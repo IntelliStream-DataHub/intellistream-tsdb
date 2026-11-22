@@ -1126,7 +1126,9 @@ static void isr_set(struct meta_volume *v, const uint32_t *ids, uint32_t n)
 
 /* The grant of a replicated volume: the promotion of design-cluster.md §6.2 over the fence replies, by the function
  * the replication simulator checks. Replica indexes (rep[]) are its node numbers. */
-static int promote(struct meta_volume *v, const struct meta_grant *g)
+/* repl_meta_promote over the record and the grant's fences and replies: the rule both the proposer (the pick, through
+ * meta_promote_pick) and the apply run */
+static int promote_rule(const struct meta_volume *v, const struct meta_grant *g, struct repl_vmeta *out)
 {
     struct repl_vmeta vm;
     memset(&vm, 0, sizeof vm);
@@ -1155,10 +1157,32 @@ static int promote(struct meta_volume *v, const struct meta_grant *g)
             return META_ERR_INVALID;
         rr[i] = (struct repl_fence_reply){x, g->reply[i].durable, g->reply[i].last_epoch, g->reply[i].rid};
     }
-    int rc = repl_meta_promote(&vm, g->epoch, g->isr_version, fenced, rr, (int)g->nreplies);
+    /* MUT(14) (versionless) drops the ISR version check here too: repl_meta_promote makes it again */
+    int rc = repl_meta_promote(&vm, g->epoch, MUT(14) ? v->isr_version : g->isr_version, fenced, rr, (int)g->nreplies);
+    *out = vm;
     if (rc == REPL_E_STALE)
         return META_ERR_STALE;
-    if (rc != REPL_OK || vm.leader < 0 || v->rep[vm.leader].node != g->leader)
+    if (rc != REPL_OK || vm.leader < 0 || (uint32_t)vm.leader >= v->nrep)
+        return META_ERR_INVALID;
+    return META_OK;
+}
+
+int meta_promote_pick(const struct meta_volume *v, const struct meta_grant *g, uint32_t *leader)
+{
+    struct repl_vmeta vm;
+    int rc = promote_rule(v, g, &vm);
+    if (rc == META_OK)
+        *leader = v->rep[vm.leader].node;
+    return rc;
+}
+
+static int promote(struct meta_volume *v, const struct meta_grant *g)
+{
+    struct repl_vmeta vm;
+    int rc = promote_rule(v, g, &vm);
+    if (rc != META_OK)
+        return rc;
+    if (v->rep[vm.leader].node != g->leader)
         return META_ERR_INVALID; /* the proposer's pick is not what the rule gives: a bug or a stale view */
     uint32_t ids[META_REPLICAS_MAX], n = 0;
     for (uint32_t i = 0; i < v->nrep; i++) {
@@ -1449,7 +1473,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         int rc = vol_get(m, g.number, touched, *ntouched, &v);
         if (rc)
             return rc;
-        if (g.epoch != v->epoch || g.isr_version != v->isr_version)
+        if (g.epoch != v->epoch || (g.isr_version != v->isr_version && !MUT(14)))
             return META_ERR_STALE;
         if (g.reason < 1 || g.reason > META_GR_LAST)
             return META_ERR_INVALID;
@@ -1457,6 +1481,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             if ((g.new_epoch != v->epoch + 1 && !(MUT(1) && g.new_epoch > v->epoch)) || v->nhist < 1 ||
                 (g.start <= v->hist[v->nhist - 1].start && !MUT(13)))
                 return META_ERR_INVALID;
+            if (g.new_epoch >= META_EPOCH_LIMIT && !MUT(9))
+                return META_ERR_RANGE; /* D10: the engine refuses it (replica_epoch_begin) */
             rc = promote(v, &g);
             if (rc == META_OK)
                 v->pos = g.pos;
@@ -2319,6 +2345,8 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
         FAIL("volume %u: epoch went back from %llu to %llu", va, (unsigned long long)a->epoch,
              (unsigned long long)b->epoch);
     int moved = b->leader != a->leader;
+    if (b->epoch >= META_EPOCH_LIMIT && b->epoch != a->epoch)
+        FAIL("volume %u: epoch %llu is beyond META_EPOCH_LIMIT", va, (unsigned long long)b->epoch);
     if (b->kind == META_VOL_REPLICATED) {
         if (b->epoch > a->epoch + 1)
             FAIL("volume %u: epoch jumped from %llu to %llu in one entry", va, (unsigned long long)a->epoch,
@@ -2333,8 +2361,6 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
         if (moved && b->epoch < a->epoch + 2)
             FAIL("volume %u: the owner changed from %u to %u at epoch %llu, which was reserved for %u (from %llu)",
                  va, a->leader, b->leader, (unsigned long long)b->epoch, a->leader, (unsigned long long)a->epoch);
-        if (b->epoch >= META_EPOCH_LIMIT)
-            FAIL("volume %u: epoch %llu is beyond the u24 bound", va, (unsigned long long)b->epoch);
         /* a grant lands above every epoch a claimant reported (highest_seen); only the owner's own step to e + 1
          * (VOLUME_SELF) is exempt */
         if (b->epoch > a->epoch && (moved || b->epoch != a->epoch + 1) && b->epoch <= a->highest_seen)

@@ -23,6 +23,9 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
                           # and kv-local (a cluster volume of 1 replica per node); JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
+                          # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
+                          # picks the run's terminal crash point, failover points included; JEPSEN_TRACE=1 stamps the nemesis's
+                          # actions and kvr's leader changes in ms and details the first stale reads)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
@@ -63,9 +66,11 @@ docs/tasks/macos.md.
 Tests take a scratch directory as their first argument
 (`./build/test_tsdb /tmp/x`); default `/tmp`.
 
-Run the tests that cover what you changed, and the sanitizers for anything
-concurrent or touching memory layout. A change to how data reaches the disk
-(writes, fsync, renames, recovery, merges, the WAL) also needs `make jepsen`.
+Run the tests that cover what you changed (integration tests of the behaviour, end to end where it shows), and
+those test binaries under the sanitizers for anything concurrent or touching memory layout. A change to how data
+reaches the disk (writes, fsync, renames, recovery, merges, the WAL) also needs a power-loss or crash-point case for
+that path. The full gates (`make asan`, `make tsan`, `make jepsen`, the cluster gate, the mutant suites) run once a
+week on main (.claude/skills/tsdb-tracks/SKILL.md), not per change.
 `make tsan` builds into `build-tsan/`, the server under test included, and
 leaves `build/` alone. `make asan` starts with `make clean`: while anything
 else uses `build/` (a running tsdbd, client tests, another agent), run it in a
@@ -186,7 +191,13 @@ cgroup, so `nice` does not keep your work out of its way.
   instance is freed only after tsdbd's workers are joined (`fwd_cluster_free`), `test_cluster fwdlinks`. The entry node's decision is `route_decide` in `server/tsdbd.c` (D5, S2-1:
   served only where every cluster volume of the request is led here, else MOVED to the copy's leader, reads included, or
   UNAVAILABLE NO_OWNER/PROMOTING; before any right on an id is checked; a frame spanning two owners is INVALID;
-  docs/design-cluster.md 6.4); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
+  docs/design-cluster.md 6.4; NO_OWNER when no ISR member is UP, 6.2); a refusal after it (a leader deposed by a failover
+  before the engine call) takes the same answer (`route_fill` in `frame_put`), and `TSDB_REPLICA_READS=1` (a test hook) lets
+  a replica that holds a lease serve reads (test_cluster defaults to it: a scenario about a read's safety sets
+  `strict_reads`, the production path); a read admitted under the lease (`lguard`) records which of its volumes are led
+  here and at which epoch, and its first reply frame (after the snapshot) refuses it when that leadership changed
+  (deposed, or deposed and promoted again) or the lease lapsed meanwhile: never "led now", which a read held across a
+  deposal answers from the demoted replica engine (`test_cluster readdepose`, mutant `leadnow` in repld_mutants.sh); `TSDB_ROUTE_MUTANT` plants its bugs, `test_cluster route` must catch each. `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
   disk, power loss under crashfs; `lease` and `hungloop` the leases and the serving loop's stamp, whose mutants
@@ -446,6 +457,12 @@ cgroup, so `nice` does not keep your work out of its way.
   segments for the replicas (`eng_leader_keep`): one goes only once its last position is at or below min(the driver's
   keep bound, the commit point), after `fno_require`, by its own name (`lk_unlink_upto`: kept numbers jump at a promotion,
   so never through `wal_unlink_upto`'s run of consecutive ones); `wal_removed` never passes one still on disk.
+  A replica keeps its flushed segments as well, past its saved commit floor, under the same caps (`replica_keep_cap`,
+  `replica_keep_next` before its open; `unl_cap_bound` counts from the newest back), so that, promoted, it can serve a
+  member that was away (`test_cluster failoverkeep`, mutant `replicadropsfloor`); never one above the floor.
+  The files of the committed COMMIT markers in kept segments stay with them on every member as `keep_<pos>_<key>.part`
+  (a replica's apply and open rename the stage_ file; a leader serves them from its attach, by position, never by name
+  alone; `test_replica keepfiles`, mutant `replicadropsfiles`).
   Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
   take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

@@ -86,7 +86,28 @@ static void die(const char *fmt, ...)
     fprintf(stderr, "\n  (server logs in %s/n*.log)\n", base);
     va_end(ap);
     static int dying;
-    if (!dying++) { /* what every live server says, for the report */
+    if (!dying++) { /* a server a sanitizer stopped (halt_on_error) shows only as a timeout here: name its report */
+        for (int i = 0; i < N; i++) {
+            char path[PATH_MAX + 96], ln[512];
+            snprintf(path, sizeof path, "%s/n%d.log", base, i);
+            FILE *fp = fopen(path, "r");
+            int shown = -1;
+            while (fp && shown < 12 && fgets(ln, sizeof ln, fp)) {
+                if (shown < 0 && (strstr(ln, "WARNING: ThreadSanitizer") || strstr(ln, "ERROR: AddressSanitizer") ||
+                                  strstr(ln, "runtime error:"))) {
+                    fprintf(stderr, "  -- server %d's log has a sanitizer report (%s):\n", i, path);
+                    shown = 0;
+                }
+                if (shown >= 0) {
+                    fprintf(stderr, "  %s", ln);
+                    shown++;
+                }
+            }
+            if (fp)
+                fclose(fp);
+        }
+    }
+    if (dying == 1) { /* what every live server says, for the report */
         const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
         for (int i = 0; i < N; i++)
             if (pids[i] > 0 && pports[i] && !stopped[i]) {
@@ -128,6 +149,9 @@ static uint64_t now_ms(void)
 static void server_dir(int i, char *out, size_t n) { snprintf(out, n, "%s/n%d", base, i); }
 
 static int auth_on[N]; /* server i runs with login (no --no-auth): its root has USERS */
+/* Servers run with TSDB_REPLICA_READS=1 (replicas holding a lease answer reads, so a scenario can count a replica's
+ * rows) unless a scenario sets strict_reads: then every read goes to the leader (D5), as in production. */
+static int strict_reads;
 static int cports[N];  /* the client port of server i */
 
 /* Starts server i; returns th_await's answer (the client port, or TH_EXITED with th_status, or TH_BAD). */
@@ -146,6 +170,10 @@ static int start_try(int i)
         int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
             dup2(fd, 2);
+        if (strict_reads)
+            unsetenv("TSDB_REPLICA_READS");
+        else
+            setenv("TSDB_REPLICA_READS", "1", 1);
         if (envs[i])
             setenv("TSDB_CLUSTER_TEST", envs[i], 1);
         else
@@ -258,7 +286,6 @@ static int log_has(int i, const char *needle)
 
 static uint32_t isr_of(int via, const char *name, uint64_t *version);
 static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what);
-static uint64_t wal_lowest(int i, uint32_t num);
 
 /* stops every live server (SIGTERM, status 0) and starts a new scenario in its own directory */
 static void stop_all(void)
@@ -278,6 +305,7 @@ static void scenario(const char *name)
     memset(envs, 0, sizeof envs);
     memset(xargs, 0, sizeof xargs);
     memset(penv, 0, sizeof penv);
+    strict_reads = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
@@ -467,6 +495,7 @@ static void node_add(int via, int newi)
 }
 
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
+static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to this instead of 1.5 s */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 
@@ -481,7 +510,7 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.repl_retain_s = init_retain_s;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
-    s.node_timeout_ms = 1500;
+    s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
     uint8_t req[128], *reply;
@@ -2386,6 +2415,47 @@ static void expect_held(tsdbc *c, int rc, int s, const char *name, uint16_t vol,
         expect_moved(c, rc, vol, w.leader, ls, what);
 }
 
+/* expect_moved with the epoch checked (design-cluster.md 6.3): a write to a replicated volume on a server that does not lead it, naming
+ * volume `vol` and its leader `node` at `epoch` with that server's client address */
+static void expect_moved_ep(tsdbc *c, int rc, uint16_t vol, uint32_t node, uint64_t epoch, const char *what)
+{
+    tsdbc_err_info e;
+    if (rc != TSDB_ERR_MOVED)
+        die("%s: %s, not MOVED", what, ers(rc));
+    if (tsdbc_last_error(c, &e) != TSDB_ERR_MOVED || !e.has_body || e.nmoved != 1)
+        die("%s: MOVED without one entry (body %d, %u entries)", what, e.has_body, e.nmoved);
+    int s = server_of(node);
+    char port[16];
+    snprintf(port, sizeof port, ":%d", s >= 0 ? cports[s] : -1);
+    size_t al = strlen(e.moved[0].addr), pl = strlen(port);
+    if (e.moved[0].vol != vol || e.moved[0].node_id != node || e.moved[0].epoch != epoch || al < pl ||
+        strcmp(e.moved[0].addr + al - pl, port) != 0)
+        die("%s: MOVED names volume %u, node %u at epoch %u, address %s; not volume %u, node %u at epoch %" PRIu64
+            ", port %s", what, e.moved[0].vol, e.moved[0].node_id, e.moved[0].epoch, e.moved[0].addr, vol, node, epoch,
+            port + 1);
+}
+
+/* a write of one row to a server that no longer leads `vol` after a promotion, expected to be MOVED to (node, epoch).
+ * The server answers from its own copy of the record, which the group's watch delivers a little after the record
+ * another server reported: until then it may say UNAVAILABLE (its volume is fenced and the record still names it) or
+ * MOVED to the leader of an older epoch. Both refuse before numbering anything, so they are retried for 5 s; anything
+ * else, or a stale answer after that, fails (r3e-clus4: writerdepose got UNAVAILABLE right after the record moved). */
+static void insert_expect_moved(tsdbc *c, tsdb_sid id, int64_t ts, float val, uint16_t vol, uint32_t node,
+                                uint64_t epoch, const char *what)
+{
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        int rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        tsdbc_err_info e;
+        int stale = rc == TSDB_ERR_UNAVAILABLE ||
+                    (rc == TSDB_ERR_MOVED && tsdbc_last_error(c, &e) == TSDB_ERR_MOVED && e.has_body &&
+                     e.nmoved == 1 && e.moved[0].epoch < epoch);
+        if (!stale || now_ms() - t0 > 5000) {
+            expect_moved_ep(c, rc, vol, node, epoch, what);
+            return;
+        }
+    }
+}
+
 /* series pump7.flow in `vol` on server i: made, written and read back (returns its id) */
 static tsdb_sid write_read(tsdbc *c, const char *vol, int64_t t0)
 {
@@ -2501,6 +2571,7 @@ static void await_probe(int i, const char *name, const char *want, const char *w
 static void scen_users(void)
 {
     scenario("users");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     /* frequent snapshots: the member restarted below loads its copy (members, addresses, carol) from one, so it reaches
      * the leader with its Raft core held; server 1 registers a users watch and drops probe-drop through
      * cluster_user_propose; a watch ring of 256 KiB, which two big blobs pass */
@@ -2826,6 +2897,7 @@ static void *unlink_later(void *path)
 static void scen_login(void)
 {
     scenario("login");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     const char *mut = getenv("TSDB_AUTH_MUTANT");
     static char mpenv[128], mpenv2[PATH_MAX + 256];
     char failpush[PATH_MAX + 96], holdraft[PATH_MAX + 96];
@@ -3109,6 +3181,7 @@ static void scen_login(void)
 static void scen_userimport(void)
 {
     scenario("userimport");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     auth_on[0] = 1;
     start(0);
     init_fast(0);
@@ -3683,6 +3756,7 @@ static void fwd_await(int i, uint32_t peer, const char *kind, int conn)
 static void scen_fwdlinks(void)
 {
     scenario("fwdlinks");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     for (int i = 0; i < 3; i++)
         start(i);
     init_cluster(0, 600);
@@ -3876,6 +3950,7 @@ struct rep_writer {
     int64_t t0;
     int count, done, rc;
     int big; /* > 0: one insert of this many rows instead of `count` single rows */
+    int acked; /* rows acknowledged so far (rows t0, t0 + 1000, ...) */
 };
 static int rep_timeout_ms; /* > 0: every answer to a rep_write_thread within this, or the write fails (a hang shows as
                               a failure, not as a test that never ends) */
@@ -3898,6 +3973,8 @@ static void *rep_write_thread(void *a)
             for (int j = 0; j < w->big; j++)
                 ts[j] = w->t0 + 1000LL * j, val[j] = (float)(j % 613);
             w->rc = tsdbc_insert_series(c, w->id, ts, val, w->big);
+            if (w->rc == 0)
+                __atomic_store_n(&w->acked, w->big, __ATOMIC_RELEASE);
             free(ts);
             free(val);
         }
@@ -3905,6 +3982,8 @@ static void *rep_write_thread(void *a)
             int64_t ts = w->t0 + 1000LL * j;
             float val = (float)j;
             w->rc = tsdbc_insert_series(c, w->id, &ts, &val, 1);
+            if (w->rc == 0)
+                __atomic_store_n(&w->acked, j + 1, __ATOMIC_RELEASE);
         }
         tsdbc_close(c);
     }
@@ -4015,21 +4094,12 @@ static void scen_replicate(void)
     /* a replica killed while the leader takes writes: restarted, it catches up from the leader's log (a restart of
      * every server would come back on new peer ports, which the metadata group does not know) */
     int R = (L + 1) % 3;
-    /* R has removed a segment of its own (its floor passed a flushed one) before it dies: the floor that allowed it
-     * must be in R's REPL by then, or R's log starts above the floor it reads back (floornotsaved, caught only when
-     * R's flush and floor had moved by this point: once in four runs they had not) */
-    for (uint64_t t1 = now_ms(); wal_lowest(R, 1) <= 1 && now_ms() - t1 < 20000;) {
-        struct timespec ms = {0, 50000000};
-        nanosleep(&ms, NULL);
-    }
-    if (wal_lowest(R, 1) <= 1)
-        die("replica %d removed none of its WAL segments in 20 s (a flush every 5 s, the floor every second)", R);
     stop(R, SIGKILL);
-    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0};
+    struct rep_writer w = {cports[L], id[0], 10000000, 300, 0, 0, 0, 0};
     /* and a large insert: its part is shipped while R is down; R, back, does not stage the first file it receives
      * (TSDB_REPLD_TEST=dropbulk), finds the COMMIT marker in the log without the file and fetches it from the leader
      * by the marker's position (eng_leader_file_open serves a name only for the marker that named it) */
-    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000, 0}; /* above wal_max_batch_rows */
     pthread_t th, thb;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0 || pthread_create(&thb, NULL, rep_write_thread, &wb) != 0)
         die("pthread_create");
@@ -4060,8 +4130,8 @@ static void scen_replicate(void)
     /* the writes no longer wait for R: once R is silent for isr_lag_ms it leaves the ISR and they go on. R catches up
      * as a learner and grows back; only then has it surely seen the COMMIT marker and fetched the part. 60 s: under
      * TSan the restart, the catch-up and the fetch (5 s late on purpose) took the whole of 30 s (r3d-isr g3 tsan).
-     * A replica that refuses its own log (the leader dropped segments past a floor it never saved: floornotsaved) is
-     * named apart from a slow rejoin, so that mutant's catch cannot be a timeout for any other reason */
+     * A replica that refuses its own log is named apart from a slow rejoin. (Under the default keep caps R removes no
+     * segment here, so floornotsaved is repcheck's: its caps are 2 s.) */
     for (uint64_t t1 = now_ms(); isr_of(L, "plant", NULL) != 3;) {
         if (log_has(R, "the log starts above the commit floor"))
             die("the replica restarted under writes refused its log: the log starts above the commit floor");
@@ -4179,7 +4249,7 @@ static void scen_isr(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     hold_isr(1);
     stop(R1, SIGKILL);
-    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -4403,6 +4473,7 @@ static void status_id(tsdbc *c, uint32_t want, const char *what)
 static void scen_topology(void)
 {
     scenario("topology");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     for (int i = 0; i < 3; i++) {
         penv[i] = "TSDBD_TEST_ROUTE_MOVED=1";
         start(i);
@@ -4534,6 +4605,7 @@ static void scen_topology(void)
 static void scen_movedself(void)
 {
     scenario("movedself");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     penv[0] = "TSDBD_TEST_ROUTE_MOVED=2";
     start(0);
     init_cluster(0, 600);
@@ -4627,6 +4699,7 @@ static void moved_many(tsdbc *c, tsdb_sid id, uint32_t vol, uint32_t node, int s
 static void scen_route(void)
 {
     scenario("route");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     const char *mut = getenv("TSDB_ROUTE_MUTANT");
     static char menv[128];
     snprintf(menv, sizeof menv, "TSDB_ROUTE_MUTANT=%s", mut ? mut : "");
@@ -4842,6 +4915,7 @@ static void scen_ccstress(void)
 static void scen_copyhold(void)
 {
     scenario("copyhold");
+    strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     envs[0] = "copy_hold=50";
     start(0);
     init_cluster(0, 600);
@@ -4912,7 +4986,7 @@ static void scen_minisr(void)
     /* a write admitted with the ISR at 3, its commit point reached only once the shrink to 2 committed: held */
     hold_isr(1);
     stop(R1, SIGKILL);
-    struct rep_writer w = {cports[L], id, 2500, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2500, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -5038,7 +5112,7 @@ static void scen_closegone(void)
     L = closegone_setup("closegone-above", NULL, &id);
     pause_server((L + 1) % 3, 1);
     pause_server((L + 2) % 3, 1);
-    struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -5126,7 +5200,7 @@ static void scen_writersync(void)
     /* BATCHES at least, on until the overtaking was seen (synclate makes it happen in the first), and two batches past it */
     for (b = 0; b < MAX_BATCHES && (b < BATCHES || !seen || b <= seen_at + 2); b++) {
         for (int k = 0; k < CONNS; k++) {
-            w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0};
+            w[k] = (struct rep_writer){cports[L], id, 100000000LL * (b * CONNS + k + 1), WRITES, 0, 0, 0, 0};
             if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
                 die("pthread_create");
         }
@@ -5174,27 +5248,6 @@ static int wal_count(int i, uint32_t num)
     return n;
 }
 
-/* the lowest WAL segment number in server i's directory of volume num; UINT64_MAX when it has none (a volume that
- * flushed everything and removed its segments also passed number 1) */
-static uint64_t wal_lowest(int i, uint32_t num)
-{
-    char dir[PATH_MAX + 80], v[PATH_MAX + 120];
-    server_dir(i, dir, sizeof dir);
-    snprintf(v, sizeof v, "%s/v%" PRIu32, dir, num);
-    DIR *d = opendir(v);
-    if (!d)
-        die("opendir %s: %s", v, strerror(errno));
-    uint64_t lo = UINT64_MAX, seq;
-    errno = 0;
-    for (struct dirent *e; (e = readdir(d));)
-        if (sscanf(e->d_name, "wal_%" SCNx64 ".log", &seq) == 1 && seq < lo)
-            lo = seq;
-    if (errno)
-        die("readdir %s: %s", v, strerror(errno));
-    closedir(d);
-    return lo;
-}
-
 /* A writer of 1000-row inserts on one connection until `stop` (inboxshared's stalled volume) */
 struct flood {
     int port;
@@ -5206,7 +5259,7 @@ static void *flood_thread(void *a)
     struct flood *f = a;
     while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
         struct rep_writer w = {f->port, f->id, 1000000000LL * (__atomic_load_n(&f->rounds, __ATOMIC_RELAXED) + 1), 0, 0,
-                               0, 1000};
+                               0, 1000, 0};
         rep_write_thread(&w);
         if (w.rc != 0) {
             __atomic_store_n(&f->rc, w.rc, __ATOMIC_RELEASE);
@@ -5385,7 +5438,7 @@ static void scen_backpressure(void)
     while (now_ms() - t0 < 4000) {
         for (int k = 0; k < 4; k++) {
             w[k] = (struct rep_writer){cports[L], id[0], 4000000LL * rounds + 1000000LL * k, 0, 0, 0,
-                                       1000};
+                                       1000, 0};
             if (pthread_create(&th[k], NULL, rep_write_thread, &w[k]) != 0)
                 die("pthread_create");
         }
@@ -5398,7 +5451,7 @@ static void scen_backpressure(void)
         rounds++;
     }
     /* and a large write: its part is shipped as a file above the spill threshold */
-    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000};
+    struct rep_writer wb = {cports[L], id[2], 2000000000, 0, 0, 0, 100000, 0};
     rep_write_thread(&wb);
     if (wb.rc != 0)
         die("a large write with a stalled replica: %s", ers(wb.rc));
@@ -5468,7 +5521,7 @@ static void scen_stallstop(void)
             unlink(stall);
             die("the stalled replica's inbox never filled in 20 s (the case proved nothing)");
         }
-        struct rep_writer w = {cports[L], id, 1000000LL * round + 1, 0, 0, 0, 1000};
+        struct rep_writer w = {cports[L], id, 1000000LL * round + 1, 0, 0, 0, 1000, 0};
         rep_write_thread(&w);
         if (w.rc != 0) {
             unlink(stall);
@@ -5894,7 +5947,7 @@ static void scen_reopenhold(void)
     start(R);
     penv[R] = NULL;
     await_open_gen(L, "plant", R, 2, 0);
-    struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000}; /* above wal_max_batch_rows */
+    struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000, 0}; /* above wal_max_batch_rows */
     rep_write_thread(&wb);
     if (wb.rc != 0)
         die("a large write with a replica that drops its file: %s", ers(wb.rc));
@@ -5905,7 +5958,14 @@ static void scen_reopenhold(void)
         struct timespec ms = {0, 50000000};
         nanosleep(&ms, NULL);
     }
-    /* the leader seals the marker's segment, and R's log passes its end */
+    /* the leader seals the marker's segment, and R's log passes its end. The large write flushed the memtable before
+     * its marker, and a flush of an empty memtable starts no segment: a row first, or the marker's segment stays open
+     * until an idle seal that the 1.5 s below may miss, and the leader drops it only after R fetched (the mutant
+     * survived 2 runs of 3) */
+    t += 1000;
+    if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+        die("a write after the large one: %s", ers(rc));
+    n[0]++;
     if ((rc = tsdbc_flush(c)) != 0)
         die("flush: %s", ers(rc));
     for (int k = 0; k < 20; k++) {
@@ -6055,11 +6115,20 @@ static void scen_idleseal(void)
     /* and an idle volume's WAL grows by its NOW markers alone */
     char dir[PATH_MAX + 80], wp[PATH_MAX + 160];
     server_dir(L, dir, sizeof dir);
-    snprintf(wp, sizeof wp, "%s/v1/wal_%016" PRIx64 ".log", dir, wal_newest(L));
     struct stat st0, st1;
     struct timespec s5 = {5, 0};
-    if (stat(wp, &st0) != 0 || (nanosleep(&s5, NULL), stat(wp, &st1)) != 0)
-        die("stat %s: %s", wp, strerror(errno));
+    /* The last write's seal may still be under way (slow under ASan): its segment then goes once flushed and the NOW
+     * marker starts the next one. Measure a segment that stays for the whole 5 s; a third roll is a failure. */
+    for (int tries = 0;; tries++) {
+        uint64_t w = wal_newest(L);
+        snprintf(wp, sizeof wp, "%s/v1/wal_%016" PRIx64 ".log", dir, w);
+        if (stat(wp, &st0) == 0 && (nanosleep(&s5, NULL), stat(wp, &st1)) == 0)
+            break;
+        int e = errno;
+        if (e != ENOENT || tries == 2 || wal_newest(L) == w)
+            die("stat %s: %s", wp, strerror(e));
+        printf("  the newest segment rolled while measured (the last seal still running); again\n");
+    }
     printf("  an idle leader's WAL grows by %lld bytes in 5 s (NOW markers; about %lld KB an hour)\n",
            (long long)(st1.st_size - st0.st_size), (long long)(st1.st_size - st0.st_size) * 720 / 1024);
     tsdbc_close(c);
@@ -6178,7 +6247,7 @@ static void scen_replindet(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     pause_server(R1, 1); /* no replica acknowledges: the commit point stops below the next write */
     pause_server(R2, 1);
-    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -6194,6 +6263,299 @@ static void scen_replindet(void)
     pause_server(R2, 0);
     stop_all();
     printf("  a write left of unknown outcome by its leader's stop gets a closed connection, never an answer\n");
+}
+
+/* The rows of `id` in [from, to) on server i, once its answer is not UNAVAILABLE (a promotion under way): -1 after ms */
+static int rows_in(int i, tsdb_sid id, int64_t from, int64_t to, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        tsdbc *c = client(i);
+        nrows = 0;
+        int rc = tsdbc_query_raw(c, id, from, to, count_rows, NULL);
+        tsdbc_close(c);
+        if (rc == 0)
+            return nrows;
+        if (now_ms() - t0 > (uint64_t)ms)
+            return -1;
+        usleep(50000);
+    }
+}
+
+/* Says which of the rows t0, t0 + 1000, ... (n of them) server i lacks: a failed check names what it lost */
+static unsigned char *seen_rows;
+static int seen_n;
+static int64_t seen_t0;
+static int mark_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)v;
+    for (size_t k = 0; k < n; k++) {
+        int64_t j = (ts[k] - seen_t0) / 1000;
+        if (j >= 0 && j < seen_n && (ts[k] - seen_t0) % 1000 == 0)
+            seen_rows[j] = 1;
+    }
+    return 0;
+}
+
+static void missing_rows(int i, tsdb_sid id, int64_t t0, int n)
+{
+    seen_rows = calloc((size_t)n + 1, 1);
+    if (!seen_rows)
+        return;
+    seen_n = n, seen_t0 = t0;
+    tsdbc *c = client(i);
+    int rc = tsdbc_query_raw(c, id, t0, t0 + 1000LL * n, mark_rows, NULL);
+    tsdbc_close(c);
+    printf("  server %d (query %s) lacks:", i, ers(rc));
+    for (int j = 0; j < n; j++)
+        if (!seen_rows[j])
+            printf(" row %d (ts %" PRId64 ")", j, (int64_t)(t0 + 1000LL * j));
+    printf("\n");
+    fflush(stdout);
+    free(seen_rows);
+    seen_rows = NULL;
+}
+
+/* design-cluster.md 6.2-6.3 (r3e-failover): the leader of a replicated volume is killed under writes. The Raft leader
+ * sees it down (node_timeout, then its lease's end), fences the ISR, and a replica leads at epoch e+1; every
+ * acknowledged write is there; the new leader takes writes; the old leader restarts as a replica (led e: it never
+ * resumes), is cut by the new leader's history, catches up and holds the same rows as the others. */
+static void scen_failover(void)
+{
+    scenario("failover");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    /* isr_lag_ms well above unanswered_ms (1000): the killed old leader, which the promotion keeps in the ISR as
+     * unanswered, must leave it by unanswered_ms, not by the lag rule (design-cluster.md 6.2; mutant keepunanswered) */
+    init_isr_lag_ms = 10000;
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fo", 3, &num)) != 0 || num != 1)
+        die("volume add fo: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fo", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fo", &v))
+        die("no record of fo");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fo is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fo", 30000);
+    tsdbc_close(c);
+    await_isr(0, "fo", 3, 30000, "every replica in the ISR before the kill");
+    struct rep_writer w = {cports[L], id, 1000000, 1000000, 0, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    uint64_t t0 = now_ms();
+    while (__atomic_load_n(&w.acked, __ATOMIC_ACQUIRE) < 300) {
+        if (now_ms() - t0 > 30000)
+            die("the writer had %d rows acknowledged in 30 s", __atomic_load_n(&w.acked, __ATOMIC_ACQUIRE));
+        usleep(10000);
+    }
+    signal_child(pids[L], SIGKILL);
+    uint64_t tk = now_ms();
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    pthread_join(th, NULL);
+    int acked = __atomic_load_n(&w.acked, __ATOMIC_ACQUIRE);
+    int via = (L + 1) % 3, Nw = -1;
+    for (;;) {
+        if (vol_rec(via, "fo", &v) && v.leader != ids[L] && v.epoch > e0) {
+            Nw = server_of(v.leader);
+            break;
+        }
+        if (now_ms() - tk > 30000)
+            die("no new leader of fo 30 s after its leader was killed (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    if (v.epoch != e0 + 1 || Nw < 0 || Nw == L)
+        die("the new record of fo: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    /* the promotion kept the dead old leader in the ISR, unanswered: it goes after unanswered_ms (1 s), well before the
+     * lag rule's 10 s would take it (until then it holds the new leader's commit point, its EPOCH marker first) */
+    {
+        uint64_t version;
+        while (isr_of(via, "fo", &version) != 2) {
+            if (now_ms() - tr > 4000)
+                die("the killed old leader was still in the ISR of fo %" PRIu64 " ms after the promotion (unanswered_ms "
+                    "1000, isr_lag_ms 10000)", now_ms() - tr);
+            usleep(50000);
+        }
+        printf("  the killed old leader left the ISR %" PRIu64 " ms after the record named the new leader\n",
+               now_ms() - tr);
+    }
+    /* a replica answers reads from what it applied (it may lag the commit point): the new leader's own answer counts,
+     * once it leads (after its EPOCH marker is committed and applied, and the engine reopened as the writer) */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    uint64_t tl = now_ms();
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000); /* [from, to): rows 0 .. acked - 1 */
+    if (got != acked) {
+        missing_rows(Nw, id, 1000000, acked);
+        die("the new leader (server %d) holds %d of the %d acknowledged rows", Nw, got, acked);
+    }
+    printf("  leader %d killed after %d acknowledged rows: the record names server %d at epoch %" PRIu64 " after %" PRIu64
+           " ms, which leads after %" PRIu64 " ms and holds every one\n", L, acked, Nw, v.epoch, tr - tk, tl - tk);
+    /* the new leader takes writes */
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    tsdbc_close(c);
+    /* a write to the other replica is MOVED to the new leader, and a client with a budget follows it there */
+    int R = 3 - L - Nw;
+    c = client(R);
+    ts = 9001000;
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to a replica after the failover");
+    tsdbc_set_retry(c, 10000);
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write that follows MOVED from server %d: %s", R, ers(rc));
+    tsdbc_close(c);
+    /* the old leader restarts as a replica and rejoins; it never resumes leading: writes to it are MOVED */
+    start(L);
+    await_isr(via, "fo", 3, 60000, "the old leader back in the ISR");
+    c = client(L);
+    ts = 9002000;
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to the old leader after it rejoined");
+    tsdbc_close(c);
+    int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
+    if (total < acked + 2)
+        die("the new leader holds %d rows after the rejoin, fewer than the %d acknowledged", total, acked + 2);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)total;
+    rep_same(wantr, "after the failover");
+    printf("  the old leader came back as a replica, was cut and caught up: every server holds the same %d rows\n",
+           total);
+}
+
+/* failoverkeep: a replica keeps its flushed segments under the retention caps past its commit floor (design-cluster.md
+ * 8.3), so that, promoted, it can serve a member that was away. R is killed, the leader L writes and flushes segments
+ * past it (B, the other replica, flushes them too and its floor passes them), L is killed and B leads; R back must catch
+ * up from B's segments and join the ISR, never be told it needs a snapshot (jepsen-cluster partition, fHdR4T: a
+ * promoted replica had unlinked what a laggard still needed). Mutant replicadropsfloor (the floor alone again). */
+static void scen_failoverkeep(void)
+{
+    scenario("failoverkeep");
+    /* two witnesses (servers 3, 4): five voters, so the metadata group keeps a majority with L and R down, and the
+     * volume's replicas are on servers 0-2 */
+    for (int i = 3; i < 5; i++) {
+        is_witness[i] = 1;
+        xargs[i] = "--peer-port 0";
+        char wdir[PATH_MAX + 160];
+        snprintf(wdir, sizeof wdir, "%s/n%d", base, i);
+        if (mkdir(wdir, 0755) != 0)
+            die("mkdir %s: %s", wdir, strerror(errno));
+    }
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters (two witnesses)");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fk", 3, &num)) != 0 || num != 1)
+        die("volume add fk: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fk", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fk", &v))
+        die("no record of fk");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fk is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fk", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    uint64_t rows = 0;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    rows++;
+    await_isr(L, "fk", 3, 5000, "every replica up");
+    int R = (L + 1) % 3, B = (L + 2) % 3;
+    stop(R, SIGKILL);
+    await_isr(L, "fk", 2, 10000, "a replica killed");
+    int64_t t = 10000;
+    for (int k = 0; k < 5; k++) {
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("a write with a replica away: %s", ers(rc));
+        rows += 100;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush: %s", ers(rc));
+    }
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0) /* a commit after the last flush: B's floor passes them */
+        die("a write with a replica away: %s", ers(rc));
+    rows++;
+    tsdbc_close(c);
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    int nb = wal_count(B, 1);
+    stop(L, SIGKILL);
+    uint64_t tk = now_ms();
+    for (;;) {
+        if (vol_rec(B, "fk", &v) && v.leader == ids[B] && v.epoch > e0)
+            break;
+        if (now_ms() - tk > 30000)
+            die("server %d was not promoted 30 s after the leader was killed (epoch %" PRIu64 ", leader %u)", B, v.epoch,
+                v.leader);
+        usleep(20000);
+    }
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(B, lead, 1, 30000);
+    start(R);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        if (log_has(R, "it needs a snapshot"))
+            die("the replica away during the failover was told it needs a snapshot by the promoted leader (which held %d"
+                " WAL segments before the failover)", nb);
+        int in = 0;
+        if (vol_rec(B, "fk", &v))
+            for (uint32_t k = 0; k < v.nisr; k++)
+                in |= v.isr[k] == ids[R];
+        if (in)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("the replica away during the failover did not join the new leader's ISR in 30 s");
+        usleep(50000);
+    }
+    c = client(B);
+    tsdbc_set_retry(c, 10000);
+    t++;
+    if ((rc = tsdbc_insert_series(c, id, &t, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    rows++;
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the new leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    start(L);
+    await_isr(B, "fk", 3, 60000, "the old leader back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, 0};
+    rep_same(wantr, "after a clean stop");
+    printf("  the promoted replica had kept %d WAL segments past its floor; the member away caught up from them and "
+           "every server holds the same %" PRIu64 " rows\n", nb, rows);
 }
 
 /* D13: an engine failure (EIO on a WAL fdatasync, crashfs) of one replica of a cluster volume stops that volume
@@ -6254,7 +6616,7 @@ static void scen_replfail(void)
     tsdbc_close(c);
     int R = (L + 1) % 3;
     signal_child(pids[R], SIGUSR2); /* crashfs: the next fdatasync of a wal_ file there fails with EIO */
-    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 2000, 1000000, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -6403,7 +6765,7 @@ static void scen_ackdurable(void)
     int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
     signal_child(pids[R1], SIGUSR2);
     signal_child(pids[R2], SIGUSR2);
-    struct rep_writer w1 = {cports[L], id, 1000 + 1000LL * ACKED, 1, 0, 0, 0};
+    struct rep_writer w1 = {cports[L], id, 1000 + 1000LL * ACKED, 1, 0, 0, 0, 0};
     pthread_t th1, th2;
     if (pthread_create(&th1, NULL, rep_write_thread, &w1) != 0)
         die("pthread_create");
@@ -6413,7 +6775,7 @@ static void scen_ackdurable(void)
             die("server %d ended with status %d after the power loss, expected 99 (crashfs)", R, st);
     }
     signal_child(pids[L], SIGUSR2); /* and the leader's, at its next append */
-    struct rep_writer w2 = {cports[L], id, 1000 + 1000LL * (ACKED + 1), 1, 0, 0, 0};
+    struct rep_writer w2 = {cports[L], id, 1000 + 1000LL * (ACKED + 1), 1, 0, 0, 0, 0};
     if (pthread_create(&th2, NULL, rep_write_thread, &w2) != 0)
         die("pthread_create");
     int st = await_exit(L, 15000);
@@ -6468,18 +6830,36 @@ static void *wf_write_thread(void *a)
 
 /* writerfail (M5, D13 on the writer): the leader's engine fails (crashfs: EIO on its next fdatasync of a wal_ file:
  * a second write's) while a write waits for a paused replica. The driver deposes the writer: the outcome of both
- * writes is unknown (each went to the replicas), so their connections close without an answer (D12); the volume answers UNAVAILABLE from then on (quiesced: clients go to its
- * next leader); the server reports the volume LOCAL_FAULT, answers in its root, keeps its vote and its other
- * volumes (a later volume add commits and opens there) and stops cleanly. TSDB_REPLD_MUTANT=nodepose and noquiesce
- * fail it. */
-static void scen_writerfail(void)
+ * writes is unknown (each went to the replicas), so their connections close without an answer (D12); the volume is
+ * quiesced (UNAVAILABLE), the group promotes a replica at e+1 and writes and reads on the old leader are MOVED to it; the
+ * server reports the volume LOCAL_FAULT, answers in its root, keeps its vote and its other
+ * volumes (a later volume add commits and opens there) and stops cleanly. writerfail runs on strict reads (D5, the
+ * production path), where routing refuses the failed volume's reads before its engine is asked, so the quiesce
+ * itself is observed by writerfailq: the same run under TSDB_REPLICA_READS=1, whose routing lets a read of the failed
+ * volume through to its engine (a replica's FENCED with a lease), so only the quiesce answers it UNAVAILABLE (then
+ * MOVED by frame_put). TSDB_REPLD_MUTANT=nodepose fails both, noquiesce writerfailq. */
+/* waits up to 30 s for server `via`'s copy of volume `name` to name a leader other than node `old` at an epoch above
+ * e0 (a promotion, design-cluster.md 6.2); returns its server */
+static int await_promoted(int via, const char *name, uint32_t old, uint64_t e0, struct meta_volume *v)
 {
-    scenario("writerfail");
+    for (uint64_t t0 = now_ms();; usleep(20000)) {
+        if (vol_rec(via, name, v) && v->leader != old && v->epoch > e0)
+            return server_of(v->leader);
+        if (now_ms() - t0 > 30000)
+            die("no new leader of %s 30 s after its leader %u failed it (epoch %" PRIu64 ", leader %u)", name, old,
+                v->epoch, v->leader);
+    }
+}
+
+static void writerfail_run(const char *name, int strict)
+{
+    scenario(name);
     const char *so, *skip = crashfs_skip(&so);
     if (skip) {
         printf("  skipped: %s\n", skip);
         return;
     }
+    strict_reads = strict; /* 1: every read on the leader (D5), as in production; 0: the engine's own refusal */
     static char pe[3][PATH_MAX * 3 + 256];
     static char mark[3][PATH_MAX + 80];
     for (int i = 0; i < 3; i++) {
@@ -6551,14 +6931,19 @@ static void scen_writerfail(void)
     if (await_exit(L, 1000) >= 0)
         die("server %d exited on its cluster volume's engine failure (D13: only the volume stops)", L);
     pause_server(R1, 0);
-    /* the failed volume: UNAVAILABLE for writes and reads; the root answers */
+    /* the failed volume: the group promotes a replica (reason FENCED, D13), writes and reads on L are MOVED to it
+     * (reads too, D5: the failed volume answers nothing); the root answers */
+    uint64_t e0 = v.epoch;
+    int Nw = await_promoted((L + 1) % 3, "plant", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of plant: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     tsdbc *c2 = client(L);
     ts = 7000;
-    if ((rc = tsdbc_insert_series(c2, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
-        die("a write to the failed volume: %s, not UNAVAILABLE", ers(rc));
+    insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_points p;
-    if ((rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p)) != TSDB_ERR_UNAVAILABLE)
-        die("a read of the failed volume: %s, not UNAVAILABLE", ers(rc));
+    rc = tsdbc_query_points(c2, id, INT64_MIN, INT64_MAX, &p); /* D5: reads go to the leader as well; writerfailq: the
+                                                                  * quiesced engine's UNAVAILABLE, MOVED by frame_put */
+    expect_moved_ep(c2, rc, 1, v.leader, v.epoch, "a read of the failed volume");
     tsdb_sid any;
     if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
         die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
@@ -6582,8 +6967,7 @@ static void scen_writerfail(void)
     for (int k = 0; k < 5; k++) {
         tsdbc *c3 = client(L);
         ts = 8000 + k;
-        if ((rc = tsdbc_insert_series(c3, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
-            die("write %d to the failed volume: %s, not UNAVAILABLE", k, ers(rc));
+        insert_expect_moved(c3, id, ts, val, 1, v.leader, v.epoch, "a later write to the failed volume");
         tsdbc_close(c3);
         usleep(200000);
     }
@@ -6602,17 +6986,23 @@ static void scen_writerfail(void)
             die("replica %d holds %" PRIu64 " rows: 1 was acknowledged, 3 written before the volume failed", r, rows);
     }
     stop_all();
-    printf("  a leader whose engine failed closes the connections of the writes in flight, answers UNAVAILABLE for "
-           "the volume, keeps its root, its vote and its other volumes and stops cleanly; the replicas hold nothing "
-           "written after the failure\n");
+    printf("  a leader whose engine failed closes the connections of the writes in flight, a replica leads at epoch "
+           "%" PRIu64 ", the old leader answers writes and reads MOVED, keeps its root, its vote and its "
+           "other volumes and stops cleanly; the replicas hold nothing "
+           "written after the failure\n",
+           v.epoch);
 }
+
+static void scen_writerfail(void) { writerfail_run("writerfail", 1); }
+static void scen_writerfailq(void) { writerfail_run("writerfailq", 0); }
 
 /* writerdepose (M5, D13 with a healthy engine): the leader's driver fails the volume while its engine is fine
  * (crashfs: EIO on the leader's next fdatasync of its REPL file, the save of the commit floor at most once a second
  * after the floor moved), with a write waiting for a paused replica. Nothing in the engine ends that wait: only the
  * deposal does (eng_leader_depose in vol_fail), and its outcome is unknown (its records went to the replicas), so its
- * connection closes without an answer (D12). A later write is refused (UNAVAILABLE) and never numbered; the replicas
- * hold no row past what was sent before the failure. TSDB_REPLD_MUTANT=nodepose fails it (the write waits for good). */
+ * connection closes without an answer (D12). A replica is promoted at e+1; a later write on the old leader is MOVED
+ * to it and never numbered; the replicas hold no row past what was sent before the failure. TSDB_REPLD_MUTANT=nodepose
+ * fails it (the write waits for good). */
 static void scen_writerdepose(void)
 {
     scenario("writerdepose");
@@ -6702,11 +7092,14 @@ static void scen_writerdepose(void)
     tsdbc_close(c);
     pause_server(R1, 0);
     await_local_fault(L, num, 3);
-    /* a write after the failure: refused, never numbered */
+    /* a write after the failure: never numbered; once a replica leads (D13 promotes away from L) it is MOVED there */
+    uint64_t e0 = v.epoch;
+    int Nw = await_promoted((L + 1) % 3, "plant", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of plant: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
     tsdbc *c2 = client(L);
     ts += 100000;
-    if ((rc = tsdbc_insert_series(c2, id, &ts, &val, 1)) != TSDB_ERR_UNAVAILABLE)
-        die("a write to the failed volume: %s, not UNAVAILABLE", ers(rc));
+    insert_expect_moved(c2, id, ts, val, 1, v.leader, v.epoch, "a write to the failed volume");
     tsdb_sid any;
     if ((rc = tsdbc_series(c2, "writerfail.none", 0, &any)) != TSDB_ERR_NOTFOUND)
         die("a lookup in server %d's root after its volume failed: %s", L, ers(rc));
@@ -6730,7 +7123,8 @@ static void scen_writerdepose(void)
     }
     stop_all();
     printf("  a leader whose driver failed the volume (its engine healthy) closes the connection of the write waiting "
-           "for its commit point and refuses the next; the replicas hold between %d and %d rows\n",
+           "for its commit point and sends the next to the promoted replica (MOVED); the replicas hold between %d and "
+           "%d rows\n",
            acked, sent);
 }
 
@@ -6959,9 +7353,35 @@ static void scen_lease(void)
     }
     pause_server(R, 0);
     pause_server(F, 0);
-    if (!lease_until_ok(c, id, 30000, 1))
-        die("no read answered on %d after every server was resumed", X);
-    printf("  %d paused past its lease: %d reads refused while nobody renewed it, then answered\n", X, nb);
+    /* X was away past node_timeout: the group declared it down and moved the volume to another member, and X, deposed,
+     * answers MOVED (it serves no reads for a volume it does not lead). The row is read back where MOVED points. */
+    int at = X;
+    for (uint64_t t2 = now_ms();;) {
+        int rows;
+        if (now_ms() - t2 > 30000)
+            die("no read answered after every server was resumed (last asked server %d)", at);
+        rc = lease_read(c, id, 2, &rows); /* a raw query: MOVED for the whole request, with its body */
+        if (rc == 0) {
+            if (rows != 1)
+                die("a read on server %d answered %d rows, 1 was written", at, rows);
+            break;
+        }
+        tsdbc_err_info e;
+        if (rc == TSDB_ERR_MOVED && tsdbc_last_error(c, &e) == TSDB_ERR_MOVED && e.has_body && e.nmoved == 1) {
+            int s = server_of(e.moved[0].node_id);
+            if (s < 0 || s > 2)
+                die("a read on server %d: MOVED to node %u, no server of this test", at, e.moved[0].node_id);
+            if (s != at) {
+                tsdbc_close(c);
+                c = client(s);
+                at = s;
+            }
+        } else if (rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) {
+            die("a read on server %d: %s", at, ers(rc));
+        }
+        usleep(20000);
+    }
+    printf("  %d paused past its lease: %d reads refused while nobody renewed it, then answered on %d\n", X, nb, at);
     tsdbc_close(c);
 }
 
@@ -7180,8 +7600,9 @@ static int cmp_u64(const void *a, const void *b)
 }
 
 /* repcheck: three duties of the replication driver that no other scenario sees, each the target of one of its mutants
- * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments (floornottold
- * keeps them all); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
+ * (server/repld.c): a replica's saved floor reaches its engine, which then removes its flushed segments once they are
+ * also past the keep caps (repl_retain_s is 2 s here; floornottold keeps them all) and, restarted, opens its log from
+ * the floor it saved (floornotsaved never saves it: the log starts above it, the core refuses); a replica whose newest REPL slot is damaged opens "unsure" and its first save at the open takes the
  * group's epoch as fence and led, which clears the flag (unsureignored keeps the older slot's values and the flag);
  * a write whose position in the core is not its log number fails the volume before it is acknowledged (admitnocheck
  * acknowledges it; the fault is TSDB_REPLD_TEST=skippos). It also prints the latency of single-row writes (the fast
@@ -7194,7 +7615,9 @@ static void scen_repcheck(void)
         penv[i] = "TSDB_REPLD_TEST=skippos,stalesent";
         start(i);
     }
+    init_retain_s = 2; /* a replica keeps flushed segments past its floor for repl_retain_s (design-cluster.md 8.3) */
     init_cluster(0, 600);
+    init_retain_s = 0;
     node_add(0, 1);
     node_add(0, 2);
     unsigned want = 3;
@@ -7250,10 +7673,34 @@ static void scen_repcheck(void)
             break;
         if (now_ms() - t0 > 20000)
             die("replica %d still holds %d WAL segments 20 s after the writes (its saved floor never removed its "
-                "flushed segments)", R, nw);
+                "flushed segments past the keep caps)", R, nw);
         usleep(100000);
     }
     printf("  the replica removed its flushed segments once its floor was saved (%d left)\n", nw);
+    /* a clean restart: the segments went, so the log starts above position 1, and the floor that let them go must be
+     * in REPL, or the core refuses the log at this open and every later one (floornotsaved: the engine was told the
+     * floor, the save was skipped). Done here because only these 2 s keep caps let a replica's segments go in a test. */
+    {
+        int o = log_count(R, " of 3, log ");
+        stop(R, SIGTERM);
+        start(R);
+        await_log_count(R, " of 3, log ", o + 1, 30000);
+        /* the core's refusal is said by the volume's thread, after the open's line, and the ISR may still hold R for
+         * isr_lag_ms: 2 s for the line before the ISR is asked */
+        for (uint64_t t1 = now_ms(); isr_of(L, "plant", NULL) != 3 || now_ms() - t1 < 2000;) {
+            if (log_has(R, "the log starts above the commit floor"))
+                die("replica %d restarted after its flushed segments went refused its log: the log starts above the "
+                    "commit floor (the floor that let them go was not saved)", R);
+            if (now_ms() - t1 > 30000)
+                die("replica %d restarted after its flushed segments went: the ISR of plant has %" PRIu32
+                    " members, not 3, after 30000 ms", R, isr_of(L, "plant", NULL));
+            usleep(50000);
+        }
+        if (log_has(R, "the log starts above the commit floor"))
+            die("replica %d restarted after its flushed segments went refused its log: the log starts above the "
+                "commit floor (the floor that let them go was not saved)", R);
+        printf("  restarted, the replica opened its log from the floor it saved and joined the ISR again\n");
+    }
 
     /* damage the newer REPL slot of the replica, restart it: it opens unsure, and the open's save clears that */
     stop(R, SIGTERM);
@@ -7322,7 +7769,7 @@ static void scen_repcheck(void)
                 die("the stalesent fault did not fire in 10 s");
             usleep(10000);
         }
-        struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0};
+        struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0, 0};
         pthread_t sth;
         if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)
             die("pthread_create");
@@ -7351,7 +7798,7 @@ static void scen_repcheck(void)
     if (fd < 0)
         die("%s: %s", skip, strerror(errno));
     close(fd);
-    struct rep_writer w = {cports[L], id, 5000000, 1, 0, 0, 0};
+    struct rep_writer w = {cports[L], id, 5000000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -7368,6 +7815,1848 @@ static void scen_repcheck(void)
         die("the leader did not fail the volume on a core position that is not the log number");
     printf("  a write whose core position is not its log number failed the volume (%s), unacknowledged\n", ers(w.rc));
     tsdbc_close(c);
+    stop_all();
+}
+
+
+/* design-cluster.md 6.3 (r3e-failover): the leader of a replicated volume is paused (SIGSTOP) past its lease and
+ * node_timeout with a write waiting for its commit point (both replicas were paused first, and nothing can shrink
+ * the ISR without a Raft quorum). The replicas resume and one is promoted at e+1; it takes a write. The old leader
+ * resumes with the others paused: it answers no read (no lease, deposed or not). Once every server runs, its waiting
+ * write ends acknowledged (the replicas read the record from their sockets, acknowledged it, and the new epoch starts
+ * past it: the old leader may see those acknowledgements before the fence) or with a closed connection (D12: of
+ * unknown outcome), never MOVED or UNAVAILABLE; a new write is MOVED to the new leader and a client with a budget
+ * follows it there; the old leader rejoins as a replica (cut, caught up) with the same rows as the others. Which of
+ * the two ends the waiting write gets is a race, so the planted fault deposemoved is writerdepose's to catch. */
+/* the fence in server i's REPL of volume number (the slot with the newer generation; offset 88, src/replfile.c) */
+static uint64_t repl_fence_of(int i, uint32_t number)
+{
+    char dir[PATH_MAX + 80], path[PATH_MAX + 160];
+    uint8_t pg[2][4096];
+    server_dir(i, dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/v%" PRIu32 "/REPL", dir, number);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die("%s: %s", path, strerror(errno));
+    size_t got = fread(pg, 1, sizeof pg, f);
+    fclose(f);
+    if (got != sizeof pg)
+        die("%s: %zu bytes, not two slots", path, got);
+    uint64_t g[2], fence;
+    memcpy(&g[0], pg[0] + 8, 8);
+    memcpy(&g[1], pg[1] + 8, 8);
+    memcpy(&fence, pg[g[1] > g[0]] + 88, 8);
+    return fence;
+}
+
+/* Crash points of a promotion (design-cluster.md 6.2), a replica armed, the leader killed under none of its writes lost:
+ * fencecrash: a fenced replica saves the fence in REPL before it answers, so one that stops at fence-saved-before-reply
+ * (its reply not yet out) holds the new epoch's fence on disk (mutant fencenosync answers with the fence unsaved); the
+ * other replica is promoted alone. promotecrash: both replicas armed with promote-before-epoch, the one the record
+ * names stops before its EPOCH marker; restarted, it never resumes that epoch (it resigns, or is promoted again later)
+ * and some replica leads with every acknowledged row. deposecrash: the leader paused past its lease and node_timeout is
+ * promoted away; resumed, it stops at depose-before-reopen (writer closed, replica not yet open) and, restarted, opens
+ * as a replica, rejoins and holds the same rows. Each time the crashed server rejoins. */
+static void crash_promo(int promote)
+{
+    scenario(promote == 2 ? "deposecrash" : promote ? "promotecrash" : "fencecrash");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = promote == 2 ? "TSDB_CRASH_AT=depose-before-reopen" : NULL; /* only a demotion passes it */
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "fc", 3, &num)) != 0)
+        die("volume add fc: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fc", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "fc", &v))
+        die("no record of fc");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of fc is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "fc", 30000);
+    for (int j = 0; j < 20; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d to the leader: %s", j, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "fc", 3, 30000, "every replica in the ISR");
+    /* the crashing replica is one that is not the Raft leader (the fences come from there) */
+    int R = -1;
+    for (int i = 0; i < 3 && R < 0; i++)
+        if (i != L && i != 0)
+            R = i;
+    int Q = 3 - L - R;
+    const char *spec = promote ? "TSDB_CRASH_AT=promote-before-epoch" : "TSDB_CRASH_AT=fence-saved-before-reply";
+    for (int k = 0; k < (promote == 2 ? 0 : promote ? 2 : 1); k++) {
+        int x = k ? Q : R;
+        stop(x, SIGTERM);
+        penv[x] = spec;
+        start(x);
+        /* back as a replica (its volume opens once the group holds its new incarnation) before the next one stops:
+         * two servers restarted at new peer ports at once cannot find each other (scen_minisr) */
+        await_log_count(x, "open as the replica", 2, 60000);
+        await_isr(k ? R : Q, "fc", 3, 60000, "the restarted replica back in the ISR");
+    }
+    if (promote == 2) {
+        /* paused past its lease and node_timeout, the leader is promoted away; resumed, it is deposed and stops
+         * between the close of its writer and the open as a replica; restarted, it opens as a replica and rejoins */
+        pause_server(L, 1);
+        uint64_t t1 = now_ms();
+        while (!(vol_rec(Q, "fc", &v) && v.epoch > e0 && v.leader != ids[L])) {
+            if (now_ms() - t1 > 30000)
+                die("no new leader of fc 30 s after its leader was paused");
+            usleep(50000);
+        }
+        pause_server(L, 0);
+        int st = await_exit(L, 30000);
+        for (int i = 0; i < 3; i++)
+            penv[i] = NULL;
+        if (st != 99)
+            die("the deposed leader %d did not stop at depose-before-reopen (status %d)", L, st);
+        printf("  the deposed leader %d stopped at depose-before-reopen\n", L);
+        start(L);
+    } else {
+        signal_child(pids[L], SIGKILL);
+        if (await_exit(L, 5000) < 0)
+            die("server %d did not die of SIGKILL", L);
+    }
+    if (promote == 2) {
+    } else if (promote) {
+        /* the one named first stops; the other may be named after it and stop as well */
+        uint64_t t1 = now_ms();
+        int st = -1;
+        for (;;) {
+            int got_one = -1;
+            for (int x = 0; x < 3 && got_one < 0; x++)
+                if (x != L && pids[x] && (st = await_exit(x, 0)) >= 0)
+                    got_one = x;
+            if (got_one >= 0) {
+                if (st != 99)
+                    die("replica %d ended with status %d, not at promote-before-epoch", got_one, st);
+                printf("  replica %d stopped at promote-before-epoch\n", got_one);
+                penv[got_one] = NULL;
+                start(got_one);
+                break;
+            }
+            if (now_ms() - t1 > 30000)
+                die("no replica stopped at promote-before-epoch 30 s after the leader was killed");
+            usleep(50000);
+        }
+        penv[R] = penv[Q] = NULL;
+    } else {
+        int st = await_exit(R, 30000);
+        penv[R] = NULL;
+        if (st != 99)
+            die("replica %d did not stop at fence-saved-before-reply (status %d)", R, st);
+        uint64_t fence = repl_fence_of(R, num);
+        if (fence < e0 + 1)
+            die("replica %d: REPL holds fence %" PRIu64 " after it stopped at fence-saved-before-reply for epoch %" PRIu64,
+                R, fence, e0 + 1);
+        printf("  replica %d stopped at fence-saved-before-reply with fence %" PRIu64 " in REPL\n", R, fence);
+        start(R);
+    }
+    uint64_t t0 = now_ms();
+    for (;;) {
+        if (promote) {
+            /* the replica still armed may stop too when named; it is restarted unarmed */
+            for (int x = 0; x < 3; x++)
+                if (x != L && pids[x] && await_exit(x, 0) >= 0)
+                    start(x);
+        }
+        int via = pids[Q] ? Q : R;
+        char lead[64];
+        if (vol_rec(via, "fc", &v) && v.leader != ids[L] && v.epoch > e0 && server_of(v.leader) >= 0 &&
+            (snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch), log_has(server_of(v.leader), lead)))
+            break;
+        if (now_ms() - t0 > 30000)
+            die("no new leader of fc 30 s after its leader was killed (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    int Nw = server_of(v.leader);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * 20, 30000);
+    if (got != 20)
+        die("the new leader (server %d) holds %d of the 20 acknowledged rows", Nw, got);
+    if (promote == 2) {
+        await_log_count(L, "open as the replica", 1, 60000); /* its first open was as the leader */
+        await_isr(Nw, "fc", 3, 60000, "the deposed leader back in the ISR");
+        stop_all();
+        uint64_t wantr[REP_NAMES] = {0};
+        wantr[0] = 20;
+        rep_same(wantr, "after the deposed leader rejoined");
+        printf("  server %d leads fc at epoch %" PRIu64 "; the deposed leader reopened as a replica and holds the same "
+               "rows\n", Nw, v.epoch);
+        return;
+    }
+    await_isr(Nw, "fc", 2, 60000, "the two live replicas in the ISR");
+    printf("  server %d leads fc at epoch %" PRIu64 " with every row; the crashed replica rejoined\n", Nw, v.epoch);
+    stop_all();
+}
+
+/* leasestale (r3e-leases F5): a deposed writer that has not heard of its deposal gets no read lease. Server L, the
+ * leader of the volume, has its volume thread stalled (TSDB_REPLD_TEST=stallinbox, the file in place, a write waiting
+ * on its replicas' ACKs, which the stalled thread never takes) and is paused until the record names a new leader. Once
+ * it runs again its driver still sees itself the writer at the old epoch (the record change waits in the stalled
+ * inbox) and reports OWNER; the promotion's state is gone with the record moved, so only the check of the report
+ * against the record keeps the lease from it. Reads on L must be refused (they would miss the new leader's rows) until
+ * the stall ends and L, deposed, takes up the new history. TSDB_CLUSTER_MUTANT=leasestale fails it. */
+static void scen_leasestale(void)
+{
+    scenario("leasestale");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=stallinbox";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ls", 3, &num)) != 0 || num != 1)
+        die("volume add ls: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ls", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ls", &v))
+        die("no record of ls");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ls is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ls", 30000);
+    for (int k = 0; k < 10; k++) {
+        int64_t ts = 1000 + k;
+        float val = 1;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d with every replica up: %s", k, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "ls", 3, 30000, "every replica in the ISR before the stall");
+    char stall[PATH_MAX + 80];
+    server_dir(L, stall, sizeof stall);
+    strcat(stall, "/stallinbox");
+    FILE *sf = fopen(stall, "w");
+    if (!sf)
+        die("create %s", stall);
+    fclose(sf);
+    struct wf_writer w = {client(L), id, 2000, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, wf_write_thread, &w) != 0)
+        die("pthread_create");
+    nanosleep(&(struct timespec){0, 500000000}, NULL); /* the replicas' ACKs reach L's inbox: its thread stalls */
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE)) {
+        unlink(stall);
+        die("a write to a leader with a stalled volume thread was answered: %s", ers(w.rc));
+    }
+    pause_server(L, 1);
+    int Nw = await_promoted((L + 1) % 3, "ls", ids[L], e0, &v);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    int64_t ts = 3000;
+    float val = 3;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0) {
+        unlink(stall);
+        die("a write to the new leader: %s", ers(rc));
+    }
+    tsdbc_close(cn);
+    pause_server(L, 0);
+    /* L heartbeats again, as OWNER at e0, for 4 s: no read there may be answered */
+    tsdbc *cr = client(L);
+    tsdbc_set_retry(cr, 0);
+    int answered = 0, refused = 0, rows = 0, last = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 4000; usleep(100000)) {
+        int r = lease_read(cr, id, 0, &rows);
+        if (r == 0) {
+            answered++;
+            last = rows;
+        } else if (r == TSDB_ERR_UNAVAILABLE) {
+            refused++;
+        }
+    }
+    tsdbc_close(cr);
+    unlink(stall);
+    if (answered)
+        die("server %d, deposed at epoch %" PRIu64 " while stalled and not yet told, answered %d reads (the last with "
+            "%d rows; the new leader has 11): it held a read lease",
+            L, e0, answered, last);
+    if (!refused)
+        die("no read on the stale writer was refused UNAVAILABLE in 4 s (the case proved nothing)");
+    pthread_join(th, NULL);
+    tsdbc_close(w.c);
+    await_isr(Nw, "ls", 3, 60000, "the stale writer back in the ISR once its stall ended");
+    stop_all();
+    for (int i = 0; i < 3; i++)
+        penv[i] = NULL;
+    printf("  a writer deposed while stalled reports itself OWNER at epoch %" PRIu64 " and gets no read lease (%d reads "
+           "refused); it rejoins once the stall ends\n",
+           e0, refused);
+}
+
+static void scen_fencecrash(void) { crash_promo(0); }
+static void scen_promotecrash(void) { crash_promo(1); }
+static void scen_deposecrash(void) { crash_promo(2); }
+
+static void scen_pause(void)
+{
+    scenario("pause");
+    strict_reads = 1; /* the deposed leader back in the ISR holds a lease again: its reads must go to the new leader */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "pz", 3, &num)) != 0 || num != 1)
+        die("volume add pz: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "pz", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "pz", &v))
+        die("no record of pz");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of pz is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "pz", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    await_isr(0, "pz", 3, 30000, "every replica in the ISR before the pause");
+    int R1 = (L + 1) % 3, R2 = (L + 2) % 3;
+    pause_server(R1, 1);
+    pause_server(R2, 1);
+    struct wf_writer w = {client(L), id, 2000, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, wf_write_thread, &w) != 0)
+        die("pthread_create");
+    nanosleep(&(struct timespec){0, 300000000}, NULL);
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        die("a write with both replicas paused was answered: %s", ers(w.rc));
+    pause_server(L, 1);
+    uint64_t tp = now_ms();
+    pause_server(R1, 0);
+    pause_server(R2, 0);
+    int Nw = await_promoted(R1, "pz", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of pz: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    ts = 3000;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0)
+        die("a write to the new leader: %s", ers(rc));
+    tsdbc_close(cn);
+    printf("  leader %d paused with a write waiting: the record names server %d at epoch %" PRIu64 " after %" PRIu64
+           " ms\n", L, Nw, v.epoch, tr - tp);
+    /* the old leader resumes alone: whatever it learns from what was queued for it, it answers no read */
+    pause_server(R1, 1);
+    pause_server(R2, 1);
+    pause_server(L, 0);
+    uint64_t t1 = now_ms();
+    int nb = 0;
+    while (now_ms() - t1 < 1500) {
+        int rows;
+        if ((rc = lease_read(c, id, nb % 3, &rows)) == 0)
+            die("server %d answered a read %" PRIu64 " ms after it was resumed with every other server paused (%d rows)",
+                L, now_ms() - t1, rows);
+        nb++;
+    }
+    if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE) && w.rc != 0 && (w.rc != TSDB_ERR_IO || w.after != TSDB_ERR_IO))
+        die("the write waiting on the paused leader got %d (%s), then its connection %d (%s): not a closed connection",
+            w.rc, ers(w.rc), w.after, ers(w.after));
+    pause_server(R1, 0);
+    pause_server(R2, 0);
+    for (uint64_t t0 = now_ms(); !__atomic_load_n(&w.done, __ATOMIC_ACQUIRE); usleep(20000))
+        if (now_ms() - t0 > 15000)
+            die("the write waiting on the deposed leader %d was not ended in 15 s", L);
+    pthread_join(th, NULL);
+    if (w.rc != 0 && (w.rc != TSDB_ERR_IO || w.after != TSDB_ERR_IO))
+        die("the write waiting on the deposed leader got %d (%s), then its connection %d (%s): neither acknowledged "
+            "nor a closed connection (D12)", w.rc, ers(w.rc), w.after, ers(w.after));
+    tsdbc_close(w.c);
+    tsdbc_close(c);
+    printf("  resumed alone it answered none of %d reads; its waiting write ended %s\n", nb,
+           w.rc == 0 ? "acknowledged (committed in the new epoch)" : "with a closed connection");
+    /* new writes on the old leader are MOVED, and a client with a budget follows them */
+    c = client(L);
+    ts = 4000;
+    insert_expect_moved(c, id, ts, val, 1, v.leader, v.epoch, "a write to the deposed leader");
+    tsdbc_set_retry(c, 10000);
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write that follows MOVED from the deposed leader %d: %s", L, ers(rc));
+    tsdbc_close(c);
+    await_isr(R1, "pz", 3, 60000, "the deposed leader back in the ISR");
+    /* back in the ISR the deposed leader holds a read lease again, but the writes the new leader acknowledges reach it
+     * only at its next apply: every read there is MOVED to the new leader (D5, review F2), never answered stale. A
+     * write acknowledged by the new leader is in every answer a client following MOVED from L gets. */
+    c = client(L);
+    for (int k = 0; k < 3; k++) {
+        int rows = -1;
+        rc = lease_read(c, id, k, &rows);
+        if (rc == 0)
+            die("the deposed leader %d, back in the ISR, answered a read (kind %d, %d rows): a replica's answer may "
+                "miss a write the new leader acknowledged", L, k, rows);
+        expect_moved_ep(c, rc, (uint16_t)num, v.leader, v.epoch, "a read on the deposed leader");
+    }
+    tsdbc_set_retry(c, 10000);
+    tsdbc *cw = client(Nw);
+    for (int k = 0; k < 20; k++) {
+        ts = 10000 + k;
+        if ((rc = tsdbc_insert_series(cw, id, &ts, &val, 1)) != 0)
+            die("write %d on the new leader: %s", k, ers(rc));
+        int want = rows_in(Nw, id, 0, INT64_MAX / 2, 10000), rows = -1;
+        if ((rc = lease_read(c, id, k % 2 ? 2 : 0, &rows)) != 0 || rows != want) /* a count: raw, QUERY_MULTI */
+            die("a read through the deposed leader %d after write %d was acknowledged: %d (%s), %d rows of %d", L, k,
+                rc, ers(rc), rows, want);
+    }
+    tsdbc_close(cw);
+    tsdbc_close(c);
+    int total = rows_in(Nw, id, 0, INT64_MAX / 2, 10000);
+    if (total != 24 && !(total == 23 && w.rc != 0))
+        die("the new leader holds %d rows: 23 acknowledged, and the waiting write %s", total,
+            w.rc == 0 ? "acknowledged too" : "of unknown outcome");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)total;
+    rep_same(wantr, "after the pause");
+    printf("  the deposed leader rejoined as a replica: every server holds the same %d rows\n", total);
+}
+
+
+/* promoteslow (review F3): a promotion that takes longer than the 3 s after which the Raft leader takes a record leader
+ * whose driver does not lead for deposed (leader_deposed: a fence nobody followed up). Every server's swap to the writer
+ * waits 5 s first (TSDB_REPLD_TEST=promoteslow: a reopen of a large volume or on a loaded host; jepsen saw 7.7 s). The
+ * new leader reports PROMOTING to the record's epoch meanwhile, so the record stays at e0 + 1 and that leader takes
+ * writes; mutant promotenone (role NONE while promoting) fences it again and the record moves on to e0 + 2 and beyond
+ * (the volume's first promotion is as slow, so under the mutant it may get no writer at all). The swap's 5 s in the
+ * volume thread are the thread's own silence, not its peers': the new leader must not ask for an ISR of one after it
+ * (repld.c long_step), which the group takes for a leader cut from its replicas and moves away. */
+static void scen_promoteslow(void)
+{
+    scenario("promoteslow");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=promoteslow";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ps", 3, &num)) != 0 || num != 1)
+        die("volume add ps: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ps", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ps", &v))
+        die("no record of ps");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ps is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ps", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "ps", 3, 30000, "every replica in the ISR before the kill");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    int via = (L + 1) % 3;
+    int Nw = await_promoted(via, "ps", ids[L], e0, &v);
+    if (Nw < 0 || Nw == L || v.epoch != e0 + 1)
+        die("the new record of ps: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    uint64_t tr = now_ms();
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", e0 + 1);
+    await_log_count(Nw, lead, 1, 30000);
+    uint64_t tl = now_ms();
+    /* past the 5 s of the swap and the 3 s of leader_deposed, with margin: the record must not have moved on */
+    while (now_ms() - tr < 12000) {
+        struct meta_volume w;
+        if (vol_rec(via, "ps", &w) && (w.epoch != e0 + 1 || w.leader != v.leader))
+            die("the record of ps moved past epoch %" PRIu64 " (leader %u): epoch %" PRIu64 ", leader %u, %" PRIu64
+                " ms after the promotion; a slow promotion was taken for a deposed leader", e0 + 1, v.leader, w.epoch,
+                w.leader, now_ms() - tr);
+        usleep(100000);
+    }
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    ts = 2000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the slowly promoted leader %d: %s", Nw, ers(rc));
+    tsdbc_close(c);
+    printf("  a promotion of %" PRIu64 " ms (5 s of it before the swap): the record stayed at epoch %" PRIu64
+           " and server %d took writes\n", tl - tr, e0 + 1, Nw);
+}
+
+
+/* openread (r3e fixer, jepsen kill-classes): a restarted server opens a replicated volume's engine as a replica at REPL's
+ * floor (repld_open) a moment before the volume manager counts the volume open; a restarted leader's floor lies below
+ * what it acknowledged before the kill, and a read it answered in that window went back in time (stale read and
+ * monotonic reads in jepsen-cluster). TSDB_REPLD_TEST=openslow holds the window open for 3 s: a raw query and a
+ * QUERY_LATEST on that server meanwhile are refused (UNAVAILABLE, RECOVERING), never answered. */
+static void scen_openread(void)
+{
+    scenario("openread");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "or", 3, &num)) != 0 || num != 1)
+        die("volume add or: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "or", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "or", &v))
+        die("no record of or");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of or is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "or", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every replica up: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(0, "or", 3, 30000, "every replica in the ISR before the restart");
+    int R = (L + 1) % 3;
+    signal_child(pids[R], SIGKILL);
+    if (await_exit(R, 5000) < 0)
+        die("server %d did not die of SIGKILL", R);
+    penv[R] = "TSDB_REPLD_TEST=openslow";
+    start(R);
+    penv[R] = NULL;
+    await_log_count(R, "(openslow)", 1, 30000);
+    c = client(R);
+    tsdb_points p;
+    rc = tsdbc_query_points(c, id, INT64_MIN, INT64_MAX, &p);
+    if (rc == 0)
+        die("a raw query on server %d while its volume opens: answered (%zu rows) from the engine at REPL's floor", R,
+            p.n);
+    expect_unavail(c, rc, (uint16_t)num, TSDB_WHY_RECOVERING, "a raw query while the volume opens");
+    tsdb_latest_result lr;
+    rc = tsdbc_latest(c, &id, 1, NULL, &lr);
+    if (rc == 0 && lr.status == 0)
+        die("QUERY_LATEST on server %d while its volume opens: answered", R);
+    expect_unavail(c, rc, (uint16_t)num, TSDB_WHY_RECOVERING, "QUERY_LATEST while the volume opens");
+    tsdbc_close(c);
+    printf("  server %d refused a raw query and QUERY_LATEST while its replica engine was open but the volume was not\n",
+           R);
+}
+
+/* openreadlead (int-r review F2): openread on the production path (strict reads, D5) and for the LEADER: L, which
+ * acknowledged writes, is killed and restarted with TSDB_REPLD_TEST=openslow, so its engine is open as a replica at
+ * REPL's floor (below what L acknowledged) for 3 s before the manager counts the volume open. A raw query and a
+ * QUERY_LATEST on L meanwhile go through route_decide (route_fill: UNAVAILABLE RECOVERING where the copy still names
+ * L, MOVED where it names the leader that replaced it) and must never be answered from that engine. */
+static void scen_openreadlead(void)
+{
+    scenario("openreadlead");
+    strict_reads = 1;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "ol", 3, &num)) != 0 || num != 1)
+        die("volume add ol: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "ol", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "ol", &v))
+        die("no record of ol");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of ol is node %u", v.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "ol", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "ol", 3, 30000, "every replica in the ISR before the restart");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    penv[L] = "TSDB_REPLD_TEST=openslow";
+    start(L);
+    penv[L] = NULL;
+    await_log_count(L, "(openslow)", 1, 30000);
+    c = client(L);
+    tsdbc_set_retry(c, 0); /* the first answer, not a followed one */
+    tsdb_points p;
+    rc = tsdbc_query_points(c, id, INT64_MIN, INT64_MAX, &p);
+    if (rc == 0)
+        die("a raw query on the restarted leader %d while its volume opens: answered (%zu of %d acknowledged rows) "
+            "from the engine at REPL's floor", L, p.n, acked);
+    int why = -1;
+    tsdb_unavail e;
+    unsigned n = 0;
+    if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &n) == 0 && n == 1)
+        why = e.reason;
+    if (!(rc == TSDB_ERR_MOVED || (rc == TSDB_ERR_UNAVAILABLE && why == TSDB_WHY_RECOVERING)))
+        die("a raw query on the restarted leader %d while its volume opens: %s (reason %d), not UNAVAILABLE "
+            "(RECOVERING) or MOVED", L, ers(rc), why);
+    const char *raw = rc == TSDB_ERR_MOVED ? "MOVED" : "UNAVAILABLE (RECOVERING)";
+    tsdb_latest_result lr;
+    rc = tsdbc_latest(c, &id, 1, NULL, &lr);
+    if (rc == 0 && lr.status == 0)
+        die("QUERY_LATEST on the restarted leader %d while its volume opens: answered", L);
+    if (rc == 0)
+        rc = lr.status;
+    why = -1, n = 0;
+    if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &n) == 0 && n == 1)
+        why = e.reason;
+    if (!(rc == TSDB_ERR_MOVED || (rc == TSDB_ERR_UNAVAILABLE && why == TSDB_WHY_RECOVERING)))
+        die("QUERY_LATEST on the restarted leader %d while its volume opens: %s (reason %d), not UNAVAILABLE "
+            "(RECOVERING) or MOVED", L, ers(rc), why);
+    tsdbc_close(c);
+    printf("  restarted leader %d, its engine open at REPL's floor: a raw query %s, QUERY_LATEST %s\n", L, raw,
+           rc == TSDB_ERR_MOVED ? "MOVED" : "UNAVAILABLE (RECOVERING)");
+}
+
+/* jointpause (r3e jc7, finding P): every server of a volume stopped together for 2 s (SIGSTOP: a VM pause, a host
+ * that froze) and resumed. Nobody was silent but for the stop itself: the leader must not catch the 2 s up in ticks
+ * (every peer then looks silent for isr_lag and it asks for an ISR of one) and no member may name a peer unreachable for
+ * its own stop (a cut that deposes the leader: the pause scenario's write after MOVED got a closed connection). The
+ * record keeps its epoch and its ISR version, and a write is acknowledged (mutant stallcatchup). */
+static void scen_jointpause(void)
+{
+    scenario("jointpause");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "jp", 3, &num)) != 0 || num != 1)
+        die("volume add jp: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "jp", i, 1, 0);
+    struct meta_volume v0, v;
+    if (!vol_rec(0, "jp", &v0))
+        die("no record of jp");
+    int L = server_of(v0.leader);
+    if (L < 0 || L > 2)
+        die("the leader of jp is node %u", v0.leader);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "jp", 30000);
+    int64_t ts = 1000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write with every server up: %s", ers(rc));
+    await_isr(0, "jp", 3, 30000, "every replica in the ISR before the stop");
+    if (!vol_rec(0, "jp", &v0))
+        die("no record of jp");
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 3; i++)
+            pause_server(i, 1);
+        nanosleep(&(struct timespec){2, 0}, NULL);
+        for (int i = 0; i < 3; i++)
+            pause_server(i, 0);
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 4000; usleep(20000)) {
+            for (int i = 0; i < 3; i++)
+                if (vol_rec(i, "jp", &v) && (v.epoch != v0.epoch || v.isr_version != v0.isr_version || v.nisr != 3))
+                    die("round %d: after a stop of every server the record of jp (via server %d) has epoch %" PRIu64
+                        " (was %" PRIu64 "), ISR version %" PRIu64 " (was %" PRIu64 ") of %" PRIu32 " members: a "
+                        "member took the stop for its peers' silence", round, i, v.epoch, v0.epoch, v.isr_version,
+                        v0.isr_version, v.nisr);
+        }
+        ts = 2000 + round;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("round %d: a write to the leader after a stop of every server: %s", round, ers(rc));
+    }
+    tsdbc_close(c);
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {4, 0, 0, 0};
+    rep_same(wantr, "after three stops of every server");
+    printf("  three stops of every server for 2 s: epoch %" PRIu64 " and ISR version %" PRIu64 " kept, writes go on\n",
+           v0.epoch, v0.isr_version);
+}
+
+/* design-cluster.md 6.2 (r3e-failover, item 6): the leader of a replicated volume is killed and restarted before the
+ * group sees it down (node_timeout 20 s here). Its REPL says it led epoch e, so it never resumes: its core sends
+ * RESIGN(v, e), the Raft leader fences the ISR at once (reason RESIGNED, no node_timeout) and the record moves to e+1, the restarted server again
+ * when it is still the best; every acknowledged write is there and the new leader takes writes. */
+static void scen_resign(void)
+{
+    scenario("resign");
+    strict_reads = 1; /* every read on the leader (D5), as in production */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_node_timeout_ms = 20000; /* the restart (open generation recorded, then the core) must beat detection */
+    init_cluster(0, 600);
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "rs", 3, 30000, "every replica in the ISR before the restart");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    uint64_t tk = now_ms();
+    start(L);
+    uint64_t ts0 = now_ms();
+    char line[96];
+    snprintf(line, sizeof line, "cannot lead epoch %" PRIu64 " (led it before a restart); resigns", e0);
+    await_log_count(L, line, 1, 30000);
+    int via = (L + 1) % 3;
+    for (;;) {
+        if (vol_rec(via, "rs", &v) && v.epoch > e0)
+            break;
+        if (now_ms() - ts0 > 30000)
+            die("no new record of rs 30 s after its leader restarted (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+        usleep(20000);
+    }
+    uint64_t tr = now_ms();
+    int Nw = server_of(v.leader);
+    if (v.epoch != e0 + 1 || Nw < 0 || Nw > 2)
+        die("the new record of rs: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    /* the RESIGN moves it, not detection: the restart usually made another server the Raft leader, which must record
+     * the new incarnation (the volume opens only then) without waiting out its node_timeout of 20 s first; and the
+     * restarted server, at a new peer port nobody dials, must find the others at once (its watch), not after 10 s */
+    if (tr - ts0 >= 10000)
+        die("the record of rs moved %" PRIu64 " ms after its leader restarted: that is detection (node_timeout 20 s), "
+            "not the RESIGN", tr - ts0);
+    int resigned = 0;
+    for (int i = 0; i < 3; i++)
+        resigned += log_count(i, "(reason 7); fences");
+    if (!resigned)
+        die("the record moved to epoch %" PRIu64 " but no Raft leader promoted for a RESIGN (reason 7)", v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 ": %s", v.epoch, ers(rc));
+    tsdbc_close(c);
+    printf("  leader %d restarted %" PRIu64 " ms after its kill resigned epoch %" PRIu64 ": server %d%s leads epoch %"
+           PRIu64 " %" PRIu64 " ms after the restart, with all %d acknowledged rows\n", L, ts0 - tk, e0, Nw,
+           Nw == L ? " (the restarted one, still the best)" : "", v.epoch, tr - ts0, acked);
+    await_isr(via, "rs", 3, 60000, "every server in the ISR after the resign");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the resign");
+}
+
+/* D13 for a volume the restarted leader cannot open (r3c review F4): the leader of a replicated volume is killed, its
+ * REPL removed, and it is restarted before the group sees it down (node_timeout 20 s). The manager refuses the volume
+ * (MV_REFUSED: no driver, no RESIGN), and the server is UP, so only its heartbeat can tell the group: it reports the
+ * volume LOCAL_FAULT, and the Raft leader promotes another replica at e+1 (reason FENCED) well before node_timeout.
+ * Before, a refused volume was left out of the report and the volume had no writer for as long as the server ran. */
+static void scen_refused(void)
+{
+    scenario("refused");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_node_timeout_ms = 20000;
+    init_cluster(0, 600);
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, "rf", 3, 30000, "every replica in the ISR before the restart");
+    signal_child(pids[L], SIGKILL);
+    if (await_exit(L, 5000) < 0)
+        die("server %d did not die of SIGKILL", L);
+    char path[2 * PATH_MAX];
+    snprintf(path, sizeof path, "%s/n%d/v%" PRIu32 "/REPL", base, L, num);
+    if (unlink(path) != 0)
+        die("unlink %s: %s", path, strerror(errno));
+    start(L);
+    uint64_t ts0 = now_ms();
+    await_log_count(L, "/REPL is missing: the volume is not opened", 1, 30000);
+    int via = (L + 1) % 3;
+    for (;;) {
+        if (vol_rec(via, "rf", &v) && v.epoch > e0)
+            break;
+        if (now_ms() - ts0 > 15000)
+            die("no new record of rf 15 s after its leader came back unable to open it (epoch %" PRIu64 ", leader %u): "
+                "the refused volume was not reported", v.epoch, v.leader);
+        usleep(20000);
+    }
+    uint64_t tr = now_ms();
+    int Nw = server_of(v.leader);
+    if (v.epoch != e0 + 1 || Nw < 0 || Nw > 2 || Nw == L)
+        die("the new record of rf: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    int fenced = 0;
+    for (int i = 0; i < 3; i++)
+        fenced += log_count(i, "(reason 4); fences");
+    if (!fenced)
+        die("the record moved to epoch %" PRIu64 " but no Raft leader promoted for a fault (reason 4)", v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 ": %s", v.epoch, ers(rc));
+    tsdbc_close(c);
+    printf("  leader %d restarted without its REPL: refused, reported, server %d leads epoch %" PRIu64 " %" PRIu64
+           " ms after the restart, with all %d acknowledged rows\n", L, Nw, v.epoch, tr - ts0, acked);
+    stop_all();
+}
+
+static void cut_file(int at, int from, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(at, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/cutfrom.%" PRIu32, ids[from]);
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s", f);
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT) {
+        die("unlink %s", f);
+    }
+}
+
+/* oneway (review F6): the case the fence-then-promote wait exists for. The volume leader L (not the Raft leader R) is
+ * cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks), drops every FENCE it receives and hears no
+ * volume record (TSDB_CLUSTER_TEST drop_fence_file=1), while its heartbeats still reach R: it stays UP, holds a lease
+ * and answers its clients. R moves the volume (the replicas report losing L) and may name the new leader only once L
+ * answered the fence or L's last lease has ended, and gives L no lease meanwhile; the move does not give up at
+ * PROMO_MOVE_NS while a replica answered (it did, and the ISR shrank to L alone with no new leader). A reader on L logs every read; once the new leader
+ * acknowledged its first write, no read sent to L after that ack may be answered (a stale read: L does not have the
+ * row). Mutants: fencelease (L keeps its lease: no promotion within 30 s), oldpass (the promotion goes ahead at once: L
+ * answers reads after the ack). */
+struct ow_read {
+    uint64_t sent;
+    int rc, kind, rows;
+};
+struct ow_reader {
+    int server;
+    tsdb_sid id;
+    struct ow_read *log;
+    size_t n, cap;
+    int stop; /* __atomic */
+};
+static void *ow_reader_thread(void *a)
+{
+    struct ow_reader *r = a;
+    tsdbc *c = client(r->server);
+    for (int k = 0; r->n < r->cap && !__atomic_load_n(&r->stop, __ATOMIC_RELAXED); k++) {
+        struct ow_read *e = &r->log[r->n];
+        e->kind = k % 3;
+        e->sent = now_ms();
+        e->rc = lease_read(c, r->id, e->kind, &e->rows);
+        r->n++;
+        usleep(200);
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+
+/* L leads `name` at e0 with `acked` rows of `id`, every server in its ISR: cut it one way (above), read on it through
+ * the promotion and check that no read sent after the new leader's first acknowledged write is answered; then the links
+ * come back and the new leader holds every row. replay: L sends again the fence answers it gave while it was promoted
+ * (oneway2). */
+static void ow_cut_promote(int L, const char *name, tsdb_sid id, int acked, uint32_t num, uint64_t e0, uint32_t old,
+                           int replay)
+{
+    struct meta_volume v;
+    int rc;
+    struct ow_reader rd = {.server = L, .id = id, .cap = 1u << 20};
+    if (!(rd.log = calloc(rd.cap, sizeof *rd.log)))
+        die("out of memory");
+    pthread_t th;
+    if (pthread_create(&th, NULL, ow_reader_thread, &rd) != 0)
+        die("pthread_create");
+    char df[PATH_MAX + 64];
+    server_dir(L, df, sizeof df);
+    strcat(df, "/state/dropfence");
+    FILE *fp = fopen(df, "w");
+    if (!fp)
+        die("create %s: %s", df, strerror(errno));
+    fclose(fp);
+    char rf[PATH_MAX + 64];
+    server_dir(L, rf, sizeof rf);
+    strcat(rf, "/state/replayreply");
+    if (replay) {
+        if (!(fp = fopen(rf, "w")))
+            die("create %s: %s", rf, strerror(errno));
+        fclose(fp);
+    }
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted(0, name, old, e0, &v);
+    uint64_t tp = now_ms();
+    if (Nw == L || Nw < 0 || Nw > 2)
+        die("the record of %s after the cut names node %u at epoch %" PRIu64, name, v.leader, v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    tsdbc *cn = client(Nw);
+    tsdbc_set_retry(cn, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(cn, id, &ts, &val, 1)) != 0)
+        die("the first write to the leader at epoch %" PRIu64 " (server %d): %s", v.epoch, Nw, ers(rc));
+    uint64_t tack = now_ms();
+    tsdbc_close(cn);
+    usleep(2000000); /* reads on L go on past the ack */
+    __atomic_store_n(&rd.stop, 1, __ATOMIC_RELAXED);
+    pthread_join(th, NULL);
+    size_t after = 0, answered = 0;
+    uint64_t last_ok = 0;
+    for (size_t i = 0; i < rd.n; i++) {
+        const struct ow_read *e = &rd.log[i];
+        if (e->rc == 0) {
+            answered++;
+            last_ok = e->sent;
+            int want = e->kind == 1 ? 1 : acked;
+            if (e->rows != want)
+                die("a read on the old leader (kind %d) %" PRIu64 " ms after the cut answered %d rows, not %d", e->kind,
+                    e->sent - t0, e->rows, want);
+        } else if (e->rc != TSDB_ERR_UNAVAILABLE && e->rc != TSDB_ERR_MOVED) {
+            die("a read on the old leader %" PRIu64 " ms after the cut: %s", e->sent - t0, ers(e->rc));
+        }
+        if (e->sent > tack) {
+            after++;
+            if (e->rc == 0)
+                die("a read sent to the old leader %" PRIu64 " ms after the new leader's first acknowledged write was "
+                    "answered (%" PRIu64 " ms after the cut, promotion seen at %" PRIu64 " ms): a stale read",
+                    e->sent - tack, e->sent - t0, tp - t0);
+        }
+    }
+    if (!after || !answered)
+        die("%zu reads on the old leader after the ack, %zu answered in all (%zu reads): the test saw nothing", after,
+            answered, rd.n);
+    free(rd.log);
+    unlink(df); /* L hears the record again: a write is MOVED */
+    unlink(rf);
+    tsdbc *co = client(L);
+    insert_expect_moved(co, id, 9500000, 1, (uint16_t)num, v.leader, v.epoch, "a write to the old leader");
+    tsdbc_close(co);
+    printf("  leader %d cut from its replicas, fences dropped, heartbeats whole: server %d leads epoch %" PRIu64
+           " %" PRIu64 " ms after the cut; %zu reads on %d, the last answered at %" PRIu64 " ms, none of %zu after the "
+           "new leader's first ack (%" PRIu64 " ms)\n", L, Nw, v.epoch, tp - t0, rd.n, L, last_ok - t0, after,
+           tack - t0);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    int got = rows_in(Nw, id, 1000000, 9000001, 30000);
+    if (got != acked + 1)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d rows, %d were acknowledged", v.epoch, Nw, got,
+            acked + 1);
+    await_isr(Nw, name, 3, 60000, "every server in the ISR once the links are back");
+}
+
+static void scen_oneway(void)
+{
+    scenario("oneway");
+    strict_reads = 1; /* every read on the leader (D5): a replica's reads are not the question here */
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        envs[i] = "drop_fence_file=1";
+    }
+    lease_cluster(3, 5000, 200000, 3000); /* L's lease runs 4 s past its last grant; R waits 6 s */
+    int L = -1, rc;
+    uint32_t num = 0;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && L < 0; k++) {
+        snprintf(name, sizeof name, "ow%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        int s = server_of(v.leader);
+        if (s >= 1 && s <= 2)
+            L = s;
+    }
+    if (L < 0)
+        die("eight volumes, every one led by the Raft leader");
+    for (int i = 0; i < 3; i++) /* every server opened it: a series made before L knows the volume is NOTFOUND */
+        await_open_gen(0, name, i, 1, 0);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int acked = 0;
+    for (; acked < 20; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, name, 3, 30000, "every replica in the ISR before the cut");
+    ow_cut_promote(L, name, id, acked, num, e0, old, 0);
+    stop_all();
+}
+
+/* oneway2 (review R2): a late answer to an earlier fence must not count as the old leader's answer now. Server 0 (the
+ * Raft leader) leads; its data links are cut and a replica N is promoted to e0 + 1, keeping a copy of its answer to
+ * fence e0 + 1 (TSDB_CLUSTER_TEST hold_reply_file=1). Once every server is back in the ISR, N is cut one way as in
+ * oneway and sends that old answer again every round: the promotion to e0 + 2 still waits for N's lease. Mutant
+ * anyepoch (an answer of any epoch counted) promotes at once and N answers reads after the new leader's first ack. */
+static void scen_oneway2(void)
+{
+    scenario("oneway2");
+    strict_reads = 1;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+        envs[i] = "drop_fence_file=1,hold_reply_file=1";
+    }
+    lease_cluster(3, 5000, 200000, 3000);
+    int rc, L0 = -1;
+    uint32_t num = 0;
+    char name[16];
+    struct meta_volume v;
+    for (int k = 0; k < 8 && L0 < 0; k++) {
+        snprintf(name, sizeof name, "ox%d", k);
+        if ((rc = vol_add(0, name, 3, &num)) != 0)
+            die("volume add %s: %s", name, cluster_strerror(rc));
+        if (!vol_rec(0, name, &v))
+            die("no record of %s", name);
+        if (server_of(v.leader) == 0)
+            L0 = 0;
+    }
+    if (L0 < 0)
+        die("eight volumes, none led by the Raft leader");
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, name, i, 1, 0);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(0);
+    tsdb_sid id = rep_series(c, rep_names[0], name, 30000);
+    int acked = 0;
+    for (; acked < 20; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(0, name, 3, 30000, "every replica in the ISR before the first cut");
+    char hf[3][PATH_MAX + 64];
+    for (int i = 1; i < 3; i++) {
+        server_dir(i, hf[i], sizeof hf[i]);
+        strcat(hf[i], "/state/holdreply");
+        FILE *fp = fopen(hf[i], "w");
+        if (!fp)
+            die("create %s: %s", hf[i], strerror(errno));
+        fclose(fp);
+    }
+    for (int i = 1; i < 3; i++) {
+        cut_file(0, i, 1);
+        cut_file(i, 0, 1);
+    }
+    int Nn = await_promoted(0, name, ids[0], e0, &v);
+    if (Nn < 1 || Nn > 2)
+        die("the record of %s after the first cut names node %u at epoch %" PRIu64, name, v.leader, v.epoch);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nn, lead, 1, 30000);
+    for (int i = 1; i < 3; i++) {
+        cut_file(0, i, 0);
+        cut_file(i, 0, 0);
+        unlink(hf[i]);
+    }
+    char kept[96];
+    snprintf(kept, sizeof kept, "keeps a copy of its answer to fence %" PRIu64 " of volume %" PRIu32, e0 + 1, num);
+    if (log_count(Nn, kept) < 1)
+        die("server %d led epoch %" PRIu64 " without keeping its answer to the fence (no \"%s\")", Nn, v.epoch, kept);
+    await_isr(Nn, name, 3, 60000, "every server in the ISR after the first promotion");
+    printf("  server %d leads epoch %" PRIu64 " after the first cut and replays its answer to fence %" PRIu64
+           " through the second\n", Nn, v.epoch, e0 + 1);
+    ow_cut_promote(Nn, name, id, acked, num, v.epoch, v.leader, 1);
+    stop_all();
+}
+
+/* manystuck (review F4): cutstuck with more volumes than the proposer's old fixed tables of 16. 72 volumes; the server
+ * other than the Raft leader that leads the most (more than 16) is cut from its replicas while they answer no fence: every move is given up and
+ * the leader deposed in all of them at once. Once the members answer, each must be taken as resigned and get a leader
+ * past its epoch: with 16 slots per table one was overwritten at random each round, and a deposed leader's 3 s timer
+ * rarely ran out (the old tables: the last taken as resigned 10 s, re-led 13 s after the members answer). */
+static void nofence_file(int at, int on);
+static void scen_manystuck(void)
+{
+    scenario("manystuck");
+    enum { NV = 72 };
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks,nofencereply";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static char names[NV][16];
+    uint32_t nums[NV];
+    uint64_t eps[NV];
+    int lead[NV], count[3] = {0};
+    int rc;
+    for (int k = 0; k < NV; k++) {
+        snprintf(names[k], sizeof names[k], "ms%d", k);
+        if ((rc = vol_add(0, names[k], 3, &nums[k])) != 0)
+            die("volume add %s: %s", names[k], cluster_strerror(rc));
+    }
+    for (int k = 0; k < NV; k++) {
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, names[k], i, 1, 0);
+        struct meta_volume v;
+        if (!vol_rec(0, names[k], &v))
+            die("no record of %s", names[k]);
+        lead[k] = server_of(v.leader);
+        eps[k] = v.epoch;
+        if (lead[k] < 0 || lead[k] > 2)
+            die("the leader of %s is node %u", names[k], v.leader);
+        count[lead[k]]++;
+    }
+    int L = count[2] > count[1] ? 2 : 1; /* not the Raft leader: cut, it would not move its volumes but fence them */
+    if (count[L] <= 16)
+        die("server %d leads %d of %d volumes, not more than 16", L, count[L], NV);
+    for (int k = 0; k < NV; k++)
+        if (lead[k] == L)
+            await_isr(L, names[k], 3, 30000, "every replica in the ISR before the cut");
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 1);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    char line[96];
+    for (int k = 0; k < NV; k++) /* every move given up and the old leader deposed, in each of its volumes */
+        if (lead[k] == L) {
+            snprintf(line, sizeof line, "volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to;",
+                     nums[k], eps[k]);
+            await_log_count(0, line, 1, 60000); /* server 0 is the Raft leader throughout */
+            snprintf(line, sizeof line, "volume %" PRIu32 ": deposed at epoch %" PRIu64 "", nums[k], eps[k]);
+            await_log_count(L, line, 1, 60000);
+        }
+    uint64_t tg = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 0);
+    /* the proposer's own decision, at most DEPOSED_HOLD_NS (3 s) after each move was given up: 6 s. A new leader's
+     * reopen of 24 volumes at once may take longer on a loaded host: 30 s for those */
+    int left = count[L];
+    uint64_t taken[NV] = {0}, tlast = 0;
+    for (; left > 0; usleep(100000)) {
+        for (int k = 0; k < NV; k++) {
+            if (lead[k] != L || taken[k])
+                continue;
+            snprintf(line, sizeof line, "volume %" PRIu32 ": leader %" PRIu32 " of epoch %" PRIu64 " is up but",
+                     nums[k], ids[L], eps[k]);
+            if (log_count(0, line) > 0) {
+                taken[k] = tlast = now_ms();
+                left--;
+            }
+        }
+        if (left > 0 && now_ms() - tg > 6000) {
+            for (int k = 0; k < NV; k++)
+                if (lead[k] == L && !taken[k])
+                    die("%d of the %d volumes server %d led are not taken as its resignation 6 s after the members "
+                        "answer again (%s among them): the proposer lost their deposed time", left, count[L], L,
+                        names[k]);
+        }
+    }
+    left = count[L];
+    uint64_t done[NV] = {0};
+    for (; left > 0; usleep(100000)) {
+        for (int k = 0; k < NV; k++) {
+            struct meta_volume v;
+            if (lead[k] != L || done[k] || !vol_rec(0, names[k], &v) || v.epoch <= eps[k])
+                continue;
+            int Nw = server_of(v.leader);
+            snprintf(line, sizeof line, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", nums[k], v.epoch);
+            if (Nw >= 0 && Nw <= 2 && log_count(Nw, line) > 0) {
+                done[k] = now_ms();
+                left--;
+            }
+        }
+        if (left > 0 && now_ms() - tg > 30000) {
+            for (int k = 0; k < NV; k++)
+                if (lead[k] == L && !done[k])
+                    die("%d of the %d volumes server %d led have no leader past their epoch 30 s after the members "
+                        "answer again (%s among them)", left, count[L], L, names[k]);
+        }
+    }
+    uint64_t last = 0;
+    for (int k = 0; k < NV; k++)
+        if (done[k] > last)
+            last = done[k];
+    printf("  server %d led %d of %d volumes; cut, every move given up, deposed in all %" PRIu64 " ms after the cut; "
+           "each taken as resigned, the last %" PRIu64 " ms, and has a new leader, the last %" PRIu64 " ms after the "
+           "members answer again\n", L, count[L], NV, tg - t0, tlast - tg, last - tg);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    stop_all();
+}
+
+/* A leader cut from its replicas on the data links (TSDB_REPLD_TEST=cutlinks; the peer port, heartbeats and the Raft
+ * group stay whole) asks to shrink the ISR to itself; the Raft leader, which hears the replicas and reads in their
+ * heartbeats that they lost the leader, moves the leadership to one of them instead (design-cluster.md 6.1): no ISR of
+ * one member at the old epoch, a replica leads e+1 with every acknowledged row, a write to the old leader is MOVED, and
+ * the old leader rejoins once the links are back. TSDB_CLUSTER_MUTANT=cutshrinks (the shrink proposed) fails it. */
+/* cut, and cuthold (review R13): the replicas report the cut leader unreachable only after 1.8 s (TSDB_CVOL_TEST
+ * unreach_ms), later than the leader asks to drop them (unanswered_ms), so the Raft leader must hold that shrink
+ * below 2 (cut_move, CUT_HOLD_NS) until the report comes; mutant nocuthold shrinks the ISR to the cut leader alone,
+ * and no replica is promoted. */
+static void cut_run(int late)
+{
+    for (int i = 0; i < 3; i++) {
+        penv[i] = late ? "TSDB_REPLD_TEST=cutlinks TSDB_CVOL_TEST=unreach_ms=1800" : "TSDB_REPLD_TEST=cutlinks";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 0); /* the MOVED below is to be seen, not followed */
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    /* A replica still connecting while the 50 writes run may leave the ISR and come back: only shrinks after the cut
+     * count (clus8, 2026-11-19: ISR version 2 of one member at commit point 54, before the cut). */
+    char line[96];
+    snprintf(line, sizeof line, "ISR of 1 members (epoch %" PRIu64 ",", e0);
+    int shrunk0 = 0;
+    for (int i = 0; i < 3; i++)
+        shrunk0 += log_count(i, line);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted((L + 1) % 3, "rs", old, e0, &v);
+    uint64_t tm = now_ms();
+    if (v.epoch != e0 + 1 || Nw == L)
+        die("the record of rs after the cut: epoch %" PRIu64 " (was %" PRIu64 "), leader %u", v.epoch, e0, v.leader);
+    int moved = 0, shrunk = -shrunk0;
+    for (int i = 0; i < 3; i++) {
+        moved += log_count(i, "(reason 3); fences");
+        shrunk += log_count(i, line);
+    }
+    if (shrunk || !moved)
+        die("the cut leader's ISR: %d proposals of one member at epoch %" PRIu64 ", %d moves (want 0 and 1 at least)",
+            shrunk, e0, moved);
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(Nw, lead, 1, 30000);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    insert_expect_moved(c, id, 5000000, 1, (uint16_t)num, v.leader, v.epoch, "a write to the cut-off old leader");
+    tsdbc_close(c);
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 ": %s", v.epoch, ers(rc));
+    tsdbc_close(c);
+    printf("  leader %d cut from its replicas: server %d leads epoch %" PRIu64 " %" PRIu64 " ms after the cut, with all "
+           "%d acknowledged rows; no ISR of one\n", L, Nw, v.epoch, tm - t0, acked);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    await_isr(Nw, "rs", 3, 60000, "every server in the ISR once the links are back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the cut");
+}
+
+static void scen_cut(void)
+{
+    scenario("cut");
+    cut_run(0);
+}
+
+static void scen_cuthold(void)
+{
+    scenario("cuthold");
+    cut_run(1);
+}
+
+/* readdepose (int-r review F1): a read on the leader L of a replicated volume, admitted under its lease and the
+ * volume led here, then held before its snapshot (TSDBD_TEST_READ_STALL), while L is deposed: cut from its replicas on
+ * the data links (TSDB_REPLD_TEST=cutlinks), the group moves the volume and L, fenced, reopens its engine as a
+ * replica at REPL's floor ("a replica again"). L's lease goes on (its heartbeats reach the Raft leader), so a check of
+ * the lease alone lets the read through to the replica engine, which may lie below writes acknowledged before the
+ * read was sent. Once the stall ends the read must be refused (UNAVAILABLE or MOVED), never answered: a raw query (the
+ * single-volume path) and a QUERY_LATEST and a QUERY_MULTI (the ids path). Strict reads (D5), as in production.
+ * TSDB_REPLD_MUTANT=leadnow (the check before the fix: a lapse on a volume led now) fails it. */
+struct held_read {
+    int server, kind;
+    tsdb_sid id;
+    int rc, rows;
+    atomic_int done;
+};
+static void *held_read_thread(void *a)
+{
+    struct held_read *h = a;
+    tsdbc *c = client(h->server);
+    tsdbc_set_retry(c, 0); /* the first answer, not a followed one */
+    h->rc = lease_read(c, h->id, h->kind, &h->rows);
+    tsdbc_close(c);
+    atomic_store(&h->done, 1);
+    return NULL;
+}
+
+static void scen_readdepose(void)
+{
+    scenario("readdepose");
+    strict_reads = 1; /* the production path: reads only on the leader (D5) */
+    static char pe[3][PATH_MAX + 128];
+    char stall[3][PATH_MAX + 64];
+    for (int i = 0; i < 3; i++) {
+        snprintf(stall[i], sizeof stall[i], "%s/rstall-n%d", base, i);
+        unlink(stall[i]);
+        snprintf(pe[i], sizeof pe[i], "TSDB_REPLD_TEST=cutlinks TSDBD_TEST_READ_STALL=%s", stall[i]);
+        penv[i] = pe[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rd", 3, &num)) != 0 || num != 1)
+        die("volume add rd: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rd", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rd", &v))
+        die("no record of rd");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rd is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rd", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) { /* W0: acknowledged before any read below was sent */
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, "rd", 3, 30000, "every replica in the ISR before the reads");
+    int got = rows_in(L, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader %d answers %d of the %d acknowledged rows before the stall", L, got, acked);
+    int fd = open(stall[L], O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+        die("create %s: %s", stall[L], strerror(errno));
+    close(fd);
+    struct held_read h[3];
+    pthread_t th[3];
+    for (int k = 0; k < 3; k++) {
+        h[k] = (struct held_read){.server = L, .kind = k, .id = id, .rc = 1};
+        atomic_init(&h[k].done, 0);
+        if (pthread_create(&th[k], NULL, held_read_thread, &h[k]) != 0)
+            die("pthread_create");
+    }
+    nanosleep(&(struct timespec){0, 500000000}, NULL);
+    for (int k = 0; k < 3; k++)
+        if (atomic_load(&h[k].done))
+            die("read kind %d on the leader %d came back (%s) before its stall ended: not admitted", k, L,
+                ers(h[k].rc));
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    int Nw = await_promoted((L + 1) % 3, "rd", old, e0, &v);
+    char deposed[64];
+    snprintf(deposed, sizeof deposed, "deposed at epoch %" PRIu64 ":", e0);
+    await_log_count(L, deposed, 1, 30000);
+    await_log_count(L, "a replica again", 1, 30000); /* the demotion's reopen: the engine is a replica's now */
+    unlink(stall[L]);
+    for (int k = 0; k < 3; k++)
+        pthread_join(th[k], NULL);
+    static const char *const kn[3] = {"a raw query", "QUERY_LATEST", "QUERY_MULTI"};
+    for (int k = 0; k < 3; k++) {
+        if (h[k].rc == 0)
+            die("%s admitted on the leader %d under its lease and held while it was deposed answered (%d rows%s) from "
+                "the replica engine of its demotion", kn[k], L, h[k].rows,
+                h[k].kind == 0 && h[k].rows < acked ? ", fewer than the acknowledged" : "");
+        if (h[k].rc != TSDB_ERR_UNAVAILABLE && h[k].rc != TSDB_ERR_MOVED)
+            die("%s held across the deposal of its leader got %s, not UNAVAILABLE or MOVED", kn[k], ers(h[k].rc));
+    }
+    printf("  reads admitted on leader %d and held across its deposal (server %d leads epoch %" PRIu64 "): refused "
+           "(%s, %s, %s)\n", L, Nw, v.epoch, ers(h[0].rc), ers(h[1].rc), ers(h[2].rc));
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    stop_all();
+}
+
+static void nofence_file(int at, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(at, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/nofencereply");
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s", f);
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT) {
+        die("unlink %s", f);
+    }
+}
+
+/* cutstuck (jepsen-cluster meta,classes kill, 2026-11-19: kvr had no writer for the second half of the run): a move of
+ * the leadership away from a cut leader (cut) fences every ISR member, the old leader too, which answers and is
+ * deposed; when no candidate answers (TSDB_REPLD_TEST=nofencereply on the replicas: they save the fence and say
+ * nothing, as a member killed before its answer) the Raft leader gives the move up, and the record still names the old
+ * leader at the old epoch while its core waits for a record past its fence. The group must take that as the old
+ * leader's resignation and promote again once the members answer: a leader past the old epoch, which accepts a write
+ * and holds every acknowledged row. TSDB_CLUSTER_MUTANT=deposedstuck (never taken as resigned) fails it. */
+static void scen_cutstuck(void)
+{
+    scenario("cutstuck");
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=cutlinks,nofencereply";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rs", 3, &num)) != 0 || num != 1)
+        die("volume add rs: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rs", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rs", &v))
+        die("no record of rs");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rs is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rs", 30000);
+    int acked = 0;
+    for (; acked < 50; acked++) {
+        int64_t ts = 1000000 + 1000LL * acked;
+        float val = (float)acked;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", acked, ers(rc));
+    }
+    tsdbc_close(c);
+    await_isr(L, "rs", 3, 30000, "every replica in the ISR before the cut");
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 1);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 1);
+            cut_file(i, L, 1);
+        }
+    char gaveup[96], deposed[64];
+    snprintf(gaveup, sizeof gaveup, "no replica to move the leadership of epoch %" PRIu64 " to;", e0);
+    snprintf(deposed, sizeof deposed, "deposed at epoch %" PRIu64 ":", e0);
+    for (int n = 0; n < 1;) {
+        n = 0;
+        for (int i = 0; i < 3; i++)
+            n += log_count(i, gaveup);
+        if (now_ms() - t0 > 30000)
+            die("no Raft leader gave the move of the cut leader up in 30 s");
+        usleep(50000);
+    }
+    await_log_count(L, deposed, 1, 10000);
+    uint64_t tg = now_ms();
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            nofence_file(i, 0);
+    /* a leader past e0 that leads (the old one may be granted e + 1 first and moved from again while it promotes) */
+    int Nw = -1;
+    for (char lead[64];; usleep(50000)) {
+        if (vol_rec(L, "rs", &v) && v.epoch > e0 && (Nw = server_of(v.leader)) >= 0 && Nw <= 2) {
+            snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+            if (log_count(Nw, lead) > 0)
+                break;
+        }
+        if (now_ms() - tg > 30000)
+            die("rs has no leader past epoch %" PRIu64 " 30 s after the move was given up (record: leader %u at epoch "
+                "%" PRIu64 "): the deposed leader is still named", e0, v.leader, v.epoch);
+    }
+    uint64_t tl = now_ms();
+    c = client(Nw);
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the leader at epoch %" PRIu64 " (server %d): %s", v.epoch, Nw, ers(rc));
+    tsdbc_close(c);
+    int got = rows_in(Nw, id, 1000000, 1000000 + 1000LL * acked, 30000);
+    if (got != acked)
+        die("the leader at epoch %" PRIu64 " (server %d) holds %d of the %d acknowledged rows", v.epoch, Nw, got, acked);
+    printf("  the move away from cut leader %d given up %llu ms after the cut (the old leader deposed); server %d leads "
+           "epoch %" PRIu64 " %llu ms after the members answer again, with all %d acknowledged rows\n", L,
+           (unsigned long long)(tg - t0), Nw, v.epoch, (unsigned long long)(tl - tg), acked);
+    for (int i = 0; i < 3; i++)
+        if (i != L) {
+            cut_file(L, i, 0);
+            cut_file(i, L, 0);
+        }
+    await_isr(Nw, "rs", 3, 60000, "every server in the ISR once the links are back");
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {0};
+    wantr[0] = (uint64_t)acked + 1;
+    rep_same(wantr, "after the cut and the given-up move");
+}
+
+/* No ISR member up (design-cluster.md 6.2): a replica outside the ISR is up, but the group cannot promote it. Clients
+ * get UNAVAILABLE(NO_OWNER) from it (not MOVED to the dead leader), the leader of the group says NO_OWNER, and
+ * `tsdb cluster volume force-leader` makes the replica the leader at e + 1: its rows stand, the rows the old ISR
+ * acknowledged after the cut are lost (unclean, said so), and the old members return and are cut to its history. Two
+ * witnesses keep the metadata group's majority with two of the three data servers dead. */
+static void scen_noowner(void)
+{
+    scenario("noowner");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+    for (int i = 3; i < 5; i++) {
+        is_witness[i] = 1;
+        xargs[i] = "--peer-port 0"; /* a witness takes the peer port 7071 unless told */
+        char wdir[PATH_MAX + 80];
+        server_dir(i, wdir, sizeof wdir);
+        if (mkdir(wdir, 0755) != 0)
+            die("mkdir %s: %s", wdir, strerror(errno));
+    }
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters, two of them witnesses");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "nw", 3, &num)) != 0 || num != 1)
+        die("volume add nw: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "nw", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "nw", &v))
+        die("no record of nw");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of nw is node %u", v.leader);
+    int Cs = (L + 1) % 3, B = (L + 2) % 3;
+    uint32_t old = v.leader;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "nw", 30000);
+    enum { BEFORE = 20, AFTER = 10 };
+    await_isr(L, "nw", 3, 30000, "every replica in the ISR");
+    for (int j = 0; j < BEFORE; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s", j, ers(rc));
+    }
+    for (uint64_t t1 = now_ms(); rows_in(Cs, id, 1000000, 1000000 + 1000LL * BEFORE, 30000) != BEFORE; usleep(50000))
+        if (now_ms() - t1 > 30000)
+            die("server %d does not hold the %d rows written with every replica in the ISR", Cs, BEFORE);
+    cut_file(L, Cs, 1);
+    cut_file(Cs, L, 1);
+    await_isr(L, "nw", 2, 30000, "the cut replica out of the ISR");
+    for (int j = BEFORE; j < BEFORE + AFTER; j++) {
+        int64_t ts = 1000000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d with ISR {leader, server %d}: %s", j, B, ers(rc));
+    }
+    tsdbc_close(c);
+    if (!vol_rec(Cs, "nw", &v))
+        die("no record of nw");
+    uint64_t e0 = v.epoch;
+    { /* while an ISR member is up the group promotes by itself: force-leader is refused and moves nothing (review R6) */
+        uint8_t freq[8], *frep = NULL;
+        size_t flen = 0, frl = cluster_volume_force_encode(num, ids[Cs], freq);
+        rc = admin(Cs, CLUSTER_OP_VOLUME_FORCE, freq, frl, 1, &frep, &flen);
+        if (rc != CLUSTER_ERR_STATE)
+            die("force-leader of server %d with ISR {leader, server %d} up: %s, not refused (%.*s)", Cs, B,
+                cluster_strerror(rc), (int)flen, frep ? (const char *)frep : "");
+        printf("  force-leader with the ISR up: refused (%.*s)\n", (int)flen, frep ? (const char *)frep : "");
+        free(frep);
+        if (!vol_rec(Cs, "nw", &v) || v.epoch != e0 || v.leader != old)
+            die("a refused force-leader moved nw (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+    }
+    stop(L, SIGKILL);
+    stop(B, SIGKILL);
+    uint64_t t0 = now_ms();
+    c = client(Cs);
+    tsdbc_set_retry(c, 0);
+    for (;; usleep(50000)) {
+        int64_t ts = 8000000;
+        float val = 1;
+        rc = tsdbc_insert_series(c, id, &ts, &val, 1);
+        tsdb_unavail e;
+        unsigned ne = 0;
+        if (rc == TSDB_ERR_UNAVAILABLE && tsdbc_unavailable(c, &e, 1, &ne) == 0 && ne == 1 &&
+            e.reason == TSDB_WHY_NO_OWNER)
+            break;
+        if (rc == 0)
+            die("server %d acknowledged a write with no ISR member up", Cs);
+        if (now_ms() - t0 > 30000)
+            die("no UNAVAILABLE(NO_OWNER) from server %d 30 s after its ISR died (last: %s)", Cs, ers(rc));
+    }
+    int said = 0;
+    for (uint64_t t1 = now_ms(); !said; usleep(50000)) {
+        for (int i = 0; i < 5; i++)
+            if (i != L && i != B)
+                said += log_count(i, "NO_OWNER: no ISR member answers");
+        if (!said && now_ms() - t1 > 30000)
+            die("the leader of the group never said NO_OWNER");
+    }
+    if (!vol_rec(Cs, "nw", &v) || v.epoch != e0 || v.leader != old)
+        die("the record of nw moved with no ISR member up (epoch %" PRIu64 ", leader %u)", v.epoch, v.leader);
+    uint8_t req[8], *reply = NULL;
+    size_t len = 0;
+    uint32_t cnode = ids[Cs];
+    size_t rl = cluster_volume_force_encode(num, cnode, req);
+    if ((rc = admin(Cs, CLUSTER_OP_VOLUME_FORCE, req, rl, 1, &reply, &len)) != 0)
+        die("force-leader %" PRIu32 " %" PRIu32 ": %s (%.*s)", num, cnode, cluster_strerror(rc), (int)len,
+            reply ? (const char *)reply : "");
+    printf("  force-leader: %.*s\n", (int)len, (const char *)reply);
+    free(reply);
+    int Nw = await_promoted(Cs, "nw", old, e0, &v);
+    if (Nw != Cs || v.epoch != e0 + 1)
+        die("after force-leader: leader server %d at epoch %" PRIu64 " (want %d at %" PRIu64 ")", Nw, v.epoch, Cs,
+            e0 + 1);
+    await_isr(Cs, "nw", 1, 30000, "the dead members out of the forced leader's ISR (unanswered)");
+    int logged = 0;
+    for (uint64_t t1 = now_ms(); !logged; usleep(50000)) {
+        for (int i = 0; i < 5; i++)
+            if (i != L && i != B)
+                logged += log_count(i, "it holds every write acknowledged before that shrink");
+        if (!logged && now_ms() - t1 > 10000)
+            die("no log line compares the forced leader's end with the last shrink's commit point");
+    }
+    tsdbc_set_retry(c, 10000);
+    int64_t ts = 9000000;
+    float val = 7;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the forced leader: %s", ers(rc));
+    tsdbc_close(c);
+    int got = rows_in(Cs, id, 1000000, 1000000 + 1000LL * (BEFORE + AFTER), 30000);
+    if (got != BEFORE)
+        die("the forced leader holds %d rows of the first %d, want exactly the %d written before the cut", got,
+            BEFORE + AFTER, BEFORE);
+    printf("  no ISR member up: NO_OWNER %" PRIu64 " ms after the kill; force-leader made server %d leader at epoch "
+           "%" PRIu64 " with the %d rows from before the cut (the %d after it are lost, as said)\n",
+           now_ms() - t0, Cs, v.epoch, BEFORE, AFTER);
+    cut_file(L, Cs, 0);
+    cut_file(Cs, L, 0);
+    /* An old member whose REPL floor had reached rows past the forced leader's history (committed at epoch e0)
+     * reopens with them applied: it cannot cut below what it applied, so it stops the volume, loudly, rather than
+     * rejoin with rows the leader lacks (rebuilding it from the leader is not built). One whose floor was still at or
+     * below the forced leader's start (the floor is saved after the commit point moves, and the kill came right after
+     * the last acknowledgement; jc5, 2026-11-20) reopens without them, cuts its log there and rejoins: then it must
+     * hold exactly the forced leader's rows, none of the lost ones. Either way per member. */
+    start(L);
+    start(B);
+    int olds[2] = {L, B}, stopped[2] = {0, 0}, joined[2] = {0, 0};
+    for (uint64_t t1 = now_ms();; usleep(50000)) {
+        if (!vol_rec(Cs, "nw", &v))
+            die("no record of nw");
+        int left = 0;
+        for (int k = 0; k < 2; k++) {
+            stopped[k] = log_count(olds[k], "stopped: a cut below the applied end") > 0;
+            joined[k] = 0;
+            for (uint32_t j = 0; j < v.nisr; j++)
+                joined[k] |= v.isr[j] == ids[olds[k]];
+            if (stopped[k] && joined[k])
+                die("server %d stopped at a cut below its applied end and is in the ISR", olds[k]);
+            left += !stopped[k] && !joined[k];
+        }
+        if (!left)
+            break;
+        if (now_ms() - t1 > 60000)
+            die("60 s after the old members returned: server %d %s, server %d %s (want each stopped or in the ISR)",
+                L, stopped[0] ? "stopped" : joined[0] ? "joined" : "neither", B,
+                stopped[1] ? "stopped" : joined[1] ? "joined" : "neither");
+    }
+    if (v.leader != ids[Cs] || v.nisr != 1u + (unsigned)joined[0] + (unsigned)joined[1])
+        die("after the old members returned: leader %u, ISR of %u (want %u and the %d that rejoined)", v.leader,
+            v.nisr, ids[Cs], joined[0] + joined[1]);
+    c = client(Cs);
+    tsdbc_set_retry(c, 10000);
+    ts = 9001000;
+    if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+        die("a write to the forced leader after the old members returned: %s", ers(rc));
+    tsdbc_close(c);
+    if ((got = rows_in(Cs, id, 0, INT64_MAX, 30000)) != BEFORE + 2)
+        die("the forced leader holds %d rows, want %d", got, BEFORE + 2);
+    for (int k = 0; k < 2; k++) {
+        if (!joined[k])
+            continue;
+        uint64_t t1 = now_ms();
+        while ((got = rows_in(olds[k], id, 0, INT64_MAX, 30000)) != BEFORE + 2 && now_ms() - t1 < 30000)
+            usleep(100000);
+        if (got != BEFORE + 2)
+            die("server %d rejoined the forced leader's ISR and holds %d rows, want its %d", olds[k], got, BEFORE + 2);
+        if ((got = rows_in(olds[k], id, 1000000 + 1000LL * BEFORE, 1000000 + 1000LL * (BEFORE + AFTER), 30000)) != 0)
+            die("server %d rejoined and holds %d of the %d rows lost with the force", olds[k], got, AFTER);
+    }
+    printf("  the old members returned: server %d %s, server %d %s (a cut below the applied end stops; a member that "
+           "had not applied past the forced leader's start cuts and rejoins without the lost rows)\n",
+           L, stopped[0] ? "stopped" : "rejoined", B, stopped[1] ? "stopped" : "rejoined");
     stop_all();
 }
 
@@ -7411,8 +9700,8 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
-               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
     int n = (int)(sizeof all / sizeof all[0]);

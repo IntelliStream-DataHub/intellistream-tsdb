@@ -55,6 +55,10 @@ enum cluster_admin_op {
      * (META_ERR_NOTFOUND without a body). An empty name lists: u32 n, n x {u16 name length, the name, u32 uid, u64
      * version} */
     CLUSTER_OP_USER_GET = 7,
+    CLUSTER_OP_VOLUME_FORCE = 8, /* body: u32 volume, u32 node; on the Raft leader. While no ISR member of the volume
+                                  * is up (NO_OWNER), puts the replica on `node` into its ISR, so that the next
+                                  * promotion fences it and picks it: an unclean election (design-cluster.md 6.2).
+                                  * Reply: text for the operator (the proposal is made; the promotion follows) */
 };
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
@@ -73,7 +77,9 @@ const char *cluster_strerror(int rc);
 enum cluster_mode { CLUSTER_MODE_NONE = 0, CLUSTER_MODE_CORE = 1, CLUSTER_MODE_WATCH = 2 };
 /* ---- what a server reports in its heartbeat besides its address: sections (docs/design-ha-modes.md §7.1 item 1) */
 
-enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2 };
+/* PROMOTING: named the record's leader, its driver not the writer yet (the EPOCH marker's commit, the reopen); the
+ * report's epoch is then the epoch it promotes to */
+enum cluster_vol_role { CL_ROLE_NONE = 0, CL_ROLE_OWNER = 1, CL_ROLE_RELEASING = 2, CL_ROLE_PROMOTING = 3 };
 enum cluster_vol_health { CL_HEALTH_OK = 0, CL_HEALTH_LOCAL_FAULT = 1, CL_HEALTH_DOMAIN_FAULT = 2 };
 enum cluster_dom_state { CL_DOM_OK = 0, CL_DOM_SLOW = 1, CL_DOM_FAULT = 2 };
 #define CLUSTER_REPORT_VOLS 256
@@ -164,6 +170,22 @@ void cluster_set_peerlink(struct peerlink *pl);
  * shutdown order above. -1 for PL_KIND_META (the cluster thread's own) or a kind out of range, else 0. */
 #define CLUSTER_PL_KINDS 8
 int cluster_set_peerlink_kind(int kind, struct peerlink *pl);
+
+/* Promotion (design-cluster.md 6.2, r3e-failover). The Raft leader sends FENCE(v, fence) to the reachable ISR members of
+ * a volume whose leader is gone; the cluster thread hands it to the handler (repld_fence), whose core saves the fence
+ * before it answers. The answer, and a restarted leader's RESIGN, go back through cluster_vol_msg (any thread: queued
+ * and sent by the cluster thread, to `to`, or the Raft leader when 0). */
+enum { CL_VMSG_FENCE_REPLY = 1, CL_VMSG_RESIGN = 2 };
+struct cluster_vmsg {
+    uint8_t kind;
+    uint32_t volume;
+    uint64_t epoch; /* FENCE_REPLY: the fence answered; RESIGN: the epoch resigned */
+    uint64_t durable, last_epoch, rid, start;
+    uint32_t to;
+};
+void cluster_vol_msg(const struct cluster_vmsg *m);
+typedef void (*cluster_fence_fn)(void *arg, uint32_t volume, uint64_t fence, uint32_t from);
+void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
 /* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
  * server is in no cluster yet (id 0). */
 struct cluster_self {
@@ -183,6 +205,7 @@ struct cluster_vol_rec {
     uint8_t uuid[16], cluster[16];
     uint32_t leader; /* the record's leader (rep[0] at VOLUME_ADD): the writer */
     uint64_t epoch;
+    char leader_addr[META_ADDR_MAX]; /* its client address as the member list holds it ("" unknown): MOVED names it */
     uint64_t rid, open_gen; /* this server's replica: its instance and the last REPLICA_OPEN generation committed */
     uint64_t open_nonce;    /* and the nonce committed with it */
     /* replication (server/repld.c): the replicas in record order (the node index of the core, src/repl.h, is the
@@ -192,12 +215,14 @@ struct cluster_vol_rec {
         uint32_t node;
         uint64_t rid;
         uint8_t learner;
+        uint8_t unanswered; /* kept in the ISR by the last promotion without a fence reply (meta.h; repl.h unanswered) */
         char peer[META_ADDR_MAX];
     } rep[META_REPLICAS_MAX];
     uint32_t nisr;
     uint32_t isr[META_REPLICAS_MAX]; /* node ids */
     uint64_t isr_version;
-    uint32_t min_isr, isr_lag_ms;
+    uint32_t min_isr, isr_lag_ms, unanswered_ms;
+    uint8_t no_owner; /* no ISR member is up in the group's view: UNAVAILABLE(NO_OWNER), not MOVED to a dead leader */
     uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
@@ -373,6 +398,7 @@ void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *cons
 
 /* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
+size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out); /* 8 bytes */
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

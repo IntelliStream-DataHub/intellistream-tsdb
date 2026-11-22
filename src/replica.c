@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct rseg {
@@ -85,10 +86,13 @@ struct replica {
     uint64_t epoch, epoch_pos; /* the newest EPOCH marker applied (0: none): its epoch and position */
     _Atomic uint64_t floor_saved;
     _Atomic int64_t now_ms; /* the replicated retention clock: the newest commit_ms / NOW applied, never the wall clock */
-    struct {
-        uint64_t seq, fno_end;
+    struct unlseg {
+        uint64_t seq, fno_end, bytes, ms; /* ms: CLOCK_MONOTONIC when it was flushed (or found at the open) */
     } *unl; /* flushed segments not yet unlinked, ascending (unl_mu) */
     size_t nunl, capunl;
+    /* the retention caps (replica_keep_cap; design-cluster.md 8.3): unset, a segment goes once the floor passes it */
+    _Atomic bool keep_set;
+    _Atomic uint64_t keep_bytes, keep_ms;
     int rfd; /* the segment the cursor reads (-1: none) */
     uint64_t rfd_seq;
     uint8_t *rbuf;
@@ -119,6 +123,7 @@ struct replica {
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
 static int rs_load(eng *db, struct rstate *rs);
 static int open_scan(eng *db, struct replica *rp);
+static void open_unl_parts(struct replica *rp);
 
 void replica_now_advance(eng *db, int64_t ms)
 {
@@ -200,8 +205,19 @@ static void rfd_close(struct replica *rp)
 
 /* ------------------------------------------------------------------- open */
 
+/* The caps for the replica the next eng_open_replica on this thread opens (the driver's, from the volume's settings):
+ * its open replays and flushes the segments it finds, and they must not go by the floor alone before the driver's
+ * first save sets the caps (a deposed writer reopened as a replica lost the segments a laggard needed that way) */
+static __thread struct {
+    bool set;
+    uint64_t bytes, ms;
+} keep_next;
+
 int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
 {
+    bool keep_set = keep_next.set;
+    uint64_t keep_b = keep_next.bytes, keep_ms = keep_next.ms;
+    keep_next.set = false; /* one open only, failed or not */
     if (db->feed_req || atomic_load(&db->feed_on)) {
         /* a retained segment (fwal_) is kept for the feed instead of unlinked: the replica unlinks flushed segments and
          * ignores fwal_ names in its numbering, which would break that invariant silently. Not designed yet. */
@@ -217,6 +233,9 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     pthread_mutex_init(&rp->stage_mu, NULL);
     pthread_mutex_init(&rp->apply_mu, NULL);
     rp->rfd = -1;
+    atomic_store(&rp->keep_bytes, keep_b);
+    atomic_store(&rp->keep_ms, keep_ms);
+    atomic_store(&rp->keep_set, keep_set);
     db->rp = rp; /* from here wal_check_segment lets rows name series that SERIES does not hold yet */
 
     wal_seg *segs = NULL;
@@ -257,9 +276,22 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     if (nseg)
         qsort(segs, nseg, sizeof *segs, cmp_seg);
 
-    uint64_t parts_seq = 0;
-    for (size_t i = 0; i < db->nparts; i++)
+    uint64_t parts_seq = 0, parts_fno = 0;
+    for (size_t i = 0; i < db->nparts; i++) {
         parts_seq = MAX(parts_seq, db->parts[i]->wal_seq);
+        parts_fno = MAX(parts_fno, db->parts[i]->fno_hi);
+    }
+    /* RSTATE's `kept`: the newest segment a leader flushed (leader_rs_kept, saved before the segment can go) or a
+     * promotion found flushed. It names a segment whose records are all markers, which no part's wal_seq or fno_hi
+     * reaches (below). Read here as well as in the open below: the gap check needs it before anything is listed. */
+    uint64_t kept_seq = 0;
+    {
+        struct rstate rs0 = {0};
+        rc = rs_load(db, &rs0);
+        free(rs0.drops);
+        if (rc == 0 && eng_test_mutant != MUT_REPLICA_GAP_NO_KEPT)
+            kept_seq = rs0.kept;
+    }
     for (size_t k = 0; k < nseg && rc == 0; k++)
         rc = wal_check_segment(db, &segs[k]);
     if (rc == 0)
@@ -271,6 +303,46 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
          * wrong log end would make it ack positions it does not hold. It is rebuilt (8.1). */
         fprintf(stderr, "tsdb: %s: FNO has a damaged slot: a replica cannot tell its log end, rebuild it\n", db->dir);
         rc = TSDB_ERR_CORRUPT;
+    }
+    /* A gap below what the parts and the floor hold is a removal a power loss interrupted, not damage: flushed segments
+     * go in batches with one directory fsync after each (unlink_due), and a file system may keep a later unlink of a
+     * batch and lose an earlier one (jepsen-cluster power, 2026-11-20: a promoted replica's old segment of position 1
+     * came back beside the rest of its retained log, and every later open refused the volume for good). The segments
+     * before such a gap hold only rows the parts hold: they go now, before anything is listed, so the log starts after
+     * the gap and a laggard below it is sent a snapshot. A gap above the parts or the floor stays damage (below).
+     * "Below the parts" is either the segment numbers (the one before the segment after the gap was flushed) or, where
+     * the numbers jump at a promotion (epoch << 40) and the old epoch's last number is unknown, the positions: a part
+     * holds the row just before the gap's end, and a flush takes every row of the segments it seals, in segment order
+     * (jepsen-cluster power, 2026-11-20: a promoted leader's flushed epoch-1 segments went in part, wal_..20000000000
+     * followed the gap, and its open refused the volume for good). A marker as the gap's last record fails the positions;
+ * RSTATE's `kept` then says the missing segment was flushed (jepsen-cluster power, 2026-11-20: a promoted leader's
+ * first segment held only its EPOCH marker; the unlink of it and of the epoch-1 segments went in one batch, a power
+ * loss kept the first and lost one of the others, and every open refused the volume for good). */
+    if (rc == 0 && eng_test_mutant != MUT_REPLICA_NO_LEFTOVER_DROP) {
+        size_t lo = 0;
+        uint64_t prev_end = 0;
+        for (size_t k = 0; k < nseg; k++) {
+            if (!segs[k].fno_first)
+                continue;
+            if (prev_end && segs[k].fno_first > prev_end &&
+                (segs[k].seq - 1 <= MAX(parts_seq, kept_seq) ||
+                 (parts_fno >= segs[k].fno_first - 1 && eng_test_mutant != MUT_REPLICA_GAP_BY_SEQ)) &&
+                segs[k].fno_first - 1 <= floor)
+                lo = k;
+            prev_end = segs[k].fno_end;
+        }
+        for (size_t k = 0; k < lo && rc == 0; k++) {
+            fprintf(stderr, "tsdb: %s: segment %s lies below a gap that the parts and the floor (%" PRIu64 ") cover: a "
+                            "removal a power loss interrupted, it goes now\n", db->dir, segs[k].name, floor);
+            if (unlinkat(db->dirfd, segs[k].name, 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+        }
+        if (rc == 0 && lo > 0) {
+            if (db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
+                rc = TSDB_ERR_IO;
+            memmove(segs, segs + lo, (nseg - lo) * sizeof *segs);
+            nseg -= lo;
+        }
     }
     /* The log of a replica is contiguous (replica_append enforces it): a segment that does not start where the one before
      * it ends means a file went (damage, or a file system that reordered the unlinks of a cut), and the replica would
@@ -370,6 +442,8 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         return rc;
     pthread_mutex_lock(&rp->mu);
     rc = replica_apply_locked(db, rp, floor);
+    if (rc == 0)
+        open_unl_parts(rp);
     pthread_mutex_unlock(&rp->mu);
     return rc;
 }
@@ -466,19 +540,74 @@ int replica_flush(eng *db)
     return rc;
 }
 
-/* Unlinks the flushed segments whose last position is at or below the saved floor (flush_lock held). */
+static uint64_t unl_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+void replica_keep_next(uint64_t max_bytes, uint64_t max_ms)
+{
+    keep_next.set = true;
+    keep_next.bytes = max_bytes;
+    keep_next.ms = max_ms;
+}
+
+void tsdb_test_replica_drops_floor(void)
+{
+    eng_test_mutant = MUT_REPLICA_KEEP_FLOOR;
+}
+
+void tsdb_test_replica_drops_files(void)
+{
+    eng_test_mutant = MUT_REPLICA_DROP_APPLIED_FILES;
+}
+
+void replica_keep_cap(eng *db, uint64_t max_bytes, uint64_t max_ms)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return;
+    atomic_store(&rp->keep_bytes, max_bytes);
+    atomic_store(&rp->keep_ms, max_ms);
+    atomic_store(&rp->keep_set, true);
+}
+
+/* The last position the caps let go (unl_mu held): counted from the newest flushed segment back, as a leader counts
+ * its kept ones (lk_cap_bound), so what goes is always a prefix of unl[]; 0: none. Without caps every flushed segment
+ * goes once the floor passes it, the rule before failover (a replica that never leads keeps nothing for others). */
+static uint64_t unl_cap_bound(struct replica *rp)
+{
+    uint64_t maxb = atomic_load(&rp->keep_bytes), maxms = atomic_load(&rp->keep_ms);
+    if (!atomic_load(&rp->keep_set) || (!maxb && !maxms) || eng_test_mutant == MUT_REPLICA_KEEP_FLOOR)
+        return UINT64_MAX - 1; /* planted (replicadropsfloor): the floor alone again */
+    uint64_t now = unl_now_ms(), sum = 0;
+    for (size_t i = rp->nunl; i-- > 0;) {
+        sum += rp->unl[i].bytes;
+        if ((maxb && sum > maxb) || (maxms && now > rp->unl[i].ms && now - rp->unl[i].ms > maxms))
+            return rp->unl[i].fno_end - 1;
+    }
+    return 0;
+}
+
+/* Unlinks the flushed segments whose last position is at or below the saved floor and that the retention caps let go
+ * (flush_lock held). A replica keeps its sealed segments under the same caps as a leader (design-cluster.md 8.3): once
+ * a failover promotes it, it is the catch-up source of every member that lags it, and a member whose next record went
+ * with a segment needs a snapshot. Never past the floor: a segment above it may hold records a new leader cuts. */
 static void unlink_due(eng *db)
 {
     struct replica *rp = db->rp;
     uint64_t floor = atomic_load(&rp->floor_saved);
     if (eng_test_mutant == MUT_REPLICA_NO_FLOOR) /* planted: a segment goes before the floor is saved */
         floor = UINT64_MAX - 1;
-    uint64_t seqs[64];
+    struct unlseg seqs[64];
     for (;;) {
         size_t n = 0;
         pthread_mutex_lock(&rp->unl_mu);
-        while (n < rp->nunl && n < 64 && rp->unl[n].fno_end - 1 <= floor)
-            seqs[n] = rp->unl[n].seq, n++;
+        uint64_t bound = MIN(floor, unl_cap_bound(rp));
+        while (n < rp->nunl && n < 64 && rp->unl[n].fno_end - 1 <= bound)
+            seqs[n] = rp->unl[n], n++;
         if (n > 0) { /* rp->unl is NULL while the list was never used: memmove(NULL, ...) is undefined */
             memmove(rp->unl, rp->unl + n, (rp->nunl - n) * sizeof *rp->unl);
             rp->nunl -= n;
@@ -489,7 +618,7 @@ static void unlink_due(eng *db)
         size_t done = 0;
         for (; done < n; done++) {
             char name[64];
-            wal_name(name, sizeof name, seqs[done]);
+            wal_name(name, sizeof name, seqs[done].seq);
             if (unlinkat(db->dirfd, name, 0) != 0 && errno != ENOENT) {
                 fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
                         strerror(errno));
@@ -509,10 +638,8 @@ static void unlink_due(eng *db)
                 rp->capunl = c;
             }
             memmove(rp->unl + (n - done), rp->unl, rp->nunl * sizeof *rp->unl);
-            for (size_t i = done; i < n; i++) {
-                rp->unl[i - done].seq = seqs[i];
-                rp->unl[i - done].fno_end = floor + 1; /* due: below the floor already */
-            }
+            for (size_t i = done; i < n; i++)
+                rp->unl[i - done] = seqs[i]; /* due again at the next call: the bound only grows */
             rp->nunl += n - done;
             pthread_mutex_unlock(&rp->unl_mu);
         }
@@ -523,16 +650,17 @@ static void unlink_due(eng *db)
         for (size_t i = 0; i < rp->nsegs; i++) {
             bool gone = false;
             for (size_t j = 0; j < done; j++)
-                gone |= rp->segs[i].seq == seqs[j];
+                gone |= rp->segs[i].seq == seqs[j].seq;
             if (!gone)
                 rp->segs[keep++] = rp->segs[i];
         }
         rp->nsegs = keep;
         pthread_mutex_unlock(&rp->segs_mu);
         pthread_mutex_lock(&db->lock);
-        db->wal_removed = MAX(db->wal_removed, seqs[done - 1]);
+        db->wal_removed = MAX(db->wal_removed, seqs[done - 1].seq);
         pthread_mutex_unlock(&db->lock);
         eng_sync_dir(db, "fsync of the directory after removing WAL segments"); /* fails the engine itself */
+        leader_links_drop(db, seqs[done - 1].fno_end); /* the keep_ files of their markers go with them */
         if (done < n)
             return;
     }
@@ -552,11 +680,44 @@ void replica_flushed(eng *db, uint64_t seq, uint64_t fno_end)
         rp->unl = p;
         rp->capunl = c;
     }
-    rp->unl[rp->nunl].seq = seq;
-    rp->unl[rp->nunl].fno_end = fno_end;
-    rp->nunl++;
+    char name[64];
+    struct stat st;
+    wal_name(name, sizeof name, seq);
+    uint64_t bytes = fstatat(db->dirfd, name, &st, 0) == 0 ? (uint64_t)st.st_size : 0; /* gone: nothing to count */
+    rp->unl[rp->nunl++] = (struct unlseg){seq, fno_end, bytes, unl_now_ms()};
     pthread_mutex_unlock(&rp->unl_mu);
     unlink_due(db);
+}
+
+/* The segments the open found wholly in parts and applied (a deposed writer's kept ones, a replica's kept under the
+ * caps) go as flushed ones do (unlink_due: past the floor, under the caps), with their markers' keep_ files; the age
+ * cap counts from the open. Otherwise they stayed until a promotion. rp->mu held, before any flush. */
+static void open_unl_parts(struct replica *rp)
+{
+    struct unlseg add[64];
+    size_t n = 0;
+    uint64_t now = unl_now_ms(), applied = atomic_load(&rp->apply_next);
+    pthread_mutex_lock(&rp->segs_mu);
+    for (size_t k = 0; k + 1 < rp->nsegs && n < 64; k++) { /* never the last: it takes the appends */
+        uint64_t first = rp->segs[k].first, end = rp->segs[k + 1].first; /* the log is contiguous (checked at the open) */
+        if (rp->segs[k].seq > rp->sealed_seq || !first || !end || end > applied)
+            break;
+        add[n++] = (struct unlseg){rp->segs[k].seq, end, rp->segs[k].len, now};
+    }
+    pthread_mutex_unlock(&rp->segs_mu);
+    pthread_mutex_lock(&rp->unl_mu);
+    if (n && rp->nunl == 0 && rp->capunl < n) {
+        void *p = realloc(rp->unl, n * sizeof *rp->unl);
+        if (p) {
+            rp->unl = p;
+            rp->capunl = n;
+        }
+    }
+    if (n && rp->nunl == 0 && rp->capunl >= n) { /* else they stay on disk until a promotion, as before */
+        memcpy(rp->unl, add, n * sizeof *add);
+        rp->nunl = n;
+    }
+    pthread_mutex_unlock(&rp->unl_mu);
 }
 
 int replica_floor_saved(eng *db, uint64_t floor)
@@ -594,6 +755,54 @@ int replica_floor_saved(eng *db, uint64_t floor)
 static uint64_t stage_key(const char *name) { return xxh64(name, strlen(name), 0); }
 
 static void stage_path(char *buf, size_t cap, uint64_t key) { snprintf(buf, cap, "stage_%016" PRIx64 ".part", key); }
+
+/* A committed COMMIT marker's file, kept as long as the segment that holds the marker (design-cluster.md 8.3): every
+ * member keeps them, so whichever is promoted serves a laggard both the log and the files its markers name. The name
+ * holds the marker's position, which no other marker ever has (the marker is committed: no cut goes below it), so a
+ * file of an earlier leadership is never confused with one a later COMMIT links under the same stage_ key, as names
+ * repeat across engines and processes (r3a2 R5). */
+static void keep_path(char *buf, size_t cap, uint64_t fno, uint64_t key)
+{
+    snprintf(buf, cap, "keep_%016" PRIx64 "_%016" PRIx64 ".part", fno, key);
+}
+
+/* Notes a keep_ file in db->lf (lead_mu, a leaf). False when there is no room: the caller removes the file, a laggard
+ * that needs it is then told to take a snapshot, never sent another file. */
+static bool links_keep(eng *db, uint64_t fno, uint64_t key)
+{
+    bool ok = true;
+    pthread_mutex_lock(&db->lead_mu);
+    for (size_t i = 0; i < db->nlf; i++)
+        if (db->lf[i].keep && db->lf[i].fno == fno && db->lf[i].key == key)
+            goto out; /* an attach again on the same engine */
+    if (db->nlf + db->rlf + 1 > db->caplf) {
+        size_t c = db->caplf ? db->caplf * 2 : 16;
+        void *p = realloc(db->lf, c * sizeof *db->lf);
+        if (!p) {
+            ok = false;
+            goto out;
+        }
+        db->lf = p;
+        db->caplf = c;
+    }
+    db->lf[db->nlf++] = (struct lkfile){fno, key, true};
+out:
+    pthread_mutex_unlock(&db->lead_mu);
+    return ok;
+}
+
+/* A staged file whose marker is applied (or was published by this member as the leader) becomes keep_<fno>_<key>: the
+ * stage_ name is free for the next marker that names the same key. */
+static void stage_to_keep(eng *db, uint64_t fno, uint64_t key)
+{
+    char sp[40], kp[64];
+    stage_path(sp, sizeof sp, key);
+    keep_path(kp, sizeof kp, fno, key);
+    if (renameat(db->dirfd, sp, db->dirfd, kp) != 0)
+        return; /* not there: nothing to keep */
+    if (!links_keep(db, fno, key))
+        unlinkat(db->dirfd, kp, 0);
+}
 
 static void put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 
@@ -718,14 +927,17 @@ static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
     return 0;
 }
 
-/* forgets the i-th COMMIT marker and removes the files it staged (applied, or cut) */
-static void cm_remove(eng *db, struct replica *rp, size_t i)
+/* forgets the i-th COMMIT marker: the files it staged are kept with its segment when it was applied (stage_to_keep),
+ * removed when it was cut */
+static void cm_remove(eng *db, struct replica *rp, size_t i, bool applied)
 {
     struct rcm *x = &rp->cm[i];
     for (uint32_t k = 0; k < x->nf; k++) {
         char sp[40];
         stage_path(sp, sizeof sp, x->f[k].key);
-        if (eng_test_mutant != MUT_REPLICA_KEEP_STAGED)
+        if (applied && eng_test_mutant != MUT_REPLICA_DROP_APPLIED_FILES && eng_test_mutant != MUT_REPLICA_KEEP_STAGED)
+            stage_to_keep(db, x->first, x->f[k].key);
+        else if (eng_test_mutant != MUT_REPLICA_KEEP_STAGED)
             unlinkat(db->dirfd, sp, 0);
         stg_del(rp, x->f[k].key);
     }
@@ -1109,7 +1321,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         rp->rs.doing_pos = rp->rs.doing_b0 = rp->rs.doing_n = 0;
         int rc = rs_save(db, &rp->rs);
         if (rc == 0 && ci < rp->ncm)
-            cm_remove(db, rp, ci);
+            cm_remove(db, rp, ci, true);
         return rc;
     }
     if (c->flush_through >= seq || c->nfiles == 0 || ci == rp->ncm || rp->cm[ci].nf != c->nfiles) {
@@ -1175,7 +1387,7 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
     if (rc == 0)
         rc = rs_save(db, &rp->rs);
     if (rc == 0 && ci < rp->ncm)
-        cm_remove(db, rp, ci);
+        cm_remove(db, rp, ci, true);
     return rc;
 }
 
@@ -1226,6 +1438,24 @@ static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     return rs_save(db, &rp->rs);
 }
 
+/* A COMMIT marker at or below RSTATE's `done` found by the open: its files, still staged (a crash between the apply and
+ * stage_to_keep, or the stage_ links this member made as the leader before it was deposed), are kept with its segment
+ * when they are what the marker names; anything else goes with the orphans below. */
+static void open_keep_done(eng *db, struct replica *rp, const wal_rec *wr, const mk *m)
+{
+    const mk_commit *c = &m->u.commit;
+    size_t pos = 0;
+    mk_file f;
+    for (uint32_t n = 0; n < c->nfiles && mk_file_next(c, &pos, &f); n++) {
+        uint64_t key = xxh64(f.name, f.name_len, 0);
+        struct rstg *s = stg_find(rp, key);
+        if (!s || s->size != f.size || s->xxh != f.xxh64 || eng_test_mutant == MUT_REPLICA_DROP_APPLIED_FILES)
+            continue;
+        stg_del(rp, key);
+        stage_to_keep(db, wr->fno, key);
+    }
+}
+
 /* The open: the staged files that are on disk, the COMMIT markers above RSTATE's `done` (their files must be staged
  * before their positions are durable), and the staged files no marker names (shipped for a marker that never arrived:
  * the leader sends them again) removed. */
@@ -1237,10 +1467,27 @@ static int open_scan(eng *db, struct replica *rp)
     rewinddir(d);
     struct dirent *e;
     int rc = 0;
+    struct lkfile *kf = NULL; /* the keep_ files found */
+    size_t nkf = 0, capkf = 0;
     for (errno = 0; rc == 0 && (e = readdir(d)); errno = 0) {
-        uint64_t key;
+        uint64_t key, fno;
         int consumed = 0;
         size_t nl = strlen(e->d_name);
+        if (sscanf(e->d_name, "keep_%" SCNx64 "_%" SCNx64 ".part%n", &fno, &key, &consumed) == 2 && !e->d_name[consumed]) {
+            if (nkf == capkf) {
+                size_t c = capkf ? capkf * 2 : 16;
+                void *p = realloc(kf, c * sizeof *kf);
+                if (!p) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                kf = p;
+                capkf = c;
+            }
+            kf[nkf++] = (struct lkfile){fno, key, true};
+            continue;
+        }
+        consumed = 0;
         if (strncmp(e->d_name, "stage_", 6) == 0 && nl > 4 && strcmp(e->d_name + nl - 4, ".tmp") == 0) {
             unlinkat(db->dirfd, e->d_name, 0); /* a stage that did not finish: the leader sends the file again */
             continue;
@@ -1272,12 +1519,28 @@ static int open_scan(eng *db, struct replica *rp)
                 break;
             mk m;
             if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_COMMIT && (rc = mk_decode(wr.payload, wr.n, &m)) == 0 &&
-                m.type == MK_COMMIT)
+                m.type == MK_COMMIT) {
                 rc = cm_add(rp, &wr, &m);
+                if (rc == 0 && wr.fno + wr.span - 1 <= rp->rs.done)
+                    open_keep_done(db, rp, &wr, &m);
+            }
             pos += sz;
         }
         free(fb);
     }
+    /* keep_ files of markers whose segment is still here are served after a promotion; the rest went with theirs */
+    uint64_t lowest = UINT64_MAX;
+    for (size_t k = 0; k < rp->nsegs; k++)
+        if (rp->segs[k].first)
+            lowest = MIN(lowest, rp->segs[k].first);
+    for (size_t i = 0; i < nkf; i++) {
+        if (rc == 0 && kf[i].fno >= lowest && links_keep(db, kf[i].fno, kf[i].key))
+            continue;
+        char kp[64];
+        keep_path(kp, sizeof kp, kf[i].fno, kf[i].key);
+        unlinkat(db->dirfd, kp, 0);
+    }
+    free(kf);
     for (size_t i = rp->nstg; rc == 0 && i-- > 0;) {
         bool named = false;
         for (size_t c = 0; c < rp->ncm && !named; c++)
@@ -1886,8 +2149,10 @@ int replica_cut(eng *db, uint64_t last)
         rp->log_next = last + 1;
         for (size_t i = rp->ncm; i-- > 0;) /* the COMMIT markers above the cut never happened: their files go */
             if (rp->cm[i].first > last)
-                cm_remove(db, rp, i);
-        rp->durable_next = last + 1; /* what stays was synced (the cut's own sync, the rotations') */
+                cm_remove(db, rp, i, false);
+        /* what stays was synced (the cut's own sync, the rotations'), but a COMMIT marker below the cut whose files are
+         * not staged still holds it: a cut never acknowledges a marker without its files (r3e: the apply then failed) */
+        rp->durable_next = eng_test_mutant == MUT_REPLICA_CUT_NO_HOLD ? last + 1 : MIN(last + 1, hold_cap(rp));
         rp->cut_gen++;
         rp->last_cut_next = last + 1;
         /* the cursor: it is at the applied end, which is at or below the cut; if its segment went, it is at the end of
@@ -2077,8 +2342,12 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
             rc = TSDB_ERR_IO;
         else if ((size_t)st.st_size >= WAL_HDR && pread(fd, h, WAL_HDR, 0) == WAL_HDR)
             memcpy(&first, h + 16, 8);
-        else if (!newest)
-            rc = TSDB_ERR_CORRUPT; /* a sealed segment without a record */
+        else if (!newest && st.st_size != 0)
+            rc = TSDB_ERR_CORRUPT; /* a sealed segment with a torn first record */
+        /* An empty sealed one never got a record (a process killed right after the rotation that made it; a writer's
+         * open neither replays nor removes a kept segment): it holds no position, as an empty replica segment holds
+         * none (rseg.first 0), and the read goes on below it. A missing position is still an error: the segment below
+         * must have it, or its scan does not find it (INVALID). */
         close(fd);
         if (rc)
             return rc;
@@ -2310,8 +2579,25 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
          * the COMMITs and DROPs it applied as a replica are still in its `done` and `drops` */
         eng_close(db);
         *dbp = NULL;
-        rc = eng_open(dir, &opt, out);
+        rc = eng_open_leader(dir, &opt, out); /* no class switch before the driver attaches (db->leader_open) */
     }
+    free(dir);
+    return rc;
+}
+
+int replica_demote(eng **dbp, uint64_t floor, void (*between)(void), eng **out)
+{
+    eng *db = *dbp;
+    tsdb_options opt = db->opt;
+    opt.latest_cache = db->latest_cache_asked; /* the replica's open runs without the table and keeps the size asked */
+    char *dir = strdup(db->dir);
+    if (!dir)
+        return TSDB_ERR_NOMEM;
+    eng_close(db); /* a leader's close deposes it and never flushes: nothing the commit point did not pass is put in parts */
+    *dbp = NULL;
+    if (between)
+        between();
+    int rc = eng_open_replica(dir, &opt, floor, out);
     free(dir);
     return rc;
 }
@@ -2360,9 +2646,11 @@ static __thread uint64_t lead_pos, lead_drop_pos;
  * Each file a leader's COMMIT marker names is hard linked as stage_<key>.part, the name a replica stages it under, so a
  * replica that missed it can fetch it (eng_leader_file_open) after the leader merged the part away, and a deposed
  * leader reopened as a replica finds the files of the markers it had not published (open_scan keeps the stage_ files
- * that a marker above RSTATE's `done` names and removes the rest). The links go with the retained segment that holds
- * their marker (leader_links_drop, from leader_unlink_due); the list is in memory only: links of an earlier leadership
- * are removed at attach (leader_links_sweep). */
+ * that a marker above RSTATE's `done` names, and keeps those of the markers at or below it as keep_ files). The links
+ * go with the retained segment that holds their marker (leader_links_drop, from leader_unlink_due); the list is in
+ * memory only: stage_ links of an earlier leadership are removed at attach (leader_links_sweep). The files of committed
+ * markers of earlier leaderships (this member's own, or ones it applied as a replica) are keep_<fno>_<key>.part, kept
+ * by every member with the marker's segment and served from the attach on (keep_path). */
 static void leader_links_unlink(eng *db, const uint64_t *keys, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
@@ -2414,50 +2702,67 @@ static void leader_links_note(eng *db, uint64_t fno, void *arg)
     const struct lnote *ln = arg;
     pthread_mutex_lock(&db->lead_mu);
     for (size_t i = 0; i < ln->n; i++)
-        db->lf[db->nlf++] = (struct lkfile){fno, ln->keys[i]};
+        db->lf[db->nlf++] = (struct lkfile){fno, ln->keys[i], false};
     db->rlf -= ln->n;
     pthread_mutex_unlock(&db->lead_mu);
 }
 
+/* The files of the markers in segments below fno_end, which went: a leader's (leader_unlink_due) or a replica's
+ * (unlink_due). No directory sync: a name that comes back after a power loss goes at the next open or attach. */
 void leader_links_drop(eng *db, uint64_t fno_end)
 {
-    uint64_t keys[64];
+    struct lkfile ents[64];
     for (;;) {
         size_t n = 0, k = 0;
         pthread_mutex_lock(&db->lead_mu);
         for (size_t i = 0; i < db->nlf; i++) {
             if (db->lf[i].fno < fno_end && n < 64)
-                keys[n++] = db->lf[i].key;
+                ents[n++] = db->lf[i];
             else
                 db->lf[k++] = db->lf[i];
         }
         bool more = n == 64 && k < db->nlf;
         db->nlf = k;
         pthread_mutex_unlock(&db->lead_mu);
-        leader_links_unlink(db, keys, n); /* outside lead_mu, a leaf */
+        for (size_t i = 0; i < n; i++) { /* outside lead_mu, a leaf */
+            char p[64];
+            if (ents[i].keep)
+                keep_path(p, sizeof p, ents[i].fno, ents[i].key);
+            else
+                stage_path(p, sizeof p, ents[i].key);
+            unlinkat(db->dirfd, p, 0);
+        }
         if (!more)
             return;
     }
 }
 
-void leader_links_sweep(eng *db)
+/* At the attach: the stage_ links of an earlier leadership and a promoted replica's stages go (unless the planted
+ * mutant keeps them), and the keep_ files are served from here on while their segments are kept (db->lk: every segment
+ * a promotion or a writer's open kept; without one, no marker of theirs is in the log any more). */
+void leader_links_sweep(eng *db, bool stages)
 {
     DIR *d = fdopendir(dup(db->dirfd));
     if (!d)
-        return; /* the links stay: a leak, never a missing file */
+        return; /* the links stay: a leak, never a missing file; keep_ ones not served (NOTFOUND: a snapshot) */
     rewinddir(d);
     struct dirent *e;
     while ((e = readdir(d))) {
-        uint64_t key;
+        uint64_t key, fno;
         int consumed = 0;
-        if (sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) == 1 && !e->d_name[consumed])
+        if (sscanf(e->d_name, "stage_%" SCNx64 ".part%n", &key, &consumed) == 1 && !e->d_name[consumed]) {
+            if (stages)
+                unlinkat(db->dirfd, e->d_name, 0);
+        } else if ((consumed = 0, sscanf(e->d_name, "keep_%" SCNx64 "_%" SCNx64 ".part%n", &fno, &key, &consumed)) == 2 &&
+                   !e->d_name[consumed] && (db->nlk == 0 || !links_keep(db, fno, key))) {
             unlinkat(db->dirfd, e->d_name, 0);
+        }
     }
     closedir(d);
 }
 
 /* A file of the COMMIT marker at `pos`, by its name in the marker. Only a link this leadership noted for that very
- * marker is served: names repeat across engines in one process (the tmp counter starts at 0 at every open, a pid
+ * marker, or a keep_ file named by that marker's position, is served: names repeat across engines in one process (the tmp counter starts at 0 at every open, a pid
  * repeats in a container), and a promoted leader keeps the replica-era segments, whose markers may name a file that a
  * COMMIT of this leadership links under the same key; serving that one would stall a replica's catch-up on a file
  * that fails its check, where NOTFOUND sends it to a snapshot (r3a2 R5). A link noted and then dropped with its
@@ -2467,15 +2772,19 @@ void (*leader_test_marker_hook)(eng *db, uint64_t fno);
 int eng_leader_file_open(eng *db, uint64_t pos, const char *name)
 {
     const uint64_t key = stage_key(name);
-    bool noted = eng_test_mutant == MUT_LEADER_LINK_BY_NAME;
+    bool noted = eng_test_mutant == MUT_LEADER_LINK_BY_NAME, keep = false;
     pthread_mutex_lock(&db->lead_mu);
     for (size_t i = 0; i < db->nlf && !noted; i++)
-        noted = db->lf[i].fno == pos && db->lf[i].key == key;
+        if ((noted = db->lf[i].fno == pos && db->lf[i].key == key))
+            keep = db->lf[i].keep;
     pthread_mutex_unlock(&db->lead_mu);
     if (!noted)
         return TSDB_ERR_NOTFOUND;
-    char sp[40];
-    stage_path(sp, sizeof sp, key);
+    char sp[64];
+    if (keep)
+        keep_path(sp, sizeof sp, pos, key); /* an earlier leadership's committed marker, or one this member applied */
+    else
+        stage_path(sp, sizeof sp, key);
     int fd = openat(db->dirfd, sp, O_RDONLY | O_CLOEXEC);
     return fd >= 0 ? fd : errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
 }

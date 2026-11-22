@@ -89,8 +89,11 @@ static struct {
     struct mvol vols[CLUSTER_REPORT_VOLS]; /* what this manager made of them; under mu */
     uint32_t nvols;
     int writes;  /* TSDB_CLUSTER_WRITES=1 */
-    int mutant;  /* 1 noopengen, 3 anynonce (the others are cvolfs.h's) */
+    int replica_reads; /* TSDB_REPLICA_READS=1: a replica with a lease answers reads (tests only, until REPLICA_OK) */
+    int mutant;  /* 1 noopengen, 3 anynonce, 4 refusedsilent (the others are cvolfs.h's) */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
+    unsigned unreach_ms; /* UNREACH_MS, or TSDB_CVOL_TEST unreach_ms=N (tests only: a report later than the leader's
+                          * shrink request, which cluster.c's cut_move holds for, test_cluster cuthold) */
 } M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 #define say cvolfs_say
@@ -245,23 +248,32 @@ static void on_report(void *arg, struct cluster_report *out)
     pthread_mutex_lock(&M.mu);
     for (uint32_t i = 0; i < M.nvols && out->nvols < CLUSTER_REPORT_VOLS; i++) {
         const struct mvol *m = &M.vols[i];
-        if (m->state != MV_WAIT && m->state != MV_OPEN)
+        /* a refused volume (no valid REPL, an older copy, a failed open) is LOCAL_FAULT, D13: when this server leads
+         * it, nothing else would tell the group (the server is up, and no driver runs to resign) */
+        if (m->state == MV_NONE || (m->state == MV_REFUSED && M.mutant == 4))
             continue;
         struct cluster_vol_report *v = &out->vols[out->nvols++];
         v->volume = m->number;
         int writer = m->writer || (m->state == MV_OPEN && tsdb_cvol_role(M.t, m->number) == CVOL_WRITER);
         v->role = m->state == MV_OPEN && writer ? CL_ROLE_OWNER : CL_ROLE_NONE;
-        v->health = CL_HEALTH_OK;
+        v->health = m->state == MV_REFUSED ? CL_HEALTH_LOCAL_FAULT : CL_HEALTH_OK;
         v->epoch = m->epoch;
         v->rid = m->rid;
         v->open_gen = m->gen;
         v->open_nonce = m->nonce;
     }
     pthread_mutex_unlock(&M.mu);
-    for (uint32_t i = 0; i < out->nvols; i++) /* after M.mu: the driver's locks are never taken under it */
+    for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
         if (repld_failed(out->vols[i].volume))
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
-    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, UNREACH_MS);
+        uint64_t pe = 0;
+        int l = repld_leading(out->vols[i].volume, &pe); /* the driver's writer only while its core leads: a deposed */
+        if (l >= 0)                                       /* one is no OWNER (the Raft leader's lease check) */
+            out->vols[i].role = l == 1 ? CL_ROLE_OWNER : l == 2 ? CL_ROLE_PROMOTING : CL_ROLE_NONE;
+        if (l == 2)
+            out->vols[i].epoch = pe; /* the epoch it promotes to (leader_deposed in cluster.c) */
+    }
+    out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, M.unreach_ms);
     out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);
 }
 
@@ -276,24 +288,49 @@ int cvol_why(uint32_t v)
     if (m && !open)
         why = TSDB_WHY_RECOVERING;
     pthread_mutex_unlock(&M.mu);
-    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
-        writer = 1; /* promoted by the replication driver */
+    if (open && !writer && repld_leading(v, NULL) == 1)
+        writer = 1; /* promoted by the replication driver, and not deposed since */
     if (open) /* led here: answered only under a read lease (§7.1; reads and writes alike) */
         why = !writer ? TSDB_WHY_FENCED : cluster_lease_valid() ? -1 : TSDB_WHY_UNREACHABLE;
     return why;
 }
 
-int cvol_led(uint32_t v)
+int cvol_replica_reads(void) { return M.replica_reads; }
+
+int cvol_lead(uint32_t v, uint64_t *epoch)
 {
+    if (epoch)
+        *epoch = 0;
     if (!M.active)
         return 0;
     pthread_mutex_lock(&M.mu);
     const struct mvol *m = mv_get(v);
     int open = m && m->state == MV_OPEN, writer = m && m->writer;
     pthread_mutex_unlock(&M.mu);
-    if (open && !writer && !repld_failed(v) && tsdb_cvol_role(M.t, v) == CVOL_WRITER)
+    uint64_t e = 0;
+    if (open && !writer && repld_leading(v, &e) == 1) {
         writer = 1; /* promoted by the replication driver (as in cvol_why) */
+        if (epoch)
+            *epoch = e;
+    }
     return open && writer;
+}
+
+int cvol_led(uint32_t v) { return cvol_lead(v, NULL); }
+
+int cvol_no_owner(uint32_t v)
+{
+    if (!M.active)
+        return 0;
+    int no = 0;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nrecs; i++)
+        if (M.recs[i].number == v) {
+            no = M.recs[i].no_owner && M.recs[i].leader != M.self;
+            break;
+        }
+    pthread_mutex_unlock(&M.mu);
+    return no;
 }
 
 int cvol_active(void) { return M.active; }
@@ -313,10 +350,15 @@ int cvol_start(tsdb *t, const char *dir)
     repld_init(t, dir);
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
+    const char *rr = getenv("TSDB_REPLICA_READS");
+    M.replica_reads = rr && !strcmp(rr, "1");
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
     const char *mu = getenv("TSDB_CVOL_MUTANT");
-    M.mutant = mu && !strcmp(mu, "noopengen") ? 1 : mu && !strcmp(mu, "anynonce") ? 3 : 0;
+    M.mutant = mu && !strcmp(mu, "noopengen")       ? 1
+               : mu && !strcmp(mu, "anynonce")      ? 3
+               : mu && !strcmp(mu, "refusedsilent") ? 4
+                                                    : 0;
     cvolfs_test_mutant = !mu                         ? CVOLFS_MUT_NONE
                          : !strcmp(mu, "samerid")     ? CVOLFS_MUT_SAMERID
                          : !strcmp(mu, "replnonce")   ? CVOLFS_MUT_REPLNONCE
@@ -327,8 +369,14 @@ int cvol_start(tsdb *t, const char *dir)
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
+    const char *cv = getenv("TSDB_CVOL_TEST");
+    M.unreach_ms = UNREACH_MS;
+    if (cv && sscanf(cv, "unreach_ms=%u", &M.unreach_ms) == 1)
+        say("TSDB_CVOL_TEST: a peer is reported unreachable after %u ms (tests only)", M.unreach_ms);
     if (M.writes)
         say("TSDB_CLUSTER_WRITES=1: a volume's leader takes writes before replication is wired (tests only)");
+    if (M.replica_reads)
+        say("TSDB_REPLICA_READS=1: a replica holding a read lease answers reads, which may be stale (tests only)");
     if (M.mutant || cvolfs_test_mutant)
         say("MUTANT %s (tests only)", mu);
     if (pthread_create(&M.th, NULL, mgr_main, NULL) != 0) {
@@ -338,6 +386,7 @@ int cvol_start(tsdb *t, const char *dir)
     M.started = 1;
     M.active = 1;
     cluster_set_volume_watch(on_watch, NULL);
+    cluster_set_fence_handler(repld_fence, NULL);
     cluster_set_reporter(on_report, NULL);
     return 0;
 }

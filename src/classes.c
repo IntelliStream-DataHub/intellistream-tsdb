@@ -442,6 +442,11 @@ typedef struct cls_rec {
 /* A leader's CLASS markers for records r[0..n) that go to CLASSES at `off` (jr_markers: 0 at once elsewhere). */
 static int cls_markers(eng *db, const cls_rec *r, size_t n, uint64_t off)
 {
+    /* a promoted writer before its attach: a record with no marker would diverge. switch_locked defers before this;
+     * the first class of a series made after the open (a large insert of it, a flush; the open takes every series it
+     * finds as decided) is refused only here (planted: MUT_LEADER_FRESH_UNATTACHED) */
+    if (db->leader_open && !db->rp && !eng_jr(db) && n != 0 && eng_test_mutant != MUT_LEADER_FRESH_UNATTACHED)
+        return TSDB_ERR_UNAVAILABLE;
     if (!eng_jr(db) || db->rp || n == 0)
         return 0;
     mk *m = calloc(n, sizeof *m);
@@ -1081,6 +1086,12 @@ static int switch_locked(eng *db, const sw *w, size_t n)
 {
     if (!n)
         return 0;
+    /* A promoted writer whose driver has not attached yet (its merges and flusher already run): the switch would be
+     * written with no CLASS marker, a record of this member alone, and the next epoch decides another T for the same
+     * offset (jepsen-cluster meta,classes partition, r3e). It waits for the attach like a switch that waits for the
+     * replay floor. */
+    if (db->leader_open && !w[0].pos && !db->rp && !eng_jr(db))
+        return CLS_DEFER;
     cls_rec *r = malloc(n * sizeof *r);
     if (!r)
         return TSDB_ERR_NOMEM;

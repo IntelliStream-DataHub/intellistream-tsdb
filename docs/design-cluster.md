@@ -740,7 +740,11 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
   answered in 1.6 s with a replica stopped; mutant `shipperfile`).
 - **A leader that cannot reach its replicas but reaches the Raft leader**: before shrinking the ISR below 2 while the
   Raft leader still hears the replicas' heartbeats, the Raft leader moves leadership to a replica instead (ha.md D38's
-  reasoning: the cut-off one should step aside, not the others).
+  reasoning: the cut-off one should step aside, not the others). *Built in R3 (r3e-failover):* a member the shrink drops that
+  the Raft leader hears and whose heartbeat lists the leader among the peers it has not heard on any data link for a
+  second makes it a move (a promotion with reason PLANNED: the old leader is fenced and its own answer is no candidate);
+  a shrink below 2 that drops a member heard but not yet reporting waits up to 2 s for that report, and a move with no
+  candidate in 2 s gives way to the shrink (`test_cluster cut`, `TSDB_REPLD_TEST=cutlinks`; mutant `cutshrinks`).
 - A tsdbd that hangs but keeps its sockets open stops heartbeating (heartbeats come from the event loop, which also
   serves the volumes), so it is treated as down. A slow disk shows as a replica falling behind: ISR removal, not
   failover.
@@ -803,6 +807,15 @@ when no write was acknowledged after the last shrink. To let the operator judge 
 carries the leader's commit point when it asked**, and `force-leader` (and `tsdb cluster status`) shows, per
 remaining replica, whether its log end reaches that point: a replica that does holds everything acknowledged before
 the shrink, and only writes acknowledged by the lone leader afterwards can be lost.
+
+*As built (r3e-failover).* `tsdb cluster volume force-leader PEER VOLUME NODE` asks the Raft leader, which accepts it
+only while no ISR member is up and NODE is an up replica outside the ISR. It adds NODE to the ISR (an `ISR_CHANGE`
+that keeps the record's leader, so no new metadata operation and no new invariant: the leader the promotion then
+picks was in the previous ISR); the promotion that waited fences NODE, NODE alone answers and leads at e + 1. The
+leader's log line compares NODE's log end with the last shrink's commit point and says whether writes acknowledged
+before the shrink are all kept or which ones are lost. Members of the old ISR that come back with records past the new
+history (applied at the old epoch, never in NODE's log) stop the volume with "a cut below the applied end" rather than
+diverge silently; rebuilding such a replica (a new instance copied from the leader) is not built yet.
 
 Time to writes again: 3 s detection + about 10 ms for fencing, a Raft commit and the first record + the clients'
 TOPOLOGY refresh. About 4 s in total for the volumes the server led. Other volumes see only the ISR shrink (§6.1,
@@ -956,6 +969,12 @@ write (a body that 1.x adds for clients that ask, §11.2); a query may carry `mi
 that far waits up to 50 ms, then answers MOVED to the leader. Use: dashboards and heavy scans spread over all three
 copies; the Pulsar sink and anything that reads after writing stay on leaders.
 
+As built (r3e-failover, with s2e's entry node decision `route_decide`, 6.4), `REPLICA_OK` does not exist yet, so tsdbd
+answers every request on a replicated volume it does not lead MOVED to the record's leader, reads included: a leader deposed by a failover reopens as a replica and is back
+in the ISR with a read lease within seconds, without the writes the new leader acknowledged meanwhile. The environment
+variable `TSDB_REPLICA_READS=1` (tests only: `test_cluster` counts a replica's rows through it) lets a replica that
+holds a lease answer; a replica without a lease is refused even then.
+
 ### 7.3 Many series, many servers
 
 - **QUERY_MULTI** (direct mode): the client splits the series by the leader of their volume, sends one QUERY_MULTI per
@@ -1021,7 +1040,12 @@ the inbox had its slice, up to a second of backlog; a thread that is never curre
 the last one as that one took, so the steps keep at least half its time and a lagging peer is never starved
 (`rejoinlate`, mutant `stepcurrentonly`: under TSan a replica never rejoined). Before, each tick ran a step and a late
 tick was dropped, so with 20 ms catch-up reads a core tick took 25 ms and a stopped member held the writes 5 s
-(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`).
+(r3d-isr review M1; `test_cluster tickwall`, mutant `tickstretch`). A stop of the whole process is not caught up: a
+tick wait that returns 250 ms (`STALL_MS`) past its deadline was a SIGSTOP or a VM pause, not a busy step, so the
+ticks restart from the resume, the peers count as heard then, and the heartbeat names no peer unreachable while the
+driver's thread has not looped for that long. Otherwise a leader and a replica stopped together came back with every
+peer silent for a second of ticks (an ISR of one) and the replica named the leader for its own stop (a cut that deposed
+it; `test_cluster jointpause`, mutant `stallcatchup`).
 
 A replica's durable end stops below a COMMIT marker whose files it has not staged, and its core starts there at an
 open too (`repl_durable.hold`), not at its log end: a replica killed between such a marker and the FETCH of its file
@@ -1070,6 +1094,37 @@ than that, or than the budget, gets a snapshot.
 commit floor (the one in REPL, not the one in memory), and records its new log start in REPL; a replica whose next
 position the leader no longer retains is told to install a snapshot (§8.1). A segment deleted above the saved floor
 could leave a replica that restarts unable to rebuild what it had applied.
+
+*Built in R3 (r3e-failover, 2026-11-20): replicas retain too.* A replica used to unlink a flushed segment as soon as
+its saved floor passed it. After a failover the promoted member is the only source of what a lagging member still
+needs, and it had kept nothing below its floor: in jepsen-cluster a deposed writer, reopened as a replica and promoted
+again, had dropped the records a killed member needed next, which then stayed a learner ("needs a snapshot") with the
+ISR short of it. Now a replica keeps its flushed segments under the same caps as a leader (`replica_keep_cap`, the
+volume's `repl_retain_mb` and `repl_retain_s`, counted from the newest flushed segment back): a segment goes once the
+saved floor passes it **and** the caps let it go, never above the floor. The driver gives the caps to every replica
+open (`replica_keep_next`: a demotion's and a restart's open replay and flush the segments they find, which must not
+go by the floor alone before the driver's first save) and again at every floor save. Both caps zero, or a replica
+opened without a driver (tests), keeps the old rule (a replica has no keep bound of its own to wait for, so "no cap"
+would be "forever"). A promotion keeps every segment still on disk (RSTATE `kept`), so a member that lags the new
+leader by less than the caps catches up from it; one past the caps still needs the snapshot of R4.
+Not done: a replica's flushed segments are not named in RSTATE `kept`, so a replica's open still replays them
+(rows a part of their segment holds are skipped per partition, DROPs by RSTATE's `drops`, which are kept while a
+retained segment lies behind them) and reads up to the caps at every open; and the replay floor (5.4) is the members'
+log start, which now lies up to the caps back, so a new leader's class switches wait (CLS_DEFER) until its members'
+retained segments pass its attach: up to `repl_retain_s` after a failover. Naming them in `kept` and reporting a replay
+start separate from the log start would end both. `test_replica keepcap` (mutant `replicadropsfloor`).
+The files of COMMIT markers go the same way (jepsen-cluster meta,classes power, finding A2: a member that had led an
+earlier epoch was promoted again and answered "needs a snapshot" for the files of its own earlier markers, because the
+leader's links (5.2, M4) were per leadership and in memory, a replica removed a COMMIT's staged files once applied and
+a deposed leader's open removed its links as orphans). Every member now keeps the files of a committed marker as
+`keep_<position>_<key>.part` for as long as the segment that holds the marker: a replica renames a staged file to that
+name when its marker is applied, a replica's open (a deposed leader's included) renames the stage_ files of markers at
+or below RSTATE's `done` that match what the marker names, and the files go with their segment (`unlink_due`,
+`leader_unlink_due`). At the attach a leader serves the keep_ files it finds by position and key; the position in the
+name is what keeps r3a2 R5 (a file of an earlier leadership is never served for a later marker that names the same
+key). A replica's open also hands the segments it finds wholly in parts and applied to the same rule (before, a deposed
+writer's kept segments stayed until a promotion). `test_replica keepfiles` (mutant `replicadropsfiles`, also
+`TSDB_REPLD_MUTANT=replicadropsfiles` in tsdbd).
 
 ### 8.4 Priorities
 

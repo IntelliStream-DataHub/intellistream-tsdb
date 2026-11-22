@@ -86,9 +86,11 @@
  * stream), so the users keep half of it and the rest of the state the other half. */
 #define META_USERS_BYTES_MAX (8u << 20)
 #define META_OPS_MAX 1024 /* operations in one entry */
-/* A shared volume's epoch, and the epoch reserved after it, stay below this (ha.md §2.4: E is a u24 in block
- * numbers, and an epoch at or above 2^24 - 1 is refused everywhere). */
-#define META_EPOCH_LIMIT ((1ull << 24) - 1)
+/* Every volume's epoch stays below this (DECISION D10 of r3-scope: one bound, the engine's): a replicated volume's
+ * new leader begins segment epoch << 40, and replica_epoch_begin refuses an epoch at or above 2^22 (src/replica.c),
+ * so the metadata group never commits a promotion the engine would refuse. A shared volume's epoch and the epoch
+ * reserved after it stay below it too (ha.md §2.4 asked only for u24 in block numbers). */
+#define META_EPOCH_LIMIT (1ull << 22)
 
 enum meta_err {
     META_OK = 0,
@@ -418,6 +420,9 @@ void meta_op_member_flags(struct meta_entry *e, uint32_t id, uint64_t incarnatio
 void meta_op_settings(struct meta_entry *e, const struct meta_settings *s);
 void meta_op_volume_add(struct meta_entry *e, const struct meta_volume_add *a);
 void meta_op_volume_leader(struct meta_entry *e, const struct meta_grant *g);
+/* The leader a replicated VOLUME_LEADER with g's basis, fences and replies must name (repl_meta_promote over v);
+ * g->leader is not read. META_OK, META_ERR_STALE (the basis is not v's) or META_ERR_INVALID (no candidate). */
+int meta_promote_pick(const struct meta_volume *v, const struct meta_grant *g, uint32_t *leader);
 /* `rid` parallel to `isr`; `commit` the leader's commit point (0: none; kept when given). */
 void meta_op_isr_change(struct meta_entry *e, uint32_t number, uint64_t epoch, uint64_t isr_version,
                         const uint32_t *isr, const uint64_t *rid, uint32_t nisr, uint64_t commit);

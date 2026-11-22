@@ -21,18 +21,30 @@
 # while the next is due) rejoinslow; opennohold (a replica's core opens with its whole log durable, past a COMMIT
 # marker whose file it has not staged) reopenhold (knobs dropbulk, nofetch, syncpause, fetchlate); tickstretch (a late
 # tick dropped: the core's clock slower than the wall's under a slow catch-up step) tickwall (knob slowtick);
-# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick).
+# stepcurrentonly (catch-up steps only on ticks that are not late) rejoinlate (knob latetick); stallcatchup (a stop
+# of the whole process caught up in ticks and taken for the peers' silence) jointpause. Three are tsdbd's, read by
+# it under the same name: nomoved (a write to a non-leader refused UNAVAILABLE, not MOVED) failover; deposemoved (a
+# write of unknown outcome on a deposed leader refused, not its connection closed, D12) writerdepose; leadnow (a read
+# admitted on the leader and held while it is deposed is checked against the lease only, and answered from the
+# replica engine its demotion reopened) readdepose. fencenosync (a FENCE_REPLY sent with the raised fence not in REPL)
+# fencecrash. One is the volume manager's (server/cvol.c,
+# TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
+# report, not LOCAL_FAULT) refused. One is the engine's (src/replica.c, planted by tsdbd under the same name):
+# replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
+# promotenone (a driver promoting reports role NONE, so a promotion slower than 3 s is taken for a deposed leader and
+# fenced again; the volume's first promotion is slow too, so it may never get a writer) promoteslow (knob promoteslow).
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
 dir=${1:-/tmp}; shift || true
+mkdir -p "$dir" || exit 1
 # mutant, its scenario, an extended regular expression its FAIL line must match
 table=(
     "commitbyleader|replindet|a write with both replicas paused was answered"
-    "floornotsaved|replicate|the replica restarted under writes refused its log: the log starts above the commit floor"
+    "floornotsaved|repcheck|restarted after its flushed segments went refused its log: the log starts above the commit floor"
     "ackbeforesync|ackdurable|after a power loss replica [0-9]+ holds [0-9]+ rows"
     "nodepose|writerdepose|the writer was not deposed"
-    "noquiesce|writerfail|of the failed volume: .*not UNAVAILABLE"
+    "noquiesce|writerfailq|of the failed volume: .*not (UNAVAILABLE|MOVED)"
     "floornottold|repcheck|its saved floor never removed its flushed segments"
     "unsureignored|repcheck|opened with a damaged REPL slot and saved unsure 1"
     "admitnocheck|repcheck|a write whose core position is not its log number was acknowledged"
@@ -49,16 +61,25 @@ table=(
     "noinboxbound|backpressure|the stalled replica held the leader's whole stream in its inbox"
     "nospill|backpressure|a replica received a part above the spill threshold into memory"
     "keepignorespeers|keepfloor|the leader keeps [0-9]+ WAL segments, not the 5 flushed ones a replica away has not acked"
+    "replicadropsfloor|failoverkeep|the replica away during the failover was told it needs a snapshot"
     "fastride|rejoin|did not join the ISR again in 30 s"
     "nojoinhold|rejoinsteady|did not join the ISR again in 30 s"
     "inboxstarve|rejoinslow|the leader dropped the healthy replica from the ISR while another"
     "opennohold|reopenhold|the leader dropped the file of a COMMIT marker that a restarted replica had not staged"
     "tickstretch|tickwall|a member stopped under writes left the ISR only after [0-9]+ ms"
     "stepcurrentonly|rejoinlate|did not join the ISR again in 30 s"
+    "stallcatchup|jointpause|after a stop of every server the record of jp"
+    "keepunanswered|failover|the killed old leader was still in the ISR of fo"
+    "promotenone|promoteslow|the record of ps moved past epoch|series pump1.flow in ps: error -11"
+    "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"
     "syncbyrep|writersync|writersync: batch [0-9]+, a write from connection [0-9]+: .*its commit point stayed below"
+    "nomoved|failover|a write to a replica after the failover: .*not MOVED"
+    "deposemoved|writerdepose|the write waiting for the commit point on the failed writer got"
+    "leadnow|readdepose|held while it was deposed answered"
+    "refusedsilent|refused|the refused volume was not reported"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 all=
@@ -76,7 +97,7 @@ for m in $muts; do
     fi
     rest=${row#*|}; s=${rest%%|*}; want=${rest#*|}
     log="$dir/mut-$m-$s.log"
-    TSDB_REPLD_MUTANT=$m timeout 600 ./build/test_cluster "$dir" "$s" > "$log" 2>&1
+    TSDB_REPLD_MUTANT=$m TSDB_CVOL_MUTANT=$m timeout 600 ./build/test_cluster "$dir" "$s" > "$log" 2>&1
     rc=$?
     fail=$(grep -m1 FAIL "$log")
     if [ $rc -ne 0 ] && grep -m1 FAIL "$log" | grep -qE "$want"; then
