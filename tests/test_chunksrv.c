@@ -57,7 +57,8 @@ static const uint8_t VUUID[16] = {0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8
         }                                                                                                             \
     } while (0)
 
-static uint64_t rng = 88172645463325252ull;
+/* Per thread: test_net's threads draw rids too (chunksrv_call assigns its own, so equal seeds are harmless). */
+static _Thread_local uint64_t rng = 88172645463325252ull;
 static uint64_t rnd(void)
 {
     rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17;
