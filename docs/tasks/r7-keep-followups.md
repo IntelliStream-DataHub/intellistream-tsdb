@@ -1,6 +1,6 @@
 # Settled sources and their digest (src/eckeep.c): what R7 left open
 
-**Open (from the r7-keep review, 2026-11-20). Owners: r7-docs, r7-settle, r7-jepsen, R15.**
+**Open (from the r7-keep review, 2026-11-20). Owners: R8, R15. The E26 difference is recorded in design-cluster-data.md 2.3 and docs/tasks/r8-from-r7.md.**
 
 ## tsdbd cannot see a DIVERGED engine (R15, or before tiers reach tsdbd)
 
