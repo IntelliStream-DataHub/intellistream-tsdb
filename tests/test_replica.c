@@ -3892,7 +3892,12 @@ static void case_power_commit(void)
  * equivalent, and this loop shows it: a DROP begins its segment, rows after it reach a part only through a flush that
  * moves the parts' wal_seq past that segment, and the open applies from the first segment above it (replica_open_log), so
  * a DROP whose `done` was lost is applied again only with nothing after it applied yet. Step 5 writes rows below the
- * dropped bound after the DROP and step 6's COMMIT flushes them, the case where an extra DROP would remove them. */
+ * dropped bound after the DROP and step 6's COMMIT flushes them, the case where an extra DROP would remove them.
+ * The leader's links of a COMMIT's files (stage_ names, src/replica.c leader_commit) are synced with their directory before
+ * the marker is written: crashfs tracks link and linkat (round 16), so a marker that is durable with its links lost (the
+ * power goes after the marker's WAL sync and before the directory's, while the replica applies it) leaves the ex-leader
+ * with a log that ends at the marker and a durable end below it: the ex-leader's log end must be its durable end
+ * (mutant leaderlinknosync: no sync of the directory after the links). */
 #define RSTEPS 8
 
 static void xp_rows_at(xport *x, uint32_t s, int64_t t0, int n, float base);
@@ -4059,7 +4064,12 @@ static void case_rstate_crash(void)
         int lj = 0;
         while (lj < RSTEPS && P[lj + 1] <= le)
             lj++;
-        if (le < P[done] || le != P[lj]) {
+        if (replica_log_end(ex) != le) { /* a COMMIT marker is in the log, but the open does not count it: its files are not there */
+            fprintf(stderr, "R: step %d: the ex-leader's log ends at %" PRIu64 ", its durable end at %" PRIu64 ": the files "
+                    "of a COMMIT marker that is durable are gone (the links of a COMMIT were not synced before its marker: "
+                    "mutant leaderlinknosync)\n", k, replica_log_end(ex), le);
+            failures++;
+        } else if (le < P[done] || le != P[lj]) {
             fprintf(stderr, "R: step %d: the ex-leader's durable end %" PRIu64 " is not the end of a step from %" PRIu64
                     " on\n", k, le, done);
             failures++;
@@ -6380,6 +6390,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "closewait") == 0 ? MUT_LEADER_CLOSE_WAIT
                         : strcmp(m, "keepignored") == 0 ? MUT_LEADER_KEEP_IGNORED
                         : strcmp(m, "nohardlink") == 0 ? MUT_LEADER_NO_HARDLINK
+                        : strcmp(m, "leaderlinknosync") == 0 ? MUT_LEADER_LINK_NOSYNC
                         : strcmp(m, "promotenocarry") == 0 ? MUT_PROMOTE_NO_CARRY
                         : strcmp(m, "keptreplayed") == 0 ? MUT_KEPT_REPLAYED
                         : strcmp(m, "leaderkeptnosave") == 0 ? MUT_LEADER_KEPT_NOSAVE
