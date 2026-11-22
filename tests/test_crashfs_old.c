@@ -48,6 +48,17 @@
  *  - otrunc_emfile:    the same open fails with EMFILE (the descriptor limit): the 1000 bytes are still there
  *  - tmp_rename_nosync: a durable leftover tmp of 1000 bytes opened O_TRUNC, 500 new bytes written, closed, renamed over a durable f of 300 bytes,
  *                     nothing synced: f is the old 300 bytes or a prefix of the 500 new ones, never the OLD tmp content
+ * and round 16 (VERIFY15: a failed ftruncate zeroed durable bytes in the zero mode, and a new hard link survived any power loss), in every mode:
+ *  - ftrunc_fail_rdonly, pwrite_fail_rdonly: a durable file of 1000 bytes, ftruncate / pwrite through an O_RDONLY descriptor fails (EINVAL /
+ *                     EBADF): after the loss it holds the 1000 (a failed call changed nothing, whatever the shim kept for the loss)
+ *  - unlink_dir:      unlink() of a directory fails (EISDIR): it and the durable file inside are there after the loss
+ *  - link_nodirsync, linkat_nodirsync: link / linkat of a durable file, the directory not synced: the new name is gone after the loss
+ *                     (CRASHFS_TEAR may keep it), the file is whole under its old name
+ *  - link_dirsync:    the same with the directory synced: both names hold the 1000 bytes
+ *  - link_unlink_orig: linked, directory synced, the old name unlinked (not synced): the new name has the 1000
+ *  - link_fail_exist: link onto an existing name fails (EEXIST): both files keep their content
+ *  - link_append:     linked (directory synced), the file appended to without a sync: after the loss both names are the 1000 synced bytes (a
+ *                     prefix of the 100 appended may be there with CRASHFS_TEAR)
  * Usage: test_crashfs_old LIBCRASHFS.so DIR [SEEDS]
  */
 #define _GNU_SOURCE
@@ -247,11 +258,99 @@ static void dsync(const char *dir)
 }
 static void np(const char *dir, const char *n, char *out) { snprintf(out, 4400, "%s/%s", dir, n); }
 
+static bool r16_kind(const char *k)
+{
+    static const char *names[] = {"ftrunc_fail_rdonly", "pwrite_fail_rdonly", "unlink_dir", "link_nodirsync", "linkat_nodirsync",
+                                  "link_dirsync", "link_unlink_orig", "link_fail_exist", "link_append"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (!strcmp(k, names[i]))
+            return true;
+    return false;
+}
+
+/* a file of n bytes of `src`, synced with its directory */
+static int mk_durable(const char *dir, const char *path, const unsigned char *src, size_t n)
+{
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    wr(fd, src, n);
+    if (fsync(fd) != 0)
+        return -1;
+    close(fd);
+    dsync(dir);
+    return 0;
+}
+
+static int child_r16(const char *kind, const char *dir)
+{
+    char a[4400], b[4400], c[4400];
+    np(dir, "a", a);
+    np(dir, "b", b);
+    np(dir, "c", c);
+    if (!strcmp(kind, "unlink_dir")) {
+        char sub[4400], f[4400];
+        np(dir, "sub", sub);
+        np(sub, "f", f);
+        if (mkdir(sub, 0755) != 0)
+            return 2;
+        dsync(dir);
+        if (mk_durable(sub, f, CA, 1000) != 0)
+            return 2;
+        dsync(dir);
+        if (unlink(sub) == 0 || errno != EISDIR)
+            return 9; /* a directory is not unlinked, and the failed call changes nothing */
+        pull(dir);
+        return 3;
+    }
+    if (mk_durable(dir, a, CA, 1000) != 0)
+        return 2;
+    if (!strcmp(kind, "ftrunc_fail_rdonly") || !strcmp(kind, "pwrite_fail_rdonly")) {
+        int fd = open(a, O_RDONLY);
+        if (fd < 0)
+            return 2;
+        if (!strcmp(kind, "ftrunc_fail_rdonly") ? ftruncate(fd, 300) == 0 : pwrite(fd, CB, 100, 200) >= 0)
+            return 9; /* the call must fail: this is the descriptor the case is about */
+    } else if (!strcmp(kind, "link_nodirsync")) {
+        if (link(a, b) != 0)
+            return 9;
+    } else if (!strcmp(kind, "linkat_nodirsync")) {
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd < 0 || linkat(AT_FDCWD, a, AT_FDCWD, b, 0) != 0 || linkat(dfd, "a", dfd, "c", 0) != 0)
+            return 9;
+    } else if (!strcmp(kind, "link_dirsync")) {
+        if (link(a, b) != 0)
+            return 9;
+        dsync(dir);
+    } else if (!strcmp(kind, "link_unlink_orig")) {
+        if (link(a, b) != 0)
+            return 9;
+        dsync(dir);
+        if (unlink(a) != 0)
+            return 9;
+    } else if (!strcmp(kind, "link_fail_exist")) {
+        if (mk_durable(dir, b, CB, 700) != 0)
+            return 2;
+        if (link(a, b) == 0 || errno != EEXIST)
+            return 9;
+    } else { /* link_append */
+        int fd = open(a, O_WRONLY | O_APPEND);
+        if (fd < 0 || link(a, b) != 0)
+            return 9;
+        dsync(dir);
+        wr(fd, CA + 1000, 100);
+    }
+    pull(dir);
+    return 3;
+}
+
 static int child2(const char *kind, const char *dir)
 {
     char a[4400], b[4400];
     cfill(CA, sizeof CA, 10);
     cfill(CB, sizeof CB, 77);
+    if (r16_kind(kind))
+        return child_r16(kind, dir);
     if (!strcmp(kind, "rename_sync") || !strcmp(kind, "rename_newfile")) {
         np(dir, "a", a);
         np(dir, "b", b);
@@ -476,6 +575,83 @@ static long slurp(const char *p, unsigned char *buf, size_t cap)
     return n;
 }
 
+/* the file `name` of dir: its length, or -1; and whether it is the first n bytes of src */
+static unsigned char got_head[1000]; /* the first 1000 bytes of the last file r16_file read */
+static long r16_file(const char *dir, const char *name, const unsigned char *src, bool *same)
+{
+    char p[4400];
+    static unsigned char got[16384];
+    np(dir, name, p);
+    long n = slurp(p, got, sizeof got);
+    *same = n >= 0 && n <= 1100 && memcmp(got, src, (size_t)n) == 0;
+    if (n >= 1000)
+        memcpy(got_head, got, 1000);
+    return n;
+}
+
+static void check_r16(const char *kind, const char *mode, const char *dir, unsigned long seed, int st)
+{
+    const bool tr = !strcmp(mode, "tear");
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 99, "%s/%s seed %lu: the child ended with status 0x%x, not the loss's 99 (the call under test did not fail "
+          "or succeed as the case needs: status 9)", kind, mode, seed, st);
+    bool same;
+    long n;
+    if (!strcmp(kind, "unlink_dir")) {
+        char sub[4400];
+        np(dir, "sub", sub);
+        n = r16_file(sub, "f", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: sub/f has %ld bytes, the 1000 synced (the failed unlink moved the directory aside?)", kind, mode, seed, n);
+        return;
+    }
+    if (!strcmp(kind, "ftrunc_fail_rdonly") || !strcmp(kind, "pwrite_fail_rdonly")) {
+        n = r16_file(dir, "a", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: a has %ld bytes%s, the 1000 synced: a call that FAILED must change nothing (the shim kept its "
+              "bookkeeping of the call: zeroed bytes %s)", kind, mode, seed, n, same ? "" : " that differ", !strcmp(mode, "zero") ? "in the harsh mode" : "?");
+        return;
+    }
+    if (!strcmp(kind, "link_nodirsync") || !strcmp(kind, "linkat_nodirsync")) {
+        n = r16_file(dir, "a", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: a has %ld bytes, the 1000 synced", kind, mode, seed, n);
+        const char *names[] = {"b", "c"};
+        for (int i = 0; i < (!strcmp(kind, "link_nodirsync") ? 1 : 2); i++) {
+            n = r16_file(dir, names[i], CA, &same);
+            CHECK((n == -1) || (tr && n == 1000 && same), "%s/%s seed %lu: %s has %ld bytes: a hard link whose directory was never synced "
+                  "survived the power loss (crashfs does not track link/linkat?)", kind, mode, seed, names[i], n);
+        }
+        return;
+    }
+    if (!strcmp(kind, "link_dirsync")) {
+        n = r16_file(dir, "b", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: b has %ld bytes: a link whose directory was synced must stay (the undo took it?)", kind, mode, seed, n);
+        n = r16_file(dir, "a", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: a has %ld bytes", kind, mode, seed, n);
+        return;
+    }
+    if (!strcmp(kind, "link_unlink_orig")) {
+        n = r16_file(dir, "b", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: b has %ld bytes, the linked and synced 1000", kind, mode, seed, n);
+        n = r16_file(dir, "a", CA, &same);
+        CHECK((n == 1000 && same) || (tr && n == -1), "%s/%s seed %lu: a (unlinked, not synced) has %ld bytes", kind, mode, seed, n);
+        return;
+    }
+    if (!strcmp(kind, "link_fail_exist")) {
+        n = r16_file(dir, "a", CA, &same);
+        CHECK(n == 1000 && same, "%s/%s seed %lu: a has %ld bytes, the 1000 synced", kind, mode, seed, n);
+        n = r16_file(dir, "b", CB, &same);
+        CHECK(n == 700 && same, "%s/%s seed %lu: b has %ld bytes, its own 700: a link that failed with EEXIST changed it", kind, mode, seed, n);
+        return;
+    }
+    /* link_append: both names are one file, cut back to what was synced */
+    const char *names[] = {"a", "b"};
+    for (int i = 0; i < 2; i++) {
+        n = r16_file(dir, names[i], CA, &same);
+        /* (CRASHFS_TEAR may keep garbage past the synced end, up to the end of its sector: only the synced 1000 are compared) */
+        bool synced = n >= 1000 && memcmp(CA, got_head, 1000) == 0;
+        CHECK(synced && (tr ? n <= 1536 : n == 1000), "%s/%s seed %lu: %s has %ld bytes%s: the synced 1000 were wanted (a link must not hide the file from the "
+              "rollback of its data)", kind, mode, seed, names[i], n, synced ? "" : " that differ");
+    }
+}
+
 /* mode: "tear", "plain", "old" or "zero" */
 static void run_case2(const char *so, const char *kind, const char *mode, const char *dir, unsigned long seed)
 {
@@ -517,6 +693,10 @@ static void run_case2(const char *so, const char *kind, const char *mode, const 
     int st = 0;
     if (pid < 0 || waitpid(pid, &st, 0) != pid) {
         failures++;
+        return;
+    }
+    if (r16_kind(kind)) {
+        check_r16(kind, mode, dir, seed, st);
         return;
     }
     bool noloss = !strcmp(kind, "otrunc_ident");
@@ -634,7 +814,8 @@ int main(int argc, char **argv)
             }
         static const char *k2[] = {"rename_sync", "rename_newfile", "maxdirty", "otrunc_sync", "otrunc_nocreat", "otrunc_pre", "otrunc_nosync",
                                    "otrunc_dirsync", "otrunc_ident", "unlink_nosync", "write_then_unlink", "otrunc_fail_excl", "otrunc_emfile",
-                                   "tmp_rename_nosync"};
+                                   "tmp_rename_nosync", "ftrunc_fail_rdonly", "pwrite_fail_rdonly", "unlink_dir", "link_nodirsync",
+                                   "linkat_nodirsync", "link_dirsync", "link_unlink_orig", "link_fail_exist", "link_append"};
         static const char *m2[] = {"plain", "tear", "old", "zero"};
         for (int k = 0; k < (int)(sizeof k2 / sizeof k2[0]); k++)
             for (int m = 0; m < 4; m++) {

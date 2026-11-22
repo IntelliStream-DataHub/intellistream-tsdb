@@ -6,8 +6,8 @@
  * For files under $CRASHFS_ROOT it keeps what a disk would really hold:
  *  - file data is durable up to the size it had at its last fsync/fdatasync;
  *    regions rewritten in place since then are dirty;
- *  - creating, renaming and removing a directory entry is durable only after
- *    an fsync of that directory.
+ *  - creating (a file, a directory or a hard link: link and linkat), renaming and removing a directory entry is
+ *    durable only after an fsync of that directory. A call that fails changes nothing the shim keeps (round 16).
  * On a "power loss" it truncates every file to its durable size, gives the
  * dirty regions their old bytes back (a real disk keeps old or new pages of a
  * sector it was rewriting, never blank ones; CRASHFS_REWRITE=zero zeroes them,
@@ -589,7 +589,7 @@ static void add_dirop(op_kind k, const char *a, const char *b, const char *saved
 static bool keep_aside(const char *path, char *saved)
 {
     struct stat st;
-    if (lstat(path, &st) != 0)
+    if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) /* unlink of a directory fails (EISDIR): nothing is kept aside, the real call fails */
         return false;
     char dir[PATH_MAX];
     dir_of(path, dir);
@@ -1406,12 +1406,18 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     bool fail = eio_now(fd, "pwrite");
     if (fail)
         n = n > 1 ? n / 2 : 0;
-    if (f && off < f->durable) { /* a rewrite of durable data */
+    const off_t durable = f ? f->durable : 0;
+    const size_t nold = f ? f->nold : 0;
+    const bool rewrite = f && off < durable; /* a rewrite of durable data */
+    if (rewrite)
         keep_old(f, fd, off, off + (off_t)n);
-        if (rewrite_zero)
-            dirty_add(f, off, (off + (off_t)n < f->durable ? off + (off_t)n : f->durable) - off);
-    }
     ssize_t r = real_pwrite(fd, buf, n, off);
+    if (rewrite && r <= 0) { /* nothing was written (EBADF on an O_RDONLY descriptor, ENOSPC, EIO): nothing was rewritten */
+        f->nold = nold;
+    } else if (rewrite && rewrite_zero) { /* the bytes that were written, no more (a short write rewrote less) */
+        off_t end = off + (off_t)r;
+        dirty_add(f, off, (end < durable ? end : durable) - off);
+    }
     pthread_mutex_unlock(&lock);
     if (fail) {
         errno = EIO;
@@ -1651,7 +1657,7 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         char dir[PATH_MAX];
         dir_of(b, dir);
         snprintf(hard, PATH_MAX, "%s/.crashfs_saved_%d_%u", dir, (int)getpid(), saved_counter++);
-        if (link(b, hard) == 0)
+        if (syscall(SYS_linkat, AT_FDCWD, b, AT_FDCWD, hard, 0) == 0) /* (not link(): that one is the shim's own, tracked) */
             snprintf(saved, PATH_MAX, "%s", hard);
     }
     int r = at ? real_renameat(ofd, oldp, nfd, newp) : real_rename(oldp, newp);
@@ -1736,6 +1742,29 @@ static int do_unlink(int dirfd, const char *name, int flags, bool at)
 }
 
 int unlink(const char *name) { return do_unlink(AT_FDCWD, name, 0, false); }
+
+/* link and linkat (round 16, VERIFY15): a new hard link is a new directory entry, durable only after an fsync of its directory,
+ * like a created file (a leader links its COMMIT's pending parts to stage_ names and syncs the directory before the marker is
+ * written: src/replica.c). A power loss undoes it (OP_CREATE: the new name is unlinked; the file stays under its other names and
+ * keeps its data). Not tracked before: a link never synced always survived. The file's record keeps the name it had (the rollback
+ * of its data finds it by that name or by the last one a rename gave it). */
+static int do_link(int ofd, const char *a, int nfd, const char *b, int flags)
+{
+    char pb[PATH_MAX];
+    path_of_at(nfd, b, pb);
+    if (!tracked(pb))
+        return (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
+    pthread_mutex_lock(&lock);
+    maybe_crash();
+    int r = (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
+    if (r == 0)
+        add_dirop(OP_CREATE, pb, NULL, NULL);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+int link(const char *a, const char *b) { return do_link(AT_FDCWD, a, AT_FDCWD, b, 0); }
+int linkat(int ofd, const char *a, int nfd, const char *b, int flags) { return do_link(ofd, a, nfd, b, flags); }
 int unlinkat(int dirfd, const char *name, int flags) { return do_unlink(dirfd, name, flags, true); }
 
 int mkdir(const char *p, mode_t mode)
@@ -1768,6 +1797,10 @@ int mkdirat(int dirfd, const char *p, mode_t mode)
     return r;
 }
 
+/* A call that fails changed nothing on a real disk, so what the shim keeps for a power loss is committed only when the
+ * call returned (round 16, VERIFY15: a failed ftruncate on an O_RDONLY descriptor zeroed durable bytes in the zero mode;
+ * round 14 had the same for open(O_TRUNC)). The old sectors keep_old reads must be read before the call; they are
+ * dropped again when it failed (they only ever make a region come back as it was, but a failed call has no region). */
 int ftruncate(int fd, off_t len)
 {
     if (!fd_tracked(fd) || md_mode)
@@ -1775,12 +1808,17 @@ int ftruncate(int fd, off_t len)
     pthread_mutex_lock(&lock);
     maybe_crash();
     file *f = file_of_fd(fd);
-    if (f && len < f->durable) { /* cutting durable data, unsynced */
-        keep_old(f, fd, len, f->durable);
-        if (rewrite_zero)
-            dirty_add(f, len, f->durable - len);
-    }
+    const bool cut = f && len >= 0 && len < f->durable; /* cutting durable data, unsynced */
+    const off_t durable = f ? f->durable : 0;
+    const size_t nold = f ? f->nold : 0;
+    if (cut)
+        keep_old(f, fd, len, durable);
     int r = real_ftruncate(fd, len);
+    if (cut && r != 0) {
+        f->nold = nold;
+    } else if (cut && rewrite_zero) {
+        dirty_add(f, len, durable - len);
+    }
     pthread_mutex_unlock(&lock);
     return r;
 }
