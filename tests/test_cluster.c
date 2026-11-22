@@ -26,7 +26,8 @@
  *   directory (another identity) is refused and does not move the member's address.
  * watch: a watcher whose voter hangs (SIGSTOP) watches another one and keeps up.
  *
- * Usage: test_cluster [SCRATCH [SCENARIO...]]   (TSDBD: the server, default ./build/tsdbd; TSDB_CLI: ./build/tsdb)
+ * Usage: test_cluster [SCRATCH [SCENARIO...]]   (TSDBD: the server, default ./build/tsdbd; TSDB_CLI: ./build/tsdb;
+ *                                                 TSDBD_IO: epoll or uring, passed as --io)
  */
 #define _GNU_SOURCE
 #include "cluster.h"
@@ -214,6 +215,10 @@ static int start_try(int i)
         if (!fwd_on) { /* the scenarios written before forwarding (S2-2) judge s2e's MOVED off the leader */
             argv[n++] = "--forward";
             argv[n++] = "off";
+        }
+        if (getenv("TSDBD_IO") && !is_witness[i]) { /* as test_server: epoll or uring (default: tsdbd's choice) */
+            argv[n++] = "--io";
+            argv[n++] = getenv("TSDBD_IO");
         }
         char extra[256];
         snprintf(extra, sizeof extra, "%s", xargs[i] ? xargs[i] : "");
@@ -3536,12 +3541,18 @@ static void scen_userreplay(void)
  * elect another and a revoke commits there. Server 0 still takes itself for the leader: a grant of what its copy
  * says alice holds (a no-op there) asks itself for the barrier, which must refuse (no lease): UNAVAILABLE, never an
  * OK while the revoke stands. Mutant (TSDB_CLUSTER_MUTANT): syncnolease. Not covered: the barrier's check that the
- * commit index is of the leader's term (a SYNC between an election and the new leader's first commit). */
+ * commit index is of the leader's term (a SYNC between an election and the new leader's first commit).
+ * The revoke goes through the new leader at once: its own users' change must go to itself from the moment it leads.
+ * It used to follow the address the 100 ms duty last stored, server 0's for up to 100 ms after the election; server 0,
+ * held, appended the revoke and never committed it, and the revoke's connection closed after 20 s (2 of 7 runs).
+ * ul_tick_stale on servers 1 and 2 keeps that duty from moving the address, so only the role change can: mutant
+ * uladdrtick (the address moved by the duty alone) fails here every time. */
 static void scen_userlease(void)
 {
     scenario("userlease");
     strict_reads = 1;
     envs[0] = "hold_raft_file=1";
+    envs[1] = envs[2] = "ul_tick_stale=1";
     users_cluster(NULL, 1);
     tsdbc *r0 = login_on(0, "root", "root-pw");
     if (tsdbc_set_retry(r0, 0) != 0)
@@ -3576,9 +3587,11 @@ static void scen_userlease(void)
         if (!nl)
             usleep(100000);
     }
-    tsdbc *rl = login_on(nl, "root", "root-pw");
+    tsdbc *rl = login_on(nl, "root", "root-pw"); /* retries UNAVAILABLE (30 s), as clients do */
+    uint64_t tr = now_ms();
     if ((rc = tsdbc_revoke(rl, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
-        die("revoke through server %d, the new leader: %s", nl, ers(rc));
+        die("revoke through server %d, the new leader: %s after %" PRIu64 " ms (sent to server 0, the leader it "
+            "replaced?)", nl, ers(rc), now_ms() - tr);
     tsdbc_close(rl);
     if ((rc = plant_lookup(0, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
         die("server 0, its Raft core held, has alice's revoke: %s (the scenario needs it behind)", ers(rc));

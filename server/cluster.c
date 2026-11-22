@@ -1115,6 +1115,9 @@ static struct {
     int push_every_apply; /* TSDB_CLUSTER_TEST push_every_apply=1: the users watch is given the copy at every loop pass
                            * that applied something, as while a read barrier waits (test_cluster userreplay: a held
                            * older list would otherwise go out only if a heartbeat fell inside the replay) */
+    int ul_tick_stale;   /* TSDB_CLUSTER_TEST ul_tick_stale=1: the 100 ms duty does not move cluster_user_propose's address
+                          * once it names a leader; only a role change does (test_cluster userlease: a new leader that
+                          * sent its own users' change to the deposed one would do so every time, not in a 100 ms window) */
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     unsigned copy_hold;  /* TSDB_CLUSTER_TEST copy_hold=N: cc_hold_main holds a snapshot across N more */
     unsigned copy_noleader; /* TSDB_CLUSTER_TEST copy_noleader=V (test_cluster route): the copy shows volume V with no
@@ -1357,6 +1360,8 @@ static void test_knobs(void)
             C.hold_users = v != 0;
         else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
             C.push_every_apply = v != 0;
+        else if (sscanf(p, "ul_tick_stale=%llu", &v) == 1)
+            C.ul_tick_stale = v != 0;
         else if (sscanf(p, "users_probe=%llu", &v) == 1)
             C.users_probe = v != 0;
         else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
@@ -1664,7 +1669,8 @@ enum cl_mutant {
     CLM_FORCEUP = 30,      /* force-leader goes ahead while an ISR member is up (review R6) */
     CLM_PUSHREBUILD = 31,  /* the users watch is given the copy while it is rebuilt (a promotion's core_boot) */
     CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
-    CLM_SYNCNOLEASE = 33   /* USER_SYNC answered by a leader without its lease (review F7) */
+    CLM_SYNCNOLEASE = 33,  /* USER_SYNC answered by a leader without its lease (review F7) */
+    CLM_ULADDRTICK = 34    /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
 };
 static int cl_mutant(void)
 {
@@ -1706,6 +1712,7 @@ static int cl_mutant(void)
             : !strcmp(e, "pushrebuild")   ? CLM_PUSHREBUILD
             : !strcmp(e, "holdempty")     ? CLM_HOLDEMPTY
             : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
+            : !strcmp(e, "uladdrtick")    ? CLM_ULADDRTICK
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2949,6 +2956,8 @@ static void restore(const raft_action *a)
     state_replaced();
 }
 
+static void ul_addr_refresh(int tick);
+
 static void pump(void)
 {
     raft_action a;
@@ -2991,6 +3000,11 @@ static void pump(void)
             C.role = a.u.state.role;
             if (a.u.state.leader)
                 C.leader_seen = now;
+            /* at once, not at the next duty: a server elected a moment ago would otherwise send its own users'
+             * change to the leader it replaced, which, cut off but still taking itself for the leader, appends it and
+             * never commits it (the caller's connection closes after 20 s, outcome unknown: test_cluster userlease) */
+            if (cl_mutant() != CLM_ULADDRTICK)
+                ul_addr_refresh(0);
             break;
         }
         default: break;
@@ -3740,6 +3754,17 @@ static const char *leader_peer(void)
     return m ? m->peer : "";
 }
 
+/* The leader's address for cluster_user_propose: at every role change (pump) and every 100 ms (users_duty, `tick`:
+ * a leader's member record may be applied after the election that named it). */
+static void ul_addr_refresh(int tick)
+{
+    const char *lp = C.r && raft_get_role(C.r) == RAFT_LEADER ? C.padv : leader_peer();
+    pthread_mutex_lock(&ul_mu);
+    if (!tick || !C.ul_tick_stale || !g_ul_addr[0])
+        snprintf(g_ul_addr, sizeof g_ul_addr, "%s", lp);
+    pthread_mutex_unlock(&ul_mu);
+}
+
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out)
 {
     size_t n = strlen(name);
@@ -4221,11 +4246,7 @@ static void users_duty(uint64_t now)
         *w = C.uwait[--C.nuwait];
     }
 
-
-    const char *lp = C.r && raft_get_role(C.r) == RAFT_LEADER ? C.padv : leader_peer();
-    pthread_mutex_lock(&ul_mu);
-    snprintf(g_ul_addr, sizeof g_ul_addr, "%s", lp);
-    pthread_mutex_unlock(&ul_mu);
+    ul_addr_refresh(1);
 }
 
 static int user_admin_send(int aop, const uint8_t *q, size_t qn, int wait_ms, uint64_t *index, uint32_t *uid,
