@@ -453,6 +453,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
 	B=$(B) tests/test_cli_feed.sh
+	B=$(B) tests/test_cli_chunkstore.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
