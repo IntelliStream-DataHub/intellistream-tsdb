@@ -11,9 +11,12 @@
  *  - store binding: a store of another cluster or node, or of none, is refused with a line naming both;
  *  - power loss (crashfs) at every step of a put: once PUT_OK went out the chunk is there and whole, before it the
  *    chunk is absent or whole;
+ *  - EIO (crashfs eio) at every step of a run of puts: the server carries on; a store the error failed (E57) is
+ *    reported DOWN and refuses puts, one it did not fail stays UP and takes the next put whole;
  *  - net: puts and reads between two chunk servers over real links, several threads at once.
  * Mutants (--mutant NAME; the Makefile requires each to fail it): chunknofence, chunkselfraise, putokearly,
- * nocellcheck, storeforeign.
+ * nocellcheck, storeforeign. The eio case's teeth were checked by hand (chunk_be_store_state reporting a failed
+ * store UP fails it with exit 20); that check is R6's, in src/chunkstore.c.
  */
 #include "internal.h"
 #include "chunk.h"
@@ -737,6 +740,101 @@ static void test_crashfs(void)
     cdata_free(&c);
 }
 
+/* ---------------------------------------------------------------- EIO (crashfs eio): a failed store is DOWN */
+/* Puts until one fails (the shim injects one EIO), then: the report, one more put and a read of it. Exit 0: no put
+ * failed (the fault lay past the workload); 10: the store failed, is reported DOWN and refuses the put; 11: only the
+ * call failed, the store is UP and takes the put whole; 20, 21: the report and the store disagree; 30: a check. */
+static int child_eio(const char *dir)
+{
+    char st[PATH_MAX + 16];
+    snprintf(st, sizeof st, "%s/st0", dir);
+    const char *pp[1] = {st};
+    char err[256];
+    struct chunksrv *cs = chunksrv_open(pp, 1, err, sizeof err);
+    if (!cs)
+        return 3;
+    int code = 0;
+    bool failed = false;
+    for (int i = 0; i < 3 && !failed; i++) {
+        cdata c;
+        cdata_make(&c, 2, 1, 4096, 4096 * 3 * 3 + 100, 50 + (uint64_t)i);
+        failed = fake_put(cs, &c, 1 + (uint64_t)i, NULL, NULL) != 0;
+        cdata_free(&c);
+    }
+    if (failed) {
+        int up = -1;
+        chunksrv_stores(cs, &up, false);
+        cdata c;
+        cdata_make(&c, 2, 1, 4096, 4096 * 3 * 3 + 100, 60);
+        bool ok = fake_put(cs, &c, 9, NULL, NULL) == 0;
+        if (ok) {
+            cap cp = {0};
+            struct cs_req r;
+            req_of(&r, CS_OP_READ, &c, 2);
+            r.off = 0, r.len = (uint32_t)c.len;
+            ok = fake_req(cs, &r, &cp) == 0 && cp.body_len == c.len && memcmp(cp.body, c.cells, c.len) == 0;
+            free(cp.body);
+        }
+        cdata_free(&c);
+        code = up == 0 ? (ok ? 21 : 10) : (ok ? 11 : 20);
+    }
+    chunksrv_close(cs);
+    return fails ? 30 : code;
+}
+
+static void test_eio(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  eio: SKIPPED (no %s)\n", SHIM);
+        return;
+    }
+    int n[32] = {0}, k = 0;
+    for (; k < 400; k++) {
+        char dir[PATH_MAX], st[PATH_MAX + 16];
+        fresh("eio", dir, sizeof dir);
+        mkstore(dir, 0, 7, true, st, sizeof st);
+        int code = -1;
+        pid_t pid = fork();
+        if (pid == 0) {
+            char asan[512], w[16];
+            snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
+                     getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+            snprintf(w, sizeof w, "%d", k);
+            setenv("LD_PRELOAD", SHIM, 1);
+            setenv("CRASHFS_ROOT", dir, 1);
+            setenv("CRASHFS_MODE", "eio", 1);
+            setenv("CRASHFS_PROB", "1", 1);
+            setenv("CRASHFS_WARMUP", w, 1);
+            setenv("CRASHFS_SEED", w, 1);
+            int null = open("/dev/null", O_WRONLY);
+            if (null >= 0) {
+                dup2(null, 1);
+                dup2(null, 2);
+            }
+            execl(SELF, "test_chunksrv", "--child-eio", dir, (char *)NULL);
+            _exit(127);
+        }
+        int ws = -1;
+        if (pid > 0 && waitpid(pid, &ws, 0) == pid && WIFEXITED(ws))
+            code = WEXITSTATUS(ws);
+        if (code != 0 && code != 10 && code != 11) {
+            fprintf(stderr, "FAIL eio step %d: child exit %d (%s)\n", k, code,
+                    code == 20   ? "a failed store reported UP"
+                    : code == 21 ? "a store reported DOWN took a put"
+                                 : "the child failed");
+            fails++;
+            break;
+        }
+        n[code]++;
+        if (code == 0)
+            break;
+    }
+    printf("  eio: %d steps: the store failed and was reported DOWN %d times, the call alone failed %d times\n", k + 1,
+           n[10], n[11]);
+    CHECK(n[0] == 1 && n[10] > 0);
+}
+
 /* ---------------------------------------------------------------- two servers over real links */
 struct net_arg {
     struct chunksrv *a;
@@ -846,6 +944,8 @@ int main(int argc, char **argv)
         chunksrv_mutant = chunksrv_mutant_parse(getenv("TSDB_CHUNKSRV_MUTANT"));
     if (argc >= 4 && strcmp(argv[1], "--child") == 0)
         return child_put(argv[2], argv[3]);
+    if (argc >= 3 && strcmp(argv[1], "--child-eio") == 0)
+        return child_eio(argv[2]);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick"))
             quick = true;
@@ -881,6 +981,7 @@ int main(int argc, char **argv)
     test_unsure();
     test_owner();
     test_crashfs();
+    test_eio();
     test_net();
     if (fails == 0) {
         char cmd[PATH_MAX + 16];

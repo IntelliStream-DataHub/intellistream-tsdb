@@ -391,10 +391,7 @@ int chunksrv_stores(struct chunksrv *cs, int *up, bool log)
 {
     int u = 0;
     for (int i = 0; cs->be && i < cs->n; i++) {
-        int s = chunk_be_store_state(cs->be, i);
-        chunk_store *st = chunk_be_store(cs->be, i);
-        if (s == CHUNK_STORE_UP && st && chunk_store_failed(st))
-            s = CHUNK_STORE_DOWN_IOERR; /* E57: failed in place, reported DOWN; tsdbd goes on */
+        int s = chunk_be_store_state(cs->be, i); /* a store failed in place is DOWN_IOERR there (E57) */
         u += s == CHUNK_STORE_UP;
         if (log)
             fprintf(stderr, "tsdbd: chunk store %s: %s\n", cs->paths[i], chunk_store_state_name(s));
