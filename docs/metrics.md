@@ -48,6 +48,7 @@ directory) and `path`.
 | `tsdb_stats_parts_counted`, `tsdb_stats_parts_listed` | gauge | parts the statistics sweeper has counted, and parts listed: the five numbers above are exact once the two are equal (they differ for a moment after a flush or merge, or for a while after the open of a large database) |
 | `tsdb_stats_ring_overflows_total`, `tsdb_stats_cpu_seconds_total` | counter | part events the sweeper's ring dropped (it then compared its records with the part list: still exact, just later), and the CPU time of the sweeper thread |
 | `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors and tsdbd exits; alert on it |
+| `tsdb_volume_diverged` | gauge | 1 while the volume is DIVERGED (its DIVERGED file, written when a settled copy failed its digest, or an outage reopen that found acknowledged data gone): refused with UNAVAILABLE (DIVERGED), out of a cluster volume's ISR, until an operator acts (`tsdb DIR volume diverged`); alert on it |
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |
 | `tsdb_queries_total` | counter | outermost queries the engine ran, all volumes (a QUERY_MULTI counts once). 0 with `--no-stats`; the `tsdb_query_*_total` families too |
 | `tsdb_query_rows_total{source}` | counter | rows queries covered: `decoded` (granules decoded), `stats` (answered from granule statistics), `memtable` |

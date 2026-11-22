@@ -572,6 +572,16 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
     *outage_id = 0;
     *retry_ms = 1000;
     *domain = 0xffff;
+    if (vol_diverged(v, NULL)) { /* first: a diverged replica is not merely FENCED, nor a diverged leader UNREACHABLE */
+        *health = TSDB_HEALTH_UNAVAILABLE;
+        *reason = TSDB_WHY_DIVERGED;
+        *retry_ms = 60000;
+        int d = dom_of(v);
+        tsdb_domain_info di;
+        if (d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0) /* the outage it came from, if any */
+            *domain = (uint16_t)d, *since_ms = di.since_ms, *outage_id = di.outage_id;
+        return;
+    }
     int cw = cvol_why((uint32_t)v); /* a cluster volume: a replica (FENCED), one not open yet (RECOVERING), or led
                                       * here without a read lease (UNREACHABLE: retried after about a heartbeat) */
     if (cw >= 0) {
@@ -590,15 +600,8 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
         return;
     *since_ms = di.since_ms;
     *outage_id = di.outage_id;
-    bool diverged = v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].diverged);
     int64_t age = di.age_ms < 0 ? 0 : di.age_ms;
     uint32_t after = (uint32_t)(age / 10 < 1000 ? 1000 : age / 10 > 60000 ? 60000 : age / 10);
-    if (diverged) {
-        *health = TSDB_HEALTH_UNAVAILABLE;
-        *reason = TSDB_WHY_DIVERGED;
-        *retry_ms = 60000;
-        return;
-    }
     switch (di.state) {
     case TSDB_DOM_DOWN:
         *health = TSDB_HEALTH_UNAVAILABLE;
@@ -625,6 +628,12 @@ static void vol_health(size_t v, uint8_t *health, uint8_t *reason, int64_t *sinc
     }
 }
 
+/* The metrics thread's view of vol_diverged (no I/O, any thread). */
+static int metrics_vol_diverged(uint32_t v)
+{
+    return vol_diverged(v, NULL);
+}
+
 /* The one entry of an UNAVAILABLE reply: the named volume's health. A refusal whose volume is known to be fine
  * (the library quiesced it a moment ago) says RECOVERING, the reason a quiesced volume has. */
 static tsdb_unavail unav_entry(uint16_t vol)
@@ -640,7 +649,8 @@ static tsdb_unavail unav_entry(uint16_t vol)
     }
     if (vol == TSDB_VOL_ANY) { /* the first domain that is not UP, else nothing is known */
         size_t nvol = dom.db ? tsdb_volume_count(dom.db) : 0;
-        for (size_t v = 1; v < DOM_MAX_VOLS && v < nvol; v++) {
+        for (size_t v = 0; v < DOM_MAX_VOLS && v < nvol; v++) { /* the root has no domain, but may be DIVERGED */
+
             vol_health(v, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
             if (health != TSDB_HEALTH_AVAILABLE)
                 goto found;
@@ -5967,7 +5977,8 @@ int main(int argc, char **argv)
                           .max_conns = max_conns,
                           .workers = workers_now,
                           .request_memory = request_memory_now,
-                          .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL};
+                          .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL,
+                          .vol_diverged = metrics_vol_diverged};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

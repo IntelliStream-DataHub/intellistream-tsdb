@@ -91,6 +91,7 @@ static struct {
     int writes;  /* TSDB_CLUSTER_WRITES=1 */
     int replica_reads; /* TSDB_REPLICA_READS=1: a replica with a lease answers reads (tests only, until REPLICA_OK) */
     int mutant;  /* 1 noopengen, 3 anynonce, 4 refusedsilent (the others are cvolfs.h's) */
+    bool divergeisr; /* TSDB_REPLD_MUTANT=divergeisr: the planted "DIVERGED stays healthy" skips this report too */
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
     unsigned unreach_ms; /* UNREACH_MS, or TSDB_CVOL_TEST unreach_ms=N (tests only: a report later than the leader's
                           * shrink request, which cluster.c's cut_move holds for, test_cluster cuthold) */
@@ -266,6 +267,10 @@ static void on_report(void *arg, struct cluster_report *out)
     for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
         if (repld_failed(out->vols[i].volume))
             out->vols[i].health = CL_HEALTH_LOCAL_FAULT; /* D13: reported in the next heartbeat (r3e-failover acts) */
+        /* D8: a DIVERGED volume (its file, read by the open) is LOCAL_FAULT from the first heartbeat after the open,
+         * not only once the driver's tick has stopped it: in between, a restarted replica would report OK */
+        if (!M.divergeisr && M.t && tsdb_volume_diverged(M.t, out->vols[i].volume) == 1)
+            out->vols[i].health = CL_HEALTH_LOCAL_FAULT;
         uint64_t pe = 0;
         int l = repld_leading(out->vols[i].volume, &pe); /* the driver's writer only while its core leads: a deposed */
         if (l >= 0)                                       /* one is no OWNER (the Raft leader's lease check) */
@@ -354,7 +359,10 @@ int cvol_start(tsdb *t, const char *dir)
     M.replica_reads = rr && !strcmp(rr, "1");
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
+    const char *rmu = getenv("TSDB_REPLD_MUTANT");
+    M.divergeisr = rmu && !strcmp(rmu, "divergeisr");
     const char *mu = getenv("TSDB_CVOL_MUTANT");
+
     M.mutant = mu && !strcmp(mu, "noopengen")       ? 1
                : mu && !strcmp(mu, "anynonce")      ? 3
                : mu && !strcmp(mu, "refusedsilent") ? 4

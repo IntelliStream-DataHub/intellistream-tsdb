@@ -2108,8 +2108,10 @@ struct eng {
     void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
     atomic_bool quiesced;  /* no new caller: the volume is being recovered */
-    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced until a
-                            * restart (tsdb_volume_resume does not clear it) */
+    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced, also after
+                            * a restart (the DIVERGED file, src/ecdiverge.h) until `volume diverged --clear`
+                            * (tsdb_volume_resume does not clear it) */
+
     struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
     pthread_mutex_t tl_mu;  /* a leaf */
     bool retiring;        /* eng_close keeps the names of the dictionaries (eng_retire) */

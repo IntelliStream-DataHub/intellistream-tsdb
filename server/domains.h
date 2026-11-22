@@ -36,6 +36,7 @@ typedef struct dom_vol {
     int inflight, counted;   /* under dom_mu: requests inside, and how many of them count as waiting workers */
     atomic_bool recovering;  /* a recovery thread runs */
     atomic_bool diverged;    /* the reopen found lost data: quiesced until tsdbd restarts (sticky) */
+    atomic_int div_logged;   /* vol_diverged's log-once bits: 1 the engine's DIVERGED file, 2 the reopen's report */
 } dom_vol;
 
 static struct {
@@ -65,6 +66,30 @@ static void dom_log(const char *what, size_t v, const char *extra)
 {
     fprintf(stderr, "tsdbd: [%.3f] volume %zu: %s%s%s\n", dom_now_s(), v, what, extra ? ": " : "",
             extra ? extra : "");
+}
+
+/* The one answer to "is volume v DIVERGED" (r8i, D8): the engine's durable flag (the DIVERGED file, src/ecdiverge.h:
+ * a settle's digest that failed, set again by every open) or the outage reopen's report (dom.vol[v].diverged, memory
+ * only: a restart accepts that loss). Both are TSDB_WHY_DIVERGED; vol_health, and through it UNAVAILABLE, STATUS,
+ * TOPOLOGY and the metrics, read only this, so the two flags never give two answers. `which` names the source (the
+ * engine's first); the first sighting of each source is logged once per volume. No I/O: the engine flag is an atomic
+ * read under the tsdb read lock. */
+static bool vol_diverged(size_t v, const char **which)
+{
+    const char *w = NULL;
+    int bit = 0;
+    if (dom.db && tsdb_volume_diverged(dom.db, v) == 1) /* the root too: it has a tier, and refuses when diverged */
+
+        w = "the volume's DIVERGED file", bit = 1;
+    else if (v < DOM_MAX_VOLS && atomic_load(&dom.vol[v].diverged))
+        w = "the outage reopen's report", bit = 2;
+    if (which)
+        *which = w;
+    if (!w)
+        return false;
+    if (v < DOM_MAX_VOLS && !(atomic_fetch_or(&dom.vol[v].div_logged, bit) & bit))
+        dom_log("DIVERGED, refused until an operator acts (tsdb DIR volume diverged)", v, w);
+    return true;
 }
 
 /* The domain of volume v: the longest prefix that holds its directory. Decided once, by comparing strings (no I/O:

@@ -107,6 +107,7 @@
 #include "peerlink.h"
 #include "replwire.h"
 #include "../src/cvol.h"
+#include "../src/ecdiverge.h"
 #include "../src/marker.h"
 #include "../src/repl.h"
 #include "../src/replfile.h"
@@ -269,7 +270,8 @@ enum {
     RM_TICKSTRETCH,
     RM_STEPCURRENTONLY,
     RM_STALLCATCHUP,
-    RM_DEMOTESTALEIDX /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
+    RM_DEMOTESTALEIDX, /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
+    RM_DIVERGEISR      /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
 };
 
 static struct {
@@ -321,6 +323,8 @@ static struct {
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int plant_diverge; /* TSDB_REPLD_TEST=plantdiverge (tests only): <dir>/diverge.<volume> makes that volume DIVERGED
+                        * (ec_diverge, EC_DIV_TEST) at the driver's next tick, and is removed */
     int no_fence_reply; /* TSDB_REPLD_TEST=nofencereply (tests only): no FENCE_REPLY leaves while <dir>/nofencereply
                          * exists (the fence is saved; a member that dies before its answer is out) */
     int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
@@ -1390,6 +1394,23 @@ static void vol_fail(struct rvol *rv, const char *why)
     tsdb_cvol_unref(&db);
 }
 
+/* TSDB_REPLD_TEST=plantdiverge: the volume's DIVERGED file as a settle's failed digest writes it. Under rv->mu, which
+ * it lets go of for the write (the engine reference must not be held across a replace, nor rv->mu across I/O). */
+static void plant_diverge(struct rvol *rv)
+{
+    char f[sizeof G.dir + 32];
+    snprintf(f, sizeof f, "%s/diverge.%" PRIu32, G.dir, rv->number);
+    if (access(f, F_OK) != 0)
+        return;
+    pthread_mutex_unlock(&rv->mu);
+    unlink(f);
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    int rc = db ? ec_diverge(db, 0, NULL, EC_DIV_TEST) : TSDB_ERR_UNAVAILABLE;
+    tsdb_cvol_unref(&db);
+    say("test: volume %" PRIu32 ": planted DIVERGED: %s", rv->number, rc ? tsdb_strerror(rc) : "ok");
+    pthread_mutex_lock(&rv->mu);
+}
+
 static int promote_fn(void *ctx, struct eng **old, struct eng **neu)
 {
     struct rvol *rv = ctx;
@@ -2106,6 +2127,20 @@ static void *vol_main(void *arg)
                 rv->sync_late = 0;
                 synced_locked(rv, NULL, l);
             }
+            /* D8, D13: a DIVERGED volume (its DIVERGED file: a settled copy failed its digest) must not stay in the
+             * ISR, where a failover could promote it with the rows it lost, nor lead: it stops like a failed one
+             * (deposed, quiesced, LOCAL_FAULT in the heartbeat) and the process serves the others. The open sets the
+             * flag from the file, so a restart stops it again at its first tick. */
+            if (G.plant_diverge)
+                plant_diverge(rv);
+            if (!rv->failed && G.mutant != RM_DIVERGEISR && tsdb_volume_diverged(G.t, rv->number) == 1) {
+                vol_fail(rv, "the volume is DIVERGED (tsdb DIR volume diverged lists why)");
+                pthread_mutex_unlock(&rv->mu);
+                if (G.mutant != RM_NOQUIESCE)
+                    tsdb_volume_quiesce(G.t, rv->number); /* clients get UNAVAILABLE (DIVERGED) or MOVED on */
+                pthread_mutex_lock(&rv->mu);
+                continue;
+            }
             repl_tick(rv->core);
             commit_watch(rv, now);
             next_tick += TICK_MS;
@@ -2273,6 +2308,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "stallcatchup")   ? RM_STALLCATCHUP
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                : !strcmp(mu, "demotestaleidx") ? RM_DEMOTESTALEIDX
+               : !strcmp(mu, "divergeisr")     ? RM_DIVERGEISR
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2298,6 +2334,7 @@ void repld_init(tsdb *t, const char *dir)
     G.stall_inbox = te && strstr(te, "stallinbox");
     G.cut_links = te && strstr(te, "cutlinks");
     G.no_fence_reply = te && strstr(te, "nofencereply");
+    G.plant_diverge = te && strstr(te, "plantdiverge");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");

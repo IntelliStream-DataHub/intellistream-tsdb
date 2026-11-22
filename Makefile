@@ -50,7 +50,7 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart diverge
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
@@ -102,7 +102,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -279,6 +279,11 @@ $(B)/test_upgrade: tests/test_upgrade.c src/internal.h $(LIB)
 $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# the DIVERGED file (src/ecdiverge.c, R8 D8): damage, power loss and EIO at every step (crashfs), --clear, and tsdbd's
+# one answer for it (STATUS, UNAVAILABLE, /metrics, the root included). The mutant runs plant the bugs it guards against.
+$(B)/test_diverge: tests/test_diverge.c tests/harness.h src/internal.h src/ecdiverge.h $(CLIB) $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
 # an insert's intent recovered at the open (src/part.c intents_recover), power lost at every step of it (crashfs);
 # the mutant unlinks the intent before its renames are synced and must fail
 $(B)/test_intents: tests/test_intents.c src/internal.h $(LIB) $(CRASHFS_SO)
@@ -324,7 +329,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -344,6 +349,9 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	$(MUT) --name test_upgrade --list "v8hash48" -- ./$(B)/test_upgrade --mutant @M@ @D@ # the planted bug must fail it
 	./$(B)/test_fno $(or $(TMPDIR),/tmp)
 	$(MUT) --name test_fno --list "reuse manifest markers nosync flushclose walclock" -- ./$(B)/test_fno --mutant @M@ @D@ # each planted bug must fail it
+	TSDBD=$(TSDBD) ./$(B)/test_diverge $(or $(TMPDIR),/tmp)
+	$(MUT) --name test_diverge --list "nocorrupt seed0 nocut notailconfirm readerrend" -- ./$(B)/test_diverge --case damage --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_diverge --list "nofail nodirsync nofdatasync metaopen" -- ./$(B)/test_diverge --case eio,power,preexist,cli --mutant @M@ @D@
 	./$(B)/test_intents $(or $(TMPDIR),/tmp)
 	$(MUT) --name test_intents --stdout-only --grep 'ROWS WRONG' --list "unlinkfirst" -- ./$(B)/test_intents --mutant @M@ @D@ # the old order must lose rows
 	./$(B)/test_drops $(or $(TMPDIR),/tmp)
@@ -437,7 +445,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_ecpart $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(or $(TMPDIR),/tmp)
@@ -454,6 +462,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
+	B=$(B) tests/test_cli_diverged.sh
 	B=$(B) tests/test_cli_feed.sh
 	B=$(B) tests/test_cli_chunkstore.sh
 	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
@@ -904,7 +913,7 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
-	    refusedsilent
+	    refusedsilent divergeisr
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(or $(TMPDIR),/tmp)

@@ -6,6 +6,7 @@
 #include "tsdb.h"
 #include "../client/tsdb_client.h"
 #include "../src/chunk.h"
+#include "../src/ecdiverge.h"
 #include "tsdb_calendar.h"
 
 #include <errno.h>
@@ -136,6 +137,9 @@ static void usage(void)
             "  volume add <path>                  add a volume: a directory for series of their own\n"
             "                                     (e.g. one per disk or NFS mount); also while tsdbd runs\n"
             "  volume list                        list the volumes, the database directory first\n"
+            "  volume diverged [PATH] [--clear]   the DIVERGED records of volume PATH (default: DIR), whose\n"
+            "                                     settled data did not match; --clear (with the writer stopped)\n"
+            "                                     removes them so it is served again; refused on a cluster volume\n"
             "  upgrade                            carry a database closed cleanly by the previous release\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
             "  latest NAME... [--with-nulls] [--end TIME]\n"
@@ -1544,6 +1548,23 @@ int main(int argc, char **argv)
         else
             printf("%s: %d director%s carried over to disk format 9; parts keep their old headers until merges "
                    "rewrite them\n", dir, rc, rc == 1 ? "y" : "ies");
+        return 0;
+    }
+    if (strcmp(cmd, "volume") == 0 && argc >= 4 && strcmp(argv[3], "diverged") == 0) {
+        /* without opening the database: a DIVERGED volume would be refused, and --clear needs the writer stopped */
+        bool clear = false;
+        const char *path = dir;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--clear") == 0)
+                clear = true;
+            else if (argv[i][0] != '-' && path == dir)
+                path = argv[i];
+            else
+                usage();
+        }
+        int rc = ecdiverge_cli(path, clear, stdout);
+        if (rc < 0)
+            die(path, rc);
         return 0;
     }
     if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
