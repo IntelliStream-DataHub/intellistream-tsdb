@@ -35,6 +35,8 @@
         tsdb_test_class_switch;
         tsdb_test_deferred_retires;
         tsdb_test_dict_fault;
+        tsdb_test_ec_retries;
+        tsdb_test_engine;
         tsdb_test_fence_wakeups;
         tsdb_test_granules;
         tsdb_test_kept_names;
@@ -52,6 +54,9 @@
         tsdb_test_observe;
         tsdb_test_precommit;
         tsdb_test_reopen_hook;
+        tsdb_test_replica_drops_files;
+        tsdb_test_replica_drops_floor;
+        tsdb_test_settle;
         tsdb_test_wal_state;
         *;
 };
