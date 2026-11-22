@@ -66,6 +66,7 @@
  * its chunks are durable, and then its tmp_*.ec too, nothing renamed. An unknown name ends the process with status 2 at the first point passed.
  */
 #include "ecswap.h"
+#include "ecapply.h"
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
@@ -310,6 +311,15 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     pthread_mutex_lock(&db->publish_lock);
     int rc = eng_check(db) ? TSDB_ERR_IO : 0;
     bool early = ecswap_mutant == SWAP_MUT_EARLY;
+    /* R8 (src/ecapply.h): before the intent's commit point, a cluster ec volume's .ec PPOS records and the COLD's
+     * RSTATE `doing` (a stub that does nothing elsewhere); failed, nothing of the swap is visible */
+    if (rc == 0 && (rc = ecapply_swap_pre(db, in, ec, n)) != 0) {
+        pthread_mutex_unlock(&db->publish_lock);
+        if (rc != TSDB_ERR_NOMEM)
+            swap_discard(db, NULL, ec, n);
+        free(at);
+        return rc;
+    }
     if (rc == 0 && !early && (rc = intent_write(db, intent, in, ec, n)) != 0) {
         pthread_mutex_unlock(&db->publish_lock);
         if (rc != TSDB_ERR_NOMEM || settle_mutant == SETTLE_MUT_GCDOUBLE) /* NOMEM: nothing written, the caller
@@ -383,6 +393,7 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
         pthread_mutex_unlock(&db->publish_lock);
         return rc; /* the engine failed; the intent is still there: the next open rolls the swap forward */
     }
+    ecapply_swap_post(db, in, ec, n); /* R8: the swap is durable (a COLD's RSTATE `done`); under publish_lock */
     settle_crash(SC_BEFORE_UNLINK);
     /* The swap is durable and listed. An intent that stays (this unlink failed, or a power cut brings it back:
      * nothing syncs it) is rolled forward at the next open, which finds the L names (ecswap_recover). */

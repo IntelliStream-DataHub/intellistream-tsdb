@@ -26,6 +26,7 @@
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecswap.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <stddef.h>
@@ -916,6 +917,12 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return rc;
     }
+    /* an ec cluster volume (R8, src/ppos.h): the output's position is durable in PPOS before its name is */
+    if (db->ppos) {
+        const char *nm = name;
+        if ((rc = ppos_record(db, &nm, 1, w->ppos)) != 0)
+            goto fail;
+    }
     /* a merge that finishes after the engine failed: a failed engine names no new files */
     if (eng_check(db) || renameat(db->dirfd, w->tmp_name, db->dirfd, name) != 0) {
         rc = TSDB_ERR_IO;
@@ -1009,6 +1016,19 @@ int parts_commit(eng *db, part **ps, size_t n)
         p->level = 0;
         snprintf(p->name, sizeof p->name, "p%" PRId64 "_%" PRIu64 "_%" PRIu64 "_0.part", p->partition, p->min_block,
                  p->max_block);
+    }
+    /* an ec cluster volume (R8, src/ppos.h): the parts' positions are durable in PPOS before any of their names is (a
+     * COMMIT's position on a leader or a replica, jr_part_pos; a flush's from its memtable's map, ppos_flush_begin) */
+    if (db->ppos) {
+        const char **nm = malloc(n * sizeof *nm);
+        if (!nm)
+            return TSDB_ERR_NOMEM;
+        for (size_t i = 0; i < n; i++)
+            nm[i] = ps[i]->name;
+        int rc = ppos_record(db, nm, n, jr_part_pos());
+        free(nm);
+        if (rc)
+            return rc;
     }
     char intent[64] = "";
     if (n > 1) {

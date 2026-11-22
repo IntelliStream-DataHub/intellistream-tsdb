@@ -38,6 +38,7 @@
  * wal_sync_lock only guards the wal_writing flag.
  */
 #include "internal.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -144,11 +145,14 @@ void mt_unref(memtable *m)
         free(s->v);
         free(s->lsn);
     }
+    if (m->ppos)
+        ppos_mt_free(m);
     mt_s_free(m);
     tsdb_free_big(m->ids, (size_t)m->idcap * sizeof *m->ids);
     free(m);
 }
 
+void (*ppos_test_note)(struct eng *db, memtable *m, int site, size_t n); /* test hook (internal.h eng_ppos_rows) */
 int (*mt_test_reserve_fail)(uint32_t id); /* test hook: nonzero fails the growth of series id (tests/test_failstop.c) */
 /* test hook: how often the slow part of the room check ran (tests/test_failstop.c: a row inside the capacity must not
  * get here; counted with a relaxed atomic, on the slow path only) */
@@ -1319,7 +1323,10 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
             mt_unreserve(db->active, series, n); /* no mt_add clears the counts */
     }
     if (rc == 0) {
-        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_enabled ? fno0 : db->wal_appended + 1, type);
+        const uint64_t f0 = db->wal_enabled ? fno0 : db->wal_appended + 1;
+        rc = mt_add(db->active, series, cs, ts, v, w, n, f0, type);
+        if (rc == 0)
+            eng_ppos_rows(db, db->active, PPOS_SITE_INSERT, ts, n, f0, NULL);
         if (rc && db->wal_enabled)
             eng_fail(db, "adding a write the WAL holds to the memtable", ENOMEM); /* cannot happen: room reserved */
     }
@@ -1600,6 +1607,8 @@ int flush_waiting(eng *db)
             (rc = eng_leader_wait(db, m->fno_end - 1, gate_hook && eng_test_mutant != MUT_LEADER_GATE_NOHOOK)) != 0)
             break;
         cls_freeze(db); /* one history from placing its rows until they are listed (classes.c) */
+        if (db->ppos) /* the parts' positions from m's map (src/ppos.h), through parts_commit's ppos_record */
+            ppos_flush_begin(db, m);
         rc = mt_write(db, m, &pl);
         struct cls_wtail *wt = rc == 0 && db->cls_on ? cls_wal_tail_new(m) : NULL;
         if (rc == 0) {
@@ -1610,6 +1619,8 @@ int flush_waiting(eng *db)
             else
                 jr_commit(db, JR_FLUSHED, &pl);
         }
+        if (db->ppos)
+            ppos_flush_end(db, m);
         if (rc) {
             cls_thaw(db);
             free(wt);
@@ -2291,8 +2302,10 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                 if (cached_seq >= segs[k].seq)
                     continue; /* already in a part */
                 rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0, -1);
-                if (rc == 0)
+                if (rc == 0) {
                     mt_note_fno(m, wr.fno + i, 1);
+                    eng_ppos_rows(db, m, PPOS_SITE_REPLAY, &ts, 1, wr.fno + i, NULL);
+                }
             }
             if (rc)
                 break;
@@ -2316,9 +2329,13 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         free(buf);
         if (rc == 0 && !ro) {
             part_list pl = {0};
+            if (db->ppos)
+                ppos_flush_begin(db, m);
             rc = mt_write(db, m, &pl);
             if (rc == 0)
                 rc = parts_publish(db, pl.p, pl.n);
+            if (db->ppos)
+                ppos_flush_end(db, m);
             if (rc)
                 parts_discard(db, pl.p, pl.n);
             free(pl.p);

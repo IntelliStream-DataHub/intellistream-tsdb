@@ -26,4 +26,22 @@ bool eccold_may_attach(struct eng *db);
 int eccold_open(struct eng *db);
 void eccold_close(struct eng *db);
 
+/* ---- the leader API (r8a2-hooks, built in src/replica.c) ---- */
+struct mk;
+/* A COLD marker m (its file list, objects, Y and retired names filled in; flush_through 0: the leader's flushed
+ * segment, as a COMMIT's) carried to the replicas as a COMMIT is: the i-th file the marker names is shipped from
+ * src[i] (a name in the volume's directory, size and checksum as the marker says) and linked as stage_<key>.part,
+ * the directory synced, then the marker appended and waited for. 0 with *pos its position; TSDB_ERR_INDETERMINATE
+ * when the leader was deposed meanwhile (a later open as a replica decides); any other error: refused (no marker), or
+ * the engine failed. The caller holds jr_serial (eccold.c's gate), never publish_lock. */
+int jr_cold(struct eng *db, struct mk *m, const char *const *src, size_t n, uint64_t *pos);
+/* The leader's RSTATE record of the swap that carries the COLD at pos out (key: its partition key): `doing` before the
+ * swap intent's commit point, `done` after its renames, both with publish_lock held (ecapply_swap_pre/post). A
+ * deposed leader reopened as a replica skips a COLD at or below `done` and decides one in `doing` by what is listed
+ * (ecapply_cold_decide). A failed save fails the engine. Nothing on an engine that is not a leader. */
+int jr_cold_precommit(struct eng *db, uint64_t pos, int64_t key);
+int jr_cold_commit(struct eng *db, uint64_t pos);
+/* The COLD in progress RSTATE names (pos 0: none), a leader's or a replica's, read at open (or with publish_lock). */
+int jr_cold_pending(struct eng *db, uint64_t *pos, int64_t *key);
+
 #endif

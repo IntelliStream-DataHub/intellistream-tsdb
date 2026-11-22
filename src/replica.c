@@ -32,6 +32,11 @@
  */
 #include "replica.h"
 #include "marker.h"
+#include "ecapply.h"
+#include "eccold.h"
+#include "ecdigest.h"
+#include "ecgcmk.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -51,11 +56,13 @@ typedef struct rseg {
     uint64_t len;   /* its valid bytes */
 } rseg;
 
-/* The RSTATE file: which COMMIT and DROP markers are carried out already. A replica writes it as it applies them, a
- * leader as it publishes its own (jr_precommit, jr_commit, leader_rs_drop), so a deposed leader reopened as a replica
- * skips its own published markers instead of applying them again (design-cluster.md 6.3). */
+/* The RSTATE file: which COMMIT, DROP and COLD markers are carried out already. A replica writes it as it applies them,
+ * a leader as it publishes its own (jr_precommit, jr_commit, leader_rs_drop, jr_cold_precommit, jr_cold_commit), so a
+ * deposed leader reopened as a replica skips its own published markers instead of applying them again
+ * (design-cluster.md 6.3). A COLD's swap allocates no block numbers, so its `doing` names the marker's key and the
+ * recovery asks what is listed (ecapply_cold_decide) instead of looking for a block. */
 struct rstate {
-    uint64_t done; /* the last position of the last COMMIT or DROP applied */
+    uint64_t done; /* the last position of the last COMMIT, DROP or COLD applied */
     uint64_t doing_pos, doing_b0, doing_n; /* a COMMIT being published: its position, first block, parts (0: none) */
     struct rdrop {
         uint64_t pos;  /* the DROP's position */
@@ -64,6 +71,8 @@ struct rstate {
     size_t ndrops;
     uint64_t kept; /* the wal_ segments up to this seq hold no row outside the parts: a writer's open neither replays nor
                     * removes them (a leader's flushed segments kept for its replicas, a promoted replica's) */
+    uint64_t cold_pos; /* a COLD being carried out: its last position (0: none), and its partition key */
+    int64_t cold_key;
 };
 
 struct replica {
@@ -115,10 +124,14 @@ struct replica {
     } *cm; /* ascending by first */
     size_t ncm, capcm;
     struct rstate rs; /* the RSTATE file */
+    uint64_t mk_seq;  /* the segment of the marker being applied (the applier's: replica_flush_through) */
 };
 
+/* The position of the COMMIT whose parts this thread commits (apply_commit), for jr_part_pos */
+static __thread uint64_t rp_part_pos;
+
 #define RP_CHUNK ((size_t)1 << 20)
-#define RP_AGAIN 1 /* a marker's apply: a cut came while rp->mu was let go, nothing was done, read the record again */
+/* RP_AGAIN (src/ecapply.h): a marker's apply: a cut came while rp->mu was let go, nothing was done, read it again */
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
 static int rs_load(eng *db, struct rstate *rs);
@@ -750,7 +763,8 @@ int replica_floor_saved(eng *db, uint64_t floor)
  * `drops` the DROPs applied, which a replay needs to keep the rows of dropped partitions out of the memtable again.
  */
 #define RS_FILE "RSTATE"
-#define RS_MAGIC UINT64_C(0x5453544154535231)
+#define RS_MAGIC UINT64_C(0x5453544154535232) /* "2RSTATST": format 2 adds the COLD in progress (R8) */
+#define RS_MAGIC_1 UINT64_C(0x5453544154535231) /* format 1 (before R8): refused by name, no carry-over (0.11-dev) */
 
 static uint64_t stage_key(const char *name) { return xxh64(name, strlen(name), 0); }
 
@@ -877,13 +891,33 @@ static void durable_raise(struct replica *rp, uint64_t v)
         rp->durable_next = v;
 }
 
-/* a COMMIT marker that arrived (appended, or found at open): remembered until it is applied or cut */
+/* The markers that ship files (COMMIT; COLD's .ec and Y files, R8): their file lists, read the same way. A file of a
+ * COLD is a part's name or an .ec index file's; of a COMMIT a part's only. */
+static bool mk_ships(const mk *m) { return m->type == MK_COMMIT || m->type == MK_COLD; }
+
+static uint32_t mkf_count(const mk *m) { return m->type == MK_COMMIT ? m->u.commit.nfiles : m->u.cold.nfiles; }
+
+static bool mkf_next(const mk *m, size_t *pos, mk_file *f)
+{
+    return m->type == MK_COMMIT ? mk_file_next(&m->u.commit, pos, f) : mk_cold_file_next(&m->u.cold, pos, f);
+}
+
+static bool mkf_name_ok(const mk *m, const char *name)
+{
+    return part_file_name(name) || (m->type == MK_COLD && ec_file_name(name));
+}
+
+/* A marker that ships files (COMMIT, COLD) that arrived (appended, or found at open): remembered until it is applied or
+ * cut. Its positions are not durable here before every file it names is staged (hold_cap), the same for both types: a
+ * COLD acknowledged without its .ec and Y files would leave this member, once promoted, unable to carry it out. */
 static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
 {
-    const mk_commit *c = &m->u.commit;
     uint64_t last = wr->fno + wr->span - 1;
     if (last <= rp->rs.done)
         return 0; /* applied already (RSTATE): nothing to stage */
+    if (m->type == MK_COLD && eng_test_mutant == MUT_REPLICA_COLD_NO_STAGE)
+        return 0; /* planted: a COLD's files are not waited for */
+    const uint32_t nfiles = mkf_count(m);
     if (rp->ncm == rp->capcm) {
         size_t cap = rp->capcm ? rp->capcm * 2 : 8;
         struct rcm *x = realloc(rp->cm, cap * sizeof *x);
@@ -896,12 +930,12 @@ static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
     memset(x, 0, sizeof *x);
     x->first = wr->fno;
     x->last = last;
-    x->f = calloc(c->nfiles ? c->nfiles : 1, sizeof *x->f);
+    x->f = calloc(nfiles ? nfiles : 1, sizeof *x->f);
     if (!x->f)
         return TSDB_ERR_NOMEM;
     size_t pos = 0;
     mk_file f;
-    while (x->nf < c->nfiles && mk_file_next(c, &pos, &f)) {
+    while (x->nf < nfiles && mkf_next(m, &pos, &f)) {
         struct rcf *e = &x->f[x->nf];
         if (f.name_len == 0 || f.name_len >= sizeof e->name) {
             free(x->f);
@@ -915,11 +949,11 @@ static int cm_add(struct replica *rp, const wal_rec *wr, const mk *m)
         x->nf++;
     }
     for (uint32_t i = 0; i < x->nf; i++)
-        if (!part_file_name(x->f[i].name)) {
+        if (!mkf_name_ok(m, x->f[i].name)) {
             free(x->f);
             return TSDB_ERR_CORRUPT;
         }
-    if (x->nf != c->nfiles) {
+    if (x->nf != nfiles) {
         free(x->f);
         return TSDB_ERR_CORRUPT;
     }
@@ -977,8 +1011,8 @@ static void rp_lock(struct replica *rp)
 int replica_stage(eng *db, const char *name, const void *buf, size_t len)
 {
     struct replica *rp = db->rp;
-    if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0)
-        return TSDB_ERR_INVALID;
+    if (!rp || !name || !(part_file_name(name) || ec_file_name(name)) || strlen(name) >= 64 || len == 0)
+        return TSDB_ERR_INVALID; /* a part, or a COLD's .ec file */
     const bool trunc = eng_test_mutant == MUT_REPLICA_STAGE_TRUNC;
     uint64_t key = stage_key(name), xx = xxh64(buf, len, 0);
     char sp[40], tp[48];
@@ -1042,7 +1076,7 @@ int replica_stage_spilled(eng *db, const char *name, int fd, const char *tmp, si
 {
     struct replica *rp = db->rp;
     struct stat st;
-    if (!rp || !name || !part_file_name(name) || strlen(name) >= 64 || len == 0 || fd < 0 ||
+    if (!rp || !name || !(part_file_name(name) || ec_file_name(name)) || strlen(name) >= 64 || len == 0 || fd < 0 ||
         strncmp(tmp, "stage_s", 7) != 0) {
         replica_spill_drop(db, tmp);
         return TSDB_ERR_INVALID;
@@ -1115,7 +1149,7 @@ int replica_missing(eng *db, uint64_t *pos, char *name, size_t cap, uint64_t *si
 
 static int rs_save(eng *db, struct rstate *rs)
 {
-    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8 + 8, o = 0;
+    size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8 + 16 + 8, o = 0;
     uint8_t *b = malloc(n);
     if (!b)
         return TSDB_ERR_NOMEM;
@@ -1130,6 +1164,8 @@ static int rs_save(eng *db, struct rstate *rs)
         put64(b + o, (uint64_t)rs->drops[i].until), o += 8;
     }
     put64(b + o, rs->kept), o += 8;
+    put64(b + o, rs->cold_pos), o += 8;
+    put64(b + o, (uint64_t)rs->cold_key), o += 8;
     put64(b + o, xxh64(b, o, 0));
     int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, b, n) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
@@ -1154,9 +1190,15 @@ static int rs_load(eng *db, struct rstate *rs)
     int rc = read_file(db->dirfd, RS_FILE, &b, &len);
     if (rc)
         return rc;
-    bool ok = len >= 64 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
+    if (len >= 8 && get64(b) == RS_MAGIC_1) {
+        free(b);
+        fprintf(stderr, "tsdb: %s: RSTATE is of format 1 (written before 0.11.0's R8), this binary reads format 2 only: "
+                        "initialise the cluster again (0.11 development clusters carry nothing over)\n", db->dir);
+        return TSDB_ERR_CORRUPT;
+    }
+    bool ok = len >= 80 && get64(b) == RS_MAGIC && get64(b + len - 8) == xxh64(b, len - 8, 0);
     uint64_t nd = ok ? get64(b + 40) : 0;
-    ok = ok && nd <= (len - 64) / 16 && len == 64 + nd * 16;
+    ok = ok && nd <= (len - 80) / 16 && len == 80 + nd * 16;
     if (!ok) {
         free(b);
         fprintf(stderr, "tsdb: %s: RSTATE is damaged: the replica's state is lost, rebuild it\n", db->dir);
@@ -1179,6 +1221,8 @@ static int rs_load(eng *db, struct rstate *rs)
         rs->ndrops = nd;
     }
     rs->kept = get64(b + 48 + nd * 16);
+    rs->cold_pos = get64(b + 56 + nd * 16);
+    rs->cold_key = (int64_t)get64(b + 64 + nd * 16);
     free(b);
     return 0;
 }
@@ -1222,6 +1266,80 @@ static bool rs_committed(eng *db, struct replica *rp)
         yes = db->parts[i]->min_block <= rp->rs.doing_b0 && rp->rs.doing_b0 <= db->parts[i]->max_block;
     pthread_mutex_unlock(&db->lock);
     return yes;
+}
+
+/* ---- the replica API of a COLD's apply (src/ecapply.h; r8h-apply builds on it) ---- */
+
+int rs_cold_begin(eng *db, uint64_t pos, int64_t key)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return TSDB_ERR_INVALID;
+    rp->rs.cold_pos = pos;
+    rp->rs.cold_key = key;
+    return rs_save(db, &rp->rs);
+}
+
+int rs_cold_done(eng *db, uint64_t pos)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return TSDB_ERR_INVALID;
+    rp->rs.done = MAX(rp->rs.done, pos);
+    rp->rs.cold_pos = 0;
+    rp->rs.cold_key = 0;
+    return rs_save(db, &rp->rs);
+}
+
+uint64_t replica_cut_gen(eng *db) { return db->rp ? db->rp->cut_gen : 0; }
+
+uint64_t replica_mu_drop(eng *db)
+{
+    struct replica *rp = db->rp;
+    uint64_t gen = rp->cut_gen;
+    pthread_mutex_unlock(&rp->mu);
+    return gen;
+}
+
+bool replica_mu_retake(eng *db, uint64_t gen)
+{
+    struct replica *rp = db->rp;
+    pthread_mutex_lock(&rp->mu);
+    return rp->cut_gen != gen;
+}
+
+void replica_stage_hold(eng *db) { pthread_mutex_lock(&db->rp->stage_mu); }
+
+void replica_stage_release(eng *db) { pthread_mutex_unlock(&db->rp->stage_mu); }
+
+int replica_stage_path(eng *db, const char *name, char *buf, size_t cap)
+{
+    struct replica *rp = db->rp;
+    if (!rp || !name)
+        return TSDB_ERR_INVALID;
+    const uint64_t key = stage_key(name);
+    rp_lock(rp);
+    const struct rstg *s = stg_find(rp, key);
+    bool ok = s && stage_wanted(rp, key, s->size, s->xxh);
+    pthread_mutex_unlock(&rp->mu);
+    if (!ok)
+        return TSDB_ERR_NOTFOUND;
+    stage_path(buf, cap, key);
+    return 0;
+}
+
+int replica_flush_through(eng *db, uint64_t f)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return TSDB_ERR_INVALID;
+    if (rp->mk_seq == 0 || f >= rp->mk_seq) {
+        fprintf(stderr, "tsdb: %s: a marker in segment %" PRIx64 " asks for a flush through segment %" PRIx64 ", which "
+                        "is not below it\n", db->dir, rp->mk_seq, f);
+        return TSDB_ERR_CORRUPT;
+    }
+    /* every sealed memtable holds a segment below the marker's, the active one the marker's own: never flushed here */
+    return replica_flush(db);
 }
 
 int (*replica_test_apply_hook)(eng *db, int at); /* test hook: the applier's windows (RH_*, replica.h) */
@@ -1362,8 +1480,11 @@ static int apply_commit(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         rp->rs.doing_b0 = atomic_load(&db->next_block);
         rp->rs.doing_n = n;
         rc = rs_save(db, &rp->rs);
-        if (rc == 0)
+        if (rc == 0) {
+            rp_part_pos = last; /* the parts' position (ppos_record in parts_commit) */
             rc = parts_commit(db, ps, n);
+            rp_part_pos = 0;
+        }
         if (rc == 0) {
             pthread_mutex_lock(&db->lock);
             for (size_t i = 0; i < n; i++)
@@ -1438,15 +1559,14 @@ static int apply_drop(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     return rs_save(db, &rp->rs);
 }
 
-/* A COMMIT marker at or below RSTATE's `done` found by the open: its files, still staged (a crash between the apply and
- * stage_to_keep, or the stage_ links this member made as the leader before it was deposed), are kept with its segment
- * when they are what the marker names; anything else goes with the orphans below. */
+/* A COMMIT or COLD marker at or below RSTATE's `done` found by the open: its files, still staged (a crash between the
+ * apply and stage_to_keep, or the stage_ links this member made as the leader before it was deposed), are kept with
+ * its segment when they are what the marker names; anything else goes with the orphans below. */
 static void open_keep_done(eng *db, struct replica *rp, const wal_rec *wr, const mk *m)
 {
-    const mk_commit *c = &m->u.commit;
     size_t pos = 0;
     mk_file f;
-    for (uint32_t n = 0; n < c->nfiles && mk_file_next(c, &pos, &f); n++) {
+    for (uint32_t n = 0; n < mkf_count(m) && mkf_next(m, &pos, &f); n++) {
         uint64_t key = xxh64(f.name, f.name_len, 0);
         struct rstg *s = stg_find(rp, key);
         if (!s || s->size != f.size || s->xxh != f.xxh64 || eng_test_mutant == MUT_REPLICA_DROP_APPLIED_FILES)
@@ -1518,8 +1638,8 @@ static int open_scan(eng *db, struct replica *rp)
             if (sz == 0)
                 break;
             mk m;
-            if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_COMMIT && (rc = mk_decode(wr.payload, wr.n, &m)) == 0 &&
-                m.type == MK_COMMIT) {
+            if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD) &&
+                (rc = mk_decode(wr.payload, wr.n, &m)) == 0 && mk_ships(&m)) {
                 rc = cm_add(rp, &wr, &m);
                 if (rc == 0 && wr.fno + wr.span - 1 <= rp->rs.done)
                     open_keep_done(db, rp, &wr, &m);
@@ -1571,14 +1691,15 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     int64_t ts_s[B];
     uint64_t sl_s[B];
     int ty_s[B];
-    uint32_t *ids = ids_s;
+    uint32_t ix_s[B]; /* each row's index in the record: its position is wr->fno + ix (ppos) */
+    uint32_t *ids = ids_s, *ix = ix_s;
     int64_t *ts = ts_s;
     uint64_t *sl = sl_s;
     int *ty = ty_s;
     void *heap = NULL;
     if (wr->n > B) {
         size_t n = wr->n;
-        heap = malloc(n * (sizeof *ids + sizeof *ts + sizeof *sl + sizeof *ty));
+        heap = malloc(n * (sizeof *ids + sizeof *ts + sizeof *sl + sizeof *ty + sizeof *ix));
         if (!heap) {
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
             return TSDB_ERR_NOMEM;
@@ -1587,6 +1708,7 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
         ts = (int64_t *)(sl + n);
         ids = (uint32_t *)(ts + n);
         ty = (int *)(ids + n);
+        ix = (uint32_t *)(ty + n);
     }
     int64_t cached_p = 0;
     uint64_t cached_seq = 0;
@@ -1633,7 +1755,7 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             if (cached_seq >= seq && eng_test_mutant != MUT_REPLICA_NO_REPLAY_SKIP)
                 continue;
         }
-        ids[k] = id, ts[k] = t, sl[k] = slot, ty[k] = eng_series_type(db, id);
+        ids[k] = id, ts[k] = t, sl[k] = slot, ty[k] = eng_series_type(db, id), ix[k] = (uint32_t)i;
         k++;
     }
     if (k > 0) {
@@ -1646,14 +1768,81 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             rc = mt_add(db->active, ids + a, 0, ts + a, sl + a, 8, b - a, 0, ty[a]);
             a = b;
         }
-        if (rc == 0)
+        if (rc == 0) {
             mt_note_fno(db->active, wr->fno, wr->n);
+            eng_ppos_rows(db, db->active, PPOS_SITE_APPLY, ts, k, wr->fno, ix);
+        }
         pthread_mutex_unlock(&db->buf_lock);
         if (rc)
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
     }
     free(heap);
     return rc;
+}
+
+/* The objects' oids of a COLD (n x MK_OID bytes, malloc'd), as ecapply_cold_decide takes them */
+static int cold_oids(const mk_cold *c, uint8_t **out, uint32_t *n)
+{
+    uint8_t *o = malloc((size_t)(c->nobjs ? c->nobjs : 1) * MK_OID);
+    if (!o)
+        return TSDB_ERR_NOMEM;
+    size_t pos = 0;
+    uint32_t k = 0;
+    mk_cold_obj ob;
+    while (k < c->nobjs && mk_cold_obj_next(c, &pos, &ob))
+        memcpy(o + (size_t)k++ * MK_OID, ob.oid, MK_OID);
+    *out = o;
+    *n = k;
+    return 0;
+}
+
+/* A committed COLD (R8; design-cluster-data.md 2.3 step 6): carried out by ecapply_cold (r8h), which records it in
+ * RSTATE (rs_cold_begin, rs_cold_done) and may let go of rp->mu (replica_mu_drop: RP_AGAIN when a cut came). Its
+ * files are staged (cm_add held the position back until they were). A replay skips one at or below `done`; one in
+ * `doing` is decided by what is listed (its swap takes no block numbers, so rs_committed cannot tell). */
+static int apply_cold(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, const mk *m)
+{
+    uint64_t last = wr->fno + wr->span - 1;
+    size_t ci = rp->ncm;
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (rp->cm[i].last == last)
+            ci = i;
+    if (last <= rp->rs.done)
+        return 0; /* a replay: carried out already */
+    int rc = 0;
+    if (rp->rs.cold_pos == last) {
+        uint8_t *oids;
+        uint32_t n;
+        if ((rc = cold_oids(&m->u.cold, &oids, &n)) != 0)
+            return rc;
+        rc = ecapply_cold_decide(db, m->u.cold.key, oids, n);
+        free(oids);
+        if (rc < 0) {
+            fprintf(stderr, "tsdb: %s: the COLD at position %" PRIu64 " (key %" PRId64 ") was being carried out and what "
+                            "is listed does not say whether it was\n", db->dir, last, m->u.cold.key);
+            return rc;
+        }
+        if (rc == 1) { /* it was: only the record is left to write */
+            rc = rs_cold_done(db, last);
+            if (rc == 0 && ci < rp->ncm)
+                cm_remove(db, rp, ci, true);
+            return rc;
+        }
+    }
+    rp->mk_seq = seq;
+    rc = ecapply_cold(db, last, m);
+    rp->mk_seq = 0;
+    if (rc) /* RP_AGAIN included: the marker is read again, its files stay staged */
+        return rc;
+    ci = rp->ncm; /* found again: rp->mu may have been let go */
+    for (size_t i = 0; i < rp->ncm; i++)
+        if (rp->cm[i].last == last)
+            ci = i;
+    if (rp->rs.done < last && (rc = rs_cold_done(db, last)) != 0) /* the stub (and an apply that wrote none) */
+        return rc;
+    if (ci < rp->ncm)
+        cm_remove(db, rp, ci, true);
+    return 0;
 }
 
 /* One marker, in position order, once committed. Every type is applied in a way a replay can repeat: a restart applies
@@ -1701,6 +1890,12 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         return apply_commit(db, rp, seq, wr, &m);
     case MK_DROP:
         return apply_drop(db, rp, seq, wr, &m);
+    case MK_COLD:
+        return apply_cold(db, rp, seq, wr, &m);
+    case MK_DIGEST:
+        return ecdigest_apply(db, wr->fno + wr->span - 1, &m);
+    case MK_GC:
+        return ecgcmk_apply(db, wr->fno + wr->span - 1, &m);
     case MK_EPOCH:
         /* The marker sits in the segment its epoch names, (e << 40) (6.2 step 3): segments only go up, so epochs do too,
          * and a record of a lower epoch's leader cannot pass as the new one's. */
@@ -1952,18 +2147,18 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         s->len = db->wal_off;
         pthread_mutex_unlock(&rp->segs_mu);
         atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
-        /* COMMIT markers among them: their files must be staged before their positions count as durable */
+        /* COMMIT and COLD markers among them: their files must be staged before their positions count as durable */
         for (size_t pos = 0; pos < len && rc == 0;) {
             wal_rec wr;
             size_t sz = wal_record(p + pos, len - pos, seq, off + pos, &wr);
             mk m;
-            if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_COMMIT && (rc = mk_decode(wr.payload, wr.n, &m)) == 0 &&
-                m.type == MK_COMMIT)
+            if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD) &&
+                (rc = mk_decode(wr.payload, wr.n, &m)) == 0 && mk_ships(&m))
                 rc = cm_add(rp, &wr, &m);
             pos += sz;
         }
         if (rc)
-            eng_fail(db, "a COMMIT marker that cannot be tracked", EIO);
+            eng_fail(db, "a COMMIT or COLD marker that cannot be tracked", EIO);
     }
     pthread_mutex_unlock(&rp->mu);
     if (rc == 0 && fresh) /* readers of the directory start on the new segment, as at a writer's (mt_flush); no I/O
@@ -2642,6 +2837,8 @@ static int leader_marker_wait(eng *db, uint64_t last, const char *what)
  * publish that follows on the same thread records in the leader's RSTATE (jr_precommit, jr_commit, leader_rs_drop) */
 static __thread uint64_t lead_pos, lead_drop_pos;
 
+uint64_t jr_part_pos(void) { return rp_part_pos ? rp_part_pos : lead_pos; }
+
 /* ---- the leader's links of its COMMITs' files (design-cluster.md 5.2, M4) ----
  * Each file a leader's COMMIT marker names is hard linked as stage_<key>.part, the name a replica stages it under, so a
  * replica that missed it can fetch it (eng_leader_file_open) after the leader merged the part away, and a deposed
@@ -2878,6 +3075,121 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     rc = leader_marker_wait(db, fno, "a COMMIT marker was appended but its commit point did not come");
     lead_pos = rc == 0 ? fno : 0;
     return rc;
+}
+
+/* ---- the leader's COLD (src/eccold.h; r8g-cut and r8h-apply build on it) ---- */
+
+int jr_cold(eng *db, mk *m, const char *const *src, size_t n, uint64_t *pos)
+{
+    const struct jr_ops *jr = eng_jr(db);
+    *pos = 0;
+    if (!jr || db->rp || !m || m->type != MK_COLD || n != m->u.cold.nfiles || n > MK_FILES_MAX || (n && !src))
+        return TSDB_ERR_INVALID;
+    uint64_t *keys = calloc(n ? n : 1, sizeof *keys);
+    if (!keys)
+        return TSDB_ERR_NOMEM;
+    int rc = 0;
+    size_t fp = 0, linked = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        mk_file f;
+        char mname[64];
+        if (!mk_cold_file_next(&m->u.cold, &fp, &f) || f.name_len == 0 || f.name_len >= sizeof mname || !src[i]) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(mname, f.name, f.name_len);
+        mname[f.name_len] = '\0';
+        if (!part_file_name(mname) && !ec_file_name(mname)) {
+            rc = TSDB_ERR_INVALID; /* a replica stages neither (replica_stage) */
+            break;
+        }
+        rc = jr->ship(jr->ctx, db, src[i], mname, f.size);
+        keys[i] = stage_key(mname);
+        if (rc == 0) { /* served to a replica that missed it, and found by this member reopened as one (as a COMMIT's) */
+            char sp[40];
+            stage_path(sp, sizeof sp, keys[i]);
+            unlinkat(db->dirfd, sp, 0);
+            if (linkat(db->dirfd, src[i], db->dirfd, sp, 0) != 0)
+                rc = TSDB_ERR_IO;
+            else
+                linked = i + 1;
+        }
+    }
+    if (jr->ship_wait) {
+        int wr = jr->ship_wait(jr->ctx, db, rc != 0);
+        if (rc == 0)
+            rc = wr;
+    }
+    if (rc == 0)
+        rc = eng_sync_dir(db, "the links of a COLD's files");
+    if (rc == 0)
+        rc = leader_links_reserve(db, n);
+    if (rc) {
+        leader_links_unlink(db, keys, linked);
+        free(keys);
+        return rc;
+    }
+    if (m->u.cold.flush_through == 0) { /* the replicas flush through the same segment before they carry it out */
+        pthread_mutex_lock(&db->lock);
+        m->u.cold.flush_through = db->wal_flushed;
+        pthread_mutex_unlock(&db->lock);
+    }
+    m->span = 1;
+    uint64_t fno = 0, lst = 0;
+    struct lnote ln = {keys, n};
+    rc = wal_markers_mk_at(db, m, 1, &fno, &lst, leader_links_note, &ln);
+    if (fno && leader_test_marker_hook)
+        leader_test_marker_hook(db, fno);
+    if (!fno) {
+        leader_links_release(db, n);
+        leader_links_unlink(db, keys, n); /* no marker names them */
+    }
+    free(keys);
+    if (rc)
+        return rc; /* the marker may be in the log (a failed sync): the engine is failed by the WAL's own rules */
+    rc = leader_marker_wait(db, fno, "a COLD marker was appended but its commit point did not come");
+    if (rc == 0)
+        *pos = fno;
+    return rc;
+}
+
+int jr_cold_precommit(eng *db, uint64_t pos, int64_t key)
+{
+    struct rstate *rs = db->lrs;
+    if (!eng_jr(db) || !rs || !pos)
+        return 0;
+    rs->cold_pos = pos;
+    rs->cold_key = key;
+    return rs_save(db, rs);
+}
+
+int jr_cold_commit(eng *db, uint64_t pos)
+{
+    struct rstate *rs = db->lrs;
+    if (!eng_jr(db) || !rs || !pos)
+        return 0;
+    rs->done = MAX(rs->done, pos);
+    rs->cold_pos = 0;
+    rs->cold_key = 0;
+    return rs_save(db, rs); /* fails the engine on error: reopened as a replica it would carry the COLD out again */
+}
+
+int jr_cold_pending(eng *db, uint64_t *pos, int64_t *key)
+{
+    *pos = 0;
+    *key = 0;
+    const struct rstate *rs = db->rp ? &db->rp->rs : db->lrs;
+    struct rstate tmp = {0};
+    if (!rs) { /* a leader before its first marker: read the file (a promoted replica's carries on) */
+        int rc = rs_load(db, &tmp);
+        if (rc)
+            return rc;
+        free(tmp.drops);
+        rs = &tmp;
+    }
+    *pos = rs->cold_pos;
+    *key = rs->cold_key;
+    return 0;
 }
 
 static int leader_drop(eng *db, int64_t ts)
