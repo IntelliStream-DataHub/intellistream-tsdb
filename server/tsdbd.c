@@ -121,6 +121,7 @@
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
+#include "chunksrv.h"
 #include "fwd.h"
 #include "fwdreq.h"
 #include "cvol.h"
@@ -3590,6 +3591,9 @@ static void *worker_main(void *arg)
 static uint32_t fwd_wait_ms = 2000, fwd_max_age_ms = 1000, fwd_reply_ms = 30000;
 static int fwd_base = 4; /* --fwd-workers */
 static int fwd_off;      /* --forward off: requests for volumes led elsewhere get MOVED (s2e's answer), never forwarded */
+/* The erasure-coded tier's settings (--ec-*, docs/config.md): parsed here, handed to the tier's attach (R8, r8f). */
+struct chunksrv_ec_cfg g_ec_cfg = {.settle_grace_s = 3600, .settle_keep_s = 86400, .settle_force_s = 3600,
+                                   .settle_wait_max_s = 7200, .cache_bytes = 0};
 static atomic_ullong fwd_seq;
 static const char *test_fwd_stall; /* TSDBD_TEST_FWD_STALL: the entry node stalls before each send while it exists */
 /* TSDBD_TEST_FWD_KNOBS=DIR (test_cluster forward): while DIR/<name> exists, prestall: the entry stalls before it builds
@@ -5385,6 +5389,13 @@ int main(int argc, char **argv)
                                    {"fwd-reply-ms", required_argument, 0, 0x112},
                                    {"fwd-workers", required_argument, 0, 0x113},
                                    {"forward", required_argument, 0, 0x114},
+                                   {"chunk-dir", required_argument, 0, 0x115},
+                                   {"chunk-rate-mb-s", required_argument, 0, 0x116},
+                                   {"ec-settle-grace-s", required_argument, 0, 0x117},
+                                   {"ec-settle-keep-s", required_argument, 0, 0x118},
+                                   {"ec-settle-force-s", required_argument, 0, 0x119},
+                                   {"ec-settle-wait-max-s", required_argument, 0, 0x11a},
+                                   {"ec-cache-mb", required_argument, 0, 0x11b},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -5401,6 +5412,9 @@ int main(int argc, char **argv)
     int witness = 0, rb_off = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
+    const char *chunk_dirs[CHUNKSRV_DIRS_MAX];
+    int nchunk = 0;
+    uint64_t chunk_rate = 0; /* bytes/s; 0: the peerlink's default */
     const char *peer_addr = NULL, *advertise = NULL, *peer_advertise = NULL, *rack = "", *secret_file = NULL;
     const char *state_dir = NULL, *power_feed = "", *bmc = "";
     const char *metrics_addr = NULL, *tenants_file = NULL;
@@ -5568,6 +5582,20 @@ int main(int argc, char **argv)
             }
             cluster_opts = 1;
             break;
+        case 0x115:
+            if (nchunk >= CHUNKSRV_DIRS_MAX) {
+                fprintf(stderr, "tsdbd: at most %d --chunk-dir\n", CHUNKSRV_DIRS_MAX);
+                return 2;
+            }
+            chunk_dirs[nchunk++] = optarg;
+            cluster_opts = 1;
+            break;
+        case 0x116: chunk_rate = (uint64_t)num_arg("chunk-rate-mb-s", optarg, 1, 1 << 20) << 20; cluster_opts = 1; break;
+        case 0x117: g_ec_cfg.settle_grace_s = (uint32_t)num_arg("ec-settle-grace-s", optarg, 0, 86400 * 365); break;
+        case 0x118: g_ec_cfg.settle_keep_s = (uint32_t)num_arg("ec-settle-keep-s", optarg, 0, 86400 * 365); break;
+        case 0x119: g_ec_cfg.settle_force_s = (uint32_t)num_arg("ec-settle-force-s", optarg, 0, 86400 * 365); break;
+        case 0x11a: g_ec_cfg.settle_wait_max_s = (uint32_t)num_arg("ec-settle-wait-max-s", optarg, 0, 86400 * 365); break;
+        case 0x11b: g_ec_cfg.cache_bytes = (uint64_t)num_arg("ec-cache-mb", optarg, 0, 1ll << 30) << 20; break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -5643,9 +5671,9 @@ int main(int argc, char **argv)
                         "%d\n", o.wal_sync_ms);
         return 2;
     }
-    if (witness && (!cluster_on || dir)) {
+    if (witness && (!cluster_on || dir || nchunk)) {
         fprintf(stderr, "tsdbd: --witness is a cluster member without volumes: it needs --cluster, and takes no "
-                        "--dir\n");
+                        "--dir and no --chunk-dir\n");
         return 2;
     }
     if ((!dir && !witness) || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
@@ -5672,7 +5700,10 @@ int main(int argc, char **argv)
                         "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off] [--forward on|off] [--fwd-wait-ms 2000]\n"
-                        "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]]\n"
+                        "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
+                        "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
+                        "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
+                        "             [--ec-settle-wait-max-s 7200] [--ec-cache-mb MB]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
@@ -5974,6 +6005,11 @@ int main(int argc, char **argv)
         if (cvol_start(db, dir) != 0 || cluster_start(&cc) != 0 || fwd_start() != 0 ||
             fwd_cluster_start(fwd_on_event, NULL) != 0)
             return 1;
+        char cerr[512];
+        if (chunksrv_cluster_start(chunk_dirs, nchunk, chunk_rate, cerr, sizeof cerr) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", cerr); /* D11: a store of another owner, or one another process holds */
+            return 1;
+        }
         crash_point(CP_CLUSTER_STARTED); /* the harness restarts the node and counts the hit (tests/jepsen) */
         tsdb_wipe(secret, sizeof secret);
         fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
@@ -6008,6 +6044,7 @@ int main(int argc, char **argv)
     if (cluster_on) {
         cluster_stop();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
+        chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
     pthread_mutex_lock(&work_lock);
@@ -6030,6 +6067,7 @@ int main(int argc, char **argv)
     if (cluster_on) {
         fwd_join(); /* the reserved workers of forwarded requests */
         fwd_cluster_free(); /* no worker can call into the forwarding links any more */
+        chunksrv_cluster_free(); /* nor into the chunk server; its stores are closed (the flocks released) */
         fwdr_tab_free(fwd_tab);
         fwd_tab = NULL;
     }

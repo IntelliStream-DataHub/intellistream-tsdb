@@ -5,7 +5,7 @@
  * link's own frame bodies (BEGIN, RESUME, CHUNK, END, DONE), the HELLO that carries the link kind, and the streaming
  * xxh64 against the one-shot, and the replication driver's payloads (server/replwire.c).
  *
- * Input: byte 0 picks the mode (mod 8), the rest is the data:
+ * Input: byte 0 picks the mode (mod 10), the rest is the data:
  *   0  a byte stream of frames, tags not checked, fed in pieces whose sizes come from byte 1
  *   1  one frame body: byte 1 is the type, the rest the payload
  *   2  a round trip: the data is encoded as a (compressed) frame of type byte 1 and must come back exactly, with
@@ -15,12 +15,16 @@
  *   5  a replication message (RW_T_MSG); one that decodes must encode back to the same bytes
  *   6  a FETCH body, then the same as a bulk meta; each that decodes must encode back to the same bytes
  *   7  a replication message decoded with room for byte 1 records only
+ *   8  a forwarding payload (server/fwd.h): bit 0 of byte 1 FWDQ, bits 1-2 the type
+ *   9  a chunk server payload (server/chunksrv.h), byte 1 mod 3: a request, an answer, a put's meta; a request and a
+ *      meta that decode must encode back to the same bytes
  */
 #include "fuzz.h"
 #include "internal.h"
 #include "peerlink.h"
 #include "replwire.h"
 #include "fwd.h"
+#include "chunksrv.h"
 
 static const uint8_t KEY[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
                                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
@@ -78,7 +82,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 2)
         return 0;
-    int mode = data[0] % 9;
+    int mode = data[0] % 10;
     uint8_t arg = data[1];
     size_t n = size - 2;
     /* an exact-size copy: a read past the end is the sanitizer's to find */
@@ -185,6 +189,45 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 uint8_t back[12];
                 if (fwd_wire_credit(back, w.frame_id, w.chunks) != n || memcmp(back, p, n) != 0)
                     abort();
+            }
+        }
+    } else if (mode == 9) {
+        int w = arg % 3;
+        if (w == 0) {
+            struct cs_req r;
+            if (cs_req_decode(p, n, &r) == 0) {
+                if (r.op < CS_OP_READ || r.op > CS_OP_EPOCH || r.pos >= CHUNK_POS_MAX)
+                    abort();
+                uint32_t max = r.op == CS_OP_READ ? CS_READ_MAX : r.op == CS_OP_SUMS ? CS_SUMS_MAX : CS_LIST_MAX;
+                if ((r.op == CS_OP_READ || r.op == CS_OP_SUMS || r.op == CS_OP_LIST) && (r.len == 0 || r.len > max))
+                    abort();
+                uint8_t back[128];
+                if (cs_req_encode(&r, back, sizeof back) != n || memcmp(back, p, n) != 0)
+                    abort();
+            }
+        } else if (w == 1) {
+            struct cs_resp r;
+            if (cs_resp_decode(p, n, &r) == 0) {
+                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_PUT)
+                    abort();
+                if (r.body_len && (r.body < p || r.body + r.body_len != p + n))
+                    abort();
+                if (r.op == CS_OP_READ && r.body_len > CS_READ_MAX)
+                    abort();
+                uint8_t x = 0;
+                for (size_t i = 0; i < r.body_len; i++)
+                    x ^= r.body[i];
+                (void)x;
+                (void)chunksrv_st(r.rc);
+            }
+        } else {
+            struct cs_put_meta m;
+            if (cs_put_meta_decode(p, n, &m) == 0) {
+                uint8_t back[CS_PUT_META_LEN];
+                cs_put_meta_encode(&m, back);
+                if (n != CS_PUT_META_LEN || memcmp(back, p, n) != 0 || m.pos >= chunk_npos(&m.g))
+                    abort();
+                (void)cs_put_total(&m);
             }
         }
     } else if (mode == 3) {
@@ -299,4 +342,28 @@ void fuzz_seeds(const char *dir)
     if (!fl2)
         abort();
     put_frame(dir, "seed-rw-bulkmeta", 6, 0, fb, fl2);
+    /* the chunk server's payloads (mode 9) */
+    uint8_t cb[128];
+    struct cs_req cr = {.rid = 5, .op = CS_OP_READ, .volume = 3, .epoch = 7, .pos = 2, .off = 4096, .len = 100};
+    memset(cr.vuuid, 0x11, 16), memset(cr.oid, 0x22, 16);
+    size_t cl = cs_req_encode(&cr, cb, sizeof cb);
+    put_frame(dir, "seed-cs-read", 9, 0, cb, cl);
+    cr.op = CS_OP_LIST, cr.has_cursor = 1, cr.len = 64;
+    cl = cs_req_encode(&cr, cb, sizeof cb);
+    put_frame(dir, "seed-cs-list", 9, 0, cb, cl);
+    cr.op = CS_OP_EPOCH;
+    cl = cs_req_encode(&cr, cb, sizeof cb);
+    put_frame(dir, "seed-cs-epoch", 9, 0, cb, cl);
+    memset(cb, 0, sizeof cb); /* an answer: rid 5, EPOCH, rc 0, fence 9, sure */
+    le(cb, 5, 8), cb[8] = CS_OP_EPOCH, le(cb + 13, 9, 8);
+    put_frame(dir, "seed-cs-resp-epoch", 9, 1, cb, 13 + 9);
+    memset(cb, 0, sizeof cb); /* SUMS: header of 36 bytes, 2 sums */
+    le(cb, 6, 8), cb[8] = CS_OP_SUMS, le(cb + 13 + 32, 2, 4);
+    put_frame(dir, "seed-cs-resp-sums", 9, 1, cb, 13 + 36 + 16);
+    struct cs_put_meta pm = {.volume = 3, .epoch = 7, .pos = 1};
+    memset(pm.vuuid, 0x11, 16), memset(pm.oid, 0x22, 16);
+    if (chunk_geom_make(&pm.g, 4, 2, 4096, 100000) != 0)
+        abort();
+    cs_put_meta_encode(&pm, cb);
+    put_frame(dir, "seed-cs-putmeta", 9, 2, cb, CS_PUT_META_LEN);
 }

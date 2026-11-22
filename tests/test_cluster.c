@@ -4027,6 +4027,118 @@ static void scen_volumes(void)
 
 /* A node refuses to start with --wal-sync-ms other than 0, with series in its root or with VOLUMES (DECISION D2:
  * the root holds USERS only); login stays per node (USERS in the root). */
+/* R8 D11, E14, E26, E27 (server/chunksrv*.c): two tsdbd with --chunk-dir. A store whose META names another node or
+ * another cluster refuses the start with a line naming both; a store another tsdbd holds (its flock) and one named
+ * twice refuse it too. Then puts through the real peer links (the hook TSDB_CHUNKSRV_TEST in chunksrv_cluster.c):
+ * a chunk put from A to B reads back whole, B's fence raised to 5 refuses a put at 3 and a delete at 4; B killed with
+ * SIGKILL and restarted still holds the chunk and the fence (a put at 4 is FENCED). The cell checks, power loss around
+ * PUT_OK and the unsure stores are test_chunksrv's (with its mutants). */
+static void chunk_store_make(const char *path, const uint8_t uuid[16], uint32_t node)
+{
+    char hex[33], args[PATH_MAX + 128], out[4096];
+    for (int k = 0; k < 16; k++)
+        snprintf(hex + 2 * k, 3, "%02x", uuid[k]);
+    snprintf(args, sizeof args, "chunk-store init %s --cluster %s --node %" PRIu32, path, hex, node);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("`tsdb %s`: %s", args, out);
+}
+
+static void scen_chunksrv(void)
+{
+    scenario("chunksrv");
+    for (int i = 0; i < 3; i++) /* three voters: a restarted one publishes its new peer address */
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16], other[16];
+    memcpy(uuid, v.m.uuid, 16);
+    const struct meta_member *mb = meta_member(&v.m, ids[1]);
+    struct state_want up = {ids[1], META_UP, mb ? mb->incarnation + 1 : 1};
+    view_free(&v);
+    memcpy(other, uuid, 16);
+    other[5] ^= 0x20;
+    stop(1, SIGTERM); /* one server down at a time: the other two keep the group's quorum */
+    char s0[PATH_MAX], s1[PATH_MAX], sf[PATH_MAX], so[PATH_MAX], stage[PATH_MAX], hex[33], need[256];
+    snprintf(s0, sizeof s0, "%s/cs0", base);
+    snprintf(s1, sizeof s1, "%s/cs1", base);
+    snprintf(sf, sizeof sf, "%s/csf", base);
+    snprintf(so, sizeof so, "%s/cso", base);
+    snprintf(stage, sizeof stage, "%s/stage", base);
+    if (mkdir(stage, 0755) != 0)
+        die("mkdir %s: %s", stage, strerror(errno));
+    chunk_store_make(s0, uuid, ids[0]);
+    chunk_store_make(s1, uuid, ids[1]);
+    chunk_store_make(sf, uuid, ids[1] + 40); /* another member's disk */
+    chunk_store_make(so, other, ids[1]);     /* this node id in another cluster */
+    for (int k = 0; k < 16; k++)
+        snprintf(hex + 2 * k, 3, "%02x", uuid[k]);
+
+    char xa[PATH_MAX * 2 + 64];
+    snprintf(xa, sizeof xa, "--chunk-dir %s", sf);
+    xargs[1] = xa;
+    int rc = start_try(1);
+    snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, hex,
+             ids[1] + 40, hex, ids[1]);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
+        die("a store of another node did not refuse the start naming both (%d, 0x%x)", rc, th_status);
+    snprintf(xa, sizeof xa, "--chunk-dir %s", so);
+    rc = start_try(1);
+    char ohex[33];
+    for (int k = 0; k < 16; k++)
+        snprintf(ohex + 2 * k, 3, "%02x", other[k]);
+    snprintf(need, sizeof need, "belongs to cluster %s node %" PRIu32 ", but this is cluster %s node %" PRIu32, ohex,
+             ids[1], hex, ids[1]);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) != 1 || !log_has(1, need))
+        die("a store of another cluster did not refuse the start naming both (%d, 0x%x)", rc, th_status);
+    snprintf(xa, sizeof xa, "--chunk-dir %s --chunk-dir %s", s1, s1);
+    rc = start_try(1);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0)
+        die("a store named twice did not refuse the start (%d, 0x%x)", rc, th_status);
+    printf("  a store of another node, of another cluster and one named twice refuse the start\n");
+
+    snprintf(xa, sizeof xa, "--chunk-dir %s", s1);
+    start(1);
+    await_view(0, p_member_state, &up, "server 1 back with a new incarnation");
+    stop(0, SIGTERM);
+    char xb[PATH_MAX + 64], pe[PATH_MAX + 96];
+    snprintf(xb, sizeof xb, "--chunk-dir %s", s1); /* server 0 names server 1's store: its flock refuses */
+    xargs[0] = xb;
+    rc = start_try(0);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 || !log_has(0, "is open elsewhere"))
+        die("a store another tsdbd holds did not refuse the start (%d, 0x%x)", rc, th_status);
+    printf("  a store another tsdbd holds refuses the start\n");
+
+    snprintf(xb, sizeof xb, "--chunk-dir %s", s0);
+    snprintf(pe, sizeof pe, "TSDB_CHUNKSRV_TEST=put:%" PRIu32 ":%s", ids[1], stage);
+    penv[0] = pe;
+    start(0);
+    await_log_count(0, "chunksrv test: ", 1, 90000);
+    if (!log_has(0, "chunksrv test: pass put"))
+        die("the put through two tsdbd failed (n0.log: chunksrv test: FAIL ...)");
+    printf("  a chunk put from A to B reads back whole; B's fence at 5 refuses a put at 3 and a delete at 4\n");
+
+    struct view vk;
+    view(0, &vk);
+    const struct meta_member *mk = meta_member(&vk.m, ids[1]);
+    up.min_incarnation = mk ? mk->incarnation + 1 : 1;
+    view_free(&vk);
+    stop(1, SIGKILL);
+    start(1);
+    await_view(0, p_member_state, &up, "the killed member back with a new incarnation");
+    stop(0, SIGTERM);
+    snprintf(pe, sizeof pe, "TSDB_CHUNKSRV_TEST=check:%" PRIu32 ":%s", ids[1], stage);
+    start(0);
+    await_log_count(0, "chunksrv test: ", 2, 90000);
+    if (!log_has(0, "chunksrv test: pass check"))
+        die("after B's SIGKILL the chunk or the fence was gone (n0.log: chunksrv test: FAIL ...)");
+    printf("  B killed and restarted: the chunk reads back whole, a put at 4 is still FENCED\n");
+}
+
 static void scen_volrefuse(void)
 {
     scenario("volrefuse");
@@ -11355,7 +11467,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

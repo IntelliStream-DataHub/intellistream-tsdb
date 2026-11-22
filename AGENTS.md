@@ -347,6 +347,16 @@ cgroup, so `nice` does not keep your work out of its way.
   file name against every predicate, `make NO_EC=1`), `test_settle.c`, `test_settle_oracle.c`, `test_ecgc.c`, each with
   its planted bugs (`--mutant NAME`, a Makefile loop that requires each to fail). A test that cannot run without the codec
   prints that it is skipped.
+- `server/chunksrv.[ch]` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on every cluster member with
+  kinds CHUNK (6, requests and answers, worked by 4 FIFO workers) and CHUNKB (7, puts as bulk files; the link's callbacks
+  only queue, a put thread per peer does the store I/O (peerlink.h:24-26), and the queue is bounded per peer). Every
+  request raises the volume's fence first (E14); an unsure store is raised only from `chunksrv_epoch_source` (r8f's
+  hook, D9), and then to the highest epoch the member's sure stores hold, never below it. LIST pages never split the
+  copies of one (oid, pos). `server/chunksrv_cluster.c` opens `--chunk-dir` stores at start (META's cluster and node:
+  `tsdb chunk-store init`), listens once a member, follows the members (`chunksrv_keep_peers` stops those that left);
+  `TSDB_CHUNKSRV_TEST` is its test hook for `test_cluster chunksrv`. `tests/test_chunksrv.c` (mutants in the Makefile),
+  `test_peerlink chunk`, `tests/test_cli_chunkstore.sh`, fuzz-replframe mode 9. Open: a store that hangs (not fails) in
+  fdatasync holds the backend's fence mutex and stalls every request (R13's health domains).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,

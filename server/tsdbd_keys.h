@@ -121,6 +121,21 @@ static const struct cfg_key tsdbd_keys[] = {
          "without an answer (its outcome is unknown). 0: no limit (a dead link still ends it)."),
     CK_I("cluster.fwd.workers", "fwd-workers", "4",
          "Worker threads reserved for requests other members forward here (more start while all of them wait)."),
+    CK_L("cluster.chunk.dir", "chunk-dir", "",
+         "The chunk stores of this member, one per disk (each made by tsdb chunk-store init PATH --cluster UUID --node "
+         "ID); a comma-separated list. A store of another cluster or node refuses the start; a missing or failing one "
+         "is reported down."),
+    CK_I("cluster.chunk.rate", "chunk-rate-mb-s", "256",
+         "MB/s of chunk puts to other members, all links together: a cap of its own, apart from replication's."),
+    /* the erasure-coded tier */
+    CK_D("ec.settle.grace", "ec-settle-grace-s", "s", "1h",
+         "How long after a partition's end it is erasure-coded (settled)."),
+    CK_D("ec.settle.keep", "ec-settle-keep-s", "s", "1d", "How long the parts a settle replaced are kept."),
+    CK_D("ec.settle.force", "ec-settle-force-s", "s", "1h",
+         "How long a settle waits for the partition's rows in memory to be flushed before it flushes them."),
+    CK_D("ec.settle.wait.max", "ec-settle-wait-max-s", "s", "2h",
+         "How long a settle waits for every member of its stripe to be up before it settles without one."),
+    CK_Z("ec.cache", "ec-cache-mb", "MB", "", "Memory of the cache of decoded erasure-coded data. Default: a tenth of the RAM."),
     /* options without a key */
     CK_S(CK_NONE, "version", "", "Prints the version and exits."),
     CK_S(CK_NONE, "config", "", "Names the file itself."),

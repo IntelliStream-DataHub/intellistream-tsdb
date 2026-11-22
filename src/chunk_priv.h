@@ -24,6 +24,10 @@ int chunk_store_volumes(chunk_store *st, uint32_t **vols, uint64_t **epochs, siz
 
 /* True while the volume's EPOCH lost a slot at open and has not been raised since (puts and deletes are refused). */
 bool chunk_store_epoch_unsure(chunk_store *st, uint32_t volume);
+/* A request showed epoch e (E14: every request raises the fence first). Not authoritative, unlike chunk_store_raise: an
+ * unsure volume is left as it is and the answer is CHUNK_ERR_EPOCH_UNSURE (only the metadata group's epoch clears it,
+ * D9); else EPOCH is at least e, durably, when it returns 0. */
+int chunk_store_see(chunk_store *st, uint32_t volume, uint64_t e);
 void chunk_store_test_fail(chunk_store *st);                    /* test hook: the store failed in service */
 int chunk_store_test_flip(chunk_store *st, const chunk_ident *id); /* test hook: one byte of the first cell flipped */
 

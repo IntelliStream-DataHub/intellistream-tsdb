@@ -126,6 +126,18 @@ intellistream-objects (`tools/sync-ec.sh`; `src/ec/UPSTREAM` names the commit), 
   `tools/check-ec-symbols.sh`, and `tools/sync-ec.sh --check`. `build/ec-bench` measures encode and decode per
   geometry, level and kernel (docs/tasks/ec-bench.md).
 
+**The chunk server (R8, cluster): a member serves its chunk stores to the others.** `--chunk-dir PATH` (repeatable,
+key `cluster.chunk.dir`) opens a store at start (its `flock`: one owner; a store named twice, held by another process,
+or whose META names another cluster or node is refused at start with a line naming both); `--chunk-rate-mb-s`
+(`cluster.chunk.rate`) caps the chunk puts apart from replication's bulk rate; `--ec-settle-grace-s`, `-keep-s`,
+`-force-s`, `-wait-max-s` and `--ec-cache-mb` (`ec.settle.*`, `ec.cache`) are read for the tier. `tsdb chunk-store init
+PATH --cluster UUID --node ID` makes a store bound to one member. Two new peer link kinds, CHUNK (6: READ, SUMS, LIST,
+DEL, EPOCH and the PUT answers) and CHUNKB (7: puts as bulk files, every cell checked against its sum, PUT_OK only once
+the chunk is synced and named); every request raises the volume's fence first and puts and deletes below it are FENCED.
+No peer protocol version change: a server that does not know the kinds refuses their HELLO. `server/chunksrv.[ch]`,
+`server/chunksrv_cluster.c`; tests `test_chunksrv`, `test_peerlink chunk`, `test_cluster chunksrv`,
+`tests/test_cli_chunkstore.sh`.
+
 **Settled parts on one server (R7, internal): partitions can be erasure coded into a chunk store, behind a test-only
 switch; no format change.** The engine can turn the parts of a key into `.ec` parts (the part's granule index in the
 volume directory, its bytes erasure coded k + m over a set of store directories), read them back through a granule cache
