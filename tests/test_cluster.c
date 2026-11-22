@@ -8226,6 +8226,12 @@ static void scen_pause(void)
     }
     tsdbc_set_retry(c, 10000);
     tsdbc *cw = client(Nw);
+    /* The pauses above (the old leader resumed alone, its peers paused, then all resumed) can make the metadata group
+     * elect again (term 3 or 4) about now, and a lease that lapses meanwhile refuses a write UNAVAILABLE until the new
+     * term's heartbeats are answered (§7.1, nothing written): retried, as by any client. What this part checks is the
+     * reads through the deposed leader. (ASan under load: 2 of 12 runs of c0047c5 failed here with retry 0, each
+     * with such an election.) */
+    tsdbc_set_retry(cw, 10000);
     for (int k = 0; k < 20; k++) {
         ts = 10000 + k;
         if ((rc = tsdbc_insert_series(cw, id, &ts, &val, 1)) != 0)
