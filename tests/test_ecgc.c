@@ -25,6 +25,7 @@
 #include "chunk_priv.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
 #include "settle.h"
@@ -133,6 +134,10 @@ static int h_open_at(h *x, const char *dir, const char *db, int lifetime_s)
      * (midround failed so under TSan). Settles are test_settle's, with r7-gc's handoffs (gcpaths, gcpower). */
     ecsettle_tier_quiesce(x->t);
     x->rounds = atomic_load(&settle_rounds);
+    /* So is each engine's digest thread (r7-keep): a swap queues its settled_ source, and the digest references the
+     * .ec part across its reads of the object, so a drop and purge while it runs find the object held and queue
+     * nothing (midround failed so under TSan). That reference is test_keep's (digestnohold). */
+    atomic_store(&eckeep_test_pause, true);
     tsdb_options o;
     tsdb_options_init(&o);
     o.merge_threads = 0;
@@ -159,8 +164,10 @@ static int h_open(h *x, const char *dir, int lifetime_s)
 static void h_close(h *x)
 {
     CHECK(atomic_load(&settle_rounds) == x->rounds); /* no settle thread ran beside the case */
-    if (x->db)
+    if (x->db) {
+        CHECK(eckeep_test_tries(x->db) == 0); /* nor a digest */
         eng_close(x->db);
+    }
     tier_put(x->t);
     x->db = NULL;
     x->t = NULL;
