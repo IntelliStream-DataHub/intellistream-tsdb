@@ -112,6 +112,31 @@ intellistream-objects (`tools/sync-ec.sh`; `src/ec/UPSTREAM` names the commit), 
   `tools/check-ec-symbols.sh`, and `tools/sync-ec.sh --check`. `build/ec-bench` measures encode and decode per
   geometry, level and kernel (docs/tasks/ec-bench.md).
 
+**Settled parts on one server (R7, internal): partitions can be erasure coded into a chunk store, behind a test-only
+switch; no format change.** The engine can turn the parts of a key into `.ec` parts (the part's granule index in the
+volume directory, its bytes erasure coded k + m over a set of store directories), read them back through a granule cache
+with every cell checked against its sum, and keep answering exactly as before: same rows, same rank, same key (the
+`.ec` file has its source's name and block range). Nothing reaches users yet: the tier is configured only by the test
+variable `TSDB_TEST_TIER`, which acts only with `TSDB_TEST_TIER_I_KNOW=1` beside it, there are no options, no CLI and no
+tsdbd flag, and a volume opened once for writing with the tier carries `requires=tier` in META from then on, before
+anything is settled (E17: `FORMAT_VERSION` stays 9; an older binary, a build without the codec, an open with no tier
+configured and every read-only or follower open, `tsdb export` and the CLI's read commands included, refuse the volume). Public options come with R15.
+
+- What it does: a settle encodes each part of a key once (the granule checksums, the footer hash and the class judgement
+  are checked on the copy that is encoded) and swaps the parts for their `.ec` files in one intent (intent v4, rolled
+  forward or back at open); merges, rewrites, `tsdb_optimize` and the TTL rewrite never take an `.ec` part and a drop
+  retires it; the source part stays as `settled_*` for `keep_s` from the settle time and until a digest of the object
+  matches, and a digest that does not match makes the volume answer UNAVAILABLE (DIVERGED; the flag is in memory only, so a
+  restart clears it and the engine serves the `.ec` part until its open digest fails again; R15); the objects
+  of retired parts are deleted at their last reference and the open sweeps orphans. A cluster or replica volume, a
+  follower and a build without `TSDB_EC` (`make NO_EC=1`) never settle.
+- Not yet: re-encoding a key's objects (R10), the replicated half (`ppos`, the settle gate and cut, markers, shipping
+  `.ec` files: R8), the way out of DIVERGED (R15). Late rows settle as further objects of their key.
+- Tests: `test_ecpart`, `test_seam`, `test_tier`, `test_ecskip`, `test_ecswap`, `test_keep`, `test_ecgc`, `test_settle`,
+  `test_settle_oracle` (settled and unsettled answers bit for bit), `test_ecnames`, each with planted bugs it must catch;
+  `fuzz_ecpart`; `make jepsen` runs a directory tier (`--tier`: kill, power, EIO and a power cut at each step of a
+  settle).
+
 **Appends without an fsync per call are faster again, no format change.** 0.10.0 lost speed on one-row appends with
 `wal_sync_ms` above 0 when many threads append (16 to 17% less than 0.9.1 at 16 and 64 threads, measured; nothing
 measurable at one thread or with an fsync per call). The branch gets back about half of it (+10 to 11% over 0.10.0, 7.7%
@@ -216,6 +241,17 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
 - Tests, examples and benchmarks of the embedded bindings moved to the new directories (`bench/clients/run.sh`
   follows); `make test-rust`, `test-python` and `test-licenses` cover both packages of each language, and
   `tools/check-version.sh` the pins between them.
+
+### Fixed
+
+- **A power cut during recovery could leave a multi-partition insert half applied (every database).** The open's
+  roll-forward of an intent unlinked it before the directory was synced, so a power loss could keep the unlink and lose
+  a rename. The directory is synced first now (`tests/test_intents.c`, crashfs with `CRASHFS_TEAR`).
+- **Damaged granule timestamps could make a bucketed query write outside its arrays** (with `verify_checksums` off, the
+  default). `granule_decode` now fails a granule whose timestamps do not strictly increase inside its entry's range
+  (`TSDB_ERR_CORRUPT`; `test_damage`).
+- `tsdb DIR feed enable` dropped the `requires=` words of META other than `feed` (so it could drop `requires=cluster` or
+  `tier`); a volume add copied the root's `vuuid=` into the new volume's META.
 
 ### Added
 

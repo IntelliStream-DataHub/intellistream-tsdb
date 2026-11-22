@@ -128,7 +128,7 @@ modes and the combined build plan; §7 there carries this design's steps R5-R14 
 | E23 | **0.11.0 holds replicated mode's data path (R2-R4), this design (R5-R14, R10 included: E33) and the production steps P1-P6 (E36)**; shared mode's steps go on in parallel and ship when their maintenance windows allow (not as production in 0.11.0, E46). | Waiting for N7 (M21's order) | The user's "that will go in v0.11.0". M21 put replicated mode after shared mode; this changes the order, not the content. Nothing moves to 0.12 (E33). |
 | E24 | **The young tier's ISR floor for EC volumes**: `min_isr` defaults to **m** for `ec=k+m` volumes (2 for m = 2, 4 for m = 4), so an acknowledged row survives at least m − 1 losses at worst and m with the ISR full; `replicas=3` keeps D1's 1. TOPOLOGY and health report both margins: the young tier's (ISR size − 1) and the settled tier's (fewest positions beyond k). | D1's 1 for every volume | The user chose m = 4 to survive 4 losses; with `min_isr = 1` one slow node (or two on 8+4) leaves writes acknowledged on one copy. The cost: an EC volume refuses writes when more than one of its log replicas lags (of 3 for m = 2, of 5 for m = 4). Confirmed by the user on 2026-11-09 (E35). |
 | E25 | **Scrub every chunk every `scrub_days` (14)**, paced by `scrub_mb_s` (50 MB/s per disk) below rebuild: each storage server reads its chunks and checks every cell against the encode-time cell checksums (E26); log replicas scrub `.ec` files and young parts the same way (`verify_checksums` reads). A bad cell is repaired by a range decode through the rebuild path. Damaged chunks are counted per disk; a disk with more than `scrub_out_count` (8) in a day goes OUT (E27). Health shows the oldest unscrubbed object. | Scrub on demand; checking parity against data across servers | Systematic reads never touch parity, and range reads cannot check a 1 MiB cell's sum, so rot in parity or unread data stays hidden until a degraded read or a rebuild needs it: at margin 0 that is loss. Encode-time sums make a local check sufficient: a cell that matches its encode-time sum is what the encoder produced (objects counts damage per device the same way, objects:src/cluster/cmap.h:169-170). |
-| E26 | **Checks at every hand-over.** The encode checks every granule checksum and the footer hash of each part it reads (it reads every byte anyway) and aborts on a mismatch (the part is repaired from a replica first, design-cluster.md §8.5); it computes a 64-bit sum per cell for **every position**, data and parity, sends each position its sums with the put, and records all of them in the object record; a chunk server checks the cells it receives before PUT_OK and the leader compares each PUT_OK's sum. After the settle, every log replica compares a **logical digest** of the rows it retired (rows per series and an xxh64 over the visible rows in (series, ts) order) with the leader's (`MK_DIGEST`), before it deletes them; a mismatch keeps the retired parts and raises DIVERGED. Retired parts of a settle are kept `settle_keep_s` (1 day), not `obsolete_part_lifetime_s`. A rebuilt cell is checked against its encode-time sum, never self-certified. | Trusting the leader's bytes (the first draft); a digest on the apply path | Granule payloads are hashed only with `verify_checksums` (default off; src/part.c:314-318), so rot in the leader's part would be encoded with fresh, matching sums while the good replica copies are retired; and a merge bug on the leader would become the only lineage. The digest costs one decode of each settled partition per log replica, in the background (EU6). |
+| E26 | **Checks at every hand-over.** The encode checks every granule checksum and the footer hash of each part it reads (it reads every byte anyway) and aborts on a mismatch (the part is repaired from a replica first, design-cluster.md §8.5); it computes a 64-bit sum per cell for **every position**, data and parity, sends each position its sums with the put, and records all of them in the object record; a chunk server checks the cells it receives before PUT_OK and the leader compares each PUT_OK's sum. After the settle, every log replica compares a **logical digest** of the rows it retired (rows per series and an xxh64 over the visible rows in (series, ts) order) with the leader's (`MK_DIGEST`), before it deletes them; a mismatch keeps the retired parts and raises DIVERGED. Retired parts of a settle are kept `settle_keep_s` (1 day), not `obsolete_part_lifetime_s`. A rebuilt cell is checked against its encode-time sum, never self-certified. | Trusting the leader's bytes (the first draft); a digest on the apply path | Granule payloads are hashed only with `verify_checksums` (default off; src/part.c:314-318), so rot in the leader's part would be encoded with fresh, matching sums while the good replica copies are retired; and a merge bug on the leader would become the only lineage. The digest costs one decode of each settled partition per log replica, in the background (EU6). *(2026-11-22: R7 built a byte digest of the object, not the logical digest of the visible rows described here; the logical digest is R8's, §2.3, docs/tasks/r8-from-r7.md.)* |
 | E27 | **A storage server holds one chunk store per disk** (`--chunk-dir`, repeated; each with its own META and store id; *2026-11-11*: declared with `--disk PATH[:CLASS]` instead, E47, chunk stores only on capacity disks where a server has any, E50). A position stays one per server; each chunk lives on one of its disks, in the server's local index. A dead disk is a **device** DOWN/OUT: only that disk's chunks are rebuilt, onto the server's other disks when they have room, else the server's positions move by the balancer. `tsdb cluster disk out|replace NODE DISK`. | One file system over all disks (one disk loss is the whole server); RAID under the chunks (redundancy on redundancy, the 1.25x is no longer 1.25x) | At 1-2% a year per disk, a 20-node cluster of 24-disk servers loses several disks a year: the most frequent hardware event. Objects does it per device (objects:src/cluster/cmap.h:66-77; timers per device, objects:src/mds/server.h:84-100). |
 | E28 | **A server back during a rebuild takes its positions back**: for each position whose replacement is not yet `whole`, a returned holder whose stores are intact gets it back with one `STRIPE_SET` conditional on `stripe_version`, and copies only what was settled while it was away; the partial fill is deleted. Where the replacement is already whole, it gets the position back only when that saves a balance move at an unchanged margin. `tsdb cluster node replace OLD NEW` gives OLD's positions to NEW directly, filled once by copy or decode. | The first draft: the returned server only serves as a copy source, then deletes everything, and the balancer moves 1/N of the cluster back onto it | A 35-minute firmware update without a hold would otherwise move the node's data twice (out by decoding at k times the reads, then back), days of traffic at reduced margin. Ceph does the same when an OSD returns during backfill. |
 | E29 | **Segments are retained for a DOWN or held member** of the log group until it goes OUT or its hold ends, within `repl_retain_down_gb` per server (sized by §4's rule: ingest × `rebuild_after` × WAL bytes per row), beyond design-cluster.md §8.3's 30 min and `repl_retain_mb`. | §8.3's budget alone | At high ingest 4 GB lasts minutes, so "back within 30 minutes only catches up" would not hold, and a planned 2-hour hold would cost a snapshot of terabytes of young data. |
@@ -260,7 +260,35 @@ replicas as a pending file, as `Y` (§2.3); it is never fetched at apply time.
 The protocol fixes one cut Z: the objects and `Y` hold exactly the rows of the key P from log positions at or below Z,
 and nothing writes into P between Z and the marker.
 
-**Part position.** Every part of a cluster volume has a `ppos`, recorded in its MANIFEST entry: for a flush part, the
+**On one server (R7, built; the plan's D1 and D2).** A single server with a tier needs only part of this section, and
+R7 built only that part. The `.ec` file keeps its source's name and block range (D2), so the settle changes how a part's
+bytes are stored and nothing else: same rows, same rank, same key. Step by step:
+
+- Step 1 (choose) applies: the key's parts are pinned by `settling` under `db->lock`, and merge selection treats a
+  pinned part, and every `.ec` part, as a barrier (never a merge input).
+- Step 2 (encode, check, put) applies, in one pass: each stripe of the part is copied once, and the granule checksums,
+  the footer hash and the CLASSES judgement are checked on that copy, which is what is encoded (E26). Every position is
+  written (no degraded settle: the record's `positions` is 0).
+- Steps 3-5 (close the key, cut, marker) do not apply. There is no gate, no `lw_enter` over the key, no Z, no `Y` and no
+  marker: a part written meanwhile is simply another part, with a higher block number, and ranks above the `.ec`. What
+  keeps a drop from bringing rows back is the swap's input check, made under `db->lock` in the hold of its renames.
+- Step 6 (apply) is the swap `ec_swap_commit` (src/ecswap.c): intent v4 (`L tmp final` and `R part settled_part` lines),
+  all parts of the key or none, each `.ec` listed where its source was, each source renamed `settled_<name>`. There are
+  no fresh block numbers and no renames of `Y` (D2), and nothing is retired to `retired_*`: the source is kept as
+  `settled_*` (step 7).
+- Step 7 (digest) is a byte digest of the object read whole, compared with the record's `object_xxh64` and with the
+  `settled_` file's (src/eckeep.c), not the logical digest of the visible rows E26 describes; a mismatch sets
+  `db->diverged`, the volume answers UNAVAILABLE, and the way out comes with R15 (D5). `settle_keep_s` is counted from
+  the record's settle time, never from a file's mtime.
+
+What R8 must add for a cluster (the plan's D1: the gate, the cut, `Y`, `MK_COLD`, `MK_DIGEST`, the replica's apply,
+shipping `.ec` files) is in docs/tasks/r8-from-r7.md. Steps 3-6 below are that design and are unbuilt.
+
+**Part position.** `ppos` needs a durable home before R8 can use it, and MANIFEST is not one: it names parts only
+(`manifest_publish` writes one line per part), it is rewritten in place without a sync and the writer never reads it at
+open (a torn write is why FNO exists). The `.ec` record has a `ppos` field (written as 0 in R7, refused when not), a
+flush part has nowhere to keep one. R8 picks the home (a checksummed sidecar, or the part header, which E17's "no new
+format number" would have to allow). Every part of a cluster volume has a `ppos`, which was meant to be recorded in its MANIFEST entry: for a flush part, the
 highest position of a record holding a row of that key (the memtable keeps that maximum per partition key as it
 appends; the header's `fno_hi` is not it, since a flush's `fno` range covers every key of the flush); for a part a
 `COMMIT` published (large insert, delete, replace), the `COMMIT`'s position; for a merge output, the largest of its
@@ -296,7 +324,9 @@ inputs'; for an `.ec` part, its settle's Z.
    the marker, **stop**: the volume on this replica is DIVERGED (`TSDB_WHY_DIVERGED`), nothing is retired, and the
    replica is rebuilt (design-cluster.md §8.5); list the `.ec` files under fresh block numbers in the leader's order,
    then commit the `Y` files above them (`parts_commit`; they keep the leader's `ppos`), then retire the objects the
-   marker names. A merge of P in flight on a replica drops its output, as when a replace retires its inputs. Then the
+   marker names. (On one server the `.ec` keeps its source's name and block range instead, D2, and nothing is renumbered.
+   Whether a replica's `.ec` takes the name of its own copy of the part or fresh numbers, as written here, is R8's choice:
+   the replicas' parts are not the leader's files.) A merge of P in flight on a replica drops its output, as when a replace retires its inputs. Then the
    leader leaves the fence (`lw_leave`) and opens the gate.
 7. **Digest.** In the background the leader computes the logical digest of P as of Z from its own retired parts and
    appends `MK_DIGEST` (oids, digest). Each log replica computes the digest of its own retired set and compares; on a
@@ -339,6 +369,13 @@ or tombstones cover more than 10% of their rows. A retention drop of a whole par
 retires the `.ec` files; the leader deletes the chunks by `MK_GC` after `obsolete_part_lifetime_s`. Expired rows inside
 a settled partition are clamped by queries as today and go only when the whole partition does (partitions span at most
 364 days).
+
+**Built in R7 (one server):** merges, rewrites, `tsdb_optimize` and the TTL rewrite skip `.ec` and settling parts
+(`part_merge_barrier`); `db_wait_merges` counts them as walls, not pairs; a retention drop retires an `.ec` part with
+`retired_` and its chunks go at the last reference, after `obsolete_part_lifetime_s` (src/ecgc.c). **Re-encode is not
+built** (the plan's D9, moved to R10: docs/tasks/r10-reencode.md): late rows settle as further objects of the key and
+are never combined, so a key with late rows reads more objects, and tombstones in young parts keep hiding rows of
+objects that the reader decodes first. Answers do not change.
 
 At open, an `.ec` part is judged from its index only: its class check was done at the settle (step 2), and a class
 switch is always past every row of its series (AGENTS.md "Partition classes"), so no later switch falls inside a
@@ -849,14 +886,14 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 |---|---|---|---:|---:|
 | R5 | EC codec in `src/ec/`, copied unchanged by `tools/sync-ec.sh` with `src/ec/UPSTREAM` (E32), after the upstream change that replaces gf256.c's constructor by a selection call that `src/cpu.c` makes; fitting AGENTS.md "CPU levels" (`tools/check-isa.sh` must allow the AVX-512 and GFNI kernels behind target attributes, or they move into `src/levels.h`); `test_rs`, `build/ec-bench`; the check that no client library or package holds a codec symbol; docs/licenses.md's row moves from planned to present | numbers on three CPUs | — | 1-2 |
 | R6 | Object layout, chunk files (header with epoch, cell sums), chunk stores per disk with ids and `EPOCH`, the directory backend; range decode; `fuzz_chunk`, `fuzz_ec` | fuzz 1 h each | 2 | 2-3 |
-| R7 | Engine: `.ec` parts (the read seam, the cache, merges skip them), `ppos` in MANIFEST, the settle gate and cut, the settle intent, DIVERGED on a part above Z, encode-time checks, `MK_DIGEST` and `settle_keep_s`, per-part and coarse settles, re-encode, retention drops; X1's cold boundary folded in | `make jepsen` (single server, directory backend: kill, power during settle, deletes/replaces/large inserts into settling keys, the `Y` mutant) | 8 | 5-7 |
-| R8 | tsdbd: roles, chunk peer messages, epoch fences (durable per volume), `MK_GC` and the orphan rules, GC suspension, degraded reads with E31's hedging and `read-avoid`, metadata v3, TOPOLOGY with both margins, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients, `min_isr` by mode | `make jepsen-cluster` (kill, partition, partial partition, pause past the lifetime, disk loss, chunk rot, crash between `MK_COLD` and commit) on 4+2 and 16+4; `make test-clients` | 12 | 6-8 |
+| R7 | **As built (2026-11-22): settled `.ec` parts on one server, directory backend, behind the test-only `TSDB_TEST_TIER`** (docs/tasks/r8-from-r7.md): `.ec` parts that keep their source's name and block range (D2), the read seam and the granule cache, merges and drops that respect them, intent v4 and the swap with its input check under `db->lock`, the one-pass settle with the encode-time checks, per-part and coarse settles (E5), `settled_*` kept from the record's settle time with a byte digest and DIVERGED (D5), the delete queue at the last unref and the orphan sweep (D6), no format change (E17); gate: `make jepsen` with a directory tier (`--tier`, kill, power, `settle-steps`, eio) on both backends | `make jepsen` (single server, directory backend: kill, power during settle, deletes/replaces/large inserts into settling keys) | 8 | 5-7 (done) |
+| R8 | **takes what R7 left out (D1; docs/tasks/r8-from-r7.md): `ppos` with a durable home (MANIFEST holds none), the settle gate and cut, `Y`, `MK_COLD` and the `MK_DIGEST` with E26's logical digest, the replica's apply of the settle intent and shipping `.ec` files, DIVERGED on a part above Z and its way out, the choice between a replica's own block numbers and fresh ones (§2.3 step 6), the epoch authority in place of the constant 1 (D4), followers over a tier (D7), prefetch (D8); the `Y` mutant**; and tsdbd: roles, chunk peer messages, epoch fences (durable per volume), `MK_GC` and the orphan rules, GC suspension, degraded reads with E31's hedging and `read-avoid`, metadata v3, TOPOLOGY with both margins, unavailable/corrupt/lost, `TSDB_WHY_LOST` in the four clients, `min_isr` by mode | `make jepsen-cluster` (kill, partition, partial partition, pause past the lifetime, disk loss, chunk rot, crash between `MK_COLD` and commit) on 4+2 and 16+4; `make test-clients` | 12 | 9-11 |
 | R9 | Failure handling: DOWN/OUT at `rebuild_after`, opening hold and fail-stop fast path, bounded holds and guard, degraded settles, retention for DOWN members, backpressure (`TSDB_WHY_FULL`), checked stripe rebuild by margin and pace, the `whole` barrier, return during rebuild and `node replace`, moves and the balancer with `balance_mb_s`, `node drain`; `sim_place` with its mutants and MTTDL | sim_place soak; jepsen-cluster (rebuild during writes, back during rebuild, two, m, m + 1, slow node, slow then disk loss, 2-hour hold, `STRIPE_SET` during a settle) on all four geometries | 24 | 6-8 |
 | R12 | Scrub (E25, §5.9): chunks, `.ec` files and young parts, damage counts and disk OUT, health age, metrics | jepsen-cluster: rot (parity included) then m failures | 6 | 2 |
 | R13 | Disks **with classes** (E27, §5.5; *2026-11-11*: E47-E58, §15): `tsdb disk init`, `--disk PATH[:CLASS]`, detection and its fake `/sys` test, the start checks (META, `st_dev`), disk META, the member record's disks, `STORE_ADD`/`STORE_CLASS`, roles from disks, placement and balancing by class (log replicas on fast disks, chunks on capacity disks, one-class stripe groups, projected use), local chunk moves and drains, filling per disk and per use with the four alerts' metrics, each disk a fault domain (probe, `disk_stall_s`, worker pools per disk, per-disk quiesce), device DOWN/OUT, rebuild within a server, a lost fast disk with the chunk stores serving on, the adoption runbook (`--adopt`), `disk out`, `disk replace`, `disk class`; `sim_place` with disks and classes | jepsen-cluster: EIO on one hard drive under load, a stuck NVMe, single-disk loss of each class, disk loss back within 30 min, a fast disk filling to FULL under ingest, on servers with two classes on outagefs; `sim_place` soak with the class invariants and mutants (4 h) | 16 | 6-8 |
 | R14 | Operator CLI (`node hold/replace/drain/destroyed`, `disk ...`, `volume move/redundancy/salvage/gc`, `cluster status` with both margins, rebuild progress and settle backlog) and metrics (docs/metrics.md) | test_server cases | — | 2 |
 | R15 | *2026-11-11*: a single server's local tier (E55, §15.7): `TIERS`, `tsdb DIR tier add/set/lost/salvage/status` with the path and device checks, tier store META with `db_id`, `requires=tier`, objects coded k' + m across stores (R5's codec, R6's cells; mirror, k' + 1, 4+2 by default, `--single-copy`), the settle by `tier_after_s` and by `tier_high_pct` on R7's settle, reads by `pread` through the seam with degraded range reads, the local rebuild of a lost store, scrub with repair, the open check and orphan scan, FULL before ENOSPC with the tier metrics and `dist/alerts/tsdb.rules.yml`, followers and health domains over tier stores, `fuzz_tiers` | `make jepsen` on one server with a six-store tier on outagefs (kill and power during a settle, EIO and stuck on one store, one store lost and rebuilt, m + 1 lost and salvaged, the tier filling under ingest); fuzz 1 h | 10 | 5-6 |
-| R10 | Redundancy change on a running volume (§6.4: order, re-encode, `MK_UNSETTLE`); in 0.11.0 (E33) | jepsen-cluster with a conversion running | 6 | 3 |
+| R10 | **Re-encode (D9, moved from R7; docs/tasks/r10-reencode.md: E6's rule, bounded input, abort without marking a part, the logical digest of the rows, intent v4's `R` lines for `.ec` sources)** and redundancy change on a running volume (§6.4: order, re-encode, `MK_UNSETTLE`); in 0.11.0 (E33) | jepsen-cluster with a conversion running | 6 | 4-5 |
 | R11 | Benchmarks (§10.4, NVMe and HDD storage) and the sizing numbers for P5's guide (compute disks, index and rebuild time, m = 4 above 20-30 TB a node), README section, AGENTS.md invariants (the settle cut, chunk fences, `MK_GC`) | the numbers | — | 1-2 |
 | P1 | Versions (E37-E41, §14.1-14.2): the compat triple (`tsdbd --compat`, HELLO, heartbeats, recorded at `init`) and the refusals (peer link, open, a binary older than the cluster version); `CLUSTER_VERSION`, `upgrade check`, `upgrade status` and `upgrade finish`; every behaviour change gated on the cluster version; `node prepare` (triple check, margin check, hold, leadership and Raft-leader hand-off, one at a time); the window message; versioned state files refused on a mismatch; the golden `tests/data/meta-snap-v3.bin` for converters. No reader of older versions and no AGENTS.md change (E40) | meta-soak with members of two builds of one triple (a member held back stands in for the old build); test_server cases | 4 | 3-4 |
 | P2 | Upgrade test (§10.6): `make upgrade-test` with the behaviour-only bump (a rolling upgrade within the formats, the upgrade nemesis in jepsen-cluster) and the format bump (the refusal test across a change, the window procedure) | `make upgrade-test`, long form | 6 | 1-2 |
@@ -865,9 +902,12 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 | P5 | The production operator guide (E44, §14.5): `docs/cluster-operations.md`, systemd units in `dist/`, runbook scripts in `tests/cluster/runbooks/` | the runbook tests | 3 | 3-4 |
 | P6 | Release gates (E45) on the release commit: jepsen-cluster's full set on all four geometries and `replicas=3` (§10.3), with the device-class cases of R13 (*2026-11-11*), the 72-hour soak (§10.5), the upgrade test, the reviews, and the fixes they find | the gates themselves | 98 (26 + 72) | 2-4 |
 
-R5-R15: **39-51 track-days**, 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
+*(2026-11-22: R7 as built leaves the replicated half to R8 (+3 track-days, row above) and re-encode to R10 (+1.5); the
+track-day totals below add them, the gate hours are not recomputed.)*
+
+R5-R15: **43-56 track-days** (39-51 before the R7 split of 2026-11-22: R8 +3, R10 +1 to 2), 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
 instead of 2-3 and 6, R15 5-6 and 10, E56; it was 30-40 and 64). P1-P6: **14-21 track-days**,
-117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: about 66-92 track-days and 244 gate
+117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: about 70-97 track-days (66-92 before the R7 split) and 244 gate
 hours (about 10.2 machine-days, 3 of them the soak) before reruns after fixes** (*2026-11-11*, with device classes as
 revised after review; it was 57-81 and 222) (2026-11-09, after the user's answers; it was 44-60
 track-days and 107 gate hours with R10 as the first cut and the cluster data a preview, and 59-84 and 226 in the
@@ -1331,10 +1371,12 @@ below). How the key and TIERS agree at start is settled with the `config-files` 
 - **How it moves**: E6's settle at a cut on one replica (R7 builds and gates exactly this case with the directory
   backend). Each position's chunk is written to its store as `tmp_*`, fsync'd, renamed, directory fsync'd; then the
   `.ec` index file is written in the volume directory and the full part retired under `publish_lock`, through the
-  settle intent. The settle lists parts, so it folds into the latest table like any publisher (AGENTS.md "The latest
+  settle intent (as built: the swap keeps the source's name and block range, renames the source to `settled_*`, and
+  keeps it `keep_s`, §2.3). The settle lists parts, so it folds into the latest table like any publisher (AGENTS.md "The latest
   table"), with no change to its answers. The open's orphan scan of the tier stores runs after the intent replay and
-  deletes only chunks that no MANIFEST entry, settle intent or `retired_*` `.ec` file (kept for followers until
-  `obsolete_part_lifetime_s`) names; on one server no settle is in flight then.
+  deletes only chunks whose object no `.ec` file name in the volume directory names, listed or `retired_*` (kept for
+  followers until `obsolete_part_lifetime_s`), reading one chunk header to check that it names this volume's uuid
+  (as built, `src/ecgc.c`; MANIFEST is not consulted); on one server no settle is in flight then.
 - **Reads**: statistics from the `.ec` index on the NVMe, as before. A granule to decode is read from the granule cache
   or with one `pread` of its byte range from the store holding its data cell (a seek), or, with that store DOWN, the
   same range from k' others; adjacent granules of one series in one partition (they lie together in a part) are read
@@ -1372,8 +1414,10 @@ below). How the key and TIERS agree at start is settled with the `config-files` 
   (`tsdb_tier_add`) only.
 - **Production (NFS/ZFS)**: a tier store may be a second export from a hard-drive pool, `:hdd --single-copy` (ZFS gives
   the redundancy; no device to detect), under its own `--health-domain`.
-- **Formats**: `.ec` files, `ppos` in MANIFEST, the settle markers and the settle intent come to single-server volumes
-  with a tier, behind `requires=tier` (E17 amended).
+- **Formats**: `.ec` files and the settle intent (intent v4) come to single-server volumes with a tier, behind
+  `requires=tier` (E17 amended). R7 built exactly these two: a single server has no `ppos` and no settle marker (the
+  `.ec` record's `ppos` field is written as 0), and a part's name is kept by the settle. `ppos` and the markers are R8's
+  (§2.3).
 
 ### 15.8 Formats that freeze at 1.0
 
