@@ -410,10 +410,13 @@ void chunksrv_epoch_source(struct chunksrv *cs, chunksrv_epoch_fn fn, void *arg)
     atomic_store(&cs->src, fn);
 }
 
+/* Each counter is read on its own (relaxed, as STAT writes them): a plain struct copy races the workers. */
 void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st)
 {
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    *st = cs->st;
+#define LD(f) st->f = __atomic_load_n(&cs->st.f, __ATOMIC_RELAXED)
+    LD(requests); LD(malformed); LD(puts_ok); LD(puts_refused); LD(put_bytes); LD(reads); LD(read_bytes); LD(fenced);
+    LD(unsure_refused); LD(source_raises);
+#undef LD
 }
 
 static bool any_unsure(struct chunksrv *cs, uint32_t volume)
