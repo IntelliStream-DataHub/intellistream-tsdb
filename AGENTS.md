@@ -66,9 +66,11 @@ docs/tasks/macos.md.
 Tests take a scratch directory as their first argument
 (`./build/test_tsdb /tmp/x`); default `/tmp`.
 
-Run the tests that cover what you changed, and the sanitizers for anything
-concurrent or touching memory layout. A change to how data reaches the disk
-(writes, fsync, renames, recovery, merges, the WAL) also needs `make jepsen`.
+Run the tests that cover what you changed (integration tests of the behaviour, end to end where it shows), and
+those test binaries under the sanitizers for anything concurrent or touching memory layout. A change to how data
+reaches the disk (writes, fsync, renames, recovery, merges, the WAL) also needs a power-loss or crash-point case for
+that path. The full gates (`make asan`, `make tsan`, `make jepsen`, the cluster gate, the mutant suites) run once a
+week on main (.claude/skills/tsdb-tracks/SKILL.md), not per change.
 `make tsan` builds into `build-tsan/`, the server under test included, and
 leaves `build/` alone. `make asan` starts with `make clean`: while anything
 else uses `build/` (a running tsdbd, client tests, another agent), run it in a

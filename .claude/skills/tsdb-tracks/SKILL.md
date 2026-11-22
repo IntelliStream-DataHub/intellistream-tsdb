@@ -29,17 +29,26 @@ calls). Read AGENTS.md first: its invariants and rules are the contract every tr
    the session's model. Review always runs on the session's model.
 4. Several tracks may run at once if they touch different files; serialise tracks that share files.
 
-## Gates (the builder runs them detached; the fixer reruns what a finding touched, then all once)
+## Tests per change, gates once a week (the owner's rule, 2026-11-22)
 
-| change | gates |
-|---|---|
-| anything in src/, server/, client/*.c | `make test`; `make asan` in the worktree (it runs `make clean`); `make tsan` |
-| how data reaches the disk (writes, fsync, renames, recovery, merges, WAL) | the above + `make jepsen` |
-| wire protocol | the above + `make test-clients` (all four clients change in the same commit) |
-| anything under client/ or connectors/ (code, tests, docstrings, stubs, constants) | that client's own suite (`make test-rust`, `test-python`, `test-java`, `mvn test` in connectors/pulsar); a protocol version bump runs `make test-clients` |
-| portability | `make dist`, `make dist-check-sandybridge`, `make test-almalinux10` |
-| a test or benchmark harness that starts tsdbd | `--port 0 --port-file`, never a computed port (AGENTS.md "Ports"); `make test` in two copies of the tree at once shows no collision |
-| docs | every claim checked against the code or a primary source; runnable snippets run |
+A track proves its own behaviour with integration tests aimed at what it changed; the full gates run once a week on
+main, not per track or per merge. GitHub CI still runs on every push.
+
+Per change (the builder runs them, detached when long; the fixer reruns what a finding touched):
+- the regression and integration tests of the change: the new cases, the whole test binary or `test_cluster`
+  scenarios they live in, end to end through tsdbd where the behaviour is visible there;
+- a planted mutant per new check, caught by its test (the Makefile's mutant loop for that binary);
+- those binaries under ASan or TSan when the change is concurrent or touches memory layout (only those binaries,
+  `make B=build-asan ... build-asan/test_x`, not `make asan`);
+- for how data reaches the disk: a crashfs power-loss or crash-point case for that path, not `make jepsen`;
+- a wire protocol change: `make test-clients`; a client or connector: its own suite; docs: every claim checked;
+- a harness that starts tsdbd: `--port 0 --port-file`, never a computed port (AGENTS.md "Ports").
+
+Weekly gate (Saturdays, on main, when nobody else needs the machines; one job per machine): `make test`,
+`make test IO=epoll`, `make asan`, `make tsan` (its groups as parallel jobs), `make jepsen`, the cluster gate
+(`agents/tsdb/r3-gate/gate-par.sh REV`: jepsen-cluster's matrix in parallel lanes, about an hour), the mutant suites
+(`repld-mutants lease-mutants copy-mutants meta-mutants auth-mutants sim-repl-mutants`), `make dist-test` when
+portability changed. What it finds becomes fix tracks. Never a 12-hour soak as a gate; long soaks only on idle machines.
 
 ## Merge (main session)
 
@@ -48,8 +57,8 @@ calls). Read AGENTS.md first: its invariants and rules are the contract every tr
   commit ends with `Co-Authored-By: ...` then `Signed-off-by:` (the commit-msg hook in .githooks enforces it;
   `make hooks` installs it).
 - Fast-forward when the branch sits on main; otherwise `git merge --no-edit --signoff <br>`. Resolve conflicts
-  keeping both sides' intent; then rerun `make test` (and the gates the merge could affect) on main, detached.
-- Push main only when green. Remove worktrees of merged branches when no longer needed.
+  keeping both sides' intent; then rerun the tests of both branches' changes on the merge, detached.
+- Push main only when those tests are green. Remove worktrees of merged branches when no longer needed.
 
 ## Benchmarks
 
