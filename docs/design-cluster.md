@@ -905,6 +905,22 @@ this as well; until then the entry's own stall is the case the age check does no
 fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone`;
 `make fwd-mutants` and `test_fwd` must catch each.
 
+Through the entry node, end to end (S2-2, s2h-via). `tsdbc-bench via` sends the same load to the leader and then to another
+member that forwards it (`test_cluster viabench` runs it in a few seconds). jepsen-cluster's workload `kv-via` is kv on
+3 replicas with every client on a random member, so most operations are forwarded, and checks read-your-writes (check 6:
+the read on the connection of an acknowledged write sees it or newer). Its nemesis `fwdstall` makes a member that does not
+lead hold its forwards for 2 s (`TSDBD_TEST_FWD_STALL`, a file in its directory) and requires that no write that began in
+that window, lasted 1.3 s or more and was acknowledged (check 7, "old frame"). `make jepsen-cluster-selftest` plants
+`TSDBD_FWD_MUTANT=fwdoldframe` (check 7 must fail) and replicas that answer reads (`TSDB_REPLICA_READS=1`, no mutant:
+a replica applies at the commit point, after the leader's acknowledgement, so check 6 must fail; this proves check 6
+fires, not the route mutant). `TSDB_ROUTE_MUTANT=replicaread` alone shows nothing there: the replica's read gate still
+refuses a replica read unless `TSDB_REPLICA_READS` is set, so `test_cluster route` is that mutant's only test.
+`fwdstall` holds a frame at the entry node, before its age check, so it catches an entry that applies an old frame
+(`fwdoldframe`); the owner's own age check and the arrival stamp (`fwdownerage`, `fwdarrival`) need a frame delayed after
+the stamp, which no jepsen nemesis does yet (`test_cluster forward`, `make fwd-mutants` catch them). kv-via also missed
+`fwdtwice`, `fwdepoch`, `fwdnolease` and `fwdgone` in one 30 to 40 s run each; those have their own `test_cluster`
+scenarios.
+
 The Pulsar sink inherits this through the Java client. Its `ErrorClassifier` already retries unknown codes; MOVED,
 UNAVAILABLE and IO become explicitly retryable, DROPPED stays final. It acknowledges a Pulsar message only after tsdb's
 OK, so a failover costs it a pause, never a message.

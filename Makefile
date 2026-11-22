@@ -1424,6 +1424,9 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	out=$$(TSDBD_FWD_MUTANT=fwdoldframe $$j --seconds 40 --nemesis fwdstall --workload kv-via 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'old frame: write'; then \
 	        echo "jepsen-cluster-selftest: a frame held past the forward age at its entry node and then applied (fwdoldframe) went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDB_REPLICA_READS=1 $$j --seconds 30 --nemesis none --workload kv-via 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'read-your-writes: key'; then \
+	        echo "jepsen-cluster-selftest: a read served from a replica's own copy (replica reads on, no mutant) went unnoticed by read-your-writes (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

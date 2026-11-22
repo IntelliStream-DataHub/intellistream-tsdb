@@ -2,8 +2,8 @@
 /*
  * jepsen-cluster: a Jepsen-style run of a tsdbd cluster (docs/design-cluster.md 13.2, design-cluster-data.md 10.3).
  *
- *   jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--nemesis kill,partition,pause,midcommit,power]
- *                  [--workload meta,kv-local|kv|classes] [--seed N] [--crashfs build/libcrashfs.so] [--mutant NAME]
+ *   jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--nemesis kill,partition,pause,midcommit,power,fwdstall]
+ *                  [--workload meta,kv-local|kv|kv-via|classes] [--seed N] [--crashfs build/libcrashfs.so] [--mutant NAME]
  *
  * What it is. A runner starts 3-8 tsdbd (default 5), each a direct child with --port 0 --port-file,
  * --exit-with-parent=<this pid>, --cluster, a --state-dir and a --peer-advertise that names a proxy of this harness,
@@ -64,6 +64,18 @@
  * same rows (replicas_equal) and the keys of the leader's final read, and every replica holds each of the filler's
  * large writes whole or not at all, whole when acknowledged (fill_check).
  *
+ * kv-via (--workload kv-via; S2-2, forwarding): kv's volume, writers and readers, but each client sends its operations
+ * through a random member (a third of the picks of pick_node go to a node a client is on), so most of them reach kvr's
+ * leader as a FORWARD of the entry node (server/fwdreq.h); `via_entry` is the choice. Checks 1-5 as in kv, plus
+ *  6 read-your-writes: the read the writer thread makes on the connection of its own acknowledged write sees that
+ *    write or newer (a read answered by a lagging replica fails it: the run under
+ *    TSDB_REPLICA_READS=1, a test hook that lets replicas with a lease answer reads, must fail, selftest);
+ *  7 old frame: nemesis fwdstall steers the writers to a random member that does not lead kvr and makes it hold its
+ *    next forwards (the hook file `fwd-stall` in its directory, TSDBD_TEST_FWD_STALL) for 2 s, beyond the 1 s forward
+ *    age, so a frame the entry sent late would be a write the client has long given up on: no write that begins in the
+ *    window and lasts 1.3 s or more may be acknowledged by it (TSDBD_FWD_MUTANT=fwdoldframe must fail, selftest). The
+ *    run also fails when no write, read and read-your-writes read went through a member that does not lead kvr, and
+ *    when fwdstall held no write at all (up to 3 attempts per round; the misses are counted in the summary).
  * users (--workload users, implies --auth: every tsdbd starts with a login, the cluster with a superuser made by the CLI;
  * tests/jepsen/cluster_users.h has the design and the checks): an admin thread adds, drops and re-adds users and changes
  * their passwords and grants through random members, one prober per member logs in and reads as them; an acknowledged
