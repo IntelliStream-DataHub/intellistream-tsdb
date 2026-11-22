@@ -1047,6 +1047,8 @@ static struct {
     uint64_t users_floor;    /* a Raft leader's commit index heard in this run (cluster_users_caught_up); 0: none */
     uint64_t uw_n, uw_max;   /* the users' count and highest version last pushed to the users watch */
     uint64_t uw_at;          /* the applied index whose users the watch has taken (the barrier waits for it) */
+    uint64_t uw_rgen;        /* the restore generation of the copy at uw_at */
+    uint64_t uw_seen;        /* C.sm.applied at the last users_push (the loop pushes when it moved) */
     int uw_said;
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
@@ -1110,6 +1112,9 @@ static struct {
     char holdusersfile[1100];
     int users_probe;     /* TSDB_CLUSTER_TEST users_probe=1: a users watch that writes <state-dir>/userswatch, and drops a
                           * user named probe-drop through cluster_user_propose from another thread (test_cluster users) */
+    int push_every_apply; /* TSDB_CLUSTER_TEST push_every_apply=1: the users watch is given the copy at every loop pass
+                           * that applied something, as while a read barrier waits (test_cluster userreplay: a held
+                           * older list would otherwise go out only if a heartbeat fell inside the replay) */
     unsigned sync_delay_ms; /* TSDB_CLUSTER_TEST sync_delay_ms=N: the worker waits N ms before each sync round */
     unsigned copy_hold;  /* TSDB_CLUSTER_TEST copy_hold=N: cc_hold_main holds a snapshot across N more */
     unsigned copy_noleader; /* TSDB_CLUSTER_TEST copy_noleader=V (test_cluster route): the copy shows volume V with no
@@ -1350,6 +1355,8 @@ static void test_knobs(void)
             C.hold_copy = v != 0;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
+        else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
+            C.push_every_apply = v != 0;
         else if (sscanf(p, "users_probe=%llu", &v) == 1)
             C.users_probe = v != 0;
         else if (sscanf(p, "hold_isr_file=%llu", &v) == 1)
@@ -1654,7 +1661,10 @@ enum cl_mutant {
                             * answered and only the old leader's lease is awaited */
     CLM_ANYEPOCH = 28,     /* a FENCE_REPLY of any epoch counts for the promotion of its volume (review R2) */
     CLM_NOCUTHOLD = 29,    /* a shrink below 2 goes ahead before the member it drops reported the cut (review R13) */
-    CLM_FORCEUP = 30       /* force-leader goes ahead while an ISR member is up (review R6) */
+    CLM_FORCEUP = 30,      /* force-leader goes ahead while an ISR member is up (review R6) */
+    CLM_PUSHREBUILD = 31,  /* the users watch is given the copy while it is rebuilt (a promotion's core_boot) */
+    CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
+    CLM_SYNCNOLEASE = 33   /* USER_SYNC answered by a leader without its lease (review F7) */
 };
 static int cl_mutant(void)
 {
@@ -1693,6 +1703,9 @@ static int cl_mutant(void)
             : !strcmp(e, "anyepoch")      ? CLM_ANYEPOCH
             : !strcmp(e, "nocuthold")     ? CLM_NOCUTHOLD
             : !strcmp(e, "forceup")       ? CLM_FORCEUP
+            : !strcmp(e, "pushrebuild")   ? CLM_PUSHREBUILD
+            : !strcmp(e, "holdempty")     ? CLM_HOLDEMPTY
+            : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2239,6 +2252,7 @@ static void *g_uwatch_arg;
 static atomic_int g_uw_new;
 static atomic_int g_users_ok; /* cluster_users_caught_up */
 static _Atomic uint64_t g_users_through; /* cluster_users_through: C.uw_at, for other threads */
+static _Atomic uint64_t g_uw_want;       /* the highest index a read barrier (cluster_user_sync) waits for here */
 /* where cluster_user_propose sends: the Raft leader's peer address as this server last knew it ("" none) */
 static pthread_mutex_t ul_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_ul_addr[META_ADDR_MAX];
@@ -3962,6 +3976,47 @@ static void admin_user_change(struct conn *c, uint32_t reqid, struct rd *r, int 
     }
 }
 
+static void uwait_reply(const struct uwait *w, const struct cluster_laggard *lag, uint32_t nl);
+static uint32_t user_laggards(uint64_t index, struct cluster_laggard *lag);
+
+/* USER_SYNC (cluster_user_sync): the read barrier. The commit index is every committed entry only while the leader
+ * holds its check-quorum lease (users_floor's rule); without it the member is told to try again. */
+static void admin_user_sync(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint32_t wait_ms = get32(r);
+    if (r->bad || r->off != r->len || wait_ms > 3600000) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    uint64_t now = iso_now_ns();
+    raft_index commit = raft_get_commit(C.r);
+    int lease = core_lease_until(now) != 0 || cl_mutant() == CLM_SYNCNOLEASE;
+    if (!lease || raft_get_term_at(C.r, commit) != raft_get_term(C.r)) {
+        admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, NULL, 0);
+        return;
+    }
+    struct uwait w = {c->serial, reqid, 0, commit, now + (uint64_t)wait_ms * MS};
+    struct cluster_laggard lag[CLUSTER_LAGGARDS_MAX];
+    uint32_t nl = user_laggards(commit, lag);
+    if (!nl || !wait_ms) {
+        uwait_reply(&w, lag, nl);
+        return;
+    }
+    if (C.nuwait == C.capuwait) {
+        C.capuwait = C.capuwait ? C.capuwait * 2 : 8;
+        C.uwait = realloc(C.uwait, C.capuwait * sizeof *C.uwait);
+        if (!C.uwait)
+            oom();
+    }
+    C.uwait[C.nuwait++] = w;
+}
+
 static void admin_user_get(struct conn *c, uint32_t reqid, struct rd *r)
 {
     char name[META_USER_NAME_MAX];
@@ -4050,8 +4105,17 @@ static int users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32
  * the change), and before the leader answers waiting user ops. */
 static void users_push(void)
 {
+    C.uw_seen = C.sm.applied; /* also while held below: the loop asks again only once the copy moves */
     if (C.hold_users && access(C.holdusersfile, F_OK) == 0)
         return; /* a test's lagging watch: nothing given, cluster_users_through stays where it was */
+    /* A copy below what the watch was given is being rebuilt (a learner promoted to voter: core_boot starts it from
+     * nothing or its snapshot, then the log replays): the watch keeps the users it has until the copy is back at
+     * them, or logins on this server meet an empty or older list and its sessions end (A32). A restore (a higher
+     * restore generation) is the one way the group itself goes back: a copy below the generation the watch has
+     * (rebuilt from nothing, or from a snapshot older than the restore) is held as well (state_after's order). */
+    int older = C.sm.restore_gen < C.uw_rgen || (C.sm.restore_gen == C.uw_rgen && C.sm.applied < C.uw_at);
+    if (C.uw_said && older && cl_mutant() != CLM_PUSHREBUILD && (cl_mutant() != CLM_HOLDEMPTY || !C.sm.nusers))
+        return;
     uint64_t umax = 0;
     for (uint32_t i = 0; i < C.sm.nusers; i++)
         if (C.sm.users[i].version > umax)
@@ -4083,6 +4147,7 @@ static void users_push(void)
     /* a watch set meanwhile (g_uw_new) has not been given these yet */
     if (taken && !atomic_load(&g_uw_new)) {
         C.uw_at = C.sm.applied;
+        C.uw_rgen = C.sm.restore_gen;
         atomic_store_explicit(&g_users_through, C.uw_at, memory_order_release);
     }
 }
@@ -4096,6 +4161,33 @@ static uint64_t member_applied(uint32_t id)
         return C.sm.applied;
     struct heard *h = heard_get(id);
     return h ? h->applied : 0;
+}
+
+/* the members (not OUT) whose last reported applied index is below `index` */
+static uint32_t user_laggards(uint64_t index, struct cluster_laggard *lag)
+{
+    uint32_t nl = 0;
+    for (uint32_t k = 0; k < C.sm.nmembers && nl < CLUSTER_LAGGARDS_MAX; k++) {
+        const struct meta_member *m = &C.sm.members[k];
+        uint64_t a = m->state == META_OUT ? UINT64_MAX : member_applied(m->id);
+        if (a < index)
+            lag[nl++] = (struct cluster_laggard){m->id, a};
+    }
+    return nl;
+}
+
+static void uwait_reply(const struct uwait *w, const struct cluster_laggard *lag, uint32_t nl)
+{
+    struct buf b = {0};
+    put64(&b, w->index);
+    put32(&b, w->uid);
+    put32(&b, nl);
+    for (uint32_t k = 0; k < nl; k++) {
+        put32(&b, lag[k].id);
+        put64(&b, lag[k].applied);
+    }
+    admin_reply(w->conn, w->reqid, 0, b.p, b.len);
+    buf_free(&b);
 }
 
 /* Every 100 ms on the cluster thread: the users' barrier, the waiting user replies, the users watch, and the leader's
@@ -4120,27 +4212,12 @@ static void users_duty(uint64_t now)
     for (size_t i = 0; i < C.nuwait;) {
         struct uwait *w = &C.uwait[i];
         struct cluster_laggard lag[CLUSTER_LAGGARDS_MAX];
-        uint32_t nl = 0;
-        for (uint32_t k = 0; k < C.sm.nmembers && nl < CLUSTER_LAGGARDS_MAX; k++) {
-            const struct meta_member *m = &C.sm.members[k];
-            uint64_t a = m->state == META_OUT ? UINT64_MAX : member_applied(m->id);
-            if (a < w->index)
-                lag[nl++] = (struct cluster_laggard){m->id, a};
-        }
+        uint32_t nl = user_laggards(w->index, lag);
         if (nl && now < w->deadline) {
             i++;
             continue;
         }
-        struct buf b = {0};
-        put64(&b, w->index);
-        put32(&b, w->uid);
-        put32(&b, nl);
-        for (uint32_t k = 0; k < nl; k++) {
-            put32(&b, lag[k].id);
-            put64(&b, lag[k].applied);
-        }
-        admin_reply(w->conn, w->reqid, 0, b.p, b.len);
-        buf_free(&b);
+        uwait_reply(w, lag, nl);
         *w = C.uwait[--C.nuwait];
     }
 
@@ -4150,6 +4227,9 @@ static void users_duty(uint64_t now)
     snprintf(g_ul_addr, sizeof g_ul_addr, "%s", lp);
     pthread_mutex_unlock(&ul_mu);
 }
+
+static int user_admin_send(int aop, const uint8_t *q, size_t qn, int wait_ms, uint64_t *index, uint32_t *uid,
+                           struct cluster_laggard *lag, uint32_t *nlag);
 
 int cluster_user_propose(int op, const char *name, const void *blob, uint32_t len, uint64_t version,
                          const char *actor, uint64_t actor_version, int wait_ms, uint64_t *index, uint32_t *uid,
@@ -4190,6 +4270,16 @@ int cluster_user_propose(int op, const char *name, const void *blob, uint32_t le
         for (int j = 0; j < 8; j++)
             *p++ = (uint8_t)(actor_version >> (8 * j));
     }
+    int ret = user_admin_send(op == CLUSTER_USER_PUT ? CLUSTER_OP_USER_PUT : CLUSTER_OP_USER_DEL, q, qn, wait_ms,
+                              index, uid, lag, nlag);
+    free(q);
+    return ret;
+}
+
+/* Sends a user op to the Raft leader as this server knows it, following one NOTLEADER; parses a META_OK reply. */
+static int user_admin_send(int aop, const uint8_t *q, size_t qn, int wait_ms, uint64_t *index, uint32_t *uid,
+                           struct cluster_laggard *lag, uint32_t *nlag)
+{
     char addr[META_ADDR_MAX];
     pthread_mutex_lock(&ul_mu);
     snprintf(addr, sizeof addr, "%s", g_ul_addr);
@@ -4200,9 +4290,8 @@ int cluster_user_propose(int op, const char *name, const void *blob, uint32_t le
         uint8_t *rep = NULL;
         size_t rn = 0;
         char err[256];
-        if (cluster_admin(addr, C.secret, C.secret_len, op == CLUSTER_USER_PUT ? CLUSTER_OP_USER_PUT
-                                                                               : CLUSTER_OP_USER_DEL,
-                          q, qn, wait_ms + 15000, &rc, &rep, &rn, err, sizeof err) != 0) {
+        if (cluster_admin(addr, C.secret, C.secret_len, aop, q, qn, wait_ms + 15000, &rc, &rep, &rn, err,
+                          sizeof err) != 0) {
             ret = CLUSTER_ERR_RETRY; /* sent or not: the outcome is unknown */
             break;
         }
@@ -4230,8 +4319,23 @@ int cluster_user_propose(int op, const char *name, const void *blob, uint32_t le
         free(rep);
         break;
     }
-    free(q);
     return ret;
+}
+
+int cluster_user_sync(int wait_ms, uint64_t *index, struct cluster_laggard *lag, uint32_t *nlag)
+{
+    *index = 0;
+    *nlag = 0;
+    if (wait_ms < 0)
+        return META_ERR_INVALID;
+    uint8_t q[4] = {(uint8_t)wait_ms, (uint8_t)((uint32_t)wait_ms >> 8), (uint8_t)((uint32_t)wait_ms >> 16),
+                    (uint8_t)((uint32_t)wait_ms >> 24)};
+    uint32_t uid;
+    int rc = user_admin_send(CLUSTER_OP_USER_SYNC, q, sizeof q, wait_ms, index, &uid, lag, nlag);
+    uint64_t w = atomic_load(&g_uw_want);
+    while (rc == META_OK && *index > w && !atomic_compare_exchange_weak(&g_uw_want, &w, *index))
+        ;
+    return rc;
 }
 
 static void admin_init(struct conn *c, uint32_t reqid, struct rd *r)
@@ -4582,6 +4686,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_USER_DEL: admin_user_change(c, reqid, r, 1); break;
     case CLUSTER_OP_USER_GET: admin_user_get(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_FORCE: admin_volume_force(c, reqid, r); break;
+    case CLUSTER_OP_USER_SYNC: admin_user_sync(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -6255,6 +6360,12 @@ static void *cluster_main(void *arg)
                 sync_stall_check();
         }
         copy_flush(now, 0);
+        /* the copy moved while an admin op's read barrier waits for it: the users watch is told now, not at the next
+         * tick (100 ms), so the barrier (cluster_users_through) passes one loop pass after the entry applied here.
+         * Only then: users_push scans every user, which a loop pass per applied entry need not pay otherwise. */
+        if (C.sm.applied != C.uw_seen &&
+            (C.push_every_apply || atomic_load_explicit(&g_uw_want, memory_order_relaxed) > C.uw_at))
+            users_push();
         if (now >= C.next_hb || (now >= C.next_duty && atomic_exchange(&g_beat_soon, 0))) {
             uint32_t hb = settings()->heartbeat_ms;
             C.next_hb = now + (uint64_t)(hb < 10 ? 10 : hb) * MS;

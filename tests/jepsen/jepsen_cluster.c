@@ -3369,8 +3369,6 @@ int main(int argc, char **argv)
             die(1, "node %d exited with status 0x%x before it listened (log %s)", i, st, nodes[i].log);
     }
     cluster_form();
-    if (want_users)
-        ju_await_voters();
     settle("the formation");
     if (want_kv)
         kv_setup();

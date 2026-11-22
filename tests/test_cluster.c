@@ -3179,6 +3179,429 @@ static void scen_login(void)
     tsdbc_close(r1);
 }
 
+/* A cluster of three for the users scenarios below, root the superuser, login on; server 2 gets `env2` (a test hook)
+ * besides the mutants of TSDB_AUTH_MUTANT and TSDB_CLUSTER_MUTANT. Servers 1 and 2 are added only when `add`. */
+static void users_cluster(const char *env2, int add)
+{
+    static char menv[3][PATH_MAX + 384];
+    const char *am = getenv("TSDB_AUTH_MUTANT"), *cm = getenv("TSDB_CLUSTER_MUTANT");
+    for (int i = 0; i < 3; i++) {
+        auth_on[i] = 1;
+        snprintf(menv[i], sizeof menv[i], "TSDB_AUTH_MUTANT=%s TSDB_CLUSTER_MUTANT=%s%s%s", am ? am : "",
+                 cm ? cm : "", i == 2 && env2 ? " " : "", i == 2 && env2 ? env2 : "");
+        penv[i] = menv[i];
+        start(i);
+    }
+    char pw[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p0[META_ADDR_MAX];
+    put_file("pw", "root-pw", pw, sizeof pw);
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p0, secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "put user root: uid 1, index "))
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    if (!add)
+        return;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    for (int i = 0; i < 3; i++) {
+        await_view(i, p_users_caught_up, NULL, "users caught up");
+        await_login(i, "root", "root-pw");
+    }
+}
+
+/* a lookup of plant.x as user/pw on server i: NOTFOUND with the grant, DENIED without it; a failed login is its
+ * result (plant_lookup_try) */
+static int plant_lookup_try(int i, const char *user, const char *pw)
+{
+    tsdbc *c = NULL;
+    int rc = tsdbc_connect_auth("127.0.0.1", cports[i], user, pw, &c);
+    if (rc != 0)
+        return rc;
+    tsdb_sid sid = 0;
+    rc = tsdbc_series(c, "plant.x", 0, &sid);
+    tsdbc_close(c);
+    return rc;
+}
+static int plant_lookup(int i, const char *user, const char *pw)
+{
+    tsdbc *c = login_on(i, user, pw);
+    tsdb_sid sid = 0;
+    int rc = tsdbc_series(c, "plant.x", 0, &sid);
+    tsdbc_close(c);
+    return rc;
+}
+
+struct stale_op {
+    tsdbc *c;
+    int what; /* 0 grant, 1 revoke, 2 drop, 3 passwd */
+    const char *user;
+    int rc;
+    uint64_t end; /* now_ms() when it was answered */
+};
+static void *stale_op_run(void *a)
+{
+    struct stale_op *o = a;
+    o->rc = o->what == 0   ? tsdbc_grant(o->c, o->user, TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)
+            : o->what == 1 ? tsdbc_revoke(o->c, o->user, TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)
+            : o->what == 2 ? tsdbc_user_drop(o->c, o->user)
+                           : tsdbc_user_password(o->c, o->user, "new-pw", 0);
+    o->end = now_ms();
+    return NULL;
+}
+
+/* An admin op through server 2 while its copy of the users lags a change acknowledged through server 0 (its pushes
+ * failing, TSDB_AUTH_TEST failpush_file, until 1.5 s later; then once SIGSTOPped): a check there finds nothing to
+ * change or refuses, from a copy that does not have the change. That answer must not go out from the copy (A32): a
+ * grant answered OK (already held) while the acknowledged revoke stands is an acknowledged grant that holds nowhere;
+ * a revoke, drop or passwd refused NOTFOUND contradicts the acknowledged grant or add. server/auth.c admin_group: the
+ * read barrier, then the check again. Mutants (TSDB_AUTH_MUTANT): nooplocal (no barrier), syncnowait (the barrier's
+ * index not waited for in server 2's copy). */
+static void scen_userstale(void)
+{
+    scenario("userstale");
+    strict_reads = 1;
+    char failpush[PATH_MAX + 96], fenv[PATH_MAX + 128], fp[PATH_MAX + 96];
+    snprintf(failpush, sizeof failpush, "%s/failpush", base);
+    snprintf(fenv, sizeof fenv, "TSDB_AUTH_TEST=failpush_file=%s", failpush);
+    users_cluster(fenv, 1);
+    tsdbc *r0 = login_on(0, "root", "root-pw"), *r2 = login_on(2, "root", "root-pw");
+    if (tsdbc_set_retry(r2, 0) != 0)
+        die("tsdbc_set_retry");
+    int rc;
+    if ((rc = tsdbc_user_create(r0, "alice", "alice-pw", 0, 0)) != 0 ||
+        (rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("create alice, grant: %s", ers(rc));
+    await_login(2, "alice", "alice-pw");
+    /* what the barrier costs a plain no-op (every copy caught up): the mean of 20 grants already held */
+    for (uint64_t t0 = now_ms(); plant_lookup(2, "alice", "alice-pw") != TSDB_ERR_NOTFOUND;)
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 2 never saw alice's grant");
+        else
+            usleep(50000);
+    uint64_t tn = now_ms();
+    for (int k = 0; k < 20; k++)
+        if ((rc = tsdbc_grant(r2, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+            die("a grant already held, through server 2: %s", ers(rc));
+    printf("  a no-op grant through server 2, every copy caught up: %.1f ms (mean of 20)\n", (now_ms() - tn) / 20.0);
+    static const char *names[] = {"grant", "revoke", "drop", "passwd"};
+    for (int what = 0; what < 4; what++) {
+        const char *user = what < 2 ? "alice" : what == 2 ? "bob" : "carol";
+        if (what == 1 && (rc = tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+            die("revoke through server 0: %s", ers(rc));
+        if (what == 1) /* server 2 must have the revoke before it falls behind the grant */
+            for (uint64_t t0 = now_ms(); plant_lookup(2, "alice", "alice-pw") != TSDB_ERR_DENIED;) {
+                if (now_ms() - t0 > WAIT_MS)
+                    die("server 2 never saw alice's revoke");
+                usleep(50000);
+            }
+        put_file("failpush", "", fp, sizeof fp);
+        /* the change server 2's copy does not get */
+        rc = what == 0   ? tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)
+             : what == 1 ? tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)
+                         : tsdbc_user_create(r0, user, "user-pw", 0, 0);
+        if (rc != 0)
+            die("the change through server 0 before the %s: %s", names[what], ers(rc));
+        pthread_t ul;
+        if (pthread_create(&ul, NULL, unlink_later, failpush) != 0)
+            die("pthread_create");
+        uint64_t t0 = now_ms();
+        struct stale_op o = {r2, what, user, 0};
+        stale_op_run(&o);
+        uint64_t took = now_ms() - t0;
+        pthread_join(ul, NULL);
+        if (o.rc != 0)
+            die("%s through server 2, its users behind an acknowledged change: %s after %" PRIu64 " ms, answered "
+                "from its stale copy", names[what], ers(o.rc), took);
+        /* and what it acknowledged holds in the group: server 0 says so */
+        if (what == 0 && (rc = plant_lookup(0, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
+            die("grant through server 2 answered OK after %" PRIu64 " ms while the revoke stands: alice's lookup on "
+                "server 0 %s, not NOTFOUND (an acknowledged grant that holds nowhere)", took, ers(rc));
+        if (what == 1 && (rc = plant_lookup(0, "alice", "alice-pw")) != TSDB_ERR_DENIED)
+            die("revoke through server 2: alice's lookup on server 0 %s, not DENIED", ers(rc));
+        if (what >= 2 && (rc = try_login(0, user, what == 2 ? "user-pw" : "new-pw")) != (what == 2 ? TSDB_ERR_AUTH : 0))
+            die("%s of %s through server 2: login on server 0 %s", names[what], user, ers(rc));
+        printf("  %s through server 2, its users behind: confirmed against the group, %" PRIu64 " ms\n", names[what],
+               took);
+    }
+
+    /* the same with server 2 paused (SIGSTOP) across the revoke, and the grant sent to it before it resumes */
+    await_login(2, "carol", "new-pw");
+    if ((rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("grant: %s", ers(rc));
+    for (uint64_t t0 = now_ms(); plant_lookup(2, "alice", "alice-pw") != TSDB_ERR_NOTFOUND;) {
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 2 never saw alice's grant");
+        usleep(50000);
+    }
+    pause_server(2, 1);
+    if ((rc = tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("revoke through server 0 with server 2 paused: %s", ers(rc));
+    struct stale_op o = {r2, 0, "alice", 0};
+    pthread_t t;
+    if (pthread_create(&t, NULL, stale_op_run, &o) != 0)
+        die("pthread_create");
+    usleep(300000);
+    pause_server(2, 0);
+    pthread_join(t, NULL);
+    /* OK (the grant made again) or UNAVAILABLE (the barrier did not pass in time: nothing changed, the client asks
+     * again); anything else is a regression that the check below would not see */
+    if (o.rc != 0 && o.rc != TSDB_ERR_UNAVAILABLE)
+        die("grant through server 2 paused across a revoke: %s, neither OK nor UNAVAILABLE", ers(o.rc));
+    if (o.rc == 0 && (rc = plant_lookup(0, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
+        die("grant through server 2 answered OK on its resume while the revoke stands: alice's lookup on server 0 "
+            "%s, not NOTFOUND (an acknowledged grant that holds nowhere)", ers(rc));
+    printf("  grant through server 2 paused across a revoke: %s, and it holds\n", ers(o.rc));
+
+    /* A no-op's OK acknowledges a state, so it waits for the members as the change did (A32): server 1 paused across
+     * a grant through server 0, then the same grant through server 2 (a no-op there) is answered only once server 1
+     * has the grant, so that a client of server 1 sees it after the OK. Mutant: nomembers. */
+    if ((rc = tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0 && rc != TSDB_ERR_NOTFOUND)
+        die("revoke: %s", ers(rc));
+    for (uint64_t t0 = now_ms(); plant_lookup(1, "alice", "alice-pw") != TSDB_ERR_DENIED;) {
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 1 never saw alice's revoke");
+        usleep(50000);
+    }
+    pause_server(1, 1);
+    if ((rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("grant through server 0 with server 1 paused: %s", ers(rc));
+    for (uint64_t t0 = now_ms(); plant_lookup(2, "alice", "alice-pw") != TSDB_ERR_NOTFOUND;) {
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 2 never saw alice's grant");
+        usleep(50000);
+    }
+    struct stale_op d = {r2, 0, "alice", 0};
+    uint64_t t0 = now_ms();
+    if (pthread_create(&t, NULL, stale_op_run, &d) != 0)
+        die("pthread_create");
+    usleep(1500000);
+    uint64_t resumed = now_ms();
+    pause_server(1, 0);
+    pthread_join(t, NULL);
+    uint64_t done = d.end;
+    if (d.rc != 0)
+        die("the grant again through server 2 (a no-op there) with server 1 paused: %s", ers(d.rc));
+    if (done < resumed)
+        die("the grant again through server 2 answered OK after %" PRIu64 " ms, before server 1 (paused) had the "
+            "grant: a no-op's OK did not wait for the members", done - t0);
+    if ((rc = plant_lookup(1, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
+        die("the grant again through server 2 answered OK, then alice's lookup on server 1 %s, not NOTFOUND: a "
+            "no-op's OK did not wait for the members", ers(rc));
+    printf("  a no-op through server 2 with server 1 paused: OK after %" PRIu64 " ms, %" PRIu64 " ms after server 1 "
+           "resumed\n", done - t0, done - resumed);
+    tsdbc_close(r0);
+    tsdbc_close(r2);
+}
+
+struct promo_probe {
+    int i;
+    tsdbc *s;
+    atomic_int stop;
+    int refused, ended, logins;
+    char why[160];
+};
+static void *promo_probe_run(void *a)
+{
+    struct promo_probe *p = a;
+    while (!atomic_load(&p->stop)) {
+        int rc = try_login(p->i, "root", "root-pw");
+        p->logins++;
+        if (rc != 0 && !p->refused++)
+            snprintf(p->why, sizeof p->why, "login %s", ers(rc));
+        tsdb_sid sid = 0;
+        rc = tsdbc_series(p->s, "plant.x", 0, &sid);
+        if (rc != TSDB_ERR_NOTFOUND && !p->ended++ && !p->why[0])
+            snprintf(p->why, sizeof p->why, "the open session's lookup %s", ers(rc));
+        usleep(2000);
+    }
+    return NULL;
+}
+
+/* A member that becomes a voter (a watcher made a learner, then a voter: core_boot rebuilds its metadata copy from
+ * nothing or its snapshot, and the log replays) keeps answering logins from the users it had: during the rebuild no
+ * login is refused there and an open session goes on (server/cluster.c users_push holds the watch while the copy is
+ * below what it was given). Mutant (TSDB_CLUSTER_MUTANT): pushrebuild (the empty copy is pushed). */
+static void scen_userpromote(void)
+{
+    scenario("userpromote");
+    strict_reads = 1;
+    /* the leader's log compacted (an install is needed) and server 1's install held 2 s: its core starts from nothing
+     * and stays empty that long, a window no login can miss */
+    envs[0] = "snap_every=2,snap_retain=1,seg_bytes=200";
+    envs[1] = "snap_every=2,snap_retain=1,seg_bytes=200,hold_install_ms=2000";
+    users_cluster(NULL, 0);
+    node_add(0, 1); /* two members: server 1 watches, no core */
+    await_view(1, p_users_caught_up, NULL, "users caught up");
+    await_login(1, "root", "root-pw");
+    struct promo_probe p = {.i = 1, .s = login_on(1, "root", "root-pw")};
+    if (tsdbc_set_retry(p.s, 0) != 0)
+        die("tsdbc_set_retry");
+    pthread_t t;
+    if (pthread_create(&t, NULL, promo_probe_run, &p) != 0)
+        die("pthread_create");
+    node_add(0, 2); /* three: servers 1 and 2 become learners, then voters */
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    await_view(1, p_users_caught_up, NULL, "users caught up");
+    usleep(1000000);
+    atomic_store(&p.stop, 1);
+    pthread_join(t, NULL);
+    tsdbc_close(p.s);
+    if (p.refused || p.ended)
+        die("server 1 made a voter: %d of %d logins refused, %d lookups of the open session failed (first: %s)",
+            p.refused, p.logins, p.ended, p.why);
+    if (log_has(1, "the cluster's users went back"))
+        die("server 1 made a voter: its users went back (an older list pushed while its copy was rebuilt)");
+    printf("  server 1 made a voter: %d logins and the open session's lookups all answered\n", p.logins);
+}
+
+struct replay_probe {
+    atomic_int stop;
+    int n, wrong;
+    char why[160];
+};
+static void *replay_probe_run(void *a)
+{
+    struct replay_probe *p = a;
+    while (!atomic_load(&p->stop)) {
+        int rc = plant_lookup_try(1, "alice", "alice-pw2");
+        p->n++;
+        if (rc != TSDB_ERR_DENIED && !p->wrong++)
+            snprintf(p->why, sizeof p->why, "alice's lookup %s, not DENIED", ers(rc));
+        usleep(1000);
+    }
+    return NULL;
+}
+
+/* A promoted member's copy rebuilt by replaying the log from the start (no snapshot: the first append is 256 entries,
+ * applied before the leader sends more) passes through older lists of users, non-empty ones: alice granted before her
+ * revoke, with her old password. None of them may reach the users watch (users_push holds it until the copy is back at
+ * what it gave, A32): the revoke would be undone on that server for the window. auth.c logs a list that goes back;
+ * a probe as alice looks too (the window is short: the log line is the deterministic check; push_every_apply on
+ * server 1 offers the watch every list the replay passes, where heartbeats alone hit the window by chance). Mutants
+ * (TSDB_CLUSTER_MUTANT): holdempty (held only while the copy has no users), pushrebuild. */
+static void scen_userreplay(void)
+{
+    scenario("userreplay");
+    strict_reads = 1;
+    envs[1] = "push_every_apply=1"; /* every list the replay passes reaches the watch, not only one at a heartbeat */
+    users_cluster(NULL, 0);
+    tsdbc *r0 = login_on(0, "root", "root-pw");
+    int rc;
+    if ((rc = tsdbc_user_create(r0, "alice", "alice-pw", 0, 0)) != 0 ||
+        (rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0 ||
+        (rc = tsdbc_user_create(r0, "churn", "churn-pw", 0, 0)) != 0)
+        die("create alice, grant, create churn: %s", ers(rc));
+    /* past the first append: the copy at entry 256 has alice granted */
+    for (int k = 0; k < 150; k++)
+        if ((rc = tsdbc_grant(r0, "churn", TSDB_SEL_PREFIX, "c.", TSDB_RIGHT_READ)) != 0 ||
+            (rc = tsdbc_revoke(r0, "churn", TSDB_SEL_PREFIX, "c.", TSDB_RIGHT_READ)) != 0)
+            die("churn %d: %s", k, ers(rc));
+    if ((rc = tsdbc_revoke(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0 ||
+        (rc = tsdbc_user_password(r0, "alice", "alice-pw2", 0)) != 0)
+        die("revoke alice, passwd: %s", ers(rc));
+    node_add(0, 1); /* server 1 watches: its copy comes whole from the stream */
+    await_view(1, p_users_caught_up, NULL, "users caught up");
+    await_login(1, "alice", "alice-pw2");
+    if ((rc = plant_lookup(1, "alice", "alice-pw2")) != TSDB_ERR_DENIED)
+        die("server 1 before its promotion: alice's lookup %s, not DENIED", ers(rc));
+    struct replay_probe p = {0};
+    pthread_t t;
+    if (pthread_create(&t, NULL, replay_probe_run, &p) != 0)
+        die("pthread_create");
+    node_add(0, 2); /* servers 1 and 2 become voters: server 1's core replays from entry 1 */
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    await_view(1, p_users_caught_up, NULL, "users caught up");
+    usleep(1000000);
+    atomic_store(&p.stop, 1);
+    pthread_join(t, NULL);
+    tsdbc_close(r0);
+    if (log_has(1, "the cluster's users went back"))
+        die("server 1 made a voter: its users went back while its copy replayed (an older list pushed)");
+    if (p.wrong)
+        die("server 1 made a voter: %d of %d probes wrong (first: %s)", p.wrong, p.n, p.why);
+    printf("  server 1 made a voter, its copy replayed from entry 1: the watch kept the newest users (%d probes)\n",
+           p.n);
+}
+
+/* The read barrier answers only from a leader that holds its lease (A32): server 0, the leader, has its Raft core
+ * held (hold_raft_file: neither ticked nor given a message; its admin ops and heartbeats go on), so servers 1 and 2
+ * elect another and a revoke commits there. Server 0 still takes itself for the leader: a grant of what its copy
+ * says alice holds (a no-op there) asks itself for the barrier, which must refuse (no lease): UNAVAILABLE, never an
+ * OK while the revoke stands. Mutant (TSDB_CLUSTER_MUTANT): syncnolease. Not covered: the barrier's check that the
+ * commit index is of the leader's term (a SYNC between an election and the new leader's first commit). */
+static void scen_userlease(void)
+{
+    scenario("userlease");
+    strict_reads = 1;
+    envs[0] = "hold_raft_file=1";
+    users_cluster(NULL, 1);
+    tsdbc *r0 = login_on(0, "root", "root-pw");
+    if (tsdbc_set_retry(r0, 0) != 0)
+        die("tsdbc_set_retry");
+    int rc;
+    if ((rc = tsdbc_user_create(r0, "alice", "alice-pw", 0, 0)) != 0 ||
+        (rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("create alice, grant: %s", ers(rc));
+    for (int i = 1; i < 3; i++)
+        for (uint64_t t0 = now_ms(); plant_lookup(i, "alice", "alice-pw") != TSDB_ERR_NOTFOUND;) {
+            if (now_ms() - t0 > WAIT_MS)
+                die("server %d never saw alice's grant", i);
+            usleep(50000);
+        }
+    char holdraft[PATH_MAX + 96];
+    server_dir(0, holdraft, sizeof holdraft);
+    strcat(holdraft, "/state/holdraft");
+    FILE *hr = fopen(holdraft, "w");
+    if (!hr || fclose(hr) != 0)
+        die("cannot make %s", holdraft);
+    int nl = 0;
+    for (uint64_t t0 = now_ms(); !nl;) {
+        for (int i = 1; i < 3 && !nl; i++) {
+            struct view v;
+            view(i, &v);
+            if (p_leader_self(&v, NULL))
+                nl = i;
+            view_free(&v);
+        }
+        if (!nl && now_ms() - t0 > WAIT_MS)
+            die("no new leader among servers 1 and 2 with server 0's Raft core held");
+        if (!nl)
+            usleep(100000);
+    }
+    tsdbc *rl = login_on(nl, "root", "root-pw");
+    if ((rc = tsdbc_revoke(rl, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ)) != 0)
+        die("revoke through server %d, the new leader: %s", nl, ers(rc));
+    tsdbc_close(rl);
+    if ((rc = plant_lookup(0, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
+        die("server 0, its Raft core held, has alice's revoke: %s (the scenario needs it behind)", ers(rc));
+    uint64_t t0 = now_ms();
+    int g = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ);
+    uint64_t took = now_ms() - t0;
+    if (g == 0 && (rc = plant_lookup(nl, "alice", "alice-pw")) != TSDB_ERR_NOTFOUND)
+        die("grant through server 0 (cut off, its lease gone) answered OK after %" PRIu64 " ms while the revoke "
+            "stands: alice's lookup on server %d %s, not NOTFOUND (a barrier from a leader without its lease)", took,
+            nl, ers(rc));
+    if (g != TSDB_ERR_UNAVAILABLE)
+        die("grant through server 0 (cut off, its lease gone): %s after %" PRIu64 " ms, not UNAVAILABLE", ers(g), took);
+    if (unlink(holdraft) != 0)
+        die("cannot remove %s", holdraft);
+    for (uint64_t t1 = now_ms(); plant_lookup(0, "alice", "alice-pw") != TSDB_ERR_DENIED;) {
+        if (now_ms() - t1 > WAIT_MS)
+            die("server 0 never caught up with alice's revoke");
+        usleep(50000);
+    }
+    tsdbc_close(r0);
+    printf("  grant through a leader cut off from its group: UNAVAILABLE after %" PRIu64 " ms\n", took);
+}
+
 /* `tsdb cluster user import PEER DIR...` (tools/cluster-user-cli.c): the USERS of two stopped servers, the same (a
  * user with 5,000 grants among them), go in as they are: the verifiers copied, so the passwords log in on a cluster
  * server, the grants count and are in force; a rerun skips what the group holds the same. Two that differ (a grant
@@ -10913,7 +11336,9 @@ int main(int argc, char **argv)
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
-               {"witness", scen_witness},   {"users", scen_users}, {"login", scen_login}, {"userimport", scen_userimport},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
+               {"witness", scen_witness},   {"users", scen_users}, {"login", scen_login}, {"userimport", scen_userimport},
+               {"userstale", scen_userstale}, {"userpromote", scen_userpromote}, {"userreplay", scen_userreplay},
+               {"userlease", scen_userlease},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},

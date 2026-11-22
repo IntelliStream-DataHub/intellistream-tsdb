@@ -686,8 +686,11 @@ cgroup, so `nice` does not keep your work out of its way.
   from the users watch (users.c's group store, no file), a root holding USERS is refused at start naming
   `tsdb cluster user import`, logins answer UNAVAILABLE until `cluster_users_caught_up()`, the admin ops propose
   through `cluster_user_propose` and answer once committed and back in the local copy (a failed proposal changes
-  nothing), and `tsdb DIR user` refuses a root marked `CLUSTER_USERS`. `test_cluster login|userimport|volrefuse`,
-  `make auth-mutants`.
+  nothing); one the copy finds a no-op or refuses is answered only after a read barrier (`cluster_user_sync`: the
+  leader's commit index under its lease, this copy's users through it; a no-op also waits for the members) and a check
+  again, never from a lagging copy; `users_push` keeps the last list while a promoted member's copy is rebuilt
+  (`core_boot`), so logins and sessions there go on; and `tsdb DIR user` refuses a root marked `CLUSTER_USERS`.
+  `test_cluster login|userimport|volrefuse|userstale|userpromote|userreplay|userlease`, `make auth-mutants`.
 - **Storage outages** (ha.md 15, N1; `src/health.c`, `server/domains.h`, `src/revalidate.c`). A volume on NFS that is
   down must refuse fast while the other volumes go on, and come back without losing or resurrecting anything.
   `tsdb_health_*` (probe threads with `O_DIRECT`, no engine call) gives each domain UP, DEGRADED, DOWN, RECOVERING.

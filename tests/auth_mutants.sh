@@ -7,7 +7,12 @@
 # guard: a demoted superuser's change through a lagging server commits), retryunavail (an outcome unknown answered
 # UNAVAILABLE, which clients send again), pushnoretry (a push of the users a server failed to take is not asked for
 # again, and the barrier opens without it) must fail test_cluster login; importmerge (users that differ between the
-# servers imported silently from the first) must fail userimport. Each must fail with its own FAIL line (the pattern
+# servers imported silently from the first) must fail userimport; nooplocal (a no-op or a refusal answered from the
+# server's own copy, no read barrier) and syncnowait (the barrier's index not waited for) must fail userstale;
+# nomembers (a no-op's barrier does not wait for the members) userstale too; pushrebuild (TSDB_CLUSTER_MUTANT: a
+# promoted member's users watch given its copy while it is rebuilt) userpromote; holdempty (TSDB_CLUSTER_MUTANT: that
+# hold only while the copy has no users) userreplay; syncnolease (TSDB_CLUSTER_MUTANT: the barrier answered by a
+# leader without its lease) userlease. Each must fail with its own FAIL line (the pattern
 # below), not with any failure: a mutant that only stops a server from starting would otherwise count as caught.
 # Usage: tests/auth_mutants.sh SCRATCH [MUTANT...] (from the top of the tree, after make build/tsdbd build/test_cluster
 # build/tsdb).
@@ -24,16 +29,26 @@ expect() {
     retryunavail) echo "outcome unknown" ;;
     pushnoretry) echo "pushes taken again\|its users watch failing every push" ;;
     importmerge) echo "import of two USERS that differ" ;;
+    nooplocal | syncnowait) echo "holds nowhere\|answered from its stale copy\|while the revoke stands\|not DENIED" ;;
+    nomembers) echo "did not wait for the members" ;;
+    pushrebuild) echo "made a voter: .* logins refused" ;;
+    holdempty) echo "its users went back while its copy replayed" ;;
+    syncnolease) echo "a barrier from a leader without its lease" ;;
     *) echo "FAIL" ;;
     esac
 }
-scenario() { case $1 in importmerge) s=userimport ;; *) s=login ;; esac; }
+scenario() {
+    case $1 in importmerge) s=userimport ;; nooplocal | syncnowait | nomembers) s=userstale ;;
+    pushrebuild) s=userpromote ;; holdempty) s=userreplay ;; syncnolease) s=userlease ;; *) s=login ;; esac
+}
+# the mutants of server/cluster.c go in TSDB_CLUSTER_MUTANT, the rest in TSDB_AUTH_MUTANT
+menv() { case $1 in pushrebuild | holdempty | syncnolease) echo TSDB_CLUSTER_MUTANT ;; *) echo TSDB_AUTH_MUTANT ;; esac; }
 # one mutant, then its verdict: tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and
 # asks this script (--mutant-verify) whether the scenario failed where the mutant's own oracle is
 case ${1:-} in
 --mutant-run)
     scenario "$2"
-    TSDB_AUTH_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s" ;;
+    exec env "$(menv "$2")=$2" "$TEST_CLUSTER" "$3" "$s" ;;
 --mutant-verify)
     scenario "$2"
     if [ "$3" -eq 0 ]; then echo "$s passed"; exit 1; fi
@@ -46,7 +61,7 @@ case ${1:-} in
     exit 0 ;;
 esac
 dir=${1:-/tmp}; shift || true
-muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge}
+muts=${*:-authlocalusers adminlocal loginbeforecatchup barrierifempty noguard retryunavail pushnoretry importmerge nooplocal syncnowait nomembers pushrebuild holdempty syncnolease}
 # MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
 exec "$(dirname "$0")/../tools/mutants.sh" --name auth --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" --fail \
     --verify "$0" --list "$muts" -- "$0" --mutant-run @M@ @D@
