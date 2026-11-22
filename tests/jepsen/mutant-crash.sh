@@ -10,7 +10,9 @@
 #   JV_EXIT=N    _exit(JV_EXITCODE, 0 by default) on every Nth insert request (an end of its own, with no signal of ours); JV_EXITMSG: the line it
 #                prints first (round 15: "tsdbd: wal: No space left on device", with jepsen's JEPSEN_FREE_BYTES=0: a fail-stop on a full disk)
 #   JV_DSTALL=N  a worker blocks in D state for good (vfork whose child never execs) on every Nth insert request: the kernel's stall, as an I/O stall
-#                is, and not tsdbd's hang (JV_HANG: pause(), no D state)
+#                is, and not tsdbd's hang (JV_HANG: pause(), no D state). The vfork child closes its copies of the server's descriptors first (round 16:
+#                under busy loops it outlived the SIGKILLed server by the time PDEATHSIG took, holding the flock: the restart then failed with "database
+#                is locked", a verdict about the mutant's child, not about a stall)
 #   JV_CRASHONCE=N  the same, once per gate (JV_ONCEFILE names the file whose creation says it happened)
 #   JV_CRASH_MB=M   a thread of the server touches M MB from its first insert on, in the background: the abort then dumps a core of up to that
 #                size, a dump that takes long on every core handler (touching before the abort made a window in which the nemesis killed
@@ -172,6 +174,7 @@ static void jv_openany(const char *dir)
             pause();
     }
     if (!strcmp(m, "dstall") && vfork() == 0) {
+        syscall(SYS_close_range, 3, ~0U, 0); /* as jv_dstall: the child holds none of the server's descriptors */
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         for (;;)
             pause();
@@ -210,6 +213,7 @@ static void jv_crash(void)\
 static void jv_dstall(void)\
 {\
     if (vfork() == 0) {\
+        syscall(SYS_close_range, 3, ~0U, 0);\
         prctl(PR_SET_PDEATHSIG, SIGKILL);\
         for (;;)\
             pause();\
