@@ -108,6 +108,8 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_S("cluster.bmc", "bmc", "", "The address of this node's BMC, for fencing."),
     CK_B("cluster.witness", "witness", "false", "A member that only votes: no volumes, no client port."),
     CK_E("cluster.read.barrier", "read-barrier", "on|off", "on", "Whether reads wait for the leader's confirmation."),
+    CK_E("cluster.forward", "forward", "on|off", "on",
+         "Whether a request for a volume another member leads is forwarded there (on) or answered MOVED to it (off)."),
     CK_D("cluster.fwd.wait", "fwd-wait-ms", "ms", "2s",
          "How long a request for a volume another member leads may wait to be sent there (forwarded) before it is "
          "answered UNAVAILABLE (definite: nothing reached the leader)."),

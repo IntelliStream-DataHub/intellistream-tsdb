@@ -511,6 +511,11 @@ static __thread struct {
     tsdb_unavail u;
     char addr[META_ADDR_MAX];
 } rmv;
+/* The request handle() runs (route_ids forwards a many-series frame whole: its handler has parsed it, the frame goes
+ * as it came), and whether route_ids forwarded it: the handler's own answer (route_ids' nonzero status) is then dropped
+ * by frame_put, the owner's reply having been relayed. */
+static __thread req *rt_req;
+static __thread bool rt_forwarded;
 /* A read admitted under the lease (§7.1) checks it again at its first reply frame, which comes after its snapshot: a
  * process paused between admission and snapshot would otherwise answer from a snapshot taken after the lease ended,
  * and a leader deposed in between (a cut, a resign, LOCAL_FAULT: its lease goes on) from the engine its demotion
@@ -1036,6 +1041,8 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
                       size_t alen, const void *b, size_t blen, const void *d, size_t dlen)
 {
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
+    if (rt_forwarded) /* route_ids forwarded the frame and relayed the owner's reply: the handler's answer is void */
+        return !atomic_load(&c->closing);
     /* D12: a replicated write whose leader was deposed (or failed) after its WAL append may or may not commit; the
      * client must not read that as a refusal, so it gets no answer at all: the connection closes, and the client
      * treats every request in flight on it as of unknown outcome. Never put -110 on the wire. */
@@ -2551,6 +2558,7 @@ static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
     size_t ns = 0, last = 0;
     const uint32_t HERE = UINT32_MAX; /* no member id: ids are below it */
     uint32_t key = 0, kvol = 0, away = UINT32_MAX, self = route_copy() ? rt_cp->self : 0;
+    bool noowner = false;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
         if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
@@ -2571,6 +2579,8 @@ static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
             if (ns < sizeof seen / sizeof seen[0])
                 seen[ns++] = (__typeof__(seen[0])){v, k};
         }
+        if (!k)
+            noowner = true;
         if (!k || k == key)
             continue; /* no leader: no owner to span (route_fill answers NO_OWNER) */
         if (!key) {
@@ -2589,6 +2599,13 @@ static int32_t route_ids(conn *c, const tsdb_sid *ids, size_t n, bool read)
     }
     if (away == UINT32_MAX)
         return 0;
+    /* every id on one other member that leads all of them (no volume without a leader, none here): the frame goes
+     * there whole, as route_decide's single volume does */
+    if (key && key != HERE && !noowner && rt_req && rt_req->c == c && (!fwd_owner || fwdx_mutant == FWM_TWICE) &&
+        fwd_entry(rt_req, kvol)) {
+        rt_forwarded = true;
+        return TSDB_ERR_MOVED; /* the handler stops; nothing of its answer goes out */
+    }
     return route_fill(c, (uint16_t)away);
 }
 
@@ -2864,7 +2881,11 @@ static void handle(req *r)
     lguard.on = lguard.checked = lguard.failed = false;
     lguard.ids = NULL;
     rmv.on = false; /* per request, as lguard: no answer carries another request's route body */
+    rt_req = r;
+    rt_forwarded = false;
     handle_in(r);
+    rt_req = NULL;
+    rt_forwarded = false;
     rmv.on = false; /* a handler's route_ids answer went out with its reply; lguard's below is its own */
     if (lguard.on && lguard.failed) { /* the lease lapsed before the snapshot: nothing went out, refused now */
         lguard.on = false;
@@ -3564,6 +3585,7 @@ static void *worker_main(void *arg)
  * LAST_STATS on the entry node needs no forward). */
 static uint32_t fwd_wait_ms = 2000, fwd_max_age_ms = 1000, fwd_reply_ms = 30000;
 static int fwd_base = 4; /* --fwd-workers */
+static int fwd_off;      /* --forward off: requests for volumes led elsewhere get MOVED (s2e's answer), never forwarded */
 static atomic_ullong fwd_seq;
 static const char *test_fwd_stall; /* TSDBD_TEST_FWD_STALL: the entry node stalls before each send while it exists */
 
@@ -3699,7 +3721,8 @@ static int fwd_entry(req *r, uint32_t v)
     uint32_t node = 0;
     uint64_t epoch = 0;
     char addr[META_ADDR_MAX];
-    if (!f || !fwd_tab || cluster_vol_owner(v, &node, &epoch, addr, sizeof addr) != 1 || epoch >= META_EPOCH_LIMIT)
+    if (fwd_off || !f || !fwd_tab || cluster_vol_owner(v, &node, &epoch, addr, sizeof addr) != 1 ||
+        epoch >= META_EPOCH_LIMIT)
         return 0;
     conn *c = r->c;
     size_t n = FWDR_ENV + FWDR_INNER + r->len;
@@ -5318,6 +5341,7 @@ int main(int argc, char **argv)
                                    {"fwd-max-age-ms", required_argument, 0, 0x111},
                                    {"fwd-reply-ms", required_argument, 0, 0x112},
                                    {"fwd-workers", required_argument, 0, 0x113},
+                                   {"forward", required_argument, 0, 0x114},
                                    {"rack", required_argument, 0, 'k'},
                                    {"cluster-secret-file", required_argument, 0, 'S'},
                                    {"state-dir", required_argument, 0, 0x102},
@@ -5489,6 +5513,15 @@ int main(int argc, char **argv)
         case 0x111: fwd_max_age_ms = (uint32_t)num_arg("fwd-max-age-ms", optarg, 1, 3600000); cluster_opts = 1; break;
         case 0x112: fwd_reply_ms = (uint32_t)num_arg("fwd-reply-ms", optarg, 0, 86400000); cluster_opts = 1; break;
         case 0x113: fwd_base = (int)num_arg("fwd-workers", optarg, 1, 4096); cluster_opts = 1; break;
+        case 0x114:
+            if (!strcmp(optarg, "off"))
+                fwd_off = 1;
+            else if (strcmp(optarg, "on")) {
+                fprintf(stderr, "tsdbd: --forward %s: expected on or off\n", optarg);
+                return 2;
+            }
+            cluster_opts = 1;
+            break;
         case 'k': rack = optarg; cluster_opts = 1; break;
         case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 0x102: state_dir = optarg; cluster_opts = 1; break;
@@ -5592,7 +5625,8 @@ int main(int argc, char **argv)
                         "             [--cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "              [--power-feed NAME]\n"
-                        "              [--bmc ADDR] [--read-barrier on|off]]\n"
+                        "              [--bmc ADDR] [--read-barrier on|off] [--forward on|off] [--fwd-wait-ms 2000]\n"
+                        "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
                         "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);

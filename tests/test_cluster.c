@@ -152,6 +152,7 @@ static int auth_on[N]; /* server i runs with login (no --no-auth): its root has 
 /* Servers run with TSDB_REPLICA_READS=1 (replicas holding a lease answer reads, so a scenario can count a replica's
  * rows) unless a scenario sets strict_reads: then every read goes to the leader (D5), as in production. */
 static int strict_reads;
+static int fwd_on; /* the servers forward requests for volumes led elsewhere (tsdbd's default; else --forward off) */
 static int cports[N];  /* the client port of server i */
 
 /* Starts server i; returns th_await's answer (the client port, or TH_EXITED with th_status, or TH_BAD). */
@@ -210,6 +211,10 @@ static int start_try(int i)
         argv[n++] = secret_path;
         argv[n++] = "--state-dir";
         argv[n++] = state;
+        if (!fwd_on) { /* the scenarios written before forwarding (S2-2) judge s2e's MOVED off the leader */
+            argv[n++] = "--forward";
+            argv[n++] = "off";
+        }
         char extra[256];
         snprintf(extra, sizeof extra, "%s", xargs[i] ? xargs[i] : "");
         for (char *t = strtok(extra, " "); t && n < 38; t = strtok(NULL, " "))
@@ -306,6 +311,7 @@ static void scenario(const char *name)
     memset(xargs, 0, sizeof xargs);
     memset(penv, 0, sizeof penv);
     strict_reads = 0;
+    fwd_on = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);

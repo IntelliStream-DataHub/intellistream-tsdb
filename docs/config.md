@@ -155,6 +155,11 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.bmc` | `--bmc` | string | unset | The address of this node's BMC, for fencing. |
 | `cluster.witness` | `--witness` | boolean | false | A member that only votes: no volumes, no client port. |
 | `cluster.read.barrier` | `--read-barrier` | on,off | on | Whether reads wait for the leader's confirmation. |
+| `cluster.forward` | `--forward` | on,off | on | Whether a request for a volume another member leads is forwarded there (on) or answered MOVED to it (off). |
+| `cluster.fwd.wait` | `--fwd-wait-ms` | duration (plain: ms) | 2s | How long a request for a volume another member leads may wait to be sent there (forwarded) before it is answered UNAVAILABLE (definite: nothing reached the leader). |
+| `cluster.fwd.max.age` | `--fwd-max-age-ms` | duration (plain: ms) | 1s | A request older than this since it was read is never forwarded, and its leader refuses it (UNAVAILABLE). |
+| `cluster.fwd.reply` | `--fwd-reply-ms` | duration (plain: ms) | 30s | How long a forwarded request may wait for its leader's reply before the client's connection is closed without an answer (its outcome is unknown). 0: no limit (a dead link still ends it). |
+| `cluster.fwd.workers` | `--fwd-workers` | integer | 4 | Worker threads reserved for requests other members forward here (more start while all of them wait). |
 
 Options with no key:
 
