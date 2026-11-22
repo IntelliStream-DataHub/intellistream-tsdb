@@ -130,9 +130,19 @@ launch() { # index
     (
         set +m
         export MUTANT_NAME=$name MUTANT_DIR=$d/s
+        # A SIGKILL of the helper runs no trap, and the run is in a group of its own, so nothing else would stop it:
+        # a watcher in the run's group kills the group once the helper is gone (and is stopped when the run ends).
+        me=$BASHPID helper=$$
+        (
+            while kill -0 "$helper" 2>/dev/null; do sleep 1; done
+            [ "$me" -gt 1 ] && kill -KILL -- "-$me" 2>/dev/null
+        ) >/dev/null 2>&1 </dev/null &
+        watcher=$!
         if [ -n "$stdout_only" ]; then "${args[@]}" >"$d/out.log" 2>/dev/null </dev/null
         else "${args[@]}" >"$d/out.log" 2>&1 </dev/null; fi
-        echo $? >"$d/rc.tmp" && mv "$d/rc.tmp" "$d/rc"
+        echo $? >"$d/rc.tmp"
+        kill "$watcher" 2>/dev/null
+        mv "$d/rc.tmp" "$d/rc"
     ) &
     pids[$i]=$!
     set +m
@@ -206,6 +216,7 @@ while [ "$left" -gt 0 ]; do
         elif ! kill -0 "${pids[$i]}" 2>/dev/null; then
             [ -f "${dirs[$i]}/rc" ] || { sleep 0.2; [ -f "${dirs[$i]}/rc" ] || { rc=died; }; }
             [ "${rc:-}" = died ] || continue
+            kill_group "${pids[$i]}" # what is left of its group (the watcher)
         else
             continue
         fi

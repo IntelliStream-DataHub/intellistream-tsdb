@@ -28,6 +28,8 @@ r66b) echo "manifest_publish only"; exit 66 ;;
 r1) echo "manifest_publish and replica_cut"; exit 1 ;;
 err) echo "on stderr: KILLED" >&2; echo "plain"; exit 0 ;;
 hang) sleep 300 & echo $! >"$FAKE_PIDS/hang"; wait ;;
+hangk) sleep 300 & echo $! >"$FAKE_PIDS/hangk"; wait ;;
+died*) echo "going down"; kill -KILL "$PPID" ;; # the run's wrapper is killed (the OOM killer's doing): no status
 fixed*) # a file with a fixed name in the scratch directory: two runs sharing the directory collide
     [ ! -e "$d/state" ] || { echo "collision"; exit 0; }
     touch "$d/state"; sleep 0.3; exit 1 ;;
@@ -44,6 +46,9 @@ mkdir -p "$FAKE_PIDS"
 F=$base/fake
 
 run() { out=$("$@" 2>&1); rc=$?; }
+# a deadline for the cases that wait on a hang or a pool: a helper without its timeout or takeover must fail here,
+# not hold make test for ever (timeout is GNU coreutils; without it the case runs without a deadline)
+dl() { if command -v timeout >/dev/null 2>&1; then timeout 90 "$@"; else "$@"; fi; }
 has() { case $out in *"$1"*) ;; *) fail "output lacks '$1'" ;; esac; }
 hasnt() { case $out in *"$1"*) fail "output has '$1'" ;; esac; }
 survivors_are() { # the last line names exactly these
@@ -108,7 +113,7 @@ rm -rf "$base"/mut.*
 
 # 8. a hang is SURVIVED (timeout), its process group is killed, and the others finish
 t0=$SECONDS
-run "$H" --name t --timeout 2 --jobs 2 --list "hang catch1" -- "$F" @M@ @D@
+run dl "$H" --name t --timeout 2 --jobs 2 --list "hang catch1" -- "$F" @M@ @D@
 [ $rc -eq 1 ] || fail "hang: rc $rc"
 has "mutant hang: SURVIVED"; has "timeout after 2 s"; has "mutant catch1: caught"
 [ $((SECONDS - t0)) -lt 20 ] || fail "the hang took $((SECONDS - t0)) s"
@@ -117,7 +122,7 @@ sleep 0.3
 if kill -0 "$hp" 2>/dev/null; then kill "$hp" 2>/dev/null; fail "the hung run's child $hp is still alive"; fi
 rm -rf "$base"/mut.*
 # MUTANT_TIMEOUT too
-MUTANT_TIMEOUT=1 run "$H" --name t --list "hang" -- "$F" @M@ @D@
+MUTANT_TIMEOUT=1 run dl "$H" --name t --list "hang" -- "$F" @M@ @D@
 has "timeout after 1 s"
 rm -rf "$base"/mut.*
 
@@ -176,9 +181,9 @@ rm -rf "$base"/mut.*
 # 14. a pool shared by helpers that run at once (make tsan-par): MUTANT_SLOTS runs alive in all of them together
 rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
 export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
-"$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
 pa=$!
-"$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+dl "$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
 pb=$!
 wait $pa || fail "pool: first helper failed"
 wait $pb || fail "pool: second helper failed"
@@ -187,10 +192,29 @@ wait $pb || fail "pool: second helper failed"
 # a slot left by a helper that died is taken over
 mkdir -p "$base/slots/1" "$base/slots/2"
 echo 999999 >"$base/slots/1/pid"; echo 999999 >"$base/slots/2/pid"
-run "$H" --name t --jobs 2 --list "catch1 catch2" -- "$F" @M@ @D@
+run dl "$H" --name t --jobs 2 --list "catch1 catch2" -- "$F" @M@ @D@
 [ $rc -eq 0 ] || fail "stale slots: rc $rc"
 [ -z "$(ls "$base/slots")" ] || fail "slots left behind: $(ls "$base/slots")"
 unset MUTANT_SLOT_DIR MUTANT_SLOTS
+rm -rf "$base"/mut.*
+
+# 15. a run whose wrapper ended without a status is SURVIVED, never caught
+run dl "$H" --name t --jobs 2 --list "died1 catch1" -- "$F" @M@ @D@
+[ $rc -eq 1 ] || fail "died: rc $rc"
+has "mutant died1: SURVIVED"; has "without a status"; has "mutant catch1: caught"
+rm -rf "$base"/mut.*
+
+# 16. a SIGKILL of the helper runs no trap: the runs, each in a group of its own, must not outlive it
+"$H" --name t --timeout 600 --jobs 2 --list "hangk" -- "$F" @M@ @D@ >"$base/k.out" 2>&1 &
+hp=$!
+for _ in $(seq 1 50); do [ -s "$FAKE_PIDS/hangk" ] && break; sleep 0.1; done
+[ -s "$FAKE_PIDS/hangk" ] || { kill -KILL "$hp" 2>/dev/null; fail "the run did not start"; }
+kp=$(cat "$FAKE_PIDS/hangk")
+kill -0 "$kp" 2>/dev/null || fail "the run's child is not alive before the kill"
+kill -KILL "$hp"; wait "$hp" 2>/dev/null
+gone=
+for _ in $(seq 1 60); do kill -0 "$kp" 2>/dev/null || { gone=1; break; }; sleep 0.1; done
+[ -n "$gone" ] || { kill "$kp" 2>/dev/null; fail "the run's child $kp outlived a SIGKILL of the helper"; }
 rm -rf "$base"/mut.*
 
 echo "test_mutants_helper: ok"
