@@ -83,6 +83,7 @@ table=(
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
 row_of() { # the table's row of mutant $1 (empty when there is none)
     local e
     row=
@@ -95,7 +96,7 @@ row_of() { # the table's row of mutant $1 (empty when there is none)
 case ${1:-} in
 --mutant-run)
     row_of "$2" || { echo "mutant $2: no scenario is named for it in $0"; exit 0; }
-    TSDB_REPLD_MUTANT=$2 TSDB_CVOL_MUTANT=$2 exec ./build/test_cluster "$3" "$s" ;;
+    TSDB_REPLD_MUTANT=$2 TSDB_CVOL_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s" ;;
 --mutant-verify)
     row_of "$2" || { echo "no scenario is named for it in $0"; exit 1; }
     fail=$(grep -m1 FAIL "$4")

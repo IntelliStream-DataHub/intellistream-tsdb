@@ -22,13 +22,14 @@
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
 scenario() {
     case $1 in stampignored) s=hungloop ;; noquorum) s=leasequorum ;; nopromotewait) s=leasedown ;; shrinknocond) s=isr ;; upwaits|probelate) s=resign ;; cutshrinks) s=cut ;; leasestale) s=leasestale ;; deposedstuck) s=cutstuck ;; fencelease|oldpass|movegiveup) s=oneway ;; anyepoch) s=oneway2 ;; nocuthold) s=cuthold ;; forceup) s=noowner ;; dropnotcommitted|caughtupearly|floornoapplied) s=users ;; *) s=lease ;; esac
 }
 # one mutant (tools/mutants.sh runs them in parallel, each in a scratch directory of its own)
 if [ "${1:-}" = --mutant-run ]; then
     scenario "$2"
-    TSDB_CLUSTER_MUTANT=$2 exec ./build/test_cluster "$3" "$s"
+    TSDB_CLUSTER_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s"
 fi
 dir=${1:-/tmp}; shift || true
 muts=${*:-leaseanyvoter nodrift stampignored nocoreclock noquorum nopromotewait shrinknocond upwaits cutshrinks probelate leasestale deposedstuck fencelease oldpass movegiveup anyepoch nocuthold forceup dropnotcommitted caughtupearly floornoapplied}

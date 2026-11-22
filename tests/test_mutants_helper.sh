@@ -11,6 +11,8 @@ H=$PWD/tools/mutants.sh
 base=$(mktemp -d "${TMPDIR:-/tmp}/mutants-helper.XXXXXX") || exit 1
 trap 'rm -rf "$base"' EXIT
 fail() { echo "test_mutants_helper: FAIL: $*" >&2; [ -z "${out:-}" ] || printf '%s\n' "$out" >&2; exit 1; }
+export XDG_RUNTIME_DIR=$base # the default pool of the helpers lives here
+unset MUTANT_JOBS MUTANT_SLOTS MUTANT_SLOT_DIR MUTANT_URING_JOBS MUTANT_TIMEOUT
 export TMPDIR=$base # the helper's scratch root, unless --tmp says otherwise
 
 # the fake test: FAKE MUTANT SCRATCH, behaviour by mutant name
@@ -189,6 +191,21 @@ wait $pa || fail "pool: first helper failed"
 wait $pb || fail "pool: second helper failed"
 [ "$(maxc)" = 2 ] || fail "MUTANT_SLOTS=2 over two helpers: $(maxc) at once"
 [ "$(sort -n "$FAKE_CONC.max" | wc -l)" = 8 ] || fail "pool: not all eight runs happened"
+# no job count given: the helpers share a default pool per user (MUTANT_SLOTS wide here), jobs given: no pool
+rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
+unset MUTANT_SLOT_DIR
+MUTANT_SLOTS=1 dl "$H" --name a --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+pa=$!
+MUTANT_SLOTS=1 dl "$H" --name b --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+pb=$!
+wait $pa || fail "default pool: first helper failed"
+wait $pb || fail "default pool: second helper failed"
+[ "$(maxc)" = 1 ] || fail "default pool of 1 over two helpers: $(maxc) at once"
+[ -d "$base/tsdb-mutant-slots-$(id -u)" ] || fail "the default pool was not made under XDG_RUNTIME_DIR"
+rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
+MUTANT_SLOTS=1 run dl "$H" --name t --jobs 3 --list "conc1 conc2 conc3" -- "$F" @M@ @D@
+[ "$(maxc)" = 3 ] || fail "--jobs given: the default pool applied ($(maxc) at once)"
+export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
 # a slot left by a helper that died is taken over
 mkdir -p "$base/slots/1" "$base/slots/2"
 echo 999999 >"$base/slots/1/pid"; echo 999999 >"$base/slots/2/pid"

@@ -25,7 +25,9 @@
 #                   (timeout) and its process group is killed, never counted as caught
 # Several helpers at once (make tsan-par runs the test groups side by side) share one pool when MUTANT_SLOT_DIR names a
 # directory (any, created on demand) and MUTANT_SLOTS its size (default: the job limit): no more than that many runs of
-# all of them are alive at once; a helper that died leaves no slot behind.
+# all of them are alive at once; a helper that died leaves no slot behind. When neither --jobs nor MUTANT_JOBS is given,
+# a pool of that kind, per user ($XDG_RUNTIME_DIR or /tmp, tsdb-mutant-slots-UID) and half the CPUs (MUTANT_SLOTS) wide,
+# is used: several worktrees testing at once do not each start half the CPUs.
 # A command that cannot be run (status 126 or 127) is SURVIVED too: a missing binary must not "catch" every mutant.
 # One line per mutant, in the order they finish. A survivor's log and scratch directory are kept and named; the exit
 # status is 1 when any survived (all of them are named at the end, not only the first), 2 for a wrong call.
@@ -56,6 +58,8 @@ done
 [ -n "$label" ] || label=${cmd[0]##*/}
 [ -n "$conds" ] || [ ${#greps[@]} -gt 0 ] || [ -n "$verify" ] || conds=" fail"
 cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)
+default_jobs=
+if [ -z "$jobs" ] && [ -z "${MUTANT_JOBS:-}" ]; then default_jobs=1; fi
 : "${jobs:=${MUTANT_JOBS:-$((cpus / 2))}}"
 : "${tmo:=${MUTANT_TIMEOUT:-1800}}"
 ujobs=${MUTANT_URING_JOBS:-2}
@@ -82,6 +86,12 @@ done
 caught=0 survivors=() slot=()
 slots=${MUTANT_SLOTS:-$jobs}
 slot_dir=${MUTANT_SLOT_DIR:-}
+if [ -z "$slot_dir" ] && [ -n "$default_jobs" ]; then
+    # Nobody chose a job count: the helpers of all worktrees of this user (make test in several at once) share one pool,
+    # half the CPUs in all, instead of half the CPUs each. A MUTANT_JOBS or --jobs is the caller's own decision.
+    slot_dir=${XDG_RUNTIME_DIR:-/tmp}/tsdb-mutant-slots-$(id -u)
+    slots=${MUTANT_SLOTS:-$jobs} # jobs is cpus / 2 here (at least 1)
+fi
 case $slots in '' | *[!0-9]*) die "not a number: '$slots'" ;; esac
 if [ -n "$slot_dir" ]; then mkdir -p "$slot_dir" || exit 2; fi
 take_slot() { # index: 0 when a slot of the shared pool is ours (or there is no pool)

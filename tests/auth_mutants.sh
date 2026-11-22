@@ -13,6 +13,7 @@
 # build/tsdb).
 set -u
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
 expect() {
     case $1 in
     authlocalusers) echo 'server 0: login as root\|no login as root\|did not start\|exited' ;;
@@ -32,7 +33,7 @@ scenario() { case $1 in importmerge) s=userimport ;; *) s=login ;; esac; }
 case ${1:-} in
 --mutant-run)
     scenario "$2"
-    TSDB_AUTH_MUTANT=$2 exec ./build/test_cluster "$3" "$s" ;;
+    TSDB_AUTH_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s" ;;
 --mutant-verify)
     scenario "$2"
     if [ "$3" -eq 0 ]; then echo "$s passed"; exit 1; fi

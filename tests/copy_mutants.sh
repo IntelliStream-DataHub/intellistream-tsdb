@@ -10,6 +10,7 @@
 # build/tsdb).
 set -u
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
 scenario() {
     case $1 in snapfreeheld) s=copyhold ;; kindall) s=links ;; ccnowait | cconeslot) s=ccstress ;;
         ownerself) s=movedself ;; *) s=topology ;; esac
@@ -17,7 +18,7 @@ scenario() {
 # one mutant (tools/mutants.sh runs them in parallel, each in a scratch directory of its own)
 if [ "${1:-}" = --mutant-run ]; then
     scenario "$2"
-    TSDB_CLUSTER_MUTANT=$2 exec ./build/test_cluster "$3" "$s"
+    TSDB_CLUSTER_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$s"
 fi
 dir=${1:-/tmp}; shift || true
 muts=${*:-snapfreeheld rolesswap selfone movedpeeraddr kindall ccnowait cconeslot ownerself}
