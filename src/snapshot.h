@@ -110,8 +110,12 @@ extern int snap_mutant;
  * identity's volume_uuid and cluster), FNO = P + 1, REPL (floor P, log start S or P + 1, the history from S on, and the
  * promises of D6 below), SNAPDONE, each synced, the directory synced; then swaps: v<N> -> v<N>.old (when there),
  * v<N>.snap -> v<N>, the root synced, v<N>.old removed, the root synced. 0: v<N> is the snapshot's and opens with
- * eng_open_replica(floor P). On an error before the swap v<N> is untouched and v<N>.snap is left for the caller to
- * remove (snap_release) or for snap_leftovers.
+ * eng_open_replica(floor P). On an error before SNAPDONE v<N> is untouched and v<N>.snap is left for the caller to
+ * remove (snap_release) or for snap_leftovers; a retry on the same v<N>.snap is TSDB_ERR_CORRUPT once the install wrote
+ * a file SNAPMAN does not name (FNO, REPL), which is not damage: release it and fetch again. An error after SNAPDONE
+ * (the swap's) leaves the outcome to snap_leftovers, which finishes the swap: the caller neither releases v<N>.snap
+ * nor opens v<N> before it ran. snap_leftovers runs before any install (a start does it first): v<N>.old without v<N>
+ * is refused (TSDB_ERR_INVALID), it holds the only copy of the old directory and snap_leftovers puts it back.
  *
  * `keep` is the REPL of the directory being replaced; the caller reads it only after its driver stopped saving REPL
  * (the volume closed: a FENCE saved between the read and the close would be lost). Kept: rid, open generation and

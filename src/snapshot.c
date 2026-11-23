@@ -890,8 +890,10 @@ out:
 /* ---- release and sweep ---- */
 
 /* The names are read whole before any is unlinked, and the directory read again until a pass finds none: readdir is
- * unspecified while entries go (NFS's cookies skip some), and a skipped one would fail the rmdir */
-static int rm_dir_at(int pfd, const char *name)
+ * unspecified while entries go (NFS's cookies skip some), and a skipped one would fail the rmdir. A directory entry is
+ * removed the same way, a few levels deep: a former leader's v<N> holds the snap_* directories of its makes until a
+ * writable open sweeps them (snap_sweep), and an install over it removes v<N>.old whole or fails on every start */
+static int rm_dir_depth(int pfd, const char *name, int depth)
 {
     int dfd = openat(pfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dfd < 0)
@@ -929,9 +931,12 @@ static int rm_dir_at(int pfd, const char *name)
         if (rc == 0 && errno)
             rc = TSDB_ERR_IO; /* a readdir error is an error, never the end of the directory */
         closedir(d);
-        for (size_t i = 0; rc == 0 && i < found; i++)
-            if (unlinkat(dfd, v[i], 0) != 0 && errno != ENOENT)
-                rc = TSDB_ERR_IO;
+        for (size_t i = 0; rc == 0 && i < found; i++) {
+            if (unlinkat(dfd, v[i], 0) == 0 || errno == ENOENT)
+                continue;
+            /* EISDIR on Linux, EPERM where POSIX allows it: a directory (anything else fails its O_DIRECTORY open) */
+            rc = (errno == EISDIR || errno == EPERM) && depth < 3 ? rm_dir_depth(dfd, v[i], depth + 1) : TSDB_ERR_IO;
+        }
         /* each pass's unlinks synced before the next looks (and before the rmdir): a power loss then leaves the
          * directory with whole files or without them, and the install's removal of v<N>.old works under a shim that
          * keeps unsynced unlinks aside in the directory until its fsync (crashfs: test_snapshot's install power case) */
@@ -943,6 +948,11 @@ static int rm_dir_at(int pfd, const char *name)
     if (rc == 0 && unlinkat(pfd, name, AT_REMOVEDIR) != 0 && errno != ENOENT)
         rc = TSDB_ERR_IO;
     return rc;
+}
+
+static int rm_dir_at(int pfd, const char *name)
+{
+    return rm_dir_depth(pfd, name, 0);
 }
 
 int snap_release(const char *path)
@@ -1014,6 +1024,17 @@ static int cmp_fname(const void *a, const void *b)
     return strcmp((*(const struct snap_file *const *)a)->name, (*(const struct snap_file *const *)b)->name);
 }
 
+/* The names the install writes itself: a SNAPMAN that lists one is refused, so a received copy never carries the mark
+ * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO or LOCK of the sender */
+static bool snap_name_reserved(const char *n)
+{
+    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp"};
+    for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
+        if (strcmp(n, r[i]) == 0)
+            return true;
+    return false;
+}
+
 int snap_man_read(const char *dir, struct snap_man *m)
 {
     memset(m, 0, sizeof *m);
@@ -1076,6 +1097,7 @@ int snap_man_read(const char *dir, struct snap_man *m)
             f->xxh64 = get64(b + o), o += 8;
             memcpy(&f->link, b + o, 4), o += 4;
             ok = strcmp(f->name, ".") && strcmp(f->name, "..") && strncmp(f->name, SNAP_MAN, strlen(SNAP_MAN)) &&
+                 !snap_name_reserved(f->name) &&
                  f->kind >= SNAP_PART && f->kind <= SNAP_META &&
                  (!f->link || (f->link <= i && !m->files[f->link - 1].link && m->files[f->link - 1].size == f->size &&
                                m->files[f->link - 1].xxh64 == f->xxh64));
@@ -1465,6 +1487,16 @@ int snap_install(const char *root, uint32_t number, const char *staged, const st
         fprintf(stderr, "tsdb: a snapshot of volume %" PRIu32 " is installed from %s, not %s\n", number, want, staged);
         close(rfd);
         return TSDB_ERR_INVALID;
+    }
+    /* v<N>.old without v<N> is an install's swap cut short (or its put-back failed): it holds the only copy of the
+     * old directory and its promises, which snap_leftovers puts back; an install now would delete it (inst_swap, and
+     * snap_leftovers' roll-forward once SNAPDONE is written) */
+    bool err = false, ho = exists_at(rfd, old, &err), hv = exists_at(rfd, vn, &err);
+    if (err || (ho && !hv)) {
+        if (!err)
+            fprintf(stderr, "tsdb: %s/%s is there without %s: snap_leftovers first, not installed\n", root, old, vn);
+        close(rfd);
+        return err ? TSDB_ERR_IO : TSDB_ERR_INVALID;
     }
     int sdfd = openat(rfd, snap, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     struct snap_man m = {0};

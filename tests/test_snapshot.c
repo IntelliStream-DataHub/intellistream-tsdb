@@ -1050,7 +1050,14 @@ static void case_man_bad(void)
     CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, lfwd, NULL, 2) == TSDB_ERR_CORRUPT);
     CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, l1, sz2, 2) == TSDB_ERR_CORRUPT);
     CHECK(man_try(dir, 0x7fffffff, (const char *const[]){"p1.part"}, pk, nol, NULL, 1) == TSDB_ERR_CORRUPT);
-    printf("  SNAPMAN: \".\", \"..\", its own names, a name twice, unknown kinds, bad links and a huge count refused\n");
+    /* the names the install writes: a copy that carried SNAPDONE would be taken for a finished install */
+    for (const char *const *r = (const char *const[]){SNAP_DONE, "REPL", "FNO", "LOCK", "META.tmp", NULL}; *r; r++)
+        if (man_try(dir, 2, (const char *const[]){"p1.part", *r}, pk, nol, NULL, 2) != TSDB_ERR_CORRUPT) {
+            fprintf(stderr, "  SNAPMAN naming %s was not refused\n", *r);
+            fails++;
+        }
+    printf("  SNAPMAN: \".\", \"..\", its own names, the install's names, a name twice, unknown kinds, bad links and a "
+           "huge count refused\n");
 }
 static void hook_write_after_cut(eng *db, int at, const char *arg)
 {
@@ -1870,7 +1877,13 @@ static void case_install_keep(void)
     small_rows(db, 1);
     small_snap(db, "snap_b", root, &b);
     CHECK(b.p > a.p);
+    /* a former leader's v<N> holds the snap_* directories of its makes until a writable open sweeps them: the
+     * install removes v<N>.old with them (it reported IO after a durable swap, and snap_leftovers failed forever) */
+    sh("mkdir -p '%s/snap_x' && echo x > '%s/snap_x/" SNAP_MAN "'", vd, vd);
     CHECK(inst_do(root, b.vol, 999, &kp) == 0);
+    char vo[PATH_MAX + 48];
+    snprintf(vo, sizeof vo, "%s.old", vd);
+    CHECK(!exists(vo));
     CHECK(load_repl(vd, &st) == 0);
     if (st.rid != 555 || st.fence != 6 || st.led != 1 || st.open_gen != 77 || st.open_nonce != 99 || st.unsure ||
         st.floor != b.p)
@@ -1910,6 +1923,11 @@ static void case_install_keep(void)
     CHECK(exists(sp));
     CHECK(snap_leftovers(root, (uint32_t)c.vol) == 0);
     CHECK(!exists(sp) && exists(vd));
+    char od[PATH_MAX + 48];
+    snprintf(od, sizeof od, "%s.old", vd);
+    sh("mkdir -p '%s/snap_y/d' && touch '%s/MANIFEST' '%s/snap_y/" SNAP_MAN "' '%s/snap_y/d/f'", od, od, od, od);
+    CHECK(snap_leftovers(root, (uint32_t)c.vol) == 0);
+    CHECK(!exists(od) && exists(vd));
     replfile_state_free(&st);
     replfile_state_free(&kp);
     /* a half directory left by a failed release: the next make of that name is refused (its mkdir finds it), a
@@ -1933,9 +1951,270 @@ static void case_install_keep(void)
     sh("rm -rf '%s' '%s'", dir, root);
 }
 
-/* The power case's child: installs <root>/v0.snap over <root>/v0 (its REPL the keep), acks "i" once it returned 0 */
+static void flip_at(const char *path, int64_t off) /* off < 0: from the end */
+{
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    struct stat sb;
+    uint8_t c = 0;
+    if (fd < 0 || fstat(fd, &sb) != 0) {
+        ifail("flip %s: %s", path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    off_t o = off < 0 ? sb.st_size + off : off;
+    if (pread(fd, &c, 1, o) != 1 || (c ^= 0x5a, pwrite(fd, &c, 1, o) != 1))
+        ifail("flip %s at %lld", path, (long long)o);
+    close(fd);
+}
+
+/* SNAPMAN's entry of `name` made to say the file's bytes as they are now, and SNAPMAN's own hash again: a copy whose
+ * damage only the deeper checks can see */
+static void man_fix(const char *dir, const char *name)
+{
+    char mp[PATH_MAX + 16], fp[PATH_MAX + 128];
+    PJ(mp, "%s/%s", dir, SNAP_MAN);
+    PJ(fp, "%s/%s", dir, name);
+    FILE *f = fopen(mp, "rb");
+    uint8_t b[1 << 16];
+    size_t len = f ? fread(b, 1, sizeof b, f) : 0;
+    if (f)
+        fclose(f);
+    size_t nl = strlen(name);
+    bool found = false;
+    for (size_t o = 0; !found && len > 8 && o + 2 + nl + 21 <= len - 8; o++) {
+        uint16_t l;
+        memcpy(&l, b + o, 2);
+        if (l != nl || memcmp(b + o + 2, name, nl) != 0 || b[o + 2 + nl] < SNAP_PART || b[o + 2 + nl] > SNAP_META)
+            continue;
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        uint64_t sz = 0, x = 0;
+        if (fd < 0 || snap_xxh64_fd(fd, &sz, &x) != 0)
+            ifail("man_fix: %s", fp);
+        if (fd >= 0)
+            close(fd);
+        memcpy(b + o + 2 + nl + 1, &sz, 8);
+        memcpy(b + o + 2 + nl + 9, &x, 8);
+        found = true;
+    }
+    if (!found) {
+        ifail("man_fix: no entry %s in %s", name, mp);
+        return;
+    }
+    uint64_t h = xxh64(b, len - 8, 0);
+    memcpy(b + len - 8, &h, 8);
+    f = fopen(mp, "wb");
+    if (!f || fwrite(b, 1, len, f) != len)
+        ifail("man_fix: write %s", mp);
+    if (f)
+        fclose(f);
+}
+
+static bool meta_requires_both(const char *vd)
+{
+    char mp[PATH_MAX + 16], line[512];
+    PJ(mp, "%s/META", vd);
+    FILE *f = fopen(mp, "r");
+    bool ok = false;
+    while (f && fgets(line, sizeof line, f))
+        if (strncmp(line, "requires=", 9) == 0)
+            ok = strstr(line, "cluster") && strstr(line, "replica");
+    if (f)
+        fclose(f);
+    return ok;
+}
+
+/* The install's verify one check at a time: a received copy damaged or foreign in one way is refused, nothing is swapped
+ * in; then what a good install writes (FNO = P + 1, REPL's log start and fence, META's requires=), a keep of another
+ * identity, a keep whose fence is below P's epoch, and v<N>.old without v<N> */
+static void case_install_verify(void)
+{
+    char dir[PATH_MAX], root[PATH_MAX + 16], st[PATH_MAX + 32], vd[PATH_MAX + 32], od[PATH_MAX + 32], x[PATH_MAX + 128];
+    eng *db = small_leader(dir, "iver");
+    snprintf(root, sizeof root, "%s_root", dir);
+    sh("rm -rf '%s'", root);
+    for (int k = 0; k < 4; k++)
+        small_rows(db, k);
+    struct snap_info si = {0};
+    CHECK(make(db, "snap_v", &si, NULL) == 0);
+    eng_close(db);
+    struct snap_man m = {0};
+    CHECK(snap_man_read(si.path, &m) == 0);
+    const char *seg = NULL, *dict = NULL, *pname = NULL, *link = NULL;
+    for (size_t i = 0; i < m.nfiles; i++) {
+        const struct snap_file *f = &m.files[i];
+        bool target = false;
+        for (size_t j = 0; j < m.nfiles; j++)
+            target |= m.files[j].link == i + 1;
+        if (f->kind == SNAP_SEG && !seg && f->size > 0)
+            seg = f->name;
+        if (f->kind == SNAP_DICT && !dict && f->size > 0)
+            dict = f->name;
+        if (f->kind == SNAP_PART && !pname && !target)
+            pname = f->name;
+        if (f->link && !link)
+            link = f->name;
+    }
+    CHECK(seg && dict && pname && link);
+    if (fails) {
+        snap_man_free(&m);
+        return;
+    }
+    struct inst_snap is;
+    PJ(st, "%s/v0.snap", root);
+    PJ(vd, "%s/v0", root);
+    PJ(od, "%s/v0.old", root);
+    int n = 0;
+#define BAD(what, code, ...)                                                                                           \
+    do {                                                                                                               \
+        CHECK(inst_copy(si.path, root, &is) && is.vol == 0);                                                           \
+        __VA_ARGS__;                                                                                                   \
+        int rc_ = inst_do(root, 0, 555, NULL);                                                                         \
+        if (rc_ != (code) || exists(vd))                                                                               \
+            ifail("install verify: %s: rc %d (want %d), v0 %d", what, rc_, code, exists(vd));                          \
+        sh("rm -rf '%s'", root);                                                                                       \
+        n++;                                                                                                           \
+    } while (0)
+    BAD("a segment's byte flipped", TSDB_ERR_CORRUPT, PJ(x, "%s/%s", st, seg); flip_at(x, -1));
+    BAD("a dictionary cut short", TSDB_ERR_CORRUPT, PJ(x, "%s/%s", st, dict); CHECK(truncate(x, (off_t)fsize_at(
+                                                         AT_FDCWD, x) - 1) == 0));
+    BAD("a file SNAPMAN does not name", TSDB_ERR_CORRUPT, sh("echo x > '%s/p99_1_1_0.part'", st));
+    BAD("a file SNAPMAN names missing", TSDB_ERR_CORRUPT, sh("rm -f '%s/%s'", st, seg));
+    BAD("a link entry a separate, damaged file", TSDB_ERR_CORRUPT,
+        sh("cd '%s' && cp '%s' t.x && mv t.x '%s'", st, link, link); PJ(x, "%s/%s", st, link); flip_at(x, -1));
+    BAD("a part's header damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT,
+        PJ(x, "%s/%s", st, pname); flip_at(x, 0); man_fix(st, pname));
+    {
+        /* a granule's payload: only the granule crc tells */
+        BAD("a granule's payload damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT, {
+            int dfd = open(st, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            part *pp = NULL;
+            CHECK(dfd >= 0 && part_open_as(dfd, pname, pname, false, false, &pp) == 0 && pp->ng > 0);
+            granule g;
+            uint64_t off = 0;
+            if (pp) {
+                gx_load(pp, 0, GW_LOC, &g);
+                off = g.off + (g.ts_len + g.val_len) / 2;
+                part_unref(pp);
+            }
+            if (dfd >= 0)
+                close(dfd);
+            PJ(x, "%s/%s", st, pname);
+            flip_at(x, (int64_t)off);
+            man_fix(st, pname);
+        });
+    }
+    BAD("META of another volume_uuid", TSDB_ERR_INVALID,
+        sh("cd '%s' && sed -i '/^volume_uuid=/d' META && echo volume_uuid=0123456789abcdef0123456789abcdef >> META",
+           st);
+        man_fix(st, "META"));
+    BAD("META of another cluster", TSDB_ERR_INVALID,
+        sh("cd '%s' && sed -i '/^cluster=/d' META && echo cluster=0123456789abcdef0123456789abcdef >> META", st);
+        man_fix(st, "META"));
+    {
+        /* a snapshot of volume 0 installed as volume 1 */
+        CHECK(inst_copy(si.path, root, &is));
+        sh("mv '%s' '%s/v1.snap'", st, root);
+        int rc = inst_do(root, 1, 555, NULL);
+        PJ(x, "%s/v1", root);
+        if (rc != TSDB_ERR_INVALID || exists(x))
+            ifail("install verify: volume 0's snapshot as volume 1: rc %d, v1 %d", rc, exists(x));
+        sh("rm -rf '%s'", root);
+        n++;
+    }
+    /* a good install: what it wrote */
+    CHECK(inst_copy(si.path, root, &is) && inst_do(root, 0, 555, NULL) == 0);
+    struct replfile_state rs;
+    CHECK(load_repl(vd, &rs) == 0);
+    uint64_t ls = is.s_first ? is.s_first : is.p + 1;
+    if (rs.floor != is.p || rs.log_start != ls || rs.fence != is.p_epoch || rs.rid != 555 || rs.led != 0)
+        ifail("install verify: REPL floor %" PRIu64 " (P %" PRIu64 "), log start %" PRIu64 " (S %" PRIu64
+              "), fence %" PRIu64 " (P's epoch %" PRIu64 "), rid %" PRIu64 ", led %" PRIu64,
+              rs.floor, is.p, rs.log_start, ls, rs.fence, is.p_epoch, rs.rid, rs.led);
+    {
+        eng *fk = calloc(1, sizeof *fk);
+        uint64_t next = 0, gen = 0;
+        int slot = 0;
+        bool torn = false;
+        if (fk) {
+            fk->dirfd = open(vd, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            fk->fno_fd = -1;
+            if (fno_load(fk, &next, &gen, &slot, &torn) != 0 || next != is.p + 1 || torn)
+                ifail("install verify: FNO says %" PRIu64 " (torn %d), P + 1 is %" PRIu64, next, torn, is.p + 1);
+            if (fk->fno_fd >= 0)
+                close(fk->fno_fd);
+            close(fk->dirfd);
+            free(fk);
+        }
+    }
+    if (!meta_requires_both(vd))
+        ifail("install verify: META does not require cluster and replica");
+    /* a keep of another node, cluster or volume: refused, v0 untouched */
+    for (int w = 0; w < 3; w++) {
+        struct replfile_state kp;
+        CHECK(load_repl(vd, &kp) == 0);
+        struct snap_ident id;
+        ident_of(&id, &m, 555);
+        memcpy(id.volume_uuid, rs.volume_uuid, 16), memcpy(id.cluster_uuid, rs.cluster_uuid, 16), id.node = rs.node;
+        if (w == 0)
+            kp.node++;
+        else if (w == 1)
+            kp.cluster_uuid[3] ^= 1;
+        else
+            kp.volume_uuid[3] ^= 1;
+        CHECK(inst_copy(si.path, root, &is));
+        int rc = snap_install(root, 0, st, &id, &kp);
+        if (rc != TSDB_ERR_INVALID || exists(od))
+            ifail("install verify: a keep of another %s: rc %d", w == 0 ? "node" : w == 1 ? "cluster" : "volume", rc);
+        replfile_state_free(&kp);
+        CHECK(snap_leftovers(root, 0) == 0 && !exists(st));
+        n++;
+    }
+    /* a keep whose fence is below P's epoch: the fence goes up to it (D6: never below the snapshot's epoch) */
+    replfile_state_free(&rs);
+    struct replfile_state kp;
+    CHECK(load_repl(vd, &kp) == 0);
+    kp.fence = 1, kp.led = 0; /* as handed in (replfile_save never lowers a fence: no REPL on disk says this) */
+    CHECK(inst_copy(si.path, root, &is) && inst_do(root, 0, 999, &kp) == 0);
+    CHECK(load_repl(vd, &rs) == 0);
+    if (rs.fence != is.p_epoch || rs.led != 0 || rs.rid != 555)
+        ifail("install verify: over a fence 1 REPL: fence %" PRIu64 " (P's epoch %" PRIu64 "), led %" PRIu64,
+              rs.fence, is.p_epoch, rs.led);
+    replfile_state_free(&rs);
+    replfile_state_free(&kp);
+    /* v0.old without v0 (a swap cut short): refused before anything is written, v0.old kept for snap_leftovers */
+    sh("mv '%s' '%s'", vd, od);
+    CHECK(inst_copy(si.path, root, &is));
+    int rc = inst_do(root, 0, 555, NULL);
+    PJ(x, "%s/" REPLFILE_NAME, od);
+    if (rc != TSDB_ERR_INVALID || exists(vd) || !exists(x))
+        ifail("install verify: v0.old without v0: rc %d, v0 %d, v0.old's REPL %d", rc, exists(vd), exists(x));
+    PJ(x, "%s/" SNAP_DONE, st);
+    CHECK(!exists(x));
+    CHECK(snap_leftovers(root, 0) == 0 && exists(vd) && !exists(od) && !exists(st));
+    n++;
+#undef BAD
+    printf("  install verify: %d damaged or foreign copies refused, nothing swapped in; FNO P + 1, REPL's log start, "
+           "requires=, a fence raised to P's epoch\n", n);
+    snap_man_free(&m);
+    snap_release(si.path);
+    MK_HIST = NULL, MK_NHIST = 0;
+    sh("rm -rf '%s' '%s'", dir, root);
+}
+
+static const char *IACK;
+static void ihook(int at)
+{
+    if (at == SNAP_INST_DONE)
+        ack(IACK, "d"); /* SNAPDONE and its directory synced (a failed inst_done ends the child with 7) */
+}
+
+/* The power case's child: installs <root>/v0.snap over <root>/v0 (its REPL the keep), acks "d" once SNAPDONE is durable
+ * and "i" once it returned 0 */
 static int ichild(const char *root, const char *ackf)
 {
+    IACK = ackf;
+    snap_inst_hook = ihook;
     char vd[PATH_MAX + 8];
     snprintf(vd, sizeof vd, "%s/v0", root);
     struct replfile_state kp;
@@ -1952,7 +2231,7 @@ static int ichild(const char *root, const char *ackf)
 
 /* After a crash: snap_leftovers, then v0 is the old directory whole (floor A, A's rows) or the new one whole */
 static int ipower_step(const char *tmpl, const char *root, const char *ackf, int k, int seed, uint64_t pa,
-                       uint64_t ha, uint64_t pb, uint64_t hb, int *olds, int *news)
+                       uint64_t ha, uint64_t pb, uint64_t hb, int *olds, int *news, int *dones)
 {
     sh("rm -rf '%s' && cp -a '%s' '%s'", root, tmpl, root);
     unlink(ackf);
@@ -2009,6 +2288,11 @@ static int ipower_step(const char *tmpl, const char *root, const char *ackf, int
         ifail("install power: step %d seed %d: the install returned 0, v0 is the old directory", k, seed);
         return -1;
     }
+    if (strchr(a, 'd') && !nw) { /* SNAPDONE decides: once it is durable the install stands */
+        ifail("install power: step %d seed %d: SNAPDONE was durable, v0 is the old directory after leftovers", k, seed);
+        return -1;
+    }
+    *dones += strchr(a, 'd') && !strchr(a, 'i');
     *olds += old, *news += nw;
     return code;
 }
@@ -2062,10 +2346,10 @@ static void case_install_power(void)
     CHECK(ha != hb);
     if (fails)
         return;
-    int olds = 0, news = 0, crashes = 0, kend = -1;
+    int olds = 0, news = 0, crashes = 0, kend = -1, dones = 0;
     for (int k = 0; k < 2000 && kend < 0; k++)
         for (int sd = 0; sd < 3; sd++) {
-            int code = ipower_step(tmpl, root, ackf, k, k * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news);
+            int code = ipower_step(tmpl, root, ackf, k, k * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news, &dones);
             if (code < 0)
                 return;
             crashes += code == 99;
@@ -2075,14 +2359,14 @@ static void case_install_power(void)
     /* the step that ran whole loses power at its exit: more seeds there, each tearing another subset of the
      * root's unsynced renames (an install that skips the root's fsync keeps both renames in 1 seed of 4) */
     for (int sd = 3; kend > 0 && sd < 16; sd++) {
-        int code = ipower_step(tmpl, root, ackf, kend, kend * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news);
+        int code = ipower_step(tmpl, root, ackf, kend, kend * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news, &dones);
         if (code < 0)
             return;
         crashes += code == 99;
     }
-    CHECK(kend > 0 && olds > 0 && news > 0);
-    printf("  install power: %d steps, %d crashes: %d left the old directory whole, %d the new one\n", kend + 1, crashes,
-           olds, news);
+    CHECK(kend > 0 && olds > 0 && news > 0 && dones > 0);
+    printf("  install power: %d steps, %d crashes: %d left the old directory whole, %d the new one (%d of them with "
+           "SNAPDONE durable and the swap left to snap_leftovers)\n", kend + 1, crashes, olds, news, dones);
     MK_HIST = NULL, MK_NHIST = 0;
     sh("rm -rf '%s' '%s' '%s' '%s' '%s'", dir, tmpl, root, scr, ackf);
 }
@@ -2276,6 +2560,7 @@ int main(int argc, char **argv)
         INST_NOVERIFY = true;
         case_install();
         case_install_keep();
+        case_install_verify();
         case_install_power();
         goto out;
     }
@@ -2293,6 +2578,7 @@ int main(int argc, char **argv)
     case_power();
     case_install();
     case_install_keep();
+    case_install_verify();
     case_install_power();
 out:
     if (fails) {

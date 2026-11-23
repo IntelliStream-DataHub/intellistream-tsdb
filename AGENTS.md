@@ -338,10 +338,14 @@ cgroup, so `nice` does not keep your work out of its way.
   the open generation's belt) and `SNAPDONE`, each synced, then swaps vN -> vN.old, vN.snap -> vN, syncs the root,
   removes vN.old and syncs the root again: a 0 means vN is the new directory on disk, before any recovery.
   `snap_leftovers` (before vN is looked at) finishes an install whose SNAPDONE is there and removes or renames back
-  the rest. `rm_dir_at` syncs a directory after each pass of unlinks (crashfs keeps unsynced unlinks aside in the
-  directory, and on disk an emptied directory must be durable before its rmdir). Tests: `test_snapshot` install cases
+  the rest. SNAPMAN never names the install's own files (SNAPDONE, REPL, FNO, LOCK, META.tmp): leftovers trusts SNAPDONE
+  by its name. vN.old without vN is refused (leftovers puts it back first). `rm_dir_at` removes subdirectories too (a
+  former leader's vN holds its `snap_*` directories until a writable open sweeps them) and syncs a directory after each
+  pass of unlinks (crashfs keeps unsynced unlinks aside in the directory, and on disk an emptied directory must be
+  durable before its rmdir). Tests: `test_snapshot` install cases
   (made under writers, installed, compared with a replica fed 1..P, fed on to the leader's end, promoted and serving
-  every COMMIT file; `keep`; power loss at every step of an install under crashfs with tearing, the step that ran
+  every COMMIT file; `keep`; `verify`: each check of the verify alone on a damaged or foreign copy, and what a good
+  install wrote; power loss at every step of an install under crashfs with tearing (SNAPDONE durable: new), the step that ran
   whole with 16 seeds; `--only install` runs these alone), mutants `snaplowerfence snapraiseled snapkeepunsure
   snapswapfirst snapinstnodirsync`. A crashfs child that must lose power at its end exits with `exit`, never `_exit`
   (the loss at exit is the shim's destructor).
