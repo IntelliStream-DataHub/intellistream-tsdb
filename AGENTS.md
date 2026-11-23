@@ -302,7 +302,12 @@ cgroup, so `nice` does not keep your work out of its way.
   listed or retired name names, by file name only, reading one header per such object: only those whose header names
   the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
   chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
-  `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile).
+  `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile). The sweep is skipped on
+  every ec cluster volume (`db->ppos`), leaders included: on a replica it would delete the objects of a COLD not yet
+  applied (with the sweep there, test_ecapply `apply` loses its rows); a leader's crash orphans (chunks put, no marker) stay until r8k's
+  MK_GC rules. Also r8k's (D13): a replica now lists `.ec` parts, and its own retention drop retires them through the
+  R7 purge (`ecgc_retire_locked` -> `ecgc_purge_entry`), which deletes the shared object's chunks with no committed
+  MK_GC; nothing gates that on a cluster volume yet.
 - `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,
   epoch, see_epoch, writable, all_up); settle.c, eccache.c, eckeep.c, ecgc.c and tier.c reach the stores only through them
   and never name a store index. Per attached engine (`tier_attach`: ops, settings, epoch provider; a refcounted `coldvol`
@@ -597,6 +602,23 @@ cgroup, so `nice` does not keep your work out of its way.
     record (`src/ppos.h`: the object record's `ppos`, the cut Z) appended and synced before the intent is written
     (`ecapply_swap_pre`), never after the renames: the open fails on a listed part without one (`test_eccold swappower`,
     crashfs at every step of a settle, a drop of its `.ec` and a compacting open; mutants `pposswapnone pposswapafter`).
+  - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
+    marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
+    check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's
+    order), records PPOS for every new name at Z (Y too, which design 2.3 lets keep the leader's ppos: at Z is
+    conservative for the `<= Z` rule) and RSTATE `doing` before the intent, then under `publish_lock`, `latest_rw` and
+    `db->lock` checks its own parts of the key (any with a ppos above Z, or with no PPOS record, which is unknown: nothing
+    retired, DIVERGED; none listed: the key was dropped, nothing listed) and writes **intent v5** (`N tmp final` per
+    `.ec`, `Y tmp final`, `R part settled_part` per own part, a hash), fdatasyncs it and the directory, renames N, Y, R and
+    syncs the directory. A merge of its own parts in flight finds them `dropped` and drops its output. Recovery
+    (`ecapply_recover`, first pass of `intents_recover`): any new name on disk means the apply stands; nothing renamed
+    with every tmp and source there rolls forward; a tmp gone rolls back (the replay applies again); an own part gone
+    rolls back DIVERGED; the directory is synced before the intent is unlinked. A v5 intent torn into its head line is
+    reported by the generic path with insert wording. `ecapply_cold_decide` (RSTATE `doing` at a replay, on a leader too:
+    its swap records the COLD): every oid listed is done, none is not, some or one twice is damage. Crash points
+    `cold-before-apply`, `cold-mid-intent` (after the `.ec` renames). `tests/test_ecapply.c` (power loss at every step
+    of the apply and of the recovering open, a tampered marker, several objects, a second COLD of a key; mutants in the
+    Makefile).
   - **The settle reads each byte once.** `eng_settle` checks the granule crcs, the footer hash and the class judgement on
     the stripe copy it then encodes (`chunk_be_put_stream`): a check on a second read could pass on bytes that differ
     from the encoded ones (mutant `settletwopass`). A CORRUPT check marks the part damaged and writes no chunk.
@@ -786,9 +808,11 @@ cgroup, so `nice` does not keep your work out of its way.
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
   `latest_rw` is held across no I/O but `tsdb_drop_before`'s drop intent and renames of the partitions it retires
-  (`drop_retire_parts_locked`, in its write section; `db->lock` is held across them too) and the settle swap's 2n renames (`ec_swap_commit`,
+  (`drop_retire_parts_locked`, in its write section; `db->lock` is held across them too), the settle swap's 2n renames (`ec_swap_commit`,
   `src/ecswap.c`: its input check and renames are one step against a drop, which takes no `publish_lock`; on NFS,
-  snapshots and lookups of the volume wait for those round trips), and never across a lookup's reads of granules. Followers have no table.
+  snapshots and lookups of the volume wait for those round trips) and a replica's cold apply (`src/ecapply.c`: its
+  check of its own parts, the v5 intent's write and fdatasync, two directory fsyncs and n + nown renames, one step
+  against a drop or merge; reads of a replica volume wait for them once per COLD), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or

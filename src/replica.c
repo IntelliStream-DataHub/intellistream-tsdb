@@ -1340,6 +1340,21 @@ int replica_flush_through(eng *db, uint64_t f)
         return TSDB_ERR_CORRUPT;
     }
     /* every sealed memtable holds a segment below the marker's, the active one the marker's own: never flushed here */
+    if (ecapply_mutant == ECAPPLY_MUT_COLDNOFLUSHTHROUGH) { /* planted (test_ecapply): the active memtable sealed too */
+        memtable *nm = mt_new(rp->act_seq);
+        if (!nm)
+            return TSDB_ERR_NOMEM;
+        pthread_mutex_lock(&db->flush_lock);
+        pthread_mutex_lock(&db->lock);
+        pthread_mutex_lock(&db->buf_lock);
+        memtable *m = db->active;
+        db->active = nm;
+        m->fno_end = rp->apply_next;
+        db->flushing[db->nflushing++] = m;
+        pthread_mutex_unlock(&db->buf_lock);
+        pthread_mutex_unlock(&db->lock);
+        pthread_mutex_unlock(&db->flush_lock);
+    }
     return replica_flush(db);
 }
 

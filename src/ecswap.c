@@ -56,6 +56,11 @@
  *   and a lookup that fails other than ENOENT (EIO, ESTALE on NFS: never read as "absent"). The directory is synced
  *   before ecswap_recover returns, so the intent is unlinked only after its renames are durable.
  *
+ * Intent v5 (R8): a replica's apply of MK_COLD (src/ecapply.c) writes "tsdb-intent 5 <n>", lines "N <tmp_*.ec> <.ec>"
+ * (its objects' .ec files under fresh block numbers), "Y <tmp_0_*.part> <part>" (the late parts above them),
+ * "R <own part> <settled_own part>" (its own parts of the key at or below Z), and later R10's "X" lines (refused
+ * until then), "end <xxh64>". Its rules are written above ecapply_recover.
+ *
  * Crash points for r7-jepsen: TSDB_SETTLE_CRASH_AT=after-put|after-ec-tmp|after-intent|between-renames|before-unlink[:n]
  * ends the process
  * with exit(99) the n-th time (default 1) the point is passed; read once per process. exit, not _exit: under
@@ -67,6 +72,7 @@
  */
 #include "ecswap.h"
 #include "ecapply.h"
+#include "ecdiverge.h"
 #include "eckeep.h"
 #include "ecgc.h"
 #include "ecpart.h"
@@ -599,6 +605,145 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
      * with no intent left nothing would finish them. So they are made durable here, before the intent can go. */
     if (rc == 0 && db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
         fprintf(stderr, "tsdb: settle intent %s: fsync of the directory: %s\n", name, strerror(errno));
+        rc = TSDB_ERR_IO;
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------ intent v5: a replica's cold apply (src/ecapply.c) */
+
+typedef struct {
+    char kind;          /* N (an .ec part), Y (a late part), R (an own part retired) */
+    char from[128], to[160];
+} v5_line;
+
+/* Parses an unsealed v5 intent: 1; 0 when a line breaks the rules (only the names an apply writes, one key);
+ * TSDB_ERR_NOMEM */
+static int v5_parse(char *buf, v5_line **out, size_t *nout, int64_t *key)
+{
+    *out = NULL;
+    *nout = 0;
+    char *line = buf, *next = strchr(line, '\n'), extra;
+    size_t n;
+    if (!next)
+        return 0;
+    *next = '\0';
+    if (sscanf(line, INTENT_V5_HEAD "%zu%c", &n, &extra) != 1 || n < 1 || n > 1u << 16)
+        return 0;
+    v5_line *s = calloc(n, sizeof *s);
+    if (!s)
+        return TSDB_ERR_NOMEM;
+    size_t got = 0;
+    for (line = next + 1; got < n; line = next + 1) {
+        next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        v5_line *x = &s[got];
+        bool good = sscanf(line, "%c %127s %159s%c", &x->kind, x->from, x->to, &extra) == 3;
+        int64_t k = 0;
+        if (good && x->kind == 'N')
+            good = ec_tmp_name(x->from) && ec_file_name(x->to) && name_key(x->to, &k);
+        else if (good && x->kind == 'Y')
+            good = part_tmp_name(x->from) && part_file_name(x->to) && name_key(x->to, &k);
+        else if (good && x->kind == 'R') {
+            char want[sizeof x->to];
+            settled_of(x->from, want, sizeof want);
+            good = part_file_name(x->from) && strcmp(want, x->to) == 0 && name_key(x->from, &k);
+        } else
+            good = false; /* X (R10's retired .ec parts) is not written in R8 */
+        if (good && got == 0)
+            *key = k;
+        if (!good || k != *key) {
+            free(s);
+            return 0;
+        }
+        got++;
+        if (!next)
+            break;
+    }
+    if (got != n || next) {
+        free(s);
+        return 0;
+    }
+    *out = s;
+    *nout = n;
+    return 1;
+}
+
+/* Recovery of a v5 intent at open (before load_parts removes the temporaries). The apply wrote it with db->lock held
+ * from its check (every R source listed, none above Z, the key not dropped) through its renames (N, then Y, then R),
+ * so the rules are R7's, with Y beside N:
+ *   - torn: no rename followed it; the temporaries go with load_parts.
+ *   - complete, any N or Y name (or retired_ of it) or settled_ name on disk: the apply renamed, it stands: every
+ *     remaining tmp to its name, every R source still there to settled_. A name under none of its names counts as
+ *     done (a drop after the apply retired it, its file deleted at its last reference).
+ *   - complete, nothing renamed, every tmp and every R source there: cut before its renames: roll forward.
+ *   - complete, nothing renamed, a tmp or a source gone: no flow loses one while the apply holds db->lock (a drop or
+ *     merge of the key waits for it), so this is damage: the tmps go (rolled back: the own parts stay listed) and,
+ *     when a source is gone, the volume is DIVERGED (ec_diverge, durable): this member no longer holds the rows the
+ *     COLD replaced. RSTATE's `doing` then makes the replay decide (nothing listed) and apply the COLD again.
+ *   Damage that fails the open (the intent kept): a sealed intent whose lines break the rules, a lookup that fails
+ *   other than ENOENT. The directory is synced before returning: the intent is unlinked only after its renames. */
+int ecapply_recover(eng *db, const char *name, char *buf, size_t len)
+{
+    if (!intent_unseal(buf, len)) {
+        fprintf(stderr, "tsdb: cold apply intent %s is torn: the apply is rolled back\n", name);
+        return 0;
+    }
+    v5_line *s = NULL;
+    size_t n = 0;
+    int64_t key = 0;
+    int rc = v5_parse(buf, &s, &n, &key);
+    if (rc <= 0) {
+        if (rc == 0)
+            fprintf(stderr, "tsdb: cold apply intent %s: its checksum holds but a line breaks the rules of an apply's "
+                            "names: damage, the open fails\n", name);
+        return rc < 0 ? rc : TSDB_ERR_CORRUPT;
+    }
+    rc = 0;
+    unsigned char (*on)[3] = calloc(n, sizeof *on); /* 0: from, 1: to, 2: retired_ of to (N, Y) */
+    if (!on) {
+        free(s);
+        return TSDB_ERR_NOMEM;
+    }
+    bool renamed = false, from_missing = false, src_missing = false;
+    char nm[200];
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        int r0 = name_at(db, name, s[i].from), r1 = r0 < 0 ? r0 : name_at(db, name, s[i].to), r2 = 0;
+        if (r1 >= 0 && s[i].kind != 'R') {
+            snprintf(nm, sizeof nm, "retired_%s", s[i].to);
+            r2 = name_at(db, name, nm);
+        }
+        if (r0 < 0 || r1 < 0 || r2 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        on[i][0] = (unsigned char)r0, on[i][1] = (unsigned char)r1, on[i][2] = (unsigned char)r2;
+        renamed |= r1 || r2;
+        from_missing |= !r0;
+        src_missing |= s[i].kind == 'R' && !r0 && !r1;
+    }
+    if (rc == 0 && !renamed && from_missing && ecapply_mutant != ECAPPLY_MUT_RECROLLMISSING) {
+        fprintf(stderr, "tsdb: cold apply intent %s: nothing of the apply was renamed and %s: it is rolled back%s\n",
+                name, src_missing ? "an own part is gone" : "a temporary is gone",
+                src_missing ? ", the volume is DIVERGED" : "");
+        for (size_t i = 0; i < n && rc == 0; i++)
+            if (s[i].kind != 'R' && on[i][0] && unlinkat(db->dirfd, s[i].from, 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+        if (rc == 0 && src_missing && ecapply_mutant != ECAPPLY_MUT_RECNODIVERGE)
+            rc = ec_diverge(db, key, NULL, EC_DIV_PPOS);
+    } else if (rc == 0) {
+        for (size_t i = 0; i < n && rc == 0; i++)
+            if (on[i][0] && renameat(db->dirfd, s[i].from, db->dirfd, s[i].to) != 0) {
+                fprintf(stderr, "tsdb: rolling cold apply intent %s forward: rename of %s: %s\n", name, s[i].from,
+                        strerror(errno));
+                rc = TSDB_ERR_IO;
+            }
+    }
+    free(on);
+    free(s);
+    if (rc == 0 && db->opt.fsync && ecapply_mutant != ECAPPLY_MUT_RECNODIRSYNC && tsdb_fsync(db->dirfd) != 0) {
+        fprintf(stderr, "tsdb: cold apply intent %s: fsync of the directory: %s\n", name, strerror(errno));
         rc = TSDB_ERR_IO;
     }
     return rc;

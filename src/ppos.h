@@ -111,5 +111,7 @@ extern int ppos_mutant;
 size_t ppos_test_records(struct eng *db);
 int ppos_test_flags(struct eng *db, const char *name);
 extern int ppos_test_lose_map, ppos_test_fail_errno;
+/* ppos_test_hide: ppos_of answers NOTFOUND for this name (a part some listing path forgot to record) */
+extern const char *_Atomic ppos_test_hide;
 
 #endif

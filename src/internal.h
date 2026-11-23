@@ -1101,6 +1101,7 @@ enum { R7_MUT_NONE = 0, R7_MUT_NAMELOOSE, R7_MUT_TIERLOOSE };
 extern int r7_mutant;
 /* The first line of an intent of version 4 (a settle's swap, src/ecswap.c); version 3 is an insert's. */
 #define INTENT_V4_HEAD "tsdb-intent 4 "
+#define INTENT_V5_HEAD "tsdb-intent 5 " /* a replica's apply of MK_COLD (src/ecapply.c, src/ecswap.c) */
 /* Checks an intent's last line ("end <xxh64 of everything before it>") and cuts it off: the body is then buf, a
  * NUL-terminated string without its last newline. false when it is torn or damaged (buf may be changed). */
 bool intent_unseal(char *buf, size_t len);

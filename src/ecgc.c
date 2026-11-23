@@ -736,6 +736,14 @@ int ecgc_open_sweep(eng *db)
     struct ecgc_eng *e = eng_gc(db);
     if (!t || !t->gc || !e || atomic_load(&ecgc_test_nosweep))
         return 0;
+    /* An ec cluster volume (PPOS: src/ppos.h): an object no file of this member names may be one a COLD marker names
+     * that is not yet applied here (a leader that lost power between its marker and its swap, or after a swap intent
+     * that rolled back, reopens as a replica and lists the object from its staged .ec file; r8h). Its orphans are
+     * the leader's to delete by a committed MK_GC (E14), never this member's by file name. */
+    if (db->ppos) {
+        atomic_fetch_add(&t->gc->sweeps_skipped, 1);
+        return 0;
+    }
     /* what the engine names: its listed .ec parts and its retired names (no thread of it runs yet) */
     pthread_mutex_lock(&db->lock);
     size_t n = 0;

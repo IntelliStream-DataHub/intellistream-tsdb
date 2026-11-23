@@ -87,6 +87,11 @@ extern void (*_Atomic eccold_test_hook)(struct eng *db, int step);
 enum { ECCOLD_MUT_NONE = 0, ECCOLD_MUT_CUTNOGATE, ECCOLD_MUT_CUTNOWAIT, ECCOLD_MUT_TTLSETTLING,
        ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED };
 extern int eccold_mutant;
+/* What the next markers carry (test_ecapply; a test hook, never set by the engine): the files in reverse order (the
+ * apply must number them by the leader's blocks, not by the marker's order), or one field damaged for the replica's
+ * checks to refuse: Z one above the object records' ppos, the second .ec file named as the first, Y's header check. */
+enum { ECCOLD_TM_NONE = 0, ECCOLD_TM_REVERSE, ECCOLD_TM_Z, ECCOLD_TM_DUPEC, ECCOLD_TM_YHC };
+extern _Atomic int eccold_test_marker;
 int eccold_mutant_parse(const char *name); /* -1 when unknown */
 
 /* ---- the leader API (r8a2-hooks, built in src/replica.c) ---- */

@@ -108,6 +108,7 @@
 #include "replwire.h"
 #include "../src/cvol.h"
 #include "../src/eccold.h"
+#include "../src/ecapply.h"
 #include "../src/ecdiverge.h"
 #include "../src/marker.h"
 #include "../src/repl.h"
@@ -2271,6 +2272,13 @@ static void cold_marker_crash(struct eng *db, uint64_t pos)
 }
 
 
+/* a replica's apply of MK_COLD (src/ecapply.c) */
+static void cold_apply_crash(struct eng *db, int which)
+{
+    (void)db;
+    crash_point(which == ECAPPLY_CRASH_BEFORE_APPLY ? CP_COLD_BEFORE_APPLY : CP_COLD_MID_INTENT);
+}
+
 void repld_init(tsdb *t, const char *dir)
 {
     const char *mu = getenv("TSDB_REPLD_MUTANT");
@@ -2338,6 +2346,7 @@ void repld_init(tsdb *t, const char *dir)
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
+    atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */
         leader_test_marker_hook = eccold_after_append;
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
