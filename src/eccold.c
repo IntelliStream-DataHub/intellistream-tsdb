@@ -315,15 +315,18 @@ static void put_file(uint8_t *files, size_t *len, const char *name, uint64_t siz
     *len += mk_file_put(files + *len, &f);
 }
 
+_Atomic int eccold_test_marker;
+
 /* MK_COLD for the .ec parts ec[0 .. np) (records recs) and the late parts y[0 .. ny), then jr_cold */
 static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, part **ec, size_t np, part **y,
                        size_t ny, uint64_t *pos)
 {
     size_t olen = 0, flen = 0, nf = np + ny, fcap = 0;
+    int tm = atomic_load(&eccold_test_marker);
     for (size_t i = 0; i < np; i++) {
         olen += mk_cold_obj_size((uint32_t)ec_record_size(&recs[i]));
         mk_file f = {.name = ec[i]->name, .name_len = (uint32_t)strlen(ec[i]->name)};
-        fcap += mk_file_size(&f);
+        fcap += mk_file_size(&f) + (tm == ECCOLD_TM_DUPEC ? sizeof ec[0]->name : 0);
     }
     for (size_t i = 0; i < ny; i++) {
         mk_file f = {.name = y[i]->name, .name_len = (uint32_t)strlen(y[i]->name)};
@@ -333,7 +336,8 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
     const char **src = calloc(nf ? nf : 1, sizeof *src);
     int rc = objs && files && src ? 0 : TSDB_ERR_NOMEM;
     size_t off = 0;
-    for (size_t i = 0; rc == 0 && i < np; i++) {
+    for (size_t j = 0; rc == 0 && j < np; j++) {
+        size_t i = tm == ECCOLD_TM_REVERSE ? np - 1 - j : j;
         size_t rl = ec_record_size(&recs[i]);
         uint8_t *rb = malloc(rl);
         if (!rb) {
@@ -344,22 +348,24 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
             off += mk_cold_obj_put(objs + off, recs[i].oid, rb, (uint32_t)rl);
         free(rb);
         uint64_t size = 0, sum = 0;
-        if (rc == 0 && (rc = file_sum(db, ec[i]->pending, &size, &sum)) == 0) {
-            put_file(files, &flen, ec[i]->name, size, sum, ec[i]->index_hash, MK_FILE_EC);
-            src[i] = ec[i]->pending;
+        size_t fi = tm == ECCOLD_TM_DUPEC && j == 1 ? 0 : i; /* the second .ec file named as the first */
+        if (rc == 0 && (rc = file_sum(db, ec[fi]->pending, &size, &sum)) == 0) {
+            put_file(files, &flen, ec[fi]->name, size, sum, ec[fi]->index_hash, MK_FILE_EC);
+            src[j] = ec[fi]->pending;
         }
     }
-    for (size_t i = 0; rc == 0 && i < ny; i++) {
-        put_file(files, &flen, y[i]->name, y[i]->map_len, xxh64(y[i]->map, y[i]->map_len, 0), y[i]->index_hash,
-                 MK_FILE_Y);
-        src[np + i] = y[i]->name;
+    for (size_t j = 0; rc == 0 && j < ny; j++) {
+        size_t i = tm == ECCOLD_TM_REVERSE ? ny - 1 - j : j;
+        put_file(files, &flen, y[i]->name, y[i]->map_len, xxh64(y[i]->map, y[i]->map_len, 0),
+                 y[i]->index_hash ^ (tm == ECCOLD_TM_YHC), MK_FILE_Y);
+        src[np + j] = y[i]->name;
     }
     if (rc == 0) {
         mk m;
         memset(&m, 0, sizeof m);
         m.type = MK_COLD;
         m.span = 1;
-        m.u.cold.z = cut->z;
+        m.u.cold.z = cut->z + (tm == ECCOLD_TM_Z);
         m.u.cold.flush_through = cut->f;
         m.u.cold.stripe_version = cut->stripe_version;
         m.u.cold.key = cut->key;

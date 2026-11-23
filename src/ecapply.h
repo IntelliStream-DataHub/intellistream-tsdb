@@ -50,6 +50,12 @@ enum {
     ECAPPLY_MUT_LEADERSWAPNORS,     /* leaderswapnors: a leader's swap writes no RSTATE `doing`/`done` */
     ECAPPLY_MUT_PPOSAFTERSWAP,      /* pposafterswap: a leader's swap records its .ec parts' PPOS after its renames */
     ECAPPLY_MUT_MERGEKEPT,          /* mergekept: a retired own part is not marked dropped (a merge in flight lists) */
+    ECAPPLY_MUT_NOTFOUNDZERO,       /* notfoundzero: a listed part with no PPOS record counts as position 0 (<= Z) */
+    ECAPPLY_MUT_NOORDER,            /* noorder: the new parts numbered in the marker's order, not the leader's blocks */
+    ECAPPLY_MUT_CHECKZ,             /* checkz: an object record whose ppos is not the marker's Z passes */
+    ECAPPLY_MUT_SEENSKIP,           /* seenskip: two .ec files of the marker may match one object */
+    ECAPPLY_MUT_NOYHCHECK,          /* noyhcheck: a staged Y's header (index hash, granule rows, key) is not checked */
+    ECAPPLY_MUT_DECIDESOME,         /* decidesome: decide answers "not done" when only some of the oids are listed */
 };
 extern int ecapply_mutant;
 /* Crash points of a replica's apply (tsdbd's server/crashpt.h installs the hook: cold-before-apply, cold-mid-intent):

@@ -129,7 +129,8 @@ static int cold_check(struct eng *db, uint64_t pos, const mk_cold *c, cfile **ou
                     pos);
             return TSDB_ERR_CORRUPT;
         }
-        bool good = memcmp(r.oid, o.oid, MK_OID) == 0 && r.key == c->key && r.ppos == c->z;
+        bool good = memcmp(r.oid, o.oid, MK_OID) == 0 && r.key == c->key &&
+                    (r.ppos == c->z || ecapply_mutant == ECAPPLY_MUT_CHECKZ);
         ec_record_free(&r);
         if (!good) {
             fprintf(stderr, "tsdb: %s: an object record of the COLD at position %" PRIu64 " does not name its oid, key "
@@ -206,7 +207,8 @@ static int cold_stage_one(struct eng *db, uint64_t pos, const mk_cold *c, cfile 
         }
         if ((rc = part_open_as(db->dirfd, x->tmp, x->name, db->opt.pin_index, db->parts_v8, &x->p)) != 0)
             return rc;
-        if (x->p->index_hash != x->hc || x->p->grows != db->granule_rows || x->p->partition != c->key) {
+        if ((x->p->index_hash != x->hc || x->p->grows != db->granule_rows || x->p->partition != c->key) &&
+            ecapply_mutant != ECAPPLY_MUT_NOYHCHECK) {
             fprintf(stderr, "tsdb: %s: staged file %s does not have the header the COLD at position %" PRIu64 " names\n",
                     db->dir, sp, pos);
             return TSDB_ERR_CORRUPT;
@@ -230,7 +232,7 @@ static int cold_stage_one(struct eng *db, uint64_t pos, const mk_cold *c, cfile 
     mk_cold_obj o;
     while (mk_cold_obj_next(c, &at, &o)) {
         if (memcmp(o.oid, x->rec.oid, MK_OID) == 0 && o.rec_len == x->rlen &&
-            memcmp(o.rec, x->buf + x->roff, o.rec_len) == 0 && !seen[i]) {
+            memcmp(o.rec, x->buf + x->roff, o.rec_len) == 0 && (!seen[i] || ecapply_mutant == ECAPPLY_MUT_SEENSKIP)) {
             seen[i] = 1;
             x->lblock = x->rec.min_block;
             return 0;
@@ -349,8 +351,10 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
     for (size_t i = 0, k = nec; i < n; i++)
         if (f[i].kind == MK_FILE_Y)
             ord[k++] = &f[i];
-    qsort(ord, nec, sizeof *ord, by_lblock);
-    qsort(ord + nec, n - nec, sizeof *ord, by_lblock);
+    if (ecapply_mutant != ECAPPLY_MUT_NOORDER) { /* planted noorder: the marker's order, not the leader's blocks */
+        qsort(ord, nec, sizeof *ord, by_lblock);
+        qsort(ord + nec, n - nec, sizeof *ord, by_lblock);
+    }
 
     pthread_mutex_lock(&db->publish_lock);
     rc = eng_check(db) ? TSDB_ERR_IO : 0;
@@ -411,9 +415,10 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         struct ecpart *e = atomic_load(&p->ec);
         if (p->partition != c->key || (e && !e->test_mark))
             continue;
+        /* no record (ppos_of then gives 0) is unknown, above every Z: retiring it as <= Z is what this check is for */
         uint64_t pp = PPOS_UNKNOWN;
-        if (db->ppos)
-            (void)ppos_of(db, p->name, &pp);
+        if (db->ppos && ppos_of(db, p->name, &pp) != 0 && ecapply_mutant != ECAPPLY_MUT_NOTFOUNDZERO)
+            pp = PPOS_UNKNOWN;
         if (pp > c->z && ecapply_mutant != ECAPPLY_MUT_PPOSIGNORED) {
             above++;
             above_name = above_name ? above_name : p->name;
@@ -528,7 +533,8 @@ int ecapply_mutant;
 int ecapply_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "ycold", "ecabovey", "pposignored", "v5nodirsync", "coldnoflushthrough",
-                                        "leaderswapnors", "pposafterswap", "mergekept"};
+                                        "leaderswapnors", "pposafterswap", "mergekept", "notfoundzero", "noorder",
+                                        "checkz", "seenskip", "noyhcheck", "decidesome"};
     for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -563,7 +569,7 @@ int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32
     for (uint32_t k = 0; k < n; k++)
         listed += seen[k] > 0, twice += seen[k] > 1;
     free(seen);
-    if (twice || (listed && listed < n)) {
+    if (twice || (listed && listed < n && ecapply_mutant != ECAPPLY_MUT_DECIDESOME)) {
         fprintf(stderr, "tsdb: %s: of the %u objects of a COLD of key %" PRId64 ", %u are listed (%u more than once): "
                         "its swap was all or nothing\n", db->dir, n, key, listed, twice);
         return TSDB_ERR_CORRUPT;

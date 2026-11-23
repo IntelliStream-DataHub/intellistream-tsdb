@@ -22,6 +22,7 @@
 
 int ppos_mutant;
 int ppos_test_lose_map, ppos_test_fail_errno;
+const char *_Atomic ppos_test_hide;
 
 /* ------------------------------------------------------------ the memtable's map */
 
@@ -407,6 +408,9 @@ int ppos_of(struct eng *db, const char *name, uint64_t *pos)
     if (found)
         *pos = p->vals[at];
     pthread_mutex_unlock(&p->mapmu);
+    const char *hide = atomic_load_explicit(&ppos_test_hide, memory_order_relaxed);
+    if (found && hide && strcmp(hide, name) == 0)
+        found = false, *pos = 0;
     if (!found) {
         fprintf(stderr, "tsdb: %s: PPOS has no record of the part %s\n", db->dir, name);
         return TSDB_ERR_NOTFOUND;

@@ -10,7 +10,11 @@
  * Cases: apply (the .ec part and Y listed, Y above it, the replica's own parts of P retired as settled_, the rows of P
  * unchanged, an overwrite in Y still winning; rows of another day written at the cut and after the marker, in the
  * marker's segment, survive a crash after the apply: the replay); above (a part of P with ppos above Z: TSDB_ERR_CORRUPT,
- * nothing renamed, DIVERGED, still after a restart); dropped (P dropped by the replica between the staging and the
+ * nothing renamed, DIVERGED, still after a restart; norecord: the same for a part with no PPOS record); multi (two
+ * objects whose rows overlap and three Y, the marker listing them in reverse: numbered by the leader's blocks;
+ * ecapply_cold_decide on that listing); twice (a second COLD of a settled key: the first .ec part kept, the second
+ * above it); tamper (a marker whose Z is not the object records', with one object's .ec file named twice, or with a
+ * damaged Y header check: refused, nothing listed); dropped (P dropped by the replica between the staging and the
  * intent: nothing listed, nothing retired); merging (a merge of the replica's own parts of P held across the apply: its
  * output retired, never listed); leader (a leader killed after its swap, or after the swap's intent and
  * before its renames, reopened as a replica: the COLD replayed is not applied again, every oid listed once, the .ec's
@@ -21,7 +25,7 @@
  * apply: the old parts or the new set, then the apply ends with the new set).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
- * pposafterswap mergekept;
+ * pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome;
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -783,12 +787,12 @@ static void test_apply(void)
 
 /* ------------------------------------------------------------ above: a part of P with ppos above Z */
 
-static void test_above(void)
+static void above_case(const char *what, bool norecord)
 {
     lt L;
     rt R;
     rec_reset();
-    if (!start("above", &L))
+    if (!start(what, &L))
         return;
     make_replica(&L, &R);
     eccold_cut c;
@@ -802,11 +806,16 @@ static void test_above(void)
         return;
     }
     CHECK(feed(&R, cpos - 1) == 0);
-    /* planted: one of the replica's own parts of P says it came after Z (a gate that failed) */
+    /* planted: one of the replica's own parts of P says it came after Z (a gate that failed), or has no record at all
+     * (a listing path that forgot it: ppos_of then answers 0, which must count as unknown, above Z) */
     part *own[8];
+    static char hidden[96];
     size_t no = parts_of(R.db, KEY, own, 8, false);
     CHECK(no >= 1);
-    if (no >= 1) {
+    if (no >= 1 && norecord) {
+        snprintf(hidden, sizeof hidden, "%s", own[0]->name);
+        atomic_store(&ppos_test_hide, hidden);
+    } else if (no >= 1) {
         const char *nm[1] = {own[0]->name};
         pthread_mutex_lock(&R.db->publish_lock);
         CHECK(ppos_record(R.db, nm, 1, c.z + 1) == 0);
@@ -814,6 +823,7 @@ static void test_above(void)
     }
     unref_all(own, no);
     int rc = replica_apply(R.db, last);
+    atomic_store(&ppos_test_hide, NULL);
     CHECK(rc != 0);
     CHECK(atomic_load(&R.db->diverged));
     part *ec[8], *rest[8];
@@ -837,7 +847,256 @@ static void test_above(void)
         CHECK(0);
     }
     lclose(&L);
-    printf("  above: a part of P above Z: refused, nothing renamed, DIVERGED also after a restart\n");
+    printf("  %s: a part of P %s: refused, nothing renamed, DIVERGED also after a restart\n", what,
+           norecord ? "with no PPOS record" : "above Z");
+}
+static void test_above(void)
+{
+    above_case("above", false);
+    above_case("norecord", true);
+}
+
+/* ------------------------------------------------------------ multi, twice, tamper: several objects and Y parts */
+
+/* the value series 0 holds at t s of day 0 after workload `m` (false: no row there) */
+enum { RW_ONE, RW_MULTI, RW_TWICE };
+static bool want_row(int m, int64_t t, float *v)
+{
+    if (!((t >= 0 && t < 500) || (t >= 1000 && t < 1005) || (m == RW_TWICE && t >= 2000 && t < 2020)))
+        return false;
+    if (t >= 2000)
+        *v = 9000.0f + (float)(t - 2000);
+    else if (t >= 1000)
+        *v = 100.0f + (float)(t - 1000);
+    else if (t < 2)
+        *v = 900.0f + (float)t;
+    else if (m == RW_TWICE && t >= 300 && t < 400)
+        *v = 8000.0f + (float)(t - 300);
+    else if (m == RW_MULTI && t >= 240 && t < 260)
+        *v = 7000.0f + (float)(t - 240);
+    else if (m == RW_MULTI && t >= 150 && t < 250)
+        *v = 6000.0f + (float)(t - 150);
+    else if (m == RW_MULTI && t >= 100 && t < 200)
+        *v = 5000.0f + (float)(t - 100);
+    else
+        *v = 1.0f + (float)t;
+    return true;
+}
+static bool rows_hold(eng *db, int m, const char *what)
+{
+    qctx *q = query(db, 0, 0);
+    bool ok = q->n != SIZE_MAX;
+    size_t i = 0;
+    for (int64_t t = 0; ok && t < 2100; t++) {
+        float v;
+        if (!want_row(m, t, &v))
+            continue;
+        ok = i < q->n && q->ts[i] == DAY0 + 1000LL * t && q->v[i] == v;
+        if (!ok)
+            fprintf(stderr, "%s: row %zu is %s, wanted %" PRId64 " s at %g\n", what, i, i < q->n ? "another" : "missing",
+                    t, v);
+        i++;
+    }
+    if (ok && i != q->n) {
+        ok = false;
+        fprintf(stderr, "%s: %zu rows, wanted %zu\n", what, q->n, i);
+    }
+    free(q);
+    return ok;
+}
+/* P lists wec .ec parts and wrest others (-1: any), every .ec part below every other part */
+static void listed_n(eng *db, const char *what, size_t wec, int wrest)
+{
+    part *ec[8], *rest[8];
+    size_t ne = parts_of(db, KEY, ec, 8, true), nr = parts_of(db, KEY, rest, 8, false);
+    bool ok = ne == wec && (wrest < 0 || nr == (size_t)wrest);
+    for (size_t i = 0; i < ne; i++)
+        for (size_t j = 0; j < nr; j++)
+            ok &= ec[i]->max_block < rest[j]->min_block;
+    CHECK(ok);
+    if (!ok)
+        fprintf(stderr, "%s: P lists %zu .ec parts and %zu others, wanted %zu and %d, the .ec parts below\n", what, ne,
+                nr, wec, wrest);
+    unref_all(ec, ne);
+    unref_all(rest, nr);
+}
+
+/* I of two level-1 parts, A (make_i) and B over A's rows 100-199 (5000 + i: B was rewritten alone while A was held
+ * settling, a barrier), then Y: C over 150-249 (6000 + i), D over 240-259 (7000 + i), two parts inserts wrote, and the
+ * memtable's rows (900, 901 at 0, 1 s; 100 + i from 1000 s), flushed at the cut. Each overlap is one only the leader's
+ * order of the objects, and of Y above them, gets right. The marker as `tm` makes it. */
+static void workload_multi(lt *L, eccold_cut *c, int tm)
+{
+    int64_t key = KEY;
+    make_i(L);
+    part *a[4];
+    size_t na = parts_of(L->db, KEY, a, 4, false);
+    CHECK(na == 1);
+    pthread_mutex_lock(&L->db->lock);
+    for (size_t i = 0; i < na; i++)
+        a[i]->settling = true;
+    pthread_mutex_unlock(&L->db->lock);
+    CHECK(rows(L->db, L->s[0], 0, 100, 100, 5000.0f) == 0);
+    CHECK(eng_optimize_keys(L->db, &key, 1) == 0);
+    pthread_mutex_lock(&L->db->lock);
+    for (size_t i = 0; i < na; i++)
+        a[i]->settling = false;
+    pthread_mutex_unlock(&L->db->lock);
+    unref_all(a, na);
+    CHECK(rows(L->db, L->s[0], 0, 150, 100, 6000.0f) == 0);
+    CHECK(rows(L->db, L->s[0], 0, 240, 20, 7000.0f) == 0);
+    CHECK(rows(L->db, L->s[0], 0, 0, 2, 900.0f) == 0);
+    CHECK(rows(L->db, L->s[0], 0, 1000, 5, 100.0f) == 0);
+    part *all[8];
+    size_t n = parts_of(L->db, KEY, all, 8, false), lv = 0;
+    for (size_t i = 0; i < n; i++)
+        lv += all[i]->level > 0;
+    unref_all(all, n);
+    CHECK(n == 4 && lv == 2);
+    if (n != 4 || lv != 2)
+        fprintf(stderr, "multi: P has %zu parts, %zu of them merged, wanted 4 and 2\n", n, lv);
+    atomic_store(&eccold_test_marker, tm);
+    CHECK(settle_key(L->db, KEY) == 0);
+    atomic_store(&eccold_test_marker, ECCOLD_TM_NONE);
+    eccold_test_last(c);
+    CHECK(c->rc == 0 && c->nobjs == 2 && c->ny == 3);
+    if (c->nobjs != 2 || c->ny != 3)
+        fprintf(stderr, "multi: the COLD has %u objects and %u Y parts, wanted 2 and 3\n", (unsigned)c->nobjs,
+                (unsigned)c->ny);
+}
+
+/* Two objects and three Y in a marker that lists them in reverse: the replica numbers them by the leader's blocks.
+ * The decision of a replayed COLD on that listing: both oids done, one of them damage, none not done. */
+static void test_multi(void)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("multi", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload_multi(&L, &c, ECCOLD_TM_REVERSE);
+    CHECK(rows_hold(L.db, RW_MULTI, "multi: the leader"));
+    uint64_t last = LAST;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(feed(&R, last) == 0);
+    listed_n(R.db, "multi", 2, 3);
+    CHECK(rows_hold(R.db, RW_MULTI, "multi: the replica"));
+    part *ec[4];
+    size_t ne = parts_of(R.db, KEY, ec, 4, true);
+    if (ne == 2) {
+        uint8_t o[3 * MK_OID];
+        memcpy(o, atomic_load(&ec[0]->ec)->rec.oid, MK_OID);
+        memcpy(o + MK_OID, atomic_load(&ec[1]->ec)->rec.oid, MK_OID);
+        memset(o + 2 * MK_OID, 0xa5, MK_OID);
+        CHECK(ecapply_cold_decide(R.db, KEY, o, 2) == 1);
+        CHECK(ecapply_cold_decide(R.db, KEY, o + MK_OID, 2) == TSDB_ERR_CORRUPT); /* one listed, one not */
+        CHECK(ecapply_cold_decide(R.db, KEY, o + 2 * MK_OID, 1) == 0);
+    }
+    unref_all(ec, ne);
+    rstop(&R);
+    if (ropen(&L, &R, last) == 0) {
+        listed_n(R.db, "multi after a close", 2, 3);
+        CHECK(rows_hold(R.db, RW_MULTI, "multi after a close"));
+        rstop(&R);
+    } else {
+        CHECK(0);
+    }
+    lclose(&L);
+    printf("  multi: two objects and three Y in reverse marker order, numbered by the leader's blocks; decide\n");
+}
+
+/* A second COLD of a settled key (E6: late rows settle as a further object): the replica keeps the first .ec part,
+ * lists the second above it, and the rows the second carries win */
+static void test_twice(void)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("twice", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c, c2;
+    int64_t key = KEY;
+    workload(&L, &c, false);
+    CHECK(rows(L.db, L.s[0], 0, 300, 100, 8000.0f) == 0);
+    CHECK(rows(L.db, L.s[0], 0, 2000, 20, 9000.0f) == 0);
+    CHECK(eng_optimize_keys(L.db, &key, 1) == 0); /* Y and the two inserts above the .ec part, a level-1 part */
+    CHECK(settle_key(L.db, KEY) == 0);
+    eccold_test_last(&c2);
+    CHECK(c2.rc == 0 && c2.nobjs == 1 && c2.pos > c.pos);
+    CHECK(rows_hold(L.db, RW_TWICE, "twice: the leader"));
+    uint64_t last = LAST;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(feed(&R, last) == 0);
+    for (int pass = 0; pass < 2; pass++) {
+        const char *what = pass ? "twice after a close" : "twice";
+        part *ec[4];
+        size_t ne = parts_of(R.db, KEY, ec, 4, true);
+        CHECK(ne == 2);
+        if (ne != 2)
+            fprintf(stderr, "%s: P lists %zu .ec parts, wanted 2\n", what, ne);
+        else
+            CHECK(memcmp(atomic_load(&ec[0]->ec)->rec.oid, atomic_load(&ec[1]->ec)->rec.oid, MK_OID) != 0);
+        unref_all(ec, ne);
+        listed_n(R.db, what, 2, -1);
+        CHECK(rows_hold(R.db, RW_TWICE, what));
+        rstop(&R);
+        if (pass == 0 && ropen(&L, &R, last) != 0) {
+            CHECK(0);
+            break;
+        }
+    }
+    lclose(&L);
+    printf("  twice: a second COLD of the key keeps the first .ec part and lists its object above it\n");
+}
+
+/* A marker with one field damaged is refused by the replica's checks, nothing listed or renamed */
+static void tamper_one(int tm, const char *what)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start(what, &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload_multi(&L, &c, tm);
+    uint64_t last = LAST;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    int rc = feed(&R, last);
+    CHECK(rc != 0);
+    part *ec[4];
+    size_t ne = parts_of(R.db, KEY, ec, 4, true);
+    unref_all(ec, ne);
+    CHECK(ne == 0 && settled_of_key(R.dir) == 0);
+    if (rc == 0 || ne)
+        fprintf(stderr, "%s: the replica applied a damaged COLD (%d, %zu .ec parts)\n", what, rc, ne);
+    rstop(&R);
+    lclose(&L);
+}
+static void test_tamper(void)
+{
+    tamper_one(ECCOLD_TM_Z, "tamper-z");
+    tamper_one(ECCOLD_TM_DUPEC, "tamper-dupec");
+    tamper_one(ECCOLD_TM_YHC, "tamper-yhc");
+    printf("  tamper: Z not the objects', an object's .ec file twice, a Y header check: each refused, nothing listed\n");
 }
 
 /* ------------------------------------------------------------ dropped: P dropped between the staging and the intent */
@@ -1428,7 +1687,7 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"merging", test_merging},
-                 {"leader", test_leader},
+                 {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
