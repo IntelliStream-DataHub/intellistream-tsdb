@@ -42,6 +42,20 @@ int ecapply_cold_decide(struct eng *db, int64_t key, const uint8_t *oids, uint32
 int ecapply_swap_pre(struct eng *db, struct part **in, struct part **ec, size_t n, bool *logged);
 void ecapply_swap_post(struct eng *db, struct part **in, struct part **ec, size_t n);
 
+/* planted bugs (tests/test_ecapply.c --mutant NAME; the Makefile requires each to fail it, D14) */
+enum {
+    ECAPPLY_MUT_NONE = 0,
+    ECAPPLY_MUT_YCOLD,              /* ycold: Y retired with the input set (its parts renamed settled_, never listed) */
+    ECAPPLY_MUT_ECABOVEY,           /* ecabovey: the .ec parts numbered above Y */
+    ECAPPLY_MUT_PPOSIGNORED,        /* pposignored: a part above Z is retired like the others, no stop */
+    ECAPPLY_MUT_V5NODIRSYNC,        /* v5nodirsync: no directory fsync after the v5 intent */
+    ECAPPLY_MUT_COLDNOFLUSHTHROUGH, /* coldnoflushthrough: the active memtable flushed at the marker too */
+    ECAPPLY_MUT_LEADERSWAPNORS,     /* leaderswapnors: a leader's swap writes no RSTATE `doing`/`done` */
+    ECAPPLY_MUT_PPOSAFTERSWAP,      /* pposafterswap: a leader's swap records its .ec parts' PPOS after its renames */
+};
+extern int ecapply_mutant;
+int ecapply_mutant_parse(const char *name); /* -1 when unknown */
+
 /* ---- the replica API (r8a2-hooks, built in src/replica.c) ----
  * ecapply_cold runs on the replica's applier (rp->apply_mu held) with rp->mu held, as apply_commit does. Lock order:
  * apply_mu > stage_mu > rp->mu > flush_lock > publish_lock > db->lock. */
