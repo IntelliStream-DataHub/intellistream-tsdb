@@ -125,6 +125,11 @@ typedef struct tier_settings {
     int64_t grace_s, keep_s, coarse_s;
     uint64_t cache_mb;
     bool eager;
+    /* r8g-cut, a cluster leader's settle (src/eccold.c; ec.settle_force_s, ec.settle_wait_max_s): how long past
+     * grace_s the policy waits for the memtable to let go of the key's rows by itself before the gate flushes it, and
+     * how long a settle waits for every position to be UP under the stripe version it put by. 0: the defaults
+     * (ECCOLD_FORCE_S_DEFAULT, ECCOLD_WAIT_MAX_S_DEFAULT). */
+    int64_t force_s, wait_max_s;
 } tier_settings;
 void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s);
 

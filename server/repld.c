@@ -107,6 +107,7 @@
 #include "peerlink.h"
 #include "replwire.h"
 #include "../src/cvol.h"
+#include "../src/eccold.h"
 #include "../src/ecdiverge.h"
 #include "../src/marker.h"
 #include "../src/repl.h"
@@ -2261,6 +2262,14 @@ static int links_up(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&G.mu);
     return 0;
 }
+/* a leader's settle (src/eccold.c): its MK_COLD marker appended and synced, its commit point not yet come */
+static void cold_marker_crash(struct eng *db, uint64_t pos)
+{
+    (void)db;
+    (void)pos;
+    crash_point(CP_COLD_AFTER_MARKER);
+}
+
 
 void repld_init(tsdb *t, const char *dir)
 {
@@ -2328,6 +2337,9 @@ void repld_init(tsdb *t, const char *dir)
     G.fetch_late = te && strstr(te, "fetchlate");
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
+    atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
+    if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */
+        leader_test_marker_hook = eccold_after_append;
     G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;

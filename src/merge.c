@@ -33,6 +33,7 @@
  */
 #include "ecskip.h"
 #include "internal.h"
+#include "eccold.h"
 #include "ppos.h"
 
 #include <math.h>
@@ -570,7 +571,7 @@ static int64_t sat_add64(int64_t a, int64_t b)
 
 /* When some row of p expires (ttl_any) and when all of it, tombstones included, has expired past the end of
  * its partition (ttl_all), in retention "now"; cached per part until a limit changes. Caller holds db->lock. */
-static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
+void ttl_compute_locked(eng *db, part *p, uint32_t gen)
 {
     int64_t any = INT64_MAX, all = INT64_MIN;
     int64_t lo, pend;
@@ -643,6 +644,9 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, cha
         for (b = a; b < db->nparts && db->parts[b]->partition == db->parts[a]->partition; b++) {
             part *p = db->parts[b];
             busy |= p->merging;
+            /* a cluster ec volume (R8): a settle between its gate and its swap has the key pinned, and its MK_COLD names
+             * the key's parts; a TTL rewrite or drop of them would retire rows the replicas then settle (r8g-cut) */
+            busy |= p->settling && db->ec_cluster && eccold_mutant != ECCOLD_MUT_TTLSETTLING;
             if (!p->ng && !p->nt) {
                 if (p->wal_seq > db->wal_removed_synced) {
                     all = INT64_MAX;
