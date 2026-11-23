@@ -566,6 +566,15 @@ static void dict_lengths(eng *db, struct dictlen *dl)
     pthread_mutex_unlock(&db->class_lock);
 }
 
+/* SNAP_MUT_DICTSHORT only: the lengths as they are, without the barrier */
+static void dict_lengths_now(eng *db, struct dictlen *dl)
+{
+    dl->series = __atomic_load_n(&db->series.file_off, __ATOMIC_RELAXED);
+    dl->states = __atomic_load_n(&db->states.file_off, __ATOMIC_RELAXED);
+    dl->ret = __atomic_load_n(&db->ret_off, __ATOMIC_RELAXED);
+    dl->cls = __atomic_load_n(&db->cls_off, __ATOMIC_RELAXED);
+}
+
 static int copy_dicts(mk_ctx *c, const struct dictlen *dl)
 {
     const struct {
@@ -645,14 +654,14 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     struct dictlen dl = {0};
     if (rc)
         goto out;
-    if (snap_mutant == SNAP_MUT_DICTSHORT)
-        dict_lengths(db, &dl); /* planted: before the cut, so a record whose marker P passes may be left out */
 
     /* ---- the cut (snapshot.c's header): memory only ---- */
     uint64_t p, done, mem_seq = UINT64_MAX;
     pthread_mutex_lock(&db->flush_lock);
     pthread_mutex_lock(&db->publish_lock);
     p = atomic_load(&db->lead_commit);
+    if (snap_mutant == SNAP_MUT_DICTSHORT) /* planted: the lengths read with no barrier, so a writer whose marker P */
+        dict_lengths_now(db, &dl);         /* passes and whose record is not written yet is left out */
     if (snap_mutant != SNAP_MUT_AFTERP)
         rc = list_part_names(db, &parts, &nparts);
     pthread_mutex_lock(&db->lock);
