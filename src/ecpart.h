@@ -36,7 +36,8 @@
  *    80  u64  writer_epoch        the chunk epoch the chunks were written under (D4: 1 in R7)
  *    88  i64  settle_ms           when the swap was decided, eng_now_ms (r7-keep counts settle_keep_s from it, the
  *                                 policy settle_coarse_s: never from an mtime, which a rename does not change)
- *    96  u64  ppos                R8: the log position of the settle's MK_COLD marker; 0 but in a cluster ec volume
+ *    96  u64  ppos                R8: the settle's cut Z (the log end its rows are taken at, below its MK_COLD
+ *                                 marker); 0 but in a cluster ec volume
  *   104  u64  stripe_version      R8: the stripe list's version; 0 but in a cluster ec volume
  *   112  u8[96] source            the source part's name, NUL padded (p<K>_<A>_<B>_<L>.part)
  *   208  u64  nsums               chunk_sums_total(geometry): one encode-time xxh64 per cell of every position (E26)

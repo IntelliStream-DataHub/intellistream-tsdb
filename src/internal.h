@@ -2224,6 +2224,9 @@ void partition_range(const struct eng *db, int64_t key, int64_t *lo, int64_t *hi
 /* A drop (eng_drop_before) is under way that retires this partition: no new merge or rewrite may start in it, or
  * the drop could wait for as long as merges keep being selected. Caller holds db->lock. */
 bool partition_dropping(const struct eng *db, int64_t key);
+/* merge.c: p->ttl_any / ttl_all for retention generation gen (db->lock held): when some row / every row and tombstone of
+ * p has expired by retention "now" (INT64_MAX: never / not known). The TTL pass's and the cluster settle policy's. */
+void ttl_compute_locked(struct eng *db, struct part *p, uint32_t gen);
 int partition_class(const struct eng *db, int64_t key);
 /* Lists committed parts, taking over the caller's references, and rewrites
  * MANIFEST. Cannot fail: once listed, the parts are published and must not

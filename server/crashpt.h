@@ -35,7 +35,8 @@
     X(CP_CLASS_SWITCH, "class-switch")                 /* during a partition class switch (r3e) */           \
     X(CP_FENCE_SAVED, "fence-saved-before-reply")      /* a replica saved a FENCE in REPL, its reply not sent */ \
     X(CP_PROMOTE_BEFORE_EPOCH, "promote-before-epoch") /* named leader of e+1, its EPOCH marker not written */  \
-    X(CP_DEPOSE_BEFORE_REOPEN, "depose-before-reopen") /* a deposed writer closed, not yet open as a replica */
+    X(CP_DEPOSE_BEFORE_REOPEN, "depose-before-reopen") /* a deposed writer closed, not yet open as a replica */ \
+    X(CP_COLD_AFTER_MARKER, "cold-after-marker")       /* a leader's settle: MK_COLD committed, the swap not run (r8g) */
 
 enum crash_point_id {
 #define X(id, name) id,

@@ -30,20 +30,39 @@ void ecsettle_eng_stop(eng *db);
  * settling, .ec, damaged, without granules or carried over from format 8 are skipped (left as they are); a key that
  * a drop is retiring is skipped whole. 0: every pinned part is now an .ec part (the count in *settled when not NULL).
  * TSDB_ERR_NOTFOUND: nothing to settle. TSDB_ERR_INVALID: no tier, or a cluster or replica volume (D1: R7 settles
- * only on one server). TSDB_ERR_READONLY. TSDB_ERR_UNAVAILABLE: a store is DOWN or failed (tier_writable), or the
+ * only on one server) that is not the leader of a cluster ec volume (R8, D21: src/eccold.c settles there, with a gate
+ * and a MK_COLD marker; TSDB_ERR_INDETERMINATE when the leader was deposed after the marker went out). TSDB_ERR_READONLY. TSDB_ERR_UNAVAILABLE: a store is DOWN or failed (tier_writable), or the
  * backend refused a put. TSDB_ERR_STOPPED: the engine is closing or halting, or a drop or a merge took a part
  * meanwhile. TSDB_ERR_CORRUPT: a granule, the index or the footer did not match its checksum, or rows contradict
  * CLASSES: the part is marked damaged (part_mark_payload) and nothing is written. TSDB_ERR_IO, TSDB_ERR_NOMEM.
  * Whatever the result, no part stays `settling`, and the chunks of an object that was not swapped in are handed to
  * r7-gc (an engine failure after the intent leaves them to the next open, which may roll the swap forward). The
- * caller holds no engine lock; jr_serial, flush_lock and cls_rw are never taken. */
+ * caller holds no engine lock. On one server jr_serial, flush_lock and cls_rw are never taken; on a cluster leader
+ * eccold_settle takes jr_serial through lw_enter (the gate, like a large write) after the puts and holds it across a
+ * memtable flush (flush_lock, cls_rw), the commit-point wait, the marker and the swap (publish_lock > latest_rw >
+ * db->lock), so the lock order there is jr_serial > flush_lock > ... as a large write's. */
 int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled);
+
+/* The two halves of a settle of one part, for src/eccold.c (a leader puts the object before its gate and writes the
+ * .ec file, whose record carries the cut, after it). ecsettle_put: the geometry, a fresh oid, the record (r owned by
+ * the caller from 0 on: ec_record_free) and the put of the object under the volume's epoch (into *epoch when not
+ * NULL); a failure hands what was put to r7-gc and leaves r freed. ecsettle_index: the tmp_*.ec of r and the .ec part
+ * opened from it (pending names the temporary); a failure removes the temporary and hands the object to r7-gc.
+ * ecsettle_gc_object: hands an object no .ec part names to r7-gc. */
+struct ec_record;
+int ecsettle_put(eng *db, part *p, struct ec_record *r, uint64_t *epoch);
+int ecsettle_index(eng *db, part *p, const struct ec_record *r, part **out);
+void ecsettle_gc_object(eng *db, const struct ec_record *r);
+/* whether db is closing or halting (a settle in progress gives up: STOPPED) */
+bool ecsettle_stopping(eng *db);
 
 /* ------------------------------------------------------------ the policy (src/ecpolicy.c, E5) */
 /* Picks what settles next in db (under db->lock, which the caller holds): the key into *key and its parts, referenced,
  * into sel[0 .. return value) (at most cap; the caller passes them to eng_settle and unrefs them). 0: nothing is due.
  * now_ms: eng_now_ms. */
 size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
+/* tests: the cluster branch takes every key as too big for one marker (it says so and marks the key failed) */
+extern bool ecpolicy_test_cap_hit;
 /* A settle of key failed (not STOPPED): the policy leaves the key alone for an hour. */
 void ecpolicy_failed(eng *db, int64_t key, int64_t now_ms);
 /* A settle happened (eager mode counts them: at most ECPOLICY_EAGER_PER_MIN a minute per engine). */

@@ -6,8 +6,9 @@
  * The leader API r8a2-hooks adds (jr_cold, jr_cold_precommit, jr_cold_commit) is declared here and built in
  * src/replica.c.
  *
- * STUB (r8a1-mk): filled by r8g-cut. Until then no cluster volume attaches a tier and nothing settles in a cluster:
- * db->cold stays NULL.
+ * Built by r8g-cut (src/eccold.c has the design of the gate and the cut). db->cold points at the settle in progress on
+ * this engine (its key, cut and marker position) only while that settle's ec_swap_commit runs: r8h's swap hooks read
+ * it through eccold_swap_cur on the same thread; NULL otherwise. eccold_open and eccold_close have nothing to do.
  *
  * Builds with and without TSDB_EC (the embedded crates copy every .c file of src/).
  */
@@ -25,6 +26,68 @@ struct eccold; /* the leader's settle state (r8g), eng.cold */
 bool eccold_may_attach(struct eng *db);
 int eccold_open(struct eng *db);
 void eccold_close(struct eng *db);
+
+struct part;
+/* Whether db is the leader of a cluster ec volume now (jr attached, not a replica, not deposed): eng_settle settles it
+ * through eccold_settle, the settle thread asks every round. */
+bool eccold_leader(struct eng *db);
+/* eng_settle's leader branch: the parts pin[0 .. np) of key `key` are pinned (settling, referenced) by the caller,
+ * which unpins them whatever the result. ec[0 .. np) comes back with the .ec parts (references the caller drops) on 0
+ * only; on any error eccold_settle has dropped what it opened and ec[] is NULL. Results: 0 (swapped);
+ * TSDB_ERR_UNAVAILABLE (a position not UP under the stripe version and epoch the objects were put by, within
+ * settle_wait_max_s, or at the re-check after the gate: the objects go to r7-gc, the policy retries later);
+ * TSDB_ERR_STOPPED (closing, or a late part of the key was merging); TSDB_ERR_INDETERMINATE (deposed after the marker
+ * went out: nothing is cleaned up, the reopen as a replica decides); TSDB_ERR_IO (the engine failed: after the marker
+ * committed, any refusal of the swap fails it); the errors of the puts, the flush and jr_cold before the marker. */
+int eccold_settle(struct eng *db, int64_t key, struct part **pin, size_t np, struct part **ec);
+/* The COLD being carried out by ec_swap_commit on this engine, for r8h's swap hooks (the same thread): its marker
+ * position, key and cut. false when no settle of this engine is between its marker and the end of its swap. */
+bool eccold_swap_cur(struct eng *db, uint64_t *pos, int64_t *key, uint64_t *z);
+
+#define ECCOLD_FORCE_S_DEFAULT 3600   /* tier_settings.force_s 0 */
+#define ECCOLD_WAIT_MAX_S_DEFAULT 600 /* tier_settings.wait_max_s 0 */
+#define ECCOLD_RETAIN_S_DEFAULT 1800  /* repl_retain_s when the leader has no keep cap (meta.h's default) */
+
+/* r8l's crash point cold-after-marker (server/crashpt.h, for the midcommit nemesis): tsdbd sets it; called right after
+ * a COLD marker was appended and synced, before its commit point came (appended, not committed). It is reached
+ * through jr_cold's own hook: whoever installs eccold_marker_hook sets replica.h's leader_test_marker_hook to
+ * eccold_after_append once, before any engine opens; eccold_after_append passes on only the COLD that this thread is
+ * appending (a COMMIT's marker passes the same hook). */
+extern void (*_Atomic eccold_marker_hook)(struct eng *db, uint64_t pos);
+void eccold_after_append(struct eng *db, uint64_t fno);
+/* reads TSDB_ECCOLD_MUTANT once (the settle and the open of a settling engine call it, so the TTL pass's mutant
+ * works before the first settle) */
+void eccold_mutant_init(void);
+
+/* ---- tests (tests/test_eccold.c) ---- */
+/* What the last leader settle of any engine decided (eccold_test_last copies it): the log end L after lw_enter, F, Z,
+ * the stripe version, the key, the marker's position, the number of Y parts and their names, whether the gate
+ * flushed the memtable. */
+#define ECCOLD_TEST_Y_MAX 16
+typedef struct eccold_cut {
+    uint64_t l, f, z, stripe_version, pos;
+    int64_t key;
+    size_t nobjs, ny;
+    char y[ECCOLD_TEST_Y_MAX][64];
+    bool flushed, gated;
+    int rc;
+    int64_t hold_us; /* from lw_enter to lw_leave (0: never gated) */
+} eccold_cut;
+void eccold_test_last(eccold_cut *out);
+/* Steps a settle passes, for tests to act at (the hook runs on the settle's thread, no engine lock held but those
+ * named): PUT (objects put, nothing taken), GATED (lw_enter done: jr_serial held, the fence up), CUT (Z and Y taken),
+ * MARKER (the marker committed, before the swap). */
+enum { ECCOLD_STEP_PUT = 1, ECCOLD_STEP_GATED, ECCOLD_STEP_CUT, ECCOLD_STEP_MARKER };
+extern void (*_Atomic eccold_test_hook)(struct eng *db, int step);
+/* Planted bugs (tests/test_eccold.c --mutant NAME, or TSDB_ECCOLD_MUTANT=NAME): cutnogate: Y and Z taken without
+ * lw_enter (no fence, no jr_serial); cutnowait: Z without waiting for the commit point to pass L; ttlsettling: the TTL
+ * pass takes a key with a settling part in a cluster; cutnorotate: no flush at the cut (F inside the active segment,
+ * the key's memtable rows in no part); fencekeyonly: the fence covers only the buckets of the series in the settled
+ * parts; stripewaitfenced: the wait for the positions runs under the fence. */
+enum { ECCOLD_MUT_NONE = 0, ECCOLD_MUT_CUTNOGATE, ECCOLD_MUT_CUTNOWAIT, ECCOLD_MUT_TTLSETTLING,
+       ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED };
+extern int eccold_mutant;
+int eccold_mutant_parse(const char *name); /* -1 when unknown */
 
 /* ---- the leader API (r8a2-hooks, built in src/replica.c) ---- */
 struct mk;

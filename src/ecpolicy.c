@@ -26,11 +26,24 @@
  * as before; nothing in the object has to change. A cluster (R8) settles the leader's parts while the replicas may
  * still hold memtable rows of the key that only a later flush lists, and it needs settle_force_s (a bound after which
  * the key is settled anyway) to keep a key that never quiets down from never settling.
+ *
+ * On the leader of a cluster ec volume (R8, D21, r8g-cut; src/eccold.c the settle): whole keys only, of any class, once
+ * the key's end is grace_s old by eng_now_ms (the leader's clock, which its NOW markers carry: E5) and no merge of it
+ * is selectable; no per-part, coarse or eager settle; never an insert-written part (level 0, D18: it is rewritten alone
+ * first); never a key some row of which expires within keep_s + repl_retain_s + 1 h (a replica lagging up to
+ * repl_retain_s must not cross the expiry; repl_retain_s is the leader's keep cap, eng_leader_keep_cap, else 1800 s);
+ * never on a diverged engine; and while the memtable may still hold rows of the key, not before the key's end is
+ * grace_s + force_s old (the gate then flushes it). A settle that gave up (a position not UP) counts as failed: the
+ * key waits an hour.
  */
 #include "settle.h"
+#include "eccold.h"
 #include "ecpart.h"
 #include "ecskip.h"
+#include "marker.h"
 #include "tier.h"
+
+#include <stdio.h>
 
 static bool failed_recently(const ecpolicy_state *ps, int64_t key, int64_t now)
 {
@@ -86,6 +99,34 @@ static bool settleable(const part *p)
            p->hdr_len == sizeof(part_header) && !p->pending[0];
 }
 
+/* A cluster leader's settle (R8, D21; eccold.c). Whether some row of parts[a, b) expires within margin of now (MK_NOW's
+ * clock: eng_now_ms on a leader is what its NOW markers carry): a replica lagging up to repl_retain_s must not see the
+ * key's rows expire while it still applies the settle. */
+static bool expires_within(eng *db, size_t a, size_t b, int64_t now, int64_t margin)
+{
+    if (!atomic_load_explicit(&db->has_retention, memory_order_relaxed))
+        return false;
+    uint32_t gen = atomic_load(&db->ret_gen);
+    for (size_t i = a; i < b; i++) {
+        part *p = db->parts[i];
+        if (p->ttl_gen != gen)
+            ttl_compute_locked(db, p, gen);
+        if (p->ttl_any != INT64_MAX && p->ttl_any - margin <= now)
+            return true;
+    }
+    return false;
+}
+
+/* whether the memtable may still hold rows of [lo, hi] (db->lock held): a flush pending, or the active one's span */
+static bool mt_holds_locked(eng *db, int64_t lo, int64_t hi)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    const memtable *m = db->active;
+    bool any = db->nflushing > 0 || (m && m->rows > 0 && m->min_ts <= hi && m->max_ts >= lo);
+    pthread_mutex_unlock(&db->buf_lock);
+    return any;
+}
+
 static bool mergeable(const part *p)
 {
     return !p->merging && !atomic_load(&p->damaged) && !part_merge_barrier(p);
@@ -114,6 +155,8 @@ static bool merge_selectable(const eng *db, size_t a, size_t b)
     return false;
 }
 
+bool ecpolicy_test_cap_hit;
+
 size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size_t cap)
 {
     ecpolicy_state *ps = ecpolicy_of(db);
@@ -124,7 +167,15 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
     pthread_mutex_lock(&ps->pmu);
     ecpolicy_state snap = *ps; /* the fail list and the eager count (pmu is a leaf: not held across the walk) */
     pthread_mutex_unlock(&ps->pmu);
-    if (cfg->eager && now - snap.eager_win_ms < 60000 && now >= snap.eager_win_ms &&
+    /* R8: a cluster ec volume settles on its leader only (settle_engine asks), never on a diverged engine (item 9) */
+    bool cluster = db->ec_cluster;
+    if (cluster && atomic_load(&db->diverged))
+        return 0;
+    int64_t force = (cfg->force_s > 0 ? cfg->force_s : ECCOLD_FORCE_S_DEFAULT) * 1000;
+    uint64_t cap_ms = atomic_load(&db->lead_cap_ms);
+    int64_t retain = cap_ms ? (int64_t)cap_ms : ECCOLD_RETAIN_S_DEFAULT * 1000LL;
+    int64_t margin = cfg->keep_s * 1000 + retain + 3600 * 1000LL;
+    if (!cluster && cfg->eager && now - snap.eager_win_ms < 60000 && now >= snap.eager_win_ms &&
         snap.eager_n >= ECPOLICY_EAGER_PER_MIN)
         return 0;
     for (size_t a = 0; a < db->nparts;) {
@@ -151,7 +202,37 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
         int64_t plo, phi;
         partition_range(db, k, &plo, &phi);
         size_t n = 0;
-        if (cfg->eager) {
+        if (cluster) { /* D21: whole keys of any class, no per-part, coarse or eager settle */
+            if (phi == INT64_MAX || now - phi < grace)
+                continue;
+            if (merge_selectable(db, lo_i, hi_i) && settle_mutant != SETTLE_MUT_BUSY)
+                continue;
+            if (expires_within(db, lo_i, hi_i, now, margin))
+                continue;
+            /* the natural flush: the gate flushes the memtable only once force_s has passed */
+            if (now - phi < grace + force && mt_holds_locked(db, plo, phi - 1))
+                continue;
+            /* the whole key or nothing: the parts it settles (I) and the rest of it (Y) must fit one marker; a key that
+             * does not is said once and tried an hour later (the merges may make it smaller), never settled in part */
+            size_t ni = 0, nall = 0;
+            for (size_t i = lo_i; i < hi_i; i++) {
+                const part *p = db->parts[i];
+                nall += !part_is_ec(p);
+                ni += settleable(db->parts[i]) && p->level > 0; /* D18: never an insert-written part */
+            }
+            if (ni > cap || nall > MK_FILES_MAX || ecpolicy_test_cap_hit) {
+                if (ni) {
+                    fprintf(stderr, "tsdb: %s: settle: key %lld has %zu parts to settle and %zu in all, more than one "
+                                    "marker names (%zu, %d): tried again in an hour\n",
+                            db->dir, (long long)k, ni, nall, cap, MK_FILES_MAX);
+                    ecpolicy_failed(db, k, now);
+                }
+                continue;
+            }
+            for (size_t i = lo_i; i < hi_i; i++)
+                if (settleable(db->parts[i]) && db->parts[i]->level > 0)
+                    sel[n++] = db->parts[i];
+        } else if (cfg->eager) {
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
                 part *p = db->parts[i];
                 if (settleable(p) && p->max_ts <= now - grace &&

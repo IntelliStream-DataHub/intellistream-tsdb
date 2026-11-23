@@ -31,8 +31,12 @@
  *
  * The thread (D11): one per tier, nice 19, one settle at a time over the tier's engines (registered by
  * ecsettle_eng_ready at the end of a writer's open, never a read-only engine, a follower, a cluster or a replica
- * volume). It never holds jr_serial, flush_lock or cls_rw: a settle takes db->lock only to pin and to unpin, and the
- * swap takes publish_lock > latest_rw > db->lock like a publisher. Inserts never wait for it (a settling part still
+ * volume; a cluster ec volume registers too and settles only while its member leads it). On one server it never holds
+ * jr_serial, flush_lock or cls_rw: a settle takes db->lock only to pin and to unpin, and the swap takes publish_lock >
+ * latest_rw > db->lock like a publisher. On a cluster leader (R8, src/eccold.c) the settle puts its objects with no
+ * lock held, then takes the gate (lw_enter: jr_serial, a fence over the key's days for every series) and holds it
+ * across a flush of the memtable (flush_lock, cls_rw), the wait for the commit point, the MK_COLD marker and the
+ * swap, as a large write holds it; writes into the key's days wait for it, others do not. Elsewhere inserts never wait for it (a settling part still
  * counts towards a partition's parts: src/db.c). eng_halt and eng_close stop it for their engine (ecsettle_eng_stop):
  * db->stop is set by then, which the next fill sees (STOPPED: the put leaves no chunk), and the stop waits for the
  * settle to unwind before the parts go.
@@ -40,10 +44,12 @@
 #define _GNU_SOURCE
 #include "settle.h"
 #include "chunk.h"
+#include "eccold.h"
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecskip.h"
 #include "ecswap.h"
+#include "marker.h"
 #include "coldops.h"
 #include "tier.h"
 
@@ -220,6 +226,8 @@ static bool eng_stopping(eng *db)
 {
     return atomic_load(&db->stop) || (db->ecstate && db->ecstate->settle && atomic_load(&db->ecstate->settle->stopping));
 }
+
+bool ecsettle_stopping(eng *db) { return eng_stopping(db); }
 
 /* ------------------------------------------------------------ the one pass */
 
@@ -444,7 +452,7 @@ static int sfill_prepare(sfill *f)
 }
 
 /* hands the chunks of an object that no .ec part names to r7-gc (ecgc_unlisted_object reads only the record) */
-static void gc_object(eng *db, const ec_record *r)
+void ecsettle_gc_object(eng *db, const ec_record *r)
 {
     part *fake = calloc(1, sizeof *fake);
     struct ecpart *e = calloc(1, sizeof *e);
@@ -460,15 +468,24 @@ static void gc_object(eng *db, const ec_record *r)
     free(fake);
 }
 
-/* p: pinned. *out: the .ec part opened from its tmp_*.ec (pending names it). */
-static int settle_one(eng *db, part *p, part **out)
+/* the failure planted for this settle_one, taken once; ecsettle_put takes only PUT and ecsettle_index only INDEX and
+ * OPEN (a = b = 0: any), so the cold path's index failures can be planted too */
+static int fail_take_of(int a, int b)
 {
-    *out = NULL;
     int fail_at = atomic_load(&settle_test_fail_at); /* tests: one planted failure (settle.h) */
+    if (fail_at && a && fail_at != a && fail_at != b)
+        return SETTLE_FAIL_NONE;
     if (fail_at && atomic_fetch_sub(&settle_test_fail_skip, 1) > 0)
         fail_at = SETTLE_FAIL_NONE;
     else if (fail_at)
         atomic_store(&settle_test_fail_at, SETTLE_FAIL_NONE);
+    return fail_at;
+}
+static int fail_take(void) { return fail_take_of(0, 0); }
+
+static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, int fail_at)
+{
+    memset(r, 0, sizeof *r);
     coldvol *cv = tier_cold(db);
     if (!cv)
         return TSDB_ERR_UNAVAILABLE;
@@ -479,47 +496,58 @@ static int settle_one(eng *db, part *p, part **out)
     uint64_t epoch = coldvol_epoch(cv); /* the volume's provider (D4: 1 on a single server) */
     if (epoch == 0)
         return TSDB_ERR_UNAVAILABLE;
-    ec_record r;
-    memset(&r, 0, sizeof r);
-    r.version = EC_RECORD_VERSION;
-    r.class_check = EC_CLS_PASSED;
-    chunk_random(r.oid, sizeof r.oid);
-    r.key = p->partition;
-    r.min_block = p->min_block;
-    r.max_block = p->max_block;
-    r.level = p->level;
-    r.k = g.k;
-    r.m = g.m;
-    r.cell_bytes = g.cell;
-    r.object_len = p->map_len;
-    r.writer_epoch = epoch;
-    snprintf(r.source, sizeof r.source, "%s", p->name);
-    r.nsums = chunk_sums_total(&g);
-    if (!(r.sums = malloc(r.nsums * sizeof *r.sums)))
+    if (epoch_out)
+        *epoch_out = epoch;
+    r->version = EC_RECORD_VERSION;
+    r->class_check = EC_CLS_PASSED;
+    chunk_random(r->oid, sizeof r->oid);
+    r->key = p->partition;
+    r->min_block = p->min_block;
+    r->max_block = p->max_block;
+    r->level = p->level;
+    r->k = g.k;
+    r->m = g.m;
+    r->cell_bytes = g.cell;
+    r->object_len = p->map_len;
+    r->writer_epoch = epoch;
+    snprintf(r->source, sizeof r->source, "%s", p->name);
+    r->nsums = chunk_sums_total(&g);
+    if (!(r->sums = malloc(r->nsums * sizeof *r->sums)))
         return TSDB_ERR_NOMEM;
     sfill f = {.db = db, .p = p};
     if ((rc = sfill_prepare(&f)) != 0)
         goto out;
     chunk_put_src src = {.ctx = &f, .fill = settle_fill};
-    rc = cv->ops->put_stream(cv->ctx, r.oid, &g, r.writer_epoch, &src, r.sums);
+    rc = cv->ops->put_stream(cv->ctx, r->oid, &g, r->writer_epoch, &src, r->sums);
     if (rc == 0 && fail_at == SETTLE_FAIL_PUT)
         rc = TSDB_ERR_IO;
     if (rc) {
         if (!f.aborted) {
             fprintf(stderr, "tsdb: %s: settle of part %s: the put failed (%d)\n", db->dir, p->name, rc);
             if (settle_mutant != SETTLE_MUT_GCSKIPPUT)
-                gc_object(db, &r); /* a failure while committing leaves the positions committed before it */
+                ecsettle_gc_object(db, r); /* a failure while committing leaves the positions committed before it */
         }
         goto out;
     }
     ecswap_crash_point(ECSWAP_CRASH_AFTER_PUT);
-    r.object_xxh64 = f.hash;
-    r.settle_ms = eng_now_ms(db);
+    r->object_xxh64 = f.hash;
+    r->settle_ms = eng_now_ms(db);
+out:
+    sfill_free(&f);
+    if (rc)
+        ec_record_free(r);
+    return rc;
+}
+
+static int settle_index_as(eng *db, part *p, const ec_record *r, part **out, int fail_at)
+{
+    *out = NULL;
+    int rc;
     char tmp[96];
-    if ((rc = fail_at == SETTLE_FAIL_INDEX ? TSDB_ERR_IO : ec_index_write(db, p, &r, tmp)) != 0) {
+    if ((rc = fail_at == SETTLE_FAIL_INDEX ? TSDB_ERR_IO : ec_index_write(db, p, r, tmp)) != 0) {
         if (settle_mutant != SETTLE_MUT_GCSKIPINDEX)
-            gc_object(db, &r);
-        goto out;
+            ecsettle_gc_object(db, r);
+        return rc;
     }
     ecswap_crash_point(ECSWAP_CRASH_AFTER_EC_TMP);
     char name[96];
@@ -528,14 +556,35 @@ static int settle_one(eng *db, part *p, part **out)
     if ((rc = fail_at == SETTLE_FAIL_OPEN ? TSDB_ERR_IO : part_open_ec(db, tmp, name, &e)) != 0) {
         unlinkat(db->dirfd, tmp, 0);
         if (settle_mutant != SETTLE_MUT_GCSKIPOPEN)
-            gc_object(db, &r);
-        goto out;
+            ecsettle_gc_object(db, r);
+        return rc;
     }
     if (!e->pending[0])
         snprintf(e->pending, sizeof e->pending, "%.63s", tmp); /* tmp_<pid>_<n>.ec: short */
     *out = e;
-out:
-    sfill_free(&f);
+    return 0;
+}
+
+int ecsettle_put(eng *db, part *p, ec_record *r, uint64_t *epoch)
+{
+    return settle_put_as(db, p, r, epoch, fail_take_of(SETTLE_FAIL_PUT, SETTLE_FAIL_PUT));
+}
+
+int ecsettle_index(eng *db, part *p, const ec_record *r, part **out)
+{
+    return settle_index_as(db, p, r, out, fail_take_of(SETTLE_FAIL_INDEX, SETTLE_FAIL_OPEN));
+}
+
+/* p: pinned. *out: the .ec part opened from its tmp_*.ec (pending names it). */
+static int settle_one(eng *db, part *p, part **out)
+{
+    *out = NULL;
+    int fail_at = fail_take();
+    ec_record r;
+    int rc = settle_put_as(db, p, &r, NULL, fail_at);
+    if (rc)
+        return rc;
+    rc = settle_index_as(db, p, &r, out, fail_at);
     ec_record_free(&r);
     return rc;
 }
@@ -553,8 +602,11 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
     pthread_once(&mut_once, mut_env);
     if (settled)
         *settled = 0;
-    if (!db->tier || !db->ecstate || !db->ecstate->settle || db->replica_req || db->cluster_req || eng_jr(db))
-        return TSDB_ERR_INVALID; /* D1: R7 settles on one server only */
+    /* D1: R7 settles on one server only; R8 (D21) also on the leader of a cluster ec volume, through eccold_settle */
+    bool cold = eccold_leader(db);
+    if (!db->tier || !db->ecstate || !db->ecstate->settle ||
+        (!cold && (db->replica_req || db->cluster_req || eng_jr(db))))
+        return TSDB_ERR_INVALID;
     if (db->opt.read_only || db->opt.follow)
         return TSDB_ERR_READONLY;
     if (eng_check(db))
@@ -580,7 +632,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
             /* a v8 part (hdr_len) is rewritten alone first (src/merge.c rewrite_alone); ec_index_write refuses it */
             if (dup || p->partition != partition || p->merging || p->settling || p->dropped || part_is_ec(p) ||
                 atomic_load(&p->damaged) || p->ng == 0 || p->hdr_len != sizeof(part_header) || p->pending[0] ||
-                !listed_locked(db, p))
+                (cold && p->level == 0) || !listed_locked(db, p)) /* D18: never an insert-written part in a cluster */
                 continue;
             p->settling = true;
             part_ref(p);
@@ -589,6 +641,11 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
     pthread_mutex_unlock(&db->lock);
     int rc = np ? 0 : TSDB_ERR_NOTFOUND;
     size_t nec = 0;
+    if (cold && rc == 0) {
+        rc = eccold_settle(db, partition, pin, np, ec); /* the gate, the cut, Y, MK_COLD and the swap (src/eccold.c) */
+        nec = np;
+        goto unpin;
+    }
     for (; rc == 0 && nec < np; nec++)
         if ((rc = settle_one(db, pin[nec], &ec[nec])) != 0)
             break;
@@ -617,6 +674,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
                 ecgc_unlisted_object(db, ec[i]);
         }
     }
+unpin:
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < np; i++)
         pin[i]->settling = false;
@@ -651,16 +709,27 @@ static bool settle_engine(eng *db)
 {
     if (eng_check(db) || eng_stopping(db) || !tier_cold_writable(db))
         return false;
-    int64_t now = eng_now_ms(db), key = 0;
-    part *sel[64];
-    pthread_mutex_lock(&db->lock);
-    size_t n = ecpolicy_pick_locked(db, now, &key, sel, sizeof sel / sizeof *sel);
-    pthread_mutex_unlock(&db->lock);
-    if (!n)
+    if (db->cluster_req && !eccold_leader(db)) /* a cluster volume settles only while this member leads it (D21) */
         return false;
-    int rc = eng_settle(db, key, sel, n, NULL);
+    int64_t now = eng_now_ms(db), key = 0;
+    /* a cluster leader settles whole keys (D21): as many parts as a marker may name, never the first 64 of a key */
+    part *sel64[64], **sel = sel64;
+    size_t cap = 64;
+    if (db->ec_cluster) {
+        if (!(sel = malloc(MK_FILES_MAX * sizeof *sel)))
+            return false;
+        cap = MK_FILES_MAX;
+    }
+    pthread_mutex_lock(&db->lock);
+    size_t n = ecpolicy_pick_locked(db, now, &key, sel, cap);
+    pthread_mutex_unlock(&db->lock);
+    int rc = n ? eng_settle(db, key, sel, n, NULL) : 0;
     for (size_t i = 0; i < n; i++)
         part_unref(sel[i]);
+    if (sel != sel64)
+        free(sel);
+    if (!n)
+        return false;
     if (rc == 0)
         ecpolicy_settled(db, now);
     else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND)
@@ -762,14 +831,17 @@ int ecsettle_eng_open(eng *db)
         return TSDB_ERR_NOMEM;
     pthread_mutex_init(&e->pol.pmu, NULL);
     db->ecstate->settle = e;
+    eccold_mutant_init(); /* the TTL pass's planted bug (ttlsettling) before any settle ran */
     return 0;
 }
 
 void ecsettle_eng_ready(eng *db)
 {
     struct ecsettle_tier *st = db->tier ? db->tier->settle : NULL;
-    if (!st || !db->ecstate || !db->ecstate->settle || db->opt.read_only || db->opt.follow || db->replica_req ||
-        db->cluster_req)
+    /* a cluster ec volume registers whatever its role now: settle_engine asks eccold_leader at every round (a writer
+     * becomes a leader at eng_leader_attach, after its open, and a deposed one stops) */
+    if (!st || !db->ecstate || !db->ecstate->settle || db->opt.read_only || db->opt.follow ||
+        ((db->replica_req || db->cluster_req) && !db->ec_cluster))
         return;
     pthread_mutex_lock(&st->mu);
     if (st->neng == st->cap) {

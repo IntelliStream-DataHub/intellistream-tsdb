@@ -68,6 +68,10 @@ typedef struct cold_ops {
     /* Every position up now (eckeep's digest waits otherwise: a REPLACING store lacks chunks it will have). */
     bool (*all_up)(void *ctx);
     void (*ctx_free)(void *ctx);
+    /* R8 (r8g-cut, design-cluster-data.md 2.3 step 3): the version of the stripe list the positions are placed by now;
+     * a leader's settle puts under one and carries it in MK_COLD only while it is still the copy's. NULL: 0 (the
+     * directory ops, one server: the list never changes). */
+    uint64_t (*stripe_version)(void *ctx);
 } cold_ops;
 
 /* ------------------------------------------------------------ the directory ops (src/coldops_dir.c) */
