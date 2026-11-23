@@ -143,6 +143,7 @@ static struct sim {
     int fo;
     uint64_t fo_epoch, fo_version, fo_start;
     uint32_t fo_fenced;
+    int fo_off;               /* nid of a leaving leader this failover moves off (a planned transfer, D14), 0: none */
     struct repl_fence_reply rep[NM];
     int nrep;
     /* clients */
@@ -167,7 +168,7 @@ static struct sim {
         uint64_t acked, refused, unknown, promotions, stale, none, resigns, cuts, isr, crashes, wipes, parts, pauses,
             moves, msgs, applied, waits, refuses, xcuts, ack_isr1, ack_isrn, wiped_acked, wipe_leader,
             fence_rep_out, deg_runs, deg_ok, trims, snaps, lies, floors, adds, removes, resets, mvdone, reconfs,
-            restarts, xver, leaves, leavereq, replays;
+            restarts, xver, leaves, leavereq, replays, planned;
     } st, tot;
 } S;
 
@@ -829,6 +830,7 @@ static void fo_begin(const char *why)
     S.fo_version = S.vm.isr_version;
     S.fo_fenced = S.vm.isr;
     S.fo_start = S.now;
+    S.fo_off = 0;
     S.nrep = 0;
     trace("meta: failover of epoch %" PRIu64 " (%s), fencing isr %#x", S.vm.epoch, why, S.vm.isr);
     for (int i = 0; i < S.nn; i++)
@@ -854,7 +856,27 @@ static void meta_tick(void)
     uint32_t old = S.vm.isr;
     uint64_t oldrid[NM];
     memcpy(oldrid, S.vm.rid, sizeof oldrid);
-    int rc = repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
+    /* Moving off a leaving leader: the target is the replier (other than it) with the highest durable end, and only if
+     * that is the highest of all replies (D14: the target holds what the old one wrote). Otherwise the usual choice,
+     * which may pick the leaving member again: the mover then tries once more. */
+    int target = -1, off = S.fo_off ? slot_of(S.fo_off) : -1;
+    uint64_t min_end = 0;
+    for (int i = 0; off >= 0 && i < S.nrep; i++) {
+        int nd = S.rep[i].node;
+        if (nd < 0 || nd >= S.nn || !(S.vm.isr & S.fo_fenced & (1u << nd)) || S.rep[i].rid != S.vm.rid[nd])
+            continue;
+        if (S.rep[i].durable > min_end)
+            min_end = S.rep[i].durable;
+        if (nd != off && (target < 0 || S.rep[i].durable > S.rep[target].durable))
+            target = i;
+    }
+    if (target >= 0 && S.rep[target].durable < min_end)
+        target = -1;
+    int rc = target >= 0 ? repl_meta_promote_to(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep,
+                                                S.rep[target].node, min_end)
+                         : repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
+    if (rc == REPL_OK && target >= 0)
+        S.st.planned++;
     if (rc == REPL_OK) {
         S.fo = 0;
         /* The D1 excuse goes only with a promotion that drops an intact member (one still on the disk the old ISR
@@ -1191,8 +1213,12 @@ static void mover(void)
         return;
     }
     if (l == a) {
-        if (S.chaos && !S.fo && chance(20))
+        /* A failover may have made the leaving member the leader: move off it (every tick once the faults healed,
+         * or the move never ends: seeds 31511, 37712 and 14 more of 100,000 before). */
+        if (!S.fo && (!S.chaos || chance(20))) {
             fo_begin("moving off a leaving member");
+            S.fo_off = S.mv.a;
+        }
         return;
     }
     struct node *L = l >= 0 ? &S.node[l] : NULL;
@@ -1707,8 +1733,9 @@ int main(int argc, char **argv)
     if (!quiet)
         printf("set changes: %" PRIu64 " adds, %" PRIu64 " removes, %" PRIu64 " resets, %" PRIu64 " moves done (%"
                PRIu64 " leaves told, %" PRIu64 " leave requests), %" PRIu64 " reconfigurations, %" PRIu64
-               " cores restarted, %" PRIu64 " messages of another set version dropped, %" PRIu64 " replay starts raised\n",
+               " cores restarted, %" PRIu64 " messages of another set version dropped, %" PRIu64 " replay starts raised, %"
+               PRIu64 " planned transfers off a leaving leader\n",
                S.tot.adds, S.tot.removes, S.tot.resets, S.tot.mvdone, S.tot.leaves, S.tot.leavereq, S.tot.reconfs,
-               S.tot.restarts, S.tot.xver, S.tot.replays);
+               S.tot.restarts, S.tot.xver, S.tot.replays, S.tot.planned);
     return 0;
 }
