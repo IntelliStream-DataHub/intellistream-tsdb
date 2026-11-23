@@ -56,6 +56,9 @@ enum {
     ECAPPLY_MUT_SEENSKIP,           /* seenskip: two .ec files of the marker may match one object */
     ECAPPLY_MUT_NOYHCHECK,          /* noyhcheck: a staged Y's header (index hash, granule rows, key) is not checked */
     ECAPPLY_MUT_DECIDESOME,         /* decidesome: decide answers "not done" when only some of the oids are listed */
+    ECAPPLY_MUT_RECROLLMISSING,     /* recrollmissing: v5 recovery rolls forward with nothing renamed and a file gone */
+    ECAPPLY_MUT_RECNODIVERGE,       /* recnodiverge: v5 recovery rolls back a lost own part without DIVERGED */
+    ECAPPLY_MUT_RECNODIRSYNC,       /* recnodirsync: v5 recovery does not sync the directory before the intent goes */
 };
 extern int ecapply_mutant;
 /* Crash points of a replica's apply (tsdbd's server/crashpt.h installs the hook: cold-before-apply, cold-mid-intent):

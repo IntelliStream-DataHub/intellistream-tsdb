@@ -446,7 +446,7 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	./$(B)/test_eccold $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(or $(TMPDIR),/tmp)
-	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
 	./$(B)/test_seam $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(or $(TMPDIR),/tmp)

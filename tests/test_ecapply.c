@@ -22,10 +22,13 @@
  * (a COLD whose F is not below its own segment, through the seam ecapply_test_ft: TSDB_ERR_CORRUPT, nothing listed);
  * leaderpower (crashfs: the leader's power fails once its COLD marker committed, before the swap; reopened as a replica
  * it carries the COLD out from the stage_ links jr_cold made durable); power (crashfs power loss at every step of the
- * apply: the old parts or the new set, then the apply ends with the new set).
+ * apply: the old parts or the new set, then the apply ends with the new set); recover (a durable v5 intent with nothing
+ * renamed: rolled forward; with a temporary gone: rolled back and applied again; with an own part gone: rolled back,
+ * DIVERGED); recpower (crashfs power loss at every step of the open that rolls a cut apply forward: it stands).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
- * pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome;
+ * pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge
+ * recnodirsync;
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -1490,14 +1493,28 @@ static int power_child(const char *root, uint64_t last, uint64_t cpos)
     tier_put(R.t);
     _exit(0);
 }
-static int power_run(const char *root, int warmup, int seed, uint64_t last, uint64_t cpos)
+/* the child under crashfs of recpower: the replica's open, which recovers the apply's intent, then a close */
+static int recover_child(const char *root, uint64_t cpos)
+{
+    lt L;
+    lt_paths(&L, root);
+    rt R = {0};
+    snprintf(R.dir, sizeof R.dir, "%s/rep", root);
+    if (ropen(&L, &R, cpos - 1) != 0)
+        _exit(2);
+    power_ack(root, "applied");
+    eng_close(R.db);
+    tier_put(R.t);
+    _exit(0);
+}
+static int power_run_as(const char *mode, const char *root, int warmup, int seed, uint64_t last, uint64_t cpos)
 {
     fflush(NULL);
     char a[24], b[24];
     snprintf(a, sizeof a, "%" PRIu64, last);
     snprintf(b, sizeof b, "%" PRIu64, cpos);
     /* the planted bug goes to the child too: the apply that loses power runs there */
-    char *argv[] = {"test_ecapply", S, "--power-child", (char *)root, a, b, "--mutant", (char *)mutant, NULL};
+    char *argv[] = {"test_ecapply", S, (char *)mode, (char *)root, a, b, "--mutant", (char *)mutant, NULL};
     pid_t pid = fork();
     if (pid == 0) {
         char asan[512], w[16], sd[16];
@@ -1522,6 +1539,10 @@ static int power_run(const char *root, int warmup, int seed, uint64_t last, uint
     if (pid < 0 || waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws))
         return -1;
     return WEXITSTATUS(ws);
+}
+static int power_run(const char *root, int warmup, int seed, uint64_t last, uint64_t cpos)
+{
+    return power_run_as("--power-child", root, warmup, seed, last, cpos);
 }
 /* After a power loss at step k the replica opens with P's old parts listed (no .ec, no settled_) or the new set (the
  * .ec part, Y above it, every retired part under settled_), the rows of P the same either way; the apply then ends
@@ -1627,6 +1648,216 @@ static void test_power(void)
            keep0);
 }
 
+/* ------------------------------------------------------------ recover, recpower: the open's recovery of a v5 intent */
+
+static void mid_exit(eng *db, int which)
+{
+    (void)db;
+    if (which == ECAPPLY_CRASH_MID_INTENT) {
+        fflush(NULL);
+        _exit(99);
+    }
+}
+/* The template of the recovery cases: the leader settled (one object, one Y), the replica applied through cpos - 1 and
+ * closed, then killed in its apply of the COLD right after the .ec renames (cold-mid-intent): the intent durable, N
+ * renamed, Y and R not. Without crashfs every byte the child wrote is on disk for the cases. */
+static bool mid_template(lt *L, uint64_t *last, uint64_t *cpos)
+{
+    rt R;
+    rec_reset();
+    make_replica(L, &R);
+    eccold_cut c;
+    workload(L, &c, false);
+    *last = LAST, *cpos = L->x.cold_fno;
+    lstop(L);
+    if (ropen(L, &R, 0) != 0)
+        return false;
+    CHECK(feed(&R, *cpos - 1) == 0);
+    rstop(&R);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (ropen(L, &R, *cpos - 1) != 0)
+            _exit(2);
+        atomic_store(&ecapply_crash_hook, mid_exit);
+        (void)replica_apply(R.db, *last);
+        _exit(5);
+    }
+    int st = child_status(pid);
+    CHECK(st == 99);
+    if (st != 99)
+        fprintf(stderr, "recover: the apply's child exited %d, wanted the crash point (99)\n", st);
+    char rep[PATH_MAX + 8];
+    snprintf(rep, sizeof rep, "%s/rep", L->root);
+    CHECK(count_names(rep, "txn_") == 1);
+    return st == 99;
+}
+/* the intent in dir: its N and Y names renamed back to their temporaries (nothing renamed, as a cut right after the
+ * intent leaves it); the first N temporary and the first R source to *tmp and *src */
+static bool unrename(const char *dir, char *tmp, char *src, size_t cap)
+{
+    DIR *dd = opendir(dir);
+    struct dirent *de;
+    char in[PATH_MAX + 300] = "";
+    while (dd && (de = readdir(dd)) != NULL)
+        if (!strncmp(de->d_name, "txn_", 4))
+            snprintf(in, sizeof in, "%s/%s", dir, de->d_name);
+    if (dd)
+        closedir(dd);
+    FILE *f = in[0] ? fopen(in, "r") : NULL;
+    if (!f)
+        return false;
+    char line[512];
+    tmp[0] = src[0] = '\0';
+    bool ok = true;
+    while (fgets(line, sizeof line, f)) {
+        char k, a[200], b[200], p[PATH_MAX + 300], q[PATH_MAX + 300];
+        if (sscanf(line, "%c %199s %199s", &k, a, b) != 3 || (k != 'N' && k != 'Y' && k != 'R'))
+            continue;
+        if (k == 'R') {
+            if (!src[0])
+                snprintf(src, cap, "%s", a);
+            continue;
+        }
+        if (k == 'N' && !tmp[0])
+            snprintf(tmp, cap, "%s", a);
+        snprintf(p, sizeof p, "%s/%s", dir, b);
+        snprintf(q, sizeof q, "%s/%s", dir, a);
+        if (access(p, F_OK) == 0 && rename(p, q) != 0)
+            ok = false;
+    }
+    fclose(f);
+    return ok && tmp[0] && src[0];
+}
+/* One copy of the template, its intent's renames undone and `gone` (0: nothing, 1: an N temporary, 2: an R source)
+ * removed, opened: rolled forward (the new set), rolled back (the own parts listed, then the replay applies the COLD
+ * again), or rolled back DIVERGED (an own part is gone: this member no longer holds the rows the COLD replaced). */
+static void recover_one(const char *tmpl, int gone, uint64_t last, uint64_t cpos)
+{
+    static const char *const what[] = {"recover-forward", "recover-tmpgone", "recover-srcgone"};
+    char work[PATH_MAX / 2 + 8], cmd[PATH_MAX * 2], rep[PATH_MAX], tmp[200], src[200], p[PATH_MAX + 256];
+    snprintf(work, sizeof work, "%s-%d", tmpl, gone);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", work, tmpl, work);
+    CHECK(system(cmd) == 0);
+    snprintf(rep, sizeof rep, "%s/rep", work);
+    bool un = unrename(rep, tmp, src, sizeof tmp);
+    CHECK(un);
+    if (!un)
+        return;
+    if (gone) {
+        snprintf(p, sizeof p, "%s/%s", rep, gone == 1 ? tmp : src);
+        CHECK(unlink(p) == 0);
+    }
+    lt W;
+    lt_paths(&W, work);
+    rt Q = {0};
+    snprintf(Q.dir, sizeof Q.dir, "%s", rep);
+    if (ropen(&W, &Q, cpos - 1) != 0) {
+        CHECK(0);
+        fprintf(stderr, "%s: the replica does not open\n", what[gone]);
+        return;
+    }
+    CHECK(count_names(rep, "txn_") == 0);
+    part *ec[8];
+    size_t ne = parts_of(Q.db, KEY, ec, 8, true);
+    unref_all(ec, ne);
+    int st = settled_of_key(rep);
+    bool div = atomic_load(&Q.db->diverged);
+    bool ok = gone == 0 ? ne == 1 && st >= 1 && !div : gone == 1 ? ne == 0 && st == 0 && !div : ne == 0 && div;
+    CHECK(ok);
+    if (!ok)
+        fprintf(stderr, "%s: %zu .ec parts, %d settled_, %sDIVERGED after the open\n", what[gone], ne, st,
+                div ? "" : "not ");
+    if (gone < 2) {
+        CHECK(p_holds(Q.db));
+        CHECK(replica_apply(Q.db, last) == 0); /* RSTATE's `doing`: the decide, and the COLD again where rolled back */
+        check_listed(Q.db, what[gone]);
+        CHECK(p_holds(Q.db) && d1_holds(Q.db, false));
+    }
+    rstop(&Q);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", work);
+    if (!failures)
+        CHECK(system(cmd) == 0);
+}
+static void test_recover(void)
+{
+    lt L;
+    uint64_t last = 0, cpos = 0;
+    if (!start("recover", &L))
+        return;
+    if (mid_template(&L, &last, &cpos))
+        for (int gone = 0; gone < 3; gone++)
+            recover_one(L.root, gone, last, cpos);
+    lclose(&L);
+    printf("  recover: a durable v5 intent with nothing renamed: rolled forward; a temporary gone: rolled back, applied "
+           "again; an own part gone: rolled back, DIVERGED\n");
+}
+/* crashfs power loss at every step of the open that rolls a cut apply forward (cold-mid-intent: N renamed, Y and R
+ * not): the apply stands at every step, the intent goes only once its renames are durable */
+static void test_recpower(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  recpower: skipped (no %s)\n", SHIM);
+        return;
+    }
+    lt L;
+    uint64_t last = 0, cpos = 0;
+    if (!start("recpower", &L))
+        return;
+    if (!mid_template(&L, &last, &cpos)) {
+        lclose(&L);
+        return;
+    }
+    int crashes = 0, f0 = failures, seeds = 6;
+    bool finished = false;
+    char work[PATH_MAX / 2 + 8], cmd[PATH_MAX * 2];
+    snprintf(work, sizeof work, "%s-w", L.root);
+    for (int ks = 0; ks < 400 * seeds && !finished && failures == f0; ks++) {
+        int k = ks / seeds;
+        alarm(240);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", work, L.root, work);
+        CHECK(system(cmd) == 0);
+        int code = power_run_as("--recover-child", work, k, ks + 1, last, cpos);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0) {
+            fprintf(stderr, "recpower: the child at step %d exited %d\n", k, code);
+            break;
+        }
+        crashes += code == 99;
+        finished = code == 0 && ks % seeds == seeds - 1;
+        lt W;
+        lt_paths(&W, work);
+        rt Q = {0};
+        snprintf(Q.dir, sizeof Q.dir, "%s/rep", work);
+        if (ropen(&W, &Q, cpos - 1) != 0) {
+            CHECK(0);
+            fprintf(stderr, "recpower: after a power loss at step %d the replica does not open\n", k);
+            break;
+        }
+        part *ec[8], *rest[8];
+        size_t ne = parts_of(Q.db, KEY, ec, 8, true), nr = parts_of(Q.db, KEY, rest, 8, false);
+        unref_all(ec, ne);
+        unref_all(rest, nr);
+        int st = settled_of_key(Q.dir);
+        bool ok = ne == 1 && nr == 1 && st >= 1 && count_names(Q.dir, "txn_") == 0 && p_holds(Q.db);
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "recpower: step %d seed %d: %zu .ec parts, %zu others, %d settled_\n", k, ks % seeds, ne, nr,
+                    st);
+        CHECK(replica_apply(Q.db, last) == 0);
+        check_listed(Q.db, "recpower");
+        CHECK(p_holds(Q.db) && d1_holds(Q.db, false));
+        rstop(&Q);
+    }
+    CHECK(finished && crashes >= 3);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", work);
+    if (failures == f0)
+        CHECK(system(cmd) == 0);
+    lclose(&L);
+    printf("  recpower: power lost at each of %d steps of the open that rolls a cut apply forward: it stands\n",
+           crashes);
+}
+
 static void alarm_exit(int sig)
 {
     (void)sig;
@@ -1638,7 +1869,7 @@ static void alarm_exit(int sig)
 
 int main(int argc, char **argv)
 {
-    const char *only = NULL, *power_root = NULL, *lpower_root = NULL;
+    const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL;
     uint64_t p_last = 0, p_cpos = 0;
     snprintf(S, sizeof S, "/tmp");
     for (int i = 1; i < argc; i++) {
@@ -1648,6 +1879,8 @@ int main(int argc, char **argv)
             only = argv[++i];
         else if (!strcmp(argv[i], "--power-child") && i + 3 < argc)
             power_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--recover-child") && i + 3 < argc)
+            recover_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--leader-power-child") && i + 1 < argc)
             lpower_root = argv[++i];
         else
@@ -1673,6 +1906,8 @@ int main(int argc, char **argv)
         return power_child(power_root, p_last, p_cpos);
     if (lpower_root)
         return leader_power_child(lpower_root);
+    if (recover_root)
+        return recover_child(recover_root, p_cpos);
     char self[PATH_MAX];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
     self[sl > 0 ? sl : 0] = '\0';
@@ -1688,7 +1923,8 @@ int main(int argc, char **argv)
         void (*fn)(void);
     } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"merging", test_merging},
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
-                 {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power}};
+                 {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
+                 {"recover", test_recover}, {"recpower", test_recpower}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

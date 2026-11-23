@@ -461,6 +461,8 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
                 rc = TSDB_ERR_IO;
             }
         }
+        if (renamed && nec == n + nown) /* nothing followed the .ec renames: the point is after them all the same */
+            crash_at(db, ECAPPLY_CRASH_MID_INTENT);
         if (renamed) {
             for (size_t i = 0; i < nown; i++) {
                 part_ref(own[i]);
@@ -534,7 +536,8 @@ int ecapply_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "ycold", "ecabovey", "pposignored", "v5nodirsync", "coldnoflushthrough",
                                         "leaderswapnors", "pposafterswap", "mergekept", "notfoundzero", "noorder",
-                                        "checkz", "seenskip", "noyhcheck", "decidesome"};
+                                        "checkz", "seenskip", "noyhcheck", "decidesome", "recrollmissing",
+                                        "recnodiverge", "recnodirsync"};
     for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
         if (strcmp(name, names[i]) == 0)
             return i;

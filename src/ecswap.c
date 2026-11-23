@@ -723,14 +723,14 @@ int ecapply_recover(eng *db, const char *name, char *buf, size_t len)
         from_missing |= !r0;
         src_missing |= s[i].kind == 'R' && !r0 && !r1;
     }
-    if (rc == 0 && !renamed && from_missing) {
+    if (rc == 0 && !renamed && from_missing && ecapply_mutant != ECAPPLY_MUT_RECROLLMISSING) {
         fprintf(stderr, "tsdb: cold apply intent %s: nothing of the apply was renamed and %s: it is rolled back%s\n",
                 name, src_missing ? "an own part is gone" : "a temporary is gone",
                 src_missing ? ", the volume is DIVERGED" : "");
         for (size_t i = 0; i < n && rc == 0; i++)
             if (s[i].kind != 'R' && on[i][0] && unlinkat(db->dirfd, s[i].from, 0) != 0 && errno != ENOENT)
                 rc = TSDB_ERR_IO;
-        if (rc == 0 && src_missing)
+        if (rc == 0 && src_missing && ecapply_mutant != ECAPPLY_MUT_RECNODIVERGE)
             rc = ec_diverge(db, key, NULL, EC_DIV_PPOS);
     } else if (rc == 0) {
         for (size_t i = 0; i < n && rc == 0; i++)
@@ -742,7 +742,7 @@ int ecapply_recover(eng *db, const char *name, char *buf, size_t len)
     }
     free(on);
     free(s);
-    if (rc == 0 && db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
+    if (rc == 0 && db->opt.fsync && ecapply_mutant != ECAPPLY_MUT_RECNODIRSYNC && tsdb_fsync(db->dirfd) != 0) {
         fprintf(stderr, "tsdb: cold apply intent %s: fsync of the directory: %s\n", name, strerror(errno));
         rc = TSDB_ERR_IO;
     }
