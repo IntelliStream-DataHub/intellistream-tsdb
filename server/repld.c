@@ -115,232 +115,14 @@
 #include "../src/replfile.h"
 #include "../src/replica.h"
 
-#define TICK_MS 5
-#define COMMIT_STALL_MS 5000 /* the writer says what holds its commit point once it has not moved for this long */
-#define SPILL_BYTES (16u << 20) /* a bulk file above this is received into a file, not memory (r3d review M3) */
-#define INBOX_BYTES (64u << 20) /* a volume's inbox of peer frames: past it the link waits, then drops (M3) */
-#define INBOX_WAIT_MS 500       /* how long a link's thread waits for room (well below a link's dead_ms) */
-#define IDLE_HEARTBEAT_MS 100 /* an idle volume's empty APPEND per peer (r3d review L1: was every tick) */
-_Static_assert(META_ISR_LAG_MIN_MS >= 5 * IDLE_HEARTBEAT_MS, "a live idle member must be heard well within isr_lag_ms");
-#define NOW_EVERY_MS 1000 /* a leader's NOW markers (design-cluster.md 5.4): its replicas' retention clock lags by at most this */
-#define RESEND_MS 50
-#define LOST_MS 500 /* a peer's acknowledged end standing still this long with the cursor ahead: what was sent is lost */
-#define FETCH_LATE_MS 5000 /* fetchlate (tests) */
-#define SYNC_PAUSE_MS 4000 /* syncpause (tests) */
-#define READ_CAP (4u << 20)
-#define SLOW_READ_MS 10  /* slowread (tests): longer than a tick */
-#define SLOW_TICK_MS 20  /* slowtick (tests): a catch-up step that long, at every tick it runs */
-#define LATE_TICK_MS 6   /* latetick (tests): every tick of a writer that much longer: the thread is never current */
-#define TICK_BACKLOG_MS 1000 /* the core's clock catches up at most this much of wall time (vol_main) */
-#define STALL_MS 250 /* a tick wait that returns this late: the process was stopped (SIGSTOP, a VM pause), not busy */
-#define SLOW_ACK_MS 100  /* slowack (tests) */
-#define SLOW_ACK_RING 512
-#define MAX_NODES 64
+#include "repld_int.h"
+#include "rset.h"
+#include "rsnap.h"
+#include "rtransfer.h"
 
-enum { M_REPLICA = 0, M_PROMOTING, M_WRITER, M_DEAD };
-enum { IN_MSG = 1, IN_FETCH, IN_META, IN_WAKE, IN_FENCE };
+struct repld_g G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
-struct item {
-    struct item *next;
-    int kind;
-    uint32_t node;
-    size_t n;
-    uint8_t data[];
-};
-
-struct rpeer {
-    uint64_t sent;     /* the last position whose records went out to it (a WAL record end) */
-    uint64_t want;     /* the core wants it to have up to here */
-    uint64_t sent_ms;  /* when `sent` last moved forward */
-    uint64_t acked;    /* the `durable` of its last ACK in this run: a replica's durable end stops below a COMMIT
-                        * marker whose file it has not staged, so the segment that holds the marker, and with it the
-                        * link the file is fetched from, stays (its `written` passes the marker: replicate) */
-    uint64_t gen;      /* the log link's connection the cursor was moved on */
-    uint64_t wrote, wrote_ms; /* the `written` of its last ACK, and when that last changed */
-    uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
-    int heard;
-    uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
-    int rderr;         /* the last error of a catch-up read for it, and when it was said (never silent, not a flood) */
-    uint64_t rderr_ms;
-};
-
-struct rvol {
-    uint32_t number;
-    char dir[4200];
-    pthread_mutex_t mu; /* the core, the index, the cursors, the inbox; below buf_lock (jr_ops.admit takes it) */
-    pthread_cond_t cv;
-    pthread_t th;
-    int started, stop, mode, failed, set_changed;
-    struct repl *core;
-    struct replfile *rf;
-    struct replfile_state st;
-    struct cluster_vol_rec rec;
-    int self, nnodes;
-    uint64_t epoch; /* the core's, cached for the bytes path */
-    struct rpeer peer[REPL_MAX_NODES];
-    uint64_t open_ms; /* when its driver started: a peer never heard counts as unheard since then */
-    uint64_t resumed_ms; /* when its thread came back from a stall (STALL_MS): peers count as unheard since then */
-    uint64_t loop_ms;    /* when its thread last woke or looped (repld_unreachable) */
-    struct item *in_head, *in_tail;
-    size_t in_bytes;         /* of peer frames in the inbox (bounded: inbox_bytes) */
-    pthread_cond_t in_space; /* a link's thread waits here for room */
-    int in_waiters, in_full; /* in_full: the bound was hit and said, until the inbox empties */
-    /* the index: starts of the WAL records from the log start, ascending; idx_end the last position indexed */
-    uint64_t *idx;
-    size_t nidx, cidx;
-    uint64_t idx_end, log_start;
-    uint64_t trace_ms;
-    struct repl_epoch hist[REPLFILE_MAX_HIST];
-    uint32_t nhist;
-    /* the message being handled */
-    struct rw_msg cur;
-    struct repl_rec *recs;
-    uint32_t *lens;
-    uint32_t crec;
-    uint64_t *coff; /* byte offset of each record of cur */
-    int sync_wanted;
-    uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
-    int rec_short;       /* isr_short_locked of `rec`, counted in G.nshort (rec_set) */
-    int sync_said;       /* noclock's line, once */
-    uint64_t sync_late;  /* synclate: a report op_synced held back for the next tick (0: none) */
-    unsigned sync_n;     /* synclate: the reports op_synced has had */
-    uint64_t cstall_at, cstall_ms; /* the writer: the commit point and since when it has not moved with writes above it */
-    int cstall_said;
-    uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
-    uint64_t fetch_ms;
-    char fetch_name[RW_NAME_MAX + 1];
-    uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
-    uint64_t sync_pause_end;                /* syncpause (tests): a replica's syncs wait until then */
-    uint64_t cu_next;                       /* a late tick runs a catch-up step only from then on (vol_main) */
-    int sync_paused;                        /* syncpause: a SYNC waits for sync_pause_end */
-    char fetch_late_name[RW_NAME_MAX + 1];
-    struct jr_ops ops;
-    /* the ISR change the core asked the metadata group for (REPL_M_ISR_REQ), reported in this server's heartbeats
-     * (repld_isr_requests) while the record still is the request's basis */
-    int isr_want;
-    struct repl_vmeta isr_req;
-    uint64_t resigned; /* the epoch a RESIGN was said for */
-    uint64_t nofence_said; /* tests (nofencereply): the epoch whose withheld fence answer was said */
-    uint32_t fence_from; /* the Raft leader whose FENCE the core is answering (its reply goes there) */
-    /* min_isr after the append: a write admitted while the ISR was large enough, whose commit point is reached only
-     * after a shrink below min_isr, is not acknowledged (the core's REPLY waits the same way, but the writer's waiters
-     * go by APPLY): the commit point is held here and handed to the engine once the ISR is back at min_isr */
-    uint64_t held_commit;
-    int short_said;
-    int snap_said; /* the SNAPSHOT notice was said */
-    /* slowack (tests): the durable ends of its last ACKs and when they were sent; the one it reported last */
-    uint64_t sa_ms[SLOW_ACK_RING], sa_dur[SLOW_ACK_RING], sa_last;
-    unsigned sa_n;
-};
-
-enum {
-    RM_NONE,
-    RM_COMMITBYLEADER,
-    RM_ACKBEFORESYNC,
-    RM_FLOORNOTSAVED,
-    RM_NODEPOSE,
-    RM_NOQUIESCE,
-    RM_NOFASTPATH,
-    RM_FLOORNOTTOLD,
-    RM_HBNOCLAMP,
-    RM_UNSUREIGNORED,
-    RM_ADMITNOCHECK,
-    RM_NOCURSORUP,
-    RM_COMMITPASTREMOVED,
-    RM_NOMINISR,
-    RM_ACKBELOWMINISR,
-    RM_SHIPPERFILE,
-    RM_NOCAP,
-    RM_NOSEAL,
-    RM_NOSPILL,
-    RM_NOINBOXBOUND,
-    RM_KEEPIGNORESPEERS,
-    RM_NOLOGSTARTCHECK,
-    RM_STOPNODEPOSE,
-    RM_LATECLOCK,
-    RM_SYNCBYREP,
-    RM_INBOXWAITALL,
-    RM_SHIPNOISR,
-    RM_KEEPWRITTEN,
-    RM_FASTRIDE,
-    RM_NOJOINHOLD,
-    RM_KEEPUNANSWERED, /* unanswered_ticks 0: a member a promotion kept unanswered goes only by the lag rule */
-    RM_FENCENOSYNC,    /* a SAVE that raises the fence skipped: the FENCE_REPLY goes out, the fence not in REPL */
-    RM_INBOXSTARVE,
-    RM_OPENNOHOLD,
-    RM_PROMOTENONE, /* a driver promoting reports role NONE: a slow promotion is taken for deposed (F3) */
-    RM_TICKSTRETCH,
-    RM_STEPCURRENTONLY,
-    RM_STALLCATCHUP,
-    RM_DEMOTESTALEIDX, /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
-    RM_DIVERGEISR      /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
-};
-
-static struct {
-    uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
-    int nshort; /* (atomic) the volumes whose record has an ISR below min_isr: 0, and repld_isr_short asks nothing more */
-    pthread_mutex_t mu;
-    tsdb *t;
-    char dir[4096];
-    struct peerlink *pl;
-    uint32_t self;
-    struct {
-        uint32_t node;
-        char addr[META_ADDR_MAX];
-        struct plink *log, *bulk;
-    } nodes[MAX_NODES];
-    uint32_t nn;
-    struct rvol *vols[CLUSTER_REPORT_VOLS];
-    uint32_t nvols;
-    uint64_t fileno;
-    int mutant; /* RM_*: tests only */
-    uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
-    int spill_said;
-    size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
-    int cut_links;      /* TSDB_REPLD_TEST=cutlinks: a message of any volume from node N is dropped as it arrives while
-                         * <dir>/cutfrom.N exists (test_cluster cut) */
-    int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a
-                           stalled disk's stand-in), until repld_stop (test_cluster stallstop) */
-    int drop_bulk; /* TSDB_REPLD_TEST=dropbulk (a fault, tests only): the first bulk file received is not staged */
-    int promote_wait; /* TSDB_REPLD_TEST=promotewait (tests only): 1 s between the promotion's swap and M_WRITER */
-    int promote_slow; /* TSDB_REPLD_TEST=promoteslow (tests only): 5 s before the promotion's swap, a slow reopen */
-    int open_slow;    /* TSDB_REPLD_TEST=openslow (tests only): 3 s between the engine's open and the manager's MV_OPEN */
-    int late_wal; /* TSDB_REPLD_TEST=latewal (tests only): repld_stop leaves its writers in place and waits 2.5 s after
-                   * freeing the links, and a stopped driver admits records whatever its lease, so the engine's NOW
-                   * markers reach the WAL hooks of a stopped driver (op_bytes says so once) */
-    _Atomic int said_late; /* latewal's line, once */
-    int late_bytes;   /* TSDB_REPLD_TEST=latebytes: the writer's first rows record written while <dir>/latebytes exists
-                       * is held in op_bytes (written, not yet indexed or shipped) until a demote has begun (deposetail) */
-    _Atomic int late_bytes_done;
-    int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
-    int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
-    int no_fetch;     /* TSDB_REPLD_TEST=nofetch: a replica sends no FETCH and says once per name that it withholds it */
-    int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
-                       * ACKs carry the durable end the core opened with that long (reopenhold) */
-    int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
-                       * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
-    int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so
-                   * only the clients' writes move its WAL (writersync), and says once when a SYNC finds the WAL
-                   * durable past the core's durable end */
-    int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
-    int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
-    int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
-    int plant_diverge; /* TSDB_REPLD_TEST=plantdiverge (tests only): <dir>/diverge.<volume> makes that volume DIVERGED
-                        * (ec_diverge, EC_DIV_TEST) at the driver's next tick, and is removed */
-    int no_fence_reply; /* TSDB_REPLD_TEST=nofencereply (tests only): no FENCE_REPLY leaves while <dir>/nofencereply
-                         * exists (the fence is saved; a member that dies before its answer is out) */
-    int slow_read;    /* TSDB_REPLD_TEST=slowread: every catch-up read takes SLOW_READ_MS more (a slow disk, NFS) */
-    int slow_tick;    /* TSDB_REPLD_TEST=slowtick: a writer's catch-up step takes SLOW_TICK_MS at every tick it runs,
-                       * lagging peer or not (tickwall) */
-    int late_tick;    /* TSDB_REPLD_TEST=latetick: every tick of a writer takes LATE_TICK_MS more, so its ticks are always
-                       * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
-    int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
-                       * replica: what it reports trails the leader's end even while it keeps up) */
-    struct rin *ins; /* bulk files being received */
-} G = {.mu = PTHREAD_MUTEX_INITIALIZER};
-
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void say(const char *fmt, ...)
+void say(const char *fmt, ...)
 {
     char b[1024];
     va_list ap;
@@ -357,7 +139,7 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-static struct rvol *vol_find(uint32_t number)
+struct rvol *vol_find(uint32_t number)
 {
     struct rvol *rv = NULL;
     pthread_mutex_lock(&G.mu);
@@ -571,8 +353,10 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
     if (m->to < 0 || (uint32_t)m->to >= rv->rec.nrep)
         return; /* the metadata group's messages go through the cluster thread (ISR changes: not wired yet) */
     struct plink *l = link_of(rv->rec.rep[m->to].node, 0);
+    struct repl_msg sm = *m;
+    rset_stamp(rv, &sm);
     uint8_t b[RW_HEAD];
-    size_t n = rw_encode_msg(b, sizeof b, rv->number, m, NULL, 0, 0, NULL, 0);
+    size_t n = rw_encode_msg(b, sizeof b, rv->number, &sm, NULL, 0, 0, NULL, 0);
     if (l && n)
         plink_send(l, RW_T_MSG, b, n, 0);
 }
@@ -682,6 +466,7 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
     struct repl_msg m = {.type = REPL_M_APPEND, .from = rv->self, .to = to, .epoch = repl_epoch(rv->core),
                          .leader = rv->self, .prev_pos = first - 1, .prev_epoch = epoch_at(rv, first - 1),
                          .commit = repl_commit(rv->core), .nrec = nrec, .rec = rv->recs, .meta.leader = -1};
+    rset_stamp(rv, &m);
     size_t cap = rw_msg_size(nrec, len);
     if (cap > PL_FRAME_MAX) {
         if (nrec == 1) /* never sent, so never committed: a backstop for jr_rec_max_rows (src/internal.h) */
@@ -833,6 +618,11 @@ static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
      * that window is refused for a retry, never taken as a sign that this node no longer leads (that deposed the
      * fresh leader for good) */
     if (rv->mode == M_PROMOTING) {
+        pthread_mutex_unlock(&rv->mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    /* a planned transfer drains (rtransfer.c, D14): refused for a retry, definite (never admitted) */
+    if (rv->mode == M_WRITER && !rtr_admit_ok(rv)) {
         pthread_mutex_unlock(&rv->mu);
         return TSDB_ERR_UNAVAILABLE;
     }
@@ -1169,6 +959,8 @@ static struct rin *rin_find(struct plink *l, uint64_t file, int unlink_it)
 static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, size_t meta_len, uint64_t total,
                     uint64_t *resume, int *prefix_fd)
 {
+    if (plink_kind(l) == PL_KIND_SNAP) /* a snapshot's file: rsnap.c's (D7, D18) */
+        return rsnap_bin_open(arg, l, file, meta, meta_len, total, resume, prefix_fd);
     (void)arg;
     struct rin *r = calloc(1, sizeof *r);
     uint64_t size;
@@ -1211,10 +1003,11 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     return 0;
 }
 
-static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n);
 
 static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, const void *p, size_t n)
 {
+    if (plink_kind(l) == PL_KIND_SNAP)
+        return rsnap_bin_data(arg, l, file, off, p, n);
     (void)arg;
     pthread_mutex_lock(&G.mu);
     struct rin *r = rin_find(l, file, 0);
@@ -1261,6 +1054,10 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
 
 static void bin_end(void *arg, struct plink *l, uint64_t file, int status)
 {
+    if (plink_kind(l) == PL_KIND_SNAP) {
+        rsnap_bin_end(arg, l, file, status);
+        return;
+    }
     (void)arg, (void)status;
     pthread_mutex_lock(&G.mu);
     struct rin *r = rin_find(l, file, 1);
@@ -1270,7 +1067,7 @@ static void bin_end(void *arg, struct plink *l, uint64_t file, int status)
 
 /* ------------------------------------------------------------------ the inbox */
 
-static int peer_kind(int kind) { return kind == IN_MSG || kind == IN_FETCH; }
+static int peer_kind(int kind) { return kind == IN_MSG || kind == IN_FETCH || kind == IN_SNAP; }
 
 /* the volume's thread took `it` off the inbox */
 static void inbox_took(struct rvol *rv, const struct item *it)
@@ -1336,7 +1133,7 @@ static int inbox_room(struct rvol *rv, size_t need)
     return 0;
 }
 
-static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
+void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
 {
     struct item *it = malloc(sizeof *it + n);
     if (!it)
@@ -1365,6 +1162,10 @@ static void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     (void)arg;
+    if (plink_kind(l) == PL_KIND_SNAP) { /* a snapshot's control frame: rsnap.c posts what it keeps (IN_SNAP) */
+        rsnap_frame(l, type, p, n);
+        return;
+    }
     uint32_t volume;
     if (type == RW_T_MSG && n >= 8)
         memcpy(&volume, p + 4, 4);
@@ -1426,7 +1227,7 @@ static int promote_fn(void *ctx, struct eng **old, struct eng **neu)
 
 /* Saves REPL with the core's fence, led and floor, the driver's log start and epoch history. Under rv->mu, which it
  * lets go of for the write. */
-static int save_repl(struct rvol *rv, uint64_t fence, uint64_t led, uint64_t floor)
+int save_repl(struct rvol *rv, uint64_t fence, uint64_t led, uint64_t floor)
 {
     rv->st.fence = fence;
     rv->st.led = led;
@@ -1705,11 +1506,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
     case REPL_A_FAIL:
         vol_fail(rv, a->reason ? a->reason : "the core failed");
         break;
-    case REPL_A_SNAPSHOT:
-        if (!rv->snap_said) /* the core repeats the notice until the replica catches up: said once per open */
-            say("volume %" PRIu32 ": the leader no longer has the records this replica needs: it needs a snapshot (not"
-                " built yet); it stays a learner", rv->number);
-        rv->snap_said = 1;
+    case REPL_A_SNAPSHOT: /* the core repeats the notice until the replica catches up */
+        rsnap_need(rv, (int)a->pos);
         break;
     }
     tsdb_cvol_unref(&db);
@@ -1735,7 +1533,7 @@ static int isr_short_locked(const struct rvol *rv)
 
 /* rv->rec = *r (rv->mu held, or the volume not yet listed), with G.nshort kept: the write path's check of min_isr
  * (repld_isr_short, every write request) takes no lock while no volume is short (r3d-isr review M3) */
-static void rec_set(struct rvol *rv, const struct cluster_vol_rec *r)
+void rec_set(struct rvol *rv, const struct cluster_vol_rec *r)
 {
     rv->rec = *r;
     int s = isr_short_locked(rv);
@@ -1800,6 +1598,7 @@ static void handle(struct rvol *rv, struct item *it)
             return;
         memcpy(&fence, it->data, sizeof fence);
         struct repl_msg m = {.type = REPL_M_FENCE, .from = REPL_META, .to = rv->self, .epoch = fence, .leader = -1};
+        rset_stamp(rv, &m);
         rv->fence_from = it->node;
         repl_recv(rv->core, &m);
         drain(rv);
@@ -1809,9 +1608,25 @@ static void handle(struct rvol *rv, struct item *it)
         struct repl_msg m = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
         m.meta = vmeta_of(rv);
         m.epoch = m.meta.epoch;
+        rset_stamp(rv, &m);
         repl_recv(rv->core, &m);
         drain(rv);
         isr_meta(rv);
+        return;
+    }
+    if (it->kind == IN_SNAP) {
+        rsnap_in(rv, it->node, it->data, it->n);
+        return;
+    }
+    if (it->kind == IN_CMD) { /* a VOLCMD of the Raft leader (cluster.h struct cluster_volcmd) */
+        struct cluster_volcmd c;
+        if (it->n != sizeof c)
+            return;
+        memcpy(&c, it->data, sizeof c);
+        if (c.kind == CL_VOLCMD_DROP_MEMBER)
+            rset_cmd(rv, &c);
+        else if (c.kind == CL_VOLCMD_TRANSFER || c.kind == CL_VOLCMD_CANCEL)
+            rtr_cmd(rv, &c);
         return;
     }
     int from = node_index(rv, it->node);
@@ -1858,6 +1673,10 @@ static void handle(struct rvol *rv, struct item *it)
     if (rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec) != 0 || rv->cur.volume != rv->number ||
         rv->cur.m.from != from || rv->cur.m.to != rv->self)
         return; /* not a message of this volume from that peer: dropped */
+    if (!rset_msg_ok(rv, &rv->cur.m)) {
+        rv->cur.m.nrec = 0;
+        return; /* another replica set version (rset.c) */
+    }
     if (G.cut_links) { /* a data link cut both ways when each end has the other's file (the peer port stays) */
         char f[sizeof G.dir + 32];
         snprintf(f, sizeof f, "%s/cutfrom.%" PRIu32, G.dir, rv->rec.rep[from].node);
@@ -2165,6 +1984,8 @@ static void *vol_main(void *arg)
             if (stretch ? next_tick < now : next_tick + TICK_BACKLOG_MS < now)
                 next_tick = stretch ? now + TICK_MS : now - TICK_BACKLOG_MS; /* a longer stall: that much is caught up */
             drain(rv);
+            rsnap_tick(rv);
+            rtr_tick(rv);
             if (G.late_tick && rv->mode == M_WRITER) {
                 pthread_mutex_unlock(&rv->mu);
                 struct timespec lt = {0, LATE_TICK_MS * 1000000L};
@@ -2567,10 +2388,8 @@ void repld_update(const struct cluster_vol_rec *r)
         same = r->rep[i].node == rv->rec.rep[i].node; /* a rid is filled in at its first open */
     if (same)
         rec_set(rv, r); /* the replica set is fixed for a volume's driver (a move: r3e and later) */
-    else if (!rv->set_changed) { /* a member's cursor and acks must never pass to another node: ignored, said once */
-        rv->set_changed = 1;
-        say("volume %" PRIu32 ": its replica set changed; this driver keeps the old one until a restart", r->number);
-    }
+    else
+        rset_change(rv, r);
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
@@ -2582,6 +2401,14 @@ void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from)
     struct rvol *rv = vol_find(v);
     if (rv && fence)
         post(rv, IN_FENCE, from, &fence, sizeof fence);
+}
+
+void repld_volcmd(void *arg, const struct cluster_volcmd *c, uint32_t from)
+{
+    (void)arg;
+    struct rvol *rv = vol_find(c->volume);
+    if (rv)
+        post(rv, IN_CMD, from, c, sizeof *c);
 }
 
 int repld_isr_short(uint32_t v)
@@ -2759,6 +2586,7 @@ void repld_stop(void)
         if (rv->started)
             pthread_join(rv->th, NULL);
         rv->started = 0;
+        rsnap_stop(rv);
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
         if (db && rv->mode == M_WRITER && G.mutant != RM_STOPNODEPOSE && !G.late_wal)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */

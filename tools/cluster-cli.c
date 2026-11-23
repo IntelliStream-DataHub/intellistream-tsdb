@@ -37,6 +37,9 @@ static const char cl_help[] =
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
     "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
+    "       tsdb cluster volume transfer PEER VOLUME NODE --secret-file F\n"
+    "       tsdb cluster volume move PEER VOLUME --log --from NODE --to NODE [--cancel] --secret-file F\n"
+    "       tsdb cluster replica reset PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
        "       tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
     "       tsdb cluster help\n"
@@ -62,6 +65,13 @@ static const char cl_help[] =
     "                      UNAVAILABLE NO_OWNER), makes the replica on node NODE its leader. Unclean: writes\n"
     "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
     "                      end beside the commit point of the last ISR shrink.\n"
+    "  volume transfer PEER VOLUME NODE  hands the leadership of volume number VOLUME to NODE, an in-sync copy:\n"
+    "                      writes pause while the leader drains to it (at most --transfer-wait-ms). Not built yet.\n"
+    "  volume move PEER VOLUME --log --from A --to B  moves the copy on node A to node B: B is added and filled,\n"
+    "                      then A is removed (--log: B catches up from the log and a snapshot; --cancel stops a\n"
+    "                      move that has not removed A yet). Not built yet.\n"
+    "  replica reset PEER VOLUME NODE  gives the copy on NODE (neither the leader nor in sync) a new identity: its\n"
+    "                      directory is set aside as v<N>.lost-<rid> and it is rebuilt from a snapshot. Not built yet.\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
     "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
     "\n"
@@ -89,6 +99,11 @@ static const char cl_help[] =
     "    --repl-retain-mb MB     log kept for a copy that fell behind, at most [4096]\n"
     "    --repl-retain-s S       and for at most this long [1800]\n"
     "    --idle-seal-ms MS       an idle leader closes its log segment after this [1000] (at least 100)\n"
+    "    --rebuild-mb-s MB       a snapshot's send rate per link [200]\n"
+    "    --rebuild-max N         snapshots sent and received per server at once [2] (at most 16)\n"
+    "    --transfer-wait-ms MS   a leader transfer's drain, at most [2000] (100 to 60000)\n"
+    "    --leader-balance-s S    leadership goes back to a volume's first server once it has been in sync this\n"
+    "                            long [0: off] (at most 86400)\n"
     "  In this preview the settings are stored and shown by status; nothing acts on the replication, failover and\n"
     "  volume ones yet.\n";
 
@@ -147,9 +162,11 @@ static void print_status(const struct cluster_status *st)
     if (m.initialised)
         printf("replicated lease_ms %" PRIu32 " drift_ppm %" PRIu32 " unanswered_ms %" PRIu32
                " commit_interval_ms %" PRIu32 " repl_retain_mb %" PRIu32 " repl_retain_s %" PRIu32
-               " idle_seal_ms %" PRIu32 "\n",
+               " idle_seal_ms %" PRIu32 " rebuild_mb_s %" PRIu32 " rebuild_max %" PRIu32 " transfer_wait_ms %" PRIu32
+               " leader_balance_s %" PRIu32 "\n",
                m.set.lease_ms, m.set.drift_ppm, m.set.unanswered_ms, m.set.commit_interval_ms,
-               m.set.repl_retain_mb, m.set.repl_retain_s, m.set.idle_seal_ms);
+               m.set.repl_retain_mb, m.set.repl_retain_s, m.set.idle_seal_ms, m.set.rebuild_mb_s, m.set.rebuild_max,
+               m.set.transfer_wait_ms, m.set.leader_balance_s);
     else
         printf("cluster %s (not initialised)\n", u);
     raft_config cfg = {0};
@@ -247,6 +264,8 @@ int cluster_cli(int argc, char **argv)
     const char *verb = argv[1], *addr = NULL, *newpeer = NULL, *secret_file = NULL;
     const char *superuser = NULL, *pwfile = NULL;
     uint32_t force_vol = 0, force_node = 0; /* volume force-leader */
+    int r4op = 0;                                         /* volume transfer, volume move, replica reset */
+    uint32_t r4_vol = 0, r4_node = 0, mv_from = 0, mv_to = 0, mv_flags = 0;
     int i = 2;
     if (!strcmp(verb, "user"))
         return cluster_user_cli(argc, argv);
@@ -255,6 +274,19 @@ int cluster_cli(int argc, char **argv)
             return cl_usage();
         addr = argv[3];
         newpeer = argv[4];
+        i = 5;
+    } else if ((!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "transfer")) ||
+               (!strcmp(verb, "replica") && argc >= 6 && !strcmp(argv[2], "reset"))) {
+        addr = argv[3];
+        if (num("VOLUME", argv[4], &r4_vol) != 0 || num("NODE", argv[5], &r4_node) != 0)
+            return 2;
+        r4op = !strcmp(verb, "replica") ? CLUSTER_OP_REPLICA_RESET : CLUSTER_OP_VOLUME_TRANSFER;
+        i = 6;
+    } else if (!strcmp(verb, "volume") && argc >= 5 && !strcmp(argv[2], "move")) {
+        addr = argv[3];
+        if (num("VOLUME", argv[4], &r4_vol) != 0)
+            return 2;
+        r4op = CLUSTER_OP_VOLUME_MOVE;
         i = 5;
     } else if (!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "force-leader")) {
         addr = argv[3];
@@ -300,7 +332,10 @@ int cluster_cli(int argc, char **argv)
                 {"--commit-interval-ms", &s.commit_interval_ms},
                 {"--repl-retain-mb", &s.repl_retain_mb},
                 {"--repl-retain-s", &s.repl_retain_s},
-                {"--idle-seal-ms", &s.idle_seal_ms}};
+                {"--idle-seal-ms", &s.idle_seal_ms},
+                {"--rebuild-mb-s", &s.rebuild_mb_s},
+                {"--rebuild-max", &s.rebuild_max},
+                {"--transfer-wait-ms", &s.transfer_wait_ms}};
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--secret-file") && i + 1 < argc) {
             secret_file = argv[++i];
@@ -331,6 +366,27 @@ int cluster_cli(int argc, char **argv)
             i++;
             continue;
         }
+        if (r4op == CLUSTER_OP_VOLUME_MOVE && (!strcmp(argv[i], "--log") || !strcmp(argv[i], "--cancel"))) {
+            mv_flags |= !strcmp(argv[i], "--log") ? CLUSTER_MOVE_LOG : CLUSTER_MOVE_CANCEL;
+            continue;
+        }
+        if (r4op == CLUSTER_OP_VOLUME_MOVE && i + 1 < argc && (!strcmp(argv[i], "--from") || !strcmp(argv[i], "--to"))) {
+            if (num(argv[i], argv[i + 1], !strcmp(argv[i], "--from") ? &mv_from : &mv_to) != 0)
+                return 2;
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc && !strcmp(argv[i], "--leader-balance-s")) { /* 0 is off */
+            char *end;
+            unsigned long v = strtoul(argv[i + 1], &end, 10);
+            if (!argv[i + 1][0] || *end || v > 86400) {
+                fprintf(stderr, "tsdb cluster: --leader-balance-s %s: expected 0 (off) to 86400\n", argv[i + 1]);
+                return 2;
+            }
+            s.leader_balance_s = (uint32_t)v;
+            i++;
+            continue;
+        }
         if (!strcmp(verb, "volume") && i + 1 < argc && !strcmp(argv[i], "--replicas")) {
             if (num(argv[i], argv[i + 1], &replicas) != 0)
                 return 2;
@@ -357,6 +413,14 @@ int cluster_cli(int argc, char **argv)
     if (!secret_file) {
         fprintf(stderr, "tsdb cluster: --secret-file is required (the cluster's secret, as tsdbd's "
                         "--cluster-secret-file)\n");
+        return 2;
+    }
+    if (r4op == CLUSTER_OP_VOLUME_MOVE && (!(mv_flags & CLUSTER_MOVE_LOG) || !mv_from || !mv_to || mv_from == mv_to)) {
+        fprintf(stderr, "tsdb cluster volume move: --log, --from NODE and --to NODE (another node) are required\n");
+        return 2;
+    }
+    if (s.rebuild_max > 16 || s.transfer_wait_ms < 100 || s.transfer_wait_ms > 60000) {
+        fprintf(stderr, "tsdb cluster: --rebuild-max is at most 16, --transfer-wait-ms 100 to 60000\n");
         return 2;
     }
     if (s.heartbeat_ms >= s.node_timeout_ms || s.min_isr > s.replication) {
@@ -392,6 +456,10 @@ int cluster_cli(int argc, char **argv)
         req[1] = (uint8_t)(n >> 8);
         memcpy(req + 2, newpeer, n);
         rl = 2 + n;
+    } else if (r4op) {
+        op = r4op;
+        rl = op == CLUSTER_OP_VOLUME_MOVE ? cluster_volume_move_encode(r4_vol, mv_from, mv_to, mv_flags, req)
+                                          : cluster_volume_force_encode(r4_vol, r4_node, req);
     } else if (force_vol) {
         op = CLUSTER_OP_VOLUME_FORCE;
         rl = cluster_volume_force_encode(force_vol, force_node, req);
@@ -423,8 +491,8 @@ int cluster_cli(int argc, char **argv)
             continue;
         }
         if (rc != 0) {
-            if (op == CLUSTER_OP_VOLUME_FORCE && len)
-                fprintf(stderr, "tsdb cluster volume force-leader: %.*s\n", (int)len, (const char *)reply);
+            if ((op == CLUSTER_OP_VOLUME_FORCE || r4op) && len)
+                fprintf(stderr, "tsdb cluster %s %s: %.*s\n", verb, argv[2], (int)len, (const char *)reply);
             fprintf(stderr, "tsdb cluster %s: %s\n", verb, cluster_strerror(rc));
             free(reply);
             return 1;
@@ -443,7 +511,7 @@ int cluster_cli(int argc, char **argv)
             for (size_t k = 0; k < 4 && k < len; k++)
                 number |= (uint32_t)reply[k] << (8 * k);
             printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
-        } else if (op == CLUSTER_OP_VOLUME_FORCE) {
+        } else if (op == CLUSTER_OP_VOLUME_FORCE || r4op) {
             printf("%.*s\n", (int)len, (const char *)reply);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);

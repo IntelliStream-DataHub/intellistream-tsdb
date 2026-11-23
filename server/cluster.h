@@ -65,7 +65,15 @@ enum cluster_admin_op {
      * u32 n, n x {u32 member, u64 applied} (the members below the index after wait_ms). CLUSTER_ERR_STATE: a leader
      * without the lease (a new one, or one cut off): try again. */
     CLUSTER_OP_USER_SYNC = 9,
+    /* R4 (design-cluster-data.md §6.2; R4 plan D10, D13, D14), on the Raft leader; server/ctransfer.c, cmove.c and
+     * cset.c (stubs: META_ERR_INVALID "not built"). Reply: text for the operator. TRANSFER: body u32 volume, u32 node
+     * (the new leader, an ISR member). MOVE: body u32 volume, u32 from, u32 to, u32 flags (CLUSTER_MOVE_LOG, required
+     * until R8 adds positions; CLUSTER_MOVE_CANCEL). RESET: body u32 volume, u32 node (neither leader nor in the ISR). */
+    CLUSTER_OP_VOLUME_TRANSFER = 10,
+    CLUSTER_OP_VOLUME_MOVE = 11,
+    CLUSTER_OP_REPLICA_RESET = 12,
 };
+enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -181,17 +189,33 @@ int cluster_set_peerlink_kind(int kind, struct peerlink *pl);
  * a volume whose leader is gone; the cluster thread hands it to the handler (repld_fence), whose core saves the fence
  * before it answers. The answer, and a restarted leader's RESIGN, go back through cluster_vol_msg (any thread: queued
  * and sent by the cluster thread, to `to`, or the Raft leader when 0). */
-enum { CL_VMSG_FENCE_REPLY = 1, CL_VMSG_RESIGN = 2 };
+/* READY (R4 plan D14): a volume leader's planned transfer drained; `epoch` its epoch, `durable` the end every write it
+ * admitted lies below and the target acknowledged durable, `rid` the target node (server/ctransfer.c's ctr_ready). */
+enum { CL_VMSG_FENCE_REPLY = 1, CL_VMSG_RESIGN = 2, CL_VMSG_READY = 3 };
 struct cluster_vmsg {
     uint8_t kind;
     uint32_t volume;
-    uint64_t epoch; /* FENCE_REPLY: the fence answered; RESIGN: the epoch resigned */
+    uint64_t epoch; /* FENCE_REPLY: the fence answered; RESIGN: the epoch resigned; READY: the leader's epoch */
     uint64_t durable, last_epoch, rid, start;
     uint32_t to;
 };
 void cluster_vol_msg(const struct cluster_vmsg *m);
 typedef void (*cluster_fence_fn)(void *arg, uint32_t volume, uint64_t fence, uint32_t from);
 void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
+/* VOLCMD (R4): the Raft leader's command to a volume's member, frame F_VOLCMD {u8 kind, u32 volume, u64 epoch, u32 node,
+ * u64 arg}: TRANSFER (to the volume leader: drain and report READY for a transfer to `node`), DROP_MEMBER (a move's
+ * shrink of `node`), CANCEL (a transfer is off: admit again). Handed to the handler (repld_volcmd) by the cluster
+ * thread; sent by server/ctransfer.c and cmove.c (cluster_int.h cl_volcmd_send). */
+enum { CL_VOLCMD_TRANSFER = 1, CL_VOLCMD_DROP_MEMBER = 2, CL_VOLCMD_CANCEL = 3 };
+struct cluster_volcmd {
+    uint8_t kind;
+    uint32_t volume;
+    uint64_t epoch; /* the volume's epoch the command is for */
+    uint32_t node;
+    uint64_t arg;
+};
+typedef void (*cluster_volcmd_fn)(void *arg, const struct cluster_volcmd *c, uint32_t from);
+void cluster_set_volcmd_handler(cluster_volcmd_fn fn, void *arg);
 /* What a peerlink needs to dial and answer as this server (any thread, after cluster_start). 0, or -1 while this
  * server is in no cluster yet (id 0). */
 struct cluster_self {
@@ -421,6 +445,8 @@ void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *cons
 /* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
 size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out); /* 8 bytes */
+/* The bodies of VOLUME_TRANSFER and REPLICA_RESET (8 bytes, as VOLUME_FORCE's) and VOLUME_MOVE (16 bytes). */
+size_t cluster_volume_move_encode(uint32_t volume, uint32_t from, uint32_t to, uint32_t flags, uint8_t *out);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

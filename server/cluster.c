@@ -98,6 +98,7 @@
  */
 #define _GNU_SOURCE
 #include "cluster.h"
+#include "cluster_int.h"
 
 #include "meta.h"
 #include "peerlink.h"
@@ -134,7 +135,8 @@
 #define CL_MAGIC PL_CL_MAGIC /* "TSDC" */
 #define CL_VERSION PL_CL_VERSION /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; 4: the link
                       * kind in HELLO (data links, peerlink.h); 5: HBS_LEASE, HBS_UNREACH and
-                      * the lease fields of HB_ACK; 6: replwire RW_VERSION 2; peers of another
+                      * the lease fields of HB_ACK; 6: replwire RW_VERSION 2, and R4's F_VOLCMD and
+                      * VOLMSG READY (one release: dev clusters are initialised again); peers of another
                       * version are refused (no mixed versions) */
 #define RING 4096
 #define RING_BYTES (64ull << 20) /* the ring's entries hold at most this many bytes (a user's blob is up to 1 MiB, and every
@@ -173,6 +175,7 @@ enum {
     F_PROBE_REPLY,
     F_FENCE,  /* Raft leader -> member: u32 volume, u64 fence (promotion, 6.2) */
     F_VOLMSG, /* member -> Raft leader (or the fence's sender): cluster_vmsg */
+    F_VOLCMD, /* Raft leader -> member: struct cluster_volcmd (R4: transfer, a move's drop, cancel) */
 };
 
 /* the sections of a heartbeat (after its address fields) */
@@ -1875,6 +1878,7 @@ void cluster_set_peerlink(struct peerlink *pl)
 {
     cluster_set_peerlink_kind(PL_KIND_LOG, pl);
     cluster_set_peerlink_kind(PL_KIND_BULK, pl);
+    cluster_set_peerlink_kind(PL_KIND_SNAP, pl); /* snapshots (R4 D7): repld.c hands them to rsnap.c */
 }
 
 /* ---- the metadata copy as one snapshot (cluster.h "the whole metadata copy")
@@ -3852,6 +3856,15 @@ size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out)
     return 8;
 }
 
+size_t cluster_volume_move_encode(uint32_t volume, uint32_t from, uint32_t to, uint32_t flags, uint8_t *out)
+{
+    const uint32_t v[4] = {volume, from, to, flags};
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = (uint8_t)(v[i] >> (8 * j));
+    return 16;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -4775,6 +4788,9 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_USER_GET: admin_user_get(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_FORCE: admin_volume_force(c, reqid, r); break;
     case CLUSTER_OP_USER_SYNC: admin_user_sync(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_TRANSFER: ctr_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
+    case CLUSTER_OP_VOLUME_MOVE: cmove_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
+    case CLUSTER_OP_REPLICA_RESET: cset_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -4980,6 +4996,7 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
 
 static void on_fence(struct conn *c, struct rd *r);
 static void on_volmsg(struct conn *c, struct rd *r);
+static void on_volcmd(struct conn *c, struct rd *r);
 
 static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
 {
@@ -5009,6 +5026,7 @@ static void on_frame(struct conn *c, uint8_t type, const uint8_t *p, size_t n)
     case F_PROBE_REPLY: on_probe_reply(c, &r); break;
     case F_FENCE: on_fence(c, &r); break;
     case F_VOLMSG: on_volmsg(c, &r); break;
+    case F_VOLCMD: on_volcmd(c, &r); break;
     default: c->dead = 1; break;
     }
 }
@@ -5780,6 +5798,8 @@ struct promo {
     uint32_t vol, old;
     uint64_t epoch, version;
     uint8_t reason;
+    uint32_t target;  /* a planned transfer's (promo_start_target; 0: none): preferred if its end is >= min_end */
+    uint64_t min_end; /* READY's end */
     uint32_t nfenced, fenced[META_REPLICAS_MAX];
     uint8_t replied[META_REPLICAS_MAX];
     struct meta_fence_reply reply[META_REPLICAS_MAX];
@@ -5792,9 +5812,17 @@ static struct cluster_vmsg vmsg_q[VMSG_Q];
 static unsigned vmsg_n;
 static cluster_fence_fn g_fence_fn;
 static void *g_fence_arg;
+static cluster_volcmd_fn g_volcmd_fn;
+static void *g_volcmd_arg;
 static struct promo *g_promo; /* the cluster thread's */
 static size_t g_npromo, g_promo_cap;
 static unsigned g_nresign; /* RESIGNs noted in the per-volume state since the last duty round */
+
+void cluster_set_volcmd_handler(cluster_volcmd_fn fn, void *arg)
+{
+    g_volcmd_fn = fn;
+    g_volcmd_arg = arg;
+}
 
 void cluster_set_fence_handler(cluster_fence_fn fn, void *arg)
 {
@@ -5830,6 +5858,10 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
+    if (m->kind == CL_VMSG_READY) {
+        ctr_ready(from, m);
+        return;
+    }
     if (m->kind == CL_VMSG_RESIGN) {
         const struct meta_volume *v = meta_volume(&C.sm, m->volume);
         struct vstate *vs = v && v->leader == from && v->epoch == m->epoch ? vs_find(m->volume) : NULL;
@@ -5912,6 +5944,41 @@ static void on_volmsg(struct conn *c, struct rd *r)
     volmsg_in(c->id, &m);
 }
 
+static void on_volcmd(struct conn *c, struct rd *r)
+{
+    struct cluster_volcmd m = {.kind = get8(r), .volume = get32(r)};
+    m.epoch = get64(r);
+    m.node = get32(r);
+    m.arg = get64(r);
+    if (r->bad) {
+        c->dead = 1;
+        return;
+    }
+    if (g_volcmd_fn)
+        g_volcmd_fn(g_volcmd_arg, &m, c->id);
+}
+
+int cl_volcmd_send(uint32_t node, const struct cluster_volcmd *m)
+{
+    if (node == C.id) {
+        if (g_volcmd_fn)
+            g_volcmd_fn(g_volcmd_arg, m, C.id);
+        return 0;
+    }
+    struct conn *c = conn_to(node);
+    if (!c)
+        return -1;
+    frame_begin(&C.fb, F_VOLCMD);
+    put8(&C.fb, m->kind);
+    put32(&C.fb, m->volume);
+    put64(&C.fb, m->epoch);
+    put32(&C.fb, m->node);
+    put64(&C.fb, m->arg);
+    frame_end(&C.fb);
+    conn_send(c, 0);
+    return 0;
+}
+
 static void on_fence(struct conn *c, struct rd *r)
 {
     uint32_t vol = get32(r);
@@ -5950,7 +6017,7 @@ static int promo_holds_lease(uint32_t node)
     return 0;
 }
 
-static void promo_start(const struct meta_volume *v, uint8_t reason, uint64_t now)
+void promo_start_target(const struct meta_volume *v, uint8_t reason, uint32_t target, uint64_t min_end, uint64_t now)
 {
     if (v->epoch + 1 >= META_EPOCH_LIMIT) {
         static uint32_t said = UINT32_MAX;
@@ -5976,11 +6043,18 @@ static void promo_start(const struct meta_volume *v, uint8_t reason, uint64_t no
     p->epoch = v->epoch;
     p->version = v->isr_version;
     p->reason = reason;
+    p->target = target;
+    p->min_end = min_end;
     p->t0 = now;
     for (uint32_t i = 0; i < v->nisr && i < META_REPLICAS_MAX; i++)
         p->fenced[p->nfenced++] = v->isr[i];
     say("volume %" PRIu32 ": leader %" PRIu32 " at epoch %" PRIu64 " is gone (reason %u); fences %" PRIu32
         " ISR members for epoch %" PRIu64, v->number, v->leader, v->epoch, (unsigned)reason, p->nfenced, v->epoch + 1);
+}
+
+static void promo_start(const struct meta_volume *v, uint8_t reason, uint64_t now)
+{
+    promo_start_target(v, reason, 0, 0, now);
 }
 
 static int heard_fresh(uint32_t id, uint64_t now)
@@ -6292,6 +6366,8 @@ static void leader_duties(uint64_t now)
     propose_opens(now);
     propose_isr(now);
     promote_duty(now);
+    ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
+    cmove_duty(now);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -6769,4 +6845,35 @@ void cluster_stop(void)
     close(C.lfd);
     close(C.stop_pipe[0]);
     close(C.stop_pipe[1]);
+}
+
+/* ------------------------------------------------------------------ cluster_int.h (R4's files) */
+
+void cl_say(const char *fmt, ...)
+{
+    char b[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    say("%s", b);
+}
+
+uint64_t cl_now_ns(void) { return mono_ns(); }
+
+uint32_t cl_self(void) { return C.id; }
+
+int cl_leading(void) { return C.r && raft_get_role(C.r) == RAFT_LEADER && C.sm.initialised; }
+
+const char *cl_leader_peer(void) { return leader_peer(); }
+
+const struct meta_state *cl_meta(void) { return &C.sm; }
+
+int cl_heard_fresh(uint32_t id, uint64_t now) { return heard_fresh(id, now); }
+
+int cl_propose(struct meta_entry *e) { return propose(e, 0, 0, 0) == ISO_OK ? 0 : CLUSTER_ERR_RETRY; }
+
+void cl_admin_reply(uint64_t conn, uint32_t reqid, int32_t rc, const void *body, size_t len)
+{
+    admin_reply(conn, reqid, rc, body, len);
 }

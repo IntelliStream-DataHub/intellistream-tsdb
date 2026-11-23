@@ -61,8 +61,10 @@
 /* CHUNK (requests to a member's chunk stores and their answers) and CHUNKB (chunk puts as bulk files, under a rate cap
  * of their own) are server/chunksrv.c's, on a peerlink of its own as well (design-cluster-data.md §5.7, R8 D10); 5 is
  * R4's snapshot transfer. */
-enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_CHUNK = 6,
-       PL_KIND_CHUNKB = 7 };
+/* SNAP carries snapshots only (R4 plan D7: a COMMIT's file never waits behind a snapshot's), on the replication
+ * driver's peerlink (repld.c hands its frames and files to server/rsnap.c). */
+enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_SNAP = 5,
+       PL_KIND_CHUNK = 6, PL_KIND_CHUNKB = 7 };
 #define PL_KIND_DATA_MAX PL_KIND_CHUNKB /* data kinds are 1 .. this */
 
 enum {

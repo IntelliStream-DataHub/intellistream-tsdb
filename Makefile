@@ -325,8 +325,8 @@ $(B)/test_cvol: tests/test_cvol.c src/cvol.h src/replica.h src/internal.h $(LIB)
 
 # the disk side of tsdbd's volume manager (server/cvolfs.c): make v<N>, REPL's open generation and nonce; power loss
 # at every step (crashfs); the mutant runs plant the bugs it guards against and must fail
-$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
-	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ tests/test_cvolfs.c server/cvolfs.c $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/snapinst.c server/snapinst.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ tests/test_cvolfs.c server/cvolfs.c server/cvolset.c server/snapinst.c $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
 $(B)/test_feedstore: tests/test_feedstore.c tests/jepsen/feedcheck.c src/internal.h src/feed.h $(LIB)
@@ -891,7 +891,7 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # tsdbd's cluster thread (and the CLI's side of the admin ops); CLUSTER_OBJ goes into tsdbd, every binary that
 # includes tsdbd.c, and the CLI
-$(B)/cluster.o: server/cluster.c server/cluster.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
+$(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
 $(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
@@ -919,7 +919,15 @@ $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 # the replication driver's payloads on the data links (server/replwire.h)
 $(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-CLUSTER_OBJ := $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
+# R4's files on the Raft leader's side (server/cluster_int.h): stubs until r4-transfer, r4-move, r4-setchg fill them
+R4_CL_HDR := server/cluster_int.h server/cluster.h server/meta.h
+$(B)/ctransfer.o: server/ctransfer.c $(R4_CL_HDR) | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+$(B)/cmove.o: server/cmove.c $(R4_CL_HDR) | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+$(B)/cset.o: server/cset.c $(R4_CL_HDR) | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+CLUSTER_OBJ := $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
@@ -982,10 +990,14 @@ fwd-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
-TSDBD_SRC := server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+# R4's files beside the replication driver and the volume manager (server/repld_int.h, cvolset.h, snapinst.h): stubs
+# until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is
+R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/snapinst.c
+R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h
+TSDBD_SRC := $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
@@ -1000,7 +1012,7 @@ $(B)/raft_log_c2.o: $(B)/raft_log_c2.c $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft -Isrc/raft/compat -c -o $@ $<
 $(B)/tsdbd-mut-c2: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) \
                    $(B)/raft_log_c2.o $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ server/tsdbd.c server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ server/tsdbd.c server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) $(CFG_OBJ) \
 	    $(B)/raft_log_c2.o $(LIB) $(LDLIBS) $(URING_LIBS)
 # Under AddressSanitizer crashfs cannot be preloaded (test_cluster's powervote prints "skipped" and passes, so the planted
@@ -1019,7 +1031,7 @@ endif
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -1094,7 +1106,7 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)

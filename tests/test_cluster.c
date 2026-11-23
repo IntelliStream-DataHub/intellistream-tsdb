@@ -11927,6 +11927,70 @@ static int rm_one(const char *path, const struct stat *st, int flag, struct FTW 
     return remove(path) != 0 && errno != ENOENT ? -1 : 0;
 }
 
+/* r4stubs (r4-iface): R4's operator verbs reach their stubs on the Raft leader and answer "not built" (each later track
+ * replaces its line here with its own scenario), and `tsdb cluster init` stores R4's four settings, which STATUS prints
+ * back; out-of-range values are refused by the CLI before anything is sent, and by the group if they get past it. */
+static void scen_r4stubs(void)
+{
+    scenario("r4stubs");
+    start(0);
+    char p0[META_ADDR_MAX], args[PATH_MAX * 2 + 512], out[8192];
+    peer_of(0, p0, sizeof p0);
+    static const char *const bad[] = {"--rebuild-max 17",       "--rebuild-max 0",        "--rebuild-mb-s 0",
+                                      "--transfer-wait-ms 99",   "--transfer-wait-ms 60001", "--leader-balance-s 86401",
+                                      "--leader-balance-s x",    "--leader-balance-s -1"};
+    for (size_t k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        snprintf(args, sizeof args, "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 %s", p0,
+                 secret_path, bad[k]);
+        int rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 2 || strstr(out, "initialised"))
+            die("cluster init %s: exit %d (not 2): %s", bad[k], rc, out);
+    }
+    /* past the CLI: an INIT body with rebuild_max 17 is refused by the state machine (settings_valid) */
+    struct meta_settings s;
+    meta_settings_default(&s);
+    s.node_timeout_ms = 1500, s.heartbeat_ms = 200, s.rebuild_max = 17;
+    uint8_t req[128], *reply = NULL;
+    size_t len = 0, rl = cluster_settings_encode(&s, META_MODE_REPLICATED, req);
+    int arc = admin(0, CLUSTER_OP_INIT, req, rl, 0, &reply, &len);
+    free(reply);
+    if (arc == 0)
+        die("an INIT with rebuild_max 17 was taken");
+    printf("  out-of-range R4 settings refused (CLI exit 2; the group: %s)\n", cluster_strerror(arc));
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --rebuild-mb-s 150 "
+             "--rebuild-max 4 --transfer-wait-ms 3000 --leader-balance-s 120", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "initialised"))
+        die("cluster init with R4's settings: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 ||
+        !strstr(out, " rebuild_mb_s 150 rebuild_max 4 transfer_wait_ms 3000 leader_balance_s 120\n"))
+        die("status does not print R4's settings as init stored them: %s", out);
+    printf("  init stored rebuild_mb_s 150, rebuild_max 4, transfer_wait_ms 3000, leader_balance_s 120\n");
+    static const char *const verbs[] = {"volume transfer %s 1 1", "volume move %s 1 --log --from 1 --to 2",
+                                        "volume move %s 1 --log --from 1 --to 2 --cancel", "replica reset %s 1 1"};
+    for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
+        char v[256];
+        snprintf(v, sizeof v, verbs[k], p0);
+        snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
+        int rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 1 || !strstr(out, "not built"))
+            die("tsdb cluster %s: exit %d, not \"not built\": %s", v, rc, out);
+        printf("  %s: %s", v, out);
+    }
+    /* the CLI's own checks of a move: --log, --from and --to are required, and two different nodes */
+    static const char *const badmove[] = {"1 --from 1 --to 2", "1 --log --from 1", "1 --log --from 2 --to 2",
+                                          "x --log --from 1 --to 2"};
+    for (size_t k = 0; k < sizeof badmove / sizeof badmove[0]; k++) {
+        snprintf(args, sizeof args, "cluster volume move %s %s --secret-file %s", p0, badmove[k], secret_path);
+        int rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 2)
+            die("tsdb cluster volume move %s: exit %d, not 2: %s", badmove[k], rc, out);
+    }
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -11964,7 +12028,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

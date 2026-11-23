@@ -57,6 +57,7 @@
 #include "cvol.h"
 #include "cvolfs.h"
 #include "repld.h"
+#include "cvolset.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
 #include "tsdb_protocol.h"
@@ -72,6 +73,7 @@ struct mvol {
     uint64_t nonce; /* and its draw */
     int unsure;   /* REPL was unsure at this open: its fence, led and log start are not trusted (r3a gates on it) */
     uint64_t epoch;
+    int unnamed; /* the latest push does not name this server for it (cvolset_record CVS_UNNAMED said once) */
 };
 
 static struct {
@@ -191,7 +193,14 @@ static void *mgr_main(void *arg)
             int st = m ? m->state : MV_NONE;
             if (m)
                 m->epoch = r->epoch;
+            uint64_t mrid = m ? m->rid : 0;
+            if (m)
+                m->unnamed = 0;
             pthread_mutex_unlock(&M.mu);
+            if (st == MV_NONE)
+                cvolset_record(CVS_NAMED, r->number, r);
+            else if (mrid && r->rid && r->rid != mrid)
+                cvolset_record(CVS_RESET, r->number, r);
             if (st == MV_NONE)
                 prepare(r);
             else if (st == MV_OPEN && !M.writes)
@@ -216,6 +225,19 @@ static void *mgr_main(void *arg)
                     " (this one saved %" PRIu64 "): an older copy of the directory, not opened",
                     r->number, r->name, r->open_gen, gen);
         }
+        /* R4 (cvolset.h): the volumes this manager knows that the push no longer names, each said once */
+        uint32_t gone[CLUSTER_REPORT_VOLS], ngone = 0;
+        pthread_mutex_lock(&M.mu);
+        for (uint32_t k = 0; k < M.nvols && !M.stop; k++) {
+            uint32_t i = 0;
+            while (i < n && recs[i].number != M.vols[k].number)
+                i++;
+            if (i == n && !M.vols[k].unnamed)
+                M.vols[k].unnamed = 1, gone[ngone++] = M.vols[k].number;
+        }
+        pthread_mutex_unlock(&M.mu);
+        for (uint32_t k = 0; k < ngone; k++)
+            cvolset_record(CVS_UNNAMED, gone[k], NULL);
         pthread_mutex_lock(&M.mu);
         M.synced = 1;
         if (n)
@@ -395,6 +417,7 @@ int cvol_start(tsdb *t, const char *dir)
     M.active = 1;
     cluster_set_volume_watch(on_watch, NULL);
     cluster_set_fence_handler(repld_fence, NULL);
+    cluster_set_volcmd_handler(repld_volcmd, NULL);
     cluster_set_reporter(on_report, NULL);
     return 0;
 }
