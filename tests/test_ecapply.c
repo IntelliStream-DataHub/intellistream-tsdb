@@ -1052,7 +1052,7 @@ static void test_leaderpower(void)
         return;
     lstop(&L);
     fflush(NULL);
-    char *argv[] = {"test_ecapply", S, "--leader-power-child", L.root, NULL};
+    char *argv[] = {"test_ecapply", S, "--leader-power-child", L.root, "--mutant", (char *)mutant, NULL};
     pid_t pid = fork();
     if (pid == 0) {
         char asan[512];
@@ -1146,7 +1146,8 @@ static int power_run(const char *root, int warmup, int seed, uint64_t last, uint
     char a[24], b[24];
     snprintf(a, sizeof a, "%" PRIu64, last);
     snprintf(b, sizeof b, "%" PRIu64, cpos);
-    char *argv[] = {"test_ecapply", S, "--power-child", (char *)root, a, b, NULL};
+    /* the planted bug goes to the child too: the apply that loses power runs there */
+    char *argv[] = {"test_ecapply", S, "--power-child", (char *)root, a, b, "--mutant", (char *)mutant, NULL};
     pid_t pid = fork();
     if (pid == 0) {
         char asan[512], w[16], sd[16];
@@ -1201,6 +1202,7 @@ static void test_power(void)
     char tmpl[PATH_MAX / 2];
     snprintf(tmpl, sizeof tmpl, "%s", L.root);
     int crashes = 0, applied = 0, newset = 0, f0 = failures;
+    int keep0 = -1, stage0 = -1;
     bool finished = false;
     int k0 = getenv("TEST_ECAPPLY_POWER_K") ? atoi(getenv("TEST_ECAPPLY_POWER_K")) : 0;
     /* several seeds per step: CRASHFS_TEAR keeps a random subset of the unsynced directory operations, and the window
@@ -1250,6 +1252,15 @@ static void test_power(void)
         CHECK(p_holds(Q.db));
         CHECK(replica_apply(Q.db, last) == 0);
         check_listed(Q.db, "power");
+        /* the files of every shipped marker end as keep_ files whatever the step: a COLD at or below `done` whose
+         * files were still staged (power lost between the apply and stage_to_keep) is kept by the open, never an orphan */
+        int kp = count_names(Q.dir, "keep_"), sg = count_names(Q.dir, "stage_");
+        if (keep0 < 0)
+            keep0 = kp, stage0 = sg;
+        CHECK(kp == keep0 && sg == stage0);
+        if (kp != keep0 || sg != stage0)
+            fprintf(stderr, "power: step %d: %d keep_ and %d stage_ files, other steps %d and %d\n", k, kp, sg, keep0,
+                    stage0);
         CHECK(p_holds(Q.db) && d1_holds(Q.db, false));
         CHECK(count_names(Q.dir, "txn_") == 0);
         CHECK(eng_check(Q.db) == 0);
@@ -1262,7 +1273,8 @@ static void test_power(void)
         CHECK(0);
     lclose(&L);
     printf("  power: power lost at each of %d steps of the apply (%d acknowledged, %d with the new set listed): the "
-           "old parts or the new set, then the apply ends with the new set\n", crashes, applied, newset);
+           "old parts or the new set, then the apply ends with the new set and %d keep_ files\n", crashes, applied, newset,
+           keep0);
 }
 
 static void alarm_exit(int sig)
@@ -1317,6 +1329,10 @@ int main(int argc, char **argv)
     char *slash = strrchr(self, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - self) : 1, slash ? self : ".");
     printf("test_ecapply%s%s\n", strcmp(mutant, "none") ? ": mutant " : "", strcmp(mutant, "none") ? mutant : "");
+    if (strcmp(mutant, "none") && access(SHIM, R_OK) != 0) { /* a skipped power case would let a planted bug pass */
+        fprintf(stderr, "test_ecapply: a mutant run needs %s (make %s)\n", SHIM, SHIM);
+        return 2;
+    }
     struct {
         const char *name;
         void (*fn)(void);
