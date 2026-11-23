@@ -170,13 +170,14 @@ static int probe_write(const char *dir, const char *node, uint64_t n)
 /* ---------------------------------------------------------- state change */
 
 /* How long good write probes must last for the domain to leave DOWN: recover_ms, and the flapping minimum when it
- * went DOWN HEALTH_FLAP_DOWNS times within HEALTH_FLAP_WINDOW_MS. Caller holds h->mu. */
+ * went DOWN HEALTH_FLAP_DOWNS times within HEALTH_FLAP_WINDOW_MS (the flapping minimum is HEALTH_FLAP_NEED_MS unless the
+ * options set flap_recover_ms). Caller holds h->mu. */
 static int64_t down_need_ms(const struct hdomain *d, int64_t now)
 {
     int64_t need = d->h->o.recover_ms;
     if (d->ndown >= HEALTH_FLAP_DOWNS && now - d->down_at[(d->ndown - HEALTH_FLAP_DOWNS) % HEALTH_FLAP_DOWNS] <
                                              HEALTH_FLAP_WINDOW_MS)
-        need = need > HEALTH_FLAP_NEED_MS ? need : HEALTH_FLAP_NEED_MS;
+        need = need > d->h->o.flap_recover_ms ? need : d->h->o.flap_recover_ms; /* HEALTH_FLAP_NEED_MS unless set */
     return need;
 }
 
@@ -500,6 +501,8 @@ static void defaults(tsdb_health_options *o)
         o->write_every_ms = 5000;
     if (o->recover_ms <= 0)
         o->recover_ms = 10000;
+    if (o->flap_recover_ms <= 0)
+        o->flap_recover_ms = HEALTH_FLAP_NEED_MS;
     if (o->fast_ms <= 0)
         o->fast_ms = 1000;
     if (o->spawn_ms <= 0)

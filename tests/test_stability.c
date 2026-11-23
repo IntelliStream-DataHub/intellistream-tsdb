@@ -1241,6 +1241,7 @@ int main(int argc, char **argv)
         base = argv[1];
     signal(SIGALRM, on_alarm);
     signal(SIGPIPE, SIG_IGN);
+    th_watchdog("test_stability", 900); /* a thread: the tests use alarm() themselves */
     test_graceful(SIGTERM, "SIGTERM");
     test_graceful(SIGINT, "SIGINT");
     test_kill9_restart();

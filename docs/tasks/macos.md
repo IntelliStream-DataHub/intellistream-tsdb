@@ -159,6 +159,14 @@ Run them in order, in the same shell, from the checkout. Each writes a log into 
 
    A failure there means a client that reads slowly is cut off (or one that stopped reading is kept) on macOS.
 
+## libtsdb.dylib keeps the test hooks out (test-trust, 2026-11-09)
+
+The Linux library hides the `tsdb_test_*` hooks (tools/libtsdb.map); the macOS link does it with
+`-unexported_symbols_list` (`_tsdb_test_*`), which nobody here could try. On the Mac: `make build/test_shared` and
+`build/test_shared /tmp` (its export check is skipped on macOS, so also run
+`nm -gU build/libtsdb.dylib | grep -c tsdb_test_`, expected 0, and `nm -gU build/libtsdb.dylib | grep -c ' _tsdb_'`,
+about 100). If the dylib fails to link or the hooks are still listed, say so.
+
 ## Send back
 
 The whole `~/tsdb-mac-report` directory (`tar czf tsdb-mac-report.tgz -C ~ tsdb-mac-report`), or if that is too

@@ -387,6 +387,20 @@ static void dom_on_change(void *ctx, int d, int old_state, int new_state)
         pthread_mutex_unlock(&dom.mu);
     } else {
         dom_count_inside(d);
+        /* A recovery thread that finished before this call fired may already have set the domain UP: its UP came
+         * first, so the nonup flag this call set must go again. */
+        if (tsdb_health_state(dom.health, d) == TSDB_DOM_UP) {
+            pthread_mutex_lock(&dom.mu);
+            atomic_store(&dom.nonup[d], false);
+            pthread_mutex_unlock(&dom.mu);
+        }
+    }
+    if (new_state == TSDB_DOM_RECOVERING && dom_all_back(d)) {
+        /* No volume of the domain has a recovery thread to set it UP: all are diverged (dom_recover skips them, and
+         * a diverged volume stays refused on its own) or the domain has none. Without this the domain stayed DOWN
+         * for good after any outage that followed the first, and every request that names no volume counted as a
+         * waiting worker. After dom_count_inside: the UP this fires clears the flag that call sets. */
+        tsdb_health_set_up(dom.health, d);
     }
     if (new_state == TSDB_DOM_DOWN) {
         size_t n = tsdb_volume_count(dom.db);
@@ -417,6 +431,8 @@ static void dom_test_options(tsdb_health_options *o)
             o->write_every_ms = val;
         else if (!strcmp(kv, "recover"))
             o->recover_ms = val;
+        else if (!strcmp(kv, "flap"))
+            o->flap_recover_ms = val;
         else if (!strcmp(kv, "fast"))
             o->fast_ms = val;
         else if (!strcmp(kv, "spawn"))

@@ -130,7 +130,7 @@ recommendations). Two were taken as defaults and the user may still change them 
 | Status codes: -10 to -15 kept for HA (-14 is `ABANDONED`, released in 0.9.1; `STALE_ID` is planned as -15), -16 `DENIED`, -17 `AUTH`; HA's `EXISTS` is planned as -20 | tsdb.h:74-76 |
 | `FORMAT_VERSION` 8 | internal.h:41 |
 | tsdbd: output capped at `OUT_CAP` (8 MiB); `CANCEL` handled in `parse()`, stops QUERY_MULTI (`cancel_multi`) | tsdbd.c:160-161, 2273, 2343 |
-| crashfs intercepts `rename`, `renameat`, `unlinkat`, not `linkat` | tests/jepsen/crashfs.c:174-212 |
+| crashfs intercepts `rename`, `renameat`, `renameat2`, `unlinkat`, `link` and `linkat` (a new hard link is a created name, undone by a power loss unless its directory was synced; round 16) | tests/jepsen/crashfs.c |
 | The Pulsar sink runs only `ATLEAST_ONCE`; it reads JSON and Avro `GenericRecord`s, also one series with arrays; its selection is `series`, `seriesPrefixes`, `seriesPattern`, added together | TsdbSink.java:88-101; PointParser.java:128-134, 202-225; SeriesSelection.java:16-26 |
 | Merges keep the highest `wal_seq` of their sources and retire them (`retired_*`); expiry drops rows and whole partitions in the merge thread (at 87eb49e) | merge.c |
 | Followers tail MANIFEST and the WAL segments it names (at 87eb49e) | manifest.c:1-23 |

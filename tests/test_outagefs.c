@@ -5,6 +5,7 @@
 #include "outagefs_ctl.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -128,26 +129,37 @@ static void run(void)
     CHECK(cmd("heal", dir_a, NULL) == 0);
 
     /* slow */
-    CHECK(cmd("slow", dir_a, "200") == 0);
+    /* the promise is the delay itself: a call under "slow" takes at least it, one after heal takes less than it
+     * (a bound of a few ms would be a claim about this machine's disk, not about the shim) */
+    CHECK(cmd("slow", dir_a, "1000") == 0);
     double t0 = now_ms();
     CHECK(pread(fd, buf, 5, 0) == 5);
-    CHECK(now_ms() - t0 >= 190);
+    CHECK(now_ms() - t0 >= 950);
     CHECK(cmd("heal", dir_a, NULL) == 0);
     t0 = now_ms();
     CHECK(pread(fd, buf, 5, 0) == 5);
-    CHECK(now_ms() - t0 < 100);
+    CHECK(now_ms() - t0 < 1000);
 
     /* hang: the writer blocks, a sibling prefix goes on, heal lets it finish */
     hung_fd = fd;
     CHECK(cmd("hang", dir_a, NULL) == 0);
     pthread_t th;
     pthread_create(&th, NULL, hung_writer, NULL);
+    /* until the writer is in the hang (the shim counts it: hung=1): a thread that waits for a CPU for 300 ms (a load average of 150) has
+     * not made its call yet, and a fixed sleep read "hung=0" there */
+    char out[512];
+    for (int w = 0; w < 2000; w++) {
+        if (outagefs_cmd(ctl, "state", out, sizeof out) == 0 && strstr(out, "hung=1"))
+            break;
+        sleep_ms(10);
+    }
     sleep_ms(300);
     CHECK(atomic_load(&hung_done) == 0);
-    t0 = now_ms();
+    /* the sibling's write returns while the hang is still in force (the hung call ends only at heal): that it
+     * returned at all is the check, no stopwatch (a fsync on a busy disk takes what it takes; a blocked write
+     * ends in the watchdog) */
     put(pb, "still going");
-    CHECK(now_ms() - t0 < 100);
-    char out[512];
+    CHECK(atomic_load(&hung_done) == 0);
     CHECK(outagefs_cmd(ctl, "state", out, sizeof out) == 0);
     CHECK(strstr(out, "hang") && strstr(out, "hung=1"));
     CHECK(cmd("heal", dir_a, NULL) == 0);
@@ -246,6 +258,7 @@ static void orphan(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_outagefs", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     if (outagefs_reexec(argv, base, (const char *const[]){"a", "b"}, 2))
         return 1;

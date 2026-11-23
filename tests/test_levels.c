@@ -12,10 +12,13 @@
  * into aggregates, granule statistics and the packed granule index, and compares everything, byte for
  * byte, with the baseline. Decoded values must also equal the input.
  *
+ * The baseline is also compared with tests/data/levels-golden.txt (committed digests), so a machine that has one
+ * configuration still checks every output against what the other CPUs gave; a missing file fails.
+ *
  * In a build without CPU levels (the default -march=native `make`) the codecs
  * exist once and only the aggregation kernels vary; the test still runs.
  *
- *   test_levels            (TSDB_CPU caps the levels it can reach)
+ *   test_levels            (TSDB_CPU caps the levels it can reach; TSDB_LEVELS_GOLDEN_UPDATE=1 rewrites the digests)
  */
 #include "internal.h"
 #include "bitpack.h"
@@ -24,6 +27,8 @@
 #include "hydraulic_psi.h"
 
 #include <fenv.h>
+#include "watchdog.h"
+#include "require.h"
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1269,6 +1274,115 @@ static bool same(const rec *a, const rec *b, const char *label)
     return bad == 0;
 }
 
+/* ---- golden digests: what every level must give, kept in the repository ----
+ * The comparison above is among the levels this CPU has: on a machine with one configuration (an older CPU, a
+ * build without levels) it compares nothing. The golden file holds, per input and kind of output, the number of
+ * outputs and one hash over their hashes (a block's bytes, a decoded array, an aggregate); every run on every CPU
+ * must reproduce it. It changes only with a codec or format change, deliberately: TSDB_LEVELS_GOLDEN_UPDATE=1
+ * rewrites it (tests/data/levels-golden.txt), and the diff is the review. Found next to the executable (the
+ * tarball's tests/) or at tests/data/ below the current directory (the source tree). */
+#define GOLDEN_NAME "levels-golden.txt"
+
+static void golden_group(const char *name, char *out, size_t cap)
+{
+    const char *sep = strstr(name, " / ");
+    size_t n = sep ? (size_t)(sep - name) : strlen(name);
+    snprintf(out, cap, "%.*s", (int)n, name);
+}
+
+/* One line per group of outputs in the order of first appearance: "group TAB count TAB hash". */
+static char *golden_text(const rec *r)
+{
+    size_t cap = 1 << 16, len = 0;
+    char *t = malloc(cap);
+    for (size_t i = 0; i < r->n;) {
+        char g[160], g2[160];
+        golden_group(r->name[i], g, sizeof g);
+        uint64_t h = 0xcbf29ce484222325ull;
+        size_t j = i;
+        for (; j < r->n; j++) {
+            golden_group(r->name[j], g2, sizeof g2);
+            if (strcmp(g, g2) != 0)
+                break;
+            h = fnv(&r->hash[j], sizeof r->hash[j], h);
+        }
+        if (len + 400 > cap)
+            t = realloc(t, cap *= 2);
+        len += (size_t)snprintf(t + len, cap - len, "%s\t%zu\t%016llx\n", g, j - i, (unsigned long long)h);
+        i = j;
+    }
+    return t;
+}
+
+static char *read_all(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    char *b = malloc((size_t)n + 1);
+    size_t got = fread(b, 1, (size_t)n, f);
+    fclose(f);
+    b[got] = 0;
+    return b;
+}
+
+static void golden_check(const rec *base, const char *argv0)
+{
+    char *want_text = golden_text(base);
+    char exe_path[PATH_MAX + 32] = "", src_path[] = "tests/data/" GOLDEN_NAME;
+    const char *slash = strrchr(argv0, '/');
+    if (slash)
+        snprintf(exe_path, sizeof exe_path, "%.*s/%s", (int)(slash - argv0), argv0, GOLDEN_NAME);
+    const char *upd = getenv("TSDB_LEVELS_GOLDEN_UPDATE");
+    if (upd && *upd && strcmp(upd, "0") != 0) {
+        FILE *f = fopen(src_path, "wb");
+        if (!f || fputs(want_text, f) < 0 || fclose(f) != 0) {
+            fprintf(stderr, "test_levels: cannot write %s (run from the source directory)\n", src_path);
+            failures++;
+        } else
+            printf("golden digests written to %s (%zu bytes): review the diff\n", src_path, strlen(want_text));
+        free(want_text);
+        return;
+    }
+    const char *path = src_path;
+    char *have = read_all(path);
+    if (!have && exe_path[0]) {
+        path = exe_path;
+        have = read_all(path);
+    }
+    if (!have) {
+        fprintf(stderr, "test_levels: FAIL: no golden digests (looked for %s and %s)\n", src_path, exe_path);
+        failures++;
+        free(want_text);
+        return;
+    }
+    int bad = 0, lines = 0;
+    const char *a = want_text, *b = have;
+    while (*a || *b) {
+        const char *ae = strchr(a, '\n'), *be = strchr(b, '\n');
+        size_t al = ae ? (size_t)(ae - a) : strlen(a), bl = be ? (size_t)(be - b) : strlen(b);
+        lines++;
+        if (al != bl || memcmp(a, b, al) != 0) {
+            if (bad++ < 20)
+                fprintf(stderr, "golden %s, line %d:\n  produced %.*s\n  expected %.*s\n", path, lines, (int)al, a,
+                        (int)bl, b);
+        }
+        a += al + (ae != NULL);
+        b += bl + (be != NULL);
+    }
+    if (bad) {
+        fprintf(stderr, "test_levels: FAIL: %d of the golden digests differ (a codec or kernel changed its bytes; if on "
+                        "purpose, TSDB_LEVELS_GOLDEN_UPDATE=1 from the source directory)\n", bad);
+        failures++;
+    } else
+        printf("golden digests (%s): %d groups, as committed\n", path, lines);
+    free(want_text);
+    free(have);
+}
+
 #ifdef TSDB_LEVELS
 /* The dispatch itself: a level the CPU has must be used, and must call that level's compile. A broken
  * CPU check or table would otherwise ship baseline code everywhere with every comparison still equal. */
@@ -1349,8 +1463,10 @@ static void check_thresholds(void)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc;
+    th_watchdog("test_levels", 1200);
     check_dispatch();
     make_inputs();
     size_t maxn = GR;
@@ -1379,6 +1495,7 @@ int main(void)
             if (!configs++) {
                 base = r;
                 printf("%s: %zu outputs\n", label, r.n);
+                golden_check(&base, argv[0]);
                 continue;
             }
             bool ok = same(&base, &r, label);
@@ -1393,12 +1510,14 @@ int main(void)
     free(base.hash);
     if (configs > 1)
         printf("%d inputs, %d configurations compared\n", nin, configs);
-    else /* an older CPU, or TSDB_CPU=v2 on a build without levels: still decodes every input exactly */
-        printf("%d inputs, one configuration on this CPU: nothing to compare (SKIPPED the comparison)\n", nin);
+    else { /* an older CPU, or TSDB_CPU=v2 on a build without levels: still decodes every input exactly */
+        printf("%d inputs: ", nin);
+        tr_skip("the comparison", "one configuration on this CPU: nothing to compare");
+    }
     if (failures) {
         printf("test_levels: %d failures\n", failures);
         return 1;
     }
-    printf("test_levels: all passed\n");
+    printf("test_levels: all passed%s\n", tr_skips());
     return 0;
 }

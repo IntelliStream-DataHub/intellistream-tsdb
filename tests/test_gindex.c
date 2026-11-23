@@ -21,6 +21,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <float.h>
 #include <ftw.h>
@@ -618,6 +619,7 @@ static void test_engine(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_gindex", 1200);
     char base[400];
     snprintf(base, sizeof base, "%s/tsdb-gindex-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rm_rf(base);

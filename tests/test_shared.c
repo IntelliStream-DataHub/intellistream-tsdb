@@ -4,9 +4,13 @@
  * FFM) use it: only the public API, memory returned by the library freed with
  * tsdb_free, and no internal symbol visible.
  */
+#define _GNU_SOURCE 1 /* dladdr */
 #include "tsdb.h"
 
 #include <dlfcn.h>
+#include <string.h>
+#include "watchdog.h"
+#include "require.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +32,93 @@ static int failures;
 #define LIBTSDB "libtsdb.so"
 #endif
 
+/* The exported names of the library, read with nm, must each be named in a public header. A hook for the tests
+ * (tsdb_test_*, declared in src/internal.h) is not an API: a binding that calls it can corrupt the database, and
+ * the version script (tools/libtsdb.map) must keep it out. Linux only: the production platform; the macOS export
+ * list is tools/libtsdb.map's twin in the Makefile. */
+static char *slurp(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return NULL;
+    size_t cap = 1 << 16, n = 0;
+    char *b = malloc(cap + 1);
+    size_t got;
+    while (b && (got = fread(b + n, 1, cap - n, f)) > 0) {
+        n += got;
+        if (n == cap) {
+            cap *= 2;
+            b = realloc(b, cap + 1);
+        }
+    }
+    fclose(f);
+    if (b)
+        b[n] = '\0';
+    return b;
+}
+
+static int word_in(const char *text, const char *name)
+{
+    size_t l = strlen(name);
+    for (const char *p = text; (p = strstr(p, name)); p += l) {
+        int before = p == text || !(p[-1] == '_' || (p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9'));
+        char c = p[l];
+        int after = !(c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+        if (before && after)
+            return 1;
+    }
+    return 0;
+}
+
+static void check_exports(void *self)
+{
+#ifdef __linux__
+    Dl_info di;
+    void *open_fn = dlsym(self, "tsdb_open");
+    CHECK(open_fn && dladdr(open_fn, &di) && di.dli_fname);
+    if (!open_fn || !dladdr(open_fn, &di) || !di.dli_fname)
+        return;
+    char *pub = slurp("include/tsdb.h"), *cal = slurp("include/tsdb_calendar.h");
+    CHECK(pub && cal);
+    if (!pub || !cal)
+        return;
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "nm -D --defined-only '%s'", di.dli_fname);
+    FILE *f = popen(cmd, "r");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    char line[512];
+    int exported = 0, bad = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *name = strrchr(line, ' ');
+        if (!name)
+            continue;
+        name++;
+        name[strcspn(name, "\n")] = '\0';
+        exported++;
+        if (!word_in(pub, name) && !word_in(cal, name)) {
+            fprintf(stderr, "libtsdb.so exports %s, which no public header declares\n", name);
+            bad++;
+        }
+    }
+    int rc = pclose(f);
+    CHECK(rc == 0);          /* nm ran */
+    CHECK(exported > 50);     /* and listed the library, not nothing */
+    CHECK(bad == 0);
+    if (bad == 0)
+        printf("  exports: %d symbols, all in the public headers\n", exported);
+    free(pub);
+    free(cal);
+#else
+    (void)self;
+    tr_skip("exports", "the export list is checked on Linux");
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    th_watchdog("test_shared", 1200);
     char dir[512], cmd[600];
     snprintf(dir, sizeof dir, "%s/tsdb-shared-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
@@ -45,6 +134,8 @@ int main(int argc, char **argv)
         CHECK(dlsym(self, "eng_open") == NULL);
         CHECK(dlsym(self, "parts_publish") == NULL);
         CHECK(dlsym(self, "tsdb_struct_size") != NULL);
+        CHECK(dlsym(self, "tsdb_test_midplace") == NULL);
+        check_exports(self);
     }
 
     /* what a binding compares with its own layouts when it loads the library */
@@ -92,6 +183,6 @@ int main(int argc, char **argv)
         printf("FAILED: %d checks\n", failures);
         return 1;
     }
-    printf("shared library tests passed\n");
+    printf("shared library tests passed%s\n", tr_skips());
     return 0;
 }

@@ -11,6 +11,7 @@
 #include "../client/tsdb_calendar.c"
 
 #include <ftw.h>
+#include "watchdog.h"
 #include <sys/wait.h>
 
 static int failures;
@@ -339,6 +340,7 @@ static int rm_one(const char *p, const struct stat *s, int flag, struct FTW *f)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_tzfiles", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     snprintf(tzdir, sizeof tzdir, "%s/tzfiles_%d", base, (int)getpid());
     nftw(tzdir, rm_one, 16, FTW_DEPTH | FTW_PHYS);

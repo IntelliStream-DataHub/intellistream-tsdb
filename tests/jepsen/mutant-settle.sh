@@ -60,7 +60,13 @@ for m in $muts; do
     esac
     # the refusal's own line: one below jepsen's "does not come up", never any line of the run that names an intent
     after=$(echo "$out" | awk -v r="${refused:-^$}" 'f; $0 ~ r {f=1}')
-    if [ $m = swapearly ] && [ $st -eq 2 ] && echo "$after" | grep -Eq "$named"; then
+    # An open that refuses on damage after the faults is a verdict of this jepsen (exit 1: "refuses to open the database after the faults:
+    # damaged data", the server's log tail below it names the file); the older form, exit 2 after "does not come up", is kept for a
+    # jepsen that has no such verdict. Either way the tail's own line must name the swap's file.
+    if [ $m = swapearly ] && [ $st -eq 1 ]; then
+        after=$(echo "$out" | awk '/refuses to open the database after the faults/ {f=1; next} f')
+    fi
+    if [ $m = swapearly ] && { [ $st -eq 2 ] || [ $st -eq 1 ]; } && echo "$after" | grep -Eq "$named"; then
         # a refused open: a catch only if the control comes up
         ctl=$(env JEPSEN_TSDBD="$tsdbd" "$jepsen" --dir "$dir" --nemesis settle-steps --crashfs "$crashfs" \
             --seconds 40 --tier 3 2>&1); cst=$?

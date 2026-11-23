@@ -9,6 +9,7 @@ import pathlib
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -249,7 +250,10 @@ class Outage:
         root = pathlib.Path(TSDBD).parent
         self.bin, self.lib = root / "outage_server", root / "liboutagefs.so"
         if not (self.bin.exists() and self.lib.exists()):
-            pytest.skip(f"{self.bin} or {self.lib} is missing (make builds them on Linux)")
+            # Linux builds both (make): missing there is a broken build, and a skip would hide every outage test.
+            if sys.platform.startswith("linux"):
+                pytest.fail(f"{self.bin} or {self.lib} is missing: make builds them on Linux")
+            pytest.skip(f"{self.bin} or {self.lib} is missing (outagefs is Linux only)")
         import tempfile
 
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-outage-", dir=base))

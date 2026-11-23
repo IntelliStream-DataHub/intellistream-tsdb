@@ -33,6 +33,22 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # rows it replaced and a swap that renames early: jepsen-selftest runs it, both must be caught)
                           # (kv also writes nulls and checks every QUERY_LATEST answer, and the final ones; tests/jepsen/mutant-latest.sh
                           # plants stale latest-table entries in tsdbd, which the check must fail: jepsen-selftest runs it)
+                          # jepsen exits 0 valid, 1 VIOLATION (a wrong answer of tsdb: never repeated), 2 harness failure, 3 INCONCLUSIVE
+                          # (a liveness or coverage check of the run itself failed: the nemesis too slow for its floor, a server dead
+                          # too long, a gap, a step that idled, the kv or classes workload that wrote or switched too little, the healthy outage volume
+                          # slowed; says nothing about tsdb). The final state and the whole history are judged first, whatever the liveness
+                          # checks found: a lost, resurrected or wrong row is exit 1 on its own attempt, never an INCONCLUSIVE rerun
+                          # (tests/jepsen/mutant-loss.sh plants a loss in tsdbd beside a lazy nemesis; jepsen-selftest runs it).
+                          # A tsdbd that ends by itself (a crash, an exit of its own) or stops answering is a VIOLATION on that attempt under
+                          # every nemesis and under none: every request has a deadline (60 s; JEPSEN_REQ_DEADLINE_S), no answer is
+                          # "server stopped answering", joins and stops are bounded and the harness stops its servers by pid at every end.
+                          # How soon writes resume after an outage heal is liveness (INCONCLUSIVE). A tsdbd that does not start is a harness
+                          # error (exit 2) unless its log says the data is damaged (a violation). tests/jepsen/mutant-crash.sh plants a crash
+                          # (JV_CRASH) and a hang (JV_HANG) in a copy of tsdbd and requires exit 1 at the first attempt under each nemesis.
+                          # tests/jepsen/rerun.sh runs every gate's jepsen: an INCONCLUSIVE run is rerun with the next seed, twice at
+                          # most, printed each time; three in a row fail the gate with all three messages; the summary line at the
+                          # end of make jepsen counts the reruns. jepsen-selftest requires each planted nemesis to end in that failure
+                          # with its check named (tests/jepsen/expect.sh), the honest ones to end valid
 make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every peer port) under kill, partition, pause, midcommit
                           # (crash points: server/crashpt.h, TSDB_CRASH_AT=name[:n] -> _exit(99)) and power (crashfs), workloads meta
                           # and kv-local (a cluster volume of 1 replica per node), and users (every tsdbd requires a login, an admin thread
@@ -75,7 +91,8 @@ make test-clients         # Rust, Python and Java clients (network and embedded)
                           # (needs cargo, python3, mvn); make test-spdx: the licence line of every file (part of make test)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
-                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
+                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/;
+                          # make integration-mutants (mutate.py: 23 planted bugs, ~40 min, CI weekly) checks it has teeth;
                           # run.py --auth off,on (default both): matrix and cli also as users with grants, cross-tenant reads fail;
                           # make integration-selftest tests the harness itself (seconds)
 ```
@@ -910,6 +927,26 @@ cgroup, so `nice` does not keep your work out of its way.
 - Match the surrounding code: 4-space indent, lines up to about 120
   characters, `snake_case`, errors as negative `TSDB_ERR_*` codes.
 - Comments say why, not what; file headers describe the design of the file.
+- **A test never retries and never excuses a failure by the load of the machine** (the `tests/busy.h` mechanism is gone).
+  A correctness check and a timing check both fail when they fail; a bound on a time is what tsdb documents or promises
+  (the 60 s flapping rule, `--send-timeout`, a client's retry budget), a state that is only promised to come is a
+  condition wait with a generous bound, never a tuned number. The watchdog (`tests/watchdog.h`) has a fixed deadline
+  (`TH_WATCHDOG_SCALE` gives a CI job more). A red run on an overloaded machine is investigated; CI runs the timing-heavy
+  groups with fewer jobs at once. The jepsen nemesis is judged (`nemesis_check` in
+  `tests/jepsen/jepsen.c`, right after the run, before the final state and the history check) from the faults it issued, each
+  with its time (a kill, an EIO the shim logged in its mark file, a plug the shim logged in its pull file, a pause...):
+  a floor from the time a server was listening (at least a third of an honest rate, never below 3), one in each third of
+  the run, and from a watcher thread that polls the server pid every 50 ms on its own clock: no server dead for more than
+  250 ms, the final stretch up to the end of the run included; and no time idle inside its fault step. A failed
+  check of that kind is INCONCLUSIVE (exit 3), never a violation: a machine that stalls a thread makes an honest run fail
+  it once in a few dozen, so `tests/jepsen/rerun.sh` repeats the run with the next seed (twice at most, three in a row
+  fail the gate) and no excuse is taken off a bound for time a thread waited for a CPU (a spinning nemesis and a starved
+  one look alike to the kernel); only a wrong answer of tsdb is a violation, and a violation is never repeated.
+  `make jepsen-selftest` plants the idle nemeses (once, a burst and then asleep, naps that do not look, steps and waits that
+  sleep or spin, a nemesis that never restarts the server, a shim that ignores SIGUSR2, clients that write nothing) and
+  requires each to end in the three-INCONCLUSIVE gate failure with its check named, the honest odd ones (a late last pull,
+  a slow mark) to end valid, and a hung server, or data lost beside a lazy nemesis (`tests/jepsen/mutant-loss.sh`), to be a
+  violation at once.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to

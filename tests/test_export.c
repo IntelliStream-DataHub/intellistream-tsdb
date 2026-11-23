@@ -20,6 +20,7 @@
 #include "tsdb.h"
 
 #include <errno.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -2036,6 +2037,7 @@ static void test_old_format(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_export", 1200);
     const char *cli_env = getenv("TSDB_CLI");
     if (cli_env)
         snprintf(cli, sizeof cli, "%s", cli_env);

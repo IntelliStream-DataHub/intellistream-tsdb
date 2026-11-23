@@ -44,8 +44,8 @@ mut("M2", "Rust client: a local midnight near a clock change is one hour off (wr
     ["rust"], "matrix")
 mut("M3", "server loses the acknowledgement of every 61st values insert (a dropped ack)",
     "server/tsdbd.c",
-    "    default: rc = TSDB_ERR_INVALID; break;\n    }\n    reply_status(c, r->id, rc);\n}",
-    "    default: rc = TSDB_ERR_INVALID; break;\n    }\n"
+    "        metrics_rows_inserted(n);\n    }\n    reply_status(c, r->id, rc);\n}",
+    "        metrics_rows_inserted(n);\n    }\n"
     "    static unsigned dropped;\n"
     "    if (!(r->op == TSDB_OP_INSERT_VALUES && rc == 0 && ++dropped % 61 == 0))\n"
     "        reply_status(c, r->id, rc);\n}",
@@ -59,8 +59,13 @@ mut("M4", "Java client sends limit + 1 for raw queries (off by one in limits)",
     ["java"], "matrix")
 mut("M5", "server mixes up two fields of a bucket reply (min and max swapped): all clients agree, the engine does not",
     "server/tsdbd.c",
-    "        memcpy(o + 24, &b[i].min, 8);\n        memcpy(o + 32, &b[i].max, 8);",
-    "        memcpy(o + 24, &b[i].max, 8);\n        memcpy(o + 32, &b[i].min, 8);",
+    "    reply_rows(c, NULL, id, NULL, bb, nb, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW);\n}",
+    "    if (!(fields & TSDB_SPREAD)) { /* the rows are the handler's own buffer: swapped in place */\n"
+    "        tsdb_bucket *sw = (tsdb_bucket *)bb;\n"
+    "        for (size_t i = 0; i < nb; i++) {\n"
+    "            double t = sw[i].min;\n            sw[i].min = sw[i].max;\n            sw[i].max = t;\n        }\n"
+    "    }\n"
+    "    reply_rows(c, NULL, id, NULL, bb, nb, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW);\n}",
     ["c"], "matrix")
 mut("M6", "merge keeps the OLDEST value on equal keys (a correction is undone by optimize)",
     "src/merge.c",
@@ -69,8 +74,8 @@ mut("M6", "merge keeps the OLDEST value on equal keys (a correction is undone by
     ["c"], "matrix")
 mut("M7", "follower never reads a new MANIFEST version (stops following)",
     "src/manifest.c",
-    "    if (m.version != db->follow_version) {",
-    "    if (false && m.version != db->follow_version) {",
+    "    if (m.version != db->follow_version || m.check != db->follow_check) {",
+    "    if (false && (m.version != db->follow_version || m.check != db->follow_check)) {",
     ["c"], "follower")
 mut("M8", "tsdb import no longer reads an empty field as null",
     "tools/tsdb-cli.c",
@@ -84,8 +89,8 @@ mut("M9", "Java packed inserts canonicalise NaN (floatToIntBits): payloads and t
     ["java"], "matrix")
 mut("M10", "crash recovery skips the WAL segment that follows a flushed part (acknowledged rows are lost)",
     "src/memtable.c",
-    "if (cached_seq >= segs[k].seq || id >= eng_series_count(db))",
-    "if (cached_seq + 1 >= segs[k].seq || id >= eng_series_count(db))",
+    "                if (cached_seq >= segs[k].seq)\n                    continue; /* already in a part */",
+    "                if (cached_seq + 1 >= segs[k].seq)\n                    continue; /* already in a part */",
     ["c"], "durability")
 mut("M11", "epoll backend only: a large send is accounted one byte too far (a corrupt reply stream)",
     "server/tsdbd.c",
@@ -93,7 +98,7 @@ mut("M11", "epoll backend only: a large send is accounted one byte too far (a co
     "                on_send(c, r < 0 ? -err : r + (r > 60000));\n        }\n        c->in_ready = false;",
     ["c"], "matrix", io="epoll")
 mut("M12", "Python client sends limit - 1 (off by one in limits, in the PyO3 layer)",
-    "client/python/src/lib.rs",
+    "client/python-common/src/lib.rs",
     "    Ok(tc::QueryOpts { order, limit })",
     "    Ok(tc::QueryOpts { order, limit: limit.map(|l| if l > 1 { l - 1 } else { l }) })",
     ["python"], "matrix")
@@ -101,8 +106,8 @@ mut("M12", "Python client sends limit - 1 (off by one in limits, in the PyO3 lay
 # found by review: these four survived the first version of the suite
 mut("M13", "crash recovery replays every WAL segment, ignoring each part's wal_seq (old values over newer parts)",
     "src/memtable.c",
-    "if (cached_seq >= segs[k].seq || id >= eng_series_count(db))",
-    "if ((cached_seq >= segs[k].seq && 0) || id >= eng_series_count(db))",
+    "                if (cached_seq >= segs[k].seq)\n                    continue; /* already in a part */",
+    "                if (cached_seq >= segs[k].seq && 0)\n                    continue; /* already in a part */",
     ["c"], "stale_wal")
 mut("M14", "descending raw reads: every window after the first loses its oldest row (only series over 65536 rows)",
     "src/query.c",

@@ -41,31 +41,41 @@ mode=${1:-quick}
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
-# prev_epoch check while following: never reached, the core fails there now); 37 (unanswered members wait for the lag
-# rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
+# prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
+# 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 # 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
 quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41"
 all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41"
-# test_repl's scenarios and the planted bug each must catch
-scenarios="34 35 36 37 39 40 42"
+# test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
+# run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
+# or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
+# by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
+scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
+           14:promote 39:replay_floor 40:idle_shrink 42:steady_join"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the
-# second argument of mutants()), "scn:K" test_repl's scenario K with its planted bug.
+# second argument of mutants()), "scn:B:S" test_repl with planted bug B, which scenario S must report.
 SIM_SEEDS=${SIM_SEEDS:-20000}
 case $mode in
 --mutant-run)
     case $2 in
-    scn:*) exec "$B"/test_repl_mut --mutant "${2#scn:}" ;;
+    scn:*:*) m=${2#scn:} && exec "$B"/test_repl_mut --mutant "${m%%:*}" 2>&1 ;;
     sim:*)
         m=${2#sim:} n=$SIM_SEEDS
         case $m in *@*) n=${m#*@} m=${m%@*} ;; esac
-        exec "$B"/sim_repl_mut --mutant "$m" --seeds "$n" ;;
+        exec "$B"/sim_repl_mut --mutant "$m" --seeds "$n" 2>/dev/null ;;
     esac
     exit 2 ;;
 --mutant-verify)
+    # $3 the exit status, $4 the log. A scenario's bug is killed only by exit 1 with a failure line of that scenario
+    # before "scenario(s) failed": a crash (139), an unknown bug number (2) or a missing binary (127) is not caught.
     case $2 in
-    scn:*) [ "$3" -ne 0 ] && echo "KILLED" ;;
+    scn:*:*)
+        s=${2##*:}
+        [ "$3" = 1 ] && awk -v s="test_repl: $s:" 'index($0, s) { f = 1 } f && /scenario\(s\) failed/ { ok = 1 }
+            END { exit !ok }' "$4" && echo "KILLED by $s" ;;
+    scn:*) exit 2 ;;
     *) grep -m1 KILLED "$4" ;;
     esac
     exit ;;
@@ -76,7 +86,7 @@ mutants() {
     for m in $2; do list="$list sim:$m"; done
     for m in $scenarios; do list="$list scn:$m"; done
     # MUTANT_JOBS, MUTANT_TIMEOUT; one that survives (or hangs) fails the run
-    SIM_SEEDS=$seeds "$(dirname "$0")"/../tools/mutants.sh --name sim_repl --stdout-only --timeout "${MUTANT_TIMEOUT:-3600}" \
+    SIM_SEEDS=$seeds "$(dirname "$0")"/../tools/mutants.sh --name sim_repl --timeout "${MUTANT_TIMEOUT:-3600}" \
         --verify "$0" --list "$list" -- "$0" --mutant-run @M@ @D@ || {
         echo "sim_repl.sh: a planted bug survived: the checker lost its teeth"
         exit 1

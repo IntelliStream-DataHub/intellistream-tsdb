@@ -467,7 +467,14 @@ impl Outage {
         let bin = common::tsdbd().with_file_name("outage_server");
         let lib = common::tsdbd().with_file_name("liboutagefs.so");
         if !bin.exists() || !lib.exists() {
-            eprintln!("skipped: {} or {} is missing (make builds them on Linux)", bin.display(), lib.display());
+            // Linux builds both (make): missing there is a broken build, and a skip would hide every outage test.
+            assert!(
+                !cfg!(target_os = "linux"),
+                "{} or {} is missing: make builds them on Linux",
+                bin.display(),
+                lib.display()
+            );
+            eprintln!("skipped: {} or {} is missing (outagefs is Linux only)", bin.display(), lib.display());
             return None;
         }
         let dir = common::test_dir("tsdb-rust-outage");

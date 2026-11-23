@@ -693,7 +693,7 @@ static int start_node(int i, const char *crash_at, int *status)
             envp[ne++] = e4;
             atomic_fetch_add(&crashfs_tears, 1);
         } else
-            envp[ne++] = "CRASHFS_KEEP_OLD=1";
+            envp[ne++] = "CRASHFS_REWRITE=old";
     }
     envp[ne] = NULL;
     int64_t t_fork = now_ns();
@@ -3549,7 +3549,7 @@ int main(int argc, char **argv)
            faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses, restarts,
            rounds);
     if (use_crashfs)
-        printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_KEEP_OLD\n",
+        printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_REWRITE=old\n",
                (uint64_t)atomic_load(&crashfs_starts), (uint64_t)atomic_load(&crashfs_tears));
     printf("settles: %d (mean %lld ms, max %lld ms); proxy: %" PRIu64 " links held, %" PRIu64 " reset by a heal\n", settles,
            settles ? (long long)(settle_ms_total / settles) : 0, (long long)settle_ms_max, (uint64_t)atomic_load(&held_links),

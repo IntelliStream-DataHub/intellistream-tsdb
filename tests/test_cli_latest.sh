@@ -41,9 +41,20 @@ out=$(cli latest f i --end 1700000001000) || fail "latest --end"
 [ "$(cli latest f | cut -f2,3)" = "$(cli query f min max raw | tail -n 1)" ] || fail "not the last row of a raw read"
 # a name with a tab is escaped like everywhere
 cli latest 'odd	name' | grep -q '^odd\\tname	' || fail "name not escaped"
-# refusals
-if cli latest nosuch >/dev/null 2>&1; then fail "an unknown series was accepted"; fi
-if cli latest >/dev/null 2>&1; then fail "no series accepted"; fi
-if cli latest f --end >/dev/null 2>&1; then fail "--end without a time accepted"; fi
-if cli latest f --end x >/dev/null 2>&1; then fail "--end x accepted"; fi
+# refusals: status 1 or 2 and a message that says why (a crash or a missing binary is not a refusal); the controls
+# above are the same command lines with valid arguments
+. tests/cli_refuse.sh
+err=$dir/stderr
+refused() { # refused <word> <what> <args...>
+    local word=$1 what=$2 rc
+    shift 2
+    cli "$@" >/dev/null 2>"$err"
+    rc=$?
+    [ "$rc" -ne 0 ] || fail "$what was accepted"
+    cli_refusal_ok "$rc" "$err" "$word" || fail "$what: status $rc, stderr '$(head -c 200 "$err")': not a refusal saying '$word'"
+}
+refused 'nosuch: not found' "an unknown series" latest nosuch
+refused 'usage:' "no series" latest
+refused 'not found' "--end without a time" latest f --end
+refused 'cannot parse --end' "--end x" latest f --end x
 echo "test_cli_latest: ok"

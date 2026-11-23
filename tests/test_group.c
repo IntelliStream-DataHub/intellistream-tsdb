@@ -10,6 +10,7 @@
 #include "tsdb_calendar.h"
 
 #include <math.h>
+#include "watchdog.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +235,7 @@ static void test_sparse_local(tsdb *db)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_group", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdb-group-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[600];

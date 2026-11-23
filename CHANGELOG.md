@@ -294,6 +294,15 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
   function; `tsdb_abi_version` stays). The outage nemesis of `make jepsen` judges the last heal of a run, reports the
   heals it judged, keeps the server log of a failed run (also one that ends at a server that does not start or a final read that cannot connect), runs the servers with `fast_ms` 2000, extends a flapping heal's bound when the server logged a slow write probe after it and jepsen's own fdatasync was slow then too (never past 150 s after the heal: the heal fails there, naming the slow-probe lines; `tests/jepsen/mutant-slowprobe.sh`, in jepsen-selftest, plants a server that reports every probe slow), bounds the wait for the last heal at the run's end, and takes its seeds from `JEPSEN_OUTAGE_SEEDS`.
 
+### Fixed
+
+- **tsdbd: a storage domain whose volumes cannot be recovered stays DOWN no more.** After an outage of a domain whose only
+  volume was DIVERGED (or that holds no volume), nothing set the domain UP again: STATUS and the metrics reported an outage
+  that was over, and every request that names no volume (QUERY_MULTI, COMMIT, FLUSH) counted as a waiting worker. The
+  volume itself stays refused as DIVERGED (only a restart accepts the loss); the domain is UP when the storage works.
+  New option `flap_recover_ms` of `tsdb_health_options` (60000, the wait after a third DOWN in ten minutes, which was
+  fixed in the code).
+
 ## [0.10.0] - 2026-11-09
 
 **Disk format 9, wire protocol 14 (floor 12, so clients and servers of protocol 12 and up still talk), embedded C ABI 7.**

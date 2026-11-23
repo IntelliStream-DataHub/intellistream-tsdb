@@ -15,6 +15,7 @@
 #include "tsdb_calendar.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
 #include <stdio.h>
@@ -223,6 +224,7 @@ static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
+static int64_t from_ts = INT64_MIN; /* the start of the range query_rows asks for */
 static void query_rows(const char *dir, int *rc, long *rows)
 {
     tsdb_options o = opts();
@@ -234,7 +236,7 @@ static void query_rows(const char *dir, int *rc, long *rows)
         return;
     OK(tsdb_series_lookup(db, "s1", &id));
     long n = 0;
-    *rc = tsdb_query_raw(db, id, INT64_MIN, INT64_MAX, count_cb, &n);
+    *rc = tsdb_query_raw(db, id, from_ts, INT64_MAX, count_cb, &n);
     if (*rc == 0)
         *rows = n;
     tsdb_close(db);
@@ -361,13 +363,17 @@ static void make_db_3_granules(const char *dir)
     OK(tsdb_close(db));
 }
 
-/* a crafted index may be refused or answered, but never overflow a buffer (ASan) */
-static void query_safe(const char *dir)
+/* A query on a part whose index is valid but uneven: it must answer, and with exactly the rows the series holds
+   (a decode buffer too small for a granule overflows; ASan sees it, and without ASan the rows are wrong or it crashes,
+   which fails the child). */
+static long expect_rows;
+static void query_exact(const char *dir)
 {
     int rc;
     long rows;
     query_rows(dir, &rc, &rows);
-    CHECK(rc == 0 || rc == TSDB_ERR_CORRUPT);
+    CHECK(rc == 0);
+    CHECK(rows == expect_rows);
 }
 
 static void test_parts(const char *base)
@@ -411,8 +417,9 @@ static void test_parts(const char *base)
        the mapping (a shorter one goes through memcpy) */
     CHECK(in_child(merge_refused, part_dir));
 
-    /* the 8-row granule first in the index (entries 0 and 2 swapped, hash recomputed): the raw query sizes its decode
-       buffers by the largest granule it reads; sized by the first, it decoded 16 rows into room for 8 */
+    /* the 8-row granule first in the index (entries 0 and 2 swapped, hash recomputed): the rows of the series are out
+       of time order across granules, which the open refuses (it once reached the query, which sized its decode buffers
+       by the first granule: 16 rows decoded into room for 8; the next case reaches that shape with a valid index) */
     make_db_3_granules(part_dir);
     CHECK(find_part(part_dir, name, sizeof name));
     snprintf(path, sizeof path, "%s/%s", part_dir, name);
@@ -428,7 +435,55 @@ static void test_parts(const char *base)
         index_store(path, gs, 3);
     }
     free(gs);
-    CHECK(in_child(query_safe, part_dir));
+    CHECK(in_child(open_refused, part_dir));
+    rm_rf(part_dir);
+
+    /* a valid index with a short granule followed by longer ones: granules of 16 rows, 3000 rows in the first hour
+       of the series, then the hour cut (HOUR_CUT_MIN rows lie before the edge): the 188th granule has the 8 rows that
+       remain, and the hour after begins with granules of 16 again. A query that begins in the short granule decodes
+       8 rows first and then 16: it sizes its decode buffers by the largest granule it reads, not by the first
+       (sized by the first, it decoded 16 rows into room for 8). */
+    rm_rf(part_dir);
+    enum { HOUR_ROWS = 3000, NEXT_ROWS = 100, FROM_ROW = 2992 };
+    {
+        tsdb_options o = opts();
+        o.granule_rows = 16;
+        o.wal_max_batch_rows = 4; /* straight to a part */
+        tsdb *db;
+        tsdb_sid id;
+        OK(tsdb_open(part_dir, &o, &db));
+        OK(tsdb_series(db, "s1", &id));
+        static int64_t ts[HOUR_ROWS + NEXT_ROWS];
+        static float v[HOUR_ROWS + NEXT_ROWS];
+        int64_t hour0 = 472224LL * 3600000; /* a day start: hour 1 is in the same partition */
+        for (int i = 0; i < HOUR_ROWS + NEXT_ROWS; i++) {
+            ts[i] = hour0 + (i < HOUR_ROWS ? i : 3600 + (i - HOUR_ROWS)) * 1000LL;
+            v[i] = (float)(i % 11);
+        }
+        OK(tsdb_insert_series(db, id, ts, v, HOUR_ROWS + NEXT_ROWS));
+        OK(tsdb_close(db));
+    }
+    CHECK(find_part(part_dir, name, sizeof name));
+    snprintf(path, sizeof path, "%s/%s", part_dir, name);
+    buf = slurp(path, &len);
+    gs = index_load((const uint8_t *)buf, len, &f);
+    free(buf);
+    CHECK(gs && f.ngranules == 188 + 7);
+    if (gs && f.ngranules == 188 + 7) {
+        CHECK(gs[186].count == 16 && gs[187].count == 8 && gs[188].count == 16); /* the shape this case exists for */
+        long total = 0;
+        for (uint32_t i = 0; i < f.ngranules; i++)
+            total += gs[i].count;
+        CHECK(total == HOUR_ROWS + NEXT_ROWS);
+    }
+    free(gs);
+    expect_rows = HOUR_ROWS + NEXT_ROWS;
+    CHECK(in_child(query_exact, part_dir));
+    /* from the short granule on (the range starts at its first row) */
+    expect_rows = HOUR_ROWS + NEXT_ROWS - FROM_ROW;
+    from_ts = 472224LL * 3600000 + FROM_ROW * 1000LL;
+    CHECK(in_child(query_exact, part_dir));
+    from_ts = INT64_MIN;
     rm_rf(part_dir);
 }
 
@@ -1198,6 +1253,7 @@ static void test_check_order(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_crafted", 1200);
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
     char base[400];
     snprintf(base, sizeof base, "%s/tsdb-crafted-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());

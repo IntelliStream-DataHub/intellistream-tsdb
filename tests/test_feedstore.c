@@ -21,8 +21,11 @@
  */
 #define _GNU_SOURCE
 #include "internal.h"
+#include "scratch.h"
 
 #include <dirent.h>
+#include "watchdog.h"
+#include "require.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -1223,10 +1226,38 @@ static void test_stuck_seals_later(void)
     printf("  open: a replayed segment behind a failed rename is sealed too\n");
 }
 
+/* The leftover of an interrupted disable (FEEDSLOTS.tmp) in a feed-off database is removed by the open: feed_dir_state
+ * finds it by scanning the directory (the scan rewinds first: the dup shares its offset with dirfd). Nothing scanned
+ * dirfd before that scan at the open, so tests/rewind_mutants.sh classes that rewinddir as one no test can tell
+ * (equivalent today); this test keeps the behaviour. */
+static void test_dir_scan_after_scan(void)
+{
+    char dir[PATH_MAX + 32], p[PATH_MAX + 64];
+    fresh("scan_twice", dir, sizeof dir);
+    eng *db;
+    uint32_t s;
+    CHECK(open_eng(dir, &db) == 0 && eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    rows(db, s, T0, 500);
+    CHECK(eng_flush(db) == 0);
+    CHECK(eng_close(db) == 0);
+    snprintf(p, sizeof p, "%s/FEEDSLOTS.tmp", dir);
+    int fd = open(p, O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && write(fd, "x", 1) == 1);
+    if (fd >= 0)
+        close(fd);
+    CHECK(exists(dir, "FEEDSLOTS.tmp"));
+    CHECK(open_eng(dir, &db) == 0);
+    CHECK(!exists(dir, "FEEDSLOTS.tmp")); /* the open finished the disable that left it */
+    CHECK(db && !atomic_load(&db->feed_on));
+    if (db)
+        CHECK(eng_close(db) == 0);
+    printf("  the open scans the directory from its start after the scans before it (FEEDSLOTS.tmp removed)\n");
+}
+
 static void test_power_replay(void)
 {
     if (access(SHIM, R_OK) != 0) {
-        printf("  power loss at the replay: skipped (no %s)\n", SHIM);
+        failures += tr_crashfs_missing("power loss at the replay", SHIM);
         return;
     }
     char dir[PATH_MAX + 32], src[PATH_MAX + 32];
@@ -1266,6 +1297,7 @@ static void test_power_replay(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_feedstore", 1200);
     if (argc == 4 && strcmp(argv[1], "--child") == 0 && strcmp(argv[2], "replay") == 0) {
         feed_test_free_hook(free_hook, NULL);
         if (getenv("FEEDSTORE_MUTANT"))
@@ -1285,7 +1317,7 @@ int main(int argc, char **argv)
         else
             return 2;
     }
-    snprintf(S, sizeof S, "%s", argc > 1 ? argv[1] : "/tmp");
+    snprintf(S, sizeof S, "%s", scratch_make(argc > 1 ? argv[1] : "/tmp", "test_feedstore")); /* its own directory */
     if (!realpath(self, SELF))
         snprintf(SELF, sizeof SELF, "%s", self);
     char *slash = strrchr(SELF, '/');
@@ -1296,6 +1328,7 @@ int main(int argc, char **argv)
             test_floor_order(); /* the floor set after the unlinks */
         else
             test_power_replay(); /* the replayed segment renamed without its fdatasync: only a power loss sees it */
+        scratch_done(0); /* the planted bug is expected to fail: nothing to keep */
         printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
         return failures != 0;
     }
@@ -1318,7 +1351,12 @@ int main(int argc, char **argv)
     test_slot_halves();
     test_feedcheck();
     test_info();
+    test_dir_scan_after_scan();
     test_power_replay();
-    printf(failures ? "FAILED: %d\n" : "all ok\n", failures);
+    scratch_done(failures);
+    if (failures)
+        printf("FAILED: %d\n", failures);
+    else
+        printf("all ok%s\n", tr_skips());
     return failures != 0;
 }

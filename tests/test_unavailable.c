@@ -11,8 +11,10 @@
 #include "tsdb.h"
 #include "tsdb_client.h"
 #include <limits.h>
+#include "watchdog.h"
 #include "harness.h"
 #include "outagefs_ctl.h"
+#include "outage_status.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -23,13 +25,15 @@
 #include <sys/wait.h>
 #include <time.h>
 
+/* Every check is a verdict: nothing is run again and no failure is excused by a busy machine. A bound on a time is
+ * what tsdb promises (the client's retry budget), not what one machine happened to take. */
 static int failures;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            fprintf(stderr, "%s:%d: FAILED: %s\n", __FILE__, __LINE__, #cond); \
-            failures++;                                                        \
-        }                                                                      \
+#define CHECK(cond)                                                                                                    \
+    do {                                                                                                               \
+        if (!(cond)) {                                                                                                 \
+            fprintf(stderr, "%s:%d: FAILED: %s\n", __FILE__, __LINE__, #cond);                                        \
+            failures++;                                                                                                \
+        }                                                                                                              \
     } while (0)
 
 static char ctl[256], root[512];
@@ -228,6 +232,7 @@ int main(int argc, char **argv)
     const char *names[] = {"a"};
     if (outagefs_reexec(argv, base, names, 1) != 0)
         return 1;
+    th_watchdog("test_unavailable", 600);
     const char *dir_a = outagefs_dir("a");
     snprintf(ctl, sizeof ctl, "%s", getenv("OUTAGEFS_CTL"));
     snprintf(root, sizeof root, "%s.root", getenv("OUTAGEFS_CTL"));
@@ -262,7 +267,10 @@ int main(int argc, char **argv)
     if (t) {
         CHECK(t->nnodes == 1 && t->nvols == 2);
         for (size_t i = 0; i < t->nvols; i++)
-            CHECK(t->vols[i].health == TSDB_HEALTH_AVAILABLE && t->vols[i].role == TSDB_ROLE_OWNER);
+            {
+                CHECK(t->vols[i].health == TSDB_HEALTH_AVAILABLE);
+                CHECK(t->vols[i].role == TSDB_ROLE_OWNER);
+            }
         tsdbc_topology_free(t);
     }
     char *status = NULL;
@@ -271,7 +279,7 @@ int main(int argc, char **argv)
 
     /* the domain hangs and goes DOWN */
     CHECK(fault("hang", dir_a) == 0);
-    msleep(4500);
+    CHECK(os_await_domain_down(c, vol_a, 30000) >= 0);
     int64_t ts = 2000;
     int rc = tsdbc_insert_series(c, sid_a, &ts, &v, 1);
     CHECK(rc == TSDB_ERR_UNAVAILABLE);
@@ -309,7 +317,7 @@ int main(int argc, char **argv)
     struct caller shortb = {.budget_ms = 1200, .ts = 3000};
     call_insert(&shortb);
     CHECK(shortb.rc == TSDB_ERR_UNAVAILABLE);
-    CHECK(shortb.ms >= 600 && shortb.ms < 4000);
+    CHECK(shortb.ms >= 600 && shortb.ms < 1200 + 5000); /* the budget (1200), and at most a retry's wait and a call beyond it */
 
     /* the default budget: the call waits, the volume heals, the call succeeds (once) */
     struct caller longb = {.budget_ms = 30000, .ts = 4000};
@@ -319,7 +327,7 @@ int main(int argc, char **argv)
     CHECK(fault("heal", dir_a) == 0);
     pthread_join(th, NULL);
     CHECK(longb.rc == 0); /* mutation "no retry": UNAVAILABLE */
-    CHECK(longb.ms >= 1200 && longb.ms < 25000);
+    CHECK(longb.ms >= 1200 && longb.ms < 30000); /* healed at 1.5 s, inside the budget (30 s) */
 
     /* the rows: 1000 and 4000 of A, not 2000 and 3000 (refused) */
     size_t n = 0;
@@ -330,7 +338,9 @@ int main(int argc, char **argv)
         if (qrc)
             msleep(100);
     }
-    CHECK(qrc == 0 && n == 2);
+    CHECK(qrc == 0);
+    CHECK(n <= 2); /* 1000 and 4000 only: a refused row (2000, 3000) that shows up is a ghost, whatever the machine does */
+    CHECK(n == 2);
 
     tsdbc_close(c);
     CHECK(kill(server, SIGTERM) == 0);

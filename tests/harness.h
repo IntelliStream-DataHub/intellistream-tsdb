@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -20,6 +21,34 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "watchdog.h"
+
+/* SIGTERM to a server this test started and wait for it, for at most `ms`: a server that does not stop (a hung
+ * shutdown) is killed and reported, never waited for forever. Returns the wait status; *hung is set to 1 for a kill. */
+static inline int th_stop(pid_t pid, int ms, int *hung)
+{
+    int status = 0;
+    if (hung)
+        *hung = 0;
+    if (pid <= 0) /* kill(0 or -1) would signal the process group or every process of the user */
+        return status;
+    kill(pid, SIGTERM);
+    for (int waited = 0; waited < ms; waited += 5) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid)
+            return status;
+        if (r < 0 && errno != EINTR)
+            return -1; /* not our child, or reaped elsewhere: no exit status to vouch for */
+        usleep(5000);
+    }
+    fprintf(stderr, "harness: tsdbd (pid %d) did not stop within %d ms of SIGTERM: killed\n", (int)pid, ms);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    if (hung)
+        *hung = 1;
+    return status;
+}
 
 /* "--exit-with-parent=PID" for a tsdbd this process is about to fork, PID being this process: the server stops once
  * the test is gone, and refuses to start when it is gone already. Call it before the fork: in the child, getppid()

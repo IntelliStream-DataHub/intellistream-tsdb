@@ -117,8 +117,20 @@ fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
     if apple {
         // Mach-O: `ld -r` with an exported-symbols list turns every other global into a local symbol
         // (they are private externs, which -r makes local unless -keep_private_externs is given)
+        // The list names every public symbol the objects define, written out: ld64 has no exclusion pattern, and it
+        // refuses -exported_symbols_list together with -unexported_symbols_list. The tsdb_test_* hooks (they
+        // reach into the engine and can corrupt a database) are left out. Untested on a Mac (docs/tasks/macos.md).
         let list = out.join("tsdb_exports.txt");
-        std::fs::write(&list, "_tsdb_*\n").expect("write the exported symbols list");
+        let nm = std::process::Command::new("nm").args(["-gUj"]).args(&objects).output().expect("run nm");
+        assert!(nm.status.success(), "nm failed to list the engine's symbols");
+        let names: std::collections::BTreeSet<&str> = std::str::from_utf8(&nm.stdout)
+            .expect("nm output")
+            .lines()
+            .filter(|n| n.starts_with("_tsdb_") && !n.starts_with("_tsdb_test_"))
+            .collect();
+        assert!(names.contains("_tsdb_open"), "nm listed no _tsdb_open: the exported symbols list would be empty");
+        let text: String = names.iter().map(|n| format!("{n}\n")).collect();
+        std::fs::write(&list, text).expect("write the exported symbols list");
         let mut cmd = cc.to_command();
         cmd.args(["-r", "-nostdlib", "-Wl,-exported_symbols_list"]).arg(format!("-Wl,{}", list.display()));
         let status = cmd.arg("-o").arg(&merged).args(&objects).status();
@@ -130,13 +142,40 @@ fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
     println!("cargo:rerun-if-env-changed=OBJCOPY");
     let tools = env::var("OBJCOPY").map(|o| vec![o]).unwrap_or_else(|_| vec!["objcopy".into(), "llvm-objcopy".into()]);
     for tool in &tools {
-        let status =
-            std::process::Command::new(tool).args(["--wildcard", "--keep-global-symbol=tsdb_*"]).arg(&merged).status();
+        // The test hooks match tsdb_* as well: they are localized by name (tools/libtsdb.map does the same for
+        // libtsdb.so), whatever the order in which the tool applies the two options.
+        let status = std::process::Command::new(tool)
+            .args(["--wildcard", "--keep-global-symbol=tsdb_*", "--localize-symbol=tsdb_test_*"])
+            .arg(&merged)
+            .status();
         match status {
-            Ok(s) if s.success() => return vec![merged],
+            Ok(s) if s.success() => {
+                assert_no_test_hooks(&merged);
+                return vec![merged];
+            }
             Ok(s) => panic!("{tool} failed ({s}) to localize the engine's internal symbols"),
             Err(_) => continue,
         }
     }
     panic!("no objcopy found (tried {tools:?}; set OBJCOPY) to localize the engine's internal symbols");
+}
+
+/// Fails the build when the merged object still exports a `tsdb_test_*` hook (they can corrupt a database).
+/// ELF only (the Apple list excludes them by pattern); skipped with a warning when no `nm` is installed.
+fn assert_no_test_hooks(merged: &Path) {
+    println!("cargo:rerun-if-env-changed=NM");
+    let tools = env::var("NM").map(|o| vec![o]).unwrap_or_else(|_| vec!["nm".into(), "llvm-nm".into()]);
+    for tool in &tools {
+        let Ok(out) = std::process::Command::new(tool).args(["-g", "--defined-only"]).arg(merged).output() else {
+            continue;
+        };
+        assert!(out.status.success(), "{tool} failed to list the symbols of the engine object");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let hooks: Vec<&str> =
+            text.lines().filter_map(|l| l.split_whitespace().last()).filter(|n| n.starts_with("tsdb_test_")).collect();
+        assert!(hooks.is_empty(), "the engine object still exports test hooks: {hooks:?}");
+        assert!(text.contains(" tsdb_open"), "the engine object exports no tsdb_open: the symbol check read nothing");
+        return;
+    }
+    println!("cargo:warning=no nm found (set NM): the test hooks were not checked");
 }

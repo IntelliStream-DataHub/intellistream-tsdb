@@ -12,28 +12,41 @@ cd "$(dirname "$0")/.."
 B=${B:-build}
 dir=$(mktemp -d "${TMPDIR:-/tmp}/tsdb-cli-input.XXXXXX")
 trap 'rm -rf "$dir"' EXIT
+. tests/cli_refuse.sh
 errors=0
 fail() { echo "test_cli_input: FAIL: $*" >&2; errors=$((errors + 1)); }
 t() { "$B/tsdb" "$dir/db" "$@"; }
-refused() { # refused <what> <stdin> <args...>: the command must fail and change nothing
-    local what=$1 input=$2
-    shift 2
-    if printf '%s' "$input" | t "$@" >/dev/null 2>&1; then fail "$what was accepted"; fi
+err=$dir/stderr
+refused() { # refused <word> <what> <stdin> <args...>: the command fails with status 1 or 2, its stderr says <word>
+    local word=$1 what=$2 input=$3 rc
+    shift 3
+    printf '%s' "$input" | t "$@" >/dev/null 2>"$err"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        fail "$what was accepted"
+    elif ! cli_refusal_ok "$rc" "$err" "$word"; then
+        fail "$what: status $rc, stderr '$(head -c 200 "$err")': not a refusal that says '$word'"
+    fi
 }
+# the helper itself must reject a crash, a missing binary and a silent failure
+echo 'Segmentation fault' >"$err"
+for bad in 139 127 124 0; do ! cli_refusal_ok $bad "$err" Segmentation || fail "cli_refusal_ok accepts status $bad"; done
+: >"$err"
+! cli_refusal_ok 1 "$err" tsdb || fail "cli_refusal_ok accepts a silent failure"
 
 t create f32 --type float32 >/dev/null || fail "create f32"
 t create f64 --type float64 >/dev/null || fail "create f64"
 t create i64 --type int64 >/dev/null || fail "create i64"
 
 # numbers: no clamping to the largest value or to inf, no silent null
-refused "int64 below the range" $'1000,-99999999999999999999\n' insert i64
-refused "int64 above the range" $'1000,99999999999999999999\n' insert i64
-refused "int64 null value" $'1000,-9223372036854775808\n' insert i64
-refused "float64 1e999" $'1000,1e999\n' insert f64
-refused "float64 null NaN" $'1000,nan(0x8000000001001)\n' insert f64
-refused "float32 1e39" $'1000,1e39\n' insert f32
-refused "float32 null NaN" $'1000,nan(0x401001)\n' insert f32
-refused "import int64 overflow" $'i64,1000,99999999999999999999\n' import
+refused 'cannot parse' "int64 below the range" $'1000,-99999999999999999999\n' insert i64
+refused 'cannot parse' "int64 above the range" $'1000,99999999999999999999\n' insert i64
+refused 'cannot parse' "int64 null value" $'1000,-9223372036854775808\n' insert i64
+refused 'cannot parse' "float64 1e999" $'1000,1e999\n' insert f64
+refused 'cannot parse' "float64 null NaN" $'1000,nan(0x8000000001001)\n' insert f64
+refused 'cannot parse' "float32 1e39" $'1000,1e39\n' insert f32
+refused 'cannot parse' "float32 null NaN" $'1000,nan(0x401001)\n' insert f32
+refused 'cannot parse' "import int64 overflow" $'i64,1000,99999999999999999999\n' import
 printf '1000,-9223372036854775807\n2000,9223372036854775807\n' | t insert i64 >/dev/null 2>&1 || fail "int64 limits"
 printf '1000,inf\n2000,-inf\n3000,1e-999\n' | t insert f64 >/dev/null 2>&1 || fail "explicit inf, underflow"
 out=$(t query i64 min max raw 2>/dev/null | cut -f2 | tr '\n' ' ')
@@ -42,31 +55,38 @@ out=$(t query f64 min max count 2>/dev/null | cut -f2)
 [ "$out" = 3 ] || fail "float64 rows: $out"
 
 # times: no wrap, no 99:99:99, no 02-31
-refused "drop-before year 2147483647" "" drop-before 2147483647-01-01
-refused "delete at 99:99:99" "" delete i64 '2024-01-01 99:99:99' max
-refused "delete at 24:00:00" "" delete i64 '2024-01-01 24:00:00' max
-refused "delete from 02-31" "" delete i64 2023-02-31 max
-refused "delete from 2023-02-29" "" delete i64 2023-02-29 max
-refused "delete from month 13" "" delete i64 2023-13-01 max
-refused "delete from day 0" "" delete i64 2023-01-00 max
-refused "delete at 00:60:00" "" delete i64 '2024-01-01 00:60:00' max
-refused "delete at 00:00:60" "" delete i64 '2024-01-01 00:00:60' max
-refused "delete before now+2^63-808ms (an interval in range, a sum past int64)" "" delete i64 min now+9223372036854775000
-refused "delete before now-1e18d" "" delete i64 min now-1e18d
-refused "delete before an integer past int64" "" delete i64 min 99999999999999999999
-refused "retention 1e30" "" retention i64 1e30
-refused "retention inf" "" retention i64 inf
-refused "query by nan" "" query i64 min max avg nan
-refused "query by 1e30d" "" query i64 min max avg 1e30d
+refused 'usage:' "drop-before year 2147483647" "" drop-before 2147483647-01-01
+refused 'usage:' "delete at 99:99:99" "" delete i64 '2024-01-01 99:99:99' max
+refused 'usage:' "delete at 24:00:00" "" delete i64 '2024-01-01 24:00:00' max
+refused 'usage:' "delete from 02-31" "" delete i64 2023-02-31 max
+refused 'usage:' "delete from 2023-02-29" "" delete i64 2023-02-29 max
+refused 'usage:' "delete from month 13" "" delete i64 2023-13-01 max
+refused 'usage:' "delete from day 0" "" delete i64 2023-01-00 max
+refused 'usage:' "delete at 00:60:00" "" delete i64 '2024-01-01 00:60:00' max
+refused 'usage:' "delete at 00:00:60" "" delete i64 '2024-01-01 00:00:60' max
+refused 'usage:' "delete before now+2^63-808ms (an interval in range, a sum past int64)" "" delete i64 min now+9223372036854775000
+refused 'usage:' "delete before now-1e18d" "" delete i64 min now-1e18d
+refused 'usage:' "delete before an integer past int64" "" delete i64 min 99999999999999999999
+refused 'usage:' "retention 1e30" "" retention i64 1e30
+refused 'usage:' "retention inf" "" retention i64 inf
+refused 'cannot parse group' "query by nan" "" query i64 min max avg nan
+refused 'cannot parse group' "query by 1e30d" "" query i64 min max avg 1e30d
+# the controls: each refused command line, with a valid value, is accepted (so a typo cannot pass for a refusal)
+t drop-before 1969-01-01 >/dev/null 2>&1 || fail "control: drop-before"
+t create ret --type float32 >/dev/null || fail "create ret"
+t retention ret 30d >/dev/null 2>&1 || fail "control: retention 30d"
+t retention ret off >/dev/null 2>&1 || fail "control: retention off"
+t delete i64 2023-02-28 '2023-03-01 23:59:59' >/dev/null 2>&1 || fail "control: delete with valid dates"
+t query i64 min max avg 1h >/dev/null 2>&1 || fail "control: group 1h"
 t delete f64 2024-02-29 '2024-02-29 23:59:59.999Z' >/dev/null 2>&1 || fail "a leap day"
 [ "$(t query i64 min max count 2>/dev/null | cut -f2)" = 2 ] || fail "a refused command deleted rows"
 
 # --limit and group counts
-refused "--limit abc" "" query i64 min max raw --limit abc
-refused "--limit -1" "" query i64 min max raw --limit -1
-refused "--limit 5x" "" query i64 min max raw --limit 5x
-refused "--limit 0" "" query i64 min max raw --limit 0
-refused "group 4294967297h" "" query i64 min max avg 4294967297h
+refused '--limit wants a positive number' "--limit abc" "" query i64 min max raw --limit abc
+refused '--limit wants a positive number' "--limit -1" "" query i64 min max raw --limit -1
+refused '--limit wants a positive number' "--limit 5x" "" query i64 min max raw --limit 5x
+refused '--limit wants a positive number' "--limit 0" "" query i64 min max raw --limit 0
+refused 'cannot parse group' "group 4294967297h" "" query i64 min max avg 4294967297h
 out=$(t query i64 min max raw --limit 1 2>/dev/null | wc -l)
 [ "$out" -eq 1 ] || fail "--limit 1 gave $out rows" # numeric: BSD wc pads
 

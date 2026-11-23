@@ -21,6 +21,8 @@
 #include "users.c" /* -Iserver: the record builders and the batch internals */
 
 #include <ftw.h>
+#include "seed.h"
+#include "watchdog.h"
 #include <limits.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -457,7 +459,7 @@ static void globs(void)
     CHECK(us_each < 500); /* about 1 us measured; quadratic would be far beyond, even under sanitizers */
     free(name);
     /* random patterns over a small alphabet against the recursive matcher */
-    unsigned seed = 12345;
+    unsigned seed = (unsigned)ts_seed("glob patterns", 12345);
     const char alpha[] = "ab/*?\\";
     for (int i = 0; i < 200000; i++) {
         char g[12], s[12];
@@ -509,7 +511,7 @@ static double ms_since(const struct timespec *t0)
  * backtracking matcher). */
 static void globs_linear(void)
 {
-    unsigned seed = 4242;
+    unsigned seed = (unsigned)ts_seed("glob linear", 4242);
     int matched = 0;
     for (int i = 0; i < 20000; i++) {
         char g[700], s[1400];
@@ -749,7 +751,7 @@ static void name_table(void)
     users us;
     memset(&us, 0, sizeof us);
     us.fd = -1;
-    unsigned seed = 11;
+    unsigned seed = (unsigned)ts_seed("users 11", 11);
     uint32_t next = 1;
     char name[32];
     int bad = 0;
@@ -808,7 +810,7 @@ static void matching(void)
     free_user(u);
 
     /* random users and names: the index answers what trying every grant answers */
-    unsigned seed = 7;
+    unsigned seed = (unsigned)ts_seed("users 7", 7);
     const char alpha[] = "ab/";
     for (int round = 0; round < 300; round++) {
         user *r = mk(1, "r", 0);
@@ -2092,6 +2094,7 @@ static void group_set(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_users", 1200);
     snprintf(base_dir, sizeof base_dir, "%s", argc > 1 ? argv[1] : "/tmp");
     char self[PATH_MAX];
     ssize_t n = tp_self_exe(self, sizeof self);

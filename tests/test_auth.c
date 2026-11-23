@@ -1034,6 +1034,7 @@ static void test_rfc7677_server(const char *base)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    th_watchdog("test_auth", 600);
     printf("test_auth (%s)\n", getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default io");
     char dir[PATH_MAX + 16];
     snprintf(dir, sizeof dir, "%s/tsdbd-auth-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());

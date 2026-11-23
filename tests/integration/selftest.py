@@ -10,6 +10,8 @@ failure into a pass.
                 a server that cannot start is an error
   signals       SIGTERM while the main thread holds the process-list lock must not deadlock the driver
   verdicts      mutate.py counts a crashed driver or a hang as a problem, never as a caught bug
+  mutants       every mutate.py mutant still applies (its text occurs exactly once) and names a scenario run.py has:
+                a mutant that no longer applies is an ERROR nobody sees until someone runs mutate.py
   float sums    a float sum whose NaN-ness depends on the order of additions is neither compared between layouts
                 nor predicted by the model; one that is NaN in every order is compared bit for bit
 
@@ -209,6 +211,22 @@ def test_verdicts():
     check(got == "CAUGHT", "a timeout of a hang mutant -> %s (wanted CAUGHT)" % got)
 
 
+def test_mutants_apply():
+    print("mutants")
+    import mutate
+    import run
+    ids = [m["id"] for m in mutate.M]
+    check(len(ids) == len(set(ids)), "the mutant ids are unique (duplicates: %s)" % sorted(i for i in set(ids) if ids.count(i) > 1))
+    check(len(ids) >= 23, "at least 23 mutants (have %d)" % len(ids))
+    for m in mutate.M:
+        path = ROOT / m["file"]
+        check(path.exists(), "%s: %s exists" % (m["id"], m["file"]))
+        n = path.read_text().count(m["old"]) if path.exists() else 0
+        check(n == 1, "%s: its text occurs once in %s (found %d times): %s" % (m["id"], m["file"], n, m["what"][:60]))
+        check(m["old"] != m["new"], "%s: the mutation changes the text" % m["id"])
+        check(m["scen"] in run.SCENARIOS, "%s: scenario %r is one of run.py's" % (m["id"], m["scen"]))
+
+
 def test_float_sums():
     print("float sums")
     import run
@@ -242,6 +260,7 @@ def main():
         print("build/tsdbd and build/tsdb are missing: run make", file=sys.stderr)
         return 2
     test_verdicts()
+    test_mutants_apply()
     test_float_sums()
     test_ports()
     test_signal_while_locked()

@@ -15,6 +15,7 @@
 #include "lttb_ref.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <stddef.h>
 #include <fcntl.h>
 #include <math.h>
@@ -590,6 +591,7 @@ static int64_t lttb_clock(void *arg)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_lttb", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdb-lttb-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[600];

@@ -5,8 +5,8 @@
  *
  *   READY port sid_a sid_root vol_a
  *
- * and then answers one command per stdin line with "ok": `down` (A's storage hangs; replies once the server has
- * declared the volume DOWN, about 4.5 s), `heal` (A's storage answers again; the volume recovers by itself in
+ * and then answers one command per stdin line with "ok": `down` (A's storage hangs; replies once STATUS says the
+ * volume's domain is down, about 2.5 s, "err" after 30 s), `heal` (A's storage answers again; the volume recovers by itself in
  * about two seconds), `quit`. End of stdin quits too: the server is stopped (by its pid) and its status checked
  * (the last line printed is "exit N").
  *
@@ -17,6 +17,7 @@
 #include <limits.h>
 #include "harness.h"
 #include "outagefs_ctl.h"
+#include "outage_status.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -24,12 +25,6 @@
 #include <time.h>
 
 static char ctl[256], root[512];
-
-static void msleep(int ms)
-{
-    struct timespec d = {ms / 1000, (long)(ms % 1000) * 1000000L};
-    nanosleep(&d, NULL);
-}
 
 static int fault(const char *cmd, const char *dir)
 {
@@ -99,7 +94,18 @@ int main(int argc, char **argv)
         int rc = 0;
         if (!strncmp(line, "down", 4)) {
             rc = fault("hang", dir_a);
-            msleep(4500);
+            if (!rc) {
+                tsdbc *c = NULL;
+                if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) != 0) {
+                    fprintf(stderr, "outage_server: cannot connect to ask STATUS\n");
+                    rc = -1;
+                } else {
+                    tsdbc_set_retry(c, 0);
+                    if (os_await_domain_down(c, (unsigned)TSDB_SID_VOLUME(sid_a), 30000) < 0)
+                        rc = -1;
+                    tsdbc_close(c);
+                }
+            }
         } else if (!strncmp(line, "heal", 4)) {
             rc = fault("heal", dir_a);
         } else if (!strncmp(line, "quit", 4)) {

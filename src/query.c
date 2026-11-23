@@ -1044,6 +1044,7 @@ typedef struct agg_job {
 } agg_job;
 
 uint64_t query_rows_per_thread = QUERY_ROWS_PER_THREAD;
+_Atomic int query_threads_peak;
 
 int query_threads_for(const eng *db, uint64_t rows, size_t items)
 {
@@ -1051,7 +1052,11 @@ int query_threads_for(const eng *db, uint64_t rows, size_t items)
     uint64_t t = rows / per;
     t = MIN(t, (uint64_t)items);
     t = MIN(t, (uint64_t)db->opt.query_threads);
-    return t > 1 ? (int)t : 1;
+    int r = t > 1 ? (int)t : 1;
+    /* test_threads: the most threads any step asked for (a load and a compare once the peak is reached) */
+    if (r > atomic_load_explicit(&query_threads_peak, memory_order_relaxed))
+        atomic_store_explicit(&query_threads_peak, r, memory_order_relaxed);
+    return r;
 }
 
 /* The passes over a dense array of bucket states that are not per granule (setting the states up, turning them into

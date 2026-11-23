@@ -1,5 +1,8 @@
 /* Exported symbols of libtsdb.so: the public API of include/tsdb.h and
- * include/tsdb_calendar.h, nothing internal (and the tsdb_test_* hooks of the tests, which link against the .so).
+ * include/tsdb_calendar.h, nothing internal. The test hooks (tsdb_test_*, declared in src/internal.h or in the tests
+ * themselves) reach into the engine and can corrupt a database, so a binding must not find them. They match
+ * tsdb_*, and the linker prefers a name written out in full to a pattern, so each is named below as local. A new
+ * hook needs a line here: tests/test_shared.c fails on any exported name that no public header declares.
  * The tsdb_ec_* functions are the erasure codec's glue (src/ec/compat.c): internal, and a caller could lift the CPU
  * level cap with tsdb_ec_select. The tsdb_cvol_* functions (src/cvol.h) are tsdbd's hold on cluster volumes (declare,
  * open, swap, promote) and tsdb_volume_diverged (R8, also in src/cvol.h): internal as well; tsdbd and test_cvol link
@@ -9,13 +12,6 @@
     global:
         tsdb_*;
     local:
-        tsdb_ec_cpu_has;
-        tsdb_ec_now_ns;
-        tsdb_ec_panic;
-        tsdb_ec_prefer_512;
-        tsdb_ec_select;
-        tsdb_ec_strlcpy;
-        tsdb_ec_xmalloc;
         tsdb_cvol_declare;
         tsdb_cvol_find;
         tsdb_cvol_fno_create;
@@ -28,6 +24,40 @@
         tsdb_cvol_test_replace_arg;
         tsdb_cvol_test_replace_hook;
         tsdb_cvol_unref;
+        tsdb_ec_cpu_has;
+        tsdb_ec_now_ns;
+        tsdb_ec_panic;
+        tsdb_ec_prefer_512;
+        tsdb_ec_select;
+        tsdb_ec_strlcpy;
+        tsdb_ec_xmalloc;
+        tsdb_test_before_parts;
+        tsdb_test_class_switch;
+        tsdb_test_deferred_retires;
+        tsdb_test_dict_fault;
+        tsdb_test_ec_retries;
+        tsdb_test_engine;
+        tsdb_test_fence_wakeups;
+        tsdb_test_granules;
+        tsdb_test_kept_names;
+        tsdb_test_latest_hook;
+        tsdb_test_latest_nowarm;
+        tsdb_test_latest_stats;
+        tsdb_test_latest_window;
+        tsdb_test_latest_wr_held;
+        tsdb_test_mark_ec;
+        tsdb_test_mem_cap;
+        tsdb_test_meta_hold;
+        tsdb_test_meta_release;
+        tsdb_test_meta_use;
+        tsdb_test_midplace;
+        tsdb_test_observe;
+        tsdb_test_precommit;
+        tsdb_test_reopen_hook;
+        tsdb_test_replica_drops_files;
+        tsdb_test_replica_drops_floor;
+        tsdb_test_settle;
+        tsdb_test_wal_state;
         tsdb_volume_diverged;
         *;
 };

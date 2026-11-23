@@ -22,6 +22,8 @@
 #include "tsdb.h"
 
 #include <math.h>
+#include "seed.h"
+#include "watchdog.h"
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -800,6 +802,7 @@ static void test_max_buckets(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_limits", 1200);
     snprintf(base, sizeof base, "%s/tsdb_limits_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rmrf(base);
     char cmd[600];
@@ -809,6 +812,8 @@ int main(int argc, char **argv)
 #ifndef LIMITS_STATS_ONLY
     if (argc > 2) /* another seed */
         rng = strtoull(argv[2], NULL, 0) | 1;
+    else
+        rng = ts_seed("limits", rng) | 1;
     test_random(1, 300);
     test_random(4, 200);
     printf("test_limits: %d random queries against compute-all-then-cut\n", queries);

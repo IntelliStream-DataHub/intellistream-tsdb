@@ -19,6 +19,8 @@
 #include "internal.h"
 
 #include <dirent.h>
+#include "watchdog.h"
+#include "require.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -391,7 +393,7 @@ static void test_v8_part_not_allowed(void)
 static void test_power_loss(void)
 {
     if (access(CLI, X_OK) != 0 || access(SHIM, R_OK) != 0) {
-        printf("  power loss during the upgrade: skipped (no %s or %s)\n", CLI, SHIM);
+        failures += tr_crashfs_missing("power loss during the upgrade", access(CLI, X_OK) != 0 ? CLI : SHIM);
         return;
     }
     char top[PATH_MAX + 16], db[PATH_MAX + 16], vol[PATH_MAX + 16];
@@ -458,13 +460,23 @@ static void test_power_loss(void)
            "the open refuses or works, a second run finishes, the rows are the same\n", crashes, half);
 }
 
-/* An optional check with the binary of 0.9.0 itself (TSDB_V090_CLI): it refuses what the upgrade made, loudly. */
+/* An optional check with the binary of 0.9.0 itself (TSDB_V090_CLI; TSDB_REQUIRE_V090_CLI=1 makes a
+ * missing one a failure): it refuses what the upgrade made, loudly. */
 static void test_old_binary(void)
 {
     const char *old = getenv("TSDB_V090_CLI");
     if (!old) {
-        printf("  the 0.9.0 binary on an upgraded database: skipped (set TSDB_V090_CLI)\n");
+        const char *req = getenv("TSDB_REQUIRE_V090_CLI"); /* the weekly job (ci.yml, upgrade-v090) sets it */
+        if (req && *req && strcmp(req, "0") != 0) {
+            fprintf(stderr, "test_upgrade: FAIL: the 0.9.0 binary is required (TSDB_REQUIRE_V090_CLI) and TSDB_V090_CLI is not set\n");
+            exit(1);
+        }
+        tr_skip("the 0.9.0 binary on an upgraded database", "set TSDB_V090_CLI; counted by the weekly job");
         return;
+    }
+    if (access(old, X_OK) != 0) { /* a path that is not there is a failed check, not a skip */
+        fprintf(stderr, "test_upgrade: FAIL: TSDB_V090_CLI=%s is not an executable file\n", old);
+        exit(1);
     }
     char top[PATH_MAX + 16], db[PATH_MAX + 16], vol[PATH_MAX + 16];
     snprintf(top, sizeof top, "%s/old", S);
@@ -482,6 +494,7 @@ static void test_old_binary(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_upgrade", 1200);
     const char *scratch = "/tmp";
     const char *mutant = NULL;
     for (int i = 1; i < argc; i++) {
@@ -489,6 +502,14 @@ int main(int argc, char **argv)
             mutant = argv[++i];
         else
             scratch = argv[i];
+    }
+    if (mutant && strcmp(mutant, "v8hash48") != 0) { /* a typo must not count as a planted bug that was caught */
+        fprintf(stderr, "test_upgrade: unknown mutant \"%s\" (exit 2)\n", mutant);
+        return 2;
+    }
+    if (access(FIXTURE, R_OK) != 0) { /* the fixture is read relative to the source directory */
+        fprintf(stderr, "test_upgrade: cannot read %s: run it from the source directory (exit 2)\n", FIXTURE);
+        return 2;
     }
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "%s/test-upgrade.XXXXXX", scratch);
@@ -525,6 +546,6 @@ int main(int argc, char **argv)
     if (failures)
         fprintf(stderr, "%d upgrade checks FAILED\n", failures);
     else
-        printf("upgrade tests passed\n");
+        printf("upgrade tests passed%s\n", tr_skips());
     return failures ? 1 : 0;
 }

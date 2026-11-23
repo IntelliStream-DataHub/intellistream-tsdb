@@ -24,6 +24,8 @@
 #include "tsdb_wire.h"
 
 #include <arpa/inet.h>
+#include "seed.h"
+#include "watchdog.h"
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -275,7 +277,7 @@ static void test_codec(void)
     }
 
     /* one-byte mutations: whatever the decoders say, they stay inside the range (run under ASan: make asan) */
-    unsigned long seed = 12345;
+    unsigned long seed = (unsigned long)ts_seed("wire mutations", 12345);
     for (int i = 0; i < 6; i++) {
         for (size_t at = 0; at < vecs[i].len; at++) {
             for (int rep = 0; rep < 8; rep++) {
@@ -971,6 +973,7 @@ static void test_topology(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_wire", 1200);
     if (argc > 1 && strcmp(argv[1], "--emit") == 0) {
         emit();
         return 0;

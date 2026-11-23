@@ -3057,7 +3057,7 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     /* The links are named before the marker can be durable anywhere: a leader that loses power after its marker and
      * before parts_commit has its tmp_ files removed by the open (load_parts, db.c), and reopened as a replica
      * (design-cluster.md 6.3) it applies the marker from these, as any replica does from what it staged. */
-    if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK)
+    if (rc == 0 && eng_test_mutant != MUT_LEADER_NO_HARDLINK && eng_test_mutant != MUT_LEADER_LINK_NOSYNC /* planted: no sync */)
         rc = eng_sync_dir(db, "the links of a COMMIT's files");
     if (rc == 0)
         rc = leader_links_reserve(db, ja->n);

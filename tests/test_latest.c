@@ -20,8 +20,11 @@
 #include "ecpart.h" /* EC_MARK_EC: the settle step */
 
 #include <dirent.h>
+#include "seed.h"
+#include "watchdog.h"
 #include <fcntl.h>
 #include <ftw.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -781,10 +784,18 @@ static void test_crash(void)
     char dir[700];
     snprintf(dir, sizeof dir, "%s/latest_crash", root);
     rmrf(dir);
+    /* The child reports progress: one byte per PROGRESS_EVERY acknowledged inserts. The parent kills it only after
+     * it has seen at least `need` bytes, so a slow or loaded machine cannot make a round check an empty database,
+     * and every acknowledged row must be there after the crash (the WAL syncs before it acknowledges). */
+    enum { PROGRESS_EVERY = 20 };
+    int rounds_with_value = 0;
     for (int round = 0; round < 4; round++) {
+        int pf[2];
+        CHECK(pipe(pf) == 0);
         pid_t pid = fork();
         CHECK(pid >= 0);
         if (pid == 0) {
+            close(pf[0]);
             tsdb *db;
             OK(tsdb_open(dir, &o, &db));
             tsdb_sid id;
@@ -795,30 +806,74 @@ static void test_crash(void)
                 double v = (double)i;
                 uint8_t valid = i % 5 != 0;
                 tsdb_values vals = {TSDB_FLOAT64, &v, &valid};
-                (void)tsdb_insert_series_values(db, id, &ts, &vals, 1);
+                if (tsdb_insert_series_values(db, id, &ts, &vals, 1) == 0 && (i + 1) % PROGRESS_EVERY == 0) {
+                    char b = 'x';
+                    if (write(pf[1], &b, 1) != 1)
+                        _exit(3);
+                }
             }
         }
-        struct timespec d = {0, (100 + round * 60) * 1000000L};
+        close(pf[1]);
+        long bytes = 0;
+        int need = 3 + round * 2; /* 60 rows at least, more each round */
+        for (int waited_ms = 0; bytes < need; ) {
+            struct pollfd p = {pf[0], POLLIN, 0};
+            int pr = poll(&p, 1, 1000);
+            if (pr > 0) {
+                char b[64];
+                ssize_t got = read(pf[0], b, sizeof b);
+                if (got <= 0) {
+                    fprintf(stderr, "crash round %d: the writer child ended after %ld progress bytes\n", round, bytes);
+                    exit(1);
+                    break;
+                }
+                bytes += got;
+            } else if (++waited_ms >= 120) {
+                fprintf(stderr, "crash round %d: the writer made no progress in 120 s (%ld of %d)\n", round, bytes, need);
+                exit(1);
+                break;
+            }
+        }
+        struct timespec d = {0, (20 + round * 60) * 1000000L}; /* the kill lands at a varying place after that */
         nanosleep(&d, NULL);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        for (;;) { /* what it reported before the kill */
+            char b[64];
+            ssize_t got = read(pf[0], b, sizeof b);
+            if (got <= 0)
+                break;
+            bytes += got;
+        }
+        close(pf[0]);
+        long acked = bytes * PROGRESS_EVERY; /* inserts of one row each, i < 5000 so every timestamp is its own */
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
         tsdb_sid id;
-        if (tsdb_series_lookup(db, "c.a", &id) == 0) {
+        if (tsdb_series_lookup(db, "c.a", &id) != 0) {
+            fprintf(stderr, "crash round %d: series c.a is gone after %ld acknowledged inserts\n", round, acked);
+            exit(1);
+        } else {
             rowset rr = {0};
             scan(db, id, &rr);
+            if ((long)rr.n < (acked < 5000 ? acked : 5000)) {
+                fprintf(stderr, "crash round %d: %ld acknowledged rows, %zu found after the crash\n", round, acked, rr.n);
+                exit(1);
+            }
             for (int wn = 0; wn < 2; wn++) {
                 tsdb_latest_opts op = {.end = TSDB_TS_MAX, .with_nulls = wn};
                 tsdb_latest_result out;
                 OK(tsdb_latest(db, &id, 1, &op, &out));
                 expect e = oracle(&rr, TSDB_TS_MAX, wn);
                 same(&out, &e, id, "after a crash", round);
+                if (wn == 0 && out.kind == TSDB_LATEST_VALUE)
+                    rounds_with_value++;
             }
             rs_free(&rr);
         }
         OK(tsdb_close(db));
     }
+    CHECK(rounds_with_value == 4); /* every round compared a real answer, not only an empty one */
 }
 
 /* ------------------------------------------------------------------ concurrency */
@@ -851,7 +906,7 @@ static void *conc_writer(void *arg)
 {
     cwr *a = arg;
     conc *c = a->c;
-    uint64_t seed = 1234567u + (uint64_t)a->idx * 77;
+    uint64_t seed = ts_seed("latest writer", 1234567u + (uint64_t)a->idx * 77);
     int64_t t = 1000 * (a->idx + 1);
     for (int i = 0; i < 400; i++) {
         seed = seed * 6364136223846793005ull + 1442695040888963407ull;
@@ -1149,6 +1204,18 @@ static void test_retention_lengthened_in_merge(void)
     OK(tsdb_close(db));
 }
 
+/* Waits until *v >= want, at most `ms`; a miss prints what was waited for (a hang is a failure with a message). */
+static bool wait_until(_Atomic long *v, long want, int ms, const char *what)
+{
+    for (int i = 0; i < ms; i++) {
+        if (atomic_load(v) >= want)
+            return true;
+        usleep(1000);
+    }
+    fprintf(stderr, "test_latest: waited %d ms for %s\n", ms, what);
+    return false;
+}
+
 /* Lengthening the limit of OTHER series must not throw away a merge (design-latest.md 3.5 lists across a change). The
  * first version discarded every merge in flight in the volume at every lengthening, so while such calls kept coming
  * tsdb_optimize never finished (starve.c of the review: 8 s and 123 merges, 122 of them discarded, for one that takes
@@ -1212,8 +1279,8 @@ static void test_merges_not_starved(void)
     atomic_store(&ns_calls, 0);
     pthread_t th, wd;
     CHECK(pthread_create(&th, NULL, ns_lengthen, NULL) == 0);
-    while (atomic_load(&ns_calls) < 10)
-        usleep(1000);
+    bool started = wait_until(&ns_calls, 10, 20000, "ns_lengthen to make 10 calls");
+    CHECK(started);
     CHECK(pthread_create(&wd, NULL, ns_watchdog, NULL) == 0);
     OK(tsdb_optimize(ns_db));
     int timed_out = atomic_load(&ns_stop); /* the watchdog ended the run before optimize did */
@@ -1232,7 +1299,8 @@ static void test_merges_not_starved(void)
 
 /* An fdatasync of a WAL file that blocks once armed (T4), the way a slow disk would. The tests link libtsdb.a, so this
  * definition is the one the engine's tsdb_fdatasync reaches. */
-static atomic_int sy_armed, sy_stalled, sy_release;
+static atomic_int sy_armed, sy_release;
+static _Atomic long sy_stalled;
 int fdatasync(int fd)
 {
     if (atomic_load(&sy_armed)) {
@@ -1293,11 +1361,13 @@ static void test_active_over_flushing(void)
 /* T2: a known entry below the drop floor whose row drop_before removed, looked up while the warmer holds its floor
  * walk (it has not stored yet): the lookup reads the entry as unknown and searches. Mutant: lookups read it as known. */
 static atomic_int dc2_hold;
+static _Atomic long dc2_arrived;
 static void dc2_hook(void *arg, int at)
 {
     (void)arg;
     if (at != LH_WARM_AFTER_CUT)
         return;
+    atomic_fetch_add(&dc2_arrived, 1);
     while (atomic_load(&dc2_hold))
         usleep(1000);
 }
@@ -1316,10 +1386,16 @@ static void test_drop_floor_lookup(void)
     tsdb_latest_result r = one(db, id, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_VALUE && r.ts == DAY + 5);
     atomic_store(&dc2_hold, 1);
+    atomic_store(&dc2_arrived, 0);
     tsdb_test_latest_hook(db, dc2_hook, NULL);
     OK(tsdb_drop_before(db, 2 * DAY));
+    /* The lookup must run while the warmer is held at its floor walk: wait for it to arrive (it never does if the
+     * hook point is no longer reached, and then this test would check nothing). */
+    bool arrived = wait_until(&dc2_arrived, 1, 10000, "the warmer to reach LH_WARM_AFTER_CUT");
+    CHECK(arrived);
     r = one(db, id, TSDB_TS_MAX, 0);
     CHECK(r.kind == TSDB_LATEST_NONE);
+    CHECK(atomic_load(&dc2_arrived) == 1);
     atomic_store(&dc2_hold, 0);
     tsdb_test_latest_hook(db, NULL, NULL);
     OK(tsdb_close(db));
@@ -1381,8 +1457,13 @@ static void test_sync_visibility(void)
     atomic_store(&sy_armed, 1);
     pthread_t th;
     CHECK(pthread_create(&th, NULL, dc4_writer, &x) == 0);
-    while (!atomic_load(&sy_stalled))
-        usleep(1000);
+    if (!wait_until(&sy_stalled, 1, 10000, "the WAL fdatasync of the append to block")) {
+        CHECK(false);
+        atomic_store(&sy_release, 1);
+        pthread_join(th, NULL);
+        OK(tsdb_close(x.db));
+        return;
+    }
     rowset rr = {0};
     scan(x.db, x.id, &rr);
     CHECK(rr.n == 1 && rr.ts[0] == 10); /* the query sees only the durable row */
@@ -2011,6 +2092,7 @@ static void test_lf_free_unlocked(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_latest", 1200);
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
     snprintf(root, sizeof root, "%s/tsdb_latest_%d", scratch, (int)getpid());
     mkdir(root, 0755);

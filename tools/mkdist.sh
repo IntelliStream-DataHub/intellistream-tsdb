@@ -23,6 +23,7 @@ for t in test_tsdb test_types test_levels test_rs test_group test_follow test_vo
 done
 cp "$b/libcrashfs.so" "$stage/tests/" # the power-loss and EIO shim test_server preloads
 cp dist/run-tests.sh "$stage/tests/"
+cp tests/data/levels-golden.txt "$stage/tests/" # test_levels compares every level with these digests (found next to it)
 cp dist/tsdbd.service dist/tsdbd.properties "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"
 # The binaries contain zstd and liburing (linked statically): their licenses require that their notices

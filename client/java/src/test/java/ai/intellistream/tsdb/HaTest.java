@@ -568,7 +568,12 @@ class HaTest {
             this.dir = dir;
             Path bin = TsdbServer.binary().resolveSibling("outage_server");
             Path lib = TsdbServer.binary().resolveSibling("liboutagefs.so");
-            assumeTrue(Files.isExecutable(bin) && Files.exists(lib), bin + " or " + lib + " is missing (make builds them on Linux)");
+            boolean built = Files.isExecutable(bin) && Files.exists(lib);
+            // Linux builds both (make): missing there is a broken build, and a skip would hide every outage test.
+            if (!built && System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+                throw new AssertionError(bin + " or " + lib + " is missing: make builds them on Linux");
+            }
+            assumeTrue(built, bin + " or " + lib + " is missing (outagefs is Linux only)");
             ProcessBuilder pb = new ProcessBuilder(bin.toString(), dir.toString());
             pb.environment().put("OUTAGEFS_LIB", lib.toString());
             pb.environment().put("TSDBD", TsdbServer.binary().toString());

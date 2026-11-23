@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -27,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
@@ -109,10 +111,9 @@ static pid_t start_server(const char *dir, const char *const *extra)
 
 static void stop_server(pid_t pid)
 {
-    if (pid > 0)
-        kill(pid, SIGTERM);
-    int status;
-    waitpid(pid, &status, 0);
+    int hung;
+    int status = th_stop(pid, 30000, &hung);
+    CHECK(!hung); /* a server that ignores SIGTERM for 30 s is a failure, not something to wait for */
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
@@ -322,6 +323,18 @@ static void raw_send(int fd, uint32_t id, uint8_t op, const void *p, size_t len)
     h[8] = op;
     CHECK(send(fd, h, 9, MSG_NOSIGNAL) == 9);
     CHECK(len == 0 || send(fd, p, len, MSG_NOSIGNAL) == (ssize_t)len);
+}
+
+/* Frames meant to arrive together: with the socket corked the writes leave as one segment when it is uncorked, so
+ * a server that acts on the first frame before it has read the next cannot be helped by Nagle's delay (without
+ * TCP_CORK, as on macOS, the frames may still go out one by one: the check then proves less, never more). */
+static void raw_cork(int fd, int on)
+{
+#ifdef TCP_CORK
+    setsockopt(fd, IPPROTO_TCP, TCP_CORK, &on, sizeof on);
+#else
+    (void)fd, (void)on;
+#endif
 }
 
 static bool read_full(int fd, void *p, size_t n)
@@ -703,6 +716,43 @@ static int read_to_end(int fd, uint32_t id, uint32_t *answered, uint32_t *seen)
     }
 }
 
+/* The server's anonymous memory growth since `before`, once the request has started and has stopped growing (the same
+ * to within 1 MiB for 600 ms): measured, not slept for. "Started" is that the server has written something to `fd`
+ * (a request that never ran cannot pass an upper bound this way) and the growth reached `lo_kb` (0: the allocator may
+ * reuse freed memory, so only a reply whose size forces new pages has a floor). Fails when either does not hold
+ * within 20 s. */
+static long settled_growth_kb(pid_t pid, int fd, long before, long lo_kb, const char *what)
+{
+    int queued = 0;
+    for (int i = 0; i < 200 && queued <= 0; i++) {
+        if (ioctl(fd, FIONREAD, &queued) != 0)
+            queued = 0;
+        if (queued <= 0)
+            usleep(100000);
+    }
+    if (queued <= 0)
+        fprintf(stderr, "%s: the server sent nothing in 20 s\n", what);
+    CHECK(queued > 0);
+    long last = LONG_MIN;
+    int flat = 0;
+    for (int i = 0; i < 200; i++) {
+        long g = rss_anon_kb(pid) - before;
+        if ((lo_kb <= 0 || g >= lo_kb) && last != LONG_MIN && g - last < 1024 && last - g < 1024)
+            flat++;
+        else
+            flat = 0;
+        if (flat >= 6)
+            return g;
+        last = g;
+        usleep(100000);
+    }
+    long g = rss_anon_kb(pid) - before;
+    fprintf(stderr, "%s: memory grew %ld KiB, wanted at least %ld KiB and a flat curve within 20 s\n", what, g, lo_kb);
+    /* a miss of the lower bound is the failure; a curve still rising is judged by the caller */
+    CHECK(lo_kb <= 0 || g >= lo_kb);
+    return g;
+}
+
 /* Whether the server has shut down its side of the connection that client socket `fd` is the other end of: its TCP
  * state (/proc/net/tcp, the row whose local port is the server's and whose remote port is the client's) has left
  * ESTABLISHED, which shutdown() does at once even with output still queued. Only this says it of one connection: the
@@ -754,9 +804,7 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     struct pollfd pf = {fd, POLLIN, 0};
     double first_byte = poll(&pf, 1, 15000) == 1 ? now_ms() - t0 : -1;
     CHECK(first_byte >= 0);
-    if (first_byte < 1500)
-        usleep((useconds_t)((1500 - first_byte) * 1000));
-    long grown = rss_anon_kb(pid) - before;
+    long grown = settled_growth_kb(pid, fd, before, 0, "stalled reader");
     fprintf(stderr, "stalled reader: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     tsdbc *c2;
@@ -831,8 +879,7 @@ static void test_stall_small(pid_t pid)
     long before = rss_anon_kb(pid);
     int fd = raw_connect();
     raw_send(fd, 9, TSDB_OP_QUERY_MULTI, req, len);
-    usleep(2000000);
-    long grown = rss_anon_kb(pid) - before;
+    long grown = settled_growth_kb(pid, fd, before, 0, "stalled reader, small replies");
     fprintf(stderr, "stalled reader, small replies: server anonymous memory grew %ld KiB\n", grown);
     CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
     close(fd);
@@ -865,8 +912,11 @@ static void test_stall_buckets(pid_t pid)
             raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 48));
         else
             raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
-        usleep(2000000);
-        long grown = status_kb(pid, "RssAnon") - before, peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
+        /* under a sanitizer the allocator gives memory back to the OS on its own clock (ASan every 5 s), so the growth
+         * may be negative while the reply is queued (tt10d: -176 MiB): the lower bound means nothing there */
+        long grown = settled_growth_kb(pid, fd, before, SANITIZED ? 0 : result_kb / 2,
+                                       "stalled reader, a full frame of buckets"),
+             peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
                 getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
@@ -891,6 +941,7 @@ static void test_cancel_pipeline(void)
 {
     int fd = raw_connect();
     tsdb_sid a[4] = {big_id, big_id, ids[0], big_id}, b[2] = {ids[1], ids[2]};
+    raw_cork(fd, 1); /* request 2 is cancelled while it still waits behind request 1: they must arrive together */
     raw_values_multi(fd, 1, a, 4);
     raw_values_multi(fd, 2, b, 2);
     uint8_t t[33];
@@ -899,6 +950,7 @@ static void test_cancel_pipeline(void)
     uint32_t cid = 2, nobody = 77;
     raw_send(fd, 2, TSDB_OP_CANCEL, &cid, 4);
     raw_send(fd, 77, TSDB_OP_CANCEL, &nobody, 4);
+    raw_cork(fd, 0);
     uint32_t answered = 99, seen = 0;
     CHECK(read_to_end(fd, 1, &answered, &seen) == 0 && answered == 4 && seen == 4);
     CHECK(read_to_end(fd, 2, &answered, &seen) == TSDB_ERR_STOPPED && answered == 0 && seen == 0);
@@ -1264,6 +1316,7 @@ static void run_cases(tsdbc *c)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_server_multi", 900);
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[PATH_MAX];
     snprintf(dir, sizeof dir, "%s/test_server_multi-%d", base, (int)getpid());

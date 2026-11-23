@@ -6,12 +6,13 @@
  * For files under $CRASHFS_ROOT it keeps what a disk would really hold:
  *  - file data is durable up to the size it had at its last fsync/fdatasync;
  *    regions rewritten in place since then are dirty;
- *  - creating, renaming and removing a directory entry is durable only after
- *    an fsync of that directory.
- * On a "power loss" it truncates every file to its durable size, zeroes the
- * dirty regions (harsher than a real disk, which keeps old or new pages),
- * undoes every directory change that was not made durable, newest first, and
- * exits at once.
+ *  - creating (a file, a directory or a hard link: link and linkat), renaming and removing a directory entry is
+ *    durable only after an fsync of that directory. A call that fails changes nothing the shim keeps (round 16).
+ * On a "power loss" it truncates every file to its durable size, gives the
+ * dirty regions their old bytes back (a real disk keeps old or new pages of a
+ * sector it was rewriting, never blank ones; CRASHFS_REWRITE=zero zeroes them,
+ * harsher than any disk), undoes every directory change that was not made
+ * durable, newest first, and exits at once.
  *
  * A power loss happens with probability $CRASHFS_PROB at each tracked
  * operation (after $CRASHFS_WARMUP of them), or at the next one after
@@ -36,6 +37,13 @@
  * or syncfs). If $CRASHFS_MARK is set, the path of the
  * file that failed is written there, so a harness knows the fault happened.
  *
+ * $CRASHFS_PULL_FILE: a SIGUSR2 that reaches the shim appends "pid N power loss requested by SIGUSR2" there as it is
+ * delivered (the process loses power at its next file operation, or by its own odds just before: exit 99), so a harness counts the
+ * plugs it pulled from what the shim did, not from what it sent, and a loss that the shim's own odds drew in the same moment
+ * is not lost to the count.
+ * $CRASHFS_IGNORE_USR2=1 makes the shim ignore SIGUSR2 (a self-test of that count); =2 makes it honour the signal and not log the
+ * plug (the loss is as sudden as ever, the harness has no proof of it: whatever the speed of the file system, the plug is there and not counted).
+ *
  * With CRASHFS_TEAR=1 a power loss keeps what a real disk may keep rather
  * than the least it must (each choice drawn from $CRASHFS_SEED):
  *  - of a file's unsynced appends, a random prefix: none, all, or up to a
@@ -57,11 +65,16 @@
  * durable (files that lie after an injected EIO excepted), and is a point
  * where the EIO can be injected.
  *
- * With CRASHFS_KEEP_OLD=1 (and no CRASHFS_TEAR) a power loss puts the sectors rewritten in place since the last
- * sync back as they were instead of zeroing them: still the least a disk must keep (a write in place that never
- * synced is lost), but never a state no disk leaves. A reader may rightly refuse zeros where the old bytes or the new
- * ones are all a power cut can leave: the Raft hard state's two slots (src/raft/raft_log.c, "What the reader
- * accepts") take a zeroed slot beside a later sequence for rot, so tsdbd --cluster under a power nemesis needs this.
+ * The dirty regions that rewrote durable bytes get those bytes back at a power loss, not zeros (what a disk keeps
+ * of an in-place overwrite: old or new, never blank: round 13, the default; CRASHFS_REWRITE=old says it too); data
+ * past the durable size is cut, and what a file system may return there (zeros, a hole) is all that is made up.
+ * Without CRASHFS_TEAR (no kept prefixes, no mixed sectors), so a log append never synced is lost for certain, and
+ * a rewritten hard-state slot is not blank. CRASHFS_REWRITE=zero gives the old harsher default: the rewritten
+ * region (never a byte nobody rewrote) comes back as zeros.
+ *
+ * A file is found by the identity of the descriptor's inode, not by the name the descriptor was opened under: a write,
+ * truncate or sync through a descriptor that is still open on a file that was renamed since (or whose old name now
+ * names another file) is that file's, and an fsync then makes the renamed file durable.
  *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable. With $CRASHFS_EXIT_MARK set, the process that rolled
@@ -117,21 +130,23 @@
 #define MAX_FDS 65536
 #define MAX_FILES 65536
 #define MAX_OPS 1000000
-#define MAX_DIRTY 16
 
 typedef struct file {
     dev_t dev;
     ino_t ino;
     char path[PATH_MAX];
     off_t durable;
-    struct {
+    struct dirty_ext {
         off_t off, len;
-    } dirty[MAX_DIRTY];
-    int ndirty;
+    } *dirty; /* CRASHFS_REWRITE=zero only: the regions rewritten in place (or cut) since the last sync */
+    int ndirty, capdirty;
     bool used;
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
-    struct old_sector *old; /* CRASHFS_TEAR or _KEEP_OLD: durable sectors rewritten since the last sync, as they were */
+    struct old_sector *old; /* CRASHFS_TEAR or the old-bytes default: durable sectors rewritten since the last sync, as they were */
     size_t nold, capold;
+    unsigned tsave;  /* open(O_TRUNC) of a durable file: the id of the copy of what a power loss brings back (0: none), until the file is synced */
+    off_t tsave_len; /* its length */
+    size_t tsave_ndops; /* how many directory operations there were when the truncation was made (CRASHFS_TEAR: a rename after it that survives takes it along) */
 } file;
 
 #define SECTOR 512
@@ -161,7 +176,7 @@ static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
-static bool keep_old_mode; /* CRASHFS_KEEP_OLD=1 */
+static bool rewrite_zero; /* CRASHFS_REWRITE=zero: the regions rewritten in place come back as zeros (harsher than a disk); else as they were */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
@@ -171,7 +186,14 @@ static int md_files; /* 0: every file, 1: parts only, 2: all but parts */
 static char md_log[PATH_MAX];
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
 static char mark[PATH_MAX], eio_only[64], eio_on[16], eio_dir[PATH_MAX], exit_mark[PATH_MAX];
+static unsigned mark_slow_ms; /* CRASHFS_MARK_SLOW_MS: the mark file is created this long before its line is written (a thread that waits for a CPU does the same) */
 static char *fdpath[MAX_FDS];
+/* the file a tracked descriptor was opened on (round 14). A descriptor closed by a call the shim does not see (closedir
+ * of a dup'ed directory descriptor; fclose) leaves its entry behind, and the next socket, pipe or eventfd of that number
+ * would be taken for the file: a worker's wake-up write failed "on the directory" with EIO, the server went on, and the
+ * harness reported a server that did not fail-stop. fd_tracked checks the descriptor still is that file. */
+static dev_t fddev[MAX_FDS];
+static ino_t fdino[MAX_FDS];
 static file *files;
 static size_t nfiles;
 static dirop *dops;
@@ -205,10 +227,53 @@ REAL(mkdirat);
 REAL(ftruncate);
 REAL(closedir);
 
+static volatile sig_atomic_t power_losing; /* the power loss is rolling files back: another thread that reads a mapping of one gets SIGBUS */
+static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
+static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
+static int ignore_usr2;                 /* $CRASHFS_IGNORE_USR2: 1: a shim that does not honour the pull, 2: one that honours it and does not log it (jepsen's self-test of its count) */
+
+/* The harness's proof of a plug it pulled is written where the signal is delivered, not where the process dies of it: a loss
+ * drawn by the shim's own odds on another thread can win the race to the exit (the signal arriving while that loss is rolling
+ * back, 2 of 17 pulls of a classes run), and the harness then saw a server that lost power with the pull's line missing.
+ * The server loses power either way, and a signal the shim ignored (=1) or a server that was dead (never delivered) leaves no
+ * line. Async-signal-safe: raw system calls, the line built by hand. */
+static void log_pull_delivered(void)
+{
+    if (!pull_file[0] || ignore_usr2 == 2)
+        return;
+    char line[64], digits[16];
+    int nd = 0, n = 0;
+    long pid = (long)getpid();
+    do
+        digits[nd++] = (char)('0' + pid % 10);
+    while ((pid /= 10) > 0);
+    static const char head[] = "pid ", tail[] = " power loss requested by SIGUSR2\n";
+    for (size_t i = 0; i < sizeof head - 1; i++)
+        line[n++] = head[i];
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    for (size_t i = 0; i < sizeof tail - 1; i++)
+        line[n++] = tail[i];
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, pull_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        if (syscall(SYS_write, fd, line, (size_t)n) < 0) {
+        }
+        syscall(SYS_close, fd);
+    }
+}
+
+static void on_bus(int sig);
+
 static void on_usr2(int sig)
 {
     (void)sig;
+    if (ignore_usr2 == 1)
+        return;
+    int saved = errno;
+    usr2_seen = 1;
+    log_pull_delivered();
     crash_requested = 1;
+    errno = saved;
 }
 
 /* 16 GB of address space, touched only as far as used. Not calloc: a sanitizer's allocator
@@ -217,6 +282,21 @@ static void *zeroed(size_t size)
 {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     return p == MAP_FAILED ? NULL : p;
+}
+
+/* A list that grows (the dirty extents, the kept old sectors) lives in its own mapping, never in the heap: a sanitizer's leak
+ * check does not scan the shim's mapped tables (`files`), so a heap block only they point to reads as a leak at the exit of a
+ * process that loaded the shim (test_export under ASan: the default old-bytes mode of round 13 keeps sectors in every run). */
+static void *regrow(void *p, size_t oldsz, size_t newsz)
+{
+    void *n = zeroed(newsz);
+    if (!n)
+        return NULL;
+    if (p) {
+        memcpy(n, p, oldsz);
+        munmap(p, oldsz);
+    }
+    return n;
 }
 
 __attribute__((constructor)) static void init(void)
@@ -268,8 +348,10 @@ __attribute__((constructor)) static void init(void)
         snprintf(exit_mark, sizeof exit_mark, "%s", getenv("CRASHFS_EXIT_MARK"));
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
+    if (getenv("CRASHFS_MARK_SLOW_MS"))
+        mark_slow_ms = (unsigned)atoi(getenv("CRASHFS_MARK_SLOW_MS"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
-    keep_old_mode = getenv("CRASHFS_KEEP_OLD") && atoi(getenv("CRASHFS_KEEP_OLD")) != 0;
+    rewrite_zero = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "zero");
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
     md_rate = getenv("CRASHFS_MD_RATE") ? atof(getenv("CRASHFS_MD_RATE")) : 0.001;
@@ -280,7 +362,11 @@ __attribute__((constructor)) static void init(void)
         snprintf(md_log, sizeof md_log, "%s", getenv("CRASHFS_MD_LOG"));
     if (md_mode)
         prob = 0;
+    if (getenv("CRASHFS_PULL_FILE"))
+        snprintf(pull_file, sizeof pull_file, "%s", getenv("CRASHFS_PULL_FILE"));
+    ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") ? atoi(getenv("CRASHFS_IGNORE_USR2")) : 0;
     signal(SIGUSR2, on_usr2);
+    signal(SIGBUS, on_bus);
     active = files && dops;
 }
 
@@ -345,11 +431,95 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
-/* CRASHFS_TEAR, CRASHFS_KEEP_OLD: keeps the durable content of the sectors in [off, end) that
+/* The file behind a tracked descriptor, found by the identity of its inode: the name the descriptor was opened under may have been
+ * renamed since (the descriptor's file is then the renamed one), or may name another file now (a new file made at the old name).
+ * Round 13 (VERIFY12): a sync or write through such a descriptor went to the record of whatever the old name said, so an fsync never
+ * raised the renamed file's durable size and a power loss cut fsynced bytes. A file that has no record yet (made before the shim was
+ * loaded, or opened by a path the shim did not see) gets one, durable as it is. */
+static file *file_of_fd(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return NULL;
+    for (size_t i = 0; i < nfiles; i++)
+        if (files[i].used && files[i].dev == st.st_dev && files[i].ino == st.st_ino)
+            return &files[i];
+    if (nfiles == MAX_FILES)
+        return NULL;
+    file *f = &files[nfiles++];
+    memset(f, 0, sizeof *f);
+    f->used = true;
+    f->dev = st.st_dev;
+    f->ino = st.st_ino;
+    snprintf(f->path, PATH_MAX, "%s", fdpath[fd] ? fdpath[fd] : "");
+    f->durable = st.st_size;
+    return f;
+}
+
+/* Zero mode: a region of a durable file that was rewritten or cut, joined to the last one when they touch (never a region that nobody wrote). */
+static void dirty_add(file *f, off_t off, off_t len)
+{
+    if (len <= 0)
+        return;
+    if (f->ndirty > 0) {
+        struct dirty_ext *l = &f->dirty[f->ndirty - 1];
+        if (off <= l->off + l->len && off + len >= l->off) {
+            off_t lo = off < l->off ? off : l->off, hi = off + len > l->off + l->len ? off + len : l->off + l->len;
+            l->off = lo;
+            l->len = hi - lo;
+            return;
+        }
+    }
+    if (f->ndirty == f->capdirty) {
+        int cap = f->capdirty ? 2 * f->capdirty : 16;
+        struct dirty_ext *d = regrow(f->dirty, (size_t)f->capdirty * sizeof *d, (size_t)cap * sizeof *d);
+        if (!d) { /* no room: the region is not remembered, so it keeps its new bytes (the disk may have kept them too) */
+            return;
+        }
+        f->dirty = d;
+        f->capdirty = cap;
+    }
+    f->dirty[f->ndirty].off = off;
+    f->dirty[f->ndirty].len = len;
+    f->ndirty++;
+}
+
+/* The bytes [off, off + n) of the file behind `fd`, read through a descriptor crashfs opens itself: the caller's may be
+ * write-only (tsdb opens CLASSES O_WRONLY), and a failed pread there once left zeros that tear_file wrote back over
+ * synced records. False when they cannot be read in full: the caller keeps nothing, never bytes it made up. */
+static bool read_through(int fd, const char *path, void *buf, size_t n, off_t off)
+{
+    char self[64];
+    snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+    int rfd = real_open(self, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0 && path[0]) { /* no /proc: the file's path, if it is still the same inode */
+        struct stat a, b;
+        rfd = real_open(path, O_RDONLY | O_CLOEXEC, 0);
+        if (rfd >= 0 && (fstat(rfd, &a) != 0 || fstat(fd, &b) != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev)) {
+            real_close(rfd);
+            rfd = -1;
+        }
+    }
+    if (rfd < 0)
+        return false;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = real_pread(rfd, (char *)buf + got, n - got, off + (off_t)got);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+    }
+    real_close(rfd);
+    return got == n;
+}
+
+/* CRASHFS_TEAR: keeps the durable content of the sectors in [off, end) that
  * are about to change, once per sync, so a power loss can bring them back. */
 static void keep_old(file *f, int fd, off_t off, off_t end)
 {
-    if ((!tear && !keep_old_mode) || f->lying)
+    if (!tear && rewrite_zero)
         return;
     if (end > f->durable)
         end = f->durable;
@@ -359,9 +529,14 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
             have = f->old[i].off == s;
         if (have)
             continue;
+        unsigned char data[SECTOR];
+        off_t len = f->durable - s < SECTOR ? f->durable - s : SECTOR; /* the durable bytes of the sector */
+        memset(data, 0, sizeof data);
+        if (!read_through(fd, f->path, data, (size_t)len, s))
+            continue; /* not kept: a sector of made-up bytes is a loss no disk has */
         if (f->nold == f->capold) {
             size_t cap = f->capold ? 2 * f->capold : 16;
-            struct old_sector *o = realloc(f->old, cap * sizeof *o);
+            struct old_sector *o = regrow(f->old, f->capold * sizeof *o, cap * sizeof *o);
             if (!o)
                 return;
             f->old = o;
@@ -369,9 +544,7 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
         }
         struct old_sector *o = &f->old[f->nold++];
         o->off = s;
-        memset(o->data, 0, SECTOR);
-        if (pread(fd, o->data, SECTOR, s) < 0) {
-        }
+        memcpy(o->data, data, SECTOR);
     }
 }
 
@@ -416,12 +589,137 @@ static void add_dirop(op_kind k, const char *a, const char *b, const char *saved
 static bool keep_aside(const char *path, char *saved)
 {
     struct stat st;
-    if (lstat(path, &st) != 0)
+    if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) /* unlink of a directory fails (EISDIR): nothing is kept aside, the real call fails */
         return false;
     char dir[PATH_MAX];
     dir_of(path, dir);
     snprintf(saved, PATH_MAX, "%s/.crashfs_saved_%d_%u", dir, (int)getpid(), saved_counter++);
     return real_rename(path, saved) == 0;
+}
+
+/* open(O_TRUNC) of a durable file (round 14; VERIFY13 finding 2). The file stays the same file (its name and its inode: a
+ * descriptor, a hard link or a mapping that another party holds sees what a truncation does, never a new file). What it holds
+ * from then on is new content, none of it durable until the file is synced: an fsync of the descriptor makes the truncation and
+ * what was written after it durable (on ext4 and every journalling file system the truncation commits with the data's size at
+ * that sync), and so does a sync of its directory or of the file system (the transaction that carries the truncation commits).
+ * Until then a power loss may leave the truncation undone: the old content is back as it was durable (a copy, kept in the root
+ * directory, made at the truncation: the durable prefix with the rewritten sectors put back, or zeroed in the harsher mode). With
+ * CRASHFS_TEAR the new content may instead be what the loss leaves (a prefix of it, an empty file), as for any unsynced data.
+ * Never an older state than the last sync, never a mix of old and new bytes that no disk leaves in the plain modes. An open(O_TRUNC) that
+ * fails truncated nothing (the state before it is put back), and with CRASHFS_TEAR a rename of the file that survives after the truncation takes
+ * the truncation with it (the metadata operations of a journalled file system commit in order). Known gap: only the file's last rename is
+ * looked at; a chain of renames (tmp to a, a to b) with the first kept and the last not may bring the old content back. No tsdb path does it
+ * (every tmp is fsynced before its rename). */
+static unsigned tsave_counter;
+static void tsave_name(unsigned id, char *out)
+{
+    snprintf(out, PATH_MAX, "%s/.crashfs_tsave_%d_%u", root, (int)getpid(), id);
+}
+
+static void tsave_drop(file *f)
+{
+    if (f->tsave) {
+        char sv[PATH_MAX];
+        tsave_name(f->tsave, sv);
+        real_unlink(sv);
+        f->tsave = 0;
+    }
+}
+
+/* A copy of what a power loss now leaves of `f` (read through `path`), at the saved name; its length, or -1. */
+static off_t tsave_make(file *f, const char *path, const char *sv)
+{
+    int rfd = real_open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0)
+        return -1;
+    int wfd = real_open(sv, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (wfd < 0) {
+        real_close(rfd);
+        return -1;
+    }
+    static __thread char buf[1 << 16];
+    off_t at = 0;
+    bool ok = true;
+    while (ok && at < f->durable) {
+        size_t want = (size_t)(f->durable - at < (off_t)sizeof buf ? f->durable - at : (off_t)sizeof buf);
+        ssize_t r = real_pread(rfd, buf, want, at);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break; /* the file is shorter than its durable size (an unsynced cut): the old sectors below put back what they can */
+        ssize_t w = real_pwrite(wfd, buf, (size_t)r, at);
+        ok = w == r;
+        at += r;
+    }
+    off_t len = at;
+    if (ok && !rewrite_zero) {
+        for (size_t i = 0; i < f->nold; i++) {
+            struct old_sector *o = &f->old[i];
+            off_t l = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+            if (l > 0 && real_pwrite(wfd, o->data, (size_t)l, o->off) == l && o->off + l > len)
+                len = o->off + l;
+        }
+    }
+    for (int k = 0; ok && rewrite_zero && k < f->ndirty; k++) {
+        off_t end = f->dirty[k].off + f->dirty[k].len;
+        if (end > len)
+            end = len;
+        static const char zeros[4096];
+        for (off_t o = f->dirty[k].off; o < end; o += (off_t)sizeof zeros)
+            if (real_pwrite(wfd, zeros, (size_t)(end - o < (off_t)sizeof zeros ? end - o : (off_t)sizeof zeros), o) < 0)
+                break;
+    }
+    if (len > f->durable)
+        len = f->durable;
+    if (ok && real_ftruncate(wfd, len) != 0)
+        ok = false;
+    real_close(rfd);
+    real_close(wfd);
+    if (!ok)
+        real_unlink(sv);
+    return ok ? len : -1;
+}
+
+/* open(O_TRUNC) of `f`: keeps the durable image aside, and the file's content is new from here on. */
+static void tsave_trunc(file *f, const char *path)
+{
+    if (f->durable > 0 && !f->tsave) {
+        char sv[PATH_MAX];
+        unsigned id = ++tsave_counter;
+        tsave_name(id, sv);
+        off_t len = tsave_make(f, path, sv);
+        if (len >= 0) {
+            f->tsave = id;
+            f->tsave_len = len;
+            f->tsave_ndops = ndops;
+        }
+    }
+    f->durable = 0;
+    f->ndirty = 0;
+    f->nold = 0;
+}
+
+/* The power loss brings the old content back into the file behind `fd`. */
+static void tsave_restore(file *f, int fd)
+{
+    char sv[PATH_MAX];
+    tsave_name(f->tsave, sv);
+    int rfd = real_open(sv, O_RDONLY | O_CLOEXEC, 0);
+    if (rfd < 0)
+        return;
+    static __thread char buf[1 << 16];
+    off_t at = 0;
+    while (at < f->tsave_len) {
+        ssize_t r = real_pread(rfd, buf, (size_t)(f->tsave_len - at < (off_t)sizeof buf ? f->tsave_len - at : (off_t)sizeof buf), at);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0 || real_pwrite(fd, buf, (size_t)r, at) != r)
+            break;
+        at += r;
+    }
+    if (at == f->tsave_len && real_ftruncate(fd, f->tsave_len) != 0) {
+    }
+    real_close(rfd);
 }
 
 /* ---------------------------------------------------------- power loss */
@@ -530,8 +828,21 @@ static void tear_dirops(void)
 }
 
 /* Rolls the tracked tree back to what was made durable. Called with the lock held. */
+/* CRASHFS_TEAR: a rename of the file (after its O_TRUNC) that reached the disk took the truncation, which came before it, along: a journalled file system
+ * commits its metadata operations in order, so the old content is not back in a file that was renamed over its target (round 15, VERIFY14: the
+ * old tmp's content in the target). Only the file's last rename is looked at (its current name is the destination). */
+static bool tsave_carried(const file *f)
+{
+    for (size_t i = f->tsave_ndops; i < ndops; i++)
+        if (dops[i].kind == OP_RENAME && dops[i].done && !strcmp(dops[i].b, f->path))
+            return true;
+    return false;
+}
+
 static void rollback(void)
 {
+    if (tear)
+        tear_dirops(); /* the survivors among the directory operations are known before the files are cut back */
     /* file data first, by each file's current name */
     for (size_t i = 0; i < nfiles; i++) {
         file *f = &files[i];
@@ -541,12 +852,25 @@ static void rollback(void)
         int fd = real_open(f->path, O_WRONLY);
         if (fd < 0)
             continue;
+        if (f->tsave && (!tear || (!tsave_carried(f) && urand() < 0.5))) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
+            tsave_restore(f, fd);
+            real_close(fd);
+            continue;
+        }
         if (tear) {
             tear_file(f, fd, st.st_size);
             real_close(fd);
             continue;
         }
-        for (int k = 0; k < f->ndirty; k++) { /* rewritten in place, never synced */
+        if (!rewrite_zero) { /* rewritten in place, never synced: the old bytes come back, not zeros */
+            for (size_t i = 0; i < f->nold; i++) {
+                struct old_sector *o = &f->old[i];
+                off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+                if (len > 0 && real_pwrite(fd, o->data, (size_t)len, o->off) < 0)
+                    break;
+            }
+        }
+        for (int k = 0; rewrite_zero && k < f->ndirty; k++) { /* CRASHFS_REWRITE=zero: rewritten in place, never synced */
             off_t end = f->dirty[k].off + f->dirty[k].len;
             if (end > f->durable)
                 end = f->durable;
@@ -557,20 +881,11 @@ static void rollback(void)
                     break;
             }
         }
-        /* CRASHFS_KEEP_OLD: the rewritten sectors as they were (what a cut that kept none of the new ones leaves) */
-        for (size_t k = 0; keep_old_mode && k < f->nold; k++) {
-            struct old_sector *o = &f->old[k];
-            off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
-            if (len > 0 && real_pwrite(fd, o->data, (size_t)len, o->off) < 0) {
-            }
-        }
         if (st.st_size > f->durable)
             real_ftruncate(fd, f->durable);
         real_close(fd);
     }
     /* then directory entries, newest first */
-    if (tear)
-        tear_dirops();
     for (size_t i = ndops; i-- > 0;) {
         dirop *d = &dops[i];
         if (d->done)
@@ -597,17 +912,34 @@ static void rollback(void)
     for (size_t i = 0; i < ndops; i++)
         if (dops[i].done && dops[i].saved[0])
             rm_tree(dops[i].saved);
+    for (size_t i = 0; i < nfiles; i++)
+        tsave_drop(&files[i]);
+}
+
+/* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
+ * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
+ * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
+ * Any other SIGBUS keeps its default action. */
+static void on_bus(int sig)
+{
+    if (power_losing)
+        _exit(99);
+    signal(sig, SIG_DFL); /* the instruction faults again: the default action */
 }
 
 __attribute__((noreturn)) static void power_loss(void)
 {
+    power_losing = 1;
     rollback();
     char msg[200];
+    /* "requested by SIGUSR2": the harness (tests/jepsen/jepsen.c) pulled the plug; without it the loss was drawn by the
+     * shim's own odds. The harness counts the first kind from this line, not from its own bookkeeping. */
+    const char *by = usr2_seen ? " requested by SIGUSR2" : "";
     int n = tear ? snprintf(msg, sizeof msg,
-                            "crashfs: power loss (torn: %u unsynced prefixes kept, %u garbage tails, %u old sectors "
+                            "crashfs: power loss%s (torn: %u unsynced prefixes kept, %u garbage tails, %u old sectors "
                             "back, %u unsynced directory operations kept)\n",
-                            tear_prefix, tear_garbage, tear_old, tear_kept)
-                 : snprintf(msg, sizeof msg, "crashfs: power loss\n");
+                            by, tear_prefix, tear_garbage, tear_old, tear_kept)
+                 : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
     _exit(99);
@@ -648,7 +980,7 @@ static bool eio_now(int fd, const char *what)
     if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
         snprintf(lying_dir, sizeof lying_dir, "%s", fdpath[fd]);
     } else {
-        file *f = file_get(fdpath[fd], false);
+        file *f = file_of_fd(fd);
         if (f)
             f->lying = true;
     }
@@ -659,6 +991,8 @@ static bool eio_now(int fd, const char *what)
     if (mark[0]) {
         int m = real_open(mark, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (m >= 0) {
+            if (mark_slow_ms)
+                usleep(mark_slow_ms * 1000);
             n = snprintf(msg, sizeof msg, "%s\n", fdpath[fd]);
             if (real_write(m, msg, (size_t)n) < 0) {
             }
@@ -674,8 +1008,11 @@ static bool eio_now(int fd, const char *what)
  * (a command line tool: what it reported done must be on disk). */
 __attribute__((destructor)) static void fini(void)
 {
-    if (!eio_done && !(loss_at_exit && active))
+    if (!eio_done && !(loss_at_exit && active)) {
+        for (size_t i = 0; i < nfiles; i++) /* no power loss: the copies kept for one are not left in the directory */
+            tsave_drop(&files[i]);
         return;
+    }
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
     rollback();
     if (exit_mark[0]) {
@@ -905,6 +1242,8 @@ static int md_open(int dirfd, const char *name, int flags, mode_t mode, bool at,
         pthread_mutex_lock(&lock);
         free(fdpath[fd]);
         fdpath[fd] = strdup(path);
+        fddev[fd] = st.st_dev;
+        fdino[fd] = st.st_ino;
         pthread_mutex_unlock(&lock);
     }
     return fd;
@@ -925,18 +1264,33 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
     maybe_crash();
     struct stat st;
     bool existed = stat(path, &st) == 0;
+    file *tf = NULL;
+    struct { /* what the file was before tsave_trunc: an open that FAILS truncated nothing (round 15, VERIFY14: EMFILE, EEXIST) */
+        unsigned tsave;
+        off_t tsave_len, durable;
+        size_t tsave_ndops;
+        int ndirty;
+        size_t nold;
+    } keep = {0, 0, 0, 0, 0, 0};
     if ((flags & O_TRUNC) && existed && S_ISREG(st.st_mode)) {
-        file *f = file_get(path, false);
-        if (f && f->durable > 0) { /* truncating durable data: keep it until synced */
-            char saved[PATH_MAX];
-            if (keep_aside(path, saved)) {
-                add_dirop(OP_UNLINK, path, NULL, saved);
-                f->used = false;
-                existed = false;
-            }
+        tf = file_get(path, false);
+        if (tf) { /* the same file, truncated: not a removal and a new file (round 14), whatever O_CREAT says */
+            keep.tsave = tf->tsave, keep.tsave_len = tf->tsave_len, keep.tsave_ndops = tf->tsave_ndops;
+            keep.durable = tf->durable, keep.ndirty = tf->ndirty, keep.nold = tf->nold;
+            tsave_trunc(tf, path);
         }
     }
     int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+    if (fd < 0 && tf) {
+        if (tf->tsave != keep.tsave)
+            tsave_drop(tf); /* the copy this call made */
+        tf->tsave = keep.tsave;
+        tf->tsave_len = keep.tsave_len;
+        tf->tsave_ndops = keep.tsave_ndops;
+        tf->durable = keep.durable; /* dirty and old are kept as they were: tsave_trunc only set their counts to 0 */
+        tf->ndirty = keep.ndirty;
+        tf->nold = keep.nold;
+    }
     if (fd >= 0) {
         if ((flags & O_CREAT) && !existed) {
             add_dirop(OP_CREATE, path, NULL, NULL);
@@ -947,6 +1301,10 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
         if (fd < MAX_FDS) {
             free(fdpath[fd]);
             fdpath[fd] = strdup(path);
+            if (fstat(fd, &st) == 0) {
+                fddev[fd] = st.st_dev;
+                fdino[fd] = st.st_ino;
+            }
         }
     }
     pthread_mutex_unlock(&lock);
@@ -980,13 +1338,34 @@ int openat(int dirfd, const char *name, int flags, ...)
 int open64(const char *name, int flags, ...) __attribute__((alias("open")));
 int openat64(int dirfd, const char *name, int flags, ...) __attribute__((alias("openat")));
 
-static bool fd_tracked(int fd) { return fd >= 0 && fd < MAX_FDS && fdpath[fd]; }
+static bool fd_is(int fd) /* the entry is there and the descriptor still is the file it was made for */
+{
+    struct stat st;
+    return fd >= 0 && fd < MAX_FDS && fdpath[fd] && fstat(fd, &st) == 0 && st.st_dev == fddev[fd] &&
+           st.st_ino == fdino[fd];
+}
+
+static bool fd_tracked(int fd) /* the lock is not held */
+{
+    if (fd < 0 || fd >= MAX_FDS || !fdpath[fd])
+        return false;
+    if (fd_is(fd))
+        return true;
+    pthread_mutex_lock(&lock); /* closed behind the shim's back: whatever has this number now is not the file */
+    if (fdpath[fd] && !fd_is(fd)) {
+        free(fdpath[fd]);
+        fdpath[fd] = NULL;
+    }
+    bool t = fdpath[fd] != NULL;
+    pthread_mutex_unlock(&lock);
+    return t;
+}
 
 /* misdirect mode: a write that may go astray; false if the caller must do it as usual */
 static bool md_maybe_write(int fd, const void *buf, size_t n, off_t off, bool positional, ssize_t *r)
 {
     pthread_mutex_lock(&lock);
-    *r = fdpath[fd] && urand() < md_rate ? md_write(fd, buf, n, off, positional) : -1;
+    *r = fd_is(fd) && urand() < md_rate ? md_write(fd, buf, n, off, positional) : -1;
     pthread_mutex_unlock(&lock);
     return *r >= 0;
 }
@@ -1023,21 +1402,22 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     }
     pthread_mutex_lock(&lock);
     maybe_crash();
-    file *f = file_get(fdpath[fd], false);
+    file *f = file_of_fd(fd);
     bool fail = eio_now(fd, "pwrite");
     if (fail)
         n = n > 1 ? n / 2 : 0;
-    if (f && off < f->durable) { /* a rewrite of durable data */
+    const off_t durable = f ? f->durable : 0;
+    const size_t nold = f ? f->nold : 0;
+    const bool rewrite = f && off < durable; /* a rewrite of durable data */
+    if (rewrite)
         keep_old(f, fd, off, off + (off_t)n);
-        if (f->ndirty < MAX_DIRTY) {
-            f->dirty[f->ndirty].off = off;
-            f->dirty[f->ndirty].len = (off_t)n;
-            f->ndirty++;
-        } else {
-            f->dirty[MAX_DIRTY - 1].len = f->durable; /* everything from there on */
-        }
-    }
     ssize_t r = real_pwrite(fd, buf, n, off);
+    if (rewrite && r <= 0) { /* nothing was written (EBADF on an O_RDONLY descriptor, ENOSPC, EIO): nothing was rewritten */
+        f->nold = nold;
+    } else if (rewrite && rewrite_zero) { /* the bytes that were written, no more (a short write rewrote less) */
+        off_t end = off + (off_t)r;
+        dirty_add(f, off, (end < durable ? end : durable) - off);
+    }
     pthread_mutex_unlock(&lock);
     if (fail) {
         errno = EIO;
@@ -1110,7 +1490,7 @@ ssize_t read(int fd, void *buf, size_t n)
     off_t off = lseek(fd, 0, SEEK_CUR);
     ssize_t r = real_read(fd, buf, n);
     pthread_mutex_lock(&lock);
-    if (r > 0 && fdpath[fd] && urand() < md_rate)
+    if (r > 0 && fd_is(fd) && urand() < md_rate)
         md_read(fd, buf, (size_t)r, off);
     pthread_mutex_unlock(&lock);
     return r;
@@ -1122,7 +1502,7 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
         return real_pread(fd, buf, n, off);
     ssize_t r = real_pread(fd, buf, n, off);
     pthread_mutex_lock(&lock);
-    if (r > 0 && fdpath[fd] && urand() < md_rate)
+    if (r > 0 && fd_is(fd) && urand() < md_rate)
         md_read(fd, buf, (size_t)r, off);
     pthread_mutex_unlock(&lock);
     return r;
@@ -1140,7 +1520,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
         len > ((size_t)1 << 28))
         return real_mmap(addr, len, prot, flags, fd, off);
     pthread_mutex_lock(&lock);
-    bool fault = fdpath[fd] && md_part(fdpath[fd]) && urand() < md_map_rate;
+    bool fault = fd_is(fd) && md_part(fdpath[fd]) && urand() < md_map_rate;
     struct stat st;
     void *p = MAP_FAILED;
     if (fault && fstat(fd, &st) == 0 && (size_t)st.st_size == len && len >= 2)
@@ -1202,12 +1582,19 @@ static int do_sync(int fd, bool data_only)
                         /* the old name is gone for good too, if it was in another dir */
                     }
                 }
+            for (size_t i = 0; i < nfiles; i++) { /* the transaction that carries a truncation commits with the directory's sync */
+                char fdir[PATH_MAX];
+                dir_of(files[i].path, fdir);
+                if (files[i].used && files[i].tsave && !strcmp(fdir, fdpath[fd]))
+                    tsave_drop(&files[i]);
+            }
         } else {
-            file *f = file_get(fdpath[fd], false);
+            file *f = file_of_fd(fd);
             if (f && !f->lying) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
+                tsave_drop(f); /* the truncation and the new content are durable */
             }
         }
     }
@@ -1239,6 +1626,7 @@ int syncfs(int fd)
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
+                tsave_drop(f);
             }
         }
         for (size_t i = 0; i < ndops; i++) {
@@ -1269,13 +1657,23 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         char dir[PATH_MAX];
         dir_of(b, dir);
         snprintf(hard, PATH_MAX, "%s/.crashfs_saved_%d_%u", dir, (int)getpid(), saved_counter++);
-        if (link(b, hard) == 0)
+        if (syscall(SYS_linkat, AT_FDCWD, b, AT_FDCWD, hard, 0) == 0) /* (not link(): that one is the shim's own, tracked) */
             snprintf(saved, PATH_MAX, "%s", hard);
     }
     int r = at ? real_renameat(ofd, oldp, nfd, newp) : real_rename(oldp, newp);
     if (r == 0) {
         add_dirop(OP_RENAME, a, b, saved[0] ? saved : NULL);
         file_get(b, false);
+        if (stat(b, &st) == 0 && S_ISREG(st.st_mode)) { /* a descriptor still open on the file is the file under its new name */
+            for (int fd = 0; fd < MAX_FDS; fd++)
+                if (fdpath[fd] && !strcmp(fdpath[fd], a)) {
+                    char *n = strdup(b);
+                    if (n) {
+                        free(fdpath[fd]);
+                        fdpath[fd] = n;
+                    }
+                }
+        }
         if (stat(b, &st) == 0 && S_ISDIR(st.st_mode)) { /* what is inside moved with it */
             for (size_t i = 0; i < nfiles; i++)
                 rekey(files[i].path, a, b);
@@ -1344,6 +1742,29 @@ static int do_unlink(int dirfd, const char *name, int flags, bool at)
 }
 
 int unlink(const char *name) { return do_unlink(AT_FDCWD, name, 0, false); }
+
+/* link and linkat (round 16, VERIFY15): a new hard link is a new directory entry, durable only after an fsync of its directory,
+ * like a created file (a leader links its COMMIT's pending parts to stage_ names and syncs the directory before the marker is
+ * written: src/replica.c). A power loss undoes it (OP_CREATE: the new name is unlinked; the file stays under its other names and
+ * keeps its data). Not tracked before: a link never synced always survived. The file's record keeps the name it had (the rollback
+ * of its data finds it by that name or by the last one a rename gave it). */
+static int do_link(int ofd, const char *a, int nfd, const char *b, int flags)
+{
+    char pb[PATH_MAX];
+    path_of_at(nfd, b, pb);
+    if (!tracked(pb))
+        return (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
+    pthread_mutex_lock(&lock);
+    maybe_crash();
+    int r = (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
+    if (r == 0)
+        add_dirop(OP_CREATE, pb, NULL, NULL);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+int link(const char *a, const char *b) { return do_link(AT_FDCWD, a, AT_FDCWD, b, 0); }
+int linkat(int ofd, const char *a, int nfd, const char *b, int flags) { return do_link(ofd, a, nfd, b, flags); }
 int unlinkat(int dirfd, const char *name, int flags) { return do_unlink(dirfd, name, flags, true); }
 
 int mkdir(const char *p, mode_t mode)
@@ -1376,21 +1797,28 @@ int mkdirat(int dirfd, const char *p, mode_t mode)
     return r;
 }
 
+/* A call that fails changed nothing on a real disk, so what the shim keeps for a power loss is committed only when the
+ * call returned (round 16, VERIFY15: a failed ftruncate on an O_RDONLY descriptor zeroed durable bytes in the zero mode;
+ * round 14 had the same for open(O_TRUNC)). The old sectors keep_old reads must be read before the call; they are
+ * dropped again when it failed (they only ever make a region come back as it was, but a failed call has no region). */
 int ftruncate(int fd, off_t len)
 {
     if (!fd_tracked(fd) || md_mode)
         return real_ftruncate(fd, len);
     pthread_mutex_lock(&lock);
     maybe_crash();
-    file *f = file_get(fdpath[fd], false);
-    if (f && len < f->durable)
-        keep_old(f, fd, len, f->durable);
-    if (f && len < f->durable && f->ndirty < MAX_DIRTY) { /* cutting durable data, unsynced */
-        f->dirty[f->ndirty].off = len;
-        f->dirty[f->ndirty].len = f->durable - len;
-        f->ndirty++;
-    }
+    file *f = file_of_fd(fd);
+    const bool cut = f && len >= 0 && len < f->durable; /* cutting durable data, unsynced */
+    const off_t durable = f ? f->durable : 0;
+    const size_t nold = f ? f->nold : 0;
+    if (cut)
+        keep_old(f, fd, len, durable);
     int r = real_ftruncate(fd, len);
+    if (cut && r != 0) {
+        f->nold = nold;
+    } else if (cut && rewrite_zero) {
+        dirty_add(f, len, durable - len);
+    }
     pthread_mutex_unlock(&lock);
     return r;
 }
@@ -1406,6 +1834,8 @@ static void dup_note(int from, int to)
     pthread_mutex_lock(&lock);
     free(fdpath[to]);
     fdpath[to] = fdpath[from] ? strdup(fdpath[from]) : NULL;
+    fddev[to] = fddev[from];
+    fdino[to] = fdino[from];
     pthread_mutex_unlock(&lock);
 }
 

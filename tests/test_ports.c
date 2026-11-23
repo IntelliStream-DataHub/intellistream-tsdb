@@ -413,6 +413,7 @@ int main(int argc, char **argv)
 {
     if (argc > 1)
         base = argv[1];
+    th_watchdog("test_ports", 600);
     char d1[600], d2[600], pf1[700], pf2[700];
     snprintf(d1, sizeof d1, "%s/ports-%d-a", base, (int)getpid());
     snprintf(d2, sizeof d2, "%s/ports-%d-b", base, (int)getpid());

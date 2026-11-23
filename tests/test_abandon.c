@@ -16,6 +16,7 @@
 #include "tsdb.h"
 
 #include <pthread.h>
+#include "watchdog.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #include <unistd.h>
 
 #include "portable.h"
+#include "scratch.h"
 
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg); /* the library's test hook (src/internal.h) */
 
@@ -294,12 +296,13 @@ static void test_not_set(void)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1)
-        scratch = argv[1];
+    th_watchdog("test_abandon", 1200);
+    scratch = scratch_make(argc > 1 ? argv[1] : "/tmp", "test_abandon"); /* its own directory, removed when it passed */
     test_large_insert();
     test_delete_replace();
     test_parked_small();
     test_not_set();
+    scratch_done(failures);
     if (failures) {
         fprintf(stderr, "test_abandon: %d failures\n", failures);
         return 1;

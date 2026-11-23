@@ -17,6 +17,7 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include "watchdog.h"
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -28,6 +29,7 @@
 #include <unistd.h>
 
 #include "portable.h"
+#include "scratch.h"
 
 static int failures;
 static const char *scratch = "/tmp";
@@ -651,8 +653,8 @@ static void multi_cut_holds_volume(void)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1)
-        scratch = argv[1];
+    th_watchdog("test_recover", 1200);
+    scratch = scratch_make(argc > 1 ? argv[1] : "/tmp", "test_recover"); /* its own directory, removed when it passed */
     char root[1024], vol[1024], cmd[2200];
     snprintf(root, sizeof root, "%s/recover_root", scratch);
     snprintf(vol, sizeof vol, "%s/recover_vol", scratch);
@@ -735,6 +737,7 @@ int main(int argc, char **argv)
     names_not_kept();
     lookups_do_not_starve_idle();
     multi_cut_holds_volume();
+    scratch_done(failures);
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);
         return 1;

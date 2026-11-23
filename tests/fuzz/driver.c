@@ -148,18 +148,29 @@ static int read_file(const char *path, uint8_t **d, size_t *n)
     return 0;
 }
 
+static bool strict; /* -replay: a path that cannot be read is a failure, not an empty corpus */
+
 /* calls fn for every regular file under path (a file or a directory), in name order */
 static void each_file(const char *path, void (*fn)(const char *))
 {
     struct stat st;
-    if (stat(path, &st) != 0)
+    if (stat(path, &st) != 0) {
+        if (strict) {
+            fprintf(stderr, "fuzz: cannot read %s: %s\n", path, strerror(errno));
+            exit(1);
+        }
         return;
+    }
     if (!S_ISDIR(st.st_mode)) {
         fn(path);
         return;
     }
     struct dirent **ents;
     int k = scandir(path, &ents, NULL, alphasort);
+    if (k < 0 && strict) {
+        fprintf(stderr, "fuzz: cannot list %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
     for (int i = 0; i < k; i++) {
         if (ents[i]->d_name[0] != '.') {
             char sub[4096];
@@ -374,8 +385,14 @@ int main(int argc, char **argv)
         __sanitizer_set_death_callback(on_death);
     signal(SIGALRM, on_alarm);
     if (replay) {
+        strict = true;
         for (int i = first; i < argc; i++)
             each_file(argv[i], replay_file);
+        if (nreplayed == 0) {
+            /* a replay that ran nothing proves nothing: a moved or emptied corpus must not pass make test */
+            fprintf(stderr, "fuzz: %s: no input was replayed from the %d path(s) given\n", argv[0], argc - first);
+            return 1;
+        }
         printf("%s: %zu inputs replayed\n", argv[0], nreplayed);
         return 0;
     }

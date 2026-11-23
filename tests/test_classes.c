@@ -45,6 +45,7 @@
 #include "tsdb_calendar.h"
 #include "../tools/datasets.h"
 #include <dirent.h>
+#include "watchdog.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -2437,6 +2438,7 @@ static void test_hourcut(void)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_classes", 1200);
     snprintf(base, sizeof base, "%s", argc > 1 ? argv[1] : "/tmp");
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *only = argc > 2 ? argv[2] : NULL; /* one section: bulk, live, overlap, fresh, wal, damage, retention, format, midplace, far, wtail, opencheck, comeback, daycut, stall, hourcut */

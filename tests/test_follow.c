@@ -12,6 +12,7 @@
 #include "tsdb.h"
 
 #include <fcntl.h>
+#include "watchdog.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -577,6 +578,7 @@ static void test_rowless_series(const char *base)
 
 int main(int argc, char **argv)
 {
+    th_watchdog("test_follow", 1200);
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdb-follow-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[600];
@@ -606,16 +608,32 @@ int main(int argc, char **argv)
 
     /* while the writer appends: acknowledged rows show up within a few refreshes */
     int fresh_checks = 0, fresh_ok = 0;
+    double fresh_max = 0; /* the longest a row acknowledged by the writer took to show up in the follower */
     size_t queries = 0;
     bool ordered = true;
     while (sh->phase == 1) {
         long long want = sh->acked[0];
-        usleep(100000); /* five refresh intervals */
-        tsdb_points p;
-        if (tsdb_query_points(db, TSDB_SID(0, 0), want, want + 1, &p) == 0) {
+        usleep(20000);
+        /* a row acknowledged before this point shows up within a few refreshes (20 ms each): polled up to 5 s, the
+         * delay recorded, so that a loaded machine that refreshes late is not a failure and a follower that never
+         * refreshes is */
+        double t1 = now();
+        bool seen = false;
+        int qrc = 0;
+        do {
+            tsdb_points p;
+            qrc = tsdb_query_points(db, TSDB_SID(0, 0), want, want + 1, &p);
+            if (qrc == 0) {
+                seen = p.n == 1;
+                tsdb_points_free(&p);
+            }
+            if (!seen)
+                usleep(5000);
+        } while (!seen && now() - t1 < 5);
+        if (qrc == 0) {
             fresh_checks++;
-            fresh_ok += p.n == 1;
-            tsdb_points_free(&p);
+            fresh_ok += seen;
+            fresh_max = fmax(fresh_max, now() - t1);
         }
     }
     /* while it overwrites, merges and retires: every snapshot is consistent */
@@ -633,6 +651,7 @@ int main(int argc, char **argv)
     }
     CHECK(ordered);
     CHECK(fresh_checks > 3 && fresh_ok == fresh_checks);
+    CHECK(fresh_max < 2.0); /* generous: 100 refresh intervals. Seen to be about 0.02 s on a quiet machine */
 
     /* after: the follower converges to exactly the writer's data */
     bool converged = false;
@@ -661,8 +680,8 @@ int main(int argc, char **argv)
     CHECK(converged);
     tsdb_stats st;
     tsdb_get_stats(db, &st);
-    printf("  follower: %d freshness checks, %zu consistent queries during merges, %llu parts now\n", fresh_checks,
-           queries, (unsigned long long)st.parts);
+    printf("  follower: %d freshness checks (slowest %.0f ms), %zu consistent queries during merges, %llu parts now\n",
+           fresh_checks, fresh_max * 1000, queries, (unsigned long long)st.parts);
     tsdb_close(db);
     sh->follower_done = 1;
     int status;

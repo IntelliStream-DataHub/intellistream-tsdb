@@ -77,7 +77,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
        MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
        MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
-       MUT_LEADER_FRESH_UNATTACHED };
+       MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1200,6 +1200,7 @@ extern void (*_Atomic merge_hook)(int at);
  * count that many times over (threads-bench: 105 us against 8.1 us for one granule). */
 #define TWA_ROW_WEIGHT 12
 extern uint64_t query_rows_per_thread;
+extern _Atomic int query_threads_peak; /* test hook: the most threads query_threads_for has returned (tests reset it) */
 int query_threads_for(const eng *db, uint64_t rows, size_t items);
 static inline bool qbudget_ok(size_t bytes)
 {

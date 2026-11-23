@@ -426,7 +426,10 @@ static void scenario(const char *name)
 
 static void peer_of(int i, char *out, size_t n) { snprintf(out, n, "127.0.0.1:%d", pports[i]); }
 
-/* One admin op to server i; follows NOTLEADER once when `follow`. Returns the op's result; dies when unreachable. */
+/* One admin op to server i; follows NOTLEADER once when `follow`. Returns the op's result; dies when unreachable.
+ * The deadline is 30 s: the five servers of a scenario under AddressSanitizer on a machine that other gates keep busy
+ * answered a STATUS after more than 10 s (test-trust gate tt4-asan: "closed the connection" at [feed], the deadline
+ * of the handshake passing between its two halves); a hung server is the watchdog's to end, not this deadline's. */
 static int admin(int i, int op, const void *req, size_t rl, int follow, uint8_t **reply, size_t *len)
 {
     char target[META_ADDR_MAX + 1], err[1024];
@@ -435,7 +438,7 @@ static int admin(int i, int op, const void *req, size_t rl, int follow, uint8_t 
         int rc;
         *reply = NULL;
         *len = 0;
-        if (cluster_admin(target, secret, secret_len, op, req, rl, 10000, &rc, reply, len, err, sizeof err) != 0)
+        if (cluster_admin(target, secret, secret_len, op, req, rl, 30000, &rc, reply, len, err, sizeof err) != 0)
             die("admin op %d to %s: %s", op, target, err);
         if (rc == CLUSTER_ERR_NOTLEADER && follow && hop == 0 && *len > 0 && *len < sizeof target) {
             memcpy(target, *reply, *len);
@@ -1110,6 +1113,35 @@ static void scen_secret(void)
     if (!strstr(err, "secret"))
         die("a wrong secret failed with \"%s\", not a word of the secret", err);
     printf("  a wrong secret is refused: %s\n", err);
+    /* The message names the cause: a peer that is slow (the deadline passed) and one that closed the link looked alike,
+     * which left the tt4-asan failure of [feed] undecidable. A listener that never answers, and one that closes. */
+    for (int closes = 0; closes < 2; closes++) {
+        int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in la = {.sin_family = AF_INET};
+        la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t ll = sizeof la;
+        if (lfd < 0 || bind(lfd, (struct sockaddr *)&la, sizeof la) != 0 || listen(lfd, 4) != 0 ||
+            getsockname(lfd, (struct sockaddr *)&la, &ll) != 0)
+            die("listener for the cause test: %s", strerror(errno));
+        char ls[64];
+        snprintf(ls, sizeof ls, "127.0.0.1:%d", (int)ntohs(la.sin_port));
+        pid_t kid = closes ? fork() : 0;
+        if (kid == 0 && closes) { /* accepts one link and closes it at once, with the HELLO unread */
+            int a = accept(lfd, NULL, NULL);
+            if (a >= 0)
+                close(a);
+            _exit(0);
+        }
+        if (cluster_admin(ls, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, 400, &rc, &rep, &rl, err, sizeof err) == 0)
+            die("a listener that %s gave an answer", closes ? "closes" : "never answers");
+        const char *cause = strerror(closes ? ECONNRESET : ETIMEDOUT);
+        if (!strstr(err, cause))
+            die("a peer that %s: \"%s\", the cause (%s) is not named", closes ? "closes the link" : "never answers", err,
+                cause);
+        if (kid > 0)
+            waitpid(kid, NULL, 0);
+        close(lfd);
+    }
     /* a long frame before the handshake: closed at once, never buffered */
     int fd = dial_peer(0);
     uint8_t h[5] = {0, 0, 0x10, 0, W_HELLO}; /* 1 MiB */
@@ -1779,7 +1811,7 @@ static void scen_retired(void)
     while (access(path, F_OK) != 0 && now_ms() - t0 < 10000)
         usleep(50000);
     if (access(path, F_OK) != 0)
-        die("server 2 wrote no retired mark");
+        die("server 2 wrote no retired mark within 10 s of its log line");
     int rc = waitpid(pids[2], NULL, WNOHANG);
     if (rc != 0)
         die("server 2 is gone: a log fault in shared mode must end the voter role only");
@@ -1834,12 +1866,20 @@ static void scen_syncrace(void)
 /* Power loss on the metadata state (crashfs under server 0's state directory): what the leader acknowledged, it keeps.
  * Three watchers join (the one voter commits each entry after its own sync), then the power fails at the next write
  * the server makes. After the restart the state holds everything that was acknowledged and the term has gone up.
- * Catches a log that is never synced (applied falls back), a hard state that is never saved (the term restarts from
- * the start) and a snapshot whose directory entry is not synced (with `snaps`: the log was compacted behind it, and the
- * state goes back to an earlier image). Planted in a copy of the server, `power` fails on the unsynced log (C1) and on
- * the unsaved hard state (C2), `powersnap` on those and on the snapshot without its directory sync (C7); the clean
+ * Catches a log that is never synced at all (applied falls back), a hard state that is never saved (the term restarts
+ * from the start) and, with `snaps` (the log is compacted behind the snapshot), a snapshot lost with its directory
+ * entry where no other sync covers it; a single missing sync site is another matter, see below.
+ * What each scenario catches was measured, not assumed (test-trust review,
+ * 2026-11-09): with every fdatasync of raft_log.c removed `power` fails; with only the hard state's sync removed (C2)
+ * `power` and `powersnap` PASS, because the term saved at the restart is synced by the log's own rounds, and only
+ * `powervote` (below) fails it, in every run, and `make test` plants it (cluster-mutants). NOT caught (measured, 6 runs
+ * each): the log's two fdatasync sites removed (C1) by `power`, and the snapshot's rename without its directory fsync
+ * (C7, cluster.c write of the snapshot) by `powersnap`: other syncs cover them, so those two have no test yet. The clean
  * server passes every run. crashfs follows dup'ed descriptors for this (the log syncs duplicates of its segments).
- * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then. */
+ * No CRASHFS_TEAR: a tear may keep every unsynced byte, which would let the unsynced log pass now and then.
+ * CRASHFS_REWRITE=old: a hard-state slot rewritten in place and not yet synced comes back as the old slot, not as zeros
+ * (a blank slot beside sequence N > 1 is damage by the log's own rule, and a disk leaves old or new bytes there: with
+ * zeros the restart refused to open in about 1 run in 10, 2 of 20 in tt-cluster-20b). */
 static void power_loss(int snaps)
 {
     scenario(snaps ? "powersnap" : "power");
@@ -1873,7 +1913,7 @@ static void power_loss(int snaps)
     snprintf(dir0, sizeof dir0, "%s/n0", base);
     if (mkdir(dir0, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_REWRITE=old", so, st);
     penv[0] = pe;
     envs[0] = snaps ? "snap_every=2,snap_retain=1,seg_bytes=200" : NULL;
     for (int i = 1; i < 5; i++)
@@ -1910,7 +1950,18 @@ static void power_loss(int snaps)
         die("server 0 ended with status %d after the power loss, expected 99 (crashfs)", status);
     start(0);
     await_view(0, p_leader_self, NULL, "server 0 leading after the power loss");
-    view(0, &v);
+    /* A restarted leader knows its commit index only once an entry of its own term is committed (the one voter syncs
+     * it and commits at once), so until then `applied` is the earlier copy of the state (run 17 of 20 read applied 7 of
+     * 10 right after "leader"). Wait for it, bounded: a log that lost acknowledged entries never gets back to
+     * applied0 (its first new entry gets applied0 - k + 1), and the check below fails with its numbers. */
+    uint64_t t_applied = now_ms();
+    for (;;) {
+        view(0, &v);
+        if ((v.m.nmembers >= members0 && v.m.applied >= applied0) || now_ms() - t_applied > 10000)
+            break;
+        view_free(&v);
+        usleep(100000);
+    }
     if (v.m.nmembers < members0 || v.m.applied < applied0)
         die("after the power loss server 0 holds %u members and applied %" PRIu64 ", it had acknowledged %u and %" PRIu64,
             (unsigned)v.m.nmembers, v.m.applied, (unsigned)members0, applied0);
@@ -1929,25 +1980,31 @@ static void scen_power(void) { power_loss(0); }
  * for itself, saving the hard state first), then n2 loses power at its next tracked operation (a proposal's append).
  * What its state directory holds then must say it voted in T, and for whom: a hard save that kept the term but lost
  * the vote would let it vote again for another candidate in T (two leaders), and one that kept nothing is worse. */
-static void scen_powervote(void)
+static int powervote_round(int attempt)
 {
-    scenario("powervote");
+    if (attempt == 0)
+        scenario("powervote");
+    else {
+        char name[32];
+        snprintf(name, sizeof name, "powervote%d", attempt);
+        scenario(name);
+    }
     const char *so = getenv("CRASHFS_SO") ? getenv("CRASHFS_SO") : "./build/libcrashfs.so";
     if (access(so, F_OK) != 0) {
 #ifdef __linux__
         die("no %s (make build/libcrashfs.so): the power-loss scenarios cannot run, and must not pass as skipped", so);
 #else
         printf("  skipped: no %s\n", so);
-        return;
+        return 1;
 #endif
     }
 #if defined(__SANITIZE_ADDRESS__)
     printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
-    return;
+    return 1;
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer)
     printf("  skipped: crashfs cannot be preloaded into an AddressSanitizer build\n");
-    return;
+    return 1;
 #endif
 #endif
     static char pe[PATH_MAX * 2 + 128];
@@ -1956,7 +2013,7 @@ static void scen_powervote(void)
     snprintf(st, sizeof st, "%s/n2/state", base);
     if (mkdir(dir2, 0755) != 0 || mkdir(st, 0755) != 0)
         die("mkdir %s: %s", st, strerror(errno));
-    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, st);
+    snprintf(pe, sizeof pe, "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_REWRITE=old", so, st);
     penv[2] = pe;
     envs[3] = "free_min=9999999999999999"; /* a watcher: the proposal that makes n2 append */
     for (int i = 0; i < 4; i++)
@@ -1987,6 +2044,14 @@ static void scen_powervote(void)
     }
     if (!leader)
         die("no new leader after the first one was killed");
+    if (leader == ids[2]) {
+        /* n2 won the election itself: it is the leader now, and its own log syncs (its first entries) make the hard
+         * state durable too, whether or not the hard save syncs. That run cannot tell a vote that was not synced
+         * (planted C2: it passed in 3 of 8 runs), so the cluster is made again until n2 is the one that votes for
+         * another candidate. */
+        printf("  n2 won term %" PRIu64 " itself: its vote proves nothing here, trying again\n", term);
+        return 0;
+    }
     int li = leader == ids[1] ? 1 : 2;
     signal_child(pids[2], SIGUSR2); /* the power fails at n2's next tracked operation */
     char addr[META_ADDR_MAX], err[1024];
@@ -2011,6 +2076,14 @@ static void scen_powervote(void)
             " for %" PRIu32,
             (uint64_t)hs.term, (uint32_t)hs.vote, term, leader);
     printf("  a voter's vote in term %" PRIu64 " (for node %" PRIu32 ") survives a power loss\n", term, leader);
+    return 1;
+}
+static void scen_powervote(void)
+{
+    for (int attempt = 0; attempt < 12; attempt++)
+        if (powervote_round(attempt))
+            return;
+    die("n2 won its own election in 12 clusters in a row (a fair coin: 1 in 4096): the vote was never checked");
 }
 static void scen_powersnap(void) { power_loss(1); }
 
@@ -2018,9 +2091,9 @@ static void scen_powersnap(void) { power_loss(1); }
  * raft hard state in raft/hard is blank beside sequence 6 in slot 0", and the node never started again). A disk keeps
  * the slot's old sectors or the new ones, which the reader takes; crashfs zeroed rewrites it was not told to keep, and
  * the reader rightly takes a zeroed slot beside a later save for rot. So every power-loss harness of tsdbd --cluster
- * runs crashfs with CRASHFS_KEEP_OLD=1: here a child saves six hard states (seq 6 in slot 0, seq 5 in slot 1), writes
- * the seventh save's slot 1 without its sync and loses power at exit. With KEEP_OLD the hard state reads back as
- * term 6; without it (crashfs's default) it must be refused, which is the state the jepsen node was left in. */
+ * runs crashfs with the old bytes coming back (CRASHFS_REWRITE=old, the default; main's KEEP_OLD): here a child saves six hard states (seq 6 in slot 0, seq 5 in slot 1), writes
+ * the seventh save's slot 1 without its sync and loses power at exit. With the old bytes the hard state reads back as
+ * term 6; with CRASHFS_REWRITE=zero it must be refused, which is the state the jepsen node was left in. */
 static int hardslot_child(const char *dir)
 {
     char err[512];
@@ -2092,10 +2165,7 @@ static void scen_hardslot(void)
             setenv("CRASHFS_ROOT", top, 1);
             setenv("CRASHFS_PROB", "0", 1);
             setenv("CRASHFS_AT_EXIT", "1", 1);
-            if (keep)
-                setenv("CRASHFS_KEEP_OLD", "1", 1);
-            else
-                unsetenv("CRASHFS_KEEP_OLD");
+            setenv("CRASHFS_REWRITE", keep ? "old" : "zero", 1); /* old bytes back (the default), or zeros (the harsher mode) */
             unsetenv("CRASHFS_TEAR");
             execl(self, self, "hardslot-child", rd, (char *)NULL);
             _exit(127);
@@ -2109,13 +2179,13 @@ static void scen_hardslot(void)
         iso_err e = raft_log_hard_load(rd, &hs, lerr, sizeof lerr);
         if (keep) {
             if (e != ISO_OK || hs.term != 6)
-                die("CRASHFS_KEEP_OLD: after a power cut inside the seventh hard save the state reads as rc %d term %" PRIu64
+                die("CRASHFS_REWRITE=old: after a power cut inside the seventh hard save the state reads as rc %d term %" PRIu64
                     " (want term 6): %s",
                     (int)e, (uint64_t)hs.term, lerr);
-            printf("  CRASHFS_KEEP_OLD: a power cut inside a hard save leaves the previous one (term 6)\n");
+            printf("  CRASHFS_REWRITE=old: a power cut inside a hard save leaves the previous one (term 6)\n");
         } else {
             if (e == ISO_OK)
-                die("without CRASHFS_KEEP_OLD the zeroed slot read as term %" PRIu64 ": this scenario no longer reaches "
+                die("with CRASHFS_REWRITE=zero the zeroed slot read as term %" PRIu64 ": this scenario no longer reaches "
                     "the state the jepsen node was left in",
                     (uint64_t)hs.term);
             printf("  crashfs's default zeroes the slot, and the reader refuses it: %.120s\n", lerr);
@@ -7944,7 +8014,7 @@ static void scen_ackdurable(void)
         server_dir(i, dir, sizeof dir);
         if (mkdir(dir, 0755) != 0 && errno != EEXIST)
             die("mkdir %s: %s", dir, strerror(errno));
-        snprintf(pe[i], sizeof pe[i], "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_KEEP_OLD=1", so, dir);
+        snprintf(pe[i], sizeof pe[i], "LD_PRELOAD=%s CRASHFS_ROOT=%s CRASHFS_REWRITE=old", so, dir);
         penv[i] = pe[i];
     }
     for (int i = 3; i < 5; i++) {
@@ -11774,6 +11844,7 @@ static int rm_one(const char *path, const struct stat *st, int flag, struct FTW 
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    th_watchdog("test_cluster", 1800);
     if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
         return hardslot_child(argv[2]);
     /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a run writes over a GB */
@@ -11812,6 +11883,13 @@ int main(int argc, char **argv)
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
     int n = (int)(sizeof all / sizeof all[0]);
+    for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
+        int known = 0;
+        for (int k = 0; k < n; k++)
+            known |= !strcmp(argv[a], all[k].name);
+        if (!known)
+            die("unknown scenario \"%s\"", argv[a]);
+    }
     for (int k = 0; k < n; k++) {
         int run = argc <= 2;
         for (int a = 2; a < argc; a++)
