@@ -2725,7 +2725,13 @@ static void case_cold_hold(void)
     CHECK_EQ(replica_sync(db), 0);
     CHECK_EQ(replica_durable_end(db), n1->last);
     /* RSTATE's COLD in progress survives a reopen (format 2), and the replay asks ecapply_cold_decide: nothing listed,
-     * so the apply runs and refuses the test's fake object record (8 bytes, no .ec file behind it) */
+     * so the apply runs and refuses the test's fake object record (8 bytes, no .ec file behind it); a build without the
+     * codec refuses every COLD it would carry out (INVALID, naming the codec) */
+#ifdef TSDB_EC
+    const int cold_refused = TSDB_ERR_CORRUPT;
+#else
+    const int cold_refused = TSDB_ERR_INVALID;
+#endif
     CHECK_EQ(rs_cold_begin(db, c->last, m.u.cold.key), 0);
     eng_close(db);
     CHECK_EQ(open_replica(dir, 0, &db), 0);
@@ -2736,7 +2742,7 @@ static void case_cold_hold(void)
     CHECK_EQ(jr_cold_pending(db, &cp, &ck), 0);
     CHECK(cp == c->last && ck == m.u.cold.key);
     CHECK_EQ(replica_sync(db), 0);
-    CHECK(replica_apply(db, n1->last) == TSDB_ERR_CORRUPT);
+    CHECK_EQ(replica_apply(db, n1->last), cold_refused);
     eng_close(db);
     /* a record that names another key at the marker's position is damage (mutant coldkeyany) */
     CHECK_EQ(open_replica(dir, 0, &db), 0);
@@ -2752,7 +2758,7 @@ static void case_cold_hold(void)
     CHECK_EQ(rs_cold_begin(db, 0, 0), 0); /* none in progress: the apply carries it out, and refuses the fake record */
     CHECK_EQ(replica_sync(db), 0);
     CHECK_EQ(replica_durable_end(db), n1->last);
-    CHECK_EQ(replica_apply(db, n1->last), TSDB_ERR_CORRUPT);
+    CHECK_EQ(replica_apply(db, n1->last), cold_refused);
     eng_close(db);
     /* RSTATE's `done` at the marker, as an apply leaves it (tests/test_ecapply.c applies real ones) */
     CHECK_EQ(open_replica(dir, 0, &db), 0);
