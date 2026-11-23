@@ -318,7 +318,7 @@ $(B)/test_crashfs: tests/test_crashfs.c $(CRASHFS_SO) | $(B)
 # the engine as a replica (src/replica.c, design-cluster.md step 3): the mutant runs plant the bugs it guards against
 $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
-$(B)/test_snapshot: tests/test_snapshot.c src/snapshot.h src/marker.h src/internal.h $(LIB) $(CRASHFS_SO)
+$(B)/test_snapshot: tests/test_snapshot.c src/snapshot.h src/marker.h src/internal.h src/replica.h src/replfile.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # cluster volumes in a tsdb handle (src/cvol.h): holes, routing by the cluster name, the engine swap (promote)
@@ -388,7 +388,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	$(MUT) --name test_replfile --list "nosync sameslot nochecksum" -- ./$(B)/test_replfile --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_crashfs $(SCRATCH)
 	./$(B)/test_snapshot $(SCRATCH)
-	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_replica $(SCRATCH)
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's

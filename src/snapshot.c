@@ -932,6 +932,11 @@ static int rm_dir_at(int pfd, const char *name)
         for (size_t i = 0; rc == 0 && i < found; i++)
             if (unlinkat(dfd, v[i], 0) != 0 && errno != ENOENT)
                 rc = TSDB_ERR_IO;
+        /* each pass's unlinks synced before the next looks (and before the rmdir): a power loss then leaves the
+         * directory with whole files or without them, and the install's removal of v<N>.old works under a shim that
+         * keeps unsynced unlinks aside in the directory until its fsync (crashfs: test_snapshot's install power case) */
+        if (rc == 0 && found && tsdb_fsync(dfd) != 0)
+            rc = TSDB_ERR_IO;
         free(v);
     }
     close(dfd);

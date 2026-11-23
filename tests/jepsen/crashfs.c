@@ -1578,6 +1578,12 @@ static int do_sync(int fd, bool data_only)
             for (size_t i = 0; i < ndops; i++)
                 if (!dops[i].done && (op_now(i, dops[i].dir, now), !strcmp(now, fdpath[fd]))) {
                     dops[i].done = true;
+                    if (dops[i].kind == OP_UNLINK && dops[i].saved[0]) {
+                        /* the unlink is durable: the copy kept aside goes now, not at the power loss, so the directory
+                         * can be emptied and removed in the process (test_snapshot: an install removes v<N>.old) */
+                        rm_tree(dops[i].saved);
+                        dops[i].saved[0] = 0;
+                    }
                     if (dops[i].kind == OP_RENAME && dops[i].a[0]) {
                         /* the old name is gone for good too, if it was in another dir */
                     }
