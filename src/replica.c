@@ -1148,12 +1148,13 @@ int replica_missing(eng *db, uint64_t *pos, char *name, size_t cap, uint64_t *si
 
 /* ---- RSTATE ---- */
 
-static int rs_save(eng *db, struct rstate *rs)
+/* RSTATE's bytes (rs_save writes them, a snapshot copies them): malloc'd, *len bytes */
+static uint8_t *rs_encode(const struct rstate *rs, size_t *len)
 {
     size_t n = 8 + 4 * 8 + 8 + rs->ndrops * 16 + 8 + 16 + 8, o = 0;
     uint8_t *b = malloc(n);
     if (!b)
-        return TSDB_ERR_NOMEM;
+        return NULL;
     put64(b + o, RS_MAGIC), o += 8;
     put64(b + o, rs->done), o += 8;
     put64(b + o, rs->doing_pos), o += 8;
@@ -1168,6 +1169,16 @@ static int rs_save(eng *db, struct rstate *rs)
     put64(b + o, rs->cold_pos), o += 8;
     put64(b + o, (uint64_t)rs->cold_key), o += 8;
     put64(b + o, xxh64(b, o, 0));
+    *len = n;
+    return b;
+}
+
+static int rs_save(eng *db, struct rstate *rs)
+{
+    size_t n;
+    uint8_t *b = rs_encode(rs, &n);
+    if (!b)
+        return TSDB_ERR_NOMEM;
     int fd = openat(db->dirfd, RS_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, b, n) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
     if (fd >= 0)
@@ -3434,4 +3445,54 @@ int leader_rs_drop(eng *db, int64_t ts)
     }
     pthread_mutex_unlock(&db->publish_lock);
     return rc;
+}
+
+/* ---- what a snapshot reads (src/snapshot.c) ---- */
+
+int leader_rs_image(eng *db, uint8_t **buf, size_t *len, uint64_t *done)
+{
+    static const struct rstate none;
+    const struct rstate *rs = db->lrs ? db->lrs : &none; /* publish_lock held: RSTATE's writers hold it */
+    *buf = rs_encode(rs, len);
+    *done = rs->done;
+    return *buf ? 0 : TSDB_ERR_NOMEM;
+}
+
+int leader_links_list(eng *db, uint64_t hi, struct lkfile **out, size_t *n)
+{
+    *out = NULL, *n = 0;
+    pthread_mutex_lock(&db->lead_mu);
+    struct lkfile *v = malloc((db->nlf ? db->nlf : 1) * sizeof *v);
+    size_t k = 0;
+    for (size_t i = 0; v && i < db->nlf; i++)
+        if (db->lf[i].fno <= hi)
+            v[k++] = db->lf[i];
+    pthread_mutex_unlock(&db->lead_mu);
+    if (!v)
+        return TSDB_ERR_NOMEM;
+    *out = v, *n = k;
+    return 0;
+}
+
+void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep)
+{
+    if (keep)
+        keep_path(buf, cap, f->fno, f->key);
+    else
+        stage_path(buf, cap, f->key);
+}
+
+uint64_t replica_replay_start(eng *db)
+{
+    /* r4-replay separates the replay start from the log start; until then they are one: the first position of the
+     * oldest segment a replica holds (0: none, or not a replica) */
+    struct replica *rp = db->rp;
+    uint64_t first = 0;
+    if (!rp)
+        return 0;
+    pthread_mutex_lock(&rp->segs_mu);
+    for (size_t i = 0; i < rp->nsegs && !first; i++)
+        first = rp->segs[i].first;
+    pthread_mutex_unlock(&rp->segs_mu);
+    return first;
 }
