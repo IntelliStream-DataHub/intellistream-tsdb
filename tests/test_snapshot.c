@@ -461,7 +461,7 @@ static struct {
     int ncut;
 } CUT;
 
-static void note_cut(eng *db, uint64_t p)
+static void note_cut(eng *db, uint64_t p, const char (*mparts)[96], size_t mn)
 {
     free(CUT.parts);
     free(CUT.lf);
@@ -469,9 +469,12 @@ static void note_cut(eng *db, uint64_t p)
     memset(&CUT, 0, sizeof CUT);
     CUT.ncut = n + 1, CUT.p = p;
     pthread_mutex_lock(&db->lock);
-    CUT.parts = malloc((db->nparts ? db->nparts : 1) * sizeof *CUT.parts);
-    for (size_t i = 0; CUT.parts && i < db->nparts; i++)
-        snprintf(CUT.parts[CUT.nparts++], sizeof CUT.parts[0], "%s", db->parts[i]->name);
+    /* the make's own list: a merge that listed its output since its db->lock section is not in the cut (it would
+     * name a merged part the snapshot rightly holds as its sources: a red run with no bug, ~1 in 60) */
+    size_t np = mparts ? mn : db->nparts;
+    CUT.parts = malloc((np ? np : 1) * sizeof *CUT.parts);
+    for (size_t i = 0; CUT.parts && i < np; i++)
+        snprintf(CUT.parts[CUT.nparts++], sizeof CUT.parts[0], "%s", mparts ? mparts[i] : db->parts[i]->name);
     pthread_mutex_lock(&db->buf_lock);
     for (size_t i = 0; i <= db->nflushing && CUT.nmem < 64; i++) {
         memtable *mt = i < db->nflushing ? db->flushing[i] : db->active;

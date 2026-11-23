@@ -82,7 +82,7 @@
 #include <unistd.h>
 
 void (*snap_test_hook)(struct eng *db, int at, const char *arg);
-void (*snap_test_cut)(struct eng *db, uint64_t p);
+void (*snap_test_cut)(struct eng *db, uint64_t p, const char (*parts)[96], size_t nparts);
 void (*snap_inst_hook)(int at);
 int snap_mutant;
 
@@ -727,9 +727,9 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         rc = leader_rs_image(db, &rsb, &rsl, &done);
     if (rc == 0)
         rc = leader_links_list(db, p, &lf, &nlf);
-    void (*cut)(eng *, uint64_t) = __atomic_load_n(&snap_test_cut, __ATOMIC_ACQUIRE);
-    if (rc == 0 && cut)
-        cut(db, p);
+    void (*cut)(eng *, uint64_t, const char (*)[96], size_t) = __atomic_load_n(&snap_test_cut, __ATOMIC_ACQUIRE);
+    if (rc == 0 && cut) /* the list the make took: a merge may list its output since (it takes no publish_lock) */
+        cut(db, p, snap_mutant == SNAP_MUT_AFTERP ? NULL : (const char(*)[96])parts, nparts);
     pthread_mutex_unlock(&db->publish_lock);
     pthread_mutex_unlock(&db->flush_lock);
     if (rc)

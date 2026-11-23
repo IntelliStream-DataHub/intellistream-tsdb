@@ -91,8 +91,9 @@ enum { SNAP_AT_CUT = 1, SNAP_AT_PART = 2, SNAP_AT_LINKED = 3, SNAP_AT_DICTS = 4,
        SNAP_AT_DONE = 7, SNAP_AT_SEGLIST = 8 };
 extern void (*snap_test_hook)(struct eng *db, int at, const char *arg);
 /* Called inside the cut, under flush_lock and publish_lock, once P, the part list and the COMMITs' files are read: the
- * test notes what the leader had there, and its verify requires the snapshot to hold all of it */
-extern void (*snap_test_cut)(struct eng *db, uint64_t p);
+ * test notes what the leader had there, and its verify requires the snapshot to hold all of it. `parts` is the list the
+ * make took (NULL under SNAP_MUT_AFTERP): db->parts may differ by now, a merge commit takes no publish_lock */
+extern void (*snap_test_cut)(struct eng *db, uint64_t p, const char (*parts)[96], size_t nparts);
 /* Planted bugs (tests/test_snapshot.c --mutant NAME; the Makefile requires each to fail it) */
 enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_MUT_NOKEEP, SNAP_MUT_NOSTAGE,
                    SNAP_MUT_NORETIRED, SNAP_MUT_NODIRSYNC, SNAP_MUT_NONEEDSEQ, SNAP_MUT_NOSEGRETRY,
