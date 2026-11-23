@@ -134,10 +134,108 @@ static void signal_child(pid_t pid, int sig)
     kill(pid, sig);
 }
 
+static uint64_t now_ms(void);
+
+/* Whether every thread of pid is in the group stop (state T in /proc/PID/task/TID/stat); names the first that is not
+ * in busy, and sets *gone when the process itself is a zombie (it exited before the pause). io_uring's kernel workers
+ * (iou-wrk-*, iou-sqp-*) are not counted: they need not enter the group stop and may still complete I/O queued before
+ * it, so "stopped" does not cover io_uring-driven paths (tsdbd's client loop); a replica's repld and peer links use
+ * plain calls and stop with the process. */
+static int all_threads_stopped(pid_t pid, char *busy, size_t n, int *gone)
+{
+    *gone = 0;
+#ifdef __linux__
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+    DIR *d = opendir(path);
+    if (!d) {
+        snprintf(busy, n, "no %s: %s", path, strerror(errno));
+        return 0;
+    }
+    int ok = 1, seen = 0;
+    struct dirent *e;
+    while (ok && (e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        char sp[300], buf[512];
+        snprintf(sp, sizeof sp, "/proc/%d/task/%s/stat", (int)pid, e->d_name);
+        int fd = open(sp, O_RDONLY);
+        if (fd < 0)
+            continue; /* the thread exited */
+        ssize_t got = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (got <= 0)
+            continue;
+        buf[got] = 0;
+        char *open_p = strchr(buf, '('), *close_p = strrchr(buf, ')');
+        if (!open_p || !close_p || close_p[1] != ' ')
+            continue;
+        *close_p = 0;
+        if (!strncmp(open_p + 1, "iou-", 4))
+            continue;
+        seen++;
+        if (close_p[2] == 'Z' && atoi(e->d_name) == (int)pid)
+            *gone = 1;
+        if (close_p[2] != 'T') {
+            snprintf(busy, n, "thread %.20s (%.32s) in state %c", e->d_name, open_p + 1, close_p[2]);
+            ok = 0;
+        }
+    }
+    closedir(d);
+    if (ok && !seen) {
+        snprintf(busy, n, "no thread of %d listed", (int)pid);
+        ok = 0;
+    }
+    return ok;
+#else
+    (void)pid;
+    (void)busy;
+    (void)n;
+    return 1; /* no /proc: the stop is only as certain as the signal (docs/tasks/macos.md) */
+#endif
+}
+
+/* SIGSTOP is not a stop when kill() returns: the kernel wakes ONE thread to take the signal, and only that thread,
+ * once it runs, stops the others. Until then every other thread of the server runs on (on a loaded machine for ms or
+ * more): a replica "paused" before a write could still receive, log and acknowledge it (closegone-above checks that
+ * no replica wrote after its pause returned). So a pause returns only once every thread is stopped.
+ * TEST_CLUSTER_PAUSE_NOWAIT=1 returns right after kill(), as the old harness did; TEST_CLUSTER_PAUSE_TRACE=1 logs
+ * what was still running (with NOWAIT that one look at /proc delays the return, which narrows the window). */
 static void pause_server(int i, int on)
 {
     signal_child(pids[i], on ? SIGSTOP : SIGCONT);
     stopped[i] = on;
+    if (!on)
+        return;
+    const char *nw = getenv("TEST_CLUSTER_PAUSE_NOWAIT"), *tr = getenv("TEST_CLUSTER_PAUSE_TRACE");
+    int nowait = nw && *nw == '1', trace = tr && *tr == '1';
+    if (nowait && !trace)
+        return;
+    char busy[160] = "", first[160] = "";
+    uint64_t t0 = now_ms();
+    int polls = 0, gone;
+    while (!all_threads_stopped(pids[i], busy, sizeof busy, &gone)) {
+        if (gone) { /* a crash point or a fail-stop: name the exit, never wait 10 s for a stop that cannot come */
+            int st = 0;
+            if (waitpid(pids[i], &st, WNOHANG) == pids[i]) {
+                pids[i] = 0;
+                stopped[i] = 0;
+                die("server %d exited (status 0x%x) before its pause", i, st);
+            }
+            die("server %d (pid %d) is a zombie before its pause", i, (int)pids[i]);
+        }
+        if (!polls++)
+            snprintf(first, sizeof first, "%s", busy);
+        if (nowait)
+            break;
+        if (now_ms() - t0 > 10000)
+            die("server %d (pid %d) not stopped 10 s after SIGSTOP: %s", i, (int)pids[i], busy);
+        nanosleep(&(struct timespec){0, 200000}, NULL);
+    }
+    if (trace)
+        fprintf(stderr, "  pause server %d (pid %d): %s after %d polls, %" PRIu64 " ms%s%s\n", i, (int)pids[i],
+                nowait ? "not waited" : "every thread stopped", polls, now_ms() - t0, *first ? "; at first " : "",
+                first);
 }
 
 static uint64_t now_ms(void)
@@ -6180,6 +6278,34 @@ static int closegone_setup(const char *name, const char *env, tsdb_sid *id)
     return L;
 }
 
+/* What a volume directory's WAL is: its segments' names and sizes (order-free), and their bytes. A stopped server writes
+ * nothing, so these do not change between its pause and its SIGKILL. */
+static uint64_t wal_print(const char *vd, uint64_t *bytes)
+{
+    uint64_t h = 0;
+    *bytes = 0;
+    DIR *d = opendir(vd);
+    if (!d)
+        die("opendir %s: %s", vd, strerror(errno));
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "wal_", 4) != 0)
+            continue;
+        char p[PATH_MAX + 400];
+        struct stat st;
+        snprintf(p, sizeof p, "%s/%s", vd, e->d_name);
+        if (stat(p, &st) != 0)
+            die("stat %s: %s", p, strerror(errno));
+        uint64_t f = 1469598103934665603ULL;
+        for (const char *c = e->d_name; *c; c++)
+            f = (f ^ (unsigned char)*c) * 1099511628211ULL;
+        h += (f ^ (uint64_t)st.st_size) * 0x9e3779b97f4a7c15ULL;
+        *bytes += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return h;
+}
+
 static void scen_closegone(void)
 {
     tsdb_sid id;
@@ -6193,6 +6319,16 @@ static void scen_closegone(void)
     L = closegone_setup("closegone-above", NULL, &id);
     pause_server((L + 1) % 3, 1);
     pause_server((L + 2) % 3, 1);
+    /* the replicas' WAL once both pauses returned: should a replica still log the write, that names the cause (the
+     * pause was no stop yet), not "holds 3 rows" below */
+    uint64_t wh[3] = {0}, wb[3] = {0};
+    for (int r = 0; r < 3; r++)
+        if (r != L) {
+            char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+            server_dir(r, dir, sizeof dir);
+            snprintf(vd, sizeof vd, "%s/v1", dir);
+            wh[r] = wal_print(vd, &wb[r]);
+        }
     struct rep_writer w = {cports[L], id, 3000, 1, 0, 0, 0, 0};
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
@@ -6209,6 +6345,13 @@ static void scen_closegone(void)
             die("waitpid %d: %s", (int)pids[r], strerror(errno));
         pids[r] = 0;
         stopped[r] = 0;
+        char dir[PATH_MAX + 80], vd[PATH_MAX + 120];
+        server_dir(r, dir, sizeof dir);
+        snprintf(vd, sizeof vd, "%s/v1", dir);
+        uint64_t b, hh = wal_print(vd, &b);
+        if (hh != wh[r])
+            die("server %d (a replica) wrote its WAL after its pause returned (%" PRIu64 " -> %" PRIu64 " bytes)", r,
+                wb[r], b);
     }
     int ms2 = term_within(L, 15000, "the leader with a write above its commit point and its replicas killed");
     uint64_t tw = now_ms();
