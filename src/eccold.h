@@ -87,6 +87,8 @@ extern void (*_Atomic eccold_test_hook)(struct eng *db, int step);
 enum { ECCOLD_MUT_NONE = 0, ECCOLD_MUT_CUTNOGATE, ECCOLD_MUT_CUTNOWAIT, ECCOLD_MUT_TTLSETTLING,
        ECCOLD_MUT_CUTNOROTATE, ECCOLD_MUT_FENCEKEYONLY, ECCOLD_MUT_STRIPEWAITFENCED };
 extern int eccold_mutant;
+/* the number of files one marker may name in place of MK_FILES_MAX (0: MK_FILES_MAX), for test_eccold's toomany */
+extern _Atomic size_t eccold_test_files_max;
 /* What the next markers carry (test_ecapply; a test hook, never set by the engine): the files in reverse order (the
  * apply must number them by the leader's blocks, not by the marker's order), or one field damaged for the replica's
  * checks to refuse: Z one above the object records' ppos, the second .ec file named as the first, Y's header check. */

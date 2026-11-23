@@ -77,7 +77,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
        MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
        MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
-       MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC };
+       MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC, MUT_JR_BARGE };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -2018,7 +2018,17 @@ struct eng {
     atomic_bool lead_deposed;         /* with jr: eng_leader_depose was called */
     pthread_mutex_t lead_mu;          /* a leaf: waits for the commit point (lead_cv), its moves, depose, eng_fail */
     pthread_cond_t lead_cv;
-    pthread_mutex_t jr_serial; /* with jr: one large write at a time, lw_enter to lw_leave (marker order = block order) */
+    /* with jr: one large write at a time, lw_enter to lw_leave (marker order = block order), taken in turn (a ticket
+     * lock: jr_serial_lock): with a plain mutex a thread writing back to back took it again before the woken waiter
+     * ran, and starved the leader's settle at its gate (src/eccold.c) and the other large writers for tens of
+     * seconds (test_eccold turns, ticket). TSan's and other tools' lock-order checks see only the leaf mu, never
+     * jr_serial held across flush_lock, cls_rw and publish_lock: an inversion with it is the code review's to find */
+    struct {
+        pthread_mutex_t mu; /* a leaf, held only to take or hand on a turn */
+        pthread_cond_t cv;
+        uint64_t next, serving;
+        bool held; /* a turn is taken (the mutant jrbarge takes it whenever it is not) */
+    } jr_serial;
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
@@ -2296,6 +2306,8 @@ void lw_table_put(void);
 int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
 void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
 bool lw_enter(struct eng *db, lw_fence *f); /* returns whether the memtable holds rows to flush first */
+void jr_serial_lock(struct eng *db);         /* in the order the callers came (a ticket), never a thread's again first */
+void jr_serial_unlock(struct eng *db);
 void lw_leave(struct eng *db, lw_fence *f);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);

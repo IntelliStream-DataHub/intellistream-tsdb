@@ -921,7 +921,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->wal_sync_lock, NULL);
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
-    pthread_mutex_init(&db->jr_serial, NULL);
+    pthread_mutex_init(&db->jr_serial.mu, NULL);
+    pthread_cond_init(&db->jr_serial.cv, NULL);
     pthread_mutex_init(&db->lead_mu, NULL);
     pthread_cond_init(&db->lead_cv, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
@@ -1278,7 +1279,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->wal_sync_lock);
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
-    pthread_mutex_destroy(&db->jr_serial);
+    pthread_mutex_destroy(&db->jr_serial.mu);
+    pthread_cond_destroy(&db->jr_serial.cv);
     pthread_mutex_destroy(&db->lead_mu);
     pthread_cond_destroy(&db->lead_cv);
     pthread_mutex_destroy(&db->refresh_lock);
@@ -1578,7 +1580,7 @@ int eng_drop_before(eng *db, int64_t ts)
      * the rows the leader keeps) */
     const bool serial = eng_jr(db) && eng_test_mutant != MUT_REPLICA_NO_DROP_SERIAL;
     if (serial)
-        pthread_mutex_lock(&db->jr_serial);
+        jr_serial_lock(db);
     /* A leader holds flush_lock from its marker's flush (leader_drop, mt_flush_held) to the retire: rows written after
      * the marker stay in the memtable meanwhile. A flush between the two would put them into parts the retire then
      * takes away on the leader, while every replica keeps them in its active memtable (the marker begins its
@@ -1612,7 +1614,7 @@ int eng_drop_before(eng *db, int64_t ts)
     if (rc == 0 && eng_jr(db))
         rc = leader_rs_drop(db, ts); /* RSTATE says the DROP is done (replica.c) */
     if (serial)
-        pthread_mutex_unlock(&db->jr_serial);
+        jr_serial_unlock(db);
     return rc;
 }
 

@@ -1190,10 +1190,33 @@ void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end)
     f->hi = end - 1; /* start < end */
 }
 
+void jr_serial_lock(eng *db)
+{
+    pthread_mutex_lock(&db->jr_serial.mu);
+    uint64_t t = db->jr_serial.next++;
+    if (eng_test_mutant == MUT_JR_BARGE) /* a plain mutex: whoever finds it free takes it, a waiter just woken or not */
+        while (db->jr_serial.held)
+            pthread_cond_wait(&db->jr_serial.cv, &db->jr_serial.mu);
+    else
+        while (db->jr_serial.serving != t)
+            pthread_cond_wait(&db->jr_serial.cv, &db->jr_serial.mu);
+    db->jr_serial.held = true;
+    pthread_mutex_unlock(&db->jr_serial.mu);
+}
+
+void jr_serial_unlock(eng *db)
+{
+    pthread_mutex_lock(&db->jr_serial.mu);
+    db->jr_serial.held = false;
+    db->jr_serial.serving++;
+    pthread_cond_broadcast(&db->jr_serial.cv); /* few wait (large writes, a drop, a settle): the next ticket goes */
+    pthread_mutex_unlock(&db->jr_serial.mu);
+}
+
 bool lw_enter(eng *db, lw_fence *f)
 {
     if (eng_jr(db)) /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2) */
-        pthread_mutex_lock(&db->jr_serial);
+        jr_serial_lock(db);
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
     pthread_cond_init(&f->cv, NULL);
     pthread_mutex_lock(&db->buf_lock);
@@ -1225,7 +1248,7 @@ void lw_leave(eng *db, lw_fence *f)
     else if (f->r)
         lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
     if (eng_jr(db))
-        pthread_mutex_unlock(&db->jr_serial);
+        jr_serial_unlock(db);
     f->r = NULL;
     f->r_heap = false;
 }
