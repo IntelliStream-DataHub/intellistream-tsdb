@@ -2726,7 +2726,9 @@ static void case_cold_hold(void)
     CHECK_EQ(replica_durable_end(db), n1->last);
     /* RSTATE's COLD in progress survives a reopen (format 2), and the replay asks ecapply_cold_decide: nothing listed,
      * so the apply runs and refuses the test's fake object record (8 bytes, no .ec file behind it); a build without the
-     * codec refuses every COLD it would carry out (INVALID, naming the codec) */
+     * codec refuses every COLD it would carry out (INVALID, naming the codec). The apply's answer is the same with the
+     * `doing` record lost, so it tells nothing about RSTATE here: jr_cold_pending checks the record's load, and
+     * test_ecapply (leader and multi, mutants leaderswapnors and decidesome) checks the decision it drives. */
 #ifdef TSDB_EC
     const int cold_refused = TSDB_ERR_CORRUPT;
 #else
