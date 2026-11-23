@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Snapshots of a leader's volume (design-cluster.md 8.1, R4 D3/D4): the make side. snapshot.c's header has the design.
+ * Snapshots of a leader's volume (design-cluster.md 8.1, R4 D3-D6): the make side and the install. snapshot.c has the
+ * design.
  * Internal: engine and tsdbd only, never exported from libtsdb.so.
  */
 #ifndef TSDB_SNAPSHOT_H
@@ -94,7 +95,47 @@ extern void (*snap_test_hook)(struct eng *db, int at, const char *arg);
 extern void (*snap_test_cut)(struct eng *db, uint64_t p);
 /* Planted bugs (tests/test_snapshot.c --mutant NAME; the Makefile requires each to fail it) */
 enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_MUT_NOKEEP, SNAP_MUT_NOSTAGE,
-                   SNAP_MUT_NORETIRED, SNAP_MUT_NODIRSYNC, SNAP_MUT_NONEEDSEQ, SNAP_MUT_NOSEGRETRY };
+                   SNAP_MUT_NORETIRED, SNAP_MUT_NODIRSYNC, SNAP_MUT_NONEEDSEQ, SNAP_MUT_NOSEGRETRY,
+                   /* the install's */
+                   SNAP_MUT_LOWERFENCE, SNAP_MUT_RAISELED, SNAP_MUT_KEEPUNSURE, SNAP_MUT_SWAPFIRST,
+                   SNAP_MUT_INSTNODIRSYNC };
 extern int snap_mutant;
+
+/* ---- the install (r4-snapinst; snapshot.c's second half has the design) ----
+ *
+ * A received copy is installed as volume `number`'s replica directory under `root` (the cluster volumes' root, where
+ * v<N> lies): snap_install(root, number, "<root>/v<N>.snap", id, keep) checks every file against SNAPMAN (size,
+ * xxh64; a link entry missing is made from the entry it names), refuses a file SNAPMAN does not name, checks every
+ * part's header, index, footer and granule checksums, then writes META (requires=cluster,replica, volume=number, the
+ * identity's volume_uuid and cluster), FNO = P + 1, REPL (floor P, log start S or P + 1, the history from S on, and the
+ * promises of D6 below), SNAPDONE, each synced, the directory synced; then swaps: v<N> -> v<N>.old (when there),
+ * v<N>.snap -> v<N>, the root synced, v<N>.old removed, the root synced. 0: v<N> is the snapshot's and opens with
+ * eng_open_replica(floor P). On an error before the swap v<N> is untouched and v<N>.snap is left for the caller to
+ * remove (snap_release) or for snap_leftovers.
+ *
+ * `keep` is the REPL of the directory being replaced; the caller reads it only after its driver stopped saving REPL
+ * (the volume closed: a FENCE saved between the read and the close would be lost). Kept: rid, open generation and
+ * nonce (the reopen raises it), fence = max(keep's, P's epoch) (never lowered), led as it was (never raised: led =
+ * fence is what clears `unsure`), unsure, with the open generation moved by REPLFILE_OPEN_GEN_BELT. A snapshot whose P
+ * is below keep's floor is refused (TSDB_ERR_INVALID). keep NULL: a fresh learner: id->rid, generation 0, fence P's
+ * epoch, led 0. id: the identity REPL carries (and keep must match). */
+#define SNAP_DONE "SNAPDONE"
+struct replfile_state;
+struct snap_ident {
+    uint8_t volume_uuid[16];
+    uint8_t cluster_uuid[16];
+    uint32_t node;
+    uint64_t incarnation;
+    uint64_t rid; /* a fresh learner's (the metadata record's), never 0; with keep, keep's rid is used */
+};
+int snap_install(const char *root, uint32_t number, const char *staged, const struct snap_ident *id,
+                 const struct replfile_state *keep);
+/* What a crash left of an install of volume `number` (the start of cvolfs_prepare, before v<N> is looked at):
+ * v<N>.snap with SNAPDONE is finished (v<N> -> v<N>.old when there, v<N>.snap -> v<N>); v<N>.snap without it is removed;
+ * v<N>.old beside a v<N> is removed, without one it is renamed back. Every step synced. 0 or TSDB_ERR_IO. */
+int snap_leftovers(const char *root, uint32_t number);
+/* tests: called after the verify, after SNAPDONE and after the swap (whatever their result) */
+enum { SNAP_INST_VERIFIED = 1, SNAP_INST_DONE = 2, SNAP_INST_SWAPPED = 3 };
+extern void (*snap_inst_hook)(int at);
 
 #endif
