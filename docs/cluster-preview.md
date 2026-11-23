@@ -203,7 +203,7 @@ volume's leader and told the volume's name (`TSDB_VOLUME=plant`). Its answer is 
 <!-- cluster-tutorial-output -->
 ```
 added volume plant: number 1
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -236,7 +236,7 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -257,7 +257,7 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -276,7 +276,7 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -380,8 +380,8 @@ line until the group has confirmed it.
 | `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
 | `replicated lease_ms ...` | The settings of replicated volumes (`init` fixes them; stored, not acted on yet). |
 | `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. |
-| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. |
-| `replica volume N node X rid R open_gen G` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). |
+| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
+| `replica volume N node X rid R open_gen G [replaces Y]` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). `replaces Y`: this copy is being built to take the place of node Y's copy (a move); it takes Y's position in the list once Y's copy is removed. |
 | `volumes N users M` | How many volumes and users the group holds (users: always 0 in the preview). |
 
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or

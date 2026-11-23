@@ -467,7 +467,8 @@ size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t 
         s->replication,   s->min_isr,          s->node_timeout_ms,    s->heartbeat_ms,   s->isr_lag_ms,
         s->out_after_s,   s->voter_replace_s,  s->voters,             s->volumes_per_server, s->failover,
         s->read_barrier,  s->lease_s,          s->lease_ms,           s->drift_ppm,      s->unanswered_ms,
-        s->commit_interval_ms, s->repl_retain_mb, s->repl_retain_s,   s->idle_seal_ms,   (uint32_t)mode};
+        s->commit_interval_ms, s->repl_retain_mb, s->repl_retain_s,   s->idle_seal_ms,   s->rebuild_mb_s,
+        s->rebuild_max,   s->transfer_wait_ms, s->leader_balance_s,   (uint32_t)mode};
     for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
@@ -484,7 +485,9 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
                                 .volumes_per_server = v[8], .failover = (uint8_t)v[9],
                                 .read_barrier = (uint8_t)v[10], .lease_s = v[11], .lease_ms = v[12],
                                 .drift_ppm = v[13], .unanswered_ms = v[14], .commit_interval_ms = v[15],
-                                .repl_retain_mb = v[16], .repl_retain_s = v[17], .idle_seal_ms = v[18]};
+                                .repl_retain_mb = v[16], .repl_retain_s = v[17], .idle_seal_ms = v[18],
+                                .rebuild_mb_s = v[19], .rebuild_max = v[20], .transfer_wait_ms = v[21],
+                                .leader_balance_s = v[22]};
     *mode = (int)v[META_SETTINGS_WORDS];
     return r->bad || v[9] > 255 || v[10] > 255 ? -1 : 0;
 }
@@ -2633,9 +2636,14 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
 {
     int rc0 = CLUSTER_ERR_RETRY;
     if (type == RAFT_ENTRY_NORMAL) {
-        if (meta_apply(m, index, term, data, len, &rc0, 1) != META_OK)
+        if (meta_apply(m, index, term, data, len, &rc0, 1) != META_OK) {
+            if (meta_entry_older(data, len)) /* a preview cluster is initialised again, never upgraded */
+                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 4 "
+                          "or older and this build reads version %d: the cluster was made by another build; "
+                          "initialise it again (docs/cluster-preview.md)", index, term, META_SNAP_VERSION);
             fail_stop("entry %" PRIu64 " (term %" PRIu64 ") does not decode: this build cannot apply it", index,
                       term);
+        }
     } else {
         meta_apply_other(m, index, term, type == RAFT_ENTRY_CONFIG ? data : NULL,
                          type == RAFT_ENTRY_CONFIG ? len : 0);
@@ -3157,6 +3165,34 @@ static int keep_install(const raft_msg *m)
     return 1;
 }
 
+static void say_other_version(const char *path, uint32_t ver, char *err, size_t errn)
+{
+    snprintf(err, errn, "%s holds metadata of snapshot version %" PRIu32 " and this build reads version %d: the "
+             "cluster was made by another build; initialise it again (docs/cluster-preview.md)", path, ver,
+             META_SNAP_VERSION);
+}
+
+/* 1 (with err) when `path` is a whole image of another snapshot version; 0 otherwise (also when it cannot be read:
+ * the load that follows says why) */
+static int image_other_version(const char *path, char *err, size_t errn)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *img = n > 0 ? malloc((size_t)n) : NULL;
+    int ok = img && fread(img, 1, (size_t)n, f) == (size_t)n && !ferror(f);
+    fclose(f);
+    uint32_t ver = ok ? meta_snapshot_version(img, (size_t)n) : 0;
+    free(img);
+    if (!ver || ver == META_SNAP_VERSION)
+        return 0;
+    say_other_version(path, ver, err, errn);
+    return 1;
+}
+
 /* A whole image file decoded into *m (img and n keep its bytes). 0, or -1 with err. */
 static int load_image(const char *path, struct meta_state *m, uint8_t **img_out, size_t *n_out, char *err,
                       size_t errn)
@@ -3172,9 +3208,13 @@ static int load_image(const char *path, struct meta_state *m, uint8_t **img_out,
     uint8_t *img = n > 0 ? malloc((size_t)n) : NULL;
     int ok = img && fread(img, 1, (size_t)n, f) == (size_t)n && !ferror(f);
     fclose(f);
+    uint32_t ver = ok ? meta_snapshot_version(img, (size_t)n) : 0;
     if (!ok || meta_snapshot_decode(m, img, (size_t)n) != META_OK) {
         free(img);
-        snprintf(err, errn, "%s is damaged (it does not verify): this server's metadata cannot be read", path);
+        if (ver && ver != META_SNAP_VERSION) /* a preview cluster is initialised again, never upgraded */
+            say_other_version(path, ver, err, errn);
+        else
+            snprintf(err, errn, "%s is damaged (it does not verify): this server's metadata cannot be read", path);
         return -1;
     }
     *img_out = img;
@@ -5498,12 +5538,14 @@ static void vol_watch_duty(void)
             r->open_gen = v->rep[k].open_gen;
             r->open_nonce = v->rep[k].open_nonce;
             r->nrep = v->nrep;
+            r->set_version = v->set_version;
             for (uint32_t j = 0; j < v->nrep && j < META_REPLICAS_MAX; j++) {
                 const struct meta_member *mm = meta_member(&C.sm, v->rep[j].node);
                 r->rep[j].node = v->rep[j].node;
                 r->rep[j].rid = v->rep[j].rid;
                 r->rep[j].learner = v->rep[j].learner;
                 r->rep[j].unanswered = v->rep[j].unanswered;
+                r->rep[j].replaces = v->rep[j].replaces;
                 snprintf(r->rep[j].peer, sizeof r->rep[j].peer, "%s", mm ? mm->peer : "");
             }
             r->nisr = v->nisr;
@@ -5521,6 +5563,10 @@ static void vol_watch_duty(void)
             r->repl_retain_mb = C.sm.set.repl_retain_mb;
             r->repl_retain_s = C.sm.set.repl_retain_s;
             r->idle_seal_ms = C.sm.set.idle_seal_ms;
+            r->rebuild_mb_s = C.sm.set.rebuild_mb_s;
+            r->rebuild_max = C.sm.set.rebuild_max;
+            r->transfer_wait_ms = C.sm.set.transfer_wait_ms;
+            r->leader_balance_s = C.sm.set.leader_balance_s;
             for (uint32_t j = 0; hold && j < nprev; j++) /* drop_fence_file: a volume this server led stays so here */
                 if (prev[j].number == r->number && prev[j].leader == C.id && r->epoch > prev[j].epoch) {
                     *r = prev[j];
@@ -6607,6 +6653,13 @@ int cluster_start(const struct cluster_cfg *cfg)
         return -1;
     }
     if (got) {
+        /* metadata of another snapshot version (a cluster made by another preview build) is refused before anything
+         * reads its log or NODE is written again, with the line that names both versions; a log without either image
+         * names them at its first entry (meta_entry_older, apply_entry) */
+        if (image_other_version(C.snapfile, err, sizeof err) || image_other_version(C.copyfile, err, sizeof err)) {
+            fprintf(stderr, "tsdbd: cluster: %s\n", err);
+            return -1;
+        }
         C.have_node = 1;
         C.incarnation++;
         if (node_save() != 0) {

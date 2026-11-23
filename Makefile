@@ -508,7 +508,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
 
-# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 18 runs of 2 minutes each under a sanitizer
+# the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 23 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
 	tests/meta_mutants.sh --part $*/2 $(B)/test_meta_mut
 

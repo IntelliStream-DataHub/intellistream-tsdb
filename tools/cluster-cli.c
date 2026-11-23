@@ -209,10 +209,15 @@ static void print_status(const struct cluster_status *st)
         printf(" isr");
         for (uint32_t k = 0; k < v->nisr; k++)
             printf("%s%" PRIu32, k ? "," : " ", v->isr[k]);
-        printf("%s isr_version %" PRIu64 "\n", v->nisr ? "" : " -", v->isr_version);
-        for (uint32_t k = 0; k < v->nrep; k++)
-            printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64 "\n",
-                   v->number, v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);
+        printf("%s isr_version %" PRIu64 " set_version %" PRIu64 "\n", v->nisr ? "" : " -", v->isr_version,
+               v->set_version);
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
+                   v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);
+            if (v->rep[k].replaces) /* a move in progress: this learner takes that member's slot (D10) */
+                printf(" replaces %" PRIu32, v->rep[k].replaces);
+            printf("\n");
+        }
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
     meta_free(&m);
