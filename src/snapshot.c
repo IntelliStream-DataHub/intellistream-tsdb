@@ -24,7 +24,12 @@
  * The links. A part is hard linked by its listed name; a merge that retired it after the cut renamed it retired_<name>
  * (kept for obsolete_part_lifetime_s), which is linked instead; with neither the make fails with SNAP_RETRY. db->lock is
  * not held across a link. A file linked (a part, a segment, a stage_ or keep_ file) stays alive however the leader
- * removes its own name later.
+ * removes its own name later. Every part is linked before any is read (hashed): links are metadata only, so the window
+ * in which a retired part can be deleted under the make does not grow with the volume (hashing part by part between
+ * the links, a volume that takes longer than obsolete_part_lifetime_s to read never got a snapshot while it merged).
+ * A keep_ file is the inode of the part its COMMIT published (stage_, part and keep_ are one file under three names)
+ * as long as no merge rewrote that part: SNAPMAN then names it as a link of the listed part's entry, which is read
+ * once, and the receiver makes the link (`snap_info.bytes` counts it once).
  *
  * The dictionaries. SERIES, STATES, RETENTION and CLASSES are appended to by writers that hold one lock from their
  * marker's append to their record's write (each dictionary's append_lock, ret_lock, class_lock). After the cut each of
@@ -34,18 +39,29 @@
  * Records past P may be in the copy too; a replay applies them again harmlessly: SERIES and STATES by id (db.c, the
  * entry is there with the same name), RETENTION and CLASSES by the record_off the marker names (a record already at its
  * offset is checked, not appended again). A record whose marker was never committed (a deposed leader's) is cut by the
- * replica's own rules, as after a restart.
+ * replica's own rules, as after a restart. CLASSES is ordered by the cut itself today: eng_class_switch holds
+ * flush_lock across its marker and its record, so every switch whose marker is at or below P wrote its record before
+ * the cut took flush_lock (the mutant that reads CLASSES' length without the barrier is equivalent for that reason);
+ * class_lock stays in the barrier for a switch that one day does not take flush_lock.
  *
  * The log. Every segment from S to the one that holds P is linked, except that one, which is copied up to P's record
- * end (the leader is still writing it). A segment gone meanwhile (a flush and the keep bound) is SNAP_RETRY.
+ * end (the leader is still writing it). A segment gone meanwhile (a flush and the keep bound) is SNAP_RETRY: the
+ * segments are listed after the parts are linked, so a flush after the cut may have removed the oldest memtable's
+ * segment before the listing; segments go oldest first (lk_unlink_upto, wal_unlink_upto), so the make checks that S's
+ * segment is listed, and a later one gone before its link is found there.
  *
  * Last SNAPMAN (below): every file is fsynced, the directory fsynced, then SNAPMAN written to a temporary, fsynced,
  * renamed and the directory fsynced again. A directory without SNAPMAN is half made; no make survives its engine:
- * snap_sweep removes every snap_* directory at the open. Nothing outside the directory changes.
+ * snap_sweep removes every snap_* directory at the open. Nothing outside the directory changes. No reader needs the
+ * syncs today (the sender ships from the live leader, and no snapshot outlives a restart): they make a whole directory
+ * mean "durable", which a reuse of the files a receiver holds (D4, R9) will rely on, and they cost a sync per copied
+ * file (a linked part is clean already, its fdatasync writes nothing).
  *
  * SNAPMAN (little endian): "TSNAPMAN" | u32 version | u32 nhist | u32 nfiles | u32 0 | i64 volume | 16-byte uuid |
  * u64 P | P's epoch | P's segment | S | S's first position | RSTATE's done | nhist x (u64 epoch, u64 first) |
- * nfiles x (u16 name length, name, u8 kind, u64 size, u64 xxh64) | u64 xxh64 of all before.
+ * nfiles x (u16 name length, name, u8 kind, u64 size, u64 xxh64, u32 link) | u64 xxh64 of all before. `link` is 0, or
+ * 1 + the index of an earlier entry that is the same inode (size and xxh64 are then that entry's). Version 2 (1 had no
+ * link); no reader of 1 exists.
  *
  * Not built: .ec parts (R8: a volume with one is refused, TSDB_ERR_INVALID), reuse of files the receiver holds (D4, R9).
  */
@@ -63,6 +79,7 @@
 #include <unistd.h>
 
 void (*snap_test_hook)(struct eng *db, int at, const char *arg);
+void (*snap_test_cut)(struct eng *db, uint64_t p);
 int snap_mutant;
 
 static void hook(eng *db, int at, const char *arg)
@@ -205,7 +222,8 @@ int snap_xxh64_fd(int fd, uint64_t *size, uint64_t *xxh)
 struct sfile {
     char name[128];
     uint8_t kind;
-    uint64_t size, xxh;
+    uint32_t link; /* SNAPMAN's: 1 + the entry this one is a link of */
+    uint64_t size, xxh, dev, ino;
 };
 
 typedef struct mk_ctx {
@@ -216,7 +234,8 @@ typedef struct mk_ctx {
     struct snap_info *out;
 } mk_ctx;
 
-static int add_file(mk_ctx *c, const char *name, uint8_t kind, uint64_t size, uint64_t xxh)
+static int add_file(mk_ctx *c, const char *name, uint8_t kind, uint64_t size, uint64_t xxh, const struct stat *st,
+                    uint32_t link)
 {
     if (strlen(name) >= sizeof c->f[0].name)
         return TSDB_ERR_INVALID;
@@ -229,31 +248,51 @@ static int add_file(mk_ctx *c, const char *name, uint8_t kind, uint64_t size, ui
     }
     struct sfile *f = &c->f[c->nf++];
     snprintf(f->name, sizeof f->name, "%s", name);
-    f->kind = kind, f->size = size, f->xxh = xxh;
-    c->out->bytes += size;
+    f->kind = kind, f->size = size, f->xxh = xxh, f->link = link;
+    f->dev = (uint64_t)st->st_dev, f->ino = (uint64_t)st->st_ino;
+    if (!link)
+        c->out->bytes += size;
     return 0;
 }
 
-/* Hashes and syncs a file just made in the snapshot directory, and lists it */
+/* Hashes and syncs a file just made in the snapshot directory, and lists it; a stage_ or keep_ file that is the inode of
+ * an entry listed already is listed as its link, not read again */
 static int seal_file(mk_ctx *c, const char *name, uint8_t kind)
 {
     int fd = openat(c->sdfd, name, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return TSDB_ERR_IO;
+    }
+    for (size_t i = 0; (kind == SNAP_KEEP || kind == SNAP_STAGE) && i < c->nf; i++)
+        if (!c->f[i].link && c->f[i].ino == (uint64_t)st.st_ino && c->f[i].dev == (uint64_t)st.st_dev) {
+            close(fd);
+            return add_file(c, name, kind, c->f[i].size, c->f[i].xxh, &st, (uint32_t)i + 1);
+        }
     uint64_t size, xxh;
     int rc = snap_xxh64_fd(fd, &size, &xxh);
     if (rc == 0 && c->db->opt.fsync && tsdb_fdatasync(fd) != 0)
         rc = TSDB_ERR_IO;
     close(fd);
-    return rc ? rc : add_file(c, name, kind, size, xxh);
+    return rc ? rc : add_file(c, name, kind, size, xxh, &st, 0);
 }
 
 /* Hard links the volume's `src` as `dst`: 0, 1 when `src` is not there, or an error */
-static int link_one(mk_ctx *c, const char *src, const char *dst, uint8_t kind)
+static int link_at(mk_ctx *c, const char *src, const char *dst)
 {
     if (linkat(c->db->dirfd, src, c->sdfd, dst, 0) != 0)
         return errno == ENOENT ? 1 : TSDB_ERR_IO;
-    return seal_file(c, dst, kind);
+    return 0;
+}
+
+/* link_at, then seal_file */
+static int link_one(mk_ctx *c, const char *src, const char *dst, uint8_t kind)
+{
+    int rc = link_at(c, src, dst);
+    return rc ? rc : seal_file(c, dst, kind);
 }
 
 /* Copies the first `len` bytes of the volume's `src` to `dst` (a file shorter than that is damage: the engine wrote
@@ -489,7 +528,7 @@ static int write_man(mk_ctx *c, int64_t volume, const uint8_t uuid[16], const st
             nh++;
     size_t n = 8 + 16 + 8 + 16 + 6 * 8 + nh * 16 + 8;
     for (size_t i = 0; i < c->nf; i++)
-        n += 2 + strlen(c->f[i].name) + 1 + 16;
+        n += 2 + strlen(c->f[i].name) + 1 + 16 + 4;
     uint8_t *b = calloc(1, n);
     if (!b)
         return TSDB_ERR_NOMEM;
@@ -519,6 +558,7 @@ static int write_man(mk_ctx *c, int64_t volume, const uint8_t uuid[16], const st
         b[o++] = c->f[i].kind;
         put64(b + o, c->f[i].size), o += 8;
         put64(b + o, c->f[i].xxh), o += 8;
+        put32(b + o, c->f[i].link), o += 4;
     }
     put64(b + o, xxh64(b, o, 0)), o += 8;
     int fd = openat(c->sdfd, SNAP_MAN ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -591,18 +631,24 @@ static int copy_dicts(mk_ctx *c, const struct dictlen *dl)
     return 0;
 }
 
+/* Every part linked first, then each read (snapshot.c's header: the links are not spaced out by the reads) */
 static int link_parts(mk_ctx *c, char (*names)[96], size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         hook(c->db, SNAP_AT_PART, names[i]);
-        int rc = link_one(c, names[i], names[i], SNAP_PART);
+        int rc = link_at(c, names[i], names[i]);
         if (rc == 1 && snap_mutant != SNAP_MUT_NORETIRED) {
             char r[128];
             snprintf(r, sizeof r, "retired_%s", names[i]); /* a merge took it after the cut */
-            rc = link_one(c, r, names[i], SNAP_PART);
+            rc = link_at(c, r, names[i]);
         }
         if (rc == 1)
             return SNAP_RETRY; /* retired and deleted already: make it again */
+        if (rc)
+            return rc;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int rc = seal_file(c, names[i], SNAP_PART);
         if (rc)
             return rc;
         c->out->nparts++;
@@ -677,6 +723,9 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         rc = leader_rs_image(db, &rsb, &rsl, &done);
     if (rc == 0)
         rc = leader_links_list(db, p, &lf, &nlf);
+    void (*cut)(eng *, uint64_t) = __atomic_load_n(&snap_test_cut, __ATOMIC_ACQUIRE);
+    if (rc == 0 && cut)
+        cut(db, p);
     pthread_mutex_unlock(&db->publish_lock);
     pthread_mutex_unlock(&db->flush_lock);
     if (rc)
@@ -703,6 +752,7 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     /* ---- the log: S .. P's segment, and the COMMITs' files in it ---- */
     if ((rc = list_segs(db, &segs, &nsegs)) != 0)
         goto out;
+    hook(db, SNAP_AT_SEGLIST, NULL);
     uint64_t need_pos = UINT64_MAX; /* the oldest COMMIT above done: its parts may not be listed */
     for (size_t i = 0; i < nlf; i++)
         if (!lf[i].keep && lf[i].fno > done)
@@ -718,10 +768,19 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         rc = SNAP_RETRY; /* its segment went: the write has published since (parts are listed) */
         goto out;
     }
+    if (mem_seq != UINT64_MAX) {
+        bool listed = false;
+        for (size_t i = 0; i < nsegs; i++)
+            listed |= segs[i].seq == mem_seq;
+        if (!listed) {
+            rc = SNAP_RETRY; /* a flush after the cut wrote its rows to parts and the keep bound removed it */
+            goto out;
+        }
+    }
     uint64_t sseq = pseq;
     if (mem_seq != UINT64_MAX)
         sseq = MIN(sseq, mem_seq);
-    if (need_seq)
+    if (need_seq && snap_mutant != SNAP_MUT_NONEEDSEQ) /* planted: a COMMIT above done in an older segment left out */
         sseq = MIN(sseq, need_seq);
     if (p && !pseq && mem_seq != UINT64_MAX) {
         rc = TSDB_ERR_CORRUPT; /* rows not in parts, and no segment holds P */
@@ -737,11 +796,17 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         wal_name(nm, sizeof nm, segs[i].seq);
         if (segs[i].seq == pseq) {
             uint64_t end;
-            if ((rc = seg_end_at(db, pseq, p, &end)) != 0)
-                goto out;
-            rc = copy_file(&c, nm, nm, end, SNAP_SEG);
+            rc = seg_end_at(db, pseq, p, &end);
+            if (rc == 0)
+                rc = copy_file(&c, nm, nm, end, SNAP_SEG);
+            else if (rc == SNAP_RETRY)
+                rc = 1; /* gone */
         } else {
             rc = link_one(&c, nm, nm, SNAP_SEG);
+        }
+        if (rc == 1 && snap_mutant == SNAP_MUT_NOSEGRETRY) { /* planted: a segment gone at its link left out */
+            rc = 0;
+            continue;
         }
         if (rc == 1)
             rc = SNAP_RETRY; /* a flush and the keep bound removed it */
@@ -749,8 +814,9 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
             goto out;
         out->nsegs++;
     }
-    /* A gap in the numbers between S and P's segment is a promotion's jump, never a removed segment: one at or above S
-     * goes only after a flush past the cut, and then the link above found it gone (SNAP_RETRY) or it was linked. */
+    /* A gap in the numbers between S and P's segment is a promotion's jump, never a removed segment: segments go oldest
+     * first, S's was listed (checked above for the memtables'; P's and the COMMITs' were found in the listing), so one
+     * removed after the listing takes S's with it, and its link above found it gone (SNAP_RETRY). */
     for (size_t i = 0; i < nlf; i++) {
         if (lf[i].fno < out->s_first || !out->s_first)
             continue; /* its marker is in parts already */
@@ -819,25 +885,50 @@ out:
 
 /* ---- release and sweep ---- */
 
+/* The names are read whole before any is unlinked, and the directory read again until a pass finds none: readdir is
+ * unspecified while entries go (NFS's cookies skip some), and a skipped one would fail the rmdir */
 static int rm_dir_at(int pfd, const char *name)
 {
     int dfd = openat(pfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dfd < 0)
         return errno == ENOENT ? 0 : TSDB_ERR_IO;
-    DIR *d = fdopendir(dup(dfd));
-    int rc = d ? 0 : TSDB_ERR_IO;
-    if (d) {
+    int rc = 0;
+    for (size_t found = 1, pass = 0; rc == 0 && found; pass++) {
+        if (pass == 16) {
+            rc = TSDB_ERR_IO; /* entries that never go */
+            break;
+        }
+        found = 0;
+        DIR *d = fdopendir(dup(dfd));
+        if (!d) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
         rewinddir(d);
+        char(*v)[256] = NULL;
+        size_t cap = 0;
         struct dirent *e;
         for (errno = 0; (e = readdir(d)); errno = 0) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
                 continue;
-            if (unlinkat(dfd, e->d_name, 0) != 0 && errno != ENOENT)
-                rc = TSDB_ERR_IO;
+            if (found == cap) {
+                size_t nc = cap ? cap * 2 : 64;
+                void *p = realloc(v, nc * sizeof *v);
+                if (!p) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                v = p, cap = nc;
+            }
+            snprintf(v[found++], sizeof v[0], "%s", e->d_name);
         }
-        if (errno)
-            rc = TSDB_ERR_IO;
+        if (rc == 0 && errno)
+            rc = TSDB_ERR_IO; /* a readdir error is an error, never the end of the directory */
         closedir(d);
+        for (size_t i = 0; rc == 0 && i < found; i++)
+            if (unlinkat(dfd, v[i], 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+        free(v);
     }
     close(dfd);
     if (rc == 0 && unlinkat(pfd, name, AT_REMOVEDIR) != 0 && errno != ENOENT)
@@ -909,6 +1000,11 @@ static uint64_t get64(const uint8_t *p)
     return v;
 }
 
+static int cmp_fname(const void *a, const void *b)
+{
+    return strcmp((*(const struct snap_file *const *)a)->name, (*(const struct snap_file *const *)b)->name);
+}
+
 int snap_man_read(const char *dir, struct snap_man *m)
 {
     memset(m, 0, sizeof *m);
@@ -929,7 +1025,8 @@ int snap_man_read(const char *dir, struct snap_man *m)
         memcpy(&m->version, b + 8, 4);
         memcpy(&nh, b + 12, 4);
         memcpy(&nf, b + 16, 4);
-        ok = m->version == SNAP_MAN_VERSION && nh <= (len - head) / 16;
+        /* bounds from the length before any allocation: a file entry takes at least 2 + 1 + 1 + 16 + 4 bytes */
+        ok = m->version == SNAP_MAN_VERSION && nh <= (len - head - 8) / 16 && nf <= (len - head - 8 - 16 * (size_t)nh) / 24;
     }
     size_t o = 24;
     if (ok) {
@@ -958,16 +1055,36 @@ int snap_man_read(const char *dir, struct snap_man *m)
                 break;
             }
             memcpy(&l, b + o, 2), o += 2;
-            if (l == 0 || l >= sizeof m->files[i].name || o + l + 17 > len - 8 || memchr(b + o, '/', l) ||
+            if (l == 0 || l >= sizeof m->files[i].name || o + l + 21 > len - 8 || memchr(b + o, '/', l) ||
                 memchr(b + o, 0, l)) {
                 ok = false;
                 break;
             }
-            memcpy(m->files[i].name, b + o, l), o += l;
-            m->files[i].kind = b[o++];
-            m->files[i].size = get64(b + o), o += 8;
-            m->files[i].xxh64 = get64(b + o), o += 8;
+            struct snap_file *f = &m->files[i];
+            memcpy(f->name, b + o, l), o += l;
+            f->kind = b[o++];
+            f->size = get64(b + o), o += 8;
+            f->xxh64 = get64(b + o), o += 8;
+            memcpy(&f->link, b + o, 4), o += 4;
+            ok = strcmp(f->name, ".") && strcmp(f->name, "..") && strncmp(f->name, SNAP_MAN, strlen(SNAP_MAN)) &&
+                 f->kind >= SNAP_PART && f->kind <= SNAP_META &&
+                 (!f->link || (f->link <= i && !m->files[f->link - 1].link && m->files[f->link - 1].size == f->size &&
+                               m->files[f->link - 1].xxh64 == f->xxh64));
             m->nfiles++;
+        }
+        if (ok && m->nfiles > 1) { /* no name twice */
+            struct snap_file **v = malloc(m->nfiles * sizeof *v);
+            if (!v) {
+                free(b);
+                snap_man_free(m);
+                return TSDB_ERR_NOMEM;
+            }
+            for (size_t i = 0; i < m->nfiles; i++)
+                v[i] = &m->files[i];
+            qsort(v, m->nfiles, sizeof *v, cmp_fname);
+            for (size_t i = 1; ok && i < m->nfiles; i++)
+                ok = strcmp(v[i - 1]->name, v[i]->name) != 0;
+            free(v);
         }
         ok = ok && o == len - 8;
     }

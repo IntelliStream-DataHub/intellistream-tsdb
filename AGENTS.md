@@ -319,14 +319,19 @@ cgroup, so `nice` does not keep your work out of its way.
   MK_GC; nothing gates that on a cluster volume yet.
 - `src/snapshot.[ch]` (R4 D3, D4; design-cluster.md 5.2-5.3, 8.1): the make side of a leader's snapshot. `snap_make`
   takes the cut P (the commit point) under `flush_lock` then `publish_lock` with no I/O (the part list, the memtables'
-  segments and S, RSTATE, the COMMIT markers' files), releases both, hard links the parts (by their `retired_` name when a
-  merge renamed one after the cut; neither: `SNAP_RETRY`), the segments S..P (P's copied up to its record end), the
+  segments and S, RSTATE, the COMMIT markers' files), releases both, hard links every part before it reads any (by its
+  `retired_` name when a merge renamed one after the cut; neither: `SNAP_RETRY`; a memtable's segment the keep bound
+  removed before the listing is `SNAP_RETRY` too, never CORRUPT), the segments S..P (P's copied up to its record end), the
   `stage_` files of COMMITs above `done` and the `keep_` files of those at or below it, copies SERIES, STATES, RETENTION
   and CLASSES to the length read under their one lock each (taken alone), then fsyncs every file and the directory and
-  writes `SNAPMAN` last (temporary, fsync, rename, directory fsync). `snap_release` removes a snapshot, and the open of an
+  writes `SNAPMAN` last (temporary, fsync, rename, directory fsync; version 2: a `keep_` file that is a listed part's
+  inode is named as that entry's link, read once). `snap_man_read` refuses `.`, `..`, its own names, a name twice,
+  unknown kinds and bad links (a SNAPMAN comes from another node). `snap_release` removes a snapshot, and the open of an
   engine removes every `snap_*` directory (no make survives its engine). `tests/test_snapshot.c` (`snap_verify_cut`, the
-  windows, merges during the links, random writers, power loss at every step under crashfs with the link model; mutants
-  `snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync`).
+  windows, merges during the links, a segment removed before and after the listing, random writers, power loss at every
+  step under crashfs with the link model; the verify also requires everything the leader had at the cut, noted by
+  `snap_test_cut` under the cut's locks; mutants `snapafterp snapdictshort snapnokeep snapnostage snapnoretired
+  snapnodirsync snapnoneedseq snapnosegretry`).
 - `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,
   epoch, see_epoch, writable, all_up); settle.c, eccache.c, eckeep.c, ecgc.c and tier.c reach the stores only through them
   and never name a store index. Per attached engine (`tier_attach`: ops, settings, epoch provider; a refcounted `coldvol`
