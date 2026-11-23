@@ -44,6 +44,7 @@
 #include <stdlib.h>
 
 void (*_Atomic ecapply_crash_hook)(struct eng *db, int which);
+void (*_Atomic ecapply_test_hook)(struct eng *db, int step);
 
 static void crash_at(struct eng *db, int which)
 {
@@ -315,9 +316,7 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         return rc;
     crash_at(db, ECAPPLY_CRASH_BEFORE_APPLY);
     uint64_t gen = replica_mu_drop(db);
-    rc = replica_flush_through(db, c->flush_through);
-    if (rc == 0 && ecapply_mutant == ECAPPLY_MUT_COLDNOFLUSHTHROUGH) /* planted: the active memtable flushed too */
-        rc = mt_flush(db);
+    rc = replica_flush_through(db, c->flush_through); /* planted coldnoflushthrough there: the active one too */
     uint8_t *seen = calloc(c->nobjs ? c->nobjs : 1, 1);
     if (!seen && rc == 0)
         rc = TSDB_ERR_NOMEM;
@@ -326,6 +325,9 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         rc = cold_stage_one(db, pos, c, &f[i], seen);
     replica_stage_release(db);
     free(seen);
+    void (*th)(struct eng *, int) = atomic_load(&ecapply_test_hook);
+    if (th && rc == 0)
+        th(db, ECAPPLY_STEP_STAGED);
     if (replica_mu_retake(db, gen)) { /* a cut: this marker and its files may be gone */
         cf_free(db, f, n, false);
         return RP_AGAIN;

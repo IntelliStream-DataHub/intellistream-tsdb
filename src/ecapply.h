@@ -57,6 +57,10 @@ extern int ecapply_mutant;
 enum { ECAPPLY_CRASH_BEFORE_APPLY = 1, ECAPPLY_CRASH_MID_INTENT = 2 };
 extern void (*_Atomic ecapply_crash_hook)(struct eng *db, int which);
 int ecapply_mutant_parse(const char *name); /* -1 when unknown */
+/* test hook (tests/test_ecapply.c): STAGED once the marker's files are read and checked, before the step that decides
+ * under publish_lock and db->lock (rp->mu, stage_mu and every engine lock free: the hook may drop or merge the key) */
+enum { ECAPPLY_STEP_STAGED = 1 };
+extern void (*_Atomic ecapply_test_hook)(struct eng *db, int step);
 
 /* ---- the replica API (r8a2-hooks, built in src/replica.c) ----
  * ecapply_cold runs on the replica's applier (rp->apply_mu held) with rp->mu held, as apply_commit does. Lock order:
