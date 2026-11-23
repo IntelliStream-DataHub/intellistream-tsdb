@@ -43,22 +43,33 @@ mode=${1:-quick}
 #     taken), 45 removedcounts (a removed member's last match still holds the commit point), 46 replayabove (the floor
 #     is the leader's own replay start), 47 snapatorbelow (a snapshot at or below the log end is wanted), 48 leaveflap
 #     (a leaving member is asked for again), 49 leaveunsafe (the move's shrink ignores its min_isr), 50 targetany (a
-#     planned promotion ignores its target: test_repl only)
+#     planned promotion ignores its target: test_repl's `target`). The simulator kills 43-49 within 1000 seeds (its
+#     set changes, moves and replay starts, checks 9 and 10); 50 is left to test_repl (the simulator promotes without
+#     a target).
+#     51-57 are test_repl's only, since the simulator's driver hands a META over in the step that reconfigures, drains
+#     every action before the next message, and filters records of other set versions before the core sees them:
+#     51 holdnever (a leader whose change removed a member of its record's ISR still counts without it), 52 adoptnosetv
+#     (a record of the new set version not adopted when its ISR version is not higher), 53 metaanyv (a record of
+#     another set version taken), 54 reconfpending (a reconfig with actions queued in the old indexes), 55 unansnoremap
+#     (the unanswered set stays by index), 56 joinnoremap (the join index stays by index), 57 busykeep (a pending add of
+#     a removed member keeps the leader waiting for a later record). The line that sends a follower whose leader was
+#     removed to F_IDLE has no mutant: its leader index becomes -1, which no message matches, so it is equivalent.
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
 # 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 # 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41"
-all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41"
+quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41 43 44 45 46 47 48 49"
+all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41 43 44 45 46 47 48 49"
 # test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
 # run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
 # by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
            14:promote 39:replay_floor 40:idle_shrink 42:steady_join 43:reconfig 44:reconfig 45:reconfig 46:replay
-           47:snapshot 48:leave 49:leave 50:target"
+           47:snapshot 48:leave 49:leave 50:target 51:hold 52:hold 53:hold 54:reconfig 55:unans_remap 56:join_remap
+           57:busy_drop"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the
