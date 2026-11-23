@@ -861,6 +861,88 @@ static void case_power(void)
     sweep("an open that compacts PPOS", "open", prep_dead, 600, 5);
 }
 
+/* ------------------------------------------------------------ cost of the notes */
+
+#include <math.h>
+#include <time.h>
+
+/* rows/s of small inserts (1000 rows, through the WAL and the memtable) into a volume; days: the rows' days cycle
+ * over this many (1: the last-day cache always hits; 30: it misses 29 times a batch) */
+static double bench_one(bool ec, int days, size_t total, size_t batch)
+{
+    char dir[PATH_MAX];
+    if (ec) {
+        fresh(dir, "bench_ec");
+    } else {
+        snprintf(dir, sizeof dir, "%s/bench_plain", S);
+        sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 100;
+    o.stats = -1;
+    eng *db = NULL;
+    meta_cluster_open_allow(true);
+    int rc = eng_open(dir, &o, &db);
+    meta_cluster_open_allow(false);
+    if (rc != 0)
+        return 0;
+    if ((db->ppos != NULL) != ec)
+        failures++;
+    uint32_t ids[16];
+    for (int i = 0; i < 16; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "s%d", i);
+        ids[i] = series(db, nm);
+    }
+    static int64_t ts[100000];
+    static float v[100000];
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (size_t k = 0, n = 0; n < total; k++, n += batch) {
+        for (size_t j = 0; j < batch; j++) { /* in time order over `days` days: leaves the cached day days - 1 times */
+            ts[j] = T0 + (int64_t)(j * (size_t)days / batch) * DAY + (int64_t)(k / 16) * (int64_t)batch + (int64_t)j;
+            v[j] = (float)j;
+        }
+        if (eng_insert_series(db, TSDB_FLOAT32, ids[k % 16], ts, v, batch) != 0) {
+            failures++;
+            break;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    eng_close(db);
+    sh("rm -rf '%s'", dir);
+    return (double)total / ((double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9);
+}
+
+static void bench(int reps)
+{
+    const size_t total = 4000000;
+    bench_one(false, 1, total, 1000); /* a warm-up, not counted */
+    /* 1000-row inserts through the memtable over 1 and 30 days (the notes), then 100,000-row inserts straight to parts
+     * with fsync on (each part's record appended and fdatasynced before its name) */
+    for (int mode = 0; mode < 3; mode++) {
+        int days = mode == 1 ? 30 : 1;
+        size_t batch = mode == 2 ? 100000 : 1000, tot = mode == 2 ? 2000000 : total;
+        double r[2][32] = {{0}};
+        for (int i = 0; i < reps && i < 32; i++) /* interleaved */
+            for (int ec = 0; ec < 2; ec++)
+                r[ec][i] = bench_one(ec, days, tot, batch);
+        for (int ec = 0; ec < 2; ec++) {
+            double m = 0, sd = 0;
+            for (int i = 0; i < reps; i++)
+                m += r[ec][i] / reps;
+            for (int i = 0; i < reps; i++)
+                sd += (r[ec][i] - m) * (r[ec][i] - m) / (reps > 1 ? reps - 1 : 1);
+            printf("  bench: %s, %zu-row inserts, rows in %d day(s): %.2f M rows/s (sd %.2f, %d runs)\n",
+                   ec ? "ec cluster volume (PPOS on)" : "plain volume (PPOS off)", batch, days, m / 1e6, sqrt(sd) / 1e6,
+                   reps);
+        }
+    }
+}
+
 static int mutant_of(const char *m)
 {
     return strcmp(m, "pposafter") == 0     ? PPOS_MUT_AFTER
@@ -922,6 +1004,11 @@ int main(int argc, char **argv)
     char *slash = strrchr(SELF, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
     printf("test_ppos%s%s\n", mutant ? " --mutant " : "", mutant ? mutant : "");
+    if (getenv("TEST_PPOS_BENCH")) {
+        bench(atoi(getenv("TEST_PPOS_BENCH")) > 0 ? atoi(getenv("TEST_PPOS_BENCH")) : 5);
+        sh("rm -rf '%s'", S);
+        return failures ? 1 : 0;
+    }
     if (ppos_mutant == PPOS_MUT_NOSYNC) { /* only a power loss can see it */
         case_power();
     } else {
