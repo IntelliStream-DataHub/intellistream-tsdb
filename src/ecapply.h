@@ -61,6 +61,9 @@ int ecapply_mutant_parse(const char *name); /* -1 when unknown */
  * under publish_lock and db->lock (rp->mu, stage_mu and every engine lock free: the hook may drop or merge the key) */
 enum { ECAPPLY_STEP_STAGED = 1 };
 extern void (*_Atomic ecapply_test_hook)(struct eng *db, int step);
+/* test seam (test_ecapply badft): nonzero, the segment a COLD's apply asks replica_flush_through for in place of the
+ * marker's F (a marker whose F is not below its own segment, which the leader never writes) */
+extern _Atomic uint64_t ecapply_test_ft;
 
 /* ---- the replica API (r8a2-hooks, built in src/replica.c) ----
  * ecapply_cold runs on the replica's applier (rp->apply_mu held) with rp->mu held, as apply_commit does. Lock order:

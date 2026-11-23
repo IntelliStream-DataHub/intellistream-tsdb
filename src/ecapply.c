@@ -45,6 +45,7 @@
 
 void (*_Atomic ecapply_crash_hook)(struct eng *db, int which);
 void (*_Atomic ecapply_test_hook)(struct eng *db, int step);
+_Atomic uint64_t ecapply_test_ft;
 
 static void crash_at(struct eng *db, int which)
 {
@@ -316,7 +317,8 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         return rc;
     crash_at(db, ECAPPLY_CRASH_BEFORE_APPLY);
     uint64_t gen = replica_mu_drop(db);
-    rc = replica_flush_through(db, c->flush_through); /* planted coldnoflushthrough there: the active one too */
+    const uint64_t tft = atomic_load(&ecapply_test_ft);
+    rc = replica_flush_through(db, tft ? tft : c->flush_through); /* planted coldnoflushthrough there: the active one */
     uint8_t *seen = calloc(c->nobjs ? c->nobjs : 1, 1);
     if (!seen && rc == 0)
         rc = TSDB_ERR_NOMEM;

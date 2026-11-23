@@ -195,6 +195,8 @@ REAL(rename);
 REAL(renameat);
 REAL(unlink);
 REAL(unlinkat);
+REAL(link);
+REAL(linkat);
 REAL(close);
 REAL(dup);
 REAL(dup2);
@@ -238,6 +240,8 @@ __attribute__((constructor)) static void init(void)
     LOAD(renameat);
     LOAD(unlink);
     LOAD(unlinkat);
+    LOAD(link);
+    LOAD(linkat);
     LOAD(close);
     LOAD(dup);
     LOAD(dup2);
@@ -1269,7 +1273,7 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         char dir[PATH_MAX];
         dir_of(b, dir);
         snprintf(hard, PATH_MAX, "%s/.crashfs_saved_%d_%u", dir, (int)getpid(), saved_counter++);
-        if (link(b, hard) == 0)
+        if (real_link(b, hard) == 0)
             snprintf(saved, PATH_MAX, "%s", hard);
     }
     int r = at ? real_renameat(ofd, oldp, nfd, newp) : real_rename(oldp, newp);
@@ -1322,6 +1326,26 @@ int renameat2(int ofd, const char *a, int nfd, const char *b, unsigned flags)
     }
     return do_rename(ofd, a, nfd, b, true);
 }
+
+/* link, linkat: a new name for an inode that already has one. Until its directory is synced it is a create like any
+ * other (a power loss takes the name away, the inode keeps its other names): tsdb links staged and kept files. */
+static int do_link(int ofd, const char *oldp, int nfd, const char *newp, int flags, bool at)
+{
+    char b[PATH_MAX];
+    path_of_at(at ? nfd : AT_FDCWD, newp, b);
+    if (!tracked(b))
+        return at ? real_linkat(ofd, oldp, nfd, newp, flags) : real_link(oldp, newp);
+    pthread_mutex_lock(&lock);
+    maybe_crash();
+    int r = at ? real_linkat(ofd, oldp, nfd, newp, flags) : real_link(oldp, newp);
+    if (r == 0)
+        add_dirop(OP_CREATE, b, NULL, NULL);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+int link(const char *a, const char *b) { return do_link(AT_FDCWD, a, AT_FDCWD, b, 0, false); }
+int linkat(int ofd, const char *a, int nfd, const char *b, int flags) { return do_link(ofd, a, nfd, b, flags, true); }
 
 static int do_unlink(int dirfd, const char *name, int flags, bool at)
 {

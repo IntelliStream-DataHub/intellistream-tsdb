@@ -13,8 +13,11 @@
  * nothing renamed, DIVERGED, still after a restart); dropped (P dropped by the replica between the staging and the
  * intent: nothing listed, nothing retired); leader (a leader killed after its swap, or after the swap's intent and
  * before its renames, reopened as a replica: the COLD replayed is not applied again, every oid listed once, the .ec's
- * PPOS record there); power (crashfs power loss at every step of the apply: the old parts or the new set, then the
- * apply ends with the new set).
+ * PPOS record there; or two COLDs and a clean close: the first's `done` is not lost under the second's `doing`); badft
+ * (a COLD whose F is not below its own segment, through the seam ecapply_test_ft: TSDB_ERR_CORRUPT, nothing listed);
+ * leaderpower (crashfs: the leader's power fails once its COLD marker committed, before the swap; reopened as a replica
+ * it carries the COLD out from the stage_ links jr_cold made durable); power (crashfs power loss at every step of the
+ * apply: the old parts or the new set, then the apply ends with the new set).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
  * pposafterswap;
@@ -627,10 +630,15 @@ static int settled_of_key(const char *dir)
 /* ------------------------------------------------------------ the leader's workload */
 
 static _Atomic bool W_CUT; /* the settle's cut step writes rows of s1 into day 1 (the marker's segment) */
+static _Atomic bool MARKER_EXIT; /* leaderpower's child: exit() (crashfs: the power fails) once the marker committed */
 static void step_hook(eng *db, int step)
 {
     if (step == ECCOLD_STEP_CUT && atomic_load(&W_CUT))
         CHECK(rows(db, 1, 1, 100, 3, 300.0f) == 0);
+    if (step == ECCOLD_STEP_MARKER && atomic_load(&MARKER_EXIT)) {
+        fflush(NULL);
+        exit(99); /* not _exit: crashfs's destructor drops what was not synced */
+    }
 }
 
 /* P: I (500 rows of s0 from 0 s, value 1 + i, a level-1 part), then in the memtable two of them overwritten (900, 901)
@@ -906,10 +914,11 @@ static void swap_exit(eng *db) { (void)db, _exit(99); }
 
 static void test_leader(void)
 {
-    for (int at = 0; at < 2; at++) {
+    static const char *const nm[] = {"leader-done", "leader-intent", "leader-two"};
+    for (int at = 0; at < 3; at++) {
         lt L;
         rec_reset();
-        if (!start(at ? "leader-intent" : "leader-done", &L))
+        if (!start(nm[at], &L))
             return;
         lstop(&L);
         fflush(NULL);
@@ -919,17 +928,24 @@ static void test_leader(void)
             if (lopen(&L) != 0)
                 _exit(2);
             eccold_cut c;
+            if (at == 2) /* a second key, settled after P: its COLD's `doing` must not stand in for P's `done` */
+                CHECK(rows(L.db, L.s[1], 1, 0, 300, 5.0f) == 0);
             make_i(&L);
-            if (at)
+            if (at == 1)
                 ec_swap_hook = swap_exit;
             CHECK(settle_key(L.db, KEY) == 0);
             eccold_test_last(&c);
             CHECK(c.rc == 0 && c.nobjs == 1);
+            if (at == 2) {
+                CHECK(settle_key(L.db, KEY + 1) == 0);
+                eccold_test_last(&c);
+                CHECK(c.rc == 0 && c.nobjs == 1);
+            }
             fflush(NULL);
             _exit(failures ? 1 : 0);
         }
         int st = child_status(pid);
-        CHECK(st == (at ? 99 : 0));
+        CHECK(st == (at == 1 ? 99 : 0));
         rt R = {0};
         snprintf(R.dir, sizeof R.dir, "%s", L.dir);
         if (ropen(&L, &R, 0) != 0) {
@@ -952,16 +968,137 @@ static void test_leader(void)
         unref_all(ec, ne);
         unref_all(rest, nr);
         CHECK(holds(R.db, 0, 0, 0, 500, 1.0f));
+        if (at == 2) {
+            ne = parts_of(R.db, KEY + 1, ec, 8, true), nr = parts_of(R.db, KEY + 1, rest, 8, false);
+            CHECK(ne == 1 && nr == 0);
+            if (ne != 1 || nr != 0)
+                fprintf(stderr, "leader-two: day 1 lists %zu .ec parts and %zu others\n", ne, nr);
+            unref_all(ec, ne);
+            unref_all(rest, nr);
+            CHECK(holds(R.db, 1, 1, 0, 300, 5.0f));
+        }
         CHECK(eng_check(R.db) == 0);
         rstop(&R);
         lclose(&L);
     }
-    printf("  leader: killed after its swap or before its renames, reopened as a replica: its COLD not applied again\n");
+    printf("  leader: killed after its swap or before its renames, or two COLDs and a close, reopened as a replica: no "
+           "COLD applied again\n");
+}
+
+static char SHIM[PATH_MAX]; /* libcrashfs.so beside this binary */
+
+/* ------------------------------------------------------------ badft: a COLD whose F is not below its own segment */
+
+static void test_badft(void)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("badft", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload(&L, &c, false);
+    uint64_t last = LAST;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    atomic_store(&ecapply_test_ft, UINT64_C(1) << 62); /* the marker asks for a flush through a segment past its own */
+    int rc = feed(&R, last);
+    atomic_store(&ecapply_test_ft, 0);
+    CHECK(rc == TSDB_ERR_CORRUPT);
+    if (rc != TSDB_ERR_CORRUPT)
+        fprintf(stderr, "badft: the apply said %d, wanted TSDB_ERR_CORRUPT\n", rc);
+    part *ec[8];
+    size_t ne = parts_of(R.db, KEY, ec, 8, true);
+    CHECK(ne == 0); /* nothing carried out */
+    unref_all(ec, ne);
+    rstop(&R);
+    lclose(&L);
+    printf("  badft: a COLD that asks for a flush through its own segment or past it is refused, nothing listed\n");
+}
+
+/* ------------------------------------------------------------ leaderpower: the leader loses power after its COLD */
+
+/* the child under crashfs: the leader settles P and the power fails once the marker is committed, before the swap (the
+ * staged links of the marker's files must be durable by then: the marker names them for every member) */
+static int leader_power_child(const char *root)
+{
+    lt L;
+    lt_paths(&L, root);
+    for (int i = 0; i < 8; i++)
+        L.s[i] = (uint32_t)i;
+    if (lopen(&L) != 0)
+        _exit(2);
+    make_i(&L);
+    atomic_store(&MARKER_EXIT, true);
+    int rc = settle_key(L.db, KEY);
+    fprintf(stderr, "leaderpower: the settle returned %d without reaching its marker\n", rc);
+    _exit(3);
+}
+
+static void test_leaderpower(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  leaderpower: skipped (no %s)\n", SHIM);
+        return;
+    }
+    lt L;
+    rec_reset();
+    if (!start("leaderpower", &L))
+        return;
+    lstop(&L);
+    fflush(NULL);
+    char *argv[] = {"test_ecapply", S, "--leader-power-child", L.root, NULL};
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", L.root, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+    int st = child_status(pid);
+    CHECK(st == 99);
+    if (st != 99)
+        fprintf(stderr, "leaderpower: the child's status %d\n", st);
+    rt R = {0};
+    snprintf(R.dir, sizeof R.dir, "%s", L.dir);
+    int rc = ropen(&L, &R, 0);
+    CHECK(rc == 0);
+    if (rc) {
+        fprintf(stderr, "leaderpower: the leader's directory does not open as a replica (%d)\n", rc);
+        lclose(&L);
+        return;
+    }
+    uint64_t end = replica_log_end(R.db);
+    rc = replica_apply(R.db, end);
+    CHECK(rc == 0);
+    if (rc)
+        fprintf(stderr, "leaderpower: the apply of its own COLD: %d\n", rc);
+    part *ec[8], *rest[8];
+    size_t ne = parts_of(R.db, KEY, ec, 8, true), nr = parts_of(R.db, KEY, rest, 8, false);
+    CHECK(ne == 1 && nr == 0); /* the marker survived and was carried out from the staged links */
+    if (ne != 1 || nr != 0)
+        fprintf(stderr, "leaderpower: P lists %zu .ec parts and %zu others\n", ne, nr);
+    unref_all(ec, ne);
+    unref_all(rest, nr);
+    CHECK(holds(R.db, 0, 0, 0, 500, 1.0f));
+    CHECK(eng_check(R.db) == 0);
+    rstop(&R);
+    lclose(&L);
+    printf("  leaderpower: power lost after the COLD marker, before the swap: reopened as a replica, it carries the COLD "
+           "out from its links\n");
 }
 
 /* ------------------------------------------------------------ power: crashfs power loss at every step of the apply */
 
-static char SHIM[PATH_MAX];
 static void ack_path(char *p, size_t cap, const char *root, const char *what)
 {
     const char *b = strrchr(root, '/');
@@ -1139,7 +1276,7 @@ static void alarm_exit(int sig)
 
 int main(int argc, char **argv)
 {
-    const char *only = NULL, *power_root = NULL;
+    const char *only = NULL, *power_root = NULL, *lpower_root = NULL;
     uint64_t p_last = 0, p_cpos = 0;
     snprintf(S, sizeof S, "/tmp");
     for (int i = 1; i < argc; i++) {
@@ -1149,6 +1286,8 @@ int main(int argc, char **argv)
             only = argv[++i];
         else if (!strcmp(argv[i], "--power-child") && i + 3 < argc)
             power_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--leader-power-child") && i + 1 < argc)
+            lpower_root = argv[++i];
         else
             snprintf(S, sizeof S, "%s", argv[i]);
     }
@@ -1170,6 +1309,8 @@ int main(int argc, char **argv)
     leader_test_marker_hook = eccold_after_append;
     if (power_root)
         return power_child(power_root, p_last, p_cpos);
+    if (lpower_root)
+        return leader_power_child(lpower_root);
     char self[PATH_MAX];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
     self[sl > 0 ? sl : 0] = '\0';
@@ -1180,7 +1321,7 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"leader", test_leader},
-                 {"power", test_power}};
+                 {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();
