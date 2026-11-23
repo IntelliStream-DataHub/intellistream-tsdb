@@ -609,6 +609,7 @@ static void node_add(int via, int newi)
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
 static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to this instead of 1.5 s */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
+static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
@@ -625,6 +626,12 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
+    if (init_r4_set) {
+        s.rebuild_mb_s = 300;
+        s.rebuild_max = 3;
+        s.transfer_wait_ms = 2500;
+        s.leader_balance_s = 60;
+    }
     uint8_t req[128], *reply;
     size_t len;
     size_t rl = cluster_settings_encode(&s, mode, req);
@@ -4305,6 +4312,85 @@ static void scen_chunksrv(void)
     if (!log_has(0, "chunksrv test: pass check"))
         die("after B's SIGKILL the chunk or the fence was gone (n0.log: chunksrv test: FAIL ...)");
     printf("  B killed and restarted: the chunk reads back whole, a put at 4 is still FENCED\n");
+}
+
+/* R4 (the plan's D9): the metadata snapshot is version 5. A state directory of another version (a cluster a preview
+ * build made before) is refused at start with a line naming both versions, never read as damage or replayed, and
+ * before NODE is written again: here a one-server cluster's `snapshot`, then (that one put back) its `copy`, is
+ * rewritten as version 4 (checksum and all) while it is down. Before that, INIT's four settings of R4 (cluster.c's
+ * settings words 19-22) are read back from STATUS. */
+uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c, as meta.c declares it */
+static size_t snapv_read(const char *path, uint8_t *img, size_t cap)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        die("cannot read %s: %s", path, strerror(errno));
+    size_t n = fread(img, 1, cap, f);
+    fclose(f);
+    if (n == cap)
+        die("%s is larger than %zu bytes", path, cap);
+    return n;
+}
+static void snapv_write(const char *path, const uint8_t *img, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f || fwrite(img, 1, n, f) != n || fclose(f) != 0)
+        die("rewriting %s", path);
+}
+/* `path` rewritten as version 4: the start must fail naming it and both versions, and leave NODE as it was */
+static void snapv_refused(const char *dir, const char *name)
+{
+    static uint8_t img[1 << 20], keep[1 << 20], node0[4096], node1[4096];
+    char path[PATH_MAX + 300], nodef[PATH_MAX + 300];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    snprintf(nodef, sizeof nodef, "%s/NODE", dir);
+    size_t n = snapv_read(path, img, sizeof img);
+    memcpy(keep, img, n);
+    if (n < 28 || meta_snapshot_version(img, n) != META_SNAP_VERSION)
+        die("%s is no image of version %d (%zu bytes)", path, META_SNAP_VERSION, n);
+    uint32_t four = 4, crc;
+    memcpy(img + 4, &four, 4);
+    crc = iso_crc32c(0, img, n - 4);
+    memcpy(img + n - 4, &crc, 4);
+    snapv_write(path, img, n);
+    size_t nn0 = snapv_read(nodef, node0, sizeof node0);
+    int rc = start_try(0);
+    char want[PATH_MAX + 400];
+    snprintf(want, sizeof want, "%s holds metadata of snapshot version 4 and this build reads version %d", path,
+             META_SNAP_VERSION);
+    if (rc != TH_EXITED || !WIFEXITED(th_status) || WEXITSTATUS(th_status) == 0 || !log_has(0, want))
+        die("a %s of snapshot version 4 was not refused naming both versions (%d, 0x%x)", name, rc, th_status);
+    size_t nn1 = snapv_read(nodef, node1, sizeof node1);
+    if (nn1 != nn0 || memcmp(node0, node1, nn0) != 0)
+        die("the start refused for %s of version 4 wrote NODE again", name);
+    snapv_write(path, keep, n);
+    printf("  a %s of snapshot version 4 is refused at start, NODE untouched: \"... %s holds metadata of snapshot "
+           "version 4 and this build reads version %d\"\n", name, name, META_SNAP_VERSION);
+}
+static void scen_snapversion(void)
+{
+    scenario("snapversion");
+    start(0);
+    init_r4_set = 1;
+    init_fast(0);
+    init_r4_set = 0;
+    struct view v;
+    view(0, &v);
+    const struct meta_settings *st = &v.m.set;
+    if (st->rebuild_mb_s != 300 || st->rebuild_max != 3 || st->transfer_wait_ms != 2500 || st->leader_balance_s != 60)
+        die("INIT's settings came back as rebuild_mb_s %u, rebuild_max %u, transfer_wait_ms %u, leader_balance_s %u "
+            "(sent 300, 3, 2500, 60)", st->rebuild_mb_s, st->rebuild_max, st->transfer_wait_ms, st->leader_balance_s);
+    view_free(&v);
+    printf("  INIT's rebuild_mb_s, rebuild_max, transfer_wait_ms and leader_balance_s read back from STATUS\n");
+    char dir[PATH_MAX + 200], path[PATH_MAX + 300];
+    snprintf(dir, sizeof dir, "%s/n0/state", base);
+    snprintf(path, sizeof path, "%s/copy", dir);
+    uint64_t t0 = now_ms();
+    while (access(path, F_OK) != 0 && now_ms() - t0 < 10000)
+        usleep(50000);
+    stop(0, SIGTERM);
+    snapv_refused(dir, "snapshot");
+    snapv_refused(dir, "copy");
 }
 
 static void scen_volrefuse(void)
@@ -11878,7 +11964,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

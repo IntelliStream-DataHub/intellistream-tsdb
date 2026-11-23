@@ -217,11 +217,14 @@ struct cluster_vol_rec {
     /* replication (server/repld.c): the replicas in record order (the node index of the core, src/repl.h, is the
      * position here), with the peer address of each server as the member list holds it */
     uint32_t nrep;
+    uint64_t set_version; /* the version of rep[]: an index into it means a node only together with it (meta.h, D8) */
     struct cluster_vol_rep {
         uint32_t node;
         uint64_t rid;
         uint8_t learner;
         uint8_t unanswered; /* kept in the ISR by the last promotion without a fence reply (meta.h; repl.h unanswered) */
+        uint32_t replaces;  /* a learner: the member it moves in for (0: none); that one's REMOVE gives it its
+                             * slot (D10) */
         char peer[META_ADDR_MAX];
     } rep[META_REPLICAS_MAX];
     uint32_t nisr;
@@ -230,6 +233,7 @@ struct cluster_vol_rec {
     uint32_t min_isr, isr_lag_ms, unanswered_ms;
     uint8_t no_owner; /* no ISR member is up in the group's view: UNAVAILABLE(NO_OWNER), not MOVED to a dead leader */
     uint32_t repl_retain_mb, repl_retain_s, idle_seal_ms; /* the settings (meta.h) */
+    uint32_t rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s; /* R4's settings (meta.h, D16) */
 };
 /* Called on the cluster thread after the metadata copy changed, once the copy holds this run's incarnation (so it
  * holds every REPLICA_OPEN committed before this start), with every replicated volume that names this server (`self`)

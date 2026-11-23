@@ -8,6 +8,13 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**The cluster's metadata snapshot is now version 5 (R4: replica set changes).** A volume's record has a replica set
+version, a move in progress (`replaces`), the target of a planned transfer and four new settings (`rebuild_mb_s`,
+`rebuild_max`, `transfer_wait_ms`, `leader_balance_s`, off by default); `REPLICA_RESET` is a new metadata operation.
+A server whose state directory holds metadata of another version refuses to start with a line naming both versions (a
+metadata log without a snapshot stops at its first entry with such a line: the log's entries are marked "TME2" now):
+a cluster made before this change is initialised again, not upgraded (as for every change of the preview).
+
 **A replica volume's RSTATE file is now format 2 (R8: it records a COLD marker in progress).** A replicated volume
 whose RSTATE is format 1 is refused at open with a line naming the format: a cluster made before this change is
 initialised again, not upgraded (as for every change of the preview).

@@ -15,7 +15,10 @@ if [ "${1:-}" = --part ]; then
 fi
 bin=$1
 shift
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39} # 36 userstaleok, 37 uidfromproposer, 38 nousersbudget, 39 noactorguard
+# 36 userstaleok, 37 uidfromproposer, 38 nousersbudget, 39 noactorguard; R4's replica set: 40 setvernoraise,
+# 41 setverraiseisr, 42 resetinisr, 43 resetleader, 44 twomoves, 45 replacesstays, 46 moveslotlast, 47 targetnotisr,
+# 48 targetleader
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 47 48}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -30,8 +33,9 @@ if [ -n "$part" ]; then
     muts=$sel
 fi
 [ -n "${muts// /}" ] || exit 0 # a part with none
-# the mutants the simulator's checker catches without the unit stage (measured: with it off 8 of the 17 are caught)
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 "
+# the mutants the simulator's checker catches without the unit stage (measured: with it off 8 of the 17 are caught;
+# R4's 40-47 all, by meta_check_step or the per-op check of the replica set's version and a reset)
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 47 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac

@@ -111,9 +111,9 @@ static void isr_chg(struct meta_entry *e, const struct meta_volume *v, uint64_t 
 
 /* A promotion of replicated volume v: the replicas in `fenced` were fenced, those in `answer` answered (with durable
  * ends 10 + their node id, so the highest node id wins), `leader` is the proposer's pick. */
-static void promo_skip(struct meta_entry *e, const struct meta_volume *v, uint64_t epoch, uint32_t leader,
-                       const uint32_t *fenced, uint32_t nf, const uint32_t *answer, uint32_t na, uint64_t start,
-                       uint64_t skip)
+static struct meta_grant promo_grant(const struct meta_volume *v, uint64_t epoch, uint32_t leader,
+                                     const uint32_t *fenced, uint32_t nf, const uint32_t *answer, uint32_t na,
+                                     uint64_t start, uint64_t skip)
 {
     struct meta_grant g;
     memset(&g, 0, sizeof g);
@@ -131,6 +131,14 @@ static void promo_skip(struct meta_entry *e, const struct meta_volume *v, uint64
         const struct meta_replica *r = meta_replica(v, answer[i]);
         g.reply[i] = (struct meta_fence_reply){answer[i], r ? r->rid : 0, 10 + answer[i], epoch};
     }
+    return g;
+}
+
+static void promo_skip(struct meta_entry *e, const struct meta_volume *v, uint64_t epoch, uint32_t leader,
+                       const uint32_t *fenced, uint32_t nf, const uint32_t *answer, uint32_t na, uint64_t start,
+                       uint64_t skip)
+{
+    struct meta_grant g = promo_grant(v, epoch, leader, fenced, nf, answer, na, start, skip);
     meta_op_volume_leader(e, &g);
 }
 
@@ -314,9 +322,9 @@ static void test_state_machine(void)
     /* replicas: a learner joins (with its instance), becomes full by joining the ISR; one leaves only once out of the
      * ISR; an ISR member added had been a replica with the same instance; REPLICA_OPEN generations only rise */
     v = meta_volume(&m, 0);
-    meta_op_replica_add(&e, 0, 2, 5, 0); /* a replicated replica needs an instance */
+    meta_op_replica_add(&e, 0, 2, 5, 0, 0); /* a replicated replica needs an instance */
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
-    meta_op_replica_add(&e, 0, 2, 5, 5555);
+    meta_op_replica_add(&e, 0, 2, 5, 5555, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     CHECK(v->nrep == 4 && v->rep[3].node == 5 && v->rep[3].learner && v->rep[3].rid == 5555);
@@ -554,6 +562,307 @@ static void test_state_machine(void)
 }
 
 /* Shared volumes (design-ha-modes.md §5.4): reserved epochs, VOLUME_SELF, reservations, claims, attestations */
+/* R4 (the plan's D8-D16): the replica set's version, moves (REPLICA_ADD with `replaces`, ended by the REMOVE of the
+ * replaced member, which puts the learner into its slot), REPLICA_RESET, a planned grant's target, R4's settings and
+ * the snapshot version 5. Each step's state is also judged by meta_check_step. */
+static void test_replica_set(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[16];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 7);
+    uint32_t n0[3] = {2, 4, 1}, n1[3] = {1, 2, 3}, n2[3] = {1, 2, 3};
+    vol_add(&e, META_VOL_REPLICATED, 0, "v0", 1, n0, 3);
+    vol_add(&e, META_VOL_REPLICATED, 1, "v1", 1, n1, 3);
+    vol_add(&e, META_VOL_REPLICATED, 2, "v2", 1, n2, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK);
+    CHECK(meta_volume(&m, 0)->set_version == 1 && meta_volume(&m, 2)->set_version == 1);
+
+    /* an ISR change is not a set change (mutant setverraiseisr) */
+    meta_copy(&prev, &m);
+    uint32_t only2[1] = {2};
+    isr_chg(&e, meta_volume(&m, 0), 1, 1, only2, 1, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->set_version == 1);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+
+    /* REPLICA_RESET: refused for a stale epoch, the leader, an ISR member, a non-member, rid 0 and an instance the
+     * volume has (the member's own included); else a learner of the new instance with open generation 0 */
+    meta_op_replica_open(&e, 0, 4, rid_of(0, 1), 3, 77);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_replica(meta_volume(&m, 0), 4)->open_gen == 3);
+    meta_copy(&prev, &m);
+    meta_op_replica_reset(&e, 0, 2, 4, 5000);          /* stale epoch */
+    meta_op_replica_reset(&e, 0, 1, 2, 5000);          /* the leader (mutant resetleader) */
+    meta_op_replica_reset(&e, 1, 1, 2, 5000);          /* an ISR member of v1 (mutant resetinisr) */
+    meta_op_replica_reset(&e, 0, 1, 5, 5000);          /* not a member */
+    meta_op_replica_reset(&e, 0, 1, 4, 0);             /* no instance */
+    meta_op_replica_reset(&e, 0, 1, 4, rid_of(0, 2));  /* another member's instance */
+    meta_op_replica_reset(&e, 0, 1, 4, rid_of(0, 1));  /* its own: not a new one */
+    meta_op_replica_reset(&e, 9, 1, 4, 5000);          /* no such volume */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_NOTFOUND && res[4] == META_ERR_INVALID &&
+          res[5] == META_ERR_INVALID && res[6] == META_ERR_INVALID && res[7] == META_ERR_NOTFOUND);
+    CHECK(meta_hash(&prev) == meta_hash(&m));
+    meta_op_replica_reset(&e, 0, 1, 4, 5000);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    const struct meta_volume *v = meta_volume(&m, 0);
+    const struct meta_replica *r4 = meta_replica(v, 4);
+    CHECK(v->set_version == 2 && v->rep[1].node == 4 && r4->rid == 5000 && r4->learner && !r4->open_gen &&
+          !r4->open_nonce && !r4->unanswered && meta_volume(&m, 1)->set_version == 1);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    {
+        /* the checker: a reset member that is no learner, or keeps an open generation */
+        struct meta_state bent;
+        meta_copy(&bent, &m);
+        bent.volumes[0].rep[1].learner = 0;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m);
+        bent.volumes[0].rep[1].open_gen = 3;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+    }
+    meta_free(&prev);
+
+    /* a move of rep[1] (node 4 of v0): one per volume; the REMOVE of the replaced member ends it, the learner in its
+     * slot; a second move while one is pending is EXISTS, an unknown member NOTFOUND */
+    meta_copy(&prev, &m);
+    meta_op_replica_add(&e, 0, 1, 5, 6000, 4);
+    meta_op_replica_add(&e, 1, 1, 6, 6002, 7); /* node 7 is no replica of v1 */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_ERR_NOTFOUND);
+    meta_op_replica_add(&e, 0, 1, 6, 6001, 1); /* a second move (an entry changes a volume once: an entry of its own) */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_EXISTS);
+    v = meta_volume(&m, 0);
+    CHECK(v->set_version == 3 && v->nrep == 4 && v->rep[3].node == 5 && v->rep[3].replaces == 4 && v->rep[3].learner);
+    CHECK(meta_volume(&m, 1)->set_version == 1);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_copy(&prev, &m);
+    meta_op_replica_remove(&e, 0, 1, 4);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    CHECK(v->set_version == 4 && v->nrep == 3 && v->rep[0].node == 2 && v->rep[1].node == 5 && v->rep[2].node == 1 &&
+          !v->rep[1].replaces && v->rep[1].rid == 6000); /* mutants moveslotlast, replacesstays */
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    {
+        /* the checker: B left at its own slot, or still naming the member it replaced */
+        struct meta_state bent;
+        meta_copy(&bent, &m);
+        struct meta_volume *bv = &bent.volumes[0];
+        struct meta_replica t = bv->rep[1];
+        bv->rep[1] = bv->rep[2];
+        bv->rep[2] = t;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m);
+        bent.volumes[0].rep[1].replaces = 4;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m); /* the set changed without its version */
+        bent.volumes[0].set_version = prev.volumes[0].set_version;
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+    }
+    meta_free(&prev);
+
+    /* a move of the last member (node 1 of v0), and its cancel first: the REMOVE of the learner drops the move */
+    meta_op_replica_add(&e, 0, 1, 6, 6003, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_remove(&e, 0, 1, 6);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    CHECK(v->set_version == 6 && v->nrep == 3 && v->rep[2].node == 1);
+    meta_op_replica_add(&e, 0, 1, 6, 6004, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_add(&e, 0, 1, 7, 6005, 0); /* a plain add beside a move: not a second move */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    {
+        /* the checker: two moves at once, or a move of a member that is gone */
+        struct meta_state bent;
+        meta_copy(&bent, &m);
+        bent.volumes[0].rep[4].replaces = 2;
+        CHECK(meta_check_step(&m, &bent, why, sizeof why) != 0);
+        bent.volumes[0].rep[4].replaces = 3;
+        CHECK(meta_check_step(&m, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+    }
+    meta_copy(&prev, &m);
+    meta_op_replica_remove(&e, 0, 1, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v = meta_volume(&m, 0);
+    CHECK(v->set_version == 9 && v->nrep == 4 && v->rep[0].node == 2 && v->rep[1].node == 5 && v->rep[2].node == 6 &&
+          v->rep[3].node == 7 && !v->rep[2].replaces);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+
+    /* a move of rep[0], the preferred leader (node 1 of v2): its leadership goes first (a promotion to 3, then an ISR
+     * without 1); the learner B ends in slot 0 (D10) */
+    meta_op_replica_add(&e, 2, 1, 4, 7000, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_replica_remove(&e, 2, 1, 1); /* still the leader: refused */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+    uint32_t f123[3] = {1, 2, 3}, a3[1] = {3}, i34[2] = {3, 4};
+    promo(&e, meta_volume(&m, 2), 1, 3, f123, 3, a3, 1, 100);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 2)->leader == 3);
+    v = meta_volume(&m, 2);
+    isr_chg(&e, v, 2, v->isr_version, i34, 2, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && !meta_replica(meta_volume(&m, 2), 4)->learner);
+    meta_copy(&prev, &m);
+    meta_op_replica_remove(&e, 2, 2, 4); /* B is in the ISR now: never removed while in it */
+    meta_op_replica_remove(&e, 2, 2, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_OK);
+    v = meta_volume(&m, 2);
+    CHECK(v->nrep == 3 && v->rep[0].node == 4 && v->rep[0].rid == 7000 && !v->rep[0].replaces && v->rep[1].node == 2 &&
+          v->rep[2].node == 3 && v->set_version == 3);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+
+    /* a planned grant's target (D14): PLANNED only, an ISR member, its end only with it; stored with the epoch */
+    {
+        v = meta_volume(&m, 2); /* epoch 2, leader 3, ISR {3, 4} */
+        uint32_t f34[2] = {3, 4}, a34[2] = {3, 4};
+        struct meta_grant g = promo_grant(v, 2, 4, f34, 2, a34, 2, 200, 0);
+        g.reason = META_GR_PLANNED;
+        g.target = 2; /* not in the ISR (mutant targetnotisr) */
+        g.min_end = 14;
+        meta_op_volume_leader(&e, &g);
+        g.target = 4;
+        g.reason = META_GR_UNHEARD; /* a target only for a planned transfer */
+        meta_op_volume_leader(&e, &g);
+        g.target = 0; /* an end without a target */
+        g.reason = META_GR_PLANNED;
+        meta_op_volume_leader(&e, &g);
+        g.target = 3; /* the leader it moves away from (mutant targetleader) */
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+              res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && meta_volume(&m, 2)->epoch == 2);
+        meta_copy(&prev, &m);
+        g.target = 4;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        v = meta_volume(&m, 2);
+        CHECK(v->epoch == 3 && v->leader == 4 && v->grant_target == 4 && v->grant_min_end == 14 && v->set_version == 3);
+        CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+        struct meta_state bent;
+        meta_copy(&bent, &m);
+        bent.volumes[2].grant_target = 2; /* the checker: a target that was not in the ISR */
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m);
+        bent.volumes[2].grant_target = 3; /* in the ISR, but the leader of epoch 2 */
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m); /* the target or its end changed within an epoch */
+        bent.volumes[2].grant_target = 3;
+        CHECK(meta_check_step(&m, &bent, why, sizeof why) != 0);
+        bent.volumes[2].grant_target = 4;
+        bent.volumes[2].grant_min_end = 15;
+        CHECK(meta_check_step(&m, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_free(&prev);
+    }
+
+    /* settings (D16): defaults and bounds */
+    {
+        struct meta_settings st;
+        meta_settings_default(&st);
+        CHECK(st.rebuild_mb_s == 200 && st.rebuild_max == 2 && st.transfer_wait_ms == 2000 && st.leader_balance_s == 0);
+        CHECK(m.set.rebuild_mb_s == 200 && m.set.leader_balance_s == 0);
+        struct { int field; uint32_t val; int ok; } b[] = {
+            {0, 0, 0}, {0, 1, 1}, {1, 0, 0}, {1, 1, 1}, {1, 16, 1}, {1, 17, 0}, {2, 99, 0}, {2, 100, 1},
+            {2, 60000, 1}, {2, 60001, 0}, {3, 0, 1}, {3, 1, 1}, {3, 86400, 1}, {3, 86401, 0},
+        };
+        for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
+            meta_settings_default(&st);
+            uint32_t *f[4] = {&st.rebuild_mb_s, &st.rebuild_max, &st.transfer_wait_ms, &st.leader_balance_s};
+            *f[b[i].field] = b[i].val;
+            meta_op_settings(&e, &st);
+            CHECK(apply1(&m, &e, res, 8) == META_OK && (res[0] == META_OK) == b[i].ok);
+            const uint32_t *got[4] = {&m.set.rebuild_mb_s, &m.set.rebuild_max, &m.set.transfer_wait_ms,
+                                      &m.set.leader_balance_s};
+            CHECK(!b[i].ok || *got[b[i].field] == b[i].val);
+        }
+        meta_settings_default(&st);
+        st.leader_balance_s = 30;
+        st.rebuild_max = 5;
+        meta_op_settings(&e, &st);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && m.set.leader_balance_s == 30 &&
+              m.set.rebuild_max == 5);
+    }
+
+    /* the snapshot, version 5: every new field back; an image of version 4 is refused, and its version is named */
+    {
+        meta_op_replica_add(&e, 2, 3, 1, 7100, 2); /* a pending move in the image */
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        uint8_t *img;
+        size_t len;
+        meta_snapshot_encode(&m, &img, &len);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 5);
+        struct meta_state back;
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
+        const struct meta_volume *bv = meta_volume(&back, 2);
+        CHECK(bv && bv->set_version == 4 && bv->rep[3].replaces == 2 && bv->grant_target == 4 &&
+              bv->grant_min_end == 14 && back.set.leader_balance_s == 30 && back.set.rebuild_max == 5 &&
+              back.set.transfer_wait_ms == 2000 && back.set.rebuild_mb_s == 200);
+        uint32_t four = 4, crc;
+        memcpy(img + 4, &four, 4);
+        crc = iso_crc32c(0, img, len - 4);
+        memcpy(img + len - 4, &crc, 4);
+        uint64_t h = meta_hash(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_ERR_FORMAT && meta_hash(&back) == h);
+        CHECK(meta_snapshot_version(img, len) == 4);
+        img[10] ^= 1; /* damage: no version at all */
+        CHECK(meta_snapshot_version(img, len) == 0);
+        meta_free(&back);
+        free(img);
+    }
+
+    /* an entry of a build of version 4 or older (magic "TME1": INIT, REPLICA_ADD and VOLUME_LEADER bodies grew) is
+     * refused, and named as older, so that a log read before any image still names both versions */
+    {
+        meta_op_replica_reset(&e, 2, 3, 3, 7200);
+        meta_entry_finish(&e);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME2", 4) == 0);
+        uint64_t h = meta_hash(&m);
+        memcpy(e.buf, "TME1", 4);
+        CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
+        CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
+        meta_entry_free(&e);
+        meta_entry_init(&e);
+    }
+
+    /* a shared volume has no moves and no resets */
+    {
+        struct meta_state sm;
+        init_cluster(&sm, &e, META_MODE_SHARED, 4);
+        uint32_t ns[3] = {1, 2, 3};
+        vol_add(&e, META_VOL_SHARED, 0, "s0", 1, ns, 3);
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_replica_add(&e, 0, 1, 4, 0, 2);
+        meta_op_replica_reset(&e, 0, 1, 2, 5000);
+        meta_op_replica_add(&e, 0, 1, 4, 0, 0); /* a plain candidate: the set's version moves */
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+              res[2] == META_OK && meta_volume(&sm, 0)->set_version == 2);
+        /* nor a planned grant's target: the same grant is refused with one and taken without */
+        const struct meta_volume *sv = meta_volume(&sm, 0);
+        uint32_t to = sv->leader == 3 ? 2 : 3;
+        struct meta_grant g = sgrant(sv, to, sv->epoch + 2, META_GR_PLANNED);
+        g.target = to;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID);
+        g.target = 0;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&sm, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&sm, 0)->leader == to &&
+              !meta_volume(&sm, 0)->grant_target);
+        meta_free(&sm);
+    }
+    meta_entry_free(&e);
+    meta_free(&m);
+}
+
 static void test_shared(void)
 {
     struct meta_state m, prev;
@@ -763,7 +1072,7 @@ static void test_shared(void)
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK &&
           !strcmp(meta_volume(&m, 0)->st.export, "nfs9:/pool/s0") && !strcmp(meta_volume(&m, 0)->st.path, "/mnt/s0"));
     v = meta_volume(&m, 0);
-    meta_op_replica_add(&e, 0, v->epoch, 4, 0);
+    meta_op_replica_add(&e, 0, v->epoch, 4, 0, 0);
     CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
     v = meta_volume(&m, 0);
     CHECK(v->nrep == 4 && v->nisr == 4 && !v->rep[3].learner);
@@ -1696,6 +2005,7 @@ struct msim {
     char fail[1024];
     uint64_t applied_max, proposals, ops_ok, leader_changes, crashes, partitions, installs, cut_installs, reseeds;
     uint64_t changes; /* membership changes the leaders started */
+    uint64_t resets;  /* REPLICA_RESET instances drawn */
     uint64_t adopts;  /* installs cut short and finished from the kept image */
     uint64_t partial_resets;
     uint64_t rebases; /* logs started again on the snapshot at a boot (a reset cut short left them below it) */
@@ -1833,6 +2143,42 @@ static void record(struct msim *s, struct snode *nd, const struct meta_state *be
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
+/* One applied op, from the state it met (pre) to the one it left (at): the replica set's version rises by one with
+ * each REPLICA_ADD, REPLICA_REMOVE and REPLICA_RESET of its volume and with nothing else; a RESET leaves exactly
+ * what it names (a learner of the new instance, open generation 0, in its slot); and the checker holds for the op on
+ * its own. An entry changes a volume once (vol_get), so this repeats per op what the checker sees per entry: it
+ * stays right should that rule ever go, and names the op that broke a rule. */
+static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint32_t k, uint8_t kind, const uint8_t *b,
+                         uint32_t n, const struct meta_state *pre, const struct meta_state *at)
+{
+    int setop = kind == META_OP_REPLICA_ADD || kind == META_OP_REPLICA_REMOVE || kind == META_OP_REPLICA_RESET;
+    uint32_t number = n >= 4 ? rd32(b) : UINT32_MAX;
+    for (uint32_t i = 0; i < pre->nvolumes; i++) {
+        const struct meta_volume *a = &pre->volumes[i], *v = meta_volume(at, a->number);
+        uint64_t want = a->set_version + (setop && a->number == number);
+        if (v && v->set_version != want)
+            sim_fail(s, "node %u, index %" PRIu64 ": op %u (kind %u) left volume %u's set version at %" PRIu64
+                     ", not %" PRIu64, nd->id, index, k, kind, a->number, v->set_version, want);
+    }
+    if (kind == META_OP_REPLICA_RESET && n >= 24) {
+        const struct meta_volume *a = meta_volume(pre, number), *v = meta_volume(at, number);
+        uint32_t node = rd32(b + 12);
+        int ia = -1, iv = -1;
+        for (uint32_t i = 0; a && i < a->nrep; i++)
+            ia = a->rep[i].node == node ? (int)i : ia;
+        for (uint32_t i = 0; v && i < v->nrep; i++)
+            iv = v->rep[i].node == node ? (int)i : iv;
+        if (ia < 0 || ia != iv || v->rep[iv].rid != rd64(b + 16) || !v->rep[iv].learner || v->rep[iv].open_gen ||
+            v->rep[iv].open_nonce || v->rep[iv].unanswered || meta_volume_in_isr(a, node) || node == a->leader)
+            sim_fail(s, "node %u, index %" PRIu64 ": REPLICA_RESET of node %u on volume %u was applied wrongly", nd->id,
+                     index, node, number);
+    }
+    char why[256];
+    if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE) &&
+        meta_check_step(pre, at, why, sizeof why))
+        sim_fail(s, "node %u, index %" PRIu64 ", op %u (kind %u) on its own: %s", nd->id, index, k, kind, why);
+}
+
 /* The conditions each operation names, against the state it met: an applied VOLUME_LEADER named the volume's epoch,
  * an applied ISR_CHANGE its epoch and ISR version, an applied MEMBER_STATE an incarnation no older than the member's
  * (of a member not out). The state each op met is rebuilt by applying, one op at a time on a copy of the state before
@@ -1915,7 +2261,11 @@ static void check_named(struct msim *s, struct snode *nd, const struct meta_stat
                 memcpy(one + 4, &n1, 4);
                 memcpy(one + 8, d + off, 5 + (size_t)n);
                 int r1 = META_ERR_INVALID;
+                struct meta_state pre;
+                meta_copy(&pre, &at);
                 meta_apply(&at, e->index, e->term, one, 13 + (size_t)n, &r1, 1);
+                check_one_op(s, nd, e->index, k, kind, b, n, &pre, &at);
+                meta_free(&pre);
             }
         }
         off += 5 + (size_t)n;
@@ -2273,8 +2623,14 @@ static void propose(struct msim *s, struct snode *nd)
                 if (rnd(s, 0, 9) == 0 && tmp.nrep)
                     tmp.rep[0].rid ^= 0x55; /* a reply of another instance */
                 tmp.isr_version = v->isr_version - (rnd(s, 0, 11) == 0);
-                promo_skip(&e, &tmp, epoch, leader, fenced, nf, ans, na, v->hist[v->nhist - 1].start + rnd(s, 0, 20),
-                           rnd(s, 0, 15) == 0);
+                struct meta_grant g = promo_grant(&tmp, epoch, leader, fenced, nf, ans, na,
+                                                  v->hist[v->nhist - 1].start + rnd(s, 0, 20), rnd(s, 0, 15) == 0);
+                if (rnd(s, 0, 3) == 0) { /* a planned transfer: its target the pick, or any replica; its end */
+                    g.reason = rnd(s, 0, 9) ? META_GR_PLANNED : META_GR_UNHEARD;
+                    g.target = rnd(s, 0, 2) ? leader : v->rep[rnd(s, 0, v->nrep - 1)].node;
+                    g.min_end = rnd(s, 0, 50);
+                }
+                meta_op_volume_leader(&e, &g);
             } else {
                 uint32_t to = rnd(s, 0, 3) ? v->rep[rnd(s, 0, v->nrep - 1)].node : v->leader;
                 uint64_t ne = v->epoch + (to == v->leader ? 1 : 2) + rnd(s, 0, 3) - (rnd(s, 0, 9) == 0);
@@ -2306,10 +2662,29 @@ static void propose(struct msim *s, struct snode *nd)
         } else if (what == 4 && v) {
             uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
             uint64_t epoch = v->epoch - (stale && v->epoch > 1);
-            if (rnd(s, 0, 1))
-                meta_op_replica_add(&e, v->number, epoch, node, shared ? (rnd(s, 0, 15) == 0) : 7000 + rnd(s, 0, 4000));
-            else
+            unsigned how = (unsigned)rnd(s, 0, 7);
+            int mover = -1; /* a pending move's learner */
+            for (uint32_t i = 0; i < v->nrep; i++)
+                if (v->rep[i].replaces)
+                    mover = (int)i;
+            if (how <= 2) { /* an add; sometimes a move (R4 D10), of a replica or of any member */
+                uint32_t replaces = 0;
+                if (rnd(s, 0, 1))
+                    replaces = rnd(s, 0, 5) ? v->rep[rnd(s, 0, v->nrep - 1)].node : node;
+                meta_op_replica_add(&e, v->number, epoch, node,
+                                    shared ? (rnd(s, 0, 15) == 0) : 7000 + rnd(s, 0, 4000), replaces);
+            } else if (how <= 5) { /* a remove; with a move pending often its end (the replaced) or its cancel */
+                if (mover >= 0 && rnd(s, 0, 1))
+                    node = rnd(s, 0, 2) ? v->rep[mover].replaces : v->rep[mover].node;
                 meta_op_replica_remove(&e, v->number, epoch, node);
+            } else { /* a reset (D13): of a replica, sometimes of any member or to an instance the volume has */
+                if (rnd(s, 0, 4))
+                    node = v->rep[rnd(s, 0, v->nrep - 1)].node;
+                /* fresh instances are even numbers above 2^40: never one a REPLICA_OPEN of this entry names (it names
+                 * the view's instance, or that one with its low bit flipped) */
+                uint64_t rid = rnd(s, 0, 9) ? (1ull << 40) + 2 * ++s->resets : v->rep[rnd(s, 0, v->nrep - 1)].rid;
+                meta_op_replica_reset(&e, v->number, epoch, node, rid);
+            }
         } else if (what == 5 && v && !shared) {
             const struct meta_replica *r = &v->rep[rnd(s, 0, v->nrep - 1)];
             meta_op_replica_open(&e, v->number, r->node, r->rid ^ (rnd(s, 0, 11) == 0), r->open_gen + rnd(s, 0, 2),
@@ -2658,7 +3033,6 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
 
 int main(int argc, char **argv)
 {
-    th_watchdog("test_meta", 1200);
     const char *dir = argc > 1 && argv[1][0] != '-' ? argv[1] : "/tmp";
     unsigned seeds = 40;
     uint64_t first = 1;
@@ -2671,6 +3045,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = strtod(argv[++i], NULL);
     }
+    /* The deadline covers the whole run, so it grows with the seeds: a seed of 30 virtual seconds takes about 3.4 s
+     * (0.11 s per virtual second, 2026-11-23, i5-13400), and make meta-soak's 5000 seeds about 4.7 hours. One real
+     * second per virtual second, never under 1200 s; a fixed 1200 s failed every soak above about 350 seeds. */
+    double budget = (double)seeds * (seconds > 0 ? seconds : 0);
+    th_watchdog("test_meta", budget > 1e7 ? 10000000L : budget > 1200 ? (long)budget : 1200);
     iso_log_quiet = true;
     int mutant = 0, sim_only = 0;
     for (int i = 1; i < argc; i++) {
@@ -2694,6 +3073,7 @@ int main(int argc, char **argv)
 #endif
     if (!sim_only) {
         test_state_machine();
+        test_replica_set();
         test_shared();
         test_users();
         test_users_limits();

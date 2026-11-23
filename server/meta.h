@@ -28,6 +28,11 @@
  *     leader, never holds a server that is not one of the volume's replicas, and names each member's replica
  *     instance (rid), which must be the one the record holds; a shared volume's ISR is not changed by ISR_CHANGE;
  *   - a learner becomes a full replica only by joining the ISR; an ISR member added had been a replica;
+ *   - the replica set (rep[]: nodes, instances, order) changes only by REPLICA_ADD, REPLICA_REMOVE and REPLICA_RESET,
+ *     each of which raises set_version by one; rids are unique in a volume; a replicated volume has at most one move
+ *     (a learner whose `replaces` names a current member); the REMOVE that ends a move puts the learner into the
+ *     removed member's slot and keeps the order of the rest (so moving rep[0] keeps the preferred leader's slot); a
+ *     RESET member is a learner of a new instance with open generation 0; a grant's target was in the ISR;
  *   - reservations of ids, watermarks, open generations, the restore generation and the highest epoch seen never go
  *     down; reservations and drops name the volume's epoch exactly, so every one of epoch E is committed before any
  *     grant above E (§5.4);
@@ -141,8 +146,14 @@ struct meta_settings {
     uint32_t repl_retain_mb;     /* WAL kept for a lagging replica, MB (4096, §8.2) */
     uint32_t repl_retain_s;      /* and for at most this long (1800) */
     uint32_t idle_seal_ms;       /* an idle leader seals its last segment after this (1000, item 13) */
+    /* Replica set changes (R4; ../design-cluster-data.md §6, the plan's D14-D16): read only by the cluster layer */
+    uint32_t rebuild_mb_s;       /* a snapshot's send rate per link, MB/s (200, >= 1) */
+    uint32_t rebuild_max;        /* snapshots sent and received per server at once (2, 1..16) */
+    uint32_t transfer_wait_ms;   /* a planned transfer's drain before READY (2000, 100..60000) */
+    uint32_t leader_balance_s;   /* leadership goes back to rep[0] once it is up and in sync this long (0: off, the
+                                  * default until the owner decides, D15; else 1..86400) */
 };
-#define META_SETTINGS_WORDS 19 /* the words of the INIT body before the mode (cluster_settings_encode) */
+#define META_SETTINGS_WORDS 23 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 struct meta_member {
@@ -167,6 +178,8 @@ struct meta_replica {
     uint64_t open_gen;     /* the last REPLICA_OPEN generation */
     uint64_t open_nonce;   /* that open's draw: two opens of copies of one directory can save the same generation,
                             * and the replica serves only under a record of its own open (gen and nonce, §8.5) */
+    uint32_t replaces;     /* replicated: the member this one is moving in for (REPLICA_ADD's `replaces`; 0: none).
+                            * The REMOVE of that member ends the move and puts this replica into its slot (D10) */
 };
 
 struct meta_epoch {
@@ -196,6 +209,9 @@ struct meta_volume {
     uint32_t min_isr;
     uint32_t nrep;
     struct meta_replica rep[META_REPLICAS_MAX]; /* rep[0] is the preferred leader; the candidates of a shared volume */
+    uint64_t set_version; /* the replica set's version: 1 at VOLUME_ADD, + 1 by every applied REPLICA_ADD,
+                           * REPLICA_REMOVE and REPLICA_RESET and by nothing else (a node's index in rep[] means
+                           * something only together with it, D8) */
     uint32_t leader; /* shared: the owner; epoch + 1 is reserved for it */
     uint64_t epoch;
     uint32_t nisr;
@@ -209,6 +225,8 @@ struct meta_volume {
     struct meta_positions pos;
     uint32_t nhist; /* replicated volumes only: a shared volume's `start` means nothing and is not kept */
     struct meta_epoch *hist;
+    uint32_t grant_target;  /* replicated: the target of the grant that made `epoch` (a planned transfer's; 0: none) */
+    uint64_t grant_min_end; /* and the end the target had to hold (the old leader's READY end) */
 };
 
 struct meta_slot_move {
@@ -328,7 +346,9 @@ enum meta_op_kind {
     META_OP_REPLICA_OPEN,     /* replicated: replica (node, rid) opened generation gen, above the recorded one */
     META_OP_RESTORE,          /* the restore generation (`tsdb cluster restore`), above the recorded one */
     META_OP_NAME_GROUP,       /* reserved for S4's prefix groups (design-ha-modes.md M23): refused until built */
-    META_OP_LAST = META_OP_NAME_GROUP,
+    META_OP_REPLICA_RESET,    /* replicated: if epoch == e: member N, neither the leader nor in the ISR, gets a new
+                               * instance rid (a learner, open generation 0): its lost directory is made again (D13) */
+    META_OP_LAST = META_OP_REPLICA_RESET,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -377,6 +397,10 @@ struct meta_grant {
     uint64_t start;
     struct meta_positions pos;
     struct meta_attest att;
+    /* a planned transfer (replicated, reason PLANNED only; D14): the ISR member it goes to (0: none) and the durable
+     * end that member must hold (the old leader's READY end) */
+    uint32_t target;
+    uint64_t min_end;
     uint32_t nfenced;
     uint32_t fenced[META_REPLICAS_MAX];
     uint32_t nreplies;
@@ -426,8 +450,13 @@ int meta_promote_pick(const struct meta_volume *v, const struct meta_grant *g, u
 /* `rid` parallel to `isr`; `commit` the leader's commit point (0: none; kept when given). */
 void meta_op_isr_change(struct meta_entry *e, uint32_t number, uint64_t epoch, uint64_t isr_version,
                         const uint32_t *isr, const uint64_t *rid, uint32_t nisr, uint64_t commit);
-void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid);
+/* `replaces` (replicated; 0: none): the member the new learner moves in for. One move per volume (a second while one
+ * is pending: META_ERR_EXISTS); the replaced member must be a member and not itself moving in for another. A REMOVE
+ * of the learner cancels the move; the REMOVE of the replaced member ends it, the learner taking its slot in rep[]. */
+void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid,
+                         uint32_t replaces);
 void meta_op_replica_remove(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node);
+void meta_op_replica_reset(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid);
 void meta_op_slot_home(struct meta_entry *e, uint32_t first, uint32_t count, uint32_t volume);
 /* USER_PUT, conditional on `version`: 0 makes the user (EXISTS when the name is taken; the uid is max_uid + 1,
  * RANGE once uids are used up, or when the users would take more than META_USERS_BYTES_MAX), anything else must be the user's version (NOTFOUND when it does not exist, STALE when
@@ -473,9 +502,18 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 /* The whole state as bytes (checksummed): what a snapshot file, a Raft SNAPSHOT, a member's persisted copy in
  * --state-dir and the watch stream carry (one format). The caller frees *out. */
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
-/* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not version 2, or has
- * a level above META_LEVEL. */
+/* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
+ * another version is refused (a preview cluster is initialised again, never upgraded). */
+#define META_SNAP_VERSION 5
+/* 1 when the entry is one of a build of metadata snapshot version 4 or older (its magic): meta_apply says
+ * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
+int meta_entry_older(const void *data, size_t len);
+/* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,
+ * or has a level above META_LEVEL. */
 int meta_snapshot_decode(struct meta_state *m, const void *buf, size_t len);
+/* The version an image says it is (its checksum verified), 0 when it is no image: a caller that met META_ERR_FORMAT
+ * names it beside META_SNAP_VERSION (an image of another version is never read: the cluster is initialised again). */
+uint32_t meta_snapshot_version(const void *buf, size_t len);
 /* A 64-bit hash of everything the state holds but the applied index and term: equal states, equal hashes. */
 uint64_t meta_hash(const struct meta_state *m);
 

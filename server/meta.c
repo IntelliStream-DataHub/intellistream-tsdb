@@ -3,8 +3,10 @@
  * The cluster's metadata state machine; see meta.h for what it holds and the rules it keeps.
  *
  * Bytes, all little-endian:
- *   entry     u32 magic "TME1", u32 nops, then nops times { u8 kind, u32 len, body[len] }
- *   snapshot  u32 magic "TMS1", u32 version 2, u64 applied, u64 applied_term, the body below, u32 crc32c of all before
+ *   entry     u32 magic "TME2" ("TME1" up to snapshot version 4: R4 grew the bodies of INIT, REPLICA_ADD and
+ *             VOLUME_LEADER), u32 nops, then nops times { u8 kind, u32 len, body[len] }
+ *   snapshot  u32 magic "TMS1", u32 version (SNAP_VERSION), u64 applied, u64 applied_term, the body below, u32 crc32c
+ *             of all before
  * (version 2: shared volumes, replica instances, domains, slot moves in flight; version 1 is refused: no cluster
  * ran on it, and a cluster built before is re-initialised.) The snapshot is also the persisted copy a member keeps in
  * its --state-dir: one format. Strings are u16 length + bytes (no terminator), bounded by their field. A body is read by a reader that fails on
@@ -21,8 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SNAP_VERSION 4 /* 3: the replicated volumes' settings (R3); 4: users with uid and version, max_uid (S2-1); a
-                        * preview cluster is initialised again */
+/* 3: the replicated volumes' settings (R3); 4: users with uid and version, max_uid (S2-1); 5: replica set changes
+ * (R4: set_version, a replica's `replaces`, the last grant's target and end, rebuild_mb_s, rebuild_max,
+ * transfer_wait_ms, leader_balance_s). A preview cluster is initialised again, not upgraded (the plan's D9): an image
+ * of another version is refused, and its reader names both (meta_snapshot_version). */
+#define SNAP_VERSION META_SNAP_VERSION
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
  * must catch every one (a checker that catches nothing proves nothing). Without the define, MUT is 0. */
@@ -33,7 +38,8 @@ uint64_t meta_mutants;
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x31454d54u /* "TME1" */
+#define ENTRY_MAGIC 0x32454d54u    /* "TME2": entries of snapshot version 5 */
+#define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define SNAP_MAGIC 0x31534d54u  /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -82,6 +88,10 @@ void meta_settings_default(struct meta_settings *s)
     s->repl_retain_mb = 4096;
     s->repl_retain_s = 1800;
     s->idle_seal_ms = 1000;
+    s->rebuild_mb_s = 200;
+    s->rebuild_max = 2;
+    s->transfer_wait_ms = 2000;
+    s->leader_balance_s = 0; /* off until the owner decides from r4-transfer's measured write pause (D15) */
 }
 
 uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers)
@@ -557,6 +567,10 @@ static void put_settings(struct wr *w, const struct meta_settings *s)
     put32(w, s->repl_retain_mb);
     put32(w, s->repl_retain_s);
     put32(w, s->idle_seal_ms);
+    put32(w, s->rebuild_mb_s);
+    put32(w, s->rebuild_max);
+    put32(w, s->transfer_wait_ms);
+    put32(w, s->leader_balance_s);
 }
 
 static void get_settings(struct rd *r, struct meta_settings *s)
@@ -586,6 +600,10 @@ static void get_settings(struct rd *r, struct meta_settings *s)
     s->repl_retain_mb = get32(r);
     s->repl_retain_s = get32(r);
     s->idle_seal_ms = get32(r);
+    s->rebuild_mb_s = get32(r);
+    s->rebuild_max = get32(r);
+    s->transfer_wait_ms = get32(r);
+    s->leader_balance_s = get32(r);
 }
 
 static int settings_valid(const struct meta_settings *s)
@@ -593,7 +611,9 @@ static int settings_valid(const struct meta_settings *s)
     return s->replication >= 1 && s->replication <= META_REPLICAS_MAX && s->min_isr >= 1 &&
            s->min_isr <= s->replication && s->failover <= META_FAILOVER_BMC && s->read_barrier <= 1 &&
            s->lease_s >= 1 && s->lease_ms >= 1 && s->drift_ppm < 1000000 && s->commit_interval_ms >= 1 &&
-           s->isr_lag_ms >= META_ISR_LAG_MIN_MS && s->idle_seal_ms >= META_IDLE_SEAL_MIN_MS;
+           s->isr_lag_ms >= META_ISR_LAG_MIN_MS && s->idle_seal_ms >= META_IDLE_SEAL_MIN_MS &&
+           s->rebuild_mb_s >= 1 && s->rebuild_max >= 1 && s->rebuild_max <= 16 && s->transfer_wait_ms >= 100 &&
+           s->transfer_wait_ms <= 60000 && s->leader_balance_s <= 86400;
 }
 
 static void put_member(struct wr *w, const struct meta_member *mb)
@@ -794,6 +814,8 @@ void meta_op_volume_leader(struct meta_entry *e, const struct meta_grant *g)
     putstr(&w, g->att.who, META_NAME_MAX);
     put64(&w, g->att.ms);
     put64(&w, g->att.incarnation);
+    put32(&w, g->target);
+    put64(&w, g->min_end);
     put_ids(&w, g->fenced, g->nfenced);
     put32(&w, g->nreplies);
     for (uint32_t i = 0; i < g->nreplies; i++) {
@@ -820,7 +842,8 @@ void meta_op_isr_change(struct meta_entry *e, uint32_t number, uint64_t epoch, u
     op_end(e, st);
 }
 
-void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid)
+void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid,
+                         uint32_t replaces)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_REPLICA_ADD);
@@ -828,6 +851,7 @@ void meta_op_replica_add(struct meta_entry *e, uint32_t number, uint64_t epoch, 
     put64(&w, epoch);
     put32(&w, node);
     put64(&w, rid);
+    put32(&w, replaces);
     op_end(e, st);
 }
 
@@ -1022,6 +1046,17 @@ void meta_op_name_group(struct meta_entry *e)
 {
     struct wr w;
     size_t st = op_begin(e, &w, META_OP_NAME_GROUP);
+    op_end(e, st);
+}
+
+void meta_op_replica_reset(struct meta_entry *e, uint32_t number, uint64_t epoch, uint32_t node, uint64_t rid)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_REPLICA_RESET);
+    put32(&w, number);
+    put64(&w, epoch);
+    put32(&w, node);
+    put64(&w, rid);
     op_end(e, st);
 }
 
@@ -1426,6 +1461,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             v->rep[i].node = nodes[i];
             v->rep[i].rid = rid[i];
         }
+        v->set_version = 1;
         v->leader = nodes[0];
         v->epoch = 1;
         isr_set(v, nodes, n);
@@ -1457,6 +1493,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         getstr(r, g.att.who, sizeof g.att.who);
         g.att.ms = get64(r);
         g.att.incarnation = get64(r);
+        g.target = get32(r);
+        g.min_end = get64(r);
         g.nfenced = get_ids(r, g.fenced);
         g.nreplies = get32(r);
         if (g.nreplies > META_REPLICAS_MAX)
@@ -1477,6 +1515,14 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_ERR_STALE;
         if (g.reason < 1 || g.reason > META_GR_LAST)
             return META_ERR_INVALID;
+        /* a planned transfer's target (D14): replicated, PLANNED, an ISR member other than the leader it moves away
+         * from; its end only with it. Which member leads is still promote_rule's (r4-transfer has it pick the target
+         * or nothing) */
+        if (g.target && (v->kind != META_VOL_REPLICATED || g.reason != META_GR_PLANNED ||
+                         (!meta_volume_in_isr(v, g.target) && !MUT(47)) || (g.target == v->leader && !MUT(48))))
+            return META_ERR_INVALID;
+        if (!g.target && g.min_end)
+            return META_ERR_INVALID;
         if (v->kind == META_VOL_REPLICATED) {
             if ((g.new_epoch != v->epoch + 1 && !(MUT(1) && g.new_epoch > v->epoch)) || v->nhist < 1 ||
                 (g.start <= v->hist[v->nhist - 1].start && !MUT(13)))
@@ -1484,8 +1530,11 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             if (g.new_epoch >= META_EPOCH_LIMIT && !MUT(9))
                 return META_ERR_RANGE; /* D10: the engine refuses it (replica_epoch_begin) */
             rc = promote(v, &g);
-            if (rc == META_OK)
+            if (rc == META_OK) {
                 v->pos = g.pos;
+                v->grant_target = g.target;
+                v->grant_min_end = g.min_end;
+            }
         } else {
             rc = grant_shared(m, v, &g);
         }
@@ -1495,10 +1544,11 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
     }
     case META_OP_ISR_CHANGE:
     case META_OP_REPLICA_ADD:
-    case META_OP_REPLICA_REMOVE: {
+    case META_OP_REPLICA_REMOVE:
+    case META_OP_REPLICA_RESET: {
         uint32_t number = get32(r);
         uint64_t epoch = get64(r), isr_version = 0, rid = 0, commit = 0, rids[META_REPLICAS_MAX];
-        uint32_t node = 0, ids[META_REPLICAS_MAX], n = 0;
+        uint32_t node = 0, replaces = 0, ids[META_REPLICAS_MAX], n = 0;
         if (kind == META_OP_ISR_CHANGE) {
             isr_version = get64(r);
             n = get_ids(r, ids);
@@ -1507,8 +1557,10 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             commit = get64(r);
         } else {
             node = get32(r);
-            if (kind == META_OP_REPLICA_ADD)
+            if (kind != META_OP_REPLICA_REMOVE)
                 rid = get64(r);
+            if (kind == META_OP_REPLICA_ADD)
+                replaces = get32(r);
         }
         if (r->bad)
             return META_ERR_FORMAT;
@@ -1529,6 +1581,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                     return META_ERR_INVALID;
             isr_set(v, ids, n);
             v->isr_version++;
+            v->set_version += MUT(41); /* setverraiseisr: the ISR is not the replica set */
             if (commit)
                 v->isr_commit = commit;
             for (uint32_t i = 0; i < v->nrep; i++)
@@ -1546,19 +1599,42 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             for (uint32_t i = 0; i < v->nrep; i++)
                 if (rid && v->rep[i].rid == rid)
                     return META_ERR_INVALID; /* one instance, one replica */
-            v->rep[v->nrep] = (struct meta_replica){.node = node, .learner = shared ? 0 : 1, .rid = rid};
+            if (replaces) { /* a move (D10): one per volume, of a member that is not itself moving in */
+                if (shared)
+                    return META_ERR_INVALID;
+                int a = replica_at(v, replaces);
+                if (a < 0)
+                    return META_ERR_NOTFOUND;
+                for (uint32_t i = 0; i < v->nrep; i++)
+                    if (v->rep[i].replaces && !MUT(44)) /* twomoves */
+                        return META_ERR_EXISTS;
+                if (v->rep[a].replaces) /* implied by the one-move rule above; kept should that rule ever go */
+                    return META_ERR_INVALID;
+            }
+            v->rep[v->nrep] =
+                (struct meta_replica){.node = node, .learner = shared ? 0 : 1, .rid = rid, .replaces = replaces};
             v->nrep++;
             if (shared) { /* a candidate is in the ISR from the start */
                 v->isr[v->nisr++] = node;
                 sort_ids(v->isr, v->nisr);
                 v->isr_version++;
             }
-        } else {
+        } else if (kind == META_OP_REPLICA_REMOVE) {
             int i = replica_at(v, node);
             if (i < 0)
                 return META_ERR_NOTFOUND;
             if ((node == v->leader && !MUT(11)) || (!shared && meta_volume_in_isr(v, node)))
                 return META_ERR_INVALID; /* the ISR shrinks first: a move never lowers the in-sync copies */
+            int b = -1; /* the learner moving in for `node`: this REMOVE ends its move */
+            for (uint32_t j = 0; j < v->nrep; j++)
+                if (v->rep[j].replaces == node)
+                    b = (int)j;
+            if (b >= 0 && !MUT(45)) /* replacesstays */
+                v->rep[b].replaces = 0;
+            if (b >= 0 && !MUT(46)) { /* moveslotlast: the learner would stay at its own slot */
+                v->rep[i] = v->rep[b]; /* B takes A's slot: a move of rep[0] keeps the preferred leader's (D10) */
+                i = b;
+            }
             memmove(&v->rep[i], &v->rep[i + 1], (v->nrep - (uint32_t)i - 1) * sizeof v->rep[0]);
             v->nrep--;
             if (shared) {
@@ -1569,7 +1645,28 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 isr_set(v, keep, k);
                 v->isr_version++;
             }
+        } else { /* REPLICA_RESET (D13): the member's directory is made again, as a new instance rebuilt by snapshot */
+            int i = replica_at(v, node);
+            if (shared)
+                return META_ERR_INVALID;
+            if (i < 0)
+                return META_ERR_NOTFOUND;
+            /* never a copy a promotion may need: neither the leader nor an ISR member (resetleader, resetinisr) */
+            if (node == v->leader ? !MUT(43) : (meta_volume_in_isr(v, node) && !MUT(42)))
+                return META_ERR_INVALID;
+            if (!rid)
+                return META_ERR_INVALID;
+            for (uint32_t j = 0; j < v->nrep; j++)
+                if (v->rep[j].rid == rid)
+                    return META_ERR_INVALID; /* one instance, one replica; and a new one */
+            v->rep[i].rid = rid;
+            v->rep[i].learner = 1;
+            v->rep[i].open_gen = 0;
+            v->rep[i].open_nonce = 0;
+            v->rep[i].unanswered = 0;
         }
+        if (kind != META_OP_ISR_CHANGE)
+            v->set_version += !MUT(40); /* setvernoraise */
         touched[(*ntouched)++] = number;
         return META_OK;
     }
@@ -1938,6 +2035,12 @@ static int entry_valid(const uint8_t *p, size_t len, uint32_t *nops)
     return r.off == len;
 }
 
+int meta_entry_older(const void *data, size_t len)
+{
+    struct rd r = {data, len, 0, 0};
+    return get32(&r) == ENTRY_MAGIC_V1 && !r.bad;
+}
+
 int meta_apply(struct meta_state *m, uint64_t index, uint64_t term, const void *data, size_t len, int *res,
                uint32_t nres)
 {
@@ -2001,7 +2104,9 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
         put64(w, v->rep[j].rid);
         put64(w, v->rep[j].open_gen);
         put64(w, v->rep[j].open_nonce);
+        put32(w, v->rep[j].replaces);
     }
+    put64(w, v->set_version);
     put32(w, v->leader);
     put64(w, v->epoch);
     put_ids(w, v->isr, v->nisr);
@@ -2018,6 +2123,8 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
         put64(w, v->hist[j].epoch);
         put64(w, v->hist[j].start);
     }
+    put32(w, v->grant_target);
+    put64(w, v->grant_min_end);
 }
 
 static void encode_body(struct wr *w, const struct meta_state *m)
@@ -2136,9 +2243,11 @@ static int get_volume(struct rd *r, struct meta_volume *v)
         v->rep[j].rid = get64(r);
         v->rep[j].open_gen = get64(r);
         v->rep[j].open_nonce = get64(r);
+        v->rep[j].replaces = get32(r);
         if (v->rep[j].learner > 1 || v->rep[j].unanswered > 1 || v->rep[j].claim_blocked > 1)
             return -1;
     }
+    v->set_version = get64(r);
     v->leader = get32(r);
     v->epoch = get64(r);
     v->nisr = get_ids(r, v->isr);
@@ -2161,6 +2270,8 @@ static int get_volume(struct rd *r, struct meta_volume *v)
         v->hist[j].epoch = get64(r);
         v->hist[j].start = get64(r);
     }
+    v->grant_target = get32(r);
+    v->grant_min_end = get64(r);
     return 0;
 }
 
@@ -2312,6 +2423,21 @@ int meta_snapshot_decode(struct meta_state *m, const void *buf, size_t len)
     return META_OK;
 }
 
+uint32_t meta_snapshot_version(const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    uint32_t crc, magic, version;
+    if (!p || len < 28)
+        return 0;
+    memcpy(&crc, p + len - 4, 4);
+    if (iso_crc32c(0, p, len - 4) != crc)
+        return 0;
+    struct rd r = {p, len - 4, 0, 0};
+    magic = get32(&r);
+    version = get32(&r);
+    return magic == SNAP_MAGIC ? version : 0;
+}
+
 uint64_t meta_hash(const struct meta_state *m)
 {
     uint8_t *buf = NULL;
@@ -2335,6 +2461,77 @@ uint64_t meta_hash(const struct meta_state *m)
 
 /* memcmp with a null pointer is undefined even for 0 bytes (UBSan) */
 static int same_bytes(const void *a, const void *b, size_t n) { return !n || !memcmp(a, b, n); }
+
+/* rep[] of a and b hold the same nodes with the same instances in the same order */
+static int same_set(const struct meta_volume *a, const struct meta_volume *b)
+{
+    if (a->nrep != b->nrep)
+        return 0;
+    for (uint32_t j = 0; j < a->nrep; j++)
+        if (a->rep[j].node != b->rep[j].node || a->rep[j].rid != b->rep[j].rid)
+            return 0;
+    return 1;
+}
+
+/* b's replica set is a's after exactly one REPLICA_ADD, REPLICA_REMOVE or REPLICA_RESET: an ADD appends; a REMOVE
+ * keeps the order of the rest, and one that ends a move puts the learner into the removed member's slot; a RESET gives
+ * one member a new instance, a learner with open generation 0 (its server opens it in a later entry). 0, or -1 with
+ * a sentence. */
+static int one_set_op(const struct meta_volume *a, const struct meta_volume *b, char *why, size_t n)
+{
+    unsigned va = a->number;
+    if (b->nrep == a->nrep + 1) {
+        for (uint32_t j = 0; j < a->nrep; j++)
+            if (a->rep[j].node != b->rep[j].node || a->rep[j].rid != b->rep[j].rid)
+                FAIL("volume %u: a REPLICA_ADD changed replica %u's slot or instance", va, a->rep[j].node);
+        return 0;
+    }
+    if (b->nrep + 1 == a->nrep) {
+        int gone = -1, mover = -1;
+        for (uint32_t j = 0; j < a->nrep; j++)
+            if (!meta_replica(b, a->rep[j].node))
+                gone = (int)j;
+        if (gone < 0)
+            FAIL("volume %u: one replica fewer, but every node is still there", va);
+        for (uint32_t j = 0; j < a->nrep; j++)
+            if (a->rep[j].replaces == a->rep[gone].node)
+                mover = (int)j;
+        struct meta_replica e[META_REPLICAS_MAX];
+        uint32_t ne = 0;
+        for (uint32_t j = 0; j < a->nrep; j++) {
+            if ((int)j == mover)
+                continue;
+            if ((int)j == gone) {
+                if (mover >= 0)
+                    e[ne++] = a->rep[mover];
+                continue;
+            }
+            e[ne++] = a->rep[j];
+        }
+        for (uint32_t j = 0; j < ne; j++)
+            if (e[j].node != b->rep[j].node || e[j].rid != b->rep[j].rid)
+                FAIL("volume %u: after the REMOVE of %u, slot %u holds %u, not %u%s", va, a->rep[gone].node, j,
+                     b->rep[j].node, e[j].node, mover >= 0 ? " (the learner of its move takes its slot)" : "");
+        return 0;
+    }
+    int changed = -1;
+    for (uint32_t j = 0; j < a->nrep; j++) {
+        if (a->rep[j].node != b->rep[j].node)
+            FAIL("volume %u: the replica set version rose by one, but slot %u went from %u to %u", va, j,
+                 a->rep[j].node, b->rep[j].node);
+        if (a->rep[j].rid != b->rep[j].rid) {
+            if (changed >= 0)
+                FAIL("volume %u: one REPLICA_RESET gave two members new instances", va);
+            changed = (int)j;
+        }
+    }
+    if (changed < 0)
+        FAIL("volume %u: the replica set version rose by one, but the replica set is the same", va);
+    const struct meta_replica *rr = &b->rep[changed];
+    if (!rr->learner || rr->open_gen || rr->open_nonce)
+        FAIL("volume %u: member %u was reset but is not a learner of open generation 0", va, rr->node);
+    return 0;
+}
 
 static int check_volume_step(const struct meta_volume *a, const struct meta_volume *b, char *why, size_t n)
 {
@@ -2375,6 +2572,22 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
             if (!meta_volume_in_isr(a, b->isr[j]))
                 FAIL("volume %u: epoch %llu's ISR holds %u, which epoch %llu's did not", va,
                      (unsigned long long)b->epoch, b->isr[j], (unsigned long long)a->epoch);
+    /* the replica set moves exactly with its version (D8): a node's index in rep[] names it only with the version */
+    if (b->set_version < a->set_version)
+        FAIL("volume %u: the replica set version went back", va);
+    if (b->set_version == a->set_version && !same_set(a, b))
+        FAIL("volume %u: the replica set changed without a new set version", va);
+    if (b->set_version == a->set_version + 1 && one_set_op(a, b, why, n))
+        return -1;
+    /* a planned transfer's target was in the ISR the grant met (D14); it changes only with the epoch */
+    if (b->epoch > a->epoch && b->grant_target && !meta_volume_in_isr(a, b->grant_target))
+        FAIL("volume %u: epoch %llu's grant names target %u, which was not in the ISR of epoch %llu", va,
+             (unsigned long long)b->epoch, b->grant_target, (unsigned long long)a->epoch);
+    if (b->epoch > a->epoch && b->grant_target && b->grant_target == a->leader)
+        FAIL("volume %u: epoch %llu's grant names target %u, the leader of epoch %llu it moves away from", va,
+             (unsigned long long)b->epoch, b->grant_target, (unsigned long long)a->epoch);
+    if (b->epoch == a->epoch && (b->grant_target != a->grant_target || b->grant_min_end != a->grant_min_end))
+        FAIL("volume %u: the grant's target changed within epoch %llu", va, (unsigned long long)a->epoch);
     int isr_same = a->nisr == b->nisr && !memcmp(a->isr, b->isr, a->nisr * sizeof a->isr[0]);
     if (!isr_same && b->isr_version <= a->isr_version)
         FAIL("volume %u: the ISR changed without a new ISR version", va);
@@ -2455,7 +2668,28 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                 FAIL("volume %u: replica %u is marked unanswered but not in the ISR", b->number, b->rep[j].node);
             if (b->rep[j].learner && meta_volume_in_isr(b, b->rep[j].node))
                 FAIL("volume %u: learner %u is in the ISR", b->number, b->rep[j].node);
+            for (uint32_t k = 0; k < j && b->kind == META_VOL_REPLICATED; k++)
+                if (b->rep[k].rid == b->rep[j].rid)
+                    FAIL("volume %u: replicas %u and %u share instance %llu", b->number, b->rep[k].node,
+                         b->rep[j].node, (unsigned long long)b->rep[j].rid);
+            if (b->kind == META_VOL_REPLICATED && !b->rep[j].rid)
+                FAIL("volume %u: replica %u has no instance", b->number, b->rep[j].node);
         }
+        /* at most one move, of a current member that is not itself moving in (D10) */
+        uint32_t moves = 0;
+        for (uint32_t j = 0; j < b->nrep; j++) {
+            uint32_t x = b->rep[j].replaces;
+            if (!x)
+                continue;
+            moves++;
+            const struct meta_replica *ra = meta_replica(b, x);
+            /* ra->replaces is implied by moves > 1 below; kept should the one-move rule ever go */
+            if (b->kind != META_VOL_REPLICATED || !ra || x == b->rep[j].node || ra->replaces)
+                FAIL("volume %u: replica %u moves in for %u, which is not a member it may replace", b->number,
+                     b->rep[j].node, x);
+        }
+        if (moves > 1)
+            FAIL("volume %u: %u moves at once", b->number, moves);
         if (b->kind == META_VOL_SHARED) {
             /* the ISR is every candidate: they all see the same storage */
             if (b->nisr != b->nrep || b->nhist != 0)

@@ -217,7 +217,11 @@ cgroup, so `nice` does not keep your work out of its way.
   path). `src/raft/`: the Raft core copied from intellistream-objects (`UPSTREAM`; `tools/sync-raft.sh` copies it
   again, never edit the copies; `compat.[ch]` is tsdb's shim for what they include). `server/meta.c`: the metadata
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
-  invariants as `meta_check_step`). `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
+  invariants as `meta_check_step`; R4's replica set: `set_version`, raised by exactly REPLICA_ADD, REPLICA_REMOVE and
+  REPLICA_RESET, one move per volume (an ADD with `replaces`; the REMOVE of the replaced member puts the learner into
+  its slot, so rep[0] stays the preferred leader's), a planned grant's `target` and `min_end`; snapshot version 5 and
+  entry magic "TME2": a state directory or log of another version is refused naming both, never upgraded).
+  `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
   add|status`; users: USER_PUT/DEL answered after commit with the members still behind, the uid assigned at apply,
   puts conditional on the user's version, `cluster_users_caught_up`, `tools/cluster-user-cli.c` for `tsdb cluster
