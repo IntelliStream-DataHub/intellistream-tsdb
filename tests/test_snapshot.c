@@ -377,6 +377,10 @@ static bool whole(const char *dir, struct snap_man *m)
                        e->d_name, size, xxh, f->size, f->xxh64);
         if (fd >= 0)
             close(fd);
+        struct stat a, b;
+        if (f->link && (fstatat(dfd, e->d_name, &a, 0) != 0 || fstatat(dfd, m->files[f->link - 1].name, &b, 0) != 0 ||
+                        a.st_ino != b.st_ino))
+            ok = vfail("%s: %s is not a link of %s", dir, e->d_name, m->files[f->link - 1].name);
     }
     if (d)
         closedir(d);
@@ -393,6 +397,64 @@ static int cmp_seq(const void *a, const void *b)
 }
 
 /* The check of the file comment. `si` is what snap_make said. */
+/* What the leader had at the cut (snap_test_cut, called under flush_lock and publish_lock): the verify requires the
+ * snapshot to hold all of it, not only to hold nothing past P */
+static struct {
+    uint64_t p;
+    char (*parts)[96];
+    size_t nparts;
+    uint64_t memseq[64], memlo[64]; /* memtables with rows: their segment and first position */
+    size_t nmem;
+    struct lkfile *lf;
+    size_t nlf;
+    int ncut;
+} CUT;
+
+static void note_cut(eng *db, uint64_t p)
+{
+    free(CUT.parts);
+    free(CUT.lf);
+    int n = CUT.ncut;
+    memset(&CUT, 0, sizeof CUT);
+    CUT.ncut = n + 1, CUT.p = p;
+    pthread_mutex_lock(&db->lock);
+    CUT.parts = malloc((db->nparts ? db->nparts : 1) * sizeof *CUT.parts);
+    for (size_t i = 0; CUT.parts && i < db->nparts; i++)
+        snprintf(CUT.parts[CUT.nparts++], sizeof CUT.parts[0], "%s", db->parts[i]->name);
+    pthread_mutex_lock(&db->buf_lock);
+    for (size_t i = 0; i <= db->nflushing && CUT.nmem < 64; i++) {
+        memtable *mt = i < db->nflushing ? db->flushing[i] : db->active;
+        if (mt && mt->rows)
+            CUT.memseq[CUT.nmem] = mt->wal_seq, CUT.memlo[CUT.nmem++] = mt->fno_lo;
+    }
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    if (leader_links_list(db, p, &CUT.lf, &CUT.nlf) != 0)
+        CUT.lf = NULL, CUT.nlf = 0;
+}
+
+/* The bytes of the distinct inodes in a directory (SNAPMAN left out) */
+static uint64_t distinct_bytes(const char *dir)
+{
+    uint64_t ino[4096], sum = 0;
+    size_t n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        struct stat st;
+        if (e->d_name[0] == '.' || strcmp(e->d_name, SNAP_MAN) == 0 || fstatat(dirfd(d), e->d_name, &st, 0) != 0)
+            continue;
+        bool seen = false;
+        for (size_t i = 0; i < n; i++)
+            seen |= ino[i] == (uint64_t)st.st_ino;
+        if (!seen && n < 4096)
+            ino[n++] = (uint64_t)st.st_ino, sum += (uint64_t)st.st_size;
+    }
+    if (d)
+        closedir(d);
+    return sum;
+}
+
 static bool snap_verify_cut(const struct snap_info *si)
 {
     struct snap_man m = {0};
@@ -517,6 +579,34 @@ static bool snap_verify_cut(const struct snap_info *si)
         ok = vfail("the segments end at %" PRIu64 ", P is %" PRIu64, lastpos, p);
     if (si->nstage + si->nkeep && !ncommit)
         ok = vfail("%zu stage_ and %zu keep_ files, no COMMIT in the segments", si->nstage, si->nkeep);
+    /* complete: everything the leader had at the cut */
+    if (CUT.p != p || !CUT.ncut) {
+        ok = vfail("the cut was not noted (P %" PRIu64 ", noted %" PRIu64 ")", p, CUT.p);
+    } else {
+        for (size_t i = 0; i < CUT.nparts; i++) {
+            const struct snap_file *f = man_find(&m, CUT.parts[i]);
+            if (!f || f->kind != SNAP_PART)
+                ok = vfail("part %s, listed at the cut, is not in the snapshot", CUT.parts[i]);
+        }
+        for (size_t i = 0; i < CUT.nmem; i++) {
+            if (!CUT.memlo[i] || CUT.memlo[i] > p)
+                continue; /* no committed row */
+            char nm[64];
+            wal_name(nm, sizeof nm, CUT.memseq[i]);
+            const struct snap_file *f = man_find(&m, nm);
+            if (!m.s_seq || m.s_seq > CUT.memseq[i] || !f || f->kind != SNAP_SEG)
+                ok = vfail("a memtable of segment %" PRIx64 " held committed rows from %" PRIu64 " at the cut: S is %" PRIx64
+                           ", %s is %sin the snapshot", CUT.memseq[i], CUT.memlo[i], m.s_seq, nm, f ? "" : "not ");
+        }
+        for (size_t i = 0; i < CUT.nlf; i++)
+            if (!CUT.lf[i].keep && CUT.lf[i].fno > m.done && CUT.lf[i].fno <= p &&
+                (!m.s_first || m.s_first > CUT.lf[i].fno))
+                ok = vfail("the COMMIT at %" PRIu64 " (above done %" PRIu64 ") is below S's first position %" PRIu64,
+                           CUT.lf[i].fno, m.done, m.s_first);
+    }
+    if (si->bytes != distinct_bytes(si->path))
+        ok = vfail("the make counts %" PRIu64 " bytes, the directory's distinct files hold %" PRIu64, si->bytes,
+                   distinct_bytes(si->path));
     close(dfd);
     snap_man_free(&m);
     return ok;
@@ -595,6 +685,16 @@ static void case_basic_sweep(void)
     CHECK(make(db, "snap_a", &si, NULL) == 0);
     CHECK(snap_verify_cut(&si));
     CHECK(si.nparts >= 2 && si.nsegs >= 1 && si.nkeep >= 1 && si.nstage == 0 && si.p > 0 && si.s_first > 0);
+    { /* the keep_ file is the published part's inode: listed as its link, its bytes counted once */
+        struct snap_man m;
+        size_t nlinks = 0;
+        if (snap_man_read(si.path, &m) == 0) {
+            for (size_t i = 0; i < m.nfiles; i++)
+                nlinks += m.files[i].kind == SNAP_KEEP && m.files[i].link;
+            snap_man_free(&m);
+        }
+        CHECK(nlinks >= 1 && si.bytes == distinct_bytes(si.path));
+    }
     CHECK(answers(db, NULL) == before);
     struct snap_info s2 = {0};
     CHECK(snap_make(db, "snap_a", &s2) == TSDB_ERR_INVALID); /* it exists */
@@ -707,7 +807,11 @@ static void case_windows(void)
         snprintf(name, sizeof name, "snap_w%d", w);
         int rc;
         pthread_t rl;
-        if (w == 0) { /* held across the whole make: its stage_ files go in */
+        if (w == 0) { /* held across the whole make: its stage_ files go in; a flush meanwhile leaves its marker in an
+                       * older segment than P's and the memtable's, so S goes down to it */
+            CHECK(put(db, 3, T0 + 700000, 1000, 5) == 0);
+            CHECK(eng_flush(db) == 0);
+            CHECK(put(db, 3, T0 + 800000, 1000, 5) == 0);
             rc = make(db, name, &si, NULL);
             hold_release();
         } else if (w < 4) { /* released once the cut is taken: the barrier waits for its record */
@@ -731,18 +835,167 @@ static void case_windows(void)
             snap_release(si.path);
         }
     }
-    /* the large write is published now: its files go in as keep_ */
+    /* the large write is published now: its parts are listed, no stage_ file goes in (its marker is in a segment
+     * below S since the flush above: the keep_ files are the basic case's) */
     struct snap_info si = {0};
     CHECK(make(db, "snap_wk", &si, NULL) == 0);
-    CHECK(snap_verify_cut(&si) && si.nkeep >= 1 && si.nstage == 0);
+    CHECK(snap_verify_cut(&si) && si.nstage == 0);
     snap_release(si.path);
     eng_close(db);
-    printf("  windows: a large write's stage_ files, then keep_; SERIES, STATES, RETENTION, CLASSES records past the "
+    printf("  windows: a large write's stage_ files (its marker in an older segment than P's), then its parts; SERIES, STATES, RETENTION, CLASSES records past the "
            "cut's barrier\n");
 }
 
 /* Right after the cut a flush lists a part and a large write publishes: neither is in the snapshot */
 static eng *HOOK_DB;
+
+/* A flush and the keep bound at the commit point (what the driver does once every member caught up) at `GONE_AT`:
+ * the memtable's segment goes. After the links (before the segments are listed) the make must answer SNAP_RETRY,
+ * not CORRUPT; after the listing, its link finds it gone (SNAP_RETRY, never a snapshot without it). */
+static int GONE_AT, gone_fired;
+static void hook_segment_gone(eng *db, int at, const char *arg)
+{
+    (void)arg;
+    if (at != GONE_AT || db != HOOK_DB || gone_fired++)
+        return;
+    CHECK(eng_flush(db) == 0);
+    eng_leader_keep(db, atomic_load(&db->lead_commit));
+}
+
+static void case_segment_gone(int at)
+{
+    char dir[PATH_MAX];
+    fresh(dir, at == SNAP_AT_LINKED ? "seggone_l" : "seggone_s", 4);
+    bk_reset();
+    eng *db = open_leader(dir, 0, 480);
+    for (int s = 0; s < 4; s++)
+        CHECK(put(db, (uint32_t)s, T0 + s, 1000, 10) == 0);
+    CHECK(eng_flush(db) == 0);
+    eng_leader_keep(db, atomic_load(&db->lead_commit));
+    CHECK(put(db, 2, T0 + 200000, 1000, 5) == 0); /* memtable rows in the active segment */
+    char seg[64], path[PATH_MAX + 64];
+    pthread_mutex_lock(&db->buf_lock);
+    wal_name(seg, sizeof seg, db->active->wal_seq);
+    pthread_mutex_unlock(&db->buf_lock);
+    HOOK_DB = db, GONE_AT = at, gone_fired = 0;
+    atomic_store(&snap_test_hook, hook_segment_gone);
+    struct snap_info si = {0};
+    int retries = 0;
+    int rc = make(db, "snap_gone", &si, &retries);
+    atomic_store(&snap_test_hook, NULL);
+    snprintf(path, sizeof path, "%s/%s", dir, seg);
+    CHECK(gone_fired >= 1 && !exists(path)); /* the window was reached */
+    if (!gone_fired || exists(path))
+        fprintf(stderr, "  segment gone (hook %d): fired %d, %s %s\n", at, gone_fired, seg, exists(path) ? "still there" : "gone");
+    CHECK(rc == 0 && retries == 1);
+    if (rc == 0) {
+        CHECK(snap_verify_cut(&si));
+        snap_release(si.path);
+    } else {
+        fprintf(stderr, "  segment gone (hook %d): make rc %d after %d retries\n", at, rc, retries);
+    }
+    eng_close(db);
+    printf("  segment gone %s: SNAP_RETRY, then a whole snapshot\n",
+           at == SNAP_AT_LINKED ? "before the listing" : "after the listing");
+}
+
+/* Every part is linked before any is read: at each part's link nothing has been hashed yet */
+static struct snap_info *LF_SI;
+static int lf_parts;
+static void hook_link_first(eng *db, int at, const char *arg)
+{
+    (void)arg;
+    if (at != SNAP_AT_PART || db != HOOK_DB)
+        return;
+    lf_parts++;
+    if (LF_SI->bytes != 0 || LF_SI->nparts != 0) {
+        CHECK(LF_SI->bytes == 0 && LF_SI->nparts == 0);
+        fprintf(stderr, "  link first: part %d linked after %" PRIu64 " bytes were read\n", lf_parts, LF_SI->bytes);
+    }
+}
+
+static void case_link_first(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "linkfirst", 4);
+    bk_reset();
+    eng *db = open_leader(dir, 0, 480);
+    for (int r = 0; r < 4; r++) {
+        for (int s = 0; s < 4; s++)
+            CHECK(put(db, (uint32_t)s, T0 + r * 20000 + s, 1000, 10) == 0);
+        CHECK(eng_flush(db) == 0);
+    }
+    struct snap_info si = {0};
+    HOOK_DB = db, LF_SI = &si, lf_parts = 0;
+    atomic_store(&snap_test_hook, hook_link_first);
+    int rc = snap_make(db, "snap_lf", &si);
+    atomic_store(&snap_test_hook, NULL);
+    CHECK(rc == 0 && lf_parts >= 3 && si.nparts == (size_t)lf_parts);
+    if (rc == 0) {
+        CHECK(snap_verify_cut(&si));
+        snap_release(si.path);
+    }
+    eng_close(db);
+    printf("  link first: %d parts linked before any was read\n", lf_parts);
+}
+
+/* snap_man_read refuses what a forged or damaged SNAPMAN could say (r4-snapinst reads one from another node) */
+static int man_try(const char *dir, uint32_t nf_claim, const char *const *names, const uint8_t *kinds,
+                   const uint32_t *links, const uint64_t *sizes, size_t n)
+{
+    uint8_t b[4096];
+    size_t o = 0;
+    memset(b, 0, sizeof b);
+    memcpy(b, "TSNAPMAN", 8), o = 8;
+    uint32_t v = SNAP_MAN_VERSION, z = 0;
+    memcpy(b + o, &v, 4), o += 4;
+    memcpy(b + o, &z, 4), o += 4; /* nhist */
+    memcpy(b + o, &nf_claim, 4), o += 4;
+    o += 4 + 8 + 16 + 6 * 8;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t l = (uint16_t)strlen(names[i]);
+        uint64_t sz = sizes ? sizes[i] : 10, x = 7;
+        memcpy(b + o, &l, 2), o += 2;
+        memcpy(b + o, names[i], l), o += l;
+        b[o++] = kinds[i];
+        memcpy(b + o, &sz, 8), o += 8;
+        memcpy(b + o, &x, 8), o += 8;
+        memcpy(b + o, &links[i], 4), o += 4;
+    }
+    uint64_t h = xxh64(b, o, 0);
+    memcpy(b + o, &h, 8), o += 8;
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof path, "%s/%s", dir, SNAP_MAN);
+    FILE *f = fopen(path, "wb");
+    if (!f || fwrite(b, 1, o, f) != o)
+        abort();
+    fclose(f);
+    struct snap_man m;
+    int rc = snap_man_read(dir, &m);
+    if (rc == 0)
+        snap_man_free(&m);
+    return rc;
+}
+
+static void case_man_bad(void)
+{
+    char dir[PATH_MAX + 16];
+    snprintf(dir, sizeof dir, "%s/manbad", S);
+    sh("mkdir -p '%s'", dir);
+    const uint8_t pk[] = {SNAP_PART, SNAP_KEEP}, bad[] = {SNAP_PART, 9};
+    const uint32_t nol[] = {0, 0}, l1[] = {0, 1}, lfwd[] = {2, 0};
+    const uint64_t sz2[] = {10, 11};
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, l1, NULL, 2) == 0);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", ".."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "SNAPMAN.tmp"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "p1.part"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "p2.part"}, bad, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, lfwd, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, l1, sz2, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 0x7fffffff, (const char *const[]){"p1.part"}, pk, nol, NULL, 1) == TSDB_ERR_CORRUPT);
+    printf("  SNAPMAN: \".\", \"..\", its own names, a name twice, unknown kinds, bad links and a huge count refused\n");
+}
 static void hook_write_after_cut(eng *db, int at, const char *arg)
 {
     (void)arg;
@@ -1131,7 +1384,8 @@ static void set_mutant(const char *m)
         int v;
     } t[] = {{"snapafterp", SNAP_MUT_AFTERP},       {"snapdictshort", SNAP_MUT_DICTSHORT},
              {"snapnokeep", SNAP_MUT_NOKEEP},       {"snapnostage", SNAP_MUT_NOSTAGE},
-             {"snapnoretired", SNAP_MUT_NORETIRED}, {"snapnodirsync", SNAP_MUT_NODIRSYNC}};
+             {"snapnoretired", SNAP_MUT_NORETIRED}, {"snapnodirsync", SNAP_MUT_NODIRSYNC},
+             {"snapnoneedseq", SNAP_MUT_NONEEDSEQ}, {"snapnosegretry", SNAP_MUT_NOSEGRETRY}};
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
         if (strcmp(m, t[i].name) == 0) {
             snap_mutant = t[i].v;
@@ -1154,6 +1408,27 @@ static double now_s(void)
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static bool bench_cold; /* --cold: every part's pages dropped from the cache before each make */
+
+static void drop_cache(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || strcmp(e->d_name + l - 5, ".part") != 0)
+            continue;
+        int fd = openat(dirfd(d), e->d_name, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            fdatasync(fd);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            close(fd);
+        }
+    }
+    if (d)
+        closedir(d);
 }
 
 static int bench(long mb)
@@ -1184,11 +1459,14 @@ static int bench(long mb)
            now_s() - t0);
     for (int r = 0; r < 3; r++) {
         struct snap_info si = {0};
+        if (bench_cold)
+            drop_cache(dir);
         double a = now_s();
         int rc = snap_make(db, "snap_bench", &si);
         double t = now_s() - a;
-        printf("bench: make %d: rc %d, %.3f s (%.0f MB/s), %zu files (%zu parts, %zu segments)\n", r, rc, t,
-               (double)bytes / 1048576.0 / t, si.nfiles, si.nparts, si.nsegs);
+        printf("bench: make %d%s: rc %d, %.3f s (%.0f MB/s of the %.1f MB read), %zu files (%zu parts, %zu segments, "
+               "%zu keep_)\n", r, bench_cold ? " cold" : "", rc, t, (double)si.bytes / 1048576.0 / t,
+               (double)si.bytes / 1048576.0, si.nfiles, si.nparts, si.nsegs, si.nkeep);
         if (rc == 0) {
             a = now_s();
             CHECK(snap_release(si.path) == 0);
@@ -1215,6 +1493,7 @@ int main(int argc, char **argv)
         T0 = strtoll(argv[4], NULL, 10);
         if (argc == 6)
             set_mutant(argv[5]);
+        atomic_store(&snap_test_cut, note_cut);
         return child(argv[2], argv[3]);
     }
     const char *mutant = NULL, *scratch = "/tmp";
@@ -1224,12 +1503,15 @@ int main(int argc, char **argv)
             mutant = argv[++i];
         else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc)
             bench_mb = atol(argv[++i]);
+        else if (strcmp(argv[i], "--cold") == 0)
+            bench_cold = true;
         else
             scratch = argv[i];
     }
     if (mutant)
         set_mutant(mutant);
     MUTANT = mutant;
+    atomic_store(&snap_test_cut, note_cut);
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "%s/test-snapshot.XXXXXX", scratch);
     if (!mkdtemp(tmpl)) {
@@ -1251,6 +1533,10 @@ int main(int argc, char **argv)
     case_basic_sweep();
     case_windows();
     case_after_cut();
+    case_segment_gone(SNAP_AT_LINKED);
+    case_segment_gone(SNAP_AT_SEGLIST);
+    case_link_first();
+    case_man_bad();
     case_merge(480);
     case_merge(0);
     case_random();
