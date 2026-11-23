@@ -1141,6 +1141,66 @@ static void set_mutant(const char *m)
     exit(2);
 }
 
+/* --bench MB DIR: the make time of a leader volume of about MB megabytes of parts (REPORT of r4-snapmake): series
+ * written in calls of a million rows of noisy values (about 8 bytes a row), a memtable left with rows, then three makes,
+ * each released. Not part of make test. */
+static void bench_part(void *ctx, const tsdb_part_info *pi)
+{
+    *(uint64_t *)ctx += pi->bytes;
+}
+
+static double now_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static int bench(long mb)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "bench", 16);
+    eng *db = open_leader(dir, 0, 480);
+    const size_t n = 1000000;
+    int64_t *ts = malloc(n * sizeof *ts);
+    double *v = malloc(n * sizeof *v);
+    if (!ts || !v)
+        abort();
+    uint64_t x = 88172645463325252ull, bytes = 0, rows = 0;
+    double t0 = now_s();
+    for (int64_t call = 0; bytes < (uint64_t)mb << 20; call++) {
+        for (size_t i = 0; i < n; i++) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            ts[i] = T0 + (call / 16) * (int64_t)n + (int64_t)i, v[i] = (double)(x >> 11) / 9007199254740992.0;
+        }
+        if (eng_insert_series(db, TSDB_FLOAT64, (uint32_t)(call % 16), ts, v, n) != 0)
+            return fprintf(stderr, "bench: insert failed\n"), 1;
+        rows += n;
+        bytes = 0;
+        eng_foreach_part(db, bench_part, &bytes);
+    }
+    CHECK(put(db, 3, T0 - 100000, 1, 1000) == 0); /* small writes: a memtable and its segment */
+    printf("bench: %" PRIu64 " rows, %.1f MB of parts written in %.1f s\n", rows, (double)bytes / 1048576.0,
+           now_s() - t0);
+    for (int r = 0; r < 3; r++) {
+        struct snap_info si = {0};
+        double a = now_s();
+        int rc = snap_make(db, "snap_bench", &si);
+        double t = now_s() - a;
+        printf("bench: make %d: rc %d, %.3f s (%.0f MB/s), %zu files (%zu parts, %zu segments)\n", r, rc, t,
+               (double)bytes / 1048576.0 / t, si.nfiles, si.nparts, si.nsegs);
+        if (rc == 0) {
+            a = now_s();
+            CHECK(snap_release(si.path) == 0);
+            printf("bench: release %d: %.3f s\n", r, now_s() - a);
+        }
+    }
+    free(ts);
+    free(v);
+    eng_close(db);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
 #ifdef __APPLE__
@@ -1158,9 +1218,12 @@ int main(int argc, char **argv)
         return child(argv[2], argv[3]);
     }
     const char *mutant = NULL, *scratch = "/tmp";
+    long bench_mb = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mutant") == 0 && i + 1 < argc)
             mutant = argv[++i];
+        else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc)
+            bench_mb = atol(argv[++i]);
         else
             scratch = argv[i];
     }
@@ -1177,6 +1240,12 @@ int main(int argc, char **argv)
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     T0 = ((int64_t)now.tv_sec * 1000 - DAY_MS) / 3600000 * 3600000;
+    if (bench_mb > 0) {
+        T0 -= 30 * DAY_MS; /* a million rows a call at 1 ms: room before now */
+        int rc = bench(bench_mb);
+        sh("rm -rf '%s'", S);
+        return rc;
+    }
     printf("test_snapshot%s%s\n", mutant ? " --mutant " : "", mutant ? mutant : "");
     case_xxh();
     case_basic_sweep();
