@@ -1286,7 +1286,7 @@ static int child(const char *dir, const char *ackf)
     if (snap_make(db, "snap_p", &si) != 0)
         _exit(7);
     ack(ackf, "m");
-    _exit(0);
+    exit(0); /* not _exit: crashfs's power loss at exit (CRASHFS_AT_EXIT) runs in its destructor, which _exit skips */
 }
 
 static const char *MUTANT; /* --mutant NAME, handed to the power case's child */
@@ -1947,7 +1947,7 @@ static int ichild(const char *root, const char *ackf)
         _exit(7);
     }
     ack(ackf, "i");
-    _exit(0);
+    exit(0); /* not _exit: the power loss at exit is crashfs's destructor (what a 0 promised must be on disk) */
 }
 
 /* After a crash: snap_leftovers, then v0 is the old directory whole (floor A, A's rows) or the new one whole */
@@ -1971,6 +1971,13 @@ static int ipower_step(const char *tmpl, const char *root, const char *ackf, int
     PJ(vd, "%s/v0", root);
     PJ(sn, "%s/v0.snap", root);
     PJ(od, "%s/v0.old", root);
+    /* a 0 from snap_install means the swap is durable as it stands: v0 is the new directory before any
+     * snap_leftovers (a caller that opens v0 at once must not find the old one, or no v0) */
+    if (strchr(a, 'i') && (!exists(vd) || exists(sn) || exists(od))) {
+        ifail("install power: step %d seed %d: the install returned 0, after the power loss v0 %d, v0.snap %d, "
+              "v0.old %d (the swap was not durable)", k, seed, exists(vd), exists(sn), exists(od));
+        return -1;
+    }
     int rc = snap_leftovers(root, 0);
     if (rc != 0 || exists(sn) || exists(od) || !exists(vd)) {
         ifail("install power: step %d seed %d: leftovers %d, v0.snap %d, v0.old %d, v0 %d", k, seed, rc, exists(sn),
@@ -2065,6 +2072,14 @@ static void case_install_power(void)
             if (code == 0)
                 kend = k;
         }
+    /* the step that ran whole loses power at its exit: more seeds there, each tearing another subset of the
+     * root's unsynced renames (an install that skips the root's fsync keeps both renames in 1 seed of 4) */
+    for (int sd = 3; kend > 0 && sd < 16; sd++) {
+        int code = ipower_step(tmpl, root, ackf, kend, kend * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news);
+        if (code < 0)
+            return;
+        crashes += code == 99;
+    }
     CHECK(kend > 0 && olds > 0 && news > 0);
     printf("  install power: %d steps, %d crashes: %d left the old directory whole, %d the new one\n", kend + 1, crashes,
            olds, news);
@@ -2095,6 +2110,7 @@ static void set_mutant(const char *m)
 
 /* --bench MB DIR: the make time of a leader volume of about MB megabytes of parts (REPORT of r4-snapmake): series
  * written in calls of a million rows of noisy values (about 8 bytes a row), a memtable left with rows, then three makes,
+ * each copied (cp -a) and installed into a root of its own (the install timed: r4-snapinst),
  * each released. Not part of make test. */
 static void bench_part(void *ctx, const tsdb_part_info *pi)
 {
@@ -2166,6 +2182,24 @@ static int bench(long mb)
                "%zu keep_)\n", r, bench_cold ? " cold" : "", rc, t, (double)si.bytes / 1048576.0 / t,
                (double)si.bytes / 1048576.0, si.nfiles, si.nparts, si.nsegs, si.nkeep);
         if (rc == 0) {
+            /* the install of that snapshot, copied for real the way a receiver has it (cp -a: no links into the
+             * leader's volume): snap_install's checks of every file against SNAPMAN, META, FNO, REPL, SNAPDONE, swap */
+            char iroot[PATH_MAX + 16], vd[PATH_MAX + 32];
+            struct inst_snap is;
+            snprintf(iroot, sizeof iroot, "%s_iroot", dir);
+            sh("rm -rf '%s'", iroot);
+            if (inst_copy(si.path, iroot, &is)) {
+                snprintf(vd, sizeof vd, "%s/v%d.snap", iroot, is.vol);
+                if (bench_cold)
+                    drop_cache(vd);
+                a = now_s();
+                int irc = inst_do(iroot, is.vol, 1000 + (uint64_t)r, NULL);
+                t = now_s() - a;
+                printf("bench: install %d%s: rc %d, %.3f s (%.0f MB/s of the %.1f MB)\n", r, bench_cold ? " cold" : "",
+                       irc, t, (double)si.bytes / 1048576.0 / t, (double)si.bytes / 1048576.0);
+                CHECK(irc == 0);
+            }
+            sh("rm -rf '%s'", iroot);
             a = now_s();
             CHECK(snap_release(si.path) == 0);
             printf("bench: release %d: %.3f s\n", r, now_s() - a);

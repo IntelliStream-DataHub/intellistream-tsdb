@@ -332,6 +332,19 @@ cgroup, so `nice` does not keep your work out of its way.
   step under crashfs with the link model; the verify also requires everything the leader had at the cut, noted by
   `snap_test_cut` under the cut's locks; mutants `snapafterp snapdictshort snapnokeep snapnostage snapnoretired
   snapnodirsync snapnoneedseq snapnosegretry`).
+  The install side (r4-snapinst, snapshot.c's second half): `snap_install(root, N, "<root>/vN.snap", id, keep)` checks
+  every file against SNAPMAN and every part's checksums, refuses a file SNAPMAN does not name, writes META, FNO = P + 1,
+  REPL (floor P; D6 with `keep`, the replaced directory's REPL: fence never lowered, led never raised, unsure kept with
+  the open generation's belt) and `SNAPDONE`, each synced, then swaps vN -> vN.old, vN.snap -> vN, syncs the root,
+  removes vN.old and syncs the root again: a 0 means vN is the new directory on disk, before any recovery.
+  `snap_leftovers` (before vN is looked at) finishes an install whose SNAPDONE is there and removes or renames back
+  the rest. `rm_dir_at` syncs a directory after each pass of unlinks (crashfs keeps unsynced unlinks aside in the
+  directory, and on disk an emptied directory must be durable before its rmdir). Tests: `test_snapshot` install cases
+  (made under writers, installed, compared with a replica fed 1..P, fed on to the leader's end, promoted and serving
+  every COMMIT file; `keep`; power loss at every step of an install under crashfs with tearing, the step that ran
+  whole with 16 seeds; `--only install` runs these alone), mutants `snaplowerfence snapraiseled snapkeepunsure
+  snapswapfirst snapinstnodirsync`. A crashfs child that must lose power at its end exits with `exit`, never `_exit`
+  (the loss at exit is the shim's destructor).
 - `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,
   epoch, see_epoch, writable, all_up); settle.c, eccache.c, eckeep.c, ecgc.c and tier.c reach the stores only through them
   and never name a store index. Per attached engine (`tier_attach`: ops, settings, epoch provider; a refcounted `coldvol`
