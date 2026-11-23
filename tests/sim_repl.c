@@ -856,24 +856,22 @@ static void meta_tick(void)
     uint32_t old = S.vm.isr;
     uint64_t oldrid[NM];
     memcpy(oldrid, S.vm.rid, sizeof oldrid);
-    /* Moving off a leaving leader: the target is the replier (other than it) with the highest durable end, and only if
-     * that is the highest of all replies (D14: the target holds what the old one wrote). Otherwise the usual choice,
-     * which may pick the leaving member again: the mover then tries once more. */
+    /* Moving off a leaving leader: the target is the replier (other than it) with the highest durable end. A fenced
+     * ISR member with the record's rid holds every committed position (the commit point is the ISR's lowest match), so
+     * only the leaving leader's uncommitted tail, never acknowledged, is cut. Asking for the highest end of all replies
+     * instead (D14's drained end) failed while clients kept the leader ahead: the old leader won every retry (seeds
+     * 14328, 39648 and 7 more of 100,000); the drain before the fence is r4-simtr's. Without such a reply, the usual
+     * choice, which may pick the leaving member again: the mover then tries once more. */
     int target = -1, off = S.fo_off ? slot_of(S.fo_off) : -1;
-    uint64_t min_end = 0;
     for (int i = 0; off >= 0 && i < S.nrep; i++) {
         int nd = S.rep[i].node;
-        if (nd < 0 || nd >= S.nn || !(S.vm.isr & S.fo_fenced & (1u << nd)) || S.rep[i].rid != S.vm.rid[nd])
+        if (nd < 0 || nd >= S.nn || nd == off || !(S.vm.isr & S.fo_fenced & (1u << nd)) || S.rep[i].rid != S.vm.rid[nd])
             continue;
-        if (S.rep[i].durable > min_end)
-            min_end = S.rep[i].durable;
-        if (nd != off && (target < 0 || S.rep[i].durable > S.rep[target].durable))
+        if (target < 0 || S.rep[i].durable > S.rep[target].durable)
             target = i;
     }
-    if (target >= 0 && S.rep[target].durable < min_end)
-        target = -1;
     int rc = target >= 0 ? repl_meta_promote_to(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep,
-                                                S.rep[target].node, min_end)
+                                                S.rep[target].node, S.rep[target].durable)
                          : repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
     if (rc == REPL_OK && target >= 0)
         S.st.planned++;
@@ -1214,8 +1212,10 @@ static void mover(void)
     }
     if (l == a) {
         /* A failover may have made the leaving member the leader: move off it (every tick once the faults healed,
-         * or the move never ends: seeds 31511, 37712 and 14 more of 100,000 before). */
-        if (!S.fo && (!S.chaos || chance(20))) {
+         * or the move never ends: seeds 31511, 37712 and 14 more of 100,000 before), but only once another member is
+         * in the ISR: with the leaving one alone there, every retry promoted it again and kept the others from
+         * joining (seeds 89586, 75053 and 4 more). */
+        if (!S.fo && (S.vm.isr & ~(1u << l)) && (!S.chaos || chance(20))) {
             fo_begin("moving off a leaving member");
             S.fo_off = S.mv.a;
         }
