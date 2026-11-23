@@ -1207,6 +1207,14 @@ void jr_serial_lock(eng *db)
 void jr_serial_unlock(eng *db)
 {
     pthread_mutex_lock(&db->jr_serial.mu);
+    if (!db->jr_serial.held) {
+        /* serving past next would make every later turn wait forever: every large write, drop and settle of the
+         * volume, with no line. A plain mutex took this unlock quietly (undefined, harmless in glibc) */
+        db->jr_serial.unheld++;
+        pthread_mutex_unlock(&db->jr_serial.mu);
+        fprintf(stderr, "tsdb: %s: jr_serial let go of with no turn taken (a bug): ignored\n", db->dir);
+        return;
+    }
     db->jr_serial.held = false;
     db->jr_serial.serving++;
     pthread_cond_broadcast(&db->jr_serial.cv); /* few wait (large writes, a drop, a settle): the next ticket goes */
@@ -1215,7 +1223,10 @@ void jr_serial_unlock(eng *db)
 
 bool lw_enter(eng *db, lw_fence *f)
 {
-    if (eng_jr(db)) /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2) */
+    /* a leader of a replicated volume: marker order is block order (design-cluster.md 5.2). db->jr is set by
+     * eng_leader_attach after the engine's threads run, so lw_leave goes by this decision, not by db->jr again */
+    f->serial = eng_jr(db) != NULL;
+    if (f->serial)
         jr_serial_lock(db);
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
     pthread_cond_init(&f->cv, NULL);
@@ -1247,8 +1258,9 @@ void lw_leave(eng *db, lw_fence *f)
         free(f->r);
     else if (f->r)
         lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
-    if (eng_jr(db))
+    if (f->serial)
         jr_serial_unlock(db);
+    f->serial = false;
     f->r = NULL;
     f->r_heap = false;
 }

@@ -2027,7 +2027,8 @@ struct eng {
         pthread_mutex_t mu; /* a leaf, held only to take or hand on a turn */
         pthread_cond_t cv;
         uint64_t next, serving;
-        bool held; /* a turn is taken (the mutant jrbarge takes it whenever it is not) */
+        bool held;       /* a turn is taken: a let-go without one would hand out a turn no one asked for */
+        uint64_t unheld; /* let-goes without a turn (a bug; logged and ignored), for the tests */
     } jr_serial;
     int wal_fd;
     uint64_t wal_seq;
@@ -2299,6 +2300,7 @@ typedef struct lw_fence {
     bool held;
     void (*hold_fn)(void *ctx, int delta);
     void *hold_ctx;
+    bool serial; /* lw_enter took jr_serial (db->jr was set): lw_leave lets go of it on this, never on db->jr again */
 } lw_fence;
 /* The thread's fence table (insert.c): taken until lw_table_put; NULL while taken (or on failure). */
 void *lw_table_take(size_t bytes);

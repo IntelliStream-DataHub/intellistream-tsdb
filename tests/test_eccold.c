@@ -1661,6 +1661,55 @@ static void test_ticket(void)
     printf("  ticket: jr_serial let go of and asked for again at once: the settle waiting at its gate went first\n");
 }
 
+/* lw_leave lets go of jr_serial by what lw_enter decided, never by db->jr again: db->jr is set by eng_leader_attach
+ * while the engine's threads run, so a large write may enter without it and leave with it, or (here, simulated) the
+ * other way round. A turn never let go of would make every later large write, drop and settle wait forever; a turn
+ * let go of twice (serving past next) too. A let-go without a turn is ignored, counted and logged */
+static bool jr_balanced(eng *db, uint64_t unheld)
+{
+    pthread_mutex_lock(&db->jr_serial.mu);
+    bool ok = db->jr_serial.next == db->jr_serial.serving && !db->jr_serial.held && db->jr_serial.unheld == unheld;
+    if (!ok)
+        fprintf(stderr, "jr_serial: next %llu serving %llu held %d unheld %llu (wanted %llu)\n",
+                (unsigned long long)db->jr_serial.next, (unsigned long long)db->jr_serial.serving,
+                (int)db->jr_serial.held, (unsigned long long)db->jr_serial.unheld, (unsigned long long)unheld);
+    pthread_mutex_unlock(&db->jr_serial.mu);
+    return ok;
+}
+static void test_jrpair(void)
+{
+    lt L;
+    if (!start("jrpair", &L))
+        return;
+    const struct jr_ops *jr = eng_jr(L.db);
+    CHECK(jr != NULL);
+    CHECK(jr_balanced(L.db, 0));
+    lw_fence f;
+    lw_fence_range(&f, L.s[2], DAY0 + 3 * DAY_MS, DAY0 + 4 * DAY_MS);
+    f.r = NULL;
+    f.r_heap = false;
+    lw_enter(L.db, &f); /* took a turn */
+    __atomic_store_n(&L.db->jr, NULL, __ATOMIC_RELEASE);
+    lw_leave(L.db, &f);
+    __atomic_store_n(&L.db->jr, jr, __ATOMIC_RELEASE);
+    CHECK(jr_balanced(L.db, 0));
+    __atomic_store_n(&L.db->jr, NULL, __ATOMIC_RELEASE);
+    lw_enter(L.db, &f); /* no turn */
+    __atomic_store_n(&L.db->jr, jr, __ATOMIC_RELEASE);
+    lw_leave(L.db, &f);
+    CHECK(jr_balanced(L.db, 0));
+    /* the guard: a let-go without a turn changes nothing but the count */
+    jr_serial_unlock(L.db);
+    CHECK(jr_balanced(L.db, 1));
+    /* and the next large write and drop of the volume go through */
+    CHECK(rows(L.db, L.s[2], 3, 0, 20, 7.0f) == 0);
+    CHECK(eng_drop_before(L.db, DAY0 - DAY_MS) == 0);
+    CHECK(jr_balanced(L.db, 1));
+    CHECK(eng_check(L.db) == 0);
+    lclose(&L);
+    printf("  jrpair: lw_leave lets go of jr_serial as lw_enter took it, db->jr set or not; a stray let-go ignored\n");
+}
+
 /* more late parts at the cut than one marker names beside I (the limit lowered to 3 files here; MK_FILES_MAX in
  * service): INVALID, and nothing is left behind: no marker, the fence and jr_serial left (writes into P go on at once),
  * no part settling, the objects to r7-gc; at the limit (I and Y exactly 4 files of 4) the settle goes through with Y */
@@ -1812,7 +1861,7 @@ int main(int argc, char **argv)
                  {"swapfail", test_swapfail}, {"deposeappend", test_deposeappend}, {"crash", test_crash},
                  {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging},
                  {"swappower", test_swappower}, {"toomany", test_toomany}, {"turns", test_turns},
-                 {"ticket", test_ticket}};
+                 {"ticket", test_ticket}, {"jrpair", test_jrpair}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();
