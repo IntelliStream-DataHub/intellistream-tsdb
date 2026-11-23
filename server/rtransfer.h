@@ -13,7 +13,8 @@
  * definite: never admitted) while a transfer drains, 1 lets the usual checks decide. Takes no lock. */
 int rtr_admit_ok(struct rvol *rv);
 /* An IN_CMD of kind CL_VOLCMD_TRANSFER or CL_VOLCMD_CANCEL, on the volume's thread, rv->mu held. */
-void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c);
+/* `from`: the member that sent it (the frame carries no term: cluster.h; check it against the Raft leader) */
+void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from);
 /* Every tick of the volume's thread, rv->mu held. */
 void rtr_tick(struct rvol *rv);
 

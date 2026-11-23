@@ -205,7 +205,10 @@ void cluster_set_fence_handler(cluster_fence_fn fn, void *arg);
 /* VOLCMD (R4): the Raft leader's command to a volume's member, frame F_VOLCMD {u8 kind, u32 volume, u64 epoch, u32 node,
  * u64 arg}: TRANSFER (to the volume leader: drain and report READY for a transfer to `node`), DROP_MEMBER (a move's
  * shrink of `node`), CANCEL (a transfer is off: admit again). Handed to the handler (repld_volcmd) by the cluster
- * thread; sent by server/ctransfer.c and cmove.c (cluster_int.h cl_volcmd_send). */
+ * thread; sent by server/ctransfer.c and cmove.c (cluster_int.h cl_volcmd_send). The frame carries no Raft term: `from`
+ * (the connection's member, or this server for its own) is all a receiver knows of the sender, and a deposed Raft
+ * leader's TRANSFER or CANCEL at the volume's current epoch looks like the new one's. The receiving track (r4-transfer,
+ * r4-move) must check `from` against the Raft leader it knows, or carry the term or a transfer id in `arg`. */
 enum { CL_VOLCMD_TRANSFER = 1, CL_VOLCMD_DROP_MEMBER = 2, CL_VOLCMD_CANCEL = 3 };
 struct cluster_volcmd {
     uint8_t kind;
@@ -445,8 +448,12 @@ void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *cons
 /* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
 size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out); /* 8 bytes */
-/* The bodies of VOLUME_TRANSFER and REPLICA_RESET (8 bytes, as VOLUME_FORCE's) and VOLUME_MOVE (16 bytes). */
+/* The bodies of VOLUME_TRANSFER and REPLICA_RESET (8 bytes, as VOLUME_FORCE's) and VOLUME_MOVE (16 bytes); the
+ * decoders take exactly that many bytes (0, else -1). */
 size_t cluster_volume_move_encode(uint32_t volume, uint32_t from, uint32_t to, uint32_t flags, uint8_t *out);
+int cluster_volume_move_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *from, uint32_t *to,
+                               uint32_t *flags);
+int cluster_volume_force_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *node);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

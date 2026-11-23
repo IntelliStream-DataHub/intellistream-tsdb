@@ -147,7 +147,7 @@ struct rvol {
     struct rsnap *snap; /* rsnap.c */
     struct rset *set;   /* rset.c */
     struct rtr *tr;     /* rtransfer.c */
-    int said_cmd_drop, said_cmd_tr; /* the stubs' lines, once per volume (until rset.c and rtransfer.c are built) */
+    int said_cmd_drop, said_cmd_tr; /* the stubs' lines, once per volume (said_cmd_tr: a bit per VOLCMD kind) */
 };
 
 enum {
@@ -233,6 +233,8 @@ struct repld_g {
     int sync_by_hook; /* TSDB_REPLD_TEST=syncbyhook: a writer's SYNC compares what op_synced reported, not the engine */
     int fetch_late;   /* TSDB_REPLD_TEST=fetchlate: a replica's first FETCH of a name waits FETCH_LATE_MS */
     int no_fetch;     /* TSDB_REPLD_TEST=nofetch: a replica sends no FETCH and says once per name that it withholds it */
+    int snap_dial;    /* TSDB_REPLD_TEST=snapdial: the driver also dials every peer's kind 5 (PL_KIND_SNAP) and sends one
+                       * frame when it comes up (test_cluster volcmd: the acceptor's row and rsnap_frame) */
     int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
                        * ACKs carry the durable end the core opened with that long (reopenhold) */
     int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
@@ -256,6 +258,16 @@ struct repld_g {
                        * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
 };
+
+/* The names below are short in the driver's files (repld.c and the R4 files that include this header) and prefixed
+ * in the binary: tsdbd links cluster.c, chunksrv_cluster.c, fwd_cluster.c and crashpt.c, each with a static `say` or
+ * `G` of its own, and an external one in another file must never bind to the driver's. */
+#define G rd_G
+#define say rd_say
+#define vol_find rd_vol_find
+#define post rd_post
+#define save_repl rd_save_repl
+#define rec_set rd_rec_set
 
 extern struct repld_g G;
 

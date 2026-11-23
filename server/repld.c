@@ -353,10 +353,10 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
     if (m->to < 0 || (uint32_t)m->to >= rv->rec.nrep)
         return; /* the metadata group's messages go through the cluster thread (ISR changes: not wired yet) */
     struct plink *l = link_of(rv->rec.rep[m->to].node, 0);
-    struct repl_msg sm = *m;
-    rset_stamp(rv, &sm);
+    /* the core's own messages: it stamps its set version (src/repl.h), and one queued before a reconfiguration is in the
+     * old record's indexes, so it must keep the old version (rset.h: rset_stamp is for what the driver builds) */
     uint8_t b[RW_HEAD];
-    size_t n = rw_encode_msg(b, sizeof b, rv->number, &sm, NULL, 0, 0, NULL, 0);
+    size_t n = rw_encode_msg(b, sizeof b, rv->number, m, NULL, 0, 0, NULL, 0);
     if (l && n)
         plink_send(l, RW_T_MSG, b, n, 0);
 }
@@ -1180,7 +1180,9 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
 
 static void on_link(void *arg, struct plink *l, int up)
 {
-    (void)arg, (void)l, (void)up;
+    (void)arg;
+    if (up && G.snap_dial && plink_kind(l) == PL_KIND_SNAP) /* TSDB_REPLD_TEST=snapdial: one frame on the new link */
+        plink_send(l, 1, "snapdial", 8, 0);
 }
 
 /* ------------------------------------------------------------------ actions */
@@ -1624,9 +1626,9 @@ static void handle(struct rvol *rv, struct item *it)
             return;
         memcpy(&c, it->data, sizeof c);
         if (c.kind == CL_VOLCMD_DROP_MEMBER)
-            rset_cmd(rv, &c);
+            rset_cmd(rv, &c, it->node);
         else if (c.kind == CL_VOLCMD_TRANSFER || c.kind == CL_VOLCMD_CANCEL)
-            rtr_cmd(rv, &c);
+            rtr_cmd(rv, &c, it->node);
         return;
     }
     int from = node_index(rv, it->node);
@@ -2079,6 +2081,8 @@ static int links_up(const struct cluster_vol_rec *r)
         snprintf(G.nodes[i].addr, sizeof G.nodes[i].addr, "%s", r->rep[k].peer);
         G.nodes[i].log = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_LOG);
         G.nodes[i].bulk = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_BULK);
+        if (G.snap_dial) /* nothing dials kind 5 until r4-xferlink: the test reaches the acceptor and rsnap_frame */
+            G.nodes[i].snap = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_SNAP);
         G.nn++;
     }
     pthread_mutex_unlock(&G.mu);
@@ -2166,6 +2170,7 @@ void repld_init(tsdb *t, const char *dir)
     G.fetch_late = te && strstr(te, "fetchlate");
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
+    G.snap_dial = te && strstr(te, "snapdial");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */
@@ -2586,7 +2591,6 @@ void repld_stop(void)
         if (rv->started)
             pthread_join(rv->th, NULL);
         rv->started = 0;
-        rsnap_stop(rv);
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
         if (db && rv->mode == M_WRITER && G.mutant != RM_STOPNODEPOSE && !G.late_wal)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */
@@ -2598,6 +2602,9 @@ void repld_stop(void)
         peerlink_free(G.pl);
         G.pl = NULL;
     }
+    /* after the links: their threads call rsnap_frame and rsnap_bin_* until peerlink_free has joined them */
+    for (uint32_t i = 0; i < n; i++)
+        rsnap_stop(G.vols[i]);
     /* `stop`, set under each volume's mu above, keeps the engine's hooks (op_bytes, op_ship) off the freed links */
     if (G.late_wal)
         nanosleep(&(struct timespec){2, 500000000}, NULL);

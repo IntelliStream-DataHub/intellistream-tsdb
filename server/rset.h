@@ -14,9 +14,13 @@ void rset_change(struct rvol *rv, const struct cluster_vol_rec *r);
 /* A peer message of this volume, decoded and checked to be from `from` to this replica: 1 to hand it to the core, 0 to
  * drop it (another set version). rv->mu held. */
 int rset_msg_ok(struct rvol *rv, const struct repl_msg *m);
-/* Before every message the driver sends (APPEND, META and the core's own): stamps the set version. rv->mu held. */
+/* On a message the driver builds by hand (the APPEND of send_records, the META and FENCE it hands to the core): stamps
+ * the set version. Never on the core's own messages (send_msg sends them as they are): the core stamps those, and one
+ * queued before a reconfiguration carries the OLD version in the old record's indexes, which a restamp would relabel
+ * (r4-core's hand-off: such actions are carried out through the old record). rv->mu held. */
 void rset_stamp(struct rvol *rv, struct repl_msg *m);
-/* An IN_CMD of kind CL_VOLCMD_DROP_MEMBER, on the volume's thread, rv->mu held. */
-void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c);
+/* An IN_CMD of kind CL_VOLCMD_DROP_MEMBER, on the volume's thread, rv->mu held. `from` is the member that sent it (the
+ * frame carries no term: cluster.h, check it against the Raft leader). */
+void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from);
 
 #endif

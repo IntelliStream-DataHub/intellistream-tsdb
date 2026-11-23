@@ -135,9 +135,9 @@
 #define CL_MAGIC PL_CL_MAGIC /* "TSDC" */
 #define CL_VERSION PL_CL_VERSION /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; 4: the link
                       * kind in HELLO (data links, peerlink.h); 5: HBS_LEASE, HBS_UNREACH and
-                      * the lease fields of HB_ACK; 6: replwire RW_VERSION 2, and R4's F_VOLCMD and
-                      * VOLMSG READY (one release: dev clusters are initialised again); peers of another
-                      * version are refused (no mixed versions) */
+                      * the lease fields of HB_ACK; 6: replwire RW_VERSION 2; 7: R4's F_VOLCMD and VOLMSG
+                      * READY (one release: dev clusters are initialised again); peers of another version
+                      * are refused (no mixed versions) */
 #define RING 4096
 #define RING_BYTES (64ull << 20) /* the ring's entries hold at most this many bytes (a user's blob is up to 1 MiB, and every
                                   * grant puts it again): the oldest go first, a watcher behind them gets a snapshot */
@@ -1131,6 +1131,10 @@ static struct {
                           * is kept; while <state-dir>/replayreply is, the copies are sent again every round (test_cluster
                           * oneway2: a late answer to an earlier fence of the volume must not count for the promotion now) */
     char holdreplyfile[1100], replayreplyfile[1100];
+    int volcmd_file;     /* TSDB_CLUSTER_TEST volcmd_file=1: the Raft leader sends the VOLCMDs that <state-dir>/volcmd lists
+                          * ("TO KIND VOLUME EPOCH NODE ARG" per line) and removes the file once every one went out
+                          * (test_cluster volcmd: the frame, its self-delivery and repld's routing, until R4's tracks send) */
+    char volcmdfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1403,6 +1407,8 @@ static void test_knobs(void)
             C.drop_fence = v != 0;
         else if (sscanf(p, "hold_reply_file=%llu", &v) == 1)
             C.hold_reply = v != 0;
+        else if (sscanf(p, "volcmd_file=%llu", &v) == 1)
+            C.volcmd_file = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -3865,6 +3871,31 @@ size_t cluster_volume_move_encode(uint32_t volume, uint32_t from, uint32_t to, u
     return 16;
 }
 
+int cluster_volume_force_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *node)
+{
+    if (n != 8)
+        return -1;
+    *volume = *node = 0;
+    for (int j = 0; j < 4; j++) {
+        *volume |= (uint32_t)p[j] << (8 * j);
+        *node |= (uint32_t)p[4 + j] << (8 * j);
+    }
+    return 0;
+}
+
+int cluster_volume_move_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *from, uint32_t *to,
+                               uint32_t *flags)
+{
+    if (n != 16)
+        return -1;
+    uint32_t v[4] = {0};
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            v[i] |= (uint32_t)p[4 * i + j] << (8 * j);
+    *volume = v[0], *from = v[1], *to = v[2], *flags = v[3];
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -4771,6 +4802,20 @@ static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
     admin_reply(c->serial, reqid, 0, text, (size_t)tl);
 }
 
+/* R4's admin ops (cluster_int.h): only the Raft leader hands them on; a follower answers NOTLEADER with the leader's
+ * peer address, as every op that proposes does (the CLI follows none of them) */
+static void r4_admin(struct conn *c, uint32_t reqid, struct rd *r,
+                     void (*fn)(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n))
+{
+    if (!cl_leading()) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    fn(c->serial, reqid, r->p + r->off, r->len - r->off);
+}
+
 static void on_admin(struct conn *c, struct rd *r)
 {
     uint8_t op = get8(r);
@@ -4788,9 +4833,9 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_USER_GET: admin_user_get(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_FORCE: admin_volume_force(c, reqid, r); break;
     case CLUSTER_OP_USER_SYNC: admin_user_sync(c, reqid, r); break;
-    case CLUSTER_OP_VOLUME_TRANSFER: ctr_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
-    case CLUSTER_OP_VOLUME_MOVE: cmove_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
-    case CLUSTER_OP_REPLICA_RESET: cset_admin(c->serial, reqid, r->p + r->off, r->len - r->off); break;
+    case CLUSTER_OP_VOLUME_TRANSFER: r4_admin(c, reqid, r, ctr_admin); break;
+    case CLUSTER_OP_VOLUME_MOVE: r4_admin(c, reqid, r, cmove_admin); break;
+    case CLUSTER_OP_REPLICA_RESET: r4_admin(c, reqid, r, cset_admin); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -5946,7 +5991,9 @@ static void on_volmsg(struct conn *c, struct rd *r)
 
 static void on_volcmd(struct conn *c, struct rd *r)
 {
-    struct cluster_volcmd m = {.kind = get8(r), .volume = get32(r)};
+    struct cluster_volcmd m = {0}; /* one read per statement: an initializer list's order of evaluation is unspecified */
+    m.kind = get8(r);
+    m.volume = get32(r);
     m.epoch = get64(r);
     m.node = get32(r);
     m.arg = get64(r);
@@ -5977,6 +6024,26 @@ int cl_volcmd_send(uint32_t node, const struct cluster_volcmd *m)
     frame_end(&C.fb);
     conn_send(c, 0);
     return 0;
+}
+
+/* TSDB_CLUSTER_TEST volcmd_file=1 (C.volcmd_file): duplicates are harmless (the stubs say each kind once), so a file
+ * with a member not connected yet is sent again whole next round */
+static void volcmd_file_send(void)
+{
+    FILE *f = fopen(C.volcmdfile, "r");
+    if (!f)
+        return;
+    unsigned to, kind, vol, node;
+    unsigned long long epoch, arg;
+    int all = 1;
+    while (fscanf(f, "%u %u %u %llu %u %llu", &to, &kind, &vol, &epoch, &node, &arg) == 6) {
+        struct cluster_volcmd m = {.kind = (uint8_t)kind, .volume = vol, .epoch = epoch, .node = node, .arg = arg};
+        if (cl_volcmd_send(to, &m) != 0)
+            all = 0;
+    }
+    fclose(f);
+    if (all)
+        unlink(C.volcmdfile);
 }
 
 static void on_fence(struct conn *c, struct rd *r)
@@ -6368,6 +6435,8 @@ static void leader_duties(uint64_t now)
     promote_duty(now);
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
     cmove_duty(now);
+    if (C.volcmd_file && cl_leading())
+        volcmd_file_send();
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -6687,6 +6756,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
+    snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     if (C.users_probe)

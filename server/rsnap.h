@@ -14,11 +14,15 @@ struct plink;
 /* The core's REPL_A_SNAPSHOT: the leader (src, its index in rv->rec.rep) no longer has the records this replica
  * needs. rv->mu held; the core repeats the notice until the replica catches up. */
 void rsnap_need(struct rvol *rv, int src);
-/* An IN_SNAP item (posted by rsnap.c itself from the kind-5 link's callbacks), on the volume's thread, rv->mu held. */
+/* An IN_SNAP item (posted by rsnap.c itself from the kind-5 link's callbacks), on the volume's thread, rv->mu held.
+ * IN_SNAP is a peer kind: it shares the volume's bounded inbox with the log frames and is DROPPED after INBOX_WAIT_MS
+ * when the inbox stays full. The core resends its own messages; nothing resends a snapshot's, so rsnap.c must post only
+ * what it can lose and retry by itself (a request again on its tick, a transfer resumed from the receiver's offset). */
 void rsnap_in(struct rvol *rv, uint32_t node, const uint8_t *p, size_t n);
 /* Every tick of the volume's thread, rv->mu held. */
 void rsnap_tick(struct rvol *rv);
-/* repld_stop, after the volume's thread has been joined, before the links are freed; rv->mu not held. */
+/* repld_stop, after every volume's thread has been joined AND the links freed (peerlink_free joins the link threads,
+ * which call rsnap_frame and rsnap_bin_* until then): nothing of rsnap.c runs any more; rv->mu not held. */
 void rsnap_stop(struct rvol *rv);
 /* A frame on a kind-5 link (the link's thread; never the driver's or the cluster thread). */
 void rsnap_frame(struct plink *l, uint8_t type, const uint8_t *p, size_t n);

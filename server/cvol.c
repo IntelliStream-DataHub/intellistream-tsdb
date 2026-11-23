@@ -74,6 +74,7 @@ struct mvol {
     int unsure;   /* REPL was unsure at this open: its fence, led and log start are not trusted (r3a gates on it) */
     uint64_t epoch;
     int unnamed; /* the latest push does not name this server for it (cvolset_record CVS_UNNAMED said once) */
+    uint64_t rec_rid; /* the rid the record gave this server when prepare ran (refused or not): CVS_RESET compares it */
 };
 
 static struct {
@@ -112,7 +113,7 @@ static struct mvol *mv_get(uint32_t number)
 /* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare); the new state under mu */
 static void prepare(const struct cluster_vol_rec *r)
 {
-    struct mvol m = {.number = r->number, .state = MV_REFUSED, .epoch = r->epoch};
+    struct mvol m = {.number = r->number, .state = MV_REFUSED, .epoch = r->epoch, .rec_rid = r->rid};
     pthread_mutex_lock(&M.mu);
     uint32_t self = M.self;
     int stale_first = M.stale_first;
@@ -172,6 +173,21 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
         say("volume %" PRIu32 " (%s): the open of %s failed: %s", r->number, r->name, vdir, tsdb_strerror(rc));
 }
 
+/* cvolset_record's CVS_AGAIN (a replica reset): the manager drops what it made of the volume, so that prepare runs again
+ * on this push (cvolset_prepare sets the old directory aside). An open one is closed by cvolset_close first, and kept
+ * when that fails (until r4-setchg builds it, always). The new state: MV_NONE, or `st` when the volume is kept. */
+static int forget(uint32_t number, int st)
+{
+    if (st == MV_OPEN && cvolset_close(number) != 0)
+        return st;
+    pthread_mutex_lock(&M.mu);
+    struct mvol *m = mv_get(number);
+    if (m)
+        *m = M.vols[--M.nvols];
+    pthread_mutex_unlock(&M.mu);
+    return MV_NONE;
+}
+
 static void *mgr_main(void *arg)
 {
     (void)arg;
@@ -193,14 +209,14 @@ static void *mgr_main(void *arg)
             int st = m ? m->state : MV_NONE;
             if (m)
                 m->epoch = r->epoch;
-            uint64_t mrid = m ? m->rid : 0;
+            uint64_t mrid = m ? m->rec_rid : 0;
             if (m)
                 m->unnamed = 0;
             pthread_mutex_unlock(&M.mu);
             if (st == MV_NONE)
                 cvolset_record(CVS_NAMED, r->number, r);
-            else if (mrid && r->rid && r->rid != mrid)
-                cvolset_record(CVS_RESET, r->number, r);
+            else if (mrid && r->rid && r->rid != mrid && cvolset_record(CVS_RESET, r->number, r) == CVS_AGAIN)
+                st = forget(r->number, st);
             if (st == MV_NONE)
                 prepare(r);
             else if (st == MV_OPEN && !M.writes)
@@ -232,7 +248,9 @@ static void *mgr_main(void *arg)
             uint32_t i = 0;
             while (i < n && recs[i].number != M.vols[k].number)
                 i++;
-            if (i == n && !M.vols[k].unnamed)
+            /* a push holds at most CLUSTER_REPORT_VOLS records, the lowest numbers: one cut there names nothing past
+             * its last, so a volume up there may still be named (cvolset_unnamed) */
+            if (i == n && !M.vols[k].unnamed && cvolset_unnamed(recs, n, M.vols[k].number))
                 M.vols[k].unnamed = 1, gone[ngone++] = M.vols[k].number;
         }
         pthread_mutex_unlock(&M.mu);

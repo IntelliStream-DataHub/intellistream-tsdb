@@ -4683,6 +4683,8 @@ static void scen_links(void)
         die("links: a member's log link did not come up");
     if (!lk_dials(padv, mid, me.uuid, mident, PL_KIND_BULK, 10000))
         die("links: a member's bulk link did not come up");
+    if (!lk_dials(padv, mid, me.uuid, mident, PL_KIND_SNAP, 10000)) /* R4's snapshot kind, handed to the same peerlink */
+        die("links: a member's snapshot link (kind 5) did not come up");
     /* the metadata port still serves its admin ops */
     if (cluster_admin(padv, secret, secret_len, CLUSTER_OP_STATUS, NULL, 0, 5000, &rc, &rep, &len, err, sizeof err) != 0 ||
         rc != 0)
@@ -11969,16 +11971,31 @@ static void scen_r4stubs(void)
         !strstr(out, " rebuild_mb_s 150 rebuild_max 4 transfer_wait_ms 3000 leader_balance_s 120\n"))
         die("status does not print R4's settings as init stored them: %s", out);
     printf("  init stored rebuild_mb_s 150, rebuild_max 4, transfer_wait_ms 3000, leader_balance_s 120\n");
-    static const char *const verbs[] = {"volume transfer %s 1 1", "volume move %s 1 --log --from 1 --to 2",
-                                        "volume move %s 1 --log --from 1 --to 2 --cancel", "replica reset %s 1 1"};
+    /* the stubs decode the body and say it back: the CLI's encoding against the server's decoder, field by field */
+    static const char *const verbs[][2] = {
+        {"volume transfer %s 3 5", "not built yet (transfer of volume 3 to node 5)"},
+        {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
+        {"volume move %s 3 --log --from 6 --to 5 --cancel",
+         "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
+        {"replica reset %s 4 6", "not built yet (reset of volume 4 on node 6)"}};
     for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
         char v[256];
-        snprintf(v, sizeof v, verbs[k], p0);
+        snprintf(v, sizeof v, verbs[k][0], p0);
         snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
         int rc = cli_run(args, NULL, out, sizeof out);
-        if (rc != 1 || !strstr(out, "not built"))
-            die("tsdb cluster %s: exit %d, not \"not built\": %s", v, rc, out);
+        if (rc != 1 || !strstr(out, verbs[k][1]))
+            die("tsdb cluster %s: exit %d, not \"%s\": %s", v, rc, verbs[k][1], out);
         printf("  %s: %s", v, out);
+    }
+    /* the bodies past the CLI: one of another length is refused by the decoders (the stubs say its length) */
+    uint8_t body[16] = {0};
+    static const uint8_t ops[3] = {CLUSTER_OP_VOLUME_TRANSFER, CLUSTER_OP_VOLUME_MOVE, CLUSTER_OP_REPLICA_RESET};
+    for (int k = 0; k < 3; k++) {
+        reply = NULL, len = 0;
+        arc = admin(0, ops[k], body, 12, 0, &reply, &len);
+        if (arc != META_ERR_INVALID || !reply || len < 21 || memcmp(reply, "not built yet (a body of 12 bytes)", 21))
+            die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
+        free(reply);
     }
     /* the CLI's own checks of a move: --log, --from and --to are required, and two different nodes */
     static const char *const badmove[] = {"1 --from 1 --to 2", "1 --log --from 1", "1 --log --from 2 --to 2",
@@ -11989,6 +12006,65 @@ static void scen_r4stubs(void)
         if (rc != 2)
             die("tsdb cluster volume move %s: exit %d, not 2: %s", badmove[k], rc, out);
     }
+}
+
+/* volcmd (r4-iface): the plumbing R4's tracks build on, before any of them sends. The Raft leader (server 0, hook
+ * TSDB_CLUSTER_TEST volcmd_file=1) sends each VOLCMD kind to server 1 (the F_VOLCMD frame) and to itself (the
+ * self-delivery of cl_volcmd_send); each server's driver routes it (IN_CMD: TRANSFER and CANCEL to rtransfer.c,
+ * DROP_MEMBER to rset.c), whose stubs say every field and the sender. And each driver dials the other's snapshot kind
+ * (TSDB_REPLD_TEST=snapdial): tsdbd's acceptor hands kind 5 to the driver, whose on_frame passes it to rsnap.c. */
+static void scen_volcmd(void)
+{
+    scenario("volcmd");
+    for (int i = 0; i < 2; i++) {
+        penv[i] = "TSDB_REPLD_TEST=snapdial";
+        envs[i] = "volcmd_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1); /* a member (a group of two keeps one voter): the volume's replicas need only that */
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "cmdv", 2, &num)) != 0)
+        die("volume add cmdv: %s", cluster_strerror(rc));
+    for (int i = 0; i < 2; i++)
+        await_open_gen(0, "cmdv", i, 1, 0);
+    /* R4's admin ops on a follower: NOTLEADER (with the leader's peer address), never handed to the stubs */
+    uint8_t body[8], *reply = NULL;
+    size_t blen = cluster_volume_force_encode(num, ids[1], body), rlen = 0;
+    if ((rc = admin(1, CLUSTER_OP_VOLUME_TRANSFER, body, blen, 0, &reply, &rlen)) != CLUSTER_ERR_NOTLEADER)
+        die("a VOLUME_TRANSFER to a follower: %s, not NOTLEADER", cluster_strerror(rc));
+    free(reply);
+    for (int i = 0; i < 2; i++)
+        await_log_count(i, "a snapshot link (kind 5) sent something", 1, 20000);
+    printf("  each driver's kind-5 link reached the other's rsnap_frame\n");
+    char path[PATH_MAX + 64];
+    server_dir(0, path, sizeof path);
+    strcat(path, "/state/volcmd.tmp");
+    FILE *f = fopen(path, "w");
+    if (!f)
+        die("%s: %s", path, strerror(errno));
+    for (int i = 0; i < 2; i++) /* TO KIND VOLUME EPOCH NODE ARG */
+        for (int k = 1; k <= 3; k++)
+            fprintf(f, "%u %d %" PRIu32 " %d %d %d\n", ids[i], k, num, 100 * (i + 1) + k, 7 + k, 4000 + 10 * i + k);
+    if (fclose(f) != 0)
+        die("%s: %s", path, strerror(errno));
+    char to[PATH_MAX + 64];
+    snprintf(to, sizeof to, "%.*s", (int)(strlen(path) - 4), path);
+    if (rename(path, to) != 0)
+        die("rename %s: %s", path, strerror(errno));
+    static const char *const what[4] = {NULL, "TRANSFER to node", "DROP_MEMBER of node", "CANCEL to node"};
+    for (int i = 0; i < 2; i++)
+        for (int k = 1; k <= 3; k++) {
+            char line[256];
+            snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num, what[k],
+                     7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
+            await_log_count(i, line, 1, 20000);
+        }
+    if (access(to, F_OK) == 0)
+        die("the leader kept %s after sending every command", to);
+    printf("  every VOLCMD kind reached the member's and the leader's own driver with its fields\n");
+    stop_all();
 }
 
 int main(int argc, char **argv)
@@ -12028,7 +12104,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

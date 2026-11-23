@@ -325,7 +325,7 @@ $(B)/test_cvol: tests/test_cvol.c src/cvol.h src/replica.h src/internal.h $(LIB)
 
 # the disk side of tsdbd's volume manager (server/cvolfs.c): make v<N>, REPL's open generation and nonce; power loss
 # at every step (crashfs); the mutant runs plant the bugs it guards against and must fail
-$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/snapinst.c server/snapinst.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
+$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/cluster.h server/snapinst.c server/snapinst.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ tests/test_cvolfs.c server/cvolfs.c server/cvolset.c server/snapinst.c $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner

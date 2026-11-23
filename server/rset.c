@@ -24,10 +24,10 @@ int rset_msg_ok(struct rvol *rv, const struct repl_msg *m)
 
 void rset_stamp(struct rvol *rv, struct repl_msg *m) { (void)rv, (void)m; }
 
-void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c)
+void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 {
     if (!rv->said_cmd_drop)
-        say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " at epoch %" PRIu64 ": replica set changes are not"
-            " built yet; ignored", rv->number, c->node, c->epoch);
+        say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " at epoch %" PRIu64 " (arg %" PRIu64 ") from node %"
+            PRIu32 ": replica set changes are not built yet; ignored", rv->number, c->node, c->epoch, c->arg, from);
     rv->said_cmd_drop = 1;
 }

@@ -20,7 +20,9 @@
  *   ./build/test_cvolfs --child DIR ACKFILE      (internal: a process the shim kills)
  */
 #define _GNU_SOURCE
+#include "cluster.h"
 #include "cvolfs.h"
+#include "cvolset.h"
 #include "internal.h"
 #include "replfile.h"
 
@@ -646,6 +648,25 @@ static void set_mutant(const char *m)
     setenv("TSDB_CVOLFS_MUTANT", m, 1); /* the processes the shim kills run the same bug */
 }
 
+/* unnamed (review r4-iface F2): the volume manager reports a volume as no longer named (CVS_UNNAMED, behind which
+ * r4-setchg sets a directory aside) only from a push that shows it: a push the cluster thread cut at CLUSTER_REPORT_VOLS
+ * (the lowest numbers) says nothing of the numbers past its last record */
+static void test_unnamed(void)
+{
+    static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
+    for (uint32_t i = 0; i < CLUSTER_REPORT_VOLS; i++)
+        recs[i].number = 2 * (i + 1); /* 2, 4, ..., 512 */
+    const uint32_t full = CLUSTER_REPORT_VOLS, last = 2 * CLUSTER_REPORT_VOLS;
+    CHECK(!cvolset_unnamed(recs, full, 4));        /* named */
+    CHECK(cvolset_unnamed(recs, full, 3));         /* below the last of a full push: absent means not named */
+    CHECK(!cvolset_unnamed(recs, full, last + 1)); /* past the last of a full push: perhaps cut, never "unnamed" */
+    CHECK(!cvolset_unnamed(recs, full, 900));
+    CHECK(cvolset_unnamed(recs, 10, 900));         /* a push below the limit is whole */
+    CHECK(cvolset_unnamed(recs, 0, 1));            /* an empty push names nothing */
+    CHECK(!cvolset_unnamed(recs, 10, 20));
+    printf("  unnamed: a cut push says nothing past its last record\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 4 && strcmp(argv[1], "--child") == 0) {
@@ -678,6 +699,7 @@ int main(int argc, char **argv)
         test_basic();
         test_refusals();
         test_unsure();
+        test_unnamed();
     } else if (cvolfs_test_mutant == CVOLFS_MUT_SAMERID) {
         test_basic();
         test_refusals();

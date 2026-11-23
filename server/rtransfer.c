@@ -13,12 +13,14 @@ int rtr_admit_ok(struct rvol *rv)
     return 1;
 }
 
-void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c)
+void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 {
-    if (!rv->said_cmd_tr)
-        say("volume %" PRIu32 ": %s to node %" PRIu32 " at epoch %" PRIu64 ": leader transfer is not built yet; ignored",
-            rv->number, c->kind == CL_VOLCMD_CANCEL ? "CANCEL" : "TRANSFER", c->node, c->epoch);
-    rv->said_cmd_tr = 1;
+    int bit = 1 << (c->kind & 7); /* TRANSFER and CANCEL each said once (test_cluster volcmd checks both) */
+    if (!(rv->said_cmd_tr & bit))
+        say("volume %" PRIu32 ": %s to node %" PRIu32 " at epoch %" PRIu64 " (arg %" PRIu64 ") from node %" PRIu32
+            ": leader transfer is not built yet; ignored",
+            rv->number, c->kind == CL_VOLCMD_CANCEL ? "CANCEL" : "TRANSFER", c->node, c->epoch, c->arg, from);
+    rv->said_cmd_tr |= bit;
 }
 
 void rtr_tick(struct rvol *rv) { (void)rv; }
