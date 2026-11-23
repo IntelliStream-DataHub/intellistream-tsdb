@@ -22,7 +22,8 @@ cp -r "$tmp" "$tmp.div" || exit 2
 sed -i 's|^    int ms = (int)(now - start);$|&\n    if (write \&\& d->state == TSDB_DOM_DOWN \&\& down_need_ms(d, now) > h->o.recover_ms) ms = h->o.fast_ms + 1; /* MUTANT */|' \
     "$tmp/src/health.c"
 if ! grep -q 'MUTANT' "$tmp/src/health.c"; then echo "mutant-slowprobe: the mutant did not apply"; rm -rf "$tmp" "$tmp.div"; exit 1; fi
-sed -i 's|^    bool diverged = v < DOM_MAX_VOLS \&\& atomic_load(\&dom.vol\[v\].diverged);$|&\n    if (di.state == TSDB_DOM_DOWN) atomic_store(\&jv_div, true); diverged = diverged \|\| atomic_load(\&jv_div); /* MUTANT */|' \
+# vol_health asks vol_diverged first (r8i): the mutant latches jv_div once the volume's domain is DOWN and answers DIVERGED from then on
+sed -i 's|^    if (vol_diverged(v, NULL)) { /\* first: .*$|    { int md = dom_of(v); tsdb_domain_info mi; if (md >= 0 \&\& dom.health \&\& tsdb_health_info(dom.health, md, \&mi) == 0 \&\& mi.state == TSDB_DOM_DOWN) atomic_store(\&jv_div, true); } if (vol_diverged(v, NULL) \|\| atomic_load(\&jv_div)) { /* MUTANT */|' \
     "$tmp.div/server/tsdbd.c"
 sed -i '0,/^#include <fcntl.h>$/s//#include <fcntl.h>\
 static _Atomic _Bool jv_div; \/* MUTANT: the first DOWN of a domain makes every volume DIVERGED for good, and every insert UNAVAILABLE *\//' "$tmp.div/server/tsdbd.c"
