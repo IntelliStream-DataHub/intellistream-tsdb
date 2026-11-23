@@ -49,8 +49,9 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 5         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
-                                 * HB and HB_ACK (r3e-leases) */
+#define PL_CL_VERSION 6         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+                                 * HB and HB_ACK (r3e-leases), 6 the replication messages' set version and replay
+                                 * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard */
 
 /* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
  * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a

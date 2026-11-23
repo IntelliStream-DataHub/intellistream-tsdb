@@ -55,6 +55,8 @@
 #define REPL_E_STALE     (-4)     /* metadata: the request names an epoch or ISR version that is no longer current */
 #define REPL_E_NONE      (-5)     /* metadata: no fence reply from an in-sync replica, nobody to promote */
 #define REPL_MOVED       (-6)     /* REPLY: the leader stepped down; the write may or may not be committed */
+#define REPL_E_INVALID   (-7)     /* repl_reconfig, repl_leave: a change the core refuses (see there) */
+#define REPL_E_PENDING   (-8)     /* repl_reconfig: actions are still queued (drain repl_next_action first) */
 
 struct repl_rec {                 /* a record descriptor; its bytes are the driver's */
     uint64_t pos;                 /* first position */
@@ -101,6 +103,10 @@ enum repl_msg_type {
 struct repl_msg {
     int type;
     int from, to;                 /* node indexes, or REPL_META */
+    uint64_t set_version;         /* the replica set version the indexes are in (repl_set_version; send() stamps it):
+                                     a receiver drops a peer message or a META of another version (FENCE has no
+                                     indexes and is taken from any); the metadata group drops an ISR_REQ, FENCE_REPLY
+                                     or RESIGN of another version than its record's */
     uint64_t epoch;               /* the sender's epoch (the fence epoch for FENCE and FENCE_REPLY) */
     int leader;                   /* REFUSE: the leader of `epoch` if known, else -1 */
     /* APPEND */
@@ -110,7 +116,10 @@ struct repl_msg {
     /* ACK, FENCE_REPLY, QUERY, ANSWER */
     uint64_t durable, written, rid, last_epoch, end;
     uint64_t start;               /* ACK, FENCE_REPLY: the first position the sender's log still holds (repl_log_start;
-                                     1: all of it): it may replay any position from there (the replay floor) */
+                                     1: all of it) */
+    uint64_t replay;              /* ACK: the first position the sender may replay after a restart (repl_replay_start,
+                                     never below `start`), the replay floor's input; 0: its log is empty, nothing to
+                                     replay (the leader bounds it by what it sends it, and by its own log start) */
     int resync;                   /* ACK: the leader should send from written + 1 */
     struct repl_vmeta meta;       /* META, ISR_REQ */
 };
@@ -125,8 +134,10 @@ enum repl_action_type {
     REPL_A_REPLY,                 /* answer the writer of positions first .. pos with status */
     REPL_A_FAIL,                  /* the core refuses to go on (reason); treat as fail-stop */
     REPL_A_SNAPSHOT,              /* the leader (`pos`: its node index) no longer has the records this replica needs:
-                                     copy its applied state P (parts) and reopen with log_start P + 1, log_end and
-                                     floor P; until then the replica goes on as it is */
+                                     copy its state at a cut P (parts, and the segments from S, the first one not
+                                     wholly in parts, S <= P + 1) and reopen with log_start S, log_end and floor P;
+                                     until then the replica goes on as it is. Install only while
+                                     repl_snapshot_wanted(P) says so (asked just before the core is closed) */
 };
 
 enum repl_src {
@@ -214,11 +225,58 @@ int repl_next_action(struct repl *r, struct repl_action *a);
 /* The driver removed the log's positions below `start` (its segments went into parts and their removal is durable:
  * a power loss cannot bring them back). Never lower; reported in every ACK and FENCE_REPLY from now on. */
 void repl_log_start(struct repl *r, uint64_t start);
-/* Leader: the lowest position any replica of the volume may still replay (its log start, from its ACKs in this
+/* The first position this replica may replay after a restart (D17: the first position of a segment not wholly in
+ * parts, from a durably saved RSTATE `kept`). Never lowered, never below the log start (a lower value is taken as the
+ * log start). A driver that never calls it replays from its log start. Reported in every ACK as `replay`. */
+void repl_replay_start(struct repl *r, uint64_t s);
+/* Leader: the lowest position any replica of the volume may still replay (its replay start, from its ACKs in this
  * epoch, and the leader's own), the replay floor of design-cluster.md 5.4; 0 (unknown) while a member has not
- * acknowledged in this epoch, or on a node that is not leading. Rows at positions below it can never come back on
- * any replica: a partition-class switch takes its T past every row at or above it (classes.c). */
+ * acknowledged in this epoch, or on a node that is not leading. A member with an empty log counts with the lowest
+ * position this leader sent it in this epoch and its own log start (everything it can get comes from there); one told
+ * to install a snapshot with this leader's replay start at that notice (a snapshot's segments start no lower) until its
+ * ACKs show a retained next position. Rows at positions below it can never come back on any replica: a
+ * partition-class switch takes its T past every row at or above it (classes.c). */
 uint64_t repl_replay_floor(const struct repl *r);
+
+/* Replica set changes (D8). The driver calls repl_reconfig when the metadata record's set version changes, then
+ * repl_set_version, then hands over the record (META) in the new indexes. old_of[i] is the old index of new member i,
+ * -1 for a new member (a never-heard learner); members not named are removed: their state goes, and they no longer
+ * count in the commit point, the join hold, the replay floor or the unanswered set. Peer state, the ISR and rid[] of
+ * the record, a pending ISR request and the leave mark move with their members. REPL_E_INVALID: a bad map, this
+ * replica not kept (a removed replica's core is closed instead), or, on a leader, a removed member that its record
+ * has in the ISR with no pending request of its own that drops it (the metadata group never removes an ISR member, so
+ * that leader is deposed: the driver reopens the core). A leader that accepts a change removing a member of its
+ * record's ISR (its shrink was applied, the record not yet adopted) moves no commit point and asks for no ISR change
+ * until it has adopted a record of the new set version: a deposed leader with a pending shrink would otherwise count
+ * without a member the next epoch fenced. A follower whose leader was removed forgets it (waits for a later epoch).
+ * REPL_E_PENDING, with nothing changed: actions are still queued. They name members by the old indexes (a SEND's
+ * `to`, a SNAPSHOT's `pos`) and carry the old set version, so the driver carries them out through the old record
+ * (repl_next_action until it returns 0) and then calls again; it is not a reason to reopen the core.
+ * The driver's contract: every META it hands over is in the core's set version (reconfig first on a newer one, never
+ * an older copy); the core drops one of another version and counts it in repl_dropped_meta, which a driver logs. */
+int repl_reconfig(struct repl *r, int nnodes, int self, const int *old_of);
+void repl_set_version(struct repl *r, uint64_t v);
+uint64_t repl_get_set_version(const struct repl *r);
+/* Messages dropped because they came in another set version; of them, records (META), which only a driver that broke
+ * the contract above hands over. */
+uint64_t repl_dropped(const struct repl *r);
+uint64_t repl_dropped_meta(const struct repl *r);
+
+/* A move's shrink (D11): on the leader, member idx is leaving: never asked for in the ISR again (no join hold
+ * either), and the core asks for the ISR without it, through its ISR requests, while the ISR without it still has at
+ * least min_isr members (re-checked at every tick: whenever the ISR or the basis changes; retried like any request).
+ * repl_leave(r, -1, 0) cancels. Cleared by losing the lead and by a set change that removes the member. REPL_OK,
+ * REPL_E_NOTLEADER, or REPL_E_INVALID (idx is this leader or no member). */
+int repl_leave(struct repl *r, int idx, uint32_t min_isr);
+int repl_leaving(const struct repl *r);            /* the leaving member's index, or -1 */
+/* Why the core asked for its current (or last) ISR change: */
+enum { REPL_WHY_NONE = 0, REPL_WHY_DROP, REPL_WHY_JOIN, REPL_WHY_LEAVE };
+int repl_isr_why(const struct repl *r);
+/* 1 if a snapshot at cut P may be installed now: this replica asked for one (REPL_A_SNAPSHOT) in its current epoch,
+ * was not told since to go on from the log instead (a new leader or epoch, the leader's resync, a set change that
+ * removed its leader), and P is above its log end (a snapshot replaces the whole log). APPENDs written meanwhile do
+ * not clear it: committed state at a cut P above everything written is safe to install. */
+int repl_snapshot_wanted(const struct repl *r, uint64_t p);
 
 /* Introspection, for drivers and checkers. */
 int repl_is_leader(const struct repl *r);
@@ -248,6 +306,11 @@ struct repl_fence_reply {
 int repl_meta_isr_change(struct repl_vmeta *m, const struct repl_vmeta *req);
 int repl_meta_promote(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis_version, uint32_t fenced,
                       const struct repl_fence_reply *r, int n);
+/* A planned promotion (D14): as repl_meta_promote, but with target >= 0 the new leader is the target, and only if its
+ * reply comes from a fenced ISR member with the record's rid and durable >= min_end; else REPL_E_NONE (nothing
+ * changes). The other replies count as answered as usual. target -1 is repl_meta_promote. */
+int repl_meta_promote_to(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis_version, uint32_t fenced,
+                         const struct repl_fence_reply *r, int n, int target, uint64_t min_end);
 
 #ifdef REPL_MUTANTS
 /* tests/sim_repl.c's mutation runs: bit n plants bug n of repl.c (MUT(n)); 0: none. */

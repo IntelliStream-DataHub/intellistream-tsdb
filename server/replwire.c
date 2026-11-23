@@ -120,9 +120,9 @@ size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct rep
     w32(&w, (uint32_t)m->from);
     w32(&w, (uint32_t)m->to);
     w32(&w, (uint32_t)m->leader);
-    const uint64_t f[10] = {m->epoch, m->prev_pos, m->prev_epoch, m->commit, m->durable,
-                            m->written, m->rid, m->last_epoch, m->end, m->start};
-    for (int i = 0; i < 10; i++)
+    const uint64_t f[12] = {m->epoch, m->prev_pos, m->prev_epoch, m->commit, m->durable,     m->written,
+                            m->rid,   m->last_epoch, m->end,   m->start,  m->set_version, m->replay};
+    for (int i = 0; i < 12; i++)
         w64(&w, f[i]);
     w64(&w, m->meta.epoch);
     w64(&w, m->meta.isr_version);
@@ -159,9 +159,9 @@ int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_re
     m->from = (int32_t)r32(&r);
     m->to = (int32_t)r32(&r);
     m->leader = (int32_t)r32(&r);
-    uint64_t *f[10] = {&m->epoch, &m->prev_pos, &m->prev_epoch, &m->commit, &m->durable,
-                       &m->written, &m->rid, &m->last_epoch, &m->end, &m->start};
-    for (int i = 0; i < 10; i++)
+    uint64_t *f[12] = {&m->epoch, &m->prev_pos, &m->prev_epoch, &m->commit, &m->durable,     &m->written,
+                       &m->rid,   &m->last_epoch, &m->end,   &m->start,  &m->set_version, &m->replay};
+    for (int i = 0; i < 12; i++)
         *f[i] = r64(&r);
     m->meta.epoch = r64(&r);
     m->meta.isr_version = r64(&r);
