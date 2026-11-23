@@ -459,7 +459,7 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
         if (renamed) {
             for (size_t i = 0; i < nown; i++) {
                 part_ref(own[i]);
-                own[i]->dropped = true; /* a merge of it in flight drops its output */
+                own[i]->dropped = ecapply_mutant != ECAPPLY_MUT_MERGEKEPT; /* a merge of it in flight drops its output */
                 db_parts_remove_locked(db, own[i]);
             }
             for (size_t i = 0; i < n; i++) {
@@ -528,7 +528,7 @@ int ecapply_mutant;
 int ecapply_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "ycold", "ecabovey", "pposignored", "v5nodirsync", "coldnoflushthrough",
-                                        "leaderswapnors", "pposafterswap"};
+                                        "leaderswapnors", "pposafterswap", "mergekept"};
     for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
         if (strcmp(name, names[i]) == 0)
             return i;

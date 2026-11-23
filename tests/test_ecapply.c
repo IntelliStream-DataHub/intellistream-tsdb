@@ -11,7 +11,8 @@
  * unchanged, an overwrite in Y still winning; rows of another day written at the cut and after the marker, in the
  * marker's segment, survive a crash after the apply: the replay); above (a part of P with ppos above Z: TSDB_ERR_CORRUPT,
  * nothing renamed, DIVERGED, still after a restart); dropped (P dropped by the replica between the staging and the
- * intent: nothing listed, nothing retired); leader (a leader killed after its swap, or after the swap's intent and
+ * intent: nothing listed, nothing retired); merging (a merge of the replica's own parts of P held across the apply: its
+ * output retired, never listed); leader (a leader killed after its swap, or after the swap's intent and
  * before its renames, reopened as a replica: the COLD replayed is not applied again, every oid listed once, the .ec's
  * PPOS record there; or two COLDs and a clean close: the first's `done` is not lost under the second's `doing`); badft
  * (a COLD whose F is not below its own segment, through the seam ecapply_test_ft: TSDB_ERR_CORRUPT, nothing listed);
@@ -20,7 +21,7 @@
  * apply: the old parts or the new set, then the apply ends with the new set).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
- * pposafterswap;
+ * pposafterswap mergekept;
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -908,6 +909,96 @@ static void test_dropped(void)
     printf("  dropped: P dropped by the replica before the intent: nothing listed, nothing retired\n");
 }
 
+/* ------------------------------------------------------------ merging: a merge of P in flight across the apply */
+
+/* The replica's own merge of P's parts (eng_optimize_keys, as a purge runs it) is held once its output is written and
+ * named, from the staging until the apply has retired its inputs: the apply marks them dropped, so the merge's commit
+ * retires its output (merge_commit_locked's dropped branch) instead of listing rows of P beside the .ec part. */
+static _Atomic int MH; /* 0 off, 1 armed, 2 held, 3 released */
+static _Atomic int MG_RC;
+static pthread_t MG_T;
+static bool MG_ON;
+static void mg_merge_hook(int at)
+{
+    int armed = 1;
+    if (at != 1 || !atomic_compare_exchange_strong(&MH, &armed, 2))
+        return;
+    while (atomic_load(&MH) == 2)
+        msleep(1);
+}
+static void *mg_thread(void *arg)
+{
+    int64_t key = KEY;
+    atomic_store(&MG_RC, eng_optimize_keys(arg, &key, 1));
+    return NULL;
+}
+static void merging_hook(eng *db, int step)
+{
+    if (step != ECAPPLY_STEP_STAGED || MG_ON)
+        return;
+    part *ps[8];
+    size_t n = parts_of(db, KEY, ps, 8, false);
+    CHECK(n >= 2); /* I and the replica's own flush of the cut's rows: a merge to make */
+    unref_all(ps, n);
+    atomic_store(&MG_RC, 1);
+    atomic_store(&MH, 1);
+    if (pthread_create(&MG_T, NULL, mg_thread, db) != 0) {
+        atomic_store(&MH, 0);
+        CHECK(0);
+        return;
+    }
+    MG_ON = true;
+    for (int i = 0; i < 10000 && atomic_load(&MH) != 2 && atomic_load(&MG_RC) == 1; i++)
+        msleep(1);
+    CHECK(atomic_load(&MH) == 2);
+}
+static void test_merging(void)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("merging", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload(&L, &c, false);
+    uint64_t last = LAST;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    MG_ON = false;
+    atomic_store(&merge_hook, mg_merge_hook);
+    atomic_store(&ecapply_test_hook, merging_hook);
+    int rc = feed(&R, last);
+    atomic_store(&ecapply_test_hook, NULL);
+    CHECK(rc == 0);
+    atomic_store(&MH, 3);
+    if (MG_ON)
+        pthread_join(MG_T, NULL);
+    atomic_store(&merge_hook, NULL);
+    CHECK(MG_ON && atomic_load(&MG_RC) == 0);
+    if (atomic_load(&MG_RC) != 0)
+        fprintf(stderr, "merging: the merge: %d\n", atomic_load(&MG_RC));
+    CHECK(replica_applied_end(R.db) == last);
+    check_listed(R.db, "merging");
+    CHECK(p_holds(R.db) && d1_holds(R.db, false));
+    CHECK(settled_of_key(R.dir) >= 2);
+    CHECK(eng_check(R.db) == 0);
+    rstop(&R);
+    if (ropen(&L, &R, last) == 0) {
+        check_listed(R.db, "merging after a close");
+        CHECK(p_holds(R.db) && d1_holds(R.db, false));
+        rstop(&R);
+    } else {
+        CHECK(0);
+    }
+    lclose(&L);
+    printf("  merging: a merge of P's own parts in flight across the apply: its output retired, never listed\n");
+}
+
 /* ------------------------------------------------------------ leader: its own COLD replayed after a crash */
 
 static void swap_exit(eng *db) { (void)db, _exit(99); }
@@ -1336,7 +1427,8 @@ int main(int argc, char **argv)
     struct {
         const char *name;
         void (*fn)(void);
-    } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"leader", test_leader},
+    } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"merging", test_merging},
+                 {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))

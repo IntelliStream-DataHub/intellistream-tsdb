@@ -49,6 +49,7 @@ enum {
     ECAPPLY_MUT_COLDNOFLUSHTHROUGH, /* coldnoflushthrough: the active memtable flushed at the marker too */
     ECAPPLY_MUT_LEADERSWAPNORS,     /* leaderswapnors: a leader's swap writes no RSTATE `doing`/`done` */
     ECAPPLY_MUT_PPOSAFTERSWAP,      /* pposafterswap: a leader's swap records its .ec parts' PPOS after its renames */
+    ECAPPLY_MUT_MERGEKEPT,          /* mergekept: a retired own part is not marked dropped (a merge in flight lists) */
 };
 extern int ecapply_mutant;
 /* Crash points of a replica's apply (tsdbd's server/crashpt.h installs the hook: cold-before-apply, cold-mid-intent):
