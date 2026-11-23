@@ -10,6 +10,8 @@
  *
  * STUB (r8a1-mk): filled by r8h-apply. Until then a MK_COLD is acknowledged and changes nothing, as the reserved type
  * was skipped before; the decision answers TSDB_ERR_INVALID ("not built yet": no swap record can name one yet).
+ * ecapply_swap_pre already writes the .ec parts' PPOS records (src/ppos.h), which r8h keeps: a leader's settle of an
+ * ec cluster volume needs them at its next open.
  *
  * Builds with and without TSDB_EC (the embedded crates copy every .c file of src/).
  */

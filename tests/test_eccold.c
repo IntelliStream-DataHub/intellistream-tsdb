@@ -15,8 +15,13 @@
  * deletes and small writes during a settle all stay visible; the policy's cluster branch (whole keys after the grace,
  * never level 0, never a key about to expire, never on a diverged engine).
  *
+ * swappower: crashfs power loss at every step of a settle, a drop of its .ec part and an open that compacts PPOS: the
+ * leader reopens with a PPOS record for every listed part, the .ec included (src/ppos.h; the swap's records, written
+ * by ecapply_swap_pre before its intent).
+ *
  * Planted bugs (--mutant NAME, eccold.h): cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced;
- * the Makefile requires each to fail this test. An alarm ends a hung run with status 3 (a hang must not survive).
+ * ppos.h's pposswapnone (the swap records nothing for its .ec parts) and pposswapafter (only after its renames: only
+ * a power loss sees it); the Makefile requires each to fail this test. An alarm ends a hung run with status 3 (a hang must not survive).
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -32,6 +37,7 @@
 #include "marker.h"
 #include "ecswap.h"
 #include "replica.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -627,15 +633,22 @@ static void test_cut(void)
     tier_put(L.t);
     L.db = NULL;
     L.t = NULL;
-    CHECK(lopen(&L) == 0);
-    if (L.db) {
-        n = parts_of(L.db, KEY, ec, 4, true);
-        CHECK(n == 1);
-        if (n == 1)
-            CHECK(atomic_load(&ec[0]->ec)->rec.ppos == c.z);
-        unref_all(ec, n);
-        CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
+    int rc = lopen(&L);
+    CHECK(rc == 0);
+    if (rc) { /* nothing below may run on a leader that did not open */
+        fprintf(stderr, "cut: the leader did not reopen after the settle (%d)\n", rc);
+        lclose(&L);
+        return;
     }
+    n = parts_of(L.db, KEY, ec, 4, true);
+    CHECK(n == 1);
+    if (n == 1) {
+        CHECK(atomic_load(&ec[0]->ec)->rec.ppos == c.z);
+        uint64_t pp = 0; /* the .ec's PPOS record (src/ppos.h), written by the swap before its intent */
+        CHECK(ppos_of(L.db, ec[0]->name, &pp) == 0 && pp == c.z);
+    }
+    unref_all(ec, n);
+    CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
     check_marker(&L, &c, true);
     lclose(&L);
     printf("  cut: L <= Z, F, the marker at its position, the .ec record's ppos Z and stripe version; a reopen\n");
@@ -1255,6 +1268,160 @@ static void test_crash(void)
     printf("  crash: killed after the append and after the commit: the leader reopens with the rows unchanged\n");
 }
 
+/* swappower: crashfs power loss at every step of a leader's settle of P (the swap's PPOS records, intent v4, renames),
+ * of a drop of P's .ec part (retired_ names) and of the open that then compacts PPOS (the records of the dropped names
+ * are dead, the one of a part of another day lives). The next open as leader must succeed: every listed part, the .ec
+ * one included, has its PPOS record (src/ppos.h); P's rows are all there or, once a drop began, all gone. Mutant
+ * pposswapafter (the .ec records after the renames) and the merged bug pposswapnone must fail it. */
+static char SHIM[PATH_MAX];
+/* S/ack.<root's last name>.what: no name crashfs takes as under CRASHFS_ROOT (a prefix match: never root.what) */
+static void ack_path(char *p, size_t cap, const char *root, const char *what)
+{
+    const char *b = strrchr(root, '/');
+    snprintf(p, cap, "%s/ack.%s.%s", S, b ? b + 1 : root, what);
+}
+static void power_ack(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0)
+        close(fd);
+}
+static bool power_acked(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    return access(p, F_OK) == 0;
+}
+static void power_unack(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    unlink(p);
+}
+/* the child under crashfs (the acks lie outside its root, so they are what the child saw acknowledged) */
+static int power_child(const char *root)
+{
+    lt L;
+    lt_paths(&L, root);
+    if (lopen(&L) != 0)
+        _exit(2);
+    if (settle_key(L.db, KEY) != 0)
+        _exit(5);
+    power_ack(root, "settled");
+    if (eng_drop_before(L.db, DAY0 + DAY_MS) != 0)
+        _exit(6);
+    power_ack(root, "dropped");
+    if (eng_close(L.db) != 0)
+        _exit(7);
+    tier_put(L.t);
+    L.db = NULL, L.t = NULL;
+    if (lopen(&L) != 0) /* PPOS compacts: three records of four are dead */
+        _exit(8);
+    if (eng_close(L.db) != 0)
+        _exit(7);
+    tier_put(L.t);
+    _exit(0);
+}
+static int power_run(const char *root, int warmup)
+{
+    fflush(NULL);
+    char *argv[] = {"test_eccold", S, "--power-child", (char *)root, NULL};
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512], w[16], sd[16];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%d", warmup + 1);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", root, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = getenv("TEST_ECCOLD_POWER_LOG") ? -1 : open("/dev/null", O_WRONLY);
+        if (null >= 0)
+            dup2(null, 2);
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+    int ws = 0;
+    if (pid < 0 || waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws))
+        return -1;
+    return WEXITSTATUS(ws);
+}
+static void test_swappower(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  swappower: skipped (no %s)\n", SHIM);
+        return;
+    }
+    int crashes = 0, settled = 0, dropped = 0, f0 = failures;
+    bool finished = false;
+    int k0 = getenv("TEST_ECCOLD_POWER_K") ? atoi(getenv("TEST_ECCOLD_POWER_K")) : 0; /* to look at one step */
+    for (int k = k0; k < 4000 && !finished && failures == f0; k++) {
+        alarm(240); /* per step: a hang still ends the run */
+        lt L;
+        if (!start("swappower", &L))
+            return;
+        make_i(&L);
+        CHECK(rows(L.db, L.s[1], 2, 0, 500, 3.0f) == 0); /* a part of another day: its record outlives the compaction */
+        CHECK(eng_close(L.db) == 0);
+        tier_put(L.t);
+        L.db = NULL, L.t = NULL;
+        power_unack(L.root, "settled");
+        power_unack(L.root, "dropped");
+        int code = power_run(L.root, k);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0) {
+            fprintf(stderr, "swappower: the child at step %d exited %d\n", k, code);
+            lclose(&L);
+            return;
+        }
+        crashes += code == 99;
+        finished = code == 0;
+        bool st = power_acked(L.root, "settled"), dr = power_acked(L.root, "dropped");
+        settled += st, dropped += dr;
+        power_unack(L.root, "settled");
+        power_unack(L.root, "dropped");
+        int rc = lopen(&L);
+        CHECK(rc == 0);
+        if (rc) {
+            fprintf(stderr, "swappower: after a power loss at step %d the leader does not open (%d)%s%s\n", k, rc,
+                    st ? ", settled" : "", dr ? ", dropped" : "");
+            lclose(&L);
+            return;
+        }
+        CHECK(eng_check(L.db) == 0);
+        CHECK(holds(L.db, L.s[1], 2, 0, 500, 3.0f));
+        qctx *q = query(L.db, L.s[0], 0);
+        CHECK(q->n == (dr ? 0 : 500) || (st && q->n == 0)); /* a drop is all or nothing */
+        if (!(q->n == (dr ? 0 : 500) || (st && q->n == 0)))
+            fprintf(stderr, "swappower: step %d: %zu rows of P%s%s\n", k, q->n, st ? ", settled" : "",
+                    dr ? ", dropped" : "");
+        if (q->n == 500)
+            CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
+        free(q);
+        pthread_mutex_lock(&L.db->lock);
+        for (size_t i = 0; i < L.db->nparts; i++) {
+            uint64_t pp = 0;
+            CHECK(ppos_of(L.db, L.db->parts[i]->name, &pp) == 0); /* the open checked it; so does this */
+            struct ecpart *e = atomic_load(&L.db->parts[i]->ec);
+            if (e)
+                CHECK(pp == e->rec.ppos);
+        }
+        pthread_mutex_unlock(&L.db->lock);
+        lclose(&L);
+    }
+    CHECK(finished && crashes >= 50 && settled > 0 && dropped > 0);
+    printf("  swappower: power lost at each of %d steps of a settle, a drop of its .ec and a compacting open (%d after "
+           "the settle, %d after the drop): the leader reopens, every listed part with its PPOS record\n",
+           crashes, settled, dropped);
+}
+
 /* a drop of P between the put and the gate: STOPPED, nothing listed, the objects to r7-gc */
 static void drop_hook(eng *db, int step)
 {
@@ -1371,7 +1538,7 @@ static void alarm_exit(int sig)
 
 int main(int argc, char **argv)
 {
-    const char *only = NULL, *crash_root = NULL;
+    const char *only = NULL, *crash_root = NULL, *power_root = NULL;
     int crash_at = -1;
     snprintf(S, sizeof S, "/tmp");
     for (int i = 1; i < argc; i++) {
@@ -1379,12 +1546,20 @@ int main(int argc, char **argv)
             mutant = argv[++i];
         else if (!strcmp(argv[i], "--crash-child") && i + 2 < argc)
             crash_at = atoi(argv[++i]), crash_root = argv[++i];
+        else if (!strcmp(argv[i], "--power-child") && i + 1 < argc)
+            power_root = argv[++i];
         else if (!strcmp(argv[i], "--case") && i + 1 < argc)
             only = argv[++i];
         else
             snprintf(S, sizeof S, "%s", argv[i]);
     }
-    if (strcmp(mutant, "none")) {
+    /* the planted bugs of the swap's PPOS records (src/ecapply.c; ppos.h): the children inherit them through the
+     * environment, which ppos_open reads */
+    if (!strcmp(mutant, "pposswapnone") || !strcmp(mutant, "pposswapafter")) {
+        char v[16];
+        snprintf(v, sizeof v, "%d", !strcmp(mutant, "pposswapnone") ? PPOS_MUT_SWAPNONE : PPOS_MUT_SWAPAFTER);
+        setenv("TSDB_PPOS_MUTANT", v, 1);
+    } else if (strcmp(mutant, "none")) {
         int m = eccold_mutant_parse(mutant);
         if (m < 0) {
             fprintf(stderr, "test_eccold: unknown mutant %s\n", mutant);
@@ -1402,6 +1577,13 @@ int main(int argc, char **argv)
     leader_test_marker_hook = eccold_after_append; /* as tsdbd's repld.c: eccold_marker_hook right after the append */
     if (crash_root)
         return crash_child(crash_at, crash_root);
+    if (power_root)
+        return power_child(power_root);
+    char self[PATH_MAX];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    self[sl > 0 ? sl : 0] = '\0';
+    char *slash = strrchr(self, '/');
+    snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - self) : 1, slash ? self : ".");
     printf("test_eccold%s%s\n", strcmp(mutant, "none") ? ": mutant " : "", strcmp(mutant, "none") ? mutant : "");
     struct {
         const char *name;
@@ -1410,7 +1592,8 @@ int main(int argc, char **argv)
                  {"wait", test_wait},     {"down", test_down},     {"ttl", test_ttl},
                  {"depose", test_depose}, {"concurrent", test_concurrent}, {"policy", test_policy},
                  {"swapfail", test_swapfail}, {"deposeappend", test_deposeappend}, {"crash", test_crash},
-                 {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging}};
+                 {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging},
+                 {"swappower", test_swappower}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

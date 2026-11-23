@@ -101,6 +101,8 @@ enum {
     PPOS_MUT_NOFAIL,    /* pposnofail: a failed write or sync of a record does not fail the engine */
     PPOS_MUT_NOBADGOOD, /* pposnobadgood: the open cuts a bad record before a valid one as a torn tail */
     PPOS_MUT_FLAGS,     /* pposflags: the open's compaction writes every record as PPOS_F_GIVEN */
+    PPOS_MUT_SWAPNONE,  /* pposswapnone: a settle's swap records nothing for its .ec parts (test_eccold) */
+    PPOS_MUT_SWAPAFTER, /* pposswapafter: a swap's .ec records only after its renames (test_eccold swappower) */
 };
 extern int ppos_mutant;
 /* test helpers: the number of records the file holds (after the open's compaction); a name's flags (-1: no record);

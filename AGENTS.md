@@ -576,7 +576,10 @@ cgroup, so `nice` does not keep your work out of its way.
     nothing renamed with every tmp and source present rolls forward, with one missing rolls back; damage (a sealed
     intent that breaks the name rules, an `.ec` under no name while its source is still `.part`, a source under
     `retired_` and not `settled_` although the swap renamed, a lookup error that is not ENOENT) fails the open with the intent kept. The directory is synced before the intent is unlinked, as every
-    rolled-forward intent now is (`tests/test_intents.c`).
+    rolled-forward intent now is (`tests/test_intents.c`). On an ec cluster volume (R8) every `.ec` name gets its PPOS
+    record (`src/ppos.h`: the object record's `ppos`, the cut Z) appended and synced before the intent is written
+    (`ecapply_swap_pre`), never after the renames: the open fails on a listed part without one (`test_eccold swappower`,
+    crashfs at every step of a settle, a drop of its `.ec` and a compacting open; mutants `pposswapnone pposswapafter`).
   - **The settle reads each byte once.** `eng_settle` checks the granule crcs, the footer hash and the class judgement on
     the stripe copy it then encodes (`chunk_be_put_stream`): a check on a second read could pass on bytes that differ
     from the encoded ones (mutant `settletwopass`). A CORRUPT check marks the part damaged and writes no chunk.
