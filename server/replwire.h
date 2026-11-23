@@ -6,6 +6,7 @@
  * Log link, frame type RW_T_MSG: one `struct repl_msg` of the core (src/repl.h) of one volume, little endian:
  *   u8 version (RW_VERSION), u8 msg type (REPL_M_*), u16 flags (bit 0: resync), u32 volume,
  *   i32 from, to, leader, u64 epoch, prev_pos, prev_epoch, commit, durable, written, rid, last_epoch, end, start,
+ *   set_version, replay (RW_VERSION 2: the replica set version of D8 and the ACK's replay start of D17),
  *   the vmeta (u64 epoch, isr_version, i32 leader, u32 isr, unanswered, u64 rid[REPL_MAX_NODES]),
  *   u32 nrec; an APPEND then has u64 seq, u64 off (where the first record lies in the leader's WAL segment `seq`),
  *   nrec descriptors (u64 pos, u64 epoch, u32 n, u32 len: the record's bytes) and the records' bytes, back to back.
@@ -31,9 +32,9 @@
 
 #include "../src/repl.h"
 
-#define RW_VERSION 1
+#define RW_VERSION 2
 enum { RW_T_MSG = 1, RW_T_FETCH = 2 };
-#define RW_HEAD 196         /* the fixed part of an RW_T_MSG */
+#define RW_HEAD 212         /* the fixed part of an RW_T_MSG */
 #define RW_DESC 24          /* one record descriptor */
 #define RW_APPEND_HEAD 16   /* seq, off */
 #define RW_NAME_MAX 255

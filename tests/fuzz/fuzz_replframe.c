@@ -319,7 +319,8 @@ void fuzz_seeds(const char *dir)
     /* replication messages: an ACK, and an APPEND of two records (5 and 1 positions) of 40 and 32 bytes */
     static uint8_t mb[RW_HEAD + RW_APPEND_HEAD + 2 * RW_DESC + 72];
     struct repl_msg am = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 3, .leader = -1, .durable = 90,
-                          .written = 95, .rid = 77, .start = 1, .meta.leader = -1};
+                          .written = 95, .rid = 77, .start = 1, .meta.leader = -1, .set_version = 5,
+                          .replay = 40};
     size_t ml = rw_encode_msg(mb, sizeof mb, 4, &am, NULL, 0, 0, NULL, 0);
     if (!ml)
         abort();

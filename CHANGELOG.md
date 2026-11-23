@@ -8,6 +8,15 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Replica set changes in the replication core (R4, r4-core; the core and its simulator only, nothing drives them in
+tsdbd yet).** `src/repl.[ch]`: `repl_reconfig` (a member added, removed or reset under a running core; refused with
+`REPL_E_PENDING` while actions are queued, `REPL_E_INVALID` for a deposed leader), the replica set version in every
+replication message (`repl_set_version`; a message of another version is dropped and counted), `repl_leave` (a move's
+shrink, D11), `repl_meta_promote_to` (a planned promotion names its target, D14) and the ACK's replay start
+(`repl_replay_start`, D17). The replication frames are now `RW_VERSION` 2 (set version and replay start) and the peer
+protocol version 6, so a node of an older build is refused at HELLO instead of having its frames dropped: a cluster
+made before this change is initialised again, not upgraded (as for every change of the preview).
+
 **A replica volume's RSTATE file is now format 2 (R8: it records a COLD marker in progress).** A replicated volume
 whose RSTATE is format 1 is refused at open with a line naming the format: a cluster made before this change is
 initialised again, not upgraded (as for every change of the preview).

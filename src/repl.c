@@ -42,6 +42,10 @@ struct peer {
     uint64_t last_heard; /* the tick of its last ACK in this epoch (last_ack also moves when a resend goes back) */
     uint64_t snap_sent; /* when it was last told to install a snapshot (its next position is not retained) */
     uint64_t start;     /* the first position its log holds, from its last ACK in this epoch (heard: one came) */
+    uint64_t replay;    /* the first position it may replay, from its last ACK in this epoch; 0: its log is empty */
+    uint64_t lo;        /* the lowest position sent to it in this epoch (0: none): an empty log gets nothing below */
+    uint64_t snap_lo;   /* told to install a snapshot (0: not): this leader's replay start at the first notice, which
+                           the snapshot's segments start at or above; until an ACK shows a retained next position */
     int heard;
 };
 
@@ -53,6 +57,20 @@ struct repl {
     struct repl_config cfg;
     uint64_t rid, fence, led, floor_saved, floor_tick;
     uint64_t start;     /* the first position this log still holds (repl_log_start; at least 1) */
+    uint64_t replay;    /* the first position a restart replays (repl_replay_start; 0: the log start) */
+    uint64_t setv;      /* the replica set version the indexes are in (repl_set_version) */
+    uint64_t meta_setv; /* the set version of the record `meta` was adopted in */
+    uint64_t dropped;   /* messages dropped for another set version */
+    uint64_t dropped_meta; /* of them, records (META): the driver broke its contract (repl.h, repl_reconfig) */
+    int meta_hold;      /* a leader whose set change removed a member of its record's ISR: no commit point and no
+                           ISR request until it adopts a record of the new set version (repl_reconfig) */
+    int snap_want;      /* asked for a snapshot in this epoch (REPL_A_SNAPSHOT) and not told since to go on instead */
+    int leave;          /* leader: the member a move takes out of the ISR (repl_leave; -1: none), while the ISR
+                           without it has leave_min members */
+    uint32_t leave_min;
+    int isr_why;        /* REPL_WHY_* of the ISR request in flight (or the last one) */
+    int ghost_on;       /* MUT(45) only: the lowest match of removed members, still counted */
+    uint64_t ghost;
     struct repl_epoch *hist;
     uint32_t nhist, chist;
     uint64_t written, durable, applied, commit, verified;
@@ -130,6 +148,7 @@ static struct repl_msg *send(struct repl *r, int type, int to)
     a->msg.to = to;
     a->msg.epoch = r->epoch;
     a->msg.leader = -1;
+    a->msg.set_version = r->setv;
     return &a->msg;
 }
 
@@ -310,6 +329,7 @@ static void ack(struct repl *r, int resync)
     m->written = r->verified;
     m->rid = r->rid;
     m->start = MUT(38) ? r->durable + 1 : r->start;
+    m->replay = r->written ? (r->replay > r->start ? r->replay : r->start) : 0;
     m->resync = resync;
 }
 
@@ -347,6 +367,8 @@ static void step_down(struct repl *r)
     }
     r->npend = r->hpend = 0;
     r->isr_busy = 0;
+    r->leave = -1;
+    r->leave_min = 0;
 }
 
 /* Follow `leader` in `epoch`: first find where our logs part (QUERY / ANSWER), then take appends. */
@@ -358,6 +380,7 @@ static void follow(struct repl *r, uint64_t epoch, int leader)
     r->resigning = 0;
     r->fstate = F_TRUNC;
     r->verified = r->applied;
+    r->snap_want = 0;
     query(r);
 }
 
@@ -495,7 +518,9 @@ static void advance(struct repl *r)
      * what it has, so it can reach it (isr_check) while the writes go on */
     if (r->join >= 0 && !(set & (1u << r->join)))
         c = min64(c, r->peer[r->join].rid == r->join_rid ? r->peer[r->join].match : 0);
-    if (c > r->commit)
+    if (MUT(45) && r->ghost_on)
+        c = min64(c, r->ghost); /* planted: a removed member still counts */
+    if (c > r->commit && !r->meta_hold)
         r->commit = c;
     apply_to(r, min64(r->commit, r->durable));
     if (popcount32(r->meta.isr) < r->cfg.min_isr && !MUT(31))
@@ -527,6 +552,8 @@ static void send_append(struct repl *r, int to, int heartbeat)
         if (rc > 0) {
             /* Its next record went into parts and its segment is gone (§8.3): the replica needs a snapshot (§8.1
              * step 3). Never a fail-stop: every next leader would meet the same replica. */
+            if (!p->snap_lo)
+                p->snap_lo = r->replay > r->start ? r->replay : r->start;
             if (!p->snap_sent || r->now - p->snap_sent >= r->cfg.resend_ticks) {
                 struct repl_msg *m = send(r, REPL_M_SNAPSHOT, to);
                 if (m)
@@ -554,12 +581,16 @@ static void send_append(struct repl *r, int to, int heartbeat)
     a->msg.to = to;
     a->msg.epoch = r->epoch;
     a->msg.leader = r->cfg.self;
+    a->msg.set_version = r->setv;
     a->msg.prev_pos = from - 1;
     a->msg.prev_epoch = epoch_at(r, from - 1);
     a->msg.commit = r->commit;
     a->upto = upto;
-    if (upto >= from)
+    if (upto >= from) {
         p->next = upto + 1;
+        if (!p->lo || from < p->lo)
+            p->lo = from;
+    }
     p->last_send = r->now;
     p->commit_sent = r->commit;
 }
@@ -571,8 +602,9 @@ static void replicate(struct repl *r)
             send_append(r, i, 0);
 }
 
-static void isr_request(struct repl *r, uint32_t isr, int add, uint64_t rid)
+static void isr_request(struct repl *r, uint32_t isr, int add, uint64_t rid, int why)
 {
+    r->isr_why = why;
     r->isr_req = r->meta;
     r->isr_req.isr = isr;
     if (add >= 0)
@@ -617,7 +649,7 @@ static void isr_check(struct repl *r)
         else if (p->rid != r->join_rid || r->now - r->join_tick >= r->cfg.join_hold_ticks)
             join_end(r, 1);
     }
-    if (r->isr_busy || r->meta.epoch != r->epoch)
+    if (r->isr_busy || r->meta.epoch != r->epoch || r->meta_hold)
         return;
     uint32_t isr = r->meta.isr;
     int lagged = r->now - r->lead_tick >= r->cfg.isr_lag_ticks;
@@ -636,15 +668,23 @@ static void isr_check(struct repl *r)
             (lagged && !MUT(29) && !MUT(40) && r->now - p->last_heard >= r->cfg.isr_lag_ticks) ||
             (grace && (r->unans & (1u << i)) && !p->rid)) {
             join_end(r, 0);
-            isr_request(r, isr & ~(1u << i), -1, 0);
+            isr_request(r, isr & ~(1u << i), -1, 0, REPL_WHY_DROP);
             return;
         }
+    }
+    /* A move's shrink (D11): the leaving member goes once the ISR keeps leave_min members without it; until then it
+     * stays (a member that lags still goes by the rule above). */
+    if (r->leave >= 0 && (isr & (1u << r->leave)) &&
+        (MUT(49) || popcount32(isr & ~(1u << r->leave)) >= (int)r->leave_min)) {
+        join_end(r, 0);
+        isr_request(r, isr & ~(1u << r->leave), -1, 0, REPL_WHY_LEAVE);
+        return;
     }
     /* what the leader had written half isr_lag ago: a learner that has it may have the commit point held for it */
     int half = lagged && r->cfg.join_hold_ticks && !MUT(42);
     uint64_t near = half ? wend_at(r, r->now - r->cfg.isr_lag_ticks / 2) : 0;
     for (int i = 0; i < r->cfg.nnodes; i++) {
-        if (i == r->cfg.self || (isr & (1u << i)))
+        if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)))
             continue;
         const struct peer *p = &r->peer[i];
         /* Its log must also reach the start of this epoch (Kafka's leaderEpochStartOffset): a new leader's commit
@@ -653,12 +693,12 @@ static void isr_check(struct repl *r)
         uint64_t start = r->nhist ? r->hist[r->nhist - 1].start : 0;
         if (p->rid && p->match >= r->commit && p->match >= old && (p->match >= start || MUT(12))) {
             join_end(r, 0);
-            isr_request(r, isr | (1u << i), i, p->rid);
+            isr_request(r, isr | (1u << i), i, p->rid, REPL_WHY_JOIN);
             return;
         }
         if (half && r->join < 0 && r->now >= r->join_retry && p->rid && p->match >= near && p->match >= start) {
             if (MUT(41)) { /* planted: asked for within the bound, without waiting for the commit point */
-                isr_request(r, isr | (1u << i), i, p->rid);
+                isr_request(r, isr | (1u << i), i, p->rid, REPL_WHY_JOIN);
                 return;
             }
             r->join = i;
@@ -688,6 +728,10 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     r->isr_busy = 0;
     r->join = -1;
     r->join_retry = 0;
+    r->leave = -1;
+    r->leave_min = 0;
+    r->meta_hold = 0;
+    r->ghost_on = 0;
     r->npend = r->hpend = 0;
     memset(r->peer, 0, sizeof r->peer);
     for (int i = 0; i < r->cfg.nnodes; i++)
@@ -725,10 +769,13 @@ static void adopt_meta(struct repl *r, const struct repl_vmeta *v)
     if (v->epoch < r->epoch)
         return;
     if (v->epoch == r->epoch) {
-        if (r->have_meta && r->meta.epoch == v->epoch && v->isr_version <= r->meta.isr_version)
+        if (r->have_meta && r->meta.epoch == v->epoch && v->isr_version <= r->meta.isr_version &&
+            (r->meta_setv == r->setv || MUT(52)))
             return;
         r->meta = *v;
         r->have_meta = 1;
+        r->meta_setv = r->setv;
+        r->meta_hold = 0;
         if (r->leading) {
             if (r->isr_busy && v->isr_version > r->isr_req.isr_version)
                 r->isr_busy = 0;
@@ -741,6 +788,8 @@ static void adopt_meta(struct repl *r, const struct repl_vmeta *v)
     raise_fence(r, v->epoch);
     r->meta = *v;
     r->have_meta = 1;
+    r->meta_setv = r->setv;
+    r->meta_hold = 0;
     if (v->leader != r->cfg.self) {
         follow(r, v->epoch, v->leader);
     } else if ((r->led >= v->epoch && !MUT(5)) || (v->rid[r->cfg.self] != r->rid && !MUT(13))) {
@@ -779,6 +828,9 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     p->last_ack = r->now;
     p->last_heard = r->now;
     p->start = m->start;
+    p->replay = m->replay;
+    if (p->snap_lo && m->written + 1 >= r->start)
+        p->snap_lo = 0; /* it has what it needs from the log: installed, or never needed one */
     p->heard = 1;
     if (m->resync || !p->next)
         p->next = m->written + 1;
@@ -830,6 +882,13 @@ void repl_recv(struct repl *r, const struct repl_msg *m)
 {
     if (r->failed)
         return;
+    /* Indexes mean members only within one set version: a message of another names others (D8). A FENCE names none. */
+    if (m->type != REPL_M_FENCE && m->set_version != r->setv && !MUT(44) && !(MUT(53) && m->type == REPL_M_META)) {
+        r->dropped++;
+        if (m->type == REPL_M_META)
+            r->dropped_meta++;
+        return;
+    }
     switch (m->type) {
     case REPL_M_APPEND:
         on_append(r, m);
@@ -866,12 +925,15 @@ void repl_recv(struct repl *r, const struct repl_msg *m)
         if (!r->leading && m->epoch == r->epoch && m->from == r->leader && r->fstate == F_FOLLOW) {
             if (m->written < r->verified) {
                 /* The leader went back to a position we have (it lost an ACK): tell it where we are instead. */
+                r->snap_want = 0;
                 ack(r, 1);
                 break;
             }
             struct repl_action *a = push(r, REPL_A_SNAPSHOT);
-            if (a)
+            if (a) {
                 a->pos = (uint64_t)m->from;
+                r->snap_want = 1;
+            }
         }
         break;
     default:
@@ -954,7 +1016,9 @@ void repl_tick(struct repl *r)
                       r->now - p->last_send >= r->cfg.idle_heartbeat_ticks))
                 send_append(r, i, 1); /* news of the commit point at once; on an idle volume, only to stay heard */
         }
-        if (r->isr_busy && r->now - r->isr_sent >= r->cfg.resend_ticks) {
+        /* Not under a set change's hold: the pending request is then the shrink the metadata group applied already
+         * (or this leader was deposed); either way it is stale. */
+        if (r->isr_busy && r->now - r->isr_sent >= r->cfg.resend_ticks && (!r->meta_hold || MUT(51))) {
             r->isr_sent = r->now;
             struct repl_msg *m = send(r, REPL_M_ISR_REQ, REPL_META);
             if (m)
@@ -1002,6 +1066,7 @@ struct repl *repl_open(const struct repl_config *cfg, const struct repl_durable 
         return NULL;
     r->cfg = *cfg;
     r->join = -1;
+    r->leave = -1;
     r->nwend = cfg->isr_lag_ticks + 1;
     r->wend = calloc(r->nwend, sizeof *r->wend);
     if (!r->wend) {
@@ -1053,16 +1118,169 @@ uint64_t repl_replay_floor(const struct repl *r)
 {
     if (!r->leading || r->failed)
         return 0;
-    uint64_t l = r->start;
+    uint64_t l = r->replay > r->start ? r->replay : r->start;
     for (int i = 0; i < r->cfg.nnodes; i++) {
+        const struct peer *p = &r->peer[i];
         if (i == r->cfg.self)
             continue;
-        if (!r->peer[i].heard && !MUT(39))
+        if (!p->heard && !MUT(39))
             return 0; /* unknown: it may hold anything from an older epoch */
-        if (r->peer[i].heard)
-            l = min64(l, r->peer[i].start);
+        if (!p->heard || MUT(46))
+            continue;
+        /* An empty log (replay 0) holds nothing yet: what it gets comes from this leader, at or above the lowest
+         * position sent to it and the log start (never lowered). A snapshot's segments start at or above snap_lo. */
+        uint64_t c = p->replay ? p->replay : p->lo ? min64(p->lo, r->start) : r->start;
+        if (p->snap_lo)
+            c = min64(c, p->snap_lo);
+        l = min64(l, c);
     }
     return l;
+}
+
+void repl_replay_start(struct repl *r, uint64_t s)
+{
+    if (s > r->replay)
+        r->replay = s;
+}
+
+static uint32_t remap_mask(uint32_t x, const int *new_of, int on)
+{
+    uint32_t y = 0;
+    for (int o = 0; o < on; o++)
+        if ((x & (1u << o)) && new_of[o] >= 0)
+            y |= 1u << new_of[o];
+    return y;
+}
+
+static void remap_meta(struct repl_vmeta *m, const int *new_of, int on)
+{
+    struct repl_vmeta o = *m;
+    m->isr = remap_mask(o.isr, new_of, on);
+    m->unanswered = remap_mask(o.unanswered, new_of, on);
+    memset(m->rid, 0, sizeof m->rid);
+    for (int i = 0; i < on; i++)
+        if (new_of[i] >= 0)
+            m->rid[new_of[i]] = o.rid[i];
+    m->leader = o.leader >= 0 && o.leader < on ? new_of[o.leader] : -1;
+}
+
+int repl_reconfig(struct repl *r, int nnodes, int self, const int *old_of)
+{
+    if (r->failed)
+        return REPL_E_FAILED;
+    int on = r->cfg.nnodes, new_of[REPL_MAX_NODES];
+    if (nnodes < 1 || nnodes > REPL_MAX_NODES || self < 0 || self >= nnodes || !old_of || old_of[self] != r->cfg.self)
+        return REPL_E_INVALID;
+    /* Queued actions name members by the old indexes (a SEND's `to`, a SNAPSHOT's `pos`) and carry the old set version:
+     * drained after the change, the driver would route them through the new record to other members. */
+    if (r->hact < r->nact && !MUT(54))
+        return REPL_E_PENDING;
+    for (int i = 0; i < REPL_MAX_NODES; i++)
+        new_of[i] = -1;
+    for (int i = 0; i < nnodes; i++) {
+        int o = old_of[i];
+        if (o < -1 || o >= on || (o >= 0 && new_of[o] >= 0))
+            return REPL_E_INVALID;
+        if (o >= 0)
+            new_of[o] = i;
+    }
+    uint32_t gone = 0;
+    for (int o = 0; o < on; o++)
+        if (new_of[o] < 0)
+            gone |= 1u << o;
+    int hold = 0;
+    if (r->leading && (r->meta.isr & gone)) {
+        /* The metadata group never removes an ISR member: either this leader's own shrink of it was applied and its
+         * record is behind, or this leader was deposed (the next epoch fenced that member). */
+        if (!r->isr_busy || (r->isr_req.isr & r->meta.isr & gone))
+            return REPL_E_INVALID;
+        hold = 1;
+    }
+    /* A pending request that adds a removed member was never applied (the metadata group refuses to remove an ISR
+     * member, and drops requests of the old set version): it goes; the next tick asks again in the new set. */
+    if (r->isr_busy && (r->isr_req.isr & gone & ~r->meta.isr) && !MUT(57))
+        r->isr_busy = 0;
+    if (MUT(45) && r->leading)
+        for (int o = 0; o < on; o++)
+            if ((gone & (1u << o)) && o != r->cfg.self && (!r->ghost_on || r->peer[o].match < r->ghost)) {
+                r->ghost = r->peer[o].match;
+                r->ghost_on = 1;
+            }
+    if (!MUT(43)) {
+        struct peer np[REPL_MAX_NODES];
+        memset(np, 0, sizeof np);
+        for (int i = 0; i < nnodes; i++) {
+            if (old_of[i] >= 0) {
+                np[i] = r->peer[old_of[i]];
+            } else {
+                np[i].last_ack = np[i].last_heard = r->now; /* a never-heard learner */
+            }
+        }
+        memcpy(r->peer, np, sizeof np);
+        remap_meta(&r->meta, new_of, on);
+        remap_meta(&r->isr_req, new_of, on);
+        if (!MUT(55))
+            r->unans = remap_mask(r->unans, new_of, on);
+    }
+    if (r->join >= 0) {
+        if (new_of[r->join] < 0)
+            join_end(r, 0);
+        else
+            r->join = MUT(56) ? r->join : new_of[r->join];
+    }
+    if (r->leave >= 0) {
+        r->leave = new_of[r->leave];
+        if (r->leave < 0)
+            r->leave_min = 0;
+    }
+    if (r->leader >= 0 && r->leader < on) {
+        r->leader = new_of[r->leader];
+        if (r->leader < 0 && !r->leading) {
+            r->fstate = F_IDLE; /* its leader was removed, so that epoch is over: wait for the record of a later one */
+            r->snap_want = 0;
+        }
+    }
+    r->cfg.nnodes = nnodes;
+    r->cfg.self = self;
+    if (hold && !MUT(51))
+        r->meta_hold = 1;
+    return REPL_OK;
+}
+
+void repl_set_version(struct repl *r, uint64_t v)
+{
+    r->setv = v;
+}
+
+uint64_t repl_get_set_version(const struct repl *r) { return r->setv; }
+uint64_t repl_dropped(const struct repl *r) { return r->dropped; }
+uint64_t repl_dropped_meta(const struct repl *r) { return r->dropped_meta; }
+int repl_leaving(const struct repl *r) { return r->leave; }
+int repl_isr_why(const struct repl *r) { return r->isr_why; }
+
+int repl_leave(struct repl *r, int idx, uint32_t min_isr)
+{
+    if (r->failed)
+        return REPL_E_FAILED;
+    if (idx < 0) {
+        r->leave = -1;
+        r->leave_min = 0;
+        return REPL_OK;
+    }
+    if (!r->leading)
+        return REPL_E_NOTLEADER;
+    if (idx >= r->cfg.nnodes || idx == r->cfg.self)
+        return REPL_E_INVALID;
+    r->leave = idx;
+    r->leave_min = min_isr;
+    if (r->join == idx)
+        join_end(r, 0);
+    return REPL_OK;
+}
+
+int repl_snapshot_wanted(const struct repl *r, uint64_t p)
+{
+    return !r->failed && !r->leading && r->snap_want && (MUT(47) || p > r->written);
 }
 
 void repl_free(struct repl *r)
@@ -1153,11 +1371,17 @@ int repl_meta_isr_change(struct repl_vmeta *m, const struct repl_vmeta *req)
 int repl_meta_promote(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis_version, uint32_t fenced,
                       const struct repl_fence_reply *r, int n)
 {
+    return repl_meta_promote_to(m, basis_epoch, basis_version, fenced, r, n, -1, 0);
+}
+
+int repl_meta_promote_to(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis_version, uint32_t fenced,
+                         const struct repl_fence_reply *r, int n, int target, uint64_t min_end)
+{
     if (m->epoch != basis_epoch || (m->isr_version != basis_version && !MUT(10)))
         return REPL_E_STALE;
     /* With the version unchanged, m->isr is the set the fences went to. */
     uint32_t from = MUT(10) ? fenced : m->isr & fenced;
-    int best = -1;
+    int best = -1, tbest = -1;
     uint32_t isr = 0, answered = 0;
     for (int i = 0; i < n; i++) {
         int node = r[i].node;
@@ -1167,9 +1391,14 @@ int repl_meta_promote(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t basis
         if (r[i].rid != m->rid[node] && !MUT(11))
             continue;
         isr |= 1u << node;
+        if (node == target)
+            tbest = i;
         if (best < 0 || r[i].durable > r[best].durable || (r[i].durable == r[best].durable && node < r[best].node))
             best = i;
     }
+    /* A planned transfer: the target or nobody (its reply must show the end the old leader drained to) */
+    if (target >= 0 && !MUT(50))
+        best = tbest >= 0 && r[tbest].durable >= min_end ? tbest : -1;
     if (best < 0)
         return REPL_E_NONE;
     /* Members that did not answer stay in the ISR, the old leader too: they hold every committed position (the old

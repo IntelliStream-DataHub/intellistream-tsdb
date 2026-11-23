@@ -38,6 +38,12 @@ mode=${1:-quick}
 #  42 no hold: a learner under writes that never pause never joins (test_repl steady_join, join_giveup)
 # The replay floor (r3b, design §5.4): 38 an ACK reports durable + 1 as its log start; 39 the floor ignores members
 #     not heard from in this epoch
+# Replica set changes (r4-core, design-cluster.md 8.1-8.3, D8 D11 D14 D17): 43 reconfnoremap (peer state, the ISR
+#     and a pending request stay by index across a set change), 44 setvaccept (a message of another set version is
+#     taken), 45 removedcounts (a removed member's last match still holds the commit point), 46 replayabove (the floor
+#     is the leader's own replay start), 47 snapatorbelow (a snapshot at or below the log end is wanted), 48 leaveflap
+#     (a leaving member is asked for again), 49 leaveunsafe (the move's shrink ignores its min_isr), 50 targetany (a
+#     planned promotion ignores its target: test_repl only)
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
@@ -51,7 +57,8 @@ all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
 # by the simulator, so a scenario is their only planted-bug check; 14 is also in the simulator's list.
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
-           14:promote 39:replay_floor 40:idle_shrink 42:steady_join"
+           14:promote 39:replay_floor 40:idle_shrink 42:steady_join 43:reconfig 44:reconfig 45:reconfig 46:replay
+           47:snapshot 48:leave 49:leave 50:target"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the

@@ -28,6 +28,17 @@
  *               behind a lone leader never). When asked for, it has every position up to the commit point.
  *   join_giveup a learner that stops short under the hold: the commit point waits at most join_hold_ticks, then
  *               moves on, and is not held again for 4 x isr_lag; a learner more than half isr_lag behind is not held for.
+ *   reconfig    a replica set change (D8): a member's match moves with it across an index shift (MUT(43): state kept
+ *               by index), a removed member no longer counts (MUT(45)); the leader refuses its own removal, an ISR
+ *               member's and a bad map; a message of another set version is dropped and counted (MUT(44)).
+ *   leave       a move's shrink (D11): asked for once, only while the ISR without the member keeps min_isr (MUT(49)),
+ *               and the leaving member is never asked for again (MUT(48)); a cancel lets it rejoin.
+ *   target      a planned promotion picks its target or nobody (MUT(50): the lowest index won a tie), and no reply is
+ *               left `unanswered`.
+ *   replay      the replay start (D17) in ACKs, an empty log's "nothing to replay", and the floor with a snapshot
+ *               notice outstanding (MUT(46): the leader's own replay start only).
+ *   snapshot    a fresh learner whose first position is not retained gets the notice; a snapshot is wanted only above
+ *               the log end (MUT(47)); an install at P with log start S <= P + 1 opens, and its ACK stops the notice.
  */
 #include "repl.h"
 
@@ -569,20 +580,21 @@ static struct repl *join_leader(struct drv *d, struct repl_config *c)
 
 /* One tick of writes that never pause: a record written and synced, member 2 at the leader's end, the learner at
  * `learner` (its durable and written end; 0: silent). Returns the ISR request this tick made, if any. */
-static const struct repl_action *join_step(struct repl *r, struct drv *d, uint64_t learner)
+static const struct repl_action *join_step_at(struct repl *r, struct drv *d, uint64_t learner, int li, int mi,
+                                             uint64_t setv)
 {
     uint64_t pos;
     repl_write(r, 1, &pos);
     drain(r, d, NULL);
     repl_synced(r, repl_written(r));
     drain(r, d, NULL);
-    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1,
-                          .durable = repl_written(r), .written = repl_written(r), .rid = 33};
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = mi, .to = 0, .epoch = 2, .leader = -1,
+                          .durable = repl_written(r), .written = repl_written(r), .rid = 33, .set_version = setv};
     repl_recv(r, &k2);
     drain(r, d, NULL);
     if (learner) {
-        struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = learner,
-                              .written = learner, .rid = 22};
+        struct repl_msg k1 = {.type = REPL_M_ACK, .from = li, .to = 0, .epoch = 2, .leader = -1, .durable = learner,
+                              .written = learner, .rid = 22, .set_version = setv};
         repl_recv(r, &k1);
         drain(r, d, NULL);
         const struct repl_action *q = find_act(d, REPL_A_SEND, REPL_M_ISR_REQ);
@@ -592,6 +604,11 @@ static const struct repl_action *join_step(struct repl *r, struct drv *d, uint64
     repl_tick(r);
     drain(r, d, NULL);
     return find_act(d, REPL_A_SEND, REPL_M_ISR_REQ);
+}
+
+static const struct repl_action *join_step(struct repl *r, struct drv *d, uint64_t learner)
+{
+    return join_step_at(r, d, learner, 1, 2, 0);
 }
 
 static void steady_join(void)
@@ -767,7 +784,7 @@ static void replay_floor(void)
     repl_log_start(r, 50);
     CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " before any member ACKed", repl_replay_floor(r));
     struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 1, .epoch = 2, .leader = -1, .durable = 101,
-                          .written = 101, .rid = 33, .resync = 1, .start = 30};
+                          .written = 101, .rid = 33, .resync = 1, .start = 30, .replay = 30};
     repl_recv(r, &k2);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " while node 0 has not ACKed in this epoch",
@@ -775,11 +792,11 @@ static void replay_floor(void)
     struct repl_msg k0 = k2;
     k0.from = 0;
     k0.rid = 11;
-    k0.start = 70;
+    k0.start = k0.replay = 70;
     repl_recv(r, &k0);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 ", not node 2's start 30", repl_replay_floor(r));
-    k2.start = 60; /* node 2 removed segments: the leader's own start is now the lowest */
+    k2.start = k2.replay = 60; /* node 2 removed segments: the leader's own start is now the lowest */
     repl_recv(r, &k2);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 50, "floor %" PRIu64 ", not the leader's start 50", repl_replay_floor(r));
@@ -800,6 +817,461 @@ static void replay_floor(void)
     repl_recv(r, &k2);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 50, "floor %" PRIu64 " in epoch 3", repl_replay_floor(r));
+    repl_free(r);
+}
+
+
+/* An ACK from `from` in epoch 2 (durable = written = end), rid, replay start. */
+static struct repl_msg ack_msg(int from, int to, uint64_t end, uint64_t rid, uint64_t replay, uint64_t setv)
+{
+    return (struct repl_msg){.type = REPL_M_ACK, .from = from, .to = to, .epoch = 2, .leader = -1, .durable = end,
+                             .written = end, .rid = rid, .start = 1, .replay = replay, .set_version = setv};
+}
+
+static void reconfig(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* node 0 leads epoch 2, ISR {0, 2}; node 1 a learner; all at 101 */
+    CHECK(r && repl_is_leader(r), "no leader");
+    /* written 110, durable 101 (the sync not back), node 2 has 108: the commit point waits for the leader */
+    for (int i = 0; i < 9; i++) {
+        uint64_t pos;
+        repl_write(r, 1, &pos);
+        if (i == 8) { /* its SENDs still queued: they name members by the old indexes */
+            int same[3] = {0, 1, 2};
+            CHECK(repl_reconfig(r, 3, 0, same) == REPL_E_PENDING, "a reconfig with actions still queued");
+        }
+        drain(r, &d, NULL);
+    }
+    struct repl_msg k = ack_msg(2, 0, 108, 33, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == 101, "commit %" PRIu64, repl_commit(r));
+    int bad[3] = {0, 2, 2};
+    CHECK(repl_reconfig(r, 3, 0, bad) == REPL_E_INVALID, "a map naming one member twice");
+    int noself[2] = {1, 2};
+    CHECK(repl_reconfig(r, 2, 0, noself) == REPL_E_INVALID, "the leader's own removal");
+    int noisr[2] = {0, 1};
+    CHECK(repl_reconfig(r, 2, 0, noisr) == REPL_E_INVALID, "removing ISR member 2");
+    /* REMOVE node 1 (the learner): node 2 becomes index 1 */
+    int map[2] = {0, 2};
+    CHECK(repl_reconfig(r, 2, 0, map) == REPL_OK, "reconfig");
+    repl_set_version(r, 1);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x3, 0);
+    m.set_version = 1;
+    m.meta.rid[1] = 33;
+    m.meta.rid[2] = 0;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    for (int i = 0; i < 2; i++) { /* the sync in flight covers 102; the next one the rest */
+        repl_synced(r, repl_written(r));
+        drain(r, &d, NULL);
+    }
+    CHECK(repl_commit(r) == 108, "commit %" PRIu64 " after the shift: node 2's match did not move to index 1",
+          repl_commit(r));
+    /* an ACK of the old set version (node 2 under its old index) is dropped and counted */
+    uint64_t dropped = repl_dropped(r);
+    k = ack_msg(2, 0, 110, 33, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_dropped(r) == dropped + 1 && repl_commit(r) == 108, "an old-version ACK was taken (commit %" PRIu64
+          ")", repl_commit(r));
+    k = ack_msg(1, 0, 110, 33, 1, 1);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == 110, "commit %" PRIu64 " with node 2 at its new index", repl_commit(r));
+    /* ADD a learner at index 2: it never ACKed, so the floor is unknown, and the removed node is not counted */
+    int add[3] = {0, 1, -1};
+    CHECK(repl_reconfig(r, 3, 0, add) == REPL_OK, "add");
+    repl_set_version(r, 2);
+    CHECK(repl_replay_floor(r) == 0, "floor %" PRIu64 " with a learner unheard", repl_replay_floor(r));
+    k = ack_msg(2, 0, 0, 44, 0, 2);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    k = ack_msg(1, 0, 110, 33, 1, 2);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 1, "floor %" PRIu64, repl_replay_floor(r));
+    uint64_t pos;
+    CHECK(repl_write(r, 1, &pos) == REPL_OK, "write");
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    k = ack_msg(1, 0, repl_written(r), 33, 1, 2);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == repl_written(r), "commit %" PRIu64 " held by a removed member (written %" PRIu64 ")",
+          repl_commit(r), repl_written(r));
+    repl_free(r);
+}
+
+static void leave(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* ISR {0, 2}, node 1 a caught-up learner */
+    CHECK(r, "no leader");
+    CHECK(repl_leave(r, 0, 1) == REPL_E_INVALID, "the leader leaving");
+    /* the move: node 1 (B) joins, node 2 (A) leaves; the ISR had 2 members before B joined */
+    CHECK(repl_leave(r, 2, 2) == REPL_OK && repl_leaving(r) == 2, "leave");
+    const struct repl_action *q = NULL;
+    for (int t = 0; t < 40 && !q; t++) {
+        struct repl_msg k = ack_msg(2, 0, 101, 33, 1, 0);
+        repl_recv(r, &k);
+        drain(r, &d, NULL);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        CHECK(!q || (q->msg.meta.isr & 0x4), "asked for ISR %#x, below min_isr 2 without node 2", q->msg.meta.isr);
+    }
+    CHECK(q && q->msg.meta.isr == 0x7 && repl_isr_why(r) == REPL_WHY_JOIN, "B was not asked for");
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    m.meta.isr_version = 8;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    int asks = 0;
+    for (int t = 0; t < 5; t++) { /* less than resend_ticks: asked once */
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        if (q) {
+            asks++;
+            CHECK(q->msg.meta.isr == 0x3 && repl_isr_why(r) == REPL_WHY_LEAVE, "asked for %#x", q->msg.meta.isr);
+        }
+    }
+    CHECK(asks == 1, "the shrink asked %d times", asks);
+    m.meta.isr_version = 9;
+    m.meta.isr = 0x3;
+    m.meta.rid[2] = 0;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    for (int t = 0; t < 60; t++) { /* node 2 keeps up: it is never asked for again */
+        struct repl_msg k = ack_msg(2, 0, repl_written(r), 33, 1, 0);
+        repl_recv(r, &k);
+        k = ack_msg(1, 0, repl_written(r), 22, 1, 0);
+        repl_recv(r, &k);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        CHECK(!q, "the leaving member asked for again (ISR %#x)", q->msg.meta.isr);
+    }
+    CHECK(repl_leave(r, -1, 0) == REPL_OK && repl_leaving(r) == -1, "cancel");
+    for (int t = 0; t < 5 && !q; t++) {
+        struct repl_msg k = ack_msg(2, 0, repl_written(r), 33, 1, 0);
+        repl_recv(r, &k);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && q->msg.meta.isr == 0x7, "after a cancel node 2 does not rejoin");
+    repl_free(r);
+}
+
+static void target(void)
+{
+    struct repl_vmeta m0 = {.epoch = 6, .isr_version = 9, .leader = 0, .isr = 0x7, .rid = {11, 22, 33}};
+    struct repl_fence_reply rep[3] = {{.node = 0, .durable = 400, .rid = 11}, {.node = 1, .durable = 500, .rid = 22},
+                                      {.node = 2, .durable = 500, .rid = 33}};
+    struct repl_vmeta m = m0;
+    CHECK(repl_meta_promote_to(&m, 6, 9, 0x7, rep, 3, 2, 500) == REPL_OK && m.leader == 2 && m.epoch == 7,
+          "the target with the same durable end as a lower index: leader %d", m.leader);
+    CHECK(m.isr == 0x7 && m.unanswered == 0, "isr %#x unanswered %#x: every member answered", m.isr, m.unanswered);
+    m = m0;
+    CHECK(repl_meta_promote_to(&m, 6, 9, 0x7, rep, 3, -1, 0) == REPL_OK && m.leader == 1, "no target: leader %d",
+          m.leader);
+    m = m0;
+    CHECK(repl_meta_promote_to(&m, 6, 9, 0x7, rep, 3, 2, 501) == REPL_E_NONE && m.epoch == 6 && m.leader == 0,
+          "a target below the drained end was promoted");
+    rep[2].rid = 99;
+    m = m0;
+    CHECK(repl_meta_promote_to(&m, 6, 9, 0x7, rep, 3, 2, 0) == REPL_E_NONE, "a target of another instance");
+    m = m0;
+    CHECK(repl_meta_promote_to(&m, 6, 9, 0x7, rep, 2, 2, 0) == REPL_E_NONE, "a target that did not answer");
+}
+
+static void replay(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    /* a follower's ACK: replay start never below the log start, never lowered; an empty log reports 0 */
+    struct repl *f = follower(&d, 100, 100, 1, 1);
+    CHECK(f, "no follower");
+    repl_log_start(f, 20);
+    repl_replay_start(f, 10);
+    struct repl_msg ap = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .leader = 0,
+                          .prev_pos = repl_written(f), .prev_epoch = 1, .commit = 0};
+    repl_recv(f, &ap);
+    drain(f, &d, &ap);
+    const struct repl_action *k = find_act(&d, REPL_A_SEND, REPL_M_ACK);
+    CHECK(k && k->msg.replay == 20 && k->msg.start == 20, "ACK replay %" PRIu64, k ? k->msg.replay : 0);
+    repl_replay_start(f, 60);
+    repl_replay_start(f, 30);
+    repl_recv(f, &ap);
+    drain(f, &d, &ap);
+    k = find_act(&d, REPL_A_SEND, REPL_M_ACK);
+    CHECK(k && k->msg.replay == 60, "ACK replay %" PRIu64 " (lowered?)", k ? k->msg.replay : 0);
+    repl_free(f);
+    /* the leader's floor: its own replay start, each member's, an empty log by what was sent to it */
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c);
+    CHECK(r, "no leader");
+    d.start = 40;
+    repl_log_start(r, 40);
+    repl_replay_start(r, 90);
+    struct repl_msg a1 = ack_msg(1, 0, 101, 22, 70, 0), a2 = ack_msg(2, 0, 101, 33, 80, 0);
+    repl_recv(r, &a1);
+    repl_recv(r, &a2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 70, "floor %" PRIu64 ", not node 1's replay start 70", repl_replay_floor(r));
+    a1.replay = 95;
+    repl_recv(r, &a1);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 80, "floor %" PRIu64 ", not node 2's replay start 80", repl_replay_floor(r));
+    a2.replay = 99;
+    repl_recv(r, &a2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 90, "floor %" PRIu64 ", not the leader's own 90", repl_replay_floor(r));
+    /* node 1 lost its disk: empty, sent from 40 (the leader's log start) on */
+    a1 = ack_msg(1, 0, 0, 23, 0, 0);
+    a1.resync = 1;
+    repl_recv(r, &a1);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 40, "floor %" PRIu64 " with an empty member: the leader sends it from 40",
+          repl_replay_floor(r));
+    repl_free(r);
+}
+
+static void snapshot(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c);
+    CHECK(r, "no leader");
+    d.start = 50; /* positions below 50 went into parts */
+    repl_log_start(r, 50);
+    repl_replay_start(r, 60);
+    /* a fresh learner (node 1 reset: empty log, a new rid) */
+    struct repl_msg k = ack_msg(1, 0, 0, 23, 0, 0);
+    k.resync = 1;
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    const struct repl_action *s = find_act(&d, REPL_A_SEND, REPL_M_SNAPSHOT);
+    CHECK(s && s->msg.written == 0 && s->msg.to == 1, "no snapshot notice for an empty learner");
+    k = ack_msg(1, 0, 0, 23, 0, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) <= 50, "floor %" PRIu64 " above what a snapshot may bring", repl_replay_floor(r));
+    /* the learner's side: asked, a snapshot wanted only above its log end */
+    static struct drv fd;
+    memset(&fd, 0, sizeof fd);
+    struct repl *f = follower(&fd, 10, 10, 1, 1);
+    CHECK(f, "no follower");
+    struct repl_msg n = {.type = REPL_M_SNAPSHOT, .from = 0, .to = 1, .epoch = 3, .leader = -1, .written = 10};
+    repl_recv(f, &n);
+    drain(f, &fd, NULL);
+    CHECK(find_act(&fd, REPL_A_SNAPSHOT, 0), "no snapshot asked for");
+    CHECK(!repl_snapshot_wanted(f, 10) && !repl_snapshot_wanted(f, 5), "a snapshot at or below the log end wanted");
+    CHECK(repl_snapshot_wanted(f, 101), "the snapshot at 101 not wanted");
+    repl_free(f);
+    /* installed: P = 101 (the leader's commit point), segments from S = 60 */
+    memset(&fd, 0, sizeof fd);
+    fill(&fd, 60, 101, 2, 1);
+    fd.start = 60;
+    struct repl_epoch h[1] = {{.epoch = 2, .start = 60}};
+    struct repl_config fc = config(1, &fd);
+    struct repl_durable du = {.rid = 23, .fence = 2, .floor = 101, .log_start = 60, .log_end = 101, .hist = h,
+                              .nhist = 1};
+    f = repl_open(&fc, &du);
+    CHECK(f && !repl_failed(f) && repl_applied(f) == 101, "the install's open (log start 60, end and floor 101)");
+    repl_free(f);
+    k = ack_msg(1, 0, 101, 23, 60, 0);
+    k.resync = 1;
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    for (int t = 0; t < 30; t++) {
+        repl_tick(r);
+        drain(r, &d, NULL);
+        CHECK(!find_act(&d, REPL_A_SEND, REPL_M_SNAPSHOT), "a notice after the ACK showed 101");
+    }
+    k = ack_msg(1, 0, repl_written(r), 23, 60, 0);
+    repl_recv(r, &k);
+    k = ack_msg(2, 0, repl_written(r), 33, 70, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 60, "floor %" PRIu64 " after the install", repl_replay_floor(r));
+    repl_free(r);
+}
+
+/* A leader whose own shrink of node 1 was applied, and then node 1's REMOVE, before it adopted the shrunk record: it
+ * takes the change but moves no commit point and asks nothing until it has adopted a record of the new set version
+ * (it may be deposed, and the next epoch fenced node 1: counting without it would commit alone). An older copy of the
+ * record is dropped and counted (the driver's contract). */
+static void hold(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    c.isr_lag_ticks = 50;
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    struct repl_msg k2 = ack_msg(2, 0, 101, 33, 1, 0);
+    k2.resync = 1;
+    const struct repl_action *q = NULL;
+    for (int t = 0; t < 3 * (int)c.isr_lag_ticks && !q; t++) { /* node 1 silent: dropped */
+        repl_recv(r, &k2);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && q->msg.meta.isr == 0x5, "no shrink of node 1");
+    uint64_t c0 = repl_commit(r);
+    int map[2] = {0, 2}; /* REMOVE node 1: node 2 becomes index 1 */
+    CHECK(repl_reconfig(r, 2, 0, map) == REPL_OK, "the reconfig with the shrink pending");
+    repl_set_version(r, 1);
+    for (int t = 0; t < 3 * (int)c.resend_ticks; t++) {
+        uint64_t pos;
+        CHECK(repl_write(r, 1, &pos) == REPL_OK, "write");
+        drain(r, &d, NULL);
+        repl_synced(r, repl_written(r));
+        drain(r, &d, NULL);
+        struct repl_msg k = ack_msg(1, 0, repl_written(r), 33, 1, 1);
+        repl_recv(r, &k);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        CHECK(repl_commit(r) == c0, "commit %" PRIu64 " before a record of the new set version", repl_commit(r));
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        CHECK(!q, "asked for ISR %#x before a record of the new set version", q->msg.meta.isr);
+    }
+    /* an older copy (set version 0; its isr 0x3 named nodes 0 and 1) is dropped, counted, and holds nothing up */
+    uint64_t dm = repl_dropped_meta(r);
+    m = meta_msg(0, 2, 0, 0x3, 0);
+    m.meta.isr_version = 8;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    CHECK(repl_dropped_meta(r) == dm + 1, "a record of another set version was not dropped");
+    CHECK(repl_commit(r) == c0, "commit %" PRIu64 " after a record of the old set version", repl_commit(r));
+    /* the record of the new set version, its ISR version not above the one held: adopted, and the commit moves */
+    m = meta_msg(0, 2, 0, 0x3, 0);
+    m.set_version = 1;
+    m.meta.rid[1] = 33;
+    m.meta.rid[2] = 0;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == repl_written(r), "commit %" PRIu64 " after the record of the new set version (written %"
+          PRIu64 ")", repl_commit(r), repl_written(r));
+    repl_free(r);
+}
+
+/* A set change that moves an unanswered member (meta.unanswered: kept by the promotion without a fence reply) to
+ * another index: the grace rule drops it there, within unanswered_ticks, not the member now at its old index. */
+static void unans_remap(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(1, &d);
+    struct repl_durable du = {.rid = 22, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    struct repl_msg m = meta_msg(1, 2, 1, 0x7, 0x1); /* node 0, the old leader, did not answer the fence */
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    int swap[3] = {2, 1, 0}; /* nodes 0 and 2 change places */
+    CHECK(repl_reconfig(r, 3, 1, swap) == REPL_OK, "reconfig");
+    repl_set_version(r, 1);
+    struct repl_msg k = {.type = REPL_M_ACK, .from = 0, .to = 1, .epoch = 2, .leader = -1, .durable = 101,
+                         .written = 101, .rid = 33, .resync = 1, .set_version = 1};
+    const struct repl_action *q = NULL;
+    int t;
+    for (t = 1; t <= 100 && !q; t++) {
+        repl_recv(r, &k); /* node 2, now index 0, keeps up; node 0, now index 2, is silent */
+        drain(r, &d, NULL);
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    }
+    CHECK(q && q->msg.meta.isr == 0x3, "the silent old leader (index 2) was not dropped within 100 ticks");
+    CHECK(t <= (int)c.unanswered_ticks + 2, "dropped only after %d ticks (unanswered_ticks %u)", t, c.unanswered_ticks);
+    repl_free(r);
+}
+
+/* A set change during a join that moves the learner to another index: the commit point is held for it there. */
+static void join_remap(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c);
+    CHECK(r && repl_is_leader(r), "not leader");
+    uint64_t wend[1024] = {0}, learner = 101;
+    char desc[2048];
+    int t, held = 0;
+    for (t = 0; t < 600 && !held; t++) {
+        learner = t >= 3 ? wend[t - 3] : 101; /* three ticks behind the leader */
+        CHECK(!join_step(r, &d, learner), "the learner was asked for before its join began");
+        wend[t] = repl_written(r);
+        repl_describe(r, desc, sizeof desc);
+        held = strstr(desc, "held for learner 1 ") != NULL;
+    }
+    CHECK(held, "the commit point was never held for the learner");
+    int swap[3] = {0, 2, 1}; /* the learner moves to index 2, member 2 to index 1 */
+    CHECK(repl_reconfig(r, 3, 0, swap) == REPL_OK, "reconfig");
+    repl_set_version(r, 1);
+    repl_describe(r, desc, sizeof desc);
+    CHECK(strstr(desc, "held for learner 2 "), "the join did not move with the learner: %s", desc);
+    uint64_t c0 = repl_commit(r); /* the hold began this tick, above the learner: it keeps the commit point there */
+    join_step_at(r, &d, learner, 2, 1, 1); /* the learner stays where it was, member 2 follows the leader */
+    CHECK(repl_commit(r) == c0, "commit %" PRIu64 " moved past %" PRIu64 " with the joining learner at %" PRIu64
+          " (written %" PRIu64 ")", repl_commit(r), c0, learner, repl_written(r));
+    repl_free(r);
+}
+
+/* A pending ISR request that adds a member the set change removes was never applied: it goes, and the leader asks
+ * again in the new set (here: to drop a member gone silent) without waiting for a later record. */
+static void busy_drop(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* ISR {0, 2}, learner 1 caught up at 101 */
+    CHECK(r && repl_is_leader(r), "not leader");
+    const struct repl_action *q = NULL;
+    for (int t = 0; t < 100 && !q; t++)
+        q = join_step(r, &d, repl_written(r));
+    CHECK(q && q->msg.meta.isr == 0x7, "the learner was not asked for");
+    int map[2] = {0, 2}; /* REMOVE the learner before the add was applied */
+    CHECK(repl_reconfig(r, 2, 0, map) == REPL_OK, "reconfig");
+    repl_set_version(r, 1);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x3, 0);
+    m.set_version = 1;
+    m.meta.rid[1] = 33;
+    m.meta.rid[2] = 0;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    q = NULL;
+    int t;
+    for (t = 0; t < 3 * (int)c.isr_lag_ticks && !q; t++) { /* node 2 (index 1) goes silent */
+        uint64_t pos;
+        repl_write(r, 1, &pos);
+        drain(r, &d, NULL);
+        repl_synced(r, repl_written(r));
+        repl_tick(r);
+        drain(r, &d, NULL);
+        q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+        if (q && q->msg.meta.isr != 0x1)
+            q = NULL;
+    }
+    CHECK(q, "a silent member was not dropped in %d ticks: the removed learner's add still pending", t);
     repl_free(r);
 }
 
@@ -840,6 +1312,15 @@ int main(int argc, char **argv)
     replay_floor();
     steady_join();
     join_giveup();
+    reconfig();
+    hold();
+    unans_remap();
+    join_remap();
+    busy_drop();
+    leave();
+    target();
+    replay();
+    snapshot();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

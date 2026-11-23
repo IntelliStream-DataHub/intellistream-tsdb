@@ -1165,6 +1165,22 @@ key). A replica's open also hands the segments it finds wholly in parts and appl
 writer's kept segments stayed until a promotion). `test_replica keepfiles` (mutant `replicadropsfiles`, also
 `TSDB_REPLD_MUTANT=replicadropsfiles` in tsdbd).
 
+*Built in R4 (r4-core), in the replication core (`src/repl.[ch]`) and its simulator only; repld does not call it
+yet.* A set change (8.1's ADD, a REMOVE, a RESET, a move) reaches a running core as `repl_reconfig(r, nnodes, self,
+old_of)`: peer state, the record's ISR and rids, a pending ISR request, the join and the leave mark move with their
+members; a removed member stops counting in the commit point, the join hold, the replay floor and the unanswered set.
+The driver drains the core's actions first (`REPL_E_PENDING` otherwise: they name the old indexes) and hands over only
+records of the core's set version (`repl_dropped_meta` counts any other). A leader whose change removes a member of its
+record's ISR (its own shrink applied, the record not yet adopted) commits nothing and asks nothing until it adopts a
+record of the new version; with no such shrink pending it is deposed (`REPL_E_INVALID`: the driver reopens the core).
+Every replication message carries the set version (`repl_set_version`; one of another version is dropped and counted,
+a FENCE excepted), and the ACK a replica's replay start (`repl_replay_start`, D17): the leader's replay floor is the
+lowest of the members' replay starts, an empty log counting with the lowest position this leader sent it and its own
+log start. A move's shrink is `repl_leave(r, A, min_isr)` (D11), a planned promotion `repl_meta_promote_to` with a
+target and its `min_end` (D14). On the wire: replwire `RW_VERSION` 2, peer protocol 6. `tests/test_repl.c`
+(`reconfig hold unans_remap join_remap busy_drop leave target replay snapshot`), `tests/sim_repl.c` checks 9 and 10,
+mutants 43-57 (`tests/sim_repl.sh`).
+
 ### 8.4 Priorities
 
 Rebuilds run in this order: volumes whose ISR has 1 member, then volumes with 2, then moves for balance. A rebuild
