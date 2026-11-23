@@ -43,6 +43,7 @@
 #include "ecapply.h"
 #include "eccold.h"
 #include "feed.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -2985,6 +2986,83 @@ static void case_ppos_pos(void)
     xp_stop(&x);
     printf("  ppos positions: a leader's COMMIT and the replica's apply of it record the marker's, a flush 0, also "
            "after a publish failed past its marker on the same thread\n");
+}
+
+/* R8 (r8d): on an ec cluster volume (requires=cluster,ec) the replica records the ppos the leader records: the same
+ * rows at the same positions, so per partition key the same highest position over its parts (flush parts from their
+ * memtables' day maps, which may group rows otherwise), and every COMMIT part (a large insert, a delete, a replace) at
+ * its marker's position on both. */
+static uint64_t key_max_ppos(eng *db, int64_t key, uint64_t want, bool *has_want)
+{
+    uint64_t mx = 0;
+    for (size_t i = 0; i < db->nparts; i++) {
+        uint64_t pp = 0;
+        if (db->parts[i]->partition != key)
+            continue;
+        CHECK_EQ(ppos_of(db, db->parts[i]->name, &pp), 0);
+        mx = pp > mx ? pp : mx;
+        if (pp == want)
+            *has_want = true;
+    }
+    return mx;
+}
+
+static void case_ppos_parity(void)
+{
+    xport x;
+    memset(&x, 0, sizeof x);
+    char ld[PATH_MAX], rd[PATH_MAX + 4];
+    fresh(ld, "pposq");
+    int fd = open(ld, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_EC) == 0);
+    if (fd >= 0)
+        close(fd);
+    snprintf(x.ldir, sizeof x.ldir, "%s", ld);
+    snprintf(rd, sizeof rd, "%s_r", ld);
+    sh("rm -rf '%s' && cp -a '%s' '%s'", rd, ld, rd);
+    meta_cluster_open_allow(true);
+    CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
+    xp_open_leader(&x);
+    CHECK(x.ld->ppos != NULL && x.rep && x.rep->ppos != NULL);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_rows(&x, 1, 2 * 86400, 10, 200); /* day 2 */
+    xp_rows(&x, 0, 20, 5, 300);
+    xp_step(&x, "pposq: rows");
+    xp_rows(&x, 0, 40, 40, 2000); /* a large insert: a COMMIT */
+    uint64_t c[3];
+    c[0] = ld_last(&x);
+    xp_step(&x, "pposq: large insert");
+    CHECK_EQ(eng_delete_range(x.ld, 1, T0 + 1000LL * 2 * 86400, T0 + 1000LL * (2 * 86400 + 3)), 0);
+    c[1] = ld_last(&x);
+    xp_step(&x, "pposq: delete");
+    xp_replace(&x, 0, 60, 70, 5, 500);
+    c[2] = ld_last(&x);
+    xp_step(&x, "pposq: replace");
+    xp_rows(&x, 1, 2 * 86400 + 30, 5, 600);
+    xp_rows(&x, 0, 90, 5, 700);
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 4 * 86400, 40, 900); /* a COMMIT in day 4: the replica flushes its memtable before it applies it */
+    xp_step(&x, "pposq: flush");
+    int64_t keys[2] = {partition_of(x.ld, 0, T0), partition_of(x.ld, 1, T0 + 1000LL * 2 * 86400)};
+    CHECK(keys[0] != keys[1]);
+    for (int k = 0; k < 2; k++) {
+        bool hl = false, hr = false;
+        uint64_t want = k == 0 ? c[0] : c[1]; /* day 0: the large insert's part; day 2: the delete's */
+        uint64_t ml = key_max_ppos(x.ld, keys[k], want, &hl), mr = key_max_ppos(x.rep, keys[k], want, &hr);
+        if (ml != mr || ml == 0)
+            fprintf(stderr, "pposq: key %" PRId64 ": the leader's highest ppos %" PRIu64 ", the replica's %" PRIu64 "\n",
+                    keys[k], ml, mr);
+        CHECK(ml == mr && ml != 0);
+        CHECK(hl && hr); /* the COMMIT part at its marker's position on both */
+    }
+    bool hl = false, hr = false; /* the replace's part, in day 0 */
+    key_max_ppos(x.ld, partition_of(x.ld, 0, T0), c[2], &hl);
+    key_max_ppos(x.rep, partition_of(x.rep, 0, T0), c[2], &hr);
+    CHECK(hl && hr);
+    xp_stop(&x);
+    meta_cluster_open_allow(false);
+    printf("  ppos parity: on an ec cluster volume the replica records the leader's ppos (per key, and each COMMIT "
+           "part at its marker's position)\n");
 }
 
 /* a COMMIT whose files are not staged: not acknowledged, not applied, until they are */
@@ -6921,6 +6999,7 @@ int main(int argc, char **argv)
         case_cold_hold();
         case_ppos_sites();
         case_ppos_pos();
+        case_ppos_parity();
         if (failures == 0)
             sh("rm -rf '%s'", S);
         printf(failures ? "test_replica (R8 cases): %d failures\n" : "test_replica (R8 cases): ok\n", failures);
@@ -7091,6 +7170,7 @@ int main(int argc, char **argv)
     case_cold_hold();
     case_ppos_sites();
     case_ppos_pos();
+    case_ppos_parity();
     case_commit_cut();
     case_commit_hold_cut();
     case_apply_concurrent();

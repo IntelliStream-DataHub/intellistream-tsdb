@@ -209,7 +209,7 @@ $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h s
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c server/tenants.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # STATS_SERIES and STATS_TENANTS over the network: tsdbd with login on and off, the C client, a fake server
-$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(CLIB) $(LIB)
+$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(B)/libtsdbclient.a $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
@@ -279,9 +279,12 @@ $(B)/test_upgrade: tests/test_upgrade.c src/internal.h $(LIB)
 $(B)/test_fno: tests/test_fno.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_ppos: tests/test_ppos.c src/internal.h src/ppos.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 # the DIVERGED file (src/ecdiverge.c, R8 D8): damage, power loss and EIO at every step (crashfs), --clear, and tsdbd's
 # one answer for it (STATUS, UNAVAILABLE, /metrics, the root included). The mutant runs plant the bugs it guards against.
-$(B)/test_diverge: tests/test_diverge.c tests/harness.h src/internal.h src/ecdiverge.h $(CLIB) $(LIB) $(CRASHFS_SO)
+$(B)/test_diverge: tests/test_diverge.c tests/harness.h src/internal.h src/ecdiverge.h $(B)/libtsdbclient.a $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 # an insert's intent recovered at the open (src/part.c intents_recover), power lost at every step of it (crashfs);
@@ -397,7 +400,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle $(B)/test_marker
+test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle $(B)/test_marker
 test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(or $(TMPDIR),/tmp)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -429,6 +432,8 @@ test-units-b: $(B)/test_props $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/
 	$(MUT) --name test_ecnames --list "nameloose tierloose" -- ./$(B)/test_ecnames --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(or $(TMPDIR),/tmp) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
+	./$(B)/test_ppos $(or $(TMPDIR),/tmp)
+	$(if $(EC_OBJ),$(MUT) --name test_ppos --list "pposafter pposnosync pposflushhi pposreplay pposunknown0 pposfallback0 pposnofail pposnobadgood pposflags" -- ./$(B)/test_ppos --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecswap $(or $(TMPDIR),/tmp)
 	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled swaploggedgc" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecgc $(or $(TMPDIR),/tmp)

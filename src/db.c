@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
+#include "ppos.h"
 #include "eccache.h"
 #include "ecgc.h"
 #include "eckeep.h"
@@ -1022,7 +1023,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         if (test_before_parts)
             test_before_parts(test_before_parts_arg);
         if ((rc = load_parts(db, ro)) != 0 || (rc = parts_check_series(db, ro)) != 0 ||
-            (rc = cls_check_parts(db)) != 0 || (rc = latest_build(db)) != 0)
+            (rc = cls_check_parts(db)) != 0 || (rc = latest_build(db)) != 0 ||
+            (rc = ppos_open(db)) != 0) /* an ec cluster volume's PPOS: a record per listed part (src/ppos.h) */
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
            after the WAL's checks too, just before the replay writes anything */
@@ -1255,6 +1257,7 @@ int eng_close(eng *db)
         ret_close(db);
     if (db->cls_fd != -2)
         cls_close(db);
+    ppos_close(db);
     while (db->cc_free) {
         codec_ctx *c = db->cc_free;
         db->cc_free = c->next;
