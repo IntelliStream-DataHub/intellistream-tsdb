@@ -16,6 +16,8 @@
  */
 #define _GNU_SOURCE
 #include "cvolfs.h"
+#include "cvolset.h"
+#include "snapinst.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -194,6 +196,8 @@ static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vd
 int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_open *out)
 {
     char vdir[4200];
+    if (snapinst_leftovers(root, r->number) != 0 || cvolset_prepare(root, r->number, r) != 0)
+        return -1; /* R4: an install a crash interrupted, a directory the record no longer describes (lines said) */
     if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number) >= sizeof vdir) {
         say("volume %" PRIu32 ": the path of %s is too long", r->number, root);
         return -1;

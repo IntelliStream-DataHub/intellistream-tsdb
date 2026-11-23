@@ -15,6 +15,10 @@ A server whose state directory holds metadata of another version refuses to star
 metadata log without a snapshot stops at its first entry with such a line: the log's entries are marked "TME2" now):
 a cluster made before this change is initialised again, not upgraded (as for every change of the preview).
 
+**The peer protocol is now version 7** (R4's command from the metadata group's leader to a volume's member, and the
+member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised
+again.
+
 **Replica set changes in the replication core (R4, r4-core; the core and its simulator only, nothing drives them in
 tsdbd yet).** `src/repl.[ch]`: `repl_reconfig` (a member added, removed or reset under a running core; refused with
 `REPL_E_PENDING` while actions are queued, `REPL_E_INVALID` for a deposed leader), the replica set version in every

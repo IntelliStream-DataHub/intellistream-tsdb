@@ -49,9 +49,11 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 6         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+#define PL_CL_VERSION 7         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
                                  * HB and HB_ACK (r3e-leases), 6 the replication messages' set version and replay
-                                 * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard */
+                                 * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard;
+                                 * 7 R4's F_VOLCMD and VOLMSG READY (r4-iface): a peer of 6 drops the connection that
+                                 * carries Raft at the first VOLCMD */
 
 /* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
  * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a
@@ -61,8 +63,10 @@
 /* CHUNK (requests to a member's chunk stores and their answers) and CHUNKB (chunk puts as bulk files, under a rate cap
  * of their own) are server/chunksrv.c's, on a peerlink of its own as well (design-cluster-data.md §5.7, R8 D10); 5 is
  * R4's snapshot transfer. */
-enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_CHUNK = 6,
-       PL_KIND_CHUNKB = 7 };
+/* SNAP carries snapshots only (R4 plan D7: a COMMIT's file never waits behind a snapshot's), on the replication
+ * driver's peerlink (repld.c hands its frames and files to server/rsnap.c). */
+enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_SNAP = 5,
+       PL_KIND_CHUNK = 6, PL_KIND_CHUNKB = 7 };
 #define PL_KIND_DATA_MAX PL_KIND_CHUNKB /* data kinds are 1 .. this */
 
 enum {
