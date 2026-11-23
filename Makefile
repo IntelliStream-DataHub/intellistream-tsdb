@@ -209,7 +209,7 @@ $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h s
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c server/tenants.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # STATS_SERIES and STATS_TENANTS over the network: tsdbd with login on and off, the C client, a fake server
-$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(CLIB) $(LIB)
+$(B)/test_stats_net: tests/test_stats_net.c tests/harness.h tests/auth_harness.h server/users.h $(B)/users.o $(B)/libtsdbclient.a $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
@@ -284,7 +284,7 @@ $(B)/test_ppos: tests/test_ppos.c src/internal.h src/ppos.h $(LIB)
 
 # the DIVERGED file (src/ecdiverge.c, R8 D8): damage, power loss and EIO at every step (crashfs), --clear, and tsdbd's
 # one answer for it (STATUS, UNAVAILABLE, /metrics, the root included). The mutant runs plant the bugs it guards against.
-$(B)/test_diverge: tests/test_diverge.c tests/harness.h src/internal.h src/ecdiverge.h $(CLIB) $(LIB) $(CRASHFS_SO)
+$(B)/test_diverge: tests/test_diverge.c tests/harness.h src/internal.h src/ecdiverge.h $(B)/libtsdbclient.a $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 # an insert's intent recovered at the open (src/part.c intents_recover), power lost at every step of it (crashfs);
