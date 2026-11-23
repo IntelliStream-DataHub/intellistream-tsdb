@@ -13,9 +13,11 @@
  * nothing renamed, DIVERGED, still after a restart); dropped (P dropped by the replica between the staging and the
  * intent: nothing listed, nothing retired); leader (a leader killed after its swap, or after the swap's intent and
  * before its renames, reopened as a replica: the COLD replayed is not applied again, every oid listed once, the .ec's
- * PPOS record there).
+ * PPOS record there); power (crashfs power loss at every step of the apply: the old parts or the new set, then the
+ * apply ends with the new set).
  *
- * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored coldnoflushthrough leaderswapnors pposafterswap;
+ * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
+ * pposafterswap;
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -957,6 +959,175 @@ static void test_leader(void)
     printf("  leader: killed after its swap or before its renames, reopened as a replica: its COLD not applied again\n");
 }
 
+/* ------------------------------------------------------------ power: crashfs power loss at every step of the apply */
+
+static char SHIM[PATH_MAX];
+static void ack_path(char *p, size_t cap, const char *root, const char *what)
+{
+    const char *b = strrchr(root, '/');
+    snprintf(p, cap, "%s/ack.%s.%s", S, b ? b + 1 : root, what);
+}
+static void power_ack(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0)
+        close(fd);
+}
+static bool power_acked(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    return access(p, F_OK) == 0;
+}
+static void power_unack(const char *root, const char *what)
+{
+    char p[PATH_MAX + 32];
+    ack_path(p, sizeof p, root, what);
+    unlink(p);
+}
+/* the child under crashfs: the replica, applied through cpos - 1 and closed, applies the COLD and the rest */
+static int power_child(const char *root, uint64_t last, uint64_t cpos)
+{
+    lt L;
+    lt_paths(&L, root);
+    rt R = {0};
+    snprintf(R.dir, sizeof R.dir, "%s/rep", root);
+    if (ropen(&L, &R, cpos - 1) != 0)
+        _exit(2);
+    if (replica_apply(R.db, last) != 0)
+        _exit(5);
+    power_ack(root, "applied");
+    eng_close(R.db);
+    tier_put(R.t);
+    _exit(0);
+}
+static int power_run(const char *root, int warmup, int seed, uint64_t last, uint64_t cpos)
+{
+    fflush(NULL);
+    char a[24], b[24];
+    snprintf(a, sizeof a, "%" PRIu64, last);
+    snprintf(b, sizeof b, "%" PRIu64, cpos);
+    char *argv[] = {"test_ecapply", S, "--power-child", (char *)root, a, b, NULL};
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512], w[16], sd[16];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%d", seed);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", root, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = getenv("TEST_ECAPPLY_POWER_LOG") ? -1 : open("/dev/null", O_WRONLY);
+        if (null >= 0)
+            dup2(null, 2);
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+    int ws = 0;
+    if (pid < 0 || waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws))
+        return -1;
+    return WEXITSTATUS(ws);
+}
+/* After a power loss at step k the replica opens with P's old parts listed (no .ec, no settled_) or the new set (the
+ * .ec part, Y above it, every retired part under settled_), the rows of P the same either way; the apply then ends
+ * with the new set. Each step starts from a copy of one template (leader settled, replica applied through cpos - 1). */
+static void test_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power: skipped (no %s)\n", SHIM);
+        return;
+    }
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("power", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload(&L, &c, false);
+    uint64_t last = LAST, cpos = L.x.cold_fno;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(feed(&R, cpos - 1) == 0);
+    rstop(&R);
+    char tmpl[PATH_MAX / 2];
+    snprintf(tmpl, sizeof tmpl, "%s", L.root);
+    int crashes = 0, applied = 0, newset = 0, f0 = failures;
+    bool finished = false;
+    int k0 = getenv("TEST_ECAPPLY_POWER_K") ? atoi(getenv("TEST_ECAPPLY_POWER_K")) : 0;
+    /* several seeds per step: CRASHFS_TEAR keeps a random subset of the unsynced directory operations, and the window
+     * that only the intent's directory fsync closes (renames kept, the intent's name lost) is a few steps wide */
+    int seeds = getenv("TEST_ECAPPLY_POWER_SEEDS") ? atoi(getenv("TEST_ECAPPLY_POWER_SEEDS")) : 6;
+    for (int ks = k0 * seeds; ks < 4000 * seeds && !finished && failures == f0; ks++) {
+        int k = ks / seeds;
+        alarm(240);
+        char work[PATH_MAX / 2 + 8], cmd[PATH_MAX * 2];
+        snprintf(work, sizeof work, "%s-w", tmpl);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", work, tmpl, work);
+        CHECK(system(cmd) == 0);
+        power_unack(work, "applied");
+        int code = power_run(work, k, ks + 1, last, cpos);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0) {
+            fprintf(stderr, "power: the child at step %d exited %d\n", k, code);
+            break;
+        }
+        crashes += code == 99;
+        finished = code == 0 && ks % seeds == seeds - 1;
+        bool ap = power_acked(work, "applied");
+        applied += ap;
+        power_unack(work, "applied");
+        lt W;
+        lt_paths(&W, work);
+        rt Q = {0};
+        snprintf(Q.dir, sizeof Q.dir, "%s/rep", work);
+        if (ropen(&W, &Q, cpos - 1) != 0) {
+            CHECK(0);
+            fprintf(stderr, "power: after a power loss at step %d the replica does not open%s\n", k,
+                    ap ? " (applied)" : "");
+            break;
+        }
+        part *ec[8], *rest[8];
+        size_t ne = parts_of(Q.db, KEY, ec, 8, true), nr = parts_of(Q.db, KEY, rest, 8, false);
+        int st = settled_of_key(Q.dir);
+        bool old = ne == 0 && st == 0 && nr >= 1, nw = ne == 1 && nr == 1 && st >= 1;
+        CHECK(old || nw);
+        CHECK(!ap || nw);
+        if (!(old || nw) || (ap && !nw))
+            fprintf(stderr, "power: step %d: %zu .ec parts, %zu others, %d settled_%s\n", k, ne, nr, st,
+                    ap ? " (applied)" : "");
+        newset += nw;
+        unref_all(ec, ne);
+        unref_all(rest, nr);
+        CHECK(p_holds(Q.db));
+        CHECK(replica_apply(Q.db, last) == 0);
+        check_listed(Q.db, "power");
+        CHECK(p_holds(Q.db) && d1_holds(Q.db, false));
+        CHECK(count_names(Q.dir, "txn_") == 0);
+        CHECK(eng_check(Q.db) == 0);
+        rstop(&Q);
+    }
+    CHECK(finished && crashes >= 20 && newset > 0);
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s-w'", tmpl);
+    if (failures == f0 && system(cmd) != 0)
+        CHECK(0);
+    lclose(&L);
+    printf("  power: power lost at each of %d steps of the apply (%d acknowledged, %d with the new set listed): the "
+           "old parts or the new set, then the apply ends with the new set\n", crashes, applied, newset);
+}
+
 static void alarm_exit(int sig)
 {
     (void)sig;
@@ -968,13 +1139,16 @@ static void alarm_exit(int sig)
 
 int main(int argc, char **argv)
 {
-    const char *only = NULL;
+    const char *only = NULL, *power_root = NULL;
+    uint64_t p_last = 0, p_cpos = 0;
     snprintf(S, sizeof S, "/tmp");
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
             mutant = argv[++i];
         else if (!strcmp(argv[i], "--case") && i + 1 < argc)
             only = argv[++i];
+        else if (!strcmp(argv[i], "--power-child") && i + 3 < argc)
+            power_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
         else
             snprintf(S, sizeof S, "%s", argv[i]);
     }
@@ -994,11 +1168,19 @@ int main(int argc, char **argv)
     WRAP.stripe_version = w_sv;
     atomic_store(&eccold_test_hook, step_hook);
     leader_test_marker_hook = eccold_after_append;
+    if (power_root)
+        return power_child(power_root, p_last, p_cpos);
+    char self[PATH_MAX];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    self[sl > 0 ? sl : 0] = '\0';
+    char *slash = strrchr(self, '/');
+    snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - self) : 1, slash ? self : ".");
     printf("test_ecapply%s%s\n", strcmp(mutant, "none") ? ": mutant " : "", strcmp(mutant, "none") ? mutant : "");
     struct {
         const char *name;
         void (*fn)(void);
-    } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"leader", test_leader}};
+    } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"leader", test_leader},
+                 {"power", test_power}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();
