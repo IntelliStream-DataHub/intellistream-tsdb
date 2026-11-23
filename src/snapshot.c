@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Snapshots of a leader's volume, the make side (docs/design-cluster.md 5.2-5.3, 8.1; R4 D3, D4). A member further
- * behind than the leader's keep caps, a fresh learner on an old volume and a reset member are rebuilt from a snapshot:
+ * Snapshots of a leader's volume, the make side and the install (docs/design-cluster.md 5.2-5.3, 8.1; R4 D3-D6). A
+ * member further behind than the leader's keep caps, a fresh learner on an old volume and a reset member are rebuilt from a snapshot:
  * the leader's crash image at a cut P, its commit point. The replica opens it as a restart would: log start S's first
- * position, log end P, floor P, the epoch history up to P (r4-snapinst installs it; this file only makes it).
+ * position, log end P, floor P, the epoch history up to P (the install, second half of this file).
  *
  * The cut. Under flush_lock, then publish_lock (and inside them db->lock, buf_lock and lead_mu, each briefly), and with
  * no I/O but these reads of memory: P = the commit point; the names of the listed parts; the memtables' segments and
@@ -67,6 +67,8 @@
  */
 #include "internal.h"
 #include "snapshot.h"
+#include "feed.h"
+#include "replfile.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -75,11 +77,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 void (*snap_test_hook)(struct eng *db, int at, const char *arg);
-void (*snap_test_cut)(struct eng *db, uint64_t p);
+void (*snap_test_cut)(struct eng *db, uint64_t p, const char (*parts)[96], size_t nparts);
+void (*snap_inst_hook)(int at);
 int snap_mutant;
 
 static void hook(eng *db, int at, const char *arg)
@@ -723,9 +727,9 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         rc = leader_rs_image(db, &rsb, &rsl, &done);
     if (rc == 0)
         rc = leader_links_list(db, p, &lf, &nlf);
-    void (*cut)(eng *, uint64_t) = __atomic_load_n(&snap_test_cut, __ATOMIC_ACQUIRE);
-    if (rc == 0 && cut)
-        cut(db, p);
+    void (*cut)(eng *, uint64_t, const char (*)[96], size_t) = __atomic_load_n(&snap_test_cut, __ATOMIC_ACQUIRE);
+    if (rc == 0 && cut) /* the list the make took: a merge may list its output since (it takes no publish_lock) */
+        cut(db, p, snap_mutant == SNAP_MUT_AFTERP ? NULL : (const char(*)[96])parts, nparts);
     pthread_mutex_unlock(&db->publish_lock);
     pthread_mutex_unlock(&db->flush_lock);
     if (rc)
@@ -886,8 +890,10 @@ out:
 /* ---- release and sweep ---- */
 
 /* The names are read whole before any is unlinked, and the directory read again until a pass finds none: readdir is
- * unspecified while entries go (NFS's cookies skip some), and a skipped one would fail the rmdir */
-static int rm_dir_at(int pfd, const char *name)
+ * unspecified while entries go (NFS's cookies skip some), and a skipped one would fail the rmdir. A directory entry is
+ * removed the same way, a few levels deep: a former leader's v<N> holds the snap_* directories of its makes until a
+ * writable open sweeps them (snap_sweep), and an install over it removes v<N>.old whole or fails on every start */
+static int rm_dir_depth(int pfd, const char *name, int depth)
 {
     int dfd = openat(pfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dfd < 0)
@@ -925,15 +931,28 @@ static int rm_dir_at(int pfd, const char *name)
         if (rc == 0 && errno)
             rc = TSDB_ERR_IO; /* a readdir error is an error, never the end of the directory */
         closedir(d);
-        for (size_t i = 0; rc == 0 && i < found; i++)
-            if (unlinkat(dfd, v[i], 0) != 0 && errno != ENOENT)
-                rc = TSDB_ERR_IO;
+        for (size_t i = 0; rc == 0 && i < found; i++) {
+            if (unlinkat(dfd, v[i], 0) == 0 || errno == ENOENT)
+                continue;
+            /* EISDIR on Linux, EPERM where POSIX allows it: a directory (anything else fails its O_DIRECTORY open) */
+            rc = (errno == EISDIR || errno == EPERM) && depth < 3 ? rm_dir_depth(dfd, v[i], depth + 1) : TSDB_ERR_IO;
+        }
+        /* each pass's unlinks synced before the next looks (and before the rmdir): a power loss then leaves the
+         * directory with whole files or without them, and the install's removal of v<N>.old works under a shim that
+         * keeps unsynced unlinks aside in the directory until its fsync (crashfs: test_snapshot's install power case) */
+        if (rc == 0 && found && tsdb_fsync(dfd) != 0)
+            rc = TSDB_ERR_IO;
         free(v);
     }
     close(dfd);
     if (rc == 0 && unlinkat(pfd, name, AT_REMOVEDIR) != 0 && errno != ENOENT)
         rc = TSDB_ERR_IO;
     return rc;
+}
+
+static int rm_dir_at(int pfd, const char *name)
+{
+    return rm_dir_depth(pfd, name, 0);
 }
 
 int snap_release(const char *path)
@@ -1005,6 +1024,17 @@ static int cmp_fname(const void *a, const void *b)
     return strcmp((*(const struct snap_file *const *)a)->name, (*(const struct snap_file *const *)b)->name);
 }
 
+/* The names the install writes itself: a SNAPMAN that lists one is refused, so a received copy never carries the mark
+ * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO or LOCK of the sender */
+static bool snap_name_reserved(const char *n)
+{
+    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp"};
+    for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
+        if (strcmp(n, r[i]) == 0)
+            return true;
+    return false;
+}
+
 int snap_man_read(const char *dir, struct snap_man *m)
 {
     memset(m, 0, sizeof *m);
@@ -1067,6 +1097,7 @@ int snap_man_read(const char *dir, struct snap_man *m)
             f->xxh64 = get64(b + o), o += 8;
             memcpy(&f->link, b + o, 4), o += 4;
             ok = strcmp(f->name, ".") && strcmp(f->name, "..") && strncmp(f->name, SNAP_MAN, strlen(SNAP_MAN)) &&
+                 !snap_name_reserved(f->name) &&
                  f->kind >= SNAP_PART && f->kind <= SNAP_META &&
                  (!f->link || (f->link <= i && !m->files[f->link - 1].link && m->files[f->link - 1].size == f->size &&
                                m->files[f->link - 1].xxh64 == f->xxh64));
@@ -1102,4 +1133,464 @@ void snap_man_free(struct snap_man *m)
     free(m->files);
     m->hist = NULL, m->files = NULL;
     m->nhist = m->nfiles = 0;
+}
+
+/* ======================================================================== the install side (R4 D5, D6)
+ *
+ * A received copy is not a replica directory yet: it has the leader's META, no FNO and no REPL. snap_install makes it
+ * one in place (META says requires=cluster,replica and this volume; FNO = P + 1, the log end the replica open accepts:
+ * it refuses an FNO above the end of its segments; REPL with floor P, log start S and the history up to P, and the
+ * receiver's identity and promises, D6), marks it whole with SNAPDONE (synced, then the directory), and swaps it in:
+ * v<N> -> v<N>.old, v<N>.snap -> v<N>, the root synced, v<N>.old removed. Before SNAPDONE nothing outside v<N>.snap
+ * changed; after it the swap may be finished by snap_leftovers at the next start. A crash at any step leaves the old
+ * directory whole (with or without a v<N>.snap that the next start finishes or removes) or the new one whole.
+ *
+ * Why the promises are kept and not taken from the snapshot: a lower fence would let a deposed leader's records in
+ * (its epoch passed this replica's fence once); `led` means "this instance led the epoch" and led = fence is what
+ * clears `unsure`, so raising it would turn an unsure REPL trusted; an unsure REPL stays unsure with the open
+ * generation moved by a belt (a gap is free, a generation used twice is not), so the open's unsure path takes the epoch
+ * from the metadata group before it leads or answers a fence. The open generation is kept: the reopen raises it.
+ */
+static void inst_hook(int at)
+{
+    void (*h)(int) = __atomic_load_n(&snap_inst_hook, __ATOMIC_ACQUIRE);
+    if (h)
+        h(at);
+}
+
+static int fsync_at(int dfd)
+{
+    return tsdb_fsync(dfd) == 0 ? 0 : TSDB_ERR_IO;
+}
+
+/* every file of the manifest is there with its size and xxh64 (a link entry may be missing: it is made here from the
+ * entry it names, the receiver got the file once), nothing else is, every file is synced */
+static int inst_verify_files(int sdfd, const struct snap_man *m, const char *staged)
+{
+    struct stat *sts = calloc(m->nfiles ? m->nfiles : 1, sizeof *sts);
+    if (!sts)
+        return TSDB_ERR_NOMEM;
+    int rc = 0;
+    for (size_t i = 0; i < m->nfiles && rc == 0; i++) {
+        const struct snap_file *f = &m->files[i];
+        if (f->link && fstatat(sdfd, f->name, &sts[i], AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
+            linkat(sdfd, m->files[f->link - 1].name, sdfd, f->name, 0) != 0) {
+            fprintf(stderr, "tsdb: %s: cannot link %s to %s: %s\n", staged, f->name, m->files[f->link - 1].name,
+                    strerror(errno));
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        int fd = openat(sdfd, f->name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            fprintf(stderr, "tsdb: %s: the snapshot's file %s is missing: %s\n", staged, f->name, strerror(errno));
+            rc = errno == ENOENT ? TSDB_ERR_CORRUPT : TSDB_ERR_IO;
+            break;
+        }
+        uint64_t size = 0, xxh = 0;
+        if (fstat(fd, &sts[i]) != 0 || !S_ISREG(sts[i].st_mode)) {
+            rc = TSDB_ERR_CORRUPT;
+        } else if (f->link && sts[i].st_ino == sts[f->link - 1].st_ino && sts[i].st_dev == sts[f->link - 1].st_dev) {
+            size = m->files[f->link - 1].size, xxh = m->files[f->link - 1].xxh64; /* the same inode: read once */
+        } else if ((rc = snap_xxh64_fd(fd, &size, &xxh)) != 0) {
+            rc = rc == TSDB_ERR_NOMEM ? rc : TSDB_ERR_IO;
+        }
+        if (rc == 0 && (size != f->size || xxh != f->xxh64)) {
+            fprintf(stderr, "tsdb: %s: the snapshot's file %s has %" PRIu64 " bytes of xxh64 %016" PRIx64 ", SNAPMAN "
+                            "says %" PRIu64 " and %016" PRIx64 "\n", staged, f->name, size, xxh, f->size, f->xxh64);
+            rc = TSDB_ERR_CORRUPT;
+        }
+        /* the receiver's bytes are durable before SNAPDONE says the directory is whole */
+        if (rc == 0 && tsdb_fdatasync(fd) != 0)
+            rc = TSDB_ERR_IO;
+        close(fd);
+    }
+    free(sts);
+    /* nothing else: a file the manifest does not name would be taken for the volume's own by the open */
+    DIR *d = rc == 0 ? fdopendir(dup(sdfd)) : NULL;
+    if (rc == 0 && !d)
+        rc = TSDB_ERR_IO;
+    if (d) {
+        rewinddir(d);
+        struct dirent *e;
+        for (errno = 0; rc == 0 && (e = readdir(d)); errno = 0) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strcmp(e->d_name, SNAP_MAN))
+                continue;
+            bool named = false;
+            for (size_t i = 0; i < m->nfiles && !named; i++)
+                named = !strcmp(m->files[i].name, e->d_name);
+            if (!named) {
+                fprintf(stderr, "tsdb: %s: %s is not the snapshot's (SNAPMAN does not name it)\n", staged, e->d_name);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+        if (rc == 0 && errno)
+            rc = TSDB_ERR_IO; /* a readdir error is an error, never the end of the directory */
+        closedir(d);
+    }
+    return rc;
+}
+
+/* every part's own checksums: header, index and footer (part_open), and every granule's crc */
+static int inst_verify_parts(int sdfd, const struct snap_man *m, bool v8_ok, const char *staged)
+{
+    for (size_t i = 0; i < m->nfiles; i++) {
+        const struct snap_file *f = &m->files[i];
+        if (f->kind != SNAP_PART)
+            continue;
+        size_t nl = strlen(f->name);
+        if (nl < 6 || strcmp(f->name + nl - 5, ".part") != 0) {
+            fprintf(stderr, "tsdb: %s: %s is not a .part (an .ec part cannot be installed yet)\n", staged, f->name);
+            return TSDB_ERR_INVALID;
+        }
+        part *p = NULL;
+        int rc = part_open_as(sdfd, f->name, f->name, false, v8_ok, &p);
+        if (rc != 0) {
+            fprintf(stderr, "tsdb: %s: the part %s does not open: %d\n", staged, f->name, rc);
+            return rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ? rc : TSDB_ERR_CORRUPT;
+        }
+        for (uint32_t k = 0; k < p->ng && rc == 0; k++) {
+            granule g;
+            gx_load(p, k, GW_LOC, &g);
+            uint64_t len = (uint64_t)g.ts_len + g.val_len;
+            if (g.off > p->map_len || len > p->map_len - g.off ||
+                (uint32_t)xxh64(p->map + g.off, (size_t)len, 0) != g.crc) {
+                fprintf(stderr, "tsdb: %s: granule %" PRIu32 " of part %s fails its checksum\n", staged, k, f->name);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+        part_unref(p);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+static bool line_has(const uint8_t *b, size_t len, const char *key, char *val, size_t cap)
+{
+    size_t kl = strlen(key);
+    for (size_t o = 0; o < len;) {
+        const uint8_t *nl = memchr(b + o, '\n', len - o);
+        size_t l = nl ? (size_t)(nl - (b + o)) : len - o;
+        if (l >= kl && memcmp(b + o, key, kl) == 0) {
+            size_t vl = MIN(l - kl, cap - 1);
+            memcpy(val, b + o + kl, vl);
+            val[vl] = 0;
+            return true;
+        }
+        o += l + 1;
+    }
+    return false;
+}
+
+static void hex16s(const uint8_t u[16], char out[33])
+{
+    for (int i = 0; i < 16; i++)
+        snprintf(out + 2 * i, 3, "%02x", u[i]);
+}
+
+/* META: the leader's lines with this volume's number, volume_uuid= and cluster= (a snapshot of another volume or
+ * cluster is refused), and requires= with cluster,replica added */
+static int inst_meta(int sdfd, uint32_t number, const struct snap_ident *id, bool *v8, const char *staged)
+{
+    uint8_t *b = NULL;
+    size_t len = 0;
+    int rc = read_file(sdfd, "META", &b, &len);
+    if (rc)
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_CORRUPT : rc;
+    int64_t vol;
+    uint8_t vu[16];
+    meta_ids(b, len, &vol, vu);
+    char u[33], c[33], have[80];
+    hex16s(id->volume_uuid, u);
+    hex16s(id->cluster_uuid, c);
+    char v8s[8];
+    *v8 = line_has(b, len, "parts_v8=", v8s, sizeof v8s) && atoi(v8s) == 1;
+    if (vol != (int64_t)number) {
+        fprintf(stderr, "tsdb: %s: the snapshot is of volume %" PRId64 ", not %" PRIu32 "\n", staged, vol, number);
+        free(b);
+        return TSDB_ERR_INVALID;
+    }
+    bool hu = line_has(b, len, "volume_uuid=", have, sizeof have);
+    if (hu && strcasecmp(have, u) != 0) {
+        fprintf(stderr, "tsdb: %s: the snapshot is of volume_uuid %s, this volume's is %s\n", staged, have, u);
+        free(b);
+        return TSDB_ERR_INVALID;
+    }
+    bool hc = line_has(b, len, "cluster=", have, sizeof have);
+    if (hc && strcasecmp(have, c) != 0) {
+        fprintf(stderr, "tsdb: %s: the snapshot is of cluster %s, this one is %s\n", staged, have, c);
+        free(b);
+        return TSDB_ERR_INVALID;
+    }
+    if (!hu || !hc) {
+        char *out = malloc(len + 128);
+        if (!out) {
+            free(b);
+            return TSDB_ERR_NOMEM;
+        }
+        size_t n = len;
+        memcpy(out, b, len);
+        if (n && out[n - 1] != '\n')
+            out[n++] = '\n';
+        if (!hu)
+            n += (size_t)sprintf(out + n, "volume_uuid=%s\n", u);
+        if (!hc)
+            n += (size_t)sprintf(out + n, "cluster=%s\n", c);
+        int fd = openat(sdfd, "META.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        rc = fd < 0 || write_full(fd, out, n) != 0 || tsdb_fdatasync(fd) != 0 ? TSDB_ERR_IO : 0;
+        if (fd >= 0)
+            close(fd);
+        if (rc == 0 && renameat(sdfd, "META.tmp", sdfd, "META") != 0)
+            rc = TSDB_ERR_IO;
+        free(out);
+    }
+    free(b);
+    if (rc == 0)
+        rc = meta_require(sdfd, true, META_REQ_CLUSTER | META_REQ_REPLICA);
+    return rc;
+}
+
+/* REPL: D6 (the header above) */
+static int inst_repl(int sdfd, const struct snap_man *m, const struct snap_ident *id,
+                     const struct replfile_state *keep, const char *staged)
+{
+    struct replfile_state st;
+    memset(&st, 0, sizeof st);
+    memcpy(st.volume_uuid, id->volume_uuid, 16);
+    memcpy(st.cluster_uuid, id->cluster_uuid, 16);
+    st.node = id->node;
+    st.incarnation = id->incarnation;
+    if (keep) {
+        if (memcmp(keep->volume_uuid, id->volume_uuid, 16) || memcmp(keep->cluster_uuid, id->cluster_uuid, 16) ||
+            keep->node != id->node || keep->rid == 0) {
+            fprintf(stderr, "tsdb: %s: the REPL kept is of another volume, cluster or node\n", staged);
+            return TSDB_ERR_INVALID;
+        }
+        if (keep->floor > m->p) {
+            /* the replica applied (and acknowledged) past the snapshot: installing it would lose positions */
+            fprintf(stderr, "tsdb: %s: the snapshot's cut %" PRIu64 " is below this replica's commit floor %" PRIu64
+                            ": not installed\n", staged, m->p, keep->floor);
+            return TSDB_ERR_INVALID;
+        }
+        st.rid = keep->rid;
+        st.open_gen = keep->open_gen;
+        st.open_nonce = keep->open_nonce;
+        st.fence = snap_mutant == SNAP_MUT_LOWERFENCE ? m->p_epoch : MAX(keep->fence, m->p_epoch);
+        st.led = keep->led;
+        st.unsure = keep->unsure && snap_mutant != SNAP_MUT_KEEPUNSURE;
+        if (snap_mutant == SNAP_MUT_RAISELED) { /* planted: led raised to P's epoch, which clears an unsure REPL */
+            st.led = MAX(st.led, m->p_epoch);
+            st.fence = MAX(st.fence, st.led);
+            if (st.led == st.fence)
+                st.unsure = false;
+        }
+        if (keep->unsure && snap_mutant != SNAP_MUT_KEEPUNSURE) {
+            if (st.open_gen > UINT64_MAX - REPLFILE_OPEN_GEN_BELT)
+                return TSDB_ERR_INVALID;
+            st.open_gen += REPLFILE_OPEN_GEN_BELT, st.open_nonce = 0;
+        }
+    } else {
+        if (id->rid == 0)
+            return TSDB_ERR_INVALID;
+        st.rid = id->rid;
+        st.fence = m->p_epoch;
+    }
+    st.floor = m->p;
+    st.log_start = m->s_first ? m->s_first : m->p + 1;
+    /* the entries wholly below log_start - 1 are not kept (replfile_save drops them the same way) */
+    size_t h0 = 0;
+    while (h0 + 1 < m->nhist && m->hist[h0 + 1].first < st.log_start)
+        h0++;
+    if (m->nhist - h0 > REPLFILE_MAX_HIST)
+        return TSDB_ERR_INVALID;
+    struct repl_epoch hist[REPLFILE_MAX_HIST];
+    for (size_t i = h0; i < m->nhist; i++)
+        hist[i - h0] = (struct repl_epoch){.epoch = m->hist[i].epoch, .start = m->hist[i].first};
+    st.hist = m->nhist > h0 ? hist : NULL;
+    st.nhist = (uint32_t)(m->nhist - h0);
+    struct replfile *rf = NULL;
+    int rc = replfile_create(sdfd, &st, true, &rf);
+    replfile_close(rf);
+    return rc;
+}
+
+/* SNAPDONE, synced, then the directory */
+static int inst_done(int sdfd, const struct snap_man *m, bool sync)
+{
+    char b[64];
+    int n = snprintf(b, sizeof b, "%" PRIu64 "\n", m->p);
+    int fd = openat(sdfd, SNAP_DONE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_full(fd, b, (size_t)n) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0)
+        close(fd);
+    return rc == 0 && sync ? fsync_at(sdfd) : rc;
+}
+
+static bool exists_at(int dfd, const char *name, bool *err)
+{
+    struct stat st;
+    if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        return true;
+    if (errno != ENOENT)
+        *err = true;
+    return false;
+}
+
+/* v<N> -> v<N>.old (when there), v<N>.snap -> v<N>, the root synced, v<N>.old removed and the root synced */
+static int inst_swap(int rfd, const char *vn, const char *snap, const char *old)
+{
+    bool err = false;
+    int rc = 0;
+    if (exists_at(rfd, old, &err)) { /* an earlier install's leftover: v<N> is whole beside it */
+        if ((rc = rm_dir_at(rfd, old)) != 0 || (rc = fsync_at(rfd)) != 0)
+            return rc;
+    }
+    bool had = exists_at(rfd, vn, &err);
+    if (err)
+        return TSDB_ERR_IO;
+    if (had && renameat(rfd, vn, rfd, old) != 0)
+        return TSDB_ERR_IO;
+    if (renameat(rfd, snap, rfd, vn) != 0) {
+        int e = errno;
+        if (had && renameat(rfd, old, rfd, vn) != 0) /* put the old one back; at a crash snap_leftovers would */
+            return TSDB_ERR_IO;
+        return e == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    }
+    if (snap_mutant != SNAP_MUT_INSTNODIRSYNC && (rc = fsync_at(rfd)) != 0)
+        return rc;
+    if (had && ((rc = rm_dir_at(rfd, old)) != 0 || (snap_mutant != SNAP_MUT_INSTNODIRSYNC && (rc = fsync_at(rfd)) != 0)))
+        return rc;
+    return 0;
+}
+
+static int inst_names(const char *root, uint32_t number, char *vn, char *snap, char *old, size_t cap, int *rfd)
+{
+    snprintf(vn, cap, "v%" PRIu32, number);
+    snprintf(snap, cap, "v%" PRIu32 ".snap", number);
+    snprintf(old, cap, "v%" PRIu32 ".old", number);
+    *rfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    return *rfd < 0 ? TSDB_ERR_IO : 0;
+}
+
+int snap_install(const char *root, uint32_t number, const char *staged, const struct snap_ident *id,
+                 const struct replfile_state *keep)
+{
+    char vn[32], snap[32], old[32], want[PATH_MAX];
+    int rfd = -1;
+    if (!root || !staged || !id)
+        return TSDB_ERR_INVALID;
+    int rc = inst_names(root, number, vn, snap, old, sizeof vn, &rfd);
+    if (rc)
+        return rc;
+    snprintf(want, sizeof want, "%s/%s", root, snap);
+    if (strcmp(want, staged) != 0) {
+        fprintf(stderr, "tsdb: a snapshot of volume %" PRIu32 " is installed from %s, not %s\n", number, want, staged);
+        close(rfd);
+        return TSDB_ERR_INVALID;
+    }
+    /* v<N>.old without v<N> is an install's swap cut short (or its put-back failed): it holds the only copy of the
+     * old directory and its promises, which snap_leftovers puts back; an install now would delete it (inst_swap, and
+     * snap_leftovers' roll-forward once SNAPDONE is written) */
+    bool err = false, ho = exists_at(rfd, old, &err), hv = exists_at(rfd, vn, &err);
+    if (err || (ho && !hv)) {
+        if (!err)
+            fprintf(stderr, "tsdb: %s/%s is there without %s: snap_leftovers first, not installed\n", root, old, vn);
+        close(rfd);
+        return err ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    }
+    int sdfd = openat(rfd, snap, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    struct snap_man m = {0};
+    bool v8 = false;
+    if (sdfd < 0)
+        rc = errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    if (rc == 0)
+        rc = snap_man_read(staged, &m);
+    if (rc == 0 && m.p >= FNO_BOUND_MAX)
+        rc = TSDB_ERR_CORRUPT;
+    if (rc == 0)
+        rc = inst_verify_files(sdfd, &m, staged);
+    if (rc == 0) {
+        uint8_t *b = NULL;
+        size_t len = 0;
+        char v8s[8];
+        if ((rc = read_file(sdfd, "META", &b, &len)) == 0)
+            v8 = line_has(b, len, "parts_v8=", v8s, sizeof v8s) && atoi(v8s) == 1;
+        free(b);
+        if (rc == TSDB_ERR_NOTFOUND)
+            rc = TSDB_ERR_CORRUPT;
+    }
+    if (rc == 0)
+        rc = inst_verify_parts(sdfd, &m, v8, staged);
+    inst_hook(SNAP_INST_VERIFIED);
+    /* planted: the swap before the directory is a replica's and SNAPDONE durable */
+    if (rc == 0 && snap_mutant == SNAP_MUT_SWAPFIRST)
+        rc = inst_swap(rfd, vn, snap, old);
+    if (rc == 0)
+        rc = inst_meta(sdfd, number, id, &v8, staged);
+    if (rc == 0)
+        rc = fno_create(sdfd, m.p + 1, true);
+    if (rc == 0)
+        rc = inst_repl(sdfd, &m, id, keep, staged);
+    if (rc == 0)
+        rc = inst_done(sdfd, &m, true);
+    inst_hook(SNAP_INST_DONE);
+    if (rc == 0 && snap_mutant != SNAP_MUT_SWAPFIRST)
+        rc = inst_swap(rfd, vn, snap, old);
+    inst_hook(SNAP_INST_SWAPPED);
+    snap_man_free(&m);
+    if (sdfd >= 0)
+        close(sdfd);
+    close(rfd);
+    return rc;
+}
+
+int snap_leftovers(const char *root, uint32_t number)
+{
+    char vn[32], snap[32], old[32];
+    int rfd = -1;
+    int rc = inst_names(root, number, vn, snap, old, sizeof vn, &rfd);
+    if (rc)
+        return rc;
+    bool err = false, hv = exists_at(rfd, vn, &err), hs = exists_at(rfd, snap, &err), ho = exists_at(rfd, old, &err);
+    bool done = false;
+    if (hs && !err) {
+        int sdfd = openat(rfd, snap, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (sdfd < 0)
+            err = true;
+        else {
+            done = exists_at(sdfd, SNAP_DONE, &err);
+            close(sdfd);
+        }
+    }
+    if (err) {
+        close(rfd);
+        return TSDB_ERR_IO;
+    }
+    if (hs && done) {
+        /* SNAPDONE is durable: the install is finished (the old directory, if any, goes) */
+        if (hv && ho) /* an older install's v<N>.old: v<N> is whole beside it */
+            rc = rm_dir_at(rfd, old);
+        if (rc == 0 && hv && renameat(rfd, vn, rfd, old) != 0)
+            rc = TSDB_ERR_IO;
+        if (rc == 0 && renameat(rfd, snap, rfd, vn) != 0)
+            rc = TSDB_ERR_IO;
+        if (rc == 0)
+            rc = fsync_at(rfd);
+        if (rc == 0)
+            hv = true, ho = exists_at(rfd, old, &err), hs = false;
+    } else if (hs) {
+        /* a copy never marked whole: nothing relied on it */
+        if ((rc = rm_dir_at(rfd, snap)) == 0)
+            rc = fsync_at(rfd);
+    }
+    if (rc == 0 && ho) {
+        if (hv) /* the swap was made: the old directory goes */
+            rc = rm_dir_at(rfd, old);
+        else /* the new one is not there (no SNAPDONE was in v<N>.snap): the old one comes back */
+            rc = renameat(rfd, old, rfd, vn) == 0 ? 0 : TSDB_ERR_IO;
+        if (rc == 0)
+            rc = fsync_at(rfd);
+    }
+    close(rfd);
+    return rc == 0 && err ? TSDB_ERR_IO : rc;
 }
