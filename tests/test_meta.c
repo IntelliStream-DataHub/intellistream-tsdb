@@ -3033,7 +3033,6 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
 
 int main(int argc, char **argv)
 {
-    th_watchdog("test_meta", 1200);
     const char *dir = argc > 1 && argv[1][0] != '-' ? argv[1] : "/tmp";
     unsigned seeds = 40;
     uint64_t first = 1;
@@ -3046,6 +3045,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = strtod(argv[++i], NULL);
     }
+    /* The deadline covers the whole run, so it grows with the seeds: a seed of 30 virtual seconds takes about 3.4 s
+     * (0.11 s per virtual second, 2026-11-23, i5-13400), and make meta-soak's 5000 seeds about 4.7 hours. One real
+     * second per virtual second, never under 1200 s; a fixed 1200 s failed every soak above about 350 seeds. */
+    double budget = (double)seeds * (seconds > 0 ? seconds : 0);
+    th_watchdog("test_meta", budget > 1e7 ? 10000000L : budget > 1200 ? (long)budget : 1200);
     iso_log_quiet = true;
     int mutant = 0, sim_only = 0;
     for (int i = 1; i < argc; i++) {
