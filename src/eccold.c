@@ -75,6 +75,7 @@
 void (*_Atomic eccold_marker_hook)(struct eng *db, uint64_t pos);
 void (*_Atomic eccold_test_hook)(struct eng *db, int step);
 int eccold_mutant;
+_Atomic size_t eccold_test_files_max;
 
 static pthread_mutex_t last_mu = PTHREAD_MUTEX_INITIALIZER;
 static eccold_cut last_cut;
@@ -400,10 +401,13 @@ static void drop_ec(eng *db, part **ec, size_t n, bool discard)
     }
 }
 
-/* Y and I still listed (db->lock held): the late parts of key into y (pinned), or STOPPED */
-static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, size_t *ny)
+/* Y and I still listed (db->lock held): the late parts of key into y (pinned), or STOPPED; INVALID when I and Y are
+ * more files than one marker names (*nlate: how many late parts there were), which the policy's pick refuses too
+ * (src/ecpolicy.c): parts written into the key between the pick and the gate made it so (a key at rest has few, D21) */
+static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, size_t *ny, size_t *nlate)
 {
     *ny = 0;
+    *nlate = 0;
     if (partition_dropping(db, key))
         return TSDB_ERR_STOPPED;
     for (size_t i = 0; i < np; i++) {
@@ -427,7 +431,9 @@ static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, 
             return TSDB_ERR_STOPPED;
         y[n++] = p;
     }
-    if (np + n > MK_FILES_MAX)
+    *nlate = n;
+    size_t max = atomic_load(&eccold_test_files_max);
+    if (np + n > (max ? max : MK_FILES_MAX))
         return TSDB_ERR_INVALID;
     for (size_t i = 0; i < n; i++) {
         y[i]->settling = true; /* no merge or TTL pass takes it until the swap is done */
@@ -521,8 +527,15 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     for (size_t i = 0; i < db->nparts; i++)
         cap += db->parts[i]->partition == key;
     y = calloc(cap ? cap : 1, sizeof *y);
-    rc = y ? take_y_locked(db, key, pin, np, y, &ny) : TSDB_ERR_NOMEM;
+    size_t nlate = 0;
+    rc = y ? take_y_locked(db, key, pin, np, y, &ny, &nlate) : TSDB_ERR_NOMEM;
     pthread_mutex_unlock(&db->lock);
+    if (rc == TSDB_ERR_INVALID) { /* the policy tries the key again in an hour (settle_engine: ecpolicy_failed) */
+        size_t max = atomic_load(&eccold_test_files_max);
+        fprintf(stderr, "tsdb: %s: settle: key %lld had %zu parts to settle and %zu late ones at the cut, more than "
+                        "one marker names (%zu): given up, the objects go to r7-gc, tried again in an hour\n",
+                db->dir, (long long)key, np, nlate, max ? max : (size_t)MK_FILES_MAX);
+    }
     cut.ny = ny;
     for (size_t i = 0; i < ny && i < ECCOLD_TEST_Y_MAX; i++)
         snprintf(cut.y[i], sizeof cut.y[i], "%.63s", y[i]->name);

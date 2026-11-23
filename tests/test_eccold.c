@@ -21,7 +21,8 @@
  *
  * Planted bugs (--mutant NAME, eccold.h): cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced;
  * ppos.h's pposswapnone (the swap records nothing for its .ec parts) and pposswapafter (only after its renames: only
- * a power loss sees it); the Makefile requires each to fail this test. An alarm ends a hung run with status 3 (a hang must not survive).
+ * a power loss sees it); jrbarge (eng_test_mutant: jr_serial a plain mutex again, ticket); the Makefile requires each
+ * to fail this test. An alarm ends a hung run with status 3 (a hang must not survive).
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -949,7 +950,10 @@ static void test_depose(void)
     printf("  depose: deposed in the wait for the commit point: INDETERMINATE, the engine not failed\n");
 }
 
-/* large inserts, replaces, deletes and small writes into P while the settle runs: every acknowledged write is seen */
+/* large inserts, replaces, deletes and small writes into P while the settle runs: every acknowledged write is seen.
+ * The large writers take jr_serial in turn with the settle's gate: when a thread writing back to back could take it
+ * again first, the gate waited up to 50 s while the large insert of s2 made thousands of parts of P, and the settle
+ * then refused the key at the cut (INVALID: more files than one marker names; test_toomany) in about 4 runs of 10. */
 typedef struct cw {
     pthread_t th;
     eng *db;
@@ -1023,12 +1027,16 @@ static void test_concurrent(void)
         pthread_create(&c[k].th, NULL, cw_run, &c[k]);
     }
     msleep(50);
+    int64_t t0 = now_ms();
     atomic_store(&CASE_HOOK, conc_hook);
     int rc = settle_key(L.db, KEY);
     atomic_store(&CASE_HOOK, NULL);
+    int64_t took = now_ms() - t0;
     atomic_store(&stop, true);
     for (int k = 0; k < 4; k++)
         pthread_join(c[k].th, NULL);
+    if (rc)
+        fprintf(stderr, "concurrent: the settle answered %d\n", rc);
     CHECK(rc == 0);
     for (int k = 0; k < 4; k++)
         CHECK(c[k].errs == 0);
@@ -1046,8 +1054,8 @@ static void test_concurrent(void)
     check_marker(&L, &cut, false);
     lclose(&L);
     printf("  concurrent: large inserts, replaces, deletes and small writes into P during a settle (Y: %zu parts, "
-           "the gate held %lld us)\n",
-           cut.ny, (long long)cut.hold_us);
+           "the gate held %lld us, the settle took %lld ms; writes %d %d %d %d)\n",
+           cut.ny, (long long)cut.hold_us, (long long)took, c[0].last, c[1].last, c[2].last, c[3].last);
 }
 
 /* the policy's cluster branch: a whole key once its end is past the grace by the replicated clock, never level 0,
@@ -1527,6 +1535,263 @@ static void test_ymerging(void)
     printf("  ymerging: a late part merging at the cut: STOPPED; afterwards settled with it as Y\n");
 }
 
+/* jr_serial is taken in turn: a thread writing large inserts back to back (into another day: no fence, no late part)
+ * does not keep the settle's gate out (a plain mutex let it take jr_serial again first: the settle waited until the
+ * writer stopped), and a second such writer gets turns too */
+typedef struct tw {
+    pthread_t th;
+    eng *db;
+    uint32_t s;
+    _Atomic bool *stop;
+    _Atomic int n;
+    int errs;
+} tw;
+static void *tw_run(void *a)
+{
+    tw *w = a;
+    int64_t t_end = now_ms() + 20000; /* the bound without the turns: the settle waits this long */
+    for (int v = 0; !atomic_load(w->stop) && now_ms() < t_end; v++) {
+        if (rows(w->db, w->s, 3, 0, 40, (float)v) != 0)
+            w->errs++;
+        else
+            atomic_fetch_add(&w->n, 1);
+    }
+    return NULL;
+}
+static _Atomic int64_t TW_PUT, TW_GATED;
+static void tw_hook(eng *db, int step)
+{
+    (void)db;
+    if (step == ECCOLD_STEP_PUT)
+        atomic_store(&TW_PUT, now_ms());
+    else if (step == ECCOLD_STEP_GATED)
+        atomic_store(&TW_GATED, now_ms());
+}
+static void test_turns(void)
+{
+    lt L;
+    if (!start("turns", &L))
+        return;
+    make_i(&L);
+    _Atomic bool stop = false;
+    tw w[2];
+    for (int k = 0; k < 2; k++) {
+        w[k] = (tw){.db = L.db, .s = L.s[2 + k], .stop = &stop};
+        atomic_init(&w[k].n, 0);
+        pthread_create(&w[k].th, NULL, tw_run, &w[k]);
+    }
+    while (atomic_load(&w[0].n) < 20 || atomic_load(&w[1].n) < 20)
+        msleep(1);
+    /* both write back to back now: they take turns (a plain mutex measured 1:259, 2630:1, 31:676 here), and the
+     * settle's lw_enter waits for the writes that came before it, not for the writers to stop (it waited 1.6-17 s) */
+    int n0 = atomic_load(&w[0].n), n1 = atomic_load(&w[1].n);
+    atomic_store(&TW_PUT, 0);
+    atomic_store(&TW_GATED, 0);
+    atomic_store(&CASE_HOOK, tw_hook);
+    int rc = settle_key(L.db, KEY);
+    atomic_store(&CASE_HOOK, NULL);
+    int64_t gate = atomic_load(&TW_GATED) - atomic_load(&TW_PUT);
+    msleep(500);
+    int d0 = atomic_load(&w[0].n) - n0, d1 = atomic_load(&w[1].n) - n1;
+    atomic_store(&stop, true);
+    for (int k = 0; k < 2; k++)
+        pthread_join(w[k].th, NULL);
+    CHECK(rc == 0 && atomic_load(&TW_PUT) > 0 && atomic_load(&TW_GATED) > 0);
+    CHECK(gate < 1000);
+    int lo = d0 < d1 ? d0 : d1, hi = d0 < d1 ? d1 : d0;
+    CHECK(hi >= 4 && lo * 3 >= hi);
+    CHECK(w[0].errs == 0 && w[1].errs == 0);
+    if (gate >= 1000 || hi < 4 || lo * 3 < hi)
+        fprintf(stderr, "turns: the gate waited %lld ms; the writers wrote %d and %d meanwhile\n", (long long)gate, d0,
+                d1);
+    CHECK(eng_check(L.db) == 0);
+    CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
+    lclose(&L);
+    printf("  turns: two threads writing large inserts back to back: the gate in %lld ms, they took turns (%d, %d)\n",
+           (long long)gate, d0, d1);
+}
+
+/* The regression test of the ticket, by steps, with no timing: the test thread holds jr_serial, the settle takes the
+ * next ticket at its gate (lw_enter), and the test lets go and asks again at once. The turn is the settle's: the
+ * test's lock returns only after the settle's lw_leave, so GATED is set by then. A plain mutex (mutant jrbarge) gives
+ * it back to the thread that let go, before the woken settle runs (a writer looping large inserts starved the gate
+ * that way for up to 50 s), whatever the number of CPUs (turns passed on one CPU with a plain mutex) */
+static uint64_t jr_next(eng *db)
+{
+    pthread_mutex_lock(&db->jr_serial.mu);
+    uint64_t n = db->jr_serial.next - db->jr_serial.serving;
+    pthread_mutex_unlock(&db->jr_serial.mu);
+    return n;
+}
+static void test_ticket(void)
+{
+    lt L;
+    if (!start("ticket", &L))
+        return;
+    make_i(&L);
+    CHECK(eng_jr(L.db) != NULL);
+    atomic_store(&TW_PUT, 0);
+    atomic_store(&TW_GATED, 0);
+    atomic_store(&CASE_HOOK, tw_hook);
+    jr_serial_lock(L.db);
+    st s;
+    st_start(&s, L.db, KEY);
+    int64_t t0 = now_ms();
+    while (jr_next(L.db) < 2 && !atomic_load(&s.done) && now_ms() - t0 < 60000) /* the settle waits at its gate */
+        msleep(1);
+    CHECK(jr_next(L.db) == 2 && atomic_load(&TW_PUT) > 0 && atomic_load(&TW_GATED) == 0);
+    jr_serial_unlock(L.db);
+    jr_serial_lock(L.db); /* back to back, as a writer looping large inserts */
+    bool gated = atomic_load(&TW_GATED) > 0;
+    CHECK(gated);
+    jr_serial_unlock(L.db);
+    pthread_join(s.th, NULL);
+    atomic_store(&CASE_HOOK, NULL);
+    CHECK(s.rc == 0);
+    CHECK(jr_next(L.db) == 0);
+    if (!gated)
+        fprintf(stderr, "ticket: the thread that let go of jr_serial took it again before the settle waiting for it\n");
+    eccold_cut c;
+    eccold_test_last(&c);
+    CHECK(c.rc == 0 && c.gated);
+    check_marker(&L, &c, true);
+    CHECK(eng_check(L.db) == 0);
+    CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
+    lclose(&L);
+    printf("  ticket: jr_serial let go of and asked for again at once: the settle waiting at its gate went first\n");
+}
+
+/* lw_leave lets go of jr_serial by what lw_enter decided, never by db->jr again: db->jr is set by eng_leader_attach
+ * while the engine's threads run, so a large write may enter without it and leave with it, or (here, simulated) the
+ * other way round. A turn never let go of would make every later large write, drop and settle wait forever; a turn
+ * let go of twice (serving past next) too. A let-go without a turn is ignored, counted and logged */
+static bool jr_balanced(eng *db, uint64_t unheld)
+{
+    pthread_mutex_lock(&db->jr_serial.mu);
+    bool ok = db->jr_serial.next == db->jr_serial.serving && !db->jr_serial.held && db->jr_serial.unheld == unheld;
+    if (!ok)
+        fprintf(stderr, "jr_serial: next %llu serving %llu held %d unheld %llu (wanted %llu)\n",
+                (unsigned long long)db->jr_serial.next, (unsigned long long)db->jr_serial.serving,
+                (int)db->jr_serial.held, (unsigned long long)db->jr_serial.unheld, (unsigned long long)unheld);
+    pthread_mutex_unlock(&db->jr_serial.mu);
+    return ok;
+}
+static void test_jrpair(void)
+{
+    lt L;
+    if (!start("jrpair", &L))
+        return;
+    const struct jr_ops *jr = eng_jr(L.db);
+    CHECK(jr != NULL);
+    CHECK(jr_balanced(L.db, 0));
+    lw_fence f;
+    lw_fence_range(&f, L.s[2], DAY0 + 3 * DAY_MS, DAY0 + 4 * DAY_MS);
+    f.r = NULL;
+    f.r_heap = false;
+    lw_enter(L.db, &f); /* took a turn */
+    __atomic_store_n(&L.db->jr, NULL, __ATOMIC_RELEASE);
+    lw_leave(L.db, &f);
+    __atomic_store_n(&L.db->jr, jr, __ATOMIC_RELEASE);
+    CHECK(jr_balanced(L.db, 0));
+    __atomic_store_n(&L.db->jr, NULL, __ATOMIC_RELEASE);
+    lw_enter(L.db, &f); /* no turn */
+    __atomic_store_n(&L.db->jr, jr, __ATOMIC_RELEASE);
+    lw_leave(L.db, &f);
+    CHECK(jr_balanced(L.db, 0));
+    /* the guard: a let-go without a turn changes nothing but the count */
+    jr_serial_unlock(L.db);
+    CHECK(jr_balanced(L.db, 1));
+    /* and the next large write and drop of the volume go through */
+    CHECK(rows(L.db, L.s[2], 3, 0, 20, 7.0f) == 0);
+    CHECK(eng_drop_before(L.db, DAY0 - DAY_MS) == 0);
+    CHECK(jr_balanced(L.db, 1));
+    CHECK(eng_check(L.db) == 0);
+    lclose(&L);
+    printf("  jrpair: lw_leave lets go of jr_serial as lw_enter took it, db->jr set or not; a stray let-go ignored\n");
+}
+
+/* more late parts at the cut than one marker names beside I (the limit lowered to 3 files here; MK_FILES_MAX in
+ * service): INVALID, and nothing is left behind: no marker, the fence and jr_serial left (writes into P go on at once),
+ * no part settling, the objects to r7-gc; at the limit (I and Y exactly 4 files of 4) the settle goes through with Y */
+static uint32_t TM_S;
+static void tm_hook(eng *db, int step)
+{
+    if (step != ECCOLD_STEP_PUT)
+        return;
+    for (int k = 0; k < 3; k++) /* level-0 parts of P after the pick: three Y */
+        CHECK(rows(db, TM_S, 0, 1000 * k, 20, 3.0f) == 0);
+}
+/* series s on day 0: the n runs of 20 rows from 1000 k s, value base + i, and nothing else */
+static bool holds_runs(eng *db, uint32_t s, int n, float base)
+{
+    qctx *q = query(db, s, 0);
+    bool ok = q->n == (size_t)n * 20;
+    for (size_t i = 0; ok && i < q->n; i++)
+        ok = q->ts[i] == DAY0 + 1000LL * (1000 * (int64_t)(i / 20) + (int64_t)(i % 20)) &&
+             q->v[i] == base + (float)(i % 20);
+    if (!ok)
+        fprintf(stderr, "series %u: %zu rows, wanted %d runs of 20\n", s, q->n, n);
+    free(q);
+    return ok;
+}
+static void test_toomany(void)
+{
+    lt L;
+    if (!start("toomany", &L))
+        return;
+    make_i(&L);
+    TM_S = L.s[1];
+    atomic_store(&eccold_test_files_max, 3);
+    atomic_store(&CASE_HOOK, tm_hook);
+    int rc = settle_key(L.db, KEY);
+    atomic_store(&CASE_HOOK, NULL);
+    CHECK(rc == TSDB_ERR_INVALID);
+    eccold_cut c;
+    eccold_test_last(&c);
+    CHECK(c.rc == TSDB_ERR_INVALID && c.gated && c.ny == 0 && c.pos == 0);
+    pthread_mutex_lock(&L.x.mu);
+    CHECK(L.x.cold == NULL); /* no COLD marker was appended */
+    pthread_mutex_unlock(&L.x.mu);
+    part *all[8];
+    size_t na = parts_of(L.db, KEY, all, 8, false);
+    CHECK(na == 4);
+    pthread_mutex_lock(&L.db->lock);
+    for (size_t i = 0; i < na; i++)
+        CHECK(!all[i]->settling);
+    pthread_mutex_unlock(&L.db->lock);
+    unref_all(all, na);
+    na = parts_of(L.db, KEY, all, 8, true);
+    CHECK(na == 0);
+    unref_all(all, na);
+    CHECK(chunks_go(&L, 0)); /* nothing names the objects */
+    /* the fence and jr_serial were left: a small and a large write into P return at once */
+    int64_t t0 = now_ms();
+    CHECK(rows(L.db, L.s[2], 0, 100, 1, 5.0f) == 0);
+    CHECK(rows(L.db, L.s[2], 0, 200, 20, 6.0f) == 0);
+    CHECK(now_ms() - t0 < 2000);
+    CHECK(eng_check(L.db) == 0);
+    /* at the limit: I and every other part of P (the three Y, s2's large write and its small one, flushed) are as
+     * many files as the marker may name */
+    CHECK(mt_flush(L.db) == 0);
+    na = parts_of(L.db, KEY, all, 8, false);
+    unref_all(all, na);
+    CHECK(na == 6);
+    atomic_store(&eccold_test_files_max, na);
+    CHECK(settle_key(L.db, KEY) == 0);
+    atomic_store(&eccold_test_files_max, 0);
+    eccold_test_last(&c);
+    CHECK(c.rc == 0 && c.ny == na - 1);
+    check_marker(&L, &c, true);
+    CHECK(holds_runs(L.db, L.s[1], 3, 3.0f));
+    qctx *q = query(L.db, L.s[2], 0);
+    CHECK(q->n == 21 && q->ts[0] == DAY0 + 100000 && q->v[0] == 5.0f && q->ts[20] == DAY0 + 1000LL * 219 &&
+          q->v[20] == 25.0f);
+    free(q);
+    CHECK(holds(L.db, L.s[0], 0, 0, 500, 1.0f));
+    lclose(&L);
+    printf("  toomany: more late parts than one marker names: INVALID, nothing left behind; at the limit: settled\n");
+}
+
 static void alarm_exit(int sig)
 {
     (void)sig;
@@ -1559,6 +1824,8 @@ int main(int argc, char **argv)
         char v[16];
         snprintf(v, sizeof v, "%d", !strcmp(mutant, "pposswapnone") ? PPOS_MUT_SWAPNONE : PPOS_MUT_SWAPAFTER);
         setenv("TSDB_PPOS_MUTANT", v, 1);
+    } else if (!strcmp(mutant, "jrbarge")) {
+        eng_test_mutant = MUT_JR_BARGE; /* jr_serial a plain mutex again: ticket must fail */
     } else if (strcmp(mutant, "none")) {
         int m = eccold_mutant_parse(mutant);
         if (m < 0) {
@@ -1593,7 +1860,8 @@ int main(int argc, char **argv)
                  {"depose", test_depose}, {"concurrent", test_concurrent}, {"policy", test_policy},
                  {"swapfail", test_swapfail}, {"deposeappend", test_deposeappend}, {"crash", test_crash},
                  {"drop", test_drop},     {"indexfail", test_indexfail}, {"ymerging", test_ymerging},
-                 {"swappower", test_swappower}};
+                 {"swappower", test_swappower}, {"toomany", test_toomany}, {"turns", test_turns},
+                 {"ticket", test_ticket}, {"jrpair", test_jrpair}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();
