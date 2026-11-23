@@ -222,7 +222,7 @@ static void opts_of(tsdb_options *o, int merge_threads, int lifetime)
 /* A fresh volume directory with `ns` float64 series s0.. */
 static void fresh(char *dir, const char *name, int ns)
 {
-    snprintf(dir, PATH_MAX, "%s/%s", S, name);
+    CHECK(snprintf(dir, PATH_MAX, "%s/%s", S, name) < PATH_MAX);
     sh("rm -rf '%s' && mkdir -p '%s'", dir, dir);
     tsdb_options o;
     opts_of(&o, 0, 480);
@@ -815,8 +815,8 @@ static void case_merge(int lifetime)
             size_t retired = 0;
             if (snap_man_read(si.path, &m) == 0) {
                 for (size_t i = 0; i < m.nfiles; i++) {
-                    snprintf(rp, sizeof rp, "%s/retired_%s", dir, m.files[i].name);
-                    retired += m.files[i].kind == SNAP_PART && exists(rp);
+                    retired += snprintf(rp, sizeof rp, "%s/retired_%s", dir, m.files[i].name) < (int)sizeof rp &&
+                               m.files[i].kind == SNAP_PART && exists(rp);
                 }
                 snap_man_free(&m);
             }
@@ -980,6 +980,8 @@ static int child(const char *dir, const char *ackf)
     _exit(0);
 }
 
+static const char *MUTANT; /* --mutant NAME, handed to the power case's child */
+
 static int run_child(const char *dir, const char *ackf, int warmup, int seed)
 {
     pid_t pid = fork();
@@ -1004,7 +1006,8 @@ static int run_child(const char *dir, const char *ackf, int warmup, int seed)
         }
         char t0[32];
         snprintf(t0, sizeof t0, "%" PRId64, T0);
-        execl(SELF, "test_snapshot", "--child", dir, ackf, t0, (char *)NULL);
+        /* the planted bug goes along: the child is the process that makes the snapshot */
+        execl(SELF, "test_snapshot", "--child", dir, ackf, t0, MUTANT ? MUTANT : (char *)NULL, (char *)NULL);
         _exit(127);
     }
     int st = -1;
@@ -1018,6 +1021,61 @@ static int cfn(void *c, const int64_t *ts, const void *vals, size_t n)
     (void)ts, (void)vals;
     *(size_t *)c += n;
     return 0;
+}
+
+struct power_count {
+    int crashes, wholes, removed;
+};
+
+/* One power loss at step k of the child's open and make: <0 when the test must stop, else the child's status (99 lost,
+ * 0 finished). */
+static int power_step(const char *tmpl, const char *dir, const char *ackf, const char *sp, int k, int seed,
+                      struct power_count *pc)
+{
+    sh("rm -rf '%s' && cp -a '%s' '%s'", dir, tmpl, dir);
+    unlink(ackf);
+    int code = run_child(dir, ackf, k, seed);
+    CHECK(code == 99 || code == 0);
+    if (code != 99 && code != 0) {
+        fprintf(stderr, "  power: step %d: the child exited %d\n", k, code);
+        return -1;
+    }
+    pc->crashes += code == 99;
+    char a[8] = {0};
+    int afd = open(ackf, O_RDONLY);
+    if (afd >= 0) {
+        (void)!read(afd, a, sizeof a - 1);
+        close(afd);
+    }
+    char man[PATH_MAX + 48];
+    snprintf(man, sizeof man, "%s/" SNAP_MAN, sp);
+    if (exists(man)) {
+        struct snap_man m = {0};
+        bool ok = whole(sp, &m);
+        snap_man_free(&m);
+        if (!ok)
+            fprintf(stderr, "  power: step %d seed %d: SNAPMAN is there, the snapshot is not whole\n", k, seed);
+        CHECK(ok);
+        pc->wholes++;
+    }
+    bool had = exists(sp);
+    tsdb_options o;
+    opts_of(&o, 0, 480);
+    eng *db = NULL;
+    int rc = eng_open(dir, &o, &db);
+    CHECK(rc == 0);
+    if (rc != 0) {
+        fprintf(stderr, "  power: step %d: the leader does not open: %d\n", k, rc);
+        return -1;
+    }
+    CHECK(!exists(sp));
+    pc->removed += had;
+    size_t n = 0;
+    CHECK(eng_query_raw_ex(db, 3, T0 + 3000000, T0 + 3010000, false, 0, cfn, &n) == 0);
+    if (strchr(a, 'w'))
+        CHECK(n == 4);
+    eng_close(db);
+    return fails ? -1 : code;
 }
 
 static void case_power(void)
@@ -1040,63 +1098,30 @@ static void case_power(void)
     snprintf(dir, sizeof dir, "%s/power", S);
     snprintf(ackf, sizeof ackf, "%s/power.ack", S);
     snprintf(sp, sizeof sp, "%s/snap_p", dir);
-    int seeds = snap_mutant == SNAP_MUT_NODIRSYNC ? 12 : 2;
-    int crashes = 0, wholes = 0, removed = 0;
-    bool finished = false;
-    for (int k = 0; k < 3000 && !finished; k++) {
+    /* Every step gets a few seeds; the last steps of the make (the links, RSTATE, META, SNAPMAN's temporary, its rename,
+     * the directory's syncs) get many more: a step there is caught only when the tear keeps SNAPMAN's directory, its
+     * temporary and its rename (one in eight) and cuts a link, so a missing directory sync before SNAPMAN
+     * (snapnodirsync) needs dozens of seeds at the one step it shows at. */
+    const int seeds = 2, tail_steps = 12, tail_seeds = 48;
+    struct power_count pc = {0};
+    int kend = -1;
+    for (int k = 0; k < 3000 && kend < 0; k++)
         for (int sd = 0; sd < seeds; sd++) {
-            sh("rm -rf '%s' && cp -a '%s' '%s'", dir, tmpl, dir);
-            unlink(ackf);
-            int code = run_child(dir, ackf, k, k * 31 + sd + 1);
-            CHECK(code == 99 || code == 0);
-            if (code != 99 && code != 0) {
-                fprintf(stderr, "  power: step %d: the child exited %d\n", k, code);
+            int code = power_step(tmpl, dir, ackf, sp, k, k * 31 + sd + 1, &pc);
+            if (code < 0)
                 return;
-            }
-            crashes += code == 99;
-            finished |= code == 0;
-            char a[8] = {0};
-            int afd = open(ackf, O_RDONLY);
-            if (afd >= 0) {
-                (void)!read(afd, a, sizeof a - 1);
-                close(afd);
-            }
-            char man[PATH_MAX + 48];
-            snprintf(man, sizeof man, "%s/" SNAP_MAN, sp);
-            if (exists(man)) {
-                struct snap_man m = {0};
-                bool ok = whole(sp, &m);
-                snap_man_free(&m);
-                if (!ok)
-                    fprintf(stderr, "  power: step %d seed %d: SNAPMAN is there, the snapshot is not whole\n", k, sd);
-                CHECK(ok);
-                wholes++;
-            }
-            bool had = exists(sp);
-            tsdb_options o;
-            opts_of(&o, 0, 480);
-            eng *db = NULL;
-            int rc = eng_open(dir, &o, &db);
-            CHECK(rc == 0);
-            if (rc != 0) {
-                fprintf(stderr, "  power: step %d: the leader does not open: %d\n", k, rc);
-                return;
-            }
-            CHECK(!exists(sp));
-            removed += had;
-            size_t n = 0;
-            CHECK(eng_query_raw_ex(db, 3, T0 + 3000000, T0 + 3010000, false, 0, cfn, &n) == 0);
-            if (strchr(a, 'w'))
-                CHECK(n == 4);
-            eng_close(db);
-            if (fails)
-                return;
+            if (code == 0)
+                kend = k;
         }
-    }
-    CHECK(finished && crashes > 50);
-    printf("  power: lost at each of %d steps (%d seeds each) of an open and a make: %d snapshots found whole, %d "
-           "directories removed at the open\n",
-           crashes / seeds, seeds, wholes, removed);
+    int base = pc.crashes;
+    for (int k = kend > tail_steps ? kend - tail_steps : 0; kend > 0 && k < kend; k++)
+        for (int sd = seeds; sd < seeds + tail_seeds; sd++)
+            if (power_step(tmpl, dir, ackf, sp, k, k * 31 + sd + 1, &pc) < 0)
+                return;
+    CHECK(kend > 0 && base > 50);
+    printf("  power: lost at each of %d steps (%d seeds each, the last %d steps %d more) of an open and a make: %d "
+           "snapshots found whole, %d directories removed at the open\n",
+           base / seeds, seeds, tail_steps, tail_seeds, pc.wholes, pc.removed);
 }
 
 static void set_mutant(const char *m)
@@ -1126,8 +1151,10 @@ int main(int argc, char **argv)
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
-    if (argc == 5 && strcmp(argv[1], "--child") == 0) {
+    if ((argc == 5 || argc == 6) && strcmp(argv[1], "--child") == 0) {
         T0 = strtoll(argv[4], NULL, 10);
+        if (argc == 6)
+            set_mutant(argv[5]);
         return child(argv[2], argv[3]);
     }
     const char *mutant = NULL, *scratch = "/tmp";
@@ -1139,6 +1166,7 @@ int main(int argc, char **argv)
     }
     if (mutant)
         set_mutant(mutant);
+    MUTANT = mutant;
     char tmpl[PATH_MAX];
     snprintf(tmpl, sizeof tmpl, "%s/test-snapshot.XXXXXX", scratch);
     if (!mkdtemp(tmpl)) {
