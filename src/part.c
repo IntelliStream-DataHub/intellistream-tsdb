@@ -1453,6 +1453,9 @@ int intents_recover(eng *db)
                  * which syncs the directory itself before it returns, so the intent's unlink below cannot pass its
                  * renames */
                 rc = ecswap_recover(db, e->d_name, buf, (size_t)st.st_size);
+            } else if ((size_t)st.st_size >= sizeof INTENT_V5_HEAD - 1 &&
+                       memcmp(buf, INTENT_V5_HEAD, sizeof INTENT_V5_HEAD - 1) == 0) {
+                rc = ecapply_recover(db, e->d_name, buf, (size_t)st.st_size); /* R8: a replica's apply of MK_COLD */
             } else if (is_drop) {
                 int r = drop_intent_recover(db, e->d_name, buf, (size_t)st.st_size);
                 rc = r < 0 ? r : 0;

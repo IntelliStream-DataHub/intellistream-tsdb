@@ -8,10 +8,7 @@
  * replica API r8a2-hooks adds (rs_cold_begin, rs_cold_done, the cut generation and rp->mu, the stage lookups,
  * replica_flush_through) is declared here and built in src/replica.c.
  *
- * STUB (r8a1-mk): filled by r8h-apply. Until then a MK_COLD is acknowledged and changes nothing, as the reserved type
- * was skipped before; the decision answers TSDB_ERR_INVALID ("not built yet": no swap record can name one yet).
- * ecapply_swap_pre already writes the .ec parts' PPOS records (src/ppos.h), which r8h keeps: a leader's settle of an
- * ec cluster volume needs them at its next open.
+ * src/ecapply.c has the apply's design; src/ecswap.c the intent v5 and its recovery (ecapply_recover).
  *
  * Builds with and without TSDB_EC (the embedded crates copy every .c file of src/).
  */
@@ -54,6 +51,11 @@ enum {
     ECAPPLY_MUT_PPOSAFTERSWAP,      /* pposafterswap: a leader's swap records its .ec parts' PPOS after its renames */
 };
 extern int ecapply_mutant;
+/* Crash points of a replica's apply (tsdbd's server/crashpt.h installs the hook: cold-before-apply, cold-mid-intent):
+ * BEFORE_APPLY once the marker is checked, nothing done; MID_INTENT with the intent durable and the .ec renames done,
+ * Y and R not (db->lock held: the hook only ends the process). */
+enum { ECAPPLY_CRASH_BEFORE_APPLY = 1, ECAPPLY_CRASH_MID_INTENT = 2 };
+extern void (*_Atomic ecapply_crash_hook)(struct eng *db, int which);
 int ecapply_mutant_parse(const char *name); /* -1 when unknown */
 
 /* ---- the replica API (r8a2-hooks, built in src/replica.c) ----

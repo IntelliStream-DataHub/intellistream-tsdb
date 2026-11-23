@@ -28,6 +28,8 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n);
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len);
+/* The same for a replica's cold apply, intent v5 (INTENT_V5_HEAD; src/ecswap.c has the rules) */
+int ecapply_recover(eng *db, const char *name, char *buf, size_t len);
 
 /* The engine's hooks (src/tier.h): db->ecstate->swap. Nothing (counted): the swap keeps no state of its own. */
 int ecswap_eng_open(eng *db);
