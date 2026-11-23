@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Database lifecycle, the active parts list, buffered appends and maintenance. */
 #include "internal.h"
+#include "snapshot.h"
 #include "ppos.h"
 #include "eccache.h"
 #include "ecgc.h"
@@ -1020,6 +1021,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             goto fail;
     } else {
         if (!ro && (rc = intents_recover(db)) != 0) /* before tmp files are cleaned up */
+            goto fail;
+        if (!ro && (rc = snap_sweep(db)) != 0) /* no snapshot outlives the engine that made it (src/snapshot.c) */
             goto fail;
         if (test_before_parts)
             test_before_parts(test_before_parts_arg);

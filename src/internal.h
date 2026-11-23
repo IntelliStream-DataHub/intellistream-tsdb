@@ -1629,6 +1629,15 @@ int eng_leader_file_open(struct eng *db, uint64_t pos, const char *name);
  * flush_lock held); every stage_ file goes (eng_leader_attach: a writer keeps no stage of its own) */
 void leader_links_drop(struct eng *db, uint64_t fno_end);
 void leader_links_sweep(struct eng *db, bool stages);
+/* replica.c, for a snapshot (src/snapshot.c): RSTATE's bytes as the leader holds it (publish_lock held; an empty one
+ * without db->lrs) and its `done`; a copy of the entries of db->lf at or below position `hi` (takes lead_mu); a link's
+ * name, as a stage_ link or as the keep_ file of its marker */
+int leader_rs_image(struct eng *db, uint8_t **buf, size_t *len, uint64_t *done);
+struct lkfile;
+int leader_links_list(struct eng *db, uint64_t hi, struct lkfile **out, size_t *n);
+void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep);
+/* The first position a replica replays from (r4-replay; today its log start, 0 when not a replica) */
+uint64_t replica_replay_start(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
