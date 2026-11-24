@@ -2506,6 +2506,20 @@ static int log_count(int i, const char *needle)
     return hits;
 }
 
+/* the lines of server i's log with `needle` after its first `skip` lines (log_count(i, "") counts every line) */
+static int log_count_from(int i, const char *needle, int skip)
+{
+    char path[PATH_MAX + 80], line[4096];
+    snprintf(path, sizeof path, "%s/n%d.log", base, i);
+    FILE *f = fopen(path, "r");
+    int hits = 0;
+    for (int n = 0; f && fgets(line, sizeof line, f); n++)
+        hits += n >= skip && strstr(line, needle) != NULL;
+    if (f)
+        fclose(f);
+    return hits;
+}
+
 static void await_log_count(int i, const char *needle, int want, int ms)
 {
     uint64_t t0 = now_ms();
@@ -5103,15 +5117,27 @@ static void scen_isr(void)
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
-    struct timespec s3 = {3, 0};
-    nanosleep(&s3, NULL);
+    /* The window is counted from the leader's ask, a condition, never from the kill: how soon the leader notices the
+     * dead replica (and then isr_lag_ms) is not the test's to guess. The plant hands its META over in the same call
+     * as the ask, so its wrong acknowledgement follows at once and 3 s from the ask is margin; a slow detection of
+     * the kill no longer lets the mutant pass as "isr passed" */
+    uint64_t t0 = now_ms();
+    while (!log_has(L, "asks for an ISR of 2 members")) {
+        if (now_ms() - t0 > 30000)
+            die("the leader never asked for an ISR without the killed replica (30 s)");
+        usleep(20000);
+    }
+    t0 = now_ms();
+    while (now_ms() - t0 < 3000 && !__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        usleep(10000);
     if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
         die("a write was acknowledged without a killed ISR member before the ISR change committed (rc %d)", w.rc);
+    if (log_has(L, "planted META was dropped"))
+        die("the leader's core dropped the planted META (TSDB_REPLD_MUTANT commitpastremoved planted nothing)");
     if (isr_of(0, "plant", NULL) != 3)
         die("the ISR changed while the proposals were held");
-    if (!log_has(L, "asks for an ISR of 2 members"))
-        die("the leader never asked for an ISR without the killed replica");
     hold_isr(0);
+    struct timespec s3 = {3, 0};
     await_writer(&w, th, 5000, "the write held by an uncommitted ISR change, once the change could commit");
     rows++;
     await_isr(0, "plant", 2, 5000, "a replica killed");
@@ -10657,18 +10683,53 @@ static void scen_repcheck(void)
      * move up to what the peer acknowledged, or the catch-up finds nothing to read and no write commits again (jepsen
      * kv, seed 1: a resync raced records in flight) */
     {
+        /* R back in the ISR first (the fault takes a peer that acknowledged after the file appeared: a replica that
+         * has just restarted holds less than its previous run acknowledged). A starved peer can come back without
+         * the cursor moving up: it leaves the ISR, the leader drops the segments it lacks and rebuilds it by a
+         * snapshot (nocursorup survived that way, 1 in 8 runs side by side). The cursor moving up sends it records
+         * at once, so no snapshot is made for it after the fault */
+        await_isr(L, "plant", 3, 30000, "after the restarts of a replica with a damaged REPL slot");
+        int lines0 = log_count(L, ""); /* the snapshots that count are those logged after this line */
         char stale[PATH_MAX + 80];
         snprintf(stale, sizeof stale, "%s/n%d/stalesent", base, L);
         int sfd = open(stale, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
         if (sfd < 0)
             die("%s: %s", stale, strerror(errno));
         close(sfd);
+        /* The fault waits for the leader's log to start above position 1 (a cursor of 0 is below it only then; with
+         * the log still at 1 the catch-up from 0 reads every record and nocursorup survived). Single-row writes keep
+         * the 200 ms flushes coming, whose segments the leader drops once every replica acknowledged them, so that
+         * start rises however the restarts above left the leader's log; rows below the next step's t0 */
+        tsdbc *sc;
+        int src = tsdbc_connect("127.0.0.1", cports[L], &sc);
+        if (src != 0)
+            die("connect to the leader before the stalesent fault: %s", ers(src));
+        tsdbc_set_retry(sc, 0);
         t0 = now_ms();
-        while (!log_has(L, "test fault: the cursor of peer")) {
-            if (now_ms() - t0 > 10000)
-                die("the stalesent fault did not fire in 10 s");
-            usleep(10000);
+        for (int j = 0; !log_has(L, "test fault: the cursor of peer"); j++) {
+            if (now_ms() - t0 > 20000 || j >= 400)
+                die("the stalesent fault did not fire in 20 s of writes (the leader's log never started above "
+                    "position 1: its flushed segments were never dropped)");
+            int64_t ts = 3500000 + 1000LL * j;
+            float val = (float)j;
+            src = tsdbc_insert_series(sc, id, &ts, &val, 1);
+            if (src != 0 && log_has(L, "test fault: the cursor of peer"))
+                die("a write as the stalesent fault fired: %s (the cursor never moved up to what the peer "
+                    "acknowledged)", ers(src));
+            if (src != 0)
+                die("a write before the stalesent fault: %s", ers(src));
+            usleep(50000);
         }
+        tsdbc_close(sc);
+        /* only the snapshots made for the faulted peer's node count; one for the other replica says nothing about
+         * this cursor */
+        char fl[4096], snapfor[64];
+        log_line(L, "test fault: the cursor of peer", fl, sizeof fl);
+        const char *nd = strstr(fl, "(node ");
+        unsigned fnode;
+        if (!nd || sscanf(nd, "(node %u)", &fnode) != 1)
+            die("the stalesent fault's line names no node: %s", fl);
+        snprintf(snapfor, sizeof snapfor, "snapshot made for node %u:", fnode);
         struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0, 0};
         pthread_t sth;
         if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)
@@ -10688,6 +10749,9 @@ static void scen_repcheck(void)
         await_isr(L, "plant", 3, 20000,
                   "after a peer's cursor went back below the leader's log start (the cursor never moved up to what the "
                   "peer acknowledged)");
+        if (log_count_from(L, snapfor, lines0) != 0)
+            die("the peer whose cursor went back below the leader's log start was rebuilt by a snapshot, not sent "
+                "records (the cursor never moved up to what the peer acknowledged)");
         printf("  a peer's cursor set back below the leader's log start moved up to what it acknowledged\n");
     }
 

@@ -77,9 +77,11 @@
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
  * it); `noclock` has a leader write no NOW markers and no idle seal (writersync); `skippos` has one admit take a
  * position more once the file <dir>/skippos exists (the check in op_admit must
- * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
- * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
- * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
+ * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor (of a peer that acknowledged
+ * since the file appeared) back to 0 once the file <dir>/stalesent exists and the leader's log starts above position 1, so 0 is below the log's start (what a resync
+ * that raced records in flight left behind; the cursor must move up to what the peer acknowledged, or it is never sent
+ * another record; with the log still starting at 1 the catch-up from 0 finds every record and the fault proves
+ * nothing: `nocursorup` survived such a run); `slowread` has every catch-up
  * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
  * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `drainhold` keeps
  * a transfer's drain from READY while <dir>/drainhold exists (rtransfer.c, transferraftdrain); `slowack` has a replica's ACKs report the durable end it had
@@ -423,7 +425,14 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
             mm.meta = m->meta;
             mm.meta.isr_version++;
             mm.epoch = mm.meta.epoch;
+            /* in the core's set version like every META the driver hands over (IN_META): unstamped (0) it was dropped
+             * by the core's set-version check from r4-setchg on (a volume starts at set version 1), and the mutant
+             * planted nothing; a drop says so, and scen isr dies with that reason (not by the mutant's own line) */
+            rset_stamp(rv, &mm);
+            uint64_t d0 = repl_dropped_meta(rv->core);
             repl_recv(rv->core, &mm);
+            if (repl_dropped_meta(rv->core) != d0)
+                say("volume %" PRIu32 ": test: the planted META was dropped by the core", rv->number);
         }
     } else if (m->type == REPL_M_FENCE_REPLY) {
         struct cluster_vmsg q = {.kind = CL_VMSG_FENCE_REPLY, .volume = rv->number, .epoch = m->epoch,
@@ -1484,15 +1493,31 @@ static void exec(struct rvol *rv, struct repl_action *a)
             struct rpeer *p = &rv->peer[a->msg.to];
             if (a->upto > p->want)
                 p->want = a->upto;
-            if (G.stale_sent == 1 && rv->mode == M_WRITER && p->acked > 0) {
-                /* the fault: the cursor of a peer that has acknowledged records goes back below the log's start */
+            if (__atomic_load_n(&G.stale_sent, __ATOMIC_RELAXED) == 1 && rv->mode == M_WRITER && p->acked > 0 &&
+                rv->log_start > 1) {
+                /* the fault: the cursor of a peer that has acknowledged records goes back below the log's start (only
+                 * once that start is above 1: before, a cursor of 0 is no fault). Only a peer whose ACK came after the
+                 * file appeared: the `acked` of a replica that has just restarted is its previous run's, above the log
+                 * its reopen kept, and the leader then rebuilds it by a snapshot, which brought it back to the ISR with
+                 * no cursor moving up (nocursorup survived 1 in 8 runs side by side). G is shared by the threads of
+                 * every replicated volume: the time is set once and the fault fires once, both by compare-and-swap */
                 char f[sizeof G.dir + 16];
                 snprintf(f, sizeof f, "%s/stalesent", G.dir);
-                if (access(f, F_OK) == 0) {
-                    G.stale_sent = 2;
+                uint64_t seen = __atomic_load_n(&G.stale_seen_ms, __ATOMIC_RELAXED);
+                if (!seen && access(f, F_OK) == 0) {
+                    uint64_t now = now_ms();
+                    seen = __atomic_compare_exchange_n(&G.stale_seen_ms, &seen, now, 0, __ATOMIC_RELAXED,
+                                                       __ATOMIC_RELAXED)
+                               ? now
+                               : seen;
+                }
+                int one = 1;
+                if (seen && p->acked_ms > seen &&
+                    __atomic_compare_exchange_n(&G.stale_sent, &one, 2, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
                     p->sent = 0;
-                    say("volume %" PRIu32 ": test fault: the cursor of peer %d set back to 0 (it acknowledged %" PRIu64
-                        ")", rv->number, a->msg.to, p->acked);
+                    say("volume %" PRIu32 ": test fault: the cursor of peer %d (node %" PRIu32 ") set back to 0 (it "
+                        "acknowledged %" PRIu64 ", the log starts at %" PRIu64 ")",
+                        rv->number, a->msg.to, rv->rec.rep[a->msg.to].node, p->acked, rv->log_start);
                 }
             }
             /* The peer has what it acknowledged, and the core still counts on it (it has not asked to go back below
@@ -1776,6 +1801,7 @@ static void handle(struct rvol *rv, struct item *it)
         struct rpeer *p = &rv->peer[from];
         p->acked = G.mutant == RM_KEEPWRITTEN ? rv->cur.m.written : rv->cur.m.durable;
         p->heard = 1;
+        p->acked_ms = now_ms();
         if (rv->cur.m.written != p->wrote || !p->wrote_ms) {
             p->wrote = rv->cur.m.written;
             p->wrote_ms = now_ms();
@@ -1923,7 +1949,7 @@ static void demote(struct rvol *rv)
     rv->cstall_said = rv->short_said = rv->snap_said = 0;
     for (int i = 0; i < REPL_MAX_NODES; i++) {
         struct rpeer *p = &rv->peer[i];
-        p->sent = p->want = p->sent_ms = p->acked = p->gen = p->wrote = p->wrote_ms = p->ahead_ms = 0;
+        p->sent = p->want = p->sent_ms = p->acked = p->acked_ms = p->gen = p->wrote = p->wrote_ms = p->ahead_ms = 0;
     }
     rv->nidx = 0;
     rv->idx_end = 0;
