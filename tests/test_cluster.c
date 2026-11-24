@@ -16138,6 +16138,34 @@ static void move_servers(const struct meta_volume *v, int L, struct mv_servers *
     }
 }
 
+/* STATUS of server i, the Raft leader that runs a move: `running` 1: a line "move volume 1 node a -> node b: " names the
+ * move; 0: no move runs and the counters say `done` moves done and none cancelled (condition wait: the duty counts a
+ * move at the round that sees the REMOVE applied, which may follow the watch's record) */
+static void move_status(int i, uint32_t a, uint32_t b, int running, uint64_t done, const char *what)
+{
+    char want[128];
+    snprintf(want, sizeof want, "move volume 1 node %" PRIu32 " -> node %" PRIu32 ": ", a, b);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct view v;
+        view(i, &v);
+        int named = strstr(v.st.moves, want) != NULL;
+        uint64_t d = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_DONE] : UINT64_MAX;
+        uint64_t c = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_CANCELLED] : UINT64_MAX;
+        uint64_t st = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_STARTED] : 0;
+        char text[sizeof v.st.moves];
+        snprintf(text, sizeof text, "%s", v.st.moves);
+        view_free(&v);
+        if (running ? named && st >= 1 : !text[0] && d == done && c == 0)
+            return;
+        if (now_ms() - t0 > 20000)
+            die("%s: STATUS of server %d says moves started %" PRIu64 " done %" PRIu64 " cancelled %" PRIu64
+                " and running \"%s\", not %s", what, i, st, d, c, text,
+                running ? "the move as running" : "no move running and the move done");
+        usleep(100000);
+    }
+}
+
 /* move: under 4 writers a replica A (not the leader) moves to X through `tsdb cluster volume move`; every committed
  * record keeps the ISR without A at least as large as before X joined (move_watch); at the end A's directory is gone,
  * X is in the ISR and the three members hold the same rows, every acknowledged one. Mutants moveshrinkfirst (A shrunk
@@ -16164,6 +16192,7 @@ static void scen_move(void)
     printf("  %s", out);
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     await_move(W, &x, 0, 90000, "move");
+    move_status(s.R, ids[A], ids[B], 0, 1, "move");
     move_dir_gone(A);
     for (int k = 0; k < REP_NAMES; k++)
         await_batches(&r.w[k], 10, 20000); /* the writes go on with the new set */
@@ -16195,6 +16224,7 @@ static void scen_movelag(void)
     move_op(s.R, A, B, 0, "proposed");
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     await_joined(W, &x, 60000);
+    move_status(s.R, ids[A], ids[B], 1, 0, "movelag"); /* held before its shrink: STATUS names it */
     pause_server(C, 1);
     await_isr(L, "plant", 3, 20000, "C lagged out of the ISR after X joined");
     move_hold_set(0);

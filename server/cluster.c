@@ -583,6 +583,8 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         r.bad = 1;
     for (uint32_t i = 0; i < st->ntr && !r.bad; i++)
         st->tr[i] = get64(&r);
+    if (!r.bad)
+        getstr(&r, st->moves, sizeof st->moves);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -3891,11 +3893,17 @@ static void put_status(struct buf *b)
     tr[CL_TR_STARTED] = cc.started, tr[CL_TR_DONE] = cc.done, tr[CL_TR_TIMEDOUT] = cc.timedout;
     tr[CL_TR_CANCELLED] = cc.cancelled, tr[CL_TR_FALLBACK] = cc.fallback, tr[CL_TR_BALANCE] = cc.balance;
     cluster_drv_counts_fn dc = atomic_load_explicit(&g_drv_counts, memory_order_acquire);
+    unsigned long ms, md, mc;
+    cmove_counts(&ms, &md, &mc);
+    tr[CL_TR_MV_STARTED] = ms, tr[CL_TR_MV_DONE] = md, tr[CL_TR_MV_CANCELLED] = mc;
     if (dc)
         dc(tr);
     put32(b, CL_TR_N);
     for (int i = 0; i < CL_TR_N; i++)
         put64(b, tr[i]);
+    char mv[sizeof ((struct cluster_status *)0)->moves];
+    cmove_status(mv, sizeof mv, now);
+    putstr(b, mv);
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
