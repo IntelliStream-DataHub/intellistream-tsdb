@@ -256,7 +256,8 @@ $(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
 # The replication core (src/repl.c, sans-IO) under its simulator (docs/design-cluster.md §13.1). sim_repl_mut has
-# the planted bugs (MUT() in repl.c) that tests/sim_repl.sh checks the checker catches.
+# the planted bugs (MUT() in repl.c, SMUT() in its own transfer model) that tests/sim_repl.sh checks the checker
+# catches.
 $(B)/sim_repl: tests/sim_repl.c src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/sim_repl.c src/repl.c
 
@@ -509,7 +510,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -978,7 +979,8 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
-	    refusedsilent divergeisr
+	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
+	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/rset_mutants.sh $(SCRATCH)
@@ -1654,7 +1656,14 @@ JEPSEN_NODES ?= 5
 # fwdstall nemesis (an entry node holds its forwards past fwd_max_age: an old frame must never be applied)
 JEPSEN_CLUSTER_WORKLOADS ?= meta,kv-local meta,kv meta,kv-via meta,classes meta,users
 JEPSEN_VIA_NEMESES ?= fwdstall
-jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
+# R4's nemeses (kill2, slow, longdown, rebuild, churn: the header of jepsen_cluster.c): the ones whose tracks are on main
+# (`jepsen_cluster --built-nemeses`; an unbuilt one is refused, never skipped silently when named), each on kv and classes
+# (kvr moves under churn; classes at the default caps once r4-replay is on main). JEPSEN_R4_NEMESES names others;
+# JEPSEN_R4_NEMESES=none leaves them out. They add runs: IO x JEPSEN_R4_WORKLOADS (2) x the built nemeses, each
+# JEPSEN_SECONDS (>= 40 min at 300 s with two built, 20 runs and about 100 min with all five).
+# JEPSEN_R4_TRY=1 runs the unbuilt ones too. longdown runs with repl_retain_s 3 (--retain-s S for another age).
+JEPSEN_R4_WORKLOADS ?= meta,kv meta,classes
+jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
 	for io in $(IO); do for wl in $(JEPSEN_CLUSTER_WORKLOADS); do for nem in $(JEPSEN_NEMESES); do \
 	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem"; \
 	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
@@ -1667,6 +1676,13 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	        --nemesis $$nem --workload meta,kv-via --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
 	        || exit 1; \
 	    done; done
+	r4="$(JEPSEN_R4_NEMESES)"; case "$$r4" in none) r4=;; "") r4=$$(./$(B)/jepsen_cluster --built-nemeses);; esac; \
+	for io in $(IO); do for wl in $(JEPSEN_R4_WORKLOADS); do for nem in $$r4; do \
+	    echo "== tsdbd --io $$io, workloads $$wl, nemesis $$nem (R4)"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) --nodes $(JEPSEN_NODES) \
+	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
+	        --outagefs $(B)/liboutagefs.so || exit 1; \
+	    done; done; done
 
 # The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
 # of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
@@ -1676,7 +1692,7 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 # Each check of the histories (validity, durability, atomic visibility, stale and monotonic reads) and the election
 # check are fed a history made here with one thing wrong (--selftest-checker). A nemesis that does nothing (a kill that
 # kills nobody, a pause that stops nobody, a delay that delays nothing, a heal that resumes held links) fails the run.
-jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
+jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
 	@d=$(JEPSEN_CLUSTER_DIR)-selftest; j="env TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb ./$(B)/jepsen_cluster --dir $$d"; \
 	out=$$($$j --mutant foreign-pid --seconds 5 --nemesis kill 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'names pid'; then \
@@ -1738,6 +1754,40 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	out=$$(TSDB_REPLICA_READS=1 $$j --seconds 30 --nemesis none --workload kv-via 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'read-your-writes: key'; then \
 	        echo "jepsen-cluster-selftest: a read served from a replica's own copy (replica reads on, no mutant) went unnoticed by read-your-writes (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nokill2 --seconds 25 --nemesis kill2 --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'kill2 nemesis (round .*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a kill2 that kills one server went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant noslow --seconds 25 --nemesis slow --workload meta,kv --outagefs $(B)/liboutagefs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'slow nemesis (round .*had no effect'; then \
+	        echo "jepsen-cluster-selftest: a slow that slows nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant plant-snap-left --seconds 15 --nemesis kill --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q '\.snap is left on node'; then \
+	        echo "jepsen-cluster-selftest: a v<N>.snap left on a node went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant plant-removed-left --seconds 15 --nemesis kill --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q '\.removed-77 is left on node'; then \
+	        echo "jepsen-cluster-selftest: a v<N>.removed-* left on a node went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(JEPSEN_R4_TRY=1 $$j --seconds 5 --nemesis churn --workload meta,kv-local 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'works on kvr'; then \
+	        echo "jepsen-cluster-selftest: churn on a workload without kvr was not refused (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --seconds 5 --nemesis slow --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q 'needs --outagefs'; then \
+	        echo "jepsen-cluster-selftest: slow without the shim was not refused (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	for n in longdown rebuild churn; do \
+	    if ! ./$(B)/jepsen_cluster --built-nemeses | grep -qw $$n; then \
+	        out=$$($$j --seconds 5 --nemesis $$n --workload meta,kv 2>&1); rc=$$?; \
+	        if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q "the $$n nemesis needs .* which is not on main yet"; then \
+	            echo "jepsen-cluster-selftest: the unbuilt nemesis $$n was not refused with its line (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; fi; \
+	    done; \
+	if grep -qs snapfloorlow server/*.c src/*.c && ./$(B)/jepsen_cluster --built-nemeses | grep -qw longdown; then \
+	    out=$$(TSDB_REPLD_MUTANT=snapfloorlow $$j --seconds 120 --nemesis longdown --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
+	        echo "jepsen-cluster-selftest: a snapshot cut below the floor (snapfloorlow) went unnoticed under longdown (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	else echo "jepsen-cluster-selftest: snapfloorlow under longdown skipped (the mutant or the nemesis is not on main yet)"; fi; \
+	if grep -qs moveshrinkfirst server/*.c src/*.c && ./$(B)/jepsen_cluster --built-nemeses | grep -qw churn; then \
+	    out=$$(TSDB_CLUSTER_MUTANT=moveshrinkfirst TSDB_REPLD_MUTANT=moveshrinkfirst $$j --seconds 120 --nemesis churn --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
+	        echo "jepsen-cluster-selftest: a move that shrinks first (moveshrinkfirst) went unnoticed under churn (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	else echo "jepsen-cluster-selftest: moveshrinkfirst under churn skipped (the mutant or the nemesis is not on main yet)"; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

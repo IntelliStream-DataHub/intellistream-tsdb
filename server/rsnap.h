@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Snapshot transfer of a replicated volume (design-cluster.md §8.1, R4 plan D2-D7, D18): the replica's request, the
- * leader's send and the receiver's side on the kind-5 link (PL_KIND_SNAP). A stub until r4-xferlink (request, source,
- * transfer) and r4-xferinst (install, reopen) fill server/rsnap.c; the call sites in repld.c are final.
+ * leader's send and the receiver's side on the kind-5 link (PL_KIND_SNAP); server/rsnap.c has the design. The install
+ * and reopen (r4-xferinst) are not built: a received copy is removed.
  */
 #ifndef TSDB_RSNAP_H
 #define TSDB_RSNAP_H
@@ -31,5 +31,13 @@ int rsnap_bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, 
                    uint64_t *resume, int *prefix_fd);
 int rsnap_bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, const void *p, size_t n);
 void rsnap_bin_end(void *arg, struct plink *l, uint64_t file, int status);
+/* repld_stop, before peerlink_free: stops the snapshot worker (a make in progress finishes first); what the links ask
+ * after it is dropped */
+void rsnap_quiesce(void);
+/* RM_SNAPSAMELINK (a planted bug: the files on kind 2): 1 when a kind-2 file is a snapshot's (meta at its begin, else
+ * (l, file)); always 0 otherwise */
+int rsnap_owns(struct plink *l, uint64_t file, const void *meta, size_t meta_len);
+
+/* struct rsnap_stats and rsnap_get_stats are in repld.h (tsdbd's STATUS and metrics read them) */
 
 #endif

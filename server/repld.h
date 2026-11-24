@@ -56,4 +56,16 @@ int repld_close(uint32_t v);
  * design; tsdb_close then reports the other volumes' errors only. */
 void repld_close_failed(void);
 
+/* snapshot transfers of this server since its start (server/rsnap.c; STATUS snap.*, metrics tsdb_snapshot_*) */
+struct rsnap_stats {
+    uint64_t asked;          /* requests this server sent as a receiver */
+    uint64_t sent, received; /* whole snapshots */
+    uint64_t refused_space;  /* refused for the free space of the receiver (D5) */
+    uint64_t failed;         /* abandoned or released before the end, either side */
+    uint64_t busy;           /* BUSY answers, either side */
+    uint64_t bytes_sent, bytes_received;
+    uint64_t last_ms;        /* the last snapshot received: ms from its request to its last file */
+};
+void rsnap_get_stats(struct rsnap_stats *out);
+
 #endif

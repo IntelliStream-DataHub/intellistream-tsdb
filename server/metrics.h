@@ -21,6 +21,12 @@ typedef struct metrics_fwd_peer {
     double p50_us, p99_us; /* hop latency: send to the reply's last byte */
 } metrics_fwd_peer;
 
+/* snapshot transfers of a cluster server (server/rsnap.c; repld.h struct rsnap_stats) */
+typedef struct metrics_snap {
+    uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received;
+    double last_seconds; /* the last snapshot received, from its request to its last file */
+} metrics_snap;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -31,6 +37,7 @@ typedef struct metrics_cfg {
     size_t (*request_memory)(void); /* bytes counted against --max-request-memory now */
     size_t request_memory_limit;    /* --max-request-memory in bytes */
     size_t (*fwd_peers)(metrics_fwd_peer *out, size_t cap); /* NULL: not a cluster server */
+    void (*snap)(metrics_snap *out); /* NULL: not a cluster server */
     int (*vol_diverged)(uint32_t v); /* 1 while volume v is DIVERGED (tsdbd's vol_diverged); NULL: no family */
 } metrics_cfg;
 
