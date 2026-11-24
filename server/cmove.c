@@ -29,10 +29,13 @@
  * Crash points (crashpt.h): move-added when this Raft leader first sees the move's REPLICA_ADD applied, move-shrunk
  * when it first sees A out of the ISR, before its REMOVE is proposed.
  *
- * Mutants (TSDB_CLUSTER_MUTANT, test_cluster move*): moveshrinkfirst (DROP_MEMBER before B joined), movenoreplaces
+ * Mutants (TSDB_CLUSTER_MUTANT, test_cluster move*): moveshrinkfirst (DROP_MEMBER before B joined, with one fewer
+ * in-sync copy allowed for the slot B is to fill: the core's own min_isr check would otherwise hold it back), movenoreplaces
  * (only moves this Raft leader started are driven: the record's `replaces` is forgotten after an election),
  * moveremovebeforeshrink (REMOVE of A while it is in the ISR: meta refuses it), moveleaderfirst (REMOVE of the
  * leader's replica without a transfer: refused by meta), movenominisr (DROP_MEMBER with min_isr 0).
+ *
+ * TSDB_CMOVE_TEST=hold_shrink=PATH holds the shrink step while PATH exists (test_cluster movelag).
  *
  * The test hook TSDB_CLUSTER_TEST vol_trace=1 (cmove_trace) appends a line to <state-dir>/voltrace for every applied
  * entry that changed a replicated volume's set, epoch, leader or ISR: the test follows every committed record.
@@ -43,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../client/tsdb_crypto.h"
 #include "cluster_int.h"
@@ -85,6 +89,21 @@ static struct mv g_mv[64];
 static uint32_t g_nmv;
 static uint64_t g_term; /* the Raft term g_mv belongs to */
 static atomic_ulong n_started, n_done, n_cancelled;
+
+/* TSDB_CMOVE_TEST=hold_shrink=PATH (test_cluster movelag): the shrink step waits while PATH exists, so a test can make
+ * another member lag after the learner joined and before the move asks for the ISR without the old member */
+static int shrink_held(void)
+{
+    static const char *path; /* the cluster thread's */
+    static int read;
+    if (!read) {
+        read = 1;
+        const char *e = getenv("TSDB_CMOVE_TEST");
+        if (e && !strncmp(e, "hold_shrink=", 12) && e[12])
+            path = e + 12;
+    }
+    return path && access(path, F_OK) == 0;
+}
 
 static uint64_t since(uint64_t now, uint64_t t) { return now > t ? now - t : 0; }
 
@@ -144,6 +163,7 @@ static void drop_member(const struct meta_volume *v, uint32_t node, uint32_t min
 static void remove_member(const struct meta_volume *v, uint32_t node)
 {
     struct meta_entry e;
+    meta_entry_init(&e);
     meta_op_replica_remove(&e, v->number, v->epoch, node);
     (void)cl_propose(&e); /* frees e; refused or lost: the next second proposes again while the condition holds */
 }
@@ -209,13 +229,15 @@ static void step(const struct meta_volume *v, struct mv *m, uint64_t now)
             return;
         }
         m->step = ST_SHRINK;
-        if (!due(m, now))
+        if (!due(m, now) || shrink_held())
             return;
         m->sent_ns = now;
         if (mut == MM_REMOVEBEFORESHRINK || (mut == MM_LEADERFIRST && v->leader == out))
             remove_member(v, out);
         else if (v->leader)
-            drop_member(v, out, mut == MM_NOMINISR ? 0 : m->min_isr);
+            drop_member(v, out, mut == MM_NOMINISR                   ? 0
+                               : mut == MM_SHRINKFIRST && m->min_isr ? m->min_isr - 1 /* "b takes a's slot" */
+                                                                     : m->min_isr);
         return;
     }
     if (!m->said_shrunk) {
@@ -344,6 +366,7 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
     }
     uint64_t rid = fresh_rid(v);
     struct meta_entry e;
+    meta_entry_init(&e);
     meta_op_replica_add(&e, vol, v->epoch, to, rid, from);
     if (cl_propose(&e) != 0) { /* frees e */
         reply(conn, reqid, CLUSTER_ERR_RETRY, "%s: not proposed (try again)", what);
