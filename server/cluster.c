@@ -1135,6 +1135,8 @@ static struct {
                           * ("TO KIND VOLUME EPOCH NODE ARG" per line) and removes the file once every one went out
                           * (test_cluster volcmd: the frame, its self-delivery and repld's routing, until R4's tracks send) */
     char volcmdfile[1100];
+    int setop_file;      /* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes <state-dir>/setop (cset.c) */
+    char setopfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1409,6 +1411,8 @@ static void test_knobs(void)
             C.hold_reply = v != 0;
         else if (sscanf(p, "volcmd_file=%llu", &v) == 1)
             C.volcmd_file = v != 0;
+        else if (sscanf(p, "setop_file=%llu", &v) == 1)
+            C.setop_file = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -6437,6 +6441,8 @@ static void leader_duties(uint64_t now)
     cmove_duty(now);
     if (C.volcmd_file && cl_leading())
         volcmd_file_send();
+    if (C.setop_file && cl_leading())
+        cset_setop_file(C.setopfile);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -6757,6 +6763,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
+    snprintf(C.setopfile, sizeof C.setopfile, "%s/setop", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     if (C.users_probe)

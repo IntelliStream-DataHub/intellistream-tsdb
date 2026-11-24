@@ -11977,7 +11977,7 @@ static void scen_r4stubs(void)
         {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
         {"volume move %s 3 --log --from 6 --to 5 --cancel",
          "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
-        {"replica reset %s 4 6", "not built yet (reset of volume 4 on node 6)"}};
+        {"replica reset %s 4 6", "volume 4 does not exist"}};
     for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
         char v[256];
         snprintf(v, sizeof v, verbs[k][0], p0);
@@ -11993,7 +11993,8 @@ static void scen_r4stubs(void)
     for (int k = 0; k < 3; k++) {
         reply = NULL, len = 0;
         arc = admin(0, ops[k], body, 12, 0, &reply, &len);
-        if (arc != META_ERR_INVALID || !reply || len < 21 || memcmp(reply, "not built yet (a body of 12 bytes)", 21))
+        const char *want = k == 2 ? "replica reset: a body of 12 bytes" : "not built yet (a body of 12 bytes)";
+        if (arc != META_ERR_INVALID || !reply || len < 21 || memcmp(reply, want, 21))
             die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
         free(reply);
     }
