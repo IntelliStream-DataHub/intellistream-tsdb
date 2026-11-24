@@ -65,9 +65,10 @@ static const char cl_help[] =
     "                      --redundancy ec=K+M (K 1 to 16, M 1 to 4): settled parts are erasure coded across a\n"
     "                      stripe group of K+M members with a chunk store up (picked once, never renumbered); its\n"
     "                      log is kept on M+1 servers and min_isr is M. replicas=N is --replicas N.\n"
-    "  volume gc resume PEER VOLUME  turns the orphan collection of an erasure-coded volume (a number or a name)\n"
-    "                      back on. It stops after a force-leader or a restore (status: gc_suspended 1) until an\n"
-    "                      operator has checked that no chunk the volume still needs would be taken for an orphan.\n"
+    "  volume gc resume PEER VOLUME  turns the orphan collection of an erasure-coded volume (a name, else a\n"
+    "                      number) back on. It stops after a force-leader (and a restore, once built; status:\n"
+    "                      gc_suspended 1) until an operator has checked that no chunk the volume still needs\n"
+    "                      would be taken for an orphan.\n"
     "  volume force-leader PEER VOLUME NODE  when no ISR member of volume number VOLUME is up (clients get\n"
     "                      UNAVAILABLE NO_OWNER), makes the replica on node NODE its leader. Unclean: writes\n"
     "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
@@ -132,15 +133,13 @@ static int num(const char *flag, const char *s, uint32_t *out)
     return 0;
 }
 
-/* `volume gc resume`'s VOLUME: a number, or a name looked up in the status of PEER (any member answers it) */
+/* `volume gc resume`'s VOLUME: a name looked up in the status of PEER (any member answers it), else a number (a
+ * volume may be named "7": its name wins over volume number 7) */
 static int gc_volume(const char *s, const char *addr, const uint8_t *secret, size_t slen, uint32_t *out)
 {
     char *end;
     unsigned long v = strtoul(s, &end, 10);
-    if (*s && !*end && v > 0 && v <= UINT32_MAX) {
-        *out = (uint32_t)v;
-        return 0;
-    }
+    int numeric = *s && !*end && v > 0 && v <= UINT32_MAX;
     char err[1024];
     int rc;
     uint8_t *reply = NULL;
@@ -164,6 +163,10 @@ static int gc_volume(const char *s, const char *addr, const uint8_t *secret, siz
     }
     meta_free(&m);
     free(reply);
+    if (!found && numeric) {
+        *out = (uint32_t)v;
+        found = 1;
+    }
     if (!found)
         fprintf(stderr, "tsdb cluster volume gc resume: no volume named %s in the status of %s\n", s, addr);
     return found ? 0 : -1;
@@ -571,7 +574,7 @@ int cluster_cli(int argc, char **argv)
         op = CLUSTER_OP_VOLUME_FORCE;
         rl = cluster_volume_force_encode(force_vol, force_node, req);
     } else if (!strcmp(verb, "volume")) {
-        op = CLUSTER_OP_VOLUME_ADD;
+        op = ec_k ? CLUSTER_OP_VOLUME_ADD_EC : CLUSTER_OP_VOLUME_ADD;
         size_t n = strlen(newpeer);
         if (n == 0 || n >= META_NAME_MAX) {
             fprintf(stderr, "tsdb cluster: %s: a volume name is 1 to %d bytes\n", newpeer, META_NAME_MAX - 1);
@@ -602,7 +605,8 @@ int cluster_cli(int argc, char **argv)
             continue;
         }
         if (rc != 0) {
-            if ((op == CLUSTER_OP_VOLUME_FORCE || op == CLUSTER_OP_VOLUME_ADD || op == CLUSTER_OP_VOLUME_GC_RESUME ||
+            if ((op == CLUSTER_OP_VOLUME_FORCE || op == CLUSTER_OP_VOLUME_ADD || op == CLUSTER_OP_VOLUME_ADD_EC ||
+                 op == CLUSTER_OP_VOLUME_GC_RESUME ||
                  r4op) && len) /* the leader's reason, e.g. how many members qualify for a stripe group */
                 fprintf(stderr, "tsdb cluster %s %s: %.*s\n", verb, argv[2], (int)len, (const char *)reply);
             fprintf(stderr, "tsdb cluster %s: %s\n", verb, cluster_strerror(rc));
@@ -618,7 +622,7 @@ int cluster_cli(int argc, char **argv)
             }
             print_status(&st);
             cluster_status_free(&st);
-        } else if (op == CLUSTER_OP_VOLUME_ADD) {
+        } else if (op == CLUSTER_OP_VOLUME_ADD || op == CLUSTER_OP_VOLUME_ADD_EC) {
             uint32_t number = 0;
             for (size_t k = 0; k < 4 && k < len; k++)
                 number |= (uint32_t)reply[k] << (8 * k);
