@@ -3619,7 +3619,8 @@ static void *promo_probe_run(void *a)
 /* A member that becomes a voter (a watcher made a learner, then a voter: core_boot rebuilds its metadata copy from
  * nothing or its snapshot, and the log replays) keeps answering logins from the users it had: during the rebuild no
  * login is refused there and an open session goes on (server/cluster.c users_push holds the watch while the copy is
- * below what it was given). Mutant (TSDB_CLUSTER_MUTANT): pushrebuild (the empty copy is pushed). */
+ * below what it was given). Its STATUS shows the watcher's state meanwhile, never an empty image. Mutants
+ * (TSDB_CLUSTER_MUTANT): pushrebuild (the empty copy is pushed), bootempty (STATUS shows the empty core's state). */
 static void scen_userpromote(void)
 {
     scenario("userpromote");
@@ -3640,7 +3641,32 @@ static void scen_userpromote(void)
         die("pthread_create");
     node_add(0, 2); /* three: servers 1 and 2 become learners, then voters */
     unsigned want = 3;
-    await_view(0, p_voters, &want, "three voters");
+    /* server 1's STATUS through the promotion shows the state it served as a watcher (marked stale) while its core
+     * starts from nothing and its install is held, never an empty image (core_boot keeps that state as the copy; a
+     * test reading a volume there found none: setchurn; mutant bootempty) */
+    int held = 0, polls = 0;
+    for (uint64_t t0 = now_ms();; polls++) {
+        struct view v1, v0;
+        view(1, &v1);
+        int empty = !v1.m.initialised || v1.m.nmembers < 2;
+        held += v1.st.mode == CLUSTER_MODE_CORE && v1.st.stale;
+        unsigned mode = v1.st.mode, stale = v1.st.stale;
+        uint64_t applied = v1.st.applied;
+        view_free(&v1);
+        if (empty)
+            die("server 1 made a learner: its STATUS showed an empty image (mode %u, stale %u, applied %" PRIu64
+                ", after %d polls)", mode, stale, applied, polls);
+        view(0, &v0);
+        int done = p_voters(&v0, &want);
+        view_free(&v0);
+        if (done)
+            break;
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 0: three voters did not happen within %d ms", WAIT_MS);
+        usleep(20000);
+    }
+    if (!held)
+        die("server 1 made a learner: none of %d STATUS answers fell in its held install", polls);
     await_view(1, p_users_caught_up, NULL, "users caught up");
     usleep(1000000);
     atomic_store(&p.stop, 1);
@@ -3651,7 +3677,8 @@ static void scen_userpromote(void)
             p.refused, p.logins, p.ended, p.why);
     if (log_has(1, "the cluster's users went back"))
         die("server 1 made a voter: its users went back (an older list pushed while its copy was rebuilt)");
-    printf("  server 1 made a voter: %d logins and the open session's lookups all answered\n", p.logins);
+    printf("  server 1 made a voter: %d logins and the open session's lookups all answered; %d of %d STATUS answers"
+           " showed its watcher's state during the held install, none an empty image\n", p.logins, held, polls);
 }
 
 struct replay_probe {

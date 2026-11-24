@@ -1019,7 +1019,8 @@ static struct {
     uint64_t copy_next; /* not before this time (ns) */
     int copy_out;       /* a DJ_COPY job is on the disk worker */
     uint64_t copy_applied, copy_gen; /* what the copy file holds (applied index, restore generation): never written lower */
-    struct meta_state cpy; /* a voter's persisted copy that is ahead of what its core has applied since the restart */
+    struct meta_state cpy; /* a voter's persisted copy that is ahead of what its core has applied since the restart, or
+                            * the state a member served before core_boot started its core */
     int cpy_on;
     int fail_copy_dirsync, fail_pend_dirsync;
     int img_shared; /* an image this run saw (an install) says shared mode: a learner's own state is empty until then */
@@ -1741,7 +1742,9 @@ enum cl_mutant {
     CLM_PUSHREBUILD = 31,  /* the users watch is given the copy while it is rebuilt (a promotion's core_boot) */
     CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
     CLM_SYNCNOLEASE = 33,  /* USER_SYNC answered by a leader without its lease (review F7) */
-    CLM_ULADDRTICK = 34    /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
+    CLM_ULADDRTICK = 34,   /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
+    CLM_BOOTEMPTY = 35     /* core_boot drops the state the member served: STATUS shows an empty image until the core
+                            * catches up (test_cluster userpromote) */
 };
 static int cl_mutant(void)
 {
@@ -1784,6 +1787,7 @@ static int cl_mutant(void)
             : !strcmp(e, "holdempty")     ? CLM_HOLDEMPTY
             : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
             : !strcmp(e, "uladdrtick")    ? CLM_ULADDRTICK
+            : !strcmp(e, "bootempty")     ? CLM_BOOTEMPTY
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -3309,9 +3313,22 @@ static int adopt_install(char *err, size_t errn)
 }
 
 /* The core from the files: the snapshot (or none), the log on it, the hard state. 0, or -1 with err. */
+static int cpy_ahead(void);
+
 static int core_boot(char *err, size_t errn)
 {
-    meta_free(&C.sm);
+    /* The state this member served until now (a watcher's stream, or its copy file) stays the one STATUS and the user
+     * list show, marked stale, until the core has applied past it (view_state, as for a restarted voter): the core
+     * starts from nothing or its snapshot, and a watcher made a learner showed an empty image until the leader's
+     * install or log reached it (test_cluster setchurn read no volume there; userpromote checks the window) */
+    if (C.sm.initialised && !cpy_ahead() && cl_mutant() != CLM_BOOTEMPTY) {
+        if (C.cpy_on)
+            meta_free(&C.cpy);
+        C.cpy = C.sm;
+        C.cpy_on = 1;
+    } else {
+        meta_free(&C.sm);
+    }
     meta_init(&C.sm);
     free(C.snap);
     C.snap = NULL;
@@ -3397,7 +3414,6 @@ static int core_boot(char *err, size_t errn)
 }
 
 static void core_stop(struct meta_state *next);
-static int cpy_ahead(void);
 
 /* removed from the group while away: the core goes (its files stay), the state goes on from `next` (or as is) */
 static void drop_core(struct meta_state *next, const char *why)
@@ -3705,7 +3721,7 @@ static int cpy_ahead(void)
 }
 
 /* The state a status is shown from: a voter that restarted shows its persisted copy (marked stale) until its core has
- * applied that far again. */
+ * applied that far again, and a member whose core just started (core_boot) the state it served before. */
 static const struct meta_state *view_state(void)
 {
     return cpy_ahead() ? &C.cpy : &C.sm;

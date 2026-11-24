@@ -412,7 +412,8 @@ struct cluster_heard {
 struct cluster_status {
     uint32_t self;
     uint8_t mode, role; /* role: raft_role (0 follower, 1 pre-candidate, 2 candidate, 3 leader) */
-    uint8_t stale;      /* 1: the image is this member's persisted copy of an earlier run, not yet confirmed */
+    uint8_t stale;      /* 1: the image is this member's persisted copy of an earlier run, or the state it served
+                         * before its core started, not yet confirmed by its core or a stream */
     uint64_t term, commit, applied;
     uint32_t leader;
     uint32_t nheard;
