@@ -397,7 +397,14 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
             mm.meta = m->meta;
             mm.meta.isr_version++;
             mm.epoch = mm.meta.epoch;
+            /* in the core's set version like every META the driver hands over (IN_META): unstamped (0) it was dropped
+             * by the core's set-version check from r4-setchg on (a volume starts at set version 1), and the mutant
+             * planted nothing; a drop says so, and scen isr dies with that reason (not by the mutant's own line) */
+            rset_stamp(rv, &mm);
+            uint64_t d0 = repl_dropped_meta(rv->core);
             repl_recv(rv->core, &mm);
+            if (repl_dropped_meta(rv->core) != d0)
+                say("volume %" PRIu32 ": test: the planted META was dropped by the core", rv->number);
         }
     } else if (m->type == REPL_M_FENCE_REPLY) {
         struct cluster_vmsg q = {.kind = CL_VMSG_FENCE_REPLY, .volume = rv->number, .epoch = m->epoch,

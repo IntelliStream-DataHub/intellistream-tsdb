@@ -5103,15 +5103,27 @@ static void scen_isr(void)
     pthread_t th;
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
-    struct timespec s3 = {3, 0};
-    nanosleep(&s3, NULL);
+    /* The window is counted from the leader's ask, a condition, never from the kill: how soon the leader notices the
+     * dead replica (and then isr_lag_ms) is not the test's to guess. The plant hands its META over in the same call
+     * as the ask, so its wrong acknowledgement follows at once and 3 s from the ask is margin; a slow detection of
+     * the kill no longer lets the mutant pass as "isr passed" */
+    uint64_t t0 = now_ms();
+    while (!log_has(L, "asks for an ISR of 2 members")) {
+        if (now_ms() - t0 > 30000)
+            die("the leader never asked for an ISR without the killed replica (30 s)");
+        usleep(20000);
+    }
+    t0 = now_ms();
+    while (now_ms() - t0 < 3000 && !__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
+        usleep(10000);
     if (__atomic_load_n(&w.done, __ATOMIC_ACQUIRE))
         die("a write was acknowledged without a killed ISR member before the ISR change committed (rc %d)", w.rc);
+    if (log_has(L, "planted META was dropped"))
+        die("the leader's core dropped the planted META (TSDB_REPLD_MUTANT commitpastremoved planted nothing)");
     if (isr_of(0, "plant", NULL) != 3)
         die("the ISR changed while the proposals were held");
-    if (!log_has(L, "asks for an ISR of 2 members"))
-        die("the leader never asked for an ISR without the killed replica");
     hold_isr(0);
+    struct timespec s3 = {3, 0};
     await_writer(&w, th, 5000, "the write held by an uncommitted ISR change, once the change could commit");
     rows++;
     await_isr(0, "plant", 2, 5000, "a replica killed");
