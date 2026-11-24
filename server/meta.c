@@ -3,8 +3,9 @@
  * The cluster's metadata state machine; see meta.h for what it holds and the rules it keeps.
  *
  * Bytes, all little-endian:
- *   entry     u32 magic "TME2" ("TME1" up to snapshot version 4: R4 grew the bodies of INIT, REPLICA_ADD and
- *             VOLUME_LEADER), u32 nops, then nops times { u8 kind, u32 len, body[len] }
+ *   entry     u32 magic "TME3" ("TME1" up to snapshot version 4: R4 grew the bodies of INIT, REPLICA_ADD and
+ *             VOLUME_LEADER; "TME2" in version 5: R8 grew VOLUME_ADD's), u32 nops, then nops times { u8 kind, u32 len,
+ *             body[len] }
  *   snapshot  u32 magic "TMS1", u32 version (SNAP_VERSION), u64 applied, u64 applied_term, the body below, u32 crc32c
  *             of all before
  * (version 2: shared volumes, replica instances, domains, slot moves in flight; version 1 is refused: no cluster
@@ -14,6 +15,8 @@
  *
  * One rule beyond meta.h's: an entry touches a volume at most once (a second operation on it is META_ERR_INVALID).
  * Then a volume's change in one entry is one step, which meta_check_step can judge from the states on either side.
+ * GC_SUSPEND is the one exception: it only sets a flag that nothing but GC_RESUME clears, so it may share an entry
+ * with the ISR_CHANGE of force-leader (it goes first: the suspension is committed with the unclean election or before).
  */
 #include "meta.h"
 
@@ -25,7 +28,8 @@
 
 /* 3: the replicated volumes' settings (R3); 4: users with uid and version, max_uid (S2-1); 5: replica set changes
  * (R4: set_version, a replica's `replaces`, the last grant's target and end, rebuild_mb_s, rebuild_max,
- * transfer_wait_ms, leader_balance_s). A preview cluster is initialised again, not upgraded (the plan's D9): an image
+ * transfer_wait_ms, leader_balance_s); 6: erasure-coded volumes (R8: redundancy, k, m, the stripe group and its version,
+ * gc_suspended, gc_gen). A preview cluster is initialised again, not upgraded (the plan's D9): an image
  * of another version is refused, and its reader names both (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
@@ -38,8 +42,9 @@ uint64_t meta_mutants;
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x32454d54u    /* "TME2": entries of snapshot version 5 */
+#define ENTRY_MAGIC 0x33454d54u    /* "TME3": entries of snapshot version 6 */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
+#define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define SNAP_MAGIC 0x31534d54u  /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -795,7 +800,22 @@ void meta_op_volume_add(struct meta_entry *e, const struct meta_volume_add *a)
     put_ids(&w, a->nodes, a->n);
     for (uint32_t i = 0; i < a->n; i++)
         put64(&w, a->rid[i]);
+    put8(&w, a->redundancy);
+    put8(&w, a->ec_k);
+    put8(&w, a->ec_m);
+    uint32_t ns = a->nstripe <= META_STRIPE_MAX ? a->nstripe : 0;
+    put32(&w, ns);
+    for (uint32_t i = 0; i < ns; i++)
+        put32(&w, a->stripe[i]);
     op_end(e, st);
+}
+
+uint32_t meta_volume_min_isr(uint8_t redundancy, uint8_t ec_m, uint32_t n, uint32_t cluster_min_isr)
+{
+    uint32_t want = redundancy == META_RED_EC ? (MUT(51) ? 1 : ec_m) : cluster_min_isr; /* minisrone */
+    if (want < 1)
+        want = 1;
+    return want < n ? want : n;
 }
 
 void meta_op_volume_leader(struct meta_entry *e, const struct meta_grant *g)
@@ -1060,6 +1080,45 @@ void meta_op_replica_reset(struct meta_entry *e, uint32_t number, uint64_t epoch
     op_end(e, st);
 }
 
+void meta_op_stripe_set(struct meta_entry *e, uint32_t number, uint32_t pos, uint32_t node, uint64_t stripe_version)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_STRIPE_SET);
+    put32(&w, number);
+    put32(&w, pos);
+    put32(&w, node);
+    put64(&w, stripe_version);
+    op_end(e, st);
+}
+
+static void op_vol_only(struct meta_entry *e, uint8_t kind, uint32_t number)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, kind);
+    put32(&w, number);
+    op_end(e, st);
+}
+
+void meta_op_gc_suspend(struct meta_entry *e, uint32_t number) { op_vol_only(e, META_OP_GC_SUSPEND, number); }
+void meta_op_gc_resume(struct meta_entry *e, uint32_t number) { op_vol_only(e, META_OP_GC_RESUME, number); }
+
+void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node)
+{
+    /* the leader's log may lack markers the old ISR committed: no orphan may be judged by it until the operator says
+     * so (E14) */
+    if (v->redundancy == META_RED_EC && !MUT(54)) /* forcenosuspend */
+        meta_op_gc_suspend(e, v->number);
+    uint32_t ids[META_REPLICAS_MAX];
+    uint64_t rids[META_REPLICAS_MAX];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < v->nrep && n < META_REPLICAS_MAX; i++)
+        if (meta_volume_in_isr(v, v->rep[i].node) || v->rep[i].node == node) {
+            ids[n] = v->rep[i].node;
+            rids[n++] = v->rep[i].rid;
+        }
+    meta_op_isr_change(e, v->number, v->epoch, v->isr_version, ids, rids, n, 0);
+}
+
 /* ---------------------------------------------------------------- apply */
 
 static void sort_ids(uint32_t *ids, uint32_t n)
@@ -1243,6 +1302,8 @@ static int promote(struct meta_volume *v, const struct meta_grant *g)
     v->hist[v->nhist++] = (struct meta_epoch){v->epoch, g->start};
     v->leader = g->leader;
     v->isr_version = vm.isr_version;
+    if (MUT(52)) /* gcresumeany: a new leader turns orphan collection back on */
+        v->gc_suspended = 0;
     return META_OK;
 }
 
@@ -1420,10 +1481,39 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         uint32_t n = get_ids(r, nodes);
         for (uint32_t i = 0; i < n; i++)
             rid[i] = get64(r);
+        uint8_t red = get8(r), ek = get8(r), em = get8(r);
+        uint32_t ns = get32(r), stripe[META_STRIPE_MAX];
+        if (ns > META_STRIPE_MAX)
+            r->bad = 1;
+        for (uint32_t i = 0; i < ns && !r->bad; i++)
+            stripe[i] = get32(r);
         if (r->bad)
             return META_ERR_FORMAT;
         if (number > META_VOLUME_MAX || !name[0] || n < 1 || min_isr < 1 || min_isr > n || vk != m->mode)
             return META_ERR_INVALID; /* a volume of the other kind is refused (M7) */
+        if (red == META_RED_REPLICAS) {
+            if (ek || em || ns)
+                return META_ERR_INVALID;
+        } else if (red == META_RED_EC) {
+            /* the group is the proposer's pick (heartbeats are no state); apply only checks it: k + m distinct
+             * members, none out. min_isr is at least m (E24, E35), or every replica where there are fewer */
+            if (vk != META_VOL_REPLICATED || ek < 1 || ek > META_EC_K_MAX || em < 1 || em > META_EC_M_MAX ||
+                ns != (uint32_t)ek + em || min_isr < (em < n ? em : n))
+                return META_ERR_INVALID;
+            for (uint32_t i = 0; i < ns; i++) {
+                const struct meta_member *sm = meta_member(m, stripe[i]);
+                if (!sm || sm->state == META_OUT || has_id(stripe, i, stripe[i]))
+                    return META_ERR_INVALID;
+            }
+            if (MUT(53)) { /* stripeatapply: the group from this copy's own members, not the proposer's pick */
+                uint32_t k2 = 0;
+                for (uint32_t i = 0; i < m->nmembers && k2 < ns; i++)
+                    if (m->members[i].state != META_OUT)
+                        stripe[k2++] = m->members[i].id;
+            }
+        } else {
+            return META_ERR_INVALID;
+        }
         if (vk == META_VOL_SHARED) {
             if (st.path[0] != '/' || !st.export[0] || !text_ok(st.path) || !text_ok(st.export) ||
                 !text_ok(st.fstype) || !text_ok(st.group))
@@ -1470,6 +1560,14 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             v->rep[i].rid = rid[i];
         }
         v->set_version = 1;
+        v->redundancy = red;
+        if (red == META_RED_EC) {
+            v->ec_k = ek;
+            v->ec_m = em;
+            v->nstripe = ns;
+            memcpy(v->stripe, stripe, ns * sizeof *stripe);
+            v->stripe_version = 1;
+        }
         v->leader = nodes[0];
         v->epoch = 1;
         isr_set(v, nodes, n);
@@ -1633,6 +1731,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 return META_ERR_NOTFOUND;
             if ((node == v->leader && !MUT(11)) || (!shared && meta_volume_in_isr(v, node)))
                 return META_ERR_INVALID; /* the ISR shrinks first: a move never lowers the in-sync copies */
+            if (v->nrep <= v->min_isr)
+                return META_ERR_INVALID; /* min_isr <= replicas: a volume never asks for copies it cannot have */
             int b = -1; /* the learner moving in for `node`: this REMOVE ends its move */
             for (uint32_t j = 0; j < v->nrep; j++)
                 if (v->rep[j].replaces == node)
@@ -1915,6 +2015,61 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         if (gen <= m->restore_gen)
             return META_ERR_STALE;
         m->restore_gen = gen;
+        /* after a restore the leaders' logs may lack markers that were committed before it (E14, §5.7) */
+        for (uint32_t i = 0; i < m->nvolumes; i++)
+            if (m->volumes[i].redundancy == META_RED_EC)
+                m->volumes[i].gc_suspended = 1;
+        return META_OK;
+    }
+    case META_OP_STRIPE_SET: {
+        uint32_t number = get32(r), pos = get32(r), node = get32(r);
+        uint64_t sv = get64(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        int rc = vol_get(m, number, touched, *ntouched, &v);
+        if (rc)
+            return rc;
+        if (v->redundancy != META_RED_EC || pos >= v->nstripe)
+            return META_ERR_INVALID;
+        if (sv != v->stripe_version && !MUT(50)) /* stripeuncond */
+            return META_ERR_STALE;
+        const struct meta_member *mb = meta_member(m, node);
+        if (!mb || mb->state == META_OUT)
+            return META_ERR_INVALID;
+        for (uint32_t i = 0; i < v->nstripe; i++)
+            if (i != pos && v->stripe[i] == node)
+                return META_ERR_INVALID; /* one position per node (E9) */
+        v->stripe[pos] = node;
+        v->stripe_version++;
+        touched[(*ntouched)++] = number;
+        return META_OK;
+    }
+    case META_OP_GC_SUSPEND:
+    case META_OP_GC_RESUME: {
+        uint32_t number = get32(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        struct meta_volume *v;
+        if (kind == META_OP_GC_SUSPEND) { /* not counted as a touch (the head comment) */
+            int32_t at = volume_at(m, number);
+            if (at < 0)
+                return META_ERR_NOTFOUND;
+            v = &m->volumes[at];
+        } else {
+            int rc = vol_get(m, number, touched, *ntouched, &v);
+            if (rc)
+                return rc;
+        }
+        if (v->redundancy != META_RED_EC)
+            return META_ERR_INVALID;
+        if (kind == META_OP_GC_SUSPEND) {
+            v->gc_suspended = 1;
+            return META_OK;
+        }
+        v->gc_suspended = 0;
+        v->gc_gen++;
+        touched[(*ntouched)++] = number;
         return META_OK;
     }
     case META_OP_NAME_GROUP:
@@ -2046,7 +2201,8 @@ static int entry_valid(const uint8_t *p, size_t len, uint32_t *nops)
 int meta_entry_older(const void *data, size_t len)
 {
     struct rd r = {data, len, 0, 0};
-    return get32(&r) == ENTRY_MAGIC_V1 && !r.bad;
+    uint32_t magic = get32(&r);
+    return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2) && !r.bad;
 }
 
 int meta_apply(struct meta_state *m, uint64_t index, uint64_t term, const void *data, size_t len, int *res,
@@ -2133,6 +2289,15 @@ static void put_volume(struct wr *w, const struct meta_volume *v)
     }
     put32(w, v->grant_target);
     put64(w, v->grant_min_end);
+    put8(w, v->redundancy);
+    put8(w, v->ec_k);
+    put8(w, v->ec_m);
+    put32(w, v->nstripe);
+    for (uint32_t j = 0; j < v->nstripe; j++)
+        put32(w, v->stripe[j]);
+    put64(w, v->stripe_version);
+    put8(w, v->gc_suspended);
+    put64(w, v->gc_gen);
 }
 
 static void encode_body(struct wr *w, const struct meta_state *m)
@@ -2280,6 +2445,17 @@ static int get_volume(struct rd *r, struct meta_volume *v)
     }
     v->grant_target = get32(r);
     v->grant_min_end = get64(r);
+    v->redundancy = get8(r);
+    v->ec_k = get8(r);
+    v->ec_m = get8(r);
+    v->nstripe = get32(r);
+    if (v->nstripe > META_STRIPE_MAX || v->redundancy > META_RED_EC)
+        return -1;
+    for (uint32_t j = 0; j < v->nstripe; j++)
+        v->stripe[j] = get32(r);
+    v->stripe_version = get64(r);
+    v->gc_suspended = get8(r);
+    v->gc_gen = get64(r);
     return 0;
 }
 
@@ -2546,6 +2722,23 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
     unsigned va = a->number;
     if (a->kind != b->kind)
         FAIL("volume %u: its kind changed", va);
+    if (a->redundancy != b->redundancy || a->ec_k != b->ec_k || a->ec_m != b->ec_m || a->nstripe != b->nstripe)
+        FAIL("volume %u: its redundancy changed", va);
+    if (b->stripe_version < a->stripe_version)
+        FAIL("volume %u: stripe version went back from %llu to %llu", va, (unsigned long long)a->stripe_version,
+             (unsigned long long)b->stripe_version);
+    uint32_t sdiff = 0;
+    for (uint32_t j = 0; j < a->nstripe && j < META_STRIPE_MAX; j++)
+        sdiff += a->stripe[j] != b->stripe[j];
+    if (b->stripe_version == a->stripe_version && sdiff)
+        FAIL("volume %u: a stripe position changed without a version bump", va);
+    if (b->stripe_version > a->stripe_version && (b->stripe_version != a->stripe_version + 1 || sdiff > 1))
+        FAIL("volume %u: stripe version %llu -> %llu with %u positions moved (one STRIPE_SET, one position)", va,
+             (unsigned long long)a->stripe_version, (unsigned long long)b->stripe_version, sdiff);
+    if (b->gc_gen < a->gc_gen)
+        FAIL("volume %u: gc_gen went back", va);
+    if (a->gc_suspended && !b->gc_suspended && b->gc_gen == a->gc_gen)
+        FAIL("volume %u: orphan collection resumed without GC_RESUME", va);
     if (b->epoch < a->epoch)
         FAIL("volume %u: epoch went back from %llu to %llu", va, (unsigned long long)a->epoch,
              (unsigned long long)b->epoch);
@@ -2667,6 +2860,31 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
     }
     for (uint32_t i = 0; i < next->nvolumes; i++) {
         const struct meta_volume *b = &next->volumes[i];
+        if (b->min_isr < 1 || b->min_isr > b->nrep)
+            FAIL("volume %u: min_isr %u with %u replicas", b->number, b->min_isr, b->nrep);
+        if (b->redundancy == META_RED_EC) {
+            if (b->kind != META_VOL_REPLICATED || b->ec_k < 1 || b->ec_k > META_EC_K_MAX || b->ec_m < 1 ||
+                b->ec_m > META_EC_M_MAX || b->nstripe != (uint32_t)b->ec_k + b->ec_m || !b->stripe_version)
+                FAIL("volume %u: an EC volume of k %u, m %u with %u positions", b->number, b->ec_k, b->ec_m,
+                     b->nstripe);
+            for (uint32_t j = 0; j < b->nstripe; j++) {
+                if (!meta_member(next, b->stripe[j]))
+                    FAIL("volume %u: stripe position %u names node %u, which is not a member", b->number, j,
+                         b->stripe[j]);
+                for (uint32_t k = 0; k < j; k++)
+                    if (b->stripe[k] == b->stripe[j])
+                        FAIL("volume %u: node %u holds stripe positions %u and %u", b->number, b->stripe[j], k, j);
+            }
+            const struct meta_volume *a = meta_volume(prev, b->number);
+            if (!a && (b->stripe_version != 1 || b->gc_gen || b->min_isr < (b->ec_m < b->nrep ? b->ec_m : b->nrep)))
+                FAIL("volume %u: a new EC volume with stripe version %llu, gc_gen %llu, min_isr %u (m %u)", b->number,
+                     (unsigned long long)b->stripe_version, (unsigned long long)b->gc_gen, b->min_isr, b->ec_m);
+            if (a && next->restore_gen > prev->restore_gen && !b->gc_suspended && b->gc_gen == a->gc_gen)
+                FAIL("volume %u: a restore left orphan collection on", b->number);
+        } else if (b->redundancy != META_RED_REPLICAS || b->nstripe || b->stripe_version || b->gc_suspended ||
+                   b->gc_gen) {
+            FAIL("volume %u: a replicas volume with EC fields", b->number);
+        }
         if (!meta_volume_in_isr(b, b->leader))
             FAIL("volume %u: leader %u is not in its ISR", b->number, b->leader);
         for (uint32_t j = 0; j < b->nisr; j++)

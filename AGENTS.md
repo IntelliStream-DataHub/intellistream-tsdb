@@ -241,8 +241,13 @@ cgroup, so `nice` does not keep your work out of its way.
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`; R4's replica set: `set_version`, raised by exactly REPLICA_ADD, REPLICA_REMOVE and
   REPLICA_RESET, one move per volume (an ADD with `replaces`; the REMOVE of the replaced member puts the learner into
-  its slot, so rep[0] stays the preferred leader's), a planned grant's `target` and `min_end`; snapshot version 5 and
-  entry magic "TME2": a state directory or log of another version is refused naming both, never upgraded).
+  its slot, so rep[0] stays the preferred leader's), a planned grant's `target` and `min_end`;
+  R8: a volume's redundancy, an EC volume's stripe group (picked by the proposer), `stripe_version`, `gc_suspended`,
+  ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
+  refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
+  heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
+  copynofloor` in `make copy-mutants`); snapshot version 6 and
+  entry magic "TME3": a state directory or log of another version is refused naming both, never upgraded).
   `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
   add|status`; users: USER_PUT/DEL answered after commit with the members still behind, the uid assigned at apply,

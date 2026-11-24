@@ -38,7 +38,15 @@
  *     grant above E (§5.4);
  *   - a name slot changes home only through a committed freeze of its old home (SLOT_FREEZE under the epoch the old
  *     home had then): SLOT_MOVE_PENDING, SLOT_FREEZE, SLOT_MOVE (or SLOT_MOVE_CANCEL);
- *   - member ids, volume numbers and volume names are never reused.
+ *   - member ids, volume numbers and volume names are never reused;
+ *   - an erasure-coded volume (redundancy EC, k + m; design-cluster-data.md E1, E3, E9) has a stripe group of exactly
+ *     k + m distinct nodes that the proposer picked (never apply: heartbeats are not replicated state) and VOLUME_ADD
+ *     carries; a position changes only by STRIPE_SET, conditional on the group's `stripe_version`, which it raises by
+ *     one (positions are never renumbered, E9); `gc_suspended` (orphan collection off, E14 and §5.7) is set by
+ *     GC_SUSPEND, which force-leader proposes before its ISR_CHANGE, and by RESTORE on every EC volume, and cleared
+ *     only by GC_RESUME (`tsdb cluster volume gc resume`), which raises `gc_gen`; an EC volume's min_isr is at least
+ *     min(m, replicas) (E24, E35) and every volume's at most its replicas. The chunk epoch of an EC volume is its
+ *     epoch (R8 D9): chunk stores fence puts and deletes by it, and there is no other counter.
  * Positions an entry carries (grants, reservations) are reports: they are copied, never compared with anything, and
  * have no "never down" rule (a lower one after a pool rollback is exactly the signal for DIVERGED).
  *
@@ -72,6 +80,9 @@
 #define META_GROUP_MAX 64 /* a server group (the takeover cap) */
 #define META_DOMAIN_MAX 64
 #define META_REPLICAS_MAX 7 /* replication 4 plus learners during a move */
+#define META_EC_K_MAX 16    /* an erasure-coded volume's data positions (E1) */
+#define META_EC_M_MAX 4     /* and its parity positions */
+#define META_STRIPE_MAX (META_EC_K_MAX + META_EC_M_MAX) /* positions of a stripe group */
 /* lower bounds of settings the replication driver acts on (r3d-isr review M5): below 500 ms a live member of an idle
  * volume, heard every 100 ms (repld's idle heartbeat), would leave its ISR between two heartbeats and grow back, an
  * endless churn through the metadata group; an idle seal below 100 ms flushes after nearly every write batch */
@@ -200,6 +211,10 @@ struct meta_storage { /* a shared volume's storage */
     char group[META_GROUP_MAX];   /* the server group (the takeover cap) */
 };
 
+/* A volume's redundancy (E1): copies on its replicas, or settled parts erasure coded k + m across its stripe group
+ * while its young data stays on its replicas, the log group (E3). */
+enum meta_redundancy { META_RED_REPLICAS = 0, META_RED_EC = 1 };
+
 struct meta_volume {
     uint32_t number;
     char name[META_NAME_MAX];
@@ -227,6 +242,14 @@ struct meta_volume {
     struct meta_epoch *hist;
     uint32_t grant_target;  /* replicated: the target of the grant that made `epoch` (a planned transfer's; 0: none) */
     uint64_t grant_min_end; /* and the end the target had to hold (the old leader's READY end) */
+    /* erasure coding (R8; snapshot version 6). Replicas: redundancy META_RED_REPLICAS and the rest 0. */
+    uint8_t redundancy;               /* enum meta_redundancy */
+    uint8_t ec_k, ec_m;               /* EC: 1 <= k <= META_EC_K_MAX, 1 <= m <= META_EC_M_MAX */
+    uint32_t nstripe;                 /* EC: k + m */
+    uint32_t stripe[META_STRIPE_MAX]; /* EC: position -> node, distinct; never renumbered (E9) */
+    uint64_t stripe_version;          /* EC: 1 at VOLUME_ADD, + 1 by every applied STRIPE_SET and by nothing else */
+    uint8_t gc_suspended;             /* EC: orphan collection is off until GC_RESUME (E14) */
+    uint64_t gc_gen;                  /* EC: + 1 by every applied GC_RESUME (the checker's witness of a resume) */
 };
 
 struct meta_slot_move {
@@ -348,7 +371,13 @@ enum meta_op_kind {
     META_OP_NAME_GROUP,       /* reserved for S4's prefix groups (design-ha-modes.md M23): refused until built */
     META_OP_REPLICA_RESET,    /* replicated: if epoch == e: member N, neither the leader nor in the ISR, gets a new
                                * instance rid (a learner, open generation 0): its lost directory is made again (D13) */
-    META_OP_LAST = META_OP_REPLICA_RESET,
+    /* R8 (snapshot version 6), erasure-coded volumes only (else META_ERR_INVALID): */
+    META_OP_STRIPE_SET,       /* if stripe_version == v: position p of the stripe group goes to node N (a known member
+                               * that is not out and holds no other position); no live-object check yet (R9) */
+    META_OP_GC_SUSPEND,       /* orphan collection off (force-leader proposes it before its ISR_CHANGE); idempotent,
+                               * and not counted by the one-touch-per-entry rule (it only ever sets a flag) */
+    META_OP_GC_RESUME,        /* orphan collection on again (`tsdb cluster volume gc resume`), gc_gen + 1 */
+    META_OP_LAST = META_OP_GC_RESUME,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -418,7 +447,14 @@ struct meta_volume_add {
     uint32_t n;
     uint32_t nodes[META_REPLICAS_MAX];
     uint64_t rid[META_REPLICAS_MAX];
+    /* EC (redundancy META_RED_EC): k, m and the stripe group the proposer picked (nstripe == k + m) */
+    uint8_t redundancy, ec_k, ec_m;
+    uint32_t nstripe;
+    uint32_t stripe[META_STRIPE_MAX];
 };
+/* The min_isr a new volume gets (E24, E35): m for EC (no more than its n replicas), the cluster's min_isr (no more
+ * than n) for replicas. */
+uint32_t meta_volume_min_isr(uint8_t redundancy, uint8_t ec_m, uint32_t n, uint32_t cluster_min_isr);
 
 struct meta_entry {
     uint8_t *buf;
@@ -489,6 +525,12 @@ void meta_op_replica_open(struct meta_entry *e, uint32_t number, uint32_t node, 
                           uint64_t nonce);
 void meta_op_restore(struct meta_entry *e, uint64_t gen);
 void meta_op_name_group(struct meta_entry *e); /* reserved: an empty body; applies as INVALID */
+void meta_op_stripe_set(struct meta_entry *e, uint32_t number, uint32_t pos, uint32_t node, uint64_t stripe_version);
+void meta_op_gc_suspend(struct meta_entry *e, uint32_t number);
+void meta_op_gc_resume(struct meta_entry *e, uint32_t number);
+/* force-leader's operations for replicated volume v (design-cluster.md 6.2, design-cluster-data.md §5.7): for an EC
+ * volume GC_SUSPEND first, then the ISR_CHANGE of v's basis that adds `node` (with its instance) to the ISR. */
+void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uint32_t node);
 
 /* Apply a committed entry at `index` (`term`). Each operation's result goes to res[i] for i < nres (pass NULL, 0 to
  * ignore them). Returns META_OK, or META_ERR_FORMAT for bytes that do not decode, which leaves the state as it was:
@@ -504,8 +546,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 5
-/* 1 when the entry is one of a build of metadata snapshot version 4 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 6
+/* 1 when the entry is one of a build of metadata snapshot version 5 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,
