@@ -6636,6 +6636,29 @@ static int wal_count(int i, uint32_t num)
     return n;
 }
 
+/* the bytes of the WAL segments in server i's directory of volume num (the transfer's kept-segment preload) */
+static uint64_t wal_bytes(int i, uint32_t num)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120], f[PATH_MAX + 400];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v%" PRIu32, dir, num);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    uint64_t n = 0;
+    errno = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        struct stat st;
+        snprintf(f, sizeof f, "%s/%s", v, e->d_name);
+        if (!strncmp(e->d_name, "wal_", 4) && stat(f, &st) == 0)
+            n += (uint64_t)st.st_size;
+    }
+    if (errno)
+        die("readdir %s: %s", v, strerror(errno));
+    closedir(d);
+    return n;
+}
+
 /* A writer of 1000-row inserts on one connection until `stop` (inboxshared's stalled volume) */
 struct flood {
     int port;
@@ -13072,6 +13095,42 @@ static void scen_transfer(void)
         w[k].server = k % 3;
         w[k].id = rep_series(c, rep_names[k], "tv", 30000);
         w[k].ts = 1000000;
+    }
+    /* TR_PRELOAD_MB: that much WAL written first and kept by the replicas (past their commit floor, under
+     * repl_retain_mb 4096 and repl_retain_s 1800 by default), so the first targets' promotions have it in their kept
+     * segments (r3-scope/PLAN.md:123); measured, not judged. The leader keeps a flushed segment only while a replica
+     * needs it, so its own WAL stays small once both have caught up: the loop counts the replicas' */
+    uint64_t preload = getenv("TR_PRELOAD_MB") ? strtoull(getenv("TR_PRELOAD_MB"), NULL, 10) << 20 : 0;
+    if (preload) {
+        enum { PB = 60000 }; /* below wal_max_batch_rows: through the WAL, not straight to a part */
+        int64_t *pts = malloc(PB * sizeof *pts);
+        float *pv = malloc(PB * sizeof *pv);
+        if (!pts || !pv)
+            die("out of memory");
+        tsdb_sid pid = rep_series(c, "preload", "tv", 30000);
+        int64_t t = 1;
+        size_t rows = 0;
+        uint64_t p0 = now_ms(), until = p0 + 600000;
+        for (;;) {
+            int short_ = 0;
+            for (int i = 0; i < 3; i++)
+                if (i != L && wal_bytes(i, num) < preload)
+                    short_ = 1;
+            if (!short_)
+                break;
+            if (now_ms() > until)
+                die("the replicas keep %" PRIu64 " / %" PRIu64 " / %" PRIu64 " MB of WAL of tv after %zu rows of preload",
+                    wal_bytes(0, num) >> 20, wal_bytes(1, num) >> 20, wal_bytes(2, num) >> 20, rows);
+            for (int j = 0; j < PB; j++, t++)
+                pts[j] = t, pv[j] = (float)(t * 7919 % 100003) / 7.0f;
+            if ((rc = tsdbc_insert_series(c, pid, pts, pv, PB)) != 0)
+                die("preload insert: %s", tsdbc_strerror(rc));
+            rows += PB;
+        }
+        free(pts);
+        free(pv);
+        printf("  preload: %zu rows in %" PRIu64 " ms; WAL of tv kept: %" PRIu64 " / %" PRIu64 " / %" PRIu64 " MB\n",
+               rows, now_ms() - p0, wal_bytes(0, num) >> 20, wal_bytes(1, num) >> 20, wal_bytes(2, num) >> 20);
     }
     tsdbc_close(c);
     await_isr(0, "tv", 3, 30000, "every replica in the ISR before the transfers");
