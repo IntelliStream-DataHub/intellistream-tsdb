@@ -35,7 +35,8 @@ static const char cl_help[] =
     "usage: tsdb cluster secret FILE\n"
     "       tsdb cluster init PEER --secret-file F [options]\n"
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
-    "       tsdb cluster volume add PEER NAME [--replicas N] --secret-file F\n"
+    "       tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M|replicas=N] --secret-file F\n"
+    "       tsdb cluster volume gc resume PEER VOLUME --secret-file F\n"
     "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster volume transfer PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster volume move PEER VOLUME --log --from NODE --to NODE [--cancel] --secret-file F\n"
@@ -61,6 +62,12 @@ static const char cl_help[] =
     "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
     "                      series inside the volume they name (in this preview only its first server takes writes,\n"
     "                      and only with TSDB_CLUSTER_WRITES=1: replication is not built yet).\n"
+    "                      --redundancy ec=K+M (K 1 to 16, M 1 to 4): settled parts are erasure coded across a\n"
+    "                      stripe group of K+M members with a chunk store up (picked once, never renumbered); its\n"
+    "                      log is kept on M+1 servers and min_isr is M. replicas=N is --replicas N.\n"
+    "  volume gc resume PEER VOLUME  turns the orphan collection of an erasure-coded volume (a number or a name)\n"
+    "                      back on. It stops after a force-leader or a restore (status: gc_suspended 1) until an\n"
+    "                      operator has checked that no chunk the volume still needs would be taken for an orphan.\n"
     "  volume force-leader PEER VOLUME NODE  when no ISR member of volume number VOLUME is up (clients get\n"
     "                      UNAVAILABLE NO_OWNER), makes the replica on node NODE its leader. Unclean: writes\n"
     "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
@@ -123,6 +130,43 @@ static int num(const char *flag, const char *s, uint32_t *out)
     }
     *out = (uint32_t)v;
     return 0;
+}
+
+/* `volume gc resume`'s VOLUME: a number, or a name looked up in the status of PEER (any member answers it) */
+static int gc_volume(const char *s, const char *addr, const uint8_t *secret, size_t slen, uint32_t *out)
+{
+    char *end;
+    unsigned long v = strtoul(s, &end, 10);
+    if (*s && !*end && v > 0 && v <= UINT32_MAX) {
+        *out = (uint32_t)v;
+        return 0;
+    }
+    char err[1024];
+    int rc;
+    uint8_t *reply = NULL;
+    size_t len = 0;
+    if (cluster_admin(addr, secret, slen, CLUSTER_OP_STATUS, NULL, 0, 30000, &rc, &reply, &len, err, sizeof err) != 0) {
+        fprintf(stderr, "tsdb cluster: %s\n", err);
+        return -1;
+    }
+    struct cluster_status st;
+    struct meta_state m;
+    meta_init(&m);
+    int found = 0;
+    if (rc == 0 && cluster_status_parse(reply, len, &st) == 0) {
+        if (st.image_len && meta_snapshot_decode(&m, st.image, st.image_len) == META_OK)
+            for (uint32_t i = 0; i < m.nvolumes; i++)
+                if (!strcmp(m.volumes[i].name, s)) {
+                    *out = m.volumes[i].number;
+                    found = 1;
+                }
+        cluster_status_free(&st);
+    }
+    meta_free(&m);
+    free(reply);
+    if (!found)
+        fprintf(stderr, "tsdb cluster volume gc resume: no volume named %s in the status of %s\n", s, addr);
+    return found ? 0 : -1;
 }
 
 static const char *role_name(int r)
@@ -230,6 +274,14 @@ static void print_status(const struct cluster_status *st)
                v->set_version);
         if (v->nrep) /* leader balance (D15) moves the leadership back to rep[0] */
             printf(" preferred %" PRIu32, v->rep[0].node);
+        if (v->redundancy == META_RED_EC) { /* R8: the stripe group by position (E9) and the orphan collection (E14) */
+            printf(" redundancy ec=%u+%u stripe", v->ec_k, v->ec_m);
+            for (uint32_t k = 0; k < v->nstripe && k < META_STRIPE_MAX; k++)
+                printf("%s%" PRIu32, k ? "," : " ", v->stripe[k]);
+            printf(" stripe_version %" PRIu64 " gc_suspended %u", v->stripe_version, v->gc_suspended);
+        } else {
+            printf(" redundancy replicas=%" PRIu32, v->nrep);
+        }
         printf("\n");
         for (uint32_t k = 0; k < v->nrep; k++) {
             printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
@@ -275,6 +327,7 @@ int cluster_cli(int argc, char **argv)
     const char *superuser = NULL, *pwfile = NULL;
     uint32_t force_vol = 0, force_node = 0; /* volume force-leader */
     int r4op = 0;                                         /* volume transfer, volume move, replica reset */
+    const char *gc_vol = NULL;                            /* volume gc resume: a number or a name */
     uint32_t r4_vol = 0, r4_node = 0, mv_from = 0, mv_to = 0, mv_flags = 0;
     int i = 2;
     if (!strcmp(verb, "user"))
@@ -298,6 +351,12 @@ int cluster_cli(int argc, char **argv)
             return 2;
         r4op = CLUSTER_OP_VOLUME_MOVE;
         i = 5;
+    } else if (!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "gc")) {
+        if (strcmp(argv[3], "resume") != 0)
+            return cl_usage();
+        addr = argv[4];
+        gc_vol = argv[5];
+        i = 6;
     } else if (!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "force-leader")) {
         addr = argv[3];
         char *end1, *end2;
@@ -322,7 +381,8 @@ int cluster_cli(int argc, char **argv)
     struct meta_settings s;
     meta_settings_default(&s);
     int mode = META_MODE_REPLICATED;
-    uint32_t replicas = 0; /* volume add: 0 takes the cluster's replication */
+    uint32_t replicas = 0; /* volume add: 0 takes the cluster's replication (an ec volume's m + 1) */
+    uint32_t ec_k = 0, ec_m = 0; /* volume add --redundancy ec=K+M */
     struct {
         const char *flag;
         uint32_t *v;
@@ -394,6 +454,35 @@ int cluster_cli(int argc, char **argv)
                 return 2;
             }
             s.leader_balance_s = (uint32_t)v;
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "volume") && newpeer && i + 1 < argc && !strcmp(argv[i], "--redundancy")) {
+            const char *rv = argv[i + 1];
+            char *end;
+            if (!strncmp(rv, "replicas=", 9)) {
+                if (num("--redundancy replicas=", rv + 9, &replicas) != 0)
+                    return 2;
+                ec_k = ec_m = 0;
+            } else if (!strncmp(rv, "ec=", 3)) {
+                unsigned long k = strtoul(rv + 3, &end, 10), m = 0;
+                int ok = end != rv + 3 && *end == '+';
+                if (ok) {
+                    const char *ms = end + 1;
+                    m = strtoul(ms, &end, 10);
+                    ok = end != ms && !*end;
+                }
+                if (!ok || k < 1 || k > META_EC_K_MAX || m < 1 || m > META_EC_M_MAX) {
+                    fprintf(stderr, "tsdb cluster: --redundancy %s: expected ec=K+M with K 1 to %d and M 1 to %d\n", rv,
+                            META_EC_K_MAX, META_EC_M_MAX);
+                    return 2;
+                }
+                ec_k = (uint32_t)k;
+                ec_m = (uint32_t)m;
+            } else {
+                fprintf(stderr, "tsdb cluster: --redundancy %s: expected ec=K+M or replicas=N\n", rv);
+                return 2;
+            }
             i++;
             continue;
         }
@@ -470,6 +559,14 @@ int cluster_cli(int argc, char **argv)
         op = r4op;
         rl = op == CLUSTER_OP_VOLUME_MOVE ? cluster_volume_move_encode(r4_vol, mv_from, mv_to, mv_flags, req)
                                           : cluster_volume_force_encode(r4_vol, r4_node, req);
+    } else if (gc_vol) {
+        op = CLUSTER_OP_VOLUME_GC_RESUME;
+        uint32_t gv = 0;
+        if (gc_volume(gc_vol, addr, secret, slen, &gv) != 0)
+            return 1;
+        for (int j = 0; j < 4; j++)
+            req[j] = (uint8_t)(gv >> (8 * j));
+        rl = 4;
     } else if (force_vol) {
         op = CLUSTER_OP_VOLUME_FORCE;
         rl = cluster_volume_force_encode(force_vol, force_node, req);
@@ -480,7 +577,8 @@ int cluster_cli(int argc, char **argv)
             fprintf(stderr, "tsdb cluster: %s: a volume name is 1 to %d bytes\n", newpeer, META_NAME_MAX - 1);
             return 2;
         }
-        rl = cluster_volume_add_encode(newpeer, replicas, req);
+        rl = ec_k ? cluster_volume_add_ec_encode(newpeer, replicas, (uint8_t)ec_k, (uint8_t)ec_m, req)
+                  : cluster_volume_add_encode(newpeer, replicas, req);
     } else {
         op = CLUSTER_OP_STATUS;
     }
@@ -504,7 +602,8 @@ int cluster_cli(int argc, char **argv)
             continue;
         }
         if (rc != 0) {
-            if ((op == CLUSTER_OP_VOLUME_FORCE || r4op) && len)
+            if ((op == CLUSTER_OP_VOLUME_FORCE || op == CLUSTER_OP_VOLUME_ADD || op == CLUSTER_OP_VOLUME_GC_RESUME ||
+                 r4op) && len) /* the leader's reason, e.g. how many members qualify for a stripe group */
                 fprintf(stderr, "tsdb cluster %s %s: %.*s\n", verb, argv[2], (int)len, (const char *)reply);
             fprintf(stderr, "tsdb cluster %s: %s\n", verb, cluster_strerror(rc));
             free(reply);
@@ -526,6 +625,8 @@ int cluster_cli(int argc, char **argv)
             printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
         } else if (op == CLUSTER_OP_VOLUME_FORCE || r4op) {
             printf("%.*s\n", (int)len, (const char *)reply);
+        } else if (op == CLUSTER_OP_VOLUME_GC_RESUME) {
+            printf("volume %s: orphan collection resumed\n", gc_vol);
         } else if (op == CLUSTER_OP_INIT) {
             printf("initialised: node 1 at %s\n", target);
             if (superuser) { /* the group's first user entries: the superuser, before anything else is asked */
