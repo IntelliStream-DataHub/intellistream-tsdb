@@ -14487,6 +14487,13 @@ static void scen_transferraftkill(void)
         if (!vol_rec(0, "tv", &v) || (L = server_of(v.leader)) != 1)
             die("tv is not led by server 1 after its transfer there");
     }
+    /* T is stopped only once L leads with every member in the ISR: stopped while L was still being promoted (a slow
+     * machine, ASan), T fell out of the ISR, the drain asked the stopped Raft leader to take it back in, and the next
+     * Raft leader's CANCEL came before any READY (the scenario's premise lost, not a fault of the transfer) */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(L, lead, 1, 30000);
+    await_isr(L, "tv", 3, 30000, "every member in the ISR before the target is stopped");
     int T = tr_other(L, 0);
     pause_server(T, 1);
     struct tr_async ta = {x.num, ids[T], 0, ""};
