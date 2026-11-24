@@ -612,6 +612,8 @@ static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 
+static uint32_t init_transfer_wait_ms, init_leader_balance_s; /* r4-transfer's scenarios (0: the default) */
+
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
 {
@@ -626,6 +628,10 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
+    if (init_transfer_wait_ms)
+        s.transfer_wait_ms = init_transfer_wait_ms;
+    if (init_leader_balance_s)
+        s.leader_balance_s = init_leader_balance_s;
     if (init_r4_set) {
         s.rebuild_mb_s = 300;
         s.rebuild_max = 3;
@@ -12156,6 +12162,412 @@ static uint64_t tr_count(int i, int which)
     return c;
 }
 
+/* After stop_all: on every member each acknowledged row of the writers is there and each refused one (UNAVAILABLE or
+ * MOVED after the client's retries: never admitted, D14) is not, and the members hold the same rows. A write with an
+ * unknown outcome (a killed server's connection) may be either. */
+struct tr_chk {
+    struct tr_writer *w;
+    int server;
+    const char *what;
+    int bad;
+};
+static int tr_chk_fn(void *ctx, const char *name, const int64_t *ts, const float *v, size_t n)
+{
+    struct tr_chk *k = ctx;
+    (void)v;
+    for (int i = 0; i < REP_NAMES; i++) {
+        if (strcmp(name, rep_names[i]) != 0)
+            continue;
+        const struct tr_writer *w = &k->w[i];
+        size_t at = 0;
+        for (size_t j = 0; j < w->n; j++) {
+            int64_t t = 1000000 + 1000 * (int64_t)j;
+            while (at < n && ts[at] < t)
+                at++;
+            int has = at < n && ts[at] == t;
+            if (w->w[j].rc == 0 && !has && k->bad++ < 3)
+                fprintf(stderr, "%s: server %d lost the acknowledged row %" PRId64 " of %s (write %zu, %" PRIu64
+                        " ms, via server %d)\n", k->what, k->server, t, name, j, w->w[j].t1 - w->w[j].t0, w->server);
+            if ((w->w[j].rc == TSDB_ERR_UNAVAILABLE || w->w[j].rc == TSDB_ERR_MOVED) && has && k->bad++ < 3)
+                fprintf(stderr, "%s: server %d holds the row %" PRId64 " of %s, refused with %s (a definite refusal "
+                        "applied)\n", k->what, k->server, t, name, ers(w->w[j].rc));
+        }
+    }
+    return 0;
+}
+static void tr_check(struct tr_writer *w, const char *what)
+{
+    uint64_t rows[3][REP_NAMES], h[3][REP_NAMES];
+    int bad = 0;
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+        server_dir(i, dir, sizeof dir);
+        snprintf(v, sizeof v, "%s/v1", dir);
+        struct tr_chk k = {w, i, what, 0};
+        int rc = cvol_rows(v, tr_chk_fn, &k);
+        bad += k.bad;
+        if (rc == 0)
+            rc = cvol_digest(v, rep_names, REP_NAMES, rows[i], h[i]);
+        if (rc != 0)
+            die("%s: open %s read-only: %s", what, v, ers(rc));
+        for (int n = 0; i && n < REP_NAMES; n++)
+            if (rows[i][n] != rows[0][n] || h[i][n] != h[0][n])
+                die("%s: server %d holds %" PRIu64 " rows of %s, server 0 %" PRIu64 "%s", what, i, rows[i][n],
+                    rep_names[n], rows[0][n], rows[i][n] == rows[0][n] ? ", other ones" : "");
+    }
+    if (bad)
+        die("%s: %d rows lost or applied after a refusal (above)", what, bad);
+}
+
+/* r4-transfer's other scenarios: 3 servers, volume tv (number 1) on all three, REP_NAMES writers through every
+ * member (forwarded where not led) */
+struct tr_run {
+    struct tr_writer w[REP_NAMES];
+    pthread_t th[REP_NAMES];
+    uint32_t num;
+};
+static void tr_setup(struct tr_run *x)
+{
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int rc;
+    if ((rc = vol_add(0, "tv", 3, &x->num)) != 0 || x->num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), x->num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    tsdbc *c = client(server_of(v.leader));
+    memset(x->w, 0, sizeof x->w);
+    for (int k = 0; k < REP_NAMES; k++) {
+        x->w[k].server = k % 3;
+        x->w[k].id = rep_series(c, rep_names[k], "tv", 30000);
+        x->w[k].ts = 1000000;
+    }
+    tsdbc_close(c);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the writers");
+    for (int k = 0; k < REP_NAMES; k++)
+        if (pthread_create(&x->th[k], NULL, tr_write_thread, &x->w[k]) != 0)
+            die("pthread_create");
+    usleep(300000);
+}
+/* the writers stopped, every server stopped cleanly, the rows checked; the writers' records freed */
+static void tr_finish(struct tr_run *x, const char *what, int indet_ok)
+{
+    for (int k = 0; k < REP_NAMES; k++)
+        __atomic_store_n(&x->w[k].stop, 1, __ATOMIC_RELEASE);
+    int indet = 0;
+    for (int k = 0; k < REP_NAMES; k++) {
+        pthread_join(x->th[k], NULL);
+        indet += x->w[k].indet;
+    }
+    if (indet && !indet_ok)
+        die("%s: %d writes had an unknown outcome (D14 promises definite answers)", what, indet);
+    /* a commit needs min_isr members, not all: every member holds the leader's rows before the stop */
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("%s: no record of tv", what);
+    tsdbc *c = client(server_of(v.leader));
+    tsdbc_set_retry(c, 30000); /* a MOVED of a record not yet in this copy is followed */
+    for (int k = 0; k < REP_NAMES; k++) {
+        int want = rows_of(c, x->w[k].id);
+        for (int i = 0; i < 3; i++) {
+            tsdbc *r = client(i);
+            tsdbc_set_retry(r, 30000);
+            uint64_t t0 = now_ms();
+            int got;
+            while ((got = rows_of(r, x->w[k].id)) != want)
+                if (now_ms() - t0 > 30000)
+                    die("%s: server %d reads %d rows of %s 30 s after the writers stopped, the leader %d", what, i,
+                        got, rep_names[k], want);
+                else
+                    usleep(20000);
+            tsdbc_close(r);
+        }
+    }
+    tsdbc_close(c);
+    stop_all();
+    tr_check(x->w, what);
+    for (int k = 0; k < REP_NAMES; k++)
+        free(x->w[k].w);
+}
+/* every writer acknowledged a write that began after t (bounded: 30 s) */
+static void tr_await_acks(struct tr_run *x, uint64_t t, const char *what)
+{
+    for (int k = 0; k < REP_NAMES; k++) {
+        uint64_t until = now_ms() + 30000;
+        while (__atomic_load_n(&x->w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= t)
+            if (now_ms() > until)
+                die("writer %d (through server %d) acknowledged nothing in 30 s %s", k, x->w[k].server, what);
+            else
+                usleep(5000);
+    }
+}
+/* the member of tv that is neither its leader (server L) nor the server `not` */
+static int tr_other(int L, int not)
+{
+    for (int i = 0; i < 3; i++)
+        if (i != L && i != not)
+            return i;
+    return -1;
+}
+struct tr_async {
+    uint32_t num, to;
+    int rc;
+    char why[256];
+};
+/* a transfer through server 0 that may be killed under it (no follow): a lost connection is rc 1 and its error */
+static void *tr_transfer_thread(void *a)
+{
+    struct tr_async *t = a;
+    char target[META_ADDR_MAX + 1];
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(t->num, t->to, body);
+    peer_of(0, target, sizeof target);
+    if (cluster_admin(target, secret, secret_len, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 30000, &t->rc, &reply, &rl,
+                      t->why, sizeof t->why) != 0) {
+        t->rc = 1;
+        return NULL;
+    }
+    snprintf(t->why, sizeof t->why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    return NULL;
+}
+static void state_flag(int i, const char *name, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(i, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/state/%s", name);
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s: %s", f, strerror(errno));
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT)
+        die("unlink %s: %s", f, strerror(errno));
+}
+
+/* transferslow: the target stopped (SIGSTOP) for 3 s across a transfer: the drain times out (transfer_wait_ms 1000),
+ * the leader admits again, the transfer is refused, the leader and epoch are unchanged, writes go on */
+static void scen_transferslow(void)
+{
+    scenario("transferslow");
+    init_transfer_wait_ms = 1000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, 0);
+    pause_server(T, 1);
+    uint64_t t0 = now_ms();
+    char why[256];
+    int rc = tr_transfer(x.num, ids[T], why, sizeof why);
+    uint64_t took = now_ms() - t0;
+    if (rc == 0)
+        die("a transfer to stopped server %d answered OK", T);
+    if (!vol_rec(0, "tv", &a) || a.leader != v.leader || a.epoch != v.epoch)
+        die("the transfer to stopped server %d moved tv: node %u at epoch %" PRIu64 " (was node %u at %" PRIu64 ")", T,
+            a.leader, a.epoch, v.leader, v.epoch);
+    uint64_t td = now_ms();
+    if (L != T) /* writes through the leader and server 0 go on while the target is still stopped */
+        for (int k = 0; k < REP_NAMES; k++)
+            if (x.w[k].server != T) {
+                uint64_t until = now_ms() + 30000;
+                while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= td)
+                    if (now_ms() > until)
+                        die("writer %d acknowledged nothing after the drain timed out", k);
+                    else
+                        usleep(5000);
+            }
+    uint64_t resumed = now_ms() - td;
+    while (now_ms() - t0 < 3000)
+        usleep(10000);
+    pause_server(T, 0);
+    if (tr_count(L, CL_TR_DRAIN_TIMEDOUT) != 1)
+        die("server %d counts %" PRIu64 " drains timed out, not 1", L, tr_count(L, CL_TR_DRAIN_TIMEDOUT));
+    await_isr(0, "tv", 3, 60000, "the stopped target back in the ISR");
+    tr_await_acks(&x, now_ms(), "after the target resumed");
+    printf("  the transfer to a stopped target: %s after %" PRIu64 " ms (%s), writes resumed %" PRIu64
+           " ms after it, leader unchanged\n", cluster_strerror(rc), took, why, resumed);
+    tr_finish(&x, "transferslow", 0);
+}
+
+/* transferkill: the old leader killed (SIGKILL) during the drain (the target stopped, so the drain waits), and, on a
+ * cluster of its own, at the crash point transfer-ready (READY sent, the fence under way): a normal failover each time,
+ * no acknowledged row lost, no refused row applied, the killed server back in the ISR */
+static void tr_kill(int ready)
+{
+    scenario(ready ? "transferkill-ready" : "transferkill");
+    if (ready)
+        for (int i = 0; i < 3; i++)
+            penv[i] = "TSDB_CRASH_AT=transfer-ready";
+    init_transfer_wait_ms = ready ? 0 : 5000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, L == 0 ? 2 : 0), via = tr_other(L, T);
+    if (!ready)
+        pause_server(T, 1);
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    if (ready) {
+        if (await_exit(L, 30000) < 0)
+            die("server %d did not stop at transfer-ready", L);
+    } else {
+        await_log_count(L, ": drains (written", 1, 30000);
+        signal_child(pids[L], SIGKILL);
+        if (await_exit(L, 5000) < 0)
+            die("server %d did not die of SIGKILL", L);
+        pause_server(T, 0);
+    }
+    uint64_t tk = now_ms();
+    while (!(vol_rec(via, "tv", &a) && a.epoch > v.epoch && a.leader != v.leader))
+        if (now_ms() - tk > 30000)
+            die("no new leader of tv 30 s after its leader was killed %s", ready ? "after READY" : "in the drain");
+        else
+            usleep(20000);
+    pthread_join(th, NULL);
+    penv[L] = NULL;
+    start(L);
+    await_isr(via, "tv", 3, 60000, "the killed leader back in the ISR");
+    tr_await_acks(&x, now_ms(), "after the killed leader came back");
+    printf("  old leader killed %s: node %u leads at epoch %" PRIu64 " %" PRIu64 " ms later; the transfer: %s%s%s\n",
+           ready ? "after READY" : "in the drain", a.leader, a.epoch, now_ms() - tk, ta.rc == 1 ? "lost" : ta.rc ? cluster_strerror(ta.rc) : "OK",
+           ta.why[0] ? ", " : "", ta.why);
+    tr_finish(&x, ready ? "transferkill-ready" : "transferkill", 1);
+}
+static void scen_transferkill(void)
+{
+    tr_kill(0);
+    tr_kill(1);
+}
+
+/* transferraftkill: READY went to a Raft leader (server 0) that was stopped (SIGSTOP) during the drain (the target
+ * stopped too, so the drain waits) and is then killed: nothing promotes. The next Raft leader's CANCEL (its first duty
+ * round) lets the old leader admit again within an election and a round, long before READY's hard cap (10 x 5000 ms).
+ * Mutant nocancel (TSDB_CLUSTER_MUTANT) waits for the cap and fails it. */
+static void scen_transferraftkill(void)
+{
+    scenario("transferraftkill");
+    init_transfer_wait_ms = 5000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader);
+    char why[256];
+    if (L == 0) { /* the volume's leader must outlive the Raft leader's kill */
+        int rc = tr_transfer(x.num, ids[1], why, sizeof why);
+        if (rc != 0)
+            die("the transfer of tv to server 1: %s (%s)", cluster_strerror(rc), why);
+        if (!vol_rec(0, "tv", &v) || (L = server_of(v.leader)) != 1)
+            die("tv is not led by server 1 after its transfer there");
+    }
+    int T = tr_other(L, 0);
+    pause_server(T, 1);
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": drains (written", 1, 30000);
+    pause_server(0, 1);
+    pause_server(T, 0);
+    await_log_count(L, ": READY at", 1, 30000);
+    signal_child(pids[0], SIGKILL);
+    uint64_t tk = now_ms();
+    if (await_exit(0, 5000) < 0)
+        die("server 0 did not die of SIGKILL");
+    stopped[0] = 0;
+    pthread_join(th, NULL);
+    await_log_count(L, "cancelled by the Raft leader", 1, 15000);
+    uint64_t cancelled = now_ms() - tk;
+    for (int k = 0; k < REP_NAMES; k++) /* the writers through L and T write again */
+        if (x.w[k].server != 0)
+            while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= tk)
+                if (now_ms() - tk > 15000)
+                    die("writer %d (through server %d) acknowledged nothing in 15 s after the Raft leader was killed",
+                        k, x.w[k].server);
+                else
+                    usleep(5000);
+    uint64_t resumed = now_ms() - tk;
+    if (tr_count(L, CL_TR_BLIND))
+        die("server %d admitted %" PRIu64 " records blind", L, tr_count(L, CL_TR_BLIND));
+    start(0);
+    await_isr(L, "tv", 3, 60000, "every member in the ISR after the Raft leader's restart");
+    printf("  the Raft leader killed after READY: CANCEL on node %u %" PRIu64 " ms later, writes again after %" PRIu64
+           " ms, no record admitted blind\n",
+           v.leader, cancelled, resumed);
+    tr_finish(&x, "transferraftkill", 1);
+}
+
+/* balance: leader_balance_s 5. tv's preferred leader (rep[0]) killed, the failover, then restarted: it leads tv again
+ * within leader_balance_s + 5 s of its return to the ISR; with leader_balance_s 0 it does not (10 s). */
+static void tr_balance(int on)
+{
+    scenario(on ? "balance" : "balance-off");
+    init_leader_balance_s = on ? 5 : 0;
+    struct tr_run x;
+    tr_setup(&x);
+    init_leader_balance_s = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int P = server_of(v.rep[0].node), via = P == 0 ? 1 : 0;
+    if (v.leader != v.rep[0].node)
+        die("tv is led by node %u, not by its preferred leader node %u", v.leader, v.rep[0].node);
+    signal_child(pids[P], SIGKILL);
+    if (await_exit(P, 5000) < 0)
+        die("server %d did not die of SIGKILL", P);
+    uint64_t tk = now_ms();
+    while (!(vol_rec(via, "tv", &a) && a.epoch > v.epoch && a.leader != v.leader))
+        if (now_ms() - tk > 30000)
+            die("no failover of tv 30 s after its leader was killed");
+        else
+            usleep(20000);
+    start(P);
+    await_isr(via, "tv", 3, 60000, "the preferred leader back in the ISR");
+    uint64_t tj = now_ms();
+    int back = 0;
+    while (now_ms() - tj < (on ? 10000u : 10000u)) {
+        if (vol_rec(via, "tv", &a) && a.leader == v.rep[0].node) {
+            back = 1;
+            break;
+        }
+        usleep(20000);
+    }
+    if (on && !back)
+        die("leader_balance_s 5: node %u does not lead tv 10 s after its return to the ISR (node %u does)",
+            v.rep[0].node, a.leader);
+    if (!on && back)
+        die("leader_balance_s 0: node %u leads tv again after its return", v.rep[0].node);
+    if (on)
+        printf("  the preferred leader leads tv again %" PRIu64 " ms after its return to the ISR\n", now_ms() - tj);
+    else
+        printf("  leader_balance_s 0: tv stays on node %u for 10 s after node %u's return\n", a.leader,
+               v.rep[0].node);
+    tr_finish(&x, on ? "balance" : "balance-off", 1);
+}
+static void scen_balance(void)
+{
+    tr_balance(1);
+    tr_balance(0);
+}
+
 /* transfer: TRANSFERS transfers of one volume round its three members under 4 writers (each through another
  * member, forwarded). D14: every transfer answers once its target leads, the ISR stays whole (the old leader is never
  * dropped as unanswered), no write's outcome is unknown, every acknowledged row is on every member at the end and no
@@ -12275,10 +12687,7 @@ static void scen_transfer(void)
             done, transfers);
     await_isr(0, "tv", 3, 30000, "every replica in the ISR at the end");
     stop_all();
-    uint64_t rows[REP_NAMES];
-    for (int k = 0; k < REP_NAMES; k++)
-        rows[k] = (uint64_t)w[k].acked;
-    rep_same(rows, "transfer");
+    tr_check(w, "transfer");
     printf("  %d transfers round 3 members under %d writers (mean %.0f ms each): %d writes acknowledged, %d refused "
            "(definite), 0 unknown, %" PRIu64 " cuts; every acknowledged row on every member\n",
            transfers, REP_NAMES, (double)took / transfers, acked, refused, cuts);
@@ -12328,7 +12737,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"balance", scen_balance},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
