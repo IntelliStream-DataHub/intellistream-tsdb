@@ -1093,10 +1093,10 @@ $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal
 $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-# what a stream link costs for peerlink-shaped frames (TCP, or rsocket under librspreload; tools/rdma-bench.sh,
-# docs/design-rdma.md): no engine, no librdmacm
+# what a stream link costs for peerlink-shaped frames (TCP, or rsocket through a dlopen of librdmacm with --rsocket;
+# tools/rdma-bench.sh, docs/design-rdma.md): no engine, and librdmacm is not linked
 $(B)/link-bench: tools/link-bench.c $(B)/tsdb_crypto.o
-	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_crypto.o -ldl
 
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)

@@ -6,22 +6,24 @@
 # arguments, and the script only reaches the servers through ssh.
 #
 #   tools/rdma-bench.sh --srv SSH_TARGET --cli SSH_TARGET --ib-addr ADDR [--tcp-addr ADDR] [--dev mlx4_0]
-#                       [--ib-port 1] [--reps 3] [--secs 3] [--only perftest,rsocket,tcp,ipoib,loop] [--out DIR]
+#                       [--ib-port 1] [--reps 3] [--secs 3] [--only perftest,rsocket,tcp,loop] [--out DIR]
 #                       [--pt-port 18515] [--bw-sizes "..."] [--lat-sizes "..."]
 #
 #   perftest  native verbs through rdma_cm (-R) at ADDR: ib_send_bw, ib_write_bw, ib_read_bw with completion events
 #             (--events: what a poll() loop would see) and ib_send_lat, ib_write_lat, ib_read_lat busy-polling,
 #             plus ib_send_lat with events; CPU per side from bash's `times` (user + system of the child)
-#   rsocket   tools/link-bench under LD_PRELOAD=librspreload.so at the IPoIB address (rdma_cm), default buffers and
-#             --buf 1 MiB; with and without peerlink's HMAC tag per frame
-#   ipoib     link-bench over TCP at --ib-addr (IPoIB), plain sockets
-#   tcp       link-bench over TCP at --tcp-addr (the Ethernet port)
+#   rsocket   tools/link-bench --rsocket (librdmacm's rsocket API, never librspreload, which falls back to a kernel
+#             socket) at --ib-addr through rdma_cm, default buffers and --buf 1 MiB; with and without peerlink's HMAC
+#             tag per frame
+#   tcp       link-bench over TCP at --tcp-addr, which must be an Ethernet address
+# There is no TCP suite at --ib-addr: no TCP is ever sent over IPoIB (the owner's rule for the test servers, 2026-11-24);
+# on InfiniBand the IPoIB address serves only rdma_cm's address resolution.
 #   loop      link-bench over TCP on the server's 127.0.0.1: the CPU of the stack and of the tag without a NIC
 # A TCP run first checks that it can connect (a firewall that lets only ssh in): if not, it says "not measured".
 # link-bench is built on each server from tools/link-bench.c and client/tsdb_crypto.c in /var/tmp/tsdb-link-bench.
 # Output: OUT/raw.txt (one key=value line per run), OUT/summary.txt (mean, sd, lowest-highest per test and size).
 set -u
-srv= cli= ibaddr= tcpaddr= dev=mlx4_0 ibport=1 reps=3 secs=3 only=perftest,rsocket,ipoib,tcp,loop out= ptport=18515
+srv= cli= ibaddr= tcpaddr= dev=mlx4_0 ibport=1 reps=3 secs=3 only=perftest,rsocket,tcp,loop out= ptport=18515
 bw_sizes="64 1024 16384 65536 262144 1048576 4194304"
 lat_sizes="64 1024 16384 65536 262144 1048576"
 while [ $# -gt 0 ]; do
@@ -47,7 +49,7 @@ log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 for h in "$srv" "$cli"; do
     tar -C "$root" -c tools/link-bench.c client/tsdb_crypto.c client/tsdb_crypto.h |
         $SSH "$h" "mkdir -p $W && tar -x -C $W && cd $W && gcc -std=gnu11 -O2 -o link-bench tools/link-bench.c \
-            client/tsdb_crypto.c" || { echo "rdma-bench: cannot build link-bench on $h" >&2; exit 1; }
+            client/tsdb_crypto.c -ldl" || { echo "rdma-bench: cannot build link-bench on $h" >&2; exit 1; }
 done
 $SSH "$srv" "uname -r; lscpu | grep 'Model name'; cat /sys/class/net/*/mode 2>/dev/null | sort | uniq -c" \
     >"$out/machine.txt" 2>&1
@@ -56,9 +58,9 @@ $SSH "$srv" "uname -r; lscpu | grep 'Model name'; cat /sys/class/net/*/mode 2>/d
 lb_pid=
 lb_start() { # $1 bind address, $2 preload (0/1); sets lb_port
     local pre=
-    [ "$2" = 1 ] && pre="env LD_PRELOAD=/usr/lib64/rsocket/librspreload.so"
+    [ "$2" = 1 ] && pre=--rsocket
     local r
-    r=$($SSH "$srv" "cd $W && rm -f pf && ($pre setsid ./link-bench serve --bind $1 --port-file pf \
+    r=$($SSH "$srv" "cd $W && rm -f pf && (setsid ./link-bench serve $pre --bind $1 --port-file pf \
         >serve.log 2>&1 </dev/null &) ; for i in \$(seq 100); do [ -s pf ] && break; sleep 0.1; done; cat pf")
     lb_port=${r%% *} lb_pid=${r##* }
     [ -n "$lb_port" ] && [ "$lb_port" != "$r" ] || { log "link-bench serve did not start on $1"; lb_pid=; return 1; }
@@ -73,9 +75,9 @@ lb_suite() { # $1 label, $2 server bind address, $3 address the client dials, $4
     local label=$1 bind=$2 addr=$3 pre=$4 ch=$5
     shift 5
     local extra="$*" cpre=
-    [ "$pre" = 1 ] && cpre="env LD_PRELOAD=/usr/lib64/rsocket/librspreload.so"
+    [ "$pre" = 1 ] && cpre=--rsocket
     lb_start "$bind" "$pre" || { echo "label=$label not_measured=serve_failed" >>"$raw"; return; }
-    if ! $SSH "$ch" "cd $W && timeout 20 $cpre ./link-bench run --host $addr --port $lb_port --mode lat --size 64 \
+    if ! $SSH "$ch" "cd $W && timeout 20 ./link-bench run $cpre --host $addr --port $lb_port --mode lat --size 64 \
         --secs 0.2 $extra" >/dev/null 2>&1; then
         log "$label: cannot connect to $addr (a firewall?): not measured"
         echo "label=$label not_measured=no_connection addr_kind=$label" >>"$raw"
@@ -88,11 +90,11 @@ lb_suite() { # $1 label, $2 server bind address, $3 address the client dials, $4
             local t=
             [ $tag = 1 ] && t=--tag
             for sz in $bw_sizes; do
-                $SSH "$ch" "cd $W && timeout $((secs + 30)) $cpre ./link-bench run --host $addr --port $lb_port \
+                $SSH "$ch" "cd $W && timeout $((secs + 30)) ./link-bench run $cpre --host $addr --port $lb_port \
                     --mode bw --size $sz --secs $secs $t $extra --label $label" | sed "s/\$/ rep=$rep/" >>"$raw"
             done
             for sz in $lat_sizes; do
-                $SSH "$ch" "cd $W && timeout $((secs + 30)) $cpre ./link-bench run --host $addr --port $lb_port \
+                $SSH "$ch" "cd $W && timeout $((secs + 30)) ./link-bench run $cpre --host $addr --port $lb_port \
                     --mode lat --size $sz --secs $secs $t $extra --label $label" | sed "s/\$/ rep=$rep/" >>"$raw"
             done
         done
@@ -156,7 +158,6 @@ if want perftest; then
 fi
 want rsocket && lb_suite rsocket "$ibaddr" "$ibaddr" 1 "$cli"
 want rsocket && lb_suite rsocket-buf1m "$ibaddr" "$ibaddr" 1 "$cli" --buf 1048576
-want ipoib && lb_suite ipoib-tcp "$ibaddr" "$ibaddr" 0 "$cli"
 [ -n "$tcpaddr" ] && want tcp && lb_suite eth-tcp "$tcpaddr" "$tcpaddr" 0 "$cli"
 want loop && lb_suite loop-tcp 127.0.0.1 127.0.0.1 0 "$srv"
 

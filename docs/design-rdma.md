@@ -70,8 +70,10 @@ changing anything:
 - **IPoIB** is configured on the test servers, in **datagram mode with an MTU of 2044** (connected mode, which allows an
   MTU of 65520 and is what TCP over IPoIB needs to be fast, is not set). In production the owner expects some servers
   without IPoIB at all.
-- **firewalld** lets only ssh in on the IPoIB interfaces, so TCP over IPoIB could not be measured (§3.4). TCP on the
-  40GbE ports is reachable. **RDMA traffic bypasses netfilter**: rdma_cm and RC queue pairs connected through a port
+- **No TCP over IPoIB** (the owner's rule for these servers, 2026-11-24): firewalld admits TCP between the servers only
+  from their Ethernet addresses, and nothing here sends TCP to an IPoIB address. The IPoIB addresses serve rdma_cm's
+  address resolution only (perftest `-R`, rsocket). TCP, and every TCP fallback in this design, runs on Ethernet.
+  **RDMA traffic bypasses netfilter**: rdma_cm and RC queue pairs connected through a port
   firewalld closes for TCP. A design that relies on the firewall to keep strangers off the RDMA path is wrong (§5.5).
 - **`ulimit -l` is 8192 KiB** (8 MB of locked memory per process). Memory registered for RDMA is locked: perftest
   could not register its buffers for 4 MiB messages (`Cannot allocate memory`). io_uring's rings count against the
@@ -82,7 +84,9 @@ changing anything:
 
 Tools: `tools/rdma-bench.sh` (drives a pair of servers over ssh; hosts and addresses are arguments) runs perftest
 through rdma_cm and `tools/link-bench` (new: peerlink's frame shape and HMAC tag over a stream socket, so the same
-binary measures TCP and, under `LD_PRELOAD=librspreload.so`, rsocket). Each number is the mean of 3 runs of 3 s
+binary measures TCP and, with `--rsocket`, rsocket: librdmacm's `rsocket`/`rconnect`/`rread`... called through
+`dlopen`. Not `LD_PRELOAD=librspreload.so`: the preload falls back to a kernel socket when `rconnect` fails, which would
+send TCP to the IPoIB address and report TCP under the rsocket label). Each number is the mean of 3 runs of 3 s
 (perftest: a fixed count of messages, about 3 s at line rate); the spread is the lowest and highest run. CPU is user +
 system time of each side's process (bash `times` for perftest, `getrusage` in link-bench) divided by the payload
 moved. perftest's CPU includes its connection setup and registration (a fixed 0.01-0.2 s), so its small numbers are
@@ -93,7 +97,7 @@ switch.
 
 <!-- results: verbs -->
 
-### 3.2 rsocket (librspreload under link-bench, InfiniBand)
+### 3.2 rsocket (link-bench --rsocket, InfiniBand)
 
 <!-- results: rsocket -->
 
@@ -103,9 +107,9 @@ switch.
 
 ### 3.4 Not measured
 
-- **TCP over IPoIB**: refused by the servers' firewall; the run says "not measured" until the owner opens it. With
-  datagram mode and MTU 2044 it is expected to be well below the 40GbE TCP numbers; either way the MAC limit of §3.3
-  applies to it as to every stream.
+- **TCP over IPoIB**: not measured, and never to be: the owner's rule is that no TCP runs over IPoIB (§2).
+  `tools/rdma-bench.sh` has no such suite. With datagram mode and MTU 2044 it would be below the 40GbE TCP numbers
+  anyway, and the MAC limit of §3.3 applies to every stream.
 - **RoCE and iWARP**: see §3.5.
 
 ### 3.5 RoCE (ConnectX-3 port 2, 40GbE) and iWARP (Chelsio T5, 40GbE)
@@ -171,7 +175,7 @@ transports.
 
 | | what | IPoIB needed | code | for tsdb |
 |---|---|---|---|---|
-| A. IPoIB only | the peer address names the IPoIB interface; nothing changes in tsdb | yes | none | the MAC cap first; then TCP over IPoIB (datagram, MTU 2044) is slower and costlier than TCP on 40GbE; no latency gain; servers without IPoIB cannot take part |
+| A. IPoIB only | the peer address names the IPoIB interface; nothing changes in tsdb | yes | none | **ruled out**: the owner allows no TCP over IPoIB. It would also gain nothing: the MAC cap first, then TCP over IPoIB (datagram, MTU 2044) is slower and costlier than TCP on 40GbE, no latency gain, and servers without IPoIB cannot take part |
 | B. rsocket under plink | `rsocket`/`rpoll` calls instead of the socket calls in peerlink.c (or LD_PRELOAD) | yes (rdma_cm resolves IP addresses) | small | 30 Gbit/s, 6 µs; but rsocket's own threads, buffers and keepalive sit under peerlink's, fork is unsafe, fallback to TCP is silent under preload, and the library sees little upkeep. Hides what §4 needs to control |
 | C. verbs under peerlink, connected by rdma_cm | RC QPs through rdma_cm on the RDMA address | yes on IB (not on RoCE/iWARP: they have Ethernet IPs) | medium | the full gain; the only way for iWARP |
 | D. verbs under peerlink, upgraded from the TCP link | the TCP data link authenticates as today, then both sides exchange QP numbers in MAC'd frames and move the link's frames to the QP | **no** (the TCP link runs on any network; the QP is addressed by LID/GID) | medium (C plus the exchange) | the full gain, on every server with an IB port; the TCP link is the anchor and the fallback; firewall policy keeps working, because no RDMA link exists without its TCP link |
@@ -216,15 +220,19 @@ per link in step 2. New keys (tsdbd_keys.h rows, docs/config.md):
 | `cluster.peer.rdma.pool_mb` | `--peer-rdma-pool-mb` | 64 | registered memory per peerlink |
 | `cluster.peer.rdma.poll_us` | `--peer-rdma-poll-us` | 0 | busy poll before sleeping on completion events |
 | `cluster.peer.rdma.cm` | `--peer-rdma-cm` | (unset) | `ADDR[:PORT]`: also listen with rdma_cm (option C; iWARP) |
+| `cluster.peer.allow_ipoib` | `--peer-allow-ipoib` | `false` | `true` lets the TCP peer address be on an IPoIB interface (§5.3); off by default because no TCP should run over IPoIB |
 
 Metrics (docs/metrics.md): per kind the links on RDMA and on TCP, fallbacks with their reason, credits stalls, RNR
 retries, QP errors. `tsdb cluster status` names each link's transport.
 
 ### 5.3 Fallback
 
-TCP is always there: the anchor is the TCP link. A failure of the RDMA path ends the connection; the redial upgrades
-again; a peer whose offers fail three times in a row is not offered to for a minute (doubling to 10), logged once per
-change. The link's drivers see the same `on_link` down and up they see after a TCP failure today, so every resume path
+TCP is always there: the anchor is the TCP link, on the Ethernet address the member advertises, never an IPoIB
+address (no TCP runs over IPoIB, §2). tsdbd checks this at start: a peer address bound to an interface of type
+InfiniBand (`/sys/class/net/IF/type` 32, ARPHRD_INFINIBAND) is refused with a line naming the interface, unless
+`cluster.peer.allow_ipoib=true` says the operator wants it (track rd-upgrade). A failure of the RDMA path ends the
+connection; the redial upgrades again; a peer whose offers fail three times in a row is not offered to for a minute
+(doubling to 10), logged once per change. The link's drivers see the same `on_link` down and up they see after a TCP failure today, so every resume path
 already tested for TCP is the one RDMA uses.
 
 ### 5.4 Build
@@ -306,7 +314,7 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
 | rd-mac | high | main | server/peerlink.c (`frame_tag` and its key schedule), client/tsdb_crypto.c or a new server/plmac.c, `PL_CL_VERSION` 8, tools/link-bench.c `--mac`, tests/test_peerlink.c (tag mutants against the new MAC), fuzz-replframe corpus | 1 |
 | rd-seam | medium | rd-mac | server/peerlink.c split: the TCP transport behind `struct pl_transport` (read, write, poll fds, close) with no change in behaviour; test_peerlink unchanged and green; `objdump` not needed (behaviour, not codegen) | 1 |
 | rd-verbs | high | rd-seam | new server/plrdma.[ch] (pool, QP setup from exchanged numbers, credits, SEND/RECV slots, frames split over slots, completion fd in the link's poll), server/plrdma_dl.c, Makefile `NO_RDMA`, tests/test_plrdma.c with the fake and its mutants | 2 |
-| rd-upgrade | high | rd-verbs | peerlink.c: `RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY`, fallback and offer backoff, on_link after the transport settles; tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 1.5 |
+| rd-upgrade | high | rd-verbs | peerlink.c: `RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY`, fallback and offer backoff, on_link after the transport settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 1.5 |
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |
 | rd-rxe | medium | rd-upgrade | tests: a helper that makes an rxe device (or says skipped), test_peerlink and test_cluster `rdma` runs, the CI job | 0.75 |
 | rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed; results here | 1 |

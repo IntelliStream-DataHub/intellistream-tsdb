@@ -2,11 +2,17 @@
 /*
  * link-bench: what a stream link between two servers costs for frames of the peer links' sizes (docs/design-rdma.md).
  * It speaks peerlink's frame shape ([u32 len][u8 type][payload][HMAC-SHA256 tag 32], the tag over a per-direction
- * sequence number, the type and the payload, as server/peerlink.c's frame_tag) over a plain stream socket, so one
- * binary measures TCP on any interface and rsocket under librspreload (LD_PRELOAD), without linking librdmacm:
+ * sequence number, the type and the payload, as server/peerlink.c's frame_tag) over a stream socket, so one binary
+ * measures TCP and rsocket:
  *
- *   link-bench serve [--bind ADDR] [--port-file FILE]        one connection at a time, until killed
- *   link-bench run --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES] [--label L]
+ *   link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE]   one connection at a time, until killed
+ *   link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES] [--label L]
+ *
+ * --rsocket calls librdmacm's rsocket API (rsocket, rconnect, rread...), loaded with dlopen so that the binary builds
+ * without librdmacm's headers and runs without the library when the flag is absent. It is not librspreload on
+ * purpose: the preload falls back to a kernel socket when rconnect fails, which would send TCP over the interface the
+ * rdma_cm address is on (IPoIB on InfiniBand), and a fallen-back run would measure TCP under the rsocket label. With
+ * --rsocket a failure is a failure.
  *
  * bw: the client streams frames for --secs, the server reads (and checks every tag with --tag); lat: one frame each
  * way, the round trip timed per frame. Both sides count their own CPU (getrusage, user + system, the whole process:
@@ -28,10 +34,53 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+/* the stream calls, from libc or from librdmacm's rsocket API (--rsocket) */
+static struct {
+    int (*socket)(int, int, int);
+    int (*bind)(int, const struct sockaddr *, socklen_t);
+    int (*listen)(int, int);
+    int (*accept)(int, struct sockaddr *, socklen_t *);
+    int (*connect)(int, const struct sockaddr *, socklen_t);
+    int (*setsockopt)(int, int, int, const void *, socklen_t);
+    int (*getsockname)(int, struct sockaddr *, socklen_t *);
+    ssize_t (*read)(int, void *, size_t);
+    ssize_t (*write)(int, const void *, size_t);
+    int (*close)(int);
+} io = {socket, bind, listen, accept, connect, setsockopt, getsockname, read, write, close};
+
+static void use_rsocket(void)
+{
+    void *h = dlopen("librdmacm.so.1", RTLD_NOW);
+    if (!h) {
+        fprintf(stderr, "link-bench: --rsocket: %s\n", dlerror());
+        exit(2);
+    }
+#define LB_SYM(f, name)                                                                                              \
+    do {                                                                                                             \
+        *(void **)&io.f = dlsym(h, name);                                                                            \
+        if (!io.f) {                                                                                                 \
+            fprintf(stderr, "link-bench: --rsocket: librdmacm has no %s\n", name);                                   \
+            exit(2);                                                                                                 \
+        }                                                                                                            \
+    } while (0)
+    LB_SYM(socket, "rsocket");
+    LB_SYM(bind, "rbind");
+    LB_SYM(listen, "rlisten");
+    LB_SYM(accept, "raccept");
+    LB_SYM(connect, "rconnect");
+    LB_SYM(setsockopt, "rsetsockopt");
+    LB_SYM(getsockname, "rgetsockname");
+    LB_SYM(read, "rread");
+    LB_SYM(write, "rwrite");
+    LB_SYM(close, "rclose");
+#undef LB_SYM
+}
 
 #define MAGIC 0x4c4b4231u /* "LKB1" */
 #define TAG 32
@@ -57,7 +106,7 @@ static int full_write(int fd, const void *p, size_t n)
 {
     const uint8_t *b = p;
     while (n) {
-        ssize_t w = write(fd, b, n);
+        ssize_t w = io.write(fd, b, n);
         if (w < 0 && errno == EINTR)
             continue;
         if (w <= 0)
@@ -72,7 +121,7 @@ static int full_read(int fd, void *p, size_t n)
 {
     uint8_t *b = p;
     while (n) {
-        ssize_t r = read(fd, b, n);
+        ssize_t r = io.read(fd, b, n);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0)
@@ -166,10 +215,10 @@ struct result {
 static void set_opts(int fd, int buf)
 {
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    io.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     if (buf > 0) {
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
+        io.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
+        io.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
     }
 }
 
@@ -213,16 +262,16 @@ static int serve(const char *bind_addr, const char *port_file, int buf)
         fprintf(stderr, "link-bench: cannot resolve %s\n", bind_addr ? bind_addr : "(any)");
         return 1;
     }
-    int ls = socket(ai->ai_family, SOCK_STREAM, 0), one = 1;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (ls < 0 || bind(ls, ai->ai_addr, ai->ai_addrlen) || listen(ls, 4)) {
+    int ls = io.socket(ai->ai_family, SOCK_STREAM, 0), one = 1;
+    io.setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (ls < 0 || io.bind(ls, ai->ai_addr, ai->ai_addrlen) || io.listen(ls, 4)) {
         perror("link-bench: listen");
         return 1;
     }
     freeaddrinfo(ai);
     struct sockaddr_storage sa;
     socklen_t sl = sizeof sa;
-    getsockname(ls, (struct sockaddr *)&sa, &sl);
+    io.getsockname(ls, (struct sockaddr *)&sa, &sl);
     int port = ntohs(sa.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&sa)->sin6_port
                                               : ((struct sockaddr_in *)&sa)->sin_port);
     if (port_file) {
@@ -237,7 +286,7 @@ static int serve(const char *bind_addr, const char *port_file, int buf)
         printf("%d %d\n", port, (int)getpid());
     fflush(stdout);
     for (;;) {
-        int fd = accept(ls, NULL, NULL);
+        int fd = io.accept(ls, NULL, NULL);
         if (fd < 0) {
             if (errno == EINTR)
                 continue;
@@ -246,7 +295,7 @@ static int serve(const char *bind_addr, const char *port_file, int buf)
         }
         set_opts(fd, buf);
         serve_one(fd);
-        close(fd);
+        io.close(fd);
     }
 }
 
@@ -264,13 +313,13 @@ static int run(const char *host, const char *port, int mode, size_t size, double
         fprintf(stderr, "link-bench: cannot resolve %s\n", host);
         return 1;
     }
-    int fd = socket(ai->ai_family, SOCK_STREAM, 0);
+    int fd = io.socket(ai->ai_family, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("link-bench: socket");
         return 1;
     }
     set_opts(fd, buf);
-    if (connect(fd, ai->ai_addr, ai->ai_addrlen)) {
+    if (io.connect(fd, ai->ai_addr, ai->ai_addrlen)) {
         fprintf(stderr, "link-bench: connect %s port %s: %s\n", host, port, strerror(errno));
         return 2;
     }
@@ -328,7 +377,7 @@ static int run(const char *host, const char *port, int mode, size_t size, double
                lat[(size_t)((double)nlat * 0.99)]);
     }
     printf("\n");
-    close(fd);
+    io.close(fd);
     free(b);
     free(lat);
     return r.errors || r.frames != frames ? 1 : 0;
@@ -336,8 +385,8 @@ static int run(const char *host, const char *port, int mode, size_t size, double
 
 static void usage(void)
 {
-    fputs("usage: link-bench serve [--bind ADDR] [--port-file FILE] [--buf BYTES]\n"
-          "       link-bench run --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES]"
+    fputs("usage: link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE] [--buf BYTES]\n"
+          "       link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES]"
           " [--label L]\n",
           stderr);
     exit(2);
@@ -355,6 +404,10 @@ int main(int argc, char **argv)
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--tag")) {
             tag = 1;
+            continue;
+        }
+        if (!strcmp(a, "--rsocket")) {
+            use_rsocket();
             continue;
         }
         if (!v)
