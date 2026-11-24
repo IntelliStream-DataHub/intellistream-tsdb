@@ -2961,6 +2961,28 @@ static void case_ro_open(void)
  * stub of r8h acknowledges: RSTATE's `done` passes it, a replay skips it). RSTATE's COLD in progress survives a reopen
  * and is decided by ecapply_cold_decide, against the marker's key; format 1 is refused; a COLD naming a file that is
  * no part or .ec is damage. Mutants coldnostage (cm_add skips COLD), coldkeyany, coldnameany. */
+/* replica_apply with its stderr kept in `err` (and passed on): which refusal came, where two answer the same code */
+static int apply_said(eng *db, uint64_t end, char *err, size_t n)
+{
+    err[0] = 0;
+    FILE *t = tmpfile();
+    if (!t)
+        return replica_apply(db, end);
+    fflush(stderr);
+    int sv = dup(2);
+    dup2(fileno(t), 2);
+    int rc = replica_apply(db, end);
+    fflush(stderr);
+    dup2(sv, 2);
+    close(sv);
+    rewind(t);
+    size_t k = fread(err, 1, n - 1, t);
+    err[k] = 0;
+    fclose(t);
+    fputs(err, stderr);
+    return rc;
+}
+
 static void case_cold_hold(void)
 {
     char dir[PATH_MAX], name[64], sp[64];
@@ -3044,7 +3066,11 @@ static void case_cold_hold(void)
         return;
     CHECK_EQ(rs_cold_begin(db, c->last, m.u.cold.key + 4), 0);
     CHECK_EQ(replica_sync(db), 0);
-    CHECK(replica_apply(db, n1->last) == TSDB_ERR_CORRUPT);
+    {   /* refused by the key check, not by the apply that would refuse the fake record with the same code */
+        char said[4096];
+        CHECK(apply_said(db, n1->last, said, sizeof said) == TSDB_ERR_CORRUPT);
+        CHECK(strstr(said, "the marker there names key") != NULL);
+    }
     eng_close(db);
     CHECK_EQ(open_replica(dir, 0, &db), 0);
     if (!db)
