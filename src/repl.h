@@ -285,7 +285,9 @@ uint64_t repl_written(const struct repl *r);
 uint64_t repl_durable_end(const struct repl *r);
 uint64_t repl_applied(const struct repl *r);
 uint64_t repl_commit(const struct repl *r);
-/* the leader: the durable end member idx acknowledged in this epoch (0: none yet, or not the leader) */
+/* Leader: the durable end member idx acknowledged in this epoch as the instance its record names (the ISR's rid, or
+ * the requested one for a member joining); this leader's own durable end for itself; 0 otherwise. A planned transfer
+ * (D14) drains until commit = written = the target's value here. */
 uint64_t repl_peer_match(const struct repl *r, int idx);
 unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap);
 int repl_failed(const struct repl *r);
