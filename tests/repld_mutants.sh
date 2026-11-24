@@ -45,7 +45,11 @@
 # after its lost DONE counted twice), snapnowaitdone (a lost DONE 0 holds the source for 6 h) and snapnostale (a stale
 # request served) snaplost; snapnostall (a receiver hearing nothing waits on) and snapnosrcdown (a source whose
 # receiver is gone kept) snapstall; snapnopeerchange is not planted: snapsrckill requires the new leader's notice to
-# end the old transfer.
+# end the old transfer. The install's (server/snapinst_run.c, rsnap.c, cvol.c): snapstalekeep (keep read before the
+# driver stopped: a FENCE meanwhile lost) snapfence; snapinstallstale (a copy at or below the log end installed) and
+# snapservebeforeopen (an installed copy opened before REPLICA_OPEN) snapcatch; snapkeepdiverged (DIVERGED carried into
+# the fresh copy) snapdiverged. A floor below P cannot be planted: replfile_save refuses a floor lowered, and the core
+# a floor below the log start.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -104,6 +108,10 @@ table=(
     "snapnostall|snapstall|the receiver of a stalled source did not leave it|the replica never received the snapshot"
     "snapnosrcdown|snapstall|a source whose receiver is gone was not released"
     "snapsrcpromoting|snapbusy|a leader that is promoting did not answer BUSY"
+    "snapstalekeep|snapfence|the receiver installed a REPL with fence [0-9]+ \\(kept [0-9]+\\) below the epoch"
+    "snapinstallstale|snapcatch|a replica in the ISR installed a copy at or below its log end"
+    "snapservebeforeopen|snapcatch|the replica opened its installed copy before the group recorded its open generation"
+    "snapkeepdiverged|snapdiverged|the rebuilt replica (stopped as DIVERGED again|joins the ISR)"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}

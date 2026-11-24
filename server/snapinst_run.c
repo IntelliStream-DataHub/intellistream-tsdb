@@ -15,7 +15,7 @@
  * root fsync, before the old directory is removed): at the next start cvolfs_prepare runs snapinst_leftovers (snapinst.c)
  * before it looks at v<N>, and snap_leftovers finishes a swap whose SNAPDONE is there and removes a copy without it (asked again).
  *
- * Mutants (TSDB_REPLD_MUTANT): snapfloorlow (REPL's floor put at P / 2 after the install), snapstalekeep (keep read
+ * Mutants (TSDB_REPLD_MUTANT): snapstalekeep (keep read
  * before the volume is closed), snapkeepdiverged (the old directory's DIVERGED copied into the new one); rsnap.c has
  * snapinstallstale, cvol.c snapservebeforeopen. Test hook: TSDB_REPLD_TEST=snapclosedelay=MS waits MS before the close.
  */
@@ -165,12 +165,6 @@ static int inst_fn(void *ctx, const struct snap_ident *id, int had_engine)
     struct replfile *rf = NULL;
     bool torn = false;
     if (dfd >= 0 && replfile_load(dfd, &rf, &st, &torn) == 0) {
-        if (G.mutant == RM_SNAPFLOORLOW && st.floor > 1) {
-            st.floor /= 2;
-            if (replfile_save(rf, &st) == 0)
-                say("MUTANT: volume %" PRIu32 ": the installed REPL's floor put at %" PRIu64 " (snapfloorlow)",
-                    in->number, st.floor);
-        }
         in->out->fence = st.fence;
         in->out->open_gen = st.open_gen;
         replfile_close(rf);

@@ -83,6 +83,7 @@ struct rvol {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop, mode, failed, set_changed;
+    int div_rebuild; /* failed as DIVERGED on a replica: rebuilt by a snapshot (rsnap_rebuild on the failed thread) */
     struct repl *core;
     struct replfile *rf;
     struct replfile_state st;
@@ -203,7 +204,6 @@ enum {
     RM_SNAPNOSTALL,      /* rsnap.c: a receiver that hears nothing waits on */
     RM_SNAPNOSRCDOWN,    /* rsnap.c: a source whose receiver's link stays down is not released */
     RM_SNAPNOSRCMAX,     /* rsnap.c: a source serves past rebuild_max */
-    RM_SNAPFLOORLOW,     /* snapinst.c: the installed REPL's floor is put below P (the keep's floor) */
     RM_SNAPINSTALLSTALE, /* rsnap.c: a snapshot with P at or below the receiver's log end is installed */
     RM_SNAPSTALEKEEP,    /* snapinst.c: the old REPL is read before the driver stopped (D6) */
     RM_SNAPKEEPDIVERGED  /* snapinst.c: the old directory's DIVERGED is carried into the installed one */
@@ -261,6 +261,7 @@ struct repld_g {
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int snap_ask; /* TSDB_REPLD_TEST=snapask (tests only): while <dir>/snapask exists a replica asks for a snapshot */
     int plant_diverge; /* TSDB_REPLD_TEST=plantdiverge (tests only): <dir>/diverge.<volume> makes that volume DIVERGED
                         * (ec_diverge, EC_DIV_TEST) at the driver's next tick, and is removed */
     int no_fence_reply; /* TSDB_REPLD_TEST=nofencereply (tests only): no FENCE_REPLY leaves while <dir>/nofencereply

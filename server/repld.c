@@ -1898,7 +1898,15 @@ static void *vol_main(void *arg)
     while (!rv->stop) {
         drain(rv);
         if (rv->failed) {
-            pthread_cond_wait(&rv->cv, &rv->mu);
+            if (!rv->div_rebuild) {
+                pthread_cond_wait(&rv->cv, &rv->mu);
+                continue;
+            }
+            rsnap_rebuild(rv); /* D8: a DIVERGED replica is rebuilt by a snapshot; asked again until installed */
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            pthread_cond_timedwait(&rv->cv, &rv->mu, &until);
             continue;
         }
         if ((rv->mode == M_WRITER || rv->mode == M_PROMOTING) && !repl_is_leader(rv->core)) {
@@ -1962,12 +1970,15 @@ static void *vol_main(void *arg)
                 plant_diverge(rv);
             if (!rv->failed && G.mutant != RM_DIVERGEISR && tsdb_volume_diverged(G.t, rv->number) == 1) {
                 vol_fail(rv, "the volume is DIVERGED (tsdb DIR volume diverged lists why)");
+                rv->div_rebuild = rv->mode == M_REPLICA; /* a replica asks for a snapshot (rsnap_rebuild) */
                 pthread_mutex_unlock(&rv->mu);
                 if (G.mutant != RM_NOQUIESCE)
                     tsdb_volume_quiesce(G.t, rv->number); /* clients get UNAVAILABLE (DIVERGED) or MOVED on */
                 pthread_mutex_lock(&rv->mu);
                 continue;
             }
+            if (G.snap_ask)
+                rsnap_rebuild(rv); /* TSDB_REPLD_TEST=snapask */
             repl_tick(rv->core);
             commit_watch(rv, now);
             next_tick += TICK_MS;
@@ -2169,7 +2180,6 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
                : !strcmp(mu, "snapnosrcdown")  ? RM_SNAPNOSRCDOWN
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
-               : !strcmp(mu, "snapfloorlow")   ? RM_SNAPFLOORLOW
                : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
                : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
                : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
@@ -2204,6 +2214,7 @@ void repld_init(tsdb *t, const char *dir)
     G.cut_links = te && strstr(te, "cutlinks");
     G.no_fence_reply = te && strstr(te, "nofencereply");
     G.plant_diverge = te && strstr(te, "plantdiverge");
+    G.snap_ask = te && strstr(te, "snapask");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");

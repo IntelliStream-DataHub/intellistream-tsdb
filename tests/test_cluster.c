@@ -7242,7 +7242,7 @@ struct snapset {
 
 /* the snap.* lines of server i's STATUS (server/rsnap.c's counters) */
 struct rsnap_stats {
-    uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received;
+    uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received, installed, refused_stale;
 };
 static void status_snap(int i, struct rsnap_stats *st)
 {
@@ -7252,9 +7252,9 @@ static void status_snap(int i, struct rsnap_stats *st)
     if (rc != 0)
         die("STATUS of server %d: %s", i, ers(rc));
     static const char *keys[] = {"asked", "sent", "received", "refused_space", "failed", "busy", "bytes_sent",
-                                 "bytes_received"};
+                                 "bytes_received", "installed", "refused_stale"};
     uint64_t *v[] = {&st->asked, &st->sent, &st->received, &st->refused_space, &st->failed, &st->busy,
-                     &st->bytes_sent, &st->bytes_received};
+                     &st->bytes_sent, &st->bytes_received, &st->installed, &st->refused_stale};
     for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
         char key[64];
         snprintf(key, sizeof key, "\nsnap.%s=", keys[k]);
@@ -7819,9 +7819,25 @@ static int snap_installed(int i, uint64_t *f, uint64_t *k, double *secs)
     return 1;
 }
 
+/* the state/holdopens files of every server: while they exist the metadata leader proposes no REPLICA_OPEN */
+static void hold_opens(int on)
+{
+    for (int i = 0; i < 3; i++) {
+        char hold[PATH_MAX + 96];
+        server_dir(i, hold, sizeof hold);
+        strcat(hold, "/state/holdopens");
+        FILE *h = on ? fopen(hold, "w") : NULL;
+        if (on ? (!h || fclose(h) != 0) : (unlink(hold) != 0 && errno != ENOENT))
+            die("%s: %s", hold, strerror(errno));
+    }
+}
+
 /* snapcatch: R away for ten flushed segments past repl_retain_s under writes, back: it is sent a snapshot, installs
  * it (closing its open engine), opens again, catches up and joins the ISR; every replica then holds the same rows,
- * nulls included, and no acknowledged write is lost (mutant snapfloorlow: a floor below P) */
+ * nulls included, and no acknowledged write is lost. The install's close is
+ * delayed (snapclosedelay) to hold REPLICA_OPEN back meanwhile: the installed copy must not open before the group
+ * recorded its generation (mutant snapservebeforeopen). Caught up, R asks again (snapask): a copy whose P is at or
+ * below its log end is refused, never installed (mutant snapinstallstale: R's log would go back to P). */
 static void scen_snapcatch(void)
 {
     scenario("snapcatch");
@@ -7832,14 +7848,30 @@ static void scen_snapcatch(void)
         snap_more(&s, 100, 1, &n[0]);
         sleep(1);
     }
+    penv[s.R] = "TSDB_REPLD_TEST=snapclosedelay=1500,snapask";
     start(s.R);
     uint64_t t0 = now_ms();
+    int held = 0, opens = 0;
     while (!log_has(s.R, "snapshot installed: P")) { /* writes go on while the copy is made, sent and installed */
         if (now_ms() - t0 > 60000)
             die("the replica back past the keep cap installed no snapshot in 60 s");
+        if (!held && log_has(s.R, "(snapclosedelay)")) {
+            hold_opens(1);
+            held = 1;
+            opens = log_count(s.R, "(plant): open as the");
+        }
         snap_more(&s, 20, 0, &n[0]);
         usleep(100000);
     }
+    if (!held)
+        die("the install came without its close delay");
+    for (int k = 0; k < 25; k++) { /* 2.5 s with no REPLICA_OPEN: the installed copy waits */
+        if (log_count(s.R, "(plant): open as the") != opens)
+            die("the replica opened its installed copy before the group recorded its open generation");
+        snap_more(&s, 10, 0, &n[0]);
+        usleep(100000);
+    }
+    hold_opens(0);
     await_isr(0, "plant", 3, 60000, "the replica that installed a snapshot joins the ISR");
     for (int k = 0; k < 5; k++)
         snap_more(&s, 100, k == 2, &n[0]);
@@ -7847,13 +7879,77 @@ static void scen_snapcatch(void)
     double secs = 0;
     if (!snap_installed(s.R, &f, &kf, &secs))
         die("no install line with a fence");
+    /* caught up, R asks for a copy as if it were behind: its P is at or below R's log end */
+    char ask[PATH_MAX + 64];
+    server_dir(s.R, ask, sizeof ask);
+    strcat(ask, "/snapask");
+    FILE *a = fopen(ask, "w");
+    if (!a || fclose(a) != 0)
+        die("%s: %s", ask, strerror(errno));
+    t0 = now_ms();
+    while (!log_has(s.R, "is stale and not installed")) {
+        if (log_count(s.R, "snapshot installed: P") != 1)
+            die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
+        if (now_ms() - t0 > 60000)
+            die("the caught-up replica's request was neither refused as stale nor installed in 60 s");
+        snap_more(&s, 10, 0, &n[0]);
+        usleep(100000);
+    }
+    unlink(ask);
+    sleep(2);
+    if (log_count(s.R, "snapshot installed: P") != 1)
+        die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
+    await_isr(0, "plant", 3, 60000, "the replica that refused a stale copy stays in the ISR");
     struct rsnap_stats sr;
     status_snap(s.R, &sr);
+    if (sr.refused_stale < 1 || sr.installed != 1)
+        die("STATUS of the receiver: installed %" PRIu64 ", refused_stale %" PRIu64 " (want 1 and >= 1)", sr.installed,
+            sr.refused_stale);
     snap_close(&s);
     stop_all();
     rep_same(n, "snapcatch: after a clean stop");
-    printf("  a replica ten segments behind installed a snapshot in %.1f s (REPL fence %" PRIu64 "), caught up and joined"
-           " the ISR; all three hold the same %" PRIu64 " rows\n", secs, f, n[0]);
+    printf("  a replica ten segments behind installed a snapshot in %.1f s (REPL fence %" PRIu64 "), waited for its"
+           " open generation, caught up and joined the ISR; a stale copy was refused; all three hold the same %" PRIu64
+           " rows\n", secs, f, n[0]);
+}
+
+static void touch_plant(int i, uint32_t num);
+
+/* snapdiverged: a caught-up replica whose volume turns DIVERGED (planted: the DIVERGED file a failed digest writes)
+ * stops, asks the leader for a snapshot, installs it and comes back without the flag: it joins the ISR, stops no more
+ * and holds the leader's rows (mutant snapkeepdiverged: the flag carried into the installed copy) */
+static void scen_snapdiverged(void)
+{
+    scenario("snapdiverged");
+    struct snapset s;
+    snap_setup(1, 0, &s);
+    uint64_t n[REP_NAMES] = {702, 0, 0, 0};
+    penv[s.R] = "TSDB_REPLD_TEST=plantdiverge";
+    start(s.R);
+    await_log(s.R, "snapshot installed: P", 60000, "the replica back past the keep cap installed no snapshot");
+    await_isr(0, "plant", 3, 60000, "the replica that installed a snapshot joins the ISR");
+    snap_more(&s, 100, 1, &n[0]);
+    touch_plant(s.R, 1);
+    await_log(s.R, "stopped: the volume is DIVERGED", 20000, "the planted DIVERGED did not stop the replica");
+    uint64_t t0 = now_ms();
+    while (log_count(s.R, "snapshot installed: P") < 2) {
+        if (now_ms() - t0 > 60000)
+            die("the DIVERGED replica was not rebuilt by a snapshot in 60 s");
+        snap_more(&s, 20, 0, &n[0]);
+        usleep(100000);
+    }
+    await_isr(0, "plant", 3, 60000, "the rebuilt replica joins the ISR");
+    for (int k = 0; k < 3; k++) {
+        snap_more(&s, 100, k == 1, &n[0]);
+        sleep(1);
+    }
+    if (log_count(s.R, "stopped: the volume is DIVERGED") != 1)
+        die("the rebuilt replica stopped as DIVERGED again: the flag was carried into the fresh copy");
+    await_isr(0, "plant", 3, 10000, "the rebuilt replica stays in the ISR");
+    snap_close(&s);
+    stop_all();
+    rep_same(n, "snapdiverged: after a clean stop");
+    printf("  a DIVERGED replica was rebuilt by a snapshot, joined the ISR and holds the same %" PRIu64 " rows\n", n[0]);
 }
 
 /* snapkill: the receiver killed at snap-received (files in, nothing installed) and at snap-swapped (after the swap's
@@ -12870,7 +12966,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

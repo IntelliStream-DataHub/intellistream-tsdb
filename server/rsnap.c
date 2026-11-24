@@ -373,10 +373,27 @@ static void job_free(struct rjob *j)
 
 /* ---- the receiver */
 
+void rsnap_rebuild(struct rvol *rv)
+{
+    pthread_once(&hooks_once, hooks_read);
+    if (!rv->div_rebuild) { /* TSDB_REPLD_TEST=snapask: asked while <dir>/snapask exists (test only: an access under
+                             * rv->mu, as plantdiverge's) */
+        char hp[sizeof G.dir + 32];
+        snprintf(hp, sizeof hp, "%s/snapask", G.dir);
+        if (access(hp, F_OK) != 0)
+            return;
+    }
+    for (uint32_t k = 0; k < rv->rec.nrep; k++)
+        if (rv->rec.rep[k].node == rv->rec.leader && rv->rec.leader != G.self) {
+            rsnap_need(rv, (int)k);
+            return;
+        }
+}
+
 void rsnap_need(struct rvol *rv, int src)
 {
     pthread_once(&hooks_once, hooks_read);
-    if (src < 0 || (uint32_t)src >= rv->rec.nrep || rv->mode != M_REPLICA || rv->failed)
+    if (src < 0 || (uint32_t)src >= rv->rec.nrep || rv->mode != M_REPLICA || (rv->failed && !rv->div_rebuild))
         return;
     uint32_t node = rv->rec.rep[src].node;
     if (node == G.self)
@@ -1106,7 +1123,9 @@ static void install(struct rjob *j)
         pthread_mutex_lock(&rv->mu);
         if (rv->core && !rv->stop) {
             drv = 1;
-            log_end = repl_durable_end(rv->core);
+            /* a DIVERGED replica's log is what the copy replaces: any P rebuilds it (out of the ISR since it failed,
+             * so no commit counts on the positions above P it held) */
+            log_end = rv->failed && rv->div_rebuild ? 0 : repl_durable_end(rv->core);
             fence = rv->st.fence;
         }
         pthread_mutex_unlock(&rv->mu);
