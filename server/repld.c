@@ -1375,6 +1375,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             for (int i = 0; i < (int)rv->rec.nrep; i++)
                 if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
+            if (G.keep_all) /* until r4-xferinst: a learner added or reset later must find position 1 */
+                keep = 0;
             /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
              * tells that peer to install a snapshot once the log start passed what it needs */
             uint64_t capb = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
@@ -2169,6 +2171,7 @@ void repld_init(tsdb *t, const char *dir)
     G.skip_pos = te && strstr(te, "skippos");
     G.stale_sent = te && strstr(te, "stalesent");
     G.set_stale = te && strstr(te, "setstale");
+    G.keep_all = te && strstr(te, "keepall");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
     G.late_bytes = te && strstr(te, "latebytes");

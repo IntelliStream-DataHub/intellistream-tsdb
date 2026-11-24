@@ -611,7 +611,6 @@ static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to thi
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
-static uint32_t init_idle_seal_ms; /* nonzero: INIT's idle_seal_ms */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
@@ -624,8 +623,6 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.repl_retain_s = init_retain_s;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
-    if (init_idle_seal_ms)
-        s.idle_seal_ms = init_idle_seal_ms;
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -12063,11 +12060,15 @@ static int dir_has(int i, const char *prefix)
     return found;
 }
 
-/* a volume "plant" of 3 replicas on servers 0..nserv-1 (setop_file on each); its leader's server */
-static int set_setup(int nserv, struct meta_volume *v)
+/* a volume "plant" of 3 replicas on servers 0..nserv-1 (setop_file on each); its leader's server. keepall: the leader
+ * keeps every segment (TSDB_REPLD_TEST=keepall). A writer drops the segment of position 1 (its open marker) once every
+ * member acknowledged it, within seconds; a member added or reset after that needs a snapshot, which r4-xferinst builds.
+ * Until it merges, a scenario that fills a fresh replica from the log keeps everything */
+static int set_setup(int nserv, struct meta_volume *v, int keepall)
 {
     for (int i = 0; i < nserv; i++) {
         envs[i] = "setop_file=1";
+        penv[i] = keepall ? "TSDB_REPLD_TEST=keepall" : NULL;
         start(i);
     }
     init_cluster(0, 600);
@@ -12098,7 +12099,7 @@ static void scen_addreplica(void)
 {
     scenario("addreplica");
     struct meta_volume v;
-    int L = set_setup(4, &v), X = -1;
+    int L = set_setup(4, &v, 1), X = -1;
     for (int i = 0; i < 4; i++)
         if (rep_index(&v, i) < 0)
             X = i;
@@ -12149,7 +12150,7 @@ static void scen_removereplica(void)
 {
     scenario("removereplica");
     struct meta_volume v;
-    int L = set_setup(3, &v), R = (L + 1) % 3, O = (L + 2) % 3;
+    int L = set_setup(3, &v, 0), R = (L + 1) % 3, O = (L + 2) % 3;
     tsdbc *c = client(L);
     tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
     int64_t t = 1000;
@@ -12193,14 +12194,7 @@ static void scen_resetlost(void)
 {
     scenario("resetlost");
     struct meta_volume v;
-    /* no flush (5 s apart by default) and no idle seal (which flushes an idle memtable): the leader drops a flushed
-     * segment once every member acknowledged it. OPEN (checkpoint 3): the segment of position 1 (the leader's open
-     * marker alone) still goes, so the fresh replica is told it needs a snapshot (r4-xferinst) and never joins */
-    init_idle_seal_ms = 3600000;
-    for (int i = 0; i < 3; i++)
-        xargs[i] = "--flush-interval-ms 3600000";
-    int L = set_setup(3, &v), R = (L + 1) % 3;
-    init_idle_seal_ms = 0;
+    int L = set_setup(3, &v, 1), R = (L + 1) % 3;
     tsdbc *c = client(L);
     tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
     int64_t t = 1000;
