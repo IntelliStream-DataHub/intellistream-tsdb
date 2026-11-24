@@ -12413,6 +12413,157 @@ static void scen_transferslow(void)
     tr_finish(&x, "transferslow", 0);
 }
 
+/* transfermarkers: a transfer with each kind of marker in flight. TSDB_REPLD_TEST=admithold holds the admit of the
+ * next marker of the type <dir>/admithold names (with buf_lock held) until the transfer drains, so the drain refuses
+ * it: the idle seal's NOW, a series create's SERIES, a retention change's RETENTION, a large write's COMMIT (its files
+ * shipped first) and the class switch of a fresh slow series' first flush. No engine fails, the drain ends (every transfer
+ * answers OK with the target leading), each client call answers OK (it retries the refusal on the new leader), and
+ * every member ends with the rows. DROP is not here: no op of tsdbd calls tsdb_drop_before. */
+enum { TMK_COMMIT = 1, TMK_RETENTION = 3, TMK_CLASS = 6, TMK_SERIES = 7, TMK_NOW = 10 }; /* src/marker.h */
+struct tm_op {
+    int server, kind;
+    tsdb_sid big, slow, now;
+    int rc;
+};
+enum { TM_BIG = 100000 };
+static void *tm_op_thread(void *a)
+{
+    struct tm_op *o = a;
+    tsdbc *c = client(o->server);
+    tsdbc_set_retry(c, 30000);
+    o->rc = 0;
+    if (o->kind == TMK_SERIES) {
+        tsdb_sid id = 0;
+        o->rc = tsdbc_series_at(c, "tm.created", "tv", &id);
+    } else if (o->kind == TMK_RETENTION) {
+        o->rc = tsdbc_set_retention(c, o->big, 100LL * 366 * 86400000);
+    } else if (o->kind == TMK_COMMIT) {
+        int64_t *ts = malloc(TM_BIG * sizeof *ts);
+        float *val = malloc(TM_BIG * sizeof *val);
+        if (!ts || !val)
+            die("out of memory");
+        for (int j = 0; j < TM_BIG; j++)
+            ts[j] = 1000 + 1000LL * j, val[j] = (float)(j % 977);
+        o->rc = tsdbc_insert_series(c, o->big, ts, val, TM_BIG);
+        free(ts);
+        free(val);
+    } else if (o->kind == TMK_CLASS) {
+        int64_t ts[200];
+        float val[200];
+        for (int j = 0; j < 200; j++)
+            ts[j] = 3600000LL * j, val[j] = (float)j;
+        /* fresh: a series the leader's open found is taken as decided and never switches */
+        o->rc = tsdbc_series_at(c, "tm.slow", "tv", &o->slow);
+        if (o->rc == 0)
+            o->rc = tsdbc_insert_series(c, o->slow, ts, val, 200);
+    } else if (o->kind == TMK_NOW) {
+        int64_t ts = 5;
+        float val = 5;
+        o->rc = tsdbc_insert_series(c, o->now, &ts, &val, 1); /* a row to seal; the seal comes when idle */
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+static void scen_transfermarkers(void)
+{
+    scenario("transfermarkers");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=admithold";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int rc;
+    uint32_t num = 0;
+    if ((rc = vol_add(0, "tv", 3, &num)) != 0 || num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR");
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    tsdbc *c = client(server_of(v.leader));
+    tsdb_sid big = rep_series(c, "tm.big", "tv", 30000), slow = 0, nowid = rep_series(c, "tm.now", "tv", 30000);
+    tsdbc_close(c);
+    static const struct {
+        int kind;
+        const char *name;
+    } kinds[] = {{TMK_SERIES, "SERIES"}, {TMK_RETENTION, "RETENTION"}, {TMK_COMMIT, "COMMIT"}, {TMK_NOW, "NOW"},
+                 {TMK_CLASS, "CLASS"}};
+    char held[64];
+    for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+        if (!vol_rec(0, "tv", &v))
+            die("no record of tv");
+        int L = server_of(v.leader), T = tr_other(L, -1);
+        char f[PATH_MAX + 40];
+        snprintf(f, sizeof f, "%s/n%d/admithold", base, L);
+        FILE *fp = fopen(f, "w");
+        if (!fp || fprintf(fp, "%d\n", kinds[k].kind) < 0 || fclose(fp) != 0)
+            die("write %s: %s", f, strerror(errno));
+        snprintf(held, sizeof held, "a marker of type %d held", kinds[k].kind);
+        int before = log_count(L, held);
+        struct tm_op o = {.server = L, .kind = kinds[k].kind, .big = big, .slow = slow, .now = nowid};
+        pthread_t th;
+        if (pthread_create(&th, NULL, tm_op_thread, &o) != 0)
+            die("pthread_create");
+        await_log_count(L, held, before + 1, 60000);
+        uint64_t t0 = now_ms();
+        char why[256];
+        if ((rc = tr_transfer(num, ids[T], why, sizeof why)) != 0)
+            die("transfermarkers: the transfer to node %u with a %s marker held: %s (%s)", ids[T], kinds[k].name,
+                cluster_strerror(rc), why);
+        uint64_t took = now_ms() - t0;
+        pthread_join(th, NULL);
+        if (kinds[k].kind == TMK_CLASS)
+            slow = o.slow;
+        struct meta_volume a;
+        if (!vol_rec(0, "tv", &a) || a.leader != ids[T])
+            die("transfermarkers: node %u leads tv after the transfer to node %u with a %s marker held", a.leader,
+                ids[T], kinds[k].name);
+        if (o.rc != 0)
+            die("transfermarkers: the call with a %s marker held answered %s", kinds[k].name, ers(o.rc));
+        if (access(f, F_OK) == 0)
+            die("transfermarkers: the %s marker was never held (%s still there)", kinds[k].name, f);
+        for (int i = 0; i < 3; i++)
+            if (log_count(i, "no more writes until") != 0)
+                die("transfermarkers: an engine of server %d failed with a %s marker held", i, kinds[k].name);
+        await_isr(0, "tv", 3, 30000, "the ISR whole after the transfer");
+        printf("  a transfer with a %s marker held at the admit: %" PRIu64 " ms, the call answered OK on node %u\n",
+               kinds[k].name, took, ids[T]);
+    }
+    /* every member holds the rows: the large write's and the slow series' */
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    c = client(server_of(v.leader));
+    tsdbc_set_retry(c, 30000);
+    int nb = rows_of(c, big), ns = rows_of(c, slow);
+    tsdb_sid made = 0;
+    if ((rc = tsdbc_series_at(c, "tm.created", "tv", &made)) != 0)
+        die("transfermarkers: the series created with its SERIES marker held: %s", ers(rc));
+    tsdbc_close(c);
+    if (nb != TM_BIG || ns != 200)
+        die("transfermarkers: the leader reads %d and %d rows, not %d and 200", nb, ns, TM_BIG);
+    for (int i = 0; i < 3; i++) {
+        tsdbc *r = client(i);
+        tsdbc_set_retry(r, 0);
+        uint64_t t0 = now_ms();
+        while (tr_rows_here(r, big) != nb || tr_rows_here(r, slow) != ns)
+            if (now_ms() - t0 > 30000)
+                die("transfermarkers: server %d does not read the leader's rows 30 s on", i);
+            else
+                usleep(50000);
+        tsdbc_close(r);
+    }
+    for (int i = 0; i < 3; i++)
+        if (log_count(i, "no more writes until") != 0)
+            die("transfermarkers: an engine of server %d failed", i);
+    stop_all();
+}
+
 /* transferhold: transfer_wait_ms 500, and the promotion's FENCE held from every member (TSDB_CLUSTER_TEST
  * drop_fence_file, dropped for 1200 ms after READY, resent every 100 ms): the old leader L stays
  * the writer past transfer_wait_ms, and admits nothing (READY's hold lasts until its epoch is lost or 10 x
@@ -13010,7 +13161,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferhold", scen_transferhold}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferhold", scen_transferhold}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

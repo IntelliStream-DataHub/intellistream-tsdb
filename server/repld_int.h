@@ -244,6 +244,7 @@ struct repld_g {
                    * durable past the core's durable end */
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
+    int admit_hold;   /* TSDB_REPLD_TEST=admithold (tests only): admit_held() */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
     int plant_diverge; /* TSDB_REPLD_TEST=plantdiverge (tests only): <dir>/diverge.<volume> makes that volume DIVERGED
                         * (ec_diverge, EC_DIV_TEST) at the driver's next tick, and is removed */

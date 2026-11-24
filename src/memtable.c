@@ -689,6 +689,8 @@ static void wal_rec_close(eng *db)
 
 /* A leader's admission of a record before it is buffered (jr_ops.admit; buf_lock held): a deposed leader refuses
  * every write, definitely not applied (the request may go to the new leader). */
+__thread uint16_t eng_admit_marker;
+
 static int leader_admit(eng *db, uint64_t fno, uint32_t span)
 {
     const struct jr_ops *jr = eng_jr(db);
@@ -801,8 +803,11 @@ static int wal_markers_locked(eng *db, const wal_mrec *r, size_t n, uint64_t *fn
             db->wal_buf = b, db->wal_cap = cap;
     }
     uint64_t lsn = 0;
-    if (rc == 0)
+    if (rc == 0) {
+        eng_admit_marker = r[0].type;
         rc = leader_admit(db, db->fno_next, (uint32_t)span); /* last: nothing below fails */
+        eng_admit_marker = 0;
+    }
     if (rc == 0) {
         wal_rec_close(db); /* the marker follows the rows record: it takes no more rows */
         if (fno)

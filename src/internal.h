@@ -2210,6 +2210,9 @@ static inline void eng_ppos_rows(struct eng *db, memtable *m, int site, const in
 uint64_t jr_part_pos(struct eng *db);
 /* The last position a reader may see: in sync mode what is durable, and on a leader no further than the commit point
  * (C7: a leader applies only up to it, as every replica does). Unchanged for every other engine. */
+/* the marker type of the record a leader admits on this thread (jr_ops.admit), 0 for rows: read only by test hooks
+ * (repld.c's admithold holds the admit of one kind) */
+extern __thread uint16_t eng_admit_marker;
 static inline const struct jr_ops *eng_jr(struct eng *db) { return __atomic_load_n(&db->jr, __ATOMIC_ACQUIRE); }
 static inline uint64_t eng_visible(struct eng *db)
 {

@@ -68,7 +68,7 @@
  * repl_retain_s (keepcap), `noseal` leaves an idle leader's last segment unsealed (no idle flush; the NOW markers go
  * on) (idleseal), `keepwritten` keeps the leader's segments by its peers' written ends, not their durable ones
  * (replicate); tests/repld_mutants.sh names the rest and pins each mutant to its scenario's FAIL line.
- * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
+ * Faults for tests, TSDB_REPLD_TEST=NAME[,NAME]: `admithold` holds one marker's admit until a transfer drains (admit_held); `dropbulk` has the first bulk file this process receives taken as staged but not kept, so its COMMIT marker finds
  * the file missing and FETCHes it; `fetchlate` has a replica send its first FETCH of a name only 5 s after it found
  * the file missing (the leader has sealed and flushed the marker's segment by then); `nofetch` has a replica send no
  * FETCH at all and say once per name that it withholds it (reopenhold kills it there); `syncpause` has a replica's
@@ -608,10 +608,40 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
     pthread_mutex_unlock(&rv->mu);
 }
 
+/* TSDB_REPLD_TEST=admithold: once <dir>/admithold holds a marker type (src/marker.h), the next admit of a marker of
+ * that type on a writer removes the file, says so and waits (with buf_lock held, without rv->mu) until a transfer of
+ * the volume drains, 20 s at most: a transfer with that marker in flight (test_cluster transfermarkers) */
+static void admit_held(struct rvol *rv)
+{
+    char f[sizeof G.dir + 16], b[16] = {0};
+    snprintf(f, sizeof f, "%s/admithold", G.dir);
+    FILE *fp = fopen(f, "r");
+    if (!fp)
+        return;
+    size_t n = fread(b, 1, sizeof b - 1, fp);
+    fclose(fp);
+    b[n] = 0;
+    if (!eng_admit_marker || atoi(b) != eng_admit_marker || unlink(f) != 0)
+        return;
+    say("volume %" PRIu32 ": the admit of a marker of type %u held until a transfer drains", rv->number,
+        (unsigned)eng_admit_marker);
+    for (int i = 0; i < 2000; i++) {
+        pthread_mutex_lock(&rv->mu);
+        int d = rv->mode == M_WRITER && rtr_draining(rv);
+        pthread_mutex_unlock(&rv->mu);
+        if (d)
+            break;
+        usleep(10000);
+    }
+    say("volume %" PRIu32 ": the held admit of a marker of type %u goes on", rv->number, (unsigned)eng_admit_marker);
+}
+
 /* jr_ops.admit, under buf_lock: the core's positions must be the engine's */
 static int op_admit(void *ctx, struct eng *db, uint64_t fno, uint32_t span)
 {
     struct rvol *rv = ctx;
+    if (G.admit_hold)
+        admit_held(rv);
     pthread_mutex_lock(&rv->mu);
     uint64_t pos = 0;
     /* M_PROMOTING: the new writer engine is listed (tsdb_cvol_replace) before the driver's mode says so; a write in
@@ -2162,6 +2192,7 @@ void repld_init(tsdb *t, const char *dir)
     G.promote_slow = te && strstr(te, "promoteslow");
     G.open_slow = te && strstr(te, "openslow");
     G.skip_pos = te && strstr(te, "skippos");
+    G.admit_hold = te && strstr(te, "admithold");
     G.stale_sent = te && strstr(te, "stalesent");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
