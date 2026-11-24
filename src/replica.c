@@ -133,6 +133,7 @@ struct replica {
     size_t nkq, capkq;
     _Atomic uint64_t kept_saved; /* RSTATE's `kept` as last saved (or loaded at the open) */
     uint64_t napplied;           /* records applied since the open (rp->mu; replica_test_napplied) */
+    uint64_t open_first;         /* the first position the open's cursor read (replica_test_open_first) */
 };
 
 /* The position of the COMMIT whose parts this thread commits (apply_commit) and its engine, for jr_part_pos */
@@ -467,6 +468,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
             rp->apply_next = segs[k].fno_first;
             break;
         }
+    rp->open_first = rp->apply_next;
     if (ck < nseg) {
         rp->apply_seq = segs[ck].seq;
         rp->apply_off = 0;
@@ -3617,6 +3619,11 @@ uint64_t replica_replay_start(eng *db)
     if (!first && logstart) /* every record is in a kept segment: an open replays from the next position appended */
         first = atomic_load(&rp->log_next);
     return MAX(first, logstart);
+}
+
+uint64_t replica_test_open_first(eng *db)
+{
+    return db->rp ? db->rp->open_first : 0;
 }
 
 uint64_t replica_test_napplied(eng *db)

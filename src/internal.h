@@ -1645,6 +1645,7 @@ void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep);
 uint64_t replica_replay_start(struct eng *db);
 /* tests: the records a replica's applier applied since its open (the open's replay included) */
 uint64_t replica_test_napplied(struct eng *db);
+uint64_t replica_test_open_first(struct eng *db); /* tests: the first position the open's cursor read */
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
