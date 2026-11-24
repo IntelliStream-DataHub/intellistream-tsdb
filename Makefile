@@ -1099,22 +1099,27 @@ $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 # what a stream link costs for peerlink-shaped frames (TCP, or rsocket through a dlopen of librdmacm with --rsocket;
 # tools/rdma-bench.sh, docs/design-rdma.md): no engine, and librdmacm is not linked
 # The MAC candidates (tools/mac_cands.c, docs/design-rdma.md 6) with BLAKE3's reference C (tools/blake3, UPSTREAM): its
-# kernels are built with their own -m flags and picked by its own cpuid dispatch (bench only, never in tsdbd).
+# kernels are built with their own -m flags and picked by its own cpuid dispatch (bench only, never in tsdbd). Their
+# objects go in $(B)/b3/: tools/check-isa.sh reads every $(B)/*.o of make dist, and these are in no shipped file.
 B3_SRC = tools/blake3/blake3.c tools/blake3/blake3_dispatch.c tools/blake3/blake3_portable.c
 ifeq ($(shell uname -m),x86_64)
-B3_OBJ = $(B)/b3_blake3_sse2.o $(B)/b3_blake3_sse41.o $(B)/b3_blake3_avx2.o $(B)/b3_blake3_avx512.o
+B3_OBJ = $(B)/b3/blake3_sse2.o $(B)/b3/blake3_sse41.o $(B)/b3/blake3_avx2.o $(B)/b3/blake3_avx512.o
 B3_DEF =
 else
 B3_OBJ =
 B3_DEF = -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0
 endif
-$(B)/b3_blake3_sse2.o: tools/blake3/blake3_sse2.c tools/blake3/blake3_impl.h | $(B)
+$(B)/b3/blake3_sse2.o: tools/blake3/blake3_sse2.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
 	$(CC) -O3 -msse2 -c -o $@ $<
-$(B)/b3_blake3_sse41.o: tools/blake3/blake3_sse41.c tools/blake3/blake3_impl.h | $(B)
+$(B)/b3/blake3_sse41.o: tools/blake3/blake3_sse41.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
 	$(CC) -O3 -msse4.1 -c -o $@ $<
-$(B)/b3_blake3_avx2.o: tools/blake3/blake3_avx2.c tools/blake3/blake3_impl.h | $(B)
+$(B)/b3/blake3_avx2.o: tools/blake3/blake3_avx2.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
 	$(CC) -O3 -mavx2 -c -o $@ $<
-$(B)/b3_blake3_avx512.o: tools/blake3/blake3_avx512.c tools/blake3/blake3_impl.h | $(B)
+$(B)/b3/blake3_avx512.o: tools/blake3/blake3_avx512.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
 	$(CC) -O3 -mavx512f -mavx512vl -c -o $@ $<
 $(B)/link-bench: tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h $(PLCHECK_HDR) $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) $(B3_DEF) -o $@ $< tools/mac_cands.c $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o -ldl
