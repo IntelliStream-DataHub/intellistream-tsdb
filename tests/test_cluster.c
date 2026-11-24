@@ -13083,20 +13083,37 @@ static void scen_addreplica(void)
 }
 
 
-/* whether server i's v1 still holds the WAL segment of position 1 (the open marker of a young volume) */
-static int has_first_segment(int i)
+/* the lowest (lo) or highest WAL segment number in server i's v1 (UINT64_MAX / 0 when it has none). Position 1 (the
+ * open marker of a young volume) need not be in segment 1: the open as the leader and the reopen as the writer each
+ * start a segment, and a run once found segment 1 gone with position 1 still kept in segment 2 (the learner then
+ * filled from the log, no snapshot). */
+static uint64_t segment_bound(int i, int lo)
 {
     char d[PATH_MAX + 64];
     server_dir(i, d, sizeof d);
-    strcat(d, "/v1/wal_0000000000000001.log");
-    struct stat st;
-    return stat(d, &st) == 0;
+    strcat(d, "/v1");
+    uint64_t b = lo ? UINT64_MAX : 0;
+    DIR *dir = opendir(d);
+    if (!dir)
+        return b;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        uint64_t seq;
+        char tail[2];
+        if (sscanf(e->d_name, "wal_%16" SCNx64 ".lo%1s", &seq, tail) != 2 || strlen(e->d_name) != 24)
+            continue;
+        if (lo ? seq < b : seq > b)
+            b = seq;
+    }
+    closedir(dir);
+    return b;
 }
 
 /* addsnap: a 4th replica added once the leader no longer keeps position 1 fills by a snapshot (r4-xferinst), and a
- * REMOVE proposed while its install waits to close the driver (snapclosedelay) is held back on it until the install is
- * done (rset_apply on rv->snap: "waits: a snapshot ..."; mutant snapsetnodefer applies it between the install's check
- * and its close); it opens the copy under the newest set, joins, and holds the rows of the other two */
+ * REMOVE (of a replica paused out of the ISR first) proposed while its install waits to close the driver
+ * (snapclosedelay) is held back on it until the install is done (rset_apply on rv->snap: "waits: a snapshot ...";
+ * mutant snapsetnodefer applies it between the install's check and its close); it opens the copy under the newest set,
+ * joins, and holds the rows of the other two */
 static void scen_addsnap(void)
 {
     scenario("addsnap");
@@ -13116,13 +13133,21 @@ static void scen_addsnap(void)
     int64_t t = 1000;
     uint64_t rows = set_write(c, id, &t, 5, 1);
     await_isr(0, "plant", 3, 10000, "every replica up");
-    uint64_t t0 = now_ms();
-    while (has_first_segment(L)) { /* every member acknowledged position 1: the leader drops its segment */
+    /* every segment that existed after the first writes (position 1 among them) goes once every member acknowledged
+     * it and it is in parts: the leader's log then starts past 1 */
+    uint64_t t0 = now_ms(), s1 = segment_bound(L, 0);
+    if (!s1)
+        die("the leader has no WAL segment after its first writes");
+    while (segment_bound(L, 1) <= s1) {
         if (now_ms() - t0 > 30000)
-            die("the leader still keeps the segment of position 1 after 30 s");
+            die("the leader still keeps a WAL segment at or below %" PRIu64 " after 30 s", s1);
         rows += set_write(c, id, &t, 1, 0);
         usleep(100000);
     }
+    /* a REMOVE of an ISR member is refused at apply (the ISR shrinks first): Y leaves the ISR before the add, so the
+     * remove proposed inside X's close wait applies at once */
+    pause_server(Y, 1);
+    await_isr(0, "plant", 2, 20000, "the replica to be removed paused");
     char res[512], op[64];
     snprintf(op, sizeof op, "add 1 %" PRIu32, ids[X]);
     set_op(4, op, res, sizeof res);
@@ -13148,6 +13173,8 @@ static void scen_addsnap(void)
     }
     if (!log_count(X, line))
         die("a set change applied on server %d while it installed a snapshot (no line \"%s\")", X, line);
+    pause_server(Y, 0);
+    await_log_count(Y, "this server's replica was removed from the replica set", 1, 20000);
     await_isr(0, "plant", 3, 60000, "the learner that installed a snapshot joins the ISR of the new set");
     rows += set_write(c, id, &t, 2, 0); /* committed by the three */
     if ((uint64_t)rows_of(c, id) != rows)
