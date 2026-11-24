@@ -203,7 +203,7 @@ volume's leader and told the volume's name (`TSDB_VOLUME=plant`). Its answer is 
 <!-- cluster-tutorial-output -->
 ```
 added volume plant: number 1
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -236,7 +236,7 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -257,7 +257,7 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -276,7 +276,7 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -380,9 +380,11 @@ line until the group has confirmed it.
 | `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
 | `replicated lease_ms ...` | The settings of replicated volumes (`init` fixes them; stored, not acted on yet). |
 | `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. |
-| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
+| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P]` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. `preferred P`: the node that should lead it (the first copy in the list); leadership goes back to it once it is in sync again. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
 | `replica volume N node X rid R open_gen G [replaces Y]` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). `replaces Y`: this copy is being built to take the place of node Y's copy (a move); it takes Y's position in the list once Y's copy is removed. |
 | `volumes N users M` | How many volumes and users the group holds (users: always 0 in the preview). |
+| `moves started S done D cancelled C` | On the group's leader: the copy moves it started, ended with the old copy removed, and ended by `--cancel`. They count from that server's start. |
+| `move volume N node A -> node B: STEP, T s` | On the group's leader, one line per move running: its step (`catch-up`, `transfer`, `shrink`, `remove`) and how long it has run. |
 
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or
 more (at most `--voters`). A member that does not vote watches.
@@ -456,6 +458,7 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster node add PEER NEW_PEER --secret-file F` | Add the server at `NEW_PEER` (running with `--cluster`, in no cluster yet). `PEER` is any member; the command follows to the leader. A server that is already a member is added again without harm (the same number). |
 | `tsdb cluster volume add PEER NAME [--replicas N] --secret-file F` | Add a cluster volume called `NAME` on `N` servers (default: the cluster's `--replication`), in different racks where it can. Answers with its number. Refused when fewer than `N` members are up and may hold volumes. A name is never used twice. |
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
+| `tsdb cluster volume move PEER VOLUME --log --from A --to B --secret-file F` | Move volume `VOLUME`'s copy on node `A` to node `B` (up, allowed to hold volumes, no copy of it yet). It answers at once and runs in the background: `B` gets a new copy, fills it and joins the in-sync set; then, if `A` leads the volume, leadership moves first; then `A` leaves the in-sync set and its copy is removed, `B` taking its place in the list. The number of in-sync copies never goes below what it was before `B` joined, so a lagging copy makes the move wait. A new group leader carries a move on. One move per volume at a time. With `--cancel` instead, `B`'s copy is removed and the old set stays (a move already past its last step ends anyway). `status` shows it. |
 | `tsdb cluster user add\|passwd\|drop PEER NAME --secret-file F` | Add a user (`--superuser`, `--password-file F`), change a password, drop a user, for every server at once ([Logins](#logins)). |
 | `tsdb cluster user grant\|revoke PEER NAME SELECTOR RIGHTS --secret-file F` | Give or take rights, as `tsdb DIR user grant` does on one server. |
 | `tsdb cluster user list PEER [NAME] --secret-file F` | The users and their grants. |
@@ -488,7 +491,7 @@ for later.
 | `--repl-retain-s S` | 1800 | And for at most this long. |
 | `--idle-seal-ms MS` | 1000 | An idle leader closes its log segment after this. At least 100. A volume written more slowly than once per this interval gets one small part per write on every copy until merges combine them (a write every 2 s: about 1800 parts an hour), and an idle leader syncs one small log record a second on each copy. Raise it for slow writers. |
 
-The design lists more commands (`node drain` and `out`, `volume move`, `restore`, `adopt` and
+The design lists more commands (`node drain` and `out`, `restore`, `adopt` and
 others). They are not built: `tsdb cluster` prints what exists.
 
 ## What's next
