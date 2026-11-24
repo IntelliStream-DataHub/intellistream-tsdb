@@ -104,6 +104,7 @@ struct repl {
     size_t nact, cact, hact;
     int failed, fail_told;
     const char *fail_reason;
+    char fail_buf[256]; /* a reason with the positions and epochs that made it (failf) */
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -116,6 +117,24 @@ static void fail(struct repl *r, const char *why)
     }
     r->leading = 0;
     r->fstate = F_IDLE;
+}
+
+static uint64_t epoch_at(const struct repl *r, uint64_t pos);
+
+/* fail() with where the logs part: an APPEND that differs below the verified end (never repaired) is told with what the
+ * leader sent and what this log holds there, so that a stop in the field says which of the two is wrong. */
+static void fail_differs(struct repl *r, const struct repl_msg *m, uint64_t pos, uint64_t epoch)
+{
+    if (r->failed)
+        return;
+    snprintf(r->fail_buf, sizeof r->fail_buf,
+             "the log differs from the leader's below the verified end (from %d at epoch %llu: position %llu of epoch "
+             "%llu, here of epoch %llu; written %llu, log start %llu, epochs from %llu at %llu)",
+             m->from, (unsigned long long)m->epoch, (unsigned long long)pos, (unsigned long long)epoch,
+             (unsigned long long)epoch_at(r, pos), (unsigned long long)r->written, (unsigned long long)r->start,
+             (unsigned long long)(r->nhist ? r->hist[0].epoch : 0),
+             (unsigned long long)(r->nhist ? r->hist[0].start : 0));
+    fail(r, r->fail_buf);
 }
 
 static struct repl_action *push(struct repl *r, int type)
@@ -423,9 +442,16 @@ static void on_append(struct repl *r, const struct repl_msg *m)
     /* While following, the log is a prefix of the leader's (verified by QUERY / ANSWER, then grown only from the
      * leader), and a leader never rewrites its epoch's log (one instance per epoch: `led`, rid). So another epoch at
      * a position both logs have is damage or a second instance leading one epoch (a restored directory, a gap of the
-     * design): never silent, never repaired by a cut. The simulator never reaches these two (MUT(30)). */
-    if (!MUT(30) && m->prev_pos && epoch_at(r, m->prev_pos) != m->prev_epoch) {
-        fail(r, "the log differs from the leader's below the verified end");
+     * design): never silent, never repaired by a cut. The simulator never reaches these two (MUT(30)).
+     * Both logs must have the position: below its log start (a snapshot's install, or segments dropped under the
+     * commit floor) this log holds nothing and its epoch history need not reach there (an install keeps the history
+     * from the entry that covers its log start), so another epoch there says nothing: those positions are committed,
+     * in parts here, and a record of them is skipped. A new leader's driver sends a member it has not heard from yet
+     * its log from the start (repld catch_up: its cursor at 0); judged by a history that starts higher, a member
+     * filled by a snapshot stopped for good (jepsen-cluster churn: "the log differs ... below the verified end";
+     * MUT(59) judges them again). */
+    if (!MUT(30) && m->prev_pos && (m->prev_pos >= r->start || MUT(59)) && epoch_at(r, m->prev_pos) != m->prev_epoch) {
+        fail_differs(r, m, m->prev_pos, m->prev_epoch);
         return;
     }
     int wrote = 0;
@@ -433,9 +459,9 @@ static void on_append(struct repl *r, const struct repl_msg *m)
         const struct repl_rec *rec = &m->rec[i];
         if (rec->pos <= r->written) {
             /* One leader per epoch writes each position once: the same epoch here is the same record. */
-            if (epoch_at(r, rec->pos) == rec->epoch)
+            if (epoch_at(r, rec->pos) == rec->epoch || (rec->pos < r->start && !MUT(59)))
                 continue;
-            fail(r, "the log differs from the leader's below the verified end");
+            fail_differs(r, m, rec->pos, rec->epoch);
             return;
         }
         if (rec->pos != r->written + 1 || rec->n == 0)
