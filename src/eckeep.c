@@ -39,6 +39,7 @@
 int eckeep_mutant;
 atomic_bool eckeep_test_pause;
 unsigned eckeep_digest_mb_s = 64;
+atomic_bool eckeep_test_exit_released;
 
 #define DIGEST_PIECE (1u << 20)
 #define RETRY_MIN_MS 1000
@@ -749,6 +750,8 @@ bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now
      * never applied again once its job file went (fail-stop: eng_sync_dir) */
     else if (ecdigest_mutant != ECDIGEST_MUT_RELEASENOSYNC)
         (void)eng_sync_dir(db, "fsync of the directory after a settled_ file's release");
+    if (atomic_load(&eckeep_test_exit_released))
+        exit(0); /* tests: the power fails here (crashfs, at exit) */
     for (size_t i = 0; i < ndone; i++)
         ecdigest_job_remove(db, done[i]);
     return true;

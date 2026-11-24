@@ -30,6 +30,9 @@
  *   pending   a digest that has not run when the handle closes: after the reopen nothing is released before it ran
  *   down      a store DOWN: the digest waits and the file stays; back UP: it matches
  *   orphan    the key dropped before the digest: the file stays, and goes keep_s (an hour) later
+ *   rot       a granule byte of the kept copy flipped, the object intact: rot of the copy (D25), counted lost, the .ec
+ *             served, not DIVERGED; released at its deadline (mutant rotdiverges)
+ *   relpower  a release and a power loss right after it (crashfs): the file stays released (mutant releasenosync)
  *
  * Usage: test_keep [--mutant digestskip|digestraw|digestnohold|keepmtime|noobjcmp|openwait|nolencheck|orphannow|
  * nohaltstop|divergemem|clearcluster] [SCRATCH]. Without TSDB_EC it says it is
@@ -39,6 +42,7 @@
 #include "chunk.h"
 #include "cvol.h"
 #include "eckeep.h"
+#include "ecdigest.h"
 #include "ecpart.h"
 #include "ecswap.h"
 #include "ecdiverge.h"
@@ -53,6 +57,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -621,6 +626,137 @@ static void reopen_hook(void *arg, int phase)
     }
 }
 
+/* rot (D25): one byte of a granule of the kept copy flipped; the object equals its record: the copy fails its own
+ * granule checksum, so it is rot of the copy (logged, counted lost, released at its deadline), the .ec served and the
+ * volume not DIVERGED (mutant rotdiverges). A copy whose rows differ with valid checksums stays DIVERGED (DV_OTHERSRC). */
+static void case_rot(void)
+{
+    fresh("rot");
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    acc a0, a1;
+    CHECK(read_all(&x, &a0) == 0);
+    atomic_store(&eckeep_test_pause, true);
+    settled s;
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
+    part *cp = NULL;
+    CHECK(part_open_as(x.db->dirfd, s.settled, s.settled + 8, false, false, &cp) == 0);
+    if (cp) {
+        granule g;
+        gx_load(cp, cp->ng / 2, GW_LOC, &g);
+        uint64_t off = g.off + g.ts_len + g.val_len / 2;
+        part_unref(cp);
+        char fp[PATH_MAX * 2];
+        snprintf(fp, sizeof fp, "%s/%s", dbdir, s.settled);
+        int fd = open(fp, O_RDWR);
+        uint8_t b = 0;
+        CHECK(fd >= 0 && pread(fd, &b, 1, (off_t)off) == 1);
+        b ^= 0x40;
+        CHECK(pwrite(fd, &b, 1, (off_t)off) == 1 && fsync(fd) == 0);
+        close(fd);
+    }
+    uint64_t lost0 = eckeep_copies_lost(x.db);
+    cap_begin();
+    atomic_store(&eckeep_test_pause, false);
+    int st = eckeep_test_wait(x.db, s.settled, 20000);
+    char *log = cap_end();
+    CHECK(st == ECKEEP_ROT);
+    CHECK(eckeep_copies_lost(x.db) == lost0 + 1);
+    CHECK(log && strstr(log, "fails its checksums (rot)") && strstr(log, s.settled));
+    CHECK(!atomic_load(&x.db->diverged) && tsdb_volume_diverged(x.t, x.v) == 0);
+    CHECK(read_all(&x, &a1) == 0 && a1.n == a0.n && a1.sum == a0.sum); /* the .ec served */
+    while (eng_now_ms(x.db) < s.rec.settle_ms + 1100)
+        sleep_ms(50);
+    graveyard_purge(x.db, false);
+    CHECK(!exists(s.settled)); /* released at its deadline, counted lost */
+    h_close(&x);
+    CHECK(div_records(dbdir) == 0);
+    free(s.rec.sums);
+}
+
+/* relpower: a release is durable before it counts. The child (crashfs) settles, waits for the match and the deadline,
+ * purges (the file released) and loses power at its exit without a close; the open finds the file still gone. Without
+ * the directory fsync after the unlink the file comes back (mutant releasenosync). */
+static char **main_argv;
+
+static void relpower_names(void) /* fresh("relpower")'s names: the parent made the root, which crashfs needs at start */
+{
+    snprintf(dbdir, sizeof dbdir, "%s/rpdb", scratch); /* not a prefix of the stores' paths (CRASHFS_ROOT is one) */
+    for (int i = 0; i < NST; i++)
+        snprintf(stores[i], sizeof stores[i], "%s/relpower.st%d", scratch, i);
+}
+
+static void relpower_child(void)
+{
+    relpower_names();
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    write_day(&x, 20000);
+    settled s;
+    CHECK(settle_one(&x, SRC_SAME, &s) == 0);
+    CHECK(eckeep_test_wait(x.db, s.settled, 20000) == ECKEEP_MATCHED);
+    while (eng_now_ms(x.db) < s.rec.settle_ms + 1100)
+        sleep_ms(50);
+    FILE *f = fopen("relpower.name", "w"); /* outside the crashfs root (the scratch, not the database) */
+    if (f) {
+        fprintf(f, "%s\n", s.settled);
+        fclose(f);
+    }
+    atomic_store(&eckeep_test_exit_released, true); /* the release's purge exits: nothing else syncs the directory */
+    graveyard_purge(x.db, false);
+    CHECK(!"the purge released nothing");
+}
+
+static void case_relpower(void)
+{
+    char shim[PATH_MAX];
+    ssize_t l = readlink("/proc/self/exe", shim, sizeof shim - 32);
+    if (l <= 0)
+        return;
+    shim[l] = 0;
+    char *sl = strrchr(shim, '/');
+    snprintf(sl + 1, sizeof shim - (size_t)(sl + 1 - shim), "libcrashfs.so");
+    if (access(shim, R_OK) != 0) {
+        printf("  relpower: skipped (no %s)\n", shim);
+        return;
+    }
+    char root[PATH_MAX + 32], namef[PATH_MAX + 32];
+    snprintf(root, sizeof root, "%s/rpdb", scratch);
+    snprintf(namef, sizeof namef, "%s/relpower.name", scratch);
+    unlink(namef);
+    fresh("relpower"); /* the stores */
+    relpower_names();
+    rm_rf(dbdir);
+    CHECK(mkdir(dbdir, 0755) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (chdir(scratch) != 0)
+            _exit(4);
+        setenv("TEST_KEEP_RELCHILD", scratch, 1);
+        setenv("LD_PRELOAD", shim, 1);
+        setenv("CRASHFS_ROOT", root, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        execv("/proc/self/exe", main_argv);
+        _exit(5);
+    }
+    int ws = 0;
+    CHECK(pid > 0 && waitpid(pid, &ws, 0) == pid && WIFEXITED(ws) && WEXITSTATUS(ws) == 0);
+    char name[300] = "";
+    FILE *f = fopen(namef, "r");
+    CHECK(f && fscanf(f, "%299s", name) == 1);
+    if (f)
+        fclose(f);
+    CHECK(name[0] && !exists(name)); /* the release survived the power loss (before any open could act) */
+    atomic_store(&eckeep_test_pause, true);
+    h x;
+    CHECK(h_open(&x, 1) == 0);
+    CHECK(!exists(name) && eckeep_status(x.db, name) == TSDB_ERR_NOTFOUND);
+    atomic_store(&eckeep_test_pause, false);
+    h_close(&x);
+    printf("  relpower: a release, power lost at once, open: the file stays released\n");
+}
+
 static void case_reopen(void)
 {
     fresh("reopen");
@@ -783,7 +919,9 @@ static const struct {
                {"orphannow", ECKEEP_MUT_ORPHANNOW},
                {"nohaltstop", ECKEEP_MUT_NOHALTSTOP},
                {"divergemem", 100 + ECDIV_MUT_MEM}, /* src/ecdiverge.h's: 100 + its number */
-               {"clearcluster", 100 + ECDIV_MUT_CLEARCLUSTER}};
+               {"clearcluster", 100 + ECDIV_MUT_CLEARCLUSTER},
+               {"releasenosync", 200 + ECDIGEST_MUT_RELEASENOSYNC}, /* src/ecdigest.h's: 200 + its number */
+               {"rotdiverges", 200 + ECDIGEST_MUT_ROTDIVERGES}};
 #endif
 
 int main(int argc, char **argv)
@@ -806,7 +944,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "unknown mutant %s\n", m);
                 return 2;
             }
-            if (eckeep_mutant >= 100) {
+            if (eckeep_mutant >= 200) {
+                ecdigest_mutant = eckeep_mutant - 200;
+                eckeep_mutant = 0;
+            } else if (eckeep_mutant >= 100) {
                 ecdiverge_mutant = eckeep_mutant - 100;
                 eckeep_mutant = 0;
             }
@@ -814,6 +955,13 @@ int main(int argc, char **argv)
             base = argv[i];
         }
     }
+    if (getenv("TEST_KEEP_RELCHILD")) { /* case_relpower's child, under crashfs */
+        snprintf(scratch, sizeof scratch, "%s", getenv("TEST_KEEP_RELCHILD"));
+        eckeep_digest_mb_s = 0;
+        relpower_child();
+        exit(failures ? 3 : 0); /* exit, not _exit: crashfs's destructor drops what was not synced */
+    }
+    main_argv = argv;
     snprintf(scratch, sizeof scratch, "%s/test_keep.XXXXXX", base);
     if (!mkdtemp(scratch)) {
         perror("mkdtemp");
@@ -830,6 +978,8 @@ int main(int argc, char **argv)
     case_pending();
     case_down();
     case_orphan();
+    case_rot();
+    case_relpower();
     if (failures == 0)
         rm_rf(scratch);
     printf("test_keep: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);

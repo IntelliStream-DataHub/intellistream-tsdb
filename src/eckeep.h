@@ -70,6 +70,8 @@ uint64_t eckeep_test_tries(eng *db);
 bool eckeep_test_stopped(eng *db);
 /* tests: while set the thread starts no digest */
 extern atomic_bool eckeep_test_pause;
+/* tests: the process exits right after a release (its unlink and directory fsync), before anything else is written */
+extern atomic_bool eckeep_test_exit_released;
 /* MB per second the digest reads (the object and the file together), per engine: n tiered volumes read up to n times
  * this; 0: no limit. Set before engines open. */
 extern unsigned eckeep_digest_mb_s;

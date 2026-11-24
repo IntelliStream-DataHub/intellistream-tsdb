@@ -479,7 +479,7 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_ecpart $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster releasenosync rotdiverges" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecdigest $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecdigest --list "digestbytes digestnotomb digestnoretention" -- ./$(B)/test_ecdigest --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(SCRATCH)
