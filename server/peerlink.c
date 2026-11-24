@@ -362,6 +362,9 @@ static void frame_put(struct buf *b, const struct fck *k, uint64_t *seq, uint8_t
                       const void *p, size_t pn)
 {
     uint8_t t[TAG];
+    /* room for the whole frame first: a put that has to make room moves the buffer's data to its start
+     * (buf_reserve), which would leave `at` pointing at other bytes */
+    buf_reserve(b, 4 + 1 + hn + pn + TAG);
     put32(b, (uint32_t)(1 + hn + pn + TAG));
     size_t at = b->len;
     put8(b, type);
