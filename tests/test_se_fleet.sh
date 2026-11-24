@@ -99,9 +99,10 @@ EOF
 fi
 
 # ---- the fake hosts ----
+# nothing of the caller's environment (a build machine's SE_REMOTES, a BGRUN_LOCAL, an SE_HOME of its own) may reach the scripts
+for v in $(compgen -e | grep -E '^(SE_|BGRUN_|RB_|RX_|WATCHDOG_|FAKE_)'); do unset "$v"; done
 export SE_HOME=$scratch/home SE_REMOTE_RUNS=$scratch/rruns SE_REMOTE_GIT=$scratch/rgit SE_RJOB_POLL=1
 export SE_REMOTE_PREFIXES="$scratch:1" FAKE_ROOT=$scratch
-unset SE_REMOTE SE_REMOTES SE_REMOTE_SLOTS SE_REMOTE_OWN SE_QUEUE BGRUN_LOCAL BGRUN_NOWAIT BGRUN_TAG SE_HOST RX_HOST WATCHDOG_ORPHANS
 mkdir -p "$SE_HOME" "$scratch/stub"
 touch "$SE_HOME/BENCH.lock"
 cat > "$scratch/stub/ssh" <<'EOF'
@@ -120,8 +121,12 @@ san=${host//[^A-Za-z0-9]/_}
 hd=$FAKE_ROOT/hosts/$san; mkdir -p "$hd"
 cmd=${cmd//"$SE_REMOTE_RUNS"/$hd/rruns}
 cmd=${cmd//"$SE_REMOTE_GIT"/$hd/rgit}
+# the host's own /var/tmp/t and /var/tmp/j; the scratch dir of this test can itself lie under them (TMPDIR of a job
+# run by bgrun.sh is /var/tmp/t/NAME), so what lies under it is kept out of the rewrite
+cmd=${cmd//"$FAKE_ROOT"/@@FAKE_ROOT@@}
 cmd=${cmd//\/var\/tmp\/t/$hd/t}
 cmd=${cmd//\/var\/tmp\/j/$hd/j}
+cmd=${cmd//@@FAKE_ROOT@@/$FAKE_ROOT}
 printf '%s\t%s\n' "$host" "${cmd:0:100}" >> "$FAKE_ROOT/ssh.log"
 export FAKE_HOST=$host
 cd "$HOME" && exec bash -c "$cmd"
