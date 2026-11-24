@@ -18,13 +18,14 @@ AlmaLinux 10), [design-auth.md](design-auth.md) (the threat model: a backend on 
 1. **The first limit is not the network: it is the frame MAC.** Every data-link frame carries an HMAC-SHA256 tag over
    all of its bytes (`frame_tag`, peerlink.c). On the test servers' Xeons (no SHA extensions) that costs about 4.2 CPU
    seconds per GB on each side and caps **one link at about 1.9 Gbit/s on every transport**: TCP on 40GbE, rsocket
-   and TCP on loopback alike (§3.3). Without the tag the same link moves about 30 Gbit/s over TCP on 40GbE. A
+   and TCP on loopback alike (§3.3). Without the tag the same link moves 30-33 Gbit/s over TCP on 40GbE. A
    replicated large insert, a snapshot or a rebuild therefore runs at about 230 MB/s per peer today, wherever it runs.
    Fixing the MAC (§6, D1) is the first track, helps TCP right away, and is a precondition for RDMA to matter for bulk.
-2. **Native verbs on the FDR InfiniBand** move 50 Gbit/s from 16 KiB messages up, at 0.02-0.06 CPU seconds per GB
-   (event-driven completions, §3.1), and a 1 KiB round trip takes 2.5 µs busy-polling or about 8 µs sleeping on
-   completion events, against about 28 µs over TCP on 40GbE. rsocket (librdmacm's socket emulation) reaches about
-   30 Gbit/s and a 6 µs round trip (§3.2).
+2. **Native verbs on the FDR InfiniBand** move 50 Gbit/s from 16 KiB messages up, at 0.02-0.09 CPU seconds per GB
+   (event-driven completions, §3.1), and a 1 KiB frame and its answer take about 5 µs busy-polling or about 15 µs
+   sleeping on completion events, against about 23 µs over TCP on 40GbE (p50, untagged). rsocket (librdmacm's socket
+   emulation) reaches 44-46 Gbit/s with 16-64 KiB frames but about 30 Gbit/s with 1 MiB ones, and a 6 µs round
+   trip, at TCP's CPU per GB (§3.2). RoCE and iWARP on the 40GbE ports reach its line rate too (§3.5).
 3. **IPoIB is not needed for RDMA if the connection is set up over the TCP link we already have.** rdma_cm and rsocket
    resolve IP addresses, so they need IPoIB on InfiniBand. A queue pair can instead be set up by exchanging its
    numbers (LID or GID, QPN, PSN, MTU) over the authenticated TCP data link, which runs on whatever network the peer
@@ -95,15 +96,96 @@ switch.
 
 ### 3.1 Native verbs (perftest, rdma_cm, InfiniBand FDR)
 
-<!-- results: verbs -->
+Bandwidth in Gbit/s, mean (lowest-highest run), then CPU seconds per GB on the sending and the receiving side.
+`send_bw` and `read_bw` sleep on completion events; `write_bw` busy-polls (perftest has no event mode for it).
+
+| message | SEND (events) | RDMA WRITE (busy poll) | RDMA READ (events) |
+|---|---|---|---|
+| 64 B | 2.74 (2.69-2.81); 6.7 / 6.6 | 2.48 (2.36-2.54); 7.1 / 7.1 | 2.61 (2.57-2.63); 6.9 / 6.9 |
+| 1 KiB | 32.5 (32.0-33.1); 0.44 / 0.43 | 39.4 (37.3-41.5); 0.44 / 0.45 | 37.9 (37.0-38.7); 0.44 / 0.45 |
+| 16 KiB | 49.2 (49.1-49.2); 0.039 / 0.090 | 49.8 (49.8-49.9); 0.18 / 0.18 | 50.1 (50.1-50.2); 0.041 / 0.18 |
+| 64 KiB | 50.1 (50.0-50.3); 0.022 / 0.057 | 50.1 (50.1-50.2); 0.18 / 0.18 | 50.2 (50.1-50.4); 0.022 / 0.18 |
+| 256 KiB | 50.1 (50.0-50.1); 0.018 / 0.031 | 50.3 (50.2-50.3); 0.18 / 0.18 | 50.1 (50.0-50.1); 0.019 / 0.18 |
+| 1 MiB | 50.0 (50.0-50.1); 0.018 / 0.021 | 50.4 (50.4-50.4); 0.22 / 0.22 | 50.3 (50.3-50.4); 0.018 / 0.18 |
+| 4 MiB | failed in every run: `Cannot allocate memory` (8 MB memlock, §2) | failed | failed |
+
+Up to 1 KiB the NIC's message rate is the limit (about 4-5 million messages a second); the CPU there is about 0.45 µs
+per message per side. From 16 KiB on the link is at line rate. The 0.18 s/GB of the busy-polling sides and of READ's
+passive side is one core spinning for the length of the run, not work per byte: a sleeping receiver of SENDs costs
+0.02-0.09.
+
+Latency in µs, typical (p99). perftest reports **one way** for SEND and WRITE (half its ping-pong round trip) and a
+**whole round trip** for READ (a request and its answer). Every run was within 3% of the mean.
+
+| message | SEND, busy poll | SEND, events | WRITE, busy poll | READ, busy poll |
+|---|---|---|---|---|
+| 64 B | 1.22 (1.77) | 5.99 (13.6) | 1.14 (1.23) | 2.03 (2.25) |
+| 1 KiB | 2.53 (3.08) | 7.51 (14.4) | 2.43 (2.57) | 2.55 (2.75) |
+| 16 KiB | 5.91 (6.69) | 11.1 (17.4) | 5.77 (5.98) | 5.86 (6.19) |
+| 64 KiB | 14.0 (14.3) | 19.1 (25.9) | 13.4 (13.6) | 13.4 (13.7) |
+| 256 KiB | 45.3 (45.7) | 53.0 (58.9) | 44.7 (45.1) | 44.8 (45.3) |
+| 1 MiB | 170 (171) | 180 (186) | 170 (172) | 170 (171) |
+
+So a 1 KiB frame and its answer over SEND take about **5 µs busy-polling and about 15 µs sleeping on events**: a
+sleeping side adds about 5 µs per message, which matters below 64 KiB only.
+
+**Without rdma_cm and without IPoIB**: perftest run without `-R` exchanges the queue pair's numbers (LID, QPN, PSN)
+over a TCP connection and addresses the peer by LID. With that TCP connection on the 40GbE Ethernet addresses and the
+data on the InfiniBand port, one run each gave 50.8 Gbit/s at 64 KiB and 2.22 µs (typical, one way; p99 2.67) for a
+1 KiB SEND busy-polling: the same as through rdma_cm. This is the set-up of option D (§5.1).
 
 ### 3.2 rsocket (link-bench --rsocket, InfiniBand)
 
-<!-- results: rsocket -->
+`link-bench --rsocket`: peerlink's frame shape over librdmacm's rsocket API (addresses resolved by rdma_cm on the
+IPoIB addresses; the data is RDMA, never TCP), untagged (the tag is §3.3's subject). Bandwidth in Gbit/s, mean
+(lowest-highest), CPU s/GB sender / receiver; round trip of a frame and an equal answer, p50 (p99) in µs.
+
+| frame | bandwidth | CPU s/GB | round trip |
+|---|---|---|---|
+| 64 B | 0.91 (0.65-1.15) | 4.3 / 4.3 | 3.04 (4.97) |
+| 1 KiB | 26.5 (26.4-26.6) | 0.30 / 0.30 | 5.96 (7.08) |
+| 16 KiB | 43.8 (43.8-43.8) | 0.18 / 0.18 | 15.6 (33.6) |
+| 64 KiB | 46.0 (45.8-46.1) | 0.17 / 0.17 | 34.5 (44.4) |
+| 256 KiB | 31.4 (31.3-31.4) | 0.18 / 0.20 | 117 (156) |
+| 1 MiB | 30.3 (30.1-30.4) | 0.17 / 0.21 | 492 (601) |
+| 4 MiB | 30.6 (28.8-33.8) | 0.18 / 0.21 | |
+
+rsocket is best at 16-64 KiB frames (44-46 Gbit/s) and falls to about 30 Gbit/s for the large ones, which copy
+through its own buffers; 1 MiB buffers (`rsocket-buf1m`, `RDMA_SNDBUF`/`RDMA_RCVBUF`) change nothing (30.6 at 1 MiB).
+Its CPU per GB is the same as TCP's (§3.3), because it copies every byte on both sides, and its round trip at 1 KiB
+(6 µs) is that of busy-polled verbs, because it polls before it sleeps. With the tag every size falls to 1.8-1.9
+Gbit/s, as on TCP.
 
 ### 3.3 TCP, and what the frame MAC costs
 
-<!-- results: tcp -->
+`link-bench` over TCP on the 40GbE ports (ConnectX-3 port 2, the same pair as §3.1), with and without peerlink's
+tag (`HMAC-SHA256` over every frame, sender and receiver). Gbit/s mean (lowest-highest), CPU s/GB sender / receiver.
+
+| frame | untagged | CPU s/GB | tagged (today's peerlink) | CPU s/GB |
+|---|---|---|---|---|
+| 64 B | 0.70 (0.70-0.70) | 6.5 / 11.4 | 0.30 (0.28-0.32) | 25 / 27 |
+| 1 KiB | 7.97 (7.11-8.44) | 0.65 / 1.01 | 1.26 (1.14-1.38) | 6.1 / 6.1 |
+| 16 KiB | 28.7 (21.3-32.8) | 0.18 / 0.27 | 1.81 (1.76-1.88) | 4.2 / 4.3 |
+| 64 KiB | 32.8 (32.6-33.0) | 0.14 / 0.17 | 1.83 (1.82-1.83) | 4.1 / 4.3 |
+| 256 KiB | 32.1 (31.9-32.5) | 0.12 / 0.15 | 1.86 (1.83-1.92) | 4.1 / 4.3 |
+| 1 MiB | 30.5 (29.8-31.1) | 0.13 / 0.16 | 1.90 (1.89-1.92) | 4.2 / 4.2 |
+| 4 MiB | 30.1 (29.9-30.2) | 0.15 / 0.16 | 1.89 (1.89-1.90) | 4.2 / 4.2 |
+
+Round trip, p50 (p99) in µs:
+
+| frame | untagged | tagged |
+|---|---|---|
+| 64 B | 23.5 (33.8) | 24.9 (33.1) |
+| 1 KiB | 22.5 (34.1) | 48.9 (116) |
+| 16 KiB | 43.8 (91.9) | 362 (1,020) |
+| 64 KiB | 108 (346) | 1,460 (1,880) |
+| 1 MiB | 1,100 (1,460) | 17,800 (18,700) |
+
+The tag is the limit, not the network: on loopback (no NIC at all) the same link moves 41.8 Gbit/s untagged at 1 MiB
+and 1.81 tagged; over rsocket (§3.2) 1.83; over TCP on the Chelsio pair (E5-2697 v4) 37.3 untagged and 1.80 tagged.
+4.2 CPU seconds per GB is about 240 MB/s per core: tsdb's own portable SHA-256 (`client/tsdb_crypto.c`), one pass
+per side. OpenSSL's assembly SHA-256 (through Python's `hashlib` on one of these servers) does 479 MB/s, so even the
+best SHA-256 here would leave a link near 3.8 Gbit/s; BLAKE2b there does 926 MB/s (§6). At 1 KiB the four MACs of a round trip (sign and check, each way) add about 26 µs, more than the network.
 
 ### 3.4 Not measured
 
@@ -114,7 +196,32 @@ switch.
 
 ### 3.5 RoCE (ConnectX-3 port 2, 40GbE) and iWARP (Chelsio T5, 40GbE)
 
-<!-- results: roce iwarp -->
+Both on 40GbE (about 37 Gbit/s of payload), perftest through rdma_cm. RoCE: ConnectX-3 port 2, the Gold 6148 pair of
+§3.1. iWARP: the Chelsio T5 pair (E5-2697 v4), back to back. Gbit/s mean (lowest-highest); latency typical one way
+(SEND, WRITE) or round trip (READ) in µs, as in §3.1.
+
+| | RoCE | iWARP |
+|---|---|---|
+| SEND 64 KiB / 1 MiB (events) | 36.6 / 36.6 (36.6-36.6) | 37.2 / 37.3 (37.2-37.3) |
+| CPU s/GB, SEND 1 MiB, sender / receiver | 0.018 / 0.022 | 0.017 / 0.023 |
+| WRITE 1 KiB (busy poll) | 35.4 (35.2-35.6) | 26.9 (26.9-26.9) |
+| SEND 1 KiB (events) | 29.6 (29.5-29.7) | 32.4 in 1 run; 2 of 3 runs failed |
+| SEND one way 64 B / 1 KiB, busy poll | 1.54 / 3.01 | 3.50 / 4.50 |
+| SEND one way 1 KiB, events | 8.0 (p99 14.8) | not trusted (below) |
+| WRITE one way 64 B, busy poll | 1.54 | 3.18 |
+| READ round trip 1 KiB | 3.41 | 6.21 |
+| rsocket 64 KiB / 1 MiB | 36.2 / 31.1 | 20.7 / 25.5 |
+| rsocket round trip 1 KiB, p50 (p99) | 6.15 (6.67) | 15.1 (18.6) |
+| TCP on the same port, 1 MiB untagged | 30.5 (§3.3) | 37.3 (37.2-37.3) |
+
+Both reach the 40GbE line rate from 64 KiB at the same CPU per GB as InfiniBand. RoCE's latency is about 20-30%
+above InfiniBand's; iWARP's is twice to three times it (TCP offload in the NIC). **iWARP failed runs**: two of three
+1 KiB SEND bandwidth runs and every 64 KiB SEND latency run in event mode ended with a completion error (status 5, a
+flushed work request: the queue pair had gone to the error state). iWARP has no receiver-not-ready retry, so a SEND
+that finds no posted receive ends the connection at once: a transport over iWARP must never send without a credit
+(§4 has credits for every transport). perftest's event-mode SEND latency on iWARP (1.64 µs, below its own busy-poll
+4.50) comes from the two runs that did not fail and is not believed. RoCE without lossless Ethernet (PFC) is fine
+back to back but can lose throughput to retransmissions on a busy switch; RoCE v1 (all a plain ConnectX-3 does; the GID type says which) is not routed across IP subnets.
 
 ## 4. What RDMA would give each kind, and at what cost
 
@@ -124,9 +231,9 @@ whatever the transport):
 | kind | gain | cost and care |
 |---|---|---|
 | 0 META | none worth having (a few frames a second) | **stays TCP** (D3): the failure detector and Raft must not depend on the new code or on the fabric's health. A volume whose RDMA path fails falls back to TCP; the metadata group never notices |
-| 1 LOG | a 1 KiB round trip of about 8 µs (events) instead of 28 µs, and a third of the CPU per frame; zstd stays (it saves bytes on the wire and in the receiver's WAL alike) | the commit path also holds the replica's `fdatasync` (0.7 ms on NVMe), so the saving is a few % of a replicated insert's latency (target p50 ≤ 0.9 ms). Worth it, not decisive |
-| 2 BULK, 5 SNAP, 7 CHUNKB | line rate (50 Gbit/s) at 0.02-0.06 CPU s/GB against 0.14-0.17 for TCP: the CPU left for merges and queries during a rebuild | registered buffers on both sides (pread into a registered slot, SEND, the receiver writes the slot to the file); the token buckets count what is posted, unchanged |
-| 3 FWD | one hop of about 8 µs instead of 28 µs on every forwarded request | WRITTEN must mean "posted" (D5), so fwd's NEVER_WRITTEN stays definite |
+| 1 LOG | a 1 KiB round trip of about 15 µs (events; 5 µs busy-polling) instead of about 23 µs, and a third of the CPU per frame; zstd stays (it saves bytes on the wire and in the receiver's WAL alike) | the commit path also holds the replica's `fdatasync` (0.7 ms on NVMe), so the saving is a few % of a replicated insert's latency (target p50 ≤ 0.9 ms). Worth it, not decisive |
+| 2 BULK, 5 SNAP, 7 CHUNKB | line rate (50 Gbit/s) at 0.02-0.09 CPU s/GB against 0.12-0.17 for TCP: the CPU left for merges and queries during a rebuild | registered buffers on both sides (pread into a registered slot, SEND, the receiver writes the slot to the file); the token buckets count what is posted, unchanged |
+| 3 FWD | one hop of about 15 µs (events) instead of about 23 µs on every forwarded request | WRITTEN must mean "posted" (D5), so fwd's NEVER_WRITTEN stays definite |
 | 4 FWDQ | streamed replies at line rate; CREDIT maps directly onto RDMA credits | the reply's credits and the link's credits are separate layers; keep them separate |
 | 6 CHUNK | a 1 MiB cell in about 0.2 ms of wire time instead of about 0.3 ms over TCP on 40GbE; k cells of a cold read in parallel | RDMA READ straight from the store's page cache would need registered file memory (ODP: not on ConnectX-3): SEND/RECV with a copy is the design; READ is later work (§10) |
 
@@ -145,7 +252,7 @@ PING, PONG and CREDIT so that a paused link is never counted dead (peerlink.h's 
 
 **Completions in the event loop.** The link thread keeps its `poll()`: the completion channel's fd joins the socket
 and the eventfd (`ibv_req_notify_cq`, then `ibv_get_cq_event` and drain the CQ when it is readable). Sleeping on
-events costs about 5 µs per message against busy polling (§3.1: 6-8 µs against 1.2-2.5 µs for 64 B-1 KiB); a short
+events costs about 5 µs per message against busy polling (§3.1, one way: 6.0-7.5 µs against 1.2-2.5 µs for 64 B-1 KiB); a short
 busy poll before sleeping (`rdma.poll_us`, default 0, rsocket's `polling_time`) buys it back on the LOG link when CPUs
 are free.
 
@@ -176,7 +283,7 @@ transports.
 | | what | IPoIB needed | code | for tsdb |
 |---|---|---|---|---|
 | A. IPoIB only | the peer address names the IPoIB interface; nothing changes in tsdb | yes | none | **ruled out**: the owner allows no TCP over IPoIB. It would also gain nothing: the MAC cap first, then TCP over IPoIB (datagram, MTU 2044) is slower and costlier than TCP on 40GbE, no latency gain, and servers without IPoIB cannot take part |
-| B. rsocket under plink | `rsocket`/`rpoll` calls instead of the socket calls in peerlink.c (or LD_PRELOAD) | yes (rdma_cm resolves IP addresses) | small | 30 Gbit/s, 6 µs; but rsocket's own threads, buffers and keepalive sit under peerlink's, fork is unsafe, fallback to TCP is silent under preload, and the library sees little upkeep. Hides what §4 needs to control |
+| B. rsocket under plink | `rsocket`/`rpoll` calls instead of the socket calls in peerlink.c (or LD_PRELOAD) | yes (rdma_cm resolves IP addresses) | small | 30-46 Gbit/s, 6 µs, TCP's CPU per GB; but rsocket's own threads, buffers and keepalive sit under peerlink's, fork is unsafe, fallback to TCP is silent under preload, and the library sees little upkeep. Hides what §4 needs to control |
 | C. verbs under peerlink, connected by rdma_cm | RC QPs through rdma_cm on the RDMA address | yes on IB (not on RoCE/iWARP: they have Ethernet IPs) | medium | the full gain; the only way for iWARP |
 | D. verbs under peerlink, upgraded from the TCP link | the TCP data link authenticates as today, then both sides exchange QP numbers in MAC'd frames and move the link's frames to the QP | **no** (the TCP link runs on any network; the QP is addressed by LID/GID) | medium (C plus the exchange) | the full gain, on every server with an IB port; the TCP link is the anchor and the fallback; firewall policy keeps working, because no RDMA link exists without its TCP link |
 | E. RoCE on the 40GbE ports | C or D on port 2 of the ConnectX-3 | no | same code as C/D | needs a lossless or ECN-configured Ethernet to behave under load; the switch configuration is the cost |
@@ -204,7 +311,8 @@ and iWARP; only the connection step differs.
 
 `on_link(up)` runs once the link's transport is settled (after step 4 or the fallback), so a driver never sees the
 change of transport. On InfiniBand without IPoIB the QP's address comes from the LID (and the SM's path) exchanged in
-step 2; on RoCE it is the GID that carries the Ethernet IP; iWARP cannot do this and uses C: step 2 then names an
+step 2 (measured, §3.1: numbers exchanged over TCP on the Ethernet addresses, data on the IB port by LID, 50.8 Gbit/s
+and 2.22 µs, the same as through rdma_cm); on RoCE it is the GID that carries the Ethernet IP; iWARP cannot do this and uses C: step 2 then names an
 rdma_cm address and port, and the dialer connects there with the nonce in the connection's private data.
 
 ### 5.2 Discovery and configuration
@@ -258,8 +366,9 @@ TCP handshake issued.
 ## 6. The frame MAC (D1)
 
 §3.3 shows that `frame_tag` limits every link to about 230 MB/s and costs about 4 CPU s/GB per side on these servers;
-OpenSSL's SHA-256 on the same CPU is about 480 MB/s (Python's hashlib, single core): a faster SHA-256 does not lift the
-cap enough. Options, to be measured with `link-bench --mac` in the first track:
+OpenSSL's SHA-256 on the same CPU is about 480 MB/s and BLAKE2b about 930 MB/s (Python's hashlib, single core, one
+run each): a faster SHA-256 does not lift the cap enough. The servers have no `openssl` command, so AES-GMAC and BLAKE3
+are not measured here yet. Options, to be measured with `link-bench --mac` in the first track:
 
 | MAC | speed on these CPUs | notes |
 |---|---|---|
