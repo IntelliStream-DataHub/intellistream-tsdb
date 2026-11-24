@@ -361,7 +361,6 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
         plink_send(l, RW_T_MSG, b, n, 0);
 }
 
-static void vol_fail(struct rvol *rv, const char *why);
 static void cvol_close(uint32_t v);
 
 /* slowack (tests): the ACK reports the highest durable end an ACK of SLOW_ACK_MS ago had, never more than it has now
@@ -1187,7 +1186,7 @@ static void on_link(void *arg, struct plink *l, int up)
 
 /* ------------------------------------------------------------------ actions */
 
-static void vol_fail(struct rvol *rv, const char *why)
+void vol_fail(struct rvol *rv, const char *why)
 {
     if (rv->failed)
         return;
@@ -1271,6 +1270,15 @@ static void log_start_check(struct rvol *rv)
 
 static int isr_short_locked(const struct rvol *rv);
 
+
+/* TSDB_REPLD_TEST=keepall is lifted while <dir>/keepoff exists (test_cluster addswitch: a log start pinned at 1 also
+ * pins the class switches' replay floor, so the scenario lifts it once its learner's own ack holds the log) */
+static int keep_off(void)
+{
+    char f[sizeof G.dir + 16];
+    snprintf(f, sizeof f, "%s/keepoff", G.dir);
+    return access(f, F_OK) == 0;
+}
 static void exec(struct rvol *rv, struct repl_action *a)
 {
     struct eng *db = NULL;
@@ -1380,10 +1388,13 @@ static void exec(struct rvol *rv, struct repl_action *a)
             for (int i = 0; i < (int)rv->rec.nrep; i++)
                 if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
+            if (G.keep_all && !keep_off()) /* until r4-xferinst: a learner added or reset later must find position 1 */
+                keep = 0;
             /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
              * tells that peer to install a snapshot once the log start passed what it needs */
-            uint64_t capb = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
-            uint64_t capms = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
+            bool nocap = G.mutant == RM_NOCAP || G.keep_all; /* keepall: a learner's position 1 outlives the caps */
+            uint64_t capb = nocap ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
+            uint64_t capms = nocap ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
             uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);
@@ -1519,7 +1530,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
     tsdb_cvol_unref(&db);
 }
 
-static void drain(struct rvol *rv)
+void drain(struct rvol *rv)
 {
     struct repl_action a;
     while (!rv->failed && rv->core && repl_next_action(rv->core, &a)) {
@@ -1611,6 +1622,7 @@ static void handle(struct rvol *rv, struct item *it)
         return;
     }
     if (it->kind == IN_META) {
+        rset_apply(rv); /* a set change first: the META below is in the core's set version (src/repl.h) */
         struct repl_msg m = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
         m.meta = vmeta_of(rv);
         m.epoch = m.meta.epoch;
@@ -2003,6 +2015,10 @@ static void *vol_main(void *arg)
             drain(rv);
             rsnap_tick(rv);
             rtr_tick(rv);
+            if (rset_apply(rv) == 2) { /* a set change kept back at its META was applied now: the core gets the record */
+                struct item mi = {.kind = IN_META};
+                handle(rv, &mi);
+            }
             if (G.late_tick && rv->mode == M_WRITER) {
                 pthread_mutex_unlock(&rv->mu);
                 struct timespec lt = {0, LATE_TICK_MS * 1000000L};
@@ -2168,6 +2184,11 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                : !strcmp(mu, "demotestaleidx") ? RM_DEMOTESTALEIDX
                : !strcmp(mu, "divergeisr")     ? RM_DIVERGEISR
+               : !strcmp(mu, "setkeepold")     ? RM_SETKEEPOLD
+               : !strcmp(mu, "setnoversion")   ? RM_SETNOVERSION
+               : !strcmp(mu, "setdrvnoremap")  ? RM_SETDRVNOREMAP
+               : !strcmp(mu, "setnextstale")   ? RM_SETNEXTSTALE
+               : !strcmp(mu, "setoldofnode")   ? RM_SETOLDOFNODE
                : !strcmp(mu, "snapnoverify")   ? RM_SNAPNOVERIFY
                : !strcmp(mu, "snapsamelink")   ? RM_SNAPSAMELINK
                : !strcmp(mu, "snapnospacecheck") ? RM_SNAPNOSPACECHECK
@@ -2181,6 +2202,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnosrcdown")  ? RM_SNAPNOSRCDOWN
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
                : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
+               : !strcmp(mu, "snapsetnodefer") ? RM_SNAPSETNODEFER
                : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
                : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
                                                : RM_NONE;
@@ -2193,6 +2215,9 @@ void repld_init(tsdb *t, const char *dir)
     G.open_slow = te && strstr(te, "openslow");
     G.skip_pos = te && strstr(te, "skippos");
     G.stale_sent = te && strstr(te, "stalesent");
+    G.set_stale = te && strstr(te, "setstale");
+    G.keep_all = te && strstr(te, "keepall");
+    G.set_drain_wait = te && strstr(te, "setdrainwait");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
     G.late_bytes = te && strstr(te, "latebytes");
@@ -2298,6 +2323,7 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
     pthread_mutex_lock(&rv->mu);
     uint32_t lag = rv->rec.isr_lag_ms ? rv->rec.isr_lag_ms : 1000;
     uint32_t rmin = rv->rec.min_isr, unans = rv->rec.unanswered_ms;
+    uint64_t setv = rv->rec.set_version; /* the core's indexes are rv->rec's (rset.c changes both in one step) */
     pthread_mutex_unlock(&rv->mu);
     int min_isr = rmin && G.mutant != RM_NOMINISR ? (int)rmin : 1; /* planted nominisr: never checked */
     struct repl_config cfg = {.self = rv->self, .nnodes = rv->nnodes, .min_isr = min_isr,
@@ -2310,6 +2336,8 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
                                   G.mutant == RM_KEEPUNANSWERED ? 0 : (unans + TICK_MS - 1) / TICK_MS,
                               .rec_find = idx_find, .ctx = rv};
     *core_out = repl_open(&cfg, &d);
+    if (*core_out)
+        repl_set_version(*core_out, setv);
     rv->sync_pause_end = now_ms() + SYNC_PAUSE_MS;
     if (!*core_out) {
         say("volume %" PRIu32 ": the replication core refused the state of %s", rv->number, rv->dir);
@@ -2421,13 +2449,8 @@ void repld_update(const struct cluster_vol_rec *r)
     links_up(r);
     pthread_mutex_lock(&rv->mu);
     int changed = r->epoch != rv->rec.epoch || r->isr_version != rv->rec.isr_version || r->leader != rv->rec.leader;
-    int same = r->nrep == rv->rec.nrep;
-    for (uint32_t i = 0; same && i < r->nrep; i++)
-        same = r->rep[i].node == rv->rec.rep[i].node; /* a rid is filled in at its first open */
-    if (same)
-        rec_set(rv, r); /* the replica set is fixed for a volume's driver (a move: r3e and later) */
-    else
-        rset_change(rv, r);
+    if (rset_change(rv, r)) /* another set version: kept for the volume's thread (rset.c) */
+        changed = 1;
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);

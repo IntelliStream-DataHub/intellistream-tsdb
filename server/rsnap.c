@@ -1112,6 +1112,13 @@ static void w_drop(struct rjob *j)
     job_free(j);
 }
 
+/* rv->snap while an install runs: rset_apply holds a set change back from the check below until the install has closed
+ * the driver (whose next open takes the newest record) or given up, so the check and the copy see one set */
+struct rsnap {
+    const char *what;
+};
+static struct rsnap rs_installing = {"install"};
+
 /* A complete copy (the worker, no lock held): refused when stale, else installed (snapinst.c). v<N>.snap stays made
  * (removed by w_drop) unless the install took it or left a SNAPDONE for snap_leftovers to finish. */
 static void install(struct rjob *j)
@@ -1141,9 +1148,20 @@ static void install(struct rjob *j)
         pthread_mutex_unlock(&S.mu);
         return;
     }
+    if (drv && G.mutant != RM_SNAPSETNODEFER) {
+        pthread_mutex_lock(&rv->mu);
+        rv->snap = &rs_installing;
+        pthread_mutex_unlock(&rv->mu);
+    }
     crash_point(CP_SNAP_RECEIVED);
     struct snapinst_result res;
     int rc = snapinst_install(G.dir, j->vol, j->dir, m->p, m->p_epoch, &res);
+    if (drv && vol_find(j->vol) == rv) { /* not taken, or refused with the driver still running: the change goes on */
+        pthread_mutex_lock(&rv->mu);
+        if (rv->snap == &rs_installing)
+            rv->snap = NULL;
+        pthread_mutex_unlock(&rv->mu);
+    }
     uint64_t took = ms_now() - t0;
     char done[sizeof j->dir + 16];
     snprintf(done, sizeof done, "%s/" SNAP_DONE, j->dir);

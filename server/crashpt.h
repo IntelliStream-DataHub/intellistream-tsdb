@@ -40,7 +40,8 @@
     X(CP_COLD_MID_INTENT, "cold-mid-intent")           /* its intent durable, the .ec renames done, Y and R not */ \
     X(CP_COLD_AFTER_MARKER, "cold-after-marker")       /* a leader's settle: MK_COLD committed, the swap not run (r8g) */ \
     X(CP_SNAP_RECEIVED, "snap-received")               /* a replica: every file of a snapshot in, not installed (placed) */ \
-    X(CP_SNAP_SWAPPED, "snap-swapped")                 /* a replica's install: the swap's root fsync done (placed) */
+    X(CP_SNAP_SWAPPED, "snap-swapped")                 /* a replica's install: the swap's root fsync done (placed) */ \
+    X(CP_SET_REMOVED, "set-removed")                   /* a removed replica's v<N> renamed .removed-, root synced (R4) */
 
 enum crash_point_id {
 #define X(id, name) id,
