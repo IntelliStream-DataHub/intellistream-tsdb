@@ -1,10 +1,11 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# se-rjob.sh CMD...: the detached half of bgrun.sh on the build machine (env RJ_N RJ_D RJ_CWD RJ_ROOTS RJ_NOWAIT; see
+# se-rjob.sh CMD...: the detached half of bgrun.sh on the build machine (env RJ_N RJ_D RJ_HOST RJ_CWD RJ_ROOTS RJ_NOWAIT; see
 # se-remote.sh). Copies the trees there, starts the job detached THERE (it survives a lost connection), copies its
 # output to $RJ_D/out as it grows, waits for its exit code, brings back what it wrote, writes $RJ_D/rc. Not called by hand.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"
 . "$SE_BIN/se-remote.sh"
+[ -z "$RJ_HOST" ] || se_use_host "$RJ_HOST" || exit 2   # the host bgrun.sh picked (recorded in $RJ_D/host); none: SE_REMOTE
 exec >> "$RJ_D/worker.log" 2>&1
 RR=$SE_REMOTE_RUNS/$RJ_N
 pg=
@@ -18,7 +19,7 @@ stop() {
 }
 trap stop TERM INT HUP
 
-echo "$(date +%T) push: $RJ_ROOTS"
+echo "$(date +%T) push to $SE_REMOTE: $RJ_ROOTS"
 rs_push $RJ_ROOTS || { note "bgrun: copying the trees to the build machine failed (see $RJ_D/worker.log)"; fin 98; }
 
 q=$(printf '%q ' "$@")
@@ -34,7 +35,7 @@ while [ -z \"\$rc\" ]; do
     if flock -n 8; then echo \"== build machine slot \$i, \$(date +%T)\" >> $RR/out; bash $RR/cmd.sh 8>&- >> $RR/out 2>&1; rc=\$?; break; fi
     exec 8>&-
   done
-  [ -n \"\$rc\" ] || sleep 15
+  [ -n \"\$rc\" ] || sleep $SE_RJOB_POLL
 done"
 fi
 job="cd $(printf '%q' "$RJ_CWD") || { echo \"bgrun: $RJ_CWD is missing on the build machine\" >> $RR/out; echo 97 > $RR/rc; exit; }
@@ -49,7 +50,7 @@ echo "$pg" > "$RJ_D/rpgid"; echo "$(date +%T) started there, pgid $pg"
 
 fails=0; rc=
 while [ -z "$rc" ]; do
-  sleep 15
+  sleep $SE_RJOB_POLL
   r=$(rssh "if [ -f $RR/rc ]; then cat $RR/rc; elif kill -0 $pg 2>/dev/null; then echo RUN; else sleep 3; cat $RR/rc 2>/dev/null || echo GONE; fi") || {
     fails=$((fails + 1)); [ $fails -lt 480 ] && continue
     note "bgrun: lost the build machine for 2 hours; the job may still run there (pgid $pg)"; fin 95; }
@@ -64,7 +65,7 @@ done
 pull_out
 tmpd=; [ -n "$envs" ] && tmpd=/var/tmp/t/$RJ_N
 rs_back "$RR/start" $RJ_ROOTS $tmpd
-note "== ran on the build machine (SE_REMOTE). Files it wrote came back here; its build dirs (build*/, target/) and binaries"
-note "== stay there. To read them: $SE_BIN/rx.sh CMD (runs CMD there in the job's directory), e.g. rx.sh ls build-fuzz/out"
+note "== ran on the build machine ($SE_REMOTE). Files it wrote came back here; its build dirs (build*/, target/) and binaries"
+note "== stay there. To read them: $SE_BIN/rx.sh -j $RJ_N CMD (runs CMD there in the job's directory), e.g. rx.sh ls build-fuzz/out"
 echo "$(date +%T) done rc=$rc"
 fin "$rc"
