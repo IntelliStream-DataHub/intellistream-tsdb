@@ -2203,6 +2203,11 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
                : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
                : !strcmp(mu, "snapsetnodefer") ? RM_SNAPSETNODEFER
+               : !strcmp(mu, "snapdropafter")  ? RM_SNAPDROPAFTER
+               : !strcmp(mu, "snapnoendafter") ? RM_SNAPNOENDAFTER
+               : !strcmp(mu, "snapnofence")    ? RM_SNAPNOFENCE
+               : !strcmp(mu, "snapdivlogend")  ? RM_SNAPDIVLOGEND
+               : !strcmp(mu, "snapnoleftovers") ? RM_SNAPNOLEFTOVERS
                : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
                : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
                                                : RM_NONE;
@@ -2624,6 +2629,13 @@ static void cvol_close(uint32_t v)
 
 int repld_close(uint32_t v)
 {
+    return repld_close_end(v, NULL);
+}
+
+int repld_close_end(uint32_t v, uint64_t *log_end)
+{
+    if (log_end)
+        *log_end = REPLD_END_UNKNOWN;
     pthread_mutex_lock(&G.mu);
     struct rvol *rv = NULL;
     for (uint32_t i = 0; i < G.nvols && !rv; i++)
@@ -2650,6 +2662,12 @@ int repld_close(uint32_t v)
         if (rv->rec_short)
             __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
         rv->rec_short = 0;
+        /* the driver is joined: nothing appends from here on, so this end is the one an install must stay above (a
+         * DIVERGED replica's log is what a rebuild replaces: 0, as in rsnap.c's check before the close) */
+        if (log_end && rv->failed && rv->div_rebuild && G.mutant != RM_SNAPDIVLOGEND)
+            *log_end = 0;
+        else if (log_end && rv->core)
+            *log_end = repl_durable_end(rv->core);
         pthread_mutex_unlock(&rv->mu);
         say("volume %" PRIu32 ": driver stopped (the replica is closed)", v);
     }

@@ -212,7 +212,12 @@ enum {
     RM_SNAPINSTALLSTALE, /* rsnap.c: a snapshot with P at or below the receiver's log end is installed */
     RM_SNAPSTALEKEEP,    /* snapinst.c: the old REPL is read before the driver stopped (D6) */
     RM_SNAPKEEPDIVERGED, /* snapinst.c: the old directory's DIVERGED is carried into the installed one */
-    RM_SNAPSETNODEFER    /* rsnap.c: an install does not set rv->snap: a set change applies between its check and close */
+    RM_SNAPSETNODEFER,   /* rsnap.c: an install does not set rv->snap: a set change applies between its check and close */
+    RM_SNAPDROPAFTER,    /* snapinst_run.c: a copy not installed is left for w_drop, after the volume went back (F1) */
+    RM_SNAPNOENDAFTER,   /* snapinst_run.c: P is not compared with the log end the closed driver left */
+    RM_SNAPNOFENCE,      /* rsnap.c, snapinst_run.c: a copy of an epoch below the receiver's fence is installed */
+    RM_SNAPDIVLOGEND,    /* rsnap.c, repld.c: a DIVERGED rebuild compares P with the log end it replaces */
+    RM_SNAPNOLEFTOVERS   /* snapinst.c: what an install left at a crash is not finished or undone at prepare */
 };
 
 struct repld_g {

@@ -148,7 +148,7 @@ static struct {
     uint32_t nvs;
     struct rsnap_stats st;
     /* test hooks (TSDB_REPLD_TEST) */
-    int hold, promoting_hook, flip, flipped, nodone, stalereq, stalesent, srcstall, srcstalled, fakesrc;
+    int hold, promoting_hook, flip, flipped, nodone, stalereq, stalesent, srcstall, srcstalled, fakesrc, blind;
     uint64_t free_hook, slowmake_ms;
     /* timers; the hooks shorten them */
     uint64_t stall_ms, down_ms, waitdone_ms;
@@ -169,6 +169,7 @@ static void hooks_read(void)
     S.stalereq = strstr(te, "snapstalereq") != NULL; /* the first request names set version + 1 */
     S.srcstall = strstr(te, "snapsrcstall") != NULL; /* the first source ignores GO (it stalls, still the leader) */
     S.fakesrc = strstr(te, "snapfakesrc") != NULL;   /* <dir>/snapfakesrc stands for one source job running */
+    S.blind = strstr(te, "snapblind") != NULL;       /* <dir>/snapblind hides the log end from the install's check */
     if (strstr(te, "snapcutdone")) /* the DONE of the second data file is lost to a cut connection */
         __atomic_store_n(&peerlink_test_cut_end, 3, __ATOMIC_RELAXED);
     const char *f = strstr(te, "snapfree=");
@@ -1124,21 +1125,34 @@ static struct rsnap rs_installing = {"install"};
 static void install(struct rjob *j)
 {
     uint64_t log_end = 0, fence = 0, t0 = ms_now();
-    int drv = 0;
+    int drv = 0, stale = 0;
+    const struct snap_man *m = &j->man;
+    /* TSDB_REPLD_TEST=snapblind with <dir>/snapblind (test_cluster snapcatch): this check does not see the log end, as
+     * when the log passes P between it and the close: the check after the close (snapinst_run.c) must refuse */
+    char bp[sizeof G.dir + 32];
+    snprintf(bp, sizeof bp, "%s/snapblind", G.dir);
+    int blind = S.blind && access(bp, F_OK) == 0;
     struct rvol *rv = vol_find(j->vol);
-    if (rv) { /* the driver's view; the fence is checked again from REPL once the driver is stopped (snapinst.c) */
+    if (rv) { /* the driver's view; both are checked again once the driver is stopped (snapinst_run.c) */
         pthread_mutex_lock(&rv->mu);
         if (rv->core && !rv->stop) {
             drv = 1;
             /* a DIVERGED replica's log is what the copy replaces: any P rebuilds it (out of the ISR since it failed,
              * so no commit counts on the positions above P it held) */
-            log_end = rv->failed && rv->div_rebuild ? 0 : repl_durable_end(rv->core);
+            log_end = rv->failed && rv->div_rebuild && G.mutant != RM_SNAPDIVLOGEND ? 0 : repl_durable_end(rv->core);
+            if (blind)
+                log_end = 0;
             fence = rv->st.fence;
+            stale = (m->p <= log_end && G.mutant != RM_SNAPINSTALLSTALE) ||
+                    (fence > m->p_epoch && G.mutant != RM_SNAPNOFENCE);
+            if (!stale && G.mutant != RM_SNAPSETNODEFER)
+                rv->snap = &rs_installing; /* in the hold of the check (review F3): no set change between the two */
         }
         pthread_mutex_unlock(&rv->mu);
     }
-    const struct snap_man *m = &j->man;
-    if (drv && ((m->p <= log_end && G.mutant != RM_SNAPINSTALLSTALE) || fence > m->p_epoch)) {
+    if (blind)
+        say("TEST: volume %" PRIu32 ": the check before the close does not see the log end (snapblind)", j->vol);
+    if (stale) {
         say("volume %" PRIu32 ": the snapshot from node %" PRIu32 " is stale and not installed: P %" PRIu64 " of epoch %"
             PRIu64 ", this replica's log ends at %" PRIu64 ", fenced at %" PRIu64 " (asked again)", j->vol, j->peer,
             m->p, m->p_epoch, log_end, fence);
@@ -1147,11 +1161,6 @@ static void install(struct rjob *j)
         vs_get(j->vol)->retry_at = 0;
         pthread_mutex_unlock(&S.mu);
         return;
-    }
-    if (drv && G.mutant != RM_SNAPSETNODEFER) {
-        pthread_mutex_lock(&rv->mu);
-        rv->snap = &rs_installing;
-        pthread_mutex_unlock(&rv->mu);
     }
     crash_point(CP_SNAP_RECEIVED);
     struct snapinst_result res;
@@ -1166,8 +1175,8 @@ static void install(struct rjob *j)
     char done[sizeof j->dir + 16];
     snprintf(done, sizeof done, "%s/" SNAP_DONE, j->dir);
     struct stat st;
-    if (res.installed || lstat(done, &st) == 0)
-        j->made = 0; /* moved to v<N>, or a swap for snap_leftovers to finish: never removed here */
+    if (res.installed || res.taken || lstat(done, &st) == 0)
+        j->made = 0; /* moved to v<N>, removed before the hand-back, or a swap for snap_leftovers: never removed here */
     if (rc == 0) {
         STAT(installed, 1);
         __atomic_store_n(&S.st.install_ms, took, __ATOMIC_RELAXED);

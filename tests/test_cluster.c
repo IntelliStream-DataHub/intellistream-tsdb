@@ -7267,6 +7267,23 @@ static void status_snap(int i, struct rsnap_stats *st)
     tsdbc_close(c);
 }
 
+/* snap.install_last_s of server i's STATUS (the seconds of its last install) */
+static double status_install_s(int i)
+{
+    tsdbc *c = client(i);
+    char *text = NULL;
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("STATUS of server %d: %s", i, ers(rc));
+    const char *at = strstr(text, "\nsnap.install_last_s=");
+    if (!at)
+        die("STATUS of server %d has no snap.install_last_s line:\n%s", i, text);
+    double v = strtod(at + strlen("\nsnap.install_last_s="), NULL);
+    free(text);
+    tsdbc_close(c);
+    return v;
+}
+
 static const char *snap_vols[2] = {"plant", "plant2"};
 
 /* n rows of random values (about 3.6 bytes each in a part) from ts *t on */
@@ -7850,7 +7867,7 @@ static void scen_snapcatch(void)
         snap_more(&s, 100, 1, &n[0]);
         sleep(1);
     }
-    penv[s.R] = "TSDB_REPLD_TEST=snapclosedelay=1500,snapask";
+    penv[s.R] = "TSDB_REPLD_TEST=snapclosedelay=1500,snapask,snapblind";
     start(s.R);
     uint64_t t0 = now_ms();
     int held = 0, opens = 0;
@@ -7907,17 +7924,45 @@ static void scen_snapcatch(void)
     if (log_count(s.R, "snapshot installed: P") != 1)
         die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
     await_isr(0, "plant", 3, 60000, "the replica that refused a stale copy stays in the ISR");
+    /* the log passes P between the check before the close and the close (planted: snapblind hides the log end from that
+     * check): the check after the close, on the stopped driver's end, refuses the copy (mutant snapnoendafter) */
+    char blind[PATH_MAX + 64];
+    server_dir(s.R, blind, sizeof blind);
+    strcat(blind, "/snapblind");
+    FILE *b = fopen(blind, "w");
+    if (!b || fclose(b) != 0 || !(a = fopen(ask, "w")) || fclose(a) != 0)
+        die("%s, %s: %s", blind, ask, strerror(errno));
+    t0 = now_ms();
+    while (!log_has(s.R, "is stale and not installed after the close")) {
+        if (log_count(s.R, "snapshot installed: P") != 1)
+            die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
+        if (log_count(s.R, "is below this replica's commit floor") != floor_refused)
+            die("a replica in the ISR took a copy at or below the log end its stopped driver left to the install");
+        if (now_ms() - t0 > 60000)
+            die("a copy at or below the log end, unseen before the close, was not refused after it in 60 s");
+        snap_more(&s, 10, 0, &n[0]);
+        usleep(100000);
+    }
+    unlink(ask);
+    unlink(blind);
+    await_isr(0, "plant", 3, 60000, "the replica that refused a stale copy after its close joins the ISR again");
+    if (log_count(s.R, "snapshot installed: P") != 1)
+        die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
     struct rsnap_stats sr;
     status_snap(s.R, &sr);
-    if (sr.refused_stale < 1 || sr.installed != 1)
-        die("STATUS of the receiver: installed %" PRIu64 ", refused_stale %" PRIu64 " (want 1 and >= 1)", sr.installed,
+    if (sr.refused_stale < 2 || sr.installed != 1)
+        die("STATUS of the receiver: installed %" PRIu64 ", refused_stale %" PRIu64 " (want 1 and >= 2)", sr.installed,
             sr.refused_stale);
+    double last_s = status_install_s(s.R);
+    if (last_s <= 0)
+        die("STATUS of the receiver: snap.install_last_s %.3f after an install", last_s);
     snap_close(&s);
     stop_all();
     rep_same(n, "snapcatch: after a clean stop");
     printf("  a replica ten segments behind installed a snapshot in %.1f s (REPL fence %" PRIu64 "), waited for its"
-           " open generation, caught up and joined the ISR; a stale copy was refused; all three hold the same %" PRIu64
-           " rows\n", secs, f, n[0]);
+           " open generation, caught up and joined the ISR; a stale copy was refused before and after the close (STATUS:"
+           " last install %.3f s); all three hold the same %" PRIu64
+           " rows\n", secs, f, last_s, n[0]);
 }
 
 static void touch_plant(int i, uint32_t num);
@@ -7925,6 +7970,27 @@ static void touch_plant(int i, uint32_t num);
 /* snapdiverged: a caught-up replica whose volume turns DIVERGED (planted: the DIVERGED file a failed digest writes)
  * stops, asks the leader for a snapshot, installs it and comes back without the flag: it joins the ISR, stops no more
  * and holds the leader's rows (mutant snapkeepdiverged: the flag carried into the installed copy) */
+/* the ISR of `name` is n members and the leader's (server `lead`) latest ISR request asked for n and is committed:
+ * no shrink is in flight that an ISR read before it would miss */
+static void isr_settled(int lead, const char *name, uint32_t n, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        char line[4096];
+        unsigned m = 0;
+        unsigned long long asked = 0;
+        uint64_t v = 0;
+        log_line(lead, "asks for an ISR of", line, sizeof line);
+        const char *a = strstr(line, "asks for an ISR of");
+        if (a && sscanf(a, "asks for an ISR of %u members (ISR version %llu", &m, &asked) == 2 && m == n &&
+            isr_of(lead, name, &v) == n && v >= asked)
+            return;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s (server %d's latest ISR request: \"%s\")", what, lead, a ? a : "none");
+        usleep(100000);
+    }
+}
+
 static void scen_snapdiverged(void)
 {
     scenario("snapdiverged");
@@ -7953,10 +8019,31 @@ static void scen_snapdiverged(void)
     if (log_count(s.R, "stopped: the volume is DIVERGED") != 1)
         die("the rebuilt replica stopped as DIVERGED again: the flag was carried into the fresh copy");
     await_isr(0, "plant", 3, 10000, "the rebuilt replica stays in the ISR");
+    /* again with no write after the plant: the diverged replica's log already reaches the leader's P, which must still
+     * rebuild it (mutant snapdivlogend: refused as stale for good) */
+    int stale0 = log_count(s.R, "is stale and not installed");
+    touch_plant(s.R, 1);
+    for (t0 = now_ms(); log_count(s.R, "stopped: the volume is DIVERGED") < 2; usleep(100000))
+        if (now_ms() - t0 > 20000)
+            die("the second planted DIVERGED did not stop the replica");
+    for (t0 = now_ms(); log_count(s.R, "snapshot installed: P") < 3; usleep(100000))
+        if (now_ms() - t0 > 60000)
+            die("the DIVERGED replica whose log reaches the leader's P was not rebuilt by a snapshot in 60 s");
+    /* the copy that rebuilt it may lie above its log end (the ISR shrink's record): a refusal before it is the bug */
+    if (log_count(s.R, "is stale and not installed") != stale0)
+        die("the DIVERGED replica whose log reaches the leader's P refused a copy as stale");
+    await_isr(0, "plant", 3, 60000, "the replica rebuilt with no write meanwhile joins the ISR");
+    snap_more(&s, 100, 0, &n[0]);
+    if (log_count(s.R, "stopped: the volume is DIVERGED") != 2)
+        die("the rebuilt replica stopped as DIVERGED again: the flag was carried into the fresh copy");
+    /* the ISR of 3 above may be the one before the leader dropped the stopped replica (slow servers): the last write
+     * is on every replica only once the leader's latest ISR request is for 3 members and committed */
+    isr_settled(0, "plant", 3, 60000, "the rebuilt replica rejoins the ISR after the last write");
     snap_close(&s);
     stop_all();
     rep_same(n, "snapdiverged: after a clean stop");
-    printf("  a DIVERGED replica was rebuilt by a snapshot, joined the ISR and holds the same %" PRIu64 " rows\n", n[0]);
+    printf("  a DIVERGED replica was rebuilt by a snapshot (also with its log at the leader's P), joined the ISR and"
+           " holds the same %" PRIu64 " rows\n", n[0]);
 }
 
 /* snapkill: the receiver killed at snap-received (files in, nothing installed) and at snap-swapped (after the swap's
@@ -7967,9 +8054,9 @@ static void scen_snapkill(void)
     struct snapset s;
     snap_setup(1, 0, &s);
     uint64_t n[REP_NAMES] = {702, 0, 0, 0};
-    static const char *const pts[2] = {"snap-received", "snap-swapped"};
-    static char env[2][64];
-    for (int p = 0; p < 2; p++) {
+    static const char *const pts[3] = {"snap-received", "snap-swapped", "snap-halfswap"};
+    static char env[3][64];
+    for (int p = 0; p < 3; p++) {
         if (p)
             snap_away(&s, &n[0]);
         snprintf(env[p], sizeof env[p], "TSDB_CRASH_AT=%s", pts[p]);
@@ -7979,16 +8066,22 @@ static void scen_snapkill(void)
         if (st != 99)
             die("the receiver armed at %s ended with %d, not 99", pts[p], st);
         penv[s.R] = NULL;
+        int got = log_count(s.R, "snapshot received from node");
         start(s.R);
         await_isr(0, "plant", 3, 60000, "the receiver restarted after its crash joins the ISR");
         if (dir_count(s.R, "v1.snap", "") >= 0 || dir_count(s.R, "v1.old", "") >= 0)
             die("after the crash at %s the receiver still has v1.snap or v1.old", pts[p]);
+        /* between the renames only snap_leftovers mends it (v1.old back or the copy in): never by a copy fetched again
+         * (mutant snapnoleftovers) */
+        if (p == 2 && log_count(s.R, "snapshot received from node") != got)
+            die("after the crash at %s the receiver fetched a copy again instead of finishing the swap", pts[p]);
         snap_more(&s, 50, 0, &n[0]);
     }
     snap_close(&s);
     stop_all();
     rep_same(n, "snapkill: after a clean stop");
-    printf("  a receiver killed at snap-received and at snap-swapped came back, joined the ISR and holds the rows\n");
+    printf("  a receiver killed at snap-received, at snap-swapped and between the swap's renames came back, joined the"
+           " ISR and holds the rows\n");
 }
 
 /* snappower: crashfs under the receiver's directory, a power loss right after each step of its install (before the
@@ -8046,7 +8139,7 @@ static void scen_snapfence(void)
     if (!vol_rec(s.O, "plant", &v))
         die("no record of plant");
     uint64_t e0 = v.epoch;
-    penv[s.R] = "TSDB_REPLD_TEST=snapclosedelay=5000";
+    penv[s.R] = "TSDB_REPLD_TEST=snapclosedelay=5000,snapleftoversrace";
     start(s.R);
     await_log(s.R, "(snapclosedelay)", 60000, "the receiver never got to the install");
     snap_close(&s);
@@ -8073,11 +8166,17 @@ static void scen_snapfence(void)
         usleep(100000);
     }
     await_isr(s.O, "plant", 2, 60000, "the receiver joins the new leader's ISR");
+    /* the old leader's copy (P of epoch e0 or below) met a fence of e1 after the close: refused, never installed
+     * (requirement 1; mutant snapnofence installs it with the raised fence kept, which the loop above lets pass) */
+    if (!log_has(s.R, "is not installed: this replica is fenced at"))
+        die("the old leader's copy was installed on a receiver fenced at %" PRIu64 " above its epoch, not refused", e1);
+    /* snapleftoversrace: the refused copy was removed before the volume went back (mutant snapdropafter: removed by
+     * the worker during the prepare's leftovers, which refuses the volume until a restart) */
+    if (log_has(s.R, "(snapleftoversrace)"))
+        die("the refused copy was removed by the snapshot worker during the prepare after the volume went back");
     stop_all();
-    printf("  a FENCE during the install's close: %s (epoch %" PRIu64 " -> %" PRIu64 ")\n",
-           log_has(s.R, "is not installed: this replica is fenced at") ? "the stale copy was refused" :
-                                                                         "the installed REPL holds the raised fence",
-           e0, e1);
+    printf("  a FENCE during the install's close: the stale copy was refused%s (epoch %" PRIu64 " -> %" PRIu64 ")\n",
+           f >= e1 ? " and the new leader's copy installed with the raised fence" : "", e0, e1);
 }
 
 /* keepfloor: below the caps the leader keeps every segment a replica away has not acked (design-cluster.md 8.3). The

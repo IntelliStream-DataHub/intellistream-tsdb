@@ -17,7 +17,10 @@
  *
  * Mutants (TSDB_REPLD_MUTANT): snapstalekeep (keep read
  * before the volume is closed), snapkeepdiverged (the old directory's DIVERGED copied into the new one); rsnap.c has
- * snapinstallstale, cvol.c snapservebeforeopen. Test hook: TSDB_REPLD_TEST=snapclosedelay=MS waits MS before the close.
+ * snapinstallstale (with the check after the close), cvol.c snapservebeforeopen; snapdropafter (a copy not installed
+ * left for the worker's removal after the hand-back), snapnoendafter (P not compared with the stopped driver's log end),
+ * snapnofence (with rsnap.c: a copy below the fence installed). Test hook: TSDB_REPLD_TEST=snapclosedelay=MS waits MS
+ * before the close. Crash point snap-halfswap: between the swap's two renames (v<N>.old, v<N>.snap, no v<N>).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -34,6 +37,7 @@
 #include "../src/snapshot.h"
 #include "crashpt.h"
 #include "cvol.h"
+#include "repld.h"
 #include "repld_int.h"
 #include "snapinst.h"
 
@@ -49,6 +53,8 @@ static void inst_hook(int at)
     }
     if (at == SNAP_INST_SWAPPED)
         crash_point(CP_SNAP_SWAPPED);
+    if (at == SNAP_INST_HALF)
+        crash_point(CP_SNAP_HALFSWAP);
 }
 
 /* vdir's REPL into st: 1 read, 0 none there, <0 an error */
@@ -106,9 +112,8 @@ struct inst {
     struct snapinst_result *out;
 };
 
-static int inst_fn(void *ctx, const struct snap_ident *id, int had_engine)
+static int inst_body(struct inst *in, const struct snap_ident *id, int had_engine, uint64_t log_end)
 {
-    struct inst *in = ctx;
     char vdir[PATH_MAX];
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, in->root, in->number);
     struct replfile_state keep = {0};
@@ -127,9 +132,23 @@ static int inst_fn(void *ctx, const struct snap_ident *id, int had_engine)
         return have;
     }
     in->out->keep_fence = have ? keep.fence : 0;
-    if (have && keep.fence > in->p_epoch) {
+    if (have && keep.fence > in->p_epoch && G.mutant != RM_SNAPNOFENCE) {
         say("volume %" PRIu32 ": the snapshot of epoch %" PRIu64 " is not installed: this replica is fenced at %" PRIu64
             " (asked again)", in->number, in->p_epoch, keep.fence);
+        replfile_state_free(&keep);
+        in->out->stale = 1;
+        return 1;
+    }
+    /* requirement 1 after the close: the driver ran on while the install waited for M.op and for its join, and a log
+     * it extended past P from a new leader holds positions the copy would truncate (rsnap.c checked before) */
+    if (had_engine && G.mutant != RM_SNAPINSTALLSTALE && G.mutant != RM_SNAPNOENDAFTER &&
+        (log_end == REPLD_END_UNKNOWN || in->p <= log_end)) {
+        if (log_end == REPLD_END_UNKNOWN)
+            say("volume %" PRIu32 ": the snapshot is stale and not installed after the close: P %" PRIu64 ", the closed"
+                " driver had no log to compare it with (asked again)", in->number, in->p);
+        else
+            say("volume %" PRIu32 ": the snapshot is stale and not installed after the close: P %" PRIu64 ", this"
+                " replica's log ended at %" PRIu64 " when its driver stopped (asked again)", in->number, in->p, log_end);
         replfile_state_free(&keep);
         in->out->stale = 1;
         return 1;
@@ -174,6 +193,32 @@ static int inst_fn(void *ctx, const struct snap_ident *id, int had_engine)
         close(dfd);
     in->out->installed = 1;
     return 0;
+}
+
+/* inst_body, then what it did not install is removed here, before cvol_install hands the volume back: the prepare that
+ * follows runs snap_leftovers on v<N>.snap, and a removal by rsnap's worker during it (exists, then an open that
+ * fails) refused the volume until a restart (review F1). A copy with its SNAPDONE stays for snap_leftovers. */
+static int inst_fn(void *ctx, const struct snap_ident *id, int had_engine, uint64_t log_end)
+{
+    struct inst *in = ctx;
+    int rc = inst_body(in, id, had_engine, log_end);
+    if (in->out->installed || G.mutant == RM_SNAPDROPAFTER)
+        return rc;
+    char done[PATH_MAX + 16];
+    snprintf(done, sizeof done, "%s/" SNAP_DONE, in->staged);
+    struct stat sb;
+    if (lstat(done, &sb) == 0) {
+        in->out->taken = 1; /* a swap for snap_leftovers to finish */
+    } else if (lstat(in->staged, &sb) != 0 && errno == ENOENT) {
+        in->out->taken = 1;
+    } else if (snap_release(in->staged) == 0) {
+        in->out->taken = 1;
+    } else {
+        say("volume %" PRIu32 ": %s could not be removed before the volume opens again (its prepare does)",
+            in->number, in->staged);
+        in->out->taken = 1; /* never removed by the worker after the hand-back: snap_leftovers alone owns it now */
+    }
+    return rc;
 }
 
 int snapinst_install(const char *root, uint32_t number, const char *staged, uint64_t p, uint64_t p_epoch,

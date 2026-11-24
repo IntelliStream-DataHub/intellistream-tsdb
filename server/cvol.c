@@ -43,10 +43,21 @@
  * (repld_close: tsdb_cvol_replace with nothing new, so no reference, lookup or read of the old copy is left and the
  * engine's DIVERGED flag goes with it), and only then is the old REPL read as the install's `keep`; one with no engine
  * (MV_WAIT: a fresh learner or a reset member before its open was recorded; MV_REFUSED: a volume refused at start)
- * is installed as it is, with the REPL on disk as `keep` if there is one. Either way the volume then goes through
+ * is installed as it is, with the REPL on disk as `keep` if there is one. Only a driver asks for a snapshot
+ * (rsnap_need, rsnap_rebuild need its rvol), so that second path is taken only by a copy that completes after its
+ * driver was closed and before the volume was opened again (a set change or a reset during the transfer): a fresh
+ * learner opens an empty engine and asks from it (the first path), and a volume refused at start never asks; it is
+ * not driven by a test (a requester without a driver is R4's open item, docs/tasks/r4-xferinst-followups.md). The
+ * install compares P with the log end the joined driver left (repld_close_end): the driver appends until it is
+ * stopped, and the manager's M.op can hold the install that long. Either way the volume then goes through
  * steps 1-3 again as for a new record (MV_REPREP: cvolfs_prepare, whose snapinst_leftovers finishes what a crash left,
  * a new open generation, REPLICA_OPEN waited for, repld_open with the installed REPL's log start, floor and history),
  * whether the install was done, refused or failed: nothing is served from the volume before that open is recorded.
+ * The install's fn removes a copy it did not install before the hand-back (or leaves it with its SNAPDONE for
+ * snap_leftovers): the prepare that follows runs snap_leftovers on v<N>.snap, which must not meet a removal by
+ * another thread. While MV_INSTALL and MV_REPREP the heartbeat reports the volume OK with its old open generation (a
+ * DIVERGED replica being rebuilt too, its driver gone): it is out of the ISR, so nothing counts on it, but STATUS
+ * and the topology say OK for the length of the install.
  * tsdb_cvol_replace never opens the installed directory, so it carries no DIVERGED over (the snapshot holds no
  * DIVERGED file: a fresh copy is not the diverged one).
  * Mutants (TSDB_CVOL_MUTANT, tests only): `noopengen` opens the engine before REPLICA_OPEN commits; `anynonce` opens
@@ -485,8 +496,10 @@ int cvol_start(tsdb *t, const char *dir)
     return 0;
 }
 
-int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, int had_engine), void *ctx)
+int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, int had_engine, uint64_t log_end),
+                 void *ctx)
 {
+    uint64_t log_end = REPLD_END_UNKNOWN;
     struct snap_ident id = {0};
     pthread_mutex_lock(&M.op);
     pthread_mutex_lock(&M.mu);
@@ -509,9 +522,10 @@ int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, i
     m->state = MV_INSTALL; /* from here on requests get RECOVERING (cvol_why) and the manager skips the volume */
     pthread_mutex_unlock(&M.mu);
     if (st == MV_OPEN)
-        repld_close(v); /* the driver stopped (no REPL save after this) and the engine closed: no read of the old copy */
+        repld_close_end(v, &log_end); /* the driver stopped (no REPL save, no append after this) and the engine
+                                       * closed: no read of the old copy */
     pthread_mutex_unlock(&M.op);
-    int rc = fn(ctx, &id, st == MV_OPEN);
+    int rc = fn(ctx, &id, st == MV_OPEN, log_end); /* fn leaves nothing of the copy for after the hand-back below */
     pthread_mutex_lock(&M.op);
     pthread_mutex_lock(&M.mu);
     if ((m = mv_get(v)) != NULL) {

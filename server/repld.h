@@ -52,6 +52,10 @@ void repld_stop(void);
  * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted (its memory kept: a link thread
  * may still hold it from vol_find). 0 (also when none was open), the manager's thread. */
 int repld_close(uint32_t v);
+/* repld_close, and *log_end the replica's durable log end once its driver was joined (nothing appends after it): 0 for a
+ * DIVERGED replica that asked for its rebuild, REPLD_END_UNKNOWN when no driver or no core was there (cvol_install) */
+#define REPLD_END_UNKNOWN UINT64_MAX
+int repld_close_end(uint32_t v, uint64_t *log_end);
 /* After repld_stop: closes the engines of the volumes the driver stopped on a failure (D13), whose close fails by
  * design; tsdb_close then reports the other volumes' errors only. */
 void repld_close_failed(void);

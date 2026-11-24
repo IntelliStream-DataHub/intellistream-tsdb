@@ -139,8 +139,9 @@ int snap_install(const char *root, uint32_t number, const char *staged, const st
  * v<N>.snap with SNAPDONE is finished (v<N> -> v<N>.old when there, v<N>.snap -> v<N>); v<N>.snap without it is removed;
  * v<N>.old beside a v<N> is removed, without one it is renamed back. Every step synced. 0 or TSDB_ERR_IO. */
 int snap_leftovers(const char *root, uint32_t number);
-/* tests: called after the verify, after SNAPDONE and after the swap (whatever their result) */
-enum { SNAP_INST_VERIFIED = 1, SNAP_INST_DONE = 2, SNAP_INST_SWAPPED = 3 };
+/* tests: called after the verify, after SNAPDONE and after the swap (whatever their result), and between the swap's two
+ * renames when there was an old v<N> */
+enum { SNAP_INST_VERIFIED = 1, SNAP_INST_DONE = 2, SNAP_INST_SWAPPED = 3, SNAP_INST_HALF = 4 };
 extern void (*snap_inst_hook)(int at);
 
 #endif
