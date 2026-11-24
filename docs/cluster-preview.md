@@ -203,7 +203,7 @@ volume's leader and told the volume's name (`TSDB_VOLUME=plant`). Its answer is 
 <!-- cluster-tutorial-output -->
 ```
 added volume plant: number 1
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -236,7 +236,7 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -257,7 +257,7 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -276,7 +276,7 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1 preferred 1 redundancy replicas=3
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
