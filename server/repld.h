@@ -48,6 +48,10 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max);
 unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t after_ms);
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
+/* Closes one volume's driver and engine (a replica the record no longer names, or one reset: server/cvolset_mgr.c): its
+ * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted (its memory kept: a link thread
+ * may still hold it from vol_find). 0 (also when none was open), the manager's thread. */
+int repld_close(uint32_t v);
 /* After repld_stop: closes the engines of the volumes the driver stopped on a failure (D13), whose close fails by
  * design; tsdb_close then reports the other volumes' errors only. */
 void repld_close_failed(void);
@@ -61,6 +65,9 @@ struct rsnap_stats {
     uint64_t busy;           /* BUSY answers, either side */
     uint64_t bytes_sent, bytes_received;
     uint64_t last_ms;        /* the last snapshot received: ms from its request to its last file */
+    uint64_t installed;      /* snapshots installed (server/snapinst.c) */
+    uint64_t refused_stale;  /* received and not installed: P at or below the log end, or fenced above its epoch */
+    uint64_t install_ms;     /* the last install: ms from the end of the transfer to the volume handed back */
 };
 void rsnap_get_stats(struct rsnap_stats *out);
 

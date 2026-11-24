@@ -202,7 +202,11 @@ enum {
     RM_SNAPNOSTALE,      /* rsnap.c: a request of another set version or epoch is served */
     RM_SNAPNOSTALL,      /* rsnap.c: a receiver that hears nothing waits on */
     RM_SNAPNOSRCDOWN,    /* rsnap.c: a source whose receiver's link stays down is not released */
-    RM_SNAPNOSRCMAX      /* rsnap.c: a source serves past rebuild_max */
+    RM_SNAPNOSRCMAX,     /* rsnap.c: a source serves past rebuild_max */
+    RM_SNAPFLOORLOW,     /* snapinst.c: the installed REPL's floor is put below P (the keep's floor) */
+    RM_SNAPINSTALLSTALE, /* rsnap.c: a snapshot with P at or below the receiver's log end is installed */
+    RM_SNAPSTALEKEEP,    /* snapinst.c: the old REPL is read before the driver stopped (D6) */
+    RM_SNAPKEEPDIVERGED  /* snapinst.c: the old directory's DIVERGED is carried into the installed one */
 };
 
 struct repld_g {

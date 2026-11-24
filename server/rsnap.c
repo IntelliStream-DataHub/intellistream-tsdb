@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Snapshot transfer of a replicated volume (rsnap.h; design-cluster.md 8.1, R4 plan D2, D5, D7, D16, D18): the
- * replica's request, the leader's make and send, the receiver's files in `v<N>.snap/`. r4-xferinst installs them; until
- * then a complete copy is logged and removed (w_finish).
+ * replica's request, the leader's make and send, the receiver's files in `v<N>.snap/`, which w_finish hands to the
+ * install (server/snapinst.c) on this worker, unless it is stale: P at or below the receiver's log end, or an epoch the
+ * receiver is fenced above (removed; asked again at the next notice).
  *
  * Links. Snapshots travel on kind 5 (PL_KIND_SNAP) only, under a token bucket of their own (`rebuild_mb_s`,
  * peerlink_set_kind_rate): a COMMIT's file on kind 2 never waits behind one (D7). Each side dials kind 5 to the other
@@ -60,6 +61,9 @@
 #include "peerlink.h"
 #include "repld.h"
 #include "rsnap.h"
+#include "crashpt.h"
+#include "cvol.h"
+#include "snapinst.h"
 
 /* frame types on kind 5 (below PL_USER_TYPE_MAX) */
 enum { RS_T_REQ = 0x20, RS_T_BUSY = 0x21, RS_T_GO = 0x22, RS_T_DONE = 0x23, RS_T_ABORT = 0x24 };
@@ -76,7 +80,7 @@ enum { RS_B_PROMOTING = 1, RS_B_MAX = 2, RS_B_STALE = 3, RS_B_MAKE = 4 };
 #define RS_SRC_DOWN_MS 60000
 #define RS_WAITDONE_MS 60000 /* source: the receiver's DONE 0 after the last file's (a lost one frees the slot) */
 #define RS_SRC_MAX_MS (6ull * 3600 * 1000)
-#define RS_STUB_WAIT_MS 60000 /* a copy received and not installed (r4-xferinst): asked again only after this */
+#define RS_STUB_WAIT_MS 60000 /* a copy being installed: no new request meanwhile (the install hands it back) */
 #define RS_TICK_EVERY_MS 200
 #define RS_MAKE_TRIES 4
 #define RS_SPACE_MIN (1ull << 30)
@@ -220,6 +224,9 @@ void rsnap_get_stats(struct rsnap_stats *out)
     out->refused_space = STATGET(refused_space);
     out->failed = STATGET(failed);
     out->busy = STATGET(busy);
+    out->installed = STATGET(installed);
+    out->refused_stale = STATGET(refused_stale);
+    out->install_ms = STATGET(install_ms);
     out->bytes_sent = STATGET(bytes_sent);
     out->bytes_received = STATGET(bytes_received);
     out->last_ms = STATGET(last_ms);
@@ -1088,8 +1095,62 @@ static void w_drop(struct rjob *j)
     job_free(j);
 }
 
+/* A complete copy (the worker, no lock held): refused when stale, else installed (snapinst.c). v<N>.snap stays made
+ * (removed by w_drop) unless the install took it or left a SNAPDONE for snap_leftovers to finish. */
+static void install(struct rjob *j)
+{
+    uint64_t log_end = 0, fence = 0, t0 = ms_now();
+    int drv = 0;
+    struct rvol *rv = vol_find(j->vol);
+    if (rv) { /* the driver's view; the fence is checked again from REPL once the driver is stopped (snapinst.c) */
+        pthread_mutex_lock(&rv->mu);
+        if (rv->core && !rv->stop) {
+            drv = 1;
+            log_end = repl_durable_end(rv->core);
+            fence = rv->st.fence;
+        }
+        pthread_mutex_unlock(&rv->mu);
+    }
+    const struct snap_man *m = &j->man;
+    if (drv && ((m->p <= log_end && G.mutant != RM_SNAPINSTALLSTALE) || fence > m->p_epoch)) {
+        say("volume %" PRIu32 ": the snapshot from node %" PRIu32 " is stale and not installed: P %" PRIu64 " of epoch %"
+            PRIu64 ", this replica's log ends at %" PRIu64 ", fenced at %" PRIu64 " (asked again)", j->vol, j->peer,
+            m->p, m->p_epoch, log_end, fence);
+        STAT(refused_stale, 1);
+        pthread_mutex_lock(&S.mu);
+        vs_get(j->vol)->retry_at = 0;
+        pthread_mutex_unlock(&S.mu);
+        return;
+    }
+    crash_point(CP_SNAP_RECEIVED);
+    struct snapinst_result res;
+    int rc = snapinst_install(G.dir, j->vol, j->dir, m->p, m->p_epoch, &res);
+    uint64_t took = ms_now() - t0;
+    char done[sizeof j->dir + 16];
+    snprintf(done, sizeof done, "%s/" SNAP_DONE, j->dir);
+    struct stat st;
+    if (res.installed || lstat(done, &st) == 0)
+        j->made = 0; /* moved to v<N>, or a swap for snap_leftovers to finish: never removed here */
+    if (rc == 0) {
+        STAT(installed, 1);
+        __atomic_store_n(&S.st.install_ms, took, __ATOMIC_RELAXED);
+        say("volume %" PRIu32 ": snapshot installed: P %" PRIu64 " of epoch %" PRIu64 ", REPL fence %" PRIu64
+            " (it was %" PRIu64 "), open generation %" PRIu64 ", in %.1f s; the volume opens again", j->vol, m->p,
+            m->p_epoch, res.fence, res.keep_fence, res.open_gen, (double)took / 1000);
+    } else if (rc == 1) {
+        STAT(refused_stale, 1);
+    } else if (rc == CVOL_NOT_TAKEN) {
+        say("volume %" PRIu32 ": the snapshot is not installed: the volume is not open here or is stopping", j->vol);
+    } else {
+        STAT(failed, 1);
+    }
+    pthread_mutex_lock(&S.mu);
+    vs_get(j->vol)->retry_at = 0; /* the volume's next open asks again if it still needs one */
+    pthread_mutex_unlock(&S.mu);
+}
+
 /* every file of a receiver's copy is in: the link entries made, the directory synced, the source told; then the
- * install (r4-xferinst). The job is claimed here (dead, so nothing else drops it) and freed at the end. */
+ * install. The job is claimed here (dead, so nothing else drops it) and freed at the end. */
 static void w_finish(struct rjob *j)
 {
     pthread_mutex_lock(&S.mu);
@@ -1153,8 +1214,7 @@ static void w_finish(struct rjob *j)
         }
     }
     if (j->made)
-        say("volume %" PRIu32 ": installing a snapshot is not built yet (r4-xferinst): %s removed; the replica stays a"
-            " learner", j->vol, j->dir);
+        install(j);
     w_drop(j); /* removes v<N>.snap when still made */
 }
 

@@ -1263,6 +1263,10 @@ static void log_start_check(struct rvol *rv)
         repl_log_start(rv->core, first);
         idx_trim(rv, first);
     }
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number); /* the replay start the ACK carries (D17; r4-replay makes it real) */
+    if (db && rv->core)
+        repl_replay_start(rv->core, replica_replay_start(db));
+    tsdb_cvol_unref(&db);
 }
 
 static int isr_short_locked(const struct rvol *rv);
@@ -2165,6 +2169,10 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
                : !strcmp(mu, "snapnosrcdown")  ? RM_SNAPNOSRCDOWN
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
+               : !strcmp(mu, "snapfloorlow")   ? RM_SNAPFLOORLOW
+               : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
+               : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
+               : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2578,6 +2586,41 @@ static int close_fn(void *ctx, struct eng **old, struct eng **neu)
 static void cvol_close(uint32_t v)
 {
     (void)tsdb_cvol_replace(G.t, v, close_fn, NULL, CVOL_NONE); /* TSDB_ERR_IO by contract: closed, nothing new */
+}
+
+int repld_close(uint32_t v)
+{
+    pthread_mutex_lock(&G.mu);
+    struct rvol *rv = NULL;
+    for (uint32_t i = 0; i < G.nvols && !rv; i++)
+        if (G.vols[i]->number == v) {
+            rv = G.vols[i];
+            memmove(&G.vols[i], &G.vols[i + 1], (G.nvols - i - 1) * sizeof G.vols[0]);
+            G.nvols--;
+        }
+    pthread_mutex_unlock(&G.mu);
+    if (rv) {
+        pthread_mutex_lock(&rv->mu);
+        rv->stop = 1;
+        pthread_cond_signal(&rv->cv);
+        pthread_cond_broadcast(&rv->in_space);
+        pthread_mutex_unlock(&rv->mu);
+        if (rv->started)
+            pthread_join(rv->th, NULL);
+        rv->started = 0;
+        struct eng *db = tsdb_cvol_ref(G.t, v);
+        if (db && rv->mode == M_WRITER)
+            eng_leader_depose(db);
+        tsdb_cvol_unref(&db);
+        pthread_mutex_lock(&rv->mu);
+        if (rv->rec_short)
+            __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
+        rv->rec_short = 0;
+        pthread_mutex_unlock(&rv->mu);
+        say("volume %" PRIu32 ": driver stopped (the replica is closed)", v);
+    }
+    cvol_close(v);
+    return 0;
 }
 
 void repld_close_failed(void)

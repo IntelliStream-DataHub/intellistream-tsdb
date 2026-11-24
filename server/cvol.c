@@ -35,6 +35,20 @@
  * that slot is one open behind the record (rot of the newest slot), one open and a belt behind (the save of the record
  * followed a torn load) or at or above it. A copy exactly one open behind whose newest slot is damaged looks like rot
  * of the current copy: it is let in, reported unsure.
+ *
+ * A received snapshot's install (server/snapinst.c, R4 plan D5, D6, D18) runs on the snapshot worker through
+ * cvol_install, which takes the volume from this manager for its length (MV_INSTALL: requests get UNAVAILABLE
+ * RECOVERING, the manager leaves the volume alone, the old open is still what the heartbeat reports). Which path a
+ * volume takes depends on what is open: an open one (MV_OPEN) has its driver stopped and its engine closed first
+ * (repld_close: tsdb_cvol_replace with nothing new, so no reference, lookup or read of the old copy is left and the
+ * engine's DIVERGED flag goes with it), and only then is the old REPL read as the install's `keep`; one with no engine
+ * (MV_WAIT: a fresh learner or a reset member before its open was recorded; MV_REFUSED: a volume refused at start)
+ * is installed as it is, with the REPL on disk as `keep` if there is one. Either way the volume then goes through
+ * steps 1-3 again as for a new record (MV_REPREP: cvolfs_prepare, whose snapinst_leftovers finishes what a crash left,
+ * a new open generation, REPLICA_OPEN waited for, repld_open with the installed REPL's log start, floor and history),
+ * whether the install was done, refused or failed: nothing is served from the volume before that open is recorded.
+ * tsdb_cvol_replace never opens the installed directory, so it carries no DIVERGED over (the snapshot holds no
+ * DIVERGED file: a fresh copy is not the diverged one).
  * Mutants (TSDB_CVOL_MUTANT, tests only): `noopengen` opens the engine before REPLICA_OPEN commits; `anynonce` opens
  * under a record of the right generation whatever its nonce; the others are in cvolfs.h (`samerid`, `replnonce`,
  * `nononce`, `trustunsure`, `tornstale`, `nodirsync`). Test switch: TSDB_CLUSTER_TEST stale_first_watch=1
@@ -60,9 +74,10 @@
 #include "cvolset.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
+#include "../src/snapshot.h"
 #include "tsdb_protocol.h"
 
-enum { MV_NONE = 0, MV_WAIT, MV_OPEN, MV_REFUSED };
+enum { MV_NONE = 0, MV_WAIT, MV_OPEN, MV_REFUSED, MV_INSTALL /* cvol_install holds it */, MV_REPREP /* prepare again */ };
 
 struct mvol {
     uint32_t number;
@@ -75,9 +90,13 @@ struct mvol {
     uint64_t epoch;
     int unnamed; /* the latest push does not name this server for it (cvolset_record CVS_UNNAMED said once) */
     uint64_t rec_rid; /* the rid the record gave this server when prepare ran (refused or not): CVS_RESET compares it */
+    int installed;    /* prepared again after an installed snapshot (TSDB_REPLD_MUTANT=snapservebeforeopen opens it at once) */
 };
 
 static struct {
+    pthread_mutex_t op; /* above mu: the manager holds it per record, cvol_install across its close and its hand-back */
+    int inst_closed;    /* under op: cvol_stop ran, no install takes a volume any more */
+    int servebeforeopen; /* TSDB_REPLD_MUTANT=snapservebeforeopen */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_t th;
@@ -98,7 +117,7 @@ static struct {
     int stale_first; /* TSDB_CLUSTER_TEST stale_first_watch=1, until the first push */
     unsigned unreach_ms; /* UNREACH_MS, or TSDB_CVOL_TEST unreach_ms=N (tests only: a report later than the leader's
                           * shrink request, which cluster.c's cut_move holds for, test_cluster cuthold) */
-} M = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+} M = {.op = PTHREAD_MUTEX_INITIALIZER, .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 #define say cvolfs_say
 
@@ -144,7 +163,11 @@ static void prepare(const struct cluster_vol_rec *r)
         }
     }
     pthread_mutex_lock(&M.mu);
-    if (M.nvols < CLUSTER_REPORT_VOLS)
+    struct mvol *old = mv_get(r->number); /* MV_REPREP: prepared again after an install */
+    if (old) {
+        m.installed = old->installed;
+        *old = m;
+    } else if (M.nvols < CLUSTER_REPORT_VOLS)
         M.vols[M.nvols++] = m;
     pthread_mutex_unlock(&M.mu);
 }
@@ -204,9 +227,15 @@ static void *mgr_main(void *arg)
         pthread_mutex_unlock(&M.mu);
         for (uint32_t i = 0; i < n && !M.stop; i++) {
             const struct cluster_vol_rec *r = &recs[i];
+            pthread_mutex_lock(&M.op);
             pthread_mutex_lock(&M.mu);
             struct mvol *m = mv_get(r->number);
             int st = m ? m->state : MV_NONE;
+            if (st == MV_INSTALL) { /* cvol_install's until it hands the volume back */
+                pthread_mutex_unlock(&M.mu);
+                pthread_mutex_unlock(&M.op);
+                continue;
+            }
             if (m)
                 m->epoch = r->epoch;
             uint64_t mrid = m ? m->rec_rid : 0;
@@ -217,7 +246,7 @@ static void *mgr_main(void *arg)
                 cvolset_record(CVS_NAMED, r->number, r);
             else if (mrid && r->rid && r->rid != mrid && cvolset_record(CVS_RESET, r->number, r) == CVS_AGAIN)
                 st = forget(r->number, st);
-            if (st == MV_NONE)
+            if (st == MV_NONE || st == MV_REPREP)
                 prepare(r);
             else if (st == MV_OPEN && !M.writes)
                 repld_update(r);
@@ -228,7 +257,7 @@ static void *mgr_main(void *arg)
             if (m && m->state == MV_WAIT) {
                 gen = m->gen;
                 if (M.mutant == 1 || (r->open_gen == m->gen && (r->open_nonce == m->nonce || M.mutant == 3)) ||
-                    (r->open_gen > m->gen && M.mutant == 3))
+                    (r->open_gen > m->gen && M.mutant == 3) || (M.servebeforeopen && m->installed))
                     ready = 1;
                 else if (r->open_gen >= m->gen)
                     older = 1, m->state = MV_REFUSED; /* the group holds another open at or above this one's */
@@ -240,6 +269,7 @@ static void *mgr_main(void *arg)
                 say("volume %" PRIu32 " (%s): the metadata group recorded open generation %" PRIu64 " of another open"
                     " (this one saved %" PRIu64 "): an older copy of the directory, not opened",
                     r->number, r->name, r->open_gen, gen);
+            pthread_mutex_unlock(&M.op);
         }
         /* R4 (cvolset.h): the volumes this manager knows that the push no longer names, each said once */
         uint32_t gone[CLUSTER_REPORT_VOLS], ngone = 0;
@@ -401,6 +431,7 @@ int cvol_start(tsdb *t, const char *dir)
         ;
     const char *rmu = getenv("TSDB_REPLD_MUTANT");
     M.divergeisr = rmu && !strcmp(rmu, "divergeisr");
+    M.servebeforeopen = rmu && !strcmp(rmu, "snapservebeforeopen");
     const char *mu = getenv("TSDB_CVOL_MUTANT");
 
     M.mutant = mu && !strcmp(mu, "noopengen")       ? 1
@@ -440,6 +471,46 @@ int cvol_start(tsdb *t, const char *dir)
     return 0;
 }
 
+int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, int had_engine), void *ctx)
+{
+    struct snap_ident id = {0};
+    pthread_mutex_lock(&M.op);
+    pthread_mutex_lock(&M.mu);
+    struct mvol *m = M.inst_closed || M.stop || M.writes ? NULL : mv_get(v);
+    const struct cluster_vol_rec *r = NULL;
+    for (uint32_t i = 0; m && i < M.nrecs && !r; i++)
+        if (M.recs[i].number == v)
+            r = &M.recs[i];
+    int st = m ? m->state : MV_NONE;
+    if (!r || (st != MV_OPEN && st != MV_WAIT && st != MV_REFUSED)) {
+        pthread_mutex_unlock(&M.mu);
+        pthread_mutex_unlock(&M.op);
+        return CVOL_NOT_TAKEN;
+    }
+    memcpy(id.volume_uuid, r->uuid, 16);
+    memcpy(id.cluster_uuid, r->cluster, 16);
+    id.node = M.self;
+    id.incarnation = M.incarnation;
+    id.rid = r->rid ? r->rid : m->rid;
+    m->state = MV_INSTALL; /* from here on requests get RECOVERING (cvol_why) and the manager skips the volume */
+    pthread_mutex_unlock(&M.mu);
+    if (st == MV_OPEN)
+        repld_close(v); /* the driver stopped (no REPL save after this) and the engine closed: no read of the old copy */
+    pthread_mutex_unlock(&M.op);
+    int rc = fn(ctx, &id, st == MV_OPEN);
+    pthread_mutex_lock(&M.op);
+    pthread_mutex_lock(&M.mu);
+    if ((m = mv_get(v)) != NULL) {
+        m->state = MV_REPREP; /* steps 1-3 again on the next push, as for a new record */
+        m->installed = rc == 0;
+    }
+    M.dirty = 1;
+    pthread_cond_signal(&M.cv);
+    pthread_mutex_unlock(&M.mu);
+    pthread_mutex_unlock(&M.op);
+    return rc;
+}
+
 void cvol_stop(void)
 {
     if (!M.started)
@@ -449,6 +520,9 @@ void cvol_stop(void)
     pthread_cond_signal(&M.cv);
     pthread_mutex_unlock(&M.mu);
     pthread_join(M.th, NULL);
+    pthread_mutex_lock(&M.op); /* an install inside repld_close is waited for; later ones take nothing */
+    M.inst_closed = 1;
+    pthread_mutex_unlock(&M.op);
     M.started = 0;
     repld_stop(); /* after the cluster thread (tsdbd stops it first) and the manager: nothing opens or updates */
 }

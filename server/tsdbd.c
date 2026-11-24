@@ -2851,10 +2851,12 @@ static void handle_status(req *r)
         struct rsnap_stats ss; /* snapshot transfers (server/rsnap.c) */
         rsnap_get_stats(&ss);
         ST_PUT("snap.asked=%llu\nsnap.sent=%llu\nsnap.received=%llu\nsnap.refused_space=%llu\nsnap.failed=%llu\n"
-               "snap.busy=%llu\nsnap.bytes_sent=%llu\nsnap.bytes_received=%llu\nsnap.last_s=%.3f\n",
+               "snap.busy=%llu\nsnap.bytes_sent=%llu\nsnap.bytes_received=%llu\nsnap.last_s=%.3f\n"
+               "snap.installed=%llu\nsnap.refused_stale=%llu\nsnap.install_last_s=%.3f\n",
                (unsigned long long)ss.asked, (unsigned long long)ss.sent, (unsigned long long)ss.received,
                (unsigned long long)ss.refused_space, (unsigned long long)ss.failed, (unsigned long long)ss.busy,
-               (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000);
+               (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000,
+               (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -3694,7 +3696,8 @@ static void snap_metrics(metrics_snap *out)
     struct rsnap_stats s;
     rsnap_get_stats(&s);
     *out = (metrics_snap){s.asked, s.sent, s.received, s.refused_space, s.failed, s.busy, s.bytes_sent,
-                          s.bytes_received, (double)s.last_ms / 1000};
+                          s.bytes_received, (double)s.last_ms / 1000, s.installed, s.refused_stale,
+                          (double)s.install_ms / 1000};
 }
 
 static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */
