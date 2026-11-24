@@ -7,8 +7,13 @@
  *
  *   link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE] [--buf BYTES] [--parent PID]
  *                                                    one connection at a time, until killed (or PID is gone)
- *   link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES]
- *                  [--batch N] [--label L]
+ *   link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag | --mac NAME]
+ *                  [--buf BYTES] [--batch N] [--label L]
+ *   link-bench mac [--mac NAME] [--sizes N,N...] [--secs S]
+ *                                                    one core tagging frames in memory: MB/s and ns per frame of each
+ *                                                    MAC candidate (tools/mac_cands.h; all that run here without --mac)
+ *
+ * --tag is --mac hmac (peerlink's HMAC-SHA256 up to cluster version 7). The server takes the MAC from the client.
  *
  * --rsocket calls librdmacm's rsocket API (rsocket, rconnect, rread...), loaded with dlopen so that the binary builds
  * without librdmacm's headers and runs without the library when the flag is absent. It is not librspreload on
@@ -30,7 +35,7 @@
  * No address is built in: hosts are arguments (tools/rdma-bench.sh drives it on a pair of servers).
  */
 #define _GNU_SOURCE
-#include "../client/tsdb_crypto.h"
+#include "mac_cands.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -155,75 +160,58 @@ static uint32_t get32(const uint8_t *p)
     return v;
 }
 
-/* peerlink's HMAC with the pads absorbed once (server/peerlink.c hk_init, hk_mac, frame_tag) */
-struct hk {
-    tsdb_sha256 in, out;
-};
-
-static void hk_init(struct hk *k)
+/* the frame's tag: one of mac_cands.c's candidates under a fixed bench key (the cost, not the secret, is measured) */
+static int mac_setup(struct mc *m, int kind)
 {
-    uint8_t pad[64];
-    for (int i = 0; i < 64; i++)
-        pad[i] = (uint8_t)(i * 7 + 1) ^ 0x36; /* a fixed bench key: the cost, not the secret, is measured */
-    tsdb_sha256_init(&k->in);
-    tsdb_sha256_update(&k->in, pad, 64);
-    for (int i = 0; i < 64; i++)
-        pad[i] = (uint8_t)(i * 7 + 1) ^ 0x5c;
-    tsdb_sha256_init(&k->out);
-    tsdb_sha256_update(&k->out, pad, 64);
-}
-
-static void frame_tag(const struct hk *k, uint64_t seq, uint8_t type, const void *p, size_t n, uint8_t out[32])
-{
-    uint8_t s[9], ih[32];
-    memcpy(s, &seq, 8);
-    s[8] = type;
-    tsdb_sha256 x = k->in;
-    tsdb_sha256_update(&x, s, 9);
-    tsdb_sha256_update(&x, p, n);
-    tsdb_sha256_final(&x, ih);
-    x = k->out;
-    tsdb_sha256_update(&x, ih, 32);
-    tsdb_sha256_final(&x, out);
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++)
+        key[i] = (uint8_t)(i * 7 + 1);
+    if (kind < 0 || kind >= MC_N || mc_init(m, kind, key) != 0) {
+        fprintf(stderr, "link-bench: the MAC %s does not run on this CPU\n", mc_name(kind));
+        return -1;
+    }
+    return 0;
 }
 
 static uint64_t bad_tag_at = UINT64_MAX; /* --bad-tag-at: the sequence number whose tag is sent wrong */
 
 /* seals one frame in place: [u32 len = 1 + n + tag][u8 type][payload n][tag]; f holds 5 + n + TAG; returns its length */
-static size_t frame_seal(uint8_t *f, size_t n, int tag, const struct hk *k, uint64_t *seq)
+static size_t frame_seal(uint8_t *f, size_t n, const struct mc *k, uint64_t *seq)
 {
-    put32(f, (uint32_t)(1 + n + (tag ? TAG : 0)));
+    size_t tl = k->taglen;
+    put32(f, (uint32_t)(1 + n + tl));
     f[4] = 1;
-    if (tag) {
-        frame_tag(k, *seq, 1, f + 5, n, f + 5 + n);
+    if (tl) {
+        mc_tag(k, *seq, 1, f + 5, n, "", 0, f + 5 + n);
         if (*seq == bad_tag_at)
             f[5 + n] ^= 1;
         (*seq)++;
     }
-    return 5 + n + (tag ? TAG : 0);
+    return 5 + n + tl;
 }
 
-static int send_frame(int fd, uint8_t *buf, size_t n, int tag, const struct hk *k, uint64_t *seq)
+static int send_frame(int fd, uint8_t *buf, size_t n, const struct mc *k, uint64_t *seq)
 {
-    return full_write(fd, buf, frame_seal(buf, n, tag, k, seq));
+    return full_write(fd, buf, frame_seal(buf, n, k, seq));
 }
 
 /* reads one frame into buf; returns the payload length, -2 for the end frame (len 0), -3 for a whole frame whose tag
  * is wrong (the stream stays in step), -1 on an error */
-static long recv_frame(int fd, uint8_t *buf, size_t cap, int tag, const struct hk *k, uint64_t *seq)
+static long recv_frame(int fd, uint8_t *buf, size_t cap, const struct mc *k, uint64_t *seq)
 {
     if (full_read(fd, buf, 4))
         return -1;
     uint32_t len = get32(buf);
     if (len == 0)
         return -2;
-    if (len < 1u + (tag ? TAG : 0) || len > cap - 4 || full_read(fd, buf + 4, len))
+    size_t tl = k->taglen;
+    if (len < 1u + tl || len > cap - 4 || full_read(fd, buf + 4, len))
         return -1;
-    size_t n = len - 1 - (tag ? TAG : 0);
-    if (tag) {
+    size_t n = len - 1 - tl;
+    if (tl) {
         uint8_t t[32];
-        frame_tag(k, (*seq)++, buf[4], buf + 5, n, t);
-        if (memcmp(t, buf + 5 + n, TAG))
+        mc_tag(k, (*seq)++, buf[4], buf + 5, n, "", 0, t);
+        if (memcmp(t, buf + 5 + n, tl))
             return -3;
     }
     return (long)n;
@@ -256,11 +244,14 @@ static void serve_one(int fd)
     uint8_t *buf = malloc(cap);
     if (!buf)
         return;
-    struct hk k;
-    hk_init(&k);
+    struct mc k;
+    if (mac_setup(&k, (int)h.tag) != 0) {
+        free(buf);
+        return;
+    }
     uint64_t rseq = 0, wseq = 0, c0 = cpu_us();
     for (;;) {
-        long n = recv_frame(fd, buf, cap, (int)h.tag, &k, &rseq);
+        long n = recv_frame(fd, buf, cap, &k, &rseq);
         if (n == -2)
             break;
         if (n == -1) {
@@ -273,7 +264,7 @@ static void serve_one(int fd)
         }
         r.frames++;
         r.bytes += (uint64_t)n;
-        if (h.mode == 1 && send_frame(fd, buf, (size_t)n, (int)h.tag, &k, &wseq)) {
+        if (h.mode == 1 && send_frame(fd, buf, (size_t)n, &k, &wseq)) {
             r.errors++;
             break;
         }
@@ -370,7 +361,10 @@ static int run(const char *host, const char *port, int mode, size_t size, double
         return 1;
     for (size_t i = 0; i < cap; i++)
         b[i] = (uint8_t)(i * 131 + (i >> 9)); /* not all zero: a transport that compresses would cheat */
-    size_t stride = 5 + size + (tag ? TAG : 0);
+    struct mc k;
+    if (mac_setup(&k, tag) != 0)
+        return 2;
+    size_t stride = 5 + size + k.taglen;
     uint8_t *bb = NULL; /* --batch: batch frames back to back, one write */
     if (!mode && batch > 1) {
         if (!(bb = malloc(stride * (size_t)batch)))
@@ -378,14 +372,12 @@ static int run(const char *host, const char *port, int mode, size_t size, double
         for (int j = 0; j < batch; j++)
             memcpy(bb + stride * (size_t)j, b, stride);
     }
-    struct hk k;
-    hk_init(&k);
     uint64_t wseq = 0, rseq = 0, frames = 0, nlat = 0, c0 = cpu_us();
     double t0 = now_s(), t = t0, sum = 0;
     while (t - t0 < secs) {
         if (bb) {
             for (int j = 0; j < batch; j++)
-                frame_seal(bb + stride * (size_t)j, size, tag, &k, &wseq);
+                frame_seal(bb + stride * (size_t)j, size, &k, &wseq);
             if (full_write(fd, bb, stride * (size_t)batch)) {
                 fprintf(stderr, "link-bench: write failed\n");
                 return 1;
@@ -396,12 +388,12 @@ static int run(const char *host, const char *port, int mode, size_t size, double
         }
         for (int i = 0; i < (mode ? 1 : 16); i++) {
             double s = mode ? now_s() : 0;
-            if (send_frame(fd, b, size, tag, &k, &wseq)) {
+            if (send_frame(fd, b, size, &k, &wseq)) {
                 fprintf(stderr, "link-bench: write failed\n");
                 return 1;
             }
             if (mode) {
-                if (recv_frame(fd, b, cap, tag, &k, &rseq) != (long)size) {
+                if (recv_frame(fd, b, cap, &k, &rseq) != (long)size) {
                     fprintf(stderr, "link-bench: bad echo\n");
                     return 1;
                 }
@@ -451,6 +443,62 @@ static void usage(void)
     exit(2);
 }
 
+/* one core tags frames of each size for `secs` of its CPU time: payload MB/s, ns per frame, CPU s per GB */
+static int mac_bench(int only, const char *sizes, double secs)
+{
+    if (mc_selftest() != 0) {
+        fprintf(stderr, "link-bench: a MAC candidate gives wrong tags here\n");
+        return 1;
+    }
+    size_t cap = 1 << 20;
+    for (const char *p = sizes; *p; p += *p == ',') {
+        size_t n = strtoull(p, (char **)&p, 0);
+        if (n > cap)
+            cap = n;
+        if (*p && *p != ',')
+            usage();
+    }
+    uint8_t *b = malloc(cap);
+    if (!b)
+        return 1;
+    for (size_t i = 0; i < cap; i++)
+        b[i] = (uint8_t)(i * 131 + (i >> 9));
+    for (int kind = MC_HMAC; kind < MC_N; kind++) {
+        if (only > 0 && kind != only)
+            continue;
+        struct mc m;
+        if (mac_setup(&m, kind) != 0) {
+            if (only > 0)
+                return 2;
+            printf("mac=%s unavailable=1\n", mc_name(kind));
+            continue;
+        }
+        for (const char *p = sizes; *p; p += *p == ',') {
+            size_t n = strtoull(p, (char **)&p, 0);
+            uint64_t frames = 0, sink = 0, seq = 0;
+            struct timespec c0, c1;
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
+            double el = 0;
+            do {
+                for (int j = 0; j < 64; j++) {
+                    uint8_t t[32];
+                    mc_tag(&m, seq++, 1, b, n, "", 0, t);
+                    sink += t[0];
+                }
+                frames += 64;
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+                el = (double)(c1.tv_sec - c0.tv_sec) + (double)(c1.tv_nsec - c0.tv_nsec) / 1e9;
+            } while (el < secs);
+            double bytes = (double)frames * (double)n;
+            printf("mac=%s size=%zu MB_s=%.1f ns_frame=%.1f cpu_s_GB=%.3f sink=%" PRIu64 "\n", mc_name(kind), n,
+                   bytes / el / 1e6, el * 1e9 / (double)frames, el / (bytes / 1e9), sink & 1);
+            fflush(stdout);
+        }
+    }
+    free(b);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -459,11 +507,12 @@ int main(int argc, char **argv)
     int mode = 0, tag = 0, buf = 0, batch = 1;
     long parent = 0;
     size_t size = 1024;
+    const char *sizes = "64,1024,16384,1048576";
     double secs = 3;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--tag")) {
-            tag = 1;
+            tag = MC_HMAC;
             continue;
         }
         if (!strcmp(a, "--rsocket")) {
@@ -489,6 +538,11 @@ int main(int argc, char **argv)
             secs = atof(v);
         else if (!strcmp(a, "--buf"))
             buf = atoi(v);
+        else if (!strcmp(a, "--mac")) {
+            if ((tag = mc_kind(v)) < 0)
+                usage();
+        } else if (!strcmp(a, "--sizes"))
+            sizes = v;
         else if (!strcmp(a, "--label"))
             label = v;
         else if (!strcmp(a, "--batch"))
@@ -508,6 +562,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "link-bench: --batch must be 1 .. 4096\n");
         return 2;
     }
+    if (!strcmp(argv[1], "mac"))
+        return mac_bench(tag ? tag : -1, sizes, secs);
     signal(SIGPIPE, SIG_IGN); /* a peer that went away is a failed write, not a dead process */
     if (!strcmp(argv[1], "serve"))
         return serve(bind_addr, port_file, buf, parent);

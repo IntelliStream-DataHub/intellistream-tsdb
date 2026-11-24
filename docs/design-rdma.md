@@ -220,7 +220,49 @@ extensions) link-bench built `-O2` (as rdma-bench.sh builds it) and `-O3 -march=
 The 64 B and 1 KiB rows are one `write()` per frame with `TCP_NODELAY` (one `rwrite` per frame on rsocket): a system
 call per frame. peerlink appends frames to its write buffer and sends many per call, so these rows overstate its CPU
 per small frame on TCP and are not the basis for a per-frame comparison. `link-bench --batch N` writes N frames per
-call (rdma-bench.sh's `eth-tcp-batch` and `rsocket-batch` suites); not run yet (rd-hw).
+call (rdma-bench.sh's `eth-tcp-batch` and `rsocket-batch` suites); with the HMAC not run (rd-hw), with cluster
+version 8's check below ("After rd-mac").
+
+**After rd-mac (D14).** The same pair, the same port, with the check of cluster version 8 (XXH3-128, §6) in place of
+the HMAC tag: `tools/rdma-bench.sh --only tcp,loop --mac xxh3-128 --reps 3 --secs 3` (2026-11-24, raw results kept in
+the track's `xeon-d14`). Gbit/s mean (lowest-highest) of 3 runs, CPU s/GB sender / receiver:
+
+| frame | untagged | CPU s/GB | XXH3-128 check | CPU s/GB | HMAC tag (above) |
+|---|---|---|---|---|---|
+| 64 B | 0.24 (0.22-0.25) | 33 / 22 | 0.46 (0.24-0.66) | 18 / 17 | 0.30 |
+| 1 KiB | 6.40 (3.35-8.03) | 1.19 / 1.25 | 4.43 (2.73-7.53) | 2.07 / 1.65 | 1.26 |
+| 16 KiB | 31.9 (26.5-36.3) | 0.14 / 0.25 | 25.8 (22.4-32.6) | 0.16 / 0.32 | 1.81 |
+| 64 KiB | 31.9 (28.9-37.4) | 0.11 / 0.25 | 29.3 (24.8-37.4) | 0.15 / 0.28 | 1.83 |
+| 256 KiB | 33.0 (32.7-33.3) | 0.12 / 0.20 | 31.1 (27.1-37.3) | 0.15 / 0.26 | 1.86 |
+| 1 MiB | 33.5 (31.9-36.6) | 0.10 / 0.19 | 32.0 (30.4-34.8) | 0.15 / 0.23 | 1.90 |
+| 4 MiB | 37.0 (36.6-37.2) | 0.11 / 0.18 | 34.5 (29.3-37.3) | 0.17 / 0.21 | 1.89 |
+
+Round trip, p50 (p99) in µs, mean of 3 runs:
+
+| frame | untagged | XXH3-128 check | HMAC tag (above) |
+|---|---|---|---|
+| 64 B | 23.2 (36.6) | 23.7 (31.5) | 24.9 (33.1) |
+| 1 KiB | 24.3 (32.0) | 28.0 (57.5) | 48.9 (116) |
+| 16 KiB | 39.3 (62.2) | 42.3 (63.9) | 362 (1,020) |
+| 64 KiB | 80.7 (120) | 87.8 (121) | 1,460 (1,880) |
+| 256 KiB | 168 (240) | 211 (307) | not measured |
+| 1 MiB | 518 (635) | 671 (969) | 17,800 (18,700) |
+
+The check takes the cap off: from 16 KiB on a checked link moves 26-35 Gbit/s against 1.8-1.9 with the HMAC, 14-18
+times as much, 4-19% below the untagged link's means (above 16 KiB within the spread of the three runs, so only the
+16 KiB gap is clearly the check's), and costs 0.02-0.07 CPU s/GB more per side than untagged (the HMAC cost 4.1). The 1 KiB round trip loses 4 µs to the check instead of 26. The 64 B and 1 KiB bandwidth rows vary
+between runs by a factor of 2-3, untagged as much as checked (a system call per frame, see below; the untagged 64 B
+row is a third of the first measurement's 0.70), so they say nothing about the check.
+On loopback (no NIC) a checked link moves 31.5 Gbit/s at 1 MiB (31.3-31.6) against 36.7 untagged and the HMAC's
+1.81, at 0.18 CPU s/GB per side against 0.145 untagged (+0.035); at 16 KiB 14.4 against 15.0. Batched, 64 frames per
+`write()` (`eth-tcp-batch`, the way peerlink sends small frames), the small frames no longer vary: 64 B 0.64 Gbit/s
+checked against 0.68 untagged (sender 0.85 against 0.35 CPU s/GB, receiver 12.4 against 11.8), 1 KiB 7.44 against
+8.22 (0.19 / 1.07 against 0.13 / 0.97), 16 KiB 33.4 against 37.3, 64 and 256 KiB within the runs' spread. At 1 and
+4 MiB batched the checked link stays at 26.7 Gbit/s (25.4-27.5) against 37.2 untagged, though unbatched it moves 32-35
+and its sender spends 0.25 CPU s/GB there (0.16 untagged), well under a core: not explained yet (XXH3 at about 30 GB/s spends some 35 µs on a 1 MiB frame, so the
+batched path of link-bench around the check is the likelier cause; a `perf record` of that sender is rd-hw's). The
+frames peerlink sends at that size (bulk CHUNKs) go one per call anyway, but until the gap is explained these numbers
+do not show that the check costs nothing on batched bulk frames.
 
 ### 3.4 Not measured
 
@@ -493,8 +535,11 @@ The threat model is a backend on an isolated network (design-auth.md). Two facts
 not see it (§2), and a peer that can reach a QP can send to it. In D the QP exists only for a connection whose TCP
 handshake passed AUTH. An RC packet names only its destination QP; the responder checks its PSN and partition key
 (P_Key), not who sent it, so a host on the fabric that learns a QP number and guesses the PSN could inject packets.
-The protection is that every frame keeps its MAC (with the faster MAC of §6), so a forged packet on the fabric ends the link instead of
-reaching a driver. No remote key is ever handed out (D9), so no peer can read or write our memory. Option C's rdma_cm
+Since rd-mac a frame carries an integrity check without a key (§6, the owner's decision of 2026-11-24: own servers,
+own network), so such a packet is caught only when it breaks the check by chance, not when it was made to pass it; a
+corrupted, dropped, repeated or reordered frame still ends the link. This is accepted for now, on the same ground as
+TCP on the cluster's network; a keyed check type (§6, "What a keyed type would cost later") would close it.
+No remote key is ever handed out (D9), so no peer can read or write our memory. Option C's rdma_cm
 listener is reachable by anyone on the fabric; it accepts only a connection whose private data carries a nonce the
 TCP handshake issued.
 
@@ -503,7 +548,7 @@ TCP handshake issued.
 §3.3 shows that `frame_tag` limits every link to about 230 MB/s and costs about 4 CPU s/GB per side on these servers;
 OpenSSL's SHA-256 on the same CPU is about 480 MB/s and BLAKE2b about 930 MB/s (Python's hashlib, single core, one
 run each): a faster SHA-256 does not lift the cap enough. The servers have no `openssl` command, so AES-GMAC and BLAKE3
-are not measured here yet. Options, to be measured with `link-bench --mac` in the first track:
+were not measured there. The options as the design listed them before rd-mac measured them:
 
 | MAC | speed on these CPUs | notes |
 |---|---|---|
@@ -513,28 +558,119 @@ are not measured here yet. Options, to be measured with `link-bench --mac` in th
 | BLAKE3 keyed | several GB/s per core with AVX2/AVX-512 (to measure) | CC0/Apache-2.0 reference code with SIMD kernels; fits `src/levels.h` style dispatch |
 | Poly1305 with a per-frame key from ChaCha20 | 1-2 GB/s in portable 64-bit C (to measure) | no SIMD needed, small code |
 
-Default proposal: the fastest that keeps a 128-bit tag and a keyed construction, negotiated in HELLO (a new cluster
-version: before 1.0 no compatibility promise, design-cluster-data.md E40). If production's CPUs have SHA extensions,
-dispatching HMAC-SHA256 to them is the cheapest first step and changes no protocol. Whatever is chosen, one link's
-MAC runs on one core per side (§4 "CPU with the MAC"): line rate on one link needs about 6 GB/s per core, which no
-candidate is expected to reach on these CPUs; spreading one link's MAC over threads is not in this design.
+**Measured (rd-mac, 2026-11-24)**: `link-bench mac` (tools/mac_cands.c; `tools/rdma-bench.sh --only mac` on the test
+servers) tags frames in memory on one core: payload MB/s, mean of 3 runs (lowest-highest), built `-O3` without
+`-march` as `make dist` builds (each kernel picks its instructions at run time). Every candidate is checked against
+known answers first (Python's `hmac`, the `cryptography` package, BLAKE3's own vectors). The input of each tag is
+peerlink's: sequence number, type, payload; GMAC and Poly1305 take sequence number and type as their nonce.
 
-What rd-mac must carry (it is more than a function): a SIMD kernel (BLAKE3, SHA-NI, AES-GMAC) needs CPU-level
-dispatch under `make dist` (the `src/levels.h` pattern or a runtime check like `src/cpu.c`'s, `tools/check-isa.sh`'s
-v2 baseline and its allow list of wide kernels); OpenSSL's libcrypto instead would be a new linked library
-(`tools/check-glibc.sh`, the tarball, AGENTS.md's Requirements). The link MAC is server-only, so it goes in a new
-AGPL `server/plmac.c` (vendored reference code under its own directory with its `UPSTREAM` and licence, as `src/ec/`),
-not in the Apache-2.0 `client/tsdb_crypto.c`; test vectors of the chosen MAC; `PL_CL_VERSION` 8 and the capability
-bit of §5.1; test_peerlink's tag mutants against the new MAC; the fuzz-replframe corpus regenerated; and
-`link-bench --mac` to take the numbers of D14. Not proposed: MAC'ing only the frame's
-xxh64 (not collision resistant: a tag over it protects nothing against a peer that can change bytes), or no MAC on
-RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forged packets).
+| MAC (tag bytes) | frame | Xeon E5-2697 v4 (test servers: AVX2, no SHA-NI) | i5-13400 (build machine: SHA-NI) | Ryzen 9 7950X (dev: AVX-512, SHA-NI) |
+|---|---|---:|---:|---:|
+| HMAC-SHA256, portable (32), today | 64 B | 71 (71-71) | 99 (99-99) | 132 (132-132) |
+| | 1 KiB | 207 (207-207) | 285 (284-286) | 390 (388-391) |
+| | 16 KiB | 235 (235-235) | 324 (323-326) | 446 (444-447) |
+| | 1 MiB | 234 (234-234) | 320 (320-321) | 451 (451-452) |
+| HMAC-SHA256, SHA-NI (32) | 64 B | not on this CPU | 387 (385-392) | 502 (502-503) |
+| | 1 KiB | | 1,573 (1,571-1,576) | 2,111 (2,101-2,118) |
+| | 16 KiB | | 1,960 (1,960-1,960) | 2,678 (2,676-2,680) |
+| | 1 MiB | | 1,991 (1,991-1,992) | 2,723 (2,722-2,724) |
+| **AES-128-GMAC** (16) | 64 B | **739 (639-789)** | **1,445 (1,440-1,448)** | **1,576 (1,574-1,578)** |
+| | 1 KiB | **5,312 (5,300-5,333)** | **8,782 (8,756-8,812)** | **8,127 (8,108-8,144)** |
+| | 16 KiB | **7,331 (7,301-7,379)** | **11,033 (10,986-11,067)** | **10,348 (10,280-10,476)** |
+| | 1 MiB | **7,540 (7,516-7,559)** | **11,297 (11,282-11,307)** | **10,469 (10,446-10,500)** |
+| Poly1305, ChaCha20 per-frame key (16) | 64 B | 329 (329-329) | 409 (409-410) | 475 (473-476) |
+| | 1 KiB | 1,465 (1,464-1,465) | 1,782 (1,780-1,784) | 1,574 (1,572-1,576) |
+| | 16 KiB | 1,870 (1,870-1,871) | 2,243 (2,231-2,251) | 1,824 (1,813-1,831) |
+| | 1 MiB | 1,908 (1,908-1,909) | 2,290 (2,266-2,314) | 1,853 (1,850-1,856) |
+| BLAKE3 keyed (16 of its output) | 64 B | 334 (332-335) | 403 (400-405) | 537 (535-538) |
+| | 1 KiB | 766 (766-767) | 889 (889-890) | 1,158 (1,157-1,158) |
+| | 16 KiB | 1,436 (1,435-1,436) | 1,739 (1,704-1,760) | 2,788 (2,785-2,790) |
+| | 1 MiB | 2,603 (2,600-2,607) | 3,261 (3,134-3,353) | 8,595 (8,581-8,603) |
+| *XXH3-64, no key* (8) | 64 B | *4,009 (4,008-4,009)* | *8,061 (7,922-8,181)* | *5,179 (5,121-5,232)* |
+| | 1 KiB | *20,363 (19,966-20,576)* | *26,612 (26,579-26,643)* | *24,991 (24,927-25,109)* |
+| | 16 KiB | *32,075 (31,955-32,143)* | *32,431 (31,982-32,656)* | *41,534 (41,265-41,668)* |
+| | 1 MiB | *29,955 (29,907-29,989)* | *32,994 (32,670-33,179)* | *43,624 (43,260-44,258)* |
+| ***XXH3-128, no key*** (16), **cluster version 8** | 64 B | ***2,720 (2,718-2,721)*** | ***5,013 (5,009-5,016)*** | ***3,687 (3,586-3,745)*** |
+| | 1 KiB | ***17,000 (16,820-17,115)*** | ***22,175 (21,913-22,318)*** | ***22,568 (22,448-22,709)*** |
+| | 16 KiB | ***31,383 (31,213-31,491)*** | ***32,219 (32,215-32,225)*** | ***40,511 (38,656-41,562)*** |
+| | 1 MiB | ***29,887 (29,822-29,923)*** | ***33,102 (33,032-33,137)*** | ***43,709 (43,476-43,842)*** |
+
+XXH3 (xxHash 0.8.3) is built at the same level, so `make dist`'s x86-64-v2 build runs its SSE2 kernel on every CPU
+(no dispatch); the XXH3 rows of the dev machine and of the build machine (there at a load of 0.5) were taken in a
+second session (`dev-mac2`, `build-mac2`), the keyed rows of that
+session agree with the first within 2-9% (GMAC 64 B 1,517 against 1,576; 1 MiB 9,453 against 10,469). The second
+test server gave the same numbers within 1% (its 64 B GMAC 789). The build machine ran beside other jobs (load about
+2 on 16 threads); its hybrid cores make the spread of BLAKE3's 1 MiB row.
+
+**The owner's BLAKE3 hypothesis** ("much faster than HMAC-SHA256"): faster than HMAC, 5-11 times at 1 MiB, but it is
+not the fastest keyed MAC on any of the three CPUs at any frame size. BLAKE3 hashes 1 KiB chunks in parallel, so it
+uses its SIMD width only from a few KiB on, and the test servers' AVX2 gives it 2.6 GB/s at 1 MiB; only the dev
+machine's AVX-512 brings it near GMAC there (8.6 against 10.5 GB/s). AES-128-GMAC is the fastest keyed MAC at every
+size on all three: on the test servers 32 times today's HMAC at 1 MiB and 26 times at 1 KiB. SHA-NI would not help
+the test servers at all (they lack it) and is 4-5 times slower than GMAC where it exists. CPU features: the test
+servers' Xeon E5-2697 v4 has AES-NI, PCLMULQDQ and AVX2, no SHA-NI, no VAES, no AVX-512; the build machine's i5-13400
+has AES-NI, PCLMULQDQ, VAES, VPCLMULQDQ, SHA-NI and AVX2, no AVX-512; the dev machine's Ryzen 9 7950X has all of them,
+AVX-512 included.
+
+**XXH3 against the fastest keyed MAC.** XXH3-128 is 3.2-4.3 times GMAC on the test servers (64 B 2.7 against
+0.74 GB/s, 1 KiB 17.0 against 5.3, 16 KiB 31.4 against 7.3, 1 MiB 29.9 against 7.5) and 2.4-4.6 times on the dev
+machine. In CPU per GB and side at 1 MiB on the test servers: HMAC-SHA256 4.3 s, GMAC 0.13 s, XXH3-128 0.033 s. A
+40GbE link at about 4 GB/s of payload costs one side 17 cores of HMAC (so one core caps it near 1.9 Gbit/s, §3.3),
+0.53 of a core of GMAC, 0.13 of XXH3-128.
+
+**The decision (owner, 2026-11-24): integrity only, XXH3-128.** "We run this on our own servers": forgery is not in
+the threat model, so a frame needs protection against corruption, loss, repetition and reordering, which a 128-bit
+non-cryptographic hash with the frame's number in it gives, and the fastest keyed MAC would cost 3-4 times its CPU for
+a protection nobody asked for. Built in rd-mac (cluster version 8, `PL_CL_VERSION`; `server/plcheck.h`):
+
+- Every data-link frame (LOG, BULK, FWD, FWDQ, CHUNK, CHUNKB) carries a 16-byte **check** in place of the 32-byte
+  HMAC tag: XXH3-128 of the frame's type, header and payload (the bytes as they are on the wire, contiguous there),
+  seeded with `salt ^ seq`. `seq` is the frame's number in its direction, from 0 on every connection (as the HMAC's
+  was); `salt` is 64 bits per connection and direction that both ends derive from the handshake transcript with HMAC
+  under the secret (labels `tsdb-link-x>`, `tsdb-link-x<`), so a frame of an earlier connection fails its check in a
+  new one although its number repeats there. The HMAC put the sequence number in the hashed bytes; the check puts it
+  in the seed, which costs nothing (one-shot hash of the frame where it lies in the write buffer, no streaming state)
+  and still makes a dropped, repeated or reordered frame fail. The check of a frame that fails ends the connection,
+  as a wrong tag did.
+- The **handshake keeps HMAC-SHA256** both ways (once per connection): a server of another cluster, or with another
+  secret, or a wrong address still cannot open a link. The metadata links (Raft, kind META) keep HMAC framing: they
+  carry little and need nothing faster.
+- The check type is **negotiated** in HELLO: the dialer's HELLO offers a bit set of the types it speaks (a byte after
+  its fields), the acceptor's HELLO_ACK names the one chosen (the highest both speak) before its MAC, and both are in
+  the transcript the handshake MACs cover, so a type cannot be changed in flight. Today the only type is 1
+  (`PL_CHECK_XXH3`). An acceptor with no type in common refuses with a line naming both sets; a dialer handed a type
+  it did not offer refuses too. A peer of another cluster version (7: HMAC frames) is refused with a line naming both
+  versions, no fallback (before 1.0 there is no compatibility promise, design-cluster-data.md E40).
+- XXH3 compiles to SSE2 at the tarball's v2 level (and to AVX2 in a `-march=native` build; AVX-512 is capped to AVX2
+  there, because ASan's fake stack aligns to 32 bytes, AGENTS.md "CPU levels"): no dispatch, no constructor, nothing
+  for `tools/check-isa.sh` to allow. xxHash is BSD-2-Clause, vendored unchanged under `server/xxhash/` with its
+  `UPSTREAM` and licence; tsdb's own `xxh64` (files) has no XXH3.
+
+**The threat model this accepts** (design-auth.md: a backend on an isolated network). Anyone who can write to a
+peer link's TCP connection (on the path, with the connection's numbers) or, with RDMA, inject into its QP (§5.5) can
+now make a frame that passes: the check has no key. They still cannot open a link of their own (the handshake proves
+the secret). A host on the cluster's network is trusted not to tamper with its traffic, as the NFS servers' traffic
+already is. The RDMA QP-injection note of §5.5 is accepted for now on the same ground.
+
+**What a keyed type would cost later.** A keyed check fits as type 2 without a redesign: HELLO offers it, the
+acceptor picks it, `keys_derive` derives a 16-byte key per direction beside the salt (another label), and the frame
+keeps its 16 bytes. AES-128-GMAC is the one to build (the table): 3-4 times XXH3-128's CPU (0.13 against 0.033 CPU
+s/GB at 1 MiB on the test servers, 1.35 against 0.37 at 64 B), a nonce from the sequence number and the type (never
+reused under a key: the key is per connection and direction, and type 2 must make peerlink refuse a counter that would
+wrap, a guard it does not have today because XXH3 needs none and a 64-bit counter does not wrap in practice), and a
+kernel picked at run time (AES-NI and PCLMULQDQ are not in x86-64-v2; a CPU without them would not offer type 2).
+`tools/mac_cands.c` has the measured GMAC (8-way GHASH, AES-NI), checked against the `cryptography` package.
+
+Not chosen: XXH3-64 (2^-64 per corrupt frame is enough against chance too, but the 128-bit check costs at most a
+third more at 64 B and nothing from 16 KiB on, and it fills the 16 bytes a keyed type will need); the frame's xxh64
+alone (no position in it); no check on RDMA (InfiniBand's ICRC catches link
+corruption but not a host's or a buffer's, and the sequence number would go unchecked).
 
 ## 7. Decisions (defaults; the owner may change them)
 
 | | decision | alternative | why |
 |---|---|---|---|
-| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code | RDMA first | §3.3: the MAC caps every link at about 1.9 Gbit/s on every transport; RDMA alone would move nothing faster for bulk. At the default rate caps D1 alone buys little for bulk (§4): it is the precondition for D11, and it halves the 1 KiB round trip's cost on LOG and FWD (26 µs of MAC, §3.3) |
+| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code; **done in rd-mac as an integrity check, XXH3-128 without a key** (owner, 2026-11-24: forgery is not in the threat model), negotiated in HELLO so a keyed type (AES-128-GMAC, the fastest keyed MAC measured) can follow; the handshake keeps HMAC-SHA256 | RDMA first; the fastest keyed MAC | §3.3: the MAC capped every link at about 1.9 Gbit/s on every transport; RDMA alone would move nothing faster for bulk. §6: XXH3-128 does 30 GB/s per core on the test servers at 1 MiB (0.033 CPU s/GB per side, against HMAC's 4.3 and GMAC's 0.13). At the default rate caps D1 alone buys little for bulk (§4): it is the precondition for D11, and it takes the 26 µs of MAC off the 1 KiB round trip on LOG and FWD (§3.3) |
 | D2 | **Verbs under peerlink, upgraded from the TCP data link** (option D), rdma_cm only for iWARP and as an option | rsocket (B); rdma_cm everywhere (C); IPoIB only (A) | works without IPoIB; one auth path; firewall still governs who may connect; fallback is the link we have |
 | D3 | **The metadata link stays TCP** | everything on RDMA | Raft and the failure detector stay independent of the fabric and of new code |
 | D4 | **`dlopen` of libibverbs and librdmacm**; `NO_RDMA=1` to build without; macOS never | link them | one binary and one tarball for hosts with and without rdma-core |
@@ -547,7 +683,7 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
 | D11 | **The bulk rate caps keep their defaults** (BULK 256 MiB/s, `rebuild_mb_s` 200, CHUNKB 256, node-wide per kind) until rd-hw has measured, with the MAC fixed, the LOG link's latency and NFS/RDMA latency under bulk load; then they are raised on that evidence, per kind | raise them with D1 | the caps, not the transport, set bulk throughput today (§1); they also protect the storage that shares the port (§4) |
 | D12 | **tsdbd refuses a peer address that leaves through an IPoIB interface**, unless `cluster.peer.allow_ipoib=true` (§5.3) | warn only; no check | the owner's rule: no TCP over IPoIB; a misconfigured member is found at start or dial, not by its traffic |
 | D13 | **A service level per kind** (`cluster.peer.rdma.sl`, default 0) and no other QoS in tsdb | rate caps only | the SM's SL-to-VL tables and VL arbitration decide what an SL means; tsdb only has to let the operator mark its traffic (§4 "Sharing the port") |
-| D14 | **A decision point after rd-mac**: §3.3 (TCP, batched and tagged) and §4 are measured again with the new MAC, on the test servers and on production's CPUs if possible, and the owner sets the order and scope of rd-seam onwards from those numbers | build all tracks in order | the case for the verbs tracks rests on numbers §6 has not taken; the owner asked for RDMA links, so the point decides order and scope, not whether |
+| D14 | **A decision point after rd-mac**: §3.3 (TCP, batched and tagged) and §4 are measured again with the new MAC, on the test servers and on production's CPUs if possible, and the owner sets the order and scope of rd-seam onwards from those numbers | build all tracks in order | the case for the verbs tracks rests on numbers §6 has not taken; the owner asked for RDMA links, so the point decides order and scope, not whether. Measured on 2026-11-24 on the test servers (§3.3 "After rd-mac", §6); production's CPUs and §4's replicated bulk with the check not yet (`test_cluster replicate` prints no throughput: it checks rows, not a rate; a timed bulk transfer between members is rd-hw's, with tsdbc-bench `via` and insert-bench on 3 members) |
 
 ## 8. Testing
 
@@ -587,7 +723,7 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
 
 | key | risk | depends on | files | days |
 |---|---|---|---|---|
-| rd-mac | high | main | server/peerlink.c (`frame_tag` and its key schedule), new server/plmac.c (AGPL; vendored kernel code with its `UPSTREAM`), CPU-level dispatch (`src/levels.h` pattern or a runtime check; tools/check-isa.sh's allow list), `PL_CL_VERSION` 8 and `PL_CAP_RDMA`, test vectors, tools/link-bench.c `--mac`, tests/test_peerlink.c (tag mutants against the new MAC), fuzz-replframe corpus; then D14's measurements | 3 |
+| rd-mac | high | main | built (2026-11-24): server/plcheck.h (AGPL; XXH3-128, xxHash vendored unchanged under server/xxhash with `UPSTREAM`; SSE2 at v2, so no dispatch), server/peerlink.c (`frame_check` in place of `frame_tag`, the salt from the handshake's transcript, the check type negotiated in HELLO), `PL_CL_VERSION` 8 (`PL_CAP_RDMA` is rd-seam's), tools/mac_cands.c and `link-bench mac` / `run --mac` (every candidate, with known answers), tests/test_peerlink.c (the check's known answers in `codec`, every bit of a frame's length, type and check flipped, replays up to 2^63 frames back, the salts each handshake derives (`salts`), a raw acceptor that names an unoffered type (`dialtype`); mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`), fuzz-replframe corpus; then D14's measurements | 3 |
 | rd-seam | medium | rd-mac | server/peerlink.c split: the TCP transport behind `struct pl_transport` (read, write, poll fds, close) with no change in behaviour; test_peerlink unchanged and green; `objdump` not needed (behaviour, not codegen) | 1 |
 | rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
 | rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |

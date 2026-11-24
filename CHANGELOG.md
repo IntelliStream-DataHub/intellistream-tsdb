@@ -27,6 +27,21 @@ A REPLICA_REMOVE that would leave a volume fewer replicas than its `min_isr` is 
 volume: `min_isr` never asks for more copies than the volume has (a volume of 2 replicas and `min_isr` 2 is shrunk by
 moving a replica, or after lowering `min_isr`, never by a plain remove).
 
+**The peer protocol is now version 8: the data links check every frame with XXH3-128 instead of HMAC-SHA256.** The
+servers of a cluster run on their own network, so a data-link frame (replication, forwarding, chunks, snapshots) is
+checked for corruption, loss, repetition and reordering, not authenticated: XXH3-128 of its type, header and payload,
+seeded with a per-connection salt and its sequence number (16 bytes, where the HMAC tag was 32). The handshake still
+proves the cluster secret both ways with HMAC-SHA256, so a server of another cluster or a wrong address cannot open a
+link. HELLO offers the check types a server runs and HELLO_ACK names the one chosen, so a keyed MAC can be added later
+as another type (docs/design-rdma.md §6 and §3.3 have the measurements on the test servers' Xeons: the tag cost
+a link about 4 CPU-seconds per GB on each side, the check 0.02-0.07 more than no check at all from 16 KiB frames on
+(the hash alone: about 0.03 per GB on one core on 16 KiB to 1 MiB frames, 0.4 on 64-byte ones); a link over TCP on
+40GbE moves 26-35 Gbit/s with it from 16 KiB frames on, where the tag held it at 1.9). A node of another version is
+refused at HELLO, and the server it dials logs a line naming both versions (the dialing node, whose HELLO_ACK never
+comes, does not); a cluster made before this change is
+initialised again. xxHash's `xxhash.h` (0.8.3, BSD-2-Clause) is vendored in
+`server/xxhash/`.
+
 **The peer protocol is now version 7** (R4's command from the metadata group's leader to a volume's member, and the
 member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised
 again.
