@@ -173,12 +173,12 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
         say("volume %" PRIu32 " (%s): the open of %s failed: %s", r->number, r->name, vdir, tsdb_strerror(rc));
 }
 
-/* cvolset_record's CVS_AGAIN (a replica reset): the manager drops what it made of the volume, so that prepare runs again
- * on this push (cvolset_prepare sets the old directory aside). An open one is closed by cvolset_close first, and kept
- * when that fails (until r4-setchg builds it, always). The new state: MV_NONE, or `st` when the volume is kept. */
+/* cvolset_record's CVS_AGAIN (a replica reset, or a committed removal): the manager drops what it made of the volume, so
+ * that prepare runs again on this push (cvolset_prepare sets the old directory aside). cvolset_close closes what is open
+ * and sets a removed directory aside; the volume is kept when that fails. The new state: MV_NONE, or `st` when kept. */
 static int forget(uint32_t number, int st)
 {
-    if (st == MV_OPEN && cvolset_close(number) != 0)
+    if (st != MV_NONE && cvolset_close(number) != 0)
         return st;
     pthread_mutex_lock(&M.mu);
     struct mvol *m = mv_get(number);
@@ -200,8 +200,11 @@ static void *mgr_main(void *arg)
             break;
         M.dirty = 0;
         uint32_t n = M.nrecs;
+        int first = !M.synced;
         memcpy(recs, M.recs, n * sizeof recs[0]);
         pthread_mutex_unlock(&M.mu);
+        if (first && !M.writes)
+            cvolset_sweep(M.dir); /* D12: a v<N> of a removal committed while this server was down is set aside */
         for (uint32_t i = 0; i < n && !M.stop; i++) {
             const struct cluster_vol_rec *r = &recs[i];
             pthread_mutex_lock(&M.mu);
@@ -255,7 +258,13 @@ static void *mgr_main(void *arg)
         }
         pthread_mutex_unlock(&M.mu);
         for (uint32_t k = 0; k < ngone; k++)
-            cvolset_record(CVS_UNNAMED, gone[k], NULL);
+            if (cvolset_record(CVS_UNNAMED, gone[k], NULL) == CVS_AGAIN) { /* a committed removal (cvolset_mgr.c) */
+                pthread_mutex_lock(&M.mu);
+                struct mvol *gm = mv_get(gone[k]);
+                int gst = gm ? gm->state : MV_NONE;
+                pthread_mutex_unlock(&M.mu);
+                forget(gone[k], gst);
+            }
         pthread_mutex_lock(&M.mu);
         M.synced = 1;
         if (n)
@@ -414,6 +423,10 @@ int cvol_start(tsdb *t, const char *dir)
                          : !strcmp(mu, "trustunsure") ? CVOLFS_MUT_TRUSTUNSURE
                          : !strcmp(mu, "tornstale")   ? CVOLFS_MUT_TORNSTALE
                          : !strcmp(mu, "nodirsync")   ? CVOLFS_MUT_NODIRSYNC
+                         : !strcmp(mu, "staleopen")   ? CVOLFS_MUT_STALEOPEN
+                         : !strcmp(mu, "removenodirsync") ? CVOLFS_MUT_REMOVENODIRSYNC
+                         : !strcmp(mu, "removedopen") ? CVOLFS_MUT_REMOVEDOPEN
+                         : !strcmp(mu, "makemissing") ? CVOLFS_MUT_MAKEMISSING
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");

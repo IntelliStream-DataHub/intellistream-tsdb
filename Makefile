@@ -996,7 +996,7 @@ meta-soak: $(B)/test_meta
 
 # R4's files beside the replication driver and the volume manager (server/repld_int.h, cvolset.h, snapinst.h): stubs
 # until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is
-R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/snapinst.c
+R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c
 R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h
 TSDBD_SRC := $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h

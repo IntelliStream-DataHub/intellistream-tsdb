@@ -8,6 +8,7 @@
 #ifndef TSDB_CVOLSET_H
 #define TSDB_CVOLSET_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "cvolfs.h"
@@ -28,8 +29,9 @@ enum {
                      * old directory aside); an open one is closed through cvolset_close first */
 /* The manager's thread, no lock held: 0, or CVS_AGAIN. */
 int cvolset_record(int change, uint32_t number, const struct cluster_vol_rec *r);
-/* An open volume the manager is to forget (CVS_AGAIN): closes its driver and engine. 0 closed, -1 kept open (a line
- * said why). The manager's thread, no lock held. */
+/* A volume the manager is to forget (CVS_AGAIN; any state but MV_NONE): closes its driver and engine when they are open,
+ * and sets the directory of a committed removal aside (v<N>.removed-<rid>, root fsynced, deleted in the background).
+ * 0 done, -1 kept (a line said why). The manager's thread, no lock held. */
 int cvolset_close(uint32_t number);
 /* 1 if a push of the records `recs` (n of them, ascending by number, at most CLUSTER_REPORT_VOLS: cluster.h) shows that
  * `number` is not named here: it is not among them, and not past the end of a push that was cut at the limit. */
@@ -37,5 +39,21 @@ int cvolset_unnamed(const struct cluster_vol_rec *recs, uint32_t n, uint32_t num
 /* In cvolfs_prepare before v<N> is looked at or its REPL loaded: sets aside a directory the record no longer
  * describes (D12, D13). 0 to go on, -1 to refuse the volume (a line said why). */
 int cvolset_prepare(const char *root, uint32_t number, const struct cvolfs_rec *r);
+
+/* cvolset.c's helpers, shared with server/cvolset_mgr.c (the manager side) */
+/* notes of the manager (any thread): kind CVS_RESET with the record's new rid, CVS_UNNAMED a committed removal */
+void cvolset_note(uint32_t number, int kind, uint64_t rid);
+/* 1 if noted (its rid in *rid when not NULL), and taken out when `take` */
+int cvolset_noted(uint32_t number, int kind, uint64_t *rid, int take);
+/* renames root/v<N> to v<N>.<kind>-<rid hex> (a free name: .1, .2 ... after it) and fsyncs root; the new path in `to`.
+ * 0, or -1 with a line */
+int cvolset_setaside(const char *root, uint32_t number, const char *kind, uint64_t rid, char *to, size_t cap);
+/* the rid in vdir/REPL: 0, or -1 (none, unreadable) */
+int cvolset_rid_of(const char *vdir, uint64_t *rid);
+/* removes `path` and everything under it on a detached thread (a line if it fails) */
+void cvolset_delete_bg(const char *path);
+/* the manager, on its first push after the start and after a committed removal: every v<N> of root that names a
+ * volume the metadata copy holds without this server is set aside as removed (as cvolset_close does) */
+void cvolset_sweep(const char *root);
 
 #endif

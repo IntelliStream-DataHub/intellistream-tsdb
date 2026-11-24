@@ -190,7 +190,10 @@ enum {
     RM_STEPCURRENTONLY,
     RM_STALLCATCHUP,
     RM_DEMOTESTALEIDX, /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
-    RM_DIVERGEISR      /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
+    RM_DIVERGEISR,     /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
+    RM_SETKEEPOLD,     /* rset.c: a driver keeps the replica set it opened with (a learner never joins) */
+    RM_SETNOVERSION,   /* rset.c: a peer message of any set version reaches the driver */
+    RM_SETDRVNOREMAP   /* rset.c: the core is remapped at a set change, the driver's cursors are not */
 };
 
 struct repld_g {
@@ -256,6 +259,7 @@ struct repld_g {
                        * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
+    int set_stale;    /* TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, a set change is not applied (rset.c) */
     struct rin *ins; /* bulk files being received */
 };
 
@@ -268,6 +272,8 @@ struct repld_g {
 #define post rd_post
 #define save_repl rd_save_repl
 #define rec_set rd_rec_set
+#define drain rd_drain
+#define vol_fail rd_vol_fail
 
 extern struct repld_g G;
 
@@ -283,5 +289,9 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n);
 int save_repl(struct rvol *rv, uint64_t fence, uint64_t led, uint64_t floor);
 /* rv->rec = *r with G.nshort kept (rv->mu held, or the volume not yet listed) */
 void rec_set(struct rvol *rv, const struct cluster_vol_rec *r);
+/* carries out the core's queued actions (rv->mu held, the volume's thread; let go of around an APPLY or a SAVE) */
+void drain(struct rvol *rv);
+/* the volume stops: reported LOCAL_FAULT, quiesced (rv->mu held) */
+void vol_fail(struct rvol *rv, const char *why);
 
 #endif
