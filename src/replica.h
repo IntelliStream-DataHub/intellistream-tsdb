@@ -48,6 +48,7 @@ void replica_keep_next(uint64_t max_bytes, uint64_t max_ms);
 /* tests: plants mutant replicadropsfloor (a replica's flushed segments go by the floor alone) in this process; tsdbd
  * calls it for TSDB_REPLD_MUTANT=replicadropsfloor (tests/test_cluster.c failoverkeep) */
 void tsdb_test_replica_drops_floor(void);
+void tsdb_test_replay_start_log(void); /* the engine's mutant replaystartlog, planted by tsdbd (TSDB_REPLD_MUTANT) */
 /* tests: plants mutant replicadropsfiles (a replica removes an applied COMMIT's files at once, and a deposed leader its
  * own, so a member promoted later cannot serve them); TSDB_REPLD_MUTANT=replicadropsfiles in tsdbd */
 void tsdb_test_replica_drops_files(void);

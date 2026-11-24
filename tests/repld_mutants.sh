@@ -33,6 +33,8 @@
 # TSDB_CVOL_MUTANT, set to the same name): refusedsilent (a volume the server refused is left out of its heartbeat
 # report, not LOCAL_FAULT) refused. One is the engine's (src/replica.c, planted by tsdbd under the same name):
 # replicadropsfloor (a replica's flushed segments go once its floor passes them, the retention caps ignored) failoverkeep.
+# replaystartlog (a member reports its log start as its replay start, D17: the floor stays up to repl_retain_s back)
+# classfailover.
 # promotenone (a driver promoting reports role NONE, so a promotion slower than 3 s is taken for a deposed leader and
 # fenced again; the volume's first promotion is slow too, so it may never get a writer) promoteslow (knob promoteslow).
 # divergeisr (a volume whose DIVERGED file is set is not stopped: no LOCAL_FAULT, it stays in the ISR and may lead)
@@ -72,6 +74,7 @@ table=(
     "nospill|backpressure|a replica received a part above the spill threshold into memory"
     "keepignorespeers|keepfloor|the leader keeps [0-9]+ WAL segments, not the 5 flushed ones a replica away has not acked"
     "replicadropsfloor|failoverkeep|the replica away during the failover was told it needs a snapshot"
+    "replaystartlog|classfailover|a class switch on the new leader waited more than 60 s"
     "fastride|rejoin|did not join the ISR again in 30 s"
     "nojoinhold|rejoinsteady|did not join the ISR again in 30 s"
     "inboxstarve|rejoinslow|the leader dropped the healthy replica from the ISR while another"

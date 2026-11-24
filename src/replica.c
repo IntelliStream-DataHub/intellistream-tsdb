@@ -617,6 +617,11 @@ void tsdb_test_replica_drops_floor(void)
     eng_test_mutant = MUT_REPLICA_KEEP_FLOOR;
 }
 
+void tsdb_test_replay_start_log(void)
+{
+    eng_test_mutant = MUT_REPLAY_START_LOG;
+}
+
 void tsdb_test_replica_drops_files(void)
 {
     eng_test_mutant = MUT_REPLICA_DROP_APPLIED_FILES;

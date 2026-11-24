@@ -2119,6 +2119,8 @@ void repld_init(tsdb *t, const char *dir)
     const char *mu = getenv("TSDB_REPLD_MUTANT");
     if (mu && !strcmp(mu, "replicadropsfloor")) /* the engine's mutant (src/replica.c), planted in tsdbd */
         tsdb_test_replica_drops_floor();
+    if (mu && !strcmp(mu, "replaystartlog")) /* the engine's (D17): the replay start is the log start again */
+        tsdb_test_replay_start_log();
     if (mu && !strcmp(mu, "replicadropsfiles"))
         tsdb_test_replica_drops_files();
     G.mutant = !mu                              ? RM_NONE
