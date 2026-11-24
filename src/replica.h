@@ -96,6 +96,7 @@ int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size
  * syncs, and when the commit point has passed the marker and replica_apply has applied it (to the end of the log)
  * replica_promote closes *dbp (set to NULL) and opens the directory as a writer in *out: see the function. */
 int replica_epoch_begin(struct eng *db, uint64_t epoch, const char *owner, uint64_t *pos);
+extern void (*replica_test_kept_hook)(struct eng *db); /* test hook: before the save of RSTATE's `kept` (D17) */
 extern void (*replica_test_promote_hook)(void); /* test hook: after the segments are removed, before the engine closes */
 int replica_promote(struct eng **dbp, uint64_t epoch_pos, struct eng **out);
 /* A deposed leader (design-cluster.md 6.3), or a replica whose promotion was fenced: *dbp is closed without a flush (a

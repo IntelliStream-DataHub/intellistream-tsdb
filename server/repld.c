@@ -1396,6 +1396,14 @@ static void exec(struct rvol *rv, struct repl_action *a)
         }
         if (G.mutant != RM_NOLOGSTARTCHECK) /* planted: the core never hears that the log start moved */
             log_start_check(rv);
+        { /* the replay start (D17): the first position an open of this member may replay, past the kept segments; the
+           * core sends it in its ACKs (a leader uses its own), and the leader's replay floor rises with it */
+            pthread_mutex_unlock(&rv->mu);
+            uint64_t rs = replica_replay_start(db);
+            pthread_mutex_lock(&rv->mu);
+            if (rs)
+                repl_replay_start(rv->core, rs);
+        }
         break;
     case REPL_A_SEND:
         if (a->msg.type == REPL_M_APPEND && a->msg.to >= 0 && a->msg.to < (int)rv->rec.nrep) {

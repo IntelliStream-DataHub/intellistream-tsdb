@@ -1570,7 +1570,7 @@ static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
 {
     /* RSTATE names it as holding nothing outside the parts before it can outlive a drop of its rows: a writer's open
      * neither replays nor removes it (fails the engine on error) */
-    leader_rs_kept(db, seq);
+    leader_rs_kept(db, seq, fno_end);
     if (lk_push(db, seq, fno_end) != 0) {
         db->lk_stuck = true; /* the segment stays; a later one must not go before it */
         return;

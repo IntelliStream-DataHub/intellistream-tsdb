@@ -77,7 +77,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_ROWS_HOLD_MU, MUT_REPLICA_PROMOTE_NO_APPLY_MU,
        MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
        MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
-       MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC, MUT_JR_BARGE };
+       MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC, MUT_JR_BARGE,
+       MUT_REPLAY_KEPT_EARLY, MUT_REPLAY_START_LOG, MUT_REPLAY_START_HIGH, MUT_REPLAY_START_UNSAVED };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1536,7 +1537,7 @@ void jr_commit(struct eng *db, enum jr_kind kind, const void *arg);
 int jr_precommit(struct eng *db, size_t n);
 int leader_rs_drop(struct eng *db, int64_t ts);
 int leader_rs_open(struct eng *db);
-int leader_rs_kept(struct eng *db, uint64_t seq);
+int leader_rs_kept(struct eng *db, uint64_t seq, uint64_t fno_end);
 /* The DROPs below `lo`, the first position the leader's log may still hold (its kept segments went up to there), leave
  * RSTATE's list in memory; the next save writes the shorter list (r3a2 R8). Takes publish_lock; a no-op on a
  * writer that is not a leader. */
@@ -1636,8 +1637,14 @@ int leader_rs_image(struct eng *db, uint8_t **buf, size_t *len, uint64_t *done);
 struct lkfile;
 int leader_links_list(struct eng *db, uint64_t hi, struct lkfile **out, size_t *n);
 void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep);
-/* The first position a replica replays from (r4-replay; today its log start, 0 when not a replica) */
+/* The replay start (design-cluster.md 5.4, D17): the first position any open of this member may replay, the first
+ * position of its oldest segment above the `kept` that RSTATE holds durably (a replica's: replica_flushed and
+ * kept_save; a leader's: leader_rs_kept), never below the log start and never from a `kept` in memory only; 0 when
+ * there is none to tell (the core then uses the log start). The driver hands it to its core (repl_replay_start), whose
+ * ACK carries it to the leader's replay floor. */
 uint64_t replica_replay_start(struct eng *db);
+/* tests: the records a replica's applier applied since its open (the open's replay included) */
+uint64_t replica_test_napplied(struct eng *db);
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1916,6 +1923,7 @@ struct eng {
      * while the floor is below it (db->lock). */
     uint64_t wtail_from;
     _Atomic uint64_t lead_floor;
+    _Atomic uint64_t lead_replay; /* a leader's replay start: the end of the `kept` RSTATE holds durably (0: none) */
     uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
     uint64_t wal_open_removed; /* wal_open: the segments up to this are gone (a failed unlink or rename at open stops it) */
     /* the change feed (feed.h, feedfile.c, feedclean.c). Lock order: feed_lock is a leaf, never held while an engine
