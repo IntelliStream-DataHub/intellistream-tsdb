@@ -15920,9 +15920,11 @@ static int mvt_parse(const char *ln, struct mvt *t)
 /* the watched check of a move of volume 1 from node a to node b over every committed record (server w's voltrace; w is
  * never killed): once b is a member, a may leave the ISR only after b joined it, and the ISR it leaves behind has at
  * least as many members as the ISR had in the last record before b joined (the move never lowers the number of in-sync
- * copies). A lag shrink of another member is not the move's and is not judged. */
+ * copies). A lag shrink of another member is not the move's and is not judged. Records at or below `from` are
+ * skipped: a second move in one scenario must not count the first one's history (b may have been a member then). */
 struct mv_watch {
     uint32_t a, b;
+    uint64_t from;
     int b_member, joined, a_left, ended, b_gone;
     uint32_t min, lines;
     struct mvt last;
@@ -15931,8 +15933,9 @@ struct mv_watch {
 static void move_watch(int w, struct mv_watch *x)
 {
     uint32_t a = x->a, b = x->b;
+    uint64_t from = x->from;
     memset(x, 0, sizeof *x);
-    x->a = a, x->b = b;
+    x->a = a, x->b = b, x->from = from;
     char p[PATH_MAX + 96];
     server_dir(w, p, sizeof p);
     strcat(p, "/state/voltrace");
@@ -15943,7 +15946,7 @@ static void move_watch(int w, struct mv_watch *x)
     int prev_a = 0;
     struct mvt t;
     while (fgets(ln, sizeof ln, f)) {
-        if (!mvt_parse(ln, &t))
+        if (!mvt_parse(ln, &t) || t.index <= from)
             continue;
         x->lines++;
         int a_in = mvt_has(t.isr, t.nisr, a), b_in = mvt_has(t.isr, t.nisr, b);
@@ -16046,9 +16049,10 @@ struct mv_run {
     uint64_t pre[REP_NAMES];
 };
 
-static void move_writers(struct mv_run *r, int s, int lenient)
+static void move_writers(struct mv_run *r, int s, int lead, int lenient)
 {
-    tsdbc *c = client(s);
+    tsdbc *c = client(lead); /* the series are made on the leader (a SERIES by path forwarded from a member that does
+                              * not lead is MOVED: see REPORT.md), the writers write through s */
     for (int k = 0; k < REP_NAMES; k++) {
         tsdb_sid id = rep_series(c, rep_names[k], "plant", 30000);
         int64_t t = 1000;
@@ -16071,6 +16075,8 @@ static void move_writers_stop(struct mv_run *r)
         pthread_join(r->th[k], NULL);
         if (r->w[k].rc != 0)
             die("a writer of %s: %s", rep_names[k], ers(r->w[k].rc));
+        if (!r->w[k].acked) /* a lenient writer whose every batch was refused proves nothing */
+            die("a writer of %s had no batch acknowledged (%" PRIu64 " sent)", rep_names[k], r->w[k].batches);
     }
 }
 
@@ -16148,7 +16154,7 @@ static void scen_move(void)
     int A = s.O[1], B = s.X, W = s.O[0];
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
-    move_writers(&r, L, 0);
+    move_writers(&r, L, L, 0);
     char p[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[2048];
     peer_of(s.R, p, sizeof p);
     snprintf(args, sizeof args, "cluster volume move %s 1 --log --from %" PRIu32 " --to %" PRIu32 " --secret-file %s",
@@ -16184,7 +16190,7 @@ static void scen_movelag(void)
     int A = s.O[1], C = s.O[0], B = s.X, W = L;
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
-    move_writers(&r, L, 0);
+    move_writers(&r, L, L, 0);
     move_hold_set(1);
     move_op(s.R, A, B, 0, "proposed");
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
@@ -16213,6 +16219,7 @@ static void scen_movelag(void)
 static void scen_moveleader(void)
 {
     scenario("moveleader");
+    fwd_on = 1; /* the writers go through a member that does not lead */
     move_env(0);
     struct meta_volume v;
     int L = set_setup(4, &v, 0);
@@ -16222,7 +16229,7 @@ static void scen_moveleader(void)
     int A = L, B = s.X, W = s.O[0];
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
-    move_writers(&r, s.O[1], 1); /* through a member that stays */
+    move_writers(&r, s.O[1], L, 1); /* through a member that stays */
     move_op(s.R, A, B, 0, "proposed");
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     await_move(W, &x, 0, 90000, "moveleader");
@@ -16244,6 +16251,7 @@ static void scen_moveleader(void)
 static void scen_moverep0(void)
 {
     scenario("moverep0");
+    fwd_on = 1; /* the writers go through a member that does not lead */
     init_leader_balance_s = 5;
     move_env(0);
     struct meta_volume v;
@@ -16261,7 +16269,7 @@ static void scen_moverep0(void)
     move_servers(&v, L, &s);
     int A = L, B = s.X, W = s.O[0];
     struct mv_run r;
-    move_writers(&r, s.O[1], 1);
+    move_writers(&r, s.O[1], L, 1);
     move_op(s.R, A, B, 0, "proposed");
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     await_move(W, &x, 0, 90000, "moverep0");
@@ -16312,7 +16320,7 @@ static void scen_moveraft(void)
         if (i != s.R && i != A && i != B)
             W = i;
     struct mv_run r;
-    move_writers(&r, L, 1);
+    move_writers(&r, L, L, 1);
     move_hold_set(1);
     move_op(s.R, A, B, 0, "proposed");
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
@@ -16355,7 +16363,7 @@ static void scen_movekill(void)
         A = s.O[1] != s.R ? s.O[1] : s.O[0];
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
-    move_writers(&r, L, 1);
+    move_writers(&r, L, L, 1);
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     move_op(s.R == B ? W : s.R, A, B, 0, "proposed");
     uint64_t t0 = now_ms();
@@ -16380,7 +16388,7 @@ static void scen_movekill(void)
         C = B;
     move_hold_set(1);
     move_op(W, C, A, 0, "proposed");
-    struct mv_watch y = {.a = ids[C], .b = ids[A]};
+    struct mv_watch y = {.a = ids[C], .b = ids[A], .from = x.last.index}; /* A was a member before the first move */
     await_joined(W, &y, 60000);
     move_op(W, C, A, 1, "cancelling");
     move_hold_set(0);
@@ -16411,7 +16419,7 @@ static void scen_moveold(void)
     int A = s.O[1], B = s.X, W = s.O[0];
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
-    move_writers(&r, L, 0);
+    move_writers(&r, L, L, 0);
     uint64_t t0 = now_ms(), s1 = segment_bound(L, 0);
     while (segment_bound(L, 1) <= s1)
         if (now_ms() - t0 > 60000)
