@@ -1,7 +1,9 @@
 # RDMA for the peer links
 
 Status: design and measurements, no transport code. Branch `rdma-design` from main at a06d4bb7, written on 2026-11-24.
-Target release: **v0.11.0** (the build is the tracks of §9).
+Target release: **v0.11.0** (the build is the tracks of §9). Revised after an adversarial review the same day: the rate
+caps, the port shared with NFS over RDMA, the MAC's CPU, the upgrade's state machine, credits, registration, the
+build's header detection and where the RDMA tests can run.
 
 The owner's request (2026-11-24, verbatim): "all servers should have infiniband too, but I do not think everyone is
 configure with ipoib yet. We should support RDMA links". Every link between two tsdbd today is TCP
@@ -15,17 +17,23 @@ AlmaLinux 10), [design-auth.md](design-auth.md) (the threat model: a backend on 
 
 ## Summary
 
-1. **The first limit is not the network: it is the frame MAC.** Every data-link frame carries an HMAC-SHA256 tag over
-   all of its bytes (`frame_tag`, peerlink.c). On the test servers' Xeons (no SHA extensions) that costs about 4.2 CPU
-   seconds per GB on each side and caps **one link at about 1.9 Gbit/s on every transport**: TCP on 40GbE, rsocket
-   and TCP on loopback alike (§3.3). Without the tag the same link moves 30-33 Gbit/s over TCP on 40GbE. A
-   replicated large insert, a snapshot or a rebuild therefore runs at about 230 MB/s per peer today, wherever it runs.
-   Fixing the MAC (§6, D1) is the first track, helps TCP right away, and is a precondition for RDMA to matter for bulk.
+1. **The first limits are not the network: they are the frame MAC and the rate caps.** Every data-link frame carries
+   an HMAC-SHA256 tag over all of its bytes (`frame_tag`, peerlink.c). On the test servers' Xeons (no SHA extensions)
+   that costs about 4.2 CPU seconds per GB on each side and caps **one link at about 1.9 Gbit/s (230 MB/s) on every
+   transport**: TCP on 40GbE, rsocket and TCP on loopback alike (§3.3). Without the tag the same link moves 30-33
+   Gbit/s over TCP on 40GbE. Below the MAC, the bulk kinds are held by **node-wide token buckets**, one per kind and
+   shared by every link of that kind on the node: 256 MiB/s for BULK (`PL_BULK_RATE_DEFAULT`), 200 MiB/s for SNAP
+   (`rebuild_mb_s`), 256 MiB/s for CHUNKB (`--chunk-rate-mb-s`). At the defaults a snapshot runs at 210 MB/s whatever
+   the MAC, and a COMMIT shipped to two replicas at about 134 MB/s each. Fixing the MAC (§6, D1) is the first track
+   and helps TCP right away; raising the caps is a decision of its own, bounded by the disks, the NFS storage on the
+   same fabric and the LOG link's latency (D11); RDMA matters for bulk only after both (§4).
 2. **Native verbs on the FDR InfiniBand** move 50 Gbit/s from 16 KiB messages up, at 0.02-0.09 CPU seconds per GB
    (event-driven completions, §3.1), and a 1 KiB frame and its answer take about 5 µs busy-polling or about 15 µs
    sleeping on completion events, against about 23 µs over TCP on 40GbE (p50, untagged). rsocket (librdmacm's socket
    emulation) reaches 44-46 Gbit/s with 16-64 KiB frames but about 30 Gbit/s with 1 MiB ones, and a 6 µs round
-   trip, at TCP's CPU per GB (§3.2). RoCE and iWARP on the 40GbE ports reach its line rate too (§3.5).
+   trip, at TCP's CPU per GB (§3.2). RoCE and iWARP on the 40GbE ports reach its line rate too (§3.5). These CPU
+   numbers leave the MAC out: with a MAC of a few GB/s per core added to both transports, verbs save about a fifth of
+   the per-byte CPU, not three to six times (§4), and one link's MAC runs on one core per side.
 3. **IPoIB is not needed for RDMA if the connection is set up over the TCP link we already have.** rdma_cm and rsocket
    resolve IP addresses, so they need IPoIB on InfiniBand. A queue pair can instead be set up by exchanging its
    numbers (LID or GID, QPN, PSN, MTU) over the authenticated TCP data link, which runs on whatever network the peer
@@ -34,18 +42,27 @@ AlmaLinux 10), [design-auth.md](design-auth.md) (the threat model: a backend on 
    connection), reached by **upgrading** a TCP data link after its handshake; the TCP connection stays as the link's
    anchor (liveness, fallback, firewall control). The metadata link (kind 0, Raft) stays TCP. libibverbs and
    librdmacm are loaded with `dlopen`, so one binary runs with and without rdma-core; `NO_RDMA=1` builds without it;
-   macOS never has it. About 8 track-days (§9).
+   macOS never has it. About 12 track-days (§9); after the first (the MAC), §3 and §4 are measured again and the
+   owner decides the order and scope of the rest with those numbers (D14).
 5. **Operational prerequisites**: `LimitMEMLOCK` for tsdbd (the test servers' 8 MB limit already refuses perftest's
    4 MiB messages, §2), and a test path without hardware: Soft-RoCE (`rdma_rxe`) and `siw` exist in Ubuntu kernels
    (the dev machine has both modules) but **not in AlmaLinux 10's kernel** (§8).
+6. **The peer links would share the InfiniBand port with production's NFS over RDMA** (design-ha-modes.md): a bulk
+   stream at line rate competes with the node's storage I/O, the WAL's `fdatasync` on the commit path included. The
+   design gives the queue pairs a configurable service level and keeps the rate caps; rd-hw measures NFS latency
+   under peer load before any cap is raised (§4 "Sharing the port", D11, D13).
 
 ## 1. What travels on the peer links today
 
 A peerlink (`server/peerlink.h`) is one TCP connection per (peer, kind), one thread per connection that owns the
-socket, a bounded send queue (8 MiB), `poll()` on the socket and an eventfd, the handshake (HELLO, HELLO_ACK, AUTH:
+socket (a tsdbd has three that carry data: repld's for LOG, BULK and SNAP, fwd's for FWD and FWDQ, chunksrv's for CHUNK
+and CHUNKB; the metadata link is the cluster thread's), a bounded send queue (8 MiB), `poll()` on the socket and an eventfd, the handshake (HELLO, HELLO_ACK, AUTH:
 HMAC over the transcript under the cluster secret), then frames `[u32 len][u8 type][payload][tag 32]` with the tag
 `HMAC-SHA256(key of the direction, seq | type | payload)`. Log frames are zstd-1 compressed. Bulk files go as
-`BEGIN`, `RESUME`, `CHUNK` (256 KiB) at the rate of a token bucket per kind (256 MiB/s by default), `END` (xxh64), `DONE`.
+`BEGIN`, `RESUME`, `CHUNK` (256 KiB) at the rate of a token bucket per kind, `END` (xxh64), `DONE`. The bucket is
+**node-wide**: every link of one kind shares it (peerlink.h, R4 D7), so one peer gets the whole rate and two share it.
+BULK's is `PL_BULK_RATE_DEFAULT`, 256 MiB/s; SNAP's is the cluster setting `rebuild_mb_s`, 200 MiB/s by default
+(rsnap.c); CHUNKB's is `cluster.chunk.rate` (`--chunk-rate-mb-s`), 256 MiB/s.
 `on_sent` reports a tracked frame WRITTEN once its first byte reached the socket, NEVER_WRITTEN otherwise (fwd's rule).
 
 | kind | owner | what | frame sizes | what matters |
@@ -55,7 +72,7 @@ HMAC over the transcript under the cluster secret), then frames `[u32 len][u8 ty
 | 2 BULK | repld.c | a COMMIT's part files | 256 KiB chunks of files up to GBs | throughput, CPU; must not delay LOG |
 | 3 FWD | fwd.c | forwarded requests and replies | up to 8 MiB, typical < 4 KiB | latency: one extra hop on a client's request; NEVER_WRITTEN vs WRITTEN |
 | 4 FWDQ | fwd.c | forwarded queries, streamed replies under CREDIT | 1 MiB chunks | throughput and latency of a query through an entry node |
-| 5 SNAP | rsnap.c | snapshots (R4) | 256 KiB chunks, GBs | throughput: rebuild time (2 TB in 30 min is 1.1 GB/s) |
+| 5 SNAP | rsnap.c | snapshots (R4) | 256 KiB chunks, GBs | throughput: rebuild time (2 TB in 30 min would be 1.1 GB/s; at today's default `rebuild_mb_s` of 200 MiB/s, 2 TB take 2.6 h) |
 | 6 CHUNK | chunksrv.c | chunk store requests (read up to 4 MiB, sums, list) | requests small, reads 64 KiB-1 MiB cells | latency of a cold read: k reads in parallel |
 | 7 CHUNKB | chunksrv.c | chunk puts as bulk files | cells of 64 KiB-1 MiB | throughput of a settle |
 
@@ -78,7 +95,13 @@ changing anything:
   firewalld closes for TCP. A design that relies on the firewall to keep strangers off the RDMA path is wrong (§5.5).
 - **`ulimit -l` is 8192 KiB** (8 MB of locked memory per process). Memory registered for RDMA is locked: perftest
   could not register its buffers for 4 MiB messages (`Cannot allocate memory`). io_uring's rings count against the
-  same limit.
+  same limit, and so do the queue and completion buffers the provider library allocates per QP. tsdbd's need is the
+  registered pool (one per tsdbd, §4), those buffers for every link and the rings (§4 "Registration").
+- **Production shares this fabric with storage**: the volumes are NFSv4.1/4.2 over RDMA exports of ZFS
+  (design-ha-modes.md), so peer links on the IB port compete with the node's NFS traffic (§4 "Sharing the port").
+  The test servers have no NFS/RDMA mount; that measurement needs a production-like node (rd-hw).
+- **The CPUs here are not production's**: these Xeons have no SHA extensions; whether production's do is unknown and
+  matters for the MAC (§6).
 - **No Soft-RoCE**: AlmaLinux 10's kernel has neither `rdma_rxe` nor `siw` (`modinfo` finds neither).
 
 ## 3. Measurements
@@ -151,7 +174,11 @@ IPoIB addresses; the data is RDMA, never TCP), untagged (the tag is §3.3's subj
 | 4 MiB | 30.6 (28.8-33.8) | 0.18 / 0.21 | |
 
 rsocket is best at 16-64 KiB frames (44-46 Gbit/s) and falls to about 30 Gbit/s for the large ones, which copy
-through its own buffers; 1 MiB buffers (`rsocket-buf1m`, `RDMA_SNDBUF`/`RDMA_RCVBUF`) change nothing (30.6 at 1 MiB).
+through its own buffers. The `rsocket-buf1m` runs asked for 1 MiB buffers (`--buf`, `SO_SNDBUF`/`SO_RCVBUF` through
+`rsetsockopt`), but on the client only: the server set them on the accepted socket, after its buffers were sized, so
+its side kept rsocket's default. One-sided, the bandwidth at 1 MiB is the same (30.6) and the 1 MiB round trip falls
+from 492 to 394 µs p50 (-20%). Buffers on both sides were not measured; link-bench now sets them on the listening
+socket and rdma-bench.sh passes `--buf` to both sides (rd-hw takes the numbers).
 Its CPU per GB is the same as TCP's (§3.3), because it copies every byte on both sides, and its round trip at 1 KiB
 (6 µs) is that of busy-polled verbs, because it polls before it sleeps. With the tag every size falls to 1.8-1.9
 Gbit/s, as on TCP.
@@ -186,6 +213,14 @@ and 1.81 tagged; over rsocket (§3.2) 1.83; over TCP on the Chelsio pair (E5-269
 4.2 CPU seconds per GB is about 240 MB/s per core: tsdb's own portable SHA-256 (`client/tsdb_crypto.c`), one pass
 per side. OpenSSL's assembly SHA-256 (through Python's `hashlib` on one of these servers) does 479 MB/s, so even the
 best SHA-256 here would leave a link near 3.8 Gbit/s; BLAKE2b there does 926 MB/s (§6). At 1 KiB the four MACs of a round trip (sign and check, each way) add about 26 µs, more than the network.
+The cap is the code, not the build flags or the CPU's extensions: on the build machine (an i5-13400, which has SHA
+extensions) link-bench built `-O2` (as rdma-bench.sh builds it) and `-O3 -march=native` (as tsdbd is built) moves
+2.25 and 2.33 Gbit/s tagged at 1 MiB on loopback (3 runs each), because `tsdb_crypto.c` is portable C only (§6).
+
+The 64 B and 1 KiB rows are one `write()` per frame with `TCP_NODELAY` (one `rwrite` per frame on rsocket): a system
+call per frame. peerlink appends frames to its write buffer and sends many per call, so these rows overstate its CPU
+per small frame on TCP and are not the basis for a per-frame comparison. `link-bench --batch N` writes N frames per
+call (rdma-bench.sh's `eth-tcp-batch` and `rsocket-batch` suites); not run yet (rd-hw).
 
 ### 3.4 Not measured
 
@@ -225,30 +260,66 @@ back to back but can lose throughput to retransmissions on a busy switch; RoCE v
 
 ## 4. What RDMA would give each kind, and at what cost
 
-The gains, from §3 on these servers (the MAC fixed as in §6; with today's MAC every kind is capped at about 230 MB/s
-whatever the transport):
+The gains, from §3 on these servers. Today every link is capped at about 230 MB/s per direction by the MAC whatever
+the transport, and the bulk kinds are held lower still by their node-wide rate caps (§1). At the default caps, fixing
+the MAC alone (D1) buys nothing for SNAP (200 MiB/s, 210 MB/s, is below the MAC's 230), about 15% for a BULK file to
+one replica (256 MiB/s, 268 MB/s), nothing for BULK to two replicas (134 MB/s each), and lifts CHUNKB only where one
+peer takes the whole 268 MB/s. The line-rate entries below need the MAC fixed **and** the caps raised (D11), which
+rd-hw is to justify with the disks' and the storage's numbers:
 
 | kind | gain | cost and care |
 |---|---|---|
 | 0 META | none worth having (a few frames a second) | **stays TCP** (D3): the failure detector and Raft must not depend on the new code or on the fabric's health. A volume whose RDMA path fails falls back to TCP; the metadata group never notices |
-| 1 LOG | a 1 KiB round trip of about 15 µs (events; 5 µs busy-polling) instead of about 23 µs, and a third of the CPU per frame; zstd stays (it saves bytes on the wire and in the receiver's WAL alike) | the commit path also holds the replica's `fdatasync` (0.7 ms on NVMe), so the saving is a few % of a replicated insert's latency (target p50 ≤ 0.9 ms). Worth it, not decisive |
-| 2 BULK, 5 SNAP, 7 CHUNKB | line rate (50 Gbit/s) at 0.02-0.09 CPU s/GB against 0.12-0.17 for TCP: the CPU left for merges and queries during a rebuild | registered buffers on both sides (pread into a registered slot, SEND, the receiver writes the slot to the file); the token buckets count what is posted, unchanged |
+| 1 LOG | a 1 KiB round trip of about 15 µs (events; 5 µs busy-polling) instead of about 23 µs, and less CPU per frame (how much is open: §3.3's small-frame TCP rows are a system call per frame, peerlink batches); zstd stays (it saves bytes on the wire and in the receiver's WAL alike) | the commit path also holds the replica's `fdatasync` (0.7 ms on NVMe), so the saving is a few % of a replicated insert's latency (target p50 ≤ 0.9 ms). Worth it, not decisive |
+| 2 BULK, 5 SNAP, 7 CHUNKB | up to line rate (50 Gbit/s) once the caps allow it (D11); the transport's own CPU is 0.02-0.09 s/GB against 0.12-0.17 for TCP, with the MAC on top of both ("CPU with the MAC" below) | registered buffers on both sides (pread into a registered slot, SEND, the receiver writes the slot to the file); the token buckets count what is posted; the receiver's write to NFS, not the wire, bounds a rebuild ("Sharing the port") |
 | 3 FWD | one hop of about 15 µs (events) instead of about 23 µs on every forwarded request | WRITTEN must mean "posted" (D5), so fwd's NEVER_WRITTEN stays definite |
-| 4 FWDQ | streamed replies at line rate; CREDIT maps directly onto RDMA credits | the reply's credits and the link's credits are separate layers; keep them separate |
+| 4 FWDQ | streamed replies at line rate (within the MAC's per-link bound) | fwd's CREDIT is an application frame that travels as data under the link's credits (§4 "Flow control"): the reply's credits and the link's are separate layers, never merged |
 | 6 CHUNK | a 1 MiB cell in about 0.2 ms of wire time instead of about 0.3 ms over TCP on 40GbE; k cells of a cold read in parallel | RDMA READ straight from the store's page cache would need registered file memory (ODP: not on ConnectX-3): SEND/RECV with a copy is the design; READ is later work (§10) |
 
-**Registration.** Every byte that RDMA moves must lie in registered (locked) memory. The design registers one pool
-per peerlink at start (D7): slots of 64 KiB for frames, used by every link of that peerlink, so registration never
-happens on the data path. A pool of 64 MiB serves 7 kinds x 8 peers with 16 slots per direction per link of the
-busiest kinds; the sizing is a setting. tsdbd needs `LimitMEMLOCK=infinity` (or a value above the pool plus the
-io_uring rings) in its systemd unit; with a lower limit it says so in one line and stays on TCP (`auto`) or refuses to
-start (`on`).
+**CPU with the MAC.** peerlink runs one thread per connection, so a link's MAC runs on one core per side: 50 Gbit/s
+is 6.25 GB/s of MAC per side on one core, beyond every candidate of §6 on these CPUs. At a MAC of 3 GB/s per core (to
+measure) a single link stops near 24 Gbit/s on any transport, and the MAC costs 0.33 CPU s/GB per side: TCP's
+per-byte CPU becomes 0.45-0.50 s/GB and verbs' 0.35-0.42, a saving of about a fifth, not the three to six times of
+the transport columns. Several links (kinds, peers) run on separate threads, so a node's total can still exceed one
+link's. This is why the measurements after rd-mac decide the order of the verbs tracks (D14).
 
-**Flow control.** SEND needs a posted receive at the peer, and a SEND that finds none is retried by the NIC (RNR) and
-then fails the QP. So the receiver grants credits: one per posted receive slot, returned in every frame's header and in
-a small CREDIT frame when it has nothing else to send (rsocket does the same). `plink_pause` stops returning credits,
-which stops the sender exactly as a closed TCP window does; two slots per direction are kept for the link's own
-PING, PONG and CREDIT so that a paused link is never counted dead (peerlink.h's rule for paused links).
+**Registration.** Every byte that RDMA moves must lie in registered (locked) memory, and registering on the data path
+costs tens of µs and fails unpredictably under a memlock limit, so memory is registered once at start (D7). A tsdbd
+has three peerlinks that upgrade (§1: repld's, fwd's, chunksrv's), so there is **one pool per tsdbd and device**,
+shared by the three (one protection domain), not one per peerlink. Receive slots are the bulk of it, and per-link
+receive rings do not add up: 7 kinds x 8 peers x 16 slots x 64 KiB is 56 MiB of posted receives alone, most of them
+idle and most 64 KiB slots holding a 64-byte ACK. The design therefore uses **two slot sizes** (4 KiB for control and
+small frames, 64 KiB for the rest; a larger frame spans several) and a **shared receive queue (SRQ) per peerlink and
+slot size**, whose depth follows what arrives rather than how many links exist; credits (below) are granted per link
+out of the SRQ's posted slots. For 8 peers: 128 large and 512 small receive slots per peerlink, 3 x (8 + 2) = 30 MiB,
+plus send slots taken from a shared free list only while a send is in flight (16 MiB): about 46 MiB, under the
+default `pool_mb` of 64, which is per tsdbd. Whether SRQs or small per-link rings are simpler for the credit rule is
+settled in rd-verbs with the fake transport (§8). tsdbd's memlock need is the pool, plus the provider's queue and
+completion buffers per QP (56 QPs at 8 peers), plus io_uring's rings: it needs `LimitMEMLOCK=infinity` (or that sum
+with headroom) in its systemd unit; with a lower limit it says so in one line and stays on TCP (`auto`) or refuses to
+start (`on`). Tests run with a pool of 1-2 MiB (§8).
+
+**Flow control.** A SEND needs a posted receive at the peer. What happens to one that finds none depends on the
+fabric: on InfiniBand with `rnr_retry` 7 (infinite) and on rxe the NIC retries for ever, so a credit bug is a silent
+stall; on iWARP the QP fails at once (§3.5 saw that). The transport never relies on RNR: production sets a small
+finite `rnr_retry`, and the tests set 0 so that a SEND without a receive fails the QP on every fabric, as the fake does
+(§8). The rule, with two classes of credits per link and direction:
+
+- **Data credits**: one per data receive slot granted to this link. Every frame of the link's protocol (the kind's
+  frames and peerlink's own BEGIN, CHUNK, END...) takes one per slot it spans. The receiver returns them in a field of
+  the header of every frame it sends, and in an `RDMA_CREDIT` frame when it owes a quarter of the window and has
+  nothing else to send. `plink_pause` stops returning data credits, which stops the sender as a closed TCP window does.
+- **Control credits**: K = 4 small receive slots per link reserved for PING, PONG and `RDMA_CREDIT`, counted apart from
+  the data credits. A control frame takes one control credit; a side sends one only while it holds one, so at most K
+  are in flight per direction and they cannot storm. Control credits are returned only piggybacked, in the header of
+  the next frame of either class, never by a frame of their own; an `RDMA_CREDIT` that would return only control
+  credits is sent only when at least K/2 are owed, so a credit exchange dies out instead of answering itself.
+  `plink_pause` never withholds control credits: PINGs and PONGs go on, and a paused link is never counted dead
+  (peerlink.h's rule for paused links).
+- Both sides at zero data credits with frames queued is not a deadlock: each still holds control credits, and an
+  `RDMA_CREDIT` returns data credits as soon as the receiver reposts slots.
+- The link-level `RDMA_CREDIT` is not fwd's FWDQ `CREDIT`: that is an application frame of kind 4 that travels as data
+  under the link's credits. Two layers, kept apart.
 
 **Completions in the event loop.** The link thread keeps its `poll()`: the completion channel's fd joins the socket
 and the eventfd (`ibv_req_notify_cq`, then `ibv_get_cq_event` and drain the CQ when it is readable). Sleeping on
@@ -260,7 +331,8 @@ are free.
 with retry 7 and timeout 14), so the link's PING every `ping_ms` and the `dead_ms` rule stay as they are, sent over the
 QP so that they test the path the data takes. A QP in the error state ends the connection, exactly as a TCP error does:
 the queue is dropped, `on_link(down)` runs, the dialer redials (with the upgrade, §5). The anchor TCP connection's end
-ends the connection too.
+ends the connection too. A QP that fails soon after it settled counts against the offer backoff like a failed offer,
+so a flapping port puts the link on TCP for a while instead of taking it down again and again (§5.3).
 
 **Written and lost.** A frame posted to the send queue may or may not reach the peer when the QP fails afterwards,
 just as bytes in a TCP socket buffer. The rule stays: WRITTEN from the moment the first work request of the frame is
@@ -269,14 +341,30 @@ not make it NEVER_WRITTEN: a work request ahead of it may have carried part of t
 statement about what the peer received. fwd's outcomes (`FWD_NEVER_WRITTEN` definite, `FWD_WRITTEN` indeterminate until
 a reply) carry over unchanged.
 
-**Fencing.** One QP belongs to one connection (one `plink_gen`). When a connection ends, its QP is destroyed before
-its slots return to the pool, so nothing an old connection posted can land in memory a newer one uses; with
+**Fencing.** One QP belongs to one connection (one `plink_gen`). When a connection ends, its QP is moved to the error
+state, every work request it posted is drained until its completion has come back (flushed or not: a last signalled
+marker request on each queue, the `ib_drain_qp` pattern), the QP is destroyed, and only then do its slots return to
+the pool, so nothing an old connection posted can land in memory a newer one uses. A send slot returns only after its
+send completion; with unsignalled sends (every n-th signalled), a slot returns only on the next signalled completion
+after it. With an SRQ the receive slots it holds for the dead QP are those of the links' credit shares, returned when
+the QP's last receive completion has been seen; with
 SEND/RECV only (no remote keys handed out, D9) a peer can never write into our memory outside the receive slots we
 posted for that QP. `plink_send_gen` keeps meaning "this connection only": a frame of generation G is posted only to
 G's QP.
 
-**Token buckets.** Unchanged: a bulk chunk takes its tokens before it is posted, so a kind's rate is the same on both
-transports.
+**Token buckets.** Unchanged in mechanism: a bulk chunk takes its tokens before it is posted, so a kind's rate is the
+same on both transports. At the defaults they, not the transport, set bulk throughput (§1); raising them is D11.
+
+**Sharing the port.** In production the volumes are NFSv4.1/4.2 over RDMA exports of ZFS (design-ha-modes.md: an
+"RDMA port" fault is a storage fault), on the same InfiniBand fabric and in all likelihood the same HCA port. A peer
+bulk stream at line rate competes with every NFS read and write of the node, including the replica's write of the
+very bytes it receives and the WAL `fdatasync` that the LOG row above counts as the commit path's dominant latency. Three
+measures: (a) the queue pairs' **service level** is a setting (`cluster.peer.rdma.sl`, put in the QP's address
+vector, `ah_attr.sl`), one SL for every kind or one per kind, so that an operator whose subnet manager maps SLs to
+virtual lanes with arbitration weights can rank peer bulk below storage and LOG above it (the SM's tables are
+operations, D13); (b) the **rate caps stay** and are sized against the port, whatever the transport (D11); (c) rd-hw
+measures NFS/RDMA read and write latency, and the WAL's `fdatasync`, under peer bulk load at several caps, and the
+end-to-end rebuild rate, which the receiver's NFS write rate bounds. 50 Gbit/s is a wire number, not a rebuild rate.
 
 ## 5. The options
 
@@ -294,23 +382,46 @@ and iWARP; only the connection step differs.
 
 ### 5.1 The upgrade
 
-1. The dialer connects TCP to the peer address and runs the handshake exactly as today (HELLO with the kind,
-   HELLO_ACK, AUTH). Nothing about authentication changes.
-2. If its `cluster.peer.rdma` is `auto` or `on` and the kind is one it moves (all but META), it sends `RDMA_OFFER`
-   (a link frame, type 0x77): its device, port, LID, GID, the QP number and first PSN of a QP it created for this
-   connection, the path MTU, the number of receive slots it posted and their size, a random 64-bit nonce.
-3. The acceptor, if it can, creates its QP, moves it to RTR with the dialer's numbers, posts its receives and answers
-   `RDMA_ACCEPT` with its own numbers; else `RDMA_DECLINE{reason}`. A peer of an older build ends the link on an
-   unknown frame type, which the dialer sees as a decline: next time it does not offer to that peer for 10 minutes.
-4. The dialer moves its QP to RTR and RTS and sends a first frame over the QP: `RDMA_HELLO{nonce}` with the frame MAC
-   under the link's key and sequence numbers continuing from the TCP stream. The acceptor checks it and answers
-   `RDMA_READY` over the QP. From then on every frame of the link goes over the QP; the TCP connection carries nothing
-   but the kernel's keepalive, and its end is the end of the connection.
-5. Any failure before `RDMA_READY` (no route to the GID, a refused registration, a timeout of 2 s) leaves the link on
-   TCP for this connection, with one log line; `on` instead ends the connection.
+The upgrade is a state machine with **one decider, the dialer**, and one rule that removes every ordering question:
+**from the offer until the dialer's decision, each side sends nothing on TCP but the upgrade's own frames, and after the
+decision a side sends on exactly one transport**. No frame of the link ever needs to be ordered against a frame on the
+other transport.
 
-`on_link(up)` runs once the link's transport is settled (after step 4 or the fallback), so a driver never sees the
-change of transport. On InfiniBand without IPoIB the QP's address comes from the LID (and the SM's path) exchanged in
+1. The dialer connects TCP to the peer address and runs the handshake exactly as today (HELLO with the kind,
+   HELLO_ACK, AUTH). Nothing about authentication changes. HELLO and HELLO_ACK carry a capability bit `PL_CAP_RDMA`,
+   set by every build of cluster version 8 or later (rd-mac bumps `PL_CL_VERSION` to 8, and peerlink refuses a HELLO
+   of another version, so an older build never sees an offer). A `NO_RDMA` build sets the bit too: it decodes
+   `RDMA_OFFER` and answers `RDMA_DECLINE{not_built}`.
+2. If its `cluster.peer.rdma` is `auto` or `on`, the kind is one it moves (all but META), the peer set the bit and no
+   backoff holds (§5.3), the dialer stops sending on TCP (frames queue; the upgrade takes milliseconds and at most the
+   2 s timeout, below `dead_ms`) and sends `RDMA_OFFER` (a link frame, type 0x77): its device, port, LID, GID, the QP
+   number and first PSN of a QP it created for this connection, the path MTU, its receive credits, a random 64-bit
+   nonce.
+3. The acceptor, if it can, creates its QP, moves it to RTR with the dialer's numbers, posts its receives and answers
+   `RDMA_ACCEPT` with its own numbers on TCP; else `RDMA_DECLINE{reason}` on TCP, after which both sides are settled on
+   TCP (`not_built`, `off` and `kind` declines stop offers to that peer and kind for the connection's life; the others
+   count for the backoff). After ACCEPT the acceptor sends nothing on TCP, and nothing on the QP but READY, until it settles (step 6).
+4. The dialer moves its QP to RTR and RTS and posts `RDMA_HELLO{nonce}` on the QP.
+5. The acceptor checks HELLO and posts `RDMA_READY` on the QP.
+6. **The dialer decides.** On READY within 2 s of the offer it settles on the QP and posts `RDMA_GO` there as its first
+   frame (its queued frames follow on the QP). On anything else (a timeout, a QP error, a refused registration, no
+   route to the GID) it sends `RDMA_ABORT` on TCP and settles on TCP, destroying its QP as in "Fencing" (§4); a READY
+   that arrives later is discarded with the QP. The acceptor settles on the QP when GO arrives there, or on TCP when
+   ABORT arrives on TCP, whichever comes: the dialer sends exactly one of the two, so the acceptor cannot settle
+   differently. An acceptor that sees neither within 4 s of its ACCEPT ends the connection (the dialer redials). With
+   `on`, the dialer ends the connection instead of sending ABORT.
+7. **Sequence numbers.** OFFER, ACCEPT, DECLINE, GO and ABORT take the next number of their direction as every frame
+   does. HELLO and READY are tagged under the link's key with the number of the OFFER (dialer) and of the ACCEPT
+   (acceptor) and with their own types, and take no number: whether they were delivered or not, the stream goes on
+   at the same number on whichever transport is settled, and nothing is skipped or reused. The link's keys are this
+   connection's (derived from the handshake's transcript, `keys_derive`), so a HELLO cannot be replayed into another
+   connection.
+8. Once settled on the QP, the TCP connection carries nothing but the kernel's keepalive, and its end is the end of
+   the connection. The same machine runs on a link that is already up (a re-offer, §5.3): the queued frames wait at
+   most the timeout, and the drivers see no `on_link` change.
+
+`on_link(up)` runs on each side once that side has settled (the dialer at its decision, the acceptor at GO or ABORT),
+so a driver never sees the change of transport. On InfiniBand without IPoIB the QP's address comes from the LID (and the SM's path) exchanged in
 step 2 (measured, §3.1: numbers exchanged over TCP on the Ethernet addresses, data on the IB port by LID, 50.8 Gbit/s
 and 2.22 µs, the same as through rdma_cm); on RoCE it is the GID that carries the Ethernet IP; iWARP cannot do this and uses C: step 2 then names an
 rdma_cm address and port, and the dialer connects there with the nonce in the connection's private data.
@@ -323,12 +434,17 @@ per link in step 2. New keys (tsdbd_keys.h rows, docs/config.md):
 | key | flag | default | meaning |
 |---|---|---|---|
 | `cluster.peer.rdma` | `--peer-rdma` | `auto` | `off`, `auto` (use where both ends can, else TCP), `on` (a data link that cannot upgrade ends; for tests and for operators who want to know) |
-| `cluster.peer.rdma.device` | `--peer-rdma-device` | first active port | `mlx4_0:1`: device and port; a list for servers with more than one |
+| `cluster.peer.rdma.device` | `--peer-rdma-device` | the first active InfiniBand port | `mlx4_0:1`: device and port; a list for servers with more than one. Unset, only ports whose link layer is InfiniBand (`IBV_LINK_LAYER_INFINIBAND`) are taken: a RoCE or iWARP port (port 2 of the test servers' ConnectX-3 is 40GbE) is used only when named (D10) |
 | `cluster.peer.rdma.kinds` | `--peer-rdma-kinds` | `log,bulk,fwd,fwdq,snap,chunk,chunkb` | the kinds that upgrade |
-| `cluster.peer.rdma.pool_mb` | `--peer-rdma-pool-mb` | 64 | registered memory per peerlink |
+| `cluster.peer.rdma.pool_mb` | `--peer-rdma-pool-mb` | 64 | registered memory per tsdbd and device, shared by its three peerlinks (§4) |
+| `cluster.peer.rdma.sl` | `--peer-rdma-sl` | `0` | the InfiniBand service level of the QPs: one number, or `KIND=SL,...` (`log=1,bulk=2,snap=2`); effective only where the subnet manager maps SLs to VLs (§4 "Sharing the port", D13) |
+| `cluster.peer.rdma.retry_s` | `--peer-rdma-retry-s` | 600 | a link that settled on TCP after a failure (not a decline for `not_built`, `off` or `kind`) offers again after this long (§5.3) |
 | `cluster.peer.rdma.poll_us` | `--peer-rdma-poll-us` | 0 | busy poll before sleeping on completion events |
 | `cluster.peer.rdma.cm` | `--peer-rdma-cm` | (unset) | `ADDR[:PORT]`: also listen with rdma_cm (option C; iWARP) |
 | `cluster.peer.allow_ipoib` | `--peer-allow-ipoib` | `false` | `true` lets the TCP peer address be on an IPoIB interface (§5.3); off by default because no TCP should run over IPoIB |
+
+An offer is declined (`subnet`) when the offered GID's subnet prefix matches none of the acceptor's chosen ports: a host
+on two IB fabrics then falls back at once instead of after the 2 s timeout of an unreachable LID.
 
 Metrics (docs/metrics.md): per kind the links on RDMA and on TCP, fallbacks with their reason, credits stalls, RNR
 retries, QP errors. `tsdb cluster status` names each link's transport.
@@ -338,18 +454,36 @@ retries, QP errors. `tsdb cluster status` names each link's transport.
 TCP is always there: the anchor is the TCP link, on the Ethernet address the member advertises, never an IPoIB
 address (no TCP runs over IPoIB, §2). tsdbd checks this at start: a peer address bound to an interface of type
 InfiniBand (`/sys/class/net/IF/type` 32, ARPHRD_INFINIBAND) is refused with a line naming the interface, unless
-`cluster.peer.allow_ipoib=true` says the operator wants it (track rd-upgrade). A failure of the RDMA path ends the
-connection; the redial upgrades again; a peer whose offers fail three times in a row is not offered to for a minute
-(doubling to 10), logged once per change. The link's drivers see the same `on_link` down and up they see after a TCP failure today, so every resume path
+`cluster.peer.allow_ipoib=true` says the operator wants it (D12, track rd-upgrade). A node knows its own interfaces,
+not the peer's, so the check is made where each end can make it: at start on the address tsdbd listens on for peers,
+and at every dial on the local address of the connected socket (`getsockname`, looked up in `getifaddrs`): a dial
+whose route leaves through an IPoIB interface is ended with that line.
+
+A failure of the RDMA path ends the connection; the redial upgrades again. **Backoff**: a failed offer, and a QP that
+fails within 60 s of settling, each count as a failure of that peer and kind; three in a row and no offer is made to
+it for a minute (doubling to 10), logged once per change; a link that stays on RDMA for 60 s resets the count. So a
+port that flaps after READY puts the link on TCP for a while instead of taking it down every few seconds (each time
+a resume of repld). **Way back**: a link that settled on TCP because of a failure re-offers on the live link after
+`cluster.peer.rdma.retry_s` (600 s) once the backoff allows it (§5.1 step 8: no `on_link` change); a decline for
+`not_built`, `off` or `kind` is final for the connection. The link's drivers see the same `on_link` down and up they see after a TCP failure today, so every resume path
 already tested for TCP is the one RDMA uses.
 
 ### 5.4 Build
 
-`NO_RDMA=1` builds without any of it (like `NO_URING`); the default build needs only rdma-core's headers
-(`libibverbs-devel`, `librdmacm-devel`) and links neither library: `server/plrdma_dl.c` loads `libibverbs.so.1` and
+`NO_RDMA=1` builds without any of it (like `NO_URING`). The default build **detects** rdma-core's headers
+(`infiniband/verbs.h`, `rdma/rdma_cma.h`: `libibverbs-devel`/`librdmacm-devel`, `libibverbs-dev`/`librdmacm-dev` on
+Ubuntu): present, it builds the transport; absent, it builds as `NO_RDMA=1` with one line from make (neither the dev
+machine nor the build machine has them today, and the default build must not break there). `make dist`, CI
+(ci.yml's packages) and the release image install them, so the tarball always has the transport; AGENTS.md's
+Requirements, docs/macos.md and the release image get a line (rd-verbs). It links neither library: `server/plrdma_dl.c` loads `libibverbs.so.1` and
 `librdmacm.so.1` with `dlopen` at the first use, so the tarball of `make dist` runs on hosts without rdma-core (one
 line: RDMA not available) and `tools/check-glibc.sh` is unaffected. The fast-path calls (`ibv_post_send`,
-`ibv_poll_cq`) are inline in `verbs.h` and call through the context's function table, so they need no symbol. macOS
+`ibv_poll_cq`) are inline in `verbs.h` and call through the context's function table, so they need no symbol. Some
+set-up calls are macros or inlines that reference exported symbols (to verify on the track against rdma-core 61's
+`verbs.h`: `ibv_reg_mr` expands to `__ibv_reg_mr`, which calls `ibv_reg_mr` or `ibv_reg_mr_iova2`; `ibv_query_port`
+to `___ibv_query_port` with the compat port struct): the shim calls the exported entry points it took with `dlsym`,
+never those macros, and rd-verbs begins with a spike and a check that `nm -u build/tsdbd` names no `ibv_` or `rdma_`
+symbol (`tools/check-rdma-syms.sh`, in `make test` when the transport is built). macOS
 builds with `NO_RDMA` forced (the code is Linux-only and behind `#ifdef TSDB_RDMA`; docs/macos.md gets a line).
 Licences: the new files are AGPL-3.0-only like the rest of `server/`; rdma-core's headers are used, not copied.
 
@@ -357,8 +491,9 @@ Licences: the new files are AGPL-3.0-only like the rest of `server/`; rdma-core'
 
 The threat model is a backend on an isolated network (design-auth.md). Two facts change with RDMA: the firewall does
 not see it (§2), and a peer that can reach a QP can send to it. In D the QP exists only for a connection whose TCP
-handshake passed AUTH; an RC QP in RTR accepts packets only from the remote QP number and address it was given; and
-every frame keeps its MAC (with the faster MAC of §6), so a forged packet on the fabric ends the link instead of
+handshake passed AUTH. An RC packet names only its destination QP; the responder checks its PSN and partition key
+(P_Key), not who sent it, so a host on the fabric that learns a QP number and guesses the PSN could inject packets.
+The protection is that every frame keeps its MAC (with the faster MAC of §6), so a forged packet on the fabric ends the link instead of
 reaching a driver. No remote key is ever handed out (D9), so no peer can read or write our memory. Option C's rdma_cm
 listener is reachable by anyone on the fabric; it accepts only a connection whose private data carries a nonce the
 TCP handshake issued.
@@ -373,12 +508,25 @@ are not measured here yet. Options, to be measured with `link-bench --mac` in th
 | MAC | speed on these CPUs | notes |
 |---|---|---|
 | HMAC-SHA256 (today) | about 230 MB/s per side (§3.3) | portable C, tsdb_crypto.c |
+| HMAC-SHA256 with SHA extensions (SHA-NI) | none here: these Xeons lack them; 1-2 GB/s per core where present (to measure) | **no protocol change** (no new cluster version), only a dispatched kernel; helps only CPUs that have the extensions. The build machine has them and still moves 2.3 Gbit/s, because tsdb_crypto.c never uses them (§3.3). Whether production's CPUs have them is unknown: read `/proc/cpuinfo` (`sha_ni`) there before choosing |
 | AES-128-GMAC (AES-NI + PCLMULQDQ) | several GB/s per core (to measure) | needs a nonce per frame (the sequence number is one); OpenSSL's libcrypto or own code; FIPS-friendly |
 | BLAKE3 keyed | several GB/s per core with AVX2/AVX-512 (to measure) | CC0/Apache-2.0 reference code with SIMD kernels; fits `src/levels.h` style dispatch |
 | Poly1305 with a per-frame key from ChaCha20 | 1-2 GB/s in portable 64-bit C (to measure) | no SIMD needed, small code |
 
 Default proposal: the fastest that keeps a 128-bit tag and a keyed construction, negotiated in HELLO (a new cluster
-version: before 1.0 no compatibility promise, design-cluster-data.md E40). Not proposed: MAC'ing only the frame's
+version: before 1.0 no compatibility promise, design-cluster-data.md E40). If production's CPUs have SHA extensions,
+dispatching HMAC-SHA256 to them is the cheapest first step and changes no protocol. Whatever is chosen, one link's
+MAC runs on one core per side (§4 "CPU with the MAC"): line rate on one link needs about 6 GB/s per core, which no
+candidate is expected to reach on these CPUs; spreading one link's MAC over threads is not in this design.
+
+What rd-mac must carry (it is more than a function): a SIMD kernel (BLAKE3, SHA-NI, AES-GMAC) needs CPU-level
+dispatch under `make dist` (the `src/levels.h` pattern or a runtime check like `src/cpu.c`'s, `tools/check-isa.sh`'s
+v2 baseline and its allow list of wide kernels); OpenSSL's libcrypto instead would be a new linked library
+(`tools/check-glibc.sh`, the tarball, AGENTS.md's Requirements). The link MAC is server-only, so it goes in a new
+AGPL `server/plmac.c` (vendored reference code under its own directory with its `UPSTREAM` and licence, as `src/ec/`),
+not in the Apache-2.0 `client/tsdb_crypto.c`; test vectors of the chosen MAC; `PL_CL_VERSION` 8 and the capability
+bit of §5.1; test_peerlink's tag mutants against the new MAC; the fuzz-replframe corpus regenerated; and
+`link-bench --mac` to take the numbers of D14. Not proposed: MAC'ing only the frame's
 xxh64 (not collision resistant: a tag over it protects nothing against a peer that can change bytes), or no MAC on
 RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forged packets).
 
@@ -386,16 +534,20 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
 
 | | decision | alternative | why |
 |---|---|---|---|
-| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code | RDMA first | §3.3: the MAC caps every transport at about 1.9 Gbit/s; RDMA alone would move nothing faster for bulk |
+| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code | RDMA first | §3.3: the MAC caps every link at about 1.9 Gbit/s on every transport; RDMA alone would move nothing faster for bulk. At the default rate caps D1 alone buys little for bulk (§4): it is the precondition for D11, and it halves the 1 KiB round trip's cost on LOG and FWD (26 µs of MAC, §3.3) |
 | D2 | **Verbs under peerlink, upgraded from the TCP data link** (option D), rdma_cm only for iWARP and as an option | rsocket (B); rdma_cm everywhere (C); IPoIB only (A) | works without IPoIB; one auth path; firewall still governs who may connect; fallback is the link we have |
 | D3 | **The metadata link stays TCP** | everything on RDMA | Raft and the failure detector stay independent of the fabric and of new code |
 | D4 | **`dlopen` of libibverbs and librdmacm**; `NO_RDMA=1` to build without; macOS never | link them | one binary and one tarball for hosts with and without rdma-core |
 | D5 | **WRITTEN = posted** | WRITTEN on completion | a completion says the peer's NIC acknowledged, not what the peer did; a flushed WR is not proof of nothing sent |
 | D6 | **`auto` is the default** | `off` until proven | a cluster with IB uses it without configuration; `off` stays one key away |
-| D7 | **One registered pool per peerlink**, slots of 64 KiB, sized by a setting (64 MiB); memlock checked at start | registration per frame or per file | registration on the data path costs tens of µs and fails unpredictably under a memlock limit |
+| D7 | **One registered pool per tsdbd and device**, shared by its three peerlinks; slots of 4 KiB and 64 KiB; receives on an SRQ per peerlink and slot size, credits granted per link (SRQ against small per-link rings settled in rd-verbs); 64 MiB by default; memlock checked at start | a pool per peerlink; registration per frame or per file | registration on the data path costs tens of µs and fails unpredictably under a memlock limit; per-link 64 KiB rings do not add up (§4) |
 | D8 | **One RC QP per link connection** (per peer and kind) | one shared QP per peer | keeps kinds independent (C25, R4 D7: a snapshot never delays a COMMIT file) and generations simple; ConnectX-3 has QPs to spare |
 | D9 | **SEND/RECV only** in 0.11.0, no RDMA WRITE/READ, no remote keys | WRITE for bulk, READ for chunk cells | §3.1: SEND reaches line rate from 16 KiB; no rkey means no fencing of remote access to get wrong |
-| D10 | **RoCE supported by the same code, not tested as a production path** until a lossless Ethernet setup exists | RoCE as a target | the production fabric is InfiniBand |
+| D10 | **RoCE supported by the same code, not tested as a production path** until a lossless Ethernet setup exists; `auto` takes InfiniBand ports only | RoCE as a target; any active port | the production fabric is InfiniBand; a RoCE v1 link on a lossy Ethernet must never be picked silently |
+| D11 | **The bulk rate caps keep their defaults** (BULK 256 MiB/s, `rebuild_mb_s` 200, CHUNKB 256, node-wide per kind) until rd-hw has measured, with the MAC fixed, the LOG link's latency and NFS/RDMA latency under bulk load; then they are raised on that evidence, per kind | raise them with D1 | the caps, not the transport, set bulk throughput today (§1); they also protect the storage that shares the port (§4) |
+| D12 | **tsdbd refuses a peer address that leaves through an IPoIB interface**, unless `cluster.peer.allow_ipoib=true` (§5.3) | warn only; no check | the owner's rule: no TCP over IPoIB; a misconfigured member is found at start or dial, not by its traffic |
+| D13 | **A service level per kind** (`cluster.peer.rdma.sl`, default 0) and no other QoS in tsdb | rate caps only | the SM's SL-to-VL tables and VL arbitration decide what an SL means; tsdb only has to let the operator mark its traffic (§4 "Sharing the port") |
+| D14 | **A decision point after rd-mac**: §3.3 (TCP, batched and tagged) and §4 are measured again with the new MAC, on the test servers and on production's CPUs if possible, and the owner sets the order and scope of rd-seam onwards from those numbers | build all tracks in order | the case for the verbs tracks rests on numbers §6 has not taken; the owner asked for RDMA links, so the point decides order and scope, not whether |
 
 ## 8. Testing
 
@@ -406,10 +558,25 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
   bugs (`--mutant`): WRITTEN reported on completion, a flushed WR reported NEVER_WRITTEN, an old generation's frame
   posted to the new QP, credits not reserved for PING (a paused link counted dead), slots returned before the QP is
   destroyed, the upgrade accepted without the MAC check, a fallback that keeps the old connection's queue.
-- **Soft-RoCE where it exists**: the dev machine (Ubuntu kernel) has `rdma_rxe` and `siw`, so `test_peerlink` and
-  `test_cluster` run every existing case once more with `--peer-rdma on` over an rxe device on loopback (made by the
-  test script with `rdma link add`, which needs root: the tests print that they are skipped otherwise). CI (Ubuntu
-  runners) does the same. AlmaLinux 10 has neither module: those runs say skipped.
+  The fake fails the QP at once on a SEND that finds no posted receive (as iWARP does, and as `rnr_retry` 0 does on
+  the hardware runs): a credit bug must be an error, never a stall. Further cases: both sides at zero data credits
+  with frames queued; a paused link that only PINGs for 10 x `dead_ms`; READY in flight when the dialer's timeout
+  fires (the dialer ABORTs, both settle on TCP, the late READY is discarded); ABORT after ACCEPT before HELLO; HELLO
+  posted and then a fallback (the next TCP frame verifies: HELLO and READY took no sequence number); a GO lost to a QP
+  error; the acceptor's 4 s timeout; a QP that fails after READY three times (the backoff, then a re-offer after
+  `retry_s` on the live link); an offer from another IB subnet. Further mutants: a control credit returned by a frame
+  of its own (a storm), a pause that withholds control credits, a slot returned before its flush completion, an
+  unsignalled send's slot returned early, the acceptor settling on READY instead of GO.
+- **Soft-RoCE where it exists**: the dev machine (Ubuntu kernel) has `rdma_rxe` and `siw` (neither loaded today), so
+  `test_peerlink` and `test_cluster` run every existing case once more with `--peer-rdma on` over an rxe device. Making
+  the device needs root (`modprobe rdma_rxe; rdma link add rxe0 type rxe netdev IF` on an Ethernet or veth interface),
+  so the tests never make it: they use a device that exists and print that they are skipped otherwise. A suite that
+  skips everywhere has no teeth, so the setup is named: the **weekly gate on the dev machine** makes the device once
+  per boot (a step of the gate's script run with sudo by the owner, or a systemd unit) and runs with
+  `TSDB_RDMA_REQUIRED=1`, which turns "skipped" into a failure. rxe pins registered pages against `RLIMIT_MEMLOCK`
+  (8 MB hard on the dev machine), and test_cluster starts 3-5 tsdbd: the tests run with `pool_mb` 1 and
+  `rnr_retry` 0. CI (ubuntu-24.04, Azure kernel) may not load `rdma_rxe` (it lives in linux-modules-extra): rd-rxe
+  finds out; if it cannot, CI runs the fake only and says so. AlmaLinux 10 has neither module: those runs say skipped.
 - **The test servers** for real hardware, by hand and in the weekly gate when they are free: `test_cluster` scenarios
   over IB (replicate, fwd, chunksrv, a snapshot), `jepsen-cluster --peer-rdma on` with a nemesis that breaks only the
   RDMA path (a QP forced to error through a test hook, `TSDB_PLRDMA_TEST`), and the §10.3 measurements of
@@ -420,15 +587,16 @@ RDMA (InfiniBand's ICRC catches corruption, but §5.5 needs the MAC against forg
 
 | key | risk | depends on | files | days |
 |---|---|---|---|---|
-| rd-mac | high | main | server/peerlink.c (`frame_tag` and its key schedule), client/tsdb_crypto.c or a new server/plmac.c, `PL_CL_VERSION` 8, tools/link-bench.c `--mac`, tests/test_peerlink.c (tag mutants against the new MAC), fuzz-replframe corpus | 1 |
+| rd-mac | high | main | server/peerlink.c (`frame_tag` and its key schedule), new server/plmac.c (AGPL; vendored kernel code with its `UPSTREAM`), CPU-level dispatch (`src/levels.h` pattern or a runtime check; tools/check-isa.sh's allow list), `PL_CL_VERSION` 8 and `PL_CAP_RDMA`, test vectors, tools/link-bench.c `--mac`, tests/test_peerlink.c (tag mutants against the new MAC), fuzz-replframe corpus; then D14's measurements | 3 |
 | rd-seam | medium | rd-mac | server/peerlink.c split: the TCP transport behind `struct pl_transport` (read, write, poll fds, close) with no change in behaviour; test_peerlink unchanged and green; `objdump` not needed (behaviour, not codegen) | 1 |
-| rd-verbs | high | rd-seam | new server/plrdma.[ch] (pool, QP setup from exchanged numbers, credits, SEND/RECV slots, frames split over slots, completion fd in the link's poll), server/plrdma_dl.c, Makefile `NO_RDMA`, tests/test_plrdma.c with the fake and its mutants | 2 |
-| rd-upgrade | high | rd-verbs | peerlink.c: `RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY`, fallback and offer backoff, on_link after the transport settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 1.5 |
+| rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
+| rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |
-| rd-rxe | medium | rd-upgrade | tests: a helper that makes an rxe device (or says skipped), test_peerlink and test_cluster `rdma` runs, the CI job | 0.75 |
-| rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed; results here | 1 |
+| rd-rxe | medium | rd-upgrade | tests: a helper that finds an rxe device (or says skipped; `TSDB_RDMA_REQUIRED=1` fails instead), the weekly gate's setup step on the dev machine (the device, memlock), test_peerlink and test_cluster `rdma` runs with a tiny pool and `rnr_retry` 0, whether CI can load rdma_rxe and the CI job if it can | 1 |
+| rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed (batched, buffers on both sides); on a production-like node NFS/RDMA and WAL `fdatasync` latency under peer bulk load at several caps, and the end-to-end rebuild rate (D11); results here | 1.5 |
 
-About 8 days; rd-mac stands alone and is worth merging first even if the rest waits. The gates: the targeted tests of
+About 12 days; rd-mac stands alone and is worth merging first even if the rest waits, and D14's decision point
+follows it. The gates: the targeted tests of
 each track, `make asan` and `make tsan` of test_peerlink and test_plrdma (memory registered and freed across threads),
 the cluster gate and `make jepsen-cluster` once rd-upgrade is in, and a weekly run over rxe.
 
@@ -436,6 +604,7 @@ the cluster gate and `make jepsen-cluster` once rd-upgrade is in, and a weekly r
 
 - RDMA READ of chunk cells straight from a store (needs registered page cache: ODP, which ConnectX-3 lacks, or a
   registered cell cache) and RDMA WRITE for bulk files: after the 0.11.0 numbers show the copy matters.
-- NFS over RDMA is the kernel's (docs/nfs-server.md); nothing here touches it.
+- NFS over RDMA is the kernel's (docs/nfs-server.md) and this design does not change it, but the peer links share
+  its fabric and port: §4 "Sharing the port", D11, D13.
 - Clients over RDMA: clients talk to tsdbd over TCP; out of scope.
 - Configuring IPoIB connected mode, the SM, PFC/ECN for RoCE: operations, not tsdb.
