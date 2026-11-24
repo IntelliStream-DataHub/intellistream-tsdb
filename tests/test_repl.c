@@ -16,6 +16,9 @@
  *               repl_open that nothing reached).
  *   follower_damage a follower fails, never repairs, when the leader's log differs from its own below the verified end
  *               (MUT(30)), or a cut would pass its applied end or a position its log no longer retains.
+ *   below_start a follower filled by a snapshot (log start and epoch history above 1) skips the records below its log
+ *               start that a new leader's catch-up sends from position 1, and still fails on another epoch at a
+ *               position it holds (MUT(59): judged them by the history and stopped).
  *   idle_shrink a member that stops acknowledging leaves the ISR after isr_lag although nothing is written (MUT(40):
  *               only a member behind the log end isr_lag ago went, so an idle volume kept a dead member, and min_isr
  *               never refused).
@@ -402,6 +405,73 @@ static void follower_damage(void)
     repl_recv(r, &an);
     drain(r, &d, NULL);
     CHECK(repl_failed(r), "a cut to a position the log does not retain was not refused");
+    repl_free(r);
+}
+
+/* A follower filled by a snapshot: its log starts at 1001 and its epoch history at 900 (epoch 2), what an install
+ * keeps. A new leader's driver sends a member it has not heard from yet its log from the start (repld catch_up): the
+ * records below 1001 are not in this log, are committed, and are skipped, also when the history has no epoch for them;
+ * the ones it holds are judged as before (MUT(59) judged them all: the member stopped, jepsen-cluster churn). */
+static void below_start(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1001, 1010, 2, 1);
+    d.start = 1001;
+    struct repl_epoch h[1] = {{.epoch = 2, .start = 900}};
+    struct repl_config c = config(1, &d);
+    struct repl_durable du = {.rid = 22, .fence = 2, .floor = 1010, .log_start = 1001, .log_end = 1010, .hist = h,
+                              .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "the follower did not open");
+    struct repl_msg m = meta_msg(1, 3, 0, 0x3, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    struct repl_msg an = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 3, .leader = 0, .last_epoch = 2,
+                          .written = 1010, .prev_epoch = 2, .prev_pos = 1010, .end = 1};
+    repl_recv(r, &an);
+    drain(r, &d, NULL);
+    CHECK(!repl_failed(r), "the follower failed on the answer");
+    /* the leader's log from 1: epoch 1 up to 899, epoch 2 from 900; then its own epoch 3 record at 1011 */
+    struct repl_rec rec[16];
+    uint32_t n = 0;
+    for (uint64_t p = 1; p <= 4; p++)
+        rec[n++] = (struct repl_rec){.pos = p, .epoch = 1, .n = 1};
+    struct repl_msg ap = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 0, .prev_epoch = 0,
+                          .nrec = n, .rec = rec, .commit = 1010};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(!repl_failed(r), "records below the log start were judged by an epoch history that does not reach them");
+    n = 0;
+    for (uint64_t p = 998; p <= 1011; p++)
+        rec[n++] = (struct repl_rec){.pos = p, .epoch = p == 1011 ? 3 : 2, .n = 1};
+    ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 850, .prev_epoch = 1,
+                           .nrec = n, .rec = rec, .commit = 1010};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(!repl_failed(r) && repl_written(r) == 1011,
+          "an append from below the log start, on through the log to a new record, was refused (written %" PRIu64 ")",
+          (uint64_t)repl_written(r));
+    repl_free(r);
+
+    /* Control: at a position the log holds, another epoch is damage all the same. */
+    memset(&d, 0, sizeof d);
+    fill(&d, 1001, 1010, 2, 1);
+    d.start = 1001;
+    r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "the follower did not open (2)");
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_recv(r, &an);
+    drain(r, &d, NULL);
+    n = 0;
+    for (uint64_t p = 999; p <= 1002; p++)
+        rec[n++] = (struct repl_rec){.pos = p, .epoch = 1, .n = 1};
+    ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 998, .prev_epoch = 1,
+                           .nrec = n, .rec = rec, .commit = 1010};
+    repl_recv(r, &ap);
+    drain(r, &d, NULL);
+    CHECK(repl_failed(r), "a record of another epoch at a position the log holds was accepted");
     repl_free(r);
 }
 
@@ -1350,6 +1420,7 @@ int main(int argc, char **argv)
     trim();
     open_damage();
     follower_damage();
+    below_start();
     open_hold();
     cut_applied();
     sync_cut();

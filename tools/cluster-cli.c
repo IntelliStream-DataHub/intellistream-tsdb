@@ -302,6 +302,10 @@ static void print_status(const struct cluster_status *st)
                st->tr[CL_TR_STARTED], st->tr[CL_TR_DONE], st->tr[CL_TR_TIMEDOUT], st->tr[CL_TR_CANCELLED],
                st->tr[CL_TR_FALLBACK], st->tr[CL_TR_BALANCE], st->tr[CL_TR_DRAIN_TIMEDOUT], st->tr[CL_TR_BLIND],
                st->tr[CL_TR_READY], st->tr[CL_TR_CUTS]);
+    if (st->ntr >= CL_TR_N) /* replica moves (cmove.c): counted on the Raft leader that ran them */
+        printf("moves started %" PRIu64 " done %" PRIu64 " cancelled %" PRIu64 "\n", st->tr[CL_TR_MV_STARTED],
+               st->tr[CL_TR_MV_DONE], st->tr[CL_TR_MV_CANCELLED]);
+    fputs(st->moves, stdout); /* "move volume V node A -> node B: STEP, AGE s", one per move running */
     meta_free(&m);
 }
 

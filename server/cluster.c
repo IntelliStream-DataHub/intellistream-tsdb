@@ -583,6 +583,8 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         r.bad = 1;
     for (uint32_t i = 0; i < st->ntr && !r.bad; i++)
         st->tr[i] = get64(&r);
+    if (!r.bad)
+        getstr(&r, st->moves, sizeof st->moves);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -1135,6 +1137,8 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int vol_trace;       /* TSDB_CLUSTER_TEST vol_trace=1: <state-dir>/voltrace, a line per changed volume (cmove_trace) */
+    char voltracefile[1100];
     int drop_hb;         /* TSDB_CLUSTER_TEST drop_hb_file=1: while <state-dir>/drophb is, a heartbeat received from the node
                           * it names (a decimal id) is dropped unanswered (test_cluster balancehb: a one-way cut of one
                           * member's heartbeats from the Raft leader, its data links untouched) */
@@ -1442,6 +1446,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "vol_trace=%llu", &v) == 1)
+            C.vol_trace = v != 0;
         else if (sscanf(p, "drop_hb_file=%llu", &v) == 1)
             C.drop_hb = v != 0;
         else if (sscanf(p, "hold_grant_ms=%llu", &v) == 1)
@@ -1818,6 +1824,8 @@ static _Atomic uint64_t g_lease_ns; /* this server's read lease runs until this 
 static atomic_int g_beat_soon;      /* cluster_beat_soon: send the next heartbeat at the next duty round */
 
 void cluster_beat_soon(void) { atomic_store_explicit(&g_beat_soon, 1, memory_order_relaxed); }
+
+const char *cluster_vol_trace_path(void) { return C.vol_trace ? C.voltracefile : NULL; }
 
 void cluster_loop_stamp(void) { atomic_store_explicit(&g_stamp_ns, mono_ns(), memory_order_relaxed); }
 
@@ -2772,6 +2780,8 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
     }
     if (!own)
         return;
+    if (C.vol_trace && type == RAFT_ENTRY_NORMAL)
+        cmove_trace(m, index, C.voltracefile);
     ring_push(index, term, type, data, len);
     for (size_t i = 0; i < C.nconns; i++)
         if (C.conns[i]->watch_served && C.conns[i]->state == CS_READY && !C.conns[i]->dead)
@@ -3967,11 +3977,17 @@ static void put_status(struct buf *b)
     tr[CL_TR_STARTED] = cc.started, tr[CL_TR_DONE] = cc.done, tr[CL_TR_TIMEDOUT] = cc.timedout;
     tr[CL_TR_CANCELLED] = cc.cancelled, tr[CL_TR_FALLBACK] = cc.fallback, tr[CL_TR_BALANCE] = cc.balance;
     cluster_drv_counts_fn dc = atomic_load_explicit(&g_drv_counts, memory_order_acquire);
+    unsigned long ms, md, mc;
+    cmove_counts(&ms, &md, &mc);
+    tr[CL_TR_MV_STARTED] = ms, tr[CL_TR_MV_DONE] = md, tr[CL_TR_MV_CANCELLED] = mc;
     if (dc)
         dc(tr);
     put32(b, CL_TR_N);
     for (int i = 0; i < CL_TR_N; i++)
         put64(b, tr[i]);
+    char mv[sizeof ((struct cluster_status *)0)->moves];
+    cmove_status(mv, sizeof mv, now);
+    putstr(b, mv);
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
@@ -7115,6 +7131,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.voltracefile, sizeof C.voltracefile, "%s/voltrace", C.metadir);
     snprintf(C.drophbfile, sizeof C.drophbfile, "%s/drophb", C.metadir);
     snprintf(C.losereadyfile, sizeof C.losereadyfile, "%s/loseready", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);

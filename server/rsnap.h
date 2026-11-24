@@ -29,6 +29,9 @@ void rsnap_tick(struct rvol *rv);
 /* repld_stop, after every volume's thread has been joined AND the links freed (peerlink_free joins the link threads,
  * which call rsnap_frame and rsnap_bin_* until then): nothing of rsnap.c runs any more; rv->mu not held. */
 void rsnap_stop(struct rvol *rv);
+/* repld_close (never an install's repld_close_end), the driver joined: ends the volume's snapshot jobs (a receiver's
+ * v<N>.snap removed by the worker, a source's snapshot released); no lock held. */
+void rsnap_closed(uint32_t vol);
 /* A frame on a kind-5 link (the link's thread; never the driver's or the cluster thread). */
 void rsnap_frame(struct plink *l, uint8_t type, const uint8_t *p, size_t n);
 /* The bulk callbacks of a kind-5 link (peerlink.h struct pl_bulk), as bin_open, bin_data and bin_end are for kind 2. */

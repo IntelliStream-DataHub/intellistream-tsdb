@@ -396,7 +396,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_cvol $(SCRATCH)
 	./$(B)/test_cvolfs $(SCRATCH)
 	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
-	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
+	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap wtailfoldall nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
 	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)
 	$(MUT) --name test_feedstore --rc 1 --grep 'renamed before its data was synced' --list "noseal" -- ./$(B)/test_feedstore --mutant @M@ @D@ # a replayed segment renamed without its fdatasync must fail it
@@ -870,7 +870,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: lease-mutants transfer-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: lease-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -985,7 +985,7 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
 	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
 	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown \
-	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer \
+	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer snapclosekeep \
 	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
@@ -996,6 +996,9 @@ lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)
+# the replica move's mutants (server/cmove.c TSDB_CLUSTER_MUTANT; tests/move_mutants.sh)
+move-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/move_mutants.sh $(SCRATCH)
 # the cluster login mutants (server/auth.c, tools/cluster-user-cli.c TSDB_AUTH_MUTANT; tests/auth_mutants.sh)
 auth-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(SCRATCH)

@@ -147,6 +147,10 @@ struct cluster_report {
 /* A volume led here has a new request for the metadata group (any thread, an atomic store): the cluster thread sends
  * its next heartbeat within a duty round (100 ms) instead of after heartbeat_ms, so an ISR change waits that long. */
 void cluster_beat_soon(void);
+/* TSDB_CLUSTER_TEST vol_trace=1 (tests only): the path of <state-dir>/voltrace, else NULL. The volume leader's driver
+ * appends its ISR requests there with the core's reason (repld.c), beside the applied records (cmove_trace), so a test
+ * tells a move's shrink (leave) from one for lag (drop). */
+const char *cluster_vol_trace_path(void);
 /* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
 typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);
@@ -444,6 +448,7 @@ struct cluster_status {
      * ran them (a transfer's state lives in memory), the volume leaders' side on every member */
     uint32_t ntr;
     uint64_t tr[16];
+    char moves[8192]; /* the Raft leader's moves running, a line each with its step and age (cmove_status) */
     const uint8_t *image;
     size_t image_len;
 };
@@ -458,6 +463,9 @@ enum cluster_tr_count {
     CL_TR_BLIND,     /* records admitted after READY's hard cap (10 x transfer_wait_ms); they may be cut */
     CL_TR_READY,     /* READYs sent */
     CL_TR_CUTS,      /* replica log cuts that removed records here (REPL_A_TRUNCATE below the log's end) */
+    CL_TR_MV_STARTED,   /* the Raft leader: replica moves it proposed the REPLICA_ADD of (cmove.c) */
+    CL_TR_MV_DONE,      /* moves it ended with the REMOVE of the replaced member */
+    CL_TR_MV_CANCELLED, /* moves it ended with the REMOVE of the learner (`--cancel`) */
     CL_TR_N
 };
 /* The volume leaders' counters (CL_TR_DRAIN_TIMEDOUT and on) come from tsdbd's driver; without one they read 0. */

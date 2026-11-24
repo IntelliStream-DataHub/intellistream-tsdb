@@ -420,6 +420,17 @@ static void transfers(uint64_t now)
     }
 }
 
+const char *ctr_move_start(uint32_t vol, uint32_t node, uint64_t now)
+{
+    const struct meta_volume *v = meta_volume(cl_meta(), vol);
+    const char *no = tr_check(v, node, now);
+    if (!no)
+        tr_start(v, node, 0, now);
+    return no;
+}
+
+int ctr_running(uint32_t vol) { return tr_find(vol) != NULL; }
+
 static int busy_server(uint32_t node)
 {
     for (uint32_t i = 0; i < g_ntr; i++)

@@ -51,7 +51,7 @@
 # driver stopped: a FENCE meanwhile lost) snapfence; snapinstallstale (a copy at or below the log end installed, or
 # the volume closed for it) and snapservebeforeopen (an installed copy opened before REPLICA_OPEN) snapcatch;
 # snapkeepdiverged (DIVERGED carried into the fresh copy) snapdiverged; snapsetnodefer (a set change applied during an
-# install) addsnap; after review: snapdropafter (a copy not installed removed by the worker after the volume went back:
+# install) addsnap; snapclosekeep (a removed replica's snapshot job left, its v1.snap with it) removesnap; after review: snapdropafter (a copy not installed removed by the worker after the volume went back:
 # the prepare's leftovers race it) and snapnofence (a copy below the receiver's fence installed) snapfence;
 # snapnoendafter (P not compared with the stopped driver's log end) snapcatch; snapdivlogend (a DIVERGED rebuild
 # compared with the log it replaces) snapdiverged; snapnoleftovers (no leftovers at prepare) snapkill. A floor below
@@ -121,6 +121,7 @@ table=(
     "snapservebeforeopen|snapcatch|the replica opened its installed copy before the group recorded its open generation"
     "snapkeepdiverged|snapdiverged|the rebuilt replica (stopped as DIVERGED again|joins the ISR)"
     "snapsetnodefer|addsnap|a set change applied on server [0-9]+ while it installed a snapshot"
+    "snapclosekeep|removesnap|v1 or v1.snap 20 s after its removal"
     "snapdropafter|snapfence|the receiver neither installed with the raised fence nor refused the stale copy and joined|the refused copy was removed by the snapshot worker"
     "snapnoendafter|snapcatch|a replica in the ISR (installed a copy|took a copy at or below the log end its stopped driver)"
     "snapnofence|snapfence|the old leader's copy was installed on a receiver fenced at [0-9]+ above its epoch"

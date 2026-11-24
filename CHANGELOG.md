@@ -31,6 +31,17 @@ moving a replica, or after lowering `min_isr`, never by a plain remove).
 member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised
 again.
 
+**Moving a log replica (R4, r4-move).** `tsdb cluster volume move PEER VOLUME --log --from A --to B` moves a
+volume's copy from one node to another in the background: B is added as a learner, fills and joins the ISR; a transfer
+first if A leads; A leaves the ISR only while the ISR without it keeps the size it had before B joined (a lagging member
+makes the move wait); then A is removed and B takes its slot. `--cancel` removes the learner. The metadata group's
+leader drives it (`server/cmove.c`), a new one carries it on. The reply of `CLUSTER_OP_STATUS` has three more transfer
+counters (moves started, done, cancelled) and, after them, a string with the moves running: a `tsdb cluster status`
+of an earlier build fails to decode a newer server's reply, and the other way round (no version number moved; the
+cluster is a preview). jepsen-cluster's `churn` nemesis now runs, with a check of every move's ISR over the nodes'
+traces. Tests: `test_cluster move*`, `removesnap` (a removed replica no longer leaves its `v<N>.snap`), `make
+move-mutants`.
+
 **Planned leader transfer and leader balance (R4, r4-transfer).** `tsdb cluster volume transfer` moves a volume's lead
 to a member of its ISR: the leader drains (writes answer UNAVAILABLE PROMOTING, retry after 50 ms), says READY to the
 metadata group's leader, and a promotion of that member alone follows; with `leader_balance_s` set, a volume moves back

@@ -5320,6 +5320,43 @@ static void case_class_floor(int dead)
            : dead == 2 ? "a WAL tail the member keeps, folded past the cap" : "a WAL tail the member keeps");
 }
 
+/* A replica keeps its flushed segments (no saved floor: a learner filling from the log start), so its WAL tail passes
+ * the cap while the leader's floor has passed every flush: the leader's T for series 0 is exact, from its rows near T0.
+ * The replica's fold must keep each series' own bound (wtail_fold). Folded into one bound for every series (mutant
+ * wtailfoldall, the code before), series 1's rows two days later were taken as series 0's, and the replica refused the
+ * leader's T as "its history is not the leader's" and stopped (jepsen-cluster churn, classes, seeds 1 and 102). */
+static void case_class_fold_replica(void)
+{
+    xport x;
+    xp_start(&x, "lcfoldrep");
+    eng *ld = x.ld;
+    atomic_store(&cls_wtail_cap, 2);
+    xp_rows(&x, 0, 0, 5, 1);
+    xp_step(&x, "L1d: series 0's rows");
+    CHECK_EQ(mt_flush(ld), 0);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    int64_t far = DAY1 + 2 * DAY_MS;
+    for (int r = 0; r < 6; r++) {
+        xp_rows_at(&x, 1, far + 10000LL * r, 3, (float)r);
+        xp_step(&x, "L1d: series 1's rows two days later");
+        CHECK_EQ(mt_flush(ld), 0);
+        CHECK_EQ(mt_flush(x.rep), 0);
+    }
+    pthread_mutex_lock(&x.rep->lock);
+    CHECK(x.rep->nwtail <= 2); /* past the cap: folded */
+    CHECK(x.rep->nwtail + (x.rep->wtail_all_seq != 0) >= 1);
+    pthread_mutex_unlock(&x.rep->lock);
+    eng_leader_replay_floor(ld, ld->fno_next); /* every member past every flush: the leader's T is its rows' */
+    CHECK_EQ(eng_class_switch(ld, 0, 2, NULL), 0);
+    xp_step(&x, "L1d: the replica applied series 0's switch");
+    int c = -1;
+    CHECK(eng_series_class(x.rep, 0, &c) == 0 && c == 2);
+    CHECK_EQ(eng_check(x.rep), 0);
+    atomic_store(&cls_wtail_cap, CLS_WTAIL_CAP);
+    xp_stop(&x);
+    printf("  a replica's WAL tail past the cap keeps each series' bound: it applies the leader's exact switch time\n");
+}
+
 static void same_file(eng *a, eng *b, const char *name, const char *what)
 {
     uint8_t *x = NULL, *y = NULL;
@@ -7142,6 +7179,7 @@ static int mutant_of(const char *m)
                         : strcmp(m, "freshunattached") == 0 ? MUT_LEADER_FRESH_UNATTACHED
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
+                        : strcmp(m, "wtailfoldall") == 0 ? MUT_WTAIL_FOLD_ALL
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF
                         : strcmp(m, "zerorate") == 0 ? MUT_LEADER_ZERO_RATE
                         : strcmp(m, "noraisefrom") == 0 ? MUT_LEADER_NO_RAISE_FROM
@@ -7709,6 +7747,7 @@ int main(int argc, char **argv)
         case_class_floor(0);
         case_class_floor(1);
         case_class_floor(2);
+        case_class_fold_replica();
         case_class_fresh();
         case_class_dropped();
         case_class_cutoff();
@@ -7779,6 +7818,7 @@ int main(int argc, char **argv)
     case_class_floor(0);
     case_class_floor(1);
     case_class_floor(2);
+    case_class_fold_replica();
     case_class_fresh();
     case_class_dropped();
     case_class_cutoff();

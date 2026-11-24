@@ -293,7 +293,15 @@ cgroup, so `nice` does not keep your work out of its way.
   transfer ids increase across Raft leaders and every VOLCMD of a transfer carries one; `make transfer-mutants`
   (tests/transfer_mutants.sh), `test_cluster transfer|transferslow|transferhold|transferstale|transfermarkers|transferkill|
   transferraftkill|balance|balancetwo|balancecut` (hooks: TSDB_REPLD_TEST `admithold`, TSDB_CLUSTER_TEST `drop_fence_file`,
-  `lose_ready_file`; `TR_TRANSFERS` the count of `transfer`, TR_DEBUG=1 its slow writes). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
+  `lose_ready_file`; `TR_TRANSFERS` the count of `transfer`, TR_DEBUG=1 its slow writes). Replica moves (R4, r4-move; design-cluster.md 3.2
+  "as built"): `server/cmove.c` on the Raft leader (`tsdb cluster volume move PEER V --log --from A --to B [--cancel]`:
+  ADD of B with `replaces` A, wait for B in the ISR noting `min_isr`, a transfer first when A leads, DROP_MEMBER to the
+  volume leader (`rset.c` -> `repl_leave(core, A, min_isr)`), REMOVE of A; resumed from the record by a new Raft leader;
+  STATUS's `moves` counters and lines; crash points `move-added`, `move-shrunk`; TSDB_CLUSTER_MUTANT `moveshrinkfirst
+  movenoreplaces moveremovebeforeshrink moveleaderfirst movenominisr`, `make move-mutants` (tests/move_mutants.sh);
+  `test_cluster move|movelag|moveleader|moverep0|moveraft|movekill|moveold`, which follow every record of the volume
+  through `vol_trace` and require the ISR without A never smaller than before B joined; hook TSDB_CMOVE_TEST
+  `hold_shrink=PATH`); jepsen-cluster's `churn` nemesis moves kvr's replicas at random (the same ISR check over every node's voltrace when it runs alone). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
   (Login and rights, below; docs/cluster-preview.md "Logins"). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled

@@ -10,7 +10,8 @@
 # group recorded as opened and that is gone is made again) resetlost. The reset's (server/cset.c, TSDB_CLUSTER_MUTANT):
 # resetinisr (proposed for an ISR member) and resetsamerid (the reset keeps the rid: it never applies) resetlost. And
 # setoldofnode (rset.c: a reset member mapped to its old index, its old ack carried over) and lostasstale (cvolset.c: a
-# reset seen while running sets the old v<N> aside as stale-, not lost-) resetlost.
+# reset seen while running sets the old v<N> aside as stale-, not lost-) resetlost. And setkeepleave (rset.c: a set
+# with no member moving in keeps the core's leaving member, after a cancel whose DROP_MEMBER(0) was lost) movecancel.
 # Usage: tests/rset_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
@@ -26,6 +27,7 @@ table=(
     "setnextstale|setnext|the leader's set change line does not name servers|no 1 lines with \"replica set version [0-9]+ -> [0-9]+\" in"
     "setoldofnode|resetlost|the leader's set change lines name server [0-9]+ \\(node [0-9]+\\) new"
     "lostasstale|resetlost|pass 2: server [0-9]+ holds v1.stale-"
+    "setkeepleave|movecancel|A back in the ISR after the cancel whose DROP_MEMBER\\(0\\) was lost"
 )
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)

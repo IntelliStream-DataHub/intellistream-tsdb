@@ -43,7 +43,9 @@
     X(CP_SNAP_RECEIVED, "snap-received")               /* a replica: every file of a snapshot in, not installed (placed) */ \
     X(CP_SNAP_SWAPPED, "snap-swapped")                 /* a replica's install: the swap's root fsync done (placed) */ \
     X(CP_SNAP_HALFSWAP, "snap-halfswap")               /* a replica's install: v<N> renamed to v<N>.old (placed) */ \
-    X(CP_SET_REMOVED, "set-removed")                   /* a removed replica's v<N> renamed .removed-, root synced (R4) */
+    X(CP_SET_REMOVED, "set-removed")                   /* a removed replica's v<N> renamed .removed-, root synced (R4) */ \
+    X(CP_MOVE_ADDED, "move-added")                     /* the Raft leader saw a move's REPLICA_ADD applied (cmove.c) */ \
+    X(CP_MOVE_SHRUNK, "move-shrunk")                   /* it saw the moved-out member leave the ISR, no REMOVE yet */
 
 enum crash_point_id {
 #define X(id, name) id,

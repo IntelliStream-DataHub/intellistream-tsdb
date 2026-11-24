@@ -950,6 +950,27 @@ void rsnap_tick(struct rvol *rv)
     pthread_mutex_unlock(&S.mu);
 }
 
+/* repld_close: the volume's driver is closed here for good (its replica removed, or set aside for a fresh one), so
+ * rsnap_tick no longer runs for its jobs and nothing else would end them. A receiver's v<N>.snap lies beside v<N>: the
+ * removal deletes v<N> only and no open of v<N> follows for snap_leftovers, so it stayed (an empty v1.snap after a move
+ * was cancelled while the joining member asked for its snapshot: jepsen-cluster churn), and the live job kept a later
+ * replica of the volume on this member from asking (job_find) until its stall timer. A source's snapshot lies in
+ * v<N>/snap_*, which goes with v<N> (deleted, or swept by the next open of a copy set aside). An install closes the
+ * driver through repld_close_end, never through this. */
+void rsnap_closed(uint32_t vol)
+{
+    pthread_mutex_lock(&S.mu);
+    for (struct rjob *j = S.jobs; j; j = j->next) {
+        if (j->dead || j->vol != vol)
+            continue;
+        if (j->role == R_DST)
+            dst_abandon(j, "the replica is closed here", 1);
+        else
+            src_abort(j, "the volume is closed here");
+    }
+    pthread_mutex_unlock(&S.mu);
+}
+
 /* ---- the worker */
 
 static int dir_sync(const char *path)

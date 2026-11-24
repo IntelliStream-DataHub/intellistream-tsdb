@@ -14425,6 +14425,67 @@ static void scen_removereplica(void)
            " rows\n", R, rows);
 }
 
+/* removesnap: a replica removed while it waits for a snapshot (its source stalls: TSDB_REPLD_TEST=snapsrcstall, the
+ * receiver's stall timer is 30 s) leaves no v1.snap: the close of its driver ends the volume's snapshot jobs
+ * (rsnap_closed), whose worker removes the directory. Before, nothing ticked the job of a closed driver, and no open of
+ * v1 followed for snap_leftovers: jepsen-cluster churn found an empty v1.snap on a member a cancelled move had joined.
+ * Mutant snapclosekeep. */
+static void scen_removesnap(void)
+{
+    scenario("removesnap");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=snapsrcstall";
+    struct meta_volume v;
+    init_retain_s = 2;
+    int L = set_setup(3, &v, 0), R = (L + 1) % 3, O = (L + 2) % 3;
+    init_retain_s = 0;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t t = 1000;
+    uint64_t rows = set_write(c, id, &t, 3, 1);
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed");
+    struct timespec s1 = {1, 0};
+    for (int r = 0; r < 7; r++) { /* past the keep cap: R needs a snapshot when it comes back */
+        rows += set_write(c, id, &t, 1, 1);
+        nanosleep(&s1, NULL);
+    }
+    rows += set_write(c, id, &t, 1, 0);
+    start(R);
+    await_log(R, "asks the leader for one", 30000, "the replica back never asked for a snapshot");
+    await_log(L, "(snapsrcstall)", 20000, "the leader's first source never stalled");
+    if (!dir_has(R, "v1.snap"))
+        die("server %d has no v1.snap while its source stalls: the test proves nothing", R);
+    char res[512], op[64];
+    snprintf(op, sizeof op, "remove 1 %" PRIu32, ids[R]);
+    set_op(3, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("remove: %s", res);
+    await_member(0, "plant", R, 0, 2, 10000, &v);
+    await_log_count(R, "this server's replica was removed from the replica set", 1, 20000);
+    if (log_has(R, "snapshot installed"))
+        die("server %d installed its snapshot before the removal: the test proves nothing", R);
+    uint64_t t0 = now_ms();
+    while (dir_has(R, "v1"))
+        if (now_ms() - t0 > 20000)
+            die("server %d still has v1 or v1.snap 20 s after its removal (abandoned: %d)", R,
+                log_has(R, "the replica is closed here"));
+        else
+            usleep(50000);
+    double gone_s = (double)(now_ms() - t0) / 1000;
+    rows += set_write(c, id, &t, 2, 0);
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t want[REP_NAMES] = {rows, 0, 0, 0};
+    int s[2] = {L, O};
+    rep_same_on(s, 2, want, "after a clean stop");
+    printf("  server %d removed while its snapshot's source stalled: its job abandoned and v1.snap removed in %.1f s\n",
+           R, gone_s);
+}
+
 /* removeindex: REMOVE of a member at a lower index than another (the members after it shift down, the leader's own
  * index too when it was above) under writes: the leader's driver remaps its per-peer state (cursors, acks, the keep
  * bound's input), so the writes go on being committed by the member that stays, which holds every row at the end.
@@ -14790,9 +14851,9 @@ static void scen_r4stubs(void)
     /* the stubs decode the body and say it back: the CLI's encoding against the server's decoder, field by field */
     static const char *const verbs[][2] = {
         {"volume transfer %s 3 5", "volume 3 to node 5: no such volume"}, /* built (r4-transfer): ctr_admin */
-        {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
+        {"volume move %s 3 --log --from 5 --to 6", "move of volume 3 from node 5 to node 6: no such volume"},
         {"volume move %s 3 --log --from 6 --to 5 --cancel",
-         "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
+         "cancel of the move of volume 3 from node 6 to node 5: no such volume"}, /* built (r4-move): cmove_admin */
         {"replica reset %s 4 6", "volume 4 does not exist"}};
     for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
         char v[256];
@@ -14811,7 +14872,7 @@ static void scen_r4stubs(void)
         arc = admin(0, ops[k], body, 12, 0, &reply, &len);
         const char *says = k == 0   ? "a transfer's body is 8 bytes (got 12)"
                            : k == 2 ? "replica reset: a body of 12 bytes"
-                                    : "not built yet (a body of 12 bytes)";
+                                    : "a move's body is 16 bytes (got 12)";
         if (arc != META_ERR_INVALID || !reply || len < strlen(says) || memcmp(reply, says, strlen(says)))
             die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
         free(reply);
@@ -14830,8 +14891,11 @@ static void scen_r4stubs(void)
 /* volcmd (r4-iface): the plumbing R4's tracks build on, before any of them sends. The Raft leader (server 0, hook
  * TSDB_CLUSTER_TEST volcmd_file=1) sends each VOLCMD kind to server 1 (the F_VOLCMD frame) and to itself (the
  * self-delivery of cl_volcmd_send); each server's driver routes it (IN_CMD: TRANSFER and CANCEL to rtransfer.c,
- * DROP_MEMBER to rset.c), whose stubs say every field and the sender. And each driver dials the other's snapshot kind
- * (TSDB_REPLD_TEST=snapdial): tsdbd's acceptor hands kind 5 to the driver, whose on_frame passes it to rsnap.c. */
+ * DROP_MEMBER to rset.c), which refuses each by name and says the sender. rset_cmd's fences (r4-move review F5): a
+ * DROP_MEMBER at an epoch the volume is not at is refused by its leader as "another epoch" (the member: "does not lead
+ * it"), and one of an older Raft term than one heard (a deposed Raft leader's) is ignored, naming both terms. And each
+ * driver dials the other's snapshot kind (TSDB_REPLD_TEST=snapdial): tsdbd's acceptor hands kind 5 to the driver, whose
+ * on_frame passes it to rsnap.c. */
 static void scen_volcmd(void)
 {
     scenario("volcmd");
@@ -14857,6 +14921,17 @@ static void scen_volcmd(void)
     for (int i = 0; i < 2; i++)
         await_log_count(i, "a snapshot link (kind 5) sent a frame of unknown type", 1, 20000);
     printf("  each driver's kind-5 link reached the other's rsnap_frame\n");
+    /* the volume's leader refuses another epoch only once its driver leads (before that it does not lead it either):
+     * the commands go out after its "leads epoch" line */
+    struct meta_volume mv;
+    if (!vol_rec(0, "cmdv", &mv) || server_of(mv.leader) < 0)
+        die("cmdv has no leader among the servers");
+    int ls = server_of(mv.leader);
+    {
+        char led[64];
+        snprintf(led, sizeof led, "volume %" PRIu32 ": leads epoch ", num);
+        await_log_count(ls, led, 1, 20000);
+    }
     char path[PATH_MAX + 64];
     server_dir(0, path, sizeof path);
     strcat(path, "/state/volcmd.tmp");
@@ -14866,24 +14941,34 @@ static void scen_volcmd(void)
     for (int i = 0; i < 2; i++) /* TO KIND VOLUME EPOCH NODE ARG */
         for (int k = 1; k <= 3; k++)
             fprintf(f, "%u %d %" PRIu32 " %d %d %d\n", ids[i], k, num, 100 * (i + 1) + k, 7 + k, 4000 + 10 * i + k);
+    /* DROP_MEMBER's arg is Raft term << 8 | min_isr: 4002 and 4012 are term 15; then one of term 14 to each (sent after,
+     * in file order, on the one link and by the self-delivery) */
+    for (int i = 0; i < 2; i++)
+        fprintf(f, "%u 2 %" PRIu32 " %d 10 %d\n", ids[i], num, 100 * (i + 1) + 2, 14 << 8 | 1);
     if (fclose(f) != 0)
         die("%s: %s", path, strerror(errno));
     char to[PATH_MAX + 64];
     snprintf(to, sizeof to, "%.*s", (int)(strlen(path) - 4), path);
     if (rename(path, to) != 0)
         die("rename %s: %s", path, strerror(errno));
-    static const char *const what[4] = {NULL, "TRANSFER to node", "DROP_MEMBER of node", "CANCEL to node"};
     for (int i = 0; i < 2; i++)
         for (int k = 1; k <= 2; k++) {
             char line[256];
             if (k == 1) /* rtransfer.c (built): an epoch the volume is not at is refused, by name */
                 snprintf(line, sizeof line, "volume %" PRIu32 ": TRANSFER to node %d at epoch %d refused: ", num, 7 + k,
                          100 * (i + 1) + k);
-            else
-                snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num,
-                         what[k], 7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
+            else /* rset.c: the volume's leader refuses another epoch by name, the member that it does not lead */
+                snprintf(line, sizeof line, "volume %" PRIu32 ": DROP_MEMBER of node %d at epoch %d from node %u "
+                         "refused: %s", num, 7 + k, 100 * (i + 1) + k, ids[0],
+                         i == ls ? "another epoch" : "this node does not lead it");
             await_log_count(i, line, 1, 20000);
         }
+    for (int i = 0; i < 2; i++) {
+        char line[256];
+        snprintf(line, sizeof line, "volume %" PRIu32 ": DROP_MEMBER of node 10 from node %u of Raft term 14 ignored "
+                 "(term 15 was heard)", num, ids[0]);
+        await_log_count(i, line, 1, 20000);
+    }
     /* a CANCEL with no transfer to cancel is silent (a new Raft leader sends one to every volume leader); its routing
      * is test_cluster transferraftkill's */
     if (access(to, F_OK) == 0)
@@ -16459,6 +16544,753 @@ static void scen_transfer(void)
     free(pause);
 }
 
+/* ------------------------------------------------------------------ r4-move: moving a log replica (cmove.c) */
+
+/* one record of server w's voltrace (TSDB_CLUSTER_TEST vol_trace=1, cmove_trace): a line per applied entry that
+ * changed volume 1's set, epoch, leader or ISR, so a reader of the whole file has seen every committed record */
+struct mvt {
+    uint64_t index, epoch, isrv;
+    uint32_t leader, nisr, isr[16], nrep, rep[16], learner[16];
+};
+
+static int mvt_has(const uint32_t *a, uint32_t n, uint32_t node)
+{
+    for (uint32_t k = 0; k < n; k++)
+        if (a[k] == node)
+            return 1;
+    return 0;
+}
+
+static int mvt_parse(const char *ln, struct mvt *t)
+{
+    if (!strncmp(ln, "req ", 4) || !strstr(ln, " v1 ")) /* a volume leader's ISR request (mv_leave_asked) */
+        return 0;
+    const char *e = strstr(ln, " epoch "), *l = strstr(ln, " leader "), *i = strstr(ln, " isr "),
+               *r = strstr(ln, " rep "), *iv = strstr(ln, " isrv ");
+    if (!e || !l || !i || !r || !iv || r < i)
+        die("voltrace: a line without its fields: %s", ln);
+    memset(t, 0, sizeof *t);
+    t->index = strtoull(ln, NULL, 10);
+    t->epoch = strtoull(e + 7, NULL, 10);
+    t->isrv = strtoull(iv + 6, NULL, 10);
+    t->leader = (uint32_t)strtoul(l + 8, NULL, 10);
+    for (const char *p = i + 5; p < r && t->nisr < 16;) {
+        char *q;
+        t->isr[t->nisr++] = (uint32_t)strtoul(p, &q, 10);
+        if (q == p)
+            break;
+        p = *q == ',' ? q + 1 : q;
+    }
+    for (const char *p = r + 5; *p && *p != '\n' && t->nrep < 16;) {
+        char *q;
+        uint32_t node = (uint32_t)strtoul(p, &q, 10);
+        if (q == p)
+            break;
+        t->learner[t->nrep] = 0;
+        if (!strncmp(q, ":L", 2))
+            t->learner[t->nrep] = 1, q += 2;
+        if (*q == '<')
+            strtoul(q + 1, &q, 10);
+        t->rep[t->nrep++] = node;
+        p = *q == ',' ? q + 1 : q;
+    }
+    return 1;
+}
+
+/* whether a volume leader asked for an ISR without `a` as a move's leave (the core's REPL_WHY_LEAVE) at the basis
+ * (epoch, isrv): the "req" lines repld.c's trace_isr_req adds to the leader's voltrace before the request leaves, so
+ * one is there before any server applies the record it led to */
+static int mv_leave_asked(uint32_t a, uint64_t epoch, uint64_t isrv)
+{
+    int hit = 0;
+    for (int i = 0; i < N && !hit; i++) {
+        char p[PATH_MAX + 96], ln[1100];
+        server_dir(i, p, sizeof p);
+        strcat(p, "/state/voltrace");
+        FILE *f = fopen(p, "r");
+        while (f && !hit && fgets(ln, sizeof ln, f)) {
+            unsigned long long e, iv;
+            char why[16];
+            int off = 0;
+            if (sscanf(ln, "req v1 epoch %llu isrv %llu why %15s isr %n", &e, &iv, why, &off) != 3 || !off ||
+                e != epoch || iv != isrv || strcmp(why, "leave"))
+                continue;
+            uint32_t isr[16], n = 0;
+            for (const char *q = ln + off; n < 16;) {
+                char *z;
+                unsigned long v = strtoul(q, &z, 10);
+                if (z == q)
+                    break;
+                isr[n++] = (uint32_t)v;
+                q = *z == ',' ? z + 1 : z;
+            }
+            hit = !mvt_has(isr, n, a);
+        }
+        if (f)
+            fclose(f);
+    }
+    return hit;
+}
+
+/* the watched check of a move of volume 1 from node a to node b over every committed record (server w's voltrace; w is
+ * never killed): once b is a member, a may leave the ISR as the move's shrink only after b joined it, and the ISR it
+ * leaves behind has at least as many members as the ISR had in the last record before b joined (the move never lowers
+ * the number of in-sync copies). The move's shrink is the record whose basis the volume leader asked for as a leave
+ * (mv_leave_asked); a shrink for lag, of a or of another member, is not the move's and is not judged (review F3), but
+ * counted. Records at or below `from` are skipped: a second move in one scenario must not count the first one's history
+ * (b may have been a member then). */
+struct mv_watch {
+    uint32_t a, b;
+    uint64_t from;
+    int b_member, joined, a_left, ended, b_gone, judged, lag_left;
+    uint32_t min, lines;
+    struct mvt last;
+};
+
+static void move_watch(int w, struct mv_watch *x)
+{
+    uint32_t a = x->a, b = x->b;
+    uint64_t from = x->from;
+    memset(x, 0, sizeof *x);
+    x->a = a, x->b = b, x->from = from;
+    char p[PATH_MAX + 96];
+    server_dir(w, p, sizeof p);
+    strcat(p, "/state/voltrace");
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return;
+    char ln[1100];
+    int prev_a = 0;
+    struct mvt t, prev = {0};
+    while (fgets(ln, sizeof ln, f)) {
+        if (!mvt_parse(ln, &t) || t.index <= from)
+            continue;
+        x->lines++;
+        int a_in = mvt_has(t.isr, t.nisr, a), b_in = mvt_has(t.isr, t.nisr, b);
+        int a_mem = mvt_has(t.rep, t.nrep, a), b_mem = mvt_has(t.rep, t.nrep, b);
+        if (b_mem)
+            x->b_member = 1;
+        if (!b_in && !x->joined)
+            x->min = t.nisr;
+        else if (b_in && x->b_member && !x->joined)
+            x->joined = 1;
+        if (prev_a && !a_in && x->b_member && !mv_leave_asked(a, prev.epoch, prev.isrv))
+            x->lag_left++;
+        else if (prev_a && !a_in && x->b_member) {
+            x->judged++;
+            if (!x->joined)
+                die("move: node %" PRIu32 " left the ISR of plant at entry %" PRIu64 " before node %" PRIu32
+                    " joined it (ISR of %" PRIu32 ")", a, t.index, b, t.nisr);
+            if (t.nisr < x->min)
+                die("move: node %" PRIu32 " left the ISR of plant at entry %" PRIu64 " with %" PRIu32 " members left, "
+                    "fewer than the %" PRIu32 " before node %" PRIu32 " joined", a, t.index, t.nisr, x->min, b);
+            x->a_left = 1;
+        }
+        int bl = 0;
+        for (uint32_t k = 0; k < t.nrep; k++)
+            if (t.rep[k] == b)
+                bl = (int)t.learner[k];
+        x->ended = !a_mem && b_mem && !bl && b_in;
+        x->b_gone = x->b_member && !b_mem && a_mem && a_in;
+        prev_a = a_in;
+        prev = t;
+        x->last = t;
+    }
+    fclose(f);
+}
+
+static void await_move(int w, struct mv_watch *x, int cancelled, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        move_watch(w, x);
+        if (!cancelled && x->ended && !x->judged) /* the check would judge nothing: the trace lost its requests */
+            die("%s: the move of plant from node %" PRIu32 " to node %" PRIu32 " ended with no shrink of node %" PRIu32
+                " judged (%d departures not asked as the move's leave)", what, x->a, x->b, x->a, x->lag_left);
+        if (cancelled ? x->b_gone : x->ended)
+            return;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: the move of plant from node %" PRIu32 " to node %" PRIu32 " did not %s in %d ms (%" PRIu32
+                " records; last: entry %" PRIu64 ", ISR of %" PRIu32 ", %" PRIu32 " members, b joined %d, a left %d)",
+                what, x->a, x->b, cancelled ? "end cancelled" : "end", ms, x->lines, x->last.index, x->last.nisr,
+                x->last.nrep, x->joined, x->a_left);
+        usleep(100000);
+    }
+}
+
+static void await_joined(int w, struct mv_watch *x, int ms)
+{
+    uint64_t t0 = now_ms();
+    for (move_watch(w, x); !x->joined; move_watch(w, x))
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("node %" PRIu32 " did not join the ISR of plant in %d ms", x->b, ms);
+        else
+            usleep(50000);
+}
+
+/* the admin op (the CLI's encoding; `move` itself goes through the CLI) to the Raft leader, followed from server via */
+static void move_op(int via, int from, int to, int cancel, const char *want)
+{
+    uint8_t body[16], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_move_encode(1, ids[from], ids[to],
+                                                   CLUSTER_MOVE_LOG | (cancel ? CLUSTER_MOVE_CANCEL : 0), body);
+    int rc = admin(via, CLUSTER_OP_VOLUME_MOVE, body, bl, 1, &reply, &rl);
+    char why[512];
+    snprintf(why, sizeof why, "%.*s", (int)(rl < 400 ? rl : 400), reply ? (const char *)reply : "");
+    free(reply);
+    if (rc != 0 || !strstr(why, want))
+        die("%smove of plant from server %d to server %d: %s (%s), not \"%s\"", cancel ? "cancel of the " : "", from,
+            to, cluster_strerror(rc), why, want);
+    printf("  %s", why);
+}
+
+/* an admin op the Raft leader must refuse with `want` in its answer (review F9: each of cmove_admin's checks);
+ * log 0 leaves out CLUSTER_MOVE_LOG */
+static void move_refused(int via, int from, int to, int cancel, int log, const char *want)
+{
+    uint8_t body[16], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_move_encode(1, ids[from], ids[to],
+                                                   (log ? CLUSTER_MOVE_LOG : 0) | (cancel ? CLUSTER_MOVE_CANCEL : 0),
+                                                   body);
+    int rc = admin(via, CLUSTER_OP_VOLUME_MOVE, body, bl, 1, &reply, &rl);
+    char why[512];
+    snprintf(why, sizeof why, "%.*s", (int)(rl < 400 ? rl : 400), reply ? (const char *)reply : "");
+    free(reply);
+    if (rc == 0 || !strstr(why, want))
+        die("%smove of plant from server %d to server %d: %s (%s), not refused with \"%s\"",
+            cancel ? "cancel of the " : "", from, to, cluster_strerror(rc), why, want);
+}
+
+static char move_hold[PATH_MAX + 96], move_penv[PATH_MAX * 2];
+static const char *move_extra = ""; /* more of TSDB_CMOVE_TEST (",cancel_lose_leave=1"), before hold_shrink */
+
+/* hold: the move's shrink waits while <base>/holdshrink exists (TSDB_CMOVE_TEST, every server). Always
+ * duty_at_propose=1: the Raft leader runs its move duty right after proposing the ADD, in the round before the ADD
+ * applies, which must not take the move for ended (review F2: STATUS said "cancelled" and the move resumed; move_status
+ * requires cancelled 0) */
+static void move_env(int hold)
+{
+    snprintf(move_hold, sizeof move_hold, "%s/holdshrink", base);
+    snprintf(move_penv, sizeof move_penv, "TSDB_CMOVE_TEST=duty_at_propose=1%s%s%s", move_extra,
+             hold ? ",hold_shrink=" : "", hold ? move_hold : "");
+    move_extra = "";
+    for (int i = 0; i < N; i++)
+        penv[i] = move_penv;
+    set_cenv = "setop_file=1,vol_trace=1";
+}
+
+static void move_hold_set(int on)
+{
+    if (on) {
+        FILE *f = fopen(move_hold, "w");
+        if (!f || fclose(f) != 0)
+            die("%s: %s", move_hold, strerror(errno));
+    } else if (unlink(move_hold) != 0 && errno != ENOENT)
+        die("unlink %s: %s", move_hold, strerror(errno));
+}
+
+/* writers of the four series of plant, one thread each, to server s (lenient: through a transfer or a kill) */
+struct mv_run {
+    struct set_writer w[REP_NAMES];
+    pthread_t th[REP_NAMES];
+    uint64_t pre[REP_NAMES];
+};
+
+static void move_writers(struct mv_run *r, int s, int lead, int lenient)
+{
+    tsdbc *c = client(lead); /* the series are made on the leader (a SERIES by path forwarded from a member that does
+                              * not lead is MOVED: docs/tasks/fwd-series-moved.md), the writers write through s */
+    for (int k = 0; k < REP_NAMES; k++) {
+        tsdb_sid id = rep_series(c, rep_names[k], "plant", 30000);
+        int64_t t = 1000;
+        r->pre[k] = set_write(c, id, &t, 3, 1);
+        memset(&r->w[k], 0, sizeof r->w[k]);
+        r->w[k].port = cports[s], r->w[k].id = id, r->w[k].t = 10000000, r->w[k].lenient = lenient;
+        if (pthread_create(&r->th[k], NULL, set_write_thread, &r->w[k]) != 0)
+            die("pthread_create");
+    }
+    tsdbc_close(c);
+    for (int k = 0; k < REP_NAMES; k++)
+        await_batches(&r->w[k], 5, 20000);
+}
+
+static void move_writers_stop(struct mv_run *r)
+{
+    for (int k = 0; k < REP_NAMES; k++)
+        __atomic_store_n(&r->w[k].stop, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < REP_NAMES; k++) {
+        pthread_join(r->th[k], NULL);
+        if (r->w[k].rc != 0)
+            die("a writer of %s: %s", rep_names[k], ers(r->w[k].rc));
+        if (!r->w[k].acked) /* a lenient writer whose every batch was refused proves nothing */
+            die("a writer of %s had no batch acknowledged (%" PRIu64 " sent)", rep_names[k], r->w[k].batches);
+    }
+}
+
+/* after stop_all: every member of the final set holds the same rows of each series, every acknowledged one, and none
+ * past what was sent (a lenient writer's refused or unknown batches may be there or not) */
+static void move_rows(const struct mvt *t, const struct mv_run *r, const char *what)
+{
+    uint64_t rows[REP_NAMES], h[REP_NAMES], r0[REP_NAMES] = {0}, h0[REP_NAMES] = {0};
+    for (uint32_t x = 0; x < t->nrep; x++) {
+        int s = server_of(t->rep[x]);
+        char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+        server_dir(s, dir, sizeof dir);
+        snprintf(v, sizeof v, "%s/v1", dir);
+        int rc = cvol_digest(v, rep_names, REP_NAMES, rows, h);
+        if (rc != 0)
+            die("%s: open %s read-only: %s", what, v, ers(rc));
+        for (int k = 0; k < REP_NAMES; k++) {
+            uint64_t lo = r->pre[k] + r->w[k].acked, hi = lo + r->w[k].unsure;
+            if (rows[k] < lo || rows[k] > hi)
+                die("%s: server %d holds %" PRIu64 " rows of %s, not in [%" PRIu64 ", %" PRIu64 "]", what, s, rows[k],
+                    rep_names[k], lo, hi);
+            if (x && (rows[k] != r0[k] || h[k] != h0[k]))
+                die("%s: server %d's rows of %s differ from the first member's", what, s, rep_names[k]);
+            r0[k] = rows[k], h0[k] = h[k];
+        }
+    }
+}
+
+static void move_dir_gone(int s)
+{
+    uint64_t t0 = now_ms();
+    while (dir_has(s, "v1"))
+        if (now_ms() - t0 > 30000)
+            die("server %d still has v1 30 s after its replica moved away", s);
+        else
+            usleep(50000);
+}
+
+/* the servers of a 4-server plant: L its leader, X the one without a replica, two others (O[0] not the Raft leader R
+ * when one of them is: a member paused or killed must not take the Raft leader with it) */
+struct mv_servers {
+    int L, X, R, O[2];
+};
+
+static void move_servers(const struct meta_volume *v, int L, struct mv_servers *s)
+{
+    s->L = L, s->X = -1, s->R = leader_of(0);
+    int n = 0;
+    for (int i = 0; i < 4; i++)
+        if (rep_index(v, i) < 0)
+            s->X = i;
+        else if (i != L)
+            s->O[n++] = i;
+    if (s->X < 0 || n != 2)
+        die("plant's replicas are not three of the four servers");
+    if (s->O[0] == s->R) {
+        int k = s->O[0];
+        s->O[0] = s->O[1], s->O[1] = k;
+    }
+}
+
+/* STATUS of server i, the Raft leader that runs a move: `running` 1: a line "move volume 1 node a -> node b: " names the
+ * move; 0: no move runs and the counters say `done` moves done and none cancelled (condition wait: the duty counts a
+ * move at the round that sees the REMOVE applied, which may follow the watch's record) */
+static void move_status(int i, uint32_t a, uint32_t b, int running, uint64_t done, const char *what)
+{
+    char want[128];
+    snprintf(want, sizeof want, "move volume 1 node %" PRIu32 " -> node %" PRIu32 ": ", a, b);
+    uint64_t t0 = now_ms();
+    for (;;) {
+        struct view v;
+        view(i, &v);
+        int named = strstr(v.st.moves, want) != NULL;
+        uint64_t d = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_DONE] : UINT64_MAX;
+        uint64_t c = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_CANCELLED] : UINT64_MAX;
+        uint64_t st = v.st.ntr >= CL_TR_N ? v.st.tr[CL_TR_MV_STARTED] : 0;
+        char text[sizeof v.st.moves];
+        snprintf(text, sizeof text, "%s", v.st.moves);
+        view_free(&v);
+        if (running ? named && st >= 1 : !text[0] && d == done && c == 0)
+            return;
+        if (now_ms() - t0 > 20000)
+            die("%s: STATUS of server %d says moves started %" PRIu64 " done %" PRIu64 " cancelled %" PRIu64
+                " and running \"%s\", not %s", what, i, st, d, c, text,
+                running ? "the move as running" : "no move running and the move done");
+        usleep(100000);
+    }
+}
+
+/* move: under 4 writers a replica A (not the leader) moves to X through `tsdb cluster volume move`; every committed
+ * record keeps the ISR without A at least as large as before X joined (move_watch); at the end A's directory is gone,
+ * X is in the ISR and the three members hold the same rows, every acknowledged one. Mutants moveshrinkfirst (A shrunk
+ * out before X joined), moveremovebeforeshrink (REMOVE of an ISR member: refused by meta, the move never ends) */
+static void scen_move(void)
+{
+    scenario("move");
+    move_env(0);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = s.O[1], B = s.X, W = s.O[0];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 0);
+    move_refused(s.R, A, B, 0, 0, "--log is required");
+    move_refused(s.R, A, A, 0, 1, "the same node twice");
+    move_refused(s.R, B, A, 0, 1, "the old node is not a member of the volume");
+    move_refused(s.R, A, W == A ? L : W, 0, 1, "the new node is a member already");
+    move_refused(s.R, A, B, 1, 1, "no such move is running");
+    char p[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[2048];
+    peer_of(s.R, p, sizeof p);
+    snprintf(args, sizeof args, "cluster volume move %s 1 --log --from %" PRIu32 " --to %" PRIu32 " --secret-file %s",
+             p, ids[A], ids[B], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "proposed"))
+        die("tsdb %s: %s", args, out);
+    printf("  %s", out);
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_move(W, &x, 0, 90000, "move");
+    move_status(s.R, ids[A], ids[B], 0, 1, "move");
+    move_dir_gone(A);
+    for (int k = 0; k < REP_NAMES; k++)
+        await_batches(&r.w[k], 10, 20000); /* the writes go on with the new set */
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(W, &x);
+    move_rows(&x.last, &r, "after the move");
+    printf("  plant moved from server %d to server %d under 4 writers: ISR never below %" PRIu32 " without the old "
+           "member (%" PRIu32 " records), its v1 gone, the rows equal on the three members\n", A, B, x.min, x.lines);
+}
+
+/* movelag: a member C lags out of the ISR after X joined and before the shrink (held by TSDB_CMOVE_TEST): the move
+ * waits (the ISR without A would have 2 members, it had 3 before X joined) until C is back. Mutant movenominisr
+ * (DROP_MEMBER with min_isr 0: A leaves with C away, move_watch fails) */
+static void scen_movelag(void)
+{
+    scenario("movelag");
+    move_env(1);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = s.O[1], C = s.O[0], B = s.X, W = L;
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 0);
+    move_hold_set(1);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_joined(W, &x, 60000);
+    move_status(s.R, ids[A], ids[B], 1, 0, "movelag"); /* held before its shrink: STATUS names it */
+    move_refused(s.R, C, A, 0, 1, "a move of the volume is running");
+    move_refused(s.R, C, B, 1, 1, "no such move is running"); /* a cancel names the running move's two nodes */
+    pause_server(C, 1);
+    await_isr(L, "plant", 3, 20000, "C lagged out of the ISR after X joined");
+    move_hold_set(0);
+    usleep(5000000); /* the shrink is sent every second: it must not take A out while C is away */
+    move_watch(W, &x);
+    if (x.a_left)
+        die("movelag: A left the ISR while C was away"); /* move_watch dies first */
+    pause_server(C, 0);
+    await_move(W, &x, 0, 90000, "movelag");
+    move_dir_gone(A);
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(W, &x);
+    move_rows(&x.last, &r, "after the move");
+    printf("  the move waited while server %d lagged (the ISR without the old member kept %" PRIu32 "), then ended\n", C,
+           x.min);
+}
+
+/* moveleader: A is the volume's leader: a transfer first (to rep[0] or to X), then the move; the writers (lenient)
+ * go on. Mutant moveleaderfirst (REMOVE of the leader's replica without a transfer: refused by meta; the move must
+ * still end, so the scenario only fails if the mutant also breaks the end) */
+static void scen_moveleader(void)
+{
+    scenario("moveleader");
+    fwd_on = 1; /* the writers go through a member that does not lead */
+    move_env(0);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = L, B = s.X, W = s.O[0];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, s.O[1], L, 1); /* through a member that stays */
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_move(W, &x, 0, 90000, "moveleader");
+    if (x.last.leader == ids[A] || !x.last.leader)
+        die("moveleader: plant is led by node %" PRIu32 " after the move of its leader's replica", x.last.leader);
+    move_dir_gone(A);
+    for (int k = 0; k < REP_NAMES; k++)
+        await_batches(&r.w[k], 10, 30000);
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(W, &x);
+    move_rows(&x.last, &r, "after the move of the leader's replica");
+    printf("  the leader's replica moved from server %d to server %d: led by node %" PRIu32 " at the end\n", A, B,
+           x.last.leader);
+}
+
+/* moverep0: with leader_balance_s 5 the leader is rep[0]; moving it puts X in its slot and X leads (the transfer
+ * goes to X), so no balance transfer follows: the epoch stays for 10 s after the move */
+static void scen_moverep0(void)
+{
+    scenario("moverep0");
+    fwd_on = 1; /* the writers go through a member that does not lead */
+    init_leader_balance_s = 5;
+    move_env(0);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    init_leader_balance_s = 0;
+    uint64_t t0 = now_ms();
+    while (!vol_rec(0, "plant", &v) || v.leader != v.rep[0].node || v.nisr != 3)
+        if (now_ms() - t0 > 30000)
+            die("plant is not led by rep[0] with an ISR of 3 after 30 s");
+        else
+            usleep(100000);
+    L = server_of(v.leader);
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = L, B = s.X, W = s.O[0];
+    struct mv_run r;
+    move_writers(&r, s.O[1], L, 1);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_move(W, &x, 0, 90000, "moverep0");
+    if (!vol_rec(W, "plant", &v) || v.rep[0].node != ids[B])
+        die("moverep0: rep[0] of plant is node %" PRIu32 ", not the new node %" PRIu32, v.rep[0].node, ids[B]);
+    uint64_t epoch = x.last.epoch;
+    usleep(10000000);
+    move_watch(W, &x);
+    if (x.last.epoch != epoch || x.last.leader != ids[B])
+        die("moverep0: plant went from epoch %" PRIu64 " to %" PRIu64 " (leader node %" PRIu32 ") after the move",
+            epoch, x.last.epoch, x.last.leader);
+    move_writers_stop(&r);
+    stop_all();
+    move_rows(&x.last, &r, "after the move of rep[0]");
+    printf("  rep[0] moved from server %d to server %d, which leads; no balance transfer in 10 s\n", A, B);
+}
+
+/* moveraft: the Raft leader is SIGKILLed between X's join and the REMOVE (the shrink held until then): the next Raft
+ * leader finds the move in the record (`replaces`) and finishes it. Mutant movenoreplaces (a move this Raft leader did
+ * not start is forgotten: the move never ends) */
+static void scen_moveraft(void)
+{
+    scenario("moveraft");
+    move_env(1);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    char why[256];
+    if (s.R == L) { /* the volume's leader outlives the Raft leader's kill */
+        int rc = tr_transfer(1, ids[s.O[0]], why, sizeof why);
+        if (rc != 0)
+            die("the transfer of plant to server %d: %s (%s)", s.O[0], cluster_strerror(rc), why);
+        uint64_t t0 = now_ms();
+        while (!vol_rec(s.O[0], "plant", &v) || server_of(v.leader) != s.O[0] || v.nisr != 3)
+            if (now_ms() - t0 > 30000)
+                die("plant is not led by server %d with an ISR of 3 after its transfer", s.O[0]);
+            else
+                usleep(100000);
+        L = s.O[0];
+        move_servers(&v, L, &s);
+    }
+    /* A: a member that is neither the leader nor the Raft leader; B: X unless X is the Raft leader */
+    int A = s.O[0] != s.R ? s.O[0] : s.O[1], B = s.X, W = -1;
+    for (int i = 0; i < 4; i++)
+        if (i != s.R && i != A && i != B)
+            W = i;
+    struct mv_run r;
+    move_writers(&r, L, L, 1);
+    move_hold_set(1);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_joined(W, &x, 60000);
+    stop(s.R, SIGKILL);
+    uint64_t t0 = now_ms();
+    int nr;
+    while ((nr = leader_of(W)) < 0 || nr == s.R)
+        if (now_ms() - t0 > 30000)
+            die("no new Raft leader 30 s after the kill of server %d", s.R);
+        else
+            usleep(100000);
+    start(s.R);
+    move_hold_set(0);
+    await_move(W, &x, 0, 90000, "moveraft");
+    if (s.R != B)
+        move_dir_gone(A);
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(W, &x);
+    move_rows(&x.last, &r, "after the move across a Raft leader's kill");
+    printf("  the Raft leader (server %d) killed after the join: server %d finished the move from %d to %d\n", s.R,
+           nr, A, B);
+}
+
+/* movekill: X is SIGKILLed as soon as the ADD is applied (in its catch-up) and restarted: the move finishes. Then a
+ * second move (of a member to the server the first one emptied) held before its shrink is cancelled after its join:
+ * the learner goes, the old set is back and the member stays in the ISR */
+static void scen_movekill(void)
+{
+    scenario("movekill");
+    move_env(1);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0) /* keepall would replace TSDB_CMOVE_TEST */;
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = s.O[0], B = s.X, W = L != s.R ? L : s.O[1];
+    if (B == s.R || A == s.R)
+        A = s.O[1] != s.R ? s.O[1] : s.O[0];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 1);
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    move_op(s.R == B ? W : s.R, A, B, 0, "proposed");
+    uint64_t t0 = now_ms();
+    for (move_watch(W, &x); !x.b_member; move_watch(W, &x))
+        if (now_ms() - t0 > 20000)
+            die("movekill: node %" PRIu32 " not a member 20 s after its move's ADD", ids[B]);
+        else
+            usleep(5000);
+    int joined = x.joined;
+    stop(B, SIGKILL);
+    usleep(1000000);
+    start(B);
+    await_move(W, &x, 0, 120000, "movekill");
+    move_dir_gone(A);
+    printf("  server %d killed %s its catch-up and restarted: the move finished\n", B, joined ? "after" : "during");
+    /* the cancel: C (a member, not the leader) to A, held before its shrink */
+    int C = -1;
+    for (uint32_t k = 0; k < x.last.nrep; k++)
+        if (server_of(x.last.rep[k]) != server_of(x.last.leader) && x.last.rep[k] != ids[B])
+            C = server_of(x.last.rep[k]);
+    if (C < 0)
+        C = B;
+    move_hold_set(1);
+    move_op(W, C, A, 0, "proposed");
+    struct mv_watch y = {.a = ids[C], .b = ids[A], .from = x.last.index}; /* A was a member before the first move */
+    await_joined(W, &y, 60000);
+    move_op(W, C, A, 1, "cancelling");
+    move_hold_set(0);
+    await_move(W, &y, 1, 60000, "the cancel");
+    move_dir_gone(A);
+    usleep(3000000);
+    move_watch(W, &y);
+    if (!mvt_has(y.last.isr, y.last.nisr, ids[C]) || y.last.nisr != 3)
+        die("movekill: after the cancel the ISR of plant has %" PRIu32 " members and %s node %" PRIu32, y.last.nisr,
+            mvt_has(y.last.isr, y.last.nisr, ids[C]) ? "holds" : "lacks", ids[C]);
+    move_writers_stop(&r);
+    stop_all();
+    move_rows(&y.last, &r, "after the move and the cancel");
+    printf("  a move from %d to %d cancelled after the join: the learner went, the ISR of 3 holds %d\n", C, A, C);
+}
+
+/* movecancel (review F4): the cancel of a move whose DROP_MEMBER(A) the volume leader holds (X joined, then lagged out:
+ * the ISR without A is below the size before X joined), with the cancel's DROP_MEMBER(0) lost (TSDB_CMOVE_TEST
+ * cancel_lose_leave=1: the frame is never resent once the REMOVE of X applied). The volume leader must stop A
+ * `leaving` from the record alone (rset.c: a set with no member moving in): a member left `leaving` is never asked
+ * back into the ISR, so A, paused until it lags out and resumed, must be back in the ISR. Mutant setkeepleave (the
+ * record's reset off) fails it there. */
+static void scen_movecancel(void)
+{
+    scenario("movecancel");
+    move_extra = ",cancel_lose_leave=1";
+    move_env(1);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int B = s.X;
+    if (s.R == B) { /* X lags out by a pause below: it must not take the Raft leader (and the move's duty) with it */
+        pause_server(B, 1);
+        uint64_t t0 = now_ms();
+        while ((s.R = leader_of(L)) == B || s.R < 0)
+            if (now_ms() - t0 > 30000)
+                die("movecancel: no Raft leader but server %d 30 s after it was paused", B);
+            else
+                usleep(100000);
+        pause_server(B, 0);
+        if (s.O[0] == s.R) {
+            int k = s.O[0];
+            s.O[0] = s.O[1], s.O[1] = k;
+        }
+    }
+    int A = s.O[0], C = s.O[1];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 1);
+    move_hold_set(1);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_joined(L, &x, 60000);
+    pause_server(B, 1);
+    await_isr(L, "plant", 3, 20000, "X lagged out of the ISR after it joined");
+    move_hold_set(0);
+    char needle[128];
+    snprintf(needle, sizeof needle, "volume 1: node %" PRIu32 " (replica ", ids[A]);
+    await_log(L, needle, 20000, "movecancel: the volume leader did not take the move's DROP_MEMBER of A");
+    usleep(2000000); /* held: the ISR without A has 2 members, it had 3 before X joined */
+    if (isr_of(L, "plant", NULL) != 3)
+        die("movecancel: A left the ISR with X away");
+    move_op(s.R, A, B, 1, "cancelling");
+    await_move(L, &x, 1, 60000, "the cancel");
+    pause_server(B, 0);
+    pause_server(A, 1);
+    await_isr(L, "plant", 2, 20000, "A lagged out of the ISR after the cancel");
+    pause_server(A, 0);
+    await_isr(L, "plant", 3, 30000,
+              "A back in the ISR after the cancel whose DROP_MEMBER(0) was lost (a member left leaving is never asked "
+              "back)");
+    if (log_count(L, "has no move: replica ") < 1)
+        die("movecancel: the volume leader did not log that the record has no move");
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(L, &x);
+    move_rows(&x.last, &r, "after the cancel");
+    printf("  a move from %d to %d cancelled with its DROP_MEMBER(0) lost: server %d (%d stayed) left leaving no more, "
+           "rejoined the ISR after a lag\n", A, B, A, C);
+}
+
+/* moveold: the leader no longer keeps position 1 (its first segments are gone): X fills by a snapshot
+ * (r4-xferinst), joins, and the move ends */
+static void scen_moveold(void)
+{
+    scenario("moveold");
+    move_env(0);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int A = s.O[1], B = s.X, W = s.O[0];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 0);
+    uint64_t t0 = now_ms(), s1 = segment_bound(L, 0);
+    while (segment_bound(L, 1) <= s1)
+        if (now_ms() - t0 > 60000)
+            die("moveold: the leader still keeps a WAL segment at or below %" PRIu64 " after 60 s", s1);
+        else
+            usleep(100000);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_move(W, &x, 0, 120000, "moveold");
+    if (!log_count(B, "snapshot installed: P"))
+        die("moveold: server %d joined without installing a snapshot", B);
+    move_dir_gone(A);
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(W, &x);
+    move_rows(&x.last, &r, "after the move by a snapshot");
+    printf("  plant moved from server %d to server %d by a snapshot (the leader's log starts past segment %" PRIu64 ")\n",
+           A, B, s1);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -16496,7 +17328,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

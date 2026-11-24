@@ -930,6 +930,65 @@ static void raise_from(eng *db, uint64_t fno_end)
         db->wtail_from = MAX(db->wtail_from, fno_end);
 }
 
+static int cmp_tail(const void *a, const void *b)
+{
+    const uint64_t *x = a, *y = b;
+    return (*x > *y) - (*x < *y);
+}
+
+/* Sorts an entry's (id, max) pairs by id, once (db->lock). False when out of memory: the entry stays as it was. */
+static bool wtail_sort(struct cls_wtail *e)
+{
+    if (e->sorted)
+        return true;
+    uint64_t *pk = malloc((e->n ? e->n : 1) * sizeof *pk); /* pack (id, index) to sort them together, then unpack */
+    int64_t *mx = malloc((e->n ? e->n : 1) * sizeof *mx);
+    if (!pk || !mx) {
+        free(pk);
+        free(mx);
+        return false;
+    }
+    for (size_t i = 0; i < e->n; i++)
+        pk[i] = (uint64_t)e->ids[i] << 32 | i;
+    qsort(pk, e->n, sizeof *pk, cmp_tail);
+    for (size_t i = 0; i < e->n; i++)
+        mx[i] = e->max[(uint32_t)pk[i]], e->ids[i] = (uint32_t)(pk[i] >> 32);
+    memcpy(e->max, mx, e->n * sizeof *mx);
+    free(mx);
+    free(pk);
+    e->sorted = true;
+    return true;
+}
+
+/* y and x (y's next: the older entry) as one entry, each series with the larger of its two bounds, in y's place: it
+ * is gone only once y is (y's segment and positions come after x's). NULL when out of memory. */
+static struct cls_wtail *wtail_fold(struct cls_wtail *y, struct cls_wtail *x)
+{
+    if (!wtail_sort(y) || !wtail_sort(x))
+        return NULL;
+    size_t n = y->n + x->n;
+    struct cls_wtail *e = malloc(sizeof *e + (n ? n : 1) * (sizeof(int64_t) + sizeof(uint32_t)));
+    if (!e)
+        return NULL;
+    e->max = (int64_t *)(e + 1);
+    e->ids = (uint32_t *)(e->max + (n ? n : 1));
+    size_t i = 0, j = 0, k = 0;
+    while (i < y->n || j < x->n) {
+        if (j == x->n || (i < y->n && y->ids[i] < x->ids[j]))
+            e->ids[k] = y->ids[i], e->max[k++] = y->max[i++];
+        else if (i == y->n || x->ids[j] < y->ids[i])
+            e->ids[k] = x->ids[j], e->max[k++] = x->max[j++];
+        else
+            e->ids[k] = y->ids[i], e->max[k++] = MAX(y->max[i], x->max[j]), i++, j++;
+    }
+    e->n = k;
+    e->sorted = true;
+    e->seq = MAX(y->seq, x->seq);
+    e->fno_end = MAX(y->fno_end, x->fno_end);
+    e->next = x->next;
+    return e;
+}
+
 void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts)
 {
     uint64_t floor = atomic_load(&db->lead_floor);
@@ -965,14 +1024,27 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fn
     db->wtail = e;
     db->nwtail++;
     /* A leader keeps its entries until the replay floor passes them, and the floor stays put while a replica is away
-     * (for hours, with a storage outage): past the cap the oldest entry is folded into the coarse bound for every
-     * series, which only moves a later switch's T further out, never below a row. */
+     * (for hours, with a storage outage); a replica keeps its flushed segments past its saved floor (a learner that
+     * fills from the log start, for as long as its fill). Past the cap the oldest entry is folded into the next older
+     * one, series by series: that only moves a later switch's T further out, never below a row, and never past the
+     * series' own rows. A replica checks the leader's exact T against these bounds (switch_locked): a bound shared by
+     * every series took another series' rows as this one's and stopped the replica (jepsen-cluster churn, classes:
+     * the filler's rows a day later than the switching series' T). Only where the fold cannot be allocated does the
+     * oldest entry go into the coarse bound for every series. */
     size_t cap = atomic_load_explicit(&cls_wtail_cap, memory_order_relaxed);
     while (db->nwtail > cap && eng_test_mutant != MUT_WTAIL_NOCAP) {
-        struct cls_wtail **pp = &db->wtail;
+        struct cls_wtail **pp = &db->wtail, **py = NULL;
         while ((*pp)->next)
-            pp = &(*pp)->next;
+            py = pp, pp = &(*pp)->next;
         struct cls_wtail *x = *pp;
+        struct cls_wtail *f = py && eng_test_mutant != MUT_WTAIL_FOLD_ALL ? wtail_fold(*py, x) : NULL;
+        if (f) {
+            free(*py);
+            *py = f;
+            free(x);
+            db->nwtail--;
+            continue;
+        }
         int64_t mx = INT64_MIN;
         for (size_t i = 0; i < x->n; i++)
             mx = MAX(mx, x->max[i]);
@@ -985,12 +1057,6 @@ void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fn
     }
 }
 
-static int cmp_tail(const void *a, const void *b)
-{
-    const uint64_t *x = a, *y = b;
-    return (*x > *y) - (*x < *y);
-}
-
 /* Newest timestamp of series s in the flushed memtables whose segments may still be replayed. db->lock held. */
 static int64_t wal_newest_locked(eng *db, uint32_t s, uint64_t floor)
 {
@@ -999,31 +1065,11 @@ static int64_t wal_newest_locked(eng *db, uint32_t s, uint64_t floor)
     for (struct cls_wtail *e = db->wtail; e; e = e->next) {
         if (wtail_gone(db, e->seq, e->fno_end, floor))
             continue;
-        if (!e->sorted) { /* pack (id, max) pairs to sort them together, then unpack */
-            uint64_t *pk = malloc((e->n ? e->n : 1) * sizeof *pk);
-            if (!pk) {
-                for (size_t i = 0; i < e->n; i++) /* ENOMEM: a linear look */
-                    if (e->ids[i] == s)
-                        newest = MAX(newest, e->max[i]);
-                continue;
-            }
-            for (size_t i = 0; i < e->n; i++)
-                pk[i] = (uint64_t)e->ids[i] << 32 | i;
-            qsort(pk, e->n, sizeof *pk, cmp_tail);
-            int64_t *mx = malloc((e->n ? e->n : 1) * sizeof *mx);
-            if (!mx) {
-                free(pk);
-                for (size_t i = 0; i < e->n; i++)
-                    if (e->ids[i] == s)
-                        newest = MAX(newest, e->max[i]);
-                continue;
-            }
-            for (size_t i = 0; i < e->n; i++)
-                mx[i] = e->max[(uint32_t)pk[i]], e->ids[i] = (uint32_t)(pk[i] >> 32);
-            memcpy(e->max, mx, e->n * sizeof *mx);
-            free(mx);
-            free(pk);
-            e->sorted = true;
+        if (!wtail_sort(e)) {
+            for (size_t i = 0; i < e->n; i++) /* ENOMEM: a linear look */
+                if (e->ids[i] == s)
+                    newest = MAX(newest, e->max[i]);
+            continue;
         }
         size_t a = 0, z = e->n;
         while (a < z) {

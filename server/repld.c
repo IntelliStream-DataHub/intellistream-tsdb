@@ -383,12 +383,38 @@ static void slow_ack(struct rvol *rv, struct repl_msg *m)
  * Raft leader proposes ISR_CHANGE on the request's own basis) until the record moves. FENCE_REPLY (after the core's SAVE
  * of the fence: the action order) goes to the Raft leader that sent the fence, RESIGN to the Raft leader, both through
  * the cluster thread (cluster_vol_msg); the core repeats a RESIGN while the record names it, the proposer a fence. */
+/* TSDB_CLUSTER_TEST vol_trace=1 (tests only): "req v<N> epoch <e> isrv <basis> why <drop|join|leave> isr <a,b,..>" for
+ * every ISR request of the core, before any heartbeat carries it, so the request precedes its record in this node's
+ * voltrace. A record that took a member out at that basis was asked for for that reason (test_cluster move_watch and
+ * jepsen-cluster's churn judge only a move's own shrinks, review F3). */
+static void trace_isr_req(struct rvol *rv, const struct repl_vmeta *q)
+{
+    const char *path = cluster_vol_trace_path();
+    if (!path || !rv->core)
+        return;
+    static const char *const why[] = {"none", "drop", "join", "leave"};
+    int w = repl_isr_why(rv->core);
+    char line[512];
+    int o = snprintf(line, sizeof line, "req v%" PRIu32 " epoch %" PRIu64 " isrv %" PRIu64 " why %s isr ", rv->number,
+                     q->epoch, q->isr_version, w >= 0 && w <= REPL_WHY_LEAVE ? why[w] : "?");
+    for (uint32_t k = 0, n = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX && o < (int)sizeof line - 16; k++)
+        if (q->isr & (1u << k))
+            o += snprintf(line + o, sizeof line - (size_t)o, "%s%" PRIu32, n++ ? "," : "", rv->rec.rep[k].node);
+    FILE *f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
+    }
+}
+
 static void meta_msg(struct rvol *rv, const struct repl_msg *m)
 {
     if (m->type == REPL_M_ISR_REQ) {
-        if (!rv->isr_want || memcmp(&rv->isr_req, &m->meta, sizeof m->meta))
+        if (!rv->isr_want || memcmp(&rv->isr_req, &m->meta, sizeof m->meta)) {
+            trace_isr_req(rv, &m->meta);
             say("volume %" PRIu32 ": asks for an ISR of %d members (ISR version %" PRIu64 ")", rv->number,
                 __builtin_popcount(m->meta.isr), m->meta.isr_version);
+        }
         rv->isr_req = m->meta;
         rv->isr_want = 1;
         cluster_beat_soon();
@@ -2246,6 +2272,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
                : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
                : !strcmp(mu, "snapsetnodefer") ? RM_SNAPSETNODEFER
+               : !strcmp(mu, "snapclosekeep")  ? RM_SNAPCLOSEKEEP
+               : !strcmp(mu, "setkeepleave")   ? RM_SETKEEPLEAVE
                : !strcmp(mu, "snapdropafter")  ? RM_SNAPDROPAFTER
                : !strcmp(mu, "snapnoendafter") ? RM_SNAPNOENDAFTER
                : !strcmp(mu, "snapnofence")    ? RM_SNAPNOFENCE
@@ -2674,7 +2702,10 @@ static void cvol_close(uint32_t v)
 
 int repld_close(uint32_t v)
 {
-    return repld_close_end(v, NULL);
+    int rc = repld_close_end(v, NULL);
+    if (G.mutant != RM_SNAPCLOSEKEEP)
+        rsnap_closed(v); /* nothing ticks its snapshot jobs any more */
+    return rc;
 }
 
 int repld_close_end(uint32_t v, uint64_t *log_end)

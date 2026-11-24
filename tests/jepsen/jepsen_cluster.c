@@ -45,7 +45,9 @@
  * replica's v<N> removed, the server started, which refuses the volume, `tsdb cluster replica reset`, rebuilt by a
  * snapshot: R4's rebuild, a lost directory; design-cluster.md 13.2's "declare a server out, add a new one" is R9's) and
  * churn (`volume transfer` and `volume move --log` at random under the workloads, a move now and then cancelled; moves go
- * between the nodes, so kvr keeps 3 replicas). At the end of every run with kvr: the members of the final record are the
+ * between the nodes, so kvr keeps 3 replicas; when churn is the only nemesis, every node's voltrace is followed and the
+ * moved-from member must not leave the ISR before the new one joined, nor with fewer ISR members: r4_move_trace_check).
+ * At the end of every run with kvr: the members of the final record are the
  * replicas compared (replicas_equal, rep_check), none is a learner, and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or
  * `snap_*` is left on any node. R4's crash points (server/crashpt.h: snap-received, snap-swapped, set-removed,
  * transfer-ready, move-added, move-shrunk, those that exist) are terminal points of kv and classes runs whose
@@ -191,7 +193,7 @@ static const struct r4nem {
              {"slow", N_SLOW, 1, "nothing new in tsdbd (the outagefs shim: --outagefs build/liboutagefs.so)"},
              {"longdown", N_LONGDOWN, 0, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
              {"rebuild", N_REBUILD, 0, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
-             {"churn", N_CHURN, 0, "r4-transfer, r4-setchg and r4-move (volume transfer, volume move --log)"}};
+             {"churn", N_CHURN, 1, "r4-transfer, r4-setchg and r4-move (volume transfer, volume move --log)"}};
 #define NR4NEM ((int)(sizeof r4nem / sizeof r4nem[0]))
 static int r4_bit(const char *name)
 {
@@ -727,6 +729,8 @@ static int start_node(int i, const char *crash_at, int *status)
     }
     if (!want_rep) /* the leader of a 1-replica cluster volume takes writes without the driver (kv-local) */
         envp[ne++] = "TSDB_CLUSTER_WRITES=1";
+    if (nemeses & N_CHURN) /* every applied record of kvr's set and ISR in <state>/voltrace (r4_move_trace_check) */
+        envp[ne++] = "TSDB_CLUSTER_TEST=vol_trace=1";
     if (crash_at) {
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
@@ -3563,6 +3567,186 @@ static int r4_leftovers_once(int say)
     return bad;
 }
 
+/* The move's own check under churn (design-cluster.md 3.2): every node's <state>/voltrace (TSDB_CLUSTER_TEST vol_trace=1,
+ * a line per applied record that changed kvr's set, epoch, leader or ISR) is followed in index order. While a move from
+ * A to B is in flight (B in the set with `replaces` A), A may leave the ISR only after B joined it, and the ISR it leaves
+ * behind has at least as many members as the ISR had in the last record before B joined: a move never lowers the number
+ * of in-sync copies. Nothing is lost when A goes early with no fault around (moveshrinkfirst under churn alone acknowledged
+ * every write and compared equal), so the record is what shows it. A node's trace may skip records (a snapshot it
+ * installed): a jump across B's join counts as joined first, so a gap can hide a violation, never invent one. Only the
+ * move's own shrink is judged: a record whose basis (epoch, ISR version) kvr's leader asked for as a leave of A (the
+ * "req" lines its driver traces with the core's reason, repld.c trace_isr_req); A going for lag (drop) is counted, not
+ * judged (review F3: a slow A under load is no move's decision). Judged only when churn is the run's one nemesis. */
+struct vtr {
+    uint64_t index, epoch, isrv;
+    uint32_t nisr, isr[META_REPLICAS_MAX + 2], nrep, rep[META_REPLICAS_MAX + 2], repl[META_REPLICAS_MAX + 2];
+};
+
+static int vtr_has(const uint32_t *a, uint32_t n, uint32_t x)
+{
+    for (uint32_t k = 0; k < n; k++)
+        if (a[k] == x)
+            return 1;
+    return 0;
+}
+
+static int vtr_list(const char *p, uint32_t *out, uint32_t *rpl, uint32_t max)
+{
+    uint32_t n = 0;
+    while (*p && *p != ' ' && *p != '\n' && n < max) {
+        char *e;
+        unsigned long v = strtoul(p, &e, 10);
+        if (e == p)
+            break;
+        out[n] = (uint32_t)v;
+        if (rpl)
+            rpl[n] = 0;
+        p = e;
+        if (*p == ':' && p[1] == 'L')
+            p += 2;
+        if (*p == '<') {
+            v = strtoul(p + 1, &e, 10);
+            if (rpl)
+                rpl[n] = (uint32_t)v;
+            p = e;
+        }
+        n++;
+        if (*p == ',')
+            p++;
+    }
+    return (int)n;
+}
+
+static int vtr_parse(const char *ln, struct vtr *t)
+{
+    unsigned long long ix;
+    unsigned v;
+    if (sscanf(ln, "%llu v%u ", &ix, &v) != 2 || v != rep_number)
+        return 0;
+    const char *i = strstr(ln, " isr "), *r = strstr(ln, " rep "), *e = strstr(ln, " epoch "),
+               *iv = strstr(ln, " isrv ");
+    if (!i || !r || !e || !iv)
+        return 0;
+    t->index = ix;
+    t->epoch = strtoull(e + 7, NULL, 10);
+    t->isrv = strtoull(iv + 6, NULL, 10);
+    t->nisr = (uint32_t)vtr_list(i + 5, t->isr, NULL, META_REPLICAS_MAX + 2);
+    t->nrep = (uint32_t)vtr_list(r + 5, t->rep, t->repl, META_REPLICAS_MAX + 2);
+    return 1;
+}
+
+static unsigned mvtr_moves, mvtr_leaves, mvtr_lag;
+
+/* kvr's leader asked for an ISR without `a` as a move's leave at the basis (epoch, isrv): a "req" line of any node */
+static int vtr_leave_asked(uint32_t a, uint64_t epoch, uint64_t isrv)
+{
+    int hit = 0;
+    for (int i = 0; i < nn && !hit; i++) {
+        char p[PATH_MAX + 48], ln[1100];
+        snprintf(p, sizeof p, "%s/state/voltrace", nodes[i].dir);
+        FILE *f = fopen(p, "r");
+        while (f && !hit && fgets(ln, sizeof ln, f)) {
+            unsigned long long e, iv;
+            unsigned v;
+            char why[16];
+            int off = 0;
+            if (sscanf(ln, "req v%u epoch %llu isrv %llu why %15s isr %n", &v, &e, &iv, why, &off) != 4 || !off ||
+                v != rep_number || e != epoch || iv != isrv || strcmp(why, "leave"))
+                continue;
+            uint32_t isr[META_REPLICAS_MAX + 2];
+            int n = vtr_list(ln + off, isr, NULL, META_REPLICAS_MAX + 2);
+            hit = !vtr_has(isr, (uint32_t)n, a);
+        }
+        if (f)
+            fclose(f);
+    }
+    return hit;
+}
+
+static int r4_move_trace_check(void)
+{
+    if (nemeses != N_CHURN) {
+        printf("r4: move trace not judged (nemeses besides churn: a fault takes a replica out of the ISR)\n");
+        return 0;
+    }
+    int bad = 0;
+    for (int i = 0; i < nn; i++) {
+        char p[PATH_MAX + 48];
+        snprintf(p, sizeof p, "%s/state/voltrace", nodes[i].dir);
+        FILE *f = fopen(p, "r");
+        if (!f)
+            continue;
+        struct {
+            uint32_t a, b, min;
+            int joined, live;
+        } mv[8];
+        int nmv = 0, have_prev = 0;
+        unsigned moves = 0, leaves = 0, lag = 0;
+        struct vtr t, prev;
+        char ln[1100];
+        while (fgets(ln, sizeof ln, f)) {
+            if (!vtr_parse(ln, &t) || (have_prev && t.index <= prev.index))
+                continue;
+            for (int m = 0; m < nmv; m++)
+                mv[m].live = 0;
+            for (uint32_t k = 0; k < t.nrep; k++) {
+                if (!t.repl[k])
+                    continue;
+                int m = 0;
+                while (m < nmv && !(mv[m].a == t.repl[k] && mv[m].b == t.rep[k]))
+                    m++;
+                if (m == nmv) {
+                    if (nmv == 8)
+                        continue;
+                    memset(&mv[nmv], 0, sizeof mv[0]);
+                    mv[nmv].a = t.repl[k], mv[nmv].b = t.rep[k];
+                    nmv++;
+                    moves++;
+                }
+                mv[m].live = 1;
+                if (vtr_has(t.isr, t.nisr, mv[m].b))
+                    mv[m].joined = 1;
+                else if (!mv[m].joined)
+                    mv[m].min = t.nisr;
+            }
+            for (int m = 0; m < nmv; m++) {
+                if (!mv[m].live || !have_prev || !vtr_has(prev.isr, prev.nisr, mv[m].a) || vtr_has(t.isr, t.nisr, mv[m].a))
+                    continue;
+                if (!vtr_leave_asked(mv[m].a, prev.epoch, prev.isrv)) {
+                    lag++; /* A went for lag: not the move's shrink */
+                    continue;
+                }
+                leaves++;
+                if (!mv[m].joined) {
+                    fprintf(stderr, "jepsen-cluster: node %d: 1 violation(s): kvr's move from member %" PRIu32 " to %"
+                            PRIu32 ": %" PRIu32 " left the ISR at entry %" PRIu64 " before %" PRIu32 " joined it (ISR of %"
+                            PRIu32 ")\n", i, mv[m].a, mv[m].b, mv[m].a, t.index, mv[m].b, t.nisr);
+                    bad++;
+                } else if (t.nisr < mv[m].min) {
+                    fprintf(stderr, "jepsen-cluster: node %d: 1 violation(s): kvr's move from member %" PRIu32 " to %"
+                            PRIu32 ": %" PRIu32 " left the ISR at entry %" PRIu64 " with %" PRIu32 " members left, fewer "
+                            "than the %" PRIu32 " before %" PRIu32 " joined\n", i, mv[m].a, mv[m].b, mv[m].a, t.index,
+                            t.nisr, mv[m].min, mv[m].b);
+                    bad++;
+                }
+            }
+            for (int m = 0; m < nmv; ) /* a move that left the set ended (done or cancelled) */
+                if (!mv[m].live)
+                    mv[m] = mv[--nmv];
+                else
+                    m++;
+            prev = t;
+            have_prev = 1;
+        }
+        fclose(f);
+        if (moves > mvtr_moves)
+            mvtr_moves = moves, mvtr_leaves = leaves, mvtr_lag = lag;
+    }
+    printf("r4: move trace: %u moves followed, %u shrinks of the moved-from member judged, %u for lag not judged, %d "
+           "violation(s)\n", mvtr_moves, mvtr_leaves, mvtr_lag, bad);
+    return bad;
+}
+
 static int r4_leftovers_check(void)
 {
     char pd[PATH_MAX + 96];
@@ -4270,6 +4454,8 @@ int main(int argc, char **argv)
         if (want_rep) {
             r4_end_bad += rep_final_check();
             r4_end_bad += r4_leftovers_check();
+            if (nemeses & N_CHURN)
+                r4_end_bad += r4_move_trace_check();
         }
         for (int i = 0; i < nhists; i++)
             kv_final(i);
