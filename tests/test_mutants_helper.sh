@@ -12,7 +12,7 @@ base=$(mktemp -d "${TMPDIR:-/tmp}/mutants-helper.XXXXXX") || exit 1
 trap 'rm -rf "$base"' EXIT
 fail() { echo "test_mutants_helper: FAIL: $*" >&2; [ -z "${out:-}" ] || printf '%s\n' "$out" >&2; exit 1; }
 export XDG_RUNTIME_DIR=$base # the default pool of the helpers lives here
-unset MUTANT_JOBS MUTANT_SLOTS MUTANT_SLOT_DIR MUTANT_URING_JOBS MUTANT_TIMEOUT
+unset MUTANT_JOBS MUTANT_SLOTS MUTANT_SLOT_DIR MUTANT_URING_JOBS MUTANT_TIMEOUT MUTANT_NO_FLOCK
 export TMPDIR=$base # the helper's scratch root, unless --tmp says otherwise
 
 # the fake test: FAKE MUTANT SCRATCH, behaviour by mutant name
@@ -35,6 +35,18 @@ died*) echo "going down"; kill -KILL "$PPID" ;; # the run's wrapper is killed (t
 fixed*) # a file with a fixed name in the scratch directory: two runs sharing the directory collide
     [ ! -e "$d/state" ] || { echo "collision"; exit 0; }
     touch "$d/state"; sleep 0.3; exit 1 ;;
+bg*) # leaves a process of its own behind, as a test that starts a server it does not stop does
+    sleep 30 >/dev/null 2>&1 & echo $! >>"$FAKE_PIDS/bg"; exit 1 ;;
+pin*) # what the pool looks like while this run holds its slot
+    { ls "$MUTANT_SLOT_DIR"
+      for f in "$MUTANT_SLOT_DIR"/nf.[0-9]*; do [ -f "$f" ] && echo "owner $(cat "$f")"; done
+      if [ -e "$MUTANT_SLOT_DIR/slot.1" ]; then
+          if flock -n "$MUTANT_SLOT_DIR/slot.1" true; then echo "slot.1 free"; else echo "slot.1 held"; fi
+      fi; } >"$FAKE_PIN" 2>&1
+    exit 1 ;;
+watch*) # is the process that held the slot before us still alive? (then the pool ran one job too many)
+    ! kill -0 "$(cat "$FAKE_A")" 2>/dev/null || echo "$m" >>"$FAKE_PIN.violation"
+    exit 1 ;;
 conc*) # how many runs are alive at once
     mkdir -p "$FAKE_CONC"; touch "$FAKE_CONC/$$"
     n=$(ls "$FAKE_CONC" | wc -l); echo "$n" >>"$FAKE_CONC.max"
@@ -43,7 +55,7 @@ esac
 exit 3
 EOF
 chmod +x "$base/fake"
-export FAKE_PIDS=$base/pids FAKE_CONC=$base/conc
+export FAKE_PIDS=$base/pids FAKE_CONC=$base/conc FAKE_PIN=$base/pin FAKE_A=$base/a.pid
 mkdir -p "$FAKE_PIDS"
 F=$base/fake
 
@@ -180,39 +192,119 @@ run "$H" --name t --detail 'FAIL:' --list "catch1" -- "$F" @M@ @D@
 has "FAIL: planted catch1"
 rm -rf "$base"/mut.*
 
-# 14. a pool shared by helpers that run at once (make tsan-par): MUTANT_SLOTS runs alive in all of them together
-rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
-dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
-pa=$!
-dl "$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
-pb=$!
-wait $pa || fail "pool: first helper failed"
-wait $pb || fail "pool: second helper failed"
-[ "$(maxc)" = 2 ] || fail "MUTANT_SLOTS=2 over two helpers: $(maxc) at once"
-[ "$(sort -n "$FAKE_CONC.max" | wc -l)" = 8 ] || fail "pool: not all eight runs happened"
-# no job count given: the helpers share a default pool per user (MUTANT_SLOTS wide here), jobs given: no pool
-rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-unset MUTANT_SLOT_DIR
-MUTANT_SLOTS=1 dl "$H" --name a --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
-pa=$!
-MUTANT_SLOTS=1 dl "$H" --name b --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
-pb=$!
-wait $pa || fail "default pool: first helper failed"
-wait $pb || fail "default pool: second helper failed"
-[ "$(maxc)" = 1 ] || fail "default pool of 1 over two helpers: $(maxc) at once"
-[ -d "$base/tsdb-mutant-slots-$(id -u)" ] || fail "the default pool was not made under XDG_RUNTIME_DIR"
-rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-MUTANT_SLOTS=1 run dl "$H" --name t --jobs 3 --list "conc1 conc2 conc3" -- "$F" @M@ @D@
-[ "$(maxc)" = 3 ] || fail "--jobs given: the default pool applied ($(maxc) at once)"
-export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
-# a slot left by a helper that died is taken over
-mkdir -p "$base/slots/1" "$base/slots/2"
-echo 999999 >"$base/slots/1/pid"; echo 999999 >"$base/slots/2/pid"
-run dl "$H" --name t --jobs 2 --list "catch1 catch2" -- "$F" @M@ @D@
-[ $rc -eq 0 ] || fail "stale slots: rc $rc"
-[ -z "$(ls "$base/slots")" ] || fail "slots left behind: $(ls "$base/slots")"
-unset MUTANT_SLOT_DIR MUTANT_SLOTS
+# 14. a pool shared by helpers that run at once (make tsan-par): MUTANT_SLOTS runs alive in all of them together.
+# Once with flock(1) and once without (MUTANT_NO_FLOCK=1: the pool of macOS, files made with O_EXCL and a pid in them).
+pool_cases() {
+    rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/slots"
+    export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
+    dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+    pa=$!
+    dl "$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+    pb=$!
+    wait $pa || fail "pool$1: first helper failed"
+    wait $pb || fail "pool$1: second helper failed"
+    [ "$(maxc)" = 2 ] || fail "pool$1: MUTANT_SLOTS=2 over two helpers: $(maxc) at once"
+    [ "$(sort -n "$FAKE_CONC.max" | wc -l)" = 8 ] || fail "pool$1: not all eight runs happened"
+    # which way the pool is made: an flock on slot.K (held while the run lives, the file empty), or a file nf.K with a pid
+    rm -f "$FAKE_PIN"
+    run dl "$H" --name t --jobs 2 --list "pin1" -- "$F" @M@ @D@
+    pin=$(cat "$FAKE_PIN" 2>/dev/null)
+    if [ -z "${MUTANT_NO_FLOCK:-}" ] && command -v flock >/dev/null 2>&1; then
+        case $pin in *"slot.1"*"slot.1 held"*) ;; *) fail "pool$1: no flock held on slot.1 during a run: $pin" ;; esac
+        case $pin in *nf.*) fail "pool$1: nf files beside the flocks: $pin" ;; esac
+    else
+        case $pin in *"nf.1"*"owner "[0-9]*) ;; *) fail "pool$1: no nf.1 with an owner pid during a run: $pin" ;; esac
+        case $pin in *slot.*) fail "pool$1: slot files beside the nf files: $pin" ;; esac
+    fi
+    # no job count given: the helpers share a default pool per user (MUTANT_SLOTS wide here), jobs given: no pool
+    rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/tsdb-mutant-slots-$(id -u)"
+    unset MUTANT_SLOT_DIR
+    MUTANT_SLOTS=1 dl "$H" --name a --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+    pa=$!
+    MUTANT_SLOTS=1 dl "$H" --name b --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+    pb=$!
+    wait $pa || fail "default pool$1: first helper failed"
+    wait $pb || fail "default pool$1: second helper failed"
+    [ "$(maxc)" = 1 ] || fail "default pool$1 of 1 over two helpers: $(maxc) at once"
+    [ -d "$base/tsdb-mutant-slots-$(id -u)" ] || fail "the default pool was not made under XDG_RUNTIME_DIR"
+    rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
+    MUTANT_SLOTS=1 run dl "$H" --name t --jobs 3 --list "conc1 conc2 conc3" -- "$F" @M@ @D@
+    [ "$(maxc)" = 3 ] || fail "--jobs given$1: the default pool applied ($(maxc) at once)"
+    # a slot left by a helper that died is taken over (a flock is let go by the kernel; a file names a dead pid)
+    export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
+    rm -rf "$base/slots"; mkdir -p "$base/slots"
+    echo 999999 >"$base/slots/nf.1"; echo 999999 >"$base/slots/nf.2"
+    rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
+    run dl "$H" --name t --jobs 2 --list "conc1 conc2" -- "$F" @M@ @D@
+    [ $rc -eq 0 ] || fail "stale slots$1: rc $rc"
+    [ "$(maxc)" = 2 ] || fail "stale slots$1: not both taken over ($(maxc) at once)"
+    [ -z "${MUTANT_NO_FLOCK:-}" ] || [ -z "$(ls "$base/slots" | grep -v '^nf\.new\.')" ] ||
+        fail "stale slots$1: left behind: $(ls "$base/slots")"
+    # a run that leaves a process behind does not keep its slot: the next one starts at once (a lock inherited by
+    # the run's children would hold it for the 30 s of the leftover)
+    rm -f "$FAKE_PIDS/bg"
+    t0=$SECONDS
+    MUTANT_SLOTS=1 run dl "$H" --name t --jobs 2 --list "bg1 bg2 bg3" -- "$F" @M@ @D@
+    for bp in $(cat "$FAKE_PIDS/bg" 2>/dev/null); do kill "$bp" 2>/dev/null; done
+    [ $((SECONDS - t0)) -lt 20 ] || fail "a leftover of a run kept its slot$1 ($((SECONDS - t0)) s)"
+    [ $rc -eq 0 ] || fail "leftover$1: rc $rc"
+    unset MUTANT_SLOT_DIR MUTANT_SLOTS
+    rm -rf "$base"/mut.*
+}
+pool_cases ""
+MUTANT_NO_FLOCK=1 pool_cases " without flock"
+
+# 14a. a stale slot is reaped without touching a live owner's (no flock). The reaper reads the dead owner's pid; before
+# it acts, the slot is taken over by a live process (a shim of cat swaps the file right after the helper's first read of
+# it: deterministic, no timing). A reaper that then removed, or moved away and put back, the file it found would free
+# or lose that live owner's slot: the run below would start while the owner is alive.
+mkdir -p "$base/shim2"
+cat >"$base/shim2/cat" <<'EOF'
+#!/bin/bash
+/bin/cat "$@"; rc=$?
+case $1 in */nf.1)
+    if [ ! -e "$FAKE_PIN.swapped" ]; then
+        : >"$FAKE_PIN.swapped"; /bin/cat "$FAKE_A" >"$1.x"; /bin/mv -f "$1.x" "$1"
+    fi ;;
+esac
+exit $rc
+EOF
+chmod +x "$base/shim2/cat"
+rm -rf "$base/slots" "$base"/pin.*
+mkdir -p "$base/slots"
+echo 999999 >"$base/slots/nf.1"
+sleep 4 &
+apid=$!
+echo $apid >"$FAKE_A"
+MUTANT_NO_FLOCK=1 MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=1 PATH=$base/shim2:$PATH run dl "$H" --name t --jobs 2 --list "watch1" -- "$F" @M@ @D@
+wait $apid
+[ -e "$FAKE_PIN.swapped" ] || fail "reaper race: the shim never ran (the helper did not read the stale slot)"
+[ ! -e "$FAKE_PIN.violation" ] || fail "reaper race: a run started while the slot's live owner was alive"
+[ $rc -eq 0 ] || fail "reaper race: rc $rc"
+rm -rf "$base/slots" "$base"/mut.*
+
+# 14b. mkdir is no lock: uutils' mkdir (the coreutils of Ubuntu 26.04) says 0 to a caller whose name is made by another
+# one at that moment, and the pool of 4d8a7d18, whose slot was a directory, then ran two jobs in its one slot. A mkdir
+# that always says 0 in front of the real one (deterministic, no timing): the helpers must not rely on it.
+mkdir -p "$base/shim"
+cat >"$base/shim/mkdir" <<'EOF'
+#!/bin/bash
+/bin/mkdir -p "$@"
+exit 0
+EOF
+chmod +x "$base/shim/mkdir"
+for nf in "" 1; do
+    rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/slots"
+    export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=1 MUTANT_NO_FLOCK=$nf
+    PATH=$base/shim:$PATH dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+    pa=$!
+    PATH=$base/shim:$PATH dl "$H" --name b --jobs 4 --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+    pb=$!
+    wait $pa || fail "mkdir that always says 0${nf:+, no flock}: first helper failed"
+    wait $pb || fail "mkdir that always says 0${nf:+, no flock}: second helper failed"
+    [ "$(maxc)" = 1 ] || fail "mkdir that always says 0${nf:+, no flock}: $(maxc) at once in a pool of 1"
+    unset MUTANT_SLOT_DIR MUTANT_SLOTS MUTANT_NO_FLOCK
+done
 rm -rf "$base"/mut.*
 
 # 15. a run whose wrapper ended without a status is SURVIVED, never caught
