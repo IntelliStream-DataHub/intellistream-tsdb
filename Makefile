@@ -516,7 +516,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -906,7 +906,7 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/pe
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
 # frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
-$(B)/peerlink.o: server/peerlink.c server/peerlink.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h | $(B)
+$(B)/peerlink.o: server/peerlink.c server/peerlink.h server/pltransport.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
 # the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
 # it), tsdbd's instance over the cluster's member list in fwd_cluster.o
@@ -946,7 +946,7 @@ $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HD
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the entry node's rules over a fake link (no sockets, no tsdbd)
 $(B)/test_fwd: tests/test_fwd.c server/fwdreq.h server/fwd.h server/peerlink.h $(B)/fwdreq.o

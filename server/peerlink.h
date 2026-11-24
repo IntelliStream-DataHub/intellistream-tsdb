@@ -235,6 +235,7 @@ struct pl_stats {
     uint64_t raw_out;                                    /* the same frames' payloads before zstd */
     uint64_t connects, drops, auth_failures;
     uint64_t bulk_files, bulk_bytes; /* files finished, payload bytes sent by this side */
+    uint64_t handshakes;             /* accepted connections in their handshake now (a gauge, bounded) */
 };
 void peerlink_stats(struct peerlink *pl, struct pl_stats *st);
 
@@ -319,6 +320,10 @@ enum {
     PL_MUT_NOTYPE = 23,         /* the frame check leaves the type byte out */
     PL_MUT_HALFCMP = 24,        /* the reader compares 8 of the check's 16 bytes */
     PL_MUT_SEQ8 = 25,           /* the seed takes the low 8 bits of the sequence number (a frame 256 back passes) */
+    PL_MUT_NOREADY = 26,        /* the link thread sleeps in poll although its transport said it holds what it wants */
+    PL_MUT_CLOSEFIRST = 27,     /* the transport is closed before on_link(down) */
+    PL_MUT_WNOSHORT = 28,       /* a short write counts the whole write buffer as written (WRITTEN for untaken frames) */
+    PL_MUT_NHANDALL = 29,       /* a connection that never was in a handshake (the test attach) is taken off nhand */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
@@ -330,5 +335,13 @@ extern int peerlink_test_cut_end;
 /* Test hook (test_peerlink salts): when set, called at the end of each connection's handshake with its salts, those of
  * the frames it sends and of those it reads (dialer: 1 on the dialing end) */
 extern void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
+/* Test hook (test_peerlink `fake`, over tests/pl_fake.h's in-memory transport; server/pltransport.h): run one
+ * connection of the accepted link (peer, kind) on `t` as if a handshake with that peer had passed, with transcript
+ * `tr` (both ends give the same bytes and opposite `dialer`: their salts then match as a handshake's do; the check
+ * type is the highest this build runs). It takes the link over as a new accepted connection does, on a thread of its
+ * own, and owns `t` from the call on (closed when the connection ends, or at once on failure). 0, or -1. */
+struct pl_transport;
+int peerlink_test_attach(struct peerlink *pl, uint32_t peer, int kind, int dialer, const uint8_t *tr, size_t trlen,
+                         struct pl_transport *t);
 
 #endif

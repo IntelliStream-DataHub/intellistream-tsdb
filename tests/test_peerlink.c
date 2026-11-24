@@ -17,6 +17,14 @@
  *                not), a timed send waits and gives up
  *   latency      with 64 MB of a bulk file in flight to a slow receiver, small log frames keep their round trip
  *                (mutant sharedsocket puts the file on the log link's socket and the round trip is the file's)
+ *   fake         the link over tests/pl_fake.h's in-memory transport (server/pltransport.h): frames, held back and
+ *                paused past dead_ms, a flipped byte, a bulk file cut mid-stream and resumed, a cut
+ *                (every fake case: no down after the transport's close, no attach counted in a handshake;
+ *                mutants closefirst nhandall)
+ *   fakeready    the `ready` path: an edge-mode fake (one 4 KiB slot per read, drained before the poll, two fds)
+ *                moves 2.4 MB both ways in well under its timers' turns (mutant noready)
+ *   fakeend      an end reported to a paused link; WRITTEN / NEVER_WRITTEN after short writes into a 4 KiB ring
+ *                with the receiver held (mutant wnoshort)
  *
  * The proxy lives here: tests/jepsen/jepsen_cluster.c has r3f's, which is part of that program.
  */
@@ -47,6 +55,7 @@
 #include "plcheck.h"
 #include "fwd.h"
 #include "tsdb_crypto.h"
+#include "pl_fake.h"
 
 static int failures;
 #define CHECK(cond)                                                                                                \
@@ -436,6 +445,9 @@ struct node {
     _Atomic int nrtt;
     /* links */
     _Atomic int ups, downs;
+    struct plf_pair *_Atomic fp; /* a fake transport's pair this node's end is on (fend), checked at each down */
+    int fend;
+    _Atomic int close_early; /* downs seen after the transport of the connection was closed */
     /* bulk in */
     char path[600];
     _Atomic int fd; /* the receiver's file: its link thread opens it, a test thread polls its size */
@@ -513,6 +525,9 @@ static void on_link(void *arg, struct plink *l, int up)
         if (nd->link_hello)
             CHECK(plink_send(l, 7, "H", 1, 0) == PL_OK); /* from inside on_link: allowed, and first */
     } else {
+        struct plf_pair *fp = atomic_load(&nd->fp);
+        if (fp && plf_closed(fp, nd->fend))
+            nd->close_early++; /* pltransport.h: close is last, after on_link(down) */
         nd->downs++;
     }
 }
@@ -2726,6 +2741,264 @@ static void test_fwdgrow(void)
     fwd_free(A);
 }
 
+/* ---------------------------------------------------------------- another transport (server/pltransport.h) */
+
+/* the two ends of (a, b, kind) on a new pair of tests/pl_fake.h (edge mode with reads of `slot` bytes, 0: level), as
+ * if a handshake with transcript `tr` had passed; a is end 0, b end 1 */
+static struct plf_pair *fake_attach_slot(struct node *a, struct node *b, int kind, const char *tr, size_t cap,
+                                         size_t slot)
+{
+    struct pl_transport *ta, *tb;
+    struct plf_pair *p = slot ? plf_new_edge(cap, slot, &ta, &tb) : plf_new(cap, &ta, &tb);
+    a->fend = 0;
+    b->fend = 1;
+    atomic_store(&a->fp, p);
+    atomic_store(&b->fp, p);
+    CHECK(peerlink_test_attach(a->pl, b->id, kind, 0, (const uint8_t *)tr, strlen(tr), ta) == 0);
+    CHECK(peerlink_test_attach(b->pl, a->id, kind, 1, (const uint8_t *)tr, strlen(tr), tb) == 0);
+    return p;
+}
+
+static struct plf_pair *fake_attach(struct node *a, struct node *b, int kind, const char *tr, size_t cap)
+{
+    return fake_attach_slot(a, b, kind, tr, cap, 0);
+}
+
+/* the test lets go of its reference to the pair once both ends are down: the nodes stop looking at it */
+static void fake_put(struct node *a, struct node *b, struct plf_pair *p)
+{
+    atomic_store(&a->fp, NULL);
+    atomic_store(&b->fp, NULL);
+    plf_put(p);
+}
+
+/* what every fake case ends with: no down after its close, and no connection counted in a handshake (an attach never
+ * is: mutant nhandall takes it off all the same) */
+static void fake_end_checks(struct node *a, struct node *b)
+{
+    struct pl_stats sa, sb;
+    peerlink_stats(a->pl, &sa);
+    peerlink_stats(b->pl, &sb);
+    printf("  fake: downs after close %d %d, in handshake %" PRId64 " %" PRId64 "\n", (int)a->close_early,
+           (int)b->close_early, (int64_t)sa.handshakes, (int64_t)sb.handshakes);
+    CHECK(a->close_early == 0 && b->close_early == 0);
+    CHECK(sa.handshakes == 0 && sb.handshakes == 0);
+}
+
+/* The link thread on a transport that is not TCP: the in-memory pair of tests/pl_fake.h with a 64 KiB ring, so a
+ * large frame is many short writes and the thread polls the transport for room. Frames both ways, zstd, an echo; a
+ * receiver held in its callback (the sender is held back: slow, not silent); a paused link that only PINGs; a byte
+ * flipped in transit (the frame check ends the link, nothing wrong reaches the driver); a bulk file cut mid-stream
+ * that resumes on the next connection from the receiver's offset; a cut now. */
+static void test_fake(void)
+{
+    struct node *a = node_new(1, SECRET, NULL, 0), *b = node_new(2, SECRET, NULL, 0);
+    struct plf_pair *p = fake_attach(a, b, PL_KIND_LOG, "fake transcript 1", 65536);
+    struct plink *l = NULL, *al = NULL;
+    CHECK(WAIT_FOR((l = peerlink_find(b->pl, 1, PL_KIND_LOG)) != NULL && plink_up(l), 3000));
+    CHECK(WAIT_FOR((al = peerlink_find(a->pl, 2, PL_KIND_LOG)) != NULL && plink_up(al), 3000));
+    if (!l || !al) {
+        fake_put(a, b, p);
+        node_free(b);
+        node_free(a);
+        return;
+    }
+    CHECK(plink_peer(l) == 1 && plink_peer(al) == 2);
+    int n = quick ? 500 : 2000;
+    uint64_t rs = 9;
+    for (int i = 0; i < n; i++) {
+        size_t len = 8 + rng_next(&rs) % 3000;
+        if (i % 97 == 0)
+            len = 8 + 300000; /* several rings of it */
+        uint8_t type = (i & 1) ? 4 : 1;
+        uint8_t *buf = malloc(len);
+        gen_payload(type, buf, len, (uint64_t)i);
+        CHECK(plink_send(l, type, buf, len, 5000) == PL_OK);
+        free(buf);
+    }
+    CHECK(WAIT_FOR(a->frames_in == (uint64_t)n, 10000));
+    CHECK(a->bad_frames == 0 && a->order_bad == 0);
+    struct pl_stats sb;
+    peerlink_stats(b->pl, &sb);
+    CHECK(sb.raw_out > sb.bytes_out); /* the text frames went through zstd */
+    CHECK(plf_total(p, 1) >= sb.bytes_out); /* the frames' bytes went through the transport (and its PINGs) */
+    uint64_t t0 = now_ns();
+    CHECK(plink_send(l, 2, &t0, 8, 1000) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&b->nrtt) == 1, 3000));
+    b->have_seq = 0;
+    CHECK(send_frames(al, 1, 0, 50, 500, 1000) == PL_OK);
+    CHECK(WAIT_FOR(b->frames_in == 50, 3000));
+    CHECK(b->bad_frames == 0 && b->order_bad == 0);
+
+    /* held back for longer than dead_ms (1 s): a receiver in its callback, then a paused one; neither link ends */
+    a->have_seq = 0;
+    set_gate(a, 1);
+    uint64_t f0 = a->frames_in;
+    CHECK(send_frames(l, 1, 0, 32, 65536, 2000) == PL_OK);
+    usleep(1500 * 1000);
+    CHECK(plink_up(l) && plink_up(al) && a->downs == 0 && b->downs == 0);
+    set_gate(a, 0);
+    CHECK(WAIT_FOR(a->frames_in == f0 + 32, 5000));
+    plink_pause(al, 1);
+    CHECK(send_frames(l, 1, 32, 32, 65536, 2000) == PL_OK);
+    usleep(1500 * 1000);
+    CHECK(plink_up(l) && plink_up(al) && a->downs == 0 && b->downs == 0);
+    CHECK(a->frames_in <= f0 + 32 + 5); /* at most the frames of the read before the pause (256 KiB) */
+    plink_pause(al, 0);
+    CHECK(WAIT_FOR(a->frames_in == f0 + 64, 5000));
+    CHECK(a->bad_frames == 0 && a->order_bad == 0);
+
+    /* a byte flipped in transit: the receiver's check ends the connection, both ends go down */
+    plf_set_flip(p, 1, plf_total(p, 1) + 700);
+    uint64_t f1 = a->frames_in;
+    CHECK(send_frames(l, 1, 64, 10, 1000, 1000) == PL_OK);
+    CHECK(WAIT_FOR(a->downs == 1 && b->downs == 1, 5000));
+    CHECK(a->frames_in < f1 + 10 && a->bad_frames == 0 && a->order_bad == 0);
+    CHECK(!plink_up(l) && !plink_up(al));
+    fake_put(a, b, p);
+
+    /* a bulk file cut after its first megabyte: the job stays, and the next connection resumes it */
+    char src[600], dst[600];
+    pathf(src, sizeof src, "fake-src");
+    pathf(dst, sizeof dst, "fake-dst");
+    size_t size = 4u * 1000 * 1000 + 321;
+    int sfd = (int)make_file(src, size, 21);
+    snprintf(a->path, sizeof a->path, "%s", dst);
+    struct plf_pair *p2 = fake_attach(a, b, PL_KIND_BULK, "fake transcript 2", 65536);
+    plf_set_cut(p2, 1, 1u << 20);
+    struct plink *bl = NULL;
+    CHECK(WAIT_FOR((bl = peerlink_find(b->pl, 1, PL_KIND_BULK)) != NULL && plink_up(bl), 3000));
+    struct jres r = {0};
+    if (bl)
+        CHECK(bulk_send(bl, sfd, size, "fake-file", &r) == PL_OK);
+    CHECK(WAIT_FOR(a->downs == 2 && b->downs == 2, 5000));
+    CHECK(!atomic_load(&r.done));
+    CHECK(a->ends == 1 && a->last_end == PL_E_DOWN);
+    fake_put(a, b, p2);
+    struct plf_pair *p3 = fake_attach(a, b, PL_KIND_BULK, "fake transcript 3", 65536);
+    CHECK(WAIT_FOR(atomic_load(&r.done), 10000));
+    CHECK(r.status == PL_OK);
+    CHECK(WAIT_FOR(a->ends == 2, 3000) && a->last_end == PL_OK);
+    CHECK(a->last_resume > 0 && a->last_resume < size); /* resumed, not begun again */
+    CHECK(same_file(sfd, a->fd, size));
+    /* the stream ends now: both ends go down */
+    plf_cut(p3);
+    CHECK(WAIT_FOR(a->downs == 3 && b->downs == 3, 5000));
+    fake_put(a, b, p3);
+    fake_end_checks(a, b);
+    node_free(b);
+    node_free(a);
+    close(sfd);
+    unlink(src);
+    unlink(dst);
+}
+
+/* The `ready` path (pltransport.h): a transport that has drained its news before the poll (tests/pl_fake.h's edge
+ * mode: reads of one 4 KiB slot, a wake only when a ring goes from empty to not empty or from full to not full, both
+ * pipes drained in poll_fds, two descriptors to poll) announces the bytes and the room it already holds through
+ * `*ready` alone. A link thread that sleeps in poll anyway reads one slot per turn of its timers (mutant noready): the
+ * frames below, about 2 MB both ways, then take tens of seconds instead of a fraction of one. */
+static void test_fakeready(void)
+{
+    struct node *a = node_new(1, SECRET, NULL, 0), *b = node_new(2, SECRET, NULL, 0);
+    struct plf_pair *p = fake_attach_slot(a, b, PL_KIND_LOG, "fake transcript r", 65536, 4096);
+    struct plink *l = NULL, *al = NULL;
+    CHECK(WAIT_FOR((l = peerlink_find(b->pl, 1, PL_KIND_LOG)) != NULL && plink_up(l), 3000));
+    CHECK(WAIT_FOR((al = peerlink_find(a->pl, 2, PL_KIND_LOG)) != NULL && plink_up(al), 3000));
+    if (!l || !al) {
+        fake_put(a, b, p);
+        node_free(b);
+        node_free(a);
+        return;
+    }
+    uint64_t t0 = now_ns();
+    CHECK(send_frames(l, 1, 0, 200, 4000, 5000) == PL_OK);
+    CHECK(send_frames(al, 1, 0, 200, 4000, 5000) == PL_OK);
+    for (int i = 0; i < 4; i++) {
+        uint8_t *buf = malloc(300000);
+        gen_payload(1, buf, 300000, 1000 + (uint64_t)i);
+        CHECK(plink_send(l, 1, buf, 300000, 5000) == PL_OK);
+        free(buf);
+    }
+    int ok = WAIT_FOR(a->frames_in == 204 && b->frames_in == 200, 5000);
+    double ms = (double)(now_ns() - t0) / 1e6;
+    printf("  fakeready: %d + %d frames (2.4 MB) through 4 KiB slots in %.0f ms\n", (int)a->frames_in,
+           (int)b->frames_in, ms);
+    CHECK(ok && ms < 3000);
+    CHECK(a->bad_frames == 0 && b->bad_frames == 0);
+    plf_cut(p);
+    CHECK(WAIT_FOR(a->downs == 1 && b->downs == 1, 5000));
+    fake_put(a, b, p);
+    fake_end_checks(a, b);
+    node_free(b);
+    node_free(a);
+}
+
+/* What a connection's end means over a transport. (1) An end is reported to a paused link too (pltransport.h): with
+ * PINGs 5 s apart, only the report ends it within a second. (2) WRITTEN and NEVER_WRITTEN after short writes: a 4 KiB
+ * ring, the receiver held in its first frame's callback, six tracked frames of 5000 bytes; the transport takes frame 0,
+ * frame 1 and at most part of frame 2 (the reader's 4 KiB beyond frame 0 at most, and a full ring), so after a cut
+ * frames 0 and 1 are WRITTEN and 3-5 NEVER_WRITTEN (mutant wnoshort counts a short write as the whole buffer). */
+static void test_fakeend(void)
+{
+    struct pl_cfg over = {.ping_ms = 5000, .dead_ms = 20000};
+    struct node *a = node_new(1, SECRET, &over, 0), *b = node_new(2, SECRET, &over, 0);
+    struct plf_pair *p = fake_attach(a, b, PL_KIND_LOG, "fake transcript e1", 65536);
+    struct plink *l = NULL, *al = NULL;
+    CHECK(WAIT_FOR((l = peerlink_find(b->pl, 1, PL_KIND_LOG)) != NULL && plink_up(l), 3000));
+    CHECK(WAIT_FOR((al = peerlink_find(a->pl, 2, PL_KIND_LOG)) != NULL && plink_up(al), 3000));
+    plink_pause(al, 1);
+    usleep(100 * 1000);
+    uint64_t t0 = now_ns();
+    plf_cut(p);
+    int ok = WAIT_FOR(a->downs == 1 && b->downs == 1, 1000);
+    printf("  fakeend: a paused link ended %s after %.0f ms\n", ok ? "down" : "NOT down", (double)(now_ns() - t0) / 1e6);
+    CHECK(ok);
+    fake_put(a, b, p);
+
+    a->strict = 0;
+    set_gate(a, 1);
+    p = fake_attach(a, b, PL_KIND_FWD, "fake transcript e2", 4096);
+    struct plink *f = NULL;
+    CHECK(WAIT_FOR((f = peerlink_find(b->pl, 1, PL_KIND_FWD)) != NULL && plink_up(f), 3000));
+    if (f) {
+        uint8_t *buf = malloc(5000);
+        for (uint64_t i = 0; i < 6; i++) {
+            gen_payload(1, buf, 5000, 300 + i);
+            CHECK(plink_sendv(f, 0, 1, NULL, 0, buf, 5000, 2000, 1, 10 + i, 0) == PL_OK);
+        }
+        free(buf);
+        /* the receiver sits in frame 0's callback (on_frame counts after it), the ring full behind it: nothing more
+         * is taken */
+        CHECK(WAIT_FOR(plf_total(p, 1) >= 5021 + 4096, 3000));
+        uint64_t tot = 0;
+        for (int i = 0; i < 100; i++) {
+            usleep(10 * 1000);
+            uint64_t t = plf_total(p, 1);
+            if (t == tot && i > 10)
+                break;
+            tot = t;
+        }
+        plf_cut(p);
+        CHECK(WAIT_FOR(sent_all(b, 10, 15), 3000));
+        printf("  fakeend: %" PRIu64 " bytes taken; frames 0-5: %d %d %d %d %d %d (2: written, 1: never)\n", tot,
+               atomic_load(&b->sent_out[10]), atomic_load(&b->sent_out[11]), atomic_load(&b->sent_out[12]),
+               atomic_load(&b->sent_out[13]), atomic_load(&b->sent_out[14]), atomic_load(&b->sent_out[15]));
+        CHECK(atomic_load(&b->sent_out[10]) == 2 && atomic_load(&b->sent_out[11]) == 2);
+        CHECK(atomic_load(&b->sent_out[12]) == 1 || atomic_load(&b->sent_out[12]) == 2);
+        for (int i = 13; i < 16; i++)
+            CHECK(atomic_load(&b->sent_out[i]) == 1);
+    }
+    CHECK(WAIT_FOR(b->downs == 2, 3000));
+    set_gate(a, 0); /* the receiver leaves its callback and finds the end */
+    CHECK(WAIT_FOR(a->downs == 2, 3000));
+    CHECK(a->frames_in <= 3 && a->bad_frames == 0); /* never a frame reported NEVER_WRITTEN */
+    fake_put(a, b, p);
+    fake_end_checks(a, b);
+    node_free(b);
+    node_free(a);
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL;
@@ -2826,6 +3099,18 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "pausedead")) {
                 peerlink_mutant = PL_MUT_PAUSEDEAD;
                 only = "fwdslow";
+            } else if (!strcmp(m, "noready")) {
+                peerlink_mutant = PL_MUT_NOREADY;
+                only = "fakeready";
+            } else if (!strcmp(m, "closefirst")) {
+                peerlink_mutant = PL_MUT_CLOSEFIRST;
+                only = "fake";
+            } else if (!strcmp(m, "wnoshort")) {
+                peerlink_mutant = PL_MUT_WNOSHORT;
+                only = "fakeend";
+            } else if (!strcmp(m, "nhandall")) {
+                peerlink_mutant = PL_MUT_NHANDALL;
+                only = "fake";
             } else if (!strcmp(m, "kindbucket")) {
                 peerlink_mutant = PL_MUT_KINDBUCKET;
                 only = "kindrate";
@@ -2852,7 +3137,8 @@ int main(int argc, char **argv)
         {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
-        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut},
+        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut}, {"fake", test_fake},
+        {"fakeready", test_fakeready}, {"fakeend", test_fakeend},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && strcmp(only, cases[i].name) != 0)

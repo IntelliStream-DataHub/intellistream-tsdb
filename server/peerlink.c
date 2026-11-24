@@ -3,11 +3,13 @@
  * Data links (peerlink.h has the design and the wire). The file has four parts: bytes and hashes (a growing buffer,
  * the streaming xxh64, HMAC with the pads absorbed once per key for the handshake, the frames' check of plcheck.h), the
  * frame codec (pl_msg_decode, pl_reader: what a
- * fuzzer reaches), the handshake (blocking, with deadlines, on the link's own thread) and the link threads.
+ * fuzzer reaches), the handshake (blocking, with deadlines, on the link's own thread, always on TCP), the TCP transport
+ * and the link threads.
  *
- * One thread runs one connection of one link: it owns the socket, the reader, the write buffer and the state of the
- * bulk file in flight in each direction. The driver's threads only touch the link's queue and job list (under
- * `plink.mu`) and the eventfd that wakes the thread. A frame queued with plink_send is copied; compressing, tagging
+ * One thread runs one connection of one link: it owns the transport (pltransport.h: the TCP socket the handshake ran
+ * on, the only one so far), the reader, the write buffer and the state of the bulk file in flight in each direction.
+ * The driver's threads only touch the link's queue and job list (under `plink.mu`) and the eventfd that wakes the
+ * thread. A frame queued with plink_send is copied; compressing, tagging
  * and writing happen on the link's thread, so a caller never waits for the CPU cost of its own frame.
  *
  * Bulk files (sender): BEGIN{file, total, meta}, the receiver answers RESUME{offset} (what it already holds; the
@@ -22,6 +24,7 @@
 
 #include "tsdb_crypto.h"
 #include "plcheck.h"
+#include "pltransport.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -36,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -1001,6 +1005,63 @@ static int dial_fd(struct peerlink *pl, const char *addr, uint64_t deadline)
 
 /* ---- the handshake */
 
+/* ---- the TCP transport (pltransport.h): a connection's socket once its handshake passed, its bytes exactly as
+ * before the seam (one read, one write per call) */
+
+struct pl_tcp {
+    struct pl_transport t;
+    int fd;
+};
+
+static ssize_t tcp_read(struct pl_transport *t, void *p, size_t n) { return read(((struct pl_tcp *)t)->fd, p, n); }
+
+static ssize_t tcp_writev(struct pl_transport *t, const struct iovec *iov, int n)
+{
+    int fd = ((struct pl_tcp *)t)->fd;
+    return n == 1 ? write(fd, iov[0].iov_base, iov[0].iov_len) : writev(fd, iov, n);
+}
+
+static int tcp_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int *ready)
+{
+    pf[0] = (struct pollfd){((struct pl_tcp *)t)->fd,
+                            (short)((want & PL_TR_IN ? POLLIN : 0) | (want & PL_TR_OUT ? POLLOUT : 0)), 0};
+    *ready = 0; /* the kernel holds the bytes: poll says */
+    return 1;
+}
+
+static int tcp_poll_ready(struct pl_transport *t, const struct pollfd *pf, int k)
+{
+    (void)t;
+    (void)k;
+    return (pf[0].revents & (POLLIN | POLLHUP | POLLERR) ? PL_TR_IN : 0) | (pf[0].revents & POLLOUT ? PL_TR_OUT : 0);
+}
+
+static void tcp_close(struct pl_transport *t)
+{
+    close(((struct pl_tcp *)t)->fd);
+    free(t);
+}
+
+static const struct pl_tr_ops tcp_ops = {"tcp", tcp_read, tcp_writev, tcp_poll_fds, tcp_poll_ready, tcp_close};
+
+/* the transport of a socket whose handshake passed; it owns fd from here on */
+static struct pl_transport *tcp_new(int fd, int sock_buf)
+{
+    struct pl_tcp *t = calloc(1, sizeof *t);
+    if (!t)
+        oom();
+    t->t.ops = &tcp_ops;
+    t->fd = fd;
+    /* no TCP_USER_TIMEOUT: Linux counts bytes held back by a shut window as unacknowledged, which would end a link
+     * whose peer is merely slow. A silent idle peer is found by PING and dead_ms; a host that vanishes while we are held
+     * back by it, by the kernel's own retransmission limit. */
+    if (sock_buf > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sock_buf, sizeof sock_buf);
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sock_buf, sizeof sock_buf);
+    }
+    return &t->t;
+}
+
 struct hello {
     uint32_t id;
     uint8_t uuid[16], ident[16], nc[32];
@@ -1195,7 +1256,8 @@ enum { HP_RX = 1, HP_TX };
 struct conn {
     struct plink *l;
     struct peerlink *pl;
-    int fd, dead;
+    struct pl_transport *t; /* the bytes of the frames go here and come from here, nowhere else (pltransport.h) */
+    int dead;
     uint64_t my_seq; /* the adoption this thread serves (accepted links) */
     struct keys keys;
     uint64_t seq_out;
@@ -1574,10 +1636,10 @@ static uint64_t job_send(struct conn *c)
     return 0;
 }
 
-static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq)
+static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys, uint64_t my_seq)
 {
     struct peerlink *pl = l->pl;
-    struct conn c = {.l = l, .pl = pl, .fd = fd, .my_seq = my_seq, .keys = *keys};
+    struct conn c = {.l = l, .pl = pl, .t = t, .my_seq = my_seq, .keys = *keys};
     c.zc = ZSTD_createCCtx();
     /* the reader checks the tags with the key the peer's frames carry: our `in` */
     c.rd = calloc(1, sizeof *c.rd);
@@ -1588,13 +1650,6 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
     if (!rbuf)
         oom();
     drain_evfd(l);
-    /* no TCP_USER_TIMEOUT: Linux counts bytes held back by a shut window as unacknowledged, which would end a link
-     * whose peer is merely slow. A silent idle peer is found by PING and dead_ms; a host that vanishes while we are held
-     * back by it, by the kernel's own retransmission limit. */
-    if (pl->cfg.sock_buf > 0) {
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &pl->cfg.sock_buf, sizeof pl->cfg.sock_buf);
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &pl->cfg.sock_buf, sizeof pl->cfg.sock_buf);
-    }
     pthread_mutex_lock(&l->mu);
     l->up = 1;
     l->gen++;
@@ -1707,7 +1762,8 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
         /* the buffer was filled to its mark: frames may be waiting behind it, and nothing wakes us for them */
         int full = c.wb.len - c.wb.off >= WB_HIGH;
         while (c.wb.len > c.wb.off) {
-            ssize_t w = write(fd, c.wb.p + c.wb.off, c.wb.len - c.wb.off);
+            struct iovec iv = {c.wb.p + c.wb.off, c.wb.len - c.wb.off};
+            ssize_t w = c.t->ops->writev(c.t, &iv, 1);
             if (w < 0 && errno == EINTR)
                 continue;
             if (w < 0 && errno == EAGAIN)
@@ -1716,8 +1772,9 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
                 c.dead = 1;
                 break;
             }
+            /* PL_MUT_WNOSHORT: a short write counted as the whole buffer (frames the transport never took: WRITTEN) */
+            c.wdone += peerlink_mutant == PL_MUT_WNOSHORT ? (uint64_t)(c.wb.len - c.wb.off) : (uint64_t)w;
             c.wb.off += (size_t)w;
-            c.wdone += (uint64_t)w;
         }
         trk_written(&c);
         if (c.wb.off == c.wb.len)
@@ -1743,19 +1800,29 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
             if (d < tmo)
                 tmo = d;
         }
-        /* paused: no POLLIN (a hangup or an error is still reported, and read) */
-        struct pollfd pf[2] = {{fd, (short)((paused ? 0 : POLLIN) | (c.wb.len > c.wb.off ? POLLOUT : 0)), 0},
-                               {l->evfd, POLLIN, 0}};
-        /* room left in the write buffer: come back as soon as the socket drains */
-        int pr = poll(pf, 2, tmo);
+        /* paused: no reading (a hangup or an error is still reported, and read); bytes left in the write buffer:
+         * come back as soon as the transport takes more */
+        struct pollfd pf[PL_TR_POLL_MAX + 1];
+        int ready = 0, want = (paused ? 0 : PL_TR_IN) | (c.wb.len > c.wb.off ? PL_TR_OUT : 0);
+        int nt = c.t->ops->poll_fds(c.t, want, pf, &ready);
+        if (nt < 0 || nt > PL_TR_POLL_MAX) {
+            fprintf(stderr, "peerlink: the %s transport asked to poll %d descriptors (at most %d): connection ended\n",
+                    c.t->ops->name, nt, PL_TR_POLL_MAX);
+            break;
+        }
+        pf[nt] = (struct pollfd){l->evfd, POLLIN, 0};
+        if (ready && peerlink_mutant != PL_MUT_NOREADY)
+            tmo = 0; /* the transport holds what we want already */
+        int pr = poll(pf, (nfds_t)nt + 1, tmo);
         if (pr < 0 && errno != EINTR)
             break;
-        if (pr <= 0)
+        if (pr <= 0 && !ready)
             continue;
-        if (pf[1].revents & POLLIN)
+        if (pr > 0 && (pf[nt].revents & POLLIN))
             drain_evfd(l);
-        if (pf[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t r = read(fd, rbuf, READ_BUF);
+        int tr = ready | (pr > 0 ? c.t->ops->poll_ready(c.t, pf, nt) : 0);
+        if (tr & PL_TR_IN) {
+            ssize_t r = c.t->ops->read(c.t, rbuf, READ_BUF);
             if (r > 0) {
                 c.last_rx = now_ns();
                 int fr = pl_reader_feed(c.rd, rbuf, (size_t)r, conn_msg, &c);
@@ -1814,9 +1881,12 @@ static void conn_run(struct plink *l, int fd, struct keys *keys, uint64_t my_seq
             pthread_mutex_unlock(&l->mu);
         }
     }
+    if (peerlink_mutant == PL_MUT_CLOSEFIRST)
+        c.t->ops->close(c.t);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 0);
-    close(fd);
+    if (peerlink_mutant != PL_MUT_CLOSEFIRST)
+        c.t->ops->close(c.t); /* last (pltransport.h): the driver saw the down before a verbs transport's slots go */
     pl_reader_free(c.rd);
     ZSTD_freeCCtx(c.zc);
     buf_free(&c.wb);
@@ -1844,7 +1914,7 @@ static void *dial_main(void *arg)
         struct keys k;
         if (fd >= 0 && hs_dial(l, fd, &k) == 0) {
             gap = lo;
-            conn_run(l, fd, &k, 0);
+            conn_run(l, tcp_new(fd, pl->cfg.sock_buf), &k, 0);
         } else if (fd >= 0) {
             close(fd);
         }
@@ -1892,18 +1962,16 @@ static struct plink *accepted_link(struct peerlink *pl, uint32_t peer, int kind)
  * then takes the link over from the connection that runs it (which leaves when it is next at its loop's top) and from
  * a connection of the same peer that is waiting for the same. At most one connection runs and one waits per link
  * (an older waiting one is closed by the newer), and this thread never joins another: a connection stuck in a driver
- * callback (a volume on NFS that is away) holds its own thread and descriptor only, however often the peer redials. */
-static void *adopt_main(void *arg)
+ * callback (a volume on NFS that is away) holds its own thread and descriptor only, however often the peer redials.
+ * claim_run is the claim and the run, on transport t, which it owns (closed when the connection ends or is not run);
+ * ok: the handshake passed; hand: the connection was counted in nhand. */
+static void claim_run(struct peerlink *pl, int ok, int hand, uint32_t peer, int kind, struct pl_transport *t,
+                      struct keys *k)
 {
-    struct adopt *a = arg;
-    struct peerlink *pl = a->pl;
-    struct hello h;
-    struct keys k = {0};
-    int ok = !atomic_load(&pl->closing) && hello_parse(a->hello, a->hn, &h) == 0 &&
-             hs_accept(pl, a->fd, a->hello, a->hn, &a->self, &k) == 0;
     pthread_mutex_lock(&pl->mu);
-    pl->nhand--;
-    struct plink *l = ok && !atomic_load(&pl->closing) ? accepted_link(pl, h.id, h.kind) : NULL;
+    if (hand || peerlink_mutant == PL_MUT_NHANDALL)
+        pl->nhand--;
+    struct plink *l = ok && !atomic_load(&pl->closing) ? accepted_link(pl, peer, kind) : NULL;
     uint64_t my = 0;
     if (l) {
         my = peerlink_mutant == PL_MUT_NOKICK ? l->adopt_seq : ++l->adopt_seq;
@@ -1918,18 +1986,86 @@ static void *adopt_main(void *arg)
     }
     pthread_mutex_unlock(&pl->mu);
     if (l) {
-        conn_run(l, a->fd, &k, my);
+        conn_run(l, t, k, my);
         pthread_mutex_lock(&pl->mu);
         l->running = 0;
         pthread_cond_broadcast(&pl->acv);
         pthread_mutex_unlock(&pl->mu);
     } else {
-        close(a->fd);
+        t->ops->close(t);
     }
+}
+
+static void *adopt_main(void *arg)
+{
+    struct adopt *a = arg;
+    struct peerlink *pl = a->pl;
+    struct hello h;
+    struct keys k = {0};
+    int ok = !atomic_load(&pl->closing) && hello_parse(a->hello, a->hn, &h) == 0 &&
+             hs_accept(pl, a->fd, a->hello, a->hn, &a->self, &k) == 0;
+    claim_run(pl, ok, 1, ok ? h.id : 0, ok ? h.kind : 0, tcp_new(a->fd, ok ? pl->cfg.sock_buf : 0), &k);
     tsdb_wipe(&k, sizeof k);
     free(a);
     atomic_fetch_sub(&pl->helpers, 1);
     return NULL;
+}
+
+/* test_peerlink's attach (peerlink.h): a connection on any transport, its keys from a transcript the two ends share */
+struct tattach {
+    struct peerlink *pl;
+    uint32_t peer;
+    int kind;
+    struct pl_transport *t;
+    struct keys k;
+};
+
+static void *tattach_main(void *arg)
+{
+    struct tattach *a = arg;
+    struct peerlink *pl = a->pl;
+    claim_run(pl, 1, 0, a->peer, a->kind, a->t, &a->k);
+    tsdb_wipe(&a->k, sizeof a->k);
+    free(a);
+    atomic_fetch_sub(&pl->helpers, 1);
+    return NULL;
+}
+
+int peerlink_test_attach(struct peerlink *pl, uint32_t peer, int kind, int dialer, const uint8_t *tr, size_t trlen,
+                         struct pl_transport *t)
+{
+    struct tattach *a = kind > PL_KIND_META && kind <= PL_KIND_DATA_MAX ? calloc(1, sizeof *a) : NULL;
+    if (!a) {
+        t->ops->close(t);
+        return -1;
+    }
+    a->pl = pl;
+    a->peer = peer;
+    a->kind = kind;
+    a->t = t;
+    keys_derive(pl, dialer, check_choose(PL_CHECKS_KNOWN), tr, trlen, &a->k);
+    a->k.peer = peer;
+    pthread_mutex_lock(&pl->mu); /* as peerlink_adopt: an attach that gets past closing is waited for */
+    int rc = -1;
+    if (!atomic_load(&pl->closing)) {
+        atomic_fetch_add(&pl->helpers, 1);
+        pthread_t th;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        rc = pthread_create(&th, &at, tattach_main, a);
+        pthread_attr_destroy(&at);
+        if (rc != 0)
+            atomic_fetch_sub(&pl->helpers, 1);
+    }
+    pthread_mutex_unlock(&pl->mu);
+    if (rc != 0) {
+        t->ops->close(t);
+        tsdb_wipe(&a->k, sizeof a->k);
+        free(a);
+        return -1;
+    }
+    return 0;
 }
 
 int peerlink_adopt(struct peerlink *pl, int fd, const uint8_t *hello, size_t hello_len, const struct pl_self *self)
@@ -2156,6 +2292,9 @@ void peerlink_stats(struct peerlink *pl, struct pl_stats *st)
     uint64_t *d = (uint64_t *)st, *s = (uint64_t *)&pl->st;
     for (size_t i = 0; i < sizeof *st / 8; i++)
         d[i] = __atomic_load_n(&s[i], __ATOMIC_RELAXED);
+    pthread_mutex_lock(&pl->mu);
+    st->handshakes = (uint64_t)(int64_t)pl->nhand;
+    pthread_mutex_unlock(&pl->mu);
 }
 
 void peerlink_free(struct peerlink *pl)
