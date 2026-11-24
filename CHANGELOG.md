@@ -20,9 +20,12 @@ redundancy (replicas, or `ec` with k and m), and an erasure-coded volume's recor
 members, one per position, picked by the leader of the group from the members whose heartbeat reports a chunk store
 up), its `stripe_version` and `gc_suspended`. `tsdb cluster volume add PEER NAME --redundancy ec=4+2` adds one (its log
 on m + 1 servers, `min_isr` m; refused naming how many members qualify), `tsdb cluster status` shows the group, a
-force-leader and a restore suspend its orphan collection and `tsdb cluster volume gc resume PEER VOLUME` resumes it.
+force-leader (and a restore, once built) suspends its orphan collection and `tsdb cluster volume gc resume PEER VOLUME` resumes it.
 STRIPE_SET, GC_SUSPEND and GC_RESUME are new metadata operations, and the log's entries are marked "TME3": a state
 directory of version 5 (or a log of "TME2") is refused with a line naming both, and the cluster is initialised again.
+A REPLICA_REMOVE that would leave a volume fewer replicas than its `min_isr` is now refused, for every replicated
+volume: `min_isr` never asks for more copies than the volume has (a volume of 2 replicas and `min_isr` 2 is shrunk by
+moving a replica, or after lowering `min_isr`, never by a plain remove).
 
 **The peer protocol is now version 7** (R4's command from the metadata group's leader to a volume's member, and the
 member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised

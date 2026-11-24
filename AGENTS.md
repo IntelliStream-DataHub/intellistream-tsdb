@@ -243,7 +243,10 @@ cgroup, so `nice` does not keep your work out of its way.
   REPLICA_RESET, one move per volume (an ADD with `replaces`; the REMOVE of the replaced member puts the learner into
   its slot, so rep[0] stays the preferred leader's), a planned grant's `target` and `min_end`;
   R8: a volume's redundancy, an EC volume's stripe group (picked by the proposer), `stripe_version`, `gc_suspended`,
-  ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`); snapshot version 6 and
+  ops STRIPE_SET, GC_SUSPEND, GC_RESUME (`test_cluster ecadd`; an EC add is admin op VOLUME_ADD_EC, so an older server
+  refuses it); `cluster_copy_caught_up_at(copy)` (D9: the copy has applied the leader's commit index heard last and that
+  heartbeat's lease still holds, read on the caller's clock; `test_cluster copycaught`, mutants `copynodeadline
+  copynofloor` in `make copy-mutants`); snapshot version 6 and
   entry magic "TME3": a state directory or log of another version is refused naming both, never upgraded).
   `server/cluster.c`: tsdbd's `--cluster` thread (own poll loop on the peer port:
   the Raft core, the watch stream, heartbeats, the admin ops of `tools/cluster-cli.c`, `tsdb cluster init|node
