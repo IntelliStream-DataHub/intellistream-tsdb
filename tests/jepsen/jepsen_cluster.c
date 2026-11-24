@@ -3573,10 +3573,12 @@ static int r4_leftovers_once(int say)
  * behind has at least as many members as the ISR had in the last record before B joined: a move never lowers the number
  * of in-sync copies. Nothing is lost when A goes early with no fault around (moveshrinkfirst under churn alone acknowledged
  * every write and compared equal), so the record is what shows it. A node's trace may skip records (a snapshot it
- * installed): a jump across B's join counts as joined first, so a gap can hide a violation, never invent one. Judged only
- * when churn is the run's one nemesis: a kill or a pause of A takes it out of the ISR by lag, which no move decided. */
+ * installed): a jump across B's join counts as joined first, so a gap can hide a violation, never invent one. Only the
+ * move's own shrink is judged: a record whose basis (epoch, ISR version) kvr's leader asked for as a leave of A (the
+ * "req" lines its driver traces with the core's reason, repld.c trace_isr_req); A going for lag (drop) is counted, not
+ * judged (review F3: a slow A under load is no move's decision). Judged only when churn is the run's one nemesis. */
 struct vtr {
-    uint64_t index;
+    uint64_t index, epoch, isrv;
     uint32_t nisr, isr[META_REPLICAS_MAX + 2], nrep, rep[META_REPLICAS_MAX + 2], repl[META_REPLICAS_MAX + 2];
 };
 
@@ -3621,16 +3623,45 @@ static int vtr_parse(const char *ln, struct vtr *t)
     unsigned v;
     if (sscanf(ln, "%llu v%u ", &ix, &v) != 2 || v != rep_number)
         return 0;
-    const char *i = strstr(ln, " isr "), *r = strstr(ln, " rep ");
-    if (!i || !r)
+    const char *i = strstr(ln, " isr "), *r = strstr(ln, " rep "), *e = strstr(ln, " epoch "),
+               *iv = strstr(ln, " isrv ");
+    if (!i || !r || !e || !iv)
         return 0;
     t->index = ix;
+    t->epoch = strtoull(e + 7, NULL, 10);
+    t->isrv = strtoull(iv + 6, NULL, 10);
     t->nisr = (uint32_t)vtr_list(i + 5, t->isr, NULL, META_REPLICAS_MAX + 2);
     t->nrep = (uint32_t)vtr_list(r + 5, t->rep, t->repl, META_REPLICAS_MAX + 2);
     return 1;
 }
 
-static unsigned mvtr_moves, mvtr_leaves;
+static unsigned mvtr_moves, mvtr_leaves, mvtr_lag;
+
+/* kvr's leader asked for an ISR without `a` as a move's leave at the basis (epoch, isrv): a "req" line of any node */
+static int vtr_leave_asked(uint32_t a, uint64_t epoch, uint64_t isrv)
+{
+    int hit = 0;
+    for (int i = 0; i < nn && !hit; i++) {
+        char p[PATH_MAX + 48], ln[1100];
+        snprintf(p, sizeof p, "%s/state/voltrace", nodes[i].dir);
+        FILE *f = fopen(p, "r");
+        while (f && !hit && fgets(ln, sizeof ln, f)) {
+            unsigned long long e, iv;
+            unsigned v;
+            char why[16];
+            int off = 0;
+            if (sscanf(ln, "req v%u epoch %llu isrv %llu why %15s isr %n", &v, &e, &iv, why, &off) != 4 || !off ||
+                v != rep_number || e != epoch || iv != isrv || strcmp(why, "leave"))
+                continue;
+            uint32_t isr[META_REPLICAS_MAX + 2];
+            int n = vtr_list(ln + off, isr, NULL, META_REPLICAS_MAX + 2);
+            hit = !vtr_has(isr, (uint32_t)n, a);
+        }
+        if (f)
+            fclose(f);
+    }
+    return hit;
+}
 
 static int r4_move_trace_check(void)
 {
@@ -3650,7 +3681,7 @@ static int r4_move_trace_check(void)
             int joined, live;
         } mv[8];
         int nmv = 0, have_prev = 0;
-        unsigned moves = 0, leaves = 0;
+        unsigned moves = 0, leaves = 0, lag = 0;
         struct vtr t, prev;
         char ln[1100];
         while (fgets(ln, sizeof ln, f)) {
@@ -3681,6 +3712,10 @@ static int r4_move_trace_check(void)
             for (int m = 0; m < nmv; m++) {
                 if (!mv[m].live || !have_prev || !vtr_has(prev.isr, prev.nisr, mv[m].a) || vtr_has(t.isr, t.nisr, mv[m].a))
                     continue;
+                if (!vtr_leave_asked(mv[m].a, prev.epoch, prev.isrv)) {
+                    lag++; /* A went for lag: not the move's shrink */
+                    continue;
+                }
                 leaves++;
                 if (!mv[m].joined) {
                     fprintf(stderr, "jepsen-cluster: node %d: 1 violation(s): kvr's move from member %" PRIu32 " to %"
@@ -3705,10 +3740,10 @@ static int r4_move_trace_check(void)
         }
         fclose(f);
         if (moves > mvtr_moves)
-            mvtr_moves = moves, mvtr_leaves = leaves;
+            mvtr_moves = moves, mvtr_leaves = leaves, mvtr_lag = lag;
     }
-    printf("r4: move trace: %u moves followed, %u shrinks of the moved-from member judged, %d violation(s)\n", mvtr_moves,
-           mvtr_leaves, bad);
+    printf("r4: move trace: %u moves followed, %u shrinks of the moved-from member judged, %u for lag not judged, %d "
+           "violation(s)\n", mvtr_moves, mvtr_leaves, mvtr_lag, bad);
     return bad;
 }
 

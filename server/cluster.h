@@ -143,6 +143,10 @@ struct cluster_report {
 /* A volume led here has a new request for the metadata group (any thread, an atomic store): the cluster thread sends
  * its next heartbeat within a duty round (100 ms) instead of after heartbeat_ms, so an ISR change waits that long. */
 void cluster_beat_soon(void);
+/* TSDB_CLUSTER_TEST vol_trace=1 (tests only): the path of <state-dir>/voltrace, else NULL. The volume leader's driver
+ * appends its ISR requests there with the core's reason (repld.c), beside the applied records (cmove_trace), so a test
+ * tells a move's shrink (leave) from one for lag (drop). */
+const char *cluster_vol_trace_path(void);
 /* Fills `out` (zeroed) from what this server runs; called from the cluster thread once per heartbeat, so it must not
  * block. Without one (set before cluster_start) the server reports no volumes and no domains. */
 typedef void (*cluster_report_fn)(void *arg, struct cluster_report *out);

@@ -35,7 +35,15 @@
  * moveremovebeforeshrink (REMOVE of A while it is in the ISR: meta refuses it), moveleaderfirst (REMOVE of the
  * leader's replica without a transfer: refused by meta), movenominisr (DROP_MEMBER with min_isr 0).
  *
- * TSDB_CMOVE_TEST=hold_shrink=PATH holds the shrink step while PATH exists (test_cluster movelag).
+ * A move this Raft leader proposed is in g_mv before its REPLICA_ADD applies: until the record shows it (`seen`) the
+ * duty does not take a record without it for the move's end, and after ADD_WAIT_NS unseen the entry goes as "not
+ * applied" (refused by meta, or lost with a Raft leader), counted neither done nor cancelled (review F2).
+ *
+ * TSDB_CMOVE_TEST (tests only, comma-separated): duty_at_propose=1 runs the duty right after the admin op proposes the
+ * ADD, so the round before the ADD applies is never missed (test_cluster move*); cancel_lose_leave=1 sends a cancel's
+ * REMOVE without its DROP_MEMBER(0), as if that frame were lost (test_cluster movecancel: the volume leader must stop
+ * the old member `leaving` from the record alone); hold_shrink=PATH, last, holds the shrink step while PATH exists
+ * (test_cluster movelag).
  *
  * The test hook TSDB_CLUSTER_TEST vol_trace=1 (cmove_trace) appends a line to <state-dir>/voltrace for every applied
  * entry that changed a replicated volume's set, epoch, leader or ISR: the test follows every committed record.
@@ -54,6 +62,7 @@
 
 #define MS UINT64_C(1000000)
 #define STEP_NS (1000 * MS) /* each step's command or proposal again while its condition holds */
+#define ADD_WAIT_NS (10000 * MS) /* a proposed move whose ADD the record has not shown by then was not applied */
 
 enum { MM_NONE = 0, MM_SHRINKFIRST, MM_NOREPLACES, MM_REMOVEBEFORESHRINK, MM_LEADERFIRST, MM_NOMINISR };
 static int mv_mutant(void)
@@ -82,6 +91,7 @@ struct mv {
     uint64_t rid;       /* b's instance */
     uint32_t min_isr;   /* the ISR's size before b joined (have_min: known) */
     int have_min, joined, mine, cancel, said_added, said_shrunk, step;
+    int seen; /* the record has shown the move (b with `replaces` a and rid): only then does its absence end it */
     const char *why;    /* the transfer's last reason not to start, said once */
     uint64_t t0, sent_ns;
 };
@@ -90,19 +100,31 @@ static uint32_t g_nmv;
 static uint64_t g_term; /* the Raft term g_mv belongs to */
 static atomic_ulong n_started, n_done, n_cancelled;
 
-/* TSDB_CMOVE_TEST=hold_shrink=PATH (test_cluster movelag): the shrink step waits while PATH exists, so a test can make
- * another member lag after the learner joined and before the move asks for the ISR without the old member */
+/* TSDB_CMOVE_TEST: hold_shrink=PATH (test_cluster movelag): the shrink step waits while PATH exists, so a test can make
+ * another member lag after the learner joined and before the move asks for the ISR without the old member;
+ * duty_at_propose=1: cmove_admin runs the duty at once after its proposal; cancel_lose_leave=1: see the header */
+static struct {
+    int read, duty_at_propose, cancel_lose_leave;
+    const char *hold; /* the cluster thread's */
+} T;
+static void test_read(void)
+{
+    if (T.read)
+        return;
+    T.read = 1;
+    const char *e = getenv("TSDB_CMOVE_TEST");
+    if (!e)
+        return;
+    T.duty_at_propose = strstr(e, "duty_at_propose=1") != NULL;
+    T.cancel_lose_leave = strstr(e, "cancel_lose_leave=1") != NULL;
+    const char *h = strstr(e, "hold_shrink=");
+    if (h && h[12])
+        T.hold = h + 12;
+}
 static int shrink_held(void)
 {
-    static const char *path; /* the cluster thread's */
-    static int read;
-    if (!read) {
-        read = 1;
-        const char *e = getenv("TSDB_CMOVE_TEST");
-        if (e && !strncmp(e, "hold_shrink=", 12) && e[12])
-            path = e + 12;
-    }
-    return path && access(path, F_OK) == 0;
+    test_read();
+    return T.hold && access(T.hold, F_OK) == 0;
 }
 
 static uint64_t since(uint64_t now, uint64_t t) { return now > t ? now - t : 0; }
@@ -208,7 +230,8 @@ static void step(const struct meta_volume *v, struct mv *m, uint64_t now)
         m->step = ST_REMOVE;
         if (due(m, now)) {
             m->sent_ns = now;
-            if (v->leader)
+            test_read();
+            if (v->leader && !T.cancel_lose_leave) /* the test hook models a lost frame (test_cluster movecancel) */
                 drop_member(v, 0, 0); /* repl_leave(-1): nobody is leaving */
             remove_member(v, m->b);
         }
@@ -268,14 +291,23 @@ void cmove_duty(uint64_t now)
         const struct meta_volume *v = meta_volume(sm, g_mv[i].vol);
         const struct meta_replica *in = v ? moving_in(v) : NULL;
         if (in && in->node == g_mv[i].b && in->replaces == g_mv[i].a && in->rid == g_mv[i].rid) {
+            g_mv[i].seen = 1;
             i++;
             continue;
         }
         struct mv *m = &g_mv[i];
+        if (!m->seen && v && !in && since(now, m->t0) < ADD_WAIT_NS) { /* proposed here, not applied yet */
+            i++;
+            continue;
+        }
         int a_member = v && meta_replica(v, m->a), b_member = v && meta_replica(v, m->b);
-        const char *how = !v ? "ended: the volume is gone" : a_member && !b_member ? "cancelled: the old set is back"
-                          : !a_member && b_member ? "done" : "ended";
-        atomic_fetch_add_explicit(!a_member && b_member ? &n_done : &n_cancelled, 1, memory_order_relaxed);
+        const char *how = !v                    ? "ended: the volume is gone"
+                          : !m->seen            ? "not applied: its REPLICA_ADD was refused or lost (try again)"
+                          : a_member && !b_member ? "cancelled: the old set is back"
+                          : !a_member && b_member ? "done"
+                                                  : "ended";
+        if (v && m->seen)
+            atomic_fetch_add_explicit(!a_member && b_member ? &n_done : &n_cancelled, 1, memory_order_relaxed);
         cl_say("volume %" PRIu32 ": move from node %" PRIu32 " to node %" PRIu32 " %s after %" PRIu64 " ms", m->vol,
                m->a, m->b, how, since(now, m->t0) / MS);
         *m = g_mv[--g_nmv];
@@ -293,7 +325,10 @@ void cmove_duty(uint64_t now)
                 continue; /* planted: a move this Raft leader did not start is forgotten */
             if (!(m = mv_new(v->number, in->replaces, in->node, in->rid, now)))
                 continue;
+            m->seen = 1;
         }
+        if (!m->seen) /* an entry of another move than the record's (the first loop ends it after ADD_WAIT_NS) */
+            continue;
         step(v, m, now);
     }
 }
@@ -358,7 +393,7 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
             reply(conn, reqid, CLUSTER_ERR_RETRY, "%s: too many moves under way", what);
             return;
         }
-        m->cancel = 1, m->sent_ns = 0, m->said_shrunk = 0;
+        m->cancel = 1, m->sent_ns = 0, m->said_shrunk = 0, m->seen = 1; /* the record shows it (checked above) */
         cl_say("volume %" PRIu32 ": %s by the operator (step %s)", vol, what, step_name[m->step]);
         reply(conn, reqid, META_OK, "%s: cancelling (node %" PRIu32 " leaves, node %" PRIu32 " stays)\n", what, to,
               from);
@@ -381,6 +416,9 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
     }
     atomic_fetch_add_explicit(&n_started, 1, memory_order_relaxed);
     cl_say("volume %" PRIu32 ": %s proposed (replica %016" PRIx64 ", ISR of %" PRIu32 ")", vol, what, rid, v->nisr);
+    test_read();
+    if (T.duty_at_propose) /* the round that falls before the ADD applies, every time */
+        cmove_duty(now);
     reply(conn, reqid, META_OK,
           "%s: proposed (replica %016" PRIx64 "); it runs in the background: learner, join, shrink, remove\n", what,
           rid);

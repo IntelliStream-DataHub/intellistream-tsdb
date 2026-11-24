@@ -97,6 +97,15 @@ int rset_change(struct rvol *rv, const struct cluster_vol_rec *r)
  * write a newer record there, of another member list. Then self and old_of, computed from the record it began with,
  * no longer describe it: it starts over from the new one (mutant setnextstale reconfigures the core with the new
  * count and the old maps, and hands the driver the new record). */
+/* the record names a member moving in for another (a move between its REPLICA_ADD and the REMOVE that ends it) */
+static int rec_moving(const struct cluster_vol_rec *r)
+{
+    for (uint32_t i = 0; i < r->nrep; i++)
+        if (r->rep[i].replaces)
+            return 1;
+    return 0;
+}
+
 static int apply(struct rvol *rv, struct rset *s)
 {
     struct cluster_vol_rec cur;
@@ -199,6 +208,14 @@ again:
     }
     rec_set(rv, n);
     rv->self = self;
+    /* a member leaves only for a move (D11), and a record with no member moving in (`replaces`) has none: a cancel's
+     * REMOVE of the learner applied, so whatever its DROP_MEMBER(0) did (a lost frame is never resent once the REMOVE
+     * applied), the old member is not left `leaving`, never asked back into the ISR (review F4) */
+    if (repl_leaving(rv->core) >= 0 && !rec_moving(n) && G.mutant != RM_SETKEEPLEAVE) {
+        say("volume %" PRIu32 ": replica set version %" PRIu64 " has no move: replica %d no longer leaves", rv->number,
+            n->set_version, repl_leaving(rv->core));
+        repl_leave(rv->core, -1, 0);
+    }
     rv->nnodes = (int)n->nrep;
     s->pending = 0;
     say("volume %" PRIu32 ": replica set version %" PRIu64 " -> %" PRIu64 ": nodes %s; this is replica %d of %d",
@@ -269,6 +286,7 @@ void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
             idx = (int)i;
     const char *no = rv->mode != M_WRITER || !repl_is_leader(rv->core) ? "this node does not lead it"
                      : c->epoch != repl_epoch(rv->core)                 ? "another epoch"
+                     : !rec_moving(&rv->rec)                            ? "no move in the record"
                      : idx < 0                                          ? "no such member"
                      : idx == rv->self                                  ? "the member is this leader"
                                                                         : NULL;

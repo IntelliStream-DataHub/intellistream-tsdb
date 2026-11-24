@@ -14297,8 +14297,11 @@ static void scen_r4stubs(void)
 /* volcmd (r4-iface): the plumbing R4's tracks build on, before any of them sends. The Raft leader (server 0, hook
  * TSDB_CLUSTER_TEST volcmd_file=1) sends each VOLCMD kind to server 1 (the F_VOLCMD frame) and to itself (the
  * self-delivery of cl_volcmd_send); each server's driver routes it (IN_CMD: TRANSFER and CANCEL to rtransfer.c,
- * DROP_MEMBER to rset.c), whose stubs say every field and the sender. And each driver dials the other's snapshot kind
- * (TSDB_REPLD_TEST=snapdial): tsdbd's acceptor hands kind 5 to the driver, whose on_frame passes it to rsnap.c. */
+ * DROP_MEMBER to rset.c), which refuses each by name and says the sender. rset_cmd's fences (r4-move review F5): a
+ * DROP_MEMBER at an epoch the volume is not at is refused by its leader as "another epoch" (the member: "does not lead
+ * it"), and one of an older Raft term than one heard (a deposed Raft leader's) is ignored, naming both terms. And each
+ * driver dials the other's snapshot kind (TSDB_REPLD_TEST=snapdial): tsdbd's acceptor hands kind 5 to the driver, whose
+ * on_frame passes it to rsnap.c. */
 static void scen_volcmd(void)
 {
     scenario("volcmd");
@@ -14324,6 +14327,17 @@ static void scen_volcmd(void)
     for (int i = 0; i < 2; i++)
         await_log_count(i, "a snapshot link (kind 5) sent a frame of unknown type", 1, 20000);
     printf("  each driver's kind-5 link reached the other's rsnap_frame\n");
+    /* the volume's leader refuses another epoch only once its driver leads (before that it does not lead it either):
+     * the commands go out after its "leads epoch" line */
+    struct meta_volume mv;
+    if (!vol_rec(0, "cmdv", &mv) || server_of(mv.leader) < 0)
+        die("cmdv has no leader among the servers");
+    int ls = server_of(mv.leader);
+    {
+        char led[64];
+        snprintf(led, sizeof led, "volume %" PRIu32 ": leads epoch ", num);
+        await_log_count(ls, led, 1, 20000);
+    }
     char path[PATH_MAX + 64];
     server_dir(0, path, sizeof path);
     strcat(path, "/state/volcmd.tmp");
@@ -14333,24 +14347,34 @@ static void scen_volcmd(void)
     for (int i = 0; i < 2; i++) /* TO KIND VOLUME EPOCH NODE ARG */
         for (int k = 1; k <= 3; k++)
             fprintf(f, "%u %d %" PRIu32 " %d %d %d\n", ids[i], k, num, 100 * (i + 1) + k, 7 + k, 4000 + 10 * i + k);
+    /* DROP_MEMBER's arg is Raft term << 8 | min_isr: 4002 and 4012 are term 15; then one of term 14 to each (sent after,
+     * in file order, on the one link and by the self-delivery) */
+    for (int i = 0; i < 2; i++)
+        fprintf(f, "%u 2 %" PRIu32 " %d 10 %d\n", ids[i], num, 100 * (i + 1) + 2, 14 << 8 | 1);
     if (fclose(f) != 0)
         die("%s: %s", path, strerror(errno));
     char to[PATH_MAX + 64];
     snprintf(to, sizeof to, "%.*s", (int)(strlen(path) - 4), path);
     if (rename(path, to) != 0)
         die("rename %s: %s", path, strerror(errno));
-    static const char *const what[4] = {NULL, "TRANSFER to node", "DROP_MEMBER of node", "CANCEL to node"};
     for (int i = 0; i < 2; i++)
         for (int k = 1; k <= 2; k++) {
             char line[256];
             if (k == 1) /* rtransfer.c (built): an epoch the volume is not at is refused, by name */
                 snprintf(line, sizeof line, "volume %" PRIu32 ": TRANSFER to node %d at epoch %d refused: ", num, 7 + k,
                          100 * (i + 1) + k);
-            else
-                snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num,
-                         what[k], 7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
+            else /* rset.c: the volume's leader refuses another epoch by name, the member that it does not lead */
+                snprintf(line, sizeof line, "volume %" PRIu32 ": DROP_MEMBER of node %d at epoch %d from node %u "
+                         "refused: %s", num, 7 + k, 100 * (i + 1) + k, ids[0],
+                         i == ls ? "another epoch" : "this node does not lead it");
             await_log_count(i, line, 1, 20000);
         }
+    for (int i = 0; i < 2; i++) {
+        char line[256];
+        snprintf(line, sizeof line, "volume %" PRIu32 ": DROP_MEMBER of node 10 from node %u of Raft term 14 ignored "
+                 "(term 15 was heard)", num, ids[0]);
+        await_log_count(i, line, 1, 20000);
+    }
     /* a CANCEL with no transfer to cancel is silent (a new Raft leader sends one to every volume leader); its routing
      * is test_cluster transferraftkill's */
     if (access(to, F_OK) == 0)
@@ -15931,7 +15955,7 @@ static void scen_transfer(void)
 /* one record of server w's voltrace (TSDB_CLUSTER_TEST vol_trace=1, cmove_trace): a line per applied entry that
  * changed volume 1's set, epoch, leader or ISR, so a reader of the whole file has seen every committed record */
 struct mvt {
-    uint64_t index, epoch;
+    uint64_t index, epoch, isrv;
     uint32_t leader, nisr, isr[16], nrep, rep[16], learner[16];
 };
 
@@ -15945,15 +15969,16 @@ static int mvt_has(const uint32_t *a, uint32_t n, uint32_t node)
 
 static int mvt_parse(const char *ln, struct mvt *t)
 {
-    if (!strstr(ln, " v1 "))
+    if (!strncmp(ln, "req ", 4) || !strstr(ln, " v1 ")) /* a volume leader's ISR request (mv_leave_asked) */
         return 0;
     const char *e = strstr(ln, " epoch "), *l = strstr(ln, " leader "), *i = strstr(ln, " isr "),
-               *r = strstr(ln, " rep ");
-    if (!e || !l || !i || !r || r < i)
+               *r = strstr(ln, " rep "), *iv = strstr(ln, " isrv ");
+    if (!e || !l || !i || !r || !iv || r < i)
         die("voltrace: a line without its fields: %s", ln);
     memset(t, 0, sizeof *t);
     t->index = strtoull(ln, NULL, 10);
     t->epoch = strtoull(e + 7, NULL, 10);
+    t->isrv = strtoull(iv + 6, NULL, 10);
     t->leader = (uint32_t)strtoul(l + 8, NULL, 10);
     for (const char *p = i + 5; p < r && t->nisr < 16;) {
         char *q;
@@ -15978,15 +16003,52 @@ static int mvt_parse(const char *ln, struct mvt *t)
     return 1;
 }
 
+/* whether a volume leader asked for an ISR without `a` as a move's leave (the core's REPL_WHY_LEAVE) at the basis
+ * (epoch, isrv): the "req" lines repld.c's trace_isr_req adds to the leader's voltrace before the request leaves, so
+ * one is there before any server applies the record it led to */
+static int mv_leave_asked(uint32_t a, uint64_t epoch, uint64_t isrv)
+{
+    int hit = 0;
+    for (int i = 0; i < N && !hit; i++) {
+        char p[PATH_MAX + 96], ln[1100];
+        server_dir(i, p, sizeof p);
+        strcat(p, "/state/voltrace");
+        FILE *f = fopen(p, "r");
+        while (f && !hit && fgets(ln, sizeof ln, f)) {
+            unsigned long long e, iv;
+            char why[16];
+            int off = 0;
+            if (sscanf(ln, "req v1 epoch %llu isrv %llu why %15s isr %n", &e, &iv, why, &off) != 3 || !off ||
+                e != epoch || iv != isrv || strcmp(why, "leave"))
+                continue;
+            uint32_t isr[16], n = 0;
+            for (const char *q = ln + off; n < 16;) {
+                char *z;
+                unsigned long v = strtoul(q, &z, 10);
+                if (z == q)
+                    break;
+                isr[n++] = (uint32_t)v;
+                q = *z == ',' ? z + 1 : z;
+            }
+            hit = !mvt_has(isr, n, a);
+        }
+        if (f)
+            fclose(f);
+    }
+    return hit;
+}
+
 /* the watched check of a move of volume 1 from node a to node b over every committed record (server w's voltrace; w is
- * never killed): once b is a member, a may leave the ISR only after b joined it, and the ISR it leaves behind has at
- * least as many members as the ISR had in the last record before b joined (the move never lowers the number of in-sync
- * copies). A lag shrink of another member is not the move's and is not judged. Records at or below `from` are
- * skipped: a second move in one scenario must not count the first one's history (b may have been a member then). */
+ * never killed): once b is a member, a may leave the ISR as the move's shrink only after b joined it, and the ISR it
+ * leaves behind has at least as many members as the ISR had in the last record before b joined (the move never lowers
+ * the number of in-sync copies). The move's shrink is the record whose basis the volume leader asked for as a leave
+ * (mv_leave_asked); a shrink for lag, of a or of another member, is not the move's and is not judged (review F3), but
+ * counted. Records at or below `from` are skipped: a second move in one scenario must not count the first one's history
+ * (b may have been a member then). */
 struct mv_watch {
     uint32_t a, b;
     uint64_t from;
-    int b_member, joined, a_left, ended, b_gone;
+    int b_member, joined, a_left, ended, b_gone, judged, lag_left;
     uint32_t min, lines;
     struct mvt last;
 };
@@ -16005,7 +16067,7 @@ static void move_watch(int w, struct mv_watch *x)
         return;
     char ln[1100];
     int prev_a = 0;
-    struct mvt t;
+    struct mvt t, prev = {0};
     while (fgets(ln, sizeof ln, f)) {
         if (!mvt_parse(ln, &t) || t.index <= from)
             continue;
@@ -16018,7 +16080,10 @@ static void move_watch(int w, struct mv_watch *x)
             x->min = t.nisr;
         else if (b_in && x->b_member && !x->joined)
             x->joined = 1;
-        if (prev_a && !a_in && x->b_member) {
+        if (prev_a && !a_in && x->b_member && !mv_leave_asked(a, prev.epoch, prev.isrv))
+            x->lag_left++;
+        else if (prev_a && !a_in && x->b_member) {
+            x->judged++;
             if (!x->joined)
                 die("move: node %" PRIu32 " left the ISR of plant at entry %" PRIu64 " before node %" PRIu32
                     " joined it (ISR of %" PRIu32 ")", a, t.index, b, t.nisr);
@@ -16034,6 +16099,7 @@ static void move_watch(int w, struct mv_watch *x)
         x->ended = !a_mem && b_mem && !bl && b_in;
         x->b_gone = x->b_member && !b_mem && a_mem && a_in;
         prev_a = a_in;
+        prev = t;
         x->last = t;
     }
     fclose(f);
@@ -16044,6 +16110,9 @@ static void await_move(int w, struct mv_watch *x, int cancelled, int ms, const c
     uint64_t t0 = now_ms();
     for (;;) {
         move_watch(w, x);
+        if (!cancelled && x->ended && !x->judged) /* the check would judge nothing: the trace lost its requests */
+            die("%s: the move of plant from node %" PRIu32 " to node %" PRIu32 " ended with no shrink of node %" PRIu32
+                " judged (%d departures not asked as the move's leave)", what, x->a, x->b, x->a, x->lag_left);
         if (cancelled ? x->b_gone : x->ended)
             return;
         if (now_ms() - t0 > (uint64_t)ms)
@@ -16081,15 +16150,38 @@ static void move_op(int via, int from, int to, int cancel, const char *want)
     printf("  %s", why);
 }
 
-static char move_hold[PATH_MAX + 32], move_penv[PATH_MAX + 64];
+/* an admin op the Raft leader must refuse with `want` in its answer (review F9: each of cmove_admin's checks);
+ * log 0 leaves out CLUSTER_MOVE_LOG */
+static void move_refused(int via, int from, int to, int cancel, int log, const char *want)
+{
+    uint8_t body[16], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_move_encode(1, ids[from], ids[to],
+                                                   (log ? CLUSTER_MOVE_LOG : 0) | (cancel ? CLUSTER_MOVE_CANCEL : 0),
+                                                   body);
+    int rc = admin(via, CLUSTER_OP_VOLUME_MOVE, body, bl, 1, &reply, &rl);
+    char why[512];
+    snprintf(why, sizeof why, "%.*s", (int)(rl < 400 ? rl : 400), reply ? (const char *)reply : "");
+    free(reply);
+    if (rc == 0 || !strstr(why, want))
+        die("%smove of plant from server %d to server %d: %s (%s), not refused with \"%s\"",
+            cancel ? "cancel of the " : "", from, to, cluster_strerror(rc), why, want);
+}
 
-/* hold: the move's shrink waits while <base>/holdshrink exists (TSDB_CMOVE_TEST, every server) */
+static char move_hold[PATH_MAX + 96], move_penv[PATH_MAX * 2];
+static const char *move_extra = ""; /* more of TSDB_CMOVE_TEST (",cancel_lose_leave=1"), before hold_shrink */
+
+/* hold: the move's shrink waits while <base>/holdshrink exists (TSDB_CMOVE_TEST, every server). Always
+ * duty_at_propose=1: the Raft leader runs its move duty right after proposing the ADD, in the round before the ADD
+ * applies, which must not take the move for ended (review F2: STATUS said "cancelled" and the move resumed; move_status
+ * requires cancelled 0) */
 static void move_env(int hold)
 {
     snprintf(move_hold, sizeof move_hold, "%s/holdshrink", base);
-    snprintf(move_penv, sizeof move_penv, "TSDB_CMOVE_TEST=hold_shrink=%s", move_hold);
+    snprintf(move_penv, sizeof move_penv, "TSDB_CMOVE_TEST=duty_at_propose=1%s%s%s", move_extra,
+             hold ? ",hold_shrink=" : "", hold ? move_hold : "");
+    move_extra = "";
     for (int i = 0; i < N; i++)
-        penv[i] = hold ? move_penv : NULL;
+        penv[i] = move_penv;
     set_cenv = "setop_file=1,vol_trace=1";
 }
 
@@ -16113,7 +16205,7 @@ struct mv_run {
 static void move_writers(struct mv_run *r, int s, int lead, int lenient)
 {
     tsdbc *c = client(lead); /* the series are made on the leader (a SERIES by path forwarded from a member that does
-                              * not lead is MOVED: see REPORT.md), the writers write through s */
+                              * not lead is MOVED: docs/tasks/fwd-series-moved.md), the writers write through s */
     for (int k = 0; k < REP_NAMES; k++) {
         tsdb_sid id = rep_series(c, rep_names[k], "plant", 30000);
         int64_t t = 1000;
@@ -16244,6 +16336,11 @@ static void scen_move(void)
     await_isr(0, "plant", 3, 10000, "every replica up");
     struct mv_run r;
     move_writers(&r, L, L, 0);
+    move_refused(s.R, A, B, 0, 0, "--log is required");
+    move_refused(s.R, A, A, 0, 1, "the same node twice");
+    move_refused(s.R, B, A, 0, 1, "the old node is not a member of the volume");
+    move_refused(s.R, A, W == A ? L : W, 0, 1, "the new node is a member already");
+    move_refused(s.R, A, B, 1, 1, "no such move is running");
     char p[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[2048];
     peer_of(s.R, p, sizeof p);
     snprintf(args, sizeof args, "cluster volume move %s 1 --log --from %" PRIu32 " --to %" PRIu32 " --secret-file %s",
@@ -16286,6 +16383,8 @@ static void scen_movelag(void)
     struct mv_watch x = {.a = ids[A], .b = ids[B]};
     await_joined(W, &x, 60000);
     move_status(s.R, ids[A], ids[B], 1, 0, "movelag"); /* held before its shrink: STATUS names it */
+    move_refused(s.R, C, A, 0, 1, "a move of the volume is running");
+    move_refused(s.R, C, B, 1, 1, "no such move is running"); /* a cancel names the running move's two nodes */
     pause_server(C, 1);
     await_isr(L, "plant", 3, 20000, "C lagged out of the ISR after X joined");
     move_hold_set(0);
@@ -16496,6 +16595,73 @@ static void scen_movekill(void)
     printf("  a move from %d to %d cancelled after the join: the learner went, the ISR of 3 holds %d\n", C, A, C);
 }
 
+/* movecancel (review F4): the cancel of a move whose DROP_MEMBER(A) the volume leader holds (X joined, then lagged out:
+ * the ISR without A is below the size before X joined), with the cancel's DROP_MEMBER(0) lost (TSDB_CMOVE_TEST
+ * cancel_lose_leave=1: the frame is never resent once the REMOVE of X applied). The volume leader must stop A
+ * `leaving` from the record alone (rset.c: a set with no member moving in): a member left `leaving` is never asked
+ * back into the ISR, so A, paused until it lags out and resumed, must be back in the ISR. Mutant setkeepleave (the
+ * record's reset off) fails it there. */
+static void scen_movecancel(void)
+{
+    scenario("movecancel");
+    move_extra = ",cancel_lose_leave=1";
+    move_env(1);
+    struct meta_volume v;
+    int L = set_setup(4, &v, 0);
+    set_cenv = NULL;
+    struct mv_servers s;
+    move_servers(&v, L, &s);
+    int B = s.X;
+    if (s.R == B) { /* X lags out by a pause below: it must not take the Raft leader (and the move's duty) with it */
+        pause_server(B, 1);
+        uint64_t t0 = now_ms();
+        while ((s.R = leader_of(L)) == B || s.R < 0)
+            if (now_ms() - t0 > 30000)
+                die("movecancel: no Raft leader but server %d 30 s after it was paused", B);
+            else
+                usleep(100000);
+        pause_server(B, 0);
+        if (s.O[0] == s.R) {
+            int k = s.O[0];
+            s.O[0] = s.O[1], s.O[1] = k;
+        }
+    }
+    int A = s.O[0], C = s.O[1];
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct mv_run r;
+    move_writers(&r, L, L, 1);
+    move_hold_set(1);
+    move_op(s.R, A, B, 0, "proposed");
+    struct mv_watch x = {.a = ids[A], .b = ids[B]};
+    await_joined(L, &x, 60000);
+    pause_server(B, 1);
+    await_isr(L, "plant", 3, 20000, "X lagged out of the ISR after it joined");
+    move_hold_set(0);
+    char needle[128];
+    snprintf(needle, sizeof needle, "volume 1: node %" PRIu32 " (replica ", ids[A]);
+    await_log(L, needle, 20000, "movecancel: the volume leader did not take the move's DROP_MEMBER of A");
+    usleep(2000000); /* held: the ISR without A has 2 members, it had 3 before X joined */
+    if (isr_of(L, "plant", NULL) != 3)
+        die("movecancel: A left the ISR with X away");
+    move_op(s.R, A, B, 1, "cancelling");
+    await_move(L, &x, 1, 60000, "the cancel");
+    pause_server(B, 0);
+    pause_server(A, 1);
+    await_isr(L, "plant", 2, 20000, "A lagged out of the ISR after the cancel");
+    pause_server(A, 0);
+    await_isr(L, "plant", 3, 30000,
+              "A back in the ISR after the cancel whose DROP_MEMBER(0) was lost (a member left leaving is never asked "
+              "back)");
+    if (log_count(L, "has no move: replica ") < 1)
+        die("movecancel: the volume leader did not log that the record has no move");
+    move_writers_stop(&r);
+    stop_all();
+    move_watch(L, &x);
+    move_rows(&x.last, &r, "after the cancel");
+    printf("  a move from %d to %d cancelled with its DROP_MEMBER(0) lost: server %d (%d stayed) left leaving no more, "
+           "rejoined the ISR after a lag\n", A, B, A, C);
+}
+
 /* moveold: the leader no longer keeps position 1 (its first segments are gone): X fills by a snapshot
  * (r4-xferinst), joins, and the move ends */
 static void scen_moveold(void)
@@ -16568,7 +16734,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removesnap", scen_removesnap}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"moveold", scen_moveold}, {"classfailover", scen_classfailover},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removesnap", scen_removesnap}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold}, {"classfailover", scen_classfailover},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

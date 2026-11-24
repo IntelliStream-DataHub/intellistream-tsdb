@@ -1809,6 +1809,8 @@ static atomic_int g_beat_soon;      /* cluster_beat_soon: send the next heartbea
 
 void cluster_beat_soon(void) { atomic_store_explicit(&g_beat_soon, 1, memory_order_relaxed); }
 
+const char *cluster_vol_trace_path(void) { return C.vol_trace ? C.voltracefile : NULL; }
+
 void cluster_loop_stamp(void) { atomic_store_explicit(&g_stamp_ns, mono_ns(), memory_order_relaxed); }
 
 static _Atomic uint64_t g_lease_gen; /* + 1 whenever a lease begins after the last one had ended (lease_extend) */
