@@ -72,6 +72,7 @@ struct rpeer {
     uint64_t ahead_ms; /* since when `sent` is past `wrote` (0: it is not): what was sent since has not arrived */
     int heard;
     uint64_t heard_ms; /* when a message of this volume last came from it (repld_unreachable) */
+    uint64_t acked_ms; /* when its last ACK came (the stalesent fault takes a peer heard from since the file) */
     int rderr;         /* the last error of a catch-up read for it, and when it was said (never silent, not a flood) */
     uint64_t rderr_ms;
 };
@@ -271,6 +272,7 @@ struct repld_g {
                    * durable past the core's durable end */
     int trace; /* TSDB_REPLD_TRACE (debugging): the core's and the cursors' state every 2 s */
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
+    uint64_t stale_seen_ms; /* when the fault first found the file */
     int admit_hold;   /* TSDB_REPLD_TEST=admithold (tests only): admit_held() */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
     int snap_ask; /* TSDB_REPLD_TEST=snapask (tests only): while <dir>/snapask exists a replica asks for a snapshot */

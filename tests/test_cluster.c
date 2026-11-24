@@ -2506,6 +2506,20 @@ static int log_count(int i, const char *needle)
     return hits;
 }
 
+/* the lines of server i's log with `needle` after its first `skip` lines (log_count(i, "") counts every line) */
+static int log_count_from(int i, const char *needle, int skip)
+{
+    char path[PATH_MAX + 80], line[4096];
+    snprintf(path, sizeof path, "%s/n%d.log", base, i);
+    FILE *f = fopen(path, "r");
+    int hits = 0;
+    for (int n = 0; f && fgets(line, sizeof line, f); n++)
+        hits += n >= skip && strstr(line, needle) != NULL;
+    if (f)
+        fclose(f);
+    return hits;
+}
+
 static void await_log_count(int i, const char *needle, int want, int ms)
 {
     uint64_t t0 = now_ms();
@@ -10499,6 +10513,13 @@ static void scen_repcheck(void)
      * move up to what the peer acknowledged, or the catch-up finds nothing to read and no write commits again (jepsen
      * kv, seed 1: a resync raced records in flight) */
     {
+        /* R back in the ISR first (the fault takes a peer that acknowledged after the file appeared: a replica that
+         * has just restarted holds less than its previous run acknowledged). A starved peer can come back without
+         * the cursor moving up: it leaves the ISR, the leader drops the segments it lacks and rebuilds it by a
+         * snapshot (nocursorup survived that way, 1 in 8 runs side by side). The cursor moving up sends it records
+         * at once, so no snapshot is made for it after the fault */
+        await_isr(L, "plant", 3, 30000, "after the restarts of a replica with a damaged REPL slot");
+        int lines0 = log_count(L, ""); /* the snapshots that count are those logged after this line */
         char stale[PATH_MAX + 80];
         snprintf(stale, sizeof stale, "%s/n%d/stalesent", base, L);
         int sfd = open(stale, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
@@ -10530,6 +10551,15 @@ static void scen_repcheck(void)
             usleep(50000);
         }
         tsdbc_close(sc);
+        /* only the snapshots made for the faulted peer's node count; one for the other replica says nothing about
+         * this cursor */
+        char fl[4096], snapfor[64];
+        log_line(L, "test fault: the cursor of peer", fl, sizeof fl);
+        const char *nd = strstr(fl, "(node ");
+        unsigned fnode;
+        if (!nd || sscanf(nd, "(node %u)", &fnode) != 1)
+            die("the stalesent fault's line names no node: %s", fl);
+        snprintf(snapfor, sizeof snapfor, "snapshot made for node %u:", fnode);
         struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0, 0};
         pthread_t sth;
         if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)
@@ -10549,6 +10579,9 @@ static void scen_repcheck(void)
         await_isr(L, "plant", 3, 20000,
                   "after a peer's cursor went back below the leader's log start (the cursor never moved up to what the "
                   "peer acknowledged)");
+        if (log_count_from(L, snapfor, lines0) != 0)
+            die("the peer whose cursor went back below the leader's log start was rebuilt by a snapshot, not sent "
+                "records (the cursor never moved up to what the peer acknowledged)");
         printf("  a peer's cursor set back below the leader's log start moved up to what it acknowledged\n");
     }
 
