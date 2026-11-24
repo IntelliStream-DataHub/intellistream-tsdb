@@ -2157,6 +2157,14 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapsamelink")   ? RM_SNAPSAMELINK
                : !strcmp(mu, "snapnospacecheck") ? RM_SNAPNOSPACECHECK
                : !strcmp(mu, "snapsrcpromoting") ? RM_SNAPSRCPROMOTING
+               : !strcmp(mu, "snapnodonebits") ? RM_SNAPNODONEBITS
+               : !strcmp(mu, "snapsharedmax")  ? RM_SNAPSHAREDMAX
+               : !strcmp(mu, "snapmakedown")   ? RM_SNAPMAKEDOWN
+               : !strcmp(mu, "snapnowaitdone") ? RM_SNAPNOWAITDONE
+               : !strcmp(mu, "snapnostale")    ? RM_SNAPNOSTALE
+               : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
+               : !strcmp(mu, "snapnosrcdown")  ? RM_SNAPNOSRCDOWN
+               : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);

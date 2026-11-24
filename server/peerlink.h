@@ -129,7 +129,8 @@ struct pl_cfg {
     struct pl_bulk_in bulk;
     uint32_t queue_bytes; /* per link; 0: PL_QUEUE_BYTES */
     uint32_t bulk_chunk;  /* 0: PL_BULK_CHUNK */
-    uint64_t bulk_rate;   /* bytes/s across every bulk link of this peerlink; 0: PL_BULK_RATE_DEFAULT */
+    uint64_t bulk_rate;   /* bytes/s across the bulk links of one kind (each kind has its bucket, so the kinds together
+                           * may move a multiple of it); 0: PL_BULK_RATE_DEFAULT */
     uint32_t ping_ms;     /* an idle link sends a PING this often; 0: 1000 */
     uint32_t dead_ms;     /* nothing heard for this long ends a link; 0: 5000 */
     uint32_t backoff_min_ms, backoff_max_ms; /* redial gap, doubled up to the max; 0: 50 and 2000 */
@@ -309,5 +310,8 @@ enum {
  * and misbehaves. */
 int plink_test_ctl(struct plink *l, uint8_t type, const void *p, size_t n);
 extern int peerlink_mutant;
+/* Test hook (rsnap's TSDB_REPLD_TEST=snapcutdone): > 0 cuts the connection of a kind-5 link once, at the n-th file
+ * that ends whole, after the receiver's end callback and before its DONE goes out (a DONE lost to a reconnect). */
+extern int peerlink_test_cut_end;
 
 #endif

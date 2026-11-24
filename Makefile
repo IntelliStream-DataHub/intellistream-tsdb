@@ -979,7 +979,8 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
-	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting
+	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
+	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)

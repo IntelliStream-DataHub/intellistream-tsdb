@@ -51,6 +51,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,6 +74,7 @@ enum { RS_B_PROMOTING = 1, RS_B_MAX = 2, RS_B_STALE = 3, RS_B_MAKE = 4 };
 #define RS_BUSY_WAIT_MS 1000
 #define RS_STALL_MS 30000
 #define RS_SRC_DOWN_MS 60000
+#define RS_WAITDONE_MS 60000 /* source: the receiver's DONE 0 after the last file's (a lost one frees the slot) */
 #define RS_SRC_MAX_MS (6ull * 3600 * 1000)
 #define RS_STUB_WAIT_MS 60000 /* a copy received and not installed (r4-xferinst): asked again only after this */
 #define RS_TICK_EVERY_MS 200
@@ -97,10 +99,12 @@ struct rjob {
     int made;                /* the directory exists and is this job's to remove */
     struct snap_man man;
     int have_man;
+    uint8_t *fdone;          /* receiver: per file of SNAPMAN, 1 once it is in whole (a file begun again is not counted) */
     size_t fnext, nleft;      /* source: the next file to send; receiver: the files still to come */
     uint64_t total, moved;   /* the bytes of the files (SNAPMAN's left out), and those moved so far */
     /* receiver: the file being written */
     int fd;
+    int cur_redo; /* the file is in already: begun again because its DONE was lost; fd is a read of it for the hash */
     uint32_t cur_idx;
     uint64_t cur_file, cur_total, got;
     struct pl_xxh h;
@@ -125,7 +129,7 @@ struct wtask {
 struct rvs {
     uint32_t vol;
     uint64_t retry_at, tick_ms;
-    int said_space, said_wait;
+    int said_space, said_wait, said_stale;
 };
 
 static struct {
@@ -140,9 +144,12 @@ static struct {
     uint32_t nvs;
     struct rsnap_stats st;
     /* test hooks (TSDB_REPLD_TEST) */
-    int hold, promoting_hook, flip, flipped;
-    uint64_t free_hook;
-} S = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+    int hold, promoting_hook, flip, flipped, nodone, stalereq, stalesent, srcstall, srcstalled, fakesrc;
+    uint64_t free_hook, slowmake_ms;
+    /* timers; the hooks shorten them */
+    uint64_t stall_ms, down_ms, waitdone_ms;
+} S = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .stall_ms = RS_STALL_MS,
+       .down_ms = RS_SRC_DOWN_MS, .waitdone_ms = RS_WAITDONE_MS};
 
 static pthread_once_t hooks_once = PTHREAD_ONCE_INIT;
 
@@ -154,9 +161,30 @@ static void hooks_read(void)
     S.hold = strstr(te, "snaphold") != NULL;
     S.promoting_hook = strstr(te, "snappromoting") != NULL;
     S.flip = strstr(te, "snapflip") != NULL;
+    S.nodone = strstr(te, "snapnodone") != NULL;     /* the receiver's DONE 0 is never sent (lost) */
+    S.stalereq = strstr(te, "snapstalereq") != NULL; /* the first request names set version + 1 */
+    S.srcstall = strstr(te, "snapsrcstall") != NULL; /* the first source ignores GO (it stalls, still the leader) */
+    S.fakesrc = strstr(te, "snapfakesrc") != NULL;   /* <dir>/snapfakesrc stands for one source job running */
+    if (strstr(te, "snapcutdone")) /* the DONE of the second data file is lost to a cut connection */
+        __atomic_store_n(&peerlink_test_cut_end, 3, __ATOMIC_RELAXED);
     const char *f = strstr(te, "snapfree=");
     if (f)
         S.free_hook = strtoull(f + 9, NULL, 10);
+    struct { const char *k; uint64_t *v; } ms[] = {{"snapslowmake=", &S.slowmake_ms}, {"snapstallms=", &S.stall_ms},
+                                                 {"snapdownms=", &S.down_ms}, {"snapwaitdonems=", &S.waitdone_ms}};
+    for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++)
+        if ((f = strstr(te, ms[i].k)))
+            *ms[i].v = strtoull(f + strlen(ms[i].k), NULL, 10);
+}
+
+/* TSDB_REPLD_TEST=snapfakesrc: one source job more while <dir>/snapfakesrc exists (read before S.mu is taken) */
+static int fake_src(void)
+{
+    if (!S.fakesrc)
+        return 0;
+    char hp[sizeof G.dir + 32];
+    snprintf(hp, sizeof hp, "%s/snapfakesrc", G.dir);
+    return access(hp, F_OK) == 0;
 }
 
 static uint64_t ms_now(void)
@@ -227,13 +255,18 @@ static void rs_send(uint32_t node, uint8_t type, uint32_t vol, uint64_t req, int
         plink_send(l, type, b, sizeof b, 0);
 }
 
+/* S.mu held. A frame on a link still connecting is lost (PL_E_DOWN): the first request of a run is usually, and
+ * rsnap_need repeats it every RS_ASK_AGAIN_MS while the job waits */
 static void rs_send_req(uint32_t node, uint32_t vol, uint64_t set_version, uint64_t epoch, uint64_t req)
 {
     uint8_t b[RS_REQ_LEN];
-    put32(b, vol), put64(b + 4, set_version), put64(b + 12, epoch), put64(b + 20, req);
+    int stale = S.stalereq && !S.stalesent; /* TSDB_REPLD_TEST=snapstalereq: the first request sent is stale */
+    put32(b, vol), put64(b + 4, set_version + (uint64_t)stale), put64(b + 12, epoch), put64(b + 20, req);
     struct plink *l = rs_link(node);
-    if (l)
-        plink_send(l, RS_T_REQ, b, sizeof b, 0);
+    if (l && plink_send(l, RS_T_REQ, b, sizeof b, 0) == PL_OK && stale) {
+        S.stalesent = 1;
+        say("TEST: volume %" PRIu32 ": a request names set version %" PRIu64 " (snapstalereq)", vol, set_version + 1);
+    }
 }
 
 /* ---- jobs (S.mu held) */
@@ -257,11 +290,13 @@ static struct rjob *job_find(int role, uint32_t vol, uint64_t req)
     return NULL;
 }
 
-static unsigned jobs_alive(void)
+/* the live jobs of one role: rebuild_max bounds the receivers and, apart, the sources of a server, so two members
+ * that each receive from the other never answer each other BUSY for good */
+static unsigned jobs_alive(int role, unsigned fake)
 {
-    unsigned n = 0;
+    unsigned n = role == R_SRC || G.mutant == RM_SNAPSHAREDMAX ? fake : 0;
     for (struct rjob *j = S.jobs; j; j = j->next)
-        n += !j->dead;
+        n += !j->dead && (j->role == role || G.mutant == RM_SNAPSHAREDMAX);
     return n;
 }
 
@@ -324,6 +359,7 @@ static void job_free(struct rjob *j)
     if (j->fd >= 0)
         close(j->fd);
     snap_man_free(&j->man);
+    free(j->fdone);
     free(j->hist);
     free(j);
 }
@@ -338,7 +374,10 @@ void rsnap_need(struct rvol *rv, int src)
     uint32_t node = rv->rec.rep[src].node;
     if (node == G.self)
         return;
-    uint64_t now = ms_now();
+    unsigned fake = (unsigned)fake_src();
+    uint64_t now = ms_now(), rnd = 0;
+    if (getrandom(&rnd, sizeof rnd, GRND_NONBLOCK) != (ssize_t)sizeof rnd)
+        rnd = now ^ ((uint64_t)G.self << 40) ^ ((uint64_t)getpid() << 16);
     pthread_mutex_lock(&S.mu);
     struct rjob *j = job_find(R_DST, rv->number, 0);
     struct rvs *v = vs_get(rv->number);
@@ -358,7 +397,7 @@ void rsnap_need(struct rvol *rv, int src)
         return;
     }
     uint32_t max = rv->rec.rebuild_max ? rv->rec.rebuild_max : 2;
-    if (jobs_alive() >= max) { /* rebuild_max: a later notice asks */
+    if (jobs_alive(R_DST, fake) >= max) { /* rebuild_max: a later notice asks */
         if (!v->said_wait)
             say("volume %" PRIu32 ": needs a snapshot and waits: %u snapshots run on this server (rebuild_max)",
                 rv->number, max);
@@ -372,7 +411,8 @@ void rsnap_need(struct rvol *rv, int src)
         return;
     }
     j->role = R_DST, j->state = S_PREP, j->vol = rv->number, j->peer = node, j->fd = -1;
-    j->req = ((uint64_t)G.self << 40) ^ (++S.seq << 8) ^ (now & 0xff);
+    /* random: a source may still serve the request of this member's previous run, whose counter started where ours did */
+    j->req = rnd ^ ++S.seq;
     if (!j->req)
         j->req = 1;
     j->set_version = rv->rec.set_version, j->epoch = rv->epoch;
@@ -415,15 +455,20 @@ static void dst_man(struct rjob *j)
     for (size_t i = 0; rc == 0 && i < m.nfiles; i++)
         if (!m.files[i].link)
             total += m.files[i].size, nfiles++;
+    uint8_t *fdone = rc == 0 ? calloc(m.nfiles ? m.nfiles : 1, 1) : NULL;
+    if (rc == 0 && !fdone)
+        rc = TSDB_ERR_NOMEM;
     int space = rc == 0 && (G.mutant == RM_SNAPNOSPACECHECK || space_ok(total, &avail));
     pthread_mutex_lock(&S.mu);
     j->busy--;
     pthread_cond_broadcast(&S.cv);
+    if (j->dead || rc != 0 || !space)
+        free(fdone), fdone = NULL;
     if (j->dead) {
         snap_man_free(&m);
     } else if (rc != 0) {
         snap_man_free(&m);
-        dst_abandon(j, "its SNAPMAN does not read", 1);
+        dst_abandon(j, rc == TSDB_ERR_NOMEM ? "out of memory" : "its SNAPMAN does not read", 1);
     } else if (!space) {
         struct rvs *v = vs_get(j->vol);
         if (!v->said_space)
@@ -437,7 +482,7 @@ static void dst_man(struct rjob *j)
         v->retry_at = ms_now() + RS_BUSY_WAIT_MS;
         job_drop(j);
     } else {
-        j->man = m, j->have_man = 1;
+        j->man = m, j->have_man = 1, j->fdone = fdone;
         j->total = total, j->nleft = nfiles, j->state = S_FILES;
         j->last_ms = ms_now();
         vs_get(j->vol)->said_space = 0;
@@ -472,7 +517,12 @@ int rsnap_bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, 
         return 0;
     }
     const char *name = NULL;
-    if (idx == RS_MAN && j->state == S_ASKED && j->fd < 0 && total <= (64u << 20))
+    int redo = 0; /* begun again after its DONE was lost: the copy on disk is offered whole, hashed by the link */
+    if (j->fd < 0 && (j->state == S_FILES || j->state == S_COMPLETE) && G.mutant != RM_SNAPNODONEBITS &&
+        ((idx == RS_MAN && j->have_man) ||
+         (idx != RS_MAN && j->fdone && idx < j->man.nfiles && j->fdone[idx] && j->man.files[idx].size == total)))
+        name = idx == RS_MAN ? SNAP_MAN : j->man.files[idx].name, redo = 1;
+    else if (idx == RS_MAN && j->state == S_ASKED && j->fd < 0 && total <= (64u << 20))
         name = SNAP_MAN;
     else if (idx != RS_MAN && j->state == S_FILES && j->fd < 0 && idx < j->man.nfiles && !j->man.files[idx].link &&
              j->man.files[idx].size == total)
@@ -485,7 +535,10 @@ int rsnap_bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, 
     snprintf(path, sizeof path, "%s/%s", j->dir, name);
     j->busy++;
     pthread_mutex_unlock(&S.mu);
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = redo ? open(path, O_RDONLY | O_CLOEXEC) : open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    struct stat st;
+    if (redo && fd >= 0 && (fstat(fd, &st) != 0 || (uint64_t)st.st_size != total))
+        close(fd), fd = -1;
     pthread_mutex_lock(&S.mu);
     j->busy--;
     pthread_cond_broadcast(&S.cv);
@@ -493,15 +546,16 @@ int rsnap_bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, 
         if (fd >= 0)
             close(fd);
         else
-            dst_abandon(j, "a file could not be created", 1);
+            dst_abandon(j, redo ? "a file that was in could not be read again" : "a file could not be created", 1);
         pthread_mutex_unlock(&S.mu);
         return -1;
     }
-    j->fd = fd, j->cur_idx = idx, j->cur_file = file, j->cur_total = total, j->cur_l = l, j->got = 0;
+    j->fd = fd, j->cur_idx = idx, j->cur_file = file, j->cur_total = total, j->cur_l = l, j->got = redo ? total : 0;
+    j->cur_redo = redo;
     j->last_ms = ms_now();
     pl_xxh_init(&j->h);
-    *resume = 0;
-    *prefix_fd = -1;
+    *resume = redo ? total : 0;
+    *prefix_fd = redo ? fd : -1;
     pthread_mutex_unlock(&S.mu);
     return 0;
 }
@@ -566,6 +620,13 @@ void rsnap_bin_end(void *arg, struct plink *l, uint64_t file, int status)
         pthread_mutex_unlock(&S.mu);
         return;
     }
+    if (j->cur_redo) { /* the link checked the copy on disk against the sender's xxh64: it was counted already */
+        close(j->fd);
+        j->fd = -1, j->cur_redo = 0;
+        j->last_ms = ms_now();
+        pthread_mutex_unlock(&S.mu);
+        return;
+    }
     int fd = j->fd;
     uint32_t idx = j->cur_idx;
     uint64_t want = idx == RS_MAN ? 0 : j->man.files[idx].xxh64, got = pl_xxh_final(&j->h);
@@ -585,7 +646,7 @@ void rsnap_bin_end(void *arg, struct plink *l, uint64_t file, int status)
         dst_abandon(j, "a file could not be synced", 1);
     else if (G.mutant != RM_SNAPNOVERIFY && got != want)
         dst_abandon(j, "a file's xxh64 is not the one SNAPMAN names", 1);
-    else if (!j->dead && --j->nleft == 0) {
+    else if (!j->dead && (!j->fdone[idx] || G.mutant == RM_SNAPNODONEBITS) && (j->fdone[idx] = 1) && --j->nleft == 0) {
         j->state = S_COMPLETE;
         task_add(W_FINISH, j);
     }
@@ -601,6 +662,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
     uint32_t vol = get32(p), from = plink_peer(l);
     uint64_t setv = get64(p + 4), epoch = get64(p + 12), req = get64(p + 20);
     pthread_once(&hooks_once, hooks_read);
+    unsigned fake = (unsigned)fake_src();
     struct rvol *rv = vol_find(vol);
     if (!rv) {
         rs_send(from, RS_T_BUSY, vol, req, RS_B_STALE);
@@ -613,17 +675,18 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
         hook = access(hp, F_OK) == 0;
     }
     int why = 0, member = 0;
-    uint64_t rate = 0, max = 2;
+    uint64_t rate = 0, max = 2, my_setv = 0, my_epoch = 0;
     struct snap_epoch *hist = NULL;
     size_t nhist = 0;
     pthread_mutex_lock(&rv->mu);
     for (uint32_t k = 0; k < rv->rec.nrep; k++)
         member |= rv->rec.rep[k].node == from;
     int promoting = rv->mode == M_PROMOTING || (hook && rv->mode == M_WRITER);
+    my_setv = rv->rec.set_version, my_epoch = rv->epoch;
     if (promoting && G.mutant != RM_SNAPSRCPROMOTING)
         why = RS_B_PROMOTING; /* D2: no make before its writer engine is attached */
     else if (!member || rv->failed || (rv->mode != M_WRITER && rv->mode != M_PROMOTING) ||
-             setv != rv->rec.set_version || epoch != rv->epoch)
+             ((setv != rv->rec.set_version || epoch != rv->epoch) && G.mutant != RM_SNAPNOSTALE))
         why = RS_B_STALE;
     if (!why) {
         rate = (uint64_t)(rv->rec.rebuild_mb_s ? rv->rec.rebuild_mb_s : 200) << 20;
@@ -643,8 +706,17 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
     }
     if (j && j->peer == from)
         src_abort(j, "the receiver asked again"); /* it abandoned the old one */
-    if (!why && (jobs_alive() >= max || S.stopping))
+    if (!why && ((jobs_alive(R_SRC, fake) >= max && G.mutant != RM_SNAPNOSRCMAX) || S.stopping)) {
+        if (fake)
+            say("TEST: volume %" PRIu32 ": a source job is counted for <dir>/snapfakesrc (snapfakesrc)", vol);
         why = RS_B_MAX;
+    }
+    struct rvs *v = vs_get(vol);
+    if (why == RS_B_STALE && !v->said_stale)
+        say("volume %" PRIu32 ": a snapshot request from node %" PRIu32 " (set version %" PRIu64 ", epoch %" PRIu64
+            ") is refused as stale: this member has set version %" PRIu64 ", epoch %" PRIu64 " (said once until one"
+            " is served)", vol, from, setv, epoch, my_setv, my_epoch);
+    v->said_stale = why == RS_B_STALE;
     if (why || !(j = calloc(1, sizeof *j))) {
         STAT(busy, 1);
         pthread_mutex_unlock(&S.mu);
@@ -782,6 +854,11 @@ void rsnap_frame(struct plink *l, uint8_t type, const uint8_t *p, size_t n)
         dst_abandon(j, "the leader released it", 0);
         break;
     case RS_T_GO:
+        if (S.srcstall && !S.srcstalled) { /* TSDB_REPLD_TEST=snapsrcstall: this source sends nothing more */
+            S.srcstalled = 1;
+            say("TEST: volume %" PRIu32 ": the source for node %" PRIu32 " ignores GO (snapsrcstall)", vol, from);
+            break;
+        }
         if (j->state == S_WAITGO || j->state == S_MAN) {
             j->state = S_SENDING;
             j->last_ms = ms_now();
@@ -820,8 +897,9 @@ void rsnap_tick(struct rvol *rv)
         if (j->role == R_DST) {
             if (rv->mode != M_REPLICA)
                 dst_abandon(j, "this member is no longer a replica", 1);
-            else if (now - j->last_ms >= RS_STALL_MS && j->state != S_PREP && j->state != S_COMPLETE)
-                dst_abandon(j, "nothing arrived for 30 s", 1);
+            else if (now - j->last_ms >= S.stall_ms && j->state != S_PREP && j->state != S_COMPLETE &&
+                     G.mutant != RM_SNAPNOSTALL)
+                dst_abandon(j, "nothing arrived for 30 s (the stall timer)", 1);
             continue;
         }
         struct plink *l = NULL;
@@ -830,14 +908,17 @@ void rsnap_tick(struct rvol *rv)
             if (G.nodes[i].node == j->peer)
                 l = G.nodes[i].snap;
         pthread_mutex_unlock(&G.mu);
-        if (l && plink_up(l))
+        /* the link is dialed by the first file (SNAPMAN): a make sends nothing, however long it takes */
+        if ((l && plink_up(l)) || (j->state == S_MAKING && G.mutant != RM_SNAPMAKEDOWN))
             j->down_ms = 0;
         else if (!j->down_ms)
             j->down_ms = now;
         if (rv->mode != M_WRITER || rv->failed || rv->epoch != j->epoch)
             src_abort(j, "this leader lost the epoch it was made in");
-        else if (j->down_ms && now - j->down_ms >= RS_SRC_DOWN_MS)
+        else if (j->down_ms && now - j->down_ms >= S.down_ms && G.mutant != RM_SNAPNOSRCDOWN)
             src_abort(j, "the link to the receiver stayed down 60 s");
+        else if (j->state == S_WAITDONE && now - j->last_ms >= S.waitdone_ms && G.mutant != RM_SNAPNOWAITDONE) /* its DONE 0 or -1 was lost */
+            src_abort(j, "the receiver never said it had the last file (60 s)");
         else if (now - j->start_ms >= RS_SRC_MAX_MS)
             src_abort(j, "it is 6 hours old");
     }
@@ -906,6 +987,12 @@ static void w_make(struct rjob *j)
     struct snap_info info;
     memset(&info, 0, sizeof info);
     int rc = TSDB_ERR_UNAVAILABLE;
+    uint64_t slow = __atomic_exchange_n(&S.slowmake_ms, 0, __ATOMIC_RELAXED);
+    if (slow) { /* TSDB_REPLD_TEST=snapslowmake=MS: the first make takes that much longer (a big volume's hashes) */
+        say("TEST: volume %" PRIu32 ": the make sleeps %" PRIu64 " ms first (snapslowmake)", j->vol, slow);
+        struct timespec ts = {(time_t)(slow / 1000), (long)(slow % 1000) * 1000000};
+        nanosleep(&ts, NULL);
+    }
     char name[96];
     snprintf(name, sizeof name, SNAP_PREFIX "%" PRIu32 "_%016" PRIx64, j->peer, j->req);
     for (int a = 0; a < RS_MAKE_TRIES; a++) {
@@ -1023,6 +1110,15 @@ static void w_finish(struct rjob *j)
         snprintf(b, sizeof b, "%s/%s", j->dir, f->name);
         ok = link(a, b) == 0 || errno == EEXIST;
     }
+    for (size_t i = 0; ok && i < j->man.nfiles; i++) { /* a backstop of the count: every file there, whole */
+        char a[PATH_MAX + 32 + 130];
+        struct stat st;
+        snprintf(a, sizeof a, "%s/%s", j->dir, j->man.files[i].name);
+        if (stat(a, &st) != 0 || (uint64_t)st.st_size != j->man.files[i].size) {
+            say("volume %" PRIu32 ": the snapshot's %s is missing or not of the size SNAPMAN names", j->vol, a);
+            ok = 0;
+        }
+    }
     ok = ok && dir_sync(j->dir) == 0;
     uint64_t took = ms_now() - j->start_ms;
     if (!ok) {
@@ -1036,7 +1132,10 @@ static void w_finish(struct rjob *j)
         w_drop(j);
         return;
     }
-    rs_send(j->peer, RS_T_DONE, j->vol, j->req, 0);
+    if (S.nodone) /* TSDB_REPLD_TEST=snapnodone: the DONE 0 is lost; the source frees itself */
+        say("TEST: volume %" PRIu32 ": the DONE of the snapshot is not sent (snapnodone)", j->vol);
+    else
+        rs_send(j->peer, RS_T_DONE, j->vol, j->req, 0);
     STAT(received, 1);
     __atomic_store_n(&S.st.last_ms, took, __ATOMIC_RELAXED);
     say("volume %" PRIu32 ": snapshot received from node %" PRIu32 ": %zu files, %" PRIu64 " bytes in %.1f s (%.1f"

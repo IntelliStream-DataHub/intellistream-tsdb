@@ -41,6 +41,7 @@
 #include "../src/compat.h" /* macOS: accept4, SOCK_CLOEXEC; nothing on Linux */
 
 int peerlink_mutant;
+int peerlink_test_cut_end;
 
 #define TAG 32
 #define MS 1000000ull
@@ -1384,6 +1385,14 @@ static int conn_msg(void *arg, const struct pl_msg *m)
             c->rx.next != c->rx.total)
             return -1;
         int st = pl_xxh_final(&c->rx.h) == m->b || peerlink_mutant == PL_MUT_ENDHASH ? PL_OK : PL_E_HASH;
+        if (st == PL_OK && c->l && c->l->kind == PL_KIND_SNAP &&
+            __atomic_load_n(&peerlink_test_cut_end, __ATOMIC_RELAXED) > 0 &&
+            __atomic_sub_fetch(&peerlink_test_cut_end, 1, __ATOMIC_RELAXED) == 0) {
+            fprintf(stderr, "TEST: a kind-5 connection cut after the end of file %" PRIu64 ", before its DONE"
+                    " (snapcutdone)\n", m->file);
+            rx_end(c, st);
+            return -1; /* the connection goes down: the sender begins the file again on the next one */
+        }
         send_done(c, m->file, st);
         rx_end(c, st);
         return 0;

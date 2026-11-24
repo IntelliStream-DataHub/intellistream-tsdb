@@ -38,8 +38,14 @@
 # divergeisr (a volume whose DIVERGED file is set is not stopped: no LOCAL_FAULT, it stays in the ISR and may lead)
 # diverged (knob plantdiverge).
 # The snapshot transfer's (server/rsnap.c): snapnoverify (a received file not compared with SNAPMAN's xxh64; the
-# source sends one file with a flipped byte) snapxfer; snapsamelink (the files on kind 2, the COMMITs' link) snaplarge;
-# snapnospacecheck (no free-space check, D5) snapnospace; snapsrcpromoting (a source serves while promoting, D2) snapbusy.
+# source sends one file with a flipped byte) and snapmakedown (the link-down timer runs during the make) snapxfer;
+# snapsamelink (the files on kind 2, the COMMITs' link) snaplarge; snapnospacecheck (no free-space check, D5)
+# snapnospace; snapsrcpromoting (a source serves while promoting, D2) snapbusy; snapnosrcmax (a source past
+# rebuild_max) and snapsharedmax (sources and receivers in one count) snapbusy; snapnodonebits (a file begun again
+# after its lost DONE counted twice), snapnowaitdone (a lost DONE 0 holds the source for 6 h) and snapnostale (a stale
+# request served) snaplost; snapnostall (a receiver hearing nothing waits on) and snapnosrcdown (a source whose
+# receiver is gone kept) snapstall; snapnopeerchange is not planted: snapsrckill requires the new leader's notice to
+# end the old transfer.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -88,7 +94,15 @@ table=(
     "divergeisr|diverged|heartbeat never reported volume 1 LOCAL_FAULT"
     "snapnoverify|snapxfer|the copy with a flipped byte was not refused"
     "snapsamelink|snaplarge|a large insert of 2000000 rows took [0-9]+ ms while a snapshot moved"
-    "snapnospacecheck|snapnospace|a snapshot larger than the free space was not refused"
+    "snapnospacecheck|snapnospace|a snapshot whose size plus the margin exceeds the free space was not refused"
+    "snapnosrcmax|snapbusy|a leader running rebuild_max sources did not answer BUSY"
+    "snapsharedmax|snapbusy|the receiver did not ask while a source job ran on it"
+    "snapnodonebits|snaplost|the file begun again after its lost DONE broke the first copy"
+    "snapmakedown|snapxfer|the leader released a snapshot while making it"
+    "snapnowaitdone|snaplost|the leader kept waiting for a DONE that was lost"
+    "snapnostale|snaplost|a request of another set version was served"
+    "snapnostall|snapstall|the receiver of a stalled source did not leave it|the replica never received the snapshot"
+    "snapnosrcdown|snapstall|a source whose receiver is gone was not released"
     "snapsrcpromoting|snapbusy|a leader that is promoting did not answer BUSY"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )

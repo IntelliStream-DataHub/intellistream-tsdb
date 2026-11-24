@@ -194,7 +194,15 @@ enum {
     RM_SNAPNOVERIFY,    /* rsnap.c: a received file is not compared with SNAPMAN's xxh64 */
     RM_SNAPSAMELINK,    /* rsnap.c: a snapshot's files go on kind 2, the COMMITs' link (D7) */
     RM_SNAPNOSPACECHECK, /* rsnap.c: the receiver takes a snapshot whatever its free space (D5) */
-    RM_SNAPSRCPROMOTING  /* rsnap.c: a source serves a request while M_PROMOTING (D2) */
+    RM_SNAPSRCPROMOTING, /* rsnap.c: a source serves a request while M_PROMOTING (D2) */
+    RM_SNAPNODONEBITS,   /* rsnap.c: no per-file done bits: a file begun again after a lost DONE is counted twice */
+    RM_SNAPSHAREDMAX,    /* rsnap.c: rebuild_max counts sources and receivers together */
+    RM_SNAPMAKEDOWN,     /* rsnap.c: the source's link-down timer runs during the make */
+    RM_SNAPNOWAITDONE,   /* rsnap.c: a source waits for the receiver's DONE 0 for up to 6 hours */
+    RM_SNAPNOSTALE,      /* rsnap.c: a request of another set version or epoch is served */
+    RM_SNAPNOSTALL,      /* rsnap.c: a receiver that hears nothing waits on */
+    RM_SNAPNOSRCDOWN,    /* rsnap.c: a source whose receiver's link stays down is not released */
+    RM_SNAPNOSRCMAX      /* rsnap.c: a source serves past rebuild_max */
 };
 
 struct repld_g {
