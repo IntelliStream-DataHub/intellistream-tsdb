@@ -44,8 +44,8 @@ mode=${1:-quick}
 #     is the leader's own replay start), 47 snapatorbelow (a snapshot at or below the log end is wanted), 48 leaveflap
 #     (a leaving member is asked for again), 49 leaveunsafe (the move's shrink ignores its min_isr), 50 targetany (a
 #     planned promotion ignores its target: test_repl's `target`). The simulator kills 43-49 within 1000 seeds (its
-#     set changes, moves and replay starts, checks 9 and 10); 50 is left to test_repl (the simulator promotes without
-#     a target).
+#     set changes, moves and replay starts, checks 9 and 10), and 50 since r4-simtr (its transfers, check 11: the new
+#     leader is not the target).
 #     51-57 are test_repl's only, since the simulator's driver hands a META over in the step that reconfigures, drains
 #     every action before the next message, and filters records of other set versions before the core sees them:
 #     51 holdnever (a leader whose change removed a member of its record's ISR still counts without it), 52 adoptnosetv
@@ -54,14 +54,28 @@ mode=${1:-quick}
 #     (the unanswered set stays by index), 56 joinnoremap (the join index stays by index), 57 busykeep (a pending add of
 #     a removed member keeps the leader waiting for a later record). The line that sends a follower whose leader was
 #     removed to F_IDLE has no mutant: its leader index becomes -1, which no message matches, so it is equivalent.
+# The planned transfer (D14, r4-simtr; check 11). 60-62 are planted in the simulator's own driver and metadata
+#     model (SMUT in sim_repl.c), not in repl.c: 60 transfernodrain (READY at once, with the target's acknowledged end
+#     as the drained end: the promotion cuts the old leader's tail), 61 transferresume (the old leader admits again on
+#     its own timer, XF_WAIT after READY, and clears its hold: the checker's own hold, CHK_XF_CAP from READY, sees
+#     the write; also the cut of what it admitted, when the promotion succeeds), 62 transferfewreplies (only the
+#     target's fence reply goes to the promotion: members left `unanswered`), 63 transferstalecancel (an earlier
+#     transfer's CANCEL ends a later one's hold: runs with slow TRANSFER/CANCEL links make it happen).
+#     Not planted, because nothing can see them: the drain's `repl_peer_match(target) >= written` (with every fence
+#     reply the core's planned promotion refuses a target short of the end: an ordinary failover follows) and READY's
+#     end as repl_meta_promote_to's min_end (after a drain the target already holds it); test_repl's `target` (min_end)
+#     and `peer_match` cover the core's side. The TRANSFER half of 63's rule (a TRANSFER at or below the last CANCEL
+#     is ignored) is liveness only: a driver that takes it holds until the drain's bound or the hard cap.
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
 # 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 # 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41 43 44 45 46 47 48 49"
-all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41 43 44 45 46 47 48 49"
+quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41 43 44 45 46 47 48 49 50
+       60 61 62 63"
+all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41 43 44 45 46 47 48 49
+     50 60 61 62 63"
 # test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
 # run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen

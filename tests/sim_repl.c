@@ -48,6 +48,31 @@
  *     start that any member still holds, down members and the leader included (an empty log holds nothing to
  *     replay). A snapshot is installed only when the core still wants it (repl_snapshot_wanted), and then above the
  *     log end.
+ * 11. Planned transfers (D14; per run, at random, and to move off a leaving leader): the metadata group sends
+ *     TRANSFER(target, an ISR member) to the leader; the leader's driver refuses every write from then on (definite:
+ *     never admitted), waits up to XF_WAIT ticks for commit = written = the target's acknowledged durable end
+ *     (repl_peer_match), then sends READY(end); the metadata group fences every ISR member, waits for every reply (up
+ *     to XF_FENCE_WAIT) and promotes with all of them through repl_meta_promote_to(target, end); a promotion that does
+ *     not happen is dropped, CANCEL goes to the old leader and the failover goes on as an ordinary one. The old leader
+ *     admits again only on a CANCEL naming this transfer or a later one, a lost epoch (a fence deposes it), a drain
+ *     that timed out before READY, or the hard cap (10 x XF_WAIT after READY). A new metadata leader (an event)
+ *     forgets its transfers and sends CANCEL to every node. Faults of their own: in some runs the metadata leader
+ *     stalls on a READY (up to 2 x XF_CAP: the hard cap ends the hold first, and the promotion then cuts what the old
+ *     leader admitted after it), and TRANSFER and CANCEL take up to 170 ticks more (a CANCEL arrives after a later
+ *     TRANSFER, or before its own). Checked, by the checker's own account of each hold (the TRANSFER and CANCEL
+ *     delivered, the first READY sent, the core's epoch, and its own bounds CHK_XF_WAIT and CHK_XF_CAP, never the
+ *     driver model's flags or timers): no write is admitted while a hold binds; after a successful transfer the new
+ *     leader is the target and no member is `unanswered`; no replica of the new epoch cuts a record the old leader
+ *     had written before READY (the drain left nothing uncommitted) or admitted after READY within the hard cap; a
+ *     write admitted after the cap may be cut (counted; it was never acknowledged, which the TRUNCATE check proves).
+ *     A run of XF_FLOOR_SEEDS seeds or more fails when no READY, no transfer done, no hard cap, no write after it,
+ *     no cut of one or no stale CANCEL happened.
+ *     Planned bugs of the driver model (not repl.c): 60 transfernodrain (READY at once, with the target's match as
+ *     the end), 61 transferresume (the old leader's hold ends on its own timer, XF_WAIT after READY), 62
+ *     transferfewreplies (only the target's fence reply goes to the promotion), 63 transferstalecancel (any CANCEL
+ *     ends the hold, an earlier transfer's too). The simulator draws transfer ids from one counter; tsdbd needs them
+ *     to increase across metadata leaders too (from the replicated state), or CANCEL(<= x) and the driver's ignored
+ *     TRANSFERs mean nothing.
  *
  * `sim_repl --seeds N [--first S] [--ticks T]`; a failure prints the seed, `--seed S --trace` replays it. Built with
  * -DREPL_MUTANTS (build/sim_repl_mut), `--mutant M` plants bug M of repl.c and runs seeds until the checker
@@ -71,6 +96,25 @@
 #define NODE_TIMEOUT  40
 #define WATCH_TICKS   10
 #define FENCE_WAIT    15
+#define XF_WAIT       40      /* transfer_wait_ms: the drain's bound */
+#define XF_CAP        (10 * XF_WAIT) /* after READY: the old leader admits again on its own only after this */
+#define XF_READY_WAIT (XF_WAIT + 30) /* the metadata group cancels a transfer without READY after this */
+#define XF_FENCE_WAIT (3 * FENCE_WAIT) /* a planned promotion waits this long for every fence reply */
+/* The checker's own numbers for D14's hold (transfer_wait_ms and its hard cap of 10 x it): written out, never derived
+ * from XF_WAIT and XF_CAP, so that a driver model that gets its timers wrong fails instead of moving the check along. */
+#define CHK_XF_WAIT   40
+#define CHK_XF_CAP    400
+#define XF_FLOOR_SEEDS 2000 /* a run of this many seeds or more fails when a transfer path never ran */
+#define SIM_TRANSFER  101     /* metadata -> leader: xid, xnid (the target) */
+#define SIM_READY     102     /* leader -> metadata: xid, xend */
+#define SIM_CANCEL    103     /* metadata -> node: every transfer up to xid */
+
+/* Planned bugs of the simulator's own driver model (the transfer, check 11): bits 60-62 of --mutant. */
+#ifdef REPL_MUTANTS
+#define SMUT(n) ((repl_mutants >> (n)) & 1)
+#else
+#define SMUT(n) 0
+#endif
 
 struct srec {
     uint64_t pos, epoch, id, wseq;
@@ -95,6 +139,15 @@ struct node {
     uint64_t applied, last_epoch;
     size_t *pend;             /* indexes into ops of writes waiting for their reply */
     size_t npend, cpend;
+    struct {                  /* the driver's planned transfer (D14), in memory only */
+        int on, ready, tnid;
+        uint64_t xid, epoch, at, ready_at, end;
+    } xf;
+    uint64_t xf_cancelled;    /* the highest transfer a CANCEL named (a TRANSFER it overtook is ignored) */
+    struct {                  /* the checker's view of D14's hold, from the messages alone; never read by the driver */
+        int on, ready, tnid;
+        uint64_t xid, epoch, at, ready_at, cancelled;
+    } xw;
 };
 
 struct smsg {
@@ -103,6 +156,8 @@ struct smsg {
     struct repl_rec *rec;
     uint64_t *ids;
     uint64_t at;
+    uint64_t xid, xend;       /* SIM_TRANSFER, SIM_READY, SIM_CANCEL */
+    int xnid;
 };
 
 enum { OP_PENDING, OP_OK, OP_UNKNOWN };
@@ -146,6 +201,31 @@ static struct sim {
     int fo_off;               /* nid of a leaving leader this failover moves off (a planned transfer, D14), 0: none */
     struct repl_fence_reply rep[NM];
     int nrep;
+    int fo_planned, fo_tnid;  /* a planned promotion (D14): its target (nid), READY's end, the transfer */
+    uint64_t fo_end, fo_xid;
+    struct {                  /* the metadata group's transfer: 1 TRANSFER sent, 2 fencing after READY */
+        int phase, lnid, tnid;
+        uint64_t xid, epoch, at;
+    } xf;
+    uint64_t next_xid;
+    int xfer_on;              /* per run: transfers at random, xrate per mille a tick */
+    int xf_answer;            /* per run: READY for a transfer the group does not hold is answered with CANCEL (else
+                                 its leader holds until the hard cap) */
+    uint32_t xrate;
+    uint64_t meta_pause_until; /* the metadata leader stalls (a GC pause, a slow disk): it neither ticks nor reads */
+    uint32_t xf_stall;        /* per run: per mille of READYs the metadata leader stalls on, for up to 2 x XF_CAP */
+    uint32_t xf_slow;         /* per run: TRANSFER and CANCEL take up to this many ticks more (stale CANCELs) */
+    uint64_t xdelay;          /* extra delay of the message being enqueued */
+    uint64_t xstall_xid;      /* the transfer the last stall was on (one stall per transfer) */
+    /* Check 11: the old leader's records above its commit point when it sent READY (none, with a drain) and every
+     * write it admitted after READY (`late`: after CHK_XF_CAP, which a promotion may cut), and once its transfer
+     * succeeded, the epoch whose replicas must not cut the others. */
+    struct {
+        uint64_t xid, epoch, *pos, *id;
+        unsigned char *late;
+        size_t n, cap;
+        int on;
+    } xc;
     /* clients */
     struct op *ops;
     size_t nops, cops;
@@ -168,7 +248,8 @@ static struct sim {
         uint64_t acked, refused, unknown, promotions, stale, none, resigns, cuts, isr, crashes, wipes, parts, pauses,
             moves, msgs, applied, waits, refuses, xcuts, ack_isr1, ack_isrn, wiped_acked, wipe_leader,
             fence_rep_out, deg_runs, deg_ok, trims, snaps, lies, floors, adds, removes, resets, mvdone, reconfs,
-            restarts, xver, leaves, leavereq, replays, planned;
+            restarts, xver, leaves, leavereq, replays, planned, xfers, xready, xdone, xcancels, xdrainout, xcap,
+            xrefused, xfailover, metachg, xstalls, xlate, xlatecuts, xstale;
     } st, tot;
 } S;
 
@@ -401,7 +482,7 @@ static void enqueue(struct smsg *m, int from, int to)
         return;
     }
     S.st.msgs++;
-    m->at = S.now + 1 + rn(S.maxdelay);
+    m->at = S.now + 1 + rn(S.maxdelay) + S.xdelay;
     S.q = grow(S.q, &S.cq, S.nq + 2, sizeof *S.q);
     S.q[S.nq++] = *m;
     if (chance(S.dup)) {
@@ -414,7 +495,7 @@ static void enqueue(struct smsg *m, int from, int to)
             memcpy(d.rec, m->rec, m->m.nrec * sizeof *d.rec);
             memcpy(d.ids, m->ids, m->m.nrec * sizeof *d.ids);
         }
-        d.at = S.now + 1 + rn(S.maxdelay * 3);
+        d.at = S.now + 1 + rn(S.maxdelay * 3) + S.xdelay;
         S.q[S.nq++] = d;
     }
 }
@@ -565,6 +646,106 @@ static void reply(int i, const struct repl_action *a)
     violation("node %d replied for %" PRIu64 ", which no writer waits for", i, a->first);
 }
 
+/* ------------------------------------------------------------------ check 11: D14's hold, as the checker sees it */
+
+/* The checker keeps its own account of each leader's hold, from what the driver must obey (the TRANSFER and CANCEL it
+ * was delivered, the READY it sent, its core's epoch) and the spec's bounds (CHK_XF_WAIT, CHK_XF_CAP), never from the
+ * driver model's flags: a driver that lets go too early is caught by the write it admits. */
+static void xc_add(uint64_t pos, uint64_t id, unsigned char late)
+{
+    if (S.xc.n == S.xc.cap) {
+        S.xc.cap = S.xc.cap ? 2 * S.xc.cap : 16;
+        S.xc.pos = realloc(S.xc.pos, S.xc.cap * sizeof *S.xc.pos);
+        S.xc.id = realloc(S.xc.id, S.xc.cap * sizeof *S.xc.id);
+        S.xc.late = realloc(S.xc.late, S.xc.cap * sizeof *S.xc.late);
+        if (!S.xc.pos || !S.xc.id || !S.xc.late)
+            exit(2);
+    }
+    S.xc.pos[S.xc.n] = pos;
+    S.xc.id[S.xc.n] = id;
+    S.xc.late[S.xc.n++] = late;
+}
+
+/* A TRANSFER for its epoch, newer than any CANCEL and any transfer it holds, binds the leader it reaches. */
+static void chk_transfer(int i, const struct smsg *sm)
+{
+    struct node *nd = &S.node[i];
+    if (!nd->r || !repl_is_leader(nd->r) || repl_epoch(nd->r) != sm->m.epoch || sm->xid <= nd->xw.cancelled ||
+        (nd->xw.on && nd->xw.xid >= sm->xid))
+        return;
+    nd->xw.on = 1;
+    nd->xw.ready = 0;
+    nd->xw.xid = sm->xid;
+    nd->xw.epoch = sm->m.epoch;
+    nd->xw.at = S.now;
+    nd->xw.tnid = sm->xnid;
+}
+
+/* A CANCEL ends the hold of its transfer and of every earlier one, never of a later one. */
+static void chk_cancel(int i, const struct smsg *sm)
+{
+    struct node *nd = &S.node[i];
+    if (sm->xid > nd->xw.cancelled)
+        nd->xw.cancelled = sm->xid;
+    if (nd->xw.on && nd->xw.xid <= sm->xid)
+        nd->xw.on = 0;
+}
+
+/* The leader sends its first READY for the transfer it holds: from now on only the hard cap lets it admit on its own.
+ * Check 11's record starts with what it has above its commit point (nothing, after a drain); it replaces the last
+ * transfer's (one transfer is checked at a time). */
+static void chk_ready(int i, uint64_t xid)
+{
+    struct node *nd = &S.node[i];
+    if (!nd->xw.on || nd->xw.xid != xid || nd->xw.ready)
+        return;
+    nd->xw.ready = 1;
+    nd->xw.ready_at = S.now;
+    uint64_t c = repl_commit(nd->r);
+    S.xc.on = 0;
+    S.xc.xid = xid;
+    S.xc.n = 0;
+    for (size_t k = nd->n; k > 0 && nd->log[k - 1].pos + nd->log[k - 1].n - 1 > c; k--)
+        xc_add(nd->log[k - 1].pos, nd->log[k - 1].id, 0);
+}
+
+/* Whether node i's hold still binds. It ends (lazily, here) with the epoch it was given for, and before READY at the
+ * drain's bound or once the target left the set. */
+static int chk_held(int i)
+{
+    struct node *nd = &S.node[i];
+    if (!nd->xw.on)
+        return 0;
+    if (!nd->r || !repl_is_leader(nd->r) || repl_epoch(nd->r) != nd->xw.epoch ||
+        (!nd->xw.ready && (S.now - nd->xw.at >= CHK_XF_WAIT ||
+                           idx_in(repl_get_set_version(nd->r), nd->xw.tnid) < 0))) {
+        nd->xw.on = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* A client write the core admitted on node i (pos: its first position). */
+static void chk_admit(int i, uint64_t id, uint64_t pos)
+{
+    struct node *nd = &S.node[i];
+    if (!chk_held(i))
+        return;
+    int late = nd->xw.ready && S.now - nd->xw.ready_at >= CHK_XF_CAP;
+    if (nd->xw.ready && S.xc.xid == nd->xw.xid)
+        xc_add(pos, id, late ? 2 : 1);
+    if (late) {
+        S.st.xlate++; /* D14: after the hard cap; a promotion that still comes may cut it (never acknowledged) */
+        return;
+    }
+    if (nd->xw.ready)
+        violation("node %d admits write %" PRIu64 " %" PRIu64 " ticks after READY of transfer %" PRIu64
+                  " (hard cap %d)", i, id, S.now - nd->xw.ready_at, nd->xw.xid, CHK_XF_CAP);
+    else
+        violation("node %d admits write %" PRIu64 " while transfer %" PRIu64 " holds it (TRANSFER %" PRIu64
+                  " ticks ago, no READY)", i, id, nd->xw.xid, S.now - nd->xw.at);
+}
+
 static void drive(int i, const struct smsg *cur)
 {
     struct node *nd = &S.node[i];
@@ -579,6 +760,7 @@ static void drive(int i, const struct smsg *cur)
             uint64_t id;
             if (a.src == REPL_SRC_CLIENT) {
                 id = S.cur_op;
+                chk_admit(i, id, a.rec.pos);
             } else if (a.src == REPL_SRC_EPOCH) {
                 id = ++S.next_marker | 1ull << 62;
                 trace("node %d: EPOCH %" PRIu64 " marker at %" PRIu64, i, a.rec.epoch, a.rec.pos);
@@ -627,6 +809,20 @@ static void drive(int i, const struct smsg *cur)
                               " (committed by epoch %" PRIu64 ")", i, e, S.cacked[p] ? "acknowledged" : "committed",
                               nd->log[j].id, p, S.cepoch[p]);
             }
+            /* Check 11: once its transfer succeeded, nothing the old leader wrote before READY or admitted after it
+             * within the hard cap is cut; what it admitted after the cap may be (D14: counted). */
+            for (size_t j = keep; S.xc.on && e >= S.xc.epoch && j < nd->n; j++)
+                for (size_t q = 0; q < S.xc.n; q++) {
+                    if (S.xc.pos[q] != nd->log[j].pos || S.xc.id[q] != nd->log[j].id)
+                        continue;
+                    if (S.xc.late[q] == 2) {
+                        S.st.xlatecuts++;
+                        continue;
+                    }
+                    violation("node %d (epoch %" PRIu64 ") cuts record %" PRIu64 " at %" PRIu64 ", %s READY of "
+                              "transfer %" PRIu64, i, e, nd->log[j].id, nd->log[j].pos,
+                              S.xc.late[q] ? "admitted within the hard cap after" : "written before", S.xc.xid);
+                }
             trace("node %d: cut after %" PRIu64 " (end was %" PRIu64 ")", i, a.pos, log_end(nd));
             nd->n = keep;
             if (nd->ndur > keep)
@@ -722,6 +918,11 @@ static void node_open(int i)
     nd->last_epoch = 0;
     nd->sync_busy = 0;
     nd->pause_until = 0;
+    /* A transfer lives in the driver's memory, the highest CANCEL too: after a restart a late TRANSFER of an earlier
+     * transfer is no longer known as cancelled; it is refused only because the core leads no epoch it names (every
+     * epoch this core leads begins after the open). */
+    memset(&nd->xf, 0, sizeof nd->xf);
+    nd->xf_cancelled = 0;
     trace("node %d: open, log end %" PRIu64 " fence %" PRIu64 " led %" PRIu64 " floor %" PRIu64, i, log_end(nd),
           nd->fence, nd->led, nd->floor);
     drive(i, NULL);
@@ -819,6 +1020,111 @@ static void node_snapshot(int i)
     node_open(i);
 }
 
+/* ------------------------------------------------------------------ planned transfers (D14): the driver's side */
+
+static void xf_release(int i, const char *why)
+{
+    struct node *nd = &S.node[i];
+    if (!nd->xf.on)
+        return;
+    nd->xf.on = 0;
+    trace("node %d: transfer %" PRIu64 " over (%s): admits again", i, nd->xf.xid, why);
+}
+
+/* Whether the driver admits a write: never while a transfer holds it. */
+static int xf_admits(int i)
+{
+    return !S.node[i].xf.on;
+}
+
+static void xf_send_ready(int i)
+{
+    struct node *nd = &S.node[i];
+    struct smsg m = {.from_nid = nd->nid, .to_nid = -1, .xid = nd->xf.xid, .xend = nd->xf.end};
+    m.m.type = SIM_READY;
+    m.m.from = i;
+    m.m.to = REPL_META;
+    m.m.epoch = nd->xf.epoch;
+    m.m.set_version = repl_get_set_version(nd->r);
+    chk_ready(i, nd->xf.xid);
+    enqueue(&m, i, META);
+}
+
+static void xf_ready(int i, uint64_t end)
+{
+    struct node *nd = &S.node[i];
+    nd->xf.ready = 1;
+    nd->xf.ready_at = S.now;
+    nd->xf.end = end;
+    S.st.xready++;
+    trace("node %d: READY for transfer %" PRIu64 " at %" PRIu64 " (written %" PRIu64 ", commit %" PRIu64 ")", i,
+          nd->xf.xid, end, repl_written(nd->r), repl_commit(nd->r));
+    xf_send_ready(i);
+}
+
+/* Each tick on an alive node: the drain, READY (sent again while it waits), and the ends of a transfer's hold. */
+static void xf_tick(int i)
+{
+    struct node *nd = &S.node[i];
+    if (!nd->xf.on || !nd->r)
+        return;
+    if (!repl_is_leader(nd->r) || repl_epoch(nd->r) != nd->xf.epoch) {
+        xf_release(i, "lost its epoch");
+        return;
+    }
+    if (nd->xf.ready) {
+        if (S.now - nd->xf.ready_at >= XF_CAP || (SMUT(61) && S.now - nd->xf.ready_at >= XF_WAIT)) {
+            S.st.xcap++; /* transferresume, planted: its own timer, XF_WAIT after READY, ends the hold */
+            xf_release(i, "hard cap");
+        } else if ((S.now - nd->xf.ready_at) % 10 == 0) {
+            xf_send_ready(i);
+        }
+        return;
+    }
+    int t = idx_in(repl_get_set_version(nd->r), nd->xf.tnid);
+    uint64_t w = repl_written(nd->r);
+    if (t >= 0 && SMUT(60)) {
+        xf_ready(i, repl_peer_match(nd->r, t)); /* planted: READY at once, the target's end as the drained end */
+        return;
+    }
+    if (t >= 0 && nd->xf.tnid != nd->nid && repl_commit(nd->r) == w &&
+        repl_peer_match(nd->r, t) >= w) {
+        xf_ready(i, w);
+        return;
+    }
+    if (t < 0 || S.now - nd->xf.at >= XF_WAIT) {
+        S.st.xdrainout++;
+        xf_release(i, t < 0 ? "target gone" : "drain timed out");
+    }
+}
+
+/* SIM_TRANSFER and SIM_CANCEL, which the driver handles (the core never sees them). */
+static void xf_recv(int i, const struct smsg *sm)
+{
+    struct node *nd = &S.node[i];
+    if (sm->m.type == SIM_CANCEL) {
+        if (sm->xid > nd->xf_cancelled)
+            nd->xf_cancelled = sm->xid;
+        if (nd->xf.on && nd->xf.xid > sm->xid)
+            S.st.xstale++; /* an earlier transfer's CANCEL, overtaken by a later TRANSFER */
+        if (nd->xf.on && (nd->xf.xid <= sm->xid || SMUT(63))) /* transferstalecancel, planted: any CANCEL */
+            xf_release(i, "CANCEL");
+        return;
+    }
+    /* A TRANSFER for another epoch, one already cancelled (a CANCEL that overtook it) or older than the one held */
+    if (!repl_is_leader(nd->r) || repl_epoch(nd->r) != sm->m.epoch || sm->xid <= nd->xf_cancelled ||
+        (nd->xf.on && nd->xf.xid >= sm->xid))
+        return;
+    nd->xf.on = 1;
+    nd->xf.ready = 0;
+    nd->xf.xid = sm->xid;
+    nd->xf.epoch = sm->m.epoch;
+    nd->xf.at = S.now;
+    nd->xf.tnid = sm->xnid;
+    trace("node %d: TRANSFER %" PRIu64 " to nid %d: stops admitting", i, sm->xid, sm->xnid);
+    xf_tick(i);
+}
+
 /* ------------------------------------------------------------------ the metadata group */
 
 static void fo_begin(const char *why)
@@ -831,6 +1137,7 @@ static void fo_begin(const char *why)
     S.fo_fenced = S.vm.isr;
     S.fo_start = S.now;
     S.fo_off = 0;
+    S.fo_planned = 0;
     S.nrep = 0;
     trace("meta: failover of epoch %" PRIu64 " (%s), fencing isr %#x", S.vm.epoch, why, S.vm.isr);
     for (int i = 0; i < S.nn; i++)
@@ -845,24 +1152,171 @@ static void meta_isr_changed(uint32_t old, const uint64_t *oldrid)
             check_node(i, 1, S.cmax);
 }
 
+/* The metadata group's side of a planned transfer (D14). */
+static void xf_meta_send(int to, int type, uint64_t xid, int xnid)
+{
+    if (to < 0)
+        return;
+    struct smsg m = {.from_nid = -1, .to_nid = S.node[to].nid, .xid = xid, .xnid = xnid};
+    m.m.type = type;
+    m.m.from = REPL_META;
+    m.m.to = to;
+    m.m.set_version = S.setv;
+    m.m.epoch = S.vm.epoch;
+    m.m.leader = -1;
+    S.xdelay = S.xf_slow ? rn(S.xf_slow) : 0;
+    enqueue(&m, META, to);
+    S.xdelay = 0;
+}
+
+static void xf_abort(const char *why)
+{
+    if (S.xf.phase != 1)
+        return;
+    trace("meta: transfer %" PRIu64 " cancelled (%s)", S.xf.xid, why);
+    S.st.xcancels++;
+    xf_meta_send(slot_of(S.xf.lnid), SIM_CANCEL, S.xf.xid, 0);
+    S.xf.phase = 0;
+}
+
+static void xf_start(int t)
+{
+    int l = S.vm.leader;
+    if (S.fo || S.xf.phase || l < 0 || t < 0 || t >= S.nn || t == l || !(S.vm.isr & (1u << t)))
+        return;
+    S.xf.phase = 1;
+    S.xf.lnid = S.node[l].nid;
+    S.xf.tnid = S.node[t].nid;
+    S.xf.xid = ++S.next_xid;
+    S.xf.epoch = S.vm.epoch;
+    S.xf.at = S.now;
+    S.st.xfers++;
+    trace("meta: transfer %" PRIu64 " of epoch %" PRIu64 " from node %d to node %d", S.xf.xid, S.vm.epoch, l, t);
+    xf_meta_send(l, SIM_TRANSFER, S.xf.xid, S.xf.tnid);
+}
+
+static void meta_ready(const struct smsg *sm)
+{
+    int l = slot_of(sm->from_nid);
+    if (S.xf.phase != 1 || sm->xid != S.xf.xid) {
+        /* READY for a transfer this group does not hold (cancelled, done, or forgotten by a new metadata leader): its
+         * leader would hold until the hard cap. A repeat of the one being fenced is ignored. */
+        if (S.xf_answer && !(S.xf.phase == 2 && sm->xid == S.xf.xid))
+            xf_meta_send(l, SIM_CANCEL, sm->xid, 0);
+        return;
+    }
+    if (S.xf_stall && sm->xid != S.xstall_xid && chance(S.xf_stall)) {
+        S.xstall_xid = sm->xid;
+        /* The metadata leader stalls with READY in hand (a pause, a slow disk) for up to twice the hard cap: the old
+         * leader's cap ends its hold first, and the promotion, when it comes, cuts what it admitted since. */
+        S.meta_pause_until = S.now + XF_CAP / 2 + rn(2 * XF_CAP);
+        S.st.xstalls++;
+        trace("meta: stalls until %" PRIu64 " with READY of transfer %" PRIu64, S.meta_pause_until, sm->xid);
+        S.q = grow(S.q, &S.cq, S.nq + 1, sizeof *S.q);
+        S.q[S.nq] = *sm; /* read again after the stall (no records to own) */
+        S.q[S.nq++].at = S.now + 1;
+        return;
+    }
+    int t = slot_of(S.xf.tnid);
+    if (S.fo || l < 0 || l != S.vm.leader || sm->m.epoch != S.vm.epoch || t < 0 || !(S.vm.isr & (1u << t))) {
+        xf_abort("READY no longer fits the record");
+        return;
+    }
+    fo_begin("planned transfer");
+    S.fo_planned = 1;
+    S.fo_tnid = S.xf.tnid;
+    S.fo_end = sm->xend;
+    S.fo_xid = S.xf.xid;
+    S.xf.phase = 2;
+}
+
+/* A new metadata leader: the transfers lived in the old one's memory. A planned promotion under way goes on as an
+ * ordinary failover (its fences are out: the old leader is deposed), and every node is told CANCEL. */
+static void meta_new_leader(void)
+{
+    S.st.metachg++;
+    trace("meta: new metadata leader: transfers forgotten, CANCEL to every node");
+    S.xf.phase = 0;
+    S.meta_pause_until = 0; /* a stalled leader is replaced */
+    if (S.fo && S.fo_planned) {
+        S.fo_planned = 0;
+        S.st.xfailover++;
+    }
+    if (!S.xf_answer && chance(500)) /* and lost its lead again before its first duty round: the hard cap ends it */
+        return;
+    for (int i = 0; i < S.nn; i++)
+        xf_meta_send(i, SIM_CANCEL, S.next_xid, 0);
+}
+
 static void meta_tick(void)
 {
     if (S.now % WATCH_TICKS == 0)
         meta_broadcast();
     if (!S.fo && S.vm.leader >= 0 && S.now - S.last_hb[S.vm.leader] > NODE_TIMEOUT)
         fo_begin("leader silent");
-    if (!S.fo || (S.nrep < popcount32(S.fo_fenced) && S.now - S.fo_start < FENCE_WAIT))
+    if (S.xf.phase == 1 && (S.fo || S.vm.epoch != S.xf.epoch || slot_of(S.xf.lnid) != S.vm.leader ||
+                            S.now - S.xf.at > XF_READY_WAIT))
+        xf_abort(S.fo ? "a failover" : S.now - S.xf.at > XF_READY_WAIT ? "no READY" : "the record moved");
+    if (!S.fo)
         return;
     uint32_t old = S.vm.isr;
     uint64_t oldrid[NM];
     memcpy(oldrid, S.vm.rid, sizeof oldrid);
+    int rc = REPL_E_NONE, target = -1, planned = 0;
+    if (S.fo_planned) {
+        /* D14: every fenced member's reply, the old leader's included, so that none is left `unanswered` */
+        uint32_t got = 0;
+        for (int k = 0; k < S.nrep; k++)
+            got |= 1u << S.rep[k].node;
+        int t = slot_of(S.fo_tnid);
+        if ((S.fo_fenced & ~got) && t >= 0 && S.now - S.fo_start < XF_FENCE_WAIT)
+            return;
+        if (!(S.fo_fenced & ~got) && t >= 0) {
+            struct repl_fence_reply one[1];
+            const struct repl_fence_reply *rp = S.rep;
+            int n = S.nrep;
+            if (SMUT(62)) { /* planted: only the target's reply */
+                n = 0;
+                for (int k = 0; k < S.nrep; k++)
+                    if (S.rep[k].node == t)
+                        one[n++] = S.rep[k];
+                rp = one;
+            }
+            rc = repl_meta_promote_to(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, rp, n, t, S.fo_end);
+            planned = rc == REPL_OK;
+            if (planned) {
+                S.st.xdone++;
+                trace("meta: transfer %" PRIu64 " done: epoch %" PRIu64 " leader %d", S.fo_xid, S.vm.epoch,
+                      S.vm.leader);
+                if (S.vm.leader != t)
+                    violation("transfer %" PRIu64 " to node %d promoted node %d", S.fo_xid, t, S.vm.leader);
+                if (S.vm.unanswered)
+                    violation("transfer %" PRIu64 " left members %#x unanswered", S.fo_xid, S.vm.unanswered);
+                if (S.xc.xid == S.fo_xid) {
+                    S.xc.on = 1;
+                    S.xc.epoch = S.vm.epoch;
+                }
+            }
+        }
+        if (!planned) {
+            /* Dropped: CANCEL, and the failover goes on as an ordinary one (the old leader is fenced) */
+            S.st.xfailover++;
+            trace("meta: transfer %" PRIu64 " dropped (%s): an ordinary failover", S.fo_xid,
+                  t < 0 ? "target gone" : rc == REPL_E_NONE && !(S.fo_fenced & ~got) ? "target short" : "replies");
+            xf_meta_send(slot_of(S.xf.lnid), SIM_CANCEL, S.fo_xid, 0);
+        }
+        S.fo_planned = 0;
+        S.xf.phase = 0;
+    }
+    if (!planned && S.nrep < popcount32(S.fo_fenced) && S.now - S.fo_start < FENCE_WAIT)
+        return;
     /* Moving off a leaving leader: the target is the replier (other than it) with the highest durable end. A fenced
      * ISR member with the record's rid holds every committed position (the commit point is the ISR's lowest match), so
      * only the leaving leader's uncommitted tail, never acknowledged, is cut. Asking for the highest end of all replies
      * instead (D14's drained end) failed while clients kept the leader ahead: the old leader won every retry (seeds
      * 14328, 39648 and 7 more of 100,000); the drain before the fence is r4-simtr's. Without such a reply, the usual
      * choice, which may pick the leaving member again: the mover then tries once more. */
-    int target = -1, off = S.fo_off ? slot_of(S.fo_off) : -1;
+    int off = S.fo_off && !planned ? slot_of(S.fo_off) : -1;
     for (int i = 0; off >= 0 && i < S.nrep; i++) {
         int nd = S.rep[i].node;
         if (nd < 0 || nd >= S.nn || nd == off || !(S.vm.isr & S.fo_fenced & (1u << nd)) || S.rep[i].rid != S.vm.rid[nd])
@@ -870,7 +1324,8 @@ static void meta_tick(void)
         if (target < 0 || S.rep[i].durable > S.rep[target].durable)
             target = i;
     }
-    int rc = target >= 0 ? repl_meta_promote_to(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep,
+    if (!planned)
+        rc = target >= 0 ? repl_meta_promote_to(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep,
                                                 S.rep[target].node, S.rep[target].durable)
                          : repl_meta_promote(&S.vm, S.fo_epoch, S.fo_version, S.fo_fenced, S.rep, S.nrep);
     if (rc == REPL_OK && target >= 0)
@@ -911,6 +1366,10 @@ static void meta_recv(const struct smsg *sm)
         int s = slot_of(sm->from_nid);
         if (s >= 0)
             S.last_hb[s] = S.now;
+        return;
+    }
+    if (m->type == SIM_READY) {
+        meta_ready(sm);
         return;
     }
     /* Indexes name members only within one set version (D8). */
@@ -1014,6 +1473,14 @@ static void node_recv(int i, struct smsg *sm)
     struct node *nd = &S.node[i];
     struct repl_msg *m = &sm->m;
     m->rec = sm->rec;
+    if (m->type == SIM_TRANSFER || m->type == SIM_CANCEL) {
+        if (m->type == SIM_TRANSFER)
+            chk_transfer(i, sm);
+        else
+            chk_cancel(i, sm);
+        xf_recv(i, sm);
+        return;
+    }
     if (m->from == REPL_META && m->type == REPL_M_META) {
         uint64_t cv = repl_get_set_version(nd->r);
         if (m->set_version < cv)
@@ -1064,6 +1531,11 @@ static void client_write(void)
         return;
     int i = nl && chance(850) ? lead[rn(nl)] : cand[rn(nc)];
     struct node *nd = &S.node[i];
+    if (!xf_admits(i)) { /* D14: refused before anything is written, a definite answer */
+        S.st.refused++;
+        S.st.xrefused++;
+        return;
+    }
     S.ops = grow(S.ops, &S.cops, S.nops + 1, sizeof *S.ops);
     struct op *o = &S.ops[S.nops];
     *o = (struct op){.id = S.nops + 1, .n = 1 + rn(4), .node = i, .status = OP_PENDING, .at = S.now};
@@ -1215,9 +1687,17 @@ static void mover(void)
          * or the move never ends: seeds 31511, 37712 and 14 more of 100,000 before), but only once another member is
          * in the ISR: with the leaving one alone there, every retry promoted it again and kept the others from
          * joining (seeds 89586, 75053 and 4 more). */
-        if (!S.fo && (S.vm.isr & ~(1u << l)) && (!S.chaos || chance(20))) {
-            fo_begin("moving off a leaving member");
-            S.fo_off = S.mv.a;
+        if (!S.fo && !S.xf.phase && (S.vm.isr & ~(1u << l)) && (!S.chaos || chance(20))) {
+            if (S.xfer_on && chance(500)) { /* D14's transfer, to a random other ISR member */
+                int c[NM], n = 0;
+                for (int j = 0; j < S.nn; j++)
+                    if (j != l && (S.vm.isr & (1u << j)))
+                        c[n++] = j;
+                xf_start(c[rn((uint32_t)n)]);
+            } else {
+                fo_begin("moving off a leaving member");
+                S.fo_off = S.mv.a;
+            }
         }
         return;
     }
@@ -1296,11 +1776,15 @@ static void nemesis(void)
             S.st.pauses++;
             trace("nemesis: pause node %d until %" PRIu64, i, nd->pause_until);
         }
+    } else if (k < 84 && S.meta_pause_until > S.now) {
+        /* the metadata leader is stalled: no move, no set change */
     } else if (k < 76) {
         S.st.moves++;
         fo_begin("moved");
     } else if (k < 84 && S.setchg) {
         set_change();
+    } else if (k < 88 && S.xfer_on) {
+        meta_new_leader();
     }
 }
 
@@ -1319,7 +1803,8 @@ static void step(void)
     for (size_t k = 0; k < S.nq;) {
         struct smsg *m = &S.q[k];
         int to = m->to_nid < 0 ? META : slot_of(m->to_nid);
-        if (m->at <= S.now && !(to >= 0 && to < S.nn && S.node[to].pause_until > S.now)) {
+        if (m->at <= S.now && !(to >= 0 && to < S.nn && S.node[to].pause_until > S.now) &&
+            !(to == META && S.meta_pause_until > S.now)) {
             due = grow(due, &cdue, nd + 1, sizeof *due);
             due[nd++] = *m;
             S.q[k] = S.q[--S.nq];
@@ -1389,6 +1874,9 @@ static void step(void)
         }
         repl_tick(n->r);
         drive(i, NULL);
+        xf_tick(i);
+        if (S.bad)
+            break;
         if (S.now % HB_TICKS == (uint64_t)i % HB_TICKS) {
             struct smsg m = {.from_nid = n->nid, .to_nid = -1};
             m.m.type = SIM_HB;
@@ -1402,10 +1890,13 @@ static void step(void)
     for (int i = 0; i < S.nn && !S.bad; i++)
         if (S.node[i].r && repl_is_leader(S.node[i].r) && repl_epoch(S.node[i].r) == S.vm.epoch)
             check_floor(i);
-    if (!S.bad)
+    int meta_up = S.meta_pause_until <= S.now;
+    if (!S.bad && meta_up)
         meta_tick();
-    if (!S.bad)
+    if (!S.bad && meta_up)
         mover();
+    if (S.xfer_on && S.chaos && !S.bad && meta_up && chance(S.xrate))
+        xf_start((int)rn((uint32_t)S.nn));
     if (S.writes && !S.bad && chance(S.wrate))
         client_write();
 }
@@ -1429,6 +1920,9 @@ static void reset(void)
     free(S.cepoch);
     free(S.cacked);
     free(S.acker);
+    free(S.xc.pos);
+    free(S.xc.id);
+    free(S.xc.late);
     int trace_on = S.trace;
     __typeof__(S.tot) tot = S.tot;
     memset(&S, 0, sizeof S);
@@ -1439,7 +1933,8 @@ static void reset(void)
 static int converged(void)
 {
     int l = S.vm.leader;
-    if (S.fo || l < 0 || !S.node[l].r || !repl_is_leader(S.node[l].r) || repl_epoch(S.node[l].r) != S.vm.epoch)
+    if (S.fo || l < 0 || !S.node[l].r || !repl_is_leader(S.node[l].r) || repl_epoch(S.node[l].r) != S.vm.epoch ||
+        S.node[l].xf.on)
         return 0;
     if (S.vm.isr != (1u << S.nn) - 1)
         return 0;
@@ -1493,6 +1988,11 @@ static int run(uint64_t seed, uint64_t ticks)
     S.trim = chance(500);
     S.replay_on = chance(500);
     S.setchg = chance(500);
+    S.xfer_on = chance(600);
+    S.xrate = 2 + rn(10);
+    S.xf_answer = chance(500);
+    S.xf_stall = chance(300) ? 100 + rn(400) : 0;
+    S.xf_slow = chance(300) ? 20 + rn(150) : 0;
     if (chance(200))
         S.maxsync = 1 + rn(30); /* a slow fdatasync against a fast round trip: syncs span cuts */
     S.vm = (struct repl_vmeta){.epoch = 1, .isr_version = 1, .leader = 0, .isr = (1u << S.nn) - 1};
@@ -1519,6 +2019,8 @@ static int run(uint64_t seed, uint64_t ticks)
     S.writes = 0;
     memset(S.cut, 0, sizeof S.cut);
     S.loss = S.dup = 0;
+    S.meta_pause_until = 0;
+    S.xf_stall = S.xf_slow = 0;
     for (int i = 0; i < S.nn; i++) {
         S.node[i].pause_until = 0;
         S.node[i].down_until = 0;
@@ -1737,5 +2239,19 @@ int main(int argc, char **argv)
                PRIu64 " planned transfers off a leaving leader\n",
                S.tot.adds, S.tot.removes, S.tot.resets, S.tot.mvdone, S.tot.leaves, S.tot.leavereq, S.tot.reconfs,
                S.tot.restarts, S.tot.xver, S.tot.replays, S.tot.planned);
+    /* Always printed: the soak judges the transfers' coverage from it. */
+    printf("transfers: %" PRIu64 " started, %" PRIu64 " READY, %" PRIu64 " done, %" PRIu64 " cancelled before READY, %"
+           PRIu64 " drains timed out, %" PRIu64 " hard caps, %" PRIu64 " writes refused while held, %" PRIu64
+           " dropped into a failover, %" PRIu64 " new metadata leaders, %" PRIu64 " metadata stalls on READY, %" PRIu64
+           " writes admitted after the hard cap (%" PRIu64 " of them cut), %" PRIu64 " stale CANCELs\n",
+           S.tot.xfers, S.tot.xready, S.tot.xdone, S.tot.xcancels, S.tot.xdrainout, S.tot.xcap, S.tot.xrefused,
+           S.tot.xfailover, S.tot.metachg, S.tot.xstalls, S.tot.xlate, S.tot.xlatecuts, S.tot.xstale);
+    /* Floors: over enough seeds every path of check 11 must have run, or a model that stopped reaching it passes. */
+    if (seeds >= XF_FLOOR_SEEDS &&
+        !(S.tot.xready && S.tot.xdone && S.tot.xcap && S.tot.xlate && S.tot.xlatecuts && S.tot.xstale)) {
+        fprintf(stderr, "sim_repl: transfer coverage below its floor over %" PRIu64 " seeds (READY, done, hard caps, "
+                        "writes after the cap, their cuts and stale CANCELs must each be above 0)\n", seeds);
+        return 1;
+    }
     return 0;
 }
