@@ -12062,7 +12062,9 @@ static void *set_write_thread(void *a)
     struct set_writer *w = a;
     tsdbc *c = NULL;
     while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
-        if (!c && (w->rc = tsdbc_connect("127.0.0.1", w->port, &c)) != 0) {
+        int crc;
+        if (!c && (crc = tsdbc_connect("127.0.0.1", w->port, &c)) != 0) {
+            __atomic_store_n(&w->rc, crc, __ATOMIC_RELEASE); /* await_batches reads it while we run */
             c = NULL;
             if (!w->lenient)
                 break;
@@ -12080,7 +12082,7 @@ static void *set_write_thread(void *a)
             __atomic_add_fetch(&w->acked, 100, __ATOMIC_RELEASE);
             continue;
         }
-        w->rc = rc;
+        __atomic_store_n(&w->rc, rc, __ATOMIC_RELEASE);
         if (!w->lenient)
             break;
         w->unsure += 100;
@@ -12091,7 +12093,7 @@ static void *set_write_thread(void *a)
     if (c)
         tsdbc_close(c);
     if (w->lenient)
-        w->rc = 0;
+        __atomic_store_n(&w->rc, 0, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -12100,8 +12102,8 @@ static void await_batches(struct set_writer *w, uint64_t n, int ms)
 {
     uint64_t b0 = __atomic_load_n(&w->batches, __ATOMIC_ACQUIRE), t0 = now_ms();
     while (__atomic_load_n(&w->batches, __ATOMIC_ACQUIRE) < b0 + n)
-        if (w->rc && !w->lenient)
-            die("a writer: %s", ers(w->rc));
+        if (__atomic_load_n(&w->rc, __ATOMIC_ACQUIRE) && !w->lenient)
+            die("a writer: %s", ers(__atomic_load_n(&w->rc, __ATOMIC_ACQUIRE)));
         else if (now_ms() - t0 > (uint64_t)ms)
             die("a writer had fewer than %" PRIu64 " batches answered in %d ms", n, ms);
         else
