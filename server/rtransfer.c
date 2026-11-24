@@ -49,6 +49,8 @@ enum { RT_IDLE = 0, RT_DRAIN, RT_READY };
 
 struct rtr {
     uint64_t heard; /* the highest transfer id a TRANSFER or CANCEL of this volume came with */
+    uint64_t ended; /* the id of the last transfer that ended here: the Raft leader resends its TRANSFER every 200 ms
+                     * until its own timeout (transfer_wait_ms + 1 s), and a drain that timed out must not begin again */
     uint64_t id;    /* this transfer's (READY carries it) */
     int state;
     uint64_t epoch;  /* the core's epoch the transfer is for */
@@ -63,7 +65,7 @@ struct rtr {
 /* STATUS's counters (rtr_counts) */
 static atomic_ulong n_timedout, n_blind, n_ready, n_cuts;
 
-enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME, RTM_PINNED };
+enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME, RTM_PINNED, RTM_NOTARGET, RTM_REDRAIN };
 /* TSDB_REPLD_MUTANT's names of this file (repld.c's parser knows none of them): READY at once, admitting during the
  * drain, admitting again after READY on its own timer (transfer_wait_ms), READY sent to the Raft leader that asked
  * instead of the current one */
@@ -78,6 +80,8 @@ static int rtr_mutant(void)
             : !strcmp(e, "transferadmit")   ? RTM_ADMIT
             : !strcmp(e, "transferresume")  ? RTM_RESUME
             : !strcmp(e, "readypinned")     ? RTM_PINNED
+            : !strcmp(e, "transfernotarget") ? RTM_NOTARGET
+            : !strcmp(e, "transferredrain")  ? RTM_REDRAIN
                                             : RTM_NONE;
         if (v != RTM_NONE)
             say("MUTANT %s (tests only)", e);
@@ -116,10 +120,12 @@ static int tr_index(const struct rvol *rv, uint32_t node)
 static void tr_end(struct rvol *rv, struct rtr *t, const char *why)
 {
     t->handed_ms = t->state == RT_READY && !t->blind && !strcmp(why, "lost its epoch") ? mono_ms() : 0;
-    if (t->state != RT_IDLE)
+    if (t->state != RT_IDLE) {
         say("volume %" PRIu32 ": transfer to node %" PRIu32 " at epoch %" PRIu64 " %s after %" PRIu64
             " ms; admits again",
             rv->number, t->target, t->epoch, why, mono_ms() - t->t0);
+        t->ended = t->id;
+    }
     t->state = RT_IDLE;
     t->blind = 0;
 }
@@ -160,6 +166,8 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
             tr_end(rv, t, "cancelled by the Raft leader");
         return;
     }
+    if (t->state == RT_IDLE && t->ended && c->arg == t->ended && rtr_mutant() != RTM_REDRAIN)
+        return; /* a resend of a transfer that ended here (its drain timed out, its epoch was lost) */
     uint64_t epoch = rv->core ? repl_epoch(rv->core) : 0;
     int ti = tr_index(rv, c->node);
     const char *no = rv->mode != M_WRITER || !rv->core || !repl_is_leader(rv->core) ? "this node does not lead it"
@@ -177,7 +185,9 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
         t->sent_ms = 0;
         return;
     }
+    uint64_t ended = t->ended;
     memset(t, 0, sizeof *t);
+    t->ended = ended;
     t->heard = t->id = c->arg;
     t->state = RT_DRAIN;
     t->epoch = c->epoch;
@@ -226,8 +236,10 @@ void rtr_tick(struct rvol *rv)
     if (t->state == RT_DRAIN) {
         uint64_t written = repl_written(rv->core);
         int ti = tr_index(rv, t->target);
-        int done = repl_commit(rv->core) >= written && ti >= 0 && repl_peer_match(rv->core, ti) >= written &&
-                   !drain_held();
+        /* the commit point alone is not enough: the target may have left the ISR during the drain (test_cluster
+         * transferlag; mutant transfernotarget) */
+        int done = repl_commit(rv->core) >= written && ti >= 0 &&
+                   (repl_peer_match(rv->core, ti) >= written || rtr_mutant() == RTM_NOTARGET) && !drain_held();
         if (done || rtr_mutant() == RTM_NODRAIN) {
             t->state = RT_READY;
             t->end = written;

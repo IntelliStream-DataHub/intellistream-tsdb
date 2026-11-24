@@ -14,7 +14,9 @@
 # current Raft leader, its CANCEL of a READY it does not hold is the rescue that nocancel alone leaves); dropproposed
 # (a transfer's promotion dropped at PROMO_MOVE_NS though its grant is proposed and may still commit) transfergrant;
 # adminself, adminbusy, adminup, adminisr (the admin accepts the current leader, a second transfer of a volume, a member
-# that is not up, one outside the ISR) transferadmin.
+# that is not up, one outside the ISR) transferadmin; transfernotarget (the drain ends on the commit point alone, which
+# moves on without a target that left the ISR) transferlag; transferredrain (a TRANSFER resent after its drain timed out
+# drains again) transferslow.
 # Usage: tests/transfer_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
@@ -23,7 +25,8 @@ export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same
 scenario() {
     v=TSDB_CLUSTER_MUTANT x=
     case $1 in
-    transfernodrain) s=transferslow v=TSDB_REPLD_MUTANT ;;
+    transfernodrain | transferredrain) s=transferslow v=TSDB_REPLD_MUTANT ;;
+    transfernotarget) s=transferlag v=TSDB_REPLD_MUTANT ;;
     transferadmit) s=transfer v=TSDB_REPLD_MUTANT ;;
     transferresume) s=transferhold v=TSDB_REPLD_MUTANT ;;
     balanceflap) s=balancecut ;;
@@ -43,7 +46,7 @@ if [ "${1:-}" = --mutant-run ]; then
     exit
 fi
 dir=${1:-/tmp}; shift || true
-muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed adminself adminbusy adminup adminisr}
+muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed adminself adminbusy adminup adminisr transfernotarget transferredrain}
 # a mutant is caught by any failure of its scenario; MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
 exec "$(dirname "$0")/../tools/mutants.sh" --name transfer --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" \
     --detail FAIL --list "$muts" -- "$0" --mutant-run @M@ @D@
