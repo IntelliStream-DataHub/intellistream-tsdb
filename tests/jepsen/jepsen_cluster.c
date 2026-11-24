@@ -200,9 +200,10 @@ static int r4_bit(const char *name)
             return r4nem[k].bit;
     return 0;
 }
-/* r4-replay (the replay start apart from the log start, D17): once it is on main a classes run keeps the default caps
- * and the switches no longer wait for them (cls_defer_s 0); until then it caps repl_retain_s at CLASSES_RETAIN_S */
-#define R4_REPLAY_ON_MAIN 0
+/* r4-replay (the replay start apart from the log start, D17): a classes run keeps the default caps and the switches no
+ * longer wait for them (cls_defer_s 0: the replay floor is the members' replay start, past their kept segments, which a
+ * flush after the promotion raises within seconds). 0 puts back the cap of repl_retain_s at CLASSES_RETAIN_S. */
+#define R4_REPLAY_ON_MAIN 1
 static int opt_retain_s = -1;     /* --retain-s: repl_retain_s of the cluster (-1: as the run needs) */
 static int retain_eff;            /* the repl_retain_s the cluster is made with (0: the default caps) */
 static int cls_defer_s;           /* how long a promoted writer's class switches wait for the members' log start */
@@ -3715,15 +3716,16 @@ static int cluster_form(void)
     S.node_timeout_ms = 1500;
     S.heartbeat_ms = 200;
     S.lease_s = 4;
-    /* classes: a promoted writer decides no class switch while a member's log may still replay below its attach
-     * (CLS_DEFER, design-cluster.md 8.3: the replay floor is the members' log start, which the keep caps hold up to
-     * repl_retain_s back); with the default 30 min every failover ended the switches for the rest of the run. 30 s
+    /* classes with R4_REPLAY_ON_MAIN 0 (before r4-replay): a promoted writer decides no class switch while a member's
+     * log may still replay below its attach (CLS_DEFER, design-cluster.md 8.3: the replay floor was the members' log
+     * start, which the keep caps hold up to repl_retain_s back); with the default 30 min every failover ended the
+     * switches for the rest of the run. 30 s
      * lets the floor pass the attach about 31 s after a promotion (flushes every 500 ms); under kill and power a new
      * epoch comes every 5 to 14 s, so those runs switch in the quiet tail after the last heal (classes_tail, up to
      * CLASSES_TAIL_MS). Shorter caps strand a member that fell further behind than them: it needs a snapshot, which
      * is not built yet (r3e-fix14: 3 s left a learner behind in 4 of 13 runs, a partition-only run among them;
      * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
-    if (retain_eff > 0) /* --retain-s, longdown's 3 s, classes' CLASSES_RETAIN_S until r4-replay (main sets it) */
+    if (retain_eff > 0) /* --retain-s, longdown's 3 s (classes' CLASSES_RETAIN_S only with R4_REPLAY_ON_MAIN 0) */
         S.repl_retain_s = (uint32_t)retain_eff;
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);

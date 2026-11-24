@@ -646,8 +646,15 @@ cgroup, so `nice` does not keep your work out of its way.
   The files of the committed COMMIT markers in kept segments stay with them on every member as `keep_<pos>_<key>.part`
   (a replica's apply and open rename the stage_ file; a leader serves them from its attach, by position, never by name
   alone; `test_replica keepfiles`, mutant `replicadropsfiles`).
-  Kept segments (a leader's flushed ones, a promoted replica's) are named in RSTATE (`kept`, saved before a drop can
-  take their rows out of parts): a writer's open neither replays nor removes a segment at or below it.
+  Kept segments (a leader's flushed ones, a promoted replica's, and a replica's flushed ones at or below its saved
+  floor, `kept_save` by the applier under `apply_mu`, never `rp->mu`) are named in RSTATE (`kept`, saved before a drop
+  can take their rows out of parts): a writer's open neither replays nor removes a segment at or below it, a replica's
+  open neither those at or below its floor (one above the floor, a deposed leader's, is replayed: a new leader may cut
+  there). The replay start (D17, `replica_replay_start`, the ACK's `replay`, the leader's replay floor) is the first
+  position any open of the member may replay: past the durably saved `kept` only, and on a leader past a kept segment
+  only once the commit floor the driver saved covers its end (`lrq`, `leader_replay_floor`): the same directory
+  reopened as a replica at that floor replays it (`test_replica` LR and PL, mutants `replayleadnofloor replayopennone
+  replayopennofloor`).
 - **Settled parts** (R7; `src/ecpart.c`, `src/ecswap.c`, `src/settle.c`, `src/eckeep.c`, `src/ecgc.c`; design-cluster-data.md
   §2.3 as it applies on one server). A settle turns the `p<K>_<A>_<B>_<L>.part` of a key into the `.ec` of the same name:
   the file keeps its source's name and block range (D2), so it has the same rows, the same rank and the same key, and a

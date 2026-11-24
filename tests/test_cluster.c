@@ -8965,6 +8965,132 @@ static void scen_failoverkeep(void)
            "every server holds the same %" PRIu64 " rows\n", nb, rows);
 }
 
+static long long file_len(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? (long long)st.st_size : -1;
+}
+
+/* classfailover (D17): at the default caps (repl_retain_s 1800) a class switch on the new leader after a failover waits
+ * only until every member acknowledges in the new epoch and has its old segments in parts and named in RSTATE `kept`:
+ * a few seconds. Before D17 a replica's replay start was its log start, which the keep caps hold up to repl_retain_s
+ * back, and the switch waited (CLS_DEFER) that long. The replicas' flushed segments stay (the caps), and every member
+ * holds the same rows at the end. Mutant replaystartlog (the replay start is the log start again). */
+static void scen_classfailover(void)
+{
+    scenario("classfailover");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "cf", 3, &num)) != 0 || num != 1)
+        die("volume add cf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "cf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "cf", &v))
+        die("no record of cf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of cf is node %u", v.leader);
+    uint64_t e0 = v.epoch;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "cf", 30000);
+    await_isr(L, "cf", 3, 30000, "every replica up");
+    int64_t t = 1000;
+    uint64_t rows = 0;
+    for (int k = 0; k < 4; k++) { /* flushed segments on every member before the failover */
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = t++, vv[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 100)) != 0)
+            die("a write before the failover: %s", ers(rc));
+        rows += 100;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("flush: %s", ers(rc));
+    }
+    /* a slow fresh series: its first flush (flush_interval_ms 5 s) gives it a long class (CLASSES on every member) */
+    tsdb_sid slow = rep_series(c, rep_names[3], "cf", 30000);
+    int64_t ts[200];
+    float val[200];
+    for (int j = 0; j < 200; j++)
+        ts[j] = 3600000LL * j, val[j] = (float)j;
+    if ((rc = tsdbc_insert_series(c, slow, ts, val, 200)) != 0)
+        die("insert of the slow series: %s", ers(rc));
+    uint64_t srows = 200;
+    tsdbc_close(c);
+    char cls[PATH_MAX + 120];
+    for (int i = 0; i < 3; i++) {
+        snprintf(cls, sizeof cls, "%s/n%d/v1/CLASSES", base, i);
+        uint64_t tc = now_ms();
+        while (file_len(cls) <= 0) {
+            if (now_ms() - tc > 30000)
+                die("the slow series got no class of its own on server %d (no %s)", i, cls);
+            usleep(100000);
+        }
+    }
+    struct timespec s1 = {1, 0};
+    nanosleep(&s1, NULL);
+    stop(L, SIGKILL);
+    int B = -1;
+    uint64_t tk = now_ms();
+    for (;;) {
+        for (int i = 0; i < 3 && B < 0; i++)
+            if (i != L && vol_rec(i, "cf", &v) && v.epoch > e0 && server_of(v.leader) == i)
+                B = i;
+        if (B >= 0)
+            break;
+        if (now_ms() - tk > 30000)
+            die("no server was promoted 30 s after the leader was killed");
+        usleep(20000);
+    }
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(B, lead, 1, 30000);
+    start(L);
+    await_isr(B, "cf", 3, 60000, "the old leader back");
+    uint64_t t_isr = now_ms(); /* every member acknowledges in the new epoch from here */
+    snprintf(cls, sizeof cls, "%s/n%d/v1/CLASSES", base, B);
+    long long len0 = file_len(cls);
+    c = client(B);
+    tsdbc_set_retry(c, 10000);
+    /* the slow series gets much faster: the next flush moves it to class 0, a switch whose T must lie past every row a
+     * member may replay, which waits for the replay floor (CLS_DEFER) and is measured again at each flush */
+    int64_t st = 3600000LL * 200;
+    while (file_len(cls) <= len0) {
+        if (now_ms() - t_isr > 60000)
+            die("a class switch on the new leader waited more than 60 s after every member was back in its ISR (the "
+                "replay floor stayed below the epoch: %s %lld bytes)", cls, file_len(cls));
+        for (int j = 0; j < 200; j++)
+            ts[j] = st + j, val[j] = (float)j;
+        if ((rc = tsdbc_insert_series(c, slow, ts, val, 200)) != 0)
+            die("a write to the new leader: %s", ers(rc));
+        st += 200;
+        srows += 200;
+        usleep(500000);
+    }
+    uint64_t waited = now_ms() - t_isr;
+    if ((uint64_t)rows_of(c, id) != rows || (uint64_t)rows_of(c, slow) != srows)
+        die("the new leader reads %d and %d rows, not %" PRIu64 " and %" PRIu64, rows_of(c, id), rows_of(c, slow), rows,
+            srows);
+    tsdbc_close(c);
+    for (int i = 0; i < 3; i++) /* (the leader lets go of what every replica holds: eng_leader_keep) */
+        if (i != B && wal_count(i, 1) < 2)
+            die("replica %d keeps %d WAL segments of cf: the flushed ones went before the caps (repl_retain_s 1800)", i,
+                wal_count(i, 1));
+    stop_all();
+    uint64_t wantr[REP_NAMES] = {rows, 0, 0, srows};
+    rep_same(wantr, "after a clean stop");
+    printf("  after a failover at the default caps a class switch waited %" PRIu64 " ms after every member was back in "
+           "the ISR; the replicas keep their flushed segments and every server holds the same rows\n", waited);
+}
+
 /* D13: an engine failure (EIO on a WAL fdatasync, crashfs) of one replica of a cluster volume stops that volume
  * there, quiesced and reported LOCAL_FAULT in the server's heartbeat; the server itself goes on (its root answers)
  * and exits cleanly on SIGTERM. Without D13 tsdbd exits with status 1 on any failed volume outside a domain. */
@@ -15776,7 +15902,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

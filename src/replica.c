@@ -125,6 +125,15 @@ struct replica {
     size_t ncm, capcm;
     struct rstate rs; /* the RSTATE file */
     uint64_t mk_seq;  /* the segment of the marker being applied (the applier's: replica_flush_through) */
+    /* RSTATE's `kept` (D17): the flushed segments not yet named there, ascending (unl_mu; replica_flushed adds, kept_save
+     * names the newest the saved floor covers), and what the file holds: the replay start is told from those alone */
+    struct kseg {
+        uint64_t seq, fno_end;
+    } *kq;
+    size_t nkq, capkq;
+    _Atomic uint64_t kept_saved; /* RSTATE's `kept` as last saved (or loaded at the open) */
+    uint64_t napplied;           /* records applied since the open (rp->mu; replica_test_napplied) */
+    uint64_t open_first;         /* the first position the open's cursor read (replica_test_open_first) */
 };
 
 /* The position of the COMMIT whose parts this thread commits (apply_commit) and its engine, for jr_part_pos */
@@ -136,7 +145,10 @@ static __thread eng *rp_part_db;
 
 static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit);
 static int rs_load(eng *db, struct rstate *rs);
+static int rs_save(eng *db, struct rstate *rs);
 static int open_scan(eng *db, struct replica *rp);
+static void kq_push(struct replica *rp, uint64_t seq, uint64_t fno_end);
+static int kept_save(eng *db, struct replica *rp);
 static void open_unl_parts(struct replica *rp);
 
 void replica_now_advance(eng *db, int64_t ms)
@@ -303,7 +315,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
         struct rstate rs0 = {0};
         rc = rs_load(db, &rs0);
         free(rs0.drops);
-        if (rc == 0 && eng_test_mutant != MUT_REPLICA_GAP_NO_KEPT)
+        if (rc == 0)
             kept_seq = rs0.kept;
     }
     for (size_t k = 0; k < nseg && rc == 0; k++)
@@ -339,7 +351,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
             if (!segs[k].fno_first)
                 continue;
             if (prev_end && segs[k].fno_first > prev_end &&
-                (segs[k].seq - 1 <= MAX(parts_seq, kept_seq) ||
+                (segs[k].seq - 1 <= MAX(parts_seq, eng_test_mutant != MUT_REPLICA_GAP_NO_KEPT ? kept_seq : 0) ||
                  (parts_fno >= segs[k].fno_first - 1 && eng_test_mutant != MUT_REPLICA_GAP_BY_SEQ)) &&
                 segs[k].fno_first - 1 <= floor)
                 lo = k;
@@ -431,13 +443,40 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     db->wal_flushed = MAX(db->wal_open_removed, parts_seq);
     rp->durable_next = db->fno_next; /* synced above (fsync on): the files' bytes are durable now */
     rp->log_next = db->fno_next;
-    rp->sealed_seq = parts_seq;
+    /* The segments up to RSTATE's `kept` are wholly in parts and applied (kept_save names no other): neither replayed
+     * nor removed here (D17); they stay for catch-up and snapshots until the floor and the caps let them go
+     * (open_unl_parts). Only those at or below the floor: a deposed leader's `kept` may name a segment that holds
+     * records above it, which a new leader may still cut (the cut refuses to go below the applied end). The cursor
+     * starts at the first segment above them, which holds the first position any open may replay
+     * (replica_replay_start: every later open's floor is at least this one). */
+    uint64_t kept_eff = kept_seq;
+    size_t ck = nseg; /* the first segment the cursor reads */
+    for (size_t k = 0; k < nseg; k++) {
+        if (segs[k].seq > kept_seq ||
+            (segs[k].fno_first && segs[k].fno_end - 1 > floor && eng_test_mutant != MUT_REPLAY_OPEN_NOFLOOR)) {
+            ck = k;
+            if (segs[k].seq <= kept_seq)
+                kept_eff = k ? segs[k - 1].seq : MIN(kept_seq, segs[k].seq - 1);
+            break;
+        }
+    }
+    rp->sealed_seq = MAX(parts_seq, kept_eff);
+    atomic_store(&rp->kept_saved, kept_eff);
+    db->wal_flushed = MAX(db->wal_flushed, kept_eff); /* in parts, as MANIFEST then says */
     rp->apply_next = db->fno_next;
-    for (size_t k = 0; k < nseg; k++)
+    for (size_t k = ck; k < nseg; k++)
         if (segs[k].fno_first) {
             rp->apply_next = segs[k].fno_first;
             break;
         }
+    rp->open_first = rp->apply_next;
+    if (ck < nseg) {
+        rp->apply_seq = segs[ck].seq;
+        rp->apply_off = 0;
+    } else if (nseg) { /* every segment kept: the next record is in a new one */
+        rp->apply_seq = segs[nseg - 1].seq;
+        rp->apply_off = segs[nseg - 1].end;
+    }
     free(segs);
     if (rc)
         return rc;
@@ -482,6 +521,7 @@ void replica_free(eng *db)
     free(rp->rbuf);
     free(rp->segs);
     free(rp->unl);
+    free(rp->kq);
     free(rp->stg);
     for (size_t i = 0; i < rp->ncm; i++)
         free(rp->cm[i].f);
@@ -542,6 +582,11 @@ static int switch_memtable(eng *db, struct replica *rp, uint64_t seq)
     pthread_mutex_unlock(&db->lock);
     pthread_mutex_unlock(&db->flush_lock);
     rp->sealed_seq = MAX(rp->sealed_seq, rp->act_seq);
+    if (eng_test_mutant == MUT_REPLAY_KEPT_EARLY && rp->act_seq) { /* planted: named kept when sealed, not flushed */
+        pthread_mutex_lock(&rp->unl_mu);
+        kq_push(rp, rp->act_seq, m->fno_end);
+        pthread_mutex_unlock(&rp->unl_mu);
+    }
     rp->act_seq = seq;
     return 0;
 }
@@ -571,6 +616,11 @@ void replica_keep_next(uint64_t max_bytes, uint64_t max_ms)
 void tsdb_test_replica_drops_floor(void)
 {
     eng_test_mutant = MUT_REPLICA_KEEP_FLOOR;
+}
+
+void tsdb_test_replay_start_log(void)
+{
+    eng_test_mutant = MUT_REPLAY_START_LOG;
 }
 
 void tsdb_test_replica_drops_files(void)
@@ -680,6 +730,21 @@ static void unlink_due(eng *db)
     }
 }
 
+void (*replica_test_kept_hook)(eng *db); /* tests: in kept_save, before RSTATE's save */
+
+static void kq_push(struct replica *rp, uint64_t seq, uint64_t fno_end)
+{
+    if (rp->nkq == rp->capkq) {
+        size_t c = rp->capkq ? rp->capkq * 2 : 16;
+        void *p = realloc(rp->kq, c * sizeof *rp->kq);
+        if (!p)
+            return; /* not named: an open replays it (its rows are in parts), as before D17 */
+        rp->kq = p;
+        rp->capkq = c;
+    }
+    rp->kq[rp->nkq++] = (struct kseg){seq, fno_end};
+}
+
 void replica_flushed(eng *db, uint64_t seq, uint64_t fno_end)
 {
     struct replica *rp = db->rp;
@@ -699,8 +764,42 @@ void replica_flushed(eng *db, uint64_t seq, uint64_t fno_end)
     wal_name(name, sizeof name, seq);
     uint64_t bytes = fstatat(db->dirfd, name, &st, 0) == 0 ? (uint64_t)st.st_size : 0; /* gone: nothing to count */
     rp->unl[rp->nunl++] = (struct unlseg){seq, fno_end, bytes, unl_now_ms()};
+    if (eng_test_mutant != MUT_REPLAY_KEPT_EARLY)
+        kq_push(rp, seq, fno_end); /* its rows are in parts and listed, its records applied (it was sealed) */
     pthread_mutex_unlock(&rp->unl_mu);
     unlink_due(db);
+}
+
+/* RSTATE's `kept` (D17): the newest flushed segment whose end the saved floor covers is named there, so an open
+ * neither replays nor removes the segments up to it, and the replay start rises past them. Saved here, by the
+ * applier (apply_mu held, as by RSTATE's other writers, and never rp->mu: appends and syncs wait for that, REVIEW F3),
+ * never by the flusher that queued it: a lost save only
+ * means a later open replays what it could have skipped (its rows are in parts: the replay skips them). Under the
+ * floor alone: a segment above it may still be cut (it is not, being sealed, but the open checks the floor against the
+ * log, and a `kept` past it would put the cursor above the floor). */
+static int kept_save(eng *db, struct replica *rp)
+{
+    uint64_t floor = atomic_load(&rp->floor_saved), seq = 0;
+    pthread_mutex_lock(&rp->unl_mu);
+    size_t n = 0;
+    while (n < rp->nkq && (rp->kq[n].fno_end - 1 <= floor || eng_test_mutant == MUT_REPLAY_KEPT_EARLY))
+        seq = rp->kq[n++].seq;
+    if (n) {
+        memmove(rp->kq, rp->kq + n, (rp->nkq - n) * sizeof *rp->kq);
+        rp->nkq -= n;
+    }
+    pthread_mutex_unlock(&rp->unl_mu);
+    if (seq <= rp->rs.kept)
+        return 0;
+    rp->rs.kept = seq;
+    if (eng_test_mutant == MUT_REPLAY_START_UNSAVED) /* planted: told before the save is durable */
+        atomic_store(&rp->kept_saved, seq);
+    if (replica_test_kept_hook)
+        replica_test_kept_hook(db);
+    int rc = rs_save(db, &rp->rs); /* fails the engine on error */
+    if (rc == 0)
+        atomic_store(&rp->kept_saved, seq);
+    return rc;
 }
 
 /* The segments the open found wholly in parts and applied (a deposed writer's kept ones, a replica's kept under the
@@ -744,6 +843,11 @@ int replica_floor_saved(eng *db, uint64_t floor)
     uint64_t cur = atomic_load(&rp->floor_saved);
     while (cur < floor && !atomic_compare_exchange_weak(&rp->floor_saved, &cur, floor)) {
     }
+    pthread_mutex_lock(&rp->apply_mu); /* RSTATE's writers: the applier's lock, never rp->mu across its fdatasync */
+    int krc = kept_save(db, rp);
+    pthread_mutex_unlock(&rp->apply_mu);
+    if (krc)
+        return krc;
     pthread_mutex_lock(&db->flush_lock);
     unlink_due(db);
     pthread_mutex_unlock(&db->flush_lock);
@@ -2053,6 +2157,7 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             break;
         rp->apply_off += sz;
         rp->apply_next = wr.fno + wr.span;
+        rp->napplied++;
         /* Between records the applier lets another thread that wants rp->mu (an append, a sync, a stage) have it, so a
          * commit point that moves over many row records does not stall the ACKs behind them (r3g REVIEW F2). A row
          * record is applied whole under rp->mu: a cut must not remove a record whose rows are half in the memtable.
@@ -2083,7 +2188,9 @@ int replica_apply(eng *db, uint64_t commit)
     pthread_mutex_lock(&rp->apply_mu);
     pthread_mutex_lock(&rp->mu);
     int rc = replica_apply_locked(db, rp, commit);
-    pthread_mutex_unlock(&rp->mu);
+    pthread_mutex_unlock(&rp->mu); /* appends and syncs wait for rp->mu: RSTATE's fdatasync runs without it */
+    if (rc == 0)
+        rc = kept_save(db, rp);
     pthread_mutex_unlock(&rp->apply_mu);
     return rc;
 }
@@ -2795,6 +2902,8 @@ int replica_promote(eng **dbp, uint64_t epoch_pos, eng **out)
         pthread_mutex_lock(&rp->mu);
         rp->rs.kept = MAX(rp->rs.kept, seqs[ns - 1]);
         rc = rs_save(db, &rp->rs);
+        if (rc == 0)
+            atomic_store(&rp->kept_saved, rp->rs.kept);
         pthread_mutex_unlock(&rp->mu);
     }
     free(seqs);
@@ -3352,6 +3461,60 @@ int jr_intent(eng *db, enum jr_kind kind, const void *arg)
  * its retire. Reopened as a replica (eng_open_replica on the same directory), the deposed leader then skips every
  * marker it published (its parts are listed: there are no staged files to apply them from) and settles one whose
  * publish a crash interrupted by its first block (rs_committed), as a replica does. All writes under publish_lock. */
+/* A leader's replay start (D17) is the first position any open of its directory may replay. A writer's open skips the
+ * segments up to RSTATE's `kept`, but the same directory reopened as a replica (a failover: cvol, demote) replays a
+ * kept segment whose last position lies above its REPL floor (replica_open_log: a new leader may still cut there), and
+ * that floor is saved by the driver on its own clock, after the flush. So a kept segment's end counts only once the
+ * saved commit floor covers its last position: lrq holds the ends not yet covered; leader_replay_floor moves them. */
+static void lead_replay_raise(eng *db, uint64_t end)
+{
+    uint64_t cur = atomic_load(&db->lead_replay);
+    while (cur < end && !atomic_compare_exchange_weak(&db->lead_replay, &cur, end)) {
+    }
+}
+
+static void lrq_pop_locked(eng *db)
+{
+    uint64_t floor = atomic_load(&db->lead_saved), hi = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < db->nlrq; i++) {
+        if (db->lrq[i] - 1 <= floor || eng_test_mutant == MUT_REPLAY_LEAD_NOFLOOR)
+            hi = MAX(hi, db->lrq[i]);
+        else
+            db->lrq[k++] = db->lrq[i];
+    }
+    db->nlrq = k;
+    if (hi)
+        lead_replay_raise(db, hi);
+}
+
+static void lead_replay_note(eng *db, uint64_t fno_end)
+{
+    if (!fno_end)
+        return;
+    pthread_mutex_lock(&db->lrq_mu);
+    if (db->nlrq == db->caplrq) {
+        size_t c = db->caplrq ? 2 * db->caplrq : 16;
+        void *p = realloc(db->lrq, c * sizeof *db->lrq);
+        if (!p) { /* not noted: the replay start stays lower than it could be (only the floor's lag), never above */
+            pthread_mutex_unlock(&db->lrq_mu);
+            return;
+        }
+        db->lrq = p;
+        db->caplrq = c;
+    }
+    db->lrq[db->nlrq++] = fno_end;
+    lrq_pop_locked(db); /* lead_saved is stored before leader_replay_floor takes lrq_mu: one of the two sees both */
+    pthread_mutex_unlock(&db->lrq_mu);
+}
+
+void leader_replay_floor(eng *db)
+{
+    pthread_mutex_lock(&db->lrq_mu);
+    lrq_pop_locked(db);
+    pthread_mutex_unlock(&db->lrq_mu);
+}
+
 int leader_rs_open(eng *db)
 {
     struct rstate *rs = calloc(1, sizeof *rs);
@@ -3364,10 +3527,18 @@ int leader_rs_open(eng *db)
         return rc;
     }
     db->lrs = rs;
+    /* the replay start as the writer's open left it: the ends of the kept segments it found on disk (db->lk), each
+     * counted once the saved commit floor covers it (leader_replay_floor; the first save after the attach does); until
+     * then the log start, below them, is the core's own */
+    pthread_mutex_lock(&db->flush_lock);
+    for (size_t i = 0; i < db->nlk; i++)
+        if (db->lk[i].seq <= rs->kept && eng_test_mutant != MUT_REPLAY_OPEN_NONE)
+            lead_replay_note(db, db->lk[i].fno_end);
+    pthread_mutex_unlock(&db->flush_lock);
     return 0;
 }
 
-int leader_rs_kept(eng *db, uint64_t seq)
+int leader_rs_kept(eng *db, uint64_t seq, uint64_t fno_end)
 {
     struct rstate *rs = db->lrs;
     if (!rs || eng_test_mutant == MUT_LEADER_KEPT_NOSAVE)
@@ -3376,7 +3547,13 @@ int leader_rs_kept(eng *db, uint64_t seq)
     int rc = 0;
     if (seq > rs->kept) {
         rs->kept = seq;
+        if (eng_test_mutant == MUT_REPLAY_START_UNSAVED) /* planted: told before the save is durable */
+            lead_replay_note(db, fno_end);
+        if (replica_test_kept_hook)
+            replica_test_kept_hook(db);
         rc = rs_save(db, rs);
+        if (rc == 0 && eng_test_mutant != MUT_REPLAY_START_UNSAVED) /* a writer's open replays from the segment above */
+            lead_replay_note(db, fno_end);
     }
     pthread_mutex_unlock(&db->publish_lock);
     return rc;
@@ -3501,15 +3678,48 @@ void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep)
 
 uint64_t replica_replay_start(eng *db)
 {
-    /* r4-replay separates the replay start from the log start; until then they are one: the first position of the
-     * oldest segment a replica holds (0: none, or not a replica) */
     struct replica *rp = db->rp;
-    uint64_t first = 0;
+    if (!rp) /* a leader (or a writer that is not one: 0) */
+        return eng_test_mutant == MUT_REPLAY_START_LOG ? 0 : atomic_load(&db->lead_replay);
+    uint64_t kept = atomic_load(&rp->kept_saved), first = 0, logstart = 0;
+    bool high = eng_test_mutant == MUT_REPLAY_START_HIGH; /* planted: one segment too high */
+    pthread_mutex_lock(&rp->segs_mu);
+    for (size_t i = 0; i < rp->nsegs && !first; i++) {
+        if (!logstart)
+            logstart = rp->segs[i].first;
+        if (rp->segs[i].first && (rp->segs[i].seq > kept || eng_test_mutant == MUT_REPLAY_START_LOG)) {
+            if (high)
+                high = false;
+            else
+                first = rp->segs[i].first;
+        }
+    }
+    pthread_mutex_unlock(&rp->segs_mu);
+    if (!first && logstart) /* every record is in a kept segment: an open replays from the next position appended */
+        first = atomic_load(&rp->log_next);
+    return MAX(first, logstart);
+}
+
+bool replica_test_mu_free(eng *db)
+{
+    if (!db->rp || pthread_mutex_trylock(&db->rp->mu) != 0)
+        return false;
+    pthread_mutex_unlock(&db->rp->mu);
+    return true;
+}
+
+uint64_t replica_test_open_first(eng *db)
+{
+    return db->rp ? db->rp->open_first : 0;
+}
+
+uint64_t replica_test_napplied(eng *db)
+{
+    struct replica *rp = db->rp;
     if (!rp)
         return 0;
-    pthread_mutex_lock(&rp->segs_mu);
-    for (size_t i = 0; i < rp->nsegs && !first; i++)
-        first = rp->segs[i].first;
-    pthread_mutex_unlock(&rp->segs_mu);
-    return first;
+    pthread_mutex_lock(&rp->mu);
+    uint64_t n = rp->napplied;
+    pthread_mutex_unlock(&rp->mu);
+    return n;
 }

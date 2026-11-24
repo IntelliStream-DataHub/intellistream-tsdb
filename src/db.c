@@ -925,6 +925,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->jr_serial.mu, NULL);
     pthread_cond_init(&db->jr_serial.cv, NULL);
     pthread_mutex_init(&db->lead_mu, NULL);
+    pthread_mutex_init(&db->lrq_mu, NULL);
     pthread_cond_init(&db->lead_cv, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
@@ -1285,6 +1286,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->jr_serial.mu);
     pthread_cond_destroy(&db->jr_serial.cv);
     pthread_mutex_destroy(&db->lead_mu);
+    pthread_mutex_destroy(&db->lrq_mu);
+    free(db->lrq);
     pthread_cond_destroy(&db->lead_cv);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);

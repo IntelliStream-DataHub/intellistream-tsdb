@@ -1444,6 +1444,14 @@ static void exec(struct rvol *rv, struct repl_action *a)
         }
         if (G.mutant != RM_NOLOGSTARTCHECK) /* planted: the core never hears that the log start moved */
             log_start_check(rv);
+        { /* the replay start (D17): the first position an open of this member may replay, past the kept segments; the
+           * core sends it in its ACKs (a leader uses its own), and the leader's replay floor rises with it */
+            pthread_mutex_unlock(&rv->mu);
+            uint64_t rs = replica_replay_start(db);
+            pthread_mutex_lock(&rv->mu); /* rv->core again: only this thread swaps it (demote, promote) */
+            if (rs)
+                repl_replay_start(rv->core, rs);
+        }
         break;
     case REPL_A_SEND:
         if (a->msg.type == REPL_M_APPEND && a->msg.to >= 0 && a->msg.to < (int)rv->rec.nrep) {
@@ -2175,6 +2183,8 @@ void repld_init(tsdb *t, const char *dir)
     const char *mu = getenv("TSDB_REPLD_MUTANT");
     if (mu && !strcmp(mu, "replicadropsfloor")) /* the engine's mutant (src/replica.c), planted in tsdbd */
         tsdb_test_replica_drops_floor();
+    if (mu && !strcmp(mu, "replaystartlog")) /* the engine's (D17): the replay start is the log start again */
+        tsdb_test_replay_start_log();
     if (mu && !strcmp(mu, "replicadropsfiles"))
         tsdb_test_replica_drops_files();
     G.mutant = !mu                              ? RM_NONE
