@@ -4683,6 +4683,37 @@ static void scen_links(void)
     }
     if (!mid)
         die("links: the second member did not show up");
+    /* a peer of the previous cluster version at tsdbd's peer port: refused, with a line that names both versions */
+    {
+        uint8_t h[128];
+        size_t o = 4;
+        h[o++] = 1; /* HELLO: magic, version, id, uuid, ident, nonce, no address, kind, check types */
+        uint32_t magic = PL_CL_MAGIC, nid = 9;
+        memcpy(h + o, &magic, 4), o += 4;
+        h[o++] = PL_CL_VERSION - 1;
+        memcpy(h + o, &nid, 4), o += 4;
+        memcpy(h + o, me.uuid, 16), o += 16;
+        memset(h + o, 0x77, 16 + 32), o += 16 + 32;
+        h[o++] = 0, h[o++] = 0, h[o++] = PL_KIND_LOG, h[o++] = 2;
+        uint32_t hl = (uint32_t)(o - 4);
+        memcpy(h, &hl, 4);
+        int rfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in ra = {.sin_family = AF_INET, .sin_port = htons((uint16_t)pports[1])};
+        ra.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (rfd < 0 || connect(rfd, (struct sockaddr *)&ra, sizeof ra) != 0 || write(rfd, h, o) != (ssize_t)o)
+            die("links: raw HELLO: %s", strerror(errno));
+        char want[96];
+        snprintf(want, sizeof want, "refused a peer of cluster version %d (node 9,", PL_CL_VERSION - 1);
+        int seen = 0;
+        for (uint64_t t0 = now_ms(); !(seen = log_has(1, want)) && now_ms() - t0 < WAIT_MS;)
+            usleep(50000);
+        close(rfd);
+        char both[64];
+        snprintf(both, sizeof both, "this server speaks %d", PL_CL_VERSION);
+        if (!seen || !log_has(1, both))
+            die("links: no line naming cluster versions %d and %d for a peer of the old version", PL_CL_VERSION - 1,
+                PL_CL_VERSION);
+    }
     uint8_t zero[16] = {0}, other[16], bad_ident[16], rnd[16];
     memcpy(other, me.uuid, 16);
     other[0] ^= 1;

@@ -313,6 +313,12 @@ enum {
     PL_MUT_NOSEQ = 17,          /* the frame check leaves the sequence number out (a reorder or repeat passes) */
     PL_MUT_NOSALT = 18,         /* the frame check leaves the connection's salt out (an old connection's frame passes) */
     PL_MUT_CHECKTYPE = 19,      /* the acceptor takes a HELLO that offers no check type it runs */
+    PL_MUT_SAMESALT = 20,       /* both directions of a connection derive one salt (a reflected frame passes) */
+    PL_MUT_NOTRANSCRIPT = 21,   /* the salts leave the transcript out: one per secret, an old connection's frame passes */
+    PL_MUT_DIALANYTYPE = 22,    /* the dialer runs whatever check type HELLO_ACK names */
+    PL_MUT_NOTYPE = 23,         /* the frame check leaves the type byte out */
+    PL_MUT_HALFCMP = 24,        /* the reader compares 8 of the check's 16 bytes */
+    PL_MUT_SEQ8 = 25,           /* the seed takes the low 8 bits of the sequence number (a frame 256 back passes) */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
@@ -321,5 +327,8 @@ extern int peerlink_mutant;
 /* Test hook (rsnap's TSDB_REPLD_TEST=snapcutdone): > 0 cuts the connection of a kind-5 link once, at the n-th file
  * that ends whole, after the receiver's end callback and before its DONE goes out (a DONE lost to a reconnect). */
 extern int peerlink_test_cut_end;
+/* Test hook (test_peerlink salts): when set, called at the end of each connection's handshake with its salts, those of
+ * the frames it sends and of those it reads (dialer: 1 on the dialing end) */
+extern void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 
 #endif

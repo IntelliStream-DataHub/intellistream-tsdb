@@ -285,6 +285,76 @@ static void test_codec(void)
         pl_reader_free(r);
         free(bad);
     }
+    /* every bit of the length, the type and the 16 check bytes of the middle frame of three, flipped one at a time
+     * (the random flips above seldom land there): the first frame comes through, the flipped one never. Small and
+     * large, compressed and not: a type left out of the check would deliver the payload under another type, a
+     * compare of part of the check would take a flip in the rest */
+    for (int v = 0; v < 4; v++) {
+        static const size_t vlen[] = {0, 80, 5000, 70000};
+        uint8_t *pay = malloc(vlen[v] + 1), *f3[3];
+        size_t n3[3];
+        uint64_t sq = 0;
+        fill_text(pay, vlen[v], (uint64_t)v);
+        for (int i = 0; i < 3; i++) {
+            n3[i] = pl_frame_encode(PL_CHECK_XXH3, salt, &sq, v & 1, (uint8_t)(0x21 + i), pay, vlen[v], &f3[i]);
+            CHECK(n3[i] != 0);
+        }
+        size_t w = n3[0] + n3[1] + n3[2];
+        uint8_t *s3 = malloc(w);
+        memcpy(s3, f3[0], n3[0]);
+        memcpy(s3 + n3[0], f3[1], n3[1]);
+        memcpy(s3 + n3[0] + n3[1], f3[2], n3[2]);
+        size_t pos[4 + 1 + PL_CHECK_LEN];
+        int np = 0;
+        for (int i = 0; i < 5; i++) /* length, type */
+            pos[np++] = n3[0] + (size_t)i;
+        for (int i = 0; i < PL_CHECK_LEN; i++)
+            pos[np++] = n3[0] + n3[1] - PL_CHECK_LEN + (size_t)i;
+        int bad = 0;
+        for (int i = 0; i < np; i++)
+            for (int bit = 0; bit < 8; bit++) {
+                s3[pos[i]] ^= (uint8_t)(1u << bit);
+                struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+                struct collect c = {0};
+                pl_reader_feed(r, s3, w, collect_msg, &c);
+                if (c.n != 1 || c.type[0] != 0x21 || c.len[0] != vlen[v])
+                    bad++;
+                collect_free(&c);
+                pl_reader_free(r);
+                s3[pos[i]] ^= (uint8_t)(1u << bit);
+            }
+        if (bad)
+            fprintf(stderr, "  codec: %zu bytes%s: %d of %d single-bit flips of length, type or check were taken\n",
+                    vlen[v], v & 1 ? " compressed" : "", bad, np * 8);
+        CHECK(bad == 0);
+        for (int i = 0; i < 3; i++)
+            free(f3[i]);
+        free(s3);
+        free(pay);
+    }
+    /* a frame replayed from further back: one encoded as frame d of its direction, read where frame 0 is due. Each
+     * distance must be refused, the whole 64-bit number counts (a seed of its low 8 or 32 bits takes 256 or 2^32) */
+    {
+        static const uint64_t dist[] = {0, 1, 255, 256, 65536, 1ull << 32, 1ull << 63};
+        uint8_t pay[100];
+        fill_random(pay, sizeof pay, 7);
+        for (size_t i = 0; i < sizeof dist / sizeof dist[0]; i++) {
+            uint64_t sq = dist[i];
+            uint8_t *fr1;
+            size_t n1 = pl_frame_encode(PL_CHECK_XXH3, salt, &sq, 0, 0x22, pay, sizeof pay, &fr1);
+            CHECK(n1 != 0);
+            struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+            struct collect c = {0};
+            int rc = pl_reader_feed(r, fr1, n1, collect_msg, &c);
+            if ((dist[i] == 0) != (rc == 0 && c.n == 1))
+                fprintf(stderr, "  codec: a frame of number %" PRIu64 " read as frame 0: rc %d, %d delivered\n",
+                        dist[i], rc, c.n);
+            CHECK(dist[i] == 0 ? rc == 0 && c.n == 1 : rc < 0 && c.n == 0);
+            collect_free(&c);
+            pl_reader_free(r);
+            free(fr1);
+        }
+    }
     /* a frame whose length field is above the cap ends the stream at once */
     {
         uint8_t hdr[8] = {0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0};
@@ -1551,13 +1621,185 @@ static void test_rawauth(void)
     raw_hello_as(fd, 4, (uint8_t)g_uuid_byte, PL_KIND_LOG, PL_CL_VERSION, 0x80);
     CHECK(raw_read(fd, 3000) == -1);
     close(fd);
-    /* a peer of the previous cluster version: refused by the version byte alone (and a line naming both) */
+    /* a peer of the previous cluster version: refused by the version byte alone, with a line naming both (stderr
+     * caught in a file for the while: the line is written before the connection is closed) */
+    char ep[4096 + 32];
+    snprintf(ep, sizeof ep, "%s/rawauth.err", scratch);
+    fflush(stderr);
+    int save = dup(2), ef = open(ep, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    CHECK(save >= 0 && ef >= 0 && dup2(ef, 2) == 2);
     fd = raw_connect(a->port);
     raw_hello_as(fd, 4, (uint8_t)g_uuid_byte, PL_KIND_LOG, PL_CL_VERSION - 1, PL_CHECKS_KNOWN);
     CHECK(raw_read(fd, 3000) == -1);
     close(fd);
+    fflush(stderr);
+    dup2(save, 2);
+    close(save);
+    char line[512] = {0}, want[128];
+    CHECK(pread(ef, line, sizeof line - 1, 0) > 0);
+    close(ef);
+    unlink(ep);
+    snprintf(want, sizeof want, "cluster version %d (this server speaks %d)", PL_CL_VERSION - 1, PL_CL_VERSION);
+    if (!strstr(line, want))
+        fprintf(stderr, "  rawauth: wanted \"%s\" on stderr, got \"%s\"\n", want, line);
+    CHECK(strstr(line, want) != NULL);
     CHECK(a->ups == 0);
     node_free(a);
+}
+
+/* the salts each handshake derived (peerlink_test_salts), both ends of every connection */
+static pthread_mutex_t salts_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int dialer;
+    uint64_t out, in;
+} salts[16];
+static int nsalts;
+
+static void salts_rec(int dialer, uint64_t out, uint64_t in)
+{
+    pthread_mutex_lock(&salts_mu);
+    if (nsalts < 16)
+        salts[nsalts].dialer = dialer, salts[nsalts].out = out, salts[nsalts].in = in, nsalts++;
+    pthread_mutex_unlock(&salts_mu);
+}
+
+static int salts_count(void)
+{
+    pthread_mutex_lock(&salts_mu);
+    int n = nsalts;
+    pthread_mutex_unlock(&salts_mu);
+    return n;
+}
+
+/* 1 when a frame encoded under salt so passes a reader under salt si */
+static int salt_reads(uint64_t so, uint64_t si)
+{
+    uint8_t pay[64], *fr;
+    uint64_t sq = 0;
+    fill_random(pay, sizeof pay, so);
+    size_t n = pl_frame_encode(PL_CHECK_XXH3, so, &sq, 0, 0x22, pay, sizeof pay, &fr);
+    struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, si, 0);
+    struct collect c = {0};
+    int ok = n && pl_reader_feed(r, fr, n, collect_msg, &c) == 0 && c.n == 1;
+    collect_free(&c);
+    pl_reader_free(r);
+    free(fr);
+    return ok;
+}
+
+/* what the handshake derives (plcheck.h): each connection and each direction of it has a salt of its own, so a frame
+ * reflected back to its sender, or one of an earlier connection replayed into a later one, fails its check (the codec
+ * test shows that a reader under another salt refuses; this shows the handshake hands out other salts). Two connections
+ * of one pair of nodes (two kinds), each seen from both ends. */
+static void test_salts(void)
+{
+    nsalts = 0;
+    peerlink_test_salts = salts_rec;
+    struct node *a = node_new(1, SECRET, NULL, 1);
+    struct node *d = node_new(2, SECRET, NULL, 0);
+    struct plink *f = dial(d, 1, a->port, PL_KIND_FWD), *q = dial(d, 1, a->port, PL_KIND_FWDQ);
+    CHECK(WAIT_FOR(plink_up(f) && plink_up(q), 3000));
+    CHECK(WAIT_FOR(salts_count() >= 4, 3000));
+    node_free(d);
+    node_free(a);
+    peerlink_test_salts = NULL;
+    int n = nsalts, dials = 0, paired = 0, distinct = 1, twoway = 1;
+    for (int i = 0; i < n; i++) {
+        if (salts[i].out == salts[i].in || salt_reads(salts[i].out, salts[i].in))
+            twoway = 0;
+        if (!salts[i].dialer)
+            continue;
+        dials++;
+        for (int j = 0; j < n; j++) {
+            if (!salts[j].dialer && salts[j].in == salts[i].out && salts[j].out == salts[i].in &&
+                salt_reads(salts[i].out, salts[j].in))
+                paired++;
+            if (j != i && salts[j].dialer &&
+                (salts[j].out == salts[i].out || salts[j].in == salts[i].in || salt_reads(salts[i].out, salts[j].in)))
+                distinct = 0;
+        }
+    }
+    printf("  salts: %d handshake ends, %d dialers, %d paired; directions differ %d, connections differ %d\n", n, dials,
+           paired, twoway, distinct);
+    CHECK(n >= 4 && dials >= 2 && paired == dials);
+    CHECK(twoway);   /* a frame reflected to its sender fails */
+    CHECK(distinct); /* a frame of one connection fails in another */
+}
+
+/* raw: one frame with its body, its type or -1 */
+static int raw_frame(int fd, int ms, uint8_t *body, size_t cap, size_t *n)
+{
+    uint8_t h[5];
+    size_t got = 0, want = 5;
+    uint64_t end = now_ms() + (uint64_t)ms;
+    uint32_t len = 0;
+    while (got < want) {
+        struct pollfd pf = {fd, POLLIN, 0};
+        int left = (int)(end - now_ms());
+        if (left <= 0 || poll(&pf, 1, left) <= 0)
+            return -1;
+        ssize_t r = got < 5 ? read(fd, h + got, 5 - got) : read(fd, body + got - 5, want - got);
+        if (r <= 0)
+            return -1;
+        got += (size_t)r;
+        if (got == 5) {
+            memcpy(&len, h, 4);
+            if (len < 1 || len - 1 > cap)
+                return -1;
+            want = 4 + (size_t)len;
+        }
+    }
+    *n = len - 1;
+    return h[4];
+}
+
+/* what the DIALER checks of a HELLO_ACK, played by a raw acceptor that holds the secret (the acceptor's own choice would
+ * hide a missing check): the ACK naming the type offered gets AUTH, one naming a type it did not offer (7, which a later
+ * build might choose) ends the handshake before AUTH */
+static void test_dialtype(void)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 4) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    struct node *d = node_new(2, SECRET, NULL, 0);
+    dial(d, 1, ntohs(sa.sin_port), PL_KIND_LOG);
+    for (int choice = PL_CHECK_XXH3, round = 0; round < 2; round++, choice = 7) {
+        struct pollfd pf = {lfd, POLLIN, 0};
+        CHECK(poll(&pf, 1, 3000) == 1);
+        int fd = accept(lfd, NULL, NULL);
+        CHECK(fd >= 0);
+        uint8_t hello[256], m[512], body[256];
+        size_t hn = 0, o = 0, bn;
+        CHECK(raw_frame(fd, 3000, hello, sizeof hello, &hn) == 1);
+        memcpy(m, "tsdb-link-s", 11);
+        o = 11;
+        memcpy(m + o, hello, hn);
+        o += hn;
+        uint8_t *ack = m + o;
+        uint32_t id = 1;
+        memcpy(ack, &id, 4);
+        memset(ack + 4, g_uuid_byte, 16);
+        memset(ack + 20, 0xB1, 16);
+        fill_random(ack + 36, 32, (uint64_t)round + 1);
+        ack[68] = (uint8_t)choice;
+        o += 69;
+        uint8_t fr[5 + 69 + 32];
+        uint32_t len = 1 + 69 + 32;
+        memcpy(fr, &len, 4);
+        fr[4] = 2; /* HELLO_ACK */
+        memcpy(fr + 5, ack, 69);
+        tsdb_hmac_sha256(SECRET, 32, m, o, fr + 5 + 69);
+        CHECK(write(fd, fr, sizeof fr) == (ssize_t)sizeof fr);
+        int t = raw_frame(fd, 3000, body, sizeof body, &bn);
+        printf("  dialtype: an ACK choosing check type %d gets %d (3: AUTH, -1: closed)\n", choice, t);
+        CHECK(choice == PL_CHECK_XXH3 ? t == 3 && bn == 32 : t == -1);
+        close(fd);
+    }
+    node_free(d);
+    close(lfd);
 }
 
 /* a file whose receiver holds a prefix that is not the sender's bytes: the file's xxh64 does not match, and both ends
@@ -2509,6 +2751,24 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "checktype")) {
                 peerlink_mutant = PL_MUT_CHECKTYPE;
                 only = "rawauth";
+            } else if (!strcmp(m, "samesalt")) {
+                peerlink_mutant = PL_MUT_SAMESALT;
+                only = "salts";
+            } else if (!strcmp(m, "notranscript")) {
+                peerlink_mutant = PL_MUT_NOTRANSCRIPT;
+                only = "salts";
+            } else if (!strcmp(m, "dialanytype")) {
+                peerlink_mutant = PL_MUT_DIALANYTYPE;
+                only = "dialtype";
+            } else if (!strcmp(m, "notype")) {
+                peerlink_mutant = PL_MUT_NOTYPE;
+                only = "codec";
+            } else if (!strcmp(m, "halfcmp")) {
+                peerlink_mutant = PL_MUT_HALFCMP;
+                only = "codec";
+            } else if (!strcmp(m, "seq8")) {
+                peerlink_mutant = PL_MUT_SEQ8;
+                only = "codec";
             } else if (!strcmp(m, "sharedsocket")) {
                 peerlink_mutant = PL_MUT_SHAREDSOCKET;
                 only = "latency";
@@ -2588,7 +2848,7 @@ int main(int argc, char **argv)
     static const struct tcase cases[] = {
         {"codec", test_codec},   {"log", test_log},         {"bulk", test_bulk},
         {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip},
-        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"endhash", test_endhash},
+        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"salts", test_salts}, {"dialtype", test_dialtype}, {"endhash", test_endhash},
         {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},

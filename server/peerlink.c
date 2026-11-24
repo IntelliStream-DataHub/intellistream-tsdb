@@ -44,6 +44,7 @@
 
 int peerlink_mutant;
 int peerlink_test_cut_end;
+void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 
 #define TAG PL_CHECK_LEN
 #define MS 1000000ull
@@ -264,8 +265,14 @@ struct fck {
  * `seq`: XXH3-128 seeded with salt ^ seq */
 static void frame_check(const struct fck *k, uint64_t seq, const uint8_t *f, size_t n, uint8_t out[TAG])
 {
-    uint64_t seed = peerlink_mutant == PL_MUT_NOSEQ ? k->salt : peerlink_mutant == PL_MUT_NOSALT ? seq : k->salt ^ seq;
-    pl_check(k->type, seed, f, n, out);
+    uint64_t seed = peerlink_mutant == PL_MUT_NOSEQ    ? k->salt
+                    : peerlink_mutant == PL_MUT_NOSALT ? seq
+                    : peerlink_mutant == PL_MUT_SEQ8   ? k->salt ^ (uint8_t)seq
+                                                       : k->salt ^ seq;
+    if (peerlink_mutant == PL_MUT_NOTYPE)
+        pl_check(k->type, seed, f + 1, n - 1, out);
+    else
+        pl_check(k->type, seed, f, n, out);
 }
 
 /* the handshake's MAC and the link keys: HMAC(secret, label | transcript) */
@@ -449,7 +456,7 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
         size_t body = len - TAG;
         uint8_t t[TAG];
         frame_check(&r->key, r->seq++, f, body, t);
-        if (!r->skip && peerlink_mutant != PL_MUT_NOTAG && !tsdb_ct_equal(t, f + body, TAG)) {
+        if (!r->skip && peerlink_mutant != PL_MUT_NOTAG && !tsdb_ct_equal(t, f + body, peerlink_mutant == PL_MUT_HALFCMP ? 8 : TAG)) {
             r->bad = 1;
             break;
         }
@@ -1002,17 +1009,14 @@ struct hello {
 };
 
 /* the HELLO body of a data link: magic, version, id, uuid, ident, nonce, address (u16 length + bytes), kind, the
- * check types offered (u8 bit set, from cluster version 8); -1 when it is not one. Another version is refused with a
- * line naming both (cluster.c's acceptor says it first for the connections it hands over). */
+ * check types offered (u8 bit set, from cluster version 8); -1 when it is not one, -2 when it is one of another cluster
+ * version (peerlink_adopt says so; peerlink_hello_kind, which the fuzzer reaches, says nothing). */
 static int hello_parse(const uint8_t *p, size_t n, struct hello *h)
 {
     if (n < 4 + 1 + 4 + 16 + 16 + 32 + 2 + 1 || le32(p) != PL_CL_MAGIC)
         return -1;
-    if (p[4] != PL_CL_VERSION) {
-        fprintf(stderr, "peerlink: refused a link of cluster version %u (this server speaks %u)\n", (unsigned)p[4],
-                (unsigned)PL_CL_VERSION);
-        return -1;
-    }
+    if (p[4] != PL_CL_VERSION)
+        return -2;
     h->id = le32(p + 5);
     memcpy(h->uuid, p + 9, 16);
     memcpy(h->ident, p + 25, 16);
@@ -1064,10 +1068,15 @@ static void keys_derive(const struct peerlink *pl, int dialer, int check, const 
                         struct keys *k)
 {
     uint8_t ko[32], ki[32];
-    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-x>" : "tsdb-link-x<", tr, trlen, ko);
-    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-x<" : "tsdb-link-x>", tr, trlen, ki);
+    int same = peerlink_mutant == PL_MUT_SAMESALT;
+    if (peerlink_mutant == PL_MUT_NOTRANSCRIPT)
+        trlen = 0;
+    hs_mac(pl->secret, pl->secret_len, dialer || same ? "tsdb-link-x>" : "tsdb-link-x<", tr, trlen, ko);
+    hs_mac(pl->secret, pl->secret_len, dialer && !same ? "tsdb-link-x<" : "tsdb-link-x>", tr, trlen, ki);
     k->out = (struct fck){check, le64(ko)};
     k->in = (struct fck){check, le64(ki)};
+    if (peerlink_test_salts)
+        peerlink_test_salts(dialer, k->out.salt, k->in.salt);
     tsdb_wipe(ko, 32);
     tsdb_wipe(ki, 32);
 }
@@ -1114,7 +1123,7 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
         (l->want_id && id != l->want_id))
         return -1;
     int check = body[4 + 16 + 16 + 32];
-    if (check < 1 || check > 7 || !(PL_CHECKS_KNOWN & (1u << check))) {
+    if ((check < 1 || check > 7 || !(PL_CHECKS_KNOWN & (1u << check))) && peerlink_mutant != PL_MUT_DIALANYTYPE) {
         fprintf(stderr, "peerlink: node %" PRIu32 " chose frame check type %d, which this server does not run (it "
                 "offered 0x%x)\n", id, check, PL_CHECKS_KNOWN);
         return -1;
@@ -1926,7 +1935,11 @@ static void *adopt_main(void *arg)
 int peerlink_adopt(struct peerlink *pl, int fd, const uint8_t *hello, size_t hello_len, const struct pl_self *self)
 {
     struct hello h;
-    if (hello_len > HS_FRAME_MAX || hello_parse(hello, hello_len, &h) != 0)
+    int hp = hello_len > HS_FRAME_MAX ? -1 : hello_parse(hello, hello_len, &h);
+    if (hp == -2) /* a peer of another version (tsdbd's cluster.c says it before it hands a connection over) */
+        fprintf(stderr, "peerlink: refused a link of cluster version %u (this server speaks %u)\n", (unsigned)hello[4],
+                (unsigned)PL_CL_VERSION);
+    if (hp != 0)
         return -1;
     if (h.kind <= PL_KIND_META || h.kind > PL_KIND_DATA_MAX) {
         fprintf(stderr, "peerlink: refused a link of kind %d from node %" PRIu32 " (unknown here)\n", h.kind, h.id);

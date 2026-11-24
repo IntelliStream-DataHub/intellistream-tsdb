@@ -516,7 +516,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
