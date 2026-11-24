@@ -259,7 +259,14 @@ cgroup, so `nice` does not keep your work out of its way.
   epoch, UNAVAILABLE while its users lag the envelope's index; `tests/test_fwd.c` (fake link), `test_cluster
   forward|fwdlease|fwddepose|fwdload`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
   `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`); end to end through entry nodes: `test_cluster viabench`, jepsen-cluster `kv-via` with
-  `fwdstall` (read-your-writes, "old frame"). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
+  `fwdstall` (read-your-writes, "old frame"). Planned leader transfer and leader balance (R4 D14, D15;
+  design-cluster.md 3.2 "as built"): `server/rtransfer.c` the volume leader's drain, READY and hold (TSDB_REPLD_MUTANT
+  `transfernodrain transferadmit transferresume`), `server/ctransfer.c` the Raft leader's TRANSFER, CANCEL, targeted
+  promotion and balance (TSDB_CLUSTER_MUTANT `transferanycand transferfewreplies balanceflap nocancel readynocancel`);
+  transfer ids increase across Raft leaders and every VOLCMD of a transfer carries one; `make transfer-mutants`
+  (tests/transfer_mutants.sh), `test_cluster transfer|transferslow|transferhold|transferstale|transfermarkers|transferkill|
+  transferraftkill|balance|balancetwo|balancecut` (hooks: TSDB_REPLD_TEST `admithold`, TSDB_CLUSTER_TEST `drop_fence_file`,
+  `lose_ready_file`; `TR_TRANSFERS` the count of `transfer`, TR_DEBUG=1 its slow writes). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
   (Login and rights, below; docs/cluster-preview.md "Logins"). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
