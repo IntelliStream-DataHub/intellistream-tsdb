@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,8 +37,16 @@
 #include "repld_int.h"
 #include "snapinst.h"
 
+/* TSDB_REPLD_TEST=snappowerat=K (test_cluster snappower, crashfs preloaded): after install step K (SNAP_INST_*) the
+ * process asks crashfs for a power loss, which comes at the next tracked operation (K = 0: before the close) */
+static int power_at = -1;
+
 static void inst_hook(int at)
 {
+    if (at == power_at) {
+        say("TEST: a power loss after install step %d (snappowerat)", at);
+        kill(getpid(), SIGUSR2); /* process-directed: a thread that blocks it does not keep it pending */
+    }
     if (at == SNAP_INST_SWAPPED)
         crash_point(CP_SNAP_SWAPPED);
 }
@@ -186,12 +195,17 @@ int snapinst_install(const char *root, uint32_t number, const char *staged, uint
         say("MUTANT: volume %" PRIu32 ": the old REPL read before the close (snapstalekeep)", number);
     }
     const char *te = getenv("TSDB_REPLD_TEST");
+    const char *pa = te ? strstr(te, "snappowerat=") : NULL;
+    if (pa)
+        power_at = atoi(pa + strlen("snappowerat="));
     const char *cd = te ? strstr(te, "snapclosedelay=") : NULL;
     if (cd) {
         unsigned ms = (unsigned)strtoul(cd + strlen("snapclosedelay="), NULL, 10);
         say("TEST: volume %" PRIu32 ": the close for the install waits %u ms (snapclosedelay)", number, ms);
         usleep((useconds_t)ms * 1000);
     }
+    if (power_at == 0)
+        inst_hook(0);
     int rc = cvol_install(number, inst_fn, &in);
     if (in.have_pre > 0)
         replfile_state_free(&in.pre);
