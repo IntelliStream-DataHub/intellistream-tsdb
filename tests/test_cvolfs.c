@@ -14,10 +14,14 @@
  *    at a step of the resumed run: v<N> is absent or whole, never a stranded v<N>.tmp after the next prepare, REPL is
  *    the last acknowledged open, the one in flight or the acknowledged one under a belt, never a nonce that is not
  *    the one reported, and the next prepare is accepted under a record at the acknowledged open.
+ *  - setpower: power lost at every step of a replica's removal (v<N> renamed v<N>.removed-<rid>) and of a prepare that
+ *    sets a v<N> of another rid aside (stale, or lost under a reset) and makes the fresh one: the old directory is v<N>
+ *    or set aside, never neither, an acknowledged step holds, the next start completes the change.
  *
  *   ./build/test_cvolfs [scratch dir]
- *   ./build/test_cvolfs --mutant nosync|nodirsync|nononce|trustunsure|tornstale|samerid [scratch dir]    must fail
+ *   ./build/test_cvolfs --mutant nosync|nodirsync|nononce|trustunsure|tornstale|samerid|removenodirsync [dir]  must fail
  *   ./build/test_cvolfs --child DIR ACKFILE      (internal: a process the shim kills)
+ *   ./build/test_cvolfs --setchild DIR ACKFILE removed|stale|lost      (internal: the same for setpower)
  */
 #define _GNU_SOURCE
 #include "cluster.h"
@@ -282,6 +286,18 @@ static void test_refusals(void)
     r = rec(1, 1, o.nonce);
     CHECK(cvolfs_prepare(root, &r, &o2) == 0 && o2.gen == 2);
     RESTORE();
+    /* another rid that the group never saw opened (an ADD after a REMOVE while this server was down): the old directory
+     * is set aside as stale and a fresh one made; the refusal above holds only for a rid recorded as opened here */
+    {
+        struct cvolfs_rec n = rec(1, 0, 0);
+        char aside[64];
+        snprintf(aside, sizeof aside, "v1.stale-%016" PRIx64, n.rid);
+        n.rid++;
+        CHECK(cvolfs_prepare(root, &n, &o2) == 0 && o2.gen == 1);
+        CHECK(exists(root, aside));
+        CHECK(sh("rm -rf '%s/%s'", root, aside) == 0);
+        RESTORE();
+    }
 
     /* a missing REPL in a directory that has data, one with no valid slot, a stub of the old text format */
     char p[PATH_MAX + 64];
@@ -485,7 +501,7 @@ static void child_run(const char *dir, const char *ackfile)
     _exit(0);
 }
 
-static int run_child(const char *dir, const char *ackfile, int warmup, int seed)
+static int run_child(const char *dir, const char *ackfile, int warmup, int seed, const char *kind)
 {
     pid_t pid = fork();
     if (pid == 0) {
@@ -508,7 +524,10 @@ static int run_child(const char *dir, const char *ackfile, int warmup, int seed)
             dup2(null, 1);
             dup2(null, 2);
         }
-        execl(SELF, "test_cvolfs", "--child", dir, ackfile, (char *)NULL);
+        if (kind)
+            execl(SELF, "test_cvolfs", "--setchild", dir, ackfile, kind, (char *)NULL);
+        else
+            execl(SELF, "test_cvolfs", "--child", dir, ackfile, (char *)NULL);
         _exit(127);
     }
     int st = -1;
@@ -600,7 +619,7 @@ static void test_power_loss(void)
     for (int k = 0; k < 600 && !finished; k++) {
         fresh("pl-dir", dir, sizeof dir);
         unlink(ackf);
-        int code = run_child(dir, ackf, k, k + 1);
+        int code = run_child(dir, ackf, k, k + 1, NULL);
         CHECK(code == 99 || code == 0);
         if (code != 99 && code != 0)
             break;
@@ -608,7 +627,7 @@ static void test_power_loss(void)
         finished = code == 0;
         if (code == 99 && k % 2 == 0) {
             /* the resumed run loses power too, at a step of its own: through the removal of a v1.tmp, the make, an open */
-            int c2 = run_child(dir, ackf, (k * 7) % 31, k + 1000);
+            int c2 = run_child(dir, ackf, (k * 7) % 31, k + 1000, NULL);
             /* crashfs's unlink moves a file aside until the process ends (to undo it at a crash), so the rmdir of a
              * leftover v1.tmp that follows its unlinks fails there with ENOTEMPTY: that run ends with 4 and the
              * leftover. So a power loss inside "remove a leftover v1.tmp, then make v1" is not exercised under the
@@ -627,6 +646,146 @@ static void test_power_loss(void)
            NOPENS, again);
 }
 
+/* setpower (r4-setchg): power lost at every step of the replica set changes' directory moves. "removed": the removal
+ * (cvolset_setaside "removed", what cvolset_mgr's remove_dir does once the copy shows the removal); "stale": the
+ * prepare of a record naming another rid (the old v1 set aside as v1.stale-<rid>, a fresh v1 made and opened); "lost":
+ * the same under a replica reset (v1.lost-<rid>). The old replica's directory is there after the loss as v1 or under
+ * its set-aside name, never neither and never both; a v1 is whole; an acknowledged step holds (the removal's rename,
+ * the fresh replica's open); and the next start (the removal again, or the prepare under the acknowledged open) ends
+ * with the change made. */
+#define RID_A UINT64_C(0x0a1b2c3d4e5f6071) /* the old replica; rec()'s rid is the new one */
+
+static void set_child(const char *dir, const char *ackfile, const char *kind)
+{
+    char to[PATH_MAX + 64];
+    if (!strcmp(kind, "removed")) {
+        if (exists(dir, "v1") && cvolset_setaside(dir, 1, "removed", RID_A, to, sizeof to) != 0)
+            _exit(4);
+        ack(ackfile, 1, 0);
+        exit(0); /* not _exit: the shim's power loss at exit is the check that the rename was made durable */
+    }
+    uint64_t gen, nonce;
+    last_ack(ackfile, &gen, &nonce);
+    for (int k = 0; k < 2; k++) {
+        struct cvolfs_rec r = rec(1, gen, nonce);
+        if (!strcmp(kind, "lost"))
+            cvolset_note(1, CVS_RESET, r.rid); /* the push that names the new rid, again at every start */
+        struct cvolfs_open o;
+        if (cvolfs_prepare(dir, &r, &o) != 0)
+            _exit(4);
+        ack(ackfile, o.gen, o.nonce);
+        gen = o.gen, nonce = o.nonce;
+    }
+    exit(0);
+}
+
+static bool whole_at(const char *dir, const char *v, uint64_t *rid)
+{
+    char a[PATH_MAX + 64], b[PATH_MAX + 64], c[PATH_MAX + 64], vd[PATH_MAX * 2];
+    snprintf(a, sizeof a, "%s/META", v), snprintf(b, sizeof b, "%s/REPL", v), snprintf(c, sizeof c, "%s/FNO", v);
+    snprintf(vd, sizeof vd, "%s/%s", dir, v);
+    return exists(dir, a) && exists(dir, b) && exists(dir, c) && cvolset_rid_of(vd, rid) == 0;
+}
+
+static void check_set_after(const char *dir, const char *ackfile, const char *kind, int k)
+{
+    char aside[64], m[400];
+    snprintf(aside, sizeof aside, "v1.%s-%016" PRIx64, kind, RID_A);
+    uint64_t agen, anonce, rid = 0, arid = 0;
+    int acks = last_ack(ackfile, &agen, &anonce);
+    bool v1 = exists(dir, "v1"), v1whole = v1 && whole_at(dir, "v1", &rid), v1old = v1whole && rid == RID_A;
+    bool as = exists(dir, aside);
+    if (v1 && !v1whole) {
+        snprintf(m, sizeof m, "%s, step %d: v1 exists without all of META, REPL (with a rid) and FNO", kind, k);
+        fail_at(__FILE__, __LINE__, m);
+    }
+    if (v1whole && rid != RID_A && rid != rec(1, 0, 0).rid) {
+        snprintf(m, sizeof m, "%s, step %d: v1 holds replica %016" PRIx64 ", neither the old nor the new", kind, k, rid);
+        fail_at(__FILE__, __LINE__, m);
+    }
+    if (v1old == as) {
+        snprintf(m, sizeof m, "%s, step %d: the old replica's directory is %s", kind, k,
+                 as ? "both v1 and set aside" : "neither v1 nor set aside");
+        fail_at(__FILE__, __LINE__, m);
+    }
+    if (as && !(whole_at(dir, aside, &arid) && arid == RID_A)) {
+        snprintf(m, sizeof m, "%s, step %d: %s is not the old replica whole", kind, k, aside);
+        fail_at(__FILE__, __LINE__, m);
+    }
+    if (acks && (!strcmp(kind, "removed") ? v1 : v1old)) {
+        snprintf(m, sizeof m, "%s, step %d: acknowledged, and v1 still holds the old replica after the power loss", kind, k);
+        fail_at(__FILE__, __LINE__, m);
+    }
+    /* the next start */
+    char to[PATH_MAX + 64];
+    if (!strcmp(kind, "removed")) {
+        if (v1) {
+            cap_begin();
+            CHECK(cvolset_setaside(dir, 1, "removed", RID_A, to, sizeof to) == 0);
+            cap_end(NULL, 0);
+        }
+        CHECK(!exists(dir, "v1") && exists(dir, aside));
+        return;
+    }
+    struct cvolfs_rec r = rec(1, agen, anonce);
+    if (!strcmp(kind, "lost"))
+        cvolset_note(1, CVS_RESET, r.rid);
+    struct cvolfs_open o;
+    cap_begin();
+    int rc = cvolfs_prepare(dir, &r, &o);
+    cap_end(NULL, 0);
+    if (rc != 0) {
+        snprintf(m, sizeof m, "%s, step %d: the next start's prepare under the acknowledged open was refused", kind, k);
+        fail_at(__FILE__, __LINE__, m);
+        return;
+    }
+    cvolset_noted(1, CVS_RESET, NULL, 1); /* none left for the next round */
+    CHECK(!exists(dir, "v1.tmp"));
+    CHECK(whole_at(dir, "v1", &rid) && rid == r.rid && o.gen > agen);
+    CHECK(whole_at(dir, aside, &arid) && arid == RID_A);
+}
+
+static void test_set_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  set power loss: skipped (no %s)\n", SHIM);
+        return;
+    }
+    static const char *const kinds[] = {"removed", "stale", "lost"};
+    char dir[PATH_MAX + 32], ackf[PATH_MAX + 32];
+    snprintf(ackf, sizeof ackf, "%s/sp.ack", S);
+    for (int i = 0; i < 3; i++) {
+        int crashes = 0, whole = 0;
+        bool finished = false;
+        /* a loss at each step in turn, then 16 runs that end whole and lose power at their exit (a random subset of
+         * what was not made durable undone: an unsynced rename is undone in about half of them) */
+        for (int k = 0; k < 300 && whole < 16; k++) {
+            int warm = finished ? 1000000 : k;
+            fresh("sp-dir", dir, sizeof dir);
+            unlink(ackf);
+            struct cvolfs_rec ra = rec(1, 0, 0);
+            ra.rid = RID_A;
+            struct cvolfs_open o;
+            cap_begin();
+            int rc = cvolfs_prepare(dir, &ra, &o);
+            cap_end(NULL, 0);
+            CHECK(rc == 0);
+            int code = run_child(dir, ackf, warm, k + 1, kinds[i]);
+            CHECK(code == 99 || code == 0);
+            if (code != 99 && code != 0)
+                break;
+            crashes += code == 99;
+            if (code == 0)
+                finished = true, whole++;
+            check_set_after(dir, ackf, kinds[i], k);
+        }
+        CHECK(finished && whole == 16 && crashes >= 2);
+        printf("  set power loss, %s: lost at each of %d steps and at the exit of %d whole runs: the old replica's "
+               "directory v1 or set aside, never neither, the acknowledged step held, the next start made the change\n",
+               kinds[i], crashes, whole);
+    }
+}
+
 static void set_mutant(const char *m)
 {
     if (!strcmp(m, "nosync"))
@@ -641,6 +800,8 @@ static void set_mutant(const char *m)
         cvolfs_test_mutant = CVOLFS_MUT_TORNSTALE;
     else if (!strcmp(m, "samerid"))
         cvolfs_test_mutant = CVOLFS_MUT_SAMERID;
+    else if (!strcmp(m, "removenodirsync"))
+        cvolfs_test_mutant = CVOLFS_MUT_REMOVENODIRSYNC;
     else {
         fprintf(stderr, "unknown mutant %s\n", m);
         exit(2);
@@ -673,6 +834,12 @@ int main(int argc, char **argv)
         if (getenv("TSDB_CVOLFS_MUTANT"))
             set_mutant(getenv("TSDB_CVOLFS_MUTANT"));
         child_run(argv[2], argv[3]);
+        return 0;
+    }
+    if (argc >= 5 && strcmp(argv[1], "--setchild") == 0) {
+        if (getenv("TSDB_CVOLFS_MUTANT"))
+            set_mutant(getenv("TSDB_CVOLFS_MUTANT"));
+        set_child(argv[2], argv[3], argv[4]);
         return 0;
     }
     const char *scratch = "/tmp", *mutant = NULL;
@@ -711,6 +878,8 @@ int main(int argc, char **argv)
     if (!mutant || replfile_test_mutant == REPLFILE_MUT_NOSYNC || cvolfs_test_mutant == CVOLFS_MUT_NODIRSYNC ||
         cvolfs_test_mutant == CVOLFS_MUT_NONONCE)
         test_power_loss();
+    if (!mutant || cvolfs_test_mutant == CVOLFS_MUT_REMOVENODIRSYNC)
+        test_set_power();
     sh("rm -rf '%s'", S);
     if (failures)
         fprintf(stderr, "%d cvolfs checks FAILED\n", failures);
