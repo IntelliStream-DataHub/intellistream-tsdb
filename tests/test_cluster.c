@@ -13239,6 +13239,129 @@ static void scen_transfergrant(void)
     tr_finish(&x, "transfergrant", 0);
 }
 
+/* transferadmin (F5 of the review): every refusal of `tsdb cluster volume transfer` (ctransfer.c tr_check) with its
+ * message, and nothing changed by one (epoch, leader, the Raft leader's started count): the current leader as target;
+ * a second transfer while one drains (TSDB_REPLD_TEST=drainhold); a member that is in the ISR but not up (paused past
+ * node_timeout_ms with the ISR held, TSDB_CLUSTER_TEST hold_isr_file); the same member once it left the ISR. Mutants
+ * adminself, adminbusy, adminup, adminisr each take one check away. */
+static int tr_refused(int R, uint32_t num, uint32_t to, const char *want, const char *what)
+{
+    struct meta_volume b, a;
+    if (!vol_rec(R, "tv", &b))
+        die("no record of tv");
+    char why[256];
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(num, to, body);
+    int rc = admin(R, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl); /* to R: server 0 may be the paused one */
+    snprintf(why, sizeof why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    if (rc == 0 || !strstr(why, want))
+        die("transferadmin: a transfer %s: %s (%s), not refused with \"%s\"", what, rc ? cluster_strerror(rc) : "OK",
+            why, want);
+    if (!vol_rec(R, "tv", &a) || a.epoch != b.epoch || a.leader != b.leader)
+        die("transferadmin: the refused transfer %s changed tv: epoch %" PRIu64 " -> %" PRIu64 ", leader %u -> %u", what,
+            b.epoch, a.epoch, b.leader, a.leader);
+    printf("  a transfer %s: refused (%s)\n", what, why);
+    return rc;
+}
+
+static void scen_transferadmin(void)
+{
+    scenario("transferadmin");
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "hold_isr_file=1";
+        penv[i] = "TSDB_REPLD_TEST=drainhold";
+    }
+    struct tr_run x;
+    tr_setup(&x);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int R = leader_of(0);
+    if (R < 0)
+        die("no Raft leader");
+    int L = server_of(v.leader);
+    /* t2, 2 replicas of 3 members: the third is up and not in its ISR */
+    uint32_t n2 = 0;
+    int rc2 = vol_add(0, "t2", 2, &n2);
+    if (rc2 != 0)
+        die("volume add t2: %s", cluster_strerror(rc2));
+    struct meta_volume v2 = {0};
+    uint64_t tw = now_ms();
+    while (!vol_rec(R, "t2", &v2) || !v2.leader || v2.nisr != 2)
+        if (now_ms() - tw > 30000)
+            die("t2 has no leader and ISR of 2 after 30 s");
+        else
+            usleep(20000);
+    uint32_t out = 0;
+    for (int i = 0; i < 3; i++)
+        if (ids[i] != v2.isr[0] && ids[i] != v2.isr[1])
+            out = ids[i];
+    uint64_t started = tr_count(R, CL_TR_STARTED);
+    {
+        char why[256];
+        uint8_t body[8], *reply = NULL;
+        size_t rl = 0, bl = cluster_volume_force_encode(n2, out, body);
+        int rc = admin(R, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl);
+        snprintf(why, sizeof why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+        free(reply);
+        struct meta_volume a2;
+        if (rc == 0 || !strstr(why, "not in its ISR"))
+            die("transferadmin: a transfer of t2 to node %u outside its ISR: %s (%s), not refused with \"not in its "
+                "ISR\"", out, rc ? cluster_strerror(rc) : "OK", why);
+        if (!vol_rec(R, "t2", &a2) || a2.epoch != v2.epoch || a2.leader != v2.leader)
+            die("transferadmin: the refused transfer of t2 changed it");
+        printf("  a transfer to an up member outside the ISR: refused (%s)\n", why);
+    }
+    tr_refused(R, x.num, v.leader, "leads it already", "to the current leader");
+    if (tr_count(R, CL_TR_STARTED) != started)
+        die("transferadmin: a refused transfer counted as started");
+    /* a second transfer while the first one's drain is held on the leader */
+    int T = tr_other(L, R == L ? -1 : R), U = 3 - L - T;
+    char f[PATH_MAX + 40];
+    snprintf(f, sizeof f, "%s/n%d/drainhold", base, L);
+    FILE *fp = fopen(f, "w");
+    if (!fp || fclose(fp) != 0)
+        die("write %s: %s", f, strerror(errno));
+    int drains = log_count(L, ": drains (written");
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": drains (written", drains + 1, 30000);
+    tr_refused(R, x.num, ids[U], "a transfer of it is under way", "while one drains");
+    tr_refused(R, x.num, ids[T], "a transfer of it is under way", "to the same target while one drains");
+    if (unlink(f) != 0)
+        die("unlink %s: %s", f, strerror(errno));
+    pthread_join(th, NULL);
+    if (ta.rc != 0)
+        die("transferadmin: the held transfer to node %u: %s (%s)", ids[T], ta.rc == 1 ? "lost" : cluster_strerror(ta.rc),
+            ta.why);
+    if (tr_count(R, CL_TR_STARTED) != started + 1)
+        die("transferadmin: the Raft leader counts %" PRIu64 " transfers started, not %" PRIu64,
+            tr_count(R, CL_TR_STARTED), started + 1);
+    tr_await_acks(&x, now_ms(), "after the held transfer");
+    /* a member in the ISR that is not up: neither the Raft leader nor the volume's leader (now T) */
+    if (!vol_rec(R, "tv", &v) || server_of(v.leader) != T)
+        die("tv is not led by server %d after its transfer there", T);
+    int P = tr_other(T, R); /* T != R: tr_other above */
+    hold_isr(1);
+    pause_server(P, 1);
+    usleep(3000 * 1000 + 1500 * 1000); /* node_timeout_ms 3000, and a heartbeat round */
+    tr_refused(R, x.num, ids[P], "the node is not up", "to a paused member still in the ISR");
+    hold_isr(0);
+    int via = tr_other(P, -1);
+    await_isr(via, "tv", 2, 30000, "the paused member out of the ISR");
+    tr_refused(R, x.num, ids[P], "not in its ISR", "to a member outside the ISR");
+    pause_server(P, 0);
+    await_isr(via, "tv", 3, 60000, "the paused member back in the ISR");
+    if (tr_count(R, CL_TR_STARTED) != started + 1)
+        die("transferadmin: the Raft leader counts %" PRIu64 " transfers started after the refusals, not %" PRIu64,
+            tr_count(R, CL_TR_STARTED), started + 1);
+    tr_await_acks(&x, now_ms(), "after the paused member came back");
+    tr_finish(&x, "transferadmin", 1);
+}
+
 /* transferstale (D14): the volume leader's READY and the Raft leader's CANCEL of the timed-out transfer are both lost
  * (TSDB_CLUSTER_TEST lose_ready_file), so the volume leader holds its writes for a transfer the Raft leader no longer
  * knows. Once READYs get through again, the Raft leader must answer the next resent one with a CANCEL of that id: the
@@ -13947,7 +14070,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

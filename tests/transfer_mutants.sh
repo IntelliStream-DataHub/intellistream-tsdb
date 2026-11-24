@@ -12,7 +12,9 @@
 # unanswered: the volume leader holds its writes until the hard cap) transferstale; readypinned (READY resent to the
 # Raft leader that asked, not the current one) with nocancel planted beside it transferraftkill (with READY to the
 # current Raft leader, its CANCEL of a READY it does not hold is the rescue that nocancel alone leaves); dropproposed
-# (a transfer's promotion dropped at PROMO_MOVE_NS though its grant is proposed and may still commit) transfergrant.
+# (a transfer's promotion dropped at PROMO_MOVE_NS though its grant is proposed and may still commit) transfergrant;
+# adminself, adminbusy, adminup, adminisr (the admin accepts the current leader, a second transfer of a volume, a member
+# that is not up, one outside the ISR) transferadmin.
 # Usage: tests/transfer_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
@@ -29,6 +31,7 @@ scenario() {
     readypinned) s=transferraftkill v=TSDB_REPLD_MUTANT x=TSDB_CLUSTER_MUTANT=nocancel ;;
     readynocancel) s=transferstale ;;
     dropproposed) s=transfergrant ;;
+    adminself | adminbusy | adminup | adminisr) s=transferadmin ;;
     *) s=transfer ;;
     esac
 }
@@ -40,7 +43,7 @@ if [ "${1:-}" = --mutant-run ]; then
     exit
 fi
 dir=${1:-/tmp}; shift || true
-muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed}
+muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed adminself adminbusy adminup adminisr}
 # a mutant is caught by any failure of its scenario; MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
 exec "$(dirname "$0")/../tools/mutants.sh" --name transfer --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" \
     --detail FAIL --list "$muts" -- "$0" --mutant-run @M@ @D@

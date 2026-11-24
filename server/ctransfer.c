@@ -78,7 +78,8 @@ static uint64_t g_last_balance; /* the last balance start */
 /* STATUS (cluster_int.h ctr_counts) */
 static atomic_ulong n_started, n_done, n_timedout, n_cancelled, n_fallback, n_balance;
 
-enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL, CTM_DROPPROPOSED };
+enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL, CTM_DROPPROPOSED,
+       CTM_ADMINSELF, CTM_ADMINISR, CTM_ADMINUP, CTM_ADMINBUSY };
 /* TSDB_CLUSTER_MUTANT's names of this file (cluster.c's parser knows none of them) */
 static int ctr_mutant(void)
 {
@@ -92,6 +93,10 @@ static int ctr_mutant(void)
             : !strcmp(e, "nocancel")           ? CTM_NOCANCEL
             : !strcmp(e, "readynocancel")      ? CTM_READYNOCANCEL
             : !strcmp(e, "dropproposed")       ? CTM_DROPPROPOSED
+            : !strcmp(e, "adminself")          ? CTM_ADMINSELF
+            : !strcmp(e, "adminisr")           ? CTM_ADMINISR
+            : !strcmp(e, "adminup")            ? CTM_ADMINUP
+            : !strcmp(e, "adminbusy")          ? CTM_ADMINBUSY
                                                : CTM_NONE;
         if (m != CTM_NONE)
             cl_say("MUTANT %s (tests only)", e);
@@ -207,15 +212,16 @@ static const char *tr_check(const struct meta_volume *v, uint32_t node, uint64_t
         return "not a replicated volume";
     if (!v->leader)
         return "the volume has no leader";
-    if (node == v->leader)
+    int m = ctr_mutant(); /* the admin mutants of test_cluster transferadmin */
+    if (node == v->leader && m != CTM_ADMINSELF)
         return "the node leads it already";
-    if (!meta_volume_in_isr(v, node))
+    if (!meta_volume_in_isr(v, node) && m != CTM_ADMINISR)
         return "the node is not in its ISR";
-    if (!member_up(node, now))
+    if (!member_up(node, now) && m != CTM_ADMINUP)
         return "the node is not up";
     if (!member_up(v->leader, now))
         return "its leader is not up";
-    if (tr_find(v->number))
+    if (tr_find(v->number) && m != CTM_ADMINBUSY)
         return "a transfer of it is under way";
     if (cl_promo_running(v->number))
         return "a promotion of it is under way";
