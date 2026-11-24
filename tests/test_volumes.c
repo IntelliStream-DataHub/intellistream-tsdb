@@ -1616,7 +1616,18 @@ static void test_add_power_loss(const char *base, const char *argv0)
     char dir[PATH_MAX], cli[PATH_MAX + 16], shim[PATH_MAX + 32];
     snprintf(dir, sizeof dir, "%.*s", (int)(strrchr(argv0, '/') ? strrchr(argv0, '/') - argv0 : 1),
              strrchr(argv0, '/') ? argv0 : ".");
+    /* the CLI: TSDB_CLI, else beside the test (a build directory), else bin/ of the unpacked tarball, whose tests/
+     * hold no second copy of it (dist-test reaches this last one: make dist-test fails when it breaks) */
+    const char *env_cli = getenv("TSDB_CLI");
     snprintf(cli, sizeof cli, "%s/tsdb", dir);
+    if (env_cli && *env_cli)
+        snprintf(cli, sizeof cli, "%s", env_cli);
+    else if (access(cli, X_OK) != 0) {
+        char alt[PATH_MAX + 16];
+        snprintf(alt, sizeof alt, "%s/../bin/tsdb", dir);
+        if (access(alt, X_OK) == 0)
+            snprintf(cli, sizeof cli, "%s", alt);
+    }
     snprintf(shim, sizeof shim, "%s/libcrashfs.so", dir);
     char shim_abs[PATH_MAX];
     if (access(cli, X_OK) != 0 || !realpath(shim, shim_abs)) {

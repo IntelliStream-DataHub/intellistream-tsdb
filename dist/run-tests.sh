@@ -13,6 +13,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/.." && pwd)
 scratch=${1:-/tmp}
 export TSDBD="$top/bin/tsdbd"
+# The tarball ships the CLI (bin/) and the crashfs shim (tests/): the cases that need them must run, never skip, here
+# and in the container gate (dist-check-almalinux10), which does not get the Makefile's export.
+export TSDB_REQUIRE_CRASHFS=${TSDB_REQUIRE_CRASHFS:-1}
 fail=0
 run() {
     echo "=== $*"
