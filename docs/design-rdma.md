@@ -249,8 +249,8 @@ Round trip, p50 (p99) in µs, mean of 3 runs:
 | 1 MiB | 518 (635) | 671 (969) | 17,800 (18,700) |
 
 The check takes the cap off: from 16 KiB on a checked link moves 26-35 Gbit/s against 1.8-1.9 with the HMAC, 14-18
-times as much, within 3-19% of the untagged link, and costs 0.04-0.07 CPU s/GB more per side than untagged (the HMAC
-cost 4.1). The 1 KiB round trip loses 4 µs to the check instead of 26. The 64 B and 1 KiB bandwidth rows vary
+times as much, 4-19% below the untagged link's means (above 16 KiB within the spread of the three runs, so only the
+16 KiB gap is clearly the check's), and costs 0.02-0.07 CPU s/GB more per side than untagged (the HMAC cost 4.1). The 1 KiB round trip loses 4 µs to the check instead of 26. The 64 B and 1 KiB bandwidth rows vary
 between runs by a factor of 2-3, untagged as much as checked (a system call per frame, see below; the untagged 64 B
 row is a third of the first measurement's 0.70), so they say nothing about the check.
 On loopback (no NIC) a checked link moves 31.5 Gbit/s at 1 MiB (31.3-31.6) against 36.7 untagged and the HMAC's
@@ -259,8 +259,10 @@ On loopback (no NIC) a checked link moves 31.5 Gbit/s at 1 MiB (31.3-31.6) again
 checked against 0.68 untagged (sender 0.85 against 0.35 CPU s/GB, receiver 12.4 against 11.8), 1 KiB 7.44 against
 8.22 (0.19 / 1.07 against 0.13 / 0.97), 16 KiB 33.4 against 37.3, 64 and 256 KiB within the runs' spread. At 1 and
 4 MiB batched the checked link stays at 26.7 Gbit/s (25.4-27.5) against 37.2 untagged, though unbatched it moves 32-35
-and its sender spends 0.25 CPU s/GB there (0.16 untagged), well under a core: not explained yet, and the frames peerlink
-sends at that size (bulk CHUNKs) go one per call anyway.
+and its sender spends 0.25 CPU s/GB there (0.16 untagged), well under a core: not explained yet (XXH3 at about 30 GB/s spends some 35 µs on a 1 MiB frame, so the
+batched path of link-bench around the check is the likelier cause; a `perf record` of that sender is rd-hw's). The
+frames peerlink sends at that size (bulk CHUNKs) go one per call anyway, but until the gap is explained these numbers
+do not show that the check costs nothing on batched bulk frames.
 
 ### 3.4 Not measured
 
@@ -654,7 +656,8 @@ already is. The RDMA QP-injection note of §5.5 is accepted for now on the same 
 acceptor picks it, `keys_derive` derives a 16-byte key per direction beside the salt (another label), and the frame
 keeps its 16 bytes. AES-128-GMAC is the one to build (the table): 3-4 times XXH3-128's CPU (0.13 against 0.033 CPU
 s/GB at 1 MiB on the test servers, 1.35 against 0.37 at 64 B), a nonce from the sequence number and the type (never
-reused under a key: the key is per connection and direction and peerlink refuses a counter that would wrap), and a
+reused under a key: the key is per connection and direction, and type 2 must make peerlink refuse a counter that would
+wrap, a guard it does not have today because XXH3 needs none and a 64-bit counter does not wrap in practice), and a
 kernel picked at run time (AES-NI and PCLMULQDQ are not in x86-64-v2; a CPU without them would not offer type 2).
 `tools/mac_cands.c` has the measured GMAC (8-way GHASH, AES-NI), checked against the `cryptography` package.
 
@@ -680,7 +683,7 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
 | D11 | **The bulk rate caps keep their defaults** (BULK 256 MiB/s, `rebuild_mb_s` 200, CHUNKB 256, node-wide per kind) until rd-hw has measured, with the MAC fixed, the LOG link's latency and NFS/RDMA latency under bulk load; then they are raised on that evidence, per kind | raise them with D1 | the caps, not the transport, set bulk throughput today (§1); they also protect the storage that shares the port (§4) |
 | D12 | **tsdbd refuses a peer address that leaves through an IPoIB interface**, unless `cluster.peer.allow_ipoib=true` (§5.3) | warn only; no check | the owner's rule: no TCP over IPoIB; a misconfigured member is found at start or dial, not by its traffic |
 | D13 | **A service level per kind** (`cluster.peer.rdma.sl`, default 0) and no other QoS in tsdb | rate caps only | the SM's SL-to-VL tables and VL arbitration decide what an SL means; tsdb only has to let the operator mark its traffic (§4 "Sharing the port") |
-| D14 | **A decision point after rd-mac**: §3.3 (TCP, batched and tagged) and §4 are measured again with the new MAC, on the test servers and on production's CPUs if possible, and the owner sets the order and scope of rd-seam onwards from those numbers | build all tracks in order | the case for the verbs tracks rests on numbers §6 has not taken; the owner asked for RDMA links, so the point decides order and scope, not whether. Measured on 2026-11-24 on the test servers (§3.3 "After rd-mac", §6); production's CPUs and §4's replicated bulk with the check not yet (`test_cluster replicate` prints no throughput) |
+| D14 | **A decision point after rd-mac**: §3.3 (TCP, batched and tagged) and §4 are measured again with the new MAC, on the test servers and on production's CPUs if possible, and the owner sets the order and scope of rd-seam onwards from those numbers | build all tracks in order | the case for the verbs tracks rests on numbers §6 has not taken; the owner asked for RDMA links, so the point decides order and scope, not whether. Measured on 2026-11-24 on the test servers (§3.3 "After rd-mac", §6); production's CPUs and §4's replicated bulk with the check not yet (`test_cluster replicate` prints no throughput: it checks rows, not a rate; a timed bulk transfer between members is rd-hw's, with tsdbc-bench `via` and insert-bench on 3 members) |
 
 ## 8. Testing
 
@@ -720,7 +723,7 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
 
 | key | risk | depends on | files | days |
 |---|---|---|---|---|
-| rd-mac | high | main | built (2026-11-24): server/plcheck.h (AGPL; XXH3-128, xxHash vendored unchanged under server/xxhash with `UPSTREAM`; SSE2 at v2, so no dispatch), server/peerlink.c (`frame_check` in place of `frame_tag`, the salt from the handshake's transcript, the check type negotiated in HELLO), `PL_CL_VERSION` 8 (`PL_CAP_RDMA` is rd-seam's), tools/mac_cands.c and `link-bench mac` / `run --mac` (every candidate, with known answers), tests/test_peerlink.c (the check's known answers in `codec`, mutants `notag noseq nosalt checktype`), fuzz-replframe corpus; then D14's measurements | 3 |
+| rd-mac | high | main | built (2026-11-24): server/plcheck.h (AGPL; XXH3-128, xxHash vendored unchanged under server/xxhash with `UPSTREAM`; SSE2 at v2, so no dispatch), server/peerlink.c (`frame_check` in place of `frame_tag`, the salt from the handshake's transcript, the check type negotiated in HELLO), `PL_CL_VERSION` 8 (`PL_CAP_RDMA` is rd-seam's), tools/mac_cands.c and `link-bench mac` / `run --mac` (every candidate, with known answers), tests/test_peerlink.c (the check's known answers in `codec`, every bit of a frame's length, type and check flipped, replays up to 2^63 frames back, the salts each handshake derives (`salts`), a raw acceptor that names an unoffered type (`dialtype`); mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`), fuzz-replframe corpus; then D14's measurements | 3 |
 | rd-seam | medium | rd-mac | server/peerlink.c split: the TCP transport behind `struct pl_transport` (read, write, poll fds, close) with no change in behaviour; test_peerlink unchanged and green; `objdump` not needed (behaviour, not codegen) | 1 |
 | rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
 | rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |

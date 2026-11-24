@@ -34,9 +34,11 @@ seeded with a per-connection salt and its sequence number (16 bytes, where the H
 proves the cluster secret both ways with HMAC-SHA256, so a server of another cluster or a wrong address cannot open a
 link. HELLO offers the check types a server runs and HELLO_ACK names the one chosen, so a keyed MAC can be added later
 as another type (docs/design-rdma.md §6 and §3.3 have the measurements on the test servers' Xeons: the tag cost
-about 4 CPU-seconds per GB on each side, the check about 0.03 on 16 KiB to 1 MiB frames and 0.4 on 64-byte ones; a
-link over TCP on 40GbE moves 26-35 Gbit/s with it from 16 KiB frames on, where the tag held it at 1.9). A node of
-another version is refused at HELLO with a line naming both versions; a cluster made before this change is
+a link about 4 CPU-seconds per GB on each side, the check 0.02-0.07 more than no check at all from 16 KiB frames on
+(the hash alone: about 0.03 per GB on one core on 16 KiB to 1 MiB frames, 0.4 on 64-byte ones); a link over TCP on
+40GbE moves 26-35 Gbit/s with it from 16 KiB frames on, where the tag held it at 1.9). A node of another version is
+refused at HELLO, and the server it dials logs a line naming both versions (the dialing node, whose HELLO_ACK never
+comes, does not); a cluster made before this change is
 initialised again. xxHash's `xxhash.h` (0.8.3, BSD-2-Clause) is vendored in
 `server/xxhash/`.
 
