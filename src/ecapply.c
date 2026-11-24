@@ -500,7 +500,7 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
      * renames (the engine failed): everything stays for the next open */
     cf_free(db, f, n, written && !renamed);
     if (renamed && nown)
-        eckeep_swapped(db, own, nown); /* held for keep_s (no .ec of the same name: no digest, R8's MK_DIGEST) */
+        eckeep_retired(db, own, nown, c->key, c->z); /* held until the MK_DIGEST of (key, Z) matched (r8j) */
     for (size_t i = 0; i < nown; i++)
         part_unref(own[i]);
     free(own);

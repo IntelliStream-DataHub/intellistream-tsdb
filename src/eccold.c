@@ -56,6 +56,7 @@
 #include "internal.h"
 #include "eccold.h"
 #include "coldops.h"
+#include "ecdigest.h"
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecskip.h"
@@ -443,6 +444,27 @@ static int take_y_locked(eng *db, int64_t key, part **pin, size_t np, part **y, 
     return 0;
 }
 
+/* After the swap: a failed digest or append changes nothing of the settle (deposed: the next leader's replicas hold
+ * their retired copies, ecdigest.h; the engine failed: it acknowledges nothing more) */
+static void leader_digest(eng *db, int64_t key, uint64_t z, part **pin, size_t np, part **y, size_t ny,
+                          const ec_record *recs)
+{
+    part **set = malloc((np + ny) * sizeof *set);
+    uint8_t *oids = malloc(np * 16 + 1);
+    if (!set || !oids) {
+        fprintf(stderr, "tsdb: %s: settle: key %lld: no memory for its DIGEST marker\n", db->dir, (long long)key);
+    } else {
+        memcpy(set, pin, np * sizeof *set);
+        if (ny)
+            memcpy(set + np, y, ny * sizeof *set);
+        for (size_t i = 0; i < np; i++)
+            memcpy(oids + 16 * i, recs[i].oid, 16);
+        (void)ecdigest_leader(db, key, z, set, np + ny, oids, np);
+    }
+    free(set);
+    free(oids);
+}
+
 int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
 {
     eccold_mutant_init();
@@ -584,6 +606,8 @@ out:
         cut.hold_us = mono_us() - t_gate;
     } else
         free(f.r);
+    if (rc == 0) /* 7: E26's digest of I and Y and its marker (src/ecdigest.c): the gate released, Y still pinned */
+        leader_digest(db, key, cut.z, pin, np, y, ny, recs);
     if (ny) {
         pthread_mutex_lock(&db->lock);
         for (size_t i = 0; i < ny; i++)

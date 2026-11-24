@@ -74,6 +74,33 @@ int ecdigest_leader(struct eng *db, int64_t key, uint64_t z, struct part **set, 
 /* A committed MK_DIGEST at log position pos (m decoded): 0 once its comparison is queued (or done). */
 int ecdigest_apply(struct eng *db, uint64_t pos, const mk *m);
 
+/* A replica's job: the expectation of one MK_DIGEST and the retired files it covers, durable as `file` */
+typedef struct ecd_job {
+    char file[64]; /* digest_<key>_<z> */
+    int64_t key;
+    uint64_t z;
+    ec_ldigest want;
+    uint8_t oid[16]; /* the marker's first object (ec_diverge names it) */
+    ecd_cut *cuts;
+    size_t ncuts;
+    char (*names)[256]; /* settled_<own part> */
+    size_t nnames;
+} ecd_job;
+void ecd_job_free(ecd_job *j);
+bool ecdigest_job_file(const char *name); /* digest_<key>_<z>, or its .tmp */
+/* eckeep's thread: the digest of j's files (opened as parts, every granule's checksum checked: a replica's retired
+ * copy is read whole once). 0: *got computed; TSDB_ERR_NOTFOUND: a file is gone (released: its job had matched);
+ * TSDB_ERR_CORRUPT: a copy failed its checksums (rot, D25); other: try again later. */
+int ecdigest_job_check(struct eng *db, const ecd_job *j, ec_ldigest *got);
+/* eckeep's thread at its start: every digest_* file of the directory to eckeep_add_job; a damaged one is logged and
+ * kept (its files stay held) */
+void ecdigest_load_jobs(struct eng *db);
+/* the job file's unlink and the directory fsync after it (the release of its last file was synced before) */
+void ecdigest_job_remove(struct eng *db, const char *file);
+/* D25: whether settled_ file `name` (a leader's kept copy whose object matched its record) fails its own checksums
+ * (footer, index, a granule): rot of the copy, never DIVERGED */
+bool ecdigest_copy_rotted(struct eng *db, const char *name);
+
 /* planted bugs (each must fail tests/test_ecdigest.c, test_keep or test_cluster ecdigest; the Makefile requires it) */
 enum {
     ECDIGEST_MUT_NONE = 0,
@@ -81,6 +108,8 @@ enum {
     ECDIGEST_MUT_NOTOMB,      /* digestnotomb: no tombstone term */
     ECDIGEST_MUT_SKIP,        /* digestskip: a replica's comparison is skipped (every job matches) */
     ECDIGEST_MUT_NORETENTION, /* digestnoretention: no cutoff (expired rows one twin still stores are hashed) */
+    ECDIGEST_MUT_RELEASENOSYNC, /* releasenosync: a release unlinks without the directory fsync (src/eckeep.c) */
+    ECDIGEST_MUT_ROTDIVERGES, /* rotdiverges: rot of a kept copy is taken for DIVERGED (src/eckeep.c) */
 };
 extern int ecdigest_mutant;
 int ecdigest_mutant_parse(const char *name); /* -1 for an unknown name */

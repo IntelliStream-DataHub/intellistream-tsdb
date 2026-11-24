@@ -41,6 +41,16 @@ bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now
 /* ec_swap_commit, after a swap is durable (publish_lock released, no engine lock held): settled_<in[i]->name> for
  * each i is held and queued for its digest. Out of memory: the file stays on disk unreleased until the next open. */
 void eckeep_swapped(eng *db, part *const *in, size_t n);
+/* A replica's cold apply (src/ecapply.c) after its renames: settled_<own[i]->name> held for the MK_DIGEST of (key, z),
+ * never digested by bytes (no .ec of its name) and never released before that digest matched. */
+void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z);
+/* the retired files of (key, z) (or of key, z unknown: found at an open) no job covers yet: *names malloc'd */
+size_t eckeep_unjobbed(eng *db, int64_t key, uint64_t z, char (**names)[256]);
+struct ecd_job;
+/* a durable job (src/ecdigest.c) for the thread; takes *j (emptied); a job of that file already known is dropped */
+int eckeep_add_job(eng *db, struct ecd_job *j);
+/* kept copies counted lost (D25: a copy that fails its checksums while its object matches) */
+uint64_t eckeep_copies_lost(eng *db);
 
 /* The engine's hooks (src/tier.h): db->ecstate->keep. eckeep_eng_stop (eng_close, eng_halt) joins the digest thread;
  * once stopped it never starts again. Each does nothing without a tier. */
@@ -49,7 +59,7 @@ void eckeep_eng_stop(eng *db);
 void eckeep_eng_close(eng *db);
 
 /* What a settled_ file's digest says (eckeep_status) */
-enum { ECKEEP_PENDING = 0, ECKEEP_MATCHED, ECKEEP_DIVERGED, ECKEEP_ORPHAN };
+enum { ECKEEP_PENDING = 0, ECKEEP_MATCHED, ECKEEP_DIVERGED, ECKEEP_ORPHAN, ECKEEP_ROT };
 /* The state of settled_ file `name`, or TSDB_ERR_NOTFOUND (not held: released, or never seen). */
 int eckeep_status(eng *db, const char *name);
 /* tests: waits up to timeout_ms for `name` to leave ECKEEP_PENDING; its state (or TSDB_ERR_NOTFOUND). */

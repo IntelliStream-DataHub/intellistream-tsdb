@@ -5,6 +5,14 @@
  */
 #include "internal.h"
 #include "ecdigest.h"
+#include "ecdiverge.h"
+#include "eckeep.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -15,7 +23,8 @@ int ecdigest_mutant;
 
 int ecdigest_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"none", "digestbytes", "digestnotomb", "digestskip", "digestnoretention"};
+    static const char *const names[] = {"none", "digestbytes", "digestnotomb", "digestskip", "digestnoretention",
+                                         "releasenosync", "rotdiverges"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++)
         if (strcmp(name, names[i]) == 0)
             return (int)i;
@@ -316,8 +325,298 @@ int ecdigest_leader(eng *db, int64_t key, uint64_t z, part **set, size_t n, cons
 
 /* ------------------------------------------------------------ a replica's jobs */
 
+/* The job file (local state of this replica, host byte order): "TSDBDGJ1", key, z, rows, series, xxh64, oid[16],
+ * ncuts u32, nnames u32, ncuts x (series u32, cutoff i64), nnames x (len u16, name), then the xxh64 of all before. */
+#define JOB_MAGIC "TSDBDGJ1"
+
+typedef struct jb {
+    uint8_t *b;
+    size_t n, cap;
+    bool err;
+} jb;
+
+static void jput(jb *w, const void *p, size_t n)
+{
+    if (w->err)
+        return;
+    if (w->n + n > w->cap) {
+        size_t cap = w->cap ? w->cap : 256;
+        while (cap < w->n + n)
+            cap *= 2;
+        uint8_t *b = realloc(w->b, cap);
+        if (!b) {
+            w->err = true;
+            return;
+        }
+        w->b = b, w->cap = cap;
+    }
+    memcpy(w->b + w->n, p, n);
+    w->n += n;
+}
+
+void ecd_job_free(ecd_job *j)
+{
+    free(j->cuts);
+    free(j->names);
+    j->cuts = NULL, j->names = NULL;
+    j->ncuts = j->nnames = 0;
+}
+
+bool ecdigest_job_file(const char *name) { return strncmp(name, "digest_", 7) == 0; }
+
+static int job_write(eng *db, const ecd_job *j)
+{
+    jb w = {0};
+    uint32_t nc = (uint32_t)j->ncuts, nn = (uint32_t)j->nnames;
+    jput(&w, JOB_MAGIC, 8);
+    jput(&w, &j->key, 8);
+    jput(&w, &j->z, 8);
+    jput(&w, &j->want.rows, 8);
+    jput(&w, &j->want.series, 8);
+    jput(&w, &j->want.xxh64, 8);
+    jput(&w, j->oid, 16);
+    jput(&w, &nc, 4);
+    jput(&w, &nn, 4);
+    for (size_t i = 0; i < j->ncuts; i++) {
+        jput(&w, &j->cuts[i].series, 4);
+        jput(&w, &j->cuts[i].cutoff, 8);
+    }
+    for (size_t i = 0; i < j->nnames; i++) {
+        uint16_t l = (uint16_t)strlen(j->names[i]);
+        jput(&w, &l, 2);
+        jput(&w, j->names[i], l);
+    }
+    uint64_t h = w.err ? 0 : xxh64(w.b, w.n, 0);
+    jput(&w, &h, 8);
+    if (w.err) {
+        free(w.b);
+        return TSDB_ERR_NOMEM;
+    }
+    char tmp[80];
+    snprintf(tmp, sizeof tmp, "%s.tmp", j->file);
+    int rc = 0;
+    int fd = openat(db->dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || write(fd, w.b, w.n) != (ssize_t)w.n || fdatasync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    if (fd >= 0)
+        close(fd);
+    free(w.b);
+    if (rc == 0 && renameat(db->dirfd, tmp, db->dirfd, j->file) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc) {
+        fprintf(stderr, "tsdb: %s: the digest job %s was not written: %s; its files are held until an operator acts\n",
+                db->dir, j->file, strerror(errno));
+        unlinkat(db->dirfd, tmp, 0);
+        return rc;
+    }
+    return eng_sync_dir(db, "fsync of the directory after a digest job file"); /* fail-stop: the job must hold */
+}
+
+static int job_read(eng *db, const char *file, ecd_job *j)
+{
+    memset(j, 0, sizeof *j);
+    int fd = openat(db->dirfd, file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    struct stat st;
+    uint8_t *b = NULL;
+    int rc = TSDB_ERR_CORRUPT;
+    if (fstat(fd, &st) == 0 && st.st_size >= 80 && st.st_size < (1 << 26) && (b = malloc((size_t)st.st_size)) &&
+        pread(fd, b, (size_t)st.st_size, 0) == st.st_size) {
+        size_t n = (size_t)st.st_size, off = 8;
+        uint64_t h;
+        memcpy(&h, b + n - 8, 8);
+        if (memcmp(b, JOB_MAGIC, 8) == 0 && xxh64(b, n - 8, 0) == h) {
+            uint32_t nc, nn;
+            memcpy(&j->key, b + off, 8), off += 8;
+            memcpy(&j->z, b + off, 8), off += 8;
+            memcpy(&j->want.rows, b + off, 8), off += 8;
+            memcpy(&j->want.series, b + off, 8), off += 8;
+            memcpy(&j->want.xxh64, b + off, 8), off += 8;
+            memcpy(j->oid, b + off, 16), off += 16;
+            memcpy(&nc, b + off, 4), off += 4;
+            memcpy(&nn, b + off, 4), off += 4;
+            n -= 8;
+            if ((uint64_t)nc * 12 <= n - off && nn <= MK_FILES_MAX * 2 &&
+                (j->cuts = calloc(nc ? nc : 1, sizeof *j->cuts)) && (j->names = calloc(nn ? nn : 1, 256))) {
+                rc = 0;
+                for (uint32_t i = 0; i < nc; i++) {
+                    memcpy(&j->cuts[i].series, b + off, 4);
+                    memcpy(&j->cuts[i].cutoff, b + off + 4, 8);
+                    off += 12;
+                }
+                j->ncuts = nc;
+                for (uint32_t i = 0; i < nn && rc == 0; i++) {
+                    uint16_t l;
+                    if (n - off < 2 || (memcpy(&l, b + off, 2), off += 2, l == 0 || l > 255 || n - off < l)) {
+                        rc = TSDB_ERR_CORRUPT;
+                        break;
+                    }
+                    memcpy(j->names[i], b + off, l);
+                    j->names[i][l] = 0;
+                    off += l;
+                    if (!settled_part_name(j->names[i]) || strchr(j->names[i], '/'))
+                        rc = TSDB_ERR_CORRUPT;
+                }
+                j->nnames = nn;
+                if (rc == 0 && off != n)
+                    rc = TSDB_ERR_CORRUPT;
+            } else if (!j->cuts || !j->names) {
+                rc = nc * 12 <= n - off && nn <= MK_FILES_MAX * 2 ? TSDB_ERR_NOMEM : TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+    free(b);
+    close(fd);
+    snprintf(j->file, sizeof j->file, "%s", file);
+    if (rc)
+        ecd_job_free(j);
+    return rc;
+}
+
+/* the files of a job as parts (their source names: p<K>_<A>_<B>_<L>.part) */
+static int open_set(eng *db, char (*names)[256], size_t n, part ***out)
+{
+    part **set = calloc(n ? n : 1, sizeof *set);
+    if (!set)
+        return TSDB_ERR_NOMEM;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        rc = part_open_as(db->dirfd, names[i], names[i] + 8, false, false, &set[i]);
+        if (rc == 0)
+            set[i]->verify = true; /* a copy's granule that fails its checksum is rot (D25), never hashed */
+    }
+    if (rc) {
+        for (size_t i = 0; i < n; i++)
+            part_unref(set[i]);
+        free(set);
+        return rc;
+    }
+    *out = set;
+    return 0;
+}
+
+static void close_set(part **set, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        part_unref(set[i]);
+    free(set);
+}
+
 int ecdigest_apply(eng *db, uint64_t pos, const mk *m)
 {
-    (void)db, (void)pos, (void)m;
-    return 0;
+    const mk_digest *d = &m->u.digest;
+    ecd_job j;
+    memset(&j, 0, sizeof j);
+    j.key = d->key;
+    j.z = d->z;
+    j.want = (ec_ldigest){.rows = d->rows, .series = d->series, .xxh64 = d->xxh64};
+    if (d->noids)
+        memcpy(j.oid, d->oids, 16);
+    snprintf(j.file, sizeof j.file, "digest_%" PRId64 "_%" PRIu64, d->key, d->z);
+    j.nnames = eckeep_unjobbed(db, d->key, d->z, &j.names);
+    if (j.nnames == 0) { /* no tier, or nothing retired here for it (a COLD applied before this member joined) */
+        free(j.names);
+        return 0;
+    }
+    part **set = NULL;
+    int rc = open_set(db, j.names, j.nnames, &set);
+    if (rc == 0) {
+        rc = ecd_freeze(db, set, j.nnames, d->key, replica_now_ms(db), &j.cuts, &j.ncuts);
+        close_set(set, j.nnames);
+    }
+    if (rc == 0)
+        rc = job_write(db, &j);
+    if (rc) {
+        fprintf(stderr, "tsdb: %s: the DIGEST at %" PRIu64 " (key %" PRId64 "): no job (%d); its %zu retired files are "
+                        "held until an operator acts\n", db->dir, pos, d->key, rc, j.nnames);
+        ecd_job_free(&j);
+        return eng_check(db) ? eng_check(db) : 0; /* held, never released unchecked; a failed engine stops the apply */
+    }
+    return eckeep_add_job(db, &j); /* takes the job */
+}
+
+int ecdigest_job_check(eng *db, const ecd_job *j, ec_ldigest *got)
+{
+    part **set = NULL;
+    int rc = open_set(db, j->names, j->nnames, &set);
+    if (rc)
+        return rc;
+    for (size_t i = 0; i < j->nnames && rc == 0; i++) /* the whole copy, every granule (the digest reads only rows the
+                                                      * cutoff and the tombstones leave) */
+        for (uint32_t g = 0; g < set[i]->ng && rc == 0; g++) {
+            granule gr;
+            gx_load(set[i], g, GW_LOC, &gr);
+            uint64_t len = (uint64_t)gr.ts_len + gr.val_len;
+            if (gr.off < set[i]->hdr_len || gr.off > set[i]->index_off || len > set[i]->index_off - gr.off ||
+                (uint32_t)xxh64(set[i]->map + gr.off, len, 0) != gr.crc)
+                rc = TSDB_ERR_CORRUPT;
+        }
+    if (rc == 0)
+        rc = ec_logical_digest_frozen(db, set, j->nnames, j->key, j->cuts, j->ncuts, got);
+    close_set(set, j->nnames);
+    return rc;
+}
+
+void ecdigest_load_jobs(eng *db)
+{
+    int fd = dup(db->dirfd);
+    DIR *d = fd >= 0 ? fdopendir(fd) : NULL;
+    if (!d) {
+        if (fd >= 0)
+            close(fd);
+        fprintf(stderr, "tsdb: %s: the digest jobs were not listed: %s; the replica's retired files are held\n",
+                db->dir, strerror(errno));
+        return;
+    }
+    rewinddir(d);
+    struct dirent *de;
+    while ((errno = 0, de = readdir(d))) {
+        if (!ecdigest_job_file(de->d_name))
+            continue;
+        size_t l = strlen(de->d_name);
+        if (l > 4 && strcmp(de->d_name + l - 4, ".tmp") == 0) { /* never renamed: its marker is applied again */
+            unlinkat(db->dirfd, de->d_name, 0);
+            continue;
+        }
+        ecd_job j;
+        int rc = job_read(db, de->d_name, &j);
+        if (rc) {
+            fprintf(stderr, "tsdb: %s: digest job %s cannot be read (%d): kept, its files are held\n", db->dir,
+                    de->d_name, rc);
+            continue;
+        }
+        (void)eckeep_add_job(db, &j);
+    }
+    if (errno)
+        fprintf(stderr, "tsdb: %s: the listing of digest jobs failed: %s; the files it did not reach are held\n",
+                db->dir, strerror(errno));
+    closedir(d);
+}
+
+void ecdigest_job_remove(eng *db, const char *file)
+{
+    if (unlinkat(db->dirfd, file, 0) != 0 && errno != ENOENT) {
+        fprintf(stderr, "tsdb: %s: unlink of digest job %s: %s\n", db->dir, file, strerror(errno));
+        return;
+    }
+    (void)eng_sync_dir(db, "fsync of the directory after a digest job's removal");
+}
+
+bool ecdigest_copy_rotted(eng *db, const char *name)
+{
+    part *p = NULL;
+    int rc = part_open_as(db->dirfd, name, name + 8, false, false, &p);
+    if (rc)
+        return rc == TSDB_ERR_CORRUPT; /* header, index or footer refused; a read error says nothing */
+    bool rot = false;
+    for (uint32_t g = 0; g < p->ng && !rot; g++) {
+        granule gr;
+        gx_load(p, g, GW_LOC, &gr);
+        uint64_t len = (uint64_t)gr.ts_len + gr.val_len;
+        rot = gr.off < p->hdr_len || gr.off > p->index_off || len > p->index_off - gr.off ||
+              (uint32_t)xxh64(p->map + gr.off, len, 0) != gr.crc;
+    }
+    part_unref(p);
+    return rot;
 }
