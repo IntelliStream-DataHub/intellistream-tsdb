@@ -18,5 +18,7 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from);
 void rtr_tick(struct rvol *rv);
 /* 1 while a transfer refuses this volume's records (rv->mu held) */
 int rtr_draining(struct rvol *rv);
+/* A replica's log cut that removed records (repld.c's REPL_A_TRUNCATE below the index's end): STATUS's CL_TR_CUTS. */
+void rtr_note_cut(void);
 
 #endif

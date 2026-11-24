@@ -578,6 +578,11 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         h->lease_left_ms = (int64_t)get64(&r);
     }
     st->users_caught_up = r.bad ? 0 : get8(&r);
+    st->ntr = r.bad ? 0 : get32(&r);
+    if (st->ntr > sizeof st->tr / sizeof st->tr[0])
+        r.bad = 1;
+    for (uint32_t i = 0; i < st->ntr && !r.bad; i++)
+        st->tr[i] = get64(&r);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -3780,6 +3785,9 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
     put64(b, (uint64_t)left);
 }
 
+static _Atomic(cluster_drv_counts_fn) g_drv_counts;
+void cluster_set_drv_counts(cluster_drv_counts_fn fn) { atomic_store_explicit(&g_drv_counts, fn, memory_order_release); }
+
 static void put_status(struct buf *b)
 {
     uint64_t now = iso_now_ns();
@@ -3811,6 +3819,17 @@ static void put_status(struct buf *b)
         put_heard_extra(b, &C.heard[i], now, 0);
     }
     put8(b, (uint8_t)cluster_users_caught_up());
+    uint64_t tr[CL_TR_N] = {0};
+    struct ctr_counts cc;
+    ctr_counts(&cc);
+    tr[CL_TR_STARTED] = cc.started, tr[CL_TR_DONE] = cc.done, tr[CL_TR_TIMEDOUT] = cc.timedout;
+    tr[CL_TR_CANCELLED] = cc.cancelled, tr[CL_TR_FALLBACK] = cc.fallback, tr[CL_TR_BALANCE] = cc.balance;
+    cluster_drv_counts_fn dc = atomic_load_explicit(&g_drv_counts, memory_order_acquire);
+    if (dc)
+        dc(tr);
+    put32(b, CL_TR_N);
+    for (int i = 0; i < CL_TR_N; i++)
+        put64(b, tr[i]);
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;

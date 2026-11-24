@@ -48,7 +48,7 @@ struct rtr {
 };
 
 /* STATUS's counters (rtr_counts) */
-static atomic_ulong n_timedout, n_blind, n_ready;
+static atomic_ulong n_timedout, n_blind, n_ready, n_cuts;
 
 enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME };
 /* TSDB_REPLD_MUTANT's names of this file (repld.c's parser knows none of them): READY at once, admitting during the
@@ -242,9 +242,12 @@ int repld_draining(uint32_t v)
     return d;
 }
 
-void repld_transfer_counts(unsigned long *timedout, unsigned long *blind, unsigned long *ready)
+void rtr_note_cut(void) { atomic_fetch_add_explicit(&n_cuts, 1, memory_order_relaxed); }
+
+void repld_transfer_counts(uint64_t out[CL_TR_N])
 {
-    *timedout = atomic_load_explicit(&n_timedout, memory_order_relaxed);
-    *blind = atomic_load_explicit(&n_blind, memory_order_relaxed);
-    *ready = atomic_load_explicit(&n_ready, memory_order_relaxed);
+    out[CL_TR_DRAIN_TIMEDOUT] = atomic_load_explicit(&n_timedout, memory_order_relaxed);
+    out[CL_TR_BLIND] = atomic_load_explicit(&n_blind, memory_order_relaxed);
+    out[CL_TR_READY] = atomic_load_explicit(&n_ready, memory_order_relaxed);
+    out[CL_TR_CUTS] = atomic_load_explicit(&n_cuts, memory_order_relaxed);
 }

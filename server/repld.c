@@ -1357,6 +1357,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
             vol_fail(rv, "a cut of the log failed");
             break;
         }
+        if (a->pos < rv->idx_end)
+            rtr_note_cut();
         idx_cut(rv, a->pos);
         hist_cut(rv, a->pos);
         break;

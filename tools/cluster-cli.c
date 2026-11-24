@@ -226,8 +226,11 @@ static void print_status(const struct cluster_status *st)
         printf(" isr");
         for (uint32_t k = 0; k < v->nisr; k++)
             printf("%s%" PRIu32, k ? "," : " ", v->isr[k]);
-        printf("%s isr_version %" PRIu64 " set_version %" PRIu64 "\n", v->nisr ? "" : " -", v->isr_version,
+        printf("%s isr_version %" PRIu64 " set_version %" PRIu64, v->nisr ? "" : " -", v->isr_version,
                v->set_version);
+        if (v->nrep) /* leader balance (D15) moves the leadership back to rep[0] */
+            printf(" preferred %" PRIu32, v->rep[0].node);
+        printf("\n");
         for (uint32_t k = 0; k < v->nrep; k++) {
             printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
                    v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);
@@ -237,6 +240,13 @@ static void print_status(const struct cluster_status *st)
         }
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
+    if (st->ntr >= CL_TR_N) /* the Raft leader's side counts on the member that ran them, the rest on every member */
+        printf("transfers started %" PRIu64 " done %" PRIu64 " timed_out %" PRIu64 " cancelled %" PRIu64
+               " fell_back %" PRIu64 " balance %" PRIu64 " drains_timed_out %" PRIu64 " resumed_blind %" PRIu64
+               " ready %" PRIu64 " cuts %" PRIu64 "\n",
+               st->tr[CL_TR_STARTED], st->tr[CL_TR_DONE], st->tr[CL_TR_TIMEDOUT], st->tr[CL_TR_CANCELLED],
+               st->tr[CL_TR_FALLBACK], st->tr[CL_TR_BALANCE], st->tr[CL_TR_DRAIN_TIMEDOUT], st->tr[CL_TR_BLIND],
+               st->tr[CL_TR_READY], st->tr[CL_TR_CUTS]);
     meta_free(&m);
 }
 

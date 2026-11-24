@@ -418,9 +418,29 @@ struct cluster_status {
     uint32_t nheard;
     struct cluster_heard *heard;
     uint8_t users_caught_up; /* cluster_users_caught_up() on that server */
+    /* planned leader transfers (R4 D14, D15): enum cluster_tr_count; the Raft leader's side counts only on the one that
+     * ran them (a transfer's state lives in memory), the volume leaders' side on every member */
+    uint32_t ntr;
+    uint64_t tr[16];
     const uint8_t *image;
     size_t image_len;
 };
+enum cluster_tr_count {
+    CL_TR_STARTED,   /* the Raft leader: transfers it sent TRANSFER for (an operator's and the balance's) */
+    CL_TR_DONE,      /* the new leader was the target */
+    CL_TR_TIMEDOUT,  /* no READY within transfer_wait_ms + 1 s: CANCEL */
+    CL_TR_CANCELLED, /* CANCEL for another reason (a refused promotion, a lost epoch) */
+    CL_TR_FALLBACK,  /* the targeted promotion was dropped after READY: a failover by another name */
+    CL_TR_BALANCE,   /* of those started, by leader balance */
+    CL_TR_DRAIN_TIMEDOUT, /* the volume leaders here: drains that gave up before READY */
+    CL_TR_BLIND,     /* records admitted after READY's hard cap (10 x transfer_wait_ms); they may be cut */
+    CL_TR_READY,     /* READYs sent */
+    CL_TR_CUTS,      /* replica log cuts that removed records here (REPL_A_TRUNCATE below the log's end) */
+    CL_TR_N
+};
+/* The volume leaders' counters (CL_TR_DRAIN_TIMEDOUT and on) come from tsdbd's driver; without one they read 0. */
+typedef void (*cluster_drv_counts_fn)(uint64_t out[CL_TR_N]);
+void cluster_set_drv_counts(cluster_drv_counts_fn fn);
 /* Parses a STATUS body; `image` points into it, `heard` is allocated (cluster_status_free). 0 or -1. */
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st);
 void cluster_status_free(struct cluster_status *st);
