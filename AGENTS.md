@@ -256,8 +256,12 @@ cgroup, so `nice` does not keep your work out of its way.
   `repl_reconfig` (drain its actions first, `REPL_E_PENDING`; hand it only records of its set version), every message
   carries the set version (`repl_set_version`, others dropped and counted) and the ACK the replay start
   (`repl_replay_start`, D17); `repl_leave` and `repl_meta_promote_to` for moves (design-cluster.md 8.3, R4);
-  `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 2, peer
-  protocol 6. `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
+  `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 2, cluster
+  version (`PL_CL_VERSION`) 8: the data links' frames carry an XXH3-128 check without a key (`server/plcheck.h`, xxHash
+  vendored unchanged in `server/xxhash/`; seeded with the frame's number and a salt per connection from the handshake,
+  whose HMAC-SHA256 still proves the secret; the check type is negotiated in HELLO; docs/design-rdma.md §6;
+  `test_peerlink` mutants `notag noseq nosalt checktype`). `server/repld.c`: the replication driver, one thread and
+  one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
   `jr_rec_max_rows` so that it fits one peer frame; its index of record starts (`idx_*`, rec_find) is sorted and is

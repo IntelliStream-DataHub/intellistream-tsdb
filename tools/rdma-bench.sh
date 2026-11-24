@@ -7,7 +7,7 @@
 #
 #   tools/rdma-bench.sh --srv SSH_TARGET --cli SSH_TARGET --ib-addr ADDR [--tcp-addr ADDR] [--dev mlx4_0]
 #                       [--ib-port 1] [--reps 3] [--secs 3] [--only perftest,rsocket,tcp,loop] [--out DIR]
-#                       [--pt-port 18515] [--bw-sizes "..."] [--lat-sizes "..."]
+#                       [--pt-port 18515] [--bw-sizes "..."] [--lat-sizes "..."] [--mac hmac]
 #
 #   perftest  native verbs through rdma_cm (-R) at ADDR: ib_send_bw, ib_write_bw, ib_read_bw with completion events
 #             (--events: what a poll() loop would see) and ib_send_lat, ib_write_lat, ib_read_lat busy-polling,
@@ -23,16 +23,18 @@
 # link-bench is built on each server from tools/link-bench.c, the MAC candidates (tools/mac_cands.c, tools/blake3) and
 # client/tsdb_crypto.c in /var/tmp/tsdb-link-bench.
 #   mac       link-bench mac on each server, --reps times: every MAC candidate's speed on one core (design-rdma.md 6)
+# --mac NAME: the tag of the tagged runs (link-bench run --mac: hmac, peerlink's until cluster version 8, or xxh3-128,
+# its frame check since; tag=N in raw.txt is the candidate's number in tools/mac_cands.h)
 # Output: OUT/raw.txt (one key=value line per run), OUT/summary.txt (mean, sd, lowest-highest per test and size).
 set -u
-srv= cli= ibaddr= tcpaddr= dev=mlx4_0 ibport=1 reps=3 secs=3 only=perftest,rsocket,tcp,loop out= ptport=18515
+srv= cli= ibaddr= tcpaddr= dev=mlx4_0 ibport=1 reps=3 secs=3 only=perftest,rsocket,tcp,loop out= ptport=18515 mac=hmac
 bw_sizes="64 1024 16384 65536 262144 1048576 4194304"
 lat_sizes="64 1024 16384 65536 262144 1048576"
 while [ $# -gt 0 ]; do
     case $1 in
     --srv) srv=$2 ;; --cli) cli=$2 ;; --ib-addr) ibaddr=$2 ;; --tcp-addr) tcpaddr=$2 ;; --dev) dev=$2 ;;
     --ib-port) ibport=$2 ;; --reps) reps=$2 ;; --secs) secs=$2 ;; --only) only=$2 ;; --out) out=$2 ;;
-    --pt-port) ptport=$2 ;; --bw-sizes) bw_sizes=$2 ;; --lat-sizes) lat_sizes=$2 ;;
+    --pt-port) ptport=$2 ;; --bw-sizes) bw_sizes=$2 ;; --lat-sizes) lat_sizes=$2 ;; --mac) mac=$2 ;;
     *) echo "rdma-bench: unknown argument $1" >&2; exit 2 ;;
     esac
     shift 2
@@ -113,7 +115,7 @@ lb_suite() { # $1 label, $2 server bind address, $3 address the client dials, $4
     for rep in $(seq "$reps"); do
         for tag in 0 1; do
             local t=
-            [ $tag = 1 ] && t=--tag
+            [ $tag = 1 ] && t="--mac $mac"
             for sz in $bw_sizes; do lb_one bw "$sz"; done
             for sz in $lat_sizes; do lb_one lat "$sz"; done
         done
