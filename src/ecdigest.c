@@ -20,6 +20,8 @@
 #include <string.h>
 
 int ecdigest_mutant;
+atomic_bool ecdigest_test_alter;
+static _Thread_local bool alter_next; /* the job check of this thread changes the value of the next row it hashes */
 
 int ecdigest_mutant_parse(const char *name)
 {
@@ -75,6 +77,10 @@ static int row_cb(void *ctx, const int64_t *ts, const void *v, size_t n)
     for (size_t i = 0; i < n; i++) {
         memcpy(rec + 4, &ts[i], 8);
         memcpy(rec + 12, (const uint8_t *)v + i * w, w);
+        if (alter_next) { /* ecdigest_test_alter: a copy whose rows differ, with valid checksums */
+            alter_next = false;
+            rec[12] ^= 1;
+        }
         dh_put(r->d, rec, 12 + w);
     }
     r->rows += n;
@@ -552,8 +558,11 @@ int ecdigest_job_check(eng *db, const ecd_job *j, ec_ldigest *got)
                 (uint32_t)xxh64(set[i]->map + gr.off, len, 0) != gr.crc)
                 rc = TSDB_ERR_CORRUPT;
         }
-    if (rc == 0)
+    if (rc == 0) {
+        alter_next = atomic_exchange(&ecdigest_test_alter, false);
         rc = ec_logical_digest_frozen(db, set, j->nnames, j->key, j->cuts, j->ncuts, got);
+        alter_next = false;
+    }
     close_set(set, j->nnames);
     return rc;
 }

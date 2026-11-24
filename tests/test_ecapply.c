@@ -24,11 +24,13 @@
  * it carries the COLD out from the stage_ links jr_cold made durable); power (crashfs power loss at every step of the
  * apply: the old parts or the new set, then the apply ends with the new set); recover (a durable v5 intent with nothing
  * renamed: rolled forward; with a temporary gone: rolled back and applied again; with an own part gone: rolled back,
- * DIVERGED); recpower (crashfs power loss at every step of the open that rolls a cut apply forward: it stands).
+ * DIVERGED); recpower (crashfs power loss at every step of the open that rolls a cut apply forward: it stands);
+ * digest (r8j: the retired copies held until the DIGEST, its job file loaded at an open and MATCHED; a copy whose
+ * rows differ: DIVERGED).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
  * pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge
- * recnodirsync;
+ * recnodirsync; r8j's digestskip (ecdigest.h) fails its digest case.
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -47,6 +49,8 @@
 #include "ecswap.h"
 #include "replica.h"
 #include "ppos.h"
+#include "ecdigest.h"
+#include "eckeep.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -1867,6 +1871,110 @@ static void alarm_exit(int sig)
     _exit(3);
 }
 
+/* ------------------------------------------------------------ digest: the replica's job (r8j, E26, D6-D7) */
+
+/* the names of the replica's retired copies of KEY */
+static size_t retired_names(const char *dir, char (*out)[256], size_t cap)
+{
+    char pre[64];
+    snprintf(pre, sizeof pre, "settled_p%" PRId64 "_", (int64_t)KEY);
+    size_t n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d)) != NULL)
+        if (strncmp(de->d_name, pre, strlen(pre)) == 0 && n < cap)
+            snprintf(out[n++], 256, "%s", de->d_name);
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* every retired copy of KEY in R's keep with status want (waits up to wait_ms for each) */
+static bool copies_are(rt *R, int want, int64_t wait_ms, const char *what)
+{
+    char names[8][256];
+    size_t n = retired_names(R->dir, names, 8);
+    bool ok = n >= 1;
+    for (size_t i = 0; i < n; i++) {
+        int st = eckeep_test_wait(R->db, names[i], wait_ms);
+        if (st != want) {
+            fprintf(stderr, "%s: %s has keep status %d, wanted %d\n", what, names[i], st, want);
+            ok = false;
+        }
+    }
+    if (n == 0)
+        fprintf(stderr, "%s: no retired copy of the key\n", what);
+    return ok;
+}
+
+/* The replica's retired copies wait for the leader's DIGEST: applied through the COLD only, they are held (no job),
+ * also across a restart (bound, never ORPHAN); the DIGEST applied with the keep thread paused writes the job file
+ * digest_<key>_<z>, which a restart loads and digests: MATCHED, the volume not DIVERGED. digestalter: the copy's rows
+ * differ from the leader's with valid checksums (the hook ecdigest_test_alter changes one row's value in the job's
+ * digest): DIVERGED and the copies kept (mutant digestskip: the compare skipped, every job matches). */
+static void test_digest(void)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        const char *what = pass ? "digestalter" : "digest";
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start(what, &L))
+            return;
+        make_replica(&L, &R);
+        eccold_cut c;
+        workload(&L, &c, true);
+        uint64_t last = LAST, cpos = L.x.cold_fno;
+        lstop(&L);
+        char job[64], jp[PATH_MAX + 64];
+        snprintf(job, sizeof job, "digest_%" PRId64 "_%" PRIu64, (int64_t)KEY, c.z);
+        snprintf(jp, sizeof jp, "%s/%s", R.dir, job);
+        if (ropen(&L, &R, 0) != 0) {
+            CHECK(0);
+            lclose(&L);
+            return;
+        }
+        if (pass == 0) {
+            CHECK(feed(&R, cpos) == 0); /* through the COLD, not its DIGEST */
+            CHECK(settled_of_key(R.dir) >= 1);
+            CHECK(copies_are(&R, ECKEEP_PENDING, 300, "digest: before the DIGEST"));
+            CHECK(access(jp, F_OK) != 0);
+            rstop(&R);
+            if (ropen(&L, &R, cpos) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            CHECK(copies_are(&R, ECKEEP_PENDING, 300, "digest: held across a restart"));
+            atomic_store(&eckeep_test_pause, true);
+            CHECK(replica_apply(R.db, last) == 0);
+            CHECK(access(jp, F_OK) == 0); /* durable before the apply goes on */
+            rstop(&R);
+            atomic_store(&eckeep_test_pause, false);
+            if (ropen(&L, &R, last) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            CHECK(copies_are(&R, ECKEEP_MATCHED, 20000, "digest: the job loaded at the open"));
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(p_holds(R.db) && d1_holds(R.db, true));
+        } else {
+            atomic_store(&ecdigest_test_alter, true);
+            CHECK(feed(&R, last) == 0);
+            CHECK(access(jp, F_OK) == 0);
+            CHECK(copies_are(&R, ECKEEP_DIVERGED, 20000, "digestalter"));
+            atomic_store(&ecdigest_test_alter, false);
+            CHECK(atomic_load(&R.db->diverged));
+            CHECK(settled_of_key(R.dir) >= 1); /* kept */
+        }
+        rstop(&R);
+        lclose(&L);
+    }
+    printf("  digest: retired copies held until the DIGEST, its job durable and loaded at an open, MATCHED; a copy "
+           "whose rows differ: DIVERGED\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL;
@@ -1887,7 +1995,11 @@ int main(int argc, char **argv)
             snprintf(S, sizeof S, "%s", argv[i]);
     }
     if (strcmp(mutant, "none")) {
-        int m = ecapply_mutant_parse(mutant);
+        int m = ecapply_mutant_parse(mutant), dm = m < 0 ? ecdigest_mutant_parse(mutant) : -1;
+        if (dm > 0) { /* r8j's: digestskip (a replica's compare skipped) */
+            ecdigest_mutant = dm;
+            m = 0;
+        }
         if (m < 0) {
             fprintf(stderr, "test_ecapply: unknown mutant %s\n", mutant);
             return 2;
@@ -1924,7 +2036,7 @@ int main(int argc, char **argv)
     } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"merging", test_merging},
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
-                 {"recover", test_recover}, {"recpower", test_recpower}};
+                 {"recover", test_recover}, {"recpower", test_recpower}, {"digest", test_digest}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

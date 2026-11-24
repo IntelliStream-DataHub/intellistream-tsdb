@@ -38,6 +38,7 @@
 #ifndef TSDB_ECDIGEST_H
 #define TSDB_ECDIGEST_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -112,6 +113,9 @@ enum {
     ECDIGEST_MUT_ROTDIVERGES, /* rotdiverges: rot of a kept copy is taken for DIVERGED (src/eckeep.c) */
 };
 extern int ecdigest_mutant;
+/* test hook: the next replica job check hashes the value of its first row changed by one bit, as a retired copy whose
+ * rows differ from the leader's with valid checksums would (test_ecapply digest, test_cluster ecdigest) */
+extern atomic_bool ecdigest_test_alter;
 int ecdigest_mutant_parse(const char *name); /* -1 for an unknown name */
 
 #endif

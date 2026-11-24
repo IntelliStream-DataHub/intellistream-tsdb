@@ -472,6 +472,7 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestskip" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: a replica's digest compare skipped must fail it
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(SCRATCH)
@@ -1207,7 +1208,7 @@ $(B)/test_settle: tests/test_settle.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_
 $(B)/test_eccold: tests/test_eccold.c src/internal.h src/eccold.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_ecapply: tests/test_ecapply.c src/internal.h src/eccold.h src/ecapply.h $(R7_HDR) $(LIB)
+$(B)/test_ecapply: tests/test_ecapply.c src/internal.h src/eccold.h src/ecapply.h src/ecdigest.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # retired .ec parts and their objects (r7-gc, src/ecgc.c): holds across the deadline, the sweep at open, a store DOWN,
