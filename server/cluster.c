@@ -1086,8 +1086,6 @@ static struct {
     struct uwait *uwait;     /* applied user ops waiting for the members (users_duty) */
     size_t nuwait, capuwait;
     uint64_t users_floor;    /* a Raft leader's commit index heard in this run (cluster_users_caught_up); 0: none */
-    uint64_t copy_floor;     /* the Raft leader's latest commit index heard (cluster_copy_caught_up); 0: none */
-    uint64_t copy_floor_ns;  /* when (iso_now_ns) */
     uint64_t uw_n, uw_max;   /* the users' count and highest version last pushed to the users watch */
     uint64_t uw_at;          /* the applied index whose users the watch has taken (the barrier waits for it) */
     uint64_t uw_rgen;        /* the restore generation of the copy at uw_at */
@@ -1167,6 +1165,12 @@ static struct {
     int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
                           * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
     char holdcopyfile[1100];
+    int stall_loop;      /* TSDB_CLUSTER_TEST stall_loop_file=1: the cluster thread's loop stalls while <state-dir>/stallloop
+                          * exists (test_cluster copycaught: cluster_copy_caught_up read on another thread) */
+    char stallloopfile[1100];
+    int copy_probe;      /* TSDB_CLUSTER_TEST copy_probe=1: a thread of its own writes <state-dir>/copyprobe every 20 ms:
+                          * cluster_copy_caught_up and the published copy's erasure-coded volumes (copy_probe_main) */
+    pthread_t copy_probe_th;
     uint64_t copy_lag_ns; /* TSDB_CLUSTER_TEST copy_lag_ms=N: the main loop publishes no copy for N ms after a push to the
                            * volume manager (test_cluster removereplica: the manager judges a removal by a copy at least as
                            * new as the push, which vol_watch_duty publishes first) */
@@ -1422,6 +1426,10 @@ static void test_knobs(void)
             C.hold_copy = v != 0;
         else if (sscanf(p, "copy_lag_ms=%llu", &v) == 1)
             C.copy_lag_ns = v * MS;
+        else if (sscanf(p, "stall_loop_file=%llu", &v) == 1)
+            C.stall_loop = v != 0;
+        else if (sscanf(p, "copy_probe=%llu", &v) == 1)
+            C.copy_probe = v != 0;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
         else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
@@ -1747,8 +1755,10 @@ enum cl_mutant {
     CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
     CLM_SYNCNOLEASE = 33,  /* USER_SYNC answered by a leader without its lease (review F7) */
     CLM_ULADDRTICK = 34,   /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
-    CLM_BOOTEMPTY = 35     /* core_boot drops the state the member served: STATUS shows an empty image until the core
+    CLM_BOOTEMPTY = 35,    /* core_boot drops the state the member served: STATUS shows an empty image until the core
                             * catches up (test_cluster userpromote) */
+    CLM_COPYNODEADLINE = 36, /* cluster_copy_caught_up ignores the deadline of the floor it heard (a stalled loop) */
+    CLM_COPYNOFLOOR = 37     /* cluster_copy_caught_up does not compare the published copy with the floor */
 };
 static int cl_mutant(void)
 {
@@ -1792,6 +1802,8 @@ static int cl_mutant(void)
             : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
             : !strcmp(e, "uladdrtick")    ? CLM_ULADDRTICK
             : !strcmp(e, "bootempty")     ? CLM_BOOTEMPTY
+            : !strcmp(e, "copynodeadline") ? CLM_COPYNODEADLINE
+            : !strcmp(e, "copynofloor")   ? CLM_COPYNOFLOOR
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2362,14 +2374,49 @@ void cluster_set_users_watch(cluster_users_fn fn, void *arg)
 
 int cluster_users_caught_up(void) { return atomic_load_explicit(&g_users_ok, memory_order_acquire); }
 
-/* R8 (D9): the chunk stores this server has UP (chunksrv_cluster.c), for HBS_STORES; and whether the metadata copy has
- * applied the Raft leader's commit index of a recent heartbeat ack (users_duty decides, every 100 ms) */
+/* R8 (D9): the chunk stores this server has UP (chunksrv_cluster.c), for HBS_STORES */
 static _Atomic uint32_t g_chunk_stores;
-static atomic_int g_copy_ok;
 
 void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_stores, n, memory_order_relaxed); }
 
-int cluster_copy_caught_up(void) { return atomic_load_explicit(&g_copy_ok, memory_order_acquire); }
+/* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
+ * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
+ * its arrival), at most 2 s. The cluster thread raises it; any thread reads it and checks the deadline itself, so a
+ * stalled cluster loop turns the answer to 0 once the lease has run out, while a new leader may commit a new epoch.
+ * cfl_mu is a leaf. */
+static pthread_mutex_t cfl_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t cfl_floor, cfl_until;
+
+static void copy_floor_note(uint64_t commit, uint64_t until)
+{
+    pthread_mutex_lock(&cfl_mu);
+    if (commit > cfl_floor) /* the leader's commit index only grows; a late ack of an older beat must not lower it */
+        cfl_floor = commit;
+    if (until > cfl_until)
+        cfl_until = until;
+    pthread_mutex_unlock(&cfl_mu);
+}
+
+int cluster_copy_caught_up_at(const struct cluster_copy *c)
+{
+    if (!c)
+        return 0;
+    pthread_mutex_lock(&cfl_mu);
+    uint64_t floor = cfl_floor, until = cfl_until;
+    pthread_mutex_unlock(&cfl_mu);
+    if (!floor || (c->applied < floor && cl_mutant() != CLM_COPYNOFLOOR))
+        return 0;
+    return iso_now_ns() < until || cl_mutant() == CLM_COPYNODEADLINE;
+}
+
+int cluster_copy_caught_up(void)
+{
+    const struct cluster_copy *c = cluster_copy_get();
+    int ok = cluster_copy_caught_up_at(c);
+    if (c)
+        cluster_copy_put(c);
+    return ok;
+}
 
 /* The sections of a heartbeat from r->off on, into h. Sets r->bad on a malformed one. An unknown type is skipped. */
 static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
@@ -3665,9 +3712,11 @@ static void on_hb_ack(struct conn *c, struct rd *r)
      * every committed entry. A deposed leader in the same term that has not stepped down yet grants nothing. */
     if (!C.users_floor && from_leader && commit)
         C.users_floor = commit;
-    if (from_leader && commit) { /* the same leader's commit index, the latest one: cluster_copy_caught_up */
-        C.copy_floor = commit;
-        C.copy_floor_ns = now;
+    /* the same leader's commit index, the latest one, good while the lease of this beat holds (from its send time):
+     * cluster_copy_caught_up */
+    if (from_leader && commit && echo && echo <= now && drift < 1000000) {
+        uint64_t end = cluster_lease_end(echo, lease_ms, drift), cap = echo + 2000000000ull;
+        copy_floor_note(commit, end < cap ? end : cap);
     }
     /* the highest commit any voter reported in this term: what the watch stream must reach (watch_duty) */
     if (term > C.hint_term || commit > C.hint_commit)
@@ -4146,18 +4195,20 @@ static int place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *q
     return 0;
 }
 
-static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
+static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int ec)
 {
     struct meta_volume_add a = {0};
     getstr(r, a.name, sizeof a.name);
     uint32_t n = get32(r);
-    uint8_t ek = 0, em = 0; /* R8: k + m of an erasure-coded volume (cluster_volume_add_ec_encode); absent: replicas */
-    if (!r->bad && r->off < r->len) {
+    uint8_t ek = 0, em = 0; /* R8: k + m of an erasure-coded volume (CLUSTER_OP_VOLUME_ADD_EC); 0: replicas */
+    if (ec) {
         ek = get8(r);
         em = get8(r);
-        if (!r->bad && (r->off != r->len || ek < 1 || ek > META_EC_K_MAX || em < 1 || em > META_EC_M_MAX))
+        if (!r->bad && (ek < 1 || ek > META_EC_K_MAX || em < 1 || em > META_EC_M_MAX))
             r->bad = 1;
     }
+    if (!r->bad && r->off != r->len) /* a VOLUME_ADD with k and m is a client's error, never a replicas volume */
+        r->bad = 1;
     if (r->bad || !a.name[0] || !text_ok_cl(a.name)) {
         admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
         return;
@@ -4435,6 +4486,41 @@ static int users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32
     return 0;
 }
 
+/* TSDB_CLUSTER_TEST copy_probe=1 (tests only): what another thread of tsdbd (a chunk server's, r8e) reads, seen from
+ * outside. Every 20 ms, on this thread and never on the cluster thread (whose loop test_cluster stalls), it writes
+ * <state-dir>/copyprobe: "caught C applied A" (cluster_copy_caught_up_at of the published copy), then a line per
+ * erasure-coded volume of that copy (test_cluster copycaught, ecadd). */
+static void *copy_probe_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&C.stop)) {
+        const struct cluster_copy *c = cluster_copy_get();
+        struct buf b = {0};
+        char line[600];
+        snprintf(line, sizeof line, "caught %d applied %" PRIu64 "\n", cluster_copy_caught_up_at(c),
+                 c ? c->applied : 0);
+        put(&b, line, strlen(line));
+        for (uint32_t i = 0; c && i < c->nvolumes; i++) {
+            const struct cluster_copy_vol *v = &c->volumes[i];
+            if (v->redundancy != META_RED_EC)
+                continue;
+            int n = snprintf(line, sizeof line, "vol %s k %u m %u stripe_version %" PRIu64 " gc %u stripe", v->name,
+                             v->ec_k, v->ec_m, v->stripe_version, v->gc_suspended);
+            for (uint32_t k = 0; k < v->nstripe && n > 0 && (size_t)n < sizeof line; k++)
+                n += snprintf(line + n, sizeof line - (size_t)n, " %" PRIu32, v->stripe[k]);
+            put(&b, line, strlen(line));
+            put(&b, "\n", 1);
+        }
+        if (c)
+            cluster_copy_put(c);
+        put(&b, "", 1);
+        probe_write("copyprobe", (const char *)b.p);
+        buf_free(&b);
+        usleep(20000);
+    }
+    return NULL;
+}
+
 /* The users watch, given the copy's users when they changed. Called before every heartbeat, so the applied index a
  * heartbeat reports is one the watch has been given (a leader's "no member lags" then means every member's watch has
  * the change), and before the leader answers waiting user ops. */
@@ -4535,19 +4621,11 @@ static void users_duty(uint64_t now)
         if (!C.users_floor && commit && raft_get_term_at(C.r, commit) == raft_get_term(C.r))
             C.users_floor = commit;
         raft_lease l;
+        /* the leader's own commit index, good while its read lease holds (cluster_copy_caught_up, R8 D9) */
         if (commit && raft_get_term_at(C.r, commit) == raft_get_term(C.r) && raft_read_lease(C.r, &l)) {
-            C.copy_floor = commit;
-            C.copy_floor_ns = iso_now_ns();
+            uint64_t cap = now + 2000000000ull;
+            copy_floor_note(commit, l.lease_until < cap ? l.lease_until : cap);
         }
-    }
-    /* the copy is caught up while it has applied the leader's commit index of an ack (or, on the leader, of its own
-     * lease) less than 2 s old: what a raise of an unsure chunk store may take the epoch from (R8 D9) */
-    {
-        uint64_t t = iso_now_ns();
-        int ok = C.copy_floor && C.copy_floor_ns && t - C.copy_floor_ns < 2000000000ull &&
-                 C.sm.applied >= C.copy_floor;
-        if (ok != atomic_load_explicit(&g_copy_ok, memory_order_relaxed))
-            atomic_store_explicit(&g_copy_ok, ok, memory_order_release);
     }
     /* before the replies: a member this server counts as caught up has its watch given the change; and before the
      * barrier opens, so a login it lets in finds the users the copy has at the floor, not the ones from before */
@@ -5060,7 +5138,8 @@ static void on_admin(struct conn *c, struct rd *r)
     switch (op) {
     case CLUSTER_OP_INIT: admin_init(c, reqid, r); break;
     case CLUSTER_OP_NODE_ADD: admin_node_add(c, reqid, r); break;
-    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r, 0); break;
+    case CLUSTER_OP_VOLUME_ADD_EC: admin_volume_add(c, reqid, r, 1); break;
     case CLUSTER_OP_USER_PUT: admin_user_change(c, reqid, r, 0); break;
     case CLUSTER_OP_USER_DEL: admin_user_change(c, reqid, r, 1); break;
     case CLUSTER_OP_USER_GET: admin_user_get(c, reqid, r); break;
@@ -6864,6 +6943,8 @@ static void *cluster_main(void *arg)
     struct pollfd *pf = NULL;
     size_t pfcap = 0;
     while (!atomic_load(&C.stop)) {
+        while (C.stall_loop && access(C.stallloopfile, F_OK) == 0 && !atomic_load(&C.stop))
+            usleep(10000); /* tests: a stalled cluster loop (stall_loop_file) */
         uint64_t now = iso_now_ns();
         dw_collect();
         vmsg_flush();
@@ -7030,6 +7111,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdraftfile, sizeof C.holdraftfile, "%s/holdraft", C.metadir);
     snprintf(C.holdcopyfile, sizeof C.holdcopyfile, "%s/holdcopy", C.metadir);
+    snprintf(C.stallloopfile, sizeof C.stallloopfile, "%s/stallloop", C.metadir);
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
@@ -7157,6 +7239,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     C.running = 1;
     if (C.copy_hold && pthread_create(&C.copy_hold_th, NULL, cc_hold_main, (void *)(uintptr_t)C.copy_hold) != 0)
         C.copy_hold = 0;
+    if (C.copy_probe && pthread_create(&C.copy_probe_th, NULL, copy_probe_main, NULL) != 0)
+        C.copy_probe = 0;
     return 0;
 }
 
@@ -7170,6 +7254,8 @@ void cluster_stop(void)
     pthread_join(C.th, NULL);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
+    if (C.copy_probe)
+        pthread_join(C.copy_probe_th, NULL);
     cc_clear(); /* readers that hold one keep it until they put it */
     dw_stop_thread();
     C.running = 0;

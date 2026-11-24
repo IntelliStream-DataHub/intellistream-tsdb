@@ -73,6 +73,9 @@ enum cluster_admin_op {
     CLUSTER_OP_VOLUME_MOVE = 11,
     CLUSTER_OP_REPLICA_RESET = 12,
     CLUSTER_OP_VOLUME_GC_RESUME = 13, /* R8: u32 volume; GC_RESUME of an erasure-coded volume (E14) */
+    /* R8: VOLUME_ADD's body then u8 k, u8 m (cluster_volume_add_ec_encode): an erasure-coded volume. An op of its own,
+     * so that a server that predates it refuses it (unknown op) instead of adding a replicas volume */
+    CLUSTER_OP_VOLUME_ADD_EC = 14,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 
@@ -362,9 +365,13 @@ void cluster_set_users_watch(cluster_users_fn fn, void *arg);
  * keeps the users it has until it hears the group, ha-modes :916). Logins wait for it, so a restarted server never
  * accepts a user whose drop committed while it was down. Any thread. */
 int cluster_users_caught_up(void);
-/* R8 (D9): 1 while this server's metadata copy has applied the Raft leader's commit index as of a heartbeat ack (or,
- * on the leader, its read lease) less than 2 s old; a chunk store that opened unsure is raised to a volume's epoch
- * only then. Any thread. */
+/* R8 (D9): 1 while copy `c` (cluster_copy_get) has applied the Raft leader's commit index heard last (from a heartbeat
+ * ack that grants the lease, or on the leader its own) and the lease of that heartbeat still holds (counted from its
+ * send time, at most 2 s): no other leader can have committed past what `c` shows. A chunk store that opened unsure is
+ * raised to a volume's epoch taken from `c` only then. The caller reads the clock itself, so a stalled cluster thread
+ * makes it 0, never a stale 1. 0 for NULL. Any thread. */
+int cluster_copy_caught_up_at(const struct cluster_copy *c);
+/* the same for the copy published now (a get and a put around cluster_copy_caught_up_at) */
 int cluster_copy_caught_up(void);
 /* the number of chunk stores UP on this server (chunksrv_cluster.c), sent in every heartbeat (HBS_STORES): the
  * proposer of an erasure-coded volume picks its stripe group among the members that report one or more */
@@ -482,7 +489,7 @@ void cluster_hmac_parts(const uint8_t *key, size_t klen, int n, const void *cons
 
 /* The VOLUME_ADD body (at most 2 + META_NAME_MAX + 4 bytes). */
 size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *out);
-/* the same with k + m of an erasure-coded volume (R8; replicas 0: m + 1) */
+/* the body of CLUSTER_OP_VOLUME_ADD_EC: the same with k + m of an erasure-coded volume (R8; replicas 0: m + 1) */
 size_t cluster_volume_add_ec_encode(const char *name, uint32_t replicas, uint8_t k, uint8_t m, uint8_t *out);
 size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out); /* 8 bytes */
 /* The bodies of VOLUME_TRANSFER and REPLICA_RESET (8 bytes, as VOLUME_FORCE's) and VOLUME_MOVE (16 bytes); the
