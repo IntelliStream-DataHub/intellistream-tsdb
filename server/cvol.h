@@ -38,5 +38,16 @@ int cvol_active(void);
 /* 1 once the manager went through the volume records of a metadata copy: before that a volume name it does not know
  * may be one the copy has not shown it yet (UNAVAILABLE, RECOVERING, rather than NOTFOUND). */
 int cvol_synced(void);
+struct snap_ident;
+/* The install of a received snapshot of replicated volume v (server/snapinst.c; the snapshot worker, no lock held; R4
+ * D5, D6): takes the volume from the manager (requests UNAVAILABLE RECOVERING), stops its driver and closes its engine
+ * when one is open, then calls fn(ctx, id, had_engine, log_end) with the identity REPL carries (the record's) and the
+ * stopped driver's log end (repld_close_end; REPLD_END_UNKNOWN with no engine or no core), and hands the
+ * volume back to be prepared and opened again as a new record would be (a new open generation, REPLICA_OPEN waited
+ * for) whatever fn returned. CVOL_NOT_TAKEN without calling fn: not this manager's volume, being installed, or
+ * stopping. */
+#define CVOL_NOT_TAKEN (-1000)
+int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, int had_engine, uint64_t log_end),
+                 void *ctx);
 
 #endif

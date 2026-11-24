@@ -14,6 +14,11 @@ struct plink;
 /* The core's REPL_A_SNAPSHOT: the leader (src, its index in rv->rec.rep) no longer has the records this replica
  * needs. rv->mu held; the core repeats the notice until the replica catches up. */
 void rsnap_need(struct rvol *rv, int src);
+/* A failed replica's thread (rv->mu held), every REBUILD_MS: a DIVERGED replica (rv->div_rebuild) asks the volume's
+ * leader for a snapshot, whose install closes this driver and opens a fresh copy without the DIVERGED file. Also the
+ * test hook TSDB_REPLD_TEST=snapask (<dir>/snapask: a running replica asks as if it were behind; test_cluster
+ * snapcatch). */
+void rsnap_rebuild(struct rvol *rv);
 /* An IN_SNAP item (posted by rsnap.c itself from the kind-5 link's callbacks), on the volume's thread, rv->mu held.
  * IN_SNAP is a peer kind: it shares the volume's bounded inbox with the log frames and is DROPPED after INBOX_WAIT_MS
  * when the inbox stays full. The core resends its own messages; nothing resends a snapshot's, so rsnap.c must post only

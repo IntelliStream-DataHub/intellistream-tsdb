@@ -1575,7 +1575,7 @@ static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
 {
     /* RSTATE names it as holding nothing outside the parts before it can outlive a drop of its rows: a writer's open
      * neither replays nor removes it (fails the engine on error) */
-    leader_rs_kept(db, seq);
+    leader_rs_kept(db, seq, fno_end);
     if (lk_push(db, seq, fno_end) != 0) {
         db->lk_stuck = true; /* the segment stays; a later one must not go before it */
         return;
@@ -1624,6 +1624,7 @@ void eng_leader_keep_floor(eng *db, uint64_t pos, uint64_t floor)
 {
     atomic_store(&db->lead_saved, MAX(pos, floor));
     atomic_store(&db->lead_keep, pos);
+    leader_replay_floor(db); /* lrq_mu, a leaf: never waits for flush_lock */
     if (pthread_mutex_trylock(&db->flush_lock) != 0)
         return;
     leader_unlink_due(db);

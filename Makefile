@@ -396,7 +396,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_cvol $(SCRATCH)
 	./$(B)/test_cvolfs $(SCRATCH)
 	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
-	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync" -- ./$(B)/test_replica --mutant @M@ @D@
+	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
 	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)
 	$(MUT) --name test_feedstore --rc 1 --grep 'renamed before its data was synced' --list "noseal" -- ./$(B)/test_feedstore --mutant @M@ @D@ # a replayed segment renamed without its fdatasync must fail it
@@ -984,7 +984,9 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
 	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
-	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown
+	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown \
+	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer \
+	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/rset_mutants.sh $(SCRATCH)
@@ -1008,7 +1010,8 @@ meta-soak: $(B)/test_meta
 
 # R4's files beside the replication driver and the volume manager (server/repld_int.h, cvolset.h, snapinst.h): stubs
 # until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is
-R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c
+R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c \
+          server/snapinst_run.c
 R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h
 TSDBD_SRC := $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h

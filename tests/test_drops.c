@@ -12,14 +12,20 @@
  *  - ttl: the TTL drop renames in block order (oldest first; it used to go newest first), and a child killed after
  *    its first rename leaves no part of either partition listed at the next open.
  *  - power: tsdb_drop_before under crashfs with CRASHFS_TEAR, power lost before every tracked operation (the intent's
- *    write, its syncs, each rename, the directory fsync, the unlink): whole or gone, gone once acknowledged.
+ *    write, its syncs, each rename, the directory fsync, the unlink): whole or gone, gone once acknowledged. At each
+ *    step the seeds draw the unsynced directory operations that survive at random; then CRASHFS_UNDO_ONE loses each
+ *    of them in turn with all the others kept, so a window such as "the intent's unlink kept, one rename lost"
+ *    (ttlunlinkfirst) is met at its step whatever the draws are (fixed seeds alone once all missed it).
  *  - recover: an open that rolls a drop intent forward (one part already renamed) under the same power loss: gone.
  *  - torn: an intent without its end line: the drop never started, everything is there. damaged: an intent whose
  *    checksum is wrong after all its renames ran reads as torn: the renames stand (the partition is gone), the
  *    intent is removed (as an insert's intent, part.c).
  *  - ec: an .ec name in a drop intent is rolled forward to retired_<name>.ec (r7-gc's name).
  *  - kill with two parts in partition 0 (fixture_parts): a drop of exactly two parts takes an intent too.
- *  - ttl power: the retention drop under crashfs: both partitions whole or both gone (one intent per pass).
+ *  - ttl power: the retention drop under crashfs: both partitions whole or both gone (one intent per pass). The
+ *    stepped sweep counts operations, which the engine's threads interleave differently from run to run, so it can
+ *    miss a window of one operation (ttlunlinkfirst survived a loaded run that way); a hook (drop_test_presync) also
+ *    cuts the power right before the directory fsync after the renames, each unsynced directory operation lost in turn.
  *  - beside a settle's swap intent: drop intents are rolled forward last (a swap rolled forward hands the drop its
  *    .ec; a swap whose renames were lost lists the .ec again unless the drop goes after it).
  *  - names: a checksummed intent naming MANIFEST, a path or a retired_ name fails the open, nothing renamed.
@@ -41,6 +47,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -303,11 +310,13 @@ static void ttl(void)
 
 /* --------------------------------------------------------------- power */
 
-static int run_child(const char *mode, const char *dir, const char *ack, int warmup, int seed)
+/* undo >= 0: CRASHFS_UNDO_ONE (every unsynced directory operation kept but that one), their number written to `count` */
+static int run_child(const char *mode, const char *dir, const char *ack, int warmup, int seed, int undo,
+                     const char *count)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        char asan[512], w[16], sd[16];
+        char asan[512], w[16], sd[16], u[16];
         snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
                  getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
         setenv("ASAN_OPTIONS", asan, 1);
@@ -320,6 +329,11 @@ static int run_child(const char *mode, const char *dir, const char *ack, int war
         setenv("CRASHFS_AT_EXIT", "1", 1);
         setenv("CRASHFS_TEAR", "1", 1);
         setenv("CRASHFS_SEED", sd, 1);
+        if (undo >= 0) {
+            snprintf(u, sizeof u, "%d", undo);
+            setenv("CRASHFS_UNDO_ONE", u, 1);
+            setenv("CRASHFS_UNDO_COUNT", count, 1);
+        }
         int null = open("/dev/null", O_WRONLY);
         if (null >= 0) {
             dup2(null, 1);
@@ -334,10 +348,23 @@ static int run_child(const char *mode, const char *dir, const char *ack, int war
     return WEXITSTATUS(st);
 }
 
+/* --child-ttl-cut: the shim cuts the power at the next tracked operation once the retention drop's renames are done
+ * (SIGUSR2): no count of operations, which the threads interleave differently from run to run */
+static void hook_presync(eng *db)
+{
+    (void)db;
+    raise(SIGUSR2);
+}
+
 /* --child-drop DIR ACK: open, drop, acknowledge; --child-open DIR -: the open alone; --child-ttl DIR ACK: open with a
- * merge thread (the retention limit is set already) and wait until its retention drop has retired every part */
+ * merge thread (the retention limit is set already) and wait until its retention drop has retired every part;
+ * --child-ttl-cut DIR ACK: the same, the power lost before the directory fsync after its renames */
 static int child_main(int mode, const char *dir, const char *ack)
 {
+    if (mode == 3) {
+        drop_test_presync = hook_presync;
+        mode = 2;
+    }
     tsdb_options o = opts(mode == 2 ? 1 : 0);
     tsdb *db = NULL;
     if (tsdb_open(dir, &o, &db) != 0)
@@ -397,7 +424,8 @@ static void sweep(int mode)
 {
     const bool drop = mode == SW_DROP, ttl_mode = mode == SW_TTL;
     const int seeds = ttl_mode ? 4 : SEEDS;
-    char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8];
+    char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8], count[PATH_MAX + 8];
+    snprintf(count, sizeof count, "%s/undo-count", S);
     snprintf(src, sizeof src, "%s/src", S);
     snprintf(work, sizeof work, "%s/work", S);
     snprintf(ack, sizeof ack, "%s/ack", S);
@@ -419,17 +447,29 @@ static void sweep(int mode)
     const char *what = drop       ? "tsdb_drop_before"
                        : ttl_mode ? "the retention drop"
                                   : "the open rolling a drop intent forward";
-    int bad = 0, steps = 0, gone = 0, whole = 0;
+    int bad = 0, steps = 0, gone = 0, whole = 0, undos = 0;
     bool half = false;
     for (int w = 0; w < 5000 && bad < 3; w++) {
         bool ended = false;
-        for (int seed = 0; seed < seeds && bad < 3; seed++) {
+        int nundo = 1; /* the runs with CRASHFS_UNDO_ONE: 0, then as many as the first loss counted */
+        for (int run = 0; run < seeds + nundo && bad < 3; run++) {
+            const int seed = run < seeds ? run : 0, undo = run < seeds ? -1 : run - seeds;
             sh("rm -rf '%s'%s", work, "");
             sh("cp -a '%s' '%s'", src, work);
             unlink(ack);
-            int st = run_child(drop ? "--child-drop" : ttl_mode ? "--child-ttl" : "--child-open", work, ack, w, seed);
+            unlink(count);
+            int st = run_child(drop ? "--child-drop" : ttl_mode ? "--child-ttl" : "--child-open", work, ack, w, seed,
+                               undo, count);
+            if (undo == 0) {
+                FILE *cf = fopen(count, "r");
+                if (!cf || fscanf(cf, "%d", &nundo) != 1 || nundo < 1)
+                    nundo = 1; /* no loss (the child ended) or nothing unsynced: the one run */
+                if (cf)
+                    fclose(cf);
+            }
+            undos += undo >= 0;
             if (st != 99 && st != 0) {
-                fprintf(stderr, "%s: step %d seed %d: the child exited with %d\n", what, w, seed, st);
+                fprintf(stderr, "%s: step %d seed %d undo %d: the child exited with %d\n", what, w, seed, undo, st);
                 failures++;
                 bad++;
                 continue;
@@ -439,7 +479,7 @@ static void sweep(int mode)
             if (getenv("TSDB_DROPS_TRACE")) {
                 char tr[64][128];
                 size_t k = count_prefix(work, "", tr, 64);
-                printf("w%d s%d st%d:", w, seed, st);
+                printf("w%d s%d u%d st%d:", w, seed, undo, st);
                 for (size_t i = 0; i < k && i < 64; i++)
                     if (strstr(tr[i], "p0_") || strncmp(tr[i], "txn_", 4) == 0)
                         printf(" %s", tr[i]);
@@ -452,8 +492,8 @@ static void sweep(int mode)
             whole += v == V_WHOLE;
             half = half || v == V_HALF;
             if (v == V_HALF || v == V_ERR || (v == V_WHOLE && ((acked && drop) || mode == SW_OPEN))) {
-                fprintf(stderr, "%s: power lost before operation %d (seed %d): partition 0 %s%s\n", what, w, seed,
-                        vname[v], acked ? " (acknowledged)" : "");
+                fprintf(stderr, "%s: power lost before operation %d (seed %d, undo %d): partition 0 %s%s\n", what, w,
+                        seed, undo, vname[v], acked ? " (acknowledged)" : "");
                 failures++;
                 bad++;
             }
@@ -462,15 +502,60 @@ static void sweep(int mode)
         if (ended)
             break;
     }
+    int cuts = 0, cbad = 0; /* its own count: a stepped sweep that failed three times still runs it */
+    for (int undo = 0, nundo = 1; ttl_mode && undo < nundo && cbad < 3; undo++) {
+        /* the mutant's window, met by a hook: the renames done, the directory fsync next (with ttlunlinkfirst the
+         * intent already unlinked); each unsynced directory operation lost in turn, all the others kept */
+        sh("rm -rf '%s'%s", work, "");
+        sh("cp -a '%s' '%s'", src, work);
+        unlink(ack);
+        unlink(count);
+        int st = run_child("--child-ttl-cut", work, ack, 1 << 30, 0, undo, count);
+        if (undo == 0) {
+            FILE *cf = fopen(count, "r");
+            if (!cf || fscanf(cf, "%d", &nundo) != 1 || nundo < 2) {
+                fprintf(stderr, "%s: the cut before its directory fsync found %d unsynced directory operations "
+                        "(the child exited with %d): the window is not there\n", what, nundo, st);
+                failures++;
+                cbad++;
+            }
+            if (cf)
+                fclose(cf);
+        }
+        if (st != 99) {
+            fprintf(stderr, "%s: cut before its directory fsync, undo %d: the child exited with %d, not at the cut\n",
+                    what, undo, st);
+            failures++;
+            cbad++;
+            continue;
+        }
+        cuts++;
+        judge_ttl = true;
+        enum verdict v = judge(work);
+        judge_ttl = false;
+        gone += v == V_GONE;
+        whole += v == V_WHOLE;
+        half = half || v == V_HALF;
+        if (v == V_HALF || v == V_ERR) {
+            fprintf(stderr, "%s: power lost before its directory fsync (undo %d): partition 0 %s\n", what, undo,
+                    vname[v]);
+            failures++;
+            cbad++;
+        }
+    }
+    if (ttl_mode)
+        printf("  the retention drop cut before its directory fsync: %d runs, each losing one directory operation\n",
+               cuts);
     if (mode != SW_OPEN && (!gone || !whole)) {
         fprintf(stderr, "%s: %d cuts left it gone, %d whole: the sweep missed a side\n", what, gone, whole);
         failures++;
     }
     if (half)
         printf("  %s: HALF DROP\n", what);
-    printf("  %s: power lost at each of %d steps (%d seeds each; %d gone, %d whole): %s\n", what, steps, seeds, gone,
-           whole,
-           bad        ? "FAILED"
+    printf("  %s: power lost at each of %d steps (%d seeds each, %d runs losing one directory operation; %d gone, "
+           "%d whole): %s\n",
+           what, steps, seeds, undos, gone, whole,
+           bad || cbad ? "FAILED"
            : drop     ? "whole or gone, gone once acknowledged"
            : ttl_mode ? "both partitions whole or both gone"
                       : "gone");
@@ -746,8 +831,11 @@ int main(int argc, char **argv)
     if (getenv("TSDB_DROP_MUTANT"))
         drop_test_mutant = parse_mutant(getenv("TSDB_DROP_MUTANT"));
     if (argc == 4 && (strcmp(argv[1], "--child-drop") == 0 || strcmp(argv[1], "--child-open") == 0 ||
-                      strcmp(argv[1], "--child-ttl") == 0))
-        return child_main(strcmp(argv[1], "--child-drop") == 0 ? 1 : strcmp(argv[1], "--child-ttl") == 0 ? 2 : 0,
+                      strcmp(argv[1], "--child-ttl") == 0 || strcmp(argv[1], "--child-ttl-cut") == 0))
+        return child_main(strcmp(argv[1], "--child-drop") == 0      ? 1
+                          : strcmp(argv[1], "--child-ttl") == 0     ? 2
+                          : strcmp(argv[1], "--child-ttl-cut") == 0 ? 3
+                                                                    : 0,
                           argv[2], argv[3]);
     const char *scratch = "/tmp";
     for (int i = 1; i < argc; i++) {

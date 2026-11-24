@@ -486,18 +486,25 @@ static void render(sb *b)
         cfg.snap(&sn);
         family(b, "tsdb_snapshot_total", "counter",
                "Snapshot transfers of replicated volumes by outcome: asked (as a receiver), sent, received, refused_space "
-               "(the receiver's free space), failed (abandoned or released before the end), busy (BUSY answers).");
+               "(the receiver's free space), failed (abandoned or released before the end), busy (BUSY answers), installed, "
+               "refused_stale (a copy not installed: its P at or below the receiver's log end, or its epoch below the "
+               "receiver's fence).");
         sb_add(b, "tsdb_snapshot_total{event=\"asked\"} %llu\ntsdb_snapshot_total{event=\"sent\"} %llu\n"
                   "tsdb_snapshot_total{event=\"received\"} %llu\ntsdb_snapshot_total{event=\"refused_space\"} %llu\n"
-                  "tsdb_snapshot_total{event=\"failed\"} %llu\ntsdb_snapshot_total{event=\"busy\"} %llu\n",
+                  "tsdb_snapshot_total{event=\"failed\"} %llu\ntsdb_snapshot_total{event=\"busy\"} %llu\n"
+                  "tsdb_snapshot_total{event=\"installed\"} %llu\ntsdb_snapshot_total{event=\"refused_stale\"} %llu\n",
                (unsigned long long)sn.asked, (unsigned long long)sn.sent, (unsigned long long)sn.received,
-               (unsigned long long)sn.refused_space, (unsigned long long)sn.failed, (unsigned long long)sn.busy);
+               (unsigned long long)sn.refused_space, (unsigned long long)sn.failed, (unsigned long long)sn.busy,
+               (unsigned long long)sn.installed, (unsigned long long)sn.refused_stale);
         family(b, "tsdb_snapshot_bytes_total", "counter", "Bytes of snapshot files this server sent and received.");
         sb_add(b, "tsdb_snapshot_bytes_total{dir=\"sent\"} %llu\ntsdb_snapshot_bytes_total{dir=\"received\"} %llu\n",
                (unsigned long long)sn.bytes_sent, (unsigned long long)sn.bytes_received);
         family(b, "tsdb_snapshot_last_seconds", "gauge",
                "The last snapshot this server received: seconds from its request to its last file.");
         sb_add(b, "tsdb_snapshot_last_seconds %.3f\n", sn.last_seconds);
+        family(b, "tsdb_snapshot_install_last_seconds", "gauge",
+               "The last snapshot this server installed: seconds from the end of its transfer to the volume handed back.");
+        sb_add(b, "tsdb_snapshot_install_last_seconds %.3f\n", sn.install_seconds);
     }
 
     family(b, "tsdb_query_duration_seconds", "histogram",
