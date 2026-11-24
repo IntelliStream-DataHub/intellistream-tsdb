@@ -340,7 +340,7 @@ static void start(int i)
     int port = start_try(i);
     if (port <= 0)
         die("server %d: %s", i, th_why);
-    cports[i] = port;
+    __atomic_store_n(&cports[i], port, __ATOMIC_RELAXED); /* the transfer writers read it while a server restarts */
     if (!th_pport)
         die("server %d: the port file names no peer port", i);
     pports[i] = th_pport;
@@ -395,6 +395,7 @@ static int log_has(int i, const char *needle)
 
 static uint32_t isr_of(int via, const char *name, uint64_t *version);
 static void await_isr(int via, const char *name, uint32_t n, int ms, const char *what);
+static uint64_t tr_count(int i, int which);
 
 /* stops every live server (SIGTERM, status 0) and starts a new scenario in its own directory */
 static void stop_all(void)
@@ -614,6 +615,8 @@ static int init_r4_set; /* nonzero: INIT's four settings of R4 off their default
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
 static uint32_t init_rebuild_mb_s, init_rebuild_max; /* nonzero: INIT's rebuild_mb_s, rebuild_max */
 
+static uint32_t init_transfer_wait_ms, init_leader_balance_s; /* r4-transfer's scenarios (0: the default) */
+
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
 {
@@ -632,6 +635,10 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
+    if (init_transfer_wait_ms)
+        s.transfer_wait_ms = init_transfer_wait_ms;
+    if (init_leader_balance_s)
+        s.leader_balance_s = init_leader_balance_s;
     if (init_r4_set) {
         s.rebuild_mb_s = 300;
         s.rebuild_max = 3;
@@ -3612,7 +3619,8 @@ static void *promo_probe_run(void *a)
 /* A member that becomes a voter (a watcher made a learner, then a voter: core_boot rebuilds its metadata copy from
  * nothing or its snapshot, and the log replays) keeps answering logins from the users it had: during the rebuild no
  * login is refused there and an open session goes on (server/cluster.c users_push holds the watch while the copy is
- * below what it was given). Mutant (TSDB_CLUSTER_MUTANT): pushrebuild (the empty copy is pushed). */
+ * below what it was given). Its STATUS shows the watcher's state meanwhile, never an empty image. Mutants
+ * (TSDB_CLUSTER_MUTANT): pushrebuild (the empty copy is pushed), bootempty (STATUS shows the empty core's state). */
 static void scen_userpromote(void)
 {
     scenario("userpromote");
@@ -3633,7 +3641,32 @@ static void scen_userpromote(void)
         die("pthread_create");
     node_add(0, 2); /* three: servers 1 and 2 become learners, then voters */
     unsigned want = 3;
-    await_view(0, p_voters, &want, "three voters");
+    /* server 1's STATUS through the promotion shows the state it served as a watcher (marked stale) while its core
+     * starts from nothing and its install is held, never an empty image (core_boot keeps that state as the copy; a
+     * test reading a volume there found none: setchurn; mutant bootempty) */
+    int held = 0, polls = 0;
+    for (uint64_t t0 = now_ms();; polls++) {
+        struct view v1, v0;
+        view(1, &v1);
+        int empty = !v1.m.initialised || v1.m.nmembers < 2;
+        held += v1.st.mode == CLUSTER_MODE_CORE && v1.st.stale;
+        unsigned mode = v1.st.mode, stale = v1.st.stale;
+        uint64_t applied = v1.st.applied;
+        view_free(&v1);
+        if (empty)
+            die("server 1 made a learner: its STATUS showed an empty image (mode %u, stale %u, applied %" PRIu64
+                ", after %d polls)", mode, stale, applied, polls);
+        view(0, &v0);
+        int done = p_voters(&v0, &want);
+        view_free(&v0);
+        if (done)
+            break;
+        if (now_ms() - t0 > WAIT_MS)
+            die("server 0: three voters did not happen within %d ms", WAIT_MS);
+        usleep(20000);
+    }
+    if (!held)
+        die("server 1 made a learner: none of %d STATUS answers fell in its held install", polls);
     await_view(1, p_users_caught_up, NULL, "users caught up");
     usleep(1000000);
     atomic_store(&p.stop, 1);
@@ -3644,7 +3677,8 @@ static void scen_userpromote(void)
             p.refused, p.logins, p.ended, p.why);
     if (log_has(1, "the cluster's users went back"))
         die("server 1 made a voter: its users went back (an older list pushed while its copy was rebuilt)");
-    printf("  server 1 made a voter: %d logins and the open session's lookups all answered\n", p.logins);
+    printf("  server 1 made a voter: %d logins and the open session's lookups all answered; %d of %d STATUS answers"
+           " showed its watcher's state during the held install, none an empty image\n", p.logins, held, polls);
 }
 
 struct replay_probe {
@@ -6630,6 +6664,29 @@ static int wal_count(int i, uint32_t num)
     errno = 0;
     for (struct dirent *e; (e = readdir(d));)
         n += !strncmp(e->d_name, "wal_", 4);
+    if (errno)
+        die("readdir %s: %s", v, strerror(errno));
+    closedir(d);
+    return n;
+}
+
+/* the bytes of the WAL segments in server i's directory of volume num (the transfer's kept-segment preload) */
+static uint64_t wal_bytes(int i, uint32_t num)
+{
+    char dir[PATH_MAX + 80], v[PATH_MAX + 120], f[PATH_MAX + 400];
+    server_dir(i, dir, sizeof dir);
+    snprintf(v, sizeof v, "%s/v%" PRIu32, dir, num);
+    DIR *d = opendir(v);
+    if (!d)
+        die("opendir %s: %s", v, strerror(errno));
+    uint64_t n = 0;
+    errno = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        struct stat st;
+        snprintf(f, sizeof f, "%s/%s", v, e->d_name);
+        if (!strncmp(e->d_name, "wal_", 4) && stat(f, &st) == 0)
+            n += (uint64_t)st.st_size;
+    }
     if (errno)
         die("readdir %s: %s", v, strerror(errno));
     closedir(d);
@@ -12021,6 +12078,9 @@ static void scen_deposetail(void)
     await_isr(Nw, "rs", 3, 30000, "the deposed writer back in the ISR once the links are back");
     if (log_count(L, "stopped:"))
         die("the deposed writer stopped its volume");
+    uint64_t cuts = tr_count(L, CL_TR_CUTS); /* STATUS's cut counter counts a real one (r4-transfer review F4) */
+    if (!cuts)
+        die("the deposed writer cut R2 from its log, but STATUS counts %" PRIu64 " cuts", cuts);
     printf("  writer %d deposed with R2 written after its demote began: a replica again, back in the ISR %" PRIu64
            " ms after the heal\n", L, now_ms() - th);
     stop_all();
@@ -13480,7 +13540,7 @@ static void scen_r4stubs(void)
     printf("  init stored rebuild_mb_s 150, rebuild_max 4, transfer_wait_ms 3000, leader_balance_s 120\n");
     /* the stubs decode the body and say it back: the CLI's encoding against the server's decoder, field by field */
     static const char *const verbs[][2] = {
-        {"volume transfer %s 3 5", "not built yet (transfer of volume 3 to node 5)"},
+        {"volume transfer %s 3 5", "volume 3 to node 5: no such volume"}, /* built (r4-transfer): ctr_admin */
         {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
         {"volume move %s 3 --log --from 6 --to 5 --cancel",
          "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
@@ -13500,8 +13560,10 @@ static void scen_r4stubs(void)
     for (int k = 0; k < 3; k++) {
         reply = NULL, len = 0;
         arc = admin(0, ops[k], body, 12, 0, &reply, &len);
-        const char *want = k == 2 ? "replica reset: a body of 12 bytes" : "not built yet (a body of 12 bytes)";
-        if (arc != META_ERR_INVALID || !reply || len < 21 || memcmp(reply, want, 21))
+        const char *says = k == 0   ? "a transfer's body is 8 bytes (got 12)"
+                           : k == 2 ? "replica reset: a body of 12 bytes"
+                                    : "not built yet (a body of 12 bytes)";
+        if (arc != META_ERR_INVALID || !reply || len < strlen(says) || memcmp(reply, says, strlen(says)))
             die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
         free(reply);
     }
@@ -13563,16 +13625,1589 @@ static void scen_volcmd(void)
         die("rename %s: %s", path, strerror(errno));
     static const char *const what[4] = {NULL, "TRANSFER to node", "DROP_MEMBER of node", "CANCEL to node"};
     for (int i = 0; i < 2; i++)
-        for (int k = 1; k <= 3; k++) {
+        for (int k = 1; k <= 2; k++) {
             char line[256];
-            snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num, what[k],
-                     7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
+            if (k == 1) /* rtransfer.c (built): an epoch the volume is not at is refused, by name */
+                snprintf(line, sizeof line, "volume %" PRIu32 ": TRANSFER to node %d at epoch %d refused: ", num, 7 + k,
+                         100 * (i + 1) + k);
+            else
+                snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num,
+                         what[k], 7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
             await_log_count(i, line, 1, 20000);
         }
+    /* a CANCEL with no transfer to cancel is silent (a new Raft leader sends one to every volume leader); its routing
+     * is test_cluster transferraftkill's */
     if (access(to, F_OK) == 0)
         die("the leader kept %s after sending every command", to);
     printf("  every VOLCMD kind reached the member's and the leader's own driver with its fields\n");
     stop_all();
+}
+
+/* ------------------------------------------------------------------ planned leader transfer (r4-transfer, D14, D15) */
+
+struct tr_write {
+    uint64_t t0, t1;
+    int rc;
+};
+struct tr_writer {
+    int server; /* the member it writes through (forwarded to the leader when not led there) */
+    tsdb_sid id;
+    int64_t ts; /* the next row's time */
+    int stop;
+    size_t n, cap;
+    struct tr_write *w;
+    int acked, refused, indet;
+    int noretry; /* no client retries: every refusal (UNAVAILABLE, MOVED) is the writer's own answer (review F4); on
+                  * MOVED it goes on through the next member (`via`), so it finds the leader and sees its drains */
+    int via, unavail;
+    int last_rc;          /* atomic: the latest write's answer (for the failure message) */
+    uint64_t last_ack_t0; /* atomic: when the latest acknowledged write began (the scenario waits for one past a
+                           * transfer, so that each write's pause belongs to one transfer) */
+};
+
+/* one row a write, each outcome recorded after the client's own retries (UNAVAILABLE PROMOTING, MOVED: 10 s) */
+static void *tr_write_thread(void *a)
+{
+    struct tr_writer *w = a;
+    tsdbc *c = NULL;
+    while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
+        if (!c) {
+            int through = w->noretry ? w->via : w->server;
+            if (tsdbc_connect("127.0.0.1", __atomic_load_n(&cports[through], __ATOMIC_RELAXED), &c) != 0) {
+                c = NULL;
+                usleep(20000);
+                continue;
+            }
+            tsdbc_set_retry(c, w->noretry ? 0 : 10000);
+            tsdbc_set_timeout(c, 30000);
+        }
+        float val = (float)(w->ts % 977);
+        struct tr_write r = {now_ms(), 0, 0};
+        r.rc = tsdbc_insert_series(c, w->id, &w->ts, &val, 1);
+        r.t1 = now_ms();
+        __atomic_store_n(&w->last_rc, r.rc, __ATOMIC_RELAXED);
+        if (r.rc == 0) {
+            w->acked++;
+            __atomic_store_n(&w->last_ack_t0, r.t0, __ATOMIC_RELEASE);
+        }
+        else if (r.rc == TSDB_ERR_UNAVAILABLE || r.rc == TSDB_ERR_MOVED) {
+            w->refused++; /* definite: the server says it was never admitted */
+            w->unavail += r.rc == TSDB_ERR_UNAVAILABLE;
+            if (w->noretry && r.rc == TSDB_ERR_MOVED) {
+                tsdbc_close(c);
+                c = NULL;
+                w->via = (w->via + 1) % 3;
+            }
+            if (w->noretry)
+                usleep(5000); /* the client's own retries would wait retry_after (50 ms in a drain) */
+        }
+        else {
+            w->indet++; /* a closed connection (D12) or a deadline: the outcome is unknown */
+            tsdbc_close(c);
+            c = NULL;
+        }
+        w->ts += 1000;
+        if (w->n == w->cap) {
+            w->cap = w->cap ? 2 * w->cap : 65536;
+            w->w = realloc(w->w, w->cap * sizeof *w->w);
+            if (!w->w)
+                die("out of memory");
+        }
+        w->w[w->n++] = r;
+    }
+    if (c)
+        tsdbc_close(c);
+    return NULL;
+}
+
+/* one transfer of `name` (number num) to node `to` through the Raft leader (server 0, followed): its answer */
+static int tr_transfer(uint32_t num, uint32_t to, char *why, size_t n)
+{
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(num, to, body);
+    int rc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl);
+    snprintf(why, n, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    return rc;
+}
+
+static uint64_t tr_count(int i, int which)
+{
+    struct view v;
+    view(i, &v);
+    uint64_t c = v.st.ntr > (uint32_t)which ? v.st.tr[which] : 0;
+    view_free(&v);
+    return c;
+}
+
+/* After stop_all: on every member each acknowledged row of the writers is there and each refused one (UNAVAILABLE or
+ * MOVED after the client's retries: never admitted, D14) is not, and the members hold the same rows. A write with an
+ * unknown outcome (a killed server's connection) may be either. */
+struct tr_chk {
+    struct tr_writer *w;
+    int server;
+    const char *what;
+    int bad;
+};
+static int tr_chk_fn(void *ctx, const char *name, const int64_t *ts, const float *v, size_t n)
+{
+    struct tr_chk *k = ctx;
+    (void)v;
+    for (int i = 0; i < REP_NAMES; i++) {
+        if (strcmp(name, rep_names[i]) != 0)
+            continue;
+        const struct tr_writer *w = &k->w[i];
+        size_t at = 0;
+        for (size_t j = 0; j < w->n; j++) {
+            int64_t t = 1000000 + 1000 * (int64_t)j;
+            while (at < n && ts[at] < t)
+                at++;
+            int has = at < n && ts[at] == t;
+            if (w->w[j].rc == 0 && !has && k->bad++ < 3)
+                fprintf(stderr, "%s: server %d lost the acknowledged row %" PRId64 " of %s (write %zu, %" PRIu64
+                        " ms, via server %d)\n", k->what, k->server, t, name, j, w->w[j].t1 - w->w[j].t0, w->server);
+            if ((w->w[j].rc == TSDB_ERR_UNAVAILABLE || w->w[j].rc == TSDB_ERR_MOVED) && has && k->bad++ < 3)
+                fprintf(stderr, "%s: server %d holds the row %" PRId64 " of %s, refused with %s (a definite refusal "
+                        "applied)\n", k->what, k->server, t, name, ers(w->w[j].rc));
+        }
+    }
+    return 0;
+}
+static void tr_check(struct tr_writer *w, const char *what)
+{
+    uint64_t rows[3][REP_NAMES], h[3][REP_NAMES];
+    int bad = 0;
+    for (int i = 0; i < 3; i++) {
+        char dir[PATH_MAX + 80], v[PATH_MAX + 120];
+        server_dir(i, dir, sizeof dir);
+        snprintf(v, sizeof v, "%s/v1", dir);
+        struct tr_chk k = {w, i, what, 0};
+        int rc = cvol_rows(v, tr_chk_fn, &k);
+        bad += k.bad;
+        if (rc == 0)
+            rc = cvol_digest(v, rep_names, REP_NAMES, rows[i], h[i]);
+        if (rc != 0)
+            die("%s: open %s read-only: %s", what, v, ers(rc));
+        for (int n = 0; i && n < REP_NAMES; n++)
+            if (rows[i][n] != rows[0][n] || h[i][n] != h[0][n])
+                die("%s: server %d holds %" PRIu64 " rows of %s, server 0 %" PRIu64 "%s", what, i, rows[i][n],
+                    rep_names[n], rows[0][n], rows[i][n] == rows[0][n] ? ", other ones" : "");
+    }
+    if (bad)
+        die("%s: %d rows lost or applied after a refusal (above)", what, bad);
+}
+
+/* r4-transfer's other scenarios: 3 servers, volume tv (number 1) on all three, REP_NAMES writers through every
+ * member (forwarded where not led) */
+struct tr_run {
+    struct tr_writer w[REP_NAMES];
+    pthread_t th[REP_NAMES];
+    uint32_t num;
+};
+static void tr_setup(struct tr_run *x)
+{
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int rc;
+    if ((rc = vol_add(0, "tv", 3, &x->num)) != 0 || x->num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), x->num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    tsdbc *c = client(server_of(v.leader));
+    memset(x->w, 0, sizeof x->w);
+    for (int k = 0; k < REP_NAMES; k++) {
+        x->w[k].server = k % 3;
+        x->w[k].id = rep_series(c, rep_names[k], "tv", 30000);
+        x->w[k].ts = 1000000;
+    }
+    tsdbc_close(c);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the writers");
+    for (int k = 0; k < REP_NAMES; k++)
+        if (pthread_create(&x->th[k], NULL, tr_write_thread, &x->w[k]) != 0)
+            die("pthread_create");
+    usleep(300000);
+}
+/* the rows server c itself answers (no retries set on c): -1 while it refuses (MOVED, UNAVAILABLE) */
+static int tr_rows_here(tsdbc *c, tsdb_sid id)
+{
+    nrows = 0;
+    int rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, count_rows, NULL);
+    if (rc == TSDB_ERR_MOVED || rc == TSDB_ERR_UNAVAILABLE)
+        return -1;
+    if (rc != 0)
+        die("query: %s", ers(rc));
+    return nrows;
+}
+/* the writers stopped, every server stopped cleanly, the rows checked; the writers' records freed */
+static void tr_finish(struct tr_run *x, const char *what, int indet_ok)
+{
+    for (int k = 0; k < REP_NAMES; k++)
+        __atomic_store_n(&x->w[k].stop, 1, __ATOMIC_RELEASE);
+    int indet = 0;
+    for (int k = 0; k < REP_NAMES; k++) {
+        pthread_join(x->th[k], NULL);
+        indet += x->w[k].indet;
+    }
+    if (indet && !indet_ok)
+        die("%s: %d writes had an unknown outcome (D14 promises definite answers)", what, indet);
+    /* a commit needs min_isr members, not all: every member holds the leader's rows before the stop */
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("%s: no record of tv", what);
+    tsdbc *c = client(server_of(v.leader));
+    tsdbc_set_retry(c, 30000); /* a MOVED of a record not yet in this copy is followed */
+    for (int k = 0; k < REP_NAMES; k++) {
+        int want = rows_of(c, x->w[k].id);
+        for (int i = 0; i < 3; i++) {
+            /* no retries: a MOVED followed to the leader would count the leader's rows as server i's (transferkill:
+             * the restarted server, without a lease yet, was stopped before its tail came) */
+            tsdbc *r = client(i);
+            tsdbc_set_retry(r, 0);
+            uint64_t t0 = now_ms();
+            int got;
+            while ((got = tr_rows_here(r, x->w[k].id)) != want)
+                if (now_ms() - t0 > 30000)
+                    die("%s: server %d reads %d rows of %s 30 s after the writers stopped, the leader %d", what, i,
+                        got, rep_names[k], want);
+                else
+                    usleep(20000);
+            tsdbc_close(r);
+        }
+    }
+    tsdbc_close(c);
+    stop_all();
+    tr_check(x->w, what);
+    for (int k = 0; k < REP_NAMES; k++)
+        free(x->w[k].w);
+}
+/* every writer acknowledged a write that began after t (bounded: 30 s) */
+static void tr_await_acks(struct tr_run *x, uint64_t t, const char *what)
+{
+    for (int k = 0; k < REP_NAMES; k++) {
+        uint64_t until = now_ms() + 30000;
+        while (__atomic_load_n(&x->w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= t)
+            if (now_ms() > until)
+                die("writer %d (through server %d) acknowledged nothing in 30 s %s", k, x->w[k].server, what);
+            else
+                usleep(5000);
+    }
+}
+/* the member of tv that is neither its leader (server L) nor the server `not` */
+static int tr_other(int L, int not)
+{
+    for (int i = 0; i < 3; i++)
+        if (i != L && i != not)
+            return i;
+    return -1;
+}
+struct tr_async {
+    uint32_t num, to;
+    int rc;
+    char why[256];
+};
+/* a transfer through server 0 that may be killed under it (no follow): a lost connection is rc 1 and its error */
+static void *tr_transfer_thread(void *a)
+{
+    struct tr_async *t = a;
+    char target[META_ADDR_MAX + 1];
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(t->num, t->to, body);
+    peer_of(0, target, sizeof target);
+    if (cluster_admin(target, secret, secret_len, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 30000, &t->rc, &reply, &rl,
+                      t->why, sizeof t->why) != 0) {
+        t->rc = 1;
+        return NULL;
+    }
+    snprintf(t->why, sizeof t->why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    return NULL;
+}
+static void state_flag(int i, const char *name, int on)
+{
+    char f[PATH_MAX + 64];
+    server_dir(i, f, sizeof f);
+    snprintf(f + strlen(f), sizeof f - strlen(f), "/state/%s", name);
+    if (on) {
+        FILE *fp = fopen(f, "w");
+        if (!fp)
+            die("create %s: %s", f, strerror(errno));
+        fclose(fp);
+    } else if (unlink(f) != 0 && errno != ENOENT)
+        die("unlink %s: %s", f, strerror(errno));
+}
+
+/* transferslow: the target stopped (SIGSTOP) for 3 s across a transfer: the drain times out (transfer_wait_ms 1000),
+ * the leader admits again, the transfer is refused, the leader and epoch are unchanged, writes go on */
+static void tr_slow(int lag)
+{
+    scenario(lag ? "transferlag" : "transferslow");
+    init_transfer_wait_ms = lag ? 6000 : 1000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, 0);
+    int ready0 = log_count(L, ": READY at"), drains0 = log_count(L, ": drains (written");
+    pause_server(T, 1);
+    uint64_t t0 = now_ms();
+    char why[256];
+    int rc = tr_transfer(x.num, ids[T], why, sizeof why);
+    uint64_t took = now_ms() - t0;
+    if (lag) { /* the stopped target left the ISR during the drain: the commit point moved on without it */
+        struct meta_volume s;
+        if (!vol_rec(0, "tv", &s) || s.nisr != 2)
+            die("transferlag: the stopped target is still in tv's ISR after the drain of %" PRIu64 " ms", took);
+    }
+    if (log_count(L, ": READY at") != ready0)
+        die("server %d sent READY for a transfer to stopped server %d", L, T);
+    /* the Raft leader resends TRANSFER until its own timeout: a drain that timed out never begins again (mutant
+     * transferredrain holds the writes a second time) */
+    if (log_count(L, ": drains (written") != drains0 + 1)
+        die("server %d drained %d times for one transfer", L, log_count(L, ": drains (written") - drains0);
+    if (rc == 0)
+        die("a transfer to stopped server %d answered OK", T);
+    if (!vol_rec(0, "tv", &a) || a.leader != v.leader || a.epoch != v.epoch)
+        die("the transfer to stopped server %d moved tv: node %u at epoch %" PRIu64 " (was node %u at %" PRIu64 ")", T,
+            a.leader, a.epoch, v.leader, v.epoch);
+    uint64_t td = now_ms();
+    if (L != T) /* writes through the leader and server 0 go on while the target is still stopped */
+        for (int k = 0; k < REP_NAMES; k++)
+            if (x.w[k].server != T) {
+                uint64_t until = now_ms() + 30000;
+                while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= td)
+                    if (now_ms() > until)
+                        die("writer %d acknowledged nothing after the drain timed out", k);
+                    else
+                        usleep(5000);
+            }
+    uint64_t resumed = now_ms() - td;
+    while (now_ms() - t0 < 3000)
+        usleep(10000);
+    pause_server(T, 0);
+    if (tr_count(L, CL_TR_DRAIN_TIMEDOUT) != 1)
+        die("server %d counts %" PRIu64 " drains timed out, not 1", L, tr_count(L, CL_TR_DRAIN_TIMEDOUT));
+    await_isr(0, "tv", 3, 60000, "the stopped target back in the ISR");
+    tr_await_acks(&x, now_ms(), "after the target resumed");
+    printf("  the transfer to a stopped target: %s after %" PRIu64 " ms (%s), writes resumed %" PRIu64
+           " ms after it, leader unchanged\n", cluster_strerror(rc), took, why, resumed);
+    tr_finish(&x, lag ? "transferlag" : "transferslow", 0);
+}
+static void scen_transferslow(void) { tr_slow(0); }
+/* transferlag: transferslow with transfer_wait_ms 6000, so that the stopped target leaves the ISR (isr_lag_ms 1000)
+ * while the leader drains and the commit point moves on without it: the drain must still wait for the target's own
+ * durable end and time out, no READY. Mutant transfernotarget (the commit point alone) sends READY. */
+static void scen_transferlag(void) { tr_slow(1); }
+
+/* transfermarkers: a transfer with each kind of marker in flight. TSDB_REPLD_TEST=admithold holds the admit of the
+ * next marker of the type <dir>/admithold names (with buf_lock held) until the transfer drains, so the drain refuses
+ * it: the idle seal's NOW, a series create's SERIES, a retention change's RETENTION, a large write's COMMIT (its files
+ * shipped first) and the class switch of a fresh slow series' first flush. No engine fails, the drain ends (every transfer
+ * answers OK with the target leading), each client call answers OK (it retries the refusal on the new leader), and
+ * every member ends with the rows. DROP is not here: no op of tsdbd calls tsdb_drop_before. */
+enum { TMK_COMMIT = 1, TMK_RETENTION = 3, TMK_CLASS = 6, TMK_SERIES = 7, TMK_NOW = 10 }; /* src/marker.h */
+struct tm_op {
+    int server, kind;
+    tsdb_sid big, slow, now;
+    int rc;
+};
+enum { TM_BIG = 100000 };
+static void *tm_op_thread(void *a)
+{
+    struct tm_op *o = a;
+    tsdbc *c = client(o->server);
+    tsdbc_set_retry(c, 30000);
+    o->rc = 0;
+    if (o->kind == TMK_SERIES) {
+        tsdb_sid id = 0;
+        o->rc = tsdbc_series_at(c, "tm.created", "tv", &id);
+    } else if (o->kind == TMK_RETENTION) {
+        o->rc = tsdbc_set_retention(c, o->big, 100LL * 366 * 86400000);
+    } else if (o->kind == TMK_COMMIT) {
+        int64_t *ts = malloc(TM_BIG * sizeof *ts);
+        float *val = malloc(TM_BIG * sizeof *val);
+        if (!ts || !val)
+            die("out of memory");
+        for (int j = 0; j < TM_BIG; j++)
+            ts[j] = 1000 + 1000LL * j, val[j] = (float)(j % 977);
+        o->rc = tsdbc_insert_series(c, o->big, ts, val, TM_BIG);
+        free(ts);
+        free(val);
+    } else if (o->kind == TMK_CLASS) {
+        int64_t ts[200];
+        float val[200];
+        for (int j = 0; j < 200; j++)
+            ts[j] = 3600000LL * j, val[j] = (float)j;
+        /* fresh: a series the leader's open found is taken as decided and never switches */
+        o->rc = tsdbc_series_at(c, "tm.slow", "tv", &o->slow);
+        if (o->rc == 0)
+            o->rc = tsdbc_insert_series(c, o->slow, ts, val, 200);
+    } else if (o->kind == TMK_NOW) {
+        int64_t ts = 5;
+        float val = 5;
+        o->rc = tsdbc_insert_series(c, o->now, &ts, &val, 1); /* a row to seal; the seal comes when idle */
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+static void scen_transfermarkers(void)
+{
+    scenario("transfermarkers");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=admithold";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int rc;
+    uint32_t num = 0;
+    if ((rc = vol_add(0, "tv", 3, &num)) != 0 || num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR");
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    tsdbc *c = client(server_of(v.leader));
+    tsdb_sid big = rep_series(c, "tm.big", "tv", 30000), slow = 0, nowid = rep_series(c, "tm.now", "tv", 30000);
+    tsdbc_close(c);
+    static const struct {
+        int kind;
+        const char *name;
+    } kinds[] = {{TMK_SERIES, "SERIES"}, {TMK_RETENTION, "RETENTION"}, {TMK_COMMIT, "COMMIT"}, {TMK_NOW, "NOW"},
+                 {TMK_CLASS, "CLASS"}};
+    char held[64];
+    for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+        if (!vol_rec(0, "tv", &v))
+            die("no record of tv");
+        int L = server_of(v.leader), T = tr_other(L, -1);
+        char f[PATH_MAX + 40];
+        snprintf(f, sizeof f, "%s/n%d/admithold", base, L);
+        FILE *fp = fopen(f, "w");
+        if (!fp || fprintf(fp, "%d\n", kinds[k].kind) < 0 || fclose(fp) != 0)
+            die("write %s: %s", f, strerror(errno));
+        snprintf(held, sizeof held, "a marker of type %d held", kinds[k].kind);
+        int before = log_count(L, held);
+        struct tm_op o = {.server = L, .kind = kinds[k].kind, .big = big, .slow = slow, .now = nowid};
+        pthread_t th;
+        if (pthread_create(&th, NULL, tm_op_thread, &o) != 0)
+            die("pthread_create");
+        await_log_count(L, held, before + 1, 60000);
+        uint64_t t0 = now_ms();
+        char why[256];
+        if ((rc = tr_transfer(num, ids[T], why, sizeof why)) != 0)
+            die("transfermarkers: the transfer to node %u with a %s marker held: %s (%s)", ids[T], kinds[k].name,
+                cluster_strerror(rc), why);
+        uint64_t took = now_ms() - t0;
+        pthread_join(th, NULL);
+        if (kinds[k].kind == TMK_CLASS)
+            slow = o.slow;
+        struct meta_volume a;
+        if (!vol_rec(0, "tv", &a) || a.leader != ids[T])
+            die("transfermarkers: node %u leads tv after the transfer to node %u with a %s marker held", a.leader,
+                ids[T], kinds[k].name);
+        if (o.rc != 0)
+            die("transfermarkers: the call with a %s marker held answered %s", kinds[k].name, ers(o.rc));
+        if (access(f, F_OK) == 0)
+            die("transfermarkers: the %s marker was never held (%s still there)", kinds[k].name, f);
+        for (int i = 0; i < 3; i++)
+            if (log_count(i, "no more writes until") != 0)
+                die("transfermarkers: an engine of server %d failed with a %s marker held", i, kinds[k].name);
+        await_isr(0, "tv", 3, 30000, "the ISR whole after the transfer");
+        printf("  a transfer with a %s marker held at the admit: %" PRIu64 " ms, the call answered OK on node %u\n",
+               kinds[k].name, took, ids[T]);
+    }
+    /* every member holds the rows: the large write's and the slow series' */
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    c = client(server_of(v.leader));
+    tsdbc_set_retry(c, 30000);
+    int nb = rows_of(c, big), ns = rows_of(c, slow);
+    tsdb_sid made = 0;
+    if ((rc = tsdbc_series_at(c, "tm.created", "tv", &made)) != 0)
+        die("transfermarkers: the series created with its SERIES marker held: %s", ers(rc));
+    tsdbc_close(c);
+    if (nb != TM_BIG || ns != 200)
+        die("transfermarkers: the leader reads %d and %d rows, not %d and 200", nb, ns, TM_BIG);
+    for (int i = 0; i < 3; i++) {
+        tsdbc *r = client(i);
+        tsdbc_set_retry(r, 0);
+        uint64_t t0 = now_ms();
+        while (tr_rows_here(r, big) != nb || tr_rows_here(r, slow) != ns)
+            if (now_ms() - t0 > 30000)
+                die("transfermarkers: server %d does not read the leader's rows 30 s on", i);
+            else
+                usleep(50000);
+        tsdbc_close(r);
+    }
+    for (int i = 0; i < 3; i++)
+        if (log_count(i, "no more writes until") != 0)
+            die("transfermarkers: an engine of server %d failed", i);
+    stop_all();
+}
+
+/* transferhold: transfer_wait_ms 500, and the promotion's FENCE held from every member (TSDB_CLUSTER_TEST
+ * drop_fence_file, dropped for 1200 ms after READY, resent every 100 ms): the old leader L stays
+ * the writer past transfer_wait_ms, and admits nothing (READY's hold lasts until its epoch is lost or 10 x
+ * transfer_wait_ms): no record admitted blind, no cut on any member, the target leads, every acknowledged row on every
+ * member. Mutant transferresume (admits again transfer_wait_ms after READY) admits records blind. */
+static void scen_transferhold(void)
+{
+    scenario("transferhold");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "drop_fence_file=1";
+    init_transfer_wait_ms = 500;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    char why[256];
+    int rc;
+    if (server_of(v.leader) == 0) { /* the Raft leader's own fence takes no message to drop: lead elsewhere first */
+        if ((rc = tr_transfer(x.num, ids[1], why, sizeof why)) != 0)
+            die("transferhold: the transfer to node %u: %s (%s)", ids[1], cluster_strerror(rc), why);
+        tr_await_acks(&x, now_ms(), "after the first transfer");
+        if (!vol_rec(0, "tv", &v))
+            die("no record of tv");
+    }
+    int L = server_of(v.leader), T = tr_other(L, 0);
+    int ready0 = log_count(L, ": READY at");
+    for (int i = 0; i < 3; i++)
+        state_flag(i, "dropfence", 1);
+    uint64_t t0 = now_ms();
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": READY at", ready0 + 1, 10000);
+    usleep(1200000);
+    for (int i = 0; i < 3; i++)
+        state_flag(i, "dropfence", 0);
+    pthread_join(th, NULL);
+    uint64_t took = now_ms() - t0;
+    if (ta.rc != 0)
+        die("transferhold: the transfer to node %u: %s (%s)", ids[T], ta.rc == 1 ? "lost" : cluster_strerror(ta.rc),
+            ta.why);
+    if (!vol_rec(0, "tv", &a) || a.leader != ids[T])
+        die("transferhold: node %u leads tv after the transfer to node %u", a.leader, ids[T]);
+    tr_await_acks(&x, now_ms(), "after the transfer past transfer_wait_ms");
+    uint64_t blind = tr_count(L, CL_TR_BLIND), cuts = 0;
+    for (int i = 0; i < 3; i++)
+        cuts += tr_count(i, CL_TR_CUTS);
+    printf("  a transfer whose fence was held 1200 ms: %" PRIu64 " ms (%s); admitted blind %" PRIu64 ", cuts %" PRIu64
+           "\n", took, ta.why, blind, cuts);
+    if (blind || cuts)
+        die("transferhold: server %d admitted %" PRIu64 " records blind, %" PRIu64 " cuts on the members", L, blind, cuts);
+    tr_finish(&x, "transferhold", 0);
+}
+
+/* transfergrant (F2 of the review): the Raft leader proposes the transfer's grant 3000 ms after it decided it
+ * (TSDB_CLUSTER_TEST hold_grant_ms, a Raft quorum slow to commit), past PROMO_MOVE_NS (2 s) from the promotion's start.
+ * A promotion whose grant is proposed waits for its commit, as a failover's does: the transfer is answered ok, the
+ * target leads, nothing fell back or was cancelled, no record admitted blind, no cut. Mutant dropproposed (the
+ * promotion dropped at PROMO_MOVE_NS though its grant is proposed) answers "cancelled" and counts a fallback while the
+ * grant commits after all. */
+static void scen_transfergrant(void)
+{
+    scenario("transfergrant");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "hold_grant_ms=3000";
+    struct tr_run x;
+    tr_setup(&x);
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, 0);
+    char why[256];
+    uint64_t t0 = now_ms();
+    int rc = tr_transfer(x.num, ids[T], why, sizeof why);
+    uint64_t took = now_ms() - t0;
+    if (rc != 0)
+        die("transfergrant: the transfer to node %u: %s (%s)", ids[T], cluster_strerror(rc), why);
+    if (!vol_rec(0, "tv", &a) || a.leader != ids[T])
+        die("transfergrant: node %u leads tv after the transfer to node %u", a.leader, ids[T]);
+    if (took < 2900)
+        die("transfergrant: the transfer took %" PRIu64 " ms: the grant was not held (%s)", took, why);
+    tr_await_acks(&x, now_ms(), "after the transfer with its grant held");
+    uint64_t fb = 0, cancelled = 0, timedout = 0, cuts = 0;
+    for (int i = 0; i < 3; i++) {
+        fb += tr_count(i, CL_TR_FALLBACK);
+        cancelled += tr_count(i, CL_TR_CANCELLED);
+        timedout += tr_count(i, CL_TR_TIMEDOUT);
+        cuts += tr_count(i, CL_TR_CUTS);
+    }
+    uint64_t blind = tr_count(L, CL_TR_BLIND);
+    printf("  a transfer whose grant was held 3000 ms: %" PRIu64 " ms (%s); fell back %" PRIu64 ", cancelled %" PRIu64
+           ", timed out %" PRIu64 ", blind %" PRIu64 ", cuts %" PRIu64 "\n", took, why, fb, cancelled, timedout, blind,
+           cuts);
+    if (fb || cancelled || timedout || blind || cuts)
+        die("transfergrant: fell back %" PRIu64 ", cancelled %" PRIu64 ", timed out %" PRIu64 ", admitted blind %" PRIu64
+            ", cuts %" PRIu64 " (a proposed grant must be waited for)", fb, cancelled, timedout, blind, cuts);
+    for (int i = 0; i < 3; i++)
+        if (log_count(i, "promotion is dropped"))
+            die("transfergrant: server %d dropped the promotion of a proposed grant", i);
+    tr_finish(&x, "transfergrant", 0);
+}
+
+/* transferadmin (F5 of the review): every refusal of `tsdb cluster volume transfer` (ctransfer.c tr_check) with its
+ * message, and nothing changed by one (epoch, leader, the Raft leader's started count): the current leader as target;
+ * a second transfer while one drains (TSDB_REPLD_TEST=drainhold); a member that is in the ISR but not up (paused past
+ * node_timeout_ms with the ISR held, TSDB_CLUSTER_TEST hold_isr_file); the same member once it left the ISR. Mutants
+ * adminself, adminbusy, adminup, adminisr each take one check away. */
+static int tr_refused(int R, uint32_t num, uint32_t to, const char *want, const char *what)
+{
+    struct meta_volume b, a;
+    if (!vol_rec(R, "tv", &b))
+        die("no record of tv");
+    char why[256];
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(num, to, body);
+    int rc = admin(R, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl); /* to R: server 0 may be the paused one */
+    snprintf(why, sizeof why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    if (rc == 0 || !strstr(why, want))
+        die("transferadmin: a transfer %s: %s (%s), not refused with \"%s\"", what, rc ? cluster_strerror(rc) : "OK",
+            why, want);
+    if (!vol_rec(R, "tv", &a))
+        die("transferadmin: no record of tv after the transfer %s", what);
+    if (a.epoch != b.epoch || a.leader != b.leader)
+        die("transferadmin: the refused transfer %s changed tv: epoch %" PRIu64 " -> %" PRIu64 ", leader %u -> %u", what,
+            b.epoch, a.epoch, b.leader, a.leader);
+    printf("  a transfer %s: refused (%s)\n", what, why);
+    return rc;
+}
+
+static void scen_transferadmin(void)
+{
+    scenario("transferadmin");
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "hold_isr_file=1";
+        penv[i] = "TSDB_REPLD_TEST=drainhold";
+    }
+    struct tr_run x;
+    tr_setup(&x);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int R = leader_of(0);
+    if (R < 0)
+        die("no Raft leader");
+    int L = server_of(v.leader);
+    /* t2, 2 replicas of 3 members: the third is up and not in its ISR */
+    uint32_t n2 = 0;
+    int rc2 = vol_add(0, "t2", 2, &n2);
+    if (rc2 != 0)
+        die("volume add t2: %s", cluster_strerror(rc2));
+    struct meta_volume v2 = {0};
+    uint64_t tw = now_ms();
+    while (!vol_rec(R, "t2", &v2) || !v2.leader || v2.nisr != 2)
+        if (now_ms() - tw > 30000)
+            die("t2 has no leader and ISR of 2 after 30 s");
+        else
+            usleep(20000);
+    uint32_t out = 0;
+    for (int i = 0; i < 3; i++)
+        if (ids[i] != v2.isr[0] && ids[i] != v2.isr[1])
+            out = ids[i];
+    uint64_t started = tr_count(R, CL_TR_STARTED);
+    {
+        char why[256];
+        uint8_t body[8], *reply = NULL;
+        size_t rl = 0, bl = cluster_volume_force_encode(n2, out, body);
+        int rc = admin(R, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl);
+        snprintf(why, sizeof why, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+        free(reply);
+        struct meta_volume a2;
+        if (rc == 0 || !strstr(why, "not in its ISR"))
+            die("transferadmin: a transfer of t2 to node %u outside its ISR: %s (%s), not refused with \"not in its "
+                "ISR\"", out, rc ? cluster_strerror(rc) : "OK", why);
+        if (!vol_rec(R, "t2", &a2) || a2.epoch != v2.epoch || a2.leader != v2.leader)
+            die("transferadmin: the refused transfer of t2 changed it");
+        printf("  a transfer to an up member outside the ISR: refused (%s)\n", why);
+    }
+    tr_refused(R, x.num, v.leader, "leads it already", "to the current leader");
+    if (tr_count(R, CL_TR_STARTED) != started)
+        die("transferadmin: a refused transfer counted as started");
+    /* a second transfer while the first one's drain is held on the leader */
+    int T = tr_other(L, R == L ? -1 : R), U = 3 - L - T;
+    char f[PATH_MAX + 40];
+    snprintf(f, sizeof f, "%s/n%d/drainhold", base, L);
+    FILE *fp = fopen(f, "w");
+    if (!fp || fclose(fp) != 0)
+        die("write %s: %s", f, strerror(errno));
+    int drains = log_count(L, ": drains (written");
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": drains (written", drains + 1, 30000);
+    tr_refused(R, x.num, ids[U], "a transfer of it is under way", "while one drains");
+    tr_refused(R, x.num, ids[T], "a transfer of it is under way", "to the same target while one drains");
+    if (unlink(f) != 0)
+        die("unlink %s: %s", f, strerror(errno));
+    pthread_join(th, NULL);
+    if (ta.rc != 0)
+        die("transferadmin: the held transfer to node %u: %s (%s)", ids[T], ta.rc == 1 ? "lost" : cluster_strerror(ta.rc),
+            ta.why);
+    if (tr_count(R, CL_TR_STARTED) != started + 1)
+        die("transferadmin: the Raft leader counts %" PRIu64 " transfers started, not %" PRIu64,
+            tr_count(R, CL_TR_STARTED), started + 1);
+    tr_await_acks(&x, now_ms(), "after the held transfer");
+    /* a member in the ISR that is not up: neither the Raft leader nor the volume's leader (now T) */
+    if (!vol_rec(R, "tv", &v) || server_of(v.leader) != T)
+        die("tv is not led by server %d after its transfer there", T);
+    int P = tr_other(T, R); /* T != R: tr_other above */
+    hold_isr(1);
+    pause_server(P, 1);
+    usleep(3000 * 1000 + 1500 * 1000); /* node_timeout_ms 3000, and a heartbeat round */
+    tr_refused(R, x.num, ids[P], "the node is not up", "to a paused member still in the ISR");
+    hold_isr(0);
+    int via = tr_other(P, -1);
+    await_isr(via, "tv", 2, 30000, "the paused member out of the ISR");
+    tr_refused(R, x.num, ids[P], "not in its ISR", "to a member outside the ISR");
+    pause_server(P, 0);
+    await_isr(via, "tv", 3, 60000, "the paused member back in the ISR");
+    if (tr_count(R, CL_TR_STARTED) != started + 1)
+        die("transferadmin: the Raft leader counts %" PRIu64 " transfers started after the refusals, not %" PRIu64,
+            tr_count(R, CL_TR_STARTED), started + 1);
+    tr_await_acks(&x, now_ms(), "after the paused member came back");
+    tr_finish(&x, "transferadmin", 1);
+}
+
+/* transferstale (D14): the volume leader's READY and the Raft leader's CANCEL of the timed-out transfer are both lost
+ * (TSDB_CLUSTER_TEST lose_ready_file), so the volume leader holds its writes for a transfer the Raft leader no longer
+ * knows. Once READYs get through again, the Raft leader must answer the next resent one with a CANCEL of that id: the
+ * writes resume within a few resends, not at the hard cap (10 x transfer_wait_ms = 10 s), and nothing is admitted blind */
+static void scen_transferstale(void)
+{
+    scenario("transferstale");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "lose_ready_file=1";
+    init_transfer_wait_ms = 1000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, 0);
+    int ready0 = log_count(L, ": READY at"), cancel0 = log_count(L, "cancelled by the Raft leader");
+    for (int i = 0; i < 3; i++)
+        state_flag(i, "loseready", 1);
+    char why[256];
+    int rc = tr_transfer(x.num, ids[T], why, sizeof why);
+    if (rc == 0 || !strstr(why, "timed out"))
+        die("transferstale: the transfer to node %u with every READY lost: %s (%s), not a timeout", ids[T],
+            cluster_strerror(rc), why);
+    if (log_count(L, ": READY at") != ready0 + 1)
+        die("transferstale: server %d sent no READY (or more than one transfer's)", L);
+    uint64_t t0 = now_ms();
+    for (int i = 0; i < 3; i++)
+        state_flag(i, "loseready", 0);
+    await_log_count(L, "cancelled by the Raft leader", cancel0 + 1, 3000);
+    uint64_t took = now_ms() - t0;
+    tr_await_acks(&x, now_ms(), "after the stale READY's CANCEL");
+    if (!vol_rec(0, "tv", &a) || a.leader != v.leader || a.epoch != v.epoch)
+        die("transferstale: tv moved (node %u at epoch %" PRIu64 ", was node %u at %" PRIu64 ")", a.leader, a.epoch,
+            v.leader, v.epoch);
+    uint64_t blind = tr_count(L, CL_TR_BLIND), cuts = 0;
+    for (int i = 0; i < 3; i++)
+        cuts += tr_count(i, CL_TR_CUTS);
+    printf("  a READY the Raft leader no longer held: cancelled %" PRIu64 " ms after READYs got through; admitted blind %"
+           PRIu64 ", cuts %" PRIu64 "\n", took, blind, cuts);
+    if (blind || cuts)
+        die("transferstale: server %d admitted %" PRIu64 " records blind, %" PRIu64 " cuts on the members", L, blind, cuts);
+    tr_finish(&x, "transferstale", 0);
+}
+
+/* transferkill: the old leader killed (SIGKILL) during the drain (the target stopped, so the drain waits), and, on a
+ * cluster of its own, at the crash point transfer-ready (READY sent, the fence under way): a normal failover each time,
+ * no acknowledged row lost, no refused row applied, the killed server back in the ISR */
+static void tr_kill(int ready)
+{
+    scenario(ready ? "transferkill-ready" : "transferkill");
+    if (ready)
+        for (int i = 0; i < 3; i++)
+            penv[i] = "TSDB_CRASH_AT=transfer-ready";
+    init_transfer_wait_ms = ready ? 0 : 5000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader), T = tr_other(L, L == 0 ? 2 : 0), via = tr_other(L, T);
+    if (!ready)
+        pause_server(T, 1);
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    if (ready) {
+        if (await_exit(L, 30000) < 0)
+            die("server %d did not stop at transfer-ready", L);
+    } else {
+        await_log_count(L, ": drains (written", 1, 30000);
+        signal_child(pids[L], SIGKILL);
+        if (await_exit(L, 5000) < 0)
+            die("server %d did not die of SIGKILL", L);
+        pause_server(T, 0);
+    }
+    uint64_t tk = now_ms();
+    while (!(vol_rec(via, "tv", &a) && a.epoch > v.epoch && a.leader != v.leader))
+        if (now_ms() - tk > 30000)
+            die("no new leader of tv 30 s after its leader was killed %s", ready ? "after READY" : "in the drain");
+        else
+            usleep(20000);
+    pthread_join(th, NULL);
+    penv[L] = NULL;
+    await_isr(via, "tv", 2, 30000, "the killed leader out of the ISR"); /* else the ISR of 3 below is the grant's */
+    start(L);
+    await_isr(via, "tv", 3, 60000, "the killed leader back in the ISR");
+    tr_await_acks(&x, now_ms(), "after the killed leader came back");
+    printf("  old leader killed %s: node %u leads at epoch %" PRIu64 " %" PRIu64 " ms later; the transfer: %s%s%s\n",
+           ready ? "after READY" : "in the drain", a.leader, a.epoch, now_ms() - tk, ta.rc == 1 ? "lost" : ta.rc ? cluster_strerror(ta.rc) : "OK",
+           ta.why[0] ? ", " : "", ta.why);
+    tr_finish(&x, ready ? "transferkill-ready" : "transferkill", 1);
+}
+static void scen_transferkill(void)
+{
+    tr_kill(0);
+    tr_kill(1);
+}
+
+/* transferraftkill: READY went to a Raft leader (server 0) that was stopped (SIGSTOP) during the drain (the target
+ * stopped too, so the drain waits) and is then killed: nothing promotes. The next Raft leader's CANCEL (its first duty
+ * round) lets the old leader admit again within an election and a round, long before READY's hard cap (10 x 5000 ms).
+ * Mutant nocancel (TSDB_CLUSTER_MUTANT) waits for the cap and fails it. */
+static void scen_transferraftkill(void)
+{
+    scenario("transferraftkill");
+    init_transfer_wait_ms = 5000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader);
+    char why[256];
+    if (L == 0) { /* the volume's leader must outlive the Raft leader's kill */
+        int rc = tr_transfer(x.num, ids[1], why, sizeof why);
+        if (rc != 0)
+            die("the transfer of tv to server 1: %s (%s)", cluster_strerror(rc), why);
+        if (!vol_rec(0, "tv", &v) || (L = server_of(v.leader)) != 1)
+            die("tv is not led by server 1 after its transfer there");
+    }
+    /* T is stopped only once L leads with every member in the ISR: stopped while L was still being promoted (a slow
+     * machine, ASan), T fell out of the ISR, the drain asked the stopped Raft leader to take it back in, and the next
+     * Raft leader's CANCEL came before any READY (the scenario's premise lost, not a fault of the transfer) */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log_count(L, lead, 1, 30000);
+    await_isr(L, "tv", 3, 30000, "every member in the ISR before the target is stopped");
+    int T = tr_other(L, 0);
+    pause_server(T, 1);
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": drains (written", 1, 30000);
+    pause_server(0, 1);
+    pause_server(T, 0);
+    await_log_count(L, ": READY at", 1, 30000);
+    signal_child(pids[0], SIGKILL);
+    uint64_t tk = now_ms();
+    if (await_exit(0, 5000) < 0)
+        die("server 0 did not die of SIGKILL");
+    stopped[0] = 0;
+    pthread_join(th, NULL);
+    await_log_count(L, "cancelled by the Raft leader", 1, 15000);
+    uint64_t cancelled = now_ms() - tk;
+    for (int k = 0; k < REP_NAMES; k++) /* the writers through L and T write again */
+        if (x.w[k].server != 0) {
+            while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= tk)
+                if (now_ms() - tk > 15000)
+                    die("writer %d (through server %d) acknowledged nothing in 15 s after the Raft leader was killed",
+                        k, x.w[k].server);
+        }
+                else
+                    usleep(5000);
+    uint64_t resumed = now_ms() - tk;
+    if (tr_count(L, CL_TR_BLIND))
+        die("server %d admitted %" PRIu64 " records blind", L, tr_count(L, CL_TR_BLIND));
+    start(0);
+    await_isr(L, "tv", 3, 60000, "every member in the ISR after the Raft leader's restart");
+    printf("  the Raft leader killed after READY: CANCEL on node %u %" PRIu64 " ms later, writes again after %" PRIu64
+           " ms, no record admitted blind\n",
+           v.leader, cancelled, resumed);
+    tr_finish(&x, "transferraftkill", 1);
+}
+
+/* transferraftdrain: the Raft leader killed while tv's leader drains (TSDB_REPLD_TEST=drainhold: a file on the volume
+ * leader keeps the drain from READY; a stopped target would leave too few voters to elect a Raft leader). Nobody holds the transfer any
+ * more: the new Raft leader's CANCEL (term << 32, its first duty rounds) ends the drain well before transfer_wait_ms
+ * (10 s) would. The mutant nocancel leaves it to the drain's own timeout and fails the 8 s bound. */
+static void scen_transferraftdrain(void)
+{
+    scenario("transferraftdrain");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=drainhold";
+    init_transfer_wait_ms = 10000;
+    struct tr_run x;
+    tr_setup(&x);
+    init_transfer_wait_ms = 0;
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader);
+    char why[256];
+    if (L == 0) { /* the volume's leader must outlive the Raft leader's kill */
+        int rc = tr_transfer(x.num, ids[1], why, sizeof why);
+        if (rc != 0)
+            die("the transfer of tv to server 1: %s (%s)", cluster_strerror(rc), why);
+        if (!vol_rec(0, "tv", &v) || (L = server_of(v.leader)) != 1)
+            die("tv is not led by server 1 after its transfer there");
+    }
+    /* the hold begins once L serves (its promotion committed) */
+    uint64_t t1 = now_ms();
+    for (int k = 0; k < REP_NAMES; k++)
+        while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= t1)
+            if (now_ms() - t1 > 15000)
+                die("writer %d (through server %d) acknowledged nothing in 15 s before the drain", k, x.w[k].server);
+            else
+                usleep(5000);
+    int T = tr_other(L, 0);
+    char f[PATH_MAX + 40];
+    snprintf(f, sizeof f, "%s/n%d/drainhold", base, L);
+    FILE *fp = fopen(f, "w");
+    if (!fp || fclose(fp) != 0)
+        die("write %s: %s", f, strerror(errno));
+    int drains = log_count(L, ": drains (written");
+    struct tr_async ta = {x.num, ids[T], 0, ""};
+    pthread_t th;
+    if (pthread_create(&th, NULL, tr_transfer_thread, &ta) != 0)
+        die("pthread_create");
+    await_log_count(L, ": drains (written", drains + 1, 30000);
+    uint64_t td = now_ms();
+    signal_child(pids[0], SIGKILL);
+    if (await_exit(0, 5000) < 0)
+        die("server 0 did not die of SIGKILL");
+    stopped[0] = 0;
+    uint64_t tk = now_ms();
+    pthread_join(th, NULL);
+    if (log_count(L, ": READY at"))
+        die("server %d sent READY with its drain held", L);
+    await_log_count(L, "cancelled by the Raft leader", 1, 8000);
+    uint64_t cancelled = now_ms() - tk;
+    if (now_ms() - td >= 10000)
+        die("the drain ended %" PRIu64 " ms after it began: by its own timeout, not by the new Raft leader's CANCEL",
+            now_ms() - td);
+    if (unlink(f) != 0)
+        die("unlink %s: %s", f, strerror(errno));
+    for (int k = 0; k < REP_NAMES; k++)
+        if (x.w[k].server != 0) {
+            while (__atomic_load_n(&x.w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= tk)
+                if (now_ms() - tk > 15000)
+                    die("writer %d (through server %d) acknowledged nothing in 15 s after the Raft leader was killed",
+                        k, x.w[k].server);
+                else
+                    usleep(5000);
+        }
+    if (tr_count(L, CL_TR_BLIND))
+        die("server %d admitted %" PRIu64 " records blind", L, tr_count(L, CL_TR_BLIND));
+    start(0);
+    await_isr(L, "tv", 3, 60000, "every member in the ISR after the Raft leader's restart");
+    printf("  the Raft leader killed during a drain: CANCEL on node %u %" PRIu64 " ms later (transfer_wait 10 s)\n",
+           v.leader, cancelled);
+    tr_finish(&x, "transferraftdrain", 1);
+}
+
+/* balance: leader_balance_s 5. tv's preferred leader (rep[0]) killed, the failover, then restarted: it leads tv again
+ * within leader_balance_s + 5 s of its return to the ISR; with leader_balance_s 0 it does not (10 s). */
+static void tr_balance(int on)
+{
+    scenario(on ? "balance" : "balance-off");
+    init_leader_balance_s = on ? 5 : 0;
+    struct tr_run x;
+    tr_setup(&x);
+    init_leader_balance_s = 0;
+    struct meta_volume v, a = {0};
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int P = server_of(v.rep[0].node), via = P == 0 ? 1 : 0;
+    if (v.leader != v.rep[0].node)
+        die("tv is led by node %u, not by its preferred leader node %u", v.leader, v.rep[0].node);
+    signal_child(pids[P], SIGKILL);
+    if (await_exit(P, 5000) < 0)
+        die("server %d did not die of SIGKILL", P);
+    uint64_t tk = now_ms();
+    while (!(vol_rec(via, "tv", &a) && a.epoch > v.epoch && a.leader != v.leader))
+        if (now_ms() - tk > 30000)
+            die("no failover of tv 30 s after its leader was killed");
+        else
+            usleep(20000);
+    /* the promotion's grant keeps the ISR of 3 until the new leader drops the dead member: without this wait the ISR
+     * of 3 below is the old one, and the 10 s would count P's restart and rejoin as well */
+    await_isr(via, "tv", 2, 30000, "the killed preferred leader out of the ISR");
+    start(P);
+    await_isr(via, "tv", 3, 60000, "the preferred leader back in the ISR");
+    uint64_t tj = now_ms();
+    int back = 0;
+    while (now_ms() - tj < (on ? 10000u : 10000u)) {
+        if (vol_rec(via, "tv", &a) && a.leader == v.rep[0].node) {
+            back = 1;
+            break;
+        }
+        usleep(20000);
+    }
+    if (on && !back)
+        die("leader_balance_s 5: node %u does not lead tv 10 s after its return to the ISR (node %u does)",
+            v.rep[0].node, a.leader);
+    if (!on && back)
+        die("leader_balance_s 0: node %u leads tv again after its return", v.rep[0].node);
+    if (on && getenv("TR_DEBUG")) {
+        for (int i = 0; i < 3; i++)
+            printf("  server %d: started %" PRIu64 " done %" PRIu64 " timed out %" PRIu64 " cancelled %" PRIu64
+                   " fell back %" PRIu64 " drains timed out %" PRIu64 "\n", i, tr_count(i, CL_TR_STARTED),
+                   tr_count(i, CL_TR_DONE), tr_count(i, CL_TR_TIMEDOUT), tr_count(i, CL_TR_CANCELLED),
+                   tr_count(i, CL_TR_FALLBACK), tr_count(i, CL_TR_DRAIN_TIMEDOUT));
+        char cmd[PATH_MAX + 200];
+        snprintf(cmd, sizeof cmd, "grep -H 'balance\\|transfer\\|drain\\|READY\\|CANCEL' %s/n*.log | cut -c1-240",
+                 base);
+        if (system(cmd) < 0)
+            perror("system");
+    }
+    if (on)
+        printf("  the preferred leader leads tv again %" PRIu64 " ms after its return to the ISR\n", now_ms() - tj);
+    else
+        printf("  leader_balance_s 0: tv stays on node %u for 10 s after node %u's return\n", a.leader,
+               v.rep[0].node);
+    tr_finish(&x, on ? "balance" : "balance-off", 1);
+}
+static void scen_balance(void)
+{
+    tr_balance(1);
+    tr_balance(0);
+}
+
+/* balancetwo: leader_balance_s 5, four volumes on three members, so two of them prefer one node P. P killed (both fail
+ * over), restarted: both lead on P again, one after the other (one transfer per server at a time, D15): in the Raft
+ * leader's log the second balance transfer to P starts only after the first one's answer, and 1 s or more after the
+ * first one's start. The first drain is held 1.5 s (TSDB_REPLD_TEST=drainhold), longer than that gap, so the one
+ * transfer per server is checked on its own (mutant balancenobusy); BT_NOHOLD=1 leaves the drains alone, so the second
+ * start waits only for the gap (balancenogap). */
+static void scen_balancetwo(void)
+{
+    scenario("balancetwo");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=drainhold";
+    init_leader_balance_s = 5;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_leader_balance_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static const char *nm[4] = {"bv0", "bv1", "bv2", "bv3"};
+    struct meta_volume v[4];
+    for (int k = 0; k < 4; k++) {
+        uint32_t num;
+        int rc = vol_add(0, nm[k], 3, &num);
+        if (rc != 0)
+            die("volume add %s: %s", nm[k], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, nm[k], i, 1, 0);
+        await_isr(0, nm[k], 3, 30000, "every replica in the ISR");
+        if (!vol_rec(0, nm[k], &v[k]))
+            die("no record of %s", nm[k]);
+    }
+    int a = -1, b = -1;
+    for (int k = 0; k < 4 && b < 0; k++)
+        for (int j = k + 1; j < 4 && b < 0; j++)
+            if (v[k].rep[0].node == v[j].rep[0].node)
+                a = k, b = j;
+    if (b < 0)
+        die("no two of four volumes on three members share a preferred leader");
+    uint32_t pn = v[a].rep[0].node;
+    for (int k = 0; k < 4; k++) /* the leader may still be moving to rep[0] from the add */
+        for (uint64_t t0 = now_ms(); v[k].leader != v[k].rep[0].node; usleep(50000))
+            if (now_ms() - t0 > 30000 || !vol_rec(0, nm[k], &v[k]))
+                die("%s is led by node %u, not by its preferred leader %u", nm[k], v[k].leader, v[k].rep[0].node);
+    int P = server_of(pn), via = P == 0 ? 1 : 0;
+    signal_child(pids[P], SIGKILL);
+    if (await_exit(P, 5000) < 0)
+        die("server %d did not die of SIGKILL", P);
+    int ab[2] = {a, b};
+    for (int q = 0; q < 2; q++) {
+        struct meta_volume x = {0};
+        for (uint64_t t0 = now_ms(); !(vol_rec(via, nm[ab[q]], &x) && x.epoch > v[ab[q]].epoch && x.leader != pn);
+             usleep(20000))
+            if (now_ms() - t0 > 30000)
+                die("no failover of %s 30 s after node %u was killed", nm[ab[q]], pn);
+        await_isr(via, nm[ab[q]], 2, 30000, "the killed preferred leader out of the ISR");
+    }
+    char hold[3][PATH_MAX + 40];
+    int held = !getenv("BT_NOHOLD"); /* BT_NOHOLD=1: transfers at their own pace, so the gap is what spaces them */
+    for (int i = 0; held && i < 3; i++) { /* the first balance transfer drains 1.5 s: longer than the gap */
+        snprintf(hold[i], sizeof hold[i], "%s/n%d/drainhold", base, i);
+        FILE *fp = i == P ? NULL : fopen(hold[i], "w");
+        if (i != P && (!fp || fclose(fp) != 0))
+            die("write %s: %s", hold[i], strerror(errno));
+    }
+    start(P);
+    for (int q = 0; q < 2; q++)
+        await_isr(via, nm[ab[q]], 3, 60000, "the preferred leader back in the ISR");
+    char bal_s[64];
+    snprintf(bal_s, sizeof bal_s, "leader balance: transfer from node");
+    for (uint64_t t0 = now_ms(); held; usleep(20000)) {
+        int n = 0;
+        for (int i = 0; i < 3; i++)
+            n += i != P && log_count(i, bal_s) > 0;
+        if (n)
+            break;
+        if (now_ms() - t0 > 20000)
+            die("balancetwo: no balance transfer to node %u 20 s after its return", pn);
+    }
+    if (held)
+        usleep(1500000);
+    for (int i = 0; held && i < 3; i++)
+        if (i != P && unlink(hold[i]) != 0)
+            die("unlink %s: %s", hold[i], strerror(errno));
+    uint64_t tj = now_ms(), back[2] = {0, 0};
+    while ((!back[0] || !back[1]) && now_ms() - tj < 20000) {
+        for (int q = 0; q < 2; q++) {
+            struct meta_volume x;
+            if (!back[q] && vol_rec(via, nm[ab[q]], &x) && x.leader == pn)
+                back[q] = now_ms() - tj;
+        }
+        usleep(20000);
+    }
+    if (!back[0] || !back[1])
+        die("balancetwo: %s and %s do not both lead on node %u 20 s after its return (%" PRIu64 ", %" PRIu64 " ms)",
+            nm[a], nm[b], pn, back[0], back[1]);
+    /* the order on the Raft leader that ran both: start, answer, start, answer, the starts 1 s apart or more */
+    char start_s[64], done_s[64];
+    snprintf(start_s, sizeof start_s, "leader balance: transfer from node");
+    snprintf(done_s, sizeof done_s, ": transfer to node %u: node %u leads", pn, pn);
+    int seen = 0;
+    for (int i = 0; i < 3; i++) {
+        if (i == P)
+            continue;
+        char path[PATH_MAX + 80], line[4096];
+        snprintf(path, sizeof path, "%s/n%d.log", base, i);
+        FILE *f = fopen(path, "r");
+        int running = 0, n = 0;
+        unsigned long long tlast = 0;
+        while (f && fgets(line, sizeof line, f)) {
+            if (strstr(line, start_s) && strstr(line, "to node") ) {
+                char to[32];
+                snprintf(to, sizeof to, "to node %u at", pn);
+                if (!strstr(line, to))
+                    continue;
+                if (running)
+                    die("balancetwo: server %d started a second balance transfer to node %u before the first one "
+                        "answered: %s", i, pn, line);
+                const char *ts = strstr(line, "(t=");
+                unsigned long long t = 0;
+                if (!ts || sscanf(ts, "(t=%llu ms)", &t) != 1)
+                    die("balancetwo: no time in %s", line);
+                if (n && t - tlast < 1000)
+                    die("balancetwo: server %d started two balance transfers %llu ms apart, less than the 1 s gap: %s",
+                        i, t - tlast, line);
+                tlast = t, running = 1, n++;
+            } else if (strstr(line, done_s))
+                running = 0;
+        }
+        if (f)
+            fclose(f);
+        seen += n;
+    }
+    if (seen < 2)
+        die("balancetwo: %d balance transfers to node %u in the logs, not 2", seen, pn);
+    printf("  %s and %s lead on node %u again %" PRIu64 " and %" PRIu64 " ms after its return, one after the other\n",
+           nm[a], nm[b], pn, back[0], back[1]);
+    stop_all();
+}
+
+/* balancecut: leader_balance_s 5, a volume moved away from its preferred leader P (an operator's transfer), then P cut
+ * one way from the Raft leader (TSDB_CLUSTER_TEST drop_fence_file: P drops every FENCE, its heartbeats still reach the
+ * Raft leader, so it stays UP and rejoins the ISR): every balance transfer back to P fails (P never answers the fence;
+ * the promotion is dropped, CANCEL, a failover by another name). Over 60 s the hold (from each rejoin) and the backoff
+ * (5, 10, 20, 40 s) allow at most 4 attempts, each failure counted; mutant balanceflap (no hold, no backoff) tries
+ * about once a second. */
+static void scen_balancecut(void)
+{
+    scenario("balancecut");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "drop_fence_file=1";
+    init_leader_balance_s = 5;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_leader_balance_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static const char *nm[3] = {"bc0", "bc1", "bc2"};
+    struct meta_volume v[3];
+    int k = -1;
+    for (int j = 0; j < 3; j++) {
+        uint32_t num;
+        int rc = vol_add(0, nm[j], 3, &num);
+        if (rc != 0)
+            die("volume add %s: %s", nm[j], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, nm[j], i, 1, 0);
+        await_isr(0, nm[j], 3, 30000, "every replica in the ISR");
+        for (uint64_t t0 = now_ms(); !vol_rec(0, nm[j], &v[j]) || v[j].leader != v[j].rep[0].node; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("%s is not led by its preferred leader", nm[j]);
+        if (k < 0 && server_of(v[j].rep[0].node) != 0) /* server 0 leads the metadata group: P is another */
+            k = j;
+    }
+    if (k < 0)
+        die("balancecut: every volume prefers the Raft leader's node");
+    uint32_t pn = v[k].rep[0].node;
+    int P = server_of(pn), Q = P == 1 ? 2 : 1;
+    char why[256];
+    int rc = tr_transfer(v[k].number, ids[Q], why, sizeof why);
+    if (rc != 0)
+        die("balancecut: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
+    state_flag(P, "dropfence", 1); /* before the hold of 5 s runs out */
+    uint64_t b0 = 0, d0 = 0;
+    for (int i = 0; i < 3; i++)
+        b0 += tr_count(i, CL_TR_BALANCE), d0 += tr_count(i, CL_TR_DONE);
+    uint64_t t0 = now_ms();
+    struct meta_volume x;
+    while (now_ms() - t0 < 60000) {
+        if (vol_rec(0, nm[k], &x) && x.leader == pn)
+            die("balancecut: node %u leads %s although it answers no fence", pn, nm[k]);
+        usleep(200000);
+    }
+    uint64_t bal = 0, done = 0, failed = 0;
+    for (int i = 0; i < 3; i++) {
+        bal += tr_count(i, CL_TR_BALANCE);
+        done += tr_count(i, CL_TR_DONE);
+        failed += tr_count(i, CL_TR_TIMEDOUT) + tr_count(i, CL_TR_CANCELLED) + tr_count(i, CL_TR_FALLBACK);
+    }
+    bal -= b0, done -= d0;
+    printf("  %s cut one way from its preferred node %u: %" PRIu64 " balance transfers in 60 s, %" PRIu64 " done, %"
+           PRIu64 " failed\n", nm[k], pn, bal, done, failed);
+    if (bal < 1)
+        die("balancecut: no balance transfer to node %u in 60 s", pn);
+    if (bal > 4)
+        die("balancecut: %" PRIu64 " balance transfers to node %u in 60 s, more than the hold and the backoff allow (4)",
+            bal, pn);
+    for (uint64_t t1 = now_ms(); failed < bal && now_ms() - t1 < 20000; usleep(200000)) { /* one may be under way */
+        failed = 0;
+        for (int i = 0; i < 3; i++)
+            failed += tr_count(i, CL_TR_TIMEDOUT) + tr_count(i, CL_TR_CANCELLED) + tr_count(i, CL_TR_FALLBACK);
+    }
+    if (done || failed < bal)
+        die("balancecut: of %" PRIu64 " balance transfers %" PRIu64 " done and %" PRIu64 " counted as failed", bal, done,
+            failed);
+    state_flag(P, "dropfence", 0);
+    stop_all();
+}
+
+/* balancehb: leader_balance_s 5, a volume moved away from its preferred leader P, then P's heartbeats to the Raft
+ * leader cut and healed again and again (TSDB_CLUSTER_TEST drop_hb_file on the Raft leader: 4 s cut, 3 s healed, or
+ * BH_CUT_MS, BH_HEAL_MS; P's data links untouched, so it stays in the ISR and answers fences). The Raft leader must see
+ * P other than UP in the cuts, and over 60 s at most 2 balance transfers start and P takes the lead at most twice (no
+ * back-and-forth every leader_balance_s). A balance never starts while P is not UP, and a cut does not depose a P that
+ * leads (its fence answers and data go on), so one transfer in a healed window ends it. balanceflap is caught by
+ * balancecut, where every transfer fails. */
+static void scen_balancehb(void)
+{
+    scenario("balancehb");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "drop_hb_file=1";
+    init_leader_balance_s = 5;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_leader_balance_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static const char *nm[3] = {"bh0", "bh1", "bh2"};
+    struct meta_volume v[3];
+    int k = -1;
+    for (int j = 0; j < 3; j++) {
+        uint32_t num;
+        int rc = vol_add(0, nm[j], 3, &num);
+        if (rc != 0)
+            die("volume add %s: %s", nm[j], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, nm[j], i, 1, 0);
+        await_isr(0, nm[j], 3, 30000, "every replica in the ISR");
+        for (uint64_t t0 = now_ms(); !vol_rec(0, nm[j], &v[j]) || v[j].leader != v[j].rep[0].node; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("%s is not led by its preferred leader", nm[j]);
+        if (k < 0 && server_of(v[j].rep[0].node) != 0) /* server 0 leads the metadata group: P is another */
+            k = j;
+    }
+    if (k < 0)
+        die("balancehb: every volume prefers the Raft leader's node");
+    uint32_t pn = v[k].rep[0].node;
+    int P = server_of(pn), Q = P == 1 ? 2 : 1;
+    char why[256];
+    int rc = tr_transfer(v[k].number, ids[Q], why, sizeof why);
+    if (rc != 0)
+        die("balancehb: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
+    char f[PATH_MAX + 64];
+    server_dir(0, f, sizeof f);
+    strcat(f, "/state/drophb");
+    uint64_t b0 = 0;
+    for (int i = 0; i < 3; i++)
+        b0 += tr_count(i, CL_TR_BALANCE);
+    uint64_t t0 = now_ms();
+    uint32_t last = ids[Q], moves = 0, led = 0, downs = 0;
+    int cut = 0;
+    uint64_t flip = 0, cut_ms = getenv("BH_CUT_MS") ? strtoull(getenv("BH_CUT_MS"), 0, 10) : 4000,
+             heal_ms = getenv("BH_HEAL_MS") ? strtoull(getenv("BH_HEAL_MS"), 0, 10) : 3000;
+    while (now_ms() - t0 < 60000) {
+        if (now_ms() >= flip) {
+            cut = !cut;
+            if (cut) {
+                FILE *fp = fopen(f, "w");
+                if (!fp || fprintf(fp, "%u\n", pn) < 0 || fclose(fp) != 0)
+                    die("write %s: %s", f, strerror(errno));
+            } else if (unlink(f) != 0)
+                die("unlink %s: %s", f, strerror(errno));
+            flip = now_ms() + (cut ? cut_ms : heal_ms);
+        }
+        struct view lv;
+        view(0, &lv);
+        const struct meta_member *mm = meta_member(&lv.m, pn);
+        downs += cut && mm && mm->state != META_UP;
+        view_free(&lv);
+        struct meta_volume x;
+        if (vol_rec(0, nm[k], &x) && x.leader && x.leader != last) {
+            moves++;
+            led += x.leader == pn;
+            last = x.leader;
+        }
+        usleep(100000);
+    }
+    if (cut && unlink(f) != 0)
+        die("unlink %s: %s", f, strerror(errno));
+    uint64_t bal = 0;
+    for (int i = 0; i < 3; i++)
+        bal += tr_count(i, CL_TR_BALANCE);
+    bal -= b0;
+    printf("  %s with node %u's heartbeats cut %" PRIu64 " ms of every %" PRIu64 ": seen not UP %u times, %" PRIu64
+           " balance transfers in 60 s, %u leader changes, %u to node %u\n", nm[k], pn, cut_ms, cut_ms + heal_ms, downs,
+           bal, moves, led, pn);
+    if (!downs)
+        die("balancehb: the Raft leader never saw node %u other than UP: the cut did not take", pn);
+    if (bal > 2 || led > 2)
+        die("balancehb: %" PRIu64 " balance transfers to node %u in 60 s and %u leader changes to it: the volume "
+            "follows the flap", bal, pn, led);
+    stop_all();
+}
+
+/* transfer: TRANSFERS transfers of one volume round its three members under 4 writers (each through another
+ * member, forwarded). D14: every transfer answers once its target leads, the ISR stays whole (the old leader is never
+ * dropped as unanswered), no write's outcome is unknown, every acknowledged row is on every member at the end and no
+ * member cut its log. The write pause of each transfer (the longest write that overlapped it) is reported. Mutants
+ * (TSDB_CLUSTER_MUTANT transferanycand transferfewreplies, TSDB_REPLD_MUTANT transfernodrain transferadmit) fail it. */
+static void scen_transfer(void)
+{
+    scenario("transfer");
+    int transfers = getenv("TR_TRANSFERS") ? atoi(getenv("TR_TRANSFERS")) : 100;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "tv", 3, &num)) != 0 || num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader);
+    tsdbc *c = client(L);
+    struct tr_writer w[REP_NAMES];
+    pthread_t th[REP_NAMES];
+    memset(w, 0, sizeof w);
+    for (int k = 0; k < REP_NAMES; k++) {
+        w[k].server = k % 3;
+        w[k].id = rep_series(c, rep_names[k], "tv", 30000);
+        w[k].ts = 1000000;
+    }
+    w[REP_NAMES - 1].noretry = 1; /* its refusals are definite, and tr_check requires each of them absent */
+    w[REP_NAMES - 1].via = w[REP_NAMES - 1].server;
+    /* TR_PRELOAD_MB: that much WAL written first and kept by the replicas (past their commit floor, under
+     * repl_retain_mb 4096 and repl_retain_s 1800 by default), so the first targets' promotions have it in their kept
+     * segments (r3-scope/PLAN.md:123); measured, not judged. The leader keeps a flushed segment only while a replica
+     * needs it, so its own WAL stays small once both have caught up: the loop counts the replicas' */
+    uint64_t preload = getenv("TR_PRELOAD_MB") ? strtoull(getenv("TR_PRELOAD_MB"), NULL, 10) << 20 : 0;
+    if (preload) {
+        enum { PB = 60000 }; /* below wal_max_batch_rows: through the WAL, not straight to a part */
+        int64_t *pts = malloc(PB * sizeof *pts);
+        float *pv = malloc(PB * sizeof *pv);
+        if (!pts || !pv)
+            die("out of memory");
+        tsdb_sid pid = rep_series(c, "preload", "tv", 30000);
+        int64_t t = 1;
+        size_t rows = 0;
+        uint64_t p0 = now_ms(), until = p0 + 600000;
+        for (;;) {
+            int short_ = 0;
+            for (int i = 0; i < 3; i++)
+                if (i != L && wal_bytes(i, num) < preload)
+                    short_ = 1;
+            if (!short_)
+                break;
+            if (now_ms() > until)
+                die("the replicas keep %" PRIu64 " / %" PRIu64 " / %" PRIu64 " MB of WAL of tv after %zu rows of preload",
+                    wal_bytes(0, num) >> 20, wal_bytes(1, num) >> 20, wal_bytes(2, num) >> 20, rows);
+            for (int j = 0; j < PB; j++, t++)
+                pts[j] = t, pv[j] = (float)(t * 7919 % 100003) / 7.0f;
+            if ((rc = tsdbc_insert_series(c, pid, pts, pv, PB)) != 0)
+                die("preload insert: %s", tsdbc_strerror(rc));
+            rows += PB;
+        }
+        free(pts);
+        free(pv);
+        printf("  preload: %zu rows in %" PRIu64 " ms; WAL of tv kept: %" PRIu64 " / %" PRIu64 " / %" PRIu64 " MB\n",
+               rows, now_ms() - p0, wal_bytes(0, num) >> 20, wal_bytes(1, num) >> 20, wal_bytes(2, num) >> 20);
+    }
+    tsdbc_close(c);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the transfers");
+    for (int k = 0; k < REP_NAMES; k++)
+        if (pthread_create(&th[k], NULL, tr_write_thread, &w[k]) != 0)
+            die("pthread_create");
+    usleep(500000);
+    uint64_t *win = calloc((size_t)transfers * 2, sizeof *win), *pause = calloc((size_t)transfers, sizeof *pause);
+    if (!win || !pause)
+        die("out of memory");
+    for (int t = 0; t < transfers; t++) {
+        if (!vol_rec(0, "tv", &v))
+            die("no record of tv");
+        await_isr(0, "tv", 3, 30000, "every replica in the ISR before a transfer");
+        uint32_t to = 0;
+        for (uint32_t k = 0; k < v.nrep; k++) /* the next member round the replicas */
+            if (v.rep[k].node == v.leader)
+                to = v.rep[(k + 1) % v.nrep].node;
+        char why[256];
+        win[2 * t] = now_ms();
+        rc = tr_transfer(num, to, why, sizeof why);
+        win[2 * t + 1] = now_ms();
+        if (rc != 0)
+            die("transfer %d of tv from node %u to node %u: %s (%s)", t, v.leader, to, cluster_strerror(rc), why);
+        struct meta_volume a = {0};
+        if (!vol_rec(0, "tv", &a) || a.leader != to || a.epoch <= v.epoch)
+            die("transfer %d answered OK, but node %u leads tv at epoch %" PRIu64 " (wanted node %u past %" PRIu64 ")",
+                t, a.leader, a.epoch, to, v.epoch);
+        if (a.nisr != v.nrep)
+            die("transfer %d to node %u: the ISR has %u members right after it (a member dropped as unanswered)", t,
+                to, a.nisr);
+        /* every writer acknowledged once after it before the next: a write refused across back-to-back transfers
+         * would add their windows up (and the client's MOVED backoff, which grows with a request's tries) */
+        for (int k = 0; k < REP_NAMES; k++) {
+            uint64_t until = now_ms() + 30000;
+            while (__atomic_load_n(&w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= win[2 * t + 1])
+                if (now_ms() > until)
+                    die("writer %d (through server %d) acknowledged nothing in 30 s after transfer %d (its latest "
+                        "answer %s)", k, w[k].server, t, ers(__atomic_load_n(&w[k].last_rc, __ATOMIC_RELAXED)));
+                else
+                    usleep(5000);
+        }
+    }
+    for (int k = 0; k < REP_NAMES; k++)
+        __atomic_store_n(&w[k].stop, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < REP_NAMES; k++)
+        pthread_join(th[k], NULL);
+    int acked = 0, refused = 0, indet = 0;
+    for (int k = 0; k < REP_NAMES; k++)
+        acked += w[k].acked, refused += w[k].refused, indet += w[k].indet;
+    if (indet)
+        die("%d writes of %d had an unknown outcome across %d transfers (D14 promises definite answers)", indet,
+            acked + refused + indet, transfers);
+    if (w[REP_NAMES - 1].unavail < 1)
+        die("the writer without retries had no write refused UNAVAILABLE across %d transfers (%d MOVED): the check "
+            "that rows refused in a drain are absent would see none", transfers,
+            w[REP_NAMES - 1].refused - w[REP_NAMES - 1].unavail);
+    printf("  the writer without retries: %d refused UNAVAILABLE (drains, handovers), %d MOVED, each checked absent\n",
+           w[REP_NAMES - 1].unavail, w[REP_NAMES - 1].refused - w[REP_NAMES - 1].unavail);
+    for (int t = 0; t < transfers; t++)
+        for (int k = 0; k < REP_NAMES; k++)
+            for (size_t j = 0; j < w[k].n; j++)
+                if (w[k].w[j].t0 <= win[2 * t + 1] && w[k].w[j].t1 >= win[2 * t] &&
+                    w[k].w[j].t1 - w[k].w[j].t0 > pause[t])
+                    pause[t] = w[k].w[j].t1 - w[k].w[j].t0;
+    uint64_t took = 0;
+    for (int t = 0; t < transfers; t++)
+        took += win[2 * t + 1] - win[2 * t];
+    if (getenv("TR_DEBUG")) /* the slow writes: which writer, when, how long, how it ended */
+        for (int k = 0; k < REP_NAMES; k++)
+            for (size_t j = 0; j < w[k].n; j++)
+                if (w[k].w[j].t1 - w[k].w[j].t0 > 300)
+                    printf("  slow write: writer %d via server %d at +%" PRIu64 " ms took %" PRIu64 " ms: %s\n", k,
+                           w[k].server, w[k].w[j].t0 - win[0], w[k].w[j].t1 - w[k].w[j].t0, ers(w[k].w[j].rc));
+    if (getenv("TR_DEBUG"))
+        for (int t = 0; t < transfers; t++)
+            printf("  transfer %d: +%" PRIu64 " .. +%" PRIu64 " ms\n", t, win[2 * t] - win[0], win[2 * t + 1] - win[0]);
+    qsort(pause, (size_t)transfers, sizeof *pause, cmp_u64);
+    uint64_t cuts = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t n = tr_count(i, CL_TR_CUTS);
+        if (n)
+            die("server %d cut its log %" PRIu64 " times across the transfers", i, n);
+        cuts += n;
+    }
+    uint64_t done = tr_count(0, CL_TR_DONE), started = tr_count(0, CL_TR_STARTED);
+    if (done != (uint64_t)transfers || started != (uint64_t)transfers)
+        die("STATUS of the Raft leader counts %" PRIu64 " transfers started and %" PRIu64 " done, not %d", started,
+            done, transfers);
+    /* every member answered every transfer's fence and every answer counted (the candidate filter passes them all, so
+     * the grant leaves no member `unanswered`): the Raft leader's "proposes" lines all say 3 of 3 */
+    int props = 0, whole = 0;
+    for (int i = 0; i < 3; i++)
+        props += log_count(i, " fenced members answered"), whole += log_count(i, " (3 of 3 fenced members answered");
+    if (props != whole || whole < transfers)
+        die("of %d promotions proposed %d counted the answers of all 3 members, %d transfers", props, whole, transfers);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR at the end");
+    stop_all();
+    tr_check(w, "transfer");
+    printf("  %d transfers round 3 members under %d writers (mean %.0f ms each): %d writes acknowledged, %d refused "
+           "(definite), 0 unknown, %" PRIu64 " cuts; every acknowledged row on every member\n",
+           transfers, REP_NAMES, (double)took / transfers, acked, refused, cuts);
+    printf("  write pause of a transfer: p50 %" PRIu64 " ms, p99 %" PRIu64 " ms, max %" PRIu64 " ms\n",
+           pause[transfers / 2], pause[(transfers * 99) / 100 < transfers ? (transfers * 99) / 100 : transfers - 1],
+           pause[transfers - 1]);
+    for (int k = 0; k < REP_NAMES; k++)
+        free(w[k].w);
+    free(win);
+    free(pause);
 }
 
 int main(int argc, char **argv)
@@ -13612,7 +15247,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

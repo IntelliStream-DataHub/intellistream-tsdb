@@ -226,8 +226,11 @@ static void print_status(const struct cluster_status *st)
         printf(" isr");
         for (uint32_t k = 0; k < v->nisr; k++)
             printf("%s%" PRIu32, k ? "," : " ", v->isr[k]);
-        printf("%s isr_version %" PRIu64 " set_version %" PRIu64 "\n", v->nisr ? "" : " -", v->isr_version,
+        printf("%s isr_version %" PRIu64 " set_version %" PRIu64, v->nisr ? "" : " -", v->isr_version,
                v->set_version);
+        if (v->nrep) /* leader balance (D15) moves the leadership back to rep[0] */
+            printf(" preferred %" PRIu32, v->rep[0].node);
+        printf("\n");
         for (uint32_t k = 0; k < v->nrep; k++) {
             printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
                    v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);
@@ -237,6 +240,13 @@ static void print_status(const struct cluster_status *st)
         }
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
+    if (st->ntr >= CL_TR_N) /* the Raft leader's side counts on the member that ran them, the rest on every member */
+        printf("transfers started %" PRIu64 " done %" PRIu64 " timed_out %" PRIu64 " cancelled %" PRIu64
+               " fell_back %" PRIu64 " balance %" PRIu64 " drains_timed_out %" PRIu64 " resumed_blind %" PRIu64
+               " ready %" PRIu64 " cuts %" PRIu64 "\n",
+               st->tr[CL_TR_STARTED], st->tr[CL_TR_DONE], st->tr[CL_TR_TIMEDOUT], st->tr[CL_TR_CANCELLED],
+               st->tr[CL_TR_FALLBACK], st->tr[CL_TR_BALANCE], st->tr[CL_TR_DRAIN_TIMEDOUT], st->tr[CL_TR_BLIND],
+               st->tr[CL_TR_READY], st->tr[CL_TR_CUTS]);
     meta_free(&m);
 }
 
@@ -476,11 +486,14 @@ int cluster_cli(int argc, char **argv)
     }
     char target[META_ADDR_MAX + 1];
     snprintf(target, sizeof target, "%s", addr);
+    /* a transfer is answered once its new leader is committed: the drain (transfer_wait_ms, at most 60 s), the READY's
+     * slack (1 s) and the targeted promotion (2 s) before it, so 30 s is short of the longest setting */
+    int wait_ms = op == CLUSTER_OP_VOLUME_TRANSFER ? 90000 : 30000;
     for (int hop = 0;; hop++) {
         int rc;
         uint8_t *reply = NULL;
         size_t len = 0;
-        if (cluster_admin(target, secret, slen, op, req, rl, 30000, &rc, &reply, &len, err, sizeof err) != 0) {
+        if (cluster_admin(target, secret, slen, op, req, rl, wait_ms, &rc, &reply, &len, err, sizeof err) != 0) {
             fprintf(stderr, "tsdb cluster: %s\n", err);
             return 1;
         }

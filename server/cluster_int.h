@@ -38,12 +38,33 @@ int cl_volcmd_send(uint32_t node, const struct cluster_volcmd *c);
  * `min_end` (0, 0: none, any ISR member as before). The filter on the target is r4-transfer's (cluster.c :5850) */
 void promo_start_target(const struct meta_volume *v, uint8_t reason, uint32_t target, uint64_t min_end, uint64_t now);
 
+/* the Raft term this server is in (a transfer's VOLCMD carries it in `arg`: a volume leader ignores an older one) */
+uint64_t cl_term(void);
+/* how long this server has led the group (0: it does not) */
+uint64_t cl_leader_age_ns(uint64_t now);
+/* the group's lease (ms) */
+uint32_t cl_lease_ms(void);
+/* 1 while a promotion of volume `vol` is under way here (the Raft leader's) */
+int cl_promo_running(uint32_t vol);
+/* TSDB_CLUSTER_TEST lose_ready_file: 1 while READYs and a timed-out transfer's CANCEL are lost */
+int cl_lose_ready(void);
+
 /* ---- the entry points (stubs answer META_ERR_INVALID "not built" until their track fills them) */
 /* server/ctransfer.c (r4-transfer): CLUSTER_OP_VOLUME_TRANSFER, the duty round (leader balance, CANCEL after an
  * election, the transfer's timeouts), a volume leader's READY */
 void ctr_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void ctr_duty(uint64_t now);
 void ctr_ready(uint32_t from, const struct cluster_vmsg *m);
+/* the candidate filter of a transfer's promotion (cluster.c promo_step): 1 if `node`'s fence reply goes into the grant */
+int ctr_reply_passes(uint32_t target, uint32_t node);
+int ctr_drop_proposed(void);
+/* a transfer's promotion of `vol` at basis `epoch` was dropped (no grant within PROMO_MOVE_NS) */
+void ctr_promo_dropped(uint32_t vol, uint64_t epoch, uint64_t now);
+/* STATUS's counters of the Raft leader's side (this server's, since it started) */
+struct ctr_counts {
+    unsigned long started, done, timedout, cancelled, fallback, balance;
+};
+void ctr_counts(struct ctr_counts *c);
 /* server/cmove.c (r4-move): CLUSTER_OP_VOLUME_MOVE and the move's steps (add -> join -> shrink -> remove) */
 void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cmove_duty(uint64_t now);

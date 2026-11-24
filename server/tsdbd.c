@@ -663,6 +663,11 @@ static tsdb_unavail unav_entry(uint16_t vol)
         e.retry_after_ms = unav_jitter(1000);
         return e;
     }
+    if (unav_write && cvol_active() && repld_draining(vol)) { /* a planned transfer drains (D14): soon elsewhere */
+        e.reason = TSDB_WHY_PROMOTING;
+        e.retry_after_ms = unav_jitter(50);
+        return e;
+    }
     vol_health(vol, &health, &reason, &e.since_ms, &e.outage_id, &retry, &dom_idx);
     if (health == TSDB_HEALTH_AVAILABLE && unav_write && cvol_active() && repld_isr_short(vol)) {
         e.reason = TSDB_WHY_UNREACHABLE; /* min_isr (REPL_E_ISR): the replicas come back or a shrink is undone */

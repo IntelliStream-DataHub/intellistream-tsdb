@@ -578,6 +578,11 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         h->lease_left_ms = (int64_t)get64(&r);
     }
     st->users_caught_up = r.bad ? 0 : get8(&r);
+    st->ntr = r.bad ? 0 : get32(&r);
+    if (st->ntr > sizeof st->tr / sizeof st->tr[0])
+        r.bad = 1;
+    for (uint32_t i = 0; i < st->ntr && !r.bad; i++)
+        st->tr[i] = get64(&r);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -1014,7 +1019,8 @@ static struct {
     uint64_t copy_next; /* not before this time (ns) */
     int copy_out;       /* a DJ_COPY job is on the disk worker */
     uint64_t copy_applied, copy_gen; /* what the copy file holds (applied index, restore generation): never written lower */
-    struct meta_state cpy; /* a voter's persisted copy that is ahead of what its core has applied since the restart */
+    struct meta_state cpy; /* a voter's persisted copy that is ahead of what its core has applied since the restart, or
+                            * the state a member served before core_boot started its core */
     int cpy_on;
     int fail_copy_dirsync, fail_pend_dirsync;
     int img_shared; /* an image this run saw (an install) says shared mode: a learner's own state is empty until then */
@@ -1127,6 +1133,17 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int drop_hb;         /* TSDB_CLUSTER_TEST drop_hb_file=1: while <state-dir>/drophb is, a heartbeat received from the node
+                          * it names (a decimal id) is dropped unanswered (test_cluster balancehb: a one-way cut of one
+                          * member's heartbeats from the Raft leader, its data links untouched) */
+    char drophbfile[1100];
+    int lose_ready;      /* TSDB_CLUSTER_TEST lose_ready_file=1: while <state-dir>/loseready is, a READY received is dropped
+                          * and a timed-out transfer's CANCEL is not sent (both lost on the link: test_cluster
+                          * transferstale, a volume leader holding a READY its Raft leader no longer knows) */
+    char losereadyfile[1100];
+    unsigned long long hold_grant_ms; /* TSDB_CLUSTER_TEST hold_grant_ms=N: the Raft leader proposes a transfer's grant
+                                       * (one with a target) N ms after it decided it (test_cluster transfergrant: a grant
+                                       * whose commit comes past PROMO_MOVE_NS, as on a slow Raft quorum) */
     int hold_reply;      /* TSDB_CLUSTER_TEST hold_reply_file=1: while <state-dir>/holdreply is, a copy of each FENCE_REPLY sent
                           * is kept; while <state-dir>/replayreply is, the copies are sent again every round (test_cluster
                           * oneway2: a late answer to an earlier fence of the volume must not count for the promotion now) */
@@ -1413,6 +1430,12 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "drop_hb_file=%llu", &v) == 1)
+            C.drop_hb = v != 0;
+        else if (sscanf(p, "hold_grant_ms=%llu", &v) == 1)
+            C.hold_grant_ms = v;
+        else if (sscanf(p, "lose_ready_file=%llu", &v) == 1)
+            C.lose_ready = v != 0;
         else if (sscanf(p, "hold_reply_file=%llu", &v) == 1)
             C.hold_reply = v != 0;
         else if (sscanf(p, "volcmd_file=%llu", &v) == 1)
@@ -1719,7 +1742,9 @@ enum cl_mutant {
     CLM_PUSHREBUILD = 31,  /* the users watch is given the copy while it is rebuilt (a promotion's core_boot) */
     CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
     CLM_SYNCNOLEASE = 33,  /* USER_SYNC answered by a leader without its lease (review F7) */
-    CLM_ULADDRTICK = 34    /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
+    CLM_ULADDRTICK = 34,   /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
+    CLM_BOOTEMPTY = 35     /* core_boot drops the state the member served: STATUS shows an empty image until the core
+                            * catches up (test_cluster userpromote) */
 };
 static int cl_mutant(void)
 {
@@ -1762,6 +1787,7 @@ static int cl_mutant(void)
             : !strcmp(e, "holdempty")     ? CLM_HOLDEMPTY
             : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
             : !strcmp(e, "uladdrtick")    ? CLM_ULADDRTICK
+            : !strcmp(e, "bootempty")     ? CLM_BOOTEMPTY
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -3287,9 +3313,22 @@ static int adopt_install(char *err, size_t errn)
 }
 
 /* The core from the files: the snapshot (or none), the log on it, the hard state. 0, or -1 with err. */
+static int cpy_ahead(void);
+
 static int core_boot(char *err, size_t errn)
 {
-    meta_free(&C.sm);
+    /* The state this member served until now (a watcher's stream, or its copy file) stays the one STATUS and the user
+     * list show, marked stale, until the core has applied past it (view_state, as for a restarted voter): the core
+     * starts from nothing or its snapshot, and a watcher made a learner showed an empty image until the leader's
+     * install or log reached it (test_cluster setchurn read no volume there; userpromote checks the window) */
+    if (C.sm.initialised && !cpy_ahead() && cl_mutant() != CLM_BOOTEMPTY) {
+        if (C.cpy_on)
+            meta_free(&C.cpy);
+        C.cpy = C.sm;
+        C.cpy_on = 1;
+    } else {
+        meta_free(&C.sm);
+    }
     meta_init(&C.sm);
     free(C.snap);
     C.snap = NULL;
@@ -3375,7 +3414,6 @@ static int core_boot(char *err, size_t errn)
 }
 
 static void core_stop(struct meta_state *next);
-static int cpy_ahead(void);
 
 /* removed from the group while away: the core goes (its files stay), the state goes on from `next` (or as is) */
 static void drop_core(struct meta_state *next, const char *why)
@@ -3511,6 +3549,21 @@ static void on_raft(struct conn *c, struct rd *r)
 
 static int promo_holds_lease(uint32_t node);
 
+/* TSDB_CLUSTER_TEST drop_hb_file: the node <state-dir>/drophb names, 0 while the file is not there */
+static uint32_t hb_dropped_node(void)
+{
+    if (!C.drop_hb)
+        return 0;
+    FILE *f = fopen(C.drophbfile, "r");
+    unsigned long n = 0;
+    if (f) {
+        if (fscanf(f, "%lu", &n) != 1)
+            n = 0;
+        fclose(f);
+    }
+    return (uint32_t)n;
+}
+
 static void on_hb(struct conn *c, struct rd *r)
 {
     uint32_t node = get32(r);
@@ -3522,6 +3575,8 @@ static void on_hb(struct conn *c, struct rd *r)
         c->dead = r->bad;
         return;
     }
+    if (C.drop_hb && hb_dropped_node() == node)
+        return;
     uint64_t now = iso_now_ns();
     heard_set(node, now, inc, applied, addr, peer);
     struct heard *h = heard_get(node);
@@ -3666,7 +3721,7 @@ static int cpy_ahead(void)
 }
 
 /* The state a status is shown from: a voter that restarted shows its persisted copy (marked stale) until its core has
- * applied that far again. */
+ * applied that far again, and a member whose core just started (core_boot) the state it served before. */
 static const struct meta_state *view_state(void)
 {
     return cpy_ahead() ? &C.cpy : &C.sm;
@@ -3790,6 +3845,9 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
     put64(b, (uint64_t)left);
 }
 
+static _Atomic(cluster_drv_counts_fn) g_drv_counts;
+void cluster_set_drv_counts(cluster_drv_counts_fn fn) { atomic_store_explicit(&g_drv_counts, fn, memory_order_release); }
+
 static void put_status(struct buf *b)
 {
     uint64_t now = iso_now_ns();
@@ -3821,6 +3879,17 @@ static void put_status(struct buf *b)
         put_heard_extra(b, &C.heard[i], now, 0);
     }
     put8(b, (uint8_t)cluster_users_caught_up());
+    uint64_t tr[CL_TR_N] = {0};
+    struct ctr_counts cc;
+    ctr_counts(&cc);
+    tr[CL_TR_STARTED] = cc.started, tr[CL_TR_DONE] = cc.done, tr[CL_TR_TIMEDOUT] = cc.timedout;
+    tr[CL_TR_CANCELLED] = cc.cancelled, tr[CL_TR_FALLBACK] = cc.fallback, tr[CL_TR_BALANCE] = cc.balance;
+    cluster_drv_counts_fn dc = atomic_load_explicit(&g_drv_counts, memory_order_acquire);
+    if (dc)
+        dc(tr);
+    put32(b, CL_TR_N);
+    for (int i = 0; i < CL_TR_N; i++)
+        put64(b, tr[i]);
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
@@ -5918,7 +5987,8 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
     if (m->kind == CL_VMSG_READY) {
-        ctr_ready(from, m);
+        if (!cl_lose_ready())
+            ctr_ready(from, m);
         return;
     }
     if (m->kind == CL_VMSG_RESIGN) {
@@ -6146,6 +6216,22 @@ static int heard_fresh(uint32_t id, uint64_t now)
     return last && since(now, last) < (uint64_t)settings()->node_timeout_ms * MS;
 }
 
+static struct {
+    struct meta_grant g;
+    uint64_t due_ns; /* 0: none held */
+} g_held;
+
+static void grant_propose(const struct meta_grant *g, uint64_t took_ns)
+{
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_volume_leader(&e, g);
+    if (propose(&e, 0, 0, 0) == ISO_OK)
+        say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
+            " fenced members answered, %" PRIu64 " ms)", g->number, g->leader, g->new_epoch, g->nreplies, g->nfenced,
+            (uint64_t)(took_ns / MS));
+}
+
 /* 1: proposed (or nothing to do any more) */
 static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now)
 {
@@ -6157,7 +6243,7 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
             if (p->replied[i])
                 continue;
             if (p->fenced[i] == C.id) {
-                if (g_fence_fn)
+                if (g_fence_fn && !(C.drop_fence && access(C.dropfencefile, F_OK) == 0)) /* the test hook, as on_fence */
                     g_fence_fn(g_fence_arg, p->vol, p->epoch + 1, C.id);
                 continue;
             }
@@ -6203,9 +6289,14 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     g.nfenced = p->nfenced;
     memcpy(g.fenced, p->fenced, sizeof g.fenced);
     uint64_t best = 0;
+    g.target = p->target;
+    g.min_end = p->min_end;
+    /* not the failed or the cut-off one; a planned transfer (target) passes every reply, the drained old leader's
+     * included, so that no member is left `unanswered` (ctr_reply_passes, D14) */
     for (uint32_t i = 0; i < p->nfenced; i++)
-        if (p->replied[i] && !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
-                               p->fenced[i] == p->old)) { /* not the failed or the cut-off one */
+        if (p->replied[i] && (p->target ? ctr_reply_passes(p->target, p->fenced[i])
+                                        : !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
+                                            p->fenced[i] == p->old))) {
             g.reply[g.nreplies++] = p->reply[i];
             if (p->reply[i].durable > best)
                 best = p->reply[i].durable;
@@ -6224,13 +6315,13 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     uint64_t last = v->nhist ? v->hist[v->nhist - 1].start : 0;
     g.start = best + 1 > last + 1 ? best + 1 : last + 1;
     p->proposed_ns = now;
-    struct meta_entry e;
-    meta_entry_init(&e);
-    meta_op_volume_leader(&e, &g);
-    if (propose(&e, 0, 0, 0) == ISO_OK)
-        say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
-            " fenced members answered, %" PRIu64 " ms)", p->vol, g.leader, g.new_epoch, g.nreplies, g.nfenced,
-            (uint64_t)(since(now, p->t0) / MS));
+    if (C.hold_grant_ms && g.target && !g_held.due_ns) { /* the test hook: proposed by promote_duty later */
+        g_held.g = g;
+        g_held.due_ns = now + C.hold_grant_ms * MS;
+        say("test: holds the grant of volume %" PRIu32 " to node %" PRIu32 " for %llu ms", p->vol, g.leader,
+            C.hold_grant_ms);
+    } else
+        grant_propose(&g, since(now, p->t0));
     const struct vstate *fs = vs_find(p->vol);
     if (fs && fs->forced && fs->forced_node == g.leader && fs->forced_epoch == p->epoch)
         say("volume %" PRIu32 ": forced leader %" PRIu32 " ends at %" PRIu64 ", the last shrink's commit point is "
@@ -6360,9 +6451,14 @@ static void promote_duty(uint64_t now)
     g_nresign = 0;
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
         g_npromo = 0;
+        g_held.due_ns = 0; /* a held grant is a proposal lost with the leadership */
         for (uint32_t i = 0; nres && i < g_nvs; i++)
             g_vs[i].resigned = 0;
         return;
+    }
+    if (g_held.due_ns && now >= g_held.due_ns) {
+        g_held.due_ns = 0;
+        grant_propose(&g_held.g, 0);
     }
     size_t k = 0;
     for (size_t i = 0; i < g_npromo; i++) { /* the record moved past the basis, or the proposal is lost */
@@ -6370,6 +6466,14 @@ static void promote_duty(uint64_t now)
         const struct meta_volume *v = meta_volume(&C.sm, p->vol);
         int moved = !v || v->epoch != p->epoch || v->isr_version != p->version;
         int cand = cl_mutant() != CLM_MOVEGIVEUP && promo_candidate(p);
+        /* a transfer's promotion with no grant proposed: ctransfer.c cancels it. One whose grant is proposed waits for
+         * the commit (or PROMO_GIVEUP_NS, a lost proposal), as a failover's does: the grant may still commit */
+        if (!moved && p->target && (!p->proposed_ns || ctr_drop_proposed()) && since(now, p->t0) >= PROMO_MOVE_NS) {
+            say("volume %" PRIu32 ": no grant to target %" PRIu32 " committed within %llu ms; the transfer's "
+                "promotion is dropped", p->vol, p->target, (unsigned long long)(PROMO_MOVE_NS / MS));
+            ctr_promo_dropped(p->vol, p->epoch, now);
+            continue;
+        }
         if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && !cand && since(now, p->t0) >= PROMO_MOVE_NS) {
             say("volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to; the ISR shrinks",
                 p->vol, p->epoch);
@@ -6771,6 +6875,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.drophbfile, sizeof C.drophbfile, "%s/drophb", C.metadir);
+    snprintf(C.losereadyfile, sizeof C.losereadyfile, "%s/loseready", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
@@ -6952,6 +7058,15 @@ uint64_t cl_now_ns(void) { return mono_ns(); }
 uint32_t cl_self(void) { return C.id; }
 
 int cl_leading(void) { return C.r && raft_get_role(C.r) == RAFT_LEADER && C.sm.initialised; }
+
+uint64_t cl_term(void) { return C.r ? (uint64_t)raft_get_term(C.r) : 0; }
+
+uint64_t cl_leader_age_ns(uint64_t now) { return cl_leading() ? since(now, C.leader_since) : 0; }
+
+uint32_t cl_lease_ms(void) { return settings()->lease_ms; }
+
+int cl_promo_running(uint32_t vol) { return promo_find(vol) != NULL; }
+int cl_lose_ready(void) { return C.lose_ready && access(C.losereadyfile, F_OK) == 0; }
 
 const char *cl_leader_peer(void) { return leader_peer(); }
 

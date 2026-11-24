@@ -449,6 +449,7 @@ int cvol_start(tsdb *t, const char *dir)
     M.active = 1;
     cluster_set_volume_watch(on_watch, NULL);
     cluster_set_fence_handler(repld_fence, NULL);
+    cluster_set_drv_counts(repld_transfer_counts);
     cluster_set_volcmd_handler(repld_volcmd, NULL);
     cluster_set_reporter(on_report, NULL);
     return 0;

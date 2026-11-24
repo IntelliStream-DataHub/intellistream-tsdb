@@ -1192,8 +1192,14 @@ static int promote_rule(const struct meta_volume *v, const struct meta_grant *g,
             return META_ERR_INVALID;
         rr[i] = (struct repl_fence_reply){x, g->reply[i].durable, g->reply[i].last_epoch, g->reply[i].rid};
     }
+    /* a planned transfer's grant (D14) names its target: the rule picks it or nothing (repl_meta_promote_to); MUT(49)
+     * (targetignored) picks as for a failover */
+    int target = g->target && !MUT(49) ? replica_at(v, g->target) : -1;
+    if (g->target && !MUT(49) && target < 0)
+        return META_ERR_INVALID;
     /* MUT(14) (versionless) drops the ISR version check here too: repl_meta_promote makes it again */
-    int rc = repl_meta_promote(&vm, g->epoch, MUT(14) ? v->isr_version : g->isr_version, fenced, rr, (int)g->nreplies);
+    int rc = repl_meta_promote_to(&vm, g->epoch, MUT(14) ? v->isr_version : g->isr_version, fenced, rr,
+                                  (int)g->nreplies, target, g->target ? g->min_end : 0);
     *out = vm;
     if (rc == REPL_E_STALE)
         return META_ERR_STALE;
@@ -1219,6 +1225,8 @@ static int promote(struct meta_volume *v, const struct meta_grant *g)
         return rc;
     if (v->rep[vm.leader].node != g->leader)
         return META_ERR_INVALID; /* the proposer's pick is not what the rule gives: a bug or a stale view */
+    if (g->target && v->rep[vm.leader].node != g->target && !MUT(49))
+        return META_ERR_INVALID; /* a planned grant leads to its target or not at all (D14) */
     uint32_t ids[META_REPLICAS_MAX], n = 0;
     for (uint32_t i = 0; i < v->nrep; i++) {
         v->rep[i].unanswered = (vm.unanswered >> i) & 1;
@@ -2586,6 +2594,9 @@ static int check_volume_step(const struct meta_volume *a, const struct meta_volu
     if (b->epoch > a->epoch && b->grant_target && b->grant_target == a->leader)
         FAIL("volume %u: epoch %llu's grant names target %u, the leader of epoch %llu it moves away from", va,
              (unsigned long long)b->epoch, b->grant_target, (unsigned long long)a->epoch);
+    if (b->epoch > a->epoch && b->grant_target && b->leader != b->grant_target)
+        FAIL("volume %u: epoch %llu's grant names target %u, but %u leads it", va, (unsigned long long)b->epoch,
+             b->grant_target, b->leader);
     if (b->epoch == a->epoch && (b->grant_target != a->grant_target || b->grant_min_end != a->grant_min_end))
         FAIL("volume %u: the grant's target changed within epoch %llu", va, (unsigned long long)a->epoch);
     int isr_same = a->nisr == b->nisr && !memcmp(a->isr, b->isr, a->nisr * sizeof a->isr[0]);

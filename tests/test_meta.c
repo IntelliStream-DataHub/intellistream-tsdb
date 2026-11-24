@@ -725,7 +725,8 @@ static void test_replica_set(void)
         uint32_t f34[2] = {3, 4}, a34[2] = {3, 4};
         struct meta_grant g = promo_grant(v, 2, 4, f34, 2, a34, 2, 200, 0);
         g.reason = META_GR_PLANNED;
-        g.target = 2; /* not in the ISR (mutant targetnotisr) */
+        /* not in the ISR (mutant targetnotisr, equivalent since r4-transfer: promote_rule refuses it too) */
+        g.target = 2;
         g.min_end = 14;
         meta_op_volume_leader(&e, &g);
         g.target = 4;
@@ -738,8 +739,19 @@ static void test_replica_set(void)
         meta_op_volume_leader(&e, &g);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
               res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && meta_volume(&m, 2)->epoch == 2);
-        meta_copy(&prev, &m);
+        /* the grant leads to its target or not at all: the old leader answered with the higher end (a transfer
+         * passes every reply), a grant naming it is refused (mutant targetignored), as is a target short of min_end */
         g.target = 4;
+        g.reply[0].durable = 20; /* node 3's */
+        g.leader = 3;
+        meta_op_volume_leader(&e, &g);
+        g.leader = 4;
+        g.min_end = 15;
+        meta_op_volume_leader(&e, &g);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+              meta_volume(&m, 2)->epoch == 2);
+        g.min_end = 14;
+        meta_copy(&prev, &m);
         meta_op_volume_leader(&e, &g);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
         v = meta_volume(&m, 2);
@@ -753,6 +765,10 @@ static void test_replica_set(void)
         meta_copy(&bent, &m);
         bent.volumes[2].grant_target = 3; /* in the ISR, but the leader of epoch 2 */
         CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0);
+        meta_free(&bent);
+        meta_copy(&bent, &m);
+        bent.volumes[2].leader = 3; /* the checker: epoch 3 is a transfer to 4, but 3 leads it */
+        CHECK(meta_check_step(&prev, &bent, why, sizeof why) != 0 && strstr(why, "but 3 leads it"));
         meta_free(&bent);
         meta_copy(&bent, &m); /* the target or its end changed within an epoch */
         bent.volumes[2].grant_target = 3;
