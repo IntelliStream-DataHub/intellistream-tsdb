@@ -12668,6 +12668,10 @@ struct tr_writer {
     size_t n, cap;
     struct tr_write *w;
     int acked, refused, indet;
+    int noretry; /* no client retries: every refusal (UNAVAILABLE, MOVED) is the writer's own answer (review F4); on
+                  * MOVED it goes on through the next member (`via`), so it finds the leader and sees its drains */
+    int via, unavail;
+    int last_rc;          /* atomic: the latest write's answer (for the failure message) */
     uint64_t last_ack_t0; /* atomic: when the latest acknowledged write began (the scenario waits for one past a
                            * transfer, so that each write's pause belongs to one transfer) */
 };
@@ -12679,24 +12683,35 @@ static void *tr_write_thread(void *a)
     tsdbc *c = NULL;
     while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
         if (!c) {
-            if (tsdbc_connect("127.0.0.1", __atomic_load_n(&cports[w->server], __ATOMIC_RELAXED), &c) != 0) {
+            int through = w->noretry ? w->via : w->server;
+            if (tsdbc_connect("127.0.0.1", __atomic_load_n(&cports[through], __ATOMIC_RELAXED), &c) != 0) {
                 c = NULL;
                 usleep(20000);
                 continue;
             }
-            tsdbc_set_retry(c, 10000);
+            tsdbc_set_retry(c, w->noretry ? 0 : 10000);
             tsdbc_set_timeout(c, 30000);
         }
         float val = (float)(w->ts % 977);
         struct tr_write r = {now_ms(), 0, 0};
         r.rc = tsdbc_insert_series(c, w->id, &w->ts, &val, 1);
         r.t1 = now_ms();
+        __atomic_store_n(&w->last_rc, r.rc, __ATOMIC_RELAXED);
         if (r.rc == 0) {
             w->acked++;
             __atomic_store_n(&w->last_ack_t0, r.t0, __ATOMIC_RELEASE);
         }
-        else if (r.rc == TSDB_ERR_UNAVAILABLE || r.rc == TSDB_ERR_MOVED)
+        else if (r.rc == TSDB_ERR_UNAVAILABLE || r.rc == TSDB_ERR_MOVED) {
             w->refused++; /* definite: the server says it was never admitted */
+            w->unavail += r.rc == TSDB_ERR_UNAVAILABLE;
+            if (w->noretry && r.rc == TSDB_ERR_MOVED) {
+                tsdbc_close(c);
+                c = NULL;
+                w->via = (w->via + 1) % 3;
+            }
+            if (w->noretry)
+                usleep(5000); /* the client's own retries would wait retry_after (50 ms in a drain) */
+        }
         else {
             w->indet++; /* a closed connection (D12) or a deadline: the outcome is unknown */
             tsdbc_close(c);
@@ -13914,6 +13929,8 @@ static void scen_transfer(void)
         w[k].id = rep_series(c, rep_names[k], "tv", 30000);
         w[k].ts = 1000000;
     }
+    w[REP_NAMES - 1].noretry = 1; /* its refusals are definite, and tr_check requires each of them absent */
+    w[REP_NAMES - 1].via = w[REP_NAMES - 1].server;
     /* TR_PRELOAD_MB: that much WAL written first and kept by the replicas (past their commit floor, under
      * repl_retain_mb 4096 and repl_retain_s 1800 by default), so the first targets' promotions have it in their kept
      * segments (r3-scope/PLAN.md:123); measured, not judged. The leader keeps a flushed segment only while a replica
@@ -13986,8 +14003,8 @@ static void scen_transfer(void)
             uint64_t until = now_ms() + 30000;
             while (__atomic_load_n(&w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= win[2 * t + 1])
                 if (now_ms() > until)
-                    die("writer %d (through server %d) acknowledged nothing in 30 s after transfer %d", k,
-                        w[k].server, t);
+                    die("writer %d (through server %d) acknowledged nothing in 30 s after transfer %d (its latest "
+                        "answer %s)", k, w[k].server, t, ers(__atomic_load_n(&w[k].last_rc, __ATOMIC_RELAXED)));
                 else
                     usleep(5000);
         }
@@ -14002,6 +14019,12 @@ static void scen_transfer(void)
     if (indet)
         die("%d writes of %d had an unknown outcome across %d transfers (D14 promises definite answers)", indet,
             acked + refused + indet, transfers);
+    if (w[REP_NAMES - 1].unavail < 1)
+        die("the writer without retries had no write refused UNAVAILABLE across %d transfers (%d MOVED): the check "
+            "that rows refused in a drain are absent would see none", transfers,
+            w[REP_NAMES - 1].refused - w[REP_NAMES - 1].unavail);
+    printf("  the writer without retries: %d refused UNAVAILABLE (drains, handovers), %d MOVED, each checked absent\n",
+           w[REP_NAMES - 1].unavail, w[REP_NAMES - 1].refused - w[REP_NAMES - 1].unavail);
     for (int t = 0; t < transfers; t++)
         for (int k = 0; k < REP_NAMES; k++)
             for (size_t j = 0; j < w[k].n; j++)
