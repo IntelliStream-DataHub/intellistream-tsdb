@@ -12,7 +12,10 @@
  *  - ttl: the TTL drop renames in block order (oldest first; it used to go newest first), and a child killed after
  *    its first rename leaves no part of either partition listed at the next open.
  *  - power: tsdb_drop_before under crashfs with CRASHFS_TEAR, power lost before every tracked operation (the intent's
- *    write, its syncs, each rename, the directory fsync, the unlink): whole or gone, gone once acknowledged.
+ *    write, its syncs, each rename, the directory fsync, the unlink): whole or gone, gone once acknowledged. At each
+ *    step the seeds draw the unsynced directory operations that survive at random; then CRASHFS_UNDO_ONE loses each
+ *    of them in turn with all the others kept, so a window such as "the intent's unlink kept, one rename lost"
+ *    (ttlunlinkfirst) is met at its step whatever the draws are (fixed seeds alone once all missed it).
  *  - recover: an open that rolls a drop intent forward (one part already renamed) under the same power loss: gone.
  *  - torn: an intent without its end line: the drop never started, everything is there. damaged: an intent whose
  *    checksum is wrong after all its renames ran reads as torn: the renames stand (the partition is gone), the
@@ -303,11 +306,13 @@ static void ttl(void)
 
 /* --------------------------------------------------------------- power */
 
-static int run_child(const char *mode, const char *dir, const char *ack, int warmup, int seed)
+/* undo >= 0: CRASHFS_UNDO_ONE (every unsynced directory operation kept but that one), their number written to `count` */
+static int run_child(const char *mode, const char *dir, const char *ack, int warmup, int seed, int undo,
+                     const char *count)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        char asan[512], w[16], sd[16];
+        char asan[512], w[16], sd[16], u[16];
         snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
                  getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
         setenv("ASAN_OPTIONS", asan, 1);
@@ -320,6 +325,11 @@ static int run_child(const char *mode, const char *dir, const char *ack, int war
         setenv("CRASHFS_AT_EXIT", "1", 1);
         setenv("CRASHFS_TEAR", "1", 1);
         setenv("CRASHFS_SEED", sd, 1);
+        if (undo >= 0) {
+            snprintf(u, sizeof u, "%d", undo);
+            setenv("CRASHFS_UNDO_ONE", u, 1);
+            setenv("CRASHFS_UNDO_COUNT", count, 1);
+        }
         int null = open("/dev/null", O_WRONLY);
         if (null >= 0) {
             dup2(null, 1);
@@ -397,7 +407,8 @@ static void sweep(int mode)
 {
     const bool drop = mode == SW_DROP, ttl_mode = mode == SW_TTL;
     const int seeds = ttl_mode ? 4 : SEEDS;
-    char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8];
+    char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8], count[PATH_MAX + 8];
+    snprintf(count, sizeof count, "%s/undo-count", S);
     snprintf(src, sizeof src, "%s/src", S);
     snprintf(work, sizeof work, "%s/work", S);
     snprintf(ack, sizeof ack, "%s/ack", S);
@@ -419,17 +430,29 @@ static void sweep(int mode)
     const char *what = drop       ? "tsdb_drop_before"
                        : ttl_mode ? "the retention drop"
                                   : "the open rolling a drop intent forward";
-    int bad = 0, steps = 0, gone = 0, whole = 0;
+    int bad = 0, steps = 0, gone = 0, whole = 0, undos = 0;
     bool half = false;
     for (int w = 0; w < 5000 && bad < 3; w++) {
         bool ended = false;
-        for (int seed = 0; seed < seeds && bad < 3; seed++) {
+        int nundo = 1; /* the runs with CRASHFS_UNDO_ONE: 0, then as many as the first loss counted */
+        for (int run = 0; run < seeds + nundo && bad < 3; run++) {
+            const int seed = run < seeds ? run : 0, undo = run < seeds ? -1 : run - seeds;
             sh("rm -rf '%s'%s", work, "");
             sh("cp -a '%s' '%s'", src, work);
             unlink(ack);
-            int st = run_child(drop ? "--child-drop" : ttl_mode ? "--child-ttl" : "--child-open", work, ack, w, seed);
+            unlink(count);
+            int st = run_child(drop ? "--child-drop" : ttl_mode ? "--child-ttl" : "--child-open", work, ack, w, seed,
+                               undo, count);
+            if (undo == 0) {
+                FILE *cf = fopen(count, "r");
+                if (!cf || fscanf(cf, "%d", &nundo) != 1 || nundo < 1)
+                    nundo = 1; /* no loss (the child ended) or nothing unsynced: the one run */
+                if (cf)
+                    fclose(cf);
+            }
+            undos += undo >= 0;
             if (st != 99 && st != 0) {
-                fprintf(stderr, "%s: step %d seed %d: the child exited with %d\n", what, w, seed, st);
+                fprintf(stderr, "%s: step %d seed %d undo %d: the child exited with %d\n", what, w, seed, undo, st);
                 failures++;
                 bad++;
                 continue;
@@ -439,7 +462,7 @@ static void sweep(int mode)
             if (getenv("TSDB_DROPS_TRACE")) {
                 char tr[64][128];
                 size_t k = count_prefix(work, "", tr, 64);
-                printf("w%d s%d st%d:", w, seed, st);
+                printf("w%d s%d u%d st%d:", w, seed, undo, st);
                 for (size_t i = 0; i < k && i < 64; i++)
                     if (strstr(tr[i], "p0_") || strncmp(tr[i], "txn_", 4) == 0)
                         printf(" %s", tr[i]);
@@ -452,8 +475,8 @@ static void sweep(int mode)
             whole += v == V_WHOLE;
             half = half || v == V_HALF;
             if (v == V_HALF || v == V_ERR || (v == V_WHOLE && ((acked && drop) || mode == SW_OPEN))) {
-                fprintf(stderr, "%s: power lost before operation %d (seed %d): partition 0 %s%s\n", what, w, seed,
-                        vname[v], acked ? " (acknowledged)" : "");
+                fprintf(stderr, "%s: power lost before operation %d (seed %d, undo %d): partition 0 %s%s\n", what, w,
+                        seed, undo, vname[v], acked ? " (acknowledged)" : "");
                 failures++;
                 bad++;
             }
@@ -468,8 +491,9 @@ static void sweep(int mode)
     }
     if (half)
         printf("  %s: HALF DROP\n", what);
-    printf("  %s: power lost at each of %d steps (%d seeds each; %d gone, %d whole): %s\n", what, steps, seeds, gone,
-           whole,
+    printf("  %s: power lost at each of %d steps (%d seeds each, %d runs losing one directory operation; %d gone, "
+           "%d whole): %s\n",
+           what, steps, seeds, undos, gone, whole,
            bad        ? "FAILED"
            : drop     ? "whole or gone, gone once acknowledged"
            : ttl_mode ? "both partitions whole or both gone"

@@ -57,6 +57,23 @@
  *  - of the directory operations not made durable, a random subset, in the
  *    order they were made for each name: once one on a name is undone,
  *    every later one on that name (or inside it) is undone too.
+ * $CRASHFS_UNDO_ONE=k replaces that random subset by a chosen one: every directory operation not made durable is kept but the
+ * k-th of them (0-based, oldest first), which is undone with whatever it forces (later ones on its names); k at or past their
+ * number keeps them all. $CRASHFS_UNDO_COUNT=FILE then gets their number, written at the power loss, so a harness steps k from
+ * 0 up to it. A sweep of power losses at every step with fixed seeds finds a window like "the intent's unlink kept, one of
+ * its renames lost" only by the luck of the draws (a reorder of the draws once hid test_drops' ttlunlinkfirst); this finds it
+ * at every step where it exists.
+ *
+ * A file's record (its durable size, its lie after an EIO, its kept old sectors) is found by its inode, and an inode is
+ * freed and given to a new file while the process runs. Three belts keep a new file from inheriting a dead one's record,
+ * each with a case of tests/test_crashfs.c `reuse` where it alone stands between them: a file created through the shim's
+ * open starts a fresh record (file_renew in file_get; `reuse-open`: the old file freed where the shim did not see it); a
+ * durable unlink of a file's last name drops its record (do_sync; `reuse-unseen`: the new file made where the shim does not
+ * see it, then renamed through it); a close of a tracked descriptor of a file with no name left drops the record a write
+ * through it re-made after that unlink (close; `reuse-close`). Known limit: a file whose death the shim did not see (a raw
+ * unlink, glibc's remove) and whose inode then goes to a file whose birth it did not see either (mkstemp and mkostemp create
+ * through glibc's internal open, which LD_PRELOAD does not reach: server/chunksrv.c chunksrv_stage, server/tsdbd.c) inherits
+ * the record at its first rename through the shim. No tsdb path removes a tracked file unseen.
  *
  * A duplicate of a tracked descriptor (dup, dup2, dup3, fcntl F_DUPFD) is the same file: syncing it makes the file
  * durable (the Raft log of tsdbd --cluster hands duplicates of its segments to a worker to sync).
@@ -178,6 +195,8 @@ static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
 static bool rewrite_zero; /* CRASHFS_REWRITE=zero: the regions rewritten in place come back as zeros (harsher than a disk); else as they were */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
+static long undo_one = -1;          /* CRASHFS_UNDO_ONE: the one unsynced directory operation undone (-1: drawn at random) */
+static char undo_count[PATH_MAX];   /* CRASHFS_UNDO_COUNT: where their number goes at the power loss */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
 static bool md_mode;            /* CRASHFS_MODE=misdirect */
@@ -351,6 +370,10 @@ __attribute__((constructor)) static void init(void)
     if (getenv("CRASHFS_MARK_SLOW_MS"))
         mark_slow_ms = (unsigned)atoi(getenv("CRASHFS_MARK_SLOW_MS"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
+    if (getenv("CRASHFS_UNDO_ONE"))
+        undo_one = atol(getenv("CRASHFS_UNDO_ONE"));
+    if (getenv("CRASHFS_UNDO_COUNT"))
+        snprintf(undo_count, sizeof undo_count, "%s", getenv("CRASHFS_UNDO_COUNT"));
     rewrite_zero = getenv("CRASHFS_REWRITE") && !strcmp(getenv("CRASHFS_REWRITE"), "zero");
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
@@ -409,6 +432,34 @@ static void dir_of(const char *p, char *out)
         *s = '\0';
 }
 
+static void tsave_drop(file *f);
+
+/* A record whose inode was freed and is now another file's: nothing of the dead file (its durable size, its lie after an EIO,
+ * its kept old sectors) is the new one's. Inodes are freed while the process runs since a durable unlink removes its kept-aside
+ * copy at the directory's fsync (do_sync): before that fix a chunk put whose tmp file got the inode of a tmp that had met an
+ * injected EIO inherited its lie, its fsync never counted, and the power loss at exit cut an acknowledged chunk to 0 bytes
+ * (test_chunk's eio sweep). */
+static void file_renew(file *f, off_t durable)
+{
+    tsave_drop(f);
+    f->durable = durable;
+    f->ndirty = 0;
+    f->nold = 0;
+    f->lying = false;
+}
+
+/* The inode (dev, ino) is free now, or will be at its last close: its records go (see the head of the file). */
+static void record_drop(dev_t dev, ino_t ino)
+{
+    for (size_t j = 0; j < nfiles; j++)
+        if (files[j].used && files[j].dev == dev && files[j].ino == ino) {
+            file_renew(&files[j], 0);
+            files[j].used = false;
+        }
+}
+
+/* The record of the file at `path`, found by its inode, made if there is none. create_new: the caller just created the
+ * file, so a record with its inode is a dead file's (the inode was reused) and starts afresh. */
 static file *file_get(const char *path, bool create_new)
 {
     struct stat st;
@@ -417,6 +468,8 @@ static file *file_get(const char *path, bool create_new)
     for (size_t i = 0; i < nfiles; i++)
         if (files[i].used && files[i].dev == st.st_dev && files[i].ino == st.st_ino) {
             snprintf(files[i].path, PATH_MAX, "%s", path);
+            if (create_new)
+                file_renew(&files[i], 0);
             return &files[i];
         }
     if (nfiles == MAX_FILES || !S_ISREG(st.st_mode))
@@ -806,7 +859,9 @@ static void tear_dirops(void)
     size_t ncut = 0;
     if (!cut)
         return;
-    /* oldest first: each not durable op is kept at random, unless an earlier one on its names was undone */
+    /* oldest first: each not durable op is kept at random (or all but the chosen one), unless an earlier one on its names
+     * was undone */
+    long nth = 0;
     for (size_t i = 0; i < ndops; i++) {
         dirop *d = &dops[i];
         if (d->done)
@@ -815,7 +870,9 @@ static void tear_dirops(void)
         dir_of(d->a, srcdir);
         bool forced = name_cut(cut, ncut, d->a) || name_cut(cut, ncut, d->b) || name_cut(cut, ncut, srcdir) ||
                       name_cut(cut, ncut, d->dir);
-        if (!forced && urand() < 0.5) {
+        bool keep = undo_one >= 0 ? nth != undo_one : urand() < 0.5;
+        nth++;
+        if (!forced && keep) {
             d->done = true; /* reached the disk after all */
             tear_kept++;
             continue;
@@ -825,6 +882,16 @@ static void tear_dirops(void)
             cut[ncut++] = d->b;
     }
     free(cut);
+    if (undo_count[0]) { /* raw calls: the lock is held and the shim's own open would track the file */
+        char line[32];
+        int n = snprintf(line, sizeof line, "%ld\n", nth);
+        int fd = real_open(undo_count, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            if (real_write(fd, line, (size_t)n) < 0) {
+            }
+            real_close(fd);
+        }
+    }
 }
 
 /* Rolls the tracked tree back to what was made durable. Called with the lock held. */
@@ -1580,7 +1647,12 @@ static int do_sync(int fd, bool data_only)
                     dops[i].done = true;
                     if (dops[i].kind == OP_UNLINK && dops[i].saved[0]) {
                         /* the unlink is durable: the copy kept aside goes now, not at the power loss, so the directory
-                         * can be emptied and removed in the process (test_snapshot: an install removes v<N>.old) */
+                         * can be emptied and removed in the process (test_snapshot: an install removes v<N>.old). Its
+                         * inode may be freed and given to a new file: the record goes with its last name (a file
+                         * still open, or linked elsewhere, gets a new record, durable as it is, at its next use) */
+                        struct stat sst;
+                        if (lstat(dops[i].saved, &sst) == 0 && S_ISREG(sst.st_mode) && sst.st_nlink == 1)
+                            record_drop(sst.st_dev, sst.st_ino);
                         rm_tree(dops[i].saved);
                         dops[i].saved[0] = 0;
                     }
@@ -1878,12 +1950,21 @@ int fcntl(int fd, int cmd, ...)
     return r;
 }
 
+/* The close of a tracked descriptor of a regular file with no name left frees its inode, unless another tracked descriptor
+ * holds it: the record a write through it re-made after a durable unlink (file_of_fd) goes with it. */
 int close(int fd)
 {
     if (fd >= 0 && fd < MAX_FDS && fdpath[fd]) {
+        struct stat st;
+        bool gone = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0;
         pthread_mutex_lock(&lock);
         free(fdpath[fd]);
         fdpath[fd] = NULL;
+        for (int k = 0; gone && k < MAX_FDS; k++)
+            if (fdpath[k] && fddev[k] == st.st_dev && fdino[k] == st.st_ino)
+                gone = false;
+        if (gone)
+            record_drop(st.st_dev, st.st_ino);
         pthread_mutex_unlock(&lock);
     }
     return real_close(fd);
