@@ -1084,6 +1084,8 @@ extern _Atomic bool drop_test_marker;
 extern const char *drop_test_eio_name;
 extern _Atomic int drop_test_intent_fails; /* how often drop_test_intent_errno failed a write */
 extern void (*drop_test_hook)(struct eng *db, const char *name, size_t at); /* after each rename of a drop */
+/* tests/test_drops.c: the retention drop's renames are done, the directory fsync after them is next */
+extern void (*drop_test_presync)(struct eng *db);
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);

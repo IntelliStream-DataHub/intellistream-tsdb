@@ -736,6 +736,8 @@ void *merge_thread_main(void *arg)
             pthread_mutex_unlock(&db->lock);
             if (drop_test_mutant == DROP_MUT_TTL_UNLINK_FIRST && dropped)
                 drop_intent_done(db, drop_intent); /* planted: the intent goes before its renames are synced */
+            if (dropped && drop_test_presync)
+                drop_test_presync(db);
             int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
             if (src == 0 && dropped) {
                 drop_intent_done(db, drop_intent); /* after the fsync: the open finishes a drop whose fsync failed */

@@ -1207,6 +1207,7 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
 
 int drop_test_mutant;
 void (*drop_test_hook)(eng *db, const char *name, size_t at);
+void (*drop_test_presync)(eng *db);
 _Atomic int drop_test_intent_errno;
 _Atomic bool drop_test_marker;
 const char *drop_test_eio_name;
