@@ -284,7 +284,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `fwd_wait_ms` is UNAVAILABLE, written and lost closes the client's connection) and relays the reply; the owner runs it
   on reserved workers (`fwd_serve`) through the same gates with the user's rights, MOVED when not led at the envelope's
   epoch, UNAVAILABLE while its users lag the envelope's index; `tests/test_fwd.c` (fake link), `test_cluster
-  forward|fwdlease|fwddepose|fwdload`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
+  forward|fwdseries|fwdseriesstrict|fwdlease|fwddepose|fwdload`, `make fwd-mutants` (`TSDBD_FWD_MUTANT`; test hooks `TSDBD_TEST_FWD_STALL`,
   `TSDB_CLUSTER_TEST hold_copy_file|hold_users_file`); end to end through entry nodes: `test_cluster viabench`, jepsen-cluster `kv-via` with
   `fwdstall` (read-your-writes, "old frame"). Planned leader transfer and leader balance (R4 D14, D15;
   design-cluster.md 3.2 "as built"): `server/rtransfer.c` the volume leader's drain, READY and hold (TSDB_REPLD_MUTANT
