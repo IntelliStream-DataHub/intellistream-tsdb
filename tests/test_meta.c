@@ -879,6 +879,235 @@ static void test_replica_set(void)
     meta_free(&m);
 }
 
+/* ================================================================ erasure-coded volumes (R8, snapshot version 6) */
+
+/* VOLUME_ADD of an EC volume: replicas `nodes` (the log group), k + m and the stripe group the proposer picked */
+static void ec_add(struct meta_entry *e, uint32_t number, const char *name, uint32_t min_isr, const uint32_t *nodes,
+                   uint32_t n, int kind, uint8_t k, uint8_t mm, const uint32_t *stripe, uint32_t ns)
+{
+    struct meta_volume_add a;
+    memset(&a, 0, sizeof a);
+    a.number = number;
+    snprintf(a.name, sizeof a.name, "%s", name);
+    a.uuid[0] = (uint8_t)(number + 1);
+    a.kind = (uint8_t)kind;
+    a.min_isr = min_isr;
+    a.n = n;
+    for (uint32_t i = 0; i < n; i++) {
+        a.nodes[i] = nodes[i];
+        a.rid[i] = kind == META_VOL_SHARED ? 0 : rid_of(number, i);
+    }
+    if (kind == META_VOL_SHARED) {
+        snprintf(a.st.path, sizeof a.st.path, "/mnt/%s", name);
+        snprintf(a.st.export, sizeof a.st.export, "nfs0:/pool/%s", name);
+        snprintf(a.st.fstype, sizeof a.st.fstype, "nfs4");
+        snprintf(a.st.group, sizeof a.st.group, "g0");
+    }
+    a.redundancy = META_RED_EC;
+    a.ec_k = k;
+    a.ec_m = mm;
+    a.nstripe = ns;
+    memcpy(a.stripe, stripe, ns * sizeof *stripe);
+    meta_op_volume_add(e, &a);
+}
+
+static void test_ec(void)
+{
+    struct meta_state m, prev;
+    struct meta_entry e;
+    int res[16];
+    char why[256];
+    meta_entry_init(&e);
+    init_cluster(&m, &e, META_MODE_REPLICATED, 8);
+    meta_op_member_state(&e, 8, META_OUT, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    uint32_t log3[3] = {1, 2, 3}, g6[6] = {2, 3, 4, 5, 6, 7};
+
+    CHECK(meta_volume_min_isr(META_RED_EC, 2, 3, 1) == 2 && meta_volume_min_isr(META_RED_EC, 4, 1, 1) == 1 &&
+          meta_volume_min_isr(META_RED_REPLICAS, 0, 3, 2) == 2 && meta_volume_min_isr(META_RED_REPLICAS, 0, 1, 3) == 1);
+
+    /* refused at apply: a group that repeats a node, names an unknown or an out member, k + m positions not given,
+     * k or m out of range, a shared volume, min_isr below m (mutant minisrone gives every EC volume min_isr 1) */
+    uint32_t dup[6] = {2, 3, 4, 5, 6, 2}, unk[6] = {2, 3, 4, 5, 6, 9}, out[6] = {2, 3, 4, 5, 6, 8};
+    uint32_t g20[20], g5[5] = {2, 3, 4, 5, 6};
+    for (uint32_t i = 0; i < 20; i++)
+        g20[i] = i + 1;
+    ec_add(&e, 0, "e0", 2, log3, 3, META_VOL_REPLICATED, 4, 2, dup, 6);
+    ec_add(&e, 1, "e1", 2, log3, 3, META_VOL_REPLICATED, 4, 2, unk, 6);
+    ec_add(&e, 2, "e2", 2, log3, 3, META_VOL_REPLICATED, 4, 2, out, 6);
+    ec_add(&e, 3, "e3", 2, log3, 3, META_VOL_REPLICATED, 4, 2, g5, 5);
+    ec_add(&e, 4, "e4", 2, log3, 3, META_VOL_REPLICATED, 0, 2, g20, 2);
+    ec_add(&e, 5, "e5", 2, log3, 3, META_VOL_REPLICATED, 17, 3, g20, 20);
+    ec_add(&e, 6, "e6", 2, log3, 3, META_VOL_SHARED, 4, 2, g6, 6);
+    ec_add(&e, 7, "e7", 1, log3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+    CHECK(apply1(&m, &e, res, 16) == META_OK);
+    for (int i = 0; i < 8; i++)
+        CHECK(res[i] == META_ERR_INVALID);
+    CHECK(m.nvolumes == 0);
+
+    /* taken: the group is the body's (mutant stripeatapply takes this copy's first members), version 1, min_isr as
+     * given; a 1-replica EC volume (TSDB_CLUSTER_WRITES) has min_isr 1 */
+    meta_copy(&prev, &m);
+    uint32_t one[1] = {4};
+    ec_add(&e, 0, "e0", 2, log3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+    ec_add(&e, 1, "e1", 1, one, 1, META_VOL_REPLICATED, 2, 1, g6 + 3, 3);
+    vol_add(&e, META_VOL_REPLICATED, 2, "r2", 1, log3, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    const struct meta_volume *v0 = meta_volume(&m, 0), *v1 = meta_volume(&m, 1), *r2 = meta_volume(&m, 2);
+    CHECK(v0 && v0->redundancy == META_RED_EC && v0->ec_k == 4 && v0->ec_m == 2 && v0->nstripe == 6 &&
+          memcmp(v0->stripe, g6, sizeof g6) == 0 && v0->stripe_version == 1 && !v0->gc_suspended && !v0->gc_gen &&
+          v0->min_isr == 2);
+    CHECK(v1 && v1->nstripe == 3 && v1->stripe[0] == 5 && v1->stripe[2] == 7 && v1->min_isr == 1);
+    CHECK(r2 && r2->redundancy == META_RED_REPLICAS && !r2->nstripe && !r2->stripe_version);
+    /* a REPLICA_REMOVE that would leave fewer replicas than min_isr is refused */
+    meta_op_replica_remove(&e, 0, 1, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && meta_volume(&m, 0)->nrep == 3);
+
+    /* STRIPE_SET: stale version, a position past the group, a node already in it, an out or unknown node, a
+     * replicas volume: refused; else one position moves and the version goes up by one (mutant stripeuncond takes a
+     * stale one) */
+    meta_op_stripe_set(&e, 0, 1, 1, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    meta_op_stripe_set(&e, 0, 1, 1, 2);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_STALE);
+    meta_op_stripe_set(&e, 0, 6, 1, 1);
+    meta_op_stripe_set(&e, 0, 1, 4, 1);
+    meta_op_stripe_set(&e, 0, 1, 8, 1);
+    meta_op_stripe_set(&e, 0, 1, 9, 1);
+    meta_op_stripe_set(&e, 2, 0, 4, 0);
+    meta_op_stripe_set(&e, 9, 0, 4, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_INVALID && res[3] == META_ERR_INVALID && res[4] == META_ERR_INVALID &&
+          res[5] == META_ERR_NOTFOUND);
+    CHECK(meta_volume(&m, 0)->stripe_version == 1 && memcmp(meta_volume(&m, 0)->stripe, g6, sizeof g6) == 0);
+    meta_copy(&prev, &m);
+    meta_op_stripe_set(&e, 0, 1, 1, 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    v0 = meta_volume(&m, 0);
+    CHECK(v0->stripe[1] == 1 && v0->stripe[0] == 2 && v0->stripe[2] == 4 && v0->stripe_version == 2);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    meta_op_stripe_set(&e, 0, 1, 1, 2); /* the same node again: the version still moves */
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->stripe_version == 3);
+
+    /* the checker: a position moved without a bump, two positions in one bump, the version back, a repeated node */
+    {
+        struct meta_state bad;
+        meta_copy(&bad, &m);
+        struct meta_volume *bv = (struct meta_volume *)meta_volume(&bad, 0);
+        bv->stripe[3] = 1;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        bv->stripe[3] = 6;
+        bv->stripe[4] = 3;
+        bv->stripe[5] = 8;
+        bv->stripe_version++;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        bv->stripe[4] = 6;
+        bv->stripe[5] = 7;
+        bv->stripe_version -= 2;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        bv->stripe_version += 1;
+        bv->gc_suspended = 0;
+        bv->min_isr = 4; /* more than its replicas */
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+    }
+
+    /* GC_SUSPEND and GC_RESUME: INVALID on a replicas volume, NOTFOUND on none; a suspend is idempotent and shares
+     * an entry with a touch of the volume, a resume clears it and raises gc_gen */
+    meta_op_gc_suspend(&e, 2);
+    meta_op_gc_resume(&e, 2);
+    meta_op_gc_suspend(&e, 9);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_ERR_INVALID &&
+          res[2] == META_ERR_NOTFOUND);
+    meta_copy(&prev, &m);
+    meta_op_gc_suspend(&e, 0);
+    meta_op_gc_suspend(&e, 0);
+    meta_op_stripe_set(&e, 0, 1, 1, 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK &&
+          meta_volume(&m, 0)->gc_suspended && meta_volume(&m, 0)->stripe_version == 4);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    {
+        struct meta_state bad;
+        meta_copy(&bad, &m);
+        ((struct meta_volume *)meta_volume(&bad, 0))->gc_suspended = 0; /* cleared by anything but a resume */
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+    }
+    meta_copy(&prev, &m);
+    meta_op_gc_resume(&e, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && !meta_volume(&m, 0)->gc_suspended &&
+          meta_volume(&m, 0)->gc_gen == 1);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+
+    /* force-leader: GC_SUSPEND with the ISR_CHANGE that adds the node, in one entry (mutant forcenosuspend); a
+     * replicas volume gets the ISR_CHANGE alone */
+    uint32_t lead[1] = {1};
+    isr_chg(&e, meta_volume(&m, 0), meta_volume(&m, 0)->epoch, meta_volume(&m, 0)->isr_version, lead, 1, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->nisr == 1);
+    isr_chg(&e, meta_volume(&m, 2), meta_volume(&m, 2)->epoch, meta_volume(&m, 2)->isr_version, lead, 1, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+    meta_op_volume_force(&e, meta_volume(&m, 0), 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+    CHECK(meta_volume(&m, 0)->gc_suspended && meta_volume(&m, 0)->nisr == 2 &&
+          meta_volume_in_isr(meta_volume(&m, 0), 3));
+    meta_op_volume_force(&e, meta_volume(&m, 2), 3);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 2)->nisr == 2 &&
+          !meta_volume(&m, 2)->gc_suspended);
+    meta_op_gc_resume(&e, 0);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->gc_gen == 2);
+
+    /* RESTORE suspends every EC volume (mutant gcresumeany: a promotion clears it) */
+    meta_copy(&prev, &m);
+    meta_op_restore(&e, m.restore_gen + 1);
+    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->gc_suspended &&
+          meta_volume(&m, 1)->gc_suspended && !meta_volume(&m, 2)->gc_suspended);
+    CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+    meta_free(&prev);
+    {
+        const struct meta_volume *v = meta_volume(&m, 0);
+        uint32_t fenced[2] = {2, 3}, answer[1] = {3};
+        promo(&e, v, v->epoch, 3, fenced, 2, answer, 1, 20);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, 0)->leader == 3);
+        CHECK(meta_volume(&m, 0)->gc_suspended);
+    }
+
+    /* the snapshot: every EC field back */
+    {
+        uint8_t *img;
+        size_t len;
+        meta_snapshot_encode(&m, &img, &len);
+        struct meta_state back;
+        meta_init(&back);
+        CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
+        const struct meta_volume *a = meta_volume(&m, 0), *b = meta_volume(&back, 0);
+        CHECK(b && b->redundancy == META_RED_EC && b->ec_k == 4 && b->ec_m == 2 && b->nstripe == 6 &&
+              memcmp(a->stripe, b->stripe, sizeof a->stripe) == 0 && b->stripe_version == a->stripe_version &&
+              b->gc_suspended == 1 && b->gc_gen == 2 && meta_volume(&back, 1)->gc_suspended &&
+              meta_volume(&back, 2)->redundancy == META_RED_REPLICAS);
+        meta_free(&back);
+        free(img);
+    }
+
+    /* an entry of a build of snapshot version 5 ("TME2") is named as older and refused */
+    {
+        meta_op_gc_resume(&e, 0);
+        meta_entry_finish(&e);
+        uint64_t h = meta_hash(&m);
+        memcpy(e.buf, "TME2", 4);
+        CHECK(meta_entry_older(e.buf, e.len));
+        CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
+        meta_entry_free(&e);
+        meta_entry_init(&e);
+    }
+    meta_entry_free(&e);
+    meta_free(&m);
+}
+
 static void test_shared(void)
 {
     struct meta_state m, prev;
@@ -2189,8 +2418,34 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
             sim_fail(s, "node %u, index %" PRIu64 ": REPLICA_RESET of node %u on volume %u was applied wrongly", nd->id,
                      index, node, number);
     }
+    if (kind == META_OP_VOLUME_ADD) { /* an EC volume's stripe group is the body's, never apply's own pick */
+        const struct meta_volume *v = meta_volume(at, number);
+        if (v && v->redundancy == META_RED_EC) {
+            size_t ns = v->nstripe, st = n - 4 * ns;
+            int same = n >= 4 * ns + 7 && rd32(b + st - 4) == ns && b[st - 7] == META_RED_EC;
+            for (size_t i = 0; same && i < ns; i++)
+                same = rd32(b + st + 4 * i) == v->stripe[i];
+            if (!same)
+                sim_fail(s, "node %u, index %" PRIu64 ": EC volume %u's stripe group is not the one VOLUME_ADD named",
+                         nd->id, index, number);
+        }
+    }
+    if (kind == META_OP_STRIPE_SET && n >= 20) {
+        const struct meta_volume *a = meta_volume(pre, number), *v = meta_volume(at, number);
+        uint32_t pos = rd32(b + 4);
+        if (!a || !v || a->stripe_version != rd64(b + 12) || v->stripe_version != a->stripe_version + 1 ||
+            pos >= v->nstripe || v->stripe[pos] != rd32(b + 8))
+            sim_fail(s, "node %u, index %" PRIu64 ": STRIPE_SET of volume %u named stripe version %" PRIu64
+                     " (the volume's: %" PRIu64 ") and was applied wrongly", nd->id, index, number, rd64(b + 12),
+                     a ? a->stripe_version : 0);
+    }
+    if (kind == META_OP_GC_SUSPEND && !(meta_volume(at, number) && meta_volume(at, number)->gc_suspended))
+        sim_fail(s, "node %u, index %" PRIu64 ": GC_SUSPEND of volume %u left orphan collection on", nd->id, index,
+                 number);
     char why[256];
-    if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE) &&
+    if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE || kind == META_OP_VOLUME_ADD ||
+         kind == META_OP_STRIPE_SET || kind == META_OP_GC_SUSPEND || kind == META_OP_GC_RESUME ||
+         kind == META_OP_RESTORE) &&
         meta_check_step(pre, at, why, sizeof why))
         sim_fail(s, "node %u, index %" PRIu64 ", op %u (kind %u) on its own: %s", nd->id, index, k, kind, why);
 }
@@ -2615,7 +2870,31 @@ static void propose(struct msim *s, struct snode *nd)
             }
             char name[16];
             snprintf(name, sizeof name, "v%u", m->next_volume);
-            vol_add(&e, rnd(s, 0, 15) == 0 ? 3 - m->mode : m->mode, m->next_volume, name, 1, nodes, 3);
+            if (rnd(s, 0, 2) == 0 && m->nmembers >= 3) {
+                /* erasure coded (R8): the proposer's pick of k + m distinct members, sometimes a bad one (a node
+                 * twice, an unknown node, too few positions), min_isr as cluster.c gives it, sometimes one below m */
+                uint8_t mm = (uint8_t)rnd(s, 1, 2), k = (uint8_t)rnd(s, 1, 4);
+                if (k + mm > m->nmembers)
+                    k = (uint8_t)(m->nmembers - mm);
+                uint32_t stripe[META_STRIPE_MAX], ns = 0;
+                while (ns < (uint32_t)k + mm) {
+                    uint32_t id = m->members[rnd(s, 0, m->nmembers - 1)].id;
+                    if (!has_id_local(stripe, ns, id))
+                        stripe[ns++] = id;
+                }
+                unsigned bad = (unsigned)rnd(s, 0, 23);
+                if (bad == 0 && ns > 1)
+                    stripe[ns - 1] = stripe[0];
+                else if (bad == 1)
+                    stripe[0] = m->next_member + 5;
+                else if (bad == 2)
+                    ns--;
+                uint32_t min_isr = meta_volume_min_isr(META_RED_EC, mm, 3, 1) - (bad == 3 && mm > 1);
+                ec_add(&e, m->next_volume, name, min_isr, nodes, 3, rnd(s, 0, 15) == 0 ? 3 - m->mode : m->mode, k, mm,
+                       stripe, ns);
+            } else {
+                vol_add(&e, rnd(s, 0, 15) == 0 ? 3 - m->mode : m->mode, m->next_volume, name, 1, nodes, 3);
+            }
         } else if (what == 2 && v) {
             uint64_t epoch = v->epoch - (stale && v->epoch > 1);
             if (!shared) {
@@ -2778,6 +3057,19 @@ static void propose(struct msim *s, struct snode *nd)
                 meta_op_domain_state(&e, name, (int)rnd(s, 0, 2));
             else
                 meta_op_restore(&e, m->restore_gen + rnd(s, 0, 1));
+        } else if (what == 12 && v && v->redundancy == META_RED_EC) {
+            unsigned how = (unsigned)rnd(s, 0, 5);
+            if (how <= 2) { /* a position to any member, at the version this copy has (stale by apply, often) */
+                uint32_t node = m->members[rnd(s, 0, m->nmembers - 1)].id;
+                meta_op_stripe_set(&e, v->number, (uint32_t)rnd(s, 0, v->nstripe), node,
+                                   v->stripe_version - (rnd(s, 0, 7) == 0));
+            } else if (how == 3) { /* force-leader: a replica outside the ISR into it, orphan collection off */
+                meta_op_volume_force(&e, v, v->rep[rnd(s, 0, v->nrep - 1)].node);
+            } else if (how == 4) {
+                meta_op_gc_resume(&e, v->number);
+            } else {
+                meta_op_gc_suspend(&e, v->number);
+            }
         } else if (what == 11 && rnd(s, 0, 5) == 0) {
             meta_op_name_group(&e);
         } else {
@@ -3090,6 +3382,7 @@ int main(int argc, char **argv)
     if (!sim_only) {
         test_state_machine();
         test_replica_set();
+        test_ec();
         test_shared();
         test_users();
         test_users_limits();
