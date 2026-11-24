@@ -63,6 +63,7 @@ data of `tools/datasets.h`) is ours.
 |---|---|---|---|
 | zstd (libzstd) | 1.5.7 | BSD-3-Clause (the Zstandard license is a "BSD License"; it is also offered under GPL-2.0, tsdb uses the BSD terms) | `make`: linked from the system, dynamically. `make dist`: **linked statically** into `tsdbd`, `tsdb`, the benchmarks and the tests (`ZSTD_LIB=-l:libzstd.a`). |
 | liburing | 2.14 | MIT (dual licensed LGPL-2.1 or MIT; tsdb uses the MIT terms) | the server only. `make`: dynamically. `make dist`: **linked statically** (`URING_LIB=-l:liburing.a`). Not used with `NO_URING=1`. |
+| xxHash (`xxhash.h`) | 0.8.3 | BSD-2-Clause | an unchanged copy in `server/xxhash/` (`UPSTREAM`), compiled inline (`XXH_INLINE_ALL`) into `tsdbd`, `tsdb` and the tests: XXH3-128, the cluster's data-link frame check (`server/plcheck.h`). Its notice is in `THIRD-PARTY-NOTICES`. |
 | libgcc | the compiler's | GPL-3.0 with the GCC Runtime Library Exception | `make dist` links it statically (`-static-libgcc`). The exception allows this for programs under any license. |
 | glibc | 2.34 or newer | LGPL-2.1-or-later | linked dynamically, taken from the machine the program runs on; not shipped. |
 | Linux kernel headers (`io_uring.h` via liburing) | | GPL-2.0 with the Linux-syscall-note, or MIT | the syscall note allows user programs under any license. |
@@ -74,7 +75,8 @@ GPL-2.0, which would not combine with the AGPL-3.0; the BSD terms do), liburing 
 Library Exception and glibc by dynamic linking, so each can be linked into AGPL and Apache-2.0 programs alike.
 
 **What ships with the tarball** (`make dist`, `tools/mkdist.sh`): `LICENSE` (the AGPL-3.0), `LICENSES/Apache-2.0.txt`,
-`LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES` (the texts of the zstd and liburing licenses and the libgcc remark)
+`LICENSING.md`, `NOTICE` and `THIRD-PARTY-NOTICES` (the texts of the zstd, liburing and xxHash licenses and the libgcc
+remark)
 at its top level. `tests/distro/dist-check.sh` checks that they are there.
 
 ## Rust: `client/rust`, `client/rust-sys`, `client/rust-embedded`, `client/python`, `client/python-embedded`, `tests/integration/rust`

@@ -40,6 +40,8 @@ fi
 is_source() {
     case $1 in
     tests/fuzz/corpus/* | tests/fuzz/frames/* | */tests/fixtures/* | */target/* | */csrc/*) return 1 ;;
+    tools/blake3/*) return 1 ;; # third-party copies, unchanged: their licence is in tools/blake3/UPSTREAM
+    server/xxhash/*) return 1 ;; # xxHash's xxhash.h, unchanged: BSD-2-Clause, server/xxhash/UPSTREAM
     *.c | *.h | *.inc | *.rs | *.java | *.js | *.mjs | *.py | *.pyi | *.sh) return 0 ;;
     *.* ) return 1 ;;
     esac

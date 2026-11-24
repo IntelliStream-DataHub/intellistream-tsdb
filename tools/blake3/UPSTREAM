@@ -1,0 +1,14 @@
+repository: https://github.com/BLAKE3-team/BLAKE3, directory c
+tag: 1.8.2 (archive refs/tags/1.8.2.tar.gz, sha256 6b51aefe515969785da02e87befafc7fdc7a065cd3458cf1141f29267749e81f)
+files: blake3.h blake3.c blake3_impl.h blake3_dispatch.c blake3_portable.c blake3_sse2.c blake3_sse41.c blake3_avx2.c blake3_avx512.c LICENSE_A2 LICENSE_CC0
+license: CC0-1.0 OR Apache-2.0 (the upstream's choice of either; LICENSE_CC0, LICENSE_A2); unchanged copies, never edit them.
+used by: tools/link-bench (link-bench mac: the keyed BLAKE3 candidate of docs/design-rdma.md §6), not by tsdbd.
+sha256 blake3.h: ca1e562d173c264c19b2a89d179f5fa94000966b6b8f4182b6682e136a8cbfdf
+sha256 blake3.c: 0cd1d6aa002ac44cbf0b0cff5d3f23df3fd190fdc25dfc6d7f3de2afeffba5bd
+sha256 blake3_impl.h: 65cf3597897090e8ded5968e3c26304a65b0091e8fabfa434c3d1a5eef29cb17
+sha256 blake3_dispatch.c: a6cef5c497d95c8f7fcde6e1a8e140637f3260b31e911319e69cf5069459b635
+sha256 blake3_portable.c: 2bc25b0dad67b4329d0b49cfa075ab2b0d04e424addbddc4e9c389c52a192524
+sha256 blake3_sse2.c: 51194fff1b0e9cb79f4db6fc148a3b34f683ca6ec3a260d66166e0f7d5b7012e
+sha256 blake3_sse41.c: 1f38e2ca58aa59af094f492f1326957b423d7a25e32daaae159fcc1966949f58
+sha256 blake3_avx2.c: 8b3516a8e42d981a9868ef670b1698f6d10207283086bd810b11cdaac1aca8f1
+sha256 blake3_avx512.c: 46653e718211d883e56d5caa9ded6d9450f2f5b44ebfa81372b3c0be538e9e3c

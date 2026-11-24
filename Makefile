@@ -61,6 +61,8 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
 FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
+# the data links' frame check: inline XXH3 (server/plcheck.h, server/xxhash); whoever includes it depends on both
+PLCHECK_HDR := server/plcheck.h server/xxhash/xxhash.h
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -514,7 +516,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -576,7 +578,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h server/replwire.h server/fwd.h server/chunksrv.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h $(PLCHECK_HDR) server/replwire.h server/fwd.h server/chunksrv.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -902,8 +904,9 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 # includes tsdbd.c, and the CLI
 $(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
-# the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
-$(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
+# the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
+# frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
+$(B)/peerlink.o: server/peerlink.c server/peerlink.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
 # the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
 # it), tsdbd's instance over the cluster's member list in fwd_cluster.o
@@ -943,7 +946,7 @@ $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HD
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the entry node's rules over a fake link (no sockets, no tsdbd)
 $(B)/test_fwd: tests/test_fwd.c server/fwdreq.h server/fwd.h server/peerlink.h $(B)/fwdreq.o
@@ -1098,8 +1101,31 @@ $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 
 # what a stream link costs for peerlink-shaped frames (TCP, or rsocket through a dlopen of librdmacm with --rsocket;
 # tools/rdma-bench.sh, docs/design-rdma.md): no engine, and librdmacm is not linked
-$(B)/link-bench: tools/link-bench.c $(B)/tsdb_crypto.o
-	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_crypto.o -ldl
+# The MAC candidates (tools/mac_cands.c, docs/design-rdma.md 6) with BLAKE3's reference C (tools/blake3, UPSTREAM): its
+# kernels are built with their own -m flags and picked by its own cpuid dispatch (bench only, never in tsdbd). Their
+# objects go in $(B)/b3/: tools/check-isa.sh reads every $(B)/*.o of make dist, and these are in no shipped file.
+B3_SRC = tools/blake3/blake3.c tools/blake3/blake3_dispatch.c tools/blake3/blake3_portable.c
+ifeq ($(shell uname -m),x86_64)
+B3_OBJ = $(B)/b3/blake3_sse2.o $(B)/b3/blake3_sse41.o $(B)/b3/blake3_avx2.o $(B)/b3/blake3_avx512.o
+B3_DEF =
+else
+B3_OBJ =
+B3_DEF = -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0
+endif
+$(B)/b3/blake3_sse2.o: tools/blake3/blake3_sse2.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
+	$(CC) -O3 -msse2 -c -o $@ $<
+$(B)/b3/blake3_sse41.o: tools/blake3/blake3_sse41.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
+	$(CC) -O3 -msse4.1 -c -o $@ $<
+$(B)/b3/blake3_avx2.o: tools/blake3/blake3_avx2.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
+	$(CC) -O3 -mavx2 -c -o $@ $<
+$(B)/b3/blake3_avx512.o: tools/blake3/blake3_avx512.c tools/blake3/blake3_impl.h | $(B)
+	@mkdir -p $(@D)
+	$(CC) -O3 -mavx512f -mavx512vl -c -o $@ $<
+$(B)/link-bench: tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h $(PLCHECK_HDR) $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) $(B3_DEF) -o $@ $< tools/mac_cands.c $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o -ldl
 
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)

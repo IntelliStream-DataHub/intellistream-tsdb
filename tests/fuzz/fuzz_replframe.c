@@ -22,12 +22,12 @@
 #include "fuzz.h"
 #include "internal.h"
 #include "peerlink.h"
+#include "plcheck.h"
 #include "replwire.h"
 #include "fwd.h"
 #include "chunksrv.h"
 
-static const uint8_t KEY[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-                                17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
+static const uint64_t SALT = 0x0102030405060708ull; /* a direction's salt (plcheck.h) */
 
 struct cnt {
     size_t frames;
@@ -92,7 +92,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(p, data + 2, n);
     struct cnt c = {0, p, p + n};
     if (mode == 0) {
-        struct pl_reader *r = pl_reader_new(KEY, 1);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, SALT, 1);
         size_t step = (size_t)arg + 1;
         for (size_t off = 0; off < n; off += step)
             if (pl_reader_feed(r, p + off, n - off < step ? n - off : step, on_msg, &c) != 0)
@@ -108,10 +108,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uint8_t type = (uint8_t)(1 + arg % PL_USER_TYPE_MAX);
         uint64_t seq = 0;
         uint8_t *fr;
-        size_t fl = pl_frame_encode(KEY, &seq, 1, type, p, n, &fr);
+        size_t fl = pl_frame_encode(PL_CHECK_XXH3, SALT, &seq, 1, type, p, n, &fr);
         if (!fl)
             abort();
-        struct pl_reader *r = pl_reader_new(KEY, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, SALT, 0);
         struct pl_msg got = {0};
         struct grab box = {&got, NULL};
         if (pl_reader_feed(r, fr, fl, grab_msg, &box) != 0 || !box.copy || got.type != type || got.n != n ||
@@ -123,7 +123,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             uint8_t *bad = malloc(fl);
             memcpy(bad, fr, fl);
             bad[fl - 1 - i] ^= 1;
-            struct pl_reader *r2 = pl_reader_new(KEY, 0);
+            struct pl_reader *r2 = pl_reader_new(PL_CHECK_XXH3, SALT, 0);
             struct cnt c2 = {0, NULL, NULL};
             if (pl_reader_feed(r2, bad, fl, on_msg, &c2) == 0 && c2.frames)
                 abort();
@@ -287,11 +287,11 @@ void fuzz_seeds(const char *dir)
     /* a compressed user frame: raw length 300, then a zstd frame (the round trip makes real ones) */
     uint8_t z[64] = {44, 1, 0, 0, 0x28, 0xb5, 0x2f, 0xfd};
     put_frame(dir, "seed-zstd-bad", 1, 0x80 | 5, z, sizeof z);
-    /* a stream of two frames, no tags checked: len 33 (type + 32 tag bytes), type PING; then a user frame */
+    /* a stream of two frames, no checks verified: len 17 (type + 16 check bytes), type PING; then a user frame */
     uint8_t s[200] = {0};
-    le(s, 33, 4), s[4] = PLT_PING;
-    le(s + 37, 38, 4), s[41] = 9, memset(s + 42, 0x55, 5);
-    put_frame(dir, "seed-stream", 0, 7, s, 37 + 4 + 38);
+    le(s, 1 + PL_CHECK_LEN, 4), s[4] = PLT_PING;
+    le(s + 21, 6 + PL_CHECK_LEN, 4), s[25] = 9, memset(s + 26, 0x55, 5);
+    put_frame(dir, "seed-stream", 0, 7, s, 21 + 4 + 6 + PL_CHECK_LEN);
     uint8_t text[300];
     for (size_t i = 0; i < sizeof text; i++)
         text[i] = (uint8_t)("tsdb log frame "[i % 15]);
@@ -299,9 +299,10 @@ void fuzz_seeds(const char *dir)
     put_frame(dir, "seed-roundtrip-small", 2, 1, "x", 1);
     uint8_t h[80] = {0};
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
-    put_frame(dir, "seed-hello", 3, 0, h, 76);
+    h[76] = PL_CHECKS_KNOWN;
+    put_frame(dir, "seed-hello", 3, 0, h, 77);
     h[75] = PL_KIND_FWDQ;
-    put_frame(dir, "seed-hello-fwdq", 3, 0, h, 76);
+    put_frame(dir, "seed-hello-fwdq", 3, 0, h, 77);
     /* the forwarding payloads (mode 8; arg: bit 0 FWDQ, bits 1-2 the type) */
     uint8_t fw[32] = {0};
     fwd_wire_credit(fw, 0x1122334455667788ull, 4);
