@@ -12248,7 +12248,7 @@ static uint64_t slow_until_switch(tsdbc *c, tsdb_sid id, int64_t *day, uint64_t 
         (*day)++;
         if (join && !*join && isr_of(0, "plant", NULL) == nisr)
             *join = now_ms() - t0 + !(now_ms() - t0);
-            if (classes_size(L) > s0)
+        if (classes_size(L) > s0)
             return now_ms() - t0;
         if (now_ms() - t0 > (uint64_t)ms)
             die("the slow series got no class of its own in %d ms (CLASSES of server %d: %lld bytes)", ms, L,
@@ -12481,6 +12481,17 @@ static void scen_removereplica(void)
     rows += set_write(c, id, &t, 2, 0);
     if ((uint64_t)rows_of(c, id) != rows)
         die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    { /* a client of the removed server: its engine is closed, so a read there is route_decide's from the copy (MOVED
+       * to the leader here, the servers run --forward off; forwarded with it on), never NOTFOUND and never an answer
+       * from the old replica's rows (cvolset_mgr.c's header) */
+        tsdbc *cr = client(R);
+        nrows = 0;
+        int rc = tsdbc_query_raw(cr, id, 0, INT64_MAX / 2, count_rows, NULL);
+        expect_moved(cr, rc, 1, ids[L], L, "a read through the removed server");
+        if (nrows != 0)
+            die("a read through the removed server %d delivered %d rows before its MOVED", R, nrows);
+        tsdbc_close(cr);
+    }
     tsdbc_close(c);
     stop_all();
     uint64_t want[REP_NAMES] = {rows, 0, 0, 0};
