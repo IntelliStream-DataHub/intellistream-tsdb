@@ -256,7 +256,8 @@ $(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
 # The replication core (src/repl.c, sans-IO) under its simulator (docs/design-cluster.md §13.1). sim_repl_mut has
-# the planted bugs (MUT() in repl.c) that tests/sim_repl.sh checks the checker catches.
+# the planted bugs (MUT() in repl.c, SMUT() in its own transfer model) that tests/sim_repl.sh checks the checker
+# catches.
 $(B)/sim_repl: tests/sim_repl.c src/repl.c src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/sim_repl.c src/repl.c
 

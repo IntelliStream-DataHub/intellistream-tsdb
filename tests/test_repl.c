@@ -36,9 +36,14 @@
  *   target      a planned promotion picks its target or nobody (MUT(50): the lowest index won a tie), and no reply is
  *               left `unanswered`.
  *   replay      the replay start (D17) in ACKs, an empty log's "nothing to replay", and the floor with a snapshot
- *               notice outstanding (MUT(46): the leader's own replay start only).
+ *               notice outstanding (MUT(46): the leader's own replay start only); a reordered ACK of an empty log
+ *               is not taken once a start was heard (MUT(58)), a lower start after an install is (replay_floor).
  *   snapshot    a fresh learner whose first position is not retained gets the notice; a snapshot is wanted only above
  *               the log end (MUT(47)); an install at P with log start S <= P + 1 opens, and its ACK stops the notice.
+ *   peer_match  what a planned transfer's drain (D14) reads of its target: the durable end acknowledged as the instance
+ *               the record names, the leader's own durable end for itself, 0 for an index outside the set and for a
+ *               member whose ACKs come from another instance (a wiped disk copied again must not pass for the drained
+ *               target: its match was earned by a log the promotion may not find).
  */
 #include "repl.h"
 
@@ -796,6 +801,21 @@ static void replay_floor(void)
     repl_recv(r, &k0);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 ", not node 2's start 30", repl_replay_floor(r));
+    /* node 2's ACK from before it held anything (an empty log: replay 0), reordered behind the one above: node 2 still
+     * replays from 30 (MUT(58): the floor rose to the leader's start 50) */
+    struct repl_msg stale = {.type = REPL_M_ACK, .from = 2, .to = 1, .epoch = 2, .leader = -1, .rid = 33, .start = 1};
+    repl_recv(r, &stale);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 " after a stale ACK of node 2, which replays from 30",
+          repl_replay_floor(r));
+    /* node 2 installed a snapshot under the same rid: its segments start at 20, below the 30 it said before, and the
+     * floor follows it down (a rule that only raised a rid's replay start kept 30: sim_repl seed 46150) */
+    struct repl_msg inst = k2;
+    inst.start = inst.replay = 20;
+    repl_recv(r, &inst);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 20, "floor %" PRIu64 " after node 2 installed segments from 20",
+          repl_replay_floor(r));
     k2.start = k2.replay = 60; /* node 2 removed segments: the leader's own start is now the lowest */
     repl_recv(r, &k2);
     drain(r, &d, NULL);
@@ -826,6 +846,35 @@ static struct repl_msg ack_msg(int from, int to, uint64_t end, uint64_t rid, uin
 {
     return (struct repl_msg){.type = REPL_M_ACK, .from = from, .to = to, .epoch = 2, .leader = -1, .durable = end,
                              .written = end, .rid = rid, .start = 1, .replay = replay, .set_version = setv};
+}
+
+static void peer_match(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* node 0 leads epoch 2, ISR {0, 2} (rid 33); node 1 a learner; all at 101 */
+    CHECK(r && repl_is_leader(r), "no leader");
+    CHECK(repl_peer_match(r, 0) == repl_durable_end(r) && repl_peer_match(r, 0) == 101, "own index: %" PRIu64,
+          repl_peer_match(r, 0));
+    CHECK(repl_peer_match(r, 2) == 101, "ISR member 2: %" PRIu64, repl_peer_match(r, 2));
+    CHECK(repl_peer_match(r, -1) == 0 && repl_peer_match(r, 3) == 0 && repl_peer_match(r, REPL_MAX_NODES - 1) == 0,
+          "an index outside the set");
+    /* node 2's disk is lost and its log copied again: a new instance acknowledges the whole log */
+    struct repl_msg k = ack_msg(2, 0, 101, 99, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 0, "member 2 as another instance than the record's: %" PRIu64,
+          repl_peer_match(r, 2));
+    k = ack_msg(2, 0, 101, 33, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 101, "member 2 as the record's instance again: %" PRIu64, repl_peer_match(r, 2));
+    /* a follower answers 0 for everyone */
+    struct repl_msg m = meta_msg(0, 3, 1, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    CHECK(!repl_is_leader(r) && repl_peer_match(r, 0) == 0 && repl_peer_match(r, 2) == 0, "a follower");
+    repl_free(r);
 }
 
 static void reconfig(void)
@@ -1313,6 +1362,7 @@ int main(int argc, char **argv)
     steady_join();
     join_giveup();
     reconfig();
+    peer_match();
     hold();
     unans_remap();
     join_remap();
