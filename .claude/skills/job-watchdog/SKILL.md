@@ -62,10 +62,14 @@ A job on the build machine (`(build machine)` in watchdog.sh's line; its run dir
 first, then the local copier, which writes rc 143:
 
 ```sh
-rg=$(cat $SE_HOME/runs/NAME/rpgid); [ "$rg" -gt 1 ] && ssh "$SE_REMOTE" "kill -TERM -- -$rg"   # SE_REMOTE from config.sh
+rg=$(cat $SE_HOME/runs/NAME/rpgid); [ "$rg" -gt 1 ] && ssh "$(cat $SE_HOME/runs/NAME/host)" "kill -TERM -- -$rg"
 ```
 
-A `LOOK remote orphan` line is stopped there by its single pid (`ssh "$SE_REMOTE" kill PID`), under the same rule as a
+(`runs/NAME/host` is the host bgrun.sh picked; with one `SE_REMOTE` the file holds it too, and watchdog.sh's line says
+`(build machine HOST)` only with a fleet, `SE_REMOTES`. A job from before the fleet has no `host` file: `SE_REMOTE`.)
+
+A `LOOK remote orphan` line (with a fleet it ends in `on HOST`: every host is asked) is stopped there by its single pid
+(`ssh HOST kill PID`, HOST from the line, else `SE_REMOTE`), under the same rule as a
 local orphan; a tsdbd stuck in its shutdown may need `kill -KILL PID`.
 
 An orphaned lock holder (a leftover tsdbd from a killed test, parent pid 1): stop that single pid after checking its

@@ -460,7 +460,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `killall`, `kill` with pid -1 or 0, `docker`) and `hooks/guard-push.sh` (refuses a push while unpushed
   commits carry a session link, or match a line of a private pattern file kept outside the repository,
   `~/.config/claude-private-patterns`: internal hosts and the like never reach GitHub); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
-  with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints;
+  with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints; build machines: one `SE_REMOTE`, or a fleet
+  `SE_REMOTES="user@hostA:3 user@hostB:8:tag"` in its config.sh that bgrun.sh picks a free slot from, `make test-se-fleet`;
   copy it to `~/.claude/skills/` to use it in other projects); `skills/jepsen-review/` is the adversarial
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
   evidence); `skills/job-watchdog/` (with `agents/job-watchdog.md` and `subagent-economy/scripts/watchdog.sh`) checks the detached jobs hourly for ones that died or hang, stops a hung one by its own process group, fixes harness causes and reruns it; `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored

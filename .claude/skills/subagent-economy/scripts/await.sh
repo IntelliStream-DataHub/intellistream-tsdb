@@ -1,10 +1,12 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # await.sh NAME [MAX_SECONDS=540]: block up to MAX_SECONDS (keep it under the 10 minute tool cap) for a bgrun.sh job.
+# With a fleet (SE_REMOTES) the host the job runs on (runs/NAME/host) is named in the status: its build dirs are there (rx.sh -j NAME).
 # Prints ONE short status, never the whole output. Exit 0 = finished (rc printed), 10 = still running, 11 = unknown/died.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"
 n=$1; max=${2:-540}; se_name_ok "$n" 11; d=$RUNS/$n
 [ -d "$d" ] || { echo "await: no job $n in $RUNS"; exit 11; }
+hl=; [ ${#SE_FH[@]} -gt 1 ] && [ -s $d/host ] && hl=" on $(cat $d/host)"
 t0=$(date +%s)
 while [ ! -e $d/rc ] && [ $(( $(date +%s) - t0 )) -lt "$max" ]; do
   kill -0 "$(cat $d/pid 2>/dev/null)" 2>/dev/null || [ -e $d/rc ] || { sleep 2; [ -e $d/rc ] || { echo "await: $n died without an exit code; last lines:"; tail -n 15 $d/out; exit 11; }; }
@@ -29,13 +31,13 @@ if [ -e $d/rc ]; then
       [ "$got" = yes ] && break
     fi
     if [ $(( $(date +%s) - t0 )) -ge "$max" ]; then
-      echo "RUNNING $n: finished (rc=$(cat $d/rc)) but HELD by the usage gate ($g): $("$G")"; exit 10
+      echo "RUNNING $n$hl: finished (rc=$(cat $d/rc)) but HELD by the usage gate ($g): $("$G")"; exit 10
     fi
     timeout 20 tail -f /dev/null
   done
 fi
 el=$(( ($(date +%s) - $(cat $d/start)) / 60 ))
 if [ -e $d/rc ]; then
-  echo "DONE $n rc=$(cat $d/rc) after ${el} min; output $d/out ($(wc -l < $d/out) lines); last 12:"; tail -n 12 $d/out | cut -c1-200; exit 0
+  echo "DONE $n$hl rc=$(cat $d/rc) after ${el} min; output $d/out ($(wc -l < $d/out) lines); last 12:"; tail -n 12 $d/out | cut -c1-200; exit 0
 fi
-echo "RUNNING $n ${el} min; output $(wc -l < $d/out) lines; last line: $(tail -n 1 $d/out | cut -c1-160)"; exit 10
+echo "RUNNING $n$hl ${el} min; output $(wc -l < $d/out) lines; last line: $(tail -n 1 $d/out | cut -c1-160)"; exit 10
