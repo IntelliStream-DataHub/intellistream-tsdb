@@ -124,7 +124,7 @@ $(B)/fuzz-ec: override CFLAGS += -Isrc/ec/compat
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(B)/link-bench $(EC_BENCH)
 
 $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h $(R7_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -1093,6 +1093,11 @@ $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal
 $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# what a stream link costs for peerlink-shaped frames (TCP, or rsocket through a dlopen of librdmacm with --rsocket;
+# tools/rdma-bench.sh, docs/design-rdma.md): no engine, and librdmacm is not linked
+$(B)/link-bench: tools/link-bench.c $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_crypto.o -ldl
+
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -1899,6 +1904,13 @@ test: test-release
 test-release:
 	tests/test_release_notes.sh
 	python3 -I tests/test_release_publish.py
+
+# tools/link-bench on loopback (the tool behind docs/design-rdma.md's numbers): tags checked, a wrong one caught, round
+# trips timed whole. LINK_BENCH=path runs the test against another binary (a planted bug). Seconds.
+test: test-link-bench
+.PHONY: test-link-bench
+test-link-bench: $(B)/link-bench
+	B=$(B) tests/test_link_bench.sh
 
 # The licence of every source file (tools/check-spdx.sh) and the test of that check (it must fail on each kind of slip).
 test: test-spdx
