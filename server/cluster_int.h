@@ -46,6 +46,8 @@ uint64_t cl_leader_age_ns(uint64_t now);
 uint32_t cl_lease_ms(void);
 /* 1 while a promotion of volume `vol` is under way here (the Raft leader's) */
 int cl_promo_running(uint32_t vol);
+/* TSDB_CLUSTER_TEST lose_ready_file: 1 while READYs and a timed-out transfer's CANCEL are lost */
+int cl_lose_ready(void);
 
 /* ---- the entry points (stubs answer META_ERR_INVALID "not built" until their track fills them) */
 /* server/ctransfer.c (r4-transfer): CLUSTER_OP_VOLUME_TRANSFER, the duty round (leader balance, CANCEL after an

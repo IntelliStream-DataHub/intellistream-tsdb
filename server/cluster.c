@@ -1132,6 +1132,10 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int lose_ready;      /* TSDB_CLUSTER_TEST lose_ready_file=1: while <state-dir>/loseready is, a READY received is dropped
+                          * and a timed-out transfer's CANCEL is not sent (both lost on the link: test_cluster
+                          * transferstale, a volume leader holding a READY its Raft leader no longer knows) */
+    char losereadyfile[1100];
     int hold_reply;      /* TSDB_CLUSTER_TEST hold_reply_file=1: while <state-dir>/holdreply is, a copy of each FENCE_REPLY sent
                           * is kept; while <state-dir>/replayreply is, the copies are sent again every round (test_cluster
                           * oneway2: a late answer to an earlier fence of the volume must not count for the promotion now) */
@@ -1410,6 +1414,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "lose_ready_file=%llu", &v) == 1)
+            C.lose_ready = v != 0;
         else if (sscanf(p, "hold_reply_file=%llu", &v) == 1)
             C.hold_reply = v != 0;
         else if (sscanf(p, "volcmd_file=%llu", &v) == 1)
@@ -5923,7 +5929,8 @@ static void volmsg_in(uint32_t from, const struct cluster_vmsg *m)
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
     if (m->kind == CL_VMSG_READY) {
-        ctr_ready(from, m);
+        if (!cl_lose_ready())
+            ctr_ready(from, m);
         return;
     }
     if (m->kind == CL_VMSG_RESIGN) {
@@ -6784,6 +6791,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.losereadyfile, sizeof C.losereadyfile, "%s/loseready", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
@@ -6972,6 +6980,7 @@ uint64_t cl_leader_age_ns(uint64_t now) { return cl_leading() ? since(now, C.lea
 uint32_t cl_lease_ms(void) { return settings()->lease_ms; }
 
 int cl_promo_running(uint32_t vol) { return promo_find(vol) != NULL; }
+int cl_lose_ready(void) { return C.lose_ready && access(C.losereadyfile, F_OK) == 0; }
 
 const char *cl_leader_peer(void) { return leader_peer(); }
 

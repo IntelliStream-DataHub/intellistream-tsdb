@@ -46,7 +46,7 @@ enum { CT_ASKED = 1, CT_PROMOTING };
 struct ctr {
     uint32_t vol, target, old;
     uint64_t epoch; /* the basis */
-    uint64_t term;
+    uint64_t id;    /* the transfer's id (next_id): TRANSFER, CANCEL and READY carry it */
     int state, balance, has_conn;
     uint64_t conn;
     uint32_t reqid;
@@ -77,7 +77,7 @@ static uint64_t g_last_balance; /* the last balance start */
 /* STATUS (cluster_int.h ctr_counts) */
 static atomic_ulong n_started, n_done, n_timedout, n_cancelled, n_fallback, n_balance;
 
-enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL };
+enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL };
 /* TSDB_CLUSTER_MUTANT's names of this file (cluster.c's parser knows none of them) */
 static int ctr_mutant(void)
 {
@@ -89,6 +89,7 @@ static int ctr_mutant(void)
             : !strcmp(e, "transferfewreplies") ? CTM_FEWREPLIES
             : !strcmp(e, "balanceflap")        ? CTM_BALANCEFLAP
             : !strcmp(e, "nocancel")           ? CTM_NOCANCEL
+            : !strcmp(e, "readynocancel")      ? CTM_READYNOCANCEL
                                                : CTM_NONE;
         if (m != CTM_NONE)
             cl_say("MUTANT %s (tests only)", e);
@@ -158,9 +159,21 @@ static void tr_reply(struct ctr *t, int32_t rc, const char *fmt, ...)
     t->has_conn = 0;
 }
 
-static void send_cmd(uint8_t kind, uint32_t to, uint32_t vol, uint64_t epoch, uint32_t node)
+/* Transfer ids increase across Raft leaders (term << 32, then one up per transfer this server starts), so a volume
+ * leader can tell a late CANCEL or TRANSFER of an earlier attempt from the current one, whoever sent it (D14: a late
+ * CANCEL of an earlier attempt would otherwise end a later attempt's write hold). A new Raft leader's CANCEL carries
+ * term << 32, below each of its own ids and above every id of an earlier term. */
+static uint64_t g_last_id;
+static uint64_t next_id(void)
 {
-    struct cluster_volcmd c = {.kind = kind, .volume = vol, .epoch = epoch, .node = node, .arg = cl_term()};
+    uint64_t floor = cl_term() << 32;
+    g_last_id = g_last_id + 1 > floor + 1 ? g_last_id + 1 : floor + 1;
+    return g_last_id;
+}
+
+static void send_cmd(uint8_t kind, uint32_t to, uint32_t vol, uint64_t epoch, uint32_t node, uint64_t id)
+{
+    struct cluster_volcmd c = {.kind = kind, .volume = vol, .epoch = epoch, .node = node, .arg = id};
     (void)cl_volcmd_send(to, &c);
 }
 
@@ -217,7 +230,7 @@ static struct ctr *tr_start(const struct meta_volume *v, uint32_t node, int bala
     t->target = node;
     t->old = v->leader;
     t->epoch = v->epoch;
-    t->term = cl_term();
+    t->id = next_id();
     t->state = CT_ASKED;
     t->balance = balance;
     t->t0 = t->sent_ns = now;
@@ -226,7 +239,7 @@ static struct ctr *tr_start(const struct meta_volume *v, uint32_t node, int bala
         atomic_fetch_add_explicit(&n_balance, 1, memory_order_relaxed);
     cl_say("volume %" PRIu32 ": %s transfer from node %" PRIu32 " to node %" PRIu32 " at epoch %" PRIu64,
            v->number, balance ? "leader balance:" : "", v->leader, node, v->epoch);
-    send_cmd(CL_VOLCMD_TRANSFER, v->leader, v->number, v->epoch, node);
+    send_cmd(CL_VOLCMD_TRANSFER, v->leader, v->number, v->epoch, node, t->id);
     return t;
 }
 
@@ -255,9 +268,18 @@ void ctr_ready(uint32_t from, const struct cluster_vmsg *m)
 {
     struct ctr *t = tr_find(m->volume);
     const struct meta_volume *v = meta_volume(cl_meta(), m->volume);
-    if (!t || !v || t->state != CT_ASKED || from != t->old || m->epoch != t->epoch || m->rid != t->target ||
-        m->start != t->term || v->epoch != t->epoch || v->leader != t->old)
-        return; /* a late or repeated READY, or one of another term */
+    if (!t || t->id != m->start) {
+        /* a READY of a transfer this Raft leader does not hold (an earlier leader's, or one it ended): without an
+         * answer the volume leader would refuse writes until its hard cap (D14). The id makes the CANCEL end that
+         * transfer only, never a later one. */
+        struct cluster_volcmd c = {.kind = CL_VOLCMD_CANCEL, .volume = m->volume, .epoch = m->epoch, .arg = m->start};
+        if (ctr_mutant() != CTM_READYNOCANCEL)
+            (void)cl_volcmd_send(from, &c);
+        return;
+    }
+    if (!v || t->state != CT_ASKED || from != t->old || m->epoch != t->epoch || m->rid != t->target ||
+        v->epoch != t->epoch || v->leader != t->old)
+        return; /* a late or repeated READY */
     uint64_t now = cl_now_ns();
     if (cl_promo_running(v->number)) { /* a failover started meanwhile: it decides */
         tr_reply(t, META_ERR_STALE, "a promotion started before READY; fell back to failover");
@@ -287,7 +309,7 @@ void ctr_promo_dropped(uint32_t vol, uint64_t epoch, uint64_t now)
     struct ctr *t = tr_find(vol);
     if (!t || t->epoch != epoch)
         return;
-    send_cmd(CL_VOLCMD_CANCEL, t->old, vol, epoch, t->target);
+    send_cmd(CL_VOLCMD_CANCEL, t->old, vol, epoch, t->target, t->id);
     atomic_fetch_add_explicit(&n_fallback, 1, memory_order_relaxed);
     tr_reply(t, META_ERR_STALE, "no grant within the promotion's time; cancelled (an old leader already fenced is "
                                 "reopened as a replica and the volume fails over)");
@@ -320,7 +342,7 @@ static void cancels(uint64_t now)
             continue;
         }
         struct cluster_volcmd cmd = {.kind = CL_VOLCMD_CANCEL, .volume = c->vol, .epoch = 0, .node = 0,
-                                     .arg = term};
+                                     .arg = term << 32};
         if (cl_volcmd_send(v->leader, &cmd) == 0)
             c->cancel_owed = 0;
     }
@@ -359,7 +381,8 @@ static void transfers(uint64_t now)
         if (t->state == CT_ASKED) {
             uint64_t wait = (uint64_t)sm->set.transfer_wait_ms * MS + READY_SLACK_NS;
             if (since(now, t->t0) >= wait) {
-                send_cmd(CL_VOLCMD_CANCEL, t->old, t->vol, t->epoch, t->target);
+                if (!cl_lose_ready())
+                    send_cmd(CL_VOLCMD_CANCEL, t->old, t->vol, t->epoch, t->target, t->id);
                 atomic_fetch_add_explicit(&n_timedout, 1, memory_order_relaxed);
                 tr_reply(t, META_ERR_STALE, "timed out: no READY within %" PRIu64 " ms; cancelled", wait / MS);
                 tr_failed(t, now);
@@ -368,11 +391,11 @@ static void transfers(uint64_t now)
             }
             if (since(now, t->sent_ns) >= RESEND_NS) {
                 t->sent_ns = now;
-                send_cmd(CL_VOLCMD_TRANSFER, t->old, t->vol, t->epoch, t->target);
+                send_cmd(CL_VOLCMD_TRANSFER, t->old, t->vol, t->epoch, t->target, t->id);
             }
         } else if (!cl_promo_running(t->vol) && since(now, t->ready_ns) >= PROMO_HOLD_NS) {
             /* the promotion never started (the epoch limit) or ended without moving the record */
-            send_cmd(CL_VOLCMD_CANCEL, t->old, t->vol, t->epoch, t->target);
+            send_cmd(CL_VOLCMD_CANCEL, t->old, t->vol, t->epoch, t->target, t->id);
             atomic_fetch_add_explicit(&n_cancelled, 1, memory_order_relaxed);
             tr_reply(t, META_ERR_STALE, "the promotion ended without a new leader; cancelled");
             tr_failed(t, now);

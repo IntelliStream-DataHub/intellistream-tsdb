@@ -2,7 +2,7 @@
 /*
  * Planned leader transfer, the volume leader's side (R4 plan D14, D15; rtransfer.h).
  *
- * The Raft leader sends TRANSFER{vol, epoch, target} (cluster_volcmd, `arg` its Raft term). The writer then stops
+ * The Raft leader sends TRANSFER{vol, epoch, target} (cluster_volcmd, `arg` the transfer's id). The writer then stops
  * admitting: rtr_admit_ok answers 0 for every WAL record, client rows and the engine's own markers alike (NOW seal,
  * DROP, CLASS, SERIES, RETENTION, a large write's COMMIT), exactly as the lease refusal does, so nothing new is
  * appended and every refused write is definite (never admitted; tsdbd answers UNAVAILABLE PROMOTING with a retry after
@@ -15,9 +15,12 @@
  * the target is promoted with (a cut). Only CANCEL, a lost epoch (the fence, a promotion) or the hard cap of
  * 10 x transfer_wait_ms admit again; records admitted after the cap are counted as "resumed blind" (they may be cut).
  *
- * The VOLCMD frame carries no Raft term (cluster.h), so `arg` does: a command of an older term than the latest this
- * volume heard is ignored, and a deposed Raft leader's late TRANSFER cannot start a drain the new one does not know of.
- * The new Raft leader sends CANCEL to every volume leader in its first duty round (ctr_duty).
+ * The VOLCMD frame carries no Raft term (cluster.h), so `arg` carries the transfer's id, which increases across Raft
+ * leaders (term << 32 and up, ctransfer.c next_id): a command older than the latest this volume heard is ignored, so a
+ * deposed Raft leader's late TRANSFER cannot start a drain the new one does not know of, and a CANCEL ends only the
+ * transfer it names or an earlier one, never a later attempt's hold (D14). The new Raft leader sends CANCEL (term << 32)
+ * to every volume leader in its first duty round (ctr_duty), and answers a READY of a transfer it does not hold with
+ * a CANCEL of that id (ctr_ready).
  *
  * Everything runs under rv->mu (rtr_cmd and rtr_tick on the volume's thread, rtr_admit_ok from op_admit, and
  * repld_draining from tsdbd's error path).
@@ -42,7 +45,8 @@ enum { RT_IDLE = 0, RT_DRAIN, RT_READY };
 #define HANDOVER_MS 2000
 
 struct rtr {
-    uint64_t term; /* the highest Raft term a TRANSFER or CANCEL of this volume came with */
+    uint64_t heard; /* the highest transfer id a TRANSFER or CANCEL of this volume came with */
+    uint64_t id;    /* this transfer's (READY carries it) */
     int state;
     uint64_t epoch;  /* the core's epoch the transfer is for */
     uint32_t target; /* node id */
@@ -139,15 +143,15 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 {
     struct rtr *t = tr_get(rv);
     const char *what = c->kind == CL_VOLCMD_CANCEL ? "CANCEL" : "TRANSFER";
-    if (c->arg < t->term) {
-        say("volume %" PRIu32 ": %s from node %" PRIu32 " of Raft term %" PRIu64 " ignored (term %" PRIu64
+    if (c->arg < t->heard) {
+        say("volume %" PRIu32 ": %s from node %" PRIu32 " of transfer %" PRIu64 " ignored (%" PRIu64
             " was heard)",
-            rv->number, what, from, c->arg, t->term);
+            rv->number, what, from, c->arg, t->heard);
         return;
     }
-    t->term = c->arg;
+    t->heard = c->arg;
     if (c->kind == CL_VOLCMD_CANCEL) {
-        if (t->state != RT_IDLE && (!c->epoch || c->epoch == t->epoch))
+        if (t->state != RT_IDLE && c->arg >= t->id && (!c->epoch || c->epoch == t->epoch))
             tr_end(rv, t, "cancelled by the Raft leader");
         return;
     }
@@ -164,11 +168,12 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
     }
     if (t->state != RT_IDLE && t->epoch == c->epoch && t->target == c->node) {
         t->to = from; /* the same transfer asked again (a new Raft leader's): READY goes there now */
+        t->id = c->arg;
         t->sent_ms = 0;
         return;
     }
     memset(t, 0, sizeof *t);
-    t->term = c->arg;
+    t->heard = t->id = c->arg;
     t->state = RT_DRAIN;
     t->epoch = c->epoch;
     t->target = c->node;
@@ -182,7 +187,7 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 static void send_ready(struct rvol *rv, struct rtr *t, uint64_t now)
 {
     struct cluster_vmsg m = {.kind = CL_VMSG_READY, .volume = rv->number, .epoch = t->epoch, .durable = t->end,
-                             .rid = t->target, .start = t->term, .to = t->to};
+                             .rid = t->target, .start = t->id, .to = t->to};
     cluster_vol_msg(&m);
     t->sent_ms = now;
 }
