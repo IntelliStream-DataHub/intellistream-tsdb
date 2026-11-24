@@ -16862,8 +16862,8 @@ struct mv_run {
 
 static void move_writers(struct mv_run *r, int s, int lead, int lenient)
 {
-    tsdbc *c = client(lead); /* the series are made on the leader (a SERIES by path forwarded from a member that does
-                              * not lead is MOVED: docs/tasks/fwd-series-moved.md), the writers write through s */
+    tsdbc *c = client(lead); /* the series are made on the leader (made through another member they are forwarded
+                              * since fwd-series: fwdseries covers that), the writers write through s */
     for (int k = 0; k < REP_NAMES; k++) {
         tsdb_sid id = rep_series(c, rep_names[k], "plant", 30000);
         int64_t t = 1000;
