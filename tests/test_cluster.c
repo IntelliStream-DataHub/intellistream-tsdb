@@ -12339,6 +12339,113 @@ static void scen_addswitch(void)
            X, lead, sw_ms, waits, join, join <= sw_ms ? "before" : "after", ctl_ms, rows);
 }
 
+/* setchurn: replica set changes under 4 writers with the volume leader SIGKILLed in the middle. 5 servers, plant on 3;
+ * the writers (lenient: a failed batch is unsure) send to the two servers outside the set (A, B: forwarded, never
+ * killed; both join it later). A is added and joins, a member R1 is removed, B is added and the leader killed while B
+ * fills; a member is promoted, the old leader started again, B fills from the new leader and joins with it; then the
+ * old leader is removed. Each member removed is paused first, until the ISR has shrunk without it (meta.c refuses a
+ * REMOVE of an ISR member). At the end every series holds at least its acknowledged rows and at most those plus the
+ * unsure ones, and the three members' rows are equal. */
+static void scen_setchurn(void)
+{
+    scenario("setchurn");
+    struct meta_volume v;
+    int L = set_setup(5, &v, 1), A = -1, B = -1, R1 = -1, R2 = -1;
+    for (int i = 0; i < 5; i++)
+        if (rep_index(&v, i) < 0)
+            *(A < 0 ? &A : &B) = i;
+        else if (i != L)
+            *(R1 < 0 ? &R1 : &R2) = i;
+    if (A < 0 || B < 0 || R1 < 0 || R2 < 0)
+        die("plant: leader %d, members %d %d, others %d %d", L, R1, R2, A, B);
+    tsdbc *c = client(L);
+    tsdb_sid ids4[4];
+    for (int k = 0; k < 4; k++)
+        ids4[k] = rep_series(c, rep_names[k], "plant", 30000);
+    tsdbc_close(c);
+    await_isr(A, "plant", 3, 10000, "every replica up");
+    struct set_writer w[4];
+    pthread_t th[4];
+    for (int k = 0; k < 4; k++) {
+        w[k] = (struct set_writer){.port = cports[k < 2 ? A : B], .id = ids4[k], .t = 1000, .lenient = 1};
+        if (pthread_create(&th[k], NULL, set_write_thread, &w[k]) != 0)
+            die("pthread_create");
+    }
+    for (int k = 0; k < 4; k++)
+        await_batches(&w[k], 20, 30000);
+    char res[512], op[64];
+    snprintf(op, sizeof op, "add 1 %" PRIu32, ids[A]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("add A: %s", res);
+    await_member(A, "plant", A, 1, 4, 10000, &v);
+    await_isr(A, "plant", 4, 60000, "A filled from the log and joined");
+    pause_server(R1, 1); /* a REMOVE needs its member out of the ISR first (meta.c: a move never lowers the copies) */
+    await_isr(A, "plant", 3, 20000, "R1 paused");
+    snprintf(op, sizeof op, "remove 1 %" PRIu32, ids[R1]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("remove R1: %s", res);
+    await_member(A, "plant", R1, 0, 3, 10000, &v);
+    pause_server(R1, 0);
+    for (int k = 0; k < 4; k++)
+        await_batches(&w[k], 10, 30000);
+    snprintf(op, sizeof op, "add 1 %" PRIu32, ids[B]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("add B: %s", res);
+    await_member(A, "plant", B, 1, 4, 10000, &v);
+    uint64_t e0 = v.epoch, tk = now_ms();
+    stop(L, SIGKILL); /* B is filling from it */
+    int Nw = -1;
+    for (;;) {
+        if (vol_rec(A, "plant", &v) && v.leader != ids[L] && v.epoch > e0 && (Nw = server_of(v.leader)) >= 0)
+            break;
+        if (now_ms() - tk > 30000)
+            die("no new leader of plant 30 s after its leader was killed (epoch %" PRIu64 ", leader %u)", v.epoch,
+                v.leader);
+        usleep(20000);
+    }
+    uint64_t promo = now_ms() - tk;
+    start(L);
+    await_isr(A, "plant", 4, 120000, "B filled from the new leader and the old leader rejoined");
+    uint64_t joined = now_ms() - tk;
+    for (int k = 0; k < 4; k++)
+        await_batches(&w[k], 10, 30000);
+    pause_server(L, 1);
+    await_isr(A, "plant", 3, 20000, "the old leader paused");
+    snprintf(op, sizeof op, "remove 1 %" PRIu32, ids[L]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("remove the old leader: %s", res);
+    await_member(A, "plant", L, 0, 3, 10000, &v);
+    pause_server(L, 0);
+    if (server_of(v.leader) != Nw)
+        die("the leader moved from server %d to %d after the failover", Nw, server_of(v.leader));
+    for (int k = 0; k < 4; k++)
+        await_batches(&w[k], 10, 30000);
+    for (int k = 0; k < 4; k++)
+        __atomic_store_n(&w[k].stop, 1, __ATOMIC_RELEASE);
+    uint64_t want[REP_NAMES], acked = 0, unsure = 0;
+    c = client(Nw);
+    for (int k = 0; k < 4; k++) {
+        pthread_join(th[k], NULL);
+        int n = rows_of(c, ids4[k]);
+        if (n < 0 || (uint64_t)n < w[k].acked || (uint64_t)n > w[k].acked + w[k].unsure)
+            die("%s: the leader reads %d rows, %" PRIu64 " acknowledged and %" PRIu64 " unsure", rep_names[k], n,
+                w[k].acked, w[k].unsure);
+        want[k] = (uint64_t)n, acked += w[k].acked, unsure += w[k].unsure;
+    }
+    tsdbc_close(c);
+    stop_all();
+    int s[3] = {R2, A, B};
+    rep_same_on(s, 3, want, "after a clean stop");
+    printf("  A added, R1 removed, B added and the leader killed while B filled (server %d promoted after %" PRIu64
+           " ms, ISR of 4 after %" PRIu64 " ms), the old leader removed: %" PRIu64 " rows acknowledged (%" PRIu64
+           " unsure) through two forwarding servers, all there, equal on the three members\n",
+           Nw, promo, joined, acked, unsure);
+}
+
 /* removereplica: a replica out of the ISR (SIGSTOPped) is removed; once it runs again it closes the volume, renames
  * v1 to v1.removed-<rid> and deletes it; the leader goes on committing without it. Mutant removedopen (the removed
  * replica keeps its directory open and serving). */
@@ -12856,7 +12963,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
