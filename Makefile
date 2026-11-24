@@ -124,7 +124,7 @@ $(B)/fuzz-ec: override CFLAGS += -Isrc/ec/compat
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(EC_BENCH)
+all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(B)/link-bench $(EC_BENCH)
 
 $(B)/%.o: src/%.c src/internal.h src/stats_priv.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h $(R7_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -1092,6 +1092,11 @@ $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal
 
 $(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# what a stream link costs for peerlink-shaped frames (TCP, or rsocket under librspreload; tools/rdma-bench.sh,
+# docs/design-rdma.md): no engine, no librdmacm
+$(B)/link-bench: tools/link-bench.c $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_crypto.o
 
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
