@@ -6162,7 +6162,7 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
             if (p->replied[i])
                 continue;
             if (p->fenced[i] == C.id) {
-                if (g_fence_fn)
+                if (g_fence_fn && !(C.drop_fence && access(C.dropfencefile, F_OK) == 0)) /* the test hook, as on_fence */
                     g_fence_fn(g_fence_arg, p->vol, p->epoch + 1, C.id);
                 continue;
             }

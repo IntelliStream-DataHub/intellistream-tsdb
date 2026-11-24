@@ -222,6 +222,8 @@ static struct ctr *tr_start(const struct meta_volume *v, uint32_t node, int bala
     t->balance = balance;
     t->t0 = t->sent_ns = now;
     atomic_fetch_add_explicit(&n_started, 1, memory_order_relaxed);
+    if (balance) /* STATUS: of those started, by leader balance */
+        atomic_fetch_add_explicit(&n_balance, 1, memory_order_relaxed);
     cl_say("volume %" PRIu32 ": %s transfer from node %" PRIu32 " to node %" PRIu32 " at epoch %" PRIu64,
            v->number, balance ? "leader balance:" : "", v->leader, node, v->epoch);
     send_cmd(CL_VOLCMD_TRANSFER, v->leader, v->number, v->epoch, node);
@@ -339,8 +341,6 @@ static void transfers(uint64_t now)
         if (v->epoch != t->epoch) {
             if (v->leader == t->target) {
                 atomic_fetch_add_explicit(&n_done, 1, memory_order_relaxed);
-                if (t->balance)
-                    atomic_fetch_add_explicit(&n_balance, 1, memory_order_relaxed);
                 struct cback *b = t->balance ? back_get(t->target) : NULL;
                 if (b)
                     b->fails = 0;
