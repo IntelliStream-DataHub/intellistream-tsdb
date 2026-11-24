@@ -339,7 +339,7 @@ static void start(int i)
     int port = start_try(i);
     if (port <= 0)
         die("server %d: %s", i, th_why);
-    cports[i] = port;
+    __atomic_store_n(&cports[i], port, __ATOMIC_RELAXED); /* the transfer writers read it while a server restarts */
     if (!th_pport)
         die("server %d: the port file names no peer port", i);
     pports[i] = th_pport;
@@ -12105,7 +12105,7 @@ static void *tr_write_thread(void *a)
     tsdbc *c = NULL;
     while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
         if (!c) {
-            if (tsdbc_connect("127.0.0.1", cports[w->server], &c) != 0) {
+            if (tsdbc_connect("127.0.0.1", __atomic_load_n(&cports[w->server], __ATOMIC_RELAXED), &c) != 0) {
                 c = NULL;
                 usleep(20000);
                 continue;
