@@ -25,8 +25,8 @@
 #                   (timeout) and its process group is killed, never counted as caught
 # Several helpers at once (make tsan-par runs the test groups side by side) share one pool when MUTANT_SLOT_DIR names a
 # directory (any, created on demand) and MUTANT_SLOTS its size (default: the job limit): no more than that many runs of
-# all of them are alive at once (a flock(1) on a file per slot, MUTANT_NO_FLOCK=1 or no flock: a file made with O_EXCL
-# and the owner's pid); a helper that died leaves no slot behind. When neither --jobs nor MUTANT_JOBS is given,
+# all of them are alive at once (a flock(1) on a file per slot; MUTANT_NO_FLOCK=1 or no flock: a file with the owner's pid, made
+# whole by a hard link); a helper that died leaves no slot behind. When neither --jobs nor MUTANT_JOBS is given,
 # a pool of that kind, per user ($XDG_RUNTIME_DIR or /tmp, tsdb-mutant-slots-UID) and half the CPUs (MUTANT_SLOTS) wide,
 # is used: several worktrees testing at once do not each start half the CPUs.
 # A command that cannot be run (status 126 or 127) is SURVIVED too: a missing binary must not "catch" every mutant.
@@ -95,22 +95,27 @@ if [ -z "$slot_dir" ] && [ -n "$default_jobs" ]; then
 fi
 case $slots in '' | *[!0-9]*) die "not a number: '$slots'" ;; esac
 if [ -n "$slot_dir" ]; then mkdir -p "$slot_dir" || exit 2; fi
-# The pool. A slot is the file $slot_dir/slot.K. With flock(1) the owner holds an flock on an open descriptor of it: the
-# kernel lets go when the helper ends, however it ends, so there is no stale slot and nothing to take over. mkdir is no
-# lock here: uutils' mkdir (Ubuntu 26.04's coreutils) answers 0 to two callers that race for one name, and two helpers
-# then each ran a job in the one slot of a pool (test_mutants_helper, section 14). Without flock (macOS, or
-# MUTANT_NO_FLOCK=1: the test of this path) the file is made by the shell's own O_EXCL create (set -C) and holds the
-# owner's pid; a slot whose owner is gone is renamed away (atomic) and removed only if what was renamed names that same
-# dead owner, else it is put back (a taker made it between the read and the rename).
+# The pool. With flock(1) a slot is the file $slot_dir/slot.K and the owner holds an flock on an open descriptor of it:
+# the kernel lets go when the helper ends, however it ends, so there is no stale slot and nothing to take over. Never
+# unlink slot.K (a lock file that goes can be held twice). mkdir is no lock here: uutils' mkdir (Ubuntu 26.04's
+# coreutils) answers 0 to two callers that race for one name, and two helpers then each ran a job in the one slot of a
+# pool (test_mutants_helper, section 14). Without flock (macOS, or MUTANT_NO_FLOCK=1: the test of this path) a slot is
+# the file nf.K (another name, so a pool is never shared between the two ways) holding the owner's pid, made whole by a
+# hard link (ln fails when the name exists; no moment with an empty file). A slot whose owner is gone is removed by one
+# reaper at a time (the O_EXCL file nf.K.reap, taken with the shell's set -C), which reads nf.K again under it and
+# removes it only if it still names that dead owner: nothing is ever renamed away or put back, so a live owner's file
+# is never touched. A reaper that died holding nf.K.reap is told by its pid and its file removed (best effort).
 use_flock=1
 if [ -n "${MUTANT_NO_FLOCK:-}" ] || ! command -v flock >/dev/null 2>&1; then use_flock=; fi
 slotfd=()
 take_slot() { # index: 0 when a slot of the shared pool is ours (or there is no pool)
     [ -n "$slot_dir" ] || return 0
-    local k f fd p c r
+    local k f fd p c t q
+    t=$slot_dir/nf.new.$$
+    [ -n "$use_flock" ] || echo $$ >"$t" 2>/dev/null || return 1
     for ((k = 1; k <= slots; k++)); do
-        f=$slot_dir/slot.$k
         if [ -n "$use_flock" ]; then
+            f=$slot_dir/slot.$k
             { exec {fd}>>"$f"; } 2>/dev/null || continue
             if flock -n "$fd"; then
                 slotfd[$1]=$fd slot[$1]=$k
@@ -119,22 +124,26 @@ take_slot() { # index: 0 when a slot of the shared pool is ours (or there is no 
             exec {fd}>&-
             continue
         fi
-        if (set -C; : >"$f") 2>/dev/null; then
-            echo $$ >"$f"
+        f=$slot_dir/nf.$k
+        if ln "$t" "$f" 2>/dev/null; then
+            rm -f "$t"
             slot[$1]=$k
             return 0
         fi
         p=$(cat "$f" 2>/dev/null)
-        # no pid yet: its maker is between the create and the write
         case $p in '' | *[!0-9]*) continue ;; esac
         kill -0 "$p" 2>/dev/null && continue
         # its owner is gone (killed before it could give it back)
-        r=$f.reap.$$
-        mv "$f" "$r" 2>/dev/null || continue
-        c=$(cat "$r" 2>/dev/null)
-        if [ "$c" != "$p" ]; then (set -C; printf '%s\n' "$c" >"$f") 2>/dev/null; fi
-        rm -f "$r"
+        if (set -C; echo $$ >"$f.reap") 2>/dev/null; then
+            c=$(cat "$f" 2>/dev/null)
+            [ "$c" != "$p" ] || rm -f "$f"
+            rm -f "$f.reap"
+        else
+            q=$(cat "$f.reap" 2>/dev/null)
+            case $q in '' | *[!0-9]*) ;; *) kill -0 "$q" 2>/dev/null || rm -f "$f.reap" ;; esac
+        fi
     done
+    [ -n "$use_flock" ] || rm -f "$t"
     return 1
 }
 give_slot() {
@@ -142,7 +151,7 @@ give_slot() {
     if [ -n "$use_flock" ]; then
         local fd=${slotfd[$1]}
         exec {fd}>&-
-    else rm -f "${slot_dir:?}/slot.${slot[$1]}"; fi
+    else rm -f "${slot_dir:?}/nf.${slot[$1]}"; fi
     slot[$1]= slotfd[$1]=
 }
 kill_group() { # a numeric pid above 1 only: kill(-1) and kill(0) would reach the user's whole session

@@ -37,6 +37,16 @@ fixed*) # a file with a fixed name in the scratch directory: two runs sharing th
     touch "$d/state"; sleep 0.3; exit 1 ;;
 bg*) # leaves a process of its own behind, as a test that starts a server it does not stop does
     sleep 30 >/dev/null 2>&1 & echo $! >>"$FAKE_PIDS/bg"; exit 1 ;;
+pin*) # what the pool looks like while this run holds its slot
+    { ls "$MUTANT_SLOT_DIR"
+      for f in "$MUTANT_SLOT_DIR"/nf.[0-9]*; do [ -f "$f" ] && echo "owner $(cat "$f")"; done
+      if [ -e "$MUTANT_SLOT_DIR/slot.1" ]; then
+          if flock -n "$MUTANT_SLOT_DIR/slot.1" true; then echo "slot.1 free"; else echo "slot.1 held"; fi
+      fi; } >"$FAKE_PIN" 2>&1
+    exit 1 ;;
+watch*) # is the process that held the slot before us still alive? (then the pool ran one job too many)
+    ! kill -0 "$(cat "$FAKE_A")" 2>/dev/null || echo "$m" >>"$FAKE_PIN.violation"
+    exit 1 ;;
 conc*) # how many runs are alive at once
     mkdir -p "$FAKE_CONC"; touch "$FAKE_CONC/$$"
     n=$(ls "$FAKE_CONC" | wc -l); echo "$n" >>"$FAKE_CONC.max"
@@ -45,7 +55,7 @@ esac
 exit 3
 EOF
 chmod +x "$base/fake"
-export FAKE_PIDS=$base/pids FAKE_CONC=$base/conc
+export FAKE_PIDS=$base/pids FAKE_CONC=$base/conc FAKE_PIN=$base/pin FAKE_A=$base/a.pid
 mkdir -p "$FAKE_PIDS"
 F=$base/fake
 
@@ -195,6 +205,17 @@ pool_cases() {
     wait $pb || fail "pool$1: second helper failed"
     [ "$(maxc)" = 2 ] || fail "pool$1: MUTANT_SLOTS=2 over two helpers: $(maxc) at once"
     [ "$(sort -n "$FAKE_CONC.max" | wc -l)" = 8 ] || fail "pool$1: not all eight runs happened"
+    # which way the pool is made: an flock on slot.K (held while the run lives, the file empty), or a file nf.K with a pid
+    rm -f "$FAKE_PIN"
+    run dl "$H" --name t --jobs 2 --list "pin1" -- "$F" @M@ @D@
+    pin=$(cat "$FAKE_PIN" 2>/dev/null)
+    if [ -z "${MUTANT_NO_FLOCK:-}" ] && command -v flock >/dev/null 2>&1; then
+        case $pin in *"slot.1"*"slot.1 held"*) ;; *) fail "pool$1: no flock held on slot.1 during a run: $pin" ;; esac
+        case $pin in *nf.*) fail "pool$1: nf files beside the flocks: $pin" ;; esac
+    else
+        case $pin in *"nf.1"*"owner "[0-9]*) ;; *) fail "pool$1: no nf.1 with an owner pid during a run: $pin" ;; esac
+        case $pin in *slot.*) fail "pool$1: slot files beside the nf files: $pin" ;; esac
+    fi
     # no job count given: the helpers share a default pool per user (MUTANT_SLOTS wide here), jobs given: no pool
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/tsdb-mutant-slots-$(id -u)"
     unset MUTANT_SLOT_DIR
@@ -212,11 +233,13 @@ pool_cases() {
     # a slot left by a helper that died is taken over (a flock is let go by the kernel; a file names a dead pid)
     export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
     rm -rf "$base/slots"; mkdir -p "$base/slots"
-    echo 999999 >"$base/slots/slot.1"; echo 999999 >"$base/slots/slot.2"
+    echo 999999 >"$base/slots/nf.1"; echo 999999 >"$base/slots/nf.2"
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
     run dl "$H" --name t --jobs 2 --list "conc1 conc2" -- "$F" @M@ @D@
     [ $rc -eq 0 ] || fail "stale slots$1: rc $rc"
     [ "$(maxc)" = 2 ] || fail "stale slots$1: not both taken over ($(maxc) at once)"
+    [ -z "${MUTANT_NO_FLOCK:-}" ] || [ -z "$(ls "$base/slots" | grep -v '^nf\.new\.')" ] ||
+        fail "stale slots$1: left behind: $(ls "$base/slots")"
     # a run that leaves a process behind does not keep its slot: the next one starts at once (a lock inherited by
     # the run's children would hold it for the 30 s of the leftover)
     rm -f "$FAKE_PIDS/bg"
@@ -230,6 +253,35 @@ pool_cases() {
 }
 pool_cases ""
 MUTANT_NO_FLOCK=1 pool_cases " without flock"
+
+# 14a. a stale slot is reaped without touching a live owner's (no flock). The reaper reads the dead owner's pid; before
+# it acts, the slot is taken over by a live process (a shim of cat swaps the file right after the helper's first read of
+# it: deterministic, no timing). A reaper that then removed, or moved away and put back, the file it found would free
+# or lose that live owner's slot: the run below would start while the owner is alive.
+mkdir -p "$base/shim2"
+cat >"$base/shim2/cat" <<'EOF'
+#!/bin/bash
+/bin/cat "$@"; rc=$?
+case $1 in */nf.1)
+    if [ ! -e "$FAKE_PIN.swapped" ]; then
+        : >"$FAKE_PIN.swapped"; /bin/cat "$FAKE_A" >"$1.x"; /bin/mv -f "$1.x" "$1"
+    fi ;;
+esac
+exit $rc
+EOF
+chmod +x "$base/shim2/cat"
+rm -rf "$base/slots" "$base"/pin.*
+mkdir -p "$base/slots"
+echo 999999 >"$base/slots/nf.1"
+sleep 4 &
+apid=$!
+echo $apid >"$FAKE_A"
+MUTANT_NO_FLOCK=1 MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=1 PATH=$base/shim2:$PATH run dl "$H" --name t --jobs 2 --list "watch1" -- "$F" @M@ @D@
+wait $apid
+[ -e "$FAKE_PIN.swapped" ] || fail "reaper race: the shim never ran (the helper did not read the stale slot)"
+[ ! -e "$FAKE_PIN.violation" ] || fail "reaper race: a run started while the slot's live owner was alive"
+[ $rc -eq 0 ] || fail "reaper race: rc $rc"
+rm -rf "$base/slots" "$base"/mut.*
 
 # 14b. mkdir is no lock: uutils' mkdir (the coreutils of Ubuntu 26.04) says 0 to a caller whose name is made by another
 # one at that moment, and the pool of 4d8a7d18, whose slot was a directory, then ran two jobs in its one slot. A mkdir
