@@ -184,9 +184,13 @@ typedef struct mk_gc {
 typedef struct mk_digest {
     int64_t key;
     uint64_t z, rows, series, xxh64;
+    int64_t now_ms; /* the clock of the digest's retention cutoffs (a replica freezes its own at it) */
     uint32_t noids; /* at most MK_FILES_MAX */
     const uint8_t *oids;
 } mk_digest;
+
+/* mk.flags of a MK_DIGEST: the leader hashed its set's tombstone term (a listed part of the key lay below the set) */
+#define MKD_TOMBS 1u
 
 typedef struct mk {
     uint16_t type;  /* enum mk_type, or the raw number of an unknown one (then mk_type_name gives NULL) */

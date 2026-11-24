@@ -1855,6 +1855,7 @@ static int apply_cold(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             return rc;
         }
         if (rc == 1) { /* it was: only the record is left to write */
+            ecdigest_cold_rebind(db, m->u.cold.key, m->u.cold.z); /* its copies' job, if the crash came first */
             rc = rs_cold_done(db, last);
             if (rc == 0 && ci < rp->ncm)
                 cm_remove(db, rp, ci, true);
@@ -3256,8 +3257,9 @@ static int leader_drop(eng *db, int64_t ts)
     return rc;
 }
 
-int jr_markers(eng *db, const mk *m, size_t n, const char *what)
+int jr_markers_append(eng *db, const mk *m, size_t n, const char *what, uint64_t *last_out)
 {
+    *last_out = 0;
     if (!eng_jr(db) || db->rp || n == 0)
         return 0;
     /* one unit: one admission for the whole batch (wal_markers_mk), so a refusal (min_isr, not leading) leaves none
@@ -3280,6 +3282,21 @@ int jr_markers(eng *db, const mk *m, size_t n, const char *what)
             eng_fail(db, what, EIO);
         return TSDB_ERR_INDETERMINATE;
     }
+    *last_out = last;
+    return 0;
+}
+
+int jr_markers_wait(eng *db, uint64_t last, const char *what)
+{
+    return last ? leader_marker_wait(db, last, what) : 0;
+}
+
+int jr_markers(eng *db, const mk *m, size_t n, const char *what)
+{
+    uint64_t last = 0;
+    int rc = jr_markers_append(db, m, n, what, &last);
+    if (rc || last == 0)
+        return rc;
     if (eng_test_mutant == MUT_LEADER_DICT_EARLY) /* planted: the record goes to the file before the commit point */
         return 0;
     return leader_marker_wait(db, last, what);

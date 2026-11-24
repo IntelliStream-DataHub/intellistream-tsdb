@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "ecapply.h"
 #include "ecdiverge.h"
+#include "ecdigest.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
@@ -499,8 +500,10 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
     /* refused before an intent: the temporaries go; renamed: the listed parts were taken out of f; an intent and no
      * renames (the engine failed): everything stays for the next open */
     cf_free(db, f, n, written && !renamed);
-    if (renamed && nown)
-        eckeep_swapped(db, own, nown); /* held for keep_s (no .ec of the same name: no digest, R8's MK_DIGEST) */
+    if (renamed && nown) {
+        eckeep_retired(db, own, nown, c->key, c->z); /* held until the MK_DIGEST of (key, Z) matched (r8j) */
+        ecdigest_cold_bind(db, c->key, c->z, own, nown); /* durable before RSTATE's done: a replay rebinds */
+    }
     for (size_t i = 0; i < nown; i++)
         part_unref(own[i]);
     free(own);

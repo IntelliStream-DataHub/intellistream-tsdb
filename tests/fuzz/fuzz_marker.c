@@ -188,7 +188,7 @@ void fuzz_seeds(const char *dir)
     memset(&m, 0, sizeof m);
     m.type = MK_DIGEST;
     m.u.digest = (mk_digest){.key = 4 * 19700 + 1, .z = 5000, .rows = 86400, .series = 3, .xxh64 = 0x1234567890abcdefull,
-                             .noids = 2, .oids = oids};
+                             .now_ms = 1700000000000, .noids = 2, .oids = oids};
     seed(dir, "seed-digest", &m);
 
     memset(&m, 0, sizeof m); /* a reserved type and an unknown one: the body is theirs */

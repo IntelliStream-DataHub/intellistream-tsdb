@@ -163,7 +163,7 @@ added 127.0.0.1:17093</code></pre>
 <p>and <code>status 2</code> shows the cluster, asked of node 2, which follows:</p>
 <pre><code data-lang="plain" data-block="4" data-src="docs/cluster-preview.md#What you should see">node 2 mode core role follower term 1 leader 1 commit 8 applied 8
 cluster 875bd313f7abb7b8c0ca9b6b59e6c292 replication 3 min_isr 1 node_timeout_ms 3000 heartbeat_ms 500 voter_replace_s 600 voters_max 5 mode replicated failover lease read_barrier on lease_s 10 restore_gen 0
-replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000
+replicated lease_ms 2000 drift_ppm 500 unanswered_ms 1000 commit_interval_ms 5 repl_retain_mb 4096 repl_retain_s 1800 idle_seal_ms 1000 rebuild_mb_s 200 rebuild_max 2 transfer_wait_ms 2000 leader_balance_s 0
 group voters 1,2,3 learners -
 member 1 up incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 457ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
@@ -172,7 +172,7 @@ volumes 0 users 0</code></pre>
 <p>Step 6: the client example is the one of the <a href="quickstart.html">quick start</a>, pointed at node 1. Node 1 has
 the series, node 2 has none:</p>
 <pre><code data-lang="plain" data-block="5" data-src="docs/cluster-preview.md#What you should see">added volume plant: number 1
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -193,7 +193,7 @@ group voters 1,2,3 learners -
 member 1 down incarnation 1 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 5482ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 377ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -207,7 +207,7 @@ group voters 1,2,3 learners -
 member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 heard 0ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard 376ms feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
@@ -222,7 +222,7 @@ member 1 up incarnation 2 addr 127.0.0.1:17081 peer 127.0.0.1:17091 rack rack1 h
 member 2 up incarnation 1 addr 127.0.0.1:17082 peer 127.0.0.1:17092 rack rack2 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 3 up incarnation 1 addr 127.0.0.1:17083 peer 127.0.0.1:17093 rack rack3 heard never feed - voter_ok 1 volumes_ok 1 core_dropped 0 read_barrier ?
 member 4 up incarnation 1 addr 127.0.0.1:0 peer 127.0.0.1:17094 rack rack4 heard 0ms feed - voter_ok 1 volumes_ok 0 core_dropped 0 read_barrier on
-volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1
+volume 1 name plant uuid 6352c65472e57ca48581ca95b719bc8a leader 1 epoch 1 min_isr 1 replicas 1,2,3 isr 1,2,3 isr_version 1 set_version 1
 replica volume 1 node 1 rid c4e00215dc777d5a open_gen 1
 replica volume 1 node 2 rid cacab39a181a87c0 open_gen 1
 replica volume 1 node 3 rid d55421a420347a3b open_gen 1
