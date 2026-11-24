@@ -561,6 +561,13 @@ static void case_keepcap(void)
  * catch-up and snapshots until the caps let them go), and its replay start is the first position of the segment
  * above them: above its log start, exactly there. Mutants replaystartlog (the log start), replaystarthigh (one
  * segment too high). */
+static int RK_SAVES, RK_HELD;
+static void rk_mu_hook(eng *db)
+{
+    RK_SAVES++;
+    RK_HELD += !replica_test_mu_free(db);
+}
+
 static void case_replaykept(void)
 {
     char dir[PATH_MAX];
@@ -590,7 +597,11 @@ static void case_replaykept(void)
     CHECK_EQ(replica_replay_start(db), l.r[0].fno); /* nothing flushed yet: every segment replays */
     CHECK_EQ(replica_apply(db, end), 0);
     CHECK_EQ(mt_flush(db), 0);
+    replica_test_kept_hook = rk_mu_hook; /* RSTATE's fdatasync never holds rp->mu, which appends wait for (REVIEW F3) */
+    RK_SAVES = RK_HELD = 0;
     CHECK_EQ(replica_floor_saved(db, end), 0);
+    replica_test_kept_hook = NULL;
+    CHECK(RK_SAVES > 0 && RK_HELD == 0);
     CHECK_EQ(count_files(dir, "wal_"), 4);
     uint64_t rs = replica_replay_start(db);
     CHECK(rs > l.r[0].fno); /* above the log start */
@@ -7098,6 +7109,9 @@ static int mutant_of(const char *m)
                         : strcmp(m, "replaystartlog") == 0 ? MUT_REPLAY_START_LOG
                         : strcmp(m, "replaystarthigh") == 0 ? MUT_REPLAY_START_HIGH
                         : strcmp(m, "replaystartunsaved") == 0 ? MUT_REPLAY_START_UNSAVED
+                        : strcmp(m, "replayleadnofloor") == 0 ? MUT_REPLAY_LEAD_NOFLOOR
+                        : strcmp(m, "replayopennone") == 0 ? MUT_REPLAY_OPEN_NONE
+                        : strcmp(m, "replayopennofloor") == 0 ? MUT_REPLAY_OPEN_NOFLOOR
                         : strcmp(m, "replicadropsfiles") == 0 ? MUT_REPLICA_DROP_APPLIED_FILES
                         : strcmp(m, "freshunattached") == 0 ? MUT_LEADER_FRESH_UNATTACHED
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
@@ -7279,6 +7293,201 @@ static void bench_one(int rep, size_t mem_rows, size_t commit_rows)
     sh("rm -rf '%s' '%s'", x.ldir, rd);
 }
 
+/* LR (D17, REVIEW F1, F5, F6): a leader's replay start against what its own directory replays. A writer's open skips
+ * the kept segments, but the same directory reopened as a replica (a failover) replays a kept segment whose last
+ * position is above its REPL floor, which the driver saves on its own clock after the flush: the start told rises past
+ * a kept segment only once the saved floor covers it (mutant replayleadnofloor: at once), never before RSTATE names it
+ * durably (replaystartunsaved, seen from inside the save), and a promoted leader (tsdbd's restart of one) rises past
+ * the kept segments its open found at its first floor save (replayopennone: never). Reopened as a replica at a floor below its kept segment's end,
+ * the deposed leader's cursor is at or below the floor, so a cut there is accepted (the open's floor clause). */
+static uint64_t LR_HOOK = UINT64_MAX;
+static void lr_hook(eng *db) { LR_HOOK = replica_replay_start(db); }
+
+static void case_leader_replay(void)
+{
+    xport x;
+    xp_start(&x, "lr");
+    eng_close(x.rep); /* the leader alone: the replica side is the reopen below */
+    x.rep = NULL;
+    x.noship = true;
+    for (int k = 0; k < 6; k++)
+        xp_rows(&x, 0, 10 * k, 10, 100 + 10 * k);
+    uint64_t c1 = ld_last(&x);
+    CHECK_EQ(eng_flush(x.ld), 0); /* sealed, flushed, named in RSTATE's kept */
+    CHECK_EQ(replica_replay_start(x.ld), 0); /* no floor saved yet: nothing told */
+    eng_leader_keep_floor(x.ld, c1 - 15, c1 - 15);
+    CHECK_EQ(replica_replay_start(x.ld), 0); /* the floor lags the kept segment's end */
+    eng_leader_keep_floor(x.ld, c1, c1);
+    uint64_t rs1 = replica_replay_start(x.ld);
+    CHECK_EQ(rs1, c1 + 1); /* covered: the next open replays from the segment above it */
+    for (int k = 0; k < 3; k++)
+        xp_rows(&x, 1, 10 * k, 10, 300 + 10 * k);
+    uint64_t c2 = ld_last(&x);
+    eng_leader_keep_floor(x.ld, c2, c2); /* the floor covers the segment before it is flushed */
+    replica_test_kept_hook = lr_hook;
+    LR_HOOK = UINT64_MAX;
+    CHECK_EQ(eng_flush(x.ld), 0);
+    replica_test_kept_hook = NULL;
+    CHECK_EQ(LR_HOOK, rs1); /* inside the save of `kept`, before it is durable: not yet past the segment */
+    uint64_t rs2 = replica_replay_start(x.ld);
+    CHECK_EQ(rs2, c2 + 1);
+    /* the leader restarts as tsdbd restarts one: deposed, reopened as a replica at its saved floor, promoted (every
+     * segment stays, named kept); the attach finds them, the first floor save that covers them raises the start */
+    eng_leader_depose(x.ld);
+    CHECK_EQ(eng_close(x.ld), 0);
+    x.ld = NULL;
+    eng *r = NULL;
+    CHECK_EQ(open_replica(x.ldir, c2, &r), 0);
+    if (!r)
+        exit(2);
+    uint64_t pos = 0;
+    CHECK_EQ(replica_epoch_begin(r, 1, "node-b", &pos), 0);
+    CHECK_EQ(replica_sync(r), 0);
+    CHECK_EQ(replica_apply(r, pos), 0);
+    CHECK_EQ(replica_promote(&r, pos, &x.ld), 0);
+    if (!x.ld)
+        exit(2);
+    CHECK_EQ(eng_leader_attach(x.ld, &XOPS), 0);
+    CHECK(replica_replay_start(x.ld) <= c2 + 1); /* the epoch's segment is above the floor until it is saved */
+    eng_leader_keep_floor(x.ld, pos, pos);
+    uint64_t rsp = replica_replay_start(x.ld);
+    CHECK_EQ(rsp, pos + 1);
+    /* a third segment, flushed while the saved floor is still pos: deposed, reopened as a replica at that floor */
+    for (int k = 0; k < 3; k++)
+        xp_rows(&x, 0, 5 + 10 * k, 4, 500 + 10 * k);
+    uint64_t c3 = ld_last(&x);
+    CHECK_EQ(eng_flush(x.ld), 0);
+    uint64_t told = replica_replay_start(x.ld);
+    CHECK_EQ(told, rsp);
+    c2 = pos;
+    eng_leader_depose(x.ld);
+    CHECK_EQ(eng_close(x.ld), 0);
+    x.ld = NULL;
+    eng *ex = NULL;
+    CHECK_EQ(open_replica(x.ldir, c2, &ex), 0);
+    if (ex) {
+        uint64_t of = replica_test_open_first(ex);
+        if (of < told || of > c2 + 1)
+            fprintf(stderr, "LR: told %" PRIu64 ", floor %" PRIu64 ", log end %" PRIu64 ": the reopen replays from "
+                            "%" PRIu64 "\n", told, c2, c3, of);
+        CHECK(of >= told);   /* never above what an open replays (F1) */
+        CHECK(of <= c2 + 1); /* the kept segment above the floor is replayed: a new leader may cut after c2 */
+        CHECK_EQ(replica_cut(ex, c2), 0);
+        eng_close(ex);
+    }
+    xp_stop(&x);
+    printf("  a leader's replay start passes a kept segment only once the saved floor covers it (told %" PRIu64
+           ", a reopen at floor %" PRIu64 " replays from there), and a promoted leader's at its first floor save\n",
+           told, c2);
+}
+
+/* PL (D17, REVIEW F2): power lost at every step of a leader that writes, flushes, has its commit floor saved (lagging
+ * a round, sometimes covering the segment it is about to flush) and restarts. The replay start told before the loss
+ * (also from inside the save of `kept`) is never above the first position the directory, reopened as a replica at the
+ * saved floor, replays. The floor is written outside the crashfs root before the leader is told, as the driver saves
+ * REPL first. */
+#define PL_ROUNDS 10
+static char PL_ACK[PATH_MAX + 16];
+static uint64_t PL_MAX;
+static void pl_tell(eng *db)
+{
+    uint64_t v = replica_replay_start(db);
+    if (v > PL_MAX) { /* the core only raises its value: the highest told counts */
+        PL_MAX = v;
+        write_ack(PL_ACK, v);
+    }
+}
+
+static int powerlk_child(const char *dir, const char *ackfile)
+{
+    static xport x;
+    char flf[PATH_MAX + 32];
+    snprintf(flf, sizeof flf, "%s.floor", ackfile);
+    snprintf(PL_ACK, sizeof PL_ACK, "%s", ackfile);
+    snprintf(x.ldir, sizeof x.ldir, "%s", dir);
+    x.noship = true;
+    replica_test_kept_hook = pl_tell;
+    xp_open_leader(&x);
+    uint64_t fl = 0, prev = 0;
+    for (int r = 0; r < PL_ROUNDS; r++) {
+        for (int k = 0; k < 2; k++)
+            xp_rows(&x, (uint32_t)k, (r * 5 + k * 3) % 48, 8, (float)(10 * r + k));
+        if (failures)
+            return 3;
+        uint64_t last = ld_last(&x);
+        if (r % 4 == 1) /* the floor covers the segment about to be flushed */
+            fl = last;
+        else /* it lags a round */
+            fl = MAX(fl, prev);
+        write_ack(flf, fl);
+        eng_leader_keep_floor(x.ld, fl, fl);
+        pl_tell(x.ld);
+        if (r % 2 == 1 && eng_flush(x.ld) != 0)
+            return 6;
+        pl_tell(x.ld);
+        prev = last;
+        if (r % 4 == 3) { /* the process restarts its leader */
+            if (eng_close(x.ld) != 0)
+                return 8;
+            xp_open_leader(&x);
+            pl_tell(x.ld);
+            eng_leader_keep_floor(x.ld, fl, fl); /* the driver's first save after the attach */
+            pl_tell(x.ld);
+        }
+    }
+    eng_close(x.ld);
+    return 0;
+}
+
+static void case_power_leader_kept(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss of a leader's kept segments: skipped (no %s)\n", SHIM);
+        return;
+    }
+    char dir[PATH_MAX], ack[PATH_MAX + 16], flf[PATH_MAX + 32];
+    snprintf(ack, sizeof ack, "%s/acks-of-pl.ack", S);
+    snprintf(flf, sizeof flf, "%s.floor", ack);
+    int crashes = 0, raised = 0;
+    bool finished = false;
+    for (int k = 0; k < 4000 && !finished; k++) {
+        fresh(dir, "pl");
+        unlink(ack);
+        unlink(flf);
+        int code = run_power_child_as("--powerlk", dir, dir, ack, k, k + 1);
+        if (code != 99 && code != 0)
+            fprintf(stderr, "PL: step %d: the child ended with status %d\n", k, code);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        uint64_t told = read_ack(ack), floor = read_ack(flf);
+        eng *db;
+        int rc = open_replica(dir, floor, &db);
+        if (rc != 0) {
+            fprintf(stderr, "PL: step %d: the open at floor %" PRIu64 " failed: %d\n", k, floor, rc);
+            failures++;
+            continue;
+        }
+        uint64_t first = replica_test_open_first(db);
+        if (told > first) {
+            fprintf(stderr, "PL: step %d: the leader told a replay start of %" PRIu64 ", its directory reopened as a "
+                            "replica at floor %" PRIu64 " replays from %" PRIu64 "\n", k, told, floor, first);
+            failures++;
+        }
+        raised += told > 0;
+        if (replica_apply(db, replica_log_end(db)) != 0) {
+            fprintf(stderr, "PL: step %d: the log does not apply\n", k);
+            failures++;
+        }
+        eng_close(db);
+    }
+    CHECK(finished && crashes > 50 && raised > 0);
+    printf("  power lost at each of %d steps of a leader flushing, saving `kept` and restarting: the replay start "
+           "told is never above what its directory replays as a replica\n", crashes);
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -7288,6 +7497,11 @@ int main(int argc, char **argv)
         if (argc >= 5) /* the mutant of the parent run: the child is a process of its own */
             eng_test_mutant = mutant_of(argv[4]);
         return power_child(argv[2], argv[3]);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--powerlk") == 0) {
+        if (argc >= 5)
+            eng_test_mutant = mutant_of(argv[4]);
+        return powerlk_child(argv[2], argv[3]);
     }
     if (argc >= 4 && strcmp(argv[1], "--powerk") == 0) {
         if (argc >= 5)
@@ -7425,7 +7639,9 @@ int main(int argc, char **argv)
     }
     if (getenv("TEST_REPLICA_KEPT_ONLY")) { /* the quick run of D17's cases (RSTATE kept, the replay start) */
         case_replaykept();
+        case_leader_replay();
         case_power_kept();
+        case_power_leader_kept();
         sh("rm -rf '%s'", S);
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
@@ -7433,6 +7649,7 @@ int main(int argc, char **argv)
     if (getenv("TEST_REPLICA_POWER_ONLY")) { /* the power losses alone (they need libcrashfs.so beside the binary) */
         case_power();
         case_power_kept();
+        case_power_leader_kept();
         case_power_commit();
         case_rstate_crash();
         case_promote_crash();
@@ -7487,6 +7704,7 @@ int main(int argc, char **argv)
     case_basic();
     case_keepcap();
     case_replaykept();
+    case_leader_replay();
     case_cut();
     case_cut_publish();
     case_refused();
@@ -7573,6 +7791,7 @@ int main(int argc, char **argv)
         case_commit_random(seed);
     case_power();
     case_power_kept();
+    case_power_leader_kept();
     case_power_commit();
     case_rstate_crash();
     case_leader_power();

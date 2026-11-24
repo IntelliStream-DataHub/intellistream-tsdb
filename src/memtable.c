@@ -1619,6 +1619,7 @@ void eng_leader_keep_floor(eng *db, uint64_t pos, uint64_t floor)
 {
     atomic_store(&db->lead_saved, MAX(pos, floor));
     atomic_store(&db->lead_keep, pos);
+    leader_replay_floor(db); /* lrq_mu, a leaf: never waits for flush_lock */
     if (pthread_mutex_trylock(&db->flush_lock) != 0)
         return;
     leader_unlink_due(db);

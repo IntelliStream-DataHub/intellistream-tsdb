@@ -78,7 +78,8 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_REPLICA_WALSEQ_UNLOCKED, MUT_REPLICA_CUT_WALSEQ_UNLOCKED,
        MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
        MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC, MUT_JR_BARGE,
-       MUT_REPLAY_KEPT_EARLY, MUT_REPLAY_START_LOG, MUT_REPLAY_START_HIGH, MUT_REPLAY_START_UNSAVED };
+       MUT_REPLAY_KEPT_EARLY, MUT_REPLAY_START_LOG, MUT_REPLAY_START_HIGH, MUT_REPLAY_START_UNSAVED,
+       MUT_REPLAY_LEAD_NOFLOOR, MUT_REPLAY_OPEN_NONE, MUT_REPLAY_OPEN_NOFLOOR };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1542,6 +1543,9 @@ int jr_precommit(struct eng *db, size_t n);
 int leader_rs_drop(struct eng *db, int64_t ts);
 int leader_rs_open(struct eng *db);
 int leader_rs_kept(struct eng *db, uint64_t seq, uint64_t fno_end);
+/* After the driver saved a commit floor (eng_leader_keep_floor, lead_saved): lead_replay rises to the end of every kept
+ * segment whose last position the floor covers (D17: never above what a reopen at that floor replays). */
+void leader_replay_floor(struct eng *db);
 /* The DROPs below `lo`, the first position the leader's log may still hold (its kept segments went up to there), leave
  * RSTATE's list in memory; the next save writes the shorter list (r3a2 R8). Takes publish_lock; a no-op on a
  * writer that is not a leader. */
@@ -1650,6 +1654,7 @@ uint64_t replica_replay_start(struct eng *db);
 /* tests: the records a replica's applier applied since its open (the open's replay included) */
 uint64_t replica_test_napplied(struct eng *db);
 uint64_t replica_test_open_first(struct eng *db); /* tests: the first position the open's cursor read */
+bool replica_test_mu_free(struct eng *db); /* tests: rp->mu is not held (by this thread or another) */
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed
  * (the write may or may not be applied). `hook`: report the wait through the write wait hook (a server thread is
  * held). Takes lead_mu only (a leaf). */
@@ -1929,6 +1934,12 @@ struct eng {
     uint64_t wtail_from;
     _Atomic uint64_t lead_floor;
     _Atomic uint64_t lead_replay; /* a leader's replay start: the end of the `kept` RSTATE holds durably (0: none) */
+    /* The ends of the kept segments (RSTATE holds them durably) whose last position is still above the commit floor
+     * the driver saved (lead_saved): the same directory reopened as a replica at that floor replays them
+     * (replica_open_log), so lead_replay passes one only once the floor does (leader_replay_floor). lrq_mu is a leaf. */
+    pthread_mutex_t lrq_mu;
+    uint64_t *lrq;
+    size_t nlrq, caplrq;
     uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
     uint64_t wal_open_removed; /* wal_open: the segments up to this are gone (a failed unlink or rename at open stops it) */
     /* the change feed (feed.h, feedfile.c, feedclean.c). Lock order: feed_lock is a leaf, never held while an engine

@@ -1411,7 +1411,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
            * core sends it in its ACKs (a leader uses its own), and the leader's replay floor rises with it */
             pthread_mutex_unlock(&rv->mu);
             uint64_t rs = replica_replay_start(db);
-            pthread_mutex_lock(&rv->mu);
+            pthread_mutex_lock(&rv->mu); /* rv->core again: only this thread swaps it (demote, promote) */
             if (rs)
                 repl_replay_start(rv->core, rs);
         }
