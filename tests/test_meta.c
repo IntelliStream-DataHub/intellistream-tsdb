@@ -815,7 +815,7 @@ static void test_replica_set(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 5);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 6);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -841,7 +841,7 @@ static void test_replica_set(void)
     {
         meta_op_replica_reset(&e, 2, 3, 3, 7200);
         meta_entry_finish(&e);
-        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME2", 4) == 0);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME3", 4) == 0);
         uint64_t h = meta_hash(&m);
         memcpy(e.buf, "TME1", 4);
         CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
