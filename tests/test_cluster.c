@@ -12493,7 +12493,7 @@ static void scen_ecadd(void)
     float val = 0;
     if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
         die("a write to e42 with every replica up: %s", ers(rc));
-    for (uint64_t t1 = now_ms(); rows_in(Cs, sid, ts, ts, 30000) != 1 || rows_in(B, sid, ts, ts, 30000) != 1;
+    for (uint64_t t1 = now_ms(); rows_in(Cs, sid, ts, ts + 1, 30000) != 1 || rows_in(B, sid, ts, ts + 1, 30000) != 1;
          usleep(50000))
         if (now_ms() - t1 > 30000)
             die("servers %d and %d do not both hold the row written to e42 with every replica up", Cs, B);
