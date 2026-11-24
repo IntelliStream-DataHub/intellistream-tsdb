@@ -191,6 +191,11 @@ enum {
     RM_STALLCATCHUP,
     RM_DEMOTESTALEIDX, /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
     RM_DIVERGEISR,     /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
+    RM_SETKEEPOLD,     /* rset.c: a driver keeps the replica set it opened with (a learner never joins) */
+    RM_SETNOVERSION,   /* rset.c: a peer message of any set version reaches the driver */
+    RM_SETDRVNOREMAP,  /* rset.c: the core is remapped at a set change, the driver's cursors are not */
+    RM_SETNEXTSTALE,   /* rset.c: a newer record that came while the queue drained is applied with the old maps */
+    RM_SETOLDOFNODE,   /* rset.c: old_of by node alone: a reset member keeps its old index's ack (test_cluster resetlost) */
     RM_SNAPNOVERIFY,    /* rsnap.c: a received file is not compared with SNAPMAN's xxh64 */
     RM_SNAPSAMELINK,    /* rsnap.c: a snapshot's files go on kind 2, the COMMITs' link (D7) */
     RM_SNAPNOSPACECHECK, /* rsnap.c: the receiver takes a snapshot whatever its free space (D5) */
@@ -271,6 +276,11 @@ struct repld_g {
                          test_cluster transferraftdrain: a drain the Raft leader's kill leaves behind) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
+    int set_drain_wait; /* TSDB_REPLD_TEST=setdrainwait: a set change's first drain lets rv->mu go for up to 10 s, until a
+                         * newer record comes (rset.c; test_cluster setnext) */
+    int set_stale;    /* TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, a set change is not applied (rset.c) */
+    int keep_all;     /* TSDB_REPLD_TEST=keepall: a writer's keep bound stays 0, every segment kept (a learner fills from
+                       * 1); <dir>/keepoff lifts it */
     struct rin *ins; /* bulk files being received */
 };
 
@@ -283,6 +293,8 @@ struct repld_g {
 #define post rd_post
 #define save_repl rd_save_repl
 #define rec_set rd_rec_set
+#define drain rd_drain
+#define vol_fail rd_vol_fail
 
 extern struct repld_g G;
 
@@ -298,5 +310,9 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n);
 int save_repl(struct rvol *rv, uint64_t fence, uint64_t led, uint64_t floor);
 /* rv->rec = *r with G.nshort kept (rv->mu held, or the volume not yet listed) */
 void rec_set(struct rvol *rv, const struct cluster_vol_rec *r);
+/* carries out the core's queued actions (rv->mu held, the volume's thread; let go of around an APPLY or a SAVE) */
+void drain(struct rvol *rv);
+/* the volume stops: reported LOCAL_FAULT, quiesced (rv->mu held) */
+void vol_fail(struct rvol *rv, const char *why);
 
 #endif

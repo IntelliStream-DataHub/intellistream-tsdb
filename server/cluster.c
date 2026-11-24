@@ -1151,6 +1151,8 @@ static struct {
                           * ("TO KIND VOLUME EPOCH NODE ARG" per line) and removes the file once every one went out
                           * (test_cluster volcmd: the frame, its self-delivery and repld's routing, until R4's tracks send) */
     char volcmdfile[1100];
+    int setop_file;      /* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes <state-dir>/setop (cset.c) */
+    char setopfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1160,6 +1162,10 @@ static struct {
     int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
                           * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
     char holdcopyfile[1100];
+    uint64_t copy_lag_ns; /* TSDB_CLUSTER_TEST copy_lag_ms=N: the main loop publishes no copy for N ms after a push to the
+                           * volume manager (test_cluster removereplica: the manager judges a removal by a copy at least as
+                           * new as the push, which vol_watch_duty publishes first) */
+    uint64_t pushed_ns;
     int hold_users;      /* TSDB_CLUSTER_TEST hold_users_file=1: the users watch is given nothing while
                           * <state-dir>/holdusers exists (test_cluster forward: an owner whose users lag the entry's) */
     char holdusersfile[1100];
@@ -1409,6 +1415,8 @@ static void test_knobs(void)
             C.hold_raft = v != 0;
         else if (sscanf(p, "hold_copy_file=%llu", &v) == 1)
             C.hold_copy = v != 0;
+        else if (sscanf(p, "copy_lag_ms=%llu", &v) == 1)
+            C.copy_lag_ns = v * MS;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
         else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
@@ -1431,6 +1439,8 @@ static void test_knobs(void)
             C.hold_reply = v != 0;
         else if (sscanf(p, "volcmd_file=%llu", &v) == 1)
             C.volcmd_file = v != 0;
+        else if (sscanf(p, "setop_file=%llu", &v) == 1)
+            C.setop_file = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -5698,6 +5708,10 @@ static void vol_watch_duty(void)
         say("holds replicas of %" PRIu32 " volumes more than the %d this server makes, opens and reports; those past"
             " volume %" PRIu32 " are not opened", over, CLUSTER_REPORT_VOLS, recs[n - 1].number);
     said_over = over > said_over ? over : said_over;
+    /* the copy first: the volume manager judges a push that no longer names a volume by the copy (cvolset_mgr.c's
+     * removed_here, the start sweep), which must hold every entry the push was made from, never the round before */
+    copy_publish();
+    C.pushed_ns = mono_ns();
     g_vwatch(g_vwatch_arg, C.id, recs, n);
 }
 
@@ -6525,6 +6539,8 @@ static void leader_duties(uint64_t now)
     cmove_duty(now);
     if (C.volcmd_file && cl_leading())
         volcmd_file_send();
+    if (C.setop_file && cl_leading())
+        cset_setop_file(C.setopfile);
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -6719,7 +6735,8 @@ static void *cluster_main(void *arg)
                     c->dead = 1;
             }
         }
-        copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
+        if (!C.copy_lag_ns || since(mono_ns(), C.pushed_ns) >= C.copy_lag_ns)
+            copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
         size_t n0 = C.nconns;
         if (pfcap < n0 + 3) {
             pfcap = (n0 + 3) * 2;
@@ -6847,6 +6864,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
+    snprintf(C.setopfile, sizeof C.setopfile, "%s/setop", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     if (C.users_probe)

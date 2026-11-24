@@ -70,5 +70,7 @@ void cmove_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cmove_duty(uint64_t now);
 /* server/cset.c (r4-setchg): CLUSTER_OP_REPLICA_RESET */
 void cset_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+/* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes the REPLICA_ADD/REMOVE/RESET lines of <state-dir>/setop */
+void cset_setop_file(const char *path);
 
 #endif

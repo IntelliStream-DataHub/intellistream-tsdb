@@ -181,6 +181,18 @@ cgroup, so `nice` does not keep your work out of its way.
   open; a missing, unreadable or CORRUPT REPL, another identity and a failed save refuse the volume with a line naming the
   path; `tests/test_cvolfs.c`: power loss at every step under crashfs, mutants `nosync nodirsync nononce trustunsure tornstale samerid`,
   also settable as `TSDB_CVOL_MUTANT` in tsdbd for `test_cluster volumes`), `server/cvol.c` the manager thread above it.
+  Replica set changes (R4, r4-setchg; design-cluster.md 8.3): `server/rset.c` applies a new `set_version` in the driver
+  on the volume thread (`rset_change` keeps a newer record, `rset_apply` drains the core, `repl_reconfig` with `old_of`
+  by node AND rid, so a reset member is new; the driver's cursors move with their members; a newer record that came
+  during the drain restarts the apply; messages of another set version are dropped and counted; it defers during a
+  snapshot), `server/cvolset.c` the manager's side on disk (a removed replica closed, renamed `.removed-<rid>`
+  and deleted in the background; at prepare, a v<N> of another rid that the group never saw opened is set aside as
+  `stale-<rid>`, or `lost-<rid>` after a reset this server saw; a missing v<N> with a recorded open is refused naming
+  `tsdb cluster replica reset`), `server/cvolset_mgr.c` (the push's RESET and UNNAMED, the start sweep),
+  `server/cset.c` (REPLICA_RESET on the Raft leader, refused for the leader and ISR members; the `setop_file` test hook
+  for ADD/REMOVE). Tests: `test_cluster addreplica setnext addswitch removereplica removeindex removedown setstale
+  setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). Until a fresh replica can be
+  filled by snapshot, the fill tests keep every leader segment (`TSDB_REPLD_TEST=keepall`).
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
