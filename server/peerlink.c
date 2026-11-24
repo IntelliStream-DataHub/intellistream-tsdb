@@ -41,6 +41,7 @@
 #include "../src/compat.h" /* macOS: accept4, SOCK_CLOEXEC; nothing on Linux */
 
 int peerlink_mutant;
+int peerlink_test_cut_end;
 
 #define TAG 32
 #define MS 1000000ull
@@ -528,9 +529,11 @@ struct peerlink {
     int nhand;           /* under mu: adopt threads still in their handshake (bounded: MAX_HAND) */
     pthread_t lthr;
     int lfd, lthr_valid;
-    pthread_mutex_t bmu; /* the bulk token bucket */
-    uint64_t vt;
-    _Atomic uint64_t rate;
+    pthread_mutex_t bmu; /* the bulk token buckets, one per data kind (R4 D7: a kind of its own never waits behind
+                          * another's files: a snapshot's on kind 5 does not hold a COMMIT's on kind 2) */
+    uint64_t vt[PL_KIND_DATA_MAX + 1];
+    _Atomic uint64_t rate;                          /* every kind without a rate of its own */
+    _Atomic uint64_t krate[PL_KIND_DATA_MAX + 1]; /* 0: `rate` */
     struct pl_stats st;
 };
 
@@ -814,26 +817,39 @@ int plink_bulk_send(struct plink *l, const struct pl_job *job)
 }
 
 /* ---- the token bucket: 0 when `n` bytes may go now (and are counted), else the nanoseconds to wait */
-static uint64_t bucket_take(struct peerlink *pl, size_t n)
+static uint64_t bucket_take(struct peerlink *pl, int kind, size_t n)
 {
-    uint64_t rate = atomic_load(&pl->rate);
+    if (kind < 0 || kind > PL_KIND_DATA_MAX || peerlink_mutant == PL_MUT_KINDBUCKET)
+        kind = 0; /* PL_MUT_KINDBUCKET: every kind in one bucket at the node-wide rate (r3d's) */
+    uint64_t rate = peerlink_mutant == PL_MUT_KINDBUCKET ? 0 : atomic_load(&pl->krate[kind]);
+    if (!rate)
+        rate = atomic_load(&pl->rate);
     if (rate == PL_RATE_UNLIMITED || peerlink_mutant == PL_MUT_NOTHROTTLE)
         return 0;
     if (!rate)
         rate = PL_BULK_RATE_DEFAULT;
     uint64_t now = now_ns(), burst = 50 * MS, cost = (uint64_t)((double)n * 1e9 / (double)rate), wait = 0;
     pthread_mutex_lock(&pl->bmu);
-    if (pl->vt <= now) {
+    uint64_t *vt = &pl->vt[kind];
+    if (*vt <= now) {
         uint64_t floor = now > burst ? now - burst : 0;
-        pl->vt = (pl->vt > floor ? pl->vt : floor) + cost;
+        *vt = (*vt > floor ? *vt : floor) + cost;
     } else {
-        wait = pl->vt - now;
+        wait = *vt - now;
     }
     pthread_mutex_unlock(&pl->bmu);
     return wait;
 }
 
 void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s) { atomic_store(&pl->rate, bytes_per_s); }
+
+int peerlink_set_kind_rate(struct peerlink *pl, int kind, uint64_t bytes_per_s)
+{
+    if (kind < PL_KIND_LOG || kind > PL_KIND_DATA_MAX)
+        return PL_E_INVALID;
+    atomic_store(&pl->krate[kind], bytes_per_s);
+    return PL_OK;
+}
 
 /* ---- sockets */
 
@@ -1369,6 +1385,14 @@ static int conn_msg(void *arg, const struct pl_msg *m)
             c->rx.next != c->rx.total)
             return -1;
         int st = pl_xxh_final(&c->rx.h) == m->b || peerlink_mutant == PL_MUT_ENDHASH ? PL_OK : PL_E_HASH;
+        if (st == PL_OK && c->l && c->l->kind == PL_KIND_SNAP &&
+            __atomic_load_n(&peerlink_test_cut_end, __ATOMIC_RELAXED) > 0 &&
+            __atomic_sub_fetch(&peerlink_test_cut_end, 1, __ATOMIC_RELAXED) == 0) {
+            fprintf(stderr, "TEST: a kind-5 connection cut after the end of file %" PRIu64 ", before its DONE"
+                    " (snapcutdone)\n", m->file);
+            rx_end(c, st);
+            return -1; /* the connection goes down: the sender begins the file again on the next one */
+        }
         send_done(c, m->file, st);
         rx_end(c, st);
         return 0;
@@ -1462,7 +1486,7 @@ static uint64_t job_send(struct conn *c)
             break;
         }
         size_t n = q->j.length - c->jnext < chunk ? (size_t)(q->j.length - c->jnext) : chunk;
-        uint64_t w = bucket_take(pl, n);
+        uint64_t w = bucket_take(pl, c->l->kind, n);
         if (w)
             return w;
         if (!c->cbuf && !(c->cbuf = malloc(chunk)))

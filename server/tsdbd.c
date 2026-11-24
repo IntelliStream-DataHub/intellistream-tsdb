@@ -2824,7 +2824,7 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 : 0);
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 + 400 : 0);
     char *t = malloc(cap + 4);
     if (!t) {
         cluster_copy_put(cp);
@@ -2853,6 +2853,13 @@ static void handle_status(req *r)
                    (unsigned)fr[i].peer, fr[i].p99_us);
         ST_PUT("fwd.late_dropped=%llu\nfwd.inflight=%d\n", (unsigned long long)fwdr_tab_dropped(fwd_tab),
                atomic_load(&fwd_inflight));
+        struct rsnap_stats ss; /* snapshot transfers (server/rsnap.c) */
+        rsnap_get_stats(&ss);
+        ST_PUT("snap.asked=%llu\nsnap.sent=%llu\nsnap.received=%llu\nsnap.refused_space=%llu\nsnap.failed=%llu\n"
+               "snap.busy=%llu\nsnap.bytes_sent=%llu\nsnap.bytes_received=%llu\nsnap.last_s=%.3f\n",
+               (unsigned long long)ss.asked, (unsigned long long)ss.sent, (unsigned long long)ss.received,
+               (unsigned long long)ss.refused_space, (unsigned long long)ss.failed, (unsigned long long)ss.busy,
+               (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -3685,6 +3692,14 @@ static size_t fwd_metrics_rows(metrics_fwd_peer *out, size_t cap)
     for (size_t i = 0; i < n; i++)
         out[i] = (metrics_fwd_peer){r[i].peer, r[i].frames, r[i].bytes, r[i].p50_us, r[i].p99_us};
     return n;
+}
+
+static void snap_metrics(metrics_snap *out)
+{
+    struct rsnap_stats s;
+    rsnap_get_stats(&s);
+    *out = (metrics_snap){s.asked, s.sent, s.received, s.refused_space, s.failed, s.busy, s.bytes_sent,
+                          s.bytes_received, (double)s.last_ms / 1000};
 }
 
 static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */
@@ -5996,6 +6011,7 @@ int main(int argc, char **argv)
                           .workers = workers_now,
                           .request_memory = request_memory_now,
                           .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL,
+                          .snap = cluster_on ? snap_metrics : NULL,
                           .vol_diverged = metrics_vol_diverged};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */

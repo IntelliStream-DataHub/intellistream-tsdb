@@ -2629,6 +2629,50 @@ static void ro_open_timeout(int sig)
     _exit(1);
 }
 
+/* wal_flushed and wal_active as the MANIFEST file of `dir` names them now (what a read-only open reads first) */
+static bool man_bounds(const char *dir, uint64_t *flushed, uint64_t *active)
+{
+    char path[PATH_MAX + 16], line[256];
+    snprintf(path, sizeof path, "%s/MANIFEST", dir);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    int got = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long v;
+        if (sscanf(line, "wal_flushed %llu", &v) == 1)
+            *flushed = v, got |= 1;
+        else if (sscanf(line, "wal_active %llu", &v) == 1)
+            *active = v, got |= 2;
+    }
+    fclose(f);
+    return got == 3;
+}
+
+/* A read-only open of a replica's or promoted replica's directory (docs/tasks/replica-ro-tails.md; jepsen-cluster's
+ * end check opens stopped replicas, promoted ones among them), compared with `w`, the engine that has the rows. In
+ * case_promote it is called in the state where wal_flushed is still below the jump of segment numbers and wal_active
+ * above it (the tail loop of follow_refresh walks the numbers between them, MAX_TAILS of them at most), and after. */
+static bool ro_dir_same(eng *w, const char *dir, int64_t hi, const char *what)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.read_only = 1;
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    eng *ro = NULL;
+    int rc = (eng_open)(dir, &o, &ro);
+    if (rc != 0) {
+        fprintf(stderr, "%s: read-only open of %s: %d\n", what, dir, rc);
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t s = 0; s < NS; s++)
+        ok &= eq_range(w, ro, s, T0 - 1000, hi, what);
+    eng_close(ro);
+    return ok;
+}
+
 static void case_ro_open(void)
 {
     xport x;
@@ -3826,6 +3870,17 @@ static void case_promote(int variant)
         CHECK(eq_range(x.ld, x.rep, s, T0 - 1000, far + 10000, "P: promoted candidate"));
         CHECK(eq_range(x.ld, b, s, T0 - 1000, far + 10000, "P: other member"));
     }
+    { /* The state docs/tasks/replica-ro-tails.md asks for, made on purpose: both directories hold the new epoch's
+       * segment (wal_active = epoch << 40) and have flushed nothing since (wal_flushed is still a number of the old
+       * epoch), so the tail walk of a read-only open has the whole jump between its bounds. The MANIFEST is read from
+       * the file, so the case fails loudly should the engine ever stop leaving this state (the run that made it
+       * showed 1..4 against 2^40 in every variant). The opens below are the ones jepsen-cluster's end check makes. */
+        uint64_t fl = 0, ac = 0;
+        CHECK(man_bounds(rd, &fl, &ac) && fl < ((uint64_t)1 << 40) && ac >= ((uint64_t)1 << 40));
+        CHECK(man_bounds(bd, &fl, &ac) && fl < ((uint64_t)1 << 40) && ac >= ((uint64_t)1 << 40));
+        CHECK(ro_dir_same(x.ld, rd, far + 10000, "P: the candidate, epoch segment made, no flush since, read-only"));
+        CHECK(ro_dir_same(x.ld, bd, far + 10000, "P: the other member, epoch segment made, no flush since, read-only"));
+    }
     uint64_t old[256];
     size_t nold = wal_seqs(rd, old, 256);
     CHECK(nold >= 2 && nold < 256);
@@ -3839,6 +3894,8 @@ static void case_promote(int variant)
     CHECK_EQ(n->fno_next, pos + 1); /* the numbers go on */
     for (uint32_t s = 0; s < NS; s++)
         CHECK(eq_range(x.ld, n, s, T0 - 1000, far + 10000, "P: new writer"));
+    /* after the promotion's own flush (wal_flushed = the epoch's segment): a read-only open of the directory */
+    CHECK(ro_dir_same(n, rd, far + 10000, "P: promoted, after its flush, read-only"));
     /* the old leader is gone: the writer leads, the other member follows */
     eng_close(x.ld);
     x.ld = n;
@@ -3924,6 +3981,8 @@ static void case_promote(int variant)
     xp_step(&x, "P: a class switch after promotion");
     xp_rows(&x, 0, 50, 6, 70);
     xp_step(&x, "P: small after promotion");
+    CHECK(ro_dir_same(x.ld, rd, far + 10000, "P: promoted, small rows in the new segment, read-only"));
+    CHECK(ro_dir_same(x.ld, bd, far + 10000, "P: the other member's directory, read-only"));
     xp_rows(&x, 1, 0, 40, 800);
     xp_step(&x, "P: large after promotion");
     { /* a sealed segment that never got a record, among the kept ones under the jump (a member killed right after a
