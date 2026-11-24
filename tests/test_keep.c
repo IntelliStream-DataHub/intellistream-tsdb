@@ -734,6 +734,9 @@ static void case_relpower(void)
         if (chdir(scratch) != 0)
             _exit(4);
         setenv("TEST_KEEP_RELCHILD", scratch, 1);
+        char asan[512]; /* an ASan build: the shim is preloaded ahead of the runtime */
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
         setenv("LD_PRELOAD", shim, 1);
         setenv("CRASHFS_ROOT", root, 1);
         setenv("CRASHFS_AT_EXIT", "1", 1);
