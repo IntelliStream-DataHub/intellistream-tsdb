@@ -50,7 +50,7 @@ log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 # ---- build link-bench on both servers (-O3 and no -march, as make dist builds: the MAC kernels pick their own level)
 LB_FILES="tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h tools/blake3 client/tsdb_crypto.c
-    client/tsdb_crypto.h"
+    client/tsdb_crypto.h server/plcheck.h server/xxhash"
 LB_BUILD='set -e; for k in sse2:-msse2 sse41:-msse4.1 avx2:-mavx2 avx512:-mavx512f,-mavx512vl; do
     gcc -O3 $(echo ${k#*:} | tr , " ") -c -o b3_${k%%:*}.o tools/blake3/blake3_${k%%:*}.c; done
     gcc -std=gnu11 -O3 -o link-bench tools/link-bench.c tools/mac_cands.c tools/blake3/blake3.c \

@@ -136,8 +136,9 @@
 #define CL_VERSION PL_CL_VERSION /* 2: heartbeat sections, flags in PROBE_REPLY; 3: the R3 settings in INIT, VOLUME_ADD; 4: the link
                       * kind in HELLO (data links, peerlink.h); 5: HBS_LEASE, HBS_UNREACH and
                       * the lease fields of HB_ACK; 6: replwire RW_VERSION 2; 7: R4's F_VOLCMD and VOLMSG
-                      * READY (one release: dev clusters are initialised again); peers of another version
-                      * are refused (no mixed versions) */
+                      * READY (one release: dev clusters are initialised again); 8: the data links' frame check
+                      * (peerlink.h, plcheck.h); peers of another version are refused with a line naming both
+                      * (no mixed versions) */
 #define RING 4096
 #define RING_BYTES (64ull << 20) /* the ring's entries hold at most this many bytes (a user's blob is up to 1 MiB, and every
                                   * grant puts it again): the oldest go first, a watcher behind them gets a snapshot */
@@ -5252,6 +5253,9 @@ static void handshake(struct conn *c, uint8_t type, struct rd *r)
         getn(r, c->nc, 32);
         getstr(r, c->peer, sizeof c->peer);
         uint8_t kind = get8(r);
+        if (magic == CL_MAGIC && ver != CL_VERSION) /* no mixed versions: say which, so an operator sees why */
+            say("refused a peer of cluster version %u (node %" PRIu32 ", %s): this server speaks %u", (unsigned)ver, id,
+                r->bad ? "?" : c->peer, (unsigned)CL_VERSION);
         if (r->bad || magic != CL_MAGIC || ver != CL_VERSION) {
             c->dead = 1;
             return;

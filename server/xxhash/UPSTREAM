@@ -1,0 +1,9 @@
+repository: https://github.com/Cyan4973/xxHash
+tag: v0.8.3 (archive refs/tags/v0.8.3.tar.gz, sha256 aae608dfe8213dfd05d909a57718ef82f30722c392344583d3f39050c7f29a80)
+files: xxhash.h LICENSE
+license: BSD-2-Clause (xxhash.h's own header and LICENSE; the upstream's command line tool is GPL-2.0 and is not copied)
+unchanged copies, never edit them: a new version replaces both files and this one.
+used by: server/plcheck.h (XXH_INLINE_ALL: every symbol static), the data links' frame check of peerlink.c from cluster
+version 8 (docs/design-rdma.md §6), and tools/mac_cands.c (link-bench mac: the xxh3-64 and xxh3-128 rows).
+sha256 xxhash.h: 17973c0dc49d9854ca26caa191f0e12f7a424b68858d9a78de3860d959d85e4b
+sha256 LICENSE: 6ffedbc0f7878612d2b23589f1ff2ab15633e1df7963a5d9fc750ec5500c7e7a

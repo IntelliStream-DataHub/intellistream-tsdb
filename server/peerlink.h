@@ -6,11 +6,14 @@
  * opaque payloads of the driver (r3d-stream); nothing here knows a replication message.
  *
  * Wire (server/cluster.c's header has the metadata side): the dialer sends the cluster HELLO with its link kind
- * (PL_KIND_LOG or PL_KIND_BULK; the metadata kind is 0) after the peer address, the acceptor answers HELLO_ACK, the
- * dialer AUTH, the MACs and keys exactly as there but under their own labels ("tsdb-link-..."), so a metadata
- * link's key is never a data link's. From AUTH on every frame is [u32 len][u8 type][payload][tag 32], len counting
- * all after itself, tag = HMAC-SHA256(key of that direction, seq u64 | type | payload), seq counting from 0 per
- * direction: a frame that was changed, dropped, repeated or reordered ends the link.
+ * (PL_KIND_LOG or PL_KIND_BULK; the metadata kind is 0) after the peer address and then the frame check types it
+ * runs (u8 bit set, plcheck.h), the acceptor answers HELLO_ACK with the type it chose, the dialer AUTH, the MACs
+ * exactly as there but under their own labels ("tsdb-link-..."), so a metadata link's MAC is never a data link's: the
+ * cluster secret is proven both ways once per connection. From AUTH on every frame is [u32 len][u8 type][payload]
+ * [check 16], len counting all after itself, check = XXH3-128(type | payload) seeded with the direction's salt (from the
+ * handshake) ^ seq, seq counting from 0 per direction: a frame that was changed, dropped, repeated or reordered, or
+ * comes from another connection, ends the link. The check is integrity only, not a MAC (docs/design-rdma.md §6, D1:
+ * the cluster runs on its own servers; a keyed type can be negotiated later).
  *
  * Frame types: 1..0x6f the driver's (opaque, at most PL_FRAME_MAX); 0x70.. are the link's own (BEGIN, RESUME, CHUNK,
  * END, DONE, PING, PONG; peerlink.c lists them). Bit 0x80 on a log link's frame says its payload is [u32 raw
@@ -53,7 +56,8 @@
                                  * HB and HB_ACK (r3e-leases), 6 the replication messages' set version and replay
                                  * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard;
                                  * 7 R4's F_VOLCMD and VOLMSG READY (r4-iface): a peer of 6 drops the connection that
-                                 * carries Raft at the first VOLCMD */
+                                 * carries Raft at the first VOLCMD; 8 the data links' frame check (XXH3-128 in place
+                                 * of HMAC-SHA256, its type negotiated in HELLO and HELLO_ACK; rd-mac) */
 
 /* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
  * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a
@@ -261,15 +265,16 @@ struct pl_msg {
  * not well formed (a frame of another length than its type has, a bad zstd frame, a raw length that is not the
  * decoded size). Reads exactly n bytes of p. */
 int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own);
-/* Encodes a driver frame: [u32 len][type][payload][tag] into *out (malloc'ed); compresses when `compress` and it pays.
- * key/seq as a link's; returns the length, or 0 on failure. Used by the tests. */
-size_t pl_frame_encode(const uint8_t key[32], uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
+/* Encodes a driver frame: [u32 len][type][payload][check] into *out (malloc'ed); compresses when `compress` and it
+ * pays. check (a PL_CHECK_ type of plcheck.h), salt and seq as a link's direction; returns the length, or 0 on
+ * failure. Used by the tests. */
+size_t pl_frame_encode(int check, uint64_t salt, uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
                        uint8_t **out);
 
 /* A streaming splitter of the frames of one direction (what a link's reader does): feed bytes, each complete frame is
- * checked against its tag (unless skip_tag, for the fuzzer) and passed on. */
+ * verified against its check (unless skip_tag, for the fuzzer) and passed on. */
 struct pl_reader;
-struct pl_reader *pl_reader_new(const uint8_t key[32], int skip_tag);
+struct pl_reader *pl_reader_new(int check, uint64_t salt, int skip_tag);
 void pl_reader_free(struct pl_reader *r);
 /* 0 while the stream is good; -1 once it is not (a bad length, tag or body, or fn returned negative): nothing more is
  * accepted. Frames are decoded through pl_msg_decode and handed to fn (m is valid during the call). */
@@ -289,7 +294,7 @@ uint64_t pl_xxh_final(const struct pl_xxh *s);
 /* test hooks: a planted bug (tests/test_peerlink.c --mutant) */
 enum {
     PL_MUT_NONE = 0,
-    PL_MUT_NOTAG = 1,
+    PL_MUT_NOTAG = 1, /* a frame whose check is wrong is accepted */
     PL_MUT_SHAREDSOCKET = 2,
     PL_MUT_NOBACKPRESSURE = 3,
     PL_MUT_ACCAUTH = 4,     /* the acceptor does not check AUTH */
@@ -305,6 +310,9 @@ enum {
     PL_MUT_WBWRITTEN = 14,      /* at a cut, every tracked frame in the write buffer is reported written */
     PL_MUT_PAUSEDEAD = 15,      /* a paused link keeps its dead_ms check and PINGs only when it hears nothing */
     PL_MUT_KINDBUCKET = 16,     /* every kind shares one bucket at the peerlink's rate (no per-kind rate) */
+    PL_MUT_NOSEQ = 17,          /* the frame check leaves the sequence number out (a reorder or repeat passes) */
+    PL_MUT_NOSALT = 18,         /* the frame check leaves the connection's salt out (an old connection's frame passes) */
+    PL_MUT_CHECKTYPE = 19,      /* the acceptor takes a HELLO that offers no check type it runs */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */

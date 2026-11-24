@@ -61,6 +61,8 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
 FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
+# the data links' frame check: inline XXH3 (server/plcheck.h, server/xxhash); whoever includes it depends on both
+PLCHECK_HDR := server/plcheck.h server/xxhash/xxhash.h
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -514,7 +516,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -576,7 +578,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h server/replwire.h server/fwd.h server/chunksrv.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h $(PLCHECK_HDR) server/replwire.h server/fwd.h server/chunksrv.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -902,8 +904,9 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 # includes tsdbd.c, and the CLI
 $(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
-# the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it
-$(B)/peerlink.o: server/peerlink.c server/peerlink.h client/tsdb_crypto.h src/compat.h | $(B)
+# the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
+# frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
+$(B)/peerlink.o: server/peerlink.c server/peerlink.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h | $(B)
 	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
 # the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
 # it), tsdbd's instance over the cluster's member list in fwd_cluster.o
@@ -943,7 +946,7 @@ $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HD
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/test_peerlink: tests/test_peerlink.c server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the entry node's rules over a fake link (no sockets, no tsdbd)
 $(B)/test_fwd: tests/test_fwd.c server/fwdreq.h server/fwd.h server/peerlink.h $(B)/fwdreq.o
@@ -1113,7 +1116,7 @@ $(B)/b3_blake3_avx2.o: tools/blake3/blake3_avx2.c tools/blake3/blake3_impl.h | $
 	$(CC) -O3 -mavx2 -c -o $@ $<
 $(B)/b3_blake3_avx512.o: tools/blake3/blake3_avx512.c tools/blake3/blake3_impl.h | $(B)
 	$(CC) -O3 -mavx512f -mavx512vl -c -o $@ $<
-$(B)/link-bench: tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o
+$(B)/link-bench: tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h $(PLCHECK_HDR) $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) $(B3_DEF) -o $@ $< tools/mac_cands.c $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o -ldl
 
 $(B)/decode-bench: tools/decode-bench.c tools/common.h src/internal.h src/bitpack.h $(LIB)

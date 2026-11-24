@@ -7,6 +7,12 @@
  *   gmac        AES-128-GMAC (AES-NI + PCLMULQDQ), the sequence number as the 96-bit nonce, 16-byte tag
  *   poly1305    Poly1305 under a one-time key from ChaCha20 (RFC 8439 2.6, the sequence number as the nonce), 16 bytes
  *   blake3      keyed BLAKE3 (tools/blake3, its own SIMD dispatch), the first 16 bytes of the output
+ *   xxh3-64     integrity only, no key: XXH3-64 seeded with salt ^ seq (salt: the key's first 8 bytes), 8 bytes
+ *   xxh3-128    the same with XXH3-128, 16 bytes: peerlink's frame check from cluster version 8 (server/plcheck.h)
+ *
+ * The xxh3 ones hash the payload in one call when it is one piece (as peerlink, whose type, header and payload are
+ * contiguous); two pieces chain the second's seed from the first's hash (a bench approximation). They are compiled
+ * at the build's level (SSE2 without -march: what `make dist` gives tsdbd).
  *
  * A candidate the CPU cannot run says so at mc_init (-1). Bench code: not linked into tsdbd. */
 #ifndef TSDB_MAC_CANDS_H
@@ -15,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { MC_NONE, MC_HMAC, MC_HMAC_SHANI, MC_GMAC, MC_POLY1305, MC_BLAKE3, MC_N };
+enum { MC_NONE, MC_HMAC, MC_HMAC_SHANI, MC_GMAC, MC_POLY1305, MC_BLAKE3, MC_XXH3_64, MC_XXH3_128, MC_N };
 
 struct mc {
     int kind;

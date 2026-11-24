@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Data links (peerlink.h has the design and the wire). The file has four parts: bytes and hashes (a growing buffer,
- * the streaming xxh64, HMAC with the pads absorbed once per key), the frame codec (pl_msg_decode, pl_reader: what a
+ * the streaming xxh64, HMAC with the pads absorbed once per key for the handshake, the frames' check of plcheck.h), the
+ * frame codec (pl_msg_decode, pl_reader: what a
  * fuzzer reaches), the handshake (blocking, with deadlines, on the link's own thread) and the link threads.
  *
  * One thread runs one connection of one link: it owns the socket, the reader, the write buffer and the state of the
@@ -20,6 +21,7 @@
 #include "peerlink.h"
 
 #include "tsdb_crypto.h"
+#include "plcheck.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,11 +45,11 @@
 int peerlink_mutant;
 int peerlink_test_cut_end;
 
-#define TAG 32
+#define TAG PL_CHECK_LEN
 #define MS 1000000ull
 #define HS_FRAME_MAX 512
 #define HS_TR_MAX (HS_FRAME_MAX + 128)
-#define WIRE_MAX (PL_FRAME_MAX + 128) /* the longest frame after its length field: type, header, payload, tag */
+#define WIRE_MAX (PL_FRAME_MAX + 128) /* the longest frame after its length field: type, header, payload, check */
 #define WB_HIGH (1u << 20)            /* the link thread encodes no more while this much waits to be written */
 #define READ_BUF (256u << 10)
 #define MAX_JOBS 64
@@ -252,15 +254,18 @@ static void hk_mac(const struct hk *k, const void *a, size_t an, const void *b, 
     tsdb_sha256_final(&x, out);
 }
 
-/* the tag of one frame: its sequence number in that direction, its type and its payload (header and body) */
-static void frame_tag(const struct hk *k, uint64_t seq, uint8_t type, const void *h, size_t hn, const void *p,
-                      size_t pn, uint8_t out[32])
+/* one direction's frame check (plcheck.h): its type and the connection's salt for that direction */
+struct fck {
+    int type;
+    uint64_t salt;
+};
+
+/* the check of one frame whose type, header and payload are the n bytes at f, the frame's number in its direction
+ * `seq`: XXH3-128 seeded with salt ^ seq */
+static void frame_check(const struct fck *k, uint64_t seq, const uint8_t *f, size_t n, uint8_t out[TAG])
 {
-    uint8_t s[9];
-    for (int i = 0; i < 8; i++)
-        s[i] = (uint8_t)(seq >> (8 * i));
-    s[8] = type;
-    hk_mac(k, s, 9, h, hn, p, pn, "", 0, out);
+    uint64_t seed = peerlink_mutant == PL_MUT_NOSEQ ? k->salt : peerlink_mutant == PL_MUT_NOSALT ? seq : k->salt ^ seq;
+    pl_check(k->type, seed, f, n, out);
 }
 
 /* the handshake's MAC and the link keys: HMAC(secret, label | transcript) */
@@ -352,21 +357,22 @@ int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, ui
     }
 }
 
-/* [u32 len][type][hdr][payload][tag] appended to b; `hdr` is the compression header or a control frame's fields */
-static void frame_put(struct buf *b, const struct hk *k, uint64_t *seq, uint8_t type, const void *h, size_t hn,
+/* [u32 len][type][hdr][payload][check] appended to b; `hdr` is the compression header or a control frame's fields */
+static void frame_put(struct buf *b, const struct fck *k, uint64_t *seq, uint8_t type, const void *h, size_t hn,
                       const void *p, size_t pn)
 {
     uint8_t t[TAG];
-    frame_tag(k, (*seq)++, type, h, hn, p, pn, t);
     put32(b, (uint32_t)(1 + hn + pn + TAG));
+    size_t at = b->len;
     put8(b, type);
     put(b, h, hn);
     put(b, p, pn);
+    frame_check(k, (*seq)++, b->p + at, b->len - at, t);
     put(b, t, TAG);
 }
 
 /* a driver frame, compressed when it pays; `zc` is the thread's zstd context (NULL: a one-off) */
-static void frame_user(struct buf *b, const struct hk *k, uint64_t *seq, ZSTD_CCtx *zc, int compress, uint8_t type,
+static void frame_user(struct buf *b, const struct fck *k, uint64_t *seq, ZSTD_CCtx *zc, int compress, uint8_t type,
                        const void *p, size_t n)
 {
     if (compress && n >= COMPRESS_MIN) {
@@ -386,30 +392,29 @@ static void frame_user(struct buf *b, const struct hk *k, uint64_t *seq, ZSTD_CC
     frame_put(b, k, seq, type, "", 0, p, n);
 }
 
-size_t pl_frame_encode(const uint8_t key[32], uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
+size_t pl_frame_encode(int check, uint64_t salt, uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
                        uint8_t **out)
 {
-    struct hk k;
+    struct fck k = {check, salt};
     struct buf b = {0};
-    hk_init(&k, key, 32);
     frame_user(&b, &k, seq, NULL, compress, type, p, n);
     *out = b.p;
     return b.len;
 }
 
 struct pl_reader {
-    struct hk key;
+    struct fck key;
     int skip, bad;
     uint64_t seq;
     struct buf rb;
 };
 
-struct pl_reader *pl_reader_new(const uint8_t key[32], int skip_tag)
+struct pl_reader *pl_reader_new(int check, uint64_t salt, int skip_tag)
 {
     struct pl_reader *r = calloc(1, sizeof *r);
     if (!r)
         return NULL;
-    hk_init(&r->key, key, 32);
+    r->key = (struct fck){check, salt};
     r->skip = skip_tag;
     return r;
 }
@@ -440,7 +445,7 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
         const uint8_t *f = at + 4;
         size_t body = len - TAG;
         uint8_t t[TAG];
-        frame_tag(&r->key, r->seq++, f[0], "", 0, f + 1, body - 1, t);
+        frame_check(&r->key, r->seq++, f, body, t);
         if (!r->skip && peerlink_mutant != PL_MUT_NOTAG && !tsdb_ct_equal(t, f + body, TAG)) {
             r->bad = 1;
             break;
@@ -990,21 +995,42 @@ struct hello {
     uint32_t id;
     uint8_t uuid[16], ident[16], nc[32];
     int kind;
+    unsigned checks; /* the frame check types the dialer can run, bit (1 << type) each (plcheck.h) */
 };
 
-/* the HELLO body: magic, version, id, uuid, ident, nonce, address (u16 length + bytes), kind; -1 when it is not */
+/* the HELLO body of a data link: magic, version, id, uuid, ident, nonce, address (u16 length + bytes), kind, the
+ * check types offered (u8 bit set, from cluster version 8); -1 when it is not one. Another version is refused with a
+ * line naming both (cluster.c's acceptor says it first for the connections it hands over). */
 static int hello_parse(const uint8_t *p, size_t n, struct hello *h)
 {
-    if (n < 4 + 1 + 4 + 16 + 16 + 32 + 2 + 1 || le32(p) != PL_CL_MAGIC || p[4] != PL_CL_VERSION)
+    if (n < 4 + 1 + 4 + 16 + 16 + 32 + 2 + 1 || le32(p) != PL_CL_MAGIC)
         return -1;
+    if (p[4] != PL_CL_VERSION) {
+        fprintf(stderr, "peerlink: refused a link of cluster version %u (this server speaks %u)\n", (unsigned)p[4],
+                (unsigned)PL_CL_VERSION);
+        return -1;
+    }
     h->id = le32(p + 5);
     memcpy(h->uuid, p + 9, 16);
     memcpy(h->ident, p + 25, 16);
     memcpy(h->nc, p + 41, 32);
     size_t al = (size_t)p[73] | (size_t)p[74] << 8;
-    if (n != 75 + al + 1 || memchr(p + 75, 0, al))
+    if (n != 75 + al + 2 || memchr(p + 75, 0, al))
         return -1;
     h->kind = p[75 + al];
+    h->checks = p[76 + al];
+    return 0;
+}
+
+/* the acceptor's choice among the check types a HELLO offers: the highest both ends run, 0 when none */
+static int check_choose(unsigned offered)
+{
+    unsigned both = offered & PL_CHECKS_KNOWN;
+    if (peerlink_mutant == PL_MUT_CHECKTYPE && !both)
+        return PL_CHECK_XXH3;
+    for (int t = 7; t > 0; t--)
+        if (both & (1u << t))
+            return t;
     return 0;
 }
 
@@ -1025,17 +1051,20 @@ static int zero16(const uint8_t *u)
 }
 
 struct keys {
-    struct hk in, out;
+    struct fck in, out;
     uint32_t peer;
 };
 
-static void keys_derive(const struct peerlink *pl, int dialer, const uint8_t *tr, size_t trlen, struct keys *k)
+/* each direction's frame check: the negotiated type and a salt from the transcript under the secret (plcheck.h), so
+ * that a frame of another connection fails its check here. A keyed type would take its key from the same place. */
+static void keys_derive(const struct peerlink *pl, int dialer, int check, const uint8_t *tr, size_t trlen,
+                        struct keys *k)
 {
     uint8_t ko[32], ki[32];
-    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-k>" : "tsdb-link-k<", tr, trlen, ko);
-    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-k<" : "tsdb-link-k>", tr, trlen, ki);
-    hk_init(&k->out, ko, 32);
-    hk_init(&k->in, ki, 32);
+    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-x>" : "tsdb-link-x<", tr, trlen, ko);
+    hs_mac(pl->secret, pl->secret_len, dialer ? "tsdb-link-x<" : "tsdb-link-x>", tr, trlen, ki);
+    k->out = (struct fck){check, le64(ko)};
+    k->in = (struct fck){check, le64(ki)};
     tsdb_wipe(ko, 32);
     tsdb_wipe(ki, 32);
 }
@@ -1060,13 +1089,14 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     put8(&b, (uint8_t)(al >> 8));
     put(&b, pl->cfg.advertise, al);
     put8(&b, (uint8_t)l->kind);
+    put8(&b, (uint8_t)PL_CHECKS_KNOWN);
     memcpy(tr, b.p, b.len);
     trlen = b.len;
     int rc = send_hs(fd, F_HELLO, b.p, b.len, dl);
     buf_free(&b);
     if (rc != 0)
         return -1;
-    if (read_hs(pl, fd, dl, &type, body, &n) != 0 || type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 32)
+    if (read_hs(pl, fd, dl, &type, body, &n) != 0 || type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 1 + 32)
         return -1;
     memcpy(tr + trlen, body, n - 32);
     trlen += n - 32;
@@ -1080,12 +1110,18 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     if ((!zero16(pl->cfg.self.uuid) && !zero16(uuid) && memcmp(uuid, pl->cfg.self.uuid, 16)) ||
         (l->want_id && id != l->want_id))
         return -1;
+    int check = body[4 + 16 + 16 + 32];
+    if (check < 1 || check > 7 || !(PL_CHECKS_KNOWN & (1u << check))) {
+        fprintf(stderr, "peerlink: node %" PRIu32 " chose frame check type %d, which this server does not run (it "
+                "offered 0x%x)\n", id, check, PL_CHECKS_KNOWN);
+        return -1;
+    }
     memcpy(tr + trlen, body + n - 32, 32);
     trlen += 32;
     hs_mac(pl->secret, pl->secret_len, "tsdb-link-c", tr, trlen, mac);
     if (send_hs(fd, F_AUTH, mac, 32, dl) != 0)
         return -1;
-    keys_derive(pl, 1, tr, trlen, k);
+    keys_derive(pl, 1, check, tr, trlen, k);
     k->peer = id;
     return 0;
 }
@@ -1102,6 +1138,12 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     if (!zero16(self->uuid) && !zero16(h.uuid) && memcmp(h.uuid, self->uuid, 16) != 0 &&
         peerlink_mutant != PL_MUT_UUID)
         return -1;
+    int check = check_choose(h.checks);
+    if (!check) {
+        fprintf(stderr, "peerlink: refused a link from node %" PRIu32 ": it offers frame check types 0x%x, this server "
+                "runs 0x%x\n", h.id, h.checks, PL_CHECKS_KNOWN);
+        return -1;
+    }
     memcpy(tr, hello, hn);
     size_t trlen = hn;
     tsdb_random(ns, sizeof ns);
@@ -1110,6 +1152,7 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     put(&b, self->uuid, 16);
     put(&b, self->ident, 16);
     put(&b, ns, 32);
+    put8(&b, (uint8_t)check);
     memcpy(tr + trlen, b.p, b.len);
     trlen += b.len;
     hs_mac(pl->secret, pl->secret_len, "tsdb-link-s", tr, trlen, mac);
@@ -1127,7 +1170,7 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
         ST(pl, auth_failures, 1);
         return -1;
     }
-    keys_derive(pl, 0, tr, trlen, k);
+    keys_derive(pl, 0, check, tr, trlen, k);
     k->peer = h.id;
     return 0;
 }

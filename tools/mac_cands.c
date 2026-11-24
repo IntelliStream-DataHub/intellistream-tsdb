@@ -10,6 +10,7 @@
 
 #include "../client/tsdb_crypto.h"
 #include "blake3/blake3.h"
+#include "../server/plcheck.h"
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -17,7 +18,7 @@
 #define MC_X86 1
 #endif
 
-static const char *const names[MC_N] = {"none", "hmac", "hmac-shani", "gmac", "poly1305", "blake3"};
+static const char *const names[MC_N] = {"none", "hmac", "hmac-shani", "gmac", "poly1305", "blake3", "xxh3-64", "xxh3-128"};
 
 const char *mc_name(int kind)
 {
@@ -567,6 +568,11 @@ int mc_init(struct mc *m, int kind, const uint8_t key[32])
         m->taglen = 16;
         memcpy(m->st, key, 32);
         return 0;
+    case MC_XXH3_64:
+    case MC_XXH3_128:
+        m->taglen = kind == MC_XXH3_64 ? 8 : 16;
+        memcpy(m->st, key, 8); /* the salt */
+        return 0;
     }
     return -1;
 }
@@ -606,6 +612,23 @@ void mc_tag(const struct mc *m, uint64_t seq, uint8_t type, const void *p1, size
         blake3_hasher_update(&h, p1, n1);
         blake3_hasher_update(&h, p2, n2);
         blake3_hasher_finalize(&h, out, 16);
+        break;
+    }
+    case MC_XXH3_64:
+    case MC_XXH3_128: {
+        uint64_t salt;
+        memcpy(&salt, m->st, 8);
+        uint64_t seed = salt ^ seq ^ (uint64_t)type << 56;
+        if (n1 && n2) /* two pieces: chained */
+            seed = XXH3_64bits_withSeed(p1, n1, seed);
+        else if (n1)
+            p2 = p1, n2 = n1;
+        if (m->kind == MC_XXH3_128) {
+            pl_check(PL_CHECK_XXH3, seed, p2, n2, out);
+        } else {
+            uint64_t h = XXH3_64bits_withSeed(p2, n2, seed);
+            le64put(out, h);
+        }
         break;
     }
     default:

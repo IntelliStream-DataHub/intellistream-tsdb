@@ -44,6 +44,7 @@
 
 #include "internal.h"
 #include "peerlink.h"
+#include "plcheck.h"
 #include "fwd.h"
 #include "tsdb_crypto.h"
 
@@ -148,10 +149,47 @@ static int feed_split(struct pl_reader *r, const uint8_t *s, size_t n, struct co
     return rc;
 }
 
+/* the frame check against xxHash's own sanity vectors (its tests/sanity_test_vectors.h, XXH128 with seed PRIME64_1 over
+ * its generated buffer), at lengths that reach each of XXH3-128's code paths (0, 1-3, 4-8, 9-16, 17-128, 129-240, and
+ * the long loop, a block and more): the copy in server/xxhash, compiled at this build's level, is the upstream's hash */
+static void test_check_kat(void)
+{
+    static const struct {
+        uint32_t len;
+        uint64_t lo, hi;
+    } v[] = {
+        {0, 0xA986DFC5D7605BFEull, 0x00FEAA732A3CE25Eull},    {3, 0x634B8990B4976373ull, 0x1C7ECF6A308CF00Eull},
+        {8, 0x7B29471DC729B5FFull, 0xF50CEC145BCD5C5Aull},    {16, 0x0346D13A7A5498C7ull, 0x6FFCB80CD33085C8ull},
+        {100, 0xD5E0C2A715F11657ull, 0x984CEC52A9A9A561ull},  {200, 0x2236D1B483E8D9EBull, 0xCF0349DD7CC2B545ull},
+        {240, 0x604E98DB085C1864ull, 0x29D2133D6EA58C5Bull},  {241, 0xDDA9B0A161D4829Aull, 0xEC64AFAE6A137582ull},
+        {1024, 0xEF368A8A2EBABAEFull, 0x17600EFE2B493A18ull}, {2048, 0x66F81670669ABABCull, 0x23CC3A2E75EBAAEAull},
+        {2367, 0xD2DB3415B942B42Aull, 0xCCB7A94CCA1A6496ull}, {4096, 0x2A3BBB20A5439DCDull, 0x8FBC8FD4D526D1BDull},
+    };
+    static uint8_t buf[4096];
+    uint64_t gen = 2654435761u; /* PRIME32_1, the generator of xxHash's sanity buffer */
+    for (size_t i = 0; i < sizeof buf; i++) {
+        buf[i] = (uint8_t)(gen >> 56);
+        gen *= 11400714785074694797ull; /* PRIME64_1 */
+    }
+    for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) {
+        uint8_t out[PL_CHECK_LEN];
+        pl_check(PL_CHECK_XXH3, 0x9E3779B185EBCA8Dull, buf, v[i].len, out);
+        uint64_t lo = 0, hi = 0;
+        for (int b = 7; b >= 0; b--) {
+            lo = lo << 8 | out[b];
+            hi = hi << 8 | out[8 + b];
+        }
+        if (lo != v[i].lo || hi != v[i].hi)
+            fprintf(stderr, "XXH3-128 of %u bytes: %016" PRIx64 "%016" PRIx64 ", want %016" PRIx64 "%016" PRIx64 "\n",
+                    v[i].len, hi, lo, v[i].hi, v[i].lo);
+        CHECK(lo == v[i].lo && hi == v[i].hi);
+    }
+}
+
 static void test_codec(void)
 {
-    uint8_t key[32];
-    fill_random(key, 32, 7);
+    test_check_kat();
+    const uint64_t salt = 0x5eed5a17c0ffee01ull;
     enum { NF = 60 };
     uint8_t *orig[NF];
     size_t olen[NF];
@@ -168,7 +206,7 @@ static void test_codec(void)
             fill_random(orig[i], olen[i], (uint64_t)i + 1);
         else
             fill_text(orig[i], olen[i], (uint64_t)i);
-        flen[i] = pl_frame_encode(key, &seq, i % 3 != 0, otype[i], orig[i], olen[i], &fr[i]);
+        flen[i] = pl_frame_encode(PL_CHECK_XXH3, salt, &seq, i % 3 != 0, otype[i], orig[i], olen[i], &fr[i]);
         CHECK(flen[i] != 0);
     }
     size_t total = 0;
@@ -184,7 +222,7 @@ static void test_codec(void)
 
     /* the whole stream, split at random */
     for (int rep = 0; rep < 5; rep++) {
-        struct pl_reader *r = pl_reader_new(key, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
         struct collect c = {0};
         CHECK(feed_split(r, stream, total, &c, &rs) == 0);
         CHECK(c.n == NF);
@@ -193,12 +231,9 @@ static void test_codec(void)
         collect_free(&c);
         pl_reader_free(r);
     }
-    /* a wrong key: nothing is delivered */
+    /* another connection's salt (the frames of an earlier connection replayed into a new one): nothing is delivered */
     {
-        uint8_t k2[32];
-        memcpy(k2, key, 32);
-        k2[0] ^= 1;
-        struct pl_reader *r = pl_reader_new(k2, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt ^ 1, 0);
         struct collect c = {0};
         CHECK(feed_split(r, stream, total, &c, &rs) < 0 && c.n == 0);
         collect_free(&c);
@@ -213,7 +248,7 @@ static void test_codec(void)
         int hit = 0;
         while (hit + 1 < NF && at[hit + 1] <= pos)
             hit++;
-        struct pl_reader *r = pl_reader_new(key, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
         struct collect c = {0};
         feed_split(r, bad, total, &c, &rs);
         CHECK(c.n <= hit);
@@ -242,7 +277,7 @@ static void test_codec(void)
             memcpy(bad + e, stream + e, total - e);
             w = total;
         }
-        struct pl_reader *r = pl_reader_new(key, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
         struct collect c = {0};
         CHECK(feed_split(r, bad, w, &c, &rs) < 0);
         CHECK(c.n <= k + 1);
@@ -253,7 +288,7 @@ static void test_codec(void)
     /* a frame whose length field is above the cap ends the stream at once */
     {
         uint8_t hdr[8] = {0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0};
-        struct pl_reader *r = pl_reader_new(key, 0);
+        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
         struct collect c = {0};
         CHECK(pl_reader_feed(r, hdr, sizeof hdr, collect_msg, &c) < 0);
         pl_reader_free(r);
@@ -1420,8 +1455,9 @@ static int raw_connect(int port)
     return fd;
 }
 
-/* the cluster HELLO as a client sends it: [u32 len][type 1][magic, version, id, uuid, ident, nonce, address, kind] */
-static void raw_hello(int fd, uint32_t id, uint8_t uuid_byte, int kind)
+/* the cluster HELLO as a data link's dialer sends it: [u32 len][type 1][magic, version, id, uuid, ident, nonce,
+ * address, kind, check types], of any version and check types */
+static void raw_hello_as(int fd, uint32_t id, uint8_t uuid_byte, int kind, int version, unsigned checks)
 {
     uint8_t b[128];
     size_t o = 4;
@@ -1429,7 +1465,7 @@ static void raw_hello(int fd, uint32_t id, uint8_t uuid_byte, int kind)
     uint32_t magic = PL_CL_MAGIC;
     memcpy(b + o, &magic, 4);
     o += 4;
-    b[o++] = PL_CL_VERSION;
+    b[o++] = (uint8_t)version;
     memcpy(b + o, &id, 4);
     o += 4;
     memset(b + o, uuid_byte, 16);
@@ -1441,9 +1477,15 @@ static void raw_hello(int fd, uint32_t id, uint8_t uuid_byte, int kind)
     b[o++] = 0; /* no address */
     b[o++] = 0;
     b[o++] = (uint8_t)kind;
+    b[o++] = (uint8_t)checks;
     uint32_t len = (uint32_t)(o - 4);
     memcpy(b, &len, 4);
     CHECK(write(fd, b, o) == (ssize_t)o);
+}
+
+static void raw_hello(int fd, uint32_t id, uint8_t uuid_byte, int kind)
+{
+    raw_hello_as(fd, id, uuid_byte, kind, PL_CL_VERSION, PL_CHECKS_KNOWN);
 }
 
 /* the next frame within ms: its type, or -1 when the peer closed or said nothing */
@@ -1502,6 +1544,16 @@ static void test_rawauth(void)
     /* another cluster's uuid: no ACK at all */
     fd = raw_connect(a->port);
     raw_hello(fd, 4, (uint8_t)(g_uuid_byte + 1), PL_KIND_LOG);
+    CHECK(raw_read(fd, 3000) == -1);
+    close(fd);
+    /* a HELLO that offers only frame check types this server does not run (here bit 7): no ACK, no common check */
+    fd = raw_connect(a->port);
+    raw_hello_as(fd, 4, (uint8_t)g_uuid_byte, PL_KIND_LOG, PL_CL_VERSION, 0x80);
+    CHECK(raw_read(fd, 3000) == -1);
+    close(fd);
+    /* a peer of the previous cluster version: refused by the version byte alone (and a line naming both) */
+    fd = raw_connect(a->port);
+    raw_hello_as(fd, 4, (uint8_t)g_uuid_byte, PL_KIND_LOG, PL_CL_VERSION - 1, PL_CHECKS_KNOWN);
     CHECK(raw_read(fd, 3000) == -1);
     close(fd);
     CHECK(a->ups == 0);
@@ -2448,6 +2500,15 @@ int main(int argc, char **argv)
             if (!strcmp(m, "notag")) {
                 peerlink_mutant = PL_MUT_NOTAG;
                 only = "flip";
+            } else if (!strcmp(m, "noseq")) {
+                peerlink_mutant = PL_MUT_NOSEQ;
+                only = "codec";
+            } else if (!strcmp(m, "nosalt")) {
+                peerlink_mutant = PL_MUT_NOSALT;
+                only = "codec";
+            } else if (!strcmp(m, "checktype")) {
+                peerlink_mutant = PL_MUT_CHECKTYPE;
+                only = "rawauth";
             } else if (!strcmp(m, "sharedsocket")) {
                 peerlink_mutant = PL_MUT_SHAREDSOCKET;
                 only = "latency";
