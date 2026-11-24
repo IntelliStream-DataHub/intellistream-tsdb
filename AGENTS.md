@@ -296,7 +296,7 @@ cgroup, so `nice` does not keep your work out of its way.
   movenoreplaces moveremovebeforeshrink moveleaderfirst movenominisr`, `make move-mutants` (tests/move_mutants.sh);
   `test_cluster move|movelag|moveleader|moverep0|moveraft|movekill|moveold`, which follow every record of the volume
   through `vol_trace` and require the ISR without A never smaller than before B joined; hook TSDB_CMOVE_TEST
-  `hold_shrink=PATH`); jepsen-cluster's `churn` nemesis moves kvr's replicas at random. Users are the metadata group's: `tsdb cluster user ...`, logins on every member
+  `hold_shrink=PATH`); jepsen-cluster's `churn` nemesis moves kvr's replicas at random (the same ISR check over every node's voltrace when it runs alone). Users are the metadata group's: `tsdb cluster user ...`, logins on every member
   (Login and rights, below; docs/cluster-preview.md "Logins"). `tests/test_meta.c`: the state machine and a simulator of it under real Raft cores (`make meta-soak`
   for thousands of seeds; `make meta-mutants` plants bugs in meta.c and requires test_meta (its unit tests or the simulator's checker) to catch each);
   `tests/test_cluster.c`: tsdbd end to end (init, node add, leader killed, restart, witness, flags, retired, stalled
