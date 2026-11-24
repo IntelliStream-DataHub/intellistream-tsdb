@@ -353,11 +353,15 @@ cluster volume move PEER V --log --from A --to B` proposes REPLICA_ADD(V, B, fre
 once; the duty then drives every volume whose record has a learner with `replaces`, so a new Raft leader resumes the move
 from the record. Steps, each retried every second while its condition holds: wait until B is in the ISR, noting the ISR's
 size before B joined (`min_isr`; from the records the duty saw, or the replication factor when it resumes without them);
-if A leads, a planned transfer first (to rep[0] when that is not A, else to the ISR member other than A with the highest
-durable end); then VOLCMD DROP_MEMBER{V, epoch, A, min_isr} to the volume leader, whose core asks for the ISR without A
-(`repl_leave`) only while that keeps at least `min_isr` members and never asks for A again; once that ISR is committed,
-REPLICA_REMOVE A, conditional on the epoch, which puts B in A's slot. `--cancel` removes the learner and sends
-`repl_leave(-1)`. Crash points `move-added` and `move-shrunk`; STATUS lists the moves running with step and age.
+if A leads, a planned transfer first (to rep[0] when that is not A and is in the ISR and up, else to B, which has just
+joined; the transfer's own check refuses a target behind the leader, and the move then waits and says why, never
+picking a third member); then VOLCMD DROP_MEMBER{V, epoch, A, min_isr} to the volume leader, whose core asks for the
+ISR without A (`repl_leave`) only while that keeps at least `min_isr` members and never asks for A again; once that ISR
+is committed, REPLICA_REMOVE A, conditional on the epoch, which puts B in A's slot. `--cancel` removes the learner and
+sends `repl_leave(-1)`; the volume leader also clears a leaving member itself once its record names no member moving
+in (a cancel's DROP_MEMBER(0) is not resent after the REMOVE applied). A move a Raft leader resumes after B joined
+waits for the ISR without A to reach the replication factor (the original leader's smaller pre-join size is not in
+the record), so with another member down it waits until that member is back. Crash points `move-added` and `move-shrunk`; STATUS lists the moves running with step and age.
 
 ### 3.3 Routing and names
 
