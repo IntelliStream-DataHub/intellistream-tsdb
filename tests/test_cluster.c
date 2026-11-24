@@ -12209,6 +12209,136 @@ static void scen_addreplica(void)
            " rows the others hold\n", X, rows);
 }
 
+
+static off_t classes_size(int i)
+{
+    char p[PATH_MAX + 96];
+    server_dir(i, p, sizeof p);
+    strcat(p, "/v1/CLASSES");
+    struct stat st;
+    return stat(p, &st) == 0 ? st.st_size : 0;
+}
+
+/* a slow series (24 rows a day, one day per round, in two flushed parts: with --merge-idle-s 1 the idle merge makes
+ * one part of them at once and measures its series, src/merge.c; fewer than 64 rows at its first flush leave a fresh
+ * series in class 0, src/classes.c) written until the leader's CLASSES grows (the series' class switch); ms from the first batch. *join: when the ISR of plant
+ * first had `nisr` members, ms from the same start (0: not while this ran) */
+static uint64_t slow_until_switch(tsdbc *c, tsdb_sid id, int64_t *day, uint64_t *rows, int L, uint32_t nisr,
+                                  uint64_t *join, int ms)
+{
+    off_t s0 = classes_size(L);
+    uint64_t t0 = now_ms();
+    if (join)
+        *join = 0;
+    for (;;) {
+        for (int half = 0; half < 2; half++) { /* two parts: the idle merge makes one and measures it */
+            int64_t tv[12];
+            float vv[12];
+            for (int h = 0; h < 12; h++)
+                tv[h] = *day * 86400000LL + 3600000LL * (12 * half + h), vv[h] = (float)h;
+            int rc = tsdbc_insert_series(c, id, tv, vv, 12);
+            if (rc != 0)
+                die("a write of the slow series: %s", ers(rc));
+            *rows += 12;
+            if ((rc = tsdbc_flush(c)) != 0)
+                die("flush: %s", ers(rc));
+        }
+        (*day)++;
+        if (join && !*join && isr_of(0, "plant", NULL) == nisr)
+            *join = now_ms() - t0 + !(now_ms() - t0);
+            if (classes_size(L) > s0)
+            return now_ms() - t0;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("the slow series got no class of its own in %d ms (CLASSES of server %d: %lld bytes)", ms, L,
+                (long long)classes_size(L));
+        usleep(250000);
+    }
+}
+
+/* addswitch: a class switch during addreplica's fill. A leader's switch waits (CLS_DEFER, src/classes.c: "a class switch
+ * waits") while the members' replay floor is below wtail_from; a learner counts with the lowest position sent to it
+ * until its replay start passes, so a switch is deferred while it fills. keepall keeps position 1 for the learner but
+ * also pins the leader's log start, and with it the floor, at 1: it is lifted (keepoff) once the leader's driver has
+ * the learner in its set, whose ack then holds the log. A member's log start counts too (repl_replay_floor): the
+ * replicas keep their own segments for repl_retain_s past their commit floor, 5 s here (1800 by default, and then
+ * every switch of a young volume waits that long). Measured: the switch's latency while the learner fills, beside
+ * the time it took to join, and a switch on the four members after the join (the control); at the end every member's
+ * rows are equal and each opens (cls_check_parts: no row in two keys). */
+static void scen_addswitch(void)
+{
+    scenario("addswitch");
+    for (int i = 0; i < 4; i++)
+        xargs[i] = "--merge-idle-s 1"; /* 0 reads as the default (src/db.c) */
+    init_retain_s = 5; /* the replicas' own segments go 5 s past their commit floor (keepall lifts the leader's caps) */
+    struct meta_volume v;
+    int L = set_setup(4, &v, 1), X = -1;
+    for (int i = 0; i < 4; i++)
+        if (rep_index(&v, i) < 0)
+            X = i;
+    if (X < 0)
+        die("plant has a replica on every server");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    tsdb_sid ctl = rep_series(c, rep_names[1], "plant", 30000), slow = rep_series(c, rep_names[3], "plant", 30000);
+    int64_t t = 1000, day = 10;
+    uint64_t rows = set_write(c, id, &t, 5, 1), nctl = 0, nslow = 0;
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct set_writer w = {.port = cports[L], .id = id, .t = 10000000};
+    pthread_t th;
+    if (pthread_create(&th, NULL, set_write_thread, &w) != 0)
+        die("pthread_create");
+    await_batches(&w, 200, 60000); /* a log for the learner to fill */
+    char res[512], op[64], line[128];
+    uint64_t sv0 = v.set_version, join = 0;
+    snprintf(op, sizeof op, "add 1 %" PRIu32, ids[X]);
+    set_op(4, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("add: %s", res);
+    uint64_t t_add = now_ms();
+    await_member(0, "plant", X, 1, 4, 10000, &v);
+    if (v.set_version != sv0 + 1)
+        die("the add moved set_version %" PRIu64 " -> %" PRIu64, sv0, v.set_version);
+    snprintf(line, sizeof line, "replica set version %" PRIu64 " -> %" PRIu64, sv0, v.set_version);
+    await_log_count(L, line, 1, 20000);
+    for (int i = 0; i < 4; i++) { /* the learner's ack holds the log from here on */
+        char f[PATH_MAX + 96];
+        server_dir(i, f, sizeof f);
+        strcat(f, "/keepoff");
+        FILE *k = fopen(f, "w");
+        if (!k)
+            die("%s: %s", f, strerror(errno));
+        fclose(k);
+    }
+    uint64_t lead = now_ms() - t_add;
+    uint64_t sw_ms = slow_until_switch(c, slow, &day, &nslow, L, 4, &join, 120000);
+    if (!join) {
+        await_isr(0, "plant", 4, 120000, "the learner filled from the log and joined");
+        join = now_ms() - t_add - lead;
+    }
+    int waits = log_count(L, "a class switch waits");
+    uint64_t ctl_ms = slow_until_switch(c, ctl, &day, &nctl, L, 0, NULL, 60000);
+    await_batches(&w, 20, 20000);
+    __atomic_store_n(&w.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    if (w.rc != 0)
+        die("a write during the fill: %s", ers(w.rc));
+    rows += w.acked;
+    if ((uint64_t)rows_of(c, id) != rows || (uint64_t)rows_of(c, ctl) != nctl || (uint64_t)rows_of(c, slow) != nslow)
+        die("the leader reads %d, %d, %d rows, not %" PRIu64 ", %" PRIu64 ", %" PRIu64, rows_of(c, id),
+            rows_of(c, ctl), rows_of(c, slow), rows, nctl, nslow);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t want[REP_NAMES] = {rows, nctl, 0, nslow};
+    int s[4] = {0, 1, 2, 3};
+    rep_same_on(s, 4, want, "after a clean stop");
+    init_retain_s = 0;
+    printf("  server %d added (in the leader's set %" PRIu64 " ms after the add): a class switch took %" PRIu64
+           " ms (%d \"waits\" lines, one per 10 s at most), the learner joined after %" PRIu64 " ms (%s the switch); "
+           "a switch on the four after the join: %" PRIu64 " ms; %" PRIu64 " rows equal on all four, every member "
+           "opens\n",
+           X, lead, sw_ms, waits, join, join <= sw_ms ? "before" : "after", ctl_ms, rows);
+}
+
 /* removereplica: a replica out of the ISR (SIGSTOPped) is removed; once it runs again it closes the volume, renames
  * v1 to v1.removed-<rid> and deletes it; the leader goes on committing without it. Mutant removedopen (the removed
  * replica keeps its directory open and serving). */
@@ -12726,7 +12856,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

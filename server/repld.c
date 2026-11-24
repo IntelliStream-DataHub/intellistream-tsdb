@@ -1266,6 +1266,15 @@ static void log_start_check(struct rvol *rv)
 
 static int isr_short_locked(const struct rvol *rv);
 
+
+/* TSDB_REPLD_TEST=keepall is lifted while <dir>/keepoff exists (test_cluster addswitch: a log start pinned at 1 also
+ * pins the class switches' replay floor, so the scenario lifts it once its learner's own ack holds the log) */
+static int keep_off(void)
+{
+    char f[sizeof G.dir + 16];
+    snprintf(f, sizeof f, "%s/keepoff", G.dir);
+    return access(f, F_OK) == 0;
+}
 static void exec(struct rvol *rv, struct repl_action *a)
 {
     struct eng *db = NULL;
@@ -1375,12 +1384,13 @@ static void exec(struct rvol *rv, struct repl_action *a)
             for (int i = 0; i < (int)rv->rec.nrep; i++)
                 if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
-            if (G.keep_all) /* until r4-xferinst: a learner added or reset later must find position 1 */
+            if (G.keep_all && !keep_off()) /* until r4-xferinst: a learner added or reset later must find position 1 */
                 keep = 0;
             /* the caps (design-cluster.md 8.3): past them a lagging peer's segments go, up to the floor, and the core
              * tells that peer to install a snapshot once the log start passed what it needs */
-            uint64_t capb = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
-            uint64_t capms = G.mutant == RM_NOCAP ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
+            bool nocap = G.mutant == RM_NOCAP || G.keep_all; /* keepall: a learner's position 1 outlives the caps */
+            uint64_t capb = nocap ? 0 : (uint64_t)rv->rec.repl_retain_mb << 20;
+            uint64_t capms = nocap ? 0 : (uint64_t)rv->rec.repl_retain_s * 1000;
             uint64_t floor = a->floor;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);

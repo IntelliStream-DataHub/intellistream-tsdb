@@ -260,7 +260,8 @@ struct repld_g {
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
     int set_stale;    /* TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, a set change is not applied (rset.c) */
-    int keep_all;     /* TSDB_REPLD_TEST=keepall: a writer's keep bound stays 0, every segment kept (a learner fills from 1) */
+    int keep_all;     /* TSDB_REPLD_TEST=keepall: a writer's keep bound stays 0, every segment kept (a learner fills from
+                       * 1); <dir>/keepoff lifts it */
     struct rin *ins; /* bulk files being received */
 };
 

@@ -1109,10 +1109,18 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     /* A leader's T must lie past every row a replica may still replay, and it knows those rows only from this run's
      * flushes (wtail, from wtail_from on): while the floor is unknown or below that, the switch waits. */
     if (leader && floor < db->wtail_from && eng_test_mutant != MUT_LEADER_NO_WTAIL_FROM) {
+        uint64_t from = db->wtail_from;
         pthread_mutex_unlock(&db->lock);
         pthread_mutex_unlock(&db->class_lock);
         pthread_rwlock_unlock(&db->cls_rw);
         free(r);
+        /* one line in 10 s per process: a learner filling holds the floor down for as long as its fill (r4-setchg
+         * addswitch measures it from this line) */
+        static _Atomic uint64_t said;
+        uint64_t now = (uint64_t)eng_mono_ms(), last = atomic_load(&said);
+        if (now - last >= 10000 && atomic_compare_exchange_strong(&said, &last, now))
+            fprintf(stderr, "tsdb: %s: a class switch waits: the members' replay floor %" PRIu64 " is below %" PRIu64
+                            "\n", db->dir, floor, from);
         return CLS_DEFER;
     }
     for (size_t i = 0; i < n; i++) {
