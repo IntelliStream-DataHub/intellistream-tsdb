@@ -486,11 +486,14 @@ int cluster_cli(int argc, char **argv)
     }
     char target[META_ADDR_MAX + 1];
     snprintf(target, sizeof target, "%s", addr);
+    /* a transfer is answered once its new leader is committed: the drain (transfer_wait_ms, at most 60 s), the READY's
+     * slack (1 s) and the targeted promotion (2 s) before it, so 30 s is short of the longest setting */
+    int wait_ms = op == CLUSTER_OP_VOLUME_TRANSFER ? 90000 : 30000;
     for (int hop = 0;; hop++) {
         int rc;
         uint8_t *reply = NULL;
         size_t len = 0;
-        if (cluster_admin(target, secret, slen, op, req, rl, 30000, &rc, &reply, &len, err, sizeof err) != 0) {
+        if (cluster_admin(target, secret, slen, op, req, rl, wait_ms, &rc, &reply, &len, err, sizeof err) != 0) {
             fprintf(stderr, "tsdb cluster: %s\n", err);
             return 1;
         }

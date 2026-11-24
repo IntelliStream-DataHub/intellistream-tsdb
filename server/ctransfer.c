@@ -233,7 +233,7 @@ void ctr_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n)
     char b[160];
     if (cluster_volume_force_decode(body, n, &vol, &node) != 0) {
         int l = snprintf(b, sizeof b, "a transfer's body is 8 bytes (got %zu)", n);
-        cl_admin_reply(conn, reqid, META_ERR_FORMAT, b, (size_t)l);
+        cl_admin_reply(conn, reqid, META_ERR_INVALID, b, (size_t)l);
         return;
     }
     uint64_t now = cl_now_ns();

@@ -11973,7 +11973,7 @@ static void scen_r4stubs(void)
     printf("  init stored rebuild_mb_s 150, rebuild_max 4, transfer_wait_ms 3000, leader_balance_s 120\n");
     /* the stubs decode the body and say it back: the CLI's encoding against the server's decoder, field by field */
     static const char *const verbs[][2] = {
-        {"volume transfer %s 3 5", "not built yet (transfer of volume 3 to node 5)"},
+        {"volume transfer %s 3 5", "volume 3 to node 5: no such volume"}, /* built (r4-transfer): ctr_admin */
         {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
         {"volume move %s 3 --log --from 6 --to 5 --cancel",
          "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
@@ -11993,7 +11993,8 @@ static void scen_r4stubs(void)
     for (int k = 0; k < 3; k++) {
         reply = NULL, len = 0;
         arc = admin(0, ops[k], body, 12, 0, &reply, &len);
-        if (arc != META_ERR_INVALID || !reply || len < 21 || memcmp(reply, "not built yet (a body of 12 bytes)", 21))
+        const char *says = k == 0 ? "a transfer's body is 8 bytes (got 12)" : "not built yet (a body of 12 bytes)";
+        if (arc != META_ERR_INVALID || !reply || len < strlen(says) || memcmp(reply, says, strlen(says)))
             die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
         free(reply);
     }
@@ -12055,16 +12056,215 @@ static void scen_volcmd(void)
         die("rename %s: %s", path, strerror(errno));
     static const char *const what[4] = {NULL, "TRANSFER to node", "DROP_MEMBER of node", "CANCEL to node"};
     for (int i = 0; i < 2; i++)
-        for (int k = 1; k <= 3; k++) {
+        for (int k = 1; k <= 2; k++) {
             char line[256];
-            snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num, what[k],
-                     7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
+            if (k == 1) /* rtransfer.c (built): an epoch the volume is not at is refused, by name */
+                snprintf(line, sizeof line, "volume %" PRIu32 ": TRANSFER to node %d at epoch %d refused: ", num, 7 + k,
+                         100 * (i + 1) + k);
+            else
+                snprintf(line, sizeof line, "volume %" PRIu32 ": %s %d at epoch %d (arg %d) from node %u: ", num,
+                         what[k], 7 + k, 100 * (i + 1) + k, 4000 + 10 * i + k, ids[0]);
             await_log_count(i, line, 1, 20000);
         }
+    /* a CANCEL with no transfer to cancel is silent (a new Raft leader sends one to every volume leader); its routing
+     * is test_cluster transferraftkill's */
     if (access(to, F_OK) == 0)
         die("the leader kept %s after sending every command", to);
     printf("  every VOLCMD kind reached the member's and the leader's own driver with its fields\n");
     stop_all();
+}
+
+/* ------------------------------------------------------------------ planned leader transfer (r4-transfer, D14, D15) */
+
+struct tr_write {
+    uint64_t t0, t1;
+    int rc;
+};
+struct tr_writer {
+    int server; /* the member it writes through (forwarded to the leader when not led there) */
+    tsdb_sid id;
+    int64_t ts; /* the next row's time */
+    int stop;
+    size_t n, cap;
+    struct tr_write *w;
+    int acked, refused, indet;
+};
+
+/* one row a write, each outcome recorded after the client's own retries (UNAVAILABLE PROMOTING, MOVED: 10 s) */
+static void *tr_write_thread(void *a)
+{
+    struct tr_writer *w = a;
+    tsdbc *c = NULL;
+    while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
+        if (!c) {
+            if (tsdbc_connect("127.0.0.1", cports[w->server], &c) != 0) {
+                c = NULL;
+                usleep(20000);
+                continue;
+            }
+            tsdbc_set_retry(c, 10000);
+            tsdbc_set_timeout(c, 30000);
+        }
+        float val = (float)(w->ts % 977);
+        struct tr_write r = {now_ms(), 0, 0};
+        r.rc = tsdbc_insert_series(c, w->id, &w->ts, &val, 1);
+        r.t1 = now_ms();
+        if (r.rc == 0)
+            w->acked++;
+        else if (r.rc == TSDB_ERR_UNAVAILABLE || r.rc == TSDB_ERR_MOVED)
+            w->refused++; /* definite: the server says it was never admitted */
+        else {
+            w->indet++; /* a closed connection (D12) or a deadline: the outcome is unknown */
+            tsdbc_close(c);
+            c = NULL;
+        }
+        w->ts += 1000;
+        if (w->n == w->cap) {
+            w->cap = w->cap ? 2 * w->cap : 65536;
+            w->w = realloc(w->w, w->cap * sizeof *w->w);
+            if (!w->w)
+                die("out of memory");
+        }
+        w->w[w->n++] = r;
+    }
+    if (c)
+        tsdbc_close(c);
+    return NULL;
+}
+
+/* one transfer of `name` (number num) to node `to` through the Raft leader (server 0, followed): its answer */
+static int tr_transfer(uint32_t num, uint32_t to, char *why, size_t n)
+{
+    uint8_t body[8], *reply = NULL;
+    size_t rl = 0, bl = cluster_volume_force_encode(num, to, body);
+    int rc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &reply, &rl);
+    snprintf(why, n, "%.*s", (int)(rl < 200 ? rl : 200), reply ? (const char *)reply : "");
+    free(reply);
+    return rc;
+}
+
+static uint64_t tr_count(int i, int which)
+{
+    struct view v;
+    view(i, &v);
+    uint64_t c = v.st.ntr > (uint32_t)which ? v.st.tr[which] : 0;
+    view_free(&v);
+    return c;
+}
+
+/* transfer: TRANSFERS transfers of one volume round its three members under 4 writers (each through another
+ * member, forwarded). D14: every transfer answers once its target leads, the ISR stays whole (the old leader is never
+ * dropped as unanswered), no write's outcome is unknown, every acknowledged row is on every member at the end and no
+ * member cut its log. The write pause of each transfer (the longest write that overlapped it) is reported. Mutants
+ * (TSDB_CLUSTER_MUTANT transferanycand transferfewreplies, TSDB_REPLD_MUTANT transfernodrain transferadmit) fail it. */
+static void scen_transfer(void)
+{
+    scenario("transfer");
+    int transfers = getenv("TR_TRANSFERS") ? atoi(getenv("TR_TRANSFERS")) : 100;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "tv", 3, &num)) != 0 || num != 1)
+        die("volume add tv: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "tv", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "tv", &v))
+        die("no record of tv");
+    int L = server_of(v.leader);
+    tsdbc *c = client(L);
+    struct tr_writer w[REP_NAMES];
+    pthread_t th[REP_NAMES];
+    memset(w, 0, sizeof w);
+    for (int k = 0; k < REP_NAMES; k++) {
+        w[k].server = k % 3;
+        w[k].id = rep_series(c, rep_names[k], "tv", 30000);
+        w[k].ts = 1000000;
+    }
+    tsdbc_close(c);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the transfers");
+    for (int k = 0; k < REP_NAMES; k++)
+        if (pthread_create(&th[k], NULL, tr_write_thread, &w[k]) != 0)
+            die("pthread_create");
+    usleep(500000);
+    uint64_t *win = calloc((size_t)transfers * 2, sizeof *win), *pause = calloc((size_t)transfers, sizeof *pause);
+    if (!win || !pause)
+        die("out of memory");
+    for (int t = 0; t < transfers; t++) {
+        if (!vol_rec(0, "tv", &v))
+            die("no record of tv");
+        await_isr(0, "tv", 3, 30000, "every replica in the ISR before a transfer");
+        uint32_t to = 0;
+        for (uint32_t k = 0; k < v.nrep; k++) /* the next member round the replicas */
+            if (v.rep[k].node == v.leader)
+                to = v.rep[(k + 1) % v.nrep].node;
+        char why[256];
+        win[2 * t] = now_ms();
+        rc = tr_transfer(num, to, why, sizeof why);
+        win[2 * t + 1] = now_ms();
+        if (rc != 0)
+            die("transfer %d of tv from node %u to node %u: %s (%s)", t, v.leader, to, cluster_strerror(rc), why);
+        struct meta_volume a;
+        if (!vol_rec(0, "tv", &a) || a.leader != to || a.epoch <= v.epoch)
+            die("transfer %d answered OK, but node %u leads tv at epoch %" PRIu64 " (wanted node %u past %" PRIu64 ")",
+                t, a.leader, a.epoch, to, v.epoch);
+        if (a.nisr != v.nrep)
+            die("transfer %d to node %u: the ISR has %u members right after it (a member dropped as unanswered)", t,
+                to, a.nisr);
+    }
+    for (int k = 0; k < REP_NAMES; k++)
+        __atomic_store_n(&w[k].stop, 1, __ATOMIC_RELEASE);
+    for (int k = 0; k < REP_NAMES; k++)
+        pthread_join(th[k], NULL);
+    int acked = 0, refused = 0, indet = 0;
+    for (int k = 0; k < REP_NAMES; k++)
+        acked += w[k].acked, refused += w[k].refused, indet += w[k].indet;
+    if (indet)
+        die("%d writes of %d had an unknown outcome across %d transfers (D14 promises definite answers)", indet,
+            acked + refused + indet, transfers);
+    for (int t = 0; t < transfers; t++)
+        for (int k = 0; k < REP_NAMES; k++)
+            for (size_t j = 0; j < w[k].n; j++)
+                if (w[k].w[j].t0 <= win[2 * t + 1] && w[k].w[j].t1 >= win[2 * t] &&
+                    w[k].w[j].t1 - w[k].w[j].t0 > pause[t])
+                    pause[t] = w[k].w[j].t1 - w[k].w[j].t0;
+    uint64_t took = 0;
+    for (int t = 0; t < transfers; t++)
+        took += win[2 * t + 1] - win[2 * t];
+    qsort(pause, (size_t)transfers, sizeof *pause, cmp_u64);
+    uint64_t cuts = 0;
+    for (int i = 0; i < 3; i++) {
+        uint64_t n = tr_count(i, CL_TR_CUTS);
+        if (n)
+            die("server %d cut its log %" PRIu64 " times across the transfers", i, n);
+        cuts += n;
+    }
+    uint64_t done = tr_count(0, CL_TR_DONE), started = tr_count(0, CL_TR_STARTED);
+    if (done != (uint64_t)transfers || started != (uint64_t)transfers)
+        die("STATUS of the Raft leader counts %" PRIu64 " transfers started and %" PRIu64 " done, not %d", started,
+            done, transfers);
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR at the end");
+    stop_all();
+    uint64_t rows[REP_NAMES];
+    for (int k = 0; k < REP_NAMES; k++)
+        rows[k] = (uint64_t)w[k].acked;
+    rep_same(rows, "transfer");
+    printf("  %d transfers round 3 members under %d writers (mean %.0f ms each): %d writes acknowledged, %d refused "
+           "(definite), 0 unknown, %" PRIu64 " cuts; every acknowledged row on every member\n",
+           transfers, REP_NAMES, (double)took / transfers, acked, refused, cuts);
+    printf("  write pause of a transfer: p50 %" PRIu64 " ms, p99 %" PRIu64 " ms, max %" PRIu64 " ms\n",
+           pause[transfers / 2], pause[(transfers * 99) / 100 < transfers ? (transfers * 99) / 100 : transfers - 1],
+           pause[transfers - 1]);
+    for (int k = 0; k < REP_NAMES; k++)
+        free(w[k].w);
+    free(win);
+    free(pause);
 }
 
 int main(int argc, char **argv)
@@ -12104,7 +12304,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
