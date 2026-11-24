@@ -39,6 +39,10 @@
  *               notice outstanding (MUT(46): the leader's own replay start only).
  *   snapshot    a fresh learner whose first position is not retained gets the notice; a snapshot is wanted only above
  *               the log end (MUT(47)); an install at P with log start S <= P + 1 opens, and its ACK stops the notice.
+ *   peer_match  what a planned transfer's drain (D14) reads of its target: the durable end acknowledged as the instance
+ *               the record names, the leader's own durable end for itself, 0 for an index outside the set and for a
+ *               member whose ACKs come from another instance (a wiped disk copied again must not pass for the drained
+ *               target: its match was earned by a log the promotion may not find).
  */
 #include "repl.h"
 
@@ -828,6 +832,35 @@ static struct repl_msg ack_msg(int from, int to, uint64_t end, uint64_t rid, uin
                              .written = end, .rid = rid, .start = 1, .replay = replay, .set_version = setv};
 }
 
+static void peer_match(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* node 0 leads epoch 2, ISR {0, 2} (rid 33); node 1 a learner; all at 101 */
+    CHECK(r && repl_is_leader(r), "no leader");
+    CHECK(repl_peer_match(r, 0) == repl_durable_end(r) && repl_peer_match(r, 0) == 101, "own index: %" PRIu64,
+          repl_peer_match(r, 0));
+    CHECK(repl_peer_match(r, 2) == 101, "ISR member 2: %" PRIu64, repl_peer_match(r, 2));
+    CHECK(repl_peer_match(r, -1) == 0 && repl_peer_match(r, 3) == 0 && repl_peer_match(r, REPL_MAX_NODES - 1) == 0,
+          "an index outside the set");
+    /* node 2's disk is lost and its log copied again: a new instance acknowledges the whole log */
+    struct repl_msg k = ack_msg(2, 0, 101, 99, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 0, "member 2 as another instance than the record's: %" PRIu64,
+          repl_peer_match(r, 2));
+    k = ack_msg(2, 0, 101, 33, 1, 0);
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 101, "member 2 as the record's instance again: %" PRIu64, repl_peer_match(r, 2));
+    /* a follower answers 0 for everyone */
+    struct repl_msg m = meta_msg(0, 3, 1, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    CHECK(!repl_is_leader(r) && repl_peer_match(r, 0) == 0 && repl_peer_match(r, 2) == 0, "a follower");
+    repl_free(r);
+}
+
 static void reconfig(void)
 {
     static struct drv d;
@@ -1313,6 +1346,7 @@ int main(int argc, char **argv)
     steady_join();
     join_giveup();
     reconfig();
+    peer_match();
     hold();
     unans_remap();
     join_remap();
