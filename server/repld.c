@@ -959,7 +959,7 @@ static struct rin *rin_find(struct plink *l, uint64_t file, int unlink_it)
 static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta, size_t meta_len, uint64_t total,
                     uint64_t *resume, int *prefix_fd)
 {
-    if (plink_kind(l) == PL_KIND_SNAP) /* a snapshot's file: rsnap.c's (D7, D18) */
+    if (plink_kind(l) == PL_KIND_SNAP || rsnap_owns(l, file, meta, meta_len)) /* a snapshot's file: rsnap.c's (D7) */
         return rsnap_bin_open(arg, l, file, meta, meta_len, total, resume, prefix_fd);
     (void)arg;
     struct rin *r = calloc(1, sizeof *r);
@@ -1006,7 +1006,7 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
 
 static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, const void *p, size_t n)
 {
-    if (plink_kind(l) == PL_KIND_SNAP)
+    if (plink_kind(l) == PL_KIND_SNAP || rsnap_owns(l, file, NULL, 0))
         return rsnap_bin_data(arg, l, file, off, p, n);
     (void)arg;
     pthread_mutex_lock(&G.mu);
@@ -1054,7 +1054,7 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
 
 static void bin_end(void *arg, struct plink *l, uint64_t file, int status)
 {
-    if (plink_kind(l) == PL_KIND_SNAP) {
+    if (plink_kind(l) == PL_KIND_SNAP || rsnap_owns(l, file, NULL, 0)) {
         rsnap_bin_end(arg, l, file, status);
         return;
     }
@@ -2072,6 +2072,8 @@ static int links_up(const struct cluster_vol_rec *r)
                     plink_set_addr(G.nodes[i].log, r->rep[k].peer);
                 if (G.nodes[i].bulk)
                     plink_set_addr(G.nodes[i].bulk, r->rep[k].peer);
+                if (G.nodes[i].snap)
+                    plink_set_addr(G.nodes[i].snap, r->rep[k].peer);
             }
             continue;
         }
@@ -2151,6 +2153,10 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "stepcurrentonly") ? RM_STEPCURRENTONLY
                : !strcmp(mu, "demotestaleidx") ? RM_DEMOTESTALEIDX
                : !strcmp(mu, "divergeisr")     ? RM_DIVERGEISR
+               : !strcmp(mu, "snapnoverify")   ? RM_SNAPNOVERIFY
+               : !strcmp(mu, "snapsamelink")   ? RM_SNAPSAMELINK
+               : !strcmp(mu, "snapnospacecheck") ? RM_SNAPNOSPACECHECK
+               : !strcmp(mu, "snapsrcpromoting") ? RM_SNAPSRCPROMOTING
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2596,6 +2602,7 @@ void repld_stop(void)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */
         tsdb_cvol_unref(&db);
     }
+    rsnap_quiesce(); /* the snapshot worker sends on the links: stopped before they go */
     /* the cluster thread is stopped (tsdbd stops it first): nothing hands a socket to the peerlink any more */
     if (G.pl) {
         cluster_set_peerlink(NULL);

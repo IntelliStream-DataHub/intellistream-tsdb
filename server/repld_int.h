@@ -190,7 +190,11 @@ enum {
     RM_STEPCURRENTONLY,
     RM_STALLCATCHUP,
     RM_DEMOTESTALEIDX, /* the index rebuilt over what a deposed writer's engine pushed after demote cleared it */
-    RM_DIVERGEISR      /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
+    RM_DIVERGEISR,     /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
+    RM_SNAPNOVERIFY,    /* rsnap.c: a received file is not compared with SNAPMAN's xxh64 */
+    RM_SNAPSAMELINK,    /* rsnap.c: a snapshot's files go on kind 2, the COMMITs' link (D7) */
+    RM_SNAPNOSPACECHECK, /* rsnap.c: the receiver takes a snapshot whatever its free space (D5) */
+    RM_SNAPSRCPROMOTING  /* rsnap.c: a source serves a request while M_PROMOTING (D2) */
 };
 
 struct repld_g {
