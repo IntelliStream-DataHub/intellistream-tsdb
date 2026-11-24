@@ -45,7 +45,16 @@
 # after its lost DONE counted twice), snapnowaitdone (a lost DONE 0 holds the source for 6 h) and snapnostale (a stale
 # request served) snaplost; snapnostall (a receiver hearing nothing waits on) and snapnosrcdown (a source whose
 # receiver is gone kept) snapstall; snapnopeerchange is not planted: snapsrckill requires the new leader's notice to
-# end the old transfer.
+# end the old transfer. The install's (server/snapinst_run.c, rsnap.c, cvol.c): snapstalekeep (keep read before the
+# driver stopped: a FENCE meanwhile lost) snapfence; snapinstallstale (a copy at or below the log end installed, or
+# the volume closed for it) and snapservebeforeopen (an installed copy opened before REPLICA_OPEN) snapcatch;
+# snapkeepdiverged (DIVERGED carried into the fresh copy) snapdiverged; snapsetnodefer (a set change applied during an
+# install) addsnap; after review: snapdropafter (a copy not installed removed by the worker after the volume went back:
+# the prepare's leftovers race it) and snapnofence (a copy below the receiver's fence installed) snapfence;
+# snapnoendafter (P not compared with the stopped driver's log end) snapcatch; snapdivlogend (a DIVERGED rebuild
+# compared with the log it replaces) snapdiverged; snapnoleftovers (no leftovers at prepare) snapkill. A floor below
+# P cannot be planted: replfile_save refuses a floor lowered, and the core
+# a floor below the log start.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -104,6 +113,16 @@ table=(
     "snapnostall|snapstall|the receiver of a stalled source did not leave it|the replica never received the snapshot"
     "snapnosrcdown|snapstall|a source whose receiver is gone was not released"
     "snapsrcpromoting|snapbusy|a leader that is promoting did not answer BUSY"
+    "snapstalekeep|snapfence|the receiver installed a REPL with fence [0-9]+ \\(kept [0-9]+\\) below the epoch"
+    "snapinstallstale|snapcatch|a replica in the ISR (installed|took) a copy at or below its log end"
+    "snapservebeforeopen|snapcatch|the replica opened its installed copy before the group recorded its open generation"
+    "snapkeepdiverged|snapdiverged|the rebuilt replica (stopped as DIVERGED again|joins the ISR)"
+    "snapsetnodefer|addsnap|a set change applied on server [0-9]+ while it installed a snapshot"
+    "snapdropafter|snapfence|the receiver neither installed with the raised fence nor refused the stale copy and joined|the refused copy was removed by the snapshot worker"
+    "snapnoendafter|snapcatch|a replica in the ISR (installed a copy|took a copy at or below the log end its stopped driver)"
+    "snapnofence|snapfence|the old leader's copy was installed on a receiver fenced at [0-9]+ above its epoch"
+    "snapdivlogend|snapdiverged|the DIVERGED replica whose log reaches the leader's P (was not rebuilt|refused a copy as stale)"
+    "snapnoleftovers|snapkill|after the crash at snap-halfswap the receiver (fetched a copy again|still has)|the receiver restarted after its crash joins the ISR"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}

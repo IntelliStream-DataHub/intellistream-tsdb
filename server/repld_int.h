@@ -83,6 +83,7 @@ struct rvol {
     pthread_cond_t cv;
     pthread_t th;
     int started, stop, mode, failed, set_changed;
+    int div_rebuild; /* failed as DIVERGED on a replica: rebuilt by a snapshot (rsnap_rebuild on the failed thread) */
     struct repl *core;
     struct replfile *rf;
     struct replfile_state st;
@@ -207,7 +208,16 @@ enum {
     RM_SNAPNOSTALE,      /* rsnap.c: a request of another set version or epoch is served */
     RM_SNAPNOSTALL,      /* rsnap.c: a receiver that hears nothing waits on */
     RM_SNAPNOSRCDOWN,    /* rsnap.c: a source whose receiver's link stays down is not released */
-    RM_SNAPNOSRCMAX      /* rsnap.c: a source serves past rebuild_max */
+    RM_SNAPNOSRCMAX,     /* rsnap.c: a source serves past rebuild_max */
+    RM_SNAPINSTALLSTALE, /* rsnap.c: a snapshot with P at or below the receiver's log end is installed */
+    RM_SNAPSTALEKEEP,    /* snapinst.c: the old REPL is read before the driver stopped (D6) */
+    RM_SNAPKEEPDIVERGED, /* snapinst.c: the old directory's DIVERGED is carried into the installed one */
+    RM_SNAPSETNODEFER,   /* rsnap.c: an install does not set rv->snap: a set change applies between its check and close */
+    RM_SNAPDROPAFTER,    /* snapinst_run.c: a copy not installed is left for w_drop, after the volume went back (F1) */
+    RM_SNAPNOENDAFTER,   /* snapinst_run.c: P is not compared with the log end the closed driver left */
+    RM_SNAPNOFENCE,      /* rsnap.c, snapinst_run.c: a copy of an epoch below the receiver's fence is installed */
+    RM_SNAPDIVLOGEND,    /* rsnap.c, repld.c: a DIVERGED rebuild compares P with the log end it replaces */
+    RM_SNAPNOLEFTOVERS   /* snapinst.c: what an install left at a crash is not finished or undone at prepare */
 };
 
 struct repld_g {
@@ -263,6 +273,7 @@ struct repld_g {
     int stale_sent;   /* TSDB_REPLD_TEST=stalesent (tests only): once <dir>/stalesent exists, one peer's cursor goes to 0 */
     int admit_hold;   /* TSDB_REPLD_TEST=admithold (tests only): admit_held() */
     int skip_pos;     /* TSDB_REPLD_TEST=skippos (tests only): once <dir>/skippos exists, one admit takes a position more */
+    int snap_ask; /* TSDB_REPLD_TEST=snapask (tests only): while <dir>/snapask exists a replica asks for a snapshot */
     int plant_diverge; /* TSDB_REPLD_TEST=plantdiverge (tests only): <dir>/diverge.<volume> makes that volume DIVERGED
                         * (ec_diverge, EC_DIV_TEST) at the driver's next tick, and is removed */
     int no_fence_reply; /* TSDB_REPLD_TEST=nofencereply (tests only): no FENCE_REPLY leaves while <dir>/nofencereply

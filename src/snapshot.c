@@ -1450,6 +1450,8 @@ static int inst_swap(int rfd, const char *vn, const char *snap, const char *old)
         return TSDB_ERR_IO;
     if (had && renameat(rfd, vn, rfd, old) != 0)
         return TSDB_ERR_IO;
+    if (had)
+        inst_hook(SNAP_INST_HALF); /* v<N>.old and v<N>.snap, no v<N>: only snap_leftovers mends it */
     if (renameat(rfd, snap, rfd, vn) != 0) {
         int e = errno;
         if (had && renameat(rfd, old, rfd, vn) != 0) /* put the old one back; at a crash snap_leftovers would */

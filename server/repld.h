@@ -58,6 +58,10 @@ void repld_stop(void);
  * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted (its memory kept: a link thread
  * may still hold it from vol_find). 0 (also when none was open), the manager's thread. */
 int repld_close(uint32_t v);
+/* repld_close, and *log_end the replica's durable log end once its driver was joined (nothing appends after it): 0 for a
+ * DIVERGED replica that asked for its rebuild, REPLD_END_UNKNOWN when no driver or no core was there (cvol_install) */
+#define REPLD_END_UNKNOWN UINT64_MAX
+int repld_close_end(uint32_t v, uint64_t *log_end);
 /* After repld_stop: closes the engines of the volumes the driver stopped on a failure (D13), whose close fails by
  * design; tsdb_close then reports the other volumes' errors only. */
 void repld_close_failed(void);
@@ -71,6 +75,9 @@ struct rsnap_stats {
     uint64_t busy;           /* BUSY answers, either side */
     uint64_t bytes_sent, bytes_received;
     uint64_t last_ms;        /* the last snapshot received: ms from its request to its last file */
+    uint64_t installed;      /* snapshots installed (server/snapinst.c) */
+    uint64_t refused_stale;  /* received and not installed: P at or below the log end, or fenced above its epoch */
+    uint64_t install_ms;     /* the last install: ms from the end of the transfer to the volume handed back */
 };
 void rsnap_get_stats(struct rsnap_stats *out);
 

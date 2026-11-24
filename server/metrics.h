@@ -25,6 +25,8 @@ typedef struct metrics_fwd_peer {
 typedef struct metrics_snap {
     uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received;
     double last_seconds; /* the last snapshot received, from its request to its last file */
+    uint64_t installed, refused_stale; /* installs done; copies not installed as stale (server/snapinst_run.c) */
+    double install_seconds; /* the last install, from the end of its transfer to the volume handed back */
 } metrics_snap;
 
 typedef struct metrics_cfg {

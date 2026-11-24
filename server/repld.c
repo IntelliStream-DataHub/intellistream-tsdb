@@ -1293,6 +1293,10 @@ static void log_start_check(struct rvol *rv)
         repl_log_start(rv->core, first);
         idx_trim(rv, first);
     }
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number); /* the replay start the ACK carries (D17; r4-replay makes it real) */
+    if (db && rv->core)
+        repl_replay_start(rv->core, replica_replay_start(db));
+    tsdb_cvol_unref(&db);
 }
 
 static int isr_short_locked(const struct rvol *rv);
@@ -1939,7 +1943,15 @@ static void *vol_main(void *arg)
     while (!rv->stop) {
         drain(rv);
         if (rv->failed) {
-            pthread_cond_wait(&rv->cv, &rv->mu);
+            if (!rv->div_rebuild) {
+                pthread_cond_wait(&rv->cv, &rv->mu);
+                continue;
+            }
+            rsnap_rebuild(rv); /* D8: a DIVERGED replica is rebuilt by a snapshot; asked again until installed */
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            pthread_cond_timedwait(&rv->cv, &rv->mu, &until);
             continue;
         }
         if ((rv->mode == M_WRITER || rv->mode == M_PROMOTING) && !repl_is_leader(rv->core)) {
@@ -2003,12 +2015,15 @@ static void *vol_main(void *arg)
                 plant_diverge(rv);
             if (!rv->failed && G.mutant != RM_DIVERGEISR && tsdb_volume_diverged(G.t, rv->number) == 1) {
                 vol_fail(rv, "the volume is DIVERGED (tsdb DIR volume diverged lists why)");
+                rv->div_rebuild = rv->mode == M_REPLICA; /* a replica asks for a snapshot (rsnap_rebuild) */
                 pthread_mutex_unlock(&rv->mu);
                 if (G.mutant != RM_NOQUIESCE)
                     tsdb_volume_quiesce(G.t, rv->number); /* clients get UNAVAILABLE (DIVERGED) or MOVED on */
                 pthread_mutex_lock(&rv->mu);
                 continue;
             }
+            if (G.snap_ask)
+                rsnap_rebuild(rv); /* TSDB_REPLD_TEST=snapask */
             repl_tick(rv->core);
             commit_watch(rv, now);
             next_tick += TICK_MS;
@@ -2219,6 +2234,15 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
                : !strcmp(mu, "snapnosrcdown")  ? RM_SNAPNOSRCDOWN
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
+               : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
+               : !strcmp(mu, "snapsetnodefer") ? RM_SNAPSETNODEFER
+               : !strcmp(mu, "snapdropafter")  ? RM_SNAPDROPAFTER
+               : !strcmp(mu, "snapnoendafter") ? RM_SNAPNOENDAFTER
+               : !strcmp(mu, "snapnofence")    ? RM_SNAPNOFENCE
+               : !strcmp(mu, "snapdivlogend")  ? RM_SNAPDIVLOGEND
+               : !strcmp(mu, "snapnoleftovers") ? RM_SNAPNOLEFTOVERS
+               : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
+               : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2254,6 +2278,7 @@ void repld_init(tsdb *t, const char *dir)
     G.cut_links = te && strstr(te, "cutlinks");
     G.no_fence_reply = te && strstr(te, "nofencereply");
     G.plant_diverge = te && strstr(te, "plantdiverge");
+    G.snap_ask = te && strstr(te, "snapask");
     G.slow_read = te && strstr(te, "slowread");
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");
@@ -2639,6 +2664,13 @@ static void cvol_close(uint32_t v)
 
 int repld_close(uint32_t v)
 {
+    return repld_close_end(v, NULL);
+}
+
+int repld_close_end(uint32_t v, uint64_t *log_end)
+{
+    if (log_end)
+        *log_end = REPLD_END_UNKNOWN;
     pthread_mutex_lock(&G.mu);
     struct rvol *rv = NULL;
     for (uint32_t i = 0; i < G.nvols && !rv; i++)
@@ -2665,6 +2697,12 @@ int repld_close(uint32_t v)
         if (rv->rec_short)
             __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
         rv->rec_short = 0;
+        /* the driver is joined: nothing appends from here on, so this end is the one an install must stay above (a
+         * DIVERGED replica's log is what a rebuild replaces: 0, as in rsnap.c's check before the close) */
+        if (log_end && rv->failed && rv->div_rebuild && G.mutant != RM_SNAPDIVLOGEND)
+            *log_end = 0;
+        else if (log_end && rv->core)
+            *log_end = repl_durable_end(rv->core);
         pthread_mutex_unlock(&rv->mu);
         say("volume %" PRIu32 ": driver stopped (the replica is closed)", v);
     }

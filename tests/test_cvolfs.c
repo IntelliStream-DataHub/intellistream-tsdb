@@ -261,9 +261,10 @@ static void test_refusals(void)
     fresh("refuse", root, sizeof root);
     struct cvolfs_rec r = rec(1, 0, 0);
     CHECK(cvolfs_prepare(root, &r, &o) == 0);
-    /* the directory is at generation 1; copy it to start each case from it */
+    /* the directory is at generation 1; copy it to start each case from it (never under v1.snap or v1.old: the
+     * prepare's snapinst_leftovers takes those for what an install left and removes them) */
     char snap[PATH_MAX + 32];
-    snprintf(snap, sizeof snap, "%s/v1.snap", root);
+    snprintf(snap, sizeof snap, "%s/v1.saved", root);
     CHECK(sh("cp -a '%s/v1' '%s'", root, snap) == 0);
 #define RESTORE() CHECK(sh("rm -rf '%s/v1' && cp -a '%s' '%s/v1'", root, snap, root) == 0)
 
