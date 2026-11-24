@@ -10505,12 +10505,31 @@ static void scen_repcheck(void)
         if (sfd < 0)
             die("%s: %s", stale, strerror(errno));
         close(sfd);
+        /* The fault waits for the leader's log to start above position 1 (a cursor of 0 is below it only then; with
+         * the log still at 1 the catch-up from 0 reads every record and nocursorup survived). Single-row writes keep
+         * the 200 ms flushes coming, whose segments the leader drops once every replica acknowledged them, so that
+         * start rises however the restarts above left the leader's log; rows below the next step's t0 */
+        tsdbc *sc;
+        int src = tsdbc_connect("127.0.0.1", cports[L], &sc);
+        if (src != 0)
+            die("connect to the leader before the stalesent fault: %s", ers(src));
+        tsdbc_set_retry(sc, 0);
         t0 = now_ms();
-        while (!log_has(L, "test fault: the cursor of peer")) {
-            if (now_ms() - t0 > 10000)
-                die("the stalesent fault did not fire in 10 s");
-            usleep(10000);
+        for (int j = 0; !log_has(L, "test fault: the cursor of peer"); j++) {
+            if (now_ms() - t0 > 20000 || j >= 400)
+                die("the stalesent fault did not fire in 20 s of writes (the leader's log never started above "
+                    "position 1: its flushed segments were never dropped)");
+            int64_t ts = 3500000 + 1000LL * j;
+            float val = (float)j;
+            src = tsdbc_insert_series(sc, id, &ts, &val, 1);
+            if (src != 0 && log_has(L, "test fault: the cursor of peer"))
+                die("a write as the stalesent fault fired: %s (the cursor never moved up to what the peer "
+                    "acknowledged)", ers(src));
+            if (src != 0)
+                die("a write before the stalesent fault: %s", ers(src));
+            usleep(50000);
         }
+        tsdbc_close(sc);
         struct rep_writer sw = {cports[L], id, 4000000, 1, 0, 0, 0, 0};
         pthread_t sth;
         if (pthread_create(&sth, NULL, rep_write_thread, &sw) != 0)

@@ -78,8 +78,10 @@
  * it); `noclock` has a leader write no NOW markers and no idle seal (writersync); `skippos` has one admit take a
  * position more once the file <dir>/skippos exists (the check in op_admit must
  * fail the volume before the write is acknowledged); `stalesent` sets one peer's cursor back to 0 once the file
- * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
- * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
+ * <dir>/stalesent exists and the leader's log starts above position 1, so 0 is below the log's start (what a resync
+ * that raced records in flight left behind; the cursor must move up to what the peer acknowledged, or it is never sent
+ * another record; with the log still starting at 1 the catch-up from 0 finds every record and the fault proves
+ * nothing: `nocursorup` survived such a run); `slowread` has every catch-up
  * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
  * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `drainhold` keeps
  * a transfer's drain from READY while <dir>/drainhold exists (rtransfer.c, transferraftdrain); `slowack` has a replica's ACKs report the durable end it had
@@ -1465,15 +1467,16 @@ static void exec(struct rvol *rv, struct repl_action *a)
             struct rpeer *p = &rv->peer[a->msg.to];
             if (a->upto > p->want)
                 p->want = a->upto;
-            if (G.stale_sent == 1 && rv->mode == M_WRITER && p->acked > 0) {
-                /* the fault: the cursor of a peer that has acknowledged records goes back below the log's start */
+            if (G.stale_sent == 1 && rv->mode == M_WRITER && p->acked > 0 && rv->log_start > 1) {
+                /* the fault: the cursor of a peer that has acknowledged records goes back below the log's start (only
+                 * once that start is above 1: before, a cursor of 0 is no fault) */
                 char f[sizeof G.dir + 16];
                 snprintf(f, sizeof f, "%s/stalesent", G.dir);
                 if (access(f, F_OK) == 0) {
                     G.stale_sent = 2;
                     p->sent = 0;
                     say("volume %" PRIu32 ": test fault: the cursor of peer %d set back to 0 (it acknowledged %" PRIu64
-                        ")", rv->number, a->msg.to, p->acked);
+                        ", the log starts at %" PRIu64 ")", rv->number, a->msg.to, p->acked, rv->log_start);
                 }
             }
             /* The peer has what it acknowledged, and the core still counts on it (it has not asked to go back below
