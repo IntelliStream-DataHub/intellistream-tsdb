@@ -1337,6 +1337,15 @@ static void golden_check(const rec *base, const char *argv0)
     if (slash)
         snprintf(exe_path, sizeof exe_path, "%.*s/%s", (int)(slash - argv0), argv0, GOLDEN_NAME);
     const char *upd = getenv("TSDB_LEVELS_GOLDEN_UPDATE");
+#ifndef TSDB_EC
+    /* Without the erasure codec there is no "ec" group to write: a rewrite here would drop the committed line. */
+    if (upd && *upd && strcmp(upd, "0") != 0) {
+        fprintf(stderr, "test_levels: TSDB_LEVELS_GOLDEN_UPDATE needs a build with TSDB_EC (the \"ec\" group)\n");
+        failures++;
+        free(want_text);
+        return;
+    }
+#endif
     if (upd && *upd && strcmp(upd, "0") != 0) {
         FILE *f = fopen(src_path, "wb");
         if (!f || fputs(want_text, f) < 0 || fclose(f) != 0) {
@@ -1362,6 +1371,14 @@ static void golden_check(const rec *base, const char *argv0)
     int bad = 0, lines = 0;
     const char *a = want_text, *b = have;
     while (*a || *b) {
+#ifndef TSDB_EC
+        /* The committed file has the erasure codec's group, which a build without TSDB_EC cannot produce. */
+        if (strncmp(b, "ec\t", 3) == 0) {
+            const char *skip = strchr(b, '\n');
+            b = skip ? skip + 1 : b + strlen(b);
+            continue;
+        }
+#endif
         const char *ae = strchr(a, '\n'), *be = strchr(b, '\n');
         size_t al = ae ? (size_t)(ae - a) : strlen(a), bl = be ? (size_t)(be - b) : strlen(b);
         lines++;

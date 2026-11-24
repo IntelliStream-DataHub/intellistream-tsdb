@@ -2084,6 +2084,33 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
     return rc;
 }
 
+/* R8 (src/ecdigest.c, the logical digest): the rows of `series` in [start, end) of exactly parts[0 .. np) (one
+ * partition, sorted by min_block; .ec parts read through the seam like any other), with their own tombstones and last
+ * write wins among them as every query applies them, and nothing else: no memtable, no other part, no retention clamp
+ * (the caller passes its own cutoff as `start`). The parts are referenced by the caller. */
+int eng_query_raw_parts(eng *db, part **parts, size_t np, uint32_t series, int64_t start, int64_t end, slot_fn fn,
+                        void *ctx)
+{
+    int type = eng_series_type(db, series);
+    if (start >= end || type < 0)
+        return type < 0 ? TSDB_ERR_NOTFOUND : 0;
+    qcut c = {.db = db, .parts = parts, .np = np};
+    snapshot sn;
+    memset(&sn, 0, sizeof sn);
+    int rc = snapshot_cut(db, &c, series, type_width(type), start, end, &sn);
+    if (rc)
+        return rc;
+    codec_ctx *cc = cc_get(db);
+    if (!cc) {
+        snapshot_release(&sn);
+        return TSDB_ERR_NOMEM;
+    }
+    rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
+    cc_put(db, cc);
+    snapshot_release(&sn);
+    return rc;
+}
+
 /* ------------------------------------------------------------------- lttb */
 
 /* Largest-Triangle-Three-Buckets (Steinarsson 2013) over the known, finite
