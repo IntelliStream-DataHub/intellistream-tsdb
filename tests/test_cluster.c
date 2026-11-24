@@ -13109,6 +13109,13 @@ static void scen_transfer(void)
     if (done != (uint64_t)transfers || started != (uint64_t)transfers)
         die("STATUS of the Raft leader counts %" PRIu64 " transfers started and %" PRIu64 " done, not %d", started,
             done, transfers);
+    /* every member answered every transfer's fence and every answer counted (the candidate filter passes them all, so
+     * the grant leaves no member `unanswered`): the Raft leader's "proposes" lines all say 3 of 3 */
+    int props = 0, whole = 0;
+    for (int i = 0; i < 3; i++)
+        props += log_count(i, " fenced members answered"), whole += log_count(i, " (3 of 3 fenced members answered");
+    if (props != whole || whole < transfers)
+        die("of %d promotions proposed %d counted the answers of all 3 members, %d transfers", props, whole, transfers);
     await_isr(0, "tv", 3, 30000, "every replica in the ISR at the end");
     stop_all();
     tr_check(w, "transfer");
