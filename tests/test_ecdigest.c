@@ -294,7 +294,7 @@ static void case_retention(void)
     int64_t k = key0(&b);
     CHECK(ecd_freeze(b.db, s, n, k, atomic_load(&clock_now), &cuts, &nc) == 0);
     CHECK(nc == 1 && cuts && cuts[0].series == b.s[SR] && cuts[0].cutoff == T0 + DAY / 2);
-    CHECK(ec_logical_digest_frozen(b.db, s, n, k, cuts, nc, &df) == 0);
+    CHECK(ec_logical_digest_frozen(b.db, s, n, k, cuts, nc, db.tombs, &df) == 0);
     CHECK(same(df, db));
     free(cuts);
     set_free(s, n);
@@ -426,6 +426,114 @@ static void case_mixed(void)
     printf("mixed: %" PRIu64 " rows, plain and .ec + plain agree\n", plain.rows);
     tw_close(&x);
 }
+
+/* A series whose rows are not in the set (only its delete is), under retention: the leader's live cutoff and a
+ * replica's frozen ones (ecd_freeze over the same set) must give one digest (review F1; mutant digestfreezerows) */
+static void case_tombonly(void)
+{
+    atomic_store(&clock_now, T0 + DAY + DAY / 4); /* r's cutoff T0 + 6 h at the delete */
+    tw x;
+    tw_open(&x, "rv_tombonly", true);
+    CHECK(tsdb_set_retention(x.t, TSDB_SID(0, x.s[SR]), DAY) == 0);
+    { /* r's rows and a's first hour in one flush: the object below the set */
+        size_t n = 1000;
+        int64_t *ts = malloc(n * sizeof *ts);
+        float *v = malloc(n * sizeof *v);
+        for (size_t j = 0; j < n; j++)
+            ts[j] = T0 + 7 * HOUR + (int64_t)j * 60000, v[j] = (float)j;
+        CHECK(eng_insert_series(x.db, TSDB_FLOAT32, x.s[SR], ts, v, n) == 0);
+        free(ts);
+        free(v);
+    }
+    write_range(&x, T0, T0 + HOUR);
+    CHECK(settle_first(&x) == 0);
+    write_range(&x, T0 + 2 * HOUR, T0 + 3 * HOUR);
+    CHECK(eng_delete_range(x.db, x.s[SR], T0 + 8 * HOUR, T0 + 20 * HOUR) == 0);
+    atomic_store(&clock_now, T0 + DAY + 12 * HOUR); /* the settle's clock: r's cutoff T0 + 12 h, inside the delete */
+    part **s;
+    int64_t k = key0(&x);
+    size_t n = tw_set(&x, k, false, &s);
+    ec_ldigest live, fr;
+    CHECK(ec_logical_digest(x.db, s, n, k, atomic_load(&clock_now), &live) == 0);
+    ecd_cut *cuts = NULL;
+    size_t nc = 0;
+    CHECK(ecd_freeze(x.db, s, n, k, atomic_load(&clock_now), &cuts, &nc) == 0);
+    CHECK(ec_logical_digest_frozen(x.db, s, n, k, cuts, nc, live.tombs, &fr) == 0);
+    printf("tombonly: %zu parts, %zu frozen cuts; live %" PRIu64 "/%" PRIu64 "/%016" PRIx64 " frozen %" PRIu64
+           "/%" PRIu64 "/%016" PRIx64 " -> %s\n", n, nc, live.rows, live.series, live.xxh64, fr.rows, fr.series,
+           fr.xxh64, same(live, fr) ? "SAME" : "DIFFERENT");
+    CHECK(same(live, fr));
+    free(cuts);
+    set_free(s, n);
+    tw_close(&x);
+    atomic_store(&clock_now, T0 + 2 * DAY);
+}
+
+/* The digest of one fixed set (a replica's retired copies) before and after the key's parts are dropped: the job runs
+ * on the keep thread at any later time (or after a restart), when the listing below the set is another; it takes the
+ * leader's tombstone decision (MKD_TOMBS) and gives the leader's digest (review F2; mutant digestlocalbelow) */
+static void case_dropafter(void)
+{
+    tw x;
+    tomb_twin(&x, "rv_drop", false, false);
+    part **s;
+    int64_t k = key0(&x);
+    size_t n = tw_set(&x, k, false, &s);
+    ec_ldigest before, after;
+    CHECK(ec_logical_digest(x.db, s, n, k, atomic_load(&clock_now), &before) == 0);
+    CHECK(before.tombs);
+    ecd_cut *cuts = NULL;
+    size_t nc = 0;
+    CHECK(ecd_freeze(x.db, s, n, k, atomic_load(&clock_now), &cuts, &nc) == 0);
+    CHECK(eng_drop_before(x.db, T0 + 2 * DAY) == 0);
+    CHECK(ec_logical_digest_frozen(x.db, s, n, k, cuts, nc, before.tombs, &after) == 0);
+    free(cuts);
+    printf("dropafter: %zu parts; before %016" PRIx64 " after %016" PRIx64 " -> %s\n", n, before.xxh64,
+           after.xxh64, same(before, after) ? "SAME" : "DIFFERENT");
+    CHECK(same(before, after));
+    set_free(s, n);
+    tw_close(&x);
+}
+
+/* Nothing listed below the set: its tombstones hide only its own rows, and a twin merged without them gives the same
+ * digest (mutant digestbelowtrue: the term hashed anyway) */
+static void case_nobelow(void)
+{
+    tw a, b;
+    for (int m = 0; m < 2; m++) {
+        tw *x = m ? &b : &a;
+        tw_open(x, m ? "nobelow_b" : "nobelow_a", false);
+        write_range(x, T0, T0 + HOUR);
+        write_range(x, T0 + HOUR, T0 + 2 * HOUR);
+        CHECK(eng_delete_range(x->db, x->s[SA], T0 + 600000, T0 + HOUR + 600000) == 0);
+        if (m)
+            CHECK(eng_optimize(x->db) == 0); /* the whole key: nothing older, the tombstones go */
+    }
+    ec_ldigest da = tw_digest(&a, false), db = tw_digest(&b, false);
+    CHECK(!da.tombs && !db.tombs);
+    CHECK(same(da, db));
+    printf("nobelow: %zu and %zu parts, nothing below: one digest\n", count_parts(&a, false), count_parts(&b, false));
+    tw_close(&a), tw_close(&b);
+}
+
+/* Two sets that differ only in one row's time give two digests (mutant digestnots) */
+static void case_time(void)
+{
+    tw a, b;
+    ec_ldigest d[2];
+    for (int m = 0; m < 2; m++) {
+        tw *x = m ? &b : &a;
+        tw_open(x, m ? "time_b" : "time_a", false);
+        int64_t ts[3] = {T0, T0 + 1000, T0 + (m ? 3000 : 2000)};
+        float v[3] = {1, 2, 3};
+        CHECK(eng_insert_series(x->db, TSDB_FLOAT32, x->s[SA], ts, v, 3) == 0);
+        CHECK(eng_flush(x->db) == 0);
+        d[m] = tw_digest(x, false);
+    }
+    CHECK(d[0].rows == 3 && d[1].rows == 3 && !same(d[0], d[1]));
+    printf("time: a row moved in time changes the digest\n");
+    tw_close(&a), tw_close(&b);
+}
 #endif
 
 int main(int argc, char **argv)
@@ -456,6 +564,10 @@ int main(int argc, char **argv)
     case_retention();
     case_tombstones();
     case_mixed();
+    case_tombonly();
+    case_dropafter();
+    case_nobelow();
+    case_time();
     if (failures == 0)
         rm_rf(scratch);
     printf("test_ecdigest: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);

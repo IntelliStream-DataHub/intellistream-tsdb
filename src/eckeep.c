@@ -62,7 +62,7 @@ typedef struct kent {
 /* a replica's MK_DIGEST (src/ecdigest.c): one logical digest over the retired files it names */
 typedef struct kjob {
     ecd_job j;
-    int status; /* ECKEEP_PENDING, then MATCHED, DIVERGED or ROT */
+    int status; /* ECKEEP_PENDING (run once armed), then MATCHED, DIVERGED or ROT; ORPHAN: superseded unarmed */
     bool busy, logged;
     int64_t next_try, backoff;
 } kjob;
@@ -78,8 +78,10 @@ struct eckeep_eng {
     uint64_t tries;
     kjob *jobs;
     size_t nj, capj;
-    bool jobs_loaded; /* the thread listed the directory's digest_* files */
-    uint64_t lost;    /* kept copies found rotted (D25): counted lost, released at their deadline */
+    bool jobs_loaded; /* the directory's digest_* files were listed (eckeep_jobs_load, under load_mu) */
+    pthread_mutex_t load_mu; /* taken with no other lock: one listing, before any job is looked up */
+    uint64_t lost;    /* kept copies found rotted or missing (D25): counted lost, released at their deadline */
+    uint64_t undigested; /* retired copies whose DIGEST can no longer come (superseded): released unchecked */
 };
 
 static struct eckeep_eng *keep_of(eng *db) { return db->ecstate ? db->ecstate->keep : NULL; }
@@ -522,7 +524,30 @@ static size_t jobs_done_locked(struct eckeep_eng *k, char (*out)[64], size_t cap
     return n;
 }
 
-/* one job (k->mu held, let go of across the reads) */
+/* every file of job x to status st, released from deadline on (k->mu held) */
+static void mark_job_locked(struct eckeep_eng *k, kjob *x, int st, int64_t deadline)
+{
+    for (size_t i = 0; i < k->n; i++)
+        if (strcmp(k->e[i].job, x->j.file) == 0) {
+            k->e[i].status = st;
+            k->e[i].deadline = deadline;
+        }
+}
+
+/* the job files none of whose copies is left go (k->mu held, let go of around the removal) */
+static void done_jobs(eng *db, struct eckeep_eng *k)
+{
+    char done[8][64]; /* a job none of whose files is left (all released before an open) */
+    size_t nd = jobs_done_locked(k, done, 8);
+    if (nd) {
+        pthread_mutex_unlock(&k->mu);
+        for (size_t i = 0; i < nd; i++)
+            ecdigest_job_remove(db, done[i]);
+        pthread_mutex_lock(&k->mu);
+    }
+}
+
+/* one armed job (k->mu held, let go of across the reads) */
 static void run_job(eng *db, struct eckeep_eng *k, kjob *jp)
 {
     jp->busy = true;
@@ -530,28 +555,42 @@ static void run_job(eng *db, struct eckeep_eng *k, kjob *jp)
     ecd_job j = jp->j; /* the arrays stay: a busy job is never freed */
     pthread_mutex_unlock(&k->mu);
     ec_ldigest got = {0};
-    int rc = ecdigest_job_check(db, &j, &got);
+    size_t bad = 0;
+    int rc = ecdigest_job_check(db, &j, &got, &bad);
     bool match = rc == 0 && ((got.rows == j.want.rows && got.series == j.want.series && got.xxh64 == j.want.xxh64) ||
                              ecdigest_mutant == ECDIGEST_MUT_SKIP);
+    if ((rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_NOTFOUND) && ecdigest_mutant == ECDIGEST_MUT_ROTMATCHES)
+        rc = 0, match = true;
+    if (rc == ECD_REFUSED && ecdigest_mutant == ECDIGEST_MUT_CORRUPTROT)
+        rc = TSDB_ERR_CORRUPT;
     int st = ECKEEP_PENDING;
-    if (rc == 0 && !match) {
-        fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the logical digest of the %zu retired copies "
-                "of the COLD at Z %" PRIu64 " is %" PRIu64 " rows, %" PRIu64 " series, %016" PRIx64 "; its DIGEST says %"
-                PRIu64 ", %" PRIu64 ", %016" PRIx64 ": the volume is DIVERGED and the copies are kept\n",
-                db->tier_vol, j.key, j.nnames, j.z, got.rows, got.series, got.xxh64, j.want.rows, j.want.series,
-                j.want.xxh64);
+    if (match) { /* durable first: a restart releases what is left of a matched job without a second digest, and a
+                  * copy missing from a job that is not marked matched is lost, never "released before" */
+        ecd_job w = j;
+        w.flags |= ECDJ_MATCHED;
+        if (ecdigest_job_write(db, &w) == 0)
+            st = ECKEEP_MATCHED;
+    } else if (rc == 0 || rc == ECD_REFUSED || (rc == TSDB_ERR_CORRUPT && ecdigest_mutant == ECDIGEST_MUT_ROTDIVERGES)) {
+        if (rc == 0)
+            fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the logical digest of the %zu retired "
+                    "copies of the COLD at Z %" PRIu64 " is %" PRIu64 " rows, %" PRIu64 " series, %016" PRIx64 "; its "
+                    "DIGEST says %" PRIu64 ", %" PRIu64 ", %016" PRIx64 ": the volume is DIVERGED and the copies are "
+                    "kept\n", db->tier_vol, j.key, j.nnames, j.z, got.rows, got.series, got.xxh64, j.want.rows,
+                    j.want.series, j.want.xxh64);
+        else /* checksums hold and the rows cannot be read (an unknown series, timestamps out of order): not rot */
+            fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the retired copies of the COLD at Z %"
+                    PRIu64 " pass their checksums and cannot be digested: the volume is DIVERGED and the copies are "
+                    "kept\n", db->tier_vol, j.key, j.z);
         ec_diverge(db, j.key, j.oid, EC_DIV_DIGEST); /* durable, then the flag; no lock held */
         st = ECKEEP_DIVERGED;
-    } else if (rc == TSDB_ERR_CORRUPT && ecdigest_mutant == ECDIGEST_MUT_ROTDIVERGES) {
-        ec_diverge(db, j.key, j.oid, EC_DIV_DIGEST);
-        st = ECKEEP_DIVERGED;
-    } else if (rc == TSDB_ERR_CORRUPT) { /* D25: the .ec parts are served; the copies cannot be compared */
-        fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": a retired copy of the COLD at Z %" PRIu64
-                " fails its checksums (rot): the copies are counted lost and released at their deadline\n",
-                db->tier_vol, j.key, j.z);
+    } else if (rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_NOTFOUND) {
+        /* D25: the .ec parts are served. One digest covers the whole set, so the healthy copies cannot be compared
+         * either: all of them go at the deadline, the rotted or missing ones counted lost */
+        fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": %zu of the %zu retired copies of the COLD at "
+                "Z %" PRIu64 " %s: they are counted lost and the copies released at their deadline unchecked\n",
+                db->tier_vol, j.key, bad, j.nnames, j.z,
+                rc == TSDB_ERR_CORRUPT ? "fail their checksums (rot)" : "are missing (no match was recorded)");
         st = ECKEEP_ROT;
-    } else if (match || rc == TSDB_ERR_NOTFOUND) { /* gone: a file is released only after its job matched */
-        st = ECKEEP_MATCHED;
     }
     int64_t deadline = eng_now_ms(db) + k->keep_ms;
     pthread_mutex_lock(&k->mu);
@@ -569,21 +608,12 @@ static void run_job(eng *db, struct eckeep_eng *k, kjob *jp)
         jp->backoff = jp->backoff * 2 > RETRY_MAX_MS ? RETRY_MAX_MS : jp->backoff * 2;
     } else {
         jp->status = st;
+        if (st == ECKEEP_MATCHED)
+            jp->j.flags |= ECDJ_MATCHED;
         if (st == ECKEEP_ROT)
-            k->lost++;
-        for (size_t i = 0; i < k->n; i++)
-            if (strcmp(k->e[i].job, j.file) == 0) {
-                k->e[i].status = st;
-                k->e[i].deadline = deadline;
-            }
-        char done[8][64]; /* a job none of whose files is left (all released before an open) */
-        size_t nd = jobs_done_locked(k, done, 8);
-        if (nd) {
-            pthread_mutex_unlock(&k->mu);
-            for (size_t i = 0; i < nd; i++)
-                ecdigest_job_remove(db, done[i]);
-            pthread_mutex_lock(&k->mu);
-        }
+            k->lost += bad;
+        mark_job_locked(k, jp, st, deadline);
+        done_jobs(db, k);
     }
     pthread_cond_broadcast(&k->cv);
 }
@@ -593,13 +623,8 @@ static void *keep_main(void *arg)
     eng *db = arg;
     struct eckeep_eng *k = keep_of(db);
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only */
+    eckeep_jobs_load(db); /* after the open listed its parts: every settled_ file has its entry */
     pthread_mutex_lock(&k->mu);
-    if (!k->jobs_loaded && !k->stop) {
-        pthread_mutex_unlock(&k->mu);
-        ecdigest_load_jobs(db); /* after the open listed its parts: every settled_ file has its entry */
-        pthread_mutex_lock(&k->mu);
-        k->jobs_loaded = true;
-    }
     while (!k->stop) {
         int64_t now = eng_mono_ms(), next = INT64_MAX;
         kent *pick = NULL;
@@ -607,8 +632,8 @@ static void *keep_main(void *arg)
         kjob *jp = NULL;
         for (size_t i = 0; i < k->nj && !jp; i++) {
             kjob *x = &k->jobs[i];
-            if (x->status != ECKEEP_PENDING || x->busy)
-                continue;
+            if (x->status != ECKEEP_PENDING || x->busy || !(x->j.flags & ECDJ_ARMED))
+                continue; /* an unarmed job waits for its DIGEST */
             if (paused)
                 next = now + 50;
             else if (x->next_try <= now)
@@ -763,24 +788,147 @@ void eckeep_swapped(eng *db, part *const *in, size_t n) { held(db, in, n, false,
 
 void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z) { held(db, own, n, true, key, z); }
 
-size_t eckeep_unjobbed(eng *db, int64_t key, uint64_t z, char (**names)[256])
+bool eckeep_active(eng *db) { return keep_of(db) != NULL; }
+
+void eckeep_jobs_load(eng *db)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return;
+    pthread_mutex_lock(&k->load_mu);
+    pthread_mutex_lock(&k->mu);
+    bool done = k->jobs_loaded;
+    pthread_mutex_unlock(&k->mu);
+    if (!done) {
+        ecdigest_load_jobs(db);
+        pthread_mutex_lock(&k->mu);
+        k->jobs_loaded = true;
+        pthread_mutex_unlock(&k->mu);
+    }
+    pthread_mutex_unlock(&k->load_mu);
+}
+
+/* the key in a settled_ name (settled_p<K>_...) */
+static bool name_key(const char *name, int64_t *key)
+{
+    if (strncmp(name, "settled_p", 9) != 0)
+        return false;
+    char *end;
+    errno = 0;
+    long long v = strtoll(name + 9, &end, 10);
+    *key = v;
+    return errno == 0 && end != name + 9 && *end == '_';
+}
+
+static bool anyz_take(struct eckeep_eng *k, const kent *e, int64_t key)
+{
+    int64_t ek;
+    if (!name_key(e->name, &ek) || ek != key)
+        return false;
+    kjob *x = e->job[0] ? find_job(k, e->job) : NULL;
+    return !x || !(x->j.flags & ECDJ_ARMED);
+}
+
+int eckeep_job_names(eng *db, const char *file, int64_t key, char (**names)[256], size_t *n)
+{
+    struct eckeep_eng *k = keep_of(db);
+    *names = NULL;
+    *n = 0;
+    if (!k)
+        return TSDB_ERR_NOTFOUND;
+    pthread_mutex_lock(&k->mu);
+    kjob *x = find_job(k, file);
+    int rc = 0;
+    size_t c = 0;
+    if (x && (x->j.flags & ECDJ_ARMED))
+        rc = ECD_ARMED;
+    for (size_t i = 0; rc == 0 && i < k->n; i++) /* the planted digestanyz: every unarmed copy of the key */
+        c += ecdigest_mutant == ECDIGEST_MUT_ANYZ ? anyz_take(k, &k->e[i], key) : x && strcmp(k->e[i].job, file) == 0;
+    if (rc == 0 && c == 0)
+        rc = TSDB_ERR_NOTFOUND;
+    if (rc == 0 && !(*names = malloc(c * sizeof **names)))
+        rc = TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < k->n; i++) {
+        bool take = ecdigest_mutant == ECDIGEST_MUT_ANYZ ? anyz_take(k, &k->e[i], key)
+                                                         : x && strcmp(k->e[i].job, file) == 0;
+        if (take)
+            memcpy((*names)[(*n)++], k->e[i].name, 256);
+    }
+    pthread_mutex_unlock(&k->mu);
+    return rc;
+}
+
+size_t eckeep_unbound(eng *db, int64_t key, char (**names)[256])
 {
     struct eckeep_eng *k = keep_of(db);
     *names = NULL;
     if (!k)
         return 0;
+    pthread_mutex_lock(&db->lock); /* db->lock > k->mu (held) */
     pthread_mutex_lock(&k->mu);
     size_t n = 0;
-    for (size_t i = 0; i < k->n; i++)
-        n += k->e[i].bound && !k->e[i].job[0] && k->e[i].key == key && (k->e[i].z == z || k->e[i].z == 0);
-    if (n && (*names = malloc(n * sizeof **names))) {
-        size_t m = 0;
-        for (size_t i = 0; i < k->n; i++)
-            if (k->e[i].bound && !k->e[i].job[0] && k->e[i].key == key && (k->e[i].z == z || k->e[i].z == 0))
-                memcpy((*names)[m++], k->e[i].name, 256);
-    } else {
-        n = 0;
+    *names = malloc((k->n ? k->n : 1) * sizeof **names);
+    for (size_t i = 0; *names && i < k->n; i++) {
+        kent *e = &k->e[i];
+        int64_t ek;
+        if (e->job[0] || !name_key(e->name, &ek) || ek != key)
+            continue;
+        const char *src = e->name + 8;
+        size_t sl = strlen(src);
+        bool ec = false; /* a leader's own settled_ file: its .ec of the same stem is listed */
+        for (size_t j = 0; j < db->nparts && !ec && sl > 5; j++)
+            ec = strncmp(db->parts[j]->name, src, sl - 5) == 0 && strcmp(db->parts[j]->name + sl - 5, ".ec") == 0;
+        if (!ec)
+            memcpy((*names)[n++], e->name, 256);
     }
+    pthread_mutex_unlock(&k->mu);
+    pthread_mutex_unlock(&db->lock);
+    if (n == 0) {
+        free(*names);
+        *names = NULL;
+    }
+    return n;
+}
+
+void eckeep_supersede(eng *db, int64_t key, uint64_t z)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k || ecdigest_mutant == ECDIGEST_MUT_NOSUPERSEDE)
+        return;
+    int64_t deadline = eng_now_ms(db) + k->keep_ms;
+    pthread_mutex_lock(&k->mu);
+    for (size_t i = 0; i < k->nj; i++) {
+        kjob *x = &k->jobs[i];
+        if (x->j.key != key || x->j.z >= z || (x->j.flags & (ECDJ_ARMED | ECDJ_SUPERSEDED)) || x->busy)
+            continue;
+        ecd_job w = x->j;
+        w.flags |= ECDJ_SUPERSEDED;
+        pthread_mutex_unlock(&k->mu); /* durable: a restart must not hold them again */
+        int rc = ecdigest_job_write(db, &w);
+        pthread_mutex_lock(&k->mu);
+        x = find_job(k, w.file);
+        if (rc || !x)
+            continue; /* logged; held until the next DIGEST of the key */
+        fprintf(stderr, "tsdb: volume %" PRIu32 " partition %" PRId64 ": the COLD at Z %" PRIu64 " got no DIGEST "
+                "before the one at Z %" PRIu64 " (its leader went first): its %zu retired copies are released at their "
+                "deadline unchecked\n", db->tier_vol, key, x->j.z, z, x->j.nnames);
+        x->j.flags |= ECDJ_SUPERSEDED;
+        x->status = ECKEEP_ORPHAN;
+        k->undigested += x->j.nnames;
+        mark_job_locked(k, x, ECKEEP_ORPHAN, deadline);
+        i = (size_t)-1; /* the list may have moved while mu was let go */
+    }
+    done_jobs(db, k);
+    pthread_mutex_unlock(&k->mu);
+}
+
+uint64_t eckeep_copies_undigested(eng *db)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return 0;
+    pthread_mutex_lock(&k->mu);
+    uint64_t n = k->undigested;
     pthread_mutex_unlock(&k->mu);
     return n;
 }
@@ -794,17 +942,23 @@ int eckeep_add_job(eng *db, ecd_job *j)
     }
     pthread_mutex_lock(&k->mu);
     int rc = 0;
-    if (find_job(k, j->file)) {
-        ecd_job_free(j);
-    } else if (k->nj == k->capj && !realloc_jobs(k)) {
+    kjob *x = find_job(k, j->file);
+    if (x && (x->busy || (x->j.flags & ECDJ_ARMED) || !(j->flags & ECDJ_ARMED))) {
+        ecd_job_free(j); /* known: only an unarmed job is replaced, by its armed form */
+    } else if (!x && k->nj == k->capj && !realloc_jobs(k)) {
         ecd_job_free(j);
         rc = TSDB_ERR_NOMEM; /* the job file is durable: the next open finds it */
     } else {
-        kjob *x = &k->jobs[k->nj++];
+        if (x)
+            ecd_job_free(&x->j);
+        else
+            x = &k->jobs[k->nj++];
         memset(x, 0, sizeof *x);
         x->j = *j;
-        x->status = ECKEEP_PENDING;
         x->backoff = RETRY_MIN_MS;
+        x->status = (j->flags & ECDJ_MATCHED) ? ECKEEP_MATCHED : (j->flags & ECDJ_SUPERSEDED) ? ECKEEP_ORPHAN
+                                                                                             : ECKEEP_PENDING;
+        int64_t deadline = eng_now_ms(db) + k->keep_ms;
         for (size_t i = 0; i < j->nnames; i++) {
             kent *e = find(k, j->names[i]); /* none: released before (its job had matched) */
             if (e) {
@@ -812,9 +966,15 @@ int eckeep_add_job(eng *db, ecd_job *j)
                 e->key = j->key;
                 e->z = j->z;
                 snprintf(e->job, sizeof e->job, "%s", j->file);
+                if (x->status != ECKEEP_PENDING) {
+                    e->status = x->status;
+                    e->deadline = deadline;
+                }
             }
         }
         memset(j, 0, sizeof *j);
+        if (x->status != ECKEEP_PENDING)
+            done_jobs(db, k);
         kick(db, k);
     }
     pthread_mutex_unlock(&k->mu);
@@ -925,6 +1085,7 @@ int eckeep_eng_open(eng *db)
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_mutex_init(&k->mu, NULL);
+    pthread_mutex_init(&k->load_mu, NULL);
     pthread_cond_init(&k->cv, &ca);
     pthread_condattr_destroy(&ca);
     k->keep_ms = tier_eng_settings(db)->keep_s * 1000;
@@ -955,6 +1116,7 @@ void eckeep_eng_close(eng *db)
         return;
     eckeep_eng_stop(db);
     pthread_mutex_destroy(&k->mu);
+    pthread_mutex_destroy(&k->load_mu);
     pthread_cond_destroy(&k->cv);
     free(k->e);
     for (size_t i = 0; i < k->nj; i++)

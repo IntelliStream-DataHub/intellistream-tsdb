@@ -44,10 +44,23 @@ void eckeep_swapped(eng *db, part *const *in, size_t n);
 /* A replica's cold apply (src/ecapply.c) after its renames: settled_<own[i]->name> held for the MK_DIGEST of (key, z),
  * never digested by bytes (no .ec of its name) and never released before that digest matched. */
 void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z);
-/* the retired files of (key, z) (or of key, z unknown: found at an open) no job covers yet: *names malloc'd */
-size_t eckeep_unjobbed(eng *db, int64_t key, uint64_t z, char (**names)[256]);
 struct ecd_job;
-/* a durable job (src/ecdigest.c) for the thread; takes *j (emptied); a job of that file already known is dropped */
+/* whether the engine keeps settled_ files (a tier is attached) */
+bool eckeep_active(eng *db);
+/* the directory's digest_* jobs, listed once (the thread's start, a DIGEST's apply, a COLD's replay: whoever is first;
+ * takes no lock of the caller's but k's) */
+void eckeep_jobs_load(eng *db);
+/* the copies of the unarmed job `file` (*names malloc'd): 0, TSDB_ERR_NOTFOUND (no such job: nothing retired here),
+ * ECD_ARMED (its DIGEST was applied before), TSDB_ERR_NOMEM */
+int eckeep_job_names(eng *db, const char *file, int64_t key, char (**names)[256], size_t *n);
+/* the retired copies of key that no job names (an open found them; a leader's own settled_ files excluded) */
+size_t eckeep_unbound(eng *db, int64_t key, char (**names)[256]);
+/* a DIGEST of (key, z) was applied: the unarmed jobs of key below z never get one (one settle at a time, the DIGEST
+ * right after its swap: their leader was deposed first): marked so durably, their copies released unchecked */
+void eckeep_supersede(eng *db, int64_t key, uint64_t z);
+uint64_t eckeep_copies_undigested(eng *db);
+/* a durable job (src/ecdigest.c) for the thread; takes *j (emptied); a job of that file already known is dropped
+ * unless it is unarmed and j is its armed form */
 int eckeep_add_job(eng *db, struct ecd_job *j);
 /* kept copies counted lost (D25: a copy that fails its checksums while its object matches) */
 uint64_t eckeep_copies_lost(eng *db);

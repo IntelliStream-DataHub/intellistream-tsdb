@@ -252,14 +252,16 @@ static void test_gc_digest(void)
     memset(&m, 0, sizeof m);
     m.type = MK_DIGEST;
     m.u.digest = (mk_digest){.key = -8, .z = 77, .rows = 1ull << 40, .series = 10000, .xxh64 = 0xfeedfacecafef00dull,
-                             .noids = 5, .oids = oids};
-    CHECK(mk_encode(&m, &p, &n) == 0 && n == MK_HDR + 48 + 5 * MK_OID);
+                             .now_ms = -1700000000123, .noids = 5, .oids = oids};
+    m.flags = MKD_TOMBS;
+    CHECK(mk_encode(&m, &p, &n) == 0 && n == MK_HDR + 56 + 5 * MK_OID);
     CHECK(mk_decode(p, n, &d) == 0 && d.type == MK_DIGEST && d.span == 1);
     const mk_digest *g = &d.u.digest;
     CHECK(g->key == -8 && g->z == 77 && g->rows == 1ull << 40 && g->series == 10000 &&
-          g->xxh64 == 0xfeedfacecafef00dull && g->noids == 5 && memcmp(g->oids, oids, 5 * MK_OID) == 0);
+          g->xxh64 == 0xfeedfacecafef00dull && g->now_ms == -1700000000123 && d.flags == MKD_TOMBS && g->noids == 5 &&
+          memcmp(g->oids, oids, 5 * MK_OID) == 0);
     truncations(p, n, "DIGEST");
-    p[MK_HDR + 44] = 1; /* the reserved word */
+    p[MK_HDR + 52] = 1; /* the reserved word */
     CHECK(mk_decode(p, n, &d) == TSDB_ERR_CORRUPT);
     free(p);
     CHECK(MK_TYPE_LAST == 13 && strcmp(mk_type_name(MK_GC), "GC") == 0 &&
@@ -299,7 +301,7 @@ static void test_bounds(void)
     for (uint32_t i = 0; i < over; i++)
         mk_file_put(files + (size_t)i * fsz, &f);
     uint8_t *ids = calloc(over, MK_OID);
-    uint8_t fixed[48];
+    uint8_t fixed[56];
     for (uint32_t cnt = MK_FILES_MAX; cnt <= over; cnt++) {
         int want = cnt == over ? TSDB_ERR_CORRUPT : 0;
         for (int list = 0; list < 3; list++) {
@@ -317,8 +319,8 @@ static void test_bounds(void)
         uint32_t g[2] = {MK_GC_RETIRED, cnt};
         CHECK(decode_body(MK_GC, (const uint8_t *)g, 8, ids, (size_t)cnt * MK_OID) == want);
         memset(fixed, 0, sizeof fixed);
-        memcpy(fixed + 40, &cnt, 4);
-        CHECK(decode_body(MK_DIGEST, fixed, 48, ids, (size_t)cnt * MK_OID) == want);
+        memcpy(fixed + 48, &cnt, 4);
+        CHECK(decode_body(MK_DIGEST, fixed, 56, ids, (size_t)cnt * MK_OID) == want);
     }
     /* the encoder refuses a count past the bound as well */
     mk m;

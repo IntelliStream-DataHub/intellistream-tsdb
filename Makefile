@@ -472,7 +472,8 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
-	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestskip" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: a replica's digest compare skipped must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: each planted bug of a replica's digest job must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digestpower --list "digestjobnosync" -- ./$(B)/test_ecapply --case digestpower --mutant @M@ @D@) # r8j: the job file written without its fdatasync must fail it
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(SCRATCH)
@@ -482,7 +483,7 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_keep $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster releasenosync rotdiverges" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecdigest $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_ecdigest --list "digestbytes digestnotomb digestnoretention" -- ./$(B)/test_ecdigest --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecdigest --list "digestbytes digestnotomb digestnoretention digestbelowtrue digestnots digestfreezerows digestlocalbelow" -- ./$(B)/test_ecdigest --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(SCRATCH)

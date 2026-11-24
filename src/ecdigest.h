@@ -16,22 +16,30 @@
  * total rows and the number of series that have any. Equal for any layout of the same rows: merged or not, any
  * granule cuts, rows of an expired series one twin's merge dropped and the other still stores.
  *
- * The clock and the limits are the log's as of the MK_DIGEST: the leader appends MK_NOW{t} and MK_DIGEST in one batch
- * (jr_markers) and digests at t holding ret_lock (no RETENTION marker between its digest and its marker); a replica's
- * clock at the marker is that t (the NOW markers in log order), and ecdigest_apply freezes the cutoffs of the series
- * of its retired set that clip the key (cutoff above the key's start; usually none) with the marker's expectation.
+ * The clock and the limits are the log's as of the MK_DIGEST: the leader takes its clock t, the limits (ret_gen) and
+ * whether a listed part of the key lies below the set under ret_lock, digests at t with the lock let go, and appends
+ * the DIGEST carrying t (`now_ms`) and that bit (mk.flags MKD_TOMBS) under ret_lock again only if ret_gen is unchanged
+ * (else it digests again; the last try holds the lock throughout), so no RETENTION marker lies between its digest and
+ * its marker; the commit wait runs with no lock. No MK_NOW goes with it: the leader's periodic NOW markers could land
+ * between and move a replica's clock. A replica freezes its cutoffs at the marker's now_ms for every series of its
+ * retired set, those with tombstones only included, and takes the tombstone term from MKD_TOMBS, never from its own
+ * listing (a drop or TTL pass between the apply and the job would change it).
  *
  * Leader (ecdigest_leader, from src/eccold.c after the swap, the gate released, Y still pinned): digests I ∪ Y and
  * appends the marker; its own settled_ files keep R7's byte digest (src/eckeep.c). A failed append is like any
  * marker's: deposed -> INDETERMINATE and dropped, else the engine failed.
- * Replica: the COLD's apply hands its retired parts (settled_<own part>) to eckeep bound to (key, z)
- * (eckeep_retired); ecdigest_apply binds the marker to them, writes the job file digest_<key>_<z> (checksummed,
- * tmp + fdatasync + rename + directory fsync: a restart finds the expectation again, as the marker is not applied
- * twice) and queues it on eckeep's thread (throttled like the byte digest), which opens the settled_ files as parts,
- * digests them and compares: a match lets eckeep release them at settle_keep_s; a mismatch keeps them and the volume
- * goes DIVERGED (ec_diverge, EC_DIV_DIGEST). The job file goes after its last file is released (unlinked, directory
- * synced). Open: a replica whose COLD was applied but whose leader was deposed before its MK_DIGEST holds those files
- * until an operator acts (logged), never released unchecked.
+ * Replica: the COLD's apply binds its retired parts (settled_<own part>) to (key, z) in an unarmed job file
+ * digest_<key>_<z> written after its renames (ecdigest_cold_bind; the decide path of a replay binds them again,
+ * ecdigest_cold_rebind), so a restart holds them, never ORPHAN. ecdigest_apply arms it (ECDJ_ARMED: the expectation,
+ * the frozen cutoffs, TOMBS; checksummed, tmp + fdatasync + rename + directory fsync: the marker is not applied twice)
+ * and queues it on eckeep's thread, which checks every granule checksum of the copies (rot, D25), opens them as parts,
+ * digests and compares: a match is written to the job (ECDJ_MATCHED) before eckeep releases the copies at
+ * settle_keep_s (a restart releases the rest without a second digest); a mismatch, or a digest that fails on copies
+ * whose checksums hold, keeps them and the volume goes DIVERGED (ec_diverge, EC_DIV_DIGEST); rot or a copy missing with
+ * no match recorded is ROT: counted lost (eckeep_copies_lost), the copies released at their deadline, the .ec parts
+ * served. A DIGEST of a later Z of the key supersedes every unarmed job of the key below it (ECDJ_SUPERSEDED: its
+ * leader was deposed before its DIGEST, which can never come): ORPHAN, released at the deadline unchecked and counted
+ * (eckeep_copies_undigested). The job file goes after its last copy is released (unlinked, directory synced).
  *
  * Builds with and without TSDB_EC (the embedded crates copy every .c file of src/).
  */
@@ -50,6 +58,7 @@ struct part;
 
 typedef struct ec_ldigest {
     uint64_t rows, series, xxh64;
+    bool tombs; /* the tombstone term was hashed (the leader's decision travels as MKD_TOMBS) */
 } ec_ldigest;
 
 /* a series' frozen cutoff (ecdigest_apply): rows before it are not visible */
@@ -61,10 +70,13 @@ typedef struct ecd_cut {
 /* The logical digest of set[0 .. n) (parts and .ec parts of key `key`, referenced by the caller) at the retention
  * clock now_ms (the limits are the engine's now). */
 int ec_logical_digest(struct eng *db, struct part **set, size_t n, int64_t key, int64_t now_ms, ec_ldigest *out);
-/* The same with frozen cutoffs: cuts[0 .. ncuts) sorted by series; a series not in it has none. */
+/* The same with frozen cutoffs: cuts[0 .. ncuts) sorted by series (a series not in it has none), and the tombstone term
+ * hashed exactly when `tombs` (the leader's MKD_TOMBS: whether a part lies below the set is listing state, which a
+ * replica's drop or retention pass changes before its job runs). */
 int ec_logical_digest_frozen(struct eng *db, struct part **set, size_t n, int64_t key, const ecd_cut *cuts,
-                             size_t ncuts, ec_ldigest *out);
-/* The cutoffs at now_ms of the series of set[0 .. n) that clip key `key` (above its start), sorted; *cuts malloc'd. */
+                             size_t ncuts, bool tombs, ec_ldigest *out);
+/* The cutoffs at now_ms of the series of set[0 .. n) that clip key `key` (above its start), sorted; *cuts malloc'd.
+ * The series of the set's tombstones count too: one whose rows are all elsewhere still has its term clipped. */
 int ecd_freeze(struct eng *db, struct part **set, size_t n, int64_t key, int64_t now_ms, ecd_cut **cuts,
                size_t *ncuts);
 
@@ -76,10 +88,18 @@ int ecdigest_leader(struct eng *db, int64_t key, uint64_t z, struct part **set, 
 int ecdigest_apply(struct eng *db, uint64_t pos, const mk *m);
 
 /* A replica's job: the expectation of one MK_DIGEST and the retired files it covers, durable as `file` */
+#define ECDJ_ARMED 1u      /* its MK_DIGEST was applied: want, cuts and TOMBS hold */
+#define ECDJ_TOMBS 2u      /* the DIGEST's MKD_TOMBS */
+#define ECDJ_MATCHED 4u    /* the copies matched: a restart releases the rest without a second digest */
+#define ECDJ_SUPERSEDED 8u /* unarmed, and a DIGEST of a later Z of the key was applied: released unchecked */
+#define ECD_REFUSED 1      /* ecdigest_job_check: the copies pass their checksums and cannot be digested */
+#define ECD_ARMED 2        /* eckeep_job_names: the job is armed already (its DIGEST is applied again) */
+
 typedef struct ecd_job {
     char file[64]; /* digest_<key>_<z> */
     int64_t key;
     uint64_t z;
+    uint32_t flags; /* ECDJ_* */
     ec_ldigest want;
     uint8_t oid[16]; /* the marker's first object (ec_diverge names it) */
     ecd_cut *cuts;
@@ -90,9 +110,18 @@ typedef struct ecd_job {
 void ecd_job_free(ecd_job *j);
 bool ecdigest_job_file(const char *name); /* digest_<key>_<z>, or its .tmp */
 /* eckeep's thread: the digest of j's files (opened as parts, every granule's checksum checked: a replica's retired
- * copy is read whole once). 0: *got computed; TSDB_ERR_NOTFOUND: a file is gone (released: its job had matched);
- * TSDB_ERR_CORRUPT: a copy failed its checksums (rot, D25); other: try again later. */
-int ecdigest_job_check(struct eng *db, const ecd_job *j, ec_ldigest *got);
+ * copy is read whole once). 0: *got computed; TSDB_ERR_NOTFOUND: *bad files are gone (the job is not matched, so
+ * lost); TSDB_ERR_CORRUPT: *bad copies fail their checksums (rot, D25); ECD_REFUSED: they pass them and the digest
+ * refuses them (a series SERIES does not know, timestamps out of order: a divergence, not rot); other: try later. */
+int ecdigest_job_check(struct eng *db, const ecd_job *j, ec_ldigest *got, size_t *bad);
+/* the job file (tmp, fdatasync, rename, directory fsync: fail-stop), replacing an earlier form of it */
+int ecdigest_job_write(struct eng *db, const ecd_job *j);
+/* A replica's COLD apply after its renames (src/ecapply.c): its retired copies bound to (key, z) in an unarmed job
+ * file, so that a restart never binds them to another COLD's DIGEST. A COLD found done at a replay
+ * (ecapply_cold_decide) binds the copies of its key that no job names (a crash before the job was durable: earlier
+ * COLDs' copies are named by theirs). */
+void ecdigest_cold_bind(struct eng *db, int64_t key, uint64_t z, struct part *const *own, size_t nown);
+void ecdigest_cold_rebind(struct eng *db, int64_t key, uint64_t z);
 /* eckeep's thread at its start: every digest_* file of the directory to eckeep_add_job; a damaged one is logged and
  * kept (its files stay held) */
 void ecdigest_load_jobs(struct eng *db);
@@ -107,10 +136,21 @@ enum {
     ECDIGEST_MUT_NONE = 0,
     ECDIGEST_MUT_BYTES,       /* digestbytes: the hash of the part files' bytes (differs across layouts) */
     ECDIGEST_MUT_NOTOMB,      /* digestnotomb: no tombstone term */
-    ECDIGEST_MUT_SKIP,        /* digestskip: a replica's comparison is skipped (every job matches) */
+    ECDIGEST_MUT_SKIP,        /* digestnocompare: a replica's comparison is skipped (every job matches) */
     ECDIGEST_MUT_NORETENTION, /* digestnoretention: no cutoff (expired rows one twin still stores are hashed) */
     ECDIGEST_MUT_RELEASENOSYNC, /* releasenosync: a release unlinks without the directory fsync (src/eckeep.c) */
     ECDIGEST_MUT_ROTDIVERGES, /* rotdiverges: rot of a kept copy is taken for DIVERGED (src/eckeep.c) */
+    ECDIGEST_MUT_BELOWTRUE,   /* digestbelowtrue: the tombstone term is hashed with nothing listed below the set */
+    ECDIGEST_MUT_NOTS,        /* digestnots: the rows' timestamps are not hashed */
+    ECDIGEST_MUT_FREEZEROWS,  /* digestfreezerows: ecd_freeze takes the series with rows only, not the tombstones' */
+    ECDIGEST_MUT_LOCALBELOW,  /* digestlocalbelow: a replica's job decides the tombstone term from its own listing */
+    ECDIGEST_MUT_JOBNOSYNC,   /* digestjobnosync: a job file is renamed without its fdatasync */
+    ECDIGEST_MUT_NOCRCWALK,   /* digestnocrcwalk: a job does not check its copies' granule checksums */
+    ECDIGEST_MUT_ROTMATCHES,  /* digestrotmatches: a job's rot (or a missing copy) counts as a match */
+    ECDIGEST_MUT_NOJOBREMOVE, /* digestnojobremove: a job file stays after its last copy was released */
+    ECDIGEST_MUT_ANYZ,        /* digestanyz: a DIGEST takes every retired copy of its key, bound to its Z or not */
+    ECDIGEST_MUT_NOSUPERSEDE, /* digestnosupersede: copies whose DIGEST can no longer come are held forever */
+    ECDIGEST_MUT_CORRUPTROT,  /* digestcorruptrot: a digest that fails on a copy with valid checksums counts as rot */
 };
 extern int ecdigest_mutant;
 /* test hook: the next replica job check hashes the value of its first row changed by one bit, as a retired copy whose

@@ -19,7 +19,7 @@
  *           files: nfiles x (as COMMIT's, with the kind in the byte after name_len: u16 name_len, u8 kind, u8 0, ...),
  *           retired: nretired x oid[16] (R10's; this build refuses nretired != 0)
  *   GC      u32 reason, u32 noids, noids x oid[16]
- *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, u32 noids, u32 0, noids x oid[16]
+ *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, i64 now_ms, u32 noids, u32 0, noids x oid[16]; flags MKD_TOMBS
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
  * type's, trailing bytes), so a payload has exactly one encoding and the fuzz harness compares both directions.
@@ -130,7 +130,7 @@ static bool name_ok(const char *s, size_t n)
 #define COLD_FIXED 48
 #define OBJ_FIXED 24 /* oid, u32 rec_len, u32 0 */
 #define GC_FIXED 8
-#define DIGEST_FIXED 48
+#define DIGEST_FIXED 56
 
 size_t mk_file_size(const mk_file *f)
 {
@@ -365,14 +365,15 @@ static int decode_gc(const uint8_t *b, size_t n, mk_gc *g)
 
 static int decode_digest(const uint8_t *b, size_t n, mk_digest *d)
 {
-    if (n < DIGEST_FIXED || !zeros(b, 44, 48))
+    if (n < DIGEST_FIXED || !zeros(b, 52, 56))
         return TSDB_ERR_CORRUPT;
     d->key = (int64_t)get64(b);
     d->z = get64(b + 8);
     d->rows = get64(b + 16);
     d->series = get64(b + 24);
     d->xxh64 = get64(b + 32);
-    memcpy(&d->noids, b + 40, 4);
+    d->now_ms = (int64_t)get64(b + 40);
+    memcpy(&d->noids, b + 48, 4);
     d->oids = b + DIGEST_FIXED;
     if (!counts_ok(d->noids, 0, 0) || n - DIGEST_FIXED != (size_t)d->noids * MK_OID)
         return TSDB_ERR_CORRUPT;
@@ -659,7 +660,8 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         put64(b + 16, d->rows);
         put64(b + 24, d->series);
         put64(b + 32, d->xxh64);
-        memcpy(b + 40, &d->noids, 4);
+        put64(b + 40, (uint64_t)d->now_ms);
+        memcpy(b + 48, &d->noids, 4);
         if (d->noids)
             memcpy(b + DIGEST_FIXED, d->oids, (size_t)d->noids * MK_OID);
         break;

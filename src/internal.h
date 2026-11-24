@@ -1522,6 +1522,10 @@ struct jr_ret_arg {
  * and waits for the last one's commit point (0 at once without a replicated backend, as on a replica); the caller
  * holds the dictionary's own append lock across it. jr_dict_series and jr_dict_state are series_dict.before_append. */
 int jr_markers(struct eng *db, const mk *m, size_t n, const char *what);
+/* jr_markers in two steps: the append (*last: the batch's last position, 0 when nothing is replicated), then the wait
+ * for its commit point, which needs none of the caller's locks (ecdigest_leader appends under ret_lock) */
+int jr_markers_append(struct eng *db, const mk *m, size_t n, const char *what, uint64_t *last);
+int jr_markers_wait(struct eng *db, uint64_t last, const char *what);
 int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type);
 int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type);
 /* jr_commit: a leader's JR_COMMIT records the published COMMIT in its RSTATE (replica.c; the other kinds do nothing).
