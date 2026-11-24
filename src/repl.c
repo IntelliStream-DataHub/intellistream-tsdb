@@ -1317,6 +1317,10 @@ uint64_t repl_written(const struct repl *r) { return r->written; }
 uint64_t repl_durable_end(const struct repl *r) { return r->durable; }
 uint64_t repl_applied(const struct repl *r) { return r->applied; }
 uint64_t repl_commit(const struct repl *r) { return r->commit; }
+uint64_t repl_peer_match(const struct repl *r, int idx)
+{
+    return idx >= 0 && idx < REPL_MAX_NODES && r->leading ? r->peer[idx].match : 0;
+}
 int repl_failed(const struct repl *r) { return r->failed; }
 
 size_t repl_describe(const struct repl *r, char *buf, size_t cap)

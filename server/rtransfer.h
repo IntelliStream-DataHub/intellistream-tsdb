@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * A planned leader transfer, the volume leader's side (R4 plan D14, D15): the drain that stops admitting records,
- * READY to the Raft leader, CANCEL. A stub until r4-transfer fills server/rtransfer.c; the call sites in repld.c are
- * final.
+ * READY to the Raft leader, CANCEL. The call sites in repld.c are final.
  */
 #ifndef TSDB_RTRANSFER_H
 #define TSDB_RTRANSFER_H
@@ -17,5 +16,7 @@ int rtr_admit_ok(struct rvol *rv);
 void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from);
 /* Every tick of the volume's thread, rv->mu held. */
 void rtr_tick(struct rvol *rv);
+/* 1 while a transfer refuses this volume's records (rv->mu held) */
+int rtr_draining(struct rvol *rv);
 
 #endif

@@ -6189,9 +6189,14 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     g.nfenced = p->nfenced;
     memcpy(g.fenced, p->fenced, sizeof g.fenced);
     uint64_t best = 0;
+    g.target = p->target;
+    g.min_end = p->min_end;
+    /* not the failed or the cut-off one; a planned transfer (target) passes every reply, the drained old leader's
+     * included, so that no member is left `unanswered` (ctr_reply_passes, D14) */
     for (uint32_t i = 0; i < p->nfenced; i++)
-        if (p->replied[i] && !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
-                               p->fenced[i] == p->old)) { /* not the failed or the cut-off one */
+        if (p->replied[i] && (p->target ? ctr_reply_passes(p->target, p->fenced[i])
+                                        : !((p->reason == META_GR_FENCED || p->reason == META_GR_PLANNED) &&
+                                            p->fenced[i] == p->old))) {
             g.reply[g.nreplies++] = p->reply[i];
             if (p->reply[i].durable > best)
                 best = p->reply[i].durable;
@@ -6356,6 +6361,12 @@ static void promote_duty(uint64_t now)
         const struct meta_volume *v = meta_volume(&C.sm, p->vol);
         int moved = !v || v->epoch != p->epoch || v->isr_version != p->version;
         int cand = cl_mutant() != CLM_MOVEGIVEUP && promo_candidate(p);
+        if (!moved && p->target && since(now, p->t0) >= PROMO_MOVE_NS) { /* a transfer: ctransfer.c cancels it */
+            say("volume %" PRIu32 ": no grant to target %" PRIu32 " committed within %llu ms; the transfer's "
+                "promotion is dropped", p->vol, p->target, (unsigned long long)(PROMO_MOVE_NS / MS));
+            ctr_promo_dropped(p->vol, p->epoch, now);
+            continue;
+        }
         if (!moved && p->reason == META_GR_PLANNED && !p->proposed_ns && !cand && since(now, p->t0) >= PROMO_MOVE_NS) {
             say("volume %" PRIu32 ": no replica to move the leadership of epoch %" PRIu64 " to; the ISR shrinks",
                 p->vol, p->epoch);
@@ -6934,6 +6945,14 @@ uint64_t cl_now_ns(void) { return mono_ns(); }
 uint32_t cl_self(void) { return C.id; }
 
 int cl_leading(void) { return C.r && raft_get_role(C.r) == RAFT_LEADER && C.sm.initialised; }
+
+uint64_t cl_term(void) { return C.r ? (uint64_t)raft_get_term(C.r) : 0; }
+
+uint64_t cl_leader_age_ns(uint64_t now) { return cl_leading() ? since(now, C.leader_since) : 0; }
+
+uint32_t cl_lease_ms(void) { return settings()->lease_ms; }
+
+int cl_promo_running(uint32_t vol) { return promo_find(vol) != NULL; }
 
 const char *cl_leader_peer(void) { return leader_peer(); }
 

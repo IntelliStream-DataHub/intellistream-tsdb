@@ -35,6 +35,12 @@ int repld_leading(uint32_t v, uint64_t *epoch);
 int repld_engine_failed(uint32_t v, const char *msg);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
+/* 1 while volume v is led here and a planned transfer refuses its writes (rtransfer.c): UNAVAILABLE PROMOTING, a
+ * retry after about 50 ms, definite (never admitted). */
+int repld_draining(uint32_t v);
+/* the volume leaders' side of STATUS's transfer counters: drains that timed out, records admitted blind after READY's
+ * hard cap, READYs sent */
+void repld_transfer_counts(unsigned long *timedout, unsigned long *blind, unsigned long *ready);
 /* A FENCE(v, fence) from the Raft leader `from` (the cluster thread's handler, cluster_set_fence_handler): handed to the
  * volume's core, whose reply goes back through cluster_vol_msg once the fence is saved. No such volume: ignored. */
 void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from);

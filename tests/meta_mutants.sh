@@ -17,8 +17,8 @@ bin=$1
 shift
 # 36 userstaleok, 37 uidfromproposer, 38 nousersbudget, 39 noactorguard; R4's replica set: 40 setvernoraise,
 # 41 setverraiseisr, 42 resetinisr, 43 resetleader, 44 twomoves, 45 replacesstays, 46 moveslotlast, 47 targetnotisr,
-# 48 targetleader
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 47 48}
+# 48 targetleader, 49 targetignored
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
