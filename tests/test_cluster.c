@@ -14196,9 +14196,9 @@ static void scen_r4stubs(void)
     /* the stubs decode the body and say it back: the CLI's encoding against the server's decoder, field by field */
     static const char *const verbs[][2] = {
         {"volume transfer %s 3 5", "volume 3 to node 5: no such volume"}, /* built (r4-transfer): ctr_admin */
-        {"volume move %s 3 --log --from 5 --to 6", "not built yet (move of volume 3 from node 5 to node 6, log)"},
+        {"volume move %s 3 --log --from 5 --to 6", "move of volume 3 from node 5 to node 6: no such volume"},
         {"volume move %s 3 --log --from 6 --to 5 --cancel",
-         "not built yet (move of volume 3 from node 6 to node 5, log, cancel)"},
+         "cancel of the move of volume 3 from node 6 to node 5: no such volume"}, /* built (r4-move): cmove_admin */
         {"replica reset %s 4 6", "volume 4 does not exist"}};
     for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
         char v[256];
@@ -14217,7 +14217,7 @@ static void scen_r4stubs(void)
         arc = admin(0, ops[k], body, 12, 0, &reply, &len);
         const char *says = k == 0   ? "a transfer's body is 8 bytes (got 12)"
                            : k == 2 ? "replica reset: a body of 12 bytes"
-                                    : "not built yet (a body of 12 bytes)";
+                                    : "a move's body is 16 bytes (got 12)";
         if (arc != META_ERR_INVALID || !reply || len < strlen(says) || memcmp(reply, says, strlen(says)))
             die("op %d with a 12-byte body: %s", ops[k], cluster_strerror(arc));
         free(reply);

@@ -42,6 +42,8 @@ struct rset {
     uint64_t dropped_said, said_ms;
     uint64_t defer_said;         /* the set version a deferral was said for */
     int stale_said;
+    uint64_t drop_term;          /* DROP_MEMBER: the newest Raft term heard (arg >> 8); an older one is ignored */
+    uint64_t drop_said;          /* the last command said: (node << 40) ^ (min_isr << 32) ^ epoch */
 };
 
 static uint64_t ms_now(void)
@@ -236,10 +238,49 @@ void rset_stamp(struct rvol *rv, struct repl_msg *m) { m->set_version = repl_get
 
 uint64_t rset_dropped(const struct rvol *rv) { return rv->set ? rv->set->dropped : 0; }
 
+/* DROP_MEMBER (D11; cmove.c): {epoch, node, arg = Raft term << 8 | min_isr}; node 0 cancels (repl_leave(-1)). Only the
+ * volume's leader at that epoch acts; a command of an older Raft term than one heard is a deposed Raft leader's and is
+ * ignored (the frame carries no term of its own, cluster.h). The Raft leader resends it every second while the move
+ * needs it, so a refusal here is never final. */
 void rset_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 {
-    if (!rv->said_cmd_drop)
-        say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " at epoch %" PRIu64 " (arg %" PRIu64 ") from node %"
-            PRIu32 ": not built yet (r4-move); ignored", rv->number, c->node, c->epoch, c->arg, from);
-    rv->said_cmd_drop = 1;
+    struct rset *s = set_of(rv);
+    if (!s || !rv->core)
+        return;
+    uint64_t term = c->arg >> 8;
+    uint32_t min_isr = (uint32_t)(c->arg & 0xff);
+    if (term < s->drop_term) {
+        say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " from node %" PRIu32 " of Raft term %" PRIu64
+            " ignored (term %" PRIu64 " was heard)", rv->number, c->node, from, term, s->drop_term);
+        return;
+    }
+    s->drop_term = term;
+    if (c->node == 0) {
+        if (repl_leaving(rv->core) >= 0)
+            say("volume %" PRIu32 ": a move is cancelled: replica %d no longer leaves", rv->number,
+                repl_leaving(rv->core));
+        repl_leave(rv->core, -1, 0);
+        s->drop_said = 0;
+        return;
+    }
+    int idx = -1;
+    for (uint32_t i = 0; i < rv->rec.nrep; i++)
+        if (rv->rec.rep[i].node == c->node)
+            idx = (int)i;
+    const char *no = rv->mode != M_WRITER || !repl_is_leader(rv->core) ? "this node does not lead it"
+                     : c->epoch != repl_epoch(rv->core)                 ? "another epoch"
+                     : idx < 0                                          ? "no such member"
+                     : idx == rv->self                                  ? "the member is this leader"
+                                                                        : NULL;
+    int rc = no ? REPL_E_INVALID : repl_leave(rv->core, idx, min_isr);
+    uint64_t key = (uint64_t)c->node << 40 ^ (uint64_t)min_isr << 32 ^ c->epoch;
+    if (s->drop_said == key)
+        return;
+    s->drop_said = key;
+    if (no || rc != REPL_OK)
+        say("volume %" PRIu32 ": DROP_MEMBER of node %" PRIu32 " at epoch %" PRIu64 " from node %" PRIu32 " refused: %s",
+            rv->number, c->node, c->epoch, from, no ? no : "the core refuses it");
+    else
+        say("volume %" PRIu32 ": node %" PRIu32 " (replica %d) leaves: the ISR without it once it keeps %" PRIu32
+            " members (epoch %" PRIu64 ")", rv->number, c->node, idx, min_isr, c->epoch);
 }

@@ -1133,6 +1133,8 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int vol_trace;       /* TSDB_CLUSTER_TEST vol_trace=1: <state-dir>/voltrace, a line per changed volume (cmove_trace) */
+    char voltracefile[1100];
     int drop_hb;         /* TSDB_CLUSTER_TEST drop_hb_file=1: while <state-dir>/drophb is, a heartbeat received from the node
                           * it names (a decimal id) is dropped unanswered (test_cluster balancehb: a one-way cut of one
                           * member's heartbeats from the Raft leader, its data links untouched) */
@@ -1430,6 +1432,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "vol_trace=%llu", &v) == 1)
+            C.vol_trace = v != 0;
         else if (sscanf(p, "drop_hb_file=%llu", &v) == 1)
             C.drop_hb = v != 0;
         else if (sscanf(p, "hold_grant_ms=%llu", &v) == 1)
@@ -2696,6 +2700,8 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
     }
     if (!own)
         return;
+    if (C.vol_trace && type == RAFT_ENTRY_NORMAL)
+        cmove_trace(m, index, C.voltracefile);
     ring_push(index, term, type, data, len);
     for (size_t i = 0; i < C.nconns; i++)
         if (C.conns[i]->watch_served && C.conns[i]->state == CS_READY && !C.conns[i]->dead)
@@ -6875,6 +6881,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.voltracefile, sizeof C.voltracefile, "%s/voltrace", C.metadir);
     snprintf(C.drophbfile, sizeof C.drophbfile, "%s/drophb", C.metadir);
     snprintf(C.losereadyfile, sizeof C.losereadyfile, "%s/loseready", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
