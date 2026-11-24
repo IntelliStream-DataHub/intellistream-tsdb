@@ -213,6 +213,7 @@ enum {
     RM_SNAPSTALEKEEP,    /* snapinst.c: the old REPL is read before the driver stopped (D6) */
     RM_SNAPKEEPDIVERGED, /* snapinst.c: the old directory's DIVERGED is carried into the installed one */
     RM_SNAPSETNODEFER,   /* rsnap.c: an install does not set rv->snap: a set change applies between its check and close */
+    RM_SNAPCLOSEKEEP,    /* rsnap.c: a closed volume's snapshot jobs are left (a receiver's v<N>.snap stays) */
     RM_SNAPDROPAFTER,    /* snapinst_run.c: a copy not installed is left for w_drop, after the volume went back (F1) */
     RM_SNAPNOENDAFTER,   /* snapinst_run.c: P is not compared with the log end the closed driver left */
     RM_SNAPNOFENCE,      /* rsnap.c, snapinst_run.c: a copy of an epoch below the receiver's fence is installed */

@@ -2246,6 +2246,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnosrcmax")   ? RM_SNAPNOSRCMAX
                : !strcmp(mu, "snapinstallstale") ? RM_SNAPINSTALLSTALE
                : !strcmp(mu, "snapsetnodefer") ? RM_SNAPSETNODEFER
+               : !strcmp(mu, "snapclosekeep")  ? RM_SNAPCLOSEKEEP
                : !strcmp(mu, "snapdropafter")  ? RM_SNAPDROPAFTER
                : !strcmp(mu, "snapnoendafter") ? RM_SNAPNOENDAFTER
                : !strcmp(mu, "snapnofence")    ? RM_SNAPNOFENCE
@@ -2674,7 +2675,10 @@ static void cvol_close(uint32_t v)
 
 int repld_close(uint32_t v)
 {
-    return repld_close_end(v, NULL);
+    int rc = repld_close_end(v, NULL);
+    if (G.mutant != RM_SNAPCLOSEKEEP)
+        rsnap_closed(v); /* nothing ticks its snapshot jobs any more */
+    return rc;
 }
 
 int repld_close_end(uint32_t v, uint64_t *log_end)
