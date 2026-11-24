@@ -6274,6 +6274,164 @@ static void scen_forward(void)
            w.ms);
 }
 
+/* fwdseries (S2-2, found by r4-move): series and state codes looked up and created by path through members that
+ * do not lead the volume, with replica reads on (TSDB_REPLICA_READS=1, this file's default: REPLICA_OK). A SERIES or
+ * STATE whose `create` byte is set is a write: it goes to the leader like an INSERT, forwarded in one hop. It was judged
+ * a read by its need alone (any right), so a replica serving reads ran it on its own engine, which refused to create
+ * (READONLY), and the client got MOVED. Three servers with login on; east on two of them (leader L, replica R), the
+ * third (N) holds no copy. Through R and N with a retry budget of 0 (a MOVED fails the call): tsdbc_series_at creates
+ * and finds again, tsdbc_series_create creates a state series, tsdbc_state creates a code; the ids and codes are the
+ * leader's. R's plain lookup by name finds the id from its copy. alice (prefix grant plant.) is NOTFOUND for a missing
+ * name inside her grant, then creates it through the same member, and is DENIED outside it. Mutant (TSDBD_FWD_MUTANT):
+ * fwdcreateread (a create judged a read). fwdseriesstrict runs the same with strict reads (production: every read of a
+ * volume led elsewhere is forwarded, so creates were forwarded there before the fix too), R's plain lookup left out. */
+static void fwdseries_run(int strict)
+{
+    scenario(strict ? "fwdseriesstrict" : "fwdseries");
+    fwd_on = 1;
+    strict_reads = strict; /* 0: replicas with a lease serve reads; 1: every read on the leader (D5), as in production */
+    const char *mut = getenv("TSDBD_FWD_MUTANT");
+    static char menv[128];
+    snprintf(menv, sizeof menv, "TSDBD_FWD_MUTANT=%s", mut ? mut : "");
+    for (int i = 0; i < 3; i++) {
+        auth_on[i] = 1;
+        penv[i] = menv;
+        start(i);
+    }
+    char pw[PATH_MAX + 80], pw2[PATH_MAX + 80], args[PATH_MAX * 2 + 512], out[8192], p0[META_ADDR_MAX];
+    put_file("pw", "root-pw", pw, sizeof pw);
+    put_file("pw2", "alice-pw", pw2, sizeof pw2);
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --node-timeout-ms 1500 --heartbeat-ms 200 --voter-replace-s 600 "
+             "--superuser root --password-file %s",
+             p0, secret_path, pw);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("cluster init --superuser root: %s", out);
+    ids[0] = 1;
+    await_view(0, p_leader_self, NULL, "leading the initialised cluster");
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    snprintf(args, sizeof args, "cluster user add %s alice --password-file %s --secret-file %s", p0, pw2,
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("user add alice: %s", out);
+    for (int i = 0; i < 3; i++) {
+        await_view(i, p_users_caught_up, NULL, "users caught up");
+        await_login(i, "root", "root-pw");
+    }
+    uint32_t num;
+    struct meta_volume v;
+    int rc;
+    if ((rc = vol_add(0, "east", 2, &num)) != 0)
+        die("volume add east: %s", cluster_strerror(rc));
+    if (!vol_rec(0, "east", &v) || v.nrep != 2)
+        die("no record of east with two replicas");
+    for (uint32_t k = 0; k < v.nrep; k++)
+        await_open_gen(0, "east", server_of(v.rep[k].node), 1, 0);
+    await_isr(0, "east", 2, 20000, "east with both replicas up");
+    int L = server_of(v.leader), R = server_of(v.rep[0].node == v.leader ? v.rep[1].node : v.rep[0].node),
+        O = 3 - L - R; /* the member without a copy */
+    {
+        tsdbc *r0 = login_on(0, "root", "root-pw");
+        if ((rc = tsdbc_grant(r0, "alice", TSDB_SEL_PREFIX, "plant.", TSDB_RIGHT_READ | TSDB_RIGHT_INSERT)) != 0)
+            die("grant: %s", ers(rc));
+        tsdbc_close(r0);
+    }
+    for (int i = 0; i < 3; i++)
+        await_view(i, p_users_caught_up, NULL, "users caught up after the grant");
+    { /* east's leader writes (its first write may be UNAVAILABLE while the volume opens, retried here) */
+        tsdbc *c = login_retry(L, "root", "root-pw", 0);
+        rep_series(c, "plant.warm", "east", 30000);
+        tsdbc_close(c);
+    }
+
+    /* a. root through the replica R and through N: creates by path and finds again; a state series and a code */
+    static const char *const ename[2] = {"replica", "member without a copy"};
+    int ent[2] = {R, O};
+    tsdb_sid sid[2], stid[2];
+    uint32_t code[2];
+    for (int e = 0; e < 2; e++) {
+        tsdbc *c = login_retry(ent[e], "root", "root-pw", 0); /* budget 0: a MOVED fails the call */
+        char nm[64], st[64];
+        snprintf(nm, sizeof nm, "plant.via%d", e);
+        snprintf(st, sizeof st, "plant.mode%d", e);
+        tsdb_sid again = 0;
+        if ((rc = tsdbc_series_at(c, nm, "east", &sid[e])) != 0)
+            die("a series created by path through the %s: %s, not its id", ename[e], ers(rc));
+        if ((rc = tsdbc_series_at(c, nm, "east", &again)) != 0 || again != sid[e])
+            die("the series found again by path through the %s: %s, id %" PRIu64 " not %" PRIu64, ename[e], ers(rc),
+                (uint64_t)again, (uint64_t)sid[e]);
+        if ((rc = tsdbc_series_create(c, st, TSDB_STATE, "east", &stid[e])) != 0)
+            die("a state series created (SERIES_CREATE) through the %s: %s", ename[e], ers(rc));
+        if ((rc = tsdbc_state(c, stid[e], "running", &code[e])) != 0)
+            die("a state code created through the %s: %s, not its code", ename[e], ers(rc));
+        tsdbc_close(c);
+    }
+    {
+        tsdbc *c = login_retry(L, "root", "root-pw", 0);
+        for (int e = 0; e < 2; e++) {
+            char nm[64], st[64];
+            snprintf(nm, sizeof nm, "plant.via%d", e);
+            snprintf(st, sizeof st, "plant.mode%d", e);
+            tsdb_sid id = 0, sx = 0;
+            uint32_t cx = 0;
+            if ((rc = tsdbc_series_at(c, nm, "east", &id)) != 0 || id != sid[e])
+                die("on the leader %s is %s, id %" PRIu64 ", not the id %" PRIu64 " made through the %s", nm, ers(rc),
+                    (uint64_t)id, (uint64_t)sid[e], ename[e]);
+            if ((rc = tsdbc_series_at(c, st, "east", &sx)) != 0 || sx != stid[e])
+                die("on the leader %s is %s, id %" PRIu64 ", not the id %" PRIu64 " made through the %s", st, ers(rc),
+                    (uint64_t)sx, (uint64_t)stid[e], ename[e]);
+            if ((rc = tsdbc_state_lookup(c, stid[e], "running", &cx)) != 0 || cx != code[e])
+                die("on the leader the code of running is %s, %u, not the %u made through the %s", ers(rc),
+                    (unsigned)cx, (unsigned)code[e], ename[e]);
+        }
+        tsdbc_close(c);
+    }
+    if (!strict) { /* a plain lookup by name on R: served from its copy (REPLICA_OK), once it has applied the creation */
+        tsdbc *c = login_retry(R, "root", "root-pw", 0);
+        uint64_t t0 = now_ms();
+        tsdb_sid id = 0;
+        while ((rc = tsdbc_series(c, "plant.via0", 0, &id)) == TSDB_ERR_NOTFOUND && now_ms() - t0 < 20000)
+            nanosleep(&(struct timespec){0, 20000000}, NULL);
+        if (rc != 0 || id != sid[0])
+            die("a lookup by name on the replica: %s, id %" PRIu64 ", not %" PRIu64, ers(rc), (uint64_t)id,
+                (uint64_t)sid[0]);
+        tsdbc_close(c);
+    }
+    printf("  through a replica and a member without a copy: series by path and state codes are created on the "
+           "leader and found again, with the leader's ids and codes\n");
+
+    /* b. alice: NOTFOUND inside her grant, then created through the same member; DENIED outside it */
+    for (int e = 0; e < 2; e++) {
+        tsdbc *a = login_retry(ent[e], "alice", "alice-pw", 0);
+        char nm[64], on[64];
+        snprintf(nm, sizeof nm, "plant.alice%d", e);
+        snprintf(on, sizeof on, "other.alice%d", e);
+        tsdb_sid id = 0, lid = 0;
+        /* no client call sends a path with create 0: this lookup names no volume (TSDB_VOL_ANY) and is answered by
+         * the member itself, from the volumes it holds (none of east on N) */
+        if ((rc = tsdbc_series(a, nm, 0, &id)) != TSDB_ERR_NOTFOUND)
+            die("alice's lookup of a missing name in her grant through the %s: %s, not NOTFOUND", ename[e], ers(rc));
+        if ((rc = tsdbc_series_at(a, nm, "east", &id)) != 0)
+            die("alice's series created by path in her grant through the %s: %s", ename[e], ers(rc));
+        if ((rc = tsdbc_series_at(a, on, "east", &(tsdb_sid){0})) != TSDB_ERR_DENIED)
+            die("alice's series created by path outside her grant through the %s: %s, not DENIED", ename[e], ers(rc));
+        tsdbc_close(a);
+        tsdbc *c = login_retry(L, "root", "root-pw", 0);
+        if ((rc = tsdbc_series_at(c, nm, "east", &lid)) != 0 || lid != id)
+            die("on the leader alice's %s is %s, id %" PRIu64 ", not %" PRIu64, nm, ers(rc), (uint64_t)lid,
+                (uint64_t)id);
+        tsdbc_close(c);
+    }
+    printf("  alice through both: NOTFOUND in her grant (a lookup by name only, served here), then created there by path "
+           "with the leader's id; DENIED outside it\n");
+}
+static void scen_fwdseries(void) { fwdseries_run(0); }
+static void scen_fwdseries_strict(void) { fwdseries_run(1); }
+
 /* ccstress: the copy's get/put/swap in-process (cluster_copy_stress, no server): 32 readers loop get/put while 5,000
  * snapshots are swapped in. The writer must get through (one counter for every reader starved it for good: mutant
  * cconeslot), and no reader may see its snapshot change or freed (ccnowait; ASan names the use after free). */
@@ -6319,8 +6477,8 @@ static void scen_copyhold(void)
 }
 
 /* minisr: with min_isr 3, a leader whose ISR shrank to 2 refuses a write before anything is written (REPL_E_ISR:
- * UNAVAILABLE, WHY UNREACHABLE), serves reads, and takes writes again once the replica is back in the ISR (mutant
- * nominisr). A write admitted while the ISR was 3 whose commit point comes only after the shrink is not acknowledged
+ * UNAVAILABLE, WHY UNREACHABLE), serves reads (a STATE of a name that has its code too, although its create byte is
+ * set), and takes writes again once the replica is back in the ISR (mutant nominisr). A write admitted while the ISR was 3 whose commit point comes only after the shrink is not acknowledged
  * until the ISR is back (mutant ackbelowminisr). The second kill happens while nothing is written: a silent member
  * goes after isr_lag (repl.c MUT(40)). With three nodes min_isr 3 stands for "two of three replicas down": two down
  * would take the metadata group's quorum, and with it every ISR change. */
@@ -6358,6 +6516,12 @@ static void scen_minisr(void)
     ts = 2000;
     if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
         die("a second write with every replica up: %s", ers(rc));
+    tsdb_sid stid = 0; /* a state code made now, asked for again below min_isr */
+    uint32_t code = 0;
+    if ((rc = tsdbc_series_create(c, "plant.mode", TSDB_STATE, "plant", &stid)) != 0)
+        die("a state series with every replica up: %s", ers(rc));
+    if ((rc = tsdbc_state(c, stid, "running", &code)) != 0)
+        die("a state code with every replica up: %s", ers(rc));
     await_isr(0, "plant", 3, 5000, "every replica up");
     int R1 = (L + 1) % 3;
     /* a write admitted with the ISR at 3, its commit point reached only once the shrink to 2 committed: held */
@@ -6397,6 +6561,12 @@ static void scen_minisr(void)
     }
     if (rows_of(c, id) != 2)
         die("the leader reads %d rows after the refused writes, not 2", rows_of(c, id));
+    { /* tsdbc_state always sends create = 1: for a name that has its code it is a read, served (fwd-series review) */
+        uint32_t again = 0;
+        if ((rc = tsdbc_state(c, stid, "running", &again)) != 0 || again != code)
+            die("the code of an existing state name below min_isr: %s, %u, not %u (a STATE that creates nothing is a "
+                "read)", ers(rc), (unsigned)again, (unsigned)code);
+    }
     start(R1);
     await_isr(0, "plant", 3, 30000, "the replica back");
     await_writer(&w, th, 10000, "the write held below min_isr, once the replica is back");
@@ -16326,7 +16496,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

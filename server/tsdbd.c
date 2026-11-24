@@ -2508,8 +2508,25 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
  * a broken link answered UNAVAILABLE, the owner runs a forward unchecked (no user), a lost forward sent again, the
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
 enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
-       FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH };
+       FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH,
+       FWM_CREATEREAD };
 static int fwdx_mutant;
+/* For route_decide alone: the request writes, by auth_ops' R_WRITE or a SERIES or STATE whose `create` byte is set
+ * (create_at, which raises its need to R_INSERT). Such a lookup that creates is judged a read by its need alone
+ * (NEED_ANY), and a replica that serves reads (TSDB_REPLICA_READS, REPLICA_OK) then ran it on its own engine, which
+ * refuses to create (READONLY, answered MOVED): through a member that does not lead the volume, tsdbc_series_at
+ * answered MOVED instead of being forwarded to the leader (found by r4-move; test_cluster fwdseries, mutant
+ * fwdcreateread). In strict mode (production) every read of a volume led elsewhere is forwarded already, so this
+ * changes nothing there. handle_in's gates keep judging by the need: tsdbc_state always sends create = 1, and a STATE
+ * of an existing name is a read answered below min_isr (D9; test_cluster minisr); the forward's link kind too (a
+ * create rides FWDQ, as it always did in strict mode). */
+static bool req_writes(uint8_t op, const uint8_t *p, size_t len)
+{
+    const auth_op *e = &auth_ops[op];
+    if (e->create_at && len >= e->create_at && p[e->create_at - 1] && fwdx_mutant != FWM_CREATEREAD)
+        return true;
+    return !(e->need & NEED_ANY) && (e->need & R_WRITE);
+}
 static int fwd_entry(req *r, uint32_t v);
 static atomic_int fwd_inflight; /* forwards this entry node is running (STATUS fwd.inflight) */
 static __thread const struct cluster_copy *rt_cp;
@@ -2647,7 +2664,7 @@ static int route_decide(req *r)
     }
     if (v == TSDB_VOL_ANY)
         return 0;
-    if (!route_away(v, !(auth_ops[r->op].need & R_WRITE), &owner))
+    if (!route_away(v, !req_writes(r->op, p, len), &owner))
         return 0;
     if ((!fwd_owner || fwdx_mutant == FWM_TWICE) && fwd_entry(r, v)) /* forwarded to its leader (S2-2) */
         return 1;
@@ -5899,7 +5916,8 @@ int main(int argc, char **argv)
         static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
                                             "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
                                             "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
-                                            "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch"};
+                                            "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
+                                            "fwdcreateread"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;
