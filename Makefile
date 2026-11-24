@@ -1905,6 +1905,13 @@ test-release:
 	tests/test_release_notes.sh
 	python3 -I tests/test_release_publish.py
 
+# tools/link-bench on loopback (the tool behind docs/design-rdma.md's numbers): tags checked, a wrong one caught, round
+# trips timed whole. LINK_BENCH=path runs the test against another binary (a planted bug). Seconds.
+test: test-link-bench
+.PHONY: test-link-bench
+test-link-bench: $(B)/link-bench
+	B=$(B) tests/test_link_bench.sh
+
 # The licence of every source file (tools/check-spdx.sh) and the test of that check (it must fail on each kind of slip).
 test: test-spdx
 test-spdx:

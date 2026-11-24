@@ -13,9 +13,9 @@
 #             (--events: what a poll() loop would see) and ib_send_lat, ib_write_lat, ib_read_lat busy-polling,
 #             plus ib_send_lat with events; CPU per side from bash's `times` (user + system of the child)
 #   rsocket   tools/link-bench --rsocket (librdmacm's rsocket API, never librspreload, which falls back to a kernel
-#             socket) at --ib-addr through rdma_cm, default buffers and --buf 1 MiB; with and without peerlink's HMAC
-#             tag per frame
-#   tcp       link-bench over TCP at --tcp-addr, which must be an Ethernet address
+#             socket) at --ib-addr through rdma_cm, default buffers and --buf 1 MiB (on both sides); with and without
+#             peerlink's HMAC tag per frame; and --batch 64 (64 frames per write, as peerlink's write buffer sends them)
+#   tcp       link-bench over TCP at --tcp-addr, which must be an Ethernet address; one write per frame and --batch 64
 # There is no TCP suite at --ib-addr: no TCP is ever sent over IPoIB (the owner's rule for the test servers, 2026-11-24);
 # on InfiniBand the IPoIB address serves only rdma_cm's address resolution.
 #   loop      link-bench over TCP on the server's 127.0.0.1: the CPU of the stack and of the tag without a NIC
@@ -56,11 +56,11 @@ $SSH "$srv" "uname -r; lscpu | grep 'Model name'; cat /sys/class/net/*/mode 2>/d
 
 # ---- link-bench server on $srv: prints "PORT PID"; stopped by its pid only
 lb_pid=
-lb_start() { # $1 bind address, $2 preload (0/1); sets lb_port
+lb_start() { # $1 bind address, $2 preload (0/1), $3 extra serve flags (--buf N); sets lb_port
     local pre=
     [ "$2" = 1 ] && pre=--rsocket
     local r
-    r=$($SSH "$srv" "cd $W && rm -f pf && (setsid ./link-bench serve $pre --bind $1 --port-file pf \
+    r=$($SSH "$srv" "cd $W && rm -f pf && (setsid ./link-bench serve $pre --bind $1 --port-file pf ${3:-} \
         >serve.log 2>&1 </dev/null &) ; for i in \$(seq 100); do [ -s pf ] && break; sleep 0.1; done; cat pf")
     lb_port=${r%% *} lb_pid=${r##* }
     [ -n "$lb_port" ] && [ "$lb_port" != "$r" ] || { log "link-bench serve did not start on $1"; lb_pid=; return 1; }
@@ -71,12 +71,29 @@ lb_stop() {
 }
 trap 'lb_stop' EXIT
 
+lb_one() { # $1 mode, $2 size; uses lb_suite's locals. A failed run is a line of its own (failed=1, its exit code and
+    # its stderr kept beside raw.txt), never a silently smaller n; a run whose server counted errors fails too
+    local o rc
+    o=$($SSH "$ch" "cd $W && timeout $((secs + 30)) ./link-bench run $cpre --host $addr --port $lb_port \
+        --mode $1 --size $2 --secs $secs $t $extra --label $label" 2>"$out/lb.err")
+    rc=$?
+    if [ $rc = 0 ] && [ -n "$o" ]; then
+        echo "$o rep=$rep" >>"$raw"
+    else
+        echo "label=$label mode=$1 size=$2 tag=$tag rep=$rep failed=1 rc=$rc $(echo "$o" | grep -o 'srv_errors=[0-9]*')" >>"$raw"
+        cp "$out/lb.err" "$out/failed-$label-$1-$2-$tag-$rep.err"
+    fi
+}
+
 lb_suite() { # $1 label, $2 server bind address, $3 address the client dials, $4 preload, $5 client host, $6.. extra
     local label=$1 bind=$2 addr=$3 pre=$4 ch=$5
     shift 5
-    local extra="$*" cpre=
+    local extra="$*" cpre= sbuf=
     [ "$pre" = 1 ] && cpre=--rsocket
-    lb_start "$bind" "$pre" || { echo "label=$label not_measured=serve_failed" >>"$raw"; return; }
+    # --buf sizes the buffers before listen and connect, so the server needs it too (an accepted socket takes them
+    # from the listening one); --batch is the client's alone
+    [[ " $extra " =~ \ --buf\ ([0-9]+)\  ]] && sbuf="--buf ${BASH_REMATCH[1]}"
+    lb_start "$bind" "$pre" "$sbuf" || { echo "label=$label not_measured=serve_failed" >>"$raw"; return; }
     if ! $SSH "$ch" "cd $W && timeout 20 ./link-bench run $cpre --host $addr --port $lb_port --mode lat --size 64 \
         --secs 0.2 $extra" >/dev/null 2>&1; then
         log "$label: cannot connect to $addr (a firewall?): not measured"
@@ -89,14 +106,8 @@ lb_suite() { # $1 label, $2 server bind address, $3 address the client dials, $4
         for tag in 0 1; do
             local t=
             [ $tag = 1 ] && t=--tag
-            for sz in $bw_sizes; do
-                $SSH "$ch" "cd $W && timeout $((secs + 30)) ./link-bench run $cpre --host $addr --port $lb_port \
-                    --mode bw --size $sz --secs $secs $t $extra --label $label" | sed "s/\$/ rep=$rep/" >>"$raw"
-            done
-            for sz in $lat_sizes; do
-                $SSH "$ch" "cd $W && timeout $((secs + 30)) ./link-bench run $cpre --host $addr --port $lb_port \
-                    --mode lat --size $sz --secs $secs $t $extra --label $label" | sed "s/\$/ rep=$rep/" >>"$raw"
-            done
+            for sz in $bw_sizes; do lb_one bw "$sz"; done
+            for sz in $lat_sizes; do lb_one lat "$sz"; done
         done
         log "$label rep $rep done"
     done
@@ -159,10 +170,14 @@ fi
 want rsocket && lb_suite rsocket "$ibaddr" "$ibaddr" 1 "$cli"
 want rsocket && lb_suite rsocket-buf1m "$ibaddr" "$ibaddr" 1 "$cli" --buf 1048576
 [ -n "$tcpaddr" ] && want tcp && lb_suite eth-tcp "$tcpaddr" "$tcpaddr" 0 "$cli"
+# frames appended to one write as peerlink's write buffer does (the rows above are a syscall per frame)
+[ -n "$tcpaddr" ] && want tcp && lb_suite eth-tcp-batch "$tcpaddr" "$tcpaddr" 0 "$cli" --batch 64
+want rsocket && lb_suite rsocket-batch "$ibaddr" "$ibaddr" 1 "$cli" --batch 64
 want loop && lb_suite loop-tcp 127.0.0.1 127.0.0.1 0 "$srv"
 
 # ---- summary: mean, sd and the lowest-highest run per (label, test or mode, tag, size)
 awk '
+/failed=1/ { nfail++ }
 /not_measured|failed=1/ { print "# " $0; next }
 {
     delete kv
@@ -170,7 +185,7 @@ awk '
     key = sprintf("%-16s %-10s tag=%s size=%-8s", kv["label"], kv["test"] != "" ? kv["test"] : kv["mode"],
                   kv["tag"] != "" ? kv["tag"] : "-", kv["size"])
     keys[key] = 1
-    for (f in kv) if (f ~ /gbit|_us|cpu_s_per_gb|mpps/) {
+    for (f in kv) if (f ~ /gbit|_us|cpu_s_per_gb|mpps|srv_errors/) {
         v = kv[f] + 0; k2 = key SUBSEP f; n[k2]++; s[k2] += v; q[k2] += v * v
         if (!(k2 in lo) || v < lo[k2]) lo[k2] = v
         if (!(k2 in hi) || v > hi[k2]) hi[k2] = v
@@ -190,5 +205,6 @@ END {
         }
         print line
     }
+    if (nfail) printf "# %d failed runs (lines above starting with # ... failed=1; their stderr in failed-*)\n", nfail
 }' "$raw" >"$out/summary.txt"
 log "done: $out/summary.txt"

@@ -5,8 +5,10 @@
  * sequence number, the type and the payload, as server/peerlink.c's frame_tag) over a stream socket, so one binary
  * measures TCP and rsocket:
  *
- *   link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE]   one connection at a time, until killed
- *   link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES] [--label L]
+ *   link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE] [--buf BYTES] [--parent PID]
+ *                                                    one connection at a time, until killed (or PID is gone)
+ *   link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES]
+ *                  [--batch N] [--label L]
  *
  * --rsocket calls librdmacm's rsocket API (rsocket, rconnect, rread...), loaded with dlopen so that the binary builds
  * without librdmacm's headers and runs without the library when the flag is absent. It is not librspreload on
@@ -18,6 +20,12 @@
  * way, the round trip timed per frame. Both sides count their own CPU (getrusage, user + system, the whole process:
  * librspreload's threads included) and the client prints one line of key=value: Gbit/s of payload, frames/s, the CPU
  * seconds per GB of payload on each side, and in lat mode the round trip's mean, p50 and p99 in microseconds.
+ * --buf sizes the socket buffers before listen or connect (an accepted socket, TCP's or rsocket's, takes them from the
+ * listening one: set after accept they come too late), so it must be given to both sides. --batch N (bw) writes N
+ * frames per write() as peerlink does (frames appended to its write buffer); without it every frame is one write with
+ * TCP_NODELAY, a syscall per frame, which is what the small-frame rows of docs/design-rdma.md 3.3 measured.
+ * The server counts a frame whose tag does not verify (srv_errors) and goes on with the next one: the framing is intact.
+ * --bad-tag-at K (a test hook, tests/test_link_bench.sh) makes the client send frame K with a wrong tag.
  * The server binds port 0 and writes "PORT PID" to --port-file (tmp, rename) once it listens: no port is picked here.
  * No address is built in: hosts are arguments (tools/rdma-bench.sh drives it on a pair of servers).
  */
@@ -35,6 +43,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <signal.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -175,17 +187,29 @@ static void frame_tag(const struct hk *k, uint64_t seq, uint8_t type, const void
     tsdb_sha256_final(&x, out);
 }
 
-/* one frame: [u32 len = 1 + n + tag][u8 type][payload n][tag]; buf holds 5 + n + TAG */
-static int send_frame(int fd, uint8_t *buf, size_t n, int tag, const struct hk *k, uint64_t *seq)
+static uint64_t bad_tag_at = UINT64_MAX; /* --bad-tag-at: the sequence number whose tag is sent wrong */
+
+/* seals one frame in place: [u32 len = 1 + n + tag][u8 type][payload n][tag]; f holds 5 + n + TAG; returns its length */
+static size_t frame_seal(uint8_t *f, size_t n, int tag, const struct hk *k, uint64_t *seq)
 {
-    put32(buf, (uint32_t)(1 + n + (tag ? TAG : 0)));
-    buf[4] = 1;
-    if (tag)
-        frame_tag(k, (*seq)++, 1, buf + 5, n, buf + 5 + n);
-    return full_write(fd, buf, 5 + n + (tag ? TAG : 0));
+    put32(f, (uint32_t)(1 + n + (tag ? TAG : 0)));
+    f[4] = 1;
+    if (tag) {
+        frame_tag(k, *seq, 1, f + 5, n, f + 5 + n);
+        if (*seq == bad_tag_at)
+            f[5 + n] ^= 1;
+        (*seq)++;
+    }
+    return 5 + n + (tag ? TAG : 0);
 }
 
-/* reads one frame into buf; returns the payload length, -2 for the end frame (len 0), -1 on error or a bad tag */
+static int send_frame(int fd, uint8_t *buf, size_t n, int tag, const struct hk *k, uint64_t *seq)
+{
+    return full_write(fd, buf, frame_seal(buf, n, tag, k, seq));
+}
+
+/* reads one frame into buf; returns the payload length, -2 for the end frame (len 0), -3 for a whole frame whose tag
+ * is wrong (the stream stays in step), -1 on an error */
 static long recv_frame(int fd, uint8_t *buf, size_t cap, int tag, const struct hk *k, uint64_t *seq)
 {
     if (full_read(fd, buf, 4))
@@ -200,7 +224,7 @@ static long recv_frame(int fd, uint8_t *buf, size_t cap, int tag, const struct h
         uint8_t t[32];
         frame_tag(k, (*seq)++, buf[4], buf + 5, n, t);
         if (memcmp(t, buf + 5 + n, TAG))
-            return -1;
+            return -3;
     }
     return (long)n;
 }
@@ -239,9 +263,13 @@ static void serve_one(int fd)
         long n = recv_frame(fd, buf, cap, (int)h.tag, &k, &rseq);
         if (n == -2)
             break;
-        if (n < 0) {
+        if (n == -1) {
             r.errors++;
             break;
+        }
+        if (n == -3) {
+            r.errors++;
+            n = 0; /* echoed empty in lat: the client's check of the echo's length fails */
         }
         r.frames++;
         r.bytes += (uint64_t)n;
@@ -255,8 +283,17 @@ static void serve_one(int fd)
     free(buf);
 }
 
-static int serve(const char *bind_addr, const char *port_file, int buf)
+static int serve(const char *bind_addr, const char *port_file, int buf, long parent)
 {
+#ifdef __linux__
+    /* a test that dies must not leave its server behind: stop with the parent, and refuse to start under another */
+    if (parent > 0 && (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != (pid_t)parent)) {
+        fprintf(stderr, "link-bench: parent %ld is gone\n", parent);
+        return 1;
+    }
+#else
+    (void)parent;
+#endif
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE}, *ai;
     if (getaddrinfo(bind_addr, "0", &hints, &ai)) {
         fprintf(stderr, "link-bench: cannot resolve %s\n", bind_addr ? bind_addr : "(any)");
@@ -264,6 +301,7 @@ static int serve(const char *bind_addr, const char *port_file, int buf)
     }
     int ls = io.socket(ai->ai_family, SOCK_STREAM, 0), one = 1;
     io.setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    set_opts(ls, buf); /* before listen: the accepted socket takes its buffers from here */
     if (ls < 0 || io.bind(ls, ai->ai_addr, ai->ai_addrlen) || io.listen(ls, 4)) {
         perror("link-bench: listen");
         return 1;
@@ -293,7 +331,7 @@ static int serve(const char *bind_addr, const char *port_file, int buf)
             perror("link-bench: accept");
             return 1;
         }
-        set_opts(fd, buf);
+        set_opts(fd, 0);
         serve_one(fd);
         io.close(fd);
     }
@@ -305,7 +343,7 @@ static int cmp_d(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-static int run(const char *host, const char *port, int mode, size_t size, double secs, int tag, int buf,
+static int run(const char *host, const char *port, int mode, size_t size, double secs, int tag, int buf, int batch,
                const char *label)
 {
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, *ai;
@@ -332,11 +370,30 @@ static int run(const char *host, const char *port, int mode, size_t size, double
         return 1;
     for (size_t i = 0; i < cap; i++)
         b[i] = (uint8_t)(i * 131 + (i >> 9)); /* not all zero: a transport that compresses would cheat */
+    size_t stride = 5 + size + (tag ? TAG : 0);
+    uint8_t *bb = NULL; /* --batch: batch frames back to back, one write */
+    if (!mode && batch > 1) {
+        if (!(bb = malloc(stride * (size_t)batch)))
+            return 1;
+        for (int j = 0; j < batch; j++)
+            memcpy(bb + stride * (size_t)j, b, stride);
+    }
     struct hk k;
     hk_init(&k);
     uint64_t wseq = 0, rseq = 0, frames = 0, nlat = 0, c0 = cpu_us();
     double t0 = now_s(), t = t0, sum = 0;
     while (t - t0 < secs) {
+        if (bb) {
+            for (int j = 0; j < batch; j++)
+                frame_seal(bb + stride * (size_t)j, size, tag, &k, &wseq);
+            if (full_write(fd, bb, stride * (size_t)batch)) {
+                fprintf(stderr, "link-bench: write failed\n");
+                return 1;
+            }
+            frames += (uint64_t)batch;
+            t = now_s();
+            continue;
+        }
         for (int i = 0; i < (mode ? 1 : 16); i++) {
             double s = mode ? now_s() : 0;
             if (send_frame(fd, b, size, tag, &k, &wseq)) {
@@ -366,28 +423,30 @@ static int run(const char *host, const char *port, int mode, size_t size, double
     double el = now_s() - t0; /* bw: until the server read the last frame */
     uint64_t c1 = cpu_us() - c0;
     double gb = (double)frames * (double)size / 1e9;
-    printf("link-bench label=%s mode=%s size=%zu tag=%d secs=%.2f frames=%" PRIu64 " gbit=%.3f fps=%.0f"
+    printf("link-bench label=%s mode=%s size=%zu tag=%d batch=%d secs=%.4f frames=%" PRIu64 " gbit=%.3f fps=%.0f"
            " cli_cpu_s_per_gb=%.3f srv_cpu_s_per_gb=%.3f cli_cpu_pct=%.1f srv_cpu_pct=%.1f srv_errors=%" PRIu64,
-           label, mode ? "lat" : "bw", size, tag, el, frames, gb * 8 / el, (double)frames / el,
+           label, mode ? "lat" : "bw", size, tag, bb ? batch : 1, el, frames, gb * 8 / el, (double)frames / el,
            gb > 0 ? (double)c1 / 1e6 / gb : 0, gb > 0 ? (double)r.cpu_us / 1e6 / gb : 0, (double)c1 / 1e4 / el,
            (double)r.cpu_us / 1e4 / el, r.errors);
     if (mode && nlat) {
         qsort(lat, nlat, sizeof *lat, cmp_d);
-        printf(" rtt_mean_us=%.2f rtt_p50_us=%.2f rtt_p99_us=%.2f", sum / (double)frames, lat[nlat / 2],
+        printf(" rtt_sum_s=%.4f rtt_mean_us=%.2f rtt_p50_us=%.2f rtt_p99_us=%.2f", sum / 1e6, sum / (double)frames,
+               lat[nlat / 2],
                lat[(size_t)((double)nlat * 0.99)]);
     }
     printf("\n");
     io.close(fd);
     free(b);
+    free(bb);
     free(lat);
     return r.errors || r.frames != frames ? 1 : 0;
 }
 
 static void usage(void)
 {
-    fputs("usage: link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE] [--buf BYTES]\n"
+    fputs("usage: link-bench serve [--rsocket] [--bind ADDR] [--port-file FILE] [--buf BYTES] [--parent PID]\n"
           "       link-bench run [--rsocket] --host ADDR --port P --mode bw|lat --size N [--secs S] [--tag] [--buf BYTES]"
-          " [--label L]\n",
+          " [--batch N] [--label L]\n",
           stderr);
     exit(2);
 }
@@ -397,7 +456,8 @@ int main(int argc, char **argv)
     if (argc < 2)
         usage();
     const char *bind_addr = NULL, *port_file = NULL, *host = NULL, *port = NULL, *label = "-";
-    int mode = 0, tag = 0, buf = 0;
+    int mode = 0, tag = 0, buf = 0, batch = 1;
+    long parent = 0;
     size_t size = 1024;
     double secs = 3;
     for (int i = 2; i < argc; i++) {
@@ -431,6 +491,12 @@ int main(int argc, char **argv)
             buf = atoi(v);
         else if (!strcmp(a, "--label"))
             label = v;
+        else if (!strcmp(a, "--batch"))
+            batch = atoi(v);
+        else if (!strcmp(a, "--parent"))
+            parent = atol(v);
+        else if (!strcmp(a, "--bad-tag-at"))
+            bad_tag_at = strtoull(v, NULL, 0);
         else
             usage();
     }
@@ -438,9 +504,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "link-bench: --size must be 1 .. %u\n", SIZE_MAX_);
         return 2;
     }
+    if (batch < 1 || batch > 4096) {
+        fprintf(stderr, "link-bench: --batch must be 1 .. 4096\n");
+        return 2;
+    }
+    signal(SIGPIPE, SIG_IGN); /* a peer that went away is a failed write, not a dead process */
     if (!strcmp(argv[1], "serve"))
-        return serve(bind_addr, port_file, buf);
+        return serve(bind_addr, port_file, buf, parent);
     if (!strcmp(argv[1], "run") && host && port)
-        return run(host, port, mode, size, secs, tag, buf, label);
+        return run(host, port, mode, size, secs, tag, buf, batch, label);
     usage();
 }
