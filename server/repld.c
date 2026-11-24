@@ -2083,7 +2083,7 @@ static int links_up(const struct cluster_vol_rec *r)
         snprintf(G.nodes[i].addr, sizeof G.nodes[i].addr, "%s", r->rep[k].peer);
         G.nodes[i].log = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_LOG);
         G.nodes[i].bulk = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_BULK);
-        if (G.snap_dial) /* nothing dials kind 5 until r4-xferlink: the test reaches the acceptor and rsnap_frame */
+        if (G.snap_dial) /* kind 5 is dialed when a snapshot needs it (rsnap.c); the test dials it at once */
             G.nodes[i].snap = peerlink_dial(G.pl, r->rep[k].node, r->rep[k].peer, PL_KIND_SNAP);
         G.nn++;
     }

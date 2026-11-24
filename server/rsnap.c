@@ -57,6 +57,7 @@
 #include "../src/cvol.h"
 #include "../src/snapshot.h"
 #include "peerlink.h"
+#include "repld.h"
 #include "rsnap.h"
 
 /* frame types on kind 5 (below PL_USER_TYPE_MAX) */
@@ -139,7 +140,7 @@ static struct {
     uint32_t nvs;
     struct rsnap_stats st;
     /* test hooks (TSDB_REPLD_TEST) */
-    int hold, promoting_hook;
+    int hold, promoting_hook, flip, flipped;
     uint64_t free_hook;
 } S = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
@@ -152,6 +153,7 @@ static void hooks_read(void)
         return;
     S.hold = strstr(te, "snaphold") != NULL;
     S.promoting_hook = strstr(te, "snappromoting") != NULL;
+    S.flip = strstr(te, "snapflip") != NULL;
     const char *f = strstr(te, "snapfree=");
     if (f)
         S.free_hook = strtoull(f + 9, NULL, 10);
@@ -381,8 +383,8 @@ void rsnap_need(struct rvol *rv, int src)
     task_add(W_PREP, j);
     pthread_mutex_unlock(&S.mu);
     if (!rv->snap_said)
-        say("volume %" PRIu32 ": the leader (node %" PRIu32 ") no longer has the records this replica needs: asks it"
-            " for a snapshot", rv->number, node);
+        say("volume %" PRIu32 ": the leader (node %" PRIu32 ") no longer has the records this replica needs: it needs"
+            " a snapshot and asks the leader for one", rv->number, node);
     rv->snap_said = 1;
 }
 
@@ -748,6 +750,11 @@ void rsnap_frame(struct plink *l, uint8_t type, const uint8_t *p, size_t n)
         src_req(l, p, n);
         return;
     }
+    if (type < RS_T_REQ || type > RS_T_ABORT) { /* nothing sends one but the snapdial hook (scen_volcmd) */
+        say("a snapshot link (kind 5) sent a frame of unknown type %u from node %" PRIu32 "; dropped", (unsigned)type,
+            plink_peer(l));
+        return;
+    }
     if (n < RS_FRAME_LEN)
         return;
     uint32_t vol = get32(p), from = plink_peer(l);
@@ -871,6 +878,29 @@ static void w_prep(struct rjob *j)
     pthread_mutex_unlock(&S.mu);
 }
 
+/* TSDB_REPLD_TEST=snapflip: the first snapshot this source makes has one byte of a copied dictionary flipped after
+ * SNAPMAN recorded its hash (rot on the source between make and send; a copy, never a link of a live file) */
+static void flip_one(const char *dir, const struct snap_man *m)
+{
+    for (size_t i = 0; i < m->nfiles; i++) {
+        const struct snap_file *f = &m->files[i];
+        if (f->kind != SNAP_DICT || f->link || !f->size)
+            continue;
+        char path[PATH_MAX + 32 + 130];
+        snprintf(path, sizeof path, "%s/%s", dir, f->name);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        uint8_t b;
+        if (fd >= 0 && pread(fd, &b, 1, (off_t)(f->size / 2)) == 1) {
+            b ^= 1;
+            if (pwrite(fd, &b, 1, (off_t)(f->size / 2)) == 1)
+                say("TEST: a byte of %s flipped after the make (snapflip)", path);
+        }
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+}
+
 static void w_make(struct rjob *j)
 {
     struct snap_info info;
@@ -893,6 +923,8 @@ static void w_make(struct rjob *j)
     memset(&m, 0, sizeof m);
     if (rc == 0 && (rc = snap_man_read(info.path, &m)) != 0)
         snap_release(info.path);
+    if (rc == 0 && S.flip && !__atomic_exchange_n(&S.flipped, 1, __ATOMIC_RELAXED))
+        flip_one(info.path, &m);
     pthread_mutex_lock(&S.mu);
     if (rc != 0) {
         say("volume %" PRIu32 ": a snapshot for node %" PRIu32 " could not be made: %s", j->vol, j->peer,

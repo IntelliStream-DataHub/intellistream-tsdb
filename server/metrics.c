@@ -481,6 +481,25 @@ static void render(sb *b)
                    (unsigned)fp[i].peer, fp[i].p50_us / 1e6, (unsigned)fp[i].peer, fp[i].p99_us / 1e6);
     }
 
+    if (cfg.snap) { /* snapshot transfers (R4, server/rsnap.c) */
+        metrics_snap sn;
+        cfg.snap(&sn);
+        family(b, "tsdb_snapshot_total", "counter",
+               "Snapshot transfers of replicated volumes by outcome: asked (as a receiver), sent, received, refused_space "
+               "(the receiver's free space), failed (abandoned or released before the end), busy (BUSY answers).");
+        sb_add(b, "tsdb_snapshot_total{event=\"asked\"} %llu\ntsdb_snapshot_total{event=\"sent\"} %llu\n"
+                  "tsdb_snapshot_total{event=\"received\"} %llu\ntsdb_snapshot_total{event=\"refused_space\"} %llu\n"
+                  "tsdb_snapshot_total{event=\"failed\"} %llu\ntsdb_snapshot_total{event=\"busy\"} %llu\n",
+               (unsigned long long)sn.asked, (unsigned long long)sn.sent, (unsigned long long)sn.received,
+               (unsigned long long)sn.refused_space, (unsigned long long)sn.failed, (unsigned long long)sn.busy);
+        family(b, "tsdb_snapshot_bytes_total", "counter", "Bytes of snapshot files this server sent and received.");
+        sb_add(b, "tsdb_snapshot_bytes_total{dir=\"sent\"} %llu\ntsdb_snapshot_bytes_total{dir=\"received\"} %llu\n",
+               (unsigned long long)sn.bytes_sent, (unsigned long long)sn.bytes_received);
+        family(b, "tsdb_snapshot_last_seconds", "gauge",
+               "The last snapshot this server received: seconds from its request to its last file.");
+        sb_add(b, "tsdb_snapshot_last_seconds %.3f\n", sn.last_seconds);
+    }
+
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");
     for (unsigned o = 1; o < NOPS; o++) {

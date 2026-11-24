@@ -37,6 +37,7 @@
 #include "peerlink.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
+#include "snapshot.h"
 #include "tsdb_client.h"
 #include "users.h"
 
@@ -611,6 +612,7 @@ static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to thi
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
+static uint32_t init_rebuild_mb_s, init_rebuild_max; /* nonzero: INIT's rebuild_mb_s, rebuild_max */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
@@ -623,6 +625,10 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.repl_retain_s = init_retain_s;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
+    if (init_rebuild_mb_s)
+        s.rebuild_mb_s = init_rebuild_mb_s;
+    if (init_rebuild_max)
+        s.rebuild_max = init_rebuild_max;
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -7211,6 +7217,433 @@ static void scen_keepcap(void)
            " stays out of the ISR\n", nw);
 }
 
+/* ---- snapshot transfer (r4-xferlink; server/rsnap.c, R4 plan D2, D5, D7, D18) */
+
+struct snapset {
+    int L, R, O; /* the leader of plant, the replica that needs a snapshot, the other member */
+    int lead[2];  /* the leader of each volume */
+    int nvol;
+    tsdbc *c[2];
+    tsdb_sid id[2];
+    int64_t t;
+};
+
+/* the snap.* lines of server i's STATUS (server/rsnap.c's counters) */
+struct rsnap_stats {
+    uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received;
+};
+static void status_snap(int i, struct rsnap_stats *st)
+{
+    tsdbc *c = client(i);
+    char *text = NULL;
+    int rc = tsdbc_status(c, &text);
+    if (rc != 0)
+        die("STATUS of server %d: %s", i, ers(rc));
+    static const char *keys[] = {"asked", "sent", "received", "refused_space", "failed", "busy", "bytes_sent",
+                                 "bytes_received"};
+    uint64_t *v[] = {&st->asked, &st->sent, &st->received, &st->refused_space, &st->failed, &st->busy,
+                     &st->bytes_sent, &st->bytes_received};
+    for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+        char key[64];
+        snprintf(key, sizeof key, "\nsnap.%s=", keys[k]);
+        const char *at = strstr(text, key);
+        if (!at)
+            die("STATUS of server %d has no snap.%s line:\n%s", i, keys[k], text);
+        *v[k] = strtoull(at + strlen(key), NULL, 10);
+    }
+    free(text);
+    tsdbc_close(c);
+}
+
+static const char *snap_vols[2] = {"plant", "plant2"};
+
+/* n rows of random values (about 3.6 bytes each in a part) from ts *t on */
+static void snap_rows(tsdbc *c, tsdb_sid id, int64_t *t, size_t n)
+{
+    size_t step = n < 1000000 ? n : 1000000;
+    int64_t *tv = malloc(step * sizeof *tv);
+    float *vv = malloc(step * sizeof *vv);
+    if (!tv || !vv)
+        die("out of memory");
+    static uint64_t x = 88172645463325252ull;
+    for (size_t done = 0; done < n;) {
+        size_t k = n - done < step ? n - done : step;
+        for (size_t j = 0; j < k; j++) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            tv[j] = (*t)++;
+            vv[j] = (float)(x >> 40) / 1024.0f;
+        }
+        int rc = tsdbc_insert_series(c, id, tv, vv, k);
+        if (rc != 0)
+            die("a write of %zu rows: %s", k, ers(rc));
+        done += k;
+    }
+    free(tv);
+    free(vv);
+}
+
+/* keepcap's way to a replica that needs a snapshot: nvol volumes of three replicas, `big` rows of random values in
+ * each with every replica up, then R (a member that leads none of them) killed and seven flushed segments written a
+ * second apart, past repl_retain_s (2 s). R is not started again: the caller sets penv[R] first. */
+static void snap_setup(int nvol, size_t big, struct snapset *s)
+{
+    memset(s, 0, sizeof *s);
+    s->nvol = nvol;
+    init_retain_s = 2;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    int rc;
+    for (int k = 0; k < nvol; k++) {
+        uint32_t num;
+        if ((rc = vol_add(0, snap_vols[k], 3, &num)) != 0 || num != (uint32_t)k + 1)
+            die("volume add %s: %s, number %" PRIu32, snap_vols[k], cluster_strerror(rc), num);
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, snap_vols[k], i, 1, 0);
+        struct meta_volume v;
+        if (!vol_rec(0, snap_vols[k], &v))
+            die("no record of %s", snap_vols[k]);
+        s->lead[k] = server_of(v.leader);
+        if (s->lead[k] < 0 || s->lead[k] > 2)
+            die("the leader of %s is node %u", snap_vols[k], v.leader);
+    }
+    s->L = s->lead[0];
+    s->R = (s->L + 1) % 3;
+    if (nvol > 1 && s->R == s->lead[1])
+        s->R = (s->R + 1) % 3;
+    if (s->R == s->L || (nvol > 1 && s->R == s->lead[1]))
+        die("no member leads none of the volumes");
+    s->O = 3 - s->L - s->R;
+    s->t = 1000;
+    for (int k = 0; k < nvol; k++) {
+        s->c[k] = client(s->lead[k]);
+        s->id[k] = rep_series(s->c[k], rep_names[0], snap_vols[k], 30000);
+        int64_t t = s->t;
+        snap_rows(s->c[k], s->id[k], &t, big ? big : 1);
+        await_isr(0, snap_vols[k], 3, 5000, "every replica up");
+    }
+    s->t += (int64_t)(big ? big : 1);
+    stop(s->R, SIGKILL);
+    for (int k = 0; k < nvol; k++)
+        await_isr(0, snap_vols[k], 2, 10000, "a replica killed");
+    struct timespec s1 = {1, 0};
+    for (int r = 0; r < 7; r++) {
+        for (int k = 0; k < nvol; k++) {
+            int64_t t = s->t;
+            snap_rows(s->c[k], s->id[k], &t, 100);
+            if ((rc = tsdbc_flush(s->c[k])) != 0)
+                die("flush: %s", ers(rc));
+        }
+        s->t += 100;
+        nanosleep(&s1, NULL);
+    }
+    for (int k = 0; k < nvol; k++) { /* a commit after the last flush: the log start moves */
+        int64_t t = s->t;
+        snap_rows(s->c[k], s->id[k], &t, 1);
+    }
+    s->t++;
+}
+
+static void snap_close(struct snapset *s)
+{
+    for (int k = 0; k < s->nvol; k++)
+        if (s->c[k])
+            tsdbc_close(s->c[k]);
+    s->c[0] = s->c[1] = NULL;
+}
+
+static void await_log(int i, const char *needle, int ms, const char *what)
+{
+    uint64_t t0 = now_ms();
+    while (!log_has(i, needle)) {
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s (server %d never logged \"%s\" in %d ms)", what, i, needle, ms);
+        usleep(50000);
+    }
+}
+
+/* the last line of server i's log with `needle`, into out ("" when none) */
+static void log_line(int i, const char *needle, char *out, size_t n)
+{
+    char path[PATH_MAX + 80], line[4096];
+    snprintf(path, sizeof path, "%s/n%d.log", base, i);
+    FILE *f = fopen(path, "r");
+    out[0] = 0;
+    while (f && fgets(line, sizeof line, f))
+        if (strstr(line, needle))
+            snprintf(out, n, "%s", line);
+    if (f)
+        fclose(f);
+}
+
+/* entries of server i's directory `sub` whose names begin with `prefix` (-1: no such directory) */
+static int dir_count(int i, const char *sub, const char *prefix)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 200];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/%s", d, sub);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return errno == ENOENT ? -1 : (die("opendir %s: %s", p, strerror(errno)), -1);
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));)
+        n += strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && !strncmp(e->d_name, prefix, strlen(prefix));
+    closedir(dd);
+    return n;
+}
+
+/* the copy server i received (TSDB_REPLD_TEST=snaphold keeps it as v<num>.snapheld) holds exactly the files its
+ * SNAPMAN names, each of the size and xxh64 SNAPMAN records; returns their bytes (links counted once) */
+static uint64_t snap_verify_held(int i, uint32_t num, size_t *nfiles)
+{
+    char d[PATH_MAX + 80], held[PATH_MAX + 120], f[PATH_MAX + 300];
+    server_dir(i, d, sizeof d);
+    snprintf(held, sizeof held, "%s/v%" PRIu32 ".snapheld", d, num);
+    struct snap_man m;
+    memset(&m, 0, sizeof m);
+    int rc = snap_man_read(held, &m);
+    if (rc != 0)
+        die("the snapshot server %d received (%s): its SNAPMAN does not read: %s", i, held, ers(rc));
+    uint64_t bytes = 0;
+    for (size_t k = 0; k < m.nfiles; k++) {
+        snprintf(f, sizeof f, "%s/%s", held, m.files[k].name);
+        int fd = open(f, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            die("the received snapshot lacks %s, which its SNAPMAN names: %s", m.files[k].name, strerror(errno));
+        uint64_t size = 0, x = 0;
+        if (snap_xxh64_fd(fd, &size, &x) != 0)
+            die("read %s: %s", f, strerror(errno));
+        close(fd);
+        if (size != m.files[k].size || x != m.files[k].xxh64)
+            die("the received snapshot's %s has %" PRIu64 " bytes, xxh64 %016" PRIx64 "; its SNAPMAN says %" PRIu64
+                ", %016" PRIx64, m.files[k].name, size, x, m.files[k].size, m.files[k].xxh64);
+        if (!m.files[k].link)
+            bytes += size;
+    }
+    char sub[64];
+    snprintf(sub, sizeof sub, "v%" PRIu32 ".snapheld", num);
+    int n = dir_count(i, sub, "");
+    if (n != (int)m.nfiles + 1)
+        die("the received snapshot holds %d files besides SNAPMAN, which names %zu", n - 1, m.nfiles);
+    *nfiles = m.nfiles;
+    snap_man_free(&m);
+    return bytes;
+}
+
+/* the leader's snap_* directories gone (released) within ms */
+static void await_released(int L, uint32_t num, int ms)
+{
+    char sub[32];
+    snprintf(sub, sizeof sub, "v%" PRIu32, num);
+    uint64_t t0 = now_ms();
+    int n;
+    while ((n = dir_count(L, sub, SNAP_PREFIX)) > 0) {
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("the leader still holds %d snapshot directories %d ms after the receiver had them all", n, ms);
+        usleep(50000);
+    }
+}
+
+/* snapxfer: a replica back past the keep caps asks its leader for a snapshot, which the leader makes and sends; the
+ * first copy, with a byte flipped on the source after the make, is refused and asked again; the copy received matches
+ * its SNAPMAN file for file, and the leader releases its snapshot. */
+static void scen_snapxfer(void)
+{
+    scenario("snapxfer");
+    for (int i = 0; i < 3; i++) /* the first snapshot made has a byte flipped after SNAPMAN took its hash */
+        penv[i] = "TSDB_REPLD_TEST=snapflip";
+    struct snapset s;
+    snap_setup(1, 200000, &s);
+    char held[PATH_MAX + 64], needle[128];
+    penv[s.R] = "TSDB_REPLD_TEST=snaphold";
+    start(s.R);
+    await_log(s.R, "it needs a snapshot and asks the leader", 15000, "the replica back past the keep cap never asked");
+    await_log(s.R, "(snaphold)", 30000, "the replica never received the whole snapshot");
+    if (!log_has(s.L, "(snapflip)") || !log_has(s.R, "a file's xxh64 is not the one SNAPMAN names"))
+        die("the copy with a flipped byte was not refused (flipped on the leader: %d)", log_has(s.L, "(snapflip)"));
+    snprintf(needle, sizeof needle, "snapshot sent to node %" PRIu32 ":", ids[s.R]);
+    await_log(s.L, needle, 10000, "the leader never heard the receiver had every file");
+    size_t nf = 0;
+    uint64_t bytes = snap_verify_held(s.R, 1, &nf);
+    await_released(s.L, 1, 5000);
+    if (dir_count(s.R, "v1.snap", "") >= 0)
+        die("v1.snap is still on the receiver beside the kept copy");
+    if (!log_has(s.L, "snapshot made for node"))
+        die("the leader never said it made the snapshot");
+    struct rsnap_stats sl, sr;
+    status_snap(s.L, &sl);
+    status_snap(s.R, &sr);
+    if (sl.sent != 1 || sl.bytes_sent < bytes || sr.asked < 1 || sr.received != 1 || sr.bytes_received < bytes)
+        die("STATUS: the leader sent %" PRIu64 " (%" PRIu64 " bytes), the receiver asked %" PRIu64 " and received %"
+            PRIu64 " (%" PRIu64 " bytes); the copy has %" PRIu64 " bytes", sl.sent, sl.bytes_sent, sr.asked,
+            sr.received, sr.bytes_received, bytes);
+    snprintf(held, sizeof held, "snapshot received from node %" PRIu32 ":", ids[s.L]);
+    char line[4096];
+    log_line(s.R, held, line, sizeof line);
+    int64_t t = s.t++;
+    float val = 1;
+    int rc = tsdbc_insert_series(s.c[0], s.id[0], &t, &val, 1);
+    if (rc != 0)
+        die("a write after the snapshot: %s", ers(rc));
+    snap_close(&s);
+    stop_all();
+    printf("  the replica back past the keep cap asked for a snapshot and received %zu files, %" PRIu64 " bytes, each"
+           " as SNAPMAN records it; the leader released its copy\n  %s", nf, bytes, line);
+}
+
+/* snapnospace (D5): a snapshot larger than the receiver's free space (the hook reports 4 KiB) is refused once SNAPMAN
+ * is in, before any file: said once, counted, asked again at a later notice, no file of it written, and the live
+ * volumes go on. */
+static void scen_snapnospace(void)
+{
+    scenario("snapnospace");
+    struct snapset s;
+    snap_setup(1, 0, &s);
+    penv[s.R] = "TSDB_REPLD_TEST=snaphold,snapfree=4096";
+    start(s.R);
+    await_log(s.R, "is refused: the file system", 20000, "a snapshot larger than the free space was not refused");
+    char needle[128];
+    snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[s.R]);
+    await_log_count(s.L, needle, 2, 20000); /* asked again */
+    if (log_count(s.R, "is refused: the file system") != 1)
+        die("the refusal for space was said %d times (once per volume)", log_count(s.R, "is refused: the file system"));
+    if (log_has(s.R, "snapshot received from node") || dir_count(s.R, "v1.snapheld", "") >= 0)
+        die("a snapshot refused for its space was taken");
+    snprintf(needle, sizeof needle, "snapshot sent to node %" PRIu32 ":", ids[s.R]);
+    if (log_has(s.L, needle))
+        die("the leader sent the files of a snapshot the receiver refused");
+    int n = dir_count(s.R, "v1.snap", "");
+    if (n > 1)
+        die("the receiver that refused a snapshot for its space holds %d of its files", n);
+    struct rsnap_stats st;
+    status_snap(s.R, &st);
+    if (st.refused_space < 1 || st.received)
+        die("STATUS of the receiver: %" PRIu64 " refused for space, %" PRIu64 " received (want >= 1, 0)",
+            st.refused_space, st.received);
+    int64_t t = s.t++;
+    float val = 1;
+    int rc = tsdbc_insert_series(s.c[0], s.id[0], &t, &val, 1);
+    if (rc != 0)
+        die("a write while the receiver refuses snapshots: %s", ers(rc));
+    snap_close(&s);
+    stop_all();
+    printf("  a snapshot above the free space was refused once SNAPMAN was in (counted %" PRIu64 "), asked again,"
+           " no file written\n", st.refused_space);
+}
+
+/* snapbusy (D2): a leader that is promoting (the hook) answers BUSY and the receiver asks again once it is not; with
+ * rebuild_max 1 a second volume's snapshot waits for the first. */
+static void scen_snapbusy(void)
+{
+    scenario("snapbusy");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=snaphold,snappromoting";
+    init_rebuild_max = 1, init_rebuild_mb_s = 2;
+    struct snapset s;
+    snap_setup(2, 1000000, &s);
+    init_rebuild_max = 0, init_rebuild_mb_s = 0;
+    char hook[PATH_MAX + 80], d[PATH_MAX + 40];
+    server_dir(s.L, d, sizeof d);
+    snprintf(hook, sizeof hook, "%s/snappromoting", d);
+    int fd = open(hook, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        die("%s: %s", hook, strerror(errno));
+    close(fd);
+    start(s.R);
+    await_log(s.R, "is busy (promoting)", 20000, "a leader that is promoting did not answer BUSY");
+    char needle[128];
+    snprintf(needle, sizeof needle, "volume 1: snapshot made for node %" PRIu32 ":", ids[s.R]);
+    if (log_has(s.L, needle))
+        die("a leader that is promoting made a snapshot");
+    unlink(hook);
+    await_log_count(s.R, "snapshot received from node", 2, 90000);
+    if (!log_has(s.R, "needs a snapshot and waits"))
+        die("two snapshots ran at once on the receiver with rebuild_max 1");
+    size_t nf;
+    snap_verify_held(s.R, 1, &nf);
+    snap_verify_held(s.R, 2, &nf);
+    struct rsnap_stats st;
+    status_snap(s.R, &st);
+    if (st.busy < 1 || st.received != 2)
+        die("STATUS of the receiver: %" PRIu64 " busy, %" PRIu64 " received (want >= 1, 2)", st.busy, st.received);
+    snap_close(&s);
+    stop_all();
+    printf("  a promoting leader answered BUSY and was asked again; with rebuild_max 1 the second snapshot waited\n");
+}
+
+/* snapsrckill: the source killed in the middle of a transfer: the receiver drops its partial copy when the new
+ * leader's notice names another source, and asks the new leader, whose copy arrives whole. */
+static void scen_snapsrckill(void)
+{
+    scenario("snapsrckill");
+    init_rebuild_mb_s = 2;
+    struct snapset s;
+    snap_setup(1, 2000000, &s);
+    init_rebuild_mb_s = 0;
+    penv[s.R] = "TSDB_REPLD_TEST=snaphold";
+    start(s.R);
+    char needle[128];
+    snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[s.R]);
+    await_log(s.L, needle, 20000, "the leader never made the snapshot");
+    usleep(1500000);
+    if (log_has(s.R, "snapshot received from node"))
+        die("the snapshot arrived before the source could be killed (too small for this test)");
+    if (dir_count(s.R, "v1.snap", "") < 2)
+        die("the receiver holds no file of the snapshot 1.5 s into its transfer");
+    snap_close(&s);
+    stop(s.L, SIGKILL);
+    await_log(s.R, "is abandoned", 40000, "the receiver kept a transfer from a killed source");
+    snprintf(needle, sizeof needle, "snapshot received from node %" PRIu32 ":", ids[s.O]);
+    await_log(s.R, needle, 90000, "the new leader's snapshot never arrived");
+    size_t nf;
+    uint64_t bytes = snap_verify_held(s.R, 1, &nf);
+    stop_all();
+    printf("  the source killed mid-transfer: the partial copy was dropped and the new leader's (%zu files, %" PRIu64
+           " bytes) arrived whole\n", nf, bytes);
+}
+
+/* snaplarge (D7): a large insert while a snapshot moves at rebuild_mb_s 5 commits within a second (the snapshot's
+ * kind 5 does not hold the COMMITs' kind 2), and the transfer takes at least its size over the rate. */
+static void scen_snaplarge(void)
+{
+    scenario("snaplarge");
+    init_rebuild_mb_s = 5;
+    struct snapset s;
+    snap_setup(1, 6000000, &s);
+    init_rebuild_mb_s = 0;
+    penv[s.R] = "TSDB_REPLD_TEST=snaphold";
+    start(s.R);
+    char needle[128], line[4096];
+    snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[s.R]);
+    await_log(s.L, needle, 30000, "the leader never made the snapshot");
+    usleep(500000);
+    uint64_t t0 = now_ms();
+    snap_rows(s.c[0], s.id[0], &s.t, 2000000);
+    uint64_t took = now_ms() - t0;
+    if (log_has(s.R, "snapshot received from node"))
+        die("the snapshot was in before the large insert ended: the test proves nothing");
+    if (took >= 1000)
+        die("a large insert of 2000000 rows took %" PRIu64 " ms while a snapshot moved (kind 5 holds kind 2)", took);
+    await_log(s.R, "(snaphold)", 120000, "the snapshot never arrived");
+    size_t nf;
+    uint64_t bytes = snap_verify_held(s.R, 1, &nf);
+    log_line(s.R, "snapshot received from node", line, sizeof line);
+    const char *in = strstr(line, " bytes in ");
+    double secs = in ? strtod(in + 10, NULL) : 0;
+    double least = (double)bytes / (5 << 20);
+    if (secs < least * 0.9)
+        die("%" PRIu64 " bytes moved in %.1f s at rebuild_mb_s 5 (at least %.1f s)", bytes, secs, least);
+    snap_close(&s);
+    stop_all();
+    printf("  a large insert of 2000000 rows took %" PRIu64 " ms during a snapshot of %" PRIu64 " bytes, which took"
+           " %.1f s at 5 MB/s\n", took, bytes, secs);
+}
+
 /* keepfloor: below the caps the leader keeps every segment a replica away has not acked (design-cluster.md 8.3). The
  * replica is killed, the leader writes and flushes segments past it, and the replica back must catch up from them,
  * join the ISR again and never be told it needs a snapshot (r3d review: keep_ignores_peers survived every test). */
@@ -12036,7 +12469,7 @@ static void scen_volcmd(void)
         die("a VOLUME_TRANSFER to a follower: %s, not NOTLEADER", cluster_strerror(rc));
     free(reply);
     for (int i = 0; i < 2; i++)
-        await_log_count(i, "a snapshot link (kind 5) sent something", 1, 20000);
+        await_log_count(i, "a snapshot link (kind 5) sent a frame of unknown type", 1, 20000);
     printf("  each driver's kind-5 link reached the other's rsnap_frame\n");
     char path[PATH_MAX + 64];
     server_dir(0, path, sizeof path);
@@ -12104,7 +12537,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

@@ -38,16 +38,6 @@ void rsnap_quiesce(void);
  * (l, file)); always 0 otherwise */
 int rsnap_owns(struct plink *l, uint64_t file, const void *meta, size_t meta_len);
 
-/* snapshots of this server since its start (STATUS, metrics) */
-struct rsnap_stats {
-    uint64_t asked;          /* requests this server sent as a receiver */
-    uint64_t sent, received; /* whole snapshots */
-    uint64_t refused_space;  /* refused for the free space of the receiver (D5) */
-    uint64_t failed;         /* abandoned or released before the end, either side */
-    uint64_t busy;           /* BUSY answers, either side */
-    uint64_t bytes_sent, bytes_received;
-    uint64_t last_ms;        /* the last snapshot received: ms from its request to its last file */
-};
-void rsnap_get_stats(struct rsnap_stats *out);
+/* struct rsnap_stats and rsnap_get_stats are in repld.h (tsdbd's STATUS and metrics read them) */
 
 #endif

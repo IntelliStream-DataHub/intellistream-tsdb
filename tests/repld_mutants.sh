@@ -37,6 +37,9 @@
 # fenced again; the volume's first promotion is slow too, so it may never get a writer) promoteslow (knob promoteslow).
 # divergeisr (a volume whose DIVERGED file is set is not stopped: no LOCAL_FAULT, it stays in the ISR and may lead)
 # diverged (knob plantdiverge).
+# The snapshot transfer's (server/rsnap.c): snapnoverify (a received file not compared with SNAPMAN's xxh64; the
+# source sends one file with a flipped byte) snapxfer; snapsamelink (the files on kind 2, the COMMITs' link) snaplarge;
+# snapnospacecheck (no free-space check, D5) snapnospace; snapsrcpromoting (a source serves while promoting, D2) snapbusy.
 # Usage: tests/repld_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb build/libcrashfs.so).
 set -u
@@ -83,6 +86,10 @@ table=(
     "refusedsilent|refused|the refused volume was not reported"
     "demotestaleidx|deposetail|the deposed writer back in the ISR once the links are back: the ISR of rs has 2 members"
     "divergeisr|diverged|heartbeat never reported volume 1 LOCAL_FAULT"
+    "snapnoverify|snapxfer|the copy with a flipped byte was not refused"
+    "snapsamelink|snaplarge|a large insert of 2000000 rows took [0-9]+ ms while a snapshot moved"
+    "snapnospacecheck|snapnospace|a snapshot larger than the free space was not refused"
+    "snapsrcpromoting|snapbusy|a leader that is promoting did not answer BUSY"
     "inboxwaitall|inboxshared|the healthy volume vd has [0-9]+ ISR members while va's inbox on n[0-9]+ is full"
 )
 export CRASHFS_SO=${CRASHFS_SO:-build/libcrashfs.so} TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb} TSDB_TEST_ACK_MS=${TSDB_TEST_ACK_MS:-3}
