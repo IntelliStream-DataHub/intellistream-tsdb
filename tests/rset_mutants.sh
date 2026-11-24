@@ -16,9 +16,9 @@ table=(
     "setnoversion|setstale|no 1 lines with \"messages of another replica set version"
     "setdrvnoremap|removeindex|the driver carried an ack of [0-9]+ over for server"
     "removedopen|removereplica|still has v1 or v1.removed|no 1 lines with \"this server's replica was removed"
-    "staleopen|removedown|pass 1: server [0-9]+ has no v1.stale|the added replica filled and joined"
+    "staleopen|removedown|still has v1 or v1.removed-[*] 20 s after it started|pass 1: server [0-9]+ has no v1.stale"
     "makemissing|resetlost|made a v1 for a replica the group recorded as opened"
-    "resetinisr|resetlost|a reset of an ISR member: exit"
+    "resetinisr|resetlost|a reset of (the leader|an ISR member): exit"
     "resetsamerid|resetlost|the reset of server [0-9]+ did not apply"
 )
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}

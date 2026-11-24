@@ -12503,7 +12503,13 @@ static void scen_resetlost(void)
         die("%s", cmd);
     rows += set_write(c, id, &t, 2, 0);
     start(R);
-    await_log_count(R, "tsdb cluster replica reset", 1, 20000);
+    /* either the refusal's line or a v1 made, whichever comes first: a start that remakes it never logs the line */
+    uint64_t r0 = now_ms();
+    while (log_count(R, "tsdb cluster replica reset") < 1 && !dir_has(R, "v1"))
+        if (now_ms() - r0 > 20000)
+            die("server %d: no line naming `tsdb cluster replica reset` 20 s after it started", R);
+        else
+            usleep(50000);
     if (dir_has(R, "v1"))
         die("server %d made a v1 for a replica the group recorded as opened", R);
     for (int pass = 0; pass < 2; pass++) {
