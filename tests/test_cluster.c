@@ -12088,6 +12088,8 @@ struct tr_writer {
     size_t n, cap;
     struct tr_write *w;
     int acked, refused, indet;
+    uint64_t last_ack_t0; /* atomic: when the latest acknowledged write began (the scenario waits for one past a
+                           * transfer, so that each write's pause belongs to one transfer) */
 };
 
 /* one row a write, each outcome recorded after the client's own retries (UNAVAILABLE PROMOTING, MOVED: 10 s) */
@@ -12109,8 +12111,10 @@ static void *tr_write_thread(void *a)
         struct tr_write r = {now_ms(), 0, 0};
         r.rc = tsdbc_insert_series(c, w->id, &w->ts, &val, 1);
         r.t1 = now_ms();
-        if (r.rc == 0)
+        if (r.rc == 0) {
             w->acked++;
+            __atomic_store_n(&w->last_ack_t0, r.t0, __ATOMIC_RELEASE);
+        }
         else if (r.rc == TSDB_ERR_UNAVAILABLE || r.rc == TSDB_ERR_MOVED)
             w->refused++; /* definite: the server says it was never admitted */
         else {
@@ -12210,13 +12214,24 @@ static void scen_transfer(void)
         win[2 * t + 1] = now_ms();
         if (rc != 0)
             die("transfer %d of tv from node %u to node %u: %s (%s)", t, v.leader, to, cluster_strerror(rc), why);
-        struct meta_volume a;
+        struct meta_volume a = {0};
         if (!vol_rec(0, "tv", &a) || a.leader != to || a.epoch <= v.epoch)
             die("transfer %d answered OK, but node %u leads tv at epoch %" PRIu64 " (wanted node %u past %" PRIu64 ")",
                 t, a.leader, a.epoch, to, v.epoch);
         if (a.nisr != v.nrep)
             die("transfer %d to node %u: the ISR has %u members right after it (a member dropped as unanswered)", t,
                 to, a.nisr);
+        /* every writer acknowledged once after it before the next: a write refused across back-to-back transfers
+         * would add their windows up (and the client's MOVED backoff, which grows with a request's tries) */
+        for (int k = 0; k < REP_NAMES; k++) {
+            uint64_t until = now_ms() + 30000;
+            while (__atomic_load_n(&w[k].last_ack_t0, __ATOMIC_ACQUIRE) <= win[2 * t + 1])
+                if (now_ms() > until)
+                    die("writer %d (through server %d) acknowledged nothing in 30 s after transfer %d", k,
+                        w[k].server, t);
+                else
+                    usleep(5000);
+        }
     }
     for (int k = 0; k < REP_NAMES; k++)
         __atomic_store_n(&w[k].stop, 1, __ATOMIC_RELEASE);
@@ -12237,6 +12252,15 @@ static void scen_transfer(void)
     uint64_t took = 0;
     for (int t = 0; t < transfers; t++)
         took += win[2 * t + 1] - win[2 * t];
+    if (getenv("TR_DEBUG")) /* the slow writes: which writer, when, how long, how it ended */
+        for (int k = 0; k < REP_NAMES; k++)
+            for (size_t j = 0; j < w[k].n; j++)
+                if (w[k].w[j].t1 - w[k].w[j].t0 > 300)
+                    printf("  slow write: writer %d via server %d at +%" PRIu64 " ms took %" PRIu64 " ms: %s\n", k,
+                           w[k].server, w[k].w[j].t0 - win[0], w[k].w[j].t1 - w[k].w[j].t0, ers(w[k].w[j].rc));
+    if (getenv("TR_DEBUG"))
+        for (int t = 0; t < transfers; t++)
+            printf("  transfer %d: +%" PRIu64 " .. +%" PRIu64 " ms\n", t, win[2 * t] - win[0], win[2 * t + 1] - win[0]);
     qsort(pause, (size_t)transfers, sizeof *pause, cmp_u64);
     uint64_t cuts = 0;
     for (int i = 0; i < 3; i++) {

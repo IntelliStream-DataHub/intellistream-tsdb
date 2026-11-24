@@ -35,6 +35,11 @@
 enum { RT_IDLE = 0, RT_DRAIN, RT_READY };
 #define READY_RESEND_MS 200
 #define HARD_CAP_X 10
+/* After READY's epoch is lost (the fence of the promotion) the volume is a replica here for the moment the target
+ * needs to be promoted and the members' copies to name it: writes that reach this node meanwhile are told to retry
+ * after about 50 ms (repld_draining) instead of the 200 ms of an unplanned promotion, which made up half of a
+ * transfer's write pause. */
+#define HANDOVER_MS 2000
 
 struct rtr {
     uint64_t term; /* the highest Raft term a TRANSFER or CANCEL of this volume came with */
@@ -45,6 +50,7 @@ struct rtr {
     uint64_t t0, ready_ms, sent_ms, end;
     int blind; /* past the hard cap: admitting, every record counted */
     int crashed;
+    uint64_t handed_ms; /* when a READY transfer lost its epoch (0: none): HANDOVER_MS of short retries */
 };
 
 /* STATUS's counters (rtr_counts) */
@@ -100,6 +106,7 @@ static int tr_index(const struct rvol *rv, uint32_t node)
 
 static void tr_end(struct rvol *rv, struct rtr *t, const char *why)
 {
+    t->handed_ms = t->state == RT_READY && !t->blind && !strcmp(why, "lost its epoch") ? mono_ms() : 0;
     if (t->state != RT_IDLE)
         say("volume %" PRIu32 ": transfer to node %" PRIu32 " at epoch %" PRIu64 " %s after %" PRIu64
             " ms; admits again",
@@ -123,6 +130,8 @@ int rtr_admit_ok(struct rvol *rv)
 int rtr_draining(struct rvol *rv)
 {
     const struct rtr *t = rv->tr;
+    if (t && t->handed_ms && rv->mode != M_WRITER && mono_ms() - t->handed_ms < HANDOVER_MS)
+        return 1; /* handed over: a replica here until the copies name the new leader */
     return t && t->state != RT_IDLE && !t->blind;
 }
 
