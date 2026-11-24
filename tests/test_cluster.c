@@ -7841,6 +7841,8 @@ static void hold_opens(int on)
 static void scen_snapcatch(void)
 {
     scenario("snapcatch");
+    for (int i = 0; i < 3; i++) /* hold_opens() acts only where the server reads the files */
+        envs[i] = "hold_opens_file=1";
     struct snapset s;
     snap_setup(1, 0, &s);
     uint64_t n[REP_NAMES] = {702, 0, 0, 0};
@@ -7886,10 +7888,15 @@ static void scen_snapcatch(void)
     FILE *a = fopen(ask, "w");
     if (!a || fclose(a) != 0)
         die("%s: %s", ask, strerror(errno));
+    /* without the driver's check the copy reaches the install, which closes the volume and then refuses a P below
+     * the commit floor (snap_install's D6 check); a P between the floor and the log end it would install */
+    int floor_refused = log_count(s.R, "is below this replica's commit floor");
     t0 = now_ms();
     while (!log_has(s.R, "is stale and not installed")) {
         if (log_count(s.R, "snapshot installed: P") != 1)
             die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
+        if (log_count(s.R, "is below this replica's commit floor") != floor_refused)
+            die("a replica in the ISR took a copy at or below its log end to the install (its volume closed for it)");
         if (now_ms() - t0 > 60000)
             die("the caught-up replica's request was neither refused as stale nor installed in 60 s");
         snap_more(&s, 10, 0, &n[0]);
