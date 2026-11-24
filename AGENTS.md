@@ -794,7 +794,8 @@ cgroup, so `nice` does not keep your work out of its way.
   its class; the key is `4 x first base partition + class` (`partition_classes = 0`: the base number). A switch
   (series, T, class) never rewrites rows: T is past every row of the series in parts and memtables and every row
   of a flushed memtable whose WAL segment may still replay (`db->wtail`, per series, kept until
-  `wal_removed_synced` passes its segment), so a replay maps each WAL row to the key its flush used: a deleted row
+  `wal_removed_synced` passes its segment; on a replica until that or its replay start, RSTATE `kept` as saved, the
+  start its ACK sends; an entry is sorted only when a fold past the cap or a switch needs it, under `flush_lock`), so a replay maps each WAL row to the key its flush used: a deleted row
   merged away cannot come back under another key. A segment counts as gone only when it was unlinked before a
   directory fsync (`eng_sync_dir` moves `wal_removed_synced` to the `wal_removed` it read before the fsync); a
   failed unlink holds `wal_removed` back until a later flush removes it. A T more than 366 days ahead of now is not
@@ -811,7 +812,7 @@ cgroup, so `nice` does not keep your work out of its way.
   loaded before the WAL replay.
   On a replicated volume (design-cluster 5.4) a replica takes the leader's T exactly, so the leader's T lies past every
   row any member may still replay (its WAL tails are pruned by the members' replay floor, never by its own removed
-  segments, and a switch waits while that floor is unknown or below its open), and the CLASS marker precedes the
+  segments, and a replica checks that T against its tails up to its replay start, never its removals alone, and a switch waits while that floor is unknown or below its open), and the CLASS marker precedes the
   CLASSES record inside the switch.
   `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
   `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set

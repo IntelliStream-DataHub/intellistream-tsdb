@@ -3700,6 +3700,8 @@ uint64_t replica_replay_start(eng *db)
     return MAX(first, logstart);
 }
 
+uint64_t replica_kept_seq(eng *db) { return db->rp ? atomic_load(&db->rp->kept_saved) : 0; }
+
 bool replica_test_mu_free(eng *db)
 {
     if (!db->rp || pthread_mutex_trylock(&db->rp->mu) != 0)
