@@ -199,6 +199,12 @@ void rtr_tick(struct rvol *rv)
         return;
     uint64_t now = mono_ms(), w = wait_ms(rv);
     if (rv->mode != M_WRITER || !rv->core || !repl_is_leader(rv->core) || repl_epoch(rv->core) != t->epoch) {
+        /* the fence can reach this member before the 100 ms below (a Raft leader on this node fenced it in ~100 ms:
+         * test_cluster transferkill-ready): READY has left all the same, and the promotion is still under way */
+        if (t->state == RT_READY && !t->blind && !t->crashed) {
+            t->crashed = 1;
+            crash_point(CP_TRANSFER_READY);
+        }
         tr_end(rv, t, "lost its epoch");
         return;
     }
