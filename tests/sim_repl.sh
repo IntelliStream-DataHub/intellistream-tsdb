@@ -83,7 +83,7 @@ all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
            14:promote 39:replay_floor 40:idle_shrink 42:steady_join 43:reconfig 44:reconfig 45:reconfig 46:replay
            47:snapshot 48:leave 49:leave 50:target 51:hold 52:hold 53:hold 54:reconfig 55:unans_remap 56:join_remap
-           57:busy_drop"
+           57:busy_drop 58:replay_floor"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the
@@ -134,7 +134,13 @@ quick)
     # schedules have changed since). 75881 3865 25133: a leader that went back to a position its follower had, and
     # had trimmed, sent snapshot notices for ever (the follower now ACKs where it is). 299557 436347: a leader's
     # shrink to itself applied in the tick it lost its disk, then promoted again (D1; the checker took it for P-F1).
-    for s in 43308 200636 294653 478816 570201 653518 756115 903046 75881 3865 25133 299557 436347; do
+    # 31071: an ACK of a replica's empty log, reordered behind its ACK after a snapshot install, raised the leader's
+    # replay floor above the installed segments (repl.c, MUT(58)). 64907 73994 97545: a core restarted in a new set
+    # with writes not yet synced: the simulator opened it with its whole log durable (repld's core_build passes `hold`).
+    # 46150: a snapshot install under the same rid lowered a replica's replay start, and a leader that kept the higher
+    # one gave a floor above the installed segments.
+    for s in 43308 200636 294653 478816 570201 653518 756115 903046 75881 3865 25133 299557 436347 31071 64907 73994 \
+        97545 46150; do
         "$B"/sim_repl --seed $s > /dev/null || exit 1
     done
     mutants 1000 "$quick"

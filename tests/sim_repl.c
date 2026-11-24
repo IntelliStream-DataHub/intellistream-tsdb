@@ -900,7 +900,10 @@ static void node_open(int i)
             h[nh++] = (struct repl_epoch){.epoch = nd->log[k].epoch, .start = nd->log[k].pos};
     }
     struct repl_durable d = {.rid = nd->rid, .fence = nd->fence, .led = nd->led, .floor = nd->floor,
-                             .log_start = nd->start, .log_end = log_end(nd), .hist = h, .nhist = nh};
+                             .log_start = nd->start, .log_end = log_end(nd), .hist = h, .nhist = nh,
+                             /* a core restarted without a power loss (node_reconfig) reads writes not yet synced: it
+                              * starts from the durable end, as repld's core_build does (`hold`), and asks for a sync */
+                             .hold = nd->ndur < nd->n ? dur_end(nd) + 1 : 0};
     /* The driver opens the core in the set the metadata copy names now. */
     nd->cfg.self = i;
     nd->cfg.nnodes = S.nn;

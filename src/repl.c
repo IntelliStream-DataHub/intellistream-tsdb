@@ -817,7 +817,8 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     if (!r->leading || (m->epoch != r->epoch && !MUT(8)) || m->from < 0 || m->from >= r->cfg.nnodes)
         return;
     struct peer *p = &r->peer[m->from];
-    if (m->rid != p->rid) {
+    int same_rid = m->rid == p->rid;
+    if (!same_rid) {
         p->rid = m->rid;
         if (!MUT(19))
             p->match = 0;
@@ -828,7 +829,15 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     p->last_ack = r->now;
     p->last_heard = r->now;
     p->start = m->start;
-    p->replay = m->replay;
+    /* A lower replay start than the one heard is taken as it comes: a snapshot install keeps the rid and may lower it
+     * (its segments start at the leader's replay start; sim_repl seed 46150), and a lower floor is only ever later.
+     * An empty log (0) is the one value that is never true again under a rid once a start was heard (a nonzero start
+     * is at most its floor + 1, below which no cut goes, and an install leaves S..P): such an ACK was sent before, and
+     * reordered or duplicated behind, one already heard. Taken, it raised the floor to the leader's log start, above
+     * the installed segments (sim_repl seed 31071, MUT(58)). A stale ACK with a higher nonzero start, from before an
+     * install that lowered it, is not told apart here: the peer links deliver in order (REPORT.md, open). */
+    if (!same_rid || m->replay || !p->replay || MUT(58))
+        p->replay = m->replay;
     if (p->snap_lo && m->written + 1 >= r->start)
         p->snap_lo = 0; /* it has what it needs from the log: installed, or never needed one */
     p->heard = 1;

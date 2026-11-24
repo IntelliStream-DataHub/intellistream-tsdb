@@ -36,7 +36,8 @@
  *   target      a planned promotion picks its target or nobody (MUT(50): the lowest index won a tie), and no reply is
  *               left `unanswered`.
  *   replay      the replay start (D17) in ACKs, an empty log's "nothing to replay", and the floor with a snapshot
- *               notice outstanding (MUT(46): the leader's own replay start only).
+ *               notice outstanding (MUT(46): the leader's own replay start only); a reordered ACK of an empty log
+ *               is not taken once a start was heard (MUT(58)), a lower start after an install is (replay_floor).
  *   snapshot    a fresh learner whose first position is not retained gets the notice; a snapshot is wanted only above
  *               the log end (MUT(47)); an install at P with log start S <= P + 1 opens, and its ACK stops the notice.
  *   peer_match  what a planned transfer's drain (D14) reads of its target: the durable end acknowledged as the instance
@@ -800,6 +801,21 @@ static void replay_floor(void)
     repl_recv(r, &k0);
     drain(r, &d, NULL);
     CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 ", not node 2's start 30", repl_replay_floor(r));
+    /* node 2's ACK from before it held anything (an empty log: replay 0), reordered behind the one above: node 2 still
+     * replays from 30 (MUT(58): the floor rose to the leader's start 50) */
+    struct repl_msg stale = {.type = REPL_M_ACK, .from = 2, .to = 1, .epoch = 2, .leader = -1, .rid = 33, .start = 1};
+    repl_recv(r, &stale);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 30, "floor %" PRIu64 " after a stale ACK of node 2, which replays from 30",
+          repl_replay_floor(r));
+    /* node 2 installed a snapshot under the same rid: its segments start at 20, below the 30 it said before, and the
+     * floor follows it down (a rule that only raised a rid's replay start kept 30: sim_repl seed 46150) */
+    struct repl_msg inst = k2;
+    inst.start = inst.replay = 20;
+    repl_recv(r, &inst);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 20, "floor %" PRIu64 " after node 2 installed segments from 20",
+          repl_replay_floor(r));
     k2.start = k2.replay = 60; /* node 2 removed segments: the leader's own start is now the lowest */
     repl_recv(r, &k2);
     drain(r, &d, NULL);
