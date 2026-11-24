@@ -50,7 +50,8 @@ enum {
     CVOLFS_MUT_STALEOPEN,    /* cvolset_prepare leaves a v<N> of another rid in place (refused: never joins again) */
     CVOLFS_MUT_REMOVENODIRSYNC, /* a removal's rename is not followed by the root's fsync */
     CVOLFS_MUT_REMOVEDOPEN,  /* cvolset_close does not close a removed replica: it keeps serving */
-    CVOLFS_MUT_MAKEMISSING   /* a missing v<N> with a recorded open is made again (fresh) instead of refused */
+    CVOLFS_MUT_MAKEMISSING,  /* a missing v<N> with a recorded open is made again (fresh) instead of refused */
+    CVOLFS_MUT_LOSTASSTALE   /* a reset's old v<N> is set aside as stale-<rid>, not lost-<rid> (test_cluster resetlost) */
 };
 extern int cvolfs_test_mutant;
 

@@ -47,7 +47,7 @@ Per change (the builder runs them, detached when long; the fixer reruns what a f
 Weekly gate (Saturdays, on main, when nobody else needs the machines; one job per machine): `make test`,
 `make test IO=epoll`, `make asan`, `make tsan` (its groups as parallel jobs), `make jepsen`, the cluster gate
 (`agents/tsdb/r3-gate/gate-par.sh REV`: jepsen-cluster's matrix in parallel lanes, about an hour), the mutant suites
-(`repld-mutants lease-mutants copy-mutants meta-mutants auth-mutants sim-repl-mutants`), `make dist-test` when
+(`repld-mutants lease-mutants copy-mutants meta-mutants auth-mutants sim-repl-mutants rset-mutants`), `make dist-test` when
 portability changed. What it finds becomes fix tracks. Never a 12-hour soak as a gate; long soaks only on idle machines.
 
 ## Merge (main session)

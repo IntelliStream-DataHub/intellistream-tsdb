@@ -12128,10 +12128,12 @@ static int dir_has(int i, const char *prefix)
  * keeps every segment (TSDB_REPLD_TEST=keepall). A writer drops the segment of position 1 (its open marker) once every
  * member acknowledged it, within seconds; a member added or reset after that needs a snapshot, which r4-xferinst builds.
  * Until it merges, a scenario that fills a fresh replica from the log keeps everything */
+static const char *set_cenv; /* TSDB_CLUSTER_TEST of set_setup's servers when not NULL (setop_file=1 among it) */
+
 static int set_setup(int nserv, struct meta_volume *v, int keepall)
 {
     for (int i = 0; i < nserv; i++) {
-        envs[i] = "setop_file=1";
+        envs[i] = set_cenv ? set_cenv : "setop_file=1";
         if (keepall)
             penv[i] = "TSDB_REPLD_TEST=keepall";
         start(i);
@@ -12211,6 +12213,63 @@ static void scen_addreplica(void)
            " rows the others hold\n", X, rows);
 }
 
+
+/* setnext: two ADDs, the second proposed while every driver's first drain of the first change lets rv->mu go
+ * (TSDB_REPLD_TEST=setdrainwait, until a newer record comes or 10 s pass). The driver applies the newest record from the record it holds,
+ * never the maps it computed for the first (mutant setnextstale: the second member is taken for an old one): every
+ * driver goes from version S to S + 2 with both new members new, both fill from the log and join, rows equal on all. */
+static void scen_setnext(void)
+{
+    scenario("setnext");
+    struct meta_volume v;
+    for (int i = 0; i < 5; i++)
+        penv[i] = "TSDB_REPLD_TEST=keepall,setdrainwait";
+    int L = set_setup(5, &v, 0), X = -1, Y = -1;
+    for (int i = 0; i < 5; i++)
+        if (rep_index(&v, i) < 0)
+            *(X < 0 ? &X : &Y) = i;
+    if (X < 0 || Y < 0)
+        die("plant: leader %d, non-members %d %d", L, X, Y);
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t t = 1000;
+    uint64_t rows = set_write(c, id, &t, 5, 1);
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    char res[512], op[96], line[160];
+    uint64_t sv0 = v.set_version;
+    snprintf(op, sizeof op, "add 1 %" PRIu32, ids[X]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("add %d: %s", X, res);
+    snprintf(line, sizeof line, "setdrainwait: replica set version %" PRIu64 " drains", sv0 + 1);
+    await_log_count(L, line, 1, 10000); /* the leader's driver is inside the first change: the second comes now */
+    snprintf(op, sizeof op, "add 1 %" PRIu32, ids[Y]);
+    set_op(5, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("add %d: %s", Y, res);
+    await_member(0, "plant", Y, 1, 5, 10000, &v);
+    if (v.set_version != sv0 + 2)
+        die("two adds moved set_version %" PRIu64 " -> %" PRIu64, sv0, v.set_version);
+    snprintf(line, sizeof line, "replica set version %" PRIu64 " -> %" PRIu64, sv0, sv0 + 2);
+    await_log_count(L, line, 1, 20000);
+    snprintf(line, sizeof line, "replica set version %" PRIu64 " -> %" PRIu64, sv0, sv0 + 1);
+    if (log_count(L, line))
+        die("the leader applied set version %" PRIu64 " although %" PRIu64 " came during its drain", sv0 + 1, sv0 + 2);
+    snprintf(line, sizeof line, "%" PRIu32 " (new), %" PRIu32 " (new);", ids[X], ids[Y]);
+    if (log_count(L, line) != 1)
+        die("the leader's set change line does not name servers %d and %d as new (\"%s\")", X, Y, line);
+    await_isr(0, "plant", 5, 60000, "both learners filled from the log and joined");
+    rows += set_write(c, id, &t, 3, 0); /* committed by five */
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    stop_all();
+    uint64_t want[REP_NAMES] = {rows, 0, 0, 0};
+    int s5[5] = {0, 1, 2, 3, 4};
+    rep_same_on(s5, 5, want, "after a clean stop");
+    printf("  two adds during one drain: every driver went to set version %" PRIu64 " at once, servers %d and %d new,"
+           " joined; %" PRIu64 " rows on all five\n", sv0 + 2, X, Y, rows);
+}
 
 static off_t classes_size(int i)
 {
@@ -12317,7 +12376,12 @@ static void scen_addswitch(void)
         await_isr(0, "plant", 4, 120000, "the learner filled from the log and joined");
         join = now_ms() - t_add - lead;
     }
+    /* the switch was deferred at least once on the way (CLS_DEFER: the floor below wtail_from, held there by the
+     * learner's lowest position or the members' retained segments): a leader that switched at once (the defer skipped)
+     * never says it. Which of the two held it is not told apart here. */
     int waits = log_count(L, "a class switch waits");
+    if (waits < 1)
+        die("the leader switched the slow series' class with no \"a class switch waits\" line (%" PRIu64 " ms)", sw_ms);
     uint64_t ctl_ms = slow_until_switch(c, ctl, &day, &nctl, L, 0, NULL, 60000);
     await_batches(&w, 20, 20000);
     __atomic_store_n(&w.stop, 1, __ATOMIC_RELEASE);
@@ -12455,7 +12519,11 @@ static void scen_removereplica(void)
 {
     scenario("removereplica");
     struct meta_volume v;
+    /* copy_lag_ms: the loop's own copy publish comes 500 ms after each push, so a manager that judged the removal by
+     * the copy of the round before (published after the push) keeps the volume for good */
+    set_cenv = "setop_file=1,copy_lag_ms=500";
     int L = set_setup(3, &v, 0), R = (L + 1) % 3, O = (L + 2) % 3;
+    set_cenv = NULL;
     tsdbc *c = client(L);
     tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
     int64_t t = 1000;
@@ -12721,8 +12789,10 @@ static void scen_setstale(void)
 /* resetlost: a stopped replica's v1 removed is refused at its start with a line naming `tsdb cluster replica reset`;
  * a reset of an ISR member or of the leader is refused with the reason; the reset of the lost one makes a fresh v1
  * that fills and joins, with no v1.lost-* (no directory existed). Then a stopped replica whose v1 is still there is
- * reset: its v1 is set aside as v1.lost-<old rid>. Mutants resetinisr (the reason is missing), resetsamerid (the reset
- * never applies: no fresh replica), makemissing (the missing v1 is made again by itself). */
+ * reset (its v1 set aside as v1.stale-<old rid>: down, it never saw the reset), and a paused one (it sees the reset when
+ * let go: v1.lost-<old rid>). After each the leader's set change line names it new. Mutants resetinisr (the reason is
+ * missing), resetsamerid (the reset never applies: no fresh replica), makemissing (the missing v1 is made again by
+ * itself), setoldofnode (the leader carries the old replica's ack over), lostasstale (stale- where lost- is due). */
 static void scen_resetlost(void)
 {
     scenario("resetlost");
@@ -12762,10 +12832,16 @@ static void scen_resetlost(void)
             usleep(50000);
     if (dir_has(R, "v1"))
         die("server %d made a v1 for a replica the group recorded as opened", R);
-    for (int pass = 0; pass < 2; pass++) {
-        if (pass) { /* a stopped replica whose v1 is still there */
+    /* pass 0: no directory; pass 1: stopped through the reset, its v1 still there (a server down through its reset
+     * cannot tell it from a REMOVE and an ADD: the reset note is in memory only, so stale-<rid>); pass 2: running and
+     * paused out of the ISR through the reset, then let go: it sees the reset, lost-<rid> */
+    for (int pass = 0; pass < 3; pass++) {
+        if (pass == 1) {
             stop(R, SIGTERM);
             await_isr(0, "plant", 2, 20000, "a replica stopped");
+        } else if (pass == 2) {
+            pause_server(R, 1);
+            await_isr(0, "plant", 2, 20000, "a replica paused");
         }
         snprintf(args, sizeof args, "cluster replica reset %s 1 %" PRIu32 " --secret-file %s", p0, ids[R], secret_path);
         int rc = cli_run(args, NULL, out, sizeof out);
@@ -12778,15 +12854,27 @@ static void scen_resetlost(void)
                 die("the reset of server %d did not apply", R);
             else
                 usleep(50000);
-        if (pass)
+        if (pass == 1)
             start(R);
+        else if (pass == 2)
+            pause_server(R, 0);
         rows += set_write(c, id, &t, 2, 0);
         await_isr(0, "plant", 3, 60000, "the reset replica filled and joined");
-        char lost[64], stale[64]; /* a server down through its reset cannot tell it from a REMOVE and an ADD */
+        /* the leader's driver took the reset member as new (old_of by node and rid): no ack of the old replica carried
+         * over to the fresh one (mutant setoldofnode) */
+        char nn[2][48];
+        snprintf(nn[0], sizeof nn[0], "nodes %" PRIu32 " (new)", ids[R]);
+        snprintf(nn[1], sizeof nn[1], ", %" PRIu32 " (new)", ids[R]);
+        if (log_count(L, nn[0]) + log_count(L, nn[1]) < pass + 1)
+            die("pass %d: the leader's set change lines name server %d (node %" PRIu32 ") new %d times, not %d", pass,
+                R, ids[R], log_count(L, nn[0]) + log_count(L, nn[1]), pass + 1);
+        char lost[64], stale[64];
         snprintf(lost, sizeof lost, "v1.lost-%016" PRIx64, oldrid);
         snprintf(stale, sizeof stale, "v1.stale-%016" PRIx64, oldrid);
-        if ((dir_has(R, lost) || dir_has(R, stale)) != pass)
-            die("pass %d: server %d %s %s", pass, R, pass ? "has no" : "has", lost);
+        int hl = dir_has(R, lost), hs = dir_has(R, stale);
+        if (pass == 0 ? hl || hs : pass == 1 ? hl || !hs : !hl || hs)
+            die("pass %d: server %d holds %s%s%s, not %s", pass, R, hl ? lost : "", hl && hs ? " and " : "",
+                hs ? stale : hl ? "" : "neither", pass == 0 ? "neither" : pass == 1 ? stale : lost);
         oldrid = rep_of(&nv, R)->rid;
     }
     if ((uint64_t)rows_of(c, id) != rows)
@@ -12796,7 +12884,8 @@ static void scen_resetlost(void)
     uint64_t want[REP_NAMES] = {rows, 0, 0, 0};
     int s[3] = {0, 1, 2};
     rep_same_on(s, 3, want, "after a clean stop");
-    printf("  a lost v1 refused with the reset's line; reset twice (no directory, then one set aside): fresh, filled,"
+    printf("  a lost v1 refused with the reset's line; reset three times (no directory, stale- when down, lost- when"
+           " running): fresh, filled,"
            " %" PRIu64 " rows on all three\n", rows);
 }
 
@@ -12976,7 +13065,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

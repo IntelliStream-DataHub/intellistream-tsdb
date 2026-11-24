@@ -2170,6 +2170,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "setkeepold")     ? RM_SETKEEPOLD
                : !strcmp(mu, "setnoversion")   ? RM_SETNOVERSION
                : !strcmp(mu, "setdrvnoremap")  ? RM_SETDRVNOREMAP
+               : !strcmp(mu, "setnextstale")   ? RM_SETNEXTSTALE
+               : !strcmp(mu, "setoldofnode")   ? RM_SETOLDOFNODE
                                                : RM_NONE;
     if (G.mutant)
         say("MUTANT %s (tests only)", mu);
@@ -2182,6 +2184,7 @@ void repld_init(tsdb *t, const char *dir)
     G.stale_sent = te && strstr(te, "stalesent");
     G.set_stale = te && strstr(te, "setstale");
     G.keep_all = te && strstr(te, "keepall");
+    G.set_drain_wait = te && strstr(te, "setdrainwait");
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
     G.late_bytes = te && strstr(te, "latebytes");

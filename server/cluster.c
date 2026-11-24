@@ -1146,6 +1146,10 @@ static struct {
     int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
                           * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
     char holdcopyfile[1100];
+    uint64_t copy_lag_ns; /* TSDB_CLUSTER_TEST copy_lag_ms=N: the main loop publishes no copy for N ms after a push to the
+                           * volume manager (test_cluster removereplica: the manager judges a removal by a copy at least as
+                           * new as the push, which vol_watch_duty publishes first) */
+    uint64_t pushed_ns;
     int hold_users;      /* TSDB_CLUSTER_TEST hold_users_file=1: the users watch is given nothing while
                           * <state-dir>/holdusers exists (test_cluster forward: an owner whose users lag the entry's) */
     char holdusersfile[1100];
@@ -1395,6 +1399,8 @@ static void test_knobs(void)
             C.hold_raft = v != 0;
         else if (sscanf(p, "hold_copy_file=%llu", &v) == 1)
             C.hold_copy = v != 0;
+        else if (sscanf(p, "copy_lag_ms=%llu", &v) == 1)
+            C.copy_lag_ns = v * MS;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
         else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
@@ -5649,6 +5655,10 @@ static void vol_watch_duty(void)
         say("holds replicas of %" PRIu32 " volumes more than the %d this server makes, opens and reports; those past"
             " volume %" PRIu32 " are not opened", over, CLUSTER_REPORT_VOLS, recs[n - 1].number);
     said_over = over > said_over ? over : said_over;
+    /* the copy first: the volume manager judges a push that no longer names a volume by the copy (cvolset_mgr.c's
+     * removed_here, the start sweep), which must hold every entry the push was made from, never the round before */
+    copy_publish();
+    C.pushed_ns = mono_ns();
     g_vwatch(g_vwatch_arg, C.id, recs, n);
 }
 
@@ -6637,7 +6647,8 @@ static void *cluster_main(void *arg)
                     c->dead = 1;
             }
         }
-        copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
+        if (!C.copy_lag_ns || since(mono_ns(), C.pushed_ns) >= C.copy_lag_ns)
+            copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
         size_t n0 = C.nconns;
         if (pfcap < n0 + 3) {
             pfcap = (n0 + 3) * 2;

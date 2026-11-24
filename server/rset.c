@@ -21,7 +21,8 @@
  *
  * Mutants (TSDB_REPLD_MUTANT): `setkeepold` keeps the old set (the stub's behaviour: a learner never joins),
  * `setnoversion` lets a message of any set version through the driver, `setdrvnoremap` remaps the core but not the
- * driver's cursors (test_cluster removeindex). TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, this server's
+ * driver's cursors (test_cluster removeindex), `setoldofnode` maps a reset member (same node, new rid) to its old
+ * index, carrying the old replica's ack over to the fresh one (test_cluster resetlost). TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, this server's
  * drivers keep the set they have (test_cluster setstale: the others drop its messages).
  */
 #include <inttypes.h>
@@ -35,6 +36,8 @@
 struct rset {
     int pending;                 /* `next` waits for the volume's thread */
     struct cluster_vol_rec next; /* the newest record of another set version */
+    uint64_t drain_waited;       /* the next_gen the setdrainwait hook waited at */
+    uint64_t next_gen;           /* bumped at every write of `next`: apply() works on a copy and starts over when it moved */
     uint64_t dropped;            /* peer messages of another set version, dropped */
     uint64_t dropped_said, said_ms;
     uint64_t defer_said;         /* the set version a deferral was said for */
@@ -83,14 +86,23 @@ int rset_change(struct rvol *rv, const struct cluster_vol_rec *r)
     if (!(s = set_of(rv)))
         return 0; /* no memory: the next push tries again */
     s->next = *r;
+    __atomic_fetch_add(&s->next_gen, 1, __ATOMIC_RELAXED); /* the setdrainwait hook reads it with rv->mu let go */
     s->pending = 1;
     return 1;
 }
 
-/* 0 applied, 1 it waits */
+/* 0 applied, 1 it waits. It works on a copy of `next`: drain() lets rv->mu go, and a push meanwhile (rset_change) may
+ * write a newer record there, of another member list. Then self and old_of, computed from the record it began with,
+ * no longer describe it: it starts over from the new one (mutant setnextstale reconfigures the core with the new
+ * count and the old maps, and hands the driver the new record). */
 static int apply(struct rvol *rv, struct rset *s)
 {
-    const struct cluster_vol_rec *n = &s->next;
+    struct cluster_vol_rec cur;
+    const struct cluster_vol_rec *n = &cur;
+    uint64_t gen;
+again:
+    cur = s->next;
+    gen = s->next_gen;
     if (held_stale()) {
         if (!s->stale_said)
             say("volume %" PRIu32 ": setstale: kept on replica set version %" PRIu64 " (the record has %" PRIu64 ")",
@@ -115,16 +127,38 @@ static int apply(struct rvol *rv, struct rset *s)
         old_of[i] = -1;
         for (uint32_t j = 0; j < rv->rec.nrep; j++)
             if (rv->rec.rep[j].node == n->rep[i].node &&
-                (rv->rec.rep[j].rid == n->rep[i].rid || !rv->rec.rep[j].rid || !n->rep[i].rid))
+                (rv->rec.rep[j].rid == n->rep[i].rid || !rv->rec.rep[j].rid || !n->rep[i].rid ||
+                 G.mutant == RM_SETOLDOFNODE)) /* planted: by node alone */
                 old_of[i] = (int)j; /* a reset member (same node, a new rid) is new: -1 */
     }
     int rc = REPL_E_PENDING;
     for (int tries = 0; tries < 8 && rc == REPL_E_PENDING; tries++) {
-        rc = repl_reconfig(rv->core, (int)n->nrep, self, old_of);
-        if (rc == REPL_E_PENDING)
-            drain(rv); /* the queued actions go out through the old record, in the old indexes */
+        if (tries == 0 && G.set_drain_wait && s->drain_waited != gen) {
+            s->drain_waited = gen; /* test hook: a drain that lets rv->mu go long enough for the next push */
+            say("volume %" PRIu32 ": setdrainwait: replica set version %" PRIu64 " drains for up to 10 s", rv->number,
+                n->set_version);
+            pthread_mutex_unlock(&rv->mu);
+            for (int k = 0; k < 1000 && __atomic_load_n(&s->next_gen, __ATOMIC_RELAXED) == gen; k++)
+                usleep(10000);
+            pthread_mutex_lock(&rv->mu);
+        } else {
+            rc = repl_reconfig(rv->core, (int)n->nrep, self, old_of);
+            if (rc == REPL_E_PENDING)
+                drain(rv); /* the queued actions go out through the old record, in the old indexes */
+        }
         if (rv->failed || !rv->core || !s->pending)
             return 1; /* nothing for the caller to hand over */
+        if (s->next_gen != gen) {
+            if (G.mutant != RM_SETNEXTSTALE)
+                goto again; /* a newer record came while the queue drained: nothing of this one was applied yet */
+            for (uint32_t i = cur.nrep; i < s->next.nrep && i < REPL_MAX_NODES; i++)
+                old_of[i] = 0; /* planted: the new member count with this record's self and old_of (past its count:
+                                * whatever the stack held, 0 here) */
+            cur.nrep = s->next.nrep;
+            memcpy(cur.rep, s->next.rep, sizeof cur.rep);
+            cur.set_version = s->next.set_version;
+            gen = s->next_gen;
+        }
     }
     if (rc == REPL_E_PENDING)
         return 1; /* the next tick */

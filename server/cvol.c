@@ -427,6 +427,7 @@ int cvol_start(tsdb *t, const char *dir)
                          : !strcmp(mu, "removenodirsync") ? CVOLFS_MUT_REMOVENODIRSYNC
                          : !strcmp(mu, "removedopen") ? CVOLFS_MUT_REMOVEDOPEN
                          : !strcmp(mu, "makemissing") ? CVOLFS_MUT_MAKEMISSING
+                         : !strcmp(mu, "lostasstale") ? CVOLFS_MUT_LOSTASSTALE
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");

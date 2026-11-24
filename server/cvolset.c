@@ -200,9 +200,15 @@ int cvolset_prepare(const char *root, uint32_t number, const struct cvolfs_rec *
             cvolset_noted(number, CVS_RESET, NULL, 1);
         return 0;
     }
+    /* A record that was opened here already (open_gen > 0) had its directory here: one of another rid in its place is
+     * not stale but a wrong copy (a disk of another instance mounted, a restore), and a fresh one would hide the loss of
+     * the recorded one. Only a replica the group never saw opened (an ADD after a REMOVE, a reset) replaces it; cvolfs
+     * refuses this one as another instance, and `tsdb cluster replica reset` is the way out. */
+    if (!reset && r->open_gen > 0)
+        return 0;
     if (cvolfs_test_mutant == CVOLFS_MUT_STALEOPEN)
         return 0; /* planted: left in place (cvolfs refuses it as another instance) */
-    const char *kind = reset ? "lost" : "stale";
+    const char *kind = reset && cvolfs_test_mutant != CVOLFS_MUT_LOSTASSTALE ? "lost" : "stale"; /* planted: stale */
     if (cvolset_setaside(root, number, kind, rid, to, sizeof to) != 0)
         return -1;
     if (reset)

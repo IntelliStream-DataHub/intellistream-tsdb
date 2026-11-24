@@ -286,6 +286,18 @@ static void test_refusals(void)
     r = rec(1, 1, o.nonce);
     CHECK(cvolfs_prepare(root, &r, &o2) == 0 && o2.gen == 2);
     RESTORE();
+    /* another rid that the group never saw opened (an ADD after a REMOVE while this server was down): the old directory
+     * is set aside as stale and a fresh one made; the refusal above holds only for a rid recorded as opened here */
+    {
+        struct cvolfs_rec n = rec(1, 0, 0);
+        char aside[64];
+        snprintf(aside, sizeof aside, "v1.stale-%016" PRIx64, n.rid);
+        n.rid++;
+        CHECK(cvolfs_prepare(root, &n, &o2) == 0 && o2.gen == 1);
+        CHECK(exists(root, aside));
+        CHECK(sh("rm -rf '%s/%s'", root, aside) == 0);
+        RESTORE();
+    }
 
     /* a missing REPL in a directory that has data, one with no valid slot, a stub of the old text format */
     char p[PATH_MAX + 64];

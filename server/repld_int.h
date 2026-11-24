@@ -193,7 +193,9 @@ enum {
     RM_DIVERGEISR,     /* a DIVERGED volume is not stopped: no LOCAL_FAULT, it stays in the ISR (r8i, D8) */
     RM_SETKEEPOLD,     /* rset.c: a driver keeps the replica set it opened with (a learner never joins) */
     RM_SETNOVERSION,   /* rset.c: a peer message of any set version reaches the driver */
-    RM_SETDRVNOREMAP   /* rset.c: the core is remapped at a set change, the driver's cursors are not */
+    RM_SETDRVNOREMAP,  /* rset.c: the core is remapped at a set change, the driver's cursors are not */
+    RM_SETNEXTSTALE,   /* rset.c: a newer record that came while the queue drained is applied with the old maps */
+    RM_SETOLDOFNODE    /* rset.c: old_of by node alone: a reset member keeps its old index's ack (test_cluster resetlost) */
 };
 
 struct repld_g {
@@ -259,6 +261,8 @@ struct repld_g {
                        * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
+    int set_drain_wait; /* TSDB_REPLD_TEST=setdrainwait: a set change's first drain lets rv->mu go for up to 10 s, until a
+                         * newer record comes (rset.c; test_cluster setnext) */
     int set_stale;    /* TSDB_REPLD_TEST=setstale: while <dir>/setstale exists, a set change is not applied (rset.c) */
     int keep_all;     /* TSDB_REPLD_TEST=keepall: a writer's keep bound stays 0, every segment kept (a learner fills from
                        * 1); <dir>/keepoff lifts it */
