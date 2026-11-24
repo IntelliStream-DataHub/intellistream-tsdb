@@ -147,17 +147,25 @@ static int apply(struct rvol *rv, struct rset *s)
     }
     rv->isr_want = 0; /* a bitmask of old indexes: the core asks again */
     uint64_t was = rv->rec.set_version;
-    char nodes[REPL_MAX_NODES * 12 + 1];
+    /* each member with what the driver carries over for it: a peer's ack is the keep bound's input, and a test reads
+     * it back (removeindex: the member that stays keeps its own ack, never the removed one's) */
+    char nodes[REPL_MAX_NODES * 48 + 1];
     size_t o = 0;
     nodes[0] = 0;
-    for (uint32_t i = 0; i < n->nrep && o < sizeof nodes - 12; i++)
-        o += (size_t)snprintf(nodes + o, sizeof nodes - o, "%s%" PRIu32 "%s", i ? " " : "", n->rep[i].node,
-                              old_of[i] < 0 ? "+" : "");
+    for (uint32_t i = 0; i < n->nrep && o < sizeof nodes - 48; i++) {
+        o += (size_t)snprintf(nodes + o, sizeof nodes - o, "%s%" PRIu32, i ? ", " : "", n->rep[i].node);
+        if ((int)i == self)
+            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (this)");
+        else if (old_of[i] < 0)
+            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (new)");
+        else
+            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (acked %" PRIu64 ")", rv->peer[i].acked);
+    }
     rec_set(rv, n);
     rv->self = self;
     rv->nnodes = (int)n->nrep;
     s->pending = 0;
-    say("volume %" PRIu32 ": replica set version %" PRIu64 " -> %" PRIu64 ": nodes %s (+: new), this is replica %d of %d",
+    say("volume %" PRIu32 ": replica set version %" PRIu64 " -> %" PRIu64 ": nodes %s; this is replica %d of %d",
         rv->number, was, rv->rec.set_version, nodes, self, rv->nnodes);
     return 0;
 }

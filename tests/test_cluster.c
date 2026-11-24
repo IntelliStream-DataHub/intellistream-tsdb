@@ -12046,6 +12046,68 @@ static uint64_t set_write(tsdbc *c, tsdb_sid id, int64_t *t, int batches, int fl
     return n;
 }
 
+/* a writer of batches of 100 rows (timestamps t, t + 1, ...) until `stop`: `acked` rows were acknowledged; a failed
+ * batch is `unsure` (it may or may not be there) when `lenient`, else the writer stops with its error in rc. Every
+ * answer within 30 s, so a hang is a failure */
+struct set_writer {
+    int port;
+    tsdb_sid id;
+    int64_t t;
+    int stop, lenient, rc;
+    uint64_t acked, unsure, batches;
+};
+
+static void *set_write_thread(void *a)
+{
+    struct set_writer *w = a;
+    tsdbc *c = NULL;
+    while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
+        if (!c && (w->rc = tsdbc_connect("127.0.0.1", w->port, &c)) != 0) {
+            c = NULL;
+            if (!w->lenient)
+                break;
+            usleep(100000);
+            continue;
+        }
+        tsdbc_set_timeout(c, 30000);
+        int64_t tv[100];
+        float vv[100];
+        for (int j = 0; j < 100; j++)
+            tv[j] = w->t++, vv[j] = (float)(j % 37);
+        int rc = tsdbc_insert_series(c, w->id, tv, vv, 100);
+        __atomic_add_fetch(&w->batches, 1, __ATOMIC_RELEASE);
+        if (rc == 0) {
+            __atomic_add_fetch(&w->acked, 100, __ATOMIC_RELEASE);
+            continue;
+        }
+        w->rc = rc;
+        if (!w->lenient)
+            break;
+        w->unsure += 100;
+        tsdbc_close(c); /* the connection may be the one a written-and-lost forward closed */
+        c = NULL;
+        usleep(100000);
+    }
+    if (c)
+        tsdbc_close(c);
+    if (w->lenient)
+        w->rc = 0;
+    return NULL;
+}
+
+/* waits until a set_writer has had `n` more batches answered than it had at the call */
+static void await_batches(struct set_writer *w, uint64_t n, int ms)
+{
+    uint64_t b0 = __atomic_load_n(&w->batches, __ATOMIC_ACQUIRE), t0 = now_ms();
+    while (__atomic_load_n(&w->batches, __ATOMIC_ACQUIRE) < b0 + n)
+        if (w->rc && !w->lenient)
+            die("a writer: %s", ers(w->rc));
+        else if (now_ms() - t0 > (uint64_t)ms)
+            die("a writer had fewer than %" PRIu64 " batches answered in %d ms", n, ms);
+        else
+            usleep(20000);
+}
+
 static int dir_has(int i, const char *prefix)
 {
     char d[PATH_MAX + 80];
@@ -12110,10 +12172,11 @@ static void scen_addreplica(void)
     int64_t t = 1000;
     uint64_t rows = set_write(c, id, &t, 5, 1);
     await_isr(0, "plant", 3, 10000, "every replica up");
-    struct rep_writer w = {cports[L], id, 10000000, 300, 0, 0, 0, 0};
+    struct set_writer w = {.port = cports[L], .id = id, .t = 10000000};
     pthread_t th;
-    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+    if (pthread_create(&th, NULL, set_write_thread, &w) != 0)
         die("pthread_create");
+    await_batches(&w, 20, 20000);
     char res[512], op[64];
     uint64_t sv0 = v.set_version;
     snprintf(op, sizeof op, "add 1 %" PRIu32, ids[X]);
@@ -12127,10 +12190,12 @@ static void scen_addreplica(void)
     snprintf(line, sizeof line, "replica set version %" PRIu64 " -> %" PRIu64, sv0, v.set_version);
     await_log_count(L, line, 1, 20000);
     await_isr(0, "plant", 4, 60000, "the learner filled from the log and joined");
+    await_batches(&w, 20, 20000); /* and the writes go on with four */
+    __atomic_store_n(&w.stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     if (w.rc != 0)
         die("a write during the fill: %s", ers(w.rc));
-    rows += (uint64_t)w.count;
+    rows += w.acked;
     rows += set_write(c, id, &t, 2, 0); /* committed by four */
     if ((uint64_t)rows_of(c, id) != rows)
         die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
@@ -12183,6 +12248,97 @@ static void scen_removereplica(void)
     rep_same_on(s, 2, want, "after a clean stop");
     printf("  server %d removed while paused: its v1 renamed and deleted once it ran again; the two others hold %" PRIu64
            " rows\n", R, rows);
+}
+
+/* removeindex: REMOVE of a member at a lower index than another (the members after it shift down, the leader's own
+ * index too when it was above) under writes: the leader's driver remaps its per-peer state (cursors, acks, the keep
+ * bound's input), so the writes go on being committed by the member that stays, which holds every row at the end.
+ * Mutant setdrvnoremap (the core remapped, the driver's peers not). */
+static void scen_removeindex(void)
+{
+    scenario("removeindex");
+    struct meta_volume v;
+    int L = set_setup(3, &v, 0), li = rep_index(&v, L), R = -1, F = -1, ri = -1;
+    for (uint32_t k = 0; k < v.nrep; k++) { /* R: the lowest index that is not the leader's; F: the other */
+        int s = server_of(v.rep[k].node);
+        if (s == L)
+            continue;
+        if (R < 0)
+            R = s, ri = (int)k;
+        else
+            F = s;
+    }
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t t = 1000;
+    uint64_t rows = set_write(c, id, &t, 3, 1);
+    await_isr(0, "plant", 3, 10000, "every replica up");
+    struct set_writer w = {.port = cports[L], .id = id, .t = 10000000};
+    pthread_t th;
+    if (pthread_create(&th, NULL, set_write_thread, &w) != 0)
+        die("pthread_create");
+    await_batches(&w, 20, 20000);
+    pause_server(R, 1);
+    await_isr(0, "plant", 2, 20000, "a replica paused");
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    await_batches(&w, 20, 20000);
+    char res[512], op[64];
+    snprintf(op, sizeof op, "remove 1 %" PRIu32, ids[R]);
+    set_op(3, op, res, sizeof res);
+    if (!strstr(res, "proposed"))
+        die("remove: %s", res);
+    struct meta_volume shr = v; /* the shrink's record: its commit point is where the paused R's ack stopped */
+    await_member(0, "plant", R, 0, 2, 10000, &v);
+    char line[160];
+    snprintf(line, sizeof line, "this is replica %d of 2", rep_index(&v, L));
+    await_log_count(L, line, 1, 20000);
+    { /* the driver carried F's own ack over to F's new index: past the shrink's commit point, which the writes after
+       * the shrink passed with F's acks alone (setdrvnoremap: R's stale ack or the leader's own empty slot) */
+        char path[PATH_MAX + 80], buf[1 << 16], pat[64];
+        snprintf(path, sizeof path, "%s/n%d.log", base, L);
+        slurp(path, buf, sizeof buf);
+        char *at = strstr(buf, "replica set version");
+        snprintf(pat, sizeof pat, "%" PRIu32 " (acked ", ids[F]);
+        char *nl = at ? strchr(at, '\n') : NULL, *q = at ? strstr(at, pat) : NULL;
+        if (!q || (nl && q > nl))
+            die("server %d's set change line names no ack for server %d: %.300s", L, F, at ? at : "(none)");
+        uint64_t ack = strtoull(q + strlen(pat), NULL, 10);
+        if (!shr.isr_commit || ack <= shr.isr_commit)
+            die("the driver carried an ack of %" PRIu64 " over for server %d, not past the shrink's commit point %" PRIu64,
+                ack, F, shr.isr_commit);
+        printf("  server %d's ack %" PRIu64 " carried over to index %d (the shrink's commit point %" PRIu64 ")\n", F,
+               ack, rep_index(&v, F), shr.isr_commit);
+    }
+    /* the stale slot of the removed member must not stand for F: F's ACKs alone carry the commit point now, and a
+     * pause of F stops it */
+    await_batches(&w, 50, 30000);
+    pause_server(F, 1);
+    usleep(300000);
+    uint64_t b0 = __atomic_load_n(&w.batches, __ATOMIC_ACQUIRE);
+    usleep(700000);
+    uint64_t b1 = __atomic_load_n(&w.batches, __ATOMIC_ACQUIRE);
+    pause_server(F, 0);
+    if (b1 != b0)
+        die("%" PRIu64 " writes were acknowledged without the one member left beside the leader", b1 - b0);
+    await_batches(&w, 50, 30000);
+    __atomic_store_n(&w.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(th, NULL);
+    if (w.rc != 0)
+        die("a write across the remove: %s", ers(w.rc));
+    rows += w.acked;
+    rows += set_write(c, id, &t, 2, 0);
+    if ((uint64_t)rows_of(c, id) != rows)
+        die("the leader reads %d rows, not %" PRIu64, rows_of(c, id), rows);
+    tsdbc_close(c);
+    pause_server(R, 0);
+    stop_all();
+    uint64_t want[REP_NAMES] = {rows, 0, 0, 0};
+    int s[2] = {L, F};
+    rep_same_on(s, 2, want, "after a clean stop");
+    printf("  index %d removed (the leader was index %d), %" PRIu64 " batches answered in 0.7 s with the member that"
+           " stays paused; %" PRIu64 " rows on the two\n", ri, li, b1 - b0,
+           rows);
 }
 
 /* resetlost: a stopped replica's v1 removed is refused at its start with a line naming `tsdb cluster replica reset`;
@@ -12437,7 +12593,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"removereplica", scen_removereplica}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
