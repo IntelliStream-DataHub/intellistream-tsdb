@@ -24,11 +24,13 @@
  * it carries the COLD out from the stage_ links jr_cold made durable); power (crashfs power loss at every step of the
  * apply: the old parts or the new set, then the apply ends with the new set); recover (a durable v5 intent with nothing
  * renamed: rolled forward; with a temporary gone: rolled back and applied again; with an own part gone: rolled back,
- * DIVERGED); recpower (crashfs power loss at every step of the open that rolls a cut apply forward: it stands).
+ * DIVERGED); recpower (crashfs power loss at every step of the open that rolls a cut apply forward: it stands);
+ * digest (r8j: the retired copies held until the DIGEST, its job file loaded at an open and MATCHED; a copy whose
+ * rows differ: DIVERGED).
  *
  * Planted bugs (--mutant NAME, ecapply.h): ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors
  * pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge
- * recnodirsync;
+ * recnodirsync; r8j's digestnocompare (ecdigest.h) fails its digest case.
  * the Makefile requires each to fail this test. An alarm ends a hung run with status 3.
  */
 #define _GNU_SOURCE
@@ -47,6 +49,8 @@
 #include "ecswap.h"
 #include "replica.h"
 #include "ppos.h"
+#include "ecdigest.h"
+#include "eckeep.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -1867,9 +1871,319 @@ static void alarm_exit(int sig)
     _exit(3);
 }
 
+/* ------------------------------------------------------------ digest: the replica's job (r8j, E26, D6-D7) */
+
+/* the names of the replica's retired copies of KEY */
+static size_t retired_names(const char *dir, char (*out)[256], size_t cap)
+{
+    char pre[64];
+    snprintf(pre, sizeof pre, "settled_p%" PRId64 "_", (int64_t)KEY);
+    size_t n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d)) != NULL)
+        if (strncmp(de->d_name, pre, strlen(pre)) == 0 && n < cap)
+            snprintf(out[n++], 256, "%s", de->d_name);
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* every retired copy of KEY in R's keep with status want (waits up to wait_ms for each) */
+static bool copies_are(rt *R, int want, int64_t wait_ms, const char *what)
+{
+    char names[8][256];
+    size_t n = retired_names(R->dir, names, 8);
+    bool ok = n >= 1;
+    for (size_t i = 0; i < n; i++) {
+        int st = eckeep_test_wait(R->db, names[i], wait_ms);
+        if (st != want) {
+            fprintf(stderr, "%s: %s has keep status %d, wanted %d\n", what, names[i], st, want);
+            ok = false;
+        }
+    }
+    if (n == 0)
+        fprintf(stderr, "%s: no retired copy of the key\n", what);
+    return ok;
+}
+
+/* a job file's flags (ECDJ_*, the u32 after magic, key and z), -1 when there is none */
+static long job_flags(const char *path)
+{
+    uint8_t b[28];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    ssize_t r = pread(fd, b, sizeof b, 0);
+    close(fd);
+    if (r != (ssize_t)sizeof b)
+        return -1;
+    uint32_t f;
+    memcpy(&f, b + 24, 4);
+    return f;
+}
+
+/* flips one byte inside the first granule of the retired copy `name` in R's directory: its checksum fails (rot) */
+static bool rot_copy(rt *R, const char *name)
+{
+    part *p = NULL;
+    if (part_open_as(R->db->dirfd, name, name + 8, false, false, &p) != 0 || p->ng == 0) {
+        if (p)
+            part_unref(p);
+        return false;
+    }
+    granule gr;
+    gx_load(p, 0, GW_LOC, &gr);
+    off_t at = (off_t)gr.off + 1;
+    part_unref(p);
+    char path[PATH_MAX + 256];
+    snprintf(path, sizeof path, "%s/%s", R->dir, name);
+    int fd = open(path, O_RDWR);
+    uint8_t c;
+    bool ok = fd >= 0 && pread(fd, &c, 1, at) == 1;
+    c ^= 0x40;
+    ok = ok && pwrite(fd, &c, 1, at) == 1 && fsync(fd) == 0;
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+/* The replica's retired copies wait for the leader's DIGEST. Modes:
+ * digest: applied through the COLD only, they are held, bound by the unarmed job file the COLD wrote (flags 0), also
+ *   across a restart (never ORPHAN); the DIGEST applied with the keep thread paused arms the job (durable before the
+ *   apply goes on), which a restart loads and digests: MATCHED (flag written), the volume not DIVERGED.
+ * digestalter: the copy's rows differ from the leader's with valid checksums (hook ecdigest_test_alter): DIVERGED and
+ *   the copies kept (mutant digestnocompare).
+ * supersede: a DIGEST of a later Z of the key arrives first (the COLD's leader was deposed before its DIGEST): the
+ *   copies are ORPHAN (released unchecked, counted undigested), never DIVERGED, also after a restart (mutants
+ *   digestanyz: they are digested against the later DIGEST; digestnosupersede: held forever).
+ * rot: one copy fails a granule checksum: ROT, counted lost, never DIVERGED (mutants digestnocrcwalk, digestrotmatches,
+ *   digestcorruptrot is the other side: a digest refused with valid checksums is DIVERGED, not rot).
+ * missing: a copy gone before the DIGEST, no match recorded: ROT, counted lost (digestrotmatches). */
+static void test_digest(void)
+{
+    static const char *const modes[] = {"digest", "digestalter", "supersede", "rot", "missing"};
+    for (int pass = 0; pass < 5; pass++) {
+        const char *what = modes[pass];
+        lt L;
+        rt R;
+        rec_reset();
+        if (!start(what, &L))
+            return;
+        make_replica(&L, &R);
+        eccold_cut c;
+        workload(&L, &c, true);
+        uint64_t last = LAST, cpos = L.x.cold_fno;
+        lstop(&L);
+        char job[64], jp[PATH_MAX + 64];
+        snprintf(job, sizeof job, "digest_%" PRId64 "_%" PRIu64, (int64_t)KEY, c.z);
+        snprintf(jp, sizeof jp, "%s/%s", R.dir, job);
+        if (ropen(&L, &R, 0) != 0) {
+            CHECK(0);
+            lclose(&L);
+            return;
+        }
+        if (pass != 1) {
+            CHECK(feed(&R, cpos) == 0); /* through the COLD, not its DIGEST */
+            CHECK(settled_of_key(R.dir) >= 1);
+            CHECK(copies_are(&R, ECKEEP_PENDING, 300, "digest: before the DIGEST"));
+            CHECK(job_flags(jp) == 0); /* bound at the COLD, unarmed */
+            rstop(&R);
+            if (ropen(&L, &R, cpos) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            CHECK(copies_are(&R, ECKEEP_PENDING, 300, "digest: held across a restart"));
+        }
+        char names[8][256];
+        size_t n = retired_names(R.dir, names, 8);
+        if (pass == 0) {
+            atomic_store(&eckeep_test_pause, true);
+            CHECK(replica_apply(R.db, last) == 0);
+            CHECK(job_flags(jp) >= 0 && (job_flags(jp) & ECDJ_ARMED)); /* durable before the apply goes on */
+            rstop(&R);
+            atomic_store(&eckeep_test_pause, false);
+            if (ropen(&L, &R, last) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            CHECK(copies_are(&R, ECKEEP_MATCHED, 20000, "digest: the job loaded at the open"));
+            CHECK(job_flags(jp) >= 0 && (job_flags(jp) & ECDJ_MATCHED));
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(p_holds(R.db) && d1_holds(R.db, true));
+            /* the release: with keep_s 0 the open of a MATCHED job releases its copies without a second digest, and
+             * the job file goes after the last one (mutant digestnojobremove) */
+            rstop(&R);
+            L.set.keep_s = 0;
+            if (ropen(&L, &R, last) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            bool gone = false;
+            for (int i = 0; i < 200 && !gone; i++) {
+                if (n)
+                    (void)eckeep_test_wait(R.db, names[0], 50);
+                gone = settled_of_key(R.dir) == 0 && access(jp, F_OK) != 0;
+                if (!gone)
+                    usleep(50000);
+            }
+            if (!gone)
+                fprintf(stderr, "digest: %d retired copies, job file %s after the release\n", settled_of_key(R.dir),
+                        access(jp, F_OK) == 0 ? "still there" : "gone");
+            CHECK(gone);
+            CHECK(eckeep_test_tries(R.db) == 0); /* released as matched: no second digest */
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(p_holds(R.db) && d1_holds(R.db, true));
+        } else if (pass == 1) {
+            atomic_store(&ecdigest_test_alter, true);
+            CHECK(feed(&R, last) == 0);
+            CHECK(access(jp, F_OK) == 0);
+            CHECK(copies_are(&R, ECKEEP_DIVERGED, 20000, "digestalter"));
+            atomic_store(&ecdigest_test_alter, false);
+            CHECK(atomic_load(&R.db->diverged));
+            CHECK(settled_of_key(R.dir) >= 1); /* kept */
+        } else if (pass == 2) {
+            /* the DIGEST of a later COLD of the key, whose expectation these copies cannot meet */
+            mk m;
+            memset(&m, 0, sizeof m);
+            m.type = MK_DIGEST;
+            m.span = 1;
+            m.u.digest = (mk_digest){.key = KEY, .z = c.z + 1, .rows = 7, .series = 3, .xxh64 = 0x5eed,
+                                     .now_ms = eng_now_ms(R.db)};
+            CHECK(ecdigest_apply(R.db, last, &m) == 0);
+            bool orphan = copies_are(&R, ECKEEP_ORPHAN, 20000, "supersede");
+            CHECK(orphan);
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(eckeep_copies_undigested(R.db) == n);
+            CHECK(job_flags(jp) >= 0 && (job_flags(jp) & ECDJ_SUPERSEDED) && !(job_flags(jp) & ECDJ_ARMED));
+            rstop(&R);
+            if (ropen(&L, &R, cpos) != 0) {
+                CHECK(0);
+                lclose(&L);
+                return;
+            }
+            CHECK(orphan && copies_are(&R, ECKEEP_ORPHAN, 20000, "supersede: after a restart"));
+            CHECK(!atomic_load(&R.db->diverged));
+        } else if (pass == 3) {
+            CHECK(n >= 1 && rot_copy(&R, names[0]));
+            uint64_t lost0 = eckeep_copies_lost(R.db);
+            CHECK(replica_apply(R.db, last) == 0); /* the log is there: appended before the restart */
+            CHECK(copies_are(&R, ECKEEP_ROT, 20000, "rot"));
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(eckeep_copies_lost(R.db) == lost0 + 1);
+        } else {
+            CHECK(n >= 1);
+            char path[PATH_MAX + 256];
+            snprintf(path, sizeof path, "%s/%s", R.dir, names[0]);
+            uint64_t lost0 = eckeep_copies_lost(R.db);
+            CHECK(unlink(path) == 0);
+            CHECK(replica_apply(R.db, last) == 0);
+            int st = eckeep_test_wait(R.db, names[0], 20000);
+            if (st != ECKEEP_ROT)
+                fprintf(stderr, "missing: %s has keep status %d, wanted %d\n", names[0], st, ECKEEP_ROT);
+            CHECK(st == ECKEEP_ROT);
+            CHECK(n < 2 || copies_are(&R, ECKEEP_ROT, 20000, "missing: the others"));
+            CHECK(!atomic_load(&R.db->diverged));
+            CHECK(eckeep_copies_lost(R.db) == lost0 + 1);
+        }
+        rstop(&R);
+        lclose(&L);
+    }
+    printf("  digest: retired copies bound at the COLD and held until the DIGEST, its job durable and loaded at an "
+           "open, MATCHED; rows that differ: DIVERGED; a later DIGEST first: ORPHAN; rot or a missing copy: ROT, "
+           "counted lost\n");
+}
+
+/* the child under crashfs (root = the replica's directory) of digestpower: the replica, applied through the COLD,
+ * applies its DIGEST with the keep thread paused (the job is armed, never run) and loses power as it exits */
+static int digest_power_child(const char *root, uint64_t last, uint64_t cpos)
+{
+    lt L;
+    lt_paths(&L, root);
+    rt R = {0};
+    snprintf(R.dir, sizeof R.dir, "%s/rep", root);
+    atomic_store(&eckeep_test_pause, true);
+    if (ropen(&L, &R, cpos) != 0)
+        _exit(2);
+    if (replica_apply(R.db, last) != 0)
+        _exit(5);
+    power_ack(root, "applied");
+    exit(0); /* the loss at exit is the shim's destructor; nothing closed, so no later sync covers the job file */
+}
+
+/* An applied DIGEST's job is durable before the apply goes on: power lost just after it, the open finds the job
+ * armed and digests it (MATCHED), never holds the copies as unarmed (mutant digestjobnosync: the file is renamed
+ * without its fdatasync, so the loss leaves it empty or torn) */
+static void test_digestpower(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  digestpower: skipped (no %s)\n", SHIM);
+        return;
+    }
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("digestpower", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload(&L, &c, true);
+    uint64_t last = LAST, cpos = L.x.cold_fno;
+    lstop(&L);
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(feed(&R, cpos) == 0);
+    rstop(&R);
+    char jp[PATH_MAX + 64];
+    snprintf(jp, sizeof jp, "%s/digest_%" PRId64 "_%" PRIu64, R.dir, (int64_t)KEY, c.z);
+    CHECK(job_flags(jp) == 0);
+    power_unack(L.root, "applied");
+    fflush(NULL);
+    char a[24], b[24];
+    snprintf(a, sizeof a, "%" PRIu64, last);
+    snprintf(b, sizeof b, "%" PRIu64, cpos);
+    char *argv[] = {"test_ecapply", S, "--digest-power-child", L.root, a, b, "--mutant", (char *)mutant, NULL};
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", R.dir, 1); /* the replica only: the stores and the ack stay as written */
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+    int st = child_status(pid);
+    CHECK(st == 99 || st == 0);
+    CHECK(power_acked(L.root, "applied"));
+    if (!power_acked(L.root, "applied"))
+        fprintf(stderr, "digestpower: the child's status %d, no ack\n", st);
+    long f = job_flags(jp);
+    if (f < 0 || !(f & ECDJ_ARMED))
+        fprintf(stderr, "digestpower: after the power loss the job file's flags are %ld\n", f);
+    CHECK(f >= 0 && (f & ECDJ_ARMED));
+    if (ropen(&L, &R, last) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(copies_are(&R, ECKEEP_MATCHED, 20000, "digestpower: the job after the power loss"));
+    CHECK(!atomic_load(&R.db->diverged));
+    rstop(&R);
+    lclose(&L);
+    printf("  digestpower: power lost just after the DIGEST's apply: its job is armed at the open and MATCHED\n");
+}
+
 int main(int argc, char **argv)
 {
-    const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL;
+    const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL, *dpower_root = NULL;
     uint64_t p_last = 0, p_cpos = 0;
     snprintf(S, sizeof S, "/tmp");
     for (int i = 1; i < argc; i++) {
@@ -1881,13 +2195,19 @@ int main(int argc, char **argv)
             power_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--recover-child") && i + 3 < argc)
             recover_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--digest-power-child") && i + 3 < argc)
+            dpower_root = argv[++i], p_last = strtoull(argv[++i], NULL, 10), p_cpos = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--leader-power-child") && i + 1 < argc)
             lpower_root = argv[++i];
         else
             snprintf(S, sizeof S, "%s", argv[i]);
     }
     if (strcmp(mutant, "none")) {
-        int m = ecapply_mutant_parse(mutant);
+        int m = ecapply_mutant_parse(mutant), dm = m < 0 ? ecdigest_mutant_parse(mutant) : -1;
+        if (dm > 0) { /* r8j's: digestskip (a replica's compare skipped) */
+            ecdigest_mutant = dm;
+            m = 0;
+        }
         if (m < 0) {
             fprintf(stderr, "test_ecapply: unknown mutant %s\n", mutant);
             return 2;
@@ -1906,6 +2226,8 @@ int main(int argc, char **argv)
         return power_child(power_root, p_last, p_cpos);
     if (lpower_root)
         return leader_power_child(lpower_root);
+    if (dpower_root)
+        return digest_power_child(dpower_root, p_last, p_cpos);
     if (recover_root)
         return recover_child(recover_root, p_cpos);
     char self[PATH_MAX];
@@ -1924,7 +2246,8 @@ int main(int argc, char **argv)
     } cases[] = {{"apply", test_apply}, {"above", test_above}, {"dropped", test_dropped}, {"merging", test_merging},
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
-                 {"recover", test_recover}, {"recpower", test_recpower}};
+                 {"recover", test_recover}, {"recpower", test_recpower}, {"digest", test_digest},
+                 {"digestpower", test_digestpower}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();

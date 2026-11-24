@@ -1523,6 +1523,10 @@ struct jr_ret_arg {
  * and waits for the last one's commit point (0 at once without a replicated backend, as on a replica); the caller
  * holds the dictionary's own append lock across it. jr_dict_series and jr_dict_state are series_dict.before_append. */
 int jr_markers(struct eng *db, const mk *m, size_t n, const char *what);
+/* jr_markers in two steps: the append (*last: the batch's last position, 0 when nothing is replicated), then the wait
+ * for its commit point, which needs none of the caller's locks (ecdigest_leader appends under ret_lock) */
+int jr_markers_append(struct eng *db, const mk *m, size_t n, const char *what, uint64_t *last);
+int jr_markers_wait(struct eng *db, uint64_t last, const char *what);
 int jr_dict_series(void *db, uint32_t id, const char *name, size_t len, int type);
 int jr_dict_state(void *db, uint32_t id, const char *name, size_t len, int type);
 /* jr_commit: a leader's JR_COMMIT records the published COMMIT in its RSTATE (replica.c; the other kinds do nothing).
@@ -2717,6 +2721,9 @@ int64_t eng_now_ms(eng *db);
 int64_t eng_retention(eng *db, uint32_t series);
 int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
 int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
+/* R8 (query.c): the rows of `series` in [start, end) of exactly parts[0 .. np), no clamp (src/ecdigest.c) */
+int eng_query_raw_parts(eng *db, part **parts, size_t np, uint32_t series, int64_t start, int64_t end, slot_fn fn,
+                        void *ctx);
 int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
 /* Replica only: the leader's RETENTION record for `series`, which has record_off in the leader's file (replica.c). */
 int eng_retention_apply(eng *db, uint32_t series, int64_t limit_ms, uint64_t record_off);

@@ -425,7 +425,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
+test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
 test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(SCRATCH)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -473,6 +473,8 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: each planted bug of a replica's digest job must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digestpower --list "digestjobnosync" -- ./$(B)/test_ecapply --case digestpower --mutant @M@ @D@) # r8j: the job file written without its fdatasync must fail it
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(SCRATCH)
@@ -480,7 +482,9 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_ecpart $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecpart --list "ecnohash ecnowalseq ecskipname ecnofno ecnolayout" -- ./$(B)/test_ecpart --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_keep $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_keep --list "digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop divergemem clearcluster releasenosync rotdiverges" -- ./$(B)/test_keep --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_ecdigest $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_ecdigest --list "digestbytes digestnotomb digestnoretention digestbelowtrue digestnots digestfreezerows digestlocalbelow" -- ./$(B)/test_ecdigest --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecskip $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecskip --list "mergeec soloec dropwaitsettle waitcountec waitnobreak waitwall waitsettle mergecountec" -- ./$(B)/test_ecskip --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_tier $(SCRATCH)
@@ -1210,7 +1214,7 @@ $(B)/test_settle: tests/test_settle.c src/internal.h $(R7_HDR) $(LIB) $(CRASHFS_
 $(B)/test_eccold: tests/test_eccold.c src/internal.h src/eccold.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_ecapply: tests/test_ecapply.c src/internal.h src/eccold.h src/ecapply.h $(R7_HDR) $(LIB)
+$(B)/test_ecapply: tests/test_ecapply.c src/internal.h src/eccold.h src/ecapply.h src/ecdigest.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # retired .ec parts and their objects (r7-gc, src/ecgc.c): holds across the deadline, the sweep at open, a store DOWN,
@@ -1222,6 +1226,11 @@ $(B)/test_ecgc: tests/test_ecgc.c src/internal.h $(R7_HDR) src/chunk_priv.h $(LI
 # settled sources (r7-keep, src/eckeep.c): the keep from the record's settle time, the digest, DIVERGED; mutants
 # digestskip digestraw digestnohold keepmtime noobjcmp openwait nolencheck orphannow nohaltstop must fail it
 $(B)/test_keep: tests/test_keep.c src/internal.h $(R7_HDR) $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# the logical digest (r8j, src/ecdigest.c): one value for the same rows in any layout; mutants digestbytes
+# digestnotomb digestnoretention must fail it
+$(B)/test_ecdigest: tests/test_ecdigest.c src/internal.h src/ecdigest.h $(R7_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # the seam of .ec parts (r7-seam, src/eccache.c): every query kind through it equals the maps, damaged cells, lost
