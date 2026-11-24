@@ -2,8 +2,9 @@
 /*
  * jepsen-cluster: a Jepsen-style run of a tsdbd cluster (docs/design-cluster.md 13.2, design-cluster-data.md 10.3).
  *
- *   jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--nemesis kill,partition,pause,midcommit,power,fwdstall]
- *                  [--workload meta,kv-local|kv|kv-via|classes] [--seed N] [--crashfs build/libcrashfs.so] [--mutant NAME]
+ *   jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--nemesis kill,partition,pause,midcommit,power,fwdstall,
+ *                  kill2,slow,longdown,rebuild,churn] [--workload meta,kv-local|kv|kv-via|classes] [--seed N]
+ *                  [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--retain-s S] [--mutant NAME]
  *
  * What it is. A runner starts 3-8 tsdbd (default 5), each a direct child with --port 0 --port-file,
  * --exit-with-parent=<this pid>, --cluster, a --state-dir and a --peer-advertise that names a proxy of this harness,
@@ -33,6 +34,22 @@
  * CRASHFS_TEAR: unsynced appends cut at a sector or ended in garbage, sectors rewritten in place old or new each,
  * which reaches the torn and unsure paths of the two-slot files (REPL, FNO, the Raft hard state); at the other half
  * CRASHFS_KEEP_OLD: the least a disk must keep, rewrites in place come back old).
+ *
+ * R4's nemeses (the R4 plan; each is refused with a line while the track it needs is not on main: `r4nem[].built`):
+ * kill2 (two servers SIGKILLed at once and restarted after 5 to 60 s: a volume may be unavailable meanwhile, and once
+ * both are back every acknowledged write must be there: a kill is not a lost disk), slow (one server's whole data root
+ * slowed for 5 to 30 s through the outagefs shim's `slow MS`, stacked with crashfs when power runs too: --outagefs),
+ * longdown (a replica of kvr down past repl_retain_s, 3 s unless --retain-s says otherwise, under writes, then back:
+ * it must take a snapshot, which shows as another inode of its v<N> (vdir_ino); the run fails when no round took one),
+ * rebuild (a stopped
+ * replica's v<N> removed, the server started, which refuses the volume, `tsdb cluster replica reset`, rebuilt by a
+ * snapshot: R4's rebuild, a lost directory; design-cluster.md 13.2's "declare a server out, add a new one" is R9's) and
+ * churn (`volume transfer` and `volume move --log` at random under the workloads, a move now and then cancelled; moves go
+ * between the nodes, so kvr keeps 3 replicas). At the end of every run with kvr: the members of the final record are the
+ * replicas compared (replicas_equal, rep_check), none is a learner, and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or
+ * `snap_*` is left on any node. R4's crash points (server/crashpt.h: snap-received, snap-swapped, set-removed,
+ * transfer-ready, move-added, move-shrunk, those that exist) are terminal points of kv and classes runs whose
+ * nemeses provide their context (nem_terminal_r4). A refused nemesis exits 2; JEPSEN_R4_TRY=1 runs it anyway.
  *
  * Workloads. meta: sampled STATUS of every node; a term has at most one leader (election safety), every node gets
  * back, every member UP after each heal, the metadata equal on every node. kv-local: per node, one writer and one
@@ -102,6 +119,7 @@
 #include "harness.h"
 #include "meta.h"
 #include "tsdb.h"
+#include "outagefs_ctl.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -155,8 +173,41 @@ static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the
 static void ju_settled(void);
 static struct meta_settings S;
 
-enum { N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32 };
-#define NNEM 6
+enum {
+    N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32,
+    N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024
+};
+#define NNEM 11
+#define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
+
+/* R4's nemeses and the tracks they need. `built`: that track is on main (flip it when it merges; the run is refused
+ * with a line until then, never skipped silently). JEPSEN_R4_TRY=1 runs a refused nemesis anyway (the track owner's
+ * first run). Their cases of crash points follow crashpt.h, not this table. */
+static const struct r4nem {
+    const char *name;
+    int bit, built;
+    const char *needs;
+} r4nem[] = {{"kill2", N_KILL2, 1, "nothing new"},
+             {"slow", N_SLOW, 1, "nothing new in tsdbd (the outagefs shim: --outagefs build/liboutagefs.so)"},
+             {"longdown", N_LONGDOWN, 0, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
+             {"rebuild", N_REBUILD, 0, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
+             {"churn", N_CHURN, 0, "r4-transfer, r4-setchg and r4-move (volume transfer, volume move --log)"}};
+#define NR4NEM ((int)(sizeof r4nem / sizeof r4nem[0]))
+static int r4_bit(const char *name)
+{
+    for (int k = 0; k < NR4NEM; k++)
+        if (!strcmp(name, r4nem[k].name))
+            return r4nem[k].bit;
+    return 0;
+}
+/* r4-replay (the replay start apart from the log start, D17): once it is on main a classes run keeps the default caps
+ * and the switches no longer wait for them (cls_defer_s 0); until then it caps repl_retain_s at CLASSES_RETAIN_S */
+#define R4_REPLAY_ON_MAIN 0
+static int opt_retain_s = -1;     /* --retain-s: repl_retain_s of the cluster (-1: as the run needs) */
+static int retain_eff;            /* the repl_retain_s the cluster is made with (0: the default caps) */
+static int cls_defer_s;           /* how long a promoted writer's class switches wait for the members' log start */
+static const char *outagefs_so;   /* --outagefs: the shim under every server (the slow nemesis) */
+static int use_outagefs;
 static int nemeses = N_KILL | N_PARTITION | N_PAUSE | N_MIDCOMMIT;
 
 static int64_t now_ns(void)
@@ -207,6 +258,7 @@ struct node {
     int64_t proc_ns; /* when the running process was forked (now_ns); the users workload tells a restart by it */
     _Atomic uint32_t id; /* member id, 0 until it joined */
     char dir[PATH_MAX + 16], log[PATH_MAX + 32];
+    char octl[PATH_MAX + 32]; /* the outagefs shim's control socket of this node (--outagefs: the slow nemesis) */
 };
 static struct node nodes[MAXN];
 static pthread_mutex_t tbl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -664,10 +716,10 @@ static int start_node(int i, const char *crash_at, int *status)
     int ne = 0;
     for (char **e = environ; *e && ne < 500; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
-            strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
+            strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "OUTAGEFS_", 9) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
             strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21))
             envp[ne++] = *e;
-    char e1[256], e2[PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64];
+    char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64];
     if (want_via) { /* kv-via: the entry node stalls its forwards while this file exists (nem_fwdstall) */
         snprintf(e5, sizeof e5, "TSDBD_TEST_FWD_STALL=%s/fwd-stall", n->dir);
         envp[ne++] = e5;
@@ -678,10 +730,19 @@ static int start_node(int i, const char *crash_at, int *status)
         snprintf(e1, sizeof e1, "TSDB_CRASH_AT=%s", crash_at);
         envp[ne++] = e1;
     }
-    if (use_crashfs) {
-        snprintf(e2, sizeof e2, "LD_PRELOAD=%s", crashfs_so);
-        snprintf(e3, sizeof e3, "CRASHFS_ROOT=%s", n->dir);
+    if (use_outagefs) { /* the slow nemesis: the node's whole directory is a domain of the shim (stacked before crashfs) */
+        snprintf(e6, sizeof e6, "OUTAGEFS_ROOTS=%s", n->dir);
+        snprintf(e7, sizeof e7, "OUTAGEFS_CTL=%s", n->octl);
+        envp[ne++] = e6;
+        envp[ne++] = e7;
+    }
+    if (use_outagefs || use_crashfs) {
+        snprintf(e2, sizeof e2, "LD_PRELOAD=%s%s%s", use_outagefs ? outagefs_so : "", use_outagefs && use_crashfs ? ":" : "",
+                 use_crashfs ? crashfs_so : "");
         envp[ne++] = e2;
+    }
+    if (use_crashfs) {
+        snprintf(e3, sizeof e3, "CRASHFS_ROOT=%s", n->dir);
         envp[ne++] = e3;
         /* a rewrite in place that never synced comes back old (KEEP_OLD), or old or new per sector and unsynced appends
          * torn (TEAR), as on a disk; crashfs's default zeroes it, which the Raft hard state's reader rightly takes for
@@ -951,7 +1012,7 @@ static int admin_real(int i, int op, const void *req, size_t rl, int follow, int
 #define SETTLE_MS 60000
 /* classes runs: the keep caps' age (repl_retain_s) and the longest quiet tail that waits for a first switch */
 #define CLASSES_RETAIN_S 30
-#define CLASSES_TAIL_MS (CLASSES_RETAIN_S * 1000 + 60000)
+#define CLASSES_TAIL_MS (cls_defer_s * 1000 + 60000)
 
 /* Every node up and answering, one leader that every core node names, every member UP, the same metadata. A node
  * stuck in a state nobody leaves is what this is for. Returns 0, or -1 with `why` naming what is not yet so. */
@@ -1743,10 +1804,87 @@ static long long classes_most(void)
     return most;
 }
 
+/* kvr's replica set as the metadata group holds it (R4: it changes under churn and a reset): the record of the copy
+ * with the highest (set_version, epoch) among the running nodes' copies. node[k] is the index of rep[k]'s node in the
+ * table (-1: not in it), learner[k] its learner flag, isr_has[k] whether it is in the ISR. 0, or -1 when no node
+ * answered or the volume is not in the copy. */
+struct rrec {
+    int nrep, node[META_REPLICAS_MAX], learner[META_REPLICAS_MAX], isr_has[META_REPLICAS_MAX], leader;
+    int moving; /* a learner with `replaces` is in the set: a move is in flight */
+    uint64_t set_version, epoch, rid[META_REPLICAS_MAX];
+    uint32_t id[META_REPLICAS_MAX];
+};
+
+static int node_by_id(uint32_t id)
+{
+    for (int i = 0; i < nn; i++)
+        if (id && atomic_load(&nodes[i].id) == id)
+            return i;
+    return -1;
+}
+
+static int rep_rec_get(struct rrec *o)
+{
+    memset(o, 0, sizeof *o);
+    o->leader = -1;
+    int have = 0;
+    for (int i = 0; i < nn; i++) {
+        pid_t pid;
+        node_snap(i, &pid, NULL, NULL);
+        struct view v;
+        if (pid <= 0 || node_paused(i) || view_get(i, &v, 2000) != 0)
+            continue;
+        for (uint32_t k = 0; k < v.m.nvolumes; k++) {
+            const struct meta_volume *mv = &v.m.volumes[k];
+            if (mv->number != rep_number || (have && (mv->set_version < o->set_version ||
+                                                      (mv->set_version == o->set_version && mv->epoch <= o->epoch))))
+                continue;
+            have = 1;
+            memset(o, 0, sizeof *o);
+            o->set_version = mv->set_version;
+            o->epoch = mv->epoch;
+            o->nrep = (int)mv->nrep;
+            o->leader = node_by_id(mv->leader);
+            for (int r = 0; r < o->nrep && r < META_REPLICAS_MAX; r++) {
+                o->id[r] = mv->rep[r].node;
+                o->node[r] = node_by_id(mv->rep[r].node);
+                o->learner[r] = mv->rep[r].learner;
+                o->rid[r] = mv->rep[r].rid;
+                o->moving |= mv->rep[r].learner && mv->rep[r].replaces;
+                for (uint32_t j = 0; j < mv->nisr; j++)
+                    o->isr_has[r] |= mv->isr[j] == mv->rep[r].node;
+            }
+        }
+        view_free(&v);
+    }
+    return have ? 0 : -1;
+}
+
+/* After churn kvr's replicas are the record's: the end check compares those (control thread only, as every user of
+ * rep_nodes and rep_dir). Only a settled record counts (3 replicas, no learner, all of them in the table). */
+static int rep_sync_members(void)
+{
+    struct rrec r;
+    if (rep_rec_get(&r) != 0 || r.nrep != 3)
+        return 0;
+    for (int k = 0; k < 3; k++)
+        if (r.learner[k] || r.node[k] < 0)
+            return 0;
+    for (int k = 0; k < 3; k++) {
+        rep_nodes[k] = r.node[k];
+        snprintf(rep_dir[k], sizeof rep_dir[k], "%s/v%" PRIu32, nodes[r.node[k]].dir, rep_number);
+    }
+    return 1;
+}
+static int r4_end_bad; /* the failures of the end checks of R4 (rep_final_check, r4_leftovers_check) */
+static int r4_dynamic; /* churn: the replica set changes, rep_isr_mask follows the record */
+
 static int rep_isr_mask(uint64_t *ver)
 {
     int mask = -1;
     *ver = 0;
+    if (r4_dynamic)
+        rep_sync_members();
     for (int i = 0; i < nn; i++) {
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
@@ -2502,19 +2640,34 @@ static int selftest_replicas(void)
 static struct {
     const char *name;
     int placed, window_ms, leader;
-} cps[] = {{"cluster-started", 1, 5000, 0},
-           {"serving", 1, 5000, 0},
-           {"wal-before-send", 1, 20000, 1},
-           {"acked-before-ok", 1, 20000, 1},
-           {"prepared-before-commit", 1, 20000, 1},
-           {"class-switch", 1, 30000, 1},
-           {"fence-saved-before-reply", 1, 30000, 2},
-           {"promote-before-epoch", 1, 30000, 2},
-           {"depose-before-reopen", 1, 30000, 2}};
-#define NCPS ((int)(sizeof cps / sizeof cps[0]))
+    char r4kind; /* R4's points (added at the start from crashpt.h's names, r4cp): which operation passes it, see nem_terminal_r4 */
+} cps[16] = {{"cluster-started", 1, 5000, 0, 0},
+           {"serving", 1, 5000, 0, 0},
+           {"wal-before-send", 1, 20000, 1, 0},
+           {"acked-before-ok", 1, 20000, 1, 0},
+           {"prepared-before-commit", 1, 20000, 1, 0},
+           {"class-switch", 1, 30000, 1, 0},
+           {"fence-saved-before-reply", 1, 30000, 2, 0},
+           {"promote-before-epoch", 1, 30000, 2, 0},
+           {"depose-before-reopen", 1, 30000, 2, 0}};
+static int ncps = 9;
+#define NCPS ncps
+/* R4's crash points by the name server/crashpt.h gives them: a point is a terminal point only when the track that
+ * placed it has added it there and a nemesis of this run provides its operation (S: a replica back after longdown or
+ * rebuild takes a snapshot, T: a planned transfer, M: a move) */
+static const struct {
+    const char *name;
+    char kind;
+} r4cp[] = {{"snap-received", 'S'}, {"snap-swapped", 'S'}, {"set-removed", 'M'},
+            {"transfer-ready", 'T'}, {"move-added", 'M'}, {"move-shrunk", 'M'}};
+static int r4_cp_ok(int k)
+{
+    char c = cps[k].r4kind;
+    return !c || (c == 'S' ? (nemeses & (N_LONGDOWN | N_REBUILD)) : (nemeses & N_CHURN));
+}
 
 static unsigned fwd_stalls_held;
-static unsigned faults[8], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
+static unsigned faults[12], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
 /* every nemesis round must show the effect it is for (a kill that reaped a SIGKILLed child, a pause that left the child
  * stopped, ...): a round that did nothing is a failed run, whatever the checks of the workloads say. */
 static int effect_seen;
@@ -2723,6 +2876,465 @@ static void nem_fwdstall(void)
     }
 }
 
+/* ------------------------------------------------------------------ R4's nemeses */
+
+static unsigned kill2_rep, kill2_done, slow_done, longdown_done, longdown_snaps, rebuild_done, rebuild_ok, churn_moves,
+    churn_transfers, churn_refused, churn_cancels, churn_landed;
+
+/* an admin op to some running node, which follows the Raft leader (the R4 ops are the leader's) */
+static int admin_any(int op, const void *req, size_t rl, int timeout_ms)
+{
+    int start = rnd_range(0, nn - 1);
+    for (int k = 0; k < nn; k++) {
+        int i = (start + k) % nn;
+        pid_t pid;
+        node_snap(i, &pid, NULL, NULL);
+        if (pid > 0 && !node_paused(i))
+            return admin_real(i, op, req, rl, 1, timeout_ms);
+    }
+    die(2, "no node is running for an admin op");
+    return -1;
+}
+
+/* The inode of node i's directory of kvr (0: none). An installed snapshot swaps v<N>.snap in for v<N> (src/snapshot.c,
+ * snap_install: rename, never a copy into the old one), so a replica that took one has another inode afterwards, and a
+ * replica that caught up from the log, was restarted or was only slowed never does. This is the evidence of a
+ * snapshot that needs no log line: the only line with "installed" in the tree is a refusal (src/snapshot.c, a staged
+ * path that is not v<N>.snap), and a successful install prints none. The old directory is removed only after the new
+ * one exists, so the two never share an inode number. */
+static unsigned long long vdir_ino(int i)
+{
+    char vd[PATH_MAX + 64];
+    struct stat sb;
+    snprintf(vd, sizeof vd, "%s/v%" PRIu32, nodes[i].dir, rep_number);
+    return stat(vd, &sb) == 0 ? (unsigned long long)sb.st_ino : 0;
+}
+
+/* kvr whole again: 3 replicas, no learner, the ISR all of them. 1, or 0 after `ms`. */
+static int rep_wait_whole(int ms)
+{
+    for (int64_t t0 = now_ms(); now_ms() - t0 < ms; usleep(300000)) {
+        check_unexpected_exits();
+        struct rrec r;
+        uint64_t ver;
+        if (rep_rec_get(&r) == 0 && r.nrep == 3 && !r.moving && !r.learner[0] && !r.learner[1] && !r.learner[2] &&
+            rep_isr_mask(&ver) == 7)
+            return 1;
+    }
+    return 0;
+}
+
+/* a replica of kvr that does not lead it (the leader's own failover is the other nemeses' business): its node */
+static int rep_follower_pick(void)
+{
+    int l = atomic_load(&kv_leader), pick[3], np = 0;
+    for (int r = 0; r < 3; r++)
+        if (rep_nodes[r] != l)
+            pick[np++] = rep_nodes[r];
+    return np ? pick[rnd_range(0, np - 1)] : -1;
+}
+
+static int hold_hi(int cap_ms) { return seconds * 200 < 5000 ? 5000 : seconds * 200 > cap_ms ? cap_ms : seconds * 200; }
+
+/* kill2: two servers SIGKILLed at once, restarted after 5 to 60 s (less in a short run). A volume may be unavailable
+ * meanwhile; once both are back every acknowledged write must be there: the checks of the workload and the end. */
+static void nem_kill2(void)
+{
+    int a = pick_node(1), b = -1;
+    /* The case this nemesis is for: two of kvr's three replicas down, so the volume has no quorum and the minority that
+     * is left holds acknowledged writes. By chance that is about a third of the rounds, so the first round of a run
+     * with kvr and every other one at even odds takes two of its replicas (counted, and required at the end). The
+     * metadata group (5 nodes) keeps its majority under any two kills. */
+    if (want_rep && (kill2_done == 0 || rnd() % 2 == 0)) {
+        int r1 = rnd_range(0, 2), r2 = (r1 + rnd_range(1, 2)) % 3;
+        a = rep_nodes[r1];
+        b = rep_nodes[r2];
+        kill2_rep++;
+    }
+    for (int t = 0; t < 8 && (b < 0 || b == a); t++)
+        b = pick_node(0);
+    if (b < 0 || b == a)
+        b = (a + rnd_range(1, nn - 1)) % nn;
+    pid_t pa, pb;
+    node_snap(a, &pa, NULL, NULL);
+    node_snap(b, &pb, NULL, NULL);
+    int planted = !strcmp(mutant, "nokill2"); /* planted: the second server is not killed */
+    signal_child(pa, SIGKILL); /* both signalled before either is reaped: at once */
+    if (!planted)
+        signal_child(pb, SIGKILL);
+    int sa = stop_node(a, SIGKILL), sb = planted ? 0 : stop_node(b, SIGKILL);
+    effect_seen = WIFSIGNALED(sa) && WTERMSIG(sa) == SIGKILL && WIFSIGNALED(sb) && WTERMSIG(sb) == SIGKILL;
+    ev("kill2: nodes %d and %d", a, b);
+    int hi = hold_hi(60000);
+    hold_ms(rnd_range(hi < 5000 ? hi : 5000, hi));
+    restart_node(a);
+    if (!planted)
+        restart_node(b);
+    kill2_done++;
+}
+
+/* The shim's answer for node i: its directory (the prefix the commands name) and the delay it is under. 0 or -1. */
+static int outage_state(int i, char *pfx, size_t pn, int *slow_ms)
+{
+    char out[1024], path[PATH_MAX];
+    int ms = -1;
+    if (outagefs_cmd(nodes[i].octl, "state", out, sizeof out) != 0 ||
+        sscanf(out, "%4095s %*s slow=%d", path, &ms) != 2)
+        return -1;
+    snprintf(pfx, pn, "%s", path);
+    *slow_ms = ms;
+    return 0;
+}
+
+/* slow: one server's data root (its state directory too: the Raft log) slowed by 10, 30 or 100 ms a call for 5 to 30 s
+ * through the shim, stacked under crashfs when power runs. The effect is read back from the shim (state: slow=MS). */
+static void nem_slow(void)
+{
+    static const int ms_tab[] = {10, 30, 100};
+    int i = pick_node(1), ms = ms_tab[rnd() % 3], cur = -1;
+    char pfx[PATH_MAX + 8], line[PATH_MAX + 64], out[512];
+    if (outage_state(i, pfx, sizeof pfx, &cur) != 0)
+        die(2, "slow: the outagefs shim of node %d does not answer on %s (the server is not under it?)", i, nodes[i].octl);
+    ju_fault(i);
+    if (strcmp(mutant, "noslow")) { /* noslow: planted, nothing is slowed */
+        snprintf(line, sizeof line, "slow %s %d", pfx, ms);
+        if (outagefs_cmd(nodes[i].octl, line, out, sizeof out) != 0)
+            die(2, "the shim refused '%s': %s", line, out);
+    }
+    effect_seen = outage_state(i, pfx, sizeof pfx, &cur) == 0 && cur == ms;
+    ev("slow: node %d by %d ms a call", i, ms);
+    int hi = hold_hi(30000);
+    int64_t ts = now_ns();
+    hold_ms(rnd_range(hi < 5000 ? hi : 5000, hi));
+    if (trace_on) { /* what the writes of the workloads cost meanwhile (JEPSEN_TRACE=1: evidence the shim slows the server) */
+        int64_t te = now_ns(), din = 0, dall = 0;
+        unsigned nin = 0, nall = 0;
+        for (int hi2 = 0; hi2 < nhists; hi2++) {
+            struct hist *h = &hists[hi2];
+            pthread_mutex_lock(&h->mu);
+            for (uint32_t id = 1; id <= h->nw; id++) {
+                const struct wr *x = &h->w[id - 1];
+                if (x->st != WS_OK || x->end == INT64_MAX)
+                    continue;
+                dall += x->end - x->begin, nall++;
+                if (x->begin >= ts && x->end <= te)
+                    din += x->end - x->begin, nin++;
+            }
+            pthread_mutex_unlock(&h->mu);
+        }
+        ev("slow: %u acknowledged writes in the window took %.2f ms on average, %u in the run so far %.2f ms", nin,
+           nin ? (double)din / nin / 1e6 : 0.0, nall, nall ? (double)dall / nall / 1e6 : 0.0);
+    }
+    snprintf(line, sizeof line, "heal %s", pfx);
+    if (outagefs_cmd(nodes[i].octl, line, out, sizeof out) != 0)
+        die(2, "the shim refused '%s': %s", line, out);
+    if (outage_state(i, pfx, sizeof pfx, &cur) != 0 || cur != 0)
+        die(2, "slow: node %d is still slowed (%d ms) after heal", i, cur);
+    slow_done++;
+}
+
+/* longdown: a replica of kvr down past repl_retain_s under writes, then back. The log it needs is gone by then: it has
+ * to take a snapshot (r4-xferinst), which the logs of the nodes show; kvr must be whole again afterwards. */
+static void nem_longdown(void)
+{
+    int i = rep_follower_pick();
+    if (i < 0)
+        return;
+    unsigned long long ino0 = vdir_ino(i);
+    int st = stop_node(i, SIGKILL);
+    effect_seen = WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
+    int retain = retain_eff > 0 ? retain_eff : 3;
+    hold_ms(retain * 1000 + rnd_range(4000, 10000));
+    restart_node(i);
+    longdown_done++;
+    if (!rep_wait_whole(120000))
+        die(1, "longdown: kvr was not whole again 120 s after node %d came back (a replica that stayed a learner: its log "
+               "was gone and no snapshot was taken?)", i);
+    unsigned long long ino1 = vdir_ino(i);
+    if (ino0 && ino1 && ino0 != ino1) {
+        longdown_snaps++;
+        ev("longdown: node %d took a snapshot (its v%" PRIu32 " was replaced)", i, rep_number);
+    } else
+        ev("longdown: node %d caught up without a snapshot (its log was still there)", i);
+}
+
+/* does node i's log, from byte `off` on, have a line with both `a` and `b` (b may be NULL)? */
+static int log_has_since(int i, long off, const char *a, const char *b)
+{
+    FILE *f = fopen(nodes[i].log, "r");
+    if (!f)
+        return 0;
+    char line[4096];
+    int found = 0;
+    if (fseek(f, off, SEEK_SET) == 0)
+        while (!found && fgets(line, sizeof line, f))
+            found = strstr(line, a) && (!b || strstr(line, b));
+    fclose(f);
+    return found;
+}
+
+static long log_size(int i)
+{
+    struct stat sb;
+    return stat(nodes[i].log, &sb) == 0 ? (long)sb.st_size : 0;
+}
+
+/* rebuild: a stopped replica's v<N> removed (a lost directory), the server started (it refuses the volume),
+ * `replica reset`, and kvr rebuilt by a snapshot. */
+static void nem_rebuild(void)
+{
+    int i = rep_follower_pick();
+    if (i < 0)
+        return;
+    uint32_t id = atomic_load(&nodes[i].id);
+    char vd[PATH_MAX + 64];
+    snprintf(vd, sizeof vd, "%s/v%" PRIu32, nodes[i].dir, rep_number);
+    int st = stop_node(i, SIGKILL);
+    effect_seen = WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
+    rmtree(vd);
+    struct stat vsb;
+    if (stat(vd, &vsb) == 0) /* the removal failed: the round would be a plain kill */
+        die(2, "rebuild: cannot remove %s", vd);
+    hold_ms(rnd_range(1500, 3000)); /* the ISR drops it (isr_lag_ms), so the reset may name it */
+    long off = log_size(i);
+    restart_node(i);
+    rebuild_done++;
+    /* The server must refuse a volume whose directory is gone, not make an empty one and rejoin (that would be a
+     * replica with no history, "rebuilt" by the leader's log alone, the thing the reset exists to avoid): after a
+     * pause for its open, no v<N> exists yet and its log has a line that names the path and does not say "made". */
+    hold_ms(3000);
+    if (stat(vd, &vsb) == 0)
+        die(1, "rebuild: node %d started with its %s removed and made it again before any `replica reset`", i, vd);
+    if (!log_has_since(i, off, vd, NULL) || log_has_since(i, off, "made ", vd))
+        die(1, "rebuild: node %d, restarted with %s removed, has no line in its log that names the path and refuses the "
+               "volume (log %s)", i, vd, nodes[i].log);
+    uint8_t body[16];
+    size_t bl = cluster_volume_force_encode(rep_number, id, body); /* RESET's body is VOLUME_FORCE's: volume, node */
+    int rc = -1;
+    for (int64_t t0 = now_ms(); now_ms() - t0 < 60000; usleep(1000000)) {
+        check_unexpected_exits();
+        rc = admin_any(CLUSTER_OP_REPLICA_RESET, body, bl, 15000);
+        if (rc == 0)
+            break;
+    }
+    if (rc != 0)
+        die(1, "rebuild: `replica reset` of volume %" PRIu32 " on node %d (member %" PRIu32 ") was refused for 60 s: %s",
+            rep_number, i, id, cluster_strerror(rc));
+    if (!rep_wait_whole(180000))
+        die(1, "rebuild: kvr was not whole again 180 s after the reset of node %d", i);
+    struct stat sb;
+    char repl[PATH_MAX + 80];
+    snprintf(repl, sizeof repl, "%s/REPL", vd);
+    if (stat(repl, &sb) != 0)
+        die(1, "rebuild: node %d has no %s after the reset: the replica was not made again", i, repl);
+    rebuild_ok++;
+}
+
+/* the end of a move: the record settled (3 replicas, no learner: done or cancelled), kvr's replicas as it names them,
+ * kvr whole */
+static void churn_finish(int from, int to)
+{
+    int64_t t0 = now_ms();
+    for (;; usleep(300000)) {
+        check_unexpected_exits();
+        struct rrec q;
+        if (rep_rec_get(&q) == 0 && q.nrep == 3 && !q.moving && !q.learner[0] && !q.learner[1] && !q.learner[2])
+            break;
+        if (now_ms() - t0 > 240000)
+            die(1, "churn: the move of kvr from node %d to node %d did not end in 240 s", from, to);
+    }
+    rep_sync_members();
+    if (!rep_wait_whole(120000))
+        die(1, "churn: kvr was not whole 120 s after a move");
+}
+
+static int churn_landed_check(int to)
+{
+    if (atomic_load(&kv_leader) != to)
+        return 0;
+    churn_landed++;
+    return 1;
+}
+
+enum { CH_ANY, CH_TRANSFER_PREF, CH_TRANSFER_ONLY, CH_MOVE_ONLY };
+
+/* One churn operation on kvr: a planned transfer to an ISR member, or a move of one replica to a node that holds none
+ * (--log; one in four is cancelled shortly after). `from_pick` >= 0 forces the node the move takes the copy from.
+ * `mode`: CH_ANY (a transfer one time in three), CH_TRANSFER_PREF, CH_TRANSFER_ONLY (-1 when no ISR member can take
+ * the lead: no move stands in for it) or CH_MOVE_ONLY (what a crash point of a move needs).
+ * Returns 1 when the operation was accepted, 0 when it was refused, -1 when it could not be made. A move is waited for:
+ * kvr whole again with 3 replicas. */
+static int churn_once(int from_pick, int mode, int wait)
+{
+    struct rrec r;
+    for (int64_t t0 = now_ms(); rep_rec_get(&r) != 0 || r.nrep < 3 || r.moving || r.leader < 0; usleep(300000))
+        if (now_ms() - t0 > 60000)
+            die(1, "churn: no settled record of kvr within 60 s (a move that never ended?)");
+    int lead = r.leader, cand[MAXN], nc = 0;
+    uint8_t body[16];
+    size_t bl;
+    int rc, accepted = 0;
+    if (mode != CH_MOVE_ONLY && (mode != CH_ANY || rnd() % 3 == 0)) {
+        for (int k = 0; k < r.nrep; k++)
+            if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0 && r.node[k] != lead)
+                cand[nc++] = k;
+        if (nc) {
+            int k = cand[rnd_range(0, nc - 1)], to = r.node[k];
+            bl = cluster_volume_force_encode(rep_number, r.id[k], body);
+            rc = admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000);
+            ev("churn: transfer of kvr to node %d: %s", to, cluster_strerror(rc));
+            if (rc != 0) {
+                churn_refused++;
+                return 0;
+            }
+            churn_transfers++;
+            for (int64_t t0 = now_ms(); wait && now_ms() - t0 < 30000 && !churn_landed_check(to); usleep(200000))
+                check_unexpected_exits();
+            return 1;
+        }
+        if (mode == CH_TRANSFER_ONLY)
+            return -1;
+    }
+    /* a move: from a member (the forced one, or any), to a node that is no replica of kvr */
+    int from = -1, to = -1, none[MAXN], nn_free = 0;
+    for (int i = 0; i < nn; i++) {
+        int in = 0;
+        for (int k = 0; k < r.nrep; k++)
+            in |= r.node[k] == i;
+        if (!in && atomic_load(&nodes[i].id))
+            none[nn_free++] = i;
+    }
+    if (!nn_free)
+        return -1;
+    to = none[rnd_range(0, nn_free - 1)];
+    from = from_pick;
+    for (int t = 0; from < 0 && t < 16; t++)
+        from = r.node[rnd_range(0, r.nrep - 1)];
+    if (from < 0)
+        return -1;
+    uint32_t fid = atomic_load(&nodes[from].id), tid = atomic_load(&nodes[to].id);
+    bl = cluster_volume_move_encode(rep_number, fid, tid, CLUSTER_MOVE_LOG, body);
+    rc = admin_any(CLUSTER_OP_VOLUME_MOVE, body, bl, 20000);
+    ev("churn: move of kvr from node %d to node %d: %s", from, to, cluster_strerror(rc));
+    if (rc != 0) {
+        churn_refused++;
+        return 0;
+    }
+    accepted = 1;
+    churn_moves++;
+    if (wait && rnd() % 4 == 0) { /* cancelled before A is removed, or too late: either way the move ends */
+        hold_ms(rnd_range(300, 2000));
+        bl = cluster_volume_move_encode(rep_number, fid, tid, CLUSTER_MOVE_LOG | CLUSTER_MOVE_CANCEL, body);
+        rc = admin_any(CLUSTER_OP_VOLUME_MOVE, body, bl, 20000);
+        ev("churn: cancel of the move: %s", cluster_strerror(rc));
+        churn_cancels += rc == 0;
+    }
+    if (wait)
+        churn_finish(from, to);
+    return accepted;
+}
+
+static void nem_churn(void)
+{
+    /* an operation the server refuses at a moment (a target still catching up) is tried again for 20 s; one that is
+     * refused all that time, with kvr settled, is a round that did nothing and fails the run like any idle nemesis */
+    int acc = 0;
+    for (int64_t t0 = now_ms(); acc <= 0 && now_ms() - t0 < 20000; ) {
+        acc = churn_once(-1, CH_ANY, 1);
+        if (acc <= 0)
+            hold_ms(1000);
+    }
+    effect_seen = acc > 0;
+}
+
+/* An R4 crash point as the run's terminal point (server/crashpt.h names it; cps[].r4kind says which operation passes
+ * it): every node is armed at its first start behind the trigger file, and the run does what makes the point happen once
+ * the trigger exists: 'S' (a snapshot's receiver: snap-received, snap-swapped) a replica of kvr down past the caps and
+ * back, 'T' (transfer-ready) a planned transfer, 'M' (a move: move-added, move-shrunk, set-removed) a move. A node that
+ * ends there (status 99) is restarted and the operation finishes: kvr must be whole after it. */
+static void nem_terminal_r4(void)
+{
+    const char *nm = cps[term_cp].name;
+    char kind = cps[term_cp].r4kind;
+    int win = cps[term_cp].window_ms, victim = -1, accepted = 1;
+    if (kind == 'S') {
+        for (int64_t tv = now_ms(); (victim = rep_follower_pick()) < 0 && now_ms() - tv < 30000; )
+            hold_ms(500);
+        if (victim < 0)
+            die(2, "%s: no replica of kvr to take down in 30 s", nm);
+        stop_node(victim, SIGKILL);
+        hold_ms((retain_eff > 0 ? retain_eff : 3) * 1000 + rnd_range(4000, 10000));
+    }
+    int fd = open(term_trigger, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+        die(2, "create %s: %s", term_trigger, strerror(errno));
+    close(fd);
+    if (kind == 'S') {
+        if (victim >= 0)
+            restart_node(victim);
+    } else {
+        /* the operation the point belongs to, tried for 30 s with the trigger there (a target that is not ready, a
+         * refusal at the moment): one that could not be made at all is the harness's, never a point that did not fire */
+        accepted = 0;
+        for (int64_t ta = now_ms(); accepted <= 0 && now_ms() - ta < 30000; ) {
+            accepted = churn_once(strstr(nm, "set-removed") ? rep_follower_pick() : -1,
+                                  kind == 'T' ? CH_TRANSFER_ONLY : CH_MOVE_ONLY, 0);
+            if (accepted <= 0)
+                hold_ms(1000);
+        }
+        if (accepted < 0)
+            die(2, "%s: no %s could be made in 30 s (no ISR member to take the lead, no free node or member)", nm,
+                kind == 'T' ? "transfer" : "move");
+    }
+    int ended[MAXN] = {0}, nend = 0;
+    int64_t t0 = now_ms(), first = -1;
+    for (;;) {
+        for (int i = 0; i < nn; i++) {
+            pid_t pid;
+            node_snap(i, &pid, NULL, NULL);
+            if (pid <= 0 || ended[i])
+                continue;
+            int st = await_exit(i, 0);
+            if (st == -1)
+                continue;
+            if (!(WIFEXITED(st) && WEXITSTATUS(st) == CRASH_EXIT_STATUS))
+                die(1, "node %d ended with status 0x%x with %s triggered, not at the point (log %s)", i, st, nm,
+                    nodes[i].log);
+            ended[i] = 1;
+            nend++;
+            if (first < 0) {
+                first = now_ms();
+                unlink(term_trigger); /* before the next node passes the point */
+            }
+        }
+        if ((first >= 0 && now_ms() - first >= 1000) || now_ms() - t0 >= win)
+            break;
+        usleep(20000);
+    }
+    if (first < 0) {
+        unlink(term_trigger);
+        cp_unfired++;
+        snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired within %d ms of its trigger (%s)", nm,
+                 win, accepted ? "the operation was accepted" : "the operation was refused");
+    } else {
+        cp_hits += (unsigned)nend;
+        cp_hits_serving += (unsigned)nend;
+        term_fired = 1;
+        printf("jepsen-cluster: terminal crash point %s: %d node(s) ended there\n", nm, nend);
+    }
+    effect_seen = 1;
+    term_done = 1;
+    hold_ms(rnd_range(200, 800));
+    for (int i = 0; i < nn; i++)
+        if (ended[i])
+            restart_node(i);
+    if (kind == 'S') {
+        if (!rep_wait_whole(180000))
+            die(1, "%s: kvr was not whole 180 s after the replica came back", nm);
+    } else
+        churn_finish(-1, -1);
+}
+
 static void nem_midcommit(void)
 {
     int pick;
@@ -2780,11 +3392,15 @@ static void nem_midcommit(void)
  * the nodes come back, and the run goes on with the volume led wherever the group put it. */
 static void nem_terminal(void)
 {
+    if (cps[term_cp].r4kind) {
+        nem_terminal_r4();
+        return;
+    }
     int L = atomic_load(&kv_leader), fo = cps[term_cp].leader == 2, win = cps[term_cp].window_ms;
     /* a leader promoted shortly before decides no switch until the members' log start passes its attach, up to
      * CLASSES_RETAIN_S later (CLS_DEFER; r3e-fix16: 2 of 13 runs fired 28 and 34 s after the trigger) */
     if (want_classes && !strcmp(cps[term_cp].name, "class-switch"))
-        win += CLASSES_RETAIN_S * 1000;
+        win += cls_defer_s * 1000;
     if (fo) {
         /* a failover needs another ISR member to promote: a leader that is the ISR alone (the others not yet back
          * after the faults before) is only cut, and the point never fires (seed 12103 epoll) */
@@ -2864,6 +3480,103 @@ static void nem_terminal(void)
     for (int i = 0; i < nn; i++)
         if (ended[i] || (first < 0 && !fo && i == L))
             restart_node(i);
+}
+
+/* The end checks of R4 (kvr, before the nodes are stopped): the replicas are those of the final record, none of them is
+ * a learner, and nothing a snapshot, a swap or a removed replica leaves behind is still on any node: v<N>.snap,
+ * v<N>.old, v<N>.removed-<rid> (its background delete ran; v<N>.lost-<rid> is never deleted by design) and snap_* (the
+ * source's makes), in a node's directory or in v<N>. Returns the failures. */
+static int rep_final_check(void)
+{
+    struct rrec r;
+    int bad = 0;
+    if (rep_rec_get(&r) != 0) {
+        fprintf(stderr, "jepsen-cluster: FAIL: no node answered with kvr's record at the end\n");
+        return 1;
+    }
+    for (int k = 0; k < r.nrep; k++)
+        if (r.learner[k]) {
+            fprintf(stderr, "jepsen-cluster: FAIL: the replica on node %d is still a learner of kvr at the end\n", r.node[k]);
+            bad++;
+        }
+    if (r.nrep != 3) {
+        fprintf(stderr, "jepsen-cluster: FAIL: kvr has %d replicas at the end, not 3\n", r.nrep);
+        bad++;
+    }
+    if (!bad && r4_dynamic)
+        rep_sync_members(); /* the replicas to compare: the final record's */
+    return bad;
+}
+
+static int r4_leftover_name(const char *nm)
+{
+    if (!strncmp(nm, "snap_", 5))
+        return 1;
+    if (nm[0] != 'v' || nm[1] < '0' || nm[1] > '9')
+        return 0;
+    const char *p = nm + 1;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    return !strcmp(p, ".snap") || !strcmp(p, ".old") || !strncmp(p, ".removed-", 9);
+}
+
+/* "v<digits>" exactly: a volume's directory */
+static int r4_is_vdir(const char *nm)
+{
+    if (nm[0] != 'v' || nm[1] < '0' || nm[1] > '9')
+        return 0;
+    const char *p = nm + 1;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    return !*p;
+}
+
+/* leftovers in one directory; 1 + the number of the v<N> directories inside it, which the caller scans in turn */
+static int r4_scan_dir(const char *where, int node, int say, int depth)
+{
+    DIR *d = opendir(where);
+    if (!d)
+        return 0;
+    int bad = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (r4_leftover_name(e->d_name)) {
+            if (say)
+                fprintf(stderr, "jepsen-cluster: FAIL: %s/%s is left on node %d\n", where, e->d_name, node);
+            bad++;
+        } else if (depth == 0 && r4_is_vdir(e->d_name)) { /* every replicated volume, not kvr's only */
+            char sub[PATH_MAX + 300];
+            snprintf(sub, sizeof sub, "%s/%s", where, e->d_name);
+            bad += r4_scan_dir(sub, node, say, 1);
+        }
+    }
+    closedir(d);
+    return bad;
+}
+
+static int r4_leftovers_once(int say)
+{
+    int bad = 0;
+    for (int i = 0; i < nn; i++)
+        bad += r4_scan_dir(nodes[i].dir, i, say, 0);
+    return bad;
+}
+
+static int r4_leftovers_check(void)
+{
+    char pd[PATH_MAX + 96];
+    if (!strcmp(mutant, "plant-snap-left")) { /* planted: a snapshot directory nobody removed */
+        snprintf(pd, sizeof pd, "%s/v%" PRIu32 ".snap", nodes[0].dir, rep_number);
+        mkdir(pd, 0755);
+    }
+    if (!strcmp(mutant, "plant-removed-left")) { /* planted: a removed replica's directory nobody deleted */
+        snprintf(pd, sizeof pd, "%s/v%" PRIu32 ".removed-77", nodes[1].dir, rep_number);
+        mkdir(pd, 0755);
+    }
+    int64_t t0 = now_ms();
+    while (r4_leftovers_once(0) && now_ms() - t0 < 30000) /* the background delete and the sweeps take their time */
+        usleep(500000);
+    return r4_leftovers_once(1);
 }
 
 static unsigned leader_cuts, leader_replaced, delays_applied;
@@ -3010,8 +3723,8 @@ static int cluster_form(void)
      * CLASSES_TAIL_MS). Shorter caps strand a member that fell further behind than them: it needs a snapshot, which
      * is not built yet (r3e-fix14: 3 s left a learner behind in 4 of 13 runs, a partition-only run among them;
      * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
-    if (want_classes)
-        S.repl_retain_s = CLASSES_RETAIN_S;
+    if (retain_eff > 0) /* --retain-s, longdown's 3 s, classes' CLASSES_RETAIN_S until r4-replay (main sets it) */
+        S.repl_retain_s = (uint32_t)retain_eff;
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
     int rc = admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
@@ -3220,8 +3933,10 @@ static int selftest_checker(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
-                    "         [--nemesis kill,partition,pause,midcommit,power,fwdstall] [--workload meta,kv-local|kv|kv-via|classes|users] [--auth]\n"
-                    "         [--crashfs build/libcrashfs.so] [--mutant NAME] | --selftest-replicas | --selftest-checker\n");
+                    "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn]\n"
+                    "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
+                    "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
+                    "         | --selftest-replicas | --selftest-checker | --built-nemeses\n");
     exit(2);
 }
 
@@ -3237,6 +3952,13 @@ int main(int argc, char **argv)
             self_checker = 1;
         else if (!strcmp(k, "--auth"))
             want_auth = 1;
+        else if (!strcmp(k, "--built-nemeses")) { /* R4's nemeses that can run now (the Makefile's loops take them from here) */
+            for (int j = 0; j < NR4NEM; j++)
+                if (r4nem[j].built || getenv("JEPSEN_R4_TRY"))
+                    printf("%s%s", j ? " " : "", r4nem[j].name);
+            printf("\n");
+            return 0;
+        }
         else if (a + 1 >= argc)
             usage();
         else if (!strcmp(k, "--dir"))
@@ -3249,6 +3971,10 @@ int main(int argc, char **argv)
             seed = strtoull(argv[++a], NULL, 10);
         else if (!strcmp(k, "--crashfs"))
             crashfs_so = argv[++a];
+        else if (!strcmp(k, "--outagefs"))
+            outagefs_so = argv[++a];
+        else if (!strcmp(k, "--retain-s"))
+            opt_retain_s = atoi(argv[++a]);
         else if (!strcmp(k, "--mutant"))
             mutant = argv[++a];
         else if (!strcmp(k, "--nemesis") || !strcmp(k, "--workload")) {
@@ -3272,6 +3998,8 @@ int main(int argc, char **argv)
                     nemeses |= N_POWER;
                 else if (nem && !strcmp(t, "fwdstall"))
                     nemeses |= N_FWDSTALL;
+                else if (nem && r4_bit(t))
+                    nemeses |= r4_bit(t);
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -3314,7 +4042,39 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen-cluster: the fwdstall nemesis needs the workload kv-via\n");
         return 2;
     }
+    for (int k = 0; k < NR4NEM; k++) {
+        if (!(nemeses & r4nem[k].bit))
+            continue;
+        if (!r4nem[k].built && !getenv("JEPSEN_R4_TRY")) {
+            fprintf(stderr, "jepsen-cluster: the %s nemesis needs %s, which is not on main yet (r4nem[].built in "
+                            "tests/jepsen/jepsen_cluster.c; JEPSEN_R4_TRY=1 runs it anyway)\n", r4nem[k].name, r4nem[k].needs);
+            return 2;
+        }
+        if ((r4nem[k].bit & N_R4_KV) && !want_rep) {
+            fprintf(stderr, "jepsen-cluster: the %s nemesis works on kvr: it needs the workload kv, kv-via or classes\n",
+                    r4nem[k].name);
+            return 2;
+        }
+    }
+    if ((nemeses & N_SLOW) && !outagefs_so) {
+        fprintf(stderr, "jepsen-cluster: the slow nemesis needs --outagefs build/liboutagefs.so\n");
+        return 2;
+    }
+    if (opt_retain_s == 0 || opt_retain_s > 100000) {
+        fprintf(stderr, "jepsen-cluster: --retain-s is 1 to 100000\n");
+        return 2;
+    }
     use_crashfs = (nemeses & N_POWER) != 0;
+    use_outagefs = (nemeses & N_SLOW) != 0;
+    r4_dynamic = (nemeses & N_CHURN) != 0;
+    /* repl_retain_s: --retain-s; longdown 3 s (a replica down for longer needs a snapshot); a classes run until r4-replay
+     * is on main the age that lets the class switches' deferral pass (CLASSES_RETAIN_S); else the cluster's default */
+    retain_eff = opt_retain_s > 0 ? opt_retain_s : (nemeses & N_LONGDOWN) ? 3 : (want_classes && !R4_REPLAY_ON_MAIN) ? CLASSES_RETAIN_S : 0;
+    cls_defer_s = want_classes && !R4_REPLAY_ON_MAIN ? (retain_eff > 0 ? retain_eff : 1800) : 0;
+    for (int k = 0; k < (int)(sizeof r4cp / sizeof r4cp[0]) && ncps < 16; k++)
+        for (int j = 0; j < CRASH_POINT_COUNT; j++)
+            if (!strcmp(r4cp[k].name, crash_point_names[j]))
+                cps[ncps++] = (typeof(cps[0])){r4cp[k].name, 1, 90000, 3, r4cp[k].kind};
     rng_state = mix(seed * 0x2545f4914f6cdd1dULL + 7);
 
     mkdir(opt_dir, 0755);
@@ -3343,6 +4103,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < nn; i++) {
         snprintf(nodes[i].dir, sizeof nodes[i].dir, "%s/n%d", rundir, i);
         snprintf(nodes[i].log, sizeof nodes[i].log, "%s/n%d.log", rundir, i);
+        snprintf(nodes[i].octl, sizeof nodes[i].octl, "%s/n%d.octl", rundir, i);
+        if (use_outagefs && strlen(nodes[i].octl) >= sizeof((struct sockaddr_un){0}.sun_path))
+            die(2, "the outagefs control socket path %s is too long for a unix socket (use a shorter --dir)", nodes[i].octl);
         char st[PATH_MAX + 16];
         snprintf(st, sizeof st, "%s/state", nodes[i].dir);
         if (mkdir(nodes[i].dir, 0755) != 0 || mkdir(st, 0755) != 0)
@@ -3353,7 +4116,7 @@ int main(int argc, char **argv)
     if (want_rep && (nemeses & N_MIDCOMMIT) && strcmp(mutant, "unfired")) {
         int cand[NCPS], nc = 0;
         for (int k = 0; k < NCPS; k++)
-            if (cps[k].placed && cps[k].leader && (want_classes || strcmp(cps[k].name, "class-switch")))
+            if (cps[k].placed && cps[k].leader && r4_cp_ok(k) && (want_classes || strcmp(cps[k].name, "class-switch")))
                 cand[nc++] = k;
         term_cp = cand[rnd() % (uint64_t)nc];
         const char *want_cp = getenv("JEPSEN_TERMINAL"); /* a point by name, to try one (the run's seed picks otherwise) */
@@ -3425,13 +4188,22 @@ int main(int argc, char **argv)
         case N_MIDCOMMIT: faults[3]++; nem_midcommit(); break;
         case N_POWER: faults[4]++; nem_power(); break;
         case N_FWDSTALL: faults[5]++; nem_fwdstall(); break;
+        case N_KILL2: faults[6]++; nem_kill2(); break;
+        case N_SLOW: faults[7]++; nem_slow(); break;
+        case N_LONGDOWN: faults[8]++; nem_longdown(); break;
+        case N_REBUILD: faults[9]++; nem_rebuild(); break;
+        case N_CHURN: faults[10]++; nem_churn(); break;
         }
         if (!effect_seen)
             die(1, "the %s nemesis (round %u) had no effect: nothing was killed, stopped, cut, delayed or crashed",
                 kind == N_KILL ? "kill" : kind == N_PARTITION ? "partition" : kind == N_PAUSE ? "pause" :
-                kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : "power", rounds);
+                kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : kind == N_KILL2 ? "kill2" :
+                kind == N_SLOW ? "slow" : kind == N_LONGDOWN ? "longdown" : kind == N_REBUILD ? "rebuild" :
+                kind == N_CHURN ? "churn" : "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
-               kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : "a power loss");
+               kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
+               kind == N_SLOW ? "a slow disk" : kind == N_LONGDOWN ? "a long outage" : kind == N_REBUILD ? "a rebuild" :
+               kind == N_CHURN ? "a transfer or move" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -3493,6 +4265,10 @@ int main(int argc, char **argv)
                 hold_ms(2000);
             }
         }
+        if (want_rep) {
+            r4_end_bad += rep_final_check();
+            r4_end_bad += r4_leftovers_check();
+        }
         for (int i = 0; i < nhists; i++)
             kv_final(i);
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
@@ -3542,12 +4318,19 @@ int main(int argc, char **argv)
     }
     atomic_store(&stopping, 1);
 
-    unsigned total_faults = faults[0] + faults[1] + faults[2] + faults[3] + faults[4] + faults[5];
+    unsigned total_faults = 0;
+    for (int k = 0; k < 11; k++)
+        total_faults += faults[k];
     printf("faults applied: kill %u, partition %u (cuts applied %d%s), pause %u, midcommit %u (crash points hit %u, %u of them while serving, "
            "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses); restarts %u, rounds %u\n",
            faults[0], faults[1], partitions_applied, partitions_planted_noop ? ", PLANTED NO-OP" : "", faults[2],
            faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses, restarts,
            rounds);
+    if (nemeses & (N_KILL2 | N_SLOW | N_R4_KV))
+        printf("r4: kill2 %u rounds (%u took two of kvr's replicas), slow %u, longdown %u (%u of them with a snapshot installed), "
+               "rebuild %u (%u rebuilt), churn %u (%u moves, %u transfers accepted of which %u landed, %u cancels, %u refused)\n",
+               kill2_done, kill2_rep, slow_done, longdown_done, longdown_snaps, rebuild_done,
+               rebuild_ok, faults[10], churn_moves, churn_transfers, churn_landed, churn_cancels, churn_refused);
     if (use_crashfs)
         printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_REWRITE=old\n",
                (uint64_t)atomic_load(&crashfs_starts), (uint64_t)atomic_load(&crashfs_tears));
@@ -3601,8 +4384,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen-cluster: FAIL: %s\n", unfired_msg);
         rc = 1;
     }
-    if (unclean || rdiff)
+    if (unclean || rdiff || r4_end_bad)
         rc = 1;
+    if ((nemeses & N_KILL2) && want_rep && kill2_done >= 1 && !kill2_rep) {
+        fprintf(stderr, "jepsen-cluster: FAIL: %u kill2 round(s) and none took two of kvr's replicas\n", kill2_done);
+        rc = 1;
+    }
+    if ((nemeses & N_LONGDOWN) && longdown_done >= 1 && !longdown_snaps) { /* a coverage miss, like an idle nemesis */
+        fprintf(stderr, "jepsen-cluster: FAIL: %u longdown round(s) (a replica down past repl_retain_s %d) and none took a "
+                        "snapshot (the directory of its volume was never replaced): every one caught up from the log, "
+                        "which tests nothing of R4\n", longdown_done, retain_eff > 0 ? retain_eff : 3);
+        rc = 1;
+    }
+    if ((nemeses & N_CHURN) && churn_transfers >= 3 && !churn_landed) {
+        fprintf(stderr, "jepsen-cluster: FAIL: %u planned transfers accepted and the leadership of kvr never reached the "
+                        "named member\n", churn_transfers);
+        rc = 1;
+    }
+    if ((nemeses & N_CHURN) && faults[10] >= 3 && !churn_moves && !churn_transfers) {
+        fprintf(stderr, "jepsen-cluster: FAIL: %u churn rounds and no transfer or move was accepted (%u refused)\n",
+                faults[10], churn_refused);
+        rc = 1;
+    }
     if ((want_kv || want_rep) && (!atomic_load(&kv_ok) || !nreads)) { /* nothing to check is no evidence */
         fprintf(stderr, "jepsen-cluster: FAIL: the workload did nothing: %" PRIu64 " writes acknowledged, %" PRIu64
                 " reads\n", (uint64_t)atomic_load(&kv_ok), nreads);
