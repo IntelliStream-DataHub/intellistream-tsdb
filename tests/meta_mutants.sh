@@ -16,9 +16,13 @@ fi
 bin=$1
 shift
 # 36 userstaleok, 37 uidfromproposer, 38 nousersbudget, 39 noactorguard; R4's replica set: 40 setvernoraise,
-# 41 setverraiseisr, 42 resetinisr, 43 resetleader, 44 twomoves, 45 replacesstays, 46 moveslotlast, 47 targetnotisr,
-# 48 targetleader, 49 targetignored
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49}
+# 41 setverraiseisr, 42 resetinisr, 43 resetleader, 44 twomoves, 45 replacesstays, 46 moveslotlast, 48 targetleader,
+# 49 targetignored. 47 targetnotisr is left out: it is equivalent since r4-transfer. A planned grant's target outside
+# the ISR is refused twice in meta.c: by the check MUT(47) removes and by promote_rule, whose repl_meta_promote_to
+# counts replies only from ISR members and picks the target or nobody (REPL_E_NONE), both META_ERR_INVALID with the
+# state untouched. The one trace left is which refusal names a grant at the epoch limit (RANGE before INVALID), an
+# order nothing relies on. The check stays as a guard should the rule change; `--mutant 47` still plants it.
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -34,8 +38,8 @@ if [ -n "$part" ]; then
 fi
 [ -n "${muts// /}" ] || exit 0 # a part with none
 # the mutants the simulator's checker catches without the unit stage (measured: with it off 8 of the 17 are caught;
-# R4's 40-47 all, by meta_check_step or the per-op check of the replica set's version and a reset)
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 47 "
+# R4's 40-46 all, by meta_check_step or the per-op check of the replica set's version and a reset)
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac

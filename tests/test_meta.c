@@ -725,7 +725,8 @@ static void test_replica_set(void)
         uint32_t f34[2] = {3, 4}, a34[2] = {3, 4};
         struct meta_grant g = promo_grant(v, 2, 4, f34, 2, a34, 2, 200, 0);
         g.reason = META_GR_PLANNED;
-        g.target = 2; /* not in the ISR (mutant targetnotisr) */
+        /* not in the ISR (mutant targetnotisr, equivalent since r4-transfer: promote_rule refuses it too) */
+        g.target = 2;
         g.min_end = 14;
         meta_op_volume_leader(&e, &g);
         g.target = 4;
