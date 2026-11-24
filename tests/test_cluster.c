@@ -611,6 +611,7 @@ static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to thi
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
+static uint32_t init_idle_seal_ms; /* nonzero: INIT's idle_seal_ms */
 
 /* INIT on server i with fast timings (down after 1.5 s, a dead voter replaced after replace_s); it leads */
 static void init_mode(int i, uint32_t replace_s, int mode)
@@ -623,6 +624,8 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.repl_retain_s = init_retain_s;
     if (init_isr_lag_ms)
         s.isr_lag_ms = init_isr_lag_ms;
+    if (init_idle_seal_ms)
+        s.idle_seal_ms = init_idle_seal_ms;
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
     s.heartbeat_ms = 200;
     s.voter_replace_s = replace_s;
@@ -12190,9 +12193,15 @@ static void scen_resetlost(void)
 {
     scenario("resetlost");
     struct meta_volume v;
+    /* no flush (5 s apart by default) and no idle seal (which flushes an idle memtable): the leader drops a flushed
+     * segment once every member acknowledged it. OPEN (checkpoint 3): the segment of position 1 (the leader's open
+     * marker alone) still goes, so the fresh replica is told it needs a snapshot (r4-xferinst) and never joins */
+    init_idle_seal_ms = 3600000;
+    for (int i = 0; i < 3; i++)
+        xargs[i] = "--flush-interval-ms 3600000";
     int L = set_setup(3, &v), R = (L + 1) % 3;
-    tsdbc *c = client(L); /* no flush: the leader keeps position 1, so a fresh replica fills from the log (the snapshot
-                           * path is r4-xferinst's: addsnap) */
+    init_idle_seal_ms = 0;
+    tsdbc *c = client(L);
     tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
     int64_t t = 1000;
     uint64_t rows = set_write(c, id, &t, 3, 0);
