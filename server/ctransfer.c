@@ -79,7 +79,7 @@ static uint64_t g_last_balance; /* the last balance start */
 static atomic_ulong n_started, n_done, n_timedout, n_cancelled, n_fallback, n_balance;
 
 enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL, CTM_DROPPROPOSED,
-       CTM_ADMINSELF, CTM_ADMINISR, CTM_ADMINUP, CTM_ADMINBUSY };
+       CTM_ADMINSELF, CTM_ADMINISR, CTM_ADMINUP, CTM_ADMINBUSY, CTM_NOBUSY, CTM_NOGAP };
 /* TSDB_CLUSTER_MUTANT's names of this file (cluster.c's parser knows none of them) */
 static int ctr_mutant(void)
 {
@@ -97,6 +97,8 @@ static int ctr_mutant(void)
             : !strcmp(e, "adminisr")           ? CTM_ADMINISR
             : !strcmp(e, "adminup")            ? CTM_ADMINUP
             : !strcmp(e, "adminbusy")          ? CTM_ADMINBUSY
+            : !strcmp(e, "balancenobusy")      ? CTM_NOBUSY
+            : !strcmp(e, "balancenogap")       ? CTM_NOGAP
                                                : CTM_NONE;
         if (m != CTM_NONE)
             cl_say("MUTANT %s (tests only)", e);
@@ -245,8 +247,8 @@ static struct ctr *tr_start(const struct meta_volume *v, uint32_t node, int bala
     atomic_fetch_add_explicit(&n_started, 1, memory_order_relaxed);
     if (balance) /* STATUS: of those started, by leader balance */
         atomic_fetch_add_explicit(&n_balance, 1, memory_order_relaxed);
-    cl_say("volume %" PRIu32 ": %s transfer from node %" PRIu32 " to node %" PRIu32 " at epoch %" PRIu64,
-           v->number, balance ? "leader balance:" : "", v->leader, node, v->epoch);
+    cl_say("volume %" PRIu32 ": %s transfer from node %" PRIu32 " to node %" PRIu32 " at epoch %" PRIu64 " (t=%" PRIu64
+           " ms)", v->number, balance ? "leader balance:" : "", v->leader, node, v->epoch, now / MS);
     send_cmd(CL_VOLCMD_TRANSFER, v->leader, v->number, v->epoch, node, t->id);
     return t;
 }
@@ -449,7 +451,7 @@ static void balance(uint64_t now)
         }
     }
     if (!hold_s || cl_leader_age_ns(now) < (uint64_t)cl_lease_ms() * MS ||
-        (g_last_balance && since(now, g_last_balance) < BALANCE_GAP_NS))
+        (g_last_balance && since(now, g_last_balance) < BALANCE_GAP_NS && ctr_mutant() != CTM_NOGAP))
         return;
     for (uint32_t i = 0; i < sm->nvolumes; i++) {
         const struct meta_volume *v = &sm->volumes[i];
@@ -470,8 +472,9 @@ static void balance(uint64_t now)
                 b = &g_back[j];
         if (b && now < b->until)
             continue;
-        const char *no = busy_server(pref) || busy_server(v->leader) ? "a transfer of its server is under way"
-                                                                       : tr_check(v, pref, now);
+        int busy = ctr_mutant() != CTM_NOBUSY && (busy_server(pref) || busy_server(v->leader));
+        const char *no = busy ? "a transfer of its server is under way"
+                         : tr_check(v, pref, now);
         if (no) {
             if (no != c->why)
                 cl_say("leader balance: volume %" PRIu32 " stays on node %" PRIu32 " for now: %s", v->number,

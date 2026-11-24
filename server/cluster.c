@@ -1132,6 +1132,10 @@ static struct {
                           * oneway: an old leader that hears nothing of its deposition, but still heartbeats and gets
                           * leases) */
     char dropfencefile[1100];
+    int drop_hb;         /* TSDB_CLUSTER_TEST drop_hb_file=1: while <state-dir>/drophb is, a heartbeat received from the node
+                          * it names (a decimal id) is dropped unanswered (test_cluster balancehb: a one-way cut of one
+                          * member's heartbeats from the Raft leader, its data links untouched) */
+    char drophbfile[1100];
     int lose_ready;      /* TSDB_CLUSTER_TEST lose_ready_file=1: while <state-dir>/loseready is, a READY received is dropped
                           * and a timed-out transfer's CANCEL is not sent (both lost on the link: test_cluster
                           * transferstale, a volume leader holding a READY its Raft leader no longer knows) */
@@ -1417,6 +1421,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "drop_hb_file=%llu", &v) == 1)
+            C.drop_hb = v != 0;
         else if (sscanf(p, "hold_grant_ms=%llu", &v) == 1)
             C.hold_grant_ms = v;
         else if (sscanf(p, "lose_ready_file=%llu", &v) == 1)
@@ -3517,6 +3523,21 @@ static void on_raft(struct conn *c, struct rd *r)
 
 static int promo_holds_lease(uint32_t node);
 
+/* TSDB_CLUSTER_TEST drop_hb_file: the node <state-dir>/drophb names, 0 while the file is not there */
+static uint32_t hb_dropped_node(void)
+{
+    if (!C.drop_hb)
+        return 0;
+    FILE *f = fopen(C.drophbfile, "r");
+    unsigned long n = 0;
+    if (f) {
+        if (fscanf(f, "%lu", &n) != 1)
+            n = 0;
+        fclose(f);
+    }
+    return (uint32_t)n;
+}
+
 static void on_hb(struct conn *c, struct rd *r)
 {
     uint32_t node = get32(r);
@@ -3528,6 +3549,8 @@ static void on_hb(struct conn *c, struct rd *r)
         c->dead = r->bad;
         return;
     }
+    if (C.drop_hb && hb_dropped_node() == node)
+        return;
     uint64_t now = iso_now_ns();
     heard_set(node, now, inc, applied, addr, peer);
     struct heard *h = heard_get(node);
@@ -6819,6 +6842,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
+    snprintf(C.drophbfile, sizeof C.drophbfile, "%s/drophb", C.metadir);
     snprintf(C.losereadyfile, sizeof C.losereadyfile, "%s/loseready", C.metadir);
     snprintf(C.holdreplyfile, sizeof C.holdreplyfile, "%s/holdreply", C.metadir);
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);

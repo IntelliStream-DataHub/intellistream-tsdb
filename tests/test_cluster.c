@@ -13710,10 +13710,15 @@ static void scen_balance(void)
 
 /* balancetwo: leader_balance_s 5, four volumes on three members, so two of them prefer one node P. P killed (both fail
  * over), restarted: both lead on P again, one after the other (one transfer per server at a time, D15): in the Raft
- * leader's log the second balance transfer to P starts only after the first one's answer. */
+ * leader's log the second balance transfer to P starts only after the first one's answer, and 1 s or more after the
+ * first one's start. The first drain is held 1.5 s (TSDB_REPLD_TEST=drainhold), longer than that gap, so the one
+ * transfer per server is checked on its own (mutant balancenobusy); BT_NOHOLD=1 leaves the drains alone, so the second
+ * start waits only for the gap (balancenogap). */
 static void scen_balancetwo(void)
 {
     scenario("balancetwo");
+    for (int i = 0; i < 3; i++)
+        penv[i] = "TSDB_REPLD_TEST=drainhold";
     init_leader_balance_s = 5;
     for (int i = 0; i < 3; i++)
         start(i);
@@ -13761,9 +13766,33 @@ static void scen_balancetwo(void)
                 die("no failover of %s 30 s after node %u was killed", nm[ab[q]], pn);
         await_isr(via, nm[ab[q]], 2, 30000, "the killed preferred leader out of the ISR");
     }
+    char hold[3][PATH_MAX + 40];
+    int held = !getenv("BT_NOHOLD"); /* BT_NOHOLD=1: transfers at their own pace, so the gap is what spaces them */
+    for (int i = 0; held && i < 3; i++) { /* the first balance transfer drains 1.5 s: longer than the gap */
+        snprintf(hold[i], sizeof hold[i], "%s/n%d/drainhold", base, i);
+        FILE *fp = i == P ? NULL : fopen(hold[i], "w");
+        if (i != P && (!fp || fclose(fp) != 0))
+            die("write %s: %s", hold[i], strerror(errno));
+    }
     start(P);
     for (int q = 0; q < 2; q++)
         await_isr(via, nm[ab[q]], 3, 60000, "the preferred leader back in the ISR");
+    char bal_s[64];
+    snprintf(bal_s, sizeof bal_s, "leader balance: transfer from node");
+    for (uint64_t t0 = now_ms(); held; usleep(20000)) {
+        int n = 0;
+        for (int i = 0; i < 3; i++)
+            n += i != P && log_count(i, bal_s) > 0;
+        if (n)
+            break;
+        if (now_ms() - t0 > 20000)
+            die("balancetwo: no balance transfer to node %u 20 s after its return", pn);
+    }
+    if (held)
+        usleep(1500000);
+    for (int i = 0; held && i < 3; i++)
+        if (i != P && unlink(hold[i]) != 0)
+            die("unlink %s: %s", hold[i], strerror(errno));
     uint64_t tj = now_ms(), back[2] = {0, 0};
     while ((!back[0] || !back[1]) && now_ms() - tj < 20000) {
         for (int q = 0; q < 2; q++) {
@@ -13776,7 +13805,7 @@ static void scen_balancetwo(void)
     if (!back[0] || !back[1])
         die("balancetwo: %s and %s do not both lead on node %u 20 s after its return (%" PRIu64 ", %" PRIu64 " ms)",
             nm[a], nm[b], pn, back[0], back[1]);
-    /* the order on the Raft leader that ran both: start, answer, start, answer */
+    /* the order on the Raft leader that ran both: start, answer, start, answer, the starts 1 s apart or more */
     char start_s[64], done_s[64];
     snprintf(start_s, sizeof start_s, "leader balance: transfer from node");
     snprintf(done_s, sizeof done_s, ": transfer to node %u: node %u leads", pn, pn);
@@ -13788,6 +13817,7 @@ static void scen_balancetwo(void)
         snprintf(path, sizeof path, "%s/n%d.log", base, i);
         FILE *f = fopen(path, "r");
         int running = 0, n = 0;
+        unsigned long long tlast = 0;
         while (f && fgets(line, sizeof line, f)) {
             if (strstr(line, start_s) && strstr(line, "to node") ) {
                 char to[32];
@@ -13797,7 +13827,14 @@ static void scen_balancetwo(void)
                 if (running)
                     die("balancetwo: server %d started a second balance transfer to node %u before the first one "
                         "answered: %s", i, pn, line);
-                running = 1, n++;
+                const char *ts = strstr(line, "(t=");
+                unsigned long long t = 0;
+                if (!ts || sscanf(ts, "(t=%llu ms)", &t) != 1)
+                    die("balancetwo: no time in %s", line);
+                if (n && t - tlast < 1000)
+                    die("balancetwo: server %d started two balance transfers %llu ms apart, less than the 1 s gap: %s",
+                        i, t - tlast, line);
+                tlast = t, running = 1, n++;
             } else if (strstr(line, done_s))
                 running = 0;
         }
@@ -13891,6 +13928,104 @@ static void scen_balancecut(void)
         die("balancecut: of %" PRIu64 " balance transfers %" PRIu64 " done and %" PRIu64 " counted as failed", bal, done,
             failed);
     state_flag(P, "dropfence", 0);
+    stop_all();
+}
+
+/* balancehb: leader_balance_s 5, a volume moved away from its preferred leader P, then P's heartbeats to the Raft
+ * leader cut and healed again and again (TSDB_CLUSTER_TEST drop_hb_file on the Raft leader: 4 s cut, 3 s healed, or
+ * BH_CUT_MS, BH_HEAL_MS; P's data links untouched, so it stays in the ISR and answers fences). The Raft leader must see
+ * P other than UP in the cuts, and over 60 s at most 2 balance transfers start and P takes the lead at most twice (no
+ * back-and-forth every leader_balance_s). A balance never starts while P is not UP, and a cut does not depose a P that
+ * leads (its fence answers and data go on), so one transfer in a healed window ends it. balanceflap is caught by
+ * balancecut, where every transfer fails. */
+static void scen_balancehb(void)
+{
+    scenario("balancehb");
+    for (int i = 0; i < 3; i++)
+        envs[i] = "drop_hb_file=1";
+    init_leader_balance_s = 5;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    init_leader_balance_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    static const char *nm[3] = {"bh0", "bh1", "bh2"};
+    struct meta_volume v[3];
+    int k = -1;
+    for (int j = 0; j < 3; j++) {
+        uint32_t num;
+        int rc = vol_add(0, nm[j], 3, &num);
+        if (rc != 0)
+            die("volume add %s: %s", nm[j], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, nm[j], i, 1, 0);
+        await_isr(0, nm[j], 3, 30000, "every replica in the ISR");
+        for (uint64_t t0 = now_ms(); !vol_rec(0, nm[j], &v[j]) || v[j].leader != v[j].rep[0].node; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("%s is not led by its preferred leader", nm[j]);
+        if (k < 0 && server_of(v[j].rep[0].node) != 0) /* server 0 leads the metadata group: P is another */
+            k = j;
+    }
+    if (k < 0)
+        die("balancehb: every volume prefers the Raft leader's node");
+    uint32_t pn = v[k].rep[0].node;
+    int P = server_of(pn), Q = P == 1 ? 2 : 1;
+    char why[256];
+    int rc = tr_transfer(v[k].number, ids[Q], why, sizeof why);
+    if (rc != 0)
+        die("balancehb: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
+    char f[PATH_MAX + 64];
+    server_dir(0, f, sizeof f);
+    strcat(f, "/state/drophb");
+    uint64_t b0 = 0;
+    for (int i = 0; i < 3; i++)
+        b0 += tr_count(i, CL_TR_BALANCE);
+    uint64_t t0 = now_ms();
+    uint32_t last = ids[Q], moves = 0, led = 0, downs = 0;
+    int cut = 0;
+    uint64_t flip = 0, cut_ms = getenv("BH_CUT_MS") ? strtoull(getenv("BH_CUT_MS"), 0, 10) : 4000,
+             heal_ms = getenv("BH_HEAL_MS") ? strtoull(getenv("BH_HEAL_MS"), 0, 10) : 3000;
+    while (now_ms() - t0 < 60000) {
+        if (now_ms() >= flip) {
+            cut = !cut;
+            if (cut) {
+                FILE *fp = fopen(f, "w");
+                if (!fp || fprintf(fp, "%u\n", pn) < 0 || fclose(fp) != 0)
+                    die("write %s: %s", f, strerror(errno));
+            } else if (unlink(f) != 0)
+                die("unlink %s: %s", f, strerror(errno));
+            flip = now_ms() + (cut ? cut_ms : heal_ms);
+        }
+        struct view lv;
+        view(0, &lv);
+        const struct meta_member *mm = meta_member(&lv.m, pn);
+        downs += cut && mm && mm->state != META_UP;
+        view_free(&lv);
+        struct meta_volume x;
+        if (vol_rec(0, nm[k], &x) && x.leader && x.leader != last) {
+            moves++;
+            led += x.leader == pn;
+            last = x.leader;
+        }
+        usleep(100000);
+    }
+    if (cut && unlink(f) != 0)
+        die("unlink %s: %s", f, strerror(errno));
+    uint64_t bal = 0;
+    for (int i = 0; i < 3; i++)
+        bal += tr_count(i, CL_TR_BALANCE);
+    bal -= b0;
+    printf("  %s with node %u's heartbeats cut %" PRIu64 " ms of every %" PRIu64 ": seen not UP %u times, %" PRIu64
+           " balance transfers in 60 s, %u leader changes, %u to node %u\n", nm[k], pn, cut_ms, cut_ms + heal_ms, downs,
+           bal, moves, led, pn);
+    if (!downs)
+        die("balancehb: the Raft leader never saw node %u other than UP: the cut did not take", pn);
+    if (bal > 2 || led > 2)
+        die("balancehb: %" PRIu64 " balance transfers to node %u in 60 s and %u leader changes to it: the volume "
+            "follows the flap", bal, pn, led);
     stop_all();
 }
 
@@ -14114,7 +14249,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

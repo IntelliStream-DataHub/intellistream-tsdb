@@ -19,6 +19,16 @@ a cluster made before this change is initialised again, not upgraded (as for eve
 member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised
 again.
 
+**Planned leader transfer and leader balance (R4, r4-transfer).** `tsdb cluster volume transfer` moves a volume's lead
+to a member of its ISR: the leader drains (writes answer UNAVAILABLE PROMOTING, retry after 50 ms), says READY to the
+metadata group's leader, and a promotion of that member alone follows; with `leader_balance_s` set, a volume moves back
+to its preferred leader (its first replica) once that member has been in the ISR that long, one transfer per server
+and one start a second, with a backoff after each failed one. The reply of `CLUSTER_OP_STATUS` has, after
+`users_caught_up`, a u32 count and that many u64 transfer counters (`CL_TR_*` in `server/cluster.h`: started, done, timed
+out, cancelled, fallen back to failover, by balance, drains timed out, records admitted blind, READYs, replica cuts), and each volume line of `tsdb cluster status` names its `preferred`
+leader: a `tsdb cluster status` of an earlier build fails to decode a newer server's reply. Tests: `test_cluster
+transfer*`, `balance*`, `make transfer-mutants`.
+
 **Replica set changes in the replication core (R4, r4-core; the core and its simulator only, nothing drives them in
 tsdbd yet).** `src/repl.[ch]`: `repl_reconfig` (a member added, removed or reset under a running core; refused with
 `REPL_E_PENDING` while actions are queued, `REPL_E_INVALID` for a deposed leader), the replica set version in every

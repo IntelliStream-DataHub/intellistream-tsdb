@@ -16,7 +16,8 @@
 # adminself, adminbusy, adminup, adminisr (the admin accepts the current leader, a second transfer of a volume, a member
 # that is not up, one outside the ISR) transferadmin; transfernotarget (the drain ends on the commit point alone, which
 # moves on without a target that left the ISR) transferlag; transferredrain (a TRANSFER resent after its drain timed out
-# drains again) transferslow.
+# drains again) transferslow; balancenobusy (two balance transfers of one server at once: the first one's drain held
+# 1.5 s) and balancenogap (balance starts less than 1 s apart, with BT_NOHOLD=1) balancetwo.
 # Usage: tests/transfer_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
@@ -30,6 +31,8 @@ scenario() {
     transferadmit) s=transfer v=TSDB_REPLD_MUTANT ;;
     transferresume) s=transferhold v=TSDB_REPLD_MUTANT ;;
     balanceflap) s=balancecut ;;
+    balancenobusy) s=balancetwo ;;
+    balancenogap) s=balancetwo x=BT_NOHOLD=1 ;;
     nocancel) s=transferraftdrain ;;
     readypinned) s=transferraftkill v=TSDB_REPLD_MUTANT x=TSDB_CLUSTER_MUTANT=nocancel ;;
     readynocancel) s=transferstale ;;
@@ -46,7 +49,7 @@ if [ "${1:-}" = --mutant-run ]; then
     exit
 fi
 dir=${1:-/tmp}; shift || true
-muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed adminself adminbusy adminup adminisr transfernotarget transferredrain}
+muts=${*:-transfernodrain transferadmit transferresume transferanycand transferfewreplies balanceflap nocancel readynocancel readypinned dropproposed adminself adminbusy adminup adminisr transfernotarget transferredrain balancenobusy balancenogap}
 # a mutant is caught by any failure of its scenario; MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
 exec "$(dirname "$0")/../tools/mutants.sh" --name transfer --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" \
     --detail FAIL --list "$muts" -- "$0" --mutant-run @M@ @D@
