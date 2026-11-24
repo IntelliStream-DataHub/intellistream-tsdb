@@ -87,7 +87,9 @@ enum {
 #define PL_BULK_CHUNK (256u << 10)    /* default chunk of a file */
 #define PL_META_MAX 4096              /* the opaque meta of a bulk file */
 #define PL_QUEUE_BYTES (8u << 20)     /* default queue bound per link */
-/* TODO(r3d-stream): the bulk rate is a node-wide cap shared by every bulk link; wire it to a setting. */
+/* The bulk rate is a node-wide cap per kind: every bulk link of one kind shares a token bucket, and each kind has its
+ * own (R4 D7: kind 5's snapshots never hold kind 2's COMMIT files). peerlink_set_bulk_rate sets the rate of every kind
+ * without one of its own (peerlink_set_kind_rate). */
 #define PL_BULK_RATE_DEFAULT (256ull << 20)
 #define PL_RATE_UNLIMITED (~0ull)
 
@@ -144,6 +146,9 @@ struct peerlink *peerlink_new(const struct pl_cfg *cfg);
 /* Stops every link, joins their threads and frees everything (a pending bulk job is completed with PL_E_CLOSED). */
 void peerlink_free(struct peerlink *pl);
 void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);
+/* The rate of one data kind's bucket (bytes/s; 0: the peerlink's rate, PL_RATE_UNLIMITED: none); PL_E_INVALID for a
+ * kind that is not a data kind */
+int peerlink_set_kind_rate(struct peerlink *pl, int kind, uint64_t bytes_per_s);
 
 /* A link to `addr` (host:port, the peer's peer port), persistent. want_id: the node id the peer must answer as (0:
  * any). The result lives until peerlink_free. */
@@ -298,6 +303,7 @@ enum {
     PL_MUT_KINDSHARED = 13,     /* a FWD link is the LOG link's socket to that peer */
     PL_MUT_WBWRITTEN = 14,      /* at a cut, every tracked frame in the write buffer is reported written */
     PL_MUT_PAUSEDEAD = 15,      /* a paused link keeps its dead_ms check and PINGs only when it hears nothing */
+    PL_MUT_KINDBUCKET = 16,     /* every kind shares one bucket at the peerlink's rate (no per-kind rate) */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
