@@ -12484,14 +12484,25 @@ static void scen_ecadd(void)
             *(Cs < 0 ? &Cs : &B) = server_of(f.rep[k].node);
     if (Lv < 0 || Cs < 0 || B < 0)
         die("e42: leader %u", f.leader);
-    await_isr(Lv, "e42", 3, 30000, "every replica of e42 in the ISR");
-    /* the leader drops a replica from the ISR once a record it sent goes unanswered: a write after the cut */
+    /* the server restarted above holds a replica of e42 too: right after the add the record's ISR still names all
+     * three while the leader may already have asked to drop that one until it catches up (seen in a NO_EC run: the
+     * write after the cut then met an ISR of one). So a row first, held by both other replicas, then the ISR. */
     tsdbc *c = client(Lv);
     tsdb_sid sid = rep_series(c, rep_names[0], "e42", 30000);
+    int64_t ts = 999000;
+    float val = 0;
+    if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
+        die("a write to e42 with every replica up: %s", ers(rc));
+    for (uint64_t t1 = now_ms(); rows_in(Cs, sid, ts, ts, 30000) != 1 || rows_in(B, sid, ts, ts, 30000) != 1;
+         usleep(50000))
+        if (now_ms() - t1 > 30000)
+            die("servers %d and %d do not both hold the row written to e42 with every replica up", Cs, B);
+    await_isr(Lv, "e42", 3, 30000, "every replica of e42 in the ISR");
+    /* the leader drops a replica from the ISR once a record it sent goes unanswered: a write after the cut */
     cut_file(Lv, Cs, 1);
     cut_file(Cs, Lv, 1);
-    int64_t ts = 1000000;
-    float val = 1;
+    ts = 1000000;
+    val = 1;
     if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
         die("a write to e42 with a replica cut off: %s", ers(rc));
     tsdbc_close(c);
