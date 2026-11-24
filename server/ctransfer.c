@@ -60,6 +60,7 @@ struct cvs {
     uint32_t vol, node;
     uint64_t isr_since;
     int cancel_owed;
+    const char *why; /* the balance's last reason not to move it back, said once */
 };
 static struct cvs *g_cv;
 static uint32_t g_ncv, g_ccv;
@@ -404,8 +405,13 @@ static void balance(uint64_t now)
         if (c->node != pref || !meta_volume_in_isr(v, pref))
             c->isr_since = 0;
         c->node = pref;
-        if (meta_volume_in_isr(v, pref) && !c->isr_since)
+        if (meta_volume_in_isr(v, pref) && !c->isr_since) {
             c->isr_since = now;
+            if (hold_s && v->leader && v->leader != pref)
+                cl_say("leader balance: volume %" PRIu32 ": node %" PRIu32 " in the ISR (version %" PRIu64
+                       "), led by node %" PRIu32 ": moves back after %" PRIu32 " s", v->number, pref,
+                       (uint64_t)v->isr_version, v->leader, hold_s);
+        }
     }
     if (!hold_s || cl_leader_age_ns(now) < (uint64_t)cl_lease_ms() * MS ||
         (g_last_balance && since(now, g_last_balance) < BALANCE_GAP_NS))
@@ -420,7 +426,7 @@ static void balance(uint64_t now)
         int learner = 0;
         for (uint32_t j = 0; j < v->nrep; j++)
             learner |= v->rep[j].learner || v->rep[j].replaces;
-        const struct cvs *c = cv_get(v->number);
+        struct cvs *c = cv_get(v->number);
         if (learner || (!flap && (!c->isr_since || since(now, c->isr_since) < (uint64_t)hold_s * 1000 * MS)))
             continue;
         const struct cback *b = NULL;
@@ -429,8 +435,16 @@ static void balance(uint64_t now)
                 b = &g_back[j];
         if (b && now < b->until)
             continue;
-        if (busy_server(pref) || busy_server(v->leader) || tr_check(v, pref, now))
+        const char *no = busy_server(pref) || busy_server(v->leader) ? "a transfer of its server is under way"
+                                                                       : tr_check(v, pref, now);
+        if (no) {
+            if (no != c->why)
+                cl_say("leader balance: volume %" PRIu32 " stays on node %" PRIu32 " for now: %s", v->number,
+                       v->leader, no);
+            c->why = no;
             continue;
+        }
+        c->why = NULL;
         tr_start(v, pref, 1, now);
         g_last_balance = now;
         return;

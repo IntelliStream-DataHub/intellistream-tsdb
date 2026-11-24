@@ -12257,6 +12257,17 @@ static void tr_setup(struct tr_run *x)
             die("pthread_create");
     usleep(300000);
 }
+/* the rows server c itself answers (no retries set on c): -1 while it refuses (MOVED, UNAVAILABLE) */
+static int tr_rows_here(tsdbc *c, tsdb_sid id)
+{
+    nrows = 0;
+    int rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, count_rows, NULL);
+    if (rc == TSDB_ERR_MOVED || rc == TSDB_ERR_UNAVAILABLE)
+        return -1;
+    if (rc != 0)
+        die("query: %s", ers(rc));
+    return nrows;
+}
 /* the writers stopped, every server stopped cleanly, the rows checked; the writers' records freed */
 static void tr_finish(struct tr_run *x, const char *what, int indet_ok)
 {
@@ -12278,11 +12289,13 @@ static void tr_finish(struct tr_run *x, const char *what, int indet_ok)
     for (int k = 0; k < REP_NAMES; k++) {
         int want = rows_of(c, x->w[k].id);
         for (int i = 0; i < 3; i++) {
+            /* no retries: a MOVED followed to the leader would count the leader's rows as server i's (transferkill:
+             * the restarted server, without a lease yet, was stopped before its tail came) */
             tsdbc *r = client(i);
-            tsdbc_set_retry(r, 30000);
+            tsdbc_set_retry(r, 0);
             uint64_t t0 = now_ms();
             int got;
-            while ((got = rows_of(r, x->w[k].id)) != want)
+            while ((got = tr_rows_here(r, x->w[k].id)) != want)
                 if (now_ms() - t0 > 30000)
                     die("%s: server %d reads %d rows of %s 30 s after the writers stopped, the leader %d", what, i,
                         got, rep_names[k], want);
@@ -12441,6 +12454,7 @@ static void tr_kill(int ready)
             usleep(20000);
     pthread_join(th, NULL);
     penv[L] = NULL;
+    await_isr(via, "tv", 2, 30000, "the killed leader out of the ISR"); /* else the ISR of 3 below is the grant's */
     start(L);
     await_isr(via, "tv", 3, 60000, "the killed leader back in the ISR");
     tr_await_acks(&x, now_ms(), "after the killed leader came back");
@@ -12539,6 +12553,9 @@ static void tr_balance(int on)
             die("no failover of tv 30 s after its leader was killed");
         else
             usleep(20000);
+    /* the promotion's grant keeps the ISR of 3 until the new leader drops the dead member: without this wait the ISR
+     * of 3 below is the old one, and the 10 s would count P's restart and rejoin as well */
+    await_isr(via, "tv", 2, 30000, "the killed preferred leader out of the ISR");
     start(P);
     await_isr(via, "tv", 3, 60000, "the preferred leader back in the ISR");
     uint64_t tj = now_ms();
@@ -12555,6 +12572,18 @@ static void tr_balance(int on)
             v.rep[0].node, a.leader);
     if (!on && back)
         die("leader_balance_s 0: node %u leads tv again after its return", v.rep[0].node);
+    if (on && getenv("TR_DEBUG")) {
+        for (int i = 0; i < 3; i++)
+            printf("  server %d: started %" PRIu64 " done %" PRIu64 " timed out %" PRIu64 " cancelled %" PRIu64
+                   " fell back %" PRIu64 " drains timed out %" PRIu64 "\n", i, tr_count(i, CL_TR_STARTED),
+                   tr_count(i, CL_TR_DONE), tr_count(i, CL_TR_TIMEDOUT), tr_count(i, CL_TR_CANCELLED),
+                   tr_count(i, CL_TR_FALLBACK), tr_count(i, CL_TR_DRAIN_TIMEDOUT));
+        char cmd[PATH_MAX + 200];
+        snprintf(cmd, sizeof cmd, "grep -H 'balance\\|transfer\\|drain\\|READY\\|CANCEL' %s/n*.log | cut -c1-240",
+                 base);
+        if (system(cmd) < 0)
+            perror("system");
+    }
     if (on)
         printf("  the preferred leader leads tv again %" PRIu64 " ms after its return to the ISR\n", now_ms() - tj);
     else
