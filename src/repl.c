@@ -449,8 +449,9 @@ static void on_append(struct repl *r, const struct repl_msg *m)
      * in parts here, and a record of them is skipped. A new leader's driver sends a member it has not heard from yet
      * its log from the start (repld catch_up: its cursor at 0); judged by a history that starts higher, a member
      * filled by a snapshot stopped for good (jepsen-cluster churn: "the log differs ... below the verified end";
-     * MUT(59) judges them again). */
-    if (!MUT(30) && m->prev_pos && (m->prev_pos >= r->start || MUT(59)) && epoch_at(r, m->prev_pos) != m->prev_epoch) {
+     * MUT(59) judges them again; MUT(32) skips the record AT the start, MUT(33) the prev_pos at it). */
+    if (!MUT(30) && m->prev_pos && (MUT(33) ? m->prev_pos > r->start : m->prev_pos >= r->start || MUT(59)) &&
+        epoch_at(r, m->prev_pos) != m->prev_epoch) {
         fail_differs(r, m, m->prev_pos, m->prev_epoch);
         return;
     }
@@ -459,7 +460,7 @@ static void on_append(struct repl *r, const struct repl_msg *m)
         const struct repl_rec *rec = &m->rec[i];
         if (rec->pos <= r->written) {
             /* One leader per epoch writes each position once: the same epoch here is the same record. */
-            if (epoch_at(r, rec->pos) == rec->epoch || (rec->pos < r->start && !MUT(59)))
+            if (epoch_at(r, rec->pos) == rec->epoch || (rec->pos < r->start + MUT(32) && !MUT(59)))
                 continue;
             fail_differs(r, m, rec->pos, rec->epoch);
             return;
