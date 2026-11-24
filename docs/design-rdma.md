@@ -513,7 +513,49 @@ are not measured here yet. Options, to be measured with `link-bench --mac` in th
 | BLAKE3 keyed | several GB/s per core with AVX2/AVX-512 (to measure) | CC0/Apache-2.0 reference code with SIMD kernels; fits `src/levels.h` style dispatch |
 | Poly1305 with a per-frame key from ChaCha20 | 1-2 GB/s in portable 64-bit C (to measure) | no SIMD needed, small code |
 
-Default proposal: the fastest that keeps a 128-bit tag and a keyed construction, negotiated in HELLO (a new cluster
+**Measured (rd-mac, 2026-11-24)**: `link-bench mac` (tools/mac_cands.c; `tools/rdma-bench.sh --only mac` on the test
+servers) tags frames in memory on one core: payload MB/s, mean of 3 runs (lowest-highest), built `-O3` without
+`-march` as `make dist` builds (each kernel picks its instructions at run time). Every candidate is checked against
+known answers first (Python's `hmac`, the `cryptography` package, BLAKE3's own vectors). The input of each tag is
+peerlink's: sequence number, type, payload; GMAC and Poly1305 take sequence number and type as their nonce.
+
+| MAC (tag bytes) | frame | Xeon E5-2697 v4 (test servers: AVX2, no SHA-NI) | i5-13400 (build machine: SHA-NI) | Ryzen 9 7950X (dev: AVX-512, SHA-NI) |
+|---|---|---:|---:|---:|
+| HMAC-SHA256, portable (32), today | 64 B | 71 (71-71) | 99 (99-99) | 132 (132-132) |
+| | 1 KiB | 207 (207-207) | 285 (284-286) | 390 (388-391) |
+| | 16 KiB | 235 (235-235) | 324 (323-326) | 446 (444-447) |
+| | 1 MiB | 234 (234-234) | 320 (320-321) | 451 (451-452) |
+| HMAC-SHA256, SHA-NI (32) | 64 B | not on this CPU | 387 (385-392) | 502 (502-503) |
+| | 1 KiB | | 1,573 (1,571-1,576) | 2,111 (2,101-2,118) |
+| | 16 KiB | | 1,960 (1,960-1,960) | 2,678 (2,676-2,680) |
+| | 1 MiB | | 1,991 (1,991-1,992) | 2,723 (2,722-2,724) |
+| **AES-128-GMAC** (16) | 64 B | **739 (639-789)** | **1,445 (1,440-1,448)** | **1,576 (1,574-1,578)** |
+| | 1 KiB | **5,312 (5,300-5,333)** | **8,782 (8,756-8,812)** | **8,127 (8,108-8,144)** |
+| | 16 KiB | **7,331 (7,301-7,379)** | **11,033 (10,986-11,067)** | **10,348 (10,280-10,476)** |
+| | 1 MiB | **7,540 (7,516-7,559)** | **11,297 (11,282-11,307)** | **10,469 (10,446-10,500)** |
+| Poly1305, ChaCha20 per-frame key (16) | 64 B | 329 (329-329) | 409 (409-410) | 475 (473-476) |
+| | 1 KiB | 1,465 (1,464-1,465) | 1,782 (1,780-1,784) | 1,574 (1,572-1,576) |
+| | 16 KiB | 1,870 (1,870-1,871) | 2,243 (2,231-2,251) | 1,824 (1,813-1,831) |
+| | 1 MiB | 1,908 (1,908-1,909) | 2,290 (2,266-2,314) | 1,853 (1,850-1,856) |
+| BLAKE3 keyed (16 of its output) | 64 B | 334 (332-335) | 403 (400-405) | 537 (535-538) |
+| | 1 KiB | 766 (766-767) | 889 (889-890) | 1,158 (1,157-1,158) |
+| | 16 KiB | 1,436 (1,435-1,436) | 1,739 (1,704-1,760) | 2,788 (2,785-2,790) |
+| | 1 MiB | 2,603 (2,600-2,607) | 3,261 (3,134-3,353) | 8,595 (8,581-8,603) |
+
+The second test server gave the same numbers within 1% (its 64 B GMAC 789). The build machine ran beside other jobs
+(load about 2 on 16 threads); its hybrid cores make the spread of BLAKE3's 1 MiB row.
+
+**The choice: AES-128-GMAC** (`server/plmac.c`). It is the fastest at every frame size on all three CPUs: on the test
+servers 32 times today's HMAC at 1 MiB (7.5 GB/s per core, more than a 40GbE link carries) and 26 times at 1 KiB,
+where BLAKE3 needs whole 1 KiB chunks in parallel to use its SIMD width and Poly1305 pays a ChaCha20 block per frame.
+SHA-NI would not help the test servers at all and is 4-5 times slower than GMAC where it exists. AES-NI and
+PCLMULQDQ are in every x86-64-v2 CPU tsdb's tarball runs on in practice (Westmere and later), but not in the v2 level
+itself, so the kernel is picked at run time and a CPU without them is refused at start. GMAC's one hazard is a nonce
+used twice under one key: the nonce is the frame's sequence number and type, the key is per connection and direction
+(derived from both sides' handshake nonces), so a sequence number is never reused under a key unless the counter
+wraps, which peerlink refuses (2^64 frames).
+
+Default proposal (before the measurements): the fastest that keeps a 128-bit tag and a keyed construction, negotiated in HELLO (a new cluster
 version: before 1.0 no compatibility promise, design-cluster-data.md E40). If production's CPUs have SHA extensions,
 dispatching HMAC-SHA256 to them is the cheapest first step and changes no protocol. Whatever is chosen, one link's
 MAC runs on one core per side (§4 "CPU with the MAC"): line rate on one link needs about 6 GB/s per core, which no

@@ -62,3 +62,6 @@ AS offer the contribution under other terms too: that is what keeps the dual lic
 The libraries tsdb links keep their own licences (zstd BSD/GPLv2, liburing MIT/LGPL, the Rust and Java
 dependencies): [`docs/licenses.md`](docs/licenses.md) lists each one, and the packages carry their notices
 (`THIRD-PARTY-NOTICES`).
+
+`tools/blake3/` is an unchanged copy of BLAKE3's reference C (CC0-1.0 OR Apache-2.0, `tools/blake3/UPSTREAM`), built
+only into the benchmark `link-bench` (`link-bench mac`), never into tsdbd, the engine or a package.

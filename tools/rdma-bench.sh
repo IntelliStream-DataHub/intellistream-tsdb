@@ -20,7 +20,9 @@
 # on InfiniBand the IPoIB address serves only rdma_cm's address resolution.
 #   loop      link-bench over TCP on the server's 127.0.0.1: the CPU of the stack and of the tag without a NIC
 # A TCP run first checks that it can connect (a firewall that lets only ssh in): if not, it says "not measured".
-# link-bench is built on each server from tools/link-bench.c and client/tsdb_crypto.c in /var/tmp/tsdb-link-bench.
+# link-bench is built on each server from tools/link-bench.c, the MAC candidates (tools/mac_cands.c, tools/blake3) and
+# client/tsdb_crypto.c in /var/tmp/tsdb-link-bench.
+#   mac       link-bench mac on each server, --reps times: every MAC candidate's speed on one core (design-rdma.md 6)
 # Output: OUT/raw.txt (one key=value line per run), OUT/summary.txt (mean, sd, lowest-highest per test and size).
 set -u
 srv= cli= ibaddr= tcpaddr= dev=mlx4_0 ibport=1 reps=3 secs=3 only=perftest,rsocket,tcp,loop out= ptport=18515
@@ -39,17 +41,23 @@ done
 out=${out:-rdma-bench-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$out"
 raw=$out/raw.txt
+: >>"$raw"
 W=/var/tmp/tsdb-link-bench
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 root=$(cd "$(dirname "$0")/.." && pwd)
 want() { case ",$only," in *",$1,"*) return 0 ;; esac; return 1; }
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
-# ---- build link-bench on both servers
+# ---- build link-bench on both servers (-O3 and no -march, as make dist builds: the MAC kernels pick their own level)
+LB_FILES="tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h tools/blake3 client/tsdb_crypto.c
+    client/tsdb_crypto.h"
+LB_BUILD='set -e; for k in sse2:-msse2 sse41:-msse4.1 avx2:-mavx2 avx512:-mavx512f,-mavx512vl; do
+    gcc -O3 $(echo ${k#*:} | tr , " ") -c -o b3_${k%%:*}.o tools/blake3/blake3_${k%%:*}.c; done
+    gcc -std=gnu11 -O3 -o link-bench tools/link-bench.c tools/mac_cands.c tools/blake3/blake3.c \
+    tools/blake3/blake3_dispatch.c tools/blake3/blake3_portable.c b3_*.o client/tsdb_crypto.c -ldl'
 for h in "$srv" "$cli"; do
-    tar -C "$root" -c tools/link-bench.c client/tsdb_crypto.c client/tsdb_crypto.h |
-        $SSH "$h" "mkdir -p $W && tar -x -C $W && cd $W && gcc -std=gnu11 -O2 -o link-bench tools/link-bench.c \
-            client/tsdb_crypto.c -ldl" || { echo "rdma-bench: cannot build link-bench on $h" >&2; exit 1; }
+    tar -C "$root" -c $LB_FILES | $SSH "$h" "mkdir -p $W && tar -x -C $W && cd $W && $LB_BUILD" ||
+        { echo "rdma-bench: cannot build link-bench on $h" >&2; exit 1; }
 done
 $SSH "$srv" "uname -r; lscpu | grep 'Model name'; cat /sys/class/net/*/mode 2>/dev/null | sort | uniq -c" \
     >"$out/machine.txt" 2>&1
@@ -152,6 +160,23 @@ pt_one() { # $1 test (send_bw...), $2 size, $3 rep, $4 extra flags, $5 variant l
            $5, $6, $8 }' >>"$raw" ;;
     esac
 }
+
+# ---- each MAC candidate on one core of each server (no network): OUT/mac.txt, its summary in OUT/mac-summary.txt
+if want mac; then
+    for h in "$srv" "$cli"; do
+        hn=$([ "$h" = "$srv" ] && echo srv || echo cli)
+        for r in $(seq "$reps"); do
+            $SSH "$h" "cd $W && ./link-bench mac --secs $secs" | sed "s/^/side=$hn rep=$r /" >>"$out/mac.txt" ||
+                log "mac on $hn failed"
+        done
+    done
+    awk '{ delete kv; for (i = 1; i <= NF; i++) { split($i, a, "="); kv[a[1]] = a[2] }
+           if (!("MB_s" in kv)) next
+           k = kv["side"] " " kv["mac"] " " kv["size"]; v = kv["MB_s"] + 0; n[k]++; s[k] += v
+           if (!(k in lo) || v < lo[k]) lo[k] = v; if (!(k in hi) || v > hi[k]) hi[k] = v }
+         END { for (k in n) printf "%s MB_s=%.0f (%.0f-%.0f, n %d)\n", k, s[k] / n[k], lo[k], hi[k], n[k] }' \
+        "$out/mac.txt" | sort -k1,1 -k2,2 -k3,3n >"$out/mac-summary.txt"
+fi
 
 if want perftest; then
     for rep in $(seq "$reps"); do
