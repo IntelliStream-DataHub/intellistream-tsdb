@@ -1574,6 +1574,50 @@ static void test_throttle(void)
     unlink(dst);
 }
 
+/* each data kind has its own bucket (R4 D7): kind 5 (a snapshot) at 4 MB/s, kind 2 (a COMMIT's file) unlimited. A file
+ * on kind 2 sent while kind 5 is busy for a second arrives at once, and kind 5 keeps its rate (mutant kindbucket: one
+ * bucket at the peerlink's rate, kind 5 is not held to its own) */
+static void test_kindrate(void)
+{
+    char src[600], src2[600];
+    pathf(src, sizeof src, "kr-src");
+    pathf(src2, sizeof src2, "kr-src2");
+    size_t size = 4u * 1000 * 1000, size2 = 1u * 1000 * 1000;
+    int sfd = (int)make_file(src, size, 41), sfd2 = (int)make_file(src2, size2, 43);
+    struct pl_cfg c;
+    memset(&c, 0, sizeof c);
+    c.bulk_rate = PL_RATE_UNLIMITED;
+    struct node *a = node_new(1, SECRET, &c, 1), *b = node_new(2, SECRET, &c, 0);
+    a->discard = 1;
+    CHECK(peerlink_set_kind_rate(b->pl, PL_KIND_SNAP, 4u * 1000 * 1000) == PL_OK);
+    CHECK(peerlink_set_kind_rate(b->pl, PL_KIND_META, 1) == PL_E_INVALID);
+    CHECK(peerlink_set_kind_rate(b->pl, PL_KIND_DATA_MAX + 1, 1) == PL_E_INVALID);
+    struct plink *ls = dial(b, 1, a->port, PL_KIND_SNAP), *lb = dial(b, 1, a->port, PL_KIND_BULK);
+    CHECK(WAIT_FOR(plink_up(ls) && plink_up(lb), 3000));
+    struct jres rs = {0}, rb = {0};
+    uint64_t t0 = now_ms();
+    CHECK(bulk_send_id(ls, 1, sfd, size, "s", &rs) == PL_OK);
+    usleep(100 * 1000);
+    uint64_t t1 = now_ms();
+    CHECK(bulk_send_id(lb, 2, sfd2, size2, "b", &rb) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&rb.done), 20000));
+    uint64_t tookb = now_ms() - t1;
+    int s_busy = !atomic_load(&rs.done); /* kind 2's file did not wait for kind 5's */
+    CHECK(WAIT_FOR(atomic_load(&rs.done), 20000));
+    uint64_t tooks = now_ms() - t0;
+    printf("  kindrate: kind 5 %zu bytes at 4 MB/s took %llu ms; kind 2 %zu bytes beside it %llu ms\n", size,
+           (unsigned long long)tooks, size2, (unsigned long long)tookb);
+    CHECK(rs.status == PL_OK && rb.status == PL_OK);
+    CHECK(tooks >= 800 && tooks < 5000);
+    CHECK(tookb < 500 && s_busy);
+    node_free(b);
+    node_free(a);
+    close(sfd);
+    close(sfd2);
+    unlink(src);
+    unlink(src2);
+}
+
 /* a peer that holds the secret and sends what no honest sender does: a CHUNK that is not at the next offset ends the
  * link, and nothing of it reaches the data callback */
 static void test_badchunk(void)
@@ -2461,6 +2505,9 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "pausedead")) {
                 peerlink_mutant = PL_MUT_PAUSEDEAD;
                 only = "fwdslow";
+            } else if (!strcmp(m, "kindbucket")) {
+                peerlink_mutant = PL_MUT_KINDBUCKET;
+                only = "kindrate";
             } else {
                 fprintf(stderr, "unknown mutant %s\n", m);
                 return 2;
@@ -2481,7 +2528,7 @@ int main(int argc, char **argv)
         {"codec", test_codec},   {"log", test_log},         {"bulk", test_bulk},
         {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip},
         {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"endhash", test_endhash},
-        {"throttle", test_throttle}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
+        {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
         {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut},

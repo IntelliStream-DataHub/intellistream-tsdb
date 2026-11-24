@@ -510,7 +510,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_peerlink --list "notag sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -979,7 +979,8 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    unsureignored admitnocheck nofastpath nocursorup commitpastremoved nominisr ackbelowminisr shipperfile nocap noseal \
 	    noinboxbound nospill keepignorespeers keepwritten nologstartcheck stopnodepose lateclock syncbyrep inboxwaitall shipnoisr fastride \
 	    nojoinhold inboxstarve opennohold promotenone tickstretch stepcurrentonly stallcatchup keepunanswered fencenosync nomoved deposemoved demotestaleidx \
-	    refusedsilent divergeisr
+	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
+	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)
