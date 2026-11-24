@@ -9,8 +9,16 @@
 
 #include "repld_int.h"
 
-/* repld_update: the record names another replica set than the driver's (by node, in order). rv->mu held. */
-void rset_change(struct rvol *rv, const struct cluster_vol_rec *r);
+/* repld_update, every push of an open volume (the manager's thread), rv->mu held: a record of the driver's set version
+ * is taken at once (rec_set), 0; one of another set version is kept for the volume's thread, 1: post IN_META. */
+int rset_change(struct rvol *rv, const struct cluster_vol_rec *r);
+/* The volume's thread, rv->mu held (at the head of IN_META and at every tick): applies a kept set change (drains the
+ * core's queue through the old record, repl_reconfig, repl_set_version, the driver's per-index state remapped). 0
+ * nothing waits, 1 it still waits (a snapshot in progress, actions still queued, this server not named), 2 applied now
+ * (the caller hands the core the record: a META). */
+int rset_apply(struct rvol *rv);
+/* peer messages dropped for another set version (the trace line) */
+uint64_t rset_dropped(const struct rvol *rv);
 /* A peer message of this volume, decoded and checked to be from `from` to this replica: 1 to hand it to the core, 0 to
  * drop it (another set version). rv->mu held. */
 int rset_msg_ok(struct rvol *rv, const struct repl_msg *m);
