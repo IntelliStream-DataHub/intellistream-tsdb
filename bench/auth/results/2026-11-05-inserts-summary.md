@@ -21,7 +21,7 @@ Mean of the runs, then (standard deviation in percent of the mean; lowest to hig
 - **governor**: performance (32 CPUs)
 - **compiler**: cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
 - **scratch**: /var/tmp/auth-build/s5/scratch-ins (ext4, 274G free)
-- **lock**: /home/olav/.local/state/subagent-economy/BENCH.lock
+- **lock**: $SE_HOME/BENCH.lock (the benchmark lock of the subagent-economy scripts)
 - **busy at start**: 1.05 of 32 CPUs over 2 s
 - **git clone**: 9d01490
 - **tree main**: ba4f6c2 = ba4f6c2: tsdbd 0.9.0 (build dev); cflags: -O3 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -march=native -Iinclude -fPIC; client defs: none

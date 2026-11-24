@@ -179,7 +179,7 @@ enum {
 };
 
 /* the sections of a heartbeat (after its address fields) */
-enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6 };
+enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6, HBS_STORES = 7 };
 #define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
@@ -954,6 +954,8 @@ struct heard {
     uint64_t answered_ns; /* the Raft leader: when it last granted it a lease (its own clock; 0: never) */
     uint32_t nisr;        /* HBS_ISR of its last heartbeat: the ISR changes the volumes it leads ask for */
     struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
+    int have_stores;       /* HBS_STORES in its last heartbeat (R8): */
+    uint32_t chunk_stores; /* its chunk stores that are UP (an EC volume's stripe group is picked among those with 1+) */
 };
 
 struct addr_e {
@@ -1167,6 +1169,12 @@ static struct {
     int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
                           * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
     char holdcopyfile[1100];
+    int stall_loop;      /* TSDB_CLUSTER_TEST stall_loop_file=1: the cluster thread's loop stalls while <state-dir>/stallloop
+                          * exists (test_cluster copycaught: cluster_copy_caught_up read on another thread) */
+    char stallloopfile[1100];
+    int copy_probe;      /* TSDB_CLUSTER_TEST copy_probe=1: a thread of its own writes <state-dir>/copyprobe every 20 ms:
+                          * cluster_copy_caught_up and the published copy's erasure-coded volumes (copy_probe_main) */
+    pthread_t copy_probe_th;
     uint64_t copy_lag_ns; /* TSDB_CLUSTER_TEST copy_lag_ms=N: the main loop publishes no copy for N ms after a push to the
                            * volume manager (test_cluster removereplica: the manager judges a removal by a copy at least as
                            * new as the push, which vol_watch_duty publishes first) */
@@ -1422,6 +1430,10 @@ static void test_knobs(void)
             C.hold_copy = v != 0;
         else if (sscanf(p, "copy_lag_ms=%llu", &v) == 1)
             C.copy_lag_ns = v * MS;
+        else if (sscanf(p, "stall_loop_file=%llu", &v) == 1)
+            C.stall_loop = v != 0;
+        else if (sscanf(p, "copy_probe=%llu", &v) == 1)
+            C.copy_probe = v != 0;
         else if (sscanf(p, "hold_users_file=%llu", &v) == 1)
             C.hold_users = v != 0;
         else if (sscanf(p, "push_every_apply=%llu", &v) == 1)
@@ -1749,8 +1761,10 @@ enum cl_mutant {
     CLM_HOLDEMPTY = 32,    /* that hold only while the rebuilt copy has no users: an older list goes out (review F6) */
     CLM_SYNCNOLEASE = 33,  /* USER_SYNC answered by a leader without its lease (review F7) */
     CLM_ULADDRTICK = 34,   /* cluster_user_propose's leader address moved only by the 100 ms duty, not at a role change */
-    CLM_BOOTEMPTY = 35     /* core_boot drops the state the member served: STATUS shows an empty image until the core
+    CLM_BOOTEMPTY = 35,    /* core_boot drops the state the member served: STATUS shows an empty image until the core
                             * catches up (test_cluster userpromote) */
+    CLM_COPYNODEADLINE = 36, /* cluster_copy_caught_up ignores the deadline of the floor it heard (a stalled loop) */
+    CLM_COPYNOFLOOR = 37     /* cluster_copy_caught_up does not compare the published copy with the floor */
 };
 static int cl_mutant(void)
 {
@@ -1794,6 +1808,8 @@ static int cl_mutant(void)
             : !strcmp(e, "syncnolease")   ? CLM_SYNCNOLEASE
             : !strcmp(e, "uladdrtick")    ? CLM_ULADDRTICK
             : !strcmp(e, "bootempty")     ? CLM_BOOTEMPTY
+            : !strcmp(e, "copynodeadline") ? CLM_COPYNODEADLINE
+            : !strcmp(e, "copynofloor")   ? CLM_COPYNOFLOOR
                                           : CLM_NONE;
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
@@ -2109,6 +2125,13 @@ static void copy_publish(void)
             o->rep[k] = (struct cluster_copy_rep){v->rep[k].node, v->rep[k].learner};
         o->nisr = v->nisr < META_REPLICAS_MAX ? v->nisr : META_REPLICAS_MAX;
         memcpy(o->isr, v->isr, o->nisr * sizeof o->isr[0]);
+        o->redundancy = v->redundancy;
+        o->ec_k = v->ec_k;
+        o->ec_m = v->ec_m;
+        o->gc_suspended = v->gc_suspended;
+        o->nstripe = v->nstripe < META_STRIPE_MAX ? v->nstripe : META_STRIPE_MAX;
+        memcpy(o->stripe, v->stripe, o->nstripe * sizeof o->stripe[0]);
+        o->stripe_version = v->stripe_version;
     }
     for (uint32_t i = 0; i < nm; i++) {
         const struct meta_member *m = &C.sm.members[i];
@@ -2359,9 +2382,54 @@ void cluster_set_users_watch(cluster_users_fn fn, void *arg)
 
 int cluster_users_caught_up(void) { return atomic_load_explicit(&g_users_ok, memory_order_acquire); }
 
+/* R8 (D9): the chunk stores this server has UP (chunksrv_cluster.c), for HBS_STORES */
+static _Atomic uint32_t g_chunk_stores;
+
+void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_stores, n, memory_order_relaxed); }
+
+/* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
+ * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
+ * its arrival), at most 2 s. The cluster thread raises it; any thread reads it and checks the deadline itself, so a
+ * stalled cluster loop turns the answer to 0 once the lease has run out, while a new leader may commit a new epoch.
+ * cfl_mu is a leaf. */
+static pthread_mutex_t cfl_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t cfl_floor, cfl_until;
+
+static void copy_floor_note(uint64_t commit, uint64_t until)
+{
+    pthread_mutex_lock(&cfl_mu);
+    if (commit > cfl_floor) /* the leader's commit index only grows; a late ack of an older beat must not lower it */
+        cfl_floor = commit;
+    if (until > cfl_until)
+        cfl_until = until;
+    pthread_mutex_unlock(&cfl_mu);
+}
+
+int cluster_copy_caught_up_at(const struct cluster_copy *c)
+{
+    if (!c)
+        return 0;
+    pthread_mutex_lock(&cfl_mu);
+    uint64_t floor = cfl_floor, until = cfl_until;
+    pthread_mutex_unlock(&cfl_mu);
+    if (!floor || (c->applied < floor && cl_mutant() != CLM_COPYNOFLOOR))
+        return 0;
+    return iso_now_ns() < until || cl_mutant() == CLM_COPYNODEADLINE;
+}
+
+int cluster_copy_caught_up(void)
+{
+    const struct cluster_copy *c = cluster_copy_get();
+    int ok = cluster_copy_caught_up_at(c);
+    if (c)
+        cluster_copy_put(c);
+    return ok;
+}
+
 /* The sections of a heartbeat from r->off on, into h. Sets r->bad on a malformed one. An unknown type is skipped. */
 static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
 {
+    h->have_stores = 0; /* a beat without the section (a build before R8) reports no stores */
     while (!r->bad && r->off < r->len) {
         uint32_t type = get8(r);
         type |= (uint32_t)get8(r) << 8;
@@ -2394,6 +2462,14 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 return;
             }
             h->nunreach = n;
+        } else if (type == HBS_STORES) {
+            uint32_t n = get32(&s);
+            if (s.bad) {
+                r->bad = 1;
+                return;
+            }
+            h->have_stores = 1;
+            h->chunk_stores = n;
         } else if (type == HBS_ISR) {
             uint32_t n = get32(&s);
             if (s.bad || n > CLUSTER_REPORT_ISR || (size_t)n * 32 > len) {
@@ -2692,7 +2768,7 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
     if (type == RAFT_ENTRY_NORMAL) {
         if (meta_apply(m, index, term, data, len, &rc0, 1) != META_OK) {
             if (meta_entry_older(data, len)) /* a preview cluster is initialised again, never upgraded */
-                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 4 "
+                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 5 "
                           "or older and this build reads version %d: the cluster was made by another build; "
                           "initialise it again (docs/cluster-preview.md)", index, term, META_SNAP_VERSION);
             fail_stop("entry %" PRIu64 " (term %" PRIu64 ") does not decode: this build cannot apply it", index,
@@ -3646,6 +3722,12 @@ static void on_hb_ack(struct conn *c, struct rd *r)
      * every committed entry. A deposed leader in the same term that has not stepped down yet grants nothing. */
     if (!C.users_floor && from_leader && commit)
         C.users_floor = commit;
+    /* the same leader's commit index, the latest one, good while the lease of this beat holds (from its send time):
+     * cluster_copy_caught_up */
+    if (from_leader && commit && echo && echo <= now && drift < 1000000) {
+        uint64_t end = cluster_lease_end(echo, lease_ms, drift), cap = echo + 2000000000ull;
+        copy_floor_note(commit, end < cap ? end : cap);
+    }
     /* the highest commit any voter reported in this term: what the watch stream must reach (watch_duty) */
     if (term > C.hint_term || commit > C.hint_commit)
         C.hint_commit = commit;
@@ -3948,6 +4030,14 @@ size_t cluster_volume_add_encode(const char *name, uint32_t replicas, uint8_t *o
     return 2 + n + 4;
 }
 
+size_t cluster_volume_add_ec_encode(const char *name, uint32_t replicas, uint8_t k, uint8_t m, uint8_t *out)
+{
+    size_t n = cluster_volume_add_encode(name, replicas, out);
+    out[n] = k;
+    out[n + 1] = m;
+    return n + 2;
+}
+
 size_t cluster_volume_force_encode(uint32_t volume, uint32_t node, uint8_t *out)
 {
     for (int j = 0; j < 4; j++) {
@@ -4075,11 +4165,66 @@ static int place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
     return 0;
 }
 
-static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
+/* An erasure-coded volume's stripe group (R8, E9): ns distinct live members that take volumes and report a chunk
+ * store UP (HBS_STORES; this server: what chunksrv_cluster.c set), the proposer's pick, never apply's (heartbeats are
+ * not replicated state). Each position goes to the candidate on the rack used least so far, then holding the fewest
+ * positions of other EC volumes, then the lowest id. *qualify: how many members qualify. */
+static int place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *qualify)
+{
+    uint32_t cand[META_STRIPE_MAX * 16], nc = 0, holds[META_STRIPE_MAX * 16];
+    for (uint32_t i = 0; i < C.sm.nmembers && nc < sizeof cand / sizeof cand[0]; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (!placeable(mb, now))
+            continue;
+        const struct heard *h = heard_get(mb->id);
+        uint32_t up = mb->id == C.id ? atomic_load_explicit(&g_chunk_stores, memory_order_relaxed)
+                                     : (h && h->have_stores ? h->chunk_stores : 0);
+        if (!up)
+            continue;
+        holds[nc] = 0;
+        for (uint32_t v = 0; v < C.sm.nvolumes; v++)
+            for (uint32_t k = 0; k < C.sm.volumes[v].nstripe; k++)
+                holds[nc] += C.sm.volumes[v].stripe[k] == mb->id;
+        cand[nc++] = i;
+    }
+    *qualify = nc;
+    if (nc < ns)
+        return -1;
+    uint8_t used[META_STRIPE_MAX * 16] = {0};
+    for (uint32_t k = 0; k < ns; k++) {
+        int best = -1;
+        uint32_t best_rack = 0;
+        for (uint32_t i = 0; i < nc; i++) {
+            if (used[i])
+                continue;
+            uint32_t rack = 0; /* positions already on this candidate's rack */
+            for (uint32_t j = 0; j < k; j++)
+                rack += !strcmp(C.sm.members[cand[i]].rack, meta_member(&C.sm, stripe[j])->rack);
+            if (best < 0 || rack < best_rack || (rack == best_rack && holds[i] < holds[best])) {
+                best = (int)i;
+                best_rack = rack;
+            }
+        }
+        used[best] = 1;
+        stripe[k] = C.sm.members[cand[best]].id;
+    }
+    return 0;
+}
+
+static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int ec)
 {
     struct meta_volume_add a = {0};
     getstr(r, a.name, sizeof a.name);
     uint32_t n = get32(r);
+    uint8_t ek = 0, em = 0; /* R8: k + m of an erasure-coded volume (CLUSTER_OP_VOLUME_ADD_EC); 0: replicas */
+    if (ec) {
+        ek = get8(r);
+        em = get8(r);
+        if (!r->bad && (ek < 1 || ek > META_EC_K_MAX || em < 1 || em > META_EC_M_MAX))
+            r->bad = 1;
+    }
+    if (!r->bad && r->off != r->len) /* a VOLUME_ADD with k and m is a client's error, never a replicas volume */
+        r->bad = 1;
     if (r->bad || !a.name[0] || !text_ok_cl(a.name)) {
         admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
         return;
@@ -4091,9 +4236,19 @@ static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
         return;
     }
     if (!n)
-        n = C.sm.set.replication;
+        n = ek ? (uint32_t)em + 1 : C.sm.set.replication;
     if (C.sm.mode != META_MODE_REPLICATED || n < 1 || n > META_REPLICAS_MAX) {
         admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    /* an EC volume's log group is m + 1 replicas (E3); fewer only in the test mode of TSDB_CLUSTER_WRITES=1 (cvol.c),
+     * so that a 1-replica EC volume can be tested */
+    const char *tw = getenv("TSDB_CLUSTER_WRITES");
+    if (ek && n != (uint32_t)em + 1 && !(n < (uint32_t)em + 1 && tw && !strcmp(tw, "1"))) {
+        char msg[160];
+        int ml = snprintf(msg, sizeof msg, "an ec=%u+%u volume has %u replicas (m + 1), not %" PRIu32, ek, em, em + 1, n);
+        say("volume add %s: %s", a.name, msg);
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, (size_t)ml);
         return;
     }
     for (uint32_t i = 0; i < C.sm.nvolumes; i++)
@@ -4112,9 +4267,25 @@ static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r)
         admin_reply(c->serial, reqid, CLUSTER_ERR_FEW, NULL, 0);
         return;
     }
+    if (ek) {
+        uint32_t qualify = 0;
+        if (place_stripe((uint32_t)ek + em, iso_now_ns(), a.stripe, &qualify) != 0) {
+            char msg[160];
+            int ml = snprintf(msg, sizeof msg,
+                              "%" PRIu32 " members qualify for an ec=%u+%u stripe group of %u (live, taking volumes, a "
+                              "chunk store up)", qualify, ek, em, ek + em);
+            say("volume add %s: %s", a.name, msg);
+            admin_reply(c->serial, reqid, CLUSTER_ERR_FEW, msg, (size_t)ml);
+            return;
+        }
+        a.redundancy = META_RED_EC;
+        a.ec_k = ek;
+        a.ec_m = em;
+        a.nstripe = (uint32_t)ek + em;
+    }
     a.n = n;
     a.kind = META_VOL_REPLICATED;
-    a.min_isr = C.sm.set.min_isr < n ? C.sm.set.min_isr : n;
+    a.min_isr = meta_volume_min_isr(a.redundancy, a.ec_m, n, C.sm.set.min_isr);
     tsdb_random(a.uuid, sizeof a.uuid);
     for (uint32_t i = 0; i < n; i++) {
         int dup;
@@ -4331,6 +4502,41 @@ static int users_probe_watch(void *arg, const struct cluster_user_rec *u, uint32
     return 0;
 }
 
+/* TSDB_CLUSTER_TEST copy_probe=1 (tests only): what another thread of tsdbd (a chunk server's, r8e) reads, seen from
+ * outside. Every 20 ms, on this thread and never on the cluster thread (whose loop test_cluster stalls), it writes
+ * <state-dir>/copyprobe: "caught C applied A" (cluster_copy_caught_up_at of the published copy), then a line per
+ * erasure-coded volume of that copy (test_cluster copycaught, ecadd). */
+static void *copy_probe_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&C.stop)) {
+        const struct cluster_copy *c = cluster_copy_get();
+        struct buf b = {0};
+        char line[600];
+        snprintf(line, sizeof line, "caught %d applied %" PRIu64 "\n", cluster_copy_caught_up_at(c),
+                 c ? c->applied : 0);
+        put(&b, line, strlen(line));
+        for (uint32_t i = 0; c && i < c->nvolumes; i++) {
+            const struct cluster_copy_vol *v = &c->volumes[i];
+            if (v->redundancy != META_RED_EC)
+                continue;
+            int n = snprintf(line, sizeof line, "vol %s k %u m %u stripe_version %" PRIu64 " gc %u stripe", v->name,
+                             v->ec_k, v->ec_m, v->stripe_version, v->gc_suspended);
+            for (uint32_t k = 0; k < v->nstripe && n > 0 && (size_t)n < sizeof line; k++)
+                n += snprintf(line + n, sizeof line - (size_t)n, " %" PRIu32, v->stripe[k]);
+            put(&b, line, strlen(line));
+            put(&b, "\n", 1);
+        }
+        if (c)
+            cluster_copy_put(c);
+        put(&b, "", 1);
+        probe_write("copyprobe", (const char *)b.p);
+        buf_free(&b);
+        usleep(20000);
+    }
+    return NULL;
+}
+
 /* The users watch, given the copy's users when they changed. Called before every heartbeat, so the applied index a
  * heartbeat reports is one the watch has been given (a leader's "no member lags" then means every member's watch has
  * the change), and before the leader answers waiting user ops. */
@@ -4430,6 +4636,12 @@ static void users_duty(uint64_t now)
         /* a leader's own commit index covers every earlier term only once an entry of its own term is committed */
         if (!C.users_floor && commit && raft_get_term_at(C.r, commit) == raft_get_term(C.r))
             C.users_floor = commit;
+        raft_lease l;
+        /* the leader's own commit index, good while its read lease holds (cluster_copy_caught_up, R8 D9) */
+        if (commit && raft_get_term_at(C.r, commit) == raft_get_term(C.r) && raft_read_lease(C.r, &l)) {
+            uint64_t cap = now + 2000000000ull;
+            copy_floor_note(commit, l.lease_until < cap ? l.lease_until : cap);
+        }
     }
     /* before the replies: a member this server counts as caught up has its watch given the change; and before the
      * barrier opens, so a login it lets in finds the users the copy has at the floor, not the ones from before */
@@ -4871,17 +5083,10 @@ static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
             return;
         }
     }
-    uint32_t ids[META_REPLICAS_MAX];
-    uint64_t rids[META_REPLICAS_MAX];
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < v->nrep; i++)
-        if (meta_volume_in_isr(v, v->rep[i].node) || (int)i == x) {
-            ids[n] = v->rep[i].node;
-            rids[n++] = v->rep[i].rid;
-        }
+    /* an EC volume's orphan collection is suspended in the same entry, before the ISR change (E14, §5.7) */
     struct meta_entry e;
     meta_entry_init(&e);
-    meta_op_isr_change(&e, number, v->epoch, v->isr_version, ids, rids, n, 0);
+    meta_op_volume_force(&e, v, node);
     if (propose(&e, 0, 0, 0) != ISO_OK) {
         admin_reply(c->serial, reqid, CLUSTER_ERR_RETRY, NULL, 0);
         return;
@@ -4891,10 +5096,37 @@ static void admin_volume_force(struct conn *c, uint32_t reqid, struct rd *r)
         vs->forced = 1, vs->forced_node = node, vs->forced_epoch = v->epoch;
     int tl = snprintf(text, sizeof text, "volume %" PRIu32 ": node %" PRIu32 " joins the ISR of epoch %" PRIu64
                       " and is promoted (unclean). The last shrink's commit point is %" PRIu64 "; writes "
-                      "acknowledged past node %" PRIu32 "'s log end are lost (the promotion's log line compares the two)",
-                      number, node, v->epoch, v->isr_commit, node);
+                      "acknowledged past node %" PRIu32 "'s log end are lost (the promotion's log line compares the two)%s",
+                      number, node, v->epoch, v->isr_commit, node,
+                      v->redundancy == META_RED_EC ? ". Orphan collection is suspended until `tsdb cluster volume gc "
+                                                     "resume`" : "");
     say("%s", text);
     admin_reply(c->serial, reqid, 0, text, (size_t)tl);
+}
+
+/* `tsdb cluster volume gc resume`: GC_RESUME of an erasure-coded volume (E14), answered once committed */
+static void admin_volume_gc_resume(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint32_t number = get32(r);
+    if (r->bad || r->off != r->len) {
+        admin_reply(c->serial, reqid, META_ERR_INVALID, NULL, 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    const struct meta_volume *v = meta_volume(&C.sm, number);
+    if (!v || v->redundancy != META_RED_EC) {
+        admin_reply(c->serial, reqid, v ? META_ERR_INVALID : META_ERR_NOTFOUND, NULL, 0);
+        return;
+    }
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_gc_resume(&e, number);
+    propose(&e, c->serial, reqid, 0);
 }
 
 /* R4's admin ops (cluster_int.h): only the Raft leader hands them on; a follower answers NOTLEADER with the leader's
@@ -4922,11 +5154,13 @@ static void on_admin(struct conn *c, struct rd *r)
     switch (op) {
     case CLUSTER_OP_INIT: admin_init(c, reqid, r); break;
     case CLUSTER_OP_NODE_ADD: admin_node_add(c, reqid, r); break;
-    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_ADD: admin_volume_add(c, reqid, r, 0); break;
+    case CLUSTER_OP_VOLUME_ADD_EC: admin_volume_add(c, reqid, r, 1); break;
     case CLUSTER_OP_USER_PUT: admin_user_change(c, reqid, r, 0); break;
     case CLUSTER_OP_USER_DEL: admin_user_change(c, reqid, r, 1); break;
     case CLUSTER_OP_USER_GET: admin_user_get(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_FORCE: admin_volume_force(c, reqid, r); break;
+    case CLUSTER_OP_VOLUME_GC_RESUME: admin_volume_gc_resume(c, reqid, r); break;
     case CLUSTER_OP_USER_SYNC: admin_user_sync(c, reqid, r); break;
     case CLUSTER_OP_VOLUME_TRANSFER: r4_admin(c, reqid, r, ctr_admin); break;
     case CLUSTER_OP_VOLUME_MOVE: r4_admin(c, reqid, r, cmove_admin); break;
@@ -5383,6 +5617,9 @@ static void put_sections(struct buf *b, uint64_t now)
             put64(b, q->rid[k]);
         }
     }
+    sec_end(b, at);
+    at = sec_begin(b, HBS_STORES);
+    put32(b, atomic_load_explicit(&g_chunk_stores, memory_order_relaxed));
     sec_end(b, at);
 }
 
@@ -6722,6 +6959,8 @@ static void *cluster_main(void *arg)
     struct pollfd *pf = NULL;
     size_t pfcap = 0;
     while (!atomic_load(&C.stop)) {
+        while (C.stall_loop && access(C.stallloopfile, F_OK) == 0 && !atomic_load(&C.stop))
+            usleep(10000); /* tests: a stalled cluster loop (stall_loop_file) */
         uint64_t now = iso_now_ns();
         dw_collect();
         vmsg_flush();
@@ -6888,6 +7127,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdraftfile, sizeof C.holdraftfile, "%s/holdraft", C.metadir);
     snprintf(C.holdcopyfile, sizeof C.holdcopyfile, "%s/holdcopy", C.metadir);
+    snprintf(C.stallloopfile, sizeof C.stallloopfile, "%s/stallloop", C.metadir);
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);
     snprintf(C.dropfencefile, sizeof C.dropfencefile, "%s/dropfence", C.metadir);
@@ -7016,6 +7256,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     C.running = 1;
     if (C.copy_hold && pthread_create(&C.copy_hold_th, NULL, cc_hold_main, (void *)(uintptr_t)C.copy_hold) != 0)
         C.copy_hold = 0;
+    if (C.copy_probe && pthread_create(&C.copy_probe_th, NULL, copy_probe_main, NULL) != 0)
+        C.copy_probe = 0;
     return 0;
 }
 
@@ -7029,6 +7271,8 @@ void cluster_stop(void)
     pthread_join(C.th, NULL);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
+    if (C.copy_probe)
+        pthread_join(C.copy_probe_th, NULL);
     cc_clear(); /* readers that hold one keep it until they put it */
     dw_stop_thread();
     C.running = 0;

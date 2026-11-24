@@ -22,7 +22,8 @@ shift
 # counts replies only from ISR members and picks the target or nobody (REPL_E_NONE), both META_ERR_INVALID with the
 # state untouched. The one trace left is which refusal names a grant at the epoch limit (RANGE before INVALID), an
 # order nothing relies on. The check stays as a guard should the rule change; `--mutant 47` still plants it.
-muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49}
+# R8's erasure-coded volumes: 50 stripeuncond, 51 minisrone, 52 gcresumeany, 53 stripeatapply, 54 forcenosuspend.
+muts=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 25 28 31 35 36 37 38 39 40 41 42 43 44 45 46 48 49 50 51 52 53 54}
 if [ -n "$part" ]; then
     k=${part%/*}
     n=${part#*/}
@@ -38,8 +39,9 @@ if [ -n "$part" ]; then
 fi
 [ -n "${muts// /}" ] || exit 0 # a part with none
 # the mutants the simulator's checker catches without the unit stage (measured: with it off 8 of the 17 are caught;
-# R4's 40-46 all, by meta_check_step or the per-op check of the replica set's version and a reset)
-SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 "
+# R4's 40-46 all, by meta_check_step or the per-op check of the replica set's version and a reset; R8's 50, 52 and 53
+# by the per-op checks of STRIPE_SET and VOLUME_ADD and meta_check_step's gc rule)
+SIM_MUTANTS=" 1 2 4 6 10 11 12 13 40 41 42 43 44 45 46 50 52 53 "
 sim=
 for n in $muts; do
     case "$SIM_MUTANTS" in *" $n "*) sim="$sim $n" ;; esac
