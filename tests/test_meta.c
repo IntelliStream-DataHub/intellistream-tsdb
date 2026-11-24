@@ -882,8 +882,9 @@ static void test_replica_set(void)
 /* ================================================================ erasure-coded volumes (R8, snapshot version 6) */
 
 /* VOLUME_ADD of an EC volume: replicas `nodes` (the log group), k + m and the stripe group the proposer picked */
-static void ec_add(struct meta_entry *e, uint32_t number, const char *name, uint32_t min_isr, const uint32_t *nodes,
-                   uint32_t n, int kind, uint8_t k, uint8_t mm, const uint32_t *stripe, uint32_t ns)
+/* a VOLUME_ADD of redundancy `red` with these k, m and group (a replicas body with EC fields: refused) */
+static void red_add(struct meta_entry *e, uint32_t number, const char *name, uint32_t min_isr, const uint32_t *nodes,
+                    uint32_t n, int kind, uint8_t red, uint8_t k, uint8_t mm, const uint32_t *stripe, uint32_t ns)
 {
     struct meta_volume_add a;
     memset(&a, 0, sizeof a);
@@ -903,12 +904,18 @@ static void ec_add(struct meta_entry *e, uint32_t number, const char *name, uint
         snprintf(a.st.fstype, sizeof a.st.fstype, "nfs4");
         snprintf(a.st.group, sizeof a.st.group, "g0");
     }
-    a.redundancy = META_RED_EC;
+    a.redundancy = red;
     a.ec_k = k;
     a.ec_m = mm;
     a.nstripe = ns;
     memcpy(a.stripe, stripe, ns * sizeof *stripe);
     meta_op_volume_add(e, &a);
+}
+
+static void ec_add(struct meta_entry *e, uint32_t number, const char *name, uint32_t min_isr, const uint32_t *nodes,
+                   uint32_t n, int kind, uint8_t k, uint8_t mm, const uint32_t *stripe, uint32_t ns)
+{
+    red_add(e, number, name, min_isr, nodes, n, kind, META_RED_EC, k, mm, stripe, ns);
 }
 
 static void test_ec(void)
@@ -927,7 +934,8 @@ static void test_ec(void)
           meta_volume_min_isr(META_RED_REPLICAS, 0, 3, 2) == 2 && meta_volume_min_isr(META_RED_REPLICAS, 0, 1, 3) == 1);
 
     /* refused at apply: a group that repeats a node, names an unknown or an out member, k + m positions not given,
-     * k or m out of range, a shared volume, min_isr below m (mutant minisrone gives every EC volume min_isr 1) */
+     * k or m out of range, a shared volume, min_isr below m (mutant minisrone gives every EC volume min_isr 1); and a
+     * replicas body that carries k, m and a group (a proposer that encodes an EC add as replicas) */
     uint32_t dup[6] = {2, 3, 4, 5, 6, 2}, unk[6] = {2, 3, 4, 5, 6, 9}, out[6] = {2, 3, 4, 5, 6, 8};
     uint32_t g20[20], g5[5] = {2, 3, 4, 5, 6};
     for (uint32_t i = 0; i < 20; i++)
@@ -940,10 +948,16 @@ static void test_ec(void)
     ec_add(&e, 5, "e5", 2, log3, 3, META_VOL_REPLICATED, 17, 3, g20, 20);
     ec_add(&e, 6, "e6", 2, log3, 3, META_VOL_SHARED, 4, 2, g6, 6);
     ec_add(&e, 7, "e7", 1, log3, 3, META_VOL_REPLICATED, 4, 2, g6, 6);
+    red_add(&e, 8, "e8", 2, log3, 3, META_VOL_REPLICATED, META_RED_REPLICAS, 4, 2, g6, 6);
     CHECK(apply1(&m, &e, res, 16) == META_OK);
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 9; i++)
         CHECK(res[i] == META_ERR_INVALID);
     CHECK(m.nvolumes == 0);
+    if (m.nvolumes) { /* what follows assumes an empty state: stop at this failure, not at a crash further on */
+        meta_entry_free(&e);
+        meta_free(&m);
+        return;
+    }
 
     /* taken: the group is the body's (mutant stripeatapply takes this copy's first members), version 1, min_isr as
      * given; a 1-replica EC volume (TSDB_CLUSTER_WRITES) has min_isr 1 */
@@ -961,9 +975,26 @@ static void test_ec(void)
           v0->min_isr == 2);
     CHECK(v1 && v1->nstripe == 3 && v1->stripe[0] == 5 && v1->stripe[2] == 7 && v1->min_isr == 1);
     CHECK(r2 && r2->redundancy == META_RED_REPLICAS && !r2->nstripe && !r2->stripe_version);
-    /* a REPLICA_REMOVE that would leave fewer replicas than min_isr is refused */
-    meta_op_replica_remove(&e, 0, 1, 2);
-    CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && meta_volume(&m, 0)->nrep == 3);
+    /* a REPLICA_REMOVE that would leave fewer replicas than min_isr is refused: r3 (min_isr 3) and r4 (min_isr 2), each
+     * with its ISR shrunk to the leader, so that node 3 is neither the leader nor in the ISR; r4 lets it go */
+    {
+        uint32_t lead1[1] = {1};
+        vol_add(&e, META_VOL_REPLICATED, 3, "r3", 3, log3, 3);
+        vol_add(&e, META_VOL_REPLICATED, 4, "r4", 2, log3, 3);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+        for (uint32_t n = 3; n <= 4; n++) {
+            const struct meta_volume *rv = meta_volume(&m, n);
+            CHECK(rv && rv->leader == 1);
+            if (!rv)
+                continue;
+            isr_chg(&e, rv, rv->epoch, rv->isr_version, lead1, 1, 0);
+            CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_volume(&m, n)->nisr == 1);
+        }
+        meta_op_replica_remove(&e, 3, meta_volume(&m, 3)->epoch, 3);
+        meta_op_replica_remove(&e, 4, meta_volume(&m, 4)->epoch, 3);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_ERR_INVALID && res[1] == META_OK &&
+              meta_volume(&m, 3)->nrep == 3 && meta_volume(&m, 4)->nrep == 2);
+    }
 
     /* STRIPE_SET: stale version, a position past the group, a node already in it, an out or unknown node, a
      * replicas volume: refused; else one position moves and the version goes up by one (mutant stripeuncond takes a
