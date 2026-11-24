@@ -56,6 +56,7 @@
         tsdb_test_reopen_hook;
         tsdb_test_replica_drops_files;
         tsdb_test_replica_drops_floor;
+        tsdb_test_replay_start_log;
         tsdb_test_settle;
         tsdb_test_wal_state;
         tsdb_volume_diverged;
