@@ -4354,10 +4354,10 @@ static void scen_chunksrv(void)
     printf("  B killed and restarted: the chunk reads back whole, a put at 4 is still FENCED\n");
 }
 
-/* R4 (the plan's D9): the metadata snapshot is version 5. A state directory of another version (a cluster a preview
- * build made before) is refused at start with a line naming both versions, never read as damage or replayed, and
- * before NODE is written again: here a one-server cluster's `snapshot`, then (that one put back) its `copy`, is
- * rewritten as version 4 (checksum and all) while it is down. Before that, INIT's four settings of R4 (cluster.c's
+/* R4 (the plan's D9): the metadata snapshot is version 6 (R8; R4 made it 5). A directory of another version (a
+ * cluster a preview build made before) is refused at start with a line naming both versions, never read as damage
+ * or replayed, and before NODE is written again: here a one-server cluster's `snapshot`, then (that one put back)
+ * its `copy`, is rewritten as version 4 (checksum and all) while it is down. Before that, INIT's four settings of R4 (cluster.c's
  * settings words 19-22) are read back from STATUS. */
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c, as meta.c declares it */
 static size_t snapv_read(const char *path, uint8_t *img, size_t cap)
@@ -12330,6 +12330,235 @@ static void scen_cutstuck(void)
     rep_same(wantr, "after the cut and the given-up move");
 }
 
+/* R8 (r8c-meta3; design-cluster-data.md E1, E3, E9, E14, E24): an erasure-coded volume added through tsdbd. Six
+ * servers (the harness's N), five of them restarted with a chunk store: an ec=4+2 add is refused with the line that
+ * says how many members qualify (the leader picks the stripe group from the heartbeats, apply never does). The sixth
+ * gets a store: the add goes through with a group of six distinct members, m + 1 = 3 replicas and min_isr m = 2, and
+ * the group is the same on every member and after the metadata leader restarts. A replica count other than m + 1 is
+ * refused. Then e42 loses its ISR (one replica cut off and dropped, the other two killed): force-leader sets
+ * gc_suspended, `tsdb cluster status` shows it, and `tsdb cluster volume gc resume` (by name) clears it; on a
+ * replicas volume it is refused. */
+static int vol_add_ec(int i, const char *name, uint32_t replicas, uint8_t k, uint8_t m, uint32_t *number, char *text,
+                      size_t tn)
+{
+    uint8_t req[2 + META_NAME_MAX + 6], *reply;
+    size_t len, rl = cluster_volume_add_ec_encode(name, replicas, k, m, req);
+    int rc = admin(i, CLUSTER_OP_VOLUME_ADD, req, rl, 1, &reply, &len);
+    *number = 0;
+    for (size_t j = 0; rc == 0 && j < 4 && j < len; j++)
+        *number |= (uint32_t)reply[j] << (8 * j);
+    snprintf(text, tn, "%.*s", rc ? (int)len : 0, reply ? (const char *)reply : "");
+    free(reply);
+    return rc;
+}
+
+static void restart_with_store(int i, const uint8_t uuid[16], char *xa, size_t xn)
+{
+    struct view v;
+    view((i + 1) % 6, &v);
+    const struct meta_member *mb = meta_member(&v.m, ids[i]);
+    struct state_want up = {ids[i], META_UP, mb ? mb->incarnation + 1 : 1};
+    view_free(&v);
+    stop(i, SIGTERM);
+    char sd[PATH_MAX];
+    snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+    chunk_store_make(sd, uuid, ids[i]);
+    snprintf(xa, xn, "--chunk-dir %s", sd);
+    xargs[i] = xa;
+    start(i);
+    await_view((i + 1) % 6, p_member_state, &up, "the server back with a chunk store");
+}
+
+/* every server's copy holds the same stripe group of `name` as `want` (positions, version, gc flag) */
+static void await_same_stripe(const char *name, const struct meta_volume *want, const char *what)
+{
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        int same = 1;
+        for (int i = 0; i < 6 && same; i++) {
+            struct meta_volume v;
+            same = !stopped[i] && vol_rec(i, name, &v) && v.redundancy == want->redundancy && v.ec_k == want->ec_k &&
+                   v.ec_m == want->ec_m && v.nstripe == want->nstripe &&
+                   !memcmp(v.stripe, want->stripe, sizeof v.stripe[0] * want->nstripe) &&
+                   v.stripe_version == want->stripe_version && v.gc_suspended == want->gc_suspended;
+        }
+        if (same)
+            return;
+        if (now_ms() - t0 > 30000)
+            die("the stripe group of %s differs between the servers' copies 30 s on (%s)", name, what);
+    }
+}
+
+static void scen_ecadd(void)
+{
+    scenario("ecadd");
+    for (int i = 0; i < 6; i++)
+        penv[i] = "TSDB_REPLD_TEST=cutlinks";
+    for (int i = 0; i < 6; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+    static char xa[6][PATH_MAX + 32];
+    for (int i = 0; i < 5; i++)
+        restart_with_store(i, uuid, xa[i], sizeof xa[i]);
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    /* the heartbeats that report the restarted servers' stores arrive within a few beats; until then fewer qualify */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        rc = vol_add_ec(5, "e42", 0, 4, 2, &num, text, sizeof text);
+        if (rc == 0)
+            die("ec=4+2 added with five members holding a chunk store (number %" PRIu32 ")", num);
+        if (rc == CLUSTER_ERR_FEW && strstr(text, "5 members qualify for an ec=4+2 stripe group of 6"))
+            break;
+        if (rc != CLUSTER_ERR_FEW || now_ms() - t0 > 30000)
+            die("ec=4+2 with five stores: %s (%s), not FEW naming five", cluster_strerror(rc), text);
+    }
+    printf("  ec=4+2 with five members holding a store: refused (%s)\n", text);
+    if ((rc = vol_add_ec(0, "e42", 2, 4, 2, &num, text, sizeof text)) != META_ERR_INVALID ||
+        !strstr(text, "has 3 replicas (m + 1), not 2"))
+        die("ec=4+2 with 2 replicas: %s (%s), not refused", cluster_strerror(rc), text);
+    printf("  ec=4+2 with two replicas: refused (%s)\n", text);
+    restart_with_store(5, uuid, xa[5], sizeof xa[5]);
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_FEW || now_ms() - t0 > 30000)
+            die("ec=4+2 with six stores: %s (%s)", cluster_strerror(rc), text);
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e); usleep(50000)) /* answered once committed, not applied here */
+        if (now_ms() - t0 > 30000)
+            die("no record of e42 in server 0's copy 30 s after the add");
+    if (e.redundancy != META_RED_EC || e.ec_k != 4 || e.ec_m != 2 || e.nstripe != 6 || e.nrep != 3 ||
+        e.min_isr != 2 || e.stripe_version != 1 || e.gc_suspended)
+        die("e42: redundancy %u k %u m %u nstripe %" PRIu32 " replicas %" PRIu32 " min_isr %" PRIu32
+            " stripe_version %" PRIu64 " gc_suspended %u", e.redundancy, e.ec_k, e.ec_m, e.nstripe, e.nrep,
+            e.min_isr, e.stripe_version, e.gc_suspended);
+    for (int a = 0; a < 6; a++) {
+        if (server_of(e.stripe[a]) < 0)
+            die("e42's stripe position %d is node %" PRIu32 ", no server of the test", a, e.stripe[a]);
+        for (int b = 0; b < a; b++)
+            if (e.stripe[a] == e.stripe[b])
+                die("e42's stripe names node %" PRIu32 " twice", e.stripe[a]);
+    }
+    await_same_stripe("e42", &e, "after the add");
+    int L = -1;
+    for (int i = 0; i < 6 && L < 0; i++) {
+        view(i, &v);
+        if (v.st.mode == CLUSTER_MODE_CORE && v.st.role == RAFT_LEADER)
+            L = i;
+        view_free(&v);
+    }
+    if (L < 0)
+        die("no leader of the metadata group");
+    stop(L, SIGTERM);
+    start(L);
+    await_same_stripe("e42", &e, "after the metadata leader's restart");
+    printf("  ec=4+2 on six stores: stripe %u,%u,%u,%u,%u,%u, 3 replicas, min_isr 2; the same on every server, also "
+           "after server %d (the metadata leader) restarted\n", e.stripe[0], e.stripe[1], e.stripe[2], e.stripe[3],
+           e.stripe[4], e.stripe[5], L);
+
+    /* force-leader of e42 (noowner's way): one replica cut off and out of the ISR, then the other two killed */
+    int Lm = -1;
+    for (uint64_t t0 = now_ms(); Lm < 0; usleep(50000)) {
+        for (int i = 0; i < 6 && Lm < 0; i++) {
+            view(i, &v);
+            if (v.st.mode == CLUSTER_MODE_CORE && v.st.role == RAFT_LEADER && v.m.initialised)
+                Lm = i;
+            view_free(&v);
+        }
+        if (Lm < 0 && now_ms() - t0 > 30000)
+            die("no leader of the metadata group 30 s after server %d restarted", L);
+    }
+    struct meta_volume f;
+    if (!vol_rec(Lm, "e42", &f))
+        die("no record of e42");
+    int Lv = server_of(f.leader), Cs = -1, B = -1;
+    for (uint32_t k = 0; k < f.nrep; k++)
+        if (f.rep[k].node != f.leader)
+            *(Cs < 0 ? &Cs : &B) = server_of(f.rep[k].node);
+    if (Lv < 0 || Cs < 0 || B < 0)
+        die("e42: leader %u", f.leader);
+    await_isr(Lv, "e42", 3, 30000, "every replica of e42 in the ISR");
+    /* the leader drops a replica from the ISR once a record it sent goes unanswered: a write after the cut */
+    tsdbc *c = client(Lv);
+    tsdb_sid sid = rep_series(c, rep_names[0], "e42", 30000);
+    cut_file(Lv, Cs, 1);
+    cut_file(Cs, Lv, 1);
+    int64_t ts = 1000000;
+    float val = 1;
+    if ((rc = tsdbc_insert_series(c, sid, &ts, &val, 1)) != 0)
+        die("a write to e42 with a replica cut off: %s", ers(rc));
+    tsdbc_close(c);
+    await_isr(Lv, "e42", 2, 30000, "the cut replica out of e42's ISR");
+    int via = -1;
+    for (int i = 0; i < 6 && via < 0; i++)
+        if (i != Lv && i != B && i != Cs)
+            via = i;
+    if (!vol_rec(via, "e42", &f))
+        die("no record of e42");
+    uint64_t e0 = f.epoch;
+    uint32_t old = f.leader;
+    stop(Lv, SIGKILL);
+    stop(B, SIGKILL);
+    for (uint64_t t0 = now_ms();; usleep(50000)) { /* the admin op follows NOTLEADER once: not to a killed server */
+        view(via, &v);
+        int ok = v.st.leader && v.st.leader != ids[Lv] && v.st.leader != ids[B];
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("the metadata group has no leader but a killed server 30 s on");
+    }
+    uint8_t req[8], *reply = NULL;
+    size_t len = 0, rl = cluster_volume_force_encode(num, ids[Cs], req);
+    for (uint64_t t0 = now_ms(); (rc = admin(via, CLUSTER_OP_VOLUME_FORCE, req, rl, 1, &reply, &len)) != 0;
+         usleep(200000)) { /* refused while the group still has the killed leader UP */
+        if (rc != CLUSTER_ERR_STATE || now_ms() - t0 > 30000)
+            die("force-leader of e42 to server %d: %s (%.*s)", Cs, cluster_strerror(rc), (int)len,
+                reply ? (const char *)reply : "");
+        free(reply);
+        reply = NULL;
+    }
+    free(reply);
+    if (await_promoted(via, "e42", old, e0, &f) != Cs || !f.gc_suspended)
+        die("after force-leader: e42 led by node %u, gc_suspended %u", f.leader, f.gc_suspended);
+    char args[PATH_MAX * 2 + 128], out[16384], p[META_ADDR_MAX + 1];
+    peer_of(via, p, sizeof p);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", p, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "redundancy ec=4+2 stripe ") ||
+        !strstr(out, "stripe_version 1 gc_suspended 1"))
+        die("tsdb cluster status after force-leader: %s", out);
+    printf("  force-leader of e42 to server %d: gc_suspended 1, shown by tsdb cluster status\n", Cs);
+    snprintf(args, sizeof args, "cluster volume gc resume %s e42 --secret-file %s", p, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "orphan collection resumed"))
+        die("tsdb %s: %s", args, out);
+    f.gc_suspended = 0;
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        struct meta_volume g;
+        if (vol_rec(via, "e42", &g) && !g.gc_suspended && g.stripe_version == f.stripe_version)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("e42 still gc_suspended 30 s after gc resume");
+    }
+    if ((rc = vol_add(via, "r3", 2, &num)) != 0)
+        die("volume add r3: %s", cluster_strerror(rc));
+    snprintf(args, sizeof args, "cluster volume gc resume %s %" PRIu32 " --secret-file %s", p, num, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) == 0)
+        die("gc resume of a replicas volume answered: %s", out);
+    printf("  tsdb cluster volume gc resume e42: gc_suspended 0; on a replicas volume refused\n");
+    for (int i = 0; i < 6; i++)
+        if (i != Lv)
+            cut_file(i, Lv, 0);
+    cut_file(Lv, Cs, 0);
+    stop_all();
+}
+
 /* No ISR member up (design-cluster.md 6.2): a replica outside the ISR is up, but the group cannot promote it. Clients
  * get UNAVAILABLE(NO_OWNER) from it (not MOVED to the dead leader), the leader of the group says NO_OWNER, and
  * `tsdb cluster volume force-leader` makes the replica the leader at e + 1: its rows stand, the rows the old ISR
@@ -15247,7 +15476,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
