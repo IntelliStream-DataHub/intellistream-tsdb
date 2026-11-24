@@ -336,8 +336,8 @@ equals its own, and the Raft leader commits the new leader and epoch. Nothing is
 *As built (r4-transfer, 2026-11-24; server/rtransfer.c the volume leader's side, server/ctransfer.c the Raft leader's):*
 TRANSFER{volume, epoch, target} goes to the volume leader, which refuses every record from then on (client rows and the
 engine's own markers, as the lease refusal does: UNAVAILABLE PROMOTING, retry after about 50 ms, a definite refusal) until
-the commit point is its written end and the target acknowledged that end durable; READY{end} then goes back, and the Raft
-leader promotes the target with that end as the grant's floor (`target`, `min_end`: the target or nobody, every member's
+the commit point is its written end and the target acknowledged that end durable; READY{end} then goes to the current Raft
+leader (resent), and the one that holds the transfer promotes the target with that end as the grant's floor (`target`, `min_end`: the target or nobody, every member's
 fence answer counted). A drain longer than `transfer_wait_ms` admits again; after READY only a CANCEL, a lost epoch or a
 hard cap of 10 x `transfer_wait_ms` (counted as "admitted blind") do. TRANSFER, CANCEL and READY carry a transfer id that
 increases across Raft leaders (term << 32 and up): a CANCEL ends only the transfer it names or an earlier one, a new Raft
@@ -346,7 +346,7 @@ with a CANCEL of that id. The write pause measured under 4 writers is p50 about 
 mean 310 ms per transfer, 0 refused writes lost or applied, 0 cuts): the drain's 50 ms refusals, the target's 200 ms
 FENCED-to-PROMOTING window and the clients' MOVED delay, not the drain itself. The balance (`leader_balance_s`) moves a
 volume back to rep[0] once it has been in the ISR for the hold, one transfer a second cluster-wide and one per server,
-with a backoff (5 s doubling to 600 s) per target after a failure.
+with a backoff per target after a failure (from `leader_balance_s`, doubling up to 600 s).
 
 ### 3.3 Routing and names
 

@@ -57,6 +57,7 @@ void ctr_duty(uint64_t now);
 void ctr_ready(uint32_t from, const struct cluster_vmsg *m);
 /* the candidate filter of a transfer's promotion (cluster.c promo_step): 1 if `node`'s fence reply goes into the grant */
 int ctr_reply_passes(uint32_t target, uint32_t node);
+int ctr_drop_proposed(void);
 /* a transfer's promotion of `vol` at basis `epoch` was dropped (no grant within PROMO_MOVE_NS) */
 void ctr_promo_dropped(uint32_t vol, uint64_t epoch, uint64_t now);
 /* STATUS's counters of the Raft leader's side (this server's, since it started) */

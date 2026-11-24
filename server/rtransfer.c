@@ -7,8 +7,9 @@
  * DROP, CLASS, SERIES, RETENTION, a large write's COMMIT), exactly as the lease refusal does, so nothing new is
  * appended and every refused write is definite (never admitted; tsdbd answers UNAVAILABLE PROMOTING with a retry after
  * about 50 ms, repld_draining). Once the commit point is the written end and the target acknowledged that end as
- * durable, READY{vol, epoch, end, target} goes to the Raft leader that asked, which promotes the target with that end
- * as its floor (ctransfer.c). The drain waits at most transfer_wait_ms; a timeout, a lost epoch or a CANCEL before
+ * durable, READY{vol, epoch, end, target} goes to the current Raft leader (the cluster thread's, `.to = 0`: after a Raft
+ * leader change the resends reach the new one, which answers a transfer it does not hold with CANCEL), and the Raft
+ * leader that holds it promotes the target with that end as its floor (ctransfer.c). The drain waits at most transfer_wait_ms; a timeout, a lost epoch or a CANCEL before
  * READY admits again and says why once.
  *
  * After READY the writer keeps refusing: a promotion may be under way, and a record admitted now would lie past the end
@@ -27,9 +28,11 @@
  */
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "crashpt.h"
 #include "repld.h"
@@ -50,7 +53,7 @@ struct rtr {
     int state;
     uint64_t epoch;  /* the core's epoch the transfer is for */
     uint32_t target; /* node id */
-    uint32_t to;     /* the Raft leader that asked (READY goes there) */
+    uint32_t to;     /* the Raft leader that asked (only the mutant readypinned sends READY there) */
     uint64_t t0, ready_ms, sent_ms, end;
     int blind; /* past the hard cap: admitting, every record counted */
     int crashed;
@@ -60,9 +63,10 @@ struct rtr {
 /* STATUS's counters (rtr_counts) */
 static atomic_ulong n_timedout, n_blind, n_ready, n_cuts;
 
-enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME };
+enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME, RTM_PINNED };
 /* TSDB_REPLD_MUTANT's names of this file (repld.c's parser knows none of them): READY at once, admitting during the
- * drain, admitting again after READY on its own timer (transfer_wait_ms) */
+ * drain, admitting again after READY on its own timer (transfer_wait_ms), READY sent to the Raft leader that asked
+ * instead of the current one */
 static int rtr_mutant(void)
 {
     static atomic_int m = -1;
@@ -73,6 +77,7 @@ static int rtr_mutant(void)
             : !strcmp(e, "transfernodrain") ? RTM_NODRAIN
             : !strcmp(e, "transferadmit")   ? RTM_ADMIT
             : !strcmp(e, "transferresume")  ? RTM_RESUME
+            : !strcmp(e, "readypinned")     ? RTM_PINNED
                                             : RTM_NONE;
         if (v != RTM_NONE)
             say("MUTANT %s (tests only)", e);
@@ -167,7 +172,7 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
         return;
     }
     if (t->state != RT_IDLE && t->epoch == c->epoch && t->target == c->node) {
-        t->to = from; /* the same transfer asked again (a new Raft leader's): READY goes there now */
+        t->to = from; /* the same transfer asked again (a new Raft leader's) */
         t->id = c->arg;
         t->sent_ms = 0;
         return;
@@ -187,9 +192,19 @@ void rtr_cmd(struct rvol *rv, const struct cluster_volcmd *c, uint32_t from)
 static void send_ready(struct rvol *rv, struct rtr *t, uint64_t now)
 {
     struct cluster_vmsg m = {.kind = CL_VMSG_READY, .volume = rv->number, .epoch = t->epoch, .durable = t->end,
-                             .rid = t->target, .start = t->id, .to = t->to};
+                             .rid = t->target, .start = t->id, .to = rtr_mutant() == RTM_PINNED ? t->to : 0};
     cluster_vol_msg(&m);
     t->sent_ms = now;
+}
+
+/* TSDB_REPLD_TEST=drainhold: no READY while <dir>/drainhold exists (the drain goes on to a CANCEL or its timeout) */
+static int drain_held(void)
+{
+    if (!G.drain_hold)
+        return 0;
+    char f[sizeof G.dir + 16];
+    snprintf(f, sizeof f, "%s/drainhold", G.dir);
+    return access(f, F_OK) == 0;
 }
 
 void rtr_tick(struct rvol *rv)
@@ -211,7 +226,8 @@ void rtr_tick(struct rvol *rv)
     if (t->state == RT_DRAIN) {
         uint64_t written = repl_written(rv->core);
         int ti = tr_index(rv, t->target);
-        int done = repl_commit(rv->core) >= written && ti >= 0 && repl_peer_match(rv->core, ti) >= written;
+        int done = repl_commit(rv->core) >= written && ti >= 0 && repl_peer_match(rv->core, ti) >= written &&
+                   !drain_held();
         if (done || rtr_mutant() == RTM_NODRAIN) {
             t->state = RT_READY;
             t->end = written;

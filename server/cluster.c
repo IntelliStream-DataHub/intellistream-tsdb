@@ -1136,6 +1136,9 @@ static struct {
                           * and a timed-out transfer's CANCEL is not sent (both lost on the link: test_cluster
                           * transferstale, a volume leader holding a READY its Raft leader no longer knows) */
     char losereadyfile[1100];
+    unsigned long long hold_grant_ms; /* TSDB_CLUSTER_TEST hold_grant_ms=N: the Raft leader proposes a transfer's grant
+                                       * (one with a target) N ms after it decided it (test_cluster transfergrant: a grant
+                                       * whose commit comes past PROMO_MOVE_NS, as on a slow Raft quorum) */
     int hold_reply;      /* TSDB_CLUSTER_TEST hold_reply_file=1: while <state-dir>/holdreply is, a copy of each FENCE_REPLY sent
                           * is kept; while <state-dir>/replayreply is, the copies are sent again every round (test_cluster
                           * oneway2: a late answer to an earlier fence of the volume must not count for the promotion now) */
@@ -1414,6 +1417,8 @@ static void test_knobs(void)
             C.hold_isr = v != 0;
         else if (sscanf(p, "drop_fence_file=%llu", &v) == 1)
             C.drop_fence = v != 0;
+        else if (sscanf(p, "hold_grant_ms=%llu", &v) == 1)
+            C.hold_grant_ms = v;
         else if (sscanf(p, "lose_ready_file=%llu", &v) == 1)
             C.lose_ready = v != 0;
         else if (sscanf(p, "hold_reply_file=%llu", &v) == 1)
@@ -6158,6 +6163,22 @@ static int heard_fresh(uint32_t id, uint64_t now)
     return last && since(now, last) < (uint64_t)settings()->node_timeout_ms * MS;
 }
 
+static struct {
+    struct meta_grant g;
+    uint64_t due_ns; /* 0: none held */
+} g_held;
+
+static void grant_propose(const struct meta_grant *g, uint64_t took_ns)
+{
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_volume_leader(&e, g);
+    if (propose(&e, 0, 0, 0) == ISO_OK)
+        say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
+            " fenced members answered, %" PRIu64 " ms)", g->number, g->leader, g->new_epoch, g->nreplies, g->nfenced,
+            (uint64_t)(took_ns / MS));
+}
+
 /* 1: proposed (or nothing to do any more) */
 static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now)
 {
@@ -6241,13 +6262,13 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
     uint64_t last = v->nhist ? v->hist[v->nhist - 1].start : 0;
     g.start = best + 1 > last + 1 ? best + 1 : last + 1;
     p->proposed_ns = now;
-    struct meta_entry e;
-    meta_entry_init(&e);
-    meta_op_volume_leader(&e, &g);
-    if (propose(&e, 0, 0, 0) == ISO_OK)
-        say("proposes volume %" PRIu32 " leader %" PRIu32 " at epoch %" PRIu64 " (%" PRIu32 " of %" PRIu32
-            " fenced members answered, %" PRIu64 " ms)", p->vol, g.leader, g.new_epoch, g.nreplies, g.nfenced,
-            (uint64_t)(since(now, p->t0) / MS));
+    if (C.hold_grant_ms && g.target && !g_held.due_ns) { /* the test hook: proposed by promote_duty later */
+        g_held.g = g;
+        g_held.due_ns = now + C.hold_grant_ms * MS;
+        say("test: holds the grant of volume %" PRIu32 " to node %" PRIu32 " for %llu ms", p->vol, g.leader,
+            C.hold_grant_ms);
+    } else
+        grant_propose(&g, since(now, p->t0));
     const struct vstate *fs = vs_find(p->vol);
     if (fs && fs->forced && fs->forced_node == g.leader && fs->forced_epoch == p->epoch)
         say("volume %" PRIu32 ": forced leader %" PRIu32 " ends at %" PRIu64 ", the last shrink's commit point is "
@@ -6377,9 +6398,14 @@ static void promote_duty(uint64_t now)
     g_nresign = 0;
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
         g_npromo = 0;
+        g_held.due_ns = 0; /* a held grant is a proposal lost with the leadership */
         for (uint32_t i = 0; nres && i < g_nvs; i++)
             g_vs[i].resigned = 0;
         return;
+    }
+    if (g_held.due_ns && now >= g_held.due_ns) {
+        g_held.due_ns = 0;
+        grant_propose(&g_held.g, 0);
     }
     size_t k = 0;
     for (size_t i = 0; i < g_npromo; i++) { /* the record moved past the basis, or the proposal is lost */
@@ -6387,7 +6413,9 @@ static void promote_duty(uint64_t now)
         const struct meta_volume *v = meta_volume(&C.sm, p->vol);
         int moved = !v || v->epoch != p->epoch || v->isr_version != p->version;
         int cand = cl_mutant() != CLM_MOVEGIVEUP && promo_candidate(p);
-        if (!moved && p->target && since(now, p->t0) >= PROMO_MOVE_NS) { /* a transfer: ctransfer.c cancels it */
+        /* a transfer's promotion with no grant proposed: ctransfer.c cancels it. One whose grant is proposed waits for
+         * the commit (or PROMO_GIVEUP_NS, a lost proposal), as a failover's does: the grant may still commit */
+        if (!moved && p->target && (!p->proposed_ns || ctr_drop_proposed()) && since(now, p->t0) >= PROMO_MOVE_NS) {
             say("volume %" PRIu32 ": no grant to target %" PRIu32 " committed within %llu ms; the transfer's "
                 "promotion is dropped", p->vol, p->target, (unsigned long long)(PROMO_MOVE_NS / MS));
             ctr_promo_dropped(p->vol, p->epoch, now);

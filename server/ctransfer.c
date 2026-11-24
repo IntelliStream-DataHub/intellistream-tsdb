@@ -5,18 +5,19 @@
  *
  * `tsdb cluster volume transfer PEER V NODE` (ctr_admin): NODE must be an ISR member of V, UP and heard, and not its
  * leader; one transfer per volume, none while a promotion of V runs. The Raft leader sends TRANSFER{V, epoch, NODE,
- * arg = its Raft term} to the volume's leader (resent until READY), whose driver drains (rtransfer.c) and answers
- * READY{V, epoch, end, NODE, start = the term}. On READY the promotion starts as PLANNED with the target and READY's
- * end (promo_start_target): FENCE to every ISR member, every reply passes the candidate filter (ctr_reply_passes: the
+ * arg = the transfer's id} to the volume's leader (resent until READY), whose driver drains (rtransfer.c) and answers
+ * READY{V, epoch, end, NODE, start = the id} to the current Raft leader. On READY the promotion starts as PLANNED with
+ * the target and READY's end (promo_start_target): FENCE to every ISR member, every reply passes the candidate filter (ctr_reply_passes: the
  * drained old leader too, so nobody is left `unanswered`), and the grant names the target and min_end, which meta's
  * promote_rule turns into the target or nothing. The admin op is answered once the record names the target at a later
  * epoch, or with why not:
  *   - no READY within transfer_wait_ms + READY_SLACK_NS: CANCEL, "timed out";
- *   - no grant within PROMO_MOVE_NS of the promotion (cluster.c drops it, ctr_promo_dropped): CANCEL, and an old leader
+ *   - no grant proposed within PROMO_MOVE_NS of the promotion (cluster.c drops it, ctr_promo_dropped; one proposed waits
+ *     for its commit or PROMO_GIVEUP_NS, then the promotion is gone and CANCEL follows PROMO_HOLD_NS later): CANCEL, and an old leader
  *     already fenced is deposed: the existing path reopens it as a replica and a failover follows ("fell back");
  *   - the record moved to another leader: "fell back to failover".
- * The state lives in memory only: a new Raft leader sends CANCEL{V, 0, arg = its term} to every volume leader in its
- * first duty rounds (until each is sent), and a volume leader ignores commands of an older term (rtransfer.c).
+ * The state lives in memory only: a new Raft leader sends CANCEL{V, 0, arg = term << 32} to every volume leader in its
+ * first duty rounds (until each is sent), and a volume leader ignores commands of an older id (rtransfer.c).
  *
  * Leader balance (D15, ctr_duty): leader_balance_s > 0, a volume led by another member than rep[0], rep[0] UP and in
  * the ISR without a break for leader_balance_s (from when this Raft leader saw it join, not from its last heartbeat),
@@ -77,7 +78,7 @@ static uint64_t g_last_balance; /* the last balance start */
 /* STATUS (cluster_int.h ctr_counts) */
 static atomic_ulong n_started, n_done, n_timedout, n_cancelled, n_fallback, n_balance;
 
-enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL };
+enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM_READYNOCANCEL, CTM_DROPPROPOSED };
 /* TSDB_CLUSTER_MUTANT's names of this file (cluster.c's parser knows none of them) */
 static int ctr_mutant(void)
 {
@@ -90,6 +91,7 @@ static int ctr_mutant(void)
             : !strcmp(e, "balanceflap")        ? CTM_BALANCEFLAP
             : !strcmp(e, "nocancel")           ? CTM_NOCANCEL
             : !strcmp(e, "readynocancel")      ? CTM_READYNOCANCEL
+            : !strcmp(e, "dropproposed")       ? CTM_DROPPROPOSED
                                                : CTM_NONE;
         if (m != CTM_NONE)
             cl_say("MUTANT %s (tests only)", e);
@@ -298,6 +300,10 @@ void ctr_ready(uint32_t from, const struct cluster_vmsg *m)
     else
         promo_start_target(v, META_GR_PLANNED, t->target, m->durable, now);
 }
+
+/* promote_duty keeps a transfer's promotion whose grant is proposed past PROMO_MOVE_NS: the grant may still commit, and a
+ * CANCEL then would answer "cancelled" for a transfer that succeeds (the mutant drops it all the same) */
+int ctr_drop_proposed(void) { return ctr_mutant() == CTM_DROPPROPOSED; }
 
 int ctr_reply_passes(uint32_t target, uint32_t node)
 {

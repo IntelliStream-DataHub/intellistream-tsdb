@@ -81,7 +81,8 @@
  * <dir>/stalesent exists, below the log's start (what a resync that raced records in flight left behind; the cursor
  * must move up to what the peer acknowledged, or it is never sent another record); `slowread` has every catch-up
  * read take SLOW_READ_MS more (a slow disk or NFS); `slowtick` has a writer's catch-up step take SLOW_TICK_MS at every
- * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `slowack` has a replica's ACKs report the durable end it had
+ * tick it runs (tickwall); `latetick` has every tick of a writer take LATE_TICK_MS more (rejoinlate); `drainhold` keeps
+ * a transfer's drain from READY while <dir>/drainhold exists (rtransfer.c, transferraftdrain); `slowack` has a replica's ACKs report the durable end it had
  * SLOW_ACK_MS before (a far replica: always a few writes behind the leader's end while it keeps up); `latebytes` holds
  * the writer's first rows record written while <dir>/latebytes exists in op_bytes, after its write(), until a demote has
  * begun (deposetail).
@@ -2233,6 +2234,7 @@ void repld_init(tsdb *t, const char *dir)
     G.slow_tick = te && strstr(te, "slowtick");
     G.late_tick = te && strstr(te, "latetick");
     G.slow_ack = te && strstr(te, "slowack");
+    G.drain_hold = te && strstr(te, "drainhold");
     G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
     if (G.mutant == RM_NOSPILL)
         G.spill_bytes = UINT64_MAX;

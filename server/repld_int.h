@@ -267,6 +267,8 @@ struct repld_g {
                        * lagging peer or not (tickwall) */
     int late_tick;    /* TSDB_REPLD_TEST=latetick: every tick of a writer takes LATE_TICK_MS more, so its ticks are always
                        * late (a volume thread that cannot keep up: TSan, a full inbox) (rejoinlate) */
+    int drain_hold;   /* TSDB_REPLD_TEST=drainhold: while <dir>/drainhold exists a drain never ends in READY (rtransfer.c;
+                         test_cluster transferraftdrain: a drain the Raft leader's kill leaves behind) */
     int slow_ack;     /* TSDB_REPLD_TEST=slowack: a replica's ACK reports the durable end it had SLOW_ACK_MS ago (a far
                        * replica: what it reports trails the leader's end even while it keeps up) */
     struct rin *ins; /* bulk files being received */
