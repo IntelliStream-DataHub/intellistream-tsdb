@@ -87,6 +87,10 @@ int ppos_set(struct eng *db, const char *name, uint64_t pos);
 int ppos_of(struct eng *db, const char *name, uint64_t *pos);
 
 #define PPOS_UNKNOWN UINT64_MAX
+/* A snapshot's install (src/snapshot.c): a new PPOS file in the directory dirfd (not an engine's: no engine is open on
+ * it) holding one record per name at pos[i] (PPOS_UNKNOWN recorded as unknown), written and, with sync, fdatasynced;
+ * the caller syncs the directory. TSDB_ERR_INVALID when a PPOS is there already, TSDB_ERR_IO, TSDB_ERR_NOMEM. */
+int ppos_write_new(int dirfd, const char *const *names, const uint64_t *pos, size_t n, bool sync);
 /* record flags: how the position was found (information only) */
 enum { PPOS_F_GIVEN = 1, PPOS_F_MAP = 2, PPOS_F_FALLBACK = 4, PPOS_F_UNKNOWN = 8, PPOS_F_ALL = 15 };
 /* planted bugs (tests/test_ppos.c --mutant; also TSDB_PPOS_MUTANT in the test's children) */

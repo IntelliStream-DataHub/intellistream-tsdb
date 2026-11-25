@@ -106,16 +106,16 @@ beside `ecrankdown` and `swapnodropcheck`, which R7's tests already catch on one
 - `tsdb_query_multi` over settled parts has no seam test of its own (the oracle covers it end to end); the cluster's
   `route_decide` is not exercised with a diverged volume.
 
-- **A snapshot carries no `.ec` parts (R4, r4-docs, 2026-11-25).** `snap_make` (`src/snapshot.c`, header: "Not built: .ec
-  parts") refuses a volume that lists one with `TSDB_ERR_INVALID`, and `snap_install` refuses a file that is not a `.part`
-  ("an .ec part cannot be installed yet"). R4's plan assumed the tier stays refused on cluster volumes (`src/tier.c`
-  then), and R8 has since let an erasure-coded cluster volume attach one (`eccold_may_attach`, `tier_engine_attach`,
-  `src/tier.c`), so once a leader has settled a key, every snapshot of that volume fails: a replica that needs one (a
-  `volume move --log` target, a `replica reset`, a member past the retention caps) stays a learner (the make fails, the source answers BUSY and the replica asks again). R8 must make the snapshot carry the `.ec` parts of the cut (the index files and object records; the
-  chunks stay on the stripe group's stores), with their `ppos` records, and decide what of the kept `settled_*` and
-  `retired_*` files travels; a test of the install with a settled key (rows equal to the leader's, a read through the
-  seam on the new replica, power loss at each step) belongs with it. Until then a log replica of an erasure-coded volume
-  cannot be moved or rebuilt once it has settled anything.
+- **Done (snap-ec, 2026-11-25): a snapshot carries `.ec` parts.** Was: `snap_make` refused a volume that listed one, so a
+  log replica of an erasure-coded volume could not be moved, reset or rebuilt past the caps once it had settled a key.
+  Now the make carries the cut's `.ec` parts (index file and object record; the chunks stay on the stores) with their
+  PPOS records (SNAPMAN version 3), the install verifies each `.ec` and writes PPOS before SNAPDONE; `settled_` and
+  `retired_` files never travel (src/snapshot.c header, "Settled parts"). Tests: `test_snapshot --only ec` (install with a
+  settled key, rows equal to the leader's, read through the seam on the new replica, power loss at each step of the
+  install), mutants `snapinstnoppos snappposafter snapcarrysettled snapskipec`. Still open: a `test_cluster` move or
+  reset of such a volume end to end, which needs tsdbd to make an EC cluster volume (`requires=ec` on a cluster volume
+  and cold ops over the chunk servers); and r8k's MK_GC: an `.ec` listed at P and dropped by the leader after P can
+  lose its chunks to the leader's purge before the receiver replays the DROP, as for any replica behind such a drop.
 
 ## What R8 inherits and must keep (do not weaken)
 

@@ -59,16 +59,45 @@
  *
  * SNAPMAN (little endian): "TSNAPMAN" | u32 version | u32 nhist | u32 nfiles | u32 0 | i64 volume | 16-byte uuid |
  * u64 P | P's epoch | P's segment | S | S's first position | RSTATE's done | nhist x (u64 epoch, u64 first) |
- * nfiles x (u16 name length, name, u8 kind, u64 size, u64 xxh64, u32 link) | u64 xxh64 of all before. `link` is 0, or
- * 1 + the index of an earlier entry that is the same inode (size and xxh64 are then that entry's). Version 2 (1 had no
- * link); no reader of 1 exists.
+ * nfiles x (u16 name length, name, u8 kind, u64 size, u64 xxh64, u32 link, u64 ppos) | u64 xxh64 of all before.
+ * `link` is 0, or 1 + the index of an earlier entry that is the same inode (size and xxh64 are then that entry's).
+ * `ppos` is a part's PPOS record at the cut on an erasure-coded volume, 0 elsewhere. Version 3 (2 had no ppos, 1 no
+ * link); no reader of an older one exists (a snapshot never outlives its engine).
  *
- * Not built: .ec parts (R8: a volume with one is refused, TSDB_ERR_INVALID), reuse of files the receiver holds (D4, R9).
+ * Settled parts (snap-ec; an erasure-coded cluster volume, META requires=cluster and ec). The cut lists .ec parts with
+ * the others, and each part's PPOS record (ppos_of under db->lock: its map mutex is a leaf); an .ec part is linked like
+ * a part (by its listed name, or retired_<name> when a drop retired it after the cut) as SNAP_EC: its file is the
+ * source's header, index and footer and the object record, a few hundred KB; the object's chunks stay on the stripe
+ * group's stores, which the receiver reads through its own tier (on a cluster, the chunk servers). The install writes
+ * PPOS from SNAPMAN's ppos fields, synced with the directory before SNAPDONE (as ecapply_swap_pre's records precede a
+ * swap), because the open refuses a listed part without a record. What does not travel, and why:
+ * - settled_ files (a swap's sources, kept for keep_s and until the digest matched): the digest guards the leader's
+ *   own encode against the bytes it read; the receiver encoded nothing and reads an .ec part only through the seam,
+ *   which checks every granule against the record's sums. Carried, each would cost a copy of the source (as large as
+ *   the object) and leave the receiver a file outside its list whose deletion it would own. The leader keeps its own
+ *   and digests them as before. SNAPMAN refuses a settled_ or retired_ name of any kind (mutant snapcarrysettled).
+ *   So a member built from a snapshot holds no source copy of the objects settled before P: its MK_DIGEST finds nothing
+ *   retired there and answers 0 (never a false DIVERGED), and it adds no independent digest of those objects until R10
+ *   re-encodes them; the leader's digest (and those of the members that applied the COLD) still run.
+ * - retired_ files (merge inputs, dropped parts, retired .ec parts whose chunks ecgc has not deleted yet): not listed
+ *   at the cut, so nothing reads them; a part listed at the cut and retired after it travels under its listed name.
+ *   ecgc's last reference stays the leader's: the receiver's open sweep is skipped on every ec cluster volume
+ *   (src/ecgc.c, db->ppos), so it deletes no shared object. Open (r8k's MK_GC): an .ec listed at P and dropped by the
+ *   leader after P can lose its chunks to the leader's purge before the receiver replays the DROP, as for any replica
+ *   behind a drop of a settled key. The install checks the .ec file only, never that its object's chunks are on the
+ *   stores (that needs the stores, which the install does not open): such an object installs and its first read is
+ *   CORRUPT; MK_GC's rules are what keeps the chunks there.
+ * - stage_ and keep_ files of COLD markers (the .ec files and Y parts jr_cold links, named by key) travel as a
+ *   COMMIT's do; a keep_ that is the inode of a listed .ec part is that entry's link.
+ *
+ * Not built: reuse of files the receiver holds (D4, R9).
  */
 #include "internal.h"
 #include "snapshot.h"
 #include "feed.h"
 #include "replfile.h"
+#include "ppos.h"
+#include "ecpart.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -228,6 +257,7 @@ struct sfile {
     uint8_t kind;
     uint32_t link; /* SNAPMAN's: 1 + the entry this one is a link of */
     uint64_t size, xxh, dev, ino;
+    uint64_t ppos; /* a part's PPOS record at the cut (an ec cluster volume), else 0 */
 };
 
 typedef struct mk_ctx {
@@ -252,7 +282,7 @@ static int add_file(mk_ctx *c, const char *name, uint8_t kind, uint64_t size, ui
     }
     struct sfile *f = &c->f[c->nf++];
     snprintf(f->name, sizeof f->name, "%s", name);
-    f->kind = kind, f->size = size, f->xxh = xxh, f->link = link;
+    f->kind = kind, f->size = size, f->xxh = xxh, f->link = link, f->ppos = 0;
     f->dev = (uint64_t)st->st_dev, f->ino = (uint64_t)st->st_ino;
     if (!link)
         c->out->bytes += size;
@@ -532,7 +562,7 @@ static int write_man(mk_ctx *c, int64_t volume, const uint8_t uuid[16], const st
             nh++;
     size_t n = 8 + 16 + 8 + 16 + 6 * 8 + nh * 16 + 8;
     for (size_t i = 0; i < c->nf; i++)
-        n += 2 + strlen(c->f[i].name) + 1 + 16 + 4;
+        n += 2 + strlen(c->f[i].name) + 1 + 16 + 4 + 8;
     uint8_t *b = calloc(1, n);
     if (!b)
         return TSDB_ERR_NOMEM;
@@ -563,6 +593,7 @@ static int write_man(mk_ctx *c, int64_t volume, const uint8_t uuid[16], const st
         put64(b + o, c->f[i].size), o += 8;
         put64(b + o, c->f[i].xxh), o += 8;
         put32(b + o, c->f[i].link), o += 4;
+        put64(b + o, c->f[i].ppos), o += 8;
     }
     put64(b + o, xxh64(b, o, 0)), o += 8;
     int fd = openat(c->sdfd, SNAP_MAN ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -636,7 +667,7 @@ static int copy_dicts(mk_ctx *c, const struct dictlen *dl)
 }
 
 /* Every part linked first, then each read (snapshot.c's header: the links are not spaced out by the reads) */
-static int link_parts(mk_ctx *c, char (*names)[96], size_t n)
+static int link_parts(mk_ctx *c, char (*names)[96], const uint64_t *pp, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         hook(c->db, SNAP_AT_PART, names[i]);
@@ -652,32 +683,59 @@ static int link_parts(mk_ctx *c, char (*names)[96], size_t n)
             return rc;
     }
     for (size_t i = 0; i < n; i++) {
-        int rc = seal_file(c, names[i], SNAP_PART);
+        int rc = seal_file(c, names[i], ec_file_name(names[i]) ? SNAP_EC : SNAP_PART);
         if (rc)
             return rc;
+        c->f[c->nf - 1].ppos = pp[i];
         c->out->nparts++;
+    }
+    if (snap_mutant == SNAP_MUT_CARRYSETTLED) { /* planted: the leader's settled_ sources travel too */
+        DIR *d = fdopendir(dup(c->db->dirfd));
+        struct dirent *e;
+        int rc = d ? 0 : TSDB_ERR_IO;
+        if (d)
+            rewinddir(d);
+        while (rc == 0 && d && (e = readdir(d)))
+            if (!strncmp(e->d_name, "settled_", 8))
+                rc = link_one(c, e->d_name, e->d_name, SNAP_PART);
+        if (d)
+            closedir(d);
+        if (rc)
+            return rc == 1 ? SNAP_RETRY : rc;
     }
     return 0;
 }
 
-static int list_part_names(eng *db, char (**out)[96], size_t *n)
+/* The names of the listed parts and, on an erasure-coded cluster volume, each one's PPOS record (ppos_of takes only
+ * the map's mutex, a leaf: no edge under db->lock). Every listed part has a record: it was synced before its name was
+ * visible (src/ppos.h), so a part without one is damage. An .ec part on any other volume is refused: only an ec
+ * cluster volume's leader settles (eccold), and a single server makes no snapshot. */
+static int list_part_names(eng *db, char (**out)[96], uint64_t **pp, size_t *n)
 {
     pthread_mutex_lock(&db->lock);
     size_t np = db->nparts;
     char(*v)[96] = malloc((np ? np : 1) * sizeof *v);
-    int rc = v ? 0 : TSDB_ERR_NOMEM;
+    uint64_t *pv = calloc(np ? np : 1, sizeof *pv);
+    int rc = v && pv ? 0 : TSDB_ERR_NOMEM;
+    size_t k = 0;
     for (size_t i = 0; rc == 0 && i < np; i++) {
-        size_t l = strlen(db->parts[i]->name);
-        if (l > 3 && strcmp(db->parts[i]->name + l - 3, ".ec") == 0)
-            rc = TSDB_ERR_INVALID; /* settled parts in a snapshot are R8's */
-        memcpy(v[i], db->parts[i]->name, sizeof v[i]);
+        memcpy(v[k], db->parts[i]->name, sizeof v[k]);
+        if (snap_mutant == SNAP_MUT_SKIPEC && ec_file_name(v[k]))
+            continue; /* planted: the settled parts left out (their rows lost to the replica) */
+        if (!db->ec_cluster && ec_file_name(v[k]))
+            rc = TSDB_ERR_INVALID;
+        else if (db->ppos && ppos_of(db, v[k], &pv[k]) != 0)
+            rc = TSDB_ERR_CORRUPT; /* ppos_of said which */
+        k++;
     }
+    np = k;
     pthread_mutex_unlock(&db->lock);
     if (rc) {
         free(v);
+        free(pv);
         return rc;
     }
-    *out = v, *n = np;
+    *out = v, *pp = pv, *n = np;
     return 0;
 }
 
@@ -696,6 +754,7 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     c.sdfd = openat(db->dirfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int rc = c.sdfd < 0 ? TSDB_ERR_IO : 0;
     char(*parts)[96] = NULL;
+    uint64_t *pp = NULL;
     size_t nparts = 0, nlf = 0, nsegs = 0;
     struct lkfile *lf = NULL;
     uint8_t *rsb = NULL, *meta = NULL;
@@ -713,7 +772,7 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     if (snap_mutant == SNAP_MUT_DICTSHORT) /* planted: the lengths read with no barrier, so a writer whose marker P */
         dict_lengths_now(db, &dl);         /* passes and whose record is not written yet is left out */
     if (snap_mutant != SNAP_MUT_AFTERP)
-        rc = list_part_names(db, &parts, &nparts);
+        rc = list_part_names(db, &parts, &pp, &nparts);
     pthread_mutex_lock(&db->lock);
     pthread_mutex_lock(&db->buf_lock);
     for (size_t i = 0; i <= db->nflushing; i++) {
@@ -738,7 +797,7 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     hook(db, SNAP_AT_CUT, NULL);
 
     /* ---- the parts ---- */
-    if (snap_mutant != SNAP_MUT_AFTERP && (rc = link_parts(&c, parts, nparts)) != 0)
+    if (snap_mutant != SNAP_MUT_AFTERP && (rc = link_parts(&c, parts, pp, nparts)) != 0)
         goto out;
     hook(db, SNAP_AT_LINKED, NULL);
 
@@ -748,7 +807,7 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     if ((rc = copy_dicts(&c, &dl)) != 0)
         goto out;
     if (snap_mutant == SNAP_MUT_AFTERP) { /* planted: the list as it is now, past the cut */
-        if ((rc = list_part_names(db, &parts, &nparts)) != 0 || (rc = link_parts(&c, parts, nparts)) != 0)
+        if ((rc = list_part_names(db, &parts, &pp, &nparts)) != 0 || (rc = link_parts(&c, parts, pp, nparts)) != 0)
             goto out;
     }
     hook(db, SNAP_AT_DICTS, NULL);
@@ -879,6 +938,7 @@ out:
     if (rc)
         snap_release(out->path);
     free(parts);
+    free(pp);
     free(lf);
     free(rsb);
     free(meta);
@@ -1025,14 +1085,38 @@ static int cmp_fname(const void *a, const void *b)
 }
 
 /* The names the install writes itself: a SNAPMAN that lists one is refused, so a received copy never carries the mark
- * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO or LOCK of the sender */
+ * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO, LOCK or PPOS of the
+ * sender (the install writes PPOS from SNAPMAN's ppos fields) */
 static bool snap_name_reserved(const char *n)
 {
-    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp"};
+    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp", "PPOS", "PPOS.tmp"};
+    if (snap_mutant == SNAP_MUT_NORESERVED) /* planted: no name is the install's own */
+        return false;
     for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
         if (strcmp(n, r[i]) == 0)
             return true;
     return false;
+}
+
+/* The names a kind allows: a part a plain part name, an .ec part a plain .ec name (never a retired_ or settled_ file:
+ * the make links a part retired after the cut under its listed name, and settled_ sources never travel), a COMMIT's
+ * file its stage_ or keep_ name; no file of any kind is a retired_ or settled_ one. */
+static bool kind_name_ok(uint8_t kind, const char *name)
+{
+    if (!strncmp(name, "retired_", 8) || !strncmp(name, "settled_", 8))
+        return false;
+    switch (kind) {
+    case SNAP_PART:
+        return part_file_name(name);
+    case SNAP_EC:
+        return ec_file_name(name);
+    case SNAP_STAGE:
+        return !strncmp(name, "stage_", 6);
+    case SNAP_KEEP:
+        return !strncmp(name, "keep_", 5);
+    default:
+        return true;
+    }
 }
 
 int snap_man_read(const char *dir, struct snap_man *m)
@@ -1055,8 +1139,8 @@ int snap_man_read(const char *dir, struct snap_man *m)
         memcpy(&m->version, b + 8, 4);
         memcpy(&nh, b + 12, 4);
         memcpy(&nf, b + 16, 4);
-        /* bounds from the length before any allocation: a file entry takes at least 2 + 1 + 1 + 16 + 4 bytes */
-        ok = m->version == SNAP_MAN_VERSION && nh <= (len - head - 8) / 16 && nf <= (len - head - 8 - 16 * (size_t)nh) / 24;
+        /* bounds from the length before any allocation: a file entry takes at least 2 + 1 + 1 + 16 + 4 + 8 bytes */
+        ok = m->version == SNAP_MAN_VERSION && nh <= (len - head - 8) / 16 && nf <= (len - head - 8 - 16 * (size_t)nh) / 32;
     }
     size_t o = 24;
     if (ok) {
@@ -1085,7 +1169,7 @@ int snap_man_read(const char *dir, struct snap_man *m)
                 break;
             }
             memcpy(&l, b + o, 2), o += 2;
-            if (l == 0 || l >= sizeof m->files[i].name || o + l + 21 > len - 8 || memchr(b + o, '/', l) ||
+            if (l == 0 || l >= sizeof m->files[i].name || o + l + 29 > len - 8 || memchr(b + o, '/', l) ||
                 memchr(b + o, 0, l)) {
                 ok = false;
                 break;
@@ -1096,9 +1180,11 @@ int snap_man_read(const char *dir, struct snap_man *m)
             f->size = get64(b + o), o += 8;
             f->xxh64 = get64(b + o), o += 8;
             memcpy(&f->link, b + o, 4), o += 4;
+            f->ppos = get64(b + o), o += 8;
             ok = strcmp(f->name, ".") && strcmp(f->name, "..") && strncmp(f->name, SNAP_MAN, strlen(SNAP_MAN)) &&
                  !snap_name_reserved(f->name) &&
-                 f->kind >= SNAP_PART && f->kind <= SNAP_META &&
+                 f->kind >= SNAP_PART && f->kind <= SNAP_EC && kind_name_ok(f->kind, f->name) &&
+                 (f->ppos == 0 || f->kind == SNAP_PART || f->kind == SNAP_EC) &&
                  (!f->link || (f->link <= i && !m->files[f->link - 1].link && m->files[f->link - 1].size == f->size &&
                                m->files[f->link - 1].xxh64 == f->xxh64));
             m->nfiles++;
@@ -1230,17 +1316,54 @@ static int inst_verify_files(int sdfd, const struct snap_man *m, const char *sta
     return rc;
 }
 
-/* every part's own checksums: header, index and footer (part_open), and every granule's crc */
-static int inst_verify_parts(int sdfd, const struct snap_man *m, bool v8_ok, const char *staged)
+/* An .ec part (SNAP_EC): its source's header, index and footer and its object record (part_open_ec_at: the hashes, the
+ * record against the footer and the name). Its granules are in the chunks, which stay on the stripe group's stores:
+ * the installed replica's reads check each granule against the record's sums (the seam). The record's ppos is the
+ * COLD's Z, at or below P (a listed .ec was swapped after its marker committed), and SNAPMAN's is what the leader's
+ * swap recorded for it: Z, or PPOS_UNKNOWN for a record whose ppos is 0 (ecapply_swap_pre, which record_valid allows
+ * on a cluster volume; refusing it here would leave every later learner of the volume refused). The install writes
+ * SNAPMAN's into PPOS, and a replica's later COLD of the key compares its own parts against it. */
+static int inst_verify_ec(int sdfd, const struct snap_man *m, const struct snap_file *f, const char *staged)
+{
+    part *p = NULL;
+    int rc = snap_mutant == SNAP_MUT_ECNOVERIFY ? 0 : part_open_ec_at(sdfd, f->name, f->name, true, false, &p);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: %s: the .ec part %s does not open: %d\n", staged, f->name, rc);
+        return rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ? rc : TSDB_ERR_CORRUPT;
+    }
+    if (!p) /* planted (snapecnoverify): the .ec file taken unread */
+        return 0;
+    uint64_t z = p->ec->rec.ppos, want = z ? z : PPOS_UNKNOWN;
+    if ((z > m->p && snap_mutant != SNAP_MUT_ECNOZP) || (f->ppos != want && snap_mutant != SNAP_MUT_ECNOZEQ)) {
+        fprintf(stderr, "tsdb: %s: the .ec part %s records ppos %" PRIu64 ", SNAPMAN %" PRIu64 ", P %" PRIu64 "\n",
+                staged, f->name, z, f->ppos, m->p);
+        rc = TSDB_ERR_CORRUPT;
+    }
+    part_unref(p);
+    return rc;
+}
+
+/* every part's own checksums: header, index and footer (part_open), and every granule's crc; an .ec part's through
+ * inst_verify_ec. `ec`: the snapshot's META says requires=ec, where every part carries its PPOS record and only there
+ * an .ec part may be: elsewhere an .ec entry has no ppos (refused below otherwise), and inst_verify_ec refuses an .ec
+ * whose SNAPMAN ppos is 0, whatever its record says */
+static int inst_verify_parts(int sdfd, const struct snap_man *m, bool v8_ok, bool ec, const char *staged)
 {
     for (size_t i = 0; i < m->nfiles; i++) {
         const struct snap_file *f = &m->files[i];
-        if (f->kind != SNAP_PART)
+        if (f->kind != SNAP_PART && f->kind != SNAP_EC)
             continue;
-        size_t nl = strlen(f->name);
-        if (nl < 6 || strcmp(f->name + nl - 5, ".part") != 0) {
-            fprintf(stderr, "tsdb: %s: %s is not a .part (an .ec part cannot be installed yet)\n", staged, f->name);
-            return TSDB_ERR_INVALID;
+        if (ec != (f->ppos != 0) && snap_mutant != SNAP_MUT_ECNOPPOS) {
+            fprintf(stderr, "tsdb: %s: %s %s\n", staged, f->name,
+                    ec ? "has no PPOS record in SNAPMAN (an erasure-coded volume)"
+                       : "is an .ec part or has a PPOS record (META does not say requires=ec)");
+            return TSDB_ERR_CORRUPT;
+        }
+        if (f->kind == SNAP_EC) {
+            int rc = inst_verify_ec(sdfd, m, f, staged);
+            if (rc)
+                return rc;
+            continue;
         }
         part *p = NULL;
         int rc = part_open_as(sdfd, f->name, f->name, false, v8_ok, &p);
@@ -1278,6 +1401,19 @@ static bool line_has(const uint8_t *b, size_t len, const char *key, char *val, s
             return true;
         }
         o += l + 1;
+    }
+    return false;
+}
+
+/* a requires= value (comma separated words) holds the word w */
+static bool req_has(const char *v, const char *w)
+{
+    size_t wl = strlen(w);
+    for (const char *s = v; *s;) {
+        size_t l = strcspn(s, ",");
+        if (l == wl && !strncmp(s, w, wl))
+            return true;
+        s += l + (s[l] == ',');
     }
     return false;
 }
@@ -1415,6 +1551,29 @@ static int inst_repl(int sdfd, const struct snap_man *m, const struct snap_ident
 }
 
 /* SNAPDONE, synced, then the directory */
+/* An erasure-coded volume's PPOS: a record of every part SNAPMAN lists at its ppos (the leader's at the cut), synced
+ * with the directory before SNAPDONE (as ecapply_swap_pre's records go before a swap's renames): the open refuses a
+ * listed part without one, so a v<N> swapped in without them would not open. */
+static int inst_ppos(int sdfd, const struct snap_man *m, bool sync)
+{
+    const char **names = calloc(m->nfiles ? m->nfiles : 1, sizeof *names);
+    uint64_t *pos = calloc(m->nfiles ? m->nfiles : 1, sizeof *pos);
+    size_t n = 0;
+    int rc = names && pos ? 0 : TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < m->nfiles; i++) {
+        const struct snap_file *f = &m->files[i];
+        if (f->kind == SNAP_PART || (f->kind == SNAP_EC && snap_mutant != SNAP_MUT_INSTNOPPOS))
+            names[n] = f->name, pos[n++] = f->ppos;
+    }
+    if (rc == 0)
+        rc = ppos_write_new(sdfd, names, pos, n, sync);
+    if (rc == 0 && sync)
+        rc = fsync_at(sdfd);
+    free(names);
+    free(pos);
+    return rc;
+}
+
 static int inst_done(int sdfd, const struct snap_man *m, bool sync)
 {
     char b[64];
@@ -1511,22 +1670,27 @@ int snap_install(const char *root, uint32_t number, const char *staged, const st
         rc = TSDB_ERR_CORRUPT;
     if (rc == 0)
         rc = inst_verify_files(sdfd, &m, staged);
+    bool ec = false;
     if (rc == 0) {
         uint8_t *b = NULL;
         size_t len = 0;
-        char v8s[8];
-        if ((rc = read_file(sdfd, "META", &b, &len)) == 0)
+        char v8s[8], req[96];
+        if ((rc = read_file(sdfd, "META", &b, &len)) == 0) {
             v8 = line_has(b, len, "parts_v8=", v8s, sizeof v8s) && atoi(v8s) == 1;
+            ec = line_has(b, len, "requires=", req, sizeof req) && req_has(req, "ec");
+        }
         free(b);
         if (rc == TSDB_ERR_NOTFOUND)
             rc = TSDB_ERR_CORRUPT;
     }
     if (rc == 0)
-        rc = inst_verify_parts(sdfd, &m, v8, staged);
+        rc = inst_verify_parts(sdfd, &m, v8, ec, staged);
     inst_hook(SNAP_INST_VERIFIED);
     /* planted: the swap before the directory is a replica's and SNAPDONE durable */
     if (rc == 0 && snap_mutant == SNAP_MUT_SWAPFIRST)
         rc = inst_swap(rfd, vn, snap, old);
+    if (rc == 0 && ec && snap_mutant != SNAP_MUT_PPOSAFTER)
+        rc = inst_ppos(sdfd, &m, true);
     if (rc == 0)
         rc = inst_meta(sdfd, number, id, &v8, staged);
     if (rc == 0)
@@ -1538,6 +1702,12 @@ int snap_install(const char *root, uint32_t number, const char *staged, const st
     inst_hook(SNAP_INST_DONE);
     if (rc == 0 && snap_mutant != SNAP_MUT_SWAPFIRST)
         rc = inst_swap(rfd, vn, snap, old);
+    if (rc == 0 && ec && snap_mutant == SNAP_MUT_PPOSAFTER) { /* planted: the records only after the swap */
+        int vfd = openat(rfd, vn, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        rc = vfd < 0 ? TSDB_ERR_IO : inst_ppos(vfd, &m, true);
+        if (vfd >= 0)
+            close(vfd);
+    }
     inst_hook(SNAP_INST_SWAPPED);
     snap_man_free(&m);
     if (sdfd >= 0)

@@ -38,10 +38,12 @@ struct snap_info {
 };
 
 /* The kinds of files a SNAPMAN names */
-enum snap_kind { SNAP_PART = 1, SNAP_SEG = 2, SNAP_STAGE = 3, SNAP_KEEP = 4, SNAP_DICT = 5, SNAP_RSTATE = 6, SNAP_META = 7 };
+/* SNAP_EC: a settled part's .ec file (its index and object record; the chunks stay on the stripe group's stores) */
+enum snap_kind { SNAP_PART = 1, SNAP_SEG = 2, SNAP_STAGE = 3, SNAP_KEEP = 4, SNAP_DICT = 5, SNAP_RSTATE = 6, SNAP_META = 7,
+                 SNAP_EC = 8 };
 
 #define SNAP_MAN "SNAPMAN"
-#define SNAP_MAN_VERSION 2u
+#define SNAP_MAN_VERSION 3u
 #define SNAP_PREFIX "snap_"
 /* A make that a merge, a flush or a retirement overtook (a part, a segment or a COMMIT's file gone between the cut and
  * its link): nothing is wrong, the caller makes the snapshot again (it removed the directory) */
@@ -64,6 +66,8 @@ struct snap_file {
     uint64_t size, xxh64;
     uint32_t link; /* 0, or 1 + the index of an earlier entry that names the same file (a hard link of it: a keep_
                     * file and the listed part a COMMIT published are one inode); size and xxh64 are that entry's */
+    uint64_t ppos; /* a part's (SNAP_PART, SNAP_EC) PPOS record at the cut on an erasure-coded cluster volume (src/ppos.h;
+                    * PPOS_UNKNOWN when nobody knew it); 0 everywhere else */
 };
 struct snap_man {
     uint32_t version;
@@ -76,7 +80,9 @@ struct snap_man {
     size_t nfiles;
 };
 /* 0, TSDB_ERR_NOTFOUND (no SNAPMAN), TSDB_ERR_CORRUPT (a bad one: also a name that is ".", "..", SNAPMAN's own or
- * holds '/' or NUL, a name twice, an unknown kind, a link that is not to an earlier entry of the same size and hash),
+ * holds '/' or NUL, a name twice, an unknown kind, a name its kind does not allow (SNAP_PART a plain .part name,
+ * SNAP_EC a plain .ec name, SNAP_STAGE stage_*, SNAP_KEEP keep_*: never a retired_ or settled_ file), a ppos on a
+ * file that is not a part, a link that is not to an earlier entry of the same size and hash),
  * TSDB_ERR_IO, TSDB_ERR_NOMEM. The checksum proves the file whole, not who wrote it. */
 int snap_man_read(const char *dir, struct snap_man *m);
 void snap_man_free(struct snap_man *m);
@@ -99,7 +105,15 @@ enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_
                    SNAP_MUT_NORETIRED, SNAP_MUT_NODIRSYNC, SNAP_MUT_NONEEDSEQ, SNAP_MUT_NOSEGRETRY,
                    /* the install's */
                    SNAP_MUT_LOWERFENCE, SNAP_MUT_RAISELED, SNAP_MUT_KEEPUNSURE, SNAP_MUT_SWAPFIRST,
-                   SNAP_MUT_INSTNODIRSYNC };
+                   SNAP_MUT_INSTNODIRSYNC,
+                   /* .ec parts (snap-ec): the install writes no PPOS record for an .ec part; the install writes PPOS
+                    * after the swap (only a power loss sees it); the make carries the leader's settled_ files; the
+                    * make leaves the .ec parts out */
+                   SNAP_MUT_INSTNOPPOS, SNAP_MUT_PPOSAFTER, SNAP_MUT_CARRYSETTLED, SNAP_MUT_SKIPEC,
+                   /* the install's checks of a received copy (snap-ec review): an .ec file not opened (no hashes, no
+                    * record); its record's ppos not compared with SNAPMAN's; nor with P; a part's ppos not required on
+                    * an ec volume nor refused elsewhere; the install's own names not reserved */
+                   SNAP_MUT_ECNOVERIFY, SNAP_MUT_ECNOZEQ, SNAP_MUT_ECNOZP, SNAP_MUT_ECNOPPOS, SNAP_MUT_NORESERVED };
 extern int snap_mutant;
 
 /* ---- the install (r4-snapinst; snapshot.c's second half has the design) ----
@@ -107,7 +121,9 @@ extern int snap_mutant;
  * A received copy is installed as volume `number`'s replica directory under `root` (the cluster volumes' root, where
  * v<N> lies): snap_install(root, number, "<root>/v<N>.snap", id, keep) checks every file against SNAPMAN (size,
  * xxh64; a link entry missing is made from the entry it names), refuses a file SNAPMAN does not name, checks every
- * part's header, index, footer and granule checksums, then writes META (requires=cluster,replica, volume=number, the
+ * part's header, index, footer and granule checksums (an .ec part's: its source's header, index and footer and its
+ * object record, whose ppos must be SNAPMAN's and at most P), on an erasure-coded volume writes PPOS (a record per
+ * part at SNAPMAN's ppos, synced: the open refuses a listed part without one), then writes META (requires=cluster,replica, volume=number, the
  * identity's volume_uuid and cluster), FNO = P + 1, REPL (floor P, log start S or P + 1, the history from S on, and the
  * promises of D6 below), SNAPDONE, each synced, the directory synced; then swaps: v<N> -> v<N>.old (when there),
  * v<N>.snap -> v<N>, the root synced, v<N>.old removed, the root synced. 0: v<N> is the snapshot's and opens with

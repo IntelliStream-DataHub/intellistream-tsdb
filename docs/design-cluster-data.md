@@ -680,8 +680,9 @@ the new leader's log, in which case it commits (§2.3, E14).
   replaces one of them; `V` is the volume's number; `--log` is required, since `--pos` (a stripe position, and its
   `STRIPE_SET`) is R8's and not accepted yet. The command answers at once (the move runs on the metadata
   group's leader, which carries it on after its own change) and `--cancel` removes the learner while the old copy is
-  still there. See design-cluster.md §3.2 "as built (r4-move)" and §8.1. A snapshot carries no `.ec` parts yet
-  (docs/tasks/r8-from-r7.md), so a log replica of an EC volume that is moved or rebuilt by snapshot needs R8 to copy them.
+  still there. See design-cluster.md §3.2 "as built (r4-move)" and §8.1. A snapshot carries the `.ec` parts of its
+  cut and their PPOS records (snap-ec; the chunks stay on the stores), so a log replica of an EC volume can be moved or
+  rebuilt by snapshot after a settle.
 - **Rebalancing** after `node add` or `node drain`: the greedy pass of design-cluster.md §3.2 over both lists, at most
   5% of a group's positions moving at once and no automatic plan that moves more than 25% (objects' balancer bounds,
   objects:src/placement/README:178-200), even leaders, chunk counts by capacity. It has its own pace, `balance_mb_s`

@@ -395,6 +395,24 @@ int ppos_set(struct eng *db, const char *name, uint64_t pos)
     return put_records(db, &name, &pos, &fl, 1);
 }
 
+int ppos_write_new(int dirfd, const char *const *names, const uint64_t *pos, size_t n, bool sync)
+{
+    uint8_t *buf = malloc(n ? n * PPOS_REC : 1);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++)
+        rec_make(buf + i * PPOS_REC, name_hash(names[i]), pos[i], pos[i] == PPOS_UNKNOWN ? PPOS_F_UNKNOWN : PPOS_F_GIVEN,
+                 i * PPOS_REC);
+    int fd = openat(dirfd, PPOS_FILE, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    int rc = fd < 0 ? (errno == EEXIST ? TSDB_ERR_INVALID : TSDB_ERR_IO) : 0;
+    if (rc == 0 && (write_all(fd, buf, n * PPOS_REC, 0) != 0 || (sync && tsdb_fdatasync(fd) != 0)))
+        rc = TSDB_ERR_IO;
+    if (fd >= 0)
+        close(fd);
+    free(buf);
+    return rc;
+}
+
 int ppos_of(struct eng *db, const char *name, uint64_t *pos)
 {
     *pos = 0;
