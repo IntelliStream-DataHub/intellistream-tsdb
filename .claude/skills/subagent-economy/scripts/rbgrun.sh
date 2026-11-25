@@ -6,7 +6,7 @@
 #   /dev/shm/iso-ci; TMPDIR=/dev/shm/t, SHORT on purpose: tests that build long paths from it make mkdtemp fail with
 #   EINVAL on a longer prefix; RAM, so fsync-heavy tests are free), with nofile/memlock raised and RB_REMOTE_ENV set.
 #   Output -> $RUNS/NAME/out, exit code -> $RUNS/NAME/rc (last), host used -> $RUNS/NAME/host. Check with await.sh.
-# One job per machine (lock dir $RB_LOCK there). Skips every machine while $SE_HOME/HOLD.fleet or $SE_HOME/RESERVED exists
+# One job per machine (flock on $RB_LOCK there). Skips every machine while $SE_HOME/HOLD.fleet or $SE_HOME/RESERVED exists
 # or $SE_HOME/BENCH.lock holds a live pid (a benchmark or power-cut series owns the fleet), and a machine running a
 # process RB_BUSY names. Env: RB_HOST=user@host forces one, RB_FETCH="rel/path ..." copies those paths back into
 # $RUNS/NAME/fetch/, RB_KEEP=1 keeps the remote copy.

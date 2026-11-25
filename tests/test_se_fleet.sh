@@ -94,6 +94,7 @@ EOF
     badlocal)     sub bgrun.sh 'if [ -n "${SE_REMOTES:-}" ] && ! se_remote_on' 'if false && ! se_remote_on' ;;
     slotcap)      sub se-env.sh '{0,2}' '*' ;;
     ownmsg)       sub se-remote.sh 'if [ ${#c[@]} -eq 0 ] && [ -n "${1:-}" ] &&' 'if false &&' ;;
+    rbnolock)     sub rbworker.sh 'flock -n 9' 'true' ;;
     *) echo "unknown mutant $mutant"; exit 2 ;;
     esac
 fi
@@ -121,6 +122,9 @@ san=${host//[^A-Za-z0-9]/_}
 hd=$FAKE_ROOT/hosts/$san; mkdir -p "$hd"
 cmd=${cmd//"$SE_REMOTE_RUNS"/$hd/rruns}
 cmd=${cmd//"$SE_REMOTE_GIT"/$hd/rgit}
+cmd=${cmd//\/dev\/shm\/iso-ci.lock/$hd/rb.lock}
+cmd=${cmd//\/dev\/shm\/iso-ci/$hd/rbroot}
+cmd=${cmd//\/dev\/shm\/t/$hd/shm_t}
 # the host's own /var/tmp/t and /var/tmp/j; the scratch dir of this test can itself lie under them (TMPDIR of a job
 # run by bgrun.sh is /var/tmp/t/NAME), so what lies under it is kept out of the rewrite
 cmd=${cmd//"$FAKE_ROOT"/@@FAKE_ROOT@@}
@@ -368,6 +372,69 @@ if [ -n "$orph" ]; then
     eq "one host: the orphan line as before" "$(grep -c '^LOOK remote orphan sfo' <<< "$wd")" 1
     hasnt "one host: no host at its end" "$wd" "^LOOK remote orphan.* on user"
 fi
+
+# ---- rbgrun.sh / rbworker.sh: flock per host (even when mkdir always returns 0, as uutils coreutils 0.10 can on a race) ----
+cat > "$scratch/stub/sudo" <<'EOF'
+#!/bin/bash
+exec "$@"
+EOF
+cat > "$scratch/stub/prlimit" <<'EOF'
+#!/bin/bash
+while [ $# -gt 0 ]; do case "$1" in --nofile=*|--memlock=*) shift ;; *) break ;; esac; done
+exec "$@"
+EOF
+chmod +x "$scratch/stub/sudo" "$scratch/stub/prlimit"
+mkdir -p "$scratch/rbwt" "$scratch/mkshim"
+echo hello > "$scratch/rbwt/hello"
+cat > "$scratch/mkshim/mkdir" <<'EOF'
+#!/bin/bash
+/bin/mkdir -p "$@"
+exit 0
+EOF
+chmod +x "$scratch/mkshim/mkdir"
+
+export RB_POLL=1
+# Two racing callers on one host under the mkdir=0 shim must never hold the host at the same time
+conf "RB_HOSTS=\"$A\""
+rbjob() {
+    local n=$1 d=${2:-2}
+    echo "touch '$scratch/rb_act.$n'; ls '$scratch'/rb_act.* 2>/dev/null | wc -l >> '$scratch/rb_conc.log'; sleep $d; ls '$scratch'/rb_act.* 2>/dev/null | wc -l >> '$scratch/rb_conc.log'; rm -f '$scratch/rb_act.$n'; echo \${FAKE_HOST:-none} > '$scratch/rb_ran.$n'"
+}
+PATH=$scratch/mkshim:$PATH "$S/rbgrun.sh" rb1 "$scratch/rbwt" - bash -c "$(rbjob rb1 2)" > /dev/null &
+PATH=$scratch/mkshim:$PATH "$S/rbgrun.sh" rb2 "$scratch/rbwt" - bash -c "$(rbjob rb2 2)" > /dev/null &
+wait
+wait_rc rb1; wait_rc rb2
+eq "rb1 exit code" "$(rcof rb1)" 0
+eq "rb2 exit code" "$(rcof rb2)" 0
+eq "rb1 ran on A" "$(cat "$scratch/rb_ran.rb1" 2>/dev/null)" "$A"
+eq "rb2 ran on A" "$(cat "$scratch/rb_ran.rb2" 2>/dev/null)" "$A"
+rbmax=$(sort -n "$scratch/rb_conc.log" 2>/dev/null | tail -1)
+eq "rbgrun: two racing callers under mkdir=0 shim never ran at once (max active)" "$rbmax" 1
+
+# Two racing callers on two hosts take different hosts
+conf "RB_HOSTS=\"$A $B\""
+"$S/rbgrun.sh" rb3 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb3'; sleep 2" > /dev/null &
+"$S/rbgrun.sh" rb4 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb4'; sleep 2" > /dev/null &
+wait
+wait_rc rb3; wait_rc rb4
+eq "rb3 exit code" "$(rcof rb3)" 0
+eq "rb4 exit code" "$(rcof rb4)" 0
+[ "$(hostof rb3)" != "$(hostof rb4)" ] && ok "rb3 and rb4 took different hosts ($(hostof rb3) vs $(hostof rb4))" || bad "rb3 and rb4 shared host $(hostof rb3)"
+
+# SIGKILL of rbworker.sh releases the flock immediately (no stale lock)
+conf "RB_HOSTS=\"$A\""
+"$S/rbgrun.sh" rb5 "$scratch/rbwt" - bash -c "echo \$\$ > '$scratch/rb5.child'; touch '$scratch/rb5.up'; exec sleep 15" > /dev/null
+for i in $(seq 1 60); do [ -e "$scratch/rb5.up" ] && break; sleep 0.1; done
+[ -e "$scratch/rb5.up" ] && ok "rb5 started" || bad "rb5 did not start"
+wp=$(cat "$SE_HOME/runs/rb5/pid" 2>/dev/null)
+kill -KILL "$wp" 2>/dev/null
+for i in $(seq 1 40); do kill -0 "$wp" 2>/dev/null || break; sleep 0.1; done
+"$S/rbgrun.sh" rb6 "$scratch/rbwt" - bash -c "echo ok > '$scratch/rb6.ok'" > /dev/null
+wait_rc rb6
+eq "rb6 acquired A after SIGKILL of rb5" "$(rcof rb6)" 0
+eq "rb6 ran" "$(cat "$scratch/rb6.ok" 2>/dev/null)" "ok"
+cp=$(cat "$scratch/rb5.child" 2>/dev/null)
+[[ "$cp" =~ ^[0-9]+$ ]] && [ "$cp" -gt 1 ] && kill -KILL "$cp" 2>/dev/null || true
 
 if [ $fail = 0 ]; then
     [ -n "$mutant" ] && { echo "mutant $mutant SURVIVED"; exit 0; }
