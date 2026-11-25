@@ -231,6 +231,8 @@ void rsnap_get_stats(struct rsnap_stats *out)
     out->bytes_sent = STATGET(bytes_sent);
     out->bytes_received = STATGET(bytes_received);
     out->last_ms = STATGET(last_ms);
+    out->kind5_bytes = peerlink_kind_bytes(PL_KIND_SNAP);
+    out->kind2_bytes = peerlink_kind_bytes(PL_KIND_BULK);
 }
 
 /* ---- links */

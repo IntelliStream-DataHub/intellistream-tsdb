@@ -237,6 +237,11 @@ struct pl_stats {
     uint64_t bulk_files, bulk_bytes; /* files finished, payload bytes sent by this side */
 };
 void peerlink_stats(struct peerlink *pl, struct pl_stats *st);
+/* The payload bytes the bulk links of one data kind took from their kind's bucket, chunk by chunk as they go to the
+ * socket, in this process (every peerlink: in tsdbd each kind belongs to one, so this is that peerlink's). A count at
+ * the bucket, not at the end of a file: test_cluster snaplarge weighs what kinds 2 and 5 moved in a window against
+ * what one bucket at rebuild_mb_s lets through (D7). Kept outside the peerlink so a reader never races its free. */
+uint64_t peerlink_kind_bytes(int kind);
 
 /* ---------------------------------------------------------------- wire (exported for the tests and the fuzzer) */
 

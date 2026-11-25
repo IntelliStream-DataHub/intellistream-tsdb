@@ -105,7 +105,7 @@ table=(
     "demotestaleidx|deposetail|the deposed writer back in the ISR once the links are back: the ISR of rs has 2 members"
     "divergeisr|diverged|heartbeat never reported volume 1 LOCAL_FAULT"
     "snapnoverify|snapxfer|the copy with a flipped byte was not refused"
-    "snapsamelink|snaplarge|a large insert of 2000000 rows took [0-9]+ ms while a snapshot moved"
+    "snapsamelink|snaplarge|a large insert of 2000000 rows during a snapshot: kinds 2 and 5 moved .* no more than one bucket"
     "snapnospacecheck|snapnospace|a snapshot whose size plus the margin exceeds the free space was not refused"
     "snapnosrcmax|snapbusy|a leader running rebuild_max sources did not answer BUSY"
     "snapsharedmax|snapbusy|the receiver did not ask while a source job ran on it"

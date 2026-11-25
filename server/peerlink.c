@@ -44,6 +44,7 @@
 
 int peerlink_mutant;
 int peerlink_test_cut_end;
+static uint64_t kind_bytes[PL_KIND_DATA_MAX + 1]; /* peerlink_kind_bytes: process-wide, so no peerlink is touched */
 void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 
 #define TAG PL_CHECK_LEN
@@ -1544,6 +1545,8 @@ static uint64_t job_send(struct conn *c)
         uint64_t w = bucket_take(pl, c->l->kind, n);
         if (w)
             return w;
+        if (c->l->kind >= 0 && c->l->kind <= PL_KIND_DATA_MAX)
+            __atomic_add_fetch(&kind_bytes[c->l->kind], n, __ATOMIC_RELAXED);
         if (!c->cbuf && !(c->cbuf = malloc(chunk)))
             oom();
         size_t got = 0;
@@ -2149,6 +2152,11 @@ struct peerlink *peerlink_new(const struct pl_cfg *cfg)
     pthread_mutex_init(&pl->bmu, NULL);
     atomic_store(&pl->rate, cfg->bulk_rate);
     return pl;
+}
+
+uint64_t peerlink_kind_bytes(int kind)
+{
+    return kind >= 0 && kind <= PL_KIND_DATA_MAX ? __atomic_load_n(&kind_bytes[kind], __ATOMIC_RELAXED) : 0;
 }
 
 void peerlink_stats(struct peerlink *pl, struct pl_stats *st)
