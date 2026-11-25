@@ -58,6 +58,7 @@ its `led` never raised. New settings of `tsdb cluster init`: `--rebuild-mb-s` (2
 `--rebuild-max` (2 snapshots sent, and as many received, at once), shown by `tsdb cluster status`, fixed for the cluster's
 life. Not built: a limit on the receiving side, reuse of files the receiver holds, a snapshot that carries `.ec` parts
 (so an erasure-coded volume that has settled a key cannot rebuild a replica by snapshot yet), rebuild progress in `status`.
+The jepsen-cluster nemeses `longdown` and `rebuild`, which would run this rebuild under faults, are written and not yet run whole (docs/tasks/r4-nemeses.md); its evidence so far is `test_cluster` and `test_snapshot`.
 `tsdbd`'s `status` and metrics port show `snap.*` and `tsdb_snapshot_*` (docs/metrics.md). Tests: `test_snapshot` (the
 make and the install, with power loss at every step), `test_cluster snap* addsnap keepcap`.
 

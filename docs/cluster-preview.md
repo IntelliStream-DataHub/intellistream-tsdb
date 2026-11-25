@@ -177,7 +177,7 @@ wait_gone 1 "^volume 1 .* isr [0-9,]*$lost"
 rm -rf $D/n$lost/data/v1
 start_node $lost
 wait_for $lost '^node'
-until grep -q 'tsdb cluster replica reset' $D/n$lost/log; do sleep 0.2; done
+for i in $(seq 150); do grep -q 'tsdb cluster replica reset' $D/n$lost/log && break; sleep 0.2; done
 grep -h 'tsdb cluster replica reset' $D/n$lost/log
 build/tsdb cluster replica reset $(peer 1) 1 $lost --secret-file $D/secret
 wait_for 1 "^volume 1 .* isr [0-9,]*$lost"
@@ -276,8 +276,8 @@ Oslo day 2: 120 rows, average 47.47
 
 What a cluster node refuses, so that no row ever lands outside a volume the group knows: a series in the server's own
 directory (`tsdbc_series` without a volume: `invalid argument`), a local `tsdb DIR volume add` while it runs, and a
-start on a directory that already has series or `VOLUMES` lines in it (the server names them and stops). A write to a
-copy that does not lead is `UNAVAILABLE` with the reason `fenced`. A copy that is older than the group's record of it (`open_gen` above the one in
+start on a directory that already has series or `VOLUMES` lines in it (the server names them and stops). A client's write to a
+copy that does not lead is forwarded to the leader (`MOVED` with `--forward off`; see "Writes through any server"). A copy that is older than the group's record of it (`open_gen` above the one in
 its directory, say a directory restored from a backup) is refused, naming both numbers.
 
 Step 7: after the kill. Node 2 (a survivor) sees a new term, a leader and the dead node 1 as `down`. If the node you
@@ -573,7 +573,7 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 | `tsdb cluster status PEER --secret-file F` | What that server knows (see above). |
 | `tsdb cluster volume move PEER VOLUME --log --from A --to B --secret-file F` | Move volume `VOLUME`'s copy on node `A` to node `B` (up, allowed to hold volumes, no copy of it yet). It answers at once and runs in the background: `B` gets a new copy, fills it and joins the in-sync set; then, if `A` leads the volume, leadership moves first; then `A` leaves the in-sync set and its copy is removed, `B` taking its place in the list. The number of in-sync copies never goes below what it was before `B` joined, so a lagging copy makes the move wait. A new group leader carries a move on, but once `B` has joined it waits until every other copy is in sync (it no longer knows the smaller size from before the join), so with another copy down such a move waits for it to come back. One move per volume at a time. With `--cancel` instead, `B`'s copy is removed and the old set stays (a move already past its last step ends anyway). `status` shows it. |
 | `tsdb cluster volume transfer PEER VOLUME NODE --secret-file F` | Hand the leadership of volume number `VOLUME` to `NODE`, a copy that is in the in-sync set and up. The leader stops taking writes (they answer `UNAVAILABLE`, retry after about 50 ms: nothing was done), waits until `NODE` has everything it has written (at most `transfer_wait_ms`), and the group then makes `NODE` the leader under a higher epoch. The command answers when `NODE` leads: `node N leads at epoch E (T ms, READY at X)`. A transfer that cannot finish is cancelled and the old leader goes on; refused at once, with the reason, when `NODE` already leads, is not in the in-sync set or not up, the old leader is not up, or another transfer or a promotion of the volume is under way. |
-| `tsdb cluster replica reset PEER VOLUME NODE --secret-file F` | For a copy whose directory is lost, or that you do not trust: give the copy on `NODE` a new replica id and rebuild it from a snapshot of the leader. Allowed only for a copy that neither leads nor is in the in-sync set (a copy that is not in sync is refused for what it is, with the reason). A directory that is still there is set aside as `v<N>.lost-<old rid>` (as `v<N>.stale-<old rid>` when its server was down for the reset) and never deleted by tsdb; a missing one is simply made again. Never done by itself: a server whose directory for a volume is missing starts, says so in its log and names this command, because an unmounted disk looks the same. |
+| `tsdb cluster replica reset PEER VOLUME NODE --secret-file F` | For a copy whose directory is lost, or that you do not trust: give the copy on `NODE` a new replica id and rebuild it from a snapshot of the leader. Allowed only for a copy that neither leads nor is in the in-sync set (the leader or a copy that is in sync is refused, with the reason). A directory that is still there is set aside as `v<N>.lost-<old rid>` (as `v<N>.stale-<old rid>` when its server was down for the reset) and never deleted by tsdb; a missing one is simply made again. Never done by itself: a server whose directory for a volume is missing starts, says so in its log and names this command, because an unmounted disk looks the same. |
 | `tsdb cluster user add\|passwd\|drop PEER NAME --secret-file F` | Add a user (`--superuser`, `--password-file F`), change a password, drop a user, for every server at once ([Logins](#logins)). |
 | `tsdb cluster user grant\|revoke PEER NAME SELECTOR RIGHTS --secret-file F` | Give or take rights, as `tsdb DIR user grant` does on one server. |
 | `tsdb cluster user list PEER [NAME] --secret-file F` | The users and their grants. |
@@ -581,8 +581,8 @@ file says `PORT PID MPORT PEER_PORT` (`MPORT` is 0 without metrics). Start serve
 
 Options of `init`. Each number is a whole number above 0. The settings are fixed when the cluster is made and shown by
 `status`; changing one on a running cluster is not built (to change one, make the cluster again). Those about
-replication, leases, rebuilds and transfers are acted on; `--out-after-s`, `--volumes-per-server` and `--bmc` are only
-stored. Members are only `up` or `down` in the preview: `draining` and `out` are for later.
+replication, leases, rebuilds and transfers are acted on; `--out-after-s`, `--volumes-per-server`, `--lease-s` and `--read-barrier` are only
+stored, and `--mode shared` and `--failover` (the shared side of the cluster) are not built. Members are only `up` or `down` in the preview: `draining` and `out` are for later.
 
 | Option | Default | Meaning |
 |---|---:|---|

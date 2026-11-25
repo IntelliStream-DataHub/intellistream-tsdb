@@ -1190,8 +1190,9 @@ volume over a real network is not measured (R11).
 *Not built* (R4's plan, "Scope"): §8.1 step 2's token bucket on the **receiving** side (R4 limits the sender and counts the
 snapshots, D16; R9's balancer needs the receiving side); step 4's reuse of files the receiver already holds (D4: a
 replica's part names carry its own block numbers, so reuse rarely matches; every snapshot copies everything and a
-second one copies it again); a source other than the leader; `.ec` parts in a snapshot (the tier is refused on cluster
-volumes today, `src/tier.c`; R8 must add them, docs/tasks/r8-from-r7.md); rebuild progress in `cluster status` (R14);
+second one copies it again); a source other than the leader; `.ec` parts in a snapshot (an EC cluster volume attaches a tier since R8, `eccold_may_attach` in `src/eccold.c`; once a
+key of it has settled, `list_part_names` in `src/snapshot.c` refuses and every snapshot of the volume fails, so a moved,
+reset or past-the-caps log replica of it stays a learner: docs/tasks/r8-from-r7.md); rebuild progress in `cluster status` (R14);
 live changes of the four settings (R14); §8.5's first bullet.
 
 ### 8.2 A returning replica
@@ -1545,7 +1546,7 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 | `power` | crashfs power loss on one or two servers (unsynced writes lost, torn tails) |
 | `partition` | random splits; a leader cut off from its replicas only; a leader cut off from the Raft leader only; a bridge |
 | `pause` | SIGSTOP a leader past its lease and the node timeout, then SIGCONT |
-| `slow` | one server's fdatasync delayed by 0.1-2 s (crashfs), a slow disk |
+| `slow` | a slow disk. *Built in R4 differently:* the outagefs shim delays every call under one node's data root and state directory by 10, 30 or 100 ms for 5 to 30 s; crashfs `fdatasync` delays of 0.1-2 s are not exercised |
 | `skew` | a server's monotonic clock runs fast or slow within the configured drift, and beyond it (only stale reads may appear) |
 | `midcommit` | crash points: after the leader's WAL write and before sending; after replicas acked and before the client's OK; between PREPARED and the `COMMIT` marker; during a class switch; between `put` and the `COLD` marker |
 | `rebuild` | declare a server out under load, and add a new one. *R4's `rebuild` is smaller (a lost directory, one replica):* a stopped replica's `v<N>` removed, the server started (it must refuse the volume with the line naming `replica reset`), the reset, rebuilt by a snapshot. The server-out version stays R9's |
@@ -1556,7 +1557,7 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 *Built in R4 (r4-jepsen, `tests/jepsen/jepsen_cluster.c`).* `kill2` (the first round and half the others take two of the
 kv volume's replicas), `slow` (the outagefs shim's `slow MS` on one node's data root, 5 to 30 s) and `churn` run in
 `make jepsen-cluster` after the other nemeses (`JEPSEN_R4_NEMESES`, `JEPSEN_R4_WORKLOADS`; `none` leaves them out).
-`longdown` and `rebuild` are written and have their selftest mutants, but each is **refused with a line until its
+`longdown` and `rebuild` are written and have their selftest mutants (docs/tasks/r4-nemeses.md owns running them whole), but each is **refused with a line until its
 `built` flag in the harness table is flipped**: the flag was set for the tracks that were on main when r4-jepsen merged,
 and these two have not been run whole against the merged R4 (`jepsen_cluster --built-nemeses` lists what runs, `JEPSEN_R4_TRY=1`
 runs the others). At the end of every run with a replicated kv volume the members of the final record are the replicas
@@ -1597,7 +1598,7 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 | 9 | Measurements (§10.3), docs (README section, AGENTS.md invariants, an operator guide) | the numbers | 2 |
 
 *Step 7 as built (R4, 2026-11-24).* The row's 3 weeks assumed pieces that were not there: replica set changes in tsdbd, the
-snapshot engine, transfer. R4 was planned as 14 tracks of about 20 builder, review and fix track-days in all, and came to about 6,000
+snapshot engine, transfer. R4 was planned as 14 tracks of about 20 builder, review and fix track-days in all (a forecast: the days spent are not counted), and came to about 6,000
 lines of new server and engine code (`src/snapshot.c`, `server/rsnap.c`, `rset.c`, `rtransfer.c`, `ctransfer.c`, `cmove.c`
 and the rest of the files named in AGENTS.md), 2,600 lines of `tests/test_snapshot.c` and about 40 `test_cluster` scenarios. Built: rebuild by snapshot (make, transfer, install), catch-up past the retention caps,
 replica set changes (add, remove, reset), the operator's move and transfer, leader balance (default off), the replay
