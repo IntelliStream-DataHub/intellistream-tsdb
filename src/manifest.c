@@ -462,13 +462,19 @@ static int tail_segment(eng *db, wal_tail *t)
     char name[64];
     wal_name(name, sizeof name, t->seq);
     int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC); /* reopened: revalidates the size on NFS */
-    if (fd < 0)
-        return 0; /* not created yet, or already flushed and deleted: the manifest catches up */
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ESTALE)
+            return 0; /* not created yet, or already flushed and deleted: the manifest catches up */
+        fprintf(stderr, "tsdb: follower: opening %s: %s\n", name, strerror(errno));
+        return TSDB_ERR_IO;
+    }
     return tail_segment_fd(db, t, fd, name);
 }
 
 /* Tails one WAL segment into db->tails (kept oldest-first by seq). When skip_missing is true, a segment that does not
- * exist (not created yet, or unlinked mid-scan on NFS) is skipped without failing or taking a MAX_TAILS slot. */
+ * exist (not created yet, or unlinked mid-scan on NFS) is skipped without failing or taking a MAX_TAILS slot. If all
+ * MAX_TAILS slots are already in use and the segment actually exists on disk, fails with TSDB_ERR_IO instead of
+ * silently dropping rows. */
 static int follow_tail_one(eng *db, uint64_t seq, bool skip_missing)
 {
     wal_tail *t = NULL;
@@ -477,15 +483,23 @@ static int follow_tail_one(eng *db, uint64_t seq, bool skip_missing)
             t = &db->tails[i];
     if (t)
         return tail_segment(db, t);
-    if (db->ntails == MAX_TAILS)
-        return 0;
     char name[64];
     wal_name(name, sizeof name, seq);
     int fd = -1;
-    if (skip_missing) {
+    if (skip_missing || db->ntails == MAX_TAILS) {
         fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-            return 0; /* not created yet, or unlinked mid-scan: never fail, never waste a tail slot */
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ESTALE)
+                return 0; /* not created yet, or unlinked mid-scan: never fail, never waste a tail slot */
+            fprintf(stderr, "tsdb: follower: opening %s: %s\n", name, strerror(errno));
+            return TSDB_ERR_IO;
+        }
+        if (db->ntails == MAX_TAILS) {
+            close(fd);
+            fprintf(stderr, "tsdb: follower: %s has more than %d unflushed WAL segments (cannot open %s)\n",
+                    db->dir ? db->dir : "(dir)", MAX_TAILS, name);
+            return TSDB_ERR_IO;
+        }
     }
     memtable *mt = mt_new(seq);
     if (!mt) {
@@ -534,7 +548,7 @@ static int follow_scan_wal(eng *db, uint64_t lo, uint64_t hi, uint64_t **out, si
 {
     *out = NULL;
     *nout = 0;
-    int dfd = dup(db->dirfd);
+    int dfd = fcntl(db->dirfd, F_DUPFD_CLOEXEC, 0);
     DIR *d = dfd >= 0 ? fdopendir(dfd) : NULL;
     if (!d) {
         if (dfd >= 0)

@@ -4336,6 +4336,7 @@ static void case_ro_epoch_jump(void)
         CHECK_EQ(open_replica(dir, 0, &db), 0);
         if (!db) {
             leader_free(&l);
+            sh("rm -rf '%s'", dir);
             return;
         }
         CHECK_EQ(feed(db, &l, 0, n_seg12), 0);
@@ -4446,21 +4447,39 @@ static void case_ro_epoch_jump(void)
         snprintf(bd, sizeof bd, "%s_b", x.ldir);
         xp_rows(&x, 0, 0, 8, 100);
         xp_step(&x, "ROJP: seg 1");
+        CHECK_EQ(mt_flush(x.rep), 0); /* flush seg 1 on x.rep cleanly; no background flush pending */
+        /* Ship seg 2 and seg 3 without applying on x.rep so its background flusher never runs or races cp -a. */
+        x.noapply = true;
         CHECK_EQ(eng_flush(x.ld), 0);
         xp_rows(&x, 0, 10, 8, 200);
         xp_rows(&x, 1, 0, 6, 300);
-        xp_step(&x, "ROJP: seg 2");
+        CHECK_EQ(xp_ship_logs(&x), 0);
         CHECK_EQ(eng_flush(x.ld), 0);
         xp_rows(&x, 1, 10, 6, 400);
-        xp_step(&x, "ROJP: seg 3");
+        CHECK_EQ(xp_ship_logs(&x), 0);
 
-        sh("rm -rf '%s' && cp -a '%s' '%s'", bd, rd, bd);
+        /* Close x.rep cleanly around cp -a so no background thread touches rd during the copy. */
+        CHECK_EQ(eng_close(x.rep), 0);
+        x.rep = NULL;
+        CHECK_EQ(sh("rm -rf '%s' && cp -a '%s' '%s'", bd, rd, bd), 0);
+        CHECK_EQ(open_replica(rd, 0, &x.rep), 0);
         eng *b = NULL;
         CHECK_EQ(open_replica(bd, 0, &b), 0);
-        if (!b) {
+        if (!x.rep || !b) {
+            if (b)
+                eng_close(b);
             xp_stop(&x);
+            sh("rm -rf '%s'", bd);
             return;
         }
+        uint64_t fl = 0, ac = 0, sq[64];
+        size_t nsq = wal_seqs(bd, sq, 64), npre = 0;
+        CHECK(man_bounds(bd, &fl, &ac) && fl < ((uint64_t)1 << 40));
+        for (size_t i = 0; i < nsq; i++)
+            if (sq[i] > fl && sq[i] < ((uint64_t)1 << 40))
+                npre++;
+        CHECK(npre >= 2); /* deterministically 2+ unflushed pre-jump segments in bd */
+
         uint64_t pos = 0;
         CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
         CHECK_EQ(replica_sync(x.rep), 0);
@@ -4473,6 +4492,7 @@ static void case_ro_epoch_jump(void)
         if (!n) {
             eng_close(b);
             xp_stop(&x);
+            sh("rm -rf '%s'", bd);
             return;
         }
         eng_close(x.ld);
@@ -4496,8 +4516,13 @@ static void case_ro_epoch_jump(void)
         xp_rows(&x, 1, 20, 6, 1200);
         CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
 
-        uint64_t fl = 0, ac = 0;
         CHECK(man_bounds(bd, &fl, &ac) && fl < ((uint64_t)1 << 40) && ac >= ((uint64_t)1 << 40) + 1);
+        nsq = wal_seqs(bd, sq, 64);
+        npre = 0;
+        for (size_t i = 0; i < nsq; i++)
+            if (sq[i] > fl && sq[i] < ((uint64_t)1 << 40))
+                npre++;
+        CHECK(npre >= 2);
         CHECK(ro_dir_same(x.ld, bd, T0 + 1000LL * (NT + 1), "ROJP: member b across promotion, read-only"));
         eng_close(x.rep);
         x.rep = NULL;
@@ -4505,6 +4530,238 @@ static void case_ro_epoch_jump(void)
         CHECK(ro_dir_same(x.ld, bd, T0 + 1000LL * (NT + 1), "ROJP: stopped member b across promotion, read-only"));
         xp_stop(&x);
         sh("rm -rf '%s'", bd);
+    }
+
+    /* 3. > MAX_TAILS refusal (F1) and non-ENOENT openat error reporting (F2):
+     *    - Exactly MAX_TAILS unflushed WAL segments succeed on read-only open;
+     *    - An unreadable WAL segment (EACCES, non-root) fails both fresh open (follow_tail_one) and live refresh
+     *      (tail_segment) with TSDB_ERR_IO rather than silently returning 0;
+     *    - MAX_TAILS + 1 unflushed WAL segments (including across a 2^40 epoch jump) fail both fresh open and live
+     *      refresh with TSDB_ERR_IO rather than silently truncating and dropping newer segments. */
+    {
+        char dir[PATH_MAX];
+        fresh(dir, "rojump_max");
+        leader l;
+        unsigned rng = 53;
+        leader_init(&l);
+        for (int i = 0; i < 2; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l); /* seq 2 */
+        for (int i = 0; i < 2; i++)
+            leader_rows(&l, 4, &rng);
+        size_t n_seg12 = l.n;
+
+        eng *db = NULL;
+        replica_keep_next(0, 3600 * 1000);
+        CHECK_EQ(open_replica(dir, 0, &db), 0);
+        if (!db) {
+            leader_free(&l);
+            sh("rm -rf '%s'", dir);
+            return;
+        }
+        CHECK_EQ(feed(db, &l, 0, n_seg12), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, l.r[n_seg12 - 1].last), 0);
+        CHECK_EQ(mt_flush(db), 0); /* wal_flushed == 1; seq 2 stays unflushed */
+        CHECK_EQ(replica_floor_saved(db, l.r[n_seg12 - 1].last), 0);
+
+        /* Add MAX_TAILS - 1 more unflushed segments (seq 3 .. MAX_TAILS + 1 = 9): total MAX_TAILS unflushed. */
+        size_t prev = n_seg12;
+        for (int k = 1; k < MAX_TAILS; k++) {
+            leader_roll(&l);
+            leader_rows(&l, 3, &rng);
+        }
+        CHECK_EQ(feed(db, &l, prev, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+
+        uint64_t fl = 0, ac = 0;
+        CHECK(man_bounds(dir, &fl, &ac) && fl == 1 && ac == (uint64_t)(MAX_TAILS + 1));
+
+        model m_max;
+        model_at(&l, l.r[l.n - 1].last, &m_max);
+        tsdb_options ro_opt;
+        tsdb_options_init(&ro_opt);
+        ro_opt.read_only = 1;
+        ro_opt.merge_threads = 0;
+        ro_opt.create_volumes = 0;
+        eng *ro_live = NULL;
+        CHECK_EQ((eng_open)(dir, &ro_opt, &ro_live), 0);
+        if (ro_live) {
+            CHECK_EQ(ro_live->ntails, (size_t)MAX_TAILS);
+            CHECK(same_as(ro_live, &m_max, "rojump_max: exactly MAX_TAILS unflushed"));
+        }
+
+        /* Non-ENOENT openat error (EACCES) must fail loudly with TSDB_ERR_IO in both tail_segment and follow_tail_one. */
+        if (geteuid() != 0 && ro_live) {
+            char wp[PATH_MAX + 64], nm[64];
+            wal_name(nm, sizeof nm, 2);
+            snprintf(wp, sizeof wp, "%s/%s", dir, nm);
+            CHECK_EQ(chmod(wp, 0000), 0);
+            CHECK_EQ(eng_refresh(ro_live), TSDB_ERR_IO); /* tail_segment */
+            eng *ro_err = NULL;
+            CHECK_EQ((eng_open)(dir, &ro_opt, &ro_err), TSDB_ERR_IO); /* follow_tail_one */
+            CHECK(ro_err == NULL);
+            if (ro_err)
+                eng_close(ro_err);
+            CHECK_EQ(chmod(wp, 0644), 0);
+            CHECK_EQ(eng_refresh(ro_live), 0);
+        }
+
+        /* Add a (MAX_TAILS + 1)-th unflushed segment at 2^40: must fail loudly with TSDB_ERR_IO, not truncate. */
+        prev = l.n;
+        l.seq = (uint64_t)1 << 40;
+        l.off = 0;
+        leader_rows(&l, 4, &rng);
+        CHECK_EQ(feed(db, &l, prev, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK(man_bounds(dir, &fl, &ac) && fl == 1 && ac == ((uint64_t)1 << 40));
+
+        if (follow_test_mutant == 0) {
+            eng *ro_over = NULL;
+            CHECK_EQ((eng_open)(dir, &ro_opt, &ro_over), TSDB_ERR_IO);
+            CHECK(ro_over == NULL);
+            if (ro_over)
+                eng_close(ro_over);
+            if (ro_live)
+                CHECK_EQ(eng_refresh(ro_live), TSDB_ERR_IO);
+        }
+
+        if (ro_live)
+            eng_close(ro_live);
+        CHECK_EQ(eng_close(db), 0);
+        leader_free(&l);
+        sh("rm -rf '%s'", dir);
+    }
+
+    /* 4. Out-of-order tail insertion (pos < db->ntails memmove path in follow_tail_one):
+     *    Open a live read-only follower seeing unflushed segments {2, 2^40} while segment 3 is absent; then make
+     *    segment 3 visible and refresh. follow_tail_one must insert seq 3 between 2 and 2^40 (sorted ascending) so
+     *    segment 3's unique rows appear, segment 3 overwrites segment 2, and segment 2^40 still beats segment 3. */
+    {
+        char dir[PATH_MAX];
+        fresh(dir, "rojump_ooo");
+        leader l;
+        unsigned rng = 71;
+        leader_init(&l);
+
+        /* Segment 1 (will be flushed): baseline rows */
+        leader_rows(&l, 4, &rng);
+        leader_roll(&l); /* seq 2 */
+        /* Segment 2: series 0 at t = 0..4 with values 10..14 */
+        {
+            lrec *r = leader_rows(&l, 5, &rng);
+            for (int k = 0; k < 5; k++) {
+                r->sid[k] = 0;
+                r->t[k] = (int8_t)k;
+                r->v[k] = 10.0f + (float)k;
+                uint8_t *p = r->bytes + WAL_HDR + (size_t)k * WAL_ROW;
+                uint32_t id = 0;
+                int64_t ts = T0 + (int64_t)k * 1000;
+                uint64_t slot = 0;
+                memcpy(&slot, &r->v[k], 4);
+                memcpy(p, &id, 4);
+                memcpy(p + 4, &ts, 8);
+                memcpy(p + 12, &slot, 8);
+            }
+            wal_reseal(r->bytes, r->seq, r->off);
+        }
+        size_t n_seg12 = l.n;
+
+        eng *db = NULL;
+        replica_keep_next(0, 3600 * 1000);
+        CHECK_EQ(open_replica(dir, 0, &db), 0);
+        if (!db) {
+            leader_free(&l);
+            sh("rm -rf '%s'", dir);
+            return;
+        }
+        CHECK_EQ(feed(db, &l, 0, n_seg12), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, l.r[n_seg12 - 1].last), 0);
+        CHECK_EQ(mt_flush(db), 0); /* wal_flushed == 1; seq 2 stays unflushed */
+        CHECK_EQ(replica_floor_saved(db, l.r[n_seg12 - 1].last), 0);
+
+        /* Segment 3: overwrites t = 0..4 with 20..24, and adds unique t = 10..12 with 30..32 */
+        leader_roll(&l); /* seq 3 */
+        {
+            lrec *r = leader_rows(&l, 8, &rng);
+            int8_t ts_idx[8] = {0, 1, 2, 3, 4, 10, 11, 12};
+            float vals[8] = {20, 21, 22, 23, 24, 30, 31, 32};
+            for (int k = 0; k < 8; k++) {
+                r->sid[k] = 0;
+                r->t[k] = ts_idx[k];
+                r->v[k] = vals[k];
+                uint8_t *p = r->bytes + WAL_HDR + (size_t)k * WAL_ROW;
+                uint32_t id = 0;
+                int64_t ts = T0 + (int64_t)ts_idx[k] * 1000;
+                uint64_t slot = 0;
+                memcpy(&slot, &r->v[k], 4);
+                memcpy(p, &id, 4);
+                memcpy(p + 4, &ts, 8);
+                memcpy(p + 12, &slot, 8);
+            }
+            wal_reseal(r->bytes, r->seq, r->off);
+        }
+        /* Segment 2^40: overwrites t = 2..4 with 42..44 (must beat seg 3 even if seg 3 is opened later) */
+        l.seq = (uint64_t)1 << 40;
+        l.off = 0;
+        {
+            lrec *r = leader_rows(&l, 3, &rng);
+            for (int k = 0; k < 3; k++) {
+                r->sid[k] = 0;
+                r->t[k] = (int8_t)(2 + k);
+                r->v[k] = 42.0f + (float)k;
+                uint8_t *p = r->bytes + WAL_HDR + (size_t)k * WAL_ROW;
+                uint32_t id = 0;
+                int64_t ts = T0 + (int64_t)(2 + k) * 1000;
+                uint64_t slot = 0;
+                memcpy(&slot, &r->v[k], 4);
+                memcpy(p, &id, 4);
+                memcpy(p + 4, &ts, 8);
+                memcpy(p + 12, &slot, 8);
+            }
+            wal_reseal(r->bytes, r->seq, r->off);
+        }
+        CHECK_EQ(feed(db, &l, n_seg12, l.n), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(eng_close(db), 0);
+        db = NULL;
+
+        /* Hide segment 3 temporarily so ro_live opens tails [2, 2^40] first. */
+        char seg3[PATH_MAX + 64], tmp3[PATH_MAX + 64], nm3[64];
+        wal_name(nm3, sizeof nm3, 3);
+        snprintf(seg3, sizeof seg3, "%s/%s", dir, nm3);
+        snprintf(tmp3, sizeof tmp3, "%s/hidden_seg3", dir);
+        CHECK_EQ(rename(seg3, tmp3), 0);
+
+        tsdb_options ro_opt;
+        tsdb_options_init(&ro_opt);
+        ro_opt.read_only = 1;
+        ro_opt.merge_threads = 0;
+        ro_opt.create_volumes = 0;
+        eng *ro_live = NULL;
+        CHECK_EQ((eng_open)(dir, &ro_opt, &ro_live), 0);
+        if (ro_live && follow_test_mutant == 0) {
+            CHECK_EQ(ro_live->ntails, 2);
+            CHECK(ro_live->tails[0].seq == 2 && ro_live->tails[1].seq == ((uint64_t)1 << 40));
+
+            /* Restore segment 3 and refresh: follow_tail_one must memmove 2^40 right and insert 3 at index 1. */
+            CHECK_EQ(rename(tmp3, seg3), 0);
+            CHECK_EQ(eng_refresh(ro_live), 0);
+            CHECK_EQ(ro_live->ntails, 3);
+            CHECK(ro_live->tails[0].seq == 2 && ro_live->tails[1].seq == 3 &&
+                  ro_live->tails[2].seq == ((uint64_t)1 << 40));
+
+            model m_all;
+            model_at(&l, l.r[l.n - 1].last, &m_all);
+            CHECK(same_as(ro_live, &m_all, "rojump_ooo: out-of-order tail insertion and precedence"));
+        } else {
+            (void)rename(tmp3, seg3);
+        }
+        if (ro_live)
+            eng_close(ro_live);
+        leader_free(&l);
+        sh("rm -rf '%s'", dir);
     }
 }
 
