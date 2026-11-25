@@ -115,7 +115,7 @@ static struct {
     int synced; /* the manager has gone through the volume records of a metadata copy once (every one declared) */
     tsdb *t;
     char dir[4096];
-    uint32_t self;
+    _Atomic uint32_t self; /* written by the watch (under mu), read by the manager thread without it */
     uint64_t incarnation; /* of this run: REPL says which run saved last (cvolfs.c) */
     struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS]; /* the latest push */
     uint32_t nrecs;

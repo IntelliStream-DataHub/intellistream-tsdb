@@ -149,6 +149,10 @@ struct rvol {
     struct rsnap *snap; /* rsnap.c */
     struct rset *set;   /* rset.c */
     struct rtr *tr;     /* rtransfer.c */
+    /* references, under G.mu: one for the listing in G.vols and one for each vol_find not yet vol_put. The driver
+     * repld_close_end unlists is freed by the last vol_put (vol_free), once no link thread, worker, the cluster
+     * thread or the snapshot worker still holds it */
+    unsigned refs;
 };
 
 enum {
@@ -304,6 +308,7 @@ struct repld_g {
 #define G rd_G
 #define say rd_say
 #define vol_find rd_vol_find
+#define vol_put rd_vol_put
 #define post rd_post
 #define save_repl rd_save_repl
 #define rec_set rd_rec_set
@@ -314,8 +319,11 @@ extern struct repld_g G;
 
 /* one line on stderr, "tsdbd: replication: ..." */
 void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-/* the driver of volume `number`, or NULL (G.mu taken inside) */
+/* the driver of volume `number` with a reference, or NULL (G.mu taken inside); every non-NULL answer is given back with
+ * vol_put once the caller is done with it */
 struct rvol *vol_find(uint32_t number);
+/* gives back vol_find's reference (rv->mu not held: the last one frees rv); NULL is ignored */
+void vol_put(struct rvol *rv);
 /* queues an item of kind IN_* for the volume's thread (any thread, rv->mu not held); a peer kind past the inbox's bound
  * waits, then is dropped (the protocol sends again) */
 void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n);

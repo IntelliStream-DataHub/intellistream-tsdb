@@ -287,6 +287,7 @@ int repld_draining(uint32_t v)
     pthread_mutex_lock(&rv->mu);
     int d = rtr_draining(rv);
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     return d;
 }
 
