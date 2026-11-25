@@ -358,6 +358,8 @@ enum {
     PL_MUT_WNOSHORT = 28,       /* a short write counts the whole write buffer as written (WRITTEN for untaken frames) */
     PL_MUT_NHANDALL = 29,       /* a connection that never was in a handshake (the test attach) is taken off nhand */
     PL_MUT_DONESTATUS = 30,     /* a DONE or RESUME status that is no PL_* code is taken as it came */
+    PL_MUT_STATUSNEG = 31,      /* a status below the lowest PL_E_* code is taken as it came (the upper end checked) */
+    PL_MUT_UPDOWNLEAK = 32,     /* a link going down leaves the process's gauge of links by check level as it was */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */

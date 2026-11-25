@@ -1893,6 +1893,10 @@ static void test_levels(void)
     for (int x = PL_CHECK_NONE; x <= PL_CHECK_FULL; x++)
         for (int y = PL_CHECK_NONE; y <= PL_CHECK_FULL; y++) {
             struct pl_cfg ox = {.check = x}, oy = {.check = y};
+            /* the process's gauge (STATUS's "peer links", the metrics port): both ends are in this process, +2 while
+             * the link is up and back to where it was once both are gone (review F5: a missing -1 at link down) */
+            uint64_t g0[PL_NKINDS][4], g[PL_NKINDS][4];
+            peerlink_up_by_check(g0);
             struct node *a = node_new(1, SECRET, &ox, 1), *b = node_new(2, SECRET, &oy, 0);
             struct plink *l = dial(b, 1, a->port, PL_KIND_LOG);
             struct plink *al = NULL;
@@ -1907,6 +1911,8 @@ static void test_levels(void)
             peerlink_stats(a->pl, &sa);
             peerlink_stats(b->pl, &sb);
             CHECK(sa.up_check[want] == 1 && sb.up_check[want] == 1);
+            peerlink_up_by_check(g);
+            CHECK(g[PL_KIND_LOG][want] == g0[PL_KIND_LOG][want] + 2);
             CHECK(send_frames(l, 1, 0, 30, 700, 1000) == PL_OK);
             CHECK(WAIT_FOR(a->frames_in == 30, 3000));
             CHECK(a->bad_frames == 0 && a->order_bad == 0);
@@ -1915,6 +1921,8 @@ static void test_levels(void)
             peerlink_stats(a->pl, &sa);
             CHECK(sa.up_check[want] == 0);
             node_free(a);
+            peerlink_up_by_check(g);
+            CHECK(g[PL_KIND_LOG][want] == g0[PL_KIND_LOG][want]);
         }
 }
 
@@ -2111,7 +2119,7 @@ static void test_badchunk(void)
 
 /* a DONE whose status is no PL_* code (a flipped bit: the frames carry no check by default) ends the connection, and the
  * file is sent again on the next one; it never reaches `done` as a status no caller knows */
-static void test_donestatus(void)
+static void donestatus_run(int32_t bad)
 {
     char src[600], dst[600];
     pathf(src, sizeof src, "ds-src");
@@ -2130,8 +2138,8 @@ static void test_donestatus(void)
     struct plink *l = dial(b, 1, a->port, PL_KIND_BULK);
     CHECK(WAIT_FOR(plink_up(l) && a->ups >= 1, 3000));
     int downs0 = atomic_load(&b->downs);
-    /* the receiver's first DONE (after every byte and its hash, so in the sender's WAITDONE) says 1, no PL_* code */
-    __atomic_store_n(&peerlink_test_done_status, 1, __ATOMIC_RELAXED);
+    /* the receiver's first DONE (after every byte and its hash, so in the sender's WAITDONE) says `bad`, no PL_* code */
+    __atomic_store_n(&peerlink_test_done_status, bad, __ATOMIC_RELAXED);
     struct jres r = {0};
     CHECK(bulk_send_id(l, 9, sfd, size, "m", &r) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&r.done), 20000));
@@ -2145,6 +2153,13 @@ static void test_donestatus(void)
     close(sfd);
     unlink(src);
     unlink(dst);
+}
+
+/* 1 above PL_OK, and one below the lowest PL_E_* code (review F5: a check of the upper end alone passed 1) */
+static void test_donestatus(void)
+{
+    donestatus_run(1);
+    donestatus_run(PL_E_GIVEUP - 1);
 }
 
 /* a new connection of a peer whose old connection is still up (a restarted server, a redial the acceptor has not
@@ -3389,6 +3404,12 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "donestatus")) {
                 peerlink_mutant = PL_MUT_DONESTATUS;
                 only = "donestatus";
+            } else if (!strcmp(m, "statusneg")) {
+                peerlink_mutant = PL_MUT_STATUSNEG;
+                only = "donestatus";
+            } else if (!strcmp(m, "updownleak")) {
+                peerlink_mutant = PL_MUT_UPDOWNLEAK;
+                only = "levels";
             } else if (!strcmp(m, "kindbucket")) {
                 peerlink_mutant = PL_MUT_KINDBUCKET;
                 only = "kindrate";

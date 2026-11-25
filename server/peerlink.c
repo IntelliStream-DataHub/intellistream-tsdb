@@ -1445,7 +1445,7 @@ static int status_known(int32_t s)
 {
     if (peerlink_mutant == PL_MUT_DONESTATUS)
         return 1;
-    return s <= PL_OK && s >= PL_E_GIVEUP;
+    return s <= PL_OK && (s >= PL_E_GIVEUP || peerlink_mutant == PL_MUT_STATUSNEG);
 }
 
 static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t sent)
@@ -1994,7 +1994,8 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         c.t->ops->close(c.t);
     if (c.keys.out.type >= 1 && c.keys.out.type <= 3)
         ST(pl, up_check[c.keys.out.type], (uint64_t)-1);
-    up_count(l->kind, c.keys.out.type, -1);
+    if (peerlink_mutant != PL_MUT_UPDOWNLEAK)
+        up_count(l->kind, c.keys.out.type, -1);
     atomic_store(&l->check, 0);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 0);
