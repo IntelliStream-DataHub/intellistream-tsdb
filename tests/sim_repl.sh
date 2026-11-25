@@ -68,6 +68,10 @@ mode=${1:-quick}
 #     is ignored) is liveness only: a driver that takes it holds until the drain's bound or the hard cap.
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
+# ACK hardening (64-66): 64 ack_bound (an ACK with durable > written or written > leader's log end is accepted:
+#     test_repl's `ack_bound`), 65 stale_replay (a same-rid ACK with durable < p->match overwrites replay/acked/next:
+#     test_repl's `stale_replay`, sim_repl's `sim_stale_replay`), 66 stale_rid (a stale ACK of an ISR member's initial
+#     rid flips p->rid back once another rid was heard: test_repl's `stale_rid`, sim_repl's `sim_stale_rid`).
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
 # 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).

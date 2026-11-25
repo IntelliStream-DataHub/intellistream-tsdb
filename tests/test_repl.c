@@ -50,8 +50,9 @@
  *               must not flip it back (stale_rid).
  *   stale_replay a stale ACK with a higher nonzero replay start sent before a snapshot install lowered it (and before
  *               a crash + install even if its unsynced written end exceeded the install) is dropped (MUT(65)).
- *   stale_rid   a stale ACK carrying an old rid (of an ISR member before or after its ISR drop, or of a wiped learner
- *               whose new rid is confirmed) must not overwrite p->rid back, raise match or replay, or revive it (MUT(66)).
+ *   stale_rid   a stale ACK carrying an ISR member's initial rid (before or after its ISR drop) must not overwrite
+ *               p->rid back, raise match or replay, or revive it (MUT(66)), while delayed/duplicated ACKs of an
+ *               earlier learner rid never permanently silence a live instance.
  *   stale_epoch a leader ignores an ACK carrying an older epoch even when its durable end is within r->written (MUT(8)).
  */
 #include "repl.h"
@@ -1534,7 +1535,7 @@ static void stale_rid(void)
     CHECK(r && repl_is_leader(r), "not leader");
     repl_log_start(r, 50);
     repl_replay_start(r, 50);
-    /* 1. ISR member 2 (meta_rid 33) wipes to rid 99; stale ACK of rid 33 arrives while 33 is still in meta.isr */
+    /* 1. ISR member 2 (init_rid 33) wipes to rid 99; stale ACK of rid 33 arrives while 33 is still in meta.isr */
     struct repl_msg wipe2 = ack_msg(2, 0, 0, 99, 0, 0);
     wipe2.resync = 1;
     repl_recv(r, &wipe2);
@@ -1552,7 +1553,7 @@ static void stale_rid(void)
     drain(r, &d, NULL);
     CHECK(repl_commit(r) == 101, "stale ACK of rid 33 let commit advance to %" PRIu64, repl_commit(r));
     CHECK(repl_replay_floor(r) <= 50, "stale ACK of rid 33 raised replay floor to %" PRIu64, repl_replay_floor(r));
-    /* 2. Even after node 2 is dropped from meta.isr (meta.rid[2] becomes 0), stale rid 33 is still refused */
+    /* 2. Even after node 2 is dropped from meta.isr (meta.rid[2] becomes 0), stale init_rid 33 is still refused */
     struct repl_msg drop2 = meta_msg(0, 2, 0, 0x1, 0);
     drop2.meta.isr_version = 8;
     drop2.meta.rid[2] = 0;
@@ -1568,28 +1569,13 @@ static void stale_rid(void)
     drain(r, &d, NULL);
     const struct repl_action *q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
     CHECK(!q, "stale rid 33 triggered ISR rejoin request (rid %" PRIu64 ")", q ? q->msg.meta.rid[2] : 0);
-    /* 3. Learner 1 (meta_rid == 0, rid 22) wipes to rid 23 (confirmed by 2 ACKs); stale rid 22 is refused */
-    struct repl_msg wipe1 = ack_msg(1, 0, 0, 23, 0, 0);
-    wipe1.resync = 1;
-    repl_recv(r, &wipe1);
-    drain(r, &d, NULL);
-    wipe1.resync = 0;
-    repl_recv(r, &wipe1);
-    drain(r, &d, NULL);
-    struct repl_msg stale1 = ack_msg(1, 0, 102, 22, 95, 0);
-    stale1.start = 95;
-    repl_recv(r, &stale1);
-    drain(r, &d, NULL);
-    CHECK(repl_replay_floor(r) <= 50, "stale learner rid 22 raised replay floor to %" PRIu64, repl_replay_floor(r));
-    /* 4. Reordered unseen rid on a learner must not permanently ban the live rid */
-    struct repl_msg live2 = ack_msg(2, 0, 102, 99, 50, 0);
-    repl_recv(r, &live2);
-    drain(r, &d, NULL);
     repl_free(r);
 
+    /* 3. Mid-epoch ISR join deadlock regression: learner 2 (init_rid == 0) wipes 22 -> 23, joins the ISR via
+     * adopt_meta(), then receives a delayed ACK(22). Live ACK(23) must continue to be accepted both before and after
+     * an ISR eviction, never permanently silencing node 2. */
     r = join_leader(&d, &c);
     CHECK(r && repl_is_leader(r), "not leader (2)");
-    /* Remove learner 1 and re-add as fresh slot (meta_rid == 0, p->rid == 0) */
     int map1[2] = {0, 2};
     CHECK(repl_reconfig(r, 2, 0, map1) == REPL_OK, "reconfig drop");
     repl_set_version(r, 1);
@@ -1607,14 +1593,59 @@ static void stale_rid(void)
     struct repl_msg r22 = ack_msg(2, 0, 101, 22, 20, 2);
     repl_recv(r, &r23);
     repl_recv(r, &r23);
-    repl_recv(r, &r22); /* one delayed stale ACK of unseen rid 22 */
+    drain(r, &d, NULL);
+    /* Promote learner 2 (rid 23) into the ISR mid-epoch */
+    struct repl_msg join2 = m;
+    join2.meta.isr = 0x7;
+    join2.meta.isr_version = 9;
+    join2.meta.rid[2] = 23;
+    repl_recv(r, &join2);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 101, "joined node 2 peer_match %" PRIu64, repl_peer_match(r, 2));
+    /* Single delayed ACK of unseen earlier rid 22 arrives; even if evicted, live rid 23 must recover and rejoin */
+    repl_recv(r, &r22);
+    drain(r, &d, NULL);
+    repl_tick(r);
+    drain(r, &d, NULL);
+    q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    CHECK(q && q->msg.meta.isr == 0x3, "expected ISR drop of node 2 after delayed rid 22");
+    struct repl_msg evict2 = join2;
+    evict2.meta.isr = 0x3;
+    evict2.meta.isr_version = 10;
+    evict2.meta.rid[2] = 0;
+    repl_recv(r, &evict2);
+    drain(r, &d, NULL);
+    repl_recv(r, &r23);
+    drain(r, &d, NULL);
+    repl_tick(r);
+    drain(r, &d, NULL);
+    q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    CHECK(q && q->msg.meta.isr == 0x7 && q->msg.meta.rid[2] == 23,
+          "live rid 23 was permanently silenced after mid-epoch ISR join + delayed rid 22");
+    repl_free(r);
+
+    /* 4. Duplicated/delayed old-rid deadlock regression on a learner: learner 2 (init_rid == 0) wipes 22 -> 23,
+     * sends live ACKs, then receives TWO delayed/duplicated ACK(22) packets back-to-back. Live ACK(23) must still
+     * recover and trigger ISR rejoin. */
+    r = join_leader(&d, &c);
+    CHECK(r && repl_is_leader(r), "not leader (3)");
+    CHECK(repl_reconfig(r, 2, 0, map1) == REPL_OK, "reconfig drop (2)");
+    repl_set_version(r, 1);
+    CHECK(repl_reconfig(r, 3, 0, map2) == REPL_OK, "reconfig add (2)");
+    repl_set_version(r, 2);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_recv(r, &r23);
+    repl_recv(r, &r23);
+    repl_recv(r, &r22); /* two delayed/duplicated ACKs of unseen rid 22 back-to-back */
+    repl_recv(r, &r22);
     repl_recv(r, &r23); /* live rid 23 keeps sending and must recover */
     repl_recv(r, &r23);
     drain(r, &d, NULL);
     repl_tick(r);
     drain(r, &d, NULL);
     q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
-    CHECK(q && q->msg.meta.rid[2] == 23, "live learner rid 23 was deadlocked by a single stale ACK");
+    CHECK(q && q->msg.meta.rid[2] == 23, "live learner rid 23 was deadlocked by two delayed/duplicated stale ACKs");
     repl_free(r);
 }
 

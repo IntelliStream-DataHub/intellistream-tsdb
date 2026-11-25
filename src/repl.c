@@ -32,17 +32,12 @@ uint64_t repl_mutants, repl_mutants2; /* bugs 0-63, 64-127 */
 
 enum { F_IDLE, F_TRUNC, F_FOLLOW };
 
-#define PEER_OLD_RIDS 16
-
 struct peer {
     uint64_t next;      /* next position to send; 0: unknown until its first ACK in this epoch */
     uint64_t match;     /* durable end it acknowledged in this epoch, as instance `rid` */
     uint64_t acked;     /* written end it last reported */
     uint64_t rid;       /* the instance its ACKs came from; 0: none yet in this epoch */
-    uint64_t meta_rid;  /* the last nonzero instance the metadata record named for it in this epoch */
-    uint64_t prev_rid;  /* previous instance, retired to old_rid once the current one is heard twice */
-    uint64_t old_rid[PEER_OLD_RIDS]; /* retired instances in this epoch: stale ACKs from them are ignored */
-    uint8_t nold_rid, old_pos, rid_acks;
+    uint64_t init_rid;  /* the ISR member's instance when lead() began this epoch; 0 for learners */
     uint64_t last_send, last_ack;
     uint64_t commit_sent; /* the commit point its last APPEND carried */
     uint64_t last_heard; /* the tick of its last ACK in this epoch (last_ack also moves when a resend goes back) */
@@ -769,7 +764,7 @@ static void lead(struct repl *r, const struct repl_vmeta *v)
     memset(r->peer, 0, sizeof r->peer);
     for (int i = 0; i < r->cfg.nnodes; i++) {
         r->peer[i].last_ack = r->peer[i].last_heard = r->now;
-        r->peer[i].meta_rid = (v->isr & (1u << i)) ? v->rid[i] : 0;
+        r->peer[i].init_rid = (v->isr & (1u << i)) ? v->rid[i] : 0;
     }
     r->lead_tick = r->now;
     for (uint32_t i = 0; i < r->nwend; i++)
@@ -799,23 +794,6 @@ static void resign(struct repl *r)
     r->last_resign = r->now;
 }
 
-static int peer_old_rid(const struct peer *p, uint64_t rid)
-{
-    for (uint8_t i = 0; i < p->nold_rid; i++)
-        if (p->old_rid[i] == rid)
-            return 1;
-    return 0;
-}
-
-static void peer_retire_rid(struct peer *p, uint64_t rid)
-{
-    if (!rid || peer_old_rid(p, rid))
-        return;
-    p->old_rid[p->old_pos++ % PEER_OLD_RIDS] = rid;
-    if (p->nold_rid < PEER_OLD_RIDS)
-        p->nold_rid++;
-}
-
 static void adopt_meta(struct repl *r, const struct repl_vmeta *v)
 {
     if (v->epoch < r->epoch)
@@ -831,14 +809,6 @@ static void adopt_meta(struct repl *r, const struct repl_vmeta *v)
         if (r->leading) {
             if (r->isr_busy && v->isr_version > r->isr_req.isr_version)
                 r->isr_busy = 0;
-            for (int i = 0; i < r->cfg.nnodes; i++) {
-                uint64_t mrid = (v->isr & (1u << i)) ? v->rid[i] : 0;
-                if (mrid && mrid != r->peer[i].meta_rid) {
-                    if (r->peer[i].meta_rid)
-                        peer_retire_rid(&r->peer[i], r->peer[i].meta_rid);
-                    r->peer[i].meta_rid = mrid;
-                }
-            }
             advance(r);
         }
         return;
@@ -885,28 +855,22 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
         return;
     }
     struct peer *p = &r->peer[m->from];
-    if (!m->rid)
+    if (!m->rid) {
+        r->dropped++;
         return;
+    }
     int same_rid = m->rid == p->rid;
     if (!same_rid) {
-        /* A stale ACK carrying an old rid (already retired in this epoch, or the metadata record's earlier instance
-         * once a newer one was heard) must not flip p->rid back or overwrite match/replay/next. Note: for a pure
-         * learner (never in the ISR in this epoch, meta_rid == 0), prev_rid is retired only once the new rid has been
-         * heard twice, so a single delayed old-rid ACK arriving ahead of a wipe's second ACK cannot permanently ban the
-         * live instance (random rids have no order on the wire). */
-        if (p->rid && !MUT(66) && (m->rid == p->meta_rid || peer_old_rid(p, m->rid)))
+        /* Once another instance has been heard in this epoch, an ACK carrying init_rid (the ISR member's instance
+         * when lead() began this epoch, which existed before the epoch started) is strictly older and must not flip
+         * p->rid back or overwrite match/replay/next (MUT(66)). Other rids are never permanently banned because
+         * random 64-bit rids have no order on the wire without a monotonic incarnation field. */
+        if (p->rid && !MUT(66) && m->rid == p->init_rid)
             return;
-        if (p->rid)
-            p->prev_rid = p->rid;
         p->rid = m->rid;
-        p->rid_acks = 1;
         if (!MUT(19))
             p->match = 0;
     } else {
-        if (p->rid_acks < 2 && ++p->rid_acks == 2 && p->prev_rid) {
-            peer_retire_rid(p, p->prev_rid);
-            p->prev_rid = 0;
-        }
         /* Under one rid, durable never shrinks (a snapshot install always raises it to P > pre-install written end, and
          * crashes keep durable records). An ACK with a lower durable end was sent before a newer one already heard
          * (e.g. before a snapshot install that lowered replay) and must not overwrite replay/acked/next (MUT(65)). */
