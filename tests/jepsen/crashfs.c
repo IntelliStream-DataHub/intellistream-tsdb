@@ -142,6 +142,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FDS 65536
@@ -249,6 +250,7 @@ REAL(closedir);
 static volatile sig_atomic_t power_losing; /* the power loss is rolling files back: another thread that reads a mapping of one gets SIGBUS */
 static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
 static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
+static char cut_file[PATH_MAX];         /* $CRASHFS_CUT_FILE: "<pid> <mono_ns>\n" per power loss, for wal_sync_ms window checks */
 static int ignore_usr2;                 /* $CRASHFS_IGNORE_USR2: 1: a shim that does not honour the pull, 2: one that honours it and does not log it (jepsen's self-test of its count) */
 
 /* The harness's proof of a plug it pulled is written where the signal is delivered, not where the process dies of it: a loss
@@ -387,6 +389,8 @@ __attribute__((constructor)) static void init(void)
         prob = 0;
     if (getenv("CRASHFS_PULL_FILE"))
         snprintf(pull_file, sizeof pull_file, "%s", getenv("CRASHFS_PULL_FILE"));
+    if (getenv("CRASHFS_CUT_FILE"))
+        snprintf(cut_file, sizeof cut_file, "%s", getenv("CRASHFS_CUT_FILE"));
     ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") ? atoi(getenv("CRASHFS_IGNORE_USR2")) : 0;
     signal(SIGUSR2, on_usr2);
     signal(SIGBUS, on_bus);
@@ -983,14 +987,65 @@ static void rollback(void)
         tsave_drop(&files[i]);
 }
 
+/* Async-signal-safe: raw syscalls, manual ASCII formatting, atomic once-guard so both on_bus() and power_loss() can
+ * call it right before _exit(99) without risking duplicate lines or calling snprintf() from a signal handler. */
+static volatile int cut_logged;
+static void log_cut_time(void)
+{
+    if (!cut_file[0] || __atomic_exchange_n(&cut_logged, 1, __ATOMIC_ACQ_REL))
+        return;
+    int saved = errno;
+    struct timespec cut_ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &cut_ts) != 0) {
+        errno = saved;
+        return;
+    }
+    int64_t cut_ns = (int64_t)cut_ts.tv_sec * 1000000000LL + cut_ts.tv_nsec;
+    char line[64], digits[24];
+    int n = 0, nd = 0;
+    long pid = (long)getpid();
+    if (pid < 0)
+        pid = 0;
+    do
+        digits[nd++] = (char)('0' + pid % 10);
+    while ((pid /= 10) > 0);
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    line[n++] = ' ';
+    if (cut_ns < 0) {
+        line[n++] = '-';
+        uint64_t u = (uint64_t)(-(cut_ns + 1)) + 1ULL;
+        do
+            digits[nd++] = (char)('0' + (int)(u % 10));
+        while ((u /= 10) > 0);
+    } else {
+        uint64_t u = (uint64_t)cut_ns;
+        do
+            digits[nd++] = (char)('0' + (int)(u % 10));
+        while ((u /= 10) > 0);
+    }
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    line[n++] = '\n';
+    int cfd = (int)syscall(SYS_openat, AT_FDCWD, cut_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (cfd >= 0) {
+        if (syscall(SYS_write, cfd, line, (size_t)n) < 0) {
+        }
+        syscall(SYS_close, cfd);
+    }
+    errno = saved;
+}
+
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
  * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
  * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
  * Any other SIGBUS keeps its default action. */
 static void on_bus(int sig)
 {
-    if (power_losing)
+    if (power_losing) {
+        log_cut_time();
         _exit(99);
+    }
     signal(sig, SIG_DFL); /* the instruction faults again: the default action */
 }
 
@@ -1009,6 +1064,10 @@ __attribute__((noreturn)) static void power_loss(void)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
+    /* Stamp right before _exit(99) (after rollback() and stderr write): with wal_sync_ms > 0, in-memory writes on other
+     * threads do not touch files and can still reply while rollback() runs, so minimizing the gap before _exit(99)
+     * keeps the timestamp tightly bounded by the actual process death. */
+    log_cut_time();
     _exit(99);
 }
 
