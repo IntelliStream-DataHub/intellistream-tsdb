@@ -135,6 +135,7 @@ static int t_eng_open(const char *dir, const tsdb_options *o, eng **db)
 #define NT 64   /* distinct times per series (a day holds them: one partition) */
 static char S[PATH_MAX - 64], SELF[PATH_MAX];
 static const char *MUTNAME;
+extern int follow_test_mutant;
 
 static int sh(const char *fmt, ...)
 {
@@ -4309,6 +4310,204 @@ static void case_promote(int variant)
     xp_stop(&x);
 }
 
+/* Regression for docs/tasks/replica-ro-tails.md: a read-only open (and a live follower refresh) of a replica whose
+ * MANIFEST has wal_flushed below a 2^40 epoch jump and wal_active at or above 2^40, with unflushed rows in two or
+ * more segments below the jump and in segments at/above the jump (2^40 and 2^40 + 1). The old sequential tail loop
+ * filled MAX_TAILS slots with non-existent segment numbers and never reached the segments above 2^40. */
+static void case_ro_epoch_jump(void)
+{
+    /* 1. Direct replica feed: kept flushed segment 1 (wal_flushed == 1), two unflushed segments below 2^40 (2, 3),
+     *    and unflushed rows in both 2^40 and 2^40 + 1 (including overwrites of pre-jump timestamps). */
+    {
+        char dir[PATH_MAX];
+        fresh(dir, "rojump");
+        leader l;
+        unsigned rng = 31;
+        leader_init(&l);
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        leader_roll(&l); /* seq 2 */
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        size_t n_seg12 = l.n;
+
+        eng *db = NULL;
+        replica_keep_next(0, 3600 * 1000); /* keep flushed segment 1 on disk to verify seq <= wal_flushed is skipped */
+        CHECK_EQ(open_replica(dir, 0, &db), 0);
+        if (!db) {
+            leader_free(&l);
+            return;
+        }
+        CHECK_EQ(feed(db, &l, 0, n_seg12), 0);
+        CHECK_EQ(replica_sync(db), 0);
+        CHECK_EQ(replica_apply(db, l.r[n_seg12 - 1].last), 0);
+        CHECK_EQ(mt_flush(db), 0); /* flushes segment 1; segment 2 stays active and unflushed */
+        CHECK_EQ(replica_floor_saved(db, l.r[n_seg12 - 1].last), 0);
+
+        leader_roll(&l); /* seq 3: second unflushed segment below 2^40 */
+        for (int i = 0; i < 3; i++)
+            leader_rows(&l, 4, &rng);
+        size_t n_pre = l.n;
+        /* Append and sync without applying seq 3 yet: replica_apply seals seq 2 and wakes the background flusher,
+         * which would race ahead and move wal_flushed past seq 2/3. Keeping seq 3..2^40+1 unapplied until after the
+         * read-only checks keeps wal_flushed == 1 deterministically while all four segments hold durable WAL rows. */
+        CHECK_EQ(feed(db, &l, n_seg12, n_pre), 0);
+        CHECK_EQ(replica_sync(db), 0);
+
+        uint64_t fl = 0, ac = 0;
+        CHECK(man_bounds(dir, &fl, &ac) && fl == 1 && ac == 3);
+
+        model m_pre;
+        model_at(&l, l.r[n_pre - 1].last, &m_pre);
+        tsdb_options ro_opt;
+        tsdb_options_init(&ro_opt);
+        ro_opt.read_only = 1;
+        ro_opt.merge_threads = 0;
+        ro_opt.create_volumes = 0;
+        eng *ro_live = NULL;
+        CHECK_EQ((eng_open)(dir, &ro_opt, &ro_live), 0);
+        if (ro_live)
+            CHECK(same_as(ro_live, &m_pre, "rojump: live before jump"));
+
+        /* Epoch jump: rows in 2^40 and in 2^40 + 1, with wal_flushed still 1. */
+        l.seq = (uint64_t)1 << 40;
+        l.off = 0;
+        for (int i = 0; i < 4; i++)
+            leader_rows(&l, 5, &rng);
+        leader_roll(&l); /* 2^40 + 1 */
+        for (int i = 0; i < 4; i++)
+            leader_rows(&l, 5, &rng);
+        size_t n_post = l.n;
+        CHECK_EQ(feed(db, &l, n_pre, n_post), 0);
+        CHECK_EQ(replica_sync(db), 0);
+
+        CHECK(man_bounds(dir, &fl, &ac) && fl == 1 && ac == ((uint64_t)1 << 40) + 1);
+        CHECK_EQ(count_files(dir, "wal_"), 5); /* seg 1 (kept), 2, 3, 2^40, 2^40+1 */
+
+        model m_post;
+        model_at(&l, l.r[n_post - 1].last, &m_post);
+
+        eng *ro1 = NULL;
+        CHECK_EQ((eng_open)(dir, &ro_opt, &ro1), 0);
+        if (ro1) {
+            CHECK(same_as(ro1, &m_post, "rojump: fresh ro open across jump"));
+            eng_close(ro1);
+        }
+        if (ro_live) {
+            CHECK_EQ(eng_refresh(ro_live), 0);
+            CHECK(same_as(ro_live, &m_post, "rojump: live refresh across jump"));
+        }
+
+        /* Stopped replica directory (as jepsen-cluster's end check opens it): wal_flushed is still 1 on disk. */
+        CHECK_EQ(eng_close(db), 0);
+        db = NULL;
+        CHECK(man_bounds(dir, &fl, &ac) && fl == 1 && ac == ((uint64_t)1 << 40) + 1);
+        eng *ro2 = NULL;
+        CHECK_EQ((eng_open)(dir, &ro_opt, &ro2), 0);
+        if (ro2) {
+            CHECK(same_as(ro2, &m_post, "rojump: stopped replica ro open across jump"));
+            eng_close(ro2);
+        }
+
+        /* Reopen, apply & flush past 2^40, write 2^40 + 2: live follower drops pre-jump tails and returns to fast path. */
+        replica_keep_next(0, 3600 * 1000);
+        CHECK_EQ(open_replica(dir, l.r[n_post - 1].last, &db), 0);
+        if (db) {
+            CHECK(same_as(db, &m_post, "rojump: reopened replica itself"));
+            CHECK_EQ(mt_flush(db), 0);
+            leader_roll(&l); /* 2^40 + 2 */
+            for (int i = 0; i < 3; i++)
+                leader_rows(&l, 4, &rng);
+            CHECK_EQ(feed(db, &l, n_post, l.n), 0);
+            CHECK_EQ(replica_sync(db), 0);
+            CHECK_EQ(replica_apply(db, l.r[l.n - 1].last), 0);
+            CHECK(man_bounds(dir, &fl, &ac) && fl >= ((uint64_t)1 << 40) && ac == ((uint64_t)1 << 40) + 2);
+            model m_after;
+            model_at(&l, l.r[l.n - 1].last, &m_after);
+            if (ro_live) {
+                CHECK_EQ(eng_refresh(ro_live), 0);
+                CHECK(same_as(ro_live, &m_after, "rojump: live refresh after flush past jump"));
+            }
+            CHECK_EQ(eng_close(db), 0);
+        }
+        if (ro_live)
+            eng_close(ro_live);
+        leader_free(&l);
+        sh("rm -rf '%s'", dir);
+    }
+
+    /* 2. Realistic promotion flow: another member b holds 2+ unflushed segments below 2^40, receives the EPOCH
+     *    marker (2^40) and small rows from the promoted leader (2^40 + 1) without flushing, then is opened ro. */
+    {
+        xport x;
+        char rd[PATH_MAX], bd[PATH_MAX];
+        xp_start(&x, "rojp");
+        rdir(rd, sizeof rd, &x);
+        snprintf(bd, sizeof bd, "%s_b", x.ldir);
+        xp_rows(&x, 0, 0, 8, 100);
+        xp_step(&x, "ROJP: seg 1");
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_rows(&x, 0, 10, 8, 200);
+        xp_rows(&x, 1, 0, 6, 300);
+        xp_step(&x, "ROJP: seg 2");
+        CHECK_EQ(eng_flush(x.ld), 0);
+        xp_rows(&x, 1, 10, 6, 400);
+        xp_step(&x, "ROJP: seg 3");
+
+        sh("rm -rf '%s' && cp -a '%s' '%s'", bd, rd, bd);
+        eng *b = NULL;
+        CHECK_EQ(open_replica(bd, 0, &b), 0);
+        if (!b) {
+            xp_stop(&x);
+            return;
+        }
+        uint64_t pos = 0;
+        CHECK_EQ(replica_epoch_begin(x.rep, 1, "node-a", &pos), 0);
+        CHECK_EQ(replica_sync(x.rep), 0);
+        CHECK_EQ(ship_from(x.rep, b), 0);
+        CHECK_EQ(replica_apply(x.rep, pos), 0);
+
+        eng *n = NULL;
+        CHECK_EQ(replica_promote(&x.rep, pos, &n), 0);
+        CHECK(x.rep == NULL && n != NULL);
+        if (!n) {
+            eng_close(b);
+            xp_stop(&x);
+            return;
+        }
+        eng_close(x.ld);
+        x.ld = n;
+        snprintf(x.ldir, sizeof x.ldir, "%s", rd);
+        x.rep = b;
+        {
+            struct stat st;
+            char p[PATH_MAX + 64], nm[64];
+            wal_name(nm, sizeof nm, (uint64_t)1 << 40);
+            snprintf(p, sizeof p, "%s/%s", rd, nm);
+            CHECK_EQ(stat(p, &st), 0);
+            x.cseq = (uint64_t)1 << 40;
+            x.coff = (uint64_t)st.st_size;
+        }
+        CHECK_EQ(eng_leader_attach(n, &XOPS), 0);
+        /* Small rows from the promoted leader go into 2^40 + 1 (including overwrites of pre-jump rows);
+         * ship them to b without applying yet so b's flusher cannot race ahead of wal_flushed < 2^40. */
+        x.noapply = true;
+        xp_rows(&x, 0, 4, 8, 900);
+        xp_rows(&x, 1, 20, 6, 1200);
+        CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+
+        uint64_t fl = 0, ac = 0;
+        CHECK(man_bounds(bd, &fl, &ac) && fl < ((uint64_t)1 << 40) && ac >= ((uint64_t)1 << 40) + 1);
+        CHECK(ro_dir_same(x.ld, bd, T0 + 1000LL * (NT + 1), "ROJP: member b across promotion, read-only"));
+        eng_close(x.rep);
+        x.rep = NULL;
+        CHECK(man_bounds(bd, &fl, &ac) && fl < ((uint64_t)1 << 40) && ac >= ((uint64_t)1 << 40) + 1);
+        CHECK(ro_dir_same(x.ld, bd, T0 + 1000LL * (NT + 1), "ROJP: stopped member b across promotion, read-only"));
+        xp_stop(&x);
+        sh("rm -rf '%s'", bd);
+    }
+}
+
 static void promote_hook_exit(void) { _exit(77); }
 
 /* the process dies after promotion named the kept segments in RSTATE and before it opened the writer: the rows the
@@ -7695,9 +7894,14 @@ int main(int argc, char **argv)
     }
     if (a + 1 < argc && strcmp(argv[a], "--mutant") == 0) {
         const char *m = argv[a + 1];
-        eng_test_mutant = mutant_of(m);
+        if (strcmp(m, "roseqtails") == 0)
+            follow_test_mutant = 1;
+        else if (strcmp(m, "roonetail") == 0)
+            follow_test_mutant = 2;
+        else
+            eng_test_mutant = mutant_of(m);
         MUTNAME = m;
-        if (!eng_test_mutant) {
+        if (!eng_test_mutant && !follow_test_mutant) {
             fprintf(stderr, "unknown mutant %s\n", m);
             return 2;
         }
@@ -7755,9 +7959,20 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (follow_test_mutant) {
+        case_ro_epoch_jump();
+        sh("rm -rf '%s'", S);
+        if (failures) {
+            fprintf(stderr, "test_replica: %d failures\n", failures);
+            return 1;
+        }
+        printf("test_replica: ok\n");
+        return 0;
+    }
     if (getenv("TEST_REPLICA_RO_ONLY")) { /* the quick run of the read-only open; under TSan with walsequnlocked it
                                             * must report the race of a rotation's wal_seq with the flusher's MANIFEST */
         case_ro_open();
+        case_ro_epoch_jump();
         sh("rm -rf '%s'", S);
         printf("test_replica: %s\n", failures ? "FAILED" : "ok");
         return failures != 0;
@@ -7898,6 +8113,7 @@ int main(int argc, char **argv)
     case_sealed_open();
     case_commit();
     case_ro_open();
+    case_ro_epoch_jump();
     case_commit_hold();
     case_cold_hold();
     case_ppos_sites();
