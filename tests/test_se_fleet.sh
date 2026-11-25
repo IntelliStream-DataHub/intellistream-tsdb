@@ -95,6 +95,7 @@ EOF
     slotcap)      sub se-env.sh '{0,2}' '*' ;;
     ownmsg)       sub se-remote.sh 'if [ ${#c[@]} -eq 0 ] && [ -n "${1:-}" ] &&' 'if false &&' ;;
     rbnolock)     sub rbworker.sh 'flock -n 9' 'true' ;;
+    rbfdleak)     sub rbworker.sh 'ssh $K "$h" "$@" 7>&-' 'ssh $K "$h" "$@"' ;;
     *) echo "unknown mutant $mutant"; exit 2 ;;
     esac
 fi
@@ -413,8 +414,8 @@ eq "rbgrun: two racing callers under mkdir=0 shim never ran at once (max active)
 
 # Two racing callers on two hosts take different hosts
 conf "RB_HOSTS=\"$A $B\""
-"$S/rbgrun.sh" rb3 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb3'; sleep 2" > /dev/null &
-"$S/rbgrun.sh" rb4 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb4'; sleep 2" > /dev/null &
+"$S/rbgrun.sh" rb3 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb3'; sleep 4" > /dev/null &
+"$S/rbgrun.sh" rb4 "$scratch/rbwt" - bash -c "echo \${FAKE_HOST:-none} > '$scratch/rb_ran.rb4'; sleep 4" > /dev/null &
 wait
 wait_rc rb3; wait_rc rb4
 eq "rb3 exit code" "$(rcof rb3)" 0
@@ -423,17 +424,22 @@ eq "rb4 exit code" "$(rcof rb4)" 0
 
 # SIGKILL of rbworker.sh releases the flock immediately (no stale lock)
 conf "RB_HOSTS=\"$A\""
-"$S/rbgrun.sh" rb5 "$scratch/rbwt" - bash -c "echo \$\$ > '$scratch/rb5.child'; touch '$scratch/rb5.up'; exec sleep 15" > /dev/null
+"$S/rbgrun.sh" rb5 "$scratch/rbwt" - bash -c "echo \$\$ > '$scratch/rb5.child'; touch '$scratch/rb5.up'; exec sleep 60" > /dev/null
 for i in $(seq 1 60); do [ -e "$scratch/rb5.up" ] && break; sleep 0.1; done
 [ -e "$scratch/rb5.up" ] && ok "rb5 started" || bad "rb5 did not start"
 wp=$(cat "$SE_HOME/runs/rb5/pid" 2>/dev/null)
-kill -KILL "$wp" 2>/dev/null
-for i in $(seq 1 40); do kill -0 "$wp" 2>/dev/null || break; sleep 0.1; done
+if [[ "$wp" =~ ^[0-9]+$ ]] && [ "$wp" -gt 1 ]; then
+    kill -KILL "$wp" 2>/dev/null
+    for i in $(seq 1 40); do kill -0 "$wp" 2>/dev/null || break; sleep 0.1; done
+else
+    bad "rb5 pid invalid: '$wp'"
+fi
 "$S/rbgrun.sh" rb6 "$scratch/rbwt" - bash -c "echo ok > '$scratch/rb6.ok'" > /dev/null
 wait_rc rb6
 eq "rb6 acquired A after SIGKILL of rb5" "$(rcof rb6)" 0
 eq "rb6 ran" "$(cat "$scratch/rb6.ok" 2>/dev/null)" "ok"
 cp=$(cat "$scratch/rb5.child" 2>/dev/null)
+[[ "$cp" =~ ^[0-9]+$ ]] && [ "$cp" -gt 1 ] && kill -0 "$cp" 2>/dev/null && ok "rb6 acquired lock while rb5 child still alive" || bad "rb5 child '$cp' already dead when rb6 finished (lock was held by leaked fd 7)"
 [[ "$cp" =~ ^[0-9]+$ ]] && [ "$cp" -gt 1 ] && kill -KILL "$cp" 2>/dev/null || true
 
 if [ $fail = 0 ]; then

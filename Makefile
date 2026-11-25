@@ -2176,7 +2176,7 @@ test: test-se-fleet
 .PHONY: test-se-fleet se-fleet-mutants
 test-se-fleet:
 	tests/test_se_fleet.sh $(SCRATCH)
-SE_FLEET_MUTANTS = nohost rxdefault rxjob overbook noprobe downfree fallbacklast slotsignored rjobhost notag ownglobal awaithost awaitone wdfirst wdhost wdone overflow pushfirst backfirst gitfirst nolock pinlock noprobetimeout claimneedspid claimslot claimnowait nowaitprobe rrunsticky rrunnonote endnote badlocal slotcap ownmsg rbnolock
+SE_FLEET_MUTANTS = nohost rxdefault rxjob overbook noprobe downfree fallbacklast slotsignored rjobhost notag ownglobal awaithost awaitone wdfirst wdhost wdone overflow pushfirst backfirst gitfirst nolock pinlock noprobetimeout claimneedspid claimslot claimnowait nowaitprobe rrunsticky rrunnonote endnote badlocal slotcap ownmsg rbnolock rbfdleak
 se-fleet-mutants:
 	$(MUT) --name se-fleet --rc 1 --timeout 600 --detail 'FAIL|SURVIVED' --list "$(SE_FLEET_MUTANTS)" -- tests/test_se_fleet.sh --mutant @M@ @D@
 # tools/link-bench on loopback (the tool behind docs/design-rdma.md's numbers): tags checked, a wrong one caught, round

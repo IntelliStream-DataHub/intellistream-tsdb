@@ -9,7 +9,7 @@ R=${RB_ROOT:-/dev/shm/iso-ci}/$RB_N
 fin() { echo "$1" > $RB_D/rc.tmp; mv $RB_D/rc.tmp $RB_D/rc; exit "$1"; }
 sshh() { local h=$1; shift; ssh $K "$h" "$@" 7>&-; }
 sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
-LKD=$(mktemp -d) || fin 97
+LKD=$(mktemp -d "$RB_D/.lock.XXXXXX") || fin 97
 LPID=
 H=
 release_lock() {
@@ -24,7 +24,9 @@ release_lock() {
 }
 cleanup() {
   if [ -n "$H" ]; then
-    [ -n "$RB_KEEP" ] || sshh "$H" "sudo rm -rf $R /dev/shm/t $RB_MIRROR" 2>/dev/null
+    if [ -n "$LPID" ] && kill -0 "$LPID" 2>/dev/null; then
+      [ -n "$RB_KEEP" ] || sshh "$H" "sudo rm -rf $R /dev/shm/t $RB_MIRROR" 2>/dev/null
+    fi
     H=
   fi
   release_lock
@@ -41,18 +43,18 @@ try_lock() {
   mkfifo "$LKD/in" || return 1
   : > "$LKD/out" || return 1
   exec 7<>"$LKD/in"
-  ssh $K "$h" "${mkd}exec 9>>$lkq || exit 1; flock -n 9 || { echo LOCKED; exit 1; }; ${busy}printf '%s %s\n' $(sq "$RB_N") $$ > $lkq 2>/dev/null; echo GOT; exec cat >/dev/null" <"$LKD/in" >"$LKD/out" 2>/dev/null 7>&- &
+  ssh -T -o ControlMaster=no -o ControlPath=none -o ClearAllForwardings=yes $K "$h" "${mkd}exec 9>>$lkq || exit 1; flock -n 9 || { echo LOCKED; exit 1; }; ${busy}printf '%s %s\n' $(sq "$RB_N") $$ > $lkq 2>/dev/null; echo GOT; exec cat >/dev/null" <"$LKD/in" >"$LKD/out" 2>/dev/null 7>&- &
   LPID=$!
   deadline=$(($(date +%s) + ${RB_LOCK_TIMEOUT:-20}))
   while :; do
-    if IFS= read -r r < "$LKD/out" 2>/dev/null; then
+    while IFS= read -r r; do
       case "$r" in
         GOT)
           if kill -0 "$LPID" 2>/dev/null; then return 0; fi
-          break ;;
-        LOCKED|BUSY) break ;;
+          break 2 ;;
+        LOCKED|BUSY) break 2 ;;
       esac
-    fi
+    done < "$LKD/out" 2>/dev/null
     kill -0 "$LPID" 2>/dev/null || break
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep 0.05
@@ -90,5 +92,5 @@ q=$(printf '%q ' "$@")
 sshh $H "cd ${RB_CWD:-$R} && sudo env TMPDIR=/dev/shm/t HOME=/root $RB_REMOTE_ENV prlimit --nofile=1048576:1048576 --memlock=unlimited bash -c $(printf '%q' "$q")"
 rc=$?
 if [ -n "$RB_BACK" ]; then for m in $RB_BACK; do rsync -a -e "$SSHR" --rsync-path="sudo rsync" $H:$m/ $m/ 7>&- || echo "rbgrun: copying $m back failed"; done; fi
-if [ -n "$RB_FETCH" ]; then mkdir -p $RB_D/fetch; for f in $RB_FETCH; do sshh $H "sudo tar -C $R -cf - $f" 2>/dev/null | tar -C $RB_D/fetch -xf - 7>&- ; done; fi
+if [ -n "$RB_FETCH" ]; then mkdir -p $RB_D/fetch; for f in $RB_FETCH; do sshh $H "sudo tar -C $R -cf - $f" 2>/dev/null 7>&- | tar -C $RB_D/fetch -xf - 7>&- ; done; fi
 cleanup; fin $rc
