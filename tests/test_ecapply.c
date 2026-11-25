@@ -285,6 +285,13 @@ static void make_cluster(lt *L)
     CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) == 0);
     if (fd >= 0)
         close(fd);
+    { /* a cluster volume's META names its metadata uuid (cvolfs writes volume_uuid=): a tier takes the
+       * volume's vuuid from it (r8f) */
+        char mp[PATH_MAX + 16];
+        FILE *mf = snprintf(mp, sizeof mp, "%s/META", L->dir) < (int)sizeof mp ? fopen(mp, "a") : NULL;
+        if (!mf || fputs("volume_uuid=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\n", mf) < 0 || fclose(mf) != 0)
+            exit(2);
+    }
 }
 
 static int lopen(lt *L)
