@@ -1860,22 +1860,29 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	        echo "jepsen-cluster-selftest: a move that shrinks first (moveshrinkfirst) went unnoticed under churn (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	else echo "jepsen-cluster-selftest: moveshrinkfirst under churn skipped (the mutant or the nemesis is not on main yet)"; fi; \
 	ecj="$$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis kill --seconds 20"; \
-	out=$$($$ecj --mutant ec-diverged 2>&1); rc=$$?; \
+	out=$$($$ecj --seconds 40 --mutant ec-diverged 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: a volume was DIVERGED'; then \
 	        echo "jepsen-cluster-selftest: a DIVERGED volume in an ec run without rot or disk loss went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	out=$$($$ecj --mutant ec-member-differs 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: ec: .* through member node'; then \
 	        echo "jepsen-cluster-selftest: a member that answers differently after a transfer went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$ecj --mutant ec-notransfer 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: ec: kvr did not move to node'; then \
+	        echo "jepsen-cluster-selftest: per-member reads with no transfer went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$ecj --nemesis partial --mutant noop-partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'exchanged'; then \
+	        echo "jepsen-cluster-selftest: a partial partition that cut nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	if ./$(B)/tsdbd --help 2>&1 | grep -q -- --ec-experimental; then \
 	    out=$$($$ecj --mutant ec-nosettle 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'nothing settled'; then \
 	        echo "jepsen-cluster-selftest: an ec run in which nothing settled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	    for m in ycold ecabovey cutnogate; do \
-	        if grep -qs $$m server/*.c src/*.c; then \
-	            out=$$(TSDB_REPLD_MUTANT=$$m $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis kill,midcommit --seconds 120 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
-	            if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: '; then \
-	                echo "jepsen-cluster-selftest: the server mutant $$m went unnoticed in an ec run (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	        else echo "jepsen-cluster-selftest: the server mutant $$m skipped (not on main yet)"; fi; \
+	    for mv in TSDB_ECAPPLY_MUTANT=ycold TSDB_ECAPPLY_MUTANT=ecabovey TSDB_ECCOLD_MUTANT=cutnogate; do \
+	        var=$${mv%%=*}; m=$${mv#*=}; \
+	        if grep -qs "\"$$var\"" server/*.c src/*.c; then \
+	            out=$$(env $$mv $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis kill,midcommit --seconds 120 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	            if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: a volume was DIVERGED\|through member node\|violation(s):\|difference(s) between the replicas'; then \
+	                echo "jepsen-cluster-selftest: the server mutant $$m ($$var) went unnoticed in an ec run, or failed for another reason (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	        else echo "jepsen-cluster-selftest: the server mutant $$m skipped (tsdbd reads no $$var)"; fi; \
 	    done; \
 	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate skipped (this tsdbd has no --ec-experimental)"; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
