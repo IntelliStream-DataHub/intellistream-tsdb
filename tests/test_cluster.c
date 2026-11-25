@@ -13380,7 +13380,8 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
  * needs a decode it cannot make. With 3000 rows of smooth values (r8f-ecbasic4) the object was one cell, k' = 1, and a
  * series whose cell sat on a live member read whole with three members away. */
 #define ECB_ROWS 43000 /* 2 s apart, two batches interleaved: 86000 rows on one day */
-#define ECB_DAY_ROWS 3000 /* the later days': they need a settle only */
+/* The later days (the EPOCH case) are written the same way: with 3000 smooth rows (r8f-ecbasic5) their object was
+ * k' = 1, three positions, none of them on the member whose store was unsure, and the settle went through. */
 struct ecb_sum {
     uint64_t n, h;
 };
@@ -13423,18 +13424,30 @@ static int ecb_chunks(uint32_t num)
 
 /* ECB_SERIES series of e42 written on the day from day_ms in two batches a flush apart (two parts, which the idle
  * merge makes one of level 1: what a cluster settle takes, D18) */
+/* batch b of series s on the day from day_ms: ECB_ROWS rows 2 s apart, the batches interleaved */
+static void ecb_rows_of(int s, int b, int64_t day_ms, int64_t *ts, float *val)
+{
+    for (int r = 0; r < ECB_ROWS; r++) {
+        ts[r] = day_ms + (int64_t)(2 * r + b) * 1000;
+        uint64_t z = ((uint64_t)s << 40 | (uint64_t)b << 32 | (uint64_t)r) + (uint64_t)day_ms * 0x2545f4914f6cdd1dull +
+                     0x9e3779b97f4a7c15ull;
+        z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ z >> 27) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        uint32_t bits = (uint32_t)(z & 0x7fffffu) | (uint32_t)(127 + (z >> 61)) << 23; /* [1, 256) */
+        memcpy(&val[r], &bits, 4); /* 23 random mantissa bits, 3 of exponent: no codec packs them below 26 */
+    }
+}
+
 static void ecb_write_day(tsdbc *c, const tsdb_sid *ide, int64_t day_ms)
 {
     for (int b = 0; b < 2; b++) {
         for (int s = 0; s < ECB_SERIES; s++) {
-            int64_t ts[ECB_DAY_ROWS];
-            float val[ECB_DAY_ROWS];
-            for (int r = 0; r < ECB_DAY_ROWS; r++) {
-                ts[r] = day_ms + (int64_t)(2 * r + b) * 1000;
-                val[r] = (float)(s * 1000 + r) * 0.5f + (float)b;
-            }
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
+            ecb_rows_of(s, b, day_ms, ts, val);
             int rc;
-            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_DAY_ROWS)) != 0; usleep(50000))
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
                 if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
                     die("insert into e42 on day %" PRId64 ": %s", day_ms, ers(rc));
         }
@@ -13544,15 +13557,7 @@ static void scen_ecbasic(void)
         for (int s = 0; s < ECB_SERIES; s++) {
             static int64_t ts[ECB_ROWS];
             static float val[ECB_ROWS];
-            for (int r = 0; r < ECB_ROWS; r++) {
-                ts[r] = day0 + (int64_t)(2 * r + b) * 1000;
-                uint64_t z = ((uint64_t)s << 40 | (uint64_t)b << 32 | (uint64_t)r) + 0x9e3779b97f4a7c15ull;
-                z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9ull;
-                z = (z ^ z >> 27) * 0x94d049bb133111ebull;
-                z ^= z >> 31;
-                uint32_t bits = (uint32_t)(z & 0x7fffffu) | (uint32_t)(127 + (z >> 61)) << 23; /* [1, 256) */
-                memcpy(&val[r], &bits, 4); /* 23 random mantissa bits, 3 of exponent: no codec packs them below 26 */
-            }
+            ecb_rows_of(s, b, day0, ts, val);
             for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
                 if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
                     die("insert into e42: %s", ers(rc));
