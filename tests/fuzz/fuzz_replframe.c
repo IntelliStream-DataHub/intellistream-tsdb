@@ -15,9 +15,12 @@
  *      head intact (a check byte flipped never), under none whatever arrives, nothing crashes
  *   3  a HELLO body
  *   4  the data hashed whole and in two pieces (cut at byte 1 mod len) against xxh64()
- *   5  a replication message (RW_T_MSG); one that decodes must encode back to the same bytes
- *   6  a FETCH body, then the same as a bulk meta; each that decodes must encode back to the same bytes
- *   7  a replication message decoded with room for byte 1 records only
+ *   5  a replication message (RW_T_MSG); one that decodes must encode back to the same bytes, and with any bit of
+ *      what its driver check covers flipped (byte 1 picks it) must not decode; bit 0 of byte 1 seals the data with
+ *      its right check first, so the decoder behind the check is reached too
+ *   6  a FETCH body, then the same as a bulk meta; each that decodes must encode back to the same bytes, and must not
+ *      decode with a bit flipped; bits 0 and 1 of byte 1 seal it as a FETCH or a bulk meta first
+ *   7  a replication message decoded with room for byte 1 records only (sealed when the check's place is found)
  *   8  a forwarding payload (server/fwd.h): bit 0 of byte 1 FWDQ, bits 1-2 the type
  *   9  a chunk server payload (server/chunksrv.h), byte 1 mod 3: a request, an answer, a put's meta; a request and a
  *      meta that decode must encode back to the same bytes
@@ -151,14 +154,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         struct repl_rec *recs = malloc((cap ? cap : 1) * sizeof *recs);
         uint32_t *lens = malloc((cap ? cap : 1) * sizeof *lens);
         struct rw_msg m;
+        size_t at = rw_msg_check_at(p, n);
+        if (at && (mode == 7 || (arg & 1))) { /* sealed: the decoder behind the check */
+            uint64_t ck = rw_check(RW_K_MSG, p, at);
+            memcpy(p + at, &ck, 8);
+        }
         if (rw_decode_msg(p, n, &m, recs, lens, cap) == 0) {
-            if (m.m.nrec > cap || (m.nbytes && (m.bytes < p || m.bytes + m.nbytes != p + n)))
+            if (!at || m.m.nrec > cap || (m.nbytes && (m.bytes < p || m.bytes + m.nbytes != p + n)))
                 abort();
             uint8_t *back = malloc(n ? n : 1);
             size_t bl = rw_encode_msg(back, n, m.volume, &m.m, m.lens, m.seq, m.off, m.bytes, m.nbytes);
             if (bl != n || memcmp(back, p, n) != 0)
                 abort();
             free(back);
+            /* one bit of what the check covers (the check included) flipped: never a message */
+            size_t bit = ((size_t)arg * 2654435761u) % ((at + 8) * 8);
+            p[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+            if (rw_decode_msg(p, n, &m, recs, lens, cap) == 0)
+                abort();
         }
         free(recs);
         free(lens);
@@ -168,14 +181,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         char name[RW_NAME_MAX + 1];
         uint8_t back[RW_NAME_MAX + 32];
         uint64_t fpos;
+        if (n > 8 && (arg & 3)) { /* sealed as a FETCH (bit 0) or a bulk meta (bit 1) */
+            uint64_t ck = rw_check(arg & 1 ? RW_K_FETCH : RW_K_META, p, n - 8);
+            memcpy(p + n - 8, &ck, 8);
+        }
+        size_t bit = n ? ((size_t)arg * 2654435761u) % (n * 8) : 0;
         if (rw_decode_fetch(p, n, &vol, &fpos, name, sizeof name) == 0) {
             size_t bl = rw_encode_fetch(back, sizeof back, vol, fpos, name);
             if (bl != n || memcmp(back, p, n) != 0)
                 abort();
+            p[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+            if (rw_decode_fetch(p, n, &vol, &fpos, name, sizeof name) == 0)
+                abort();
+            p[bit / 8] ^= (uint8_t)(1u << (bit % 8));
         }
         if (rw_decode_bulk_meta(p, n, &vol, &size, name, sizeof name) == 0) {
             size_t bl = rw_encode_bulk_meta(back, sizeof back, vol, size, name);
             if (bl != n || memcmp(back, p, n) != 0 || n > PL_META_MAX)
+                abort();
+            p[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+            if (rw_decode_bulk_meta(p, n, &vol, &size, name, sizeof name) == 0)
                 abort();
         }
     } else if (mode == 8) {
@@ -364,7 +389,7 @@ void fuzz_seeds(const char *dir)
     put_frame(dir, "seed-fwd-cancel", 8, 1 | FWDQ_T_CANCEL << 1, fw, FWD_HDR);
     put_frame(dir, "seed-xxh", 4, 3, text, sizeof text);
     /* replication messages: an ACK, and an APPEND of two records (5 and 1 positions) of 40 and 32 bytes */
-    static uint8_t mb[RW_HEAD + RW_APPEND_HEAD + 2 * RW_DESC + 72];
+    static uint8_t mb[RW_HEAD + RW_CHECK + RW_APPEND_HEAD + 2 * RW_DESC + 72];
     struct repl_msg am = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 3, .leader = -1, .durable = 90,
                           .written = 95, .rid = 77, .start = 1, .meta.leader = -1, .set_version = 5,
                           .replay = 40};
@@ -381,11 +406,15 @@ void fuzz_seeds(const char *dir)
         abort();
     put_frame(dir, "seed-rw-append", 5, 0, mb, ml);
     put_frame(dir, "seed-rw-append-cap1", 7, 1, mb, ml);
+    put_frame(dir, "seed-rw-append-sealed", 5, 0x81, mb, ml);
+    mb[RW_HEAD + RW_APPEND_HEAD + RW_DESC + 8] ^= 1; /* descriptor 1's epoch: the check refuses it */
+    put_frame(dir, "seed-rw-append-desc1flip", 5, 0x80, mb, ml);
     uint8_t fb[64];
     size_t fl2 = rw_encode_fetch(fb, sizeof fb, 4, 4242, "p19000_1_2_0.part");
     if (!fl2)
         abort();
     put_frame(dir, "seed-rw-fetch", 6, 0, fb, fl2);
+    put_frame(dir, "seed-rw-fetch-sealed", 6, 0x41, fb, fl2);
     fl2 = rw_encode_bulk_meta(fb, sizeof fb, 4, 123456, "p19000_1_2_0.part");
     if (!fl2)
         abort();

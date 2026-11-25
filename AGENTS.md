@@ -261,8 +261,13 @@ cgroup, so `nice` does not keep your work out of its way.
   `repl_reconfig` (drain its actions first, `REPL_E_PENDING`; hand it only records of its set version), every message
   carries the set version (`repl_set_version`, others dropped and counted) and the ACK the replay start
   (`repl_replay_start`, D17); `repl_leave` and `repl_meta_promote_to` for moves (design-cluster.md 8.3, R4);
-  `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 2, cluster
-  version (`PL_CL_VERSION`) 9: the data links' frame check is an option (`--peer-check none|header|full`, key
+  `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 3, cluster
+  version (`PL_CL_VERSION`) 10: every driver message (replication messages, FETCH, a bulk file's meta) ends its
+  fields with the driver check, an XXH3-64 that the decoder verifies before any field is read out (`RW_E_CHECK`:
+  dropped and counted, the resend repairs it), at every check level, `none` included, never over record bytes
+  (rd-drvcheck, review F3: a flipped ACK `durable` inside [durable, written]; `tests/test_replwire.c`, `test_cluster
+  drvcheck` with TSDB_REPLD_TEST `flipraw=ack|head|desc`, mutants `checknocmp checkshort checklate`, `build/rw-bench`);
+  the data links' frame check is an option (`--peer-check none|header|full`, key
   `cluster.peer.check`, `none` by default on every transport; `header` XXH3-64 over the length, type, zstd header and
   the first 256 payload bytes, `full` XXH3-128 over the frame; `server/plcheck.h`, xxHash vendored unchanged in
   `server/xxhash/`; seeded with the frame's number and a salt per connection from the handshake, whose HMAC-SHA256

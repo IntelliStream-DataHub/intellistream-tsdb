@@ -118,6 +118,11 @@ struct rvol {
     int nbad_said;
     uint64_t bad_msgs; /* peer messages msg_refused dropped (a flipped bit: the links carry no check by default) */
     uint64_t flip_n;   /* TSDB_REPLD_TEST=flipin: APPENDs with records seen */
+    uint64_t ck_drops; /* peer messages whose driver check failed (replwire.h RW_E_CHECK), dropped */
+    uint64_t raw_n;    /* TSDB_REPLD_TEST=flipraw: messages of the hook's kind seen */
+    uint64_t raw_m;    /* flipraw=desc: APPENDs of two records or more seen */
+    uint64_t raw_true; /* flipraw=ack: the durable end the last flipped ACK carried before its flip */
+    uint64_t raw_said; /* flipraw: the fields whose first flip was said (bits) */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
     int rec_short;       /* isr_short_locked of `rec`, counted in G.nshort (rec_set) */
@@ -237,10 +242,13 @@ enum {
     RM_METAFENCEONLY,    /* repld.c: msg_refused refuses only a FENCE from a peer (FENCE_REPLY, META, ISR_REQ, RESIGN pass) */
     RM_NOEPOCHBOUND,     /* repld.c: a peer message's epochs are not bounded by the highest this member knows */
     RM_NODESCEPOCH,      /* repld.c: an APPEND's descriptor epochs are not checked against prev_epoch and its epoch */
-    RM_NODESCCMP         /* repld.c: a record is not compared with its descriptor's position and span */
+    RM_NODESCCMP,        /* repld.c: a record is not compared with its descriptor's position and span */
+    RM_CHECKLATE         /* repld.c: a message reaches msg_refused and the core before its driver check is verified;
+                          * checknocmp and checkshort are replwire.c's (rw_mutant) */
 };
 
 enum { FI_REC = 1, FI_EPOCH, FI_DESC }; /* TSDB_REPLD_TEST=flipin[=epoch|desc] (repld.c flip_received) */
+enum { FR_ACK = 1, FR_HEAD, FR_DESC };  /* TSDB_REPLD_TEST=flipraw=ack|head|desc (repld.c flip_raw) */
 
 struct repld_g {
     uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
@@ -265,6 +273,8 @@ struct repld_g {
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
     int flip_in;        /* TSDB_REPLD_TEST=flipin[=epoch|desc] (FI_*): a field of every 8th APPEND received is flipped */
+    int flip_raw;       /* TSDB_REPLD_TEST=flipraw=ack|head|desc (FR_*): a bit of a received message flipped on the
+                         * wire bytes, before the decode and its driver check */
     int meta_in;        /* TSDB_REPLD_TEST=metain: every 8th APPEND received has its type flipped into a metadata-only
                          * type in turn, its epoch one above the leader's */
     int bulk_frame;     /* TSDB_REPLD_TEST=bulkframe: every 16th APPEND is also sent on the peer's bulk link */
@@ -290,6 +300,8 @@ struct repld_g {
                        * frame when it comes up (test_cluster volcmd: the acceptor's row and rsnap_frame) */
     int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
                        * ACKs carry the durable end the core opened with that long (reopenhold) */
+    int sync_hold;    /* TSDB_REPLD_TEST=synchold: a replica's SYNCs wait while <dir>/synchold exists (drvcheck-ack) */
+    _Atomic uint64_t bulk_ck_drops; /* bulk file metas whose driver check failed (RW_E_CHECK), dropped */
     int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
                        * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
     int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so

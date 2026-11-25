@@ -381,7 +381,7 @@ BT_TARGETS := test-groups-1 test-groups-2 test-groups-3 test-groups-4
 UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-i
 UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7
 # the binaries of `make test`, once: the groups below build the same set, so that a binary added here is built for every group
-TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_margins $(B)/test_plrdma
+TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_plrdma
 $(UNITS_GROUPS) test-groups $(BT_TARGETS): $(TEST_BINS)
 test: $(TEST_BINS)
 	./$(B)/test_tsdb $(SCRATCH)
@@ -590,7 +590,6 @@ test-units-b7:
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-
 # test-meta is the metadata simulator, test_cluster and the link tests, in groups that CI runs on runners of their own
 # (test_meta under ThreadSanitizer takes about 15 minutes, test_cluster about as long again: TEST_GROUPS below).
 # test_meta's seeds 1 to 12 in two halves; the tests that precede its simulator run in both.
@@ -603,7 +602,7 @@ test-meta-1 test-meta-2: test-meta-%: $(B)/test_meta
 CLUSTER_SCEN_1 := secret relay initcrash dirsync install reseed torn rebase slowinstall ids watch stall witness users \
     login userimport userstale userpromote userreplay userlease flags hbsections retired feed syncrace power \
     powersnap life copyback voterstale dirsyncshared installshared powervote pendshared copyfault volumes \
-    volrefuse snapversion links fwdlinks replicate replindet replfail replflip replepoch repldesc replmeta replbulk failover failoverkeep fencecrash \
+    volrefuse snapversion links fwdlinks replicate replindet replfail replflip replepoch repldesc drvcheck replmeta replbulk failover failoverkeep fencecrash \
     promotecrash deposecrash pause promoteslow openread openreadlead
 CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail readdepose oneway oneway2 cutstuck manystuck \
     noowner isr topology copyhold movedself route forward fwdseries fwdseriesstrict fwdlease fwddepose \
@@ -619,7 +618,7 @@ CLUSTER_SCEN_3 := ecbasic r4stubs addreplica setnext addswitch removereplica rem
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
-test-links: $(B)/test_peerlink $(B)/test_fwd $(B)/test_margins $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
+test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margins $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
 	./$(B)/test_peerlink $(SCRATCH)
 	for c in header full; do ./$(B)/test_peerlink $(SCRATCH) --quick --check $$c --only $(PL_KINDS_TESTS) || exit 1; done # every link kind at the other check levels
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall donestatus statusneg updownleak noidcheck" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
@@ -627,6 +626,8 @@ test-links: $(B)/test_peerlink $(B)/test_fwd $(B)/test_margins $(B)/test_plrdma 
 	$(MUT) --name test_margins --list "marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
 	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
+	./$(B)/test_replwire
+	$(MUT) --name test_replwire --list "checknocmp checkshort" -- ./$(B)/test_replwire --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -1063,7 +1064,7 @@ $(B)/repl.o: src/repl.c src/repl.h | $(B)
 $(B)/crashpt.o: server/crashpt.c server/crashpt.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # the replication driver's payloads on the data links (server/replwire.h)
-$(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h | $(B)
+$(B)/replwire.o: server/replwire.c server/replwire.h src/repl.h $(PLCHECK_HDR) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # R4's files on the Raft leader's side (server/cluster_int.h): stubs until r4-transfer, r4-move, r4-setchg fill them
 R4_CL_HDR := server/cluster_int.h server/cluster.h server/meta.h
@@ -1085,6 +1086,9 @@ $(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/pl
 
 $(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+# the replication driver's check (server/replwire.h, rd-drvcheck)
+$(B)/test_replwire: tests/test_replwire.c $(B)/replwire.o server/replwire.h src/repl.h | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ $< $(B)/replwire.o
 # the cluster volumes' margins (server/margins.c) and jepsen's judgement of a failed volume, no server
 $(B)/test_margins: tests/test_margins.c server/margins.c server/margins.h server/cluster.h server/meta.h tests/jepsen/outage_judge.h include/tsdb_protocol.h | $(B)
 	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< server/margins.c
@@ -1130,7 +1134,7 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown \
 	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer snapclosekeep \
 	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog nomsgcheck nometarefuse bulkframes \
-	    metafenceonly noepochbound nodescepoch nodesccmp
+	    metafenceonly noepochbound nodescepoch nodesccmp checknocmp checkshort checklate
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/rset_mutants.sh $(SCRATCH)
@@ -1276,6 +1280,9 @@ $(B)/b3/blake3_avx2.o: tools/blake3/blake3_avx2.c tools/blake3/blake3_impl.h | $
 $(B)/b3/blake3_avx512.o: tools/blake3/blake3_avx512.c tools/blake3/blake3_impl.h | $(B)
 	@mkdir -p $(@D)
 	$(CC) -O3 -mavx512f -mavx512vl -c -o $@ $<
+# the replication driver's messages, encode + decode, and its check (tools/rw-bench.c, docs/design-rdma.md 6)
+$(B)/rw-bench: tools/rw-bench.c $(B)/replwire.o server/replwire.h $(PLCHECK_HDR) | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ $< $(B)/replwire.o
 $(B)/link-bench: tools/link-bench.c tools/mac_cands.c tools/mac_cands.h tools/mac_cands_kat.h $(PLCHECK_HDR) $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) $(B3_DEF) -o $@ $< tools/mac_cands.c $(B3_SRC) $(B3_OBJ) $(B)/tsdb_crypto.o -ldl
 

@@ -2,9 +2,59 @@
 /* The replication driver's payloads on the data links: see replwire.h. */
 #include <string.h>
 
+#include "plcheck.h" /* xxHash, inline and static */
 #include "replwire.h"
 
 #define POS_LIMIT ((uint64_t)1 << 62) /* FNO_LIMIT: no position at or above it */
+
+int rw_mutant;
+__thread int rw_nocmp_local;
+
+/* XXH3-64 rather than CRC32C: vendored, portable to every level `make dist` builds and to arm64, and within a few ns of
+ * CRC32C over these sizes (design-rdma.md 6). The seed tells the kinds apart, so the bytes of one never pass as
+ * another's. */
+static const uint64_t rw_seed[3] = {0x3152574443484b4dull /* MSG */, 0x3252574443484b46ull /* FETCH */,
+                                    0x3352574443484b42ull /* META */};
+
+uint64_t rw_check(int kind, const void *p, size_t n)
+{
+    return XXH3_64bits_withSeed(p, n, rw_seed[kind < 0 || kind > 2 ? 0 : kind]);
+}
+
+/* what the check of a message covers: everything before it, or only RW_HEAD under the planted bug */
+static size_t covered(size_t at)
+{
+    return rw_mutant == RW_MUT_SHORT && at > RW_HEAD ? RW_HEAD : at;
+}
+
+static uint64_t le64(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+size_t rw_msg_check_at(const uint8_t *p, size_t n)
+{
+    if (n < RW_HEAD + RW_CHECK)
+        return 0;
+    uint32_t nrec;
+    memcpy(&nrec, p + RW_HEAD - 4, 4);
+    if (!nrec)
+        return RW_HEAD;
+    if (p[1] != REPL_M_APPEND || (n - RW_HEAD - RW_CHECK) / RW_DESC < nrec ||
+        n - RW_HEAD - RW_CHECK < RW_APPEND_HEAD + (size_t)nrec * RW_DESC)
+        return 0;
+    return RW_HEAD + RW_APPEND_HEAD + (size_t)nrec * RW_DESC;
+}
+
+/* the check at p + at over p[0, at): 0, RW_E_CHECK */
+static int check_ok(int kind, const uint8_t *p, size_t at)
+{
+    if (rw_mutant == RW_MUT_NOCMP || rw_nocmp_local)
+        return 0;
+    return rw_check(kind, p, kind == RW_K_MSG ? covered(at) : at) == le64(p + at) ? 0 : RW_E_CHECK;
+}
 
 struct wr {
     uint8_t *p;
@@ -141,8 +191,12 @@ size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct rep
             w32(&w, m->rec[i].n);
             w32(&w, lens[i]);
         }
-        wbytes(&w, bytes, nbytes);
     }
+    if (w.n + RW_CHECK > cap)
+        return 0;
+    w64(&w, rw_check(RW_K_MSG, out, covered(w.n)));
+    if (m->type == REPL_M_APPEND && m->nrec)
+        wbytes(&w, bytes, nbytes);
     return w.n <= cap ? w.n : 0;
 }
 
@@ -151,8 +205,16 @@ int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_re
     struct rd r = {.p = p, .n = n};
     memset(out, 0, sizeof *out);
     struct repl_msg *m = &out->m;
-    if (r8(&r) != RW_VERSION)
+    if (n < 1 || p[0] != RW_VERSION)
         return -1;
+    /* the check first: nothing of the message is read into *out before it holds (type and nrec only find it) */
+    size_t at = rw_msg_check_at(p, n);
+    if (!at)
+        return -1;
+    int ck = check_ok(RW_K_MSG, p, at);
+    if (ck)
+        return ck;
+    r8(&r);
     m->type = r8(&r);
     uint16_t flags = r16(&r);
     out->volume = r32(&r);
@@ -186,6 +248,7 @@ int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_re
             recs[i].n = r32(&r);
             lens[i] = r32(&r);
         }
+        take(&r, RW_CHECK);
         if (r.bad)
             return -1;
         m->rec = recs;
@@ -193,7 +256,7 @@ int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_re
         out->lens = lens;
         out->bytes = p + r.at;
         out->nbytes = n - r.at;
-    } else if (r.at != n) {
+    } else if (take(&r, RW_CHECK), r.bad || r.at != n) {
         return -1;
     }
     return recs_ok(m, lens, out->nbytes) ? 0 : -1;
@@ -220,6 +283,9 @@ size_t rw_encode_fetch(uint8_t *out, size_t cap, uint32_t volume, uint64_t pos, 
     w64(&w, pos);
     w16(&w, (uint16_t)len);
     wbytes(&w, name, len);
+    if (w.n + RW_CHECK > cap)
+        return 0;
+    w64(&w, rw_check(RW_K_FETCH, out, w.n));
     return w.n <= cap ? w.n : 0;
 }
 
@@ -236,12 +302,16 @@ static int rname(struct rd *r, char *name, size_t cap)
 
 int rw_decode_fetch(const uint8_t *p, size_t n, uint32_t *volume, uint64_t *pos, char *name, size_t cap)
 {
-    struct rd r = {.p = p, .n = n};
-    if (r8(&r) != RW_VERSION)
+    if (n < 1 + RW_CHECK || p[0] != RW_VERSION)
         return -1;
+    int ck = check_ok(RW_K_FETCH, p, n - RW_CHECK); /* before any field is read */
+    if (ck)
+        return ck;
+    struct rd r = {.p = p, .n = n - RW_CHECK};
+    r8(&r);
     *volume = r32(&r);
     *pos = r64(&r);
-    if (rname(&r, name, cap) != 0 || r.bad || r.at != n)
+    if (rname(&r, name, cap) != 0 || r.bad || r.at != r.n)
         return -1;
     return 0;
 }
@@ -257,17 +327,24 @@ size_t rw_encode_bulk_meta(uint8_t *out, size_t cap, uint32_t volume, uint64_t s
     w64(&w, size);
     w16(&w, (uint16_t)len);
     wbytes(&w, name, len);
+    if (w.n + RW_CHECK > cap)
+        return 0;
+    w64(&w, rw_check(RW_K_META, out, w.n));
     return w.n <= cap ? w.n : 0;
 }
 
 int rw_decode_bulk_meta(const uint8_t *p, size_t n, uint32_t *volume, uint64_t *size, char *name, size_t cap)
 {
-    struct rd r = {.p = p, .n = n};
-    if (r8(&r) != RW_VERSION)
+    if (n < 1 + RW_CHECK || p[0] != RW_VERSION)
         return -1;
+    int ck = check_ok(RW_K_META, p, n - RW_CHECK); /* before any field is read */
+    if (ck)
+        return ck;
+    struct rd r = {.p = p, .n = n - RW_CHECK};
+    r8(&r);
     *volume = r32(&r);
     *size = r64(&r);
-    if (rname(&r, name, cap) != 0 || r.bad || r.at != n)
+    if (rname(&r, name, cap) != 0 || r.bad || r.at != r.n)
         return -1;
     return 0;
 }

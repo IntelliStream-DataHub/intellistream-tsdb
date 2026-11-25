@@ -13130,6 +13130,248 @@ static void scen_repldesc(void)
     stop_all();
 }
 
+/* drvcheck (rd-drvcheck; review F3 and F2 of rd-nocheck): every driver message carries the driver's own check
+ * (server/replwire.h), at every link check level, `none` (the default, which these servers run at) included.
+ * TSDB_REPLD_TEST=flipraw flips one bit of a received message in its wire bytes, before the decode:
+ *   ack:  on the writer, while one replica's sync is held back (synchold, file <dir>/synchold) and noclock keeps
+ *         NOW markers out of the WAL, two writes (1 row at d+1, then 128 rows) advance that replica's written end
+ *         past d+1 while its durable end stays at d; flipraw=ack raises durable inside (d, written] (F3, the flip
+ *         no structural bound sees). The first write must NOT be acknowledged (commit point unchanged) while the
+ *         replica's sync is held, even after flipped ACKs arrive, and completes once synchold is removed.
+ *   head: on the replicas, bit 0 of an APPEND's commit or bit 3 of its off, in turn (both verified logged).
+ *   desc: on the replicas, bit 0 of the last descriptor's epoch or span of an APPEND of two records or more (F2:
+ *         beyond descriptor 0).
+ * Each must be dropped by the driver check, so nothing of it reaches msg_refused or the core, and every row still
+ * reaches both replicas. Mutants checknocmp, checkshort (replwire.c) and checklate (repld.c): a flipped message
+ * passes the check (or moves the commit point early in drvcheck-ack). */
+static void drvcheck_ack_run(void)
+{
+    scenario("drvcheck-ack");
+    init_isr_lag_ms = 5000;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=flipraw=ack,synchold,noclock";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    await_isr(L, "rf", 3, 30000, "every replica in the ISR before the writes");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    int64_t ts0 = 2000000;
+    float v0 = 1.0f;
+    if ((rc = tsdbc_insert_series(c, id, &ts0, &v0, 1)) != 0)
+        die("drvcheck-ack: initial write: %s", ers(rc));
+    tsdbc_close(c);
+
+    /* Hold back one replica's sync so its durable end stays at d while its written end advances past w1 (at d+1)
+     * and w2 (128 rows: guarantees a single-bit flip d ^ (1 << b) lands in [d+1, written] for any small d). */
+    int R0 = (L + 1) % 3;
+    char hold[PATH_MAX + 64];
+    server_dir(R0, hold, sizeof hold);
+    snprintf(hold + strlen(hold), sizeof hold - strlen(hold), "/synchold");
+    FILE *fp = fopen(hold, "w");
+    if (!fp)
+        die("drvcheck-ack: create %s", hold);
+    fclose(fp);
+
+    struct rep_writer w1 = {cports[L], id, 3000000, 1, 0, 0, 0, 0};
+    struct rep_writer w2 = {cports[L], id, 4000000, 0, 0, 0, 128, 0};
+    pthread_t th1, th2;
+    if (pthread_create(&th1, NULL, rep_write_thread, &w1) != 0)
+        die("pthread_create w1");
+    uint64_t t0 = now_ms();
+    while (!wal_holds_ts(R0, 3000000)) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 10000)
+            die("drvcheck-ack: w1 did not reach replica %d's WAL in 10 s", R0);
+        usleep(5000);
+    }
+    if (pthread_create(&th2, NULL, rep_write_thread, &w2) != 0)
+        die("pthread_create w2");
+    int64_t last = 4000000 + 127 * 1000LL;
+    t0 = now_ms();
+    while (!wal_holds_ts(R0, last)) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 10000)
+            die("drvcheck-ack: w2 did not reach replica %d's WAL in 10 s", R0);
+        usleep(5000);
+    }
+    t0 = now_ms();
+    while (!log_has(L, "flipraw: flipped an ACK's durable from node")) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 5000)
+            die("drvcheck-ack: leader %d never flipped an ACK's durable", L);
+        usleep(10000);
+    }
+    /* Let several flipped ACKs arrive and verify the commit point never moves past R0's true durable end */
+    for (int k = 0; k < 20; k++) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE) || __atomic_load_n(&w2.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        usleep(20000);
+    }
+    uint32_t isr = isr_of(L, "rf", NULL);
+    if (isr != 3)
+        die("drvcheck-ack: ISR shrank from 3 to %" PRIu32 " while replica %d's sync was held", isr, R0);
+    if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE) || __atomic_load_n(&w2.done, __ATOMIC_ACQUIRE))
+        die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+            "commit point)", R0);
+
+    if (unlink(hold) != 0)
+        die("drvcheck-ack: unlink %s", hold);
+    await_writer(&w1, th1, 10000, "drvcheck-ack: w1 once replica sync resumed");
+    await_writer(&w2, th2, 10000, "drvcheck-ack: w2 once replica sync resumed");
+
+    for (int i = 0; i < 3; i++) {
+        if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
+            die("drvcheck-ack: a flipped message passed the driver check on server %d", i);
+        if (i == L) {
+            if (!log_has(i, "failed its driver check, dropped"))
+                die("drvcheck-ack: leader %d dropped no message for its driver check", i);
+        } else {
+            uint64_t tw = now_ms();
+            while (!wal_holds_ts(i, last)) {
+                if (now_ms() - tw > 20000)
+                    die("drvcheck-ack: the last row did not reach replica %d's log in 20 s", i);
+                usleep(5000);
+            }
+        }
+    }
+    await_isr(L, "rf", 3, 10000, "drvcheck-ack: every replica in the ISR after sync resumed");
+    stop_all();
+}
+
+static void drvcheck_head_run(void)
+{
+    int L = repl_hook_run("drvcheck-head", "TSDB_REPLD_TEST=flipraw=head");
+    int seen_commit = 0, seen_off = 0;
+    for (int i = 0; i < 3; i++) {
+        if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
+            die("drvcheck-head: a flipped message passed the driver check on server %d", i);
+        if (i == L)
+            continue;
+        seen_commit += log_has(i, "flipraw: flipped an APPEND's commit from node");
+        seen_off += log_has(i, "flipraw: flipped an APPEND's off from node");
+        if (!log_has(i, "failed its driver check, dropped"))
+            die("drvcheck-head: server %d dropped no message for its driver check", i);
+    }
+    if (!seen_commit)
+        die("drvcheck-head: no replica flipped an APPEND's commit");
+    if (!seen_off)
+        die("drvcheck-head: no replica flipped an APPEND's off");
+    stop_all();
+}
+
+static void drvcheck_desc_run(void)
+{
+    scenario("drvcheck-desc");
+    init_isr_lag_ms = 500;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=flipraw=desc,cutlinks";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    await_isr(L, "rf", 3, 30000, "every replica in the ISR before the writes");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    int64_t next_ts = 2000000;
+    /* Cut each replica in turn so the leader accumulates a multi-record backlog (20 WAL records) before healing;
+     * the catch-up APPEND carries nrec >= 2 descriptors, so flipraw=desc deterministically flips descriptor nrec-1
+     * (beyond descriptor 0). Two cuts on the first replica flip both epoch and span. */
+    int reps[2], nr = 0;
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            reps[nr++] = i;
+    int order[3] = {reps[0], reps[0], reps[1]};
+    for (int round = 0; round < 3; round++) {
+        int r = order[round];
+        cut_file(L, r, 1);
+        cut_file(r, L, 1);
+        await_isr(L, "rf", 2, 10000, "cut replica leaves ISR");
+        for (int k = 0; k < 20; k++) {
+            int64_t ts = next_ts;
+            next_ts += 1000;
+            float val = (float)(round * 20 + k);
+            if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+                die("drvcheck-desc round %d write %d: %s", round, k, ers(rc));
+        }
+        cut_file(L, r, 0);
+        cut_file(r, L, 0);
+        await_isr(L, "rf", 3, 20000, "replica rejoins ISR after flipped multi-descriptor APPEND");
+    }
+    tsdbc_close(c);
+    int64_t last = next_ts - 1000;
+    for (int i = 0; i < 3; i++) {
+        if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
+            die("drvcheck-desc: a flipped message passed the driver check on server %d", i);
+        if (i == L)
+            continue;
+        uint64_t t0 = now_ms();
+        while (!wal_holds_ts(i, last)) {
+            if (now_ms() - t0 > 20000)
+                die("drvcheck-desc: the last row did not reach replica %d's log in 20 s", i);
+            usleep(5000);
+        }
+        if (!log_has(i, "flipraw: flipped a descriptor's"))
+            die("drvcheck-desc: server %d did not flip a descriptor beyond the first", i);
+        if (!log_has(i, "failed its driver check, dropped"))
+            die("drvcheck-desc: server %d dropped no message for its driver check", i);
+    }
+    if (!log_has(reps[0], "flipraw: flipped a descriptor's epoch") ||
+        !log_has(reps[0], "flipraw: flipped a descriptor's span"))
+        die("drvcheck-desc: server %d did not flip both a descriptor's epoch and span", reps[0]);
+    stop_all();
+}
+
+static void scen_drvcheck(void)
+{
+    drvcheck_ack_run();
+    drvcheck_head_run();
+    drvcheck_desc_run();
+    printf("  drvcheck: an ACK's durable raised inside (durable, written] leaves commit point unchanged while sync is "
+           "held, an APPEND's head and a descriptor beyond the first flipped on the wire, each dropped by the driver "
+           "check under none, all rows in both replicas\n");
+}
+
 /* replbulk (rd-nocheck, AUDIT item 8): nothing sends a driver frame on a bulk link, so one there is a frame type a
  * flipped bit turned into a user type: the receiver closes the bulk link (the files on it begin again on the next).
  * TSDB_REPLD_TEST=bulkframe makes the leader send every 16th APPEND on the replica's bulk link as well; the rows all
@@ -18519,7 +18761,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
