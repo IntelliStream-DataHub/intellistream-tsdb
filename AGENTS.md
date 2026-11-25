@@ -260,7 +260,12 @@ cgroup, so `nice` does not keep your work out of its way.
   version (`PL_CL_VERSION`) 8: the data links' frames carry an XXH3-128 check without a key (`server/plcheck.h`, xxHash
   vendored unchanged in `server/xxhash/`; seeded with the frame's number and a salt per connection from the handshake,
   whose HMAC-SHA256 still proves the secret; the check type is negotiated in HELLO; docs/design-rdma.md §6;
-  `test_peerlink` mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`).
+  `test_peerlink` mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`; HELLO and
+  HELLO_ACK end with a capability byte, `PL_CAP_RDMA` sent 0 until rd-upgrade, unknown bits ignored). A link connection's
+  bytes go through `struct pl_transport` (`server/pltransport.h`: read, writev, poll_fds with `*ready`, poll_ready, close
+  last after on_link(down); the handshake, connect and accept stay on TCP); the TCP transport is in peerlink.c,
+  `tests/pl_fake.h` an in-memory pair (level and edge modes) that `peerlink_test_attach` runs a link on: `test_peerlink
+  fake|fakeready|fakeend` (mutants `noready closefirst wnoshort nhandall`).
   `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below

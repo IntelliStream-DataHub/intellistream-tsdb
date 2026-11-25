@@ -299,10 +299,10 @@ void fuzz_seeds(const char *dir)
     put_frame(dir, "seed-roundtrip-small", 2, 1, "x", 1);
     uint8_t h[80] = {0};
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
-    h[76] = PL_CHECKS_KNOWN;
-    put_frame(dir, "seed-hello", 3, 0, h, 77);
+    h[76] = PL_CHECKS_KNOWN, h[77] = PL_CAPS;
+    put_frame(dir, "seed-hello", 3, 0, h, 78);
     h[75] = PL_KIND_FWDQ;
-    put_frame(dir, "seed-hello-fwdq", 3, 0, h, 77);
+    put_frame(dir, "seed-hello-fwdq", 3, 0, h, 78);
     /* the forwarding payloads (mode 8; arg: bit 0 FWDQ, bits 1-2 the type) */
     uint8_t fw[32] = {0};
     fwd_wire_credit(fw, 0x1122334455667788ull, 4);
