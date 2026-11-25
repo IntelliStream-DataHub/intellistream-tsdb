@@ -94,6 +94,7 @@ table=(
     "keepunanswered|failover|the killed old leader was still in the ISR of fo"
     "promotenone|promoteslow|the record of ps moved past epoch|series pump1.flow in ps: error -11"
     "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
+    "nomsgcheck|replflip|the last row did not reach replica"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

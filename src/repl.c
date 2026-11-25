@@ -24,8 +24,8 @@
 #include <string.h>
 
 #ifdef REPL_MUTANTS
-uint64_t repl_mutants;
-#define MUT(n) ((repl_mutants >> (n)) & 1)
+uint64_t repl_mutants, repl_mutants2; /* bugs 0-63, 64-127 */
+#define MUT(n) ((((n) < 64 ? repl_mutants : repl_mutants2) >> ((n) & 63)) & 1)
 #else
 #define MUT(n) 0
 #endif
@@ -843,6 +843,14 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     }
     if (!r->leading || (m->epoch != r->epoch && !MUT(8)) || m->from < 0 || m->from >= r->cfg.nnodes)
         return;
+    /* An ACK names the ends of the prefix the replica verified against this leader: durable <= written <= what this
+     * leader wrote (ack()). The peer links carry no frame check by default (server/plcheck.h): one with a flipped bit
+     * beyond that is dropped and counted, never taken as a durable end that moves the commit point past the replica's
+     * real one. The next ACK repairs it. */
+    if ((m->durable > m->written || m->written > r->written) && !MUT(64)) {
+        r->dropped++;
+        return;
+    }
     struct peer *p = &r->peer[m->from];
     int same_rid = m->rid == p->rid;
     if (!same_rid) {

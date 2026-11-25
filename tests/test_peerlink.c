@@ -2043,6 +2043,44 @@ static void test_badchunk(void)
     unlink(dst);
 }
 
+/* a DONE whose status is no PL_* code (a flipped bit: the frames carry no check by default) ends the connection, and the
+ * file is sent again on the next one; it never reaches `done` as a status no caller knows */
+static void test_donestatus(void)
+{
+    char src[600], dst[600];
+    pathf(src, sizeof src, "ds-src");
+    pathf(dst, sizeof dst, "ds-dst");
+    size_t size = 256u << 10;
+    int sfd = open(src, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(sfd >= 0);
+    uint8_t *buf = malloc(size);
+    CHECK(buf != NULL);
+    for (size_t i = 0; i < size; i++)
+        buf[i] = (uint8_t)(i * 31 + 7);
+    CHECK(write(sfd, buf, size) == (ssize_t)size);
+    free(buf);
+    struct node *a = node_new(1, SECRET, NULL, 1), *b = node_new(2, SECRET, NULL, 0);
+    snprintf(a->path, sizeof a->path, "%s", dst);
+    struct plink *l = dial(b, 1, a->port, PL_KIND_BULK);
+    CHECK(WAIT_FOR(plink_up(l) && a->ups >= 1, 3000));
+    int downs0 = atomic_load(&b->downs);
+    /* the receiver's first DONE (after every byte and its hash, so in the sender's WAITDONE) says 1, no PL_* code */
+    __atomic_store_n(&peerlink_test_done_status, 1, __ATOMIC_RELAXED);
+    struct jres r = {0};
+    CHECK(bulk_send_id(l, 9, sfd, size, "m", &r) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&r.done), 20000));
+    printf("  donestatus: status %d after %d downs\n", r.status, (int)atomic_load(&b->downs) - downs0);
+    CHECK(__atomic_load_n(&peerlink_test_done_status, __ATOMIC_RELAXED) == 0); /* the bad DONE went out */
+    CHECK(r.status == PL_OK);
+    CHECK(atomic_load(&b->downs) > downs0);
+    CHECK(r.file == 9);
+    node_free(b);
+    node_free(a);
+    close(sfd);
+    unlink(src);
+    unlink(dst);
+}
+
 /* a new connection of a peer whose old connection is still up (a restarted server, a redial the acceptor has not
  * noticed the end of) takes the accepted link over: its frames are delivered, the old one is closed */
 static void test_replace(void)
@@ -3221,6 +3259,9 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "nhandall")) {
                 peerlink_mutant = PL_MUT_NHANDALL;
                 only = "fake";
+            } else if (!strcmp(m, "donestatus")) {
+                peerlink_mutant = PL_MUT_DONESTATUS;
+                only = "donestatus";
             } else if (!strcmp(m, "kindbucket")) {
                 peerlink_mutant = PL_MUT_KINDBUCKET;
                 only = "kindrate";
@@ -3243,7 +3284,7 @@ int main(int argc, char **argv)
     static const struct tcase cases[] = {
         {"codec", test_codec},   {"log", test_log},         {"bulk", test_bulk},
         {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip}, {"levels", test_levels},
-        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"salts", test_salts}, {"dialtype", test_dialtype}, {"endhash", test_endhash},
+        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"salts", test_salts}, {"dialtype", test_dialtype}, {"endhash", test_endhash}, {"donestatus", test_donestatus},
         {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},

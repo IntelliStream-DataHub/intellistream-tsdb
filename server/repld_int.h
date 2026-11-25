@@ -112,6 +112,8 @@ struct rvol {
     uint32_t *lens;
     uint32_t crec;
     uint64_t *coff; /* byte offset of each record of cur */
+    uint64_t bad_msgs; /* peer messages msg_refused dropped (a flipped bit: the links carry no check by default) */
+    uint64_t flip_n;   /* TSDB_REPLD_TEST=flipin: APPENDs with records seen */
     int sync_wanted;
     uint64_t synced_rep; /* the writer: the last durable end handed to repl_synced */
     int rec_short;       /* isr_short_locked of `rec`, counted in G.nshort (rec_set) */
@@ -223,7 +225,10 @@ enum {
     RM_SNAPNOENDAFTER,   /* snapinst_run.c: P is not compared with the log end the closed driver left */
     RM_SNAPNOFENCE,      /* rsnap.c, snapinst_run.c: a copy of an epoch below the receiver's fence is installed */
     RM_SNAPDIVLOGEND,    /* rsnap.c, repld.c: a DIVERGED rebuild compares P with the log end it replaces */
-    RM_SNAPNOLEFTOVERS   /* snapinst.c: what an install left at a crash is not finished or undone at prepare */
+    RM_SNAPNOLEFTOVERS,  /* snapinst.c: what an install left at a crash is not finished or undone at prepare */
+    RM_NOMSGCHECK,       /* repld.c: a peer message is handed to the core unchecked (msg_refused: metadata-only types,
+                          * an ACK beyond the log, records unlike their descriptors) */
+    RM_BULKFRAMES        /* repld.c: a driver frame on a kind-2 (bulk) link is taken as on the LOG link */
 };
 
 struct repld_g {
@@ -248,6 +253,7 @@ struct repld_g {
     uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
+    int flip_in;        /* TSDB_REPLD_TEST=flipin: one byte of a record of every 8th APPEND received is flipped */
     int cut_links;      /* TSDB_REPLD_TEST=cutlinks: a message of any volume from node N is dropped as it arrives while
                          * <dir>/cutfrom.N exists (test_cluster cut) */
     int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a

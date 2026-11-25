@@ -49,6 +49,7 @@
 int peerlink_mutant;
 static _Atomic int check_default; /* peerlink_set_check_level */
 int peerlink_test_cut_end;
+int32_t peerlink_test_done_status;
 static uint64_t kind_bytes[PL_KIND_DATA_MAX + 1]; /* peerlink_kind_bytes: process-wide, so no peerlink is touched */
 void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 
@@ -1400,6 +1401,16 @@ static struct qf *q_expire(struct plink *l, uint64_t now)
     return gone;
 }
 
+/* A status in RESUME or DONE is PL_OK or one of the PL_E_* codes. The frames carry no check of their own by default
+ * (plcheck.h): a flipped bit that makes any other value ends the connection, and the file begins again on the next one,
+ * instead of reaching `done` as a status no caller knows. */
+static int status_known(int32_t s)
+{
+    if (peerlink_mutant == PL_MUT_DONESTATUS)
+        return 1;
+    return s <= PL_OK && s >= PL_E_GIVEUP;
+}
+
 static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t sent)
 {
     if (status == PL_OK) {
@@ -1419,7 +1430,8 @@ static void send_done(struct conn *c, uint64_t file, int32_t status)
 {
     struct buf b = {0};
     put64(&b, file);
-    put32(&b, (uint32_t)status);
+    int32_t bad = __atomic_exchange_n(&peerlink_test_done_status, 0, __ATOMIC_RELAXED);
+    put32(&b, (uint32_t)(bad ? bad : status));
     send_ctl(c, PLT_DONE, b.p, b.len);
     buf_free(&b);
 }
@@ -1570,7 +1582,7 @@ static int conn_msg(void *arg, const struct pl_msg *m)
     }
     case PLT_RESUME: {
         struct jobq *q = c->job;
-        if (!q || c->jstate != J_WAITRESUME || m->file != q->j.file)
+        if (!q || c->jstate != J_WAITRESUME || m->file != q->j.file || !status_known(m->status))
             return -1;
         if (m->status < 0) {
             c->job = NULL;
@@ -1592,7 +1604,7 @@ static int conn_msg(void *arg, const struct pl_msg *m)
         struct jobq *q = c->job;
         /* the receiver's verdict; in SEND it is a failure on its side (PL_E_IO): the transfer stops here, whatever
          * chunks are in flight are ignored over there */
-        if (!q || (c->jstate != J_WAITDONE && c->jstate != J_SEND) || m->file != q->j.file)
+        if (!q || (c->jstate != J_WAITDONE && c->jstate != J_SEND) || m->file != q->j.file || !status_known(m->status))
             return -1;
         c->job = NULL;
         job_done(pl, q, m->status, c->jsent);

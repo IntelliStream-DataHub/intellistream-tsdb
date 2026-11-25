@@ -1276,11 +1276,52 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
     pthread_mutex_unlock(&rv->mu);
 }
 
+/* Why a decoded peer message must not reach the core, or NULL. The data links carry no frame check by default
+ * (server/plcheck.h): what a flipped bit in a header or control field could make is bounded here, and such a message
+ * is dropped and counted; the sender's resend repairs it. Metadata-only types come from the metadata group through
+ * the driver (IN_META), never from a peer. An ACK names the replica's verified prefix: durable <= written <= this
+ * log's end (the driver's keep bound and the core's commit point take it). Every record of an APPEND must be the one
+ * its descriptor names (wal_record checks its header and checksum): one that is not is never appended, and never
+ * stops the volume either, as it did when only the apply checked it. */
+static const char *msg_refused(struct rvol *rv, const struct rw_msg *c)
+{
+    const struct repl_msg *m = &c->m;
+    switch (m->type) {
+    case REPL_M_FENCE:
+    case REPL_M_FENCE_REPLY:
+    case REPL_M_META:
+    case REPL_M_ISR_REQ:
+    case REPL_M_RESIGN:
+        return "a metadata-only type from a peer";
+    case REPL_M_ACK:
+        if (m->durable > m->written || m->written > repl_written(rv->core))
+            return "an ACK beyond the log";
+        return NULL;
+    case REPL_M_APPEND:
+        for (uint32_t i = 0; i < m->nrec; i++) {
+            wal_rec wr;
+            if (wal_record(c->bytes + rv->coff[i], c->lens[i], c->seq, c->off + rv->coff[i], &wr) != c->lens[i] ||
+                wr.fno != m->rec[i].pos || wr.span != m->rec[i].n)
+                return "a record unlike its descriptor";
+        }
+        return NULL;
+    default:
+        return NULL;
+    }
+}
+
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     (void)arg;
     if (plink_kind(l) == PL_KIND_SNAP) { /* a snapshot's control frame: rsnap.c posts what it keeps (IN_SNAP) */
         rsnap_frame(l, type, p, n);
+        return;
+    }
+    if (plink_kind(l) == PL_KIND_BULK && G.mutant != RM_BULKFRAMES) {
+        /* nothing sends a driver frame on a bulk link: a frame type turned into a user type by a flipped bit (the links
+         * carry no check by default, plcheck.h) ends the link, and the files on it begin again on the next one */
+        say("node %" PRIu32 ": a frame of type %u on a bulk link: the link is closed", plink_peer(l), (unsigned)type);
+        plink_reset(l);
         return;
     }
     uint32_t volume;
@@ -1849,6 +1890,16 @@ static void handle(struct rvol *rv, struct item *it)
     uint64_t o = 0;
     for (uint32_t i = 0; i < rv->cur.m.nrec; i++)
         rv->coff[i] = o, o += rv->cur.lens[i];
+    if (G.flip_in && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec && ++rv->flip_n % 8 == 0)
+        ((uint8_t *)rv->cur.bytes)[rv->cur.lens[0] / 2] ^= 0x10; /* the receive side of a wire flip (test_cluster replflip) */
+    const char *why = G.mutant == RM_NOMSGCHECK ? NULL : msg_refused(rv, &rv->cur);
+    if (why) {
+        if (rv->bad_msgs++ % 1000 == 0)
+            say("volume %" PRIu32 ": a message of type %d from node %" PRIu32 " dropped (%" PRIu64 " so far): %s",
+                rv->number, (int)rv->cur.m.type, rv->rec.rep[from].node, rv->bad_msgs, why);
+        rv->cur.m.nrec = 0;
+        return;
+    }
     rv->peer[from].heard_ms = now_ms();
     if (rv->cur.m.type == REPL_M_ACK) {
         struct rpeer *p = &rv->peer[from];
@@ -2346,6 +2397,8 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnodonebits") ? RM_SNAPNODONEBITS
                : !strcmp(mu, "snapsharedmax")  ? RM_SNAPSHAREDMAX
                : !strcmp(mu, "snapmakedown")   ? RM_SNAPMAKEDOWN
+               : !strcmp(mu, "nomsgcheck")     ? RM_NOMSGCHECK
+               : !strcmp(mu, "bulkframes")     ? RM_BULKFRAMES
                : !strcmp(mu, "snapnowaitdone") ? RM_SNAPNOWAITDONE
                : !strcmp(mu, "snapnostale")    ? RM_SNAPNOSTALE
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
@@ -2386,6 +2439,7 @@ void repld_init(tsdb *t, const char *dir)
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
     G.snap_dial = te && strstr(te, "snapdial");
+    G.flip_in = te && strstr(te, "flipin");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */

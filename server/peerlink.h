@@ -349,6 +349,7 @@ enum {
     PL_MUT_CLOSEFIRST = 27,     /* the transport is closed before on_link(down) */
     PL_MUT_WNOSHORT = 28,       /* a short write counts the whole write buffer as written (WRITTEN for untaken frames) */
     PL_MUT_NHANDALL = 29,       /* a connection that never was in a handshake (the test attach) is taken off nhand */
+    PL_MUT_DONESTATUS = 30,     /* a DONE or RESUME status that is no PL_* code is taken as it came */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
@@ -357,6 +358,9 @@ extern int peerlink_mutant;
 /* Test hook (rsnap's TSDB_REPLD_TEST=snapcutdone): > 0 cuts the connection of a kind-5 link once, at the n-th file
  * that ends whole, after the receiver's end callback and before its DONE goes out (a DONE lost to a reconnect). */
 extern int peerlink_test_cut_end;
+/* Test hook (test_peerlink donestatus): nonzero replaces the status of the next DONE a receiver sends with this value,
+ * once (what a flipped bit in an unchecked frame looks like to the sender) */
+extern int32_t peerlink_test_done_status;
 /* Test hook (test_peerlink salts): when set, called at the end of each connection's handshake with its salts, those of
  * the frames it sends and of those it reads (dialer: 1 on the dialing end) */
 extern void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
