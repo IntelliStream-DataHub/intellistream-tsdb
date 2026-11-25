@@ -738,8 +738,11 @@ avoid. Built in cluster version 9 (`PL_CL_VERSION`; `server/plcheck.h`, `tsdbd -
 - **`header`** (type 2): XXH3-64, 8 bytes, over the frame's length, type, compression header and the first 256 bytes
   of its payload as the driver gave it (decompressed): the drivers' heads (a replication message's 212 bytes, a
   forward envelope, a chunk put's meta, a bulk frame's fields), never the bulk of a payload, so it costs a fixed amount
-  per frame. XXH3-64 rather than CRC32C: already vendored and portable C (one hash for both checks, no arm64 shim);
-  CRC32C costs about as much here (measured below), so this is not a speed choice and the owner may switch.
+  per frame. Of an APPEND that is the message head, the APPEND head and descriptor 0 only (212 + 16 + 24 = 252 bytes):
+  the later descriptors are guarded by the receive side's bounds alone, as under `none` (below). XXH3-64 rather than
+  CRC32C: already vendored and portable C (one hash for both checks, no arm64 shim); the two are within 15-25 ns per
+  frame of each other either way (measured below: CRC32C was faster on the i5, slower on the Xeon), so this is not a
+  speed choice and the owner may switch.
 - **`full`** (type 3): rd-mac's XXH3-128 over the whole frame, unchanged. It reads every byte again, so on RDMA it
   gives up zero copy's CPU saving; it is there for a network the owner does not trust.
 
@@ -773,14 +776,27 @@ second pass over every byte costs; on RDMA that pass is the CPU zero copy saves,
 **What guards the frames under `none`** (built in every mode, each with a regression test and a planted bug; the
 receive paths must be safe on any bytes, which fuzz-replframe checks per level): a replication message is checked
 against its log before the core sees it (an ACK beyond the log, a record unlike its descriptor (`wal_record`), a
-metadata-only type (FENCE, FENCE_REPLY, META, ISR_REQ, RESIGN) from a peer: dropped and counted, the resend repairs
-it; `test_cluster replflip replmeta`, `test_repl ack_bound`); a driver frame on a bulk link ends that link
+metadata-only type (FENCE, FENCE_REPLY, META, ISR_REQ, RESIGN) from a peer, an epoch above the highest the member knows
+(the record's or the core's: a flipped high bit would fence the replica durably above every epoch the group hands out),
+a descriptor epoch outside [prev_epoch, the message's epoch]: dropped and counted, the resend repairs it;
+`test_cluster replflip replmeta replepoch repldesc`, `test_repl ack_bound`); a driver frame on a bulk link ends that link
 (`replbulk`); a DONE or RESUME with a status no version sends ends the connection (`test_peerlink donestatus`); a
 forwarded frame carries a checked frame id and must be of its link's kind (a write on FWDQ, a read on FWD: the link is
 reset, nothing applied; `test_peerlink fwdflip`, `test_cluster forward`); a chunk put's meta has an xxh64 of its own,
 checked before the fence is raised or a writer opened, every chunk request one over its fields (a flipped epoch never
-raises a fence), PUT_OK's hash covers the meta and the sums, and an answer is matched to the pending call by op as
-well as id (`test_chunksrv`). Forwarded client frames get no integrity check of their own (accepted by the owner).
+raises a fence), PUT_OK's hash covers the meta and the sums, every answer carries an xxh64 over its head and body (a
+READ's over its head and length only: its cells are checked against the object's sums by the reader), and an answer
+is matched to the pending call by op as well as id (`test_chunksrv`). Forwarded client frames get no integrity check
+of their own (accepted by the owner).
+
+**What `none` leaves open** (for the owner): an ACK whose `durable` is flipped to a value inside [the true durable,
+written] passes every bound (it is not beyond the log, and not above `written`), and the leader's commit point then
+moves over rows that replica has not synced; with two of three in the ISR a power loss of that replica afterwards loses
+acknowledged rows. Only a low bit of `durable` can do it, and only while `written > durable`, but it is the data-loss
+class the frame check existed for. No structural bound catches it; `header` and `full` do (the ACK's fields are in the
+first 212 bytes). The alternative is a check word over the replication message's fixed head on driver messages in
+every mode (8 bytes, the `header` level's 23-31 ns, on LOG messages only, never on bulk); not built, the owner
+decides.
 
 ## 7. Decisions (defaults; the owner may change them)
 

@@ -17,9 +17,12 @@
  *  - PL_CHECK_HEADER (2): XXH3-64 (8 bytes) over the frame's length, type, compression header and the first
  *    PL_CHECK_SPAN bytes of its payload as the driver gave it (decompressed): the drivers' heads (a replication
  *    message's 212 bytes, a forward envelope, a chunk put's meta, a bulk frame's fields) without the bulk of the
- *    bytes, so it costs a fixed amount per frame (at most 265 bytes hashed, 23-31 ns). XXH3-64 rather than CRC32C:
- *    already vendored and portable C, one hash for both checks; CRC32C costs about as much (design-rdma.md §6 has the
- *    numbers), so the choice is not about speed.
+ *    bytes, so it costs a fixed amount per frame (at most 265 bytes hashed, 23-31 ns). Of an APPEND it covers the
+ *    message head, the APPEND head and descriptor 0 only (212 + 16 + 24 = 252 bytes): the later descriptors are
+ *    guarded by the receive side's bounds alone (repld.c msg_refused: epochs in order and not above the member's,
+ *    each record against its descriptor), as under none. XXH3-64 rather than CRC32C: already vendored and portable
+ *    C, one hash for both checks; the two are within 15-25 ns per frame of each other either way (CRC32C faster on
+ *    an i5-13400, slower on a Xeon E5; design-rdma.md §6 has the numbers), so the choice is not about speed.
  *  - PL_CHECK_FULL (3): XXH3-128 (16 bytes) over the type, header and payload as they are on the wire (rd-mac's
  *    check, the fastest measured; it reads every byte again, so on RDMA it gives up zero copy's CPU saving).
  *

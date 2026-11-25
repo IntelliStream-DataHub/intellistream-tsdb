@@ -269,8 +269,10 @@ cgroup, so `nice` does not keep your work out of its way.
   still proves the secret; the level is a check type negotiated in HELLO, a link runs at the stronger end's;
   `plink_check`, STATUS `links.KIND.*`, metrics `tsdb_peer_links`; docs/design-rdma.md §6). Under `none` the receivers
   are the guard, in every mode: bounds and consistency checks (repld `msg_refused`: ACK beyond the log, a record
-  unlike its descriptor, metadata-only types from a peer; driver frames on BULK; DONE/RESUME status; fwd's checked
-  frame id and op of the link's kind; chunksrv's checked put meta and requests, answers matched by op), each with a
+  unlike its descriptor, metadata-only types from a peer, an epoch above the member's highest, descriptor epochs out
+  of order; driver frames on BULK; DONE/RESUME status; fwd's checked frame id and op of the link's kind; chunksrv's
+  checked put meta, requests and answers, answers matched by op; open under `none`: an ACK's `durable` flipped inside
+  [durable, written], design-rdma.md §6), each with a
   test and a mutant, and every receive path safe on any bytes (fuzz-replframe per level). `test_peerlink --check
   LEVEL` (mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8` at header and
   full; `donestatus`, `noidcheck`); HELLO and
