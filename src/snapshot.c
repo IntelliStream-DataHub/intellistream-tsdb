@@ -714,6 +714,8 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
         dict_lengths_now(db, &dl);         /* passes and whose record is not written yet is left out */
     if (snap_mutant != SNAP_MUT_AFTERP)
         rc = list_part_names(db, &parts, &nparts);
+    if (rc == 0 && snap_mutant == SNAP_MUT_DROPPART && nparts > 1) /* planted: the last part left out of the snapshot */
+        nparts--;
     pthread_mutex_lock(&db->lock);
     pthread_mutex_lock(&db->buf_lock);
     for (size_t i = 0; i <= db->nflushing; i++) {

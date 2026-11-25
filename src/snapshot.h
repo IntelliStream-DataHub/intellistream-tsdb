@@ -99,7 +99,9 @@ enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_
                    SNAP_MUT_NORETIRED, SNAP_MUT_NODIRSYNC, SNAP_MUT_NONEEDSEQ, SNAP_MUT_NOSEGRETRY,
                    /* the install's */
                    SNAP_MUT_LOWERFENCE, SNAP_MUT_RAISELED, SNAP_MUT_KEEPUNSURE, SNAP_MUT_SWAPFIRST,
-                   SNAP_MUT_INSTNODIRSYNC };
+                   SNAP_MUT_INSTNODIRSYNC,
+                   /* a leader's snapshot that lists one part fewer (tsdbd: TSDB_REPLD_MUTANT=snapdroppart; jepsen-cluster-selftest) */
+                   SNAP_MUT_DROPPART };
 extern int snap_mutant;
 
 /* ---- the install (r4-snapinst; snapshot.c's second half has the design) ----

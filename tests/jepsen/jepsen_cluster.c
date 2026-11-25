@@ -191,8 +191,8 @@ static const struct r4nem {
     const char *needs;
 } r4nem[] = {{"kill2", N_KILL2, 1, "nothing new"},
              {"slow", N_SLOW, 1, "nothing new in tsdbd (the outagefs shim: --outagefs build/liboutagefs.so)"},
-             {"longdown", N_LONGDOWN, 0, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
-             {"rebuild", N_REBUILD, 0, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
+             {"longdown", N_LONGDOWN, 1, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
+             {"rebuild", N_REBUILD, 1, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
              {"churn", N_CHURN, 1, "r4-transfer, r4-setchg and r4-move (volume transfer, volume move --log)"}};
 #define NR4NEM ((int)(sizeof r4nem / sizeof r4nem[0]))
 static int r4_bit(const char *name)
@@ -3110,7 +3110,9 @@ static void nem_rebuild(void)
     hold_ms(3000);
     if (stat(vd, &vsb) == 0)
         die(1, "rebuild: node %d started with its %s removed and made it again before any `replica reset`", i, vd);
-    if (!log_has_since(i, off, vd, NULL) || log_has_since(i, off, "made ", vd))
+    char made[PATH_MAX + 80]; /* "volume 1 (kvr): made <path>, replica ..." is the open that makes one; the refusal says "not made again" */
+    snprintf(made, sizeof made, "): made %s", vd);
+    if (!log_has_since(i, off, vd, NULL) || log_has_since(i, off, made, NULL))
         die(1, "rebuild: node %d, restarted with %s removed, has no line in its log that names the path and refuses the "
                "volume (log %s)", i, vd, nodes[i].log);
     uint8_t body[16];
@@ -4623,7 +4625,10 @@ int main(int argc, char **argv)
             rc = 1;
         }
     }
-    unsigned expect = (unsigned)(seconds / 10 > 0 ? seconds / 10 : 1); /* a round is 3 to 8 s */
+    /* a round is 3 to 8 s; a longdown round waits past repl_retain_s and then for the snapshot, a rebuild round for the
+     * reset and the snapshot (measured: about 15 s each) */
+    int per_round = (nemeses & (N_LONGDOWN | N_REBUILD)) ? 25 : 10;
+    unsigned expect = (unsigned)(seconds / per_round > 0 ? seconds / per_round : 1);
     if (nk && !takeover && total_faults < expect) {
         fprintf(stderr, "jepsen-cluster: FAIL: only %u faults in %d s (at least %u expected): the nemesis was idle\n",
                 total_faults, seconds, expect);

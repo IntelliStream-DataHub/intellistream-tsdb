@@ -394,7 +394,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	$(MUT) --name test_replfile --list "nosync sameslot nochecksum" -- ./$(B)/test_replfile --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_crashfs $(SCRATCH)
 	./$(B)/test_snapshot $(SCRATCH)
-	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync snapdroppart" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_replica $(SCRATCH)
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's
@@ -1828,11 +1828,11 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	        if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q "the $$n nemesis needs .* which is not on main yet"; then \
 	            echo "jepsen-cluster-selftest: the unbuilt nemesis $$n was not refused with its line (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; fi; \
 	    done; \
-	if grep -qs snapfloorlow server/*.c src/*.c && ./$(B)/jepsen_cluster --built-nemeses | grep -qw longdown; then \
-	    out=$$(TSDB_REPLD_MUTANT=snapfloorlow $$j --seconds 120 --nemesis longdown --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	for n in longdown rebuild; do \
+	    out=$$(TSDB_REPLD_MUTANT=snapdroppart $$j --seconds 120 --nemesis $$n --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
-	        echo "jepsen-cluster-selftest: a snapshot cut below the floor (snapfloorlow) went unnoticed under longdown (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	else echo "jepsen-cluster-selftest: snapfloorlow under longdown skipped (the mutant or the nemesis is not on main yet)"; fi; \
+	        echo "jepsen-cluster-selftest: a snapshot that leaves a part out (snapdroppart) went unnoticed under $$n (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    done; \
 	if grep -qs moveshrinkfirst server/*.c src/*.c && ./$(B)/jepsen_cluster --built-nemeses | grep -qw churn; then \
 	    out=$$(TSDB_CLUSTER_MUTANT=moveshrinkfirst TSDB_REPLD_MUTANT=moveshrinkfirst $$j --seconds 120 --nemesis churn --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
