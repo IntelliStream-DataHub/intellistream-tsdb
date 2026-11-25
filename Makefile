@@ -516,7 +516,7 @@ test-units-h3:
 test-units-h4:
 	$(MUT) --name test_replica --list "b0off leaderlinknosync notfoundsealed nosweep linkbyname leadernoprune nocutgen dropunheld rowsholdmu promotenoapplymu replicadropsfloor replaykeptearly" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-h5:
-	$(MUT) --name test_replica --list "leaderpruneall notelate switchunattached freshunattached replicadropsfiles replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
+	$(MUT) --name test_replica --list "leaderpruneall notelate switchunattached freshunattached replicadropsfiles replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor roseqtails roonetail" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-i:
 	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)

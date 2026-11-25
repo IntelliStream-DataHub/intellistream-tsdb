@@ -30,6 +30,7 @@
 #include "eckeep.h"
 #include "ecpart.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -359,14 +360,12 @@ static int open_listed_part(eng *db, const char *name, part **out)
     return rc;
 }
 
-/* Reads new records of one WAL segment into its memtable. */
-static int tail_segment(eng *db, wal_tail *t)
+/* Planted mutations for tests/test_replica.c (0 = none, 1 = old sequential tail walk, 2 = one tail past 2^40). */
+int follow_test_mutant;
+
+/* Reads new records of one WAL segment from an already-open fd into its memtable; closes fd. */
+static int tail_segment_fd(eng *db, wal_tail *t, int fd, const char *name)
 {
-    char name[64];
-    snprintf(name, sizeof name, "wal_%016" PRIx64 ".log", t->seq);
-    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC); /* reopened: revalidates the size on NFS */
-    if (fd < 0)
-        return 0; /* not created yet, or already flushed and deleted: the manifest catches up */
     struct stat st;
     if (fstat(fd, &st) != 0 || (uint64_t)st.st_size <= t->off) {
         close(fd);
@@ -455,6 +454,146 @@ static int tail_segment(eng *db, wal_tail *t)
     t->off += pos;
     free(buf);
     return rc;
+}
+
+/* Reads new records of one WAL segment into its memtable. */
+static int tail_segment(eng *db, wal_tail *t)
+{
+    char name[64];
+    wal_name(name, sizeof name, t->seq);
+    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC); /* reopened: revalidates the size on NFS */
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ESTALE)
+            return 0; /* not created yet, or already flushed and deleted: the manifest catches up */
+        fprintf(stderr, "tsdb: follower: opening %s: %s\n", name, strerror(errno));
+        return TSDB_ERR_IO;
+    }
+    return tail_segment_fd(db, t, fd, name);
+}
+
+/* Tails one WAL segment into db->tails (kept oldest-first by seq). When skip_missing is true, a segment that does not
+ * exist (not created yet, or unlinked mid-scan on NFS) is skipped without failing or taking a MAX_TAILS slot. If all
+ * MAX_TAILS slots are already in use and the segment actually exists on disk, fails with TSDB_ERR_IO instead of
+ * silently dropping rows. */
+static int follow_tail_one(eng *db, uint64_t seq, bool skip_missing)
+{
+    wal_tail *t = NULL;
+    for (size_t i = 0; i < db->ntails; i++)
+        if (db->tails[i].seq == seq)
+            t = &db->tails[i];
+    if (t)
+        return tail_segment(db, t);
+    char name[64];
+    wal_name(name, sizeof name, seq);
+    int fd = -1;
+    if (skip_missing || db->ntails == MAX_TAILS) {
+        fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ESTALE)
+                return 0; /* not created yet, or unlinked mid-scan: never fail, never waste a tail slot */
+            fprintf(stderr, "tsdb: follower: opening %s: %s\n", name, strerror(errno));
+            return TSDB_ERR_IO;
+        }
+        if (db->ntails == MAX_TAILS) {
+            close(fd);
+            fprintf(stderr, "tsdb: follower: %s has more than %d unflushed WAL segments (cannot open %s)\n",
+                    db->dir ? db->dir : "(dir)", MAX_TAILS, name);
+            return TSDB_ERR_IO;
+        }
+    }
+    memtable *mt = mt_new(seq);
+    if (!mt) {
+        if (fd >= 0)
+            close(fd);
+        return TSDB_ERR_NOMEM;
+    }
+    pthread_mutex_lock(&db->lock);
+    pthread_mutex_lock(&db->buf_lock);
+    size_t pos = db->ntails;
+    while (pos > 0 && db->tails[pos - 1].seq > seq)
+        pos--;
+    if (pos < db->ntails)
+        memmove(&db->tails[pos + 1], &db->tails[pos], (db->ntails - pos) * sizeof db->tails[0]);
+    db->ntails++;
+    t = &db->tails[pos];
+    *t = (wal_tail){.seq = seq, .m = mt};
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    return fd >= 0 ? tail_segment_fd(db, t, fd, name) : tail_segment(db, t);
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static int u64_push(uint64_t **arr, size_t *n, size_t *cap, uint64_t v)
+{
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        uint64_t *p = realloc(*arr, nc * sizeof *p);
+        if (!p)
+            return TSDB_ERR_NOMEM;
+        *arr = p;
+        *cap = nc;
+    }
+    (*arr)[(*n)++] = v;
+    return 0;
+}
+
+/* Lists existing wal_<seq>.log files with lo < seq <= hi, sorted ascending and deduplicated. Also includes already-open
+ * tails in (lo, hi] and hi itself so a segment just created on NFS is still probed by name (lookupcache=positive). */
+static int follow_scan_wal(eng *db, uint64_t lo, uint64_t hi, uint64_t **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    int dfd = fcntl(db->dirfd, F_DUPFD_CLOEXEC, 0);
+    DIR *d = dfd >= 0 ? fdopendir(dfd) : NULL;
+    if (!d) {
+        if (dfd >= 0)
+            close(dfd);
+        return TSDB_ERR_IO;
+    }
+    rewinddir(d); /* the dup shares its offset with dirfd, which an earlier scan moved */
+    uint64_t *seqs = NULL;
+    size_t n = 0, cap = 0;
+    int rc = 0;
+    struct dirent *e;
+    for (errno = 0; (e = readdir(d)); errno = 0) {
+        uint64_t seq;
+        int consumed = 0;
+        if (!wal_file_name(e->d_name) || sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 ||
+            e->d_name[consumed])
+            continue;
+        if (seq <= lo || seq > hi)
+            continue;
+        if ((rc = u64_push(&seqs, &n, &cap, seq)) != 0)
+            break;
+    }
+    if (rc == 0 && errno != 0)
+        rc = TSDB_ERR_IO;
+    closedir(d);
+    for (size_t i = 0; rc == 0 && i < db->ntails; i++)
+        if (db->tails[i].seq > lo && db->tails[i].seq <= hi)
+            rc = u64_push(&seqs, &n, &cap, db->tails[i].seq);
+    if (rc == 0)
+        rc = u64_push(&seqs, &n, &cap, hi);
+    if (rc != 0) {
+        free(seqs);
+        return rc;
+    }
+    if (n > 1) {
+        qsort(seqs, n, sizeof *seqs, cmp_u64);
+        size_t w = 1;
+        for (size_t i = 1; i < n; i++)
+            if (seqs[i] != seqs[w - 1])
+                seqs[w++] = seqs[i];
+        n = w;
+    }
+    *out = seqs;
+    *nout = n;
+    return 0;
 }
 
 /* A refresh found SERIES with nser records where `need` should be there. Records when each count first went missing,
@@ -672,27 +811,35 @@ int follow_refresh(eng *db)
         rc = 0;
 
     /* rows of the segments the writer has not flushed yet */
-    for (uint64_t seq = db->follow_flushed + 1; rc == 0 && seq <= db->follow_active && seq; seq++) {
-        wal_tail *t = NULL;
-        for (size_t i = 0; i < db->ntails; i++)
-            if (db->tails[i].seq == seq)
-                t = &db->tails[i];
-        if (!t) {
-            if (db->ntails == MAX_TAILS)
-                break;
-            memtable *mt = mt_new(seq);
-            if (!mt) {
-                rc = TSDB_ERR_NOMEM;
-                break;
+    if (rc == 0 && db->follow_flushed < db->follow_active) {
+        if (follow_test_mutant == 1) { /* planted (roseqtails): the old sequential walk across a gap */
+            for (uint64_t seq = db->follow_flushed + 1; rc == 0 && seq <= db->follow_active && seq; seq++) {
+                bool have = false;
+                for (size_t i = 0; i < db->ntails; i++)
+                    have |= db->tails[i].seq == seq;
+                if (!have && db->ntails == MAX_TAILS)
+                    break;
+                rc = follow_tail_one(db, seq, false);
             }
-            pthread_mutex_lock(&db->lock);
-            pthread_mutex_lock(&db->buf_lock);
-            t = &db->tails[db->ntails++];
-            *t = (wal_tail){.seq = seq, .m = mt};
-            pthread_mutex_unlock(&db->buf_lock);
-            pthread_mutex_unlock(&db->lock);
+        } else if (db->follow_active - db->follow_flushed <= MAX_TAILS) {
+            /* fast path: at most MAX_TAILS numbers between the bounds, no directory scan needed */
+            for (uint64_t seq = db->follow_flushed + 1; rc == 0 && seq <= db->follow_active && seq; seq++) {
+                rc = follow_tail_one(db, seq, true);
+                if (follow_test_mutant == 2 && db->follow_active >= ((uint64_t)1 << 40) && db->ntails >= 1)
+                    break;
+            }
+        } else {
+            /* a gap wider than MAX_TAILS (such as a replica's 2^40 epoch jump): walk only segments that exist */
+            uint64_t *seqs = NULL;
+            size_t nseqs = 0;
+            rc = follow_scan_wal(db, db->follow_flushed, db->follow_active, &seqs, &nseqs);
+            for (size_t i = 0; rc == 0 && i < nseqs; i++) {
+                rc = follow_tail_one(db, seqs[i], true);
+                if (follow_test_mutant == 2 && db->follow_active >= ((uint64_t)1 << 40) && db->ntails >= 1)
+                    break;
+            }
+            free(seqs);
         }
-        rc = tail_segment(db, t);
     }
     pthread_mutex_unlock(&db->refresh_lock);
     if (rc)

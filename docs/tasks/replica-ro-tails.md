@@ -1,35 +1,35 @@
 # A read-only open of a promoted replica's directory: the tail loop after the segment jump
 
-**Open (from the replica-race review, F3, 2026-11-18; not reproduced).**
+**Done (2026-11-25).**
 
-`follow_refresh` (src/manifest.c) reads the segments `follow_flushed + 1 .. follow_active` that MANIFEST names, one
-tail per sequence number, and stops at `MAX_TAILS` (8). A missing segment reads as empty (ENOENT: not yet made, or
-flushed away). After a promotion, segment numbers jump (`epoch << 40`): a MANIFEST that still says the old
-`wal_flushed` with the new `wal_active` would fill the 8 tails with numbers that were never segments and never reach the
-active one, so a read-only open would miss its rows.
+`follow_refresh` (`src/manifest.c`) previously walked every integer `follow_flushed + 1 .. follow_active`
+sequentially and stopped at `MAX_TAILS` (8), allocating a tail slot even for non-existent segment numbers. After a
+promotion's `epoch << 40` segment jump, a MANIFEST with `wal_flushed` still below `2^40` and `wal_active >= 2^40`
+filled all 8 tail slots with non-existent numbers and never reached the active segment, dropping rows in `2^40` and
+above.
 
-The review's probe (a read-only open of the promoted writer's directory and of a member's, right after the first small
-write after the promotion in `case_promote(0)` of tests/test_replica.c) passed: there `wal_flushed` had caught up before
-the MANIFEST a reader saw. Not shown either way: a promoted replica that has not flushed since the jump.
+## Fix
 
-To do, if read-only opens of replica directories are to be supported (jepsen-cluster's end check opens a stopped
-replica's directory): a test case for exactly that state, and if it fails, walk only the segments that exist (a
-directory listing between the two bounds) instead of every number between them.
+- `follow_refresh` (`src/manifest.c`) keeps the sequential fast path (without a directory scan) when
+  `follow_active - follow_flushed <= MAX_TAILS`, and skips missing segments (`openat` -> `ENOENT`/`ESTALE`) before
+  allocating a `wal_tail` slot so missing numbers never consume `MAX_TAILS`. Real `openat` errors (`EIO`, `EACCES`,
+  `EMFILE`, etc.) in both `follow_tail_one` and `tail_segment` are logged and returned as `TSDB_ERR_IO`.
+- When `follow_active - follow_flushed > MAX_TAILS` (including across a `2^40` epoch jump), `follow_scan_wal` lists
+  the directory with `fdopendir(fcntl(db->dirfd, F_DUPFD_CLOEXEC, 0))` + `rewinddir`, collects existing `wal_<seq>.log`
+  files (`wal_file_name`) with `follow_flushed < seq <= follow_active` (plus already-open tails in range and
+  `follow_active` itself so NFS followers still probe newly created segments by name under `lookupcache=positive`),
+  sorts and deduplicates by `seq`, and tails them in ascending order while keeping `db->tails` sorted oldest-first. A
+  segment unlinked mid-scan (`ENOENT`/`ESTALE`) is ignored without failing; if more than `MAX_TAILS` actual unflushed
+  WAL segments exist on disk, `follow_tail_one` probes `openat`, logs, and returns `TSDB_ERR_IO` instead of silently
+  truncating newer segments.
 
-## Status (r4-jepsen, after review)
+## Tests
 
-`case_promote` of tests/test_replica.c now produces the state on purpose and asserts it from the MANIFEST file
-(`man_bounds`): after the epoch's marker is applied and before `replica_promote`, the candidate's directory and the other
-member's both have `wal_flushed` below 2^40 (1 to 4 in the runs) and `wal_active` at 2^40, and both are opened read-only
-and compared with the old leader. The first version of the case only opened after the promotion, where the promotion's own
-flush (and a rotation's) had already moved `wal_flushed` to 2^40, so it never reached the state; the opens after the
-promotion stay as the second and third state.
-
-What this does not prove: rows in the epoch's own segment (2^40). In these runs it holds the EPOCH marker only (the
-promoted writer's first segment is 2^40 + 1, the replicas of the new leader take its records in that one), so a tail loop
-that never reaches 2^40 loses no row here. If a segment above the old numbers ever holds rows while `wal_flushed` is still
-below the jump, this state needs a case with those rows. Nor does it show that the new opens have teeth against a walk that stops early: a mutant of the tail loop that takes one
-segment only once `follow_active` is past 2^40 passed them, because these directories hold unflushed rows in at most one
-segment below the jump (the earlier `case_ro_open` catches a walk that stops early everywhere). A case with rows in two
-unflushed segments before the epoch's would. A walk of the segments that exist (a listing between the bounds)
-would not depend on any of this.
+- `case_ro_epoch_jump` (`tests/test_replica.c`): covers a direct replica feed (kept flushed segment `1` on disk,
+  unflushed segments `2` and `3` below `2^40`, unflushed rows in `2^40` and `2^40 + 1` with `wal_flushed == 1`, fresh
+  and stopped read-only opens, live `eng_refresh` across the jump and after flushing past `2^40`), a deterministic
+  promotion flow where a follower replica holds 2+ unflushed segments below `2^40` plus promoted leader rows in
+  `2^40 + 1`, `> MAX_TAILS` refusal and `EACCES` error propagation, and out-of-order tail insertion (`memmove` sorting
+  and overwrite precedence).
+- Planted mutants `roseqtails` (old sequential walk) and `roonetail` (stop after one tail once `follow_active >= 2^40`)
+  are wired into `Makefile` (`test-units-h3`).
