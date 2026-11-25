@@ -25,7 +25,7 @@ AlmaLinux 10), [design-auth.md](design-auth.md) (the threat model: a backend on 
    shared by every link of that kind on the node: 256 MiB/s for BULK (`PL_BULK_RATE_DEFAULT`), 200 MiB/s for SNAP
    (`rebuild_mb_s`), 256 MiB/s for CHUNKB (`--chunk-rate-mb-s`). At the defaults a snapshot runs at 210 MB/s whatever
    the MAC, and a COMMIT shipped to two replicas at about 134 MB/s each. Fixing the MAC (§6, D1) is the first track
-   and helps TCP right away; raising the caps is a decision of its own, bounded by the disks, the NFS storage on the
+   and helps TCP right away (since rd-nocheck the check is an option, `none` by default: §6); raising the caps is a decision of its own, bounded by the disks, the NFS storage on the
    same fabric and the LOG link's latency (D11); RDMA matters for bulk only after both (§4).
 2. **Native verbs on the FDR InfiniBand** move 50 Gbit/s from 16 KiB messages up, at 0.02-0.09 CPU seconds per GB
    (event-driven completions, §3.1), and a 1 KiB frame and its answer take about 5 µs busy-polling or about 15 µs
@@ -725,11 +725,84 @@ third more at 64 B and nothing from 16 KiB on, and it fills the 16 bytes a keyed
 alone (no position in it); no check on RDMA (InfiniBand's ICRC catches link
 corruption but not a host's or a buffer's, and the sequence number would go unchecked).
 
+**rd-nocheck (owner, 2026-11-25): the check is an option, `none` by default.** "CRC is enough. The payload we send is
+already checksummed", and then: "it can be a configurable option, where we have none, checksum header, full frame
+checksum. The default is none." The reasoning: the wire is trusted to Ethernet's FCS and TCP's checksum (InfiniBand's
+ICRC on RDMA), as NFS over TCP and over RDMA trusts it, and every payload that matters already carries a checksum of
+its own that its receiver verifies (WAL records, bulk and stage files by their END xxh64, snapshot files by SNAPMAN,
+chunk cells by their sums). What the per-frame check cost was the per-byte pass, which zero copy (rd-zerocopy) must
+avoid. Built in cluster version 9 (`PL_CL_VERSION`; `server/plcheck.h`, `tsdbd --peer-check none|header|full`, key
+`cluster.peer.check`):
+
+- **`none`** (type 1, the default on every transport, TCP included): no check bytes on the wire.
+- **`header`** (type 2): XXH3-64, 8 bytes, over the frame's length, type, compression header and the first 256 bytes
+  of its payload as the driver gave it (decompressed): the drivers' heads (a replication message's 212 bytes, a
+  forward envelope, a chunk put's meta, a bulk frame's fields), never the bulk of a payload, so it costs a fixed amount
+  per frame. Of an APPEND that is the message head, the APPEND head and descriptor 0 only (212 + 16 + 24 = 252 bytes):
+  the later descriptors are guarded by the receive side's bounds alone, as under `none` (below). XXH3-64 rather than
+  CRC32C: already vendored and portable C (one hash for both checks, no arm64 shim); the two are within 15-25 ns per
+  frame of each other either way (measured below: CRC32C was faster on the i5, slower on the Xeon), so this is not a
+  speed choice and the owner may switch.
+- **`full`** (type 3): rd-mac's XXH3-128 over the whole frame, unchanged. It reads every byte again, so on RDMA it
+  gives up zero copy's CPU saving; it is there for a network the owner does not trust.
+
+The levels are check types of the HELLO negotiation above: each end offers the types at or above its own level, the
+acceptor picks the lowest offered at or above its own, so a link runs at the **stronger** of its two ends' levels
+(turning it on at one node protects all its links), and a dialer refuses a type below its level. Both checks keep the
+seed `salt ^ seq`: the per-frame sequence number stays (it costs a counter, seeds `header` and `full`, and so makes a
+dropped, repeated or reordered frame fail there; under `none` nothing reads it, TCP and RC keep order). `cluster
+status`, the client STATUS (`links.KIND.{none,header,full}`) and the metrics port (`tsdb_peer_links{kind,check}`) say
+how many links of each kind run at each level. The handshake keeps HMAC-SHA256, the metadata links keep HMAC framing.
+
+**What the levels cost** (`test_peerlink --bench --check LEVEL`, TCP over loopback, one process; Intel Xeon E5-2697 v4,
+2 rounds of 3 repetitions per level, means, on a fleet slot whose load average was 6 to 11, so differences of a few
+per cent are noise; the per-frame check cost is a loop of its own):
+
+| | `none` | `header` | `full` |
+|---|---:|---:|---:|
+| check per frame, 265-byte frame | 0 | 27-31 ns | 29-33 ns |
+| check per frame, 64 KiB | 0 | 28-32 ns | 1.94-1.98 µs (about 33 GB/s) |
+| check per frame, 1 MiB | 0 | 27-31 ns | 33-35 µs (about 30-32 GB/s) |
+| bulk link, 64 KiB-4 MiB chunks (mean of the 4 sizes) | 2,047 MB/s | 2,026 MB/s (-1%) | 1,874 MB/s (-8%) |
+| log link, 80-byte frames | 1.47 M frames/s | 1.44 M frames/s | 1.55 M frames/s |
+| wire bytes, 80-byte frames | 106.2% of the payload | 116.2% | 126.2% |
+
+CRC32C over the header's span cost 33.5 ns per frame on the Xeon and 8.6 ns on an i5-13400 (where XXH3-64 took 23 ns
+and the full check 19 ns at 265 bytes, 1.0 µs at 64 KiB, 19 µs at 1 MiB; one repetition). Small frames are bound by
+the system calls, not the check: the log link's rate does not order by level. The bulk link loses what the full check's
+second pass over every byte costs; on RDMA that pass is the CPU zero copy saves, which is why `full` is not the default.
+`tools/rdma-bench.sh` between two servers was not rerun for the levels (it measures link-bench, not peerlink).
+
+**What guards the frames under `none`** (built in every mode, each with a regression test and a planted bug; the
+receive paths must be safe on any bytes, which fuzz-replframe checks per level): a replication message is checked
+against its log before the core sees it (an ACK beyond the log, a record unlike its descriptor (`wal_record`), a
+metadata-only type (FENCE, FENCE_REPLY, META, ISR_REQ, RESIGN) from a peer, an epoch above the highest the member knows
+(the record's or the core's: a flipped high bit would fence the replica durably above every epoch the group hands out),
+a descriptor epoch outside [prev_epoch, the message's epoch]: dropped and counted, the resend repairs it;
+`test_cluster replflip replmeta replepoch repldesc`, `test_repl ack_bound`); a driver frame on a bulk link ends that link
+(`replbulk`); a DONE or RESUME with a status no version sends ends the connection (`test_peerlink donestatus`); a
+forwarded frame carries a checked frame id and must be of its link's kind (a write on FWDQ, a read on FWD: the link is
+reset, nothing applied; `test_peerlink fwdflip`, `test_cluster forward`); a chunk put's meta has an xxh64 of its own,
+checked before the fence is raised or a writer opened, every chunk request one over its fields (a flipped epoch never
+raises a fence), PUT_OK's hash covers the meta and the sums, every answer carries an xxh64 over its head and body (a
+READ's over its head and length only: its cells are checked against the object's sums by the reader), and an answer
+is matched to the pending call by op as well as id (`test_chunksrv`). Forwarded client frames get no integrity check
+of their own (accepted by the owner).
+
+**What `none` leaves open** (for the owner): an ACK whose `durable` is flipped to a value inside [the true durable,
+written] passes every bound (it is not beyond the log, and not above `written`), and the leader's commit point then
+moves over rows that replica has not synced; with two of three in the ISR a power loss of that replica afterwards loses
+acknowledged rows. Only a low bit of `durable` can do it, and only while `written > durable`, but it is the data-loss
+class the frame check existed for. No structural bound catches it; `header` and `full` do (the ACK's fields are in the
+first 212 bytes). The alternative is a check word over the replication message's fixed head on driver messages in
+every mode (8 bytes, the `header` level's 23-31 ns, on LOG messages only, never on bulk); not built, the owner
+decides.
+
 ## 7. Decisions (defaults; the owner may change them)
 
 | | decision | alternative | why |
 |---|---|---|---|
-| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code; **done in rd-mac as an integrity check, XXH3-128 without a key** (owner, 2026-11-24: forgery is not in the threat model), negotiated in HELLO so a keyed type (AES-128-GMAC, the fastest keyed MAC measured) can follow; the handshake keeps HMAC-SHA256 | RDMA first; the fastest keyed MAC | §3.3: the MAC capped every link at about 1.9 Gbit/s on every transport; RDMA alone would move nothing faster for bulk. §6: XXH3-128 does 30 GB/s per core on the test servers at 1 MiB (0.033 CPU s/GB per side, against HMAC's 4.3 and GMAC's 0.13). At the default rate caps D1 alone buys little for bulk (§4): it is the precondition for D11, and it takes the 26 µs of MAC off the 1 KiB round trip on LOG and FWD (§3.3) |
+| D1 | **Replace the data links' HMAC-SHA256 first**, before any RDMA code; **done in rd-mac as an integrity check, XXH3-128 without a key** (owner, 2026-11-24: forgery is not in the threat model), negotiated in HELLO so a keyed type (AES-128-GMAC, the fastest keyed MAC measured) can follow; the handshake keeps HMAC-SHA256. **rd-nocheck (owner, 2026-11-25): the check is an option, `--peer-check none\|header\|full`, `none` by default on every transport**; a link runs at the stronger end's level; bounds and consistency checks on the receive side in every mode (§6) | RDMA first; the fastest keyed MAC | §3.3: the MAC capped every link at about 1.9 Gbit/s on every transport; RDMA alone would move nothing faster for bulk. §6: XXH3-128 does 30 GB/s per core on the test servers at 1 MiB (0.033 CPU s/GB per side, against HMAC's 4.3 and GMAC's 0.13). At the default rate caps D1 alone buys little for bulk (§4): it is the precondition for D11, and it takes the 26 µs of MAC off the 1 KiB round trip on LOG and FWD (§3.3) |
 | D2 | **Verbs under peerlink, upgraded from the TCP data link** (option D), rdma_cm only for iWARP and as an option | rsocket (B); rdma_cm everywhere (C); IPoIB only (A) | works without IPoIB; one auth path; firewall still governs who may connect; fallback is the link we have |
 | D3 | **The metadata link stays TCP** | everything on RDMA | Raft and the failure detector stay independent of the fabric and of new code |
 | D4 | **`dlopen` of libibverbs and librdmacm**; `NO_RDMA=1` to build without; macOS never | link them | one binary and one tarball for hosts with and without rdma-core |

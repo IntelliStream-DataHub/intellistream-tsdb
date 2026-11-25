@@ -449,6 +449,7 @@ struct cluster_status {
     uint32_t ntr;
     uint64_t tr[16];
     char moves[8192]; /* the Raft leader's moves running, a line each with its step and age (cmove_status) */
+    char links[1024]; /* the answering server's peer data links up, per kind and frame check (peerlink_links_status) */
     const uint8_t *image;
     size_t image_len;
 };

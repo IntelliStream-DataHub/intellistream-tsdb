@@ -318,7 +318,7 @@ int repl_meta_promote_to(struct repl_vmeta *m, uint64_t basis_epoch, uint64_t ba
 
 #ifdef REPL_MUTANTS
 /* tests/sim_repl.c's mutation runs: bit n plants bug n of repl.c (MUT(n)); 0: none. */
-extern uint64_t repl_mutants;
+extern uint64_t repl_mutants, repl_mutants2;
 #endif
 
 #endif

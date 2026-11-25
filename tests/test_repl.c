@@ -143,6 +143,54 @@ static struct repl_msg meta_msg(int to, uint64_t epoch, int leader, uint32_t isr
     return m;
 }
 
+/* An ACK beyond what the replica can have verified (durable above written, written above the leader's log: a flipped
+ * bit, the peer links carry no frame check by default) is dropped: the commit point stays at the replica's real
+ * durable end (MUT(64) took it: the commit point jumped to the leader's end). */
+static void ack_bound(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 1000, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 400, .log_start = 1, .log_end = 1000, .hist = h,
+                              .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "open");
+    struct repl_msg m = meta_msg(0, 2, 0, 0x3, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    struct repl_msg k = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 2, .leader = -1, .durable = 500,
+                         .written = 500, .rid = 22, .resync = 1};
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    uint64_t c1 = repl_commit(r);
+    CHECK(c1 <= 500, "the commit point %" PRIu64 " passed the replica's durable end 500", c1);
+    struct repl_msg bad[2] = {k, k};
+    bad[0].durable = 1ull << 40; /* durable above written */
+    bad[0].resync = 0;
+    bad[1].durable = bad[1].written = 1ull << 40; /* written above the leader's log */
+    bad[1].resync = 0;
+    for (int i = 0; i < 2; i++) {
+        repl_recv(r, &bad[i]);
+        drain(r, &d, NULL);
+        CHECK(!repl_failed(r) && repl_is_leader(r), "the leader failed on a bad ACK (%d)", i);
+        CHECK(repl_commit(r) == c1, "a bad ACK (%d) moved the commit point from %" PRIu64 " to %" PRIu64, i, c1,
+              (uint64_t)repl_commit(r));
+    }
+    /* control: an honest ACK of the whole log moves it */
+    k.durable = k.written = repl_written(r);
+    k.resync = 0;
+    repl_recv(r, &k);
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) > c1, "an honest ACK of %" PRIu64 " left the commit point at %" PRIu64, (uint64_t)k.durable,
+          (uint64_t)repl_commit(r));
+    repl_free(r);
+}
+
 static void trim(void)
 {
     static struct drv d;
@@ -1401,13 +1449,16 @@ static void busy_drop(void)
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
-    uint64_t mutant = 0;
+    uint64_t mutant = 0, mutant2 = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
             unsigned long b = strtoul(argv[++i], NULL, 10);
-            if (b == 0 || b > 63)
+            if (b == 0 || b > 127)
                 return 2;
-            mutant |= 1ull << b;
+            if (b < 64)
+                mutant |= 1ull << b;
+            else
+                mutant2 |= 1ull << (b - 64);
         } else {
             fprintf(stderr, "usage: test_repl [--mutant N]\n");
             return 2;
@@ -1415,13 +1466,15 @@ int main(int argc, char **argv)
     }
 #ifdef REPL_MUTANTS
     repl_mutants = mutant;
+    repl_mutants2 = mutant2;
 #else
-    if (mutant) {
+    if (mutant || mutant2) {
         fprintf(stderr, "test_repl: --mutant needs the build with -DREPL_MUTANTS (test_repl_mut)\n");
         return 2;
     }
 #endif
     trim();
+    ack_bound();
     open_damage();
     follower_damage();
     below_start();

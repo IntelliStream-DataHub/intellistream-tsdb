@@ -45,7 +45,8 @@
 #include "chunksrv.h"
 
 /* How requests reach a member (the real one: chunkpeer_cluster.c's, over chunksrv's links). call: chunksrv_call's
- * contract. put: chunksrv_put_remote's, with *answered the sum the member answered PUT_OK with (rc 0). */
+ * contract. put: chunksrv_put_remote's, with *answered the body the member answered PUT_OK with (rc 0):
+ * cs_put_answer_hash of the meta it took and of its sums table's hash. */
 struct chunkpeer_net {
     int (*call)(void *arg, uint32_t node, const struct cs_req *r, int timeout_ms, int32_t *rc, uint8_t **body,
                 size_t *body_len);

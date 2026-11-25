@@ -558,6 +558,11 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
     uint8_t *b = malloc(cap);
     size_t n = b ? rw_encode_msg(b, cap, rv->number, &m, rv->lens, seq, off, buf, len) : 0;
     int rc = n ? plink_send(l, RW_T_MSG, b, n, 0) : -1;
+    if (G.bulk_frame && n && ++rv->peer[to].bulk_n % 16 == 0) { /* a frame on the wrong link (test_cluster replbulk) */
+        struct plink *bl = link_of(rv->rec.rep[to].node, 1);
+        if (bl)
+            plink_send(bl, RW_T_MSG, b, n, 0);
+    }
     free(b);
     return rc == PL_OK ? 0 : -1;
 }
@@ -1276,11 +1281,101 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
     pthread_mutex_unlock(&rv->mu);
 }
 
+/* TSDB_REPLD_TEST=flipin[=epoch|desc] (tests only): one field of a received APPEND changed as a flipped bit on the
+ * wire would change it, before msg_refused. flipin: a byte of its first record; epoch, in turn: bit 40 of the
+ * message's epoch, bit 1 of it, bit 40 of descriptor 0's epoch; desc, in turn: bit 20 of descriptor 0's position, bit
+ * 4 of its span (the record itself intact). */
+static void flip_received(struct rvol *rv)
+{
+    struct repl_rec *d = (struct repl_rec *)rv->cur.m.rec;
+    unsigned k = (unsigned)(rv->flip_n / 8);
+    switch (G.flip_in) {
+    case FI_EPOCH:
+        if (k % 3 == 0)
+            rv->cur.m.epoch ^= 1ull << 40;
+        else if (k % 3 == 1)
+            rv->cur.m.epoch ^= 2;
+        else
+            d[0].epoch ^= 1ull << 40;
+        break;
+    case FI_DESC:
+        if (k % 2 == 0)
+            d[0].pos ^= 1ull << 20;
+        else
+            d[0].n ^= 1u << 4;
+        break;
+    default:
+        ((uint8_t *)rv->cur.bytes)[rv->cur.lens[0] / 2] ^= 0x10;
+    }
+}
+
+/* Why a decoded peer message must not reach the core, or NULL. The data links carry no frame check by default
+ * (server/plcheck.h): what a flipped bit in a header or control field could make is bounded here, and such a message
+ * is dropped and counted; the sender's resend repairs it. Metadata-only types come from the metadata group through
+ * the driver (IN_META), never from a peer. No epoch a peer names may lie above the highest one this member knows,
+ * the volume's record in the local metadata copy or its core's fence: the core takes a higher epoch as a new leader
+ * and saves it as its fence durably (raise_fence), so one flipped high bit would fence the replica above every epoch
+ * the group will ever hand out (review F1). A copy that lags drops a new leader's first messages until it catches up
+ * (a member of the new epoch's ISR answered its fence through the copy, so its copy has it); the resend comes after.
+ * The descriptors of an APPEND go up in epoch from prev_epoch and none passes the message's epoch (a leader's log is
+ * in epoch order); each goes into the replica's history unchecked otherwise. An ACK names the replica's verified
+ * prefix: durable <= written <= this log's end (the driver's keep bound and the core's commit point take it); a flip
+ * of durable inside [the true durable, written] passes that bound and is the one field no structural check can catch
+ * (design-rdma.md 6: `header` covers it). Every record of an APPEND must be the one its descriptor names (wal_record
+ * checks its header and checksum): one that is not is never appended, and never stops the volume either, as it did
+ * when only the apply checked it. */
+static const char *msg_refused(struct rvol *rv, const struct rw_msg *c)
+{
+    const struct repl_msg *m = &c->m;
+    switch (m->type) {
+    case REPL_M_FENCE:
+        return G.mutant == RM_NOMETAREFUSE ? NULL : "a metadata-only type from a peer";
+    case REPL_M_FENCE_REPLY:
+    case REPL_M_META:
+    case REPL_M_ISR_REQ:
+    case REPL_M_RESIGN:
+        return G.mutant == RM_NOMETAREFUSE || G.mutant == RM_METAFENCEONLY ? NULL : "a metadata-only type from a peer";
+    default:
+        break;
+    }
+    uint64_t known = repl_epoch(rv->core);
+    if (rv->rec.epoch > known)
+        known = rv->rec.epoch;
+    if (G.mutant != RM_NOEPOCHBOUND && (m->epoch > known || m->last_epoch > known || m->prev_epoch > known))
+        return "an epoch above the highest this member knows";
+    switch (m->type) {
+    case REPL_M_ACK:
+        if (m->durable > m->written || m->written > repl_written(rv->core))
+            return "an ACK beyond the log";
+        return NULL;
+    case REPL_M_APPEND:
+        for (uint32_t i = 0; i < m->nrec; i++) {
+            uint64_t below = i ? m->rec[i - 1].epoch : m->prev_epoch;
+            if (G.mutant != RM_NODESCEPOCH && (m->rec[i].epoch > m->epoch || m->rec[i].epoch < below))
+                return "a descriptor's epoch out of order";
+            wal_rec wr;
+            if (wal_record(c->bytes + rv->coff[i], c->lens[i], c->seq, c->off + rv->coff[i], &wr) != c->lens[i] ||
+                (G.mutant != RM_NODESCCMP && (wr.fno != m->rec[i].pos || wr.span != m->rec[i].n)))
+                return "a record unlike its descriptor";
+        }
+        return NULL;
+    default:
+        return NULL;
+    }
+}
+
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     (void)arg;
     if (plink_kind(l) == PL_KIND_SNAP) { /* a snapshot's control frame: rsnap.c posts what it keeps (IN_SNAP) */
         rsnap_frame(l, type, p, n);
+        return;
+    }
+    if (plink_kind(l) == PL_KIND_BULK && G.mutant != RM_BULKFRAMES) {
+        /* nothing sends a driver frame on a bulk link: a frame type turned into a user type by a flipped bit (the links
+         * carry no check by default, plcheck.h) ends the link, and the files on it begin again on the next one */
+        say("node %" PRIu32 ": a frame of type %u on a bulk link: the link is closed", plink_peer(l), (unsigned)type);
+        plink_reset(l);
         return;
     }
     uint32_t volume;
@@ -1849,6 +1944,34 @@ static void handle(struct rvol *rv, struct item *it)
     uint64_t o = 0;
     for (uint32_t i = 0; i < rv->cur.m.nrec; i++)
         rv->coff[i] = o, o += rv->cur.lens[i];
+    if (G.flip_in && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec && ++rv->flip_n % 8 == 0)
+        flip_received(rv); /* the receive side of a wire flip (test_cluster replflip, replepoch, repldesc) */
+    if (G.meta_in && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec && ++rv->flip_n % 8 == 0) {
+        /* a flipped type field (test_cluster replmeta): each metadata-only type in turn, a FENCE one above the
+         * leader's epoch; the others keep the APPEND's epoch, so only the type's refusal stands between them and the
+         * core */
+        static const int types[] = {REPL_M_FENCE, REPL_M_FENCE_REPLY, REPL_M_META, REPL_M_ISR_REQ, REPL_M_RESIGN};
+        rv->cur.m.type = types[(rv->flip_n / 8) % 5];
+        if (rv->cur.m.type == REPL_M_FENCE)
+            rv->cur.m.epoch++;
+    }
+    const char *why = G.mutant == RM_NOMSGCHECK ? NULL : msg_refused(rv, &rv->cur);
+    if (why) {
+        /* the first of each (type, reason), then one in 1000: one reason of a type must not hide another's
+         * (test_cluster replepoch looks for both of an APPEND's) */
+        int t = rv->cur.m.type, first = 1;
+        for (int i = 0; i < rv->nbad_said && first; i++)
+            first = !(rv->bad_said_t[i] == t && rv->bad_said[i] == why);
+        if (first && rv->nbad_said < 16)
+            rv->bad_said_t[rv->nbad_said] = t, rv->bad_said[rv->nbad_said++] = why;
+        else if (first)
+            first = 0;
+        if (rv->bad_msgs++ % 1000 == 0 || first)
+            say("volume %" PRIu32 ": a message of type %d from node %" PRIu32 " dropped (%" PRIu64 " so far): %s",
+                rv->number, (int)rv->cur.m.type, rv->rec.rep[from].node, rv->bad_msgs, why);
+        rv->cur.m.nrec = 0;
+        return;
+    }
     rv->peer[from].heard_ms = now_ms();
     if (rv->cur.m.type == REPL_M_ACK) {
         struct rpeer *p = &rv->peer[from];
@@ -2346,6 +2469,13 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnodonebits") ? RM_SNAPNODONEBITS
                : !strcmp(mu, "snapsharedmax")  ? RM_SNAPSHAREDMAX
                : !strcmp(mu, "snapmakedown")   ? RM_SNAPMAKEDOWN
+               : !strcmp(mu, "nomsgcheck")     ? RM_NOMSGCHECK
+               : !strcmp(mu, "bulkframes")     ? RM_BULKFRAMES
+               : !strcmp(mu, "nometarefuse")   ? RM_NOMETAREFUSE
+               : !strcmp(mu, "metafenceonly")  ? RM_METAFENCEONLY
+               : !strcmp(mu, "noepochbound")   ? RM_NOEPOCHBOUND
+               : !strcmp(mu, "nodescepoch")    ? RM_NODESCEPOCH
+               : !strcmp(mu, "nodesccmp")      ? RM_NODESCCMP
                : !strcmp(mu, "snapnowaitdone") ? RM_SNAPNOWAITDONE
                : !strcmp(mu, "snapnostale")    ? RM_SNAPNOSTALE
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
@@ -2386,6 +2516,13 @@ void repld_init(tsdb *t, const char *dir)
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
     G.snap_dial = te && strstr(te, "snapdial");
+    const char *fi = te ? strstr(te, "flipin") : NULL;
+    G.flip_in = !fi                                ? 0
+                : !strncmp(fi, "flipin=epoch", 12) ? FI_EPOCH
+                : !strncmp(fi, "flipin=desc", 11)  ? FI_DESC
+                                                   : FI_REC;
+    G.meta_in = te && strstr(te, "metain");
+    G.bulk_frame = te && strstr(te, "bulkframe");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */

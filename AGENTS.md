@@ -262,10 +262,20 @@ cgroup, so `nice` does not keep your work out of its way.
   carries the set version (`repl_set_version`, others dropped and counted) and the ACK the replay start
   (`repl_replay_start`, D17); `repl_leave` and `repl_meta_promote_to` for moves (design-cluster.md 8.3, R4);
   `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 2, cluster
-  version (`PL_CL_VERSION`) 8: the data links' frames carry an XXH3-128 check without a key (`server/plcheck.h`, xxHash
-  vendored unchanged in `server/xxhash/`; seeded with the frame's number and a salt per connection from the handshake,
-  whose HMAC-SHA256 still proves the secret; the check type is negotiated in HELLO; docs/design-rdma.md §6;
-  `test_peerlink` mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`; HELLO and
+  version (`PL_CL_VERSION`) 9: the data links' frame check is an option (`--peer-check none|header|full`, key
+  `cluster.peer.check`, `none` by default on every transport; `header` XXH3-64 over the length, type, zstd header and
+  the first 256 payload bytes, `full` XXH3-128 over the frame; `server/plcheck.h`, xxHash vendored unchanged in
+  `server/xxhash/`; seeded with the frame's number and a salt per connection from the handshake, whose HMAC-SHA256
+  still proves the secret; the level is a check type negotiated in HELLO, a link runs at the stronger end's;
+  `plink_check`, STATUS `links.KIND.*`, metrics `tsdb_peer_links`; docs/design-rdma.md §6). Under `none` the receivers
+  are the guard, in every mode: bounds and consistency checks (repld `msg_refused`: ACK beyond the log, a record
+  unlike its descriptor, metadata-only types from a peer, an epoch above the member's highest, descriptor epochs out
+  of order; driver frames on BULK; DONE/RESUME status; fwd's checked frame id and op of the link's kind; chunksrv's
+  checked put meta, requests and answers, answers matched by op; open under `none`: an ACK's `durable` flipped inside
+  [durable, written], design-rdma.md §6), each with a
+  test and a mutant, and every receive path safe on any bytes (fuzz-replframe per level). `test_peerlink --check
+  LEVEL` (mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8` at header and
+  full; `donestatus`, `noidcheck`); HELLO and
   HELLO_ACK end with a capability byte, `PL_CAP_RDMA` sent 0 until rd-upgrade, unknown bits ignored). A link connection's
   bytes go through `struct pl_transport` (`server/pltransport.h`: read, writev, poll_fds with `*ready`, poll_ready, close
   last after on_link(down); the handshake, connect and accept stay on TCP); the TCP transport is in peerlink.c,

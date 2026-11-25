@@ -98,10 +98,14 @@ static int net_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd
     if (self && node == self) {
         rc = chunkpeer_local_put(cs, self, m, fd, base, answered);
     } else {
-        /* chunksrv_put_remote compares the PUT_OK's sum itself (TSDB_ERR_IO when it differs): 0 means it answered sum */
+        /* chunksrv_put_remote compares the PUT_OK's body itself (TSDB_ERR_IO when it differs): 0 means it answered
+         * the hash of this meta and sum */
         rc = chunksrv_put_remote(cs, node, m, fd, base, sum, timeout_ms);
-        if (rc == 0)
-            *answered = sum;
+        if (rc == 0) {
+            uint8_t meta[CS_PUT_META_LEN];
+            cs_put_meta_encode(m, meta);
+            *answered = cs_put_answer_hash(meta, sum);
+        }
     }
     if (hold_hook_ms > 0) /* TSDB_CHUNKPEER_TEST=holdput=MS: a put in flight across tsdbd's shutdown (test_cluster) */
         hold_hook(cs);

@@ -1,17 +1,20 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * The data links (server/peerlink.c, docs/design-cluster.md C25): two endpoints in one process over 127.0.0.1, no
- * tsdbd. Usage: test_peerlink SCRATCHDIR [--quick] [--only NAME] [--mutant NAME] (the planted bugs of peerlink.h's PL_MUT_*, each of which must fail its test)
- * [--bench].
+ * tsdbd. Usage: test_peerlink SCRATCHDIR [--quick] [--only NAME[,NAME...]] [--mutant NAME] (the planted bugs of peerlink.h's PL_MUT_*, each of which must fail its test)
+ * [--check none|header|full] (every node's frame check level, plcheck.h; default none) [--bench].
  *
- *   codec        frames encoded, split at random, decoded; a flipped bit, a repeated or a swapped frame ends the
- *                stream; the streaming xxh64 equals xxh64()
+ *   codec        frames encoded, split at random, decoded at each check level; under full a flipped bit, under header
+ *                one in the length, type or the payload's head, and under both a repeated or a swapped frame end the
+ *                stream; under none nothing crashes; the streaming xxh64 equals xxh64()
  *   log          log frames arrive in order and whole (random and compressible ones, zstd on the wire); an echo
  *   bulk         a file arrives whole with its xxh64; a metadata and a size are what the sender gave
  *   resume       the connection is cut twice in the middle of a file (an in-test proxy): the file completes from the
  *                receiver's offset, the last attempt sends less than the file
  *   secret       a peer with another secret never comes up; a peer that is not the node id asked for neither
- *   flip         a byte flipped on the wire ends the link and is never delivered (mutant notag delivers it)
+ *   flip         under a check (full, or the run's header), a byte flipped on the wire ends the link and is never
+ *                delivered (mutant notag delivers it)
+ *   levels       every pair of check levels: the link runs at the stronger, both ends say so, frames go through
  *   blackhole    a pair behind a blackholing proxy exchanges nothing, goes down, and reconnects once healed
  *   backpressure a receiver that stops reading: the sender's queue stops at its bound (mutant nobackpressure does
  *                not), a timed send waits and gives up
@@ -181,8 +184,8 @@ static void test_check_kat(void)
         gen *= 11400714785074694797ull; /* PRIME64_1 */
     }
     for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) {
-        uint8_t out[PL_CHECK_LEN];
-        pl_check(PL_CHECK_XXH3, 0x9E3779B185EBCA8Dull, buf, v[i].len, out);
+        uint8_t out[16];
+        pl_check(0x9E3779B185EBCA8Dull, buf, v[i].len, out);
         uint64_t lo = 0, hi = 0;
         for (int b = 7; b >= 0; b--) {
             lo = lo << 8 | out[b];
@@ -195,9 +198,11 @@ static void test_check_kat(void)
     }
 }
 
-static void test_codec(void)
+/* the codec at one frame check level (plcheck.h): what a check covers ends the stream when flipped, what it does
+ * not cover arrives as it was sent (never a crash, never bytes outside the frame) */
+static void test_codec_at(int ck)
 {
-    test_check_kat();
+    size_t cl = pl_check_len(ck);
     const uint64_t salt = 0x5eed5a17c0ffee01ull;
     enum { NF = 60 };
     uint8_t *orig[NF];
@@ -215,7 +220,7 @@ static void test_codec(void)
             fill_random(orig[i], olen[i], (uint64_t)i + 1);
         else
             fill_text(orig[i], olen[i], (uint64_t)i);
-        flen[i] = pl_frame_encode(PL_CHECK_XXH3, salt, &seq, i % 3 != 0, otype[i], orig[i], olen[i], &fr[i]);
+        flen[i] = pl_frame_encode(ck, salt, &seq, i % 3 != 0, otype[i], orig[i], olen[i], &fr[i]);
         CHECK(flen[i] != 0);
     }
     size_t total = 0;
@@ -231,7 +236,7 @@ static void test_codec(void)
 
     /* the whole stream, split at random */
     for (int rep = 0; rep < 5; rep++) {
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+        struct pl_reader *r = pl_reader_new(ck, salt, 0);
         struct collect c = {0};
         CHECK(feed_split(r, stream, total, &c, &rs) == 0);
         CHECK(c.n == NF);
@@ -241,14 +246,16 @@ static void test_codec(void)
         pl_reader_free(r);
     }
     /* another connection's salt (the frames of an earlier connection replayed into a new one): nothing is delivered */
-    {
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt ^ 1, 0);
+    if (ck != PL_CHECK_NONE) {
+        struct pl_reader *r = pl_reader_new(ck, salt ^ 1, 0);
         struct collect c = {0};
         CHECK(feed_split(r, stream, total, &c, &rs) < 0 && c.n == 0);
         collect_free(&c);
         pl_reader_free(r);
     }
-    /* a flipped bit anywhere: the frames before it come through, it and what follows never do */
+    /* a flipped bit anywhere: the frames before it come through; under full it and what follows never do, under
+     * header the flipped frame may arrive only with its type, length and first PL_CHECK_SPAN bytes intact (a flip in
+     * the rest of its payload), under none it may arrive changed (the wire is trusted) but nothing crashes */
     for (int rep = 0; rep < 300; rep++) {
         uint8_t *bad = malloc(total);
         memcpy(bad, stream, total);
@@ -257,18 +264,25 @@ static void test_codec(void)
         int hit = 0;
         while (hit + 1 < NF && at[hit + 1] <= pos)
             hit++;
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+        struct pl_reader *r = pl_reader_new(ck, salt, 0);
         struct collect c = {0};
         feed_split(r, bad, total, &c, &rs);
-        CHECK(c.n <= hit);
-        for (int i = 0; i < c.n && i < NF; i++)
-            CHECK(c.len[i] == olen[i] && memcmp(c.data[i], orig[i], olen[i]) == 0);
+        if (ck == PL_CHECK_FULL)
+            CHECK(c.n <= hit);
+        for (int i = 0; i < c.n && i < NF; i++) {
+            if (i < hit || ck == PL_CHECK_FULL || (ck == PL_CHECK_HEADER && i > hit))
+                CHECK(c.type[i] == otype[i] && c.len[i] == olen[i] && memcmp(c.data[i], orig[i], olen[i]) == 0);
+            else if (ck == PL_CHECK_HEADER && i == hit) {
+                size_t h = olen[i] < PL_CHECK_SPAN ? olen[i] : PL_CHECK_SPAN;
+                CHECK(c.type[i] == otype[i] && c.len[i] == olen[i] && memcmp(c.data[i], orig[i], h) == 0);
+            }
+        }
         collect_free(&c);
         pl_reader_free(r);
         free(bad);
     }
     /* a repeated frame and two swapped ones */
-    for (int mode = 0; mode < 2; mode++) {
+    for (int mode = 0; mode < 2 && ck != PL_CHECK_NONE; mode++) {
         int k = 5 + (int)(rng_next(&rs) % 40);
         size_t cut = at[k] + flen[k];
         uint8_t *bad = malloc(total + flen[k]);
@@ -286,7 +300,7 @@ static void test_codec(void)
             memcpy(bad + e, stream + e, total - e);
             w = total;
         }
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+        struct pl_reader *r = pl_reader_new(ck, salt, 0);
         struct collect c = {0};
         CHECK(feed_split(r, bad, w, &c, &rs) < 0);
         CHECK(c.n <= k + 1);
@@ -294,18 +308,20 @@ static void test_codec(void)
         pl_reader_free(r);
         free(bad);
     }
-    /* every bit of the length, the type and the 16 check bytes of the middle frame of three, flipped one at a time
-     * (the random flips above seldom land there): the first frame comes through, the flipped one never. Small and
-     * large, compressed and not: a type left out of the check would deliver the payload under another type, a
-     * compare of part of the check would take a flip in the rest */
-    for (int v = 0; v < 4; v++) {
+    /* every bit of the length, the type and the check bytes of the middle frame of three, flipped one at a time
+     * (the random flips above seldom land there), and under header every bit of an uncompressed payload's first
+     * PL_CHECK_SPAN bytes: the first frame comes through, the flipped one never. Small and large, compressed and not:
+     * a type left out of the check would deliver the payload under another type, a compare of part of the check would
+     * take a flip in the rest. Under header a flip just past the span arrives (the check covers a header, not the
+     * bytes), under full it does not */
+    for (int v = 0; v < 4 && ck != PL_CHECK_NONE; v++) {
         static const size_t vlen[] = {0, 80, 5000, 70000};
         uint8_t *pay = malloc(vlen[v] + 1), *f3[3];
         size_t n3[3];
         uint64_t sq = 0;
         fill_text(pay, vlen[v], (uint64_t)v);
         for (int i = 0; i < 3; i++) {
-            n3[i] = pl_frame_encode(PL_CHECK_XXH3, salt, &sq, v & 1, (uint8_t)(0x21 + i), pay, vlen[v], &f3[i]);
+            n3[i] = pl_frame_encode(ck, salt, &sq, v & 1, (uint8_t)(0x21 + i), pay, vlen[v], &f3[i]);
             CHECK(n3[i] != 0);
         }
         size_t w = n3[0] + n3[1] + n3[2];
@@ -313,17 +329,21 @@ static void test_codec(void)
         memcpy(s3, f3[0], n3[0]);
         memcpy(s3 + n3[0], f3[1], n3[1]);
         memcpy(s3 + n3[0] + n3[1], f3[2], n3[2]);
-        size_t pos[4 + 1 + PL_CHECK_LEN];
+        size_t pos[4 + 1 + PL_CHECK_LEN_MAX + PL_CHECK_SPAN];
         int np = 0;
         for (int i = 0; i < 5; i++) /* length, type */
             pos[np++] = n3[0] + (size_t)i;
-        for (int i = 0; i < PL_CHECK_LEN; i++)
-            pos[np++] = n3[0] + n3[1] - PL_CHECK_LEN + (size_t)i;
+        for (size_t i = 0; i < cl; i++)
+            pos[np++] = n3[0] + n3[1] - cl + i;
+        int plain = n3[1] == 4 + 1 + vlen[v] + cl; /* not compressed: the payload is on the wire as it was given */
+        if (plain)
+            for (size_t i = 0; i < vlen[v] && i < PL_CHECK_SPAN; i++)
+                pos[np++] = n3[0] + 5 + i;
         int bad = 0;
         for (int i = 0; i < np; i++)
             for (int bit = 0; bit < 8; bit++) {
                 s3[pos[i]] ^= (uint8_t)(1u << bit);
-                struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+                struct pl_reader *r = pl_reader_new(ck, salt, 0);
                 struct collect c = {0};
                 pl_reader_feed(r, s3, w, collect_msg, &c);
                 if (c.n != 1 || c.type[0] != 0x21 || c.len[0] != vlen[v])
@@ -333,9 +353,20 @@ static void test_codec(void)
                 s3[pos[i]] ^= (uint8_t)(1u << bit);
             }
         if (bad)
-            fprintf(stderr, "  codec: %zu bytes%s: %d of %d single-bit flips of length, type or check were taken\n",
-                    vlen[v], v & 1 ? " compressed" : "", bad, np * 8);
+            fprintf(stderr, "  codec %s: %zu bytes%s: %d of %d single-bit flips of length, type, head or check were "
+                    "taken\n", pl_check_name(ck), vlen[v], plain ? "" : " compressed", bad, np * 8);
         CHECK(bad == 0);
+        if (plain && vlen[v] > PL_CHECK_SPAN) { /* the first byte past the span */
+            s3[n3[0] + 5 + PL_CHECK_SPAN] ^= 1;
+            struct pl_reader *r = pl_reader_new(ck, salt, 0);
+            struct collect c = {0};
+            int rc = pl_reader_feed(r, s3, w, collect_msg, &c);
+            CHECK(ck == PL_CHECK_HEADER ? rc == 0 && c.n == 3 && c.data[1][PL_CHECK_SPAN] != pay[PL_CHECK_SPAN]
+                                        : rc < 0 && c.n == 1);
+            collect_free(&c);
+            pl_reader_free(r);
+            s3[n3[0] + 5 + PL_CHECK_SPAN] ^= 1;
+        }
         for (int i = 0; i < 3; i++)
             free(f3[i]);
         free(s3);
@@ -343,16 +374,16 @@ static void test_codec(void)
     }
     /* a frame replayed from further back: one encoded as frame d of its direction, read where frame 0 is due. Each
      * distance must be refused, the whole 64-bit number counts (a seed of its low 8 or 32 bits takes 256 or 2^32) */
-    {
+    if (ck != PL_CHECK_NONE) {
         static const uint64_t dist[] = {0, 1, 255, 256, 65536, 1ull << 32, 1ull << 63};
         uint8_t pay[100];
         fill_random(pay, sizeof pay, 7);
         for (size_t i = 0; i < sizeof dist / sizeof dist[0]; i++) {
             uint64_t sq = dist[i];
             uint8_t *fr1;
-            size_t n1 = pl_frame_encode(PL_CHECK_XXH3, salt, &sq, 0, 0x22, pay, sizeof pay, &fr1);
+            size_t n1 = pl_frame_encode(ck, salt, &sq, 0, 0x22, pay, sizeof pay, &fr1);
             CHECK(n1 != 0);
-            struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+            struct pl_reader *r = pl_reader_new(ck, salt, 0);
             struct collect c = {0};
             int rc = pl_reader_feed(r, fr1, n1, collect_msg, &c);
             if ((dist[i] == 0) != (rc == 0 && c.n == 1))
@@ -367,7 +398,7 @@ static void test_codec(void)
     /* a frame whose length field is above the cap ends the stream at once */
     {
         uint8_t hdr[8] = {0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0};
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, salt, 0);
+        struct pl_reader *r = pl_reader_new(ck, salt, 0);
         struct collect c = {0};
         CHECK(pl_reader_feed(r, hdr, sizeof hdr, collect_msg, &c) < 0);
         pl_reader_free(r);
@@ -415,6 +446,16 @@ static void test_codec(void)
         CHECK(pl_msg_decode(0x81, body, 4 + zn, &m, &own) == 0 && m.n == 900); /* the right size passes */
         free(own);
     }
+}
+
+static void test_codec(void)
+{
+    test_check_kat();
+    for (int ck = PL_CHECK_NONE; ck <= PL_CHECK_FULL; ck++)
+        test_codec_at(ck);
+    /* the levels and their HELLO offers: each end offers what is at or above its level */
+    CHECK(pl_check_offer(PL_CHECK_NONE) == PL_CHECKS_KNOWN && pl_check_offer(PL_CHECK_FULL) == 1u << PL_CHECK_FULL);
+    CHECK(pl_check_len(PL_CHECK_NONE) == 0 && pl_check_len(PL_CHECK_HEADER) == 8 && pl_check_len(PL_CHECK_FULL) == 16);
 }
 
 /* ---------------------------------------------------------------- a node: a peerlink with recording callbacks */
@@ -608,6 +649,8 @@ static void rec_sent(void *arg, struct plink *l, uint64_t token, uint64_t gen, i
     atomic_store(&nd->sent_gen[token], gen);
 }
 
+static int g_check; /* --check: every node's frame check level (plcheck.h; 0: the default, none) */
+
 static struct node *node_new(uint32_t id, const uint8_t *secret, struct pl_cfg *over, int listen_it)
 {
     struct node *nd = calloc(1, sizeof *nd);
@@ -622,6 +665,8 @@ static struct node *node_new(uint32_t id, const uint8_t *secret, struct pl_cfg *
     memset(&c, 0, sizeof c);
     if (over)
         c = *over;
+    if (!c.check)
+        c.check = g_check;
     c.self.id = id;
     memset(c.self.uuid, g_uuid_byte, 16); /* one cluster: one uuid */
     memset(c.self.ident, 0xB0 + (int)id, 16);
@@ -1112,22 +1157,28 @@ static void test_secret(void)
     node_free(a);
 }
 
+/* under a check (full, or header with frames short enough that it covers every byte; the run's --check when it names
+ * one, else full: under none a flipped payload byte is delivered, the wire is trusted) */
 static void test_flip(void)
 {
-    struct node *a = node_new(1, SECRET, NULL, 1), *b = node_new(2, SECRET, NULL, 0);
+    struct pl_cfg o = {.check = g_check > PL_CHECK_NONE ? g_check : PL_CHECK_FULL};
+    size_t fl = o.check == PL_CHECK_HEADER ? 200 : 1500; /* header: 4 + 1 + 200 + 8 bytes, all covered */
+    struct node *a = node_new(1, SECRET, &o, 1), *b = node_new(2, SECRET, &o, 0);
     a->strict = 0; /* a drop loses frames; the order inside a connection must still hold */
     struct proxy *px = proxy_new(a->port);
     struct plink *l = dial(b, 1, px->port, PL_KIND_LOG);
     CHECK(WAIT_FOR(plink_up(l) && a->ups >= 1, 3000));
-    CHECK(send_frames(l, 1, 0, 20, 1500, 1000) == PL_OK);
+    CHECK(plink_check(l) == o.check);
+    CHECK(send_frames(l, 1, 0, 20, fl, 1000) == PL_OK);
     CHECK(WAIT_FOR(a->frames_in == 20, 3000));
     int downs0 = a->downs, ups0 = b->ups;
     atomic_store(&px->flip, 1);
-    /* 1500-byte random frames: byte 200 of the next read is inside a payload (a frame is 1537 bytes) */
+    /* random frames: byte 200 of the next read is inside a frame's checked bytes (1500: its payload) */
     uint64_t sent_to = 20;
+    int per = o.check == PL_CHECK_HEADER ? 4 : 1; /* the proxy flips in reads of 300 bytes or more */
     for (int i = 0; i < 40; i++) {
-        send_frames(l, 1, sent_to, 1, 1500, 100);
-        sent_to++;
+        send_frames(l, 1, sent_to, per, fl, 100);
+        sent_to += (uint64_t)per;
         usleep(3000);
     }
     CHECK(WAIT_FOR(a->downs > downs0, 3000)); /* the acceptor ended the link */
@@ -1351,6 +1402,70 @@ static void bench_hash(void)
     free(buf);
 }
 
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+static uint32_t crc32c_hw(const uint8_t *p, size_t n)
+{
+    uint64_t c = 0xffffffffu;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        c = _mm_crc32_u64(c, w);
+    }
+    for (; i < n; i++)
+        c = _mm_crc32_u8((uint32_t)c, p[i]);
+    return (uint32_t)c ^ 0xffffffffu;
+}
+#endif
+
+/* what a frame's check costs on one core, per level (design-rdma.md 6): header hashes at most 265 bytes whatever the
+ * frame's size; full hashes every byte. CRC32C (SSE4.2) over the same 265 bytes is the candidate header did not take. */
+static void bench_check(void)
+{
+    size_t sizes[] = {80, 265, 4096, 65536, 1u << 20};
+    uint8_t *buf = malloc(1u << 20);
+    fill_random(buf, 1u << 20, 3);
+    for (int rep = 0; rep < 3; rep++) {
+        for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            size_t n = sizes[si];
+            long iters = (long)((256u << 20) / n);
+            if (iters > 4000000)
+                iters = 4000000;
+            volatile uint8_t sink = 0;
+            uint8_t out[16];
+            uint64_t t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                pl_check_header((uint64_t)i, (uint32_t)n, 4, NULL, 0, buf, n, NULL, 0, out);
+                sink ^= out[0];
+            }
+            double hs = secs(t);
+            t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                pl_check((uint64_t)i, buf, n, out);
+                sink ^= out[0];
+            }
+            double fs = secs(t);
+            double cs = 0;
+#ifdef __SSE4_2__
+            size_t cn = n < 265 ? n : 265;
+            t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                buf[0] = (uint8_t)i;
+                sink ^= (uint8_t)crc32c_hw(buf, cn);
+            }
+            cs = secs(t);
+#endif
+            (void)sink;
+            printf("  bench check rep %d size %zu: header %.1f ns/frame, full %.1f ns/frame (%.0f MB/s), crc32c of the "
+                   "header's span %.1f ns/frame\n",
+                   rep + 1, n, hs * 1e9 / (double)iters, fs * 1e9 / (double)iters, (double)n * (double)iters / 1e6 / fs,
+                   cs * 1e9 / (double)iters);
+        }
+    }
+    free(buf);
+}
+
 static void bench_bulk(uint32_t chunk, size_t size, int reps)
 {
     char src[600];
@@ -1426,7 +1541,9 @@ static void bench_log(int reps, size_t len)
 
 static void bench(void)
 {
+    printf("  bench at check level %s\n", pl_check_name(g_check ? g_check : PL_CHECK_NONE));
     bench_hash();
+    bench_check();
     size_t size = 512u << 20;
     uint32_t chunks[] = {64u << 10, 256u << 10, 1u << 20, 4u << 20};
     for (int i = 0; i < 4; i++)
@@ -1693,8 +1810,8 @@ static int salt_reads(uint64_t so, uint64_t si)
     uint8_t pay[64], *fr;
     uint64_t sq = 0;
     fill_random(pay, sizeof pay, so);
-    size_t n = pl_frame_encode(PL_CHECK_XXH3, so, &sq, 0, 0x22, pay, sizeof pay, &fr);
-    struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, si, 0);
+    size_t n = pl_frame_encode(PL_CHECK_FULL, so, &sq, 0, 0x22, pay, sizeof pay, &fr);
+    struct pl_reader *r = pl_reader_new(PL_CHECK_FULL, si, 0);
     struct collect c = {0};
     int ok = n && pl_reader_feed(r, fr, n, collect_msg, &c) == 0 && c.n == 1;
     collect_free(&c);
@@ -1769,20 +1886,64 @@ static int raw_frame(int fd, int ms, uint8_t *body, size_t cap, size_t *n)
     return h[4];
 }
 
+/* the frame check levels (plcheck.h): a link runs at the stronger of its two ends' levels, both ends say so
+ * (plink_check, the stats' gauge), and frames go through at every pair of levels, a file on the bulk link too */
+static void test_levels(void)
+{
+    for (int x = PL_CHECK_NONE; x <= PL_CHECK_FULL; x++)
+        for (int y = PL_CHECK_NONE; y <= PL_CHECK_FULL; y++) {
+            struct pl_cfg ox = {.check = x}, oy = {.check = y};
+            /* the process's gauge (STATUS's "peer links", the metrics port): both ends are in this process, +2 while
+             * the link is up and back to where it was once both are gone (review F5: a missing -1 at link down) */
+            uint64_t g0[PL_NKINDS][4], g[PL_NKINDS][4];
+            peerlink_up_by_check(g0);
+            struct node *a = node_new(1, SECRET, &ox, 1), *b = node_new(2, SECRET, &oy, 0);
+            struct plink *l = dial(b, 1, a->port, PL_KIND_LOG);
+            struct plink *al = NULL;
+            CHECK(WAIT_FOR(plink_up(l) && (al = peerlink_find(a->pl, 2, PL_KIND_LOG)) != NULL && plink_up(al), 3000));
+            int want = x > y ? x : y;
+            if (al && (plink_check(l) != want || plink_check(al) != want))
+                fprintf(stderr, "  levels: %s acceptor, %s dialer: link at %s and %s, want %s\n", pl_check_name(x),
+                        pl_check_name(y), pl_check_name(plink_check(al)), pl_check_name(plink_check(l)),
+                        pl_check_name(want));
+            CHECK(plink_check(l) == want && al && plink_check(al) == want);
+            struct pl_stats sa, sb;
+            peerlink_stats(a->pl, &sa);
+            peerlink_stats(b->pl, &sb);
+            CHECK(sa.up_check[want] == 1 && sb.up_check[want] == 1);
+            peerlink_up_by_check(g);
+            CHECK(g[PL_KIND_LOG][want] == g0[PL_KIND_LOG][want] + 2);
+            CHECK(send_frames(l, 1, 0, 30, 700, 1000) == PL_OK);
+            CHECK(WAIT_FOR(a->frames_in == 30, 3000));
+            CHECK(a->bad_frames == 0 && a->order_bad == 0);
+            node_free(b);
+            CHECK(WAIT_FOR(!plink_up(al), 3000));
+            peerlink_stats(a->pl, &sa);
+            CHECK(sa.up_check[want] == 0);
+            node_free(a);
+            peerlink_up_by_check(g);
+            CHECK(g[PL_KIND_LOG][want] == g0[PL_KIND_LOG][want]);
+        }
+}
+
 /* what the DIALER checks of a HELLO_ACK, played by a raw acceptor that holds the secret (the acceptor's own choice would
  * hide a missing check): the ACK naming the type offered gets AUTH, one naming a type it did not offer (7, which a later
- * build might choose) ends the handshake before AUTH */
+ * build might choose) ends the handshake before AUTH, and so does one naming a type below the dialer's level (none to
+ * a dialer of level header: its frames would go unchecked) */
 static void test_dialtype(void)
 {
+    struct pl_cfg o = {.check = PL_CHECK_HEADER};
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa = {.sin_family = AF_INET};
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     socklen_t sl = sizeof sa;
     CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 4) == 0 &&
           getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
-    struct node *d = node_new(2, SECRET, NULL, 0);
+    struct node *d = node_new(2, SECRET, &o, 0);
     dial(d, 1, ntohs(sa.sin_port), PL_KIND_LOG);
-    for (int choice = PL_CHECK_XXH3, round = 0; round < 2; round++, choice = 7) {
+    static const int choices[] = {PL_CHECK_HEADER, 7, PL_CHECK_NONE, PL_CHECK_FULL};
+    for (int round = 0; round < 4; round++) {
+        int choice = choices[round];
         struct pollfd pf = {lfd, POLLIN, 0};
         CHECK(poll(&pf, 1, 3000) == 1);
         int fd = accept(lfd, NULL, NULL);
@@ -1812,7 +1973,7 @@ static void test_dialtype(void)
         CHECK(write(fd, fr, sizeof fr) == (ssize_t)sizeof fr);
         int t = raw_frame(fd, 3000, body, sizeof body, &bn);
         printf("  dialtype: an ACK choosing check type %d gets %d (3: AUTH, -1: closed)\n", choice, t);
-        CHECK(choice == PL_CHECK_XXH3 ? t == 3 && bn == 32 : t == -1);
+        CHECK(choice == PL_CHECK_HEADER || choice == PL_CHECK_FULL ? t == 3 && bn == 32 : t == -1);
         close(fd);
     }
     node_free(d);
@@ -1954,6 +2115,51 @@ static void test_badchunk(void)
     node_free(b);
     node_free(a);
     unlink(dst);
+}
+
+/* a DONE whose status is no PL_* code (a flipped bit: the frames carry no check by default) ends the connection, and the
+ * file is sent again on the next one; it never reaches `done` as a status no caller knows */
+static void donestatus_run(int32_t bad)
+{
+    char src[600], dst[600];
+    pathf(src, sizeof src, "ds-src");
+    pathf(dst, sizeof dst, "ds-dst");
+    size_t size = 256u << 10;
+    int sfd = open(src, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(sfd >= 0);
+    uint8_t *buf = malloc(size);
+    CHECK(buf != NULL);
+    for (size_t i = 0; i < size; i++)
+        buf[i] = (uint8_t)(i * 31 + 7);
+    CHECK(write(sfd, buf, size) == (ssize_t)size);
+    free(buf);
+    struct node *a = node_new(1, SECRET, NULL, 1), *b = node_new(2, SECRET, NULL, 0);
+    snprintf(a->path, sizeof a->path, "%s", dst);
+    struct plink *l = dial(b, 1, a->port, PL_KIND_BULK);
+    CHECK(WAIT_FOR(plink_up(l) && a->ups >= 1, 3000));
+    int downs0 = atomic_load(&b->downs);
+    /* the receiver's first DONE (after every byte and its hash, so in the sender's WAITDONE) says `bad`, no PL_* code */
+    __atomic_store_n(&peerlink_test_done_status, bad, __ATOMIC_RELAXED);
+    struct jres r = {0};
+    CHECK(bulk_send_id(l, 9, sfd, size, "m", &r) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&r.done), 20000));
+    printf("  donestatus: status %d after %d downs\n", r.status, (int)atomic_load(&b->downs) - downs0);
+    CHECK(__atomic_load_n(&peerlink_test_done_status, __ATOMIC_RELAXED) == 0); /* the bad DONE went out */
+    CHECK(r.status == PL_OK);
+    CHECK(atomic_load(&b->downs) > downs0);
+    CHECK(r.file == 9);
+    node_free(b);
+    node_free(a);
+    close(sfd);
+    unlink(src);
+    unlink(dst);
+}
+
+/* 1 above PL_OK, and one below the lowest PL_E_* code (review F5: a check of the upper end alone passed 1) */
+static void test_donestatus(void)
+{
+    donestatus_run(1);
+    donestatus_run(PL_E_GIVEUP - 1);
 }
 
 /* a new connection of a peer whose old connection is still up (a restarted server, a redial the acceptor has not
@@ -2574,6 +2780,64 @@ static void test_fwdslow(void)
 
 /* FWDQ streams: the span of a frame's deadline applies again after a chunk while the owner holds credit; a cancel
  * ends the owner's stream; a chunk that found no queue room keeps its credit and, the last, its stream */
+/* With the link's frame check off (the default), a flipped bit of a reply's frame id must not land the reply on
+ * another frame in flight on the same connection: the id's check word ends the connection, and neither waiter gets
+ * the other's reply (both frames are LOST, indeterminate). Also a chunk of a FWDQ stream. Mutant noidcheck. */
+static void test_fwdflip(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    struct fwd *A, *B;
+    fwd_pair(&A, &ra, &B, &rb, NULL);
+    struct fwd_stats st0, st1;
+    fwd_stats(A, &st0);
+    struct fwd_msg m = {PL_KIND_FWD, "w", 1};
+    CHECK(fwd_send(A, 2, &m, 40, in_ms(5000)) == FWD_OK && fwd_send(A, 2, &m, 41, in_ms(5000)) == FWD_OK);
+    struct fwd_ev q40 = {0}, q41 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 40, 0, &q40) >= 0 && frec_find(&rb, FWD_EV_REQUEST, 41, 0, &q41) >= 0,
+                   2000));
+    atomic_store(&fwd_test_flip_reply, 1); /* 40 ^ 1 = 41: the reply to 40 arrives naming 41 */
+    CHECK(fwd_reply(B, &q40.from, 40, "for40", 5) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_LOST, 40) + frec_count(&ra, FWD_EV_LOST, 41) +
+                           frec_count(&ra, FWD_EV_REPLY, 40) + frec_count(&ra, FWD_EV_REPLY, 41) ==
+                       2,
+                   3000));
+    int r40 = frec_count(&ra, FWD_EV_REPLY, 40), r41 = frec_count(&ra, FWD_EV_REPLY, 41);
+    fwd_stats(A, &st1);
+    printf("  fwdflip: a reply to 40 arriving as 41: replies 40/41 %d/%d, lost %d/%d, refused %" PRIu64 "\n", r40, r41,
+           frec_count(&ra, FWD_EV_LOST, 40), frec_count(&ra, FWD_EV_LOST, 41), st1.refused - st0.refused);
+    CHECK(r41 == 0); /* 41's waiter never gets 40's reply */
+    CHECK(r40 == 0 && frec_count(&ra, FWD_EV_LOST, 40) == 1 && frec_count(&ra, FWD_EV_LOST, 41) == 1);
+    CHECK(st1.refused == st0.refused + 1);
+    /* the link comes back and serves */
+    CHECK(WAIT_FOR(fwd_link_up(A, 2, PL_KIND_FWD), 3000));
+    CHECK(fwd_send(A, 2, &m, 42, in_ms(3000)) == FWD_OK);
+    struct fwd_ev q42 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 42, 0, &q42) >= 0, 3000));
+    CHECK(fwd_reply(B, &q42.from, 42, "for42", 5) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_REPLY, 42) == 1, 3000));
+
+    /* a chunk of stream 50 arriving as stream 51's */
+    struct fwd_msg mq = {PL_KIND_FWDQ, "q", 1};
+    CHECK(fwd_send(A, 2, &mq, 50, in_ms(5000)) == FWD_OK && fwd_send(A, 2, &mq, 51, in_ms(5000)) == FWD_OK);
+    struct fwd_ev q50 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 50, 0, &q50) >= 0 && frec_find(&rb, FWD_EV_REQUEST, 51, 0, NULL) >= 0,
+                   2000));
+    atomic_store(&fwd_test_flip_reply, 50 ^ 51);
+    CHECK(fwd_chunk(B, &q50.from, 50, "c50", 3, 0, 2000) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_LOST, 50) + frec_count(&ra, FWD_EV_LOST, 51) +
+                           frec_count(&ra, FWD_EV_CHUNK, 50) + frec_count(&ra, FWD_EV_CHUNK, 51) >=
+                       2,
+                   3000));
+    printf("  fwdflip: a chunk of 50 arriving as 51: chunks 50/51 %d/%d, lost %d/%d\n", frec_count(&ra, FWD_EV_CHUNK, 50),
+           frec_count(&ra, FWD_EV_CHUNK, 51), frec_count(&ra, FWD_EV_LOST, 50), frec_count(&ra, FWD_EV_LOST, 51));
+    CHECK(frec_count(&ra, FWD_EV_CHUNK, 51) == 0 && frec_count(&ra, FWD_EV_CHUNK, 50) == 0);
+    CHECK(frec_count(&ra, FWD_EV_LOST, 50) == 1 && frec_count(&ra, FWD_EV_LOST, 51) == 1);
+    fwd_free(A);
+    fwd_free(B);
+}
+
 static void test_fwdstream(void)
 {
     static struct frec ra, rb;
@@ -2850,10 +3114,15 @@ static void test_fake(void)
     CHECK(WAIT_FOR(a->frames_in == f0 + 64, 5000));
     CHECK(a->bad_frames == 0 && a->order_bad == 0);
 
-    /* a byte flipped in transit: the receiver's check ends the connection, both ends go down */
-    plf_set_flip(p, 1, plf_total(p, 1) + 700);
+    /* a byte flipped in transit: the receiver's check ends the connection, both ends go down. Under none a payload
+     * byte would arrive flipped (the wire is trusted): the flip lands in the next frame's length field, whose bound
+     * ends it; under header in a 200-byte frame's covered head, under full in a payload */
+    int ckl = g_check ? g_check : PL_CHECK_NONE;
+    size_t fl = ckl == PL_CHECK_HEADER ? 200 : 1000;
+    CHECK(plink_check(l) == ckl && plink_check(al) == ckl);
+    plf_set_flip(p, 1, plf_total(p, 1) + (ckl == PL_CHECK_NONE ? 4 : ckl == PL_CHECK_HEADER ? 140 : 700));
     uint64_t f1 = a->frames_in;
-    CHECK(send_frames(l, 1, 64, 10, 1000, 1000) == PL_OK);
+    CHECK(send_frames(l, 1, 64, 10, fl, 1000) == PL_OK);
     CHECK(WAIT_FOR(a->downs == 1 && b->downs == 1, 5000));
     CHECK(a->frames_in < f1 + 10 && a->bad_frames == 0 && a->order_bad == 0);
     CHECK(!plink_up(l) && !plink_up(al));
@@ -3001,6 +3270,16 @@ static void test_fakeend(void)
     node_free(a);
 }
 
+/* --only NAME[,NAME...] */
+static int only_has(const char *only, const char *name)
+{
+    size_t n = strlen(name);
+    for (const char *p = only; p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL)
+        if (!strncmp(p, name, n) && (p[n] == ',' || p[n] == 0))
+            return 1;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL;
@@ -3012,9 +3291,15 @@ int main(int argc, char **argv)
             do_bench = 1;
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
             only = argv[++i];
+        else if (!strcmp(argv[i], "--check") && i + 1 < argc) {
+            if ((g_check = pl_check_parse(argv[++i])) < 0) {
+                fprintf(stderr, "test_peerlink: --check none|header|full\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
             const char *m = argv[++i];
-            if (!strcmp(m, "notag")) {
+            if (!strcmp(m, "notag")) { /* (flip runs under a check whatever --check says) */
                 peerlink_mutant = PL_MUT_NOTAG;
                 only = "flip";
             } else if (!strcmp(m, "noseq")) {
@@ -3095,6 +3380,9 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "chunkfirst")) {
                 fwd_mutant = FWD_MUT_CHUNKFIRST;
                 only = "fwdstream";
+            } else if (!strcmp(m, "noidcheck")) {
+                fwd_mutant = FWD_MUT_NOIDCHECK;
+                only = "fwdflip";
             } else if (!strcmp(m, "wbwritten")) {
                 peerlink_mutant = PL_MUT_WBWRITTEN;
                 only = "wbcut";
@@ -3113,6 +3401,15 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "nhandall")) {
                 peerlink_mutant = PL_MUT_NHANDALL;
                 only = "fake";
+            } else if (!strcmp(m, "donestatus")) {
+                peerlink_mutant = PL_MUT_DONESTATUS;
+                only = "donestatus";
+            } else if (!strcmp(m, "statusneg")) {
+                peerlink_mutant = PL_MUT_STATUSNEG;
+                only = "donestatus";
+            } else if (!strcmp(m, "updownleak")) {
+                peerlink_mutant = PL_MUT_UPDOWNLEAK;
+                only = "levels";
             } else if (!strcmp(m, "kindbucket")) {
                 peerlink_mutant = PL_MUT_KINDBUCKET;
                 only = "kindrate";
@@ -3134,16 +3431,16 @@ int main(int argc, char **argv)
     }
     static const struct tcase cases[] = {
         {"codec", test_codec},   {"log", test_log},         {"bulk", test_bulk},
-        {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip},
-        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"salts", test_salts}, {"dialtype", test_dialtype}, {"endhash", test_endhash},
+        {"resume", test_resume}, {"secret", test_secret},   {"flip", test_flip}, {"levels", test_levels},
+        {"blackhole", test_blackhole}, {"backpressure", test_backpressure}, {"backlog", test_backlog}, {"latency", test_latency}, {"kick", test_kick}, {"dataerr", test_dataerr}, {"slowcb", test_slowcb}, {"chain", test_chain}, {"rawauth", test_rawauth}, {"salts", test_salts}, {"dialtype", test_dialtype}, {"endhash", test_endhash}, {"donestatus", test_donestatus},
         {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
-        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut}, {"fake", test_fake},
+        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"fwdflip", test_fwdflip}, {"wbcut", test_wbcut}, {"fake", test_fake},
         {"fakeready", test_fakeready}, {"fakeend", test_fakeend},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        if (only && strcmp(only, cases[i].name) != 0)
+        if (only && !only_has(only, cases[i].name))
             continue;
         int f0 = failures;
         uint64_t t = now_ns();

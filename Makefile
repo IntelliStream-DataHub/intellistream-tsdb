@@ -63,6 +63,8 @@ FUZZ_OBJS_props := props.o cfg.o
 FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
 # the data links' frame check: inline XXH3 (server/plcheck.h, server/xxhash); whoever includes it depends on both
 PLCHECK_HDR := server/plcheck.h server/xxhash/xxhash.h
+# test_peerlink's cases that carry frames on every link kind, run again at the check levels header and full
+PL_KINDS_TESTS := log,bulk,resume,flip,kinds,chunk,fwd,fwdstream,fake,fakeend
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -482,7 +484,8 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_chunk --list "nosums nofence eof settings nosync epochnosync" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # each planted bug must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_chunk --fail --grep 'stream put .* differ from chunk_encode' --list "streamreread" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # pinned to its oracle's line
 	./$(B)/test_chunksrv $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_chunksrv --list "chunknofence chunkselfraise putokearly nocellcheck storeforeign" -- ./$(B)/test_chunksrv --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),for c in header full; do ./$(B)/test_chunksrv $(SCRATCH) --net --check $$c || exit 1; done) # its peer links at the other check levels
+	$(if $(EC_OBJ),$(MUT) --name test_chunksrv --list "chunknofence chunkselfraise putokearly nocellcheck storeforeign nometacheck sumsonly noreqcheck noopmatch norespcheck" -- ./$(B)/test_chunksrv --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_chunkpeer $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_chunkpeer --list "ownepoch nosumcmp staleraise delbeforegc sticky unsuredown" -- ./$(B)/test_chunkpeer --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_chunk_heal $(SCRATCH)
@@ -546,7 +549,8 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
-	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	for c in header full; do ./$(B)/test_peerlink $(SCRATCH) --quick --check $$c --only $(PL_KINDS_TESTS) || exit 1; done # every link kind at the other check levels
+	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall donestatus statusneg updownleak noidcheck" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_margins
 	$(MUT) --name test_margins --list "marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
@@ -1049,7 +1053,8 @@ repld-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/libcrashfs.so
 	    refusedsilent divergeisr snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax \
 	    snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown \
 	    snapstalekeep snapinstallstale snapservebeforeopen snapkeepdiverged snapsetnodefer snapclosekeep \
-	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog
+	    snapdropafter snapnoendafter snapnofence snapdivlogend snapnoleftovers replaystartlog nomsgcheck nometarefuse bulkframes \
+	    metafenceonly noepochbound nodescepoch nodesccmp
 # the replica set change mutants (server/rset.c, cvolset*.c, cset.c; tests/rset_mutants.sh pins each to its FAIL line)
 rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/rset_mutants.sh $(SCRATCH)

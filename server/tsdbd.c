@@ -124,6 +124,7 @@
 #include "chunksrv.h"
 #include "chunkpeer.h"
 #include "fwd.h"
+#include "peerlink.h" /* --peer-check */
 #include "fwdreq.h"
 #include "cvol.h"
 #include "repld.h"
@@ -2632,7 +2633,7 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
 enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
        FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH,
-       FWM_CREATEREAD };
+       FWM_CREATEREAD, FWM_OPKIND, FWM_OPKINDREAD };
 static int fwdx_mutant;
 /* For route_decide alone: the request writes, by auth_ops' R_WRITE or a SERIES or STATE whose `create` byte is set
  * (create_at, which raises its need to R_INSERT). Such a lookup that creates is judged a read by its need alone
@@ -2965,7 +2966,8 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480 +
+                           PL_NKINDS * 100
                      : 0);
     char *t = malloc(cap + 4);
     if (!t) {
@@ -3021,6 +3023,14 @@ static void handle_status(req *r)
                (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000,
                (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000,
                (unsigned long long)ss.kind5_bytes, (unsigned long long)ss.kind2_bytes);
+        /* the peer data links up, by kind and the frame check they run (--peer-check: the stronger end's level) */
+        static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        uint64_t lup[PL_NKINDS][4];
+        peerlink_up_by_check(lup);
+        for (int k = 1; k < PL_NKINDS && at + 160 < cap; k++)
+            ST_PUT("links.%s.none=%llu\nlinks.%s.header=%llu\nlinks.%s.full=%llu\n", lkind[k],
+                   (unsigned long long)lup[k][1], lkind[k], (unsigned long long)lup[k][2], lkind[k],
+                   (unsigned long long)lup[k][3]);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -3993,6 +4003,8 @@ static int fwd_entry(req *r, uint32_t v)
     if (r->len)
         memcpy(m + FWDR_ENV + FWDR_INNER, r->payload, r->len);
     bool rd = !(auth_ops[r->op].need & R_WRITE);
+    if (fwd_knob("opkind"))
+        rd = !rd; /* as a flipped op would arrive: the owner must refuse it on this link */
     struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = m, .n = n,
                          .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1,
                          .arrival_ns = fwdx_mutant == FWM_ARRIVAL ? now_ns() : r->t_arr,
@@ -4222,6 +4234,19 @@ static void fwd_serve(struct fjob *j)
     req r = {.c = &pc, .t_arr = j->t_in};
     if (fwdr_env_decode(j->p, j->n, &e) != 0) {
         atomic_store(&pc.closing, true); /* not ours to read: the entry node closes its client's connection */
+        goto done;
+    }
+    if (((auth_ops[e.op].need & R_WRITE) != 0) != (j->kind == PL_KIND_FWD) && fwdx_mutant != FWM_OPKIND &&
+        !(fwdx_mutant == FWM_OPKINDREAD && j->kind == PL_KIND_FWD)) {
+        /* a write on the read link or a read on the write link: the entry chose the kind by the op (fwd_entry), so
+         * the op or the kind is not what it sent (the link's frame check is off by default). Neither is trusted:
+         * the connection ends, nothing runs and no reply goes, so the entry's frames on it are WRITTEN and lost */
+        static atomic_ulong said;
+        if (atomic_fetch_add(&said, 1) % 1000 == 0)
+            fprintf(stderr, "tsdbd: a forward from node %u with op %u on its %s link: refused, the link reset\n",
+                    j->from.peer, e.op, j->kind == PL_KIND_FWD ? "write" : "read");
+        fwd_refuse(o.f, &j->from);
+        o.f = NULL; /* no fwdo_finish: nothing is sent */
         goto done;
     }
     atomic_store(&pc.proto, e.proto);
@@ -5611,6 +5636,7 @@ int main(int argc, char **argv)
                                    {"fwd-reply-ms", required_argument, 0, 0x112},
                                    {"fwd-workers", required_argument, 0, 0x113},
                                    {"forward", required_argument, 0, 0x114},
+                                   {"peer-check", required_argument, 0, 0x11c},
                                    {"chunk-dir", required_argument, 0, 0x115},
                                    {"chunk-rate-mb-s", required_argument, 0, 0x116},
                                    {"ec-settle-grace-s", required_argument, 0, 0x117},
@@ -5804,6 +5830,16 @@ int main(int argc, char **argv)
             }
             cluster_opts = 1;
             break;
+        case 0x11c: { /* the data links' frame check level (server/plcheck.h): every peerlink of this process */
+            int lv = peerlink_check_parse(optarg);
+            if (lv < 0) {
+                fprintf(stderr, "tsdbd: --peer-check %s: expected none, header or full\n", optarg);
+                return 2;
+            }
+            peerlink_set_check_level(lv);
+            cluster_opts = 1;
+            break;
+        }
         case 0x115:
             if (nchunk >= CHUNKSRV_DIRS_MAX) {
                 fprintf(stderr, "tsdbd: at most %d --chunk-dir\n", CHUNKSRV_DIRS_MAX);
@@ -5935,6 +5971,7 @@ int main(int argc, char **argv)
                         "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off] [--forward on|off] [--fwd-wait-ms 2000]\n"
+                        "              [--peer-check none|header|full]\n"
                         "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
                         "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
@@ -6102,7 +6139,7 @@ int main(int argc, char **argv)
                                             "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
                                             "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
                                             "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
-                                            "fwdcreateread"};
+                                            "fwdcreateread", "fwdopkind", "fwdopkindread"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;
@@ -6219,7 +6256,8 @@ int main(int argc, char **argv)
                           .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL,
                           .snap = cluster_on ? snap_metrics : NULL,
                           .vol_diverged = metrics_vol_diverged,
-                          .margins = cluster_on ? metrics_margins : NULL};
+                          .margins = cluster_on ? metrics_margins : NULL,
+                          .peer_links = cluster_on ? peerlink_up_by_check : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

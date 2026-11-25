@@ -229,8 +229,11 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
         memcpy(m.vuuid, p->vuuid, 16);
         memcpy(m.oid, oid, 16);
         uint64_t sum = cs_sums_hash(sums_out + chunk_sums_base(g, i), chunk_pos_cells(g, i)), answered = 0;
+        uint8_t meta[CS_PUT_META_LEN];
+        cs_put_meta_encode(&m, meta);
         rc = cp->net.put(cp->net.arg, v.stripe[i], &m, s.fd[i], 0, sum, timeout_of(cp), &answered);
-        if (rc == 0 && answered != sum && chunkpeer_mutant != CP_MUT_NOSUMCMP) {
+        /* the answer covers the identity the member took (volume, epoch, position, oid) as well as the sums */
+        if (rc == 0 && answered != cs_put_answer_hash(meta, sum) && chunkpeer_mutant != CP_MUT_NOSUMCMP) {
             fprintf(stderr, "tsdbd: volume %" PRIu32 ": member %" PRIu32 " answered the put of position %u with "
                             "another sum than the chunk's: the put fails\n", p->volume, v.stripe[i], i);
             rc = TSDB_ERR_IO;

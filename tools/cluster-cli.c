@@ -305,6 +305,7 @@ static void print_status(const struct cluster_status *st)
         printf("moves started %" PRIu64 " done %" PRIu64 " cancelled %" PRIu64 "\n", st->tr[CL_TR_MV_STARTED],
                st->tr[CL_TR_MV_DONE], st->tr[CL_TR_MV_CANCELLED]);
     fputs(st->moves, stdout); /* "move volume V node A -> node B: STEP, AGE s", one per move running */
+    fputs(st->links, stdout); /* "peer links KIND: none N header N full N", the answering server's, per kind up */
     meta_free(&m);
 }
 

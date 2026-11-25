@@ -53,14 +53,21 @@ enum { CS_OP_READ = 1, CS_OP_SUMS = 2, CS_OP_LIST = 3, CS_OP_DEL = 4, CS_OP_EPOC
 #define CS_LIST_MAX 4096u        /* entries of one CS_OP_LIST */
 #define CS_LIST_ENTRY 52u        /* oid 16, pos 2, size 8, epoch 8, vuuid 16, status 1, store 1 */
 #define CS_PUT_MAGIC 0x54505343u /* "CSPT" */
-#define CS_PUT_META_LEN 66u /* magic 4, volume 4, epoch 8, vuuid 16, oid 16, pos 2, k 2, m 2, cell 4, len 8 */
+/* magic 4, volume 4, epoch 8, vuuid 16, oid 16, pos 2, k 2, m 2, cell 4, len 8, then xxh64 of those 66 bytes: the data
+ * links carry no frame check by default (`--peer-check none`), and the receiver raises a durable fence from the epoch
+ * here, so the meta checks itself (as a request does, below) */
+#define CS_PUT_META_LEN 74u
+#define CS_CHECK_LEN 8u /* the xxh64 that ends a request and a put meta */
 
 /* A request: [u64 rid][u8 op][u32 volume][u64 epoch] and the op's body:
  *   READ   vuuid 16, oid 16, u16 pos, u64 off, u32 len (1 .. CS_READ_MAX)
  *   SUMS   vuuid 16, oid 16, u16 pos, u64 first, u32 count (1 .. CS_SUMS_MAX)
  *   LIST   u8 has_cursor, oid 16, u16 pos (the last entry seen), u32 max (1 .. CS_LIST_MAX)
  *   DEL    vuuid 16, oid 16, u16 pos
- *   EPOCH  nothing */
+ *   EPOCH  nothing
+ * and an xxh64 of all of that (CS_CHECK_LEN): a request's epoch raises a store's fence durably, so a flipped bit there
+ * must never be acted on. An answer is matched to the pending call by rid AND op; one whose op is not its call's ends
+ * the link (neither call takes it). */
 struct cs_req {
     uint64_t rid;
     uint8_t op;
@@ -98,10 +105,16 @@ struct cs_put_meta {
 size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap); /* bytes written, 0 if cap is too small */
 int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r);         /* 0, or -1 for a malformed frame */
 int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r);       /* 0 or -1 (the body is checked per op) */
+/* An answer is rid 8, op 1, rc 4, an xxh64 check 8, then the body; this writes the check of the n bytes at p (an answer
+ * built whole; tests and fuzz seeds build theirs with it). */
+void cs_resp_seal(uint8_t *p, size_t n);
 void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN]);
 int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m); /* 0, or -1 (a geometry that cannot be too) */
 uint64_t cs_put_total(const struct cs_put_meta *m);                       /* the file's bytes: sums, then cells */
 uint64_t cs_sums_hash(const uint64_t *sums, uint64_t n);                  /* xxh64 of the table, little endian */
+/* PUT_OK's body: xxh64 of the put meta as the receiver decoded it, then cs_sums_hash of its sums (8 bytes, little
+ * endian), so a put whose identity changed on the way is never taken as the sender's (the sender compares) */
+uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_hash);
 int chunksrv_st(int rc); /* CHUNK_ST_* of an answer's rc: OK, ABSENT, DAMAGED, IOERR, DOWN (-1: none of those) */
 
 /* ---------------------------------------------------------------- the server */
@@ -141,7 +154,7 @@ void chunksrv_put_end(struct cs_put *p, int status);
 
 struct chunksrv_stats {
     uint64_t requests, malformed, puts_ok, puts_refused, put_bytes, reads, read_bytes, fenced, unsure_refused,
-        source_raises;
+        source_raises, answer_mismatch;
 };
 void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st);
 
@@ -216,9 +229,18 @@ enum {
     CS_MUT_PUTOKEARLY = 3, /* putokearly: PUT_OK goes out before the chunk is synced and named */
     CS_MUT_NOCELLCHECK = 4, /* nocellcheck: cells are taken without checking them against their sums */
     CS_MUT_STOREFOREIGN = 5, /* storeforeign: a store's cluster and node are not checked */
+    CS_MUT_NOMETACHECK = 6,  /* nometacheck: a put meta's check is not compared */
+    CS_MUT_SUMSONLY = 7,     /* sumsonly: PUT_OK's hash covers the sums only, not the meta */
+    CS_MUT_NOREQCHECK = 8,   /* noreqcheck: a request's check is not compared */
+    CS_MUT_NOOPMATCH = 9,    /* noopmatch: an answer goes to the call of its rid whatever its op */
+    CS_MUT_NORESPCHECK = 10, /* norespcheck: an answer's check is not compared */
 };
 extern int chunksrv_mutant;
 extern int chunksrv_test_put_delay_ms; /* tests: the first cell of every put waits this long (a slow disk) */
 int chunksrv_mutant_parse(const char *name); /* CS_MUT_* or -1 */
+/* tests: XOR `mask` into byte `off` of the next frame received of kind `where` (CS_FLIP_*), on the receive side, before
+ * it is decoded; with `rehash` its check is computed again over the changed bytes (a flip the check would miss) */
+enum { CS_FLIP_NONE = 0, CS_FLIP_META = 1, CS_FLIP_REQ = 2, CS_FLIP_RESP = 3 };
+void chunksrv_test_flip(int where, uint32_t off, uint8_t mask, bool rehash);
 
 #endif

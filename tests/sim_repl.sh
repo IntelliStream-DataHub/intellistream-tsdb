@@ -83,7 +83,8 @@ all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 
 scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:unanswered 24:round_cut 11:promote
            14:promote 39:replay_floor 40:idle_shrink 42:steady_join 43:reconfig 44:reconfig 45:reconfig 46:replay
            47:snapshot 48:leave 49:leave 50:target 51:hold 52:hold 53:hold 54:reconfig 55:unans_remap 56:join_remap
-           57:busy_drop 58:replay_floor 59:below_start 32:below_start 33:below_start"
+           57:busy_drop 58:replay_floor 59:below_start 32:below_start 33:below_start
+           64:ack_bound"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the

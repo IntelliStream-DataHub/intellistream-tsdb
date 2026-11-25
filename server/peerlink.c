@@ -47,11 +47,12 @@
 #include "../src/compat.h" /* macOS: accept4, SOCK_CLOEXEC; nothing on Linux */
 
 int peerlink_mutant;
+static _Atomic int check_default; /* peerlink_set_check_level */
 int peerlink_test_cut_end;
+int32_t peerlink_test_done_status;
 static uint64_t kind_bytes[PL_KIND_DATA_MAX + 1]; /* peerlink_kind_bytes: process-wide, so no peerlink is touched */
 void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 
-#define TAG PL_CHECK_LEN
 #define MS 1000000ull
 #define HS_FRAME_MAX 512
 #define HS_TR_MAX (HS_FRAME_MAX + 128)
@@ -260,24 +261,30 @@ static void hk_mac(const struct hk *k, const void *a, size_t an, const void *b, 
     tsdb_sha256_final(&x, out);
 }
 
-/* one direction's frame check (plcheck.h): its type and the connection's salt for that direction */
+/* one direction's frame check (plcheck.h): its type (the level the connection runs at) and the connection's salt for
+ * that direction */
 struct fck {
     int type;
     uint64_t salt;
 };
 
-/* the check of one frame whose type, header and payload are the n bytes at f, the frame's number in its direction
- * `seq`: XXH3-128 seeded with salt ^ seq */
-static void frame_check(const struct fck *k, uint64_t seq, const uint8_t *f, size_t n, uint8_t out[TAG])
+/* the check of the frame of wire length `len` at f, the frame's number in its direction `seq`, seeded with salt ^ seq;
+ * `body` is its type, header and payload (all before the check). PL_CHECK_FULL covers the body as it is on the wire;
+ * PL_CHECK_HEADER the length, the type, the compression header and the first PL_CHECK_SPAN bytes of the payload as the
+ * driver gave it, a[0..an) then b[0..bn) (a compressed frame's decompressed bytes: the reader has them only after the
+ * decode). out: pl_check_len(k->type) bytes; nothing for PL_CHECK_NONE. */
+static void frame_check(const struct fck *k, uint64_t seq, uint32_t len, const uint8_t *f, size_t body,
+                        const uint8_t *a, size_t an, const uint8_t *b, size_t bn, uint8_t *out)
 {
     uint64_t seed = peerlink_mutant == PL_MUT_NOSEQ    ? k->salt
                     : peerlink_mutant == PL_MUT_NOSALT ? seq
                     : peerlink_mutant == PL_MUT_SEQ8   ? k->salt ^ (uint8_t)seq
                                                        : k->salt ^ seq;
-    if (peerlink_mutant == PL_MUT_NOTYPE)
-        pl_check(k->type, seed, f + 1, n - 1, out);
-    else
-        pl_check(k->type, seed, f, n, out);
+    int notype = peerlink_mutant == PL_MUT_NOTYPE;
+    if (k->type == PL_CHECK_FULL)
+        pl_check(seed, f + notype, body - (size_t)notype, out);
+    else if (k->type == PL_CHECK_HEADER)
+        pl_check_header(seed, len, notype ? 0 : f[0], f + 1, f[0] & 0x80 ? 4 : 0, a, an, b, bn, out);
 }
 
 /* the handshake's MAC and the link keys: HMAC(secret, label | transcript) */
@@ -369,21 +376,31 @@ int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, ui
     }
 }
 
-/* [u32 len][type][hdr][payload][check] appended to b; `hdr` is the compression header or a control frame's fields */
+/* [u32 len][type][hdr][payload][check] appended to b; `hdr` is the compression header (then lp, ln is the payload
+ * before compression, for PL_CHECK_HEADER) or a control frame's fields (lp NULL); the check as long as its type says
+ * (none: no bytes) */
 static void frame_put(struct buf *b, const struct fck *k, uint64_t *seq, uint8_t type, const void *h, size_t hn,
-                      const void *p, size_t pn)
+                      const void *p, size_t pn, const void *lp, size_t ln)
 {
-    uint8_t t[TAG];
+    size_t cl = pl_check_len(k->type);
+    uint8_t t[PL_CHECK_LEN_MAX];
     /* room for the whole frame first: a put that has to make room moves the buffer's data to its start
      * (buf_reserve), which would leave `at` pointing at other bytes */
-    buf_reserve(b, 4 + 1 + hn + pn + TAG);
-    put32(b, (uint32_t)(1 + hn + pn + TAG));
+    buf_reserve(b, 4 + 1 + hn + pn + cl);
+    uint32_t len = (uint32_t)(1 + hn + pn + cl);
+    put32(b, len);
     size_t at = b->len;
     put8(b, type);
     put(b, h, hn);
     put(b, p, pn);
-    frame_check(k, (*seq)++, b->p + at, b->len - at, t);
-    put(b, t, TAG);
+    if (cl) {
+        if (lp)
+            frame_check(k, *seq, len, b->p + at, b->len - at, lp, ln, NULL, 0, t);
+        else
+            frame_check(k, *seq, len, b->p + at, b->len - at, h, hn, p, pn, t);
+        put(b, t, cl);
+    }
+    (*seq)++;
 }
 
 /* a driver frame, compressed when it pays; `zc` is the thread's zstd context (NULL: a one-off) */
@@ -397,14 +414,14 @@ static void frame_user(struct buf *b, const struct fck *k, uint64_t *seq, ZSTD_C
             size_t zn = zc ? ZSTD_compressCCtx(zc, z, bound, p, n, 1) : ZSTD_compress(z, bound, p, n, 1);
             if (!ZSTD_isError(zn) && zn + 4 + n / 8 < n) {
                 uint8_t h[4] = {(uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24)};
-                frame_put(b, k, seq, type | 0x80, h, 4, z, zn);
+                frame_put(b, k, seq, type | 0x80, h, 4, z, zn, p, n);
                 free(z);
                 return;
             }
             free(z);
         }
     }
-    frame_put(b, k, seq, type, "", 0, p, n);
+    frame_put(b, k, seq, type, "", 0, p, n, NULL, 0);
 }
 
 size_t pl_frame_encode(int check, uint64_t salt, uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
@@ -451,25 +468,39 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
     while (r->rb.len - r->rb.off >= 4) {
         const uint8_t *at = r->rb.p + r->rb.off;
         uint32_t len = le32(at);
-        if (len < 1 + TAG || len > WIRE_MAX) {
+        size_t cl = pl_check_len(r->key.type);
+        if (len < 1 + cl || len > WIRE_MAX) {
             r->bad = 1;
             break;
         }
         if (r->rb.len - r->rb.off - 4 < len)
             break;
         const uint8_t *f = at + 4;
-        size_t body = len - TAG;
-        uint8_t t[TAG];
-        frame_check(&r->key, r->seq++, f, body, t);
-        if (!r->skip && peerlink_mutant != PL_MUT_NOTAG && !tsdb_ct_equal(t, f + body, peerlink_mutant == PL_MUT_HALFCMP ? 8 : TAG)) {
-            r->bad = 1;
-            break;
+        size_t body = len - cl;
+        uint8_t t[PL_CHECK_LEN_MAX];
+        uint64_t seq = r->seq++;
+        int verify = cl && !r->skip && peerlink_mutant != PL_MUT_NOTAG;
+        size_t cmp = peerlink_mutant == PL_MUT_HALFCMP ? cl / 2 : cl;
+        if (verify && r->key.type == PL_CHECK_FULL) { /* before the decode: the bytes as they are on the wire */
+            frame_check(&r->key, seq, len, f, body, NULL, 0, NULL, 0, t);
+            if (!tsdb_ct_equal(t, f + body, cmp)) {
+                r->bad = 1;
+                break;
+            }
         }
         struct pl_msg m;
         uint8_t *own = NULL;
         if (pl_msg_decode(f[0], f + 1, body - 1, &m, &own) != 0) {
             r->bad = 1;
             break;
+        }
+        if (verify && r->key.type == PL_CHECK_HEADER) { /* after it: the payload's head as the driver gave it */
+            frame_check(&r->key, seq, len, f, body, m.p, m.n, NULL, 0, t);
+            if (!tsdb_ct_equal(t, f + body, cmp)) {
+                free(own);
+                r->bad = 1;
+                break;
+            }
         }
         int rc = fn ? fn(arg, &m) : 0;
         free(own);
@@ -510,6 +541,7 @@ struct plink {
     uint32_t want_id;
     char addr[160];
     _Atomic uint32_t peer;
+    _Atomic int check; /* the frame check type its connection runs (plcheck.h), 0 while down */
     void *arg;
     int evfd, evw;
     pthread_t thr; /* a dialed link's thread (accepted ones run on detached threads, counted in pl->helpers) */
@@ -605,6 +637,7 @@ static struct plink *link_new(struct peerlink *pl, int kind, int dialed)
 
 uint32_t plink_peer(const struct plink *l) { return atomic_load(&((struct plink *)l)->peer); }
 int plink_kind(const struct plink *l) { return l->kind; }
+int plink_check(const struct plink *l) { return atomic_load(&((struct plink *)l)->check); }
 void plink_set_arg(struct plink *l, void *arg) { l->arg = arg; }
 void *plink_arg(const struct plink *l) { return l->arg; }
 
@@ -724,10 +757,12 @@ int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, si
     return send_impl2(l, gen, type, hdr, hn, p, n, timeout_ms, tracked, token, deadline_ns);
 }
 
-void plink_reset(struct plink *l)
+void plink_reset(struct plink *l) { plink_reset_gen(l, 0); }
+
+void plink_reset_gen(struct plink *l, uint64_t gen)
 {
     pthread_mutex_lock(&l->mu);
-    if (l->up)
+    if (l->up && (!gen || l->gen == gen))
         l->reset_gen = l->gen;
     pthread_mutex_unlock(&l->mu);
     wake(l);
@@ -1093,13 +1128,60 @@ static int hello_parse(const uint8_t *p, size_t n, struct hello *h)
     return 0;
 }
 
-/* the acceptor's choice among the check types a HELLO offers: the highest both ends run, 0 when none */
-static int check_choose(unsigned offered)
+void peerlink_set_check_level(int level) { atomic_store(&check_default, level); }
+int peerlink_check_parse(const char *s) { return pl_check_parse(s); }
+const char *peerlink_check_name(int type) { return pl_check_name(type); }
+
+static _Atomic uint64_t g_up[PL_NKINDS][4]; /* the process's connections up by kind and check type */
+
+static void up_count(int kind, int type, int d)
 {
-    unsigned both = offered & PL_CHECKS_KNOWN;
+    if (kind >= 0 && kind < PL_NKINDS && type >= 1 && type <= 3)
+        atomic_fetch_add_explicit(&g_up[kind][type], (uint64_t)(int64_t)d, memory_order_relaxed);
+}
+
+void peerlink_up_by_check(uint64_t out[PL_NKINDS][4])
+{
+    for (int k = 0; k < PL_NKINDS; k++)
+        for (int t = 0; t < 4; t++)
+            out[k][t] = atomic_load_explicit(&g_up[k][t], memory_order_relaxed);
+}
+
+int peerlink_links_status(char *buf, size_t n)
+{
+    static const char *const kname[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+    uint64_t up[PL_NKINDS][4];
+    peerlink_up_by_check(up);
+    size_t off = 0;
+    if (n)
+        buf[0] = 0;
+    for (int k = 0; k < PL_NKINDS; k++) {
+        if (!up[k][1] && !up[k][2] && !up[k][3])
+            continue;
+        int w = snprintf(buf + off, n - off, "peer links %s: none %" PRIu64 " header %" PRIu64 " full %" PRIu64 "\n",
+                         kname[k], up[k][1], up[k][2], up[k][3]);
+        if (w < 0 || (size_t)w >= n - off)
+            return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* this end's frame check level (cfg.check, else the process's; plcheck.h) */
+static int check_level(const struct peerlink *pl)
+{
+    int d = atomic_load(&check_default);
+    return pl->cfg.check ? pl->cfg.check : d ? d : PL_CHECK_NONE;
+}
+
+/* the acceptor's choice among the check types a HELLO offers: the lowest it offers that this end runs at or above its
+ * own level, so the stronger of the two ends' levels (each end offers the types at or above its own); 0 when none */
+static int check_choose(unsigned offered, int level)
+{
+    unsigned both = offered & pl_check_offer(level);
     if (peerlink_mutant == PL_MUT_CHECKTYPE && !both)
-        return PL_CHECK_XXH3;
-    for (int t = 7; t > 0; t--)
+        return level;
+    for (int t = 1; t <= 7; t++)
         if (both & (1u << t))
             return t;
     return 0;
@@ -1166,7 +1248,8 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     put8(&b, (uint8_t)(al >> 8));
     put(&b, pl->cfg.advertise, al);
     put8(&b, (uint8_t)l->kind);
-    put8(&b, (uint8_t)PL_CHECKS_KNOWN);
+    unsigned offer = pl_check_offer(check_level(pl));
+    put8(&b, (uint8_t)offer);
     put8(&b, (uint8_t)PL_CAPS);
     memcpy(tr, b.p, b.len);
     trlen = b.len;
@@ -1189,9 +1272,9 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
         (l->want_id && id != l->want_id))
         return -1;
     int check = body[4 + 16 + 16 + 32];
-    if ((check < 1 || check > 7 || !(PL_CHECKS_KNOWN & (1u << check))) && peerlink_mutant != PL_MUT_DIALANYTYPE) {
-        fprintf(stderr, "peerlink: node %" PRIu32 " chose frame check type %d, which this server does not run (it "
-                "offered 0x%x)\n", id, check, PL_CHECKS_KNOWN);
+    if ((check < 1 || check > 7 || !(offer & (1u << check))) && peerlink_mutant != PL_MUT_DIALANYTYPE) {
+        fprintf(stderr, "peerlink: node %" PRIu32 " chose frame check type %d, which this server does not run at "
+                "its level %s (it offered 0x%x)\n", id, check, pl_check_name(check_level(pl)), offer);
         return -1;
     }
     memcpy(tr + trlen, body + n - 32, 32);
@@ -1217,10 +1300,11 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     if (!zero16(self->uuid) && !zero16(h.uuid) && memcmp(h.uuid, self->uuid, 16) != 0 &&
         peerlink_mutant != PL_MUT_UUID)
         return -1;
-    int check = check_choose(h.checks);
+    int check = check_choose(h.checks, check_level(pl));
     if (!check) {
         fprintf(stderr, "peerlink: refused a link from node %" PRIu32 ": it offers frame check types 0x%x, this server "
-                "runs 0x%x\n", h.id, h.checks, PL_CHECKS_KNOWN);
+                "runs 0x%x at its level %s\n", h.id, h.checks, pl_check_offer(check_level(pl)),
+                pl_check_name(check_level(pl)));
         return -1;
     }
     memcpy(tr, hello, hn);
@@ -1354,6 +1438,16 @@ static struct qf *q_expire(struct plink *l, uint64_t now)
     return gone;
 }
 
+/* A status in RESUME or DONE is PL_OK or one of the PL_E_* codes. The frames carry no check of their own by default
+ * (plcheck.h): a flipped bit that makes any other value ends the connection, and the file begins again on the next one,
+ * instead of reaching `done` as a status no caller knows. */
+static int status_known(int32_t s)
+{
+    if (peerlink_mutant == PL_MUT_DONESTATUS)
+        return 1;
+    return s <= PL_OK && (s >= PL_E_GIVEUP || peerlink_mutant == PL_MUT_STATUSNEG);
+}
+
 static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t sent)
 {
     if (status == PL_OK) {
@@ -1366,14 +1460,15 @@ static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t s
 
 static void send_ctl(struct conn *c, uint8_t type, const void *p, size_t n)
 {
-    frame_put(&c->wb, &c->keys.out, &c->seq_out, type, "", 0, p, n);
+    frame_put(&c->wb, &c->keys.out, &c->seq_out, type, "", 0, p, n, NULL, 0);
 }
 
 static void send_done(struct conn *c, uint64_t file, int32_t status)
 {
     struct buf b = {0};
     put64(&b, file);
-    put32(&b, (uint32_t)status);
+    int32_t bad = __atomic_exchange_n(&peerlink_test_done_status, 0, __ATOMIC_RELAXED);
+    put32(&b, (uint32_t)(bad ? bad : status));
     send_ctl(c, PLT_DONE, b.p, b.len);
     buf_free(&b);
 }
@@ -1524,7 +1619,7 @@ static int conn_msg(void *arg, const struct pl_msg *m)
     }
     case PLT_RESUME: {
         struct jobq *q = c->job;
-        if (!q || c->jstate != J_WAITRESUME || m->file != q->j.file)
+        if (!q || c->jstate != J_WAITRESUME || m->file != q->j.file || !status_known(m->status))
             return -1;
         if (m->status < 0) {
             c->job = NULL;
@@ -1546,7 +1641,7 @@ static int conn_msg(void *arg, const struct pl_msg *m)
         struct jobq *q = c->job;
         /* the receiver's verdict; in SEND it is a failure on its side (PL_E_IO): the transfer stops here, whatever
          * chunks are in flight are ignored over there */
-        if (!q || (c->jstate != J_WAITDONE && c->jstate != J_SEND) || m->file != q->j.file)
+        if (!q || (c->jstate != J_WAITDONE && c->jstate != J_SEND) || m->file != q->j.file || !status_known(m->status))
             return -1;
         c->job = NULL;
         job_done(pl, q, m->status, c->jsent);
@@ -1638,7 +1733,7 @@ static uint64_t job_send(struct conn *c)
             h[i] = (uint8_t)(q->j.file >> (8 * i));
             h[8 + i] = (uint8_t)(c->jnext >> (8 * i));
         }
-        frame_put(&c->wb, &c->keys.out, &c->seq_out, PLT_CHUNK, h, 16, c->cbuf, n);
+        frame_put(&c->wb, &c->keys.out, &c->seq_out, PLT_CHUNK, h, 16, c->cbuf, n, NULL, 0);
         pl_xxh_update(&c->jh, c->cbuf, n);
         c->jnext += n;
         c->jsent += n;
@@ -1667,8 +1762,12 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     l->io_thr = pthread_self();
     l->io_set = 1;
     atomic_store(&l->peer, keys->peer);
+    atomic_store(&l->check, keys->out.type);
     pthread_mutex_unlock(&l->mu);
     ST(pl, connects, 1);
+    if (keys->out.type >= 1 && keys->out.type <= 3)
+        ST(pl, up_check[keys->out.type], 1);
+    up_count(l->kind, keys->out.type, 1);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 1);
     pthread_mutex_lock(&l->mu);
@@ -1893,6 +1992,11 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     }
     if (peerlink_mutant == PL_MUT_CLOSEFIRST)
         c.t->ops->close(c.t);
+    if (c.keys.out.type >= 1 && c.keys.out.type <= 3)
+        ST(pl, up_check[c.keys.out.type], (uint64_t)-1);
+    if (peerlink_mutant != PL_MUT_UPDOWNLEAK)
+        up_count(l->kind, c.keys.out.type, -1);
+    atomic_store(&l->check, 0);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 0);
     if (peerlink_mutant != PL_MUT_CLOSEFIRST)
@@ -2053,7 +2157,7 @@ int peerlink_test_attach(struct peerlink *pl, uint32_t peer, int kind, int diale
     a->peer = peer;
     a->kind = kind;
     a->t = t;
-    keys_derive(pl, dialer, check_choose(PL_CHECKS_KNOWN), tr, trlen, &a->k);
+    keys_derive(pl, dialer, check_level(pl), tr, trlen, &a->k);
     a->k.peer = peer;
     a->k.peer_caps = PL_CAPS;
     pthread_mutex_lock(&pl->mu); /* as peerlink_adopt: an attach that gets past closing is waited for */

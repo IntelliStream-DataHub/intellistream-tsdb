@@ -701,19 +701,35 @@ static void cli_status(int i, int members)
     char cmd[PATH_MAX * 2 + 128], peer[META_ADDR_MAX], line[1024];
     peer_of(i, peer, sizeof peer);
     snprintf(cmd, sizeof cmd, "%s cluster status %s --secret-file %s", cli, peer, secret_path);
-    FILE *p = popen(cmd, "r");
-    if (!p)
-        die("popen %s: %s", cmd, strerror(errno));
-    int node = 0, group = 0, up = 0;
-    while (fgets(line, sizeof line, p)) {
-        node += !strncmp(line, "node ", 5);
-        group += !strncmp(line, "group voters ", 13);
-        up += !strncmp(line, "member ", 7) && strstr(line, " up ");
+    /* the peer links' lines ("peer links KIND: none N header N full N") come once the forwarding links to the
+     * members are up, which the members' own dials decide: asked again until one is there (a promised state) */
+    for (uint64_t until = now_ms() + 20000;;) {
+        FILE *p = popen(cmd, "r");
+        if (!p)
+            die("popen %s: %s", cmd, strerror(errno));
+        int node = 0, group = 0, up = 0, links = 0;
+        while (fgets(line, sizeof line, p)) {
+            node += !strncmp(line, "node ", 5);
+            group += !strncmp(line, "group voters ", 13);
+            up += !strncmp(line, "member ", 7) && strstr(line, " up ");
+            if (!strncmp(line, "peer links ", 11)) {
+                char kind[16];
+                unsigned a, b, c;
+                if (sscanf(line, "peer links %15[a-z]: none %u header %u full %u", kind, &a, &b, &c) != 4)
+                    die("`%s`: a peer links line that does not parse: %s", cmd, line);
+                links += !strcmp(kind, "fwd") && a > 0 && b == 0 && c == 0; /* none, the default level */
+            }
+        }
+        int st = pclose(p);
+        if (st != 0 || node != 1 || group != 1 || up != members)
+            die("`%s`: status %d, %d node, %d group, %d up member lines (expected 0, 1, 1, %d)", cmd, st, node, group,
+                up, members);
+        if (links == 1)
+            break;
+        if (now_ms() > until)
+            die("`%s`: no line \"peer links fwd: none N header 0 full 0\" with N > 0 in 20 s", cmd);
+        usleep(200 * 1000);
     }
-    int st = pclose(p);
-    if (st != 0 || node != 1 || group != 1 || up != members)
-        die("`%s`: status %d, %d node, %d group, %d up member lines (expected 0, 1, 1, %d)", cmd, st, node, group,
-            up, members);
 }
 
 /* the leader as server i's view names it, or -1 */
@@ -4623,6 +4639,30 @@ static void fwd_await(int i, uint32_t peer, const char *kind, int conn)
         die("server %d: no \"%s\"", i, needle);
 }
 
+static int status_key(int i, const char *key, char *val, size_t vn);
+
+/* STATUS's links.KIND.CHECK of server i: at least `least` connections at `check`, none at the other levels */
+static void links_await(int i, const char *kind, const char *check, int least)
+{
+    static const char *const lv[] = {"none", "header", "full"};
+    char key[64], val[32];
+    int n[3] = {-1, -1, -1};
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        for (int c = 0; c < 3; c++) {
+            snprintf(key, sizeof key, "links.%s.%s", kind, lv[c]);
+            n[c] = status_key(i, key, val, sizeof val) ? atoi(val) : -1;
+        }
+        int ok = 1;
+        for (int c = 0; c < 3; c++)
+            ok &= strcmp(lv[c], check) == 0 ? n[c] >= least : n[c] == 0;
+        if (ok)
+            break;
+        if (now_ms() - t0 > WAIT_MS)
+            die("server %d: STATUS says links.%s none %d header %d full %d, want %d or more at %s", i, kind, n[0], n[1],
+                n[2], least, check);
+    }
+}
+
 static void scen_fwdlinks(void)
 {
     scenario("fwdlinks");
@@ -4646,7 +4686,12 @@ static void scen_fwdlinks(void)
         fwd_await(i, ids[2], "fwd", 2);
         fwd_await(i, ids[2], "fwdq", 2);
     }
-    printf("  fwdlinks: 3 servers, each with FWD and FWDQ links to both others; both redial a restarted one\n");
+    for (int i = 0; i < 3; i++) { /* STATUS says each link's frame check: none, the default */
+        links_await(i, "fwd", "none", 2);
+        links_await(i, "fwdq", "none", 2);
+    }
+    printf("  fwdlinks: 3 servers, each with FWD and FWDQ links to both others; both redial a restarted one; STATUS "
+           "says their check (none)\n");
 }
 
 static void scen_links(void)
@@ -6211,6 +6256,42 @@ static void scen_forward(void)
         if (fw_has(L, id, wl.ts) != 0)
             die("a forward the owner could not read was applied");
         printf("  a forward the owner could not read closes the client's connection (%" PRIu64 " ms)\n", wl.ms);
+    }
+
+    /* m. a write that reaches the owner on the read link (FWDQ), as a flipped op or kind would with the link's frame
+     *    check off (the default): the owner refuses it by ending that connection, so the write is never applied and the
+     *    entry closes its client's connection (written and lost) at once; served, it would be acknowledged */
+    {
+        struct fw_write wm = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000350};
+        tsdbc_set_timeout(wm.c, 8000);
+        fw_knob("opkind", 1);
+        fw_write_run(&wm);
+        fw_knob("opkind", 0);
+        tsdbc_close(wm.c);
+        if (fw_has(L, id, wm.ts) != 0)
+            die("a write sent on the read link was applied (%s)", ers(wm.rc));
+        if (wm.rc != TSDB_ERR_IO || wm.ms >= 4000)
+            die("a write sent on the read link: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(wm.rc), wm.ms);
+        printf("  a write sent on the read link is refused by the owner: the connection closes (%" PRIu64 " ms)\n",
+               wm.ms);
+    }
+
+    /* m2. the other way: a read that reaches the owner on the write link (FWD) is refused the same way; served, a
+     *     flipped op on FWD could make a write look like a read there (review F5: the check one way only) */
+    {
+        tsdbc *cq = login_retry(R, "root", "root-pw", 0);
+        tsdbc_set_timeout(cq, 8000);
+        fw_knob("opkind", 1);
+        uint64_t t0 = now_ms();
+        int rq = tsdbc_query_raw(cq, id, 0, INT64_MAX / 2, count_rows, NULL);
+        uint64_t ms = now_ms() - t0;
+        fw_knob("opkind", 0);
+        tsdbc_close(cq);
+        if (rq != TSDB_ERR_IO || ms >= 4000)
+            die("a read sent on the write link: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(rq), ms);
+        printf("  a read sent on the write link is refused by the owner: the connection closes (%" PRIu64 " ms)\n", ms);
     }
 
     /* n. the owner leads at another epoch than the one the entry stamped: refused before anything is done, never run.
@@ -12924,6 +13005,147 @@ static int wal_holds_ts(int i, int64_t ts)
     return found;
 }
 
+/* replflip (rd-nocheck): the data links carry no frame check by default, so a flipped bit in a record reaches the
+ * replica's driver. Every 8th APPEND with records gets one byte of its first record flipped as it is received
+ * (TSDB_REPLD_TEST=flipin, on every server); the driver drops it before the core (msg_refused: the record is not the
+ * one its descriptor names), the leader sends it again, and every row reaches both replicas' logs with the volume up.
+ * TSDB_REPLD_MUTANT=nomsgcheck hands the message to the core unchecked: the apply's check stops the volume there. */
+static int repl_hook_run(const char *name, const char *env)
+{
+    scenario(name);
+    for (int i = 0; i < 3; i++) {
+        penv[i] = env;
+        start(i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    await_isr(L, "rf", 3, 30000, "every replica in the ISR before the writes");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    const int n = 200;
+    int64_t last = 0;
+    for (int k = 0; k < n; k++) {
+        int64_t ts = 2000000 + 1000LL * k;
+        float val = (float)k;
+        if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+            die("write %d: %s: the leader stopped taking writes under the hook (a planted message reached the "
+                "core)", k, ers(rc));
+        last = ts;
+    }
+    tsdbc_close(c);
+    for (int i = 0; i < 3; i++) {
+        if (i == L)
+            continue;
+        uint64_t t0 = now_ms();
+        while (!wal_holds_ts(i, last)) {
+            if (now_ms() - t0 > 20000)
+                die("the last row did not reach replica %d's log in 20 s (flipped records were not dropped and sent "
+                    "again)", i);
+            usleep(5000);
+        }
+    }
+    await_isr(L, "rf", 3, 10000, "every replica in the ISR after the flipped records");
+    return L;
+}
+
+static void scen_replflip(void)
+{
+    repl_hook_run("replflip", "TSDB_REPLD_TEST=flipin");
+    printf("  replflip: 200 rows, every 8th APPEND flipped at each replica, all in both replicas' logs\n");
+    stop_all();
+}
+
+/* replmeta (rd-nocheck, AUDIT item 4): a flipped type field turns an APPEND into a metadata-only type, here a FENCE
+ * one above the leader's epoch (TSDB_REPLD_TEST=metain, every 8th APPEND with records as it is received). Those come
+ * from the metadata group through the driver, never from a peer: msg_refused drops it, the leader sends the APPEND
+ * again. TSDB_REPLD_MUTANT=nometarefuse hands it to the core, which takes the fence and refuses its own leader. */
+static void scen_replmeta(void)
+{
+    int L = repl_hook_run("replmeta", "TSDB_REPLD_TEST=metain");
+    /* every type in turn (metain): FENCE 6, FENCE_REPLY 7, META 8, ISR_REQ 9, RESIGN 10 (src/repl.h); the driver says
+     * the first drop of each type, so each must have its own line on both replicas (TSDB_REPLD_MUTANT=metafenceonly:
+     * the four after FENCE reach the core) */
+    for (int t = 6; t <= 10; t++) {
+        char needle[64];
+        snprintf(needle, sizeof needle, "a message of type %d from node", t);
+        int seen = 0;
+        for (int i = 0; i < 3; i++)
+            seen += i != L && log_has(i, needle) && log_has(i, "a metadata-only type from a peer");
+        if (seen != 2)
+            die("no metadata-only message of type %d was refused on %d of the two replicas", t, 2 - seen);
+    }
+    printf("  replmeta: 200 rows, every 8th APPEND turned into each metadata-only type at each replica and dropped, "
+           "all in both logs\n");
+    stop_all();
+}
+
+/* replepoch (rd-nocheck review F1): no epoch a peer names may lie above the highest the member knows, or one flipped
+ * bit fences the replica durably above every epoch the group will hand out (the leader stops taking writes), and a
+ * descriptor's epoch goes up from prev_epoch to the message's, or the history takes a wrong epoch (the replica stops).
+ * TSDB_REPLD_TEST=flipin=epoch flips, in turn, bit 40 and bit 1 of every 8th APPEND's epoch and bit 40 of its first
+ * descriptor's epoch as it is received; each is dropped and sent again. Mutants noepochbound, nodescepoch. */
+static void scen_replepoch(void)
+{
+    int L = repl_hook_run("replepoch", "TSDB_REPLD_TEST=flipin=epoch");
+    const char *why[] = {"an epoch above the highest this member knows", "a descriptor's epoch out of order"};
+    for (int w = 0; w < 2; w++) {
+        int seen = 0;
+        for (int i = 0; i < 3; i++)
+            seen += i != L && log_has(i, why[w]);
+        if (seen != 2)
+            die("no APPEND was dropped for %s on %d of the two replicas", why[w], 2 - seen);
+    }
+    printf("  replepoch: 200 rows, epochs of every 8th APPEND flipped at each replica and dropped, all in both logs\n");
+    stop_all();
+}
+
+/* repldesc (rd-nocheck review F5): a descriptor's position or span flipped with its record intact. The record's own
+ * checksum holds, so only the comparison with the descriptor (msg_refused) drops it. TSDB_REPLD_TEST=flipin=desc;
+ * mutant nodesccmp. */
+static void scen_repldesc(void)
+{
+    int L = repl_hook_run("repldesc", "TSDB_REPLD_TEST=flipin=desc");
+    int seen = 0;
+    for (int i = 0; i < 3; i++)
+        seen += i != L && log_has(i, "a record unlike its descriptor");
+    if (seen != 2)
+        die("no APPEND with a flipped descriptor was dropped on %d of the two replicas", 2 - seen);
+    printf("  repldesc: 200 rows, a descriptor of every 8th APPEND flipped at each replica and dropped, all in both "
+           "logs\n");
+    stop_all();
+}
+
+/* replbulk (rd-nocheck, AUDIT item 8): nothing sends a driver frame on a bulk link, so one there is a frame type a
+ * flipped bit turned into a user type: the receiver closes the bulk link (the files on it begin again on the next).
+ * TSDB_REPLD_TEST=bulkframe makes the leader send every 16th APPEND on the replica's bulk link as well; the rows all
+ * arrive on the log links. TSDB_REPLD_MUTANT=bulkframes takes the frame as one of the log link. */
+static void scen_replbulk(void)
+{
+    int L = repl_hook_run("replbulk", "TSDB_REPLD_TEST=bulkframe");
+    int seen = 0;
+    for (int i = 0; i < 3; i++)
+        seen += i != L && log_has(i, "on a bulk link: the link is closed");
+    if (seen != 2)
+        die("no driver frame on a bulk link was refused on %d of the two replicas", 2 - seen);
+    printf("  replbulk: 200 rows, every 16th APPEND also on the bulk link, refused there, all in both replicas' logs\n");
+    stop_all();
+}
+
 /* deposetail (jepsen-cluster pause, seed 123, 2026-11-22): a deposed writer whose log runs past the commit point, with
  * a record of its uncommitted tail written only after its demote began, rejoins as a replica. L's replicas hold R1,
  * whose acknowledgements L never heard (cutfrom files at L), so the new leader's epoch e0 ends above L's commit floor;
@@ -13567,6 +13789,9 @@ static void await_margins(int i, uint32_t num, int young, int settled, const cha
     static const char *const states[] = {"ok", "unavailable", "corrupt", "lost"};
     char key[128];
     const char *l;
+    if (!strstr(buf, "\ntsdb_peer_links{kind=\"log\",check=\"none\"} ") ||
+        !strstr(buf, "\ntsdb_peer_links{kind=\"chunkb\",check=\"full\"} 0\n"))
+        die("%s: server %d's metrics have no tsdb_peer_links of every kind and check", what, i);
     snprintf(key, sizeof key, "\ntsdb_volume_young_margin{volume=\"%u\"} ", (unsigned)num);
     if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != young)
         die("%s: server %d's metrics say tsdb_volume_young_margin %s, not %d", what, i, l ? l + strlen(key) : "missing",
@@ -18294,7 +18519,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
