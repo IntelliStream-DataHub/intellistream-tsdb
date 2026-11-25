@@ -40,6 +40,9 @@ Requirements
           the x86-64-v2 builds of AlmaLinux 10 run it.
   glibc   2.34 or newer (AlmaLinux 10 has 2.39, EL9 has 2.34). zstd and liburing
           are linked in; nothing else is needed.
+  RDMA    optional: the verbs transport of a cluster's peer links needs
+          rdma-core's libibverbs.so.1 (`dnf install libibverbs`), which
+          tsdbd loads at run time, not at start; without it they stay on TCP.
   kernel  io_uring for tsdbd (AlmaLinux 10: kernel 6.12). If tsdbd stops with
           "io_uring: Operation not permitted" or "Function not implemented",
           check `sysctl kernel.io_uring_disabled` (0 allows it) and, in a

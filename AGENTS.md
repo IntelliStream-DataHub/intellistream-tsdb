@@ -107,7 +107,11 @@ make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end,
                           # make integration-selftest tests the harness itself (seconds)
 ```
 
-Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).
+Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`), rdma-core's headers
+(`libibverbs-dev` / `rdma-core-devel`, or `RDMA_CFLAGS=-I<dir>`) for tsdbd's verbs transport (detected; without them
+`NO_RDMA=1` with one line, and `make dist` refuses unless `NO_RDMA=1` is given: the release carries it). No RDMA library
+is linked: libibverbs is loaded with dlopen at run time, so one tsdbd runs with and without rdma-core
+(`tools/check-rdma-syms.sh`, in `make test`). macOS never builds it.
 Platforms: Linux is the one production platform; every gate, benchmark and durability claim is about Linux. macOS
 (arm64, x86-64) is a developer platform only (docs/macos.md): it must build and pass `make test IO=epoll`, but never
 at any cost to Linux. macOS code goes behind `#ifdef __APPLE__` or into the portability headers (`src/compat.h`,
@@ -266,6 +270,15 @@ cgroup, so `nice` does not keep your work out of its way.
   last after on_link(down); the handshake, connect and accept stay on TCP); the TCP transport is in peerlink.c,
   `tests/pl_fake.h` an in-memory pair (level and edge modes) that `peerlink_test_attach` runs a link on: `test_peerlink
   fake|fakeready|fakeend` (mutants `noready closefirst wnoshort nhandall`).
+  `server/plrdma.[ch]` (rd-verbs; docs/design-rdma.md §4, D7-D9): the verbs transport under that seam, for rd-upgrade to
+  switch a link connection to: one registered pool per tsdbd and device (one slot size; memlock checked, naming
+  RLIMIT_MEMLOCK), one RC queue pair per link connection with its own receive ring (data and control slots), SEND/RECV
+  only, credits (a SEND never finds no posted receive), WRITTEN = posted, completions on the completion channel's fd in
+  the link's poll, the drain (error state, a marker, then destroy) before any slot goes back; `plr_ep_encode/decode` are
+  the numbers the upgrade exchanges over the TCP link. Every verb goes through `struct plr_ops`: `server/plrdma_dl.c`
+  fills it by dlopen of libibverbs (`NO_RDMA=1` leaves it out), `tests/plr_fake.h` is a fake fabric that checks
+  ownership. `tests/test_plrdma.c` (mutants `writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff`;
+  `--verbs-listen`/`--verbs-dial` run two hosts on real InfiniBand, the numbers of design-rdma.md §3.6).
   `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below

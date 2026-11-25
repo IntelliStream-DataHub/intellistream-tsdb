@@ -718,10 +718,16 @@ DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench fold-bench tsdb-bench 
 DIST_TESTS  = test_tsdb test_types test_levels test_rs test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
-DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
+DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(RDMA_FLAGS) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
               | $$(cksum <tools/glibc-compat.h)
 
+# The release carries the verbs transport (docs/design-rdma.md §5.4): without rdma-core's headers `make dist` stops,
+# unless NO_RDMA=1 was asked for (a tarball for TCP only).
 dist:
+	@if [ "$(NO_RDMA)" = 1 ] && [ "$(origin NO_RDMA)" = file ]; then \
+	    echo "dist: rdma-core's headers (infiniband/verbs.h) not found: install libibverbs-dev or rdma-core-devel," \
+	         "or give RDMA_CFLAGS=-I<dir>, or NO_RDMA=1 for a tarball without the verbs transport" >&2; exit 1; \
+	fi
 	@sig="$(DIST_SIG)"; \
 	if [ "$$(cat $(DIST_B)/.flags 2>/dev/null)" != "$$sig" ]; then \
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
@@ -730,6 +736,7 @@ dist:
 	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
+	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(DIST_B)/tsdbd
 	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
 # The tarball's own test suite on this machine, every CPU level included.

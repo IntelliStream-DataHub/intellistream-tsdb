@@ -82,6 +82,12 @@ for b in tsdbd tsdb; do
     got=$("$top/bin/$b" --version)
     [ "$got" = "$b $base (build $tag)" ] || die "$b --version says '$got', not '$b $base (build $tag)'"
 done
+# the release carries the verbs transport of the peer links (make dist refuses without rdma-core's headers unless
+# NO_RDMA=1, which this script never gives) and links no RDMA library (it loads libibverbs with dlopen); a tag from
+# before the transport is built as it was
+if [ -f server/plrdma.c ]; then
+    tools/check-rdma-syms.sh --rdma "$top/bin/tsdbd" || die "the tarball's tsdbd lacks the verbs transport or links an RDMA library"
+fi
 cat "$top/BUILDINFO"
 
 mkdir -p "$out"
