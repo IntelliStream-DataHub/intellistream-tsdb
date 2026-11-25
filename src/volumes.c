@@ -2325,6 +2325,47 @@ int tsdb_test_settle(tsdb *t, bool (*pick)(void *ctx, uint32_t vol, int64_t part
     return first;
 }
 
+int tsdb_test_reencode(tsdb *t, bool suffix_only, size_t *reencoded)
+{
+    int first = 0;
+    if (reencoded)
+        *reencoded = 0;
+    for (size_t v = 0; v < t->nvols; v++) {
+        eng *e = t->vols[v];
+        size_t n;
+        part **ps;
+        if (!e || !(ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n)))
+            continue;
+        for (size_t a = 0; a < n;) {
+            size_t b = a + 1;
+            int64_t key = ps[a]->partition;
+            while (b < n && ps[b]->partition == key)
+                b++;
+            size_t lo = a;
+            if (suffix_only && b - lo >= 3)
+                lo++; /* leave oldest part below so tombstones hiding older rows are exercised */
+            bool has_ec = false, has_mark = false;
+            for (size_t i = lo; i < b; i++) {
+                struct ecpart *ep = atomic_load(&ps[i]->ec);
+                has_ec |= ep != NULL && !ep->test_mark;
+                has_mark |= ep != NULL && ep->test_mark;
+            }
+            if (has_ec && !has_mark && b - lo >= 2) {
+                size_t take = b - lo > MAX_MERGE_PARTS ? MAX_MERGE_PARTS : b - lo;
+                size_t got = 0;
+                int rc = eng_reencode(e, key, ps + lo, take, &got);
+                if (rc == 0 && got && reencoded)
+                    (*reencoded)++;
+                else if (rc && rc != TSDB_ERR_NOTFOUND && !first)
+                    first = rc;
+            }
+            a = b;
+        }
+        db_release(ps, n);
+    }
+    return first;
+}
+
 /* test hook (tests/test_settle_oracle.c): the cache's count of granules read again as whole cells (their RAW bytes
  * failed the crc: a damaged chunk was met); drop: empty the cache and close its objects first, so the next queries
  * read the chunks */

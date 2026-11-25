@@ -547,6 +547,7 @@ test-units-b3:
 test-units-b4:
 	./$(B)/test_settle $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "ecrankdown settlenocheck settletwopass settlebusy coarsewhole" -- ./$(B)/test_settle --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_settle --list "reencodedroptomb reencoderankdown reencodemarkunavail" -- ./$(B)/test_settle --quick --case reencode --mutant @M@ @D@) # R10 re-encode mutants must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble" -- ./$(B)/test_settle --quick --case gcpaths --mutant @M@ @D@) # each failure path's handoff (int-h)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcearly nullnosync syncfailgo" -- ./$(B)/test_settle --quick --case gcpower --mutant @M@ @D@) # the handoff after the directory sync, never on a failed engine
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
