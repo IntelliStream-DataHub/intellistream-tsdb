@@ -430,9 +430,10 @@ decision a side sends on exactly one transport**. No frame of the link ever need
 other transport.
 
 1. The dialer connects TCP to the peer address and runs the handshake exactly as today (HELLO with the kind,
-   HELLO_ACK, AUTH). Nothing about authentication changes. HELLO and HELLO_ACK carry a capability bit `PL_CAP_RDMA`,
-   set by every build of cluster version 8 or later (rd-mac bumps `PL_CL_VERSION` to 8, and peerlink refuses a HELLO
-   of another version, so an older build never sees an offer). A `NO_RDMA` build sets the bit too: it decodes
+   HELLO_ACK, AUTH). Nothing about authentication changes. HELLO and HELLO_ACK carry a capability bit `PL_CAP_RDMA`
+   (rd-mac bumps `PL_CL_VERSION` to 8, and peerlink refuses a HELLO of another version, so an older build never sees an
+   offer). rd-seam added the capability byte (sent 0, unknown bits ignored, so the bit needs no version bump); every
+   build from rd-upgrade on sets the bit (a build between the two never decodes an offer and is never sent one). A `NO_RDMA` build sets the bit too: it decodes
    `RDMA_OFFER` and answers `RDMA_DECLINE{not_built}`.
 2. If its `cluster.peer.rdma` is `auto` or `on`, the kind is one it moves (all but META), the peer set the bit and no
    backoff holds (§5.3), the dialer stops sending on TCP (frames queue; the upgrade takes milliseconds and at most the
@@ -724,7 +725,7 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
 | key | risk | depends on | files | days |
 |---|---|---|---|---|
 | rd-mac | high | main | built (2026-11-24): server/plcheck.h (AGPL; XXH3-128, xxHash vendored unchanged under server/xxhash with `UPSTREAM`; SSE2 at v2, so no dispatch), server/peerlink.c (`frame_check` in place of `frame_tag`, the salt from the handshake's transcript, the check type negotiated in HELLO), `PL_CL_VERSION` 8 (`PL_CAP_RDMA` is rd-seam's), tools/mac_cands.c and `link-bench mac` / `run --mac` (every candidate, with known answers), tests/test_peerlink.c (the check's known answers in `codec`, every bit of a frame's length, type and check flipped, replays up to 2^63 frames back, the salts each handshake derives (`salts`), a raw acceptor that names an unoffered type (`dialtype`); mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`), fuzz-replframe corpus; then D14's measurements | 3 |
-| rd-seam | medium | rd-mac | server/peerlink.c split: the TCP transport behind `struct pl_transport` (read, write, poll fds, close) with no change in behaviour; test_peerlink unchanged and green; `objdump` not needed (behaviour, not codegen) | 1 |
+| rd-seam | medium | rd-mac | built (2026-11-25): server/pltransport.h (read, writev, poll_fds with `*ready`, poll_ready, close after on_link(down); no shutdown op until rd-upgrade gives it a caller), the TCP transport in server/peerlink.c with no change in behaviour, the capability byte of HELLO and HELLO_ACK (`PL_CAP_RDMA` sent 0), tests/pl_fake.h (an in-memory pair: level mode, and edge mode with one slot per read, news drained before the poll, two fds) under `peerlink_test_attach`; test_peerlink `fake`, `fakeready`, `fakeend`, mutants `noready closefirst wnoshort nhandall` | 1 |
 | rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
 | rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |

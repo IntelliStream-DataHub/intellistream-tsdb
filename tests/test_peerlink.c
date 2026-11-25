@@ -1541,7 +1541,7 @@ static int raw_connect(int port)
 }
 
 /* the cluster HELLO as a data link's dialer sends it: [u32 len][type 1][magic, version, id, uuid, ident, nonce,
- * address, kind, check types], of any version and check types */
+ * address, kind, check types, capabilities (all bits set)], of any version and check types */
 static void raw_hello_as(int fd, uint32_t id, uint8_t uuid_byte, int kind, int version, unsigned checks)
 {
     uint8_t b[128];
@@ -1563,6 +1563,7 @@ static void raw_hello_as(int fd, uint32_t id, uint8_t uuid_byte, int kind, int v
     b[o++] = 0;
     b[o++] = (uint8_t)kind;
     b[o++] = (uint8_t)checks;
+    b[o++] = 0xFF; /* every capability bit: those this build does not know are ignored */
     uint32_t len = (uint32_t)(o - 4);
     memcpy(b, &len, 4);
     CHECK(write(fd, b, o) == (ssize_t)o);
@@ -1800,13 +1801,14 @@ static void test_dialtype(void)
         memset(ack + 20, 0xB1, 16);
         fill_random(ack + 36, 32, (uint64_t)round + 1);
         ack[68] = (uint8_t)choice;
-        o += 69;
-        uint8_t fr[5 + 69 + 32];
-        uint32_t len = 1 + 69 + 32;
+        ack[69] = 0xFF; /* every capability bit: unknown ones are ignored */
+        o += 70;
+        uint8_t fr[5 + 70 + 32];
+        uint32_t len = 1 + 70 + 32;
         memcpy(fr, &len, 4);
         fr[4] = 2; /* HELLO_ACK */
-        memcpy(fr + 5, ack, 69);
-        tsdb_hmac_sha256(SECRET, 32, m, o, fr + 5 + 69);
+        memcpy(fr + 5, ack, 70);
+        tsdb_hmac_sha256(SECRET, 32, m, o, fr + 5 + 70);
         CHECK(write(fd, fr, sizeof fr) == (ssize_t)sizeof fr);
         int t = raw_frame(fd, 3000, body, sizeof body, &bn);
         printf("  dialtype: an ACK choosing check type %d gets %d (3: AUTH, -1: closed)\n", choice, t);

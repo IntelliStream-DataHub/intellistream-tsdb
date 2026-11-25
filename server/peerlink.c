@@ -1067,14 +1067,15 @@ struct hello {
     uint8_t uuid[16], ident[16], nc[32];
     int kind;
     unsigned checks; /* the frame check types the dialer can run, bit (1 << type) each (plcheck.h) */
+    unsigned caps;   /* the dialer's PL_CAP_* bits (unknown ones ignored) */
 };
 
 /* the HELLO body of a data link: magic, version, id, uuid, ident, nonce, address (u16 length + bytes), kind, the
- * check types offered (u8 bit set, from cluster version 8); -1 when it is not one, -2 when it is one of another cluster
+ * check types offered (u8 bit set, from cluster version 8), the capability bits (u8, PL_CAP_*); -1 when it is not one, -2 when it is one of another cluster
  * version (peerlink_adopt says so; peerlink_hello_kind, which the fuzzer reaches, says nothing). */
 static int hello_parse(const uint8_t *p, size_t n, struct hello *h)
 {
-    if (n < 4 + 1 + 4 + 16 + 16 + 32 + 2 + 1 || le32(p) != PL_CL_MAGIC)
+    if (n < 4 + 1 + 4 + 16 + 16 + 32 + 2 + 1 + 1 + 1 || le32(p) != PL_CL_MAGIC)
         return -1;
     if (p[4] != PL_CL_VERSION)
         return -2;
@@ -1083,10 +1084,11 @@ static int hello_parse(const uint8_t *p, size_t n, struct hello *h)
     memcpy(h->ident, p + 25, 16);
     memcpy(h->nc, p + 41, 32);
     size_t al = (size_t)p[73] | (size_t)p[74] << 8;
-    if (n != 75 + al + 2 || memchr(p + 75, 0, al))
+    if (n != 75 + al + 3 || memchr(p + 75, 0, al))
         return -1;
     h->kind = p[75 + al];
     h->checks = p[76 + al];
+    h->caps = p[77 + al];
     return 0;
 }
 
@@ -1121,6 +1123,7 @@ static int zero16(const uint8_t *u)
 struct keys {
     struct fck in, out;
     uint32_t peer;
+    unsigned peer_caps; /* the PL_CAP_* bits the peer's HELLO or HELLO_ACK carried (rd-upgrade decides on them) */
 };
 
 /* each direction's frame check: the negotiated type and a salt from the transcript under the secret (plcheck.h), so
@@ -1163,13 +1166,14 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     put(&b, pl->cfg.advertise, al);
     put8(&b, (uint8_t)l->kind);
     put8(&b, (uint8_t)PL_CHECKS_KNOWN);
+    put8(&b, (uint8_t)PL_CAPS);
     memcpy(tr, b.p, b.len);
     trlen = b.len;
     int rc = send_hs(fd, F_HELLO, b.p, b.len, dl);
     buf_free(&b);
     if (rc != 0)
         return -1;
-    if (read_hs(pl, fd, dl, &type, body, &n) != 0 || type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 1 + 32)
+    if (read_hs(pl, fd, dl, &type, body, &n) != 0 || type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 1 + 1 + 32)
         return -1;
     memcpy(tr + trlen, body, n - 32);
     trlen += n - 32;
@@ -1196,6 +1200,7 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
         return -1;
     keys_derive(pl, 1, check, tr, trlen, k);
     k->peer = id;
+    k->peer_caps = body[4 + 16 + 16 + 32 + 1];
     return 0;
 }
 
@@ -1226,6 +1231,7 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     put(&b, self->ident, 16);
     put(&b, ns, 32);
     put8(&b, (uint8_t)check);
+    put8(&b, (uint8_t)PL_CAPS);
     memcpy(tr + trlen, b.p, b.len);
     trlen += b.len;
     hs_mac(pl->secret, pl->secret_len, "tsdb-link-s", tr, trlen, mac);
@@ -1245,6 +1251,7 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     }
     keys_derive(pl, 0, check, tr, trlen, k);
     k->peer = h.id;
+    k->peer_caps = h.caps;
     return 0;
 }
 
@@ -2045,6 +2052,7 @@ int peerlink_test_attach(struct peerlink *pl, uint32_t peer, int kind, int diale
     a->t = t;
     keys_derive(pl, dialer, check_choose(PL_CHECKS_KNOWN), tr, trlen, &a->k);
     a->k.peer = peer;
+    a->k.peer_caps = PL_CAPS;
     pthread_mutex_lock(&pl->mu); /* as peerlink_adopt: an attach that gets past closing is waited for */
     int rc = -1;
     if (!atomic_load(&pl->closing)) {

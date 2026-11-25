@@ -57,7 +57,14 @@
                                  * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard;
                                  * 7 R4's F_VOLCMD and VOLMSG READY (r4-iface): a peer of 6 drops the connection that
                                  * carries Raft at the first VOLCMD; 8 the data links' frame check (XXH3-128 in place
-                                 * of HMAC-SHA256, its type negotiated in HELLO and HELLO_ACK; rd-mac) */
+                                 * of HMAC-SHA256, its type negotiated in HELLO and HELLO_ACK; rd-mac), and the
+                                 * capability byte after it in both (rd-seam) */
+/* The capability bits of a data link's HELLO and HELLO_ACK (one byte after the check types; bits a build does not know
+ * are ignored, so a later build of the same cluster version adds one without a version bump). PL_CAP_RDMA: this build
+ * decodes RDMA_OFFER (docs/design-rdma.md §5.1 step 1); rd-upgrade sets it, a build before it sends 0 and is never
+ * offered an upgrade. */
+#define PL_CAP_RDMA 0x01u
+#define PL_CAPS 0u /* the bits this build sends */
 
 /* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
  * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a
