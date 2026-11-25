@@ -13435,6 +13435,23 @@ static void ecb_write_day(tsdbc *c, const tsdb_sid *ide, int64_t day_ms)
     }
 }
 
+/* the series `name` of `vol` through its leader's client: MOVED too is retried, because the metadata leader's copy can
+ * name a new volume's leader before that member's own copy does or before it has reopened the volume as the writer
+ * (route_away answers MOVED to itself in that window; r8f-ecbasic3 met it for the twin) */
+static tsdb_sid ecb_series(tsdbc *c, const char *name, const char *vol)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        tsdb_sid id = 0;
+        int rc = tsdbc_series_at(c, name, vol, &id);
+        if (rc == 0)
+            return id;
+        if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+            die("series %s in %s: %s", name, vol, ers(rc));
+        usleep(20000);
+    }
+}
+
 /* the .ec parts listed in server i's v<num> (retired_ ones not counted) */
 static int ecb_ec_parts(int i, uint32_t num)
 {
@@ -13511,8 +13528,8 @@ static void scen_ecbasic(void)
     for (int s = 0; s < ECB_SERIES; s++) {
         char nm[32];
         snprintf(nm, sizeof nm, "ecb.s%d", s);
-        ide[s] = rep_series(c, nm, "e42", 30000);
-        idt[s] = rep_series(ct, nm, "t42", 30000);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
     }
     /* two batches a flush apart: two parts in the day's partition, which its idle merge (1 s) makes one of level 1,
      * the only kind a cluster settle takes (D18) */
