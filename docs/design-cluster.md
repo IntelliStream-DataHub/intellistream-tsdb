@@ -1190,9 +1190,7 @@ volume over a real network is not measured (R11).
 *Not built* (R4's plan, "Scope"): §8.1 step 2's token bucket on the **receiving** side (R4 limits the sender and counts the
 snapshots, D16; R9's balancer needs the receiving side); step 4's reuse of files the receiver already holds (D4: a
 replica's part names carry its own block numbers, so reuse rarely matches; every snapshot copies everything and a
-second one copies it again); a source other than the leader; `.ec` parts in a snapshot (an EC cluster volume attaches a tier since R8, `eccold_may_attach` in `src/eccold.c`; once a
-key of it has settled, `list_part_names` in `src/snapshot.c` refuses and every snapshot of the volume fails, so a moved,
-reset or past-the-caps log replica of it stays a learner: docs/tasks/r8-from-r7.md); rebuild progress in `cluster status` (R14);
+second one copies it again); a source other than the leader; rebuild progress in `cluster status` (R14);
 live changes of the four settings (R14); §8.5's first bullet.
 
 ### 8.2 A returning replica
@@ -1604,8 +1602,8 @@ and the rest of the files named in AGENTS.md), 2,600 lines of `tests/test_snapsh
 replica set changes (add, remove, reset), the operator's move and transfer, leader balance (default off), the replay
 start apart from the log start, and `kill2`, `slow`, `churn` in the cluster gate. Left to R9: the greedy placement pass
 and its triggers, `node drain` and `out`, rebuilding a lost server's replicas elsewhere, the balancer, §8.4's priorities, the
-receive-side rate limit, file reuse in a snapshot, §8.5's first bullet. Left to R8: stripe positions and `.ec` parts in a
-snapshot. Left to R14: rebuild progress in `cluster status`, live changes of the settings. The gate's `longdown` and
+receive-side rate limit, file reuse in a snapshot, §8.5's first bullet. Left to R8: stripe positions (the snapshot carries
+`.ec` parts and their PPOS records since snap-ec). Left to R14: rebuild progress in `cluster status`, live changes of the settings. The gate's `longdown` and
 `rebuild` nemeses are not yet run whole (13.2).
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
