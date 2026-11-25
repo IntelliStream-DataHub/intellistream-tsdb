@@ -374,6 +374,29 @@ int main(int argc, char **argv)
     tsdb_health_close(h);
     h = NULL;
 
+    /* cold-start spike: a slow first write probe (such as cold O_CREAT + fdatasync on XFS, below degraded_min_ms so the
+     * domain stays UP) must not poison the baseline and keep a later genuinely degraded period from entering DEGRADED */
+    o.read_only = 0;
+    CHECK(cmd("slow", da2, "70") == 0);
+    h = tsdb_health_open(&o);
+    int dc = tsdb_health_add_domain(h, "cold", da2);
+    for (int t = 0; t < LATE_MS; t += 20) {
+        if (tsdb_health_info(h, dc, &in) == 0 && in.probes_ok >= 1 && in.write_ms >= 150)
+            break;
+        nap(20);
+    }
+    CHECK(cmd("heal", da2, NULL) == 0);
+    for (int t = 0; t < LATE_MS; t += 20) {
+        if (tsdb_health_info(h, dc, &in) == 0 && in.probes_ok >= 15)
+            break;
+        nap(20);
+    }
+    CHECK(cmd("slow", da2, "400") == 0);
+    CHECK(wait_state(dc, TSDB_DOM_DEGRADED, 3000));
+    CHECK(cmd("heal", da2, NULL) == 0);
+    tsdb_health_close(h);
+    h = NULL;
+
     if (failures) {
         fprintf(stderr, "test_health: %d failures (log: %s)\n", failures, lg);
         return 1;
