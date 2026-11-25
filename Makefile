@@ -56,7 +56,7 @@ endif
 # where the tests make their scratch directories (each run makes its own below it)
 SCRATCH ?= $(or $(TMPDIR),/tmp)
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart diverge
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes marker wire props chunk ec repl replframe ecpart diverge bucketed
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o

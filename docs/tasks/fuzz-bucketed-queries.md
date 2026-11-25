@@ -1,6 +1,6 @@
 # A fuzz harness for bucketed queries over a damaged part
 
-**Open.** Follow-up to the fix of `fold_into` (a damaged granule wrote outside a bucketed query's arrays).
+**Done.** Follow-up to the fix of `fold_into` (a damaged granule wrote outside a bucketed query's arrays). Implemented in `tests/fuzz/fuzz_bucketed.c` with seeds in `tests/fuzz/corpus/bucketed/`.
 
 `granule_decode` now refuses a granule whose timestamps do not strictly increase inside its entry's
 [ts_min, ts_max], and `fuzz_part` and `fuzz_codec` reach that check. Nothing fuzzes what the readers do with the
