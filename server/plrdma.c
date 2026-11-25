@@ -26,6 +26,10 @@ enum { WR_RECV = 1, WR_SEND = 2, WR_MARK = 3 };
 #define WR(kind, i) (((uint64_t)(kind) << 32) | (uint32_t)(i))
 #define MARK_SEND 1u
 #define MARK_RECV 2u
+/* The counters have one writer, the link thread, and are read by plr_conn_stats from any thread: relaxed atomics, and a
+ * load and a store rather than a locked add (one writer needs no read-modify-write) */
+#define ST_ADD(c, f, n) __atomic_store_n(&(c)->st.f, __atomic_load_n(&(c)->st.f, __ATOMIC_RELAXED) + (uint64_t)(n), \
+                                         __ATOMIC_RELAXED)
 
 struct plr_pool {
     const struct plr_ops *ops;
@@ -334,9 +338,9 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
         fail(c, EPROTO);
         return;
     }
-    c->st.msgs_in++;
+    ST_ADD(c, msgs_in, 1);
     if (h[0] == MSG_CREDIT) {
-        c->st.credit_in++;
+        ST_ADD(c, credit_in, 1);
         if (plrdma_mutant != PLR_MUT_PAUSECTL) {
             repost(c, i); /* at once, paused or not: control credits are never withheld */
             c->owed_ctl++;
@@ -382,7 +386,7 @@ static int send_msg(struct plr_conn *c, int type, uint32_t len, uint32_t stream)
     c->s_len[si] = stream;
     if (!(plrdma_mutant == PLR_MUT_UNSIGEARLY && !sig))
         c->s_n++; /* the mutant: the next message takes the same slot while this one may still be read by the NIC */
-    c->st.msgs_out++;
+    ST_ADD(c, msgs_out, 1);
     return 0;
 }
 
@@ -398,7 +402,7 @@ static void maybe_credit(struct plr_conn *c)
         return;
     if (send_msg(c, MSG_CREDIT, 0, 0) == 0) {
         (*cr)--;
-        c->st.credit_out++;
+        ST_ADD(c, credit_out, 1);
     }
 }
 
@@ -447,7 +451,7 @@ static ssize_t rd_read(struct pl_transport *t, void *out, size_t n)
         }
     }
     if (got) {
-        c->st.bytes_in += got;
+        ST_ADD(c, bytes_in, got);
         return (ssize_t)got;
     }
     if (c->err) {
@@ -481,7 +485,7 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
     }
     while (pos < total && !c->err) {
         if ((c->cr_data <= 0 && plrdma_mutant != PLR_MUT_NOCREDIT) || c->s_n >= c->S) {
-            c->st.stalls += c->cr_data <= 0;
+            ST_ADD(c, stalls, c->cr_data <= 0);
             break;
         }
         uint32_t k = (uint32_t)(total - pos < c->room ? total - pos : c->room);
@@ -506,7 +510,7 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
         pos += k;
         posted += k;
     }
-    c->st.bytes_out += posted;
+    ST_ADD(c, bytes_out, posted);
     size_t taken = posted;
     if (plrdma_mutant == PLR_MUT_WRITTENCQE) { /* only what completed counts as taken */
         c->ahead += posted;
@@ -777,5 +781,12 @@ void plr_conn_free(struct plr_conn *c)
 
 void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st)
 {
-    *st = ((const struct plr_conn *)t)->st;
+    const struct plr_conn_stats *s = &((const struct plr_conn *)t)->st;
+    st->msgs_out = __atomic_load_n(&s->msgs_out, __ATOMIC_RELAXED);
+    st->msgs_in = __atomic_load_n(&s->msgs_in, __ATOMIC_RELAXED);
+    st->credit_out = __atomic_load_n(&s->credit_out, __ATOMIC_RELAXED);
+    st->credit_in = __atomic_load_n(&s->credit_in, __ATOMIC_RELAXED);
+    st->bytes_out = __atomic_load_n(&s->bytes_out, __ATOMIC_RELAXED);
+    st->bytes_in = __atomic_load_n(&s->bytes_in, __ATOMIC_RELAXED);
+    st->stalls = __atomic_load_n(&s->stalls, __ATOMIC_RELAXED);
 }
