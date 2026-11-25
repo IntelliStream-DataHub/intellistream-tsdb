@@ -999,6 +999,7 @@ static void case_link_first(void)
 }
 
 /* snap_man_read refuses what a forged or damaged SNAPMAN could say (r4-snapinst reads one from another node) */
+static const uint64_t *MAN_PPOS; /* each entry's ppos (NULL: 0) */
 static int man_try(const char *dir, uint32_t nf_claim, const char *const *names, const uint8_t *kinds,
                    const uint32_t *links, const uint64_t *sizes, size_t n)
 {
@@ -1020,6 +1021,8 @@ static int man_try(const char *dir, uint32_t nf_claim, const char *const *names,
         memcpy(b + o, &sz, 8), o += 8;
         memcpy(b + o, &x, 8), o += 8;
         memcpy(b + o, &links[i], 4), o += 4;
+        uint64_t pp = MAN_PPOS ? MAN_PPOS[i] : 0;
+        memcpy(b + o, &pp, 8), o += 8;
     }
     uint64_t h = xxh64(b, o, 0);
     memcpy(b + o, &h, 8), o += 8;
@@ -1044,23 +1047,38 @@ static void case_man_bad(void)
     const uint8_t pk[] = {SNAP_PART, SNAP_KEEP}, bad[] = {SNAP_PART, 9};
     const uint32_t nol[] = {0, 0}, l1[] = {0, 1}, lfwd[] = {2, 0};
     const uint64_t sz2[] = {10, 11};
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, l1, NULL, 2) == 0);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", ".."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "SNAPMAN.tmp"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "p1.part"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "p2.part"}, bad, nol, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, lfwd, NULL, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 2, (const char *const[]){"p1.part", "keep_1_2.part"}, pk, l1, sz2, 2) == TSDB_ERR_CORRUPT);
-    CHECK(man_try(dir, 0x7fffffff, (const char *const[]){"p1.part"}, pk, nol, NULL, 1) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "keep_1_2.part"}, pk, l1, NULL, 2) == 0);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", ".."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "."}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "SNAPMAN.tmp"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p1_1_1_0.part"}, pk, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.part"}, bad, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "keep_1_2.part"}, pk, lfwd, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "keep_1_2.part"}, pk, l1, sz2, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 0x7fffffff, (const char *const[]){"p1_1_1_0.part"}, pk, nol, NULL, 1) == TSDB_ERR_CORRUPT);
     /* the names the install writes: a copy that carried SNAPDONE would be taken for a finished install */
-    for (const char *const *r = (const char *const[]){SNAP_DONE, "REPL", "FNO", "LOCK", "META.tmp", NULL}; *r; r++)
-        if (man_try(dir, 2, (const char *const[]){"p1.part", *r}, pk, nol, NULL, 2) != TSDB_ERR_CORRUPT) {
+    for (const char *const *r = (const char *const[]){SNAP_DONE, "REPL", "FNO", "LOCK", "META.tmp", "PPOS", "PPOS.tmp", NULL}; *r; r++)
+        if (man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", *r}, pk, nol, NULL, 2) != TSDB_ERR_CORRUPT) {
             fprintf(stderr, "  SNAPMAN naming %s was not refused\n", *r);
             fails++;
         }
-    printf("  SNAPMAN: \".\", \"..\", its own names, the install's names, a name twice, unknown kinds, bad links and a "
-           "huge count refused\n");
+    /* snap-ec: a kind takes only its names (a settled_ or retired_ file never travels), a ppos only on a part */
+    const uint8_t pe[] = {SNAP_PART, SNAP_EC}, ps[] = {SNAP_PART, SNAP_SEG}, pp[] = {SNAP_PART, SNAP_PART};
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.ec"}, pe, nol, NULL, 2) == 0);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.part"}, pe, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.ec"}, pp, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "settled_p2_1_1_0.part"}, pp, nol, NULL, 2) ==
+          TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "retired_p2_1_1_0.ec"}, pe, nol, NULL, 2) ==
+          TSDB_ERR_CORRUPT);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "settled_p2_1_1_0.part"}, pk, nol, NULL, 2) ==
+          TSDB_ERR_CORRUPT);
+    MAN_PPOS = (const uint64_t[]){5, 9};
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.ec"}, pe, nol, NULL, 2) == 0);
+    CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "wal_1.log"}, ps, nol, NULL, 2) == TSDB_ERR_CORRUPT);
+    MAN_PPOS = NULL;
+    printf("  SNAPMAN: \".\", \"..\", its own names, the install's names, a name twice, unknown kinds, bad links, a "
+           "huge count, a name its kind does not take (settled_, retired_) and a ppos on a non-part refused\n");
 }
 static void hook_write_after_cut(eng *db, int at, const char *arg)
 {

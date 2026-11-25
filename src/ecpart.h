@@ -130,6 +130,9 @@ int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96]);
 /* Opens an .ec file as a part (p->ec set, p->verify true: E11): the source's header and footer hash, the trailer,
  * the record's hash, and the record against the footer and the name (rows, time range, block range). */
 int part_open_ec(eng *db, const char *file, const char *name, part **out);
+/* The same in the directory dirfd with no engine (a snapshot's install checks the .ec files it received): cluster_ec
+ * and pin as db->ec_cluster and db->opt.pin_index. The checks are part_open_ec's; part_unref frees it. */
+int part_open_ec_at(int dirfd, const char *file, const char *name, bool cluster_ec, bool pin, part **out);
 
 /* r7-ecfile's planted bugs (tests/test_ecpart.c --mutant NAME; the Makefile requires each to fail it): the open checks
  * no hash (neither the source's nor the record's); the open leaves wal_seq 0 (a WAL segment replays into a partition an

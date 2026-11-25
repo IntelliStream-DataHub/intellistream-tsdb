@@ -300,6 +300,17 @@ out:
 /* ---------------------------------------------------------------- the open */
 int part_open_ec(eng *db, const char *file, const char *name, part **out)
 {
+    int rc = part_open_ec_at(db->dirfd, file, name, db->ec_cluster, db->opt.pin_index, out);
+    if (rc == 0) {
+        struct ecpart *e = atomic_load(&(*out)->ec);
+        e->tier = db->tier;
+        e->volume = db->tier_vol;
+    }
+    return rc;
+}
+
+int part_open_ec_at(int dirfd, const char *file, const char *name, bool cluster_ec, bool pin, part **out)
+{
     *out = NULL;
     part *p = calloc(1, sizeof *p);
     struct ecpart *e = calloc(1, sizeof *e);
@@ -319,9 +330,9 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
         return TSDB_ERR_INVALID;
     }
     snprintf(p->name, sizeof p->name, "%s", name);
-    p->dirfd = db->dirfd;
+    p->dirfd = dirfd;
 
-    int fd = openat(db->dirfd, file, O_RDONLY | O_CLOEXEC);
+    int fd = openat(dirfd, file, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         int err = errno;
         free(p);
@@ -374,7 +385,7 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
     e->rec_hash = xxh64(p->map + roff, (size_t)rlen, 0);
     if (hashes && e->rec_hash != get64(tr + EC_TR_REC_HASH))
         goto fail;
-    if ((rc = ec_record_decode_as(p->map + roff, (size_t)rlen, &e->rec, db->ec_cluster)) != 0)
+    if ((rc = ec_record_decode_as(p->map + roff, (size_t)rlen, &e->rec, cluster_ec)) != 0)
         goto fail;
     rc = TSDB_ERR_CORRUPT;
     const ec_record *r = &e->rec;
@@ -419,7 +430,7 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
     if (f.ngranules > f.index_off - HL)
         goto fail;
     const uint8_t *ib = p->map + HL;
-    if (db->opt.pin_index) { /* as part_open_as: the bytes checked are the bytes used */
+    if (pin) { /* as part_open_as: the bytes checked are the bytes used */
         rc = TSDB_ERR_NOMEM;
         if (!(p->icopy = malloc(ilen + tlen + 8)))
             goto fail;
@@ -468,9 +479,7 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
             goto fail;
     }
     p->verify = true; /* E11: an .ec part's granules are always checked */
-    e->tier = db->tier;
-    e->volume = db->tier_vol;
-    atomic_init(&p->ec, e);
+    atomic_init(&p->ec, e); /* no tier: part_open_ec sets it, part_open_ec_at's part releases nothing in ecgc */
     atomic_init(&p->refs, 1);
     atomic_init(&p->obsolete, false);
     *out = p;
