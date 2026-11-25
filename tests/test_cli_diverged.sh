@@ -43,4 +43,24 @@ for p in "$dir/db" "$dir/db/" "$dir/v1" "$dir/v1/" "$dir/v1_link"; do
     [[ $out == *"not diverged"* ]] || fail "volume diverged on $p said: $out"
     "$B/tsdb" "$dir/db" volume diverged "$p" --clear >/dev/null || fail "--clear on valid volume $p"
 done
+
+# Non-existent PATH, non-directory PATH (ENOTDIR), relative PATH, and corrupted VOLUMES checksum
+err=$("$B/tsdb" "$dir/db" volume diverged "$dir/nope" 2>&1 >/dev/null) && fail "accepted non-existent PATH"
+[[ $err == *"nope"* ]] || fail "non-existent PATH error: $err"
+
+: >"$dir/notadir"
+err=$("$B/tsdb" "$dir/db" volume diverged "$dir/notadir" 2>&1 >/dev/null) && fail "accepted non-directory PATH"
+[[ $err == *"Not a directory"* ]] || fail "non-directory PATH error: $err"
+
+tsdb_bin=$(readlink -f "$B/tsdb")
+out=$(cd "$dir" && "$tsdb_bin" db volume diverged v1) || fail "relative PATH failed: exit $?"
+[[ $out == *"not diverged"* ]] || fail "relative PATH said: $out"
+(cd "$dir" && "$tsdb_bin" db volume diverged v1 --clear >/dev/null) || fail "relative PATH --clear failed"
+err=$(cd "$dir" && "$tsdb_bin" db volume diverged other 2>&1 >/dev/null) && fail "accepted relative non-volume PATH"
+[[ $err == *"not a volume"* ]] || fail "relative non-volume error: $err"
+
+"$B/tsdb" "$dir/badvol" create b >/dev/null || fail "create b in badvol"
+printf '00000000 %s\n' "$dir/v1" >"$dir/badvol/VOLUMES"
+err=$("$B/tsdb" "$dir/badvol" volume diverged "$dir/v1" 2>&1 >/dev/null) && fail "accepted corrupted VOLUMES checksum"
+[[ $err == *"damaged"* ]] || fail "corrupted VOLUMES checksum error: $err"
 echo "test_cli_diverged: ok"

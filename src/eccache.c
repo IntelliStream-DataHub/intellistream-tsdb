@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
@@ -79,14 +80,24 @@ typedef struct og {
 
 /* A sequential walk (prefetch): the next granule index of object oid a miss would continue it at, and its window. */
 #define PF_STREAMS 16
+#define PF_BAD_SLOTS 16
+#define PF_BAD_TTL_NS (5ull * 1000000000ull) /* monotonic cooldown before probing a degraded object again */
 #define PF_INIT 4
 #define PF_CALL_BYTES (4ull << 20)
 typedef struct pfstream {
     uint8_t oid[16];
     uint32_t next, n;
     uint64_t stamp; /* 0: free */
-    bool degraded;  /* a stripe read had to reconstruct or failed: skip prefetch until reopened/dropped */
 } pfstream;
+
+/* Recently degraded objects: skip prefetch during their monotonic cooldown so damaged stripes do not issue extra
+ * range reads, while transient peer restarts or out-of-band heals recover automatically once the cooldown elapses
+ * (and immediately on eccache_reopen / eccache_forget). */
+typedef struct pfbad {
+    uint8_t oid[16];
+    uint64_t stamp;    /* 0: free */
+    uint64_t until_ns; /* CLOCK_MONOTONIC ns */
+} pfbad;
 
 struct eccache_tier {
     tier *t;
@@ -103,7 +114,8 @@ struct eccache_tier {
     uint64_t budget, bytes, fd_budget, fds;
     eccache_counters n; /* the counters (bytes, entries, objs_open, fds_open, budgets filled in on read) */
     pfstream pfs[PF_STREAMS];
-    uint64_t pf_stamp, pf_bytes;
+    pfbad pf_bad[PF_BAD_SLOTS];
+    uint64_t pf_stamp, pf_bad_stamp, pf_bad_ttl_ns, pf_bytes;
     unsigned pf_cap;          /* granules read ahead per read at most; 0: no prefetch */
     uint64_t pf_call;         /* bytes of one window's range read at most (PF_CALL_BYTES; a test lowers it) */
     _Atomic uint64_t nreads;  /* obj_read calls (counted outside the leaf) */
@@ -441,6 +453,8 @@ static void co_close_list(struct eccache_tier *c, co *o)
     }
 }
 
+static void pf_mark_degraded_locked(struct eccache_tier *c, const uint8_t oid[16]);
+
 /* The CHUNK_ERR_* codes are not the engine's: a store another owner holds or one that failed is an I/O error here. */
 static int map_rc(int rc)
 {
@@ -450,7 +464,7 @@ static int map_rc(int rc)
 }
 
 /* Gives the reader the object of e, open and pinned (obj_put lets go of it). */
-static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
+static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, co **out)
 {
     const ec_record *r = &e->rec;
     chunk_geom gm;
@@ -518,7 +532,10 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
         eccache_test_hook(c->t, ECC_HOOK_OPENED, r->oid);
     pthread_mutex_lock(&c->mu);
     if (rc) {
+        bool still_listed = nw->listed;
         co_remove(c, nw);
+        if (still_listed && (!x || x->listed) && rc != TSDB_ERR_NOMEM)
+            pf_mark_degraded_locked(c, r->oid);
         pthread_cond_broadcast(&c->cv);
         pthread_mutex_unlock(&c->mu);
         free(nw->sums);
@@ -538,14 +555,21 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, co **out)
 /* Lets go of o. `stale`: the read just made saw it degraded (a cell that failed or was rebuilt, a position away, an
  * error), so it leaves the table and the next reader opens it again: a chunk that heal or replace wrote since is a new
  * file (chunkheal.c), and a position that was away at the open may be back; an open object keeps its fds on the old
- * inodes and its positions' state for its life. */
-static void obj_put(struct eccache_tier *c, co *o, bool stale)
+ * inodes and its positions' state for its life. `mark_degraded` records the object in pf_bad under the same lock
+ * acquisition only if o (and x, when given) were still listed, so an in-flight read from before eccache_reopen or
+ * eccache_forget cannot re-poison the cleared object. */
+static void obj_put(struct eccache_tier *c, co *o, bool stale, bool mark_degraded, const ce *x, bool count_corrupt)
 {
     co *vict = NULL;
     pthread_mutex_lock(&c->mu);
     o->pins--;
+    bool still_listed = o->listed;
     if (stale && eccache_mutant != ECC_MUT_KEEPSTALE)
         co_remove(c, o);
+    if (mark_degraded && still_listed && (!x || x->listed))
+        pf_mark_degraded_locked(c, o->oid);
+    if (count_corrupt)
+        c->n.corrupt++;
     if (o->pins == 0 && !o->listed) {
         vict = o; /* out of the table (stale, forgotten, reopened): closed by its last reader */
         o->hnext = NULL;
@@ -581,20 +605,34 @@ static void corrupt_line(const part *p, const struct ecpart *e, const granule *g
             hex);
 }
 
-/* Clears any tracked walk on `oid` (reopen, forget). */
+static uint64_t pf_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Clears any tracked walk and degraded cooldown on `oid` (reopen, forget). */
 static void pf_reset_locked(struct eccache_tier *c, const uint8_t oid[16])
 {
     for (int k = 0; k < PF_STREAMS; k++)
         if (c->pfs[k].stamp && memcmp(c->pfs[k].oid, oid, 16) == 0)
             memset(&c->pfs[k], 0, sizeof c->pfs[k]);
+    for (int k = 0; k < PF_BAD_SLOTS; k++)
+        if (c->pf_bad[k].stamp && memcmp(c->pf_bad[k].oid, oid, 16) == 0)
+            memset(&c->pf_bad[k], 0, sizeof c->pf_bad[k]);
 }
 
-/* Marks `oid` degraded so further misses do not issue extra prefetch reads on a damaged object/stripe. */
+/* Marks `oid` degraded for a monotonic cooldown so further misses do not issue extra prefetch reads on a damaged
+ * object/stripe, and drops any active walks on it so recovery probes cleanly from PF_INIT. */
 static void pf_mark_degraded_locked(struct eccache_tier *c, const uint8_t oid[16])
 {
-    pfstream *s = NULL, *old = &c->pfs[0];
-    for (int k = 0; k < PF_STREAMS; k++) {
-        pfstream *q = &c->pfs[k];
+    for (int k = 0; k < PF_STREAMS; k++)
+        if (c->pfs[k].stamp && memcmp(c->pfs[k].oid, oid, 16) == 0)
+            memset(&c->pfs[k], 0, sizeof c->pfs[k]);
+    pfbad *s = NULL, *old = &c->pf_bad[0];
+    for (int k = 0; k < PF_BAD_SLOTS; k++) {
+        pfbad *q = &c->pf_bad[k];
         if (q->stamp && memcmp(q->oid, oid, 16) == 0) {
             s = q;
             break;
@@ -605,10 +643,24 @@ static void pf_mark_degraded_locked(struct eccache_tier *c, const uint8_t oid[16
     if (!s)
         s = old;
     memcpy(s->oid, oid, 16);
-    s->next = 0;
-    s->n = 0;
-    s->degraded = true;
-    s->stamp = ++c->pf_stamp;
+    s->stamp = ++c->pf_bad_stamp;
+    s->until_ns = pf_now_ns() + c->pf_bad_ttl_ns;
+}
+
+/* True while `oid` is within its degraded cooldown. Does not refresh `stamp` on a hit (so healed entries expire by
+ * both TTL and LRU); clears expired entries so prefetch recovers automatically. */
+static bool pf_is_degraded_locked(struct eccache_tier *c, const uint8_t oid[16])
+{
+    for (int k = 0; k < PF_BAD_SLOTS; k++) {
+        pfbad *q = &c->pf_bad[k];
+        if (q->stamp && memcmp(q->oid, oid, 16) == 0) {
+            if (pf_now_ns() < q->until_ns)
+                return true;
+            memset(q, 0, sizeof *q);
+            return false;
+        }
+    }
+    return false;
 }
 
 /* Reads the granule into x->data and checks it (E11); the reader holds x (LOADING, pinned). When `skip_raw` is set,
@@ -617,11 +669,8 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
                       bool skip_raw)
 {
     co *o = NULL;
-    int rc = obj_get(c, e, &o);
+    int rc = obj_get(c, e, x, &o);
     if (rc) {
-        pthread_mutex_lock(&c->mu);
-        pf_mark_degraded_locked(c, e->rec.oid);
-        pthread_mutex_unlock(&c->mu);
         if (rc == TSDB_ERR_CORRUPT)
             corrupt_line(p, e, g, "the object cannot be opened");
         return rc;
@@ -652,17 +701,10 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
                          (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
     bool degraded = rc != 0 || retried || rep.bad_cells || rep.decoded_cells || !ok;
-    obj_put(c, o, degraded);
     bool mismatch = !ok && rc == 0;
     if (mismatch)
         rc = TSDB_ERR_CORRUPT;
-    if (degraded || rc == TSDB_ERR_CORRUPT) {
-        pthread_mutex_lock(&c->mu);
-        pf_mark_degraded_locked(c, e->rec.oid);
-        if (rc == TSDB_ERR_CORRUPT)
-            c->n.corrupt++;
-        pthread_mutex_unlock(&c->mu);
-    }
+    obj_put(c, o, degraded, degraded || rc == TSDB_ERR_CORRUPT, x, rc == TSDB_ERR_CORRUPT);
     if (rc == TSDB_ERR_CORRUPT)
         corrupt_line(p, e, g, mismatch ? "its bytes fail its checksum after a decode of whole cells"
                                        : "its object lost more chunks of a stripe than it has parity");
@@ -694,31 +736,28 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
     unsigned n = 0;
     pthread_mutex_lock(&c->mu);
     unsigned cap = MIN(c->pf_cap, (unsigned)wcap);
-    pfstream *match = NULL, *old = &c->pfs[0];
+    if (cap && pf_is_degraded_locked(c, oid)) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    pfstream *s = NULL, *old = &c->pfs[0];
     for (int k = 0; k < PF_STREAMS && cap; k++) {
         pfstream *q = &c->pfs[k];
-        if (q->stamp && !memcmp(q->oid, oid, 16)) {
-            match = q;
+        if (q->stamp && q->next == i && !memcmp(q->oid, oid, 16)) {
+            s = q;
             break;
         }
         if (q->stamp < old->stamp)
             old = q;
     }
-    if (match && match->degraded) {
-        match->stamp = ++c->pf_stamp;
-        pthread_mutex_unlock(&c->mu);
-        return 0;
-    }
-    pfstream *s = (match && match->next == i) ? match : NULL;
     if (s && cont)
         n = s->n && eccache_mutant != ECC_MUT_PFNODOUBLE ? MIN(2 * s->n, cap) : MIN(PF_INIT, cap);
     uint64_t callb = c->pf_call;
     if (cap) { /* this miss is where the walk stands now: the next one continues it at i + 1 */
-        pfstream *dst = match ? match : old;
+        pfstream *dst = s ? s : old;
         memcpy(dst->oid, oid, 16);
         dst->next = i + 1;
         dst->n = n;
-        dst->degraded = false;
         dst->stamp = ++c->pf_stamp;
     }
     pthread_mutex_unlock(&c->mu);
@@ -771,7 +810,7 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
                 c->n.pf_peak = c->pf_bytes;
         }
     for (int q = 0; q < PF_STREAMS; q++) /* the walk continues after the window */
-        if (c->pfs[q].next == i + 1 && !memcmp(c->pfs[q].oid, oid, 16)) {
+        if (c->pfs[q].stamp && c->pfs[q].next == i + 1 && !memcmp(c->pfs[q].oid, oid, 16)) {
             c->pfs[q].next = i + 1 + (uint32_t)k;
             break;
         }
@@ -787,13 +826,10 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
 /* Ends the window: each entry checked (ok[q]) turns READY and cached, the rest leave (dropped); pins let go of.
  * `bytes`: the range read's length, 0 when none was made. The window goes to the LRU's front from its far end, so
  * the granule a walk needs next is the warmest of it and a window that makes room for itself loses its far end first. */
-static void pf_finish(struct eccache_tier *c, ce **win, const bool *ok, size_t k, uint64_t bytes,
-                      const uint8_t *degraded_oid)
+static void pf_finish(struct eccache_tier *c, ce **win, const bool *ok, size_t k, uint64_t bytes)
 {
     ce *vict = NULL;
     pthread_mutex_lock(&c->mu);
-    if (degraded_oid)
-        pf_mark_degraded_locked(c, degraded_oid);
     if (bytes) {
         c->n.pf_reads++;
         if (bytes > c->n.pf_call_peak)
@@ -837,8 +873,8 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
         total += win[q]->len;
     uint8_t *b = malloc(total);
     co *o = NULL;
-    int rc = b ? obj_get(c, e, &o) : TSDB_ERR_NOMEM;
-    bool demand = false, degraded = false, pf_injected = false;
+    int rc = b ? obj_get(c, e, x, &o) : TSDB_ERR_NOMEM;
+    bool demand = false, pf_injected = false;
     if (rc == 0) {
         chunk_report rep;
         memset(&rep, 0, sizeof rep);
@@ -850,13 +886,14 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
             rc = o->ops->obj_read(o->o, x->off, total, b, CHUNK_RR_RAW, &rep);
         }
         atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
-        degraded = (!pf_injected && rc != 0) || rep.bad_cells || rep.decoded_cells;
-        obj_put(c, o, rc != 0 || rep.bad_cells || rep.decoded_cells);
+        bool bad_crc = false;
         if (rc == 0) {
             atomic_fetch_add_explicit(&granule_checks, 1 + k, memory_order_relaxed);
             if (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(b, x->len, 0) == x->crc) {
                 memcpy(x->data, b, x->len);
                 demand = true;
+            } else {
+                bad_crc = true;
             }
             uint64_t at = x->len;
             for (size_t q = 0; q < k; q++) {
@@ -865,16 +902,17 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
                 at += y->len;
                 ok[q] = eccache_mutant == ECC_MUT_PFNOCHECK || (uint32_t)xxh64(y->data, y->len, 0) == y->crc;
                 if (!ok[q])
-                    degraded = true;
+                    bad_crc = true;
             }
-            if (!demand)
-                degraded = true;
         }
+        bool stale = rc != 0 || rep.bad_cells || rep.decoded_cells || bad_crc;
+        bool degraded = (!pf_injected && rc != 0) || rep.bad_cells || rep.decoded_cells || bad_crc;
+        obj_put(c, o, stale, degraded, x, false);
     }
     free(b);
     if (eccache_test_hook)
         eccache_test_hook(c->t, ECC_HOOK_PFREAD, e->rec.oid);
-    pf_finish(c, win, ok, k, o != NULL ? total : 0, degraded ? e->rec.oid : NULL);
+    pf_finish(c, win, ok, k, o != NULL ? total : 0);
     if (!demand && eccache_mutant == ECC_MUT_PFNOFALLBACK && rc)
         return map_rc(rc);
     return demand ? 0 : fill_inner(c, p, e, g, x, rc == 0 && o != NULL);
@@ -1096,11 +1134,11 @@ int eccache_tier_open(struct tier *t)
     uint64_t nofile = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY ? rl.rlim_cur : 4096;
     c->fd_budget = MIN(MAX(nofile / 4, 64), 4096); /* a quarter of the process's: tsdbd's connections need the rest */
     const char *pf_env = getenv("TSDB_EC_PREFETCH");
-    bool pf_off = pf_env && (strcmp(pf_env, "0") == 0 || strcmp(pf_env, "off") == 0 || strcmp(pf_env, "OFF") == 0 ||
-                             strcmp(pf_env, "false") == 0 || strcmp(pf_env, "FALSE") == 0 ||
-                             strcmp(pf_env, "no") == 0 || strcmp(pf_env, "NO") == 0);
+    bool pf_off = pf_env && (strcmp(pf_env, "0") == 0 || strcasecmp(pf_env, "off") == 0 ||
+                             strcasecmp(pf_env, "false") == 0 || strcasecmp(pf_env, "no") == 0);
     c->pf_cap = pf_off ? 0 : ECCACHE_PF_CAP;
     c->pf_call = PF_CALL_BYTES;
+    c->pf_bad_ttl_ns = PF_BAD_TTL_NS;
     t->cache = c;
     return 0;
 }
@@ -1227,7 +1265,7 @@ void eccache_get_counters(struct tier *t, eccache_counters *out)
     out->reads = atomic_load_explicit(&c->nreads, memory_order_relaxed);
 }
 
-static void pf_set_cap(struct tier *t, unsigned cap)
+static void pf_set_cap(struct tier *t, unsigned cap, bool reset_peak)
 {
     struct eccache_tier *c = t ? t->cache : NULL;
     if (!c)
@@ -1235,13 +1273,14 @@ static void pf_set_cap(struct tier *t, unsigned cap)
     pthread_mutex_lock(&c->mu);
     c->pf_cap = cap;
     memset(c->pfs, 0, sizeof c->pfs);
-    c->n.pf_peak = c->pf_bytes;
+    if (reset_peak)
+        c->n.pf_peak = c->pf_bytes;
     pthread_mutex_unlock(&c->mu);
 }
 
 void eccache_set_prefetch(struct tier *t, bool on)
 {
-    pf_set_cap(t, on ? ECCACHE_PF_CAP : 0);
+    pf_set_cap(t, on ? ECCACHE_PF_CAP : 0, false);
 }
 
 bool eccache_prefetch_enabled(const struct tier *t)
@@ -1257,7 +1296,7 @@ bool eccache_prefetch_enabled(const struct tier *t)
 
 void eccache_test_prefetch(struct tier *t, unsigned cap)
 {
-    pf_set_cap(t, cap);
+    pf_set_cap(t, cap, true);
 }
 
 void eccache_test_prefetch_call(struct tier *t, uint64_t bytes)
@@ -1266,6 +1305,16 @@ void eccache_test_prefetch_call(struct tier *t, uint64_t bytes)
     pthread_mutex_lock(&c->mu);
     c->pf_call = bytes ? bytes : PF_CALL_BYTES;
     c->n.pf_call_peak = 0;
+    pthread_mutex_unlock(&c->mu);
+}
+
+void eccache_test_pf_bad_ttl_ms(struct tier *t, uint64_t ms)
+{
+    struct eccache_tier *c = t ? t->cache : NULL;
+    if (!c)
+        return;
+    pthread_mutex_lock(&c->mu);
+    c->pf_bad_ttl_ns = ms ? ms * 1000000ull : PF_BAD_TTL_NS;
     pthread_mutex_unlock(&c->mu);
 }
 
@@ -1348,6 +1397,7 @@ void eccache_test_drop(struct tier *t)
     c->budget = b;
     c->fd_budget = f;
     memset(c->pfs, 0, sizeof c->pfs);
+    memset(c->pf_bad, 0, sizeof c->pf_bad);
     pthread_mutex_unlock(&c->mu);
     ce_free_list(vict);
     co_close_list(c, ov);

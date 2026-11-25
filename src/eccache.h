@@ -116,6 +116,8 @@ void eccache_test_fd_budget(struct tier *t, uint64_t fds);
 void eccache_test_prefetch(struct tier *t, unsigned cap);
 /* The bytes of one window's range read at most (0: the default, 4 MiB); resets pf_call_peak. */
 void eccache_test_prefetch_call(struct tier *t, uint64_t bytes);
+/* The monotonic cooldown (ms) a degraded object skips prefetch for (0: the default). */
+void eccache_test_pf_bad_ttl_ms(struct tier *t, uint64_t ms);
 /* While above 0, each window's range read fails (UNAVAILABLE) without reading, and the count goes down by one. */
 extern _Atomic int eccache_test_pf_fail;
 /* Pins the READY entry of (oid, off) as a reader does (NULL: none); eccache_test_unpin lets go of it. */

@@ -61,6 +61,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
@@ -1216,6 +1217,20 @@ static void pf_hook(struct tier *t, int where, const uint8_t oid[16])
     eccache_forget(t, 0, oid);
 }
 
+typedef struct pf_conc_arg {
+    eng *db;
+    uint32_t sid;
+    const buf *want;
+    bool ok;
+} pf_conc_arg;
+
+static void *pf_conc_fn(void *arg)
+{
+    pf_conc_arg *a = arg;
+    a->ok = raw_same(a->db, a->sid, TSDB_FLOAT32, INT64_MIN, INT64_MAX, a->want, "qb concurrent");
+    return NULL;
+}
+
 /* A long scan reads fewer ranges with prefetch on and answers the same; a small budget holds; a pinned entry stays
  * while windows make room (prefetchevictpinned); a granule read ahead whose bytes are wrong is dropped and refused
  * as CORRUPT at its own read (prefetchnocheck: it would be cached unchecked, nothing dropped, nothing refused). */
@@ -1276,7 +1291,8 @@ static void case_prefetch(void)
     free(ts);
     free(v);
     CHECK(eng_flush(x.db) == 0);
-    buf want[3] = {{0}}, wday[DAYS] = {{0}}, wa[DAYS] = {{0}}, we = {0}, wq = {0}, wa2h = {0}, wa5 = {0}, wa12h = {0};
+    buf want[3] = {{0}}, wday[DAYS] = {{0}}, wa[DAYS] = {{0}}, we = {0}, wq = {0}, wqb = {0}, wa2h = {0}, wa5 = {0},
+        wa12h = {0};
     int rc;
     for (int d = 0; d < DAYS; d++) {
         raw_all(x.db, s[0], ty[0], d * DAY, (d + 1) * DAY - 1, &wa[d], &rc);
@@ -1285,6 +1301,8 @@ static void case_prefetch(void)
     raw_all(x.db, se, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &we, &rc);
     CHECK(rc == 0);
     raw_all(x.db, sq[0], TSDB_FLOAT32, INT64_MIN, INT64_MAX, &wq, &rc);
+    CHECK(rc == 0);
+    raw_all(x.db, sq[1], TSDB_FLOAT32, INT64_MIN, INT64_MAX, &wqb, &rc);
     CHECK(rc == 0);
     raw_all(x.db, s[0], ty[0], 0, 2 * HOUR - 1, &wa2h, &rc);
     CHECK(rc == 0);
@@ -1514,6 +1532,8 @@ static void case_prefetch(void)
     eccache_test_prefetch_call(x.t, 0);
 
     /* 10 (r8p F6): runtime and env off-switch (default ON, TSDB_EC_PREFETCH=0 off, eccache_set_prefetch off/on) */
+    eccache_set_prefetch(NULL, false);
+    CHECK(!eccache_prefetch_enabled(NULL));
     CHECK(eccache_prefetch_enabled(x.t));
     eccache_set_prefetch(x.t, false);
     CHECK(!eccache_prefetch_enabled(x.t));
@@ -1533,10 +1553,12 @@ static void case_prefetch(void)
           k1.reads - k0.reads < k1.misses - k0.misses + (k1.prefetched - k0.prefetched));
 
     /* 11 (r8p F7): damaged/reconstructed stripe suppresses further prefetch reads on that object */
-    /* (a) missing chunk (<= m): every read reconstructs via parity -> zero prefetch reads (old code prefetched 20) */
+    /* (a) missing chunk (<= m): every read reconstructs via parity -> zero prefetch reads, and recovers
+     * automatically after the monotonic cooldown elapses without eccache_reopen */
     char cpath[4096], chid[4200];
     CHECK(chunk_path(pa[0]->ec->rec.oid, 0, cpath, sizeof cpath));
     snprintf(chid, sizeof chid, "%s.hid", cpath);
+    eccache_test_pf_bad_ttl_ms(x.t, 120);
     CHECK(rename(cpath, chid) == 0);
     eccache_test_drop(x.t);
     eccache_get_counters(x.t, &k0);
@@ -1545,6 +1567,15 @@ static void case_prefetch(void)
     CHECK(k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched && k1.pf_dropped == k0.pf_dropped);
     CHECK(k1.reads - k0.reads == pa[0]->ix.n);
     CHECK(rename(chid, cpath) == 0);
+    struct timespec nap = {0, 180000000};
+    nanosleep(&nap, NULL);
+    eccache_test_drop_entries(x.t); /* keeps pf_bad intact; cooldown expiry must restore prefetch */
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, healed after cooldown"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads > k0.pf_reads && k1.prefetched > k0.prefetched && k1.retries == k0.retries);
+    eccache_test_pf_bad_ttl_ms(x.t, 0);
+
     /* (b) silent rot in chunk 0 of pa[1] (whole-cell retry): zero prefetch reads (old code issued wasted windows) */
     CHECK(chunk_path(pa[1]->ec->rec.oid, 0, cpath, sizeof cpath));
     chunk_geom rg;
@@ -1569,8 +1600,93 @@ static void case_prefetch(void)
     CHECK(k1.retries > k0.retries && k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched &&
           k1.pf_dropped == k0.pf_dropped);
     CHECK(k1.reads - k0.reads == pa[1]->ix.n + (k1.retries - k0.retries));
-    printf("test_seam: prefetch: degraded/rot chunks issue 0 prefetch reads (%" PRIu64 " retries)\n",
-           k1.retries - k0.retries);
+
+    /* (c) silent rot ONLY in granule 1 of pa[2] (granule 0 healthy): exercises fill_ahead with demand == false and
+     * fill_inner(..., skip_raw = true) -> exact reads (no duplicate RAW read), zero subsequent prefetch reads, and
+     * eccache_reopen immediately restores prefetch */
+    granule g1;
+    gx_load(pa[2], 1, GW_LOC, &g1);
+    uint64_t g1_off = g1.off + g1.ts_len + g1.val_len / 2;
+    CHECK(chunk_geom_make(&rg, pa[2]->ec->rec.k, pa[2]->ec->rec.m, pa[2]->ec->rec.cell_bytes,
+                          pa[2]->ec->rec.object_len) == 0);
+    uint64_t g1_cell = g1_off / rg.cell;
+    unsigned g1_pos = (unsigned)(g1_cell % rg.k);
+    uint64_t g1_foff = CHUNK_HDR_BYTES + (g1_cell / rg.k) * rg.cell + (g1_off % rg.cell);
+    CHECK(chunk_path(pa[2]->ec->rec.oid, g1_pos, cpath, sizeof cpath));
+    rfd = open(cpath, O_RDWR);
+    CHECK(rfd >= 0);
+    if (rfd >= 0) {
+        uint8_t b;
+        CHECK(pread(rfd, &b, 1, (off_t)g1_foff) == 1);
+        b ^= 0x5a;
+        CHECK(pwrite(rfd, &b, 1, (off_t)g1_foff) == 1);
+        close(rfd);
+    }
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 2 * DAY, 3 * DAY - 1, &wa[2], "pa, rot in granule 1 (skip_raw)"));
+    eccache_get_counters(x.t, &k1);
+    /* granule 0: 1 RAW; granule 1: 1 RAW window (2..5 healthy, cached) + 1 whole-cell retry (skip_raw=true);
+     * granules 6..N-1: N-6 single RAW reads with prefetch suppressed -> total reads == N - 3 */
+    CHECK(k1.pf_reads - k0.pf_reads == 1 && k1.prefetched - k0.prefetched == 4 && k1.retries - k0.retries == 1);
+    CHECK(k1.reads - k0.reads == pa[2]->ix.n - 3);
+    /* heal granule 1 on disk and verify eccache_reopen clears degraded immediately (under default 5 s TTL) */
+    rfd = open(cpath, O_RDWR);
+    CHECK(rfd >= 0);
+    if (rfd >= 0) {
+        uint8_t b;
+        CHECK(pread(rfd, &b, 1, (off_t)g1_foff) == 1);
+        b ^= 0x5a;
+        CHECK(pwrite(rfd, &b, 1, (off_t)g1_foff) == 1);
+        close(rfd);
+    }
+    eccache_test_drop_entries(x.t); /* keeps pf_bad; eccache_reopen must clear it */
+    eccache_reopen(x.t, 0, pa[2]->ec->rec.oid);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 2 * DAY, 3 * DAY - 1, &wa[2], "pa, healed + eccache_reopen"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads - k0.pf_reads > 1 && k1.prefetched - k0.prefetched > 4 && k1.retries == k0.retries);
+    printf("test_seam: prefetch: degraded/rot chunks suppress prefetch, skip_raw verified, cooldown & reopen restore\n");
+
+    /* 12: interleaved and concurrent multi-series sequential scans on a shared .ec part (pq: qa and qb) must keep
+     * independent pfstream slots and both prefetch */
+    uint32_t qa_idx[32], qb_idx[32], nqa = 0, nqb2 = 0;
+    for (uint32_t j = 0; j < pq->ix.n; j++) {
+        if (gx_series(pq, j) == sq[0] && nqa < 32)
+            qa_idx[nqa++] = j;
+        else if (gx_series(pq, j) == sq[1] && nqb2 < 32)
+            qb_idx[nqb2++] = j;
+    }
+    CHECK(nqa >= 8 && nqb2 >= 8);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    for (uint32_t j = 0; j < nqa && j < nqb2; j++) {
+        granule ga, gb;
+        gx_load(pq, qa_idx[j], GW_TIME, &ga);
+        gx_load(pq, qb_idx[j], GW_TIME, &gb);
+        buf ba = {0}, bb = {0};
+        int rca = 0, rcb = 0;
+        raw_all(x.db, sq[0], TSDB_FLOAT32, ga.ts_min, ga.ts_max, &ba, &rca);
+        raw_all(x.db, sq[1], TSDB_FLOAT32, gb.ts_min, gb.ts_max, &bb, &rcb);
+        CHECK(rca == 0 && rcb == 0 && ba.n > 0 && bb.n > 0);
+        free(ba.b);
+        free(bb.b);
+    }
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads - k0.pf_reads >= 2 && k1.prefetched - k0.prefetched >= 8 &&
+          k1.pf_used - k0.pf_used == k1.prefetched - k0.prefetched);
+    /* concurrent 2-thread scan of qa and qb on pq */
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    pf_conc_arg ca = {.db = x.db, .sid = sq[1], .want = &wqb, .ok = false};
+    pthread_t cth;
+    CHECK(pthread_create(&cth, NULL, pf_conc_fn, &ca) == 0);
+    CHECK(raw_same(x.db, sq[0], TSDB_FLOAT32, INT64_MIN, INT64_MAX, &wq, "qa concurrent"));
+    CHECK(pthread_join(cth, NULL) == 0);
+    CHECK(ca.ok);
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads - k0.pf_reads >= 2 && k1.prefetched - k0.prefetched >= 8);
+    printf("test_seam: prefetch: interleaved & concurrent scans on shared .ec part both prefetch\n");
 
     /* Env switch TSDB_EC_PREFETCH=0 on a fresh tier (reattaching pa[0] from its record) */
     ec_record pa0_rec = pa[0]->ec->rec;
@@ -1606,6 +1722,7 @@ static void case_prefetch(void)
 
     free(we.b);
     free(wq.b);
+    free(wqb.b);
     free(wa2h.b);
     free(wa5.b);
     free(wa12h.b);
