@@ -199,6 +199,7 @@
 #include "../../src/health_rules.h"
 #include "../harness.h"
 #include "../outagefs_ctl.h"
+#include "outage_judge.h"
 
 #define NSERIES 4        /* kv */
 #define NKEYS 6000
@@ -2931,7 +2932,7 @@ static bool outage_volume_failed(void)
     bool failed = false;
     if (tsdbc_topology(c, &t) == 0 && t) {
         for (size_t i = 0; i < t->nvols; i++)
-            failed |= t->vols[i].health == TSDB_HEALTH_UNAVAILABLE && t->vols[i].reason == TSDB_WHY_DIVERGED;
+            failed |= outage_entry_failed(t->vols[i].health, t->vols[i].reason);
         tsdbc_topology_free(t);
     }
     tsdbc_close(c);
@@ -3025,7 +3026,7 @@ static void outage_await_recovery(int v, int64_t since, const char *what)
             if (outage_volume_failed()) {
                 outage_problems++;
                 fprintf(stderr, "  volume %d: no write acknowledged in %d s after the heal (%s), and the server reports a volume as failed "
-                        "(UNAVAILABLE, reason DIVERGED): it will not come back\n", v, OUTAGE_HARD_S, what);
+                        "(reason DIVERGED or LOST): it will not come back\n", v, OUTAGE_HARD_S, what);
             } else {
                 INCONCLUSIVE("outage-heal", "volume %d: still no write acknowledged %d s after the heal (%s%s): the server reports no failure, "
                              "so this is a stall of the disk or the machine\n", v, OUTAGE_HARD_S, what,

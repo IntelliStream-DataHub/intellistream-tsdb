@@ -4176,7 +4176,7 @@ public final class TsdbClient implements AutoCloseable {
      * budget would be over, or a MOVED with nowhere to go).
      */
     private boolean retryStep(ErrorInfo e, Retry r) {
-        if (retryNanos <= 0)
+        if (retryNanos <= 0 || e.lost()) /* LOST: the data will not come back (design-cluster-data.md E15) */
             return false;
         long now = System.nanoTime();
         if (!r.started) {

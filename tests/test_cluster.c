@@ -13405,6 +13405,255 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
     }
 }
 
+/* margins (R8-2, r8o-margins; design-cluster-data.md E15, E24, server/margins.h): STATUS of an ec=4+2 volume with 3
+ * replicas on six servers says young margin 2 (ISR 3 - 1), settled margin 2 (6 positions - k) and tier ok; a killed
+ * stripe member that holds no replica takes the settled margin to 1 and leaves the young one; a killed replica takes
+ * both down by one once it left the ISR; each back, both are 2 again. Then the test hook TSDBD_TEST_COLD: three stripe
+ * members declared destroyed (alive) make the tier lost, and a read of the volume on its leader (refused as a settled
+ * read short of k positions) answers UNAVAILABLE with TSDB_WHY_LOST at once, never retried by the C client; two
+ * destroyed and one away is unavailable, reason UNREACHABLE, which the client retries until its budget; LOST carries
+ * retry_after TSDB_RETRY_MAX_MS (a client that does not know LOST must not retry it every millisecond); a young
+ * part's CORRUPT leaves the tier ok, a settled read that answers CORRUPT makes the leader's tier corrupt (only there,
+ * and until a restart). Every STATUS check is repeated on the metrics port (tsdb_volume_young_margin,
+ * _settled_margin, _settled_state) of the servers that serve one. Mutants: tests/margin_mutants.sh. */
+static int margin_mports[6]; /* the metrics port of server i in scen_margins (0: none) */
+static int status_key(int i, const char *key, char *val, size_t vn)
+{
+    tsdbc *c = client(i);
+    char *text = NULL, k[96];
+    int rc = tsdbc_status(c, &text);
+    tsdbc_close(c);
+    if (rc != 0)
+        return 0;
+    snprintf(k, sizeof k, "\n%s=", key);
+    const char *at = strstr(text, k);
+    int found = at != NULL;
+    if (found) {
+        at += strlen(k);
+        size_t n = strcspn(at, "\n");
+        snprintf(val, vn, "%.*s", (int)n, at);
+    }
+    free(text);
+    return found;
+}
+
+static void await_margins(int i, uint32_t num, int young, int settled, const char *tier, int ms, const char *what)
+{
+    char ky[64], ks[64], kt[64], y[32] = "-", st[32] = "-", t[32] = "-", wy[16], ws[16];
+    snprintf(ky, sizeof ky, "vol.%u.young_margin", (unsigned)num);
+    snprintf(ks, sizeof ks, "vol.%u.settled_margin", (unsigned)num);
+    snprintf(kt, sizeof kt, "vol.%u.tier", (unsigned)num);
+    snprintf(wy, sizeof wy, "%d", young);
+    snprintf(ws, sizeof ws, "%d", settled);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int ok = status_key(i, ky, y, sizeof y) & status_key(i, ks, st, sizeof st) & status_key(i, kt, t, sizeof t);
+        if (ok && strcmp(y, wy) == 0 && strcmp(st, ws) == 0 && strcmp(t, tier) == 0)
+            break;
+        if (now_ms() - t0 > (uint64_t)ms)
+            die("%s: STATUS of server %d says young_margin %s settled_margin %s tier %s, want %d %d %s (%d ms)", what,
+                i, y, st, t, young, settled, tier, ms);
+    }
+    printf("  %s: young margin %d, settled margin %d, tier %s\n", what, young, settled, tier);
+    if (margin_mports[i] <= 0)
+        return;
+    /* the metrics port says the same (from the same copy, which only moves forward) */
+    static char buf[1 << 20];
+    metrics_get(margin_mports[i], buf, sizeof buf);
+    static const char *const states[] = {"ok", "unavailable", "corrupt", "lost"};
+    char key[128];
+    const char *l;
+    snprintf(key, sizeof key, "\ntsdb_volume_young_margin{volume=\"%u\"} ", (unsigned)num);
+    if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != young)
+        die("%s: server %d's metrics say tsdb_volume_young_margin %s, not %d", what, i, l ? l + strlen(key) : "missing",
+            young);
+    snprintf(key, sizeof key, "\ntsdb_volume_settled_margin{volume=\"%u\"} ", (unsigned)num);
+    if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != settled)
+        die("%s: server %d's metrics say tsdb_volume_settled_margin %s, not %d", what, i,
+            l ? l + strlen(key) : "missing", settled);
+    for (size_t k = 0; k < sizeof states / sizeof *states; k++) {
+        snprintf(key, sizeof key, "\ntsdb_volume_settled_state{volume=\"%u\",state=\"%s\"} ", (unsigned)num,
+                 states[k]);
+        int want = strcmp(states[k], tier) == 0;
+        if (!(l = strstr(buf, key)) || l[strlen(key)] != '0' + want)
+            die("%s: server %d's metrics say tsdb_volume_settled_state %s %s, not %d", what, i, states[k],
+                l ? l + strlen(key) : "missing", want);
+    }
+}
+
+static void cold_file(const char *path, const char *text)
+{
+    char tmp[PATH_MAX + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f || fputs(text, f) < 0 || fclose(f) != 0 || rename(tmp, path) != 0)
+        die("write %s: %s", path, strerror(errno));
+}
+
+static int no_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ctx, (void)ts, (void)v, (void)n;
+    return 0;
+}
+
+static void scen_margins(void)
+{
+    scenario("margins");
+    static char cold[PATH_MAX], pe[PATH_MAX + 32];
+    snprintf(cold, sizeof cold, "%s/cold-hook", base);
+    snprintf(pe, sizeof pe, "TSDBD_TEST_COLD=%s", cold);
+    for (int i = 0; i < 6; i++) {
+        penv[i] = pe;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view vw;
+    view(0, &vw);
+    uint8_t uuid[16];
+    memcpy(uuid, vw.m.uuid, 16);
+    view_free(&vw);
+    static char xa[6][PATH_MAX + 64];
+    for (int i = 0; i < 6; i++) { /* restart_with_store's, with a metrics port */
+        char sd[PATH_MAX];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --metrics-port auto", sd);
+        restart_xargs(i, xa[i]);
+        margin_mports[i] = th_mport;
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "m42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 m42 with six stores: %s (%s)", cluster_strerror(rc), text);
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "m42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of m42 with a leader in server 0's copy 30 s after the add");
+    if (e.redundancy != META_RED_EC || e.nstripe != 6 || e.nrep != 3)
+        die("m42: redundancy %u nstripe %" PRIu32 " replicas %" PRIu32, e.redundancy, e.nstripe, e.nrep);
+    int L = server_of(e.leader), R = -1, S = -1;
+    for (uint32_t k = 0; k < e.nrep; k++)
+        if (e.rep[k].node != e.leader)
+            R = server_of(e.rep[k].node); /* a replica that does not lead */
+    for (int i = 0; i < 6 && S < 0; i++) {
+        bool rep = false;
+        for (uint32_t k = 0; k < e.nrep; k++)
+            rep |= server_of(e.rep[k].node) == i;
+        if (!rep)
+            S = i; /* a stripe member without a replica (every member is in the group of six) */
+    }
+    if (L < 0 || R < 0 || S < 0)
+        die("m42: leader server %d, replica %d, stripe-only member %d", L, R, S);
+    await_isr(L, "m42", 3, 30000, "m42 with every replica");
+    await_margins(L, num, 2, 2, "ok", 30000, "every member up");
+
+    /* a stripe member down: the settled tier is one loss from unavailable, the young tier keeps its ISR */
+    stop(S, SIGKILL);
+    await_margins(L, num, 2, 1, "ok", 30000, "a stripe member killed");
+    start(S);
+    margin_mports[S] = th_mport;
+    await_margins(L, num, 2, 2, "ok", 30000, "the stripe member back");
+
+    /* a replica down: it leaves the ISR once the leader has something for it (writes), and both margins drop */
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid id = rep_series(c, rep_names[0], "m42", 30000);
+    stop(R, SIGKILL);
+    struct rep_writer w = {cports[L], id, 5000, 3, 0, 0, 0, 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    await_writer(&w, th, 60000, "writes with a replica killed");
+    await_isr(L, "m42", 2, 30000, "a replica killed");
+    await_margins(L, num, 1, 1, "ok", 30000, "a replica killed");
+    start(R);
+    margin_mports[R] = th_mport;
+    w = (struct rep_writer){cports[L], id, 9000, 3, 0, 0, 0, 0};
+    if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
+        die("pthread_create");
+    await_writer(&w, th, 60000, "writes with the replica back");
+    await_isr(L, "m42", 3, 60000, "the replica back");
+    await_margins(L, num, 2, 2, "ok", 30000, "the replica back");
+
+    /* lost: more than m positions on members declared destroyed (alive: a destroyed position never counts) */
+    char line[160];
+    int O = -1; /* another member that stays up */
+    for (int i = 0; i < 6 && O < 0; i++)
+        if (i != L && i != S)
+            O = i;
+    snprintf(line, sizeof line, "destroyed %u %u %u\nreads\n", (unsigned)e.stripe[0], (unsigned)e.stripe[1],
+             (unsigned)e.stripe[2]);
+    cold_file(cold, line);
+    await_margins(L, num, 2, -1, "lost", 10000, "three positions declared destroyed");
+    await_margins(O, num, 2, -1, "lost", 10000, "three positions declared destroyed, on another member");
+    tsdbc_set_retry(c, 30000);
+    uint64_t t0 = now_ms();
+    rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL);
+    uint64_t took = now_ms() - t0;
+    tsdb_unavail u[4];
+    unsigned nu = 0;
+    if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, u, 4, &nu) != 0 || nu != 1 || u[0].reason != TSDB_WHY_LOST ||
+        u[0].vol != num)
+        die("a settled read of a lost volume: %s, %u entries, reason %u volume %u (want UNAVAILABLE, LOST, %u)",
+            ers(rc), nu, nu ? u[0].reason : 0, nu ? u[0].vol : 0, (unsigned)num);
+    if (took > 1000)
+        die("a settled read of a lost volume took %llu ms: the client retried LOST", (unsigned long long)took);
+    if (u[0].retry_after_ms != TSDB_RETRY_MAX_MS) /* a client that does not know LOST waits this long, or gives up */
+        die("LOST says retry_after %" PRIu32 " ms, not %u: a client that does not know LOST would retry it that often",
+            u[0].retry_after_ms, (unsigned)TSDB_RETRY_MAX_MS);
+    printf("  a settled read of the lost volume: UNAVAILABLE (LOST) in %llu ms, not retried\n",
+           (unsigned long long)took);
+
+    /* two destroyed and one away (the stripe-only member: the ISR stays whole): unavailable, retried (reason
+     * UNREACHABLE) until the budget runs out */
+    uint32_t dn[2], nd = 0;
+    for (uint32_t p = 0; p < e.nstripe && nd < 2; p++)
+        if (server_of(e.stripe[p]) != S)
+            dn[nd++] = e.stripe[p];
+    snprintf(line, sizeof line, "destroyed %u %u\nreads\n", (unsigned)dn[0], (unsigned)dn[1]);
+    cold_file(cold, line);
+    stop(S, SIGKILL);
+    await_margins(L, num, 2, -1, "unavailable", 30000, "two positions destroyed and one away");
+    tsdbc_set_retry(c, 1500);
+    t0 = now_ms();
+    rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL);
+    took = now_ms() - t0;
+    if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, u, 4, &nu) != 0 || nu != 1 ||
+        u[0].reason != TSDB_WHY_UNREACHABLE)
+        die("a settled read short of k positions: %s, %u entries, reason %u (want UNAVAILABLE, UNREACHABLE)", ers(rc),
+            nu, nu ? u[0].reason : 0);
+    /* retried at least once: the first refusal's delay is 1000 ms +-20%, and the second's would pass the 1500 ms
+     * budget, so the client gives up right after its one retry, at 800 ms or later (never a tuned bound) */
+    if (took < 800)
+        die("a settled read short of k positions gave up after %llu ms: UNREACHABLE is retried within the budget",
+            (unsigned long long)took);
+    start(S);
+    margin_mports[S] = th_mport;
+    cold_file(cold, "reads\ncorrupt-young\n");
+    await_margins(L, num, 2, 2, "ok", 60000, "the member back, nothing destroyed");
+
+    /* a young part's damage: answered CORRUPT, the settled tier stays ok (frame_put marks it before the reply) */
+    tsdbc_set_retry(c, 0);
+    if ((rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL)) != TSDB_ERR_CORRUPT)
+        die("a read with the corrupt-young hook: %s, not CORRUPT", ers(rc));
+    await_margins(L, num, 2, 2, "ok", 2000, "a young part's read answered CORRUPT (on the leader)");
+
+    /* corrupt: a settled read that answers CORRUPT marks this server's view of the tier, until a restart */
+    cold_file(cold, "reads\ncorrupt\n");
+    if ((rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL)) != TSDB_ERR_CORRUPT)
+        die("a settled read with the corrupt hook: %s, not CORRUPT", ers(rc));
+    cold_file(cold, "\n");
+    await_margins(L, num, 2, 2, "corrupt", 10000, "a read answered CORRUPT (on the leader)");
+    await_margins(O, num, 2, 2, "ok", 10000, "a read answered CORRUPT on the leader (another member)");
+    tsdbc_close(c);
+}
+
 static void scen_ecadd(void)
 {
     scenario("ecadd");
@@ -17461,7 +17710,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

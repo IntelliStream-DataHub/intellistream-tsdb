@@ -1895,6 +1895,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DEFAULT_PORT", tc::DEFAULT_PORT)?;
     m.add("PROTOCOL_VERSION", tc::PROTOCOL_VERSION)?;
     m.add("DEFAULT_COMPRESSION", tc::DEFAULT_COMPRESSION)?;
+    m.add("WHY_LOST", tc::WHY_LOST)?;
     m.add("VALUE_TYPES", ValueType::ALL.map(ValueType::name).to_vec())?;
     for (name, s) in [
         ("ERR_IO", tc::Status::Io),

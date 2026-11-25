@@ -309,6 +309,25 @@ class HaTest {
     }
 
     @Test
+    void lostIsNotRetried() throws Exception {
+        /* reason TSDB_WHY_LOST (18): the settled data's holders were declared destroyed; asking again cannot help */
+        byte[] body = unavailableBody(1, 300);
+        body[4] = (byte) ErrorInfo.WHY_LOST;
+        try (Fake f = new Fake(r -> r.nth() == 0 ? new Reply(-11, body) : ok());
+                TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+            long t0 = System.nanoTime();
+            TsdbException e = assertThrows(TsdbException.class, c::flush);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertEquals(Status.ERR_UNAVAILABLE, e.status());
+            assertTrue(ms < 250, "waited " + ms + " ms");
+            assertEquals(1, f.seen(OP_FLUSH).size(), "a LOST refusal was sent again");
+            assertTrue(c.lastError().lost());
+            assertEquals(18, c.lastError().unavailable().get(0).reason());
+            c.flush(); /* the refusal is an answer: the connection goes on */
+        }
+    }
+
+    @Test
     void retryOffReturnsTheFirstRefusal() throws Exception {
         try (Fake f = new Fake(r -> unavailable(5)); TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             c.setRetry(Duration.ZERO);

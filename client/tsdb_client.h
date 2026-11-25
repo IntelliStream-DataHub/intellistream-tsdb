@@ -131,7 +131,8 @@ int tsdbc_wait(tsdbc *c);
  * the status. A MOVED goes to the node it names, or another node of the connect string (tsdbc_connect_nodes), and
  * is sent again there. Pipelined inserts (tsdbc_insert_async) that were refused are sent again in order from the
  * first refused one, those acknowledged after it too (last write wins keeps that safe: the same rows, the same
- * order). Not retried: a query whose reply has begun (rows were delivered), QUERY_MULTI, and an I/O error or
+ * order). Not retried: an UNAVAILABLE that names TSDB_WHY_LOST (the data will not come back), a query whose reply
+ * has begun (rows were delivered), QUERY_MULTI, and an I/O error or
  * timeout (the request may have been applied: the caller decides). TSDB_ERR_PARTIAL and TSDB_ERR_DROPPED are
  * returned with their bodies; a server of one node never sends them. DROPPED rows are never to be sent again.
  * A single request that is refused for the whole budget costs that budget in latency: set it lower (or 0 for none)

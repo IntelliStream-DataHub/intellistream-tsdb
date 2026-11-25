@@ -133,6 +133,22 @@ def test_the_exception_carries_the_body(fake):
     assert len(f.seen(OP_FLUSH)) == 1
 
 
+def test_lost_is_not_retried(fake):
+    # reason WHY_LOST (18): the settled data's holders were declared destroyed; asking again cannot help
+    body = bytearray(unavailable_body(1, 300))
+    body[4] = tsdb_client.WHY_LOST
+    assert tsdb_client.WHY_LOST == 18
+    f = fake(lambda op, nth: (-11, bytes(body)) if nth == 0 else (0, b""))
+    with Client("127.0.0.1", f.port) as c:
+        t0 = time.monotonic()
+        with pytest.raises(TsdbUnavailable) as e:
+            c.flush()
+        assert time.monotonic() - t0 < 0.25
+        assert len(f.seen(OP_FLUSH)) == 1, "a LOST refusal was sent again"
+        assert e.value.entries[0]["reason"] == tsdb_client.WHY_LOST
+        c.flush()  # the refusal is an answer: the connection goes on
+
+
 def test_the_budget_runs_out(fake):
     f = fake(lambda op, nth: unavailable(400))
     with Client("127.0.0.1", f.port, retry=1.5) as c:

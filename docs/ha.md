@@ -1152,7 +1152,16 @@ The row numbers refer to the stall map (rows 1-16).
 >   `vol.<n>.reason`, `domain.<d>.state`, ...); every client returns the text without the length. `since_gen` of
 >   TOPOLOGY is reserved: 13 answers in full whatever it is and the clients send none.
 >   On a cluster node STATUS's `node.id` is the member id, followed by `cluster.applied` and
->   `peer.<id>.addr`, `peer.<id>.peer`, `peer.<id>.alive` of every other member, from the copy.
+>   `peer.<id>.addr`, `peer.<id>.peer`, `peer.<id>.alive` of every other member, from the copy, and per cluster volume
+>   its margins (design-cluster-data.md E15, E24; `server/margins.h`): `vol.<n>.young_margin` (in-sync replicas minus
+>   one; none for a shared volume, whose candidates hold no copies) and, for an erasure-coded volume,
+>   `vol.<n>.settled_margin` (stripe positions present minus k: members up in the copy, not their chunk stores) and
+>   `vol.<n>.tier` (`ok`, `unavailable`, `corrupt`: a settled read answered CORRUPT here, `lost`). They are the copy's
+>   at `cluster.applied`: a member cut off from the metadata group reports its last copy. TOPOLOGY gets the margins
+>   with protocol 16 (its decoders refuse bytes they do not know). An UNAVAILABLE entry with reason `TSDB_WHY_LOST`
+>   (18: settled data whose holders were declared destroyed) is never retried by the clients; it carries
+>   `retry_after_ms` 60000, so an older client, which retries it as any UNAVAILABLE, gives up within its default
+>   budget of 30 s, or waits a minute between tries.
 > - **Who sees the bodies.** A connection reads the HA bodies only if its HELLO said 13: tsdbd keeps the negotiated
 >   version per connection and sends a 12 client the bare status of every op (protocol 12 reads a longer error reply as
 >   corrupt). In QUERY_MULTI only the END frame carries the body; a per-series frame with status UNAVAILABLE is bare.

@@ -31,6 +31,8 @@ DEFAULT_PORT: int
 PROTOCOL_VERSION: int
 """The protocol version this client speaks."""
 DEFAULT_COMPRESSION: int
+WHY_LOST: int
+"""An UNAVAILABLE entry's reason: settled data of a cluster volume whose holders were declared destroyed. It will not come back, so it is never retried."""
 """The zstd level a new client compresses inserts with (1)."""
 ERR_IO: int
 ERR_NOMEM: int

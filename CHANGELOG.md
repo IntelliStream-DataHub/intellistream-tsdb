@@ -382,6 +382,12 @@ live in their own packages, so that the network clients can stay Apache-2.0 with
 
 ### Added
 
+- Cluster volumes report their margins (design-cluster-data.md E15, E24): STATUS `vol.<n>.young_margin` (in-sync
+  replicas minus one) and, for an erasure-coded volume, `vol.<n>.settled_margin` (stripe positions present minus k) and
+  `vol.<n>.tier` (ok, unavailable, corrupt, lost), and the same on the metrics port (`tsdb_volume_young_margin`,
+  `tsdb_volume_settled_margin`, `tsdb_volume_settled_state`). New UNAVAILABLE reason `TSDB_WHY_LOST` (18): settled data
+  whose holders were declared destroyed; the four clients name it (`WHY_LOST`) and never retry it (an older client
+  retries it as any UNAVAILABLE). No protocol number: TOPOLOGY gets the margins with protocol 16.
 - `tsdb cluster` with no arguments (or `help`) prints the cluster commands and options (it printed the general usage and
   exited with 2). New tutorial for the cluster preview, [docs/cluster-preview.md](docs/cluster-preview.md): three servers
   and a witness on one machine, the leader killed and restarted; `tests/test_cluster_tutorial.sh` runs its command block.
