@@ -1,0 +1,207 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/*
+ * tsdbd's instance of the peer cold ops (server/chunkpeer.h, R8 r8f): the transport over the chunk server's links
+ * (chunksrv_call, chunksrv_put_remote on chunksrv_cluster(); this member's own position handed to its own chunk server
+ * in process), the view of a volume from the metadata copy (cluster_copy_get: the stripe group by position, the
+ * volume's epoch, cluster_copy_caught_up_at), the tier's cluster hook (tier_set_cluster: an ec volume attaches with
+ * coldops_peer, the copy's k and m and the --ec-* settings) and chunksrv's epoch source for an unsure store.
+ *
+ * Links (r8f requirement 2): chunksrv_cluster.c already dials CHUNK and CHUNKB to every member of the copy and drops
+ * the ones that left (chunksrv_keep_peers), a superset of every stripe group this member leads or replicates, kept
+ * as fwd_cluster.c keeps FWD links; nothing here dials.
+ *
+ * The epoch source is installed by a small thread once the chunk server serves (chunksrv_cluster() is NULL before):
+ * until then an unsure store refuses puts and deletes, the safe side.
+ */
+#include "chunkpeer.h"
+
+#include "../include/tsdb.h"
+#include "../src/feed.h"
+#include "../src/tier.h"
+#include "chunksrv.h"
+#include "cluster.h"
+#include "meta.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifdef TSDB_EC
+
+static struct chunkpeer G;
+static pthread_t src_th;
+static atomic_bool src_stop, src_started;
+
+static uint32_t self_id(const struct cluster_copy *c) { return c ? c->self : 0; }
+
+static int net_call(void *arg, uint32_t node, const struct cs_req *r, int timeout_ms, int32_t *rc, uint8_t **body,
+                    size_t *body_len)
+{
+    (void)arg;
+    struct chunksrv *cs = chunksrv_cluster();
+    if (!cs)
+        return TSDB_ERR_UNAVAILABLE; /* no chunk server here (yet): every member is away as far as we know */
+    const struct cluster_copy *c = cluster_copy_get();
+    uint32_t self = self_id(c);
+    cluster_copy_put(c);
+    if (self && node == self)
+        return chunkpeer_local_call(cs, self, r, rc, body, body_len);
+    return chunksrv_call(cs, node, r, timeout_ms, rc, body, body_len);
+}
+
+static int net_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd, uint64_t base, uint64_t sum,
+                   int timeout_ms, uint64_t *answered)
+{
+    (void)arg;
+    struct chunksrv *cs = chunksrv_cluster();
+    if (!cs)
+        return TSDB_ERR_UNAVAILABLE;
+    const struct cluster_copy *c = cluster_copy_get();
+    uint32_t self = self_id(c);
+    cluster_copy_put(c);
+    if (self && node == self)
+        return chunkpeer_local_put(cs, self, m, fd, base, answered);
+    /* chunksrv_put_remote compares the PUT_OK's sum itself (TSDB_ERR_IO when it differs): 0 means it answered sum */
+    int rc = chunksrv_put_remote(cs, node, m, fd, base, sum, timeout_ms);
+    if (rc == 0)
+        *answered = sum;
+    return rc;
+}
+
+static int view(void *arg, uint32_t volume, struct chunkpeer_view *v)
+{
+    (void)arg;
+    memset(v, 0, sizeof *v);
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return TSDB_ERR_NOTFOUND;
+    const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+    int rc = TSDB_ERR_NOTFOUND;
+    if (cv && cv->redundancy == META_RED_EC && cv->nstripe && cv->nstripe <= CHUNK_POS_MAX) {
+        v->caught_up = cluster_copy_caught_up_at(c);
+        v->epoch = cv->epoch;
+        v->stripe_version = cv->stripe_version;
+        v->k = cv->ec_k;
+        v->m = cv->ec_m;
+        v->nstripe = cv->nstripe;
+        memcpy(v->stripe, cv->stripe, cv->nstripe * sizeof *cv->stripe);
+        rc = 0;
+    }
+    cluster_copy_put(c);
+    return rc;
+}
+
+/* tier_cluster_fn: what an ec volume attaches with */
+static int attach(void *arg, uint32_t volume, tier_attach *a, tier_settings *s)
+{
+    struct chunkpeer *cp = arg;
+    struct chunkpeer_view v;
+    int rc = cp->view(cp->view_arg, volume, &v);
+    if (rc)
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_UNAVAILABLE : rc; /* the copy does not hold it as ec (yet) */
+    s->k = (int)v.k;
+    s->m = (int)v.m;
+    s->grace_s = g_ec_cfg.settle_grace_s;
+    s->keep_s = g_ec_cfg.settle_keep_s;
+    s->coarse_s = 0;
+    s->cache_mb = g_ec_cfg.cache_bytes >> 20;
+    s->force_s = g_ec_cfg.settle_force_s;
+    s->wait_max_s = g_ec_cfg.settle_wait_max_s;
+    a->ops = &coldops_peer;
+    a->make = chunkpeer_make;
+    a->make_arg = cp;
+    a->epoch = chunkpeer_epoch;
+    a->epoch_arg = cp;
+    return 0;
+}
+
+static void *src_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&src_stop)) {
+        struct chunksrv *cs = chunksrv_cluster();
+        if (cs) {
+            G.local = cs;
+            chunksrv_epoch_source(cs, chunkpeer_epoch_source, &G);
+            return NULL;
+        }
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+int chunkpeer_cluster_start(const char *stage_dir)
+{
+    const char *mu = getenv("TSDB_CHUNKPEER_MUTANT");
+    if (mu && *mu) {
+        int k = chunkpeer_mutant_parse(mu);
+        if (k < 0) {
+            fprintf(stderr, "tsdbd: TSDB_CHUNKPEER_MUTANT=%s is not a planted bug\n", mu);
+            return -1;
+        }
+        chunkpeer_mutant = k;
+        fprintf(stderr, "tsdbd: chunkpeer MUTANT %s (tests only)\n", mu);
+    }
+    G.net = (struct chunkpeer_net){.call = net_call, .put = net_put, .arg = &G};
+    G.view = view;
+    G.view_arg = &G;
+    snprintf(G.stage_dir, sizeof G.stage_dir, "%s", stage_dir);
+    tier_set_cluster(attach, &G, g_ec_cfg.cache_bytes >> 20);
+    if (pthread_create(&src_th, NULL, src_main, NULL) != 0)
+        return -1;
+    atomic_store(&src_started, true);
+    return 0;
+}
+
+void chunkpeer_cluster_stop(void)
+{
+    if (!atomic_exchange(&src_started, false))
+        return;
+    atomic_store(&src_stop, true);
+    pthread_join(src_th, NULL);
+}
+
+struct chunkpeer *chunkpeer_cluster(void) { return &G; }
+
+int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir)
+{
+    struct chunkpeer_view v;
+    if (view(NULL, volume, &v) != 0)
+        return 0; /* a replicas volume (or one the copy does not hold as ec): no tier */
+    int dfd = open(vdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    /* before the engine reads META: requires=ec is what makes it attach (eccold_may_attach), tier what makes every
+     * later open need one; the attach adds vuuid= (the volume's uuid) */
+    int rc = meta_require(dfd, true, META_REQ_TIER | META_REQ_EC);
+    close(dfd);
+    if (rc)
+        fprintf(stderr, "tsdbd: volume %u: META could not be given requires=tier,ec (%s): not opened\n", volume,
+                tsdb_strerror(rc));
+    return rc;
+}
+
+#else /* a build without the erasure codec: no cluster tier; an ec volume's open is refused by its META */
+
+int chunkpeer_cluster_start(const char *stage_dir)
+{
+    (void)stage_dir;
+    return 0;
+}
+void chunkpeer_cluster_stop(void) {}
+struct chunkpeer *chunkpeer_cluster(void) { return NULL; }
+int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir)
+{
+    (void)volume;
+    (void)vdir;
+    return 0;
+}
+
+#endif

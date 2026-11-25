@@ -89,7 +89,11 @@ int chunkpeer_local_put(struct chunksrv *cs, uint32_t from, const struct cs_put_
 /* tsdbd's instance (chunkpeer_cluster.c): over chunksrv_cluster() and the metadata copy; installs chunksrv's epoch
  * source and tier.c's cluster attach hook. Before tsdb_open. */
 int chunkpeer_cluster_start(const char *stage_dir);
+void chunkpeer_cluster_stop(void); /* the epoch source's installer, if it still waits; after chunksrv_cluster_stop */
 struct chunkpeer *chunkpeer_cluster(void);
+/* cvol.c, before a cluster volume's engine opens (writer or replica): an ec volume in the copy gets requires=tier,ec in
+ * its META (synced), so that it attaches the peer cold ops; 0 for any other volume, else the line and an error. */
+int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);
 
 /* Planted bugs (tests/test_chunkpeer.c and test_cluster ecbasic --mutant; TSDB_CHUNKPEER_MUTANT in tsdbd). */
 enum {

@@ -13367,6 +13367,183 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
     }
 }
 
+/* ecbasic (r8f, server/chunkpeer.h; design-cluster-data.md E9-E11, E14, E15): an ec=4+2 volume settles through the
+ * peer cold ops (each position on its stripe member over CHUNKB, the leader's own in process) and its answers equal a
+ * replicas twin's; with one stripe member killed reads decode around it, with three they are UNAVAILABLE, never
+ * CORRUPT, and whole again once the members are back. N is 6, so the stripe group is every server. Each phase reads
+ * series of its own: the granule cache would answer a series read before from memory. */
+#define ECB_SERIES 8
+#define ECB_ROWS 3000
+struct ecb_sum {
+    uint64_t n, h;
+};
+static int ecb_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    struct ecb_sum *s = ctx;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t b;
+        memcpy(&b, &v[i], 4);
+        s->h = s->h * 1000003u ^ (uint64_t)ts[i] * 31u ^ b;
+    }
+    s->n += n;
+    return 0;
+}
+
+static int ecb_read(tsdbc *c, tsdb_sid id, struct ecb_sum *s)
+{
+    memset(s, 0, sizeof *s);
+    return tsdbc_query_raw(c, id, 0, INT64_MAX / 2, ecb_rows, s);
+}
+
+/* the .ec parts listed in server i's v<num> (retired_ ones not counted) */
+static int ecb_ec_parts(int i, uint32_t num)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += l > 3 && !strcmp(e->d_name + l - 3, ".ec") && strncmp(e->d_name, "retired_", 8) != 0;
+    }
+    closedir(dd);
+    return n;
+}
+
+static void scen_ecbasic(void)
+{
+    scenario("ecbasic");
+    for (int i = 0; i < 6; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+    static char xa[6][PATH_MAX + 256];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200", sd);
+        restart_xargs(i, xa[i]);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 with six stores: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("the twin t42: %s", cluster_strerror(rc));
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of e42 with a leader in server 0's copy 30 s after the add");
+    int L = server_of(e.leader);
+    if (L < 0)
+        die("e42's leader %" PRIu32 " is no server of the test", e.leader);
+    printf("  e42 (volume %" PRIu32 ") led by server %d, twin t42 (volume %" PRIu32 ")\n", num, L, tnum);
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL; /* 2024-01-01: long past the settle grace */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecb.s%d", s);
+        ide[s] = rep_series(c, nm, "e42", 30000);
+        idt[s] = rep_series(c, nm, "t42", 30000);
+    }
+    /* two batches a flush apart: two parts in the day's partition, which its idle merge (1 s) makes one of level 1,
+     * the only kind a cluster settle takes (D18) */
+    tsdbc *ct = client(L);
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            int64_t ts[ECB_ROWS];
+            float val[ECB_ROWS];
+            for (int r = 0; r < ECB_ROWS; r++) {
+                ts[r] = day0 + (int64_t)(2 * r + b) * 1000;
+                val[r] = (float)(s * 1000 + r) * 0.25f + (float)b;
+            }
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into e42: %s", ers(rc));
+            int trc;
+            for (uint64_t t0 = now_ms(); (trc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((trc != TSDB_ERR_UNAVAILABLE && trc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into t42: %s", ers(trc));
+        }
+        usleep(1000000); /* past the flush interval */
+    }
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) == 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("no .ec part in the leader's v%" PRIu32 " 120 s after the writes: nothing settled", num);
+    printf("  settled: %d .ec part(s) in the leader's volume directory\n", nec);
+    for (int s = 0; s < 2; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || ecb_read(ct, idt[s], &b) != 0)
+            die("read of series %d after the settle: %s", s, ers(rc));
+        if (a.n != 2 * ECB_ROWS || a.n != b.n || a.h != b.h)
+            die("series %d after the settle: %" PRIu64 " rows (hash %" PRIx64 "), the twin %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, b.n, b.h);
+    }
+    printf("  every answer equals the twin's after the settle\n");
+    /* stripe members that are neither e42's log replicas nor the metadata leader: killed and restarted */
+    int victims[6], nv = 0, ml = leader_of(L);
+    for (int i = 0; i < 6; i++) {
+        bool rep = false;
+        for (uint32_t k = 0; k < e.nrep; k++)
+            rep |= server_of(e.rep[k].node) == i;
+        if (!rep && i != ml)
+            victims[nv++] = i;
+    }
+    if (nv < 1)
+        die("no stripe member outside e42's log group");
+    stop(victims[0], SIGKILL);
+    for (int s = 2; s < 4; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || ecb_read(ct, idt[s], &b) != 0)
+            die("read of series %d with server %d killed: %s", s, victims[0], ers(rc));
+        if (a.n != b.n || a.h != b.h)
+            die("series %d with one stripe member away: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
+    }
+    printf("  one stripe member killed (server %d): reads decode around it\n", victims[0]);
+    for (int k = 1; k < nv && k < 3; k++)
+        stop(victims[k], SIGKILL);
+    if (nv >= 3) {
+        struct ecb_sum a;
+        rc = ecb_read(c, ide[4], &a);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("series 4 with three stripe members away: %s (%" PRIu64 " rows), want UNAVAILABLE", ers(rc), a.n);
+        printf("  three stripe members killed: UNAVAILABLE\n");
+    } else
+        printf("  three stripe members killed: skipped (only %d outside the log group and the metadata leader)\n", nv);
+    for (int k = 0; k < nv && k < 3; k++)
+        start(victims[k]);
+    for (int s = 4; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+            if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 60000)
+                die("read of series %d after the restarts: %s", s, ers(rc));
+        if (ecb_read(ct, idt[s], &b) != 0 || a.n != b.n || a.h != b.h)
+            die("series %d after the restarts: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
+    }
+    printf("  the members back: reads whole\n");
+    tsdbc_close(ct);
+    tsdbc_close(c);
+}
+
 static void scen_ecadd(void)
 {
     scenario("ecadd");
@@ -17423,7 +17600,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

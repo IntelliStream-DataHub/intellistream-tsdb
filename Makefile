@@ -1028,10 +1028,12 @@ meta-soak: $(B)/test_meta
 R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c \
           server/snapinst_run.c
 R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h
-TSDBD_SRC := $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+# r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
+CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
+TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
@@ -1046,7 +1048,7 @@ $(B)/raft_log_c2.o: $(B)/raft_log_c2.c $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft -Isrc/raft/compat -c -o $@ $<
 $(B)/tsdbd-mut-c2: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) \
                    $(B)/raft_log_c2.o $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ server/tsdbd.c server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) \
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ server/tsdbd.c server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) $(CFG_OBJ) \
 	    $(B)/raft_log_c2.o $(LIB) $(LDLIBS) $(URING_LIBS)
 # Under AddressSanitizer crashfs cannot be preloaded (test_cluster's powervote prints "skipped" and passes, so the planted
@@ -1065,7 +1067,7 @@ endif
 # is always set).
 $(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -1166,7 +1168,7 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
 $(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(R4_SRC) $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)

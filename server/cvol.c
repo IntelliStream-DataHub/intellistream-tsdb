@@ -82,6 +82,7 @@
 #include "cvol.h"
 #include "cvolfs.h"
 #include "repld.h"
+#include "chunkpeer.h"
 #include "cvolset.h"
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
@@ -190,7 +191,9 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, M.dir, r->number);
     int writer = r->leader == M.self && M.writes;
     /* replication (server/repld.c) opens it as a replica with REPL's floor; the record's leader promotes itself */
-    int rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r);
+    int rc = chunkpeer_cluster_prepare(r->number, vdir); /* r8f: an ec volume's META asks for the peer cold ops */
+    if (rc == 0)
+        rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r);
     pthread_mutex_lock(&M.mu);
     if (rc == 0) {
         m->state = MV_OPEN;

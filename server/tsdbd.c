@@ -122,6 +122,7 @@
 #include "tenants.h"
 #include "cluster.h"
 #include "chunksrv.h"
+#include "chunkpeer.h"
 #include "fwd.h"
 #include "fwdreq.h"
 #include "cvol.h"
@@ -5855,6 +5856,11 @@ int main(int argc, char **argv)
         return 1;
     o.tenants = (const char *const *)tn_list;
     o.ntenants = tn_n;
+    /* r8f: the cluster ec volumes' cold side (server/chunkpeer.h), before tsdb_open opens the tier it hooks into */
+    if (cluster_on && !witness && chunkpeer_cluster_start(dir) != 0) {
+        fprintf(stderr, "tsdbd: the peer cold ops do not start\n");
+        return 1;
+    }
     int rc = tsdb_open(dir, &o, &db);
     tn_free_list(tn_list, tn_n);
     if (rc) {
@@ -6111,6 +6117,7 @@ int main(int argc, char **argv)
         cluster_stop();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */
+        chunkpeer_cluster_stop(); /* its installer thread names the chunk server: before that is freed */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
     pthread_mutex_lock(&work_lock);
