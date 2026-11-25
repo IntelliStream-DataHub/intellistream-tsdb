@@ -939,7 +939,11 @@ $(B)/peerlink.o: server/peerlink.c server/peerlink.h server/pltransport.h $(PLCH
 # the verbs transport under peerlink (plrdma.h): no verbs header, every verb through struct plr_ops
 $(B)/plrdma.o: server/plrdma.c server/plrdma.h server/pltransport.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(B)/plrdma_dl.o: server/plrdma_dl.c server/plrdma.h | $(B)
+# rdma.flags holds RDMA_FLAGS and changes only when they do: headers installed later, RDMA_CFLAGS or NO_RDMA given,
+# rebuild plrdma_dl.o (and tsdbd) instead of keeping the object built the other way
+$(B)/rdma.flags: FORCE | $(B)
+	@printf '%s\n' '$(RDMA_FLAGS)' | cmp -s - $@ || printf '%s\n' '$(RDMA_FLAGS)' >$@
+$(B)/plrdma_dl.o: server/plrdma_dl.c server/plrdma.h $(B)/rdma.flags | $(B)
 	$(CC) $(CFLAGS) $(RDMA_FLAGS) -c -o $@ $<
 # the forwarding links (server/fwd.h): the transport in fwd.o (no cluster calls: test_peerlink and the fuzzer link
 # it), tsdbd's instance over the cluster's member list in fwd_cluster.o
