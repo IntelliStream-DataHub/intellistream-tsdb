@@ -12,7 +12,7 @@ base=$(mktemp -d "${TMPDIR:-/tmp}/mutants-helper.XXXXXX") || exit 1
 trap 'rm -rf "$base"' EXIT
 fail() { echo "test_mutants_helper: FAIL: $*" >&2; [ -z "${out:-}" ] || printf '%s\n' "$out" >&2; exit 1; }
 export XDG_RUNTIME_DIR=$base # the default pool of the helpers lives here
-unset MUTANT_JOBS MUTANT_SLOTS MUTANT_SLOT_DIR MUTANT_URING_JOBS MUTANT_TIMEOUT MUTANT_NO_FLOCK
+unset MUTANT_JOBS MUTANT_SLOTS MUTANT_SLOT_DIR MUTANT_URING_JOBS MUTANT_TIMEOUT MUTANT_NO_FLOCK FAKE_CONC_WANT
 export TMPDIR=$base # the helper's scratch root, unless --tmp says otherwise
 
 # the fake test: FAKE MUTANT SCRATCH, behaviour by mutant name
@@ -51,14 +51,14 @@ conc*) # how many runs are alive at once; wait up to 10 s for FAKE_CONC_WANT pee
     mkdir -p "$FAKE_CONC"; touch "$FAKE_CONC/$$"
     want=${FAKE_CONC_WANT:-1} max=0
     for _ in $(seq 1 200); do
-        n=$(ls "$FAKE_CONC" | wc -l)
+        n=$(( $(ls "$FAKE_CONC" | wc -l) ))
         [ "$n" -gt "$max" ] && max=$n
         [ "$n" -ge "$want" ] && break
         grep -qx "$want" "$FAKE_CONC.max" 2>/dev/null && break
         sleep 0.05
     done
     sleep 0.25
-    n=$(ls "$FAKE_CONC" | wc -l)
+    n=$(( $(ls "$FAKE_CONC" | wc -l) ))
     [ "$n" -gt "$max" ] && max=$n
     echo "$max" >>"$FAKE_CONC.max"
     rm -f "$FAKE_CONC/$$"; exit 1 ;;

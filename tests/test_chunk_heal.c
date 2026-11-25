@@ -95,7 +95,7 @@ static void sh(const char *fmt, ...)
     vsnprintf(cmd, sizeof cmd, fmt, ap);
     va_end(ap);
     if (system(cmd) != 0)
-        fprintf(ERR, "(command failed: %s)\n", cmd);
+        fprintf(ERR ? ERR : stderr, "(command failed: %s)\n", cmd);
 }
 
 static void fresh(const char *tag, char *out, size_t cap)
@@ -1676,6 +1676,7 @@ int main(int argc, char **argv)
         return 1;
     }
     sh("rm -rf '%s'", S);
+    S[0] = '\0';
     printf("test_chunk_heal: ok\n");
     return 0;
 }

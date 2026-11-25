@@ -41,8 +41,9 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     (void)argc, (void)argv;
     const char *td = getenv("TMPDIR");
-    if (!getenv("FUZZ_TMP") && td && *td)
-        setenv("FUZZ_TMP", td, 0);
+    const char *ft = getenv("FUZZ_TMP");
+    if ((!ft || !*ft) && td && *td)
+        setenv("FUZZ_TMP", td, 1);
     const char *d = fuzz_dir("chunk");
     atexit(cleanup_chunk);
     char sp[1100];

@@ -2428,6 +2428,7 @@ int main(int argc, char **argv)
         return 1;
     }
     sh("rm -rf '%s'", S);
+    S[0] = '\0';
     printf("test_chunk: ok\n");
     return 0;
 }
