@@ -1555,10 +1555,22 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 *Built in R4 (r4-jepsen, `tests/jepsen/jepsen_cluster.c`).* `kill2` (the first round and half the others take two of the
 kv volume's replicas), `slow` (the outagefs shim's `slow MS` on one node's data root, 5 to 30 s) and `churn` run in
 `make jepsen-cluster` after the other nemeses (`JEPSEN_R4_NEMESES`, `JEPSEN_R4_WORKLOADS`; `none` leaves them out).
-`longdown` and `rebuild` are written and have their selftest mutants (docs/tasks/r4-nemeses.md owns running them whole), but each is **refused with a line until its
-`built` flag in the harness table is flipped**: the flag was set for the tracks that were on main when r4-jepsen merged,
-and these two have not been run whole against the merged R4 (`jepsen_cluster --built-nemeses` lists what runs, `JEPSEN_R4_TRY=1`
-runs the others). At the end of every run with a replicated kv volume the members of the final record are the replicas
+`longdown` and `rebuild` are built too (r4-nemeses: run whole against the merged R4, on kv and classes, both IO backends, several
+seeds; `jepsen_cluster --built-nemeses` lists all five, and a nemesis whose `built` flag is 0 would be refused with a line, `JEPSEN_R4_TRY=1`
+runs it anyway). Their selftest plants `snapdroppart` (a leader's snapshot that lists one part fewer, `TSDB_REPLD_MUTANT`
+in tsdbd; `test_snapshot --mutant snapdroppart` too), which the final comparison of the replicas must catch under each. That
+proves the plumbing (a snapshot is made, installed and compared), not the races of the cut: the other snapshot bugs
+(`snapnostage`, `snapnokeep`, `snapafterp`, `snapdictshort` and the install's REPL fields, planted the same way in a 120 s run) were not
+seen by either nemesis, and `test_snapshot` stays the oracle for them. The selftest also plants `nolongdown` (a node back
+after 300 ms), `nosnapdone` (a rebuild whose snapshot mark is not seen) and `TSDB_CVOL_MUTANT=makemissing` (a volume made again
+where its directory was removed) and requires each to fail with its own line. At the default `repl_retain_s` of 3 a
+longdown round takes about 17 s and a rebuild round about 12 s, so the floor of faults of a run is a third of that rate
+(`retain + 14` s for longdown, from the chosen nemeses' mean, not 10 s). A run fails when fewer than half its longdown
+rounds installed a snapshot (the v<N> directory replaced) or fewer than half its rebuild rounds were filled by one (a SNAPDONE in the
+rebuilt directory); `rebuild` waits for the refusal line of the removed volume (60 s), never a fixed pause. Evidence (2026-11-25): 8 longdown
+and 8 rebuild runs of 300 s (kv and classes; two lanes on io_uring, two on epoll; seeds 101-104, 201-204, 301-304, 401-404) all valid;
+each longdown run did 17-18 rounds, 16-18 of them installed a snapshot, and each rebuild run did 23-26 rounds, all rebuilt;
+`make jepsen-cluster-selftest` ok. At the end of every run with a replicated kv volume the members of the final record are the replicas
 compared, none is a learner and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or `snap_*` is left on any node. R4's crash
 points are terminal points of kv and classes runs: `snap-received`, `snap-swapped`, `snap-halfswap`, `set-removed`,
 `transfer-ready`, `move-added`, `move-shrunk` (`server/crashpt.h`). `classes` runs with the default retention caps
@@ -1604,7 +1616,7 @@ start apart from the log start, and `kill2`, `slow`, `churn` in the cluster gate
 and its triggers, `node drain` and `out`, rebuilding a lost server's replicas elsewhere, the balancer, §8.4's priorities, the
 receive-side rate limit, file reuse in a snapshot, §8.5's first bullet. Left to R8: stripe positions (the snapshot carries
 `.ec` parts and their PPOS records since snap-ec). Left to R14: rebuild progress in `cluster status`, live changes of the settings. The gate's `longdown` and
-`rebuild` nemeses are not yet run whole (13.2).
+`rebuild` nemeses run (13.2).
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
 

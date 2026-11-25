@@ -59,7 +59,7 @@ its `led` never raised. New settings of `tsdb cluster init`: `--rebuild-mb-s` (2
 life. Not built: a limit on the receiving side, reuse of files the receiver holds, rebuild progress in `status`. A
 snapshot of an erasure-coded volume carries its `.ec` parts (index files and object records; the chunks stay on the
 stores) and their stripe-position records (SNAPMAN version 3).
-The jepsen-cluster nemeses `longdown` and `rebuild`, which would run this rebuild under faults, are written and not yet run whole (docs/tasks/r4-nemeses.md); its evidence so far is `test_cluster` and `test_snapshot`.
+The jepsen-cluster nemeses `longdown` (a replica down past `repl_retain_s` must come back through a snapshot) and `rebuild` (a removed replica directory refused, then `replica reset` and rebuilt by a snapshot) run this rebuild under faults on the kv and classes workloads, with the planted bug `snapdroppart` as their selftest; its other evidence is `test_cluster` and `test_snapshot`.
 `tsdbd`'s `status` and metrics port show `snap.*` and `tsdb_snapshot_*` (docs/metrics.md). Tests: `test_snapshot` (the
 make and the install, with power loss at every step), `test_cluster snap* addsnap keepcap`.
 

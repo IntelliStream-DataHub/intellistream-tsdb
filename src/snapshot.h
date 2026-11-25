@@ -113,7 +113,9 @@ enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_
                    /* the install's checks of a received copy (snap-ec review): an .ec file not opened (no hashes, no
                     * record); its record's ppos not compared with SNAPMAN's; nor with P; a part's ppos not required on
                     * an ec volume nor refused elsewhere; the install's own names not reserved */
-                   SNAP_MUT_ECNOVERIFY, SNAP_MUT_ECNOZEQ, SNAP_MUT_ECNOZP, SNAP_MUT_ECNOPPOS, SNAP_MUT_NORESERVED };
+                   SNAP_MUT_ECNOVERIFY, SNAP_MUT_ECNOZEQ, SNAP_MUT_ECNOZP, SNAP_MUT_ECNOPPOS, SNAP_MUT_NORESERVED,
+                   /* a leader's snapshot that lists one part fewer (tsdbd: TSDB_REPLD_MUTANT=snapdroppart; jepsen-cluster-selftest) */
+                   SNAP_MUT_DROPPART };
 extern int snap_mutant;
 
 /* ---- the install (r4-snapinst; snapshot.c's second half has the design) ----

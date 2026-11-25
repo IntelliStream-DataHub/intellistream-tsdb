@@ -116,6 +116,8 @@
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
  * nobody placed), idle (a nemesis that sleeps through its naps), lost-write (a write missing from the final state), nokill, nopause,
  * nodelay and noreset (a kill, pause or delay that does nothing, a heal that resumes held links: the run fails),
+ * nolongdown (longdown's node is back after 300 ms: no round takes a snapshot, the run fails), nosnapdone (rebuild's
+ * check of the snapshot's mark sees none: the run fails),
  * rep-lost-write (kv: an acknowledged write missing from one replica's directory, also under midcommit),
  * rep-half-batch (kv: half of an
  * acknowledged large write of the filler missing from one replica's directory).
@@ -207,8 +209,8 @@ static const struct r4nem {
     const char *needs;
 } r4nem[] = {{"kill2", N_KILL2, 1, "nothing new"},
              {"slow", N_SLOW, 1, "nothing new in tsdbd (the outagefs shim: --outagefs build/liboutagefs.so)"},
-             {"longdown", N_LONGDOWN, 0, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
-             {"rebuild", N_REBUILD, 0, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
+             {"longdown", N_LONGDOWN, 1, "r4-xferlink and r4-xferinst (a snapshot for a replica past repl_retain_s)"},
+             {"rebuild", N_REBUILD, 1, "r4-setchg and r4-xferinst (replica reset, rebuilt by a snapshot)"},
              {"churn", N_CHURN, 1, "r4-transfer, r4-setchg and r4-move (volume transfer, volume move --log)"}};
 #define NR4NEM ((int)(sizeof r4nem / sizeof r4nem[0]))
 static int r4_bit(const char *name)
@@ -2987,7 +2989,7 @@ static void nem_fwdstall(void)
 
 /* ------------------------------------------------------------------ R4's nemeses */
 
-static unsigned kill2_rep, kill2_done, slow_done, longdown_done, longdown_snaps, rebuild_done, rebuild_ok, churn_moves,
+static unsigned kill2_rep, kill2_done, slow_done, longdown_done, longdown_snaps, rebuild_done, rebuild_ok, rebuild_snaps, churn_moves,
     churn_transfers, churn_refused, churn_cancels, churn_landed;
 
 /* an admin op to some running node, which follows the Raft leader (the R4 ops are the leader's) */
@@ -3153,7 +3155,10 @@ static void nem_longdown(void)
     int st = stop_node(i, SIGKILL);
     effect_seen = WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
     int retain = retain_eff > 0 ? retain_eff : 3;
-    hold_ms(retain * 1000 + rnd_range(4000, 10000));
+    if (strcmp(mutant, "nolongdown")) /* nolongdown: planted, a plain kill (the node is back before its log is gone) */
+        hold_ms(retain * 1000 + rnd_range(4000, 10000));
+    else
+        hold_ms(300);
     restart_node(i);
     longdown_done++;
     if (!rep_wait_whole(120000))
@@ -3209,14 +3214,25 @@ static void nem_rebuild(void)
     restart_node(i);
     rebuild_done++;
     /* The server must refuse a volume whose directory is gone, not make an empty one and rejoin (that would be a
-     * replica with no history, "rebuilt" by the leader's log alone, the thing the reset exists to avoid): after a
-     * pause for its open, no v<N> exists yet and its log has a line that names the path and does not say "made". */
-    hold_ms(3000);
-    if (stat(vd, &vsb) == 0)
-        die(1, "rebuild: node %d started with its %s removed and made it again before any `replica reset`", i, vd);
-    if (!log_has_since(i, off, vd, NULL) || log_has_since(i, off, "made ", vd))
+     * replica with no history, "rebuilt" by the leader's log alone, the thing the reset exists to avoid). Its line
+     * comes when its open gets there (a loaded machine, io_uring setup): a condition wait with a generous bound, never
+     * a pause. No v<N> may exist before the reset and the log must not say "made" for it, at any moment of the wait. */
+    char made[PATH_MAX + 80]; /* "volume 1 (kvr): made <path>, replica ..." is the open that makes one; the refusal says "not made again" */
+    snprintf(made, sizeof made, "): made %s", vd);
+    int refused = 0;
+    for (int64_t t0 = now_ms(); !refused && now_ms() - t0 < 60000; ) {
+        check_unexpected_exits();
+        if (stat(vd, &vsb) == 0 || log_has_since(i, off, made, NULL))
+            die(1, "rebuild: node %d started with its %s removed and made it again before any `replica reset`", i, vd);
+        refused = log_has_since(i, off, vd, NULL);
+        if (!refused)
+            usleep(100000);
+    }
+    if (!refused)
         die(1, "rebuild: node %d, restarted with %s removed, has no line in its log that names the path and refuses the "
-               "volume (log %s)", i, vd, nodes[i].log);
+               "volume in 60 s (log %s)", i, vd, nodes[i].log);
+    if (stat(vd, &vsb) == 0 || log_has_since(i, off, made, NULL))
+        die(1, "rebuild: node %d started with its %s removed and made it again before any `replica reset`", i, vd);
     uint8_t body[16];
     size_t bl = cluster_volume_force_encode(rep_number, id, body); /* RESET's body is VOLUME_FORCE's: volume, node */
     int rc = -1;
@@ -3237,6 +3253,14 @@ static void nem_rebuild(void)
     if (stat(repl, &sb) != 0)
         die(1, "rebuild: node %d has no %s after the reset: the replica was not made again", i, repl);
     rebuild_ok++;
+    /* SNAPDONE stays in the directory a snapshot's install swapped in (the replicas that were never rebuilt have none):
+     * the log alone would have filled a replica with no SNAPDONE, which the run's end counts */
+    char done[PATH_MAX + 80];
+    snprintf(done, sizeof done, "%s/SNAPDONE", vd);
+    if (stat(done, &sb) == 0 && strcmp(mutant, "nosnapdone")) /* nosnapdone: planted, the install's mark is not seen */
+        rebuild_snaps++;
+    else
+        ev("rebuild: node %d was filled without a snapshot (no %s)", i, done);
 }
 
 /* the end of a move: the record settled (3 replicas, no learner: done or cancelled), kvr's replicas as it names them,
@@ -4681,9 +4705,9 @@ int main(int argc, char **argv)
            rounds);
     if (nemeses & (N_KILL2 | N_SLOW | N_R4_KV))
         printf("r4: kill2 %u rounds (%u took two of kvr's replicas), slow %u, longdown %u (%u of them with a snapshot installed), "
-               "rebuild %u (%u rebuilt), churn %u (%u moves, %u transfers accepted of which %u landed, %u cancels, %u refused)\n",
+               "rebuild %u (%u rebuilt, %u by a snapshot), churn %u (%u moves, %u transfers accepted of which %u landed, %u cancels, %u refused)\n",
                kill2_done, kill2_rep, slow_done, longdown_done, longdown_snaps, rebuild_done,
-               rebuild_ok, faults[10], churn_moves, churn_transfers, churn_landed, churn_cancels, churn_refused);
+               rebuild_ok, rebuild_snaps, faults[10], churn_moves, churn_transfers, churn_landed, churn_cancels, churn_refused);
     if (use_crashfs)
         printf("crashfs: %" PRIu64 " node starts, %" PRIu64 " of them with CRASHFS_TEAR, the rest CRASHFS_REWRITE=old\n",
                (uint64_t)atomic_load(&crashfs_starts), (uint64_t)atomic_load(&crashfs_tears));
@@ -4744,10 +4768,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "jepsen-cluster: FAIL: %u kill2 round(s) and none took two of kvr's replicas\n", kill2_done);
         rc = 1;
     }
-    if ((nemeses & N_LONGDOWN) && longdown_done >= 1 && !longdown_snaps) { /* a coverage miss, like an idle nemesis */
-        fprintf(stderr, "jepsen-cluster: FAIL: %u longdown round(s) (a replica down past repl_retain_s %d) and none took a "
-                        "snapshot (the directory of its volume was never replaced): every one caught up from the log, "
-                        "which tests nothing of R4\n", longdown_done, retain_eff > 0 ? retain_eff : 3);
+    /* a coverage miss, like an idle nemesis: at least half the rounds must have taken a snapshot (honest runs: 16 to 18
+     * of 17 to 18, 7 of 8 in 120 s), or a retain cap that stopped working would pass on a round or two */
+    if ((nemeses & N_LONGDOWN) && longdown_done >= 1 && 2 * longdown_snaps < longdown_done) {
+        fprintf(stderr, "jepsen-cluster: FAIL: %u longdown round(s) (a replica down past repl_retain_s %d) and only %u "
+                        "took a snapshot (the directory of its volume was replaced): the others caught up from the log, "
+                        "which tests nothing of R4\n", longdown_done, retain_eff > 0 ? retain_eff : 3, longdown_snaps);
+        rc = 1;
+    }
+    if ((nemeses & N_REBUILD) && rebuild_ok >= 1 && 2 * rebuild_snaps < rebuild_ok) { /* as longdown's: the rebuild is by snapshot */
+        fprintf(stderr, "jepsen-cluster: FAIL: %u rebuild round(s) and only %u were filled by a snapshot (a SNAPDONE in the "
+                        "rebuilt v<N>): the others were filled from the log, which tests nothing of R4's rebuild\n",
+                rebuild_ok, rebuild_snaps);
         rc = 1;
     }
     if ((nemeses & N_CHURN) && churn_transfers >= 3 && !churn_landed) {
@@ -4789,7 +4821,21 @@ int main(int argc, char **argv)
             rc = 1;
         }
     }
-    unsigned expect = (unsigned)(seconds / 10 > 0 ? seconds / 10 : 1); /* a round is 3 to 8 s */
+    /* a round of the older nemeses is 3 to 8 s. A longdown round holds the node down repl_retain_s + 4 to 10 s and then
+     * waits for the snapshot, a rebuild round for the reset and the snapshot (measured: about 17 s at the default
+     * retain of 3 and about 12 s). The rounds pick a nemesis at random, so the honest round is the mean of the chosen
+     * ones, and the floor, as everywhere, a third of the honest rate (never below one fault). A list without these two
+     * keeps its 10 s. */
+    int per_round = 10;
+    if (nemeses & (N_LONGDOWN | N_REBUILD)) {
+        int sum = 0, n = 0;
+        for (int k = 0; k < nk; k++) {
+            sum += kinds[k] == N_LONGDOWN ? (retain_eff > 0 ? retain_eff : 3) + 14 : kinds[k] == N_REBUILD ? 12 : 6;
+            n++;
+        }
+        per_round = 3 * sum / n;
+    }
+    unsigned expect = (unsigned)(seconds / per_round > 0 ? seconds / per_round : 1);
     if (nk && !takeover && total_faults < expect) {
         fprintf(stderr, "jepsen-cluster: FAIL: only %u faults in %d s (at least %u expected): the nemesis was idle\n",
                 total_faults, seconds, expect);

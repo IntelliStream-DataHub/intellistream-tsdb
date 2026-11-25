@@ -117,6 +117,7 @@
 #include "../src/repl.h"
 #include "../src/replfile.h"
 #include "../src/replica.h"
+#include "../src/snapshot.h"
 
 #include "repld_int.h"
 #include "rset.h"
@@ -2291,6 +2292,8 @@ void repld_init(tsdb *t, const char *dir)
         tsdb_test_replay_start_log();
     if (mu && !strcmp(mu, "replicadropsfiles"))
         tsdb_test_replica_drops_files();
+    if (mu && !strcmp(mu, "snapdroppart")) /* the snapshot's make (src/snapshot.c), planted in tsdbd: jepsen-cluster-selftest */
+        snap_mutant = SNAP_MUT_DROPPART;
     G.mutant = !mu                              ? RM_NONE
                : !strcmp(mu, "commitbyleader") ? RM_COMMITBYLEADER
                : !strcmp(mu, "ackbeforesync")  ? RM_ACKBEFORESYNC

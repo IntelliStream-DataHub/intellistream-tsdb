@@ -3044,7 +3044,8 @@ static void set_mutant(const char *m)
              {"snappposafter", SNAP_MUT_PPOSAFTER},     {"snapcarrysettled", SNAP_MUT_CARRYSETTLED},
              {"snapskipec", SNAP_MUT_SKIPEC},           {"snapecnoverify", SNAP_MUT_ECNOVERIFY},
              {"snapecnozeq", SNAP_MUT_ECNOZEQ},         {"snapecnozp", SNAP_MUT_ECNOZP},
-             {"snapecnoppos", SNAP_MUT_ECNOPPOS},       {"snapnoreserved", SNAP_MUT_NORESERVED}};
+             {"snapecnoppos", SNAP_MUT_ECNOPPOS},       {"snapnoreserved", SNAP_MUT_NORESERVED},
+             {"snapdroppart", SNAP_MUT_DROPPART}};
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
         if (strcmp(m, t[i].name) == 0) {
             snap_mutant = t[i].v;
