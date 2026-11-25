@@ -111,11 +111,11 @@ mut("M10", "crash recovery skips the WAL segment that follows a flushed part (ac
     "                if (cached_seq >= segs[k].seq)\n                    continue; /* already in a part */",
     "                if (cached_seq + 1 >= segs[k].seq)\n                    continue; /* already in a part */",
     ["c"], "durability")
-mut("M11", "epoll backend only: a large send is accounted one byte too far (a corrupt reply stream)",
+mut("M11", "worker send: a large send is accounted one byte short (a corrupt reply stream)",
     "server/tsdbd.c",
-    "                on_send(c, r < 0 ? -err : r);\n        }\n        c->in_ready = false;",
-    "                on_send(c, r < 0 ? -err : r + (r > 60000));\n        }\n        c->in_ready = false;",
-    ["c"], "matrix", io="epoll")
+    "        if (n > 0)\n            done += (size_t)n;",
+    "        if (n > 0)\n            done += (size_t)n - (n > 60000);",
+    ["c"], "matrix")
 mut("M12", "Python client sends limit - 1 (off by one in limits, in the PyO3 layer)",
     "client/python-common/src/lib.rs",
     "    Ok(tc::QueryOpts { order, limit })",
