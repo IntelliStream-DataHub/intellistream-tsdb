@@ -22,19 +22,26 @@
  *
  * --mutant NAME plants a bug of plrdma.h's list; each must fail this test.
  */
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "compat.h"
 #include "peerlink.h"
 #include "plcheck.h"
+#include "tsdb_crypto.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function" /* test_peerlink uses the rest of the fake */
 #include "pl_fake.h"
@@ -888,7 +895,7 @@ static void test_lateready(void)
     __atomic_store_n(&peerlink_test_rdma_hold_ready_ms, 300, __ATOMIC_RELAXED);
     struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
     rcb.offer_timeout_ms = 120;
-    rcb.retry_ms = UINT32_MAX;
+    rcb.retry_ms = UINT64_MAX;
     struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
     struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
     int port = peerlink_listen(a->pl, 0);
@@ -916,7 +923,7 @@ static void test_lateready(void)
     rca = fast_rcfg(pa, PL_RDMA_AUTO);
     rcb = fast_rcfg(pb, PL_RDMA_AUTO);
     rcb.offer_timeout_ms = 120;
-    rcb.retry_ms = UINT32_MAX;
+    rcb.retry_ms = UINT64_MAX;
     a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
     b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
     port = peerlink_listen(a->pl, 0);
@@ -927,8 +934,8 @@ static void test_lateready(void)
     pthread_mutex_unlock(&f->mu);
     lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
     CHECK(WAIT_FOR(atomic_load(&f->hold) == 1, 3000));
-    /* Wait past dialer's 120 ms timeout so dialer aborts and moves its QP to ERR while READY sits in acceptor's sq */
-    usleep(220000);
+    /* Wait for dialer's 120 ms timeout to abort and settle on TCP while READY sits in acceptor's sq */
+    CHECK(WAIT_FOR(plink_up(lb) && !plink_is_rdma(lb), 3000));
     pthread_mutex_lock(&f->mu);
     f->hold_after_sends = 0;
     pthread_mutex_unlock(&f->mu);
@@ -967,34 +974,37 @@ static void test_abortseq(void)
     plr_pool_test_on_free(pa, on_free, f);
     plr_pool_test_on_free(pb, on_free, f);
 
-    for (int sub = 0; sub < 2; sub++) {
-        __atomic_store_n(&peerlink_test_rdma_abort_before_hello, (sub == 0), __ATOMIC_RELAXED);
-        __atomic_store_n(&peerlink_test_rdma_fail_after_hello, (sub == 1), __ATOMIC_RELAXED);
-        struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
-        rcb.retry_ms = UINT32_MAX;
-        struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
-        struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
-        int port = peerlink_listen(a->pl, 0);
-        char addr[64];
-        snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
-        struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
-        CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 5000));
-        struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
-        CHECK(la != NULL && !plink_is_rdma(la) && !plink_is_rdma(lb));
-        if (la && lb) {
-            uint64_t na = 0, nb = 0, s1 = 10 + (uint64_t)sub, s2 = 20 + (uint64_t)sub;
-            send_frames(la, &na, 30, &s1);
-            send_frames(lb, &nb, 30, &s2);
-            CHECK(WAIT_FOR(atomic_load(&a->in) == 30 && atomic_load(&b->in) == 30, 5000));
-            CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0 && atomic_load(&a->downs) == 0 &&
-                  atomic_load(&b->downs) == 0);
+    static const int checks[] = {PL_CHECK_FULL, PL_CHECK_HEADER};
+    for (size_t ci = 0; ci < sizeof checks / sizeof checks[0]; ci++) {
+        for (int sub = 0; sub < 2; sub++) {
+            __atomic_store_n(&peerlink_test_rdma_abort_before_hello, (sub == 0), __ATOMIC_RELAXED);
+            __atomic_store_n(&peerlink_test_rdma_fail_after_hello, (sub == 1), __ATOMIC_RELAXED);
+            struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+            rcb.retry_ms = UINT64_MAX;
+            struct node *a = node_new_rdma(1, 100, 2000, checks[ci], &rca);
+            struct node *b = node_new_rdma(2, 100, 2000, checks[ci], &rcb);
+            int port = peerlink_listen(a->pl, 0);
+            char addr[64];
+            snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+            struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+            CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 5000));
+            struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
+            CHECK(la != NULL && !plink_is_rdma(la) && !plink_is_rdma(lb));
+            if (la && lb) {
+                uint64_t na = 0, nb = 0, s1 = 10 + (uint64_t)sub, s2 = 20 + (uint64_t)sub;
+                send_frames(la, &na, 30, &s1);
+                send_frames(lb, &nb, 30, &s2);
+                CHECK(WAIT_FOR(atomic_load(&a->in) == 30 && atomic_load(&b->in) == 30, 5000));
+                CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0 && atomic_load(&a->downs) == 0 &&
+                      atomic_load(&b->downs) == 0);
+            }
+            __atomic_store_n(&peerlink_test_rdma_abort_before_hello, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&peerlink_test_rdma_fail_after_hello, 0, __ATOMIC_RELAXED);
+            peerlink_free(b->pl);
+            peerlink_free(a->pl);
+            free(a);
+            free(b);
         }
-        __atomic_store_n(&peerlink_test_rdma_abort_before_hello, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&peerlink_test_rdma_fail_after_hello, 0, __ATOMIC_RELAXED);
-        peerlink_free(b->pl);
-        peerlink_free(a->pl);
-        free(a);
-        free(b);
     }
     check_pools_clean(f, pa, pb, "abortseq");
     plr_pool_close(pa);
@@ -1095,7 +1105,7 @@ static void test_declines(void)
 
     /* 1. Subnet mismatch */
     struct pl_rdma_cfg rca = fast_rcfg(pb_sub, PL_RDMA_AUTO), rcb = fast_rcfg(pa, PL_RDMA_AUTO);
-    rcb.retry_ms = UINT32_MAX;
+    rcb.retry_ms = UINT64_MAX;
     struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
     struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
     int port = peerlink_listen(a->pl, 0);
@@ -1106,6 +1116,58 @@ static void test_declines(void)
     CHECK(!plink_is_rdma(lb));
     peerlink_rdma_fallbacks(fb1);
     CHECK(fb1[PL_RDMA_FB_SUBNET] > fb0[PL_RDMA_FB_SUBNET]);
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    free(a);
+    free(b);
+
+    /* 1b. Multi-device dialer rotates pools on subnet decline (SF-1) */
+    rca = fast_rcfg(pb_sub, PL_RDMA_AUTO);
+    rcb = fast_rcfg(pa, PL_RDMA_AUTO);
+    rcb.pools[1] = pb_sub;
+    rcb.npools = 2;
+    rcb.retry_ms = 60;
+    a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
+    b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
+    port = peerlink_listen(a->pl, 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    CHECK(WAIT_FOR(plink_up(lb) && plink_is_rdma(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 4000));
+    CHECK(atomic_load(&a->downs) == 0 && atomic_load(&b->downs) == 0);
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    free(a);
+    free(b);
+
+    /* 1c. Timeout RDMA_ABORT racing with acceptor RDMA_DECLINE keeps settled TCP alive (MF-1) */
+    f->fail_rts = 1;
+    rca = fast_rcfg(pa, PL_RDMA_AUTO);
+    rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+    rcb.offer_timeout_ms = 80;
+    rcb.retry_ms = 60;
+    a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
+    b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
+    port = peerlink_listen(a->pl, 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 3000));
+    struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
+    CHECK(la != NULL && !plink_is_rdma(la) && !plink_is_rdma(lb));
+    if (la) {
+        /* Pause acceptor so dialer's live re-offer and its timeout ABORT arrive pipelined on TCP */
+        plink_pause(la, 1);
+        uint64_t off_before = __atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED);
+        CHECK(WAIT_FOR(__atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED) > off_before, 3000));
+        usleep(160000); /* > offer_timeout_ms (80 ms): dialer sent RDMA_ABORT and returned to UP_IDLE */
+        plink_pause(la, 0);
+        uint64_t na = 0, nb = 0, s1 = 51, s2 = 52;
+        send_frames(la, &na, 15, &s1);
+        send_frames(lb, &nb, 15, &s2);
+        CHECK(WAIT_FOR(atomic_load(&a->in) == 15 && atomic_load(&b->in) == 15, 5000));
+        CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0);
+        CHECK(atomic_load(&a->downs) == 0 && atomic_load(&b->downs) == 0);
+    }
+    f->fail_rts = 0;
     peerlink_free(b->pl);
     peerlink_free(a->pl);
     free(a);
@@ -1141,7 +1203,7 @@ static void test_declines(void)
         free(b);
     }
 
-    /* 3. mode=on refuses TCP fallback */
+    /* 3. mode=on refuses TCP fallback on dialer */
     rca = fast_rcfg(NULL, PL_RDMA_OFF);
     rcb = fast_rcfg(pa, PL_RDMA_ON);
     a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
@@ -1152,6 +1214,43 @@ static void test_declines(void)
     lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
     CHECK(WAIT_FOR(__atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED) >= off0 + 2, 3000));
     CHECK(!plink_up(lb) && atomic_load(&b->ups) == 0);
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    free(a);
+    free(b);
+
+    /* 3b. mode=on dialer does NOT enter 60 s TCP-stay backoff after 3 failures: recovers as soon as fabric heals (MF-3a) */
+    f->fail_rts = 1;
+    rca = fast_rcfg(pa, PL_RDMA_ON);
+    rcb = fast_rcfg(pb, PL_RDMA_ON);
+    rcb.backoff_min_ms = 60000;
+    rcb.backoff_max_ms = 60000;
+    a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
+    b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
+    port = peerlink_listen(a->pl, 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    off0 = __atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED);
+    lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    CHECK(WAIT_FOR(__atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED) >= off0 + 4, 4000));
+    CHECK(!plink_up(lb) && atomic_load(&a->ups) == 0 && atomic_load(&b->ups) == 0);
+    f->fail_rts = 0;
+    CHECK(WAIT_FOR(plink_up(lb) && plink_is_rdma(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 4000));
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    free(a);
+    free(b);
+
+    /* 3c. mode=on acceptor refuses a mode=off dialer instead of settling on TCP (MF-3b) */
+    rca = fast_rcfg(pa, PL_RDMA_ON);
+    rcb = fast_rcfg(NULL, PL_RDMA_OFF);
+    a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
+    b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
+    port = peerlink_listen(a->pl, 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    usleep(250000);
+    CHECK(atomic_load(&a->ups) == 0);
+    CHECK(!plink_is_rdma(lb));
     peerlink_free(b->pl);
     peerlink_free(a->pl);
     free(a);
@@ -1180,7 +1279,7 @@ static void test_badauth(void)
         __atomic_store_n(&peerlink_test_rdma_bad_auth, mode, __ATOMIC_RELAXED);
         struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
         rcb.offer_timeout_ms = 200;
-        rcb.retry_ms = UINT32_MAX;
+        rcb.retry_ms = UINT64_MAX;
         struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
         struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
         int port = peerlink_listen(a->pl, 0);
@@ -1221,7 +1320,7 @@ static void test_backoff(void)
     rcb.retry_ms = 80;
     rcb.backoff_min_ms = 700;
     rcb.backoff_max_ms = 2800;
-    rcb.stable_ms = 1000;
+    rcb.stable_ms = 500;
     f->fail_rts = 1; /* every offer fails */
     struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
     struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
@@ -1255,13 +1354,29 @@ static void test_backoff(void)
     CHECK(WAIT_FOR(atomic_load(&a->in) == 40, 5000));
     CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0);
 
-    /* Also verify 3 early QP failures (within stable_ms) trigger backoff on reconnect */
+    /* Wait past stable_ms (500 ms) so rdma_fails resets from 3 back to 0, then verify loop wakes and applies reset */
+    usleep(650000);
+    send_frames(lb, &na, 1, &s1);
+    CHECK(WAIT_FOR(atomic_load(&a->in) == 41, 3000));
+
+    /* Drop the stable connection once: must not count as an early failure and reconnects immediately on RDMA
+     * (proving stable_ms reset rdma_fails from 3 to 0, so no backoff triggers). */
+    {
+        int d0 = atomic_load(&b->downs), u0 = atomic_load(&b->ups);
+        pfk_fail_qp(f, 0);
+        CHECK(WAIT_FOR(atomic_load(&b->downs) > d0 && atomic_load(&b->ups) > u0 && plink_up(lb), 5000));
+        CHECK(plink_is_rdma(lb));
+    }
+
+    /* Verify 3 fresh early QP failures (within stable_ms) from 0: k=0,1 reconnect directly on RDMA (no backoff),
+     * and k=2 hits 3 failures and triggers backoff so the next connection settles on TCP immediately! */
     for (int k = 0; k < 3; k++) {
         int d0 = atomic_load(&b->downs);
+        int u0 = atomic_load(&b->ups);
         pfk_fail_qp(f, 0);
-        CHECK(WAIT_FOR(atomic_load(&b->downs) > d0 && plink_up(lb), 4000));
+        CHECK(WAIT_FOR(atomic_load(&b->downs) > d0 && atomic_load(&b->ups) > u0 && plink_up(lb), 5000));
         if (k < 2)
-            CHECK(WAIT_FOR(plink_is_rdma(lb), 3000));
+            CHECK(plink_is_rdma(lb));
     }
     /* After 3 early QP failures, the 4th connection settles on TCP immediately without offering! */
     CHECK(!plink_is_rdma(lb));
@@ -1289,7 +1404,7 @@ static void test_keepqueue(void)
     plr_pool_test_on_free(pb, on_free, f);
 
     struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
-    rcb.retry_ms = UINT32_MAX;
+    rcb.retry_ms = UINT64_MAX;
     struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
     struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
     int port = peerlink_listen(a->pl, 0);
@@ -1338,7 +1453,7 @@ static void test_keepqueue(void)
 
 static int fake_ipoib_lo(const char *ifname)
 {
-    return !strcmp(ifname, "lo") ? 32 : 1;
+    return (!strcmp(ifname, "lo") || !strcmp(ifname, "lo0")) ? 32 : 1;
 }
 
 /* IPoIB refusal (design-rdma.md §5.3, D12): listener address check and dial check refuse ARPHRD_INFINIBAND (32)
@@ -1351,6 +1466,11 @@ static void test_ipoib(void)
     CHECK(peerlink_check_ipoib_addr("127.0.0.1", err, sizeof err) == -1);
     printf("  ipoib: addr check refused: %s\n", err);
     CHECK(strstr(err, "lo") != NULL && strstr(err, "allow_ipoib") != NULL);
+    CHECK(peerlink_check_ipoib_addr("127.0.0.1:4201", err, sizeof err) == -1);
+    CHECK(peerlink_check_ipoib_addr("localhost", err, sizeof err) == -1);
+    CHECK(peerlink_check_ipoib_addr("localhost:4201", err, sizeof err) == -1);
+    CHECK(peerlink_check_ipoib_addr("fe80::1%lo", err, sizeof err) == -1);
+    CHECK(peerlink_check_ipoib_addr("[fe80::1%lo]:4201", err, sizeof err) == -1);
 
     /* Dial to 127.0.0.1 must also be refused while lo reports ARPHRD_INFINIBAND (32) */
     struct node *a = node_new(1, 100, 2000), *b = node_new(2, 100, 2000);
@@ -1365,6 +1485,9 @@ static void test_ipoib(void)
     /* With allow_ipoib=1, both the addr check and dialing succeed */
     peerlink_set_allow_ipoib(1);
     CHECK(peerlink_check_ipoib_addr("127.0.0.1", err, sizeof err) == 0);
+    CHECK(peerlink_check_ipoib_addr("127.0.0.1:4201", err, sizeof err) == 0);
+    CHECK(peerlink_check_ipoib_addr("localhost:4201", err, sizeof err) == 0);
+    CHECK(peerlink_check_ipoib_addr("[fe80::1%lo]:4201", err, sizeof err) == 0);
     CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&b->ups) == 1, 3000));
 
     peerlink_set_allow_ipoib(0);
@@ -1373,6 +1496,182 @@ static void test_ipoib(void)
     peerlink_free(a->pl);
     free(a);
     free(b);
+}
+
+/* Raw handshake helper for MF-2 wire test: connects to a listener with PL_CAP_RDMA_TRY. */
+static void test_hmac(const char *label, const uint8_t *tr, size_t trlen, uint8_t out[32])
+{
+    uint8_t kb[64] = {0}, pad[64], ih[32];
+    memcpy(kb, SECRET, sizeof SECRET);
+    tsdb_sha256 s;
+    for (int i = 0; i < 64; i++)
+        pad[i] = kb[i] ^ 0x36;
+    tsdb_sha256_init(&s);
+    tsdb_sha256_update(&s, pad, 64);
+    tsdb_sha256_update(&s, label, strlen(label));
+    tsdb_sha256_update(&s, tr, trlen);
+    tsdb_sha256_final(&s, ih);
+    for (int i = 0; i < 64; i++)
+        pad[i] = kb[i] ^ 0x5c;
+    tsdb_sha256_init(&s);
+    tsdb_sha256_update(&s, pad, 64);
+    tsdb_sha256_update(&s, ih, 32);
+    tsdb_sha256_final(&s, out);
+}
+
+static int raw_send_all(int fd, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    while (n) {
+        ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
+        if (w <= 0)
+            return -1;
+        b += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int raw_recv_all(int fd, void *p, size_t n)
+{
+    uint8_t *b = p;
+    while (n) {
+        struct pollfd pf = {fd, POLLIN, 0};
+        if (poll(&pf, 1, 3000) != 1)
+            return -1;
+        ssize_t r = recv(fd, b, n, 0);
+        if (r <= 0)
+            return -1;
+        b += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int raw_dial_try_rdma(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    tsdb_nosigpipe(fd);
+    /* F_HELLO: magic(4) ver(1) id(4) uuid(16) ident(16) nc(32) advlen(2) kind(1) checks(1) caps(1) = 78 bytes */
+    uint8_t hello[78];
+    memset(hello, 0, sizeof hello);
+    uint32_t magic = PL_CL_MAGIC, id = 2;
+    memcpy(hello, &magic, 4);
+    hello[4] = PL_CL_VERSION;
+    memcpy(hello + 5, &id, 4);
+    memset(hello + 9, 0x5a, 16);
+    memset(hello + 25, 0xB2, 16);
+    hello[75] = PL_KIND_LOG;
+    hello[76] = (uint8_t)pl_check_offer(PL_CHECK_NONE);
+    hello[77] = (uint8_t)(PL_CAP_RDMA | PL_CAP_RDMA_TRY);
+    uint8_t hdr[5] = {(uint8_t)(sizeof hello + 1), 0, 0, 0, 1};
+    if (raw_send_all(fd, hdr, 5) != 0 || raw_send_all(fd, hello, sizeof hello) != 0) {
+        close(fd);
+        return -1;
+    }
+    uint8_t ah[5], abody[256];
+    if (raw_recv_all(fd, ah, 5) != 0 || ah[4] != 2) {
+        close(fd);
+        return -1;
+    }
+    uint32_t alen = (uint32_t)ah[0] | ((uint32_t)ah[1] << 8) | ((uint32_t)ah[2] << 16) | ((uint32_t)ah[3] << 24);
+    if (alen < 33 || alen - 1 > sizeof abody || raw_recv_all(fd, abody, alen - 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    uint8_t tr[512], mac[32];
+    memcpy(tr, hello, sizeof hello);
+    memcpy(tr + sizeof hello, abody, alen - 1);
+    test_hmac("tsdb-link-c", tr, sizeof hello + alen - 1, mac);
+    uint8_t fh[5] = {33, 0, 0, 0, 3};
+    if (raw_send_all(fd, fh, 5) != 0 || raw_send_all(fd, mac, 32) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Non-upgrade TCP frames arriving before settle or mid-upgrade must be rejected (MF-2). */
+static void test_upframes(void)
+{
+    char err[256];
+    struct pfk_fab *f = pfk_new();
+    struct plr_pool_cfg pc = small_cfg();
+    struct plr_pool *pa = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    struct plr_pool *pb = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    CHECK(pa && pb);
+    struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO);
+    rca.offer_timeout_ms = 2000;
+    struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
+    int port = peerlink_listen(a->pl, 0);
+    CHECK(port > 0);
+
+    /* Case 1: user frame while acceptor is in UP_A_WAIT_OFFER (!settled) must be rejected without on_frame */
+    int fd = raw_dial_try_rdma(port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        uint8_t payload[16] = {0};
+        uint64_t seq = 0;
+        uint8_t *fr = NULL;
+        size_t fl = pl_frame_encode(PL_CHECK_NONE, 0, &seq, 0, 1, payload, sizeof payload, &fr);
+        CHECK(fl > 0 && raw_send_all(fd, fr, fl) == 0);
+        free(fr);
+        struct pollfd pf = {fd, POLLIN, 0};
+        CHECK(poll(&pf, 1, 2000) == 1);
+        uint8_t b;
+        CHECK(recv(fd, &b, 1, 0) <= 0); /* acceptor closed connection */
+        close(fd);
+        CHECK(atomic_load(&a->in) == 0 && atomic_load(&a->ups) == 0);
+    }
+
+    /* Case 2: user frame on TCP after RDMA_OFFER / RDMA_ACCEPT (UP_A_WAIT_HELLO) must also be rejected */
+    fd = raw_dial_try_rdma(port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        struct plr_conn *tmpc = plr_conn_new(pb, err, sizeof err);
+        CHECK(tmpc != NULL);
+        if (tmpc) {
+            struct plr_ep ep;
+            plr_conn_ep(tmpc, &ep);
+            uint8_t op[PLR_EP_LEN + 8];
+            plr_ep_encode(&ep, op);
+            memset(op + PLR_EP_LEN, 0x11, 8);
+            uint8_t ohdr[5] = {(uint8_t)(1 + sizeof op), 0, 0, 0, PLT_RDMA_OFFER};
+            CHECK(raw_send_all(fd, ohdr, 5) == 0 && raw_send_all(fd, op, sizeof op) == 0);
+            /* Read RDMA_ACCEPT */
+            uint8_t ah[5], ab[PLR_EP_LEN];
+            CHECK(raw_recv_all(fd, ah, 5) == 0 && ah[4] == PLT_RDMA_ACCEPT && raw_recv_all(fd, ab, sizeof ab) == 0);
+            /* Now send illegal user frame on TCP while acceptor is in UP_A_WAIT_HELLO */
+            uint8_t payload[16] = {0};
+            uint64_t seq = 1;
+            uint8_t *fr = NULL;
+            size_t fl = pl_frame_encode(PL_CHECK_NONE, 0, &seq, 0, 1, payload, sizeof payload, &fr);
+            CHECK(fl > 0 && raw_send_all(fd, fr, fl) == 0);
+            free(fr);
+            struct pollfd pf = {fd, POLLIN, 0};
+            CHECK(poll(&pf, 1, 2000) == 1);
+            uint8_t b;
+            CHECK(recv(fd, &b, 1, 0) <= 0);
+            plr_conn_free(tmpc);
+        }
+        close(fd);
+        CHECK(atomic_load(&a->in) == 0 && atomic_load(&a->ups) == 0);
+    }
+
+    peerlink_free(a->pl);
+    check_pools_clean(f, pa, pb, "upframes");
+    plr_pool_close(pa);
+    plr_pool_close(pb);
+    pfk_free(f);
+    free(a);
 }
 
 /* ------------------------------------------------------------------------------------------------- two hosts */
@@ -1388,13 +1687,6 @@ static void test_ipoib(void)
  * all), the receiver's DONE with its elapsed time and CPU; Gbit/s from the sender's clock (BEGIN to DONE), CPU s/GB of
  * each process (getrusage: every thread), then END. Each pool must be whole after the link closed.
  */
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-
 static uint64_t now_ns(void)
 {
     struct timespec ts;
@@ -1803,7 +2095,7 @@ int main(int argc, char **argv)
                  {"wakeup", test_wakeup},     {"errors", test_errors},     {"upgrade", test_upgrade},
                  {"lateready", test_lateready}, {"abortseq", test_abortseq}, {"golost", test_golost},
                  {"declines", test_declines}, {"badauth", test_badauth},   {"backoff", test_backoff},
-                 {"keepqueue", test_keepqueue}, {"ipoib", test_ipoib}};
+                 {"keepqueue", test_keepqueue}, {"ipoib", test_ipoib},     {"upframes", test_upframes}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && !strstr(only, cases[i].name))
             continue;

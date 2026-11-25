@@ -2969,7 +2969,7 @@ static void handle_status(req *r)
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
                  (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480 +
-                           PL_NKINDS * 100
+                           PL_NKINDS * 220
                      : 0);
     char *t = malloc(cap + 4);
     if (!t) {
@@ -2978,7 +2978,14 @@ static void handle_status(req *r)
         return;
     }
     size_t at = 4;
-#define ST_PUT(...) (at += (size_t)snprintf(t + at, cap - at, __VA_ARGS__))
+#define ST_PUT(...)                                                       \
+    do {                                                                  \
+        if (at + 1 < cap) {                                               \
+            int _n = snprintf(t + at, cap - at, __VA_ARGS__);             \
+            if (_n > 0)                                                   \
+                at += (size_t)_n >= cap - at ? cap - at - 1 : (size_t)_n; \
+        }                                                                 \
+    } while (0)
     ST_PUT("node.id=%u\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", cp ? (unsigned)cp->self : cvol_active() ? 0u : 1u,
            g_reader_only ? "follower" : "owner", TSDB_PROTOCOL_VERSION, (unsigned)nv);
     if (cp) {
@@ -5483,8 +5490,10 @@ static int parse_rdma_kind_name(const char *s, size_t n)
 
 static int parse_rdma_kinds(const char *arg, unsigned *mask)
 {
+    if (!arg || !*arg)
+        return -1;
     const char *p = arg;
-    while (*p) {
+    for (;;) {
         const char *c = strchr(p, ',');
         size_t n = c ? (size_t)(c - p) : strlen(p);
         while (n && (*p == ' ' || *p == '\t'))
@@ -5504,8 +5513,10 @@ static int parse_rdma_kinds(const char *arg, unsigned *mask)
 
 static int parse_rdma_sl(const char *arg, uint8_t sl[PL_NKINDS])
 {
+    if (!arg || !*arg)
+        return -1;
     const char *p = arg;
-    while (*p) {
+    for (;;) {
         const char *c = strchr(p, ',');
         size_t n = c ? (size_t)(c - p) : strlen(p);
         while (n && (*p == ' ' || *p == '\t'))
@@ -5557,8 +5568,10 @@ struct rdma_dev_spec {
 
 static int parse_rdma_devices(const char *arg, struct rdma_dev_spec *out, int *cnt, int max)
 {
+    if (!arg || !*arg)
+        return -1;
     const char *p = arg;
-    while (*p) {
+    for (;;) {
         const char *c = strchr(p, ',');
         size_t n = c ? (size_t)(c - p) : strlen(p);
         while (n && (*p == ' ' || *p == '\t'))
@@ -6236,7 +6249,8 @@ int main(int argc, char **argv)
             return 1;
         char ierr[256];
         if (peerlink_check_ipoib_fd(wfd, ierr, sizeof ierr) != 0 ||
-            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0)) {
+            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0) ||
+            (peer_advertise && peerlink_check_ipoib_addr(peer_advertise, ierr, sizeof ierr) != 0)) {
             fprintf(stderr, "tsdbd: %s\n", ierr);
             close(wfd);
             return 1;
@@ -6410,7 +6424,8 @@ int main(int argc, char **argv)
             return 1;
         char ierr[256];
         if (peerlink_check_ipoib_fd(pfd, ierr, sizeof ierr) != 0 ||
-            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0)) {
+            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0) ||
+            (peer_advertise && peerlink_check_ipoib_addr(peer_advertise, ierr, sizeof ierr) != 0)) {
             fprintf(stderr, "tsdbd: %s\n", ierr);
             close(pfd);
             return 1;
@@ -6516,7 +6531,7 @@ int main(int argc, char **argv)
         rcfg.mode = rdma_mode;
         rcfg.kinds = rdma_kinds_set ? rdma_kinds : 0;
         memcpy(rcfg.sl, rdma_sl, sizeof rcfg.sl);
-        rcfg.retry_ms = rdma_retry_set ? (rdma_retry_s == 0 ? UINT32_MAX : rdma_retry_s * 1000u) : 600000u;
+        rcfg.retry_ms = rdma_retry_set ? (rdma_retry_s == 0 ? UINT64_MAX : (uint64_t)rdma_retry_s * 1000ull) : 600000ull;
         rcfg.poll_us = rdma_poll_us;
         if (rdma_mode != PL_RDMA_OFF) {
             char rerr[256];
@@ -6542,12 +6557,14 @@ int main(int argc, char **argv)
                                 plr_pool_close(rdma_pools[j]);
                             return 1;
                         }
-                        fprintf(stderr, "tsdbd: %s; data links stay on TCP\n", rerr);
+                        fprintf(stderr, "tsdbd: %s\n", rerr);
                         continue;
                     }
                     rdma_pools[rdma_npools++] = pool;
                     rcfg.pools[rcfg.npools++] = pool;
                 }
+                if (rcfg.npools == 0)
+                    fprintf(stderr, "tsdbd: no RDMA pool opened; data links stay on TCP\n");
             }
         }
         peerlink_set_rdma(&rcfg);

@@ -414,5 +414,14 @@ rc=$?
 cfg cli-bad.properties 'client.server = x' 'client.nope = 1'
 refused "CLI unknown key" 'cli-bad.properties:2' "$B/tsdb" --config "$dir/cli-bad.properties" --check-config
 
+# RDMA parser edge cases (empty strings, trailing commas, > 49.7d retry_s)
+refused "empty --peer-rdma-kinds" '--peer-rdma-kinds' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-kinds "" --check-config
+refused "trailing comma --peer-rdma-kinds" '--peer-rdma-kinds' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-kinds "log," --check-config
+refused "empty --peer-rdma-sl" '--peer-rdma-sl' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-sl "" --check-config
+refused "trailing comma --peer-rdma-sl" '--peer-rdma-sl' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-sl "1," --check-config
+refused "empty --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "" --check-config
+refused "trailing comma --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "mlx5_0," --check-config
+"$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-retry-s 5000000 --check-config > /dev/null 2>&1 || fail "--peer-rdma-retry-s 5000000 refused"
+
 if [ $errors = 0 ]; then echo "test_config: ok"; else echo "test_config: $errors failure(s)"; fi
 exit $((errors > 0))

@@ -280,6 +280,15 @@ static void pfk_step_locked(struct pfk_fab *f)
     }
 }
 
+static void pfk_flush_only_locked(struct pfk_fab *f)
+{
+    for (int i = 0; i < PFK_QPS; i++) {
+        struct plr_qp *q = &f->qp[i];
+        if (q->used && q->state == 2 && f->slow_flush && !f->no_flush)
+            pfk_flush_step_locked(q);
+    }
+}
+
 static void *pfk_thread(void *arg)
 {
     struct pfk_fab *f = arg;
@@ -287,6 +296,8 @@ static void *pfk_thread(void *arg)
         pthread_mutex_lock(&f->mu);
         if (!atomic_load(&f->hold))
             pfk_step_locked(f);
+        else
+            pfk_flush_only_locked(f);
         pthread_mutex_unlock(&f->mu);
         struct timespec ts = {0, 50000};
         nanosleep(&ts, NULL);

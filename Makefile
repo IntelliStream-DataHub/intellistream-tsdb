@@ -1084,8 +1084,8 @@ $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h
 $(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
-$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the replication driver's check (server/replwire.h, rd-drvcheck)
 $(B)/test_replwire: tests/test_replwire.c $(B)/replwire.o server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ $< $(B)/replwire.o

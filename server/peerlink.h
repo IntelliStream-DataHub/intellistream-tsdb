@@ -151,7 +151,7 @@ struct pl_rdma_cfg {
     int mode;                                /* PL_RDMA_AUTO, PL_RDMA_OFF, PL_RDMA_ON */
     unsigned kinds;                          /* bitmask (1u << PL_KIND_*); 0: all data kinds (1..PL_KIND_DATA_MAX) */
     uint8_t sl[PL_NKINDS];                   /* InfiniBand service level per kind (0..15) */
-    uint32_t retry_ms;                       /* re-offer interval on live TCP link (0: 600000 ms; UINT32_MAX: never) */
+    uint64_t retry_ms;                       /* re-offer interval on live TCP link (0: 600000 ms; UINT64_MAX: never) */
     uint32_t poll_us;                        /* busy-poll CQ before sleeping (0: none) */
     struct plr_pool *pools[PL_RDMA_POOLS_MAX]; /* registered memory pools, shared across peerlinks (D7) */
     int npools;
