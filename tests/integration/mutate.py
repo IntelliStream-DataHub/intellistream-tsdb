@@ -23,13 +23,32 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 
-# id, what the bug is, file, old text (must occur once), new text, components rebuilt, scenario(s) to run, backend
+# id, what the bug is, file, old text (must occur once), new text, components rebuilt, scenario(s) to run, backend.
+# old and new may be lists of the same length: one bug planted at several places of the file, each edit's old text
+# occurring once in the text the edits before it left.
 M = []
 
 
 def mut(id, what, file, old, new, build, scen, io="epoll", hang=False):
     """hang: the bug can only show as a client that waits for ever (a lost reply); its timeout is then the catch."""
     M.append(dict(id=id, what=what, file=file, old=old, new=new, build=build, scen=scen, io=io, hang=hang))
+
+
+def edits(m):
+    """The (old, new) pairs of a mutant, in the order they are applied."""
+    if isinstance(m["old"], list):
+        return list(zip(m["old"], m["new"]))
+    return [(m["old"], m["new"])]
+
+
+def plant(m, text):
+    """(the text with the mutant planted, None), or (None, why it cannot be: an old text that does not occur
+    exactly once)."""
+    for i, (old, new) in enumerate(edits(m)):
+        if text.count(old) != 1:
+            return None, "the text to mutate (edit %d) occurs %d times in %s" % (i + 1, text.count(old), m["file"])
+        text = text.replace(old, new)
+    return text, None
 
 
 mut("M1", "C client ignores the validity bitmap of a values reply (nulls read as values)",
@@ -44,8 +63,8 @@ mut("M2", "Rust client: a local midnight near a clock change is one hour off (wr
     ["rust"], "matrix")
 mut("M3", "server loses the acknowledgement of every 61st values insert (a dropped ack)",
     "server/tsdbd.c",
-    "        metrics_rows_inserted(n);\n    }\n    reply_status(c, r->id, rc);\n}",
-    "        metrics_rows_inserted(n);\n    }\n"
+    "        tn_count(ts, TN_INSERTED_BYTES, len);\n    }\n    reply_status(c, r->id, rc);\n}",
+    "        tn_count(ts, TN_INSERTED_BYTES, len);\n    }\n"
     "    static unsigned dropped;\n"
     "    if (!(r->op == TSDB_OP_INSERT_VALUES && rc == 0 && ++dropped % 61 == 0))\n"
     "        reply_status(c, r->id, rc);\n}",
@@ -133,20 +152,29 @@ mut("M17", "granule statistics drop the high word of 128-bit integer sums beyond
     ["c"], "matrix")
 mut("M18", "server skips the rights check in handle(): a logged-in user reads another tenant's series",
     "server/tsdbd.c",
-    "    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {",
-    "    if ((rc = auth_fresh(a)) != 0 || (rc = 0) != 0) {",
+    # handle_in checks in two steps: who may send the op and the series it names (auth_check_login) before the
+    # routing decision, the series it names by id (auth_check_ids) after it; the bug skips both
+    ["    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check_login(a, r->op, p, len)) != 0 ||",
+     "    if ((rc = auth_check_ids(a, r->op, p, len)) != 0) { /* only where the volume is served (route_decide) */"],
+    ["    if ((rc = auth_fresh(a)) != 0 || (rc = 0) != 0 ||",
+     "    if ((rc = 0) != 0) { /* only where the volume is served (route_decide) */"],
     ["c"], "matrix")
 mut("M19", "server skips the rights check of reads by id: a tenant reads any series whose id it has",
     "server/auth.c",
-    "        return auth_id(a, id, need);",
-    "        return need == R_READ ? 0 : auth_id(a, id, need);",
+    "        return 0; /* an id per row: the handler checks each (auth_ids) */\n    return auth_id(a, id, need);",
+    "        return 0; /* an id per row: the handler checks each (auth_ids) */\n"
+    "    return need == R_READ ? 0 : auth_id(a, id, need);",
     ["c"], "matrix")
 
 # QUERY_LATEST (protocol 14)
 mut("M20", "server answers QUERY_LATEST for ids the user may not read (the denied mask is never set)",
     "server/tsdbd.c",
-    "            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;",
-    "            bool no = false;",
+    "    if (!auth_all(&c->auth, R_READ)) {\n        own = malloc((size_t)n * sizeof *own);\n"
+    "        denied = calloc(((size_t)n + 7) / 8, 1);\n        if (!own || !denied)\n            rc = TSDB_ERR_NOMEM;\n"
+    "        for (uint32_t i = 0; rc == 0 && i < n; i++) {\n            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;",
+    "    if (!auth_all(&c->auth, R_READ)) {\n        own = malloc((size_t)n * sizeof *own);\n"
+    "        denied = calloc(((size_t)n + 7) / 8, 1);\n        if (!own || !denied)\n            rc = TSDB_ERR_NOMEM;\n"
+    "        for (uint32_t i = 0; rc == 0 && i < n; i++) {\n            bool no = false;",
     ["c"], "matrix")
 mut("M21", "Java client drops the WITH_NULLS flag of latest (a null answers as the older value under it)",
     "client/java/src/main/java/ai/intellistream/tsdb/TsdbClient.java",
@@ -209,10 +237,10 @@ def run_one(m, keep, logdir):
         shutil.copytree(ROOT, tree, symlinks=True,
                         ignore=shutil.ignore_patterns(".git", "build", "build-*", "target", "__pycache__"))
         p = tree / m["file"]
-        text = p.read_text()
-        if text.count(m["old"]) != 1:
-            return "ERROR", "the text to mutate occurs %d times in %s" % (text.count(m["old"]), m["file"])
-        p.write_text(text.replace(m["old"], m["new"]))
+        text, why = plant(m, p.read_text())
+        if why:
+            return "ERROR", why
+        p.write_text(text)
         b = tree / "build"
         (b / "integ").mkdir(parents=True)
         real = ROOT / "build"
