@@ -724,6 +724,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
         nhist = hist ? rv->nhist : 0;
     }
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     pthread_mutex_lock(&S.mu);
     struct rjob *j = why ? NULL : job_find(R_SRC, vol, 0);
     if (j && j->peer == from && j->req == req) { /* a repeat of a request being served */
@@ -1183,17 +1184,23 @@ static void install(struct rjob *j)
         pthread_mutex_lock(&S.mu);
         vs_get(j->vol)->retry_at = 0;
         pthread_mutex_unlock(&S.mu);
+        vol_put(rv);
         return;
     }
     crash_point(CP_SNAP_RECEIVED);
     struct snapinst_result res;
     int rc = snapinst_install(G.dir, j->vol, j->dir, m->p, m->p_epoch, &res);
-    if (drv && vol_find(j->vol) == rv) { /* not taken, or refused with the driver still running: the change goes on */
+    /* rv's reference keeps it (unlisted by the install's repld_close_end, or not) from being freed and its address
+     * reused by the next open's driver until this compare is done */
+    struct rvol *cur = drv ? vol_find(j->vol) : NULL;
+    if (drv && cur == rv) { /* not taken, or refused with the driver still running: the change goes on */
         pthread_mutex_lock(&rv->mu);
         if (rv->snap == &rs_installing)
             rv->snap = NULL;
         pthread_mutex_unlock(&rv->mu);
     }
+    vol_put(cur);
+    vol_put(rv);
     uint64_t took = ms_now() - t0;
     char done[sizeof j->dir + 16];
     snprintf(done, sizeof done, "%s/" SNAP_DONE, j->dir);

@@ -149,8 +149,54 @@ struct rvol *vol_find(uint32_t number)
     for (uint32_t i = 0; i < G.nvols && !rv; i++)
         if (G.vols[i]->number == number)
             rv = G.vols[i];
+    if (rv)
+        rv->refs++;
     pthread_mutex_unlock(&G.mu);
     return rv;
+}
+
+/* whether volume `number` has a driver listed (no reference kept) */
+static int vol_listed(uint32_t number)
+{
+    struct rvol *rv = vol_find(number);
+    vol_put(rv);
+    return rv != NULL;
+}
+
+/* Frees a driver nobody refers to any more (vol_put's last reference): its thread joined, its engine closed (so no
+ * jr_ops hook runs on it), unlisted, and no vol_find holder left. What it owns goes with it: the core, the REPL handle
+ * and state, the record index, the message arrays, the inbox items posted after its thread stopped, R4's state. */
+static void vol_free(struct rvol *rv)
+{
+    repl_free(rv->core);
+    if (rv->rf)
+        replfile_close(rv->rf);
+    replfile_state_free(&rv->st);
+    free(rv->idx);
+    free(rv->recs);
+    free(rv->lens);
+    free(rv->coff);
+    for (struct item *it = rv->in_head, *nx; it; it = nx) {
+        nx = it->next;
+        free(it);
+    }
+    free(rv->set);
+    free(rv->tr); /* rv->snap is rsnap.c's static marker, never allocated */
+    pthread_cond_destroy(&rv->in_space);
+    pthread_cond_destroy(&rv->cv);
+    pthread_mutex_destroy(&rv->mu);
+    free(rv);
+}
+
+void vol_put(struct rvol *rv)
+{
+    if (!rv)
+        return;
+    pthread_mutex_lock(&G.mu);
+    int last = --rv->refs == 0;
+    pthread_mutex_unlock(&G.mu);
+    if (last)
+        vol_free(rv);
 }
 
 static int node_index(const struct rvol *rv, uint32_t node)
@@ -904,7 +950,10 @@ static void ship_batch_end(int wait)
 {
     struct shipbatch *b = &tl_ship;
     uint32_t lag = 0;
-    if (b->rv) { /* the writer's thread, not the volume's: rv->rec is the manager's to rewrite (rec_set) under rv->mu */
+    /* the writer's thread, not the volume's: rv->rec is the manager's to rewrite (rec_set) under rv->mu. Read only for
+     * a wait, which op_ship_wait asks with its own engine's ctx (alive while the engine is): a batch left behind
+     * (wait 0) may name a driver that repld_close_end has freed since */
+    if (wait && b->rv) {
         pthread_mutex_lock(&b->rv->mu);
         lag = b->rv->rec.isr_lag_ms;
         pthread_mutex_unlock(&b->rv->mu);
@@ -1033,7 +1082,7 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
         return -1;
     r->fd = -1;
     if (rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 || size != total ||
-        total > (1ull << 32) || !vol_find(r->volume)) {
+        total > (1ull << 32) || !vol_listed(r->volume)) {
         free(r);
         return -1;
     }
@@ -1101,6 +1150,7 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
     pthread_mutex_unlock(&G.mu);
     if (drop) {
         say("TEST: volume %" PRIu32 ": %s received and not staged (dropbulk)", r->volume, r->name);
+        vol_put(rv);
         return 0;
     }
     struct eng *db = tsdb_cvol_ref(G.t, r->volume);
@@ -1114,6 +1164,7 @@ static int bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, con
     tsdb_cvol_unref(&db);
     if (rc == 0)
         post(rv, IN_WAKE, 0, NULL, 0); /* a COMMIT may be durable now: sync and ACK */
+    vol_put(rv);
     return rc == 0 ? 0 : -1;
 }
 
@@ -1241,6 +1292,7 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
     struct rvol *rv = vol_find(volume);
     if (rv)
         post(rv, type == RW_T_MSG ? IN_MSG : IN_FETCH, plink_peer(l), p, n);
+    vol_put(rv);
 }
 
 static void on_link(void *arg, struct plink *l, int up)
@@ -2515,8 +2567,10 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->open_ms = now_ms(); /* before it is listed: repld_unreachable reads it from the list */
     pthread_mutex_lock(&G.mu);
     room = G.nvols < CLUSTER_REPORT_VOLS; /* checked before the open; repld_open runs on the manager thread only */
-    if (room)
+    if (room) {
         G.vols[G.nvols++] = rv;
+        rv->refs = 1; /* the listing's: given back by repld_close_end */
+    }
     pthread_mutex_unlock(&G.mu);
     if (!room || pthread_create(&rv->th, NULL, vol_main, rv) != 0) {
         say("volume %" PRIu32 ": no driver thread", r->number);
@@ -2527,7 +2581,6 @@ int repld_open(const struct cluster_vol_rec *r)
             tsdb_volume_quiesce(G.t, r->number);
         } else {
             cvol_close(r->number);
-            repl_free(rv->core);
             goto fail;
         }
         return TSDB_ERR_NOMEM;
@@ -2538,10 +2591,9 @@ int repld_open(const struct cluster_vol_rec *r)
         r->number, rv->self, rv->nnodes, said_start, log_end, said_floor, said_fence);
     return 0;
 fail:
-    if (rv->rf)
-        replfile_close(rv->rf);
-    replfile_state_free(&rv->st);
-    free(rv);
+    if (rv->rec_short) /* counted by rec_set above; a listed driver gives it back in repld_close_end */
+        __atomic_add_fetch(&G.nshort, -1, __ATOMIC_RELEASE);
+    vol_free(rv); /* never listed, no thread: nothing else holds it (the core and index of a failed core_build too) */
     return rc ? rc : TSDB_ERR_INVALID;
 }
 
@@ -2558,6 +2610,7 @@ void repld_update(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&rv->mu);
     if (changed)
         post(rv, IN_META, 0, NULL, 0);
+    vol_put(rv);
 }
 
 void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from)
@@ -2566,6 +2619,7 @@ void repld_fence(void *arg, uint32_t v, uint64_t fence, uint32_t from)
     struct rvol *rv = vol_find(v);
     if (rv && fence)
         post(rv, IN_FENCE, from, &fence, sizeof fence);
+    vol_put(rv);
 }
 
 void repld_volcmd(void *arg, const struct cluster_volcmd *c, uint32_t from)
@@ -2574,6 +2628,7 @@ void repld_volcmd(void *arg, const struct cluster_volcmd *c, uint32_t from)
     struct rvol *rv = vol_find(c->volume);
     if (rv)
         post(rv, IN_CMD, from, c, sizeof *c);
+    vol_put(rv);
 }
 
 int repld_isr_short(uint32_t v)
@@ -2586,6 +2641,7 @@ int repld_isr_short(uint32_t v)
     pthread_mutex_lock(&rv->mu);
     int s = rv->mode == M_WRITER && !rv->failed && isr_short_locked(rv);
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     return s;
 }
 
@@ -2595,6 +2651,8 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
     pthread_mutex_lock(&G.mu);
     uint32_t nv = G.nvols;
     memcpy(vs, G.vols, nv * sizeof *vs);
+    for (uint32_t i = 0; i < nv; i++)
+        vs[i]->refs++; /* a driver repld_close_end unlists meanwhile is freed only by the vol_put below */
     pthread_mutex_unlock(&G.mu);
     unsigned n = 0;
     /* from where the last report stopped: with more requests than one heartbeat carries (CLUSTER_REPORT_ISR) every
@@ -2622,6 +2680,8 @@ unsigned repld_isr_requests(struct cluster_isr_req *out, unsigned max)
         }
         pthread_mutex_unlock(&rv->mu);
     }
+    for (uint32_t k = 0; k < nv; k++)
+        vol_put(vs[k]);
     if (n == max)
         __atomic_store_n(&G.isr_rot, (rot + i) % nv, __ATOMIC_RELAXED);
     return n;
@@ -2633,6 +2693,8 @@ unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t a
     pthread_mutex_lock(&G.mu);
     uint32_t nv = G.nvols;
     memcpy(vs, G.vols, nv * sizeof *vs);
+    for (uint32_t i = 0; i < nv; i++)
+        vs[i]->refs++; /* a driver repld_close_end unlists meanwhile is freed only by the vol_put below */
     pthread_mutex_unlock(&G.mu);
     uint64_t now = now_ms();
     struct {
@@ -2662,6 +2724,8 @@ unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t a
         }
         pthread_mutex_unlock(&rv->mu);
     }
+    for (uint32_t i = 0; i < nv; i++)
+        vol_put(vs[i]);
     unsigned n = 0;
     for (unsigned j = 0; j < ns && n < max; j++) {
         uint64_t age = now > seen[j].last ? now - seen[j].last : 0;
@@ -2679,6 +2743,7 @@ int repld_failed(uint32_t v)
     pthread_mutex_lock(&rv->mu);
     int f = rv->failed;
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     return f;
 }
 
@@ -2694,6 +2759,7 @@ int repld_leading(uint32_t v, uint64_t *epoch)
     if (l && epoch)
         *epoch = rv->mode == M_PROMOTING ? rv->epoch : repl_epoch(rv->core);
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     return l;
 }
 
@@ -2706,6 +2772,7 @@ int repld_engine_failed(uint32_t v, const char *msg)
     int first = !rv->failed;
     vol_fail(rv, msg && msg[0] ? msg : "the engine failed"); /* deposes a writer before the quiesce hides its engine */
     pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
     if (first && G.mutant != RM_NOQUIESCE)
         tsdb_volume_quiesce(G.t, v); /* clients get UNAVAILABLE and go to the volume's next leader */
     return 1;
@@ -2774,6 +2841,15 @@ int repld_close_end(uint32_t v, uint64_t *log_end)
         say("volume %" PRIu32 ": driver stopped (the replica is closed)", v);
     }
     cvol_close(v);
+    /* The listing's reference (repld_open) is given back here, and rv is freed with what it owns by the last vol_put.
+     * Who else may hold it: its own thread (joined above), the engine's jr_ops hooks (ctx = rv: cvol_close has closed
+     * the engine, so no write, ship or admit runs on it any more), and every vol_find holder (link threads posting
+     * frames and bulk files, the cluster thread's fence, volcmd and update, workers asking repld_leading or
+     * repld_isr_short, the heartbeat's report copies, the snapshot worker's src_req and install, which calls this
+     * through cvol_install): each keeps its own reference until it is done, so whichever of them comes last frees rv.
+     * Unlisted, it is never found again; a new open of the volume makes a new rvol. Before this an unlisted driver was
+     * never freed: every snapshot install and every closed replica (repld_close) leaked its core, index and REPL. */
+    vol_put(rv);
     return 0;
 }
 

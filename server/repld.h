@@ -55,8 +55,9 @@ unsigned repld_unreachable(struct cluster_unreach *out, unsigned max, uint32_t a
 /* Stops every driver thread and the links (before the handle is closed). */
 void repld_stop(void);
 /* Closes one volume's driver and engine (a replica the record no longer names, or one reset: server/cvolset_mgr.c): its
- * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted (its memory kept: a link thread
- * may still hold it from vol_find). 0 (also when none was open), the manager's thread. */
+ * thread stopped and joined, a writer deposed, the engine closed, the driver unlisted and freed once the last holder of
+ * a vol_find reference (a link thread, the cluster thread, a worker, the snapshot worker) gives it back. 0 (also when
+ * none was open), the manager's thread. */
 int repld_close(uint32_t v);
 /* repld_close, and *log_end the replica's durable log end once its driver was joined (nothing appends after it): 0 for a
  * DIVERGED replica that asked for its rebuild, REPLD_END_UNKNOWN when no driver or no core was there (cvol_install) */
