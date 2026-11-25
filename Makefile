@@ -378,8 +378,8 @@ $(B)/test_recover: tests/test_recover.c $(LIB)
 # CI's plain-build job runs TEST_GROUPS as four runners (test-groups-1 .. 4: BT_GROUPS_N, about equal by their ASan times);
 # tests/check_ci_groups.sh requires the four to be exactly TEST_GROUPS, each once
 BT_TARGETS := test-groups-1 test-groups-2 test-groups-3 test-groups-4
-UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-i
-UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7
+UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-h4 test-units-h5 test-units-i
+UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7 test-units-b8 test-units-b9
 # the binaries of `make test`, once: the groups below build the same set, so that a binary added here is built for every group
 TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_replwire $(B)/test_margins $(B)/test_plrdma
 $(UNITS_GROUPS) test-groups $(BT_TARGETS): $(TEST_BINS)
@@ -469,10 +469,10 @@ test-units-b: $(TEST_B_BINS_1) $(TEST_B_BINS_2)
 # then runs the groups one after the other: the second plain job of CI, beside `make test TEST_GROUPS=`.
 test-groups:
 	$(MAKE) -j1 $(TEST_GROUPS)
-BT_GROUPS_1 := test-units-h3 test-units-b test-units-c test-units-d
+BT_GROUPS_1 := test-units-h3 test-units-h4 test-units-h5 test-units-b test-units-c test-units-d
 BT_GROUPS_2 := test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-b6 test-units-b7
 BT_GROUPS_3 := test-cluster-3 test-cluster-2 test-cluster-1 test-links test-net test-units-i
-BT_GROUPS_4 := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-meta-1 test-meta-2 test-meta-mutants-1 test-meta-mutants-2
+BT_GROUPS_4 := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b8 test-units-b9 test-meta-1 test-meta-2 test-meta-mutants-1 test-meta-mutants-2
 $(BT_TARGETS): test-groups-%:
 	$(MAKE) -j1 $(BT_GROUPS_$*)
 
@@ -512,7 +512,11 @@ test-units-h1:
 test-units-h2:
 	$(MUT) --name test_replica --list "epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap wtailfoldall wtailfoldmin wtailfoldnewer wtailfolddropold wtailsortnomax wtailremoved nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-h3:
-	$(MUT) --name test_replica --list "closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
+	$(MUT) --name test_replica --list "rscommittedtrue rscommittedfalse nohardlink readgap cursoranyway tailoksealed closewait keepignored promotenocarry keptreplayed leaderkeptnosave applyholdsmu" -- ./$(B)/test_replica --mutant @M@ @D@
+test-units-h4:
+	$(MUT) --name test_replica --list "b0off leaderlinknosync notfoundsealed nosweep linkbyname leadernoprune nocutgen dropunheld rowsholdmu promotenoapplymu replicadropsfloor replaykeptearly" -- ./$(B)/test_replica --mutant @M@ @D@
+test-units-h5:
+	$(MUT) --name test_replica --list "leaderpruneall notelate switchunattached freshunattached replicadropsfiles replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
 test-units-i:
 	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
 	./$(B)/test_feedstore $(SCRATCH)
@@ -550,9 +554,13 @@ test-units-b5:
 	./$(B)/test_eccold $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "recnodirsync v5nodirsync coldnoflushthrough ycold ecabovey" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it (part 1 of 3)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: each planted bug of a replica's digest job must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digestpower --list "digestjobnosync" -- ./$(B)/test_ecapply --case digestpower --mutant @M@ @D@) # r8j: the job file written without its fdatasync must fail it
+test-units-b8:
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "pposignored leaderswapnors pposafterswap mergekept notfoundzero noorder" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it (part 2 of 3)
+test-units-b9:
+	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "checkz seenskip noyhcheck decidesome recrollmissing recnodiverge" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it (part 3 of 3)
 test-units-b6:
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
