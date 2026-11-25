@@ -1285,9 +1285,8 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
  * the decode and its driver check (test_cluster drvcheck). ack, on a writer: every 2nd ACK whose written lies above its
  * durable gets one bit of durable flipped so that it lands inside (durable, written], which no structural bound can
  * see (review F3); head, on a replica: every 8th APPEND with records, bit 0 of its commit or bit 3 of its off, in turn;
- * desc: every 2nd APPEND with two records or more, bit 0 of the last descriptor's epoch or span, in turn (and bit 3
- * of the off of four in a row of every 16 with one record, whose resend carries several). 1 when it flipped (the first flip of each
- * field is said). */
+ * desc: every 2nd APPEND with two records or more (starting at the first), bit 0 of the last descriptor's epoch or
+ * span, in turn. 1 when it flipped (the first flip of each field is said). */
 static int flip_raw(struct rvol *rv, uint8_t *p, size_t n, int from)
 {
     if (n < RW_HEAD + RW_CHECK || p[0] != RW_VERSION)
@@ -1320,23 +1319,19 @@ static int flip_raw(struct rvol *rv, uint8_t *p, size_t n, int from)
         else
             p[RW_HEAD + 8] ^= 8, what = "an APPEND's off"; /* bit 3 of off */
         break;
-    case FR_DESC:
-        if (p[1] != REPL_M_APPEND || !nrec || (n - RW_HEAD - RW_CHECK - RW_APPEND_HEAD) / RW_DESC < nrec)
+    case FR_DESC: {
+        if (p[1] != REPL_M_APPEND || nrec < 2 || (n - RW_HEAD - RW_CHECK - RW_APPEND_HEAD) / RW_DESC < nrec)
             return 0;
-        if (nrec < 2) { /* four in a row of every 16 lose bit 3 of off: their resend carries several records */
-            if (++rv->raw_n % 16 >= 4)
-                return 0;
-            p[RW_HEAD + 8] ^= 8, what = "an APPEND's off";
-            break;
-        }
-        if (++rv->raw_m % 2) /* every 2nd with several: never all of them, or the resends never get through */
+        unsigned k = rv->raw_m++;
+        if (k % 2) /* every 2nd with several: never all of them, or the resends never get through */
             return 0;
         uint8_t *d = p + RW_HEAD + RW_APPEND_HEAD + (size_t)(nrec - 1) * RW_DESC;
-        if ((rv->raw_m / 2) % 2)
+        if ((k / 2) % 2 == 0)
             d[8] ^= 1, what = "a descriptor's epoch"; /* bit 0 of the last descriptor's epoch */
         else
             d[16] ^= 1, what = "a descriptor's span"; /* bit 0 of its n */
         break;
+    }
     default:
         return 0;
     }

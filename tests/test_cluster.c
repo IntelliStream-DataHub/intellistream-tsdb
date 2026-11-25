@@ -13162,11 +13162,89 @@ static void drvcheck_run(const char *name, const char *env, const char *field, i
     stop_all();
 }
 
+static void drvcheck_desc_run(void)
+{
+    scenario("drvcheck-desc");
+    init_isr_lag_ms = 500;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=flipraw=desc,cutlinks";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    await_isr(L, "rf", 3, 30000, "every replica in the ISR before the writes");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    int64_t next_ts = 2000000;
+    /* Cut each replica in turn so the leader accumulates a multi-record backlog (20 WAL records) before healing;
+     * the catch-up APPEND carries nrec >= 2 descriptors, so flipraw=desc deterministically flips descriptor nrec-1
+     * (beyond descriptor 0). Two cuts on the first replica flip both epoch and span. */
+    int reps[2], nr = 0;
+    for (int i = 0; i < 3; i++)
+        if (i != L)
+            reps[nr++] = i;
+    int order[3] = {reps[0], reps[0], reps[1]};
+    for (int round = 0; round < 3; round++) {
+        int r = order[round];
+        cut_file(L, r, 1);
+        cut_file(r, L, 1);
+        await_isr(L, "rf", 2, 10000, "cut replica leaves ISR");
+        for (int k = 0; k < 20; k++) {
+            int64_t ts = next_ts;
+            next_ts += 1000;
+            float val = (float)(round * 20 + k);
+            if ((rc = tsdbc_insert_series(c, id, &ts, &val, 1)) != 0)
+                die("drvcheck-desc round %d write %d: %s", round, k, ers(rc));
+        }
+        cut_file(L, r, 0);
+        cut_file(r, L, 0);
+        await_isr(L, "rf", 3, 20000, "replica rejoins ISR after flipped multi-descriptor APPEND");
+    }
+    tsdbc_close(c);
+    int64_t last = next_ts - 1000;
+    for (int i = 0; i < 3; i++) {
+        if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
+            die("drvcheck-desc: a flipped message passed the driver check on server %d", i);
+        if (i == L)
+            continue;
+        uint64_t t0 = now_ms();
+        while (!wal_holds_ts(i, last)) {
+            if (now_ms() - t0 > 20000)
+                die("drvcheck-desc: the last row did not reach replica %d's log in 20 s", i);
+            usleep(5000);
+        }
+        if (!log_has(i, "flipraw: flipped a descriptor's"))
+            die("drvcheck-desc: server %d did not flip a descriptor beyond the first", i);
+        if (!log_has(i, "failed its driver check, dropped"))
+            die("drvcheck-desc: server %d dropped no message for its driver check", i);
+    }
+    if (!log_has(reps[0], "flipraw: flipped a descriptor's epoch") ||
+        !log_has(reps[0], "flipraw: flipped a descriptor's span"))
+        die("drvcheck-desc: server %d did not flip both a descriptor's epoch and span", reps[0]);
+    stop_all();
+}
+
 static void scen_drvcheck(void)
 {
     drvcheck_run("drvcheck-ack", "TSDB_REPLD_TEST=flipraw=ack,synclate", "an ACK's durable", 1);
     drvcheck_run("drvcheck-head", "TSDB_REPLD_TEST=flipraw=head", "an APPEND's commit", 0);
-    drvcheck_run("drvcheck-desc", "TSDB_REPLD_TEST=flipraw=desc", "a descriptor's", 0);
+    drvcheck_desc_run();
     printf("  drvcheck: an ACK's durable raised inside (durable, written], an APPEND's head and a descriptor beyond the "
            "first flipped on the wire, each dropped by the driver check under none, all rows in both replicas\n");
 }
