@@ -68,6 +68,8 @@ struct plr_qp {
     struct pfk_fifo held; /* sends executed whose buffers the NIC may still hold: until a later signalled completion */
     struct plr_wc cq[PFK_CQ];
     int cq_head, cq_n, armed;
+    struct plr_wc late[PFK_CQ]; /* arm_race: made while not armed, into cq at the next arm */
+    int late_n;
     int ev[2]; /* the completion channel */
 };
 
@@ -84,6 +86,12 @@ struct pfk_fab {
     long err_send_at; /* > 0: the send executed as number err_send_at (from 1) completes with status ERR */
     long sends;       /* sends executed */
     int fail_reg, fail_qp_new, fail_rts, fail_dev;
+    /* slow_flush: a queue pair in error flushes one work request per queue and tick, in order (as an HCA does:
+     * asynchronously), so a drain that waits for less than both markers returns while the receive queue still holds
+     * slots. no_flush: it flushes nothing (a drain that never finishes). arm_race: a completion made while its queue
+     * pair is not armed shows in the CQ only when it is armed next, without an event: the worst timing, a completion
+     * that lands after the last poll of the CQ and before the arm. */
+    int slow_flush, no_flush, arm_race;
     /* findings */
     _Atomic int violations;
     long rnr, delivered;
@@ -142,7 +150,14 @@ static int pfk_owned(struct pfk_fab *f, const void *p, size_t n)
 
 static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uint32_t len)
 {
-    if (q->cq_n == PFK_CQ) {
+    if (q->f->arm_race && !q->armed) {
+        if (q->late_n + q->cq_n == PFK_CQ)
+            pfk_violation(q->f, "a completion queue overflowed");
+        else
+            q->late[q->late_n++] = (struct plr_wc){id, op, status, len, status};
+        return;
+    }
+    if (q->cq_n + q->late_n == PFK_CQ) {
         pfk_violation(q->f, "a completion queue overflowed");
         return;
     }
@@ -160,6 +175,8 @@ static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uin
 static void pfk_qp_err_locked(struct plr_qp *q)
 {
     q->state = 2;
+    if (q->f->slow_flush || q->f->no_flush)
+        return; /* pfk_flush_step_locked, a tick at a time */
     while (q->sq.n) {
         struct pfk_wr w = pfk_pop(&q->sq);
         pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_FLUSH, 0);
@@ -179,12 +196,29 @@ static struct plr_qp *pfk_find_locked(struct pfk_fab *f, uint32_t qpn)
     return NULL;
 }
 
+/* slow_flush: a queue pair in error returns one work request of each queue per tick */
+static void pfk_flush_step_locked(struct plr_qp *q)
+{
+    if (q->sq.n) {
+        struct pfk_wr w = pfk_pop(&q->sq);
+        pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_FLUSH, 0);
+    }
+    if (!q->sq.n)
+        q->held.n = 0; /* every send before the last one flushed is done: the NIC holds nothing more of them */
+    if (q->rq.n) {
+        struct pfk_wr w = pfk_pop(&q->rq);
+        pfk_wc_locked(q, w.id, PLR_WC_RECV, PLR_WC_FLUSH, 0);
+    }
+}
+
 /* execute the sends posted before this tick */
 static void pfk_step_locked(struct pfk_fab *f)
 {
     f->tick++;
     for (int i = 0; i < PFK_QPS; i++) {
         struct plr_qp *q = &f->qp[i];
+        if (q->used && q->state == 2 && f->slow_flush && !f->no_flush)
+            pfk_flush_step_locked(q);
         while (q->used && q->state == 1 && q->sq.n && q->sq.w[q->sq.head].tick < f->tick - 1) {
             struct pfk_wr w = pfk_pop(&q->sq);
             struct plr_qp *r = pfk_find_locked(f, q->a.qpn);
@@ -444,6 +478,8 @@ static void pfk_qp_free(struct plr_qp *q)
 {
     struct pfk_fab *f = q->f;
     pthread_mutex_lock(&f->mu);
+    if (f->no_flush) /* the test withheld the flush: destroying the queue pair stops the NIC */
+        q->sq.n = q->rq.n = q->held.n = 0;
     if (q->sq.n || q->rq.n || q->held.n)
         pfk_violation(f, "a queue pair destroyed with work requests outstanding (not drained)");
     close(q->ev[0]);
@@ -457,6 +493,9 @@ static int pfk_fd(struct plr_qp *q) { return q->ev[0]; }
 static int pfk_arm(struct plr_qp *q)
 {
     pthread_mutex_lock(&q->f->mu);
+    for (int i = 0; i < q->late_n; i++) /* they came between the poll and this arm: no event */
+        q->cq[(q->cq_head + q->cq_n++) % PFK_CQ] = q->late[i];
+    q->late_n = 0;
     q->armed = 1;
     pthread_mutex_unlock(&q->f->mu);
     return 0;
@@ -498,13 +537,13 @@ static int pfk_post(struct plr_qp *q, int send, uint64_t id, const void *p, uint
     if (n && pfk_owned_locked(f, p, n))
         pfk_violation(f, "a buffer posted while another work request still holds it");
     struct pfk_wr w = {id, (uint8_t *)p, n, sig, f->tick};
-    if (q->state == 2) /* posted to a queue pair in error: flushed at once (how the drain's markers come back) */
+    if (q->state == 2 && !f->slow_flush && !f->no_flush) /* in error: flushed at once (the drain's markers) */
         pfk_wc_locked(q, id, send ? PLR_WC_SEND : PLR_WC_RECV, PLR_WC_FLUSH, 0);
     else if ((send ? q->sq.n : q->rq.n) == PFK_WRS) {
         pthread_mutex_unlock(&f->mu);
         errno = ENOMEM;
         return -1;
-    } else if (send && q->state != 1) {
+    } else if (send && q->state == 0) {
         pthread_mutex_unlock(&f->mu);
         errno = EINVAL;
         return -1;

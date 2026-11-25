@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 int plrdma_mutant;
+int plrdma_drain_ms = PLR_DRAIN_MS;
 
 enum { MSG_DATA = 1, MSG_CREDIT = 2 };
 enum { WR_RECV = 1, WR_SEND = 2, WR_MARK = 3 };
@@ -30,6 +31,7 @@ enum { WR_RECV = 1, WR_SEND = 2, WR_MARK = 3 };
  * load and a store rather than a locked add (one writer needs no read-modify-write) */
 #define ST_ADD(c, f, n) __atomic_store_n(&(c)->st.f, __atomic_load_n(&(c)->st.f, __ATOMIC_RELAXED) + (uint64_t)(n), \
                                          __ATOMIC_RELAXED)
+#define ST_SET(c, f, v) __atomic_store_n(&(c)->st.f, (uint64_t)(v), __ATOMIC_RELAXED)
 
 struct plr_pool {
     const struct plr_ops *ops;
@@ -107,7 +109,16 @@ struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_
         errno = ENOSYS;
         return NULL;
     }
-    if (cfg->slot < 1024 || cfg->slot % 64 || cfg->data_slots < 1 || cfg->ctl_slots < 1 || cfg->send_slots < 2 ||
+    if (cfg->ctl_slots < PLR_CTL_MIN || cfg->ctl_slots > PLR_CTL_MAX ||
+        (uint32_t)cfg->data_slots + cfg->ctl_slots > 65535) {
+        snprintf(err, errlen,
+                 "RDMA: %u control slots and %u data slots per connection: the control slots must be %d to %d and the "
+                 "two together at most 65535",
+                 (unsigned)cfg->ctl_slots, (unsigned)cfg->data_slots, PLR_CTL_MIN, PLR_CTL_MAX);
+        errno = EINVAL;
+        return NULL;
+    }
+    if (cfg->slot < 1024 || cfg->slot % 64 || cfg->data_slots < 1 || cfg->send_slots < 2 ||
         cfg->pool_bytes < (size_t)cfg->slot * (cfg->data_slots + cfg->ctl_slots + cfg->send_slots)) {
         snprintf(err, errlen, "RDMA: a pool of %zu bytes cannot hold one connection's slots (%u of %u bytes)",
                  cfg->pool_bytes, (unsigned)(cfg->data_slots + cfg->ctl_slots + cfg->send_slots), (unsigned)cfg->slot);
@@ -119,7 +130,8 @@ struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_
     if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && (uint64_t)rl.rlim_cur < bytes) {
         snprintf(err, errlen,
                  "RDMA: the locked-memory limit (RLIMIT_MEMLOCK, %" PRIu64 " KiB) is below the registered pool's %zu "
-                 "KiB: raise LimitMEMLOCK or lower cluster.peer.rdma.pool_mb",
+                 "KiB: raise LimitMEMLOCK or lower cluster.peer.rdma.pool_mb (the queue pairs' buffers and io_uring's "
+                 "rings count against the same limit: leave room for them)",
                  (uint64_t)rl.rlim_cur / 1024, bytes / 1024);
         errno = ENOMEM;
         return NULL;
@@ -257,8 +269,8 @@ int plr_ep_decode(struct plr_ep *e, const uint8_t *in, size_t n)
     e->data = get16(in + 34);
     e->ctl = get16(in + 36);
     if (e->mtu < 1 || e->mtu > 5 || (e->link_layer != PLR_LL_IB && e->link_layer != PLR_LL_ETH) ||
-        e->qpn >= 1u << 24 || e->psn >= 1u << 24 || e->slot < 1024 || e->slot > (1u << 24) || !e->data || !e->ctl ||
-        e->ctl > 255)
+        e->qpn >= 1u << 24 || e->psn >= 1u << 24 || e->slot < 1024 || e->slot > (1u << 24) || !e->data ||
+        e->ctl < PLR_CTL_MIN || e->ctl > PLR_CTL_MAX || (uint32_t)e->data + e->ctl > 65535)
         goto bad;
     return 0;
 bad:
@@ -338,6 +350,7 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
         fail(c, EPROTO);
         return;
     }
+    ST_SET(c, credits, c->cr_data);
     ST_ADD(c, msgs_in, 1);
     if (h[0] == MSG_CREDIT) {
         ST_ADD(c, credit_in, 1);
@@ -507,6 +520,7 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
             break;
         if (plrdma_mutant != PLR_MUT_NOCREDIT || c->cr_data > 0)
             c->cr_data--;
+        ST_SET(c, credits, c->cr_data);
         pos += k;
         posted += k;
     }
@@ -533,6 +547,8 @@ static void anchor_check(struct plr_conn *c)
     if (r == 0)
         c->ended = 1;
     else if (r > 0) {
+        if (plrdma_mutant == PLR_MUT_ANCHORBYTE)
+            return;
         fprintf(stderr, "peerlink: rdma: a byte on the TCP anchor of a link on RDMA: connection ended\n");
         fail(c, EPROTO);
     } else if (errno != EAGAIN && errno != EINTR)
@@ -547,7 +563,8 @@ static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int 
         pump(c, 0);
         if (c->ops->arm(c->qp) < 0)
             fail(c, errno);
-        pump(c, 0); /* a completion between the drain and the arm raises no event */
+        if (plrdma_mutant != PLR_MUT_NOREARM)
+            pump(c, 0); /* a completion between the drain and the arm raises no event */
         maybe_credit(c);
     }
     pf[0] = (struct pollfd){c->ops->fd(c->qp), POLLIN, 0};
@@ -596,9 +613,9 @@ static int drain(struct plr_conn *c)
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         pump(c, 1);
-        if (c->marks == (MARK_SEND | MARK_RECV))
+        if (c->marks == (MARK_SEND | MARK_RECV) || (plrdma_mutant == PLR_MUT_NORECVMARK && (c->marks & MARK_SEND)))
             return 1;
-        long left = PLR_DRAIN_MS - ms_since(&t0);
+        long left = plrdma_drain_ms - ms_since(&t0);
         if (left <= 0)
             return 0;
         if (c->ops->arm(c->qp) < 0)
@@ -626,7 +643,7 @@ static void conn_release(struct plr_conn *c)
             if (!ok)
                 fprintf(stderr,
                         "peerlink: rdma: a queue pair did not drain within %d ms: its %u slots stay out of the pool\n",
-                        PLR_DRAIN_MS, (unsigned)n);
+                        plrdma_drain_ms, (unsigned)n);
             if (c->have_slots)
                 pool_give(c->pool, c->slots, n, !ok);
             c->have_slots = 0;
@@ -759,9 +776,10 @@ int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, siz
         return -1;
     }
     c->peer = *peer;
-    c->cr_data = peer->data;
+    c->cr_data = plrdma_mutant == PLR_MUT_CROWN ? pc->data_slots : peer->data;
     c->cr_ctl = peer->ctl;
-    uint32_t m = peer->slot < pc->slot ? peer->slot : pc->slot;
+    ST_SET(c, credits, c->cr_data);
+    uint32_t m = peer->slot < pc->slot && plrdma_mutant != PLR_MUT_ROOM ? peer->slot : pc->slot;
     c->room = m - PLR_HDR;
     c->started = 1;
     return 0;
@@ -789,4 +807,5 @@ void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st)
     st->bytes_out = __atomic_load_n(&s->bytes_out, __ATOMIC_RELAXED);
     st->bytes_in = __atomic_load_n(&s->bytes_in, __ATOMIC_RELAXED);
     st->stalls = __atomic_load_n(&s->stalls, __ATOMIC_RELAXED);
+    st->credits = __atomic_load_n(&s->credits, __ATOMIC_RELAXED);
 }

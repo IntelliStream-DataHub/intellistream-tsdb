@@ -13,7 +13,12 @@
  * queued), pause (a paused link that only PINGs for 10 x dead_ms is not counted dead), storm (an idle link sends no
  * stream of CREDITs), written (a frame posted and then flushed by a failed queue pair is WRITTEN), qperr (a send that
  * fails mid-stream ends the connection on both sides; the next connection carries on), pool (memlock, a failed
- * registration, a pool with room for two connections), ep (the endpoint's encoding).
+ * registration, a pool with room for two connections, the bounds of the slots), ep (the endpoint's encoding), asym
+ * (two pools with other slot sizes, data and control slots: the peer's numbers rule what is sent), anchor (a byte on
+ * the anchor ends the connection on both sides), wakeup (with PINGs far apart, a completion that lands between a poll
+ * of the CQ and the arm must not wait for the next timer), errors (a device, a queue pair and its connect that fail;
+ * a drain that never finishes keeps its slots out of the pool). The rigs' fabric flushes a failed queue pair
+ * asynchronously, one work request per queue and tick, as an HCA does.
  *
  * --mutant NAME plants a bug of plrdma.h's list; each must fail this test.
  */
@@ -27,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "compat.h"
 #include "peerlink.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function" /* test_peerlink uses the rest of the fake */
@@ -167,6 +173,7 @@ struct rig {
     struct node *a, *b;
     struct plf_pair *anchor;
     struct pl_transport *ta, *tb;
+    struct pl_transport *xa, *xb; /* the anchor's ends, which ta and tb own */
     uint32_t qa, qb; /* the queue pairs' numbers */
 };
 
@@ -192,13 +199,15 @@ static struct plr_pool_cfg small_cfg(void)
     return c;
 }
 
-static void pools_open(struct rig *r)
+/* cb: b's configuration (NULL: a's) */
+static void pools_open(struct rig *r, const struct plr_pool_cfg *cb)
 {
     char err[256];
     struct plr_pool_cfg c = small_cfg();
     r->f = pfk_new();
+    r->f->slow_flush = 1;
     r->pa = plr_pool_open(&pfk_ops, &c, err, sizeof err);
-    r->pb = plr_pool_open(&pfk_ops, &c, err, sizeof err);
+    r->pb = plr_pool_open(&pfk_ops, cb ? cb : &c, err, sizeof err);
     if (!r->pa || !r->pb) {
         fprintf(stderr, "pool: %s\n", err);
         exit(2);
@@ -229,6 +238,8 @@ static void attach(struct rig *r)
     CHECK(plr_conn_start(ca, &db, err, sizeof err) == 0);
     struct pl_transport *xa, *xb;
     r->anchor = plf_new(65536, &xa, &xb);
+    r->xa = xa;
+    r->xb = xb;
     r->ta = plr_conn_transport(ca, xa);
     r->tb = plr_conn_transport(cb, xb);
     int up_a = atomic_load(&r->a->ups), up_b = atomic_load(&r->b->ups);
@@ -237,14 +248,16 @@ static void attach(struct rig *r)
     CHECK(WAIT_FOR(atomic_load(&r->a->ups) > up_a && atomic_load(&r->b->ups) > up_b, 3000));
 }
 
-static void rig_up(struct rig *r, uint32_t ping_ms, uint32_t dead_ms)
+static void rig_up_cfg(struct rig *r, uint32_t ping_ms, uint32_t dead_ms, const struct plr_pool_cfg *cb)
 {
     memset(r, 0, sizeof *r);
-    pools_open(r);
+    pools_open(r, cb);
     r->a = node_new(1, ping_ms, dead_ms);
     r->b = node_new(2, ping_ms, dead_ms);
     attach(r);
 }
+
+static void rig_up(struct rig *r, uint32_t ping_ms, uint32_t dead_ms) { rig_up_cfg(r, ping_ms, dead_ms, NULL); }
 
 /* both peerlinks closed (every connection drained), then the end checks */
 static void rig_down(struct rig *r, const char *name)
@@ -392,12 +405,20 @@ static void test_written(void)
         uint64_t next = 0, rs = 1;
         send_frames(la, &next, 5, &rs);
         CHECK(WAIT_FOR(atomic_load(&r.b->in) == 5, 5000));
+        /* every data credit back before the NIC is held: else b's CREDIT may be what the hold keeps, the frame stays
+         * in peerlink's buffer, and NEVER_WRITTEN would be right */
+        struct plr_conn_stats s0;
+        CHECK(WAIT_FOR((plr_conn_stats(r.ta, &s0), s0.credits == small_cfg().data_slots), 3000));
         atomic_store(&r.f->hold, 1);
         uint8_t b[300];
         fill(b, sizeof b, next++);
         int downs = atomic_load(&r.a->downs);
+        plr_conn_stats(r.ta, &s0);
         CHECK(plink_sendv(la, 0, 1, NULL, 0, b, sizeof b, 1000, 1, 77, 0) == PL_OK);
-        CHECK(WAIT_FOR(pfk_sq_posted(r.f, r.qa) > 0, 3000));
+        /* the frame itself taken by the transport (a CREDIT or a PING posted meanwhile carries fewer bytes) */
+        struct plr_conn_stats s1;
+        CHECK(WAIT_FOR((plr_conn_stats(r.ta, &s1), s1.bytes_out >= s0.bytes_out + sizeof b), 3000));
+        CHECK(pfk_sq_posted(r.f, r.qa) > 0);
         pfk_fail_qp(r.f, r.qa);
         atomic_store(&r.f->hold, 0);
         CHECK(WAIT_FOR(atomic_load(&r.a->sent_token) / 2 == 77, 5000));
@@ -454,6 +475,170 @@ static void test_qperr(void)
     rig_down(&r, "qperr");
 }
 
+/* b's pool has smaller slots, more data and more control slots than a's: each side sends what the peer's numbers allow
+ * (a message no longer than the peer's slot, as many DATA as the peer has data slots), both ways, then an idle link */
+static void test_asym(void)
+{
+    struct plr_pool_cfg cb = small_cfg();
+    cb.slot = 2048;
+    cb.data_slots = 6;
+    cb.ctl_slots = 5;
+    struct rig r;
+    rig_up_cfg(&r, 50, 2000, &cb);
+    struct plink *la = link_of(r.a, 2), *lb = link_of(r.b, 1);
+    CHECK(la && lb);
+    if (la && lb) {
+        int n = quick ? 200 : 800;
+        uint64_t na = 0, nb = 0, s1 = 17, s2 = 19;
+        send_frames(la, &na, n, &s1);
+        send_frames(lb, &nb, n, &s2);
+        CHECK(WAIT_FOR(atomic_load(&r.a->in) == (uint64_t)n && atomic_load(&r.b->in) == (uint64_t)n, 20000));
+        usleep(300000);
+        struct plr_conn_stats a0, b0, a1, b1;
+        plr_conn_stats(r.ta, &a0);
+        plr_conn_stats(r.tb, &b0);
+        usleep(1000000);
+        plr_conn_stats(r.ta, &a1);
+        plr_conn_stats(r.tb, &b1);
+        uint64_t d = a1.credit_out - a0.credit_out + b1.credit_out - b0.credit_out;
+        printf("  asym: %" PRIu64 " and %" PRIu64 " frames in, bad %" PRIu64 " %" PRIu64 ", downs %d %d, credits held "
+               "%" PRIu64 " %" PRIu64 ", CREDITs in an idle second %" PRIu64 "\n",
+               atomic_load(&r.a->in), atomic_load(&r.b->in), atomic_load(&r.a->bad), atomic_load(&r.b->bad),
+               atomic_load(&r.a->downs), atomic_load(&r.b->downs), a1.credits, b1.credits, d);
+        CHECK(atomic_load(&r.a->bad) == 0 && atomic_load(&r.b->bad) == 0);
+        CHECK(atomic_load(&r.a->downs) == 0 && atomic_load(&r.b->downs) == 0);
+        CHECK(a1.credits == cb.data_slots && b1.credits == small_cfg().data_slots); /* each the peer's data slots */
+        CHECK(d <= 100);
+    }
+    rig_down(&r, "asym");
+}
+
+/* a byte on the anchor (which carries none once the link is on RDMA) ends the connection on both sides */
+static void test_anchor(void)
+{
+    struct rig r;
+    rig_up(&r, 100, 2000);
+    struct plink *la = link_of(r.a, 2);
+    CHECK(la != NULL);
+    if (la) {
+        int da = atomic_load(&r.a->downs), db = atomic_load(&r.b->downs);
+        /* on a's end of the anchor: the byte arrives at b's */
+        struct iovec v = {(void *)"x", 1};
+        CHECK(r.xa->ops->writev(r.xa, &v, 1) == 1);
+        CHECK(WAIT_FOR(atomic_load(&r.b->downs) > db && atomic_load(&r.a->downs) > da, 3000));
+        printf("  anchor: a byte on the anchor: downs of a %d, of b %d\n", atomic_load(&r.a->downs) - da,
+               atomic_load(&r.b->downs) - db);
+    }
+    rig_down(&r, "anchor");
+}
+
+/* PINGs 10 s apart: nothing but a completion's event wakes the link threads. Frames of two messages each, and every
+ * completion made while its queue pair is not armed shows only at the arm, without an event (the fake's arm_race): the
+ * second message of a frame lands that way, and poll_fds must look once more after arming or it waits for a timer. */
+static void test_wakeup(void)
+{
+    struct rig r;
+    rig_up(&r, 10000, 60000);
+    struct plink *la = link_of(r.a, 2);
+    CHECK(la != NULL);
+    if (la) {
+        pthread_mutex_lock(&r.f->mu);
+        r.f->arm_race = 1;
+        pthread_mutex_unlock(&r.f->mu);
+        uint64_t next = 0, worst = 0;
+        int n = quick ? 60 : 200, late = 0;
+        for (int i = 0; i < n && !late; i++) {
+            uint8_t b[6000]; /* two messages of a 4 KiB slot */
+            fill(b, sizeof b, next++);
+            uint64_t t0 = now_ms();
+            CHECK(plink_send(la, 1, b, sizeof b, 5000) == PL_OK);
+            if (!WAIT_FOR(atomic_load(&r.b->in) == next, 3000))
+                late = 1;
+            uint64_t dt = now_ms() - t0;
+            worst = dt > worst ? dt : worst;
+            usleep(2000);
+        }
+        printf("  wakeup: %" PRIu64 " single frames, the slowest delivered in %" PRIu64 " ms%s\n", next, worst,
+               late ? " (one waited for a timer: a lost wakeup)" : "");
+        CHECK(!late);
+        pthread_mutex_lock(&r.f->mu);
+        r.f->arm_race = 0;
+        pthread_mutex_unlock(&r.f->mu);
+    }
+    rig_down(&r, "wakeup");
+}
+
+/* the error paths of a connection's setup, and a drain that never finishes */
+static void test_errors(void)
+{
+    char err[256];
+    struct pfk_fab *f = pfk_new();
+    struct plr_pool_cfg c = small_cfg();
+    f->fail_dev = 1;
+    struct plr_pool *p = plr_pool_open(&pfk_ops, &c, err, sizeof err);
+    printf("  errors: no device: %s\n", p ? "opened" : err);
+    CHECK(!p);
+    if (p)
+        plr_pool_close(p);
+    f->fail_dev = 0;
+    p = plr_pool_open(&pfk_ops, &c, err, sizeof err);
+    CHECK(p != NULL);
+    if (!p) {
+        pfk_free(f);
+        return;
+    }
+    struct plr_pool_stats st;
+    /* no queue pair: the slots the connection took go back */
+    f->fail_qp_new = 1;
+    struct plr_conn *x = plr_conn_new(p, err, sizeof err);
+    printf("  errors: no queue pair: %s\n", x ? "made" : err);
+    CHECK(!x);
+    f->fail_qp_new = 0;
+    plr_pool_stats(p, &st);
+    CHECK(st.free == st.slots && st.conns == 0 && pfk_live_qps(f) == 0);
+    /* the connect fails: the caller frees a queue pair that never reached RTS */
+    x = plr_conn_new(p, err, sizeof err);
+    struct plr_conn *y = x ? plr_conn_new(p, err, sizeof err) : NULL;
+    CHECK(x && y);
+    if (x && y) {
+        struct plr_ep ex, ey;
+        plr_conn_ep(x, &ex);
+        plr_conn_ep(y, &ey);
+        f->fail_rts = 1;
+        int rc = plr_conn_start(x, &ey, err, sizeof err);
+        printf("  errors: the connect refused: %s\n", rc ? err : "connected");
+        CHECK(rc < 0);
+        f->fail_rts = 0;
+        plr_conn_free(x);
+        plr_conn_free(y);
+        plr_pool_stats(p, &st);
+        CHECK(st.free == st.slots && st.lost == 0 && st.conns == 0 && pfk_live_qps(f) == 0);
+    }
+    /* a drain that never finishes: the queue pair goes, its slots stay out of the pool for good */
+    x = plr_conn_new(p, err, sizeof err);
+    CHECK(x != NULL);
+    if (x) {
+        int d0 = plrdma_drain_ms;
+        plrdma_drain_ms = 200;
+        pthread_mutex_lock(&f->mu);
+        f->no_flush = 1;
+        pthread_mutex_unlock(&f->mu);
+        plr_conn_free(x);
+        plrdma_drain_ms = d0;
+        pthread_mutex_lock(&f->mu);
+        f->no_flush = 0;
+        pthread_mutex_unlock(&f->mu);
+        uint32_t per = c.data_slots + c.ctl_slots + c.send_slots;
+        plr_pool_stats(p, &st);
+        printf("  errors: a drain that never finished: %u slots lost, %u/%u free, queue pairs left %d\n",
+               (unsigned)st.lost, (unsigned)st.free, (unsigned)st.slots, pfk_live_qps(f));
+        CHECK(st.lost == per && st.free == st.slots - per && st.conns == 0 && pfk_live_qps(f) == 0);
+    }
+    plr_pool_close(p);
+    CHECK(atomic_load(&f->violations) == 0);
+    pfk_free(f);
+}
+
 static void test_pool(void)
 {
     char err[256];
@@ -477,6 +662,21 @@ static void test_pool(void)
     printf("  pool: registration refused: %s\n", p ? "opened" : err);
     CHECK(!p && strstr(err, "registering"));
     f->fail_reg = 0;
+    /* control slots below 4 (a credit storm), above 255 (one header byte), and more slots than a ring counts */
+    static const uint16_t bad[][2] = {{4, 1}, {4, 3}, {4, 256}, {65532, 4}};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        struct plr_pool_cfg b = c;
+        b.data_slots = bad[i][0];
+        b.ctl_slots = bad[i][1];
+        b.slot = 1024;
+        b.pool_bytes = (size_t)b.slot * (b.data_slots + b.ctl_slots + b.send_slots);
+        p = plr_pool_open(&pfk_ops, &b, err, sizeof err);
+        printf("  pool: %u data and %u control slots: %s\n", (unsigned)b.data_slots, (unsigned)b.ctl_slots,
+               p ? "opened" : err);
+        CHECK(!p && strstr(err, "control slots must be"));
+        if (p)
+            plr_pool_close(p);
+    }
     /* room for two connections: the third is refused with a line, and fits once one is gone */
     c.pool_bytes = (size_t)2 * 16 * c.slot;
     p = plr_pool_open(&pfk_ops, &c, err, sizeof err);
@@ -530,6 +730,15 @@ static void test_ep(void)
             memset(x + 30, 0, 4); /* no slot */
         else
             x[offs[i]] = 0xff; /* another version, an MTU or link layer no port has, a QPN above 2^24 */
+        CHECK(plr_ep_decode(&d, x, sizeof x) < 0);
+    }
+    /* a peer's control slots below 4 or above 255, and data and control slots above what a ring counts */
+    static const uint16_t bad[][2] = {{12, 3}, {12, 1}, {12, 256}, {65535, 4}};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        struct plr_ep b = e;
+        b.data = bad[i][0];
+        b.ctl = bad[i][1];
+        plr_ep_encode(&b, x);
         CHECK(plr_ep_decode(&d, x, sizeof x) < 0);
     }
 }
@@ -785,6 +994,7 @@ static int hosts_run(const struct hosts_opt *o)
         }
         close(ls);
     }
+    tsdb_nosigpipe(fd); /* where MSG_NOSIGNAL is 0 (src/compat.h) */
     uint8_t mode[2] = {(uint8_t)o->tcp, (uint8_t)o->kind}; /* the dialer's */
     if (full_io(fd, mode, 2, dialer) < 0 || (mode[1] != PL_KIND_LOG && mode[1] != PL_KIND_BULK)) {
         fprintf(stderr, "handshake: the peer went\n");
@@ -883,7 +1093,9 @@ static const struct {
     int m;
 } mutants[] = {{"writtencqe", PLR_MUT_WRITTENCQE}, {"noctl", PLR_MUT_NOCTL},       {"ctlstorm", PLR_MUT_CTLSTORM},
                {"pausectl", PLR_MUT_PAUSECTL},     {"nodrain", PLR_MUT_NODRAIN},   {"unsigearly", PLR_MUT_UNSIGEARLY},
-               {"nocredit", PLR_MUT_NOCREDIT},     {"splitoff", PLR_MUT_SPLITOFF}};
+               {"nocredit", PLR_MUT_NOCREDIT},     {"splitoff", PLR_MUT_SPLITOFF}, {"room", PLR_MUT_ROOM},
+               {"crown", PLR_MUT_CROWN},           {"norecvmark", PLR_MUT_NORECVMARK},
+               {"norearm", PLR_MUT_NOREARM},       {"anchorbyte", PLR_MUT_ANCHORBYTE}};
 
 int main(int argc, char **argv)
 {
@@ -892,6 +1104,7 @@ int main(int argc, char **argv)
     memset(&ho, 0, sizeof ho);
     ho.cfg = (struct plr_pool_cfg)PLR_POOL_CFG_DEFAULT;
     ho.cfg.pool_bytes = (size_t)4 << 20; /* the test servers' memlock is 8 MB */
+    ho.cfg.rnr_retry = 0; /* a SEND that finds no posted receive fails the queue pair: the credit rule on real verbs */
     ho.sizes = "4096,16384,65536,262144,1048576,4194304";
     ho.bytes = (uint64_t)4 << 30;
     ho.kind = PL_KIND_BULK; /* frames as they are: the bulk link does not compress */
@@ -920,6 +1133,8 @@ int main(int argc, char **argv)
             ho.cfg.data_slots = (uint16_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--send-slots") && i + 1 < argc)
             ho.cfg.send_slots = (uint16_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--rnr-retry") && i + 1 < argc)
+            ho.cfg.rnr_retry = (uint8_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
             only = argv[++i];
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
@@ -942,7 +1157,8 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } cases[] = {{"ep", test_ep},         {"pool", test_pool},       {"basic", test_basic}, {"pause", test_pause},
-                 {"storm", test_storm},   {"written", test_written}, {"qperr", test_qperr}};
+                 {"storm", test_storm},   {"written", test_written}, {"qperr", test_qperr},  {"asym", test_asym},
+                 {"anchor", test_anchor}, {"wakeup", test_wakeup},   {"errors", test_errors}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && !strstr(only, cases[i].name))
             continue;

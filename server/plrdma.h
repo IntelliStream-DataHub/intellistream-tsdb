@@ -71,6 +71,11 @@
 #define PLR_HDR 8          /* bytes of the header of every message */
 #define PLR_EP_LEN 40      /* an encoded endpoint (plr_ep_encode) */
 #define PLR_DRAIN_MS 5000  /* the most close waits for the drain's markers */
+/* Control slots of a connection (K) and of a peer: at least 4, so that a CREDIT is sent for K/2 >= 2 owed control
+ * credits. With a threshold of 1 every CREDIT sent only to return control credits makes the peer owe one, which it
+ * returns at once, and so on: an idle link exchanges thousands of CREDITs a second. At most 255 (one header byte). */
+#define PLR_CTL_MIN 4
+#define PLR_CTL_MAX 255
 
 struct plr_dev; /* an open device and port with its protection domain (the ops' own) */
 struct plr_qp;  /* one RC queue pair with its CQ and completion channel (the ops' own) */
@@ -186,6 +191,7 @@ void plr_conn_free(struct plr_conn *c);
 struct plr_conn_stats {
     uint64_t msgs_out, msgs_in, credit_out, credit_in, bytes_out, bytes_in;
     uint64_t stalls; /* writev found no data credit */
+    uint64_t credits; /* the data credits it holds now (the peer's free data slots as last heard) */
 };
 void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st);
 
@@ -200,8 +206,14 @@ enum {
     PLR_MUT_UNSIGEARLY, /* an unsignalled send's slot reused at once */
     PLR_MUT_NOCREDIT,   /* DATA sent without a data credit */
     PLR_MUT_SPLITOFF,   /* a frame split over slots loses a byte at the slot's end */
+    PLR_MUT_ROOM,       /* a message as long as this side's slot, the peer's ignored */
+    PLR_MUT_CROWN,      /* data credits counted from this side's data slots, the peer's ignored */
+    PLR_MUT_NORECVMARK, /* the drain waits for the send marker only (the receive queue may still be flushing) */
+    PLR_MUT_NOREARM,    /* poll_fds does not look again after arming: a completion in between is a lost wakeup */
+    PLR_MUT_ANCHORBYTE, /* a byte on the anchor is ignored */
 };
 extern int plrdma_mutant;
+extern int plrdma_drain_ms; /* tests: PLR_DRAIN_MS */
 
 /* server/plrdma_dl.c: libibverbs through dlopen (NULL with a line where it is not built or not installed) */
 const struct plr_ops *plrdma_verbs(char *err, size_t errlen);

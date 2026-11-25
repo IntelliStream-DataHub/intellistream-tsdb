@@ -92,6 +92,9 @@ $(info RDMA: rdma-core's headers (infiniband/verbs.h) not found: tsdbd is built 
 endif
 endif
 RDMA_FLAGS := $(if $(filter 1,$(NO_RDMA)),,-DTSDB_RDMA $(RDMA_CFLAGS))
+# plrdma_dl.c's dlopen and dlsym live in libdl before glibc 2.34 (EL8, Debian 11); --as-needed keeps it out of the
+# links where libc has them (check-glibc.sh allows libdl either way)
+LDLIBS += $(if $(filter 1,$(NO_RDMA)),,-Wl,--push-state,--as-needed -ldl -Wl,--pop-state)
 
 comma := ,
 
@@ -537,7 +540,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_plrdma 
 	./$(B)/test_peerlink $(SCRATCH)
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
-	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
