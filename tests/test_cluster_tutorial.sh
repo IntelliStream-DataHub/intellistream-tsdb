@@ -32,7 +32,7 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/tsdb-clt.XXXXXX")
 D=$scratch/c
 cleanup() {
     # Stop only the servers this test started, by the pids the block saved (they exit with the block's shell anyway).
-    for n in 1 2 3 4; do
+    for n in 1 2 3 4 5; do
         if [ -s "$D/n$n/pid" ]; then
             pid=$(cat "$D/n$n/pid")
             case $pid in ''|*[!0-9]*|0|1) pid= ;; esac
@@ -50,7 +50,7 @@ fail() {
     echo "test_cluster_tutorial: FAIL: $*" >&2
     echo "--- last output ---" >&2
     tail -n 40 "$scratch/out" >&2
-    for n in 1 2 3 4; do
+    for n in 1 2 3 4 5; do
         if [ -f "$D/n$n/log" ]; then echo "--- n$n/log ---" >&2; tail -n 8 "$D/n$n/log" >&2; fi
     done
     exit 1
@@ -103,7 +103,13 @@ norm() {
         -e 's/read_barrier (on|off|\?)$/read_barrier X/' \
         -e 's/^member [0-9]+ (up|down) incarnation/member M \1 incarnation/' \
         -e 's/ rack rack[0-9]+ / rack rackM /' \
-        -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ /volume \1 name \2 uuid UUID leader L /' \
+        -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ epoch [0-9]+ min_isr ([0-9]+) replicas [0-9,]+ isr [0-9,]+ isr_version [0-9]+ set_version [0-9]+ preferred [0-9]+ /volume \1 name \2 uuid UUID leader L epoch E min_isr \3 replicas R isr I isr_version V set_version S preferred P /' \
+        -e 's/^volume-report node [0-9]+ volume ([0-9]+) role [a-z]+ health ([a-z]+) epoch [0-9]+ (.*) fenced_age_ms [0-9]+$/volume-report node N volume \1 role R health \2 epoch E \3 fenced_age_ms F/' \
+        -e 's/^node [0-9]+ leads at epoch [0-9]+ \([0-9]+ ms, READY at [0-9]+\)$/node N leads at epoch E (T ms, READY at X)/' \
+        -e 's/^(move of volume [0-9]+ from node )[0-9]+( to node )[0-9]+(: proposed \(replica )[0-9a-f]{16}\)/\1N\2N\3RID)/' \
+        -e 's/^(volume [0-9]+: reset of node )[0-9]+( proposed \(new instance )[0-9a-f]{16}\)/\1N\2RID)/' \
+        -e '/^tsdbd: /{s/[0-9a-f]{16}/RID/g;s/[0-9]+/N/g}' \
+        -e 's#/n[0-9]/data/#/nN/data/#' \
         -e 's/^replica volume ([0-9]+) node ([0-9]+) rid [0-9a-f]{16} open_gen [0-9]+$/replica volume \1 node \2 rid RID open_gen G/' \
         -e 's/^node [0-9]+ leads volume /node L leads volume /'
 }
@@ -132,7 +138,7 @@ expect 4 '^group voters 1,2,3 learners -$'                  # steps 5, 7, 8 and 
 expect 1 '^node [0-9]+ mode none role - term 0 leader 0 commit 0 applied 0$'
 expect 1 '^cluster \(no state yet\)$'                         # step 4: node 1 before the init
 expect 1 '^initialised: node 1 at '
-expect 3 '^added 127\.0\.0\.1:[0-9]+$'                       # nodes 2 and 3, then the witness
+expect 4 '^added 127\.0\.0\.1:[0-9]+$'                       # nodes 2 and 3, the witness, then node 5
 expect 1 '^node [0-9]+ is the leader: stopping it$'
 expect 1 '^member [123] down incarnation 1 '                # the killed leader (node 1 unless an election moved it)
 expect 2 '^member [123] up incarnation 2 '                  # step 8, and step 9 (the witness sees the new incarnation)
@@ -142,6 +148,11 @@ expect 1 '^node [123] leads volume plant$'                    # step 6: the clus
 expect 1 '^wrote 1440 rows$'                                  # written into plant, through its leader
 expect 1 '^read 1440 rows, the first: 1717200000000 50\.00$'
 expect 3 '/n[123]/data/v1$'                                   # every node made the volume's directory
+expect 1 '^node [0-9]+ leads at epoch [0-9]+ \([0-9]+ ms, READY at [0-9]+\)$'      # step 10: the transfer
+expect 1 '^move of volume 1 from node [123] to node 5: proposed \(replica [0-9a-f]{16}\)'   # the move
+expect 1 '^volume 1: reset of node [123] proposed \(new instance [0-9a-f]{16}\)'       # the reset of the lost copy
+expect 1 '^tsdbd: replication: volume 1: snapshot installed: P [0-9]+ of epoch [0-9]+, '   # rebuilt by a snapshot
+expect 1 '^/.*/n[123]/data/v1/p[0-9_]+\.part$'                                 # and it holds the volume's part
 [ "$(grep -cE '^replica volume 1 node [123] rid [0-9a-f]{16} open_gen 1$' "$scratch/out")" -ge 3 ] \
     || fail "step 6 does not show the three copies of plant with their open generation 1"
 # steps 5, 7 and 8 ask a voter; 7 and 8 (the last two) answer at a term above 1 (an election happened). Step 5 may too:

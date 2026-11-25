@@ -60,8 +60,7 @@ static const char cl_help[] =
     "  volume add PEER NAME  a replicated volume called NAME on N servers (the cluster's --replication by default).\n"
     "                      The leader of the group picks its number and its servers; each of them makes the\n"
     "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
-    "                      series inside the volume they name (in this preview only its first server takes writes,\n"
-    "                      and only with TSDB_CLUSTER_WRITES=1: replication is not built yet).\n"
+    "                      series inside the volume they name. Its leader sends every write to the other copies.\n"
     "                      --redundancy ec=K+M (K 1 to 16, M 1 to 4): settled parts are erasure coded across a\n"
     "                      stripe group of K+M members with a chunk store up (picked once, never renumbered); its\n"
     "                      log is kept on M+1 servers and min_isr is M. replicas=N is --replicas N.\n"
@@ -74,12 +73,12 @@ static const char cl_help[] =
     "                      acknowledged past that replica's log end are lost; the leader of the group logs its log\n"
     "                      end beside the commit point of the last ISR shrink.\n"
     "  volume transfer PEER VOLUME NODE  hands the leadership of volume number VOLUME to NODE, an in-sync copy:\n"
-    "                      writes pause while the leader drains to it (at most --transfer-wait-ms). Not built yet.\n"
+    "                      writes pause while the leader drains to it (at most --transfer-wait-ms).\n"
     "  volume move PEER VOLUME --log --from A --to B  moves the copy on node A to node B: B is added and filled,\n"
     "                      then A is removed (--log: B catches up from the log and a snapshot; --cancel stops a\n"
-    "                      move that has not removed A yet). Not built yet.\n"
+    "                      move that has not removed A yet).\n"
     "  replica reset PEER VOLUME NODE  gives the copy on NODE (neither the leader nor in sync) a new identity: its\n"
-    "                      directory is set aside as v<N>.lost-<rid> and it is rebuilt from a snapshot. Not built yet.\n"
+    "                      directory is set aside as v<N>.lost-<rid> and it is rebuilt from a snapshot.\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
     "                      incarnation, when it was last heard), the volumes and users. One fact a line.\n"
     "\n"
@@ -112,8 +111,7 @@ static const char cl_help[] =
     "    --transfer-wait-ms MS   a leader transfer's drain, at most [2000] (100 to 60000)\n"
     "    --leader-balance-s S    leadership goes back to a volume's first server once it has been in sync this\n"
     "                            long [0: off] (at most 86400)\n"
-    "  In this preview the settings are stored and shown by status; nothing acts on the replication, failover and\n"
-    "  volume ones yet.\n";
+    "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n";
 
 static int cl_usage(void)
 {
