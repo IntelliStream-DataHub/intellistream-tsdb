@@ -29,7 +29,7 @@ int chunksrv_mutant;
 int chunksrv_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "chunknofence", "chunkselfraise", "putokearly", "nocellcheck",
-                                        "storeforeign"};
+                                        "storeforeign", "nometacheck", "sumsonly", "noreqcheck", "noopmatch"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -68,6 +68,14 @@ static uint64_t get64(const uint8_t *p)
 #define RESP_HDR 13u /* rid 8, op 1, rc 4 */
 #define ID_LEN 34u   /* vuuid 16, oid 16, pos 2 */
 
+static uint64_t xh(const void *p, size_t n)
+{
+    struct pl_xxh h;
+    pl_xxh_init(&h);
+    pl_xxh_update(&h, p, n);
+    return pl_xxh_final(&h);
+}
+
 static size_t req_body_len(uint8_t op)
 {
     switch (op) {
@@ -83,7 +91,7 @@ static size_t req_body_len(uint8_t op)
 size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
 {
     size_t bl = req_body_len(r->op);
-    if (bl == (size_t)-1 || cap < REQ_HDR + bl)
+    if (bl == (size_t)-1 || cap < REQ_HDR + bl + CS_CHECK_LEN)
         return 0;
     put64(out, r->rid);
     out[8] = r->op;
@@ -104,7 +112,8 @@ size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
         put16(b + 17, r->pos);
         put32(b + 19, r->len);
     }
-    return REQ_HDR + bl;
+    put64(out + REQ_HDR + bl, xh(out, REQ_HDR + bl));
+    return REQ_HDR + bl + CS_CHECK_LEN;
 }
 
 int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
@@ -117,7 +126,9 @@ int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
     r->volume = get32(p + 9);
     r->epoch = get64(p + 13);
     size_t bl = req_body_len(r->op);
-    if (bl == (size_t)-1 || n != REQ_HDR + bl)
+    if (bl == (size_t)-1 || n != REQ_HDR + bl + CS_CHECK_LEN)
+        return -1;
+    if (get64(p + REQ_HDR + bl) != xh(p, REQ_HDR + bl) && chunksrv_mutant != CS_MUT_NOREQCHECK)
         return -1;
     const uint8_t *b = p + REQ_HDR;
     if (r->op == CS_OP_READ || r->op == CS_OP_SUMS || r->op == CS_OP_DEL) {
@@ -187,12 +198,15 @@ void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN
     put16(out + 52, m->g.m);
     put32(out + 54, m->g.cell);
     put64(out + 58, m->g.len);
+    put64(out + 66, xh(out, 66));
 }
 
 int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m)
 {
     memset(m, 0, sizeof *m);
     if (n != CS_PUT_META_LEN || get32(p) != CS_PUT_MAGIC)
+        return -1;
+    if (get64(p + 66) != xh(p, 66) && chunksrv_mutant != CS_MUT_NOMETACHECK)
         return -1;
     m->volume = get32(p + 4);
     m->epoch = get64(p + 8);
@@ -219,6 +233,50 @@ uint64_t cs_sums_hash(const uint64_t *sums, uint64_t n)
         pl_xxh_update(&h, b, 8);
     }
     return pl_xxh_final(&h);
+}
+
+uint64_t cs_put_answer_hash(const uint8_t meta[CS_PUT_META_LEN], uint64_t sums_hash)
+{
+    if (chunksrv_mutant == CS_MUT_SUMSONLY) /* planted: the identity the receiver took is not covered */
+        return sums_hash;
+    struct pl_xxh h;
+    uint8_t b[8];
+    put64(b, sums_hash);
+    pl_xxh_init(&h);
+    pl_xxh_update(&h, meta, CS_PUT_META_LEN);
+    pl_xxh_update(&h, b, 8);
+    return pl_xxh_final(&h);
+}
+
+/* the receive-side flip of the tests (chunksrv_test_flip) */
+static _Atomic int flip_where;
+static uint32_t flip_off;
+static uint8_t flip_mask;
+static bool flip_rehash;
+
+void chunksrv_test_flip(int where, uint32_t off, uint8_t mask, bool rehash)
+{
+    flip_off = off, flip_mask = mask, flip_rehash = rehash;
+    atomic_store(&flip_where, where);
+}
+
+/* p, n: a frame of kind `where` as received; a copy flipped once when the test armed it (to be freed), else NULL */
+static uint8_t *flip_take(int where, const void *p, size_t n)
+{
+    int w = where;
+    if (atomic_load_explicit(&flip_where, memory_order_relaxed) != where || flip_off >= n ||
+        !atomic_compare_exchange_strong(&flip_where, &w, CS_FLIP_NONE))
+        return NULL;
+    uint8_t *c = malloc(n);
+    if (!c)
+        return NULL;
+    memcpy(c, p, n);
+    c[flip_off] ^= flip_mask;
+    if (flip_rehash && where == CS_FLIP_META && n == CS_PUT_META_LEN)
+        put64(c + 66, xh(c, 66));
+    else if (flip_rehash && where == CS_FLIP_REQ && n > CS_CHECK_LEN)
+        put64(c + n - CS_CHECK_LEN, xh(c, n - CS_CHECK_LEN));
+    return c;
 }
 
 int chunksrv_st(int rc)
@@ -248,6 +306,7 @@ struct cs_job {
 struct cs_pend {
     struct cs_pend *next;
     uint64_t rid;
+    uint8_t op; /* the answer's op must be this one */
     int refs; /* the caller, and a bulk job while it lives */
     bool done, job_done;
     int job_status;
@@ -437,7 +496,7 @@ void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st)
 {
 #define LD(f) st->f = __atomic_load_n(&cs->st.f, __ATOMIC_RELAXED)
     LD(requests); LD(malformed); LD(puts_ok); LD(puts_refused); LD(put_bytes); LD(reads); LD(read_bytes); LD(fenced);
-    LD(unsure_refused); LD(source_raises);
+    LD(unsure_refused); LD(source_raises); LD(answer_mismatch);
 #undef LD
 }
 
@@ -757,6 +816,7 @@ struct cs_put {
     uint64_t *sums;
     uint8_t *cell;     /* the cell being assembled */
     uint64_t cell_have, cell_len;
+    uint8_t meta[CS_PUT_META_LEN]; /* as received and checked: PUT_OK's hash covers it */
     int rc;            /* the first failure (answered) */
     bool answered;
     cs_reply_fn reply;
@@ -770,7 +830,7 @@ static void put_answer(struct cs_put *p, int rc)
     p->answered = true;
     uint8_t b[8] = {0};
     if (rc == 0)
-        put64(b, cs_sums_hash(p->sums, p->ncells));
+        put64(b, cs_put_answer_hash(p->meta, cs_sums_hash(p->sums, p->ncells)));
     reply_rc(p->reply, p->arg, p->file, CS_OP_PUT, rc, b, rc == 0 ? 8 : 0);
     if (rc == 0) {
         STAT(p->cs, puts_ok);
@@ -799,7 +859,15 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
     if (!p)
         return TSDB_ERR_NOMEM;
     p->cs = cs, p->file = file, p->reply = reply, p->arg = arg;
+    uint8_t *flipped = flip_take(CS_FLIP_META, meta, meta_len);
+    if (flipped)
+        meta = flipped;
+    /* The meta's own check comes first: the fence raise below is durable, and nothing is raised from a meta that
+     * fails it (the data's checks, the cells against their sums, come later and cannot vouch for the epoch). */
     int rc = cs_put_meta_decode(meta, meta_len, &p->m) == 0 && total == cs_put_total(&p->m) ? 0 : TSDB_ERR_INVALID;
+    if (rc == 0)
+        memcpy(p->meta, meta, CS_PUT_META_LEN);
+    free(flipped);
     if (rc == 0 && !cs->be)
         rc = TSDB_ERR_UNAVAILABLE;
     if (rc == 0) {
@@ -974,10 +1042,23 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
+static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8_t type, const uint8_t *p, size_t n);
+
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     struct chunksrv *cs = arg;
     int kind = plink_kind(l);
+    uint8_t *flipped = kind == PL_KIND_CHUNK && (type == CS_T_REQ || type == CS_T_RESP)
+                           ? flip_take(type == CS_T_REQ ? CS_FLIP_REQ : CS_FLIP_RESP, p, n)
+                           : NULL;
+    if (flipped)
+        p = flipped;
+    on_frame_chunk(cs, l, kind, type, p, n);
+    free(flipped);
+}
+
+static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8_t type, const uint8_t *p, size_t n)
+{
     if (kind == PL_KIND_CHUNK && type == CS_T_REQ) {
         struct cs_req r;
         if (cs_req_decode(p, n, &r) != 0)
@@ -997,6 +1078,15 @@ static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p,
         pthread_mutex_lock(&cs->cmu);
         for (struct cs_pend *q = cs->pend; q; q = q->next)
             if (q->rid == r.rid && !q->done) {
+                if (q->op != r.op && chunksrv_mutant != CS_MUT_NOOPMATCH) {
+                    /* another call's answer (a changed rid or op): neither call takes it, the link ends */
+                    pthread_mutex_unlock(&cs->cmu);
+                    STAT(cs, answer_mismatch);
+                    fprintf(stderr, "tsdbd: chunk link from node %" PRIu32 ": an answer of op %u for a call of op %u: "
+                            "link ended\n", plink_peer(l), r.op, q->op);
+                    plink_reset(l);
+                    return;
+                }
                 q->rc = r.rc;
                 q->body = r.body_len ? malloc(r.body_len) : NULL;
                 if (q->body)
@@ -1331,12 +1421,13 @@ static uint64_t now_ns(void)
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
-static struct cs_pend *pend_add(struct chunksrv *cs, uint64_t rid, int refs)
+static struct cs_pend *pend_add(struct chunksrv *cs, uint64_t rid, int refs, uint8_t op)
 {
     struct cs_pend *q = calloc(1, sizeof *q);
     if (!q)
         return NULL;
     q->rid = rid;
+    q->op = op;
     q->refs = refs;
     pthread_mutex_lock(&cs->cmu);
     q->next = cs->pend;
@@ -1402,7 +1493,7 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     size_t n = cs_req_encode(&q, buf, sizeof buf);
     if (!n)
         return TSDB_ERR_INVALID;
-    struct cs_pend *pd = pend_add(cs, q.rid, 1);
+    struct cs_pend *pd = pend_add(cs, q.rid, 1, q.op);
     if (!pd)
         return TSDB_ERR_NOMEM;
     int ret = send_until(lc, buf, n, deadline) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
@@ -1466,7 +1557,7 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
         return TSDB_ERR_NOMEM;
     }
     uint64_t rid = atomic_fetch_add(&cs->rid, 1);
-    struct cs_pend *pd = pend_add(cs, rid, 2);
+    struct cs_pend *pd = pend_add(cs, rid, 2, CS_OP_PUT);
     if (!pd) {
         free(ja);
         close(dfd);
@@ -1506,7 +1597,7 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
     if (ret == 0) {
         if (pd->rc != 0)
             ret = pd->rc;
-        else if (pd->body_len != 8 || get64(pd->body) != sum) {
+        else if (pd->body_len != 8 || get64(pd->body) != cs_put_answer_hash(meta, sum)) {
             fprintf(stderr, "tsdbd: chunk put to node %" PRIu32 ": the answer's sum is not the chunk's\n", peer);
             ret = TSDB_ERR_IO;
         }

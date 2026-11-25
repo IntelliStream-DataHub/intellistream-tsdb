@@ -15,7 +15,7 @@
  *    reported DOWN and refuses puts, one it did not fail stays UP and takes the next put whole;
  *  - net: puts and reads between two chunk servers over real links, several threads at once.
  * Mutants (--mutant NAME; the Makefile requires each to fail it): chunknofence, chunkselfraise, putokearly,
- * nocellcheck, storeforeign. The eio case's teeth were checked by hand (chunk_be_store_state reporting a failed
+ * nocellcheck, storeforeign, nometacheck, sumsonly, noreqcheck (test_wire and net_flips), noopmatch (net_flips). The eio case's teeth were checked by hand (chunk_be_store_state reporting a failed
  * store UP fails it with exit 20); that check is R6's, in src/chunkstore.c.
  */
 #include "internal.h"
@@ -202,7 +202,8 @@ static int fake_put(struct chunksrv *cs, const cdata *c, uint64_t file, bool *su
         CHECK(cp.n == 1 && cp.rc == rc && cp.op == CS_OP_PUT && cp.rid == file);
     }
     if (sum_ok)
-        *sum_ok = rc == 0 && cp.body_len == 8 && le64(cp.body) == cs_sums_hash(c->sums, c->ncells);
+        *sum_ok = rc == 0 && cp.body_len == 8 &&
+                  le64(cp.body) == cs_put_answer_hash(meta, cs_sums_hash(c->sums, c->ncells));
     free(cp.body);
     free(f);
     return rc;
@@ -259,6 +260,15 @@ static void test_wire(void)
             CHECK(cs_req_decode(buf, k, &d) == -1);
         buf[n] = 0;
         CHECK(cs_req_decode(buf, n + 1, &d) == -1);
+        /* every bit of a request is covered by its check: with no frame check on the link (the default), a flipped
+         * epoch would otherwise raise a store's fence durably */
+        int taken = 0;
+        for (size_t k = 0; k < 8 * n; k++) {
+            buf[k / 8] ^= (uint8_t)(1u << k % 8);
+            taken += cs_req_decode(buf, n, &d) == 0;
+            buf[k / 8] ^= (uint8_t)(1u << k % 8);
+        }
+        CHECK(taken == 0);
     }
     struct cs_req r = {.op = CS_OP_READ, .len = CS_READ_MAX + 1}, d;
     size_t n = cs_req_encode(&r, buf, sizeof buf);
@@ -296,7 +306,19 @@ static void test_wire(void)
     struct cs_put_meta m;
     CHECK(cs_put_meta_decode(meta, sizeof meta, &m) == 0 && m.pos == 4 && m.epoch == 5 && m.g.len == 100000);
     CHECK(cs_put_meta_decode(meta, sizeof meta - 1, &m) == -1);
-    meta[48] = 5; /* position 5 of 3+2 */
+    int taken = 0; /* every bit of the meta is covered by its check (the epoch is raised durably from it) */
+    for (size_t k = 0; k < 8 * sizeof meta; k++) {
+        meta[k / 8] ^= (uint8_t)(1u << k % 8);
+        taken += cs_put_meta_decode(meta, sizeof meta, &m) == 0;
+        meta[k / 8] ^= (uint8_t)(1u << k % 8);
+    }
+    CHECK(taken == 0);
+    /* PUT_OK's hash covers the meta: another identity with the same sums answers another hash */
+    uint64_t h0 = cs_put_answer_hash(meta, 42);
+    meta[32] ^= 1;
+    CHECK(cs_put_answer_hash(meta, 42) != h0 && cs_put_answer_hash(meta, 43) != cs_put_answer_hash(meta, 42));
+    c.m.pos = 5; /* position 5 of 3+2, with a check that holds */
+    cs_put_meta_encode(&c.m, meta);
     CHECK(cs_put_meta_decode(meta, sizeof meta, &m) == -1);
     cdata_free(&c);
     CHECK(chunksrv_st(0) == CHUNK_ST_OK && chunksrv_st(TSDB_ERR_NOTFOUND) == CHUNK_ST_ABSENT &&
@@ -1070,6 +1092,108 @@ static void *net_thread(void *arg)
     return NULL;
 }
 
+/* b's fence of volume 1, by an EPOCH call at epoch 0 (which raises nothing) */
+static uint64_t net_epoch(struct chunksrv *a)
+{
+    struct cs_req r = {.op = CS_OP_EPOCH, .volume = 1, .epoch = 0};
+    int32_t prc = -1;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    uint64_t e = UINT64_MAX;
+    for (int i = 0; i < 100 && e == UINT64_MAX; i++) /* the link may be coming back after a reset */
+        if (chunksrv_call(a, 2, &r, 10000, &prc, &body, &bl) == 0 && prc == 0 && bl == 9)
+            e = le64(body);
+    free(body);
+    return e;
+}
+
+static int net_link_reset(struct chunksrv *cs, uint64_t g0, struct plink *l)
+{
+    for (int i = 0; i < 500 && plink_gen(l) == g0; i++)
+        nanosleep(&(struct timespec){0, 10 * 1000000L}, NULL);
+    (void)cs;
+    return plink_gen(l) != g0;
+}
+
+/* Flips planted on the receive side, as the links carry no frame check by default (--peer-check none): a put meta's
+ * epoch (refused, the fence not raised), its oid with a check that holds (never PUT_OK), a request's epoch (refused,
+ * the link ended, the fence not raised), an answer that reaches a call of another op (refused, the link ended). */
+static void net_flips(struct chunksrv *a, struct chunksrv *b, const char *dir)
+{
+    uint64_t e0 = net_epoch(a);
+    CHECK(e0 == 20);
+    cdata c;
+    cdata_make(&c, 21, 0, 4096, 40000, 78);
+    c.m.epoch = 20;
+    int fd = chunksrv_stage(dir, &c.m.g, c.m.pos, c.cells, c.sums);
+    uint64_t sh = cs_sums_hash(c.sums, c.ncells);
+    chunksrv_test_flip(CS_FLIP_META, 8 + 5, 0x01, false); /* the epoch's bit 40 */
+    int rc = chunksrv_put_remote(a, 2, &c.m, fd, 0, sh, 10000);
+    uint64_t e1 = net_epoch(a);
+    if (rc == 0 || e1 != 20)
+        fprintf(stderr, "FAIL a put meta with its epoch flipped: put %d, the fence went from 20 to %" PRIu64 "\n", rc, e1);
+    CHECK(rc != 0 && e1 == 20);
+    chunksrv_test_flip(CS_FLIP_META, 32, 0x01, true); /* the oid, with a check that holds */
+    rc = chunksrv_put_remote(a, 2, &c.m, fd, 0, sh, 10000);
+    if (rc != TSDB_ERR_IO)
+        fprintf(stderr, "FAIL a put whose oid changed on the way: %d, not IO (PUT_OK taken for another chunk)\n", rc);
+    CHECK(rc == TSDB_ERR_IO);
+    CHECK(chunksrv_put_remote(a, 2, &c.m, fd, 0, sh, 10000) == 0); /* the honest put after them */
+    close(fd);
+    cdata_free(&c);
+
+    struct plink *lb = peerlink_find(chunksrv_peerlink(b), 1, PL_KIND_CHUNK);
+    CHECK(lb != NULL);
+    if (lb) {
+        uint64_t g0 = plink_gen(lb);
+        struct chunksrv_stats st0, st1;
+        chunksrv_get_stats(b, &st0);
+        chunksrv_test_flip(CS_FLIP_REQ, 13 + 5, 0x01, false); /* a request's epoch, bit 40 */
+        struct cs_req r = {.op = CS_OP_EPOCH, .volume = 1, .epoch = 0};
+        int32_t prc = -1;
+        uint8_t *body = NULL;
+        size_t bl = 0;
+        rc = chunksrv_call(a, 2, &r, 2000, &prc, &body, &bl);
+        free(body);
+        body = NULL;
+        CHECK(rc == TSDB_ERR_UNAVAILABLE && net_link_reset(b, g0, lb));
+        chunksrv_get_stats(b, &st1);
+        CHECK(st1.malformed == st0.malformed + 1);
+        e1 = net_epoch(a);
+        if (e1 != 20)
+            fprintf(stderr, "FAIL a request with its epoch flipped raised the fence from 20 to %" PRIu64 "\n", e1);
+        CHECK(e1 == 20);
+    }
+    struct plink *la = peerlink_find(chunksrv_peerlink(a), 2, PL_KIND_CHUNK);
+    CHECK(la != NULL);
+    if (la) {
+        /* a fenced DEL answers an error with no body, which decodes as any op's: the op is
+         * changed to EPOCH's on its way back, so only the match with the pending call refuses it */
+        struct cs_req r = {.op = CS_OP_DEL, .volume = 1, .epoch = 19, .pos = 0}; /* fenced: an rc, no body */
+        memset(r.vuuid, 0x33, 16);
+        memset(r.oid, 0x44, 16);
+        int32_t prc = 0;
+        uint8_t *body = NULL;
+        size_t bl = 0;
+        CHECK(chunksrv_call(a, 2, &r, 10000, &prc, &body, &bl) == 0 && prc != 0 && bl == 0); /* the control */
+        free(body);
+        body = NULL;
+        struct chunksrv_stats st0, st1;
+        chunksrv_get_stats(a, &st0);
+        chunksrv_test_flip(CS_FLIP_RESP, 8, CS_OP_DEL ^ CS_OP_EPOCH, false);
+        prc = 0;
+        rc = chunksrv_call(a, 2, &r, 2000, &prc, &body, &bl);
+        free(body);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            fprintf(stderr, "FAIL an answer of op EPOCH taken by a DEL call: %d (rc %d)\n", rc, prc);
+        CHECK(rc == TSDB_ERR_UNAVAILABLE); /* the link the answer came on is ended (the line it says) */
+        chunksrv_get_stats(a, &st1);
+        CHECK(st1.answer_mismatch == st0.answer_mismatch + 1);
+        CHECK(net_epoch(a) == 20); /* and serves again */
+    }
+    chunksrv_test_flip(CS_FLIP_NONE, 0, 0, false);
+}
+
 static void test_net(void)
 {
     char dir[PATH_MAX], st[PATH_MAX + 16], err[256];
@@ -1143,6 +1267,7 @@ static void test_net(void)
         free(body);
         body = NULL;
     }
+    net_flips(a, b, dir);
     /* a member that left: its links stop, calls to it are unavailable at once, and it is not dialed again */
     chunksrv_keep_peers(a, NULL, 0);
     CHECK(chunksrv_call(a, 2, &r, 5000, &prc, &body, &bl) == TSDB_ERR_UNAVAILABLE);
