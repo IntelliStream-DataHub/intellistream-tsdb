@@ -112,6 +112,29 @@ static const struct cfg_key tsdbd_keys[] = {
          "The check on every frame of the data links between members: none (the payloads' own checksums and the "
          "receivers' bounds checks), header (8 bytes over each frame's header and its payload's first 256 bytes) or "
          "full (16 bytes over every byte). A link runs at the stronger of its two ends' levels."),
+    CK_E("cluster.peer.rdma", "peer-rdma", "off|auto|on", "auto",
+         "Upgrade data links between members to RDMA verbs (docs/design-rdma.md): off (TCP only), auto (upgrade where "
+         "both ends can, else TCP), or on (a data link that cannot upgrade ends, and tsdbd refuses to start without an "
+         "RDMA pool)."),
+    CK_L("cluster.peer.rdma.device", "peer-rdma-device", "",
+         "RDMA device and port (NAME[:PORT], comma-separated list for multiple fabrics). Default: the first active "
+         "InfiniBand port (RoCE and iWARP ports are used only when named)."),
+    CK_L("cluster.peer.rdma.kinds", "peer-rdma-kinds", "log,bulk,fwd,fwdq,snap,chunk,chunkb",
+         "Data link kinds that upgrade to RDMA (comma-separated; the metadata link always stays TCP)."),
+    CK_Z("cluster.peer.rdma.pool_mb", "peer-rdma-pool-mb", "MB", "64",
+         "Registered memory per tsdbd and RDMA device, shared by its peerlinks (default 64 MiB: 32 KiB slots, 1 MiB "
+         "per connection; needs LimitMEMLOCK above this plus QP and io_uring rings)."),
+    CK_L("cluster.peer.rdma.sl", "peer-rdma-sl", "0",
+         "InfiniBand service level (0 to 15) of RDMA queue pairs: one number for every kind, or KIND=SL entries "
+         "(log=1,bulk=2,snap=2)."),
+    CK_D("cluster.peer.rdma.retry_s", "peer-rdma-retry-s", "s", "600s",
+         "How long a data link that settled on TCP after a transient RDMA failure waits before offering RDMA again on "
+         "the live link (0 disables re-offers)."),
+    CK_I("cluster.peer.rdma.poll_us", "peer-rdma-poll-us", "0",
+         "Microseconds to busy-poll an RDMA completion queue before sleeping on completion events (0 to 10000)."),
+    CK_B("cluster.peer.allow_ipoib", "peer-allow-ipoib", "false",
+         "true lets the TCP peer address bind or dial through an IPoIB interface (ARPHRD_INFINIBAND); off by default "
+         "so no TCP runs over IPoIB."),
     CK_E("cluster.forward", "forward", "on|off", "on",
          "Whether a request for a volume another member leads is forwarded there (on) or answered MOVED to it (off)."),
     CK_D("cluster.fwd.wait", "fwd-wait-ms", "ms", "2s",

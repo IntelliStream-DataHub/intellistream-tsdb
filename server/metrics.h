@@ -38,6 +38,16 @@ typedef struct metrics_margin {
     uint8_t tier;       /* enum margin_tier */
 } metrics_margin;
 
+/* peer link RDMA transport and fault counters (design-rdma.md §5.2; peerlink.h + plrdma.h) */
+#define METRICS_RDMA_FB_MAX 11
+typedef struct metrics_peer_rdma {
+    uint64_t up[8][2];                    /* [kind][0=tcp, 1=rdma] */
+    uint64_t fallbacks[METRICS_RDMA_FB_MAX]; /* indexed by PL_RDMA_FB_* */
+    uint64_t credit_stalls;
+    uint64_t rnr_retries;
+    uint64_t qp_errors;
+} metrics_peer_rdma;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -55,6 +65,8 @@ typedef struct metrics_cfg {
     size_t (*margins)(metrics_margin **out);
     /* the peer data links up by kind and frame check type (peerlink_up_by_check); NULL: not a cluster server */
     void (*peer_links)(uint64_t out[8][4]);
+    /* the peer data links by transport and RDMA counters; NULL: not a cluster server */
+    void (*peer_rdma)(metrics_peer_rdma *out);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

@@ -374,6 +374,7 @@ static int dl_poll(struct plr_qp *q, struct plr_wc *out, int n)
                                                               : PLR_WC_ERR;
         out[i].byte_len = wc[i].byte_len;
         out[i].vendor = (int)wc[i].status;
+        out[i].rnr = (uint8_t)(wc[i].status == IBV_WC_RNR_RETRY_EXC_ERR);
     }
     return k;
 }

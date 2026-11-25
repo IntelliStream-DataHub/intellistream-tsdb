@@ -124,7 +124,9 @@
 #include "chunksrv.h"
 #include "chunkpeer.h"
 #include "fwd.h"
-#include "peerlink.h" /* --peer-check */
+#include "peerlink.h" /* --peer-check, --peer-rdma, --peer-allow-ipoib */
+#include "plrdma.h"
+_Static_assert(METRICS_RDMA_FB_MAX == PL_RDMA_FB_MAX, "metrics RDMA fallback table matches peerlink.h");
 #include "fwdreq.h"
 #include "cvol.h"
 #include "repld.h"
@@ -3023,14 +3025,16 @@ static void handle_status(req *r)
                (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000,
                (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000,
                (unsigned long long)ss.kind5_bytes, (unsigned long long)ss.kind2_bytes);
-        /* the peer data links up, by kind and the frame check they run (--peer-check: the stronger end's level) */
+        /* the peer data links up, by kind, frame check (--peer-check) and transport (tcp vs rdma) */
         static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
-        uint64_t lup[PL_NKINDS][4];
+        uint64_t lup[PL_NKINDS][4], ltr[PL_NKINDS][2];
         peerlink_up_by_check(lup);
-        for (int k = 1; k < PL_NKINDS && at + 160 < cap; k++)
-            ST_PUT("links.%s.none=%llu\nlinks.%s.header=%llu\nlinks.%s.full=%llu\n", lkind[k],
-                   (unsigned long long)lup[k][1], lkind[k], (unsigned long long)lup[k][2], lkind[k],
-                   (unsigned long long)lup[k][3]);
+        peerlink_up_by_transport(ltr);
+        for (int k = 1; k < PL_NKINDS && at + 220 < cap; k++)
+            ST_PUT("links.%s.none=%llu\nlinks.%s.header=%llu\nlinks.%s.full=%llu\nlinks.%s.tcp=%llu\nlinks.%s.rdma=%llu\n",
+                   lkind[k], (unsigned long long)lup[k][1], lkind[k], (unsigned long long)lup[k][2], lkind[k],
+                   (unsigned long long)lup[k][3], lkind[k], (unsigned long long)ltr[k][0], lkind[k],
+                   (unsigned long long)ltr[k][1]);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -5457,6 +5461,141 @@ static void on_signal(int sig)
     wake_signal();
 }
 
+static void tsdbd_peer_rdma_metrics(metrics_peer_rdma *out)
+{
+    peerlink_up_by_transport(out->up);
+    peerlink_rdma_fallbacks(out->fallbacks);
+    struct plr_global_stats gs;
+    plr_global_stats(&gs);
+    out->credit_stalls = gs.credit_stalls;
+    out->rnr_retries = gs.rnr_retries;
+    out->qp_errors = gs.qp_errors;
+}
+
+static int parse_rdma_kind_name(const char *s, size_t n)
+{
+    static const char *const names[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+    for (int k = 1; k < PL_NKINDS; k++)
+        if (strlen(names[k]) == n && memcmp(names[k], s, n) == 0)
+            return k;
+    return -1;
+}
+
+static int parse_rdma_kinds(const char *arg, unsigned *mask)
+{
+    const char *p = arg;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        while (n && (*p == ' ' || *p == '\t'))
+            p++, n--;
+        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t'))
+            n--;
+        int k = parse_rdma_kind_name(p, n);
+        if (k < 0)
+            return -1;
+        *mask |= 1u << k;
+        if (!c)
+            break;
+        p = c + 1;
+    }
+    return 0;
+}
+
+static int parse_rdma_sl(const char *arg, uint8_t sl[PL_NKINDS])
+{
+    const char *p = arg;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        while (n && (*p == ' ' || *p == '\t'))
+            p++, n--;
+        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t'))
+            n--;
+        if (!n)
+            return -1;
+        const char *eq = memchr(p, '=', n);
+        if (eq) {
+            int k = parse_rdma_kind_name(p, (size_t)(eq - p));
+            if (k < 0)
+                return -1;
+            char num[16];
+            size_t vn = (size_t)(p + n - (eq + 1));
+            if (!vn || vn >= sizeof num)
+                return -1;
+            memcpy(num, eq + 1, vn);
+            num[vn] = 0;
+            char *end = NULL;
+            long v = strtol(num, &end, 10);
+            if (*end || v < 0 || v > 15)
+                return -1;
+            sl[k] = (uint8_t)v;
+        } else {
+            char num[16];
+            if (n >= sizeof num)
+                return -1;
+            memcpy(num, p, n);
+            num[n] = 0;
+            char *end = NULL;
+            long v = strtol(num, &end, 10);
+            if (*end || v < 0 || v > 15)
+                return -1;
+            for (int k = 1; k < PL_NKINDS; k++)
+                sl[k] = (uint8_t)v;
+        }
+        if (!c)
+            break;
+        p = c + 1;
+    }
+    return 0;
+}
+
+struct rdma_dev_spec {
+    char name[64];
+    int port;
+};
+
+static int parse_rdma_devices(const char *arg, struct rdma_dev_spec *out, int *cnt, int max)
+{
+    const char *p = arg;
+    while (*p) {
+        const char *c = strchr(p, ',');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        while (n && (*p == ' ' || *p == '\t'))
+            p++, n--;
+        while (n && (p[n - 1] == ' ' || p[n - 1] == '\t'))
+            n--;
+        if (!n || *cnt >= max)
+            return -1;
+        const char *col = memchr(p, ':', n);
+        size_t nl = col ? (size_t)(col - p) : n;
+        int port = 0;
+        if (!nl || nl >= sizeof out[0].name)
+            return -1;
+        if (col) {
+            char ps[16];
+            size_t pn = (size_t)(p + n - (col + 1));
+            if (!pn || pn >= sizeof ps)
+                return -1;
+            memcpy(ps, col + 1, pn);
+            ps[pn] = 0;
+            char *end = NULL;
+            long v = strtol(ps, &end, 10);
+            if (*end || v < 1 || v > 255)
+                return -1;
+            port = (int)v;
+        }
+        memcpy(out[*cnt].name, p, nl);
+        out[*cnt].name[nl] = 0;
+        out[*cnt].port = port;
+        (*cnt)++;
+        if (!c)
+            break;
+        p = c + 1;
+    }
+    return 0;
+}
+
 /* Binds and listens; *port_p is updated to the port actually bound, which is the kernel's choice for port 0. */
 static int listen_on(const char *addr, int *port_p)
 {
@@ -5637,6 +5776,14 @@ int main(int argc, char **argv)
                                    {"fwd-workers", required_argument, 0, 0x113},
                                    {"forward", required_argument, 0, 0x114},
                                    {"peer-check", required_argument, 0, 0x11c},
+                                   {"peer-rdma", required_argument, 0, 0x11d},
+                                   {"peer-rdma-device", required_argument, 0, 0x11e},
+                                   {"peer-rdma-kinds", required_argument, 0, 0x11f},
+                                   {"peer-rdma-pool-mb", required_argument, 0, 0x120},
+                                   {"peer-rdma-sl", required_argument, 0, 0x121},
+                                   {"peer-rdma-retry-s", required_argument, 0, 0x122},
+                                   {"peer-rdma-poll-us", required_argument, 0, 0x123},
+                                   {"peer-allow-ipoib", no_argument, 0, 0x124},
                                    {"chunk-dir", required_argument, 0, 0x115},
                                    {"chunk-rate-mb-s", required_argument, 0, 0x116},
                                    {"ec-settle-grace-s", required_argument, 0, 0x117},
@@ -5657,7 +5804,16 @@ int main(int argc, char **argv)
                                    {"config-keys", no_argument, 0, 0x10b},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0, cluster_on = 0, peer_port = -1, cluster_opts = 0;
-    int witness = 0, rb_off = 0;
+    int witness = 0, rb_off = 0, allow_ipoib = 0;
+    int rdma_mode = PL_RDMA_AUTO, rdma_ndevs = 0, rdma_kinds_set = 0;
+    unsigned rdma_kinds = 0;
+    uint64_t rdma_pool_mb = 64;
+    uint8_t rdma_sl[PL_NKINDS] = {0};
+    uint32_t rdma_retry_s = 600, rdma_poll_us = 0;
+    int rdma_retry_set = 0;
+    struct rdma_dev_spec rdma_devs[PL_RDMA_POOLS_MAX];
+    struct plr_pool *rdma_pools[PL_RDMA_POOLS_MAX] = {0};
+    int rdma_npools = 0;
     char *health_domains[DOM_MAX];
     int nhealth = 0;
     const char *chunk_dirs[CHUNKSRV_DIRS_MAX];
@@ -5840,6 +5996,60 @@ int main(int argc, char **argv)
             cluster_opts = 1;
             break;
         }
+        case 0x11d:
+            if (!strcmp(optarg, "off"))
+                rdma_mode = PL_RDMA_OFF;
+            else if (!strcmp(optarg, "auto"))
+                rdma_mode = PL_RDMA_AUTO;
+            else if (!strcmp(optarg, "on"))
+                rdma_mode = PL_RDMA_ON;
+            else {
+                fprintf(stderr, "tsdbd: --peer-rdma %s: expected off, auto or on\n", optarg);
+                return 2;
+            }
+            cluster_opts = 1;
+            break;
+        case 0x11e:
+            if (parse_rdma_devices(optarg, rdma_devs, &rdma_ndevs, PL_RDMA_POOLS_MAX) != 0) {
+                fprintf(stderr, "tsdbd: --peer-rdma-device %s: expected NAME[:PORT] (at most %d)\n", optarg,
+                        PL_RDMA_POOLS_MAX);
+                return 2;
+            }
+            cluster_opts = 1;
+            break;
+        case 0x11f:
+            if (parse_rdma_kinds(optarg, &rdma_kinds) != 0) {
+                fprintf(stderr, "tsdbd: --peer-rdma-kinds %s: expected data kinds (log,bulk,fwd,fwdq,snap,chunk,chunkb; "
+                                "meta always stays TCP)\n", optarg);
+                return 2;
+            }
+            rdma_kinds_set = 1;
+            cluster_opts = 1;
+            break;
+        case 0x120:
+            rdma_pool_mb = (uint64_t)num_arg("peer-rdma-pool-mb", optarg, 1, 16384);
+            cluster_opts = 1;
+            break;
+        case 0x121:
+            if (parse_rdma_sl(optarg, rdma_sl) != 0) {
+                fprintf(stderr, "tsdbd: --peer-rdma-sl %s: expected SL (0..15) or KIND=SL,...\n", optarg);
+                return 2;
+            }
+            cluster_opts = 1;
+            break;
+        case 0x122:
+            rdma_retry_s = (uint32_t)num_arg("peer-rdma-retry-s", optarg, 0, 86400 * 365);
+            rdma_retry_set = 1;
+            cluster_opts = 1;
+            break;
+        case 0x123:
+            rdma_poll_us = (uint32_t)num_arg("peer-rdma-poll-us", optarg, 0, 10000);
+            cluster_opts = 1;
+            break;
+        case 0x124:
+            allow_ipoib = 1;
+            cluster_opts = 1;
+            break;
         case 0x115:
             if (nchunk >= CHUNKSRV_DIRS_MAX) {
                 fprintf(stderr, "tsdbd: at most %d --chunk-dir\n", CHUNKSRV_DIRS_MAX);
@@ -5971,7 +6181,10 @@ int main(int argc, char **argv)
                         "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off] [--forward on|off] [--fwd-wait-ms 2000]\n"
-                        "              [--peer-check none|header|full]\n"
+                        "              [--peer-check none|header|full] [--peer-rdma off|auto|on]\n"
+                        "              [--peer-rdma-device DEV[:PORT]] [--peer-rdma-kinds KINDS]\n"
+                        "              [--peer-rdma-pool-mb 64] [--peer-rdma-sl 0|KIND=SL,...]\n"
+                        "              [--peer-rdma-retry-s 600] [--peer-rdma-poll-us 0] [--peer-allow-ipoib]\n"
                         "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
                         "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
@@ -6013,6 +6226,7 @@ int main(int argc, char **argv)
          * client port, volumes_ok 0 (never in placement); a voter candidate on any small machine with a local disk.
          * The port file names the peer port twice ("PEER PID 0 PEER"), so a harness that waits for the first number
          * finds a server that serves. */
+        peerlink_set_allow_ipoib(allow_ipoib);
         if (peer_port < 0)
             peer_port = TSDB_DEFAULT_PORT + 1;
         if (port_file)
@@ -6020,6 +6234,13 @@ int main(int argc, char **argv)
         int wfd = listen_on(peer_addr ? peer_addr : addr, &peer_port);
         if (wfd < 0)
             return 1;
+        char ierr[256];
+        if (peerlink_check_ipoib_fd(wfd, ierr, sizeof ierr) != 0 ||
+            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0)) {
+            fprintf(stderr, "tsdbd: %s\n", ierr);
+            close(wfd);
+            return 1;
+        }
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         signal(SIGPIPE, SIG_IGN);
@@ -6184,8 +6405,16 @@ int main(int argc, char **argv)
         return 1;
     int pfd = -1;
     if (cluster_on) {
+        peerlink_set_allow_ipoib(allow_ipoib);
         if ((pfd = listen_on(peer_addr ? peer_addr : addr, &peer_port)) < 0)
             return 1;
+        char ierr[256];
+        if (peerlink_check_ipoib_fd(pfd, ierr, sizeof ierr) != 0 ||
+            (advertise && peerlink_check_ipoib_addr(advertise, ierr, sizeof ierr) != 0)) {
+            fprintf(stderr, "tsdbd: %s\n", ierr);
+            close(pfd);
+            return 1;
+        }
     }
     int mfd = -1;
     if (metrics_on)
@@ -6257,7 +6486,8 @@ int main(int argc, char **argv)
                           .snap = cluster_on ? snap_metrics : NULL,
                           .vol_diverged = metrics_vol_diverged,
                           .margins = cluster_on ? metrics_margins : NULL,
-                          .peer_links = cluster_on ? peerlink_up_by_check : NULL};
+                          .peer_links = cluster_on ? peerlink_up_by_check : NULL,
+                          .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
@@ -6282,6 +6512,45 @@ int main(int argc, char **argv)
         return 1;
     }
     if (cluster_on) {
+        struct pl_rdma_cfg rcfg = {0};
+        rcfg.mode = rdma_mode;
+        rcfg.kinds = rdma_kinds_set ? rdma_kinds : 0;
+        memcpy(rcfg.sl, rdma_sl, sizeof rcfg.sl);
+        rcfg.retry_ms = rdma_retry_set ? (rdma_retry_s == 0 ? UINT32_MAX : rdma_retry_s * 1000u) : 600000u;
+        rcfg.poll_us = rdma_poll_us;
+        if (rdma_mode != PL_RDMA_OFF) {
+            char rerr[256];
+            const struct plr_ops *rops = plrdma_verbs(rerr, sizeof rerr);
+            if (!rops) {
+                if (rdma_mode == PL_RDMA_ON) {
+                    fprintf(stderr, "tsdbd: --peer-rdma on: %s\n", rerr);
+                    return 1;
+                }
+                fprintf(stderr, "tsdbd: %s; data links stay on TCP\n", rerr);
+            } else {
+                int nd = rdma_ndevs ? rdma_ndevs : 1;
+                for (int i = 0; i < nd; i++) {
+                    struct plr_pool_cfg pc = PLR_POOL_CFG_DEFAULT;
+                    pc.dev = rdma_ndevs ? rdma_devs[i].name : NULL;
+                    pc.port = rdma_ndevs ? rdma_devs[i].port : 0;
+                    pc.pool_bytes = (size_t)rdma_pool_mb << 20;
+                    struct plr_pool *pool = plr_pool_open(rops, &pc, rerr, sizeof rerr);
+                    if (!pool) {
+                        if (rdma_mode == PL_RDMA_ON) {
+                            fprintf(stderr, "tsdbd: --peer-rdma on: %s\n", rerr);
+                            for (int j = 0; j < rdma_npools; j++)
+                                plr_pool_close(rdma_pools[j]);
+                            return 1;
+                        }
+                        fprintf(stderr, "tsdbd: %s; data links stay on TCP\n", rerr);
+                        continue;
+                    }
+                    rdma_pools[rdma_npools++] = pool;
+                    rcfg.pools[rcfg.npools++] = pool;
+                }
+            }
+        }
+        peerlink_set_rdma(&rcfg);
         const char *host = advertise ? advertise : addr;
         const char *lb = strchr(host, ':') ? "[" : "", *rb = strchr(host, ':') ? "]" : "";
         char cadv[256], padv[256];
@@ -6359,6 +6628,9 @@ int main(int argc, char **argv)
         fwd_join(); /* the reserved workers of forwarded requests */
         fwd_cluster_free(); /* no worker can call into the forwarding links any more */
         chunksrv_cluster_free(); /* nor into the chunk server; its stores are closed (the flocks released) */
+        peerlink_set_rdma(NULL);
+        for (int i = 0; i < rdma_npools; i++)
+            plr_pool_close(rdma_pools[i]);
         fwdr_tab_free(fwd_tab);
         fwd_tab = NULL;
     }

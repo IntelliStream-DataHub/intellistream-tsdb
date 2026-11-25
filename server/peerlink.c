@@ -24,10 +24,13 @@
 
 #include "tsdb_crypto.h"
 #include "plcheck.h"
+#include "plrdma.h"
 #include "pltransport.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -48,6 +51,16 @@
 
 int peerlink_mutant;
 static _Atomic int check_default; /* peerlink_set_check_level */
+static _Atomic int g_allow_ipoib; /* peerlink_set_allow_ipoib */
+static pthread_mutex_t g_rdma_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct pl_rdma_cfg g_rdma;
+int (*peerlink_test_iftype)(const char *ifname);
+int peerlink_test_rdma_hold_ready_ms;
+int peerlink_test_rdma_abort_before_hello;
+int peerlink_test_rdma_fail_after_hello;
+int peerlink_test_rdma_skip_go;
+int peerlink_test_rdma_bad_auth;
+uint64_t peerlink_test_rdma_offers;
 int peerlink_test_cut_end;
 int32_t peerlink_test_done_status;
 static uint64_t kind_bytes[PL_KIND_DATA_MAX + 1]; /* peerlink_kind_bytes: process-wide, so no peerlink is touched */
@@ -370,7 +383,35 @@ int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, ui
         return 0;
     case PLT_PING:
     case PLT_PONG:
+    case PLT_RDMA_GO:
+    case PLT_RDMA_ABORT:
         return n == 0 ? 0 : -1;
+    case PLT_RDMA_OFFER:
+        if (n != PLR_EP_LEN + 8)
+            return -1;
+        m->data = p;
+        m->data_len = PLR_EP_LEN;
+        m->a = le64(p + PLR_EP_LEN);
+        return 0;
+    case PLT_RDMA_ACCEPT:
+        if (n != PLR_EP_LEN)
+            return -1;
+        m->data = p;
+        m->data_len = PLR_EP_LEN;
+        return 0;
+    case PLT_RDMA_DECLINE:
+        if (n != 1)
+            return -1;
+        m->a = p[0];
+        return 0;
+    case PLT_RDMA_HELLO:
+    case PLT_RDMA_READY:
+        if (n != 8 + 32)
+            return -1;
+        m->a = le64(p);
+        m->data = p + 8;
+        m->data_len = 32;
+        return 0;
     default:
         return -1;
     }
@@ -541,11 +582,17 @@ struct plink {
     uint32_t want_id;
     char addr[160];
     _Atomic uint32_t peer;
-    _Atomic int check; /* the frame check type its connection runs (plcheck.h), 0 while down */
+    _Atomic int check;     /* the frame check type its connection runs (plcheck.h), 0 while down */
+    _Atomic int transport; /* 0: down, 1: tcp, 2: rdma */
     void *arg;
     int evfd, evw;
     pthread_t thr; /* a dialed link's thread (accepted ones run on detached threads, counted in pl->helpers) */
     int thr_valid;
+    /* RDMA upgrade backoff state (dialed links, owned by dial_main / conn_run thread) */
+    int rdma_fails;
+    int rdma_backed_off;
+    uint64_t rdma_backoff_ns;
+    uint64_t rdma_until_ns;
     /* under pl->mu: accepted links. adopt_seq bumps when a connection that passed the handshake claims the link
      * (never before: a peer that fails AUTH replaces nothing); the connection running it, and any older one waiting
      * for it to leave, sees the bump and leaves. running: a connection's thread is inside conn_run. */
@@ -638,6 +685,12 @@ static struct plink *link_new(struct peerlink *pl, int kind, int dialed)
 uint32_t plink_peer(const struct plink *l) { return atomic_load(&((struct plink *)l)->peer); }
 int plink_kind(const struct plink *l) { return l->kind; }
 int plink_check(const struct plink *l) { return atomic_load(&((struct plink *)l)->check); }
+int plink_is_rdma(const struct plink *l) { return atomic_load(&((struct plink *)l)->transport) == 2; }
+const char *plink_transport(const struct plink *l)
+{
+    int tr = atomic_load(&((struct plink *)l)->transport);
+    return tr == 2 ? "rdma" : tr == 1 ? "tcp" : "";
+}
 void plink_set_arg(struct plink *l, void *arg) { l->arg = arg; }
 void *plink_arg(const struct plink *l) { return l->arg; }
 
@@ -982,6 +1035,117 @@ static int send_hs(int fd, uint8_t type, const uint8_t *body, size_t n, uint64_t
     return write_dl(fd, fr, 5 + n, deadline);
 }
 
+/* ---- IPoIB refusal (docs/design-rdma.md §5.3, D12): no TCP over InfiniBand interfaces unless explicitly allowed */
+
+#define PL_ARPHRD_INFINIBAND 32
+
+void peerlink_set_allow_ipoib(int allow) { atomic_store(&g_allow_ipoib, allow ? 1 : 0); }
+
+static int iface_arphrd(const char *ifname)
+{
+    int (*fn)(const char *) = __atomic_load_n(&peerlink_test_iftype, __ATOMIC_RELAXED);
+    if (fn)
+        return fn(ifname);
+#ifdef __linux__
+    char path[256], buf[32];
+    if (snprintf(path, sizeof path, "/sys/class/net/%s/type", ifname) >= (int)sizeof path)
+        return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t r = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (r <= 0)
+        return -1;
+    buf[r] = 0;
+    return atoi(buf);
+#else
+    (void)ifname;
+    return -1;
+#endif
+}
+
+static int sa_same_ip(const struct sockaddr *a, const struct sockaddr *b)
+{
+    if (!a || !b)
+        return 0;
+    if (a->sa_family == AF_INET && b->sa_family == AF_INET)
+        return memcmp(&((const struct sockaddr_in *)a)->sin_addr, &((const struct sockaddr_in *)b)->sin_addr, 4) == 0;
+    if (a->sa_family == AF_INET6 && b->sa_family == AF_INET6)
+        return memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr, &((const struct sockaddr_in6 *)b)->sin6_addr, 16) == 0;
+    if (a->sa_family == AF_INET6 && b->sa_family == AF_INET) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)a)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(v6))
+            return memcmp(v6->s6_addr + 12, &((const struct sockaddr_in *)b)->sin_addr, 4) == 0;
+    }
+    if (a->sa_family == AF_INET && b->sa_family == AF_INET6) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)b)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(v6))
+            return memcmp(v6->s6_addr + 12, &((const struct sockaddr_in *)a)->sin_addr, 4) == 0;
+    }
+    return 0;
+}
+
+int peerlink_check_ipoib_sa(const struct sockaddr *sa, char *err, size_t errlen)
+{
+    if (atomic_load(&g_allow_ipoib) || peerlink_mutant == PL_MUT_NOIPOIB)
+        return 0;
+    if (!sa || (sa->sa_family != AF_INET && sa->sa_family != AF_INET6))
+        return 0;
+    struct ifaddrs *iflist = NULL;
+    if (getifaddrs(&iflist) != 0)
+        return 0;
+    int bad = 0;
+    for (struct ifaddrs *ifa = iflist; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_name || !sa_same_ip(sa, ifa->ifa_addr))
+            continue;
+        if (iface_arphrd(ifa->ifa_name) == PL_ARPHRD_INFINIBAND) {
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "peer address uses IPoIB interface %s (ARPHRD_INFINIBAND): TCP over IPoIB is refused "
+                         "unless cluster.peer.allow_ipoib=true (--peer-allow-ipoib)",
+                         ifa->ifa_name);
+            bad = 1;
+            break;
+        }
+    }
+    freeifaddrs(iflist);
+    return bad ? -1 : 0;
+}
+
+int peerlink_check_ipoib_fd(int fd, char *err, size_t errlen)
+{
+    if (atomic_load(&g_allow_ipoib) || peerlink_mutant == PL_MUT_NOIPOIB)
+        return 0;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) != 0)
+        return 0;
+    return peerlink_check_ipoib_sa((const struct sockaddr *)&ss, err, errlen);
+}
+
+int peerlink_check_ipoib_addr(const char *addr, char *err, size_t errlen)
+{
+    if (!addr || !*addr || atomic_load(&g_allow_ipoib) || peerlink_mutant == PL_MUT_NOIPOIB)
+        return 0;
+    char host[128];
+    size_t n = strlen(addr);
+    if (n >= sizeof host)
+        return 0;
+    memcpy(host, addr, n + 1);
+    if (n >= 2 && host[0] == '[' && host[n - 1] == ']') {
+        memmove(host, host + 1, n - 2);
+        host[n - 2] = 0;
+    }
+    struct sockaddr_in sa4 = {.sin_family = AF_INET};
+    if (inet_pton(AF_INET, host, &sa4.sin_addr) == 1)
+        return peerlink_check_ipoib_sa((const struct sockaddr *)&sa4, err, errlen);
+    struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6};
+    if (inet_pton(AF_INET6, host, &sa6.sin6_addr) == 1)
+        return peerlink_check_ipoib_sa((const struct sockaddr *)&sa6, err, errlen);
+    return 0;
+}
+
 static int dial_fd(struct peerlink *pl, const char *addr, uint64_t deadline)
 {
     char host[128], port[16];
@@ -1035,6 +1199,12 @@ static int dial_fd(struct peerlink *pl, const char *addr, uint64_t deadline)
             }
             break;
         }
+    }
+    char ierr[256];
+    if (peerlink_check_ipoib_fd(fd, ierr, sizeof ierr) != 0) {
+        fprintf(stderr, "peerlink: dial %s refused: %s\n", addr, ierr);
+        close(fd);
+        return -1;
     }
     return fd;
 }
@@ -1132,12 +1302,65 @@ void peerlink_set_check_level(int level) { atomic_store(&check_default, level); 
 int peerlink_check_parse(const char *s) { return pl_check_parse(s); }
 const char *peerlink_check_name(int type) { return pl_check_name(type); }
 
-static _Atomic uint64_t g_up[PL_NKINDS][4]; /* the process's connections up by kind and check type */
+static _Atomic uint64_t g_up[PL_NKINDS][4];    /* the process's connections up by kind and check type */
+static _Atomic uint64_t g_up_tr[PL_NKINDS][2]; /* the process's connections up by kind and transport (0: tcp, 1: rdma) */
+static _Atomic uint64_t g_rdma_fb[PL_RDMA_FB_MAX];
+
+static const char *const kname_tab[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+
+static const char *const rdma_fb_names[PL_RDMA_FB_MAX] = {
+    [PL_RDMA_FB_NOT_BUILT] = "not_built",
+    [PL_RDMA_FB_OFF] = "off",
+    [PL_RDMA_FB_KIND] = "kind",
+    [PL_RDMA_FB_SUBNET] = "subnet",
+    [PL_RDMA_FB_POOL] = "pool",
+    [PL_RDMA_FB_QP] = "qp",
+    [PL_RDMA_FB_TIMEOUT] = "timeout",
+    [PL_RDMA_FB_AUTH] = "auth",
+    [PL_RDMA_FB_QP_ERROR] = "qp_error",
+    [PL_RDMA_FB_BACKOFF] = "backoff",
+    [PL_RDMA_FB_BAD] = "bad",
+};
+
+void peerlink_set_rdma(const struct pl_rdma_cfg *cfg)
+{
+    pthread_mutex_lock(&g_rdma_mu);
+    if (cfg)
+        g_rdma = *cfg;
+    else
+        memset(&g_rdma, 0, sizeof g_rdma);
+    pthread_mutex_unlock(&g_rdma_mu);
+}
+
+static void rdma_cfg_get(const struct peerlink *pl, struct pl_rdma_cfg *out)
+{
+    if (pl->cfg.has_rdma) {
+        *out = pl->cfg.rdma;
+    } else {
+        pthread_mutex_lock(&g_rdma_mu);
+        *out = g_rdma;
+        pthread_mutex_unlock(&g_rdma_mu);
+    }
+    if (!out->kinds)
+        out->kinds = ((1u << (PL_KIND_DATA_MAX + 1)) - 1u) & ~1u; /* all data kinds 1..7, never META (0) */
+}
 
 static void up_count(int kind, int type, int d)
 {
     if (kind >= 0 && kind < PL_NKINDS && type >= 1 && type <= 3)
         atomic_fetch_add_explicit(&g_up[kind][type], (uint64_t)(int64_t)d, memory_order_relaxed);
+}
+
+static void up_tr_count(int kind, int rdma, int d)
+{
+    if (kind >= 0 && kind < PL_NKINDS)
+        atomic_fetch_add_explicit(&g_up_tr[kind][rdma ? 1 : 0], (uint64_t)(int64_t)d, memory_order_relaxed);
+}
+
+static void fb_count(int reason)
+{
+    if (reason >= 0 && reason < PL_RDMA_FB_MAX)
+        atomic_fetch_add_explicit(&g_rdma_fb[reason], 1, memory_order_relaxed);
 }
 
 void peerlink_up_by_check(uint64_t out[PL_NKINDS][4])
@@ -1147,19 +1370,39 @@ void peerlink_up_by_check(uint64_t out[PL_NKINDS][4])
             out[k][t] = atomic_load_explicit(&g_up[k][t], memory_order_relaxed);
 }
 
+void peerlink_up_by_transport(uint64_t out[PL_NKINDS][2])
+{
+    for (int k = 0; k < PL_NKINDS; k++)
+        for (int t = 0; t < 2; t++)
+            out[k][t] = atomic_load_explicit(&g_up_tr[k][t], memory_order_relaxed);
+}
+
+void peerlink_rdma_fallbacks(uint64_t out[PL_RDMA_FB_MAX])
+{
+    for (int i = 0; i < PL_RDMA_FB_MAX; i++)
+        out[i] = atomic_load_explicit(&g_rdma_fb[i], memory_order_relaxed);
+}
+
+const char *peerlink_rdma_fb_name(int reason)
+{
+    return reason >= 0 && reason < PL_RDMA_FB_MAX && rdma_fb_names[reason] ? rdma_fb_names[reason] : "unknown";
+}
+
 int peerlink_links_status(char *buf, size_t n)
 {
-    static const char *const kname[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
-    uint64_t up[PL_NKINDS][4];
+    uint64_t up[PL_NKINDS][4], tr[PL_NKINDS][2];
     peerlink_up_by_check(up);
+    peerlink_up_by_transport(tr);
     size_t off = 0;
     if (n)
         buf[0] = 0;
     for (int k = 0; k < PL_NKINDS; k++) {
         if (!up[k][1] && !up[k][2] && !up[k][3])
             continue;
-        int w = snprintf(buf + off, n - off, "peer links %s: none %" PRIu64 " header %" PRIu64 " full %" PRIu64 "\n",
-                         kname[k], up[k][1], up[k][2], up[k][3]);
+        int w = snprintf(buf + off, n - off,
+                         "peer links %s: none %" PRIu64 " header %" PRIu64 " full %" PRIu64 " tcp %" PRIu64
+                         " rdma %" PRIu64 "\n",
+                         kname_tab[k], up[k][1], up[k][2], up[k][3], tr[k][0], tr[k][1]);
         if (w < 0 || (size_t)w >= n - off)
             return -1;
         off += (size_t)w;
@@ -1205,8 +1448,10 @@ static int zero16(const uint8_t *u)
 
 struct keys {
     struct fck in, out;
+    uint8_t rdma_key[32]; /* connection-scoped HMAC key for RDMA_HELLO / RDMA_READY (design-rdma.md §5.1 step 7) */
     uint32_t peer;
-    unsigned peer_caps; /* the PL_CAP_* bits the peer's HELLO or HELLO_ACK carried (rd-upgrade decides on them) */
+    unsigned peer_caps; /* the PL_CAP_* bits the peer's HELLO or HELLO_ACK carried */
+    int try_rdma;       /* dialer sent PL_CAP_RDMA_TRY and both sides speak PL_CAP_RDMA */
 };
 
 /* each direction's frame check: the negotiated type and a salt from the transcript under the secret (plcheck.h), so
@@ -1220,6 +1465,7 @@ static void keys_derive(const struct peerlink *pl, int dialer, int check, const 
         trlen = 0;
     hs_mac(pl->secret, pl->secret_len, dialer || same ? "tsdb-link-x>" : "tsdb-link-x<", tr, trlen, ko);
     hs_mac(pl->secret, pl->secret_len, dialer && !same ? "tsdb-link-x<" : "tsdb-link-x>", tr, trlen, ki);
+    hs_mac(pl->secret, pl->secret_len, "tsdb-link-rdma", tr, trlen, k->rdma_key);
     k->out = (struct fck){check, le64(ko)};
     k->in = (struct fck){check, le64(ki)};
     if (peerlink_test_salts)
@@ -1228,12 +1474,30 @@ static void keys_derive(const struct peerlink *pl, int dialer, int check, const 
     tsdb_wipe(ki, 32);
 }
 
+static int dial_can_try_rdma(const struct plink *l, const struct pl_rdma_cfg *rc, uint64_t now)
+{
+    if (!l->dialed || l->kind <= PL_KIND_META || l->kind > PL_KIND_DATA_MAX)
+        return 0;
+    if (rc->mode == PL_RDMA_OFF || rc->npools <= 0)
+        return 0;
+    if (!(rc->kinds & (1u << l->kind)))
+        return 0;
+    if (peerlink_mutant != PL_MUT_RDMA_NOBACKOFF && l->rdma_until_ns && now < l->rdma_until_ns)
+        return 0;
+    return 1;
+}
+
 static int hs_dial(struct plink *l, int fd, struct keys *k)
 {
     struct peerlink *pl = l->pl;
-    uint64_t dl = now_ns() + (uint64_t)(pl->cfg.hs_ms ? pl->cfg.hs_ms : 5000) * MS;
+    uint64_t now = now_ns();
+    uint64_t dl = now + (uint64_t)(pl->cfg.hs_ms ? pl->cfg.hs_ms : 5000) * MS;
     uint8_t tr[HS_TR_MAX], body[HS_FRAME_MAX], mac[32], want[32], type;
     size_t trlen = 0, n;
+    struct pl_rdma_cfg rc;
+    rdma_cfg_get(pl, &rc);
+    int want_try = dial_can_try_rdma(l, &rc, now);
+    unsigned my_caps = PL_CAPS | (want_try ? PL_CAP_RDMA_TRY : 0u);
     struct buf b = {0};
     uint8_t nc[32];
     tsdb_random(nc, sizeof nc);
@@ -1250,12 +1514,12 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     put8(&b, (uint8_t)l->kind);
     unsigned offer = pl_check_offer(check_level(pl));
     put8(&b, (uint8_t)offer);
-    put8(&b, (uint8_t)PL_CAPS);
+    put8(&b, (uint8_t)my_caps);
     memcpy(tr, b.p, b.len);
     trlen = b.len;
-    int rc = send_hs(fd, F_HELLO, b.p, b.len, dl);
+    int s_rc = send_hs(fd, F_HELLO, b.p, b.len, dl);
     buf_free(&b);
-    if (rc != 0)
+    if (s_rc != 0)
         return -1;
     if (read_hs(pl, fd, dl, &type, body, &n) != 0 || type != F_HELLO_ACK || n != 4 + 16 + 16 + 32 + 1 + 1 + 32)
         return -1;
@@ -1285,6 +1549,7 @@ static int hs_dial(struct plink *l, int fd, struct keys *k)
     keys_derive(pl, 1, check, tr, trlen, k);
     k->peer = id;
     k->peer_caps = body[4 + 16 + 16 + 32 + 1];
+    k->try_rdma = want_try && (k->peer_caps & PL_CAP_RDMA);
     return 0;
 }
 
@@ -1337,6 +1602,7 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
     keys_derive(pl, 0, check, tr, trlen, k);
     k->peer = h.id;
     k->peer_caps = h.caps;
+    k->try_rdma = !!(h.caps & PL_CAP_RDMA_TRY);
     return 0;
 }
 
@@ -1344,6 +1610,21 @@ static int hs_accept(struct peerlink *pl, int fd, const uint8_t *hello, size_t h
 
 enum { J_WAITRESUME = 1, J_HASH, J_SEND, J_WAITDONE };
 enum { HP_RX = 1, HP_TX };
+enum {
+    UP_IDLE = 0,
+    UP_D_WAIT_ACCEPT, /* dialer sent OFFER on TCP; waiting for ACCEPT or DECLINE */
+    UP_D_WAIT_READY,  /* dialer sent HELLO on QP; waiting for READY on QP */
+    UP_A_WAIT_OFFER,  /* acceptor saw PL_CAP_RDMA_TRY; waiting for initial OFFER or ABORT on TCP */
+    UP_A_WAIT_HELLO,  /* acceptor sent ACCEPT on TCP; waiting for HELLO on QP or ABORT on TCP */
+    UP_A_WAIT_GO,     /* acceptor sent READY on QP; waiting for GO on QP or ABORT on TCP */
+};
+
+struct dctl {
+    struct dctl *next;
+    uint8_t type;
+    size_t n;
+    uint8_t p[];
+};
 
 struct conn {
     struct plink *l;
@@ -1358,6 +1639,17 @@ struct conn {
     ZSTD_CCtx *zc;
     uint64_t last_rx, last_ping;
     uint8_t *cbuf; /* a chunk's read buffer */
+
+    /* RDMA upgrade state machine (docs/design-rdma.md §5.1, §5.3) */
+    struct pl_rdma_cfg rcfg;
+    int up_state, settled, on_rdma, rdma_final_decline, rdma_stable_reset;
+    int up_aborted_wait, up_fail_after_hello;
+    struct plr_conn *up_conn;
+    struct pl_transport *up_t;
+    struct buf up_wb, up_rb;
+    uint64_t up_nonce, up_self_seq, up_peer_seq, up_deadline, up_ready_at;
+    uint64_t rdma_settled_ns, next_reoffer_ns;
+    struct dctl *dctl_h, *dctl_t; /* control frames deferred while an upgrade is in flight */
 
     struct { /* the file arriving. skip: the driver's data callback failed it: the chunks and END still in flight
               * for that file are ignored (the sender is told PL_E_IO and stops) */
@@ -1458,9 +1750,488 @@ static void job_done(struct peerlink *pl, struct jobq *q, int status, uint64_t s
     free(q);
 }
 
-static void send_ctl(struct conn *c, uint8_t type, const void *p, size_t n)
+static void send_ctl_now(struct conn *c, uint8_t type, const void *p, size_t n)
 {
     frame_put(&c->wb, &c->keys.out, &c->seq_out, type, "", 0, p, n, NULL, 0);
+}
+
+static void send_ctl(struct conn *c, uint8_t type, const void *p, size_t n)
+{
+    if (c->up_state != UP_IDLE) {
+        struct dctl *d = malloc(sizeof *d + n);
+        if (!d)
+            oom();
+        d->next = NULL;
+        d->type = type;
+        d->n = n;
+        if (n)
+            memcpy(d->p, p, n);
+        if (c->dctl_t)
+            c->dctl_t->next = d;
+        else
+            c->dctl_h = d;
+        c->dctl_t = d;
+        return;
+    }
+    send_ctl_now(c, type, p, n);
+}
+
+static void dctl_flush(struct conn *c)
+{
+    struct dctl *d = c->dctl_h;
+    c->dctl_h = c->dctl_t = NULL;
+    while (d) {
+        struct dctl *nx = d->next;
+        send_ctl_now(c, d->type, d->p, d->n);
+        free(d);
+        d = nx;
+    }
+}
+
+static void dctl_free(struct conn *c)
+{
+    struct dctl *d = c->dctl_h;
+    c->dctl_h = c->dctl_t = NULL;
+    while (d) {
+        struct dctl *nx = d->next;
+        free(d);
+        d = nx;
+    }
+}
+
+/* ---- RDMA upgrade helpers (docs/design-rdma.md §5.1, §5.3) */
+
+static void up_rdma_mac(const uint8_t key[32], uint8_t type, uint64_t seq, uint64_t nonce, uint8_t out[32])
+{
+    uint8_t msg[1 + 8 + 8];
+    msg[0] = type;
+    for (int i = 0; i < 8; i++) {
+        msg[1 + i] = (uint8_t)(seq >> (8 * i));
+        msg[9 + i] = (uint8_t)(nonce >> (8 * i));
+    }
+    struct hk hk;
+    hk_init(&hk, key, 32);
+    hk_mac(&hk, msg, sizeof msg, "", 0, "", 0, "", 0, out);
+    tsdb_wipe(&hk, sizeof hk);
+}
+
+static void up_cleanup(struct conn *c)
+{
+    if (c->up_t) {
+        c->up_t->ops->close(c->up_t); /* anchor is NULL, so c->t (TCP) is untouched */
+        c->up_t = NULL;
+        c->up_conn = NULL;
+    } else if (c->up_conn) {
+        plr_conn_free(c->up_conn);
+        c->up_conn = NULL;
+    }
+    c->up_ready_at = 0;
+    c->up_fail_after_hello = 0;
+    buf_free(&c->up_wb);
+    buf_free(&c->up_rb);
+}
+
+static void conn_settle(struct conn *c, int rdma)
+{
+    struct plink *l = c->l;
+    struct peerlink *pl = c->pl;
+    int was_rdma = c->on_rdma;
+    c->on_rdma = rdma;
+    if (!c->settled) {
+        c->settled = 1;
+        pthread_mutex_lock(&l->mu);
+        l->up = 1;
+        l->gen++;
+        c->gen = l->gen;
+        l->io_thr = pthread_self();
+        l->io_set = 1;
+        atomic_store(&l->peer, c->keys.peer);
+        atomic_store(&l->check, c->keys.out.type);
+        atomic_store(&l->transport, rdma ? 2 : 1);
+        pthread_mutex_unlock(&l->mu);
+        ST(pl, connects, 1);
+        if (c->keys.out.type >= 1 && c->keys.out.type <= 3)
+            ST(pl, up_check[c->keys.out.type], 1);
+        up_count(l->kind, c->keys.out.type, 1);
+        up_tr_count(l->kind, rdma, 1);
+        if (pl->cfg.on_link)
+            pl->cfg.on_link(pl->cfg.arg, l, 1);
+        pthread_mutex_lock(&l->mu);
+        l->open = 1; /* the driver's own threads may send from here on (their frames follow on_link's) */
+        pthread_mutex_unlock(&l->mu);
+    } else if (rdma != was_rdma) {
+        up_tr_count(l->kind, was_rdma, -1);
+        up_tr_count(l->kind, rdma, 1);
+        atomic_store(&l->transport, rdma ? 2 : 1);
+    }
+    dctl_flush(c);
+}
+
+static void up_record_fail(struct conn *c, int fb_reason)
+{
+    fb_count(fb_reason);
+    if (!c->l->dialed)
+        return;
+    struct plink *l = c->l;
+    l->rdma_fails++;
+    if (l->rdma_fails >= 3 && peerlink_mutant != PL_MUT_RDMA_NOBACKOFF) {
+        uint64_t bmin = (uint64_t)(c->rcfg.backoff_min_ms ? c->rcfg.backoff_min_ms : 60000u) * MS;
+        uint64_t bmax = (uint64_t)(c->rcfg.backoff_max_ms ? c->rcfg.backoff_max_ms : 600000u) * MS;
+        uint64_t prev = l->rdma_backoff_ns;
+        l->rdma_backoff_ns = prev ? (prev * 2 > bmax ? bmax : prev * 2) : bmin;
+        l->rdma_until_ns = now_ns() + l->rdma_backoff_ns;
+        if (!l->rdma_backed_off || l->rdma_backoff_ns != prev)
+            fprintf(stderr, "peerlink: rdma: peer %" PRIu32 " kind %s: %d failures in a row (%s), staying on TCP for %" PRIu64 " ms\n",
+                    c->keys.peer, kname_tab[l->kind], l->rdma_fails, peerlink_rdma_fb_name(fb_reason),
+                    (uint64_t)(l->rdma_backoff_ns / MS));
+        l->rdma_backed_off = 1;
+    }
+}
+
+static void up_schedule_reoffer(struct conn *c, uint64_t now)
+{
+    c->next_reoffer_ns = 0;
+    if (!c->l->dialed || c->rdma_final_decline || c->rcfg.mode == PL_RDMA_OFF || c->rcfg.npools <= 0 ||
+        !(c->rcfg.kinds & (1u << c->l->kind)) || !(c->keys.peer_caps & PL_CAP_RDMA) ||
+        c->rcfg.retry_ms == UINT32_MAX)
+        return;
+    uint64_t retry_ns = (uint64_t)(c->rcfg.retry_ms ? c->rcfg.retry_ms : 600000u) * MS;
+    uint64_t at = now + retry_ns;
+    if (peerlink_mutant != PL_MUT_RDMA_NOBACKOFF && c->l->rdma_until_ns > at)
+        at = c->l->rdma_until_ns;
+    c->next_reoffer_ns = at;
+}
+
+static void up_dial_abort(struct conn *c, int fb_reason, int send_abort)
+{
+    int was_wait_accept = c->up_state == UP_D_WAIT_ACCEPT;
+    up_cleanup(c);
+    up_record_fail(c, fb_reason);
+    if (c->rcfg.mode == PL_RDMA_ON) {
+        fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s upgrade failed (%s): ending connection\n",
+                c->keys.peer, kname_tab[c->l->kind], peerlink_rdma_fb_name(fb_reason));
+        c->up_state = UP_IDLE;
+        c->dead = 1;
+        return;
+    }
+    if (send_abort) {
+        send_ctl_now(c, PLT_RDMA_ABORT, "", 0);
+        if (was_wait_accept)
+            c->up_aborted_wait = 1;
+    }
+    c->up_state = UP_IDLE;
+    up_schedule_reoffer(c, now_ns());
+    conn_settle(c, 0);
+}
+
+static void up_dial_start_offer(struct conn *c, int initial)
+{
+    char err[256] = "no RDMA pool";
+    struct plr_conn *conn = NULL;
+    for (int i = 0; i < c->rcfg.npools && !conn; i++)
+        if (c->rcfg.pools[i])
+            conn = plr_conn_new(c->rcfg.pools[i], err, sizeof err);
+    if (!conn) {
+        fprintf(stderr, "peerlink: rdma: %s\n", err);
+        up_dial_abort(c, PL_RDMA_FB_POOL, initial && c->keys.try_rdma);
+        return;
+    }
+    struct plr_ep ep;
+    plr_conn_ep(conn, &ep);
+    uint8_t payload[PLR_EP_LEN + 8];
+    plr_ep_encode(&ep, payload);
+    tsdb_random(&c->up_nonce, sizeof c->up_nonce);
+    for (int i = 0; i < 8; i++)
+        payload[PLR_EP_LEN + i] = (uint8_t)(c->up_nonce >> (8 * i));
+    c->up_conn = conn;
+    c->up_self_seq = c->seq_out;
+    send_ctl_now(c, PLT_RDMA_OFFER, payload, sizeof payload);
+    __atomic_add_fetch(&peerlink_test_rdma_offers, 1, __ATOMIC_RELAXED);
+    uint64_t otmo = (uint64_t)(c->rcfg.offer_timeout_ms ? c->rcfg.offer_timeout_ms : 2000u) * MS;
+    c->up_deadline = now_ns() + otmo;
+    c->up_state = UP_D_WAIT_ACCEPT;
+}
+
+static void up_encode_qp_probe(struct conn *c, uint8_t type, uint64_t at_seq, uint64_t nonce)
+{
+    uint8_t payload[8 + 32];
+    uint64_t wn = nonce;
+    int ba = __atomic_load_n(&peerlink_test_rdma_bad_auth, __ATOMIC_RELAXED);
+    if ((ba == 3 && type == PLT_RDMA_HELLO) || (ba == 4 && type == PLT_RDMA_READY))
+        wn ^= 1;
+    for (int i = 0; i < 8; i++)
+        payload[i] = (uint8_t)(wn >> (8 * i));
+    up_rdma_mac(c->keys.rdma_key, type, at_seq, nonce, payload + 8);
+    if ((ba == 1 && type == PLT_RDMA_HELLO) || (ba == 2 && type == PLT_RDMA_READY))
+        payload[8] ^= 0xff;
+    uint64_t tmp_seq = at_seq;
+    frame_put(&c->up_wb, &c->keys.out, &tmp_seq, type, "", 0, payload, sizeof payload, NULL, 0);
+    if (peerlink_mutant == PL_MUT_RDMA_SEQBUMP)
+        c->seq_out++; /* planted bug: HELLO/READY consumes a stream seq number */
+}
+
+static int conn_msg(void *arg, const struct pl_msg *m);
+
+static int up_switch_to_rdma(struct conn *c, int send_go)
+{
+    if (c->wb.len != c->wb.off) {
+        c->dead = 1;
+        return -1;
+    }
+    c->wb.off = c->wb.len = 0;
+    plr_conn_set_anchor(c->up_conn, c->t);
+    c->t = c->up_t;
+    c->up_t = NULL;
+    c->up_conn = NULL;
+    c->up_state = UP_IDLE;
+    c->up_ready_at = 0;
+    c->next_reoffer_ns = 0;
+    c->rdma_settled_ns = now_ns();
+    c->rdma_stable_reset = 0;
+    if (c->up_wb.len > c->up_wb.off)
+        put(&c->wb, c->up_wb.p + c->up_wb.off, c->up_wb.len - c->up_wb.off);
+    buf_free(&c->up_wb);
+    if (send_go)
+        send_ctl_now(c, PLT_RDMA_GO, "", 0);
+    conn_settle(c, 1);
+    if (c->up_rb.len > c->up_rb.off) {
+        size_t nl = c->up_rb.len - c->up_rb.off;
+        uint8_t *tmp = malloc(nl);
+        if (!tmp)
+            oom();
+        memcpy(tmp, c->up_rb.p + c->up_rb.off, nl);
+        buf_free(&c->up_rb);
+        int fr = pl_reader_feed(c->rd, tmp, nl, conn_msg, c);
+        free(tmp);
+        if (fr != 0) {
+            c->dead = 1;
+            return -1;
+        }
+    } else {
+        buf_free(&c->up_rb);
+    }
+    return 0;
+}
+
+static int up_handle_offer(struct conn *c, const struct pl_msg *m)
+{
+    if (c->l->dialed || (c->up_state != UP_A_WAIT_OFFER && !(c->up_state == UP_IDLE && !c->on_rdma)))
+        return -1;
+    int decl = 0;
+    struct plr_ep peer_ep;
+    struct plr_pool *pool = NULL;
+    if (c->rcfg.mode == PL_RDMA_OFF)
+        decl = PL_RDMA_DECL_OFF;
+    else if (c->rcfg.test_not_built)
+        decl = PL_RDMA_DECL_NOT_BUILT;
+#ifndef TSDB_RDMA
+    else if (c->rcfg.npools <= 0)
+        decl = PL_RDMA_DECL_NOT_BUILT;
+#endif
+    else if (!(c->rcfg.kinds & (1u << c->l->kind)))
+        decl = PL_RDMA_DECL_KIND;
+    else if (c->rcfg.npools <= 0)
+        decl = PL_RDMA_DECL_POOL;
+    else if (plr_ep_decode(&peer_ep, m->data, m->data_len) != 0)
+        decl = PL_RDMA_DECL_BAD;
+    else {
+        for (int i = 0; i < c->rcfg.npools && !pool; i++)
+            if (c->rcfg.pools[i] && plr_port_subnet_match(plr_pool_port(c->rcfg.pools[i]), &peer_ep))
+                pool = c->rcfg.pools[i];
+        if (!pool)
+            decl = PL_RDMA_DECL_SUBNET;
+    }
+    if (!decl) {
+        char err[256];
+        struct plr_conn *conn = plr_conn_new(pool, err, sizeof err);
+        if (!conn) {
+            fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
+            decl = PL_RDMA_DECL_POOL;
+        } else if (plr_conn_start_opt(conn, &peer_ep, c->rcfg.sl[c->l->kind], c->rcfg.poll_us, err, sizeof err) != 0) {
+            fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
+            plr_conn_free(conn);
+            decl = PL_RDMA_DECL_QP;
+        } else {
+            struct plr_ep my_ep;
+            uint8_t ep_bytes[PLR_EP_LEN];
+            plr_conn_ep(conn, &my_ep);
+            plr_ep_encode(&my_ep, ep_bytes);
+            c->up_conn = conn;
+            c->up_t = plr_conn_transport(conn, NULL);
+            c->up_peer_seq = c->rd->seq - 1; /* seq of RDMA_OFFER */
+            c->up_nonce = m->a;
+            c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
+            send_ctl_now(c, PLT_RDMA_ACCEPT, ep_bytes, sizeof ep_bytes);
+            uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
+            c->up_deadline = now_ns() + atmo;
+            c->up_state = UP_A_WAIT_HELLO;
+            return 0;
+        }
+    }
+    uint8_t r = (uint8_t)decl;
+    send_ctl_now(c, PLT_RDMA_DECLINE, &r, 1);
+    c->up_state = UP_IDLE;
+    conn_settle(c, 0);
+    return 0;
+}
+
+static int up_handle_accept(struct conn *c, const struct pl_msg *m)
+{
+    if (c->up_state == UP_IDLE && c->up_aborted_wait) {
+        c->up_aborted_wait = 0; /* late ACCEPT racing with dialer's timeout ABORT */
+        return 0;
+    }
+    if (!c->l->dialed || c->up_state != UP_D_WAIT_ACCEPT || !c->up_conn)
+        return -1;
+    struct plr_ep peer_ep;
+    char err[256];
+    if (plr_ep_decode(&peer_ep, m->data, m->data_len) != 0) {
+        up_dial_abort(c, PL_RDMA_FB_BAD, 1);
+        return 0;
+    }
+    if (__atomic_load_n(&peerlink_test_rdma_abort_before_hello, __ATOMIC_RELAXED)) {
+        up_dial_abort(c, PL_RDMA_FB_QP, 1);
+        return 0;
+    }
+    if (plr_conn_start_opt(c->up_conn, &peer_ep, c->rcfg.sl[c->l->kind], c->rcfg.poll_us, err, sizeof err) != 0) {
+        fprintf(stderr, "peerlink: rdma: dial: %s\n", err);
+        up_dial_abort(c, PL_RDMA_FB_QP, 1);
+        return 0;
+    }
+    c->up_t = plr_conn_transport(c->up_conn, NULL);
+    c->up_peer_seq = c->rd->seq - 1; /* seq of RDMA_ACCEPT */
+    up_encode_qp_probe(c, PLT_RDMA_HELLO, c->up_self_seq, c->up_nonce);
+    c->up_fail_after_hello = __atomic_load_n(&peerlink_test_rdma_fail_after_hello, __ATOMIC_RELAXED);
+    c->up_state = UP_D_WAIT_READY;
+    return 0;
+}
+
+static int up_handle_decline(struct conn *c, const struct pl_msg *m)
+{
+    if (c->up_state == UP_IDLE && c->up_aborted_wait) {
+        c->up_aborted_wait = 0; /* late DECLINE racing with dialer's timeout ABORT */
+        return 0;
+    }
+    if (!c->l->dialed || c->up_state != UP_D_WAIT_ACCEPT)
+        return -1;
+    uint8_t reason = (uint8_t)m->a;
+    int final = reason == PL_RDMA_DECL_NOT_BUILT || reason == PL_RDMA_DECL_OFF || reason == PL_RDMA_DECL_KIND;
+    int fb = reason == PL_RDMA_DECL_NOT_BUILT ? PL_RDMA_FB_NOT_BUILT
+             : reason == PL_RDMA_DECL_OFF     ? PL_RDMA_FB_OFF
+             : reason == PL_RDMA_DECL_KIND    ? PL_RDMA_FB_KIND
+             : reason == PL_RDMA_DECL_SUBNET  ? PL_RDMA_FB_SUBNET
+             : reason == PL_RDMA_DECL_POOL    ? PL_RDMA_FB_POOL
+             : reason == PL_RDMA_DECL_QP      ? PL_RDMA_FB_QP
+                                              : PL_RDMA_FB_BAD;
+    up_cleanup(c);
+    if (final) {
+        fb_count(fb);
+        c->rdma_final_decline = 1;
+        if (c->rcfg.mode == PL_RDMA_ON) {
+            fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s declined (%s): ending connection\n",
+                    c->keys.peer, kname_tab[c->l->kind], peerlink_rdma_fb_name(fb));
+            c->up_state = UP_IDLE;
+            c->dead = 1;
+            return 0;
+        }
+        c->up_state = UP_IDLE;
+        c->next_reoffer_ns = 0;
+        conn_settle(c, 0);
+        return 0;
+    }
+    up_dial_abort(c, fb, 0); /* no ABORT needed after peer's DECLINE */
+    return 0;
+}
+
+static int up_handle_abort(struct conn *c)
+{
+    if (c->l->dialed ||
+        (c->up_state != UP_A_WAIT_OFFER && c->up_state != UP_A_WAIT_HELLO && c->up_state != UP_A_WAIT_GO))
+        return -1;
+    up_cleanup(c);
+    c->up_state = UP_IDLE;
+    conn_settle(c, 0);
+    return 0;
+}
+
+/* Parses upgrade frames (RDMA_HELLO, RDMA_READY, RDMA_GO) arriving on c->up_t in c->up_rb. */
+static int up_feed_qp(struct conn *c)
+{
+    size_t cl = pl_check_len(c->keys.in.type);
+    while (c->up_state != UP_IDLE && c->up_rb.len - c->up_rb.off >= 4) {
+        const uint8_t *at = c->up_rb.p + c->up_rb.off;
+        uint32_t len = le32(at);
+        if (len < 1 + cl || len > WIRE_MAX)
+            return -1;
+        if (c->up_rb.len - c->up_rb.off - 4 < len)
+            break;
+        const uint8_t *f = at + 4;
+        size_t body = len - cl;
+        uint8_t type = f[0];
+        int is_probe = (c->up_state == UP_A_WAIT_HELLO && type == PLT_RDMA_HELLO) ||
+                       (c->up_state == UP_D_WAIT_READY && type == PLT_RDMA_READY);
+        int is_go = (c->up_state == UP_A_WAIT_GO && type == PLT_RDMA_GO);
+        if (!is_probe && !is_go)
+            return -1;
+        uint64_t seq = is_probe ? c->up_peer_seq : c->rd->seq++;
+        int verify = cl && peerlink_mutant != PL_MUT_NOTAG;
+        size_t cmp = peerlink_mutant == PL_MUT_HALFCMP ? cl / 2 : cl;
+        uint8_t t[PL_CHECK_LEN_MAX];
+        if (verify && c->keys.in.type == PL_CHECK_FULL) {
+            frame_check(&c->keys.in, seq, len, f, body, NULL, 0, NULL, 0, t);
+            if (!tsdb_ct_equal(t, f + body, cmp))
+                return -1;
+        }
+        struct pl_msg m;
+        uint8_t *own = NULL;
+        if (pl_msg_decode(type, f + 1, body - 1, &m, &own) != 0)
+            return -1;
+        if (verify && c->keys.in.type == PL_CHECK_HEADER) {
+            frame_check(&c->keys.in, seq, len, f, body, m.p, m.n, NULL, 0, t);
+            if (!tsdb_ct_equal(t, f + body, cmp)) {
+                free(own);
+                return -1;
+            }
+        }
+        c->up_rb.off += 4 + (size_t)len;
+        if (is_probe) {
+            uint8_t want_mac[32];
+            up_rdma_mac(c->keys.rdma_key, type, c->up_peer_seq, c->up_nonce, want_mac);
+            int auth_ok = m.a == c->up_nonce && tsdb_ct_equal(want_mac, m.data, 32);
+            free(own);
+            if (!auth_ok && peerlink_mutant != PL_MUT_RDMA_NOAUTH) {
+                fprintf(stderr, "peerlink: rdma: %s authentication or nonce mismatch: refusing upgrade\n",
+                        type == PLT_RDMA_HELLO ? "RDMA_HELLO" : "RDMA_READY");
+                if (c->up_state == UP_D_WAIT_READY) {
+                    up_dial_abort(c, PL_RDMA_FB_AUTH, 1);
+                    return 0;
+                }
+                return -1;
+            }
+            if (c->up_state == UP_A_WAIT_HELLO) {
+                int hold_ms = __atomic_load_n(&peerlink_test_rdma_hold_ready_ms, __ATOMIC_RELAXED);
+                if (hold_ms > 0) {
+                    c->up_ready_at = now_ns() + (uint64_t)hold_ms * MS;
+                    c->up_state = UP_A_WAIT_GO;
+                } else {
+                    up_encode_qp_probe(c, PLT_RDMA_READY, c->up_self_seq, c->up_nonce);
+                    c->up_state = UP_A_WAIT_GO;
+                    if (peerlink_mutant == PL_MUT_RDMA_SETTLEREADY)
+                        return up_switch_to_rdma(c, 0); /* planted bug: settles on READY instead of GO */
+                }
+            } else { /* UP_D_WAIT_READY */
+                if (__atomic_load_n(&peerlink_test_rdma_skip_go, __ATOMIC_RELAXED)) {
+                    c->up_deadline = now_ns() + 15000ull * MS; /* test: wait so acceptor's 4 s timeout fires */
+                    return 0;
+                }
+                return up_switch_to_rdma(c, 1);
+            }
+        } else { /* UP_A_WAIT_GO: RDMA_GO arrived */
+            free(own);
+            return up_switch_to_rdma(c, 0);
+        }
+    }
+    return 0;
 }
 
 static void send_done(struct conn *c, uint64_t file, int32_t status)
@@ -1647,6 +2418,14 @@ static int conn_msg(void *arg, const struct pl_msg *m)
         job_done(pl, q, m->status, c->jsent);
         return 0;
     }
+    case PLT_RDMA_OFFER:
+        return up_handle_offer(c, m);
+    case PLT_RDMA_ACCEPT:
+        return up_handle_accept(c, m);
+    case PLT_RDMA_DECLINE:
+        return up_handle_decline(c, m);
+    case PLT_RDMA_ABORT:
+        return up_handle_abort(c);
     default:
         return -1;
     }
@@ -1745,6 +2524,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
 {
     struct peerlink *pl = l->pl;
     struct conn c = {.l = l, .pl = pl, .t = t, .my_seq = my_seq, .keys = *keys};
+    rdma_cfg_get(pl, &c.rcfg);
     c.zc = ZSTD_createCCtx();
     /* the reader checks the tags with the key the peer's frames carry: our `in` */
     c.rd = calloc(1, sizeof *c.rd);
@@ -1755,30 +2535,39 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     if (!rbuf)
         oom();
     drain_evfd(l);
-    pthread_mutex_lock(&l->mu);
-    l->up = 1;
-    l->gen++;
-    c.gen = l->gen;
-    l->io_thr = pthread_self();
-    l->io_set = 1;
-    atomic_store(&l->peer, keys->peer);
-    atomic_store(&l->check, keys->out.type);
-    pthread_mutex_unlock(&l->mu);
-    ST(pl, connects, 1);
-    if (keys->out.type >= 1 && keys->out.type <= 3)
-        ST(pl, up_check[keys->out.type], 1);
-    up_count(l->kind, keys->out.type, 1);
-    if (pl->cfg.on_link)
-        pl->cfg.on_link(pl->cfg.arg, l, 1);
-    pthread_mutex_lock(&l->mu);
-    l->open = 1; /* the driver's own threads may send from here on (their frames follow on_link's) */
-    pthread_mutex_unlock(&l->mu);
     c.last_rx = c.last_ping = now_ns();
+    /* Decide initial RDMA upgrade state before calling on_link(up) (design-rdma.md §5.1):
+     * - dialer with keys->try_rdma: send RDMA_OFFER, settle only at decision (GO or ABORT/DECLINE)
+     * - dialer in mode ON that cannot offer (e.g. peer lacks PL_CAP_RDMA or no pool): end connection
+     * - acceptor whose peer set PL_CAP_RDMA_TRY: wait in UP_A_WAIT_OFFER for OFFER/ABORT before on_link(up)
+     * - otherwise: settle on TCP immediately and call on_link(up) now */
+    if (l->dialed && keys->try_rdma) {
+        up_dial_start_offer(&c, 1);
+    } else if (l->dialed && c.rcfg.mode == PL_RDMA_ON && (c.rcfg.kinds & (1u << l->kind))) {
+        int fb = !(keys->peer_caps & PL_CAP_RDMA) ? PL_RDMA_FB_NOT_BUILT
+                 : c.rcfg.npools <= 0             ? PL_RDMA_FB_POOL
+                                                  : PL_RDMA_FB_BACKOFF;
+        fb_count(fb);
+        fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s cannot upgrade (%s): ending connection\n",
+                keys->peer, kname_tab[l->kind], peerlink_rdma_fb_name(fb));
+        c.dead = 1;
+    } else if (!l->dialed && keys->try_rdma) {
+        uint64_t otmo = (uint64_t)(c.rcfg.offer_timeout_ms ? c.rcfg.offer_timeout_ms : 2000u) * MS;
+        c.up_deadline = c.last_rx + otmo;
+        c.up_state = UP_A_WAIT_OFFER;
+    } else {
+        if (l->dialed && c.rcfg.mode == PL_RDMA_AUTO && c.rcfg.npools > 0 && (c.rcfg.kinds & (1u << l->kind)) &&
+            (keys->peer_caps & PL_CAP_RDMA) && l->rdma_until_ns && c.last_rx < l->rdma_until_ns)
+            fb_count(PL_RDMA_FB_BACKOFF);
+        up_schedule_reoffer(&c, c.last_rx);
+        conn_settle(&c, 0);
+    }
     uint64_t ping_ns = (uint64_t)(pl->cfg.ping_ms ? pl->cfg.ping_ms : 1000) * MS;
     uint64_t dead_ns = (uint64_t)(pl->cfg.dead_ms ? pl->cfg.dead_ms : 5000) * MS;
     int poll_cap = (int)(ping_ns / MS / 2);
     if (poll_cap < 10)
         poll_cap = 10;
+    int reset_seen = 0;
 
     while (!c.dead && !atomic_load(&pl->closing) && !atomic_load(&l->stopped)) {
         pthread_mutex_lock(&pl->mu);
@@ -1788,7 +2577,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             break;
         uint64_t now = now_ns();
         pthread_mutex_lock(&l->mu);
-        int reset = l->reset_gen == c.gen;
+        int reset = c.settled && l->reset_gen == c.gen;
         struct qf *expired = l->qdl_min && l->qdl_min <= now ? q_expire(l, now) : NULL;
         pthread_mutex_unlock(&l->mu);
         while (expired) {
@@ -1798,55 +2587,101 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             expired = nx;
         }
         if (reset) {
+            reset_seen = 1;
             ST(pl, drops, 1);
             break;
         }
-        /* queued frames of the driver */
-        while (c.wb.len - c.wb.off < WB_HIGH) {
-            pthread_mutex_lock(&l->mu);
-            struct qf *f = l->qh;
-            if (f) {
-                l->qh = f->next;
-                if (!l->qh)
-                    l->qt = NULL;
-                l->qbytes -= f->n + 48;
-                pthread_cond_broadcast(&l->cv);
+        /* Staying on RDMA for stable_ms (60 s) resets the per-(peer, kind) failure count (design-rdma.md §5.3). */
+        if (c.on_rdma && l->dialed && !c.rdma_stable_reset) {
+            uint64_t stab = (uint64_t)(c.rcfg.stable_ms ? c.rcfg.stable_ms : 60000u) * MS;
+            if (now - c.rdma_settled_ns >= stab) {
+                if (l->rdma_backed_off)
+                    fprintf(stderr, "peerlink: rdma: peer %" PRIu32 " kind %s stable on RDMA: backoff reset\n",
+                            c.keys.peer, kname_tab[l->kind]);
+                l->rdma_fails = 0;
+                l->rdma_backoff_ns = 0;
+                l->rdma_until_ns = 0;
+                l->rdma_backed_off = 0;
+                c.rdma_stable_reset = 1;
             }
-            pthread_mutex_unlock(&l->mu);
-            if (!f)
-                break;
-            if (f->tracked && f->deadline && f->deadline <= now) {
-                sent_cb(&c, f->token, 0);
-                free(f);
-                continue;
-            }
-            size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
-            frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, l->kind != PL_KIND_BULK, f->type, f->p, f->n);
-            if (f->tracked) {
-                if (c.trk_n == c.trk_cap) {
-                    if (c.trk_h) {
-                        memmove(c.trk, c.trk + c.trk_h, (c.trk_n - c.trk_h) * sizeof *c.trk);
-                        c.trk_n -= c.trk_h;
-                        c.trk_h = 0;
-                    } else {
-                        c.trk_cap = c.trk_cap ? c.trk_cap * 2 : 64;
-                        c.trk = realloc(c.trk, c.trk_cap * sizeof *c.trk);
-                        if (!c.trk)
-                            oom();
-                    }
-                }
-                c.trk[c.trk_n++] = (struct trk){f->token, c.wdone + pend0, c.wdone + (c.wb.len - c.wb.off)};
-            }
-            ST(pl, frames_out, 1);
-            ST(pl, bytes_out, c.wb.len - before);
-            ST(pl, raw_out, f->n);
-            free(f);
         }
-        job_start(&c);
-        if (c.hp.active)
-            hash_step(&c);
+        /* Upgrade timers: delayed READY (test hook), dialer 2 s timeout, acceptor 4 s timeout, live re-offer. */
+        if (c.up_state == UP_A_WAIT_GO && c.up_ready_at && now >= c.up_ready_at) {
+            c.up_ready_at = 0;
+            if (c.up_t) {
+                up_encode_qp_probe(&c, PLT_RDMA_READY, c.up_self_seq, c.up_nonce);
+                if (peerlink_mutant == PL_MUT_RDMA_SETTLEREADY)
+                    up_switch_to_rdma(&c, 0);
+            }
+        }
+        if (c.up_state != UP_IDLE && now >= c.up_deadline) {
+            if (c.up_state == UP_D_WAIT_ACCEPT || c.up_state == UP_D_WAIT_READY) {
+                up_dial_abort(&c, PL_RDMA_FB_TIMEOUT, 1);
+            } else {
+                fprintf(stderr, "peerlink: rdma: acceptor timed out waiting for peer %" PRIu32 " kind %s: closing\n",
+                        c.keys.peer, kname_tab[l->kind]);
+                c.dead = 1;
+            }
+            if (c.dead)
+                break;
+        }
+        if (c.up_state == UP_IDLE && c.settled && !c.on_rdma && c.next_reoffer_ns && now >= c.next_reoffer_ns) {
+            c.next_reoffer_ns = 0;
+            if (dial_can_try_rdma(l, &c.rcfg, now))
+                up_dial_start_offer(&c, 0);
+            else
+                up_schedule_reoffer(&c, now);
+            if (c.dead)
+                break;
+        }
+        /* queued frames of the driver (held in l->qh while an upgrade is in flight: §5.1) */
+        if (c.up_state == UP_IDLE && c.settled) {
+            while (c.wb.len - c.wb.off < WB_HIGH) {
+                pthread_mutex_lock(&l->mu);
+                struct qf *f = l->qh;
+                if (f) {
+                    l->qh = f->next;
+                    if (!l->qh)
+                        l->qt = NULL;
+                    l->qbytes -= f->n + 48;
+                    pthread_cond_broadcast(&l->cv);
+                }
+                pthread_mutex_unlock(&l->mu);
+                if (!f)
+                    break;
+                if (f->tracked && f->deadline && f->deadline <= now) {
+                    sent_cb(&c, f->token, 0);
+                    free(f);
+                    continue;
+                }
+                size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
+                frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, l->kind != PL_KIND_BULK, f->type, f->p, f->n);
+                if (f->tracked) {
+                    if (c.trk_n == c.trk_cap) {
+                        if (c.trk_h) {
+                            memmove(c.trk, c.trk + c.trk_h, (c.trk_n - c.trk_h) * sizeof *c.trk);
+                            c.trk_n -= c.trk_h;
+                            c.trk_h = 0;
+                        } else {
+                            c.trk_cap = c.trk_cap ? c.trk_cap * 2 : 64;
+                            c.trk = realloc(c.trk, c.trk_cap * sizeof *c.trk);
+                            if (!c.trk)
+                                oom();
+                        }
+                    }
+                    c.trk[c.trk_n++] = (struct trk){f->token, c.wdone + pend0, c.wdone + (c.wb.len - c.wb.off)};
+                }
+                ST(pl, frames_out, 1);
+                ST(pl, bytes_out, c.wb.len - before);
+                ST(pl, raw_out, f->n);
+                free(f);
+            }
+            job_start(&c);
+            if (c.hp.active)
+                hash_step(&c);
+        }
         uint64_t bwait = 0;
-        if (c.job && c.jstate == J_SEND) {
+        if (c.up_state == UP_IDLE && c.settled && c.job && c.jstate == J_SEND) {
             if (c.throttle_until <= now)
                 bwait = job_send(&c);
             else
@@ -1855,8 +2690,8 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 c.throttle_until = now + bwait;
         }
         int paused = atomic_load(&l->paused), pfresh = paused && peerlink_mutant != PL_MUT_PAUSEDEAD;
-        if (c.stalled)
-            c.last_rx = now; /* the peer's window is shut with our bytes waiting: it is slow, not silent */
+        if (c.stalled || c.up_state != UP_IDLE)
+            c.last_rx = now; /* held back, or an upgrade has its own deadline (2 s / 4 s) */
         if (pfresh)
             c.last_rx = now; /* we do not read: the peer's silence is ours (its PINGs wait in the socket) */
         if (now - c.last_rx > dead_ns) {
@@ -1864,7 +2699,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             break;
         }
         /* paused, we still PING on our own clock: the peer hears from us and does not count us dead */
-        if ((pfresh || now - c.last_rx > ping_ns) && now - c.last_ping > ping_ns) {
+        if (c.up_state == UP_IDLE && c.settled && (pfresh || now - c.last_rx > ping_ns) && now - c.last_ping > ping_ns) {
             send_ctl(&c, PLT_PING, "", 0);
             c.last_ping = now;
         }
@@ -1889,6 +2724,30 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         if (c.wb.off == c.wb.len)
             c.wb.off = c.wb.len = 0;
         c.stalled = c.wb.len > c.wb.off;
+        /* Write upgrade probe frames (RDMA_HELLO / RDMA_READY) to the candidate QP transport */
+        while (c.up_t && c.up_wb.len > c.up_wb.off && !c.dead) {
+            struct iovec iv = {c.up_wb.p + c.up_wb.off, c.up_wb.len - c.up_wb.off};
+            ssize_t w = c.up_t->ops->writev(c.up_t, &iv, 1);
+            if (w < 0 && errno == EINTR)
+                continue;
+            if (w < 0 && errno == EAGAIN)
+                break;
+            if (w <= 0) {
+                if (c.up_state == UP_D_WAIT_READY)
+                    up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
+                else
+                    up_cleanup(&c); /* acceptor keeps waiting on TCP for ABORT until 4 s deadline */
+                break;
+            }
+            c.up_wb.off += (size_t)w;
+        }
+        if (c.up_wb.off == c.up_wb.len)
+            c.up_wb.off = c.up_wb.len = 0;
+        if (c.up_state == UP_D_WAIT_READY && c.up_fail_after_hello && c.up_wb.len == c.up_wb.off) {
+            /* test hook: RDMA_HELLO was posted on the QP; now fall back to TCP via RDMA_ABORT */
+            c.up_fail_after_hello = 0;
+            up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
+        }
         if (c.dead)
             break;
         int tmo = poll_cap;
@@ -1896,10 +2755,27 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             tmo = (int)(bwait / MS) + 1;
         /* a file with more to send, not held by the bucket, and nothing left to write: fill the buffer again at
          * once (with data in the buffer the POLLOUT below wakes us when the socket drains) */
-        if (c.wb.len == c.wb.off && (full || (!bwait && c.job && c.jstate == J_SEND)))
+        if (c.up_state == UP_IDLE && c.settled && c.wb.len == c.wb.off &&
+            (full || (!bwait && c.job && c.jstate == J_SEND)))
             tmo = 0;
-        if (c.hp.active && !c.dead)
+        if (c.up_state == UP_IDLE && c.settled && c.hp.active && !c.dead)
             tmo = 0; /* the next megabyte of a prefix */
+        if (c.up_state != UP_IDLE) {
+            uint64_t t = now_ns();
+            int d = c.up_deadline <= t ? 0 : (int)((c.up_deadline - t) / MS) + 1;
+            if (d < tmo)
+                tmo = d;
+            if (c.up_ready_at) {
+                int r = c.up_ready_at <= t ? 0 : (int)((c.up_ready_at - t) / MS) + 1;
+                if (r < tmo)
+                    tmo = r;
+            }
+        } else if (c.settled && !c.on_rdma && c.next_reoffer_ns) {
+            uint64_t t = now_ns();
+            int d = c.next_reoffer_ns <= t ? 0 : (int)((c.next_reoffer_ns - t) / MS) + 1;
+            if (d < tmo)
+                tmo = d;
+        }
         pthread_mutex_lock(&l->mu);
         uint64_t qdl = l->qdl_min;
         pthread_mutex_unlock(&l->mu);
@@ -1911,25 +2787,38 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         }
         /* paused: no reading (a hangup or an error is still reported, and read); bytes left in the write buffer:
          * come back as soon as the transport takes more */
-        struct pollfd pf[PL_TR_POLL_MAX + 1];
-        int ready = 0, want = (paused ? 0 : PL_TR_IN) | (c.wb.len > c.wb.off ? PL_TR_OUT : 0);
+        struct pollfd pf[PL_TR_POLL_MAX * 2 + 1];
+        int ready = 0, want = ((paused && c.up_state == UP_IDLE) ? 0 : PL_TR_IN) | (c.wb.len > c.wb.off ? PL_TR_OUT : 0);
         int nt = c.t->ops->poll_fds(c.t, want, pf, &ready);
         if (nt < 0 || nt > PL_TR_POLL_MAX) {
             fprintf(stderr, "peerlink: the %s transport asked to poll %d descriptors (at most %d): connection ended\n",
                     c.t->ops->name, nt, PL_TR_POLL_MAX);
             break;
         }
-        pf[nt] = (struct pollfd){l->evfd, POLLIN, 0};
-        if (ready && peerlink_mutant != PL_MUT_NOREADY)
+        int nu = 0, uready = 0;
+        if (c.up_t) {
+            int uwant = PL_TR_IN | (c.up_wb.len > c.up_wb.off ? PL_TR_OUT : 0);
+            nu = c.up_t->ops->poll_fds(c.up_t, uwant, pf + nt, &uready);
+            if (nu < 0 || nu > PL_TR_POLL_MAX) {
+                nu = 0;
+                if (c.up_state == UP_D_WAIT_READY)
+                    up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
+                else
+                    up_cleanup(&c);
+            }
+        }
+        pf[nt + nu] = (struct pollfd){l->evfd, POLLIN, 0};
+        if ((ready || uready) && peerlink_mutant != PL_MUT_NOREADY)
             tmo = 0; /* the transport holds what we want already */
-        int pr = poll(pf, (nfds_t)nt + 1, tmo);
+        int pr = poll(pf, (nfds_t)(nt + nu + 1), tmo);
         if (pr < 0 && errno != EINTR)
             break;
-        if (pr <= 0 && !ready)
+        if (pr <= 0 && !ready && !uready)
             continue;
-        if (pr > 0 && (pf[nt].revents & POLLIN))
+        if (pr > 0 && (pf[nt + nu].revents & POLLIN))
             drain_evfd(l);
         int tr = ready | (pr > 0 ? c.t->ops->poll_ready(c.t, pf, nt) : 0);
+        int utr = c.up_t ? (uready | (pr > 0 && nu > 0 ? c.up_t->ops->poll_ready(c.up_t, pf + nt, nu) : 0)) : 0;
         if (tr & PL_TR_IN) {
             ssize_t r = c.t->ops->read(c.t, rbuf, READ_BUF);
             if (r > 0) {
@@ -1945,20 +2834,53 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 break;
             }
         }
+        if (c.up_t && !c.dead && (utr & PL_TR_IN)) {
+            ssize_t r = c.up_t->ops->read(c.up_t, rbuf, READ_BUF);
+            if (r > 0) {
+                put(&c.up_rb, rbuf, (size_t)r);
+                if (up_feed_qp(&c) != 0) {
+                    if (c.up_state == UP_D_WAIT_READY)
+                        up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
+                    else {
+                        ST(pl, drops, 1);
+                        break;
+                    }
+                }
+            } else if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
+                if (c.up_state == UP_D_WAIT_READY)
+                    up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
+                else
+                    up_cleanup(&c); /* acceptor waits on TCP for ABORT or 4 s timeout */
+            }
+        }
     }
+
+    /* If an RDMA connection dropped unexpectedly within stable_ms (60 s) of settling, count against backoff (§5.3). */
+    if (c.on_rdma && l->dialed && !atomic_load(&pl->closing) && !atomic_load(&l->stopped) && !reset_seen) {
+        uint64_t stab = (uint64_t)(c.rcfg.stable_ms ? c.rcfg.stable_ms : 60000u) * MS;
+        if (!c.rdma_stable_reset && now_ns() - c.rdma_settled_ns < stab)
+            up_record_fail(&c, PL_RDMA_FB_QP_ERROR);
+    }
+    up_cleanup(&c);
+    dctl_free(&c);
 
     /* the connection ended: what was in flight goes back or is told */
     rx_end(&c, PL_E_DOWN);
-    pthread_mutex_lock(&l->mu);
-    l->up = 0;
-    l->open = 0;
-    l->io_set = 0;
-    struct qf *f = l->qh;
-    l->qh = l->qt = NULL;
-    l->qbytes = 0;
-    l->qdl_min = 0;
-    pthread_cond_broadcast(&l->cv);
-    pthread_mutex_unlock(&l->mu);
+    struct qf *f = NULL;
+    if (c.settled) {
+        pthread_mutex_lock(&l->mu);
+        l->up = 0;
+        l->open = 0;
+        l->io_set = 0;
+        if (!(peerlink_mutant == PL_MUT_RDMA_KEEPQUEUE && c.on_rdma)) {
+            f = l->qh;
+            l->qh = l->qt = NULL;
+            l->qbytes = 0;
+            l->qdl_min = 0;
+        }
+        pthread_cond_broadcast(&l->cv);
+        pthread_mutex_unlock(&l->mu);
+    }
     /* the tracked frames still in wb: written if any of their bytes went (the mutant: all of them), else not; then
      * the queue, none of whose bytes went */
     for (; c.trk_h < c.trk_n; c.trk_h++) {
@@ -1992,13 +2914,17 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     }
     if (peerlink_mutant == PL_MUT_CLOSEFIRST)
         c.t->ops->close(c.t);
-    if (c.keys.out.type >= 1 && c.keys.out.type <= 3)
-        ST(pl, up_check[c.keys.out.type], (uint64_t)-1);
-    if (peerlink_mutant != PL_MUT_UPDOWNLEAK)
-        up_count(l->kind, c.keys.out.type, -1);
-    atomic_store(&l->check, 0);
-    if (pl->cfg.on_link)
-        pl->cfg.on_link(pl->cfg.arg, l, 0);
+    if (c.settled) {
+        if (c.keys.out.type >= 1 && c.keys.out.type <= 3)
+            ST(pl, up_check[c.keys.out.type], (uint64_t)-1);
+        if (peerlink_mutant != PL_MUT_UPDOWNLEAK)
+            up_count(l->kind, c.keys.out.type, -1);
+        up_tr_count(l->kind, c.on_rdma, -1);
+        atomic_store(&l->check, 0);
+        atomic_store(&l->transport, 0);
+        if (pl->cfg.on_link)
+            pl->cfg.on_link(pl->cfg.arg, l, 0);
+    }
     if (peerlink_mutant != PL_MUT_CLOSEFIRST)
         c.t->ops->close(c.t); /* last (pltransport.h): the driver saw the down before a verbs transport's slots go */
     pl_reader_free(c.rd);

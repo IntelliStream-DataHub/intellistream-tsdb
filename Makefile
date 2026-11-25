@@ -60,7 +60,7 @@ FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users cl
 # objects a harness links besides the library (in $(B) or build-fuzz/)
 FUZZ_OBJS_users := users.o tsdb_crypto.o
 FUZZ_OBJS_props := props.o cfg.o
-FUZZ_OBJS_replframe := peerlink.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
+FUZZ_OBJS_replframe := peerlink.o plrdma.o tsdb_crypto.o replwire.o fwd.o chunksrv.o
 # the data links' frame check: inline XXH3 (server/plcheck.h, server/xxhash); whoever includes it depends on both
 PLCHECK_HDR := server/plcheck.h server/xxhash/xxhash.h
 # test_peerlink's cases that carry frames on every link kind, run again at the check levels header and full
@@ -625,7 +625,7 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	./$(B)/test_margins
 	$(MUT) --name test_margins --list "marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
-	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte settleready noauth keepqueue seqbump nobackoff noipoib" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_replwire
 	$(MUT) --name test_replwire --list "checknocmp checkshort" -- ./$(B)/test_replwire --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
@@ -693,7 +693,7 @@ $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuz
 	    $(PLAT_FUZZ_LDFLAGS)
 $(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
-$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h $(PLCHECK_HDR) server/replwire.h server/fwd.h server/chunksrv.h
+$(B)/fuzz-replframe: $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(B)/replwire.o $(B)/fwd.o $(B)/chunksrv.o server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/replwire.h server/fwd.h server/chunksrv.h
 $(B)/fuzz-props: $(CFG_OBJ) server/tsdbd_keys.h tools/cfg.h tools/props.h
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
@@ -710,7 +710,7 @@ $(FUZZ_B)/libtsdb.a: FORCE
 	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
 	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
-	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/replwire.o $(FUZZ_B)/fwd.o \
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o $(FUZZ_B)/props.o $(FUZZ_B)/cfg.o $(FUZZ_B)/peerlink.o $(FUZZ_B)/plrdma.o $(FUZZ_B)/replwire.o $(FUZZ_B)/fwd.o \
 	    $(FUZZ_B)/chunksrv.o
 
 # the driver is built without coverage: it holds the hook
@@ -1028,8 +1028,8 @@ $(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/pe
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
 # frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
-$(B)/peerlink.o: server/peerlink.c server/peerlink.h server/pltransport.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h | $(B)
-	$(CC) $(CFLAGS) -Iclient -c -o $@ $<
+$(B)/peerlink.o: server/peerlink.c server/peerlink.h server/pltransport.h server/plrdma.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h $(B)/rdma.flags | $(B)
+	$(CC) $(CFLAGS) $(RDMA_FLAGS) -Iclient -c -o $@ $<
 # the verbs transport under peerlink (plrdma.h): no verbs header, every verb through struct plr_ops
 $(B)/plrdma.o: server/plrdma.c server/plrdma.h server/pltransport.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -1084,8 +1084,8 @@ $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h
 $(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
-$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the replication driver's check (server/replwire.h, rd-drvcheck)
 $(B)/test_replwire: tests/test_replwire.c $(B)/replwire.o server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ $< $(B)/replwire.o
@@ -1177,7 +1177,7 @@ R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h ser
           server/margins.h
 # r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
 CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
-TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
@@ -1465,12 +1465,12 @@ $(B)/test_tier: tests/test_tier.c src/internal.h src/ecgc.h src/tier.h src/chunk
 
 # the chunk server through a fake link and two real peerlinks: puts, reads, fences, unsure stores, store binding, power
 # loss in a put (crashfs); mutants must fail it
-$(B)/test_chunksrv: tests/test_chunksrv.c server/chunksrv.h src/chunk.h src/chunk_priv.h $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
-	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ $< $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_chunksrv: tests/test_chunksrv.c server/chunksrv.h src/chunk.h src/chunk_priv.h $(B)/chunksrv.o $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
+	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ $< $(B)/chunksrv.o $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # the cold ops of a cluster ec volume against six in-process chunk servers (a fake transport); mutants must fail it
-$(B)/test_chunkpeer: tests/test_chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -Iinclude -o $@ $< $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_chunkpeer: tests/test_chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -Iinclude -o $@ $< $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/plrdma.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
 # boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it

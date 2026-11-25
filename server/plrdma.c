@@ -22,6 +22,12 @@
 int plrdma_mutant;
 int plrdma_drain_ms = PLR_DRAIN_MS;
 
+static _Atomic uint64_t g_credit_stalls;
+static _Atomic uint64_t g_rnr_retries;
+static _Atomic uint64_t g_qp_errors;
+
+#define GST_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
+
 enum { MSG_DATA = 1, MSG_CREDIT = 2 };
 enum { WR_RECV = 1, WR_SEND = 2, WR_MARK = 3 };
 #define WR(kind, i) (((uint64_t)(kind) << 32) | (uint32_t)(i))
@@ -75,6 +81,7 @@ struct plr_conn {
     int err, ended, want, ak;
     unsigned marks;
     struct pl_transport *anchor;
+    uint32_t poll_us; /* busy-poll CQ before sleeping (cluster.peer.rdma.poll_us) */
     uint64_t ahead, done_unrep; /* PLR_MUT_WRITTENCQE */
     struct plr_conn_stats st;
 };
@@ -314,6 +321,10 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
         c->s_head = (uint16_t)((c->s_head + k) % c->S);
         c->s_n = (uint16_t)(c->s_n - k);
         if (w->status != PLR_WC_OK && !closing && !c->err) {
+            if (w->status == PLR_WC_ERR)
+                GST_INC(g_qp_errors);
+            if (w->rnr)
+                GST_INC(g_rnr_retries);
             fprintf(stderr, "peerlink: rdma: a send completed with status %d (provider %d): connection ended\n",
                     w->status, w->vendor);
             fail(c, w->status == PLR_WC_FLUSH ? ECONNRESET : EIO);
@@ -328,9 +339,14 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
     if (closing)
         return;
     if (w->status != PLR_WC_OK) {
-        if (!c->err)
+        if (!c->err) {
+            if (w->status == PLR_WC_ERR)
+                GST_INC(g_qp_errors);
+            if (w->rnr)
+                GST_INC(g_rnr_retries);
             fprintf(stderr, "peerlink: rdma: a receive completed with status %d (provider %d): connection ended\n",
                     w->status, w->vendor);
+        }
         fail(c, w->status == PLR_WC_FLUSH ? ECONNRESET : EIO);
         return;
     }
@@ -498,7 +514,10 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
     }
     while (pos < total && !c->err) {
         if ((c->cr_data <= 0 && plrdma_mutant != PLR_MUT_NOCREDIT) || c->s_n >= c->S) {
-            ST_ADD(c, stalls, c->cr_data <= 0);
+            if (c->cr_data <= 0) {
+                ST_ADD(c, stalls, 1);
+                GST_INC(g_credit_stalls);
+            }
             break;
         }
         uint32_t k = (uint32_t)(total - pos < c->room ? total - pos : c->room);
@@ -555,12 +574,24 @@ static void anchor_check(struct plr_conn *c)
         fail(c, errno);
 }
 
+static uint64_t mono_ns_rdma(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
 static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int *ready)
 {
     struct plr_conn *c = (struct plr_conn *)t;
     c->want = want;
     if (!c->err) {
         pump(c, 0);
+        if (c->poll_us && (want & PL_TR_IN) && !c->rq_n && !c->err && !c->ended) {
+            uint64_t until = mono_ns_rdma() + (uint64_t)c->poll_us * 1000ull;
+            while (!c->rq_n && !c->err && !c->ended && mono_ns_rdma() < until)
+                pump(c, 0);
+        }
         if (c->ops->arm(c->qp) < 0)
             fail(c, errno);
         if (plrdma_mutant != PLR_MUT_NOREARM)
@@ -568,14 +599,17 @@ static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int 
         maybe_credit(c);
     }
     pf[0] = (struct pollfd){c->ops->fd(c->qp), POLLIN, 0};
-    int ar = 0;
-    c->ak = c->anchor->ops->poll_fds(c->anchor, PL_TR_IN, pf + 1, &ar);
-    if (c->ak < 0 || c->ak > PL_TR_POLL_MAX - 1) {
-        fail(c, EPROTO);
-        c->ak = 0;
+    c->ak = 0;
+    if (c->anchor) {
+        int ar = 0;
+        c->ak = c->anchor->ops->poll_fds(c->anchor, PL_TR_IN, pf + 1, &ar);
+        if (c->ak < 0 || c->ak > PL_TR_POLL_MAX - 1) {
+            fail(c, EPROTO);
+            c->ak = 0;
+        }
+        if (ar & PL_TR_IN)
+            anchor_check(c);
     }
-    if (ar & PL_TR_IN)
-        anchor_check(c);
     *ready = ready_mask(c, want);
     return 1 + c->ak;
 }
@@ -589,7 +623,7 @@ static int rd_poll_ready(struct pl_transport *t, const struct pollfd *pf, int k)
         pump(c, 0);
         maybe_credit(c);
     }
-    if (k > 1 && (c->anchor->ops->poll_ready(c->anchor, pf + 1, k - 1) & PL_TR_IN))
+    if (c->anchor && k > 1 && (c->anchor->ops->poll_ready(c->anchor, pf + 1, k - 1) & PL_TR_IN))
         anchor_check(c);
     return ready_mask(c, c->want);
 }
@@ -748,7 +782,17 @@ void plr_conn_ep(const struct plr_conn *c, struct plr_ep *o)
     o->ctl = c->K;
 }
 
-int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, size_t errlen)
+int plr_port_subnet_match(const struct plr_port *local, const struct plr_ep *peer)
+{
+    if (!local || !peer || local->link_layer != peer->link_layer)
+        return 0;
+    if (local->link_layer == PLR_LL_IB && memcmp(local->gid, peer->gid, 8) != 0)
+        return 0;
+    return 1;
+}
+
+int plr_conn_start_opt(struct plr_conn *c, const struct plr_ep *peer, uint8_t sl, uint32_t poll_us, char *err,
+                       size_t errlen)
 {
     const struct plr_port *pp = &c->pool->port;
     if (peer->link_layer != pp->link_layer) {
@@ -766,16 +810,18 @@ int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, siz
     a.rq_psn = peer->psn;
     a.sq_psn = c->psn;
     a.mtu = peer->mtu < pp->mtu ? peer->mtu : pp->mtu;
-    a.sl = pc->sl;
+    a.sl = sl;
     a.rnr_retry = pc->rnr_retry;
     a.retry_cnt = pc->retry_cnt;
     a.timeout = pc->timeout;
     if (c->ops->qp_rts(c->qp, &a) < 0) {
+        GST_INC(g_qp_errors);
         snprintf(err, errlen, "RDMA: connecting the queue pair to QPN %" PRIu32 " (LID %u) failed: %s", peer->qpn,
                  (unsigned)peer->lid, strerror(errno));
         return -1;
     }
     c->peer = *peer;
+    c->poll_us = poll_us;
     c->cr_data = plrdma_mutant == PLR_MUT_CROWN ? pc->data_slots : peer->data;
     c->cr_ctl = peer->ctl;
     ST_SET(c, credits, c->cr_data);
@@ -785,10 +831,20 @@ int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, siz
     return 0;
 }
 
+int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, size_t errlen)
+{
+    return plr_conn_start_opt(c, peer, c->pool->cfg.sl, 0, err, errlen);
+}
+
 struct pl_transport *plr_conn_transport(struct plr_conn *c, struct pl_transport *anchor)
 {
     c->anchor = anchor;
     return &c->t;
+}
+
+void plr_conn_set_anchor(struct plr_conn *c, struct pl_transport *anchor)
+{
+    c->anchor = anchor;
 }
 
 void plr_conn_free(struct plr_conn *c)
@@ -808,4 +864,11 @@ void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st)
     st->bytes_in = __atomic_load_n(&s->bytes_in, __ATOMIC_RELAXED);
     st->stalls = __atomic_load_n(&s->stalls, __ATOMIC_RELAXED);
     st->credits = __atomic_load_n(&s->credits, __ATOMIC_RELAXED);
+}
+
+void plr_global_stats(struct plr_global_stats *st)
+{
+    st->credit_stalls = __atomic_load_n(&g_credit_stalls, __ATOMIC_RELAXED);
+    st->rnr_retries = __atomic_load_n(&g_rnr_retries, __ATOMIC_RELAXED);
+    st->qp_errors = __atomic_load_n(&g_qp_errors, __ATOMIC_RELAXED);
 }
