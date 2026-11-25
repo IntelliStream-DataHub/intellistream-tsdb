@@ -983,6 +983,18 @@ static void rollback(void)
         tsave_drop(&files[i]);
 }
 
+/* A power cut stops the process at once without running sanitizer finalizers: _exit() is intercepted by ThreadSanitizer,
+ * whose leak report on exit turns status 99 into 66 with halt_on_error=1 (as in server/crashpt.c). */
+__attribute__((noreturn)) static void power_cut_exit(void)
+{
+#ifdef __APPLE__
+    _exit(99);
+#else
+    syscall(SYS_exit_group, 99);
+    _exit(99); /* not reached */
+#endif
+}
+
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
  * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
  * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
@@ -990,7 +1002,7 @@ static void rollback(void)
 static void on_bus(int sig)
 {
     if (power_losing)
-        _exit(99);
+        power_cut_exit();
     signal(sig, SIG_DFL); /* the instruction faults again: the default action */
 }
 
@@ -1009,7 +1021,7 @@ __attribute__((noreturn)) static void power_loss(void)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
-    _exit(99);
+    power_cut_exit();
 }
 
 /* Called with the lock held, before each tracked operation. In eio mode a
