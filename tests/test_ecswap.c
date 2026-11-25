@@ -1253,6 +1253,10 @@ static const char *const RE4 = "tsdb-intent 4 1 3\nL tmp_7_1.ec p500_1_3_2.ec\n"
                                "R p500_2_2_1.ec retired_p500_2_2_1.ec\n"
                                "R p500_3_3_0.part settled_p500_3_3_0.part\n";
 
+static const char *const RE4P = "tsdb-intent 4 1 2\nL tmp_7_1.part p500_1_2_2.part\n"
+                                "R p500_1_1_1.ec retired_p500_1_1_1.ec\n"
+                                "R p500_2_2_0.part settled_p500_2_2_0.part\n";
+
 static void reencode_recover_case(void)
 {
     char dir[PATH_MAX];
@@ -1299,7 +1303,34 @@ static void reencode_recover_case(void)
                     (const char *const[]){"p500_1_1_1.ec", "retired_p500_2_2_1.ec", "settled_p500_3_3_0.part", NULL},
                     RE4, true, dir, sizeof dir);
     CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
-    /* crafted re-encode intents: no .ec source, wrong block range, two keys, fin == src, wrong dst prefix */
+    /* Empty-.part output recovery (L tmp_*.part p*.part): torn, forward, half-renamed, rollback over dropped .ec
+     * sources, drop after swap, and damage with L missing. */
+    plant_open("re-ptorn", (const char *const[]){"tmp_7_1.part", NULL}, RE4P, false, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "tmp_7_1.part") && !exists(dir, "p500_1_2_2.part"));
+    plant_open("re-pfwd", (const char *const[]){"tmp_7_1.part", "p500_1_1_1.ec", "p500_2_2_0.part", NULL}, RE4P, true,
+               dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_2_2.part") && exists(dir, "retired_p500_1_1_1.ec") &&
+          exists(dir, "settled_p500_2_2_0.part") && !exists(dir, "tmp_7_1.part") && !exists(dir, "p500_1_1_1.ec") &&
+          !exists(dir, "p500_2_2_0.part"));
+    plant_open("re-phalf", (const char *const[]){"p500_1_2_2.part", "retired_p500_1_1_1.ec", "p500_2_2_0.part", NULL},
+               RE4P, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_2_2.part") && exists(dir, "retired_p500_1_1_1.ec") &&
+          exists(dir, "settled_p500_2_2_0.part") && !exists(dir, "p500_2_2_0.part"));
+    plant_open("re-pdropbefore",
+               (const char *const[]){"tmp_7_1.part", "retired_p500_1_1_1.ec", "retired_p500_2_2_0.part", NULL}, RE4P,
+               true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "tmp_7_1.part") && !exists(dir, "p500_1_2_2.part") &&
+          exists(dir, "retired_p500_1_1_1.ec") && exists(dir, "retired_p500_2_2_0.part"));
+    plant_open("re-pdropafter",
+               (const char *const[]){"retired_p500_1_2_2.part", "retired_p500_1_1_1.ec", "settled_p500_2_2_0.part",
+                                     NULL},
+               RE4P, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "p500_1_2_2.part") && exists(dir, "retired_p500_1_2_2.part"));
+    rc = plant_open("re-plostl", (const char *const[]){"p500_1_1_1.ec", "settled_p500_2_2_0.part", NULL}, RE4P, true,
+                    dir, sizeof dir);
+    CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
+    /* crafted re-encode intents: no .ec source, wrong block range, two keys, fin == src, wrong dst prefix,
+     * mismatched L tmp/fin extensions */
     static const char *const rbad[] = {
         "tsdb-intent 4 1 2\nL tmp_7_1.ec p500_1_2_1.ec\n"
         "R p500_1_1_0.part settled_p500_1_1_0.part\nR p500_2_2_0.part settled_p500_2_2_0.part\n",
@@ -1311,6 +1342,10 @@ static void reencode_recover_case(void)
         "tsdb-intent 4 1 1\nL tmp_7_1.ec p500_1_1_2.ec\nR p500_1_1_1.ec settled_p500_1_1_1.ec\n",
         "tsdb-intent 4 2 2\nL tmp_7_1.ec p500_1_2_2.ec\nL tmp_7_2.ec p500_1_2_3.ec\n"
         "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p500_2_2_1.ec retired_p500_2_2_1.ec\n",
+        "tsdb-intent 4 1 2\nL tmp_7_1.ec p500_1_2_2.part\n"
+        "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p500_2_2_0.part settled_p500_2_2_0.part\n",
+        "tsdb-intent 4 1 2\nL tmp_7_1.part p500_1_2_2.ec\n"
+        "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p500_2_2_0.part settled_p500_2_2_0.part\n",
     };
     for (size_t i = 0; i < sizeof rbad / sizeof *rbad; i++) {
         rc = plant_open("re-bad", (const char *const[]){"tmp_7_1.ec", "p500_1_1_1.ec", "p500_2_2_1.ec", NULL}, rbad[i],
@@ -1318,7 +1353,7 @@ static void reencode_recover_case(void)
         CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
     }
     printf("  re-encode recovery: torn, forward, half-renamed, rollback over dropped .ec sources, drop after swap, "
-           "damage and crafted intents refused\n");
+           "empty .part output, damage and crafted intents refused\n");
 }
 #endif /* TSDB_EC */
 

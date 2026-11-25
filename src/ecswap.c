@@ -72,6 +72,7 @@
  */
 #include "ecswap.h"
 #include "ecapply.h"
+#include "eccache.h"
 #include "ecdiverge.h"
 #include "eckeep.h"
 #include "ecgc.h"
@@ -533,8 +534,10 @@ static void swap_discard_reencode(eng *db, part *out)
     unlinkat(db->dirfd, out->pending, 0);
     if (ecswap_discard_hook)
         ecswap_discard_hook(db);
-    if (!atomic_load(&out->ec))
+    struct ecpart *ep = atomic_load(&out->ec);
+    if (!ep)
         return;
+    eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
     if (eng_sync_dir(db, "fsync of the directory after removing a refused re-encode's files") != 0 &&
         settle_mutant != SETTLE_MUT_SYNCFAILGO)
         return;
@@ -678,10 +681,10 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         return rc;
     }
     if (rc != 0) {
-        pthread_mutex_unlock(&db->publish_lock);
-        free(pin_parts);
         if (!wrote_intent && rc != TSDB_ERR_NOMEM)
             swap_discard_reencode(db, out);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
         return rc;
     }
     if (!renamed) {
@@ -704,6 +707,8 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         fprintf(stderr, "tsdb: unlink of re-encode intent %s after its swap: %s (the next open rolls it forward)\n",
                 intent, strerror(errno));
     pthread_mutex_unlock(&db->publish_lock);
+    /* Re-encoded .part sources have no same-stem .ec, so eckeep's digest thread marks them ECKEEP_ORPHAN and releases
+     * them after keep_s; eng_reencode already verified ec_logical_digest_frozen before swapping. */
     if (npart_src)
         eckeep_swapped(db, pin_parts, npart_src);
     free(pin_parts);
@@ -937,8 +942,9 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
             }
             if (rc == 0 && !on_l[0][0] && !on_l[0][1] && !on_l[0][2] &&
                 (any_src || ecswap_mutant == SWAP_MUT_LOSTSETTLED)) {
-                fprintf(stderr, "tsdb: settle intent %s: an .ec part is under none of its names although the swap "
-                                "renamed (%s): damage, the open fails\n", name, p.l[0].fin);
+                fprintf(stderr, "tsdb: settle intent %s: %s is under none of its names although the swap "
+                                "renamed (%s): damage, the open fails\n",
+                        name, p.l[0].is_ec ? "an .ec part" : "a re-encoded part", p.l[0].fin);
                 rc = TSDB_ERR_CORRUPT;
             }
         }

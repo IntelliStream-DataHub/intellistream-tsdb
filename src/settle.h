@@ -68,10 +68,11 @@ bool ecsettle_stopping(eng *db);
  * into sel[0 .. return value) (at most cap; the caller passes them to eng_settle and unrefs them). 0: nothing is due.
  * now_ms: eng_now_ms. */
 size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
-/* R10 (E6): picks a contiguous range of parts of one key to re-encode (under db->lock, caller holds it): > ec_objects_max
- * combinable .ec objects, or tombstones in newer combinable parts covering > 10% of .ec rows; bounded by max_part_bytes
- * and MAX_MERGE_PARTS; skips keys with a pending eckeep digest or recent re-encode failure. Referenced parts into sel. */
-size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
+/* R10 (E6): picks a contiguous range of parts of one key to re-encode (caller holds no engine lock): > ec_objects_max
+ * combinable .ec objects, or tombstones in newer combinable parts covering > 10% of .ec rows (evaluated outside
+ * db->lock); bounded by max_part_bytes and MAX_MERGE_PARTS; skips keys with a pending eckeep digest or recent
+ * re-encode failure. Referenced parts into sel. */
+size_t ecpolicy_pick_reencode(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
 /* tests: the cluster branch takes every key as too big for one marker (it says so and marks the key failed) */
 extern bool ecpolicy_test_cap_hit;
 /* A settle of key failed (not STOPPED): the policy leaves the key alone for an hour. */

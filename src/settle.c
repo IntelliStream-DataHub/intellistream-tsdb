@@ -781,11 +781,9 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
             if (!contig || !has_ec) {
                 np = 0;
             } else {
-                uint64_t rgen = atomic_load(&db->ret_len_gen);
                 for (size_t i = 0; i < np; i++) {
                     pin[i]->settling = true;
                     pin[i]->reencoding = true;
-                    pin[i]->merge_len_gen = rgen;
                     part_ref(pin[i]);
                 }
             }
@@ -924,9 +922,7 @@ static bool settle_engine(eng *db)
     /* R10: check E6 re-encode triggers first on single-server tiered volumes (keeps eager jepsen partitions small). */
     if (!db->ec_cluster && !atomic_load(&settle_reencode_pause)) {
         part *rsel[MAX_MERGE_PARTS];
-        pthread_mutex_lock(&db->lock);
-        size_t rn = ecpolicy_pick_reencode_locked(db, now, &key, rsel, MAX_MERGE_PARTS);
-        pthread_mutex_unlock(&db->lock);
+        size_t rn = ecpolicy_pick_reencode(db, now, &key, rsel, MAX_MERGE_PARTS);
         if (rn) {
             int rc = eng_reencode(db, key, rsel, rn, NULL);
             for (size_t i = 0; i < rn; i++)

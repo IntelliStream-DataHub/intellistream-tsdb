@@ -45,6 +45,7 @@
 #include "tier.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 atomic_uint ecpolicy_objects_max = ECPOLICY_OBJECTS_MAX_DEFAULT;
 
@@ -343,30 +344,17 @@ static bool reencodeable(const part *p)
            (ep != NULL || p->hdr_len == sizeof(part_header));
 }
 
-/* Estimate rows of .ec part p hidden by tombstones in newer parts newer[0 .. nnewer), from the in-memory granule index
- * alone (never touches the chunk store under db->lock). */
-static uint64_t ec_hidden_rows(const part *p, part *const *newer, size_t nnewer)
+/* Estimate rows of .ec part p hidden by the sorted/coalesced tombstones in ts, from the in-memory granule index
+ * alone (never touches the chunk store). */
+static uint64_t ec_hidden_rows_ts(const part *p, const tomb_set *ts)
 {
-    if (!p->ng || !nnewer)
+    if (!p->ng || !ts->n)
         return 0;
-    tomb_set ts = {0};
-    bool any = false;
-    for (size_t i = 0; i < nnewer; i++)
-        if (newer[i]->nt) {
-            if (tomb_set_add(&ts, newer[i]->t, newer[i]->nt) != 0) {
-                tomb_set_free(&ts);
-                return 0;
-            }
-            any = true;
-        }
-    if (!any)
-        return 0;
-    tomb_set_finish(&ts);
     uint64_t hidden = 0;
-    for (size_t ti = 0; ti < ts.n;) {
-        uint32_t s = ts.t[ti].series;
+    for (size_t ti = 0; ti < ts->n;) {
+        uint32_t s = ts->t[ti].series;
         size_t tj = ti + 1;
-        while (tj < ts.n && ts.t[tj].series == s)
+        while (tj < ts->n && ts->t[tj].series == s)
             tj++;
         uint32_t ga = 0, gb = 0;
         gix_run(&p->ix, s, &ga, &gb);
@@ -374,16 +362,16 @@ static uint64_t ec_hidden_rows(const part *p, part *const *newer, size_t nnewer)
         for (uint32_t g = ga; g < gb && tk < tj; g++) {
             int64_t glo, ghi;
             gx_ts(p, g, &glo, &ghi);
-            while (tk < tj && ts.t[tk].end <= glo)
+            while (tk < tj && ts->t[tk].end <= glo)
                 tk++;
-            if (tk == tj || ts.t[tk].start > ghi)
+            if (tk == tj || ts->t[tk].start > ghi)
                 continue;
             uint32_t cnt = gx_count(p, g);
             uint64_t span = (uint64_t)ghi - (uint64_t)glo + 1;
             uint64_t ov = 0;
-            for (size_t k = tk; k < tj && ts.t[k].start <= ghi; k++) {
-                int64_t a = MAX(glo, ts.t[k].start);
-                int64_t b = MIN(ghi, ts.t[k].end - 1);
+            for (size_t k = tk; k < tj && ts->t[k].start <= ghi; k++) {
+                int64_t a = MAX(glo, ts->t[k].start);
+                int64_t b = MIN(ghi, ts->t[k].end - 1);
                 if (a <= b)
                     ov += (uint64_t)b - (uint64_t)a + 1;
             }
@@ -396,7 +384,6 @@ static uint64_t ec_hidden_rows(const part *p, part *const *newer, size_t nnewer)
         }
         ti = tj;
     }
-    tomb_set_free(&ts);
     return MIN(hidden, p->rows);
 }
 
@@ -415,7 +402,126 @@ static bool span_fits(part *const *parts, size_t a, size_t b, size_t limit, uint
     return true;
 }
 
-size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now, int64_t *key, part **sel, size_t cap)
+/* Evaluate all candidate start indices x in [g_lo, g_last] sharing the same right endpoint `end` in a single
+ * right-to-left cumulative tomb_set pass (O(end - g_lo) instead of O(M^2)/O(M^3)). Sets *out_lo to the leftmost
+ * triggering start index, matching a left-to-right scan. */
+static bool eval_tomb_group(part *const *parts, size_t g_lo, size_t g_last, size_t end, size_t *out_lo)
+{
+    tomb_set ts = {0};
+    bool dirty = false;
+    uint64_t ec_rows = 0, hidden = 0;
+    size_t pick_i = SIZE_MAX;
+    for (size_t x = end; x-- > g_lo;) {
+        if (x + 1 < end && parts[x + 1]->nt > 0) {
+            if (tomb_set_add(&ts, parts[x + 1]->t, parts[x + 1]->nt) != 0) {
+                tomb_set_free(&ts);
+                return false;
+            }
+            dirty = true;
+        }
+        if (!part_is_ec(parts[x]))
+            continue;
+        ec_rows += parts[x]->rows;
+        if (parts[x]->rows > 0 && ts.n > 0) {
+            if (dirty) {
+                tomb_set_finish(&ts);
+                dirty = false;
+            }
+            hidden += ec_hidden_rows_ts(parts[x], &ts);
+        }
+        if (x <= g_last && parts[x]->rows > 0 && ec_rows > 0 &&
+            (__uint128_t)hidden * 100 > (__uint128_t)ec_rows * ECPOLICY_TOMB_PCT)
+            pick_i = x;
+    }
+    tomb_set_free(&ts);
+    if (pick_i == SIZE_MAX)
+        return false;
+    *out_lo = pick_i;
+    return true;
+}
+
+/* Scan a combinable run parts[0 .. len) for Trigger 2 using a two-pointer window bound and constant-end grouping. */
+static bool pick_tomb_window(part *const *parts, size_t len, size_t limit, uint64_t max_bytes, size_t *out_lo,
+                             size_t *out_hi)
+{
+    size_t last_tomb = 0;
+    for (size_t i = len; i-- > 0;)
+        if (parts[i]->nt > 0) {
+            last_tomb = i;
+            break;
+        }
+    if (last_tomb == 0)
+        return false;
+    size_t end = 0, tomb_cnt = 0;
+    uint64_t sum = 0;
+    size_t cur_end = 0, g_lo = SIZE_MAX, g_last = 0;
+    for (size_t i = 0; i < last_tomb; i++) {
+        if (end < i) {
+            end = i;
+            sum = 0;
+            tomb_cnt = 0;
+        }
+        while (end < len && end - i < limit) {
+            uint64_t sz = part_data_bytes(parts[end]);
+            if (sz > max_bytes - sum)
+                break;
+            sum += sz;
+            tomb_cnt += parts[end]->nt > 0;
+            end++;
+        }
+        bool win_tombs = tomb_cnt > (size_t)(parts[i]->nt > 0);
+        if (part_is_ec(parts[i]) && parts[i]->rows > 0 && end - i >= 2 && win_tombs) {
+            if (g_lo == SIZE_MAX) {
+                cur_end = end;
+                g_lo = g_last = i;
+            } else if (end == cur_end) {
+                g_last = i;
+            } else {
+                size_t pick_i = 0;
+                if (eval_tomb_group(parts, g_lo, g_last, cur_end, &pick_i)) {
+                    *out_lo = pick_i;
+                    *out_hi = cur_end;
+                    return true;
+                }
+                cur_end = end;
+                g_lo = g_last = i;
+            }
+        }
+        if (end > i) {
+            sum -= part_data_bytes(parts[i]);
+            tomb_cnt -= parts[i]->nt > 0;
+        }
+    }
+    if (g_lo != SIZE_MAX) {
+        size_t pick_i = 0;
+        if (eval_tomb_group(parts, g_lo, g_last, cur_end, &pick_i)) {
+            *out_lo = pick_i;
+            *out_hi = cur_end;
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    int64_t key;
+    size_t off, len;
+} reenc_run;
+
+/* Whether a reencodeable run parts[r_lo .. r_hi) has any non-empty .ec part followed by a part with tombstones. */
+static bool run_has_ec_tombs(part *const *parts, size_t r_lo, size_t r_hi)
+{
+    bool seen_ec = false;
+    for (size_t i = r_lo; i < r_hi; i++) {
+        if (seen_ec && parts[i]->nt > 0)
+            return true;
+        if (part_is_ec(parts[i]) && parts[i]->rows > 0)
+            seen_ec = true;
+    }
+    return false;
+}
+
+size_t ecpolicy_pick_reencode(eng *db, int64_t now, int64_t *key, part **sel, size_t cap)
 {
     ecpolicy_state *ps = ecpolicy_of(db);
     const tier_settings *cfg = db->tier ? tier_eng_settings(db) : NULL;
@@ -436,6 +542,11 @@ size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now, int64_t *key, part **
     if (limit < 2 || max_bytes == 0)
         return 0;
 
+    part **cand_parts = NULL;
+    reenc_run *runs = NULL;
+    size_t ncand = 0, nruns = 0;
+
+    pthread_mutex_lock(&db->lock);
     for (size_t a = 0; a < db->nparts;) {
         size_t b = a + 1;
         int64_t k = db->parts[a]->partition;
@@ -507,6 +618,10 @@ size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now, int64_t *key, part **
                 }
                 prev_ec = i;
             }
+            if (has_tombs && run_has_ec_tombs(db->parts, r_lo, r_hi)) {
+                nruns++;
+                ncand += r_hi - r_lo;
+            }
         }
         if (ncomb > obj_max && pick_lo != SIZE_MAX) {
             size_t n = pick_hi - pick_lo;
@@ -514,58 +629,76 @@ size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now, int64_t *key, part **
                 sel[i] = db->parts[pick_lo + i];
                 part_ref(sel[i]);
             }
+            pthread_mutex_unlock(&db->lock);
             *key = k;
             return n;
         }
+    }
 
-        /* Trigger 2 (E6): tombstones in newer combinable parts covering > 10% of combinable .ec objects' rows. */
-        if (!has_tombs)
-            continue;
-        for (size_t r = lo_i; r < hi_i;) {
-            while (r < hi_i && !reencodeable(db->parts[r]))
-                r++;
-            size_t r_lo = r;
-            while (r < hi_i && reencodeable(db->parts[r]))
-                r++;
-            size_t r_hi = r;
-            for (size_t i = r_lo; i < r_hi; i++) {
-                if (!part_is_ec(db->parts[i]) || db->parts[i]->rows == 0)
+    /* Snapshot candidate runs for Trigger 2 so tombstone sorting and granule walks run outside db->lock. */
+    size_t got_runs = 0, got_parts = 0;
+    if (nruns > 0) {
+        cand_parts = malloc(ncand * sizeof *cand_parts);
+        runs = malloc(nruns * sizeof *runs);
+        if (cand_parts && runs) {
+            for (size_t a = 0; a < db->nparts && got_runs < nruns;) {
+                size_t b = a + 1;
+                int64_t k = db->parts[a]->partition;
+                while (b < db->nparts && db->parts[b]->partition == k)
+                    b++;
+                size_t lo_i = a, hi_i = b;
+                a = b;
+                if (hi_i - lo_i < 2 || partition_dropping(db, k) || rfailed_recently(&snap, k, now) ||
+                    eckeep_key_pending(db, k))
                     continue;
-                uint64_t sz0 = part_data_bytes(db->parts[i]);
-                if (sz0 > max_bytes)
-                    continue;
-                uint64_t sum = sz0;
-                size_t end = i + 1;
-                bool win_tombs = false;
-                while (end < r_hi && end - i < limit) {
-                    uint64_t sz = part_data_bytes(db->parts[end]);
-                    if (sz > max_bytes - sum)
-                        break;
-                    sum += sz;
-                    win_tombs |= db->parts[end]->nt > 0;
-                    end++;
+                bool blocked = false, has_ec = false, has_tombs = false;
+                for (size_t i = lo_i; i < hi_i; i++) {
+                    const part *p = db->parts[i];
+                    blocked |= p->settling || atomic_load(&p->damaged);
+                    has_ec |= part_is_real_ec(p);
+                    has_tombs |= p->nt > 0;
                 }
-                if (end - i < 2 || !win_tombs)
+                if (blocked || !has_ec || !has_tombs)
                     continue;
-                uint64_t ec_rows = 0, hidden = 0;
-                for (size_t x = i; x < end; x++) {
-                    if (!part_is_ec(db->parts[x]))
-                        continue;
-                    ec_rows += db->parts[x]->rows;
-                    if (x + 1 < end)
-                        hidden += ec_hidden_rows(db->parts[x], db->parts + x + 1, end - (x + 1));
-                }
-                if (ec_rows > 0 && hidden * 100 > ec_rows * ECPOLICY_TOMB_PCT) {
-                    size_t n = end - i;
-                    for (size_t x = 0; x < n; x++) {
-                        sel[x] = db->parts[i + x];
-                        part_ref(sel[x]);
+                for (size_t r = lo_i; r < hi_i && got_runs < nruns;) {
+                    while (r < hi_i && !reencodeable(db->parts[r]))
+                        r++;
+                    size_t r_lo = r;
+                    while (r < hi_i && reencodeable(db->parts[r]))
+                        r++;
+                    size_t r_hi = r;
+                    size_t rlen = r_hi - r_lo;
+                    if (run_has_ec_tombs(db->parts, r_lo, r_hi) && got_parts + rlen <= ncand) {
+                        runs[got_runs++] = (reenc_run){.key = k, .off = got_parts, .len = rlen};
+                        for (size_t i = r_lo; i < r_hi; i++) {
+                            part_ref(db->parts[i]);
+                            cand_parts[got_parts++] = db->parts[i];
+                        }
                     }
-                    *key = k;
-                    return n;
                 }
             }
         }
     }
-    return 0;
+    pthread_mutex_unlock(&db->lock);
+
+    /* Trigger 2 (E6): tombstones in newer combinable parts covering > 10% of combinable .ec objects' rows. */
+    size_t picked = 0;
+    for (size_t ri = 0; ri < got_runs; ri++) {
+        size_t wlo = 0, whi = 0;
+        if (pick_tomb_window(cand_parts + runs[ri].off, runs[ri].len, limit, max_bytes, &wlo, &whi)) {
+            picked = whi - wlo;
+            for (size_t i = 0; i < picked; i++) {
+                sel[i] = cand_parts[runs[ri].off + wlo + i];
+                cand_parts[runs[ri].off + wlo + i] = NULL; /* reference transferred to caller */
+            }
+            *key = runs[ri].key;
+            break;
+        }
+    }
+    for (size_t i = 0; i < got_parts; i++)
+        if (cand_parts[i])
+            part_unref(cand_parts[i]);
+    free(cand_parts);
+    free(runs);
+    return picked;
 }
