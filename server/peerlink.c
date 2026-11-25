@@ -1132,6 +1132,41 @@ void peerlink_set_check_level(int level) { atomic_store(&check_default, level); 
 int peerlink_check_parse(const char *s) { return pl_check_parse(s); }
 const char *peerlink_check_name(int type) { return pl_check_name(type); }
 
+static _Atomic uint64_t g_up[PL_NKINDS][4]; /* the process's connections up by kind and check type */
+
+static void up_count(int kind, int type, int d)
+{
+    if (kind >= 0 && kind < PL_NKINDS && type >= 1 && type <= 3)
+        atomic_fetch_add_explicit(&g_up[kind][type], (uint64_t)(int64_t)d, memory_order_relaxed);
+}
+
+void peerlink_up_by_check(uint64_t out[PL_NKINDS][4])
+{
+    for (int k = 0; k < PL_NKINDS; k++)
+        for (int t = 0; t < 4; t++)
+            out[k][t] = atomic_load_explicit(&g_up[k][t], memory_order_relaxed);
+}
+
+int peerlink_links_status(char *buf, size_t n)
+{
+    static const char *const kname[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+    uint64_t up[PL_NKINDS][4];
+    peerlink_up_by_check(up);
+    size_t off = 0;
+    if (n)
+        buf[0] = 0;
+    for (int k = 0; k < PL_NKINDS; k++) {
+        if (!up[k][1] && !up[k][2] && !up[k][3])
+            continue;
+        int w = snprintf(buf + off, n - off, "peer links %s: none %" PRIu64 " header %" PRIu64 " full %" PRIu64 "\n",
+                         kname[k], up[k][1], up[k][2], up[k][3]);
+        if (w < 0 || (size_t)w >= n - off)
+            return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
 /* this end's frame check level (cfg.check, else the process's; plcheck.h) */
 static int check_level(const struct peerlink *pl)
 {
@@ -1732,6 +1767,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     ST(pl, connects, 1);
     if (keys->out.type >= 1 && keys->out.type <= 3)
         ST(pl, up_check[keys->out.type], 1);
+    up_count(l->kind, keys->out.type, 1);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 1);
     pthread_mutex_lock(&l->mu);
@@ -1958,6 +1994,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         c.t->ops->close(c.t);
     if (c.keys.out.type >= 1 && c.keys.out.type <= 3)
         ST(pl, up_check[c.keys.out.type], (uint64_t)-1);
+    up_count(l->kind, c.keys.out.type, -1);
     atomic_store(&l->check, 0);
     if (pl->cfg.on_link)
         pl->cfg.on_link(pl->cfg.arg, l, 0);

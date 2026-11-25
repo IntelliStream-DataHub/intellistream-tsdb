@@ -2966,7 +2966,8 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480 +
+                           PL_NKINDS * 100
                      : 0);
     char *t = malloc(cap + 4);
     if (!t) {
@@ -3022,6 +3023,14 @@ static void handle_status(req *r)
                (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000,
                (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000,
                (unsigned long long)ss.kind5_bytes, (unsigned long long)ss.kind2_bytes);
+        /* the peer data links up, by kind and the frame check they run (--peer-check: the stronger end's level) */
+        static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        uint64_t lup[PL_NKINDS][4];
+        peerlink_up_by_check(lup);
+        for (int k = 1; k < PL_NKINDS && at + 160 < cap; k++)
+            ST_PUT("links.%s.none=%llu\nlinks.%s.header=%llu\nlinks.%s.full=%llu\n", lkind[k],
+                   (unsigned long long)lup[k][1], lkind[k], (unsigned long long)lup[k][2], lkind[k],
+                   (unsigned long long)lup[k][3]);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
@@ -6246,7 +6255,8 @@ int main(int argc, char **argv)
                           .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL,
                           .snap = cluster_on ? snap_metrics : NULL,
                           .vol_diverged = metrics_vol_diverged,
-                          .margins = cluster_on ? metrics_margins : NULL};
+                          .margins = cluster_on ? metrics_margins : NULL,
+                          .peer_links = cluster_on ? peerlink_up_by_check : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

@@ -166,6 +166,12 @@ struct peerlink *peerlink_new(const struct pl_cfg *cfg);
 void peerlink_set_check_level(int level);
 int peerlink_check_parse(const char *s); /* "none", "header", "full" -> the level; -1 for anything else */
 const char *peerlink_check_name(int type); /* the level's word ("?" for none known, 0 included) */
+/* Connections up now in this process, of every peerlink instance, by link kind and frame check type (index PL_KIND_*,
+ * PL_CHECK_*; 0 unused): what STATUS's "peer links" line and the metric tsdb_peer_links say. */
+#define PL_NKINDS 8
+void peerlink_up_by_check(uint64_t out[PL_NKINDS][4]);
+/* the "peer links" lines of STATUS into buf (a line per kind with a connection up, "" when none): 0, or -1 if cut */
+int peerlink_links_status(char *buf, size_t n);
 /* Stops every link, joins their threads and frees everything (a pending bulk job is completed with PL_E_CLOSED). */
 void peerlink_free(struct peerlink *pl);
 void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);

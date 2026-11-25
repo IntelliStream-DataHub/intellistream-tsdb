@@ -701,19 +701,35 @@ static void cli_status(int i, int members)
     char cmd[PATH_MAX * 2 + 128], peer[META_ADDR_MAX], line[1024];
     peer_of(i, peer, sizeof peer);
     snprintf(cmd, sizeof cmd, "%s cluster status %s --secret-file %s", cli, peer, secret_path);
-    FILE *p = popen(cmd, "r");
-    if (!p)
-        die("popen %s: %s", cmd, strerror(errno));
-    int node = 0, group = 0, up = 0;
-    while (fgets(line, sizeof line, p)) {
-        node += !strncmp(line, "node ", 5);
-        group += !strncmp(line, "group voters ", 13);
-        up += !strncmp(line, "member ", 7) && strstr(line, " up ");
+    /* the peer links' lines ("peer links KIND: none N header N full N") come once the forwarding links to the
+     * members are up, which the members' own dials decide: asked again until one is there (a promised state) */
+    for (uint64_t until = now_ms() + 20000;;) {
+        FILE *p = popen(cmd, "r");
+        if (!p)
+            die("popen %s: %s", cmd, strerror(errno));
+        int node = 0, group = 0, up = 0, links = 0;
+        while (fgets(line, sizeof line, p)) {
+            node += !strncmp(line, "node ", 5);
+            group += !strncmp(line, "group voters ", 13);
+            up += !strncmp(line, "member ", 7) && strstr(line, " up ");
+            if (!strncmp(line, "peer links ", 11)) {
+                char kind[16];
+                unsigned a, b, c;
+                if (sscanf(line, "peer links %15[a-z]: none %u header %u full %u", kind, &a, &b, &c) != 4)
+                    die("`%s`: a peer links line that does not parse: %s", cmd, line);
+                links += !strcmp(kind, "fwd") && a > 0 && b == 0 && c == 0; /* none, the default level */
+            }
+        }
+        int st = pclose(p);
+        if (st != 0 || node != 1 || group != 1 || up != members)
+            die("`%s`: status %d, %d node, %d group, %d up member lines (expected 0, 1, 1, %d)", cmd, st, node, group,
+                up, members);
+        if (links == 1)
+            break;
+        if (now_ms() > until)
+            die("`%s`: no line \"peer links fwd: none N header 0 full 0\" with N > 0 in 20 s", cmd);
+        usleep(200 * 1000);
     }
-    int st = pclose(p);
-    if (st != 0 || node != 1 || group != 1 || up != members)
-        die("`%s`: status %d, %d node, %d group, %d up member lines (expected 0, 1, 1, %d)", cmd, st, node, group,
-            up, members);
 }
 
 /* the leader as server i's view names it, or -1 */
@@ -4623,6 +4639,30 @@ static void fwd_await(int i, uint32_t peer, const char *kind, int conn)
         die("server %d: no \"%s\"", i, needle);
 }
 
+static int status_key(int i, const char *key, char *val, size_t vn);
+
+/* STATUS's links.KIND.CHECK of server i: at least `least` connections at `check`, none at the other levels */
+static void links_await(int i, const char *kind, const char *check, int least)
+{
+    static const char *const lv[] = {"none", "header", "full"};
+    char key[64], val[32];
+    int n[3] = {-1, -1, -1};
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        for (int c = 0; c < 3; c++) {
+            snprintf(key, sizeof key, "links.%s.%s", kind, lv[c]);
+            n[c] = status_key(i, key, val, sizeof val) ? atoi(val) : -1;
+        }
+        int ok = 1;
+        for (int c = 0; c < 3; c++)
+            ok &= strcmp(lv[c], check) == 0 ? n[c] >= least : n[c] == 0;
+        if (ok)
+            break;
+        if (now_ms() - t0 > WAIT_MS)
+            die("server %d: STATUS says links.%s none %d header %d full %d, want %d or more at %s", i, kind, n[0], n[1],
+                n[2], least, check);
+    }
+}
+
 static void scen_fwdlinks(void)
 {
     scenario("fwdlinks");
@@ -4646,7 +4686,12 @@ static void scen_fwdlinks(void)
         fwd_await(i, ids[2], "fwd", 2);
         fwd_await(i, ids[2], "fwdq", 2);
     }
-    printf("  fwdlinks: 3 servers, each with FWD and FWDQ links to both others; both redial a restarted one\n");
+    for (int i = 0; i < 3; i++) { /* STATUS says each link's frame check: none, the default */
+        links_await(i, "fwd", "none", 2);
+        links_await(i, "fwdq", "none", 2);
+    }
+    printf("  fwdlinks: 3 servers, each with FWD and FWDQ links to both others; both redial a restarted one; STATUS "
+           "says their check (none)\n");
 }
 
 static void scen_links(void)
@@ -13644,6 +13689,9 @@ static void await_margins(int i, uint32_t num, int young, int settled, const cha
     static const char *const states[] = {"ok", "unavailable", "corrupt", "lost"};
     char key[128];
     const char *l;
+    if (!strstr(buf, "\ntsdb_peer_links{kind=\"log\",check=\"none\"} ") ||
+        !strstr(buf, "\ntsdb_peer_links{kind=\"chunkb\",check=\"full\"} 0\n"))
+        die("%s: server %d's metrics have no tsdb_peer_links of every kind and check", what, i);
     snprintf(key, sizeof key, "\ntsdb_volume_young_margin{volume=\"%u\"} ", (unsigned)num);
     if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != young)
         die("%s: server %d's metrics say tsdb_volume_young_margin %s, not %d", what, i, l ? l + strlen(key) : "missing",

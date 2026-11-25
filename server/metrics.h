@@ -53,6 +53,8 @@ typedef struct metrics_cfg {
     /* the cluster volumes' margins, *out malloc'ed (freed by the caller), (size_t)-1 when it could not be allocated;
      * NULL: not a cluster server */
     size_t (*margins)(metrics_margin **out);
+    /* the peer data links up by kind and frame check type (peerlink_up_by_check); NULL: not a cluster server */
+    void (*peer_links)(uint64_t out[8][4]);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

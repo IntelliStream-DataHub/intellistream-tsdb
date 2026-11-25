@@ -586,6 +586,8 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         st->tr[i] = get64(&r);
     if (!r.bad)
         getstr(&r, st->moves, sizeof st->moves);
+    if (!r.bad)
+        getstr(&r, st->links, sizeof st->links);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -3989,6 +3991,9 @@ static void put_status(struct buf *b)
     char mv[sizeof ((struct cluster_status *)0)->moves];
     cmove_status(mv, sizeof mv, now);
     putstr(b, mv);
+    char lk[sizeof ((struct cluster_status *)0)->links];
+    peerlink_links_status(lk, sizeof lk); /* 8 lines of at most ~70 bytes: never cut */
+    putstr(b, lk);
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
