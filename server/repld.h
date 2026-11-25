@@ -78,6 +78,8 @@ struct rsnap_stats {
     uint64_t installed;      /* snapshots installed (server/snapinst.c) */
     uint64_t refused_stale;  /* received and not installed: P at or below the log end, or fenced above its epoch */
     uint64_t install_ms;     /* the last install: ms from the end of the transfer to the volume handed back */
+    uint64_t kind5_bytes, kind2_bytes; /* bytes the snapshots' links (kind 5) and the COMMIT files' (kind 2) took
+                                        * from their buckets (peerlink_kind_bytes) */
 };
 void rsnap_get_stats(struct rsnap_stats *out);
 
