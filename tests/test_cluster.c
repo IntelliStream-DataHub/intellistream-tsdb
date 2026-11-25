@@ -13528,6 +13528,31 @@ static int ecb_ec_parts(int i, uint32_t num)
     return n;
 }
 
+/* the live .part files (p<K>_<A>_<B>_<L>.part) in server i's v<num>, and their names into buf: rows still outside
+ * every object, which a read answers without a decode */
+static int ecb_live_parts(int i, uint32_t num, char *buf, size_t cap)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return -1;
+    int n = 0;
+    size_t at = 0;
+    buf[0] = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'p' || l < 6 || strcmp(e->d_name + l - 5, ".part") != 0)
+            continue;
+        n++;
+        if (at + l + 2 < cap)
+            at += (size_t)snprintf(buf + at, cap - at, " %s", e->d_name);
+    }
+    closedir(dd);
+    return n;
+}
+
 static void scen_ecbasic(void)
 {
     scenario("ecbasic");
@@ -13610,7 +13635,16 @@ static void scen_ecbasic(void)
     for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) == 0; usleep(200000))
         if (now_ms() - t0 > 120000)
             die("no .ec part in the leader's v%" PRIu32 " 120 s after the writes: nothing settled", num);
-    printf("  settled: %d .ec part(s) in the leader's volume directory\n", nec);
+    /* every row of the day in an object before the kills: rows in a .part (a part the gate's flush wrote after the
+     * first settle, settled again once rewritten) are answered without a decode, and a read of them cannot tell
+     * three members away (the r8f-final run: 2 .ec parts, series 4 read whole with three members killed) */
+    char live[1024];
+    int nlive;
+    for (uint64_t t0 = now_ms(); (nlive = ecb_live_parts(L, num, live, sizeof live)) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("%d .part file(s) left in the leader's v%" PRIu32 " 120 s after the first settle:%s", nlive, num, live);
+    nec = ecb_ec_parts(L, num);
+    printf("  settled: %d .ec part(s) in the leader's volume directory, no .part left\n", nec);
     for (int s = 0; s < 2; s++) {
         struct ecb_sum a, b;
         if ((rc = ecb_read(c, ide[s], &a)) != 0 || ecb_read(ct, idt[s], &b) != 0)
@@ -13649,8 +13683,12 @@ static void scen_ecbasic(void)
     if (nv >= 3) {
         struct ecb_sum a;
         rc = ecb_read(c, ide[4], &a);
-        if (rc != TSDB_ERR_UNAVAILABLE)
-            die("series 4 with three stripe members away: %s (%" PRIu64 " rows), want UNAVAILABLE", ers(rc), a.n);
+        if (rc != TSDB_ERR_UNAVAILABLE) {
+            char live[1024];
+            int nl = ecb_live_parts(L, num, live, sizeof live);
+            die("series 4 with three stripe members away: %s (%" PRIu64 " rows), want UNAVAILABLE (%d .ec, %d .part:%s)",
+                ers(rc), a.n, ecb_ec_parts(L, num), nl, live);
+        }
         printf("  three stripe members killed: UNAVAILABLE\n");
     } else
         printf("  three stripe members killed: skipped (only %d outside the log group and the metadata leader)\n", nv);
