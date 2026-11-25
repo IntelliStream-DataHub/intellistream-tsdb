@@ -10,6 +10,7 @@
 #include "tsdb_calendar.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <math.h>
@@ -1421,6 +1422,111 @@ static char **cli_with_cfg(const struct cfg *c, int *argc, char **argv, const ch
     return nv;
 }
 
+extern uint64_t xxh64(const void *data, size_t len, uint64_t seed);
+
+/* Line i (from 1) of VOLUMES, len bytes, NUL-terminated in place of '\n'; matches src/volumes.c:vol_line_ok. */
+static bool vol_line_ok_cli(const char *line, size_t len, size_t i)
+{
+    if (len < 10 || memchr(line, '\0', len) || line[8] != ' ')
+        return false;
+    for (int j = 0; j < 8; j++)
+        if (!isxdigit((unsigned char)line[j]))
+            return false;
+    unsigned check = 0;
+    int pos = 0;
+    return sscanf(line, "%8x %n", &check, &pos) == 1 && pos == 9 &&
+           check == (uint32_t)xxh64(line + 9, len - 9, i);
+}
+
+/* Checks whether `path` is a volume of `dir`: `dir` itself, or listed in `dir/VOLUMES`. Returns 0 if so,
+ * non-zero after printing a clear diagnostic to stderr otherwise. */
+static int check_volume_of_dir(const char *dir, const char *path)
+{
+    struct stat sdir, spath;
+    if (stat(dir, &sdir) != 0) {
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    if (!S_ISDIR(sdir.st_mode)) {
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(ENOTDIR));
+        return 1;
+    }
+    if (stat(path, &spath) != 0) {
+        fprintf(stderr, "tsdb: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (!S_ISDIR(spath.st_mode)) {
+        fprintf(stderr, "tsdb: %s: %s\n", path, strerror(ENOTDIR));
+        return 1;
+    }
+    if (sdir.st_dev == spath.st_dev && sdir.st_ino == spath.st_ino)
+        return 0;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    int vfd = openat(dfd, "VOLUMES", O_RDONLY | O_CLOEXEC);
+    close(dfd);
+    if (vfd < 0) {
+        if (errno == ENOENT)
+            fprintf(stderr, "tsdb: %s is not a volume of %s\n", path, dir);
+        else
+            fprintf(stderr, "tsdb: %s/VOLUMES: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    FILE *f = fdopen(vfd, "r");
+    if (!f) {
+        close(vfd);
+        fprintf(stderr, "tsdb: %s/VOLUMES: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    char *canon = realpath(path, NULL);
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    size_t line_no = 0;
+    bool found = false, damaged = false;
+    int rd_err = 0;
+    errno = 0;
+    while ((len = getline(&line, &cap, f)) > 0) {
+        if (line[len - 1] != '\n')
+            break; /* torn tail: never an acknowledged volume */
+        line[--len] = '\0';
+        line_no++;
+        if (!vol_line_ok_cli(line, (size_t)len, line_no)) {
+            damaged = true;
+            break;
+        }
+        const char *vp = line + 9;
+        struct stat sv;
+        if ((stat(vp, &sv) == 0 && sv.st_dev == spath.st_dev && sv.st_ino == spath.st_ino) ||
+            (canon && strcmp(canon, vp) == 0)) {
+            found = true;
+            break;
+        }
+        errno = 0;
+    }
+    if (ferror(f))
+        rd_err = errno ? errno : EIO;
+    free(line);
+    free(canon);
+    fclose(f);
+    if (rd_err) {
+        fprintf(stderr, "tsdb: %s/VOLUMES: %s\n", dir, strerror(rd_err));
+        return 1;
+    }
+    if (damaged) {
+        fprintf(stderr, "tsdb: %s/VOLUMES: line %zu is damaged\n", dir, line_no);
+        return 1;
+    }
+    if (!found) {
+        fprintf(stderr, "tsdb: %s is not a volume of %s\n", path, dir);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *cfg_path = NULL;
@@ -1562,6 +1668,8 @@ int main(int argc, char **argv)
             else
                 usage();
         }
+        if (path != dir && check_volume_of_dir(dir, path) != 0)
+            return 1;
         int rc = ecdiverge_cli(path, clear, stdout);
         if (rc < 0)
             die(path, rc);

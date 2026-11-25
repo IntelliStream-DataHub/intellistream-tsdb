@@ -86,6 +86,12 @@ void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16]);
  * object degraded (a cell failed or rebuilt, a position away, an error) does the same by itself. */
 void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16]);
 
+/* Prefetch off-switch (R8 D19, F6): on by default (unless TSDB_EC_PREFETCH=0/off/false/no at tier_open);
+ * eccache_set_prefetch disables or enables the tier's sequential granule prefetch at run time and resets active
+ * walks. Safe when t == NULL or when the build has no cache (NO_EC=1). */
+void eccache_set_prefetch(struct tier *t, bool on);
+bool eccache_prefetch_enabled(const struct tier *t);
+
 /* ------------------------------------------------------------ tests */
 typedef struct eccache_counters {
     uint64_t hits, misses, waits;   /* granule lookups; waits: a miss another reader was already filling */
@@ -110,6 +116,8 @@ void eccache_test_fd_budget(struct tier *t, uint64_t fds);
 void eccache_test_prefetch(struct tier *t, unsigned cap);
 /* The bytes of one window's range read at most (0: the default, 4 MiB); resets pf_call_peak. */
 void eccache_test_prefetch_call(struct tier *t, uint64_t bytes);
+/* The monotonic cooldown (ms) a degraded object skips prefetch for (0: the default). */
+void eccache_test_pf_bad_ttl_ms(struct tier *t, uint64_t ms);
 /* While above 0, each window's range read fails (UNAVAILABLE) without reading, and the count goes down by one. */
 extern _Atomic int eccache_test_pf_fail;
 /* Pins the READY entry of (oid, off) as a reader does (NULL: none); eccache_test_unpin lets go of it. */
