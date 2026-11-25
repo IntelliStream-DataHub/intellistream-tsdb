@@ -134,3 +134,58 @@ that CPU under qemu, `tests/distro/sandybridge.sh`), but its speed per clock wil
 column. The avx2 loop is bound by its 8 vpshufb per source vector of a 4-output group and by the front end, not by
 loads, and the Skylake family runs vpshufb ymm on one port and allocates 4 micro-ops a cycle, where the i5's P-core
 has two ports and 6. At 4 MiB it is whatever its memory gives one core.
+
+## The Xeon Gold 6148 numbers (Skylake-SP, 2 sockets x 20 cores / 80 threads, AVX-512, no GFNI; measured 2026-11-25)
+
+Built with `-march=native` (`-DTSDB_EC`), governor `performance`, one run of 7 rounds of at least 300 ms per shard
+size; 1-min load average before the 1 MiB run was `0.54` (before 4 MiB: `7.34` from a preceding multi-thread load).
+`build/test_rs`: `ok (9 kernel configurations, 238500 erasure patterns decoded)`. At `v4` the dispatch picks `avx512`
+(no GFNI on Skylake-SP), which is the fastest kernel at every geometry. Encode / decode / rebuild (plan), MB/s of data;
+scalar is 0.4 to 1.0 GB/s.
+
+1 MiB per shard (`--len 1048576`):
+
+| geometry | base ssse3 | v3 avx2 | v4 avx2 | v4 avx512 |
+|---|---:|---:|---:|---:|
+| 4+2 | 8615 / 8565 / 8574 | 12986 / 13186 / 13043 | 13117 / 12926 / 13033 | 17156 / 17355 / 17496 |
+| 8+2 | 8711 / 8726 / 8766 | 14108 / 13970 / 14075 | 13198 / 13529 / 13974 | 19216 / 19141 / 19106 |
+| 8+4 | 5151 / 5166 / 5147 | 9403 / 9325 / 9258 | 9026 / 8995 / 8788 | 13254 / 13201 / 13126 |
+| 16+4 | 5299 / 4955 / 5197 | 9848 / 9297 / 9738 | 8971 / 8435 / 8741 | 14066 / 13979 / 14031 |
+
+4 MiB per shard (`--len 4194304`):
+
+| geometry | base ssse3 | v3 avx2 | v4 avx2 | v4 avx512 |
+|---|---:|---:|---:|---:|
+| 8+4 | 4316 / 4336 / 4360 | 8421 / 8415 / 8711 | 8777 / 8798 / 8900 | 10069 / 9997 / 10036 |
+| 16+4 | 4783 / 4859 / 4872 | 8327 / 8793 / 8823 | 8704 / 9085 / 9108 | 9550 / 9631 / 9660 |
+
+What it shows:
+
+- `v4 avx512` beats `v4 avx2` and `v3 avx2` across all geometries: +31% to +56% at 1 MiB shards (17.2-19.2 GB/s at m=2,
+  13.3-14.1 GB/s at m=4) and +6% to +15% at 4 MiB shards (9.6-10.1 GB/s), well above the 8 GB/s per core claim (EU1).
+
+### 1 GiB object settle, digest, fold-bounds, and PPOS insert costs (Xeon Gold 6148, Micron 2450 NVMe)
+
+Measured on the same machine (`fsync=1`, `zstd=1`, directory tier over NVMe):
+
+- **1 GiB `.part` settle and digest** (`1,073,852,312` B = `1024.11 MiB`, `33,600` granules, derived `1 MiB` cell; mean of 3 runs at `load < 1.6`):
+  - `4+2` (`6` chunks, `1,610,957,184` B): settle `2.340 s` (`458.9 MB/s`, `0.874 CPU s/GB`, peak RSS `1040.1 MiB`);
+    unthrottled cold digest + release `1.664 s` (`652.0 MB/s` obj / `1304.1 MB/s` total read, `0.811 CPU s/GB`, peak RSS `17.4 MiB`);
+    default `64 MB/s` throttled cold digest + release `32.025 s` (`33.6 MB/s` obj / `67.1 MB/s` read, `1.077 CPU s/GB`).
+  - `8+2` (`10` chunks, `1,342,520,128` B): settle `2.309 s` (`469.0 MB/s`, `0.831 CPU s/GB`, peak RSS `1048.2 MiB`);
+    unthrottled cold digest + release `1.883 s` (`608.4 MB/s` obj / `1216.7 MB/s` read, `0.819 CPU s/GB`, peak RSS `29.9 MiB`);
+    default `64 MB/s` throttled cold digest + release `32.026 s` (`33.6 MB/s` obj / `67.1 MB/s` read, `1.093 CPU s/GB`).
+    For a small `8.96 MiB` part deriving a `144 KiB` (`147,456` B) cell at `8+2`: settle `0.065 s` (`144.4 MB/s`, `1.351 CPU s/GB`),
+    unthrottled cold digest + release `0.033 s` (`484.8 MB/s` obj, `1.665 CPU s/GB`, peak RSS `6.9 MiB`), throttled `64 MB/s` release `0.293 s`.
+  - `16+4` (`20` chunks, `1,342,742,240` B): settle `2.398 s` (`447.8 MB/s`, `1.006 CPU s/GB`, peak RSS `1065.8 MiB`);
+    unthrottled cold digest + release `1.767 s` (`614.6 MB/s` obj / `1229.3 MB/s` read, `1.002 CPU s/GB`, peak RSS `53.7 MiB`);
+    default `64 MB/s` throttled cold digest + release `32.031 s` (`33.5 MB/s` obj / `67.1 MB/s` read, `1.324 CPU s/GB`).
+  - Settle peak RSS tracks the `mmap` of the 1 GiB source part plus one stripe's buffers (~16-42 MiB); digest uses `pread` in stripe pieces and keeps peak RSS to `17-54 MiB`.
+- **`fold-bounds` (`block_decode_ts_sorted` + bounds check) and `verify_checksums`** (5 interleaved rounds on 100 M rows):
+  - Micro (`8192`-row granule): `block_decode_ts_sorted` + `[ts_min, ts_max]` check adds `+0.007 ns/row` (`+2.7%` to `+3.3%`) on regular 60s DoubleDelta runs (`3701-4344 M rows/s`) and `+0.22-0.23 ns/row` (`+18%` to `+21%`) on zstd-compressed jittered series (`689-755 M rows/s`).
+  - Macro (`verify_checksums=1` vs `0` on 100 M rows): `raw scan` `283.0 -> 275.7 M rows/s` (`+2.67%`), `agg 3600` `6430.5 -> 6185.6 M rows/s` (`+3.96%`), `agg 60` `1603.3 -> 1493.5 M rows/s` (`+7.35%`), `agg 10` `749.3 -> 620.2 M rows/s` (`+20.82%`), `group 15m` `1955.0 -> 1788.1 M rows/s` (`+9.33%`), `group 1h` `4251.5 -> 3938.9 M rows/s` (`+7.94%`).
+- **`PPOS` insert overhead (`plain` vs `requires=cluster,ec`)** (5 interleaved rounds, 1000 mixed series):
+  - `100k -> parts (fsync=1, mt=0)`: `7.56 -> 6.96 M rows/s` (`-7.93%`, p50 `13.35 -> 13.87 ms`, `+0.68%` CPU, `151` PPOS records / `4832 B`); with `fsync=0, mt=0`: `16.51 -> 16.34 M rows/s` (`-1.07%`).
+  - `100k -> WAL+memtable (fsync=1, mt=0)`: `11.92 -> 10.56 M rows/s` (`-11.45%`, p50 `7.06 -> 8.21 ms`, `+21.70%` CPU).
+  - `10k -> WAL+memtable (fsync=1, mt=0)`: `3.42 -> 3.18 M rows/s` (`-6.91%`, p50 `2.60 -> 2.87 ms`, `+17.84%` CPU).
+
