@@ -13395,6 +13395,46 @@ static int ecb_read(tsdbc *c, tsdb_sid id, struct ecb_sum *s)
     return tsdbc_query_raw(c, id, 0, INT64_MAX / 2, ecb_rows, s);
 }
 
+/* the chunk files of volume num in the six stores (ecs<i>/s<num>/o*.chunk) */
+static int ecb_chunks(uint32_t num)
+{
+    int n = 0;
+    for (int i = 0; i < 6; i++) {
+        char p[PATH_MAX + 80];
+        snprintf(p, sizeof p, "%s/ecs%d/s%" PRIu32, base, i, num);
+        DIR *dd = opendir(p);
+        if (!dd)
+            continue;
+        for (struct dirent *e; (e = readdir(dd));) {
+            size_t l = strlen(e->d_name);
+            n += e->d_name[0] == 'o' && l > 6 && !strcmp(e->d_name + l - 6, ".chunk");
+        }
+        closedir(dd);
+    }
+    return n;
+}
+
+/* ECB_SERIES series of e42 written on the day from day_ms in two batches a flush apart (two parts, which the idle
+ * merge makes one of level 1: what a cluster settle takes, D18) */
+static void ecb_write_day(tsdbc *c, const tsdb_sid *ide, int64_t day_ms)
+{
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            int64_t ts[ECB_ROWS];
+            float val[ECB_ROWS];
+            for (int r = 0; r < ECB_ROWS; r++) {
+                ts[r] = day_ms + (int64_t)(2 * r + b) * 1000;
+                val[r] = (float)(s * 1000 + r) * 0.5f + (float)b;
+            }
+            int rc;
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into e42 on day %" PRId64 ": %s", day_ms, ers(rc));
+        }
+        usleep(1000000); /* past the flush interval */
+    }
+}
+
 /* the .ec parts listed in server i's v<num> (retired_ ones not counted) */
 static int ecb_ec_parts(int i, uint32_t num)
 {
@@ -13416,8 +13456,10 @@ static int ecb_ec_parts(int i, uint32_t num)
 static void scen_ecbasic(void)
 {
     scenario("ecbasic");
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 6; i++) {
+        envs[i] = "hold_copy_file=1,copy_probe=1"; /* the EPOCH case holds a stripe member's copy */
         start(i);
+    }
     init_cluster(0, 600);
     for (int i = 1; i < 6; i++)
         node_add(0, i);
@@ -13454,19 +13496,26 @@ static void scen_ecbasic(void)
     int L = server_of(e.leader);
     if (L < 0)
         die("e42's leader %" PRIu32 " is no server of the test", e.leader);
-    printf("  e42 (volume %" PRIu32 ") led by server %d, twin t42 (volume %" PRIu32 ")\n", num, L, tnum);
-    tsdbc *c = client(L);
+    struct meta_volume tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of t42 with a leader in server 0's copy 30 s after the add");
+    int Lt = server_of(tv.leader);
+    if (Lt < 0)
+        die("t42's leader %" PRIu32 " is no server of the test", tv.leader);
+    printf("  e42 (volume %" PRIu32 ") led by server %d, twin t42 (volume %" PRIu32 ") by server %d\n", num, L, tnum,
+           Lt);
+    tsdbc *c = client(L), *ct = client(Lt);
     tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
     const int64_t day0 = 1704067200000LL; /* 2024-01-01: long past the settle grace */
     for (int s = 0; s < ECB_SERIES; s++) {
         char nm[32];
         snprintf(nm, sizeof nm, "ecb.s%d", s);
         ide[s] = rep_series(c, nm, "e42", 30000);
-        idt[s] = rep_series(c, nm, "t42", 30000);
+        idt[s] = rep_series(ct, nm, "t42", 30000);
     }
     /* two batches a flush apart: two parts in the day's partition, which its idle merge (1 s) makes one of level 1,
      * the only kind a cluster settle takes (D18) */
-    tsdbc *ct = client(L);
     for (int b = 0; b < 2; b++) {
         for (int s = 0; s < ECB_SERIES; s++) {
             int64_t ts[ECB_ROWS];
@@ -13499,6 +13548,10 @@ static void scen_ecbasic(void)
                 s, a.n, a.h, b.n, b.h);
     }
     printf("  every answer equals the twin's after the settle\n");
+    struct ecb_sum twin[ECB_SERIES]; /* read now: the kills below may take t42's members too */
+    for (int s = 0; s < ECB_SERIES; s++)
+        if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 2 * ECB_ROWS)
+            die("the twin's series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
     /* stripe members that are neither e42's log replicas nor the metadata leader: killed and restarted */
     int victims[6], nv = 0, ml = leader_of(L);
     for (int i = 0; i < 6; i++) {
@@ -13512,8 +13565,8 @@ static void scen_ecbasic(void)
         die("no stripe member outside e42's log group");
     stop(victims[0], SIGKILL);
     for (int s = 2; s < 4; s++) {
-        struct ecb_sum a, b;
-        if ((rc = ecb_read(c, ide[s], &a)) != 0 || ecb_read(ct, idt[s], &b) != 0)
+        struct ecb_sum a, b = twin[s];
+        if ((rc = ecb_read(c, ide[s], &a)) != 0)
             die("read of series %d with server %d killed: %s", s, victims[0], ers(rc));
         if (a.n != b.n || a.h != b.h)
             die("series %d with one stripe member away: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
@@ -13532,14 +13585,92 @@ static void scen_ecbasic(void)
     for (int k = 0; k < nv && k < 3; k++)
         start(victims[k]);
     for (int s = 4; s < ECB_SERIES; s++) {
-        struct ecb_sum a, b;
+        struct ecb_sum a, b = twin[s];
         for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
             if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 60000)
                 die("read of series %d after the restarts: %s", s, ers(rc));
-        if (ecb_read(ct, idt[s], &b) != 0 || a.n != b.n || a.h != b.h)
+        if (a.n != b.n || a.h != b.h)
             die("series %d after the restarts: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
     }
     printf("  the members back: reads whole\n");
+
+    /* D9: one EPOCH slot of e42 damaged in S's store, S restarted: the store is unsure. Its copy held behind a volume
+     * add (not caught up), a settle's put to S is refused and the settle fails: neither the put's epoch nor the
+     * store's surviving slot (mutant ownepoch) nor a copy that is not caught up (staleraise) raises it. Let go, the
+     * copy raises it and the next day settles. */
+    int S = victims[0];
+    char ep[PATH_MAX + 80], hold[PATH_MAX + 96], needle[96];
+    snprintf(ep, sizeof ep, "%s/ecs%d/s%" PRIu32 "/EPOCH", base, S, num);
+    {
+        struct view vv;
+        view((S + 1) % 6, &vv);
+        const struct meta_member *mb = meta_member(&vv.m, ids[S]);
+        struct state_want up = {ids[S], META_UP, mb ? mb->incarnation + 1 : 1};
+        view_free(&vv);
+        stop(S, SIGTERM);
+        int fd = open(ep, O_RDWR);
+        uint8_t byte;
+        if (fd < 0 || pread(fd, &byte, 1, 16) != 1)
+            die("%s: %s", ep, strerror(errno));
+        byte ^= 0x5a;
+        if (pwrite(fd, &byte, 1, 16) != 1 || fsync(fd) != 0)
+            die("%s: %s", ep, strerror(errno));
+        close(fd);
+        start(S);
+        await_view((S + 1) % 6, p_member_state, &up, "the stripe member back with a damaged EPOCH slot");
+    }
+    server_dir(S, hold, sizeof hold);
+    strcat(hold, "/state/holdcopy");
+    FILE *hf = fopen(hold, "w");
+    if (!hf)
+        die("%s: %s", hold, strerror(errno));
+    fclose(hf);
+    usleep(300000); /* a round of S's cluster thread */
+    uint32_t hnum;
+    for (uint64_t t0 = now_ms(); (rc = vol_add(meta_leader_of(6), "hx", 3, &hnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("volume add hx: %s", cluster_strerror(rc));
+    await_caught(S, 0, now_ms(), WAIT_MS, "its published copy held behind a volume add");
+    snprintf(needle, sizeof needle, "on member %" PRIu32 " failed", ids[S]);
+    int refused0 = log_count(L, needle), nec0 = ecb_ec_parts(L, num);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    for (uint64_t t0 = now_ms(); log_count(L, needle) == refused0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("no put to server %d (an unsure store, its copy held) was refused in 60 s: %d .ec parts, %d before", S,
+                ecb_ec_parts(L, num), nec0);
+    if (!log_has(S, "EPOCH slot 0 is damaged"))
+        die("server %d's store did not say its EPOCH slot 0 is damaged", S);
+    usleep(1000000);
+    if (ecb_ec_parts(L, num) != nec0)
+        die("a settle went through with server %d's store unsure and its copy not caught up", S);
+    printf("  an unsure store with its copy held: the put refused, nothing settled\n");
+    unlink(hold);
+    await_caught(S, 1, now_ms(), WAIT_MS, "its published copy let go");
+    ecb_write_day(c, ide, day0 + 4 * 86400000LL); /* a failed key waits an hour: another day */
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == nec0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("nothing settled 120 s after server %d's copy was let go", S);
+    printf("  the copy caught up raises it: the next day settles\n");
+
+    /* D13: chunks of a cluster volume are deleted only by a committed MK_GC (r8k). The rows expired, the .ec parts
+     * are retired, and every chunk stays (mutant delbeforegc deletes them). */
+    int nch = ecb_chunks(num);
+    if (nch == 0)
+        die("no chunk files of e42 in the stores");
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("retention of e42's series %d: %s", s, ers(rc));
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) != 0 || !log_has(L, "deleted only by a committed MK_GC");
+         usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("e42's expired .ec parts: %d still listed, the delete %s refused in 60 s", ecb_ec_parts(L, num),
+                log_has(L, "deleted only by a committed MK_GC") ? "was" : "not");
+    usleep(2000000); /* the gc worker's retries */
+    int nch2 = ecb_chunks(num);
+    if (nch2 != nch)
+        die("e42's chunks: %d before the drop, %d after: deleted with no MK_GC", nch, nch2);
+    printf("  the .ec parts dropped by retention: the delete refused, %d chunk files kept\n", nch);
     tsdbc_close(ct);
     tsdbc_close(c);
 }
