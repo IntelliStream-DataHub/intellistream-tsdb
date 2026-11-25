@@ -370,7 +370,9 @@ static bool idle_mutant_long;       /* --mutant-longnap: naps of 5 s without wat
 static int hang_problems;           /* power: a server that did not die within PULL_WAIT_S of SIGUSR2 */
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static char pullpath[PATH_MAX]; /* power: crashfs appends a line here for each power loss a SIGUSR2 asked for */
+static char cutpath[PATH_MAX];  /* power: crashfs appends "<pid> <mono_ns>" per power loss */
 static char slogpath[PATH_MAX]; /* the stderr of the server's latest start */
+static int wal_sync_ms;         /* --wal-sync-ms N: passed to tsdbd; periodic WAL sync durability window */
 
 /* The last lines a file holds (a server's log), to stderr: why it did not come up. */
 static void print_tail(const char *path)
@@ -1154,6 +1156,7 @@ static void start_server_run(bool faulty)
                 setenv("LD_PRELOAD", crashfs, 1);
                 setenv("CRASHFS_ROOT", dir, 1);
                 setenv("CRASHFS_PULL_FILE", pullpath, 1);
+                setenv("CRASHFS_CUT_FILE", cutpath, 1);
                 setenv("CRASHFS_SEED", sd, 1);
                 setenv("CRASHFS_PROB", crash_prob(), 1);
                 setenv("CRASHFS_WARMUP", "200", 1);
@@ -1206,12 +1209,17 @@ static void start_server_run(bool faulty)
                 if (lfd >= 0)
                     dup2(lfd, 2);
             }
-            const char *av[40] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
+            const char *av[48] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
                                   "--wal-max-batch-rows", "500", "--partition-ms", pms};
             int ac = 13;
             av[ac++] = follow; /* a killed run leaves no server behind */
             if (!auth)
                 av[ac++] = "--no-auth";
+            char wsms[32];
+            if (wal_sync_ms > 0) {
+                snprintf(wsms, sizeof wsms, "%d", wal_sync_ms);
+                av[ac++] = "--wal-sync-ms", av[ac++] = wsms;
+            }
             if (classes) {
                 av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
                 av[ac++] = "--merge-idle-s", av[ac++] = "1";
@@ -3903,6 +3911,40 @@ static int row_of(const wop *w, uint32_t k, bool incover)
 }
 
 static int latest_ok_answers, latest_violations;
+static bool *cuttable;
+static int64_t *cut_at;
+
+static int cmp_i64(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void load_cuts(int64_t **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    FILE *f = fopen(cutpath, "r");
+    if (!f)
+        return;
+    size_t cap = 64, n = 0;
+    int64_t *a = malloc(cap * sizeof *a);
+    long long t;
+    int pid;
+    while (a && fscanf(f, "%d %lld", &pid, &t) == 2) {
+        if (n == cap) {
+            cap *= 2;
+            a = realloc(a, cap * sizeof *a);
+        }
+        if (a)
+            a[n++] = (int64_t)t;
+    }
+    fclose(f);
+    if (a && n > 1)
+        qsort(a, n, sizeof *a, cmp_i64);
+    *out = a;
+    *nout = n;
+}
 
 static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
 {
@@ -3953,7 +3995,8 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
                 }
                 for (size_t j = 0; j < n; j++) {
                     const wop *w = &writes[cov[j]];
-                    if (cov[j] != v && w->st == ST_OK && w->complete < l->invoke && older(v, cov[j])) {
+                    if (cov[j] != v && w->st == ST_OK && w->complete < l->invoke && older(v, cov[j]) &&
+                        !(cuttable && cuttable[cov[j]] && l->complete >= cut_at[cov[j]])) {
                         LVIOL("value %u at key %u, but write %u (%s) was acknowledged before the request and began "
                               "after %u completed: stale\n",
                               v, k, cov[j], w->kind == W_INSERT ? "insert" : w->kind == W_NULL ? "null" : "delete or replace", v);
@@ -3972,7 +4015,8 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
                 }
                 for (size_t j = 0; j < n; j++) {
                     const wop *w = &writes[cov[j]];
-                    if (w->st != ST_OK || w->complete >= l->invoke)
+                    if (w->st != ST_OK || w->complete >= l->invoke ||
+                        (cuttable && cuttable[cov[j]] && l->complete >= cut_at[cov[j]]))
                         continue;
                     bool all_older = true; /* every null write that could be the row is older than w */
                     for (size_t x = 0; x < n && all_older; x++)
@@ -3999,7 +4043,8 @@ static void check_latest(uint32_t nw, const uint32_t *wc, const uint32_t *wl)
             for (size_t j = 0; j < n; j++) {
                 const wop *w = &writes[cov[j]];
                 int row = row_of(w, (uint32_t)k, true);
-                if (w->st != ST_OK || w->complete >= l->invoke || row == 0 || (row == 2 && !l->with_nulls))
+                if (w->st != ST_OK || w->complete >= l->invoke || row == 0 || (row == 2 && !l->with_nulls) ||
+                    (cuttable && cuttable[cov[j]] && l->complete >= cut_at[cov[j]]))
                     continue;
                 if (latest_removes(s, (uint32_t)k, w->invoke, l->complete, !l->with_nulls))
                     continue;
@@ -4068,6 +4113,16 @@ static int check(const uint32_t *final)
     if (nr > max_ops)
         nr = max_ops;
     bool *applied = calloc(nw, sizeof *applied);
+    bool *in_final = calloc(nw, sizeof *in_final);
+    bool *must_survive = calloc(nw, sizeof *must_survive);
+    bool *seen_after_cut = calloc(nw, sizeof *seen_after_cut);
+    int64_t *eff_time = malloc(nw * sizeof *eff_time);
+    cuttable = calloc(nw, sizeof *cuttable);
+    cut_at = malloc(nw * sizeof *cut_at);
+    for (uint32_t w = 0; w < nw; w++) {
+        eff_time[w] = writes[w].st == ST_OK ? writes[w].complete : INT64_MAX;
+        cut_at[w] = INT64_MAX;
+    }
     skeys = calloc(nw, sizeof *skeys);
     dcnt = calloc(koff[nseries] + 1, sizeof *dcnt);
     size_t ndel = 0;
@@ -4097,6 +4152,7 @@ static int check(const uint32_t *final)
                 continue;
             }
             applied[w] = true;
+            in_final[w] = true;
         }
     for (uint32_t i = 0; i < nr; i++) {
         rop *q = &reads[i];
@@ -4115,8 +4171,58 @@ static int check(const uint32_t *final)
                 continue;
             }
             applied[w] = true;
+            if (q->complete < eff_time[w])
+                eff_time[w] = q->complete;
         }
     }
+    int64_t *cuts = NULL;
+    size_t ncuts = 0;
+    int slack_ms = 0;
+    uint64_t durable_before_cut = 0, window_acked = 0;
+    if (wal_sync_ms > 0) {
+        load_cuts(&cuts, &ncuts);
+        slack_ms = wal_sync_ms / 2;
+        if (slack_ms < 50)
+            slack_ms = 50;
+        if (slack_ms > 250)
+            slack_ms = 250;
+        int64_t win_ns = (int64_t)(wal_sync_ms + slack_ms) * 1000000LL;
+        for (uint32_t w = 1; w < nw; w++) {
+            if (eff_time[w] == INT64_MAX || ncuts == 0)
+                continue;
+            size_t lo = 0, hi = ncuts;
+            while (lo < hi) {
+                size_t mid = (lo + hi) / 2;
+                if (cuts[mid] < writes[w].invoke)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (lo < ncuts) {
+                if (cuts[lo] - eff_time[w] <= win_ns) {
+                    cuttable[w] = true;
+                    cut_at[w] = cuts[lo];
+                    if (writes[w].st == ST_OK)
+                        window_acked++;
+                } else if (writes[w].st == ST_OK) {
+                    durable_before_cut++;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < nr; i++) {
+            rop *q = &reads[i];
+            if (q->st != ST_OK)
+                continue;
+            for (uint32_t k = q->lo; k < q->hi; k++) {
+                uint32_t w = q->seen[k - q->lo];
+                if (w && w < nw && cuttable[w] && q->invoke > cut_at[w])
+                    seen_after_cut[w] = true;
+            }
+        }
+    }
+    for (uint32_t w = 1; w < nw; w++)
+        must_survive[w] = wal_sync_ms == 0 ? applied[w]
+                                           : (in_final[w] || seen_after_cut[w] || (applied[w] && !cuttable[w]));
     /* 2. a definitely failed write was applied */
     for (uint32_t w = 1; w < nw; w++)
         if (applied[w] && writes[w].st == ST_FAIL)
@@ -4207,7 +4313,7 @@ static int check(const uint32_t *final)
     int before_loss = violations;
     uint64_t lost = 0;
     for (uint32_t w = 1; final && w < nw; w++) {
-        if (!applied[w])
+        if (!must_survive[w])
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
             uint32_t k = writes[w].keys[i], f = final[koff[writes[w].series] + k];
@@ -4225,7 +4331,7 @@ static int check(const uint32_t *final)
     }
     /* 1. for deletes: nothing older than an applied delete survives in its range */
     for (uint32_t w = 1; final && w < nw; w++) {
-        if (!applied[w] || writes[w].kind == W_INSERT)
+        if (!must_survive[w] || writes[w].kind == W_INSERT)
             continue;
         for (uint32_t k = writes[w].lo; k < writes[w].hi; k++) {
             uint32_t f = final[koff[writes[w].series] + k];
@@ -4238,6 +4344,37 @@ static int check(const uint32_t *final)
                     violations++;
             }
         }
+    }
+    if (wal_sync_ms > 0) {
+        uint64_t window_lost = 0;
+        double worst_lost_ms = 0;
+        for (uint32_t w = 1; final && w < nw; w++) {
+            if (writes[w].st != ST_OK || !cuttable[w])
+                continue;
+            bool wlost = false;
+            for (uint32_t i = 0; !wlost && i < writes[w].nkeys; i++) {
+                uint32_t k = writes[w].keys[i], f = final[koff[writes[w].series] + k];
+                if (f ? older_seen(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX))
+                    wlost = true;
+            }
+            for (uint32_t k = writes[w].lo; !wlost && writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
+                uint32_t f = final[koff[writes[w].series] + k];
+                if (f && f < nw && older_seen(f, w))
+                    wlost = true;
+            }
+            if (wlost) {
+                window_lost++;
+                double age = (double)(cut_at[w] - writes[w].complete) / 1e6;
+                if (age > worst_lost_ms)
+                    worst_lost_ms = age;
+            }
+        }
+        printf("wal-sync-ms %d (slack %d ms): %zu cuts, %llu durable writes before cuts, %llu in window (%llu lost, oldest %.1f ms before cut)\n",
+               wal_sync_ms, slack_ms, ncuts, (unsigned long long)durable_before_cut,
+               (unsigned long long)window_acked, (unsigned long long)window_lost, worst_lost_ms);
+        if (!strcmp(nemesis, "power") && seconds >= 10 && (ncuts == 0 || durable_before_cut == 0))
+            INCONCLUSIVE("walsync-coverage", "wal-sync-ms %d: %zu power cuts and %llu durable writes before cuts in %.0f s: periodic sync was not tested across a cut\n",
+                         wal_sync_ms, ncuts, (unsigned long long)durable_before_cut, seconds);
     }
     /* 3. atomic visibility: each distinct write seen by a read, checked once */
     uint32_t *distinct = malloc(400 * sizeof *distinct);
@@ -4292,11 +4429,12 @@ static int check(const uint32_t *final)
      * not show anything older than the newest-starting write completed by t. */
     typedef struct ack {
         int64_t complete, max_invoke, max_lb; /* max_lb: of lb (check 5), for acknowledged values */
+        uint32_t max_w;
     } ack;
     size_t total = 0;
     uint32_t *cnt = calloc(koff[nseries] + 1, sizeof *cnt);
     for (uint32_t w = 1; w < nw; w++)
-        if (writes[w].st == ST_OK) {
+        if (writes[w].st == ST_OK && !cuttable[w]) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
                 cnt[koff[writes[w].series] + writes[w].keys[j] + 1]++;
                 total++;
@@ -4311,14 +4449,14 @@ static int check(const uint32_t *final)
     ack *acks = malloc((total + 1) * sizeof *acks);
     uint32_t *fill = calloc(koff[nseries], sizeof *fill);
     for (uint32_t w = 1; w < nw; w++)
-        if (writes[w].st == ST_OK) {
+        if (writes[w].st == ST_OK && !cuttable[w]) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
                 size_t slot = koff[writes[w].series] + writes[w].keys[j];
-                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w]};
+                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w], w};
             }
             for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
                 size_t slot = koff[writes[w].series] + k;
-                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w]};
+                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w], w};
             }
         }
     for (size_t slot = 0; slot < koff[nseries]; slot++) {
@@ -4331,8 +4469,10 @@ static int check(const uint32_t *final)
                 a[y - 1] = t;
             }
         for (size_t x = 1; x < n; x++) {
-            if (a[x].max_invoke < a[x - 1].max_invoke)
+            if (a[x].max_invoke < a[x - 1].max_invoke) {
                 a[x].max_invoke = a[x - 1].max_invoke;
+                a[x].max_w = a[x - 1].max_w;
+            }
             if (a[x].max_lb < a[x - 1].max_lb)
                 a[x].max_lb = a[x - 1].max_lb;
         }
@@ -4352,14 +4492,41 @@ static int check(const uint32_t *final)
                 else
                     hi = mid;
             }
-            if (!lo)
+            int64_t req_inv = lo ? a[lo - 1].max_invoke : INT64_MIN;
+            int64_t req_lb = lo ? a[lo - 1].max_lb : INT64_MIN;
+            uint32_t req_w = lo ? a[lo - 1].max_w : 0;
+            if (wal_sync_ms > 0) {
+                const uint32_t *cov = wl + wc[slot];
+                size_t ncov = wc[slot + 1] - wc[slot];
+                for (size_t j = 0; j < ncov; j++) {
+                    uint32_t w = cov[j];
+                    if (writes[w].st == ST_OK && cuttable[w] && writes[w].complete < q->invoke &&
+                        q->complete < cut_at[w]) {
+                        if (writes[w].invoke > req_inv) {
+                            req_inv = writes[w].invoke;
+                            req_w = w;
+                        }
+                        if (lb[w] > req_lb)
+                            req_lb = lb[w];
+                    }
+                }
+            }
+            if (req_inv == INT64_MIN)
                 continue;
             uint32_t seen = q->seen[k - q->lo];
-            if (seen ? seen < nw && writes[seen].complete < a[lo - 1].max_invoke
-                     : !absent_ok(q->series, k, a[lo - 1].max_invoke, q->complete))
-                VIOLATION("read %u shows %u at series %d key %u, older than an acknowledged write: stale\n", i, seen,
-                          q->series, k);
-            else if (seen && seen < nw && writes[seen].st == ST_OK && writes[seen].complete < a[lo - 1].max_lb)
+            if (seen ? seen < nw && writes[seen].complete < req_inv
+                     : !absent_ok(q->series, k, req_inv, q->complete)) {
+                double cut_ms = -1;
+                if (wal_sync_ms > 0 && req_w && ncuts > 0) {
+                    for (size_t c = 0; c < ncuts; c++)
+                        if (cuts[c] >= writes[req_w].invoke) {
+                            cut_ms = (double)(cuts[c] - writes[req_w].complete) / 1e6;
+                            break;
+                        }
+                }
+                VIOLATION("read %u shows %u at series %d key %u, older than an acknowledged write %u (%.1f ms before cut): stale\n",
+                          i, seen, q->series, k, req_w, cut_ms);
+            } else if (seen && seen < nw && writes[seen].st == ST_OK && writes[seen].complete < req_lb)
                 VIOLATION("read %u shows %u at series %d key %u, acknowledged before a read saw a later acknowledged "
                           "write to it not yet in effect (check 5): stale\n", i, seen, q->series, k);
         }
@@ -4376,6 +4543,15 @@ static int check(const uint32_t *final)
     free(wl);
     free(wc);
     free(applied);
+    free(in_final);
+    free(must_survive);
+    free(seen_after_cut);
+    free(eff_time);
+    free(cuts);
+    free(cuttable);
+    cuttable = NULL;
+    free(cut_at);
+    cut_at = NULL;
     for (uint32_t w = 0; skeys && w < nw; w++)
         free(skeys[w]);
     free(skeys);
@@ -5220,6 +5396,7 @@ int main(int argc, char **argv)
                                    {"feed", no_argument, 0, 'E'},           {"tier", required_argument, 0, 'T'},
                                    {"scan-tier", required_argument, 0, 'S'},
                                    {"auth", no_argument, 0, 'A'},           {"outagefs", required_argument, 0, 'o'},
+                                   {"wal-sync-ms", required_argument, 0, 'W'},
                                    {"mutant-idle", no_argument, 0, 'I'},
                                    {"mutant-longnap", no_argument, 0, 'L'},
                                    {"mutant-nemesis", required_argument, 0, 'M'},
@@ -5267,6 +5444,7 @@ int main(int argc, char **argv)
             return 0;
         }
         case 'o': outagefs_lib = optarg; break;
+        case 'W': wal_sync_ms = atoi(optarg); break;
         default: return 2;
         }
     }
@@ -5277,10 +5455,12 @@ int main(int argc, char **argv)
     bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md || outage || settle_steps;
     if (!dir || (shim && !outage && !crashfs) || (outage && (!outagefs_lib || classes || auth)) ||
         ((md || rot) && classes) || tier_n < 0 || (tier_n && (tier_n < 3 || outage || md || rot || verify)) ||
-        (settle_steps && !tier_n)) {
+        (settle_steps && !tier_n) || wal_sync_ms < 0 ||
+        (wal_sync_ms > 0 && (classes || (strcmp(nemesis, "power") && strcmp(nemesis, "none"))))) {
         fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|outage|settle-steps|none]\n"
                         "              [--seconds S] [--clients N] [--seed N] [--crashfs build/libcrashfs.so]\n"
                         "              [--workload kv|classes] [--verify-checksums]   (misdirect and rot: workload kv)\n"
+                        "              [--wal-sync-ms MS]   (periodic WAL sync: workload kv under power or none)\n"
                         "              [--auth] [--feed] [--tier N]   (N stores, at least 3; not with outage, misdirect, rot or\n"
                         "              --verify-checksums; settle-steps needs it)\n"
                         "              [--outagefs build/liboutagefs.so]   (outage: workload kv, no login)\n");
@@ -5337,6 +5517,8 @@ int main(int argc, char **argv)
     rm_cmd = cmd;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
     snprintf(pullpath, sizeof pullpath, "%s.pulls", dir);
+    snprintf(cutpath, sizeof cutpath, "%s.cuts", dir);
+    unlink(cutpath);
     snprintf(exitmark, sizeof exitmark, "%s.cut", dir);
     if (md || rot)
         snprintf(slogpath, sizeof slogpath, "%s.e%d.server.log", dir, epoch);
@@ -5487,7 +5669,7 @@ int main(int argc, char **argv)
             md_death(st, 0, pid);
         server_gone();
     }
-    stop_server(strcmp(nemesis, "eio") ? SIGKILL : SIGTERM); /* eio: the shim rolls back at a normal exit */
+    stop_server(!strcmp(nemesis, "eio") || wal_sync_ms > 0 ? SIGTERM : SIGKILL); /* eio: the shim rolls back at a normal exit; wal_sync_ms > 0: clean stop flushes unsynced buffer */
     uint32_t *final = calloc(koff[nseries], sizeof *final), *again = calloc(koff[nseries], sizeof *again);
     if (!damaged) /* misdirect, rot: a database refused while the clients ran has no final state */
         start_server(false);
@@ -5599,6 +5781,8 @@ int main(int argc, char **argv)
     JP_PHASE("the cleanup (rm -rf of the directory)");
     unlink(markpath);
     unlink(pullpath);
+    if (!v || !getenv("JEPSEN_KEEP"))
+        unlink(cutpath);
     {
         glob_t g; /* exitmark.<pid> of servers that were stopped, not read */
         char pat[PATH_MAX + 8];

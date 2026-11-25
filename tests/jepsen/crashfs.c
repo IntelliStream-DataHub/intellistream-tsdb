@@ -142,6 +142,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FDS 65536
@@ -249,6 +250,7 @@ REAL(closedir);
 static volatile sig_atomic_t power_losing; /* the power loss is rolling files back: another thread that reads a mapping of one gets SIGBUS */
 static volatile sig_atomic_t usr2_seen; /* only a SIGUSR2 sets it: the power loss line says so (jepsen counts the nemesis's own) */
 static char pull_file[PATH_MAX];        /* $CRASHFS_PULL_FILE: a line per power loss that a SIGUSR2 asked for, written by the shim */
+static char cut_file[PATH_MAX];         /* $CRASHFS_CUT_FILE: "<pid> <mono_ns>\n" per power loss, for wal_sync_ms window checks */
 static int ignore_usr2;                 /* $CRASHFS_IGNORE_USR2: 1: a shim that does not honour the pull, 2: one that honours it and does not log it (jepsen's self-test of its count) */
 
 /* The harness's proof of a plug it pulled is written where the signal is delivered, not where the process dies of it: a loss
@@ -387,6 +389,8 @@ __attribute__((constructor)) static void init(void)
         prob = 0;
     if (getenv("CRASHFS_PULL_FILE"))
         snprintf(pull_file, sizeof pull_file, "%s", getenv("CRASHFS_PULL_FILE"));
+    if (getenv("CRASHFS_CUT_FILE"))
+        snprintf(cut_file, sizeof cut_file, "%s", getenv("CRASHFS_CUT_FILE"));
     ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") ? atoi(getenv("CRASHFS_IGNORE_USR2")) : 0;
     signal(SIGUSR2, on_usr2);
     signal(SIGBUS, on_bus);
@@ -998,6 +1002,22 @@ __attribute__((noreturn)) static void power_loss(void)
 {
     power_losing = 1;
     rollback();
+    /* Stamp after rollback(), right before _exit(99): with wal_sync_ms > 0, in-memory writes on other
+     * threads do not touch files and can still reply while rollback() runs, so their invoke/complete
+     * times are strictly before _exit(99) rather than before rollback() began. */
+    if (cut_file[0]) {
+        struct timespec cut_ts;
+        clock_gettime(CLOCK_MONOTONIC, &cut_ts);
+        int64_t cut_ns = (int64_t)cut_ts.tv_sec * 1000000000LL + cut_ts.tv_nsec;
+        char cline[96];
+        int cn = snprintf(cline, sizeof cline, "%d %lld\n", (int)getpid(), (long long)cut_ns);
+        int cfd = (int)syscall(SYS_openat, AT_FDCWD, cut_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (cfd >= 0) {
+            if (syscall(SYS_write, cfd, cline, (size_t)cn) < 0) {
+            }
+            syscall(SYS_close, cfd);
+        }
+    }
     char msg[200];
     /* "requested by SIGUSR2": the harness (tests/jepsen/jepsen.c) pulled the plug; without it the loss was drawn by the
      * shim's own odds. The harness counts the first kind from this line, not from its own bookkeeping. */

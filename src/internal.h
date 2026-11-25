@@ -84,6 +84,7 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_WTAIL_SORT_NO_MAX };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
+extern int eng_test_flusher_fail; /* db.c: tests: the next n flusher thread starts fail */
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */

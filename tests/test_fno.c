@@ -926,6 +926,53 @@ static void test_wal_cadence(void)
     printf("  the first periodic WAL sync is due wal_sync_ms after the open, the next a period later, and syncs\n");
 }
 
+/* F7: if the flusher/syncer thread fails to start (e.g. with wal_sync_ms > 0), eng_open / tsdb_open must fail
+ * cleanly and release all resources (lock, descriptors, memory, mergers) rather than succeeding with nothing syncing. */
+static void test_flusher_start_fail(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("flusherfail", dir, sizeof dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 2;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 50;
+
+    eng *db = (eng *)0x1;
+    eng_test_flusher_fail = 1;
+    int rc = eng_open(dir, &o, &db);
+    CHECK(rc != 0 && db == NULL);
+    CHECK(eng_test_flusher_fail == 0);
+
+    /* LOCK and resources were cleaned up, so an immediate open on the same directory succeeds. */
+    CHECK(eng_open(dir, &o, &db) == 0 && db != NULL);
+    if (db) {
+        uint32_t s;
+        CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+        rows(db, s, T0, 3);
+        wal_flush_now(db);
+        CHECK(eng_close(db) == 0);
+    }
+
+    /* Reopen via tsdb_open with existing data + WAL + merger threads while flusher start fails. */
+    tsdb *tdb = (tsdb *)0x1;
+    eng_test_flusher_fail = 1;
+    rc = tsdb_open(dir, &o, &tdb);
+    CHECK(rc != 0 && tdb == NULL);
+    CHECK(eng_test_flusher_fail == 0);
+
+    CHECK(tsdb_open(dir, &o, &tdb) == 0 && tdb != NULL);
+    tsdb_sid sid;
+    CHECK(tsdb_series_lookup(tdb, "s", &sid) == 0);
+    tsdb_points p;
+    CHECK(tsdb_query_points(tdb, sid, INT64_MIN, INT64_MAX, &p) == 0);
+    CHECK(p.n == 3);
+    free(p.ts);
+    free(p.values);
+    CHECK(tsdb_close(tdb) == 0);
+    printf("  flusher thread start failure fails eng_open and tsdb_open cleanly without leaking resources or LOCK\n");
+}
+
 static void test_wal_races(void)
 {
     char dir[PATH_MAX + 32];
@@ -1158,6 +1205,7 @@ int main(int argc, char **argv)
         test_wal_split();
         test_wal_clock();
         test_wal_cadence();
+        test_flusher_start_fail();
         test_wal_flush_tail();
         test_wal_races();
         test_sync_far_stays();

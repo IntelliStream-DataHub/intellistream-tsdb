@@ -858,6 +858,8 @@ int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, e
     return rc;
 }
 
+int eng_test_flusher_fail;
+
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
@@ -1086,8 +1088,16 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     db->last_wal_sync_ms = eng_mono_ms();
     if (eng_test_mutant == MUT_WALSYNC_FROM_ZERO) /* planted: the old clock from 0 on a machine up for a period */
         db->last_wal_sync_ms -= db->opt.wal_sync_ms;
-    if (!ro && tsdb_thread_create(&db->flusher, flusher_main, db) == 0)
+    if (!ro) {
+        int trc = eng_test_flusher_fail > 0 ? (eng_test_flusher_fail--, EAGAIN)
+                                            : tsdb_thread_create(&db->flusher, flusher_main, db);
+        if (trc != 0) {
+            fprintf(stderr, "tsdb: %s: cannot start flusher thread: %s\n", dir, strerror(trc));
+            rc = TSDB_ERR_NOMEM;
+            goto fail;
+        }
         db->has_flusher = true;
+    }
     if (!ro && atomic_load(&db->feed_on) && (rc = feed_cleaner_start(db)) != 0)
         goto fail;
     atomic_store(&db->follow_ok_ms, eng_mono_ms());
