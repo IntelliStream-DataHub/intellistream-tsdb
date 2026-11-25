@@ -13,7 +13,8 @@
 # nothing instead of a close), fwdtailclose (the entry ignores the owner's close), fwdepoch (the owner skips its epoch
 # check) and fwdgone (a forward whose client left keeps waiting); test_cluster fwdseries must catch fwdcreateread (a
 # SERIES or STATE that creates judged a read: a replica serving reads answers MOVED instead of forwarding it);
-# forward must catch fwdopkind (the owner serves a write that came on the read link).
+# forward must catch fwdopkind (the owner serves a write that came on the read link) and fwdopkindread (it serves a read
+# that came on the write link: the check one way only).
 # fwdretry (a lost forward sent again) is test_fwd's (make test runs its mutants).
 # A mutant counts as caught only by its intended FAIL line (the first FAIL of the run must match the mutant's pattern):
 # a flake, a timeout, a crash or a FAIL in another part is reported as WRONG and fails the run like a survivor.
@@ -22,7 +23,8 @@
 set -u
 dir=${1:-/tmp}; shift || true
 muts=${*:-fwdoldframe fwdunavonbreak fwdnouser fwdnowait fwdauthlag fwdnolease fwdtwice fwdchunknowait fwdinline
-    fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone fwdcreateread fwdopkind}
+    fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone fwdcreateread fwdopkind
+    fwdopkindread}
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
 tc=${TEST_CLUSTER:-build/test_cluster}
 bad=
@@ -46,6 +48,7 @@ for m in $muts; do
     fwdgone) sc=forward pat='whose client left is still in flight' ;;
     fwdcreateread) sc=fwdseries pat='a series created by path through the replica' ;;
     fwdopkind) sc=forward pat='a write sent on the read link' ;;
+    fwdopkindread) sc=forward pat='a read sent on the write link' ;;
     *) echo "fwd_mutants: unknown mutant $m" >&2; exit 2 ;;
     esac
     log=$dir/mut-$m-$sc.log

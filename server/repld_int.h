@@ -113,6 +113,9 @@ struct rvol {
     uint32_t *lens;
     uint32_t crec;
     uint64_t *coff; /* byte offset of each record of cur */
+    const char *bad_said[16]; /* the (type, reason) pairs msg_refused said a drop of: the first of each is said */
+    int bad_said_t[16];
+    int nbad_said;
     uint64_t bad_msgs; /* peer messages msg_refused dropped (a flipped bit: the links carry no check by default) */
     uint64_t flip_n;   /* TSDB_REPLD_TEST=flipin: APPENDs with records seen */
     int sync_wanted;
@@ -230,8 +233,14 @@ enum {
     RM_NOMSGCHECK,       /* repld.c: a peer message is handed to the core unchecked (msg_refused: metadata-only types,
                           * an ACK beyond the log, records unlike their descriptors) */
     RM_BULKFRAMES,       /* repld.c: a driver frame on a kind-2 (bulk) link is taken as on the LOG link */
-    RM_NOMETAREFUSE      /* repld.c: msg_refused lets a metadata-only type (FENCE, META, ...) from a peer reach the core */
+    RM_NOMETAREFUSE,     /* repld.c: msg_refused lets a metadata-only type (FENCE, META, ...) from a peer reach the core */
+    RM_METAFENCEONLY,    /* repld.c: msg_refused refuses only a FENCE from a peer (FENCE_REPLY, META, ISR_REQ, RESIGN pass) */
+    RM_NOEPOCHBOUND,     /* repld.c: a peer message's epochs are not bounded by the highest this member knows */
+    RM_NODESCEPOCH,      /* repld.c: an APPEND's descriptor epochs are not checked against prev_epoch and its epoch */
+    RM_NODESCCMP         /* repld.c: a record is not compared with its descriptor's position and span */
 };
+
+enum { FI_REC = 1, FI_EPOCH, FI_DESC }; /* TSDB_REPLD_TEST=flipin[=epoch|desc] (repld.c flip_received) */
 
 struct repld_g {
     uint32_t isr_rot; /* (atomic) where repld_isr_requests starts its next report */
@@ -255,8 +264,9 @@ struct repld_g {
     uint64_t spill_bytes; /* a bulk file larger than this is received into a spill file (TSDB_REPLD_TEST=spill: 64 KiB) */
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
-    int flip_in;        /* TSDB_REPLD_TEST=flipin: one byte of a record of every 8th APPEND received is flipped */
-    int meta_in;        /* TSDB_REPLD_TEST=metain: every 8th APPEND received has its type flipped into a FENCE above it */
+    int flip_in;        /* TSDB_REPLD_TEST=flipin[=epoch|desc] (FI_*): a field of every 8th APPEND received is flipped */
+    int meta_in;        /* TSDB_REPLD_TEST=metain: every 8th APPEND received has its type flipped into a metadata-only
+                         * type in turn, its epoch one above the leader's */
     int bulk_frame;     /* TSDB_REPLD_TEST=bulkframe: every 16th APPEND is also sent on the peer's bulk link */
     int cut_links;      /* TSDB_REPLD_TEST=cutlinks: a message of any volume from node N is dropped as it arrives while
                          * <dir>/cutfrom.N exists (test_cluster cut) */

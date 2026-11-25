@@ -2633,7 +2633,7 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
 enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
        FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH,
-       FWM_CREATEREAD, FWM_OPKIND };
+       FWM_CREATEREAD, FWM_OPKIND, FWM_OPKINDREAD };
 static int fwdx_mutant;
 /* For route_decide alone: the request writes, by auth_ops' R_WRITE or a SERIES or STATE whose `create` byte is set
  * (create_at, which raises its need to R_INSERT). Such a lookup that creates is judged a read by its need alone
@@ -4236,7 +4236,8 @@ static void fwd_serve(struct fjob *j)
         atomic_store(&pc.closing, true); /* not ours to read: the entry node closes its client's connection */
         goto done;
     }
-    if (((auth_ops[e.op].need & R_WRITE) != 0) != (j->kind == PL_KIND_FWD) && fwdx_mutant != FWM_OPKIND) {
+    if (((auth_ops[e.op].need & R_WRITE) != 0) != (j->kind == PL_KIND_FWD) && fwdx_mutant != FWM_OPKIND &&
+        !(fwdx_mutant == FWM_OPKINDREAD && j->kind == PL_KIND_FWD)) {
         /* a write on the read link or a read on the write link: the entry chose the kind by the op (fwd_entry), so
          * the op or the kind is not what it sent (the link's frame check is off by default). Neither is trusted:
          * the connection ends, nothing runs and no reply goes, so the entry's frames on it are WRITTEN and lost */
@@ -6138,7 +6139,7 @@ int main(int argc, char **argv)
                                             "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
                                             "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
                                             "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
-                                            "fwdcreateread", "fwdopkind"};
+                                            "fwdcreateread", "fwdopkind", "fwdopkindread"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;

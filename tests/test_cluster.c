@@ -6277,6 +6277,23 @@ static void scen_forward(void)
                wm.ms);
     }
 
+    /* m2. the other way: a read that reaches the owner on the write link (FWD) is refused the same way; served, a
+     *     flipped op on FWD could make a write look like a read there (review F5: the check one way only) */
+    {
+        tsdbc *cq = login_retry(R, "root", "root-pw", 0);
+        tsdbc_set_timeout(cq, 8000);
+        fw_knob("opkind", 1);
+        uint64_t t0 = now_ms();
+        int rq = tsdbc_query_raw(cq, id, 0, INT64_MAX / 2, count_rows, NULL);
+        uint64_t ms = now_ms() - t0;
+        fw_knob("opkind", 0);
+        tsdbc_close(cq);
+        if (rq != TSDB_ERR_IO || ms >= 4000)
+            die("a read sent on the write link: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(rq), ms);
+        printf("  a read sent on the write link is refused by the owner: the connection closes (%" PRIu64 " ms)\n", ms);
+    }
+
     /* n. the owner leads at another epoch than the one the entry stamped: refused before anything is done, never run.
      *    The owner's copy names itself, so route_fill answers UNAVAILABLE (MOVED to itself would send the client round in
      *    a circle); an owner whose copy names another leader answers MOVED. Either says "not applied": the client resends
@@ -13060,12 +13077,56 @@ static void scen_replflip(void)
 static void scen_replmeta(void)
 {
     int L = repl_hook_run("replmeta", "TSDB_REPLD_TEST=metain");
+    /* every type in turn (metain): FENCE 6, FENCE_REPLY 7, META 8, ISR_REQ 9, RESIGN 10 (src/repl.h); the driver says
+     * the first drop of each type, so each must have its own line on both replicas (TSDB_REPLD_MUTANT=metafenceonly:
+     * the four after FENCE reach the core) */
+    for (int t = 6; t <= 10; t++) {
+        char needle[64];
+        snprintf(needle, sizeof needle, "a message of type %d from node", t);
+        int seen = 0;
+        for (int i = 0; i < 3; i++)
+            seen += i != L && log_has(i, needle) && log_has(i, "a metadata-only type from a peer");
+        if (seen != 2)
+            die("no metadata-only message of type %d was refused on %d of the two replicas", t, 2 - seen);
+    }
+    printf("  replmeta: 200 rows, every 8th APPEND turned into each metadata-only type at each replica and dropped, "
+           "all in both logs\n");
+    stop_all();
+}
+
+/* replepoch (rd-nocheck review F1): no epoch a peer names may lie above the highest the member knows, or one flipped
+ * bit fences the replica durably above every epoch the group will hand out (the leader stops taking writes), and a
+ * descriptor's epoch goes up from prev_epoch to the message's, or the history takes a wrong epoch (the replica stops).
+ * TSDB_REPLD_TEST=flipin=epoch flips, in turn, bit 40 and bit 1 of every 8th APPEND's epoch and bit 40 of its first
+ * descriptor's epoch as it is received; each is dropped and sent again. Mutants noepochbound, nodescepoch. */
+static void scen_replepoch(void)
+{
+    int L = repl_hook_run("replepoch", "TSDB_REPLD_TEST=flipin=epoch");
+    const char *why[] = {"an epoch above the highest this member knows", "a descriptor's epoch out of order"};
+    for (int w = 0; w < 2; w++) {
+        int seen = 0;
+        for (int i = 0; i < 3; i++)
+            seen += i != L && log_has(i, why[w]);
+        if (seen != 2)
+            die("no APPEND was dropped for %s on %d of the two replicas", why[w], 2 - seen);
+    }
+    printf("  replepoch: 200 rows, epochs of every 8th APPEND flipped at each replica and dropped, all in both logs\n");
+    stop_all();
+}
+
+/* repldesc (rd-nocheck review F5): a descriptor's position or span flipped with its record intact. The record's own
+ * checksum holds, so only the comparison with the descriptor (msg_refused) drops it. TSDB_REPLD_TEST=flipin=desc;
+ * mutant nodesccmp. */
+static void scen_repldesc(void)
+{
+    int L = repl_hook_run("repldesc", "TSDB_REPLD_TEST=flipin=desc");
     int seen = 0;
     for (int i = 0; i < 3; i++)
-        seen += i != L && log_has(i, "a metadata-only type from a peer");
+        seen += i != L && log_has(i, "a record unlike its descriptor");
     if (seen != 2)
-        die("no metadata-only message was refused on %d of the two replicas", 2 - seen);
-    printf("  replmeta: 200 rows, every 8th APPEND turned into a FENCE at each replica and dropped, all in both logs\n");
+        die("no APPEND with a flipped descriptor was dropped on %d of the two replicas", 2 - seen);
+    printf("  repldesc: 200 rows, a descriptor of every 8th APPEND flipped at each replica and dropped, all in both "
+           "logs\n");
     stop_all();
 }
 
@@ -18458,7 +18519,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};
