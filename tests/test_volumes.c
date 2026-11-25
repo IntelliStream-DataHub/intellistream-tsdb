@@ -606,10 +606,19 @@ static void test_concurrent_adds(const char *base)
     tsdb *db;
     tsdb_sid id;
     uint32_t v;
-    OK(tsdb_open(root, &o, &db));
+    /* The adders fork before the writer opens: a child of a process with threads (the engine's query helpers, merge
+     * and flush threads) may allocate only what fork left consistent, and ASan's allocator is not (a child hung in its
+     * free, holding the VOLUMES lock, while the others waited for it). They start once the writer is open, so the adds
+     * still run beside an open writer. */
+    int go[2];
+    CHECK(pipe(go) == 0);
     pid_t kids[PROCS];
     for (int k = 0; k < PROCS; k++) {
         if ((kids[k] = fork()) == 0) {
+            char c;
+            close(go[1]);
+            if (read(go[0], &c, 1) != 1)
+                _exit(99);
             int bad = 0;
             for (int i = 0; i < EACH; i++) {
                 snprintf(p, sizeof p, "%s/c%d_%d", top, k, i);
@@ -619,6 +628,12 @@ static void test_concurrent_adds(const char *base)
         }
         CHECK(kids[k] > 0);
     }
+    close(go[0]);
+    OK(tsdb_open(root, &o, &db));
+    char start[PROCS];
+    memset(start, 'g', sizeof start);
+    CHECK(write(go[1], start, sizeof start) == (ssize_t)sizeof start);
+    close(go[1]);
     for (int k = 0; k < PROCS; k++) {
         int st = -1;
         CHECK(kids[k] > 0 && waitpid(kids[k], &st, 0) == kids[k] && WIFEXITED(st) && WEXITSTATUS(st) == 0);
