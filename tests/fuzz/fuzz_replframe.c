@@ -6,10 +6,13 @@
  * xxh64 against the one-shot, and the replication driver's payloads (server/replwire.c).
  *
  * Input: byte 0 picks the mode (mod 10), the rest is the data:
- *   0  a byte stream of frames, tags not checked, fed in pieces whose sizes come from byte 1
+ *   0  a byte stream of frames, checks not verified (byte 1 mod 3 picks the level: none, header, full, which sets
+ *      the check's length), fed in pieces of byte 1 / 3 + 1 bytes: any bytes, no crash, nothing read outside a frame
  *   1  one frame body: byte 1 is the type, the rest the payload
- *   2  a round trip: the data is encoded as a (compressed) frame of type byte 1 and must come back exactly, with
- *      its tag checked
+ *   2  a round trip at the level byte 1 / 111 picks (none, header, full): the data is encoded as a (compressed) frame
+ *      of type 1 + byte 1 mod 111 and must come back exactly, its check verified; then each of its last 64 bytes
+ *      flipped: under full the frame never arrives, under header it arrives only with its type, length and payload
+ *      head intact (a check byte flipped never), under none whatever arrives, nothing crashes
  *   3  a HELLO body
  *   4  the data hashed whole and in two pieces (cut at byte 1 mod len) against xxh64()
  *   5  a replication message (RW_T_MSG); one that decodes must encode back to the same bytes
@@ -92,8 +95,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(p, data + 2, n);
     struct cnt c = {0, p, p + n};
     if (mode == 0) {
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, SALT, 1);
-        size_t step = (size_t)arg + 1;
+        struct pl_reader *r = pl_reader_new(PL_CHECK_NONE + arg % 3, SALT, 1);
+        size_t step = (size_t)arg / 3 + 1;
         for (size_t off = 0; off < n; off += step)
             if (pl_reader_feed(r, p + off, n - off < step ? n - off : step, on_msg, &c) != 0)
                 break;
@@ -106,27 +109,35 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         free(own);
     } else if (mode == 2) {
         uint8_t type = (uint8_t)(1 + arg % PL_USER_TYPE_MAX);
+        int ck = PL_CHECK_NONE + arg / PL_USER_TYPE_MAX; /* 0..255 / 111: none, header, full */
+        size_t cl = pl_check_len(ck);
         uint64_t seq = 0;
         uint8_t *fr;
-        size_t fl = pl_frame_encode(PL_CHECK_XXH3, SALT, &seq, 1, type, p, n, &fr);
+        size_t fl = pl_frame_encode(ck, SALT, &seq, 1, type, p, n, &fr);
         if (!fl)
             abort();
-        struct pl_reader *r = pl_reader_new(PL_CHECK_XXH3, SALT, 0);
+        struct pl_reader *r = pl_reader_new(ck, SALT, 0);
         struct pl_msg got = {0};
         struct grab box = {&got, NULL};
         if (pl_reader_feed(r, fr, fl, grab_msg, &box) != 0 || !box.copy || got.type != type || got.n != n ||
             (n && memcmp(box.copy, p, n)))
             abort();
         free(box.copy);
-        /* a flipped bit anywhere must end the stream */
+        /* a flipped bit in its last 64 bytes: what the level's check covers ends the stream */
         for (size_t i = 0; i < fl && i < 64; i++) {
             uint8_t *bad = malloc(fl);
             memcpy(bad, fr, fl);
             bad[fl - 1 - i] ^= 1;
-            struct pl_reader *r2 = pl_reader_new(PL_CHECK_XXH3, SALT, 0);
-            struct cnt c2 = {0, NULL, NULL};
-            if (pl_reader_feed(r2, bad, fl, on_msg, &c2) == 0 && c2.frames)
+            struct pl_reader *r2 = pl_reader_new(ck, SALT, 0);
+            struct pl_msg g2 = {0};
+            struct grab b2 = {&g2, NULL};
+            int ok = pl_reader_feed(r2, bad, fl, grab_msg, &b2) == 0 && b2.copy;
+            size_t h = n < PL_CHECK_SPAN ? n : PL_CHECK_SPAN;
+            if (ok && (ck == PL_CHECK_FULL || (ck == PL_CHECK_HEADER && i < cl)))
                 abort();
+            if (ok && ck == PL_CHECK_HEADER && (g2.type != type || g2.n != n || (h && memcmp(b2.copy, p, h))))
+                abort();
+            free(b2.copy);
             pl_reader_free(r2);
             free(bad);
         }
@@ -287,16 +298,23 @@ void fuzz_seeds(const char *dir)
     /* a compressed user frame: raw length 300, then a zstd frame (the round trip makes real ones) */
     uint8_t z[64] = {44, 1, 0, 0, 0x28, 0xb5, 0x2f, 0xfd};
     put_frame(dir, "seed-zstd-bad", 1, 0x80 | 5, z, sizeof z);
-    /* a stream of two frames, no checks verified: len 17 (type + 16 check bytes), type PING; then a user frame */
+    /* a stream of two frames at level none (byte 1 = 6: none, pieces of 3 bytes): len 1, type PING; then a user
+     * frame; and the same at full (byte 1 = 8: 16 check bytes, not verified, pieces of 3) */
     uint8_t s[200] = {0};
-    le(s, 1 + PL_CHECK_LEN, 4), s[4] = PLT_PING;
-    le(s + 21, 6 + PL_CHECK_LEN, 4), s[25] = 9, memset(s + 26, 0x55, 5);
-    put_frame(dir, "seed-stream", 0, 7, s, 21 + 4 + 6 + PL_CHECK_LEN);
+    le(s, 1, 4), s[4] = PLT_PING;
+    le(s + 5, 6, 4), s[9] = 9, memset(s + 10, 0x55, 5);
+    put_frame(dir, "seed-stream", 0, 6, s, 5 + 4 + 6);
+    memset(s, 0, sizeof s);
+    le(s, 1 + 16, 4), s[4] = PLT_PING;
+    le(s + 21, 6 + 16, 4), s[25] = 9, memset(s + 26, 0x55, 5);
+    put_frame(dir, "seed-stream-full", 0, 8, s, 21 + 4 + 6 + 16);
     uint8_t text[300];
     for (size_t i = 0; i < sizeof text; i++)
         text[i] = (uint8_t)("tsdb log frame "[i % 15]);
     put_frame(dir, "seed-roundtrip-text", 2, 4, text, sizeof text);
     put_frame(dir, "seed-roundtrip-small", 2, 1, "x", 1);
+    put_frame(dir, "seed-roundtrip-text-header", 2, 111 + 4, text, sizeof text);
+    put_frame(dir, "seed-roundtrip-text-full", 2, 222 + 4, text, sizeof text);
     uint8_t h[80] = {0};
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
     h[76] = PL_CHECKS_KNOWN, h[77] = PL_CAPS;

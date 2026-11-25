@@ -108,6 +108,10 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_S("cluster.bmc", "bmc", "", "The address of this node's BMC, for fencing."),
     CK_B("cluster.witness", "witness", "false", "A member that only votes: no volumes, no client port."),
     CK_E("cluster.read.barrier", "read-barrier", "on|off", "on", "Whether reads wait for the leader's confirmation."),
+    CK_E("cluster.peer.check", "peer-check", "none|header|full", "none",
+         "The check on every frame of the data links between members: none (the payloads' own checksums and the "
+         "receivers' bounds checks), header (8 bytes over each frame's header and its payload's first 256 bytes) or "
+         "full (16 bytes over every byte). A link runs at the stronger of its two ends' levels."),
     CK_E("cluster.forward", "forward", "on|off", "on",
          "Whether a request for a volume another member leads is forwarded there (on) or answered MOVED to it (off)."),
     CK_D("cluster.fwd.wait", "fwd-wait-ms", "ms", "2s",

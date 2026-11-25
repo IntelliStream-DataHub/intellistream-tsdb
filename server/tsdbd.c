@@ -124,6 +124,7 @@
 #include "chunksrv.h"
 #include "chunkpeer.h"
 #include "fwd.h"
+#include "peerlink.h" /* --peer-check */
 #include "fwdreq.h"
 #include "cvol.h"
 #include "repld.h"
@@ -5611,6 +5612,7 @@ int main(int argc, char **argv)
                                    {"fwd-reply-ms", required_argument, 0, 0x112},
                                    {"fwd-workers", required_argument, 0, 0x113},
                                    {"forward", required_argument, 0, 0x114},
+                                   {"peer-check", required_argument, 0, 0x11c},
                                    {"chunk-dir", required_argument, 0, 0x115},
                                    {"chunk-rate-mb-s", required_argument, 0, 0x116},
                                    {"ec-settle-grace-s", required_argument, 0, 0x117},
@@ -5804,6 +5806,16 @@ int main(int argc, char **argv)
             }
             cluster_opts = 1;
             break;
+        case 0x11c: { /* the data links' frame check level (server/plcheck.h): every peerlink of this process */
+            int lv = peerlink_check_parse(optarg);
+            if (lv < 0) {
+                fprintf(stderr, "tsdbd: --peer-check %s: expected none, header or full\n", optarg);
+                return 2;
+            }
+            peerlink_set_check_level(lv);
+            cluster_opts = 1;
+            break;
+        }
         case 0x115:
             if (nchunk >= CHUNKSRV_DIRS_MAX) {
                 fprintf(stderr, "tsdbd: at most %d --chunk-dir\n", CHUNKSRV_DIRS_MAX);
@@ -5935,6 +5947,7 @@ int main(int argc, char **argv)
                         "              [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
                         "              [--power-feed NAME]\n"
                         "              [--bmc ADDR] [--read-barrier on|off] [--forward on|off] [--fwd-wait-ms 2000]\n"
+                        "              [--peer-check none|header|full]\n"
                         "              [--fwd-max-age-ms 1000] [--fwd-reply-ms 30000] [--fwd-workers 4]\n"
                         "              [--chunk-dir PATH]... [--chunk-rate-mb-s 256]]\n"
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"

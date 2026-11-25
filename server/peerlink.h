@@ -7,16 +7,19 @@
  *
  * Wire (server/cluster.c's header has the metadata side): the dialer sends the cluster HELLO with its link kind
  * (PL_KIND_LOG or PL_KIND_BULK; the metadata kind is 0) after the peer address and then the frame check types it
- * runs (u8 bit set, plcheck.h), the acceptor answers HELLO_ACK with the type it chose, the dialer AUTH, the MACs
- * exactly as there but under their own labels ("tsdb-link-..."), so a metadata link's MAC is never a data link's: the
- * cluster secret is proven both ways once per connection. From AUTH on every frame is [u32 len][u8 type][payload]
- * [check 16], len counting all after itself, check = XXH3-128(type | payload) seeded with the direction's salt (from the
- * handshake) ^ seq, seq counting from 0 per direction: a frame that was changed, dropped, repeated or reordered, or
- * comes from another connection, ends the link. The check is integrity only, not a MAC (docs/design-rdma.md §6, D1:
- * the cluster runs on its own servers; a keyed type can be negotiated later).
+ * offers (u8 bit set: those at or above its level, plcheck.h), the acceptor answers HELLO_ACK with the type it chose
+ * (the stronger of the two levels), the dialer AUTH, the MACs exactly as there but under their own labels
+ * ("tsdb-link-..."), so a metadata link's MAC is never a data link's: the cluster secret is proven both ways once per
+ * connection. From AUTH on every frame is [u32 len][u8 type][payload][check], len counting all after itself, the check
+ * as long as its type says: none (the default) 0 bytes, header 8 (XXH3-64 of the length, the type and the payload's
+ * first PL_CHECK_SPAN bytes), full 16 (XXH3-128 of type | payload), both seeded with the direction's salt (from the
+ * handshake) ^ seq, seq counting from 0 per direction: under them a frame that was changed (in what they cover),
+ * dropped, repeated or reordered, or comes from another connection, ends the link. Without a check the wire is trusted
+ * to Ethernet's and TCP's checksums, the payloads carry their own (verified by the drivers), and every receive path
+ * bounds and cross-checks the fields it acts on (docs/design-rdma.md §6, D1). Integrity only, never a MAC.
  *
  * Frame types: 1..0x6f the driver's (opaque, at most PL_FRAME_MAX); 0x70.. are the link's own (BEGIN, RESUME, CHUNK,
- * END, DONE, PING, PONG; peerlink.c lists them). Bit 0x80 on a log link's frame says its payload is [u32 raw
+ * END, DONE, PING, PONG; peerlink.c lists them). Bit 0x80 on a frame of any kind but BULK says its payload is [u32 raw
  * length][zstd frame] (raw length at most PL_FRAME_MAX, and the decoded size must equal it).
  *
  * Threads. One I/O thread per link connection (never the cluster thread): the cluster thread's acceptor reads the
@@ -52,13 +55,14 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 8         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+#define PL_CL_VERSION 9         /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
                                  * HB and HB_ACK (r3e-leases), 6 the replication messages' set version and replay
                                  * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard;
                                  * 7 R4's F_VOLCMD and VOLMSG READY (r4-iface): a peer of 6 drops the connection that
                                  * carries Raft at the first VOLCMD; 8 the data links' frame check (XXH3-128 in place
                                  * of HMAC-SHA256, its type negotiated in HELLO and HELLO_ACK; rd-mac), and the
-                                 * capability byte after it in both (rd-seam) */
+                                 * capability byte after it in both (rd-seam); 9 the check an option of three levels
+                                 * (none by default: no check bytes; rd-nocheck): an 8 peer is refused naming both */
 /* The capability bits of a data link's HELLO and HELLO_ACK (one byte after the check types; bits a build does not know
  * are ignored, so a later build of the same cluster version adds one without a version bump). PL_CAP_RDMA: this build
  * decodes RDMA_OFFER (docs/design-rdma.md §5.1 step 1); rd-upgrade sets it, a build before it sends 0 and is never
@@ -152,9 +156,16 @@ struct pl_cfg {
      * per tracked frame, on the link's thread, with the connection number it was queued on; must not block. */
     void (*on_sent)(void *arg, struct plink *l, uint64_t token, uint64_t gen, int written);
     int sock_buf; /* tests: SO_SNDBUF and SO_RCVBUF of every connection (0: the kernel's) */
+    int check;    /* the frame check level this end asks for (PL_CHECK_* of plcheck.h; 0: PL_CHECK_NONE); a link runs
+                   * at the stronger of its two ends' */
 };
 
 struct peerlink *peerlink_new(const struct pl_cfg *cfg);
+/* The frame check level (PL_CHECK_*) of every peerlink whose cfg.check is 0, this process's (tsdbd's --peer-check);
+ * set before any peerlink runs a handshake. 0: PL_CHECK_NONE. */
+void peerlink_set_check_level(int level);
+int peerlink_check_parse(const char *s); /* "none", "header", "full" -> the level; -1 for anything else */
+const char *peerlink_check_name(int type); /* the level's word ("?" for none known, 0 included) */
 /* Stops every link, joins their threads and frees everything (a pending bulk job is completed with PL_E_CLOSED). */
 void peerlink_free(struct peerlink *pl);
 void peerlink_set_bulk_rate(struct peerlink *pl, uint64_t bytes_per_s);
@@ -184,6 +195,7 @@ int peerlink_listen(struct peerlink *pl, int port);
 
 uint32_t plink_peer(const struct plink *l); /* the peer's node id, once connected */
 int plink_kind(const struct plink *l);
+int plink_check(const struct plink *l); /* the frame check type its connection runs (plcheck.h); 0 while down */
 int plink_up(const struct plink *l);
 uint64_t plink_gen(const struct plink *l); /* counts connections of this link (from 1); valid from on_link(up) on */
 void plink_set_arg(struct plink *l, void *arg);
@@ -243,6 +255,7 @@ struct pl_stats {
     uint64_t connects, drops, auth_failures;
     uint64_t bulk_files, bulk_bytes; /* files finished, payload bytes sent by this side */
     uint64_t handshakes;             /* accepted connections in their handshake now (a gauge, bounded) */
+    uint64_t up_check[4];            /* connections up now per frame check type (index PL_CHECK_*; a gauge) */
 };
 void peerlink_stats(struct peerlink *pl, struct pl_stats *st);
 /* The payload bytes the bulk links of one data kind took from their kind's bucket, chunk by chunk as they go to the
@@ -279,13 +292,13 @@ struct pl_msg {
  * decoded size). Reads exactly n bytes of p. */
 int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own);
 /* Encodes a driver frame: [u32 len][type][payload][check] into *out (malloc'ed); compresses when `compress` and it
- * pays. check (a PL_CHECK_ type of plcheck.h), salt and seq as a link's direction; returns the length, or 0 on
- * failure. Used by the tests. */
+ * pays. check (a PL_CHECK_ type of plcheck.h: the check's length follows it, 0 for none), salt and seq as a link's
+ * direction; returns the length, or 0 on failure. Used by the tests. */
 size_t pl_frame_encode(int check, uint64_t salt, uint64_t *seq, int compress, uint8_t type, const void *p, size_t n,
                        uint8_t **out);
 
 /* A streaming splitter of the frames of one direction (what a link's reader does): feed bytes, each complete frame is
- * verified against its check (unless skip_tag, for the fuzzer) and passed on. */
+ * verified against its check of type `check` (none: no check bytes; unless skip_tag, for the fuzzer) and passed on. */
 struct pl_reader;
 struct pl_reader *pl_reader_new(int check, uint64_t salt, int skip_tag);
 void pl_reader_free(struct pl_reader *r);
@@ -325,12 +338,12 @@ enum {
     PL_MUT_KINDBUCKET = 16,     /* every kind shares one bucket at the peerlink's rate (no per-kind rate) */
     PL_MUT_NOSEQ = 17,          /* the frame check leaves the sequence number out (a reorder or repeat passes) */
     PL_MUT_NOSALT = 18,         /* the frame check leaves the connection's salt out (an old connection's frame passes) */
-    PL_MUT_CHECKTYPE = 19,      /* the acceptor takes a HELLO that offers no check type it runs */
+    PL_MUT_CHECKTYPE = 19,      /* the acceptor takes a HELLO that offers no check type it runs at its level */
     PL_MUT_SAMESALT = 20,       /* both directions of a connection derive one salt (a reflected frame passes) */
     PL_MUT_NOTRANSCRIPT = 21,   /* the salts leave the transcript out: one per secret, an old connection's frame passes */
-    PL_MUT_DIALANYTYPE = 22,    /* the dialer runs whatever check type HELLO_ACK names */
+    PL_MUT_DIALANYTYPE = 22,    /* the dialer runs whatever check type HELLO_ACK names, below its level too */
     PL_MUT_NOTYPE = 23,         /* the frame check leaves the type byte out */
-    PL_MUT_HALFCMP = 24,        /* the reader compares 8 of the check's 16 bytes */
+    PL_MUT_HALFCMP = 24,        /* the reader compares half of the check's bytes */
     PL_MUT_SEQ8 = 25,           /* the seed takes the low 8 bits of the sequence number (a frame 256 back passes) */
     PL_MUT_NOREADY = 26,        /* the link thread sleeps in poll although its transport said it holds what it wants */
     PL_MUT_CLOSEFIRST = 27,     /* the transport is closed before on_link(down) */
@@ -350,7 +363,7 @@ extern void (*peerlink_test_salts)(int dialer, uint64_t out, uint64_t in);
 /* Test hook (test_peerlink `fake`, over tests/pl_fake.h's in-memory transport; server/pltransport.h): run one
  * connection of the accepted link (peer, kind) on `t` as if a handshake with that peer had passed, with transcript
  * `tr` (both ends give the same bytes and opposite `dialer`: their salts then match as a handshake's do; the check
- * type is the highest this build runs). It takes the link over as a new accepted connection does, on a thread of its
+ * type is this peerlink's level, cfg.check: both ends' peerlinks must have the same). It takes the link over as a new accepted connection does, on a thread of its
  * own, and owns `t` from the call on (closed when the connection ends, or at once on failure). 0, or -1. */
 struct pl_transport;
 int peerlink_test_attach(struct peerlink *pl, uint32_t peer, int kind, int dialer, const uint8_t *tr, size_t trlen,
