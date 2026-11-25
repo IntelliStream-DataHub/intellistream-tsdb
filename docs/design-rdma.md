@@ -739,7 +739,8 @@ avoid. Built in cluster version 9 (`PL_CL_VERSION`; `server/plcheck.h`, `tsdbd -
   of its payload as the driver gave it (decompressed): the drivers' heads (a replication message's 212 bytes, a
   forward envelope, a chunk put's meta, a bulk frame's fields), never the bulk of a payload, so it costs a fixed amount
   per frame. Of an APPEND that is the message head, the APPEND head and descriptor 0 only (212 + 16 + 24 = 252 bytes):
-  the later descriptors are guarded by the receive side's bounds alone, as under `none` (below). XXH3-64 rather than
+  the later descriptors were guarded by the receive side's bounds alone; since rd-drvcheck the driver check (below)
+  covers every descriptor at every level. XXH3-64 rather than
   CRC32C: already vendored and portable C (one hash for both checks, no arm64 shim); the two are within 15-25 ns per
   frame of each other either way (measured below: CRC32C was faster on the i5, slower on the Xeon), so this is not a
   speed choice and the owner may switch.
@@ -789,14 +790,35 @@ READ's over its head and length only: its cells are checked against the object's
 is matched to the pending call by op as well as id (`test_chunksrv`). Forwarded client frames get no integrity check
 of their own (accepted by the owner).
 
-**What `none` leaves open** (for the owner): an ACK whose `durable` is flipped to a value inside [the true durable,
-written] passes every bound (it is not beyond the log, and not above `written`), and the leader's commit point then
-moves over rows that replica has not synced; with two of three in the ISR a power loss of that replica afterwards loses
-acknowledged rows. Only a low bit of `durable` can do it, and only while `written > durable`, but it is the data-loss
-class the frame check existed for. No structural bound catches it; `header` and `full` do (the ACK's fields are in the
-first 212 bytes). The alternative is a check word over the replication message's fixed head on driver messages in
-every mode (8 bytes, the `header` level's 23-31 ns, on LOG messages only, never on bulk); not built, the owner
-decides.
+**The driver check (rd-drvcheck, closes rd-nocheck's review F3).** Under `none` an ACK whose `durable` was flipped to
+a value inside [the true durable, written] passed every bound (not beyond the log, not above `written`), and the
+leader's commit point then moved over rows that replica had not synced; with two of three in the ISR a power loss of
+that replica afterwards lost acknowledged rows. No structural bound can catch it, so the owner chose (2026-11-25) a
+small check on the driver's own messages in every mode, `none` included: replwire `RW_VERSION` 3 ends every
+replication message's fields (the 212-byte head, an APPEND's seq and off and every descriptor) with an 8-byte XXH3-64
+over them, before the records' bytes, which it never covers (they have their own checksum and their descriptor); a
+FETCH and a bulk file's meta end with one over their fields too. The seed differs per kind. The decoder verifies it
+before it reads any field out (`RW_E_CHECK`); the driver drops such a message, counts it and says the first of every
+1000 ("failed its driver check, dropped"); the sender's resend repairs it. A replica set of cluster version 9 is refused
+by one of 10 with the line naming both. It also closes F2's gap of `header` (descriptors after the first): the driver
+check covers all of them. `header` stays as it is: for a LOG frame its 256 bytes now cover nothing of the driver's
+that the driver check does not, but it also covers the frame's length, type and compression header, is keyed to the
+frame's number and the connection's salt (a frame repeated or misplaced), and covers the FWD, CHUNK and bulk kinds,
+which have no driver check; making it skip LOG frames would save 8-20 ns per frame and add a special case, so both stay
+simple. Tests: `test_replwire` (F3's ACK at every durable in the window, every bit of an APPEND's head, APPEND head
+and descriptors, FETCH and bulk meta; mutants `checknocmp`, `checkshort`), `test_cluster drvcheck` (bits flipped on the
+wire under `none`, TSDB_REPLD_TEST `flipraw=ack|head|desc`: each dropped by the check, none reaches the core, every row
+in both replicas; repld mutant `checklate` too), fuzz-replframe modes 5-7 (a sealed input reaches the decoder behind
+the check; a decoded message with any covered bit flipped must not decode).
+
+Cost (`build/rw-bench`, encode + decode on one core, i5-13400, mean of three runs, before -> after): an ACK 25.9 ->
+42.7 ns; an APPEND of one 4 KiB record 63.0 -> 82.8 ns (record bytes through one core 65.0 -> 49.5 GB/s); of one 64
+KiB record 1092 -> 1126 ns (60.0 -> 58.2 GB/s); of sixteen 4 KiB records 1144 -> 1205 ns. The check alone: XXH3-64 8.4
+ns over an ACK's 212 bytes, 15.7 over an APPEND of one descriptor (252), 19.2 over sixteen (612); CRC32C (SSE4.2) 7.6,
+9.1 and 25.6. Neither wins across the sizes; XXH3-64 is kept for the reasons of `header` above. At 25 Gbit/s a LOG link
+of 4 KiB records carries about 760,000 APPENDs a second, so the check (about 20 ns per message, encode and decode together) costs about 1.5% of one core there,
+and well under 0.1% at 64 KiB: a link's throughput does not move (the encode and decode run at 20 to 50 times the
+line rate either way; a pair of servers was not measured).
 
 ## 7. Decisions (defaults; the owner may change them)
 

@@ -27,6 +27,15 @@ A REPLICA_REMOVE that would leave a volume fewer replicas than its `min_isr` is 
 volume: `min_isr` never asks for more copies than the volume has (a volume of 2 replicas and `min_isr` 2 is shrunk by
 moving a replica, or after lowering `min_isr`, never by a plain remove).
 
+**The peer protocol is now version 10: the replication driver checks its own messages.** Every replication message,
+file request and file description between cluster members now ends its fields with an 8-byte check (XXH3-64) that the
+receiver verifies before it acts on any of them, whatever `--peer-check` says, `none` included; it never covers the
+rows themselves, which carry checksums of their own. A message whose check fails is dropped, counted in the log and sent
+again by its sender. Without it, under `none`, a single flipped bit in a replica's acknowledgement could let the leader
+count rows as safely stored on that replica before they were, and a power loss there could then lose acknowledged
+rows. It costs about 17-20 ns per message on each side. A member of version 9 is refused by one of 10 with a line
+naming both: upgrade every member together.
+
 **The peer protocol is now version 9: the data links' frame check is an option, off by default.** `tsdbd
 --peer-check none|header|full` (key `cluster.peer.check`): `none`, the default on every transport, puts no check bytes
 on a frame (the wire is trusted to Ethernet's and TCP's checksums, and the payloads that matter, WAL records, files

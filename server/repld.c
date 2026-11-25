@@ -405,7 +405,7 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
     struct plink *l = link_of(rv->rec.rep[m->to].node, 0);
     /* the core's own messages: it stamps its set version (src/repl.h), and one queued before a reconfiguration is in the
      * old record's indexes, so it must keep the old version (rset.h: rset_stamp is for what the driver builds) */
-    uint8_t b[RW_HEAD];
+    uint8_t b[RW_HEAD + RW_CHECK];
     size_t n = rw_encode_msg(b, sizeof b, rv->number, m, NULL, 0, 0, NULL, 0);
     if (l && n)
         plink_send(l, RW_T_MSG, b, n, 0);
@@ -1281,6 +1281,80 @@ void post(struct rvol *rv, int kind, uint32_t node, const void *p, size_t n)
     pthread_mutex_unlock(&rv->mu);
 }
 
+/* TSDB_REPLD_TEST=flipraw=ack|head|desc (tests only): one bit of a received message flipped in its wire bytes, before
+ * the decode and its driver check (test_cluster drvcheck). ack, on a writer: every 2nd ACK whose written lies above its
+ * durable gets one bit of durable flipped so that it lands inside (durable, written], which no structural bound can
+ * see (review F3); head, on a replica: every 8th APPEND with records, bit 0 of its commit or bit 3 of its off, in turn;
+ * desc: every 2nd APPEND with two records or more, bit 0 of the last descriptor's epoch or span, in turn (and bit 3
+ * of the off of four in a row of every 16 with one record, whose resend carries several). 1 when it flipped (the first flip of each
+ * field is said). */
+static int flip_raw(struct rvol *rv, uint8_t *p, size_t n, int from)
+{
+    if (n < RW_HEAD + RW_CHECK || p[0] != RW_VERSION)
+        return 0;
+    uint32_t nrec;
+    memcpy(&nrec, p + RW_HEAD - 4, 4);
+    const char *what = NULL;
+    switch (G.flip_raw) {
+    case FR_ACK: {
+        uint64_t d, w;
+        memcpy(&d, p + 52, 8); /* durable, then written (replwire.h: the 12 u64 from byte 20) */
+        memcpy(&w, p + 60, 8);
+        if (p[1] != REPL_M_ACK || rv->mode != M_WRITER || w <= d || ++rv->raw_n % 2)
+            return 0;
+        for (int b = 0; b < 63 && !what; b++) {
+            uint64_t f = d ^ (1ull << b);
+            if (f > d && f <= w) {
+                memcpy(p + 52, &f, 8);
+                rv->raw_true = d;
+                what = "an ACK's durable";
+            }
+        }
+        break;
+    }
+    case FR_HEAD:
+        if (p[1] != REPL_M_APPEND || !nrec || ++rv->raw_n % 8)
+            return 0;
+        if ((rv->raw_n / 8) % 2)
+            p[44] ^= 1, what = "an APPEND's commit"; /* bit 0 of commit */
+        else
+            p[RW_HEAD + 8] ^= 8, what = "an APPEND's off"; /* bit 3 of off */
+        break;
+    case FR_DESC:
+        if (p[1] != REPL_M_APPEND || !nrec || (n - RW_HEAD - RW_CHECK - RW_APPEND_HEAD) / RW_DESC < nrec)
+            return 0;
+        if (nrec < 2) { /* four in a row of every 16 lose bit 3 of off: their resend carries several records */
+            if (++rv->raw_n % 16 >= 4)
+                return 0;
+            p[RW_HEAD + 8] ^= 8, what = "an APPEND's off";
+            break;
+        }
+        if (++rv->raw_m % 2) /* every 2nd with several: never all of them, or the resends never get through */
+            return 0;
+        uint8_t *d = p + RW_HEAD + RW_APPEND_HEAD + (size_t)(nrec - 1) * RW_DESC;
+        if ((rv->raw_m / 2) % 2)
+            d[8] ^= 1, what = "a descriptor's epoch"; /* bit 0 of the last descriptor's epoch */
+        else
+            d[16] ^= 1, what = "a descriptor's span"; /* bit 0 of its n */
+        break;
+    default:
+        return 0;
+    }
+    /* the first flip of each field is said */
+    static const char *const fields[] = {"an ACK's durable", "an APPEND's commit", "an APPEND's off",
+                                         "a descriptor's epoch", "a descriptor's span"};
+    unsigned bit = 0;
+    for (unsigned i = 0; what && i < sizeof fields / sizeof *fields; i++)
+        if (!strcmp(what, fields[i]))
+            bit = 1u << i;
+    if (what && !(rv->raw_said & bit)) {
+        rv->raw_said |= bit;
+        say("volume %" PRIu32 ": flipraw: flipped %s from node %" PRIu32 " on the wire", rv->number, what,
+            rv->rec.rep[from].node);
+    }
+    return what != NULL;
+}
+
 /* TSDB_REPLD_TEST=flipin[=epoch|desc] (tests only): one field of a received APPEND changed as a flipped bit on the
  * wire would change it, before msg_refused. flipin: a byte of its first record; epoch, in turn: bit 40 of the
  * message's epoch, bit 1 of it, bit 40 of descriptor 0's epoch; desc, in turn: bit 20 of descriptor 0's position, bit
@@ -1894,7 +1968,11 @@ static void handle(struct rvol *rv, struct item *it)
         char name[RW_NAME_MAX + 1];
         uint32_t vol;
         uint64_t mpos;
-        if (rw_decode_fetch(it->data, it->n, &vol, &mpos, name, sizeof name) != 0 || rv->mode != M_WRITER)
+        int frc = rw_decode_fetch(it->data, it->n, &vol, &mpos, name, sizeof name);
+        if (frc == RW_E_CHECK && rv->ck_drops++ % 1000 == 0)
+            say("volume %" PRIu32 ": a FETCH from node %" PRIu32 " failed its driver check, dropped (%" PRIu64
+                " so far)", rv->number, it->node, rv->ck_drops);
+        if (frc != 0 || rv->mode != M_WRITER)
             return;
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
         int fd = db ? eng_leader_file_open(db, mpos, name) : TSDB_ERR_UNAVAILABLE;
@@ -1913,7 +1991,8 @@ static void handle(struct rvol *rv, struct item *it)
         return;
     }
     /* IN_MSG */
-    size_t maxrec = it->n > RW_HEAD + RW_APPEND_HEAD ? (it->n - RW_HEAD - RW_APPEND_HEAD) / RW_DESC : 0;
+    size_t maxrec = it->n > RW_HEAD + RW_CHECK + RW_APPEND_HEAD ? (it->n - RW_HEAD - RW_CHECK - RW_APPEND_HEAD) / RW_DESC
+                                                                 : 0;
     if (maxrec > rv->crec) {
         uint32_t c = (uint32_t)(maxrec < (1u << 24) ? maxrec : (1u << 24));
         struct repl_rec *r = realloc(rv->recs, c * sizeof *r);
@@ -1928,8 +2007,28 @@ static void handle(struct rvol *rv, struct item *it)
         if (r && ln && co)
             rv->crec = c;
     }
-    if (rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec) != 0 || rv->cur.volume != rv->number ||
-        rv->cur.m.from != from || rv->cur.m.to != rv->self)
+    int flipped = G.flip_raw ? flip_raw(rv, it->data, it->n, from) : 0;
+    int drc;
+    if (G.mutant == RM_CHECKLATE) { /* planted: decoded unverified, the check looked at only after the core */
+        int saved = rw_mutant;
+        rw_mutant = RW_MUT_NOCMP;
+        drc = rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec);
+        rw_mutant = saved;
+    } else {
+        drc = rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec);
+    }
+    if (drc == RW_E_CHECK) {
+        /* a flipped bit in a field the driver acts on (replwire.h): dropped before any of it is read, counted; the
+         * sender's resend repairs it */
+        if (rv->ck_drops++ % 1000 == 0)
+            say("volume %" PRIu32 ": a message from node %" PRIu32 " failed its driver check, dropped (%" PRIu64
+                " so far)", rv->number, rv->rec.rep[from].node, rv->ck_drops);
+        return;
+    }
+    if (flipped)
+        say("volume %" PRIu32 ": flipraw: a flipped message of type %d from node %" PRIu32 " passed the driver check",
+            rv->number, drc ? -1 : (int)rv->cur.m.type, rv->rec.rep[from].node);
+    if (drc != 0 || rv->cur.volume != rv->number || rv->cur.m.from != from || rv->cur.m.to != rv->self)
         return; /* not a message of this volume from that peer: dropped */
     if (!rset_msg_ok(rv, &rv->cur.m)) {
         rv->cur.m.nrec = 0;
@@ -1987,6 +2086,13 @@ static void handle(struct rvol *rv, struct item *it)
     repl_recv(rv->core, &rv->cur.m);
     drain(rv);
     rv->cur.m.nrec = 0;
+    if (flipped && rv->cur.m.type == REPL_M_ACK)
+        say("volume %" PRIu32 ": flipraw: a flipped ACK reached the core: node %" PRIu32 "'s durable end %" PRIu64
+            " taken for %" PRIu64 ", commit point %" PRIu64, rv->number, rv->rec.rep[from].node, rv->raw_true,
+            rv->cur.m.durable, repl_commit(rv->core));
+    if (G.mutant == RM_CHECKLATE && rw_msg_check_at(it->data, it->n) &&
+        rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec) == RW_E_CHECK)
+        rv->ck_drops++; /* too late: the core has it */
     if (rv->mode == M_WRITER && rv->cur.m.type == REPL_M_ACK) {
         uint64_t f = repl_replay_floor(rv->core);
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
@@ -2039,7 +2145,7 @@ static void do_sync(struct rvol *rv)
     if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
-        uint8_t b[RW_NAME_MAX + 24];
+        uint8_t b[RW_NAME_MAX + 24 + RW_CHECK];
         size_t n = rw_encode_fetch(b, sizeof b, rv->number, mpos, name);
         if (l && n && strcmp(name, rv->fetch_name) != 0)
             say("volume %" PRIu32 ": fetches %s (the marker at %" PRIu64 ") from node %" PRIu32, rv->number, name, mpos,
@@ -2492,8 +2598,13 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapnoleftovers") ? RM_SNAPNOLEFTOVERS
                : !strcmp(mu, "snapstalekeep")  ? RM_SNAPSTALEKEEP
                : !strcmp(mu, "snapkeepdiverged") ? RM_SNAPKEEPDIVERGED
+               : !strcmp(mu, "checklate")      ? RM_CHECKLATE
                                                : RM_NONE;
-    if (G.mutant)
+    rw_mutant = !mu                         ? RW_MUT_NONE
+                : !strcmp(mu, "checknocmp") ? RW_MUT_NOCMP
+                : !strcmp(mu, "checkshort") ? RW_MUT_SHORT
+                                            : RW_MUT_NONE;
+    if (G.mutant || rw_mutant)
         say("MUTANT %s (tests only)", mu);
     const char *te = getenv("TSDB_REPLD_TEST");
     G.drop_bulk = te && strstr(te, "dropbulk");
@@ -2521,6 +2632,12 @@ void repld_init(tsdb *t, const char *dir)
                 : !strncmp(fi, "flipin=epoch", 12) ? FI_EPOCH
                 : !strncmp(fi, "flipin=desc", 11)  ? FI_DESC
                                                    : FI_REC;
+    const char *fr = te ? strstr(te, "flipraw=") : NULL;
+    G.flip_raw = !fr                                  ? 0
+                 : !strncmp(fr, "flipraw=ack", 11)  ? FR_ACK
+                 : !strncmp(fr, "flipraw=head", 12) ? FR_HEAD
+                 : !strncmp(fr, "flipraw=desc", 12) ? FR_DESC
+                                                    : 0;
     G.meta_in = te && strstr(te, "metain");
     G.bulk_frame = te && strstr(te, "bulkframe");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
