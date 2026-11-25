@@ -13373,7 +13373,14 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
  * CORRUPT, and whole again once the members are back. N is 6, so the stripe group is every server. Each phase reads
  * series of its own: the granule cache would answer a series read before from memory. */
 #define ECB_SERIES 8
-#define ECB_ROWS 3000
+/* The first day's rows per series and batch, with random values (at least 26 bits a row): each series is then some 280 KB
+ * of the part, the object some 2.2 MB, so its geometry is k' = 4 with cells of 64 to 72 KiB (E7: cell = L / 8k, at
+ * least 64 KiB), and every series' bytes cover four cells in a row, one at each data position. With three of the six
+ * members away at least one of them holds a data position and only three positions are left: a read of any series
+ * needs a decode it cannot make. With 3000 rows of smooth values (r8f-ecbasic4) the object was one cell, k' = 1, and a
+ * series whose cell sat on a live member read whole with three members away. */
+#define ECB_ROWS 43000 /* 2 s apart, two batches interleaved: 86000 rows on one day */
+#define ECB_DAY_ROWS 3000 /* the later days': they need a settle only */
 struct ecb_sum {
     uint64_t n, h;
 };
@@ -13420,14 +13427,14 @@ static void ecb_write_day(tsdbc *c, const tsdb_sid *ide, int64_t day_ms)
 {
     for (int b = 0; b < 2; b++) {
         for (int s = 0; s < ECB_SERIES; s++) {
-            int64_t ts[ECB_ROWS];
-            float val[ECB_ROWS];
-            for (int r = 0; r < ECB_ROWS; r++) {
+            int64_t ts[ECB_DAY_ROWS];
+            float val[ECB_DAY_ROWS];
+            for (int r = 0; r < ECB_DAY_ROWS; r++) {
                 ts[r] = day_ms + (int64_t)(2 * r + b) * 1000;
                 val[r] = (float)(s * 1000 + r) * 0.5f + (float)b;
             }
             int rc;
-            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_DAY_ROWS)) != 0; usleep(50000))
                 if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
                     die("insert into e42 on day %" PRId64 ": %s", day_ms, ers(rc));
         }
@@ -13535,11 +13542,16 @@ static void scen_ecbasic(void)
      * the only kind a cluster settle takes (D18) */
     for (int b = 0; b < 2; b++) {
         for (int s = 0; s < ECB_SERIES; s++) {
-            int64_t ts[ECB_ROWS];
-            float val[ECB_ROWS];
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
             for (int r = 0; r < ECB_ROWS; r++) {
                 ts[r] = day0 + (int64_t)(2 * r + b) * 1000;
-                val[r] = (float)(s * 1000 + r) * 0.25f + (float)b;
+                uint64_t z = ((uint64_t)s << 40 | (uint64_t)b << 32 | (uint64_t)r) + 0x9e3779b97f4a7c15ull;
+                z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9ull;
+                z = (z ^ z >> 27) * 0x94d049bb133111ebull;
+                z ^= z >> 31;
+                uint32_t bits = (uint32_t)(z & 0x7fffffu) | (uint32_t)(127 + (z >> 61)) << 23; /* [1, 256) */
+                memcpy(&val[r], &bits, 4); /* 23 random mantissa bits, 3 of exponent: no codec packs them below 26 */
             }
             for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
                 if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
