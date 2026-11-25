@@ -4188,7 +4188,11 @@ int tsdb_cvol_replace(tsdb *t, uint32_t number, int (*fn)(void *ctx, eng **old, 
     bool was_div = atomic_load_explicit(&old->diverged, memory_order_acquire);
     eng *o = old, *neu = NULL;
     meta_cluster_open_allow(true);
+    /* the engine fn opens (a promotion, a demotion) attaches to the tier as tsdb_cvol_open's does: an ec volume's META
+     * says requires=tier, and without the wish its reopen is refused (r8f, test_cluster ecbasic) */
+    tier_want(t->tier, number);
     int rc = fn(ctx, &o, &neu);
+    tier_want(NULL, 0);
     meta_cluster_open_allow(false);
     if (o) { /* not closed: the old engine goes on */
         old->retiring = false;

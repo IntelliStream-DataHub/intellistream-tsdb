@@ -316,13 +316,34 @@ static int tier_be_open(tier *t, const char *dir)
 }
 #endif
 
+static tier_cluster_fn cluster_fn; /* set once before any tsdb_open (tier_set_cluster), read-only after */
+static void *cluster_arg;
+static uint64_t cluster_cache_mb;
+
+void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
+{
+    cluster_fn = fn;
+    cluster_arg = arg;
+    cluster_cache_mb = cache_mb;
+}
+
 int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 {
     *out = NULL;
     tier_cfg c;
     int rc = tier_decide(dir, getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), &c);
-    if (rc || !c.set)
+    if (rc)
         return rc;
+    if (!c.set) {
+#ifdef TSDB_EC
+        /* r8f: a cluster tsdbd's tier, for its ec volumes only (no stores: their cold ops reach the stripe group) */
+        if (!cluster_fn || (opt && (opt->read_only || opt->follow)))
+            return 0;
+        c.cache_mb = cluster_cache_mb;
+#else
+        return 0;
+#endif
+    }
 #ifndef TSDB_EC
     (void)opt;
     fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set, but this build has no erasure codec (TSDB_EC): the open fails\n",
@@ -330,7 +351,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     tier_cfg_free(&c);
     return TSDB_ERR_INVALID;
 #else
-    if (opt && (opt->read_only || opt->follow)) {
+    if (c.set && opt && (opt->read_only || opt->follow)) {
         /* the writer holds the stores (flock), and a follower does not read .ec parts (D7) */
         fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set on a read-only open or a follower: only a writer opens a "
                         "tier: the open fails\n", dir);
@@ -346,7 +367,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     atomic_init(&t->halted, false);
     pthread_mutex_init(&t->cmu, NULL);
     t->cfg = c;
-    if (tier_mutant != TIER_MUT_PERENGINE && (rc = tier_be_open(t, dir)) != 0) {
+    if (c.set && tier_mutant != TIER_MUT_PERENGINE && (rc = tier_be_open(t, dir)) != 0) {
         tier_put(t);
         return rc;
     }
@@ -419,11 +440,12 @@ static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && 
 
 /* META's vuuid= line: 1 and *u when there is one, 0 when there is none, TSDB_ERR_CORRUPT when it is not 32 lowercase
  * hex digits. */
-static int meta_vuuid(const char *txt, uint8_t u[16])
+static int meta_hexline(const char *txt, const char *key, uint8_t u[16])
 {
+    size_t kl = strlen(key);
     for (const char *l = txt; *l;) {
-        if (strncmp(l, "vuuid=", 6) == 0) {
-            const char *h = l + 6;
+        if (strncmp(l, key, kl) == 0) {
+            const char *h = l + kl;
             for (int i = 0; i < 16; i++) {
                 int a = hexval(h[2 * i]), b = a < 0 ? -1 : hexval(h[2 * i + 1]);
                 if (b < 0)
@@ -439,6 +461,8 @@ static int meta_vuuid(const char *txt, uint8_t u[16])
     }
     return 0;
 }
+
+static int meta_vuuid(const char *txt, uint8_t u[16]) { return meta_hexline(txt, "vuuid=", u); }
 
 static bool random_bytes(uint8_t *b, size_t n)
 {
@@ -481,7 +505,14 @@ static int tier_meta_write(eng *db, const char *txt, uint8_t u[16])
     }
     if (rc == 1 && (feats & META_REQ_TIER))
         return 0;
-    if (rc == 0 && !random_bytes(u, 16)) {
+    if (rc == 0 && db->cluster_req) { /* r8f: a cluster volume's vuuid is its metadata uuid (cvolfs's volume_uuid=) */
+        if ((rc = meta_hexline(txt, "volume_uuid=", u)) != 1) {
+            fprintf(stderr, "tsdb: %s: META of a cluster volume has no valid volume_uuid= line: the open fails\n",
+                    db->dir);
+            return rc < 0 ? rc : TSDB_ERR_CORRUPT;
+        }
+        rc = 0;
+    } else if (rc == 0 && !random_bytes(u, 16)) {
         fprintf(stderr, "tsdb: %s: no random bytes for the volume's uuid: the open fails\n", db->dir);
         return TSDB_ERR_IO;
     }
@@ -637,7 +668,28 @@ int tier_engine_attach(eng *db)
     }
     if (!t)
         return 0;
-    if (tier_is_cluster_volume(db) && !eccold_may_attach(db)) { /* eccold.h: asked for cluster volumes only */
+    tier_settings cset;
+    if (!t->cfg.set) { /* r8f: a cluster tsdbd's tier takes its ec volumes only, with the hook's ops */
+        if (!tier_is_cluster_volume(db) || !eccold_may_attach(db)) {
+            if (feats & META_REQ_TIER) {
+                fprintf(stderr, "tsdb: %s: META says requires=tier, but the volume is not a cluster ec volume and no "
+                                "tier is configured for it: the open fails\n", db->dir);
+                return TSDB_ERR_INVALID;
+            }
+            return 0;
+        }
+        if (!at.ops) {
+            if (!cluster_fn)
+                return TSDB_ERR_INVALID;
+            memset(&cset, 0, sizeof cset);
+            if ((rc = cluster_fn(cluster_arg, vol, &at, &cset)) != 0) {
+                fprintf(stderr, "tsdb: %s: the cold side of cluster ec volume %u cannot be attached (%s): the open "
+                                "fails\n", db->dir, vol, tsdb_strerror(rc));
+                return rc;
+            }
+            at.settings = &cset;
+        }
+    } else if (tier_is_cluster_volume(db) && !eccold_may_attach(db)) { /* eccold.h: asked for cluster volumes only */
         fprintf(stderr, "tsdb: %s: a tier on a cluster volume (META requires=cluster or replica) is not built yet "
                         "(R8): the open fails\n", db->dir);
         return TSDB_ERR_INVALID;

@@ -351,12 +351,37 @@ void chunksrv_cluster_stop(void)
     }
 }
 
+/* Callers that are not tsdbd's workers (the engines' tier threads through chunkpeer: a settle's puts, a digest's or a
+ * query's reads, asks an open stopped waiting for) hold the instance across their call, and free waits for them: the
+ * engines are closed only after it (tsdb_close), so without the hold a settle in flight at SIGTERM called into a
+ * freed chunk server. Seq_cst on both sides: a holder that loaded the instance is counted before free looks. */
+static atomic_int holders;
+static atomic_int closes; /* chunksrv_cluster_closes: tsdbd's test hook holdput tells a close under a put */
+
+struct chunksrv *chunksrv_cluster_hold(void)
+{
+    atomic_fetch_add(&holders, 1);
+    struct chunksrv *cs = atomic_load(&G.pub);
+    if (!cs)
+        atomic_fetch_sub(&holders, 1);
+    return cs;
+}
+
+void chunksrv_cluster_release(void) { atomic_fetch_sub(&holders, 1); }
+
 void chunksrv_cluster_free(void)
 {
     atomic_store(&G.pub, NULL);
-    chunksrv_close(G.cs); /* tsdbd's workers are joined: no client call into it is running; unlistens first */
+    while (atomic_load(&holders) > 0) { /* a call in flight ends by its deadline at the latest */
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    atomic_fetch_add(&closes, 1); /* before the close: a holder that sees no change still has a live instance */
+    chunksrv_close(G.cs); /* tsdbd's workers are joined, and no holder is left; unlistens first */
     G.cs = NULL;
     G.checked = 0;
 }
+
+int chunksrv_cluster_closes(void) { return atomic_load(&closes); }
 
 struct chunksrv *chunksrv_cluster(void) { return atomic_load(&G.pub); }

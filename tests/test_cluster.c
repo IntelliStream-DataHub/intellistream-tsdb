@@ -659,6 +659,13 @@ static void init_mode(int i, uint32_t replace_s, int mode)
 static void init_cluster(int i, uint32_t replace_s) { init_mode(i, replace_s, META_MODE_REPLICATED); }
 static void init_fast(int i) { init_cluster(i, 3); }
 
+/* A core member names the leader once it has heard from it: a restarted voter whose own snapshot is already at the
+ * leader's index is caught up before the first heartbeat reaches it, and names no leader (0) until then. */
+static int p_names_leader(const struct view *v, void *a)
+{
+    return v->st.mode != CLUSTER_MODE_CORE || v->st.leader == *(const uint32_t *)a;
+}
+
 /* Every live server's STATUS agrees on the leader and, once caught up, on the state (meta_hash). */
 static void check_all_agree(int leader_i, uint32_t members)
 {
@@ -671,6 +678,7 @@ static void check_all_agree(int leader_i, uint32_t members)
         if (pids[i] <= 0)
             continue;
         await_view(i, p_caught_up, &c, "catching up with the leader's state");
+        await_view(i, p_names_leader, &leader, "naming the leader");
         struct view v;
         view(i, &v);
         if (v.st.self != ids[i])
@@ -13744,6 +13752,485 @@ static void scen_margins(void)
     tsdbc_close(c);
 }
 
+/* ecbasic (r8f, server/chunkpeer.h; design-cluster-data.md E9-E11, E14, E15): an ec=4+2 volume settles through the
+ * peer cold ops (each position on its stripe member over CHUNKB, the leader's own in process) and its answers equal a
+ * replicas twin's; with one stripe member killed reads decode around it, with three they are UNAVAILABLE, never
+ * CORRUPT, and whole again once the members are back. N is 6, so the stripe group is every server. Each phase reads
+ * series of its own: the granule cache would answer a series read before from memory. */
+#define ECB_SERIES 8
+/* The first day's rows per series and batch, with random values (at least 26 bits a row): the day settles as two
+ * objects of some 1.1 MB each (one per level-1 part), geometry k' = 4 with 64 KiB cells (E7: cell = L / 8k, at least
+ * 64 KiB), about 17 data cells an object, and a series covers some 2 cells of each: two or three data positions, not
+ * every one. With three of the six members away at least one of them holds a data position, whose cells cannot be
+ * rebuilt from the three positions left, but a series whose cells all lie elsewhere reads whole without a decode
+ * (the r8f review's F12: a check of one series passed or failed with the replica placement). So the three-member case
+ * reads every series not read before and wants each answer whole or UNAVAILABLE, and UNAVAILABLE at least once. With
+ * 3000 rows of smooth values (r8f-ecbasic4) the object was one cell, k' = 1. */
+#define ECB_ROWS 43000 /* 2 s apart, two batches interleaved: 86000 rows on one day */
+/* The later days (the EPOCH case) are written the same way: with 3000 smooth rows (r8f-ecbasic5) their object was
+ * k' = 1, three positions, none of them on the member whose store was unsure, and the settle went through. */
+struct ecb_sum {
+    uint64_t n, h;
+};
+static int ecb_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    struct ecb_sum *s = ctx;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t b;
+        memcpy(&b, &v[i], 4);
+        s->h = s->h * 1000003u ^ (uint64_t)ts[i] * 31u ^ b;
+    }
+    s->n += n;
+    return 0;
+}
+
+static int ecb_read(tsdbc *c, tsdb_sid id, struct ecb_sum *s)
+{
+    memset(s, 0, sizeof *s);
+    return tsdbc_query_raw(c, id, 0, INT64_MAX / 2, ecb_rows, s);
+}
+
+/* the chunk files of volume num in the six stores (ecs<i>/s<num>/o*.chunk) */
+static int ecb_chunks(uint32_t num)
+{
+    int n = 0;
+    for (int i = 0; i < 6; i++) {
+        char p[PATH_MAX + 80];
+        snprintf(p, sizeof p, "%s/ecs%d/s%" PRIu32, base, i, num);
+        DIR *dd = opendir(p);
+        if (!dd)
+            continue;
+        for (struct dirent *e; (e = readdir(dd));) {
+            size_t l = strlen(e->d_name);
+            n += e->d_name[0] == 'o' && l > 6 && !strcmp(e->d_name + l - 6, ".chunk");
+        }
+        closedir(dd);
+    }
+    return n;
+}
+
+/* ECB_SERIES series of e42 written on the day from day_ms in two batches a flush apart (two parts, which the idle
+ * merge makes one of level 1: what a cluster settle takes, D18) */
+/* batch b of series s on the day from day_ms: ECB_ROWS rows 2 s apart, the batches interleaved */
+static void ecb_rows_of(int s, int b, int64_t day_ms, int64_t *ts, float *val)
+{
+    for (int r = 0; r < ECB_ROWS; r++) {
+        ts[r] = day_ms + (int64_t)(2 * r + b) * 1000;
+        uint64_t z = ((uint64_t)s << 40 | (uint64_t)b << 32 | (uint64_t)r) + (uint64_t)day_ms * 0x2545f4914f6cdd1dull +
+                     0x9e3779b97f4a7c15ull;
+        z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ z >> 27) * 0x94d049bb133111ebull;
+        z ^= z >> 31;
+        uint32_t bits = (uint32_t)(z & 0x7fffffu) | (uint32_t)(127 + (z >> 61)) << 23; /* [1, 256) */
+        memcpy(&val[r], &bits, 4); /* 23 random mantissa bits, 3 of exponent: no codec packs them below 26 */
+    }
+}
+
+static void ecb_write_day(tsdbc *c, const tsdb_sid *ide, int64_t day_ms)
+{
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
+            ecb_rows_of(s, b, day_ms, ts, val);
+            int rc;
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into e42 on day %" PRId64 ": %s", day_ms, ers(rc));
+        }
+        usleep(1000000); /* past the flush interval */
+    }
+}
+
+/* the series `name` of `vol` through its leader's client: MOVED too is retried, because the metadata leader's copy can
+ * name a new volume's leader before that member's own copy does or before it has reopened the volume as the writer
+ * (route_away answers MOVED to itself in that window; r8f-ecbasic3 met it for the twin) */
+static tsdb_sid ecb_series(tsdbc *c, const char *name, const char *vol)
+{
+    uint64_t t0 = now_ms();
+    for (;;) {
+        tsdb_sid id = 0;
+        int rc = tsdbc_series_at(c, name, vol, &id);
+        if (rc == 0)
+            return id;
+        if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+            die("series %s in %s: %s", name, vol, ers(rc));
+        usleep(20000);
+    }
+}
+
+/* the .ec parts listed in server i's v<num> (retired_ ones not counted) */
+/* is server i one of volume e's log replicas */
+static bool ecb_is_rep(const struct meta_volume *e, int i)
+{
+    for (uint32_t k = 0; k < e->nrep; k++)
+        if (server_of(e->rep[k].node) == i)
+            return true;
+    return false;
+}
+
+static int ecb_ec_parts(int i, uint32_t num)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += l > 3 && !strcmp(e->d_name + l - 3, ".ec") && strncmp(e->d_name, "retired_", 8) != 0;
+    }
+    closedir(dd);
+    return n;
+}
+
+/* the live .part files (p<K>_<A>_<B>_<L>.part) in server i's v<num>, and their names into buf: rows still outside
+ * every object, which a read answers without a decode */
+static int ecb_live_parts(int i, uint32_t num, char *buf, size_t cap)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return -1;
+    int n = 0;
+    size_t at = 0;
+    buf[0] = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        if (e->d_name[0] != 'p' || l < 6 || strcmp(e->d_name + l - 5, ".part") != 0)
+            continue;
+        n++;
+        if (at + l + 2 < cap)
+            at += (size_t)snprintf(buf + at, cap - at, " %s", e->d_name);
+    }
+    closedir(dd);
+    return n;
+}
+
+static int tr_transfer(uint32_t num, uint32_t to, char *why, size_t n);
+
+static void scen_ecbasic(void)
+{
+    scenario("ecbasic");
+#ifndef TSDB_EC
+    /* without the codec (make NO_EC=1) a tsdbd settles nothing: an ec volume's rows stay in .part files */
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#endif
+    static char hpenv[PATH_MAX + 4300], hpath[PATH_MAX + 4200];
+    snprintf(hpath, sizeof hpath, "%s/holdput", base);
+    snprintf(hpenv, sizeof hpenv, "TSDB_CHUNKPEER_TEST=holdput=8000:%s", hpath); /* the last case: a put at SIGTERM */
+    for (int i = 0; i < 6; i++) {
+        envs[i] = "hold_copy_file=1,copy_probe=1"; /* the EPOCH case holds a stripe member's copy */
+        penv[i] = hpenv;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+    static char xa[6][PATH_MAX + 256];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200", sd);
+        restart_xargs(i, xa[i]);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 with six stores: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("the twin t42: %s", cluster_strerror(rc));
+    struct meta_volume e;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of e42 with a leader in server 0's copy 30 s after the add");
+    int L = server_of(e.leader);
+    if (L < 0)
+        die("e42's leader %" PRIu32 " is no server of the test", e.leader);
+    struct meta_volume tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of t42 with a leader in server 0's copy 30 s after the add");
+    int Lt = server_of(tv.leader);
+    if (Lt < 0)
+        die("t42's leader %" PRIu32 " is no server of the test", tv.leader);
+    printf("  e42 (volume %" PRIu32 ") led by server %d, twin t42 (volume %" PRIu32 ") by server %d\n", num, L, tnum,
+           Lt);
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL; /* 2024-01-01: long past the settle grace */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecb.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    /* two batches a flush apart: two parts in the day's partition, which its idle merge (1 s) makes one of level 1,
+     * the only kind a cluster settle takes (D18) */
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECB_SERIES; s++) {
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
+            ecb_rows_of(s, b, day0, ts, val);
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into e42: %s", ers(rc));
+            int trc;
+            for (uint64_t t0 = now_ms(); (trc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((trc != TSDB_ERR_UNAVAILABLE && trc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert into t42: %s", ers(trc));
+        }
+        usleep(1000000); /* past the flush interval */
+    }
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) == 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("no .ec part in the leader's v%" PRIu32 " 120 s after the writes: nothing settled", num);
+    /* every row of the day in an object before the kills: rows in a .part (a part the gate's flush wrote after the
+     * first settle, settled again once rewritten) are answered without a decode, and a read of them cannot tell
+     * three members away (the r8f-final run: 2 .ec parts, series 4 read whole with three members killed) */
+    char live[1024];
+    int nlive;
+    for (uint64_t t0 = now_ms(); (nlive = ecb_live_parts(L, num, live, sizeof live)) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("%d .part file(s) left in the leader's v%" PRIu32 " 120 s after the first settle:%s", nlive, num, live);
+    nec = ecb_ec_parts(L, num);
+    printf("  settled: %d .ec part(s) in the leader's volume directory, no .part left\n", nec);
+    for (int s = 0; s < 2; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || ecb_read(ct, idt[s], &b) != 0)
+            die("read of series %d after the settle: %s", s, ers(rc));
+        if (a.n != 2 * ECB_ROWS || a.n != b.n || a.h != b.h)
+            die("series %d after the settle: %" PRIu64 " rows (hash %" PRIx64 "), the twin %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, b.n, b.h);
+    }
+    printf("  every answer equals the twin's after the settle\n");
+    struct ecb_sum twin[ECB_SERIES]; /* read now: the kills below may take t42's members too */
+    for (int s = 0; s < ECB_SERIES; s++)
+        if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 2 * ECB_ROWS)
+            die("the twin's series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
+    /* stripe members killed and restarted: first those that are neither e42's log replicas nor the metadata leader,
+     * then, while fewer than three, e42's follower replicas (never its leader L nor the metadata leader): with the
+     * metadata leader among e42's replicas only two members are outside both, and the three-member case must never be
+     * skipped (a run of a185e2a1 skipped it). A follower killed leaves L leading: reads stay at L. */
+    int victims[6] = {-1}, nv = 0, ml = leader_of(L);
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < 6 && (pass == 0 || nv < 3); i++) {
+            if (i != ml && i != L && ecb_is_rep(&e, i) == (pass == 1))
+                victims[nv++] = i;
+        }
+    if (nv < 3 || ecb_is_rep(&e, victims[0]))
+        die("%d stripe members to kill besides L and the metadata leader (server %d first)", nv, victims[0]);
+    stop(victims[0], SIGKILL);
+    for (int s = 2; s < 4; s++) {
+        struct ecb_sum a, b = twin[s];
+        if ((rc = ecb_read(c, ide[s], &a)) != 0)
+            die("read of series %d with server %d killed: %s", s, victims[0], ers(rc));
+        if (a.n != b.n || a.h != b.h)
+            die("series %d with one stripe member away: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
+    }
+    printf("  one stripe member killed (server %d): reads decode around it\n", victims[0]);
+    for (int k = 1; k < nv && k < 3; k++)
+        stop(victims[k], SIGKILL);
+    {
+        int nun = 0;
+        for (int s = 4; s < ECB_SERIES; s++) { /* none read before: the granule cache holds none of them */
+            struct ecb_sum a, b = twin[s];
+            rc = ecb_read(c, ide[s], &a);
+            if (rc == TSDB_ERR_UNAVAILABLE) {
+                nun++;
+                continue;
+            }
+            if (rc != 0 || a.n != b.n || a.h != b.h)
+                die("series %d with three stripe members away: %s (%" PRIu64 " rows, the twin %" PRIu64
+                    "), want UNAVAILABLE or the twin's rows", s, ers(rc), a.n, b.n);
+        }
+        if (nun == 0) {
+            char live[1024];
+            int nl = ecb_live_parts(L, num, live, sizeof live);
+            die("series 4-%d with three stripe members away (servers %d %d %d): every one read whole, none UNAVAILABLE "
+                "(%d .ec, %d .part:%s)", ECB_SERIES - 1, victims[0], victims[1], victims[2], ecb_ec_parts(L, num), nl,
+                live);
+        }
+        printf("  three stripe members killed (servers %d %d %d): UNAVAILABLE for %d of %d series, the rest whole\n",
+               victims[0], victims[1], victims[2], nun, ECB_SERIES - 4);
+    }
+    for (int k = 0; k < nv && k < 3; k++)
+        start(victims[k]);
+    for (int s = 4; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b = twin[s];
+        for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+            if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 60000)
+                die("read of series %d after the restarts: %s", s, ers(rc));
+        if (a.n != b.n || a.h != b.h)
+            die("series %d after the restarts: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
+    }
+    printf("  the members back: reads whole\n");
+
+    /* e42's leadership moved to another replica: the new leader reads the objects the old one settled, with every
+     * cache cold. A chunk's identity names the volume's uuid (META's, the same on every member: the r8f review's
+     * mutant B01, a uuid of each member's own, survived while no test read after a leader change). */
+    {
+        int T = -1;
+        for (uint32_t k = 0; k < e.nrep && T < 0; k++)
+            if (server_of(e.rep[k].node) != L)
+                T = server_of(e.rep[k].node);
+        if (T < 0)
+            die("e42 has no replica besides its leader %d", L);
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[T], why, sizeof why)) != 0; usleep(500000))
+            if (now_ms() - t0 > 60000) /* a member restarted above may still be out of the ISR */
+                die("transfer of e42 to server %d: %s (%s)", T, cluster_strerror(rc), why);
+        struct meta_volume ne;
+        for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &ne) || ne.leader != ids[T]; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("e42's record does not name server %d its leader 30 s after the transfer", T);
+        /* The record names T before T has reopened as the writer, and that reopen attaches the tier: it asks every
+         * stripe member to hold the new epoch. The EPOCH case below stops a member; let the attach end first, or it
+         * finds that member down or unsure and the settle is refused at the writable gate before any put (the r8f
+         * fixer's run fx4 base1: no "failed" line from a put in 60 s). */
+        char lead[96];
+        snprintf(lead, sizeof lead, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", num, ne.epoch);
+        for (uint64_t t0 = now_ms(); !log_has(T, lead); usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("server %d named e42's leader but has not reopened as its writer in 30 s", T);
+        L = T;
+        tsdbc_close(c);
+        c = client(L);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum a, b = twin[s];
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 60000)
+                    die("read of series %d at the new leader %d: %s", s, L, ers(rc));
+            if (a.n != b.n || a.h != b.h)
+                die("series %d at the new leader %d: %" PRIu64 " rows, the twin %" PRIu64, s, L, a.n, b.n);
+        }
+        printf("  e42 transferred to server %d: every series read whole from the objects\n", L);
+    }
+
+    /* D9: one EPOCH slot of e42 damaged in S's store, S restarted: the store is unsure. Its copy held behind a volume
+     * add (not caught up), a settle's put to S is refused and the settle fails: neither the put's epoch nor the
+     * store's surviving slot (mutant ownepoch) nor a copy that is not caught up (staleraise) raises it. Let go, the
+     * copy raises it and the next day settles. */
+    int S = victims[0];
+    char ep[PATH_MAX + 80], hold[PATH_MAX + 96], needle[96];
+    snprintf(ep, sizeof ep, "%s/ecs%d/s%" PRIu32 "/EPOCH", base, S, num);
+    {
+        struct view vv;
+        view((S + 1) % 6, &vv);
+        const struct meta_member *mb = meta_member(&vv.m, ids[S]);
+        struct state_want up = {ids[S], META_UP, mb ? mb->incarnation + 1 : 1};
+        view_free(&vv);
+        stop(S, SIGTERM);
+        int fd = open(ep, O_RDWR);
+        uint8_t byte;
+        if (fd < 0 || pread(fd, &byte, 1, 16) != 1)
+            die("%s: %s", ep, strerror(errno));
+        byte ^= 0x5a;
+        if (pwrite(fd, &byte, 1, 16) != 1 || fsync(fd) != 0)
+            die("%s: %s", ep, strerror(errno));
+        close(fd);
+        start(S);
+        await_view((S + 1) % 6, p_member_state, &up, "the stripe member back with a damaged EPOCH slot");
+    }
+    server_dir(S, hold, sizeof hold);
+    strcat(hold, "/state/holdcopy");
+    FILE *hf = fopen(hold, "w");
+    if (!hf)
+        die("%s: %s", hold, strerror(errno));
+    fclose(hf);
+    usleep(300000); /* a round of S's cluster thread */
+    uint32_t hnum;
+    for (uint64_t t0 = now_ms(); (rc = vol_add(meta_leader_of(6), "hx", 3, &hnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("volume add hx: %s", cluster_strerror(rc));
+    await_caught(S, 0, now_ms(), WAIT_MS, "its published copy held behind a volume add");
+    snprintf(needle, sizeof needle, "on member %" PRIu32 " failed", ids[S]);
+    int refused0 = log_count(L, needle), nec0 = ecb_ec_parts(L, num);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    for (uint64_t t0 = now_ms(); log_count(L, needle) == refused0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("no put to server %d (an unsure store, its copy held) was refused in 60 s: %d .ec parts, %d before", S,
+                ecb_ec_parts(L, num), nec0);
+    if (!log_has(S, "EPOCH slot 0 is damaged"))
+        die("server %d's store did not say its EPOCH slot 0 is damaged", S);
+    usleep(1000000);
+    if (ecb_ec_parts(L, num) != nec0)
+        die("a settle went through with server %d's store unsure and its copy not caught up", S);
+    printf("  an unsure store with its copy held: the put refused, nothing settled\n");
+    unlink(hold);
+    await_caught(S, 1, now_ms(), WAIT_MS, "its published copy let go");
+    ecb_write_day(c, ide, day0 + 4 * 86400000LL); /* a failed key waits an hour: another day */
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == nec0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("nothing settled 120 s after server %d's copy was let go", S);
+    printf("  the copy caught up raises it: the next day settles\n");
+
+    /* D13: chunks of a cluster volume are deleted only by a committed MK_GC (r8k). The rows expired, the .ec parts
+     * are retired, and every chunk stays (mutant delbeforegc deletes them). */
+    int nch = ecb_chunks(num);
+    if (nch == 0)
+        die("no chunk files of e42 in the stores");
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("retention of e42's series %d: %s", s, ers(rc));
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) != 0 || !log_has(L, "deleted only by a committed MK_GC");
+         usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("e42's expired .ec parts: %d still listed, the delete %s refused in 60 s", ecb_ec_parts(L, num),
+                log_has(L, "deleted only by a committed MK_GC") ? "was" : "not");
+    usleep(2000000); /* the gc worker's retries */
+    int nch2 = ecb_chunks(num);
+    if (nch2 != nch)
+        die("e42's chunks: %d before the drop, %d after: deleted with no MK_GC", nch, nch2);
+    printf("  the .ec parts dropped by retention: the delete refused, %d chunk files kept\n", nch);
+
+    /* A settle's put in flight at SIGTERM (the r8f review's F3): the engines' threads call into the chunk server until
+     * tsdb_close, after tsdbd frees it, so the free waits for every call holding it. The hook holds the first put once
+     * its file exists for 8 s and says whether the chunk server was still open when it let go. New series of their own
+     * (no retention) on a new day, so that there is something to settle. */
+    tsdb_sid idh[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecb.h%d", s);
+        idh[s] = ecb_series(c, nm, "e42");
+    }
+    FILE *hpf = fopen(hpath, "w");
+    if (!hpf)
+        die("%s: %s", hpath, strerror(errno));
+    fclose(hpf);
+    ecb_write_day(c, idh, day0 + 6 * 86400000LL);
+    for (uint64_t t0 = now_ms(); !log_has(L, "holdput: a put holds"); usleep(100000))
+        if (now_ms() - t0 > 120000)
+            die("no settle put held at server %d 120 s after the writes", L);
+    tsdbc_close(ct);
+    tsdbc_close(c);
+    stop(L, SIGTERM); /* exit status 0 required */
+    if (!log_has(L, "holdput: released, the chunk server still open"))
+        die("server %d stopped with a put in flight: %s", L,
+            log_has(L, "closed under it") ? "the chunk server was closed under it" : "the put never let go");
+    printf("  a settle's put in flight at SIGTERM: the shutdown waited for it, exit 0\n");
+}
+
 static void scen_ecadd(void)
 {
     scenario("ecadd");
@@ -17800,7 +18287,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

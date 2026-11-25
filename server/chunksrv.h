@@ -202,6 +202,11 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
 void chunksrv_cluster_stop(void);         /* after cluster_stop: no socket is handed to the links any more */
 void chunksrv_cluster_free(void);         /* once tsdbd's workers are joined */
 struct chunksrv *chunksrv_cluster(void);  /* NULL until it serves */
+/* chunksrv_cluster() for a caller that is not one of tsdbd's workers (the engines' threads): held until
+ * chunksrv_cluster_release, which chunksrv_cluster_free waits for; NULL (nothing held) until it serves and once freed */
+struct chunksrv *chunksrv_cluster_hold(void);
+void chunksrv_cluster_release(void);
+int chunksrv_cluster_closes(void); /* how many times chunksrv_cluster_free closed it (a test hook's check) */
 
 /* ---------------------------------------------------------------- test hooks (tests/test_chunksrv.c --mutant) */
 enum {

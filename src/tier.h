@@ -160,6 +160,15 @@ typedef struct tier_attach {
     const tier_settings *settings; /* copied at attach */
 } tier_attach;
 
+/* R8 (r8f): a cluster tsdbd's ec volumes. Set once before tsdb_open (server/chunkpeer_cluster.c). With no
+ * TSDB_TEST_TIER, tier_open then makes a tier with no stores of its own (cfg.set false, be NULL, the cache's budget
+ * cache_mb): only cluster ec volumes (META requires=cluster and ec) attach to it, each with what fn fills in (the peer
+ * cold ops, the copy's epoch provider, *s: the settings with the copy's k and m, which the attach copies); every other
+ * volume opens without a tier. fn returns 0, or an error that fails the volume's open. Without TSDB_EC it is ignored
+ * (a volume whose META says requires=tier is then refused at open, as on any build without the codec). */
+typedef int (*tier_cluster_fn)(void *arg, uint32_t volume, tier_attach *a, tier_settings *s);
+void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb);
+
 /* One attached volume's cold side: its ops and their context, epoch provider and settings. Reference counted: the
  * engine holds one (db->ecstate->cold), the tier's registry one for the volume's latest successful attach (what
  * tier_cold_get finds: a reopen's new engine replaces the entry once its attach has seen the epoch, the retired engine

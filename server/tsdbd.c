@@ -122,6 +122,7 @@
 #include "tenants.h"
 #include "cluster.h"
 #include "chunksrv.h"
+#include "chunkpeer.h"
 #include "fwd.h"
 #include "fwdreq.h"
 #include "cvol.h"
@@ -1288,8 +1289,13 @@ typedef struct raw_out {
     bool gone;
 } raw_out;
 
+/* An error's frame carries no rows: the clients read a status frame as `last` with n = 0 and then the body of an HA
+ * status (UNAVAILABLE, MOVED). Rows still gathered when a query fails after earlier frames (an .ec granule whose
+ * stores went away, r8f) belong to a failed answer, and with them the C client took the frame as corrupt. */
 static bool raw_flush(raw_out *o, bool last, int32_t status)
 {
+    if (status)
+        o->n = 0;
     uint8_t h[5];
     h[0] = last;
     put32(h + 1, o->n);
@@ -1332,6 +1338,10 @@ typedef struct values_out {
 
 static bool values_flush(values_out *o, bool last, int32_t status)
 {
+    if (status) { /* no rows in an error's frame: raw_flush */
+        o->n = 0;
+        o->any_null = 0;
+    }
     unsigned aw = tsdb_wire_width(o->type);
     size_t vb = (size_t)o->n * aw;
     uint8_t h[8] = {last, o->type, (uint8_t)(o->any_null ? TSDB_VALID : 0), 0};
@@ -3052,6 +3062,9 @@ static int test_auth_delay_ms;
  * topology: the C client follows it), not UNAVAILABLE. =2: an insert to any cluster volume, one led here too
  * (test_cluster movedself: never MOVED to this server itself). */
 static int test_route_moved;
+/* TSDBD_TEST_QUERY_STATUS=N: a raw or values query the engine answered whole ends with status N instead, after its rows
+ * (the shape of a query that fails after earlier frames; test_server error_after_rows) */
+static int test_query_status;
 static void handle_in(req *r);
 static void handle(req *r)
 {
@@ -3408,6 +3421,8 @@ static void handle_op(req *r)
             return;
         }
         rc = tsdb_query_raw_ex(db, s, start, end, &q, raw_cb, &o);
+        if (rc == 0 && test_query_status)
+            rc = test_query_status;
         if (!o.gone)
             raw_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -3519,6 +3534,8 @@ static void handle_op(req *r)
             rc = tsdb_query_values(db, s, qr.start, qr.end, &qr.q, values_cb, &o);
         else
             rc = tsdb_query_lttb_ex(db, s, qr.start, qr.end, (size_t)qr.threshold, &qr.q, values_cb, &o);
+        if (rc == 0 && test_query_status)
+            rc = test_query_status;
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -6010,6 +6027,11 @@ int main(int argc, char **argv)
         return 1;
     o.tenants = (const char *const *)tn_list;
     o.ntenants = tn_n;
+    /* r8f: the cluster ec volumes' cold side (server/chunkpeer.h), before tsdb_open opens the tier it hooks into */
+    if (cluster_on && !witness && chunkpeer_cluster_start(dir) != 0) {
+        fprintf(stderr, "tsdbd: the peer cold ops do not start\n");
+        return 1;
+    }
     int rc = tsdb_open(dir, &o, &db);
     tn_free_list(tn_list, tn_n);
     if (rc) {
@@ -6062,6 +6084,7 @@ int main(int argc, char **argv)
     }
     if (margin_mutant)
         fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s\n", getenv("TSDBD_MARGIN_MUTANT"));
+    test_query_status = getenv("TSDBD_TEST_QUERY_STATUS") ? atoi(getenv("TSDBD_TEST_QUERY_STATUS")) : 0;
     if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
         static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
                                             "replicaread", "spanaccepted",      "nocopyserved"};
@@ -6274,6 +6297,7 @@ int main(int argc, char **argv)
         cluster_stop();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */
+        chunkpeer_cluster_stop(); /* its installer thread names the chunk server: before that is freed */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
     pthread_mutex_lock(&work_lock);
