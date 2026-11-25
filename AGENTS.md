@@ -191,8 +191,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb cluster replica reset`), `server/cvolset_mgr.c` (the push's RESET and UNNAMED, the start sweep),
   `server/cset.c` (REPLICA_RESET on the Raft leader, refused for the leader and ISR members; the `setop_file` test hook
   for ADD/REMOVE). Tests: `test_cluster addreplica setnext addswitch removereplica removeindex removedown setstale
-  setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). Until a fresh replica can be
-  filled by snapshot, the fill tests keep every leader segment (`TSDB_REPLD_TEST=keepall`).
+  setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). `TSDB_REPLD_TEST=keepall` keeps every
+  leader segment, for the tests that fill a learner from the log (a fresh learner otherwise gets a snapshot, below).
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
   decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
@@ -400,6 +400,34 @@ cgroup, so `nice` does not keep your work out of its way.
   whole with 16 seeds; `--only install` runs these alone), mutants `snaplowerfence snapraiseled snapkeepunsure
   snapswapfirst snapinstnodirsync`. A crashfs child that must lose power at its end exits with `exit`, never `_exit`
   (the loss at exit is the shim's destructor).
+- `server/rsnap.c`, `server/snapinst.c`, `server/snapinst_run.c` (R4 r4-xferlink, r4-xferinst; D2, D7, D16, D18;
+  design-cluster.md 8.1 "Built in R4"): a snapshot's transfer and install. The receiver's driver calls `rsnap_need` at the
+  core's `REPL_A_SNAPSHOT` (the notice names the leader); frames REQ, BUSY, GO, DONE, ABORT and the files go on the
+  snapshot link kind 5 (`PL_KIND_SNAP`, its own token bucket `rebuild_mb_s`, `peerlink_set_kind_rate`: a COMMIT's file on
+  kind 2 never waits behind one), SNAPMAN first, then each file hashed as it arrives by the link's own data callback.
+  One worker thread per server makes, releases and installs (`rebuild_max` jobs alive per role, sent and received counted
+  apart); never the driver's, a link's or the cluster thread. The receiver checks free space (total + max(10%, 1 GiB))
+  before it says GO. `snapinst_run.c` takes the volume from the manager (`cvol_install`: RECOVERING, driver stopped, engine
+  closed), reads the old REPL as `keep` only then, runs `snap_install`, and the manager opens the volume as a new record
+  (new open generation, REPLICA_OPEN waited for); P at or below the stopped driver's log end, or an epoch below the fence,
+  is "stale and not installed", checked before and after the close. `snapinst_leftovers` runs `snap_leftovers` at
+  `cvolfs_prepare`. Crash points `snap-received`, `snap-swapped`, `snap-halfswap`; STATUS `snap.*` and the metrics
+  `tsdb_snapshot_*` (docs/metrics.md). Tests: `test_cluster snapxfer snaplarge snapnospace snapbusy snapsrckill snaplost
+  snapstall snapcatch snapkill snappower snapfence snapdiverged addsnap keepcap`, `test_cvolfs`; mutants through
+  `make repld-mutants` (`snapnoverify snapsamelink snapnospacecheck snapsrcpromoting snapnosrcmax snapsharedmax
+  snapnodonebits snapmakedown snapnowaitdone snapnostale snapnostall snapnosrcdown snapstalekeep snapinstallstale
+  snapservebeforeopen snapkeepdiverged snapsetnodefer snapclosekeep snapdropafter snapnoendafter snapnofence
+  snapdivlogend snapnoleftovers`; each pinned to its FAIL line in `tests/repld_mutants.sh`). Not built: the receive-side
+  rate limit, reuse of files the receiver holds (D4), `.ec` parts in a snapshot (the make refuses a volume that lists
+  one: docs/tasks/r8-from-r7.md).
+- `server/repld_int.h` (r4-iface): the replication driver's structs (`rvol`, `rpeer`, `item`, `G`) and the few helpers
+  that `repld.c` shares with `rsnap.c`, `rset.c` and `rtransfer.c` (the names it exports for them are `rd_*`, `#define`d
+  back to the short ones in the header, so each source reads as before); the lock rules of `repld.c` hold in every file that includes it.
+  `server/cluster_int.h`: what `ctransfer.c`, `cmove.c` and `cset.c` (the Raft leader's side) need of `cluster.c` (`cl_*`:
+  the clock, this node, the leader's peer, a proposal and its reply, the duty hooks) and the entry points `cluster.c` calls;
+  all of it runs on the cluster thread only, nothing there takes a lock. R4's wire pieces: admin ops 10 to 12
+  (`CLUSTER_OP_VOLUME_TRANSFER`, `_VOLUME_MOVE`, `_REPLICA_RESET` in `cluster.h`), the Raft leader's command to a volume's member
+  (`F_VOLCMD`, `CL_VOLCMD_*`) and the member's READY, link kind 5, peer protocol 7 for these, 8 now.
 - `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,
   epoch, see_epoch, writable, all_up); settle.c, eccache.c, eckeep.c, ecgc.c and tier.c reach the stores only through them
   and never name a store index. Per attached engine (`tier_attach`: ops, settings, epoch provider; a refcounted `coldvol`
@@ -678,6 +706,35 @@ cgroup, so `nice` does not keep your work out of its way.
   only once the commit floor the driver saved covers its end (`lrq`, `leader_replay_floor`): the same directory
   reopened as a replica at that floor replays it (`test_replica` LR and PL, mutants `replayleadnofloor replayopennone
   replayopennofloor`).
+- **Snapshots** (R4; `src/snapshot.c`, `server/rsnap.c`, `server/snapinst_run.c`; design-cluster.md 8.1). A leader's
+  snapshot is its **crash image at the cut P** (its commit point): what a restart of the leader at P would find, taken
+  without stopping writes. The cut reads memory only, under `flush_lock` then `publish_lock`, and lets go of both before it
+  touches a file; the files are hard links (a part a merge renamed meanwhile by its `retired_` name; neither: the make
+  retries, never CORRUPT), then **the lock barrier**: SERIES, STATES, RETENTION and CLASSES are copied last, each after
+  taking its own lock (`append_lock`, `ret_lock`, `class_lock`) alone and reading the file's length, so every record
+  whose marker is at or below P is in the copy (its writer held that lock from marker to record) and later ones are
+  applied again harmlessly; never nest those locks or take one under an engine lock (no new lock-order edge). A new file
+  that records something a marker names must be copied under that rule or be one of the files the cut lists.
+  **The install never lowers a promise and never invents one:** the new directory's fence is the old one's raised to P's
+  epoch, never lowered; its `led` is never raised; an unsure REPL stays unsure (with the open generation's belt carried);
+  FNO is P + 1; the old directory's REPL is read only after its driver has stopped saving it (a FENCE between the read and
+  the close would be lost); a snapshot whose P is at or below the log end of the receiver, or whose epoch is below its
+  fence, is not installed (stale), checked again after the close; and the swap is `v<N>` -> `v<N>.old`, `v<N>.snap` ->
+  `v<N>`, root fsync, remove (`snap_leftovers` decides every crash state; neither release `v<N>.snap` nor open `v<N>`
+  before it ran). A rebuilt copy needs twice the volume's space meanwhile: the receiver checks free space first, so a
+  rebuild never runs a live volume's WAL into ENOSPC (fail-stop). `src/snapshot.c` is in the embedded bindings' copy of
+  `src/*.c` and builds without `TSDB_EC`. Tests `test_snapshot` (windows, merges during the links, random writers,
+  power loss at every step), mutants in the Makefile's `test_snapshot` loop (`snapafterp` ... `snapinstnodirsync`).
+- **Replica set versions** (R4; `server/meta.c`, `src/repl.c`, `server/rset.c`). A volume's `set_version` is raised by
+  exactly REPLICA_ADD, REPLICA_REMOVE and REPLICA_RESET and by nothing else; every replication message carries it and a
+  receiver drops (and counts) another version's (a FENCE excepted); the driver adopts a new version only on the volume's
+  thread, with the core's actions drained (`REPL_E_PENDING`), remapping its per-index state by node AND rid in the same
+  step, and hands the core only records of the core's own version (`repl_dropped_meta`); a leader whose change removes a
+  member of its record's ISR commits nothing until it adopts the new record. A removed or reset member's directory is
+  set aside by rename (`.removed-<rid>`, `.stale-<rid>`, `.lost-<rid>`) with a root fsync before anything relies on it;
+  a `v<N>` the record does not name is never opened, and one that is missing while the group recorded an open of it is
+  refused, never made again by itself. One move per volume; a move's shrink never takes the ISR below the size it had
+  before the new member joined (`repl_leave`, `min_isr`).
 - **Settled parts** (R7; `src/ecpart.c`, `src/ecswap.c`, `src/settle.c`, `src/eckeep.c`, `src/ecgc.c`; design-cluster-data.md
   §2.3 as it applies on one server). A settle turns the `p<K>_<A>_<B>_<L>.part` of a key into the `.ec` of the same name:
   the file keeps its source's name and block range (D2), so it has the same rows, the same rank and the same key, and a

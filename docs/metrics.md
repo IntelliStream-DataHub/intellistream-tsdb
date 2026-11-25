@@ -78,6 +78,13 @@ directory) and `path`.
 | `tsdb_snapshot_install_last_seconds` | gauge | cluster only: the last snapshot installed, seconds from the end of its transfer to the volume handed back to be opened (STATUS `snap.install_last_s`) |
 | `tsdb_fwd_hop_seconds{peer,quantile}` | summary | cluster only: time from a forward's send to its reply, p50 and p99 of every forward since the server started (cumulative, not a window); STATUS shows the same per peer (`peer.<id>.fwd.*`) |
 
+R4's other cluster counters are **not** on the metrics port, only in `tsdb cluster status` (the `transfers started ...` and
+`moves started ...` lines, `CL_TR_*` in `server/cluster.h`, counted from the start of the server you ask): leadership
+transfers started, done, timed out, cancelled, fallen back to a failover, started by the leader balance, drains that gave
+up, records admitted blind after a READY's hard cap, READYs sent and replica log cuts; replica moves started, done and
+cancelled; and the messages a replica dropped for another set version (a log line, once in 5 s). Per-volume rebuild
+progress is not counted at all (R14). The snapshot rows above are what the metrics port has of R4.
+
 Not exported, although docs/design-latest.md 6.5 names them: the engine keeps no counters for why a lookup searched
 (`tsdb_latest_search_total{why}`), for the time lookups waited for a write section (`wait_seconds_total`) or for the
 series whose newest row lies more than an hour ahead of the clock (`future_series`). Requests themselves are the

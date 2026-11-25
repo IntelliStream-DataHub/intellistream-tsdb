@@ -46,6 +46,35 @@ initialised again. xxHash's `xxhash.h` (0.8.3, BSD-2-Clause) is vendored in
 member's READY): a node of an older build is refused at HELLO, and a cluster made before this change is initialised
 again.
 
+**Rebuild by snapshot (R4: rebuild, catch-up past the caps).** A replica that cannot catch up from the log (a new copy, a
+reset one, a member that was away longer than `repl_retain_mb` or `repl_retain_s` allow) no longer stays a learner: it
+asks the volume's leader for a snapshot, receives it on a link kind of its own (kind 5), and installs it. The snapshot is
+the leader's crash image at its commit point, made while writes go on: hard links of every part, the log segments and
+the files of commits in flight, and SERIES, STATES, RETENTION and CLASSES copied last under a lock barrier that adds no
+lock to the engine's order. The receiver checks every file against the leader's hashes, every part's checksums and its own
+free space (the snapshot's size plus 10%, at least 1 GiB more: the old directory stays until the new one is in place),
+swaps the directory in, and opens it as a restart would, under a raised open generation; its fence is never lowered and
+its `led` never raised. New settings of `tsdb cluster init`: `--rebuild-mb-s` (200: the sender's rate per link),
+`--rebuild-max` (2 snapshots sent, and as many received, at once), shown by `tsdb cluster status`, fixed for the cluster's
+life. Not built: a limit on the receiving side, reuse of files the receiver holds, a snapshot that carries `.ec` parts
+(so an erasure-coded volume that has settled a key cannot rebuild a replica by snapshot yet), rebuild progress in `status`.
+`tsdbd`'s `status` and metrics port show `snap.*` and `tsdb_snapshot_*` (docs/metrics.md). Tests: `test_snapshot` (the
+make and the install, with power loss at every step), `test_cluster snap* addsnap keepcap`.
+
+**Replica set changes and `tsdb cluster replica reset` (R4).** A volume's set of copies can change under a running
+cluster: a copy is added (as a learner), removed or replaced, and the leader's replication core follows without a
+restart (`repl_reconfig`). A removed copy's directory is deleted once the removal is committed; a directory that no longer
+belongs (another replica id, or one that a server finds after having been down through a removal) is set aside as
+`v<N>.stale-<rid>`, never opened and never deleted by tsdb. A directory that is missing while the group recorded an open of
+it is refused at start with a line naming `tsdb cluster replica reset PEER VOLUME NODE`, which gives the copy (one that
+neither leads nor is in the in-sync set) a new replica id, sets a directory still there aside as `v<N>.lost-<rid>`, and
+rebuilds the copy from a snapshot. It is never done by itself: an unmounted disk looks the same as a lost one.
+
+**A replica's replay start (R4, r4-replay).** A replica names the segments it has flushed in RSTATE (`kept`) and its
+open no longer replays them, and it tells the leader the first position it would replay, apart from its log start. The
+leader's class switches now wait for that (seconds after a failover) and no longer for `repl_retain_s` (30 minutes by
+default). The change is in the replica's RSTATE contents and the ACK; the on-disk formats are as before.
+
 **Moving a log replica (R4, r4-move).** `tsdb cluster volume move PEER VOLUME --log --from A --to B` moves a
 volume's copy from one node to another in the background: B is added as a learner, fills and joins the ISR; a transfer
 first if A leads; A leaves the ISR only while the ISR without it keeps the size it had before B joined (a lagging member
@@ -59,7 +88,7 @@ move-mutants`.
 
 **Planned leader transfer and leader balance (R4, r4-transfer).** `tsdb cluster volume transfer` moves a volume's lead
 to a member of its ISR: the leader drains (writes answer UNAVAILABLE PROMOTING, retry after 50 ms), says READY to the
-metadata group's leader, and a promotion of that member alone follows; with `leader_balance_s` set, a volume moves back
+metadata group's leader, and a promotion of that member alone follows; with `leader_balance_s` set (it is 0, off, by default: the pause of a transfer is not measured on real servers yet), a volume moves back
 to its preferred leader (its first replica) once that member has been in the ISR that long, one transfer per server
 and one start a second, with a backoff after each failed one. The reply of `CLUSTER_OP_STATUS` has, after
 `users_caught_up`, a u32 count and that many u64 transfer counters (`CL_TR_*` in `server/cluster.h`: started, done, timed
@@ -67,8 +96,7 @@ out, cancelled, fallen back to failover, by balance, drains timed out, records a
 leader: a `tsdb cluster status` of an earlier build fails to decode a newer server's reply. Tests: `test_cluster
 transfer*`, `balance*`, `make transfer-mutants`.
 
-**Replica set changes in the replication core (R4, r4-core; the core and its simulator only, nothing drives them in
-tsdbd yet).** `src/repl.[ch]`: `repl_reconfig` (a member added, removed or reset under a running core; refused with
+**Replica set changes in the replication core (R4, r4-core).** `src/repl.[ch]`: `repl_reconfig` (a member added, removed or reset under a running core; refused with
 `REPL_E_PENDING` while actions are queued, `REPL_E_INVALID` for a deposed leader), the replica set version in every
 replication message (`repl_set_version`; a message of another version is dropped and counted), `repl_leave` (a move's
 shrink, D11), `repl_meta_promote_to` (a planned promotion names its target, D14) and the ACK's replay start

@@ -106,6 +106,17 @@ beside `ecrankdown` and `swapnodropcheck`, which R7's tests already catch on one
 - `tsdb_query_multi` over settled parts has no seam test of its own (the oracle covers it end to end); the cluster's
   `route_decide` is not exercised with a diverged volume.
 
+- **A snapshot carries no `.ec` parts (R4, r4-docs, 2026-11-25).** `snap_make` (`src/snapshot.c`, header: "Not built: .ec
+  parts") refuses a volume that lists one with `TSDB_ERR_INVALID`, and `snap_install` refuses a file that is not a `.part`
+  ("an .ec part cannot be installed yet"). R4's plan assumed the tier stays refused on cluster volumes (`src/tier.c`
+  then), and R8 has since let an erasure-coded cluster volume attach one (`eccold_may_attach`, `tier_engine_attach`,
+  `src/tier.c`), so once a leader has settled a key, every snapshot of that volume fails: a replica that needs one (a
+  `volume move --log` target, a `replica reset`, a member past the retention caps) stays a learner (the make fails, the source answers BUSY and the replica asks again). R8 must make the snapshot carry the `.ec` parts of the cut (the index files and object records; the
+  chunks stay on the stripe group's stores), with their `ppos` records, and decide what of the kept `settled_*` and
+  `retired_*` files travels; a test of the install with a settled key (rows equal to the leader's, a read through the
+  seam on the new replica, power loss at each step) belongs with it. Until then a log replica of an erasure-coded volume
+  cannot be moved or rebuilt once it has settled anything.
+
 ## What R8 inherits and must keep (do not weaken)
 
 The settle checks the bytes it encodes, once. The seam always checks. A drop and a swap meet under `db->lock`. The

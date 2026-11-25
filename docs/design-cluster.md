@@ -8,7 +8,8 @@ This design is the *replicated mode* of tsdb's two HA modes; ha.md is the *share
 the fifteen gaps that build step 2's replication simulator found (branch `cluster-s2`, 44b352b, 13081cc and 9f2cf49;
 "Corrections from step 2's simulator" below, each with its mutant or seed, and marked *Corrected 2026-11-06 (gap N)*
 in the section it changes).
-Tutorial: [cluster-preview.md](cluster-preview.md) runs what is built (the metadata group, `tsdb cluster`) on one machine.
+Tutorial: [cluster-preview.md](cluster-preview.md) runs what is built (the metadata group, replicated volumes with failover,
+transfer, move and rebuild by snapshot) on one machine.
 Update 2026-11-08: step 1 is built (branch ha-s1 on top of cluster-s1) with the amendments of design-ha-modes.md §7.1:
 the metadata format is snapshot version 2, the peer protocol version 2, the state lives in `--state-dir`, and a
 cluster of an earlier build is initialised again (no mixed versions). Where this document says §2.3 puts hard saves
@@ -16,6 +17,9 @@ on a worker, the hard save is still on the cluster thread (see design-ha-modes.m
 *Update 2026-11-09*: the cluster's data path is **production** in 0.11.0 (the user; [design-cluster-data.md](design-cluster-data.md)
 E36): from 0.11.0 on, servers of versions N and N + 1 run together during a rolling upgrade, the metadata and every
 file are upgraded in place, and "initialised again" holds only for 0.10.0's preview group (E37-E41 there).
+*Update 2026-11-24 (R4)*: until the first release that promises it (P1), clusters of the 0.11 development builds are
+initialised again across the metadata and peer-protocol bumps of R4 and R8 (the owner, 2026-11-22: metadata snapshot version
+5, then 6; peer protocol 6, 7, 8): a server refuses a state directory or a peer of another version and names both versions.
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -87,7 +91,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
   Writes to those volumes pause for about 4 s; every other volume does not notice.
 - **Two servers down**: every volume keeps at least one in-sync replica, so writes go on. A volume that lost two of its
   three replicas is acknowledged on one disk until a new replica has caught up (D1).
-- **Rebuild** copies a replica's immutable parts by hard-linked snapshot from any in-sync replica, throttled, then
+- **Rebuild** copies a replica's parts by hard-linked snapshot from the volume's leader (R4: §8.1), throttled, then
   catches up from the leader's WAL. A server back after a short outage only catches up.
 - **Cold tier boundary**: a settled, idle, old partition is handed to a cold tier through four calls (put, read
   range, delete, list); every replica keeps the partition's granule index on local disk, so statistics-only queries
@@ -129,7 +133,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | C17 | **Clients, streams and forwarding as in ha.md** §9 and §9.1: a node list, TOPOLOGY, direct mode by default (D39), streams `(session, vol)` with `seq` and `attempt` (D13, D31), one hop of forwarding (D29, D30), MOVED and UNAVAILABLE, resends in order by time budget. | New client rules | They were designed for exactly this: a volume whose writer moves. Only TOPOLOGY's content changes. |
 | C18 | **Names stay unique in the whole database** (decided 2026-11-02, confirmed with D4 on 2026-11-06) through **name slots**: a name hashes to one of 65,536 slots; each slot has a home volume, whose leader serialises creation of the slot's names and records every one of them (§3.3). | A name index in Raft; names unique per volume; asking every leader | A billion names do not fit a Raft state machine. Per-volume names reverse the user's decision. Asking every leader cannot stop two concurrent creations. |
 | C19 | **Placement is explicit** in the metadata: replica lists per volume, chosen by a balancing rule (distinct servers, distinct racks, even leaders, even pairs) and changed only by moves (§3.2). | Placement computed from the member list (CRUSH, rendezvous hashing) | A computed placement moves data whenever membership changes, even briefly. Explicit lists move it only when the operator or a permanent loss says so. |
-| C20 | **Rebuild from a hard-linked snapshot** of any ISR member, throttled per server, then catch-up from the leader's retained WAL segments (§8). | Copying only from the leader; replaying a log from the beginning | Spreading sources spreads the load; the WAL is not kept forever. |
+| C20 | **Rebuild from a hard-linked snapshot** of any ISR member, throttled per server, then catch-up from the leader's retained WAL segments (§8). | Copying only from the leader; replaying a log from the beginning | Spreading sources spreads the load; the WAL is not kept forever. *As built in R4 (D2): the source is the volume's leader; leaders are spread by §3.2 rule 2, so the sources are spread as well.* |
 | C21 | ~~**Cold tier: only the boundary here** (§9). A whole partition, settled and idle, is handed over; every replica keeps its granule index locally.~~ **Replaced on 2026-11-09** by [design-cluster-data.md](design-cluster-data.md) E3, E5-E7 and E22: the boundary is now first the volume's own erasure-coded settled tier (a settled partition key's parts, one object per part, by a replace at a cut that needs no idleness), and later an external tier (isod, S3) behind the same calls. | Designing erasure coding inside tsdb now (the rejection of 2026-11-05, reversed by the user on 2026-11-09) | The user moved the cold tier to its own design; isod may serve it over S3 (see Later). Since 2026-11-09 the cluster codes its own settled data (E1). |
 | C22 | **Users and grants live in the metadata group** in a cluster; peer links prove the cluster secret (ha.md D35), and a forwarded request carries the user it was logged in as. | A USERS file per server | Login must work on every server, and a password change must reach all of them. |
 | C23 | **The replication logic is a sans-IO core** (`src/repl.c`) with its own simulator, as the Raft core is (§13.1). | Testing it only end to end | Truncation, epochs and ISR changes are where replicated logs lose data; a simulator explores millions of interleavings that a test cluster never reaches. |
@@ -329,6 +333,15 @@ move never lowers the number of in-sync copies. Moves happen when a server is ad
 `rebuild_after_s` on 2026-11-09, with operator holds and a mass-OUT guard*, [design-cluster-data.md](design-cluster-data.md)
 E12; an EC volume moves its log replicas this way and its stripe positions by §6 there).
 
+*Built in R4 (2026-11-24) and left to R9.* R4 built the moves as an operator's verb (`tsdb cluster volume move PEER V --log
+--from A --to B`), not the greedy pass that finds them: what is not built, and stays R9's (docs/design-ha-modes.md), is
+the pass itself and its triggers (a server added, `node drain`, a server declared lost or down for `rebuild_after_s`,
+the mass-OUT guard), the rebuild of a lost server's replicas elsewhere, the balancer and `balance_mb_s`, and §8.4's
+priorities. A move of the replica of an EC volume's stripe position stays R8's (`--pos`); `--log` is required until
+then. No verb changes a volume's number of copies: REPLICA_ADD and REPLICA_REMOVE are driven by a move, and by the tests
+through a file the server reads (`setop_file`, a test hook). `tsdb cluster replica reset` (§8.5) is the operator's rebuild
+of one copy.
+
 **Leader balance.** When a server comes back and its replicas are in sync again, leadership moves back to the preferred
 leader with a planned transfer: the old leader stops admitting writes to that volume, waits until the target's log end
 equals its own, and the Raft leader commits the new leader and epoch. Nothing is cut.
@@ -346,7 +359,9 @@ with a CANCEL of that id. The write pause measured under 4 writers is p50 about 
 mean 310 ms per transfer, 0 refused writes lost or applied, 0 cuts): the drain's 50 ms refusals, the target's 200 ms
 FENCED-to-PROMOTING window and the clients' MOVED delay, not the drain itself. The balance (`leader_balance_s`) moves a
 volume back to rep[0] once it has been in the ISR for the hold, one transfer a second cluster-wide and one per server,
-with a backoff per target after a failure (from `leader_balance_s`, doubling up to 600 s).
+with a backoff per target after a failure (from `leader_balance_s`, doubling up to 600 s). `leader_balance_s` is 0, off,
+by default (D15, the default taken on 2026-11-22), until the pause above has been measured on real servers: the figures are from
+one machine's loopback, and a promotion that reads a gigabyte of kept segments is not among them.
 
 *As built (r4-move, 2026-11-24; server/cmove.c on the Raft leader, the DROP_MEMBER command in server/rset.c):* `tsdb
 cluster volume move PEER V --log --from A --to B` proposes REPLICA_ADD(V, B, fresh rid, `replaces` = A) and answers at
@@ -646,8 +661,9 @@ and every marker in it is applied durably, and keeps sealed segments for catch-u
   than before the restart until the apply catches up (retention "now" never going back holds for a leader, not across a
   replica's restart); rows clamped before the restart may show again until then.
 - **`RETENTION` and `CLASSES` records are keyed by their file offset** (`record_off`), which makes a replay idempotent.
-  That ties a replica to files that hold exactly the leader's records: a snapshot (R4) must copy both whole, and a
-  replica never writes a class record of its own (a fresh series' class-0 decision stays in memory).
+  That ties a replica to files that hold exactly the leader's records: a snapshot copies both whole (R4: the lock
+  barrier of §8.1 step 1 makes every record whose marker is at or below the cut P part of the copy), and a replica never
+  writes a class record of its own (a fresh series' class-0 decision stays in memory).
 - **A volume with a change feed cannot be opened as a replica yet** (retained `fwal_` segments are not designed for
   it): the open is refused with `TSDB_ERR_INVALID`.
 - **The log is contiguous and its durable end is what was synced.** The open refuses a missing middle segment and an
@@ -844,7 +860,8 @@ picks was in the previous ISR); the promotion that waited fences NODE, NODE alon
 leader's log line compares NODE's log end with the last shrink's commit point and says whether writes acknowledged
 before the shrink are all kept or which ones are lost. Members of the old ISR that come back with records past the new
 history (applied at the old epoch, never in NODE's log) stop the volume with "a cut below the applied end" rather than
-diverge silently; rebuilding such a replica (a new instance copied from the leader) is not built yet.
+diverge silently; rebuilding such a replica (a new instance copied from the leader) is `tsdb cluster replica reset` (R4, §8.5): it is out of
+the ISR, so the reset is allowed.
 
 Time to writes again: 3 s detection + about 10 ms for fencing, a Raft commit and the first record + the clients'
 TOPOLOGY refresh. About 4 s in total for the volumes the server led. Other volumes see only the ISR shrink (§6.1,
@@ -1060,6 +1077,9 @@ holds a lease answer; a replica without a lease is refused even then.
 
 ### 8.1 A new replica (learner)
 
+*The steps below are the design; the R4 paragraph at the end of this section says what was built and where it
+differs (the source is the leader; no receive-side token bucket; every snapshot copies everything).*
+
 1. **Snapshot** on a source: any ISR member, chosen to spread load (not only the leader). Under `publish_lock` it
    makes `snap_<id>/` in the replica directory with hard links to every listed part, copies of SERIES, STATES,
    CLASSES, RETENTION, the slot index and REPL, and the list of WAL segments not yet in parts with their committed
@@ -1122,6 +1142,58 @@ and the link the file is served from went; the replica asked for the file for th
 kill, kv and classes, 2026-11-18), and its match claimed positions it could not apply (`test_repl open_hold`,
 `test_cluster reopenhold`, mutant `opennohold`).
 
+*Built in R4 (r4-snapmake, r4-snapinst, r4-xferlink, r4-xferinst; 2026-11-24).* A replica that has to be rebuilt (a
+learner added by a move, a reset copy, a member past the retention caps) asks for a snapshot when its core says its next
+position is not retained, and installs it. As it runs:
+
+1. **Source and cut** (`src/snapshot.c`, `snap_make`; D2, D3). The source is the volume's leader, not "any in-sync
+   replica": leaders are spread by rule 2 of §3.2, so a lost server's volumes still copy from many servers. It answers
+   BUSY while it is promoting, before its writer engine is attached, with `rebuild_max` snapshots alive, or to a request
+   of another set version. The snapshot is the leader's crash image at the cut P = its commit point: P, the part list,
+   the memtables' segments that hold committed rows, RSTATE and the files of COMMIT markers in flight are read in
+   memory under `flush_lock` then `publish_lock`, which are released before any file is touched. Then every part is
+   hard linked by its listed name (by its `retired_` name when a merge renamed it after the cut; neither: the make
+   retries), the segments from S (the oldest not wholly in parts) to P's, the last cut at P's record end, the `stage_`
+   files of COMMITs above RSTATE's `done` and the `keep_` files of those at or below it. **The lock barrier:** SERIES
+   and STATES, RETENTION and CLASSES are copied last, each after taking its own lock (`append_lock`, `ret_lock`,
+   `class_lock`) alone, reading the file's length and letting go, so no lock-order edge exists and no engine lock is
+   held; their writers hold that lock from the marker to the record, so every record whose marker is at or below P is in
+   the copy, and records past P are applied again harmlessly (by id, or by `record_off`). Every file and the directory are
+   synced, and SNAPMAN (names, sizes, xxh64, links between a `keep_` file and the part it is, P, P's epoch, the epoch
+   history, S) is written last.
+2. **Transfer** (`server/rsnap.c`; D7, D16, D18). Snapshots have a link kind of their own (kind 5), so a COMMIT's file on
+   the bulk link never waits behind one. The receiver asks (set version and epoch in the request, asked again after 2 s),
+   gets SNAPMAN, checks the free space of the file system of `v<N>` against the snapshot's size plus 10% (at least
+   1 GiB more: the old directory stays until the new one is in place) and refuses, with a line, when short; then it
+   says GO and receives the files one at a time into `v<N>.snap/`, each hashed as it arrives and compared with
+   SNAPMAN's xxh64, resumed from the receiver's offset after a broken link. The sender's rate is `rebuild_mb_s` per link
+   (200 MB/s); `rebuild_max` (2) snapshots are sent and, counted apart, received at once. Making, releasing and installing
+   run on a snapshot worker, never on the driver's thread, a link's or the cluster thread. A source whose link to the receiver
+   stays down for 60 s, or that gets no DONE 60 s after the last file, releases its snapshot; a transfer that moves no byte
+   for 30 s is abandoned and asked again.
+3. **Install** (`snap_install`; D5, D6). The copy is checked whole (every file against SNAPMAN, every part opened and
+   every granule's crc, META), FNO is made P + 1, REPL by D6, and SNAPDONE written, each synced;
+   then `v<N>` is renamed `v<N>.old`, `v<N>.snap` `v<N>`, the root synced and the old directory removed. A crash at any
+   step is finished or undone by `snap_leftovers` before the volume is looked at. REPL keeps the old directory's identity
+   and promises: its rid; its fence raised to P's epoch, never lowered; `led` never raised; a doubtful ("unsure") REPL
+   stays doubtful with the open generation's belt; a fresh learner gets the record's rid, generation 0, fence P's epoch.
+   The reopen is a new open (a new generation, served only after REPLICA_OPEN). A copy whose P is not above the receiver's
+   log end, or whose epoch is below the receiver's fence, is refused as stale, before and after the volume is closed,
+   and asked for again.
+4. **Catch-up and join** as written above, from the log at P + 1 out of the leader's retained segments.
+
+Measured on the build machine (one NVMe, 146 M rows, 1 GB in 147 parts): a make takes 0.44 s with the files cached and
+0.7 s without; an install, which reads every byte to check it, 1.0 to 1.6 s; through tsdbd a 20 MB snapshot at
+`rebuild_mb_s` 5 took 5.9 s, the make included, while a 2M-row large insert committed in 140 ms. A rebuild of a large
+volume over a real network is not measured (R11).
+
+*Not built* (R4's plan, "Scope"): §8.1 step 2's token bucket on the **receiving** side (R4 limits the sender and counts the
+snapshots, D16; R9's balancer needs the receiving side); step 4's reuse of files the receiver already holds (D4: a
+replica's part names carry its own block numbers, so reuse rarely matches; every snapshot copies everything and a
+second one copies it again); a source other than the leader; `.ec` parts in a snapshot (the tier is refused on cluster
+volumes today, `src/tier.c`; R8 must add them, docs/tasks/r8-from-r7.md); rebuild progress in `cluster status` (R14);
+live changes of the four settings (R14); §8.5's first bullet.
+
 ### 8.2 A returning replica
 
 A replica back after an outage or a restart:
@@ -1152,8 +1224,8 @@ The leader keeps sealed WAL segments of each volume after they are in parts, for
 *Built in R3 (r3d-isr), per volume:* `repl_retain_mb` (4096) and `repl_retain_s` (1800) are caps of each volume, not
 split per server yet. The leader keeps what the slowest member still needs (the driver's keep bound) only while the
 kept segments, newest first, stay within both caps; past them it unlinks as if that member had caught up
-(`eng_leader_keep_cap`), and the member, once back, is told to install a snapshot (the driver says so once in its log;
-it stays a learner until the snapshot path of R4). `test_cluster keepcap` (`repl_retain_s` 2, seven flushes a second
+(`eng_leader_keep_cap`), and the member, once back, is told to install a snapshot (R4: it asks the leader for one and installs it, §8.1;
+before R4 it stayed a learner). `test_cluster keepcap` (`repl_retain_s` 2, seven flushes a second
 apart with a replica down: 3 segments kept, 8 under the mutant `nocap`). The change feed
 of design-cdc.md retains segments the same way (`fwal_` names); one mechanism serves both. A replica away for longer
 than that, or than the budget, gets a snapshot.
@@ -1174,13 +1246,23 @@ open (`replica_keep_next`: a demotion's and a restart's open replay and flush th
 go by the floor alone before the driver's first save) and again at every floor save. Both caps zero, or a replica
 opened without a driver (tests), keeps the old rule (a replica has no keep bound of its own to wait for, so "no cap"
 would be "forever"). A promotion keeps every segment still on disk (RSTATE `kept`), so a member that lags the new
-leader by less than the caps catches up from it; one past the caps still needs the snapshot of R4.
-Not done: a replica's flushed segments are not named in RSTATE `kept`, so a replica's open still replays them
-(rows a part of their segment holds are skipped per partition, DROPs by RSTATE's `drops`, which are kept while a
-retained segment lies behind them) and reads up to the caps at every open; and the replay floor (5.4) is the members'
-log start, which now lies up to the caps back, so a new leader's class switches wait (CLS_DEFER) until its members'
-retained segments pass its attach: up to `repl_retain_s` after a failover. Naming them in `kept` and reporting a replay
-start separate from the log start would end both. `test_replica keepcap` (mutant `replicadropsfloor`).
+leader by less than the caps catches up from it; one past the caps installs a snapshot (R4: no member is left behind a cap).
+*Built in R4 (r4-replay, D17), what was "not done" here.* A replica now names its flushed segments in RSTATE `kept` (the
+newest segment wholly in its parts and applied, saved durably before it is relied on, the rule a leader follows), and its
+open neither replays nor removes a segment at or below `kept`: it no longer reads up to the caps at every open. Its ACK
+carries a **replay start** apart from the log start (`replica_replay_start`: the first position of the oldest segment above
+the durably saved `kept`, never below the log start), and the leader's replay floor (5.4) is the lowest of the members'
+replay starts, not their log starts: a new leader's class switches wait seconds after a failover, not up to
+`repl_retain_s` (`test_cluster classfailover`: a switch 2 s after every member was back, at the default caps; the mutant
+`replaystartlog` fails it). A leader's own replay start passes a kept segment only once the commit floor the driver
+saved covers it. A fresh series' first switch never waits. A member with an empty log (a learner before its first
+position or its install) reports "nothing to replay", and the leader counts it with the lowest position it sent it in
+the epoch and its own log start: while a learner fills, the floor sits at the leader's log start, and a class switch
+decided by an idle merge waits for it (`test_cluster addswitch`, measured before r4-replay with `repl_retain_s` 5: a switch
+6.6 to 7.2 s after the add, the join 1.2 to 2.2 s of it; a switch on four members after the join 0.9 to 1.1 s). The
+simulator's floor checker holds with the rule over a soak of 100,000 seeds. What is not covered: a floor once reported can be undercut
+within the epoch by an add or a reset (the new member counts with the leader's log start); a kept segment above every
+part's `wal_seq` (markers only) has thin tests. `tests/test_replica.c` (`case_replaykept`, `case_power_kept`, `case_leader_replay`, `case_power_leader_kept`).
 The files of COMMIT markers go the same way (jepsen-cluster meta,classes power, finding A2: a member that had led an
 earlier epoch was promoted again and answered "needs a snapshot" for the files of its own earlier markers, because the
 leader's links (5.2, M4) were per leadership and in memory, a replica removed a COMMIT's staged files once applied and
@@ -1194,8 +1276,7 @@ key). A replica's open also hands the segments it finds wholly in parts and appl
 writer's kept segments stayed until a promotion). `test_replica keepfiles` (mutant `replicadropsfiles`, also
 `TSDB_REPLD_MUTANT=replicadropsfiles` in tsdbd).
 
-*Built in R4 (r4-core), in the replication core (`src/repl.[ch]`) and its simulator only; repld does not call it
-yet.* A set change (8.1's ADD, a REMOVE, a RESET, a move) reaches a running core as `repl_reconfig(r, nnodes, self,
+*Built in R4 (r4-core), in the replication core (`src/repl.[ch]`) and its simulator; tsdbd drives it (next paragraphs).* A set change (8.1's ADD, a REMOVE, a RESET, a move) reaches a running core as `repl_reconfig(r, nnodes, self,
 old_of)`: peer state, the record's ISR and rids, a pending ISR request, the join and the leave mark move with their
 members; a removed member stops counting in the commit point, the join hold, the replay floor and the unanswered set.
 The driver drains the core's actions first (`REPL_E_PENDING` otherwise: they name the old indexes) and hands over only
@@ -1210,9 +1291,27 @@ target and its `min_end` (D14). On the wire: replwire `RW_VERSION` 2, peer proto
 (`reconfig hold unans_remap join_remap busy_drop leave target replay snapshot`), `tests/sim_repl.c` checks 9 and 10,
 mutants 43-57 (`tests/sim_repl.sh`).
 
+*Built in R4 (r4-meta, r4-setchg), the set in tsdbd.* The metadata record of a volume has a `set_version`, raised by exactly
+REPLICA_ADD, REPLICA_REMOVE and REPLICA_RESET (D8; metadata snapshot version 5 then, 6 with R8's erasure-coded volumes, the
+log's entries "TME2" then "TME3": a state directory of another version is refused naming both, never upgraded; the peer
+protocol is version 8 with R8's frame check; D9, an older cluster is initialised again). A move's REPLICA_ADD has
+`replaces`; one move per volume. The driver (`server/rset.c`) adopts a new version on the volume's thread: it waits while
+this member is not named, while a snapshot is being installed or a test file holds it, remaps by node and rid (a reset
+member is a new one), drains the core's actions, calls `repl_reconfig`, remaps its own per-index state and logs "replica
+set version A -> B" and the new set with the acks it carried over; a message of another version is dropped and counted. The volume
+manager (`server/cvolset.c`, `cvolset_mgr.c`; D12, D13): a replica removed by a committed REMOVE closes its driver and
+engine, renames `v<N>` to `v<N>.removed-<rid>`, syncs the root and deletes it in the background (the owner's decision: a
+removed member is never in the ISR, so the ISR members hold every committed position); at prepare a `v<N>` whose REPL
+holds another rid than the record's is set aside as `v<N>.stale-<rid>` (`v<N>.lost-<rid>` when this server saw the reset;
+neither is ever deleted by tsdb, and a line names it) and never opened, so a server that was down through a REMOVE and
+is added again later starts fresh; a `v<N>` that is missing while the group recorded an open of that replica is refused
+with a line that names `tsdb cluster replica reset`, never made again by itself (an unmounted disk looks the same).
+Tests: `test_cluster addreplica removereplica removeindex removedown setstale resetlost setchurn addswitch`,
+`test_cvolfs` (power loss at every step of a set-aside), `make rset-mutants`.
+
 ### 8.4 Priorities
 
-Rebuilds run in this order: volumes whose ISR has 1 member, then volumes with 2, then moves for balance. A rebuild
+*(Not built: R4 rebuilds on request, R9 orders them.)* Rebuilds run in this order: volumes whose ISR has 1 member, then volumes with 2, then moves for balance. A rebuild
 yields to foreground work: the token bucket is halved while the server's query p99 or WAL sync p99 is above twice its
 1-hour median.
 
@@ -1226,13 +1325,20 @@ Time: a server's hot replicas are rebuilt on all the others at once. With 2 TB o
   them in under `publish_lock` (the cold move of §9 uses the same swap).
 - A replaced disk: the replicas on it are learners again and are rebuilt (§8.1), on the same server or elsewhere.
   Each gets a new `rid` (gap 3): its old entry in the ISR does not match it, so it is neither counted nor promoted
-  until it has caught up and joined again.
+  until it has caught up and joined again. *Built in R4 (r4-setchg, D13):* `tsdb cluster replica reset PEER V NODE`
+  commits REPLICA_RESET(V, epoch, NODE, a new rid), allowed only for a member that is neither the leader nor in the ISR
+  (refused with the reason otherwise); its server sets the old directory aside as `v<N>.lost-<rid>`, or
+  `v<N>.stale-<rid>` when it was down for the reset and cannot tell it from a REMOVE and an ADD, makes a fresh one, and
+  it is rebuilt by a snapshot. It is never automatic, not even for a missing directory (the server refuses that one with a
+  line naming the command); a removed replica's directory goes the other way, deleted once the REMOVE is committed
+  (§8.3, D12). The reset is the lost-disk case of §8.1 on one replica: the hardware replacement's other half, rebuilding
+  elsewhere after `node out`, is R9's.
 - **A restored replica directory** (*decided 2026-11-06 in this revision, gap 14; the user may change it*; review
   seed 6 of cluster-s2, the rest reasoning).
   A directory restored from a backup or a ZFS snapshot keeps its `rid` but rolls back `led`, its log and its fence:
   it could lead an epoch a second time, be promoted with fewer records than it acknowledged, or let a leader count
   ACKs it no longer holds. The rule: **a restore is a lost disk**. The operator gives a restored directory a new rid
-  (`tsdb cluster replica reset V`, which makes it a learner) or, better, lets the replica be rebuilt. Where the
+  (`tsdb cluster replica reset PEER V NODE`, which makes it a learner) or, better, lets the replica be rebuilt. Where the
   system can see a restore, it enforces the rule: REPL holds an **open generation**, raised (and synced) at every
   open and registered with the metadata group (`REPLICA_OPEN(v, node, rid, gen)`, conditional on gen being above the
   recorded one) before the replica answers a fence, sends an ACK or leads; a directory whose generation is below the
@@ -1442,8 +1548,22 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 | `slow` | one server's fdatasync delayed by 0.1-2 s (crashfs), a slow disk |
 | `skew` | a server's monotonic clock runs fast or slow within the configured drift, and beyond it (only stale reads may appear) |
 | `midcommit` | crash points: after the leader's WAL write and before sending; after replicas acked and before the client's OK; between PREPARED and the `COMMIT` marker; during a class switch; between `put` and the `COLD` marker |
-| `rebuild` | declare a server out under load, and add a new one |
+| `rebuild` | declare a server out under load, and add a new one. *R4's `rebuild` is smaller (a lost directory, one replica):* a stopped replica's `v<N>` removed, the server started (it must refuse the volume with the line naming `replica reset`), the reset, rebuilt by a snapshot. The server-out version stays R9's |
+| `longdown` | (R4) a replica of the replicated kv volume down past `repl_retain_s` (3 s in this run) under writes, then back: it must take a snapshot, seen as another inode of its `v<N>`; a run in which none did fails |
+| `churn` | (R4) `volume transfer` and `volume move --log` at random under the workloads, a move now and then cancelled; with churn alone, every node's trace of the volume is followed and the moved-from member must not leave the ISR before the new one joined, nor with fewer members than before |
 | `eio`, `rot`, `misdirect` | as today, on one server at a time |
+
+*Built in R4 (r4-jepsen, `tests/jepsen/jepsen_cluster.c`).* `kill2` (the first round and half the others take two of the
+kv volume's replicas), `slow` (the outagefs shim's `slow MS` on one node's data root, 5 to 30 s) and `churn` run in
+`make jepsen-cluster` after the other nemeses (`JEPSEN_R4_NEMESES`, `JEPSEN_R4_WORKLOADS`; `none` leaves them out).
+`longdown` and `rebuild` are written and have their selftest mutants, but each is **refused with a line until its
+`built` flag in the harness table is flipped**: the flag was set for the tracks that were on main when r4-jepsen merged,
+and these two have not been run whole against the merged R4 (`jepsen_cluster --built-nemeses` lists what runs, `JEPSEN_R4_TRY=1`
+runs the others). At the end of every run with a replicated kv volume the members of the final record are the replicas
+compared, none is a learner and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or `snap_*` is left on any node. R4's crash
+points are terminal points of kv and classes runs: `snap-received`, `snap-swapped`, `snap-halfswap`, `set-removed`,
+`transfer-ready`, `move-added`, `move-shrunk` (`server/crashpt.h`). `classes` runs with the default retention caps
+(r4-replay), no longer capped at 30 s.
 
 Checks: the existing checks 1-4 over the whole cluster, plus: no acknowledged write lost across any failover; reads
 on leaders monotonic per session; `min_pos` reads see the write; at the end, every replica of every volume holds the
@@ -1475,6 +1595,17 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 | 7 | Rebuild, catch-up, retained segments, moves, leader balance, throttling | jepsen-cluster: kill2, rebuild, slow | 3 |
 | 8 | Cold boundary: `tsdb_cold_ops`, the move, `.cold` index files; a directory-backed tier for tests | jepsen-cluster: midcommit at the move | 2 |
 | 9 | Measurements (§10.3), docs (README section, AGENTS.md invariants, an operator guide) | the numbers | 2 |
+
+*Step 7 as built (R4, 2026-11-24).* The row's 3 weeks assumed pieces that were not there: replica set changes in tsdbd, the
+snapshot engine, transfer. R4 was planned as 14 tracks of about 20 builder, review and fix track-days in all, and came to about 6,000
+lines of new server and engine code (`src/snapshot.c`, `server/rsnap.c`, `rset.c`, `rtransfer.c`, `ctransfer.c`, `cmove.c`
+and the rest of the files named in AGENTS.md), 2,600 lines of `tests/test_snapshot.c` and about 40 `test_cluster` scenarios. Built: rebuild by snapshot (make, transfer, install), catch-up past the retention caps,
+replica set changes (add, remove, reset), the operator's move and transfer, leader balance (default off), the replay
+start apart from the log start, and `kill2`, `slow`, `churn` in the cluster gate. Left to R9: the greedy placement pass
+and its triggers, `node drain` and `out`, rebuilding a lost server's replicas elsewhere, the balancer, §8.4's priorities, the
+receive-side rate limit, file reuse in a snapshot, §8.5's first bullet. Left to R8: stripe positions and `.ec` parts in a
+snapshot. Left to R14: rebuild progress in `cluster status`, live changes of the settings. The gate's `longdown` and
+`rebuild` nemeses are not yet run whole (13.2).
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
 

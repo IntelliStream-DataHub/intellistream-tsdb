@@ -674,7 +674,14 @@ the new leader's log, in which case it commits (§2.3, E14).
 - `tsdb cluster volume move V --pos P --to N` (a stripe position) or `--log --to N` (a log replica). A stripe position
   moves by copy from its holder (1x, no decode), the target `filling` until whole (the barrier of §5.3), then one
   `STRIPE_SET` conditional on the list version; reads use the old holder until then. A log replica moves as in
-  design-cluster.md §3.2 (learner, catch-up, join, drop).
+  design-cluster.md §3.2 (learner, catch-up, join, drop). *Built in R4 for the log replica, 2026-11-24, and the verb
+  differs from the line above:* `tsdb cluster volume move PEER V --log --from A --to B [--cancel] --secret-file F`. It names
+  the node the copy leaves (`--from`) as well as the one it goes to, because a volume has several copies and a move
+  replaces one of them; `V` is the volume's number; `--log` is required, since `--pos` (a stripe position, and its
+  `STRIPE_SET`) is R8's and not accepted yet. The command answers at once (the move runs on the metadata
+  group's leader, which carries it on after its own change) and `--cancel` removes the learner while the old copy is
+  still there. See design-cluster.md §3.2 "as built (r4-move)" and §8.1. A snapshot carries no `.ec` parts yet
+  (docs/tasks/r8-from-r7.md), so a log replica of an EC volume that is moved or rebuilt by snapshot needs R8 to copy them.
 - **Rebalancing** after `node add` or `node drain`: the greedy pass of design-cluster.md §3.2 over both lists, at most
   5% of a group's positions moving at once and no automatic plan that moves more than 25% (objects' balancer bounds,
   objects:src/placement/README:178-200), even leaders, chunk counts by capacity. It has its own pace, `balance_mb_s`
