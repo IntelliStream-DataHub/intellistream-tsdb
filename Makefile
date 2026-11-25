@@ -425,7 +425,11 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 # .github/workflows/ci.yml): ThreadSanitizer and ASan take about 80 minutes for all of them on 4 CPUs. A group has the
 # prerequisites it needs, so that it builds and runs alone. `make test TEST_GROUPS=` runs only the lines above.
 # the planted bugs of a test binary, in parallel (tools/mutants.sh: MUTANT_JOBS, MUTANT_URING_JOBS, MUTANT_TIMEOUT)
-MUT = tools/mutants.sh --tmp $(SCRATCH)
+# Under ThreadSanitizer a planted bug that the binary catches late runs longer than the 1800 s default (test_replica
+# takes about 2000 s whole under TSan, more with MUTANT_JOBS of them side by side): a timeout is a survivor, so those
+# loops get TSAN_MUT_TIMEOUT unless MUTANT_TIMEOUT is set.
+TSAN_MUT_TIMEOUT ?= 5400
+MUT = tools/mutants.sh --tmp $(SCRATCH)$(if $(findstring -fsanitize=thread,$(CFLAGS)), --timeout $${MUTANT_TIMEOUT:-$(TSAN_MUT_TIMEOUT)})
 TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
