@@ -1392,6 +1392,7 @@ static void scen_exitthreads(void)
     printf("  skipped: the crash point's child (a thread's /proc/self/task entry; Linux only)\n");
 #endif
 
+#ifdef TSDB_EC
     envs[0] = "snap_every=1,fail_snap_dirsync=2";
     start(0);
     start(1);
@@ -1417,6 +1418,9 @@ static void scen_exitthreads(void)
             "with \"cannot sync\" in its log; 66: a sanitizer's report at exit)",
             ex);
     printf("  a member whose chunk peer runs fail-stops with status 1\n");
+#else
+    printf("  skipped: NO_EC build\n");
+#endif
 }
 
 /* a crash inside a snapshot install: the log is reset to the image's index, the snapshot not written (a directory in
@@ -15193,8 +15197,8 @@ static int set_setup(int nserv, struct meta_volume *v, int keepall)
     for (int i = 1; i < nserv; i++)
         node_add(0, i);
     if (nserv >= 3) { /* a member stopped later must not take the metadata group's quorum with it */
-        unsigned want = 3;
-        await_view(0, p_voters, &want, "three voters");
+        unsigned want = nserv >= 5 ? 5 : 3;
+        await_view(0, p_voters, &want, want == 5 ? "five voters" : "three voters");
     }
     uint32_t num;
     int rc;
@@ -16856,7 +16860,9 @@ static void scen_transferhold(void)
     int L2 = server_of(a.leader), T2 = 0, B2 = 3 - L2 - T2; /* T2 = server 0 (Raft leader), B2 = the other non-leader */
     if (L2 == 0)
         T2 = 1, B2 = 2;
-    int props0 = log_count(0, " fenced members answered"), whole0 = log_count(0, " (3 of 3 fenced members answered");
+    int props0 = 0, whole0 = 0;
+    for (int i = 0; i < 3; i++)
+        props0 += log_count(i, " fenced members answered"), whole0 += log_count(i, " (3 of 3 fenced members answered");
     int ready1 = log_count(L2, ": READY at");
     state_flag(B2, "dropfence", 1);
     struct tr_async tb = {x.num, ids[T2], 0, ""};
@@ -16869,7 +16875,9 @@ static void scen_transferhold(void)
     if (tb.rc != 0)
         die("transferhold: slow-bystander transfer to node %u: %s (%s)", ids[T2],
             tb.rc == 1 ? "lost" : cluster_strerror(tb.rc), tb.why);
-    int props1 = log_count(0, " fenced members answered"), whole1 = log_count(0, " (3 of 3 fenced members answered");
+    int props1 = 0, whole1 = 0;
+    for (int i = 0; i < 3; i++)
+        props1 += log_count(i, " fenced members answered"), whole1 += log_count(i, " (3 of 3 fenced members answered");
     if (props1 - props0 != 1 || whole1 - whole0 != 1)
         die("transferhold: slow bystander (750 ms) was not counted (%d proposed, %d with 3 of 3 answers)",
             props1 - props0, whole1 - whole0);
@@ -17553,6 +17561,25 @@ static void scen_balancecut(void)
     int rc = tr_transfer(v[k].number, ids[Q], why, sizeof why);
     if (rc != 0)
         die("balancecut: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
+    /* Wait until P's volume manager has stepped past v[k].epoch: otherwise dropfence holds P's own vwatch at the old
+     * epoch as leader (server/cluster.c drop_fence_file), which drops P out of the ISR so balance never targets P. */
+    for (uint64_t tw = now_ms();;) {
+        struct view vw;
+        view(P, &vw);
+        int seen = 0;
+        for (uint32_t i = 0; i < vw.st.nheard && !seen; i++)
+            if (vw.st.heard[i].id == ids[P])
+                for (uint32_t j = 0; j < vw.st.heard[i].nvols; j++)
+                    if (vw.st.heard[i].vols[j].v.volume == v[k].number &&
+                        vw.st.heard[i].vols[j].v.epoch > v[k].epoch)
+                        seen = 1;
+        view_free(&vw);
+        if (seen)
+            break;
+        if (now_ms() - tw > 4000)
+            die("balancecut: server %d did not step past epoch %" PRIu64 " of %s", P, v[k].epoch, nm[k]);
+        usleep(20000);
+    }
     state_flag(P, "dropfence", 1); /* before the hold of 5 s runs out */
     uint64_t b0[3] = {0}, d0 = 0;
     for (int i = 0; i < 3; i++)

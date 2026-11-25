@@ -282,7 +282,7 @@ static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t
                  * up before tick_domain enters DEGRADED. */
                 if (!space && d->state == TSDB_DOM_UP) {
                     double thr = d->base_ms * 10 > h->o.degraded_min_ms ? d->base_ms * 10 : h->o.degraded_min_ms;
-                    if (d->nbase < 3 || ms <= thr) {
+                    if (ms <= thr) {
                         if (d->nbase < BASE_INIT_N) {
                             d->base_init[d->nbase++] = ms;
                             d->base_ms = base_median(d->base_init, d->nbase);

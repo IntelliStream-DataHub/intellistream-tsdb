@@ -380,19 +380,33 @@ int main(int argc, char **argv)
     CHECK(cmd("slow", da2, "70") == 0);
     h = tsdb_health_open(&o);
     int dc = tsdb_health_add_domain(h, "cold", da2);
+    in = (tsdb_domain_info){0};
     for (int t = 0; t < LATE_MS; t += 20) {
         if (tsdb_health_info(h, dc, &in) == 0 && in.probes_ok >= 1 && in.write_ms >= 150)
             break;
         nap(20);
     }
+    CHECK(in.probes_ok >= 1 && in.write_ms >= 150);
     CHECK(cmd("heal", da2, NULL) == 0);
     for (int t = 0; t < LATE_MS; t += 20) {
         if (tsdb_health_info(h, dc, &in) == 0 && in.probes_ok >= 15)
             break;
         nap(20);
     }
+    CHECK(in.probes_ok >= 15);
     CHECK(cmd("slow", da2, "400") == 0);
     CHECK(wait_state(dc, TSDB_DOM_DEGRADED, 3000));
+    CHECK(cmd("heal", da2, NULL) == 0);
+    tsdb_health_close(h);
+    h = NULL;
+
+    /* slow from boot: a domain already above degraded_min_ms when opened must enter DEGRADED rather than seeding the
+     * baseline from those degraded probes (slow 200 -> ~600 ms write probe, > degraded_min_ms 300 ms, and with
+     * probe_make ~800 ms total inflight, well below down_ms 1500 ms) */
+    CHECK(cmd("slow", da2, "200") == 0);
+    h = tsdb_health_open(&o);
+    int ds = tsdb_health_add_domain(h, "slowboot", da2);
+    CHECK(wait_state(ds, TSDB_DOM_DEGRADED, 3000));
     CHECK(cmd("heal", da2, NULL) == 0);
     tsdb_health_close(h);
     h = NULL;

@@ -9,7 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifndef __APPLE__
+#ifdef __linux__
 #include <sys/syscall.h>
 #endif
 
@@ -86,12 +86,10 @@ static void arm_from_env(void)
  * sanitizer had to make before this point was made when it was found (halt_on_error) or stays in the log. */
 static void power_cut_exit(void)
 {
-#ifdef __APPLE__
-    _exit(CRASH_EXIT_STATUS);
-#else
+#ifdef __linux__
     syscall(SYS_exit_group, CRASH_EXIT_STATUS);
-    _exit(CRASH_EXIT_STATUS); /* not reached */
 #endif
+    _exit(CRASH_EXIT_STATUS);
 }
 
 void crashpt_slow(enum crash_point_id id)

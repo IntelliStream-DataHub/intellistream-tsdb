@@ -987,12 +987,10 @@ static void rollback(void)
  * whose leak report on exit turns status 99 into 66 with halt_on_error=1 (as in server/crashpt.c). */
 __attribute__((noreturn)) static void power_cut_exit(void)
 {
-#ifdef __APPLE__
-    _exit(99);
-#else
+#ifdef __linux__
     syscall(SYS_exit_group, 99);
-    _exit(99); /* not reached */
 #endif
+    _exit(99);
 }
 
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
