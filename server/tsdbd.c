@@ -2841,7 +2841,7 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 + 400 : 0);
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 + 480 : 0);
     char *t = malloc(cap + 4);
     if (!t) {
         cluster_copy_put(cp);
@@ -2874,11 +2874,13 @@ static void handle_status(req *r)
         rsnap_get_stats(&ss);
         ST_PUT("snap.asked=%llu\nsnap.sent=%llu\nsnap.received=%llu\nsnap.refused_space=%llu\nsnap.failed=%llu\n"
                "snap.busy=%llu\nsnap.bytes_sent=%llu\nsnap.bytes_received=%llu\nsnap.last_s=%.3f\n"
-               "snap.installed=%llu\nsnap.refused_stale=%llu\nsnap.install_last_s=%.3f\n",
+               "snap.installed=%llu\nsnap.refused_stale=%llu\nsnap.install_last_s=%.3f\n"
+               "snap.kind5_bytes=%llu\nsnap.kind2_bytes=%llu\n",
                (unsigned long long)ss.asked, (unsigned long long)ss.sent, (unsigned long long)ss.received,
                (unsigned long long)ss.refused_space, (unsigned long long)ss.failed, (unsigned long long)ss.busy,
                (unsigned long long)ss.bytes_sent, (unsigned long long)ss.bytes_received, (double)ss.last_ms / 1000,
-               (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000);
+               (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000,
+               (unsigned long long)ss.kind5_bytes, (unsigned long long)ss.kind2_bytes);
     }
     for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
         uint8_t health, reason;
