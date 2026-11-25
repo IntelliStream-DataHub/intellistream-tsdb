@@ -32,6 +32,11 @@
 #include "replfile.h"
 #include "replica.h"
 #include "snapshot.h"
+#include "coldops.h"
+#include "ecpart.h"
+#include "ecskip.h"
+#include "settle.h"
+#include "tier.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2250,6 +2255,10 @@ static int ichild(const char *root, const char *ackf)
     exit(0); /* not _exit: the power loss at exit is crashfs's destructor (what a 0 promised must be on disk) */
 }
 
+/* How ipower_step opens and closes v0: open_rep and eng_close, or the ec case's (with the tier on its stores) */
+static int (*IPOW_OPEN)(const char *vd, uint64_t floor, eng **x);
+static void (*IPOW_CLOSE)(eng *x);
+
 /* After a crash: snap_leftovers, then v0 is the old directory whole (floor A, A's rows) or the new one whole */
 static int ipower_step(const char *tmpl, const char *root, const char *ackf, int k, int seed, uint64_t pa,
                        uint64_t ha, uint64_t pb, uint64_t hb, int *olds, int *news, int *dones)
@@ -2292,13 +2301,16 @@ static int ipower_step(const char *tmpl, const char *root, const char *ackf, int
     uint64_t floor = st.floor, fence = st.fence;
     replfile_state_free(&st);
     eng *x = NULL;
-    if ((rc = open_rep(vd, floor, &x)) != 0) {
+    if ((rc = IPOW_OPEN ? IPOW_OPEN(vd, floor, &x) : open_rep(vd, floor, &x)) != 0) {
         ifail("install power: step %d seed %d: v0 (floor %" PRIu64 ") does not open: %d", k, seed, floor, rc);
         return -1;
     }
     uint64_t h = answers(x, NULL);
     uint64_t le = replica_log_end(x);
-    eng_close(x);
+    if (IPOW_CLOSE)
+        IPOW_CLOSE(x);
+    else
+        eng_close(x);
     bool old = floor == pa && h == ha && fence == 6 && le == pa, nw = floor == pb && h == hb && fence == 6 && le == pb;
     if (!old && !nw) {
         ifail("install power: step %d seed %d: v0 is neither whole (floor %" PRIu64 ", log end %" PRIu64
@@ -2391,6 +2403,419 @@ static void case_install_power(void)
     MK_HIST = NULL, MK_NHIST = 0;
     sh("rm -rf '%s' '%s' '%s' '%s' '%s'", dir, tmpl, root, scr, ackf);
 }
+
+/* ======================================================================== snap-ec: an erasure-coded cluster volume
+ *
+ * A leader on requires=cluster,replica,ec with the tier (three directory stores, k=2 m=1) settles a day of series 0
+ * and 1 (an .ec part, its chunks on the stores) and snapshots are made under writers of series 2 and 3. Each is
+ * installed and opened as a replica with the tier on the same stores (the leader closed first: a store has one owner):
+ * the installed directory has a PPOS record of every part, series 0 and 1 read back the leader's rows (the .ec file
+ * holds no row: they are decoded from the chunks), fed P + 1..end it answers as the leader, and no chunk went (the open
+ * sweep is skipped on an ec cluster volume). The first snapshot is taken before the settle: an ec volume with no .ec
+ * part, whose every .part still needs its PPOS record, fed on through the COLD marker. */
+#ifdef TSDB_EC
+static cold_ops EC_OPS;
+static uint64_t ec_sv(void *c) { return (void)c, 7; }
+static int ec_make(void *arg, tier *t, uint32_t volume, const uint8_t vuuid[16], void **ctx)
+{
+    (void)arg;
+    return coldops_dir_make(NULL, t, volume, vuuid, ctx);
+}
+
+typedef struct ecl {
+    char dir[PATH_MAX + 64], st[3][PATH_MAX + 80];
+    tier_settings set;
+} ecl;
+
+static void ec_opts(tsdb_options *o)
+{
+    opts_of(o, 0, 0);
+    o->partition_classes = 0; /* the key is the day */
+}
+
+static void ec_paths(ecl *L, const char *name)
+{
+    memset(L, 0, sizeof *L);
+    snprintf(L->dir, sizeof L->dir, "%s/%s", S, name);
+    for (int i = 0; i < 3; i++)
+        snprintf(L->st[i], sizeof L->st[i], "%s_st%d", L->dir, i);
+    char spec[4 * PATH_MAX];
+    snprintf(spec, sizeof spec, "k=2,m=1,dirs=%s:%s:%s,grace_s=%lld", L->st[0], L->st[1], L->st[2], 30LL * 86400);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    L->set = (tier_settings){.k = 2, .m = 1, .grace_s = 30 * 86400, .keep_s = 3600, .coarse_s = 86400,
+                             .cache_mb = 16, .force_s = 3600, .wait_max_s = 1};
+    EC_OPS = coldops_dir;
+    EC_OPS.stripe_version = ec_sv;
+}
+
+/* a fresh ec cluster volume with `ns` float64 series and its three empty stores */
+static void ec_fresh(ecl *L, const char *name, int ns)
+{
+    ec_paths(L, name);
+    sh("rm -rf '%s' '%s' '%s' '%s' && mkdir -p '%s' '%s' '%s' '%s'", L->dir, L->st[0], L->st[1], L->st[2], L->dir,
+       L->st[0], L->st[1], L->st[2]);
+    tsdb_options o;
+    ec_opts(&o);
+    eng *db = NULL;
+    if (eng_open(L->dir, &o, &db) != 0)
+        exit(2);
+    for (int i = 0; i < ns; i++) {
+        char nm[16];
+        uint32_t id;
+        snprintf(nm, sizeof nm, "s%d", i);
+        if (eng_series(db, nm, TSDB_FLOAT64, &id) != 0 || id != (uint32_t)i)
+            exit(2);
+    }
+    eng_close(db);
+    int fd = open(L->dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0 || meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) != 0)
+        exit(2);
+    close(fd);
+}
+
+/* the leader (replica 0) or, with `floor`, the replica in `dir`, with the tier on L's stores */
+static int ec_open(const ecl *L, const char *dir, bool leader, uint64_t floor, tier **tp, eng **out)
+{
+    tsdb_options o;
+    ec_opts(&o);
+    *out = NULL;
+    int rc = tier_open(dir, &o, tp);
+    if (rc)
+        return rc;
+    tier_attach a = {.ops = &EC_OPS, .make = ec_make, .settings = &L->set};
+    tier_want_attach(*tp, 0, &a);
+    rc = leader ? eng_open(dir, &o, out) : eng_open_replica(dir, &o, floor, out);
+    tier_want(NULL, 0);
+    if (rc == 0 && leader && (rc = eng_leader_attach(*out, &OPS)) == 0)
+        eng_leader_replay_floor(*out, eng_wal_durable_fno(*out) + 1);
+    if (rc) {
+        if (*out)
+            eng_close(*out);
+        tier_put(*tp);
+        *tp = NULL, *out = NULL;
+    }
+    return rc;
+}
+
+static void ec_close(tier **t, eng **db)
+{
+    if (*db)
+        eng_close(*db);
+    if (*t)
+        tier_put(*t);
+    *db = NULL, *t = NULL;
+}
+
+static int ec_chunks(const ecl *L)
+{
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof p, "%s/s0", L->st[i]);
+        DIR *dd = opendir(p);
+        struct dirent *de;
+        while (dd && (de = readdir(dd)) != NULL)
+            n += de->d_name[0] != '.' && strcmp(de->d_name, "EPOCH") && strncmp(de->d_name, "tmp_", 4);
+        if (dd)
+            closedir(dd);
+    }
+    return n;
+}
+
+static size_t ec_listed(eng *db)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++)
+        n += part_is_ec(db->parts[i]);
+    pthread_mutex_unlock(&db->lock);
+    return n;
+}
+
+static int ec_settle(eng *db, int64_t key)
+{
+    part *sel[64];
+    size_t n = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts && n < 64; i++)
+        if (db->parts[i]->partition == key && !part_is_ec(db->parts[i]))
+            part_ref(db->parts[i]), sel[n++] = db->parts[i];
+    pthread_mutex_unlock(&db->lock);
+    int rc = eng_settle(db, key, sel, n, NULL);
+    for (size_t i = 0; i < n; i++)
+        part_unref(sel[i]);
+    return rc;
+}
+
+/* day A: series 0 and 1, large writes (parts) and a flushed small one, merged */
+static void ec_day_a(eng *db, int64_t day0)
+{
+    for (int s = 0; s < 2; s++)
+        for (int k = 0; k < 3; k++)
+            CHECK(put(db, (uint32_t)s, day0 + 3600000 + k * 500000 + s, 1000, 400) == 0);
+    CHECK(put(db, 0, day0 + 7 * 3600000, 1000, 5) == 0);
+    CHECK(eng_flush(db) == 0);
+    CHECK(eng_optimize(db) == 0); /* D18: a cluster settles merged parts only */
+}
+
+static eng *ECDB;
+static atomic_int ec_stop;
+
+static void *ec_writer(void *a)
+{
+    uint32_t s = 2 + (uint32_t)(intptr_t)a;
+    for (int k = 0; !atomic_load(&ec_stop); k++) {
+        int64_t ts = T0 + (int64_t)(k % 2000) * 20000 + s;
+        int rc = put(ECDB, s, ts, 100, k % 3 == 0 ? 40 : 4); /* 40: a COMMIT */
+        if (rc == 0 && k % 7 == 6)
+            rc = eng_flush(ECDB);
+        if (rc) {
+            fprintf(stderr, "ec writer %u: %d\n", s, rc);
+            CHECK(rc == 0);
+            break;
+        }
+        usleep(500);
+    }
+    return NULL;
+}
+
+/* SNAPMAN of an ec volume: a ppos on every part, at or below P; `want_ec` .ec entries at least */
+static void ec_man_check(const char *sp, size_t want_ec)
+{
+    struct snap_man m = {0};
+    CHECK(whole(sp, &m));
+    size_t nec = 0, bad = 0;
+    for (size_t i = 0; i < m.nfiles; i++) {
+        const struct snap_file *f = &m.files[i];
+        if (f->kind == SNAP_EC || f->kind == SNAP_PART)
+            bad += f->ppos == 0 || f->ppos > m.p;
+        else
+            bad += f->ppos != 0;
+        nec += f->kind == SNAP_EC;
+    }
+    if (bad || nec < want_ec)
+        ifail("%s: %zu entries with a wrong ppos, %zu .ec entries (want %zu)", sp, bad, nec, want_ec);
+    snap_man_free(&m);
+}
+
+#define NEC 4
+static void case_ec(void)
+{
+    ecl L;
+    ec_fresh(&L, "ec", 4);
+    bk_reset();
+    static const struct snap_epoch hist[] = {{3, 1}};
+    MK_HIST = hist, MK_NHIST = 1;
+    PUT_NULLS = false;
+    atomic_store(&REC, true);
+    tier *t = NULL;
+    eng *db = NULL;
+    int rc = ec_open(&L, L.dir, true, 0, &t, &db);
+    CHECK(rc == 0);
+    if (rc)
+        return;
+    int64_t day0 = (T0 / DAY_MS - 5) * DAY_MS;
+    ec_day_a(db, day0);
+    struct inst_snap in[NEC];
+    char roots[NEC][PATH_MAX + 32];
+    int nin = 0, retries = 0;
+    struct snap_info si = {0};
+    /* before the settle: no .ec part, every .part with its PPOS record */
+    rc = make(db, "snap_ec0", &si, &retries);
+    CHECK(rc == 0);
+    if (rc == 0) {
+        ec_man_check(si.path, 0);
+        snprintf(roots[nin], sizeof roots[0], "%s_root%d", L.dir, nin);
+        if (inst_copy(si.path, roots[nin], &in[nin]))
+            nin++;
+        snap_release(si.path);
+    }
+    if ((rc = ec_settle(db, day0 / DAY_MS)) != 0)
+        ifail("ec: the settle of day A: %d", rc);
+    size_t nec = ec_listed(db);
+    CHECK(nec >= 1);
+    int c0 = ec_chunks(&L);
+    CHECK(c0 > 0);
+    ECDB = db;
+    atomic_store(&ec_stop, 0);
+    pthread_t w[2];
+    for (int i = 0; i < 2; i++)
+        pthread_create(&w[i], NULL, ec_writer, (void *)(intptr_t)i);
+    for (int i = 1; i < NEC; i++) {
+        usleep(20000 + 15000 * (useconds_t)i);
+        if (i == 2)
+            eng_leader_keep(db, atomic_load(&db->lead_commit));
+        eng_leader_replay_floor(db, eng_wal_durable_fno(db) + 1);
+        char name[32];
+        snprintf(name, sizeof name, "snap_ec%d", i);
+        memset(&si, 0, sizeof si);
+        rc = make(db, name, &si, &retries);
+        CHECK(rc == 0);
+        if (rc)
+            continue;
+        ec_man_check(si.path, nec);
+        snprintf(roots[nin], sizeof roots[0], "%s_root%d", L.dir, nin);
+        if (inst_copy(si.path, roots[nin], &in[nin]))
+            nin++;
+        snap_release(si.path);
+    }
+    atomic_store(&ec_stop, 1);
+    for (int i = 0; i < 2; i++)
+        pthread_join(w[i], NULL);
+    atomic_store(&REC, false);
+    size_t nch = chunks_sorted();
+    uint64_t end = nch ? CH[nch - 1].last : 0;
+    uint64_t want = answers(db, NULL), want_a = answers_n(db, 2);
+    ec_close(&t, &db); /* the stores have one owner: the replicas open on them next */
+    CHECK(ec_chunks(&L) == c0);
+    size_t ok = 0;
+    for (int i = 0; i < nin; i++) {
+        char vd[PATH_MAX + 48], pp[PATH_MAX + 64];
+        PJ(vd, "%s/v%d", roots[i], in[i].vol);
+        if ((rc = inst_do(roots[i], in[i].vol, 2000 + (uint64_t)i, NULL)) != 0) {
+            ifail("ec install %d (P %" PRIu64 "): snap_install: %d", i, in[i].p, rc);
+            continue;
+        }
+        PJ(pp, "%s/PPOS", vd);
+        if (!exists(pp))
+            ifail("ec install %d: no PPOS in %s", i, vd);
+        replica_keep_next((uint64_t)1 << 40, 7 * (uint64_t)DAY_MS);
+        tier *xt = NULL;
+        eng *x = NULL;
+        if ((rc = ec_open(&L, vd, false, in[i].p, &xt, &x)) != 0) {
+            ifail("ec install %d (P %" PRIu64 "): the installed directory does not open as a replica: %d", i, in[i].p,
+                  rc);
+            continue;
+        }
+        if (replica_applied_end(x) != in[i].p)
+            ifail("ec install %d: applied end %" PRIu64 ", P %" PRIu64, i, replica_applied_end(x), in[i].p);
+        if (ec_listed(x) != (i ? nec : 0))
+            ifail("ec install %d: %zu .ec parts listed, want %zu", i, ec_listed(x), i ? nec : (size_t)0);
+        if (ec_chunks(&L) != c0)
+            ifail("ec install %d: the replica's open changed the chunks (%d, were %d)", i, ec_chunks(&L), c0);
+        if (answers_n(x, 2) != want_a)
+            ifail("ec install %d (P %" PRIu64 "): the settled series differ from the leader's", i, in[i].p);
+        if ((rc = feed_range(x, in[i].p, end, nch)) != 0)
+            ifail("ec install %d: P + 1..%" PRIu64 " not taken: %d", i, end, rc);
+        else if (answers(x, NULL) != want)
+            ifail("ec install %d (P %" PRIu64 "): after P + 1..end it differs from the leader", i, in[i].p);
+        else
+            ok++;
+        if (ec_listed(x) != nec)
+            ifail("ec install %d: %zu .ec parts listed at the end, want %zu", i, ec_listed(x), nec);
+        ec_close(&xt, &x);
+    }
+    CHECK(nin == NEC);
+    printf("  ec: %d snapshots of an erasure-coded cluster volume (%zu .ec part, %d chunks; the first before the "
+           "settle) installed with their PPOS records; %zu read the settled rows from the stores and, fed on, equal "
+           "the leader; no chunk removed (%d retries)\n", nin, nec, c0, ok, retries);
+    for (int i = 0; i < nin && !fails; i++)
+        sh("rm -rf '%s'", roots[i]);
+    if (!fails)
+        sh("rm -rf '%s' '%s' '%s' '%s'", L.dir, L.st[0], L.st[1], L.st[2]);
+}
+
+/* ec power: install_power's steps with v0 opened by the tier on the stores */
+static const ecl *EP_L;
+static tier *EP_T;
+static int ep_open(const char *vd, uint64_t floor, eng **x) { return ec_open(EP_L, vd, false, floor, &EP_T, x); }
+static void ep_close(eng *x) { ec_close(&EP_T, &x); }
+
+/* Power loss at every step of an install that brings an .ec part and the PPOS records over a replica that has neither
+ * (A: the day's merged .part; B: its .ec): v0 is A whole or B whole, and B opens only with every part's PPOS record,
+ * which must be durable before SNAPDONE (mutant snappposafter) */
+static void case_ec_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  ec power: skipped (no %s)\n", SHIM);
+        return;
+    }
+    ecl L;
+    ec_fresh(&L, "ecpow", 4);
+    bk_reset();
+    static const struct snap_epoch hist[] = {{3, 1}};
+    MK_HIST = hist, MK_NHIST = 1;
+    tier *t = NULL;
+    eng *db = NULL;
+    int rc = ec_open(&L, L.dir, true, 0, &t, &db);
+    CHECK(rc == 0);
+    if (rc)
+        return;
+    char tmpl[PATH_MAX + 96], root[PATH_MAX + 96], ackf[PATH_MAX + 96], scr[PATH_MAX + 96];
+    snprintf(tmpl, sizeof tmpl, "%s_tmpl", L.dir);
+    snprintf(root, sizeof root, "%s_root", L.dir);
+    snprintf(scr, sizeof scr, "%s_scr", L.dir);
+    snprintf(ackf, sizeof ackf, "%s.ack", L.dir);
+    sh("rm -rf '%s' '%s'", tmpl, scr);
+    int64_t day0 = (T0 / DAY_MS - 5) * DAY_MS;
+    ec_day_a(db, day0);
+    small_rows(db, 0);
+    struct inst_snap a, b;
+    small_snap(db, "snap_a", tmpl, &a);
+    CHECK(inst_do(tmpl, 0, 555, NULL) == 0);
+    char vd[PATH_MAX + 128];
+    snprintf(vd, sizeof vd, "%s/v0", tmpl);
+    struct replfile_state st;
+    CHECK(load_repl(vd, &st) == 0);
+    st.fence = 6, st.led = 1, st.open_gen = 5;
+    CHECK(save_repl(vd, &st) == 0);
+    replfile_state_free(&st);
+    if ((rc = ec_settle(db, day0 / DAY_MS)) != 0)
+        ifail("ec power: the settle of day A: %d", rc);
+    small_rows(db, 1);
+    small_snap(db, "snap_b", tmpl, &b);
+    ec_close(&t, &db);
+    EP_L = &L, IPOW_OPEN = ep_open, IPOW_CLOSE = ep_close;
+    uint64_t ha = 0, hb = 0;
+    size_t eca = 9, ecb = 0;
+    eng *x = NULL;
+    sh("mkdir -p '%s' && cp -a '%s' '%s/va'", scr, vd, scr);
+    char p[PATH_MAX + 160];
+    snprintf(p, sizeof p, "%s/va", scr);
+    CHECK(ep_open(p, a.p, &x) == 0);
+    if (x)
+        ha = answers(x, NULL), eca = ec_listed(x), ep_close(x);
+    sh("cp -a '%s/v0.snap' '%s/v0.snap'", tmpl, scr);
+    CHECK(inst_do(scr, 0, 777, NULL) == 0);
+    snprintf(p, sizeof p, "%s/v0", scr);
+    x = NULL;
+    CHECK(ep_open(p, b.p, &x) == 0);
+    if (x)
+        hb = answers(x, NULL), ecb = ec_listed(x), ep_close(x);
+    CHECK(ha != hb && eca == 0 && ecb == 1);
+    int olds = 0, news = 0, crashes = 0, kend = -1, dones = 0;
+    for (int k = 0; k < 2000 && kend < 0 && !fails; k++)
+        for (int sd = 0; sd < 3; sd++) {
+            int code = ipower_step(tmpl, root, ackf, k, k * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news, &dones);
+            if (code < 0)
+                goto out;
+            crashes += code == 99;
+            if (code == 0)
+                kend = k;
+        }
+    for (int sd = 3; kend > 0 && sd < 8; sd++) {
+        int code = ipower_step(tmpl, root, ackf, kend, kend * 17 + sd + 1, a.p, ha, b.p, hb, &olds, &news, &dones);
+        if (code < 0)
+            goto out;
+        crashes += code == 99;
+    }
+    CHECK(kend > 0 && olds > 0 && news > 0 && dones > 0);
+    printf("  ec power: %d steps of an install that brings an .ec part and PPOS, %d crashes: %d left the old directory "
+           "whole, %d the new one with its .ec part (%d with SNAPDONE durable and the swap left to snap_leftovers)\n",
+           kend + 1, crashes, olds, news, dones);
+out:
+    IPOW_OPEN = NULL, IPOW_CLOSE = NULL, EP_L = NULL;
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    MK_HIST = NULL, MK_NHIST = 0;
+    if (!fails)
+        sh("rm -rf '%s' '%s' '%s' '%s' '%s' '%s' '%s' '%s'", L.dir, tmpl, root, scr, ackf, L.st[0], L.st[1], L.st[2]);
+}
+#else
+static void case_ec(void) { printf("  ec: skipped (built without TSDB_EC)\n"); }
+static void case_ec_power(void) {}
+#endif
 
 static void set_mutant(const char *m)
 {
@@ -2575,8 +3000,13 @@ int main(int argc, char **argv)
         sh("rm -rf '%s'", S);
         return rc;
     }
-    printf("test_snapshot%s%s%s\n", mutant ? " --mutant " : "", mutant ? mutant : "", only ? " --only install" : "");
+    printf("test_snapshot%s%s%s%s\n", mutant ? " --mutant " : "", mutant ? mutant : "", only ? " --only " : "", only ? only : "");
     meta_cluster_open_allow(true); /* an installed directory says requires=cluster */
+    if (only && strcmp(only, "ec") == 0) { /* --only ec: the erasure-coded cases alone */
+        case_ec();
+        case_ec_power();
+        goto out;
+    }
     if (only && strcmp(only, "install") == 0) {
         INST_NOVERIFY = true;
         case_install();
@@ -2601,6 +3031,8 @@ int main(int argc, char **argv)
     case_install_keep();
     case_install_verify();
     case_install_power();
+    case_ec();
+    case_ec_power();
 out:
     if (fails) {
         fprintf(stderr, "test_snapshot: %d checks failed (scratch kept: %s)\n", fails, S);

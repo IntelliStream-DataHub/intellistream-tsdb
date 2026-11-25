@@ -324,7 +324,7 @@ $(B)/test_crashfs: tests/test_crashfs.c $(CRASHFS_SO) | $(B)
 # the engine as a replica (src/replica.c, design-cluster.md step 3): the mutant runs plant the bugs it guards against
 $(B)/test_replica: tests/test_replica.c src/replica.h src/internal.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
-$(B)/test_snapshot: tests/test_snapshot.c src/snapshot.h src/marker.h src/internal.h src/replica.h src/replfile.h src/feed.h $(LIB) $(CRASHFS_SO)
+$(B)/test_snapshot: tests/test_snapshot.c src/snapshot.h src/marker.h $(R7_HDR) src/internal.h src/replica.h src/replfile.h src/feed.h $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 # cluster volumes in a tsdb handle (src/cvol.h): holes, routing by the cluster name, the engine swap (promote)
