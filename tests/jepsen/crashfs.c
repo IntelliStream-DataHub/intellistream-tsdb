@@ -188,6 +188,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static char root[PATH_MAX];
 static size_t rootlen;
 static bool active;
+static pid_t init_pid;
 static double prob;
 static long warmup, ops;
 static uint64_t rng;
@@ -213,6 +214,7 @@ static char *fdpath[MAX_FDS];
  * harness reported a server that did not fail-stop. fd_tracked checks the descriptor still is that file. */
 static dev_t fddev[MAX_FDS];
 static ino_t fdino[MAX_FDS];
+static int max_fd;
 static file *files;
 static size_t nfiles;
 static dirop *dops;
@@ -392,6 +394,7 @@ __attribute__((constructor)) static void init(void)
     ignore_usr2 = getenv("CRASHFS_IGNORE_USR2") ? atoi(getenv("CRASHFS_IGNORE_USR2")) : 0;
     signal(SIGUSR2, on_usr2);
     signal(SIGBUS, on_bus);
+    init_pid = getpid();
     active = files && dops;
 }
 
@@ -406,7 +409,12 @@ static double urand(void)
 /* ------------------------------------------------------------- tracking */
 
 /* misdirect mode keeps none of the power-loss state: only which descriptors are its files (md_open) */
-static bool tracked(const char *p) { return active && !md_mode && strncmp(p, root, rootlen) == 0; }
+static bool tracked(const char *p)
+{
+    if (!active || md_mode || strncmp(p, root, rootlen) != 0)
+        return false;
+    return (rootlen == 1 && root[0] == '/') || p[rootlen] == '\0' || p[rootlen] == '/';
+}
 
 static void path_of_at(int dirfd, const char *name, char *out)
 {
@@ -486,72 +494,158 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
-static bool scan_inode_dir(const char *dir, dev_t dev, ino_t ino, char *out, struct stat *st_out, int depth)
+struct stale_file {
+    file *f;
+    bool done;
+};
+
+struct inode_scan {
+    struct stale_file *stale;
+    size_t *tab;
+    size_t mask;
+    size_t remaining;
+};
+
+static size_t inode_hash(dev_t dev, ino_t ino)
 {
-    if (depth > 32)
-        return false;
-    DIR *d = opendir(dir);
+    uint64_t h = ((uint64_t)dev * 0x9e3779b97f4a7c15ull) ^ (uint64_t)ino;
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    return (size_t)h;
+}
+
+static struct stale_file *inode_scan_find(struct inode_scan *sc, dev_t dev, ino_t ino)
+{
+    size_t slot = inode_hash(dev, ino) & sc->mask;
+    while (sc->tab[slot] != SIZE_MAX) {
+        struct stale_file *sf = &sc->stale[sc->tab[slot]];
+        if (sf->f->dev == dev && sf->f->ino == ino)
+            return sf;
+        slot = (slot + 1) & sc->mask;
+    }
+    return NULL;
+}
+
+static void scan_inodes_dir(char *path, size_t len, struct inode_scan *sc, int depth)
+{
+    if (depth > 32 || sc->remaining == 0)
+        return;
+    DIR *d = opendir(path);
     if (!d)
-        return false;
+        return;
     struct dirent *e;
-    bool found = false;
-    while (!found && (e = readdir(d)) != NULL) {
+    while (sc->remaining > 0 && (e = readdir(d)) != NULL) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
             continue;
         if (!strncmp(e->d_name, ".crashfs_tsave_", 15) || !strncmp(e->d_name, ".crashfs_saved_", 15))
             continue;
-        char p[PATH_MAX];
-        int n = snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
-        if (n < 0 || n >= (int)sizeof p)
-            continue;
-        struct stat st;
-        if (lstat(p, &st) != 0)
-            continue;
-        if (S_ISREG(st.st_mode)) {
-            if (st.st_dev == dev && st.st_ino == ino) {
-                snprintf(out, PATH_MAX, "%s", p);
-                *st_out = st;
-                found = true;
-            }
-        } else if (S_ISDIR(st.st_mode)) {
-            found = scan_inode_dir(p, dev, ino, out, st_out, depth + 1);
+        size_t dlen = strlen(e->d_name);
+        size_t nlen;
+        if (len == 1 && path[0] == '/') {
+            if (1 + dlen >= PATH_MAX)
+                continue;
+            memcpy(path + 1, e->d_name, dlen + 1);
+            nlen = 1 + dlen;
+        } else {
+            if (len + 1 + dlen >= PATH_MAX)
+                continue;
+            path[len] = '/';
+            memcpy(path + len + 1, e->d_name, dlen + 1);
+            nlen = len + 1 + dlen;
         }
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (S_ISREG(st.st_mode)) {
+                struct stale_file *sf = inode_scan_find(sc, st.st_dev, st.st_ino);
+                if (sf && !sf->done) {
+                    memcpy(sf->f->path, path, nlen + 1);
+                    sf->done = true;
+                    sc->remaining--;
+                }
+            } else if (S_ISDIR(st.st_mode)) {
+                scan_inodes_dir(path, nlen, sc, depth + 1);
+            }
+        }
+        path[len] = '\0';
     }
     real_closedir(d);
-    return found;
 }
 
-static bool find_inode_path(dev_t dev, ino_t ino, char *out, struct stat *st_out)
+static bool file_path_stat(const file *f, struct stat *st)
 {
-    for (int fd = 0; fd < MAX_FDS; fd++) {
-        if (!fdpath[fd] || fddev[fd] != dev || fdino[fd] != ino)
+    return f->path[0] && stat(f->path, st) == 0 && st->st_dev == f->dev && st->st_ino == f->ino;
+}
+
+/* Refreshes f->path for every tracked file whose recorded path no longer matches (f->dev, f->ino)
+ * in at most one pass over open tracked descriptors and at most one walk of $CRASHFS_ROOT. */
+static void relocate_stale_files(bool only_tsave, bool skip_lying)
+{
+    size_t nstale = 0;
+    for (size_t i = 0; i < nfiles; i++) {
+        file *f = &files[i];
+        struct stat st;
+        if (!f->used || (only_tsave && !f->tsave) || (skip_lying && f->lying) || file_path_stat(f, &st))
+            continue;
+        nstale++;
+    }
+    if (nstale == 0)
+        return;
+    size_t cap = 16;
+    while (cap < nstale * 2)
+        cap <<= 1;
+    struct stale_file *stale = malloc(nstale * sizeof *stale);
+    size_t *tab = malloc(cap * sizeof *tab);
+    if (!stale || !tab) {
+        free(stale);
+        free(tab);
+        return;
+    }
+    for (size_t i = 0; i < cap; i++)
+        tab[i] = SIZE_MAX;
+    struct inode_scan sc = {stale, tab, cap - 1, 0};
+    for (size_t i = 0; i < nfiles && sc.remaining < nstale; i++) {
+        file *f = &files[i];
+        struct stat st;
+        if (!f->used || (only_tsave && !f->tsave) || (skip_lying && f->lying) || file_path_stat(f, &st))
+            continue;
+        size_t idx = sc.remaining++;
+        stale[idx].f = f;
+        stale[idx].done = false;
+        size_t slot = inode_hash(f->dev, f->ino) & sc.mask;
+        while (tab[slot] != SIZE_MAX)
+            slot = (slot + 1) & sc.mask;
+        tab[slot] = idx;
+    }
+    for (int fd = 0; fd < max_fd && sc.remaining > 0; fd++) {
+        if (!fdpath[fd])
+            continue;
+        struct stale_file *sf = inode_scan_find(&sc, fddev[fd], fdino[fd]);
+        if (!sf || sf->done)
             continue;
         struct stat st;
-        if (fstat(fd, &st) != 0 || st.st_dev != dev || st.st_ino != ino)
+        if (fstat(fd, &st) != 0 || st.st_dev != sf->f->dev || st.st_ino != sf->f->ino)
             continue;
-        if (st.st_nlink == 0)
-            return false; /* unlinked everywhere: no directory entry remains */
-        if (stat(fdpath[fd], &st) == 0 && st.st_dev == dev && st.st_ino == ino) {
-            snprintf(out, PATH_MAX, "%s", fdpath[fd]);
-            *st_out = st;
-            return true;
+        if (st.st_nlink == 0) {
+            sf->done = true;
+            sc.remaining--;
+            continue;
+        }
+        if (stat(fdpath[fd], &st) == 0 && st.st_dev == sf->f->dev && st.st_ino == sf->f->ino) {
+            snprintf(sf->f->path, PATH_MAX, "%s", fdpath[fd]);
+            sf->done = true;
+            sc.remaining--;
         }
     }
-    return scan_inode_dir(root, dev, ino, out, st_out, 0);
-}
-
-/* Resolves `f` to a live path and stat: uses f->path if still valid, else relocates via open descriptors or root scan. */
-static bool file_stat_path(file *f, struct stat *st, char *out)
-{
-    if (f->path[0] && stat(f->path, st) == 0 && st->st_dev == f->dev && st->st_ino == f->ino) {
-        snprintf(out, PATH_MAX, "%s", f->path);
-        return true;
+    if (sc.remaining > 0) {
+        static char scan_path[PATH_MAX];
+        memcpy(scan_path, root, rootlen + 1);
+        scan_inodes_dir(scan_path, rootlen, &sc, 0);
     }
-    if (find_inode_path(f->dev, f->ino, out, st)) {
-        snprintf(f->path, PATH_MAX, "%s", out);
-        return true;
-    }
-    return false;
+    free(tab);
+    free(stale);
 }
 
 /* The file behind a tracked descriptor, found by the identity of its inode: the name the descriptor was opened under may have been
@@ -737,7 +831,14 @@ static bool keep_dir_aside(const char *path, char *saved)
         return false;
     bool empty = true;
     struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
+    for (;;) {
+        errno = 0;
+        e = readdir(d);
+        if (!e) {
+            if (errno != 0)
+                empty = false;
+            break;
+        }
         if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
             empty = false;
             break;
@@ -969,6 +1070,26 @@ static bool name_inside_cut(char **cut, size_t ncut, const char *dir)
     return false;
 }
 
+static void rekey_cut(char **cut, size_t ncut, const char *from, const char *to)
+{
+    for (size_t k = 0; k < ncut; k++) {
+        char tmp[PATH_MAX];
+        if (!strcmp(cut[k], from)) {
+            snprintf(tmp, sizeof tmp, "%s", to);
+        } else {
+            snprintf(tmp, sizeof tmp, "%s", cut[k]);
+            rekey(tmp, from, to);
+        }
+        if (strcmp(tmp, cut[k]) != 0) {
+            char *r = strdup(tmp);
+            if (r) {
+                free(cut[k]);
+                cut[k] = r;
+            }
+        }
+    }
+}
+
 static void tear_dirops(void)
 {
     char **cut = malloc((2 * ndops + 1) * sizeof *cut);
@@ -980,8 +1101,11 @@ static void tear_dirops(void)
     long nth = 0;
     for (size_t i = 0; i < ndops; i++) {
         dirop *d = &dops[i];
-        if (d->done)
+        if (d->done) {
+            if (d->kind == OP_RENAME)
+                rekey_cut(cut, ncut, d->a, d->b);
             continue;
+        }
         char srcdir[PATH_MAX];
         dir_of(d->a, srcdir);
         bool forced = name_cut(cut, ncut, d->a) || name_cut(cut, ncut, d->b) || name_cut(cut, ncut, srcdir) ||
@@ -991,20 +1115,8 @@ static void tear_dirops(void)
         if (!forced && keep) {
             d->done = true; /* reached the disk after all */
             tear_kept++;
-            if (d->kind == OP_RENAME) {
-                for (size_t k = 0; k < ncut; k++) {
-                    char tmp[PATH_MAX];
-                    snprintf(tmp, sizeof tmp, "%s", cut[k]);
-                    rekey(tmp, d->a, d->b);
-                    if (strcmp(tmp, cut[k]) != 0) {
-                        char *r = strdup(tmp);
-                        if (r) {
-                            free(cut[k]);
-                            cut[k] = r;
-                        }
-                    }
-                }
-            }
+            if (d->kind == OP_RENAME)
+                rekey_cut(cut, ncut, d->a, d->b);
             continue;
         }
         char *ca = strdup(d->a);
@@ -1048,13 +1160,13 @@ static void rollback(void)
     if (tear)
         tear_dirops(); /* the survivors among the directory operations are known before the files are cut back */
     /* file data first, by each file's current live path (relocating if a hard link was unlinked) */
+    relocate_stale_files(false, false);
     for (size_t i = 0; i < nfiles; i++) {
         file *f = &files[i];
         struct stat st;
-        char fpath[PATH_MAX];
-        if (!f->used || !file_stat_path(f, &st, fpath))
+        if (!f->used || !file_path_stat(f, &st))
             continue;
-        int fd = real_open(fpath, O_WRONLY);
+        int fd = real_open(f->path, O_WRONLY);
         if (fd < 0)
             continue;
         if (f->tsave && (!tear || (!tsave_carried(f) && urand() < 0.5))) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
@@ -1223,13 +1335,15 @@ __attribute__((destructor)) static void fini(void)
     if (!eio_done && !(loss_at_exit && active)) {
         for (size_t i = 0; i < nfiles; i++) /* no power loss: the copies kept for one are not left in the directory */
             tsave_drop(&files[i]);
-        for (size_t i = 0; active && i < ndops; i++)
-            if (!dops[i].done && dops[i].saved[0]) {
-                char snow[PATH_MAX];
-                op_now(i, dops[i].saved, snow);
-                rm_tree(snow);
-                dops[i].saved[0] = 0;
-            }
+        if (getpid() == init_pid) {
+            for (size_t i = 0; active && i < ndops; i++)
+                if (!dops[i].done && dops[i].saved[0]) {
+                    char snow[PATH_MAX];
+                    op_now(i, dops[i].saved, snow);
+                    rm_tree(snow);
+                    dops[i].saved[0] = 0;
+                }
+        }
         return;
     }
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
@@ -1329,7 +1443,7 @@ static off_t md_dest(const char *path, ino_t self, off_t size, off_t a, size_t c
             }
         }
         if (d)
-            closedir(d);
+            real_closedir(d);
         if (pick[0]) {
             snprintf(dest, PATH_MAX, "%s", pick);
             if (kind < 0.2 && a < psize) /* the offset it was meant for, in the wrong file */
@@ -1432,6 +1546,33 @@ static void md_read(int fd, void *buf, size_t r, off_t off)
 
 /* --------------------------------------------------------------- hooks */
 
+static void fd_clear_locked(int fd)
+{
+    if (fd >= 0 && fd < MAX_FDS && fdpath[fd]) {
+        free(fdpath[fd]);
+        fdpath[fd] = NULL;
+        while (max_fd > 0 && !fdpath[max_fd - 1])
+            max_fd--;
+    }
+}
+
+static void fd_set_locked(int fd, const char *path, dev_t dev, ino_t ino)
+{
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+    free(fdpath[fd]);
+    fdpath[fd] = path ? strdup(path) : NULL;
+    fddev[fd] = dev;
+    fdino[fd] = ino;
+    if (fdpath[fd]) {
+        if (fd + 1 > max_fd)
+            max_fd = fd + 1;
+    } else {
+        while (max_fd > 0 && !fdpath[max_fd - 1])
+            max_fd--;
+    }
+}
+
 /* A descriptor number open() hands out is not the file a record of it names any more: that one was closed where this
  * shim does not see it (glibc's closedir of an fdopendir(dup(fd))). A stale record made an fsync of a file outside
  * the root fail as an EIO on a directory inside it. */
@@ -1439,8 +1580,7 @@ static void fd_forget(int fd)
 {
     if (fd >= 0 && fd < MAX_FDS && fdpath[fd]) {
         pthread_mutex_lock(&lock);
-        free(fdpath[fd]);
-        fdpath[fd] = NULL;
+        fd_clear_locked(fd);
         pthread_mutex_unlock(&lock);
     }
 }
@@ -1459,10 +1599,7 @@ static int md_open(int dirfd, const char *name, int flags, mode_t mode, bool at,
     struct stat st;
     if (fd >= 0 && fd < MAX_FDS && md_eligible(path) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
         pthread_mutex_lock(&lock);
-        free(fdpath[fd]);
-        fdpath[fd] = strdup(path);
-        fddev[fd] = st.st_dev;
-        fdino[fd] = st.st_ino;
+        fd_set_locked(fd, path, st.st_dev, st.st_ino);
         pthread_mutex_unlock(&lock);
     }
     return fd;
@@ -1518,12 +1655,13 @@ static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
             file_get(path, false);
         }
         if (fd < MAX_FDS) {
-            free(fdpath[fd]);
-            fdpath[fd] = strdup(path);
+            dev_t dev = 0;
+            ino_t ino = 0;
             if (fstat(fd, &st) == 0) {
-                fddev[fd] = st.st_dev;
-                fdino[fd] = st.st_ino;
+                dev = st.st_dev;
+                ino = st.st_ino;
             }
+            fd_set_locked(fd, path, dev, ino);
         }
     }
     pthread_mutex_unlock(&lock);
@@ -1571,10 +1709,8 @@ static bool fd_tracked(int fd) /* the lock is not held */
     if (fd_is(fd))
         return true;
     pthread_mutex_lock(&lock); /* closed behind the shim's back: whatever has this number now is not the file */
-    if (fdpath[fd] && !fd_is(fd)) {
-        free(fdpath[fd]);
-        fdpath[fd] = NULL;
-    }
+    if (fdpath[fd] && !fd_is(fd))
+        fd_clear_locked(fd);
     bool t = fdpath[fd] != NULL;
     pthread_mutex_unlock(&lock);
     return t;
@@ -1816,14 +1952,13 @@ static int do_sync(int fd, bool data_only)
                     dops[i].done = true;
                     drop_saved_op(i);
                 }
+            relocate_stale_files(true, false);
             for (size_t i = 0; i < nfiles; i++) { /* the transaction that carries a truncation commits with the directory's sync */
                 struct stat fst;
-                char fpath[PATH_MAX], fdir[PATH_MAX];
-                if (!files[i].used || !files[i].tsave)
+                char fdir[PATH_MAX];
+                if (!files[i].used || !files[i].tsave || !file_path_stat(&files[i], &fst))
                     continue;
-                if (!file_stat_path(&files[i], &fst, fpath))
-                    continue;
-                dir_of(fpath, fdir);
+                dir_of(files[i].path, fdir);
                 if (!strcmp(fdir, fdpath[fd]))
                     tsave_drop(&files[i]);
             }
@@ -1858,12 +1993,11 @@ int syncfs(int fd)
     int r = real_syncfs(fd);
     struct stat fs;
     if (r == 0 && fstat(fd, &fs) == 0) {
+        relocate_stale_files(false, true);
         for (size_t i = 0; i < nfiles; i++) {
             file *f = &files[i];
             struct stat st;
-            char fpath[PATH_MAX];
-            if (f->used && !f->lying && file_stat_path(f, &st, fpath) && st.st_dev == fs.st_dev &&
-                st.st_ino == f->ino) {
+            if (f->used && !f->lying && file_path_stat(f, &st) && st.st_dev == fs.st_dev) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
@@ -1915,7 +2049,7 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         add_dirop(OP_RENAME, a, b, saved[0] ? saved : NULL);
         file_get(b, false);
         if (stat(b, &st) == 0 && S_ISREG(st.st_mode)) { /* a descriptor still open on the file is the file under its new name */
-            for (int fd = 0; fd < MAX_FDS; fd++)
+            for (int fd = 0; fd < max_fd; fd++)
                 if (fdpath[fd] && !strcmp(fdpath[fd], a)) {
                     char *n = strdup(b);
                     if (n) {
@@ -1927,7 +2061,7 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         if (stat(b, &st) == 0 && S_ISDIR(st.st_mode)) { /* what is inside moved with it */
             for (size_t i = 0; i < nfiles; i++)
                 rekey(files[i].path, a, b);
-            for (int fd = 0; fd < MAX_FDS; fd++) {
+            for (int fd = 0; fd < max_fd; fd++) {
                 char p[PATH_MAX];
                 if (!fdpath[fd])
                     continue;
@@ -2101,10 +2235,10 @@ static void dup_note(int from, int to)
     if (to < 0 || to >= MAX_FDS || from < 0 || from >= MAX_FDS || to == from)
         return;
     pthread_mutex_lock(&lock);
-    free(fdpath[to]);
-    fdpath[to] = fdpath[from] ? strdup(fdpath[from]) : NULL;
-    fddev[to] = fddev[from];
-    fdino[to] = fdino[from];
+    if (fdpath[from])
+        fd_set_locked(to, fdpath[from], fddev[from], fdino[from]);
+    else
+        fd_clear_locked(to);
     pthread_mutex_unlock(&lock);
 }
 
@@ -2149,9 +2283,8 @@ int close(int fd)
         struct stat st;
         bool gone = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0;
         pthread_mutex_lock(&lock);
-        free(fdpath[fd]);
-        fdpath[fd] = NULL;
-        for (int k = 0; gone && k < MAX_FDS; k++)
+        fd_clear_locked(fd);
+        for (int k = 0; gone && k < max_fd; k++)
             if (fdpath[k] && fddev[k] == st.st_dev && fdino[k] == st.st_ino)
                 gone = false;
         if (gone)
