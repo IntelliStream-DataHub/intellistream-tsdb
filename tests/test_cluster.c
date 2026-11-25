@@ -13511,6 +13511,15 @@ static tsdb_sid ecb_series(tsdbc *c, const char *name, const char *vol)
 }
 
 /* the .ec parts listed in server i's v<num> (retired_ ones not counted) */
+/* is server i one of volume e's log replicas */
+static bool ecb_is_rep(const struct meta_volume *e, int i)
+{
+    for (uint32_t k = 0; k < e->nrep; k++)
+        if (server_of(e->rep[k].node) == i)
+            return true;
+    return false;
+}
+
 static int ecb_ec_parts(int i, uint32_t num)
 {
     char d[PATH_MAX + 80], p[PATH_MAX + 120];
@@ -13572,7 +13581,7 @@ static void scen_ecbasic(void)
     view_free(&v);
     static char xa[6][PATH_MAX + 256];
     for (int i = 0; i < 6; i++) {
-        char sd[PATH_MAX];
+        char sd[PATH_MAX + 96];
         snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
         chunk_store_make(sd, uuid, ids[i]);
         snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
@@ -13658,17 +13667,18 @@ static void scen_ecbasic(void)
     for (int s = 0; s < ECB_SERIES; s++)
         if ((rc = ecb_read(ct, idt[s], &twin[s])) != 0 || twin[s].n != 2 * ECB_ROWS)
             die("the twin's series %d: %s (%" PRIu64 " rows)", s, ers(rc), twin[s].n);
-    /* stripe members that are neither e42's log replicas nor the metadata leader: killed and restarted */
-    int victims[6], nv = 0, ml = leader_of(L);
-    for (int i = 0; i < 6; i++) {
-        bool rep = false;
-        for (uint32_t k = 0; k < e.nrep; k++)
-            rep |= server_of(e.rep[k].node) == i;
-        if (!rep && i != ml)
-            victims[nv++] = i;
-    }
-    if (nv < 1)
-        die("no stripe member outside e42's log group");
+    /* stripe members killed and restarted: first those that are neither e42's log replicas nor the metadata leader,
+     * then, while fewer than three, e42's follower replicas (never its leader L nor the metadata leader): with the
+     * metadata leader among e42's replicas only two members are outside both, and the three-member case must never be
+     * skipped (a run of a185e2a1 skipped it). A follower killed leaves L leading: reads stay at L. */
+    int victims[6] = {-1}, nv = 0, ml = leader_of(L);
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < 6 && (pass == 0 || nv < 3); i++) {
+            if (i != ml && i != L && ecb_is_rep(&e, i) == (pass == 1))
+                victims[nv++] = i;
+        }
+    if (nv < 3 || ecb_is_rep(&e, victims[0]))
+        die("%d stripe members to kill besides L and the metadata leader (server %d first)", nv, victims[0]);
     stop(victims[0], SIGKILL);
     for (int s = 2; s < 4; s++) {
         struct ecb_sum a, b = twin[s];
@@ -13680,7 +13690,7 @@ static void scen_ecbasic(void)
     printf("  one stripe member killed (server %d): reads decode around it\n", victims[0]);
     for (int k = 1; k < nv && k < 3; k++)
         stop(victims[k], SIGKILL);
-    if (nv >= 3) {
+    {
         struct ecb_sum a;
         rc = ecb_read(c, ide[4], &a);
         if (rc != TSDB_ERR_UNAVAILABLE) {
@@ -13689,9 +13699,8 @@ static void scen_ecbasic(void)
             die("series 4 with three stripe members away: %s (%" PRIu64 " rows), want UNAVAILABLE (%d .ec, %d .part:%s)",
                 ers(rc), a.n, ecb_ec_parts(L, num), nl, live);
         }
-        printf("  three stripe members killed: UNAVAILABLE\n");
-    } else
-        printf("  three stripe members killed: skipped (only %d outside the log group and the metadata leader)\n", nv);
+        printf("  three stripe members killed (servers %d %d %d): UNAVAILABLE\n", victims[0], victims[1], victims[2]);
+    }
     for (int k = 0; k < nv && k < 3; k++)
         start(victims[k]);
     for (int s = 4; s < ECB_SERIES; s++) {
