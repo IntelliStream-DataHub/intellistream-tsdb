@@ -1743,6 +1743,27 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	        --nemesis $$nem --workload $$wl --seconds $(call jsec,30) --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so \
 	        --outagefs $(B)/liboutagefs.so || exit 1; \
 	    done; done; done
+	$(MAKE) --no-print-directory jepsen-cluster-ec
+
+# --ec (tests/jepsen/cluster_ec.h, row r8l-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
+# The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (it takes --ec-experimental: only then
+# is there a chunk to rot and a crash point of the settle to reach) to partition pause rot midcommit power as well;
+# JEPSEN_EC= (empty) leaves the runs out. Per io and workload (JEPSEN_EC_WORKLOADS).
+JEPSEN_EC ?= 4+2
+JEPSEN_EC_NODES ?= 7
+JEPSEN_EC_WORKLOADS ?= meta,kv
+JEPSEN_EC_NEMESES ?=
+jepsen-cluster-ec: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
+	@if [ -z "$(JEPSEN_EC)" ]; then echo "jepsen-cluster-ec: off (JEPSEN_EC is empty)"; exit 0; fi; \
+	nems="$(JEPSEN_EC_NEMESES)"; if [ -z "$$nems" ]; then \
+	    if ./$(B)/tsdbd --help 2>&1 | grep -q -- --ec-experimental; then nems="kill partition partial pause diskloss rot midcommit power"; \
+	    else nems="kill partial diskloss"; fi; fi; \
+	for io in $(IO); do for wl in $(JEPSEN_EC_WORKLOADS); do for nem in $$nems; do \
+	    echo "== tsdbd --io $$io, workloads $$wl, --ec $(JEPSEN_EC) on $(JEPSEN_EC_NODES) nodes, nemesis $$nem"; \
+	    TSDBD=./$(B)/tsdbd TSDB_CLI=./$(B)/tsdb TSDBD_IO=$$io ./$(B)/jepsen_cluster --dir $(JEPSEN_CLUSTER_DIR) \
+	        --nodes $(JEPSEN_EC_NODES) --ec $(JEPSEN_EC) --nemesis $$nem --workload $$wl --seconds $(call jsec,30) \
+	        --seed $(JEPSEN_SEED) --crashfs $(B)/libcrashfs.so || exit 1; \
+	    done; done; done
 
 # The harness has to notice what it is meant to: a port file that names another pid, a client that skips the check
 # of the port it connected to while a foreign server holds the node's old one (and the same client with the check:
@@ -1848,6 +1869,32 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
 	        echo "jepsen-cluster-selftest: a move that shrinks first (moveshrinkfirst) went unnoticed under churn (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	else echo "jepsen-cluster-selftest: moveshrinkfirst under churn skipped (the mutant or the nemesis is not on main yet)"; fi; \
+	ecj="$$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis kill --seconds 20"; \
+	out=$$($$ecj --seconds 40 --mutant ec-diverged 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: a volume was DIVERGED'; then \
+	        echo "jepsen-cluster-selftest: a DIVERGED volume in an ec run without rot or disk loss went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$ecj --mutant ec-member-differs 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: ec: .* through member node'; then \
+	        echo "jepsen-cluster-selftest: a member that answers differently after a transfer went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$ecj --mutant ec-notransfer 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: ec: kvr did not move to node'; then \
+	        echo "jepsen-cluster-selftest: per-member reads with no transfer went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$ecj --nemesis partial --mutant noop-partition 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'exchanged'; then \
+	        echo "jepsen-cluster-selftest: a partial partition that cut nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	if ./$(B)/tsdbd --help 2>&1 | grep -q -- --ec-experimental; then \
+	    out=$$($$ecj --mutant ec-nosettle 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'nothing settled'; then \
+	        echo "jepsen-cluster-selftest: an ec run in which nothing settled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    for mv in TSDB_ECAPPLY_MUTANT=ycold TSDB_ECAPPLY_MUTANT=ecabovey TSDB_ECCOLD_MUTANT=cutnogate; do \
+	        var=$${mv%%=*}; m=$${mv#*=}; \
+	        if grep -qs "\"$$var\"" server/*.c src/*.c; then \
+	            out=$$(env $$mv $$j --nodes 7 --ec 4+2 --workload meta,kv --nemesis kill,midcommit --seconds 120 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	            if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'FAIL: a volume was DIVERGED\|through member node\|violation(s):\|difference(s) between the replicas'; then \
+	                echo "jepsen-cluster-selftest: the server mutant $$m ($$var) went unnoticed in an ec run, or failed for another reason (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	        else echo "jepsen-cluster-selftest: the server mutant $$m skipped (tsdbd reads no $$var)"; fi; \
+	    done; \
+	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate skipped (this tsdbd has no --ec-experimental)"; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
