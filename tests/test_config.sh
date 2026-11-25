@@ -73,13 +73,13 @@ refused() {
 
 # 1. every option of tsdbd.c has a row in the table, and every row an option (and the same for the file's keys)
 opts=$(sed -n '/static struct option opts\[\]/,/};/p' server/tsdbd.c | grep -o '{"[a-z-]*"' | tr -d '{"' | sort -u)
-rows=$("$B/tsdbd" --config-keys | sed -n 's/^| `[a-z.]*` | `--\([a-z-]*\)`.*/\1/p; /^Options with no key/,$ s/^| `--\([a-z-]*\)`.*/\1/p' | sort -u)
+rows=$("$B/tsdbd" --config-keys | sed -n 's/^| `[a-z._]*` | `--\([a-z-]*\)`.*/\1/p; /^Options with no key/,$ s/^| `--\([a-z-]*\)`.*/\1/p' | sort -u)
 [ -n "$opts" ] && [ -n "$rows" ] || fail "no options or rows found"
 diff <(echo "$opts") <(echo "$rows") > "$dir/d" || fail "options and table differ: $(tr '\n' ' ' < "$dir/d")"
-keys=$("$B/tsdbd" --config-keys | sed -n 's/^| `\([a-z.]*\)` | `--.*/\1/p')
+keys=$("$B/tsdbd" --config-keys | sed -n 's/^| `\([a-z._]*\)` | `--.*/\1/p')
 check "duplicate keys" "$(echo "$keys" | sort | uniq -d | tr '\n' ' ')" ""
 for k in $keys; do
-    case $k in [a-z]*.[a-z]*) ;; *) fail "key $k is not a dotted key" ;; esac
+    case $k in [a-z]*.[a-z_]*) ;; *) fail "key $k is not a dotted key" ;; esac
 done
 
 # 2. docs/config.md holds the tables that the binaries print
@@ -251,6 +251,8 @@ while IFS= read -r row; do
             cluster.enabled)
                 lines+=('storage.dir = /x')
                 [ $eff = true ] && extra="--cluster-secret-file /s --state-dir /st" ;;
+            cluster.*)
+                lines+=('storage.dir = /x' 'cluster.enabled = true' 'cluster.secret.file = /s' 'cluster.state.dir = /st') ;;
             *) lines+=('storage.dir = /x') ;;
             esac
             cfg bool.properties "${lines[@]}"
@@ -411,6 +413,15 @@ rc=$?
     || fail "a 132 byte --peer-advertise: exit $rc, message '$out'"
 cfg cli-bad.properties 'client.server = x' 'client.nope = 1'
 refused "CLI unknown key" 'cli-bad.properties:2' "$B/tsdb" --config "$dir/cli-bad.properties" --check-config
+
+# RDMA parser edge cases (empty strings, trailing commas, > 49.7d retry_s)
+refused "empty --peer-rdma-kinds" '--peer-rdma-kinds' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-kinds "" --check-config
+refused "trailing comma --peer-rdma-kinds" '--peer-rdma-kinds' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-kinds "log," --check-config
+refused "empty --peer-rdma-sl" '--peer-rdma-sl' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-sl "" --check-config
+refused "trailing comma --peer-rdma-sl" '--peer-rdma-sl' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-sl "1," --check-config
+refused "empty --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "" --check-config
+refused "trailing comma --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "mlx5_0," --check-config
+"$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-retry-s 5000000 --check-config > /dev/null 2>&1 || fail "--peer-rdma-retry-s 5000000 refused"
 
 if [ $errors = 0 ]; then echo "test_config: ok"; else echo "test_config: $errors failure(s)"; fi
 exit $((errors > 0))

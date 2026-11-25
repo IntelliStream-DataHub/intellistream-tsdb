@@ -83,9 +83,11 @@ struct pfk_fab {
     struct plr_qp qp[PFK_QPS];
     struct plr_mr *mrs[16];
     /* faults */
-    long err_send_at; /* > 0: the send executed as number err_send_at (from 1) completes with status ERR */
-    long sends;       /* sends executed */
-    int fail_reg, fail_qp_new, fail_rts, fail_dev;
+    long err_send_at;      /* > 0: the send executed as number err_send_at (from 1) completes with status ERR */
+    long hold_after_sends; /* > 0: set hold=1 as soon as sends reaches this count (deterministic mid-exchange hold) */
+    long sends;            /* sends executed */
+    int fail_reg, fail_qp_new, fail_dev;
+    _Atomic int fail_rts;
     /* slow_flush: a queue pair in error flushes one work request per queue and tick, in order (as an HCA does:
      * asynchronously), so a drain that waits for less than both markers returns while the receive queue still holds
      * slots. no_flush: it flushes nothing (a drain that never finishes). arm_race: a completion made while its queue
@@ -95,6 +97,10 @@ struct pfk_fab {
     /* findings */
     _Atomic int violations;
     long rnr, delivered;
+    uint8_t gid_prefix[8]; /* if use_gid_prefix: override default fe80::0 subnet prefix for next dev_open */
+    int use_gid_prefix;
+    _Atomic uint8_t last_sl;  /* SL passed to most recent qp_rts */
+    _Atomic uint32_t last_qpn; /* QPN of most recent qp_new */
 };
 
 static struct pfk_fab *pfk_cur; /* the ops have no context argument for dev_open: the fabric the test made */
@@ -148,20 +154,20 @@ static int pfk_owned(struct pfk_fab *f, const void *p, size_t n)
     return r;
 }
 
-static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uint32_t len)
+static void pfk_wc_rnr_locked(struct plr_qp *q, uint64_t id, int op, int status, uint32_t len, uint8_t rnr)
 {
     if (q->f->arm_race && !q->armed) {
         if (q->late_n + q->cq_n == PFK_CQ)
             pfk_violation(q->f, "a completion queue overflowed");
         else
-            q->late[q->late_n++] = (struct plr_wc){id, op, status, len, status};
+            q->late[q->late_n++] = (struct plr_wc){id, op, status, len, status, rnr};
         return;
     }
     if (q->cq_n + q->late_n == PFK_CQ) {
         pfk_violation(q->f, "a completion queue overflowed");
         return;
     }
-    q->cq[(q->cq_head + q->cq_n) % PFK_CQ] = (struct plr_wc){id, op, status, len, status};
+    q->cq[(q->cq_head + q->cq_n) % PFK_CQ] = (struct plr_wc){id, op, status, len, status, rnr};
     q->cq_n++;
     if (q->armed) {
         q->armed = 0;
@@ -169,6 +175,11 @@ static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uin
             /* full: an event is pending */
         }
     }
+}
+
+static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uint32_t len)
+{
+    pfk_wc_rnr_locked(q, id, op, status, len, 0);
 }
 
 /* the queue pair fails: everything posted comes back flushed (every send gets a completion then) */
@@ -240,7 +251,7 @@ static void pfk_step_locked(struct pfk_fab *f)
                 f->rnr++;
                 fprintf(stderr, "plr_fake: a SEND found no posted receive (RNR): queue pair %u failed\n",
                         (unsigned)q->qpn);
-                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0);
+                pfk_wc_rnr_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0, 1);
                 pfk_qp_err_locked(q);
                 break;
             }
@@ -261,7 +272,20 @@ static void pfk_step_locked(struct pfk_fab *f)
                 pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_OK, 0);
             } else
                 pfk_push(&q->held, w);
+            if (f->hold_after_sends > 0 && f->sends == f->hold_after_sends) {
+                atomic_store(&f->hold, 1);
+                return;
+            }
         }
+    }
+}
+
+static void pfk_flush_only_locked(struct pfk_fab *f)
+{
+    for (int i = 0; i < PFK_QPS; i++) {
+        struct plr_qp *q = &f->qp[i];
+        if (q->used && q->state == 2 && f->slow_flush && !f->no_flush)
+            pfk_flush_step_locked(q);
     }
 }
 
@@ -272,6 +296,8 @@ static void *pfk_thread(void *arg)
         pthread_mutex_lock(&f->mu);
         if (!atomic_load(&f->hold))
             pfk_step_locked(f);
+        else
+            pfk_flush_only_locked(f);
         pthread_mutex_unlock(&f->mu);
         struct timespec ts = {0, 50000};
         nanosleep(&ts, NULL);
@@ -351,9 +377,13 @@ static int pfk_dev_open(const char *dev, int port, struct plr_dev **d, struct pl
     x->f = f;
     pthread_mutex_lock(&f->mu);
     x->port.lid = f->next_lid++;
+    if (f->use_gid_prefix)
+        memcpy(x->port.gid, f->gid_prefix, 8);
+    else {
+        x->port.gid[0] = 0xfe;
+        x->port.gid[1] = 0x80;
+    }
     pthread_mutex_unlock(&f->mu);
-    x->port.gid[0] = 0xfe;
-    x->port.gid[1] = 0x80;
     x->port.gid[15] = (uint8_t)x->port.lid;
     x->port.mtu = 5;
     x->port.link_layer = PLR_LL_IB;
@@ -435,6 +465,7 @@ static struct plr_qp *pfk_qp_new(struct plr_dev *d, int sq, int rq, uint32_t *qp
     q->f = f;
     q->d = d;
     q->qpn = f->next_qpn++;
+    f->last_qpn = q->qpn;
     if (pipe(q->ev) < 0) {
         q->used = 0;
         pthread_mutex_unlock(&f->mu);
@@ -459,6 +490,7 @@ static int pfk_qp_rts(struct plr_qp *q, const struct plr_qp_attr *a)
         q->a = *a;
         q->sq_psn = a->sq_psn;
         q->state = 1;
+        q->f->last_sl = a->sl;
     }
     pthread_mutex_unlock(&q->f->mu);
     if (!ok)

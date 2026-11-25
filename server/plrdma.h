@@ -109,6 +109,7 @@ struct plr_wc {
     int status; /* PLR_WC_* */
     uint32_t byte_len;
     int vendor; /* the provider's status, for the log */
+    uint8_t rnr; /* 1 when RNR retry limit was exceeded */
 };
 
 /* The verbs, as the transport uses them. Every call is made by one thread at a time per queue pair (the link
@@ -176,15 +177,23 @@ void plr_ep_encode(const struct plr_ep *e, uint8_t out[PLR_EP_LEN]);
 /* -1 (EPROTO) for numbers no peer of this code sends (a slot below 1 KiB, no credits, a QPN above 2^24) */
 int plr_ep_decode(struct plr_ep *e, const uint8_t *in, size_t n);
 
+/* 1 if peer's link layer and (for InfiniBand) 8-byte GID subnet prefix match local port, else 0. */
+int plr_port_subnet_match(const struct plr_port *local, const struct plr_ep *peer);
+
 struct plr_conn;
 /* A queue pair in INIT with every receive posted, its slots taken from the pool. NULL with a line in err. */
 struct plr_conn *plr_conn_new(struct plr_pool *p, char *err, size_t errlen);
 void plr_conn_ep(const struct plr_conn *c, struct plr_ep *out);
 /* RTR and RTS with the peer's numbers. -1 with a line. */
 int plr_conn_start(struct plr_conn *c, const struct plr_ep *peer, char *err, size_t errlen);
-/* The transport of a started connection; it takes over `anchor` (polled for its end, closed with it) and the
- * connection (closed by the transport's close). */
+/* RTR and RTS with per-connection service level (0..15) and busy-poll duration before sleeping (us). */
+int plr_conn_start_opt(struct plr_conn *c, const struct plr_ep *peer, uint8_t sl, uint32_t poll_us, char *err,
+                       size_t errlen);
+/* The transport of a started connection; it takes over `anchor` (if non-NULL: polled for its end, closed with it)
+ * and the connection (closed by the transport's close). */
 struct pl_transport *plr_conn_transport(struct plr_conn *c, struct pl_transport *anchor);
+/* Attaches the TCP anchor to a transport created with anchor == NULL (used when an upgrade settles on RDMA). */
+void plr_conn_set_anchor(struct plr_conn *c, struct pl_transport *anchor);
 /* A connection that never became a transport: drained and freed (its slots back to the pool). */
 void plr_conn_free(struct plr_conn *c);
 /* tests and stats: what the connection did */
@@ -194,6 +203,13 @@ struct plr_conn_stats {
     uint64_t credits; /* the data credits it holds now (the peer's free data slots as last heard) */
 };
 void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st);
+/* process-wide cumulative counters across all RDMA connections (for Prometheus metrics) */
+struct plr_global_stats {
+    uint64_t credit_stalls;
+    uint64_t rnr_retries;
+    uint64_t qp_errors;
+};
+void plr_global_stats(struct plr_global_stats *st);
 
 /* tests/test_plrdma.c: planted bugs (docs/design-rdma.md §8) */
 enum {

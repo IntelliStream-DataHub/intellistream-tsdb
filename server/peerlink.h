@@ -70,7 +70,8 @@
  * decodes RDMA_OFFER (docs/design-rdma.md §5.1 step 1); rd-upgrade sets it, a build before it sends 0 and is never
  * offered an upgrade. */
 #define PL_CAP_RDMA 0x01u
-#define PL_CAPS 0u /* the bits this build sends */
+#define PL_CAP_RDMA_TRY 0x02u /* dialer HELLO: intends to send an initial RDMA_OFFER right after AUTH */
+#define PL_CAPS PL_CAP_RDMA   /* the bits this build always sets (including NO_RDMA, which answers not_built) */
 
 /* LOG and BULK are the replication driver's (server/repld.c); FWD (forwarded requests and their replies) and FWDQ
  * (forwarded queries and their streamed replies under CREDIT) are server/fwd.c's, on a peerlink of its own, so a
@@ -133,6 +134,36 @@ struct pl_bulk_in {
     void (*end)(void *arg, struct plink *l, uint64_t file, int status);
 };
 
+/* RDMA upgrade modes (docs/design-rdma.md §5.2, cluster.peer.rdma) */
+enum {
+    PL_RDMA_AUTO = 0, /* upgrade where both ends can, else TCP */
+    PL_RDMA_OFF = 1,  /* never offer; decline incoming offers with 'off' */
+    PL_RDMA_ON = 2,   /* require RDMA on enabled kinds: end connection instead of falling back to TCP */
+};
+
+#define PL_NKINDS 8
+#define PL_RDMA_POOLS_MAX 8
+
+struct plr_pool;
+struct sockaddr;
+
+struct pl_rdma_cfg {
+    int mode;                                /* PL_RDMA_AUTO, PL_RDMA_OFF, PL_RDMA_ON */
+    unsigned kinds;                          /* bitmask (1u << PL_KIND_*); 0: all data kinds (1..PL_KIND_DATA_MAX) */
+    uint8_t sl[PL_NKINDS];                   /* InfiniBand service level per kind (0..15) */
+    uint64_t retry_ms;                       /* re-offer interval on live TCP link (0: 600000 ms; UINT64_MAX: never) */
+    uint32_t poll_us;                        /* busy-poll CQ before sleeping (0: none) */
+    struct plr_pool *pools[PL_RDMA_POOLS_MAX]; /* registered memory pools, shared across peerlinks (D7) */
+    int npools;
+    /* test overrides (0: design-rdma.md §5 defaults: 2000, 4000, 60000, 60000, 600000 ms) */
+    uint32_t offer_timeout_ms;
+    uint32_t accept_timeout_ms;
+    uint32_t stable_ms;
+    uint32_t backoff_min_ms;
+    uint32_t backoff_max_ms;
+    int test_not_built; /* tests: answer RDMA_DECLINE{not_built} even when built with TSDB_RDMA */
+};
+
 struct pl_cfg {
     struct pl_self self;
     const uint8_t *secret; /* the cluster secret (copied) */
@@ -160,9 +191,19 @@ struct pl_cfg {
     int sock_buf; /* tests: SO_SNDBUF and SO_RCVBUF of every connection (0: the kernel's) */
     int check;    /* the frame check level this end asks for (PL_CHECK_* of plcheck.h; 0: PL_CHECK_NONE); a link runs
                    * at the stronger of its two ends' */
+    int has_rdma; /* 1: use `rdma` below instead of the process-wide peerlink_set_rdma() config */
+    struct pl_rdma_cfg rdma;
 };
 
 struct peerlink *peerlink_new(const struct pl_cfg *cfg);
+/* Process-wide RDMA upgrade configuration (tsdbd sets before starting peerlinks; tests override via pl_cfg.has_rdma). */
+void peerlink_set_rdma(const struct pl_rdma_cfg *cfg);
+/* Process-wide cluster.peer.allow_ipoib setting (0 by default: refuse peer addresses on ARPHRD_INFINIBAND interfaces). */
+void peerlink_set_allow_ipoib(int allow);
+/* IPoIB check (design-rdma.md §5.3, D12): returns 0 if allowed, -1 if refused (with interface name in err). */
+int peerlink_check_ipoib_sa(const struct sockaddr *sa, char *err, size_t errlen);
+int peerlink_check_ipoib_fd(int fd, char *err, size_t errlen);
+int peerlink_check_ipoib_addr(const char *addr, char *err, size_t errlen);
 /* The frame check level (PL_CHECK_*) of every peerlink whose cfg.check is 0, this process's (tsdbd's --peer-check);
  * set before any peerlink runs a handshake. 0: PL_CHECK_NONE. */
 void peerlink_set_check_level(int level);
@@ -170,8 +211,26 @@ int peerlink_check_parse(const char *s); /* "none", "header", "full" -> the leve
 const char *peerlink_check_name(int type); /* the level's word ("?" for none known, 0 included) */
 /* Connections up now in this process, of every peerlink instance, by link kind and frame check type (index PL_KIND_*,
  * PL_CHECK_*; 0 unused): what STATUS's "peer links" line and the metric tsdb_peer_links say. */
-#define PL_NKINDS 8
 void peerlink_up_by_check(uint64_t out[PL_NKINDS][4]);
+/* Connections up now by link kind and transport (0: tcp, 1: rdma). */
+void peerlink_up_by_transport(uint64_t out[PL_NKINDS][2]);
+/* Fallback reasons counted in tsdb_peer_rdma_fallbacks_total{reason}. */
+enum {
+    PL_RDMA_FB_NOT_BUILT = 0,
+    PL_RDMA_FB_OFF = 1,
+    PL_RDMA_FB_KIND = 2,
+    PL_RDMA_FB_SUBNET = 3,
+    PL_RDMA_FB_POOL = 4,
+    PL_RDMA_FB_QP = 5,
+    PL_RDMA_FB_TIMEOUT = 6,
+    PL_RDMA_FB_AUTH = 7,
+    PL_RDMA_FB_QP_ERROR = 8,
+    PL_RDMA_FB_BACKOFF = 9,
+    PL_RDMA_FB_BAD = 10,
+    PL_RDMA_FB_MAX = 11,
+};
+void peerlink_rdma_fallbacks(uint64_t out[PL_RDMA_FB_MAX]);
+const char *peerlink_rdma_fb_name(int reason);
 /* the "peer links" lines of STATUS into buf (a line per kind with a connection up, "" when none): 0, or -1 if cut */
 int peerlink_links_status(char *buf, size_t n);
 /* Stops every link, joins their threads and frees everything (a pending bulk job is completed with PL_E_CLOSED). */
@@ -204,6 +263,8 @@ int peerlink_listen(struct peerlink *pl, int port);
 uint32_t plink_peer(const struct plink *l); /* the peer's node id, once connected */
 int plink_kind(const struct plink *l);
 int plink_check(const struct plink *l); /* the frame check type its connection runs (plcheck.h); 0 while down */
+int plink_is_rdma(const struct plink *l); /* 1 while settled on RDMA, 0 on TCP or down */
+const char *plink_transport(const struct plink *l); /* "rdma", "tcp", or "" while down */
 int plink_up(const struct plink *l);
 uint64_t plink_gen(const struct plink *l); /* counts connections of this link (from 1); valid from on_link(up) on */
 void plink_set_arg(struct plink *l, void *arg);
@@ -284,6 +345,23 @@ enum {
     PLT_DONE = 0x74,   /* rx->tx: u64 file, i32 status */
     PLT_PING = 0x75,
     PLT_PONG = 0x76,
+    PLT_RDMA_OFFER = 0x77,   /* dialer->acceptor on TCP: [PLR_EP_LEN ep][u64 nonce] */
+    PLT_RDMA_ACCEPT = 0x78,  /* acceptor->dialer on TCP: [PLR_EP_LEN ep] */
+    PLT_RDMA_DECLINE = 0x79, /* acceptor->dialer on TCP: [u8 reason] */
+    PLT_RDMA_HELLO = 0x7a,   /* dialer->acceptor on QP: [u64 nonce][u8 mac 32] (no seq consumed) */
+    PLT_RDMA_READY = 0x7b,   /* acceptor->dialer on QP: [u64 nonce][u8 mac 32] (no seq consumed) */
+    PLT_RDMA_GO = 0x7c,      /* dialer->acceptor on QP: empty */
+    PLT_RDMA_ABORT = 0x7d,   /* dialer->acceptor on TCP: empty */
+};
+
+enum {
+    PL_RDMA_DECL_NOT_BUILT = 1,
+    PL_RDMA_DECL_OFF = 2,
+    PL_RDMA_DECL_KIND = 3,
+    PL_RDMA_DECL_SUBNET = 4,
+    PL_RDMA_DECL_POOL = 5,
+    PL_RDMA_DECL_QP = 6,
+    PL_RDMA_DECL_BAD = 7,
 };
 
 struct pl_msg {
@@ -362,11 +440,26 @@ enum {
     PL_MUT_DONESTATUS = 30,     /* a DONE or RESUME status that is no PL_* code is taken as it came */
     PL_MUT_STATUSNEG = 31,      /* a status below the lowest PL_E_* code is taken as it came (the upper end checked) */
     PL_MUT_UPDOWNLEAK = 32,     /* a link going down leaves the process's gauge of links by check level as it was */
+    PL_MUT_RDMA_SETTLEREADY = 33, /* acceptor settles on QP at READY instead of waiting for GO */
+    PL_MUT_RDMA_NOAUTH = 34,      /* RDMA_HELLO / RDMA_READY accepted without nonce/MAC verification */
+    PL_MUT_RDMA_KEEPQUEUE = 35,   /* a failed RDMA connection leaves its queued frames for the next connection */
+    PL_MUT_RDMA_SEQBUMP = 36,     /* RDMA_HELLO / RDMA_READY bumps the stream sequence number (breaks TCP fallback) */
+    PL_MUT_RDMA_NOBACKOFF = 37,   /* RDMA upgrade backoff after 3 failures is ignored */
+    PL_MUT_NOIPOIB = 38,          /* IPoIB interface check is skipped */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
 int plink_test_ctl(struct plink *l, uint8_t type, const void *p, size_t n);
 extern int peerlink_mutant;
+/* Test seam for IPoIB check: when non-NULL, returns the ARPHRD_* type of `ifname` instead of reading sysfs. */
+extern int (*peerlink_test_iftype)(const char *ifname);
+/* Test hooks for RDMA upgrade fault injection (tests/test_plrdma.c) */
+extern int peerlink_test_rdma_hold_ready_ms;   /* acceptor delays sending READY by this many ms */
+extern int peerlink_test_rdma_abort_before_hello; /* dialer sends ABORT right after ACCEPT without posting HELLO */
+extern int peerlink_test_rdma_fail_after_hello;   /* dialer posts HELLO on QP then sends ABORT on TCP */
+extern int peerlink_test_rdma_skip_go;            /* dialer neither sends GO nor ABORT after READY (tests acceptor timeout) */
+extern int peerlink_test_rdma_bad_auth;           /* 1: bad HELLO mac, 2: bad READY mac, 3: bad HELLO nonce, 4: bad READY nonce */
+extern uint64_t peerlink_test_rdma_offers;        /* atomic counter of RDMA_OFFER frames sent */
 /* Test hook (rsnap's TSDB_REPLD_TEST=snapcutdone): > 0 cuts the connection of a kind-5 link once, at the n-th file
  * that ends whole, after the receiver's end callback and before its DONE goes out (a DONE lost to a reconnect). */
 extern int peerlink_test_cut_end;

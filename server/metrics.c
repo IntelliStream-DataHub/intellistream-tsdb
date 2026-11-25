@@ -495,6 +495,38 @@ static void render(sb *b)
                        (unsigned long long)up[k][c]);
     }
 
+    if (cfg.peer_rdma) { /* peer links by transport (tcp vs rdma) and RDMA fault counters (design-rdma.md §5.2) */
+        static const char *const kname[8] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        static const char *const fbname[METRICS_RDMA_FB_MAX] = {
+            "not_built", "off", "kind", "subnet", "pool", "qp", "timeout", "auth", "qp_error", "backoff", "bad",
+        };
+        metrics_peer_rdma rd;
+        memset(&rd, 0, sizeof rd);
+        cfg.peer_rdma(&rd);
+        family(b, "tsdb_peer_links_transport", "gauge",
+               "Peer link connections up now, by link kind and transport (tcp or rdma).");
+        for (int k = 1; k < 8; k++) {
+            sb_add(b, "tsdb_peer_links_transport{kind=\"%s\",transport=\"tcp\"} %llu\n", kname[k],
+                   (unsigned long long)rd.up[k][0]);
+            sb_add(b, "tsdb_peer_links_transport{kind=\"%s\",transport=\"rdma\"} %llu\n", kname[k],
+                   (unsigned long long)rd.up[k][1]);
+        }
+        family(b, "tsdb_peer_rdma_fallbacks_total", "counter",
+               "RDMA peer link upgrade fallbacks and declines, by reason.");
+        for (int r = 0; r < METRICS_RDMA_FB_MAX; r++)
+            sb_add(b, "tsdb_peer_rdma_fallbacks_total{reason=\"%s\"} %llu\n", fbname[r],
+                   (unsigned long long)rd.fallbacks[r]);
+        family(b, "tsdb_peer_rdma_credit_stalls_total", "counter",
+               "Times an RDMA peer link write waited for a peer data credit.");
+        sb_add(b, "tsdb_peer_rdma_credit_stalls_total %llu\n", (unsigned long long)rd.credit_stalls);
+        family(b, "tsdb_peer_rdma_rnr_retries_total", "counter",
+               "RDMA peer link completions failed with receiver-not-ready retry exceeded.");
+        sb_add(b, "tsdb_peer_rdma_rnr_retries_total %llu\n", (unsigned long long)rd.rnr_retries);
+        family(b, "tsdb_peer_rdma_qp_errors_total", "counter",
+               "RDMA peer link queue pair completion or state-transition errors.");
+        sb_add(b, "tsdb_peer_rdma_qp_errors_total %llu\n", (unsigned long long)rd.qp_errors);
+    }
+
     if (cfg.margins) { /* the cluster volumes' margins (server/margins.h; design-cluster-data.md E15, E24) */
         static const char *const tier_names[] = {"none", "ok", "unavailable", "corrupt", "lost"};
         _Static_assert(sizeof tier_names / sizeof *tier_names == MARGIN_TIER_LOST + 1, "a name per enum margin_tier");
