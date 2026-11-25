@@ -375,7 +375,15 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_margins $(B)/test_plrdma
+# CI's plain-build job runs TEST_GROUPS as four runners (test-groups-1 .. 4: BT_GROUPS_N, about equal by their ASan times);
+# tests/check_ci_groups.sh requires the four to be exactly TEST_GROUPS, each once
+BT_TARGETS := test-groups-1 test-groups-2 test-groups-3 test-groups-4
+UNITS_GROUPS := test-units-c test-units-d test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-h3 test-units-i
+UNITS_B_GROUPS := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-units-b6 test-units-b7
+# the binaries of `make test`, once: the groups below build the same set, so that a binary added here is built for every group
+TEST_BINS := $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_margins $(B)/test_plrdma
+$(UNITS_GROUPS) test-groups $(BT_TARGETS): $(TEST_BINS)
+test: $(TEST_BINS)
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -402,45 +410,6 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	TSDBD=$(TSDBD) ./$(B)/test_diverge $(SCRATCH)
 	$(MUT) --name test_diverge --list "nocorrupt seed0 nocut notailconfirm readerrend" -- ./$(B)/test_diverge --case damage --mutant @M@ @D@ # each planted bug must fail it
 	$(MUT) --name test_diverge --list "nofail nodirsync nofdatasync metaopen" -- ./$(B)/test_diverge --case eio,power,preexist,cli --mutant @M@ @D@
-	./$(B)/test_intents $(SCRATCH)
-	$(MUT) --name test_intents --stdout-only --grep 'ROWS WRONG' --list "unlinkfirst" -- ./$(B)/test_intents --mutant @M@ @D@ # the old order must lose rows
-	./$(B)/test_drops $(SCRATCH)
-	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "nointent nosync unlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@ # each planted bug must leave a half drop
-	$(MUT) --name test_drops --stdout-only --grep 'TTL ORDER WRONG' --list "ttlreverse" -- ./$(B)/test_drops --mutant @M@ @D@
-	$(MUT) --name test_drops --stdout-only --grep 'EC LEFT' --list "skipec" -- ./$(B)/test_drops --mutant @M@ @D@
-	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "dropfirst nosettled two ttlunlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@
-	$(MUT) --name test_drops --stdout-only --grep 'NAMES ACCEPTED' --list "novalidate" -- ./$(B)/test_drops --mutant @M@ @D@
-	$(MUT) --name test_drops --stdout-only --grep 'EIO AS GONE' --list "eioasgone" -- ./$(B)/test_drops --mutant @M@ @D@
-	$(MUT) --name test_drops --stdout-only --grep 'TTL FAIL-STOP' --list "ttlfailstop" -- ./$(B)/test_drops --mutant @M@ @D@
-	./$(B)/test_replfile $(SCRATCH)
-	$(MUT) --name test_replfile --list "nosync sameslot nochecksum" -- ./$(B)/test_replfile --mutant @M@ @D@ # each planted bug must fail it
-	./$(B)/test_crashfs $(SCRATCH)
-	./$(B)/test_snapshot $(SCRATCH)
-	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync snapnoreserved snapdroppart" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
-	$(if $(EC_OBJ),$(MUT) --name test_snapshot_ec --list "snapinstnoppos snappposafter snapcarrysettled snapskipec snapecnoverify snapecnozeq snapecnozp snapecnoppos" -- ./$(B)/test_snapshot --only ec --mutant @M@ @D@) # snap-ec: each planted bug of an ec volume's snapshot must fail it
-	./$(B)/test_replica $(SCRATCH)
-	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
-	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's
-	./$(B)/test_cvol $(SCRATCH)
-	./$(B)/test_cvolfs $(SCRATCH)
-	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
-	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap wtailfoldall wtailfoldmin wtailfoldnewer wtailfolddropold wtailsortnomax wtailremoved nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
-	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
-	./$(B)/test_feedstore $(SCRATCH)
-	$(MUT) --name test_feedstore --rc 1 --grep 'renamed before its data was synced' --list "noseal" -- ./$(B)/test_feedstore --mutant @M@ @D@ # a replayed segment renamed without its fdatasync must fail it
-	$(MUT) --name test_feedstore --rc 1 --grep 'removed before the floor was durable' --list "latefloor" -- ./$(B)/test_feedstore --mutant @M@ @D@ # the cleaner's floor set after its unlinks must fail it
-	./$(B)/test_crafted $(SCRATCH)
-	./$(B)/test_gindex $(SCRATCH)
-	./$(B)/test_flush_tail
-	./$(B)/test_stats $(SCRATCH)
-	./$(B)/test_tenants $(SCRATCH)
-	./$(B)/test_tn_race $(SCRATCH)
-	./$(B)/test_tzfiles $(SCRATCH)
-	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
-	tests/test_fuzz_replay.sh $(B) $(SCRATCH) # a replay of nothing, or of a missing corpus, fails
-	./$(B)/test_types $(SCRATCH)
-	./$(B)/test_delete $(SCRATCH)
-	./$(B)/test_levels
 	$(if $(TEST_GROUPS),$(MAKE) -j1 $(TEST_GROUPS))
 
 # The rest of `make test` as groups (the recipe lines are those that were here, in the same order). `make test` runs
@@ -453,12 +422,16 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 # loops get TSAN_MUT_TIMEOUT unless MUTANT_TIMEOUT is set.
 TSAN_MUT_TIMEOUT ?= 5400
 MUT = tools/mutants.sh --tmp $(SCRATCH)$(if $(findstring -fsanitize=thread,$(CFLAGS)), --timeout $${MUTANT_TIMEOUT:-$(TSAN_MUT_TIMEOUT)})
-TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+META_GROUPS := test-meta-1 test-meta-2 test-cluster-1 test-cluster-2 test-cluster-3 test-links
+TEST_GROUPS ?= $(UNITS_GROUPS) test-units-b $(UNITS_B_GROUPS) $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
 TEST_TARGET ?= test
-.PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
+.PHONY: test-groups $(BT_TARGETS) test-units-b $(UNITS_GROUPS) $(UNITS_B_GROUPS) test-meta $(META_GROUPS) test-meta-mutants-1 test-meta-mutants-2 test-net
+TEST_B_BINS_1 := $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
+TEST_B_BINS_2 := $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+$(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
+$(UNITS_B_GROUPS) test-groups $(BT_TARGETS): $(TEST_B_BINS_1) $(TEST_B_BINS_2)
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
-test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
+test-units-b: $(TEST_B_BINS_1) $(TEST_B_BINS_2)
 	./$(B)/test_props $(SCRATCH)
 	B=$(B) tests/test_config.sh $(TMPDIR)
 	./$(B)/test_watchdog
@@ -491,25 +464,96 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/test_chunk_heal $(SCRATCH)
 	./$(B)/test_ecnames $(SCRATCH)
 	$(MUT) --name test_ecnames --list "nameloose tierloose" -- ./$(B)/test_ecnames --mutant @M@ @D@ # each planted bug must fail it
+
+# What `make test` runs after its own lines, as one target that builds everything first in parallel (make -j4 test-groups) and
+# then runs the groups one after the other: the second plain job of CI, beside `make test TEST_GROUPS=`.
+test-groups:
+	$(MAKE) -j1 $(TEST_GROUPS)
+BT_GROUPS_1 := test-units-h3 test-units-b test-units-c test-units-d
+BT_GROUPS_2 := test-units-e test-units-f test-units-g test-units-h1 test-units-h2 test-units-b6 test-units-b7
+BT_GROUPS_3 := test-cluster-3 test-cluster-2 test-cluster-1 test-links test-net test-units-i
+BT_GROUPS_4 := test-units-b2 test-units-b3 test-units-b4 test-units-b5 test-meta-1 test-meta-2 test-meta-mutants-1 test-meta-mutants-2
+$(BT_TARGETS): test-groups-%:
+	$(MAKE) -j1 $(BT_GROUPS_$*)
+
+# The recipe lines of `test` and of test-units-b that follow the first lines of each, as groups of their own (the lines are those
+# that were there, in the same order): under ThreadSanitizer test_intents alone takes 50 minutes and each planted-bug line of
+# test_drops about 17 (it runs the whole test again), so CI runs each group on a runner of its own. `make test` runs them
+# after its own lines, in this order (TEST_GROUPS).
+test-units-c:
+	./$(B)/test_intents $(SCRATCH)
+test-units-d:
+	$(MUT) --name test_intents --stdout-only --grep 'ROWS WRONG' --list "unlinkfirst" -- ./$(B)/test_intents --mutant @M@ @D@ # the old order must lose rows
+	./$(B)/test_replfile $(SCRATCH)
+	$(MUT) --name test_replfile --list "nosync sameslot nochecksum" -- ./$(B)/test_replfile --mutant @M@ @D@ # each planted bug must fail it
+	./$(B)/test_crashfs $(SCRATCH)
+	./$(B)/test_snapshot $(SCRATCH)
+	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync snapnoreserved snapdroppart" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_snapshot_ec --list "snapinstnoppos snappposafter snapcarrysettled snapskipec snapecnoverify snapecnozeq snapecnozp snapecnoppos" -- ./$(B)/test_snapshot --only ec --mutant @M@ @D@) # snap-ec: each planted bug of an ec volume's snapshot must fail it
+test-units-e:
+	./$(B)/test_drops $(SCRATCH)
+	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "nointent nosync unlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@ # each planted bug must leave a half drop
+	$(MUT) --name test_drops --stdout-only --grep 'TTL ORDER WRONG' --list "ttlreverse" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'EC LEFT' --list "skipec" -- ./$(B)/test_drops --mutant @M@ @D@
+test-units-f:
+	$(MUT) --name test_drops --stdout-only --grep 'HALF DROP' --list "dropfirst nosettled two ttlunlinkfirst" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'NAMES ACCEPTED' --list "novalidate" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'EIO AS GONE' --list "eioasgone" -- ./$(B)/test_drops --mutant @M@ @D@
+	$(MUT) --name test_drops --stdout-only --grep 'TTL FAIL-STOP' --list "ttlfailstop" -- ./$(B)/test_drops --mutant @M@ @D@
+test-units-g:
+	./$(B)/test_replica $(SCRATCH)
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
+	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's
+	./$(B)/test_cvol $(SCRATCH)
+	./$(B)/test_cvolfs $(SCRATCH)
+	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
+test-units-h1:
+	$(MUT) --name test_replica --list "applyall ackunsynced keepcut nofloor walclock nopos classmax noclasspurge opensync gapcheck noleftover gapbyseq gapnokept torncut floorcheck durablegate applycontig rotsync cutsync cutdirsync replayskip nonow commitclock earlyseal sealedrule cutgen nostagehold cutnohold nocommitflush nodoneskip keepstaged nodropskip nodropflush nostagesync promoteunapplied promotekeepsegs" -- ./$(B)/test_replica --mutant @M@ @D@
+test-units-h2:
+	$(MUT) --name test_replica --list "epochseg nodropserial stagetrunc coldnostage coldkeyany coldnameany ppostale noorphans leadervisible leaderflush deposefails admitafter bytesaftersync markerrc gatenohook nosynced dictearly wtaillocal classmarkerlate nowtailfrom markersplit droppedglobal wtailnocap wtailfoldall wtailfoldmin wtailfoldnewer wtailfolddropold wtailsortnomax wtailremoved nocutoff zerorate noraisefrom pruneoff1 freshunchecked leaderclose leadernorstate" -- ./$(B)/test_replica --mutant @M@ @D@
+test-units-h3:
+	$(MUT) --name test_replica --list "closewait rscommittedtrue rscommittedfalse keepignored nohardlink promotenocarry keptreplayed leaderkeptnosave readgap cursoranyway tailoksealed notfoundsealed nosweep b0off applyholdsmu nocutgen dropunheld linkbyname leadernoprune leaderpruneall notelate rowsholdmu promotenoapplymu switchunattached freshunattached replicadropsfloor replicadropsfiles leaderlinknosync replaykeptearly replaystartlog replaystarthigh replaystartunsaved replayleadnofloor replayopennone replayopennofloor" -- ./$(B)/test_replica --mutant @M@ @D@
+test-units-i:
+	$(if $(filter Darwin,$(UNAME_S)),,./$(B)/test_crashfs_old $(CURDIR)/$(B)/libcrashfs.so $(SCRATCH))
+	./$(B)/test_feedstore $(SCRATCH)
+	$(MUT) --name test_feedstore --rc 1 --grep 'renamed before its data was synced' --list "noseal" -- ./$(B)/test_feedstore --mutant @M@ @D@ # a replayed segment renamed without its fdatasync must fail it
+	$(MUT) --name test_feedstore --rc 1 --grep 'removed before the floor was durable' --list "latefloor" -- ./$(B)/test_feedstore --mutant @M@ @D@ # the cleaner's floor set after its unlinks must fail it
+	./$(B)/test_crafted $(SCRATCH)
+	./$(B)/test_gindex $(SCRATCH)
+	./$(B)/test_flush_tail
+	./$(B)/test_stats $(SCRATCH)
+	./$(B)/test_tenants $(SCRATCH)
+	./$(B)/test_tn_race $(SCRATCH)
+	./$(B)/test_tzfiles $(SCRATCH)
+	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+	tests/test_fuzz_replay.sh $(B) $(SCRATCH) # a replay of nothing, or of a missing corpus, fails
+	./$(B)/test_types $(SCRATCH)
+	./$(B)/test_delete $(SCRATCH)
+	./$(B)/test_levels
+test-units-b2:
 	./$(B)/test_settle_oracle $(SCRATCH)
 	$(if $(EC_OBJ),tests/oracle_mutants.sh ./$(B)/test_settle_oracle $(SCRATCH) $(ORACLE_MUTANTS)) # each planted bug must fail it by its own line (EC builds: without TSDB_EC the oracle skips)
 	./$(B)/test_ppos $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ppos --list "pposafter pposnosync pposflushhi pposreplay pposunknown0 pposfallback0 pposnofail pposnobadgood pposflags" -- ./$(B)/test_ppos --mutant @M@ @D@) # each planted bug must fail it
+test-units-b3:
 	./$(B)/test_ecswap $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled swaploggedgc" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecgc $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
+test-units-b4:
 	./$(B)/test_settle $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "ecrankdown settlenocheck settletwopass settlebusy coarsewhole" -- ./$(B)/test_settle --quick --mutant @M@ @D@) # each planted bug must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcskipput gcskipindex gcskipopen gcskipelse gcskipswap gcskipdiscard gccommitted gcdouble" -- ./$(B)/test_settle --quick --case gcpaths --mutant @M@ @D@) # each failure path's handoff (int-h)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "gcearly nullnosync syncfailgo" -- ./$(B)/test_settle --quick --case gcpower --mutant @M@ @D@) # the handoff after the directory sync, never on a failed engine
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "nohaltstop" -- ./$(B)/test_settle --quick --case halt --mutant @M@ @D@) # a halt stops the settle
+test-units-b5:
 	./$(B)/test_eccold $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_eccold --list "cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge" -- ./$(B)/test_eccold --mutant @M@ @D@) # each planted bug of the leader's gate and cut must fail it
 	./$(B)/test_ecapply $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply --list "ycold ecabovey pposignored v5nodirsync coldnoflushthrough leaderswapnors pposafterswap mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge recnodirsync" -- ./$(B)/test_ecapply --mutant @M@ @D@) # each planted bug of a replica's COLD apply must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digest --list "digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove" -- ./$(B)/test_ecapply --case digest --mutant @M@ @D@) # r8j: each planted bug of a replica's digest job must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_ecapply_digestpower --list "digestjobnosync" -- ./$(B)/test_ecapply --case digestpower --mutant @M@ @D@) # r8j: the job file written without its fdatasync must fail it
+test-units-b6:
 	./$(B)/test_seam $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_seam --list "seamnoverify seamnoretry cachekeyoff seamnorecheck seamretryerr seamkeepstale forgetnoop prefetchnocheck prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback" -- ./$(B)/test_seam --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_marker $(SCRATCH)
@@ -526,6 +570,7 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
 	$(if $(EC_OBJ),$(MUT) --name test_chunk_heal --list "heal_noverify heal_epoch0 replace_late open_busy_down open_id_up heal_kminus1 heal_resurrect heal_count_target settle_up_always" -- ./$(B)/test_chunk_heal --quick --mutant @M@ @D@) # each planted bug must fail it
+test-units-b7:
 	tests/test_sync_ec.sh
 	tools/sync-ec.sh --check
 	tests/test_check_ec_symbols.sh
@@ -545,9 +590,36 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/test_margins $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
-	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
-	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
+
+# test-meta is the metadata simulator, test_cluster and the link tests, in groups that CI runs on runners of their own
+# (test_meta under ThreadSanitizer takes about 15 minutes, test_cluster about as long again: TEST_GROUPS below).
+# test_meta's seeds 1 to 12 in two halves; the tests that precede its simulator run in both.
+test-meta-1 test-meta-2: test-meta-%: $(B)/test_meta
+	./$(B)/test_meta $(SCRATCH) --seeds 6 --first $(if $(filter 1,$*),1,7) --seconds 15
+
+# test_cluster's scenarios, in the order of the table all[] in tests/test_cluster.c, one group each (a scenario named in
+# none, or in two, fails tests/check_ci_groups.sh; test_cluster with no names runs them all, in one process, in the
+# table's order: `make test-meta` does not, it runs these)
+CLUSTER_SCEN_1 := secret relay initcrash dirsync install reseed torn rebase slowinstall ids watch stall witness users \
+    login userimport userstale userpromote userreplay userlease flags hbsections retired feed syncrace power \
+    powersnap life copyback voterstale dirsyncshared installshared powervote pendshared copyfault volumes \
+    volrefuse snapversion links fwdlinks replicate replindet replfail failover failoverkeep fencecrash \
+    promotecrash deposecrash pause promoteslow openread openreadlead
+CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail readdepose oneway oneway2 cutstuck manystuck \
+    noowner isr topology copyhold movedself route forward fwdseries fwdseriesstrict fwdlease fwddepose \
+    fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
+    snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
+    reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
+CLUSTER_SCEN_3 := ecbasic r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+    volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
+    transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
+    snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
+    moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
+    writerdepose lease hungloop leasedown leasequorum hardslot repcheck
+test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
+	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
+
+test-links: $(B)/test_peerlink $(B)/test_fwd $(B)/test_margins $(B)/test_plrdma $(B)/tsdbd $(B)/tsdb
 	./$(B)/test_peerlink $(SCRATCH)
 	for c in header full; do ./$(B)/test_peerlink $(SCRATCH) --quick --check $$c --only $(PL_KINDS_TESTS) || exit 1; done # every link kind at the other check levels
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall donestatus statusneg updownleak noidcheck" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
@@ -558,6 +630,10 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
+
+# all of them, one after the other (what `make test` runs as its test-meta groups, and what a hand run wants)
+test-meta:
+	$(MAKE) -j1 $(META_GROUPS)
 
 # the planted bugs, in two halves (tests/meta_mutants.sh --part K/N): 23 runs of 2 minutes each under a sanitizer
 test-meta-mutants-1 test-meta-mutants-2: test-meta-mutants-%: $(B)/test_meta_mut
@@ -1296,7 +1372,10 @@ $(B)/test_rs: tests/test_rs.c src/internal.h $(EC_HDR) $(LIB)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -o $@ $< $(LIB) $(LDLIBS) -lm
 
 # whether this build has the erasure codec (test-units-b checks that NO_EC=0 keeps it and NO_EC=1 drops it)
-.PHONY: print-ec
+.PHONY: print-ec print-var
+# the value of a variable (tests/check_ci_groups.sh): make -s print-var VAR=TEST_GROUPS
+print-var:
+	@echo '$($(VAR))'
 print-ec:
 	@echo $(if $(EC_OBJ),ec,noec)
 
@@ -1500,7 +1579,10 @@ jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
 # tests/jepsen/rerun.sh with the next seed, twice at most; three in a row fail the gate with all three messages; a violation fails at once.
 # The reruns are printed as they happen and counted in the summary line at the end (never silent).
 JR = JEPSEN_RERUN_LOG=$(JEPSEN_DIR).reruns tests/jepsen/rerun.sh
+# `make jepsen` is the selftest and then the runs (jepsen-run: CI runs the two apart, and the event loops of IO apart: make jepsen-run IO=uring)
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so jepsen-selftest
+	@$(MAKE) jepsen-run
+jepsen-run: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
 	rm -f $(JEPSEN_DIR).reruns; trap 'tests/jepsen/rerun.sh --summary $(JEPSEN_DIR).reruns; rm -f $(JEPSEN_DIR).reruns' EXIT; \
 	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
 	    TSDBD_IO=$$io $(JR) ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
@@ -1591,7 +1673,15 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so 
 # jepsen.c. tests/test_crashfs_old.c (make test) holds the shim to what a disk may do: a rewritten or cut sector comes back as it was synced.
 # What passes on purpose is listed at the end of the comment of nemesis_check.
 # What each bound is set to, and the honest worst under load on tmpfs and disk, is in the comments of nemesis_check (jepsen.c).
-jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus
+# The selftest in five parts that CI runs on runners of their own (it took 97 minutes in one piece on 4 CPUs): the lines are those
+# that were one recipe, cut between two statements; `make jepsen-selftest` runs them in this order. Each needs $(B)/tsdb (the CLI
+# of mutant-crash.sh's login and feed cases): `make jepsen` had built it first, a part alone did not (round 3: the --auth and --feed cases failed).
+JEPSEN_SELFTEST_PARTS := jepsen-selftest-1 jepsen-selftest-2 jepsen-selftest-3 jepsen-selftest-4 jepsen-selftest-5
+.PHONY: $(JEPSEN_SELFTEST_PARTS) jepsen-run
+jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus
+	@$(MAKE) -j1 $(JEPSEN_SELFTEST_PARTS) && echo "jepsen-selftest: ok"
+$(JEPSEN_SELFTEST_PARTS): $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so $(B)/test_crashfs_bus
+jepsen-selftest-1:
 	@d=$$(mktemp -d $(JEPSEN_DIR)-bus.XXXXXX) || exit 1; \
 	    LD_PRELOAD=$(CURDIR)/$(B)/libcrashfs.so CRASHFS_ROOT=$$d CRASHFS_PROB=0 ./$(B)/test_crashfs_bus $$d; rc=$$?; rm -r $$d; \
 	    if [ $$rc -ne 99 ]; then \
@@ -1650,8 +1740,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    n=$$(echo "$$out" | sed -n 's/^jepsen none: .*; writes \([0-9]*\) ok .*reads \([0-9]*\) ok;.*/\1 \2/p' | awk '{print $$1+$$2}'); \
 	    if [ $$rc -ne 0 ] || [ -z "$$n" ] || [ "$$n" -gt 6000 ] || [ "$$n" -lt 400 ]; then \
 	        echo "jepsen-selftest: JEPSEN_OPS_PER_S=400 did not pace the clients ($$n writes and reads in 10 s, wanted 400 to 6000; rc $$rc)"; \
-	        echo "$$out" | tail -n 12; exit 1; fi; \
-	for spec in \
+	        echo "$$out" | tail -n 12; exit 1; fi;
+jepsen-selftest-2:
+	@for spec in \
 	    'kill@20@killnoeffect@-@the nemesis issued 0 faults in 20 s.*it was idle@a kill that kills nothing was counted as a fault' \
 	    'pause@10@pausenoeffect@-@the nemesis issued 0 faults in 10 s.*it was idle@a pause that stops nothing was counted as a fault' \
 	    'kill@20@slow:1500@-@the nemesis issued [0-9]* faults in 20 s.*it was idle@a kill nemesis at half the honest rate slipped past the floor' \
@@ -1680,8 +1771,9 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    shim=; case $$nem in power|eio) shim="--crashfs $(B)/libcrashfs.so";; esac; \
 	    tests/jepsen/expect.sh gate "$$pat" "$$what" env $$envs ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis $$nem --seconds $$secs \
 	        $$shim --mutant-nemesis $$mut || exit 1; \
-	done; \
-	tests/jepsen/expect.sh gate 'that the shim did not log are not faults' 'plugs that the shim made and did not log (counted as pulled)' \
+	done;
+jepsen-selftest-3:
+	@tests/jepsen/expect.sh gate 'that the shim did not log are not faults' 'plugs that the shim made and did not log (counted as pulled)' \
 	    env CRASHFS_IGNORE_USR2=2 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so || exit 1; \
 	tests/jepsen/expect.sh gate 'was idle' 'plugs that the shim ignored (counted as pulled)' \
 	    env CRASHFS_IGNORE_USR2=1 JEPSEN_PULL_PROB=0.0003 ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power --seconds 20 \
@@ -1723,11 +1815,13 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	    b=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/vola,151 2>&1); \
 	    c=$$(./$(B)/jepsen --scan-slow-probes $(JEPSEN_DIR)-selftest.scan.log,/d/volb,100 2>&1); \
 	    if [ "$$a" != 150.750 ] || [ "$$b" != 0.000 ] || [ "$$c" != 140.250 ]; then \
-	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi; \
-	    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
+	        echo "jepsen-selftest: the scan of slow write probes in a server log is wrong ($$a $$b $$c)"; exit 1; fi;
+jepsen-selftest-4:
+	@    tests/jepsen/mutant-latest.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a stale latest table went unnoticed"; exit 1; }; \
 	    tests/jepsen/mutant-loss.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: data loss beside a lazy nemesis was hidden behind INCONCLUSIVE or went unnoticed"; exit 1; }; \
-	    tests/jepsen/mutant-crash.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a server that dies by itself or stops answering was hidden behind INCONCLUSIVE, a rerun or a pass, or hung the harness"; exit 1; }; \
-	for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so' \
+	    tests/jepsen/mutant-crash.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a server that dies by itself or stops answering was hidden behind INCONCLUSIVE, a rerun or a pass, or hung the harness"; exit 1; };
+jepsen-selftest-5:
+	@for spec in 'kill@3@--nemesis kill --seconds 5' 'power@4@--nemesis power --seconds 8 --crashfs $(B)/libcrashfs.so' \
 	    'misdirect@3@--nemesis misdirect --seconds 8 --crashfs $(B)/libcrashfs.so' 'rot@3@--nemesis rot --seconds 8'; do \
 	    oldifs=$$IFS; IFS=@; set -- $$spec; IFS=$$oldifs; nem=$$1; at=$$2; args=$$3; \
 	    for dly in 0 400; do \
@@ -1764,8 +1858,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so $(B)/liboutagefs.so $
 	        echo "jepsen-selftest: the settle-steps nemesis fails a server that ends at its step with exit(99) (rc $$rc)"; \
 	        echo "$$out" | tail -n 20; exit 1; fi; \
 	    JEPSEN_REQUIRE_TIER=$(if $(strip $(JEPSEN_TIER)),1,0) tests/jepsen/mutant-settle.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a settle bug went unnoticed"; exit 1; }; \
-	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; }; \
-	    echo "jepsen-selftest: ok"
+	    tests/jepsen/mutant-slowprobe.sh $(JEPSEN_DIR)-selftest || { echo "jepsen-selftest: a domain that reports every probe slow went unnoticed"; exit 1; };
 
 # jepsen-cluster (tests/jepsen/jepsen_cluster.c, docs/design-cluster.md 13.2): 3-8 tsdbd with a proxy of the harness in
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
