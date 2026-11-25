@@ -2853,6 +2853,8 @@ int repld_close_end(uint32_t v, uint64_t *log_end)
     return 0;
 }
 
+/* repld_close_failed and repld_stop read G.vols without references: safe only because they run after cvol_stop, when
+ * the manager is joined and no repld_close_end can unlist and free a driver under them (b3c7024e frees drivers) */
 void repld_close_failed(void)
 {
     pthread_mutex_lock(&G.mu);

@@ -8230,9 +8230,12 @@ static void scen_snapcatch(void)
     /* without the driver's check the copy reaches the install, which closes the volume and then refuses a P below
      * the commit floor (snap_install's D6 check); a P between the floor and the log end it would install */
     int floor_refused = log_count(s.R, "is below this replica's commit floor");
+    /* R may have installed twice before it joined the ISR: with repl_retain_s 2 a slow install finds the leader past
+     * its copy's P and asks again, before it is in the ISR. Only installs after the ask count. */
+    int installs = log_count(s.R, "snapshot installed: P");
     t0 = now_ms();
     while (!log_has(s.R, "is stale and not installed")) {
-        if (log_count(s.R, "snapshot installed: P") != 1)
+        if (log_count(s.R, "snapshot installed: P") != installs)
             die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
         if (log_count(s.R, "is below this replica's commit floor") != floor_refused)
             die("a replica in the ISR took a copy at or below its log end to the install (its volume closed for it)");
