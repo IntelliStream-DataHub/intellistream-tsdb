@@ -7,25 +7,33 @@
  *  - Setup: every node gets two chunk stores (`tsdb chunk-store init PATH --cluster UUID --node ID`) once the cluster has
  *    member ids, and is restarted with --chunk-dir for both, --metrics-port auto and --ec-settle-grace-s 3 (and
  *    --ec-experimental when this tsdbd has it: `ec_experimental`, found from its --help). kvr is then added with
- *    VOLUME_ADD_EC (m = 2, so 3 replicas as in every kv run), and the workloads of kv, kv-via and classes run on it
- *    unchanged: their keys are back-dated (KV_BASE_TS is in 2023), so their partition ended long before the grace and
- *    settles while the writers go on with late rows into it; the filler's large inserts land a day later and become
- *    the young parts above the settled object (E6). Settles are whole keys (D21).
+ *    VOLUME_ADD_EC (m = 2, so 3 replicas as in every kv run), and the workloads of kv, kv-via and classes run on it:
+ *    their keys are back-dated (KV_BASE_TS is in 2023), so their partition ended long before the grace and settles while
+ *    the writers go on with late rows into it, and (--ec only) a third of the single-key writes are replaces of that key
+ *    (a tombstone and a row in one commit: the young part with a tombstone above a settled object, E6); the filler's
+ *    large inserts land a day later and become further young parts. Settles are whole keys (D21). Not built: a delete
+ *    aimed at a key (the model of check_hist has no "key is gone again") and large inserts that cover keys.
+ *    D15: io_uring only on the first two nodes of a run, epoll on the rest (start_node).
  *  - Check E1, divergence: in a run without rot or disk loss (`ec_damaged`) no volume may be DIVERGED (`tsdb_volume_diverged`
- *    on every node's /metrics, polled about once a second and at the end) or stopped on its node (a "volume N: stopped:"
- *    line of a node's log, which is what LOCAL_FAULT in the heartbeat is made of). A leader whose digest or cut is wrong
+ *    on every node's /metrics, polled about once a second by a thread of its own and at the end; the text is read line by
+ *    line) or stopped on its node (a "volume N: stopped:"
+ *    line of a node's log for kvr's number, counted once at the end: a proxy for LOCAL_FAULT in the heartbeat, which is
+ *    not polled (STATUS); the stop of another volume is not seen, and a log a power loss cut loses its line). A leader whose digest or cut is wrong
  *    tends to end as a DIVERGED replica while its own answers stay right: a checker that only counts lost writes passes it.
  *  - Check E2, settles: after the run the replicas hold `.ec` parts (counted in the replica directories, with the parts
  *    per partition). A run with none fails when this tsdbd settles at all (`ec_experimental`).
  *  - Check E3, every member: after the final read leadership moves to each ISR member in turn (VOLUME_TRANSFER, as churn
  *    does) and every key is read again through it: the answers must equal the final read. A member that settled
- *    differently, or one whose cut or Y is wrong, answers otherwise.
- *  - Nemeses: partial (a replica of kvr cut from the metadata group's Raft leader alone: the data links of kvr's leader
- *    to it stay, the metadata path is gone), diskloss (a node's chunk stores removed and made again empty with its
+ *    differently, or one whose cut or Y is wrong, answers otherwise. A transfer that did not land within 30 s fails (reads
+ *    through a member that does not lead are forwarded to the leader and would equal the final read by construction).
+ *  - Nemeses: partial (the metadata group's Raft leader cut from the stripe members of kvr but kvr's leader, whose links
+ *    to the stripe stay; the proxy cuts every kind of link between two nodes; net_cut_done: the heal checks the cut held), diskloss (a node's chunk stores removed and made again empty with its
  *    cluster and node: the node comes back with no chunk), rot (bytes flipped in a chunk file at rest; needs a tsdbd that
  *    settles). The last two excuse E1.
  *  - Mutants of the harness (--mutant, each must fail, `make jepsen-cluster-selftest`): ec-diverged (a poll that finds a
- *    volume DIVERGED), ec-member-differs (one member's answer has a key changed), ec-nosettle (the part count is 0).
+ *    volume DIVERGED: tsdbd's own plant, TSDB_REPLD_TEST=plantdiverge and a diverge.N file in a replica's directory, so
+ *    the fetch, the parse and the log count are tried against the real thing), ec-member-differs (one member's answer has a key changed), ec-notransfer (no
+ *    transfer is made: a read through a member that never led must not count), ec-nosettle (the part count is 0).
  *    The server's own (ycold, ecabovey: r8h; cutnogate: r8g) are TSDB_REPLD_MUTANT in the tsdbd that runs: the Makefile
  *    runs them when the binary has the name.
  */
@@ -34,10 +42,15 @@
 
 static uint8_t ec_uuid[16];
 static int ec_damaged;              /* a rot or disk loss happened: DIVERGED is then allowed (reported, not failed) */
-static unsigned ec_polls, ec_div_polls, ec_stopped_lines;
-static unsigned ec_rots, ec_diskloss, ec_partials, ec_member_reads, ec_member_bad;
+static _Atomic unsigned ec_polls, ec_div_polls, ec_poll_errs; /* written by the poller thread, read after its join */
+static unsigned ec_stopped_lines;
+static unsigned ec_transfers, ec_rots, ec_diskloss, ec_partials, ec_member_reads, ec_member_bad;
+static _Atomic int ec_poll_run;
+static pthread_t ec_poll_th;
+static int ec_poll_started;
 static int ec_ec_parts = -1, ec_partitions_max;
 static char ec_div_msg[256];
+static void ec_poller_start(void);
 
 /* does the tsdbd under test settle ec volumes (it takes --ec-experimental)? */
 static void ec_detect(void)
@@ -90,7 +103,7 @@ static void ec_form_stores(void)
 {
     struct view v;
     if (view_get(0, &v, 5000) != 0)
-        die(1, "ec: no STATUS of node 0 for the cluster's uuid");
+        die(2, "ec: no STATUS of node 0 for the cluster's uuid");
     memcpy(ec_uuid, v.m.uuid, sizeof ec_uuid);
     view_free(&v);
     for (int i = 0; i < nn; i++) {
@@ -101,6 +114,7 @@ static void ec_form_stores(void)
         restart_node(i);
         settle("a chunk store");
     }
+    ec_poller_start();
 }
 
 /* kvr as VOLUME_ADD_EC: replicas 0 is m + 1; the add is refused (FEW) until the members report their stores */
@@ -119,8 +133,10 @@ static void ec_add_kvr(void)
     die(1, "volume add kvr ec=%d+%d: %s", want_ec_k, want_ec_m, cluster_strerror(rc));
 }
 
-/* GET /metrics of a node into b (0 on success) */
-static int ec_http_get(int port, char *b, size_t bn)
+/* GET /metrics of a node, read line by line (the text of a node with many volumes is long, and the diverged family is
+ * printed late: nothing is cut off by a buffer). 1: a "tsdb_volume_diverged{...} 1" line, 0: none, -1: no answer. A line
+ * longer than the buffer is skipped to its end (no metric line is that long). */
+static int ec_poll_node(int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
@@ -131,54 +147,108 @@ static int ec_http_get(int port, char *b, size_t bn)
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     static const char rq[] = "GET /metrics HTTP/1.0\r\n\r\n";
-    size_t n = 0;
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0 || write(fd, rq, sizeof rq - 1) != (ssize_t)(sizeof rq - 1)) {
         close(fd);
         return -1;
     }
-    for (ssize_t r; n + 1 < bn && (r = read(fd, b + n, bn - 1 - n)) > 0;)
-        n += (size_t)r;
-    close(fd);
-    b[n] = 0;
-    return n > 0 ? 0 : -1;
-}
-
-/* a "tsdb_volume_diverged{...} 1" line in a node's metrics text */
-static int ec_text_diverged(const char *b)
-{
-    for (const char *p = b; (p = strstr(p, "tsdb_volume_diverged{")); p++) {
-        const char *e = strchr(p, '\n');
-        if (e && e - p >= 2 && e[-1] == '1' && e[-2] == ' ')
-            return 1;
+    char chunk[4096], line[512];
+    size_t ln = 0;
+    int skipping = 0, got = 0, div = 0;
+    for (ssize_t r; (r = read(fd, chunk, sizeof chunk)) > 0;) {
+        got = 1;
+        for (ssize_t k = 0; k < r; k++) {
+            if (chunk[k] != '\n') {
+                if (ln + 1 < sizeof line)
+                    line[ln++] = chunk[k];
+                else
+                    skipping = 1;
+                continue;
+            }
+            line[ln] = 0;
+            if (!skipping && !strncmp(line, "tsdb_volume_diverged{", 21) && ln >= 2 && line[ln - 1] == '1' && line[ln - 2] == ' ')
+                div = 1;
+            ln = 0;
+            skipping = 0;
+        }
     }
-    return 0;
+    close(fd);
+    return got ? div : -1;
 }
 
 static void ec_poll(void)
 {
-    static char b[1 << 18];
     for (int i = 0; i < nn; i++) {
         pid_t pid;
+        int port;
         node_snap(i, &pid, NULL, NULL);
-        if (pid <= 0 || node_paused(i) || nodes[i].mport <= 0)
+        pthread_mutex_lock(&tbl_mu);
+        port = nodes[i].mport;
+        pthread_mutex_unlock(&tbl_mu);
+        if (pid <= 0 || node_paused(i) || port <= 0)
             continue;
-        ec_polls++;
-        int bad = ec_http_get(nodes[i].mport, b, sizeof b) == 0 && ec_text_diverged(b);
-        if (!strcmp(mutant, "ec-diverged") && ec_polls == 20) /* planted: a poll that finds a DIVERGED volume */
-            bad = 1;
-        if (bad && !ec_div_polls++)
+        atomic_fetch_add(&ec_polls, 1);
+        int d = ec_poll_node(port);
+        if (d < 0)
+            atomic_fetch_add(&ec_poll_errs, 1); /* a node going down or starting: no answer is no verdict */
+        if (d > 0 && atomic_fetch_add(&ec_div_polls, 1) == 0)
             snprintf(ec_div_msg, sizeof ec_div_msg, "node %d reports a volume DIVERGED (tsdb_volume_diverged 1)", i);
     }
 }
 
-/* once a second at most, from hold_ms (the control thread) */
-static void ec_tick(void)
+/* --mutant ec-diverged: tsdbd's own plant (TSDB_REPLD_TEST=plantdiverge, set for every node in main) on a replica of kvr,
+ * once the run has been going for ten polls: the volume writes the DIVERGED file a failed digest writes, stops and is rebuilt
+ * by a snapshot (D8). It proves the metrics fetch and parse and the node-log count against the real thing. */
+static int ec_plant(void)
 {
-    static int64_t last;
-    if (!want_ec_k || now_ms() - last < 1000)
+    struct rrec r;
+    if (rep_rec_get(&r) != 0 || r.leader < 0)
+        return 0;
+    for (int k = 0; k < r.nrep; k++)
+        if (r.node[k] >= 0 && r.node[k] != r.leader) {
+            char f[PATH_MAX + 64];
+            snprintf(f, sizeof f, "%s/diverge.%" PRIu32, nodes[r.node[k]].dir, (uint32_t)rep_number);
+            int fd = open(f, O_WRONLY | O_CREAT, 0644);
+            if (fd >= 0)
+                close(fd);
+            return fd >= 0;
+        }
+    return 0;
+}
+
+/* about once a second, a thread of its own: a node whose metrics thread is slow (a stalled disk, a restart) costs its own
+ * 1 s timeouts here and never stretches a nemesis' hold or the check for a server that exited */
+static void *ec_poller(void *arg)
+{
+    (void)arg;
+    int planted = 0;
+    while (atomic_load(&ec_poll_run)) {
+        int64_t t0 = now_ms();
+        ec_poll();
+        if (!planted && !strcmp(mutant, "ec-diverged") && atomic_load(&ec_polls) >= 10 * (unsigned)nn)
+            planted = ec_plant();
+        while (atomic_load(&ec_poll_run) && now_ms() - t0 < 1000)
+            usleep(50000);
+    }
+    return NULL;
+}
+
+static void ec_poller_start(void)
+{
+    if (ec_poll_started)
         return;
-    last = now_ms();
-    ec_poll();
+    ec_poll_started = 1;
+    atomic_store(&ec_poll_run, 1);
+    if (pthread_create(&ec_poll_th, NULL, ec_poller, NULL) != 0)
+        die(2, "ec: no thread for the metrics poll");
+}
+
+static void ec_poller_stop(void)
+{
+    if (!ec_poll_started)
+        return;
+    atomic_store(&ec_poll_run, 0);
+    pthread_join(ec_poll_th, NULL);
+    ec_poll_started = 0;
 }
 
 /* "volume N: stopped:" in a node's log: the volume failed there (what the heartbeat calls LOCAL_FAULT) */
@@ -200,6 +270,7 @@ static unsigned ec_log_stops(void)
 /* E1 (and the final poll), after the last heal. Returns the number of failures. */
 static int ec_div_check(void)
 {
+    ec_poller_stop();
     ec_poll();
     ec_stopped_lines = ec_log_stops();
     int bad = 0;
@@ -234,16 +305,26 @@ static int ec_members_check(void)
         if (r.leader != to) {
             uint8_t body[16];
             size_t bl = cluster_volume_force_encode(rep_number, r.id[k], body);
-            int rc = admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000);
+            int rc = !strcmp(mutant, "ec-notransfer") ? 0 /* planted: none is made */
+                                                      : admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000);
             if (rc != 0) {
                 fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr was not moved to node %d for its read: %s\n", to,
                         cluster_strerror(rc));
                 bad++;
                 continue;
             }
+            /* tsdbd forwards by default: a read through a member that does not lead is answered by the leader, so a
+             * transfer that did not land would make this check read the old leader and pass by construction */
             int64_t t0 = now_ms();
-            while (now_ms() - t0 < 30000 && !churn_landed_check(to))
+            while (now_ms() - t0 < 30000 && atomic_load(&kv_leader) != to)
                 usleep(200000);
+            if (atomic_load(&kv_leader) != to) {
+                fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr did not move to node %d within 30 s of its transfer: its "
+                        "reads would be the old leader's\n", to);
+                bad++;
+                continue;
+            }
+            ec_transfers++;
         }
         for (int hi = 0; hi < nhists; hi++) {
             struct rd rd;
@@ -287,8 +368,8 @@ static int ec_parts_check(const char *const *dirs, int nd)
         DIR *dp = opendir(dirs[d]);
         if (!dp)
             continue;
-        long keys[256];
-        int cnt[256], nk = 0;
+        long *keys = NULL;
+        int *cnt = NULL, nk = 0, kcap = 0;
         for (struct dirent *e; (e = readdir(dp));) {
             size_t l = strlen(e->d_name);
             int is_ec = l > 3 && !strcmp(e->d_name + l - 3, ".ec"), is_part = l > 5 && !strcmp(e->d_name + l - 5, ".part");
@@ -300,14 +381,25 @@ static int ec_parts_check(const char *const *dirs, int nd)
             int j = 0;
             while (j < nk && keys[j] != key)
                 j++;
-            if (j == nk && nk < 256) {
+            if (j == nk) {
+                if (nk == kcap) {
+                    kcap = kcap ? 2 * kcap : 64;
+                    long *nkeys = realloc(keys, (size_t)kcap * sizeof *keys);
+                    int *ncnt = realloc(cnt, (size_t)kcap * sizeof *cnt);
+                    if (!nkeys || !ncnt)
+                        die(2, "ec: out of memory counting parts");
+                    keys = nkeys;
+                    cnt = ncnt;
+                }
                 keys[nk] = key;
                 cnt[nk++] = 0;
             }
-            if (j < nk && ++cnt[j] > per_max)
+            if (++cnt[j] > per_max)
                 per_max = cnt[j];
         }
         closedir(dp);
+        free(keys);
+        free(cnt);
     }
     if (!strcmp(mutant, "ec-nosettle")) /* planted: nothing settled */
         nec = 0;
@@ -323,18 +415,47 @@ static int ec_parts_check(const char *const *dirs, int nd)
 
 /* ---- nemeses */
 
-/* partial: a replica of kvr (not its leader) cut from the Raft leader alone, for a few seconds; kvr's own links stay */
+/* partial: the Raft leader of the metadata group cut from every stripe member of kvr but kvr's own leader: the leader
+ * keeps its links to the stripe (writes, chunk puts and gets go on) and the members lose the metadata path, the one a
+ * member needs for an epoch, a digest's answer or a heartbeat. The harness' proxy cuts a whole peer connection pair, so
+ * every kind of link between the cut nodes goes, not the metadata one alone (design 10.3's "stripe members to metadata
+ * down" as far as a proxy can make it); when the Raft leader is kvr's leader itself, one other replica is cut from it
+ * instead. net_cut_done takes the byte counts the heal checks: a round whose rules do not apply fails like a partition's. */
 static void nem_partial(void)
 {
-    int l = atomic_load(&last_leader), kl = atomic_load(&kv_leader), x = -1;
+    int l = atomic_load(&last_leader), kl = atomic_load(&kv_leader), cut = 0;
+    struct rrec r;
     if (l < 0 || l >= nn)
         l = rnd_range(0, nn - 1);
     ju_fault(-1);
-    for (int tries = 0; tries < 20 && (x < 0 || x == l || x == kl); tries++)
-        x = rnd_range(0, nn - 1);
-    if (x == l || x == kl)
-        x = (l + 1) % nn == kl ? (l + 2) % nn : (l + 1) % nn;
-    net_cut(l, x, 1);
+    if (rep_rec_get(&r) == 0) {
+        if (r.leader >= 0)
+            kl = r.leader;
+        int first = -1;
+        for (int k = 0; k < r.nrep; k++) {
+            int x = r.node[k];
+            if (x < 0 || x >= nn || x == l || x == kl)
+                continue;
+            if (l == kl) { /* the Raft leader leads kvr: one other replica only */
+                if (first < 0 || rnd() % 2)
+                    first = x;
+                continue;
+            }
+            net_cut(l, x, 1);
+            cut++;
+        }
+        if (l == kl && first >= 0) {
+            net_cut(l, first, 1);
+            cut++;
+        }
+    }
+    if (!cut) { /* no replica to aim at (kvr not whole): any other node */
+        int x = rnd_range(0, nn - 1);
+        if (x == l)
+            x = (l + 1) % nn;
+        net_cut(l, x, 1);
+    }
+    net_cut_done();
     ec_partials++;
     effect_seen = 1;
     hold_ms(rnd_range(3000, 8000));
@@ -388,8 +509,10 @@ static void nem_rot(void)
         return; /* no chunk yet: the round has no effect and the run says so */
     struct stat sb;
     int fd = open(path, O_RDWR);
+    if (fd < 0 && errno == ENOENT) /* a chunk file is always a new inode: a heal or a gc took it between the find and here */
+        return;
     if (fd < 0 || fstat(fd, &sb) != 0)
-        die(1, "ec: rot: cannot open %s: %s", path, strerror(errno));
+        die(2, "ec: rot: cannot open %s: %s", path, strerror(errno)); /* the harness' own error, never a VIOLATION (1) */
     int flips = rnd_range(1, 8);
     for (int k = 0; k < flips; k++) {
         off_t off = (off_t)(rnd() % (uint64_t)sb.st_size);
@@ -398,7 +521,7 @@ static void nem_rot(void)
             continue;
         b ^= (uint8_t)(1u << (rnd() % 8));
         if (pwrite(fd, &b, 1, off) != 1)
-            die(1, "ec: rot: write to %s: %s", path, strerror(errno));
+            die(2, "ec: rot: write to %s: %s", path, strerror(errno));
     }
     close(fd);
     ec_rots++;
@@ -416,7 +539,7 @@ static void nem_diskloss(void)
     for (int k = 0; k < 2; k++) {
         rmtree(nodes[i].chunk[k]);
         if (mkdir(nodes[i].chunk[k], 0755) != 0)
-            die(1, "ec: diskloss: mkdir %s: %s", nodes[i].chunk[k], strerror(errno));
+            die(2, "ec: diskloss: mkdir %s: %s", nodes[i].chunk[k], strerror(errno));
         ec_chunk_init(nodes[i].chunk[k], atomic_load(&nodes[i].id));
     }
     ec_diskloss++;
@@ -430,11 +553,11 @@ static void ec_summary(void)
 {
     if (!want_ec_k)
         return;
-    printf("ec %d+%d: %s; %u polls of /metrics (%u DIVERGED), %u node-log stop line(s); .ec parts on the replicas: %d, most "
-           "parts of one partition on a replica: %d; per-member reads %u (%u differing); partial %u, diskloss %u, rot %u\n",
+    printf("ec %d+%d: %s; %u polls of /metrics (%u DIVERGED, %u without an answer), %u node-log stop line(s); .ec parts on the replicas: %d, most "
+           "parts of one partition on a replica: %d; per-member reads %u through %u transfers (%u differing); kv replaces %" PRIu64 "; partial %u, diskloss %u, rot %u\n",
            want_ec_k, want_ec_m, ec_experimental ? "tsdbd settles (--ec-experimental)" : "tsdbd does not settle yet",
-           ec_polls, ec_div_polls, ec_stopped_lines, ec_ec_parts, ec_partitions_max, ec_member_reads, ec_member_bad,
-           ec_partials, ec_diskloss, ec_rots);
+           ec_polls, ec_div_polls, ec_poll_errs, ec_stopped_lines, ec_ec_parts, ec_partitions_max, ec_member_reads, ec_transfers, ec_member_bad,
+           (uint64_t)atomic_load(&ec_replaces), ec_partials, ec_diskloss, ec_rots);
 }
 
 #endif

@@ -184,8 +184,8 @@ static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users
 static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the cuts leave in step stop being exempt */
 static void ju_settled(void);
 static struct meta_settings S;
+static _Atomic uint64_t ec_replaces; /* --ec: the kv writers' replaces of one key (cluster_ec.h) */
 static int ec_experimental; /* the tsdbd under test has --ec-experimental (the leader's settle of an ec volume is built) */
-static void ec_tick(void);  /* cluster_ec.h: the divergence poll, from hold_ms */
 static void ec_add_kvr(void);
 static void rmtree(const char *path);
 
@@ -738,7 +738,10 @@ static int start_node(int i, const char *crash_at, int *status)
             argv[na++] = n->chunk[k];
         }
     }
-    if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
+    if (want_ec_k && (n - nodes) >= 2) { /* D15: io_uring on at most two nodes of an --ec run (8 MB memlock per user), epoll on the rest */
+        argv[na++] = "--io";
+        argv[na++] = "epoll";
+    } else if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
         snprintf(io, sizeof io, "%s", getenv("TSDBD_IO"));
         argv[na++] = "--io";
         argv[na++] = io;
@@ -1559,7 +1562,16 @@ static void *kv_writer(void *arg)
             val[k] = (float)id;
         }
         int lead0 = atomic_load(&kv_leader);
-        int rc = tsdbc_insert_series(c, sid, ts, val, (size_t)nk);
+        int rc;
+        if (want_ec_k && nk == 1 && mix(r += 1) % 3 == 0) {
+            /* --ec: a replace of the key's one row (a tombstone of [ts, ts + 1) and the row in one commit): into a settled
+             * key it is a young part with a tombstone above the object (design-cluster-data.md E6, the read path of R8 that
+             * is the easiest to get wrong); as a write of one key it fits the model of an insert */
+            tsdb_values tv = {TSDB_FLOAT32, val, NULL};
+            rc = tsdbc_replace_range(c, sid, ts[0], ts[0] + 1, ts, &tv, 1);
+            atomic_fetch_add(&ec_replaces, 1);
+        } else
+            rc = tsdbc_insert_series(c, sid, ts, val, (size_t)nk);
         if (rc == 0) {
             hist_end(h, id, WS_OK);
             atomic_fetch_add(&kv_ok, 1);
@@ -2715,7 +2727,6 @@ static void hold_ms(int ms)
 {
     for (int t = 0; t < ms; t += 100) {
         check_unexpected_exits();
-        ec_tick();
         usleep(100000);
     }
 }
@@ -4276,6 +4287,8 @@ int main(int argc, char **argv)
     }
     if (want_ec_k) {
         ec_detect();
+        if (!strcmp(mutant, "ec-diverged")) /* the plant of the server: a replica turns DIVERGED (cluster_ec.h ec_plant) */
+            setenv("TSDB_REPLD_TEST", "plantdiverge", 1);
         if (!want_rep || want_kv) {
             fprintf(stderr, "jepsen-cluster: --ec needs the workload kv, kv-via or classes (and not kv-local)\n");
             return 2;
@@ -4574,7 +4587,7 @@ int main(int argc, char **argv)
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = 7;
     if (want_ec_k)
-        rdiff += ec_div_check();
+        r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
     /* a clean stop of every node: SIGTERM, status 0 */
     int unclean = 0;
     for (int i = 0; i < nn; i++) {
