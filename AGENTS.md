@@ -65,16 +65,16 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
                           # picks the run's terminal crash point, failover points included; JEPSEN_TRACE=1 stamps the nemesis's
                           # actions and kvr's leader changes in ms and details the first stale reads)
-                          # R4's nemeses (header of jepsen_cluster.c; the one a track has not put on main is refused with a line, exit 2,
-                          # `jepsen_cluster --built-nemeses` lists the others, JEPSEN_R4_TRY=1 runs it anyway): kill2 (two servers at
+                          # R4's nemeses (header of jepsen_cluster.c; all five are built: one whose `built` flag is 0 is refused with a line,
+                          # exit 2, `jepsen_cluster --built-nemeses` lists what runs, JEPSEN_R4_TRY=1 runs it anyway): kill2 (two servers at
                           # once; the first round and half the others take two of kvr's replicas), slow (outagefs `slow MS` on one
                           # node's data root, `--outagefs build/liboutagefs.so`: fd calls only, not mmap faults), longdown (a replica
                           # down past repl_retain_s, `--retain-s S`, 3 s: it must take a snapshot, seen as another inode of its v<N>;
-                          # a run in which none did fails), rebuild (v<N> removed, the server must refuse it, `replica reset`), churn
+                          # a run in which none did fails; the selftest plants `snapdroppart`, a snapshot that leaves a part out), rebuild (v<N> removed, the server must refuse it, `replica reset`), churn
                           # (`volume transfer` and `volume move --log`); the end checks compare the members of the final record, want no
                           # learner and no v<N>.snap, v<N>.old, v<N>.removed-* or snap_* on any node. make jepsen-cluster runs them
                           # after the others on kv and classes (JEPSEN_R4_WORKLOADS, JEPSEN_R4_NEMESES, `none` leaves them out): IO x 2 x
-                          # the built ones more runs of JEPSEN_SECONDS)
+                          # the built ones more runs of JEPSEN_SECONDS: 20 runs, about 100 min at 300 s)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec

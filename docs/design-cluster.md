@@ -1557,10 +1557,13 @@ no containers needed). Workloads `kv` and `classes`, as today, through clients i
 *Built in R4 (r4-jepsen, `tests/jepsen/jepsen_cluster.c`).* `kill2` (the first round and half the others take two of the
 kv volume's replicas), `slow` (the outagefs shim's `slow MS` on one node's data root, 5 to 30 s) and `churn` run in
 `make jepsen-cluster` after the other nemeses (`JEPSEN_R4_NEMESES`, `JEPSEN_R4_WORKLOADS`; `none` leaves them out).
-`longdown` and `rebuild` are written and have their selftest mutants (docs/tasks/r4-nemeses.md owns running them whole), but each is **refused with a line until its
-`built` flag in the harness table is flipped**: the flag was set for the tracks that were on main when r4-jepsen merged,
-and these two have not been run whole against the merged R4 (`jepsen_cluster --built-nemeses` lists what runs, `JEPSEN_R4_TRY=1`
-runs the others). At the end of every run with a replicated kv volume the members of the final record are the replicas
+`longdown` and `rebuild` are built too (r4-nemeses: run whole against the merged R4, on kv and classes, both IO backends, several
+seeds; `jepsen_cluster --built-nemeses` lists all five, and a nemesis whose `built` flag is 0 would be refused with a line, `JEPSEN_R4_TRY=1`
+runs it anyway). Their selftest plants `snapdroppart` (a leader's snapshot that lists one part fewer, `TSDB_REPLD_MUTANT`
+in tsdbd; `test_snapshot --mutant snapdroppart` too), which the final comparison of the replicas must catch under each. A
+longdown or rebuild round takes about 15 s, so such a run expects a fault per 25 s, not per 10. Evidence (2026-11-25): 16 runs of 300 s
+(longdown and rebuild on kv and classes; two lanes on io_uring, two on epoll; seeds 101-104, 201-204, 301-304, 401-404) all valid, 16-18 of
+17-18 longdown runs took a snapshot and 23-26 rebuilds each ran whole; `make jepsen-cluster-selftest` ok. At the end of every run with a replicated kv volume the members of the final record are the replicas
 compared, none is a learner and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or `snap_*` is left on any node. R4's crash
 points are terminal points of kv and classes runs: `snap-received`, `snap-swapped`, `snap-halfswap`, `set-removed`,
 `transfer-ready`, `move-added`, `move-shrunk` (`server/crashpt.h`). `classes` runs with the default retention caps
@@ -1606,7 +1609,7 @@ start apart from the log start, and `kill2`, `slow`, `churn` in the cluster gate
 and its triggers, `node drain` and `out`, rebuilding a lost server's replicas elsewhere, the balancer, §8.4's priorities, the
 receive-side rate limit, file reuse in a snapshot, §8.5's first bullet. Left to R8: stripe positions and `.ec` parts in a
 snapshot. Left to R14: rebuild progress in `cluster status`, live changes of the settings. The gate's `longdown` and
-`rebuild` nemeses are not yet run whole (13.2).
+`rebuild` nemeses run (13.2).
 
 About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, which brings it to about 5 months.
 

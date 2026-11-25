@@ -1710,7 +1710,7 @@ JEPSEN_VIA_NEMESES ?= fwdstall
 # (`jepsen_cluster --built-nemeses`; an unbuilt one is refused, never skipped silently when named), each on kv and classes
 # (kvr moves under churn; classes at the default caps once r4-replay is on main). JEPSEN_R4_NEMESES names others;
 # JEPSEN_R4_NEMESES=none leaves them out. They add runs: IO x JEPSEN_R4_WORKLOADS (2) x the built nemeses, each
-# JEPSEN_SECONDS (>= 40 min at 300 s with two built, 20 runs and about 100 min with all five).
+# JEPSEN_SECONDS (20 runs and about 100 min at 300 s with all five built).
 # JEPSEN_R4_TRY=1 runs the unbuilt ones too. longdown runs with repl_retain_s 3 (--retain-s S for another age).
 JEPSEN_R4_WORKLOADS ?= meta,kv meta,classes
 jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)/liboutagefs.so
