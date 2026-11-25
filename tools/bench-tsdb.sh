@@ -403,6 +403,11 @@ build() {
     MAKE_ENV=(env "${mk[@]}")
     rm -rf -- "${ROOT:?}/$B"
     if [ $PORTABLE = 1 ]; then
+        # make dist stops without rdma-core's headers (the release carries the verbs transport); no benchmark here
+        # uses the peer links, so a machine without them measures a tarball for TCP only
+        if ! echo 'int x;' | "${CC:-cc}" -include infiniband/verbs.h -E -x c - >/dev/null 2>&1; then
+            NOURING_MAKE+=(NO_RDMA=1)
+        fi
         what="make -j$JOBS dist DIST_B=$B${NOURING_MAKE[*]:+ ${NOURING_MAKE[*]}}"
         log "building the portable release build from scratch: $what ..."
         "${MAKE_ENV[@]}" make -j"$JOBS" dist DIST_B="$B" ${NOURING_MAKE[@]+"${NOURING_MAKE[@]}"} >"$RAW/build.log" 2>&1

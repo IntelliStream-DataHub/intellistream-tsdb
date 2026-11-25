@@ -17,7 +17,8 @@ make test-clients           # Rust, Python and Java clients (needs cargo, python
 
 The Makefile sees Darwin by itself. It then builds with `-mcpu=native` on Apple silicon, takes zstd from
 `brew --prefix zstd`, makes `libtsdb.dylib` instead of `libtsdb.so`, and builds `tsdbd` without io_uring (as if you
-had typed `NO_URING=1`). zstd somewhere else: `make ZSTD_LIB="-L/path/lib -lzstd" CFLAGS="-O3 -g -I/path/include"`.
+had typed `NO_URING=1`) and without the InfiniBand verbs transport of the peer links (as `NO_RDMA=1`: a cluster member on
+a Mac talks TCP only, docs/design-rdma.md). zstd somewhere else: `make ZSTD_LIB="-L/path/lib -lzstd" CFLAGS="-O3 -g -I/path/include"`.
 
 The shell's default limit of open files is 256. Raise it before you run a server with many connections, or a program
 with dozens of volumes: `ulimit -n 10240` (`tsdbd` raises its own limit as far as the kernel lets it).
@@ -42,6 +43,7 @@ read and write everything, so keep it on 127.0.0.1).
 | `tsdbd` wake-ups, timer | eventfd, timerfd | a pipe, a kqueue timer |
 | aggregation kernels | AVX-512 / AVX2 / SSE, chosen at startup | Apple silicon: scalar; Intel Macs: as Linux (untried) |
 | `make dist` CPU levels | yes | no (one build for the machine) |
+| peer links over InfiniBand verbs | where rdma-core's headers are at build time (`server/plrdma.c`) | no: TCP only (`NO_RDMA=1`) |
 | bytes on disk | | the same: a database moves between the two |
 | durability | `fsync`, `fdatasync` | the same, then `fcntl(F_FULLFSYNC)` (see below) |
 | thread stacks | 8 MB | set to 8 MB (`tsdb_thread_create`); macOS gives 512 KB |
