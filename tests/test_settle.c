@@ -1811,6 +1811,25 @@ static int child_gcpower(const where *w)
     return 6; /* the hooks never returned here */
 }
 
+/* gcp_swap_hook holds dir_sync_lock (a leaf of the engine's lock order) while the swap goes on to take latest_rw: the
+ * test's own way of keeping the drop's directory sync after its renames from running before the power cut. The drop
+ * took dir_sync_lock under latest_rw earlier, so ThreadSanitizer sees a cycle that the engine never makes (and the
+ * child exits 66, its report lost to /dev/null). Only that report is suppressed, for these children, by the hook's
+ * name in the stack; every other report still fails them. */
+static void gcp_tsan_env(const char *dir, char *saved, size_t n)
+{
+    const char *cur = getenv("TSAN_OPTIONS");
+    snprintf(saved, n, "%s", cur ? cur : "");
+    char supp[PATH_MAX], opts[PATH_MAX + 1024];
+    snprintf(supp, sizeof supp, "%s.gcpower-tsan-supp", dir); /* beside the base copy, inside no database */
+    FILE *f = fopen(supp, "w");
+    if (!f || fputs("deadlock:gcp_swap_hook\n", f) < 0 || fclose(f) != 0)
+        fprintf(stderr, "FAIL gcpower: cannot write %s\n", supp), exit(1);
+    if (snprintf(opts, sizeof opts, "%s%ssuppressions=%s", saved, saved[0] ? " " : "", supp) >= (int)sizeof opts)
+        fprintf(stderr, "FAIL gcpower: TSAN_OPTIONS too long\n"), exit(1);
+    setenv("TSAN_OPTIONS", opts, 1);
+}
+
 static void gcpower_case(void)
 {
     if (access(SHIM, R_OK) != 0) {
@@ -1829,9 +1848,15 @@ static void gcpower_case(void)
         copy_base("gcpower", &w);
         setenv("TSDB_TEST_SETTLE_CHILD", "gcpower", 1);
         setenv("TSDB_TEST_GCPOWER", v, 1);
+        char tsan_saved[1024];
+        gcp_tsan_env(BASE.root, tsan_saved, sizeof tsan_saved);
         no_tear = seed == 1; /* every unsynced name change lost: the intent finds all it names and rolls forward */
         int code = run_child(&w, NULL, 1000000000, seed);
         no_tear = false;
+        if (tsan_saved[0])
+            setenv("TSAN_OPTIONS", tsan_saved, 1);
+        else
+            unsetenv("TSAN_OPTIONS");
         unsetenv("TSDB_TEST_SETTLE_CHILD");
         unsetenv("TSDB_TEST_GCPOWER");
         if (code != 99)
