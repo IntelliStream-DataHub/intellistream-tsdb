@@ -1008,6 +1008,7 @@ lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 # r8f: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail test_cluster
 # ecbasic (nosumcmp only test_chunkpeer: a member that answers another sum needs its fake transport)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "chunkpeer-mutants: this build has no erasure codec (NO_EC=1): ecbasic skips, nothing to plant"; false)
 	$(MUT) --name ecbasic --list "ownepoch staleraise delbeforegc" -- env TSDB_CHUNKPEER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecbasic
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)

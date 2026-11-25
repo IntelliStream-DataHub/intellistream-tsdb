@@ -13565,6 +13565,11 @@ static int ecb_live_parts(int i, uint32_t num, char *buf, size_t cap)
 static void scen_ecbasic(void)
 {
     scenario("ecbasic");
+#ifndef TSDB_EC
+    /* without the codec (make NO_EC=1) a tsdbd settles nothing: an ec volume's rows stay in .part files */
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#endif
     for (int i = 0; i < 6; i++) {
         envs[i] = "hold_copy_file=1,copy_probe=1"; /* the EPOCH case holds a stripe member's copy */
         start(i);
