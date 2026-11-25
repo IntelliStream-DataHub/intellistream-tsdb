@@ -718,6 +718,18 @@ typedef struct via_job {
     const char *what;
 } via_job;
 
+/* frees what run_via allocated (the jobs and their latency buffers) and returns rc: LeakSanitizer fails the benchmark's
+ * run under ASan otherwise (test_cluster viabench) */
+static int via_jobs_free(via_job *jobs, int conns, int rc)
+{
+    for (int i = 0; jobs && i < conns; i++) {
+        free(jobs[i].w.a);
+        free(jobs[i].r.a);
+    }
+    free(jobs);
+    return rc;
+}
+
 static int addr_split(const char *a, char *h, size_t hn, int *p)
 {
     const char *c = strrchr(a, ':');
@@ -981,7 +993,7 @@ static int run_via(void)
     }
     tsdbc_close(c);
     if (bad)
-        return 1;
+        return via_jobs_free(jobs, conns, 1);
     int64_t fwd1 = via_forwarded(vh, vp);
     if (fwd0 < 0 || fwd1 < 0)
         fprintf(stderr, "tsdbc-bench via: note: STATUS of %s was not readable (a superuser is needed), so that it "
@@ -989,11 +1001,11 @@ static int run_via(void)
     else if (fwd1 - fwd0 < (int64_t)via_reps) { /* every via run sends at least a frame per connection */
         fprintf(stderr, "tsdbc-bench via: the entry %s forwarded %" PRId64 " frames in %d via runs: its numbers would be "
                         "the leader's, no hop is printed\n", via_addr, fwd1 - fwd0, via_reps);
-        return 1;
+        return via_jobs_free(jobs, conns, 1);
     }
     if (got != want) {
         fprintf(stderr, "tsdbc-bench via: the leader holds %" PRIu64 " rows, %" PRIu64 " were acknowledged\n", got, want);
-        return 1;
+        return via_jobs_free(jobs, conns, 1);
     }
     static const char *const names[VIA_FIELDS] = {"requests a second", "write p50 (ms)", "write p99 (ms)",
                                                   "read p50 (ms)", "read p99 (ms)", "CPU ms per 1000 requests"};
@@ -1014,7 +1026,7 @@ static int run_via(void)
         mean_sd(h, via_reps, &hm, &hs);
         printf("  %-26s %9.3f +- %-6.3f %9.3f +- %-6.3f %+10.3f +- %-6.3f\n", names[f], dm, ds, vm, vs, hm, hs);
     }
-    return 0;
+    return via_jobs_free(jobs, conns, 0);
 }
 
 int main(int argc, char **argv)

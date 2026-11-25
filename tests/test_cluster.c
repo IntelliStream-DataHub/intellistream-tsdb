@@ -7527,6 +7527,7 @@ struct snapset {
 /* the snap.* lines of server i's STATUS (server/rsnap.c's counters) */
 struct rsnap_stats {
     uint64_t asked, sent, received, refused_space, failed, busy, bytes_sent, bytes_received, installed, refused_stale;
+    uint64_t kind5_bytes, kind2_bytes; /* what the node's kind-5 and kind-2 links took from their buckets */
 };
 static void status_snap(int i, struct rsnap_stats *st)
 {
@@ -7536,9 +7537,10 @@ static void status_snap(int i, struct rsnap_stats *st)
     if (rc != 0)
         die("STATUS of server %d: %s", i, ers(rc));
     static const char *keys[] = {"asked", "sent", "received", "refused_space", "failed", "busy", "bytes_sent",
-                                 "bytes_received", "installed", "refused_stale"};
+                                 "bytes_received", "installed", "refused_stale", "kind5_bytes", "kind2_bytes"};
     uint64_t *v[] = {&st->asked, &st->sent, &st->received, &st->refused_space, &st->failed, &st->busy,
-                     &st->bytes_sent, &st->bytes_received, &st->installed, &st->refused_stale};
+                     &st->bytes_sent, &st->bytes_received, &st->installed, &st->refused_stale, &st->kind5_bytes,
+                     &st->kind2_bytes};
     for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
         char key[64];
         snprintf(key, sizeof key, "\nsnap.%s=", keys[k]);
@@ -7956,12 +7958,30 @@ static void scen_snapsrckill(void)
            " bytes) arrived whole\n", nf, bytes);
 }
 
-/* snaplarge (D7): a large insert while a snapshot moves at rebuild_mb_s 5 commits within a second (the snapshot's
- * kind 5 does not hold the COMMITs' kind 2), and the transfer takes at least its size over the rate. */
+/* snaplarge (D7): a large insert while a snapshot moves at rebuild_mb_s 2 is not held by it (the snapshot's kind 5
+ * does not hold the COMMITs' kind 2), and the transfer takes at least its size over the rate.
+ *
+ * The proof is a byte budget, not a time limit, so it holds on a machine of any speed (a 2000000-row insert takes a
+ * few hundred ms in a normal build and over a second under TSan on 4 CPUs; neither matters). Every bulk link of one
+ * kind takes its chunks from that kind's token bucket (server/peerlink.c, bucket_take: a chunk goes only when the
+ * bucket's virtual clock is at or below now, the clock never starts more than 50 ms behind now, and each chunk moves
+ * it on by its size over the rate). So over any window of W ms one bucket at R bytes/s lets through at most
+ * R * (W + 50) / 1000 bytes plus one chunk, whatever the machine. The leader's STATUS counts the bytes each kind took
+ * from its bucket (snap.kind5_bytes, snap.kind2_bytes). The window spans the whole insert (the counters are read
+ * before it began and after it was acknowledged), and the insert is acknowledged only after its COMMIT files reached
+ * the other member, so they are in the window's kind-2 bytes (13.5 MB). The snapshot keeps its own bucket busy for
+ * the whole window (it moved before the window and is still moving after it), so kind 5 alone takes close to R * W,
+ * and the COMMIT files come on top of it whatever W is: kinds 2 and 5 together moved more than one bucket at R could,
+ * so they did not share one. Were the COMMIT files to share the snapshot's bucket (the planted snapsamelink: the
+ * snapshot's files on kind 2, at rebuild_mb_s), everything the window moved would have passed that one bucket, and
+ * the sum could never exceed its bound, however fast or slow the machine. The rate is low (2 MB/s) so that a slow
+ * insert still lies inside the transfer; a snapshot that ended inside the window is reported as proving nothing,
+ * never as a pass. */
 static void scen_snaplarge(void)
 {
     scenario("snaplarge");
-    init_rebuild_mb_s = 5;
+    const uint64_t rate = 2u << 20; /* rebuild_mb_s 2, in bytes/s as rsnap.c takes it */
+    init_rebuild_mb_s = 2;
     struct snapset s;
     snap_setup(1, 6000000, &s);
     init_rebuild_mb_s = 0;
@@ -7970,27 +7990,45 @@ static void scen_snaplarge(void)
     char needle[128], line[4096];
     snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[s.R]);
     await_log(s.L, needle, 30000, "the leader never made the snapshot");
-    usleep(500000);
+    /* the snapshot's files are moving (more than SNAPMAN, a few KB, has arrived): a condition, not a pause */
+    struct rsnap_stats st, a, b;
+    uint64_t w0 = now_ms();
+    for (status_snap(s.R, &st); st.bytes_received < (1u << 20); status_snap(s.R, &st)) {
+        if (now_ms() - w0 > 60000)
+            die("the snapshot's files did not begin to move in 60 s (%" PRIu64 " bytes received)", st.bytes_received);
+        usleep(50000);
+    }
+    uint64_t ta = now_ms();
+    status_snap(s.L, &a);
     uint64_t t0 = now_ms();
     snap_rows(s.c[0], s.id[0], &s.t, 2000000);
     uint64_t took = now_ms() - t0;
+    status_snap(s.L, &b);
+    uint64_t win = now_ms() - ta;
     if (log_has(s.R, "snapshot received from node"))
-        die("the snapshot was in before the large insert ended: the test proves nothing");
-    if (took >= 1000)
-        die("a large insert of 2000000 rows took %" PRIu64 " ms while a snapshot moved (kind 5 holds kind 2)", took);
+        die("the snapshot was in before the window of the large insert ended: the test proves nothing");
+    uint64_t k5 = b.kind5_bytes - a.kind5_bytes, k2 = b.kind2_bytes - a.kind2_bytes;
+    uint64_t one_bucket = rate * (win + 50) / 1000 + (256u << 10); /* PL_BULK_CHUNK */
+    if (k2 + k5 <= one_bucket)
+        die("a large insert of 2000000 rows during a snapshot: kinds 2 and 5 moved %" PRIu64 " + %" PRIu64
+            " bytes in %" PRIu64 " ms, no more than one bucket at rebuild_mb_s passes (%" PRIu64
+            "): kind 5 holds kind 2", k2, k5, win, one_bucket);
+    if (!k5)
+        die("no byte of the snapshot moved on kind 5 during the large insert (%" PRIu64 " ms)", win);
     await_log(s.R, "(snaphold)", 120000, "the snapshot never arrived");
     size_t nf;
     uint64_t bytes = snap_verify_held(s.R, 1, &nf);
     log_line(s.R, "snapshot received from node", line, sizeof line);
     const char *in = strstr(line, " bytes in ");
     double secs = in ? strtod(in + 10, NULL) : 0;
-    double least = (double)bytes / (5 << 20);
+    double least = (double)bytes / (double)rate;
     if (secs < least * 0.9)
-        die("%" PRIu64 " bytes moved in %.1f s at rebuild_mb_s 5 (at least %.1f s)", bytes, secs, least);
+        die("%" PRIu64 " bytes moved in %.1f s at rebuild_mb_s 2 (at least %.1f s)", bytes, secs, least);
     snap_close(&s);
     stop_all();
-    printf("  a large insert of 2000000 rows took %" PRIu64 " ms during a snapshot of %" PRIu64 " bytes, which took"
-           " %.1f s at 5 MB/s\n", took, bytes, secs);
+    printf("  a large insert of 2000000 rows took %" PRIu64 " ms during a snapshot of %" PRIu64 " bytes (%.1f s at"
+           " 2 MB/s); in its %" PRIu64 " ms window kind 2 moved %" PRIu64 " and kind 5 %" PRIu64 " bytes, more than"
+           " one bucket's %" PRIu64 "\n", took, bytes, secs, win, k2, k5, one_bucket);
 }
 
 /* snaplost: the losses of a transfer's control frames. The first request names a newer set version (the hook): the
