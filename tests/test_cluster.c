@@ -13132,33 +13132,155 @@ static void scen_repldesc(void)
 
 /* drvcheck (rd-drvcheck; review F3 and F2 of rd-nocheck): every driver message carries the driver's own check
  * (server/replwire.h), at every link check level, `none` (the default, which these servers run at) included.
- * TSDB_REPLD_TEST=flipraw flips one bit of a received message in its wire bytes, before the decode: ack, on the
- * writer, an ACK's durable raised inside (durable, written] (synclate keeps replicas' written ahead of their durable:
- * F3, the flip no structural bound sees, which would move the commit point over rows that replica has not synced);
- * head, on the replicas, bit 0 of an APPEND's commit or bit 3 of its off; desc, bit 0 of the last descriptor's epoch
- * or span of an APPEND of two records or more (F2: beyond descriptor 0). Each must be dropped by the driver check, so
- * nothing of it reaches msg_refused or the core (the commit point never takes a flipped ACK), and every row still
+ * TSDB_REPLD_TEST=flipraw flips one bit of a received message in its wire bytes, before the decode:
+ *   ack:  on the writer, while one replica's sync is held back (synchold, file <dir>/synchold) and noclock keeps
+ *         NOW markers out of the WAL, two writes (1 row at d+1, then 128 rows) advance that replica's written end
+ *         past d+1 while its durable end stays at d; flipraw=ack raises durable inside (d, written] (F3, the flip
+ *         no structural bound sees). The first write must NOT be acknowledged (commit point unchanged) while the
+ *         replica's sync is held, even after flipped ACKs arrive, and completes once synchold is removed.
+ *   head: on the replicas, bit 0 of an APPEND's commit or bit 3 of its off, in turn (both verified logged).
+ *   desc: on the replicas, bit 0 of the last descriptor's epoch or span of an APPEND of two records or more (F2:
+ *         beyond descriptor 0).
+ * Each must be dropped by the driver check, so nothing of it reaches msg_refused or the core, and every row still
  * reaches both replicas. Mutants checknocmp, checkshort (replwire.c) and checklate (repld.c): a flipped message
- * passes the check and the driver says so. */
-static void drvcheck_run(const char *name, const char *env, const char *field, int on_leader)
+ * passes the check (or moves the commit point early in drvcheck-ack). */
+static void drvcheck_ack_run(void)
 {
-    int L = repl_hook_run(name, env);
-    char flipped[96];
-    snprintf(flipped, sizeof flipped, "flipraw: flipped %s from node", field);
-    int seen = 0;
+    scenario("drvcheck-ack");
+    init_isr_lag_ms = 5000;
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=flipraw=ack,synchold,noclock";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want3 = 3;
+    await_view(0, p_voters, &want3, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "rf", 3, &num)) != 0 || num != 1)
+        die("volume add rf: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "rf", i, 1, 0);
+    struct meta_volume v;
+    if (!vol_rec(0, "rf", &v))
+        die("no record of rf");
+    int L = server_of(v.leader);
+    if (L < 0 || L > 2)
+        die("the leader of rf is node %u", v.leader);
+    await_isr(L, "rf", 3, 30000, "every replica in the ISR before the writes");
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "rf", 30000);
+    int64_t ts0 = 2000000;
+    float v0 = 1.0f;
+    if ((rc = tsdbc_insert_series(c, id, &ts0, &v0, 1)) != 0)
+        die("drvcheck-ack: initial write: %s", ers(rc));
+    tsdbc_close(c);
+
+    /* Hold back one replica's sync so its durable end stays at d while its written end advances past w1 (at d+1)
+     * and w2 (128 rows: guarantees a single-bit flip d ^ (1 << b) lands in [d+1, written] for any small d). */
+    int R0 = (L + 1) % 3;
+    char hold[PATH_MAX + 64];
+    server_dir(R0, hold, sizeof hold);
+    snprintf(hold + strlen(hold), sizeof hold - strlen(hold), "/synchold");
+    FILE *fp = fopen(hold, "w");
+    if (!fp)
+        die("drvcheck-ack: create %s", hold);
+    fclose(fp);
+
+    struct rep_writer w1 = {cports[L], id, 3000000, 1, 0, 0, 0, 0};
+    struct rep_writer w2 = {cports[L], id, 4000000, 0, 0, 0, 128, 0};
+    pthread_t th1, th2;
+    if (pthread_create(&th1, NULL, rep_write_thread, &w1) != 0)
+        die("pthread_create w1");
+    uint64_t t0 = now_ms();
+    while (!wal_holds_ts(R0, 3000000)) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 10000)
+            die("drvcheck-ack: w1 did not reach replica %d's WAL in 10 s", R0);
+        usleep(5000);
+    }
+    if (pthread_create(&th2, NULL, rep_write_thread, &w2) != 0)
+        die("pthread_create w2");
+    int64_t last = 4000000 + 127 * 1000LL;
+    t0 = now_ms();
+    while (!wal_holds_ts(R0, last)) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 10000)
+            die("drvcheck-ack: w2 did not reach replica %d's WAL in 10 s", R0);
+        usleep(5000);
+    }
+    t0 = now_ms();
+    while (!log_has(L, "flipraw: flipped an ACK's durable from node")) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        if (now_ms() - t0 > 5000)
+            die("drvcheck-ack: leader %d never flipped an ACK's durable", L);
+        usleep(10000);
+    }
+    /* Let several flipped ACKs arrive and verify the commit point never moves past R0's true durable end */
+    for (int k = 0; k < 20; k++) {
+        if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE) || __atomic_load_n(&w2.done, __ATOMIC_ACQUIRE))
+            die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+                "commit point)", R0);
+        usleep(20000);
+    }
+    uint32_t isr = isr_of(L, "rf", NULL);
+    if (isr != 3)
+        die("drvcheck-ack: ISR shrank from 3 to %" PRIu32 " while replica %d's sync was held", isr, R0);
+    if (__atomic_load_n(&w1.done, __ATOMIC_ACQUIRE) || __atomic_load_n(&w2.done, __ATOMIC_ACQUIRE))
+        die("drvcheck-ack: a write was acknowledged while replica %d's sync was held (flipped ACK moved the "
+            "commit point)", R0);
+
+    if (unlink(hold) != 0)
+        die("drvcheck-ack: unlink %s", hold);
+    await_writer(&w1, th1, 10000, "drvcheck-ack: w1 once replica sync resumed");
+    await_writer(&w2, th2, 10000, "drvcheck-ack: w2 once replica sync resumed");
+
     for (int i = 0; i < 3; i++) {
         if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
-            die("%s: a flipped message passed the driver check on server %d", name, i);
-        if ((i == L) != on_leader)
-            continue;
-        seen += log_has(i, flipped);
-        if (!log_has(i, "failed its driver check, dropped"))
-            die("%s: server %d dropped no message for its driver check", name, i);
+            die("drvcheck-ack: a flipped message passed the driver check on server %d", i);
+        if (i == L) {
+            if (!log_has(i, "failed its driver check, dropped"))
+                die("drvcheck-ack: leader %d dropped no message for its driver check", i);
+        } else {
+            uint64_t tw = now_ms();
+            while (!wal_holds_ts(i, last)) {
+                if (now_ms() - tw > 20000)
+                    die("drvcheck-ack: the last row did not reach replica %d's log in 20 s", i);
+                usleep(5000);
+            }
+        }
     }
-    /* the leader's resend of what a replica missed carries several records only when the replica's position lagged
-     * by then: one replica of the two is enough for the descriptor case */
-    if (!seen)
-        die("%s: no server flipped %s (the hook found nothing to flip)", name, field);
+    await_isr(L, "rf", 3, 10000, "drvcheck-ack: every replica in the ISR after sync resumed");
+    stop_all();
+}
+
+static void drvcheck_head_run(void)
+{
+    int L = repl_hook_run("drvcheck-head", "TSDB_REPLD_TEST=flipraw=head");
+    int seen_commit = 0, seen_off = 0;
+    for (int i = 0; i < 3; i++) {
+        if (log_has(i, "passed the driver check") || log_has(i, "a flipped ACK reached the core"))
+            die("drvcheck-head: a flipped message passed the driver check on server %d", i);
+        if (i == L)
+            continue;
+        seen_commit += log_has(i, "flipraw: flipped an APPEND's commit from node");
+        seen_off += log_has(i, "flipraw: flipped an APPEND's off from node");
+        if (!log_has(i, "failed its driver check, dropped"))
+            die("drvcheck-head: server %d dropped no message for its driver check", i);
+    }
+    if (!seen_commit)
+        die("drvcheck-head: no replica flipped an APPEND's commit");
+    if (!seen_off)
+        die("drvcheck-head: no replica flipped an APPEND's off");
     stop_all();
 }
 
@@ -13242,11 +13364,12 @@ static void drvcheck_desc_run(void)
 
 static void scen_drvcheck(void)
 {
-    drvcheck_run("drvcheck-ack", "TSDB_REPLD_TEST=flipraw=ack,synclate", "an ACK's durable", 1);
-    drvcheck_run("drvcheck-head", "TSDB_REPLD_TEST=flipraw=head", "an APPEND's commit", 0);
+    drvcheck_ack_run();
+    drvcheck_head_run();
     drvcheck_desc_run();
-    printf("  drvcheck: an ACK's durable raised inside (durable, written], an APPEND's head and a descriptor beyond the "
-           "first flipped on the wire, each dropped by the driver check under none, all rows in both replicas\n");
+    printf("  drvcheck: an ACK's durable raised inside (durable, written] leaves commit point unchanged while sync is "
+           "held, an APPEND's head and a descriptor beyond the first flipped on the wire, each dropped by the driver "
+           "check under none, all rows in both replicas\n");
 }
 
 /* replbulk (rd-nocheck, AUDIT item 8): nothing sends a driver frame on a bulk link, so one there is a frame type a

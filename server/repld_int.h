@@ -300,6 +300,8 @@ struct repld_g {
                        * frame when it comes up (test_cluster volcmd: the acceptor's row and rsnap_frame) */
     int sync_pause;   /* TSDB_REPLD_TEST=syncpause: a replica's SYNCs wait SYNC_PAUSE_MS after its core's open, so its
                        * ACKs carry the durable end the core opened with that long (reopenhold) */
+    int sync_hold;    /* TSDB_REPLD_TEST=synchold: a replica's SYNCs wait while <dir>/synchold exists (drvcheck-ack) */
+    _Atomic uint64_t bulk_ck_drops; /* bulk file metas whose driver check failed (RW_E_CHECK), dropped */
     int sync_late;    /* TSDB_REPLD_TEST=synclate: every other report of op_synced reaches the core only at the next
                        * tick, so the report after it covers records written behind the SYNC in flight (writersync) */
     int no_clock; /* TSDB_REPLD_TEST=noclock (tests only): a leader writes no NOW markers and seals nothing idle, so

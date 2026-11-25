@@ -72,7 +72,8 @@
  * the file missing and FETCHes it; `fetchlate` has a replica send its first FETCH of a name only 5 s after it found
  * the file missing (the leader has sealed and flushed the marker's segment by then); `nofetch` has a replica send no
  * FETCH at all and say once per name that it withholds it (reopenhold kills it there); `syncpause` has a replica's
- * SYNCs wait 4 s after its core's open (its ACKs carry the durable end it opened with; reopenhold); `promotewait` waits 1 s between
+ * SYNCs wait 4 s after its core's open (its ACKs carry the durable end it opened with; reopenhold); `synchold` holds a
+ * replica's SYNCs while <dir>/synchold exists (drvcheck-ack); `promotewait` waits 1 s between
  * the promotion's engine swap and the mode M_WRITER
  * (writes then reach the new writer while the driver still promotes: they must be refused for a retry, never depose
  * it); `noclock` has a leader write no NOW markers and no idle seal (writersync); `skippos` has one admit take a
@@ -1087,8 +1088,16 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
     if (!r)
         return -1;
     r->fd = -1;
-    if (rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name) != 0 || size != total ||
-        total > (1ull << 32) || !vol_listed(r->volume)) {
+    int brc = rw_decode_bulk_meta(meta, meta_len, &r->volume, &size, r->name, sizeof r->name);
+    if (brc == RW_E_CHECK) {
+        uint64_t n = atomic_fetch_add_explicit(&G.bulk_ck_drops, 1, memory_order_relaxed) + 1;
+        if ((n - 1) % 1000 == 0)
+            say("node %" PRIu32 ": a bulk file meta failed its driver check, dropped (%" PRIu64 " so far)",
+                plink_peer(l), n);
+        free(r);
+        return -1;
+    }
+    if (brc != 0 || size != total || total > (1ull << 32) || !vol_listed(r->volume)) {
         free(r);
         return -1;
     }
@@ -1320,7 +1329,7 @@ static int flip_raw(struct rvol *rv, uint8_t *p, size_t n, int from)
             p[RW_HEAD + 8] ^= 8, what = "an APPEND's off"; /* bit 3 of off */
         break;
     case FR_DESC: {
-        if (p[1] != REPL_M_APPEND || nrec < 2 || (n - RW_HEAD - RW_CHECK - RW_APPEND_HEAD) / RW_DESC < nrec)
+        if (p[1] != REPL_M_APPEND || nrec < 2 || !rw_msg_check_at(p, n))
             return 0;
         unsigned k = rv->raw_m++;
         if (k % 2) /* every 2nd with several: never all of them, or the resends never get through */
@@ -2005,10 +2014,9 @@ static void handle(struct rvol *rv, struct item *it)
     int flipped = G.flip_raw ? flip_raw(rv, it->data, it->n, from) : 0;
     int drc;
     if (G.mutant == RM_CHECKLATE) { /* planted: decoded unverified, the check looked at only after the core */
-        int saved = rw_mutant;
-        rw_mutant = RW_MUT_NOCMP;
+        rw_nocmp_local = 1;
         drc = rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec);
-        rw_mutant = saved;
+        rw_nocmp_local = 0;
     } else {
         drc = rw_decode_msg(it->data, it->n, &rv->cur, rv->recs, rv->lens, rv->crec);
     }
@@ -2097,12 +2105,20 @@ static void handle(struct rvol *rv, struct item *it)
     }
 }
 
+static int sync_held(void)
+{
+    char f[sizeof G.dir + 16];
+    snprintf(f, sizeof f, "%s/synchold", G.dir);
+    return access(f, F_OK) == 0;
+}
+
 /* A replica's deferred SYNC (every WRITE handed in so far), and a fetch of a file a COMMIT marker still lacks. */
 static void do_sync(struct rvol *rv)
 {
     rv->sync_wanted = 0;
-    if (G.sync_pause && rv->mode == M_REPLICA && now_ms() < rv->sync_pause_end) {
-        rv->sync_paused = 1; /* the tick hands it back once the pause is over */
+    if (rv->mode == M_REPLICA &&
+        ((G.sync_pause && now_ms() < rv->sync_pause_end) || (G.sync_hold && sync_held()))) {
+        rv->sync_paused = 1; /* the tick hands it back once the pause/hold is over */
         return;
     }
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
@@ -2335,7 +2351,7 @@ static void *vol_main(void *arg)
              * test_cluster rejoinlate, mutant stepcurrentonly) */
             const int stretch = G.mutant == RM_TICKSTRETCH;
             int behind = !stretch && now >= next_tick + TICK_MS;
-            if (rv->sync_paused && now >= rv->sync_pause_end) {
+            if (rv->sync_paused && (!G.sync_pause || now >= rv->sync_pause_end) && (!G.sync_hold || !sync_held())) {
                 rv->sync_paused = 0;
                 rv->sync_wanted = 1;
             }
@@ -2621,6 +2637,7 @@ void repld_init(tsdb *t, const char *dir)
     G.fetch_late = te && strstr(te, "fetchlate");
     G.no_fetch = te && strstr(te, "nofetch");
     G.sync_pause = te && strstr(te, "syncpause");
+    G.sync_hold = te && strstr(te, "synchold");
     G.snap_dial = te && strstr(te, "snapdial");
     const char *fi = te ? strstr(te, "flipin") : NULL;
     G.flip_in = !fi                                ? 0

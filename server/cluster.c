@@ -137,8 +137,10 @@
                       * kind in HELLO (data links, peerlink.h); 5: HBS_LEASE, HBS_UNREACH and
                       * the lease fields of HB_ACK; 6: replwire RW_VERSION 2; 7: R4's F_VOLCMD and VOLMSG
                       * READY (one release: dev clusters are initialised again); 8: the data links' frame check
-                      * (peerlink.h, plcheck.h); peers of another version are refused with a line naming both
-                      * (no mixed versions) */
+                      * (peerlink.h, plcheck.h); 9: the check an option of three levels, none by default
+                      * (rd-nocheck); 10: the replication driver's own check on every driver message
+                      * (replwire RW_VERSION 3, rd-drvcheck); peers of another version are refused with a line
+                      * naming both (no mixed versions) */
 #define RING 4096
 #define RING_BYTES (64ull << 20) /* the ring's entries hold at most this many bytes (a user's blob is up to 1 MiB, and every
                                   * grant puts it again): the oldest go first, a watcher behind them gets a snapshot */

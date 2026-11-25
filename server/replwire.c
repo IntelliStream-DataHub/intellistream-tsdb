@@ -8,6 +8,7 @@
 #define POS_LIMIT ((uint64_t)1 << 62) /* FNO_LIMIT: no position at or above it */
 
 int rw_mutant;
+__thread int rw_nocmp_local;
 
 /* XXH3-64 rather than CRC32C: vendored, portable to every level `make dist` builds and to arm64, and within a few ns of
  * CRC32C over these sizes (design-rdma.md 6). The seed tells the kinds apart, so the bytes of one never pass as
@@ -50,7 +51,7 @@ size_t rw_msg_check_at(const uint8_t *p, size_t n)
 /* the check at p + at over p[0, at): 0, RW_E_CHECK */
 static int check_ok(int kind, const uint8_t *p, size_t at)
 {
-    if (rw_mutant == RW_MUT_NOCMP)
+    if (rw_mutant == RW_MUT_NOCMP || rw_nocmp_local)
         return 0;
     return rw_check(kind, p, kind == RW_K_MSG ? covered(at) : at) == le64(p + at) ? 0 : RW_E_CHECK;
 }

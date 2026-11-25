@@ -69,9 +69,12 @@ static inline size_t rw_msg_size(uint32_t nrec, size_t nbytes)
 /* What a decoder returns for a message whose driver check does not hold (-1: not a well formed message). */
 #define RW_E_CHECK (-2)
 
-/* Planted bugs (tests only; tsdbd sets them from TSDB_REPLD_MUTANT, tests/test_replwire.c from --mutant). */
+/* Planted bugs (tests only; tsdbd sets them from TSDB_REPLD_MUTANT, tests/test_replwire.c from --mutant).
+ * rw_mutant is set at startup before threads run; rw_nocmp_local lets one thread skip the check (RM_CHECKLATE)
+ * without racing with other volume threads or bin_open. */
 enum { RW_MUT_NONE, RW_MUT_NOCMP /* the check is never compared */, RW_MUT_SHORT /* covers RW_HEAD only */ };
 extern int rw_mutant;
+extern __thread int rw_nocmp_local;
 
 /* The offset of an encoded message's check (the length of what it covers), or 0 when p[0, n) cannot be a message.
  * Reads only the type and nrec, to find it. */

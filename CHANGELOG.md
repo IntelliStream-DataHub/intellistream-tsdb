@@ -33,7 +33,7 @@ receiver verifies before it acts on any of them, whatever `--peer-check` says, `
 rows themselves, which carry checksums of their own. A message whose check fails is dropped, counted in the log and sent
 again by its sender. Without it, under `none`, a single flipped bit in a replica's acknowledgement could let the leader
 count rows as safely stored on that replica before they were, and a power loss there could then lose acknowledged
-rows. It costs about 17-20 ns per message on each side. A member of version 9 is refused by one of 10 with a line
+rows. It costs about 17-20 ns per message, encode and decode together. A member of version 9 is refused by one of 10 with a line
 naming both: upgrade every member together.
 
 **The peer protocol is now version 9: the data links' frame check is an option, off by default.** `tsdbd
