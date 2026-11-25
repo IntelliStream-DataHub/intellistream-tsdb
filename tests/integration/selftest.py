@@ -221,9 +221,16 @@ def test_mutants_apply():
     for m in mutate.M:
         path = ROOT / m["file"]
         check(path.exists(), "%s: %s exists" % (m["id"], m["file"]))
-        n = path.read_text().count(m["old"]) if path.exists() else 0
-        check(n == 1, "%s: its text occurs once in %s (found %d times): %s" % (m["id"], m["file"], n, m["what"][:60]))
-        check(m["old"] != m["new"], "%s: the mutation changes the text" % m["id"])
+        es = mutate.edits(m)
+        check(len(es) >= 1 and (not isinstance(m["old"], list) or len(m["old"]) == len(m["new"])),
+              "%s: as many new texts as old ones" % m["id"])
+        text = path.read_text() if path.exists() else ""
+        for i, (old, new) in enumerate(es):
+            n = text.count(old)
+            check(n == 1, "%s: its text%s occurs once in %s (found %d times): %s"
+                  % (m["id"], " %d" % (i + 1) if len(es) > 1 else "", m["file"], n, m["what"][:60]))
+            check(old != new, "%s: the mutation changes the text" % m["id"])
+            text = text.replace(old, new)
         check(m["scen"] in run.SCENARIOS, "%s: scenario %r is one of run.py's" % (m["id"], m["scen"]))
 
 
