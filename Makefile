@@ -124,6 +124,9 @@ $(B)/chunk.o $(B)/chunkread.o: override CFLAGS += -Isrc/ec/compat
 $(B)/chunk.o $(B)/chunkstore.o $(B)/chunkread.o $(B)/chunkheal.o: src/chunk.h src/chunk_priv.h $(EC_HDR)
 $(B)/fuzz-ec: override CFLAGS += -Isrc/ec/compat
 LIB  := $(B)/libtsdb.a
+# defined here, before any rule names it: a rule's prerequisites are expanded when it is read, so a later definition left
+# them empty (test_readonly linked a client library that nothing had built yet after make clean)
+CLIB := $(B)/libtsdbclient.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/outage-load $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench $(B)/link-bench $(EC_BENCH)
@@ -1074,8 +1077,6 @@ fuzz-frames:
 	    ASAN_OPTIONS="allocator_may_return_null=0 max_allocation_size_mb=$(FUZZ_MAX_ALLOC_MB) $$ASAN_OPTIONS" \
 	    ./build-fuzz-frames/fuzz_frames fuzz --seconds $(FUZZ_SECONDS) --out build-fuzz-frames/frames-new \
 	    tests/fuzz/frames $$(test -d build-fuzz-frames/frames-new && echo build-fuzz-frames/frames-new)
-
-CLIB := $(B)/libtsdbclient.a
 
 $(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
                     include/tsdb.h include/tsdb_wire.h | $(B)
