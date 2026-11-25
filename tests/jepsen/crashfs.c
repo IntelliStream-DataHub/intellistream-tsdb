@@ -987,14 +987,65 @@ static void rollback(void)
         tsave_drop(&files[i]);
 }
 
+/* Async-signal-safe: raw syscalls, manual ASCII formatting, atomic once-guard so both on_bus() and power_loss() can
+ * call it right before _exit(99) without risking duplicate lines or calling snprintf() from a signal handler. */
+static volatile int cut_logged;
+static void log_cut_time(void)
+{
+    if (!cut_file[0] || __atomic_exchange_n(&cut_logged, 1, __ATOMIC_ACQ_REL))
+        return;
+    int saved = errno;
+    struct timespec cut_ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &cut_ts) != 0) {
+        errno = saved;
+        return;
+    }
+    int64_t cut_ns = (int64_t)cut_ts.tv_sec * 1000000000LL + cut_ts.tv_nsec;
+    char line[64], digits[24];
+    int n = 0, nd = 0;
+    long pid = (long)getpid();
+    if (pid < 0)
+        pid = 0;
+    do
+        digits[nd++] = (char)('0' + pid % 10);
+    while ((pid /= 10) > 0);
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    line[n++] = ' ';
+    if (cut_ns < 0) {
+        line[n++] = '-';
+        uint64_t u = (uint64_t)(-(cut_ns + 1)) + 1ULL;
+        do
+            digits[nd++] = (char)('0' + (int)(u % 10));
+        while ((u /= 10) > 0);
+    } else {
+        uint64_t u = (uint64_t)cut_ns;
+        do
+            digits[nd++] = (char)('0' + (int)(u % 10));
+        while ((u /= 10) > 0);
+    }
+    while (nd > 0)
+        line[n++] = digits[--nd];
+    line[n++] = '\n';
+    int cfd = (int)syscall(SYS_openat, AT_FDCWD, cut_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (cfd >= 0) {
+        if (syscall(SYS_write, cfd, line, (size_t)n) < 0) {
+        }
+        syscall(SYS_close, cfd);
+    }
+    errno = saved;
+}
+
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
  * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
  * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
  * Any other SIGBUS keeps its default action. */
 static void on_bus(int sig)
 {
-    if (power_losing)
+    if (power_losing) {
+        log_cut_time();
         _exit(99);
+    }
     signal(sig, SIG_DFL); /* the instruction faults again: the default action */
 }
 
@@ -1002,22 +1053,6 @@ __attribute__((noreturn)) static void power_loss(void)
 {
     power_losing = 1;
     rollback();
-    /* Stamp after rollback(), right before _exit(99): with wal_sync_ms > 0, in-memory writes on other
-     * threads do not touch files and can still reply while rollback() runs, so their invoke/complete
-     * times are strictly before _exit(99) rather than before rollback() began. */
-    if (cut_file[0]) {
-        struct timespec cut_ts;
-        clock_gettime(CLOCK_MONOTONIC, &cut_ts);
-        int64_t cut_ns = (int64_t)cut_ts.tv_sec * 1000000000LL + cut_ts.tv_nsec;
-        char cline[96];
-        int cn = snprintf(cline, sizeof cline, "%d %lld\n", (int)getpid(), (long long)cut_ns);
-        int cfd = (int)syscall(SYS_openat, AT_FDCWD, cut_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (cfd >= 0) {
-            if (syscall(SYS_write, cfd, cline, (size_t)cn) < 0) {
-            }
-            syscall(SYS_close, cfd);
-        }
-    }
     char msg[200];
     /* "requested by SIGUSR2": the harness (tests/jepsen/jepsen.c) pulled the plug; without it the loss was drawn by the
      * shim's own odds. The harness counts the first kind from this line, not from its own bookkeeping. */
@@ -1029,6 +1064,10 @@ __attribute__((noreturn)) static void power_loss(void)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
+    /* Stamp right before _exit(99) (after rollback() and stderr write): with wal_sync_ms > 0, in-memory writes on other
+     * threads do not touch files and can still reply while rollback() runs, so minimizing the gap before _exit(99)
+     * keeps the timestamp tightly bounded by the actual process death. */
+    log_cut_time();
     _exit(99);
 }
 
