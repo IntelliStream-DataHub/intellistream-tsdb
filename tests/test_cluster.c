@@ -12597,8 +12597,15 @@ static void scen_manystuck(void)
     if (count[L] <= 16)
         die("server %d leads %d of %d volumes, not more than 16", L, count[L], NV);
     for (int k = 0; k < NV; k++)
-        if (lead[k] == L)
+        if (lead[k] == L) {
             await_isr(L, names[k], 3, 30000, "every replica in the ISR before the cut");
+            /* the epoch the cut deposes is the one before it: a leader that took more than 3 s to promote itself
+             * (24 volumes opening at once under TSan) was taken as resigned and granted again at epoch 2 */
+            struct meta_volume v;
+            if (!vol_rec(0, names[k], &v) || server_of(v.leader) != L)
+                die("%s is no longer led by server %d before the cut", names[k], L);
+            eps[k] = v.epoch;
+        }
     for (int i = 0; i < 3; i++)
         if (i != L)
             nofence_file(i, 1);
