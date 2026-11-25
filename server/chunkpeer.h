@@ -20,8 +20,11 @@
  *               volume goes only by a committed MK_GC, never by R7's queue or sweep, which could delete the objects of
  *               an MK_COLD that is not committed yet (E14). ecgc keeps the item.
  *   list_names  CS_OP_LIST of every stripe member; `owner` reads the header's vuuid from a one-entry LIST.
- *   see_epoch   CS_OP_EPOCH at e on every stripe member: a member that does not then hold e (an unsure store, which
- *               only the copy raises) makes `writable` false for the context's life.
+ *   see_epoch   CS_OP_EPOCH at e on every stripe member: a member that does not then hold e (away, or an unsure
+ *               store, which only the copy raises) makes `writable` false until every member holds the copy's epoch:
+ *               writable asks them again, at most once a second. Members that are away never fail the attach.
+ * Every position of an open, and every member of see_epoch, writable and all_up, is asked at once (one thread each):
+ * a member that hangs costs one deadline, and an open stops waiting for it once k' positions answered.
  *
  * The epoch (D9): a cluster volume's chunk epoch is its metadata epoch. chunkpeer_epoch is the tier's provider (the
  * volume's epoch as the copy holds it); chunkpeer_epoch_source is chunksrv's hook for an unsure store, and answers only
@@ -78,6 +81,9 @@ int chunkpeer_make(void *arg, struct tier *t, uint32_t volume, const uint8_t vuu
 uint64_t chunkpeer_epoch(void *arg, uint32_t volume);
 /* chunksrv_epoch_fn (arg a struct chunkpeer *): 1 with *epoch only while the copy is caught up and holds the volume */
 int chunkpeer_epoch_source(void *arg, uint32_t volume, uint64_t *epoch);
+/* Waits until no ask of this process runs any more, those an open stopped waiting for included (tests, before they
+ * close the chunk servers their transport calls). */
+void chunkpeer_quiesce(void);
 
 /* A request or a put handed to an in-process chunk server as if member `from` had sent it (this member's own
  * position; the tests' transport): the same contracts as chunkpeer_net's call and put. */
@@ -102,8 +108,11 @@ enum {
     CP_MUT_NOSUMCMP = 2,    /* nosumcmp: a PUT_OK's sum is not compared with the table sent */
     CP_MUT_STALERAISE = 3,  /* staleraise: the source answers from a copy that is not caught up */
     CP_MUT_DELBEFOREGC = 4, /* delbeforegc: deletes go through on a cluster volume before MK_GC exists */
+    CP_MUT_STICKY = 5,      /* sticky: a context unfenced at attach stays so for its life (never asked again) */
+    CP_MUT_UNSUREDOWN = 6,  /* unsuredown: all_up counts a member whose store is unsure as down */
 };
 extern int chunkpeer_mutant;
+extern uint32_t chunkpeer_test_list_max; /* entries per page of list_names (test_chunkpeer: pagination) */
 int chunkpeer_mutant_parse(const char *name); /* CP_MUT_* or -1 */
 
 #endif

@@ -27,6 +27,7 @@ int main(void)
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "chunkpeer.h"
@@ -53,6 +54,11 @@ struct fake {
     struct chunksrv *cs[NM + 1]; /* by member id 1..NM */
     atomic_uint down;            /* bit i: member i does not answer */
     atomic_uint liar;            /* bit i: member i answers a put with another sum */
+    atomic_uint hang;            /* bit i: member i's link is up and nothing answers (until hang is cleared) */
+    atomic_uint shortread;       /* bit i: member i answers a READ one byte short */
+    atomic_uint ioerr;           /* bit i: member i answers every request with its store's IO error */
+    atomic_uint garble;          /* bit i: member i's LIST pages say one entry fewer than they carry */
+    pthread_cond_t hcv;
     struct chunkpeer_view view;
     pthread_mutex_t mu;
 };
@@ -64,7 +70,29 @@ static int f_call(void *arg, uint32_t node, const struct cs_req *r, int tmo, int
     *body = NULL;
     if (node == 0 || node > NM || (atomic_load(&F.down) >> node & 1))
         return TSDB_ERR_UNAVAILABLE;
-    return chunkpeer_local_call(F.cs[node], 99, r, rc, body, n);
+    if (atomic_load(&F.hang) >> node & 1) { /* the deadline is the test's (CP.timeout_ms 600 s in test_hang) */
+        pthread_mutex_lock(&F.mu);
+        while (atomic_load(&F.hang) >> node & 1)
+            pthread_cond_wait(&F.hcv, &F.mu);
+        pthread_mutex_unlock(&F.mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    if (atomic_load(&F.ioerr) >> node & 1) {
+        *rc = TSDB_ERR_IO;
+        return 0;
+    }
+    int trc = chunkpeer_local_call(F.cs[node], 99, r, rc, body, n);
+    if (trc == 0 && *rc == 0 && r->op == CS_OP_READ && *n > 0 && (atomic_load(&F.shortread) >> node & 1))
+        (*n)--;
+    if (trc == 0 && *rc == 0 && r->op == CS_OP_LIST && *n >= 5 && (atomic_load(&F.garble) >> node & 1)) {
+        uint32_t c = (uint32_t)(*body)[0] | (uint32_t)(*body)[1] << 8 | (uint32_t)(*body)[2] << 16 |
+                     (uint32_t)(*body)[3] << 24;
+        if (c > 0)
+            c--; /* the page carries more than it says: as wrong as less */
+        (*body)[0] = (uint8_t)c, (*body)[1] = (uint8_t)(c >> 8), (*body)[2] = (uint8_t)(c >> 16);
+        (*body)[3] = (uint8_t)(c >> 24);
+    }
+    return trc;
 }
 
 static int f_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd, uint64_t base, uint64_t sum, int tmo,
@@ -138,6 +166,10 @@ static void cluster_up(const char *name, char *dir, size_t cap)
         F.cs[i] = open_member(dir, i, true);
     atomic_store(&F.down, 0);
     atomic_store(&F.liar, 0);
+    atomic_store(&F.shortread, 0);
+    atomic_store(&F.ioerr, 0);
+    atomic_store(&F.garble, 0);
+    chunkpeer_test_list_max = CS_LIST_MAX;
     F.view = (struct chunkpeer_view){.caught_up = 1, .epoch = 5, .stripe_version = 1, .k = 4, .m = 2, .nstripe = NM};
     for (unsigned i = 0; i < NM; i++)
         F.view.stripe[i] = i + 1;
@@ -150,6 +182,7 @@ static void cluster_up(const char *name, char *dir, size_t cap)
 
 static void cluster_down(void)
 {
+    chunkpeer_quiesce(); /* asks an open stopped waiting for still call the members */
     for (uint32_t i = 1; i <= NM; i++) {
         if (F.cs[i])
             chunksrv_close(F.cs[i]);
@@ -259,8 +292,27 @@ static void test_put_read(void)
     int rc = read_back(ctx, &o, &rep);
     CHECK(rc == TSDB_ERR_UNAVAILABLE);
     atomic_store(&F.down, 0x7eu);
+    CHECK(read_back(ctx, &o, &rep) == TSDB_ERR_UNAVAILABLE); /* every position away, with the record's geometry */
     uint8_t other[16] = {0xee};
     CHECK(coldops_peer.obj_open(ctx, other, NULL, NULL, &h) == TSDB_ERR_UNAVAILABLE);
+    /* every member's store failing reads: UNAVAILABLE, never NOTFOUND (which eccache takes as lost, eckeep as
+     * DIVERGED) */
+    atomic_store(&F.down, 0);
+    atomic_store(&F.ioerr, 0x7eu);
+    CHECK(read_back(ctx, &o, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(coldops_peer.obj_open(ctx, other, NULL, NULL, &h) == TSDB_ERR_UNAVAILABLE);
+    atomic_store(&F.ioerr, 0);
+    /* a short READ answer is an error of that position, never the end: decoded around */
+    atomic_store(&F.shortread, 1u << 2);
+    CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells > 0 && rep.st[1] == CHUNK_ST_IOERR);
+    atomic_store(&F.shortread, 0);
+    /* a header of another geometry than the record's is another encoding of the object: no position is taken */
+    {
+        chunk_geom g2 = o.g;
+        g2.len--;
+        cold_obj *h2 = NULL;
+        CHECK(coldops_peer.obj_open(ctx, o.oid, &g2, NULL, &h2) == TSDB_ERR_CORRUPT && !h2);
+    }
     atomic_store(&F.down, 0);
     CHECK(coldops_peer.obj_open(ctx, other, NULL, NULL, &h) == TSDB_ERR_NOTFOUND);
     CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells == 0);
@@ -271,6 +323,12 @@ static void test_put_read(void)
     CHECK(put(ctx, &q, 5) == TSDB_ERR_UNAVAILABLE);
     atomic_store(&F.down, 0);
     CHECK(put(ctx, &q, 5) == 0 && read_back(ctx, &q, &rep) == 0);
+    /* an object of another m than the copy's stripe group is refused, though it has fewer positions */
+    obj w;
+    obj_make(&w, 300000, 4);
+    CHECK(chunk_geom_derive(&w.g, 4, 1, 300000) == 0);
+    CHECK(put(ctx, &w, 5) == TSDB_ERR_INVALID);
+    obj_free(&w);
     obj_free(&q);
     obj_free(&o);
     coldops_peer.ctx_free(ctx);
@@ -372,7 +430,15 @@ static void test_unsure(void)
     CHECK(chunkpeer_epoch(&CP, VOL) == 8);
     uint64_t e;
     CHECK(chunkpeer_epoch_source(&CP, VOL, &e) == 0);
+    void *c3 = make_ctx(); /* an unsure member does not hold the epoch it was asked: no put (writable false) */
+    CHECK(coldops_peer.see_epoch(c3, 8) == 0 && !coldops_peer.writable(c3));
+    coldops_peer.ctx_free(c3);
+    set_view(1, 0); /* a copy that holds no epoch for the volume is no source */
+    CHECK(chunkpeer_epoch_source(&CP, VOL, &e) == 0);
+    set_view(0, 8);
     ctx = make_ctx();
+    /* an unsure member answers: all UP (eccold's stripe_ok would refuse every settle before its put otherwise) */
+    CHECK(coldops_peer.all_up(ctx));
     obj o;
     obj_make(&o, 400000, 5);
     CHECK(put(ctx, &o, own) == CHUNK_ERR_EPOCH_UNSURE);
@@ -389,7 +455,21 @@ static void test_unsure(void)
     cluster_down();
 }
 
-/* see_epoch on a member that cannot take it (unsure, no caught-up copy): writable is false for the context's life */
+/* writable once every member holds the copy's epoch again: asked at most once a second, so waited for */
+static bool wait_writable(void *ctx)
+{
+    for (int i = 0; i < 1000; i++) { /* 20 s: the asks are once a second */
+        if (coldops_peer.writable(ctx))
+            return true;
+        struct timespec ts = {0, 20 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return false;
+}
+
+/* see_epoch with a member away (a promotion after the old leader's node died): no put until every member holds the
+ * epoch, and puts again once it is back (F1: a promoted leader must settle again without being reopened). With every
+ * member away the attach still succeeds (a cluster's cold start opens its volumes before the chunk links are up). */
 static void test_unfenced(void)
 {
     char dir[PATH_MAX];
@@ -397,17 +477,81 @@ static void test_unfenced(void)
     void *ctx = make_ctx();
     atomic_store(&F.down, 1u << 6);
     CHECK(coldops_peer.see_epoch(ctx, 5) == 0 && !coldops_peer.writable(ctx));
-    atomic_store(&F.down, 0);
-    CHECK(!coldops_peer.writable(ctx));
     obj o;
     obj_make(&o, 100000, 6);
     CHECK(put(ctx, &o, 5) == TSDB_ERR_UNAVAILABLE);
+    atomic_store(&F.down, 0);
+    CHECK(wait_writable(ctx));
+    CHECK(put(ctx, &o, 5) == 0);
     atomic_store(&F.down, 0x7eu);
     void *c2 = make_ctx();
-    CHECK(coldops_peer.see_epoch(c2, 5) == TSDB_ERR_UNAVAILABLE);
+    CHECK(coldops_peer.see_epoch(c2, 5) == 0 && !coldops_peer.writable(c2));
     atomic_store(&F.down, 0);
+    set_view(1, 6); /* a new epoch meanwhile: the members are asked at the copy's */
+    CHECK(wait_writable(c2));
+    CHECK(chunk_be_epoch(chunksrv_backend(F.cs[1]), VOL) == 6);
     obj_free(&o);
     coldops_peer.ctx_free(c2);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* A member that hangs (its link up, no answer) while the deadline is far: an open with k' positions answers at once,
+ * decoding around it, never waiting for it (F5: one paused member made every cold read wait 30 s per position). */
+static void test_hang(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hang", dir, sizeof dir);
+    CP.timeout_ms = 600000;
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 1u << 20, 7);
+    CHECK(put(ctx, &o, 5) == 0);
+    atomic_store(&F.hang, 1u << 2);
+    chunk_report rep;
+    CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells > 0 && rep.st[1] == CHUNK_ST_DOWN);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, NULL, NULL, &h) == 0 && h);
+    coldops_peer.obj_close(h);
+    pthread_mutex_lock(&F.mu);
+    atomic_store(&F.hang, 0);
+    pthread_cond_broadcast(&F.hcv);
+    pthread_mutex_unlock(&F.mu);
+    CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells == 0);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* list_names reads every page of every member, and a garbled page is an error, never the end */
+static long listed;
+static int count_fn(void *c, const chunk_listed *e)
+{
+    (void)c, (void)e;
+    listed++;
+    return 0;
+}
+
+static void test_list(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("list", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    long want = 0;
+    for (uint8_t t = 1; t <= 7; t++) {
+        obj o;
+        obj_make(&o, 300000 + 1000 * t, (uint8_t)(t + 8));
+        CHECK(put(ctx, &o, 5) == 0);
+        want += chunk_npos(&o.g);
+        obj_free(&o);
+    }
+    chunkpeer_test_list_max = 3;
+    listed = 0;
+    CHECK(coldops_peer.list_names(ctx, count_fn, NULL) == 0 && listed == want);
+    atomic_store(&F.garble, 1u << 4);
+    CHECK(coldops_peer.list_names(ctx, count_fn, NULL) != 0);
     coldops_peer.ctx_free(ctx);
     cluster_down();
 }
@@ -471,6 +615,7 @@ int main(int argc, char **argv)
         }
     }
     pthread_mutex_init(&F.mu, NULL);
+    pthread_cond_init(&F.hcv, NULL);
     snprintf(S, sizeof S, "%s/test_chunkpeer.%d", base, (int)getpid());
     if (mkdir(S, 0755) != 0) {
         fprintf(stderr, "cannot make %s: %s\n", S, strerror(errno));
@@ -481,6 +626,8 @@ int main(int argc, char **argv)
     test_fence_del();
     test_unsure();
     test_unfenced();
+    test_hang();
+    test_list();
     test_threads();
     char cmd[PATH_MAX + 16];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", S);

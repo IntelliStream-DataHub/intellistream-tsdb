@@ -14,17 +14,21 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 int chunkpeer_mutant;
+uint32_t chunkpeer_test_list_max = CS_LIST_MAX;
 
 int chunkpeer_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"none", "ownepoch", "nosumcmp", "staleraise", "delbeforegc"};
+    static const char *const names[] = {"none", "ownepoch", "nosumcmp", "staleraise", "delbeforegc", "sticky",
+                                         "unsuredown"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++)
         if (!strcmp(name, names[i]))
             return (int)i;
@@ -101,10 +105,13 @@ typedef struct pctx {
     struct chunkpeer *cp;
     uint32_t volume;
     uint8_t vuuid[16];
-    atomic_bool unfenced;  /* a member did not take the epoch at see_epoch: no put or delete (writable false) */
+    atomic_bool unfenced;  /* a member did not hold the epoch when last asked: no put or delete (writable false) */
     atomic_bool del_said;  /* the refusal of deletes was logged */
     _Atomic uint64_t seen; /* the highest fence a member answered */
+    _Atomic int64_t asked_ms; /* when the members were last asked again while unfenced (one asker a second) */
 } pctx;
+
+static bool p_writable(void *ctx);
 
 int chunkpeer_make(void *arg, struct tier *t, uint32_t volume, const uint8_t vuuid[16], void **ctx)
 {
@@ -180,7 +187,7 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
 {
     pctx *p = ctx;
     struct chunkpeer *cp = p->cp;
-    if (atomic_load(&p->unfenced))
+    if (!p_writable(p))
         return TSDB_ERR_UNAVAILABLE;
     struct chunkpeer_view v;
     int rc = view_of(p, &v);
@@ -199,8 +206,14 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
     for (unsigned i = 0; i < npos; i++)
         s.fd[i] = -1;
     for (unsigned i = 0; i < npos && rc == 0; i++) {
-        s.fd[i] = open(cp->stage_dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
-        if (s.fd[i] < 0) {
+        /* mkstemp and unlink, never O_TMPFILE: macOS has none, and NFS (tsdbd's root in production) refuses it */
+        char path[PATH_MAX + 32];
+        snprintf(path, sizeof path, "%s/chunkstage.XXXXXX", cp->stage_dir);
+        s.fd[i] = mkstemp(path);
+        if (s.fd[i] >= 0) {
+            unlink(path);
+            (void)fcntl(s.fd[i], F_SETFD, FD_CLOEXEC);
+        } else {
             fprintf(stderr, "tsdbd: volume %" PRIu32 ": a put cannot be staged in %s: %s\n", p->volume, cp->stage_dir,
                     strerror(errno));
             rc = TSDB_ERR_IO;
@@ -325,6 +338,191 @@ static int fetch_sums(const struct chunkpeer_net *net, int tmo, uint32_t node, u
     return st;
 }
 
+/* ---------------------------------------------------------------- asking the positions at once */
+/* Every position is asked on a thread of its own, so that one member that hangs (paused, a stuck disk: the link is up
+ * and nothing answers) costs one deadline, not one per position, and an open that has its k' positions stops waiting
+ * for it after FAN_GRACE_MS. A thread the caller stopped waiting for finishes on its own: what it shares with the
+ * caller is the fan, reference-counted, and the transport, which outlives every context (tsdbd's holds the chunk
+ * server while a call is in it). It never touches a context or an object handle. */
+#define FAN_GRACE_MS 200
+
+typedef struct ask {
+    int st; /* SUMS: CHUNK_ST_*; EPOCH: the call's rc (0, or the error) */
+    chunk_geom g;
+    uint64_t *sums;
+    uint64_t fence;
+    bool unsure;
+} ask;
+
+typedef struct fan fan;
+typedef struct fan_job {
+    fan *f;
+    unsigned i;
+} fan_job;
+
+struct fan {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int refs;
+    unsigned n, done, ok;
+    bool epoch_op; /* CS_OP_EPOCH at epoch, else CS_OP_SUMS (of the whole table with expect, else one sum) */
+    struct chunkpeer_net net;
+    int tmo;
+    uint32_t volume;
+    uint64_t epoch;
+    uint8_t vuuid[16], oid[16];
+    bool has_expect;
+    chunk_geom expect;
+    uint32_t node[CHUNK_POS_MAX];
+    ask a[CHUNK_POS_MAX];
+    bool fin[CHUNK_POS_MAX];
+    fan_job job[CHUNK_POS_MAX];
+};
+
+static atomic_int fan_threads; /* asks still running, abandoned ones included (chunkpeer_quiesce) */
+
+static void fan_one(fan *f, unsigned i, ask *out)
+{
+    memset(out, 0, sizeof *out);
+    if (!f->epoch_op) {
+        out->st = fetch_sums(&f->net, f->tmo, f->node[i], f->volume, f->epoch, f->vuuid, f->oid, i,
+                             f->has_expect ? &f->expect : NULL, &out->g, &out->sums);
+        return;
+    }
+    struct cs_req r;
+    req_init(&r, CS_OP_EPOCH, f->volume, f->epoch, NULL, NULL, 0);
+    int32_t arc = 0;
+    uint8_t *b = NULL;
+    size_t bn = 0;
+    int rc = f->net.call(f->net.arg, f->node[i], &r, f->tmo, &arc, &b, &bn);
+    if (rc == 0 && arc != 0)
+        rc = arc;
+    if (rc == 0 && bn != 9)
+        rc = TSDB_ERR_IO;
+    if (rc == 0) {
+        out->fence = get64(b);
+        out->unsure = b[8] != 0;
+    }
+    free(b);
+    out->st = rc;
+}
+
+static bool fan_ok(const fan *f, const ask *a) { return f->epoch_op ? a->st == 0 : a->st == CHUNK_ST_OK; }
+
+static void fan_unref_locked(fan *f) /* unlocks f->mu; frees f at the last reference */
+{
+    bool last = --f->refs == 0;
+    pthread_mutex_unlock(&f->mu);
+    if (!last)
+        return;
+    for (unsigned i = 0; i < f->n; i++)
+        free(f->a[i].sums);
+    pthread_cond_destroy(&f->cv);
+    pthread_mutex_destroy(&f->mu);
+    free(f);
+}
+
+static void fan_record(fan *f, unsigned i, ask *a)
+{
+    pthread_mutex_lock(&f->mu);
+    f->a[i] = *a;
+    f->fin[i] = true;
+    f->done++;
+    f->ok += fan_ok(f, a);
+    pthread_cond_broadcast(&f->cv);
+}
+
+static void *fan_main(void *arg)
+{
+    fan_job *j = arg;
+    fan *f = j->f;
+    ask a;
+    fan_one(f, j->i, &a);
+    fan_record(f, j->i, &a);
+    fan_unref_locked(f);
+    atomic_fetch_sub(&fan_threads, 1);
+    return NULL;
+}
+
+/* Asks positions 0..n-1 of f and waits until all answered, or `need` (> 0) are OK and FAN_GRACE_MS more passed (0
+ * grace with need 1: the first OK), or, with stop_on_fail, one failed. out[i] gets each answer (its sums move to the
+ * caller), `unfinished` where none came in time. Consumes the caller's reference on f. */
+static void fan_run(fan *f, unsigned need, int grace_ms, bool stop_on_fail, ask *out, int unfinished)
+{
+    pthread_mutex_init(&f->mu, NULL);
+    pthread_cond_init(&f->cv, NULL);
+    f->refs = 1 + (int)f->n;
+    for (unsigned i = 0; i < f->n; i++) {
+        f->job[i] = (fan_job){f, i};
+        pthread_attr_t at;
+        pthread_t th;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        atomic_fetch_add(&fan_threads, 1);
+        int e = pthread_create(&th, &at, fan_main, &f->job[i]);
+        pthread_attr_destroy(&at);
+        if (e != 0) { /* no thread: asked here, in turn */
+            atomic_fetch_sub(&fan_threads, 1);
+            ask a;
+            fan_one(f, i, &a);
+            fan_record(f, i, &a);
+            f->refs--;
+            pthread_mutex_unlock(&f->mu);
+        }
+    }
+    pthread_mutex_lock(&f->mu);
+    bool armed = false;
+    struct timespec dl;
+    while (f->done < f->n && !(stop_on_fail && f->done > f->ok)) {
+        if (need && f->ok >= need) {
+            if (!armed) {
+                clock_gettime(CLOCK_REALTIME, &dl);
+                dl.tv_sec += grace_ms / 1000;
+                dl.tv_nsec += (long)(grace_ms % 1000) * 1000000L;
+                if (dl.tv_nsec >= 1000000000L)
+                    dl.tv_sec++, dl.tv_nsec -= 1000000000L;
+                armed = true;
+            }
+            if (pthread_cond_timedwait(&f->cv, &f->mu, &dl) == ETIMEDOUT)
+                break;
+            continue;
+        }
+        pthread_cond_wait(&f->cv, &f->mu);
+    }
+    for (unsigned i = 0; i < f->n; i++) {
+        if (f->fin[i]) {
+            out[i] = f->a[i];
+            f->a[i].sums = NULL;
+        } else {
+            memset(&out[i], 0, sizeof out[i]);
+            out[i].st = unfinished;
+        }
+    }
+    fan_unref_locked(f);
+}
+
+static fan *fan_new(const struct chunkpeer *cp, uint32_t volume, uint64_t epoch, const uint32_t *nodes, unsigned n)
+{
+    fan *f = calloc(1, sizeof *f);
+    if (!f)
+        return NULL;
+    f->net = cp->net;
+    f->tmo = timeout_of(cp);
+    f->volume = volume;
+    f->epoch = epoch;
+    f->n = n;
+    memcpy(f->node, nodes, n * sizeof *nodes);
+    return f;
+}
+
+void chunkpeer_quiesce(void)
+{
+    while (atomic_load(&fan_threads) > 0) {
+        struct timespec ts = {0, 2 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
 static int src_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
 {
     struct cold_obj *o = ctx;
@@ -371,6 +569,19 @@ static void p_obj_close(cold_obj *o)
     free(o);
 }
 
+/* An open with no position OK: NOTFOUND only when every position answered that it holds no such chunk; UNAVAILABLE
+ * when one is away or failed to read (its chunk may be there: E15, never CORRUPT for that), CORRUPT when the rest
+ * failed their checks (another encoding of the object, a header or table that does not parse). */
+static int none_ok(const int *st, unsigned n)
+{
+    bool away = false, damaged = false;
+    for (unsigned i = 0; i < n; i++) {
+        away |= st[i] == CHUNK_ST_DOWN || st[i] == CHUNK_ST_IOERR;
+        damaged |= st[i] == CHUNK_ST_DAMAGED;
+    }
+    return away ? TSDB_ERR_UNAVAILABLE : damaged ? TSDB_ERR_CORRUPT : TSDB_ERR_NOTFOUND;
+}
+
 static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
                       cold_obj **out)
 {
@@ -391,21 +602,30 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
     memcpy(o->oid, oid, 16);
     for (unsigned i = 0; i < v.nstripe; i++)
         o->node[i] = v.stripe[i];
-    bool down = false;
     if (expect) {
         o->g = *expect;
     } else { /* the geometry from the first header found (positions are placed whatever k' is: E9) */
+        fan *f = fan_new(p->cp, o->volume, o->epoch, o->node, v.nstripe);
+        if (!f) {
+            p_obj_close(o);
+            return TSDB_ERR_NOMEM;
+        }
+        memcpy(f->vuuid, o->vuuid, 16);
+        memcpy(f->oid, oid, 16);
+        ask a[CHUNK_POS_MAX];
+        fan_run(f, 1, 0, false, a, CHUNK_ST_DOWN);
+        int st[CHUNK_POS_MAX];
         bool found = false;
-        for (unsigned i = 0; i < v.nstripe && !found; i++) {
-            uint64_t *none;
-            int st = fetch_sums(&o->net, o->timeout_ms, o->node[i], o->volume, o->epoch, o->vuuid, oid, i, NULL,
-                                &o->g, &none);
-            found = st == CHUNK_ST_OK;
-            down |= st == CHUNK_ST_DOWN;
+        for (unsigned i = 0; i < v.nstripe; i++) {
+            st[i] = a[i].st;
+            if (a[i].st == CHUNK_ST_OK && !found) {
+                o->g = a[i].g;
+                found = true;
+            }
         }
         if (!found) {
             p_obj_close(o);
-            return down ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_NOTFOUND;
+            return none_ok(st, v.nstripe);
         }
     }
     o->npos = chunk_npos(&o->g);
@@ -413,18 +633,28 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
         p_obj_close(o);
         return TSDB_ERR_CORRUPT; /* an object record of more positions than the volume has members */
     }
+    fan *f = fan_new(p->cp, o->volume, o->epoch, o->node, o->npos);
+    if (!f) {
+        p_obj_close(o);
+        return TSDB_ERR_NOMEM;
+    }
+    memcpy(f->vuuid, o->vuuid, 16);
+    memcpy(f->oid, oid, 16);
+    f->has_expect = true;
+    f->expect = o->g;
+    ask a[CHUNK_POS_MAX];
+    /* k' positions are enough to read every byte: one that does not answer by then is DOWN for this handle */
+    fan_run(f, o->g.k, FAN_GRACE_MS, false, a, CHUNK_ST_DOWN);
     unsigned ok = 0;
-    down = false;
     for (unsigned i = 0; i < o->npos; i++) {
-        chunk_geom h;
-        o->st[i] = fetch_sums(&o->net, o->timeout_ms, o->node[i], o->volume, o->epoch, o->vuuid, oid, i, &o->g, &h,
-                              &o->sums[i]);
+        o->st[i] = a[i].st;
+        o->sums[i] = a[i].sums;
         ok += o->st[i] == CHUNK_ST_OK;
-        down |= o->st[i] == CHUNK_ST_DOWN;
     }
     if (ok == 0) {
+        int rc0 = none_ok(o->st, o->npos);
         p_obj_close(o);
-        return down ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_NOTFOUND;
+        return rc0;
     }
     if (rec_sums) {
         size_t n = chunk_sums_total(&o->g);
@@ -523,7 +753,7 @@ static int p_list_names(void *ctx, chunk_list_fn fn, void *fctx)
             uint8_t *b;
             size_t bn;
             uint32_t n = 0;
-            if ((rc = list_page(p, v.stripe[i], has, coid, cpos, CS_LIST_MAX, &b, &bn, &n, &more)) != 0)
+            if ((rc = list_page(p, v.stripe[i], has, coid, cpos, chunkpeer_test_list_max, &b, &bn, &n, &more)) != 0)
                 break;
             for (uint32_t j = 0; j < n && rc == 0; j++) {
                 chunk_listed c;
@@ -591,69 +821,112 @@ static int p_owner(void *ctx, const chunk_listed *c, uint8_t vuuid[16])
 }
 
 /* ---------------------------------------------------------------- epoch and state */
-/* EPOCH at e on member `node`: 0 with its fence and whether it is unsure, or the transport's error. */
-static int ask_epoch(pctx *p, uint32_t node, uint64_t e, uint64_t *fence, bool *unsure)
+/* EPOCH at e on every stripe member at once (e 0: only asks): how many hold e (a fence at or above it, a store that is
+ * sure) in *held, how many answered at all in *answered (NULL: not wanted); *first_bad the first that did not hold it
+ * (its index), its answer in *bad. */
+static int ask_all(pctx *p, uint64_t e, bool stop_on_fail, unsigned *held, unsigned *answered, unsigned *nstripe,
+                   int *first_bad, ask *bad)
 {
-    struct cs_req r;
-    req_init(&r, CS_OP_EPOCH, p->volume, e, NULL, NULL, 0);
-    int32_t arc = 0;
-    uint8_t *b = NULL;
-    size_t bn = 0;
-    int rc = p->cp->net.call(p->cp->net.arg, node, &r, timeout_of(p->cp), &arc, &b, &bn);
-    if (rc == 0 && arc != 0)
-        rc = arc;
-    if (rc == 0 && bn != 9)
-        rc = TSDB_ERR_IO;
-    if (rc == 0) {
-        *fence = get64(b);
-        *unsure = b[8] != 0;
-        see_fence(p, *fence);
-    }
-    free(b);
-    return rc;
-}
-
-static int p_see_epoch(void *ctx, uint64_t e)
-{
-    pctx *p = ctx;
     struct chunkpeer_view v;
     int rc = view_of(p, &v);
     if (rc)
         return rc;
-    unsigned held = 0;
+    fan *f = fan_new(p->cp, p->volume, e, v.stripe, v.nstripe);
+    if (!f)
+        return TSDB_ERR_NOMEM;
+    f->epoch_op = true;
+    ask a[CHUNK_POS_MAX];
+    fan_run(f, 0, 0, stop_on_fail, a, TSDB_ERR_UNAVAILABLE);
+    *held = 0;
+    if (answered)
+        *answered = 0;
+    *nstripe = v.nstripe;
+    *first_bad = -1;
     for (unsigned i = 0; i < v.nstripe; i++) {
-        uint64_t fence = 0;
-        bool unsure = true;
-        int arc = ask_epoch(p, v.stripe[i], e, &fence, &unsure);
-        if (arc == 0 && fence >= e && !unsure) {
-            held++;
+        if (a[i].st == 0) {
+            see_fence(p, a[i].fence);
+            if (answered)
+                (*answered)++;
+        }
+        if (a[i].st == 0 && a[i].fence >= e && !a[i].unsure) {
+            (*held)++;
             continue;
         }
-        atomic_store(&p->unfenced, true); /* see_epoch runs at attach only: one line per member that refused */
-        fprintf(stderr, "tsdbd: volume %" PRIu32 ": stripe member %" PRIu32 " (position %u) does not hold epoch %"
-                            PRIu64 " (%s): no put or delete of the volume until it is opened again\n", p->volume,
-                    v.stripe[i], i, e, arc ? err_name(arc) : unsure ? "its store is unsure" : "a lower fence");
+        if (*first_bad < 0) {
+            *first_bad = (int)i;
+            *bad = a[i];
+            if (bad->st == 0)
+                bad->st = bad->unsure ? CHUNK_ERR_EPOCH_UNSURE : CHUNK_ERR_FENCED;
+        }
     }
-    return held ? 0 : TSDB_ERR_UNAVAILABLE;
+    return 0;
+}
+
+/* At attach (a writer's open, a promotion, a replica's open). A member that is away or does not take e makes the
+ * context unfenced: no put or delete until every member holds the copy's epoch (asked again by writable, at most once a
+ * second). Never an error for members that are away: an attach that failed would refuse the volume until tsdbd
+ * restarts, and a cluster's cold start opens its volumes before the chunk links are up. */
+static int p_see_epoch(void *ctx, uint64_t e)
+{
+    pctx *p = ctx;
+    unsigned held, n;
+    int bad_i;
+    ask bad;
+    int rc = ask_all(p, e, false, &held, NULL, &n, &bad_i, &bad);
+    if (rc)
+        return rc;
+    if (held == n) {
+        atomic_store(&p->unfenced, false);
+        return 0;
+    }
+    atomic_store(&p->unfenced, true);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    atomic_store(&p->asked_ms, (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    fprintf(stderr, "tsdbd: volume %" PRIu32 ": %u of %u stripe members do not hold epoch %" PRIu64 " (position %d: "
+                    "%s): no put or delete of the volume until they do (asked again every second)\n",
+            p->volume, n - held, n, e, bad_i, err_name(bad.st));
+    return 0;
 }
 
 static uint64_t p_epoch(void *ctx) { return atomic_load(&((pctx *)ctx)->seen); }
 
-static bool p_writable(void *ctx) { return !atomic_load(&((pctx *)ctx)->unfenced); }
-
-static bool p_all_up(void *ctx)
+static bool p_writable(void *ctx)
 {
     pctx *p = ctx;
+    if (!atomic_load(&p->unfenced))
+        return true;
+    if (chunkpeer_mutant == CP_MUT_STICKY)
+        return false; /* planted: unfenced for the context's life (a promoted leader never settles again) */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, last = atomic_load(&p->asked_ms);
+    if (now - last < 1000 || !atomic_compare_exchange_strong(&p->asked_ms, &last, now))
+        return false; /* asked within the last second, or another thread asks now */
     struct chunkpeer_view v;
-    if (view_of(p, &v) != 0)
+    if (view_of(p, &v) != 0 || v.epoch == 0)
         return false;
-    for (unsigned i = 0; i < v.nstripe; i++) {
-        uint64_t fence;
-        bool unsure;
-        if (ask_epoch(p, v.stripe[i], 0, &fence, &unsure) != 0)
-            return false;
-    }
+    unsigned held, n;
+    int bad_i;
+    ask bad;
+    if (ask_all(p, v.epoch, true, &held, NULL, &n, &bad_i, &bad) != 0 || held != n)
+        return false;
+    atomic_store(&p->unfenced, false);
+    fprintf(stderr, "tsdbd: volume %" PRIu32 ": every stripe member holds epoch %" PRIu64 ": puts and deletes go "
+                    "on\n", p->volume, v.epoch);
     return true;
+}
+
+/* Every member answered: an unsure store is UP (as the directory backend's is) and refuses puts itself; counting it
+ * down made eccold's stripe_ok refuse every settle before its put while one store was unsure (ecbasic's D9 case). */
+static bool p_all_up(void *ctx)
+{
+    unsigned held, up, n;
+    int bad_i;
+    ask bad;
+    if (chunkpeer_mutant == CP_MUT_UNSUREDOWN)
+        return ask_all(ctx, 0, true, &held, &up, &n, &bad_i, &bad) == 0 && held == n; /* planted: unsure is down */
+    return ask_all(ctx, 0, true, &held, &up, &n, &bad_i, &bad) == 0 && up == n;
 }
 
 static uint64_t p_stripe_version(void *ctx)
