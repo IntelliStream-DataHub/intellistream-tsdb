@@ -17,9 +17,11 @@
  *
  *   test_crashfs [scratch dir]        (needs build/libcrashfs.so beside the binary)
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,10 +50,22 @@ static int failures;
 /* The child's steps under the shim: 512 bytes of 'A' synced, then (by `how`) a rewrite of them with 'B' through
  * pwritev ("pwritev"), an append of 'B' through writev ("writev") or nothing ("none"). */
 static int child_reuse(const char *file, const char *how);
+static int child_rmdir(const char *dir, const char *how);
+static int child_tear_link(const char *dir, const char *how);
+static int child_rename_hl(const char *dir, const char *how);
+static int child_unlink_append(const char *dir, const char *how);
 static int child(const char *file, const char *how)
 {
     if (!strncmp(how, "reuse", 5))
         return child_reuse(file, how);
+    if (!strncmp(how, "rmdir", 5))
+        return child_rmdir(file, how);
+    if (!strncmp(how, "tear-link", 9))
+        return child_tear_link(file, how);
+    if (!strncmp(how, "rename-", 7))
+        return child_rename_hl(file, how);
+    if (!strncmp(how, "ul-", 3))
+        return child_unlink_append(file, how);
     int fd = open(file, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         return 3;
@@ -139,19 +153,251 @@ static int child_reuse(const char *file, const char *how)
 }
 #endif
 
-static int run(const char *dir, const char *file, const char *how, const char *prob, int warmup)
+static int make_synced_file(const char *path, int fill)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    char buf[512];
+    memset(buf, fill, sizeof buf);
+    if (pwrite(fd, buf, sizeof buf, 0) != (ssize_t)sizeof buf || fsync(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int sync_dir(const char *dir)
+{
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0)
+        return -1;
+    int rc = fsync(dfd);
+    close(dfd);
+    return rc;
+}
+
+static bool has_saved_artifact(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d)
+        return true;
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!strncmp(e->d_name, ".crashfs_saved_", 15)) {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static int child_rmdir(const char *dir, const char *how)
+{
+    if (!strcmp(how, "rmdir-tear")) {
+        char d1[PATH_MAX + 32], a[PATH_MAX + 48], out[PATH_MAX + 32];
+        snprintf(d1, sizeof d1, "%s/d1", dir);
+        snprintf(a, sizeof a, "%s/d1/a", dir);
+        snprintf(out, sizeof out, "%s/out", dir);
+        if (mkdir(d1, 0755) != 0 || make_synced_file(a, 'A') != 0)
+            return 3;
+        if (sync_dir(d1) != 0 || sync_dir(dir) != 0)
+            return 4;
+        if (rename(a, out) != 0 || rmdir(d1) != 0)
+            return 5;
+        return 7;
+    }
+    if (!strcmp(how, "rmdir-fork")) {
+        char d1[PATH_MAX + 32];
+        snprintf(d1, sizeof d1, "%s/d1", dir);
+        if (mkdir(d1, 0755) != 0 || sync_dir(dir) != 0)
+            return 3;
+        if (rmdir(d1) != 0)
+            return 4;
+        pid_t p = fork();
+        if (p < 0)
+            return 5;
+        if (p == 0)
+            exit(0); /* normal exit runs fini() in forked child; must not delete parent's saved dir */
+        int st = 0;
+        if (waitpid(p, &st, 0) != p || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+            return 6;
+        raise(SIGUSR2);
+        int fd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (fd >= 0)
+            close(fd);
+        return 7; /* unreachable: power_loss() exits with 99 */
+    }
+    if (!strcmp(how, "rmdir-sib")) {
+        char sib[PATH_MAX + 32];
+        snprintf(sib, sizeof sib, "%s2", dir);
+        if (rmdir(sib) != 0)
+            return 4;
+        return 7;
+    }
+    char d1[PATH_MAX + 32], d2[PATH_MAX + 32], d3[PATH_MAX + 32], d3in[PATH_MAX + 48];
+    char d4[PATH_MAX + 32], d5[PATH_MAX + 32], d5sl[PATH_MAX + 34], f[PATH_MAX + 32];
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    snprintf(d2, sizeof d2, "%s/d2", dir);
+    snprintf(d3, sizeof d3, "%s/d3", dir);
+    snprintf(d3in, sizeof d3in, "%s/d3/inside", dir);
+    snprintf(d4, sizeof d4, "%s/d4", dir);
+    snprintf(d5, sizeof d5, "%s/d5", dir);
+    snprintf(d5sl, sizeof d5sl, "%s/d5/", dir);
+    snprintf(f, sizeof f, "%s/f", dir);
+    if (mkdir(d1, 0755) != 0 || mkdir(d2, 0755) != 0 || mkdir(d3, 0755) != 0 || mkdir(d3in, 0755) != 0 ||
+        mkdir(d4, 0755) != 0 || mkdir(d5, 0755) != 0 || make_synced_file(f, 'A') != 0)
+        return 3;
+    if (sync_dir(d3) != 0 || sync_dir(dir) != 0)
+        return 4;
+    if (rmdir(d3) == 0 || (errno != ENOTEMPTY && errno != EEXIST))
+        return 5;
+    if (rmdir(f) == 0 || errno != ENOTDIR)
+        return 6;
+    if (rmdir(d4) != 0 || sync_dir(dir) != 0)
+        return 8;
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0)
+        return 9;
+    if (rmdir(d1) != 0 || unlinkat(dfd, "d2", AT_REMOVEDIR) != 0 || rmdir(d5sl) != 0) {
+        close(dfd);
+        return 10;
+    }
+    close(dfd);
+    return 7;
+}
+
+static int child_tear_link(const char *dir, const char *how)
+{
+    if (!strcmp(how, "tear-link-dren")) {
+        char d1[PATH_MAX + 32], d2[PATH_MAX + 32], a1[PATH_MAX + 48], l1[PATH_MAX + 48], a2[PATH_MAX + 48];
+        snprintf(d1, sizeof d1, "%s/d1", dir);
+        snprintf(d2, sizeof d2, "%s/d2", dir);
+        snprintf(a1, sizeof a1, "%s/a", d1);
+        snprintf(l1, sizeof l1, "%s/l", d1);
+        snprintf(a2, sizeof a2, "%s/a", d2);
+        if (mkdir(d1, 0755) != 0 || make_synced_file(a1, 'A') != 0)
+            return 3;
+        if (sync_dir(d1) != 0 || sync_dir(dir) != 0)
+            return 4;
+        if (link(a1, l1) != 0 || rename(d1, d2) != 0 || sync_dir(dir) != 0 || unlink(a2) != 0)
+            return 5;
+        return 7;
+    }
+    if (!strcmp(how, "tear-link-xdir")) {
+        char s1[PATH_MAX + 32], s2[PATH_MAX + 32], a[PATH_MAX + 48], l[PATH_MAX + 48];
+        snprintf(s1, sizeof s1, "%s/s1", dir);
+        snprintf(s2, sizeof s2, "%s/s2", dir);
+        snprintf(a, sizeof a, "%s/a", s1);
+        snprintf(l, sizeof l, "%s/l", s2);
+        if (mkdir(s1, 0755) != 0 || mkdir(s2, 0755) != 0 || make_synced_file(a, 'A') != 0)
+            return 3;
+        if (sync_dir(s1) != 0 || sync_dir(s2) != 0 || sync_dir(dir) != 0)
+            return 4;
+        if (link(a, l) != 0 || unlink(a) != 0)
+            return 5;
+        return 7;
+    }
+    char a[PATH_MAX + 32], l[PATH_MAX + 32];
+    snprintf(a, sizeof a, "%s/a", dir);
+    snprintf(l, sizeof l, "%s/l", dir);
+    if (make_synced_file(a, 'A') != 0 || sync_dir(dir) != 0)
+        return 3;
+    if (link(a, l) != 0 || unlink(a) != 0)
+        return 5;
+    return 7;
+}
+
+static int child_rename_hl(const char *dir, const char *how)
+{
+    if (!strcmp(how, "rename-sym")) {
+        char a[PATH_MAX + 32], s[PATH_MAX + 32];
+        snprintf(a, sizeof a, "%s/a", dir);
+        snprintf(s, sizeof s, "%s/s", dir);
+        if (make_synced_file(a, 'A') != 0 || symlink(a, s) != 0 || sync_dir(dir) != 0)
+            return 3;
+        if (rename(s, a) != 0)
+            return 4;
+        return 7;
+    }
+    char a[PATH_MAX + 32], b[PATH_MAX + 32];
+    snprintf(a, sizeof a, "%s/a", dir);
+    snprintf(b, sizeof b, "%s/b", dir);
+    if (make_synced_file(a, 'A') != 0 || link(a, b) != 0 || sync_dir(dir) != 0)
+        return 3;
+    if (rename(a, b) != 0)
+        return 4;
+    if (has_saved_artifact(dir))
+        return 5;
+    if (sync_dir(dir) != 0)
+        return 6;
+    if (has_saved_artifact(dir))
+        return 8;
+    return 7;
+}
+
+static int child_unlink_append(const char *dir, const char *how)
+{
+    char a[PATH_MAX + 32], b[PATH_MAX + 32], tail[512];
+    snprintf(a, sizeof a, "%s/a", dir);
+    snprintf(b, sizeof b, "%s/b", dir);
+    memset(tail, 'B', sizeof tail);
+    if (make_synced_file(a, 'A') != 0 || link(a, b) != 0 || sync_dir(dir) != 0)
+        return 3;
+    if (!strcmp(how, "ul-open")) {
+        int fd = open(a, O_WRONLY | O_APPEND);
+        if (fd < 0 || unlink(a) != 0 || sync_dir(dir) != 0)
+            return 4;
+        if (write(fd, tail, sizeof tail) != (ssize_t)sizeof tail)
+            return 5;
+        return 7;
+    }
+    int fb = open(b, O_WRONLY | O_APPEND);
+    int fa = open(a, O_RDONLY);
+    if (fb < 0 || fa < 0)
+        return 4;
+    close(fa);
+    if (unlink(a) != 0 || sync_dir(dir) != 0) {
+        close(fb);
+        return 5;
+    }
+    if (write(fb, tail, sizeof tail) != (ssize_t)sizeof tail) {
+        close(fb);
+        return 6;
+    }
+    close(fb);
+    return 7;
+}
+
+static int run_ext(const char *dir, const char *file, const char *how, const char *prob, int warmup, bool tear,
+                   unsigned long seed, int undo_one, bool at_exit)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        char asan[512], w[16];
+        char asan[512], w[16], sd[32], u[16];
         snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
         setenv("ASAN_OPTIONS", asan, 1);
         snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%lu", seed);
         setenv("LD_PRELOAD", SHIM, 1);
         setenv("CRASHFS_ROOT", dir, 1);
         setenv("CRASHFS_PROB", prob, 1);
         setenv("CRASHFS_WARMUP", w, 1);
-        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_AT_EXIT", at_exit ? "1" : "0", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        if (tear)
+            setenv("CRASHFS_TEAR", "1", 1);
+        else
+            unsetenv("CRASHFS_TEAR");
+        if (undo_one >= 0) {
+            snprintf(u, sizeof u, "%d", undo_one);
+            setenv("CRASHFS_UNDO_ONE", u, 1);
+        } else {
+            unsetenv("CRASHFS_UNDO_ONE");
+        }
         if (!strncmp(how, "reuse", 5)) {
             setenv("CRASHFS_MODE", "eio", 1);
             setenv("CRASHFS_EIO_ONLY", "x", 1);
@@ -171,6 +417,11 @@ static int run(const char *dir, const char *file, const char *how, const char *p
     if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
         return -1;
     return WEXITSTATUS(st);
+}
+
+static int run(const char *dir, const char *file, const char *how, const char *prob, int warmup)
+{
+    return run_ext(dir, file, how, prob, warmup, false, 1, -1, true);
 }
 
 /* A rewrite in place through pwritev is not durable without a sync: the power loss at exit takes it back. */
@@ -283,6 +534,203 @@ static void inode_reuse(const char *dir)
 static void inode_reuse(const char *dir) { (void)dir; }
 #endif
 
+static bool check_file_512a(const char *path)
+{
+    char got[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    ssize_t n = read(fd, got, sizeof got);
+    close(fd);
+    if (n != 512)
+        return false;
+    for (int i = 0; i < 512; i++)
+        if (got[i] != 'A')
+            return false;
+    return true;
+}
+
+static void rmdir_rollback(const char *top)
+{
+    char dir[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s/rmdir_rb", top);
+    CHECK(mkdir(dir, 0755) == 0);
+    CHECK(run_ext(dir, dir, "rmdir", "0", 0, false, 1, -1, true) == 7);
+    char d1[PATH_MAX + 48], d2[PATH_MAX + 48], d3in[PATH_MAX + 64], d4[PATH_MAX + 48], d5[PATH_MAX + 48], f[PATH_MAX + 48];
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    snprintf(d2, sizeof d2, "%s/d2", dir);
+    snprintf(d3in, sizeof d3in, "%s/d3/inside", dir);
+    snprintf(d4, sizeof d4, "%s/d4", dir);
+    snprintf(d5, sizeof d5, "%s/d5", dir);
+    snprintf(f, sizeof f, "%s/f", dir);
+    struct stat st;
+    CHECK(stat(d1, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(stat(d2, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(stat(d5, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(stat(d3in, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(stat(d4, &st) != 0 && errno == ENOENT);
+    CHECK(check_file_512a(f));
+    CHECK(!has_saved_artifact(dir));
+
+    /* normal exit without CRASHFS_AT_EXIT cleans up unsynced .crashfs_saved_* entries */
+    snprintf(dir, sizeof dir, "%s/rmdir_fini", top);
+    CHECK(mkdir(dir, 0755) == 0);
+    CHECK(run_ext(dir, dir, "rmdir", "0", 0, false, 1, -1, false) == 7);
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    snprintf(d2, sizeof d2, "%s/d2", dir);
+    snprintf(d3in, sizeof d3in, "%s/d3/inside", dir);
+    snprintf(d4, sizeof d4, "%s/d4", dir);
+    snprintf(d5, sizeof d5, "%s/d5", dir);
+    snprintf(f, sizeof f, "%s/f", dir);
+    CHECK(stat(d1, &st) != 0 && errno == ENOENT);
+    CHECK(stat(d2, &st) != 0 && errno == ENOENT);
+    CHECK(stat(d4, &st) != 0 && errno == ENOENT);
+    CHECK(stat(d5, &st) != 0 && errno == ENOENT);
+    CHECK(stat(d3in, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(check_file_512a(f));
+    CHECK(!has_saved_artifact(dir));
+
+    /* CRASHFS_TEAR: undoing rename(d1/a, out) must also undo rmdir(d1) via name_inside_cut */
+    for (int u = 0; u <= 2; u++) {
+        snprintf(dir, sizeof dir, "%s/rmdir_tear_u%d", top, u);
+        CHECK(mkdir(dir, 0755) == 0);
+        CHECK(run_ext(dir, dir, "rmdir-tear", "0", 0, true, 1, u, true) == 7);
+        char a[PATH_MAX + 64], out[PATH_MAX + 48];
+        snprintf(d1, sizeof d1, "%s/d1", dir);
+        snprintf(a, sizeof a, "%s/d1/a", dir);
+        snprintf(out, sizeof out, "%s/out", dir);
+        if (u == 0) {
+            CHECK(stat(d1, &st) == 0 && S_ISDIR(st.st_mode));
+            CHECK(check_file_512a(a));
+            CHECK(access(out, F_OK) != 0 && errno == ENOENT);
+            CHECK(!has_saved_artifact(d1));
+        } else if (u == 1) {
+            CHECK(stat(d1, &st) == 0 && S_ISDIR(st.st_mode));
+            CHECK(access(a, F_OK) != 0 && errno == ENOENT);
+            CHECK(check_file_512a(out));
+        } else {
+            CHECK(stat(d1, &st) != 0 && errno == ENOENT);
+            CHECK(check_file_512a(out));
+        }
+        CHECK(!has_saved_artifact(dir));
+    }
+
+    /* forked child normal exit must not delete parent's .crashfs_saved_* backup */
+    snprintf(dir, sizeof dir, "%s/rmdir_fork", top);
+    CHECK(mkdir(dir, 0755) == 0);
+    CHECK(run_ext(dir, dir, "rmdir-fork", "0", 0, false, 1, -1, false) == 99);
+    snprintf(d1, sizeof d1, "%s/d1", dir);
+    CHECK(stat(d1, &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(!has_saved_artifact(dir));
+
+    /* sibling path sharing prefix with CRASHFS_ROOT must not be tracked */
+    char sib[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s/rmdir_sib", top);
+    snprintf(sib, sizeof sib, "%s/rmdir_sib2", top);
+    CHECK(mkdir(dir, 0755) == 0 && mkdir(sib, 0755) == 0);
+    CHECK(run_ext(dir, dir, "rmdir-sib", "0", 0, false, 1, -1, true) == 7);
+    CHECK(stat(sib, &st) != 0 && errno == ENOENT);
+    CHECK(!has_saved_artifact(top));
+}
+
+static void check_tear_link_one(const char *dir, const char *how, int mode, unsigned long sd, int undo_one)
+{
+    CHECK(mkdir(dir, 0755) == 0);
+    CHECK(run_ext(dir, dir, how, "0", 0, true, sd, undo_one, true) == 7);
+    char a[PATH_MAX + 64], l[PATH_MAX + 64];
+    snprintf(a, sizeof a, mode == 1 ? "%s/s1/a" : mode == 2 ? "%s/d2/a" : "%s/a", dir);
+    snprintf(l, sizeof l, mode == 1 ? "%s/s2/l" : mode == 2 ? "%s/d2/l" : "%s/l", dir);
+    bool ha = access(a, F_OK) == 0, hl = access(l, F_OK) == 0;
+    if (undo_one == 0)
+        CHECK(ha && !hl);
+    else if (undo_one == 1)
+        CHECK(ha && hl);
+    else if (undo_one == 2)
+        CHECK(!ha && hl);
+    else
+        CHECK(ha || hl);
+    CHECK(!ha || check_file_512a(a));
+    CHECK(!hl || check_file_512a(l));
+    CHECK(!has_saved_artifact(dir));
+    if (mode == 1) {
+        char s1[PATH_MAX + 64], s2[PATH_MAX + 64];
+        snprintf(s1, sizeof s1, "%s/s1", dir);
+        snprintf(s2, sizeof s2, "%s/s2", dir);
+        CHECK(!has_saved_artifact(s1));
+        CHECK(!has_saved_artifact(s2));
+    } else if (mode == 2) {
+        char d2[PATH_MAX + 64];
+        snprintf(d2, sizeof d2, "%s/d2", dir);
+        CHECK(!has_saved_artifact(d2));
+    }
+}
+
+static void tear_link_unlink(const char *top)
+{
+    const char *hows[] = {"tear-link", "tear-link-xdir", "tear-link-dren"};
+    for (int h = 0; h < 3; h++) {
+        for (int u = 0; u <= 2; u++) {
+            char dir[PATH_MAX + 48];
+            snprintf(dir, sizeof dir, "%s/tl_%d_u%d", top, h, u);
+            check_tear_link_one(dir, hows[h], h, 1, u);
+        }
+        for (unsigned long sd = 1; sd <= 32; sd++) {
+            char dir[PATH_MAX + 48];
+            snprintf(dir, sizeof dir, "%s/tl_%d_s%lu", top, h, sd);
+            check_tear_link_one(dir, hows[h], h, sd, -1);
+        }
+    }
+}
+
+static void rename_hardlink(const char *top)
+{
+    for (int ae = 0; ae <= 1; ae++) {
+        char dir[PATH_MAX + 32];
+        snprintf(dir, sizeof dir, "%s/rhl_%d", top, ae);
+        CHECK(mkdir(dir, 0755) == 0);
+        CHECK(run_ext(dir, dir, "rename-hl", "0", 0, false, 1, -1, ae != 0) == 7);
+        char a[PATH_MAX + 48], b[PATH_MAX + 48];
+        snprintf(a, sizeof a, "%s/a", dir);
+        snprintf(b, sizeof b, "%s/b", dir);
+        CHECK(check_file_512a(a));
+        CHECK(check_file_512a(b));
+        CHECK(!has_saved_artifact(dir));
+
+        /* rename(symlink_to_a, a) is NOT a no-op: lstat differs from stat */
+        snprintf(dir, sizeof dir, "%s/rsym_%d", top, ae);
+        CHECK(mkdir(dir, 0755) == 0);
+        CHECK(run_ext(dir, dir, "rename-sym", "0", 0, false, 1, -1, ae != 0) == 7);
+        snprintf(a, sizeof a, "%s/a", dir);
+        snprintf(b, sizeof b, "%s/s", dir);
+        struct stat sa, sb;
+        if (ae) {
+            CHECK(lstat(a, &sa) == 0 && S_ISREG(sa.st_mode));
+            CHECK(check_file_512a(a));
+            CHECK(lstat(b, &sb) == 0 && S_ISLNK(sb.st_mode));
+        } else {
+            CHECK(lstat(a, &sa) == 0 && S_ISLNK(sa.st_mode));
+            CHECK(lstat(b, &sb) != 0 && errno == ENOENT);
+        }
+        CHECK(!has_saved_artifact(dir));
+    }
+}
+
+static void unlink_first_append(const char *top)
+{
+    const char *hows[] = {"ul-open", "ul-closed"};
+    for (size_t i = 0; i < 2; i++) {
+        char dir[PATH_MAX + 32];
+        snprintf(dir, sizeof dir, "%s/%s", top, hows[i]);
+        CHECK(mkdir(dir, 0755) == 0);
+        CHECK(run_ext(dir, dir, hows[i], "0", 0, false, 1, -1, true) == 7);
+        char a[PATH_MAX + 48], b[PATH_MAX + 48];
+        snprintf(a, sizeof a, "%s/a", dir);
+        snprintf(b, sizeof b, "%s/b", dir);
+        CHECK(access(a, F_OK) != 0 && errno == ENOENT);
+        CHECK(check_file_512a(b));
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 4 && !strcmp(argv[1], "--child"))
@@ -312,6 +760,10 @@ int main(int argc, char **argv)
     rewrite_lost(dir);
     writev_counts(dir);
     inode_reuse(dir);
+    rmdir_rollback(dir);
+    tear_link_unlink(dir);
+    rename_hardlink(dir);
+    unlink_first_append(dir);
     char cmd[PATH_MAX + 16];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0) {
