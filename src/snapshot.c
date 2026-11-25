@@ -277,7 +277,7 @@ static int add_file(mk_ctx *c, const char *name, uint8_t kind, uint64_t size, ui
     }
     struct sfile *f = &c->f[c->nf++];
     snprintf(f->name, sizeof f->name, "%s", name);
-    f->kind = kind, f->size = size, f->xxh = xxh, f->link = link;
+    f->kind = kind, f->size = size, f->xxh = xxh, f->link = link, f->ppos = 0;
     f->dev = (uint64_t)st->st_dev, f->ino = (uint64_t)st->st_ino;
     if (!link)
         c->out->bytes += size;
