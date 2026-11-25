@@ -51,7 +51,8 @@ int main(int argc, char **argv)
     if (argc == 3 && strcmp(argv[1], "--mutant") == 0) {
         if (strcmp(argv[2], "jepsenlost") == 0)
             judge_mut = 1;
-        else if ((mut = margin_mutant_parse(argv[2])) <= 0) {
+        else if ((mut = margin_mutant_parse(argv[2])) <= 0 || mut == MARGIN_MUT_LOSTNOWAIT ||
+                 mut == MARGIN_MUT_YOUNGCORRUPT) { /* tsdbd's own: tests/margin_mutants.sh */
             fprintf(stderr, "test_margins: no mutant %s\n", argv[2]);
             return 2;
         }
@@ -109,6 +110,11 @@ int main(int argc, char **argv)
     margins_of(&cp, &v, three, 3, false, mut, &m);
     CHECK(m.tier == MARGIN_TIER_LOST && m.destroyed == 3 && m.settled == -1, "three destroyed: tier %s destroyed %u "
           "settled %d", margin_tier_name(m.tier), m.destroyed, m.settled);
+    /* unavailable wins over corrupt: short of k positions, a read is retried whatever damage was seen before */
+    members[0].state = members[1].state = members[2].state = META_DOWN;
+    margins_of(&cp, &v, NULL, 0, true, mut, &m);
+    CHECK(m.tier == MARGIN_TIER_UNAVAILABLE, "three down and corrupt: %s, not unavailable", margin_tier_name(m.tier));
+    members_up();
     /* lost wins over corrupt; corrupt is the state of a volume with every position there */
     margins_of(&cp, &v, three, 3, true, mut, &m);
     CHECK(m.tier == MARGIN_TIER_LOST, "lost and corrupt: %s", margin_tier_name(m.tier));
@@ -125,6 +131,16 @@ int main(int argc, char **argv)
     margins_of(&cp, &r, three, 3, true, mut, &m);
     CHECK(m.young == 1 && m.tier == MARGIN_TIER_NONE && m.settled == 0, "replicas volume: young %d tier %s", m.young,
           margin_tier_name(m.tier));
+
+    /* a shared volume (NFS failover): every candidate is in its ISR, but they share one storage and hold no copies */
+    struct cluster_copy_vol sh = {.number = 4, .kind = META_VOL_SHARED, .nrep = 3, .nisr = 3, .isr = {1, 2, 3},
+                                  .rep = {{1, 0}, {2, 0}, {3, 0}}};
+    margins_of(&cp, &sh, NULL, 0, false, mut, &m);
+    CHECK(m.young_na && m.young == 0 && m.tier == MARGIN_TIER_NONE, "shared volume: young_na %d young %d tier %s",
+          m.young_na, m.young, margin_tier_name(m.tier));
+    r.kind = META_VOL_REPLICATED;
+    margins_of(&cp, &r, NULL, 0, false, mut, &m);
+    CHECK(!m.young_na, "a replicated volume has a young margin");
 
     /* 6+2 with one away: margin 1 */
     struct cluster_copy_vol w = {.number = 9, .redundancy = META_RED_EC, .ec_k = 6, .ec_m = 2, .nstripe = 8, .nrep = 3,

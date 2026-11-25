@@ -554,19 +554,21 @@ static void dom_waits(int delta) { worker_waits(delta); }
 /* The margins of the cluster volumes (server/margins.h): STATUS, the metrics port and the reason of a settled read's
  * refusal. TSDBD_MARGIN_MUTANT plants margins.h's bugs (tests/margin_mutants.sh). */
 static int margin_mutant;
-/* A read of volume v answered TSDB_ERR_CORRUPT here (frame_put): its settled tier says corrupt until a restart. */
+/* A settled read of volume v answered TSDB_ERR_CORRUPT here (frame_put, with unav_cold): its settled tier says corrupt
+ * until a restart. A young part's CORRUPT does not count: it says nothing about the settled tier. */
 static _Atomic uint8_t vol_corrupt[TSDB_VOL_ANY];
 /* Tests (TSDBD_TEST_COLD=FILE, read at every use; no file: no fault): until R9 nobody can declare a node destroyed and
  * no cluster volume reads a settled object (r8f, r8n), so the file stands in for both. A line "destroyed ID..." names
  * the nodes the operator declared destroyed; with "reads" a read of an EC cluster volume this server serves, once
  * routed, is refused UNAVAILABLE where its settled tier is unavailable or lost (a settled read short of k positions),
- * and with "corrupt" it is answered TSDB_ERR_CORRUPT (a granule failing its checks after a decode). */
+ * with "corrupt" it is answered TSDB_ERR_CORRUPT as a settled read (a granule failing its checks after a decode), and
+ * with "corrupt-young" TSDB_ERR_CORRUPT as a read of a young part (a damaged .part: the settled tier stays as it is). */
 static const char *test_cold;
 #define COLD_DESTROYED_MAX 32
 struct cold_hook {
     uint32_t destroyed[COLD_DESTROYED_MAX];
     size_t nd;
-    bool reads, corrupt;
+    bool reads, corrupt, corrupt_young;
 };
 static void cold_hook_read(struct cold_hook *h)
 {
@@ -586,6 +588,8 @@ static void cold_hook_read(struct cold_hook *h)
             }
         } else if (strncmp(s, "reads", 5) == 0) {
             h->reads = true;
+        } else if (strncmp(s, "corrupt-young", 13) == 0) {
+            h->corrupt_young = true;
         } else if (strncmp(s, "corrupt", 7) == 0) {
             h->corrupt = true;
         }
@@ -607,24 +611,33 @@ static bool vol_margins(uint32_t vol, struct margins *m)
     cluster_copy_put(cp);
     return v != NULL;
 }
-/* The refusal in hand is a settled read's (a stripe group short of k positions): unav_entry names it by the tier's
- * state, LOST or UNREACHABLE, never by the volume's health. */
+/* The error in hand is a settled read's: an UNAVAILABLE (a stripe group short of k positions), which unav_entry names
+ * by the tier's state, LOST or UNREACHABLE, never by the volume's health; or a CORRUPT, which frame_put records as the
+ * settled tier's (vol_corrupt). Set around the reply by the read path that knows the read was settled (today the test
+ * hook; r8n's read seam). */
 static __thread bool unav_cold;
-/* The metrics port's rows (no I/O but the test hook's file; any thread). */
-static size_t metrics_margins(metrics_margin *out, size_t cap)
+/* The metrics port's rows, one per cluster volume of the copy (no I/O but the test hook's file; any thread): *out is
+ * malloc'ed, the caller frees it. (size_t)-1 when it cannot be allocated: the caller says so, never a silent gap. */
+static size_t metrics_margins(metrics_margin **out)
 {
+    *out = NULL;
     if (!cvol_active())
         return 0;
     const struct cluster_copy *cp = cluster_copy_get();
     size_t n = 0;
+    if (cp && cp->nvolumes > 0 && !(*out = malloc(cp->nvolumes * sizeof **out))) {
+        cluster_copy_put(cp);
+        return (size_t)-1;
+    }
     struct cold_hook h;
     cold_hook_read(&h);
-    for (uint32_t i = 0; cp && i < cp->nvolumes && n < cap; i++) {
+    for (uint32_t i = 0; cp && i < cp->nvolumes; i++) {
         const struct cluster_copy_vol *v = &cp->volumes[i];
         struct margins m;
         margins_of(cp, v, h.destroyed, h.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
                    margin_mutant, &m);
-        out[n++] = (metrics_margin){.vol = v->number, .young = m.young, .settled = m.settled, .tier = m.tier};
+        (*out)[n++] = (metrics_margin){.vol = v->number, .young = m.young, .young_na = m.young_na,
+                                       .settled = m.settled, .tier = m.tier};
     }
     cluster_copy_put(cp);
     return n;
@@ -742,7 +755,13 @@ static tsdb_unavail unav_entry(uint16_t vol)
         struct margins m;
         if (vol_margins(vol, &m) && (m.tier == MARGIN_TIER_LOST || m.tier == MARGIN_TIER_UNAVAILABLE)) {
             e.reason = m.tier == MARGIN_TIER_LOST ? TSDB_WHY_LOST : TSDB_WHY_UNREACHABLE;
-            e.retry_after_ms = m.tier == MARGIN_TIER_LOST ? 0 : unav_jitter(1000);
+            /* LOST is final: a client that knows it gives up at once whatever this says; one that does not (0.10
+             * and older, the Pulsar sink on them) retries any UNAVAILABLE after this delay, floored at 1 ms, for its
+             * budget (30 s by default): the most the wire allows makes it give up at once within that budget, and
+             * wait a minute between tries with a larger one, never hammer a cluster that is already hurt */
+            e.retry_after_ms = m.tier != MARGIN_TIER_LOST         ? unav_jitter(1000)
+                               : margin_mutant == MARGIN_MUT_LOSTNOWAIT ? 0
+                                                                        : TSDB_RETRY_MAX_MS;
             return e;
         }
     }
@@ -1171,10 +1190,11 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
      * --read-only and --follow) */
     if (status == TSDB_ERR_READONLY && cvol_active())
         status = TSDB_ERR_UNAVAILABLE;
-    /* a read of a cluster volume found damage (E15's corrupt: enough positions, checks failed beyond what a decode
-     * repairs; a young part's damage too, which this cannot tell apart): its settled tier says corrupt in STATUS and
-     * on the metrics port until a restart (R9's repair) */
-    if (status == TSDB_ERR_CORRUPT && unav_vol != TSDB_VOL_ANY && !unav_write && cvol_active())
+    /* a settled read of a cluster volume found damage (E15's corrupt: enough positions, checks failed beyond what a
+     * decode repairs): its settled tier says corrupt in STATUS and on the metrics port until a restart (R9's repair).
+     * Only a read its path flagged as settled (unav_cold): a damaged young part says nothing about the settled tier */
+    if (status == TSDB_ERR_CORRUPT && unav_vol != TSDB_VOL_ANY && !unav_write && cvol_active() &&
+        (unav_cold || margin_mutant == MARGIN_MUT_YOUNGCORRUPT))
         atomic_store(&vol_corrupt[unav_vol], 1);
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
@@ -2964,7 +2984,8 @@ static void handle_status(req *r)
             struct margins m;
             margins_of(cp, v, h.destroyed, h.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
                        margin_mutant, &m);
-            ST_PUT("vol.%u.young_margin=%d\n", (unsigned)v->number, m.young);
+            if (!m.young_na) /* a shared volume's candidates hold no copies */
+                ST_PUT("vol.%u.young_margin=%d\n", (unsigned)v->number, m.young);
             if (m.tier != MARGIN_TIER_NONE)
                 ST_PUT("vol.%u.settled_margin=%d\nvol.%u.tier=%s\n", (unsigned)v->number, m.settled,
                        (unsigned)v->number, margin_tier_name(m.tier));
@@ -3131,6 +3152,12 @@ static void handle_in(req *r)
                 return;
             }
             if (h.corrupt) {
+                unav_cold = true;
+                reply_error(c, r->id, r->op, TSDB_ERR_CORRUPT);
+                unav_cold = false;
+                return;
+            }
+            if (h.corrupt_young) { /* a young part's damage: answered, but not the settled tier's */
                 reply_error(c, r->id, r->op, TSDB_ERR_CORRUPT);
                 return;
             }

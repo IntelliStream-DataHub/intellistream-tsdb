@@ -485,12 +485,19 @@ static void render(sb *b)
     if (cfg.margins) { /* the cluster volumes' margins (server/margins.h; design-cluster-data.md E15, E24) */
         static const char *const tier_names[] = {"none", "ok", "unavailable", "corrupt", "lost"};
         _Static_assert(sizeof tier_names / sizeof *tier_names == MARGIN_TIER_LOST + 1, "a name per enum margin_tier");
-        metrics_margin *mg = malloc(256 * sizeof *mg);
-        size_t nm = mg ? cfg.margins(mg, 256) : 0;
+        metrics_margin *mg = NULL;
+        size_t nm = cfg.margins(&mg); /* every cluster volume of the copy: a monitoring gap must not be silent */
+        if (nm == (size_t)-1) {
+            family(b, "tsdb_volume_margins_missing", "gauge",
+                   "1 when this scrape could not list the cluster volumes' margins (out of memory).");
+            sb_add(b, "tsdb_volume_margins_missing 1\n");
+            nm = 0;
+        }
         family(b, "tsdb_volume_young_margin", "gauge",
                "Losses an acknowledged row of the cluster volume survives now: its in-sync replicas minus one.");
         for (size_t i = 0; i < nm; i++)
-            sb_add(b, "tsdb_volume_young_margin{volume=\"%u\"} %d\n", (unsigned)mg[i].vol, mg[i].young);
+            if (!mg[i].young_na) /* a shared volume's candidates hold no copies */
+                sb_add(b, "tsdb_volume_young_margin{volume=\"%u\"} %d\n", (unsigned)mg[i].vol, mg[i].young);
         family(b, "tsdb_volume_settled_margin", "gauge",
                "Losses the settled objects of an erasure-coded cluster volume survive now: the positions of its stripe "
                "group that are present minus k (negative: settled reads short of positions).");

@@ -25,6 +25,10 @@ void margins_of(const struct cluster_copy *cp, const struct cluster_copy_vol *v,
     memset(out, 0, sizeof *out);
     uint32_t n = mutant == MARGIN_MUT_YOUNGREP ? v->nrep : v->nisr;
     out->young = (int)n - 1;
+    if (v->kind == META_VOL_SHARED && mutant != MARGIN_MUT_SHAREDCOPIES) {
+        out->young = 0;
+        out->young_na = true;
+    }
     if (v->redundancy != META_RED_EC || v->nstripe == 0) {
         out->tier = MARGIN_TIER_NONE;
         return;
@@ -45,6 +49,8 @@ void margins_of(const struct cluster_copy *cp, const struct cluster_copy_vol *v,
     out->settled = (int)out->present - base;
     if (out->destroyed > v->ec_m)
         out->tier = MARGIN_TIER_LOST;
+    else if (corrupt && mutant == MARGIN_MUT_CORRUPTFIRST)
+        out->tier = MARGIN_TIER_CORRUPT;
     else if (out->present < v->ec_k)
         out->tier = MARGIN_TIER_UNAVAILABLE;
     else if (corrupt)
@@ -62,7 +68,8 @@ const char *margin_tier_name(int tier)
 
 int margin_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"", "marginoff", "youngrep", "lostasdown"};
+    static const char *const names[] = {"",           "marginoff",   "youngrep",     "lostasdown",
+                                        "sharedcopies", "lostnowait", "youngcorrupt", "corruptfirst"};
     _Static_assert(sizeof names / sizeof *names == MARGIN_MUT_COUNT, "a name per enum margin_mutant");
     if (!name || !*name)
         return MARGIN_MUT_NONE;

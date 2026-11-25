@@ -521,7 +521,7 @@ test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B
 	./$(B)/test_peerlink $(SCRATCH)
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_margins
-	$(MUT) --name test_margins --list "marginoff youngrep lostasdown jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_margins --list "marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants

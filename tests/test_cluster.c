@@ -13411,8 +13411,12 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
  * both down by one once it left the ISR; each back, both are 2 again. Then the test hook TSDBD_TEST_COLD: three stripe
  * members declared destroyed (alive) make the tier lost, and a read of the volume on its leader (refused as a settled
  * read short of k positions) answers UNAVAILABLE with TSDB_WHY_LOST at once, never retried by the C client; two
- * destroyed and one away is unavailable, reason UNREACHABLE, which the client retries until its budget; a read that
- * answers CORRUPT makes the leader's tier corrupt (only there, and until a restart). Mutants: tests/margin_mutants.sh. */
+ * destroyed and one away is unavailable, reason UNREACHABLE, which the client retries until its budget; LOST carries
+ * retry_after TSDB_RETRY_MAX_MS (a client that does not know LOST must not retry it every millisecond); a young
+ * part's CORRUPT leaves the tier ok, a settled read that answers CORRUPT makes the leader's tier corrupt (only there,
+ * and until a restart). Every STATUS check is repeated on the metrics port (tsdb_volume_young_margin,
+ * _settled_margin, _settled_state) of the servers that serve one. Mutants: tests/margin_mutants.sh. */
+static int margin_mports[6]; /* the metrics port of server i in scen_margins (0: none) */
 static int status_key(int i, const char *key, char *val, size_t vn)
 {
     tsdbc *c = client(i);
@@ -13450,6 +13454,30 @@ static void await_margins(int i, uint32_t num, int young, int settled, const cha
                 i, y, st, t, young, settled, tier, ms);
     }
     printf("  %s: young margin %d, settled margin %d, tier %s\n", what, young, settled, tier);
+    if (margin_mports[i] <= 0)
+        return;
+    /* the metrics port says the same (from the same copy, which only moves forward) */
+    static char buf[1 << 20];
+    metrics_get(margin_mports[i], buf, sizeof buf);
+    static const char *const states[] = {"ok", "unavailable", "corrupt", "lost"};
+    char key[128];
+    const char *l;
+    snprintf(key, sizeof key, "\ntsdb_volume_young_margin{volume=\"%u\"} ", (unsigned)num);
+    if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != young)
+        die("%s: server %d's metrics say tsdb_volume_young_margin %s, not %d", what, i, l ? l + strlen(key) : "missing",
+            young);
+    snprintf(key, sizeof key, "\ntsdb_volume_settled_margin{volume=\"%u\"} ", (unsigned)num);
+    if (!(l = strstr(buf, key)) || atoi(l + strlen(key)) != settled)
+        die("%s: server %d's metrics say tsdb_volume_settled_margin %s, not %d", what, i,
+            l ? l + strlen(key) : "missing", settled);
+    for (size_t k = 0; k < sizeof states / sizeof *states; k++) {
+        snprintf(key, sizeof key, "\ntsdb_volume_settled_state{volume=\"%u\",state=\"%s\"} ", (unsigned)num,
+                 states[k]);
+        int want = strcmp(states[k], tier) == 0;
+        if (!(l = strstr(buf, key)) || l[strlen(key)] != '0' + want)
+            die("%s: server %d's metrics say tsdb_volume_settled_state %s %s, not %d", what, i, states[k],
+                l ? l + strlen(key) : "missing", want);
+    }
 }
 
 static void cold_file(const char *path, const char *text)
@@ -13487,9 +13515,15 @@ static void scen_margins(void)
     uint8_t uuid[16];
     memcpy(uuid, vw.m.uuid, 16);
     view_free(&vw);
-    static char xa[6][PATH_MAX + 32];
-    for (int i = 0; i < 6; i++)
-        restart_with_store(i, uuid, xa[i], sizeof xa[i]);
+    static char xa[6][PATH_MAX + 64];
+    for (int i = 0; i < 6; i++) { /* restart_with_store's, with a metrics port */
+        char sd[PATH_MAX];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s --metrics-port auto", sd);
+        restart_xargs(i, xa[i]);
+        margin_mports[i] = th_mport;
+    }
     await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
     uint32_t num = 0;
     char text[256];
@@ -13523,6 +13557,7 @@ static void scen_margins(void)
     stop(S, SIGKILL);
     await_margins(L, num, 2, 1, "ok", 30000, "a stripe member killed");
     start(S);
+    margin_mports[S] = th_mport;
     await_margins(L, num, 2, 2, "ok", 30000, "the stripe member back");
 
     /* a replica down: it leaves the ISR once the leader has something for it (writes), and both margins drop */
@@ -13538,6 +13573,7 @@ static void scen_margins(void)
     await_isr(L, "m42", 2, 30000, "a replica killed");
     await_margins(L, num, 1, 1, "ok", 30000, "a replica killed");
     start(R);
+    margin_mports[R] = th_mport;
     w = (struct rep_writer){cports[L], id, 9000, 3, 0, 0, 0, 0};
     if (pthread_create(&th, NULL, rep_write_thread, &w) != 0)
         die("pthread_create");
@@ -13568,6 +13604,9 @@ static void scen_margins(void)
             ers(rc), nu, nu ? u[0].reason : 0, nu ? u[0].vol : 0, (unsigned)num);
     if (took > 1000)
         die("a settled read of a lost volume took %llu ms: the client retried LOST", (unsigned long long)took);
+    if (u[0].retry_after_ms != TSDB_RETRY_MAX_MS) /* a client that does not know LOST waits this long, or gives up */
+        die("LOST says retry_after %" PRIu32 " ms, not %u: a client that does not know LOST would retry it that often",
+            u[0].retry_after_ms, (unsigned)TSDB_RETRY_MAX_MS);
     printf("  a settled read of the lost volume: UNAVAILABLE (LOST) in %llu ms, not retried\n",
            (unsigned long long)took);
 
@@ -13589,15 +13628,24 @@ static void scen_margins(void)
         u[0].reason != TSDB_WHY_UNREACHABLE)
         die("a settled read short of k positions: %s, %u entries, reason %u (want UNAVAILABLE, UNREACHABLE)", ers(rc),
             nu, nu ? u[0].reason : 0);
-    if (took < 900)
+    /* retried at least once: the first refusal's delay is 1000 ms +-20%, and the second's would pass the 1500 ms
+     * budget, so the client gives up right after its one retry, at 800 ms or later (never a tuned bound) */
+    if (took < 800)
         die("a settled read short of k positions gave up after %llu ms: UNREACHABLE is retried within the budget",
             (unsigned long long)took);
     start(S);
-    cold_file(cold, "reads\ncorrupt\n");
+    margin_mports[S] = th_mport;
+    cold_file(cold, "reads\ncorrupt-young\n");
     await_margins(L, num, 2, 2, "ok", 60000, "the member back, nothing destroyed");
 
-    /* corrupt: a read that answers CORRUPT marks this server's view of the tier, until a restart */
+    /* a young part's damage: answered CORRUPT, the settled tier stays ok (frame_put marks it before the reply) */
     tsdbc_set_retry(c, 0);
+    if ((rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL)) != TSDB_ERR_CORRUPT)
+        die("a read with the corrupt-young hook: %s, not CORRUPT", ers(rc));
+    await_margins(L, num, 2, 2, "ok", 2000, "a young part's read answered CORRUPT (on the leader)");
+
+    /* corrupt: a settled read that answers CORRUPT marks this server's view of the tier, until a restart */
+    cold_file(cold, "reads\ncorrupt\n");
     if ((rc = tsdbc_query_raw(c, id, 0, INT64_MAX, no_rows, NULL)) != TSDB_ERR_CORRUPT)
         die("a settled read with the corrupt hook: %s, not CORRUPT", ers(rc));
     cold_file(cold, "\n");
