@@ -6213,6 +6213,25 @@ static void scen_forward(void)
         printf("  a forward the owner could not read closes the client's connection (%" PRIu64 " ms)\n", wl.ms);
     }
 
+    /* m. a write that reaches the owner on the read link (FWDQ), as a flipped op or kind would with the link's frame
+     *    check off (the default): the owner refuses it by ending that connection, so the write is never applied and the
+     *    entry closes its client's connection (written and lost) at once; served, it would be acknowledged */
+    {
+        struct fw_write wm = {.c = login_retry(R, "root", "root-pw", 0), .id = id, .ts = 98000350};
+        tsdbc_set_timeout(wm.c, 8000);
+        fw_knob("opkind", 1);
+        fw_write_run(&wm);
+        fw_knob("opkind", 0);
+        tsdbc_close(wm.c);
+        if (fw_has(L, id, wm.ts) != 0)
+            die("a write sent on the read link was applied (%s)", ers(wm.rc));
+        if (wm.rc != TSDB_ERR_IO || wm.ms >= 4000)
+            die("a write sent on the read link: %s after %" PRIu64 " ms, not a closed connection at once (IO)",
+                ers(wm.rc), wm.ms);
+        printf("  a write sent on the read link is refused by the owner: the connection closes (%" PRIu64 " ms)\n",
+               wm.ms);
+    }
+
     /* n. the owner leads at another epoch than the one the entry stamped: refused before anything is done, never run.
      *    The owner's copy names itself, so route_fill answers UNAVAILABLE (MOVED to itself would send the client round in
      *    a circle); an owner whose copy names another leader answers MOVED. Either says "not applied": the client resends

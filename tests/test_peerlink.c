@@ -2699,6 +2699,64 @@ static void test_fwdslow(void)
 
 /* FWDQ streams: the span of a frame's deadline applies again after a chunk while the owner holds credit; a cancel
  * ends the owner's stream; a chunk that found no queue room keeps its credit and, the last, its stream */
+/* With the link's frame check off (the default), a flipped bit of a reply's frame id must not land the reply on
+ * another frame in flight on the same connection: the id's check word ends the connection, and neither waiter gets
+ * the other's reply (both frames are LOST, indeterminate). Also a chunk of a FWDQ stream. Mutant noidcheck. */
+static void test_fwdflip(void)
+{
+    static struct frec ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    struct fwd *A, *B;
+    fwd_pair(&A, &ra, &B, &rb, NULL);
+    struct fwd_stats st0, st1;
+    fwd_stats(A, &st0);
+    struct fwd_msg m = {PL_KIND_FWD, "w", 1};
+    CHECK(fwd_send(A, 2, &m, 40, in_ms(5000)) == FWD_OK && fwd_send(A, 2, &m, 41, in_ms(5000)) == FWD_OK);
+    struct fwd_ev q40 = {0}, q41 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 40, 0, &q40) >= 0 && frec_find(&rb, FWD_EV_REQUEST, 41, 0, &q41) >= 0,
+                   2000));
+    atomic_store(&fwd_test_flip_reply, 1); /* 40 ^ 1 = 41: the reply to 40 arrives naming 41 */
+    CHECK(fwd_reply(B, &q40.from, 40, "for40", 5) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_LOST, 40) + frec_count(&ra, FWD_EV_LOST, 41) +
+                           frec_count(&ra, FWD_EV_REPLY, 40) + frec_count(&ra, FWD_EV_REPLY, 41) ==
+                       2,
+                   3000));
+    int r40 = frec_count(&ra, FWD_EV_REPLY, 40), r41 = frec_count(&ra, FWD_EV_REPLY, 41);
+    fwd_stats(A, &st1);
+    printf("  fwdflip: a reply to 40 arriving as 41: replies 40/41 %d/%d, lost %d/%d, refused %" PRIu64 "\n", r40, r41,
+           frec_count(&ra, FWD_EV_LOST, 40), frec_count(&ra, FWD_EV_LOST, 41), st1.refused - st0.refused);
+    CHECK(r41 == 0); /* 41's waiter never gets 40's reply */
+    CHECK(r40 == 0 && frec_count(&ra, FWD_EV_LOST, 40) == 1 && frec_count(&ra, FWD_EV_LOST, 41) == 1);
+    CHECK(st1.refused == st0.refused + 1);
+    /* the link comes back and serves */
+    CHECK(WAIT_FOR(fwd_link_up(A, 2, PL_KIND_FWD), 3000));
+    CHECK(fwd_send(A, 2, &m, 42, in_ms(3000)) == FWD_OK);
+    struct fwd_ev q42 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 42, 0, &q42) >= 0, 3000));
+    CHECK(fwd_reply(B, &q42.from, 42, "for42", 5) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_REPLY, 42) == 1, 3000));
+
+    /* a chunk of stream 50 arriving as stream 51's */
+    struct fwd_msg mq = {PL_KIND_FWDQ, "q", 1};
+    CHECK(fwd_send(A, 2, &mq, 50, in_ms(5000)) == FWD_OK && fwd_send(A, 2, &mq, 51, in_ms(5000)) == FWD_OK);
+    struct fwd_ev q50 = {0};
+    CHECK(WAIT_FOR(frec_find(&rb, FWD_EV_REQUEST, 50, 0, &q50) >= 0 && frec_find(&rb, FWD_EV_REQUEST, 51, 0, NULL) >= 0,
+                   2000));
+    atomic_store(&fwd_test_flip_reply, 50 ^ 51);
+    CHECK(fwd_chunk(B, &q50.from, 50, "c50", 3, 0, 2000) == FWD_OK);
+    CHECK(WAIT_FOR(frec_count(&ra, FWD_EV_LOST, 50) + frec_count(&ra, FWD_EV_LOST, 51) +
+                           frec_count(&ra, FWD_EV_CHUNK, 50) + frec_count(&ra, FWD_EV_CHUNK, 51) >=
+                       2,
+                   3000));
+    printf("  fwdflip: a chunk of 50 arriving as 51: chunks 50/51 %d/%d, lost %d/%d\n", frec_count(&ra, FWD_EV_CHUNK, 50),
+           frec_count(&ra, FWD_EV_CHUNK, 51), frec_count(&ra, FWD_EV_LOST, 50), frec_count(&ra, FWD_EV_LOST, 51));
+    CHECK(frec_count(&ra, FWD_EV_CHUNK, 51) == 0 && frec_count(&ra, FWD_EV_CHUNK, 50) == 0);
+    CHECK(frec_count(&ra, FWD_EV_LOST, 50) == 1 && frec_count(&ra, FWD_EV_LOST, 51) == 1);
+    fwd_free(A);
+    fwd_free(B);
+}
+
 static void test_fwdstream(void)
 {
     static struct frec ra, rb;
@@ -3241,6 +3299,9 @@ int main(int argc, char **argv)
             } else if (!strcmp(m, "chunkfirst")) {
                 fwd_mutant = FWD_MUT_CHUNKFIRST;
                 only = "fwdstream";
+            } else if (!strcmp(m, "noidcheck")) {
+                fwd_mutant = FWD_MUT_NOIDCHECK;
+                only = "fwdflip";
             } else if (!strcmp(m, "wbwritten")) {
                 peerlink_mutant = PL_MUT_WBWRITTEN;
                 only = "wbcut";
@@ -3288,7 +3349,7 @@ int main(int argc, char **argv)
         {"throttle", test_throttle}, {"kindrate", test_kindrate}, {"badchunk", test_badchunk}, {"replace", test_replace}, {"freehs", test_freehs},
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
-        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"wbcut", test_wbcut}, {"fake", test_fake},
+        {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"fwdflip", test_fwdflip}, {"wbcut", test_wbcut}, {"fake", test_fake},
         {"fakeready", test_fakeready}, {"fakeend", test_fakeend},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {

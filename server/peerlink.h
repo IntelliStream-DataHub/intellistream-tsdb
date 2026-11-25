@@ -219,6 +219,8 @@ int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, si
  * was queued is dropped as when the peer goes. Tests call it, and chunksrv for a frame that does not parse (a late
  * reply is never a reason). */
 void plink_reset(struct plink *l);
+/* plink_reset of connection `gen` only (0: whatever is up); a later connection stays. */
+void plink_reset_gen(struct plink *l, uint64_t gen);
 /* A dialed link that is no longer wanted (its member left): its connection ends and it dials no more; the link
  * stays valid (sends are PL_E_DOWN) until peerlink_free. */
 void plink_stop(struct plink *l);

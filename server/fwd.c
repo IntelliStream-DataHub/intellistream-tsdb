@@ -63,12 +63,31 @@ static unsigned hb(uint64_t id) { return (unsigned)((id * 0x9E3779B97F4A7C15ull)
 
 /* ------------------------------------------------------------------ wire */
 
+uint64_t fwd_id_check(uint64_t x)
+{
+    x ^= 0x6677645f69645f63ull; /* "fwd_id_c": the word of id 0 is not 0 */
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+void fwd_wire_head(uint8_t out[FWD_HDR], uint64_t frame_id)
+{
+    put64(out, frame_id);
+    put64(out + 8, fwd_id_check(frame_id));
+}
+
 int fwd_wire_decode(int kind, uint8_t type, const uint8_t *p, size_t n, struct fwd_wire *w)
 {
     memset(w, 0, sizeof *w);
     if (n < FWD_HDR)
         return -1;
     w->frame_id = le64(p);
+    if (fwd_mutant != FWD_MUT_NOIDCHECK && le64(p + 8) != fwd_id_check(w->frame_id))
+        return FWD_E_IDCHECK;
     w->body = p + FWD_HDR;
     w->n = n - FWD_HDR;
     if (kind == PL_KIND_FWD)
@@ -93,7 +112,8 @@ int fwd_wire_decode(int kind, uint8_t type, const uint8_t *p, size_t n, struct f
     case FWDQ_T_CREDIT:
         if (n != FWD_HDR + 4)
             return -1;
-        w->chunks = (uint32_t)p[8] | (uint32_t)p[9] << 8 | (uint32_t)p[10] << 16 | (uint32_t)p[11] << 24;
+        w->chunks = (uint32_t)p[FWD_HDR] | (uint32_t)p[FWD_HDR + 1] << 8 | (uint32_t)p[FWD_HDR + 2] << 16 |
+                    (uint32_t)p[FWD_HDR + 3] << 24;
         w->body = NULL;
         w->n = 0;
         return 0;
@@ -102,12 +122,12 @@ int fwd_wire_decode(int kind, uint8_t type, const uint8_t *p, size_t n, struct f
     }
 }
 
-size_t fwd_wire_credit(uint8_t out[12], uint64_t frame_id, uint32_t chunks)
+size_t fwd_wire_credit(uint8_t out[FWD_CREDIT_LEN], uint64_t frame_id, uint32_t chunks)
 {
-    put64(out, frame_id);
+    fwd_wire_head(out, frame_id);
     for (int i = 0; i < 4; i++)
-        out[8 + i] = (uint8_t)(chunks >> (8 * i));
-    return 12;
+        out[FWD_HDR + i] = (uint8_t)(chunks >> (8 * i));
+    return FWD_CREDIT_LEN;
 }
 
 /* ------------------------------------------------------------------ state */
@@ -411,12 +431,39 @@ static void on_sent(void *arg, struct plink *l, uint64_t token, uint64_t gen, in
     pthread_mutex_unlock(&f->mu);
 }
 
+static void on_frame_in(struct fwd *f, struct plink *l, uint8_t type, const uint8_t *p, size_t n);
+
+_Atomic uint64_t fwd_test_flip_reply;
+
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     struct fwd *f = arg;
+    uint64_t x = atomic_load(&fwd_test_flip_reply);
+    if (x && type != FWD_T_REQ && n >= FWD_HDR && atomic_compare_exchange_strong(&fwd_test_flip_reply, &x, 0)) {
+        uint8_t *c = malloc(n); /* the test's flip, planted where a flipped bit of the wire would arrive */
+        if (!c)
+            abort();
+        memcpy(c, p, n);
+        for (int i = 0; i < 8; i++)
+            c[i] ^= (uint8_t)(x >> (8 * i));
+        on_frame_in(f, l, type, c, n);
+        free(c);
+        return;
+    }
+    on_frame_in(f, l, type, p, n);
+}
+
+static void on_frame_in(struct fwd *f, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
+{
     int kind = link_kind(l);
     struct fwd_wire w;
-    if (fwd_wire_decode(kind, type, p, n, &w) != 0) {
+    int drc = fwd_wire_decode(kind, type, p, n, &w);
+    if (drc == FWD_E_IDCHECK) { /* a flipped frame id (the link's frame check is off): no frame of it is trusted */
+        ST(f, refused);
+        plink_reset(l);
+        return;
+    }
+    if (drc != 0) {
         ST(f, dropped); /* a peer of this version never sends it; nothing it could mean is lost by dropping it */
         return;
     }
@@ -742,7 +789,7 @@ int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t f
     f->nent++;
     pthread_mutex_unlock(&f->mu);
     uint8_t h[FWD_HDR];
-    put64(h, frame_id);
+    fwd_wire_head(h, frame_id);
     int rc = plink_sendv(l, 0, msg->kind == PL_KIND_FWD ? FWD_T_REQ : FWDQ_T_REQ, h, sizeof h, msg->p, msg->n, 0, 1,
                          frame_id, deadline_ns);
     if (rc != PL_OK) { /* nothing was queued and on_sent never runs: the entry is ours to remove */
@@ -765,9 +812,17 @@ int fwd_reply(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, con
         return FWD_E_TOOBIG;
     (void)f;
     uint8_t h[FWD_HDR];
-    put64(h, frame_id);
+    fwd_wire_head(h, frame_id);
     /* a reply waits a little for queue room: dropping it would make an answered request indeterminate */
     return pl_err(plink_sendv(from->l, from->gen, FWD_T_REP, h, sizeof h, p, n, 1000, 0, 0, 0));
+}
+
+void fwd_refuse(struct fwd *f, const struct fwd_from *from)
+{
+    if (!f || !from || !from->l || !from->gen)
+        return;
+    ST(f, refused);
+    plink_reset_gen(from->l, from->gen);
 }
 
 int fwd_chunk(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, const void *p, size_t n, int last,
@@ -814,7 +869,7 @@ int fwd_chunk(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, con
     }
     pthread_mutex_unlock(&f->mu);
     uint8_t h[FWD_HDR + 1];
-    put64(h, frame_id);
+    fwd_wire_head(h, frame_id);
     h[FWD_HDR] = last ? 1 : 0;
     uint64_t now = now_ns();
     int wait = dl > now ? (int)((dl - now) / MS) : 0;
@@ -853,7 +908,7 @@ int fwd_credit(struct fwd *f, uint32_t peer, uint64_t frame_id, uint32_t chunks)
         arm(f, e->deadline);
     }
     pthread_mutex_unlock(&f->mu);
-    uint8_t b[12];
+    uint8_t b[FWD_CREDIT_LEN];
     fwd_wire_credit(b, frame_id, chunks);
     int rc = plink_sendv(l, gen, FWDQ_T_CREDIT, NULL, 0, b, sizeof b, 1000, 0, 0, 0);
     if (rc != PL_OK) { /* the owner never got it */
@@ -887,7 +942,7 @@ int fwd_cancel(struct fwd *f, uint32_t peer, uint64_t frame_id)
         /* best effort, no wait (a full queue: the owner's next fwd_chunk times out for credit); not yet reported
          * written, it is in the write buffer of the connection now up, and the CANCEL follows it there */
         uint8_t h[FWD_HDR];
-        put64(h, frame_id);
+        fwd_wire_head(h, frame_id);
         plink_sendv(e->l, e->written ? e->gen : 0, FWDQ_T_CANCEL, h, sizeof h, NULL, 0, 0, 0, 0, 0);
     }
     ST(f, canceled);

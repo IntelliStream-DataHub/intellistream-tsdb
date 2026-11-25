@@ -757,10 +757,12 @@ int plink_sendv(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, si
     return send_impl2(l, gen, type, hdr, hn, p, n, timeout_ms, tracked, token, deadline_ns);
 }
 
-void plink_reset(struct plink *l)
+void plink_reset(struct plink *l) { plink_reset_gen(l, 0); }
+
+void plink_reset_gen(struct plink *l, uint64_t gen)
 {
     pthread_mutex_lock(&l->mu);
-    if (l->up)
+    if (l->up && (!gen || l->gen == gen))
         l->reset_gen = l->gen;
     pthread_mutex_unlock(&l->mu);
     wake(l);

@@ -2633,7 +2633,7 @@ static int route_mutant; /* TSDB_ROUTE_MUTANT (tests: each must fail test_cluste
  * owner skips the lease, no worker_waits around a forward's wait, AUTH while the owner's users are behind */
 enum { FWM_NONE, FWM_TWICE, FWM_OLDFRAME, FWM_UNAVONBREAK, FWM_NOUSER, FWM_RETRY, FWM_NOLEASE, FWM_NOWAIT, FWM_AUTHLAG,
        FWM_CHUNKNOWAIT, FWM_INLINE, FWM_OWNERAGE, FWM_ARRIVAL, FWM_GONE, FWM_OWNERCLOSE, FWM_TAILCLOSE, FWM_EPOCH,
-       FWM_CREATEREAD };
+       FWM_CREATEREAD, FWM_OPKIND };
 static int fwdx_mutant;
 /* For route_decide alone: the request writes, by auth_ops' R_WRITE or a SERIES or STATE whose `create` byte is set
  * (create_at, which raises its need to R_INSERT). Such a lookup that creates is judged a read by its need alone
@@ -3994,6 +3994,8 @@ static int fwd_entry(req *r, uint32_t v)
     if (r->len)
         memcpy(m + FWDR_ENV + FWDR_INNER, r->payload, r->len);
     bool rd = !(auth_ops[r->op].need & R_WRITE);
+    if (fwd_knob("opkind"))
+        rd = !rd; /* as a flipped op would arrive: the owner must refuse it on this link */
     struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = m, .n = n,
                          .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1,
                          .arrival_ns = fwdx_mutant == FWM_ARRIVAL ? now_ns() : r->t_arr,
@@ -4223,6 +4225,18 @@ static void fwd_serve(struct fjob *j)
     req r = {.c = &pc, .t_arr = j->t_in};
     if (fwdr_env_decode(j->p, j->n, &e) != 0) {
         atomic_store(&pc.closing, true); /* not ours to read: the entry node closes its client's connection */
+        goto done;
+    }
+    if (((auth_ops[e.op].need & R_WRITE) != 0) != (j->kind == PL_KIND_FWD) && fwdx_mutant != FWM_OPKIND) {
+        /* a write on the read link or a read on the write link: the entry chose the kind by the op (fwd_entry), so
+         * the op or the kind is not what it sent (the link's frame check is off by default). Neither is trusted:
+         * the connection ends, nothing runs and no reply goes, so the entry's frames on it are WRITTEN and lost */
+        static atomic_ulong said;
+        if (atomic_fetch_add(&said, 1) % 1000 == 0)
+            fprintf(stderr, "tsdbd: a forward from node %u with op %u on its %s link: refused, the link reset\n",
+                    j->from.peer, e.op, j->kind == PL_KIND_FWD ? "write" : "read");
+        fwd_refuse(o.f, &j->from);
+        o.f = NULL; /* no fwdo_finish: nothing is sent */
         goto done;
     }
     atomic_store(&pc.proto, e.proto);
@@ -6115,7 +6129,7 @@ int main(int argc, char **argv)
                                             "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
                                             "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
                                             "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
-                                            "fwdcreateread"};
+                                            "fwdcreateread", "fwdopkind"};
         for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
             if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
                 fwdx_mutant = i;

@@ -43,7 +43,8 @@
 
 #include "peerlink.h"
 
-#define FWD_HDR 8                              /* the frame id before every body */
+#define FWD_HDR 16 /* the frame id and its check word (fwd_id_check) before every body: with the link's frame check
+                    * off, a flipped id must not land a reply on another frame in flight, so a mismatch ends the link */
 #define FWD_MSG_MAX (PL_FRAME_MAX - FWD_HDR)   /* a request or reply body: the whole frame fits one peerlink frame */
 #define FWD_CHUNK_MAX (1u << 20)               /* a streamed reply's chunk */
 #define FWD_CREDIT_DEFAULT 4                   /* chunks granted when a query stream starts */
@@ -144,6 +145,10 @@ struct fwd_msg {
 int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t frame_id, uint64_t deadline_ns);
 /* The reply to a FWD request, on the connection it came on (FWD_E_DOWN once that connection is gone). Any thread. */
 int fwd_reply(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, const void *p, size_t n);
+/* A request that must not be served on the connection it came on (a write op on FWDQ, a read on FWD: a flipped op
+ * with the link's frame check off): that connection ends, so the entry's frames in flight there are lost (WRITTEN and
+ * lost: their clients' connections close) and no reply is sent. Counted as refused. Any thread. */
+void fwd_refuse(struct fwd *f, const struct fwd_from *from);
 /* One chunk of a FWDQ reply (at most FWD_CHUNK_MAX): waits up to timeout_ms for credit (FWD_E_TIMEOUT; 0: no
  * wait) and then for queue room (FWD_E_FULL). A chunk that was not queued keeps its credit and, the last, its stream:
  * the same chunk may be tried again. `last` ends the stream. FWD_E_DOWN once its connection is gone or the entry
@@ -165,6 +170,7 @@ struct fwd_stats {
     uint64_t requests, credits;
     uint64_t canceled; /* fwd_cancel of a frame in flight */
     uint64_t cancels;  /* CANCELs received for the streams this node answers */
+    uint64_t refused;  /* frames that ended their connection: a frame id's check word, an op of the other kind */
 };
 void fwd_stats(struct fwd *f, struct fwd_stats *st);
 
@@ -179,7 +185,14 @@ struct fwd_wire {
 /* One frame's payload of `kind` and `type`: 0, or -1 when it is not well formed (a short header, a CREDIT of another
  * length, a chunk above FWD_CHUNK_MAX or with unknown flags, an unknown type). Reads exactly n bytes of p. */
 int fwd_wire_decode(int kind, uint8_t type, const uint8_t *p, size_t n, struct fwd_wire *w);
-size_t fwd_wire_credit(uint8_t out[12], uint64_t frame_id, uint32_t chunks);
+/* The check word of a frame id: a bijective mix, so one flip in the id or in the word never matches (two: 2^-64). */
+uint64_t fwd_id_check(uint64_t frame_id);
+/* The FWD_HDR bytes before a body: the id, then its check word. */
+void fwd_wire_head(uint8_t out[FWD_HDR], uint64_t frame_id);
+/* fwd_wire_decode answers -2 (FWD_E_IDCHECK) when the id's check word does not match: the link goes down. */
+#define FWD_E_IDCHECK (-2)
+#define FWD_CREDIT_LEN (FWD_HDR + 4)
+size_t fwd_wire_credit(uint8_t out[FWD_CREDIT_LEN], uint64_t frame_id, uint32_t chunks);
 
 /* ---- tsdbd's instance (server/fwd_cluster.c): made once this server is a member (cluster_self), registered in the
  * acceptor's table for PL_KIND_FWD and _FWDQ, its members kept to the metadata copy's (every member not OUT, at the
@@ -203,7 +216,10 @@ enum {
     FWD_MUT_INBOXWAIT = 3,  /* a link's thread waits for inbox room (its keepalive stops) */
     FWD_MUT_INBOXDROP = 4,  /* a message that does not fit the inbox is dropped */
     FWD_MUT_CHUNKFIRST = 5, /* fwd_chunk spends the credit, and the last its stream, before the send that may fail */
+    FWD_MUT_NOIDCHECK = 6,  /* a frame id's check word is not compared */
 };
 extern int fwd_mutant;
+/* tests: XORed into the frame id of the next reply, chunk, cancel or credit this process receives (then 0) */
+extern _Atomic uint64_t fwd_test_flip_reply;
 
 #endif
