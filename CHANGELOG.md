@@ -27,6 +27,21 @@ A REPLICA_REMOVE that would leave a volume fewer replicas than its `min_isr` is 
 volume: `min_isr` never asks for more copies than the volume has (a volume of 2 replicas and `min_isr` 2 is shrunk by
 moving a replica, or after lowering `min_isr`, never by a plain remove).
 
+**The peer protocol is now version 9: the data links' frame check is an option, off by default.** `tsdbd
+--peer-check none|header|full` (key `cluster.peer.check`): `none`, the default on every transport, puts no check bytes
+on a frame (the wire is trusted to Ethernet's and TCP's checksums, and the payloads that matter, WAL records, files
+and chunk cells, carry checksums of their own that their receivers verify); `header` an 8-byte XXH3-64 over each
+frame's header and the first 256 bytes of its payload, a fixed cost per frame; `full` the XXH3-128 over the whole frame
+described below. A link runs at the stronger of its two ends' levels, so turning it on at one node covers all its
+links. In every mode the receivers now bound what a flipped bit in a header or control field could do: replication
+messages are checked against the log before they are acted on (an ACK beyond the log, a record unlike its descriptor,
+a metadata-only message from a peer are dropped and sent again), a driver frame on a bulk link or an unknown status in
+a file transfer's DONE ends the link, a forwarded frame carries a checked frame id and must be of its link's kind, and
+a chunk put's meta and every chunk request carry a checksum of their own, with answers matched to their call by op.
+`tsdb cluster status`, the client STATUS and the metrics port (`tsdb_peer_links{kind,check}`) say how many links run
+at each level. A node of version 8 is refused at HELLO with a line naming both versions; a cluster made before this
+change is initialised again (docs/design-rdma.md §6).
+
 **The peer protocol is now version 8: the data links check every frame with XXH3-128 instead of HMAC-SHA256.** The
 servers of a cluster run on their own network, so a data-link frame (replication, forwarding, chunks, snapshots) is
 checked for corruption, loss, repetition and reordering, not authenticated: XXH3-128 of its type, header and payload,
