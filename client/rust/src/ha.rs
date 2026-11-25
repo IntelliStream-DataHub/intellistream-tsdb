@@ -17,6 +17,10 @@ const UNAVAIL_ENTRY: usize = 28;
 pub const VOL_ANY: u16 = 0xffff;
 /// MOVED flag: a clean release is under way (`TSDB_MOVED_HANDOFF`).
 pub const MOVED_HANDOFF: u8 = 1;
+/// UNAVAILABLE reason: settled data of a cluster volume whose holders were declared destroyed (`TSDB_WHY_LOST`). It
+/// will not come back, so a refusal naming it is never retried.
+pub const WHY_LOST: u8 = 18;
+
 /// The time budget of one request's retries, by default (`TSDB_BUDGET_MS`).
 pub const DEFAULT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(30_000);
 
@@ -89,6 +93,11 @@ pub struct ErrorInfo {
 }
 
 impl ErrorInfo {
+    /// UNAVAILABLE naming [`WHY_LOST`] in one of its entries: the data will not come back (never retried).
+    pub fn lost(&self) -> bool {
+        self.status == -11 && self.unavailable.iter().any(|e| e.reason == WHY_LOST)
+    }
+
     /// How long the server asks to wait: the largest `retry_after_ms` of the entries, 0 without any.
     pub fn retry_after_ms(&self) -> u32 {
         self.unavailable.iter().map(|e| e.retry_after_ms).max().unwrap_or(0)

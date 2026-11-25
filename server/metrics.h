@@ -29,6 +29,13 @@ typedef struct metrics_snap {
     double install_seconds; /* the last install, from the end of its transfer to the volume handed back */
 } metrics_snap;
 
+/* the margins of one cluster volume (server/margins.h) */
+typedef struct metrics_margin {
+    uint32_t vol;
+    int young, settled; /* settled: tier MARGIN_TIER_NONE has none */
+    uint8_t tier;       /* enum margin_tier */
+} metrics_margin;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -41,6 +48,7 @@ typedef struct metrics_cfg {
     size_t (*fwd_peers)(metrics_fwd_peer *out, size_t cap); /* NULL: not a cluster server */
     void (*snap)(metrics_snap *out); /* NULL: not a cluster server */
     int (*vol_diverged)(uint32_t v); /* 1 while volume v is DIVERGED (tsdbd's vol_diverged); NULL: no family */
+    size_t (*margins)(metrics_margin *out, size_t cap); /* the cluster volumes' margins; NULL: not a cluster server */
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

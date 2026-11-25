@@ -353,7 +353,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink
+test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_upgrade $(B)/test_fno $(B)/test_diverge $(B)/test_intents $(B)/test_drops $(B)/test_fwd $(B)/test_replfile $(B)/test_crashfs $(B)/test_replica $(B)/test_snapshot $(B)/test_cvol $(B)/test_cvolfs $(B)/test_feedstore $(if $(filter Darwin,$(UNAME_S)),,$(B)/test_crashfs_old) $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_flush_tail $(B)/test_stats $(B)/test_tenants $(B)/test_tn_race $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_readonly $(B)/test_stats_net $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut $(B)/test_meta $(B)/test_meta_mut $(B)/test_cluster $(B)/test_peerlink $(B)/test_margins
 	./$(B)/test_tsdb $(SCRATCH)
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched $(SCRATCH)
@@ -515,11 +515,13 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
 
-test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
+test-meta: $(B)/test_meta $(B)/test_cluster $(B)/test_peerlink $(B)/test_fwd $(B)/test_margins $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	./$(B)/test_meta $(SCRATCH) --seeds 12 --seconds 15
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster
 	./$(B)/test_peerlink $(SCRATCH)
 	$(MUT) --name test_peerlink --list "notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8 sharedsocket nobackpressure accauth uuid endhash nothrottle zstdsize chunkoff resumebound nokick queuedasunsent kindshared lateclose nocredit inboxwait inboxdrop chunkfirst wbwritten pausedead kindbucket noready closefirst wnoshort nhandall" -- ./$(B)/test_peerlink @D@ --quick --mutant @M@ # each planted bug must fail it
+	./$(B)/test_margins
+	$(MUT) --name test_margins --list "marginoff youngrep lostasdown jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
@@ -875,7 +877,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: lease-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: margin-mutants lease-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -951,6 +953,9 @@ $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
 $(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+# the cluster volumes' margins (server/margins.c) and jepsen's judgement of a failed volume, no server
+$(B)/test_margins: tests/test_margins.c server/margins.c server/margins.h server/cluster.h server/meta.h tests/jepsen/outage_judge.h include/tsdb_protocol.h | $(B)
+	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< server/margins.c
 # the entry node's rules over a fake link (no sockets, no tsdbd)
 $(B)/test_fwd: tests/test_fwd.c server/fwdreq.h server/fwd.h server/peerlink.h $(B)/fwdreq.o
 	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< $(B)/fwdreq.o -lpthread
@@ -1008,6 +1013,9 @@ move-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 # the cluster login mutants (server/auth.c, tools/cluster-user-cli.c TSDB_AUTH_MUTANT; tests/auth_mutants.sh)
 auth-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/auth_mutants.sh $(SCRATCH)
+# the cluster volumes' margins (server/margins.c TSDBD_MARGIN_MUTANT; tests/margin_mutants.sh): test_cluster margins
+margin-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/margin_mutants.sh $(SCRATCH)
 # the metadata copy's snapshot, TOPOLOGY, STATUS, MOVED and the acceptor's table (tests/copy_mutants.sh)
 copy-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/copy_mutants.sh $(SCRATCH)
@@ -1018,10 +1026,12 @@ meta-soak: $(B)/test_meta
 	./$(B)/test_meta $(SCRATCH) --seeds $(META_SOAK_SEEDS) --seconds $(META_SOAK_SECONDS) --first $(META_SOAK_FIRST)
 
 # R4's files beside the replication driver and the volume manager (server/repld_int.h, cvolset.h, snapinst.h): stubs
-# until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is
+# until r4-xferlink, r4-xferinst, r4-setchg, r4-transfer fill them; compiled with repld.c wherever it is (and so is
+# server/margins.c, the cluster volumes' margins: every build of tsdbd.c)
 R4_SRC := server/rsnap.c server/rset.c server/rtransfer.c server/cvolset.c server/cvolset_mgr.c server/snapinst.c \
-          server/snapinst_run.c
-R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h
+          server/snapinst_run.c server/margins.c
+R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h server/cvolset.h server/snapinst.h \
+          server/margins.h
 TSDBD_SRC := $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
@@ -1384,7 +1394,7 @@ $(B)/outage_server: tests/outage_server.c tests/harness.h tests/outagefs_ctl.h t
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h src/health_rules.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/harness.h src/internal.h src/feed.h src/health_rules.h $(CLIB) $(LIB)
+$(B)/jepsen: tests/jepsen/jepsen.c tests/jepsen/feedcheck.c tests/jepsen/outage_judge.h tests/harness.h src/internal.h src/feed.h src/health_rules.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ tests/jepsen/jepsen.c tests/jepsen/feedcheck.c $(CLIB) $(LIB) $(LDLIBS)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while

@@ -799,6 +799,9 @@ static bool retryable_status(int32_t st) { return st == TSDB_ERR_UNAVAILABLE || 
  * over, or a MOVED with nowhere to go). deadline is 0 until the first refusal of this request. */
 static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsigned *tries)
 {
+    for (size_t i = 0; e->status == TSDB_ERR_UNAVAILABLE && e->has_body && i < e->nunavail; i++)
+        if (e->unavail[i].reason == TSDB_WHY_LOST)
+            return 0; /* the data will not come back (E15): never retried */
     int64_t now = mono_ms();
     if (!*deadline)
         *deadline = now + c->retry_ms;

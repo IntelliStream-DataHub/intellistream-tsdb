@@ -128,6 +128,7 @@
 #include "repld.h"
 #include "../src/cvol.h"
 #include "crashpt.h"
+#include "margins.h"
 /* The engine's "outcome unknown" (src/internal.h, which tsdbd does not include): a replicated write that was appended
  * but whose leader was deposed or failed before the commit point passed it. It reaches tsdbd through the public calls
  * unchanged and must never reach a client (frame_put). */
@@ -550,6 +551,85 @@ static bool test_depose_moved; /* TSDBD_TEST_DEPOSE_MOVED (a planted fault): a w
 #include "domains.h"
 static void dom_waits(int delta) { worker_waits(delta); }
 
+/* The margins of the cluster volumes (server/margins.h): STATUS, the metrics port and the reason of a settled read's
+ * refusal. TSDBD_MARGIN_MUTANT plants margins.h's bugs (tests/margin_mutants.sh). */
+static int margin_mutant;
+/* A read of volume v answered TSDB_ERR_CORRUPT here (frame_put): its settled tier says corrupt until a restart. */
+static _Atomic uint8_t vol_corrupt[TSDB_VOL_ANY];
+/* Tests (TSDBD_TEST_COLD=FILE, read at every use; no file: no fault): until R9 nobody can declare a node destroyed and
+ * no cluster volume reads a settled object (r8f, r8n), so the file stands in for both. A line "destroyed ID..." names
+ * the nodes the operator declared destroyed; with "reads" a read of an EC cluster volume this server serves, once
+ * routed, is refused UNAVAILABLE where its settled tier is unavailable or lost (a settled read short of k positions),
+ * and with "corrupt" it is answered TSDB_ERR_CORRUPT (a granule failing its checks after a decode). */
+static const char *test_cold;
+#define COLD_DESTROYED_MAX 32
+struct cold_hook {
+    uint32_t destroyed[COLD_DESTROYED_MAX];
+    size_t nd;
+    bool reads, corrupt;
+};
+static void cold_hook_read(struct cold_hook *h)
+{
+    memset(h, 0, sizeof *h);
+    FILE *f = test_cold ? fopen(test_cold, "r") : NULL;
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *s = line, *end;
+        if (strncmp(s, "destroyed", 9) == 0) {
+            for (s += 9;; s = end) {
+                unsigned long id = strtoul(s, &end, 10);
+                if (end == s || h->nd == COLD_DESTROYED_MAX)
+                    break;
+                h->destroyed[h->nd++] = (uint32_t)id;
+            }
+        } else if (strncmp(s, "reads", 5) == 0) {
+            h->reads = true;
+        } else if (strncmp(s, "corrupt", 7) == 0) {
+            h->corrupt = true;
+        }
+    }
+    fclose(f);
+}
+/* The margins of cluster volume `vol` from the metadata copy now: false when it is no cluster volume here. */
+static bool vol_margins(uint32_t vol, struct margins *m)
+{
+    if (!cvol_active())
+        return false;
+    const struct cluster_copy *cp = cluster_copy_get();
+    const struct cluster_copy_vol *v = cp ? cluster_copy_vol(cp, vol) : NULL;
+    if (v) {
+        struct cold_hook h;
+        cold_hook_read(&h);
+        margins_of(cp, v, h.destroyed, h.nd, vol < TSDB_VOL_ANY && atomic_load(&vol_corrupt[vol]), margin_mutant, m);
+    }
+    cluster_copy_put(cp);
+    return v != NULL;
+}
+/* The refusal in hand is a settled read's (a stripe group short of k positions): unav_entry names it by the tier's
+ * state, LOST or UNREACHABLE, never by the volume's health. */
+static __thread bool unav_cold;
+/* The metrics port's rows (no I/O but the test hook's file; any thread). */
+static size_t metrics_margins(metrics_margin *out, size_t cap)
+{
+    if (!cvol_active())
+        return 0;
+    const struct cluster_copy *cp = cluster_copy_get();
+    size_t n = 0;
+    struct cold_hook h;
+    cold_hook_read(&h);
+    for (uint32_t i = 0; cp && i < cp->nvolumes && n < cap; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        struct margins m;
+        margins_of(cp, v, h.destroyed, h.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
+                   margin_mutant, &m);
+        out[n++] = (metrics_margin){.vol = v->number, .young = m.young, .settled = m.settled, .tier = m.tier};
+    }
+    cluster_copy_put(cp);
+    return n;
+}
+
 static uint32_t unav_jitter(uint32_t ms) /* +-20% */
 {
     static __thread uint64_t x;
@@ -657,6 +737,14 @@ static tsdb_unavail unav_entry(uint16_t vol)
         }
         e.retry_after_ms = unav_jitter(1000);
         return e;
+    }
+    if (unav_cold) { /* a settled read short of k positions (E15): lost is never retried, unavailable is */
+        struct margins m;
+        if (vol_margins(vol, &m) && (m.tier == MARGIN_TIER_LOST || m.tier == MARGIN_TIER_UNAVAILABLE)) {
+            e.reason = m.tier == MARGIN_TIER_LOST ? TSDB_WHY_LOST : TSDB_WHY_UNREACHABLE;
+            e.retry_after_ms = m.tier == MARGIN_TIER_LOST ? 0 : unav_jitter(1000);
+            return e;
+        }
     }
     if (cvol_active() && cvol_no_owner(vol)) { /* design-cluster.md 6.2: until a member returns or force-leader */
         e.reason = TSDB_WHY_NO_OWNER;
@@ -1083,6 +1171,11 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
      * --read-only and --follow) */
     if (status == TSDB_ERR_READONLY && cvol_active())
         status = TSDB_ERR_UNAVAILABLE;
+    /* a read of a cluster volume found damage (E15's corrupt: enough positions, checks failed beyond what a decode
+     * repairs; a young part's damage too, which this cannot tell apart): its settled tier says corrupt in STATUS and
+     * on the metrics port until a restart (R9's repair) */
+    if (status == TSDB_ERR_CORRUPT && unav_vol != TSDB_VOL_ANY && !unav_write && cvol_active())
+        atomic_store(&vol_corrupt[unav_vol], 1);
     /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
      * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
     if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
@@ -2818,7 +2911,8 @@ static const char *why_name(unsigned why)
 {
     static const char *const names[] = {"none", "nfs_down", "not_mounted", "stuck", "full", "busy", "root_down",
                                         "locked", "recovering", "diverged", "maintenance", "suspect", "promoting",
-                                        "fenced", "mismatch", "no_owner", "unreachable", "reloading"};
+                                        "fenced", "mismatch", "no_owner", "unreachable", "reloading", "lost"};
+    _Static_assert(sizeof names / sizeof *names == TSDB_WHY_LAST + 1, "a name per TSDB_WHY_*");
     return why <= TSDB_WHY_LAST ? names[why] : "unknown";
 }
 
@@ -2841,7 +2935,8 @@ static void handle_status(req *r)
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
     size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + 64 * 200 + 64 + 400 : 0);
+                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 400
+                     : 0);
     char *t = malloc(cap + 4);
     if (!t) {
         cluster_copy_put(cp);
@@ -2859,6 +2954,20 @@ static void handle_status(req *r)
             if (m->id != cp->self)
                 ST_PUT("peer.%u.addr=%s\npeer.%u.peer=%s\npeer.%u.alive=%d\n", (unsigned)m->id, m->addr,
                        (unsigned)m->id, m->peer, (unsigned)m->id, m->state == META_UP);
+        }
+        /* the margins of every cluster volume (server/margins.h; E15, E24): the young tier's on each, the settled
+         * tier's and its state on an erasure-coded one */
+        struct cold_hook h;
+        cold_hook_read(&h);
+        for (uint32_t i = 0; i < cp->nvolumes; i++) {
+            const struct cluster_copy_vol *v = &cp->volumes[i];
+            struct margins m;
+            margins_of(cp, v, h.destroyed, h.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
+                       margin_mutant, &m);
+            ST_PUT("vol.%u.young_margin=%d\n", (unsigned)v->number, m.young);
+            if (m.tier != MARGIN_TIER_NONE)
+                ST_PUT("vol.%u.settled_margin=%d\nvol.%u.tier=%s\n", (unsigned)v->number, m.settled,
+                       (unsigned)v->number, margin_tier_name(m.tier));
         }
         cluster_copy_put(cp);
         struct fwd_peer_row fr[64]; /* forwarding one hop (ha.md 15.4 STATUS): per peer forwarded to */
@@ -3006,6 +3115,23 @@ static void handle_in(req *r)
         if (lease && rd) { /* a write that passed is committed by its replicas */
             lguard = (__typeof__(lguard)){.on = true, .led = led, .gen = gen, .tok = tok, .vol = unav_vol};
             read_stall();
+        }
+    }
+    if (test_cold && unav_vol != TSDB_VOL_ANY && cvol_active() && !(auth_ops[r->op].need & R_WRITE)) {
+        struct cold_hook h; /* tests: a settled read of an EC volume (TSDBD_TEST_COLD; r8n's read path replaces it) */
+        struct margins m;
+        cold_hook_read(&h);
+        if (h.reads && vol_margins(unav_vol, &m) && m.tier != MARGIN_TIER_NONE) {
+            if (m.tier == MARGIN_TIER_LOST || m.tier == MARGIN_TIER_UNAVAILABLE) {
+                unav_cold = true;
+                reply_error(c, r->id, r->op, TSDB_ERR_UNAVAILABLE);
+                unav_cold = false;
+                return;
+            }
+            if (h.corrupt) {
+                reply_error(c, r->id, r->op, TSDB_ERR_CORRUPT);
+                return;
+            }
         }
     }
     int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
@@ -5900,6 +6026,13 @@ int main(int argc, char **argv)
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
     test_read_stall = getenv("TSDBD_TEST_READ_STALL");
     test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
+    test_cold = getenv("TSDBD_TEST_COLD") && *getenv("TSDBD_TEST_COLD") ? getenv("TSDBD_TEST_COLD") : NULL;
+    if ((margin_mutant = margin_mutant_parse(getenv("TSDBD_MARGIN_MUTANT"))) < 0) {
+        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s: no such mutant\n", getenv("TSDBD_MARGIN_MUTANT"));
+        return 2;
+    }
+    if (margin_mutant)
+        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s\n", getenv("TSDBD_MARGIN_MUTANT"));
     if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
         static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
                                             "replicaread", "spanaccepted",      "nocopyserved"};
@@ -6033,7 +6166,8 @@ int main(int argc, char **argv)
                           .request_memory = request_memory_now,
                           .request_memory_limit = req_budget, .fwd_peers = cluster_on ? fwd_metrics_rows : NULL,
                           .snap = cluster_on ? snap_metrics : NULL,
-                          .vol_diverged = metrics_vol_diverged};
+                          .vol_diverged = metrics_vol_diverged,
+                          .margins = cluster_on ? metrics_margins : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

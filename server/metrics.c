@@ -26,6 +26,7 @@
  */
 #define _GNU_SOURCE
 #include "metrics.h"
+#include "margins.h" /* enum margin_tier only: no call, so every binary with metrics.c links without margins.c */
 #include "tsdb_protocol.h"
 
 #include <errno.h>
@@ -479,6 +480,31 @@ static void render(sb *b)
         for (size_t i = 0; i < nf; i++)
             sb_add(b, "tsdb_fwd_hop_seconds{peer=\"%u\",quantile=\"0.5\"} %.6f\ntsdb_fwd_hop_seconds{peer=\"%u\",quantile=\"0.99\"} %.6f\n",
                    (unsigned)fp[i].peer, fp[i].p50_us / 1e6, (unsigned)fp[i].peer, fp[i].p99_us / 1e6);
+    }
+
+    if (cfg.margins) { /* the cluster volumes' margins (server/margins.h; design-cluster-data.md E15, E24) */
+        static const char *const tier_names[] = {"none", "ok", "unavailable", "corrupt", "lost"};
+        _Static_assert(sizeof tier_names / sizeof *tier_names == MARGIN_TIER_LOST + 1, "a name per enum margin_tier");
+        metrics_margin *mg = malloc(256 * sizeof *mg);
+        size_t nm = mg ? cfg.margins(mg, 256) : 0;
+        family(b, "tsdb_volume_young_margin", "gauge",
+               "Losses an acknowledged row of the cluster volume survives now: its in-sync replicas minus one.");
+        for (size_t i = 0; i < nm; i++)
+            sb_add(b, "tsdb_volume_young_margin{volume=\"%u\"} %d\n", (unsigned)mg[i].vol, mg[i].young);
+        family(b, "tsdb_volume_settled_margin", "gauge",
+               "Losses the settled objects of an erasure-coded cluster volume survive now: the positions of its stripe "
+               "group that are present minus k (negative: settled reads short of positions).");
+        for (size_t i = 0; i < nm; i++)
+            if (mg[i].tier != MARGIN_TIER_NONE)
+                sb_add(b, "tsdb_volume_settled_margin{volume=\"%u\"} %d\n", (unsigned)mg[i].vol, mg[i].settled);
+        family(b, "tsdb_volume_settled_state", "gauge",
+               "1 for the state of an erasure-coded cluster volume's settled tier: ok, unavailable (fewer than k "
+               "positions present), corrupt (a read answered CORRUPT here) or lost (more than m positions destroyed).");
+        for (size_t i = 0; i < nm; i++)
+            for (int t = MARGIN_TIER_OK; mg[i].tier != MARGIN_TIER_NONE && t <= MARGIN_TIER_LOST; t++)
+                sb_add(b, "tsdb_volume_settled_state{volume=\"%u\",state=\"%s\"} %d\n", (unsigned)mg[i].vol,
+                       tier_names[t], mg[i].tier == t);
+        free(mg);
     }
 
     if (cfg.snap) { /* snapshot transfers (R4, server/rsnap.c) */

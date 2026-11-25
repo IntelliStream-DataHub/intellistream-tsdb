@@ -22,6 +22,11 @@ public final class ErrorInfo {
     public static final int VOL_ANY = 0xffff;
     /** MOVED flag: a clean release is under way. */
     public static final int MOVED_HANDOFF = 1;
+    /**
+     * UNAVAILABLE reason {@code TSDB_WHY_LOST}: settled data of a cluster volume whose holders were declared
+     * destroyed. It will not come back, so a refusal naming it is never retried.
+     */
+    public static final int WHY_LOST = 18;
 
     /**
      * One volume a request was refused for.
@@ -170,6 +175,20 @@ public final class ErrorInfo {
      */
     public long droppedBefore() {
         return droppedBefore;
+    }
+
+    /**
+     * Returns whether this is an UNAVAILABLE naming {@link #WHY_LOST} in one of its entries.
+     *
+     * @return true when the data will not come back (never retried)
+     */
+    public boolean lost() {
+        if (status != Status.ERR_UNAVAILABLE)
+            return false;
+        for (Unavailable u : unavailable)
+            if (u.reason() == WHY_LOST)
+                return true;
+        return false;
     }
 
     /**

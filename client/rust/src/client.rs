@@ -2616,6 +2616,9 @@ impl Client {
     /// would be over, or a MOVED with nowhere to go). `deadline` is None until the request's first refusal.
     fn retry_step(&mut self, e: &ErrorInfo, deadline: &mut Option<Instant>, tries: &mut u32) -> bool {
         let Some(budget) = self.retry else { return false };
+        if e.lost() {
+            return false; // the data will not come back (design-cluster-data.md E15)
+        }
         let now = Instant::now();
         let dl = *deadline.get_or_insert(now + budget);
         let mut delay = match e.status {

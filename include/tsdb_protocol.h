@@ -359,7 +359,11 @@ enum {
     TSDB_WHY_BUSY = 5, TSDB_WHY_ROOT_DOWN = 6, TSDB_WHY_LOCKED = 7, TSDB_WHY_RECOVERING = 8, TSDB_WHY_DIVERGED = 9,
     TSDB_WHY_MAINTENANCE = 10, TSDB_WHY_SUSPECT = 11, TSDB_WHY_PROMOTING = 12, TSDB_WHY_FENCED = 13,
     TSDB_WHY_MISMATCH = 14, TSDB_WHY_NO_OWNER = 15, TSDB_WHY_UNREACHABLE = 16, TSDB_WHY_RELOADING = 17,
-    TSDB_WHY_LAST = 17
+    /* settled data of a cluster volume whose holders were declared destroyed (design-cluster-data.md E15): it will
+     * not come back, so the clients do not retry it (an older client retries it as any UNAVAILABLE until its budget
+     * runs out: the reason needs no protocol number) */
+    TSDB_WHY_LOST = 18,
+    TSDB_WHY_LAST = 18
 };
 enum { TSDB_HEALTH_AVAILABLE = 0, TSDB_HEALTH_DEGRADED = 1, TSDB_HEALTH_UNAVAILABLE = 2 };
 enum { TSDB_ROLE_NONE = 0, TSDB_ROLE_OWNER = 1, TSDB_ROLE_STANDBY = 2, TSDB_ROLE_FOLLOWER = 3 };

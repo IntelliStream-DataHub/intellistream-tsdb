@@ -184,6 +184,23 @@ fn budget_runs_out() {
 }
 
 #[test]
+fn lost_is_not_retried() {
+    // reason TSDB_WHY_LOST (18): the settled data's holders were declared destroyed; asking again cannot help
+    let mut body = unavailable_body(1, 300);
+    body[4] = tsdb_client::WHY_LOST;
+    let f = Fake::start(move |r| if r.nth == 0 { Reply(-11, body.clone()) } else { ok() });
+    let mut c = Client::connect(f.addr).unwrap();
+    let t0 = Instant::now();
+    assert_eq!(c.flush().unwrap_err().status(), Some(Status::Unavailable));
+    assert!(t0.elapsed() < Duration::from_millis(250), "waited {:?}", t0.elapsed());
+    assert_eq!(f.seen(OP_FLUSH).len(), 1, "a LOST refusal was sent again");
+    assert!(c.last_error().lost());
+    assert_eq!(c.last_error().unavailable[0].reason, 18);
+    // the refusal is an answer: the connection goes on
+    c.flush().unwrap();
+}
+
+#[test]
 fn retry_off_returns_the_first_refusal() {
     let f = Fake::start(|_| unavailable(5));
     let mut c = Client::connect(f.addr).unwrap();

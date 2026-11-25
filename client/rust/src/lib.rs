@@ -99,7 +99,7 @@ pub use database::Database;
 pub use error::{Error, Result, Status, strerror};
 pub use ha::{
     DEFAULT_RETRY_BUDGET, ErrorInfo, MOVED_HANDOFF, Moved, PartialVol, TopoNode, TopoVol, Topology, Unavailable,
-    VOL_ANY,
+    VOL_ANY, WHY_LOST,
 };
 pub use keepalive::KeepAlive;
 pub use latest::{Latest, LatestKind, LatestOpts, LatestValue};
