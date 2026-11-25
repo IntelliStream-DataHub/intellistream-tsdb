@@ -9861,14 +9861,15 @@ static void touch_plant(int i, uint32_t num)
  * digest (planted by TSDB_REPLD_TEST=plantdiverge, the same ec_diverge a settle calls) stops like a failed one. On a
  * replica: LOCAL_FAULT in its heartbeat, out of the ISR, STATUS and /metrics name it DIVERGED, the writes go on at the
  * leader. On a leader: deposed, another member leads, a client is MOVED there and writes there. A restart opens the
- * volume DIVERGED again (the file), and `tsdb DIR volume diverged --clear` refuses a cluster volume naming R4.
+ * volume DIVERGED again (the file; `tsdb DIR volume diverged --clear` refuses a cluster volume naming R4), and the
+ * volume, opened as a replica (a deposed leader too), is rebuilt by a snapshot (r4-xferinst: no DIVERGED, in the ISR).
  * TSDB_REPLD_MUTANT=divergeisr (the driver ignores DIVERGED) fails it. */
 static void scen_diverged(void)
 {
     scenario("diverged");
     static int mports[3];
     for (int i = 0; i < 3; i++) {
-        penv[i] = "TSDB_REPLD_TEST=plantdiverge";
+        penv[i] = "TSDB_REPLD_TEST=plantdiverge,snaphold"; /* a rebuild is asked for but never installed */
         xargs[i] = "--metrics-port auto";
         start(i);
         mports[i] = th_mport;
@@ -9950,26 +9951,36 @@ static void scen_diverged(void)
     tsdbc_close(c);
     await_local_fault(L2, num2, 3);
 
-    /* a restart opens them DIVERGED again: the file, not memory */
-    int again[2] = {R, L2};
-    for (int k = 0; k < 2; k++) {
-        int i = again[k];
-        if (k == 1 && i == R)
-            break;
-        stop(i, SIGTERM);
-        start(i);
-        mports[i] = th_mport;
-        uint32_t vn = i == R ? num : num2;
-        await_status_diverged(i, vn, 20000, "a DIVERGED volume after a restart");
-        metrics_diverged(i, mports[i], vn, 1, "a DIVERGED volume after a restart");
-        await_local_fault(i, vn, 3);
-    }
+    /* a DIVERGED replica asks the leader for a snapshot (r4-xferinst: a4e1aeef, repld.c `div_rebuild`) and gets one, which
+     * snaphold keeps instead of installing: the volume stays DIVERGED here, so the file is still there. A DIVERGED
+     * leader (deposed, no replica) asks for none: nothing rebuilds it until it opens again as a replica. */
+    char held[96], heldl[96];
+    snprintf(held, sizeof held, "volume %" PRIu32 ": the snapshot is kept", num);
+    snprintf(heldl, sizeof heldl, "volume %" PRIu32 ": the snapshot is kept", num2);
+    await_log(R, held, 30000, "the DIVERGED replica asked for no snapshot");
     usleep(3000000);
-    if ((rc = (int)isr_of(L, "plant", NULL)) != 2)
-        die("the DIVERGED replica is back in the ISR of plant after its restart (%d members)", rc);
+    if (log_count(L2, heldl) != 0)
+        die("the DIVERGED leader of lead was sent a snapshot (a leader is not rebuilt until it opens as a replica)");
+    if (log_count(R, "snapshot installed: P") != 0)
+        die("a snapshot was installed on server %d although snaphold keeps it", R);
+    await_status_diverged(R, num, 5000, "the DIVERGED replica whose snapshot is held");
+    await_status_diverged(L2, num2, 5000, "the DIVERGED leader");
 
-    /* clearing is the rebuild's (R4), not the CLI's */
-    stop(R, SIGTERM);
+    /* the DIVERGED record is a file: with both servers stopped, `tsdb DIR volume diverged` lists it and `--clear` is
+     * refused on a cluster volume naming R4 (clearing is the rebuild's, not the CLI's) and removes nothing */
+    int again[2] = {R, L2 == R ? -1 : L2};
+    struct { uint32_t vol; int stopped_n; } before[2] = {{num, 0}, {num2, 0}};
+    char needle[2][96];
+    for (int k = 0; k < 2; k++) {
+        snprintf(needle[k], sizeof needle[k], "volume %" PRIu32 ": stopped: the volume is DIVERGED", before[k].vol);
+        before[k].stopped_n = log_count(k == 0 ? R : L2, needle[k]);
+        if (before[k].stopped_n != 1)
+            die("server %d logged %d stops of volume %" PRIu32 " as DIVERGED before the restart, not 1",
+                k == 0 ? R : L2, before[k].stopped_n, before[k].vol);
+    }
+    for (int k = 0; k < 2; k++)
+        if (again[k] >= 0)
+            stop(again[k], SIGTERM);
     char dir[PATH_MAX + 80], args[PATH_MAX * 2 + 64], out[4096];
     server_dir(R, dir, sizeof dir);
     snprintf(args, sizeof args, "%s/v1 volume diverged", dir);
@@ -9981,10 +9992,86 @@ static void scen_diverged(void)
     snprintf(args, sizeof args, "%s/v1 volume diverged", dir);
     if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "DIVERGED"))
         die("the refused --clear removed the DIVERGED record:\n%s", out);
+
+    /* a restart opens each volume DIVERGED again from that file (memory is gone: a second "stopped" line); both open as
+     * replicas now (the deposed leader too), so both are rebuilt by a snapshot: the leader's copy, which carries no
+     * DIVERGED file, is installed (rsnap.c), and the volume comes back healthy, in the ISR, with the leader's rows */
+    for (int k = 0; k < 2; k++) {
+        if (again[k] < 0)
+            continue;
+        penv[again[k]] = "TSDB_REPLD_TEST=plantdiverge"; /* the rebuild may install now */
+        start(again[k]);
+        mports[again[k]] = th_mport;
+    }
+    for (int k = 0; k < 2; k++) {
+        int i = k == 0 ? R : L2;
+        uint32_t vn = before[k].vol;
+        await_log_count(i, needle[k], before[k].stopped_n + 1, 20000); /* opened DIVERGED from the file */
+        char what[96];
+        snprintf(what, sizeof what, "the DIVERGED volume %" PRIu32 " after a restart is not rebuilt", vn);
+        uint64_t t0 = now_ms();
+        char snapneedle[64];
+        snprintf(snapneedle, sizeof snapneedle, "volume %" PRIu32 ": snapshot installed: P", vn);
+        while (log_count(i, snapneedle) < 1) {
+            if (now_ms() - t0 > 60000)
+                die("%s: server %d installed no snapshot of it in 60 s", what, i);
+            usleep(100000);
+        }
+        /* STATUS no longer says diverged, and the metrics agree, once the rebuilt volume is open */
+        char sline[64], *text = NULL;
+        snprintf(sline, sizeof sline, "\nvol.%" PRIu32 ".reason=diverged\n", vn);
+        for (t0 = now_ms();; usleep(100000)) {
+            tsdbc *c2 = client(i);
+            int rc2 = tsdbc_status(c2, &text);
+            tsdbc_close(c2);
+            int gone = rc2 == 0 && !strstr(text, sline);
+            free(text);
+            text = NULL;
+            if (gone)
+                break;
+            if (now_ms() - t0 > 60000)
+                die("%s: STATUS of server %d still says volume %" PRIu32 " is diverged", what, i, vn);
+        }
+        metrics_diverged(i, mports[i], vn, 0, "a DIVERGED volume rebuilt after a restart");
+    }
+    await_isr(N2, "plant", 3, 60000, "the rebuilt replica of plant is back in the ISR");
+    await_isr(N2, "lead", 3, 60000, "the rebuilt deposed leader of lead is back in the ISR");
+    /* a settled rebuilt volume stops no more: the flag was not carried into the installed copy */
+    usleep(3000000);
+    for (int k = 0; k < 2; k++)
+        if (log_count(k == 0 ? R : L2, needle[k]) != before[k].stopped_n + 1)
+            die("volume %" PRIu32 " stopped as DIVERGED again after its rebuild", before[k].vol);
+    if (log_count(R, "snapshot installed: P") != 1 + (L2 == R))
+        die("server %d installed %d snapshots, not one per rebuilt volume", R, log_count(R, "snapshot installed: P"));
     stop_all();
+    /* the rebuilt copies: no DIVERGED record, and the leader's rows of the series each volume held */
+    for (int k = 0; k < 2; k++) {
+        int i = k == 0 ? R : L2;
+        server_dir(i, dir, sizeof dir);
+        snprintf(args, sizeof args, "%s/v%" PRIu32 " volume diverged", dir, before[k].vol);
+        if (cli_run(args, NULL, out, sizeof out) != 0 || strstr(out, "DIVERGED"))
+            die("the rebuilt volume %" PRIu32 " of server %d still has a DIVERGED record:\n%s", before[k].vol, i, out);
+    }
+    for (int k = 0; k < 2; k++) {
+        uint64_t rows[3][REP_NAMES], h[3][REP_NAMES];
+        for (int i = 0; i < 3; i++) {
+            char vd[PATH_MAX + 120];
+            server_dir(i, dir, sizeof dir);
+            snprintf(vd, sizeof vd, "%s/v%" PRIu32, dir, before[k].vol);
+            int rc2 = cvol_digest(vd, rep_names, REP_NAMES, rows[i], h[i]);
+            if (rc2 != 0)
+                die("open %s read-only: %s", vd, ers(rc2));
+            /* plant: 1 row, then 5 while R was out; lead: 1 row, then 1 at its new leader */
+            uint64_t want = k == 0 ? 6 : 2;
+            if (rows[i][k] != want || (i && h[i][k] != h[0][k]))
+                die("server %d holds %" PRIu64 " rows of %s in volume %" PRIu32 " (want %" PRIu64 ", the same "
+                    "digest as server 0)", i, rows[i][k], rep_names[k], before[k].vol, want);
+        }
+    }
     printf("  a DIVERGED replica leaves the ISR (LOCAL_FAULT) while writes go on, a DIVERGED leader is deposed and "
-           "lead moves to server %d at epoch %" PRIu64 ", STATUS and /metrics say diverged, a restart keeps it, "
-           "--clear is refused on a cluster volume\n",
+           "lead moves to server %d at epoch %" PRIu64 ", STATUS and /metrics say diverged, --clear is refused on a "
+           "cluster volume (R4); a restart opens both DIVERGED again from the file, and each, as a replica, is rebuilt "
+           "by a snapshot: no longer diverged, back in the ISR, the leader's rows\n",
            N2, v2.epoch);
 }
 
