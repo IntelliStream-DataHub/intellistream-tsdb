@@ -712,13 +712,18 @@ static int list_part_names(eng *db, char (**out)[96], uint64_t **pp, size_t *n)
     char(*v)[96] = malloc((np ? np : 1) * sizeof *v);
     uint64_t *pv = calloc(np ? np : 1, sizeof *pv);
     int rc = v && pv ? 0 : TSDB_ERR_NOMEM;
+    size_t k = 0;
     for (size_t i = 0; rc == 0 && i < np; i++) {
-        memcpy(v[i], db->parts[i]->name, sizeof v[i]);
-        if (!db->ec_cluster && ec_file_name(v[i]))
+        memcpy(v[k], db->parts[i]->name, sizeof v[k]);
+        if (snap_mutant == SNAP_MUT_SKIPEC && ec_file_name(v[k]))
+            continue; /* planted: the settled parts left out (their rows lost to the replica) */
+        if (!db->ec_cluster && ec_file_name(v[k]))
             rc = TSDB_ERR_INVALID;
-        else if (db->ppos && ppos_of(db, v[i], &pv[i]) != 0)
+        else if (db->ppos && ppos_of(db, v[k], &pv[k]) != 0)
             rc = TSDB_ERR_CORRUPT; /* ppos_of said which */
+        k++;
     }
+    np = k;
     pthread_mutex_unlock(&db->lock);
     if (rc) {
         free(v);

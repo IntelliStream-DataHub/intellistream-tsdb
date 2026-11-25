@@ -395,6 +395,7 @@ test: $(B)/test_props $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_l
 	./$(B)/test_crashfs $(SCRATCH)
 	./$(B)/test_snapshot $(SCRATCH)
 	$(MUT) --name test_snapshot --list "snapafterp snapdictshort snapnokeep snapnostage snapnoretired snapnodirsync snapnoneedseq snapnosegretry snaplowerfence snapraiseled snapkeepunsure snapswapfirst snapinstnodirsync" -- ./$(B)/test_snapshot --mutant @M@ @D@ # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_snapshot_ec --list "snapinstnoppos snappposafter snapcarrysettled snapskipec" -- ./$(B)/test_snapshot --only ec --mutant @M@ @D@) # snap-ec: each planted bug of an ec volume's snapshot must fail it
 	./$(B)/test_replica $(SCRATCH)
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_RO_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --list "walsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # under TSan the planted race (a rotation's wal_seq written unlocked) must fail it
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's

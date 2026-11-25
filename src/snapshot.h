@@ -107,8 +107,9 @@ enum snap_mutant { SNAP_MUT_NONE = 0, SNAP_MUT_AFTERP, SNAP_MUT_DICTSHORT, SNAP_
                    SNAP_MUT_LOWERFENCE, SNAP_MUT_RAISELED, SNAP_MUT_KEEPUNSURE, SNAP_MUT_SWAPFIRST,
                    SNAP_MUT_INSTNODIRSYNC,
                    /* .ec parts (snap-ec): the install writes no PPOS record for an .ec part; the install writes PPOS
-                    * after the swap (only a power loss sees it); the make carries the leader's settled_ files */
-                   SNAP_MUT_INSTNOPPOS, SNAP_MUT_PPOSAFTER, SNAP_MUT_CARRYSETTLED };
+                    * after the swap (only a power loss sees it); the make carries the leader's settled_ files; the
+                    * make leaves the .ec parts out */
+                   SNAP_MUT_INSTNOPPOS, SNAP_MUT_PPOSAFTER, SNAP_MUT_CARRYSETTLED, SNAP_MUT_SKIPEC };
 extern int snap_mutant;
 
 /* ---- the install (r4-snapinst; snapshot.c's second half has the design) ----
