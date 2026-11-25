@@ -40,37 +40,72 @@ static atomic_bool src_stop, src_started;
 
 static uint32_t self_id(const struct cluster_copy *c) { return c ? c->self : 0; }
 
+/* TSDB_CHUNKPEER_TEST=holdput=MS[:PATH]: the first put that reaches a member (with PATH: the first once PATH exists)
+ * holds the chunk server MS ms more and then reads its stores, so that a test can stop tsdbd (SIGTERM) while a settle's
+ * put is in flight: the shutdown must wait for it (chunksrv_cluster_hold), never free the chunk server under it. The
+ * hook says which happened: "still open" (its stores read), or "closed under it" (not read: a use after free, which
+ * ASan would report and a plain build might not notice). */
+static int hold_hook_ms;
+static char hold_hook_path[512];
+static atomic_bool hold_done;
+
+static void hold_hook(struct chunksrv *cs)
+{
+    if (hold_hook_path[0] && access(hold_hook_path, F_OK) != 0)
+        return;
+    if (atomic_exchange(&hold_done, true))
+        return;
+    int closes = chunksrv_cluster_closes();
+    fprintf(stderr, "tsdbd: test: holdput: a put holds the chunk server for %d ms\n", hold_hook_ms);
+    struct timespec ts = {hold_hook_ms / 1000, (long)(hold_hook_ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+    if (chunksrv_cluster_closes() != closes) {
+        fprintf(stderr, "tsdbd: test: holdput: released, the chunk server closed under it\n");
+        return;
+    }
+    int up = 0;
+    (void)chunksrv_stores(cs, &up, false);
+    fprintf(stderr, "tsdbd: test: holdput: released, the chunk server still open (%d stores up)\n", up);
+}
+
 static int net_call(void *arg, uint32_t node, const struct cs_req *r, int timeout_ms, int32_t *rc, uint8_t **body,
                     size_t *body_len)
 {
     (void)arg;
-    struct chunksrv *cs = chunksrv_cluster();
+    struct chunksrv *cs = chunksrv_cluster_hold(); /* the engines' threads call: tsdbd frees it before tsdb_close */
     if (!cs)
-        return TSDB_ERR_UNAVAILABLE; /* no chunk server here (yet): every member is away as far as we know */
+        return TSDB_ERR_UNAVAILABLE; /* no chunk server here (yet, or any more): every member is away as far as we know */
     const struct cluster_copy *c = cluster_copy_get();
     uint32_t self = self_id(c);
     cluster_copy_put(c);
-    if (self && node == self)
-        return chunkpeer_local_call(cs, self, r, rc, body, body_len);
-    return chunksrv_call(cs, node, r, timeout_ms, rc, body, body_len);
+    int ret = self && node == self ? chunkpeer_local_call(cs, self, r, rc, body, body_len)
+                                   : chunksrv_call(cs, node, r, timeout_ms, rc, body, body_len);
+    chunksrv_cluster_release();
+    return ret;
 }
 
 static int net_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd, uint64_t base, uint64_t sum,
                    int timeout_ms, uint64_t *answered)
 {
     (void)arg;
-    struct chunksrv *cs = chunksrv_cluster();
+    struct chunksrv *cs = chunksrv_cluster_hold();
     if (!cs)
         return TSDB_ERR_UNAVAILABLE;
     const struct cluster_copy *c = cluster_copy_get();
     uint32_t self = self_id(c);
     cluster_copy_put(c);
-    if (self && node == self)
-        return chunkpeer_local_put(cs, self, m, fd, base, answered);
-    /* chunksrv_put_remote compares the PUT_OK's sum itself (TSDB_ERR_IO when it differs): 0 means it answered sum */
-    int rc = chunksrv_put_remote(cs, node, m, fd, base, sum, timeout_ms);
-    if (rc == 0)
-        *answered = sum;
+    int rc;
+    if (self && node == self) {
+        rc = chunkpeer_local_put(cs, self, m, fd, base, answered);
+    } else {
+        /* chunksrv_put_remote compares the PUT_OK's sum itself (TSDB_ERR_IO when it differs): 0 means it answered sum */
+        rc = chunksrv_put_remote(cs, node, m, fd, base, sum, timeout_ms);
+        if (rc == 0)
+            *answered = sum;
+    }
+    if (hold_hook_ms > 0) /* TSDB_CHUNKPEER_TEST=holdput=MS: a put in flight across tsdbd's shutdown (test_cluster) */
+        hold_hook(cs);
+    chunksrv_cluster_release();
     return rc;
 }
 
@@ -139,6 +174,13 @@ static void *src_main(void *arg)
 
 int chunkpeer_cluster_start(const char *stage_dir)
 {
+    const char *th = getenv("TSDB_CHUNKPEER_TEST");
+    if (th && !strncmp(th, "holdput=", 8)) {
+        hold_hook_ms = atoi(th + 8);
+        const char *colon = strchr(th + 8, ':');
+        if (colon)
+            snprintf(hold_hook_path, sizeof hold_hook_path, "%s", colon + 1);
+    }
     const char *mu = getenv("TSDB_CHUNKPEER_MUTANT");
     if (mu && *mu) {
         int k = chunkpeer_mutant_parse(mu);
