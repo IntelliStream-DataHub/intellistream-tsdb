@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Bucketed and downsampled queries over two overlapping parts with mutated granule payloads:
+ * Bucketed and downsampled queries over two parts with mutated granule payloads:
  *
- * Creates two small overlapping float32 parts (3 granules of 64 rows each, interleaved
- * timestamps, periodic nulls, uncompressed insert blocks) so merge_stream interleaves them.
+ * Creates two float32 parts (4 granules of 64 rows in part 0, 3 granules of 64 rows in part 1,
+ * interleaved timestamps across the first 3 granule pairs and a standalone 4th granule in part 0,
+ * periodic nulls, uncompressed insert blocks) so queries exercise both merge_stream interleaving
+ * and single-source parallel decoding (agg_worker / twa_worker).
  * Keeps headers, indexes, and footers intact so tsdb_open succeeds, opens read-only with
  * verify_checksums = 0 and latest_cache = 0, and pwrite-mutates the granule payloads in place
  * on each fuzz input.
@@ -16,7 +18,7 @@
 #include "internal.h"
 
 #include <dirent.h>
-#include <float.h>
+#include <errno.h>
 
 static const char *D;
 static tsdb *db;
@@ -30,10 +32,11 @@ static uint8_t *mut_buf;
 /* Locations inside part 0's payload, for fuzz_seeds(). */
 static uint64_t seed_ts_off, seed_ts_len;
 static uint64_t seed_val_off, seed_val_len;
+static uint64_t seed_g3_val_off, seed_g3_val_len;
 
 static const int64_t T0 = 1704067200000LL; /* 2024-01-01T00:00:00Z */
-enum { N_PER_PART = 192, STEP_MS = 15000 };
-static const int64_t T_END = 1704067200000LL + (int64_t)(2 * N_PER_PART) * STEP_MS;
+enum { N_PART0 = 256, N_PART1 = 192, STEP_MS = 15000 };
+static const int64_t T_END = 1704067200000LL + (int64_t)(2 * N_PART0) * STEP_MS;
 
 static volatile uint64_t fuzz_sink;
 
@@ -42,8 +45,8 @@ static int pwrite_all(int fd, const void *buf, size_t len, off_t off)
     const uint8_t *p = buf;
     while (len) {
         ssize_t w = pwrite(fd, p, len, off);
-        if (w < 0) {
-            if (errno == EINTR)
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR)
                 continue;
             return -1;
         }
@@ -118,18 +121,19 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
             fprintf(stderr, "fuzz-bucketed: tsdb_series failed\n");
             exit(1);
         }
-        int64_t ts[N_PER_PART];
-        float v[N_PER_PART];
-        uint8_t valid[(N_PER_PART + 7) / 8];
+        int n = half == 0 ? N_PART0 : N_PART1;
+        int64_t ts[N_PART0];
+        float v[N_PART0];
+        uint8_t valid[(N_PART0 + 7) / 8];
         memset(valid, 0, sizeof valid);
-        for (int i = 0; i < N_PER_PART; i++) {
+        for (int i = 0; i < n; i++) {
             ts[i] = T0 + (int64_t)(2 * i + half) * STEP_MS;
             v[i] = (float)((i + half * 13) % 37) * 0.25f;
             if (i % 29 != 7)
                 valid[i >> 3] |= (uint8_t)(1u << (i & 7));
         }
         tsdb_values vals = {TSDB_FLOAT32, v, valid};
-        if (tsdb_insert_series_values(w, s, ts, &vals, N_PER_PART) != 0 || tsdb_close(w) != 0) {
+        if (tsdb_insert_series_values(w, s, ts, &vals, (size_t)n) != 0 || tsdb_close(w) != 0) {
             fprintf(stderr, "fuzz-bucketed: insert/close failed\n");
             exit(1);
         }
@@ -161,22 +165,26 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     }
     for (int k = 0; k < 2; k++) {
         part *pt = NULL;
-        if (part_open(dfd, pnames[k], false, &pt) != 0 || pt->ng < 2) {
+        if (part_open(dfd, pnames[k], false, &pt) != 0 || pt->ng < (k == 0 ? 4u : 3u)) {
             fprintf(stderr, "fuzz-bucketed: part_open failed for %s\n", pnames[k]);
             exit(1);
         }
         pay_off[k] = pt->hdr_len;
         pay_len[k] = pt->index_off - pt->hdr_len;
         if (k == 0) {
-            granule g0, g1;
+            granule g0, g1, g3;
             memset(&g0, 0, sizeof g0);
             memset(&g1, 0, sizeof g1);
+            memset(&g3, 0, sizeof g3);
             gx_load(pt, 0, GW_LOC, &g0);
             gx_load(pt, 1, GW_LOC, &g1);
+            gx_load(pt, 3, GW_LOC, &g3);
             seed_ts_off = g1.off - pay_off[0];
             seed_ts_len = g1.ts_len;
             seed_val_off = g0.off + g0.ts_len - pay_off[0];
             seed_val_len = g0.val_len;
+            seed_g3_val_off = g3.off + g3.ts_len - pay_off[0];
+            seed_g3_val_len = g3.val_len;
         }
         part_unref(pt);
         pfd[k] = openat(dfd, pnames[k], O_RDWR | O_CLOEXEC);
@@ -299,7 +307,7 @@ static void run_suite(int64_t start, int64_t end, const tsdb_query_opts *qopts, 
     uint64_t acc = 0;
     const tsdb_group minute = {TSDB_MINUTE, 1, NULL};
     const tsdb_group hour = {TSDB_HOUR, 1, NULL};
-    const int64_t bounds[4] = {T0 + 10 * 60000LL, T0 + 30 * 60000LL, T0 + 50 * 60000LL, T0 + 70 * 60000LL};
+    const int64_t bounds[4] = {T0 + 10 * 60000LL, T0 + 50 * 60000LL, T0 + 100 * 60000LL, T0 + 125 * 60000LL};
 
     /* Raw */
     tsdb_query_raw_ex(db, sid, start, end, qopts, raw_cb, &acc);
@@ -495,6 +503,23 @@ static void write_seed(const char *dir, const char *name, const uint8_t hdr[8], 
     free(b);
 }
 
+/* Corrupt a BLK_DECIMAL_BP block after its 15-byte header so decode succeeds with extreme/NaN floats. */
+static void patch_dbp_payload(uint8_t *blk, size_t len, uint32_t bits0, uint32_t bits1, uint8_t delta_xor)
+{
+    if (len < 16 || blk[0] != BLK_DECIMAL_BP)
+        return;
+    uint32_t nexc = 0;
+    memcpy(&nexc, blk + 11, 4);
+    size_t exc_bytes = (size_t)nexc * 8;
+    if (nexc >= 2 && len >= 16 + exc_bytes) {
+        uint8_t *exc = blk + len - exc_bytes;
+        memcpy(exc + 4, &bits0, 4);
+        memcpy(exc + 12, &bits1, 4);
+    }
+    if (len > 16 + exc_bytes)
+        blk[16] ^= delta_xor;
+}
+
 void fuzz_seeds(const char *dir)
 {
     uint8_t h0[8] = {0};
@@ -504,7 +529,7 @@ void fuzz_seeds(const char *dir)
     uint8_t h1[8] = {0x9f, 0x05, 0x02, 0x00, 0x40, 0x20, 0x30, 0x00};
     write_seed(dir, "seed-valid-win", h1, orig_pay, total_pay);
 
-    /* Damaged timestamp block (granule 1 of part 0) */
+    /* Damaged timestamp block (granule 1 of part 0): out of [ts_min, ts_max] and backwards */
     uint8_t *dmg = malloc(total_pay);
     if (!dmg)
         exit(1);
@@ -532,15 +557,39 @@ void fuzz_seeds(const char *dir)
     }
     write_seed(dir, "seed-damaged-ts-back", h0, dmg, total_pay);
 
-    /* Damaged value block (granule 0 of part 0) */
+    /* Shifted timestamps kept strictly increasing inside [ts_min, ts_max], colliding with part 1 */
+    memcpy(dmg, orig_pay, total_pay);
+    if (seed_ts_len >= 17 && dmg[seed_ts_off] == BLK_DD) {
+        int64_t w[2];
+        memcpy(w, dmg + seed_ts_off + 1, sizeof w);
+        w[0] += STEP_MS;
+        w[1] -= 250;
+        memcpy(dmg + seed_ts_off + 1, w, sizeof w);
+    }
+    write_seed(dir, "seed-shifted-ts", h0, dmg, total_pay);
+
+    /* Decodable-but-damaged float32 payloads (NaN, +Inf, -Inf, FLT_MAX, perturbed packed deltas) */
+    memcpy(dmg, orig_pay, total_pay);
+    patch_dbp_payload(dmg + seed_val_off, seed_val_len, 0x7fc00001u, 0x7f800000u, 0x15);
+    patch_dbp_payload(dmg + seed_g3_val_off, seed_g3_val_len, 0xff800000u, 0x7f7fffffu, 0x2a);
+    write_seed(dir, "seed-damaged-val", h1, dmg, total_pay);
+
+    /* Damaged decimal_bp header so block_decode_vals rejects early */
     memcpy(dmg, orig_pay, total_pay);
     if (seed_val_len > 1) {
         for (size_t i = 1; i < seed_val_len && i < 12; i++)
             dmg[seed_val_off + i] ^= (uint8_t)(0xa5 ^ i);
     }
-    write_seed(dir, "seed-damaged-val", h1, dmg, total_pay);
+    write_seed(dir, "seed-damaged-val-hdr", h1, dmg, total_pay);
     free(dmg);
 
-    /* Short input */
-    write_seed(dir, "seed-short", h1, orig_pay, total_pay < 8 ? total_pay : 8);
+    /* Short input with mutated leading payload bytes */
+    uint8_t sbuf[8] = {0};
+    size_t slen = total_pay < sizeof sbuf ? total_pay : sizeof sbuf;
+    memcpy(sbuf, orig_pay, slen);
+    if (slen > 1)
+        sbuf[1] ^= 0x5a;
+    if (slen > 7)
+        sbuf[7] ^= 0x01;
+    write_seed(dir, "seed-short", h1, sbuf, slen);
 }
