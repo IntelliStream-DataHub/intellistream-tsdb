@@ -102,6 +102,15 @@
  * barrier), through kill, power, partition and pause. The server mutants TSDB_CLUSTER_MUTANT=dropnotcommitted and
  * TSDB_AUTH_MUTANT=loginbeforecatchup must fail it (`make jepsen-cluster-selftest`).
  *
+ * ec (--ec K+M, with kv, kv-via or classes; design-cluster-data.md 10.3, tests/jepsen/cluster_ec.h has the design and the
+ * checks): kvr is an erasure-coded volume (VOLUME_ADD_EC, m = 2: 3 replicas), every node has two --chunk-dir stores made
+ * with `tsdb chunk-store init` once the cluster has member ids, --metrics-port auto and a short settle grace. The keys
+ * of kv are back-dated (2023), so their partition is past the grace and settles while the writers go on with late rows.
+ * Extra nemeses: partial (a stripe member cut from the metadata leader only), diskloss (a node's chunk stores removed
+ * and made again empty), rot (bytes flipped in a chunk at rest). Extra checks: no DIVERGED volume (/metrics, polled all
+ * run) in a run without rot or disk loss, the settles counted (.ec parts on the replicas) when tsdbd settles, and the
+ * final answers equal from every ISR member in turn as the leader.
+ *
  * Selftest (--selftest-checker, --mutant NAME; each must fail, `make jepsen-cluster-selftest`): foreign-pid (a port file that names another
  * pid), takeover (a stale table, a foreign server on the node's old port, and a client that skips th_owns_port),
  * takeover-checked (the same with the check: refused, the run passes), noop-partition, unfired (an armed crash point
@@ -169,17 +178,24 @@ static size_t secret_len;
 static int want_meta = 1, want_kv = 1;
 static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 replicas, written through its leader */
 static int want_via;               /* workload kv-via: kv, with the clients on entry nodes (forwarding), RYW, fwdstall */
+static int want_ec_k, want_ec_m; /* --ec K+M: kvr is an erasure-coded volume (cluster_ec.h) */
 static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
 static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users workload which members may lag */
 static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the cuts leave in step stop being exempt */
 static void ju_settled(void);
 static struct meta_settings S;
+static int ec_experimental; /* the tsdbd under test has --ec-experimental (the leader's settle of an ec volume is built) */
+static void ec_tick(void);  /* cluster_ec.h: the divergence poll, from hold_ms */
+static void ec_add_kvr(void);
+static void rmtree(const char *path);
 
 enum {
     N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32,
-    N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024
+    N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024,
+    N_PARTIAL = 2048, N_DISKLOSS = 4096, N_ROT = 8192 /* --ec runs (cluster_ec.h) */
 };
-#define NNEM 11
+#define NNEM 14
+#define N_EC (N_PARTIAL | N_DISKLOSS | N_ROT)
 #define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
 
 /* R4's nemeses and the tracks they need. `built`: that track is on main (flip it when it merges; the run is refused
@@ -261,6 +277,8 @@ struct node {
     int64_t proc_ns; /* when the running process was forked (now_ns); the users workload tells a restart by it */
     _Atomic uint32_t id; /* member id, 0 until it joined */
     char dir[PATH_MAX + 16], log[PATH_MAX + 32];
+    char chunk[2][PATH_MAX + 32]; /* --ec: the node's two chunk stores ("" until made after the cluster has member ids) */
+    int mport;                    /* its metrics port (--ec), from its port file */
     char octl[PATH_MAX + 32]; /* the outagefs shim's control socket of this node (--outagefs: the slow nemesis) */
 };
 static struct node nodes[MAXN];
@@ -675,7 +693,7 @@ static int start_node(int i, const char *crash_at, int *status)
     snprintf(padv, sizeof padv, "127.0.0.1:%d", n->proxy_port);
     snprintf(state, sizeof state, "%s/state", n->dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
-    const char *argv[32];
+    const char *argv[48];
     int na = 0;
     argv[na++] = "tsdbd";
     if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
@@ -707,6 +725,18 @@ static int start_node(int i, const char *crash_at, int *status)
         argv[na++] = "500";
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
+    }
+    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
+        argv[na++] = "--metrics-port";
+        argv[na++] = "auto";
+        argv[na++] = "--ec-settle-grace-s";
+        argv[na++] = "3";
+        if (ec_experimental)
+            argv[na++] = "--ec-experimental";
+        for (int k = 0; k < 2 && n->chunk[k][0]; k++) {
+            argv[na++] = "--chunk-dir";
+            argv[na++] = n->chunk[k];
+        }
     }
     if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
         snprintf(io, sizeof io, "%s", getenv("TSDBD_IO"));
@@ -802,6 +832,7 @@ static int start_node(int i, const char *crash_at, int *status)
     pthread_mutex_lock(&tbl_mu);
     n->pid = pid;
     n->cport = port;
+    n->mport = th_mport;
     n->pport = th_pport;
     n->proc_ns = t_fork;
     n->paused = 0;
@@ -1725,9 +1756,11 @@ static void rep_setup(void)
 {
     uint8_t req[META_NAME_MAX + 8];
     size_t rl = cluster_volume_add_encode("kvr", 3, req);
-    int rc = admin_real(0, CLUSTER_OP_VOLUME_ADD, req, rl, 1, 15000);
+    int rc = want_ec_k ? 0 : admin_real(0, CLUSTER_OP_VOLUME_ADD, req, rl, 1, 15000);
     if (rc != 0)
         die(1, "volume add kvr: %s", cluster_strerror(rc));
+    if (want_ec_k)
+        ec_add_kvr();
     for (int64_t t0 = now_ms(); rep_leader < 0; usleep(200000)) {
         struct view v;
         if (now_ms() - t0 > 60000)
@@ -2672,7 +2705,7 @@ static int r4_cp_ok(int k)
 }
 
 static unsigned fwd_stalls_held;
-static unsigned faults[12], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
+static unsigned faults[NNEM], restarts, cp_hits, cp_hits_serving, cp_unfired, power_hits, power_idle;
 /* every nemesis round must show the effect it is for (a kill that reaped a SIGKILLed child, a pause that left the child
  * stopped, ...): a round that did nothing is a failed run, whatever the checks of the workloads say. */
 static int effect_seen;
@@ -2682,6 +2715,7 @@ static void hold_ms(int ms)
 {
     for (int t = 0; t < ms; t += 100) {
         check_unexpected_exits();
+        ec_tick();
         usleep(100000);
     }
 }
@@ -3764,6 +3798,8 @@ static int r4_leftovers_check(void)
     return r4_leftovers_once(1);
 }
 
+#include "cluster_ec.h"
+
 static unsigned leader_cuts, leader_replaced, delays_applied;
 
 static void nem_partition(void)
@@ -4119,7 +4155,8 @@ static int selftest_checker(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
-                    "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn]\n"
+                    "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn,\n"
+                    "                    partial,diskloss,rot (the last three with --ec)] [--ec K+M]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
                     "         | --selftest-replicas | --selftest-checker | --built-nemeses\n");
@@ -4163,6 +4200,13 @@ int main(int argc, char **argv)
             opt_retain_s = atoi(argv[++a]);
         else if (!strcmp(k, "--mutant"))
             mutant = argv[++a];
+        else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
+            if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 || want_ec_k > 16 ||
+                want_ec_m != 2) {
+                fprintf(stderr, "jepsen-cluster: --ec K+M: K 1 to 16 and M 2 (kvr has m + 1 = 3 replicas, as in every kv run)\n");
+                return 2;
+            }
+        }
         else if (!strcmp(k, "--nemesis") || !strcmp(k, "--workload")) {
             int nem = !strcmp(k, "--nemesis");
             char list[128];
@@ -4186,6 +4230,12 @@ int main(int argc, char **argv)
                     nemeses |= N_FWDSTALL;
                 else if (nem && r4_bit(t))
                     nemeses |= r4_bit(t);
+                else if (nem && !strcmp(t, "partial"))
+                    nemeses |= N_PARTIAL;
+                else if (nem && !strcmp(t, "diskloss"))
+                    nemeses |= N_DISKLOSS;
+                else if (nem && !strcmp(t, "rot"))
+                    nemeses |= N_ROT;
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -4222,6 +4272,26 @@ int main(int argc, char **argv)
     if (want_kv && want_rep) {
         fprintf(stderr, "jepsen-cluster: kv-local (TSDB_CLUSTER_WRITES, no driver) and kv or classes (the driver) "
                         "cannot share a run\n");
+        return 2;
+    }
+    if (want_ec_k) {
+        ec_detect();
+        if (!want_rep || want_kv) {
+            fprintf(stderr, "jepsen-cluster: --ec needs the workload kv, kv-via or classes (and not kv-local)\n");
+            return 2;
+        }
+        if (nn < want_ec_k + want_ec_m + 1) {
+            fprintf(stderr, "jepsen-cluster: --ec %d+%d needs --nodes of at least %d\n", want_ec_k, want_ec_m,
+                    want_ec_k + want_ec_m + 1);
+            return 2;
+        }
+        if ((nemeses & N_ROT) && !ec_experimental) {
+            fprintf(stderr, "jepsen-cluster: the rot nemesis needs a tsdbd that settles (--ec-experimental, not in this "
+                            "build): there is no chunk to flip a byte in\n");
+            return 2;
+        }
+    } else if (nemeses & N_EC) {
+        fprintf(stderr, "jepsen-cluster: the partial, diskloss and rot nemeses need --ec K+M\n");
         return 2;
     }
     if ((nemeses & N_FWDSTALL) && !want_via) {
@@ -4319,6 +4389,8 @@ int main(int argc, char **argv)
     }
     cluster_form();
     settle("the formation");
+    if (want_ec_k)
+        ec_form_stores();
     if (want_kv)
         kv_setup();
     if (want_rep)
@@ -4379,17 +4451,22 @@ int main(int argc, char **argv)
         case N_LONGDOWN: faults[8]++; nem_longdown(); break;
         case N_REBUILD: faults[9]++; nem_rebuild(); break;
         case N_CHURN: faults[10]++; nem_churn(); break;
+        case N_PARTIAL: faults[11]++; nem_partial(); break;
+        case N_DISKLOSS: faults[12]++; nem_diskloss(); break;
+        case N_ROT: faults[13]++; nem_rot(); break;
         }
         if (!effect_seen)
             die(1, "the %s nemesis (round %u) had no effect: nothing was killed, stopped, cut, delayed or crashed",
                 kind == N_KILL ? "kill" : kind == N_PARTITION ? "partition" : kind == N_PAUSE ? "pause" :
                 kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : kind == N_KILL2 ? "kill2" :
                 kind == N_SLOW ? "slow" : kind == N_LONGDOWN ? "longdown" : kind == N_REBUILD ? "rebuild" :
-                kind == N_CHURN ? "churn" : "power", rounds);
+                kind == N_CHURN ? "churn" : kind == N_PARTIAL ? "partial" : kind == N_DISKLOSS ? "diskloss" :
+                kind == N_ROT ? "rot" : "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
                kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
                kind == N_SLOW ? "a slow disk" : kind == N_LONGDOWN ? "a long outage" : kind == N_REBUILD ? "a rebuild" :
-               kind == N_CHURN ? "a transfer or move" : "a power loss");
+               kind == N_CHURN ? "a transfer or move" : kind == N_PARTIAL ? "a partial partition" :
+               kind == N_DISKLOSS ? "a disk loss" : kind == N_ROT ? "a rotted chunk" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -4459,6 +4536,8 @@ int main(int argc, char **argv)
         }
         for (int i = 0; i < nhists; i++)
             kv_final(i);
+        if (want_ec_k)
+            r4_end_bad += ec_members_check();
         if (!strcmp(mutant, "lost-write")) { /* planted: the final state of node 0 lacks a write that was acknowledged */
             struct hist *h = &hists[0];
             for (int k = 0; k < KEYS; k++) {
@@ -4484,6 +4563,8 @@ int main(int argc, char **argv)
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
     int rdiff = isr_short, isr = 7;
+    if (want_ec_k)
+        rdiff += ec_div_check();
     /* a clean stop of every node: SIGTERM, status 0 */
     int unclean = 0;
     for (int i = 0; i < nn; i++) {
@@ -4504,10 +4585,12 @@ int main(int argc, char **argv)
             fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
                             "final read, or in the filler's large writes\n", rdiff);
     }
+    if (want_ec_k && nd > 0)
+        rdiff += ec_parts_check(dirs, nd);
     atomic_store(&stopping, 1);
 
     unsigned total_faults = 0;
-    for (int k = 0; k < 11; k++)
+    for (int k = 0; k < NNEM; k++)
         total_faults += faults[k];
     printf("faults applied: kill %u, partition %u (cuts applied %d%s), pause %u, midcommit %u (crash points hit %u, %u of them while serving, "
            "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses); restarts %u, rounds %u\n",
@@ -4544,6 +4627,7 @@ int main(int argc, char **argv)
                want_kv ? "kv-local" : want_via ? "kv-via" : "kv", (uint64_t)atomic_load(&kv_ok), (uint64_t)atomic_load(&kv_fail), (uint64_t)atomic_load(&kv_indet),
                indet_applied, nreads, (uint64_t)atomic_load(&kv_moved), (unsigned)atomic_load(&client_connects), (unsigned)atomic_load(&refused_foreign));
     (void)nwrites;
+    ec_summary();
     if (want_via)
         printf("kv-via: %" PRIu64 " writes and %" PRIu64 " reads answered through a member that did not lead kvr, %" PRIu64
                " read-your-writes reads, %d stall window(s) checked, %" PRIu64 " of %" PRIu64 " nemesis picks aimed at an entry "
