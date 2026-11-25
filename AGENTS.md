@@ -70,7 +70,7 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # once; the first round and half the others take two of kvr's replicas), slow (outagefs `slow MS` on one
                           # node's data root, `--outagefs build/liboutagefs.so`: fd calls only, not mmap faults), longdown (a replica
                           # down past repl_retain_s, `--retain-s S`, 3 s: it must take a snapshot, seen as another inode of its v<N>;
-                          # a run in which none did fails; the selftest plants `snapdroppart`, a snapshot that leaves a part out), rebuild (v<N> removed, the server must refuse it, `replica reset`), churn
+                          # a run in which fewer than half the rounds did fails; the selftest plants `snapdroppart`, a snapshot that leaves a part out), rebuild (v<N> removed, the server must refuse it, `replica reset`), churn
                           # (`volume transfer` and `volume move --log`); the end checks compare the members of the final record, want no
                           # learner and no v<N>.snap, v<N>.old, v<N>.removed-* or snap_* on any node. make jepsen-cluster runs them
                           # after the others on kv and classes (JEPSEN_R4_WORKLOADS, JEPSEN_R4_NEMESES, `none` leaves them out): IO x 2 x

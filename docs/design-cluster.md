@@ -1560,10 +1560,19 @@ kv volume's replicas), `slow` (the outagefs shim's `slow MS` on one node's data 
 `longdown` and `rebuild` are built too (r4-nemeses: run whole against the merged R4, on kv and classes, both IO backends, several
 seeds; `jepsen_cluster --built-nemeses` lists all five, and a nemesis whose `built` flag is 0 would be refused with a line, `JEPSEN_R4_TRY=1`
 runs it anyway). Their selftest plants `snapdroppart` (a leader's snapshot that lists one part fewer, `TSDB_REPLD_MUTANT`
-in tsdbd; `test_snapshot --mutant snapdroppart` too), which the final comparison of the replicas must catch under each. A
-longdown or rebuild round takes about 15 s, so such a run expects a fault per 25 s, not per 10. Evidence (2026-11-25): 16 runs of 300 s
-(longdown and rebuild on kv and classes; two lanes on io_uring, two on epoll; seeds 101-104, 201-204, 301-304, 401-404) all valid, 16-18 of
-17-18 longdown runs took a snapshot and 23-26 rebuilds each ran whole; `make jepsen-cluster-selftest` ok. At the end of every run with a replicated kv volume the members of the final record are the replicas
+in tsdbd; `test_snapshot --mutant snapdroppart` too), which the final comparison of the replicas must catch under each. That
+proves the plumbing (a snapshot is made, installed and compared), not the races of the cut: the other snapshot bugs
+(`snapnostage`, `snapnokeep`, `snapafterp`, `snapdictshort` and the install's REPL fields, planted the same way in a 120 s run) were not
+seen by either nemesis, and `test_snapshot` stays the oracle for them. The selftest also plants `nolongdown` (a node back
+after 300 ms), `nosnapdone` (a rebuild whose snapshot mark is not seen) and `TSDB_CVOL_MUTANT=makemissing` (a volume made again
+where its directory was removed) and requires each to fail with its own line. At the default `repl_retain_s` of 3 a
+longdown round takes about 17 s and a rebuild round about 12 s, so the floor of faults of a run is a third of that rate
+(`retain + 14` s for longdown, from the chosen nemeses' mean, not 10 s). A run fails when fewer than half its longdown
+rounds installed a snapshot (the v<N> directory replaced) or fewer than half its rebuild rounds were filled by one (a SNAPDONE in the
+rebuilt directory); `rebuild` waits for the refusal line of the removed volume (60 s), never a fixed pause. Evidence (2026-11-25): 8 longdown
+and 8 rebuild runs of 300 s (kv and classes; two lanes on io_uring, two on epoll; seeds 101-104, 201-204, 301-304, 401-404) all valid;
+each longdown run did 17-18 rounds, 16-18 of them installed a snapshot, and each rebuild run did 23-26 rounds, all rebuilt;
+`make jepsen-cluster-selftest` ok. At the end of every run with a replicated kv volume the members of the final record are the replicas
 compared, none is a learner and no `v<N>.snap`, `v<N>.old`, `v<N>.removed-*` or `snap_*` is left on any node. R4's crash
 points are terminal points of kv and classes runs: `snap-received`, `snap-swapped`, `snap-halfswap`, `set-removed`,
 `transfer-ready`, `move-added`, `move-shrunk` (`server/crashpt.h`). `classes` runs with the default retention caps

@@ -1828,6 +1828,15 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	        if [ $$rc -ne 2 ] || ! echo "$$out" | grep -q "the $$n nemesis needs .* which is not on main yet"; then \
 	            echo "jepsen-cluster-selftest: the unbuilt nemesis $$n was not refused with its line (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; fi; \
 	    done; \
+	out=$$($$j --mutant nolongdown --seconds 60 --nemesis longdown --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'longdown round(s) .* and only .* took a snapshot'; then \
+	        echo "jepsen-cluster-selftest: a longdown that is back before its log is gone went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$($$j --mutant nosnapdone --seconds 60 --nemesis rebuild --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'rebuild round(s) and only .* were filled by a snapshot'; then \
+	        echo "jepsen-cluster-selftest: a rebuild that no snapshot filled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	out=$$(TSDB_CVOL_MUTANT=makemissing $$j --seconds 60 --nemesis rebuild --workload meta,kv 2>&1); rc=$$?; \
+	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'made it again before any'; then \
+	        echo "jepsen-cluster-selftest: a volume made again where its directory was removed (makemissing) went unnoticed under rebuild (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	for n in longdown rebuild; do \
 	    out=$$(TSDB_REPLD_MUTANT=snapdroppart $$j --seconds 120 --nemesis $$n --workload meta,kv --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'difference(s) between the replicas\|violation(s):'; then \
