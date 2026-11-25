@@ -659,6 +659,13 @@ static void init_mode(int i, uint32_t replace_s, int mode)
 static void init_cluster(int i, uint32_t replace_s) { init_mode(i, replace_s, META_MODE_REPLICATED); }
 static void init_fast(int i) { init_cluster(i, 3); }
 
+/* A core member names the leader once it has heard from it: a restarted voter whose own snapshot is already at the
+ * leader's index is caught up before the first heartbeat reaches it, and names no leader (0) until then. */
+static int p_names_leader(const struct view *v, void *a)
+{
+    return v->st.mode != CLUSTER_MODE_CORE || v->st.leader == *(const uint32_t *)a;
+}
+
 /* Every live server's STATUS agrees on the leader and, once caught up, on the state (meta_hash). */
 static void check_all_agree(int leader_i, uint32_t members)
 {
@@ -671,6 +678,7 @@ static void check_all_agree(int leader_i, uint32_t members)
         if (pids[i] <= 0)
             continue;
         await_view(i, p_caught_up, &c, "catching up with the leader's state");
+        await_view(i, p_names_leader, &leader, "naming the leader");
         struct view v;
         view(i, &v);
         if (v.st.self != ids[i])
