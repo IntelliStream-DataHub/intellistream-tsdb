@@ -2679,7 +2679,7 @@ static struct {
     const char *name;
     int placed, window_ms, leader;
     char r4kind; /* R4's points (added at the start from crashpt.h's names, r4cp): which operation passes it, see nem_terminal_r4 */
-} cps[16] = {{"cluster-started", 1, 5000, 0, 0},
+} cps[24] = {{"cluster-started", 1, 5000, 0, 0},
            {"serving", 1, 5000, 0, 0},
            {"wal-before-send", 1, 20000, 1, 0},
            {"acked-before-ok", 1, 20000, 1, 0},
@@ -3469,7 +3469,7 @@ static void nem_terminal(void)
     for (;;) {
         for (int r = 0; r < 3; r++) {
             int i = rep_nodes[r];
-            if (!fo && i != L)
+            if (!fo && (cps[term_cp].leader == 3 ? i == L : i != L)) /* 3: a replica applying a COLD (cluster_ec.h) */
                 continue;
             pid_t pid;
             node_snap(i, &pid, NULL, NULL);
@@ -4331,6 +4331,16 @@ int main(int argc, char **argv)
         for (int j = 0; j < CRASH_POINT_COUNT; j++)
             if (!strcmp(r4cp[k].name, crash_point_names[j]))
                 cps[ncps++] = (typeof(cps[0])){r4cp[k].name, 1, 90000, 3, r4cp[k].kind};
+    if (want_ec_k && ec_experimental) { /* the settle's crash points: the leader's marker, a replica's apply (leader 3) */
+        static const struct {
+            const char *name;
+            int leader;
+        } ecp[] = {{"cold-after-marker", 1}, {"cold-before-apply", 3}, {"cold-mid-intent", 3}};
+        for (int k = 0; k < 3; k++)
+            for (int j = 0; j < CRASH_POINT_COUNT; j++)
+                if (!strcmp(ecp[k].name, crash_point_names[j]))
+                    cps[ncps++] = (typeof(cps[0])){ecp[k].name, 1, 45000, ecp[k].leader, 0};
+    }
     rng_state = mix(seed * 0x2545f4914f6cdd1dULL + 7);
 
     mkdir(opt_dir, 0755);
