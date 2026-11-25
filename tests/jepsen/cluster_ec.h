@@ -52,9 +52,10 @@ static int ec_ec_parts = -1, ec_partitions_max;
 static char ec_div_msg[256];
 static void ec_poller_start(void);
 
-/* does the tsdbd under test settle ec volumes (it takes --ec-experimental)? */
+/* does the build settle ec volumes (compiled with TSDB_EC and tsdbd accepts --ec-settle-grace-s)? */
 static void ec_detect(void)
 {
+#ifdef TSDB_EC
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
     char cmd[PATH_MAX + 32], line[512];
     snprintf(cmd, sizeof cmd, "'%s' --help 2>&1", bin);
@@ -62,9 +63,10 @@ static void ec_detect(void)
     if (!f)
         return;
     while (fgets(line, sizeof line, f))
-        if (strstr(line, "--ec-experimental"))
-            ec_experimental = 1;
+        if (strstr(line, "--ec-settle-grace-s"))
+            ec_settles = 1;
     pclose(f);
+#endif
 }
 
 /* tsdb chunk-store init PATH --cluster UUID --node ID (the CLI, TSDB_CLI): a store of this cluster and node */
@@ -98,7 +100,7 @@ static void ec_stores_init(int i)
     }
 }
 
-/* after cluster_form: the cluster's uuid, every node's stores, every node restarted with them */
+/* after cluster_form: the cluster's uuid, every node's stores, every node restarted in parallel with them */
 static void ec_form_stores(void)
 {
     struct view v;
@@ -106,14 +108,13 @@ static void ec_form_stores(void)
         die(2, "ec: no STATUS of node 0 for the cluster's uuid");
     memcpy(ec_uuid, v.m.uuid, sizeof ec_uuid);
     view_free(&v);
-    for (int i = 0; i < nn; i++) {
-        int st = stop_node(i, SIGTERM);
-        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0))
-            die(1, "ec: node %d did not stop cleanly to get its chunk stores (status 0x%x)", i, st);
+    if (stop_nodes_par() != 0)
+        die(1, "ec: a node did not stop cleanly to get its chunk stores");
+    for (int i = 0; i < nn; i++)
         ec_stores_init(i);
-        restart_node(i);
-        settle("a chunk store");
-    }
+    start_nodes_par(term_cp >= 0 ? term_spec : NULL);
+    restarts += (unsigned)nn;
+    settle("the chunk stores");
     ec_poller_start();
 }
 
@@ -286,8 +287,69 @@ static int ec_div_check(void)
     return bad;
 }
 
-/* E3: leadership to each ISR member in turn, every key of every history read through it and compared with the final
- * read (kv_final's). The writers are stopped; the ISR is whole. */
+/* Live snapshot of every series of kvr (kvr.a, kvr.b, kvr.fill) through member `to` (which currently leads kvr and
+ * reads its own young parts + settled .ec parts through the live chunk tier). Retries up to 30 s while a freshly
+ * transferred leader finishes reopening kvr. Returns 0 on success, -1 on failure. */
+static int ec_live_snap(int to, struct snaps *out, int *last_rc)
+{
+    static const char *const snames[REP_HISTS + 1] = {"kvr.a", "kvr.b", "kvr.fill"};
+    memset(out, 0, sizeof *out);
+    if (last_rc)
+        *last_rc = 0;
+    for (int64_t t0 = now_ms(); now_ms() - t0 < 60000; usleep(200000)) {
+        tsdbc *c = NULL;
+        if (connect_node(to, 1, &c) != 0)
+            continue;
+        tsdbc_set_timeout(c, 15000); /* cold-cache full scan of kvr.fill across .ec objects can exceed 3 s */
+        int ok = 1;
+        snaps_free(out);
+        for (int i = 0; i <= REP_HISTS && ok; i++) {
+            tsdb_sid sid = 0;
+            int rc = i < REP_HISTS ? kv_resolve(c, i, &sid) : tsdbc_series(c, snames[i], 0, &sid);
+            if (rc != 0) {
+                if (last_rc)
+                    *last_rc = rc;
+                ok = 0;
+                break;
+            }
+            tsdb_points p;
+            memset(&p, 0, sizeof p);
+            rc = tsdbc_query_points(c, sid, INT64_MIN, INT64_MAX, &p);
+            if (rc != 0) {
+                if (last_rc)
+                    *last_rc = rc;
+                ok = 0;
+                break;
+            }
+            if (out->n == out->cap) {
+                out->cap = out->cap ? out->cap * 2 : 8;
+                out->s = realloc(out->s, out->cap * sizeof *out->s);
+                if (!out->s)
+                    die(2, "out of memory");
+            }
+            struct snapshot *s = &out->s[out->n++];
+            snprintf(s->name, sizeof s->name, "%s", snames[i]);
+            s->n = p.n;
+            s->ts = p.ts;
+            s->v = p.values;
+        }
+        tsdbc_close(c);
+        if (ok) {
+            if (out->n)
+                qsort(out->s, out->n, sizeof *out->s, cmp_snap);
+            return 0;
+        }
+        snaps_free(out);
+    }
+    return -1;
+}
+
+/* E3 + full replica verification (replaces offline read-only cvol_rows, which cannot open META requires=tier volumes):
+ * transfers leadership of kvr to each ISR member in turn, reads every series (kvr.a, kvr.b, kvr.fill) directly from
+ * that member as leader, and checks:
+ *  - every key of every history equals kv_final (no stray timestamps; supports ec-member-differs and rep-lost-write),
+ *  - all series and rows are bit-for-bit identical across all replicas (snaps_diff),
+ *  - every filler batch in kvr.fill is whole or absent, whole when acknowledged, absent when refused (fill_check). */
 static int ec_members_check(void)
 {
     struct rrec r;
@@ -295,18 +357,41 @@ static int ec_members_check(void)
         fprintf(stderr, "jepsen-cluster: FAIL: ec: no record of kvr for the per-member reads\n");
         return 1;
     }
-    int bad = 0, order[META_REPLICAS_MAX], no = 0;
-    for (int k = 0; k < r.nrep; k++)
-        if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0)
-            order[no++] = k;
+    int bad = 0, diff = 0, order[META_REPLICAS_MAX], no = 0;
+    /* Read the current leader first so we never transfer away from a member and immediately back while it reopens. */
+    for (int pass = 0; pass < 2; pass++)
+        for (int k = 0; k < r.nrep; k++)
+            if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0 && ((r.node[k] == r.leader) == (pass == 0)))
+                order[no++] = k;
+    if (no != rep_n) {
+        fprintf(stderr, "jepsen-cluster: FAIL: ec: only %d of %d replicas in kvr's ISR for the per-member reads\n", no,
+                rep_n);
+        bad++;
+    }
+    struct snaps first;
+    memset(&first, 0, sizeof first);
+    int have_first = 0;
+    char first_lbl[64] = "";
     for (int q = 0; q < no; q++) {
         int k = order[q], to = r.node[k];
+        int rslot = q;
+        for (int s = 0; s < rep_n; s++)
+            if (rep_nodes[s] == to) {
+                rslot = s;
+                break;
+            }
         rep_rec_get(&r); /* the leader may have moved by the last transfer */
         if (r.leader != to) {
             uint8_t body[16];
             size_t bl = cluster_volume_force_encode(rep_number, r.id[k], body);
-            int rc = !strcmp(mutant, "ec-notransfer") ? 0 /* planted: none is made */
-                                                      : admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000);
+            int rc = 0;
+            if (strcmp(mutant, "ec-notransfer") != 0) { /* planted: none is made */
+                /* Retry up to 30 s: a target that was recently deposed or a new leader still warming may briefly
+                 * refuse VOLUME_TRANSFER until it rejoins the ISR. */
+                for (int64_t tr0 = now_ms(); (rc = admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000)) != 0 &&
+                     now_ms() - tr0 < 30000; usleep(300000))
+                    ;
+            }
             if (rc != 0) {
                 fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr was not moved to node %d for its read: %s\n", to,
                         cluster_strerror(rc));
@@ -326,37 +411,72 @@ static int ec_members_check(void)
             }
             ec_transfers++;
         }
+        struct snaps sn;
+        int lrc = 0;
+        if (ec_live_snap(to, &sn, &lrc) != 0) {
+            fprintf(stderr, "jepsen-cluster: FAIL: ec: no live read of kvr through member node %d (%s)\n", to,
+                    lrc ? tsdbc_strerror(lrc) : "unreachable");
+            bad++;
+            continue;
+        }
         for (int hi = 0; hi < nhists; hi++) {
-            struct rd rd;
-            memset(&rd, 0, sizeof rd);
-            int got = -1;
-            for (int64_t t0 = now_ms(); got != 0 && now_ms() - t0 < 30000; usleep(200000)) {
-                tsdbc *c = NULL;
-                tsdb_sid sid;
-                if (connect_node(to, 1, &c) == 0) {
-                    if (kv_resolve(c, hi, &sid) == 0)
-                        got = kv_read_all(c, sid, &rd);
-                    tsdbc_close(c);
-                }
-            }
-            if (got != 0) {
-                fprintf(stderr, "jepsen-cluster: FAIL: ec: no read of %s through member node %d\n", hists[hi].name, to);
-                bad++;
-                continue;
-            }
+            uint32_t seen[KEYS];
+            int stray = 0;
+            snap_seen(&sn, hists[hi].name, seen, &stray);
             if (!strcmp(mutant, "ec-member-differs") && q == 1 && hi == 0) /* planted: one member answers differently */
-                rd.seen[0] = rd.seen[0] ? 0 : 1;
+                seen[0] = seen[0] ? 0 : 1;
+            if (!strcmp(mutant, "rep-lost-write") && q == no - 1 && hi == 0)
+                for (int key = 0; key < KEYS; key++)
+                    if (seen[key] && seen[key] <= hists[hi].nw && hists[hi].w[seen[key] - 1].st == WS_OK) {
+                        seen[key] = 0;
+                        break;
+                    }
             ec_member_reads++;
+            if (stray) {
+                fprintf(stderr, "jepsen-cluster: FAIL: ec: %s through member node %d has a timestamp that is no key\n",
+                        hists[hi].name, to);
+                bad++;
+                diff++;
+            }
             for (int key = 0; key < KEYS; key++)
-                if (rd.seen[key] != hists[hi].final[key]) {
+                if (seen[key] != hists[hi].final[key]) {
                     fprintf(stderr, "jepsen-cluster: FAIL: ec: %s key %d reads write %u through member node %d, the final "
-                            "read had %u\n", hists[hi].name, key, (unsigned)rd.seen[key], to, (unsigned)hists[hi].final[key]);
+                            "read had %u\n", hists[hi].name, key, (unsigned)seen[key], to, (unsigned)hists[hi].final[key]);
                     bad++;
+                    diff++;
                     ec_member_bad++;
                     break;
                 }
         }
+        uint64_t fapplied = 0;
+        int fbad = fill_check(&sn, rslot, 1, &fapplied);
+        if (fbad) {
+            fprintf(stderr, "jepsen-cluster: replica %s: %d violation(s) of the filler's large writes\n",
+                    rep_dir[rslot], fbad);
+            bad += fbad;
+            diff += fbad;
+        } else
+            printf("jepsen-cluster: replica %s: kvr.fill holds every one of its %zu batches whole or not at all "
+                   "(%" PRIu64 " indeterminate applied)\n", rep_dir[rslot], nfb, fapplied);
+        if (!have_first) {
+            first = sn;
+            have_first = 1;
+            snprintf(first_lbl, sizeof first_lbl, "node %d", to);
+        } else {
+            char cur_lbl[64];
+            snprintf(cur_lbl, sizeof cur_lbl, "node %d", to);
+            int d = snaps_diff(&first, &sn, first_lbl, cur_lbl);
+            if (d) {
+                bad += d;
+                diff += d;
+            }
+            snaps_free(&sn);
+        }
     }
+    snaps_free(&first);
+    if (diff)
+        fprintf(stderr, "jepsen-cluster: FAIL: %d difference(s) between the replicas of kvr, with its leader's "
+                        "final read, or in the filler's large writes\n", diff);
     return bad;
 }
 
@@ -406,7 +526,7 @@ static int ec_parts_check(const char *const *dirs, int nd)
     ec_ec_parts = nec;
     ec_partitions_max = per_max;
     int bad = 0;
-    if (nec == 0 && ec_experimental) {
+    if (nec == 0 && ec_settles) {
         fprintf(stderr, "jepsen-cluster: FAIL: ec: no .ec part on any replica of kvr after the run: nothing settled\n");
         bad++;
     }
@@ -476,11 +596,12 @@ static int ec_chunk_find(const char *dir, int depth, char *out, size_t on, int *
         struct stat sb;
         if (lstat(p, &sb) != 0)
             continue;
+        size_t l = strlen(e->d_name);
         if (S_ISDIR(sb.st_mode)) {
             if (depth < 4)
                 found = ec_chunk_find(p, depth + 1, out, on, seen);
-        } else if (S_ISREG(sb.st_mode) && sb.st_size >= 8192 && strncmp(e->d_name, "tmp_", 4) && strcmp(e->d_name, "META") &&
-                   strncmp(e->d_name, "EPOCH", 5) && strcmp(e->d_name, "LOCK")) {
+        } else if (S_ISREG(sb.st_mode) && sb.st_size >= 256 && e->d_name[0] == 'o' && l > 6 &&
+                   !strcmp(e->d_name + l - 6, ".chunk")) {
             if ((*seen)++ == 0 || rnd() % 4 == 0) {
                 snprintf(out, on, "%s", p);
                 found = rnd() % 2;
@@ -491,50 +612,155 @@ static int ec_chunk_find(const char *dir, int depth, char *out, size_t on, int *
     return found;
 }
 
+/* Track rotted chunk files so at most want_ec_m distinct positions of any object are rotted simultaneously (R12 scrub
+ * repair is not built yet, so rotting > m positions of one object makes it unrecoverable). Up to m positions stay
+ * rotted across rounds and through the final per-member reads. */
+struct ec_rot_rec {
+    char path[PATH_MAX + 64];
+    char oid[64];
+    int node;
+    int nflips;
+    off_t off[8];
+    uint8_t orig[8];
+};
+#define EC_ROT_MAX 256
+static struct ec_rot_rec ec_rot_tab[EC_ROT_MAX];
+static int ec_rot_n;
+
+static void ec_rot_oid(const char *path, char *oid, size_t on)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (*base == 'o')
+        base++;
+    size_t n = strcspn(base, ".");
+    if (n >= on)
+        n = on - 1;
+    memcpy(oid, base, n);
+    oid[n] = 0;
+}
+
+static void ec_rot_heal_idx(int idx)
+{
+    struct ec_rot_rec *r = &ec_rot_tab[idx];
+    int fd = open(r->path, O_RDWR);
+    if (fd >= 0) {
+        for (int k = r->nflips - 1; k >= 0; k--)
+            if (pwrite(fd, &r->orig[k], 1, r->off[k]) != 1)
+                break;
+        fsync(fd);
+        close(fd);
+    }
+    memmove(&ec_rot_tab[idx], &ec_rot_tab[idx + 1], (size_t)(ec_rot_n - idx - 1) * sizeof *ec_rot_tab);
+    ec_rot_n--;
+}
+
+static void ec_rot_heal_node(const char *oid, int node)
+{
+    /* Undo all stacked flips for (oid, node) in exact reverse chronological order so the chunk is restored byte-for-byte. */
+    for (int k = ec_rot_n - 1; k >= 0; k--)
+        if (ec_rot_tab[k].node == node && strcmp(ec_rot_tab[k].oid, oid) == 0)
+            ec_rot_heal_idx(k);
+}
+
 /* rot: bytes flipped in one chunk file of a random node, at rest (the node goes on running) */
 static void nem_rot(void)
 {
     char path[PATH_MAX + 64] = "";
-    int seen = 0;
+    int seen = 0, node = -1;
     for (int tries = 0; tries < 30 && !path[0]; tries++) {
         int i = rnd_range(0, nn - 1);
         seen = 0;
         ec_chunk_find(nodes[i].chunk[rnd() % 2], 0, path, sizeof path, &seen);
         if (!path[0])
             ec_chunk_find(nodes[i].chunk[0], 0, path, sizeof path, &seen);
-        if (!path[0])
+        if (path[0])
+            node = i;
+        else
             hold_ms(500);
     }
     if (!path[0])
         return; /* no chunk yet: the round has no effect and the run says so */
+    char oid[64];
+    ec_rot_oid(path, oid, sizeof oid);
+    /* Count distinct nodes currently rotted for this object; heal the oldest node completely if adding `node` would exceed m. */
+    int already = 0, first_oid = -1, distinct = 0;
+    int seen_nodes[MAXN];
+    for (int k = 0; k < ec_rot_n; k++) {
+        if (strcmp(ec_rot_tab[k].oid, oid) != 0)
+            continue;
+        if (first_oid < 0)
+            first_oid = k;
+        if (ec_rot_tab[k].node == node)
+            already = 1;
+        int dup = 0;
+        for (int j = 0; j < distinct; j++)
+            dup |= seen_nodes[j] == ec_rot_tab[k].node;
+        if (!dup && distinct < MAXN)
+            seen_nodes[distinct++] = ec_rot_tab[k].node;
+    }
+    if (!already && distinct >= want_ec_m && first_oid >= 0)
+        ec_rot_heal_node(oid, ec_rot_tab[first_oid].node);
+    if (ec_rot_n >= EC_ROT_MAX) {
+        char old_oid[64];
+        snprintf(old_oid, sizeof old_oid, "%s", ec_rot_tab[0].oid);
+        ec_rot_heal_node(old_oid, ec_rot_tab[0].node);
+    }
     struct stat sb;
     int fd = open(path, O_RDWR);
     if (fd < 0 && errno == ENOENT) /* a chunk file is always a new inode: a heal or a gc took it between the find and here */
         return;
     if (fd < 0 || fstat(fd, &sb) != 0)
         die(2, "ec: rot: cannot open %s: %s", path, strerror(errno)); /* the harness' own error, never a VIOLATION (1) */
+    struct ec_rot_rec rec;
+    memset(&rec, 0, sizeof rec);
+    snprintf(rec.path, sizeof rec.path, "%s", path);
+    snprintf(rec.oid, sizeof rec.oid, "%s", oid);
+    rec.node = node;
     int flips = rnd_range(1, 8);
     for (int k = 0; k < flips; k++) {
         off_t off = (off_t)(rnd() % (uint64_t)sb.st_size);
         uint8_t b;
         if (pread(fd, &b, 1, off) != 1)
             continue;
+        rec.off[rec.nflips] = off;
+        rec.orig[rec.nflips] = b;
+        rec.nflips++;
         b ^= (uint8_t)(1u << (rnd() % 8));
         if (pwrite(fd, &b, 1, off) != 1)
             die(2, "ec: rot: write to %s: %s", path, strerror(errno));
     }
+    fsync(fd);
     close(fd);
+    if (rec.nflips)
+        ec_rot_tab[ec_rot_n++] = rec;
     ec_rots++;
     ec_damaged = 1;
     effect_seen = 1;
-    ev("rot: %d bit(s) flipped in %s", flips, path);
+    ev("rot: %d bit(s) flipped in %s (node %d, oid %s)", rec.nflips, path, node, oid);
     hold_ms(rnd_range(1000, 3000));
 }
 
-/* diskloss: a node's chunk stores gone, made again empty with its cluster and node, the node started with them */
+/* diskloss: a node's chunk stores gone, made again empty with its cluster and node, the node started with them.
+ * At most want_ec_m distinct nodes are wiped per run (R9 chunk rebuild is not built yet, so wiping > m distinct nodes
+ * would lose > m positions of settled objects). */
+static int ec_wiped[MAXN], ec_nwiped;
 static void nem_diskloss(void)
 {
-    int i = rnd_range(0, nn - 1);
+    int i;
+    if (ec_nwiped >= want_ec_m) {
+        int cand[MAXN], nc = 0;
+        for (int k = 0; k < nn; k++)
+            if (ec_wiped[k])
+                cand[nc++] = k;
+        i = cand[rnd_range(0, nc - 1)];
+    } else {
+        i = rnd_range(0, nn - 1);
+        if (!ec_wiped[i]) {
+            ec_wiped[i] = 1;
+            ec_nwiped++;
+        }
+    }
     stop_node(i, SIGKILL);
     for (int k = 0; k < 2; k++) {
         rmtree(nodes[i].chunk[k]);
@@ -555,7 +781,7 @@ static void ec_summary(void)
         return;
     printf("ec %d+%d: %s; %u polls of /metrics (%u DIVERGED, %u without an answer), %u node-log stop line(s); .ec parts on the replicas: %d, most "
            "parts of one partition on a replica: %d; per-member reads %u through %u transfers (%u differing); kv replaces %" PRIu64 "; partial %u, diskloss %u, rot %u\n",
-           want_ec_k, want_ec_m, ec_experimental ? "tsdbd settles (--ec-experimental)" : "tsdbd does not settle yet",
+           want_ec_k, want_ec_m, ec_settles ? "tsdbd settles (TSDB_EC)" : "tsdbd does not settle (NO_EC)",
            ec_polls, ec_div_polls, ec_poll_errs, ec_stopped_lines, ec_ec_parts, ec_partitions_max, ec_member_reads, ec_transfers, ec_member_bad,
            (uint64_t)atomic_load(&ec_replaces), ec_partials, ec_diskloss, ec_rots);
 }
