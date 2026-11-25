@@ -300,6 +300,40 @@ that finds no posted receive ends the connection at once: a transport over iWARP
 4.50) comes from the two runs that did not fail and is not believed. RoCE without lossless Ethernet (PFC) is fine
 back to back but can lose throughput to retransmissions on a busy switch; RoCE v1 (all a plain ConnectX-3 does; the GID type says which) is not routed across IP subnets.
 
+### 3.6 Verbs under peerlink (rd-verbs, test_plrdma on two hosts)
+
+`server/plrdma.c` under peerlink between the InfiniBand pair of §3.1 (FDR, `mlx4_0` port 1), against the same
+peerlink on TCP over the 40GbE Ethernet between the same hosts: `test_plrdma --verbs-listen` / `--verbs-dial` (§8),
+one link of the bulk kind (no zstd; its token bucket off), XXH3-128 frame check on (today's peerlink), 2 GiB of frames
+per size, `plink_send` from one thread, each side's process CPU (`getrusage`, every thread) per GB moved. Gbit/s mean
+(lowest-highest) of 3 runs; CPU s/GB sender / receiver. The pool is 4 MiB (the hosts' memlock is 8 MB). "Default" is
+`PLR_POOL_CFG_DEFAULT`'s connection (32 KiB slots, 12 data credits, 16 send slots: 384 KiB in flight); "64 KiB x 32"
+is 64 KiB slots, 32 data credits and 28 send slots (2 MiB in flight).
+
+| frame | TCP | CPU s/GB | verbs, default | CPU s/GB | verbs, 64 KiB x 32 | CPU s/GB |
+|---|---|---|---|---|---|---|
+| 4 KiB | 14.1 (10.9-15.8) | 0.97 / 0.32 | 15.2 (14.6-16.2) | 0.88 / 0.33 | 18.2 (12.2-22.0) | 0.83 / 0.31 |
+| 16 KiB | 20.8 (20.0-21.8) | 0.56 / 0.30 | 22.9 (22.3-23.6) | 0.52 / 0.27 | 27.6 (24.1-30.3) | 0.50 / 0.26 |
+| 64 KiB | 23.5 (21.8-25.6) | 0.45 / 0.30 | 24.2 (24.0-24.4) | 0.47 / 0.27 | 31.3 (30.6-31.9) | 0.39 / 0.25 |
+| 256 KiB | 22.2 (21.8-22.7) | 0.50 / 0.33 | 21.6 (20.8-22.1) | 0.49 / 0.31 | 28.0 (26.8-29.5) | 0.42 / 0.28 |
+| 1 MiB | 22.9 (19.2-26.6) | 0.46 / 0.33 | 17.6 (17.5-17.8) | 0.51 / 0.33 | 26.4 (25.3-27.0) | 0.46 / 0.28 |
+| 4 MiB | 23.6 (19.7-26.6) | 0.46 / 0.30 | 13.9 (13.6-14.2) | 0.53 / 0.34 | 16.9 (16.2-18.1) | 0.50 / 0.33 |
+
+On a log link (zstd-1 on every frame, incompressible payloads), one run each: 4 KiB 3.9 Gbit/s on both, 64 KiB 11.4
+(TCP) and 10.6 (verbs), 1 MiB 13.6 and 8.8; the sender's zstd (0.7-2.9 s/GB) is the limit there, not the transport.
+
+What this says. The transport is not the limit: perftest moves 50 Gbit/s at 0.02 CPU s/GB on this pair (§3.1),
+and here both transports stop at 20-30 Gbit/s with about 0.45 s/GB on the sender, which is peerlink's own work on one
+thread per link (the frame copied at `plink_send`, encoded with its check into the write buffer, then copied into the
+socket or a slot). Verbs saves 10-20% of the receiver's CPU and some of the sender's; it is faster than TCP only with
+a window large enough to cover the link thread's work on one frame: with the default 384 KiB it falls behind TCP from
+1 MiB frames (while the link thread encodes the next frame, a window that small sits idle, where TCP's send buffer
+of several MB keeps the wire busy), and with 2 MiB in flight it leads at every size but 4 MiB. Two consequences for
+the tracks after this one: the window should follow the kind (bulk, CHUNKB and SNAP a large one; LOG, FWD and CHUNK
+requests the default), and a zero-copy path (frames encoded straight into registered slots) is what would move
+peerlink toward the 50 Gbit/s of §3.1. Every run ended with both pools whole (no slot lost) and the check of 2000
+frames both ways, every byte compared, passed.
+
 ## 4. What RDMA would give each kind, and at what cost
 
 The gains, from §3 on these servers. Today every link is capped at about 230 MB/s per direction by the MAC whatever
@@ -335,8 +369,17 @@ small frames, 64 KiB for the rest; a larger frame spans several) and a **shared 
 slot size**, whose depth follows what arrives rather than how many links exist; credits (below) are granted per link
 out of the SRQ's posted slots. For 8 peers: 128 large and 512 small receive slots per peerlink, 3 x (8 + 2) = 30 MiB,
 plus send slots taken from a shared free list only while a send is in flight (16 MiB): about 46 MiB, under the
-default `pool_mb` of 64, which is per tsdbd. Whether SRQs or small per-link rings are simpler for the credit rule is
-settled in rd-verbs with the fake transport (§8). tsdbd's memlock need is the pool, plus the provider's queue and
+default `pool_mb` of 64, which is per tsdbd.
+
+**As built (rd-verbs, 2026-11-25): one slot size and per-connection receive rings.** Two sizes are not possible with
+one QP per connection: a receive queue, shared or not, hands each incoming SEND the next posted buffer whatever its
+size, so a sender cannot choose a 4 KiB or a 64 KiB slot (that needs XRC, one receive QP per size). Every receive slot
+is then the size of the largest message, and an SRQ per peerlink would cost what per-connection rings cost while making
+credits inexact (a credit would be a share of a queue other links drain too). So each connection takes its slots from
+the pool at creation (`server/plrdma.h`: D data slots, K control slots, S send slots, one size), returns them only after
+its drain, and its credits are exactly the slots the peer posted for that QP. The default (32 KiB slots, 12 + 4
+receive and 16 send) is 1 MiB per connection, 64 connections in the 64 MiB pool; §3.6 measures what a larger window
+buys bulk frames. tsdbd's memlock need is the pool, plus the provider's queue and
 completion buffers per QP (56 QPs at 8 peers), plus io_uring's rings: it needs `LimitMEMLOCK=infinity` (or that sum
 with headroom) in its systemd unit; with a lower limit it says so in one line and stays on TCP (`auto`) or refuses to
 start (`on`). Tests run with a pool of 1-2 MiB (§8).
@@ -352,7 +395,11 @@ finite `rnr_retry`, and the tests set 0 so that a SEND without a receive fails t
   the header of every frame it sends, and in an `RDMA_CREDIT` frame when it owes a quarter of the window and has
   nothing else to send. `plink_pause` stops returning data credits, which stops the sender as a closed TCP window does.
 - **Control credits**: K = 4 small receive slots per link reserved for PING, PONG and `RDMA_CREDIT`, counted apart from
-  the data credits. A control frame takes one control credit; a side sends one only while it holds one, so at most K
+  the data credits. *As built*: the transport sits under peerlink's byte stream (`server/pltransport.h`) and cannot
+  tell a PING from any other frame, so PING and PONG are stream bytes on data credits, and the control slots carry
+  `CREDIT` messages only (posted again the moment they arrive, also while paused). A paused side's PINGs still go out:
+  the reading side returns their data credits by `CREDIT`; its PONGs wait in its write buffer as behind a shut TCP
+  window, and peerlink never counts a peer dead while its own link is paused (test_plrdma `pause`). A control frame takes one control credit; a side sends one only while it holds one, so at most K
   are in flight per direction and they cannot storm. Control credits are returned only piggybacked, in the header of
   the next frame of either class, never by a frame of their own; an `RDMA_CREDIT` that would return only control
   credits is sent only when at least K/2 are owed, so a credit exchange dies out instead of answering itself.
@@ -677,7 +724,7 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
 | D4 | **`dlopen` of libibverbs and librdmacm**; `NO_RDMA=1` to build without; macOS never | link them | one binary and one tarball for hosts with and without rdma-core |
 | D5 | **WRITTEN = posted** | WRITTEN on completion | a completion says the peer's NIC acknowledged, not what the peer did; a flushed WR is not proof of nothing sent |
 | D6 | **`auto` is the default** | `off` until proven | a cluster with IB uses it without configuration; `off` stays one key away |
-| D7 | **One registered pool per tsdbd and device**, shared by its three peerlinks; slots of 4 KiB and 64 KiB; receives on an SRQ per peerlink and slot size, credits granted per link (SRQ against small per-link rings settled in rd-verbs); 64 MiB by default; memlock checked at start | a pool per peerlink; registration per frame or per file | registration on the data path costs tens of µs and fails unpredictably under a memlock limit; per-link 64 KiB rings do not add up (§4) |
+| D7 | **One registered pool per tsdbd and device**, shared by its three peerlinks; one slot size (32 KiB by default) and per-connection receive rings (rd-verbs: two sizes need XRC with one QP per connection, §4 "As built"); 64 MiB by default; memlock checked at start | a pool per peerlink; registration per frame or per file | registration on the data path costs tens of µs and fails unpredictably under a memlock limit; per-link 64 KiB rings do not add up (§4) |
 | D8 | **One RC QP per link connection** (per peer and kind) | one shared QP per peer | keeps kinds independent (C25, R4 D7: a snapshot never delays a COMMIT file) and generations simple; ConnectX-3 has QPs to spare |
 | D9 | **SEND/RECV only** in 0.11.0, no RDMA WRITE/READ, no remote keys | WRITE for bulk, READ for chunk cells | §3.1: SEND reaches line rate from 16 KiB; no rkey means no fencing of remote access to get wrong |
 | D10 | **RoCE supported by the same code, not tested as a production path** until a lossless Ethernet setup exists; `auto` takes InfiniBand ports only | RoCE as a target; any active port | the production fabric is InfiniBand; a RoCE v1 link on a lossy Ethernet must never be picked silently |
@@ -718,6 +765,15 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
   over IB (replicate, fwd, chunksrv, a snapshot), `jepsen-cluster --peer-rdma on` with a nemesis that breaks only the
   RDMA path (a QP forced to error through a test hook, `TSDB_PLRDMA_TEST`), and the §10.3 measurements of
   design-cluster.md over TCP and over IB.
+- **As built in rd-verbs** (`tests/test_plrdma.c`, `tests/plr_fake.h`): cases `ep pool basic pause storm written qperr`
+  and the mutants `writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff` (`make test-meta` requires
+  each to fail). Not plantable under the transport seam, so not there: "a flushed WR reported NEVER_WRITTEN" (a
+  transport cannot take back bytes `writev` took: D5 holds by construction, `written` checks it), "an old generation's
+  frame posted to the new QP" (peerlink's generations, test_peerlink's), and every upgrade, fallback, READY/GO and MAC
+  mutant (rd-upgrade's). On the hardware: `test_plrdma --verbs-listen ADDR --port-file F` on one host and
+  `--verbs-dial ADDR:PORT` on the other (ADDR an Ethernet address; the TCP connection carries the endpoints and stays
+  as the anchor) runs a check of 2000 frames both ways, every byte compared, then the §3.6 bench, and requires both
+  pools whole at the end; `--tcp` runs the same over the TCP connection.
 - `make test-spdx`, `make check-version` unchanged; `tools/check-glibc.sh` must still pass (no new linked library).
 
 ## 9. Track plan
