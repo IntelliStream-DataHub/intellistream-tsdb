@@ -558,6 +558,11 @@ static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, con
     uint8_t *b = malloc(cap);
     size_t n = b ? rw_encode_msg(b, cap, rv->number, &m, rv->lens, seq, off, buf, len) : 0;
     int rc = n ? plink_send(l, RW_T_MSG, b, n, 0) : -1;
+    if (G.bulk_frame && n && ++rv->peer[to].bulk_n % 16 == 0) { /* a frame on the wrong link (test_cluster replbulk) */
+        struct plink *bl = link_of(rv->rec.rep[to].node, 1);
+        if (bl)
+            plink_send(bl, RW_T_MSG, b, n, 0);
+    }
     free(b);
     return rc == PL_OK ? 0 : -1;
 }
@@ -1292,7 +1297,7 @@ static const char *msg_refused(struct rvol *rv, const struct rw_msg *c)
     case REPL_M_META:
     case REPL_M_ISR_REQ:
     case REPL_M_RESIGN:
-        return "a metadata-only type from a peer";
+        return G.mutant == RM_NOMETAREFUSE ? NULL : "a metadata-only type from a peer";
     case REPL_M_ACK:
         if (m->durable > m->written || m->written > repl_written(rv->core))
             return "an ACK beyond the log";
@@ -1892,6 +1897,10 @@ static void handle(struct rvol *rv, struct item *it)
         rv->coff[i] = o, o += rv->cur.lens[i];
     if (G.flip_in && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec && ++rv->flip_n % 8 == 0)
         ((uint8_t *)rv->cur.bytes)[rv->cur.lens[0] / 2] ^= 0x10; /* the receive side of a wire flip (test_cluster replflip) */
+    if (G.meta_in && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec && ++rv->flip_n % 8 == 0) {
+        rv->cur.m.type = REPL_M_FENCE; /* a flipped type field (test_cluster replmeta): a fence above the leader's epoch */
+        rv->cur.m.epoch++;
+    }
     const char *why = G.mutant == RM_NOMSGCHECK ? NULL : msg_refused(rv, &rv->cur);
     if (why) {
         if (rv->bad_msgs++ % 1000 == 0)
@@ -2399,6 +2408,7 @@ void repld_init(tsdb *t, const char *dir)
                : !strcmp(mu, "snapmakedown")   ? RM_SNAPMAKEDOWN
                : !strcmp(mu, "nomsgcheck")     ? RM_NOMSGCHECK
                : !strcmp(mu, "bulkframes")     ? RM_BULKFRAMES
+               : !strcmp(mu, "nometarefuse")   ? RM_NOMETAREFUSE
                : !strcmp(mu, "snapnowaitdone") ? RM_SNAPNOWAITDONE
                : !strcmp(mu, "snapnostale")    ? RM_SNAPNOSTALE
                : !strcmp(mu, "snapnostall")    ? RM_SNAPNOSTALL
@@ -2440,6 +2450,8 @@ void repld_init(tsdb *t, const char *dir)
     G.sync_pause = te && strstr(te, "syncpause");
     G.snap_dial = te && strstr(te, "snapdial");
     G.flip_in = te && strstr(te, "flipin");
+    G.meta_in = te && strstr(te, "metain");
+    G.bulk_frame = te && strstr(te, "bulkframe");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */

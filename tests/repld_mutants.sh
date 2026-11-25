@@ -95,6 +95,8 @@ table=(
     "promotenone|promoteslow|the record of ps moved past epoch|series pump1.flow in ps: error -11"
     "fencenosync|fencecrash|REPL holds fence [0-9]+ after it stopped at fence-saved-before-reply"
     "nomsgcheck|replflip|the last row did not reach replica"
+    "nometarefuse|replmeta|the leader stopped taking writes under the hook|the last row did not reach replica|no metadata-only message was refused"
+    "bulkframes|replbulk|no driver frame on a bulk link was refused"
     "keepwritten|replicate|the replica restarted under writes: the ISR of plant has [0-9]+ members, not 3"
     "stopnodepose|closegone|its replicas killed: server [0-9]+ still runs [0-9]+ ms after SIGTERM"
     "lateclock|closegone|the leader wrote no WAL record after its driver stopped"

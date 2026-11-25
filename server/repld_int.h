@@ -64,6 +64,7 @@ struct rpeer {
     uint64_t sent;     /* the last position whose records went out to it (a WAL record end) */
     uint64_t want;     /* the core wants it to have up to here */
     uint64_t sent_ms;  /* when `sent` last moved forward */
+    uint64_t bulk_n;   /* TSDB_REPLD_TEST=bulkframe: APPENDs sent to it */
     uint64_t acked;    /* the `durable` of its last ACK in this run: a replica's durable end stops below a COMMIT
                         * marker whose file it has not staged, so the segment that holds the marker, and with it the
                         * link the file is fetched from, stays (its `written` passes the marker: replicate) */
@@ -228,7 +229,8 @@ enum {
     RM_SNAPNOLEFTOVERS,  /* snapinst.c: what an install left at a crash is not finished or undone at prepare */
     RM_NOMSGCHECK,       /* repld.c: a peer message is handed to the core unchecked (msg_refused: metadata-only types,
                           * an ACK beyond the log, records unlike their descriptors) */
-    RM_BULKFRAMES        /* repld.c: a driver frame on a kind-2 (bulk) link is taken as on the LOG link */
+    RM_BULKFRAMES,       /* repld.c: a driver frame on a kind-2 (bulk) link is taken as on the LOG link */
+    RM_NOMETAREFUSE      /* repld.c: msg_refused lets a metadata-only type (FENCE, META, ...) from a peer reach the core */
 };
 
 struct repld_g {
@@ -254,6 +256,8 @@ struct repld_g {
     int spill_said;
     size_t inbox_bytes; /* INBOX_BYTES (TSDB_REPLD_TEST=smallinbox: 256 KiB) */
     int flip_in;        /* TSDB_REPLD_TEST=flipin: one byte of a record of every 8th APPEND received is flipped */
+    int meta_in;        /* TSDB_REPLD_TEST=metain: every 8th APPEND received has its type flipped into a FENCE above it */
+    int bulk_frame;     /* TSDB_REPLD_TEST=bulkframe: every 16th APPEND is also sent on the peer's bulk link */
     int cut_links;      /* TSDB_REPLD_TEST=cutlinks: a message of any volume from node N is dropped as it arrives while
                          * <dir>/cutfrom.N exists (test_cluster cut) */
     int stall_inbox;    /* TSDB_REPLD_TEST=stallinbox: no peer frame is handled while <dir>/stallinbox exists (a

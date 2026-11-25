@@ -48,6 +48,9 @@ int main(void)
 
 static int fails;
 static bool quick;
+static bool net_only;          /* --net: test_net alone */
+static const char *check_name; /* --check LEVEL */
+static int check_level;        /* its level (0: the default, none) */
 static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32];
 static const uint8_t CLUSTER[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 static const uint8_t VUUID[16] = {0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 9, 9, 9, 9, 9, 9, 9, 9};
@@ -1144,6 +1147,8 @@ static void net_flips(struct chunksrv *a, struct chunksrv *b, const char *dir)
 
     struct plink *lb = peerlink_find(chunksrv_peerlink(b), 1, PL_KIND_CHUNK);
     CHECK(lb != NULL);
+    if (lb) /* the link runs at the level both ends were given (--check; none by default) */
+        CHECK(plink_check(lb) == (check_level ? check_level : peerlink_check_parse("none")));
     if (lb) {
         uint64_t g0 = plink_gen(lb);
         struct chunksrv_stats st0, st1;
@@ -1366,7 +1371,20 @@ int main(int argc, char **argv)
             quick = true;
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
             mutant = argv[++i];
-        else
+        else if (!strcmp(argv[i], "--net"))
+            net_only = true;
+        else if (!strcmp(argv[i], "--check") && i + 1 < argc) {
+            /* the links' frame check level (plcheck.h): every peerlink of the process takes it (chunksrv's pl_cfg leaves
+             * its own at 0); the net cases must hold at every level */
+            int lv = peerlink_check_parse(argv[++i]);
+            if (lv < 0) {
+                fprintf(stderr, "test_chunksrv: no check level %s\n", argv[i]);
+                return 2;
+            }
+            peerlink_set_check_level(lv);
+            check_level = lv;
+            check_name = argv[i];
+        } else
             base = argv[i];
     }
     if (mutant) {
@@ -1388,7 +1406,12 @@ int main(int argc, char **argv)
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
     snprintf(SHIM, sizeof SHIM, "%.*s/libcrashfs.so", slash ? (int)(slash - SELF) : 1, slash ? SELF : ".");
-    printf("test_chunksrv%s%s%s\n", quick ? " (quick)" : "", mutant ? " mutant " : "", mutant ? mutant : "");
+    printf("test_chunksrv%s%s%s%s%s\n", quick ? " (quick)" : "", mutant ? " mutant " : "", mutant ? mutant : "",
+           check_name ? " check " : "", check_name ? check_name : "");
+    if (net_only) { /* --net: the cases on real peer links only (the Makefile runs them at each check level) */
+        test_net();
+        goto out;
+    }
     test_wire();
     test_put_read();
     test_bad_cell();
@@ -1402,6 +1425,7 @@ int main(int argc, char **argv)
     test_eio();
     test_net();
     test_slow_disk();
+out:
     if (fails == 0) {
         char cmd[PATH_MAX + 16];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", S);
