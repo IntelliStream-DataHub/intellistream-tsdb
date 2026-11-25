@@ -13,7 +13,9 @@
  * byte, with the baseline. Decoded values must also equal the input.
  *
  * The baseline is also compared with tests/data/levels-golden.txt (committed digests), so a machine that has one
- * configuration still checks every output against what the other CPUs gave; a missing file fails.
+ * configuration still checks every output against what the other CPUs gave; a missing file fails. The bytes of
+ * blocks compressed with ZSTD are compared there only where the zstd library is the version the file names
+ * (golden_check: they are zstd's bytes as well as tsdb's).
  *
  * In a build without CPU levels (the default -march=native `make`) the codecs
  * exist once and only the aggregation kernels vary; the test still runs.
@@ -73,6 +75,13 @@ static void put(rec *r, const char *what, const char *cs, const void *p, size_t 
     snprintf(r->name[r->n], sizeof r->name[0], "%.80s / %.70s", cs, what);
     r->hash[r->n++] = fnv(p, len, fnv(&len, sizeof len, 0xcbf29ce484222325ull));
 }
+
+/* The group of the outputs whose bytes depend on the zstd library as well as on tsdb's code: the blocks compressed at
+ * a level above 0. Their compressed bytes are zstd's (1.5.5 and 1.5.7 compress some of these inputs differently), and
+ * so is the transform AUTO picks at such a level, which it judges by the size of zstd's output (auto_pick,
+ * sample_block_size). The format promises what such a block decodes to, not its bytes; the golden digests keep these
+ * apart (golden_check). Within one run every configuration links the same zstd, so the levels still compare them. */
+#define ZGROUP "zstd "
 
 /* ---- the inputs ---- */
 #define GR 8192
@@ -1071,8 +1080,11 @@ static void run(rec *r, codec_ctx *c)
         size_t w = type_width(x->type);
         char what[64];
         /* the block layer, as parts store values and timestamps, with and without ZSTD, as inserts and
-         * merges write them */
+         * merges write them; the bytes of a block with ZSTD are the zstd library's too (ZGROUP) */
+        char zname[80];
+        snprintf(zname, sizeof zname, ZGROUP "%.60s", x->name);
         for (int level = 0; level <= 3; level += 3) {
+            const char *bname = level > 0 ? zname : x->name;
             int ncodecs = x->type == TSDB_FLOAT32 ? 3 : 1;
             for (int ve = 0; ve < 2 * ncodecs; ve++) {
                 int vc = ve / 2;
@@ -1080,7 +1092,7 @@ static void run(rec *r, codec_ctx *c)
                 memset(buf, 0, BUF(x->n));
                 size_t len = block_encode_vals(c, level, vc, x->type, x->v, x->n, buf);
                 snprintf(what, sizeof what, "block zstd %d codec %d effort %d", level, vc, c->effort);
-                put(r, what, x->name, buf, len);
+                put(r, what, bname, buf, len);
                 CHECK(len > 0);
                 memset(dec, 0xa5, x->n * w);
                 CHECK(block_decode_vals(c, x->type, buf, len, x->n, dec) == 0);
@@ -1090,7 +1102,7 @@ static void run(rec *r, codec_ctx *c)
             memset(buf, 0, BUF(x->n));
             size_t len = block_encode_ts(c, level, x->ts, x->n, buf);
             snprintf(what, sizeof what, "ts block zstd %d", level);
-            put(r, what, x->name, buf, len);
+            put(r, what, bname, buf, len);
             CHECK(block_decode_ts(c, buf, len, x->n, (int64_t *)dec) == 0);
             CHECK(memcmp(dec, x->ts, x->n * 8) == 0);
         }
@@ -1280,8 +1292,18 @@ static bool same(const rec *a, const rec *b, const char *label)
  * outputs and one hash over their hashes (a block's bytes, a decoded array, an aggregate); every run on every CPU
  * must reproduce it. It changes only with a codec or format change, deliberately: TSDB_LEVELS_GOLDEN_UPDATE=1
  * rewrites it (tests/data/levels-golden.txt), and the diff is the review. Found next to the executable (the
- * tarball's tests/) or at tests/data/ below the current directory (the source tree). */
+ * tarball's tests/) or at tests/data/ below the current directory (the source tree).
+ *
+ * The file has two parts. The first holds everything tsdb's code alone decides (every transform's bytes, the blocks
+ * without ZSTD, decoded values, aggregates, statistics, the index, the erasure codec) and is compared on every
+ * machine. The second, after the line "libzstd TAB VERSION", holds the ZGROUP outputs, which the zstd library
+ * decides too (a block with ZSTD: zstd's bytes, and the transform AUTO picked by zstd's sizes); it is compared only
+ * where the linked libzstd (ZSTD_versionString) is that version, and skipped with a line elsewhere: Ubuntu 24.04's
+ * 1.5.5 compresses some inputs otherwise than the 1.5.7 the file was made with, and both are right, since what a
+ * block promises is what it decodes to, which every run checks against the input. Lines starting with '#' are
+ * comments. */
 #define GOLDEN_NAME "levels-golden.txt"
+#define GOLDEN_ZSTD "libzstd\t"
 
 static void golden_group(const char *name, char *out, size_t cap)
 {
@@ -1290,25 +1312,40 @@ static void golden_group(const char *name, char *out, size_t cap)
     snprintf(out, cap, "%.*s", (int)n, name);
 }
 
-/* One line per group of outputs in the order of first appearance: "group TAB count TAB hash". */
-static char *golden_text(const rec *r)
+static bool zstd_output(const char *name)
+{
+    return strncmp(name, ZGROUP, strlen(ZGROUP)) == 0;
+}
+
+/* One line per group of outputs in the order of first appearance: "group TAB count TAB hash"; the groups of one part
+ * (zstd: the ZGROUP outputs, else the rest). The outputs of a group are consecutive once the other part's are left
+ * out. */
+static char *golden_text(const rec *r, bool zstd)
 {
     size_t cap = 1 << 16, len = 0;
     char *t = malloc(cap);
+    t[0] = 0;
     for (size_t i = 0; i < r->n;) {
+        if (zstd_output(r->name[i]) != zstd) {
+            i++;
+            continue;
+        }
         char g[160], g2[160];
         golden_group(r->name[i], g, sizeof g);
         uint64_t h = 0xcbf29ce484222325ull;
-        size_t j = i;
+        size_t j = i, count = 0;
         for (; j < r->n; j++) {
+            if (zstd_output(r->name[j]) != zstd)
+                continue;
             golden_group(r->name[j], g2, sizeof g2);
             if (strcmp(g, g2) != 0)
                 break;
             h = fnv(&r->hash[j], sizeof r->hash[j], h);
+            count++;
         }
         if (len + 400 > cap)
             t = realloc(t, cap *= 2);
-        len += (size_t)snprintf(t + len, cap - len, "%s\t%zu\t%016llx\n", g, j - i, (unsigned long long)h);
+        len += (size_t)snprintf(t + len, cap - len, "%s\t%zu\t%016llx\n", g, count, (unsigned long long)h);
         i = j;
     }
     return t;
@@ -1329,31 +1366,81 @@ static char *read_all(const char *path)
     return b;
 }
 
-static void golden_check(const rec *base, const char *argv0)
+/* The next line of the file at *b that is not a comment, its length in *len (*b then at its start, *line its
+ * number); false at the end of the file or at the libzstd line (*b left there). */
+static bool golden_next(const char **b, size_t *len, int *line)
 {
-    char *want_text = golden_text(base);
+    for (;;) {
+        if (!**b || strncmp(*b, GOLDEN_ZSTD, strlen(GOLDEN_ZSTD)) == 0)
+            return false;
+        const char *e = strchr(*b, '\n');
+        *len = e ? (size_t)(e - *b) : strlen(*b);
+        ++*line;
+        if (**b != '#')
+            return true;
+        *b += *len + (e != NULL);
+    }
+}
+
+/* Compares the lines of want with the file's lines at *b up to the libzstd line or the end; returns how many differ. */
+static int golden_compare(const char *want, const char **b, int *line, const char *path, int *groups)
+{
+    int bad = 0;
+    const char *a = want;
+    for (;;) {
+        size_t bl = 0;
+        bool more = golden_next(b, &bl, line);
+#ifndef TSDB_EC
+        /* The committed file has the erasure codec's group, which a build without TSDB_EC cannot produce. */
+        if (more && strncmp(*b, "ec\t", 3) == 0) {
+            *b += bl + ((*b)[bl] == '\n');
+            continue;
+        }
+#endif
+        if (!more && !*a)
+            return bad;
+        const char *ae = strchr(a, '\n');
+        size_t al = ae ? (size_t)(ae - a) : strlen(a);
+        ++*groups;
+        if (!more || !*a || al != bl || memcmp(a, *b, al) != 0) {
+            if (bad++ < 20)
+                fprintf(stderr, "golden %s, line %d:\n  produced %.*s\n  expected %.*s\n", path, *line, (int)al, a,
+                        more ? (int)bl : 5, more ? *b : "(end)");
+        }
+        a += al + (ae != NULL);
+        if (more)
+            *b += bl + ((*b)[bl] == '\n');
+    }
+}
+
+static void golden_check_texts(const char *want_text, const char *want_zstd, const char *argv0)
+{
     char exe_path[PATH_MAX + 32] = "", src_path[] = "tests/data/" GOLDEN_NAME;
     const char *slash = strrchr(argv0, '/');
     if (slash)
         snprintf(exe_path, sizeof exe_path, "%.*s/%s", (int)(slash - argv0), argv0, GOLDEN_NAME);
     const char *upd = getenv("TSDB_LEVELS_GOLDEN_UPDATE");
+    const char *zv = ZSTD_versionString();
 #ifndef TSDB_EC
     /* Without the erasure codec there is no "ec" group to write: a rewrite here would drop the committed line. */
     if (upd && *upd && strcmp(upd, "0") != 0) {
         fprintf(stderr, "test_levels: TSDB_LEVELS_GOLDEN_UPDATE needs a build with TSDB_EC (the \"ec\" group)\n");
         failures++;
-        free(want_text);
         return;
     }
 #endif
     if (upd && *upd && strcmp(upd, "0") != 0) {
         FILE *f = fopen(src_path, "wb");
-        if (!f || fputs(want_text, f) < 0 || fclose(f) != 0) {
+        if (!f ||
+            fprintf(f, "# test_levels' golden digests (tests/test_levels.c, \"golden digests\"): group, outputs, hash.\n"
+                       "# Written by TSDB_LEVELS_GOLDEN_UPDATE=1. The lines after \"libzstd\" depend on the zstd library\n"
+                       "# as well and are compared only where the linked libzstd is that version.\n") < 0 ||
+            fputs(want_text, f) < 0 || fprintf(f, GOLDEN_ZSTD "%s\n", zv) < 0 || fputs(want_zstd, f) < 0 ||
+            fclose(f) != 0) {
             fprintf(stderr, "test_levels: cannot write %s (run from the source directory)\n", src_path);
             failures++;
         } else
-            printf("golden digests written to %s (%zu bytes): review the diff\n", src_path, strlen(want_text));
-        free(want_text);
+            printf("golden digests written to %s (libzstd %s): review the diff\n", src_path, zv);
         return;
     }
     const char *path = src_path;
@@ -1365,39 +1452,42 @@ static void golden_check(const rec *base, const char *argv0)
     if (!have) {
         fprintf(stderr, "test_levels: FAIL: no golden digests (looked for %s and %s)\n", src_path, exe_path);
         failures++;
-        free(want_text);
         return;
     }
-    int bad = 0, lines = 0;
-    const char *a = want_text, *b = have;
-    while (*a || *b) {
-#ifndef TSDB_EC
-        /* The committed file has the erasure codec's group, which a build without TSDB_EC cannot produce. */
-        if (strncmp(b, "ec\t", 3) == 0) {
-            const char *skip = strchr(b, '\n');
-            b = skip ? skip + 1 : b + strlen(b);
-            continue;
-        }
-#endif
-        const char *ae = strchr(a, '\n'), *be = strchr(b, '\n');
-        size_t al = ae ? (size_t)(ae - a) : strlen(a), bl = be ? (size_t)(be - b) : strlen(b);
-        lines++;
-        if (al != bl || memcmp(a, b, al) != 0) {
-            if (bad++ < 20)
-                fprintf(stderr, "golden %s, line %d:\n  produced %.*s\n  expected %.*s\n", path, lines, (int)al, a,
-                        (int)bl, b);
-        }
-        a += al + (ae != NULL);
-        b += bl + (be != NULL);
+    int line = 0, groups = 0;
+    const char *b = have;
+    int bad = golden_compare(want_text, &b, &line, path, &groups);
+    if (strncmp(b, GOLDEN_ZSTD, strlen(GOLDEN_ZSTD)) != 0) {
+        fprintf(stderr, "test_levels: FAIL: %s has no \"libzstd\" line (the digests that depend on zstd)\n", path);
+        failures++;
+    } else {
+        const char *v = b + strlen(GOLDEN_ZSTD), *e = strchr(v, '\n');
+        size_t vl = e ? (size_t)(e - v) : strlen(v);
+        line++;
+        b = e ? e + 1 : v + vl;
+        int zgroups = 0;
+        if (vl == strlen(zv) && memcmp(v, zv, vl) == 0) {
+            bad += golden_compare(want_zstd, &b, &line, path, &zgroups);
+            printf("golden digests of the blocks with ZSTD: %d groups compared (libzstd %s)\n", zgroups, zv);
+        } else
+            printf("golden digests of the blocks with ZSTD: not compared, made with libzstd %.*s and this is %s (the "
+                   "levels of this run compared them, and every block decoded to its input)\n", (int)vl, v, zv);
     }
     if (bad) {
         fprintf(stderr, "test_levels: FAIL: %d of the golden digests differ (a codec or kernel changed its bytes; if on "
                         "purpose, TSDB_LEVELS_GOLDEN_UPDATE=1 from the source directory)\n", bad);
         failures++;
     } else
-        printf("golden digests (%s): %d groups, as committed\n", path, lines);
-    free(want_text);
+        printf("golden digests (%s): %d groups, as committed\n", path, groups);
     free(have);
+}
+
+static void golden_check(const rec *base, const char *argv0)
+{
+    char *want_text = golden_text(base, false), *want_zstd = golden_text(base, true);
+    golden_check_texts(want_text, want_zstd, argv0);
+    free(want_text);
+    free(want_zstd);
 }
 
 #ifdef TSDB_LEVELS
