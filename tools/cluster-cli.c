@@ -94,11 +94,11 @@ static const char cl_help[] =
     "    --out-after-s S         a server down this long is marked out [1800] (stored, not acted on yet)\n"
     "    --voter-replace-s S     a voter down this long is replaced by another member [600]\n"
     "    --voters N              the most voters the group has (an even number counts as one less) [5]\n"
-    "    --volumes-per-server N  volumes led per server at init [16]\n"
-    "    --mode replicated|shared    shared-nothing copies, or shared (NFS) volumes [replicated]\n"
-    "    --failover lease|attested|bmc   how a dead owner is replaced in shared mode [lease]\n"
-    "    --read-barrier on|off   owners answer reads only behind a fenced write [on]\n"
-    "    --lease-s S             the lease of a shared volume [10]\n"
+    "    --volumes-per-server N  volumes led per server at init [16] (stored, not acted on yet)\n"
+    "    --mode replicated|shared    shared-nothing copies, or shared (NFS) volumes [replicated] (shared: not built)\n"
+    "    --failover lease|attested|bmc   how a dead owner is replaced in shared mode [lease] (shared: not built)\n"
+    "    --read-barrier on|off   owners answer reads only behind a fenced write [on] (stored, not acted on yet)\n"
+    "    --lease-s S             the lease of a shared volume [10] (stored, not acted on yet)\n"
     "    --lease-ms MS           a replicated volume's leader read lease [2000]\n"
     "    --drift-ppm N           the clock drift every lease allows for [500]\n"
     "    --unanswered-ms MS      a copy kept in sync without answering a promotion is dropped after this [1000]\n"
@@ -111,7 +111,8 @@ static const char cl_help[] =
     "    --transfer-wait-ms MS   a leader transfer's drain, at most [2000] (100 to 60000)\n"
     "    --leader-balance-s S    leadership goes back to a volume's first server once it has been in sync this\n"
     "                            long [0: off] (at most 86400)\n"
-    "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n";
+    "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n"
+    "  A setting marked (stored, not acted on yet) is kept and shown, and nothing uses it.\n";
 
 static int cl_usage(void)
 {

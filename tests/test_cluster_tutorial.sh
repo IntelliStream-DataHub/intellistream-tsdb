@@ -93,7 +93,8 @@ if ! "${limit[@]}" bash -e "$scratch/block.sh" > "$scratch/out" 2>&1; then
     fail "the tutorial block stopped with an error"
 fi
 
-# Placeholders for what differs from run to run, on both sides.
+# Placeholders for what differs from run to run, on both sides. set_version and preferred of a volume line are
+# deterministic (1; 3 after the move; 4 after the reset; the first copy stays preferred) and stay literal.
 norm() {
     sed -E -e 's/[[:space:]][[:space:]]*/ /g' -e 's/ $//' \
         -e 's#127\.0\.0\.1:[0-9]+#127.0.0.1:PORT#g' \
@@ -103,7 +104,7 @@ norm() {
         -e 's/read_barrier (on|off|\?)$/read_barrier X/' \
         -e 's/^member [0-9]+ (up|down) incarnation/member M \1 incarnation/' \
         -e 's/ rack rack[0-9]+ / rack rackM /' \
-        -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ epoch [0-9]+ min_isr ([0-9]+) replicas [0-9,]+ isr [0-9,]+ isr_version [0-9]+ set_version [0-9]+ preferred [0-9]+ /volume \1 name \2 uuid UUID leader L epoch E min_isr \3 replicas R isr I isr_version V set_version S preferred P /' \
+        -e 's/^volume ([0-9]+) name ([a-z]+) uuid [0-9a-f]{32} leader [0-9]+ epoch [0-9]+ min_isr ([0-9]+) replicas [0-9,]+ isr [0-9,]+ isr_version [0-9]+ (set_version [0-9]+ preferred [0-9]+) /volume \1 name \2 uuid UUID leader L epoch E min_isr \3 replicas R isr I isr_version V \4 /' \
         -e 's/^volume-report node [0-9]+ volume ([0-9]+) role [a-z]+ health ([a-z]+) epoch [0-9]+ (.*) fenced_age_ms [0-9]+$/volume-report node N volume \1 role R health \2 epoch E \3 fenced_age_ms F/' \
         -e 's/^node [0-9]+ leads at epoch [0-9]+ \([0-9]+ ms, READY at [0-9]+\)$/node N leads at epoch E (T ms, READY at X)/' \
         -e 's/^(move of volume [0-9]+ from node )[0-9]+( to node )[0-9]+(: proposed \(replica )[0-9a-f]{16}\)/\1N\2N\3RID)/' \
@@ -128,6 +129,19 @@ while IFS= read -r line; do
         || fail "the page shows a line that the tutorial does not print: $line"
 done < "$scratch/shown.txt"
 [ "$nshown" -ge 30 ] || fail "only $nshown lines of the page's output were checked"
+# A line of the page that the run printed somewhere is not yet right: the volume lines differ only in the values the
+# placeholders leave (set_version, preferred), and the same line is printed early and late. The volume lines of the page
+# must therefore come in the order the run printed them (an ordered subsequence): a page that shows set_version 1 after
+# the move, where the run printed 3, is caught here.
+grep -E '^volume [0-9]+ name ' "$scratch/out.norm" > "$scratch/vol.out"
+norm < "$scratch/shown.txt" | grep -E '^volume [0-9]+ name ' > "$scratch/vol.shown"
+[ -s "$scratch/vol.shown" ] || fail "the page shows no volume line"
+awk 'NR == FNR { a[++n] = $0; next }
+     { while (i < n && a[i + 1] != $0) i++
+       if (i >= n) { print "volume line out of order or not printed: " $0; bad = 1; exit }
+       i++ }
+     END { exit bad }' "$scratch/vol.out" "$scratch/vol.shown" \
+    || fail "the volume lines of the page are not an ordered part of what the tutorial printed"
 
 # The facts. Everything the block printed is in "out"; the block cleaned up its servers and directories.
 expect() {  # expect COUNT PATTERN: COUNT lines of the output match the extended regex PATTERN
@@ -153,6 +167,25 @@ expect 1 '^move of volume 1 from node [123] to node 5: proposed \(replica [0-9a-
 expect 1 '^volume 1: reset of node [123] proposed \(new instance [0-9a-f]{16}\)'       # the reset of the lost copy
 expect 1 '^tsdbd: replication: volume 1: snapshot installed: P [0-9]+ of epoch [0-9]+, '   # rebuilt by a snapshot
 expect 1 '^/.*/n[123]/data/v1/p[0-9_]+\.part$'                                 # and it holds the volume's part
+# R4's facts, which the placeholders above would hide: the replica set version is raised by the move and again by the
+# reset, the moved copy's place is node 5's (and node 5 is in the in-sync set when the move is over), the first copy is
+# still the preferred one.
+expect 1 '^volume 1 name plant .* set_version 3 preferred 1 '
+expect 1 '^volume 1 name plant .* set_version 4 preferred 1 '
+expect 2 '^volume 1 name plant .* replicas [0-9,]*5[0-9,]* isr [0-9,]*5[0-9,]* '
+# the refusal names the copy whose directory the run removed, and the reset (and its command) is for that copy
+refusal=$(grep -E '^tsdbd: volumes: volume 1: .*/n[0-9]/data/v1 is missing' "$scratch/out")
+[ "$(printf '%s\n' "$refusal" | grep -c .)" -eq 1 ] || fail "step 10: not exactly one refusal line of the lost directory"
+rnode=$(printf '%s\n' "$refusal" | sed -E 's#.*/n([0-9])/data/v1 is missing.*#\1#')
+printf '%s\n' "$refusal" | grep -qF "\`tsdb cluster replica reset PEER 1 $rnode\`" \
+    || fail "step 10: the refusal does not name 'replica reset PEER 1 $rnode': $refusal"
+grep -qE "^volume 1: reset of node $rnode proposed " "$scratch/out" \
+    || fail "step 10: the reset is not of node $rnode, whose directory was lost"
+# the install never lowers the fence: REPL fence F (it was G) with F at least G
+fenceline=$(grep -E 'snapshot installed: .* REPL fence [0-9]+ \(it was [0-9]+\)' "$scratch/out")
+[ -n "$fenceline" ] || fail "step 10: no snapshot install line with the fence"
+printf '%s\n' "$fenceline" | sed -E 's/.*REPL fence ([0-9]+) \(it was ([0-9]+)\).*/\1 \2/' | awk '{ exit !($1 >= $2) }' \
+    || fail "step 10: the snapshot install lowered the fence: $fenceline"
 [ "$(grep -cE '^replica volume 1 node [123] rid [0-9a-f]{16} open_gen 1$' "$scratch/out")" -ge 3 ] \
     || fail "step 6 does not show the three copies of plant with their open generation 1"
 # steps 5, 7 and 8 ask a voter; 7 and 8 (the last two) answer at a term above 1 (an election happened). Step 5 may too:
