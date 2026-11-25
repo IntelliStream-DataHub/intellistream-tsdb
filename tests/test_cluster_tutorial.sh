@@ -111,6 +111,7 @@ norm() {
         -e 's/^(volume [0-9]+: reset of node )[0-9]+( proposed \(new instance )[0-9a-f]{16}\)/\1N\2RID)/' \
         -e '/^tsdbd: /{s/[0-9a-f]{16}/RID/g;s/[0-9]+/N/g}' \
         -e 's#/n[0-9]/data/#/nN/data/#' \
+        -e 's#/v1/p[0-9_]+\.part$#/v1/pPART.part#' \
         -e 's/^replica volume ([0-9]+) node ([0-9]+) rid [0-9a-f]{16} open_gen [0-9]+$/replica volume \1 node \2 rid RID open_gen G/' \
         -e 's/^node [0-9]+ leads volume /node L leads volume /'
 }
