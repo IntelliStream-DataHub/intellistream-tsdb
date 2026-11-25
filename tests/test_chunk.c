@@ -84,6 +84,8 @@ static void quiet(bool on)
 
 static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32];
 static bool quick;
+static pid_t main_pid;
+static bool keep_on_fail = true;
 
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
 static uint64_t rnd(void)
@@ -2347,6 +2349,16 @@ static void set_mutant(const char *m)
     }
 }
 
+static void cleanup_scratch(void)
+{
+    if (getpid() != main_pid || !S[0])
+        return;
+    if (!failures || !keep_on_fail) {
+        sh("rm -rf '%s'", S);
+        S[0] = '\0';
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
@@ -2354,13 +2366,14 @@ int main(int argc, char **argv)
             set_mutant(getenv("TSDB_CHUNK_MUTANT"));
         return child_workload(argv[2], argv[3], atoi(argv[4]));
     }
-    const char *mutant = NULL, *base = "/tmp";
+    const char *env_tmp = getenv("TMPDIR");
+    const char *mutant = NULL, *base = (env_tmp && *env_tmp) ? env_tmp : "/tmp";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick"))
             quick = true;
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
             mutant = argv[++i];
-        else
+        else if (argv[i][0] != '-' && *argv[i])
             base = argv[i];
     }
     if (getenv("TSDB_CHUNK_QUICK"))
@@ -2372,6 +2385,9 @@ int main(int argc, char **argv)
         return 1;
     }
     snprintf(S, sizeof S, "%s", tmpl);
+    main_pid = getpid();
+    keep_on_fail = (mutant == NULL);
+    atexit(cleanup_scratch);
     if (!realpath(argv[0], SELF))
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
@@ -2412,6 +2428,7 @@ int main(int argc, char **argv)
         return 1;
     }
     sh("rm -rf '%s'", S);
+    S[0] = '\0';
     printf("test_chunk: ok\n");
     return 0;
 }

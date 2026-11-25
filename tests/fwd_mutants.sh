@@ -21,15 +21,10 @@
 # Usage: tests/fwd_mutants.sh SCRATCH [MUTANT...]
 # (from the top of the tree, after make build/tsdbd build/test_cluster build/tsdb).
 set -u
-dir=${1:-/tmp}; shift || true
-muts=${*:-fwdoldframe fwdunavonbreak fwdnouser fwdnowait fwdauthlag fwdnolease fwdtwice fwdchunknowait fwdinline
-    fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone fwdcreateread fwdopkind
-    fwdopkindread}
 export TSDBD=${TSDBD:-build/tsdbd} TSDB_CLI=${TSDB_CLI:-build/tsdb}
-tc=${TEST_CLUSTER:-build/test_cluster}
-bad=
-for m in $muts; do
-    case $m in
+export TEST_CLUSTER=${TEST_CLUSTER:-$(dirname "$TSDBD")/test_cluster} # the same build as tsdbd (make tsan: build-tsan)
+spec() {
+    case $1 in
     fwdoldframe) sc=forward pat='a write held 1.5 s at the entry' ;;
     # the read-link case (a FWDQ write the owner refuses by closing the link) is the same written-and-lost path and
     # runs first in forward: either line is this mutant's
@@ -49,21 +44,29 @@ for m in $muts; do
     fwdcreateread) sc=fwdseries pat='a series created by path through the replica' ;;
     fwdopkind) sc=forward pat='a write sent on the read link' ;;
     fwdopkindread) sc=forward pat='a read sent on the write link' ;;
-    *) echo "fwd_mutants: unknown mutant $m" >&2; exit 2 ;;
+    *) echo "fwd_mutants: unknown mutant $1" >&2; exit 2 ;;
     esac
-    log=$dir/mut-$m-$sc.log
-    TSDBD_FWD_MUTANT=$m timeout 600 "$tc" "$dir" $sc > "$log" 2>&1
-    rc=$?
-    first=$(grep -m1 'FAIL' "$log")
-    if [ $rc = 0 ]; then
-        echo "mutant $m: SURVIVED"
-        bad="$bad $m"
-    elif echo "$first" | grep -q -- "$pat"; then
-        echo "mutant $m: caught by $sc ($first)"
-    else
-        echo "mutant $m: WRONG: $sc exited $rc, first FAIL '${first:-none}', want '$pat' ($log)"
-        bad="$bad $m"
+}
+# one mutant, then its verdict: tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and
+# asks this script (--mutant-verify) whether the first FAIL matches the mutant's pattern
+case ${1:-} in
+--mutant-run)
+    spec "$2"
+    TSDBD_FWD_MUTANT=$2 exec "$TEST_CLUSTER" "$3" "$sc" ;;
+--mutant-verify)
+    spec "$2"
+    if [ "$3" -eq 0 ]; then echo "$sc passed"; exit 1; fi
+    first=$(grep -m1 'FAIL' "$4")
+    if printf '%s\n' "$first" | grep -q -- "$pat"; then
+        echo "caught by $sc ($first)"
+        exit 0
     fi
-done
-[ -z "$bad" ] || { echo "not caught as intended:$bad"; exit 1; }
-echo "every mutant was caught by its intended FAIL"
+    echo "WRONG: $sc exited $3, first FAIL '${first:-none}', want '$pat'"
+    exit 1 ;;
+esac
+dir=${1:-${TMPDIR:-/tmp}}; shift || true
+muts=${*:-fwdoldframe fwdunavonbreak fwdnouser fwdnowait fwdauthlag fwdnolease fwdtwice fwdchunknowait fwdinline fwdarrival fwdownerage fwdownerclose fwdtailclose fwdepoch fwdgone fwdcreateread fwdopkind fwdopkindread}
+for m in $muts; do spec "$m"; done
+# MUTANT_JOBS, MUTANT_URING_JOBS (tsdbd on io_uring), MUTANT_TIMEOUT
+exec "$(dirname "$0")/../tools/mutants.sh" --name fwd --tmp "$dir" --uring --timeout "${MUTANT_TIMEOUT:-600}" --fail \
+    --verify "$0" --list "$muts" -- "$0" --mutant-run @M@ @D@

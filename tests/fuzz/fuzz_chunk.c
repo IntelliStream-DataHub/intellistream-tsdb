@@ -28,10 +28,24 @@
 static chunk_store *st;
 static char vdir[1200];
 
+static void cleanup_chunk(void)
+{
+    if (st) {
+        chunk_store_close(st);
+        st = NULL;
+    }
+    fuzz_rm_at_exit();
+}
+
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
     (void)argc, (void)argv;
+    const char *td = getenv("TMPDIR");
+    const char *ft = getenv("FUZZ_TMP");
+    if ((!ft || !*ft) && td && *td)
+        setenv("FUZZ_TMP", td, 1);
     const char *d = fuzz_dir("chunk");
+    atexit(cleanup_chunk);
     char sp[1100];
     snprintf(sp, sizeof sp, "%s/store", d);
     if (chunk_store_init(sp, NULL, NULL) != 0 || chunk_store_open(sp, NULL, &st) != 0 || chunk_store_raise(st, 1, 1) != 0) {

@@ -76,6 +76,8 @@ static int devnull = -1;
 
 static char S[PATH_MAX], SELF[PATH_MAX], SHIM[PATH_MAX + 32];
 static bool quick;
+static pid_t main_pid;
+static bool keep_on_fail = true;
 
 static uint64_t rng = 0x243f6a8885a308d3ull;
 static uint64_t rnd(void)
@@ -93,7 +95,7 @@ static void sh(const char *fmt, ...)
     vsnprintf(cmd, sizeof cmd, fmt, ap);
     va_end(ap);
     if (system(cmd) != 0)
-        fprintf(ERR, "(command failed: %s)\n", cmd);
+        fprintf(ERR ? ERR : stderr, "(command failed: %s)\n", cmd);
 }
 
 static void fresh(const char *tag, char *out, size_t cap)
@@ -1601,6 +1603,16 @@ static void set_mutant(const char *m)
     }
 }
 
+static void cleanup_scratch(void)
+{
+    if (getpid() != main_pid || !S[0])
+        return;
+    if (!failures || !keep_on_fail) {
+        sh("rm -rf '%s'", S);
+        S[0] = '\0';
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (getenv("TSDB_CHUNK_MUTANT"))
@@ -1609,13 +1621,14 @@ int main(int argc, char **argv)
         return child_heal(argv[2], atoi(argv[3]));
     if (argc >= 4 && strcmp(argv[1], "--child-replace") == 0)
         return child_replace(argv[2], atoi(argv[3]));
-    const char *mutant = NULL, *base = "/tmp";
+    const char *env_tmp = getenv("TMPDIR");
+    const char *mutant = NULL, *base = (env_tmp && *env_tmp) ? env_tmp : "/tmp";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick"))
             quick = true;
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
             mutant = argv[++i];
-        else
+        else if (argv[i][0] != '-' && *argv[i])
             base = argv[i];
     }
     if (getenv("TSDB_CHUNK_QUICK"))
@@ -1627,6 +1640,9 @@ int main(int argc, char **argv)
         return 1;
     }
     snprintf(S, sizeof S, "%s", tmpl);
+    main_pid = getpid();
+    keep_on_fail = (mutant == NULL);
+    atexit(cleanup_scratch);
     if (!realpath(argv[0], SELF))
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
@@ -1660,6 +1676,7 @@ int main(int argc, char **argv)
         return 1;
     }
     sh("rm -rf '%s'", S);
+    S[0] = '\0';
     printf("test_chunk_heal: ok\n");
     return 0;
 }

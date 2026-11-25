@@ -3372,10 +3372,12 @@ static int msim_run(uint64_t seed, double seconds, int verbose)
 
 int main(int argc, char **argv)
 {
-    const char *dir = argc > 1 && argv[1][0] != '-' ? argv[1] : "/tmp";
+    const char *env_tmp = getenv("TMPDIR");
+    const char *dir = (env_tmp && *env_tmp) ? env_tmp : "/tmp";
     unsigned seeds = 40;
     uint64_t first = 1;
     double seconds = 20;
+    int mutant = 0, sim_only = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seeds") && i + 1 < argc)
             seeds = (unsigned)strtoul(argv[++i], NULL, 10);
@@ -3383,6 +3385,12 @@ int main(int argc, char **argv)
             first = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = strtod(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
+            mutant = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
+            sim_only = 1;
+        else if (argv[i][0] != '-' && *argv[i])
+            dir = argv[i];
     }
     /* The deadline covers the whole run, so it grows with the seeds: a seed of 30 virtual seconds takes about 3.4 s
      * (0.11 s per virtual second, 2026-11-23, i5-13400), and make meta-soak's 5000 seeds about 4.7 hours. One real
@@ -3390,13 +3398,6 @@ int main(int argc, char **argv)
     double budget = (double)seeds * (seconds > 0 ? seconds : 0);
     th_watchdog("test_meta", budget > 1e7 ? 10000000L : budget > 1200 ? (long)budget : 1200);
     iso_log_quiet = true;
-    int mutant = 0, sim_only = 0;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--mutant") && i + 1 < argc)
-            mutant = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--sim-only")) /* the simulator's checker alone, to see it catch a planted bug */
-            sim_only = 1;
-    }
     if (sim_only && !mutant) {
         fprintf(stderr, "test_meta: --sim-only is for --mutant runs\n");
         return 2;
