@@ -2492,6 +2492,13 @@ static void ec_fresh(ecl *L, const char *name, int ns)
     if (fd < 0 || meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) != 0)
         exit(2);
     close(fd);
+    /* a cluster volume's META names its metadata uuid (cvolfs writes volume_uuid=): the tier takes the volume's vuuid
+     * from it (r8f), the 0x5a of the REPL identities here */
+    char meta[sizeof L->dir + 8];
+    snprintf(meta, sizeof meta, "%s/META", L->dir);
+    FILE *mf = fopen(meta, "a");
+    if (!mf || fputs("volume_uuid=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\n", mf) < 0 || fclose(mf) != 0)
+        exit(2);
 }
 
 /* the leader (replica 0) or, with `floor`, the replica in `dir`, with the tier on L's stores */
