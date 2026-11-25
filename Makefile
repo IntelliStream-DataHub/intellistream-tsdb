@@ -78,7 +78,8 @@ URING_LIBS   = $(URING_LIB)  # -l:liburing.a in make dist
 endif
 
 # The verbs transport of the peer links (docs/design-rdma.md §5.4): built where rdma-core's headers are
-# (libibverbs-devel / libibverbs-dev; RDMA_CFLAGS=-I... for headers elsewhere), else as NO_RDMA=1 with one line. No
+# (libibverbs-devel / libibverbs-dev; RDMA_CFLAGS=-I... for headers elsewhere), else as NO_RDMA=1 with one line (on
+# stderr: `make -s print-ec` and the like are read by scripts). No
 # RDMA library is linked either way: server/plrdma_dl.c loads libibverbs with dlopen (tools/check-rdma-syms.sh).
 # macOS never has it.
 ifeq ($(UNAME_S),Darwin)
@@ -88,7 +89,7 @@ RDMA_CFLAGS ?=
 ifeq ($(NO_RDMA),)
 NO_RDMA := $(shell echo 'int x;' | $(CC) $(RDMA_CFLAGS) -include infiniband/verbs.h -E -x c - >/dev/null 2>&1 && echo 0 || echo 1)
 ifeq ($(NO_RDMA),1)
-$(info RDMA: rdma-core's headers (infiniband/verbs.h) not found: tsdbd is built without the verbs transport (NO_RDMA=1))
+$(warning RDMA: rdma-core's headers (infiniband/verbs.h) not found: tsdbd is built without the verbs transport (NO_RDMA=1))
 endif
 endif
 RDMA_FLAGS := $(if $(filter 1,$(NO_RDMA)),,-DTSDB_RDMA $(RDMA_CFLAGS))
