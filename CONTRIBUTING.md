@@ -76,12 +76,11 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
 
 - **build and test:** `make`, then `make test`. If the runner does not allow io_uring, the server tests run on
   epoll only (`make test IO=epoll`) and the log says so.
-- **AddressSanitizer and UBSan, ThreadSanitizer:** `make asan` and `make tsan`. Each of them is 27 jobs, one per
+- **AddressSanitizer and UBSan, ThreadSanitizer:** `make asan` and `make tsan`. Each of them is 31 jobs, one per
   group of `make test` (`make asan TEST_TARGET=test-units-c`: the groups are listed under `TEST_GROUPS` in the Makefile),
   because all of it under a sanitizer takes many hours on 4 CPUs. A new group of `make test` needs an entry in both
   matrices of `ci.yml`; `tests/check_ci_groups.sh` (run by `make test`) fails without it. Each job's limit is 1.5 times
-  what its group took on 4 CPUs (30 minutes at least); the long ones are under tsan: the test_replica mutants of
-  `test-units-h3` and the test_ecapply mutants of `test-units-b5`, about 3 hours each.
+  what its group took on 4 CPUs (30 minutes at least); the long ones are under tsan (up to ~90 minutes on 4 CPUs).
 - **clients:** `make test-clients` (Rust, Python and Java).
 - **portable build and tarball:** `make PORTABLE=1`, `make dist` and `make dist-test`.
 - **integration tests:** `make check-version`, then `make integration-tests`.

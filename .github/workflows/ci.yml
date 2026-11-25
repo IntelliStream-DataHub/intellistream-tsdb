@@ -55,10 +55,10 @@ jobs:
       matrix:
         include:
           - { name: units, goals: "test TEST_GROUPS=", timeout: 45 }
-          - { name: groups 1, goals: "test-groups-1", timeout: 55 }
+          - { name: groups 1, goals: "test-groups-1", timeout: 60 }
           - { name: groups 2, goals: "test-groups-2", timeout: 50 }
           - { name: groups 3, goals: "test-groups-3", timeout: 95 }
-          - { name: groups 4, goals: "test-groups-4", timeout: 45 }
+          - { name: groups 4, goals: "test-groups-4", timeout: 80 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -117,15 +117,19 @@ jobs:
           - { name: units g replica, target: test-units-g, timeout: 30 }
           - { name: units h1 replica mutants 1, target: test-units-h1, timeout: 30 }
           - { name: units h2 replica mutants 2, target: test-units-h2, timeout: 30 }
-          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 70 }
+          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 55 }
+          - { name: units h4 replica mutants 4, target: test-units-h4, timeout: 55 }
+          - { name: units h5 replica mutants 5, target: test-units-h5, timeout: 45 }
           - { name: units i the rest, target: test-units-i, timeout: 30 }
           - { name: units 2, target: test-units-b, timeout: 40 }
           - { name: units 2b, target: test-units-b2, timeout: 30 }
           - { name: units 2c, target: test-units-b3, timeout: 30 }
           - { name: units 2d, target: test-units-b4, timeout: 30 }
-          - { name: units 2e, target: test-units-b5, timeout: 45 }
+          - { name: units 2e, target: test-units-b5, timeout: 30 }
           - { name: units 2f, target: test-units-b6, timeout: 30 }
           - { name: units 2g, target: test-units-b7, timeout: 30 }
+          - { name: units 2h, target: test-units-b8, timeout: 30 }
+          - { name: units 2i, target: test-units-b9, timeout: 30 }
           - { name: meta simulator 1, target: test-meta-1, timeout: 30 }
           - { name: meta simulator 2, target: test-meta-2, timeout: 30 }
           - { name: cluster 1, target: test-cluster-1, timeout: 30 }
@@ -174,9 +178,9 @@ jobs:
 
   # -------------------------------------------------------------------------------------------------------- tsan
   tsan:
-    # The groups of `make test`, as in the asan job, with TSan's own limits: 8 to 180 minutes a group on 4 CPUs (the
-    # test_replica mutants of h3 and the test_ecapply ones of 2e take the longest); the 5400 s of a mutant (TSAN_MUT_TIMEOUT)
-    # is a limit of the Makefile, the job's the matrix's.
+    # The groups of `make test`, as in the asan job, with TSan's own limits: 8 to 91 minutes a group on 4 CPUs (the
+    # test_drops mutants of e/f take the longest; h3..h5 and 2e/2h/2i split the test_replica and test_ecapply mutants);
+    # the 5400 s of a mutant (TSAN_MUT_TIMEOUT) is a limit of the Makefile, the job's the matrix's.
     name: ThreadSanitizer (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
@@ -193,15 +197,19 @@ jobs:
           - { name: units g replica, target: test-units-g, timeout: 60 }
           - { name: units h1 replica mutants 1, target: test-units-h1, timeout: 70 }
           - { name: units h2 replica mutants 2, target: test-units-h2, timeout: 40 }
-          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 275 }
+          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 105 }
+          - { name: units h4 replica mutants 4, target: test-units-h4, timeout: 105 }
+          - { name: units h5 replica mutants 5, target: test-units-h5, timeout: 85 }
           - { name: units i the rest, target: test-units-i, timeout: 30 }
           - { name: units 2, target: test-units-b, timeout: 60 }
           - { name: units 2b, target: test-units-b2, timeout: 75 }
           - { name: units 2c, target: test-units-b3, timeout: 105 }
           - { name: units 2d, target: test-units-b4, timeout: 30 }
-          - { name: units 2e, target: test-units-b5, timeout: 275 }
+          - { name: units 2e, target: test-units-b5, timeout: 100 }
           - { name: units 2f, target: test-units-b6, timeout: 35 }
           - { name: units 2g, target: test-units-b7, timeout: 30 }
+          - { name: units 2h, target: test-units-b8, timeout: 90 }
+          - { name: units 2i, target: test-units-b9, timeout: 90 }
           - { name: meta simulator 1, target: test-meta-1, timeout: 30 }
           - { name: meta simulator 2, target: test-meta-2, timeout: 30 }
           - { name: cluster 1, target: test-cluster-1, timeout: 30 }
