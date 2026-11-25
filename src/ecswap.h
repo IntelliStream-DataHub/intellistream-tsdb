@@ -25,6 +25,14 @@
  * Lock order: publish_lock > latest_rw > db->lock, as a publisher's; the caller holds none of them. */
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n);
 
+/* R10: swaps the contiguous sources in[0 .. nin) (one partition key, at least one .ec, in increasing block order) for
+ * one combined output `out` (an .ec part opened from tmp_*.ec, or an empty .part with ng == 0 opened from tmp_*.part,
+ * covering [in[0]->min_block, in[nin-1]->max_block]). Writes intent v4 ("tsdb-intent 4 1 <nin>", L <tmp> <fin>,
+ * R <p.ec> retired_<p.ec> for .ec sources, R <p.part> settled_<p.part> for .part sources), runs lt_merge_marks in its
+ * write section, hands retired .ec sources to r7-gc and settled .part sources to r7-keep, and wakes db_wait_merges.
+ * Same return contract and lock order (publish_lock > latest_rw > db->lock) as ec_swap_commit. */
+int ec_swap_reencode(eng *db, part **in, size_t nin, part *out);
+
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len);

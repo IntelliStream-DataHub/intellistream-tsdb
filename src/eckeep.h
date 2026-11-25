@@ -75,6 +75,9 @@ void eckeep_eng_close(eng *db);
 enum { ECKEEP_PENDING = 0, ECKEEP_MATCHED, ECKEEP_DIVERGED, ECKEEP_ORPHAN, ECKEEP_ROT };
 /* The state of settled_ file `name`, or TSDB_ERR_NOTFOUND (not held: released, or never seen). */
 int eckeep_status(eng *db, const char *name);
+/* R10 (src/ecpolicy.c): whether `key` has any settled_ file or digest job still ECKEEP_PENDING (or busy). Safe to
+ * call under db->lock (k->mu is a leaf). */
+bool eckeep_key_pending(eng *db, int64_t key);
 /* tests: waits up to timeout_ms for `name` to leave ECKEEP_PENDING; its state (or TSDB_ERR_NOTFOUND). */
 int eckeep_test_wait(eng *db, const char *name, int64_t timeout_ms);
 /* tests: digests started since the open (each try counts, a store that was not UP included) */

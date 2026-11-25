@@ -34,7 +34,9 @@
 #include "ecskip.h"
 #include "internal.h"
 #include "eccold.h"
+#include "ecdigest.h"
 #include "ppos.h"
+#include "settle.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -190,7 +192,7 @@ static inline bool key_lt(uint32_t s1, int64_t t1, uint32_t s2, int64_t t2)
     return s1 < s2 || (s1 == s2 && t1 < t2);
 }
 
-static int cur_load(eng *db, codec_ctx *cc, cursor *c)
+static int cur_load(eng *db, codec_ctx *cc, cursor *c, bool reencode)
 {
     if (!c->ts) {
         c->ts = malloc(c->p->grows * sizeof(int64_t));
@@ -206,8 +208,12 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c)
         return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
     int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->grows, true);
     if (rc) {
-        /* only the source's own bytes: not NOMEM or IO, and not the part writer's refusals (pw_add) */
-        if (rc == TSDB_ERR_CORRUPT)
+        /* R10: an .ec source read through the seam that is DOWN (UNAVAILABLE) or CORRUPT aborts a re-encode without
+         * marking the part damaged (a store away is not damage to the part). Ordinary merges and .part sources mark
+         * payload damage on CORRUPT as before. */
+        if (rc == TSDB_ERR_UNAVAILABLE && reencode && part_is_ec(c->p) && settle_mutant == SETTLE_MUT_MARKUNAVAIL)
+            part_mark_payload(db, c->p, "reencode");
+        if (rc == TSDB_ERR_CORRUPT && !(reencode && part_is_ec(c->p)))
             part_mark_payload(db, c->p, "merge");
         return rc;
     }
@@ -218,10 +224,10 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c)
 }
 
 /* Drops the cursor's current row (a duplicate key replaced by a newer part). */
-static int cur_skip(eng *db, codec_ctx *cc, cursor *c)
+static int cur_skip(eng *db, codec_ctx *cc, cursor *c, bool reencode)
 {
     int rc;
-    if (!c->loaded && (rc = cur_load(db, cc, c)) != 0)
+    if (!c->loaded && (rc = cur_load(db, cc, c, reencode)) != 0)
         return rc;
     if (++c->pos == c->n) {
         c->loaded = false;
@@ -230,9 +236,23 @@ static int cur_skip(eng *db, codec_ctx *cc, cursor *c)
     return 0;
 }
 
+static int64_t cut_of_frozen(const ecd_cut *cuts, size_t ncuts, uint32_t series)
+{
+    size_t lo = 0, hi = ncuts;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cuts[mid].series < series)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < ncuts && cuts[lo].series == series ? cuts[lo].cutoff : INT64_MIN;
+}
+
 void (*_Atomic merge_hook)(int at);
 
-int merge_parts(eng *db, part **src, size_t k, part **out)
+static int merge_parts_ex(eng *db, part **src, size_t k, bool pending, bool reencode, const ecd_cut *cuts,
+                          size_t ncuts, bool keep_tombs, part **out)
 {
     *out = NULL;
     cursor *cur = calloc(k, sizeof *cur);
@@ -246,8 +266,10 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
          * decodes, and would write either under the new part's fresh hash: wrong answers for good, which no later
          * check could see. So the index is hashed again first (it is about 0.3% of the part); on a mismatch the
          * merge fails and the part stays, for the next open to refuse. Decoding instead would still trust its run
-         * table and offsets. */
-        if (!part_checked(db, src[i], "merge")) {
+         * table and offsets. In re-encode mode an .ec source is checked without marking it damaged. */
+        bool ok = (reencode && part_is_ec(src[i])) ? (!atomic_load(&src[i]->damaged) && part_index_intact(src[i]))
+                                                   : part_checked(db, src[i], "merge");
+        if (!ok) {
             free(cur);
             return TSDB_ERR_CORRUPT;
         }
@@ -270,8 +292,8 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         tombs |= src[i]->nt > 0;
         min_ts = MIN(min_ts, src[i]->min_ts);
     }
-    int64_t now = eng_now_ms(db); /* one instant for the whole merge */
-    bool ttl = atomic_load(&db->has_retention);
+    int64_t now = reencode ? 0 : eng_now_ms(db); /* one instant for the whole merge */
+    bool ttl = reencode ? (ncuts > 0) : atomic_load(&db->has_retention);
     part_writer w;
     int rc = pw_begin(&w, db, src[0]->partition, wal_seq);
     if (rc) {
@@ -286,23 +308,28 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     w.empty_ts = min_ts;
     if (tombs) {
         bool older = false; /* a listed part of the partition below the merge: the tombstones still hide it */
-        pthread_mutex_lock(&db->lock);
-        for (size_t i = 0; i < db->nparts && !older; i++)
-            older = db->parts[i]->partition == src[0]->partition && db->parts[i]->max_block < min_block;
-        pthread_mutex_unlock(&db->lock);
+        if (reencode) {
+            older = keep_tombs;
+        } else {
+            pthread_mutex_lock(&db->lock);
+            for (size_t i = 0; i < db->nparts && !older; i++)
+                older = db->parts[i]->partition == src[0]->partition && db->parts[i]->max_block < min_block;
+            pthread_mutex_unlock(&db->lock);
+        }
         tomb_set keep = {0};
         for (size_t i = 0; i < k && rc == 0; i++) {
             for (size_t j = 0; j < k && rc == 0; j++)
                 if (src[j]->min_block > src[i]->max_block)
                     rc = tomb_set_add(&cur[i].hide, src[j]->t, src[j]->nt);
             tomb_set_finish(&cur[i].hide);
-            if (older && rc == 0)
+            if (older && rc == 0 && !(reencode && settle_mutant == SETTLE_MUT_DROPTOMB))
                 rc = tomb_set_add(&keep, src[i]->t, src[i]->nt);
         }
         tomb_set_finish(&keep);
         size_t o = 0;
         for (size_t i = 0; i < keep.n; i++) { /* what retention removes needs no tombstone */
-            int64_t cut = ttl ? eng_cutoff_at(db, keep.t[i].series, now) : INT64_MIN;
+            int64_t cut = reencode ? cut_of_frozen(cuts, ncuts, keep.t[i].series)
+                                   : (ttl ? eng_cutoff_at(db, keep.t[i].series, now) : INT64_MIN);
             if (keep.t[i].end <= cut)
                 continue;
             keep.t[o] = keep.t[i];
@@ -323,7 +350,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         rc = TSDB_ERR_NOMEM;
 
     while (rc == 0) {
-        if (atomic_load_explicit(&db->stop, memory_order_relaxed)) {
+        if (atomic_load_explicit(&db->stop, memory_order_relaxed) || (reencode && ecsettle_stopping(db))) {
             rc = TSDB_ERR_STOPPED;
             break;
         }
@@ -365,7 +392,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         const granule *g = &gb;
         if (ttl && g->series != cut_series) {
             cut_series = g->series;
-            cut = eng_cutoff_at(db, g->series, now);
+            cut = reencode ? cut_of_frozen(cuts, ncuts, g->series) : eng_cutoff_at(db, g->series, now);
         }
         int64_t gcut = ttl ? cut : INT64_MIN;
         bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
@@ -380,8 +407,9 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                            (w.cut_ms && floor_div(w.pend_ts[w.pend_n - 1], w.cut_ms) < floor_div(g->ts_min, w.cut_ms)) ||
                            pw_hcut_before(&w, g->ts_min);
             /* a part no merge has written was encoded at insert speed (CODEC_FAST), maybe without zstd: re-encoded
-             * once here, never copied, so that no merged part carries an insert's blocks */
-            bool merged = c->p->level > 0;
+             * once here, never copied, so that no merged part carries an insert's blocks. An .ec source has no granule
+             * bytes in its map: never passed to pw_copy_fits or pw_copy_granule (R10 decodes its rows). */
+            bool merged = c->p->level > 0 && !part_is_ec(c->p);
             int fit = 0;
             if (!filter && before_rest && day && merged && pend_ok) {
                 bool shrt = g->count < w.grows;
@@ -409,7 +437,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                 c->gi++;
                 continue;
             }
-            if ((rc = cur_load(db, cc, c)) != 0)
+            if ((rc = cur_load(db, cc, c, reencode)) != 0)
                 break;
         }
         size_t end = c->n;
@@ -449,7 +477,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
             int64_t t;
             cur_key(&cur[i], &s, &t);
             if (s == bs && t == bt)
-                rc = cur_skip(db, cc, &cur[i]);
+                rc = cur_skip(db, cc, &cur[i], reencode);
         }
     }
 
@@ -469,7 +497,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     }
     /* an ec cluster volume (R8, src/ppos.h): the output's position is its newest source's, recorded before it is named
      * (pw_finish) */
-    for (size_t i = 0; db->ppos && i < k; i++) {
+    for (size_t i = 0; db->ppos && !pending && i < k; i++) {
         uint64_t pp = 0;
         if ((rc = ppos_of(db, src[i]->name, &pp)) != 0) {
             pw_abort(&w);
@@ -478,10 +506,11 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         w.ppos = MAX(w.ppos, pp);
     }
     void (*hook)(int) = atomic_load(&merge_hook);
-    if (hook)
+    if (hook && !reencode)
         hook(0);
-    rc = pw_finish(&w, min_block, max_block, level + 1, out);
-    if (hook)
+    rc = pending ? pw_finish_pending(&w, min_block, max_block, level + 1, out)
+                 : pw_finish(&w, min_block, max_block, level + 1, out);
+    if (hook && !reencode)
         hook(1);
     if (rc == 0 && *out) {
         time_t written = 0;
@@ -495,6 +524,16 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         atomic_fetch_add(&db->st_passthrough, copied);
     }
     return rc;
+}
+
+int merge_parts(eng *db, part **src, size_t k, part **out)
+{
+    return merge_parts_ex(db, src, k, false, false, NULL, 0, false, out);
+}
+
+int merge_parts_reencode(eng *db, part **src, size_t k, const ecd_cut *cuts, size_t ncuts, bool keep_tombs, part **out)
+{
+    return merge_parts_ex(db, src, k, true, true, cuts, ncuts, keep_tombs, out);
 }
 
 /* Replaces src with out in the parts list. Caller holds db->lock and still

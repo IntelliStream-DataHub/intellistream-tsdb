@@ -257,7 +257,7 @@ void db_wait_merges(eng *db, int64_t partition)
     uint64_t start_seq = db->merge_fail_seq;
     while (!atomic_load(&db->stop)) {
         size_t n = 0;
-        bool merging = false, failed = false, pairs = false, prev_ok = false, settling = false;
+        bool merging = false, failed = false, pairs = false, prev_ok = false, settling = false, reencoding = false;
         part *bad = NULL;
         for (size_t i = 0; i < db->nparts; i++) {
             part *p = db->parts[i];
@@ -265,7 +265,8 @@ void db_wait_merges(eng *db, int64_t partition)
                 continue;
             if (!part_is_ec(p) || ecskip_mutant == ECSKIP_MUT_WAITCOUNTEC)
                 n++;
-            merging |= p->merging;
+            merging |= p->merging || p->reencoding;
+            reencoding |= p->reencoding;
             settling |= p->settling; /* only the waitsettle mutant waits for a settle (above) */
             failed |= p->fail_seq > start_seq;
             bool dmg = atomic_load(&p->damaged);
@@ -280,7 +281,7 @@ void db_wait_merges(eng *db, int64_t partition)
                 db_stall_clear_locked(db, partition);
             break;
         }
-        if (!pairs && !bad && ecskip_mutant != ECSKIP_MUT_WAITNOBREAK &&
+        if (!pairs && !reencoding && !bad && ecskip_mutant != ECSKIP_MUT_WAITNOBREAK &&
             (ecskip_mutant != ECSKIP_MUT_WAITSETTLE || !settling))
             break; /* R7: .ec or settling barriers alone, no merge can lower the count (above) */
         if (bad && !pairs) {
@@ -1725,7 +1726,7 @@ static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *me
         if (granules)
             *granules += p->ng;
         if (merging)
-            *merging += p->merging;
+            *merging += p->merging || p->reencoding;
         st->parts++;
         st->rows += p->rows;
         st->bytes += p->ec ? eccache_part_bytes(p) : p->map_len; /* R7: what an .ec part counts as its file */

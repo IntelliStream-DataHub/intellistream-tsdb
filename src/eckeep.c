@@ -1022,6 +1022,28 @@ int eckeep_status(eng *db, const char *name)
     return st;
 }
 
+bool eckeep_key_pending(eng *db, int64_t key)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return false;
+    bool pending = false;
+    pthread_mutex_lock(&k->mu);
+    for (size_t i = 0; i < k->n && !pending; i++) {
+        const kent *e = &k->e[i];
+        int64_t ek;
+        if ((e->status == ECKEEP_PENDING || e->busy) && name_key(e->name, &ek) && ek == key)
+            pending = true;
+    }
+    for (size_t i = 0; i < k->nj && !pending; i++) {
+        const kjob *x = &k->jobs[i];
+        if (x->j.key == key && (x->status == ECKEEP_PENDING || x->busy))
+            pending = true;
+    }
+    pthread_mutex_unlock(&k->mu);
+    return pending;
+}
+
 int eckeep_test_wait(eng *db, const char *name, int64_t timeout_ms)
 {
     struct eckeep_eng *k = keep_of(db);

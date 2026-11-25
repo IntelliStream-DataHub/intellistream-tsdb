@@ -44,6 +44,7 @@
 #include "internal.h"
 #include "ecpart.h"
 #include "eccache.h"
+#include "settle.h"
 
 #include <fcntl.h>
 #include <ftw.h>
@@ -251,6 +252,7 @@ typedef struct world {
     /* what the run reached */
     size_t marked, settle_steps, compares, nonempty, failed;
     size_t real_settled, real_steps, unavailable, damaged, downs, retries;
+    size_t reencoded; /* R10: partitions re-encoded at the end of the seed */
     size_t prefetched, pf_used; /* granules B's cache read ahead (prefetch is on: src/eccache.h), and used */
 } world;
 
@@ -1042,6 +1044,56 @@ static void run_seed(world *w, const char *scratch, uint64_t seed, int steps)
             compare(w, what);
     }
     compare(w, "end");
+    /* R10: re-encode B's settled partitions (suffix_only alternates per seed so tombstones hiding older parts are
+     * exercised too) and verify every raw row (ASC & DESC) and every latest answer stays bit-identical to unsettled A,
+     * both before and after a reopen. */
+    if (w->real && !w->down) {
+        size_t nr = 0;
+        int rrc = tsdb_test_reencode(w->db[1], (w->seed & 1) != 0, &nr);
+        if (rrc) {
+            fprintf(stderr, "seed %llu: tsdb_test_reencode: %s\n", (unsigned long long)w->seed, tsdb_strerror(rrc));
+            exit(1);
+        }
+        w->reencoded += nr;
+        if (nr) {
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 1) {
+                    close_both(w);
+                    open_both(w, false);
+                }
+                for (size_t i = 0; i < NS + 1; i++) {
+                    tsdb_sid id = i < NS ? w->id[i] : w->never;
+                    for (int ord = 0; ord < 2; ord++) {
+                        tsdb_query_opts o = {.order = ord ? TSDB_DESC : TSDB_ASC};
+                        fp fa = {0}, fb = {0};
+                        fp_begin(&fa, "reencode values s%zu o%d p%d", i, ord, pass);
+                        fp_begin(&fb, "reencode values s%zu o%d p%d", i, ord, pass);
+                        fp_rc(&fa, tsdb_query_values(w->db[0], id, TSDB_TS_MIN, TSDB_TS_MAX, &o, rows_cb, &fa));
+                        fp_rc(&fb, tsdb_query_values(w->db[1], id, TSDB_TS_MIN, TSDB_TS_MAX, &o, rows_cb, &fb));
+                        if (fa.n != fb.n || memcmp(fa.b, fb.b, fa.n) != 0) {
+                            fprintf(stderr, "DIVERGED seed %llu reencode values s%zu ord=%d pass=%d (len %zu vs %zu)\n",
+                                    (unsigned long long)w->seed, i, ord, pass, fa.n, fb.n);
+                            exit(1);
+                        }
+                        fp_free(&fa);
+                        fp_free(&fb);
+                    }
+                    for (int k = 0; k < 2; k++) {
+                        tsdb_latest_opts lo = {.end = TSDB_TS_MAX, .with_nulls = k == 1};
+                        tsdb_latest_result ra, rb;
+                        int r0 = tsdb_latest(w->db[0], &id, 1, &lo, &ra);
+                        int r1 = tsdb_latest(w->db[1], &id, 1, &lo, &rb);
+                        if (r0 != r1 || ra.status != rb.status || ra.kind != rb.kind || ra.ts != rb.ts ||
+                            ra.v.i64 != rb.v.i64) {
+                            fprintf(stderr, "DIVERGED seed %llu reencode latest s%zu k=%d pass=%d\n",
+                                    (unsigned long long)w->seed, i, k, pass);
+                            exit(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     w->retries += tsdb_test_ec_retries(w->db[1], false);
     pf_take(w);
     close_both(w);
@@ -1087,19 +1139,22 @@ int main(int argc, char **argv)
         eccache_mutant = ECC_MUT_NORETRY;
     if (is("rankdown"))
         setenv("TSDB_SETTLE_MUTANT", "ecrankdown", 1);
+    /* Keep the background settle thread from re-encoding B mid-seed behind the bit-for-bit stats comparison
+     * (just like grace_s=315360000 keeps it from settling behind our back); re-encode runs explicitly at seed end. */
+    atomic_store(&settle_reencode_pause, true);
 #ifndef TSDB_EC
     printf("test_settle_oracle: skipped: no TSDB_EC in this build\n");
     return 0;
 #else
     world w;
     size_t marked = 0, settle_steps = 0, compares = 0, nonempty = 0;
-    size_t real_settled = 0, real_steps = 0, unavailable = 0, damaged = 0, downs = 0, retries = 0;
+    size_t real_settled = 0, real_steps = 0, unavailable = 0, damaged = 0, downs = 0, retries = 0, reencoded = 0;
     size_t prefetched = 0, pf_used = 0;
     for (uint64_t s = first; s < first + seeds; s++) {
         run_seed(&w, scratch, s, steps);
         marked += w.marked, settle_steps += w.settle_steps, compares += w.compares, nonempty += w.nonempty;
         real_settled += w.real_settled, real_steps += w.real_steps, unavailable += w.unavailable;
-        damaged += w.damaged, downs += w.downs, retries += w.retries;
+        damaged += w.damaged, downs += w.downs, retries += w.retries, reencoded += w.reencoded;
         prefetched += w.prefetched, pf_used += w.pf_used;
     }
     /* stage 3: a run whose settles never made an .ec part tests the marks only */
@@ -1141,10 +1196,11 @@ int main(int argc, char **argv)
     for (size_t k = 0; k < NKIND && kstat[k].name[0]; k++)
         printf(" %s %zu/%zu", kstat[k].name, kstat[k].errs, kstat[k].calls);
     printf("\n");
-    printf("test_settle_oracle: stage 3: %zu eng_settle steps made %zu .ec parts (%zu refused with store 0 DOWN); store 0 "
+    printf("test_settle_oracle: stage 3: %zu eng_settle steps made %zu .ec parts (%zu refused with store 0 DOWN), "
+           "%zu partitions re-encoded; store 0 "
            "went DOWN %zu times, %zu chunks on it damaged, %zu granules read again as whole cells; prefetch on: %zu "
            "granules read ahead, %zu of them used\n",
-           real_steps, real_settled, unavailable, downs, damaged, retries, prefetched, pf_used);
+           real_steps, real_settled, unavailable, reencoded, downs, damaged, retries, prefetched, pf_used);
     return 0;
 #endif
 }

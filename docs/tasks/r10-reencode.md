@@ -1,6 +1,6 @@
 # R10 takes re-encode (the plan's D9)
 
-**Open. Owner: R10 (docs/design-cluster-data.md §11, about 4-5 track-days instead of 3).** R7 settles; it never
+**Single-server re-encode built (E6, `r10-reencode`); cluster conversion (§6.4 / intent v5 `X` lines / `MK_UNSETTLE`) remains open.** R7 settles; it never
 combines. The first version of R7 had a re-encode track (TASK-r7-reencode); D9 moved it here to shorten R7's critical
 path. R10 re-encodes for conversions (§6.4) anyway, so this is one mechanism with two triggers.
 

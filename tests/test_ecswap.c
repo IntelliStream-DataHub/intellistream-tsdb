@@ -1043,6 +1043,283 @@ static void threads_case(void)
     printf("  %d readers (%ld queries and latest lookups) while %d keys were swapped one by one: every answer the "
            "same (%ld wrong)\n", READERS, (long)atomic_load(&c.reads), swapped, (long)atomic_load(&c.bad));
 }
+
+/* ------------------------------------------------------------ R10 re-encode swap */
+
+/* Creates a test-marked .ec output part from contiguous sources in[0..nin) (merges into a pending .part, copies to
+ * tmp_*.ec, opens with test_mark, unlinks the pending .part). */
+static part *make_reencode_ec(eng *db, part **in, size_t nin)
+{
+    part *m = NULL;
+    CHECK(merge_parts_reencode(db, in, nin, NULL, 0, false, &m) == 0 && m != NULL);
+    if (!m)
+        return NULL;
+    char tmp[64];
+    snprintf(tmp, sizeof tmp, "tmp_%d_%u.ec", (int)getpid(), 950000 + atomic_fetch_add(&ec_counter, 1));
+    int fd = openat(db->dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        unlinkat(db->dirfd, m->pending, 0);
+        part_unref(m);
+        return NULL;
+    }
+    bool ok = write(fd, m->map, m->map_len) == (ssize_t)m->map_len && fsync(fd) == 0;
+    CHECK(ok);
+    close(fd);
+    part *e = NULL;
+    CHECK(part_open_as(db->dirfd, tmp, m->name, false, false, &e) == 0 && e != NULL);
+    unlinkat(db->dirfd, m->pending, 0);
+    part_unref(m);
+    if (!e)
+        return NULL;
+    char base[96];
+    snprintf(base, sizeof base, "%s", e->name);
+    snprintf(e->name, sizeof e->name, "%.*s.ec", (int)(strlen(base) - 5), base);
+    snprintf(e->pending, sizeof e->pending, "%s", tmp);
+    struct ecpart *ep = calloc(1, sizeof *ep);
+    CHECK(ep != NULL);
+    ep->test_mark = true;
+    ep->tier = db->tier;
+    ep->volume = db->tier_vol;
+    atomic_store(&e->ec, ep);
+    return e;
+}
+
+static void reencode_basic_case(void)
+{
+    char dir[PATH_MAX];
+    fresh("re-basic", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, 3600, &db) == 0);
+    if (!db)
+        return;
+    populate(db);
+    uint32_t s = 0;
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    /* Add a 3rd part on key 1 (overlapping timestamps so LWW matters) */
+    write_rows(db, s, DAY + 500, ROWS, 2000);
+    CHECK(eng_flush(db) == 0);
+    acc before = read_range(db, s, INT64_MIN, INT64_MAX);
+    latest_row l0;
+    CHECK(eng_latest(db, &s, 1, NULL, INT64_MAX, false, &l0) == 0);
+
+    /* Swap first 2 parts of key 1 to .ec, leaving the 3rd as a young .part */
+    part *p[8];
+    size_t n = key_parts(db, 1, p, 8);
+    CHECK(n == 3);
+    if (n == 3) {
+        part *ec[2] = {make_ec(db, p[0]), make_ec(db, p[1])};
+        CHECK(ec_swap_commit(db, p, ec, 2) == 0);
+        part_unref(ec[0]);
+        part_unref(ec[1]);
+    }
+    for (size_t i = 0; i < n; i++)
+        part_unref(p[i]);
+
+    /* Refusals: no .ec input (key 0 is all .part), wrong block range, two keys, read-only */
+    part *k0[4], *k1[4];
+    size_t n0 = key_parts(db, 0, k0, 4), n1 = key_parts(db, 1, k1, 4);
+    CHECK(n0 == 2 && n1 == 3);
+    if (n0 == 2 && n1 == 3) {
+        part *out0 = make_reencode_ec(db, k0, 2);
+        CHECK(ec_swap_reencode(db, k0, 2, out0) == TSDB_ERR_INVALID); /* no .ec source */
+        unlinkat(db->dirfd, out0->pending, 0);
+        part_unref(out0);
+
+        part *out1 = make_reencode_ec(db, k1, 3);
+        CHECK(ec_swap_reencode(db, k1, 2, out1) == TSDB_ERR_INVALID); /* block range mismatch */
+        part *mix[2] = {k1[0], k0[0]};
+        CHECK(ec_swap_reencode(db, mix, 2, out1) == TSDB_ERR_INVALID); /* two keys */
+        /* Merging source -> TSDB_ERR_STOPPED, nothing renamed, tmp gone */
+        pthread_mutex_lock(&db->lock);
+        k1[2]->merging = true;
+        pthread_mutex_unlock(&db->lock);
+        CHECK(ec_swap_reencode(db, k1, 3, out1) == TSDB_ERR_STOPPED);
+        pthread_mutex_lock(&db->lock);
+        k1[2]->merging = false;
+        pthread_mutex_unlock(&db->lock);
+        CHECK(count_names(dir, "tmp_", ".ec") == 0 && count_names(dir, "txn_", ".intent") == 0);
+        part_unref(out1);
+
+        /* Real re-encode swap of 2 .ec + 1 .part -> 1 .ec */
+        CHECK(stats_settle(db, 60000) == 0);
+        uint64_t g0 = lgen_of(db);
+        part *out = make_reencode_ec(db, k1, 3);
+        char s0[128], s1[128], s2[128], fout[128];
+        snprintf(s0, sizeof s0, "retired_%s", k1[0]->name);
+        snprintf(s1, sizeof s1, "retired_%s", k1[1]->name);
+        snprintf(s2, sizeof s2, "settled_%s", k1[2]->name);
+        snprintf(fout, sizeof fout, "%s", out->name);
+        CHECK(ec_swap_reencode(db, k1, 3, out) == 0);
+        CHECK(!db->lt || lgen_of(db) > g0);
+        CHECK(exists(dir, fout) && exists(dir, s0) && exists(dir, s1) && exists(dir, s2));
+        CHECK(!exists(dir, k1[0]->name) && !exists(dir, k1[1]->name) && !exists(dir, k1[2]->name));
+        CHECK(count_names(dir, "tmp_", ".ec") == 0 && count_names(dir, "txn_", ".intent") == 0);
+        part *after_p[4];
+        CHECK(key_parts(db, 1, after_p, 4) == 1 && after_p[0] == out);
+        part_unref(after_p[0]);
+        CHECK(stats_settle(db, 60000) == 0);
+        struct estats *es = atomic_load(&db->stats);
+        if (es) {
+            pthread_mutex_lock(&db->lock);
+            pthread_mutex_lock(&es->mu);
+            for (size_t i = 0; i < db->nparts; i++)
+                CHECK(rec_find(es, db->parts[i]) != NULL);
+            pthread_mutex_unlock(&es->mu);
+            pthread_mutex_unlock(&db->lock);
+        }
+        acc after = read_range(db, s, INT64_MIN, INT64_MAX);
+        CHECK(after.n == before.n && after.sum == before.sum);
+        latest_row l1;
+        CHECK(eng_latest(db, &s, 1, NULL, INT64_MAX, false, &l1) == 0 && l1.status == l0.status && l1.ts == l0.ts &&
+              l1.slot == l0.slot);
+        part_unref(out);
+
+        /* Empty .part output (ng == 0): delete all rows of key 1 and re-encode .ec + tombstone .part -> empty .part */
+        CHECK(eng_delete_range(db, s, DAY, 2 * DAY) == 0);
+        part *dk[4];
+        size_t nd = key_parts(db, 1, dk, 4);
+        CHECK(nd == 2);
+        if (nd == 2) {
+            part *empty = NULL;
+            CHECK(merge_parts_reencode(db, dk, nd, NULL, 0, false, &empty) == 0 && empty && empty->ng == 0);
+            if (empty) {
+                CHECK(ec_swap_reencode(db, dk, nd, empty) == 0);
+                CHECK(read_range(db, s, DAY, 2 * DAY).n == 0);
+                part *chk[4];
+                CHECK(key_parts(db, 1, chk, 4) == 1 && chk[0] == empty && !atomic_load(&chk[0]->ec));
+                part_unref(chk[0]);
+                part_unref(empty);
+            }
+            for (size_t i = 0; i < nd; i++)
+                part_unref(dk[i]);
+        }
+    }
+    for (size_t i = 0; i < n0; i++)
+        part_unref(k0[i]);
+    for (size_t i = 0; i < n1; i++)
+        part_unref(k1[i]);
+    CHECK(eng_close(db) == 0);
+    printf("  re-encode basic: 2 .ec + 1 .part swapped for 1 .ec (retired_ for .ec, settled_ for .part), empty .part "
+           "output, lt_merge_marks, stats, refusals\n");
+}
+
+static void reencode_drop_case(void)
+{
+    char dir[PATH_MAX];
+    fresh("re-drop", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, 3600, &db) == 0);
+    if (!db)
+        return;
+    populate(db);
+    uint32_t s = 0;
+    CHECK(eng_series(db, "s", TSDB_FLOAT32, &s) == 0);
+    acc rest = read_range(db, s, DAY, INT64_MAX);
+    part *k0[4];
+    size_t n0 = key_parts(db, 0, k0, 4);
+    CHECK(n0 == 2);
+    if (n0 == 2) {
+        part *e0 = make_ec(db, k0[0]);
+        CHECK(ec_swap_commit(db, &k0[0], &e0, 1) == 0);
+        part_unref(e0);
+    }
+    for (size_t i = 0; i < n0; i++)
+        part_unref(k0[i]);
+
+    n0 = key_parts(db, 0, k0, 4);
+    CHECK(n0 == 2);
+    if (n0 == 2) {
+        part *out = make_reencode_ec(db, k0, 2);
+        ec_swap_hook = drop_hook;
+        int rc = ec_swap_reencode(db, k0, 2, out);
+        ec_swap_hook = NULL;
+        CHECK(rc == TSDB_ERR_STOPPED && eng_check(db) == 0);
+        CHECK(read_range(db, s, INT64_MIN, DAY).n == 0);
+        acc r2 = read_range(db, s, INT64_MIN, INT64_MAX);
+        CHECK(r2.n == rest.n && r2.sum == rest.sum);
+        CHECK(count_names(dir, "tmp_", ".ec") == 0 && count_names(dir, "txn_", ".intent") == 0);
+        CHECK(!exists(dir, out->name));
+        part_unref(out);
+    }
+    for (size_t i = 0; i < n0; i++)
+        part_unref(k0[i]);
+    CHECK(eng_close(db) == 0);
+    printf("  re-encode drop: a drop inside the hook refuses with STOPPED, nothing renamed, no intent left\n");
+}
+
+static const char *const RE4 = "tsdb-intent 4 1 3\nL tmp_7_1.ec p500_1_3_2.ec\n"
+                               "R p500_1_1_1.ec retired_p500_1_1_1.ec\n"
+                               "R p500_2_2_1.ec retired_p500_2_2_1.ec\n"
+                               "R p500_3_3_0.part settled_p500_3_3_0.part\n";
+
+static void reencode_recover_case(void)
+{
+    char dir[PATH_MAX];
+    /* torn: rolled back (tmp cleaned by load_parts when no fake .ec aborts load_parts first) */
+    plant_open("re-torn", (const char *const[]){"tmp_7_1.ec", NULL}, RE4, false, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "tmp_7_1.ec") && !exists(dir, "p500_1_3_2.ec"));
+    /* torn with a source present: intent unlinked, nothing renamed, source untouched */
+    plant_open("re-tornsrc", (const char *const[]){"tmp_7_1.ec", "p500_1_1_1.ec", NULL}, RE4, false, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_1_1.ec") && !exists(dir, "p500_1_3_2.ec") &&
+          !exists(dir, "retired_p500_1_1_1.ec"));
+    /* complete, nothing renamed, all present: forward */
+    plant_open("re-fwd", (const char *const[]){"tmp_7_1.ec", "p500_1_1_1.ec", "p500_2_2_1.ec", "p500_3_3_0.part", NULL},
+               RE4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_3_2.ec") && exists(dir, "retired_p500_1_1_1.ec") &&
+          exists(dir, "retired_p500_2_2_1.ec") && exists(dir, "settled_p500_3_3_0.part") &&
+          !exists(dir, "p500_1_1_1.ec") && !exists(dir, "p500_2_2_1.ec") && !exists(dir, "p500_3_3_0.part"));
+    /* complete, L renamed, crash between R renames: forward */
+    plant_open("re-half",
+               (const char *const[]){"p500_1_3_2.ec", "retired_p500_1_1_1.ec", "p500_2_2_1.ec", "p500_3_3_0.part", NULL},
+               RE4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && exists(dir, "p500_1_3_2.ec") && exists(dir, "retired_p500_2_2_1.ec") &&
+          exists(dir, "settled_p500_3_3_0.part") && !exists(dir, "p500_2_2_1.ec") && !exists(dir, "p500_3_3_0.part"));
+    /* complete, L NOT renamed, .ec source retired (by a drop before the swap): MUST roll back, never resurrect */
+    plant_open("re-dropbefore",
+               (const char *const[]){"tmp_7_1.ec", "retired_p500_1_1_1.ec", "retired_p500_2_2_1.ec",
+                                     "retired_p500_3_3_0.part", NULL},
+               RE4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "tmp_7_1.ec") && !exists(dir, "p500_1_3_2.ec") &&
+          exists(dir, "retired_p500_1_1_1.ec") && exists(dir, "retired_p500_3_3_0.part"));
+    /* complete, L retired by a drop after swap: forward (no-op) */
+    plant_open("re-dropafter",
+               (const char *const[]){"retired_p500_1_3_2.ec", "retired_p500_1_1_1.ec", "retired_p500_2_2_1.ec",
+                                     "settled_p500_3_3_0.part", NULL},
+               RE4, true, dir, sizeof dir);
+    CHECK(!exists(dir, "txn_7_1.intent") && !exists(dir, "p500_1_3_2.ec") && exists(dir, "retired_p500_1_3_2.ec"));
+    /* damage: L renamed, .part source under retired_ instead of settled_ */
+    int rc = plant_open("re-partret",
+                        (const char *const[]){"p500_1_3_2.ec", "retired_p500_1_1_1.ec", "retired_p500_2_2_1.ec",
+                                              "retired_p500_3_3_0.part", NULL},
+                        RE4, true, dir, sizeof dir);
+    CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
+    /* damage: .part source settled_, L missing while an .ec source is still at src */
+    rc = plant_open("re-lostl",
+                    (const char *const[]){"p500_1_1_1.ec", "retired_p500_2_2_1.ec", "settled_p500_3_3_0.part", NULL},
+                    RE4, true, dir, sizeof dir);
+    CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
+    /* crafted re-encode intents: no .ec source, wrong block range, two keys, fin == src, wrong dst prefix */
+    static const char *const rbad[] = {
+        "tsdb-intent 4 1 2\nL tmp_7_1.ec p500_1_2_1.ec\n"
+        "R p500_1_1_0.part settled_p500_1_1_0.part\nR p500_2_2_0.part settled_p500_2_2_0.part\n",
+        "tsdb-intent 4 1 2\nL tmp_7_1.ec p500_1_5_2.ec\n"
+        "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p500_2_2_1.ec retired_p500_2_2_1.ec\n",
+        "tsdb-intent 4 1 2\nL tmp_7_1.ec p500_1_2_2.ec\n"
+        "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p501_2_2_1.ec retired_p501_2_2_1.ec\n",
+        "tsdb-intent 4 1 1\nL tmp_7_1.ec p500_1_1_1.ec\nR p500_1_1_1.ec retired_p500_1_1_1.ec\n",
+        "tsdb-intent 4 1 1\nL tmp_7_1.ec p500_1_1_2.ec\nR p500_1_1_1.ec settled_p500_1_1_1.ec\n",
+        "tsdb-intent 4 2 2\nL tmp_7_1.ec p500_1_2_2.ec\nL tmp_7_2.ec p500_1_2_3.ec\n"
+        "R p500_1_1_1.ec retired_p500_1_1_1.ec\nR p500_2_2_1.ec retired_p500_2_2_1.ec\n",
+    };
+    for (size_t i = 0; i < sizeof rbad / sizeof *rbad; i++) {
+        rc = plant_open("re-bad", (const char *const[]){"tmp_7_1.ec", "p500_1_1_1.ec", "p500_2_2_1.ec", NULL}, rbad[i],
+                        true, dir, sizeof dir);
+        CHECK(rc == TSDB_ERR_CORRUPT && exists(dir, "txn_7_1.intent"));
+    }
+    printf("  re-encode recovery: torn, forward, half-renamed, rollback over dropped .ec sources, drop after swap, "
+           "damage and crafted intents refused\n");
+}
 #endif /* TSDB_EC */
 
 int main(int argc, char **argv)
@@ -1093,6 +1370,9 @@ int main(int argc, char **argv)
     drop_case(3600);
     drop_case(0);
     recover_case();
+    reencode_basic_case();
+    reencode_drop_case();
+    reencode_recover_case();
     make_base();
     crashpt_case();
     power_case();

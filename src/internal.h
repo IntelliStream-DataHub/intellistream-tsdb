@@ -809,6 +809,8 @@ typedef struct part {
     bool dropped;
     bool settling; /* R7: a settle has taken it (db->lock, like merging): out of merges, rewrites and TTL selection until
                     * the swap lists its .ec or the settle is abandoned */
+    bool reencoding; /* R10: a re-encode has taken it (db->lock, with settling set too): counted as a merge in
+                      * db_wait_merges backpressure while normal merges still treat it as a barrier */
     atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
                           * granules: out of merges and drops (part_checked, part_mark_payload) */
     atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
@@ -2303,8 +2305,11 @@ part **db_snapshot(struct eng *db, int64_t start, int64_t end, size_t *n);
 void db_release(part **parts, size_t n);
 
 /* merge.c */
+struct ecd_cut;
 void *merge_thread_main(void *arg);
 int merge_parts(struct eng *db, part **src, size_t k, part **out);
+int merge_parts_reencode(struct eng *db, part **src, size_t k, const struct ecd_cut *cuts, size_t ncuts,
+                         bool keep_tombs, part **out);
 bool merge_commit_locked(struct eng *db, part **src, size_t k, part *out, int rc);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
@@ -2735,6 +2740,10 @@ size_t tsdb_test_mark_ec(struct tsdb *t, unsigned flags,
 int tsdb_test_settle(struct tsdb *t,
                      bool (*pick)(void *ctx, uint32_t vol, int64_t partition, uint32_t level, uint64_t rows),
                      void *ctx, size_t *settled);
+/* test hook (R10, tests/test_settle_oracle.c): eng_reencode on every partition with >= 2 parts including at least one
+ * .ec part (with suffix_only, skips the oldest part when >= 3 parts so tombstones over older parts are exercised);
+ * *reencoded counts partitions re-encoded; 0 or the first error other than NOTFOUND */
+int tsdb_test_reencode(struct tsdb *t, bool suffix_only, size_t *reencoded);
 /* test hook (tests/test_settle_oracle.c): the tier cache's granules read again as whole cells; drop empties it first */
 uint64_t tsdb_test_ec_retries(struct tsdb *t, bool drop);
 

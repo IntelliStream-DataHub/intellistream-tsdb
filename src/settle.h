@@ -43,6 +43,13 @@ void ecsettle_eng_stop(eng *db);
  * db->lock), so the lock order there is jr_serial > flush_lock > ... as a large write's. */
 int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled);
 
+/* Re-encodes the contiguous sources sel[0 .. n) of partition `partition` (at least one .ec, optional young .part files)
+ * into a single .ec object (or an empty .part when tombstones or retention remove every row), verifying the logical
+ * digest (ec_logical_digest_frozen) before swapping via ec_swap_reencode. An .ec source that is DOWN (UNAVAILABLE) or
+ * CORRUPT aborts the re-encode without marking the part damaged or bumping merge_fail_seq. 0: swapped (*reencoded set
+ * to the number of input parts combined when non-NULL). */
+int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded);
+
 /* The two halves of a settle of one part, for src/eccold.c (a leader puts the object before its gate and writes the
  * .ec file, whose record carries the cut, after it). ecsettle_put: the geometry, a fresh oid, the record (r owned by
  * the caller from 0 on: ec_record_free) and the put of the object under the volume's epoch (into *epoch when not
@@ -61,39 +68,59 @@ bool ecsettle_stopping(eng *db);
  * into sel[0 .. return value) (at most cap; the caller passes them to eng_settle and unrefs them). 0: nothing is due.
  * now_ms: eng_now_ms. */
 size_t ecpolicy_pick_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
+/* R10 (E6): picks a contiguous range of parts of one key to re-encode (under db->lock, caller holds it): > ec_objects_max
+ * combinable .ec objects, or tombstones in newer combinable parts covering > 10% of .ec rows; bounded by max_part_bytes
+ * and MAX_MERGE_PARTS; skips keys with a pending eckeep digest or recent re-encode failure. Referenced parts into sel. */
+size_t ecpolicy_pick_reencode_locked(eng *db, int64_t now_ms, int64_t *key, part **sel, size_t cap);
 /* tests: the cluster branch takes every key as too big for one marker (it says so and marks the key failed) */
 extern bool ecpolicy_test_cap_hit;
 /* A settle of key failed (not STOPPED): the policy leaves the key alone for an hour. */
 void ecpolicy_failed(eng *db, int64_t key, int64_t now_ms);
 /* A settle happened (eager mode counts them: at most ECPOLICY_EAGER_PER_MIN a minute per engine). */
 void ecpolicy_settled(eng *db, int64_t now_ms);
+/* A re-encode of key failed (not STOPPED): per-key backoff for ECPOLICY_BACKOFF_MS. */
+void ecpolicy_reencode_failed(eng *db, int64_t key, int64_t now_ms);
+/* A re-encode happened (eager mode counts them: at most ECPOLICY_EAGER_REENCODE_PER_MIN a minute per engine). */
+void ecpolicy_reencoded(eng *db, int64_t now_ms);
 #define ECPOLICY_BACKOFF_MS (3600 * 1000LL)
 #define ECPOLICY_EAGER_PER_MIN 30
+#define ECPOLICY_EAGER_REENCODE_PER_MIN 15
 #define ECPOLICY_EAGER_MIN_BYTES (1u << 20)
+#define ECPOLICY_OBJECTS_MAX_DEFAULT 4
+#define ECPOLICY_TOMB_PCT 10
 #define ECPOLICY_FAILS 64 /* keys remembered as failed per engine (the oldest is forgotten first) */
+/* E6: max combinable .ec objects per key before re-encode triggers (default ECPOLICY_OBJECTS_MAX_DEFAULT = 4). */
+extern atomic_uint ecpolicy_objects_max;
 
 /* The policy's per-engine state (db->ecstate->settle; src/settle.c makes it, src/ecpolicy.c uses it under pmu) */
 typedef struct ecpolicy_state {
     pthread_mutex_t pmu; /* a leaf */
     struct { int64_t key, at_ms; } fail[ECPOLICY_FAILS];
     size_t nfail;
+    struct { int64_t key, at_ms; } rfail[ECPOLICY_FAILS];
+    size_t nrfail;
     int64_t eager_win_ms; /* eager: the minute being counted, and its settles */
     int eager_n;
+    int64_t eager_rwin_ms; /* eager: the minute being counted for re-encodes */
+    int eager_rn;
 } ecpolicy_state;
 ecpolicy_state *ecpolicy_of(eng *db);
 
 /* ------------------------------------------------------------ tests */
 /* The thread's poll interval in ms (1000; tests set it lower before the open). */
 extern atomic_int settle_poll_ms;
+/* tests: while set, the settle thread skips automatic re-encodes (explicit eng_reencode still runs). */
+extern atomic_bool settle_reencode_pause;
 /* Runs in a settle's fill, for every stripe: after the stripe's bytes were copied out of the map and before they are
  * checked (with the settletwopass mutant: between the check, which reads the map, and the copy). */
 extern void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe);
 /* The hook's stripe once more, before the first stripe: the early copy of the header, index and footer is taken and
  * checked, nothing of the object is copied yet. */
 #define SETTLE_HOOK_PREPARED UINT64_MAX
-/* Counters for tests: settles that swapped, failed (CORRUPT and the others but STOPPED), abandoned (STOPPED), and the
- * settle thread's rounds. */
+/* Counters for tests: settles and re-encodes that swapped, failed (CORRUPT and the others but STOPPED), abandoned
+ * (STOPPED), and the settle thread's rounds. */
 extern atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
+extern atomic_uint_fast64_t reencode_done, reencode_failed, reencode_abandoned;
 /* A failure planted in settle_one (tests): the call after settle_test_fail_skip passing ones fails at the step
  * settle_test_fail_at names with TSDB_ERR_IO, as the real step's failure would leave it: PUT after a put that committed
  * every position (a failure while committing), INDEX in place of ec_index_write (no tmp .ec), OPEN in place of
@@ -122,7 +149,11 @@ enum { SETTLE_MUT_NONE = 0, SETTLE_MUT_RANKDOWN, SETTLE_MUT_NOCHECK, SETTLE_MUT_
         * halted engine, a volume being reopened, would go on beside the new engine: test_settle --case halt) */
        SETTLE_MUT_GCSKIPPUT, SETTLE_MUT_GCSKIPINDEX, SETTLE_MUT_GCSKIPOPEN, SETTLE_MUT_GCSKIPELSE, SETTLE_MUT_GCSKIPSWAP,
        SETTLE_MUT_GCSKIPDISCARD, SETTLE_MUT_GCCOMMITTED, SETTLE_MUT_GCDOUBLE, SETTLE_MUT_GCEARLY,
-       SETTLE_MUT_NULLNOSYNC, SETTLE_MUT_SYNCFAILGO, SETTLE_MUT_NOHALTSTOP };
+       SETTLE_MUT_NULLNOSYNC, SETTLE_MUT_SYNCFAILGO, SETTLE_MUT_NOHALTSTOP,
+       /* R10 re-encode mutants (tests/test_settle.c --mutant NAME): reencodedroptomb: drops tombstones covering older
+        * parts during re-encode; reencoderankdown: ranks the re-encoded output below other parts in memory;
+        * reencodemarkunavail: marks an .ec source damaged on TSDB_ERR_UNAVAILABLE during re-encode */
+       SETTLE_MUT_DROPTOMB, SETTLE_MUT_RERANKDOWN, SETTLE_MUT_MARKUNAVAIL };
 extern int settle_mutant;
 int settle_mutant_parse(const char *name); /* -1 when unknown */
 /* For tests: the streaming xxh64 the fill hashes the object with, fed lens[0..n) bytes of buf in turn (it must equal

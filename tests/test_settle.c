@@ -38,6 +38,8 @@
 #include "chunk.h"
 #include "coldops.h"
 #include "eccache.h"
+#include "ecdigest.h"
+#include "eckeep.h"
 #include "ecpart.h"
 #include "ecgc.h"
 #include "ecskip.h"
@@ -133,6 +135,8 @@ typedef struct {
     int merge_threads, classes;
     size_t wal_max_batch_rows;
     int idle; /* merge_idle_s; 0: 1 */
+    uint64_t max_part_bytes;
+    int lifetime_s; /* obsolete_part_lifetime_s; -1: 0 */
 } eopts;
 
 typedef struct {
@@ -150,6 +154,12 @@ static void opts_of(const eopts *e, tsdb_options *o)
     o->merge_idle_s = e->idle ? e->idle : 1;
     if (e->wal_max_batch_rows)
         o->wal_max_batch_rows = e->wal_max_batch_rows;
+    if (e->max_part_bytes)
+        o->max_part_bytes = e->max_part_bytes;
+    if (e->lifetime_s < 0)
+        o->obsolete_part_lifetime_s = 0;
+    else if (e->lifetime_s > 0)
+        o->obsolete_part_lifetime_s = e->lifetime_s;
 }
 
 /* the engine of w->db with a tier (the environment's spec) */
@@ -2208,9 +2218,617 @@ out:
            "provider's epoch; provider 0 or not writable: nothing put or deleted; a failed attach keeps the entry\n");
 }
 
+/* ------------------------------------------------------------ R10 re-encode */
+
+static int reencode_key(eng *db, int64_t key, size_t *got)
+{
+    part *p[MAX_MERGE_PARTS];
+    size_t n = key_parts(db, key, p, MAX_MERGE_PARTS);
+    int rc = eng_reencode(db, key, p, n, got);
+    unref_all(p, n);
+    return rc;
+}
+
+static bool wait_parts(eng *db, int64_t key, size_t want_all, size_t want_ec, int ms)
+{
+    for (int i = 0; i < ms / 10; i++) {
+        size_t a, e;
+        key_count(db, key, &a, &e);
+        if (a == want_all && e == want_ec)
+            return true;
+        sleep_ms(10);
+    }
+    return false;
+}
+
+/* Recording cold_ops wrapper that can fail obj_read with an injected error (for UNAVAILABLE through the seam). */
+static atomic_int seam_read_err;
+static cold_ops SREC;
+static int s_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep)
+{
+    int err = atomic_load(&seam_read_err);
+    if (err)
+        return err;
+    return coldops_dir.obj_read(o, off, len, buf, flags, rep);
+}
+
+/* child for reencode crash points & crashfs power loss */
+static int child_reencode(const char *root)
+{
+    where w;
+    snprintf(w.root, sizeof w.root, "%s", root);
+    snprintf(w.db, sizeof w.db, "%s/db", root);
+    for (int i = 0; i < 3; i++)
+        snprintf(w.st[i], sizeof w.st[i], "%s/st%d", root, i);
+    tier_env(&w, QUIET_GRACE, 86400, 0);
+    eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+    tdb d;
+    if (t_open(&w, &e, &d) != 0)
+        return 3;
+    int rc = reencode_key(d.db, 0, NULL);
+    int crc = t_close(&d);
+    return rc == 0 && crc == 0 ? 0 : 4;
+}
+
+static int run_reencode_child(const where *w, const char *crash_at, int warmup, int seed)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (crash_at) {
+            setenv("TSDB_SETTLE_CRASH_AT", crash_at, 1);
+            char asan[512];
+            snprintf(asan, sizeof asan, "%s:detect_leaks=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+        }
+        if (warmup >= 0) {
+            char asan[512], wu[16], sd[16];
+            snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0:detect_leaks=0",
+                     getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+            snprintf(wu, sizeof wu, "%d", warmup);
+            snprintf(sd, sizeof sd, "%d", seed);
+            setenv("LD_PRELOAD", SHIM, 1);
+            setenv("CRASHFS_ROOT", w->root, 1);
+            setenv("CRASHFS_PROB", "1", 1);
+            setenv("CRASHFS_WARMUP", wu, 1);
+            setenv("CRASHFS_AT_EXIT", "1", 1);
+            setenv("CRASHFS_TEAR", "1", 1);
+            setenv("CRASHFS_SEED", sd, 1);
+        }
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) {
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        execl(SELF, "test_settle", "--child-reencode", w->root, "--mutant", mutant, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+static int reencode_reopen_check(const where *w, acc want, const char *what)
+{
+    tier_env(w, QUIET_GRACE, 86400, 0);
+    eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+    tdb d;
+    bool manual = atomic_exchange(&ecgc_test_manual, true);
+    int rc = t_open(w, &e, &d);
+    atomic_store(&ecgc_test_manual, manual);
+    CHECK(rc == 0);
+    if (rc) {
+        fprintf(stderr, "  (reencode %s: reopen %d)\n", what, rc);
+        return -1;
+    }
+    graveyard_purge(d.db, false);
+    ecgc_tier_work(d.t);
+    ecgc_tier_work(d.t);
+    graveyard_purge(d.db, false);
+    stores_exact(w, d.db, what);
+    CHECK(same(digest(d.db, "s"), want));
+    size_t all, ec;
+    key_count(d.db, 0, &all, &ec);
+    int st = (all == 1 && ec == 1) ? 2 : (all == 3 && ec == 2) ? 1 : -1;
+    if (st < 0)
+        fprintf(stderr, "  (reencode %s: unexpected state all=%zu ec=%zu)\n", what, all, ec);
+    CHECK(st > 0);
+    CHECK(count_names(w->db, "tmp_", "") == 0 && count_names(w->db, "txn_", ".intent") == 0);
+    t_close(&d);
+    return st;
+}
+
+typedef struct {
+    eng *db;
+    int64_t key;
+    atomic_bool done;
+} bp_arg;
+
+static void *bp_waiter(void *arg)
+{
+    bp_arg *a = arg;
+    db_wait_merges(a->db, a->key);
+    atomic_store(&a->done, true);
+    return NULL;
+}
+
+static void reencode_case(void)
+{
+    /* 1. Late-row multi-object re-encode (> ec_objects_max = 4): also verifies eckeep pending skip, mixed .ec + .part,
+     * GC of retired objects, and bit-identical answers against an unsettled oracle before and after reopen. */
+    {
+        where w;
+        fresh("re-multi", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        atomic_store(&ecgc_test_manual, true);
+        atomic_store(&eckeep_test_pause, true); /* hold settled_ digests pending at first */
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        eng *o = o_open(&w, &e);
+        if (d.db && o) {
+            uint32_t sd = 0, so = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0 && eng_series(o, "s", TSDB_FLOAT32, &so) == 0);
+            for (int k = 0; k < 5; k++) {
+                write_rows(d.db, sd, k * 500000, 4000, 1000, k);
+                write_rows(o, so, k * 500000, 4000, 1000, k);
+                /* overlapping timestamps: newer objects must win */
+                write_rows(d.db, sd, 0, 500, 1000, k + 10);
+                write_rows(o, so, 0, 500, 1000, k + 10);
+                CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+                CHECK(settle_key(d.db, 0, NULL) == 0);
+            }
+            /* 6th part: a young .part (level 1 via optimize) above the 5 .ec objects */
+            write_rows(d.db, sd, 5 * 500000, 2000, 1000, 20);
+            write_rows(o, so, 5 * 500000, 2000, 1000, 20);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            CHECK(eng_optimize(d.db) == 0); /* young .part reaches level 1; .ec barriers untouched */
+            acc want = digest(o, "s");
+            CHECK(same(digest(d.db, "s"), want));
+
+            /* While eckeep digest is pending, policy MUST skip key 0 */
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 6 && ec == 5);
+
+            /* Unpause eckeep: digests finish, policy triggers re-encode (> 4 combinable .ec objects) */
+            atomic_store(&eckeep_test_pause, false);
+            CHECK(wait_parts(d.db, 0, 1, 1, 20000));
+            CHECK(same(digest(d.db, "s"), want));
+            /* Wait for the settle thread (and stats sweeper) to drop their refs to the 5 retired .ec parts */
+            wait_rounds(2);
+            for (int i = 0; i < 200; i++) {
+                ecgc_counters gc;
+                ecgc_get_counters(d.t, &gc);
+                if (gc.holds == 0)
+                    break;
+                sleep_ms(10);
+            }
+            /* Retired .ec objects go through r7-gc leaving only the 1 new object's chunks */
+            gc_round(d.db);
+            stores_exact(&w, d.db, "re-multi after gc");
+
+            CHECK(t_close(&d) == 0);
+            CHECK(t_open(&w, &e, &d) == 0);
+            if (d.db) {
+                CHECK(same(digest(d.db, "s"), want));
+                key_count(d.db, 0, &all, &ec);
+                CHECK(all == 1 && ec == 1);
+            }
+        }
+        atomic_store(&eckeep_test_pause, false);
+        atomic_store(&ecgc_test_manual, false);
+        t_close(&d);
+        if (o)
+            eng_close(o);
+    }
+
+    /* 2. Tombstone-heavy re-encode: <= 10% does not trigger, > 10% triggers; 100% deletion yields empty .part. */
+    {
+        where w;
+        fresh("re-tomb", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        eng *o = o_open(&w, &e);
+        if (d.db && o) {
+            uint32_t sd = 0, so = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0 && eng_series(o, "s", TSDB_FLOAT32, &so) == 0);
+            write_rows(d.db, sd, 0, 20000, 1000, 0);
+            write_rows(o, so, 0, 20000, 1000, 0);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            CHECK(settle_key(d.db, 0, NULL) == 0);
+            /* Wait for eckeep digest of settled_ copy */
+            for (int i = 0; i < 500 && eckeep_key_pending(d.db, 0); i++)
+                sleep_ms(10);
+            /* Delete 5% (1000 of 20000 rows): below 10% threshold, must NOT trigger re-encode */
+            CHECK(eng_delete_range(d.db, sd, 0, 1000 * 1000) == 0);
+            CHECK(eng_delete_range(o, so, 0, 1000 * 1000) == 0);
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 2 && ec == 1);
+            /* Delete another 15% (3000 rows, total 20% > 10%): MUST trigger re-encode */
+            CHECK(eng_delete_range(d.db, sd, 1000 * 1000, 4000 * 1000) == 0);
+            CHECK(eng_delete_range(o, so, 1000 * 1000, 4000 * 1000) == 0);
+            CHECK(wait_parts(d.db, 0, 1, 1, 20000));
+            acc want = digest(o, "s");
+            CHECK(want.n == 16000 && same(digest(d.db, "s"), want));
+
+            /* Delete 100% of remaining rows: re-encode yields 1 empty .part (ng == 0, ec == 0) */
+            CHECK(eng_delete_range(d.db, sd, 0, DAY) == 0);
+            CHECK(eng_delete_range(o, so, 0, DAY) == 0);
+            CHECK(wait_parts(d.db, 0, 1, 0, 20000));
+            CHECK(digest(d.db, "s").n == 0);
+            CHECK(t_close(&d) == 0);
+            CHECK(t_open(&w, &e, &d) == 0);
+            if (d.db)
+                CHECK(digest(d.db, "s").n == 0);
+        }
+        t_close(&d);
+        if (o)
+            eng_close(o);
+    }
+
+    /* 3. Hidden row's tombstone over an older part (reencodedroptomb) & output ranking (reencoderankdown). */
+    {
+        where w;
+        fresh("re-tomb-rank", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        eng *o = o_open(&w, &e);
+        if (d.db && o) {
+            uint32_t sd = 0, so = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0 && eng_series(o, "s", TSDB_FLOAT32, &so) == 0);
+            /* p0 (stays below re-encode window): rows at [0, 5000s) with salt 1 */
+            write_rows(d.db, sd, 0, 5000, 1000, 1);
+            write_rows(o, so, 0, 5000, 1000, 1);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            /* p1 (.ec): overwrites [2000s, 5000s) with salt 2 + adds [5000s, 8000s) */
+            write_rows(d.db, sd, 2000 * 1000, 6000, 1000, 2);
+            write_rows(o, so, 2000 * 1000, 6000, 1000, 2);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            part *ps[8];
+            size_t n = key_parts(d.db, 0, ps, 8);
+            CHECK(n == 2);
+            if (n == 2)
+                CHECK(eng_settle(d.db, 0, &ps[1], 1, NULL) == 0); /* settle p1 only; p0 stays young .part below */
+            unref_all(ps, n);
+            /* p2 (young tombstone .part): deletes [0, 1500s) which hides rows in p0! */
+            CHECK(eng_delete_range(d.db, sd, 0, 1500 * 1000) == 0);
+            CHECK(eng_delete_range(o, so, 0, 1500 * 1000) == 0);
+            /* p3 (young .part): overwrites [3000s, 5000s) with salt 3 */
+            write_rows(d.db, sd, 3000 * 1000, 2000, 1000, 3);
+            write_rows(o, so, 3000 * 1000, 2000, 1000, 3);
+            CHECK(eng_flush(d.db) == 0 && eng_flush(o) == 0);
+            acc want = digest(o, "s");
+            CHECK(same(digest(d.db, "s"), want));
+
+            /* Re-encode suffix {p1 (.ec), p2 (tomb .part), p3 (.part)} above p0 (.part).
+             * - reencodedroptomb drops p2's tombstone -> logical digest aborts eng_reencode (rc != 0)!
+             * - reencoderankdown ranks output below p0 -> p0's salt 1 overwrites salt 2/3 -> digest mismatch! */
+            n = key_parts(d.db, 0, ps, 8);
+            CHECK(n == 4);
+            if (n == 4) {
+                size_t got = 0;
+                int rc = eng_reencode(d.db, 0, ps + 1, 3, &got);
+                CHECK(rc == 0 && got == 3);
+                CHECK(same(digest(d.db, "s"), want));
+            }
+            unref_all(ps, n);
+            /* Also check v8 .part barrier: a v8 part is refused by eng_reencode */
+            n = key_parts(d.db, 0, ps, 8);
+            if (n == 2 && !part_is_ec(ps[0])) {
+                uint32_t hl = ps[0]->hdr_len;
+                ps[0]->hdr_len = PART_HDR_V8;
+                CHECK(eng_reencode(d.db, 0, ps, 2, NULL) == TSDB_ERR_NOTFOUND);
+                ps[0]->hdr_len = hl;
+            }
+            unref_all(ps, n);
+        }
+        t_close(&d);
+        if (o)
+            eng_close(o);
+    }
+
+    /* 4. max_part_bytes cap: 5 objects each > max_part_bytes/2 must NOT trigger forever. */
+    {
+        where w;
+        fresh("re-maxbytes", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        uint64_t obj_sz = 0;
+        if (d.db) {
+            uint32_t sd = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+            for (int k = 0; k < 5; k++) {
+                write_rows(d.db, sd, k * 500000, 5000, 1000, NOISY);
+                CHECK(eng_flush(d.db) == 0);
+                CHECK(settle_key(d.db, 0, NULL) == 0);
+            }
+            part *ps[8];
+            size_t n = key_parts(d.db, 0, ps, 8);
+            CHECK(n == 5);
+            if (n == 5) {
+                struct ecpart *ep = atomic_load(&ps[0]->ec);
+                CHECK(ep != NULL);
+                if (ep)
+                    obj_sz = ep->rec.object_len;
+            }
+            unref_all(ps, n);
+            CHECK(t_close(&d) == 0);
+        }
+        CHECK(obj_sz > 0);
+        /* Reopen with max_part_bytes = obj_sz + obj_sz/2 (< 2 objects): 0 combinable pairs -> never triggers! */
+        e.max_part_bytes = obj_sz + obj_sz / 2;
+        CHECK(t_open(&w, &e, &d) == 0);
+        if (d.db) {
+            for (int i = 0; i < 500 && eckeep_key_pending(d.db, 0); i++)
+                sleep_ms(10);
+            uint64_t r0 = atomic_load(&reencode_done) + atomic_load(&reencode_failed);
+            wait_rounds(6);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 5 && ec == 5);
+            CHECK(atomic_load(&reencode_done) + atomic_load(&reencode_failed) == r0);
+            CHECK(t_close(&d) == 0);
+        }
+        /* Reopen with max_part_bytes = 2*obj_sz + obj_sz/2 (2 objects fit): combines 2 -> 4 objects, then stops! */
+        e.max_part_bytes = 2 * obj_sz + obj_sz / 2;
+        CHECK(t_open(&w, &e, &d) == 0);
+        if (d.db) {
+            for (int i = 0; i < 500 && eckeep_key_pending(d.db, 0); i++)
+                sleep_ms(10);
+            CHECK(wait_parts(d.db, 0, 4, 4, 20000));
+            wait_rounds(2); /* let eng_reencode finish incrementing reencode_done */
+            uint64_t r1 = atomic_load(&reencode_done);
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(d.db, 0, &all, &ec);
+            CHECK(all == 4 && ec == 4 && atomic_load(&reencode_done) == r1);
+            CHECK(t_close(&d) == 0);
+        }
+    }
+
+    /* 5. DOWN store / seam UNAVAILABLE / seam CORRUPT aborts without marking .ec damaged or bumping merge_fail_seq;
+     * catches reencodemarkunavail; tests per-key re-encode backoff. */
+    {
+        where w;
+        fresh("re-down", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        atomic_store(&seam_read_err, 0);
+        SREC = coldops_dir;
+        SREC.name = "srec";
+        SREC.obj_read = s_obj_read;
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tsdb_options o;
+        opts_of(&e, &o);
+        tier *t = NULL;
+        eng *db = NULL;
+        CHECK(tier_open(w.db, &o, &t) == 0);
+        if (t) {
+            tier_attach a = {.ops = &SREC, .make = coldops_dir_make};
+            tier_want_attach(t, 0, &a);
+            CHECK(eng_open(w.db, &o, &db) == 0);
+            tier_want(NULL, 0);
+        }
+        if (db) {
+            atomic_store(&settle_reencode_pause, true); /* run eng_reencode manually before testing thread backoff */
+            uint32_t sd = 0;
+            CHECK(eng_series(db, "s", TSDB_FLOAT32, &sd) == 0);
+            for (int k = 0; k < 5; k++) {
+                write_rows(db, sd, k * 500000, 2000, 1000, k);
+                CHECK(eng_flush(db) == 0);
+                CHECK(settle_key(db, 0, NULL) == 0);
+            }
+            for (int i = 0; i < 500 && eckeep_key_pending(db, 0); i++)
+                sleep_ms(10);
+            /* Forget cached granules so merge_parts_reencode reads through SREC.obj_read */
+            part *ps[8];
+            size_t n = key_parts(db, 0, ps, 8);
+            CHECK(n == 5);
+            for (size_t i = 0; i < n; i++) {
+                struct ecpart *ep = atomic_load(&ps[i]->ec);
+                if (ep)
+                    eccache_forget(t, 0, ep->rec.oid);
+            }
+            uint64_t seq0 = db->merge_fail_seq;
+            /* 5a: Seam returns TSDB_ERR_UNAVAILABLE (store went down during read) */
+            atomic_store(&seam_read_err, TSDB_ERR_UNAVAILABLE);
+            CHECK(eng_reencode(db, 0, ps, n, NULL) == TSDB_ERR_UNAVAILABLE);
+            for (size_t i = 0; i < n; i++)
+                CHECK(!atomic_load(&ps[i]->damaged));
+            CHECK(db->merge_fail_seq == seq0);
+            /* 5b: Seam returns TSDB_ERR_CORRUPT */
+            atomic_store(&seam_read_err, TSDB_ERR_CORRUPT);
+            CHECK(eng_reencode(db, 0, ps, n, NULL) == TSDB_ERR_CORRUPT);
+            for (size_t i = 0; i < n; i++)
+                CHECK(!atomic_load(&ps[i]->damaged));
+            CHECK(db->merge_fail_seq == seq0);
+            /* 5c: Per-key re-encode backoff: mark failed at NOW, verify thread skips within 1h, retries after 1h */
+            ecpolicy_reencode_failed(db, 0, atomic_load(&NOW));
+            atomic_store(&seam_read_err, 0);
+            atomic_store(&settle_reencode_pause, false);
+            atomic_store(&NOW, 1000 + HOUR - 1000);
+            wait_rounds(5);
+            size_t all, ec;
+            key_count(db, 0, &all, &ec);
+            CHECK(all == 5 && ec == 5);
+            atomic_store(&NOW, 1000 + HOUR + 1000);
+            CHECK(wait_parts(db, 0, 1, 1, 20000));
+            unref_all(ps, n);
+            CHECK(eng_close(db) == 0);
+        }
+        if (t)
+            tier_put(t);
+        atomic_store(&settle_reencode_pause, false);
+        atomic_store(&seam_read_err, 0);
+    }
+
+    /* 6. Backpressure: db_wait_merges counts an in-flight re-encode and wakes when it finishes. */
+    {
+        where w;
+        fresh("re-bp", &w);
+        tier_env(&w, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        if (d.db) {
+            /* Give db_wait_merges nmergers=1 without starting a merge thread, and create > PARTS_TO_DELAY_INSERT parts */
+            d.db->nmergers = 1;
+            uint32_t sd = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+            for (int k = 0; k < PARTS_TO_DELAY_INSERT + 2; k++) {
+                write_rows(d.db, sd, k * 10000, 10, 1000, k);
+                CHECK(eng_flush(d.db) == 0);
+            }
+            part *ps[PARTS_TO_DELAY_INSERT + 4];
+            size_t n = key_parts(d.db, 0, ps, PARTS_TO_DELAY_INSERT + 4);
+            CHECK(n == PARTS_TO_DELAY_INSERT + 2);
+            /* Mark every part settling + reencoding so no merge pairs exist, ONLY reencoding */
+            pthread_mutex_lock(&d.db->lock);
+            for (size_t i = 0; i < n; i++) {
+                ps[i]->settling = true;
+                ps[i]->reencoding = true;
+            }
+            pthread_mutex_unlock(&d.db->lock);
+            bp_arg a = {.db = d.db, .key = 0};
+            atomic_init(&a.done, false);
+            pthread_t th;
+            CHECK(pthread_create(&th, NULL, bp_waiter, &a) == 0);
+            sleep_ms(120);
+            CHECK(!atomic_load(&a.done)); /* db_wait_merges MUST wait while reencoding is in flight */
+            /* Clear reencoding (leaving settling barriers): db_wait_merges wakes and returns immediately! */
+            pthread_mutex_lock(&d.db->lock);
+            for (size_t i = 0; i < n; i++)
+                ps[i]->reencoding = false;
+            pthread_cond_broadcast(&d.db->merged_cv);
+            pthread_mutex_unlock(&d.db->lock);
+            pthread_join(th, NULL);
+            CHECK(atomic_load(&a.done));
+            pthread_mutex_lock(&d.db->lock);
+            for (size_t i = 0; i < n; i++)
+                ps[i]->settling = false;
+            pthread_mutex_unlock(&d.db->lock);
+            unref_all(ps, n);
+            d.db->nmergers = 0;
+            CHECK(t_close(&d) == 0);
+        }
+    }
+
+    /* 7. Eager mode bounded: > ec_objects_max objects collapse under eager=1. */
+    {
+        where w;
+        fresh("re-eager", &w);
+        tier_env(&w, 1, 86400, 1);
+        atomic_store(&NOW, 1000);
+        atomic_store(&settle_reencode_pause, true);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&w, &e, &d) == 0);
+        if (d.db) {
+            uint32_t sd = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+            for (int k = 0; k < 6; k++) {
+                write_rows(d.db, sd, k * 500000, 1000, 1000, k);
+                CHECK(eng_flush(d.db) == 0);
+                CHECK(settle_key(d.db, 0, NULL) == 0);
+            }
+            acc want = digest(d.db, "s");
+            atomic_store(&NOW, 10 * DAY);
+            atomic_store(&settle_reencode_pause, false);
+            CHECK(wait_parts(d.db, 0, 1, 1, 20000));
+            CHECK(same(digest(d.db, "s"), want));
+            CHECK(t_close(&d) == 0);
+        }
+        atomic_store(&settle_reencode_pause, false);
+    }
+
+    /* 8. Crash points & crashfs power loss at every step of a re-encode swap (2 .ec + 1 .part -> 1 .ec). */
+    if (!quick || !strcmp(mutant, "none")) {
+        where base, w;
+        fresh("re-pbase", &base);
+        tier_env(&base, QUIET_GRACE, 86400, 0);
+        atomic_store(&NOW, 1000);
+        eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+        tdb d;
+        CHECK(t_open(&base, &e, &d) == 0);
+        acc want = {0, 0, 0};
+        if (d.db) {
+            uint32_t sd = 0;
+            CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+            for (int k = 0; k < 2; k++) {
+                write_rows(d.db, sd, k * 500000, 4000, 1000, k);
+                CHECK(eng_flush(d.db) == 0);
+                CHECK(settle_key(d.db, 0, NULL) == 0);
+            }
+            write_rows(d.db, sd, 1000000, 4000, 1000, 2);
+            CHECK(eng_flush(d.db) == 0);
+            want = digest(d.db, "s");
+            CHECK(t_close(&d) == 0);
+        }
+        const char *pts[] = {"after-put", "after-ec-tmp", "after-intent", "between-renames:1", "between-renames:2",
+                             "between-renames:3", "before-unlink"};
+        for (size_t i = 0; i < sizeof pts / sizeof *pts; i++) {
+            fresh("re-cp", &w);
+            char cmd[3 * PATH_MAX + 32];
+            snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", w.root, base.root, w.root);
+            CHECK(system(cmd) == 0);
+            CHECK(run_reencode_child(&w, pts[i], -1, 0) == 99);
+            int st = reencode_reopen_check(&w, want, pts[i]);
+            if (i < 2)
+                CHECK(st == 1); /* before intent: original 2 .ec + 1 .part stay */
+            else
+                CHECK(st == 2); /* intent durable: rolled forward to 1 .ec */
+        }
+        if (!quick && access(SHIM, R_OK) == 0) {
+            int crashes = 0, fwd = 0, back = 0, seeds = 3;
+            bool finished = false;
+            for (int k = 0; k < 4000 && !finished; k++)
+                for (int sd = 0; sd < seeds; sd++) {
+                    fresh("re-pl", &w);
+                    char cmd[3 * PATH_MAX + 32];
+                    snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", w.root, base.root, w.root);
+                    CHECK(system(cmd) == 0);
+                    int code = run_reencode_child(&w, NULL, k, k * 7 + sd + 1);
+                    CHECK(code == 99 || code == 0);
+                    if (code != 99 && code != 0) {
+                        k = 1 << 20;
+                        break;
+                    }
+                    crashes += code == 99;
+                    int st = reencode_reopen_check(&w, want, "reencode power loss");
+                    if (code == 0) {
+                        finished = true;
+                        CHECK(st == 2);
+                    }
+                    fwd += st == 2;
+                    back += st == 1;
+                }
+            CHECK(finished && crashes > 20 && back > 0 && fwd > 0);
+        }
+    }
+    printf("  reencode: multi-object E6 (>4 + eckeep pending + gc), tombstone-heavy (>10%% & 100%% empty .part), "
+           "hidden-row tombstone & ranking, max_part_bytes cap, DOWN/CORRUPT without damaged/merge_fail_seq + backoff, "
+           "backpressure, eager, crash points & power loss\n");
+}
+
 int main(int argc, char **argv)
 {
-    const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL;
+    const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL, *rchild = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick")) {
             quick = true;
@@ -2220,6 +2838,8 @@ int main(int argc, char **argv)
             only = argv[++i];
         } else if (!strcmp(argv[i], "--child") && i + 1 < argc) {
             child = argv[++i];
+        } else if (!strcmp(argv[i], "--child-reencode") && i + 1 < argc) {
+            rchild = argv[++i];
         } else {
             scratch = argv[i];
         }
@@ -2233,6 +2853,8 @@ int main(int argc, char **argv)
     atomic_store(&settle_poll_ms, 20);
     if (child)
         return child_settle(child);
+    if (rchild)
+        return child_reencode(rchild);
     if (!realpath(argv[0], SELF))
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     char *slash = strrchr(SELF, '/');
@@ -2258,6 +2880,7 @@ int main(int argc, char **argv)
     RUN(gcpaths);
     RUN(gcpower);
     RUN(coldops);
+    RUN(reencode);
 #undef RUN
     if (failures) {
         fprintf(stderr, "test_settle: %d failures\n", failures);

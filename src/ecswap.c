@@ -165,6 +165,17 @@ static bool name_key(const char *name, int64_t *key)
     return sscanf(name, "p%" SCNd64 "_", key) == 1;
 }
 
+/* partition key, block range and level of p<K>_<A>_<B>_<L>.{part,ec} */
+static bool name_meta(const char *name, int64_t *key, uint64_t *a, uint64_t *b, uint32_t *lv)
+{
+    char dot;
+    return sscanf(name, "p%" SCNd64 "_%" SCNu64 "_%" SCNu64 "_%" SCNu32 "%c", key, a, b, lv, &dot) == 5 &&
+           dot == '.' && *a <= *b;
+}
+
+/* retired_<name> of a source */
+static void retired_of(const char *src, char *out, size_t cap) { snprintf(out, cap, "retired_%s", src); }
+
 /* P.ec for P.part: the same stem */
 static bool same_stem(const char *part_name, const char *ec_name)
 {
@@ -448,80 +459,403 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     return ecswap_mutant == SWAP_MUT_MANIFESTRC ? mrc : 0;
 }
 
+/* ------------------------------------------------------------ R10 re-encode swap */
+
+static bool reencode_args_valid(part **in, size_t nin, part *out)
+{
+    if (!in || nin == 0 || nin > (1u << 16) || !out)
+        return false;
+    bool out_ec = atomic_load(&out->ec) != NULL;
+    if (out_ec) {
+        if (!ec_tmp_name(out->pending) || !ec_file_name(out->name))
+            return false;
+    } else {
+        if (out->ng != 0 || !part_tmp_name(out->pending) || !part_file_name(out->name))
+            return false;
+    }
+    uint64_t min_b = UINT64_MAX, max_b = 0;
+    bool has_ec = false;
+    for (size_t i = 0; i < nin; i++) {
+        part *p = in[i];
+        if (!p || p == out || p->partition != out->partition || strcmp(p->name, out->name) == 0)
+            return false;
+        bool pec = atomic_load(&p->ec) != NULL;
+        if (pec ? !ec_file_name(p->name) : !part_file_name(p->name))
+            return false;
+        if (i > 0 && p->min_block <= in[i - 1]->max_block)
+            return false;
+        for (size_t j = 0; j < i; j++)
+            if (in[j] == p)
+                return false;
+        has_ec |= pec;
+        min_b = MIN(min_b, p->min_block);
+        max_b = MAX(max_b, p->max_block);
+    }
+    return has_ec && out->min_block == min_b && out->max_block == max_b;
+}
+
+static int intent_write_reencode(eng *db, const char *intent, part **in, size_t nin, part *out)
+{
+    size_t cap = 96 + strlen(out->pending) + strlen(out->name), len = 0;
+    for (size_t i = 0; i < nin; i++)
+        cap += 20 + 2 * strlen(in[i]->name);
+    int fail = atomic_load(&ecswap_test_fail);
+    if (fail == ECSWAP_FAIL_INTENT_NOMEM || fail == ECSWAP_FAIL_INTENT_IO)
+        atomic_store(&ecswap_test_fail, ECSWAP_FAIL_NONE);
+    char *buf = fail == ECSWAP_FAIL_INTENT_NOMEM ? NULL : malloc(cap);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    len += (size_t)snprintf(buf + len, cap - len, INTENT_V4_HEAD "1 %zu\n", nin);
+    len += (size_t)snprintf(buf + len, cap - len, "L %s %s\n", out->pending, out->name);
+    for (size_t i = 0; i < nin; i++) {
+        const char *pfx = atomic_load(&in[i]->ec) ? "retired_" : "settled_";
+        len += (size_t)snprintf(buf + len, cap - len, "R %s %s%s\n", in[i]->name, pfx, in[i]->name);
+    }
+    len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0 && close(fd) != 0 && rc == 0)
+        rc = TSDB_ERR_IO;
+    if (fail == ECSWAP_FAIL_INTENT_IO)
+        rc = TSDB_ERR_IO;
+    free(buf);
+    if (rc && ecswap_intent_fail_hook)
+        ecswap_intent_fail_hook(db);
+    if (rc)
+        unlinkat(db->dirfd, intent, 0);
+    return rc;
+}
+
+static void swap_discard_reencode(eng *db, part *out)
+{
+    if (eng_check(db))
+        return;
+    unlinkat(db->dirfd, out->pending, 0);
+    if (ecswap_discard_hook)
+        ecswap_discard_hook(db);
+    if (!atomic_load(&out->ec))
+        return;
+    if (eng_sync_dir(db, "fsync of the directory after removing a refused re-encode's files") != 0 &&
+        settle_mutant != SETTLE_MUT_SYNCFAILGO)
+        return;
+    if (settle_mutant != SETTLE_MUT_GCEARLY && settle_mutant != SETTLE_MUT_GCSKIPDISCARD)
+        ecgc_unlisted_object(db, out);
+    if (ecswap_handed_hook)
+        ecswap_handed_hook(db);
+}
+
+/* L rename, then directory fsync (so L is durable before any .ec source is renamed to retired_, keeping crash recovery
+ * unambiguous against a concurrent drop), then R renames. Caller holds publish_lock, latest_rw and db->lock. */
+static bool swap_renames_reencode(eng *db, part **in, size_t nin, part *out)
+{
+    if (renameat(db->dirfd, out->pending, db->dirfd, out->name) != 0) {
+        eng_fail(db, "rename of a re-encoded part into place", errno);
+        return false;
+    }
+    if (ecswap_mutant != SWAP_MUT_NODIRSYNC &&
+        eng_sync_dir(db, "fsync of the directory after naming a re-encoded part") != 0)
+        return false;
+    char dst[sizeof in[0]->name + 16];
+    for (size_t i = 0; i < nin; i++) {
+        settle_crash(SC_BETWEEN_RENAMES);
+        if (atomic_load(&in[i]->ec))
+            retired_of(in[i]->name, dst, sizeof dst);
+        else
+            settled_of(in[i]->name, dst, sizeof dst);
+        if (renameat(db->dirfd, in[i]->name, db->dirfd, dst) != 0) {
+            eng_fail(db, "rename of a re-encode's source part", errno);
+            return false;
+        }
+    }
+    return true;
+}
+
+int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
+{
+    pthread_once(&sm_once, sm_read);
+    if (db->opt.read_only || db->opt.follow)
+        return TSDB_ERR_READONLY;
+    if (!reencode_args_valid(in, nin, out))
+        return TSDB_ERR_INVALID;
+    part **pin_parts = calloc(nin, sizeof *pin_parts);
+    if (!pin_parts)
+        return TSDB_ERR_NOMEM;
+    char intent[64];
+    snprintf(intent, sizeof intent, "txn_%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
+
+    pthread_mutex_lock(&db->publish_lock);
+    int rc = eng_check(db) ? TSDB_ERR_IO : 0;
+    bool early = ecswap_mutant == SWAP_MUT_EARLY;
+    if (rc) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return rc;
+    }
+    if (ec_swap_hook)
+        ec_swap_hook(db);
+
+    /* Hold latest_rw > db->lock across the input check, intent write, L rename+sync, R renames, list update and
+     * lt_merge_marks: a drop also takes latest_rw > db->lock, so a drop intent and a re-encode intent never overlap on
+     * disk. */
+    lt_sec lsec;
+    lt_begin(db, &lsec);
+    pthread_mutex_lock(&db->lock);
+    bool ok = ecswap_mutant == SWAP_MUT_NOFAILCHECK || eng_check(db) == 0;
+    size_t base = db->nparts;
+    if (ok) {
+        for (size_t j = 0; j < db->nparts; j++)
+            if (db->parts[j] == in[0]) {
+                base = j;
+                break;
+            }
+        if (ecswap_mutant != SWAP_MUT_NODROPCHECK) {
+            ok = base + nin <= db->nparts;
+            for (size_t i = 0; i < nin && ok; i++)
+                ok = (db->parts[base + i] == in[i] || ecswap_mutant == SWAP_MUT_NOLISTED) && !in[i]->dropped &&
+                     !in[i]->merging;
+        }
+    }
+    bool renamed = false;
+    bool wrote_intent = false;
+    if (ok && !early) {
+        rc = intent_write_reencode(db, intent, in, nin, out);
+        if (rc == 0) {
+            wrote_intent = true;
+            if (ecswap_mutant != SWAP_MUT_NODIRSYNC &&
+                eng_sync_dir(db, "fsync of the directory after writing a re-encode's intent") != 0)
+                rc = TSDB_ERR_IO;
+        }
+        if (rc == 0)
+            settle_crash(SC_AFTER_INTENT);
+    }
+    if (ok && rc == 0)
+        renamed = swap_renames_reencode(db, in, nin, out);
+    size_t npart_src = 0;
+    if (renamed) {
+        lt_merge_marks(db, &lsec, in, nin);
+        for (size_t i = 0; i < nin; i++) {
+            if (atomic_load(&in[i]->ec)) {
+                ecgc_retire_locked(db, in[i]);
+                if (db->opt.obsolete_part_lifetime_s <= 0) {
+                    in[i]->retired = true;
+                    atomic_store(&in[i]->obsolete, true);
+                } else {
+                    char retired[sizeof in[i]->name + 16];
+                    retired_of(in[i]->name, retired, sizeof retired);
+                    (void)graveyard_add(db, retired, GY_EC,
+                                        eng_mono_ms() + (int64_t)db->opt.obsolete_part_lifetime_s * 1000);
+                }
+            } else {
+                pin_parts[npart_src++] = in[i];
+            }
+            if (ecswap_mutant != SWAP_MUT_NOSTATS)
+                stats_ev_remove(db, in[i]);
+            part_unref(in[i]); /* the list's reference; caller holds its own */
+        }
+        part_ref(out);
+        out->pending[0] = '\0';
+        if (base + nin <= db->nparts) {
+            db->parts[base] = out;
+            if (nin > 1)
+                memmove(db->parts + base + 1, db->parts + base + nin, (db->nparts - (base + nin)) * sizeof *db->parts);
+            db->nparts -= nin - 1;
+            if (ecswap_mutant != SWAP_MUT_NOSTATS)
+                stats_ev_add(db, out);
+        } else {
+            db_parts_insert_locked(db, out);
+        }
+        db_stall_clear_locked(db, out->partition);
+        pthread_cond_broadcast(&db->merged_cv);
+    }
+    pthread_mutex_unlock(&db->lock);
+    lt_end(db, &lsec);
+
+    if (!ok) {
+        rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+        swap_discard_reencode(db, out);
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return rc;
+    }
+    if (rc != 0) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        if (!wrote_intent && rc != TSDB_ERR_NOMEM)
+            swap_discard_reencode(db, out);
+        return rc;
+    }
+    if (!renamed) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return TSDB_ERR_IO;
+    }
+    if (early && (rc = intent_write_reencode(db, intent, in, nin, out)) != 0) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return rc;
+    }
+    if ((rc = eng_sync_dir(db, "fsync of the directory after swapping re-encoded parts")) != 0) {
+        pthread_mutex_unlock(&db->publish_lock);
+        free(pin_parts);
+        return rc;
+    }
+    settle_crash(SC_BEFORE_UNLINK);
+    if (unlinkat(db->dirfd, intent, 0) != 0)
+        fprintf(stderr, "tsdb: unlink of re-encode intent %s after its swap: %s (the next open rolls it forward)\n",
+                intent, strerror(errno));
+    pthread_mutex_unlock(&db->publish_lock);
+    if (npart_src)
+        eckeep_swapped(db, pin_parts, npart_src);
+    free(pin_parts);
+    int mrc = ec_swap_publish(db);
+    return ecswap_mutant == SWAP_MUT_MANIFESTRC ? mrc : 0;
+}
+
 /* ------------------------------------------------------------ recovery */
 
 typedef struct {
-    char tmp[96], fin[128];    /* L */
-    char src[128], dst[160];   /* R */
-} swap_line;
+    char tmp[96], fin[128]; /* L */
+    bool is_ec;
+} swap_l;
 
-/* Parses an unsealed v4 intent into its n pairs: 1; 0 when a line breaks the rules (a crafted intent must not
- * rename anything but the names a swap writes); TSDB_ERR_NOMEM. */
-static int swap_parse(char *buf, swap_line **out, size_t *nout)
+typedef struct {
+    char src[128], dst[160]; /* R */
+    bool is_ec;              /* src is .ec (dst is retired_<src>), else .part (dst is settled_<src>) */
+} swap_r;
+
+typedef struct {
+    bool reencode;
+    swap_l *l;
+    size_t nl;
+    swap_r *r;
+    size_t nr;
+} swap_plan;
+
+static void swap_plan_free(swap_plan *p)
 {
-    *out = NULL;
-    *nout = 0;
+    free(p->l);
+    free(p->r);
+    memset(p, 0, sizeof *p);
+}
+
+/* Parses an unsealed v4 intent (either R7's 1-to-1 settle "tsdb-intent 4 <n>" or R10's re-encode
+ * "tsdb-intent 4 1 <nr>"): 1; 0 when a line breaks the rules; TSDB_ERR_NOMEM. */
+static int swap_parse(char *buf, swap_plan *p)
+{
+    memset(p, 0, sizeof *p);
     char *line = buf, *next = strchr(line, '\n'), extra;
-    size_t n;
+    size_t nl = 0, nr = 0;
     if (!next)
         return 0;
     *next = '\0';
-    if (sscanf(line, INTENT_V4_HEAD "%zu%c", &n, &extra) != 1 || n < 1 || n > 1u << 16)
+    int hdr = sscanf(line, INTENT_V4_HEAD "%zu %zu%c", &nl, &nr, &extra);
+    if (hdr == 2) {
+        p->reencode = true;
+        if (nl != 1 || nr < 1 || nr > 1u << 16)
+            return 0;
+    } else if (sscanf(line, INTENT_V4_HEAD "%zu%c", &nl, &extra) == 1) {
+        p->reencode = false;
+        nr = nl;
+        if (nl < 1 || nl > 1u << 16)
+            return 0;
+    } else {
         return 0;
-    swap_line *s = calloc(n, sizeof *s);
-    if (!s)
+    }
+    p->l = calloc(nl, sizeof *p->l);
+    p->r = calloc(nr, sizeof *p->r);
+    if (!p->l || !p->r) {
+        swap_plan_free(p);
         return TSDB_ERR_NOMEM;
-    size_t got = 0;
+    }
+    p->nl = nl;
+    p->nr = nr;
+    size_t got = 0, total = nl + nr;
     int64_t key = 0;
-    for (line = next + 1; got < 2 * n; line = next + 1) {
+    uint64_t lmin = 0, lmax = 0, rmin = UINT64_MAX, rmax = 0;
+    bool has_ec = false;
+    for (line = next + 1; got < total; line = next + 1) {
         next = strchr(line, '\n');
         if (next)
             *next = '\0';
-        size_t i = got % n;
-        bool good;
-        if (got < n)
-            good = sscanf(line, "L %95s %127s%c", s[i].tmp, s[i].fin, &extra) == 2 && ec_tmp_name(s[i].tmp) &&
-                   ec_file_name(s[i].fin);
-        else
-            good = sscanf(line, "R %127s %159s%c", s[i].src, s[i].dst, &extra) == 2 && part_file_name(s[i].src);
-        if (good && got >= n) {
-            char want[sizeof s[i].dst];
-            settled_of(s[i].src, want, sizeof want);
-            int64_t k;
-            good = strcmp(want, s[i].dst) == 0 && same_stem(s[i].src, s[i].fin) && name_key(s[i].src, &k) &&
-                   (i == 0 ? (key = k, true) : k == key);
+        bool good = false;
+        if (got < nl) {
+            swap_l *x = &p->l[got];
+            good = sscanf(line, "L %95s %127s%c", x->tmp, x->fin, &extra) == 2;
+            if (good && ec_tmp_name(x->tmp) && ec_file_name(x->fin)) {
+                x->is_ec = true;
+            } else if (good && p->reencode && part_tmp_name(x->tmp) && part_file_name(x->fin)) {
+                x->is_ec = false;
+            } else {
+                good = false;
+            }
+            if (good && p->reencode) {
+                uint32_t lv = 0;
+                good = name_meta(x->fin, &key, &lmin, &lmax, &lv);
+            }
+        } else {
+            size_t i = got - nl;
+            swap_r *x = &p->r[i];
+            good = sscanf(line, "R %127s %159s%c", x->src, x->dst, &extra) == 2;
+            if (good && !p->reencode) {
+                char want[sizeof x->dst];
+                settled_of(x->src, want, sizeof want);
+                int64_t k = 0;
+                x->is_ec = false;
+                good = part_file_name(x->src) && strcmp(want, x->dst) == 0 && same_stem(x->src, p->l[i].fin) &&
+                       name_key(x->src, &k) && (i == 0 ? (key = k, true) : k == key);
+            } else if (good) {
+                char want[sizeof x->dst];
+                int64_t k = 0;
+                uint64_t a = 0, b = 0;
+                uint32_t lv = 0;
+                if (ec_file_name(x->src)) {
+                    x->is_ec = true;
+                    retired_of(x->src, want, sizeof want);
+                    has_ec = true;
+                } else if (part_file_name(x->src)) {
+                    x->is_ec = false;
+                    settled_of(x->src, want, sizeof want);
+                } else {
+                    good = false;
+                }
+                if (good)
+                    good = strcmp(want, x->dst) == 0 && strcmp(x->src, p->l[0].fin) != 0 &&
+                           name_meta(x->src, &k, &a, &b, &lv) && k == key;
+                for (size_t j = 0; good && j < i; j++)
+                    if (strcmp(p->r[j].src, x->src) == 0)
+                        good = false;
+                if (good) {
+                    rmin = MIN(rmin, a);
+                    rmax = MAX(rmax, b);
+                }
+            }
         }
         if (!good) {
-            free(s);
+            swap_plan_free(p);
             return 0;
         }
         got++;
         if (!next)
             break;
     }
-    if (got != 2 * n || next) {
-        free(s);
+    if (got != total || next || (p->reencode && (!has_ec || rmin != lmin || rmax != lmax))) {
+        swap_plan_free(p);
         return 0;
     }
-    *out = s;
-    *nout = n;
     return 1;
 }
-
-enum { N_TMP, N_FIN, N_RFIN, N_SRC, N_DST, N_RSRC, N_K };
 
 int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
 {
     EC_CALLED(EC_CALL_SWAP_RECOVER);
     if (!intent_unseal(buf, len)) {
         /* no rename follows an intent before it and the directory are synced: the parts stay, and load_parts
-         * removes the tmp .ec files with the other temporaries */
+         * removes the tmp files with the other temporaries */
         fprintf(stderr, "tsdb: settle intent %s is torn: the swap is rolled back\n", name);
         return 0;
     }
-    swap_line *s = NULL;
-    size_t n = 0;
-    int rc = swap_parse(buf, &s, &n);
+    swap_plan p;
+    int rc = swap_parse(buf, &p);
     if (rc <= 0) {
         if (rc == 0)
             fprintf(stderr, "tsdb: settle intent %s: its checksum holds but a line breaks the rules of a swap's "
@@ -529,77 +863,124 @@ int ecswap_recover(eng *db, const char *name, char *buf, size_t len)
         return rc < 0 ? rc : TSDB_ERR_CORRUPT;
     }
     rc = 0;
-    unsigned char (*on)[N_K] = calloc(n, sizeof *on);
-    if (!on) {
-        free(s);
+    unsigned char (*on_l)[3] = calloc(p.nl, sizeof *on_l); /* 0: tmp, 1: fin, 2: retired_<fin> */
+    unsigned char (*on_r)[3] = calloc(p.nr, sizeof *on_r); /* 0: src, 1: dst, 2: retired_<src> (for .part only) */
+    if (!on_l || !on_r) {
+        free(on_l);
+        free(on_r);
+        swap_plan_free(&p);
         return TSDB_ERR_NOMEM;
     }
     bool renamed = false, src_missing = false, tmp_missing = false;
-    char nm[N_K][200];
-    for (size_t i = 0; i < n && rc == 0; i++) {
-        snprintf(nm[N_TMP], sizeof nm[0], "%s", s[i].tmp);
-        snprintf(nm[N_FIN], sizeof nm[0], "%s", s[i].fin);
-        snprintf(nm[N_RFIN], sizeof nm[0], "retired_%s", s[i].fin);
-        snprintf(nm[N_SRC], sizeof nm[0], "%s", s[i].src);
-        snprintf(nm[N_DST], sizeof nm[0], "%s", s[i].dst);
-        snprintf(nm[N_RSRC], sizeof nm[0], "retired_%s", s[i].src);
-        for (int k = 0; k < N_K && rc == 0; k++) {
-            int r = name_at(db, name, nm[k]);
-            if (r < 0)
-                rc = r;
-            else
-                on[i][k] = (unsigned char)r;
+    char nm[200];
+    for (size_t i = 0; i < p.nl && rc == 0; i++) {
+        int r0 = name_at(db, name, p.l[i].tmp);
+        int r1 = r0 < 0 ? r0 : name_at(db, name, p.l[i].fin);
+        snprintf(nm, sizeof nm, "retired_%s", p.l[i].fin);
+        int r2 = r1 < 0 ? r1 : name_at(db, name, nm);
+        if (r0 < 0 || r1 < 0 || r2 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
         }
-        renamed |= on[i][N_FIN] || on[i][N_RFIN] || on[i][N_DST];
-        src_missing |= !on[i][N_SRC] && !on[i][N_DST];
-        tmp_missing |= !on[i][N_TMP];
+        on_l[i][0] = (unsigned char)r0, on_l[i][1] = (unsigned char)r1, on_l[i][2] = (unsigned char)r2;
+        renamed |= r1 || r2;
+        tmp_missing |= !r0;
+    }
+    for (size_t i = 0; i < p.nr && rc == 0; i++) {
+        int r0 = name_at(db, name, p.r[i].src);
+        int r1 = r0 < 0 ? r0 : name_at(db, name, p.r[i].dst);
+        int r2 = 0;
+        if (r1 >= 0 && !p.r[i].is_ec) {
+            snprintf(nm, sizeof nm, "retired_%s", p.r[i].src);
+            r2 = name_at(db, name, nm);
+        }
+        if (r0 < 0 || r1 < 0 || r2 < 0) {
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        on_r[i][0] = (unsigned char)r0, on_r[i][1] = (unsigned char)r1, on_r[i][2] = (unsigned char)r2;
+        if (!p.r[i].is_ec) {
+            renamed |= r1;
+            src_missing |= !r0 && !r1;
+        } else {
+            /* An .ec source's dst is retired_<src>, which a drop also creates; ec_swap_reencode syncs L before any R
+             * rename runs, so retired_<src> alone without L or a settled_ .part does not mean the swap renamed. */
+            src_missing |= !r0;
+        }
     }
     if (rc == 0 && ecswap_mutant == SWAP_MUT_BACKONGONE && src_missing)
         renamed = false; /* the planted bug: a missing source read as a drop of the key, whatever was renamed */
-    for (size_t i = 0; i < n && rc == 0 && renamed; i++) {
-        const char *why = NULL;
-        /* retired_P.part with settled_P.part beside it is an older file of the same name, not this source: the open
-         * retires a merge output a crash left unlisted when its sources are still there (load_parts' cover rule),
-         * the merge runs again and names the same P, and the retired_ copy waits out obsolete_part_lifetime_s */
-        if (on[i][N_RSRC] && !on[i][N_SRC] && !on[i][N_DST])
-            why = "a source is under retired_ although the swap renamed (a drop before its check renames nothing)";
-        else if (!on[i][N_TMP] && !on[i][N_FIN] && !on[i][N_RFIN] &&
-                 (on[i][N_SRC] || ecswap_mutant == SWAP_MUT_LOSTSETTLED))
-            why = "an .ec part is under none of its names although the swap renamed";
-        if (why) {
-            fprintf(stderr, "tsdb: settle intent %s: %s (%s): damage, the open fails\n", name, why, s[i].fin);
-            rc = TSDB_ERR_CORRUPT;
+    if (rc == 0 && renamed) {
+        if (!p.reencode) {
+            for (size_t i = 0; i < p.nl && rc == 0; i++) {
+                const char *why = NULL;
+                /* retired_P.part with settled_P.part beside it is an older file of the same name, not this source */
+                if (on_r[i][2] && !on_r[i][0] && !on_r[i][1])
+                    why = "a source is under retired_ although the swap renamed (a drop before its check renames nothing)";
+                else if (!on_l[i][0] && !on_l[i][1] && !on_l[i][2] &&
+                         (on_r[i][0] || ecswap_mutant == SWAP_MUT_LOSTSETTLED))
+                    why = "an .ec part is under none of its names although the swap renamed";
+                if (why) {
+                    fprintf(stderr, "tsdb: settle intent %s: %s (%s): damage, the open fails\n", name, why, p.l[i].fin);
+                    rc = TSDB_ERR_CORRUPT;
+                }
+            }
+        } else {
+            bool any_src = false;
+            for (size_t i = 0; i < p.nr && rc == 0; i++) {
+                any_src |= on_r[i][0] != 0;
+                if (!p.r[i].is_ec && on_r[i][2] && !on_r[i][0] && !on_r[i][1]) {
+                    fprintf(stderr, "tsdb: settle intent %s: a source is under retired_ although the swap renamed "
+                                    "(%s): damage, the open fails\n", name, p.r[i].src);
+                    rc = TSDB_ERR_CORRUPT;
+                }
+            }
+            if (rc == 0 && !on_l[0][0] && !on_l[0][1] && !on_l[0][2] &&
+                (any_src || ecswap_mutant == SWAP_MUT_LOSTSETTLED)) {
+                fprintf(stderr, "tsdb: settle intent %s: an .ec part is under none of its names although the swap "
+                                "renamed (%s): damage, the open fails\n", name, p.l[0].fin);
+                rc = TSDB_ERR_CORRUPT;
+            }
         }
     }
     if (rc == 0 && !renamed && (src_missing || tmp_missing)) {
         fprintf(stderr, "tsdb: settle intent %s: nothing of the swap was renamed and %s: it is rolled back\n", name,
                 src_missing ? "a source is gone" : "a tmp .ec is gone");
-        for (size_t i = 0; i < n && rc == 0; i++) {
-            if (on[i][N_TMP] && unlinkat(db->dirfd, s[i].tmp, 0) != 0 && errno != ENOENT)
+        for (size_t i = 0; i < p.nl && rc == 0; i++) {
+            if (on_l[i][0] && unlinkat(db->dirfd, p.l[i].tmp, 0) != 0 && errno != ENOENT)
                 rc = TSDB_ERR_IO;
-            else if (ecswap_mutant == SWAP_MUT_BACKONGONE && on[i][N_FIN]) { /* the planted bug retires a live .ec */
-                snprintf(nm[0], sizeof nm[0], "retired_%s", s[i].fin);
-                rc = renameat(db->dirfd, s[i].fin, db->dirfd, nm[0]) != 0 ? TSDB_ERR_IO : 0;
+            else if (ecswap_mutant == SWAP_MUT_BACKONGONE && on_l[i][1]) { /* the planted bug retires a live .ec */
+                snprintf(nm, sizeof nm, "retired_%s", p.l[i].fin);
+                rc = renameat(db->dirfd, p.l[i].fin, db->dirfd, nm) != 0 ? TSDB_ERR_IO : 0;
             }
             if (rc)
-                fprintf(stderr, "tsdb: rolling settle intent %s back: %s: %s\n", name, s[i].tmp, strerror(errno));
+                fprintf(stderr, "tsdb: rolling settle intent %s back: %s: %s\n", name, p.l[i].tmp, strerror(errno));
         }
     } else if (rc == 0) {
-        for (size_t i = 0; i < n && rc == 0; i++)
-            if (on[i][N_TMP] && renameat(db->dirfd, s[i].tmp, db->dirfd, s[i].fin) != 0) {
-                fprintf(stderr, "tsdb: rolling settle intent %s forward: rename of %s: %s\n", name, s[i].tmp,
-                        strerror(errno));
-                rc = TSDB_ERR_IO;
+        bool did_l = false;
+        for (size_t i = 0; i < p.nl && rc == 0; i++)
+            if (on_l[i][0]) {
+                if (renameat(db->dirfd, p.l[i].tmp, db->dirfd, p.l[i].fin) != 0) {
+                    fprintf(stderr, "tsdb: rolling settle intent %s forward: rename of %s: %s\n", name, p.l[i].tmp,
+                            strerror(errno));
+                    rc = TSDB_ERR_IO;
+                }
+                did_l = true;
             }
-        for (size_t i = 0; i < n && rc == 0 && ecswap_mutant != SWAP_MUT_PARTIAL; i++)
-            if (on[i][N_SRC] && renameat(db->dirfd, s[i].src, db->dirfd, s[i].dst) != 0) {
-                fprintf(stderr, "tsdb: rolling settle intent %s forward: rename of %s: %s\n", name, s[i].src,
+        if (rc == 0 && p.reencode && did_l && db->opt.fsync && tsdb_fsync(db->dirfd) != 0) {
+            fprintf(stderr, "tsdb: rolling re-encode intent %s forward: fsync after L: %s\n", name, strerror(errno));
+            rc = TSDB_ERR_IO;
+        }
+        for (size_t i = 0; i < p.nr && rc == 0 && ecswap_mutant != SWAP_MUT_PARTIAL; i++)
+            if (on_r[i][0] && renameat(db->dirfd, p.r[i].src, db->dirfd, p.r[i].dst) != 0) {
+                fprintf(stderr, "tsdb: rolling settle intent %s forward: rename of %s: %s\n", name, p.r[i].src,
                         strerror(errno));
                 rc = TSDB_ERR_IO;
             }
     }
-    free(on);
-    free(s);
+    free(on_l);
+    free(on_r);
+    swap_plan_free(&p);
     /* intents_recover unlinks the intent next and syncs the directory only after that: a power cut between may keep
      * the unlink and lose some of these renames (directory operations become durable in any order until a sync), and
      * with no intent left nothing would finish them. So they are made durable here, before the intent can go. */

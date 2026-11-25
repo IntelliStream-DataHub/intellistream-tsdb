@@ -44,7 +44,9 @@
 #define _GNU_SOURCE
 #include "settle.h"
 #include "chunk.h"
+#include "eccache.h"
 #include "eccold.h"
+#include "ecdigest.h"
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecskip.h"
@@ -65,8 +67,10 @@
 #endif
 
 atomic_int settle_poll_ms = 1000;
+atomic_bool settle_reencode_pause;
 void (*_Atomic settle_fill_hook)(eng *db, const part *p, uint64_t stripe);
 atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned, settle_rounds;
+atomic_uint_fast64_t reencode_done, reencode_failed, reencode_abandoned;
 atomic_int settle_test_fail_at, settle_test_fail_skip;
 int settle_mutant;
 
@@ -75,7 +79,8 @@ int settle_mutant_parse(const char *name)
     static const char *const names[] = {"none", "ecrankdown", "settlenocheck", "settletwopass", "settlebusy",
                                         "coarsewhole", "gcskipput", "gcskipindex", "gcskipopen", "gcskipelse",
                                         "gcskipswap", "gcskipdiscard", "gccommitted", "gcdouble", "gcearly",
-                                        "nullnosync",  "syncfailgo",  "nohaltstop"};
+                                        "nullnosync",  "syncfailgo",  "nohaltstop",
+                                        "reencodedroptomb", "reencoderankdown", "reencodemarkunavail"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -702,9 +707,213 @@ unpin:
     return rc;
 }
 
+/* ------------------------------------------------------------ R10 re-encode */
+
+static int cmp_part_block(const void *a, const void *b)
+{
+    const part *x = *(part *const *)a, *y = *(part *const *)b;
+    return x->min_block < y->min_block ? -1 : x->min_block > y->min_block;
+}
+
+int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded)
+{
+    pthread_once(&mut_once, mut_env);
+    if (reencoded)
+        *reencoded = 0;
+    if (!db->tier || !db->ecstate || !db->ecstate->settle || db->ec_cluster || db->replica_req || db->cluster_req ||
+        eng_jr(db))
+        return TSDB_ERR_INVALID;
+    if (db->opt.read_only || db->opt.follow)
+        return TSDB_ERR_READONLY;
+    if (eng_check(db))
+        return TSDB_ERR_IO;
+    if (eng_stopping(db))
+        return TSDB_ERR_STOPPED;
+    if (!sel || n == 0 || n > MAX_MERGE_PARTS)
+        return n == 0 ? TSDB_ERR_NOTFOUND : TSDB_ERR_INVALID;
+    if (!tier_cold_writable(db)) {
+        if (settle_mutant == SETTLE_MUT_MARKUNAVAIL) {
+            for (size_t i = 0; i < n; i++)
+                if (sel[i] && part_is_ec(sel[i]))
+                    part_mark_payload(db, sel[i], "reencode");
+        }
+        return TSDB_ERR_UNAVAILABLE;
+    }
+
+    part **pin = calloc(n, sizeof *pin);
+    if (!pin)
+        return TSDB_ERR_NOMEM;
+    size_t np = 0;
+    int rc = 0;
+    pthread_mutex_lock(&db->lock);
+    if (!partition_dropping(db, partition)) {
+        for (size_t i = 0; i < n; i++) {
+            part *p = sel[i];
+            struct ecpart *ep = p ? atomic_load_explicit(&p->ec, memory_order_acquire) : NULL;
+            if (!p || p->partition != partition || p->merging || p->settling || p->dropped ||
+                atomic_load(&p->damaged) || p->pending[0] || (ep && ep->test_mark) ||
+                (!ep && p->hdr_len != sizeof(part_header))) {
+                np = 0;
+                break;
+            }
+            bool dup = false;
+            for (size_t j = 0; j < np; j++)
+                dup |= pin[j] == p;
+            if (dup) {
+                np = 0;
+                break;
+            }
+            pin[np++] = p;
+        }
+        if (np == n) {
+            qsort(pin, np, sizeof *pin, cmp_part_block);
+            size_t base = db->nparts;
+            for (size_t j = 0; j < db->nparts; j++)
+                if (db->parts[j] == pin[0]) {
+                    base = j;
+                    break;
+                }
+            bool contig = base + np <= db->nparts, has_ec = false;
+            for (size_t i = 0; i < np && contig; i++) {
+                contig = db->parts[base + i] == pin[i];
+                has_ec |= part_is_ec(pin[i]);
+            }
+            if (!contig || !has_ec) {
+                np = 0;
+            } else {
+                uint64_t rgen = atomic_load(&db->ret_len_gen);
+                for (size_t i = 0; i < np; i++) {
+                    pin[i]->settling = true;
+                    pin[i]->reencoding = true;
+                    pin[i]->merge_len_gen = rgen;
+                    part_ref(pin[i]);
+                }
+            }
+        } else {
+            np = 0;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (np == 0) {
+        free(pin);
+        return TSDB_ERR_NOTFOUND;
+    }
+
+    /* Freeze retention cutoffs and whether any listed part of this key lies below the re-encode window so the merge
+     * and the logical digest comparison use the exact same cutoffs and tombstone decision. Lock order: ret_lock >
+     * db->lock (src/ecdigest.c ecdigest_leader). */
+    ecd_cut *cuts = NULL;
+    size_t ncuts = 0;
+    bool tombs_below = false;
+    pthread_mutex_lock(&db->ret_lock);
+    int64_t now = eng_now_ms(db);
+    rc = ecd_freeze(db, pin, np, partition, now, &cuts, &ncuts);
+    if (rc == 0) {
+        uint64_t lo_block = pin[0]->min_block;
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts && !tombs_below; i++) {
+            part *p = db->parts[i];
+            tombs_below = p->partition == partition && !p->dropped && p->max_block < lo_block;
+        }
+        pthread_mutex_unlock(&db->lock);
+    }
+    pthread_mutex_unlock(&db->ret_lock);
+
+    part *merged = NULL, *out = NULL;
+    if (rc == 0)
+        rc = merge_parts_reencode(db, pin, np, cuts, ncuts, tombs_below, &merged);
+    if (rc == 0 && merged) {
+        if (merged->ng > 0) {
+            rc = settle_one(db, merged, &out);
+            unlinkat(db->dirfd, merged->pending, 0);
+            if (rc == 0 && out)
+                out->written = merged->written;
+            part_unref(merged);
+            merged = NULL;
+        } else {
+            /* All rows were deleted by tombstones or expired by retention: an empty .part needs no chunk object. */
+            out = merged;
+            merged = NULL;
+        }
+    }
+    /* Verify the logical digest of the combined output (read back through the chunk store seam for .ec) against the
+     * inputs before swapping or retiring any old object. */
+    if (rc == 0 && out) {
+        ec_ldigest d_in = {0}, d_out = {0};
+        rc = ec_logical_digest_frozen(db, pin, np, partition, cuts, ncuts, tombs_below, &d_in);
+        if (rc == 0) {
+            part *one[1] = {out};
+            rc = ec_logical_digest_frozen(db, one, 1, partition, cuts, ncuts, tombs_below, &d_out);
+        }
+        if (rc == 0 && (d_in.rows != d_out.rows || d_in.series != d_out.series || d_in.xxh64 != d_out.xxh64)) {
+            fprintf(stderr, "tsdb: %s: re-encode of partition %lld aborted: logical digest mismatch (in %" PRIu64
+                            " rows / %" PRIu64 " series / %016" PRIx64 ", out %" PRIu64 " / %" PRIu64 " / %016" PRIx64
+                            ")\n",
+                    db->dir, (long long)partition, d_in.rows, d_in.series, d_in.xxh64, d_out.rows, d_out.series,
+                    d_out.xxh64);
+            rc = TSDB_ERR_CORRUPT;
+        }
+    }
+    free(cuts);
+
+    if (rc == 0 && out) {
+        rc = ec_swap_reencode(db, pin, np, out);
+        if (rc == 0 && settle_mutant == SETTLE_MUT_RERANKDOWN) { /* planted: rank output below every other part */
+            pthread_mutex_lock(&db->lock);
+            out->min_block = out->max_block = 0;
+            pthread_mutex_unlock(&db->lock);
+        }
+        if (rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_READONLY) {
+            unlinkat(db->dirfd, out->pending, 0);
+            struct ecpart *ep = atomic_load(&out->ec);
+            if (ep) {
+                eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
+                ecgc_unlisted_object(db, out);
+            }
+        }
+    } else if (out) {
+        unlinkat(db->dirfd, out->pending, 0);
+        struct ecpart *ep = atomic_load(&out->ec);
+        if (ep) {
+            eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
+            ecgc_unlisted_object(db, out);
+        }
+    }
+    if (merged) {
+        unlinkat(db->dirfd, merged->pending, 0);
+        part_unref(merged);
+    }
+
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < np; i++) {
+        pin[i]->settling = false;
+        pin[i]->reencoding = false;
+    }
+    if (rc != 0)
+        pthread_cond_broadcast(&db->merged_cv); /* wake db_wait_merges if it waited on this re-encode */
+    pthread_mutex_unlock(&db->lock);
+    for (size_t i = 0; i < np; i++)
+        part_unref(pin[i]);
+    if (out)
+        part_unref(out);
+    free(pin);
+
+    if (rc == 0) {
+        atomic_fetch_add(&reencode_done, 1);
+        if (reencoded)
+            *reencoded = np;
+        fprintf(stderr, "tsdb: %s: re-encoded %zu parts of partition %lld into 1\n", db->dir, np, (long long)partition);
+    } else if (rc == TSDB_ERR_STOPPED) {
+        atomic_fetch_add(&reencode_abandoned, 1);
+    } else if (rc != TSDB_ERR_NOTFOUND) {
+        atomic_fetch_add(&reencode_failed, 1);
+    }
+    return rc;
+}
+
 /* ------------------------------------------------------------ the thread */
 
-/* one settle of db, if the policy has one due: whether it settled anything */
+/* one settle or re-encode of db, if the policy has one due: whether it completed one */
 static bool settle_engine(eng *db)
 {
     if (eng_check(db) || eng_stopping(db) || !tier_cold_writable(db))
@@ -712,6 +921,23 @@ static bool settle_engine(eng *db)
     if (db->cluster_req && !eccold_leader(db)) /* a cluster volume settles only while this member leads it (D21) */
         return false;
     int64_t now = eng_now_ms(db), key = 0;
+    /* R10: check E6 re-encode triggers first on single-server tiered volumes (keeps eager jepsen partitions small). */
+    if (!db->ec_cluster && !atomic_load(&settle_reencode_pause)) {
+        part *rsel[MAX_MERGE_PARTS];
+        pthread_mutex_lock(&db->lock);
+        size_t rn = ecpolicy_pick_reencode_locked(db, now, &key, rsel, MAX_MERGE_PARTS);
+        pthread_mutex_unlock(&db->lock);
+        if (rn) {
+            int rc = eng_reencode(db, key, rsel, rn, NULL);
+            for (size_t i = 0; i < rn; i++)
+                part_unref(rsel[i]);
+            if (rc == 0)
+                ecpolicy_reencoded(db, now);
+            else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND)
+                ecpolicy_reencode_failed(db, key, now);
+            return rc == 0;
+        }
+    }
     /* a cluster leader settles whole keys (D21): as many parts as a marker may name, never the first 64 of a key */
     part *sel64[64], **sel = sel64;
     size_t cap = 64;
