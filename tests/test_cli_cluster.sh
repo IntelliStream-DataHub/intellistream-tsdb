@@ -25,7 +25,9 @@ for args in "" help --help -h; do
         "tsdb cluster status PEER" "--secret-file" "--node-timeout-ms" "--voter-replace-s" "--mode replicated|shared" \
         "--failover lease|attested|bmc" "--read-barrier on|off" "--lease-s" "--replication" "--min-isr" \
         "--heartbeat-ms" "--isr-lag-ms" "--out-after-s" "--voters" "--volumes-per-server" "docs/cluster-preview.md" \
-        "marked out [1800] (stored, not acted on yet)"; do
+        "marked out [1800] (stored, not acted on yet)" "the lease of a shared volume [10] (stored, not acted on yet)" \
+        "reads only behind a fenced write [on] (stored, not acted on yet)" \
+        "led per server at init [16] (stored, not acted on yet)"; do
         case $out in *"$want"*) ;; *) echo "FAIL tsdb cluster $args: no '$want' in the help"; fail=1 ;; esac
     done
     case $out in *"usage: tsdb <dir> <command>"*) echo "FAIL tsdb cluster $args: the general usage"; fail=1 ;; esac
