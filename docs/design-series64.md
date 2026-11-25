@@ -1,6 +1,6 @@
 # 64-bit series ids
 
-Status: design, not implemented. Branch `series64-design`, written on 2026-11-02 from main at 58456ee.
+Status: implemented on main (disk format 8, protocol 11/12). Design written on branch `series64-design` on 2026-11-02 from main at 58456ee.
 
 It was decided on 2026-11-02 to widen series ids from 32 to 64 bits before the first release (0.9.0, not tagged
 yet), for a target of 1 billion series over about 1000 volumes. The roadmap

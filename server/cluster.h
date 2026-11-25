@@ -66,9 +66,9 @@ enum cluster_admin_op {
      * without the lease (a new one, or one cut off): try again. */
     CLUSTER_OP_USER_SYNC = 9,
     /* R4 (design-cluster-data.md §6.2; R4 plan D10, D13, D14), on the Raft leader; server/ctransfer.c, cmove.c and
-     * cset.c (stubs: META_ERR_INVALID "not built"). Reply: text for the operator. TRANSFER: body u32 volume, u32 node
-     * (the new leader, an ISR member). MOVE: body u32 volume, u32 from, u32 to, u32 flags (CLUSTER_MOVE_LOG, required
-     * until R8 adds positions; CLUSTER_MOVE_CANCEL). RESET: body u32 volume, u32 node (neither leader nor in the ISR). */
+     * cset.c. Reply: text for the operator. TRANSFER: body u32 volume, u32 node
+     * (the new leader, an ISR member). MOVE: body u32 volume, u32 from, u32 to, u32 flags (CLUSTER_MOVE_LOG,
+     * CLUSTER_MOVE_CANCEL). RESET: body u32 volume, u32 node (neither leader nor in the ISR). */
     CLUSTER_OP_VOLUME_TRANSFER = 10,
     CLUSTER_OP_VOLUME_MOVE = 11,
     CLUSTER_OP_REPLICA_RESET = 12,

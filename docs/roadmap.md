@@ -11,6 +11,14 @@ series store underneath; tsdb does not duplicate it.
 
 ## Done
 
+- 0.11.0 (in progress, CHANGELOG.md): statistics over the wire (protocol 15: `STATS_SERIES`, `STATS_TENANTS`,
+  `tsdbd --tenants`, `tsdb stats ... --server`, in all four clients and the embedded bindings; docs/design-stats.md step 5),
+  replicated cluster volumes with data replication, failover, leadership transfers, copy moves, and snapshot rebuilds
+  (R1–R4, docs/design-cluster.md), erasure-coded cluster volumes (`--redundancy ec=K+M`, `tsdb chunk-store init`,
+  `tsdbd --chunk-dir`, settled-part EC and tiering, R5–R8, docs/design-cluster-data.md), and RDMA peer links
+  (`server/plrdma.c`, `dlopen` of libibverbs, `--peer-check`, docs/design-rdma.md).
+- 0.10.1 (2026-11-17, CHANGELOG.md): patch release fixing refused-write recovery, flusher backpressure, dropped-user
+  connection handling, and C client `UNAVAILABLE` handling in raw/values queries.
 - 0.10.0 (2026-11-08), a minor release that changes the disk format (9: a log number in every WAL record, a 48-byte
   part header, an `FNO` file per volume, `META requires=`; `tsdb DIR upgrade` carries a 0.9.x database over, or export
   and import) and the wire protocol (13: the HA reply bodies, 14: `QUERY_LATEST`; floor 12) and the C ABI (7). New:
@@ -93,17 +101,15 @@ otherwise:
 
 ## Next
 
-What comes after 0.10.0, in the order it is likely to be done. The format and the protocol freeze at 1.0, so what
-changes them goes before it:
+What remains on the road to 1.0. The format and the protocol freeze at 1.0, so what changes them goes before it:
 
 1. The change feed's reader (docs/design-cdc.md, step F2 and on): a wire op (protocol 16) and the clients, on top of the
    segments that F1 keeps. Until then the feed is off by default and has no consumer.
-2. Statistics over the wire (docs/design-stats.md; protocol 15, built in step 5): tenants, hot series and residency are in
-   the embedded API, the CLI and over the network (STATS_SERIES, STATS_TENANTS); the metrics port carries no per-tenant
-   numbers on purpose.
-3. The cluster beyond its metadata group (docs/design-cluster.md, docs/design-ha-modes.md): the proposer's rules and
-   the time rules (N7), data replication, failover and placement. It must not need another format or protocol
-   change after 1.0: what 1.0 needs of it is in docs/design-cluster.md section 11.
+2. Shared mode (`--mode shared`, docs/ha.md, docs/design-ha-modes.md steps N0, N2–N8) and what 0.9.1 left of NFS
+   outage handling (docs/ha.md section 15): discovery of domains from mounts, parked requests with a deadline, a bounded
+   queue per volume, and SIGTERM while a call is stuck.
+3. Device classes / storage tiers (`storage.disks`, `storage.tiers`, R10 re-encode, R14, docs/design-cluster-data.md §15)
+   and the remaining cluster ops (`node drain`/`out`, `restore`, `adopt`, RDMA link upgrade `rd-upgrade`).
 4. TLS for the client port (and the metrics port), with `SCRAM-SHA-256-PLUS` channel binding: the one thing logins
    still lack (SECURITY.md). It needs no protocol break (a flag), so it may come after 1.0.
 5. The comparison of the CPU unpack kernels on the machines the user measures on (Zen 4 and Zen 5 at v4, with the
@@ -112,9 +118,6 @@ changes them goes before it:
 6. Before 1.0: the format-8 part headers that an upgraded database keeps until merges rewrite them are refused
    (docs/tasks/pre-1.0-v8-parts.md), and anything from field use that changes the format or the protocol, and the
    VALUE_PROPOSITION.md above.
-7. What 0.9.1 left of NFS outage handling (docs/ha.md section 15): discovery of domains from the mounts, parked
-   requests with a deadline, a bounded queue per volume and SIGTERM while a call is stuck. (The clients decode
-   `TSDB_ERR_UNAVAILABLE` and the other HA statuses since protocol 13, and `tsdb_latest` is in tsdbd since 14.)
 
 After 1.0: failover with one writer per volume, then the rows of the next table.
 
@@ -155,6 +158,6 @@ i9-10850K: [docs/tasks/intel-10850k.md](tasks/intel-10850k.md).
 
 ## Not planned
 
-Latest-value lookups, series metadata, quality codes, totals, M4 chart points, event frames, rollups,
+Series metadata, quality codes, totals, M4 chart points, event frames, rollups,
 subscriptions, annotations, lossy compression, asset hierarchy and calculations:
 DataHub covers what is needed of these, or they are not needed.

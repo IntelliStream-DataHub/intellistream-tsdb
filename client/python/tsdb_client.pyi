@@ -31,9 +31,9 @@ DEFAULT_PORT: int
 PROTOCOL_VERSION: int
 """The protocol version this client speaks."""
 DEFAULT_COMPRESSION: int
+"""The zstd level a new client compresses inserts with (1)."""
 WHY_LOST: int
 """An UNAVAILABLE entry's reason: settled data of a cluster volume whose holders were declared destroyed. It will not come back, so it is never retried."""
-"""The zstd level a new client compresses inserts with (1)."""
 ERR_IO: int
 ERR_NOMEM: int
 ERR_CORRUPT: int
@@ -847,11 +847,7 @@ class Client:
         does; if it raised, the connection is dropped at once.
         """
     def protocol_version(self) -> int:
-        """Returns the protocol version the server speaks.
-
-        Version 3 added compressed inserts, version 4 grouping in time zones
-        by the client (query_bounds).
-        """
+        """Returns the protocol version the server speaks (up to 15; floor 12)."""
     def series(self, name: str, create: bool = True) -> int:
         """Returns the id of a series, creating it (as float32) if needed.
 

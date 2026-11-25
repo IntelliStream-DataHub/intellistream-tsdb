@@ -39,6 +39,11 @@ const char *tsdb_strerror(int err)
     case TSDB_ERR_TOO_MANY_BUCKETS: return "too many buckets";
     case TSDB_ERR_STOPPED: return "stopped";
     case TSDB_ERR_READONLY: return "database is read only";
+    case TSDB_ERR_MOVED: return "the volume is owned by another node";
+    case TSDB_ERR_UNAVAILABLE: return "the volume is unavailable (storage down or recovering); not applied";
+    case TSDB_ERR_PARTIAL: return "applied for some volumes only";
+    case TSDB_ERR_DROPPED: return "below the volume's drop watermark; never applied";
+    case TSDB_ERR_ABANDONED: return "request abandoned";
     case TSDB_ERR_DENIED: return "permission denied";
     case TSDB_ERR_AUTH: return "login failed";
     default: return "unknown error";

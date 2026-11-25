@@ -84,8 +84,9 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 - **The file must not be writable by its group or by others.** Whoever can change it decides where the server
   stores data and who may log in (`auth.enabled = false`), so tsdbd refuses a file with write bits beyond the
   owner's (`chmod go-w FILE`), as it does for the cluster secret.
-- **No reload.** A change takes effect at the next start (`systemctl restart tsdbd`). `SIGHUP` is ignored, as
-  before.
+- **Configuration is not reloaded on `SIGHUP`.** A change to `.properties` settings or flags takes effect at the next
+  start (`systemctl restart tsdbd`). `SIGHUP` reloads `--tenants FILE` (`tenants.file`) when set, and is ignored
+  otherwise.
 - **One table.** The keys are rows of one table in the source (`server/tsdbd_keys.h`, `tools/tsdb-cli.c`), which the
   option parser, `--config-keys` and this page all read. `tests/test_config.sh` fails when an option of tsdbd has no
   row (or a row names no option), and when the tables below differ from what the program prints.

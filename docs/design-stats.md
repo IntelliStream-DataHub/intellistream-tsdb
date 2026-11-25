@@ -1,9 +1,9 @@
 # Statistics per series and per tenant
 
-Status: steps 1 and 2 (§9) are on main (query counters, event ring, sweeper, `tsdb_series_stats`, the metrics and
-`tsdb DIR stats [series]`); steps 3 and 4 are built on branch `stats-s34` (tenants, hot lists, residency, the C API
-and `tsdb DIR stats tenants|hot`; "Steps 3 and 4 as built" in §8 lists where they differ from the text below); step 5
-(the server ops, the clients and `tsdb stats ... --server`) is built on branch `stats-s5` ("Step 5 as built" in §8). Design as written: Branch `stats-design`, written on 2026-11-06 from main at e33d87f and revised the
+Status: implemented on main (steps 1–5: query counters, event ring, sweeper, tenants, hot lists, residency,
+`tsdb_series_stats`, `tsdb DIR stats`, protocol 15 `STATS_SERIES`/`STATS_TENANTS`, and all client/embedded bindings;
+"Steps 3 and 4 as built" and "Step 5 as built" in §8 list where they differ from the text below). Design written on
+branch `stats-design` on 2026-11-06 from main at e33d87f and revised the
 same day after an adversarial review (findings H1-H4, M1-M10, L1-L10; §11 says where each one is answered).
 Code references are `file:line` at e33d87f.
 

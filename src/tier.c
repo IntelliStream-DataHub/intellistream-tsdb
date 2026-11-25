@@ -690,8 +690,8 @@ int tier_engine_attach(eng *db)
             at.settings = &cset;
         }
     } else if (tier_is_cluster_volume(db) && !eccold_may_attach(db)) { /* eccold.h: asked for cluster volumes only */
-        fprintf(stderr, "tsdb: %s: a tier on a cluster volume (META requires=cluster or replica) is not built yet "
-                        "(R8): the open fails\n", db->dir);
+        fprintf(stderr, "tsdb: %s: cluster volume has no cold-tier hooks attached (!eccold_may_attach): the open "
+                        "fails\n", db->dir);
         return TSDB_ERR_INVALID;
     }
     if (ro) { /* tier_open refuses these; an engine opened read-only under a writer's tier is the same mistake */

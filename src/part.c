@@ -2,7 +2,7 @@
 /*
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *
- *   header (24 bytes) | ts block, value block, ... per granule | pad to 8 |
+ *   header (48 bytes; 24 in format-8 parts) | ts block, value block, ... per granule | pad to 8 |
  *   granule index (bit-packed, gindex.c; index_len bytes, a multiple of 8) | [tombstones] | footer (64 bytes)
  *
  * The tombstone trailer (24 bytes per range tombstone, then u32 count and u32

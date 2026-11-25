@@ -73,7 +73,7 @@ import jdk.net.ExtendedSocketOptions;
  * {@link Status#ERR_DENIED}, which leaves the connection usable. {@link #whoami()}, {@link #userList()},
  * {@link #userCreate}, {@link #grant} and the other user calls manage users from a client.
  *
- * <p><b>Versions.</b> The client speaks protocol 12 (login) and refuses to connect to a server that answers HELLO
+ * <p><b>Versions.</b> The client speaks protocol 15 (minimum protocol 12 with login) and refuses to connect to a server that answers HELLO
  * with a lower version: {@link TsdbException} with {@link Status#ERR_INVALID}.
  *
  * <p><b>Numbers.</b> Series ids are unsigned 64-bit integers carried in a {@code long} (compare them with
@@ -93,7 +93,7 @@ public final class TsdbClient implements AutoCloseable {
     private static final int INSERT_FRAME_ROWS = 8 << 20; /* as the C client: under 256 MiB for any value type */
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
-    /* QUERY_TWA carries 56 bytes before its bounds, as the C client */
+    /* QUERY_TWA carries 60 bytes (Protocol.TWA_HEADER) before its bounds, as the C client */
     private static final int MAX_TWA_BOUNDS = (Protocol.MAX_FRAME - 64 - Protocol.TWA_HEADER) / Long.BYTES;
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     /** TCP keepalive of a new connection: first probe after 30 s of silence, then every 10 s, 3 probes. */
@@ -611,7 +611,7 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (12 for the server this client is written for)
+     * @return the server's protocol version (15 for the server this client is written for)
      * @throws TsdbException with {@link Status#ERR_INVALID} for a server older than protocol 12, which has no login;
      *     with {@link Status#ERR_IO} on a connection failure
      */

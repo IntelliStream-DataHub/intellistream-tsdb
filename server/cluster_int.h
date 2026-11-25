@@ -49,7 +49,7 @@ int cl_promo_running(uint32_t vol);
 /* TSDB_CLUSTER_TEST lose_ready_file: 1 while READYs and a timed-out transfer's CANCEL are lost */
 int cl_lose_ready(void);
 
-/* ---- the entry points (stubs answer META_ERR_INVALID "not built" until their track fills them) */
+/* ---- the entry points */
 /* server/ctransfer.c (r4-transfer): CLUSTER_OP_VOLUME_TRANSFER, the duty round (leader balance, CANCEL after an
  * election, the transfer's timeouts), a volume leader's READY */
 void ctr_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);

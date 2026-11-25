@@ -1,6 +1,7 @@
 # Login and access control for tsdbd
 
-Status: design, not implemented. Branch `auth-design`, written on 2026-11-04 from main at 3bd4e96 and revised the
+Status: implemented on main (protocol 12; TLS / `SCRAM-SHA-256-PLUS` channel binding remains unbuilt). Design written on
+branch `auth-design` on 2026-11-04 from main at 3bd4e96 and revised the
 same day with the user's answers to its open questions (A9, A13, A23-A27). Code references are `file:line` at that commit.
 
 Decided by the user on 2026-11-04 and not reopened here: this lands before the 0.9.0 tag, as protocol 12, with all

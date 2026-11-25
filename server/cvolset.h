@@ -2,8 +2,8 @@
 /*
  * The volume manager's side of replica set changes (R4 plan D8, D12, D13): a replica directory set aside when the
  * record no longer names this server (v<N>.removed-<rid>, deleted once the change is committed and the new replica is
- * in sync) or resets it (v<N>.lost-<rid>, never deleted automatically). A stub until r4-setchg fills server/cvolset.c;
- * the call sites in cvol.c and cvolfs.c are final.
+ * in sync) or resets it (v<N>.lost-<rid>, never deleted automatically). Implemented in server/cvolset.c; called from
+ * cvol.c and cvolfs.c.
  */
 #ifndef TSDB_CVOLSET_H
 #define TSDB_CVOLSET_H

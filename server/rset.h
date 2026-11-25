@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Replica set changes in the replication driver (R4 plan D8, D10-D12): the core's reconfiguration when the record
- * names another replica set, the set version on every message, and the Raft leader's DROP_MEMBER of a move. A stub
- * until r4-setchg (and r4-move: DROP_MEMBER) fill server/rset.c; the call sites in repld.c are final.
+ * names another replica set, the set version on every message, and the Raft leader's DROP_MEMBER of a move.
+ * Implemented in server/rset.c; called from repld.c.
  */
 #ifndef TSDB_RSET_H
 #define TSDB_RSET_H

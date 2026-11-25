@@ -587,10 +587,7 @@ impl Client {
         format!("<tsdb_client.Client {} {}>", self.addr, if open { "open" } else { "closed" })
     }
 
-    /// Returns the protocol version the server speaks.
-    ///
-    /// Version 3 added compressed inserts, version 4 grouping in time zones
-    /// by the client (query_bounds).
+    /// Returns the protocol version the server speaks (up to 15; floor 12).
     fn protocol_version(&self, py: Python<'_>) -> PyResult<u32> {
         self.with(py, |c| c.protocol_version())
     }

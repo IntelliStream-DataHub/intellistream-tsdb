@@ -497,6 +497,45 @@ for l in &ans {
 }
 ```
 
+## High availability & clusters
+
+`Client::connect_nodes` accepts a comma-separated list of `"host:port"` addresses, shuffles them once, and connects
+to the first node that answers (keeping the list for retries). When a server answers `UNAVAILABLE` (storage down or
+recovering) or `MOVED` (another node leads the volume), `Client` waits `retry_after` or follows the `MOVED` target
+within a retry budget of 30 seconds by default (`set_retry(Some(budget))`, or `None` to disable retries). On failure,
+`last_error()` holds the body of the latest HA reply. `topology()` returns the cluster's nodes and volume replicas
+(protocol 13), and `server_status()` returns the server's `key=value` status lines (superuser, protocol 13).
+
+```rust
+use std::time::Duration;
+use tsdb_client::{Client, ConnectOptions};
+
+let opts = ConnectOptions::new().user("admin").password_file("/tmp/tsdb-demo/password");
+let mut c = Client::connect_nodes("127.0.0.1:7070,127.0.0.1:7071", &opts)?;
+c.set_retry(Some(Duration::from_secs(10)));
+let topo = c.topology()?;
+println!("generation {}, {} volumes", topo.generation, topo.volumes.len());
+```
+
+## Series and tenant statistics
+
+`series_stats` returns storage numbers (`rows`, `ts_bytes`, `value_bytes`, `index_bytes`, `parts`, `granules`,
+timestamps, and optional page-cache `resident_bytes` when `resident` is `true`) computed from the granule index and
+memtables (protocol 15). `tenant_stats` returns per-tenant storage and activity totals (`TenantOpts::default()`,
+`.volumes()`, `.hot(k)`, `.caller()`).
+
+```rust
+use tsdb_client::TenantOpts;
+
+let stats = c.series_stats(&[pump0], false)?;
+println!("rows={}, bytes={}", stats[0].rows, stats[0].ts_bytes + stats[0].value_bytes);
+
+let tenants = c.tenant_stats(&[], &TenantOpts::default().volumes().hot(5).caller())?;
+for row in &tenants.rows {
+    println!("tenant {:?}: {} rows", row.prefix, row.numbers.rows);
+}
+```
+
 ## API documentation
 
 ```sh

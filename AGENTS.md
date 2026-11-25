@@ -240,8 +240,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `client/rust-embedded` (`tsdb_embedded::Db`; it uses the client crate's `#[doc(hidden)] __private` module and
   `client/rust-sys`), `client/python-embedded` (the wheel `intellistream-tsdb-embedded`, module `tsdb_embedded`) and
   `client/java-embedded`. A protocol change has to reach all four clients; `make test-clients` runs their tests.
-- The cluster (`docs/design-cluster.md`; step 1 of its §14 so far: the metadata group only, nothing on the insert
-  path). `src/raft/`: the Raft core copied from intellistream-objects (`UPSTREAM`; `tools/sync-raft.sh` copies it
+- The cluster (`docs/design-cluster.md`, `docs/design-cluster-data.md`): metadata group, replicated and erasure-coded
+  cluster volumes, failover, moves, transfers, and snapshot rebuilds. `src/raft/`: the Raft core copied from intellistream-objects (`UPSTREAM`; `tools/sync-raft.sh` copies it
   again, never edit the copies; `compat.[ch]` is tsdb's shim for what they include). `server/meta.c`: the metadata
   state machine (members, volumes, replicas, epochs, ISR, slots, users; entries of ops, snapshots, the §13.1
   invariants as `meta_check_step`; R4's replica set: `set_version`, raised by exactly REPLICA_ADD, REPLICA_REMOVE and
@@ -1129,10 +1129,10 @@ cgroup, so `nice` does not keep your work out of its way.
   13 the HA bodies (include/tsdb_wire.h, docs/ha.md 15.4): `TSDB_ERR_MOVED` -10, `UNAVAILABLE` -11, `PARTIAL` -12 and
   `DROPPED` -13 with their bodies, the ops TOPOLOGY (48) and STATUS (49); floor still 12. The four clients retry
   UNAVAILABLE after `retry_after` and follow MOVED within a time budget (`tsdbc_set_retry`, 30 s by default), and
-  connect to a list of nodes; tsdbd sends only UNAVAILABLE (MOVED, PARTIAL and DROPPED wait for the cluster).
+  connect to a list of nodes; tsdbd sends UNAVAILABLE and MOVED (PARTIAL and DROPPED are still unused).
   14 QUERY_LATEST (39). 15 statistics (STATS_SERIES 46, STATS_TENANTS 47; docs/design-stats.md 5; `server/tenants.[ch]`:
   tsdbd's tenant list and per-caller counters; floor still 12). The change feed is planned as 16.
-  All four clients speak 13 and no call is gated on a version below the floor;
+  All four clients speak 15 and no call is gated on a version below the floor;
   the embedded bindings (Rust `tsdb_embedded::Db`, Python `tsdb_embedded.Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 

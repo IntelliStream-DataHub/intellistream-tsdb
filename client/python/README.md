@@ -293,8 +293,9 @@ Every query of one series takes `order="desc"` (newest first) and `limit`:
 `query_raw`, `query_values`, `query_points`, `query_agg`, `query_group`,
 `query_bounds`, the `query_spread*` and `query_twa*` calls and `query_lttb`.
 Of the batch calls, `query_raw_many` takes them too; `query_agg_many` does
-not. There is no batch call for the spread or time-weighted averages in
-0.9.0: run `query_spread` or `query_twa` per series.
+not. To run spread or time-weighted average queries over many series in one
+request, use `query_spread_multi` and `query_twa_multi` under
+[Many series in one request](#many-series-in-one-request).
 
 ## Value types and nulls
 
@@ -483,6 +484,41 @@ restarts, every connection is replaced: a query that failed because its
 connection broke is sent once more on a new one, so queries keep working.
 An insert is not sent again (the server may already have written it), so
 the first insert after a restart can fail; send it again.
+
+## High availability & clusters
+
+`Client.connect_nodes("host1:7070,host2:7070", ...)` shuffles the node list and connects to the first node that
+answers. When a server replies `ERR_UNAVAILABLE` or `ERR_MOVED`, `Client` waits (`retry_after`) or follows `MOVED`
+within its retry budget (30 seconds by default; `set_retry(seconds)` changes it and `0` disables retries). When retries
+are exhausted, `TsdbUnavailable` or `TsdbMoved` exposes `.entries`, `.retry_after`, and `.has_body`. `topology()`
+returns the cluster's nodes and volume replicas (protocol 13), and `status()` returns the server's `key=value` status
+text (superuser, protocol 13).
+
+```python
+import tsdb_client
+
+with tsdb_client.Client.connect_nodes(
+    "127.0.0.1:7070,127.0.0.1:7071", user="admin", password_file="/tmp/tsdb-demo/password"
+) as c:
+    c.set_retry(10.0)
+    topo = c.topology()
+    print(topo["generation"], len(topo["volumes"]))
+```
+
+## Series and tenant statistics
+
+`series_stats(ids, resident=False)` returns per-series storage numbers from the granule index and memtables
+(protocol 15; `resident=True` fills `resident_bytes`). `tenant_stats(prefixes=None, *, volumes=False, hot=0,
+caller=False)` returns per-tenant storage and caller activity numbers (protocol 15).
+
+```python
+stats = c.series_stats([s], resident=False)
+print(stats[0]["rows"], stats[0]["ts_bytes"] + stats[0]["value_bytes"])
+
+tenants = c.tenant_stats(volumes=True, hot=5, caller=True)
+for row in tenants["rows"]:
+    print(row["prefix"], row["rows"])
+```
 
 ## API documentation
 

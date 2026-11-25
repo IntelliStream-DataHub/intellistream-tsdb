@@ -5955,7 +5955,7 @@ int main(int argc, char **argv)
                         "             (settings from a .properties file, /etc/tsdb/tsdbd.properties when present; the\n"
                         "             command line wins; --config-keys prints the keys: docs/config.md)\n"
                         "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
-                        "             [--wal-sync-ms MS] [--partition-ms MS] [--partition-classes 1|0]\n"
+                        "             [--wal-sync-ms MS] [--wal-max-batch-rows 65536] [--partition-ms MS] [--partition-classes 1|0]\n"
                         "             [--granule-rows 8192] (at creation)\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums] [--pin-index]\n"
@@ -5977,7 +5977,9 @@ int main(int argc, char **argv)
                         "             [--ec-settle-grace-s 3600] [--ec-settle-keep-s 86400] [--ec-settle-force-s 3600]\n"
                         "             [--ec-settle-wait-max-s 7200] [--ec-cache-mb MB]\n"
                         "       tsdbd --witness --cluster --cluster-secret-file F --state-dir DIR [--peer-port %d|0]\n"
-                        "             [--peer-listen ADDR] --advertise HOST [--rack NAME] [--power-feed NAME]\n",
+                        "             [--peer-listen ADDR] [--advertise HOST] [--peer-advertise HOST:PORT] [--rack NAME]\n"
+                        "             [--power-feed NAME] [--bmc ADDR] [--peer-check none|header|full]\n"
+                        "             [--port-file FILE] [--exit-with-parent[=PID]]\n",
                 TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1, TSDB_DEFAULT_PORT + 1);
         return 2;
     }
