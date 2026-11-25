@@ -68,14 +68,19 @@ mode=${1:-quick}
 #     is ignored) is liveness only: a driver that takes it holds until the drain's bound or the hard cap.
 #  25 promotion takes fence replies from outside the fenced ISR: caught only with 11 (a non-member has no rid in the
 #     record), and only because some runs fence every replica.
+# ACK hardening (64-66): 64 ack_bound (an ACK with durable > written or written > leader's log end is accepted:
+#     test_repl's `ack_bound`), 65 stale_replay (a same-rid ACK with durable < p->match overwrites replay/acked/next:
+#     test_repl's `stale_replay`, sim_repl's `sim_stale_replay`), 66 stale_rid (a stale ACK of an ISR member's initial
+#     rid flips p->rid back once another rid was heard: test_repl's `stale_rid`, sim_repl's `sim_stale_rid`).
 # Equivalent, so not run: 11 and 25 alone (above); 24 (cut() rounds up: the next question cuts further); 30 (no
 # prev_epoch check while following: the simulator never reaches it; test_repl's `follower_damage` is its check);
 # 37 (unanswered members wait for the lag rule: slower, not wrong; test_repl's `unanswered` scenario catches it).
 # 20@3000: since the idle heartbeats (idle_heartbeat_ticks varies by seed) it first dies at seed 2324.
-quick="1 2 3 4 5 6 7 8 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41 43 44 45 46 47 48 49 50
-       60 61 62 63"
+# 8@10000: m->durable < p->match drops lower-durable older-epoch ACKs too, so MUT(8) first dies at seed 6112.
+quick="1 2 3 4 5 6 7 8@10000 9 12 13 11,13 14 16 17 18 19 20@3000 21 22 23 26 27 28 29 31 34 35 36 41 43 44 45 46 47 48 49 50
+       60 61 62 63 65@1 66@1"
 all="1 2 3 4 5 6 7 8 9 10 12 13 11,13 14 15 16 17 18 19 20 21 22 23 11,25 26 27 28 29 31 34 35 36 38 39 41 43 44 45 46 47 48 49
-     50 60 61 62 63"
+     50 60 61 62 63 65@1 66@1"
 # test_repl's scenarios: BUG:SCENARIO, the planted bug and the scenario that must report it. The bug has to make the
 # run exit 1 with "scenario(s) failed" and a failure line of that scenario: a crash (139), an unknown bug number (2)
 # or a missing binary (127) is not a planted bug caught. 24 (rounding a cut up) and 11 (on its own) cannot be seen
@@ -84,7 +89,7 @@ scenarios="30:follower_damage 34:promote 35:sync_cut 36:trim 36:cut_applied 37:u
            14:promote 39:replay_floor 40:idle_shrink 42:steady_join 43:reconfig 44:reconfig 45:reconfig 46:replay
            47:snapshot 48:leave 49:leave 50:target 51:hold 52:hold 53:hold 54:reconfig 55:unans_remap 56:join_remap
            57:busy_drop 58:replay_floor 59:below_start 32:below_start 33:below_start
-           64:ack_bound"
+           64:ack_bound 65:stale_replay 66:stale_rid 8:stale_epoch"
 
 # One planted bug (tools/mutants.sh runs them in parallel, each in a scratch directory of its own, and asks this
 # script, with --mutant-verify, whether it was killed): "sim:M[@N]" is the simulator with MUT(M) for N seeds (the

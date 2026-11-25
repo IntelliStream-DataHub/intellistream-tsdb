@@ -2155,11 +2155,165 @@ static int run(uint64_t seed, uint64_t ticks)
     return S.bad;
 }
 
+static void sim_init_3nodes(void)
+{
+    reset();
+    S.rng = 0x123456789abcdef0ull;
+    S.nn = 3;
+    S.min_isr = 1;
+    S.maxdelay = 1;
+    S.maxsync = 1;
+    S.vm = (struct repl_vmeta){.epoch = 1, .isr_version = 1, .leader = 0, .isr = 0x7};
+    S.nmemv[0] = 3;
+    for (int i = 0; i < 3; i++) {
+        struct node *nd = &S.node[i];
+        nd->nid = (int)++S.next_nid;
+        S.memv[0][i] = nd->nid;
+        nd->rid = ++S.next_rid;
+        S.vm.rid[i] = nd->rid;
+        nd->cfg = (struct repl_config){.self = i, .nnodes = 3, .min_isr = 1, .isr_lag_ticks = 30,
+                                       .resend_ticks = 10, .heartbeat_ticks = 3, .floor_ticks = 20,
+                                       .unanswered_ticks = 20, .max_batch = 16, .window = 512,
+                                       .rec_find = rec_find};
+        node_open(i);
+    }
+    meta_broadcast();
+}
+
+/* Write `count` records on node 0 and step until all 3 nodes converge. */
+static void sim_write_sync(int count)
+{
+    for (int w = 0; w < count && !S.bad; w++) {
+        S.ops = grow(S.ops, &S.cops, S.nops + 1, sizeof *S.ops);
+        S.ops[S.nops] = (struct op){.id = S.nops + 1, .n = 1, .node = 0, .status = OP_PENDING, .at = S.now};
+        S.cur_op = S.ops[S.nops].id;
+        if (repl_write(S.node[0].r, 1, &S.ops[S.nops].pos) == REPL_OK) {
+            struct node *nd = &S.node[0];
+            nd->pend = grow(nd->pend, &nd->cpend, nd->npend + 1, sizeof *nd->pend);
+            nd->pend[nd->npend++] = S.nops++;
+        }
+        drive(0, NULL);
+        for (int t = 0; t < 15 && !S.bad && !converged(); t++)
+            step();
+    }
+}
+
+/* Stale ACK of an old rid after node 2 wiped and ACKed with a new rid: must not flip p->rid back (MUT(66)). */
+static int sim_stale_rid(void)
+{
+    sim_init_3nodes();
+    for (int t = 0; t < 20 && !S.bad && !converged(); t++)
+        step();
+    sim_write_sync(5);
+    if (S.bad || !converged()) {
+        violation("sim_stale_rid: setup did not converge");
+        return 1;
+    }
+    uint64_t old_rid = S.node[2].rid;
+    uint64_t old_dur = dur_end(&S.node[2]);
+    struct smsg stale = {.from_nid = S.node[2].nid, .to_nid = S.node[0].nid};
+    stale.m = (struct repl_msg){.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = S.vm.epoch, .leader = -1,
+                                .durable = old_dur, .written = old_dur, .rid = old_rid, .start = 1, .replay = 1};
+    node_crash(2, 1);
+    S.node[2].down_until = S.now;
+    for (int t = 0; t < 30 && !S.bad; t++) {
+        step();
+        if (S.node[2].r && repl_peer_match(S.node[0].r, 2) == 0 && (S.vm.isr & (1u << 2)))
+            break;
+    }
+    if (!S.bad && (!(S.vm.isr & (1u << 2)) || repl_peer_match(S.node[0].r, 2) != 0))
+        violation("sim_stale_rid: setup did not reach wiped peer state");
+    if (!S.bad) {
+        deliver(&stale);
+        if (repl_peer_match(S.node[0].r, 2) != 0)
+            violation("stale ACK of old rid %" PRIu64 " restored peer match to %" PRIu64, old_rid,
+                      repl_peer_match(S.node[0].r, 2));
+        for (int t = 0; t < 5 && !S.bad; t++)
+            step();
+    }
+    if (S.bad)
+        return 1;
+    reset();
+    return 0;
+}
+
+/* Stale pre-install ACK with higher nonzero replay start arriving after a snapshot install lowered it (MUT(65)). */
+static int sim_stale_replay(void)
+{
+    sim_init_3nodes();
+    S.replay_on = 1;
+    for (int t = 0; t < 20 && !S.bad && !converged(); t++)
+        step();
+    sim_write_sync(30);
+    if (S.bad || !converged()) {
+        violation("sim_stale_replay: setup did not converge");
+        return 1;
+    }
+    for (int i = 0; i < 2; i++) {
+        S.node[i].start = S.node[i].replay = 15;
+        repl_log_start(S.node[i].r, 15);
+        repl_replay_start(S.node[i].r, 15);
+    }
+    S.node[2].start = S.node[2].replay = 25;
+    repl_log_start(S.node[2].r, 25);
+    repl_replay_start(S.node[2].r, 25);
+    uint64_t pre_end = dur_end(&S.node[2]);
+    struct smsg stale = {.from_nid = S.node[2].nid, .to_nid = S.node[0].nid};
+    stale.m = (struct repl_msg){.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = S.vm.epoch, .leader = -1,
+                                .durable = pre_end, .written = pre_end, .rid = S.node[2].rid,
+                                .start = 25, .replay = 25};
+    /* Partition node 2 while leader 0 advances to 66, then install a snapshot on node 2 from leader 0 (replay 15 < 25). */
+    S.cut[0][2] = S.cut[2][0] = S.now + 2000;
+    sim_write_sync(35);
+    if (S.bad)
+        return 1;
+    S.cut[0][2] = S.cut[2][0] = 0;
+    struct smsg sn = {.from_nid = S.node[0].nid, .to_nid = S.node[2].nid};
+    sn.m = (struct repl_msg){.type = REPL_M_SNAPSHOT, .from = 0, .to = 2, .epoch = S.vm.epoch, .leader = -1,
+                             .written = pre_end};
+    deliver(&sn);
+    if (S.node[2].snap_src)
+        S.node[2].snap_at = S.now + 1;
+    for (int t = 0; t < 40 && !S.bad; t++) {
+        step();
+        if (S.node[2].replay == 15 && repl_replay_floor(S.node[0].r) == 15)
+            break;
+    }
+    if (!S.bad && (S.node[2].replay != 15 || repl_replay_floor(S.node[0].r) != 15))
+        violation("sim_stale_replay: node 2 replay %" PRIu64 " floor %" PRIu64 " after snapshot install, expected 15",
+                  S.node[2].replay, repl_replay_floor(S.node[0].r));
+    /* Nodes 0 and 1 raise their replay start to 30 while node 2 still holds 15..29 from the snapshot. */
+    for (int i = 0; i < 2; i++) {
+        S.node[i].start = S.node[i].replay = 30;
+        repl_log_start(S.node[i].r, 30);
+        repl_replay_start(S.node[i].r, 30);
+    }
+    for (int t = 0; t < 10 && !S.bad; t++)
+        step();
+    if (!S.bad) {
+        deliver(&stale);
+        check_floor(0);
+    }
+    if (S.bad)
+        return 1;
+    reset();
+    return 0;
+}
+
+static int hardening_checks(void)
+{
+    if (sim_stale_rid())
+        return 1;
+    if (sim_stale_replay())
+        return 1;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seeds = 200, first = 1, ticks = 3000;
-    int quiet = 0;
-    uint64_t mutant = 0;
+    int quiet = 0, single_seed = 0;
+    uint64_t mutant = 0, mutant2 = 0;
     const char *mname = "";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seeds") && i + 1 < argc) {
@@ -2169,6 +2323,7 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             first = strtoull(argv[++i], NULL, 10);
             seeds = 1;
+            single_seed = 1;
         } else if (!strcmp(argv[i], "--ticks") && i + 1 < argc) {
             ticks = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--trace")) {
@@ -2180,11 +2335,14 @@ int main(int argc, char **argv)
             for (const char *p = mname; *p;) {
                 char *e;
                 unsigned long b = strtoul(p, &e, 10);
-                if (e == p || b == 0 || b > 63) {
+                if (e == p || b == 0 || b > 127) {
                     fprintf(stderr, "sim_repl: bad --mutant %s\n", mname);
                     return 2;
                 }
-                mutant |= 1ull << b;
+                if (b < 64)
+                    mutant |= 1ull << b;
+                else
+                    mutant2 |= 1ull << (b - 64);
                 p = *e == ',' ? e + 1 : e;
             }
         } else {
@@ -2195,15 +2353,17 @@ int main(int argc, char **argv)
     }
 #ifdef REPL_MUTANTS
     repl_mutants = mutant;
+    repl_mutants2 = mutant2;
 #else
-    if (mutant) {
+    if (mutant || mutant2) {
         fprintf(stderr, "sim_repl: --mutant needs the build with -DREPL_MUTANTS (sim_repl_mut)\n");
         return 2;
     }
 #endif
+    int has_mut = mutant || mutant2;
     for (uint64_t s = first; s < first + seeds; s++) {
         if (run(s, ticks)) {
-            if (mutant) {
+            if (has_mut) {
                 printf("mutant %s: KILLED at seed %" PRIu64 ": %s\n", mname, s, S.why);
                 reset();
                 return 0;
@@ -2215,7 +2375,19 @@ int main(int argc, char **argv)
         }
     }
     reset();
-    if (mutant) {
+    if (!single_seed && (!has_mut || mutant2)) {
+        if (hardening_checks()) {
+            if (has_mut) {
+                printf("mutant %s: KILLED at hardening check: %s\n", mname, S.why);
+                reset();
+                return 0;
+            }
+            fprintf(stderr, "sim_repl: FAILED hardening check: %s\n", S.why);
+            reset();
+            return 1;
+        }
+    }
+    if (has_mut) {
         printf("mutant %s: SURVIVED %" PRIu64 " seeds\n", mname, seeds);
         return 1;
     }
