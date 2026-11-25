@@ -46,7 +46,13 @@
  *   peer_match  what a planned transfer's drain (D14) reads of its target: the durable end acknowledged as the instance
  *               the record names, the leader's own durable end for itself, 0 for an index outside the set and for a
  *               member whose ACKs come from another instance (a wiped disk copied again must not pass for the drained
- *               target: its match was earned by a log the promotion may not find).
+ *               target: its match was earned by a log the promotion may not find); a stale ACK of the old instance
+ *               must not flip it back (stale_rid).
+ *   stale_replay a stale ACK with a higher nonzero replay start sent before a snapshot install lowered it (and before
+ *               a crash + install even if its unsynced written end exceeded the install) is dropped (MUT(65)).
+ *   stale_rid   a stale ACK carrying an old rid (of an ISR member before or after its ISR drop, or of a wiped learner
+ *               whose new rid is confirmed) must not overwrite p->rid back, raise match or replay, or revive it (MUT(66)).
+ *   stale_epoch a leader ignores an ACK carrying an older epoch even when its durable end is within r->written (MUT(8)).
  */
 #include "repl.h"
 
@@ -987,10 +993,19 @@ static void peer_match(void)
     drain(r, &d, NULL);
     CHECK(repl_peer_match(r, 2) == 0, "member 2 as another instance than the record's: %" PRIu64,
           repl_peer_match(r, 2));
+    /* a stale ACK of the old instance 33 must not flip p->rid back */
     k = ack_msg(2, 0, 101, 33, 1, 0);
     repl_recv(r, &k);
     drain(r, &d, NULL);
-    CHECK(repl_peer_match(r, 2) == 101, "member 2 as the record's instance again: %" PRIu64, repl_peer_match(r, 2));
+    CHECK(repl_peer_match(r, 2) == 0, "a stale ACK of old rid 33 restored peer match: %" PRIu64,
+          repl_peer_match(r, 2));
+    /* once the metadata record adopts the new instance 99, peer_match reads 101 */
+    struct repl_msg m2 = meta_msg(0, 2, 0, 0x5, 0);
+    m2.meta.isr_version = 8;
+    m2.meta.rid[2] = 99;
+    repl_recv(r, &m2);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 101, "member 2 as the record's new instance: %" PRIu64, repl_peer_match(r, 2));
     /* a follower answers 0 for everyone */
     struct repl_msg m = meta_msg(0, 3, 1, 0x7, 0);
     repl_recv(r, &m);
@@ -1446,6 +1461,190 @@ static void busy_drop(void)
     repl_free(r);
 }
 
+/* A stale ACK with a higher nonzero replay start sent before a snapshot install lowered it (m->durable < p->match)
+ * must not overwrite p->replay, p->acked, or p->next (MUT(65)). Also covers a pre-install ACK whose unsynced written
+ * end exceeded the install cut after a crash. */
+static void stale_replay(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 200, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 200, .log_start = 1, .log_end = 200, .hist = h,
+                              .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "open");
+    struct repl_msg m = meta_msg(0, 2, 0, 0x5, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    d.start = 80;
+    repl_log_start(r, 80);
+    repl_replay_start(r, 80);
+    /* node 1 (learner) and node 2 (ISR) start with replay 65 (and node 2 also had an unsynced ACK at written 180) */
+    struct repl_msg k1 = ack_msg(1, 0, 150, 22, 80, 0);
+    struct repl_msg k2_pre = ack_msg(2, 0, 70, 33, 65, 0);
+    struct repl_msg k2_unsynced = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 2, .leader = -1, .durable = 50,
+                                   .written = 180, .rid = 33, .start = 70, .replay = 70};
+    repl_recv(r, &k1);
+    repl_recv(r, &k2_pre);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 65, "floor %" PRIu64 ", not 65", repl_replay_floor(r));
+    /* node 2 installs a snapshot at P = 150 with segments from 40 (lowering its replay start from 65 to 40) */
+    struct repl_msg k2_post = ack_msg(2, 0, 150, 33, 40, 0);
+    k2_post.start = 40;
+    k2_post.resync = 1;
+    repl_recv(r, &k2_post);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 40, "floor %" PRIu64 " after install to 40", repl_replay_floor(r));
+    /* delayed pre-install ACKs arrive after the post-install ACK: must be ignored */
+    k2_pre.resync = 1;
+    repl_recv(r, &k2_pre);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 40, "floor %" PRIu64 " after stale pre-install ACK (replay 65)",
+          repl_replay_floor(r));
+    repl_recv(r, &k2_unsynced);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) == 40, "floor %" PRIu64 " after stale pre-install unsynced ACK (replay 70)",
+          repl_replay_floor(r));
+    /* p->next was not rewound to 71 (which is below r->start 80 and would trigger a bogus SNAPSHOT) */
+    uint64_t pos;
+    repl_write(r, 1, &pos);
+    drain(r, &d, NULL);
+    CHECK(!find_act(&d, REPL_A_SEND, REPL_M_SNAPSHOT), "a bogus SNAPSHOT after stale pre-install resync ACK");
+    const struct repl_action *ap = NULL;
+    for (int i = 0; i < d.nact; i++)
+        if (d.act[i].type == REPL_A_SEND && d.act[i].msg.type == REPL_M_APPEND && d.act[i].msg.to == 2) {
+            ap = &d.act[i];
+            break;
+        }
+    CHECK(ap && ap->msg.prev_pos == 166, "node 2 append prev_pos %" PRIu64 ", not 166", ap ? ap->msg.prev_pos : 0);
+    repl_free(r);
+}
+
+/* A stale ACK carrying an old rid must not flip p->rid back, revive old match, or raise p->replay (MUT(66)). */
+static void stale_rid(void)
+{
+    static struct drv d;
+    struct repl_config c;
+    struct repl *r = join_leader(&d, &c); /* node 0 leads epoch 2, ISR {0, 2} (rid 33), learner 1 (rid 22), all at 101 */
+    CHECK(r && repl_is_leader(r), "not leader");
+    repl_log_start(r, 50);
+    repl_replay_start(r, 50);
+    /* 1. ISR member 2 (meta_rid 33) wipes to rid 99; stale ACK of rid 33 arrives while 33 is still in meta.isr */
+    struct repl_msg wipe2 = ack_msg(2, 0, 0, 99, 0, 0);
+    wipe2.resync = 1;
+    repl_recv(r, &wipe2);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 0, "wiped node 2 peer_match %" PRIu64, repl_peer_match(r, 2));
+    struct repl_msg stale2 = ack_msg(2, 0, 101, 33, 80, 0);
+    stale2.start = 80;
+    repl_recv(r, &stale2);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 0, "stale ACK of rid 33 restored peer_match to %" PRIu64, repl_peer_match(r, 2));
+    uint64_t pos;
+    repl_write(r, 1, &pos);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_commit(r) == 101, "stale ACK of rid 33 let commit advance to %" PRIu64, repl_commit(r));
+    CHECK(repl_replay_floor(r) <= 50, "stale ACK of rid 33 raised replay floor to %" PRIu64, repl_replay_floor(r));
+    /* 2. Even after node 2 is dropped from meta.isr (meta.rid[2] becomes 0), stale rid 33 is still refused */
+    struct repl_msg drop2 = meta_msg(0, 2, 0, 0x1, 0);
+    drop2.meta.isr_version = 8;
+    drop2.meta.rid[2] = 0;
+    repl_recv(r, &drop2);
+    drain(r, &d, NULL);
+    stale2.durable = stale2.written = 102;
+    stale2.replay = stale2.start = 90;
+    repl_recv(r, &stale2);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) <= 50, "stale rid 33 raised replay floor after ISR drop to %" PRIu64,
+          repl_replay_floor(r));
+    repl_tick(r);
+    drain(r, &d, NULL);
+    const struct repl_action *q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    CHECK(!q, "stale rid 33 triggered ISR rejoin request (rid %" PRIu64 ")", q ? q->msg.meta.rid[2] : 0);
+    /* 3. Learner 1 (meta_rid == 0, rid 22) wipes to rid 23 (confirmed by 2 ACKs); stale rid 22 is refused */
+    struct repl_msg wipe1 = ack_msg(1, 0, 0, 23, 0, 0);
+    wipe1.resync = 1;
+    repl_recv(r, &wipe1);
+    drain(r, &d, NULL);
+    wipe1.resync = 0;
+    repl_recv(r, &wipe1);
+    drain(r, &d, NULL);
+    struct repl_msg stale1 = ack_msg(1, 0, 102, 22, 95, 0);
+    stale1.start = 95;
+    repl_recv(r, &stale1);
+    drain(r, &d, NULL);
+    CHECK(repl_replay_floor(r) <= 50, "stale learner rid 22 raised replay floor to %" PRIu64, repl_replay_floor(r));
+    /* 4. Reordered unseen rid on a learner must not permanently ban the live rid */
+    struct repl_msg live2 = ack_msg(2, 0, 102, 99, 50, 0);
+    repl_recv(r, &live2);
+    drain(r, &d, NULL);
+    repl_free(r);
+
+    r = join_leader(&d, &c);
+    CHECK(r && repl_is_leader(r), "not leader (2)");
+    /* Remove learner 1 and re-add as fresh slot (meta_rid == 0, p->rid == 0) */
+    int map1[2] = {0, 2};
+    CHECK(repl_reconfig(r, 2, 0, map1) == REPL_OK, "reconfig drop");
+    repl_set_version(r, 1);
+    int map2[3] = {0, 1, -1};
+    CHECK(repl_reconfig(r, 3, 0, map2) == REPL_OK, "reconfig add");
+    repl_set_version(r, 2);
+    struct repl_msg m = meta_msg(0, 2, 0, 0x3, 0);
+    m.set_version = 2;
+    m.meta.isr_version = 8;
+    m.meta.rid[1] = 33;
+    m.meta.rid[2] = 0;
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    struct repl_msg r23 = ack_msg(2, 0, 101, 23, 20, 2);
+    struct repl_msg r22 = ack_msg(2, 0, 101, 22, 20, 2);
+    repl_recv(r, &r23);
+    repl_recv(r, &r23);
+    repl_recv(r, &r22); /* one delayed stale ACK of unseen rid 22 */
+    repl_recv(r, &r23); /* live rid 23 keeps sending and must recover */
+    repl_recv(r, &r23);
+    drain(r, &d, NULL);
+    repl_tick(r);
+    drain(r, &d, NULL);
+    q = find_act(&d, REPL_A_SEND, REPL_M_ISR_REQ);
+    CHECK(q && q->msg.meta.rid[2] == 23, "live learner rid 23 was deadlocked by a single stale ACK");
+    repl_free(r);
+}
+
+/* A leader ignores an ACK from an older epoch even when its durable end fits within r->written (MUT(8)). */
+static void stale_epoch(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "open");
+    struct repl_msg m = meta_msg(0, 2, 0, 0x5, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+    struct repl_msg old = ack_msg(2, 0, 101, 33, 1, 0);
+    old.epoch = 1;
+    repl_recv(r, &old);
+    drain(r, &d, NULL);
+    CHECK(repl_peer_match(r, 2) == 0, "epoch-1 ACK set peer_match to %" PRIu64, repl_peer_match(r, 2));
+    CHECK(repl_commit(r) == 100, "epoch-1 ACK moved commit to %" PRIu64, repl_commit(r));
+    CHECK(repl_replay_floor(r) == 0, "epoch-1 ACK made node 2 heard (floor %" PRIu64 ")", repl_replay_floor(r));
+    repl_free(r);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
@@ -1499,6 +1698,9 @@ int main(int argc, char **argv)
     target();
     replay();
     snapshot();
+    stale_replay();
+    stale_rid();
+    stale_epoch();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;
