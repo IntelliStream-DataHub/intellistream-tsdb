@@ -1402,6 +1402,70 @@ static void bench_hash(void)
     free(buf);
 }
 
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+static uint32_t crc32c_hw(const uint8_t *p, size_t n)
+{
+    uint64_t c = 0xffffffffu;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        c = _mm_crc32_u64(c, w);
+    }
+    for (; i < n; i++)
+        c = _mm_crc32_u8((uint32_t)c, p[i]);
+    return (uint32_t)c ^ 0xffffffffu;
+}
+#endif
+
+/* what a frame's check costs on one core, per level (design-rdma.md 6): header hashes at most 265 bytes whatever the
+ * frame's size; full hashes every byte. CRC32C (SSE4.2) over the same 265 bytes is the candidate header did not take. */
+static void bench_check(void)
+{
+    size_t sizes[] = {80, 265, 4096, 65536, 1u << 20};
+    uint8_t *buf = malloc(1u << 20);
+    fill_random(buf, 1u << 20, 3);
+    for (int rep = 0; rep < 3; rep++) {
+        for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            size_t n = sizes[si];
+            long iters = (long)((256u << 20) / n);
+            if (iters > 4000000)
+                iters = 4000000;
+            volatile uint8_t sink = 0;
+            uint8_t out[16];
+            uint64_t t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                pl_check_header((uint64_t)i, (uint32_t)n, 4, NULL, 0, buf, n, NULL, 0, out);
+                sink ^= out[0];
+            }
+            double hs = secs(t);
+            t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                pl_check((uint64_t)i, buf, n, out);
+                sink ^= out[0];
+            }
+            double fs = secs(t);
+            double cs = 0;
+#ifdef __SSE4_2__
+            size_t cn = n < 265 ? n : 265;
+            t = now_ns();
+            for (long i = 0; i < iters; i++) {
+                buf[0] = (uint8_t)i;
+                sink ^= (uint8_t)crc32c_hw(buf, cn);
+            }
+            cs = secs(t);
+#endif
+            (void)sink;
+            printf("  bench check rep %d size %zu: header %.1f ns/frame, full %.1f ns/frame (%.0f MB/s), crc32c of the "
+                   "header's span %.1f ns/frame\n",
+                   rep + 1, n, hs * 1e9 / (double)iters, fs * 1e9 / (double)iters, (double)n * (double)iters / 1e6 / fs,
+                   cs * 1e9 / (double)iters);
+        }
+    }
+    free(buf);
+}
+
 static void bench_bulk(uint32_t chunk, size_t size, int reps)
 {
     char src[600];
@@ -1477,7 +1541,9 @@ static void bench_log(int reps, size_t len)
 
 static void bench(void)
 {
+    printf("  bench at check level %s\n", pl_check_name(g_check ? g_check : PL_CHECK_NONE));
     bench_hash();
+    bench_check();
     size_t size = 512u << 20;
     uint32_t chunks[] = {64u << 10, 256u << 10, 1u << 20, 4u << 20};
     for (int i = 0; i < 4; i++)
