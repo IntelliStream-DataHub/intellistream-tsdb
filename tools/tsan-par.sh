@@ -11,7 +11,7 @@
 # oversubscribed: ThreadSanitizer runs are timing-sensitive.
 #
 # Usage: tools/tsan-par.sh MAKE GROUPS     (the Makefile passes $(MAKE) and $(TEST_GROUPS); TSAN_FLAGS is in the environment)
-# Environment: TSAN_PAR_LOGS (log directory, default a new one under $TMPDIR), MUTANT_SLOTS, MUTANT_JOBS, TSAN_PAR_REST=0
+# Environment: TSAN_PAR_LOGS (log directory, default a new one under $TMPDIR), TSAN_PAR_JOBS (makes at once, 6), MUTANT_SLOTS, MUTANT_JOBS, TSAN_PAR_REST=0
 # (leave out the run of the rest of `make test`: to try the build and a few groups only).
 set -u
 make_cmd=${1:?usage: tsan-par.sh MAKE GROUPS}
@@ -37,24 +37,27 @@ echo "tsan-par: built in $((SECONDS - t0)) s"
 # 2. the groups at once
 export MUTANT_SLOT_DIR=$logs/slots MUTANT_SLOTS=${MUTANT_SLOTS:-$((cpus / 2 > 0 ? cpus / 2 : 1))}
 export TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1 ${TSAN_OPTIONS:-}"
-names=() pids=() starts=()
+# at most TSAN_PAR_JOBS makes at once (default 6: the groups are 24 and a TSan process takes several GB; the memory peak of
+# the whole set is unmeasured, see AGENTS.md); a finished make leaves its status in $logs/NAME.rc
+maxj=${TSAN_PAR_JOBS:-6}
+names=()
 start() { # name, make arguments
     local name=$1
     shift
-    mk "$@" >"$logs/$name.log" 2>&1 &
+    while [ "$(jobs -rp | wc -l)" -ge "$maxj" ]; do wait -n || true; done
+    ( mk "$@" >"$logs/$name.log" 2>&1; echo $? >"$logs/$name.rc" ) &
     names+=("$name")
-    pids+=($!)
-    starts+=("$SECONDS")
 }
 [ "${TSAN_PAR_REST:-1}" = 0 ] || start rest test TEST_GROUPS=
 for g in $groups; do start "$g" "$g"; done
+wait
 bad=0
-for i in "${!names[@]}"; do
-    if wait "${pids[$i]}"; then
-        echo "tsan-par: ${names[$i]}: ok"
+for n in "${names[@]}"; do
+    if [ "$(cat "$logs/$n.rc" 2>/dev/null || echo 1)" = 0 ]; then
+        echo "tsan-par: $n: ok"
     else
-        echo "tsan-par: ${names[$i]}: FAILED (log $logs/${names[$i]}.log)"
-        tail -n 15 "$logs/${names[$i]}.log" | sed 's/^/    /'
+        echo "tsan-par: $n: FAILED (log $logs/$n.log)"
+        tail -n 15 "$logs/$n.log" | sed 's/^/    /'
         bad=1
     fi
 done

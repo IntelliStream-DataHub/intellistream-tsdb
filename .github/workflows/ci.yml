@@ -1,7 +1,8 @@
 # Continuous integration for tsdb. What runs where is described in CONTRIBUTING.md ("CI").
 #
 #   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
-#   jepsen (about 12 minutes of fault injection) on every push and pull request too, and once a week (about 3 hours)
+#   jepsen (about 25 minutes of fault injection per event loop) on every push and pull request too, and once a week
+#   (every run 5 minutes long, not measured: its limit is the 6 hours a job may have)
 #   integration-mutants (the integration suite against 23 planted bugs, about 40 minutes): once a week and on demand
 #
 # Rules this file follows:
@@ -42,10 +43,22 @@ env:
 jobs:
   # ------------------------------------------------------------------------------------------------ build and test
   build-test:
-    name: build and test
+    # `make test` as five runners: its own lines (units) and the groups after them in four (Makefile: TEST_GROUPS,
+    # BT_GROUPS_N, test-groups-1..4), which a single job did not finish in 45 minutes on c2e0eeae. Each is built and run with -j,
+    # as `make test` is. Limits: 1.5 x the time measured on 4 CPUs (REPORT of the track ci-time), the units' an estimate.
+    name: build and test (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: units, goals: "test TEST_GROUPS=", timeout: 45 }
+          - { name: groups 1, goals: "test-groups-1", timeout: 55 }
+          - { name: groups 2, goals: "test-groups-2", timeout: 50 }
+          - { name: groups 3, goals: "test-groups-3", timeout: 95 }
+          - { name: groups 4, goals: "test-groups-4", timeout: 45 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -58,9 +71,10 @@ jobs:
         # that refuses it, as on AlmaLinux 10) that would fail on setup, so the job falls back to
         # `make test IO=epoll` and says so in a warning.
         run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
-      - name: make test (unit, crash-recovery, fuzz corpus replay, quick start, server on ${{ steps.io.outputs.list }})
+      - name: make ${{ matrix.goals }} (unit, crash-recovery, fuzz corpus replay, quick start, server on ${{ steps.io.outputs.list }})
         env:
           IO_LIST: ${{ steps.io.outputs.list }}
+          GOALS: ${{ matrix.goals }}
         run: |
           ulimit -n 65536 || true
           mkdir -p ci-logs
@@ -71,12 +85,12 @@ jobs:
           else
               echo "::warning::podman unshare does not work on this runner: test_cli_users skips the root cases"
           fi
-          make -j"$(nproc)" test IO="$IO_LIST" 2>&1 | tee ci-logs/make-test.log
+          make -j"$(nproc)" $GOALS IO="$IO_LIST" 2>&1 | tee ci-logs/make-test.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: logs-build-test
+          name: logs-build-test-${{ matrix.name }}
           path: ci-logs
           if-no-files-found: ignore
           retention-days: 14
@@ -84,23 +98,44 @@ jobs:
   # -------------------------------------------------------------------------------------------------------- asan
   asan:
     # `make test` as runners of its own: its groups (the Makefile, "The rest of `make test` as groups") are the matrix.
-    # `make asan` takes 27 to 57 minutes for all of them here and about 80 on 4 CPUs under ThreadSanitizer, so one
-    # job for the lot has no room to grow. tests/check_ci_groups.sh (in `make test`) fails when a group is missing.
+    # One job for the lot had no room to grow. Each limit is 1.5 x the time of that group on 4 CPUs (a loop of planted
+    # bugs runs 2 mutants at a time there, as tools/mutants.sh does on 4 CPUs), 30 minutes at least.
+    # tests/check_ci_groups.sh (in `make test`) fails when a group is missing.
     name: AddressSanitizer and UBSan (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: units, target: test }
-          - { name: units 2, target: test-units-b }
-          - { name: meta and cluster, target: test-meta }
-          - { name: meta mutants 1, target: test-meta-mutants-1 }
-          - { name: meta mutants 2, target: test-meta-mutants-2 }
-          - { name: server on io_uring, target: test-net, io: uring }
-          - { name: server on epoll, target: test-net, io: epoll }
+          - { name: units, target: test, timeout: 45 }
+          - { name: units c intents, target: test-units-c, timeout: 30 }
+          - { name: units d snapshot, target: test-units-d, timeout: 30 }
+          - { name: units e drops, target: test-units-e, timeout: 30 }
+          - { name: units f drops mutants, target: test-units-f, timeout: 30 }
+          - { name: units g replica, target: test-units-g, timeout: 30 }
+          - { name: units h1 replica mutants 1, target: test-units-h1, timeout: 30 }
+          - { name: units h2 replica mutants 2, target: test-units-h2, timeout: 30 }
+          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 70 }
+          - { name: units i the rest, target: test-units-i, timeout: 30 }
+          - { name: units 2, target: test-units-b, timeout: 40 }
+          - { name: units 2b, target: test-units-b2, timeout: 30 }
+          - { name: units 2c, target: test-units-b3, timeout: 30 }
+          - { name: units 2d, target: test-units-b4, timeout: 30 }
+          - { name: units 2e, target: test-units-b5, timeout: 45 }
+          - { name: units 2f, target: test-units-b6, timeout: 30 }
+          - { name: units 2g, target: test-units-b7, timeout: 30 }
+          - { name: meta simulator 1, target: test-meta-1, timeout: 30 }
+          - { name: meta simulator 2, target: test-meta-2, timeout: 30 }
+          - { name: cluster 1, target: test-cluster-1, timeout: 30 }
+          - { name: cluster 2, target: test-cluster-2, timeout: 30 }
+          - { name: cluster 3, target: test-cluster-3, timeout: 40 }
+          - { name: links, target: test-links, timeout: 30 }
+          - { name: meta mutants 1, target: test-meta-mutants-1, timeout: 30 }
+          - { name: meta mutants 2, target: test-meta-mutants-2, timeout: 30 }
+          - { name: server on io_uring, target: test-net, io: uring, timeout: 30 }
+          - { name: server on epoll, target: test-net, io: epoll, timeout: 30 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -139,23 +174,44 @@ jobs:
 
   # -------------------------------------------------------------------------------------------------------- tsan
   tsan:
-    # The groups of `make test`, as in the asan job. One job for all of them took 80 minutes on 4 CPUs and ran into
-    # the limit on every run since 2d2fdbe (more tests: test_meta, test_cluster); each group is 5 to 25 minutes.
+    # The groups of `make test`, as in the asan job, with TSan's own limits: 8 to 180 minutes a group on 4 CPUs (the
+    # test_replica mutants of h3 and the test_ecapply ones of 2e take the longest); the 5400 s of a mutant (TSAN_MUT_TIMEOUT)
+    # is a limit of the Makefile, the job's the matrix's.
     name: ThreadSanitizer (${{ matrix.name }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: units, target: test }
-          - { name: units 2, target: test-units-b }
-          - { name: meta and cluster, target: test-meta }
-          - { name: meta mutants 1, target: test-meta-mutants-1 }
-          - { name: meta mutants 2, target: test-meta-mutants-2 }
-          - { name: server on io_uring, target: test-net, io: uring }
-          - { name: server on epoll, target: test-net, io: epoll }
+          - { name: units, target: test, timeout: 55 }
+          - { name: units c intents, target: test-units-c, timeout: 85 }
+          - { name: units d snapshot, target: test-units-d, timeout: 105 }
+          - { name: units e drops, target: test-units-e, timeout: 130 }
+          - { name: units f drops mutants, target: test-units-f, timeout: 140 }
+          - { name: units g replica, target: test-units-g, timeout: 60 }
+          - { name: units h1 replica mutants 1, target: test-units-h1, timeout: 70 }
+          - { name: units h2 replica mutants 2, target: test-units-h2, timeout: 40 }
+          - { name: units h3 replica mutants 3, target: test-units-h3, timeout: 275 }
+          - { name: units i the rest, target: test-units-i, timeout: 30 }
+          - { name: units 2, target: test-units-b, timeout: 60 }
+          - { name: units 2b, target: test-units-b2, timeout: 75 }
+          - { name: units 2c, target: test-units-b3, timeout: 105 }
+          - { name: units 2d, target: test-units-b4, timeout: 30 }
+          - { name: units 2e, target: test-units-b5, timeout: 275 }
+          - { name: units 2f, target: test-units-b6, timeout: 35 }
+          - { name: units 2g, target: test-units-b7, timeout: 30 }
+          - { name: meta simulator 1, target: test-meta-1, timeout: 30 }
+          - { name: meta simulator 2, target: test-meta-2, timeout: 30 }
+          - { name: cluster 1, target: test-cluster-1, timeout: 30 }
+          - { name: cluster 2, target: test-cluster-2, timeout: 30 }
+          - { name: cluster 3, target: test-cluster-3, timeout: 40 }
+          - { name: links, target: test-links, timeout: 30 }
+          - { name: meta mutants 1, target: test-meta-mutants-1, timeout: 65 }
+          - { name: meta mutants 2, target: test-meta-mutants-2, timeout: 65 }
+          - { name: server on io_uring, target: test-net, io: uring, timeout: 30 }
+          - { name: server on epoll, target: test-net, io: epoll, timeout: 30 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages
@@ -416,15 +472,27 @@ jobs:
 
   # ------------------------------------------------------------------------------------------------------ jepsen
   jepsen:
-    name: jepsen fault injection
-    # On every push and pull request: about 12 minutes of kill -9, simulated power loss (the crashfs LD_PRELOAD shim,
+    name: jepsen fault injection (${{ matrix.name }})
+    # The selftest in five parts and the runs of each event loop, as runners of their own (one job took 145 minutes on 4
+    # CPUs: 97 of them the selftest). On every push and pull request: about 25 minutes (a loop) of kill -9, simulated power loss (the crashfs LD_PRELOAD shim,
     # built by make), I/O errors, pauses, misdirected I/O and damage at rest, on both event loops and the workloads kv
-    # and classes. Once a week the same with every run 5 minutes long (one power seed, six outage seeds): about 3 hours on both loops.
+    # and classes. Once a week the same with every run 5 minutes long (one power seed, six outage seeds): not measured on 4 CPUs, the limit is 6 hours.
     if: >-
       github.event_name != 'schedule' ||
       github.repository == 'IntelliStream-DataHub/intellistream-tsdb'
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'schedule' && 260 || 60 }}
+    timeout-minutes: ${{ github.event_name == 'schedule' && matrix.timeout_weekly || matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: selftest 1, target: jepsen-selftest-1, timeout: 40, timeout_weekly: 40 }
+          - { name: selftest 2, target: jepsen-selftest-2, timeout: 60, timeout_weekly: 60 }
+          - { name: selftest 3, target: jepsen-selftest-3, timeout: 30, timeout_weekly: 30 }
+          - { name: selftest 4, target: jepsen-selftest-4, timeout: 40, timeout_weekly: 40 }
+          - { name: selftest 5, target: jepsen-selftest-5, timeout: 30, timeout_weekly: 30 }
+          - { name: runs on io_uring, target: jepsen-run, io: uring, timeout: 40, timeout_weekly: 360 }
+          - { name: runs on epoll, target: jepsen-run, io: epoll, timeout: 40, timeout_weekly: 360 }
     env:
       JEPSEN_DIR: /tmp/tsdb-jepsen-ci
       JEPSEN_SECONDS: ${{ github.event_name == 'schedule' && '300' || '' }}
@@ -437,18 +505,27 @@ jobs:
       - name: Which event loops can the server use?
         id: io
         run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
-      - name: make jepsen
+      - name: make ${{ matrix.target }} (${{ matrix.name }})
         env:
           IO_LIST: ${{ steps.io.outputs.list }}
+          TARGET: ${{ matrix.target }}
+          IO_ONLY: ${{ matrix.io }}
         run: |
           ulimit -n 65536 || true
+          io="$IO_LIST"
+          if [ -n "$IO_ONLY" ]; then
+              case " $IO_LIST " in
+              *" $IO_ONLY "*) io="$IO_ONLY" ;;
+              *) echo "::warning::$IO_ONLY is not available on this runner: this part is skipped"; exit 0 ;;
+              esac
+          fi
           mkdir -p ci-logs
-          make jepsen IO="$IO_LIST" JEPSEN_DIR="$JEPSEN_DIR" 2>&1 | tee ci-logs/make-jepsen.log
+          make "$TARGET" IO="$io" JEPSEN_DIR="$JEPSEN_DIR" 2>&1 | tee ci-logs/make-jepsen.log
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: logs-jepsen
+          name: logs-jepsen-${{ matrix.target }}-${{ matrix.io }}
           path: |
             ci-logs
             /tmp/tsdb-jepsen-ci*.log

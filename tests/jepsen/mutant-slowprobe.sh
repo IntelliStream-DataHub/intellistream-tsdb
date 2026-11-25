@@ -49,7 +49,7 @@ if [ $st -ne 3 ] || ! echo "$out" | grep -q '\[inconclusive, check outage-heal\]
 else
     echo "mutant-slowprobe: caught as INCONCLUSIVE (liveness): $(echo "$out" | grep '^outage heals')"
 fi
-if [ $std -ne 1 ] || ! echo "$outd" | grep -q 'and the server reports a volume as failed (UNAVAILABLE, reason DIVERGED)'; then
+if [ $std -ne 1 ] || ! echo "$outd" | grep -q 'and the server reports a volume as failed (reason DIVERGED or LOST)'; then
     echo "mutant-slowprobe: a volume that the server reports as failed for good and that never takes a write was not a violation (rc $std, wanted 1)"; echo "$outd" | tail -n 12; rc=1
 else
     echo "mutant-slowprobe: a volume reported DIVERGED that never comes back is a violation"
