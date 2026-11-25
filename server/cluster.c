@@ -1105,7 +1105,8 @@ static struct {
     uint32_t core_drift;
     uint64_t watch_behind_since; /* when the watch stream first stayed behind hint_commit; 0: it does not */
 
-    /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1,
+    /* TSDB_CLUSTER_TEST (tests only): snap_every=N, snap_retain=N, seg_bytes=N, fail_snap_dirsync=1 (every snapshot's
+     * directory fsync fails; =2: only while <state-dir>/faildirsync exists, test_cluster exitthreads),
      * hold_install_ms=N (installs dropped until N ms after the first arrived: a slow one), ring_bytes=N (the watch
      * ring's byte bound, C.ring_max) */
     uint64_t snap_every, snap_retain, seg_bytes;
@@ -1172,6 +1173,7 @@ static struct {
     int hold_copy;       /* TSDB_CLUSTER_TEST hold_copy_file=1: no new metadata copy is published while <state-dir>/holdcopy
                           * exists (test_cluster fwddepose: an entry node's copy names a leader deposed since) */
     char holdcopyfile[1100];
+    char faildirsyncfile[1100]; /* fail_snap_dirsync=2 */
     int stall_loop;      /* TSDB_CLUSTER_TEST stall_loop_file=1: the cluster thread's loop stalls while <state-dir>/stallloop
                           * exists (test_cluster copycaught: cluster_copy_caught_up read on another thread) */
     char stallloopfile[1100];
@@ -1420,7 +1422,7 @@ static void test_knobs(void)
         else if (sscanf(p, "seg_bytes=%llu", &v) == 1)
             C.seg_bytes = v;
         else if (sscanf(p, "fail_snap_dirsync=%llu", &v) == 1)
-            C.fail_snap_dirsync = v != 0;
+            C.fail_snap_dirsync = v > 2 ? 1 : (int)v;
         else if (sscanf(p, "fail_copy_dirsync=%llu", &v) == 1)
             C.fail_copy_dirsync = v != 0;
         else if (sscanf(p, "fail_pend_dirsync=%llu", &v) == 1)
@@ -3026,7 +3028,7 @@ static void take_snapshot(void)
         oom();
     j.index = C.sm.applied;
     j.term = C.sm.applied_term;
-    j.fail_dirsync = C.fail_snap_dirsync;
+    j.fail_dirsync = C.fail_snap_dirsync == 1 || (C.fail_snap_dirsync == 2 && access(C.faildirsyncfile, F_OK) == 0);
     C.snap_out = 1;
     dw_submit(&j);
 }
@@ -7136,6 +7138,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.holdopensfile, sizeof C.holdopensfile, "%s/holdopens", C.metadir);
     snprintf(C.holdraftfile, sizeof C.holdraftfile, "%s/holdraft", C.metadir);
     snprintf(C.holdcopyfile, sizeof C.holdcopyfile, "%s/holdcopy", C.metadir);
+    snprintf(C.faildirsyncfile, sizeof C.faildirsyncfile, "%s/faildirsync", C.metadir);
     snprintf(C.stallloopfile, sizeof C.stallloopfile, "%s/stallloop", C.metadir);
     snprintf(C.holdusersfile, sizeof C.holdusersfile, "%s/holdusers", C.metadir);
     snprintf(C.holdisrfile, sizeof C.holdisrfile, "%s/holdisr", C.metadir);

@@ -31,6 +31,7 @@
  */
 #define _GNU_SOURCE
 #include "cluster.h"
+#include "crashpt.h"
 #include "cvol_check.h"
 #include "harness.h"
 #include "meta.h"
@@ -136,6 +137,7 @@ static void signal_child(pid_t pid, int sig)
 }
 
 static uint64_t now_ms(void);
+static void await_log(int i, const char *needle, int ms, const char *what);
 
 /* Whether every thread of pid is in the group stop (state T in /proc/PID/task/TID/stat); names the first that is not
  * in busy, and sets *gone when the process itself is a zombie (it exited before the pause). io_uring's kernel workers
@@ -1314,6 +1316,98 @@ static void scen_dirsync(void)
     if (st != 1 || !log_has(0, "cannot sync"))
         die("a failed directory fsync after a snapshot: status %d (expected 1 with \"cannot sync\" in the log)", st);
     printf("  a failed directory fsync after naming a snapshot stops the server\n");
+}
+
+/* exitthreads: the two ends of tsdbd that are not its clean stop keep the status the harness waits for when a thread
+ * has finished and nobody has joined it yet. Under ThreadSanitizer (make tsan: halt_on_error=1) the finalizer of an exit
+ * reports such a thread as a leak and ends the process with 66 (test_cluster initcrash, snapkill: "status 66"); in
+ * other builds both parts pass with or without the fixes. 1: a crash point (crashpt.c) ends as a power cut, with 99,
+ * whatever threads there are: a child of this test, the point armed, a joinable thread that has returned. 2: tsdbd's
+ * chunk peer source thread (chunkpeer_cluster.c) no longer returns once the epoch source is set, so a member that
+ * fail-stops after that (its next snapshot's directory fsync fails) ends with 1. */
+static atomic_int crashpt_child_ran;
+
+static void *crashpt_child_thread(void *arg)
+{
+    (void)arg;
+    atomic_store(&crashpt_child_ran, 1);
+    return NULL;
+}
+
+static int crashpt_child(void)
+{
+    /* the task count before the thread (a sanitizer's runtime may hold threads of its own): /proc/self/task's links */
+    struct stat st;
+    if (stat("/proc/self/task", &st) != 0)
+        return 6;
+    nlink_t before = st.st_nlink;
+    pthread_t t;
+    if (pthread_create(&t, NULL, crashpt_child_thread, NULL) != 0)
+        return 3;
+    /* the thread has finished once the kernel has let go of it: the count is back (10 s bound: a thread that only
+     * sets a flag) */
+    uint64_t t0 = now_ms();
+    for (;;) {
+        if (atomic_load(&crashpt_child_ran) && stat("/proc/self/task", &st) == 0 && st.st_nlink == before)
+            break;
+        if (now_ms() - t0 > 10000)
+            return 4;
+        usleep(1000);
+    }
+    setenv("TSDB_CRASH_AT", "serving", 1);
+    crash_point(CP_SERVING);
+    return 5; /* the point did not fire */
+}
+
+static void scen_exitthreads(void)
+{
+    scenario("exitthreads");
+    char self[PATH_MAX];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl <= 0)
+        die("readlink /proc/self/exe: %s", strerror(errno));
+    self[sl] = '\0';
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork: %s", strerror(errno));
+    if (pid == 0) {
+        execl(self, self, "crashpt-child", (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (waitpid(pid, &st, 0) != pid)
+        die("waitpid: %s", strerror(errno));
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != CRASH_EXIT_STATUS)
+        die("a crash point passed with a finished, unjoined thread ended with status 0x%x, not %d (66: a sanitizer's "
+            "report at exit)",
+            st, CRASH_EXIT_STATUS);
+    printf("  a crash point ends with %d beside a finished thread nobody joined\n", CRASH_EXIT_STATUS);
+
+    envs[0] = "snap_every=1,fail_snap_dirsync=2";
+    start(0);
+    start(1);
+    init_fast(0);
+    await_log(0, "chunk peer: the epoch source is set", WAIT_MS, "the member's chunk peer never set its epoch source");
+    char ff[PATH_MAX + 64];
+    snprintf(ff, sizeof ff, "%s/n0/state/faildirsync", base); /* the next snapshot's directory fsync fails: exit(1) */
+    int fd = open(ff, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+        die("%s: %s", ff, strerror(errno));
+    close(fd);
+    uint8_t req[META_ADDR_MAX + 64], *rep = NULL;
+    size_t n = node_add_req(1, req), len;
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(0, addr, sizeof addr);
+    int rc;
+    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, n, 5000, &rc, &rep, &len, err,
+                      sizeof err) == 0)
+        free(rep);
+    int ex = await_exit(0, WAIT_MS);
+    if (ex != 1 || !log_has(0, "cannot sync"))
+        die("a member whose snapshot's directory fsync failed after its chunk peer started ended with status %d (want 1 "
+            "with \"cannot sync\" in its log; 66: a sanitizer's report at exit)",
+            ex);
+    printf("  a member whose chunk peer runs fail-stops with status 1\n");
 }
 
 /* a crash inside a snapshot install: the log is reset to the image's index, the snapshot not written (a directory in
@@ -18488,6 +18582,8 @@ int main(int argc, char **argv)
     th_watchdog("test_cluster", 1800);
     if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
         return hardslot_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "crashpt-child"))
+        return crashpt_child();
     /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a run writes over a GB */
     const char *scratch = argc > 1 && *argv[1] ? argv[1] : getenv("TMPDIR");
     if (!scratch || !*scratch)
@@ -18509,7 +18605,7 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } all[] = {{"secret", scen_secret},     {"relay", scen_relay},     {"initcrash", scen_initcrash},
-               {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
+               {"dirsync", scen_dirsync},   {"exitthreads", scen_exitthreads},   {"install", scen_install}, {"reseed", scen_reseed},
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},
