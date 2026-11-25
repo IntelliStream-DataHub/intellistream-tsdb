@@ -172,7 +172,7 @@ struct old_sector {
     unsigned char data[SECTOR];
 };
 
-typedef enum { OP_CREATE, OP_RENAME, OP_UNLINK, OP_MKDIR } op_kind;
+typedef enum { OP_CREATE, OP_RENAME, OP_UNLINK, OP_MKDIR, OP_LINK, OP_RMDIR } op_kind;
 
 typedef struct dirop {
     op_kind kind;
@@ -243,6 +243,7 @@ REAL(dup3);
 REAL(fcntl);
 REAL(mkdir);
 REAL(mkdirat);
+REAL(rmdir);
 REAL(ftruncate);
 REAL(closedir);
 
@@ -344,6 +345,7 @@ __attribute__((constructor)) static void init(void)
     LOAD(fcntl);
     LOAD(mkdir);
     LOAD(mkdirat);
+    LOAD(rmdir);
     LOAD(ftruncate);
     LOAD(closedir);
     const char *r = getenv("CRASHFS_ROOT");
@@ -482,6 +484,74 @@ static file *file_get(const char *path, bool create_new)
     snprintf(f->path, PATH_MAX, "%s", path);
     f->durable = create_new ? 0 : st.st_size; /* files from before we started are durable */
     return f;
+}
+
+static bool scan_inode_dir(const char *dir, dev_t dev, ino_t ino, char *out, struct stat *st_out, int depth)
+{
+    if (depth > 32)
+        return false;
+    DIR *d = opendir(dir);
+    if (!d)
+        return false;
+    struct dirent *e;
+    bool found = false;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        if (!strncmp(e->d_name, ".crashfs_tsave_", 15) || !strncmp(e->d_name, ".crashfs_saved_", 15))
+            continue;
+        char p[PATH_MAX];
+        int n = snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        if (n < 0 || n >= (int)sizeof p)
+            continue;
+        struct stat st;
+        if (lstat(p, &st) != 0)
+            continue;
+        if (S_ISREG(st.st_mode)) {
+            if (st.st_dev == dev && st.st_ino == ino) {
+                snprintf(out, PATH_MAX, "%s", p);
+                *st_out = st;
+                found = true;
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            found = scan_inode_dir(p, dev, ino, out, st_out, depth + 1);
+        }
+    }
+    real_closedir(d);
+    return found;
+}
+
+static bool find_inode_path(dev_t dev, ino_t ino, char *out, struct stat *st_out)
+{
+    for (int fd = 0; fd < MAX_FDS; fd++) {
+        if (!fdpath[fd] || fddev[fd] != dev || fdino[fd] != ino)
+            continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_dev != dev || st.st_ino != ino)
+            continue;
+        if (st.st_nlink == 0)
+            return false; /* unlinked everywhere: no directory entry remains */
+        if (stat(fdpath[fd], &st) == 0 && st.st_dev == dev && st.st_ino == ino) {
+            snprintf(out, PATH_MAX, "%s", fdpath[fd]);
+            *st_out = st;
+            return true;
+        }
+    }
+    return scan_inode_dir(root, dev, ino, out, st_out, 0);
+}
+
+/* Resolves `f` to a live path and stat: uses f->path if still valid, else relocates via open descriptors or root scan. */
+static bool file_stat_path(file *f, struct stat *st, char *out)
+{
+    if (f->path[0] && stat(f->path, st) == 0 && st->st_dev == f->dev && st->st_ino == f->ino) {
+        snprintf(out, PATH_MAX, "%s", f->path);
+        return true;
+    }
+    if (find_inode_path(f->dev, f->ino, out, st)) {
+        snprintf(f->path, PATH_MAX, "%s", out);
+        return true;
+    }
+    return false;
 }
 
 /* The file behind a tracked descriptor, found by the identity of its inode: the name the descriptor was opened under may have been
@@ -650,6 +720,40 @@ static bool keep_aside(const char *path, char *saved)
     return real_rename(path, saved) == 0;
 }
 
+/* Moves an empty directory aside so an unsynced rmdir / unlinkat(..., AT_REMOVEDIR) can roll back. */
+static bool keep_dir_aside(const char *path, char *saved)
+{
+    if (!strcmp(path, root))
+        return false;
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    if (!strcmp(base, ".") || !strcmp(base, ".."))
+        return false;
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+        return false;
+    DIR *d = opendir(path);
+    if (!d)
+        return false;
+    bool empty = true;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
+            empty = false;
+            break;
+        }
+    }
+    real_closedir(d);
+    if (!empty)
+        return false;
+    char dir[PATH_MAX];
+    dir_of(path, dir);
+    int n = snprintf(saved, PATH_MAX, "%s/.crashfs_saved_%d_%u", dir, (int)getpid(), saved_counter++);
+    if (n < 0 || n >= PATH_MAX)
+        return false;
+    return real_rename(path, saved) == 0;
+}
+
 /* open(O_TRUNC) of a durable file (round 14; VERIFY13 finding 2). The file stays the same file (its name and its inode: a
  * descriptor, a hard link or a mapping that another party holds sees what a truncation does, never a new file). What it holds
  * from then on is new content, none of it durable until the file is synced: an fsync of the descriptor makes the truncation and
@@ -793,8 +897,8 @@ static void rm_tree(const char *p)
             rm_tree(c);
         }
         if (d)
-            closedir(d);
-        rmdir(p);
+            real_closedir(d);
+        real_rmdir(p);
     } else {
         real_unlink(p);
     }
@@ -853,6 +957,18 @@ static bool name_cut(char **cut, size_t ncut, const char *name)
     return false;
 }
 
+static bool name_inside_cut(char **cut, size_t ncut, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (!n)
+        return false;
+    for (size_t i = 0; i < ncut; i++) {
+        if (!strncmp(dir, cut[i], n) && cut[i][n] == '/')
+            return true;
+    }
+    return false;
+}
+
 static void tear_dirops(void)
 {
     char **cut = malloc((2 * ndops + 1) * sizeof *cut);
@@ -860,7 +976,7 @@ static void tear_dirops(void)
     if (!cut)
         return;
     /* oldest first: each not durable op is kept at random (or all but the chosen one), unless an earlier one on its names
-     * was undone */
+     * was undone (including the source of an undone link, or an entry inside a removed directory) */
     long nth = 0;
     for (size_t i = 0; i < ndops; i++) {
         dirop *d = &dops[i];
@@ -869,18 +985,39 @@ static void tear_dirops(void)
         char srcdir[PATH_MAX];
         dir_of(d->a, srcdir);
         bool forced = name_cut(cut, ncut, d->a) || name_cut(cut, ncut, d->b) || name_cut(cut, ncut, srcdir) ||
-                      name_cut(cut, ncut, d->dir);
+                      name_cut(cut, ncut, d->dir) || (d->kind == OP_RMDIR && name_inside_cut(cut, ncut, d->a));
         bool keep = undo_one >= 0 ? nth != undo_one : urand() < 0.5;
         nth++;
         if (!forced && keep) {
             d->done = true; /* reached the disk after all */
             tear_kept++;
+            if (d->kind == OP_RENAME) {
+                for (size_t k = 0; k < ncut; k++) {
+                    char tmp[PATH_MAX];
+                    snprintf(tmp, sizeof tmp, "%s", cut[k]);
+                    rekey(tmp, d->a, d->b);
+                    if (strcmp(tmp, cut[k]) != 0) {
+                        char *r = strdup(tmp);
+                        if (r) {
+                            free(cut[k]);
+                            cut[k] = r;
+                        }
+                    }
+                }
+            }
             continue;
         }
-        cut[ncut++] = d->a;
-        if (d->b[0])
-            cut[ncut++] = d->b;
+        char *ca = strdup(d->a);
+        if (ca)
+            cut[ncut++] = ca;
+        if (d->b[0]) {
+            char *cb = strdup(d->b);
+            if (cb)
+                cut[ncut++] = cb;
+        }
     }
+    for (size_t k = 0; k < ncut; k++)
+        free(cut[k]);
     free(cut);
     if (undo_count[0]) { /* raw calls: the lock is held and the shim's own open would track the file */
         char line[32];
@@ -910,13 +1047,14 @@ static void rollback(void)
 {
     if (tear)
         tear_dirops(); /* the survivors among the directory operations are known before the files are cut back */
-    /* file data first, by each file's current name */
+    /* file data first, by each file's current live path (relocating if a hard link was unlinked) */
     for (size_t i = 0; i < nfiles; i++) {
         file *f = &files[i];
         struct stat st;
-        if (!f->used || stat(f->path, &st) != 0 || st.st_ino != f->ino)
+        char fpath[PATH_MAX];
+        if (!f->used || !file_stat_path(f, &st, fpath))
             continue;
-        int fd = real_open(f->path, O_WRONLY);
+        int fd = real_open(fpath, O_WRONLY);
         if (fd < 0)
             continue;
         if (f->tsave && (!tear || (!tsave_carried(f) && urand() < 0.5))) { /* the truncation was never synced: undone (with CRASHFS_TEAR, or the new content torn) */
@@ -962,7 +1100,10 @@ static void rollback(void)
         op_now(i, d->saved, d->saved);
         d->undone = true;
         switch (d->kind) {
-        case OP_CREATE: real_unlink(d->a); break;
+        case OP_CREATE:
+        case OP_LINK:
+            real_unlink(d->a);
+            break;
         case OP_MKDIR: rm_tree(d->a); break;
         case OP_RENAME:
             real_rename(d->b, d->a);
@@ -970,6 +1111,7 @@ static void rollback(void)
                 real_rename(d->saved, d->b);
             break;
         case OP_UNLINK:
+        case OP_RMDIR:
             if (d->saved[0])
                 real_rename(d->saved, d->a);
             break;
@@ -977,8 +1119,11 @@ static void rollback(void)
     }
     /* entries made durable that were kept aside: really gone now */
     for (size_t i = 0; i < ndops; i++)
-        if (dops[i].done && dops[i].saved[0])
-            rm_tree(dops[i].saved);
+        if (dops[i].done && dops[i].saved[0]) {
+            char snow[PATH_MAX];
+            op_now(i, dops[i].saved, snow);
+            rm_tree(snow);
+        }
     for (size_t i = 0; i < nfiles; i++)
         tsave_drop(&files[i]);
 }
@@ -1078,6 +1223,13 @@ __attribute__((destructor)) static void fini(void)
     if (!eio_done && !(loss_at_exit && active)) {
         for (size_t i = 0; i < nfiles; i++) /* no power loss: the copies kept for one are not left in the directory */
             tsave_drop(&files[i]);
+        for (size_t i = 0; active && i < ndops; i++)
+            if (!dops[i].done && dops[i].saved[0]) {
+                char snow[PATH_MAX];
+                op_now(i, dops[i].saved, snow);
+                rm_tree(snow);
+                dops[i].saved[0] = 0;
+            }
         return;
     }
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
@@ -1621,6 +1773,23 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
 
 void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) __attribute__((alias("mmap")));
 
+static void drop_saved_op(size_t i)
+{
+    if ((dops[i].kind != OP_UNLINK && dops[i].kind != OP_RMDIR && dops[i].kind != OP_RENAME) || !dops[i].saved[0])
+        return;
+    /* the unlink/rename/rmdir is durable: the copy kept aside goes now, not at the power loss, so the directory
+     * can be emptied and removed in the process (test_snapshot: an install removes v<N>.old). Its
+     * inode may be freed and given to a new file: the record goes with its last name (a file
+     * still open, or linked elsewhere, gets a new record, durable as it is, at its next use) */
+    struct stat sst;
+    char snow[PATH_MAX];
+    op_now(i, dops[i].saved, snow);
+    if (lstat(snow, &sst) == 0 && S_ISREG(sst.st_mode) && sst.st_nlink == 1)
+        record_drop(sst.st_dev, sst.st_ino);
+    rm_tree(snow);
+    dops[i].saved[0] = 0;
+}
+
 static int do_sync(int fd, bool data_only)
 {
     if (!fd_tracked(fd) || md_mode)
@@ -1645,25 +1814,17 @@ static int do_sync(int fd, bool data_only)
             for (size_t i = 0; i < ndops; i++)
                 if (!dops[i].done && (op_now(i, dops[i].dir, now), !strcmp(now, fdpath[fd]))) {
                     dops[i].done = true;
-                    if (dops[i].kind == OP_UNLINK && dops[i].saved[0]) {
-                        /* the unlink is durable: the copy kept aside goes now, not at the power loss, so the directory
-                         * can be emptied and removed in the process (test_snapshot: an install removes v<N>.old). Its
-                         * inode may be freed and given to a new file: the record goes with its last name (a file
-                         * still open, or linked elsewhere, gets a new record, durable as it is, at its next use) */
-                        struct stat sst;
-                        if (lstat(dops[i].saved, &sst) == 0 && S_ISREG(sst.st_mode) && sst.st_nlink == 1)
-                            record_drop(sst.st_dev, sst.st_ino);
-                        rm_tree(dops[i].saved);
-                        dops[i].saved[0] = 0;
-                    }
-                    if (dops[i].kind == OP_RENAME && dops[i].a[0]) {
-                        /* the old name is gone for good too, if it was in another dir */
-                    }
+                    drop_saved_op(i);
                 }
             for (size_t i = 0; i < nfiles; i++) { /* the transaction that carries a truncation commits with the directory's sync */
-                char fdir[PATH_MAX];
-                dir_of(files[i].path, fdir);
-                if (files[i].used && files[i].tsave && !strcmp(fdir, fdpath[fd]))
+                struct stat fst;
+                char fpath[PATH_MAX], fdir[PATH_MAX];
+                if (!files[i].used || !files[i].tsave)
+                    continue;
+                if (!file_stat_path(&files[i], &fst, fpath))
+                    continue;
+                dir_of(fpath, fdir);
+                if (!strcmp(fdir, fdpath[fd]))
                     tsave_drop(&files[i]);
             }
         } else {
@@ -1700,7 +1861,9 @@ int syncfs(int fd)
         for (size_t i = 0; i < nfiles; i++) {
             file *f = &files[i];
             struct stat st;
-            if (f->used && !f->lying && stat(f->path, &st) == 0 && st.st_dev == fs.st_dev && st.st_ino == f->ino) {
+            char fpath[PATH_MAX];
+            if (f->used && !f->lying && file_stat_path(f, &st, fpath) && st.st_dev == fs.st_dev &&
+                st.st_ino == f->ino) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
                 f->nold = 0;
@@ -1710,8 +1873,10 @@ int syncfs(int fd)
         for (size_t i = 0; i < ndops; i++) {
             struct stat st;
             if (!dops[i].done && !(lying_dir[0] && !strcmp(lying_dir, dops[i].dir)) &&
-                (stat(dops[i].dir, &st) != 0 || st.st_dev == fs.st_dev))
+                (stat(dops[i].dir, &st) != 0 || st.st_dev == fs.st_dev)) {
                 dops[i].done = true;
+                drop_saved_op(i);
+            }
         }
     }
     pthread_mutex_unlock(&lock);
@@ -1727,6 +1892,13 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
         return at ? real_renameat(ofd, oldp, nfd, newp) : real_rename(oldp, newp);
     pthread_mutex_lock(&lock);
     maybe_crash();
+    struct stat sa, sb;
+    if (lstat(a, &sa) == 0 && lstat(b, &sb) == 0 && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) {
+        /* POSIX: rename between two hard links of the same inode is a no-op */
+        int r = at ? real_renameat(ofd, oldp, nfd, newp) : real_rename(oldp, newp);
+        pthread_mutex_unlock(&lock);
+        return r;
+    }
     char saved[PATH_MAX] = "";
     struct stat st;
     if (stat(b, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -1803,13 +1975,23 @@ static int do_unlink(int dirfd, const char *name, int flags, bool at)
 {
     char p[PATH_MAX];
     path_of_at(at ? dirfd : AT_FDCWD, name, p);
-    if (!tracked(p) || (flags & AT_REMOVEDIR))
-        return at ? real_unlinkat(dirfd, name, flags) : real_unlink(name);
+    if (!tracked(p) || (at && (flags & ~AT_REMOVEDIR) != 0))
+        return at ? real_unlinkat(dirfd, name, flags) : (flags & AT_REMOVEDIR) ? real_rmdir(name) : real_unlink(name);
     pthread_mutex_lock(&lock);
     maybe_crash();
     char saved[PATH_MAX];
     int r;
-    if (keep_aside(p, saved)) {
+    if (flags & AT_REMOVEDIR) {
+        size_t plen = strlen(p);
+        while (plen > 1 && p[plen - 1] == '/')
+            p[--plen] = '\0';
+        if (keep_dir_aside(p, saved)) {
+            add_dirop(OP_RMDIR, p, NULL, saved);
+            r = 0;
+        } else {
+            r = at ? real_unlinkat(dirfd, name, flags) : real_rmdir(name);
+        }
+    } else if (keep_aside(p, saved)) {
         add_dirop(OP_UNLINK, p, NULL, saved);
         r = 0;
     } else {
@@ -1820,23 +2002,32 @@ static int do_unlink(int dirfd, const char *name, int flags, bool at)
 }
 
 int unlink(const char *name) { return do_unlink(AT_FDCWD, name, 0, false); }
+int rmdir(const char *name) { return do_unlink(AT_FDCWD, name, AT_REMOVEDIR, false); }
 
 /* link and linkat (round 16, VERIFY15): a new hard link is a new directory entry, durable only after an fsync of its directory,
  * like a created file (a leader links its COMMIT's pending parts to stage_ names and syncs the directory before the marker is
- * written: src/replica.c). A power loss undoes it (OP_CREATE: the new name is unlinked; the file stays under its other names and
- * keeps its data). Not tracked before: a link never synced always survived. The file's record keeps the name it had (the rollback
- * of its data finds it by that name or by the last one a rename gave it). */
+ * written: src/replica.c). A power loss undoes it (OP_LINK: the new name is unlinked; the file stays under its other names and
+ * keeps its data). Recording the source path lets tear mode keep per-link ordering so undoing link(a, l) forces a later
+ * unlink(a) to be undone too. */
 static int do_link(int ofd, const char *a, int nfd, const char *b, int flags)
 {
-    char pb[PATH_MAX];
+    char pa[PATH_MAX] = "", pb[PATH_MAX];
     path_of_at(nfd, b, pb);
     if (!tracked(pb))
         return (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
+    if (a && a[0]) {
+        path_of_at(ofd, a, pa);
+    } else if ((flags & AT_EMPTY_PATH) && ofd >= 0) {
+        char linkfd[64];
+        snprintf(linkfd, sizeof linkfd, "/proc/self/fd/%d", ofd);
+        ssize_t n = readlink(linkfd, pa, sizeof pa - 1);
+        pa[n > 0 ? n : 0] = '\0';
+    }
     pthread_mutex_lock(&lock);
     maybe_crash();
     int r = (int)syscall(SYS_linkat, ofd, a, nfd, b, flags);
     if (r == 0)
-        add_dirop(OP_CREATE, pb, NULL, NULL);
+        add_dirop(OP_LINK, pb, pa[0] ? pa : NULL, NULL);
     pthread_mutex_unlock(&lock);
     return r;
 }
