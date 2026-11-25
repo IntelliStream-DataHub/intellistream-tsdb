@@ -29,7 +29,9 @@ bad=
 for m in $muts; do
     case $m in
     fwdoldframe) sc=forward pat='a write held 1.5 s at the entry' ;;
-    fwdunavonbreak) sc=forward pat='owner was killed before it answered' ;;
+    # the read-link case (a FWDQ write the owner refuses by closing the link) is the same written-and-lost path and
+    # runs first in forward: either line is this mutant's
+    fwdunavonbreak) sc=forward pat='owner was killed before it answered\|a write sent on the read link: error -11' ;;
     fwdnouser) sc=forward pat="alice's write outside her grant" ;;
     fwdnowait) sc=forward pat='while two forwards waited on a stopped owner' ;;
     fwdauthlag) sc=forward pat='users lagged: error -17' ;;

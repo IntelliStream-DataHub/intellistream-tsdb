@@ -1079,11 +1079,13 @@ static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8
         for (struct cs_pend *q = cs->pend; q; q = q->next)
             if (q->rid == r.rid && !q->done) {
                 if (q->op != r.op && chunksrv_mutant != CS_MUT_NOOPMATCH) {
-                    /* another call's answer (a changed rid or op): neither call takes it, the link ends */
+                    /* another call's answer (a changed rid or op): neither call takes it, the link ends. The
+                     * call's op is copied under cmu: once it is let go of, the caller may free q */
+                    unsigned qop = q->op;
                     pthread_mutex_unlock(&cs->cmu);
                     STAT(cs, answer_mismatch);
                     fprintf(stderr, "tsdbd: chunk link from node %" PRIu32 ": an answer of op %u for a call of op %u: "
-                            "link ended\n", plink_peer(l), r.op, q->op);
+                            "link ended\n", plink_peer(l), r.op, qop);
                     plink_reset(l);
                     return;
                 }
