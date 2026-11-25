@@ -1,0 +1,531 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/*
+ * A fake verbs fabric behind struct plr_ops (server/plrdma.h), for tests/test_plrdma.c (docs/design-rdma.md §8): RC
+ * queue pairs that deliver SENDs into the peer's posted receives, completion queues with a completion channel each (a
+ * pipe that gets a byte when an armed CQ gets an entry, as ibv_req_notify_cq: an entry already there raises nothing),
+ * and a fabric thread that executes posted sends some 50 µs later, as a NIC does, so a slot reused too early is read
+ * after the change. It is strict where the hardware runs with rnr_retry 0 (the tests' setting) or where iWARP is: a
+ * SEND that finds no posted receive fails the sender's queue pair at once (status ERR, everything else flushed), so a
+ * credit bug is an error, never a stall. It checks what the hardware cannot report: a buffer posted while a work
+ * request still holds it, a slot the pool takes back while a work request holds it (pfk_owned, called from the pool's
+ * test hook), a queue pair destroyed with work requests outstanding, numbers (LID, QPN, PSNs) that do not match the
+ * peer's, a message longer than the receive. Each is counted in `violations` with a line.
+ *
+ * Faults to plant: the n-th send fails (`err_send_at`), a queue pair fails now (pfk_fail_qp: a port that went away),
+ * registration, queue pair creation, the move to RTS or the device's open fails.
+ */
+#ifndef TSDB_PLR_FAKE_H
+#define TSDB_PLR_FAKE_H
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "plrdma.h"
+
+#define PFK_QPS 128
+#define PFK_WRS 1024
+#define PFK_CQ 4096
+
+struct pfk_wr {
+    uint64_t id;
+    uint8_t *p;
+    uint32_t n;
+    int sig;
+    uint64_t tick; /* the fabric tick it was posted in: executed only on a later one */
+};
+
+struct pfk_fifo {
+    struct pfk_wr w[PFK_WRS];
+    int head, n;
+};
+
+struct plr_dev {
+    struct pfk_fab *f;
+    struct plr_port port;
+};
+
+struct plr_mr {
+    struct plr_dev *d;
+    uint8_t *p;
+    size_t n;
+    uint32_t lkey;
+};
+
+struct plr_qp {
+    struct pfk_fab *f;
+    struct plr_dev *d;
+    int used, state; /* 0 INIT, 1 RTS, 2 ERR */
+    uint32_t qpn, sq_psn;
+    struct plr_qp_attr a;
+    struct pfk_fifo sq, rq;
+    struct pfk_fifo held; /* sends executed whose buffers the NIC may still hold: until a later signalled completion */
+    struct plr_wc cq[PFK_CQ];
+    int cq_head, cq_n, armed;
+    int ev[2]; /* the completion channel */
+};
+
+struct pfk_fab {
+    pthread_mutex_t mu;
+    pthread_t th;
+    _Atomic int stop, hold; /* hold: the NIC executes nothing meanwhile */
+    uint64_t tick;
+    uint16_t next_lid;
+    uint32_t next_qpn, next_key;
+    struct plr_qp qp[PFK_QPS];
+    struct plr_mr *mrs[16];
+    /* faults */
+    long err_send_at; /* > 0: the send executed as number err_send_at (from 1) completes with status ERR */
+    long sends;       /* sends executed */
+    int fail_reg, fail_qp_new, fail_rts, fail_dev;
+    /* findings */
+    _Atomic int violations;
+    long rnr, delivered;
+};
+
+static struct pfk_fab *pfk_cur; /* the ops have no context argument for dev_open: the fabric the test made */
+
+static void pfk_violation(struct pfk_fab *f, const char *what)
+{
+    fprintf(stderr, "plr_fake: VIOLATION: %s\n", what);
+    atomic_fetch_add(&f->violations, 1);
+}
+
+static void pfk_push(struct pfk_fifo *q, struct pfk_wr w)
+{
+    q->w[(q->head + q->n) % PFK_WRS] = w;
+    q->n++;
+}
+
+static struct pfk_wr pfk_pop(struct pfk_fifo *q)
+{
+    struct pfk_wr w = q->w[q->head];
+    q->head = (q->head + 1) % PFK_WRS;
+    q->n--;
+    return w;
+}
+
+static int pfk_overlaps(const struct pfk_fifo *q, const uint8_t *p, size_t n)
+{
+    for (int i = 0; i < q->n; i++) {
+        const struct pfk_wr *w = &q->w[(q->head + i) % PFK_WRS];
+        if (w->p && w->n && w->p < p + n && p < w->p + w->n)
+            return 1;
+    }
+    return 0;
+}
+
+/* some work request of the fabric holds bytes of [p, p + n): a posted one, or a send whose completion was not seen */
+static int pfk_owned_locked(struct pfk_fab *f, const uint8_t *p, size_t n)
+{
+    for (int i = 0; i < PFK_QPS; i++) {
+        struct plr_qp *q = &f->qp[i];
+        if (q->used && (pfk_overlaps(&q->sq, p, n) || pfk_overlaps(&q->rq, p, n) || pfk_overlaps(&q->held, p, n)))
+            return 1;
+    }
+    return 0;
+}
+
+static int pfk_owned(struct pfk_fab *f, const void *p, size_t n)
+{
+    pthread_mutex_lock(&f->mu);
+    int r = pfk_owned_locked(f, p, n);
+    pthread_mutex_unlock(&f->mu);
+    return r;
+}
+
+static void pfk_wc_locked(struct plr_qp *q, uint64_t id, int op, int status, uint32_t len)
+{
+    if (q->cq_n == PFK_CQ) {
+        pfk_violation(q->f, "a completion queue overflowed");
+        return;
+    }
+    q->cq[(q->cq_head + q->cq_n) % PFK_CQ] = (struct plr_wc){id, op, status, len, status};
+    q->cq_n++;
+    if (q->armed) {
+        q->armed = 0;
+        if (write(q->ev[1], "", 1) < 0) {
+            /* full: an event is pending */
+        }
+    }
+}
+
+/* the queue pair fails: everything posted comes back flushed (every send gets a completion then) */
+static void pfk_qp_err_locked(struct plr_qp *q)
+{
+    q->state = 2;
+    while (q->sq.n) {
+        struct pfk_wr w = pfk_pop(&q->sq);
+        pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_FLUSH, 0);
+    }
+    while (q->rq.n) {
+        struct pfk_wr w = pfk_pop(&q->rq);
+        pfk_wc_locked(q, w.id, PLR_WC_RECV, PLR_WC_FLUSH, 0);
+    }
+    q->held.n = 0; /* their completions were made: the NIC holds nothing more */
+}
+
+static struct plr_qp *pfk_find_locked(struct pfk_fab *f, uint32_t qpn)
+{
+    for (int i = 0; i < PFK_QPS; i++)
+        if (f->qp[i].used && f->qp[i].qpn == qpn)
+            return &f->qp[i];
+    return NULL;
+}
+
+/* execute the sends posted before this tick */
+static void pfk_step_locked(struct pfk_fab *f)
+{
+    f->tick++;
+    for (int i = 0; i < PFK_QPS; i++) {
+        struct plr_qp *q = &f->qp[i];
+        while (q->used && q->state == 1 && q->sq.n && q->sq.w[q->sq.head].tick < f->tick - 1) {
+            struct pfk_wr w = pfk_pop(&q->sq);
+            struct plr_qp *r = pfk_find_locked(f, q->a.qpn);
+            f->sends++;
+            if (f->err_send_at > 0 && f->sends == f->err_send_at) {
+                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0);
+                pfk_qp_err_locked(q);
+                break;
+            }
+            if (!r || r->state != 1 || r->d->port.lid != q->a.lid || r->a.qpn != q->qpn || q->a.rq_psn != r->sq_psn ||
+                r->a.rq_psn != q->sq_psn) { /* no such peer, or packets it drops: the retries run out */
+                if (r && r->state == 1)
+                    pfk_violation(f, "a queue pair connected with numbers that are not its peer's");
+                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0);
+                pfk_qp_err_locked(q);
+                break;
+            }
+            if (!r->rq.n) { /* rnr_retry 0, or iWARP: no receive posted fails the sender */
+                f->rnr++;
+                fprintf(stderr, "plr_fake: a SEND found no posted receive (RNR): queue pair %u failed\n",
+                        (unsigned)q->qpn);
+                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0);
+                pfk_qp_err_locked(q);
+                break;
+            }
+            struct pfk_wr rw = pfk_pop(&r->rq);
+            if (w.n > rw.n) {
+                pfk_violation(f, "a message longer than the receive slot");
+                pfk_wc_locked(r, rw.id, PLR_WC_RECV, PLR_WC_ERR, 0);
+                pfk_qp_err_locked(r);
+                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_ERR, 0);
+                pfk_qp_err_locked(q);
+                break;
+            }
+            memcpy(rw.p, w.p, w.n);
+            f->delivered++;
+            pfk_wc_locked(r, rw.id, PLR_WC_RECV, PLR_WC_OK, w.n);
+            if (w.sig) {
+                q->held.n = 0; /* a signalled completion: every send before it is done too */
+                pfk_wc_locked(q, w.id, PLR_WC_SEND, PLR_WC_OK, 0);
+            } else
+                pfk_push(&q->held, w);
+        }
+    }
+}
+
+static void *pfk_thread(void *arg)
+{
+    struct pfk_fab *f = arg;
+    while (!atomic_load(&f->stop)) {
+        pthread_mutex_lock(&f->mu);
+        if (!atomic_load(&f->hold))
+            pfk_step_locked(f);
+        pthread_mutex_unlock(&f->mu);
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static struct pfk_fab *pfk_new(void)
+{
+    struct pfk_fab *f = calloc(1, sizeof *f);
+    pthread_mutex_init(&f->mu, NULL);
+    f->next_lid = 7;
+    f->next_qpn = 0x400;
+    f->next_key = 0x1000;
+    pfk_cur = f;
+    pthread_create(&f->th, NULL, pfk_thread, f);
+    return f;
+}
+
+static void pfk_free(struct pfk_fab *f)
+{
+    atomic_store(&f->stop, 1);
+    pthread_join(f->th, NULL);
+    for (int i = 0; i < PFK_QPS; i++)
+        if (f->qp[i].used) {
+            close(f->qp[i].ev[0]);
+            close(f->qp[i].ev[1]);
+        }
+    pthread_mutex_destroy(&f->mu);
+    if (pfk_cur == f)
+        pfk_cur = NULL;
+    free(f);
+}
+
+/* a port goes away under queue pair qpn (0: every queue pair) */
+static void pfk_fail_qp(struct pfk_fab *f, uint32_t qpn)
+{
+    pthread_mutex_lock(&f->mu);
+    for (int i = 0; i < PFK_QPS; i++)
+        if (f->qp[i].used && (!qpn || f->qp[i].qpn == qpn) && f->qp[i].state != 2)
+            pfk_qp_err_locked(&f->qp[i]);
+    pthread_mutex_unlock(&f->mu);
+}
+
+/* sends posted on queue pair qpn and not yet executed */
+static int pfk_sq_posted(struct pfk_fab *f, uint32_t qpn)
+{
+    pthread_mutex_lock(&f->mu);
+    struct plr_qp *q = pfk_find_locked(f, qpn);
+    int n = q ? q->sq.n : 0;
+    pthread_mutex_unlock(&f->mu);
+    return n;
+}
+
+static int pfk_live_qps(struct pfk_fab *f)
+{
+    pthread_mutex_lock(&f->mu);
+    int n = 0;
+    for (int i = 0; i < PFK_QPS; i++)
+        n += f->qp[i].used;
+    pthread_mutex_unlock(&f->mu);
+    return n;
+}
+
+/* ------------------------------------------------------------------------------------------------- the ops */
+
+static int pfk_dev_open(const char *dev, int port, struct plr_dev **d, struct plr_port *pi, char *err, size_t errlen)
+{
+    struct pfk_fab *f = pfk_cur;
+    (void)dev;
+    if (!f || f->fail_dev) {
+        snprintf(err, errlen, "RDMA: no active InfiniBand port (fake)");
+        errno = ENODEV;
+        return -1;
+    }
+    struct plr_dev *x = calloc(1, sizeof *x);
+    x->f = f;
+    pthread_mutex_lock(&f->mu);
+    x->port.lid = f->next_lid++;
+    pthread_mutex_unlock(&f->mu);
+    x->port.gid[0] = 0xfe;
+    x->port.gid[1] = 0x80;
+    x->port.gid[15] = (uint8_t)x->port.lid;
+    x->port.mtu = 5;
+    x->port.link_layer = PLR_LL_IB;
+    x->port.port = (uint8_t)(port ? port : 1);
+    *d = x;
+    *pi = x->port;
+    return 0;
+}
+
+static void pfk_dev_close(struct plr_dev *d) { free(d); }
+
+static struct plr_mr *pfk_reg(struct plr_dev *d, void *p, size_t n, uint32_t *lkey)
+{
+    if (d->f->fail_reg) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    struct plr_mr *m = calloc(1, sizeof *m);
+    m->d = d;
+    m->p = p;
+    m->n = n;
+    pthread_mutex_lock(&d->f->mu);
+    m->lkey = d->f->next_key++;
+    for (int i = 0; i < 16; i++)
+        if (!d->f->mrs[i]) {
+            d->f->mrs[i] = m;
+            break;
+        }
+    pthread_mutex_unlock(&d->f->mu);
+    *lkey = m->lkey;
+    return m;
+}
+
+static void pfk_dereg(struct plr_mr *m)
+{
+    struct pfk_fab *f = m->d->f;
+    pthread_mutex_lock(&f->mu);
+    for (int i = 0; i < 16; i++)
+        if (f->mrs[i] == m)
+            f->mrs[i] = NULL;
+    if (pfk_owned_locked(f, m->p, m->n))
+        pfk_violation(f, "a region deregistered while work requests hold it");
+    pthread_mutex_unlock(&f->mu);
+    free(m);
+}
+
+/* the scatter entry lies in a region of the device with that key */
+static int pfk_key_ok_locked(struct plr_qp *q, const uint8_t *p, uint32_t n, uint32_t lkey)
+{
+    if (!n)
+        return 1;
+    for (int i = 0; i < 16; i++) {
+        struct plr_mr *m = q->f->mrs[i];
+        if (m && m->d == q->d && m->lkey == lkey && p >= m->p && p + n <= m->p + m->n)
+            return 1;
+    }
+    return 0;
+}
+
+static struct plr_qp *pfk_qp_new(struct plr_dev *d, int sq, int rq, uint32_t *qpn)
+{
+    struct pfk_fab *f = d->f;
+    if (f->fail_qp_new || sq > PFK_WRS || rq > PFK_WRS) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    pthread_mutex_lock(&f->mu);
+    struct plr_qp *q = NULL;
+    for (int i = 0; i < PFK_QPS && !q; i++)
+        if (!f->qp[i].used)
+            q = &f->qp[i];
+    if (!q) {
+        pthread_mutex_unlock(&f->mu);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(q, 0, sizeof *q);
+    q->used = 1;
+    q->f = f;
+    q->d = d;
+    q->qpn = f->next_qpn++;
+    if (pipe(q->ev) < 0) {
+        q->used = 0;
+        pthread_mutex_unlock(&f->mu);
+        return NULL;
+    }
+    fcntl(q->ev[0], F_SETFL, O_NONBLOCK);
+    fcntl(q->ev[1], F_SETFL, O_NONBLOCK);
+    *qpn = q->qpn;
+    pthread_mutex_unlock(&f->mu);
+    return q;
+}
+
+static int pfk_qp_rts(struct plr_qp *q, const struct plr_qp_attr *a)
+{
+    if (q->f->fail_rts) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&q->f->mu);
+    int ok = q->state == 0;
+    if (ok) {
+        q->a = *a;
+        q->sq_psn = a->sq_psn;
+        q->state = 1;
+    }
+    pthread_mutex_unlock(&q->f->mu);
+    if (!ok)
+        errno = EINVAL;
+    return ok ? 0 : -1;
+}
+
+static int pfk_qp_err(struct plr_qp *q)
+{
+    pthread_mutex_lock(&q->f->mu);
+    pfk_qp_err_locked(q);
+    pthread_mutex_unlock(&q->f->mu);
+    return 0;
+}
+
+static void pfk_qp_free(struct plr_qp *q)
+{
+    struct pfk_fab *f = q->f;
+    pthread_mutex_lock(&f->mu);
+    if (q->sq.n || q->rq.n || q->held.n)
+        pfk_violation(f, "a queue pair destroyed with work requests outstanding (not drained)");
+    close(q->ev[0]);
+    close(q->ev[1]);
+    q->used = 0;
+    pthread_mutex_unlock(&f->mu);
+}
+
+static int pfk_fd(struct plr_qp *q) { return q->ev[0]; }
+
+static int pfk_arm(struct plr_qp *q)
+{
+    pthread_mutex_lock(&q->f->mu);
+    q->armed = 1;
+    pthread_mutex_unlock(&q->f->mu);
+    return 0;
+}
+
+static int pfk_take_events(struct plr_qp *q)
+{
+    char b[64];
+    int n = 0;
+    ssize_t r;
+    while ((r = read(q->ev[0], b, sizeof b)) > 0)
+        n += (int)r;
+    return n;
+}
+
+static int pfk_poll(struct plr_qp *q, struct plr_wc *wc, int n)
+{
+    pthread_mutex_lock(&q->f->mu);
+    int k = 0;
+    while (k < n && q->cq_n) {
+        wc[k++] = q->cq[q->cq_head];
+        q->cq_head = (q->cq_head + 1) % PFK_CQ;
+        q->cq_n--;
+    }
+    pthread_mutex_unlock(&q->f->mu);
+    return k;
+}
+
+static int pfk_post(struct plr_qp *q, int send, uint64_t id, const void *p, uint32_t n, uint32_t lkey, int sig)
+{
+    struct pfk_fab *f = q->f;
+    pthread_mutex_lock(&f->mu);
+    if (!pfk_key_ok_locked(q, p, n, lkey)) {
+        pthread_mutex_unlock(&f->mu);
+        pfk_violation(f, "a work request outside the registered region or with another key");
+        errno = EINVAL;
+        return -1;
+    }
+    if (n && pfk_owned_locked(f, p, n))
+        pfk_violation(f, "a buffer posted while another work request still holds it");
+    struct pfk_wr w = {id, (uint8_t *)p, n, sig, f->tick};
+    if (q->state == 2) /* posted to a queue pair in error: flushed at once (how the drain's markers come back) */
+        pfk_wc_locked(q, id, send ? PLR_WC_SEND : PLR_WC_RECV, PLR_WC_FLUSH, 0);
+    else if ((send ? q->sq.n : q->rq.n) == PFK_WRS) {
+        pthread_mutex_unlock(&f->mu);
+        errno = ENOMEM;
+        return -1;
+    } else if (send && q->state != 1) {
+        pthread_mutex_unlock(&f->mu);
+        errno = EINVAL;
+        return -1;
+    } else
+        pfk_push(send ? &q->sq : &q->rq, w);
+    pthread_mutex_unlock(&f->mu);
+    return 0;
+}
+
+static int pfk_post_send(struct plr_qp *q, uint64_t id, const void *p, uint32_t n, uint32_t lkey, int sig)
+{
+    return pfk_post(q, 1, id, p, n, lkey, sig);
+}
+
+static int pfk_post_recv(struct plr_qp *q, uint64_t id, void *p, uint32_t n, uint32_t lkey)
+{
+    return pfk_post(q, 0, id, p, n, lkey, 1);
+}
+
+static const struct plr_ops pfk_ops = {"fake",   pfk_dev_open, pfk_dev_close, pfk_reg,  pfk_dereg,
+                                       pfk_qp_new, pfk_qp_rts, pfk_qp_err,    pfk_qp_free, pfk_fd,
+                                       pfk_arm,  pfk_take_events, pfk_poll,   pfk_post_send, pfk_post_recv};
+
+#endif
