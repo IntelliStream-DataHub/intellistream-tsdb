@@ -63,7 +63,8 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # JEPSEN_SECONDS, JEPSEN_NEMESES, JEPSEN_SEED,
                           # JEPSEN_NODES, both IO backends; tests/jepsen/jepsen_cluster.c; make jepsen-cluster-selftest plants what it must catch (not part of jepsen-cluster)
                           # (kv/classes: the nemeses aim at kvr's leader too, the clients roam and follow MOVED to it; JEPSEN_TERMINAL=name
-                          # picks the run's terminal crash point, failover points included; JEPSEN_TRACE=1 stamps the nemesis's
+                          # picks the run's terminal crash point, failover points included; JEPSEN_SETUP_MOVE=1 transfers kvr right after its first series: the kv setup follows a moved leader,
+                          # and a setup that cannot create its series is exit 2; JEPSEN_TRACE=1 stamps the nemesis's
                           # actions and kvr's leader changes in ms and details the first stale reads)
                           # R4's nemeses (header of jepsen_cluster.c; the one a track has not put on main is refused with a line, exit 2,
                           # `jepsen_cluster --built-nemeses` lists the others, JEPSEN_R4_TRY=1 runs it anyway): kill2 (two servers at

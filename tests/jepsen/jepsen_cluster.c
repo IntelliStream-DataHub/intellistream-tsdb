@@ -1764,6 +1764,10 @@ struct fbatch {
 static struct fbatch *fb;
 static size_t nfb, cfb;
 
+static int rep_leader_refresh(void);
+static void rep_setup_move(void);
+static int admin_any(int op, const void *req, size_t rl, int timeout_ms);
+
 static void rep_setup(void)
 {
     uint8_t req[META_NAME_MAX + 8];
@@ -1812,7 +1816,11 @@ static void rep_setup(void)
             hist_node[i] = rep_leader;
             pthread_mutex_init(&hists[i].mu, NULL);
         }
-        for (int64_t t1 = now_ms();; usleep(100000)) { /* the leader promotes itself once its EPOCH marker commits */
+        /* The leader promotes itself once its EPOCH marker commits. Before the workload starts a member that has not yet
+         * heard the leader (a slow start of many nodes) may report it unreachable and the group moves the leadership
+         * (PLANNED): MOVED, or no answer from the old leader, then re-reads the record and goes to the new leader, within
+         * the same bound. A setup that cannot create its series in 30 s is a harness failure (2), not a wrong answer. */
+        for (int64_t t1 = now_ms();; usleep(100000)) {
             tsdbc *c = NULL;
             tsdb_sid sid = 0;
             rc = connect_node(rep_leader, 1, &c);
@@ -1825,10 +1833,18 @@ static void rep_setup(void)
                     hist_sid[i] = sid;
                 break;
             }
-            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND) || now_ms() - t1 > 30000)
-                die(1, "kv: cannot create %s in kvr on its leader (node %d): %s", names[i], rep_leader, tsdbc_strerror(rc));
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_NOTFOUND && rc != TSDB_ERR_MOVED) || now_ms() - t1 > 30000)
+                die(2, "kv setup: cannot create %s in kvr on its leader (node %d): %s", names[i], rep_leader,
+                    tsdbc_strerror(rc));
+            if (rep_leader_refresh())
+                t1 = now_ms(); /* a new leader: its own 30 s for its promotion */
         }
+        if (i == 0)
+            rep_setup_move();
     }
+    for (int i = 0; i < REP_HISTS; i++)
+        hist_node[i] = rep_leader; /* the leader may have moved since the first series */
+    (void)rep_leader_refresh();
     kv_roam = 1;
     printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d; clients on random "
            "members, moved to it\n", rep_number, rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
@@ -1908,6 +1924,49 @@ static int rep_rec_get(struct rrec *o)
         view_free(&v);
     }
     return have ? 0 : -1;
+}
+
+/* rep_setup: kvr's leader as the highest record among the running nodes' copies names it. 1 when it is another node
+ * than rep_leader (rep_leader, kv_epoch and kv_leader follow it; epochs only grow). */
+static int rep_leader_refresh(void)
+{
+    struct rrec r;
+    if (rep_rec_get(&r) != 0 || r.leader < 0 || r.epoch < kv_epoch || r.leader == rep_leader)
+        return 0;
+    ev("kv setup: kvr's leader moved from node %d to node %d (epoch %llu)", rep_leader, r.leader,
+       (unsigned long long)r.epoch);
+    rep_leader = r.leader;
+    kv_epoch = r.epoch;
+    atomic_store(&kv_leader, r.leader);
+    return 1;
+}
+
+/* JEPSEN_SETUP_MOVE=1 (the test of rep_setup's way round a leader change): a planned transfer of kvr to an ISR member
+ * right after the first series was created, so that the next one meets MOVED. */
+static void rep_setup_move(void)
+{
+    const char *e = getenv("JEPSEN_SETUP_MOVE");
+    if (!e || atoi(e) <= 0)
+        return;
+    struct rrec r;
+    for (int64_t t0 = now_ms(); rep_rec_get(&r) != 0 || r.leader < 0; usleep(200000))
+        if (now_ms() - t0 > 30000)
+            die(2, "JEPSEN_SETUP_MOVE: no record of kvr");
+    for (int k = 0; k < r.nrep; k++)
+        if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0 && r.node[k] != r.leader) {
+            uint8_t body[16];
+            size_t bl = cluster_volume_force_encode(rep_number, r.id[k], body);
+            int rc = admin_any(CLUSTER_OP_VOLUME_TRANSFER, body, bl, 20000);
+            ev("setup: transfer of kvr to node %d: %s", r.node[k], cluster_strerror(rc));
+            printf("jepsen-cluster: setup: transfer of kvr from node %d to node %d: %s\n", r.leader, r.node[k],
+                   cluster_strerror(rc));
+            struct rrec r2;
+            for (int64_t t0 = now_ms(); rc == 0 && now_ms() - t0 < 30000; usleep(100000))
+                if (rep_rec_get(&r2) == 0 && r2.leader == r.node[k]) /* the record names it: the old one answers MOVED */
+                    return;
+            return;
+        }
+    die(2, "JEPSEN_SETUP_MOVE: no ISR member to take kvr");
 }
 
 /* After churn kvr's replicas are the record's: the end check compares those (control thread only, as every user of
