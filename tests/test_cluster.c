@@ -56,6 +56,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 
 #define N 6
@@ -1325,30 +1328,31 @@ static void scen_dirsync(void)
  * whatever threads there are: a child of this test, the point armed, a joinable thread that has returned. 2: tsdbd's
  * chunk peer source thread (chunkpeer_cluster.c) no longer returns once the epoch source is set, so a member that
  * fail-stops after that (its next snapshot's directory fsync fails) ends with 1. */
-static atomic_int crashpt_child_ran;
+#ifdef __linux__
+static atomic_long crashpt_child_tid;
 
 static void *crashpt_child_thread(void *arg)
 {
     (void)arg;
-    atomic_store(&crashpt_child_ran, 1);
+    atomic_store(&crashpt_child_tid, (long)syscall(SYS_gettid));
     return NULL;
 }
 
 static int crashpt_child(void)
 {
-    /* the task count before the thread (a sanitizer's runtime may hold threads of its own): /proc/self/task's links */
-    struct stat st;
-    if (stat("/proc/self/task", &st) != 0)
-        return 6;
-    nlink_t before = st.st_nlink;
     pthread_t t;
     if (pthread_create(&t, NULL, crashpt_child_thread, NULL) != 0)
         return 3;
-    /* the thread has finished once the kernel has let go of it: the count is back (10 s bound: a thread that only
-     * sets a flag) */
+    /* the thread has finished once the kernel has let go of it: its /proc/self/task entry is gone (never a count of the
+     * tasks: ThreadSanitizer starts a background thread of its own at the first pthread_create; 10 s bound: a thread
+     * that only stores its id) */
     uint64_t t0 = now_ms();
     for (;;) {
-        if (atomic_load(&crashpt_child_ran) && stat("/proc/self/task", &st) == 0 && st.st_nlink == before)
+        long tid = atomic_load(&crashpt_child_tid);
+        char path[64];
+        struct stat st;
+        snprintf(path, sizeof path, "/proc/self/task/%ld", tid);
+        if (tid > 0 && stat(path, &st) != 0 && errno == ENOENT)
             break;
         if (now_ms() - t0 > 10000)
             return 4;
@@ -1358,10 +1362,12 @@ static int crashpt_child(void)
     crash_point(CP_SERVING);
     return 5; /* the point did not fire */
 }
+#endif
 
 static void scen_exitthreads(void)
 {
     scenario("exitthreads");
+#ifdef __linux__
     char self[PATH_MAX];
     ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
     if (sl <= 0)
@@ -1382,6 +1388,9 @@ static void scen_exitthreads(void)
             "report at exit)",
             st, CRASH_EXIT_STATUS);
     printf("  a crash point ends with %d beside a finished thread nobody joined\n", CRASH_EXIT_STATUS);
+#else
+    printf("  skipped: the crash point's child (a thread's /proc/self/task entry; Linux only)\n");
+#endif
 
     envs[0] = "snap_every=1,fail_snap_dirsync=2";
     start(0);
@@ -18582,8 +18591,10 @@ int main(int argc, char **argv)
     th_watchdog("test_cluster", 1800);
     if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
         return hardslot_child(argv[2]);
+#ifdef __linux__
     if (argc == 2 && !strcmp(argv[1], "crashpt-child"))
         return crashpt_child();
+#endif
     /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a run writes over a GB */
     const char *scratch = argc > 1 && *argv[1] ? argv[1] : getenv("TMPDIR");
     if (!scratch || !*scratch)
