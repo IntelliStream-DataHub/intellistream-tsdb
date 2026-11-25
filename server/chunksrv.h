@@ -105,6 +105,9 @@ struct cs_put_meta {
 size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap); /* bytes written, 0 if cap is too small */
 int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r);         /* 0, or -1 for a malformed frame */
 int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r);       /* 0 or -1 (the body is checked per op) */
+/* An answer is rid 8, op 1, rc 4, an xxh64 check 8, then the body; this writes the check of the n bytes at p (an answer
+ * built whole; tests and fuzz seeds build theirs with it). */
+void cs_resp_seal(uint8_t *p, size_t n);
 void cs_put_meta_encode(const struct cs_put_meta *m, uint8_t out[CS_PUT_META_LEN]);
 int cs_put_meta_decode(const uint8_t *p, size_t n, struct cs_put_meta *m); /* 0, or -1 (a geometry that cannot be too) */
 uint64_t cs_put_total(const struct cs_put_meta *m);                       /* the file's bytes: sums, then cells */
@@ -230,6 +233,7 @@ enum {
     CS_MUT_SUMSONLY = 7,     /* sumsonly: PUT_OK's hash covers the sums only, not the meta */
     CS_MUT_NOREQCHECK = 8,   /* noreqcheck: a request's check is not compared */
     CS_MUT_NOOPMATCH = 9,    /* noopmatch: an answer goes to the call of its rid whatever its op */
+    CS_MUT_NORESPCHECK = 10, /* norespcheck: an answer's check is not compared */
 };
 extern int chunksrv_mutant;
 extern int chunksrv_test_put_delay_ms; /* tests: the first cell of every put waits this long (a slow disk) */

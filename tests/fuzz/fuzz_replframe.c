@@ -95,8 +95,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(p, data + 2, n);
     struct cnt c = {0, p, p + n};
     if (mode == 0) {
-        struct pl_reader *r = pl_reader_new(PL_CHECK_NONE + arg % 3, SALT, 1);
-        size_t step = (size_t)arg / 3 + 1;
+        /* bit 7 of arg: verify the level's check (review F6: the header check hashes the decompressed head of any
+         * frame, so its zstd decode runs on unchecked bytes and must be safe there); else skip it and reach the
+         * decoders behind it */
+        struct pl_reader *r = pl_reader_new(PL_CHECK_NONE + (arg & 0x7f) % 3, SALT, !(arg & 0x80));
+        size_t step = (size_t)(arg & 0x7f) / 3 + 1;
         for (size_t off = 0; off < n; off += step)
             if (pl_reader_feed(r, p + off, n - off < step ? n - off : step, on_msg, &c) != 0)
                 break;
@@ -325,6 +328,19 @@ void fuzz_seeds(const char *dir)
     put_frame(dir, "seed-roundtrip-small", 2, 1, "x", 1);
     put_frame(dir, "seed-roundtrip-text-header", 2, 111 + 4, text, sizeof text);
     put_frame(dir, "seed-roundtrip-text-full", 2, 222 + 4, text, sizeof text);
+    { /* a verified stream at header (byte 1 = 0x80 | 4: verify, header, pieces of 2): two frames whose checks hold,
+       * the first compressed, so the fuzzer starts from frames that reach the check of a decompressed head */
+        uint64_t seq = 0;
+        uint8_t *f1, *f2;
+        size_t l1 = pl_frame_encode(PL_CHECK_HEADER, SALT, &seq, 1, 4, text, sizeof text, &f1);
+        size_t l2 = pl_frame_encode(PL_CHECK_HEADER, SALT, &seq, 1, 5, "x", 1, &f2);
+        uint8_t *st = l1 && l2 ? malloc(l1 + l2) : NULL;
+        if (!st)
+            abort();
+        memcpy(st, f1, l1), memcpy(st + l1, f2, l2);
+        put_frame(dir, "seed-stream-header-verified", 0, 0x80 | 4, st, l1 + l2);
+        free(st), free(f1), free(f2);
+    }
     uint8_t h[80] = {0};
     le(h, PL_CL_MAGIC, 4), h[4] = PL_CL_VERSION, le(h + 5, 2, 4), le(h + 73, 0, 2), h[75] = PL_KIND_LOG;
     h[76] = PL_CHECKS_KNOWN, h[77] = PL_CAPS;
@@ -387,11 +403,13 @@ void fuzz_seeds(const char *dir)
     cl = cs_req_encode(&cr, cb, sizeof cb);
     put_frame(dir, "seed-cs-epoch", 9, 0, cb, cl);
     memset(cb, 0, sizeof cb); /* an answer: rid 5, EPOCH, rc 0, fence 9, sure */
-    le(cb, 5, 8), cb[8] = CS_OP_EPOCH, le(cb + 13, 9, 8);
-    put_frame(dir, "seed-cs-resp-epoch", 9, 1, cb, 13 + 9);
+    le(cb, 5, 8), cb[8] = CS_OP_EPOCH, le(cb + 21, 9, 8);
+    cs_resp_seal(cb, 21 + 9);
+    put_frame(dir, "seed-cs-resp-epoch", 9, 1, cb, 21 + 9);
     memset(cb, 0, sizeof cb); /* SUMS: header of 36 bytes, 2 sums */
-    le(cb, 6, 8), cb[8] = CS_OP_SUMS, le(cb + 13 + 32, 2, 4);
-    put_frame(dir, "seed-cs-resp-sums", 9, 1, cb, 13 + 36 + 16);
+    le(cb, 6, 8), cb[8] = CS_OP_SUMS, le(cb + 21 + 32, 2, 4);
+    cs_resp_seal(cb, 21 + 36 + 16);
+    put_frame(dir, "seed-cs-resp-sums", 9, 1, cb, 21 + 36 + 16);
     struct cs_put_meta pm = {.volume = 3, .epoch = 7, .pos = 1};
     memset(pm.vuuid, 0x11, 16), memset(pm.oid, 0x22, 16);
     if (chunk_geom_make(&pm.g, 4, 2, 4096, 100000) != 0)

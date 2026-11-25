@@ -29,7 +29,8 @@ int chunksrv_mutant;
 int chunksrv_mutant_parse(const char *name)
 {
     static const char *const names[] = {"none", "chunknofence", "chunkselfraise", "putokearly", "nocellcheck",
-                                        "storeforeign", "nometacheck", "sumsonly", "noreqcheck", "noopmatch"};
+                                        "storeforeign", "nometacheck", "sumsonly", "noreqcheck", "noopmatch",
+                                        "norespcheck"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
@@ -65,7 +66,7 @@ static uint64_t get64(const uint8_t *p)
 }
 
 #define REQ_HDR 21u  /* rid 8, op 1, volume 4, epoch 8 */
-#define RESP_HDR 13u /* rid 8, op 1, rc 4 */
+#define RESP_HDR 21u /* rid 8, op 1, rc 4, check 8 (resp_check) */
 #define ID_LEN 34u   /* vuuid 16, oid 16, pos 2 */
 
 static uint64_t xh(const void *p, size_t n)
@@ -74,6 +75,30 @@ static uint64_t xh(const void *p, size_t n)
     pl_xxh_init(&h);
     pl_xxh_update(&h, p, n);
     return pl_xxh_final(&h);
+}
+
+/* An answer's check (review F4): an xxh64 over rid, op, rc and the body; a READ's over its body's length only, since its
+ * cells are checked against the object's sums by the reader (chunkread.c) and hashing them again would be the per-byte
+ * pass the links gave up. So a flipped rc (an error taken for success: a DEL counted done that never was), a LIST
+ * page's names or an EPOCH answer's fence never reach the caller. */
+static uint64_t resp_check(const uint8_t *p, size_t n)
+{
+    struct pl_xxh h;
+    pl_xxh_init(&h);
+    pl_xxh_update(&h, p, 13);
+    if (p[8] == CS_OP_READ) {
+        uint8_t l[8];
+        put64(l, n - RESP_HDR);
+        pl_xxh_update(&h, l, 8);
+    } else {
+        pl_xxh_update(&h, p + RESP_HDR, n - RESP_HDR);
+    }
+    return pl_xxh_final(&h);
+}
+
+void cs_resp_seal(uint8_t *p, size_t n)
+{
+    put64(p + 13, resp_check(p, n));
 }
 
 static size_t req_body_len(uint8_t op)
@@ -167,6 +192,8 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     r->rc = (int32_t)get32(p + 9);
     r->body = p + RESP_HDR;
     r->body_len = n - RESP_HDR;
+    if (get64(p + 13) != resp_check(p, n) && chunksrv_mutant != CS_MUT_NORESPCHECK)
+        return -1;
     if (r->op < CS_OP_READ || r->op > CS_OP_PUT || r->rc > 0)
         return -1;
     if (r->rc != 0)
@@ -276,6 +303,8 @@ static uint8_t *flip_take(int where, const void *p, size_t n)
         put64(c + 66, xh(c, 66));
     else if (flip_rehash && where == CS_FLIP_REQ && n > CS_CHECK_LEN)
         put64(c + n - CS_CHECK_LEN, xh(c, n - CS_CHECK_LEN));
+    else if (flip_rehash && where == CS_FLIP_RESP && n >= RESP_HDR)
+        cs_resp_seal(c, n);
     return c;
 }
 
@@ -576,6 +605,7 @@ static void reply_rc(cs_reply_fn reply, void *arg, uint64_t rid, uint8_t op, int
     put32(b + 9, (uint32_t)rc);
     if (n)
         memcpy(b + RESP_HDR, body, n);
+    cs_resp_seal(b, RESP_HDR + n);
     reply(arg, b, RESP_HDR + n);
     if (b != stackbuf)
         free(b);
@@ -612,6 +642,7 @@ static void do_read(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
         put64(b, r->rid);
         b[8] = CS_OP_READ;
         put32(b + 9, 0);
+        cs_resp_seal(b, RESP_HDR + r->len);
         reply(arg, b, RESP_HDR + r->len);
         STAT(cs, reads);
         STATN(cs, read_bytes, r->len);

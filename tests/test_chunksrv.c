@@ -15,7 +15,7 @@
  *    reported DOWN and refuses puts, one it did not fail stays UP and takes the next put whole;
  *  - net: puts and reads between two chunk servers over real links, several threads at once.
  * Mutants (--mutant NAME; the Makefile requires each to fail it): chunknofence, chunkselfraise, putokearly,
- * nocellcheck, storeforeign, nometacheck, sumsonly, noreqcheck (test_wire and net_flips), noopmatch (net_flips). The eio case's teeth were checked by hand (chunk_be_store_state reporting a failed
+ * nocellcheck, storeforeign, nometacheck, sumsonly, noreqcheck (test_wire and net_flips), noopmatch (net_flips), norespcheck (test_wire and net_flips). The eio case's teeth were checked by hand (chunk_be_store_state reporting a failed
  * store UP fails it with exit 20); that check is R6's, in src/chunkstore.c.
  */
 #include "internal.h"
@@ -290,17 +290,37 @@ static void test_wire(void)
     CHECK(cs_req_decode(buf, n, &d) == -1);
     buf[8] = 99; /* an unknown op */
     CHECK(cs_req_decode(buf, n, &d) == -1);
-    /* answers: a body of the wrong length for its op */
+    /* answers (rid 8, op 1, rc 4, check 8, body): a body of the wrong length for its op; each sealed as sent */
     uint8_t a[64] = {0};
-    a[8] = CS_OP_PUT;
     struct cs_resp rr;
-    CHECK(cs_resp_decode(a, 13 + 8, &rr) == 0 && cs_resp_decode(a, 13 + 7, &rr) == -1);
+#define RESP_OK(len) (cs_resp_seal(a, (len)), cs_resp_decode(a, (len), &rr))
+    a[8] = CS_OP_PUT;
+    CHECK(RESP_OK(21 + 8) == 0 && RESP_OK(21 + 7) == -1);
     a[8] = CS_OP_EPOCH;
-    CHECK(cs_resp_decode(a, 13 + 9, &rr) == 0 && cs_resp_decode(a, 13 + 10, &rr) == -1);
+    CHECK(RESP_OK(21 + 9) == 0 && RESP_OK(21 + 10) == -1);
     a[9] = 0xff, a[10] = 0xff, a[11] = 0xff, a[12] = 0xff; /* rc -1 with a body */
-    CHECK(cs_resp_decode(a, 13 + 9, &rr) == -1 && cs_resp_decode(a, 13, &rr) == 0);
+    CHECK(RESP_OK(21 + 9) == -1 && RESP_OK(21) == 0);
     a[12] = 0x7f; /* a positive rc */
-    CHECK(cs_resp_decode(a, 13, &rr) == -1);
+    CHECK(RESP_OK(21) == -1);
+    /* the check (review F4): a DEL's error flipped to 0 after sealing is refused, and so is a flipped EPOCH fence; a
+     * READ's covers its length but not its cells (the reader checks those against the object's sums) */
+    memset(a, 0, sizeof a);
+    a[8] = CS_OP_DEL, a[9] = 0xf5, a[10] = 0xff, a[11] = 0xff, a[12] = 0xff;
+    cs_resp_seal(a, 21);
+    memset(a + 9, 0, 4);
+    CHECK(cs_resp_decode(a, 21, &rr) == -1);
+    memset(a, 0, sizeof a);
+    a[8] = CS_OP_EPOCH, a[21] = 9;
+    cs_resp_seal(a, 21 + 9);
+    a[21 + 5] ^= 0x01;
+    CHECK(cs_resp_decode(a, 21 + 9, &rr) == -1);
+    memset(a, 0, sizeof a);
+    a[8] = CS_OP_READ, a[21] = 1;
+    cs_resp_seal(a, 21 + 4);
+    a[22] ^= 0x01; /* a cell byte: the reader's sums are its check */
+    CHECK(cs_resp_decode(a, 21 + 4, &rr) == 0);
+    CHECK(cs_resp_decode(a, 21 + 3, &rr) == -1); /* a length changed */
+#undef RESP_OK
     /* put meta */
     cdata c;
     cdata_make(&c, 5, 4, 4096, 100000, 1);
@@ -328,12 +348,13 @@ static void test_wire(void)
           chunksrv_st(TSDB_ERR_CORRUPT) == CHUNK_ST_DAMAGED && chunksrv_st(TSDB_ERR_IO) == CHUNK_ST_IOERR &&
           chunksrv_st(TSDB_ERR_UNAVAILABLE) == CHUNK_ST_DOWN);
     /* a SUMS answer is taken only when its count and its length agree: a reader by count must not overread */
-    uint8_t rb[13 + 36 + 16];
+    uint8_t rb[21 + 36 + 16];
     memset(rb, 0, sizeof rb);
     rb[8] = CS_OP_SUMS;
     struct cs_resp rsp;
     for (uint32_t cnt = 0; cnt <= 3; cnt++) {
-        rb[13 + 32] = (uint8_t)cnt;
+        rb[21 + 32] = (uint8_t)cnt;
+        cs_resp_seal(rb, sizeof rb); /* a check that holds: only the count decides */
         CHECK(cs_resp_decode(rb, sizeof rb, &rsp) == (cnt == 2 ? 0 : -1));
     }
 }
@@ -1185,7 +1206,7 @@ static void net_flips(struct chunksrv *a, struct chunksrv *b, const char *dir)
         body = NULL;
         struct chunksrv_stats st0, st1;
         chunksrv_get_stats(a, &st0);
-        chunksrv_test_flip(CS_FLIP_RESP, 8, CS_OP_DEL ^ CS_OP_EPOCH, false);
+        chunksrv_test_flip(CS_FLIP_RESP, 8, CS_OP_DEL ^ CS_OP_EPOCH, true); /* the check made again: the op match */
         prc = 0;
         rc = chunksrv_call(a, 2, &r, 2000, &prc, &body, &bl);
         free(body);
@@ -1195,6 +1216,20 @@ static void net_flips(struct chunksrv *a, struct chunksrv *b, const char *dir)
         chunksrv_get_stats(a, &st1);
         CHECK(st1.answer_mismatch == st0.answer_mismatch + 1);
         CHECK(net_epoch(a) == 20); /* and serves again */
+        /* the DEL's error code flipped on its way back with the answer's check as sent (review F4): malformed, the
+         * link ends; unchecked it would reach the caller as another answer */
+        chunksrv_get_stats(a, &st0);
+        chunksrv_test_flip(CS_FLIP_RESP, 9, 0x01, false);
+        prc = 0;
+        rc = chunksrv_call(a, 2, &r, 2000, &prc, &body, &bl);
+        free(body);
+        body = NULL;
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            fprintf(stderr, "FAIL a DEL answer with a flipped rc taken: %d (rc %d)\n", rc, prc);
+        CHECK(rc == TSDB_ERR_UNAVAILABLE);
+        chunksrv_get_stats(a, &st1);
+        CHECK(st1.malformed == st0.malformed + 1);
+        CHECK(net_epoch(a) == 20);
     }
     chunksrv_test_flip(CS_FLIP_NONE, 0, 0, false);
 }
