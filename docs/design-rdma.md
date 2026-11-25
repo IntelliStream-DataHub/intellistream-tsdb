@@ -738,7 +738,8 @@ avoid. Built in cluster version 9 (`PL_CL_VERSION`; `server/plcheck.h`, `tsdbd -
 - **`header`** (type 2): XXH3-64, 8 bytes, over the frame's length, type, compression header and the first 256 bytes
   of its payload as the driver gave it (decompressed): the drivers' heads (a replication message's 212 bytes, a
   forward envelope, a chunk put's meta, a bulk frame's fields), never the bulk of a payload, so it costs a fixed amount
-  per frame. XXH3-64 rather than CRC32C: already vendored, needs no instruction a CPU level must have, no arm64 shim.
+  per frame. XXH3-64 rather than CRC32C: already vendored and portable C (one hash for both checks, no arm64 shim);
+  CRC32C costs about as much here (measured below), so this is not a speed choice and the owner may switch.
 - **`full`** (type 3): rd-mac's XXH3-128 over the whole frame, unchanged. It reads every byte again, so on RDMA it
   gives up zero copy's CPU saving; it is there for a network the owner does not trust.
 
@@ -749,6 +750,25 @@ seed `salt ^ seq`: the per-frame sequence number stays (it costs a counter, seed
 dropped, repeated or reordered frame fail there; under `none` nothing reads it, TCP and RC keep order). `cluster
 status`, the client STATUS (`links.KIND.{none,header,full}`) and the metrics port (`tsdb_peer_links{kind,check}`) say
 how many links of each kind run at each level. The handshake keeps HMAC-SHA256, the metadata links keep HMAC framing.
+
+**What the levels cost** (`test_peerlink --bench --check LEVEL`, TCP over loopback, one process; Intel Xeon E5-2697 v4,
+2 rounds of 3 repetitions per level, means, on a fleet slot whose load average was 6 to 11, so differences of a few
+per cent are noise; the per-frame check cost is a loop of its own):
+
+| | `none` | `header` | `full` |
+|---|---:|---:|---:|
+| check per frame, 265-byte frame | 0 | 27-31 ns | 29-33 ns |
+| check per frame, 64 KiB | 0 | 28-32 ns | 1.94-1.98 µs (about 33 GB/s) |
+| check per frame, 1 MiB | 0 | 27-31 ns | 33-35 µs (about 30-32 GB/s) |
+| bulk link, 64 KiB-4 MiB chunks (mean of the 4 sizes) | 2,047 MB/s | 2,026 MB/s (-1%) | 1,874 MB/s (-8%) |
+| log link, 80-byte frames | 1.47 M frames/s | 1.44 M frames/s | 1.55 M frames/s |
+| wire bytes, 80-byte frames | 106.2% of the payload | 116.2% | 126.2% |
+
+CRC32C over the header's span cost 33.5 ns per frame on the Xeon and 8.6 ns on an i5-13400 (where XXH3-64 took 23 ns
+and the full check 19 ns at 265 bytes, 1.0 µs at 64 KiB, 19 µs at 1 MiB; one repetition). Small frames are bound by
+the system calls, not the check: the log link's rate does not order by level. The bulk link loses what the full check's
+second pass over every byte costs; on RDMA that pass is the CPU zero copy saves, which is why `full` is not the default.
+`tools/rdma-bench.sh` between two servers was not rerun for the levels (it measures link-bench, not peerlink).
 
 **What guards the frames under `none`** (built in every mode, each with a regression test and a planted bug; the
 receive paths must be safe on any bytes, which fuzz-replframe checks per level): a replication message is checked
