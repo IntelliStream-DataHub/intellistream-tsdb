@@ -21,6 +21,26 @@ out=$("$B/tsdb" "$dir/db" volume diverged) || fail "volume diverged: exit $?"
 
 mkdir "$dir/cv"
 printf 'version=9\nrequires=cluster,replica\n' >"$dir/cv/META"
-err=$("$B/tsdb" "$dir/db" volume diverged "$dir/cv" --clear 2>&1 >/dev/null) && fail "--clear on a cluster volume"
+err=$("$B/tsdb" "$dir/cv" volume diverged --clear 2>&1 >/dev/null) && fail "--clear on a cluster volume"
 [[ $err == *R4* && $err == *refused* ]] || fail "the refusal does not name R4: $err"
+
+# r8i open: PATH must be a volume of DIR (DIR itself or listed in DIR/VOLUMES)
+err=$("$B/tsdb" "$dir/db" volume diverged "$dir/cv" --clear 2>&1 >/dev/null) && fail "accepted non-volume PATH with --clear"
+[[ $err == *"not a volume"* ]] || fail "non-volume refusal message: $err"
+err=$("$B/tsdb" "$dir/db" volume diverged "$dir/cv" 2>&1 >/dev/null) && fail "accepted non-volume PATH without --clear"
+[[ $err == *"not a volume"* ]] || fail "non-volume listing refusal message: $err"
+
+# Another independent database directory (not a volume of $dir/db) is also refused
+"$B/tsdb" "$dir/other" create o >/dev/null || fail "create o in other"
+err=$("$B/tsdb" "$dir/db" volume diverged "$dir/other" --clear 2>&1 >/dev/null) && fail "accepted another db as volume"
+[[ $err == *"not a volume"* ]] || fail "other db refusal message: $err"
+
+# A real volume added to $dir/db (plus explicit DIR, symlink, and trailing slash) is accepted
+"$B/tsdb" "$dir/db" volume add "$dir/v1" >/dev/null || fail "volume add v1"
+ln -s "$dir/v1" "$dir/v1_link"
+for p in "$dir/db" "$dir/db/" "$dir/v1" "$dir/v1/" "$dir/v1_link"; do
+    out=$("$B/tsdb" "$dir/db" volume diverged "$p") || fail "volume diverged on $p: exit $?"
+    [[ $out == *"not diverged"* ]] || fail "volume diverged on $p said: $out"
+    "$B/tsdb" "$dir/db" volume diverged "$p" --clear >/dev/null || fail "--clear on valid volume $p"
+done
 echo "test_cli_diverged: ok"

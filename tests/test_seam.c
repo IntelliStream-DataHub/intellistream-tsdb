@@ -36,7 +36,9 @@
  * Prefetch (R8 D19, src/eccache.h) is on in every case (the default) but where a case turns it off; case_prefetch
  * compares the range reads of a long scan off and on (exact counts, the window growing to its cap), a small budget, a
  * pinned entry, a damaged granule read ahead, a walk's stop at its series' end and at a cached granule, a window
- * wasted by a range query, the object forgotten during a window, a window's failed read and its byte limit. case_multi: tsdb_query_multi over .ec and plain parts of two volumes (one cut of each) equals the same calls
+ * wasted by a range query, the object forgotten during a window, a window's failed read, its byte limit, the runtime
+ * and env off-switches (eccache_set_prefetch, TSDB_EC_PREFETCH=0), and that degraded/rotted chunks stop issuing
+ * prefetch reads. case_multi: tsdb_query_multi over .ec and plain parts of two volumes (one cut of each) equals the same calls
  * one series at a time, at 4 threads and at 1, with prefetch on and off, with series ahead of the head deferred by a
  * small memory budget and not, and a series with a damaged granule CORRUPT in every call.
  * Not here: the statistics' byte columns of an .ec part (eccache_part_bytes is the map's length until r7-ecfile gives
@@ -1510,6 +1512,98 @@ static void case_prefetch(void)
     printf("test_seam: prefetch: windows of at most %" PRIu64 " bytes: the longest %" PRIu64 "\n", gl,
            k1.pf_call_peak);
     eccache_test_prefetch_call(x.t, 0);
+
+    /* 10 (r8p F6): runtime and env off-switch (default ON, TSDB_EC_PREFETCH=0 off, eccache_set_prefetch off/on) */
+    CHECK(eccache_prefetch_enabled(x.t));
+    eccache_set_prefetch(x.t, false);
+    CHECK(!eccache_prefetch_enabled(x.t));
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, eccache_set_prefetch off"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched &&
+          k1.reads - k0.reads == k1.misses - k0.misses);
+    eccache_set_prefetch(x.t, true);
+    CHECK(eccache_prefetch_enabled(x.t));
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, eccache_set_prefetch on"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads > k0.pf_reads && k1.prefetched > k0.prefetched &&
+          k1.reads - k0.reads < k1.misses - k0.misses + (k1.prefetched - k0.prefetched));
+
+    /* 11 (r8p F7): damaged/reconstructed stripe suppresses further prefetch reads on that object */
+    /* (a) missing chunk (<= m): every read reconstructs via parity -> zero prefetch reads (old code prefetched 20) */
+    char cpath[4096], chid[4200];
+    CHECK(chunk_path(pa[0]->ec->rec.oid, 0, cpath, sizeof cpath));
+    snprintf(chid, sizeof chid, "%s.hid", cpath);
+    CHECK(rename(cpath, chid) == 0);
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, degraded chunk (missing)"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched && k1.pf_dropped == k0.pf_dropped);
+    CHECK(k1.reads - k0.reads == pa[0]->ix.n);
+    CHECK(rename(chid, cpath) == 0);
+    /* (b) silent rot in chunk 0 of pa[1] (whole-cell retry): zero prefetch reads (old code issued wasted windows) */
+    CHECK(chunk_path(pa[1]->ec->rec.oid, 0, cpath, sizeof cpath));
+    chunk_geom rg;
+    CHECK(chunk_geom_make(&rg, pa[1]->ec->rec.k, pa[1]->ec->rec.m, pa[1]->ec->rec.cell_bytes,
+                          pa[1]->ec->rec.object_len) == 0);
+    int rfd = open(cpath, O_RDWR);
+    CHECK(rfd >= 0);
+    if (rfd >= 0) {
+        uint64_t rlen = chunk_pos_len(&rg, 0);
+        for (uint64_t off = 64; off < rlen; off += 512) {
+            uint8_t b;
+            CHECK(pread(rfd, &b, 1, CHUNK_HDR_BYTES + off) == 1);
+            b ^= 0x5a;
+            CHECK(pwrite(rfd, &b, 1, CHUNK_HDR_BYTES + off) == 1);
+        }
+        close(rfd);
+    }
+    eccache_test_drop(x.t);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], DAY, 2 * DAY - 1, &wa[1], "pa, damaged chunk (rot)"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.retries > k0.retries && k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched &&
+          k1.pf_dropped == k0.pf_dropped);
+    CHECK(k1.reads - k0.reads == pa[1]->ix.n + (k1.retries - k0.retries));
+    printf("test_seam: prefetch: degraded/rot chunks issue 0 prefetch reads (%" PRIu64 " retries)\n",
+           k1.retries - k0.retries);
+
+    /* Env switch TSDB_EC_PREFETCH=0 on a fresh tier (reattaching pa[0] from its record) */
+    ec_record pa0_rec = pa[0]->ec->rec;
+    uint64_t *pa0_sums = malloc(MAX(pa0_rec.nsums, 1) * sizeof *pa0_sums);
+    CHECK(pa0_sums != NULL);
+    memcpy(pa0_sums, pa0_rec.sums, pa0_rec.nsums * sizeof *pa0_sums);
+    pa0_rec.sums = pa0_sums;
+    char pa0_name[96];
+    snprintf(pa0_name, sizeof pa0_name, "%s", pa[0]->name);
+    h_close(&x);
+    setenv("TSDB_EC_PREFETCH", "0", 1);
+    CHECK(h_open(&x, dir, NULL) == 0);
+    unsetenv("TSDB_EC_PREFETCH");
+    if (x.db) {
+        CHECK(!eccache_prefetch_enabled(x.t));
+        part *rps[MAXP];
+        size_t rnp = list_parts(x.db, rps, MAXP);
+        bool reattached = false;
+        for (size_t i = 0; i < rnp; i++)
+            if (!strcmp(rps[i]->name, pa0_name)) {
+                CHECK(ec_test_attach_object(x.db, rps[i], &pa0_rec) == 0);
+                reattached = true;
+                break;
+            }
+        CHECK(reattached);
+        eccache_get_counters(x.t, &k0);
+        CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa, TSDB_EC_PREFETCH=0"));
+        eccache_get_counters(x.t, &k1);
+        CHECK(k1.pf_reads == k0.pf_reads && k1.prefetched == k0.prefetched &&
+              k1.reads - k0.reads == k1.misses - k0.misses);
+    }
+    free(pa0_sums);
+
     free(we.b);
     free(wq.b);
     free(wa2h.b);

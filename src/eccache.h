@@ -86,6 +86,12 @@ void eccache_forget(struct tier *t, uint32_t volume, const uint8_t oid[16]);
  * object degraded (a cell failed or rebuilt, a position away, an error) does the same by itself. */
 void eccache_reopen(struct tier *t, uint32_t volume, const uint8_t oid[16]);
 
+/* Prefetch off-switch (R8 D19, F6): on by default (unless TSDB_EC_PREFETCH=0/off/false/no at tier_open);
+ * eccache_set_prefetch disables or enables the tier's sequential granule prefetch at run time and resets active
+ * walks. Safe when t == NULL or when the build has no cache (NO_EC=1). */
+void eccache_set_prefetch(struct tier *t, bool on);
+bool eccache_prefetch_enabled(const struct tier *t);
+
 /* ------------------------------------------------------------ tests */
 typedef struct eccache_counters {
     uint64_t hits, misses, waits;   /* granule lookups; waits: a miss another reader was already filling */
