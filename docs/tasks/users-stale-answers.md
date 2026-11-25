@@ -55,17 +55,19 @@ applied past it.
 
 ## 3. What the users workload does not cover
 
-Still open. The laggard list stays off the wire reply of the user admin ops: the clients' calls (`tsdbc_grant` and the
-rest) return a status only, so carrying it means a protocol and API change in all four clients (s2k-users left it).
+Closed in track `jusers-cov` (`tests/jepsen/cluster_users.h`, `tests/jepsen/jepsen_cluster.c`):
 
-- The CLI path (`tsdb cluster user ... --wait-ms`, the only one that reports members still behind) runs once, before any
-  fault. The wire reply carries no laggard list (`admin_group` drops `lag[]`), so the checker binds a member that was
-  running before a change by a timing rule (an acknowledgement under 3.5 s, the member open a second before it). A server
-  that lets a member stay behind after a slow acknowledgement passes. Drive a share of the admin ops through the CLI and
-  bind by its list, or put the list on the wire reply.
-- The actor guard (A34: a demoted admin's change is refused): no workload step demotes an admin; the mutant `noguard`
-  survives. A second admin whose superuser right is revoked while it acts would cover it.
+- **CLI path with `--wait-ms` (DONE)**: `ju_admin` drives ~30% of admin ops through `tsdb cluster user ... --wait-ms`
+  (mixing short 50/200 ms and slow 4000/5000 ms waits), parses `lagging: node <id>` lines, and binds every non-laggard
+  member that ran continuously across the op even past the 3.5 s timing rule (`jm_bound` `has_lag` / `lag_mask`).
+- **Actor guard A34 (DONE)**: a second admin user (`jadm`) is repeatedly promoted and demoted while `ju_adm2` holds
+  open sessions on every node and fires `tsdbc_grant` after demotion commits (`ADM_DEMOTED`); `TSDB_AUTH_MUTANT=noguard`
+  is caught as a violation.
+- **`tsdb cluster init --superuser` (DONE)**: odd seeds (including default seed 1) initialise the cluster via
+  `tsdb cluster init --superuser` (`ju_init_cluster`), while even seeds keep `tsdb cluster user add --superuser`.
+
+Still open:
+
 - A failed push of the users watch (`TSDB_AUTH_TEST failpush_file`): nothing sets it; the mutant `pushnoretry` survives.
   `test_cluster` covers both; the workload does not.
 - `barrierifempty` is caught in 1 of 3 seeds: not deterministic, so it is not in `jepsen-cluster-selftest`.
-- The cluster is initialised with `tsdb cluster init`, then the superuser is added; `init --superuser` is not driven.

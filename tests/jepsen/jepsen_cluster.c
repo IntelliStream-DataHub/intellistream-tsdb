@@ -4043,7 +4043,7 @@ static int cluster_form(void)
         S.repl_retain_s = (uint32_t)retain_eff;
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
-    int rc = admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
+    int rc = (want_auth && (seed & 1)) ? ju_init_cluster(0) : admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
     if (rc != 0)
         die(1, "init: %s", cluster_strerror(rc));
     int64_t t0 = now_ms();
