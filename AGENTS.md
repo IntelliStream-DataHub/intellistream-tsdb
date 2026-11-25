@@ -403,13 +403,17 @@ cgroup, so `nice` does not keep your work out of its way.
   An erasure-coded cluster volume (META `requires=` with `ec`; snap-ec): SNAPMAN version 3 gives every entry a `ppos`
   (0 = none; only PART and EC entries may carry one), the make lists the cut's `.ec` parts (kind `SNAP_EC`, their index
   file and object record; the chunks stay on the stores) and takes each listed name's PPOS record under `db->lock`; the
-  install opens every `.ec` with `part_open_ec_at` (hashes, record; the record's ppos must equal SNAPMAN's, 0 < ppos <=
-  P), requires a ppos on every part of an ec volume and none elsewhere, and writes `PPOS` (`ppos_write_new`, synced with
+  install opens every `.ec` with `part_open_ec_at` (hashes, record; the record's ppos must be at or below P and SNAPMAN's
+  must be what the leader's swap recorded: the record's ppos, or PPOS_UNKNOWN for a record ppos of 0), requires a ppos on every part of an ec volume and none elsewhere, and writes `PPOS` (`ppos_write_new`, synced with
   the directory) BEFORE META, FNO, REPL and SNAPDONE (PPOS is one of the install's own names). `settled_` and `retired_`
   names never travel (snap_man_read refuses them in every kind); COLD's `stage_`/`keep_` files travel as a COMMIT's.
-  `test_snapshot --only ec` (`ec`: snapshots made under writers around a settle, installed, read back from the stores,
-  fed on, no chunk removed by the receiver's open; `ec power`: crashfs at every step of such an install); mutants
-  `snapinstnoppos snappposafter snapcarrysettled snapskipec` (their own Makefile loop, built only with `TSDB_EC`).
+  The install never checks that an object's chunks are on the stores (it does not open them; r8k's MK_GC keeps them).
+  A member built from a snapshot has no `settled_` copy of the objects settled before P, so it adds no digest of them.
+  `test_snapshot --only ec` (`ec`: snapshots made under writers around a settle, one between its COLD marker and its
+  swap, installed, read back from the stores, fed on, no chunk removed by the receiver's open; each install check of an
+  ec copy alone on a damaged or foreign copy; `ec power`: crashfs at every step of such an install); mutants
+  `snapinstnoppos snappposafter snapcarrysettled snapskipec snapecnoverify snapecnozeq snapecnozp snapecnoppos` (their
+  own Makefile loop, built only with `TSDB_EC`); `--only man` runs SNAPMAN's refusals (mutant `snapnoreserved`).
 - `server/rsnap.c`, `server/snapinst.c`, `server/snapinst_run.c` (R4 r4-xferlink, r4-xferinst; D2, D7, D16, D18;
   design-cluster.md 8.1 "Built in R4"): a snapshot's transfer and install. The receiver's driver calls `rsnap_need` at the
   core's `REPL_A_SNAPSHOT` (the notice names the leader); frames REQ, BUSY, GO, DONE, ABORT and the files go on the
@@ -734,8 +738,8 @@ cgroup, so `nice` does not keep your work out of its way.
   before it ran). A rebuilt copy needs twice the volume's space meanwhile: the receiver checks free space first, so a
   rebuild never runs a live volume's WAL into ENOSPC (fail-stop). `src/snapshot.c` is in the embedded bindings' copy of
   `src/*.c` and builds without `TSDB_EC`. Tests `test_snapshot` (windows, merges during the links, random writers,
-  power loss at every step), mutants in the Makefile's `test_snapshot` loops (`snapafterp` ... `snapinstnodirsync`; `snapinstnoppos` ...
-  `snapskipec` with `--only ec`).
+  power loss at every step), mutants in the Makefile's `test_snapshot` loops (`snapafterp` ... `snapinstnodirsync`, `snapnoreserved`; `snapinstnoppos` ...
+  `snapecnoppos` with `--only ec`).
 - **Replica set versions** (R4; `server/meta.c`, `src/repl.c`, `server/rset.c`). A volume's `set_version` is raised by
   exactly REPLICA_ADD, REPLICA_REMOVE and REPLICA_RESET and by nothing else; every replication message carries it and a
   receiver drops (and counts) another version's (a FENCE excepted); the driver adopts a new version only on the volume's
