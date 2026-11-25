@@ -144,6 +144,12 @@ class HaTest {
             }
         }
 
+        List<Req> seenInserts() {
+            synchronized (log) {
+                return log.stream().filter(HaTest::isInsert).toList();
+            }
+        }
+
         private void serve(int conn, Socket s) {
             try (s) {
                 DataInputStream in = new DataInputStream(s.getInputStream());
@@ -478,14 +484,31 @@ class HaTest {
     @Test
     void unavailableRetriesDoNotDelayMoved() throws Exception {
         try (Fake b = new Fake(r -> ok());
-                Fake a = new Fake(r -> r.nth() < 8 ? unavailable(5) : new Reply(-10, movedBody(b.addr())));
+                Fake a = new Fake(r -> r.nth() < 20 ? unavailable(1) : new Reply(-10, movedBody(b.addr())));
                 TsdbClient c = TsdbClient.connect("127.0.0.1", a.port())) {
+            c.setRetry(Duration.ofMillis(700));
             long t0 = System.nanoTime();
             c.flush();
             long ms = (System.nanoTime() - t0) / 1_000_000;
-            assertEquals(9, a.seen(OP_FLUSH).size());
+            assertEquals(21, a.seen(OP_FLUSH).size());
             assertEquals(1, b.seen(OP_FLUSH).size());
-            assertTrue(ms < 200, "MOVED waited for UNAVAILABLE backoff: " + ms + " ms");
+            assertTrue(ms < 700, "MOVED waited for UNAVAILABLE backoff: " + ms + " ms");
+        }
+    }
+
+    @Test
+    void pipelinedUnavailableRetriesDoNotDelayMoved() throws Exception {
+        try (Fake b = new Fake(r -> ok());
+                Fake a = new Fake(r -> r.nth() < 20 ? unavailable(1) : new Reply(-10, movedBody(b.addr())));
+                TsdbClient c = TsdbClient.connect("127.0.0.1", a.port())) {
+            c.setRetry(Duration.ofMillis(700));
+            long t0 = System.nanoTime();
+            c.insertAsync(SID, new long[] {1}, new float[] {1});
+            c.await();
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertEquals(21, a.seenInserts().size());
+            assertEquals(1, b.seenInserts().size());
+            assertTrue(ms < 700, "MOVED waited for UNAVAILABLE backoff: " + ms + " ms");
         }
     }
 
@@ -502,7 +525,7 @@ class HaTest {
                 long ms = (System.nanoTime() - t0) / 1_000_000;
                 assertTrue(ms >= 150 && ms < 1500, ms + " ms");
                 int total = a.seen(OP_FLUSH).size() + b.seen(OP_FLUSH).size();
-                assertTrue(total <= 10, "too many MOVED rounds: " + total);
+                assertTrue(total >= 2 && total <= 10, "unexpected MOVED rounds: " + total);
             }
         }
     }

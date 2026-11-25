@@ -22,6 +22,7 @@ from conftest import TSDBD
 
 WHY_NFS_DOWN = 1
 OP_FLUSH = 8
+OP_INSERT_VALUES = 14
 SID = 0x1_0000_0001
 
 
@@ -195,13 +196,25 @@ def test_moved_is_followed_to_the_node_it_names(fake):
 
 def test_unavailable_retries_do_not_delay_moved(fake):
     b = fake(lambda op, nth: (0, b""))
-    a = fake(lambda op, nth: unavailable(5) if nth < 8 else (-10, moved_body(b.addr)))
-    with Client("127.0.0.1", a.port) as c:
+    a = fake(lambda op, nth: unavailable(1) if nth < 20 else (-10, moved_body(b.addr)))
+    with Client("127.0.0.1", a.port, retry=0.7) as c:
         t0 = time.monotonic()
         c.flush()
         dt = time.monotonic() - t0
-        assert len(a.seen(OP_FLUSH)) == 9 and len(b.seen(OP_FLUSH)) == 1
-        assert dt < 0.2, f"MOVED waited for UNAVAILABLE backoff: {dt:.3f}s"
+        assert len(a.seen(OP_FLUSH)) == 21 and len(b.seen(OP_FLUSH)) == 1
+        assert dt < 0.7, f"MOVED waited for UNAVAILABLE backoff: {dt:.3f}s"
+
+
+def test_pipelined_unavailable_retries_do_not_delay_moved(fake):
+    b = fake(lambda op, nth: (0, b""))
+    a = fake(lambda op, nth: unavailable(1) if nth < 20 else (-10, moved_body(b.addr)))
+    with Client("127.0.0.1", a.port, retry=0.7) as c:
+        t0 = time.monotonic()
+        c.insert_series_async(SID, [1], [1.0])
+        c.wait()
+        dt = time.monotonic() - t0
+        assert len(a.seen(OP_INSERT_VALUES)) == 21 and len(b.seen(OP_INSERT_VALUES)) == 1
+        assert dt < 0.7, f"MOVED waited for UNAVAILABLE backoff: {dt:.3f}s"
 
 
 def test_repeated_moved_backs_off_within_budget(fake):
@@ -215,7 +228,8 @@ def test_repeated_moved_backs_off_within_budget(fake):
             c.flush()
         dt = time.monotonic() - t0
         assert 0.15 <= dt < 1.5, f"dt {dt:.3f}s"
-        assert len(a.seen(OP_FLUSH)) + len(b.seen(OP_FLUSH)) <= 10
+        total = len(a.seen(OP_FLUSH)) + len(b.seen(OP_FLUSH))
+        assert 2 <= total <= 10
 
 
 def test_moved_is_an_exception_when_there_is_nowhere_to_go(fake):

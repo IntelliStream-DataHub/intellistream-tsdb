@@ -326,14 +326,31 @@ fn moved_is_followed_to_the_node_it_names() {
 fn unavailable_retries_do_not_delay_moved() {
     let b = Fake::start(|_| ok());
     let baddr = b.addr.to_string();
-    let a = Fake::start(move |r| if r.nth < 8 { unavailable(5) } else { Reply(-10, moved_body(&baddr)) });
+    let a = Fake::start(move |r| if r.nth < 20 { unavailable(1) } else { Reply(-10, moved_body(&baddr)) });
     let mut c = Client::connect(a.addr).unwrap();
+    c.set_retry(Some(Duration::from_millis(700)));
     let t0 = Instant::now();
     c.flush().unwrap();
     let dt = t0.elapsed();
-    assert_eq!(a.seen(OP_FLUSH).len(), 9);
+    assert_eq!(a.seen(OP_FLUSH).len(), 21);
     assert_eq!(b.seen(OP_FLUSH).len(), 1);
-    assert!(dt < Duration::from_millis(200), "MOVED waited for UNAVAILABLE backoff: {dt:?}");
+    assert!(dt < Duration::from_millis(700), "MOVED waited for UNAVAILABLE backoff: {dt:?}");
+}
+
+#[test]
+fn pipelined_unavailable_retries_do_not_delay_moved() {
+    let b = Fake::start(|_| ok());
+    let baddr = b.addr.to_string();
+    let a = Fake::start(move |r| if r.nth < 20 { unavailable(1) } else { Reply(-10, moved_body(&baddr)) });
+    let mut c = Client::connect(a.addr).unwrap();
+    c.set_retry(Some(Duration::from_millis(700)));
+    let t0 = Instant::now();
+    c.insert_series_async(0x1_0000_0001, &[1], &[1.0]).unwrap();
+    c.wait().unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(a.seen(OP_INSERT_VALUES).len(), 21);
+    assert_eq!(b.seen(OP_INSERT_VALUES).len(), 1);
+    assert!(dt < Duration::from_millis(700), "MOVED waited for UNAVAILABLE backoff: {dt:?}");
 }
 
 #[test]
@@ -352,7 +369,7 @@ fn repeated_moved_backs_off_within_budget() {
     assert_eq!(e.status(), Some(Status::Moved), "{e}");
     assert!(dt >= Duration::from_millis(150) && dt < Duration::from_millis(1500), "dt {dt:?}");
     let total = a.seen(OP_FLUSH).len() + b.seen(OP_FLUSH).len();
-    assert!(total <= 10, "too many MOVED rounds: {total}");
+    assert!((2..=10).contains(&total), "unexpected MOVED round count: {total}");
 }
 
 #[test]

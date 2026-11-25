@@ -2640,7 +2640,9 @@ impl Client {
         if now + Duration::from_millis(delay) > dl {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(delay));
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         if moved {
             *moved_tries += 1;
             if !self.follow_moved(e, dl) {

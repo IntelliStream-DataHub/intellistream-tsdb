@@ -28,6 +28,7 @@
 #include "watchdog.h"
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -374,6 +375,8 @@ static void *fake_main(void *arg)
         int fd = accept(f->lfd, NULL, NULL);
         if (fd < 0)
             break;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         uint8_t body[64], op;
         uint32_t id, v = TSDB_PROTOCOL_VERSION;
         uint8_t h[8] = {0};
@@ -659,7 +662,7 @@ static void script_unavail_then_moved(struct fake *f, int fd)
     size_t n, un;
     uint32_t id;
     long nunavail = (long)(intptr_t)f->arg;
-    body_unavail(ub, &un, 5);
+    body_unavail(ub, &un, 1);
     while (read_req(fd, &id, &op, body, sizeof body, &n)) {
         int i = note_req(f, id);
         if (i < nunavail) {
@@ -701,13 +704,15 @@ static void test_unavail_then_moved(void)
 
     fake_start(&b, 1, script_ok);
     fake_start(&a, 1, script_unavail_then_moved);
-    a.arg = (void *)(intptr_t)8;
+    a.arg = (void *)(intptr_t)20;
     moved_port = b.port;
     CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    CHECK(tsdbc_set_retry(c, 700) == 0);
     int rc = tsdbc_series(c, "pump1.flow", 1, &sid);
     CHECK(rc == 0 && sid == TSDB_SID(1, 9));
-    CHECK(atomic_load(&a.nreq) == 9 && atomic_load(&b.nreq) == 1);
-    CHECK(b.req_at[0] - a.req_at[8] < 150.0); /* mutation "count UNAVAILABLE in MOVED tries": >= 400 ms */
+    CHECK(atomic_load(&a.nreq) == 21 && atomic_load(&b.nreq) == 1);
+    /* mutation "count UNAVAILABLE in MOVED tries": min(50 * 20, 1000) = 1000 ms > 700 ms budget, fails with MOVED */
+    CHECK(b.req_at[0] - a.req_at[20] < 700.0);
     tsdbc_close(c);
     fake_stop(&a);
     fake_stop(&b);
@@ -715,16 +720,17 @@ static void test_unavail_then_moved(void)
     /* the pipelined drain() path as well */
     fake_start(&b, 1, script_ok);
     fake_start(&a, 1, script_unavail_then_moved);
-    a.arg = (void *)(intptr_t)8;
+    a.arg = (void *)(intptr_t)20;
     moved_port = b.port;
     CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    CHECK(tsdbc_set_retry(c, 700) == 0);
     int64_t ts = 1000;
     float v = 1.0f;
     CHECK(tsdbc_insert_series_async(c, TSDB_SID(0, 5), &ts, &v, 1) == 0);
     rc = tsdbc_wait(c);
     CHECK(rc == 0);
-    CHECK(atomic_load(&a.nreq) == 9 && atomic_load(&b.nreq) == 1);
-    CHECK(b.req_at[0] - a.req_at[8] < 150.0);
+    CHECK(atomic_load(&a.nreq) == 21 && atomic_load(&b.nreq) == 1);
+    CHECK(b.req_at[0] - a.req_at[20] < 700.0);
     tsdbc_close(c);
     fake_stop(&a);
     fake_stop(&b);
@@ -748,7 +754,8 @@ static void test_moved_pingpong(void)
     double dt = now_ms() - t0;
     CHECK(rc == TSDB_ERR_MOVED);
     CHECK(dt >= 150.0 && dt < 1500.0);
-    CHECK(atomic_load(&a.nreq) + atomic_load(&b.nreq) <= 10);
+    int total = atomic_load(&a.nreq) + atomic_load(&b.nreq);
+    CHECK(total >= 2 && total <= 10);
     tsdbc_close(c);
     fake_stop(&a);
     fake_stop(&b);
