@@ -9,6 +9,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 const char *const crash_point_names[CRASH_POINT_COUNT] = {
 #define X(id, name) name,
@@ -75,6 +78,20 @@ static void arm_from_env(void)
     atomic_store_explicit(&crashpt_state, 1, memory_order_release);
 }
 
+/* The end of a crash point: the process stops as a power cut would stop it, running nothing of its own on the way out.
+ * Not _exit(): a sanitizer intercepts that and runs its finalizer first, and ThreadSanitizer's reports every thread that
+ * finished and was not joined yet (a leak only at a clean exit, which joins them); with halt_on_error=1 (make tsan) the
+ * report itself ends the process with status 66, so a harness that waits for 99 saw a failure that was no bug of the code
+ * at the point (test_cluster initcrash, snapkill under TSan). exit_group is the system call _exit makes; a report a
+ * sanitizer had to make before this point was made when it was found (halt_on_error) or stays in the log. */
+static void power_cut_exit(void)
+{
+#ifdef __linux__
+    syscall(SYS_exit_group, CRASH_EXIT_STATUS);
+#endif
+    _exit(CRASH_EXIT_STATUS);
+}
+
 void crashpt_slow(enum crash_point_id id)
 {
     pthread_once(&arm_once, arm_from_env);
@@ -94,5 +111,5 @@ void crashpt_slow(enum crash_point_id id)
                        crash_point_names[id], h, CRASH_EXIT_STATUS);
     if (len > 0)
         (void)!write(2, line, (size_t)len);
-    _exit(CRASH_EXIT_STATUS);
+    power_cut_exit();
 }

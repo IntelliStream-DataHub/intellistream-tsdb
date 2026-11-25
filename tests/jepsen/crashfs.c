@@ -988,7 +988,7 @@ static void rollback(void)
 }
 
 /* Async-signal-safe: raw syscalls, manual ASCII formatting, atomic once-guard so both on_bus() and power_loss() can
- * call it right before _exit(99) without risking duplicate lines or calling snprintf() from a signal handler. */
+ * call it right before power_cut_exit() without risking duplicate lines or calling snprintf() from a signal handler. */
 static volatile int cut_logged;
 static void log_cut_time(void)
 {
@@ -1036,6 +1036,16 @@ static void log_cut_time(void)
     errno = saved;
 }
 
+/* A power cut stops the process at once without running sanitizer finalizers: _exit() is intercepted by ThreadSanitizer,
+ * whose leak report on exit turns status 99 into 66 with halt_on_error=1 (as in server/crashpt.c). */
+__attribute__((noreturn)) static void power_cut_exit(void)
+{
+#ifdef __linux__
+    syscall(SYS_exit_group, 99);
+#endif
+    _exit(99);
+}
+
 /* A thread that reads a part it mapped, while the rollback cuts the file back, dies of SIGBUS before the thread that rolls back reaches
  * its _exit: the power went out under it, which is what a power loss is (the process is gone, status 99), not a crash of the server
  * (an honest run was failed "ended with status 0x87, not a power loss": a worker in part_open_as read a tmp part that the rollback had cut).
@@ -1044,7 +1054,7 @@ static void on_bus(int sig)
 {
     if (power_losing) {
         log_cut_time();
-        _exit(99);
+        power_cut_exit();
     }
     signal(sig, SIG_DFL); /* the instruction faults again: the default action */
 }
@@ -1064,11 +1074,11 @@ __attribute__((noreturn)) static void power_loss(void)
                  : snprintf(msg, sizeof msg, "crashfs: power loss%s\n", by);
     if (real_write(2, msg, (size_t)n) < 0) {
     }
-    /* Stamp right before _exit(99) (after rollback() and stderr write): with wal_sync_ms > 0, in-memory writes on other
-     * threads do not touch files and can still reply while rollback() runs, so minimizing the gap before _exit(99)
+    /* Stamp right before power_cut_exit() (after rollback() and stderr write): with wal_sync_ms > 0, in-memory writes on other
+     * threads do not touch files and can still reply while rollback() runs, so minimizing the gap before exit
      * keeps the timestamp tightly bounded by the actual process death. */
     log_cut_time();
-    _exit(99);
+    power_cut_exit();
 }
 
 /* Called with the lock held, before each tracked operation. In eio mode a

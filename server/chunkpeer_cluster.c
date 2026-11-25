@@ -37,6 +37,11 @@
 static struct chunkpeer G;
 static pthread_t src_th;
 static atomic_bool src_stop, src_started;
+/* the source thread lives until chunkpeer_cluster_stop: one that returned early (its work is done once the chunk server
+ * is there) stayed a finished thread nobody joined until the clean stop, and ThreadSanitizer reports such a thread at
+ * every other end of tsdbd (a fail-stop's exit(1)): status 66 instead of 1 (test_cluster exitthreads) */
+static pthread_mutex_t src_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t src_cv = PTHREAD_COND_INITIALIZER;
 
 static uint32_t self_id(const struct cluster_copy *c) { return c ? c->self : 0; }
 
@@ -168,6 +173,11 @@ static void *src_main(void *arg)
         if (cs) {
             G.local = cs;
             chunksrv_epoch_source(cs, chunkpeer_epoch_source, &G);
+            fprintf(stderr, "tsdbd: chunk peer: the epoch source is set\n");
+            pthread_mutex_lock(&src_mu);
+            while (!atomic_load(&src_stop))
+                pthread_cond_wait(&src_cv, &src_mu);
+            pthread_mutex_unlock(&src_mu);
             return NULL;
         }
         struct timespec ts = {0, 50 * 1000000L};
@@ -210,7 +220,10 @@ void chunkpeer_cluster_stop(void)
 {
     if (!atomic_exchange(&src_started, false))
         return;
+    pthread_mutex_lock(&src_mu);
     atomic_store(&src_stop, true);
+    pthread_cond_signal(&src_cv);
+    pthread_mutex_unlock(&src_mu);
     pthread_join(src_th, NULL);
 }
 

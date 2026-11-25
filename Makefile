@@ -599,7 +599,7 @@ test-meta-1 test-meta-2: test-meta-%: $(B)/test_meta
 # test_cluster's scenarios, in the order of the table all[] in tests/test_cluster.c, one group each (a scenario named in
 # none, or in two, fails tests/check_ci_groups.sh; test_cluster with no names runs them all, in one process, in the
 # table's order: `make test-meta` does not, it runs these)
-CLUSTER_SCEN_1 := secret relay initcrash dirsync install reseed torn rebase slowinstall ids watch stall witness users \
+CLUSTER_SCEN_1 := secret relay initcrash dirsync exitthreads install reseed torn rebase slowinstall ids watch stall witness users \
     login userimport userstale userpromote userreplay userlease flags hbsections retired feed syncrace power \
     powersnap life copyback voterstale dirsyncshared installshared powervote pendshared copyfault volumes \
     volrefuse snapversion links fwdlinks replicate replindet replfail replflip replepoch repldesc drvcheck replmeta replbulk failover failoverkeep fencecrash \
@@ -1112,7 +1112,7 @@ META_SOAK_FIRST   ?= 1000
 # cvol_check.o opens a replica directory in-process (the engine's headers; test_cluster speaks the client's)
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h server/peerlink.h \
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/crashpt.h server/meta.h server/peerlink.h \
     $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \

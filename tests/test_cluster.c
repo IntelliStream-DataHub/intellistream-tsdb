@@ -31,6 +31,7 @@
  */
 #define _GNU_SOURCE
 #include "cluster.h"
+#include "crashpt.h"
 #include "cvol_check.h"
 #include "harness.h"
 #include "meta.h"
@@ -55,6 +56,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 
 #define N 6
@@ -136,6 +140,7 @@ static void signal_child(pid_t pid, int sig)
 }
 
 static uint64_t now_ms(void);
+static void await_log(int i, const char *needle, int ms, const char *what);
 
 /* Whether every thread of pid is in the group stop (state T in /proc/PID/task/TID/stat); names the first that is not
  * in busy, and sets *gone when the process itself is a zombie (it exited before the pause). io_uring's kernel workers
@@ -1314,6 +1319,108 @@ static void scen_dirsync(void)
     if (st != 1 || !log_has(0, "cannot sync"))
         die("a failed directory fsync after a snapshot: status %d (expected 1 with \"cannot sync\" in the log)", st);
     printf("  a failed directory fsync after naming a snapshot stops the server\n");
+}
+
+/* exitthreads: the two ends of tsdbd that are not its clean stop keep the status the harness waits for when a thread
+ * has finished and nobody has joined it yet. Under ThreadSanitizer (make tsan: halt_on_error=1) the finalizer of an exit
+ * reports such a thread as a leak and ends the process with 66 (test_cluster initcrash, snapkill: "status 66"); in
+ * other builds both parts pass with or without the fixes. 1: a crash point (crashpt.c) ends as a power cut, with 99,
+ * whatever threads there are: a child of this test, the point armed, a joinable thread that has returned. 2: tsdbd's
+ * chunk peer source thread (chunkpeer_cluster.c) no longer returns once the epoch source is set, so a member that
+ * fail-stops after that (its next snapshot's directory fsync fails) ends with 1. */
+#ifdef __linux__
+static atomic_long crashpt_child_tid;
+
+static void *crashpt_child_thread(void *arg)
+{
+    (void)arg;
+    atomic_store(&crashpt_child_tid, (long)syscall(SYS_gettid));
+    return NULL;
+}
+
+static int crashpt_child(void)
+{
+    pthread_t t;
+    if (pthread_create(&t, NULL, crashpt_child_thread, NULL) != 0)
+        return 3;
+    /* the thread has finished once the kernel has let go of it: its /proc/self/task entry is gone (never a count of the
+     * tasks: ThreadSanitizer starts a background thread of its own at the first pthread_create; 10 s bound: a thread
+     * that only stores its id) */
+    uint64_t t0 = now_ms();
+    for (;;) {
+        long tid = atomic_load(&crashpt_child_tid);
+        char path[64];
+        struct stat st;
+        snprintf(path, sizeof path, "/proc/self/task/%ld", tid);
+        if (tid > 0 && stat(path, &st) != 0 && errno == ENOENT)
+            break;
+        if (now_ms() - t0 > 10000)
+            return 4;
+        usleep(1000);
+    }
+    setenv("TSDB_CRASH_AT", "serving", 1);
+    crash_point(CP_SERVING);
+    return 5; /* the point did not fire */
+}
+#endif
+
+static void scen_exitthreads(void)
+{
+    scenario("exitthreads");
+#ifdef __linux__
+    char self[PATH_MAX];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl <= 0)
+        die("readlink /proc/self/exe: %s", strerror(errno));
+    self[sl] = '\0';
+    pid_t pid = fork();
+    if (pid < 0)
+        die("fork: %s", strerror(errno));
+    if (pid == 0) {
+        execl(self, self, "crashpt-child", (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (waitpid(pid, &st, 0) != pid)
+        die("waitpid: %s", strerror(errno));
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != CRASH_EXIT_STATUS)
+        die("a crash point passed with a finished, unjoined thread ended with status 0x%x, not %d (66: a sanitizer's "
+            "report at exit)",
+            st, CRASH_EXIT_STATUS);
+    printf("  a crash point ends with %d beside a finished thread nobody joined\n", CRASH_EXIT_STATUS);
+#else
+    printf("  skipped: the crash point's child (a thread's /proc/self/task entry; Linux only)\n");
+#endif
+
+#ifdef TSDB_EC
+    envs[0] = "snap_every=1,fail_snap_dirsync=2";
+    start(0);
+    start(1);
+    init_fast(0);
+    await_log(0, "chunk peer: the epoch source is set", WAIT_MS, "the member's chunk peer never set its epoch source");
+    char ff[PATH_MAX + 64];
+    snprintf(ff, sizeof ff, "%s/n0/state/faildirsync", base); /* the next snapshot's directory fsync fails: exit(1) */
+    int fd = open(ff, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+        die("%s: %s", ff, strerror(errno));
+    close(fd);
+    uint8_t req[META_ADDR_MAX + 64], *rep = NULL;
+    size_t n = node_add_req(1, req), len;
+    char addr[META_ADDR_MAX], err[1024];
+    peer_of(0, addr, sizeof addr);
+    int rc;
+    if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_NODE_ADD, req, n, 5000, &rc, &rep, &len, err,
+                      sizeof err) == 0)
+        free(rep);
+    int ex = await_exit(0, WAIT_MS);
+    if (ex != 1 || !log_has(0, "cannot sync"))
+        die("a member whose snapshot's directory fsync failed after its chunk peer started ended with status %d (want 1 "
+            "with \"cannot sync\" in its log; 66: a sanitizer's report at exit)",
+            ex);
+    printf("  a member whose chunk peer runs fail-stops with status 1\n");
+#else
+    printf("  skipped: NO_EC build\n");
+#endif
 }
 
 /* a crash inside a snapshot install: the log is reset to the image's index, the snapshot not written (a directory in
@@ -11646,7 +11753,11 @@ static void scen_fwddepose(void)
         usleep(50000);
     }
     await_isr(Nw, "fd", 3, 30000, "the deposed leader back in the ISR");
-    usleep(300000);
+    /* wait until the new leader's replication driver has finished promoting (reopened as writer) before reading from it
+     * with retries off; the metadata record and ISR count (kept across the promotion) are visible before that finishes */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log(Nw, lead, 30000, "the new leader serving the volume");
     c = client(E);
     tsdbc_set_retry(c, 0);
     uint64_t f0 = fw_frames(c, oldlead);
@@ -11663,8 +11774,13 @@ static void scen_fwddepose(void)
     unlink(hold[E]);
     tsdbc *cn = client(Nw);
     nrows = 0;
-    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0)
-        die("a read on the new leader: %s", ers(rc));
+    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0) {
+        tsdbc_err_info ei;
+        int lrc = tsdbc_last_error(cn, &ei);
+        die("a read on the new leader: %s (detail %d, nunavail %u, reason %u)", ers(rc), lrc,
+            lrc == TSDB_ERR_UNAVAILABLE ? ei.nunavail : 0,
+            lrc == TSDB_ERR_UNAVAILABLE && ei.nunavail ? ei.unavail[0].reason : 0);
+    }
     tsdbc_close(cn);
     if (nrows != 0)
         die("the write answered MOVED by the deposed leader is on the new leader");
@@ -15322,9 +15438,9 @@ static int set_setup(int nserv, struct meta_volume *v, int keepall)
     init_cluster(0, 600);
     for (int i = 1; i < nserv; i++)
         node_add(0, i);
-    if (nserv == 3) { /* a member stopped later must not take the metadata group's quorum with it */
-        unsigned want = 3;
-        await_view(0, p_voters, &want, "three voters");
+    if (nserv >= 3) { /* a member stopped later must not take the metadata group's quorum with it */
+        unsigned want = nserv >= 5 ? 5 : 3;
+        await_view(0, p_voters, &want, want == 5 ? "five voters" : "three voters");
     }
     uint32_t num;
     int rc;
@@ -16980,6 +17096,34 @@ static void scen_transferhold(void)
            "\n", took, ta.why, blind, cuts);
     if (blind || cuts)
         die("transferhold: server %d admitted %" PRIu64 " records blind, %" PRIu64 " cuts on the members", L, blind, cuts);
+    /* a slow bystander (past failover's PROMO_WAIT_NS 500 ms, within PROMO_TRANSFER_WAIT_NS 1500 ms) must still be
+     * waited for so its answer counts (3 of 3, no member left unanswered) */
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the slow-bystander transfer");
+    int L2 = server_of(a.leader), T2 = 0, B2 = 3 - L2 - T2; /* T2 = server 0 (Raft leader), B2 = the other non-leader */
+    if (L2 == 0)
+        T2 = 1, B2 = 2;
+    int props0 = 0, whole0 = 0;
+    for (int i = 0; i < 3; i++)
+        props0 += log_count(i, " fenced members answered"), whole0 += log_count(i, " (3 of 3 fenced members answered");
+    int ready1 = log_count(L2, ": READY at");
+    state_flag(B2, "dropfence", 1);
+    struct tr_async tb = {x.num, ids[T2], 0, ""};
+    if (pthread_create(&th, NULL, tr_transfer_thread, &tb) != 0)
+        die("pthread_create");
+    await_log_count(L2, ": READY at", ready1 + 1, 10000);
+    usleep(750000);
+    state_flag(B2, "dropfence", 0);
+    pthread_join(th, NULL);
+    if (tb.rc != 0)
+        die("transferhold: slow-bystander transfer to node %u: %s (%s)", ids[T2],
+            tb.rc == 1 ? "lost" : cluster_strerror(tb.rc), tb.why);
+    int props1 = 0, whole1 = 0;
+    for (int i = 0; i < 3; i++)
+        props1 += log_count(i, " fenced members answered"), whole1 += log_count(i, " (3 of 3 fenced members answered");
+    if (props1 - props0 != 1 || whole1 - whole0 != 1)
+        die("transferhold: slow bystander (750 ms) was not counted (%d proposed, %d with 3 of 3 answers)",
+            props1 - props0, whole1 - whole0);
+    tr_await_acks(&x, now_ms(), "after the slow-bystander transfer");
     tr_finish(&x, "transferhold", 0);
 }
 
@@ -17659,10 +17803,29 @@ static void scen_balancecut(void)
     int rc = tr_transfer(v[k].number, ids[Q], why, sizeof why);
     if (rc != 0)
         die("balancecut: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
+    /* Wait until P's volume manager has stepped past v[k].epoch: otherwise dropfence holds P's own vwatch at the old
+     * epoch as leader (server/cluster.c drop_fence_file), which drops P out of the ISR so balance never targets P. */
+    for (uint64_t tw = now_ms();;) {
+        struct view vw;
+        view(P, &vw);
+        int seen = 0;
+        for (uint32_t i = 0; i < vw.st.nheard && !seen; i++)
+            if (vw.st.heard[i].id == ids[P])
+                for (uint32_t j = 0; j < vw.st.heard[i].nvols; j++)
+                    if (vw.st.heard[i].vols[j].v.volume == v[k].number &&
+                        vw.st.heard[i].vols[j].v.epoch > v[k].epoch)
+                        seen = 1;
+        view_free(&vw);
+        if (seen)
+            break;
+        if (now_ms() - tw > 4000)
+            die("balancecut: server %d did not step past epoch %" PRIu64 " of %s", P, v[k].epoch, nm[k]);
+        usleep(20000);
+    }
     state_flag(P, "dropfence", 1); /* before the hold of 5 s runs out */
-    uint64_t b0 = 0, d0 = 0;
+    uint64_t b0[3] = {0}, d0 = 0;
     for (int i = 0; i < 3; i++)
-        b0 += tr_count(i, CL_TR_BALANCE), d0 += tr_count(i, CL_TR_DONE);
+        b0[i] = tr_count(i, CL_TR_BALANCE), d0 += tr_count(i, CL_TR_DONE);
     uint64_t t0 = now_ms();
     struct meta_volume x;
     while (now_ms() - t0 < 60000) {
@@ -17670,20 +17833,28 @@ static void scen_balancecut(void)
             die("balancecut: node %u leads %s although it answers no fence", pn, nm[k]);
         usleep(200000);
     }
-    uint64_t bal = 0, done = 0, failed = 0;
+    uint64_t bal = 0, done = 0, failed = 0, max_per = 0;
+    int max_s = 0;
     for (int i = 0; i < 3; i++) {
-        bal += tr_count(i, CL_TR_BALANCE);
+        uint64_t bi = tr_count(i, CL_TR_BALANCE) - b0[i];
+        bal += bi;
+        if (bi > max_per)
+            max_per = bi, max_s = i;
         done += tr_count(i, CL_TR_DONE);
         failed += tr_count(i, CL_TR_TIMEDOUT) + tr_count(i, CL_TR_CANCELLED) + tr_count(i, CL_TR_FALLBACK);
     }
-    bal -= b0, done -= d0;
-    printf("  %s cut one way from its preferred node %u: %" PRIu64 " balance transfers in 60 s, %" PRIu64 " done, %"
-           PRIu64 " failed\n", nm[k], pn, bal, done, failed);
+    done -= d0;
+    printf("  %s cut one way from its preferred node %u: %" PRIu64 " balance transfers in 60 s (max %" PRIu64
+           " on one Raft leader), %" PRIu64 " done, %" PRIu64 " failed\n",
+           nm[k], pn, bal, max_per, done, failed);
     if (bal < 1)
         die("balancecut: no balance transfer to node %u in 60 s", pn);
-    if (bal > 4)
-        die("balancecut: %" PRIu64 " balance transfers to node %u in 60 s, more than the hold and the backoff allow (4)",
-            bal, pn);
+    /* Backoff state lives in memory on each Raft leader (ctransfer.c), so a Raft election during the 60 s lets a new
+     * leader start its own backoff sequence (4 + 1 = 5 across two leaders). No single leader may exceed 4 in 60 s, and
+     * mutant balanceflap tries ~25 times on a leader. */
+    if (max_per > 4)
+        die("balancecut: server %d started %" PRIu64 " balance transfers to node %u in 60 s, more than the hold and "
+            "the backoff allow (4)", max_s, max_per, pn);
     for (uint64_t t1 = now_ms(); failed < bal && now_ms() - t1 < 20000; usleep(200000)) { /* one may be under way */
         failed = 0;
         for (int i = 0; i < 3; i++)
@@ -18730,6 +18901,10 @@ int main(int argc, char **argv)
     th_watchdog("test_cluster", 1800);
     if (argc == 3 && !strcmp(argv[1], "hardslot-child"))
         return hardslot_child(argv[2]);
+#ifdef __linux__
+    if (argc == 2 && !strcmp(argv[1], "crashpt-child"))
+        return crashpt_child();
+#endif
     /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a run writes over a GB */
     const char *scratch = argc > 1 && *argv[1] ? argv[1] : getenv("TMPDIR");
     if (!scratch || !*scratch)
@@ -18751,7 +18926,7 @@ int main(int argc, char **argv)
         const char *name;
         void (*fn)(void);
     } all[] = {{"secret", scen_secret},     {"relay", scen_relay},     {"initcrash", scen_initcrash},
-               {"dirsync", scen_dirsync},   {"install", scen_install}, {"reseed", scen_reseed},
+               {"dirsync", scen_dirsync},   {"exitthreads", scen_exitthreads},   {"install", scen_install}, {"reseed", scen_reseed},
                {"torn", scen_torn},         {"rebase", scen_rebase},
                {"slowinstall", scen_slowinstall},
                {"ids", scen_ids},           {"watch", scen_watch},     {"stall", scen_stall},

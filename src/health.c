@@ -47,6 +47,7 @@
 #define PROBE_BYTES 4096
 #define MAX_WORKERS 2
 #define LAT_N 64
+#define BASE_INIT_N 32
 
 typedef struct {
     int64_t at_ms;
@@ -72,7 +73,9 @@ struct hdomain {
     uint64_t probes_ok, probes_err;
     lat_sample lat[LAT_N];
     int nlat;
-    double base_ms; /* slow average of the write probe latency */
+    double base_ms; /* baseline write-probe latency: median during warmup, then slow EWMA once per UP probe */
+    int base_init[BASE_INIT_N];
+    int nbase;
     int64_t up_since_ms;    /* the last time the state became UP: probes begun before it are no evidence of slowness */
     int64_t below_since_ms; /* DEGRADED: since when the latency is under the threshold */
     int64_t down_at[HEALTH_FLAP_DOWNS]; /* when the last DOWNs began */
@@ -217,6 +220,20 @@ static int dom_index(tsdb_health *h, struct hdomain *d)
     return -1;
 }
 
+static int base_median(const int *v, int n)
+{
+    int tmp[BASE_INIT_N];
+    for (int i = 0; i < n; i++) {
+        int x = v[i], j = i;
+        while (j > 0 && tmp[j - 1] > x) {
+            tmp[j] = tmp[j - 1];
+            j--;
+        }
+        tmp[j] = x;
+    }
+    return tmp[(n - 1) / 2];
+}
+
 /* A probe finished (any worker): records it and answers for the failure rules of DOWN. */
 static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t start, int64_t now)
 {
@@ -259,6 +276,21 @@ static void probe_done(struct hdomain *d, int slot, bool write, int err, int64_t
                 s->at_ms = now;
                 s->ms = ms;
                 d->nlat++;
+                /* Update the baseline once per non-space UP write probe: median during warmup so a slow cold-start
+                 * O_CREAT/fdatasync cannot poison the threshold for minutes, then a slow EWMA (~1 h at 5 s/probe).
+                 * Skip probes already above the current threshold so an onset of slowness does not drag the baseline
+                 * up before tick_domain enters DEGRADED. */
+                if (!space && d->state == TSDB_DOM_UP) {
+                    double thr = d->base_ms * 10 > h->o.degraded_min_ms ? d->base_ms * 10 : h->o.degraded_min_ms;
+                    if (ms <= thr) {
+                        if (d->nbase < BASE_INIT_N) {
+                            d->base_init[d->nbase++] = ms;
+                            d->base_ms = base_median(d->base_init, d->nbase);
+                        } else {
+                            d->base_ms = d->base_ms * 0.998 + ms * 0.002;
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -338,9 +370,16 @@ static void *probe_main(void *p)
         pthread_mutex_unlock(&h->mu);
 
         int err;
+        int64_t pstart = now;
         if (write) {
-            err = made ? 0 : probe_make(d->dir);
-            made = made || err == 0;
+            if (!made) {
+                err = probe_make(d->dir);
+                made = err == 0;
+                if (!err)
+                    pstart = mono_ms(); /* one-time PROBE creation is not part of steady-state write latency */
+            } else {
+                err = 0;
+            }
             if (!err)
                 err = probe_write(d->dir, h->node, ++wn);
         } else {
@@ -352,7 +391,7 @@ static void *probe_main(void *p)
                     err = probe_read(d->dir);
             }
         }
-        probe_done(d, slot, write, err, now, mono_ms());
+        probe_done(d, slot, write, err, pstart, mono_ms());
     }
 }
 
@@ -438,11 +477,6 @@ static void tick_domain(tsdb_health *h, int di, int64_t now, hev *events, int *n
                     d->below_since_ms = now;
                 else if (now - d->below_since_ms >= h->o.degraded_exit_ms)
                     set_state(d, TSDB_DOM_UP, now);
-            }
-            if (d->state == TSDB_DOM_UP && d->nlat) {
-                /* the baseline follows the median-ish latency slowly; a DEGRADED period does not move it */
-                double last = d->lat[(d->nlat - 1) % LAT_N].ms;
-                d->base_ms = d->base_ms == 0 ? last : d->base_ms * 0.999 + last * 0.001;
             }
         }
         break;
