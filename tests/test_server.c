@@ -2522,6 +2522,61 @@ static void test_metrics_buckets(void)
     CHECK(metrics_bucket_for(30.1) == 15 && metrics_bucket_for(1e9) == 15);
 }
 
+/* A query that fails after earlier frames (r8f-final3: an .ec granule whose stores went away, after 32768 rows): the
+ * error's frame carried the rows still gathered and the UNAVAILABLE body after them, which the C client took as
+ * corrupt (TSDB_ERR_CORRUPT, the connection broken). TSDBD_TEST_QUERY_STATUS ends a whole answer with that status. */
+static int ear_raw(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts, (void)v;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+static int ear_values(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    (void)ts, (void)v;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+static void test_error_after_rows(const char *dir)
+{
+    char cmd[700];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    setenv("TSDBD_TEST_QUERY_STATUS", "-11", 1); /* TSDB_ERR_UNAVAILABLE */
+    pid_t srv = start_server_with(dir, NULL);
+    unsetenv("TSDBD_TEST_QUERY_STATUS");
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    OK(tsdbc_set_retry(c, 0));
+    tsdb_sid a;
+    OK(tsdbc_series(c, "ear", 1, &a));
+    enum { NR = 20000 }; /* more than one frame of rows (16384), and some left when the query ends */
+    static int64_t ts[NR];
+    static float v[NR];
+    for (int i = 0; i < NR; i++)
+        ts[i] = T0 + i, v[i] = (float)i;
+    OK(tsdbc_insert_series(c, a, ts, v, NR));
+    size_t got = 0;
+    int rc = tsdbc_query_raw(c, a, 0, INT64_MAX / 2, ear_raw, &got);
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        fprintf(stderr, "raw: error %d after %zu rows, want UNAVAILABLE (-11)\n", rc, got);
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    CHECK(got == 16384); /* the rows of the frames sent before the error, never those of its own frame */
+    got = 0;
+    rc = tsdbc_query_values(c, a, 0, INT64_MAX / 2, NULL, ear_values, &got);
+    if (rc != TSDB_ERR_UNAVAILABLE)
+        fprintf(stderr, "values: error %d after %zu rows, want UNAVAILABLE (-11)\n", rc, got);
+    CHECK(rc == TSDB_ERR_UNAVAILABLE);
+    CHECK(got == 16384);
+    tsdb_sid b; /* the connection is still in step */
+    OK(tsdbc_series(c, "ear", 1, &b));
+    CHECK(a == b);
+    tsdbc_close(c);
+    stop_server(srv);
+}
+
 static void test_metrics(const char *dir)
 {
     test_metrics_buckets();
@@ -4085,6 +4140,9 @@ int main(int argc, char **argv)
     printf("small writes waiting for a large write leave workers for queries\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-fence-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_fence_workers(dir);
+    printf("an error after rows: the error's frame carries none\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-ear-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_error_after_rows(dir);
     printf("prometheus metrics\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_metrics(dir);
