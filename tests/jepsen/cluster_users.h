@@ -72,7 +72,7 @@ struct jmodel {
     int64_t open_for[MAXN], open_ns[MAXN]; /* the process (its start) that answered something but UNAVAILABLE, and when */
     uint32_t seen[MAXN][JU_NU];            /* 1 + the position of the newest password that logged in at the member */
     int64_t seen_te[MAXN][JU_NU];
-    uint64_t ck_dead, ck_live, ck_deny, ck_allow, ck_refused, ck_cli_lag, viol;
+    uint64_t ck_dead, ck_live, ck_deny, ck_allow, ck_refused, viol;
     int quiet; /* the selftest: no line per violation */
 };
 
@@ -91,7 +91,7 @@ static void jm_free(struct jmodel *m)
 }
 
 /* a change has begun: its index (1-based, in the password) */
-static uint32_t jm_add(struct jmodel *m, int kind, int user, int64_t begin)
+static uint32_t jm_add(struct jmodel *m, int kind, int u, int64_t begin)
 {
     pthread_mutex_lock(&m->mu);
     if (m->n == m->cap) {
@@ -100,21 +100,21 @@ static uint32_t jm_add(struct jmodel *m, int kind, int user, int64_t begin)
         if (!m->c)
             die(2, "out of memory");
     }
-    if (m->nux[user] == m->capx[user]) {
-        m->capx[user] = m->capx[user] ? m->capx[user] * 2 : 256;
-        m->ux[user] = realloc(m->ux[user], m->capx[user] * sizeof *m->ux[user]);
-        if (!m->ux[user])
+    if (m->nux[u] == m->capx[u]) {
+        m->capx[u] = m->capx[u] ? m->capx[u] * 2 : 256;
+        m->ux[u] = realloc(m->ux[u], m->capx[u] * sizeof *m->ux[u]);
+        if (!m->ux[u])
             die(2, "out of memory");
     }
     struct jch *c = &m->c[m->n++];
     memset(c, 0, sizeof *c);
     c->kind = (uint8_t)kind;
-    c->user = (uint8_t)user;
+    c->user = (uint8_t)u;
     c->st = JS_INFLIGHT;
     c->begin = begin;
     c->end = INT64_MAX;
-    c->pos = m->nux[user];
-    m->ux[user][m->nux[user]++] = m->n - 1;
+    c->pos = m->nux[u];
+    m->ux[u][m->nux[u]++] = m->n - 1;
     uint32_t id = m->n;
     pthread_mutex_unlock(&m->mu);
     return id;
@@ -438,7 +438,7 @@ static _Atomic uint64_t ju_adm2_cycles, ju_adm2_attempts, ju_adm2_denied, ju_adm
 enum { ADM_IDLE = 0, ADM_SUPER = 1, ADM_DEMOTING = 2, ADM_DEMOTED = 3 };
 static pthread_mutex_t adm2_mu = PTHREAD_MUTEX_INITIALIZER;
 static int adm2_phase, adm2_active;
-static uint64_t adm2_ver;
+static uint64_t adm2_ver, adm2_demoted_ver;
 static int64_t adm2_demoted_ns = INT64_MAX;
 
 static uint64_t ju_rng(uint64_t *s)
@@ -511,13 +511,10 @@ static uint32_t ju_pick_pw(int u, uint64_t *rs)
 
 /* the first violation: what every member's metadata copy holds of the user, and who leads (the copy is the cluster
  * thread's; the login reads what the users watch took from it, a step behind) */
-static void ju_diag(int x, int u, uint32_t a)
+static void ju_diag_user(int x, const char *name, const char *pw, _Atomic int *done)
 {
-    static _Atomic int done;
-    if (atomic_exchange(&done, 1))
+    if (atomic_exchange(done, 1))
         return;
-    char name[16];
-    snprintf(name, sizeof name, "ju%d", u);
     fprintf(stderr, "jepsen-cluster: users: at the first violation (member %d, user %s) at %lld ms:\n", x, name,
             (long long)(now_ns() / 1000000));
     for (int i = 0; i < nn; i++) {
@@ -527,13 +524,20 @@ static void ju_diag(int x, int u, uint32_t a)
             continue;
         }
         const struct meta_user *mu = meta_user(&v.m, name);
-        fprintf(stderr, "  member %d: role %d, leader %u, applied %" PRIu64 ", %u users, %s %s (version %" PRIu64 "), users "
-                "caught up %d\n", i, (int)v.st.role, (unsigned)v.st.leader, (uint64_t)v.m.applied, (unsigned)v.m.nusers,
-                name, mu ? "present" : "absent", mu ? (uint64_t)mu->version : 0, (int)v.st.users_caught_up);
+        int sup = -1;
+        if (mu) {
+            user *du = NULL;
+            if (user_blob_decode(mu->blob, mu->len, &du) == 0 && du) {
+                sup = (du->flags & USER_SUPERUSER) != 0;
+                user_release(du);
+            }
+        }
+        fprintf(stderr, "  member %d: role %d, leader %u, applied %" PRIu64 ", %u users, %s %s (version %" PRIu64
+                ", super %d), users caught up %d\n", i, (int)v.st.role, (unsigned)v.st.leader, (uint64_t)v.m.applied,
+                (unsigned)v.m.nusers, name, mu ? "present" : "absent", mu ? (uint64_t)mu->version : 0, sup,
+                (int)v.st.users_caught_up);
         view_free(&v);
         /* and what its login answers now: the same user and password, and the users the superuser sees there */
-        char pw[40];
-        ju_pw(pw, sizeof pw, u, a - 1);
         tsdbc *c = NULL;
         int64_t sp;
         int rc = ju_connect(i, name, pw, &c, &sp);
@@ -555,6 +559,21 @@ static void ju_diag(int x, int u, uint32_t a)
     }
 }
 
+static void ju_diag(int x, int u, uint32_t a)
+{
+    static _Atomic int done;
+    char name[16], pw[40];
+    snprintf(name, sizeof name, "ju%d", u);
+    ju_pw(pw, sizeof pw, u, a - 1);
+    ju_diag_user(x, name, pw, &done);
+}
+
+static void ju_diag_adm(int x)
+{
+    static _Atomic int done_adm;
+    ju_diag_user(x, adm2_user, adm2_pw, &done_adm);
+}
+
 static void ju_snap_procs(int64_t p[MAXN])
 {
     pthread_mutex_lock(&tbl_mu);
@@ -563,67 +582,211 @@ static void ju_snap_procs(int64_t p[MAXN])
     pthread_mutex_unlock(&tbl_mu);
 }
 
-/* run one admin op through `tsdb cluster user ... --wait-ms`; returns 0 if attempted (with *st_out, *rc_equiv,
- * *lag_mask, *lag_ok), or -1 if node i is down/paused */
-static int ju_cli_op(int i, int kind, int u, const char *name, const char *pw, const char *sel, int wait_ms,
-                     int *st_out, int *rc_equiv, uint32_t *lag_mask, int *lag_ok)
+static void ju_write_pw_file(const char *path, const char *pw)
 {
-    pid_t pid;
-    int pp, paused;
-    pthread_mutex_lock(&tbl_mu);
-    pid = nodes[i].pid;
-    pp = nodes[i].pport;
-    paused = nodes[i].paused;
-    pthread_mutex_unlock(&tbl_mu);
-    if (pid <= 0 || pp <= 0 || paused)
-        return -1;
-    if (kind == JK_ADD || kind == JK_PASSWD) {
-        FILE *f = fopen(cli_pw_path, "w");
-        if (!f || fprintf(f, "%s\n", pw) < 0 || fclose(f) != 0)
-            die(2, "cannot write %s", cli_pw_path);
-        chmod(cli_pw_path, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        die(2, "cannot open %s: %s", path, strerror(errno));
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        die(2, "fdopen %s: %s", path, strerror(errno));
     }
+    if (fprintf(f, "%s\n", pw) < 0 || fclose(f) != 0)
+        die(2, "cannot write %s", path);
+}
+
+/* Run `argv[0]` with literal `argv` (no shell), capturing stdout+stderr into `out` under a wall-clock deadline.
+ * Returns 0 on normal exit (*wstatus set, *truncated set if output exceeded out_sz - 1), 1 on timeout or early stop
+ * (child SIGKILLed and reaped), or -1 if pipe/fork failed before spawning. */
+static int ju_run_cli(char *const argv[], char *out, size_t out_sz, int timeout_ms, int check_stop, int *wstatus,
+                      int *truncated)
+{
+    out[0] = 0;
+    if (wstatus)
+        *wstatus = 0;
+    if (truncated)
+        *truncated = 0;
+    int pfd[2];
+    if (pipe(pfd) != 0)
+        return -1;
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(pfd[0]);
+        int dn = open("/dev/null", O_RDONLY);
+        if (dn >= 0) {
+            dup2(dn, 0);
+            if (dn > 2)
+                close(dn);
+        }
+        dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
+        if (pfd[1] > 2)
+            close(pfd[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    int64_t deadline = now_ms() + timeout_ms;
+    size_t got = 0;
+    int trunc = 0, killed = 0;
+    while (pfd[0] >= 0) {
+        if (check_stop && (!atomic_load(&ju_admin_run) || atomic_load(&stopping))) {
+            killed = 1;
+            break;
+        }
+        int64_t rem = deadline - now_ms();
+        if (rem <= 0) {
+            killed = 1;
+            break;
+        }
+        int slice = rem > 100 ? 100 : (int)rem;
+        struct pollfd pf = {.fd = pfd[0], .events = POLLIN};
+        int pr = poll(&pf, 1, slice);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            killed = 1;
+            break;
+        }
+        if (pr == 0)
+            continue;
+        for (;;) {
+            ssize_t n;
+            if (got < out_sz - 1) {
+                n = read(pfd[0], out + got, out_sz - 1 - got);
+                if (n > 0)
+                    got += (size_t)n;
+            } else {
+                char sink[512];
+                n = read(pfd[0], sink, sizeof sink);
+                if (n > 0)
+                    trunc = 1;
+            }
+            if (n == 0) {
+                close(pfd[0]);
+                pfd[0] = -1;
+                break;
+            }
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+                close(pfd[0]);
+                pfd[0] = -1;
+                break;
+            }
+        }
+    }
+    if (pfd[0] >= 0)
+        close(pfd[0]);
+    out[got] = 0;
+    if (truncated)
+        *truncated = trunc;
+    int st = 0;
+    if (!killed) {
+        for (;;) {
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            if (w == pid) {
+                if (wstatus)
+                    *wstatus = st;
+                return 0;
+            }
+            if (w < 0 && errno != EINTR)
+                return 1;
+            if ((check_stop && (!atomic_load(&ju_admin_run) || atomic_load(&stopping))) || now_ms() >= deadline) {
+                killed = 1;
+                break;
+            }
+            usleep(5000);
+        }
+    }
+    signal_child(pid, SIGKILL);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    return 1;
+}
+
+/* run one admin op through `tsdb cluster user ... --wait-ms` against peer port `pp`; returns 0 if spawned (with
+ * *st_out, *rc_equiv, *lag_mask, *lag_ok), or -1 if pipe/fork failed before spawning */
+static int ju_cli_op(int pp, int kind, const char *name, const char *pw, const char *sel, int wait_ms, int *st_out,
+                     int *rc_equiv, uint32_t *lag_mask, int *lag_ok)
+{
+    if (kind == JK_ADD || kind == JK_PASSWD)
+        ju_write_pw_file(cli_pw_path, pw);
     const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
-    char cmd[3 * PATH_MAX + 256], out[4096];
+    char addr[48], wms[24], pref[32], out[4096];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
+    snprintf(wms, sizeof wms, "%d", wait_ms);
+    snprintf(pref, sizeof pref, "prefix:%s", sel);
+    char *argv[16];
+    int ac = 0;
+    argv[ac++] = (char *)cli;
+    argv[ac++] = "cluster";
+    argv[ac++] = "user";
     switch (kind) {
     case JK_ADD:
-        snprintf(cmd, sizeof cmd, "%s cluster user add 127.0.0.1:%d %s --password-file %s --wait-ms %d --secret-file %s 2>&1",
-                 cli, pp, name, cli_pw_path, wait_ms, secret_path);
+        argv[ac++] = "add";
+        argv[ac++] = addr;
+        argv[ac++] = (char *)name;
+        argv[ac++] = "--password-file";
+        argv[ac++] = cli_pw_path;
         break;
     case JK_PASSWD:
-        snprintf(cmd, sizeof cmd, "%s cluster user passwd 127.0.0.1:%d %s --password-file %s --wait-ms %d --secret-file %s 2>&1",
-                 cli, pp, name, cli_pw_path, wait_ms, secret_path);
+        argv[ac++] = "passwd";
+        argv[ac++] = addr;
+        argv[ac++] = (char *)name;
+        argv[ac++] = "--password-file";
+        argv[ac++] = cli_pw_path;
         break;
     case JK_DROP:
-        snprintf(cmd, sizeof cmd, "%s cluster user drop 127.0.0.1:%d %s --wait-ms %d --secret-file %s 2>&1",
-                 cli, pp, name, wait_ms, secret_path);
+        argv[ac++] = "drop";
+        argv[ac++] = addr;
+        argv[ac++] = (char *)name;
         break;
     case JK_GRANT:
-        snprintf(cmd, sizeof cmd, "%s cluster user grant 127.0.0.1:%d %s prefix:%s read --wait-ms %d --secret-file %s 2>&1",
-                 cli, pp, name, sel, wait_ms, secret_path);
+        argv[ac++] = "grant";
+        argv[ac++] = addr;
+        argv[ac++] = (char *)name;
+        argv[ac++] = pref;
+        argv[ac++] = "read";
         break;
     default:
-        snprintf(cmd, sizeof cmd, "%s cluster user revoke 127.0.0.1:%d %s prefix:%s read --wait-ms %d --secret-file %s 2>&1",
-                 cli, pp, name, sel, wait_ms, secret_path);
+        argv[ac++] = "revoke";
+        argv[ac++] = addr;
+        argv[ac++] = (char *)name;
+        argv[ac++] = pref;
+        argv[ac++] = "read";
         break;
     }
-    (void)u;
-    FILE *p = popen(cmd, "r");
-    if (!p)
+    argv[ac++] = "--wait-ms";
+    argv[ac++] = wms;
+    argv[ac++] = "--secret-file";
+    argv[ac++] = secret_path;
+    argv[ac] = NULL;
+    int pst = 0, trunc = 0;
+    int run_rc = ju_run_cli(argv, out, sizeof out, wait_ms + 8000, 1, &pst, &trunc);
+    if (run_rc < 0)
         return -1;
-    size_t got = fread(out, 1, sizeof out - 1, p);
-    out[got] = 0;
-    int pst = pclose(p);
     *lag_mask = 0;
-    *lag_ok = 1;
+    *lag_ok = run_rc == 0 && !trunc;
     *rc_equiv = 0;
-    if (WIFEXITED(pst) && WEXITSTATUS(pst) == 0 && (strstr(out, "put user ") || strstr(out, "dropped user "))) {
+    if (run_rc == 0 && WIFEXITED(pst) && WEXITSTATUS(pst) == 0 && (strstr(out, "put user ") || strstr(out, "dropped user "))) {
         *st_out = JS_OK;
         for (int k = 0; k < nn; k++)
             if (!atomic_load(&nodes[k].id))
                 *lag_ok = 0;
         const char *lp = out;
-        while ((lp = strstr(lp, "lagging: node ")) != NULL) {
+        while (*lag_ok && (lp = strstr(lp, "lagging: node ")) != NULL) {
             lp += 14;
             char *ep = NULL;
             unsigned long nid = strtoul(lp, &ep, 10);
@@ -638,10 +801,10 @@ static int ju_cli_op(int i, int kind, int u, const char *name, const char *pw, c
                 *lag_mask |= (1u << lx);
             lp = ep;
         }
-    } else if (strstr(out, " exists\n")) {
+    } else if (run_rc == 0 && kind == JK_ADD && strstr(out, " exists\n")) {
         *st_out = JS_FAIL;
         *rc_equiv = TSDB_ERR_INVALID;
-    } else if (strstr(out, ": no such user\n") || strstr(out, "holds none of those rights")) {
+    } else if (run_rc == 0 && (strstr(out, ": no such user\n") || strstr(out, "holds none of those rights"))) {
         *st_out = JS_FAIL;
         *rc_equiv = TSDB_ERR_NOTFOUND;
     } else {
@@ -673,15 +836,23 @@ static void *ju_admin(void *arg)
         if (use_cli) {
             static const int waits[] = {50, 200, 4000, 5000};
             int wait_ms = waits[ju_rng(&rs) % 4];
+            int pp = 0;
             int64_t pb[MAXN], pe[MAXN];
-            ju_snap_procs(pb);
+            pthread_mutex_lock(&tbl_mu);
+            if (nodes[i].pid > 0 && nodes[i].pport > 0 && !nodes[i].paused)
+                pp = nodes[i].pport;
+            for (int k = 0; k < nn; k++)
+                pb[k] = nodes[k].pid > 0 ? nodes[k].proc_ns : 0;
+            pthread_mutex_unlock(&tbl_mu);
+            if (pp <= 0)
+                continue;
             int64_t tb = now_ns();
             uint32_t id = jm_add(&jm, kind, u, tb);
             ju_pw(pw, sizeof pw, u, id - 1);
             uint32_t lag_mask = 0;
             int lag_ok = 0;
-            if (ju_cli_op(i, kind, u, name, pw, sel, wait_ms, &st, &rc, &lag_mask, &lag_ok) != 0) {
-                jm_end(&jm, id, JS_INDET, tb);
+            if (ju_cli_op(pp, kind, name, pw, sel, wait_ms, &st, &rc, &lag_mask, &lag_ok) != 0) {
+                jm_end(&jm, id, JS_FAIL, tb);
                 continue;
             }
             te = now_ns();
@@ -690,12 +861,8 @@ static void *ju_admin(void *arg)
             atomic_fetch_add(&ju_cli_ops, 1);
             if (st == JS_OK) {
                 atomic_fetch_add(&ju_cli_ok, 1);
-                if (lag_mask) {
+                if (lag_mask)
                     atomic_fetch_add(&ju_cli_lag, 1);
-                    pthread_mutex_lock(&jm.mu);
-                    jm.ck_cli_lag++;
-                    pthread_mutex_unlock(&jm.mu);
-                }
                 if (te - tb > JU_FAST_NS)
                     atomic_fetch_add(&ju_cli_slow, 1);
             }
@@ -755,7 +922,7 @@ static void *ju_admin(void *arg)
     return NULL;
 }
 
-static int ju_get_user_ver(int i, const char *name, uint64_t *ver)
+static int ju_get_user_state(int i, const char *name, uint64_t *ver, int *super)
 {
     pid_t pid;
     int pp, paused;
@@ -780,12 +947,20 @@ static int ju_get_user_ver(int i, const char *name, uint64_t *ver)
     size_t rl = 0;
     if (cluster_admin(addr, secret, secret_len, CLUSTER_OP_USER_GET, q, 2 + nl, 500, &rc, &rep, &rl, err, sizeof err) != 0)
         return -1;
-    int ok = rc == 0 && rl >= 12;
-    if (ok) {
-        uint64_t v = 0;
-        for (int b = 0; b < 8; b++)
-            v |= (uint64_t)rep[b] << (8 * b);
-        *ver = v;
+    int ok = 0;
+    if (rc == 0 && rl > 12) {
+        user *du = NULL;
+        if (user_blob_decode(rep + 12, rl - 12, &du) == 0 && du) {
+            uint64_t v = 0;
+            for (int b = 0; b < 8; b++)
+                v |= (uint64_t)rep[b] << (8 * b);
+            if (ver)
+                *ver = v;
+            if (super)
+                *super = (du->flags & USER_SUPERUSER) != 0;
+            user_release(du);
+            ok = 1;
+        }
     }
     free(rep);
     return ok ? 0 : -1;
@@ -825,9 +1000,12 @@ static void *ju_adm_ctrl(void *arg)
                 usleep(50000);
                 continue;
             }
+            int l = atomic_load(&last_leader);
             for (int try_v = 0; try_v < 20 && atomic_load(&ju_admin_run) && !atomic_load(&stopping); try_v++) {
+                int x = (try_v == 0 && l >= 0 && l < nn) ? l : (i + try_v) % nn;
                 uint64_t v = 0;
-                if (ju_get_user_ver((i + try_v) % nn, adm2_user, &v) == 0 && v > last_demoted_ver) {
+                int sup = 0;
+                if (ju_get_user_state(x, adm2_user, &v, &sup) == 0 && sup && v > last_demoted_ver) {
                     ver = v;
                     promoted = 1;
                     break;
@@ -840,6 +1018,7 @@ static void *ju_adm_ctrl(void *arg)
         last_super_ver = ver;
         pthread_mutex_lock(&adm2_mu);
         adm2_ver = ver;
+        adm2_demoted_ver = 0;
         adm2_demoted_ns = INT64_MAX;
         adm2_phase = ADM_SUPER;
         pthread_mutex_unlock(&adm2_mu);
@@ -858,6 +1037,7 @@ static void *ju_adm_ctrl(void *arg)
             tsdbc_set_timeout(c, 5000);
             pthread_mutex_lock(&adm2_mu);
             adm2_demoted_ns = INT64_MAX;
+            adm2_demoted_ver = 0;
             adm2_phase = ADM_DEMOTING;
             pthread_mutex_unlock(&adm2_mu);
             int rc = tsdbc_user_alter(c, adm2_user, 0);
@@ -872,16 +1052,24 @@ static void *ju_adm_ctrl(void *arg)
             } else {
                 pthread_mutex_lock(&adm2_mu);
                 int already = adm2_phase == ADM_DEMOTED;
+                uint64_t dv = adm2_demoted_ver;
                 pthread_mutex_unlock(&adm2_mu);
                 if (already) {
                     demoted = 1;
+                    if (dv > last_super_ver)
+                        last_demoted_ver = dv;
                 } else {
+                    int l = atomic_load(&last_leader);
                     for (int k = 0; k < nn; k++) {
+                        int x = (l >= 0 && l < nn) ? (l + k) % nn : k;
                         uint64_t v = 0;
-                        if (ju_get_user_ver(k, adm2_user, &v) == 0 && v > last_super_ver) {
+                        int sup = 1;
+                        if (ju_get_user_state(x, adm2_user, &v, &sup) == 0 && !sup && v > last_super_ver) {
                             pthread_mutex_lock(&adm2_mu);
                             if (adm2_demoted_ns == INT64_MAX)
                                 adm2_demoted_ns = now_ns();
+                            if (v > adm2_demoted_ver)
+                                adm2_demoted_ver = v;
                             adm2_phase = ADM_DEMOTED;
                             pthread_mutex_unlock(&adm2_mu);
                             demoted = 1;
@@ -891,18 +1079,18 @@ static void *ju_adm_ctrl(void *arg)
                     }
                     if (!demoted) {
                         pthread_mutex_lock(&adm2_mu);
-                        adm2_phase = ADM_IDLE;
+                        if (adm2_phase == ADM_DEMOTED) {
+                            demoted = 1;
+                            if (adm2_demoted_ver > last_super_ver)
+                                last_demoted_ver = adm2_demoted_ver;
+                        } else {
+                            adm2_phase = ADM_IDLE;
+                        }
                         pthread_mutex_unlock(&adm2_mu);
-                        usleep(50000);
+                        if (!demoted)
+                            usleep(50000);
                     }
                 }
-            }
-            if (demoted) {
-                uint64_t v = 0;
-                if (ju_get_user_ver(i, adm2_user, &v) == 0 && v > last_super_ver)
-                    last_demoted_ver = v;
-                else if (last_demoted_ver <= last_super_ver)
-                    last_demoted_ver = last_super_ver + 1;
             }
         }
         if (!demoted)
@@ -915,7 +1103,26 @@ static void *ju_adm_ctrl(void *arg)
             usleep(5000);
             pthread_mutex_lock(&adm2_mu);
         }
+        if (adm2_demoted_ver > last_super_ver)
+            last_demoted_ver = adm2_demoted_ver;
         pthread_mutex_unlock(&adm2_mu);
+        /* Record the exact demoted Raft log index before the next promotion; never guess last_super_ver + 1. */
+        while (last_demoted_ver <= last_super_ver && atomic_load(&ju_admin_run) && !atomic_load(&stopping)) {
+            int l = atomic_load(&last_leader);
+            for (int k = 0; k < nn; k++) {
+                int x = (l >= 0 && l < nn) ? (l + k) % nn : k;
+                uint64_t v = 0;
+                int sup = 1;
+                if (ju_get_user_state(x, adm2_user, &v, &sup) == 0 && !sup && v > last_super_ver) {
+                    last_demoted_ver = v;
+                    break;
+                }
+            }
+            if (last_demoted_ver <= last_super_ver)
+                usleep(20000);
+        }
+        if (last_demoted_ver <= last_super_ver)
+            break;
         atomic_fetch_add(&ju_adm2_cycles, 1);
     }
     pthread_mutex_lock(&adm2_mu);
@@ -930,6 +1137,7 @@ static void *ju_adm2(void *arg)
     tsdbc *ac[MAXN] = {0};
     int64_t ac_s[MAXN] = {0};
     uint64_t seq = 0;
+    int rot = 0;
     while (atomic_load(&ju_admin_run) && !atomic_load(&stopping)) {
         pthread_mutex_lock(&adm2_mu);
         int phase = adm2_phase;
@@ -944,7 +1152,7 @@ static void *ju_adm2(void *arg)
             continue;
         }
         if (phase == ADM_SUPER) {
-            for (int x = 0; x < nn && atomic_load(&ju_admin_run); x++) {
+            for (int x = 0; x < nn && atomic_load(&ju_admin_run) && !atomic_load(&stopping); x++) {
                 pthread_mutex_lock(&tbl_mu);
                 int alive = nodes[x].pid > 0 && !nodes[x].paused && nodes[x].proc_ns == ac_s[x];
                 pthread_mutex_unlock(&tbl_mu);
@@ -953,31 +1161,54 @@ static void *ju_adm2(void *arg)
                     ac[x] = NULL;
                 }
                 if (!ac[x] && ju_connect(x, adm2_user, adm2_pw, &ac[x], &ac_s[x]) == 0)
-                    tsdbc_set_timeout(ac[x], 1000);
+                    tsdbc_set_timeout(ac[x], 500);
             }
             usleep(10000);
             continue;
         }
         if (phase == ADM_DEMOTING) {
             int l = atomic_load(&last_leader);
+            int detected = 0;
             for (int k = 0; k < nn; k++) {
-                int x = (l >= 0 && l < nn && k == 0) ? l : k;
+                int x = (l >= 0 && l < nn) ? (l + k) % nn : k;
                 uint64_t v = 0;
-                if (ju_get_user_ver(x, adm2_user, &v) == 0 && v > ver) {
+                int sup = 1;
+                if (ju_get_user_state(x, adm2_user, &v, &sup) == 0 && !sup && v > ver) {
                     pthread_mutex_lock(&adm2_mu);
                     if (adm2_phase == ADM_DEMOTING) {
                         adm2_demoted_ns = now_ns();
+                        adm2_demoted_ver = v;
                         adm2_phase = ADM_DEMOTED;
+                    } else if (adm2_phase == ADM_DEMOTED && v > adm2_demoted_ver) {
+                        adm2_demoted_ver = v;
+                    }
+                    if (adm2_phase == ADM_DEMOTED) {
+                        dem_ns = adm2_demoted_ns;
+                        adm2_active = 1;
+                        detected = 1;
                     }
                     pthread_mutex_unlock(&adm2_mu);
                     break;
                 }
             }
-            usleep(5000);
-            continue;
+            if (!detected) {
+                usleep(2000);
+                continue;
+            }
+            /* fall straight into the ADM_DEMOTED firing pass with no sleep */
         }
-        /* ADM_DEMOTED: fire admin ops at every node whose process is up; none may succeed */
-        for (int x = 0; x < nn && atomic_load(&ju_admin_run) && !atomic_load(&stopping); x++) {
+        /* ADM_DEMOTED: probe followers (rotated) before last_leader; none may succeed */
+        int order[MAXN], no = 0, l = atomic_load(&last_leader);
+        for (int k = 0; k < nn; k++) {
+            int x = (rot + k) % nn;
+            if (x != l)
+                order[no++] = x;
+        }
+        if (l >= 0 && l < nn)
+            order[no++] = l;
+        rot = (rot + 1) % nn;
+        for (int k = 0; k < no && atomic_load(&ju_admin_run) && !atomic_load(&stopping); k++) {
+            int x = order[k];
             pthread_mutex_lock(&adm2_mu);
             int cur_phase = adm2_phase;
             pthread_mutex_unlock(&adm2_mu);
@@ -991,7 +1222,7 @@ static void *ju_adm2(void *arg)
                 ac[x] = NULL;
             }
             if (!ac[x] && ju_connect(x, adm2_user, adm2_pw, &ac[x], &ac_s[x]) == 0)
-                tsdbc_set_timeout(ac[x], 1000);
+                tsdbc_set_timeout(ac[x], 500);
             if (!ac[x])
                 continue;
             char sel[32];
@@ -1008,7 +1239,7 @@ static void *ju_adm2(void *arg)
                             x, (long long)(tb / 1000000), (long long)(dem_ns / 1000000));
                 pthread_mutex_unlock(&jm.mu);
                 atomic_fetch_add(&ju_adm2_viol, 1);
-                ju_diag(x, 0, 1);
+                ju_diag_adm(x);
             } else if (rc == TSDB_ERR_DENIED) {
                 atomic_fetch_add(&ju_adm2_denied, 1);
             } else if (rc == TSDB_ERR_UNAVAILABLE) {
@@ -1112,33 +1343,33 @@ static void *ju_prober(void *arg)
 static void ju_write_root_pw(void)
 {
     snprintf(auth_pw_path, sizeof auth_pw_path, "%s/jroot.pw", rundir);
-    FILE *f = fopen(auth_pw_path, "w");
-    if (!f || fprintf(f, "%s\n", auth_pw) < 0 || fclose(f) != 0)
-        die(2, "cannot write %s", auth_pw_path);
-    chmod(auth_pw_path, 0600);
+    ju_write_pw_file(auth_pw_path, auth_pw);
 }
 
-/* initialise the cluster and create the first superuser together via `tsdb cluster init --superuser` (odd seeds) */
+/* initialise the cluster and create the first superuser together via `tsdb cluster init --superuser` (odd seeds).
+ * Mirrors every S.* override set in cluster_form() (jepsen_cluster.c): keep the two in sync. */
 static int ju_init_cluster(int i)
 {
     ju_write_root_pw();
     int pp;
     node_snap(i, NULL, NULL, &pp);
     const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
-    char cmd[3 * PATH_MAX + 512], out[4096];
-    snprintf(cmd, sizeof cmd,
-             "%s cluster init 127.0.0.1:%d --secret-file %s --superuser %s --password-file %s "
-             "--mode replicated --node-timeout-ms %u --heartbeat-ms %u --lease-s %u --repl-retain-s %u 2>&1",
-             cli, pp, secret_path, auth_user, auth_pw_path, S.node_timeout_ms, S.heartbeat_ms, S.lease_s,
-             S.repl_retain_s);
-    FILE *p = popen(cmd, "r");
-    if (!p)
-        die(2, "popen %s: %s", cmd, strerror(errno));
-    size_t got = fread(out, 1, sizeof out - 1, p);
-    out[got] = 0;
-    int st = pclose(p);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !strstr(out, "initialised: node ") || !strstr(out, "put user "))
-        die(2, "cluster init --superuser: %s", out);
+    char addr[48], tmo[24], hb[24], lease[24], ret[24], out[4096];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
+    snprintf(tmo, sizeof tmo, "%u", S.node_timeout_ms);
+    snprintf(hb, sizeof hb, "%u", S.heartbeat_ms);
+    snprintf(lease, sizeof lease, "%u", S.lease_s);
+    snprintf(ret, sizeof ret, "%u", S.repl_retain_s);
+    char *argv[] = {(char *)cli, "cluster", "init", addr, "--secret-file", secret_path, "--superuser",
+                    (char *)auth_user, "--password-file", auth_pw_path, "--mode", "replicated", "--node-timeout-ms",
+                    tmo, "--heartbeat-ms", hb, "--lease-s", lease, "--repl-retain-s", ret, NULL};
+    int st = 0;
+    int run_rc = ju_run_cli(argv, out, sizeof out, 30000, 0, &st, NULL);
+    if (run_rc < 0)
+        die(2, "spawn %s cluster init: %s", cli, strerror(errno));
+    if (run_rc != 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0 || !strstr(out, "initialised: node ") ||
+        !strstr(out, "put user "))
+        die(1, "cluster init --superuser: %s", run_rc != 0 ? "timed out" : out);
     ju_super_inited = 1;
     return 0;
 }
@@ -1153,17 +1384,16 @@ static void ju_make_superuser(int i)
     int pp;
     node_snap(i, NULL, NULL, &pp);
     const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
-    char cmd[3 * PATH_MAX + 256], out[2048];
-    snprintf(cmd, sizeof cmd, "%s cluster user add 127.0.0.1:%d %s --superuser --password-file %s --secret-file %s 2>&1",
-             cli, pp, auth_user, auth_pw_path, secret_path);
-    FILE *p = popen(cmd, "r");
-    if (!p)
-        die(2, "popen %s: %s", cmd, strerror(errno));
-    size_t got = fread(out, 1, sizeof out - 1, p);
-    out[got] = 0;
-    int st = pclose(p);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || !strstr(out, "put user "))
-        die(2, "the superuser: %s", out);
+    char addr[48], out[2048];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pp);
+    char *argv[] = {(char *)cli, "cluster", "user", "add", addr, (char *)auth_user, "--superuser", "--password-file",
+                    auth_pw_path, "--secret-file", secret_path, NULL};
+    int st = 0;
+    int run_rc = ju_run_cli(argv, out, sizeof out, 30000, 0, &st, NULL);
+    if (run_rc < 0)
+        die(2, "spawn %s cluster user add: %s", cli, strerror(errno));
+    if (run_rc != 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0 || !strstr(out, "put user "))
+        die(2, "the superuser: %s", run_rc != 0 ? "timed out" : out);
 }
 
 static void ju_start(void)

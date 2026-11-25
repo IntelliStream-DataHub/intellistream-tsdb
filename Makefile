@@ -1865,9 +1865,9 @@ jepsen-selftest-5:
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
 $(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
-    server/crashpt.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
+    server/crashpt.h server/users.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
-	    $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 # on a disk, never /tmp (a tmpfs: a failing run keeps the state of five nodes there, and a power run never syncs)
 JEPSEN_CLUSTER_DIR ?= /var/tmp/tsdb-jepsen-cluster-$(shell printf %s "$(CURDIR)" | cksum | cut -d" " -f1)
 JEPSEN_NEMESES ?= kill partition pause midcommit power

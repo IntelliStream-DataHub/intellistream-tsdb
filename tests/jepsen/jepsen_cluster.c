@@ -132,6 +132,7 @@
 #include "harness.h"
 #include "meta.h"
 #include "tsdb.h"
+#include "users.h"
 #include "outagefs_ctl.h"
 
 #include <arpa/inet.h>
@@ -4041,6 +4042,8 @@ static int cluster_form(void)
      * r3e-fix15: 10 s in 2 of 13, a learner killed again and again while it caught up). */
     if (retain_eff > 0) /* --retain-s, longdown's 3 s (classes' CLASSES_RETAIN_S only with R4_REPLAY_ON_MAIN 0) */
         S.repl_retain_s = (uint32_t)retain_eff;
+    /* Any S.* override added here must be mirrored in ju_init_cluster() (cluster_users.h), which runs
+     * `tsdb cluster init --superuser` instead of CLUSTER_OP_INIT on odd-seed --auth runs. */
     uint8_t req[4 * (META_SETTINGS_WORDS + 1)]; /* 64 overflowed since the settings grew past 15 words (ASan) */
     size_t rl = cluster_settings_encode(&S, META_MODE_REPLICATED, req);
     int rc = (want_auth && (seed & 1)) ? ju_init_cluster(0) : admin_real(0, CLUSTER_OP_INIT, req, rl, 0, 10000);
