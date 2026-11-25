@@ -306,7 +306,7 @@ back to back but can lose throughput to retransmissions on a busy switch; RoCE v
 peerlink on TCP over the 40GbE Ethernet between the same hosts: `test_plrdma --verbs-listen` / `--verbs-dial` (§8),
 one link of the bulk kind (no zstd; its token bucket off), XXH3-128 frame check on (today's peerlink), 2 GiB of frames
 per size, `plink_send` from one thread, each side's process CPU (`getrusage`, every thread) per GB moved. Gbit/s mean
-(lowest-highest) of 3 runs; CPU s/GB sender / receiver. The pool is 4 MiB (the hosts' memlock is 8 MB). "Default" is
+(lowest-highest) of 3 runs; CPU s/GB sender / receiver, the mean of the same 3 runs (their spread is below the table). The pool is 4 MiB (the hosts' memlock is 8 MB). "Default" is
 `PLR_POOL_CFG_DEFAULT`'s connection (32 KiB slots, 12 data credits, 16 send slots: 384 KiB in flight); "64 KiB x 32"
 is 64 KiB slots, 32 data credits and 28 send slots (2 MiB in flight).
 
@@ -319,18 +319,25 @@ is 64 KiB slots, 32 data credits and 28 send slots (2 MiB in flight).
 | 1 MiB | 22.9 (19.2-26.6) | 0.46 / 0.33 | 17.6 (17.5-17.8) | 0.51 / 0.33 | 26.4 (25.3-27.0) | 0.46 / 0.28 |
 | 4 MiB | 23.6 (19.7-26.6) | 0.46 / 0.30 | 13.9 (13.6-14.2) | 0.53 / 0.34 | 16.9 (16.2-18.1) | 0.50 / 0.33 |
 
+The CPU means move within the runs' spread: TCP's sender ranged 0.84-1.21 s/GB at 4 KiB and about 0.40-0.67 at the
+other sizes, its receiver 0.25-0.41; the default verbs window's sender 0.46-0.92 and receiver 0.26-0.34; 64 KiB x 32's
+sender 0.37-1.12 and receiver 0.25-0.33. So no CPU difference between the transports is shown by these runs beyond
+that spread.
+
 On a log link (zstd-1 on every frame, incompressible payloads), one run each: 4 KiB 3.9 Gbit/s on both, 64 KiB 11.4
 (TCP) and 10.6 (verbs), 1 MiB 13.6 and 8.8; the sender's zstd (0.7-2.9 s/GB) is the limit there, not the transport.
 
 What this says. The transport is not the limit: perftest moves 50 Gbit/s at 0.02 CPU s/GB on this pair (§3.1),
 and here both transports stop at 20-30 Gbit/s with about 0.45 s/GB on the sender, which is peerlink's own work on one
 thread per link (the frame copied at `plink_send`, encoded with its check into the write buffer, then copied into the
-socket or a slot). Verbs saves 10-20% of the receiver's CPU and some of the sender's; it is faster than TCP only with
-a window large enough to cover the link thread's work on one frame: with the default 384 KiB it falls behind TCP from
-1 MiB frames (while the link thread encodes the next frame, a window that small sits idle, where TCP's send buffer
+socket or a slot). The CPU per GB is about the same on both: with the default window the receiver's mean is between
+10% lower and 13% higher than TCP's and the sender's between 9% lower and 15% higher; with 64 KiB x 32 the receiver's
+is 13-17% lower from 16 KiB to 1 MiB (3% at 4 KiB, 10% higher at 4 MiB), all inside the spread of the TCP runs. Verbs
+is faster than TCP only with a window large enough to cover the link thread's work on one frame: with the default
+384 KiB it is 23% slower than TCP at 1 MiB frames and 41% slower at 4 MiB (while the link thread encodes the next frame, a window that small sits idle, where TCP's send buffer
 of several MB keeps the wire busy), and with 2 MiB in flight it leads at every size but 4 MiB. Two consequences for
 the tracks after this one: the window should follow the kind (bulk, CHUNKB and SNAP a large one; LOG, FWD and CHUNK
-requests the default), and a zero-copy path (frames encoded straight into registered slots) is what would move
+requests the default; open below §9, to be decided before rd-upgrade turns `auto` on), and a zero-copy path (frames encoded straight into registered slots) is what would move
 peerlink toward the 50 Gbit/s of §3.1. Every run ended with both pools whole (no slot lost) and the check of 2000
 frames both ways, every byte compared, passed.
 
@@ -402,7 +409,11 @@ finite `rnr_retry`, and the tests set 0 so that a SEND without a receive fails t
   window, and peerlink never counts a peer dead while its own link is paused (test_plrdma `pause`). A control frame takes one control credit; a side sends one only while it holds one, so at most K
   are in flight per direction and they cannot storm. Control credits are returned only piggybacked, in the header of
   the next frame of either class, never by a frame of their own; an `RDMA_CREDIT` that would return only control
-  credits is sent only when at least K/2 are owed, so a credit exchange dies out instead of answering itself.
+  credits is sent only when at least K/2 are owed, so a credit exchange dies out instead of answering itself. That
+  needs K/2 >= 2: with a threshold of 1 every such CREDIT makes the peer owe one, which it returns at once (test_plrdma
+  measured about 10,000 CREDITs a second on an idle link with K = 2 or 3). *As built*: a pool refuses fewer than 4
+  control slots (`PLR_CTL_MIN`) or more than 255 (one header byte), and more than 65535 data and control slots
+  together, and `plr_ep_decode` refuses a peer's endpoint that says so.
   `plink_pause` never withholds control credits: PINGs and PONGs go on, and a paused link is never counted dead
   (peerlink.h's rule for paused links).
 - Both sides at zero data credits with frames queued is not a deadlock: each still holds control credits, and an
@@ -765,15 +776,27 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
   over IB (replicate, fwd, chunksrv, a snapshot), `jepsen-cluster --peer-rdma on` with a nemesis that breaks only the
   RDMA path (a QP forced to error through a test hook, `TSDB_PLRDMA_TEST`), and the §10.3 measurements of
   design-cluster.md over TCP and over IB.
-- **As built in rd-verbs** (`tests/test_plrdma.c`, `tests/plr_fake.h`): cases `ep pool basic pause storm written qperr`
-  and the mutants `writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff` (`make test-meta` requires
-  each to fail). Not plantable under the transport seam, so not there: "a flushed WR reported NEVER_WRITTEN" (a
+- **As built in rd-verbs** (`tests/test_plrdma.c`, `tests/plr_fake.h`): cases `ep pool basic pause storm written qperr
+  asym anchor wakeup errors` and the mutants `writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff
+  room crown norecvmark norearm anchorbyte` (`make test-meta` requires each to fail). The rigs' fake flushes a failed
+  queue pair as an HCA does, asynchronously (one work request per queue and fabric tick), so a drain that waits for
+  less than both markers is caught; `asym` runs two pools with different slot sizes, data and control slots (the
+  peer's numbers rule what is sent); `wakeup` runs with PINGs 10 s apart and a fake that shows a completion made while
+  its queue pair is not armed only at the next arm, without an event (a missing look after the arm waits for a
+  timer); `errors` covers a device, a queue pair and a connect that fail, and a drain that never finishes (its slots
+  stay out of the pool, `lost`). Not plantable under the transport seam, so not there: "a flushed WR reported NEVER_WRITTEN" (a
   transport cannot take back bytes `writev` took: D5 holds by construction, `written` checks it), "an old generation's
   frame posted to the new QP" (peerlink's generations, test_peerlink's), and every upgrade, fallback, READY/GO and MAC
   mutant (rd-upgrade's). On the hardware: `test_plrdma --verbs-listen ADDR --port-file F` on one host and
   `--verbs-dial ADDR:PORT` on the other (ADDR an Ethernet address; the TCP connection carries the endpoints and stays
   as the anchor) runs a check of 2000 frames both ways, every byte compared, then the §3.6 bench, and requires both
-  pools whole at the end; `--tcp` runs the same over the TCP connection.
+  pools whole at the end; `--tcp` runs the same over the TCP connection. It sets `rnr_retry` 0 (`--rnr-retry N`
+  changes it), so a SEND that finds no posted receive fails the queue pair and the check: on real verbs the credit rule
+  is then checked, not hidden by retries (the §3.6 numbers were taken with the default 3; with 0, one run of each
+  window, the default at 4 KiB to 4 MiB frames and 64 KiB x 32 at 4 KiB to 1 MiB, 1 GiB per size: the check and the
+  bench passed, no queue pair failed, both pools whole). Not run on the hardware yet:
+  a queue pair that fails mid-stream, a peer killed with receives in flight, a drain after an error with unsignalled
+  sends in flight (how mlx4 reports flushed unsignalled work requests is checked only against the fake); rd-hw's.
 - `make test-spdx`, `make check-version` unchanged; `tools/check-glibc.sh` must still pass (no new linked library).
 
 ## 9. Track plan
@@ -787,6 +810,14 @@ corruption but not a host's or a buffer's, and the sequence number would go unch
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |
 | rd-rxe | medium | rd-upgrade | tests: a helper that finds an rxe device (or says skipped; `TSDB_RDMA_REQUIRED=1` fails instead), the weekly gate's setup step on the dev machine (the device, memlock), test_peerlink and test_cluster `rdma` runs with a tiny pool and `rnr_retry` 0, whether CI can load rdma_rxe and the CI job if it can | 1 |
 | rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed (batched, buffers on both sides); on a production-like node NFS/RDMA and WAL `fdatasync` latency under peer bulk load at several caps, and the end-to-end rebuild rate (D11); results here | 1.5 |
+
+Open before rd-upgrade turns `auto` on (D6), from §3.6: with the default connection (32 KiB slots, 12 data credits)
+bulk frames of 1 MiB and 4 MiB are 23% and 41% slower than checked TCP, and the window that wins (64 KiB x 32, about
+2 MiB in flight) does not fit D7's sizing (56 connections x (32 + 4 receive + 28 send) x 64 KiB is about 230 MiB
+against the default 64 MiB pool). A window per kind, the pool's size and the memlock it needs are to be decided
+first. rd-upgrade also creates the key `cluster.peer.rdma.pool_mb` under that name: the pool's error lines already
+name it. The pool's memlock check counts the pool alone; the queue pairs' buffers and io_uring's rings count against
+the same limit, which the line says.
 
 About 12 days; rd-mac stands alone and is worth merging first even if the rest waits, and D14's decision point
 follows it. The gates: the targeted tests of

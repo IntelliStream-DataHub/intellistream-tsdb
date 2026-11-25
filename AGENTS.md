@@ -273,12 +273,13 @@ cgroup, so `nice` does not keep your work out of its way.
   `server/plrdma.[ch]` (rd-verbs; docs/design-rdma.md §4, D7-D9): the verbs transport under that seam, for rd-upgrade to
   switch a link connection to: one registered pool per tsdbd and device (one slot size; memlock checked, naming
   RLIMIT_MEMLOCK), one RC queue pair per link connection with its own receive ring (data and control slots), SEND/RECV
-  only, credits (a SEND never finds no posted receive), WRITTEN = posted, completions on the completion channel's fd in
+  only, credits (a SEND never finds no posted receive; 4 to 255 control slots, fewer storm), WRITTEN = posted, completions on the completion channel's fd in
   the link's poll, the drain (error state, a marker, then destroy) before any slot goes back; `plr_ep_encode/decode` are
   the numbers the upgrade exchanges over the TCP link. Every verb goes through `struct plr_ops`: `server/plrdma_dl.c`
   fills it by dlopen of libibverbs (`NO_RDMA=1` leaves it out), `tests/plr_fake.h` is a fake fabric that checks
-  ownership. `tests/test_plrdma.c` (mutants `writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff`;
-  `--verbs-listen`/`--verbs-dial` run two hosts on real InfiniBand, the numbers of design-rdma.md §3.6).
+  ownership and flushes a failed queue pair asynchronously, as an HCA does. `tests/test_plrdma.c` (mutants `writtencqe
+  noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte`;
+  `--verbs-listen`/`--verbs-dial` run two hosts on real InfiniBand with `rnr_retry` 0, the numbers of design-rdma.md §3.6).
   `server/repld.c`: the replication driver, one thread and one `repl` core per replicated volume
   (log records on the peer data links, `server/replwire.[ch]` their encoding, fuzzed by `fuzz-replframe`; part files
   over the bulk link; commit point; promotion of the record's leader); a leader's WAL record stays below
