@@ -1681,13 +1681,16 @@ int flush_waiting(eng *db)
         memmove(db->flushing + i, db->flushing + i + 1, (db->nflushing - i - 1) * sizeof *db->flushing);
         db->nflushing--;
         db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
+        struct cls_wtail *wdead = NULL;
         if (db->cls_on)
-            cls_wal_tail_locked(db, wt, m->wal_seq, m->fno_end, m->max_ts);
+            cls_wal_tail_locked(db, wt, m->wal_seq, m->fno_end, m->max_ts, &wdead);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         lt_end(db, &lsec);
         pthread_mutex_unlock(&db->publish_lock);
         cls_thaw(db);
+        if (db->cls_on) /* past the cap, the oldest entries fold, built outside db->lock (classes.c) */
+            cls_wal_tail_fold(db, wdead);
         int mrc = manifest_publish(db); /* fails the engine on error */
         free(pl.p);
         if (mrc == 0) /* the numbers of the segment stay used after it is gone (fno.c) */

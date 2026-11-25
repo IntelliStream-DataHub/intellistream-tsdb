@@ -5269,11 +5269,16 @@ static void case_dict_commit(void)
  * T falls below D3 and the replica, which may replay those rows, is CORRUPT or brings them back).
  * dead: the replica unlinked the segment (the floor passed it); its parts still hold the deleted rows, which its own
  * merges never removed (merge_threads = 0): before it applies T it merges the series' partitions at or past T (mutant
- * noclasspurge: CORRUPT). Either way the replica reopens cleanly with no row on D3. */
+ * noclasspurge: CORRUPT). Either way the replica reopens cleanly with no row on D3.
+ * kept (REVIEW-merge H2): as dead, but under the driver's keep caps (a GiB, an hour), so the replica keeps the segment
+ * it saved its floor past: RSTATE's `kept` names it, no open replays it, and its replay start (the leader's floor) is
+ * past it. The leader's T is INT64_MIN (no row of series 0 is left). Judged by its removal (mutant wtailremoved, the
+ * code before), the replica counted the kept segment's rows, refused the leader's T as below them and stopped until a
+ * restart. */
 static void case_class_floor(int dead)
 {
     xport x;
-    xp_start(&x, dead == 1 ? "lcdead" : dead == 2 ? "lcfold" : "lcfloor");
+    xp_start(&x, dead == 1 ? "lcdead" : dead == 2 ? "lcfold" : dead == 3 ? "lckept" : "lcfloor");
     eng *ld = x.ld;
     char rd[PATH_MAX];
     rdir(rd, sizeof rd, &x);
@@ -5285,7 +5290,9 @@ static void case_class_floor(int dead)
     xp_step(&x, "L1c: rows on D3");
     CHECK_EQ(mt_flush(ld), 0);
     CHECK_EQ(mt_flush(x.rep), 0);
-    if (dead == 1)
+    if (dead == 3)
+        replica_keep_cap(x.rep, 1 << 30, 3600000); /* the driver's caps: the segment stays past the floor */
+    if (dead == 1 || dead == 3)
         CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
     if (dead == 2) { /* H3: the floor stays put; past the cap the oldest entries (the D3 rows) fold into the bound */
         atomic_store(&cls_wtail_cap, 2);
@@ -5301,9 +5308,14 @@ static void case_class_floor(int dead)
     CHECK_EQ(eng_optimize(ld), 0);
     xp_step(&x, "L1c: the leader merged");
     CHECK_EQ(count_query(ld, 0, d3, d3 + DAY_MS, &f), 0);
-    eng_leader_replay_floor(ld, dead == 1 ? ld->fno_next : 1);
+    eng_leader_replay_floor(ld, dead == 1 || dead == 3 ? ld->fno_next : 1);
     CHECK_EQ(eng_class_switch(ld, 0, 2, NULL), 0);
     xp_step(&x, "L1c: the replica applied the switch");
+    if (dead == 3) {
+        CHECK_EQ(eng_check(x.rep), 0); /* mutant wtailremoved: the replica refused the leader's T and stopped */
+        /* the D3 segment (sealed once the leader's delete began the next one) is named in RSTATE and still on disk */
+        CHECK(replica_kept_seq(x.rep) > atomic_load(&x.rep->wal_removed_synced));
+    }
     CHECK_EQ(mt_flush(x.rep), 0);
     CHECK_EQ(replica_floor_saved(x.rep, replica_applied_end(x.rep)), 0);
     xp_reopen(&x, rd, replica_applied_end(x.rep));
@@ -5316,8 +5328,90 @@ static void case_class_floor(int dead)
     atomic_store(&cls_wtail_cap, CLS_WTAIL_CAP);
     xp_stop(&x);
     printf("  the leader's class switch time is past every row a member may replay (%s)\n",
-           dead == 1 ? "the member's parts merged first"
-           : dead == 2 ? "a WAL tail the member keeps, folded past the cap" : "a WAL tail the member keeps");
+           dead == 1   ? "the member's parts merged first"
+           : dead == 2 ? "a WAL tail the member keeps, folded past the cap"
+           : dead == 3 ? "a segment the member keeps under its caps, below its replay start"
+                       : "a WAL tail the member keeps");
+}
+
+/* L1e (REVIEW-merge H1): the safety side of the fold, on the leader and on a replica. Flushes F1 (series 1), F2 (series
+ * 1, then series 0 on D3: its newest rows), F3 (series 0 on D2, older times, and series 1), then series 1 alone past
+ * the cap of 2, so that every entry folds, oldest first, into the second newest. The members' floor passes F1 only.
+ * Each fold must keep series 0 at its D3 bound for as long as F2 may be replayed: mutants wtailfoldmin (the fold lives
+ * only as long as its older entry: gone with F1), wtailfoldnewer (on a series in both, the newer entry's bound: D2) and
+ * wtailfolddropold (a series only in the older entry dropped) each put the bound below D3. F2 lists series 1 first (a
+ * memtable lists its series in arrival order), so the fold's sort of F2 is not the identity: wtailsortnomax (the ids
+ * sorted, their bounds left in place) gives series 0 series 1's bound. The bound (cls_test_wal_newest) and the
+ * leader's T (cls_at, on both members) are the checks: after series 0's rows are deleted and merged away, T must still
+ * lie past D3. The replica is then reopened at its saved floor (F1) and replays F2.. under that T: no deleted row may
+ * come back. That reopen alone does not catch every fold mutant (wtailfoldnewer and wtailfolddropold pass it): the
+ * bound and T checks are the teeth. */
+static void case_class_fold_safe(void)
+{
+    xport x;
+    xp_start(&x, "lcfoldsafe");
+    eng *ld = x.ld;
+    char rd[PATH_MAX];
+    rdir(rd, sizeof rd, &x);
+    atomic_store(&cls_wtail_cap, 2);
+    int64_t d2 = DAY1 + DAY_MS, d3 = DAY1 + 2 * DAY_MS;
+    float f = 0;
+    xp_rows(&x, 1, 0, 3, 1);
+    xp_step(&x, "L1e: F1, series 1");
+    CHECK_EQ(mt_flush(ld), 0);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    uint64_t f1 = ld->fno_next, rf1 = replica_applied_end(x.rep); /* F1's positions are below f1 */
+    CHECK_EQ(replica_floor_saved(x.rep, rf1), 0);
+    xp_rows(&x, 1, 5, 3, 1); /* series 1 first: F2's ids are not in order */
+    xp_rows_at(&x, 0, d3, 5, 10);
+    xp_step(&x, "L1e: F2, series 1, then series 0 on D3");
+    CHECK_EQ(mt_flush(ld), 0);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    xp_rows_at(&x, 0, d2, 5, 20);
+    xp_rows(&x, 1, 10, 3, 2);
+    xp_step(&x, "L1e: F3, series 0 on D2 and series 1");
+    CHECK_EQ(mt_flush(ld), 0);
+    CHECK_EQ(mt_flush(x.rep), 0);
+    for (int r = 0; r < 4; r++) {
+        xp_rows(&x, 1, 100 + 10 * r, 3, (float)r);
+        xp_step(&x, "L1e: series 1 past the cap");
+        CHECK_EQ(mt_flush(ld), 0);
+        CHECK_EQ(mt_flush(x.rep), 0);
+    }
+    eng_leader_replay_floor(ld, f1); /* every member past F1, none past F2 */
+    pthread_mutex_lock(&ld->lock);
+    CHECK(ld->nwtail <= 2 && ld->wtail_all_seq == 0); /* folded, series by series */
+    pthread_mutex_unlock(&ld->lock);
+    pthread_mutex_lock(&x.rep->lock);
+    CHECK(x.rep->nwtail <= 2 && x.rep->wtail_all_seq == 0);
+    pthread_mutex_unlock(&x.rep->lock);
+    int64_t bl = cls_test_wal_newest(ld, 0), br = cls_test_wal_newest(x.rep, 0);
+    if (bl < d3 + 4000 || br < d3 + 4000)
+        fprintf(stderr, "lcfoldsafe: series 0's bound: leader %" PRId64 ", replica %" PRId64 ", its rows reach %" PRId64
+                        "\n", bl, br, d3 + 4000);
+    CHECK(bl >= d3 + 4000);
+    CHECK(br >= d3 + 4000);
+    CHECK_EQ(eng_delete_range(ld, 0, d2, INT64_MAX), 0);
+    xp_step(&x, "L1e: deleted");
+    CHECK_EQ(eng_optimize(ld), 0);
+    xp_step(&x, "L1e: the leader merged");
+    CHECK_EQ(count_query(ld, 0, d2, d3 + DAY_MS, &f), 0);
+    eng_leader_replay_floor(ld, f1);
+    CHECK_EQ(eng_class_switch(ld, 0, 2, NULL), 0);
+    xp_step(&x, "L1e: the replica applied the switch");
+    int64_t lo, hi;
+    CHECK(cls_at(ld, 0, d3 + 4000, &lo, &hi) != 2 && hi > d3 + 4000); /* T past every row a member may replay */
+    CHECK(cls_at(x.rep, 0, d3 + 4000, &lo, &hi) != 2 && hi > d3 + 4000);
+    xp_reopen(&x, rd, rf1); /* below F2: the open replays F2.. */
+    if (x.rep) {
+        CHECK_EQ(eng_check(x.rep), 0);
+        CHECK_EQ(count_query(x.rep, 0, d2, d3 + DAY_MS, &f), 0);
+        int c = -1;
+        CHECK(eng_series_class(x.rep, 0, &c) == 0 && c == 2);
+    }
+    atomic_store(&cls_wtail_cap, CLS_WTAIL_CAP);
+    xp_stop(&x);
+    printf("  a folded WAL tail keeps every series' newest row for as long as its segment may be replayed\n");
 }
 
 /* A replica keeps its flushed segments (no saved floor: a learner filling from the log start), so its WAL tail passes
@@ -7180,6 +7274,11 @@ static int mutant_of(const char *m)
                         : strcmp(m, "droppedglobal") == 0 ? MUT_DROPPED_GLOBAL
                         : strcmp(m, "wtailnocap") == 0 ? MUT_WTAIL_NOCAP
                         : strcmp(m, "wtailfoldall") == 0 ? MUT_WTAIL_FOLD_ALL
+                        : strcmp(m, "wtailfoldmin") == 0 ? MUT_WTAIL_FOLD_MIN
+                        : strcmp(m, "wtailfoldnewer") == 0 ? MUT_WTAIL_FOLD_NEWER
+                        : strcmp(m, "wtailfolddropold") == 0 ? MUT_WTAIL_FOLD_DROP_OLD
+                        : strcmp(m, "wtailsortnomax") == 0 ? MUT_WTAIL_SORT_NO_MAX
+                        : strcmp(m, "wtailremoved") == 0 ? MUT_REPLICA_WTAIL_REMOVED
                         : strcmp(m, "nocutoff") == 0 ? MUT_LEADER_NO_CUTOFF
                         : strcmp(m, "zerorate") == 0 ? MUT_LEADER_ZERO_RATE
                         : strcmp(m, "noraisefrom") == 0 ? MUT_LEADER_NO_RAISE_FROM
@@ -7747,6 +7846,8 @@ int main(int argc, char **argv)
         case_class_floor(0);
         case_class_floor(1);
         case_class_floor(2);
+        case_class_floor(3);
+        case_class_fold_safe();
         case_class_fold_replica();
         case_class_fresh();
         case_class_dropped();
@@ -7818,6 +7919,8 @@ int main(int argc, char **argv)
     case_class_floor(0);
     case_class_floor(1);
     case_class_floor(2);
+    case_class_floor(3);
+    case_class_fold_safe();
     case_class_fold_replica();
     case_class_fresh();
     case_class_dropped();

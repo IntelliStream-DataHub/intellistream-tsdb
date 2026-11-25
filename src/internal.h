@@ -79,7 +79,9 @@ enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MA
        MUT_LEADER_SWITCH_UNATTACHED, MUT_REPLICA_KEEP_FLOOR, MUT_REPLICA_DROP_APPLIED_FILES,
        MUT_LEADER_FRESH_UNATTACHED, MUT_LEADER_LINK_NOSYNC, MUT_JR_BARGE,
        MUT_REPLAY_KEPT_EARLY, MUT_REPLAY_START_LOG, MUT_REPLAY_START_HIGH, MUT_REPLAY_START_UNSAVED,
-       MUT_REPLAY_LEAD_NOFLOOR, MUT_REPLAY_OPEN_NONE, MUT_REPLAY_OPEN_NOFLOOR };
+       MUT_REPLAY_LEAD_NOFLOOR, MUT_REPLAY_OPEN_NONE, MUT_REPLAY_OPEN_NOFLOOR,
+       MUT_REPLICA_WTAIL_REMOVED, MUT_WTAIL_FOLD_MIN, MUT_WTAIL_FOLD_NEWER, MUT_WTAIL_FOLD_DROP_OLD,
+       MUT_WTAIL_SORT_NO_MAX };
 extern int eng_test_mutant;
 extern int (*eng_test_retire_fail)(const char *name); /* memtable.c: a test plants a failed unlink/rename */
 #define MAX_GRANULE_ROWS 65536
@@ -1355,7 +1357,8 @@ struct cls_wtail {
     uint64_t seq;
     uint64_t fno_end; /* the end of its segment's positions: a leader keeps it while a replica may hold one below */
     size_t n;
-    bool sorted; /* ids sorted (with max), done by the first switch that looks */
+    size_t bytes; /* allocated (tsdb_free_big) */
+    bool sorted;  /* ids sorted (with max): only once a fold or a switch needed it (wtail_sort, under flush_lock) */
     uint32_t *ids;
     int64_t *max;
 };
@@ -1653,6 +1656,8 @@ void leader_link_name(char *buf, size_t cap, const struct lkfile *f, bool keep);
  * there is none to tell (the core then uses the log start). The driver hands it to its core (repl_replay_start), whose
  * ACK carries it to the leader's replay floor. */
 uint64_t replica_replay_start(struct eng *db);
+/* RSTATE's `kept` as saved: no open of this replica replays a segment up to it (the WAL tail's bound, classes.c) */
+uint64_t replica_kept_seq(struct eng *db);
 /* tests: the records a replica's applier applied since its open (the open's replay included) */
 uint64_t replica_test_napplied(struct eng *db);
 uint64_t replica_test_open_first(struct eng *db); /* tests: the first position the open's cursor read */
@@ -2658,8 +2663,13 @@ int cls_flush_guard(eng *db, const memtable *m);
 int cls_observe(eng *db, part *p);
 /* A flushed memtable whose segment may still be replayed: its series' newest timestamps, built before the flush
  * takes its locks (NULL on ENOMEM), then added under db->lock (which also drops entries no longer replayable). */
-struct cls_wtail *cls_wal_tail_new(const memtable *m);
-void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts);
+struct cls_wtail *cls_wal_tail_new(const memtable *m); /* unsorted (sorted lazily); built before any lock */
+/* db->lock held: lists e (NULL: out of memory) and unlists what can no longer be replayed into *dead, which the caller
+ * hands to cls_wal_tail_fold once it has let go of its locks */
+void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, uint64_t fno_end, int64_t max_ts,
+                         struct cls_wtail **dead);
+void cls_wal_tail_fold(eng *db, struct cls_wtail *dead); /* flush_lock held, no other engine lock */
+int64_t cls_test_wal_newest(eng *db, uint32_t s);      /* tests: the bound the WAL tail gives series s */
 /* Placements (large inserts, replaces, flushes) hold the class history frozen from their first class lookup until
  * their parts are listed; a switch waits a few ms for them, then tries later. Never nested, and never held while waiting for a flush or a
  * merge (a switch holds flush_lock and the merge thread switches). */

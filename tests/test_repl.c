@@ -454,25 +454,29 @@ static void below_start(void)
           (uint64_t)repl_written(r));
     repl_free(r);
 
-    /* Control: at a position the log holds, another epoch is damage all the same. */
-    memset(&d, 0, sizeof d);
-    fill(&d, 1001, 1010, 2, 1);
-    d.start = 1001;
-    r = repl_open(&c, &du);
-    CHECK(r && !repl_failed(r), "the follower did not open (2)");
-    repl_recv(r, &m);
-    drain(r, &d, NULL);
-    repl_recv(r, &an);
-    drain(r, &d, NULL);
-    n = 0;
-    for (uint64_t p = 999; p <= 1002; p++)
-        rec[n++] = (struct repl_rec){.pos = p, .epoch = 1, .n = 1};
-    ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = 998, .prev_epoch = 1,
-                           .nrec = n, .rec = rec, .commit = 1010};
-    repl_recv(r, &ap);
-    drain(r, &d, NULL);
-    CHECK(repl_failed(r), "a record of another epoch at a position the log holds was accepted");
-    repl_free(r);
+    /* Controls: at a position the log holds, another epoch is damage all the same, the log start (1001) included.
+     * Each differs from the log at 1001 alone: a record there (MUT(32): skipped as below the start), then a prev_pos
+     * there (MUT(33): not judged), the records around it agreeing. */
+    for (int k = 0; k < 2; k++) {
+        memset(&d, 0, sizeof d);
+        fill(&d, 1001, 1010, 2, 1);
+        d.start = 1001;
+        r = repl_open(&c, &du);
+        CHECK(r && !repl_failed(r), "the follower did not open (control %d)", k);
+        repl_recv(r, &m);
+        drain(r, &d, NULL);
+        repl_recv(r, &an);
+        drain(r, &d, NULL);
+        n = 0;
+        for (uint64_t p = k ? 1002 : 999; p <= 1003; p++)
+            rec[n++] = (struct repl_rec){.pos = p, .epoch = p <= 1001 ? 1 : 2, .n = 1};
+        ap = (struct repl_msg){.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 3, .prev_pos = k ? 1001 : 998,
+                               .prev_epoch = 1, .nrec = n, .rec = rec, .commit = 1010};
+        repl_recv(r, &ap);
+        drain(r, &d, NULL);
+        CHECK(repl_failed(r), "%s of another epoch at the log start was accepted", k ? "a prev_pos" : "a record");
+        repl_free(r);
+    }
 }
 
 static void sync_cut(void)
