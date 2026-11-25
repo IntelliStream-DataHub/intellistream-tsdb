@@ -6183,6 +6183,10 @@ static void propose_isr(uint64_t now)
 #define PROMO_MOVE_NS (2000 * MS)
 #define CUT_HOLD_NS (2000 * MS)
 #define PROMO_WAIT_NS (500 * MS)
+/* A planned transfer wants every live ISR member to answer the fence so none is left `unanswered` (D14); under heavy
+ * load or instrumentation a live replica's REPL sync can pass PROMO_WAIT_NS (500 ms). Still strictly below
+ * PROMO_MOVE_NS so a silent bystander does not drop the transfer. */
+#define PROMO_TRANSFER_WAIT_NS (1500 * MS)
 #define PROMO_GIVEUP_NS (5000 * MS)
 #define VMSG_Q 256
 
@@ -6541,7 +6545,8 @@ static int promo_step(struct promo *p, const struct meta_volume *v, uint64_t now
         }
         return 0;
     }
-    if ((waiting && since(now, p->t0) < PROMO_WAIT_NS) || !old_ok)
+    uint64_t wait_ns = p->target ? PROMO_TRANSFER_WAIT_NS : PROMO_WAIT_NS;
+    if ((waiting && since(now, p->t0) < wait_ns) || !old_ok)
         return 0;
     struct meta_grant g;
     memset(&g, 0, sizeof g);

@@ -11749,7 +11749,11 @@ static void scen_fwddepose(void)
         usleep(50000);
     }
     await_isr(Nw, "fd", 3, 30000, "the deposed leader back in the ISR");
-    usleep(300000);
+    /* wait until the new leader's replication driver has finished promoting (reopened as writer) before reading from it
+     * with retries off; the metadata record and ISR count (kept across the promotion) are visible before that finishes */
+    char lead[64];
+    snprintf(lead, sizeof lead, "leads epoch %" PRIu64 " ", v.epoch);
+    await_log(Nw, lead, 30000, "the new leader serving the volume");
     c = client(E);
     tsdbc_set_retry(c, 0);
     uint64_t f0 = fw_frames(c, oldlead);
@@ -11766,8 +11770,13 @@ static void scen_fwddepose(void)
     unlink(hold[E]);
     tsdbc *cn = client(Nw);
     nrows = 0;
-    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0)
-        die("a read on the new leader: %s", ers(rc));
+    if ((rc = tsdbc_query_raw(cn, id, 5000, 5001, count_rows, NULL)) != 0) {
+        tsdbc_err_info ei;
+        int lrc = tsdbc_last_error(cn, &ei);
+        die("a read on the new leader: %s (detail %d, nunavail %u, reason %u)", ers(rc), lrc,
+            lrc == TSDB_ERR_UNAVAILABLE ? ei.nunavail : 0,
+            lrc == TSDB_ERR_UNAVAILABLE && ei.nunavail ? ei.unavail[0].reason : 0);
+    }
     tsdbc_close(cn);
     if (nrows != 0)
         die("the write answered MOVED by the deposed leader is on the new leader");
@@ -15183,7 +15192,7 @@ static int set_setup(int nserv, struct meta_volume *v, int keepall)
     init_cluster(0, 600);
     for (int i = 1; i < nserv; i++)
         node_add(0, i);
-    if (nserv == 3) { /* a member stopped later must not take the metadata group's quorum with it */
+    if (nserv >= 3) { /* a member stopped later must not take the metadata group's quorum with it */
         unsigned want = 3;
         await_view(0, p_voters, &want, "three voters");
     }
@@ -16841,6 +16850,30 @@ static void scen_transferhold(void)
            "\n", took, ta.why, blind, cuts);
     if (blind || cuts)
         die("transferhold: server %d admitted %" PRIu64 " records blind, %" PRIu64 " cuts on the members", L, blind, cuts);
+    /* a slow bystander (past failover's PROMO_WAIT_NS 500 ms, within PROMO_TRANSFER_WAIT_NS 1500 ms) must still be
+     * waited for so its answer counts (3 of 3, no member left unanswered) */
+    await_isr(0, "tv", 3, 30000, "every replica in the ISR before the slow-bystander transfer");
+    int L2 = server_of(a.leader), T2 = 0, B2 = 3 - L2 - T2; /* T2 = server 0 (Raft leader), B2 = the other non-leader */
+    if (L2 == 0)
+        T2 = 1, B2 = 2;
+    int props0 = log_count(0, " fenced members answered"), whole0 = log_count(0, " (3 of 3 fenced members answered");
+    int ready1 = log_count(L2, ": READY at");
+    state_flag(B2, "dropfence", 1);
+    struct tr_async tb = {x.num, ids[T2], 0, ""};
+    if (pthread_create(&th, NULL, tr_transfer_thread, &tb) != 0)
+        die("pthread_create");
+    await_log_count(L2, ": READY at", ready1 + 1, 10000);
+    usleep(750000);
+    state_flag(B2, "dropfence", 0);
+    pthread_join(th, NULL);
+    if (tb.rc != 0)
+        die("transferhold: slow-bystander transfer to node %u: %s (%s)", ids[T2],
+            tb.rc == 1 ? "lost" : cluster_strerror(tb.rc), tb.why);
+    int props1 = log_count(0, " fenced members answered"), whole1 = log_count(0, " (3 of 3 fenced members answered");
+    if (props1 - props0 != 1 || whole1 - whole0 != 1)
+        die("transferhold: slow bystander (750 ms) was not counted (%d proposed, %d with 3 of 3 answers)",
+            props1 - props0, whole1 - whole0);
+    tr_await_acks(&x, now_ms(), "after the slow-bystander transfer");
     tr_finish(&x, "transferhold", 0);
 }
 
@@ -17521,9 +17554,9 @@ static void scen_balancecut(void)
     if (rc != 0)
         die("balancecut: transfer %s to node %u: %s (%s)", nm[k], ids[Q], cluster_strerror(rc), why);
     state_flag(P, "dropfence", 1); /* before the hold of 5 s runs out */
-    uint64_t b0 = 0, d0 = 0;
+    uint64_t b0[3] = {0}, d0 = 0;
     for (int i = 0; i < 3; i++)
-        b0 += tr_count(i, CL_TR_BALANCE), d0 += tr_count(i, CL_TR_DONE);
+        b0[i] = tr_count(i, CL_TR_BALANCE), d0 += tr_count(i, CL_TR_DONE);
     uint64_t t0 = now_ms();
     struct meta_volume x;
     while (now_ms() - t0 < 60000) {
@@ -17531,20 +17564,28 @@ static void scen_balancecut(void)
             die("balancecut: node %u leads %s although it answers no fence", pn, nm[k]);
         usleep(200000);
     }
-    uint64_t bal = 0, done = 0, failed = 0;
+    uint64_t bal = 0, done = 0, failed = 0, max_per = 0;
+    int max_s = 0;
     for (int i = 0; i < 3; i++) {
-        bal += tr_count(i, CL_TR_BALANCE);
+        uint64_t bi = tr_count(i, CL_TR_BALANCE) - b0[i];
+        bal += bi;
+        if (bi > max_per)
+            max_per = bi, max_s = i;
         done += tr_count(i, CL_TR_DONE);
         failed += tr_count(i, CL_TR_TIMEDOUT) + tr_count(i, CL_TR_CANCELLED) + tr_count(i, CL_TR_FALLBACK);
     }
-    bal -= b0, done -= d0;
-    printf("  %s cut one way from its preferred node %u: %" PRIu64 " balance transfers in 60 s, %" PRIu64 " done, %"
-           PRIu64 " failed\n", nm[k], pn, bal, done, failed);
+    done -= d0;
+    printf("  %s cut one way from its preferred node %u: %" PRIu64 " balance transfers in 60 s (max %" PRIu64
+           " on one Raft leader), %" PRIu64 " done, %" PRIu64 " failed\n",
+           nm[k], pn, bal, max_per, done, failed);
     if (bal < 1)
         die("balancecut: no balance transfer to node %u in 60 s", pn);
-    if (bal > 4)
-        die("balancecut: %" PRIu64 " balance transfers to node %u in 60 s, more than the hold and the backoff allow (4)",
-            bal, pn);
+    /* Backoff state lives in memory on each Raft leader (ctransfer.c), so a Raft election during the 60 s lets a new
+     * leader start its own backoff sequence (4 + 1 = 5 across two leaders). No single leader may exceed 4 in 60 s, and
+     * mutant balanceflap tries ~25 times on a leader. */
+    if (max_per > 4)
+        die("balancecut: server %d started %" PRIu64 " balance transfers to node %u in 60 s, more than the hold and "
+            "the backoff allow (4)", max_s, max_per, pn);
     for (uint64_t t1 = now_ms(); failed < bal && now_ms() - t1 < 20000; usleep(200000)) { /* one may be under way */
         failed = 0;
         for (int i = 0; i < 3; i++)
