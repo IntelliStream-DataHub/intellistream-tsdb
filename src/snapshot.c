@@ -76,12 +76,17 @@
  *   which checks every granule against the record's sums. Carried, each would cost a copy of the source (as large as
  *   the object) and leave the receiver a file outside its list whose deletion it would own. The leader keeps its own
  *   and digests them as before. SNAPMAN refuses a settled_ or retired_ name of any kind (mutant snapcarrysettled).
+ *   So a member built from a snapshot holds no source copy of the objects settled before P: its MK_DIGEST finds nothing
+ *   retired there and answers 0 (never a false DIVERGED), and it adds no independent digest of those objects until R10
+ *   re-encodes them; the leader's digest (and those of the members that applied the COLD) still run.
  * - retired_ files (merge inputs, dropped parts, retired .ec parts whose chunks ecgc has not deleted yet): not listed
  *   at the cut, so nothing reads them; a part listed at the cut and retired after it travels under its listed name.
  *   ecgc's last reference stays the leader's: the receiver's open sweep is skipped on every ec cluster volume
  *   (src/ecgc.c, db->ppos), so it deletes no shared object. Open (r8k's MK_GC): an .ec listed at P and dropped by the
  *   leader after P can lose its chunks to the leader's purge before the receiver replays the DROP, as for any replica
- *   behind a drop of a settled key.
+ *   behind a drop of a settled key. The install checks the .ec file only, never that its object's chunks are on the
+ *   stores (that needs the stores, which the install does not open): such an object installs and its first read is
+ *   CORRUPT; MK_GC's rules are what keeps the chunks there.
  * - stage_ and keep_ files of COLD markers (the .ec files and Y parts jr_cold links, named by key) travel as a
  *   COMMIT's do; a keep_ that is the inode of a listed .ec part is that entry's link.
  *
@@ -1085,6 +1090,8 @@ static int cmp_fname(const void *a, const void *b)
 static bool snap_name_reserved(const char *n)
 {
     static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp", "PPOS", "PPOS.tmp"};
+    if (snap_mutant == SNAP_MUT_NORESERVED) /* planted: no name is the install's own */
+        return false;
     for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
         if (strcmp(n, r[i]) == 0)
             return true;
@@ -1312,18 +1319,22 @@ static int inst_verify_files(int sdfd, const struct snap_man *m, const char *sta
 /* An .ec part (SNAP_EC): its source's header, index and footer and its object record (part_open_ec_at: the hashes, the
  * record against the footer and the name). Its granules are in the chunks, which stay on the stripe group's stores:
  * the installed replica's reads check each granule against the record's sums (the seam). The record's ppos is the
- * COLD's Z, at or below P (a listed .ec was swapped after its marker committed), and SNAPMAN's is the same: the
- * install writes SNAPMAN's into PPOS, and a replica's later COLD of the key compares its own parts against Z. */
+ * COLD's Z, at or below P (a listed .ec was swapped after its marker committed), and SNAPMAN's is what the leader's
+ * swap recorded for it: Z, or PPOS_UNKNOWN for a record whose ppos is 0 (ecapply_swap_pre, which record_valid allows
+ * on a cluster volume; refusing it here would leave every later learner of the volume refused). The install writes
+ * SNAPMAN's into PPOS, and a replica's later COLD of the key compares its own parts against it. */
 static int inst_verify_ec(int sdfd, const struct snap_man *m, const struct snap_file *f, const char *staged)
 {
     part *p = NULL;
-    int rc = part_open_ec_at(sdfd, f->name, f->name, true, false, &p);
+    int rc = snap_mutant == SNAP_MUT_ECNOVERIFY ? 0 : part_open_ec_at(sdfd, f->name, f->name, true, false, &p);
     if (rc != 0) {
         fprintf(stderr, "tsdb: %s: the .ec part %s does not open: %d\n", staged, f->name, rc);
         return rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_IO ? rc : TSDB_ERR_CORRUPT;
     }
-    uint64_t z = p->ec->rec.ppos;
-    if (z == 0 || z > m->p || z != f->ppos) {
+    if (!p) /* planted (snapecnoverify): the .ec file taken unread */
+        return 0;
+    uint64_t z = p->ec->rec.ppos, want = z ? z : PPOS_UNKNOWN;
+    if ((z > m->p && snap_mutant != SNAP_MUT_ECNOZP) || (f->ppos != want && snap_mutant != SNAP_MUT_ECNOZEQ)) {
         fprintf(stderr, "tsdb: %s: the .ec part %s records ppos %" PRIu64 ", SNAPMAN %" PRIu64 ", P %" PRIu64 "\n",
                 staged, f->name, z, f->ppos, m->p);
         rc = TSDB_ERR_CORRUPT;
@@ -1334,14 +1345,15 @@ static int inst_verify_ec(int sdfd, const struct snap_man *m, const struct snap_
 
 /* every part's own checksums: header, index and footer (part_open), and every granule's crc; an .ec part's through
  * inst_verify_ec. `ec`: the snapshot's META says requires=ec, where every part carries its PPOS record and only there
- * an .ec part may be */
+ * an .ec part may be: elsewhere an .ec entry has no ppos (refused below otherwise), and inst_verify_ec refuses an .ec
+ * whose SNAPMAN ppos is 0, whatever its record says */
 static int inst_verify_parts(int sdfd, const struct snap_man *m, bool v8_ok, bool ec, const char *staged)
 {
     for (size_t i = 0; i < m->nfiles; i++) {
         const struct snap_file *f = &m->files[i];
         if (f->kind != SNAP_PART && f->kind != SNAP_EC)
             continue;
-        if (ec != (f->ppos != 0) || (f->kind == SNAP_EC && !ec)) {
+        if (ec != (f->ppos != 0) && snap_mutant != SNAP_MUT_ECNOPPOS) {
             fprintf(stderr, "tsdb: %s: %s %s\n", staged, f->name,
                     ec ? "has no PPOS record in SNAPMAN (an erasure-coded volume)"
                        : "is an .ec part or has a PPOS record (META does not say requires=ec)");

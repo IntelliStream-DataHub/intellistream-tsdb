@@ -37,6 +37,8 @@
 #include "ecskip.h"
 #include "settle.h"
 #include "tier.h"
+#include "eccold.h"
+#include "ppos.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -1061,12 +1063,22 @@ static void case_man_bad(void)
     CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "keep_1_2.part"}, pk, lfwd, NULL, 2) == TSDB_ERR_CORRUPT);
     CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "keep_1_2.part"}, pk, l1, sz2, 2) == TSDB_ERR_CORRUPT);
     CHECK(man_try(dir, 0x7fffffff, (const char *const[]){"p1_1_1_0.part"}, pk, nol, NULL, 1) == TSDB_ERR_CORRUPT);
-    /* the names the install writes: a copy that carried SNAPDONE would be taken for a finished install */
-    for (const char *const *r = (const char *const[]){SNAP_DONE, "REPL", "FNO", "LOCK", "META.tmp", "PPOS", "PPOS.tmp", NULL}; *r; r++)
-        if (man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", *r}, pk, nol, NULL, 2) != TSDB_ERR_CORRUPT) {
-            fprintf(stderr, "  SNAPMAN naming %s was not refused\n", *r);
-            fails++;
-        }
+    /* the names the install writes: a copy that carried SNAPDONE would be taken for a finished install. Named as a kind
+     * that takes any name (a segment, a dictionary, RSTATE, META), so only the reserved list can refuse them (as a part
+     * or a keep_ file the kind's name rule would); the control name shows the kind takes a name that is not reserved */
+    for (uint8_t k = SNAP_SEG; k <= SNAP_META; k++) {
+        if (k == SNAP_STAGE || k == SNAP_KEEP)
+            continue;
+        const uint8_t pr[] = {SNAP_PART, k};
+        CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "REPLX"}, pr, nol, NULL, 2) == 0);
+        for (const char *const *r = (const char *const[]){SNAP_DONE, "REPL", "FNO", "LOCK", "META.tmp", "PPOS", "PPOS.tmp",
+                                                           NULL};
+             *r; r++)
+            if (man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", *r}, pr, nol, NULL, 2) != TSDB_ERR_CORRUPT) {
+                fprintf(stderr, "  SNAPMAN naming %s as kind %u was not refused\n", *r, k);
+                fails++;
+            }
+    }
     /* snap-ec: a kind takes only its names (a settled_ or retired_ file never travels), a ppos only on a part */
     const uint8_t pe[] = {SNAP_PART, SNAP_EC}, ps[] = {SNAP_PART, SNAP_SEG}, pp[] = {SNAP_PART, SNAP_PART};
     CHECK(man_try(dir, 2, (const char *const[]){"p1_1_1_0.part", "p2_1_1_0.ec"}, pe, nol, NULL, 2) == 0);
@@ -1994,9 +2006,9 @@ static void flip_at(const char *path, int64_t off) /* off < 0: from the end */
     close(fd);
 }
 
-/* SNAPMAN's entry of `name` made to say the file's bytes as they are now, and SNAPMAN's own hash again: a copy whose
- * damage only the deeper checks can see */
-static void man_fix(const char *dir, const char *name)
+/* SNAPMAN's entry of `name` made to say the file's bytes as they are now (or, with `ppos`, to carry that ppos), and
+ * SNAPMAN's own hash again: a copy whose damage only the deeper checks can see */
+static void man_edit(const char *dir, const char *name, const uint64_t *ppos)
 {
     char mp[PATH_MAX + 16], fp[PATH_MAX + 128];
     PJ(mp, "%s/%s", dir, SNAP_MAN);
@@ -2011,8 +2023,13 @@ static void man_fix(const char *dir, const char *name)
     for (size_t o = 0; !found && len > 8 && o + 2 + nl + 21 <= len - 8; o++) {
         uint16_t l;
         memcpy(&l, b + o, 2);
-        if (l != nl || memcmp(b + o + 2, name, nl) != 0 || b[o + 2 + nl] < SNAP_PART || b[o + 2 + nl] > SNAP_META)
+        if (l != nl || memcmp(b + o + 2, name, nl) != 0 || b[o + 2 + nl] < SNAP_PART || b[o + 2 + nl] > SNAP_EC)
             continue;
+        found = true;
+        if (ppos) {
+            memcpy(b + o + 2 + nl + 1 + 8 + 8 + 4, ppos, 8);
+            continue;
+        }
         int fd = open(fp, O_RDONLY | O_CLOEXEC);
         uint64_t sz = 0, x = 0;
         if (fd < 0 || snap_xxh64_fd(fd, &sz, &x) != 0)
@@ -2021,7 +2038,6 @@ static void man_fix(const char *dir, const char *name)
             close(fd);
         memcpy(b + o + 2 + nl + 1, &sz, 8);
         memcpy(b + o + 2 + nl + 9, &x, 8);
-        found = true;
     }
     if (!found) {
         ifail("man_fix: no entry %s in %s", name, mp);
@@ -2035,6 +2051,9 @@ static void man_fix(const char *dir, const char *name)
     if (f)
         fclose(f);
 }
+
+static void man_fix(const char *dir, const char *name) { man_edit(dir, name, NULL); }
+static void man_ppos(const char *dir, const char *name, uint64_t ppos) { man_edit(dir, name, &ppos); }
 
 static bool meta_requires_both(const char *vd)
 {
@@ -2110,6 +2129,7 @@ static void case_install_verify(void)
         sh("cd '%s' && cp '%s' t.x && mv t.x '%s'", st, link, link); PJ(x, "%s/%s", st, link); flip_at(x, -1));
     BAD("a part's header damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT,
         PJ(x, "%s/%s", st, pname); flip_at(x, 0); man_fix(st, pname));
+    BAD("a part with a PPOS record in a volume that is not erasure-coded", TSDB_ERR_CORRUPT, man_ppos(st, pname, 5));
     {
         /* a granule's payload: only the granule crc tells */
         BAD("a granule's payload damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT, {
@@ -2599,7 +2619,183 @@ static void ec_man_check(const char *sp, size_t want_ec)
     snap_man_free(&m);
 }
 
-#define NEC 4
+/* The record's ppos of the .ec file at `path` set to z, the record's and the trailer's hashes made right again (the
+ * footer does not cover the record): a sealed file whose ppos only the install's comparisons can judge */
+static void ec_rec_ppos(const char *path, uint64_t z)
+{
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    struct stat sb;
+    uint8_t tr[EC_TRAILER_BYTES], *r = NULL;
+    uint64_t rlen = 0, h;
+    if (fd < 0 || fstat(fd, &sb) != 0 || sb.st_size < EC_TRAILER_BYTES ||
+        pread(fd, tr, sizeof tr, sb.st_size - EC_TRAILER_BYTES) != (ssize_t)sizeof tr) {
+        ifail("ec_rec_ppos %s: %s", path, strerror(errno));
+        goto out;
+    }
+    memcpy(&rlen, tr + EC_TR_REC_LEN, 8);
+    off_t roff = sb.st_size - EC_TRAILER_BYTES - (off_t)rlen;
+    if (rlen < EC_REC_PPOS + 8 || roff < 0 || !(r = malloc(rlen)) || pread(fd, r, rlen, roff) != (ssize_t)rlen) {
+        ifail("ec_rec_ppos %s: record of %" PRIu64 " bytes", path, rlen);
+        goto out;
+    }
+    memcpy(r + EC_REC_PPOS, &z, 8);
+    h = xxh64(r, rlen, 0);
+    memcpy(tr + EC_TR_REC_HASH, &h, 8);
+    h = xxh64(tr, EC_TR_HASH, 0);
+    memcpy(tr + EC_TR_HASH, &h, 8);
+    if (pwrite(fd, r, rlen, roff) != (ssize_t)rlen || pwrite(fd, tr, sizeof tr, sb.st_size - EC_TRAILER_BYTES) !=
+                                                          (ssize_t)sizeof tr)
+        ifail("ec_rec_ppos %s: write", path);
+out:
+    free(r);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* META's requires= without the word ec (a volume that is not erasure-coded) */
+static bool meta_strip_ec(const char *dir)
+{
+    char mp[PATH_MAX + 16], b[4096], out[4096];
+    PJ(mp, "%s/META", dir);
+    FILE *f = fopen(mp, "r");
+    size_t n = f ? fread(b, 1, sizeof b - 1, f) : 0, o = 0;
+    if (f)
+        fclose(f);
+    b[n] = 0;
+    bool had = false;
+    for (char *line = strtok(b, "\n"); line; line = strtok(NULL, "\n")) {
+        if (!strncmp(line, "requires=", 9)) {
+            char words[512] = ""; /* the list rebuilt by hand: strtok is busy with the lines */
+            const char *q = line + 9;
+            size_t wl = 0;
+            while (*q) {
+                const char *e = strchr(q, ',');
+                size_t l = e ? (size_t)(e - q) : strlen(q);
+                if (l == 2 && !strncmp(q, "ec", 2))
+                    had = true;
+                else if (l && wl + l + 2 < sizeof words)
+                    wl += (size_t)snprintf(words + wl, sizeof words - wl, "%s%.*s", wl ? "," : "", (int)l, q);
+                q = e ? e + 1 : q + l;
+            }
+            o += (size_t)snprintf(out + o, sizeof out - o, "requires=%s\n", words);
+        } else
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s\n", line);
+    }
+    f = fopen(mp, "w");
+    if (!f || fwrite(out, 1, o, f) != o)
+        ifail("meta_strip_ec: write %s", mp);
+    if (f)
+        fclose(f);
+    return had;
+}
+
+/* The install's checks of an ec volume's copy, one at a time, on copies of `tpl` (a snapshot with an .ec part): each
+ * damage is refused with CORRUPT and v<N> is not made. Then a record whose ppos is 0 (what record_valid allows on a
+ * cluster volume and the leader's swap records as PPOS_UNKNOWN) installs as the leader recorded it. */
+static int ec_verify(const ecl *L, const char *tpl, const char *root)
+{
+    struct snap_man m = {0};
+    if (snap_man_read(tpl, &m) != 0)
+        return ifail("ec verify: no SNAPMAN in %s", tpl), 0;
+    char ecn[256] = "", pn[256] = "", st[PATH_MAX + 32], vd[PATH_MAX + 32], x[PATH_MAX + 300];
+    uint64_t z = 0, p = m.p;
+    for (size_t i = 0; i < m.nfiles; i++) {
+        const struct snap_file *f = &m.files[i];
+        if (f->kind == SNAP_EC && !ecn[0] && !f->link)
+            snprintf(ecn, sizeof ecn, "%s", f->name), z = f->ppos;
+        if (f->kind == SNAP_PART && !pn[0])
+            snprintf(pn, sizeof pn, "%s", f->name);
+    }
+    int vol = m.volume < 0 ? 0 : (int)m.volume;
+    snap_man_free(&m);
+    if (!ecn[0] || !pn[0] || z == 0 || z > p)
+        return ifail("ec verify: %s has no .ec (%s, ppos %" PRIu64 ", P %" PRIu64 ") or no part", tpl, ecn, z, p), 0;
+    PJ(st, "%s/v%d.snap", root, vol);
+    PJ(vd, "%s/v%d", root, vol);
+    struct inst_snap is;
+    int n = 0;
+#define EBAD(what, code, ...)                                                                                          \
+    do {                                                                                                               \
+        sh("rm -rf '%s'", root);                                                                                       \
+        CHECK(inst_copy(tpl, root, &is) && is.vol == vol);                                                             \
+        __VA_ARGS__;                                                                                                   \
+        int rc_ = inst_do(root, vol, 556, NULL);                                                                       \
+        if (rc_ != (code) || exists(vd) != ((code) == 0))                                                              \
+            ifail("ec verify: %s: rc %d (want %d), v%d %d", what, rc_, code, vol, exists(vd));                         \
+        n++;                                                                                                           \
+    } while (0)
+    EBAD("the .ec file's record damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT,
+         PJ(x, "%s/%s", st, ecn); flip_at(x, -(EC_TRAILER_BYTES + 8)); man_fix(st, ecn));
+    EBAD("the .ec file's header damaged (SNAPMAN says its bytes)", TSDB_ERR_CORRUPT,
+         PJ(x, "%s/%s", st, ecn); flip_at(x, 0); man_fix(st, ecn));
+    EBAD("SNAPMAN's ppos of the .ec is not its record's", TSDB_ERR_CORRUPT, man_ppos(st, ecn, z + 1));
+    EBAD("the .ec's record (sealed) says a ppos above P, SNAPMAN too", TSDB_ERR_CORRUPT,
+         PJ(x, "%s/%s", st, ecn); ec_rec_ppos(x, p + 1); man_fix(st, ecn); man_ppos(st, ecn, p + 1));
+    EBAD("a part of an ec volume without its ppos", TSDB_ERR_CORRUPT, man_ppos(st, pn, 0));
+    EBAD("an .ec in a volume whose META does not say ec (no ppos anywhere)", TSDB_ERR_CORRUPT, {
+        CHECK(meta_strip_ec(st));
+        man_fix(st, "META");
+        struct snap_man mm = {0};
+        CHECK(snap_man_read(st, &mm) == 0);
+        for (size_t i = 0; i < mm.nfiles; i++)
+            if (mm.files[i].ppos)
+                man_ppos(st, mm.files[i].name, 0);
+        snap_man_free(&mm);
+    });
+    EBAD("an .ec whose record's ppos is 0, recorded unknown", 0,
+         PJ(x, "%s/%s", st, ecn); ec_rec_ppos(x, 0); man_fix(st, ecn); man_ppos(st, ecn, PPOS_UNKNOWN));
+#undef EBAD
+    if (exists(vd)) { /* and it opens as the replica it is, its .ec part listed */
+        tier *xt = NULL;
+        eng *xd = NULL;
+        replica_keep_next((uint64_t)1 << 40, 7 * (uint64_t)DAY_MS);
+        int rc = ec_open(L, vd, false, p, &xt, &xd);
+        if (rc != 0)
+            ifail("ec verify: the install of an .ec with record ppos 0 does not open as a replica: %d", rc);
+        else {
+            if (ec_listed(xd) == 0)
+                ifail("ec verify: the install of an .ec with record ppos 0 lists no .ec part");
+            ec_close(&xt, &xd);
+        }
+    }
+    sh("rm -rf '%s'", root);
+    return n;
+}
+
+/* a snapshot made inside the settle, once the COLD marker committed and before the swap lists the .ec parts: it carries
+ * the marker's files as a COMMIT's, and the replica's open applies the COLD from the copied segment */
+static struct inst_snap *MW_IN;
+static char (*MW_ROOTS)[PATH_MAX + 32];
+static int *MW_NIN, MW_RETRIES, MW_DONE;
+static const char *MW_DIR;
+static void ec_marker_hook(struct eng *db, int step)
+{
+    if (step != ECCOLD_STEP_MARKER || MW_DONE)
+        return;
+    MW_DONE = 1;
+    struct snap_info si = {0};
+    int rc = make(db, "snap_ecm", &si, &MW_RETRIES);
+    if (rc != 0) {
+        ifail("ec: the make between the COLD marker and the swap: %d", rc);
+        return;
+    }
+    ec_man_check(si.path, 0);
+    struct snap_man m = {0};
+    if (snap_man_read(si.path, &m) == 0) {
+        size_t nst = 0;
+        for (size_t i = 0; i < m.nfiles; i++)
+            nst += m.files[i].kind == SNAP_STAGE;
+        if (nst == 0)
+            ifail("ec: the snapshot between the COLD marker and the swap carries no stage_ file");
+        snap_man_free(&m);
+    }
+    snprintf(MW_ROOTS[*MW_NIN], PATH_MAX + 32, "%s_root%d", MW_DIR, *MW_NIN);
+    if (inst_copy(si.path, MW_ROOTS[*MW_NIN], &MW_IN[*MW_NIN]))
+        (*MW_NIN)++;
+    snap_release(si.path);
+}
+
+#define NEC 5 /* before the settle, between its marker and its swap, three after it */
 static void case_ec(void)
 {
     ecl L;
@@ -2631,8 +2827,14 @@ static void case_ec(void)
             nin++;
         snap_release(si.path);
     }
-    if ((rc = ec_settle(db, day0 / DAY_MS)) != 0)
+    MW_IN = in, MW_ROOTS = roots, MW_NIN = &nin, MW_DIR = L.dir, MW_DONE = 0;
+    atomic_store(&eccold_test_hook, ec_marker_hook);
+    rc = ec_settle(db, day0 / DAY_MS);
+    atomic_store(&eccold_test_hook, NULL);
+    if (rc != 0)
         ifail("ec: the settle of day A: %d", rc);
+    if (nin != 2)
+        ifail("ec: no snapshot between the COLD marker and the swap (%d made)", nin);
     size_t nec = ec_listed(db);
     CHECK(nec >= 1);
     int c0 = ec_chunks(&L);
@@ -2642,7 +2844,9 @@ static void case_ec(void)
     pthread_t w[2];
     for (int i = 0; i < 2; i++)
         pthread_create(&w[i], NULL, ec_writer, (void *)(intptr_t)i);
-    for (int i = 1; i < NEC; i++) {
+    char tpl[PATH_MAX + 80];
+    PJ(tpl, "%s_vtpl", L.dir);
+    for (int i = 2; i < NEC; i++) {
         usleep(20000 + 15000 * (useconds_t)i);
         if (i == 2)
             eng_leader_keep(db, atomic_load(&db->lead_commit));
@@ -2655,6 +2859,8 @@ static void case_ec(void)
         if (rc)
             continue;
         ec_man_check(si.path, nec);
+        if (i == 2)
+            sh("rm -rf '%s' && cp -a '%s' '%s'", tpl, si.path, tpl);
         snprintf(roots[nin], sizeof roots[0], "%s_root%d", L.dir, nin);
         if (inst_copy(si.path, roots[nin], &in[nin]))
             nin++;
@@ -2707,13 +2913,19 @@ static void case_ec(void)
         ec_close(&xt, &x);
     }
     CHECK(nin == NEC);
+    char vroot[PATH_MAX + 80];
+    PJ(vroot, "%s_vroot", L.dir);
+    int nv = ec_verify(&L, tpl, vroot);
+    if (ec_chunks(&L) != c0)
+        ifail("ec: the chunks changed during the verify cases (%d, were %d)", ec_chunks(&L), c0);
     printf("  ec: %d snapshots of an erasure-coded cluster volume (%zu .ec part, %d chunks; the first before the "
-           "settle) installed with their PPOS records; %zu read the settled rows from the stores and, fed on, equal "
-           "the leader; no chunk removed (%d retries)\n", nin, nec, c0, ok, retries);
+           "settle, the second between its COLD marker and its swap) installed with their PPOS records; %zu read the "
+           "settled rows from the stores and, fed on, equal the leader; no chunk removed (%d retries); %d damaged or "
+           "foreign copies refused, a record with ppos 0 installed\n", nin, nec, c0, ok, retries + MW_RETRIES, nv - 1);
     for (int i = 0; i < nin && !fails; i++)
         sh("rm -rf '%s'", roots[i]);
     if (!fails)
-        sh("rm -rf '%s' '%s' '%s' '%s'", L.dir, L.st[0], L.st[1], L.st[2]);
+        sh("rm -rf '%s' '%s' '%s' '%s' '%s'", L.dir, L.st[0], L.st[1], L.st[2], tpl);
 }
 
 /* ec power: install_power's steps with v0 opened by the tier on the stores */
@@ -2830,7 +3042,9 @@ static void set_mutant(const char *m)
              {"snapkeepunsure", SNAP_MUT_KEEPUNSURE}, {"snapswapfirst", SNAP_MUT_SWAPFIRST},
              {"snapinstnodirsync", SNAP_MUT_INSTNODIRSYNC}, {"snapinstnoppos", SNAP_MUT_INSTNOPPOS},
              {"snappposafter", SNAP_MUT_PPOSAFTER},     {"snapcarrysettled", SNAP_MUT_CARRYSETTLED},
-             {"snapskipec", SNAP_MUT_SKIPEC}};
+             {"snapskipec", SNAP_MUT_SKIPEC},           {"snapecnoverify", SNAP_MUT_ECNOVERIFY},
+             {"snapecnozeq", SNAP_MUT_ECNOZEQ},         {"snapecnozp", SNAP_MUT_ECNOZP},
+             {"snapecnoppos", SNAP_MUT_ECNOPPOS},       {"snapnoreserved", SNAP_MUT_NORESERVED}};
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
         if (strcmp(m, t[i].name) == 0) {
             snap_mutant = t[i].v;
@@ -3007,6 +3221,10 @@ int main(int argc, char **argv)
     if (only && strcmp(only, "ec") == 0) { /* --only ec: the erasure-coded cases alone */
         case_ec();
         case_ec_power();
+        goto out;
+    }
+    if (only && strcmp(only, "man") == 0) { /* --only man: SNAPMAN's refusals alone */
+        case_man_bad();
         goto out;
     }
     if (only && strcmp(only, "install") == 0) {
