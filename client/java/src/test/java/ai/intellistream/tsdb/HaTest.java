@@ -476,6 +476,38 @@ class HaTest {
     }
 
     @Test
+    void unavailableRetriesDoNotDelayMoved() throws Exception {
+        try (Fake b = new Fake(r -> ok());
+                Fake a = new Fake(r -> r.nth() < 8 ? unavailable(5) : new Reply(-10, movedBody(b.addr())));
+                TsdbClient c = TsdbClient.connect("127.0.0.1", a.port())) {
+            long t0 = System.nanoTime();
+            c.flush();
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertEquals(9, a.seen(OP_FLUSH).size());
+            assertEquals(1, b.seen(OP_FLUSH).size());
+            assertTrue(ms < 200, "MOVED waited for UNAVAILABLE backoff: " + ms + " ms");
+        }
+    }
+
+    @Test
+    void repeatedMovedBacksOffWithinBudget() throws Exception {
+        var aAddr = new java.util.concurrent.atomic.AtomicReference<String>();
+        try (Fake b = new Fake(r -> new Reply(-10, movedBody(aAddr.get())));
+                Fake a = new Fake(r -> new Reply(-10, movedBody(b.addr())))) {
+            aAddr.set(a.addr());
+            try (TsdbClient c = TsdbClient.connect("127.0.0.1", a.port())) {
+                c.setRetry(Duration.ofMillis(350));
+                long t0 = System.nanoTime();
+                assertThrows(MovedException.class, c::flush);
+                long ms = (System.nanoTime() - t0) / 1_000_000;
+                assertTrue(ms >= 150 && ms < 1500, ms + " ms");
+                int total = a.seen(OP_FLUSH).size() + b.seen(OP_FLUSH).size();
+                assertTrue(total <= 10, "too many MOVED rounds: " + total);
+            }
+        }
+    }
+
+    @Test
     void movedWithoutAnAddressGoesToTheNextNode() throws Exception {
         try (Fake b = new Fake(r -> ok()); Fake a = new Fake(r -> new Reply(-10, movedBody("")));
                 TsdbClient c = TsdbClient.connectNodes(a.addr() + "," + b.addr())) {

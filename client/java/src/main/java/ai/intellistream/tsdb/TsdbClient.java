@@ -4167,7 +4167,7 @@ public final class TsdbClient implements AutoCloseable {
     private static final class Retry {
         long deadline;
         boolean started;
-        int tries;
+        int movedTries;
     }
 
     /**
@@ -4191,8 +4191,8 @@ public final class TsdbClient implements AutoCloseable {
             delay = 1000; /* a server without the body (protocol 12) */
         else
             delay = Math.max(1, Math.min(60_000, e.retryAfterMs()));
-        if (moved && r.tries > 0)
-            delay = Math.max(delay, Math.min(50L * r.tries, 1000)); /* a MOVED that keeps coming: not a tight loop */
+        if (moved && r.movedTries > 0)
+            delay = Math.max(delay, Math.min(50L * r.movedTries, 1000)); /* a MOVED that keeps coming: not a tight loop */
         if (r.deadline - now < delay * 1_000_000L)
             return false;
         try {
@@ -4202,8 +4202,11 @@ public final class TsdbClient implements AutoCloseable {
             Thread.currentThread().interrupt();
             return false;
         }
-        r.tries++;
-        return !moved || followMoved(e, r.deadline);
+        if (moved) {
+            r.movedTries++;
+            return followMoved(e, r.deadline);
+        }
+        return true;
     }
 
     /** After MOVED: to the address it names, else to another node of the connect string. */

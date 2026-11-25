@@ -797,7 +797,7 @@ static bool retryable_status(int32_t st) { return st == TSDB_ERR_UNAVAILABLE || 
 /* One step of retrying the request whose reply was UNAVAILABLE or MOVED (c->err describes it): waits the server's
  * retry_after_ms, follows a MOVED. 1: send the request again; 0: give up, the status stands (the budget would be
  * over, or a MOVED with nowhere to go). deadline is 0 until the first refusal of this request. */
-static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsigned *tries)
+static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsigned *moved_tries)
 {
     for (size_t i = 0; e->status == TSDB_ERR_UNAVAILABLE && e->has_body && i < e->nunavail; i++)
         if (e->unavail[i].reason == TSDB_WHY_LOST)
@@ -806,14 +806,19 @@ static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsi
     if (!*deadline)
         *deadline = now + c->retry_ms;
     int64_t delay = retry_delay_ms(e);
-    if (e->status == TSDB_ERR_MOVED && *tries) /* a MOVED that keeps coming: not a tight loop */
-        delay = delay > 50 * (int64_t)*tries ? delay : 50 * (int64_t)*tries > 1000 ? 1000 : 50 * (int64_t)*tries;
+    bool moved = e->status == TSDB_ERR_MOVED;
+    if (moved && *moved_tries) /* a MOVED that keeps coming: not a tight loop */
+        delay = delay > 50 * (int64_t)*moved_tries ? delay
+                : 50 * (int64_t)*moved_tries > 1000 ? 1000
+                                                    : 50 * (int64_t)*moved_tries;
     if (now + delay > *deadline)
         return 0;
     sleep_ms(delay);
-    (*tries)++;
-    if (e->status == TSDB_ERR_MOVED && follow_moved(c, e, *deadline) != 0)
-        return 0;
+    if (moved) {
+        (*moved_tries)++;
+        if (follow_moved(c, e, *deadline) != 0)
+            return 0;
+    }
     return 1;
 }
 
@@ -830,7 +835,7 @@ static int send_kept(tsdbc *c, const struct sent *e)
 static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *blen)
 {
     int64_t deadline = 0;
-    unsigned tries = 0;
+    unsigned moved_tries = 0;
     c->gave_up = false;
     for (;;) {
         uint32_t id = c->expect;
@@ -845,7 +850,7 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
         if (!alone || (c->stream_valid && c->stream_id == id))
             return 0;
         tsdbc_err_info err = c->err;
-        if (!retry_step(c, &err, &deadline, &tries)) {
+        if (!retry_step(c, &err, &deadline, &moved_tries)) {
             c->gave_up = true;
             return 0;
         }
@@ -860,7 +865,7 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
 static int drain(tsdbc *c)
 {
     int64_t deadline = 0;
-    unsigned tries = 0;
+    unsigned moved_tries = 0;
     for (;;) {
         bool failed = false;
         uint32_t first_id = 0;
@@ -889,7 +894,7 @@ static int drain(tsdbc *c)
         }
         if (!failed)
             break;
-        if (!retry_step(c, &first_err, &deadline, &tries)) {
+        if (!retry_step(c, &first_err, &deadline, &moved_tries)) {
             if (!c->pending_rc)
                 c->pending_rc = first_err.status;
             break;

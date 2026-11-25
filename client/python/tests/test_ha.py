@@ -193,6 +193,31 @@ def test_moved_is_followed_to_the_node_it_names(fake):
         assert len(a.seen(OP_FLUSH)) == 1 and len(b.seen(OP_FLUSH)) == 2
 
 
+def test_unavailable_retries_do_not_delay_moved(fake):
+    b = fake(lambda op, nth: (0, b""))
+    a = fake(lambda op, nth: unavailable(5) if nth < 8 else (-10, moved_body(b.addr)))
+    with Client("127.0.0.1", a.port) as c:
+        t0 = time.monotonic()
+        c.flush()
+        dt = time.monotonic() - t0
+        assert len(a.seen(OP_FLUSH)) == 9 and len(b.seen(OP_FLUSH)) == 1
+        assert dt < 0.2, f"MOVED waited for UNAVAILABLE backoff: {dt:.3f}s"
+
+
+def test_repeated_moved_backs_off_within_budget(fake):
+    target = {}
+    b = fake(lambda op, nth: (-10, moved_body(target["a"])))
+    a = fake(lambda op, nth: (-10, moved_body(b.addr)))
+    target["a"] = a.addr
+    with Client("127.0.0.1", a.port, retry=0.35) as c:
+        t0 = time.monotonic()
+        with pytest.raises(TsdbMoved):
+            c.flush()
+        dt = time.monotonic() - t0
+        assert 0.15 <= dt < 1.5, f"dt {dt:.3f}s"
+        assert len(a.seen(OP_FLUSH)) + len(b.seen(OP_FLUSH)) <= 10
+
+
 def test_moved_is_an_exception_when_there_is_nowhere_to_go(fake):
     a = fake(lambda op, nth: (-10, moved_body("")))
     with Client("127.0.0.1", a.port) as c:

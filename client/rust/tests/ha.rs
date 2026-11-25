@@ -323,6 +323,39 @@ fn moved_is_followed_to_the_node_it_names() {
 }
 
 #[test]
+fn unavailable_retries_do_not_delay_moved() {
+    let b = Fake::start(|_| ok());
+    let baddr = b.addr.to_string();
+    let a = Fake::start(move |r| if r.nth < 8 { unavailable(5) } else { Reply(-10, moved_body(&baddr)) });
+    let mut c = Client::connect(a.addr).unwrap();
+    let t0 = Instant::now();
+    c.flush().unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(a.seen(OP_FLUSH).len(), 9);
+    assert_eq!(b.seen(OP_FLUSH).len(), 1);
+    assert!(dt < Duration::from_millis(200), "MOVED waited for UNAVAILABLE backoff: {dt:?}");
+}
+
+#[test]
+fn repeated_moved_backs_off_within_budget() {
+    let a_addr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let a_addr_b = Arc::clone(&a_addr);
+    let b = Fake::start(move |_| Reply(-10, moved_body(a_addr_b.lock().unwrap().as_deref().unwrap())));
+    let baddr = b.addr.to_string();
+    let a = Fake::start(move |_| Reply(-10, moved_body(&baddr)));
+    *a_addr.lock().unwrap() = Some(a.addr.to_string());
+    let mut c = Client::connect(a.addr).unwrap();
+    c.set_retry(Some(Duration::from_millis(350)));
+    let t0 = Instant::now();
+    let e = c.flush().unwrap_err();
+    let dt = t0.elapsed();
+    assert_eq!(e.status(), Some(Status::Moved), "{e}");
+    assert!(dt >= Duration::from_millis(150) && dt < Duration::from_millis(1500), "dt {dt:?}");
+    let total = a.seen(OP_FLUSH).len() + b.seen(OP_FLUSH).len();
+    assert!(total <= 10, "too many MOVED rounds: {total}");
+}
+
+#[test]
 fn following_a_moved_takes_at_most_the_time_left_of_the_budget() {
     // B accepts the connection (the kernel does) and never answers the handshake: without the cap this call waits
     // the 10 s connect timeout
