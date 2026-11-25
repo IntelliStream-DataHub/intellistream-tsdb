@@ -430,7 +430,7 @@ TEST_GROUPS ?= test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 te
 TEST_TARGET ?= test
 .PHONY: test-units-b test-meta test-meta-mutants-1 test-meta-mutants-2 test-net
 test-units-b: $(if $(filter Linux,$(UNAME_S)),$(B)/libtsdb.so)
-test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
+test-units-b: $(B)/test_ppos $(B)/test_chunk $(B)/test_chunksrv $(B)/test_chunkpeer $(B)/test_chunk_heal $(B)/test_ecnames $(B)/test_settle_oracle $(B)/test_ecswap $(B)/test_seam $(B)/test_ecpart $(B)/test_ecskip $(B)/test_tier $(B)/test_ecgc $(B)/test_keep $(B)/test_ecdigest $(B)/test_settle $(B)/test_eccold $(B)/test_ecapply $(B)/test_marker
 test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_follow $(B)/test_volumes $(B)/test_rs $(B)/test_crypto $(B)/test_users $(B)/test_export $(B)/fuzz_frames $(B)/test_out_send $(B)/tsdb $(B)/tsdbd $(B)/tsdb-bench $(CLIB) $(CRASHFS_SO)
 	./$(B)/test_props $(SCRATCH)
 	B=$(B) tests/test_config.sh $(TMPDIR)
@@ -458,6 +458,8 @@ test-units-b: $(B)/test_props $(B)/test_watchdog $(B)/test_group $(B)/test_lttb 
 	$(if $(EC_OBJ),$(MUT) --name test_chunk --fail --grep 'stream put .* differ from chunk_encode' --list "streamreread" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # pinned to its oracle's line
 	./$(B)/test_chunksrv $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_chunksrv --list "chunknofence chunkselfraise putokearly nocellcheck storeforeign" -- ./$(B)/test_chunksrv --quick --mutant @M@ @D@) # each planted bug must fail it
+	./$(B)/test_chunkpeer $(SCRATCH)
+	$(if $(EC_OBJ),$(MUT) --name test_chunkpeer --list "ownepoch nosumcmp staleraise delbeforegc" -- ./$(B)/test_chunkpeer --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_chunk_heal $(SCRATCH)
 	./$(B)/test_ecnames $(SCRATCH)
 	$(MUT) --name test_ecnames --list "nameloose tierloose" -- ./$(B)/test_ecnames --mutant @M@ @D@ # each planted bug must fail it
@@ -924,6 +926,10 @@ $(B)/fwd_cluster.o: server/fwd_cluster.c server/fwd.h server/peerlink.h server/c
 # no cluster calls (test_chunksrv and the fuzzer link it), tsdbd's instance over the member list in chunksrv_cluster.o
 $(B)/chunksrv.o: server/chunksrv.c server/chunksrv.h server/peerlink.h src/chunk.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+# the cold ops of a cluster ec volume over its stripe group (server/chunkpeer.h, r8f); no cluster calls (test_chunkpeer
+# links it with chunksrv.o)
+$(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
@@ -1303,6 +1309,10 @@ $(B)/test_tier: tests/test_tier.c src/internal.h src/ecgc.h src/tier.h src/chunk
 # loss in a put (crashfs); mutants must fail it
 $(B)/test_chunksrv: tests/test_chunksrv.c server/chunksrv.h src/chunk.h src/chunk_priv.h $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ $< $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+
+# the cold ops of a cluster ec volume against six in-process chunk servers (a fake transport); mutants must fail it
+$(B)/test_chunkpeer: tests/test_chunkpeer.c server/chunkpeer.h server/chunksrv.h src/coldops.h src/chunk.h $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -Iinclude -o $@ $< $(B)/chunkpeer.o $(B)/chunksrv.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # objects, chunk files, stores and the directory backend (R6): every geometry, every damage pattern, range reads at every
 # boundary, epoch fences, power loss (crashfs) at every step of a chunk write and an EPOCH store; mutants must fail it
