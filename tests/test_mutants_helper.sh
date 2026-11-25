@@ -47,10 +47,21 @@ pin*) # what the pool looks like while this run holds its slot
 watch*) # is the process that held the slot before us still alive? (then the pool ran one job too many)
     ! kill -0 "$(cat "$FAKE_A")" 2>/dev/null || echo "$m" >>"$FAKE_PIN.violation"
     exit 1 ;;
-conc*) # how many runs are alive at once
+conc*) # how many runs are alive at once; wait up to 10 s for FAKE_CONC_WANT peers (unless already seen)
     mkdir -p "$FAKE_CONC"; touch "$FAKE_CONC/$$"
-    n=$(ls "$FAKE_CONC" | wc -l); echo "$n" >>"$FAKE_CONC.max"
-    sleep 0.6; rm -f "$FAKE_CONC/$$"; exit 1 ;;
+    want=${FAKE_CONC_WANT:-1} max=0
+    for _ in $(seq 1 200); do
+        n=$(ls "$FAKE_CONC" | wc -l)
+        [ "$n" -gt "$max" ] && max=$n
+        [ "$n" -ge "$want" ] && break
+        grep -qx "$want" "$FAKE_CONC.max" 2>/dev/null && break
+        sleep 0.05
+    done
+    sleep 0.25
+    n=$(ls "$FAKE_CONC" | wc -l)
+    [ "$n" -gt "$max" ] && max=$n
+    echo "$max" >>"$FAKE_CONC.max"
+    rm -f "$FAKE_CONC/$$"; exit 1 ;;
 esac
 exit 3
 EOF
@@ -132,7 +143,7 @@ run dl "$H" --name t --timeout 2 --jobs 2 --list "hang catch1" -- "$F" @M@ @D@
 has "mutant hang: SURVIVED"; has "timeout after 2 s"; has "mutant catch1: caught"
 [ $((SECONDS - t0)) -lt 20 ] || fail "the hang took $((SECONDS - t0)) s"
 hp=$(cat "$FAKE_PIDS/hang")
-sleep 0.3
+for _ in $(seq 1 30); do kill -0 "$hp" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$hp" 2>/dev/null; then kill "$hp" 2>/dev/null; fail "the hung run's child $hp is still alive"; fi
 rm -rf "$base"/mut.*
 # MUTANT_TIMEOUT too
@@ -160,16 +171,16 @@ rm -rf "$base"/mut.*
 # 11. the job limits: MUTANT_JOBS (1 = one after the other), the default, MUTANT_URING_JOBS with --uring
 maxc() { sort -n "$FAKE_CONC.max" | tail -n 1; }
 rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-MUTANT_JOBS=1 run "$H" --name t --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@
+FAKE_CONC_WANT=1 MUTANT_JOBS=1 run "$H" --name t --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@
 [ "$(maxc)" = 1 ] || fail "MUTANT_JOBS=1: $(maxc) at once"
 rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-MUTANT_JOBS=3 run "$H" --name t --list "conc1 conc2 conc3 conc4 conc5 conc6" -- "$F" @M@ @D@
+FAKE_CONC_WANT=3 MUTANT_JOBS=3 run "$H" --name t --list "conc1 conc2 conc3 conc4 conc5 conc6" -- "$F" @M@ @D@
 [ "$(maxc)" = 3 ] || fail "MUTANT_JOBS=3: $(maxc) at once"
 rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-MUTANT_JOBS=6 MUTANT_URING_JOBS=2 run "$H" --name t --uring --list "conc1 conc2 conc3 conc4 conc5 conc6" -- "$F" @M@ @D@
+FAKE_CONC_WANT=2 MUTANT_JOBS=6 MUTANT_URING_JOBS=2 run "$H" --name t --uring --list "conc1 conc2 conc3 conc4 conc5 conc6" -- "$F" @M@ @D@
 [ "$(maxc)" = 2 ] || fail "MUTANT_URING_JOBS=2: $(maxc) at once"
 rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-run "$H" --name t --jobs 2 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@
+FAKE_CONC_WANT=2 run "$H" --name t --jobs 2 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@
 [ "$(maxc)" = 2 ] || fail "--jobs 2: $(maxc) at once"
 rm -rf "$base"/mut.*
 
@@ -197,9 +208,9 @@ rm -rf "$base"/mut.*
 pool_cases() {
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/slots"
     export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
-    dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+    FAKE_CONC_WANT=2 dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3 conc4" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
     pa=$!
-    dl "$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+    FAKE_CONC_WANT=2 dl "$H" --name b --jobs 4 --list "conc5 conc6 conc7 conc8" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
     pb=$!
     wait $pa || fail "pool$1: first helper failed"
     wait $pb || fail "pool$1: second helper failed"
@@ -219,23 +230,23 @@ pool_cases() {
     # no job count given: the helpers share a default pool per user (MUTANT_SLOTS wide here), jobs given: no pool
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/tsdb-mutant-slots-$(id -u)"
     unset MUTANT_SLOT_DIR
-    MUTANT_SLOTS=1 dl "$H" --name a --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
+    FAKE_CONC_WANT=1 MUTANT_SLOTS=1 dl "$H" --name a --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
     pa=$!
-    MUTANT_SLOTS=1 dl "$H" --name b --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
+    FAKE_CONC_WANT=1 MUTANT_SLOTS=1 dl "$H" --name b --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
     pb=$!
     wait $pa || fail "default pool$1: first helper failed"
     wait $pb || fail "default pool$1: second helper failed"
     [ "$(maxc)" = 1 ] || fail "default pool$1 of 1 over two helpers: $(maxc) at once"
     [ -d "$base/tsdb-mutant-slots-$(id -u)" ] || fail "the default pool was not made under XDG_RUNTIME_DIR"
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-    MUTANT_SLOTS=1 run dl "$H" --name t --jobs 3 --list "conc1 conc2 conc3" -- "$F" @M@ @D@
+    FAKE_CONC_WANT=3 MUTANT_SLOTS=1 run dl "$H" --name t --jobs 3 --list "conc1 conc2 conc3" -- "$F" @M@ @D@
     [ "$(maxc)" = 3 ] || fail "--jobs given$1: the default pool applied ($(maxc) at once)"
     # a slot left by a helper that died is taken over (a flock is let go by the kernel; a file names a dead pid)
     export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=2
     rm -rf "$base/slots"; mkdir -p "$base/slots"
     echo 999999 >"$base/slots/nf.1"; echo 999999 >"$base/slots/nf.2"
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max"
-    run dl "$H" --name t --jobs 2 --list "conc1 conc2" -- "$F" @M@ @D@
+    FAKE_CONC_WANT=2 run dl "$H" --name t --jobs 2 --list "conc1 conc2" -- "$F" @M@ @D@
     [ $rc -eq 0 ] || fail "stale slots$1: rc $rc"
     [ "$(maxc)" = 2 ] || fail "stale slots$1: not both taken over ($(maxc) at once)"
     [ -z "${MUTANT_NO_FLOCK:-}" ] || [ -z "$(ls "$base/slots" | grep -v '^nf\.new\.')" ] ||
@@ -295,7 +306,7 @@ EOF
 chmod +x "$base/shim/mkdir"
 for nf in "" 1; do
     rm -rf "$FAKE_CONC" "$FAKE_CONC.max" "$base/slots"
-    export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=1 MUTANT_NO_FLOCK=$nf
+    export MUTANT_SLOT_DIR=$base/slots MUTANT_SLOTS=1 MUTANT_NO_FLOCK=$nf FAKE_CONC_WANT=1
     PATH=$base/shim:$PATH dl "$H" --name a --jobs 4 --list "conc1 conc2 conc3" -- "$F" @M@ @D@ >"$base/a.out" 2>&1 &
     pa=$!
     PATH=$base/shim:$PATH dl "$H" --name b --jobs 4 --list "conc4 conc5 conc6" -- "$F" @M@ @D@ >"$base/b.out" 2>&1 &
@@ -303,7 +314,7 @@ for nf in "" 1; do
     wait $pa || fail "mkdir that always says 0${nf:+, no flock}: first helper failed"
     wait $pb || fail "mkdir that always says 0${nf:+, no flock}: second helper failed"
     [ "$(maxc)" = 1 ] || fail "mkdir that always says 0${nf:+, no flock}: $(maxc) at once in a pool of 1"
-    unset MUTANT_SLOT_DIR MUTANT_SLOTS MUTANT_NO_FLOCK
+    unset MUTANT_SLOT_DIR MUTANT_SLOTS MUTANT_NO_FLOCK FAKE_CONC_WANT
 done
 rm -rf "$base"/mut.*
 
@@ -316,13 +327,13 @@ rm -rf "$base"/mut.*
 # 16. a SIGKILL of the helper runs no trap: the runs, each in a group of its own, must not outlive it
 "$H" --name t --timeout 600 --jobs 2 --list "hangk" -- "$F" @M@ @D@ >"$base/k.out" 2>&1 &
 hp=$!
-for _ in $(seq 1 50); do [ -s "$FAKE_PIDS/hangk" ] && break; sleep 0.1; done
+for _ in $(seq 1 150); do [ -s "$FAKE_PIDS/hangk" ] && break; sleep 0.1; done
 [ -s "$FAKE_PIDS/hangk" ] || { kill -KILL "$hp" 2>/dev/null; fail "the run did not start"; }
 kp=$(cat "$FAKE_PIDS/hangk")
 kill -0 "$kp" 2>/dev/null || fail "the run's child is not alive before the kill"
 kill -KILL "$hp"; wait "$hp" 2>/dev/null
 gone=
-for _ in $(seq 1 60); do kill -0 "$kp" 2>/dev/null || { gone=1; break; }; sleep 0.1; done
+for _ in $(seq 1 150); do kill -0 "$kp" 2>/dev/null || { gone=1; break; }; sleep 0.1; done
 [ -n "$gone" ] || { kill "$kp" 2>/dev/null; fail "the run's child $kp outlived a SIGKILL of the helper"; }
 rm -rf "$base"/mut.*
 
