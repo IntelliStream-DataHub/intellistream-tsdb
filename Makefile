@@ -972,8 +972,8 @@ $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HD
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 $(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)

@@ -7,6 +7,8 @@
  * violation of the fake (a buffer posted twice, a slot taken back while the NIC holds it, a queue pair destroyed
  * undrained, numbers that are not the peer's, a SEND without a posted receive).
  *
+ * Two hosts on real verbs (--verbs-listen, --verbs-dial, --tcp): below, at "two hosts".
+ *
  * Cases: basic (frames both ways, many slots each, small credit windows, so both sides run out of credits with frames
  * queued), pause (a paused link that only PINGs for 10 x dead_ms is not counted dead), storm (an idle link sends no
  * stream of CREDITs), written (a frame posted and then flushed by a failed queue pair is WRITTEN), qperr (a send that
@@ -68,6 +70,11 @@ struct node {
     _Atomic uint64_t in, next, bad;
     _Atomic int ups, downs, written, unwritten;
     _Atomic uint64_t sent_token;
+    /* two hosts (--verbs-listen, --verbs-dial): the bench's phase as its frames say it */
+    _Atomic int bench, ended;
+    _Atomic uint64_t bn, bsize, bdone, replied;
+    uint64_t b_t0, b_t1, b_cpu0, b_cpu1; /* the receiver's: written by the link thread before bdone moves */
+    uint64_t r_ns, r_cpu;                /* the sender's copy of the receiver's, before replied moves */
 };
 
 static void fill(uint8_t *b, size_t len, uint64_t i)
@@ -80,10 +87,20 @@ static void fill(uint8_t *b, size_t len, uint64_t i)
     }
 }
 
+static void hosts_frame(struct node *nd, uint8_t type, const uint8_t *p, size_t n);
+
 static void on_frame(void *arg, struct plink *l, uint8_t type, const uint8_t *p, size_t n)
 {
     struct node *nd = arg;
     (void)l;
+    if (type >= 2 && type <= 4) {
+        hosts_frame(nd, type, p, n);
+        return;
+    }
+    if (type == 1 && atomic_load(&nd->bench)) {
+        hosts_frame(nd, type, p, n);
+        return;
+    }
     if (type != 1 || n < 8) {
         atomic_fetch_add(&nd->bad, 1);
         return;
@@ -517,6 +534,350 @@ static void test_ep(void)
     }
 }
 
+/* ------------------------------------------------------------------------------------------------- two hosts */
+/*
+ * --verbs-listen ADDR --port-file F on one host, --verbs-dial ADDR:PORT on the other: the transport on real verbs
+ * (docs/design-rdma.md §3, "verbs under peerlink"). ADDR is an Ethernet address of the hosts: the TCP connection
+ * carries the two endpoints (as rd-upgrade's OFFER and ACCEPT will) and then stays as the connection's anchor, never
+ * another byte. --tcp (the dialer's): the same link on that TCP connection itself, for the comparison; --log: a log
+ * link, which compresses every frame (zstd-1), instead of a bulk link (unthrottled here), which does not. The listener
+ * binds port 0 and writes "PORT PID" to F (atomically); it serves one session and exits.
+ * A session: `check` (frames of random sizes both ways at once, every byte compared, both sides out of credits with
+ * frames queued), then the dialer's bench: per frame size (--sizes), a BEGIN frame, N frames one way (--bytes in
+ * all), the receiver's DONE with its elapsed time and CPU; Gbit/s from the sender's clock (BEGIN to DONE), CPU s/GB of
+ * each process (getrusage: every thread), then END. Each pool must be whole after the link closed.
+ */
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/socket.h>
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t cpu_ns(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ((uint64_t)ru.ru_utime.tv_sec + (uint64_t)ru.ru_stime.tv_sec) * 1000000000ull +
+           ((uint64_t)ru.ru_utime.tv_usec + (uint64_t)ru.ru_stime.tv_usec) * 1000ull;
+}
+
+/* BEGIN (2): size, count; DONE (3): elapsed ns, cpu ns; END (4). Type 1 in a bench: the frame's number first. */
+static void hosts_frame(struct node *nd, uint8_t type, const uint8_t *p, size_t n)
+{
+    uint64_t a = 0, b = 0;
+    if (type != 4 && type != 1 && n != 16) {
+        atomic_fetch_add(&nd->bad, 1);
+        return;
+    }
+    if (type == 2 || type == 3) {
+        memcpy(&a, p, 8);
+        memcpy(&b, p + 8, 8);
+    }
+    switch (type) {
+    case 1: {
+        uint64_t i = 0;
+        if (n >= 8)
+            memcpy(&i, p, 8);
+        if (n != atomic_load(&nd->bsize) || i != atomic_load(&nd->next))
+            atomic_fetch_add(&nd->bad, 1);
+        atomic_store(&nd->next, i + 1);
+        if (atomic_fetch_add(&nd->in, 1) + 1 == atomic_load(&nd->bn)) {
+            nd->b_t1 = now_ns();
+            nd->b_cpu1 = cpu_ns();
+            atomic_fetch_add(&nd->bdone, 1);
+        }
+        break;
+    }
+    case 2:
+        nd->b_t0 = now_ns();
+        nd->b_cpu0 = cpu_ns();
+        atomic_store(&nd->bsize, a);
+        atomic_store(&nd->bn, b);
+        atomic_store(&nd->next, 0);
+        atomic_store(&nd->in, 0);
+        atomic_store(&nd->bench, 1);
+        break;
+    case 3:
+        nd->r_ns = a;
+        nd->r_cpu = b;
+        atomic_fetch_add(&nd->replied, 1);
+        break;
+    case 4:
+        atomic_store(&nd->ended, 1);
+        break;
+    }
+}
+
+/* the anchor: a plain socket (peerlink's own TCP transport is not exported) */
+struct ttcp {
+    struct pl_transport t;
+    int fd;
+};
+static ssize_t ttcp_read(struct pl_transport *t, void *p, size_t n)
+{
+    return recv(((struct ttcp *)t)->fd, p, n, MSG_DONTWAIT);
+}
+static ssize_t ttcp_writev(struct pl_transport *t, const struct iovec *iov, int n)
+{
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = (struct iovec *)iov;
+    m.msg_iovlen = (size_t)n;
+    return sendmsg(((struct ttcp *)t)->fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+static int ttcp_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int *ready)
+{
+    pf[0].fd = ((struct ttcp *)t)->fd;
+    pf[0].events = (short)(((want & PL_TR_IN) ? POLLIN : 0) | ((want & PL_TR_OUT) ? POLLOUT : 0));
+    pf[0].revents = 0;
+    *ready = 0;
+    return 1;
+}
+static int ttcp_poll_ready(struct pl_transport *t, const struct pollfd *pf, int k)
+{
+    (void)t;
+    int r = 0;
+    if (k > 0 && (pf[0].revents & (POLLIN | POLLHUP | POLLERR)))
+        r |= PL_TR_IN;
+    if (k > 0 && (pf[0].revents & POLLOUT))
+        r |= PL_TR_OUT;
+    return r;
+}
+static void ttcp_close(struct pl_transport *t)
+{
+    close(((struct ttcp *)t)->fd);
+    free(t);
+}
+static const struct pl_tr_ops ttcp_ops = {"tcp", ttcp_read, ttcp_writev, ttcp_poll_fds, ttcp_poll_ready, ttcp_close};
+
+static struct pl_transport *ttcp_new(int fd)
+{
+    struct ttcp *t = calloc(1, sizeof *t);
+    if (!t)
+        exit(2);
+    t->t.ops = &ttcp_ops;
+    t->fd = fd;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    return &t->t;
+}
+
+static int full_io(int fd, void *p, size_t n, int wr)
+{
+    for (size_t k = 0; k < n;) {
+        ssize_t r = wr ? send(fd, (uint8_t *)p + k, n - k, MSG_NOSIGNAL) : recv(fd, (uint8_t *)p + k, n - k, 0);
+        if (r <= 0)
+            return -1;
+        k += (size_t)r;
+    }
+    return 0;
+}
+
+static int parse_addr(const char *s, struct sockaddr_in *sa, int need_port)
+{
+    char host[64];
+    const char *c = strrchr(s, ':');
+    size_t hl = c ? (size_t)(c - s) : strlen(s);
+    if (hl >= sizeof host || (need_port && !c))
+        return -1;
+    memcpy(host, s, hl);
+    host[hl] = 0;
+    memset(sa, 0, sizeof *sa);
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons(c ? (uint16_t)atoi(c + 1) : 0);
+    return inet_pton(AF_INET, host, &sa->sin_addr) == 1 ? 0 : -1;
+}
+
+struct hosts_opt {
+    const char *listen, *dial, *port_file, *dev, *sizes;
+    int tcp, kind;
+    uint64_t bytes;
+    struct plr_pool_cfg cfg;
+};
+
+static void hosts_bench(struct node *nd, struct plink *l, struct pl_transport *t, const struct hosts_opt *o)
+{
+    char sizes[256];
+    snprintf(sizes, sizeof sizes, "%s", o->sizes);
+    for (char *sv = NULL, *tok = strtok_r(sizes, ",", &sv); tok; tok = strtok_r(NULL, ",", &sv)) {
+        uint64_t size = strtoull(tok, NULL, 0), count = o->bytes / size;
+        if (size < 8 || size > PL_FRAME_MAX)
+            continue;
+        if (count > 4000000)
+            count = 4000000;
+        if (count < 100)
+            count = 100;
+        uint8_t *b = malloc(size);
+        fill(b, size, 0);
+        struct plr_conn_stats s0, s1;
+        memset(&s0, 0, sizeof s0);
+        memset(&s1, 0, sizeof s1);
+        if (!o->tcp)
+            plr_conn_stats(t, &s0);
+        uint64_t rep = atomic_load(&nd->replied), t0 = now_ns(), c0 = cpu_ns(), hdr[2] = {size, count};
+        int rc = plink_send(l, 2, hdr, 16, 10000);
+        for (uint64_t i = 0; rc == PL_OK && i < count; i++) {
+            memcpy(b, &i, 8);
+            rc = plink_send(l, 1, b, size, 10000);
+        }
+        free(b);
+        CHECK(rc == PL_OK && WAIT_FOR(atomic_load(&nd->replied) > rep, 120000));
+        uint64_t ns = now_ns() - t0, c = cpu_ns() - c0;
+        if (!o->tcp)
+            plr_conn_stats(t, &s1);
+        double gb = (double)size * (double)count / 1e9;
+        printf("bench %s %s %" PRIu64 ": %.2f Gbit/s, CPU s/GB sender %.3f receiver %.3f (%" PRIu64 " frames; receiver "
+               "%.2f Gbit/s; messages %" PRIu64 ", credits in %" PRIu64 ", stalls %" PRIu64 ")\n",
+               o->tcp ? "tcp" : "verbs", o->kind == PL_KIND_BULK ? "bulk" : "log", size, gb * 8 / ((double)ns / 1e9), (double)c / 1e9 / gb,
+               (double)nd->r_cpu / 1e9 / gb, count, gb * 8 / ((double)nd->r_ns / 1e9), s1.msgs_out - s0.msgs_out,
+               s1.credit_in - s0.credit_in, s1.stalls - s0.stalls);
+        if (rc != PL_OK)
+            return;
+    }
+}
+
+static int hosts_run(const struct hosts_opt *o)
+{
+    int dialer = o->dial != NULL, fd = -1;
+    struct sockaddr_in sa;
+    if (parse_addr(dialer ? o->dial : o->listen, &sa, dialer) < 0) {
+        fprintf(stderr, "bad address %s\n", dialer ? o->dial : o->listen);
+        return 2;
+    }
+    if (dialer) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+            perror("connect");
+            return 2;
+        }
+    } else {
+        int ls = socket(AF_INET, SOCK_STREAM, 0);
+        socklen_t sl = sizeof sa;
+        if (bind(ls, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(ls, 1) < 0 ||
+            getsockname(ls, (struct sockaddr *)&sa, &sl) < 0) {
+            perror("listen");
+            return 2;
+        }
+        if (o->port_file) {
+            char tmp[512];
+            snprintf(tmp, sizeof tmp, "%s.tmp", o->port_file);
+            FILE *f = fopen(tmp, "w");
+            if (!f || fprintf(f, "%u %d\n", (unsigned)ntohs(sa.sin_port), (int)getpid()) < 0 || fclose(f) != 0 ||
+                rename(tmp, o->port_file) < 0) {
+                perror("port file");
+                return 2;
+            }
+        }
+        printf("PORT %u\n", (unsigned)ntohs(sa.sin_port));
+        struct pollfd pf = {ls, POLLIN, 0};
+        if (poll(&pf, 1, 120000) != 1 || (fd = accept(ls, NULL, NULL)) < 0) {
+            fprintf(stderr, "no dialer within 120 s\n");
+            return 2;
+        }
+        close(ls);
+    }
+    uint8_t mode[2] = {(uint8_t)o->tcp, (uint8_t)o->kind}; /* the dialer's */
+    if (full_io(fd, mode, 2, dialer) < 0 || (mode[1] != PL_KIND_LOG && mode[1] != PL_KIND_BULK)) {
+        fprintf(stderr, "handshake: the peer went\n");
+        return 2;
+    }
+    struct hosts_opt oo = *o;
+    oo.tcp = mode[0];
+    oo.kind = mode[1];
+    o = &oo;
+    struct plr_pool *pool = NULL;
+    struct pl_transport *t;
+    if (o->tcp) {
+        t = ttcp_new(fd);
+    } else {
+        char err[256];
+        const struct plr_ops *ops = plrdma_verbs(err, sizeof err);
+        struct plr_pool_cfg c = o->cfg;
+        c.dev = o->dev;
+        pool = ops ? plr_pool_open(ops, &c, err, sizeof err) : NULL;
+        struct plr_conn *conn = pool ? plr_conn_new(pool, err, sizeof err) : NULL;
+        if (!conn) {
+            fprintf(stderr, "verbs: %s\n", err);
+            return 2;
+        }
+        struct plr_ep me, peer;
+        uint8_t w[PLR_EP_LEN], r[PLR_EP_LEN];
+        plr_conn_ep(conn, &me);
+        plr_ep_encode(&me, w);
+        if (full_io(fd, w, sizeof w, 1) < 0 || full_io(fd, r, sizeof r, 0) < 0 || plr_ep_decode(&peer, r, sizeof r) < 0) {
+            fprintf(stderr, "endpoint exchange failed\n");
+            return 2;
+        }
+        if (plr_conn_start(conn, &peer, err, sizeof err) < 0) {
+            fprintf(stderr, "start: %s\n", err);
+            return 2;
+        }
+        printf("verbs: lid %u qpn %u mtu %u -> lid %u qpn %u; slot %u, credits %u + %u\n", (unsigned)me.lid,
+               (unsigned)me.qpn, (unsigned)me.mtu, (unsigned)peer.lid, (unsigned)peer.qpn, (unsigned)peer.slot,
+               (unsigned)peer.data, (unsigned)peer.ctl);
+        t = plr_conn_transport(conn, ttcp_new(fd));
+    }
+    uint32_t self = dialer ? 1 : 2, other = dialer ? 2 : 1;
+    struct node *nd = node_new(self, 200, 5000);
+    peerlink_set_bulk_rate(nd->pl, PL_RATE_UNLIMITED);
+    CHECK(peerlink_test_attach(nd->pl, other, o->kind, dialer, (const uint8_t *)"host", 4, t) == 0);
+    struct plink *l = NULL;
+    WAIT_FOR((l = peerlink_find(nd->pl, other, o->kind)) != NULL && plink_up(l), 3000);
+    CHECK(l != NULL);
+    if (l) {
+        int n = 2000; /* not --quick: the two sides must agree */
+        uint64_t next = 0, rs = dialer ? 7 : 11;
+        uint64_t c0 = cpu_ns(), t0 = now_ns();
+        send_frames(l, &next, n, &rs);
+        CHECK(WAIT_FOR(atomic_load(&nd->in) == (uint64_t)n, 60000));
+        printf("check %s: %" PRIu64 " frames in, bad %" PRIu64 ", downs %d (%.0f ms, CPU %.0f ms)\n",
+               o->tcp ? "tcp" : "verbs", atomic_load(&nd->in), atomic_load(&nd->bad), atomic_load(&nd->downs),
+               (double)(now_ns() - t0) / 1e6, (double)(cpu_ns() - c0) / 1e6);
+        CHECK(atomic_load(&nd->bad) == 0 && atomic_load(&nd->downs) == 0);
+        if (dialer) {
+            /* the listener's DONE of its check first: a BEGIN before it has counted would reset its count */
+            CHECK(WAIT_FOR(atomic_load(&nd->replied) > 0, 60000));
+            hosts_bench(nd, l, t, o);
+            CHECK(plink_send(l, 4, NULL, 0, 10000) == PL_OK);
+            CHECK(WAIT_FOR(atomic_load(&nd->downs) > 0, 30000)); /* the listener closes */
+        } else {
+            uint64_t z[2] = {0, 0}, done = 0;
+            CHECK(plink_send(l, 3, z, 16, 10000) == PL_OK);
+            while (!atomic_load(&nd->ended) && atomic_load(&nd->downs) == 0) {
+                if (atomic_load(&nd->bdone) > done) {
+                    done = atomic_load(&nd->bdone);
+                    uint64_t r[2] = {nd->b_t1 - nd->b_t0, nd->b_cpu1 - nd->b_cpu0};
+                    CHECK(plink_send(l, 3, r, 16, 10000) == PL_OK);
+                }
+                usleep(200);
+            }
+            CHECK(atomic_load(&nd->ended));
+            CHECK(atomic_load(&nd->bad) == 0);
+        }
+    }
+    peerlink_free(nd->pl);
+    if (pool) {
+        struct plr_pool_stats st;
+        plr_pool_stats(pool, &st);
+        printf("pool: %u/%u slots free, %u lost, %u connections\n", (unsigned)st.free, (unsigned)st.slots,
+               (unsigned)st.lost, (unsigned)st.conns);
+        CHECK(st.free == st.slots && st.lost == 0 && st.conns == 0);
+        plr_pool_close(pool);
+    }
+    free(nd);
+    printf("test_plrdma %s: %s (%d failures)\n", dialer ? "dial" : "listen", failures ? "FAILED" : "ok", failures);
+    return failures ? 1 : 0;
+}
+
 static const struct {
     const char *name;
     int m;
@@ -527,9 +888,38 @@ static const struct {
 int main(int argc, char **argv)
 {
     const char *only = NULL;
+    struct hosts_opt ho;
+    memset(&ho, 0, sizeof ho);
+    ho.cfg = (struct plr_pool_cfg)PLR_POOL_CFG_DEFAULT;
+    ho.cfg.pool_bytes = (size_t)4 << 20; /* the test servers' memlock is 8 MB */
+    ho.sizes = "4096,16384,65536,262144,1048576,4194304";
+    ho.bytes = (uint64_t)4 << 30;
+    ho.kind = PL_KIND_BULK; /* frames as they are: the bulk link does not compress */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick"))
             quick = 1;
+        else if (!strcmp(argv[i], "--verbs-listen") && i + 1 < argc)
+            ho.listen = argv[++i];
+        else if (!strcmp(argv[i], "--verbs-dial") && i + 1 < argc)
+            ho.dial = argv[++i];
+        else if (!strcmp(argv[i], "--port-file") && i + 1 < argc)
+            ho.port_file = argv[++i];
+        else if (!strcmp(argv[i], "--dev") && i + 1 < argc)
+            ho.dev = argv[++i];
+        else if (!strcmp(argv[i], "--sizes") && i + 1 < argc)
+            ho.sizes = argv[++i];
+        else if (!strcmp(argv[i], "--bytes") && i + 1 < argc)
+            ho.bytes = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--tcp"))
+            ho.tcp = 1;
+        else if (!strcmp(argv[i], "--log"))
+            ho.kind = PL_KIND_LOG; /* zstd-1 on every frame, as the log link does */
+        else if (!strcmp(argv[i], "--slot") && i + 1 < argc)
+            ho.cfg.slot = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--credits") && i + 1 < argc)
+            ho.cfg.data_slots = (uint16_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--send-slots") && i + 1 < argc)
+            ho.cfg.send_slots = (uint16_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
             only = argv[++i];
         else if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
@@ -546,6 +936,8 @@ int main(int argc, char **argv)
         } /* else: the scratch directory, unused */
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (ho.listen || ho.dial)
+        return hosts_run(&ho);
     static const struct {
         const char *name;
         void (*fn)(void);
