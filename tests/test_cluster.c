@@ -13419,12 +13419,14 @@ static void await_same_stripe(const char *name, const struct meta_volume *want, 
  * CORRUPT, and whole again once the members are back. N is 6, so the stripe group is every server. Each phase reads
  * series of its own: the granule cache would answer a series read before from memory. */
 #define ECB_SERIES 8
-/* The first day's rows per series and batch, with random values (at least 26 bits a row): each series is then some 280 KB
- * of the part, the object some 2.2 MB, so its geometry is k' = 4 with cells of 64 to 72 KiB (E7: cell = L / 8k, at
- * least 64 KiB), and every series' bytes cover four cells in a row, one at each data position. With three of the six
- * members away at least one of them holds a data position and only three positions are left: a read of any series
- * needs a decode it cannot make. With 3000 rows of smooth values (r8f-ecbasic4) the object was one cell, k' = 1, and a
- * series whose cell sat on a live member read whole with three members away. */
+/* The first day's rows per series and batch, with random values (at least 26 bits a row): the day settles as two
+ * objects of some 1.1 MB each (one per level-1 part), geometry k' = 4 with 64 KiB cells (E7: cell = L / 8k, at least
+ * 64 KiB), about 17 data cells an object, and a series covers some 2 cells of each: two or three data positions, not
+ * every one. With three of the six members away at least one of them holds a data position, whose cells cannot be
+ * rebuilt from the three positions left, but a series whose cells all lie elsewhere reads whole without a decode
+ * (the r8f review's F12: a check of one series passed or failed with the replica placement). So the three-member case
+ * reads every series not read before and wants each answer whole or UNAVAILABLE, and UNAVAILABLE at least once. With
+ * 3000 rows of smooth values (r8f-ecbasic4) the object was one cell, k' = 1. */
 #define ECB_ROWS 43000 /* 2 s apart, two batches interleaved: 86000 rows on one day */
 /* The later days (the EPOCH case) are written the same way: with 3000 smooth rows (r8f-ecbasic5) their object was
  * k' = 1, three positions, none of them on the member whose store was unsure, and the settle went through. */
@@ -13570,6 +13572,8 @@ static int ecb_live_parts(int i, uint32_t num, char *buf, size_t cap)
     return n;
 }
 
+static int tr_transfer(uint32_t num, uint32_t to, char *why, size_t n);
+
 static void scen_ecbasic(void)
 {
     scenario("ecbasic");
@@ -13578,8 +13582,12 @@ static void scen_ecbasic(void)
     printf("  skipped: this build has no erasure codec (x86-64 only)\n");
     return;
 #endif
+    static char hpenv[PATH_MAX + 4300], hpath[PATH_MAX + 4200];
+    snprintf(hpath, sizeof hpath, "%s/holdput", base);
+    snprintf(hpenv, sizeof hpenv, "TSDB_CHUNKPEER_TEST=holdput=8000:%s", hpath); /* the last case: a put at SIGTERM */
     for (int i = 0; i < 6; i++) {
         envs[i] = "hold_copy_file=1,copy_probe=1"; /* the EPOCH case holds a stripe member's copy */
+        penv[i] = hpenv;
         start(i);
     }
     init_cluster(0, 600);
@@ -13704,15 +13712,27 @@ static void scen_ecbasic(void)
     for (int k = 1; k < nv && k < 3; k++)
         stop(victims[k], SIGKILL);
     {
-        struct ecb_sum a;
-        rc = ecb_read(c, ide[4], &a);
-        if (rc != TSDB_ERR_UNAVAILABLE) {
+        int nun = 0;
+        for (int s = 4; s < ECB_SERIES; s++) { /* none read before: the granule cache holds none of them */
+            struct ecb_sum a, b = twin[s];
+            rc = ecb_read(c, ide[s], &a);
+            if (rc == TSDB_ERR_UNAVAILABLE) {
+                nun++;
+                continue;
+            }
+            if (rc != 0 || a.n != b.n || a.h != b.h)
+                die("series %d with three stripe members away: %s (%" PRIu64 " rows, the twin %" PRIu64
+                    "), want UNAVAILABLE or the twin's rows", s, ers(rc), a.n, b.n);
+        }
+        if (nun == 0) {
             char live[1024];
             int nl = ecb_live_parts(L, num, live, sizeof live);
-            die("series 4 with three stripe members away: %s (%" PRIu64 " rows), want UNAVAILABLE (%d .ec, %d .part:%s)",
-                ers(rc), a.n, ecb_ec_parts(L, num), nl, live);
+            die("series 4-%d with three stripe members away (servers %d %d %d): every one read whole, none UNAVAILABLE "
+                "(%d .ec, %d .part:%s)", ECB_SERIES - 1, victims[0], victims[1], victims[2], ecb_ec_parts(L, num), nl,
+                live);
         }
-        printf("  three stripe members killed (servers %d %d %d): UNAVAILABLE\n", victims[0], victims[1], victims[2]);
+        printf("  three stripe members killed (servers %d %d %d): UNAVAILABLE for %d of %d series, the rest whole\n",
+               victims[0], victims[1], victims[2], nun, ECB_SERIES - 4);
     }
     for (int k = 0; k < nv && k < 3; k++)
         start(victims[k]);
@@ -13725,6 +13745,47 @@ static void scen_ecbasic(void)
             die("series %d after the restarts: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
     }
     printf("  the members back: reads whole\n");
+
+    /* e42's leadership moved to another replica: the new leader reads the objects the old one settled, with every
+     * cache cold. A chunk's identity names the volume's uuid (META's, the same on every member: the r8f review's
+     * mutant B01, a uuid of each member's own, survived while no test read after a leader change). */
+    {
+        int T = -1;
+        for (uint32_t k = 0; k < e.nrep && T < 0; k++)
+            if (server_of(e.rep[k].node) != L)
+                T = server_of(e.rep[k].node);
+        if (T < 0)
+            die("e42 has no replica besides its leader %d", L);
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[T], why, sizeof why)) != 0; usleep(500000))
+            if (now_ms() - t0 > 60000) /* a member restarted above may still be out of the ISR */
+                die("transfer of e42 to server %d: %s (%s)", T, cluster_strerror(rc), why);
+        struct meta_volume ne;
+        for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &ne) || ne.leader != ids[T]; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("e42's record does not name server %d its leader 30 s after the transfer", T);
+        /* The record names T before T has reopened as the writer, and that reopen attaches the tier: it asks every
+         * stripe member to hold the new epoch. The EPOCH case below stops a member; let the attach end first, or it
+         * finds that member down or unsure and the settle is refused at the writable gate before any put (the r8f
+         * fixer's run fx4 base1: no "failed" line from a put in 60 s). */
+        char lead[96];
+        snprintf(lead, sizeof lead, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", num, ne.epoch);
+        for (uint64_t t0 = now_ms(); !log_has(T, lead); usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("server %d named e42's leader but has not reopened as its writer in 30 s", T);
+        L = T;
+        tsdbc_close(c);
+        c = client(L);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum a, b = twin[s];
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 60000)
+                    die("read of series %d at the new leader %d: %s", s, L, ers(rc));
+            if (a.n != b.n || a.h != b.h)
+                die("series %d at the new leader %d: %" PRIu64 " rows, the twin %" PRIu64, s, L, a.n, b.n);
+        }
+        printf("  e42 transferred to server %d: every series read whole from the objects\n", L);
+    }
 
     /* D9: one EPOCH slot of e42 damaged in S's store, S restarted: the store is unsure. Its copy held behind a volume
      * add (not caught up), a settle's put to S is refused and the settle fails: neither the put's epoch nor the
@@ -13803,8 +13864,32 @@ static void scen_ecbasic(void)
     if (nch2 != nch)
         die("e42's chunks: %d before the drop, %d after: deleted with no MK_GC", nch, nch2);
     printf("  the .ec parts dropped by retention: the delete refused, %d chunk files kept\n", nch);
+
+    /* A settle's put in flight at SIGTERM (the r8f review's F3): the engines' threads call into the chunk server until
+     * tsdb_close, after tsdbd frees it, so the free waits for every call holding it. The hook holds the first put once
+     * its file exists for 8 s and says whether the chunk server was still open when it let go. New series of their own
+     * (no retention) on a new day, so that there is something to settle. */
+    tsdb_sid idh[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecb.h%d", s);
+        idh[s] = ecb_series(c, nm, "e42");
+    }
+    FILE *hpf = fopen(hpath, "w");
+    if (!hpf)
+        die("%s: %s", hpath, strerror(errno));
+    fclose(hpf);
+    ecb_write_day(c, idh, day0 + 6 * 86400000LL);
+    for (uint64_t t0 = now_ms(); !log_has(L, "holdput: a put holds"); usleep(100000))
+        if (now_ms() - t0 > 120000)
+            die("no settle put held at server %d 120 s after the writes", L);
     tsdbc_close(ct);
     tsdbc_close(c);
+    stop(L, SIGTERM); /* exit status 0 required */
+    if (!log_has(L, "holdput: released, the chunk server still open"))
+        die("server %d stopped with a put in flight: %s", L,
+            log_has(L, "closed under it") ? "the chunk server was closed under it" : "the put never let go");
+    printf("  a settle's put in flight at SIGTERM: the shutdown waited for it, exit 0\n");
 }
 
 static void scen_ecadd(void)
