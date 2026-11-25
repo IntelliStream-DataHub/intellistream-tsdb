@@ -624,7 +624,7 @@ void mc_tag(const struct mc *m, uint64_t seq, uint8_t type, const void *p1, size
         else if (n1)
             p2 = p1, n2 = n1;
         if (m->kind == MC_XXH3_128) {
-            pl_check(PL_CHECK_XXH3, seed, p2, n2, out);
+            pl_check(seed, p2, n2, out); /* PL_CHECK_FULL's check */
         } else {
             uint64_t h = XXH3_64bits_withSeed(p2, n2, seed);
             le64put(out, h);
