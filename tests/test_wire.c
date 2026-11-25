@@ -28,6 +28,7 @@
 #include "watchdog.h"
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -374,6 +375,8 @@ static void *fake_main(void *arg)
         int fd = accept(f->lfd, NULL, NULL);
         if (fd < 0)
             break;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         uint8_t body[64], op;
         uint32_t id, v = TSDB_PROTOCOL_VERSION;
         uint8_t h[8] = {0};
@@ -651,6 +654,111 @@ static void test_moved(void)
         fake_stop(&b);
     }
     CHECK(via_moved > 0 && via_moved < 12);
+}
+
+static void script_unavail_then_moved(struct fake *f, int fd)
+{
+    uint8_t body[512], op, ub[64], mb[128];
+    size_t n, un;
+    uint32_t id;
+    long nunavail = (long)(intptr_t)f->arg;
+    body_unavail(ub, &un, 1);
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        int i = note_req(f, id);
+        if (i < nunavail) {
+            reply(fd, id, TSDB_ERR_UNAVAILABLE, ub, un);
+        } else {
+            char addr[64];
+            snprintf(addr, sizeof addr, "127.0.0.1:%d", moved_port);
+            tsdb_moved m = {.vol = 1, .epoch = 12, .flags = 0, .node_id = 2, .addr = addr,
+                            .addr_len = (uint16_t)strlen(addr)};
+            size_t k = tsdb_wire_put_moved(mb, sizeof mb, &m, 1);
+            reply(fd, id, TSDB_ERR_MOVED, mb, k);
+        }
+    }
+}
+
+static void script_moved_to_arg(struct fake *f, int fd)
+{
+    uint8_t body[512], op, mb[128];
+    size_t n;
+    uint32_t id;
+    int target = (int)(intptr_t)f->arg;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        note_req(f, id);
+        char addr[64];
+        snprintf(addr, sizeof addr, "127.0.0.1:%d", target);
+        tsdb_moved m = {.vol = 1, .epoch = 12, .flags = 0, .node_id = 2, .addr = addr,
+                        .addr_len = (uint16_t)strlen(addr)};
+        size_t k = tsdb_wire_put_moved(mb, sizeof mb, &m, 1);
+        reply(fd, id, TSDB_ERR_MOVED, mb, k);
+    }
+}
+
+/* UNAVAILABLE retries before a MOVED must not add backoff before following MOVED. */
+static void test_unavail_then_moved(void)
+{
+    struct fake a, b;
+    tsdbc *c;
+    tsdb_sid sid = 0;
+
+    fake_start(&b, 1, script_ok);
+    fake_start(&a, 1, script_unavail_then_moved);
+    a.arg = (void *)(intptr_t)20;
+    moved_port = b.port;
+    CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    CHECK(tsdbc_set_retry(c, 700) == 0);
+    int rc = tsdbc_series(c, "pump1.flow", 1, &sid);
+    CHECK(rc == 0 && sid == TSDB_SID(1, 9));
+    CHECK(atomic_load(&a.nreq) == 21 && atomic_load(&b.nreq) == 1);
+    /* mutation "count UNAVAILABLE in MOVED tries": min(50 * 20, 1000) = 1000 ms > 700 ms budget, fails with MOVED */
+    CHECK(b.req_at[0] - a.req_at[20] < 700.0);
+    tsdbc_close(c);
+    fake_stop(&a);
+    fake_stop(&b);
+
+    /* the pipelined drain() path as well */
+    fake_start(&b, 1, script_ok);
+    fake_start(&a, 1, script_unavail_then_moved);
+    a.arg = (void *)(intptr_t)20;
+    moved_port = b.port;
+    CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    CHECK(tsdbc_set_retry(c, 700) == 0);
+    int64_t ts = 1000;
+    float v = 1.0f;
+    CHECK(tsdbc_insert_series_async(c, TSDB_SID(0, 5), &ts, &v, 1) == 0);
+    rc = tsdbc_wait(c);
+    CHECK(rc == 0);
+    CHECK(atomic_load(&a.nreq) == 21 && atomic_load(&b.nreq) == 1);
+    CHECK(b.req_at[0] - a.req_at[20] < 700.0);
+    tsdbc_close(c);
+    fake_stop(&a);
+    fake_stop(&b);
+}
+
+/* Repeated MOVED ping-pong backs off to avoid a tight spin loop and stops at the retry budget. */
+static void test_moved_pingpong(void)
+{
+    struct fake a, b;
+    tsdbc *c;
+    tsdb_sid sid = 0;
+
+    fake_start(&a, 16, script_moved_to_arg);
+    fake_start(&b, 16, script_moved_to_arg);
+    a.arg = (void *)(intptr_t)b.port;
+    b.arg = (void *)(intptr_t)a.port;
+    CHECK(tsdbc_connect("127.0.0.1", a.port, &c) == 0);
+    CHECK(tsdbc_set_retry(c, 350) == 0);
+    double t0 = now_ms();
+    int rc = tsdbc_series(c, "pump1.flow", 1, &sid);
+    double dt = now_ms() - t0;
+    CHECK(rc == TSDB_ERR_MOVED);
+    CHECK(dt >= 150.0 && dt < 1500.0);
+    int total = atomic_load(&a.nreq) + atomic_load(&b.nreq);
+    CHECK(total >= 2 && total <= 10);
+    tsdbc_close(c);
+    fake_stop(&a);
+    fake_stop(&b);
 }
 
 /* ------------------------------------------------------------ PARTIAL and DROPPED */
@@ -983,6 +1091,8 @@ int main(int argc, char **argv)
     check_vectors_file(argc > 1 ? argv[1] : "tests/data/wire13-vectors.txt");
     test_unavailable();
     test_moved();
+    test_unavail_then_moved();
+    test_moved_pingpong();
     test_moved_budget();
     test_partial_dropped();
     test_multi_refused();

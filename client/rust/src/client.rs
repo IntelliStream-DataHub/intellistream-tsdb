@@ -1151,14 +1151,14 @@ impl Client {
     /// order from the first refused one (also those acknowledged after it: a later frame of the same series must
     /// not be overtaken by the earlier one's resend), after what the refusal says, within the time budget.
     fn drain(&mut self) -> Result<()> {
-        let (mut deadline, mut tries) = (None, 0u32);
+        let (mut deadline, mut moved_tries) = (None, 0u32);
         loop {
             while self.pending > 0 {
                 self.collect_ack()?;
             }
             let Some(first) = self.refused.take() else { break };
             let e = std::mem::take(&mut self.refused_err);
-            if !self.retry_step(&e, &mut deadline, &mut tries) {
+            if !self.retry_step(&e, &mut deadline, &mut moved_tries) {
                 if self.pending_status == 0 {
                     self.pending_status = e.status;
                 }
@@ -2614,34 +2614,42 @@ impl Client {
     /// One step of retrying a request whose reply was UNAVAILABLE or MOVED (`e` describes it): waits what the reply
     /// asks for and follows a MOVED. True: send the request again; false: give up, the status stands (the budget
     /// would be over, or a MOVED with nowhere to go). `deadline` is None until the request's first refusal.
-    fn retry_step(&mut self, e: &ErrorInfo, deadline: &mut Option<Instant>, tries: &mut u32) -> bool {
+    fn retry_step(&mut self, e: &ErrorInfo, deadline: &mut Option<Instant>, moved_tries: &mut u32) -> bool {
         let Some(budget) = self.retry else { return false };
         if e.lost() {
             return false; // the data will not come back (design-cluster-data.md E15)
         }
         let now = Instant::now();
         let dl = *deadline.get_or_insert(now + budget);
-        let mut delay = match e.status {
-            -10 => {
-                if e.moved.first().is_some_and(|m| m.flags & MOVED_HANDOFF != 0) {
-                    200
-                } else {
-                    0
-                }
+        let moved = e.status == -10;
+        let mut delay = if moved {
+            if e.moved.first().is_some_and(|m| m.flags & MOVED_HANDOFF != 0) {
+                200
+            } else {
+                0
             }
-            _ if !e.has_body || e.unavailable.is_empty() => 1000, // a server without the body (protocol 12)
-            _ => u64::from(e.retry_after_ms().clamp(1, 60_000)),
+        } else if !e.has_body || e.unavailable.is_empty() {
+            1000 // a server without the body (protocol 12)
+        } else {
+            u64::from(e.retry_after_ms().clamp(1, 60_000))
         };
-        if e.status == -10 && *tries > 0 {
+        if moved && *moved_tries > 0 {
             // a MOVED that keeps coming: not a tight loop
-            delay = delay.max((50 * u64::from(*tries)).min(1000));
+            delay = delay.max((50 * u64::from(*moved_tries)).min(1000));
         }
         if now + Duration::from_millis(delay) > dl {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(delay));
-        *tries += 1;
-        !(e.status == -10 && !self.follow_moved(e, dl))
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        if moved {
+            *moved_tries += 1;
+            if !self.follow_moved(e, dl) {
+                return false;
+            }
+        }
+        true
     }
 
     /// `read_frame_raw`, and a request the server refused before doing anything (UNAVAILABLE, MOVED) is sent
@@ -2649,7 +2657,7 @@ impl Client {
     /// handed to a reader (a request, or a streamed reply that has not begun). Past the time budget
     /// ([`set_retry`](Client::set_retry)) the status is returned and [`last_error`](Client::last_error) says why.
     fn read_frame(&mut self) -> Result<i32> {
-        let (mut deadline, mut tries) = (None, 0u32);
+        let (mut deadline, mut moved_tries) = (None, 0u32);
         loop {
             let id = self.reply_id;
             let st = self.read_frame_raw()?;
@@ -2663,7 +2671,7 @@ impl Client {
                 return Ok(st);
             };
             let e = self.err.clone();
-            if !self.retry_step(&e, &mut deadline, &mut tries) {
+            if !self.retry_step(&e, &mut deadline, &mut moved_tries) {
                 self.delivered = Some(id);
                 return Ok(st);
             }
