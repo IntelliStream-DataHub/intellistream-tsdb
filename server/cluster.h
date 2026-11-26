@@ -342,6 +342,9 @@ int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node);
  * address in addr, cap bytes; 0 when there is none (no copy, no such volume, no leader, or the leader is not UP).
  * Never turn a 2 into MOVED: the client would follow it back here until its retry budget ran out. Any thread; never call it on the cluster thread's own path (vol_watch_duty and the like
  * read C.sm directly). */
+/* Same as cluster_vol_owner, using a snapshot the caller already holds (c may be NULL). */
+int cluster_copy_vol_owner(const struct cluster_copy *c, uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr,
+                           size_t cap);
 int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap);
 
 /* ---- users and grants in the metadata group (design-cluster.md C22, design-ha-modes.md :916; S2-1) */

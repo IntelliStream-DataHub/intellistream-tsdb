@@ -35,7 +35,7 @@ spec() {
     fwdnolease) sc=fwdlease pat='past its lease' ;;
     fwdtwice) sc=fwddepose pat='to the deposed leader .*not MOVED' ;;
     fwdchunknowait) sc=fwdload pat='beside a slow reader' ;;
-    fwdinline) sc=fwdload pat='its read after [0-9]* rounds' ;;
+    fwdinline) sc=fwdload pat='its \(read\|insert\) after [0-9]* rounds' ;;
     fwdarrival) sc=forward pat='at the entry before its forward began' ;;
     fwdownerage) sc=forward pat='at the owner before it ran the forward' ;;
     fwdownerclose | fwdtailclose) sc=forward pat='a forward the owner could not read' ;;

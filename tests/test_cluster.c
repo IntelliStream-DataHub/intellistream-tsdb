@@ -6815,6 +6815,63 @@ static void scen_forward(void)
         printf("  a forward whose client left is given up %" PRIu64 " ms after the client closed\n", gone_ms);
     }
 
+    /* m3. a client that pipelines past PIPE_CAP (disarming recv on the entry) and then closes while its first
+     *     forwarded request is held at the owner: fe_gone must still notice the closed socket within ~1-2 s */
+    {
+        tsdbc *cm = login_retry(R, "root", "root-pw", 0), *sm = login_retry(R, "root", "root-pw", 0);
+        tsdbc_set_compression(cm, 0);
+        tsdbc_set_timeout(cm, 300);
+        int64_t tm = 98000550;
+        float vm = 1;
+        size_t pnr = 44000; /* ~528 KB uncompressed per frame; 7 < PIPE_CAP (4 MiB) < 8 (~4.22 MB, 0 unread left) */
+        int64_t *pts = malloc(pnr * sizeof *pts);
+        float *pvs = malloc(pnr * sizeof *pvs);
+        if (!pts || !pvs)
+            die("malloc");
+        for (size_t i = 0; i < pnr; i++) {
+            pts[i] = 98000600 + (int64_t)i;
+            pvs[i] = 1.0f;
+        }
+        fw_knob("ownerstall", 1);
+        rc = tsdbc_insert_series_async(cm, id, &tm, &vm, 1);
+        if (rc != 0) {
+            fw_knob("ownerstall", 0);
+            die("pipelined clientgone: first async insert: %s", ers(rc));
+        }
+        uint64_t w0 = now_ms(), inflight = 0;
+        while ((inflight = fw_stat(sm, "fwd.inflight")) != 1 && now_ms() - w0 < 2000)
+            usleep(10000);
+        if (inflight != 1) {
+            fw_knob("ownerstall", 0);
+            die("pipelined clientgone: %" PRIu64 " forwards in flight on the entry, not 1", inflight);
+        }
+        for (int k = 0; k < 8 && rc == 0; k++)
+            rc = tsdbc_insert_series_async(cm, id, pts, pvs, pnr);
+        if (rc != 0) {
+            fw_knob("ownerstall", 0);
+            die("pipelined clientgone: pipelining past PIPE_CAP failed: %s", ers(rc));
+        }
+        usleep(100000); /* let the entry event loop parse past PIPE_CAP and disarm recv */
+        rc = tsdbc_wait(cm);
+        tsdbc_close(cm);
+        free(pts);
+        free(pvs);
+        uint64_t t0 = now_ms(), gone_ms = 0;
+        while ((inflight = fw_stat(sm, "fwd.inflight")) != 0 && now_ms() - t0 < 3000)
+            usleep(20000);
+        gone_ms = now_ms() - t0;
+        uint64_t left = inflight;
+        fw_knob("ownerstall", 0);
+        tsdbc_close(sm);
+        if (rc != TSDB_ERR_IO)
+            die("pipelined clientgone: wait past timeout returned %s, not IO", ers(rc));
+        if (left != 0)
+            die("pipelined clientgone: forward still in flight %" PRIu64 " ms after backpressured client closed",
+                gone_ms);
+        printf("  a forward whose backpressured (>PIPE_CAP) client left is given up %" PRIu64 " ms after close\n",
+               gone_ms);
+    }
+
     /* e. forwards waiting on a stopped owner hold no worker of R: a volume led on R is served at once */
     char solo[16] = "";
     for (int k = 1; k <= 8 && !*solo; k++) {

@@ -1033,6 +1033,16 @@ static void test_log(void)
     uint64_t t0 = now_ns();
     CHECK(plink_send(l, 2, &t0, 8, 1000) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&b->nrtt) == 1, 3000));
+    /* Wake-coalescing stress: intermittent single-frame echoes separated by short sleeps to hit WAKE_SLEEPING races;
+     * any lost wakeup would stall until ping_ms (1000 ms). */
+    int echoes = quick ? 32 : 64;
+    for (int i = 0; i < echoes; i++) {
+        if (i & 1)
+            usleep(200);
+        uint64_t ts = now_ns();
+        CHECK(plink_send(l, 2, &ts, 8, 1000) == PL_OK);
+        CHECK(WAIT_FOR(atomic_load(&b->nrtt) == i + 2, 500));
+    }
     struct pl_stats sb, sa;
     peerlink_stats(b->pl, &sb);
     peerlink_stats(a->pl, &sa);
@@ -2719,6 +2729,30 @@ static void test_fwd(void)
     CHECK(fwd_reply(B, &r30.from, 30, "x", 1) == FWD_E_DOWN);
     CHECK(fwd_send(A, 2, &m, 5, in_ms(2000)) == FWD_OK);
     CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 5, 0, NULL) >= 0, 3000));
+
+    /* fwd_credit0: returns default when cfg.credit == 0 and the configured credit otherwise */
+    CHECK(fwd_credit0(A) == FWD_CREDIT_DEFAULT);
+    CHECK(fwd_credit0(NULL) == FWD_CREDIT_DEFAULT);
+    static struct frec rc1;
+    memset(&rc1, 0, sizeof rc1);
+    int pc1 = 0;
+    struct fwd_cfg c1over = {.credit = 1};
+    struct fwd *C1 = fwd_node_with(9, &rc1, &pc1, &c1over);
+    CHECK(C1 && fwd_credit0(C1) == 1);
+    fwd_free(C1);
+
+    /* fwd_sendv: scatter header + payload arrives concatenated; oversized header is refused */
+    uint8_t big_hdr[FWD_HDR_EXTRA_MAX + 1] = {0};
+    CHECK(fwd_sendv(A, 2, PL_KIND_FWD, big_hdr, sizeof big_hdr, "x", 1, 31, 0) == FWD_E_INVALID);
+    const char *shdr = "HEAD:";
+    const char *spay = "body1234";
+    CHECK(fwd_sendv(A, 2, PL_KIND_FWD, shdr, 5, spay, 8, 32, in_ms(2000)) == FWD_OK);
+    struct fwd_ev r32 = {0};
+    int r32i = -1;
+    CHECK(WAIT_FOR((r32i = frec_find(&rb, FWD_EV_REQUEST, 32, 0, &r32)) >= 0, 2000));
+    CHECK(r32.n == 13 && r32i >= 0 && rb.body0[r32i] == 'H');
+    CHECK(fwd_reply(B, &r32.from, 32, "ok", 2) == FWD_OK);
+    CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 32, 0, NULL) >= 0, 2000));
 
     /* a member that leaves: its links stop */
     fwd_set_members(A, ma, 1);

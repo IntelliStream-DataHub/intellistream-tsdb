@@ -168,6 +168,7 @@ struct fwd {
     pthread_mutex_t mu;
     pthread_cond_t ccv; /* credit came, a stream went, or closing */
     pthread_cond_t mcv; /* the manager's: dl_min went down, or closing */
+    int cwaiters;       /* threads waiting on ccv (under mu) */
     struct ent *eh[NB];
     size_t nent;
     uint64_t dl_min; /* the earliest deadline of a written frame (0: none; may be early) */
@@ -177,6 +178,7 @@ struct fwd {
 
     pthread_mutex_t qmu;
     pthread_cond_t qcv, rcv; /* the dispatcher's; room in an inbox */
+    int disp_waiting;        /* disp_main is sleeping on qcv (under qmu) */
     struct evq *qh, *qt;
     size_t qbytes[2];
     struct plink **pz[2]; /* the links paused for the inbox of each kind slot */
@@ -205,7 +207,8 @@ static struct timespec ts_at(uint64_t ns)
 
 static int kslot(int kind) { return kind == PL_KIND_FWDQ; }
 static size_t inbox_cap(const struct fwd *f) { return f->cfg.inbox_bytes ? f->cfg.inbox_bytes : FWD_INBOX_BYTES; }
-static uint64_t credit0(const struct fwd *f) { return f->cfg.credit ? f->cfg.credit : FWD_CREDIT_DEFAULT; }
+uint32_t fwd_credit0(const struct fwd *f) { return f && f->cfg.credit ? f->cfg.credit : FWD_CREDIT_DEFAULT; }
+static uint64_t credit0(const struct fwd *f) { return fwd_credit0(f); }
 
 /* f->mu held: a written frame's deadline is set or moved */
 static void arm(struct fwd *f, uint64_t dl)
@@ -232,7 +235,8 @@ static void enq_ctl(struct fwd *f, const struct fwd_ev *ev)
     else
         f->qh = e;
     f->qt = e;
-    pthread_cond_signal(&f->qcv);
+    if (f->disp_waiting)
+        pthread_cond_signal(&f->qcv);
     pthread_mutex_unlock(&f->qmu);
 }
 
@@ -287,7 +291,8 @@ static void enq_data(struct fwd *f, struct plink *l, const struct fwd_ev *ev, co
     f->qt = e;
     if (f->qbytes[e->k] > cap && fwd_mutant != FWD_MUT_INBOXWAIT)
         pause_link(f, e->k, l);
-    pthread_cond_signal(&f->qcv);
+    if (f->disp_waiting)
+        pthread_cond_signal(&f->qcv);
     pthread_mutex_unlock(&f->qmu);
 }
 
@@ -296,8 +301,11 @@ static void *disp_main(void *arg)
     struct fwd *f = arg;
     pthread_mutex_lock(&f->qmu);
     for (;;) {
-        while (!f->qh && !atomic_load(&f->closing))
+        while (!f->qh && !atomic_load(&f->closing)) {
+            f->disp_waiting = 1;
             pthread_cond_wait(&f->qcv, &f->qmu);
+            f->disp_waiting = 0;
+        }
         if (!f->qh || atomic_load(&f->closing))
             break; /* fwd_free has begun: nothing more is delivered */
         struct evq *e = f->qh;
@@ -310,7 +318,8 @@ static void *disp_main(void *arg)
         pthread_mutex_lock(&f->qmu);
         if (e->cost) {
             f->qbytes[e->k] -= e->cost;
-            pthread_cond_broadcast(&f->rcv);
+            if (fwd_mutant == FWD_MUT_INBOXWAIT)
+                pthread_cond_broadcast(&f->rcv);
             if (f->npz[e->k] && f->qbytes[e->k] <= inbox_cap(f) / 2) { /* room again: the paused links read on */
                 for (uint32_t i = 0; i < f->npz[e->k]; i++)
                     plink_pause(f->pz[e->k][i], 0);
@@ -398,7 +407,8 @@ static void on_link(void *arg, struct plink *l, int up)
                     pp = &s->next;
                 }
             }
-        pthread_cond_broadcast(&f->ccv);
+        if (f->cwaiters > 0)
+            pthread_cond_broadcast(&f->ccv);
     }
     struct fwd_ev ev = {.type = FWD_EV_LINK, .kind = link_kind(l), .peer = peer, .gen = gen, .up = up,
                         .dialed = is_dialed(f, l)};
@@ -501,7 +511,8 @@ static void on_frame_in(struct fwd *f, struct plink *l, uint8_t type, const uint
             struct strm *s = *pp;
             *pp = s->next;
             free(s);
-            pthread_cond_broadcast(&f->ccv);
+            if (f->cwaiters > 0)
+                pthread_cond_broadcast(&f->ccv);
         }
         pthread_mutex_unlock(&f->mu);
         ST(f, cancels);
@@ -512,7 +523,8 @@ static void on_frame_in(struct fwd *f, struct plink *l, uint8_t type, const uint
         struct strm *s = *strm_find(f, l, gen, w.frame_id);
         if (s) {
             s->credit += w.chunks;
-            pthread_cond_broadcast(&f->ccv);
+            if (f->cwaiters > 0)
+                pthread_cond_broadcast(&f->ccv);
         }
         pthread_mutex_unlock(&f->mu);
         ST(f, credits);
@@ -759,25 +771,26 @@ static int pl_err(int rc)
     }
 }
 
-int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t frame_id, uint64_t deadline_ns)
+int fwd_sendv(struct fwd *f, uint32_t peer, int kind, const void *hdr, size_t hn, const void *p, size_t n,
+              uint64_t frame_id, uint64_t deadline_ns)
 {
-    if (!msg || (msg->kind != PL_KIND_FWD && msg->kind != PL_KIND_FWDQ) || (!msg->p && msg->n))
+    if ((kind != PL_KIND_FWD && kind != PL_KIND_FWDQ) || (!hdr && hn) || (!p && n) || hn > FWD_HDR_EXTRA_MAX)
         return FWD_E_INVALID;
-    if (msg->n > FWD_MSG_MAX)
+    if (n > FWD_MSG_MAX || hn > FWD_MSG_MAX - n)
         return FWD_E_TOOBIG;
     if (atomic_load(&f->closing))
         return FWD_E_CLOSED;
     struct ent *e = calloc(1, sizeof *e);
     if (!e)
         abort();
-    e->frame_id = frame_id, e->peer = peer, e->kind = msg->kind, e->deadline = deadline_ns;
-    if (deadline_ns && msg->kind == PL_KIND_FWDQ) {
+    e->frame_id = frame_id, e->peer = peer, e->kind = kind, e->deadline = deadline_ns;
+    if (deadline_ns && kind == PL_KIND_FWDQ) {
         uint64_t now = now_ns();
         e->span = deadline_ns > now ? deadline_ns - now : 1;
     }
     pthread_mutex_lock(&f->mu);
     struct node *nd = node_of(f, peer);
-    struct plink *l = nd ? nd->lk[kslot(msg->kind)] : NULL;
+    struct plink *l = nd ? nd->lk[kslot(kind)] : NULL;
     if (!l || *ent_find(f, frame_id)) {
         pthread_mutex_unlock(&f->mu);
         free(e);
@@ -788,10 +801,12 @@ int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t f
     f->eh[hb(frame_id)] = e;
     f->nent++;
     pthread_mutex_unlock(&f->mu);
-    uint8_t h[FWD_HDR];
+    uint8_t h[FWD_HDR + FWD_HDR_EXTRA_MAX];
     fwd_wire_head(h, frame_id);
-    int rc = plink_sendv(l, 0, msg->kind == PL_KIND_FWD ? FWD_T_REQ : FWDQ_T_REQ, h, sizeof h, msg->p, msg->n, 0, 1,
-                         frame_id, deadline_ns);
+    if (hn)
+        memcpy(h + FWD_HDR, hdr, hn);
+    int rc = plink_sendv(l, 0, kind == PL_KIND_FWD ? FWD_T_REQ : FWDQ_T_REQ, h, FWD_HDR + hn, p, n, 0, 1, frame_id,
+                         deadline_ns);
     if (rc != PL_OK) { /* nothing was queued and on_sent never runs: the entry is ours to remove */
         pthread_mutex_lock(&f->mu);
         struct ent **pp = ent_find(f, frame_id);
@@ -802,6 +817,13 @@ int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t f
     }
     ST(f, sent);
     return FWD_OK;
+}
+
+int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t frame_id, uint64_t deadline_ns)
+{
+    if (!msg)
+        return FWD_E_INVALID;
+    return fwd_sendv(f, peer, msg->kind, NULL, 0, msg->p, msg->n, frame_id, deadline_ns);
 }
 
 int fwd_reply(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, const void *p, size_t n)
@@ -858,7 +880,18 @@ int fwd_chunk(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, con
             }
             break;
         }
-        if (timeout_ms <= 0 || pthread_cond_timedwait(&f->ccv, &f->mu, &ts) == ETIMEDOUT) {
+        if (timeout_ms <= 0) {
+            s = *strm_find(f, from->l, from->gen, frame_id);
+            if (!s || !s->credit) {
+                pthread_mutex_unlock(&f->mu);
+                return s ? FWD_E_TIMEOUT : FWD_E_DOWN;
+            }
+            continue;
+        }
+        f->cwaiters++;
+        int wrc = pthread_cond_timedwait(&f->ccv, &f->mu, &ts);
+        f->cwaiters--;
+        if (wrc == ETIMEDOUT) {
             /* the clock may have passed dl just as credit came: look once more */
             s = *strm_find(f, from->l, from->gen, frame_id);
             if (!s || !s->credit) {
@@ -885,7 +918,8 @@ int fwd_chunk(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, con
         free(s);
     } else if (*pp && rc != PL_OK && took) {
         (*pp)->credit++;
-        pthread_cond_broadcast(&f->ccv);
+        if (f->cwaiters > 0)
+            pthread_cond_broadcast(&f->ccv);
     }
     pthread_mutex_unlock(&f->mu);
     return pl_err(rc);

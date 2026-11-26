@@ -84,12 +84,65 @@ struct piece {
     uint8_t p[];
 };
 
+struct fwait_sync {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool init;
+    bool key_set;
+};
+
+static __thread struct fwait_sync fw_tls;
+static pthread_key_t fw_tls_key;
+static bool fw_tls_key_ok;
+static pthread_once_t fw_tls_once = PTHREAD_ONCE_INIT;
+
+static void fwait_sync_destroy(struct fwait_sync *s)
+{
+    if (s && s->init) {
+        pthread_cond_destroy(&s->cv);
+        pthread_mutex_destroy(&s->mu);
+        s->init = false;
+        s->key_set = false;
+    }
+}
+
+static void fwait_sync_dtor(void *p) { fwait_sync_destroy(p); }
+
+static void fwait_sync_atexit(void)
+{
+    if (fw_tls.key_set)
+        pthread_setspecific(fw_tls_key, NULL);
+    fwait_sync_destroy(&fw_tls);
+}
+
+static void fwait_sync_init_once(void)
+{
+    fw_tls_key_ok = pthread_key_create(&fw_tls_key, fwait_sync_dtor) == 0;
+    atexit(fwait_sync_atexit);
+}
+
+static struct fwait_sync *fwait_sync_get(void)
+{
+    if (!fw_tls.init) {
+        pthread_mutex_init(&fw_tls.mu, NULL);
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+        pthread_cond_init(&fw_tls.cv, &ca);
+        pthread_condattr_destroy(&ca);
+        fw_tls.init = true;
+        pthread_once(&fw_tls_once, fwait_sync_init_once);
+        if (fw_tls_key_ok && pthread_setspecific(fw_tls_key, &fw_tls) == 0)
+            fw_tls.key_set = true;
+    }
+    return &fw_tls;
+}
+
 struct fwait {
     struct fwait *next; /* in its bucket */
     uint64_t frame_id;
     uint32_t peer;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    struct fwait_sync *sync;
     int sent;     /* -1: no outcome yet, else FWD_NEVER_WRITTEN / FWD_WRITTEN */
     int end;      /* 0, FWD_EV_LOST or FWD_EV_TIMEOUT */
     bool nomem;   /* a piece could not be kept: the reply is incomplete (INDET) */
@@ -151,8 +204,8 @@ static void tab_del(struct fwdr_tab *t, struct fwait *w, bool mut_teardown)
         }
     pthread_mutex_unlock(&t->mu);
     if (!mut_teardown) { /* planted (test_fwd teardown): the old claim that t->mu alone is enough */
-        pthread_mutex_lock(&w->mu);
-        pthread_mutex_unlock(&w->mu);
+        pthread_mutex_lock(&w->sync->mu);
+        pthread_mutex_unlock(&w->sync->mu);
     }
 }
 
@@ -184,13 +237,19 @@ void fwdr_on_event(struct fwdr_tab *t, const struct fwd_ev *ev)
     }
     if (t->hook)
         t->hook(t->hook_arg, ev, 0); /* found w, t->mu held */
-    pthread_mutex_lock(&w->mu);
+    struct fwait_sync *sync = w->sync;
+    pthread_mutex_lock(&sync->mu);
     pthread_mutex_unlock(&t->mu);
     if (t->hook)
-        t->hook(t->hook_arg, ev, 1); /* w->mu held, t->mu not: w may be leaving the table now */
+        t->hook(t->hook_arg, ev, 1); /* w->sync->mu held, t->mu not: w may be leaving the table now */
+    bool wake = true;
     switch (ev->type) {
     case FWD_EV_SENT:
         w->sent = ev->outcome;
+        /* FWD_WRITTEN does not complete the request: avoid waking the waiting worker until reply/chunk/loss/timeout
+         * (its timedwait is capped at 1 s so client_gone still fires promptly). */
+        if (ev->outcome == FWD_WRITTEN)
+            wake = false;
         break;
     case FWD_EV_LOST:
     case FWD_EV_TIMEOUT:
@@ -210,8 +269,9 @@ void fwdr_on_event(struct fwdr_tab *t, const struct fwd_ev *ev)
         w->tail = pc;
         pc = NULL;
     }
-    pthread_cond_broadcast(&w->cv);
-    pthread_mutex_unlock(&w->mu);
+    if (wake)
+        pthread_cond_signal(&sync->cv);
+    pthread_mutex_unlock(&sync->mu);
     free(pc);
 }
 
@@ -221,8 +281,6 @@ static void w_free(struct fwait *w)
         n = p->next;
         free(p);
     }
-    pthread_mutex_destroy(&w->mu);
-    pthread_cond_destroy(&w->cv);
 }
 
 static void abs_at(struct timespec *ts, int64_t now_ns, int64_t until_ns)
@@ -236,19 +294,23 @@ static void abs_at(struct timespec *ts, int64_t now_ns, int64_t until_ns)
     ts->tv_nsec = ns % 1000000000;
 }
 
+static int fwdr_send_req(const struct fwdr_ops *o, const struct fwdr_req *q, uint64_t dl)
+{
+    if (o->sendv)
+        return o->sendv(o->arg, q->peer, q->kind, q->msg, q->n, q->payload, q->payload_len, q->frame_id, dl);
+    return o->send(o->arg, q->peer, q->kind, q->msg, q->n, q->frame_id, dl);
+}
+
 int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req *q, struct fwdr_tail *tail,
              uint64_t *hop_ns)
 {
     memset(tail, 0, sizeof *tail);
     *hop_ns = 0;
     int64_t t0 = o->now_ns(o->arg), send_by = t0 + (int64_t)q->wait_ms * 1000000;
-    struct fwait w = {.frame_id = q->frame_id, .peer = q->peer, .sent = -1};
-    pthread_mutex_init(&w.mu, NULL);
-    pthread_condattr_t ca;
-    pthread_condattr_init(&ca);
-    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-    pthread_cond_init(&w.cv, &ca);
-    pthread_condattr_destroy(&ca);
+    struct fwait_sync *sync = fwait_sync_get();
+    struct fwait w = {.frame_id = q->frame_id, .peer = q->peer, .sync = sync, .sent = -1};
+    uint32_t credit_batch = q->credit_batch ? q->credit_batch : 1;
+    uint32_t uncredited = 0;
     int64_t sent_at = 0;
     int res = FWDR_INDET;
     for (int attempts = 0;; attempts++) {
@@ -267,7 +329,7 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
         memcpy(q->msg + FWDR_AGE_AT, &age_ms, 4);
         tab_add(t, &w);
         uint64_t dl = q->reply_ms ? (uint64_t)now + (uint64_t)q->reply_ms * 1000000 : 0;
-        int rc = o->send(o->arg, q->peer, q->kind, q->msg, q->n, q->frame_id, dl);
+        int rc = fwdr_send_req(o, q, dl);
         if (rc == FWD_OK) {
             sent_at = now;
             break;
@@ -286,13 +348,13 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
         o->waits(o->arg, -1);
     }
     o->waits(o->arg, 1);
-    pthread_mutex_lock(&w.mu);
+    pthread_mutex_lock(&sync->mu);
     for (;;) {
         if (w.head) {
             struct piece *pc = w.head;
             if (!(w.head = pc->next))
                 w.tail = NULL;
-            pthread_mutex_unlock(&w.mu);
+            pthread_mutex_unlock(&sync->mu);
             size_t n = pc->n;
             bool ok = true, last = pc->last;
             if (last) {
@@ -308,18 +370,20 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
             free(pc);
             if (!ok) { /* the client's connection is going: the owner's stream goes too */
                 o->cancel(o->arg, q->peer, q->frame_id);
-                pthread_mutex_lock(&w.mu);
+                pthread_mutex_lock(&sync->mu);
                 res = FWDR_INDET;
                 break;
             }
             if (last) {
-                pthread_mutex_lock(&w.mu);
+                pthread_mutex_lock(&sync->mu);
                 res = FWDR_DONE;
                 break;
             }
-            if (q->kind == PL_KIND_FWDQ)
-                o->credit(o->arg, q->peer, q->frame_id, 1);
-            pthread_mutex_lock(&w.mu);
+            if (q->kind == PL_KIND_FWDQ && ++uncredited >= credit_batch) {
+                o->credit(o->arg, q->peer, q->frame_id, uncredited);
+                uncredited = 0;
+            }
+            pthread_mutex_lock(&sync->mu);
             continue;
         }
         if (w.sent == FWD_NEVER_WRITTEN) { /* the connection ended with it unwritten: definite */
@@ -331,11 +395,11 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
             if (q->mut_retry && w.end) { /* planted: send it once more (D30 forbids) */
                 w.end = 0;
                 w.sent = -1;
-                pthread_mutex_unlock(&w.mu);
+                pthread_mutex_unlock(&sync->mu);
                 int64_t now = o->now_ns(o->arg);
                 uint64_t dl = q->reply_ms ? (uint64_t)now + (uint64_t)q->reply_ms * 1000000 : 0;
-                int rc = o->send(o->arg, q->peer, q->kind, q->msg, q->n, q->frame_id, dl);
-                pthread_mutex_lock(&w.mu);
+                int rc = fwdr_send_req(o, q, dl);
+                pthread_mutex_lock(&sync->mu);
                 if (rc == FWD_OK)
                     continue;
                 res = FWDR_UNREACH;
@@ -344,9 +408,9 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
         }
         int64_t now = o->now_ns(o->arg);
         if (w.sent < 0 && now >= send_by) {
-            pthread_mutex_unlock(&w.mu);
+            pthread_mutex_unlock(&sync->mu);
             int oc = o->cancel(o->arg, q->peer, q->frame_id);
-            pthread_mutex_lock(&w.mu);
+            pthread_mutex_lock(&sync->mu);
             if (oc == FWD_NEVER_WRITTEN) {
                 res = FWDR_UNREACH;
                 break;
@@ -359,17 +423,19 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
             continue;
         }
         struct timespec at;
-        abs_at(&at, now, w.sent < 0 ? send_by : now + 1000000000);
-        if (pthread_cond_timedwait(&w.cv, &w.mu, &at) == ETIMEDOUT && !w.head && w.sent == FWD_WRITTEN && !w.end &&
-            o->client_gone(o->arg)) { /* nobody waits for the answer any more (its client, or tsdbd's shutdown) */
-            pthread_mutex_unlock(&w.mu);
+        int64_t tick_until = now + 1000000000;
+        int64_t wait_until = (w.sent < 0 && send_by < tick_until) ? send_by : tick_until;
+        abs_at(&at, now, wait_until);
+        if (pthread_cond_timedwait(&sync->cv, &sync->mu, &at) == ETIMEDOUT && !w.head && w.sent == FWD_WRITTEN &&
+            !w.end && o->client_gone(o->arg)) { /* nobody waits for the answer any more (its client, or tsdbd's shutdown) */
+            pthread_mutex_unlock(&sync->mu);
             o->cancel(o->arg, q->peer, q->frame_id);
-            pthread_mutex_lock(&w.mu);
+            pthread_mutex_lock(&sync->mu);
             res = FWDR_INDET;
             break;
         }
     }
-    pthread_mutex_unlock(&w.mu);
+    pthread_mutex_unlock(&sync->mu);
     o->waits(o->arg, -1);
     tab_del(t, &w, q->mut_teardown);
 out:
