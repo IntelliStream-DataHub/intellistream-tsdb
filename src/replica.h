@@ -27,6 +27,13 @@
  * current segment (off is where it ends) or a higher one (off 0: the old segment is synced first, the new one made).
  * TSDB_ERR_INVALID: wrong place or numbers (nothing written); TSDB_ERR_CORRUPT: a record that fails its checks. */
 int replica_append(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
+/* Same as replica_append(), for callers (server/repld.c) that already validated every WAL record in [buf, buf + len)
+ * against (seq, off) via wal_record() on the same immutable buffer. Skips redundant xxh64 recomputation while still
+ * checking structural bounds, fno contiguity, segment/offset rules, and COMMIT/COLD markers. */
+int replica_append_verified(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
+/* Header-only parse of a WAL record already sealed by wal_seal() or verified by wal_record(). Checks structural bounds
+ * without recomputing xxh64 or the header check. Returns the record size in bytes, or 0 if malformed. */
+size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r);
 /* Makes the appended records durable (a group commit: concurrent callers share it). */
 int replica_sync(struct eng *db);
 uint64_t replica_log_end(struct eng *db);     /* the last position written (0: empty) */

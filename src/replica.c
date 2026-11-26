@@ -2236,7 +2236,51 @@ uint64_t replica_applied_end(eng *db) { return atomic_load(&db->rp->apply_next) 
 
 /* ----------------------------------------------------------------- append */
 
-int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len)
+/* Header-only parse of a WAL record already sealed by wal_seal() or verified by wal_record(). Checks structural bounds
+ * without recomputing xxh64 or the header check. */
+size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r)
+{
+    if (avail < WAL_HDR)
+        return 0;
+    uint32_t w = load32(p), kind = w >> 28, n = w & 0x0fffffffu;
+    uint64_t fno;
+    int64_t commit_ms;
+    memcpy(&fno, p + 16, 8);
+    memcpy(&commit_ms, p + 24, 8);
+    size_t body;
+    uint64_t span;
+    uint16_t mtype = 0, mflags = 0;
+    if (kind == WAL_KIND_ROWS) {
+        if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW)
+            return 0;
+        body = (size_t)n * WAL_ROW;
+        span = n;
+    } else if (kind == WAL_KIND_MARKER) {
+        if (n < WAL_MARKER_HDR || n % 4 != 0 || n > avail - WAL_HDR)
+            return 0;
+        body = n;
+        memcpy(&mtype, p + WAL_HDR, 2);
+        memcpy(&mflags, p + WAL_HDR + 2, 2);
+        span = load32(p + WAL_HDR + 4);
+        if (span == 0)
+            return 0;
+    } else {
+        return 0;
+    }
+    if (fno == 0 || fno >= FNO_LIMIT)
+        return 0;
+    r->kind = kind;
+    r->n = n;
+    r->fno = fno;
+    r->span = span;
+    r->commit_ms = commit_ms;
+    r->payload = p + WAL_HDR;
+    r->mtype = mtype;
+    r->mflags = mflags;
+    return WAL_HDR + body;
+}
+
+static int replica_append_impl(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len, bool verified)
 {
     struct replica *rp = db->rp;
     if (!rp || seq == 0)
@@ -2247,9 +2291,11 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     int rc = eng_check(db);
     const uint8_t *p = buf;
     uint64_t next = db->fno_next, first = 0;
+    bool has_ship = false;
     for (size_t pos = 0; rc == 0 && pos < len;) {
         wal_rec wr;
-        size_t sz = wal_record(p + pos, len - pos, seq, off + pos, &wr);
+        size_t sz = verified ? wal_rec_hdr(p + pos, len - pos, &wr)
+                             : wal_record(p + pos, len - pos, seq, off + pos, &wr);
         if (sz == 0) {
             rc = TSDB_ERR_CORRUPT; /* a record that fails its checks is not the leader's: refused whole */
             break;
@@ -2258,6 +2304,8 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
             rc = TSDB_ERR_INVALID;
             break;
         }
+        if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD))
+            has_ship = true;
         if (!first)
             first = wr.fno;
         next = wr.fno + wr.span;
@@ -2319,17 +2367,19 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
         pthread_mutex_unlock(&rp->segs_mu);
         atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
         /* COMMIT and COLD markers among them: their files must be staged before their positions count as durable */
-        for (size_t pos = 0; pos < len && rc == 0;) {
-            wal_rec wr;
-            size_t sz = wal_record(p + pos, len - pos, seq, off + pos, &wr);
-            mk m;
-            if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD) &&
-                (rc = mk_decode(wr.payload, wr.n, &m)) == 0 && mk_ships(&m))
-                rc = cm_add(rp, &wr, &m);
-            pos += sz;
+        if (has_ship) {
+            for (size_t pos = 0; pos < len && rc == 0;) {
+                wal_rec wr;
+                size_t sz = wal_rec_hdr(p + pos, len - pos, &wr);
+                mk m;
+                if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD) &&
+                    (rc = mk_decode(wr.payload, wr.n, &m)) == 0 && mk_ships(&m))
+                    rc = cm_add(rp, &wr, &m);
+                pos += sz;
+            }
+            if (rc)
+                eng_fail(db, "a COMMIT or COLD marker that cannot be tracked", EIO);
         }
-        if (rc)
-            eng_fail(db, "a COMMIT or COLD marker that cannot be tracked", EIO);
     }
     pthread_mutex_unlock(&rp->mu);
     if (rc == 0 && fresh) /* readers of the directory start on the new segment, as at a writer's (mt_flush); no I/O
@@ -2337,6 +2387,16 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
                              durable, the caller stops the volume all the same). */
         rc = manifest_publish(db);
     return rc;
+}
+
+int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len)
+{
+    return replica_append_impl(db, seq, off, buf, len, false);
+}
+
+int replica_append_verified(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len)
+{
+    return replica_append_impl(db, seq, off, buf, len, true);
 }
 
 void (*replica_test_sync_hook)(eng *db); /* test hook: runs after the fdatasync, before replica_sync takes its lock again */
