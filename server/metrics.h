@@ -38,6 +38,14 @@ typedef struct metrics_margin {
     uint8_t tier;       /* enum margin_tier */
 } metrics_margin;
 
+/* chunk read hedging and read-avoid counters per storage peer (R8-2, E31; server/chunkpeer.h) */
+#define METRICS_CHUNK_PEERS_MAX 256
+typedef struct metrics_chunk_peer {
+    uint32_t peer;
+    uint64_t reads, hedges, avoids, decoded_cells;
+    int read_avoid;
+} metrics_chunk_peer;
+
 /* peer link RDMA transport and fault counters (design-rdma.md §5.2; peerlink.h + plrdma.h) */
 #define METRICS_RDMA_FB_MAX 11
 typedef struct metrics_peer_rdma {
@@ -67,6 +75,8 @@ typedef struct metrics_cfg {
     void (*peer_links)(uint64_t out[8][4]);
     /* the peer data links by transport and RDMA counters; NULL: not a cluster server */
     void (*peer_rdma)(metrics_peer_rdma *out);
+    /* chunk read hedging, read-avoid and decoded cell counters per storage peer (E31); NULL: not a cluster server */
+    size_t (*chunk_peers)(metrics_chunk_peer *out, size_t cap);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

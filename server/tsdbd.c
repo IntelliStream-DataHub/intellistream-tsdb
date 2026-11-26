@@ -4123,6 +4123,23 @@ static size_t fwd_metrics_rows(metrics_fwd_peer *out, size_t cap)
     return n;
 }
 
+_Static_assert(METRICS_CHUNK_PEERS_MAX == CHUNKPEER_PEERS_MAX, "metrics chunk peer cap mismatch");
+
+static size_t chunk_peer_metrics_rows(metrics_chunk_peer *out, size_t cap)
+{
+    if (cap > CHUNKPEER_PEERS_MAX)
+        cap = CHUNKPEER_PEERS_MAX;
+    struct chunkpeer_peer_stats *r = malloc(cap * sizeof *r);
+    if (!r)
+        return 0;
+    size_t n = chunkpeer_peer_stats_get(r, cap);
+    for (size_t i = 0; i < n; i++)
+        out[i] = (metrics_chunk_peer){r[i].peer, r[i].reads, r[i].hedges, r[i].avoids, r[i].decoded_cells,
+                                      r[i].read_avoid};
+    free(r);
+    return n;
+}
+
 static void snap_metrics(metrics_snap *out)
 {
     struct rsnap_stats s;
@@ -6998,7 +7015,8 @@ int main(int argc, char **argv)
                           .vol_diverged = metrics_vol_diverged,
                           .margins = cluster_on ? metrics_margins : NULL,
                           .peer_links = cluster_on ? peerlink_up_by_check : NULL,
-                          .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL};
+                          .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL,
+                          .chunk_peers = cluster_on ? chunk_peer_metrics_rows : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
@@ -7242,6 +7260,8 @@ int main(int argc, char **argv)
      * of the others: a slot with no engine, such as a cluster volume refused at its open, answers TSDB_ERR_INVALID.) */
     repld_close_failed();
     rc = tsdb_close(db);
+    if (cluster_on)
+        chunkpeer_quiesce(); /* wait for any detached fan, primary or hedge threads before process exit */
     if (atomic_load(&db_failed))
         return 1; /* close failed too, by design: nothing more was written */
     if (rc)

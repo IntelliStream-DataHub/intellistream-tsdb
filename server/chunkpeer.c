@@ -25,11 +25,15 @@
 
 int chunkpeer_mutant;
 uint32_t chunkpeer_test_list_max = CS_LIST_MAX;
+#ifdef TSDB_TEST_HOOKS
+int64_t (*chunkpeer_test_now_ms)(void);
+int chunkpeer_test_avoid_ms;
+#endif
 
 int chunkpeer_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"none", "ownepoch", "nosumcmp", "staleraise", "delbeforegc", "sticky",
-                                         "unsuredown"};
+    static const char *const names[] = {"none",        "ownepoch",   "nosumcmp",   "staleraise",  "delbeforegc",
+                                        "sticky",      "unsuredown", "hedgeall",   "noavoid",     "hedgecorrupt"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++)
         if (!strcmp(name, names[i]))
             return (int)i;
@@ -252,6 +256,266 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
     return rc;
 }
 
+/* ---------------------------------------------------------------- per-server latency, hedging & read-avoid (E31) */
+#define CP_PEERS_MAX CHUNKPEER_PEERS_MAX
+#define CP_LAT_WIN 128        /* sliding read latency window (samples per peer) */
+#define CP_HEDGE_MIN_MS 20    /* E31: hedge timer floor 20 ms */
+#define CP_HEDGE_MAX_MS 500   /* E31: hedge timer ceiling 500 ms */
+#define CP_BUCKET_COST 20     /* 1 hedge costs 20 read credits -> 5% cap */
+#define CP_BUCKET_CAP 20      /* max 1 hedge burst */
+#define CP_BUCKET_INIT 19     /* read #1 brings tokens to 20 -> 5.0% exact over any 20*N reads */
+#define CP_AVOID_THRESH 8     /* E31: 8 timeouts in 10 s -> read-avoid */
+#define CP_AVOID_WIN_MS 10000 /* E31: 10 s timeout window */
+#define CP_AVOID_DUR_MS 30000 /* E31: 30 s read-avoid duration */
+
+typedef struct cp_peer {
+    uint32_t node;
+    uint32_t lat_us[CP_LAT_WIN];
+    unsigned lat_n, lat_pos;
+    uint32_t p99_us;
+    uint32_t hedge_ms;
+    int tokens;
+    int64_t tmo_ms[CP_AVOID_THRESH];
+    unsigned tmo_n, tmo_pos;
+    int64_t avoid_until_ms;
+    uint64_t reads, hedges, avoids, decoded_cells;
+} cp_peer;
+
+static pthread_mutex_t cp_mu = PTHREAD_MUTEX_INITIALIZER;
+static cp_peer cp_peers[CP_PEERS_MAX];
+static size_t cp_npeers;
+
+static int64_t cp_now_ms(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    if (chunkpeer_test_now_ms)
+        return chunkpeer_test_now_ms();
+#endif
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uint64_t cp_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static cp_peer *cp_peer_find_locked(uint32_t node)
+{
+    for (size_t i = 0; i < cp_npeers; i++)
+        if (cp_peers[i].node == node)
+            return &cp_peers[i];
+    return NULL;
+}
+
+static cp_peer *cp_peer_get_locked(uint32_t node)
+{
+    cp_peer *p = cp_peer_find_locked(node);
+    if (p)
+        return p;
+    if (cp_npeers >= CP_PEERS_MAX)
+        return NULL;
+    p = &cp_peers[cp_npeers++];
+    memset(p, 0, sizeof *p);
+    p->node = node;
+    p->hedge_ms = CP_HEDGE_MIN_MS;
+    p->tokens = CP_BUCKET_INIT;
+    return p;
+}
+
+static void cp_peer_record_lat(uint32_t node, uint32_t us)
+{
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p) {
+        p->lat_us[p->lat_pos] = us;
+        p->lat_pos = (p->lat_pos + 1) % CP_LAT_WIN;
+        if (p->lat_n < CP_LAT_WIN)
+            p->lat_n++;
+        /* p99 of up to 128 samples: index ceil(0.99 * n) - 1 is max1 for n < 100, max2 for 100..128 */
+        uint32_t m1 = 0, m2 = 0;
+        for (unsigned i = 0; i < p->lat_n; i++) {
+            uint32_t v = p->lat_us[i];
+            if (v >= m1) {
+                m2 = m1;
+                m1 = v;
+            } else if (v > m2) {
+                m2 = v;
+            }
+        }
+        p->p99_us = p->lat_n >= 100 ? m2 : m1;
+        uint64_t hms = ((uint64_t)p->p99_us * 2u + 999u) / 1000u;
+        if (hms < CP_HEDGE_MIN_MS)
+            hms = CP_HEDGE_MIN_MS;
+        if (hms > CP_HEDGE_MAX_MS)
+            hms = CP_HEDGE_MAX_MS;
+        p->hedge_ms = (uint32_t)hms;
+    }
+    pthread_mutex_unlock(&cp_mu);
+}
+
+static uint32_t cp_peer_begin_read(uint32_t node, bool credit_bucket)
+{
+    uint32_t hms = CP_HEDGE_MIN_MS;
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p) {
+        p->reads++;
+        if (credit_bucket && p->tokens < CP_BUCKET_CAP)
+            p->tokens++;
+        hms = p->hedge_ms;
+    }
+    pthread_mutex_unlock(&cp_mu);
+    return hms;
+}
+
+static bool cp_peer_reserve_hedge(uint32_t node)
+{
+    bool ok = false;
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p) {
+        if (chunkpeer_mutant == CP_MUT_HEDGEALL) {
+            ok = true;
+        } else if (p->tokens >= CP_BUCKET_COST) {
+            p->tokens -= CP_BUCKET_COST;
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&cp_mu);
+    return ok;
+}
+
+static void cp_peer_commit_hedge(uint32_t node)
+{
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p)
+        p->hedges++;
+    pthread_mutex_unlock(&cp_mu);
+}
+
+static void cp_peer_cancel_hedge(uint32_t node)
+{
+    if (chunkpeer_mutant == CP_MUT_HEDGEALL)
+        return;
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_find_locked(node);
+    if (p) {
+        p->tokens += CP_BUCKET_COST;
+        if (p->tokens > CP_BUCKET_CAP)
+            p->tokens = CP_BUCKET_CAP;
+    }
+    pthread_mutex_unlock(&cp_mu);
+}
+
+static void cp_peer_record_timeout(uint32_t node)
+{
+    pthread_mutex_lock(&cp_mu);
+    int64_t now = cp_now_ms();
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p) {
+        if (p->avoid_until_ms > now) {
+            pthread_mutex_unlock(&cp_mu);
+            return;
+        }
+        if (p->avoid_until_ms > 0) {
+            p->avoid_until_ms = 0;
+            p->tmo_n = 0;
+            p->tmo_pos = 0;
+            fprintf(stderr, "tsdbd: chunk peer %" PRIu32 ": read-avoid expired: resuming direct reads\n", node);
+        }
+        p->tmo_ms[p->tmo_pos] = now;
+        p->tmo_pos = (p->tmo_pos + 1) % CP_AVOID_THRESH;
+        if (p->tmo_n < CP_AVOID_THRESH)
+            p->tmo_n++;
+        if (p->tmo_n == CP_AVOID_THRESH && chunkpeer_mutant != CP_MUT_NOAVOID) {
+            int64_t oldest = p->tmo_ms[p->tmo_pos];
+            if (now - oldest <= CP_AVOID_WIN_MS) {
+                int64_t dur = CP_AVOID_DUR_MS;
+#ifdef TSDB_TEST_HOOKS
+                if (chunkpeer_test_avoid_ms > 0)
+                    dur = chunkpeer_test_avoid_ms;
+#endif
+                p->avoid_until_ms = now + dur;
+                p->tmo_n = 0;
+                p->tmo_pos = 0;
+                fprintf(stderr, "tsdbd: chunk peer %" PRIu32 ": %d read timeouts in %d s: read-avoid for %lld s\n",
+                        node, CP_AVOID_THRESH, CP_AVOID_WIN_MS / 1000, (long long)(dur / 1000));
+            }
+        }
+    }
+    pthread_mutex_unlock(&cp_mu);
+}
+
+static bool cp_peer_is_avoid(uint32_t node, bool count_avoid)
+{
+    if (chunkpeer_mutant == CP_MUT_NOAVOID)
+        return false;
+    bool av = false;
+    pthread_mutex_lock(&cp_mu);
+    int64_t now = cp_now_ms();
+    cp_peer *p = cp_peer_find_locked(node);
+    if (p && p->avoid_until_ms > 0) {
+        if (now < p->avoid_until_ms) {
+            av = true;
+            if (count_avoid)
+                p->avoids++;
+        } else {
+            p->avoid_until_ms = 0;
+            p->tmo_n = 0;
+            p->tmo_pos = 0;
+            fprintf(stderr, "tsdbd: chunk peer %" PRIu32 ": read-avoid expired: resuming direct reads\n", node);
+        }
+    }
+    pthread_mutex_unlock(&cp_mu);
+    return av;
+}
+
+static void cp_peer_add_decoded(uint32_t node, uint64_t n)
+{
+    if (n == 0)
+        return;
+    pthread_mutex_lock(&cp_mu);
+    cp_peer *p = cp_peer_get_locked(node);
+    if (p)
+        p->decoded_cells += n;
+    pthread_mutex_unlock(&cp_mu);
+}
+
+size_t chunkpeer_peer_stats_get(struct chunkpeer_peer_stats *out, size_t cap)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&cp_mu);
+    int64_t now = cp_now_ms();
+    for (size_t i = 0; i < cp_npeers && n < cap; i++) {
+        const cp_peer *p = &cp_peers[i];
+        out[n++] = (struct chunkpeer_peer_stats){
+            .peer = p->node,
+            .reads = p->reads,
+            .hedges = p->hedges,
+            .avoids = p->avoids,
+            .decoded_cells = p->decoded_cells,
+            .hedge_ms = p->hedge_ms,
+            .p99_ms = (double)p->p99_us / 1000.0,
+            .read_avoid = (chunkpeer_mutant != CP_MUT_NOAVOID && p->avoid_until_ms > now) ? 1 : 0,
+        };
+    }
+    pthread_mutex_unlock(&cp_mu);
+    return n;
+}
+
+void chunkpeer_hedge_reset(void)
+{
+    pthread_mutex_lock(&cp_mu);
+    cp_npeers = 0;
+    memset(cp_peers, 0, sizeof cp_peers);
+    pthread_mutex_unlock(&cp_mu);
+}
+
 /* ---------------------------------------------------------------- read */
 struct cold_obj {
     struct chunkpeer_net net;
@@ -263,6 +527,7 @@ struct cold_obj {
     unsigned npos;
     uint32_t node[CHUNK_POS_MAX];
     int st[CHUNK_POS_MAX];       /* the open's status of each position */
+    bool avoided[CHUNK_POS_MAX]; /* skipped at open because its peer was in read-avoid */
     uint64_t *sums[CHUNK_POS_MAX]; /* each position's own table (status OK) */
     uint64_t *rec;               /* the object record's sums, or NULL */
 };
@@ -378,18 +643,19 @@ struct fan {
     bool has_expect;
     chunk_geom expect;
     uint32_t node[CHUNK_POS_MAX];
+    unsigned pos[CHUNK_POS_MAX]; /* chunk position of each slot (default: i) */
     ask a[CHUNK_POS_MAX];
     bool fin[CHUNK_POS_MAX];
     fan_job job[CHUNK_POS_MAX];
 };
 
-static atomic_int fan_threads; /* asks still running, abandoned ones included (chunkpeer_quiesce) */
+static atomic_int fan_threads; /* asks and hedged reads still running, abandoned ones included (chunkpeer_quiesce) */
 
 static void fan_one(fan *f, unsigned i, ask *out)
 {
     memset(out, 0, sizeof *out);
     if (!f->epoch_op) {
-        out->st = fetch_sums(&f->net, f->tmo, f->node[i], f->volume, f->epoch, f->vuuid, f->oid, i,
+        out->st = fetch_sums(&f->net, f->tmo, f->node[i], f->volume, f->epoch, f->vuuid, f->oid, f->pos[i],
                              f->has_expect ? &f->expect : NULL, &out->g, &out->sums);
         return;
     }
@@ -512,48 +778,577 @@ static fan *fan_new(const struct chunkpeer *cp, uint32_t volume, uint64_t epoch,
     f->epoch = epoch;
     f->n = n;
     memcpy(f->node, nodes, n * sizeof *nodes);
+    for (unsigned i = 0; i < n; i++)
+        f->pos[i] = i;
     return f;
+}
+
+/* Small cached pool of detached workers for read_race primary/hedge tasks: avoids pthread_create per healthy direct
+ * cell read while still spawning overflow threads when peers hang (never starves). */
+#define CP_POOL_MAX 16
+#define CP_POOL_IDLE_MS 5000
+
+typedef struct cp_job {
+    void (*fn)(void *);
+    void *arg;
+    struct cp_job *next;
+} cp_job;
+
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_cv;
+static pthread_once_t pool_once = PTHREAD_ONCE_INIT;
+static cp_job *pool_head, *pool_tail;
+static int pool_idle, pool_queued, pool_total;
+static bool pool_draining;
+
+static void pool_init_once(void) { tsdb_cond_init_mono(&pool_cv); }
+
+static void *pool_oneshot_main(void *arg)
+{
+    cp_job *j = arg;
+    void (*fn)(void *) = j->fn;
+    void *a = j->arg;
+    fn(a);
+    atomic_fetch_sub(&fan_threads, 1);
+    return NULL;
+}
+
+static void *pool_worker_main(void *arg)
+{
+    cp_job *j = arg;
+    for (;;) {
+        void (*fn)(void *) = j->fn;
+        void *a = j->arg;
+        fn(a); /* may free j (embedded in read_race): never touch j again */
+        atomic_fetch_sub(&fan_threads, 1);
+        pthread_mutex_lock(&pool_mu);
+        if (pool_head) {
+            j = pool_head;
+            pool_head = j->next;
+            if (!pool_head)
+                pool_tail = NULL;
+            pool_queued--;
+            pthread_mutex_unlock(&pool_mu);
+            continue;
+        }
+        if (pool_draining) {
+            pool_total--;
+            pthread_cond_broadcast(&pool_cv);
+            pthread_mutex_unlock(&pool_mu);
+            return NULL;
+        }
+        pool_idle++;
+        struct timespec dl;
+        tsdb_cond_deadline_ms(&dl, CP_POOL_IDLE_MS);
+        while (!pool_head && !pool_draining) {
+            if (pthread_cond_timedwait(&pool_cv, &pool_mu, &dl) == ETIMEDOUT)
+                break;
+        }
+        pool_idle--;
+        if (pool_head) {
+            j = pool_head;
+            pool_head = j->next;
+            if (!pool_head)
+                pool_tail = NULL;
+            pool_queued--;
+            pthread_mutex_unlock(&pool_mu);
+            continue;
+        }
+        pool_total--;
+        pthread_cond_broadcast(&pool_cv);
+        pthread_mutex_unlock(&pool_mu);
+        return NULL;
+    }
+}
+
+static int pool_submit(cp_job *j)
+{
+    pthread_once(&pool_once, pool_init_once);
+    j->next = NULL;
+    atomic_fetch_add(&fan_threads, 1);
+    pthread_mutex_lock(&pool_mu);
+    if (!pool_draining && pool_idle > pool_queued) {
+        if (pool_tail)
+            pool_tail->next = j;
+        else
+            pool_head = j;
+        pool_tail = j;
+        pool_queued++;
+        pthread_cond_signal(&pool_cv);
+        pthread_mutex_unlock(&pool_mu);
+        return 0;
+    }
+    bool pooled = !pool_draining && pool_total < CP_POOL_MAX;
+    if (pooled)
+        pool_total++;
+    pthread_mutex_unlock(&pool_mu);
+
+    pthread_attr_t at;
+    pthread_t th;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int e = pthread_create(&th, &at, pooled ? pool_worker_main : pool_oneshot_main, j);
+    pthread_attr_destroy(&at);
+    if (e != 0) {
+        if (pooled) {
+            pthread_mutex_lock(&pool_mu);
+            pool_total--;
+            pthread_cond_broadcast(&pool_cv);
+            pthread_mutex_unlock(&pool_mu);
+        }
+        atomic_fetch_sub(&fan_threads, 1);
+        return -1;
+    }
+    return 0;
 }
 
 void chunkpeer_quiesce(void)
 {
+    pthread_once(&pool_once, pool_init_once);
+    pthread_mutex_lock(&pool_mu);
+    pool_draining = true;
+    pthread_cond_broadcast(&pool_cv);
+    while (pool_total > 0)
+        pthread_cond_wait(&pool_cv, &pool_mu);
+    pool_draining = false;
+    pthread_mutex_unlock(&pool_mu);
     while (atomic_load(&fan_threads) > 0) {
         struct timespec ts = {0, 2 * 1000000L};
         nanosleep(&ts, NULL);
     }
 }
 
-static int src_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
+/* Synchronous CS_OP_READ loop for one cell range: records read latency on success. */
+static int direct_read_call(const struct chunkpeer_net *net, int tmo, uint32_t volume, uint64_t epoch,
+                            const uint8_t vuuid[16], const uint8_t oid[16], unsigned pos, uint32_t node, uint64_t off,
+                            void *buf, size_t len, uint32_t *lat_us_out, bool *answered_out)
 {
-    struct cold_obj *o = ctx;
-    if (pos >= o->npos || o->st[pos] != CHUNK_ST_OK)
-        return pos < o->npos ? o->st[pos] : CHUNK_ST_ABSENT;
+    uint64_t t0 = cp_now_us();
+    bool answered = true;
+    int st = CHUNK_ST_OK;
     for (size_t done = 0; done < len;) {
         struct cs_req r;
-        req_init(&r, CS_OP_READ, o->volume, o->epoch, o->vuuid, o->oid, pos);
+        req_init(&r, CS_OP_READ, volume, epoch, vuuid, oid, pos);
         r.off = off + done;
         r.len = (uint32_t)(len - done < CS_READ_MAX ? len - done : CS_READ_MAX);
         int32_t rc = 0;
         uint8_t *b = NULL;
         size_t bn = 0;
-        int st = st_of(o->net.call(o->net.arg, o->node[pos], &r, o->timeout_ms, &rc, &b, &bn), rc);
+        int trc = net->call(net->arg, node, &r, tmo, &rc, &b, &bn);
+        if (trc != 0)
+            answered = false;
+        st = st_of(trc, rc);
         if (st == CHUNK_ST_OK && bn != r.len)
             st = CHUNK_ST_IOERR; /* a short read is an error, never the end */
         if (st == CHUNK_ST_OK)
             memcpy((uint8_t *)buf + done, b, bn);
         free(b);
         if (st != CHUNK_ST_OK)
-            return st;
+            break;
         done += r.len;
+    }
+    uint64_t dt = cp_now_us() - t0;
+    uint32_t us = dt > UINT32_MAX ? UINT32_MAX : (uint32_t)dt;
+    if (st == CHUNK_ST_OK && answered)
+        cp_peer_record_lat(node, us);
+    if (lat_us_out)
+        *lat_us_out = us;
+    if (answered_out)
+        *answered_out = answered;
+    return st;
+}
+
+typedef struct read_ctx {
+    struct cold_obj *o;
+    unsigned flags;
+    bool allow_hedge;
+    uint64_t c0, c1;           /* requested cell range [c0, c1] when allow_hedge is true */
+    bool has_stripe;
+    uint64_t cur_stripe;
+    uint32_t seen_direct_mask; /* data positions already visited in the direct pass of cur_stripe */
+    uint32_t skip_mask;        /* positions skipped for this entire read_ctx (set by hedge worker) */
+    uint32_t bad_mask;         /* positions known bad in cur_stripe */
+    int bad_st[CHUNK_POS_MAX]; /* failure status for positions in bad_mask */
+    bool stripe_failed;        /* a failed hedge already proved cur_stripe has < k good positions */
+    int stripe_fail_rc;        /* exact E15 error (UNAVAILABLE or CORRUPT) for cur_stripe */
+    unsigned failed_direct[CHUNK_K_MAX];
+    unsigned hedged_decoded;
+    bool had_hedge_timeout;
+    bool had_avoid;
+} read_ctx;
+
+static int src_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len);
+static const uint64_t *src_sums(void *ctx, unsigned pos, int *status);
+
+/* Reference-counted race between a primary cell read and a hedged decode from other positions (E31).
+ * Self-contained: detached threads touch only this struct, net (process-lifetime), and cp_peers — never cold_obj. */
+typedef struct read_race {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int refs;
+    struct chunkpeer_net net;
+    int timeout_ms;
+    uint32_t volume;
+    uint64_t epoch;
+    uint8_t vuuid[16], oid[16];
+    chunk_geom g;
+    unsigned npos;
+    uint32_t node[CHUNK_POS_MAX];
+    int st_open[CHUNK_POS_MAX];
+    bool avoided_open[CHUNK_POS_MAX];
+    unsigned pos;
+    uint64_t cell_off;
+    uint64_t obj_off;
+    size_t cell_len;
+    unsigned flags;
+    uint32_t skip_mask;
+    /* Primary */
+    cp_job pri_job;
+    bool pri_done;
+    int pri_st;
+    uint8_t *pri_buf;
+    /* Hedge */
+    cp_job hedge_job;
+    bool hedge_launched;
+    bool hedge_done;
+    int hedge_rc;
+    uint8_t *hedge_buf;
+    chunk_report hedge_rep;
+    uint64_t *rec_copy;
+    uint64_t *sums_copy[CHUNK_POS_MAX];
+} read_race;
+
+static void race_unref_locked(read_race *rr)
+{
+    bool last = --rr->refs == 0;
+    pthread_mutex_unlock(&rr->mu);
+    if (!last)
+        return;
+    free(rr->pri_buf);
+    free(rr->hedge_buf);
+    free(rr->rec_copy);
+    for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
+        free(rr->sums_copy[i]);
+    pthread_cond_destroy(&rr->cv);
+    pthread_mutex_destroy(&rr->mu);
+    free(rr);
+}
+
+static void race_primary_run(void *arg)
+{
+    read_race *rr = arg;
+    int st = direct_read_call(&rr->net, rr->timeout_ms, rr->volume, rr->epoch, rr->vuuid, rr->oid, rr->pos,
+                              rr->node[rr->pos], rr->cell_off, rr->pri_buf, rr->cell_len, NULL, NULL);
+    pthread_mutex_lock(&rr->mu);
+    rr->pri_st = st;
+    rr->pri_done = true;
+    pthread_cond_broadcast(&rr->cv);
+    race_unref_locked(rr);
+}
+
+static void race_hedge_run(void *arg)
+{
+    read_race *rr = arg;
+    struct cold_obj ho;
+    memset(&ho, 0, sizeof ho);
+    ho.net = rr->net;
+    ho.timeout_ms = rr->timeout_ms;
+    ho.volume = rr->volume;
+    ho.epoch = rr->epoch;
+    memcpy(ho.vuuid, rr->vuuid, 16);
+    memcpy(ho.oid, rr->oid, 16);
+    ho.g = rr->g;
+    ho.npos = rr->npos;
+    memcpy(ho.node, rr->node, sizeof ho.node);
+    memcpy(ho.st, rr->st_open, sizeof ho.st);
+    memcpy(ho.avoided, rr->avoided_open, sizeof ho.avoided);
+    for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
+        ho.sums[i] = rr->sums_copy[i];
+    ho.rec = rr->rec_copy;
+
+    read_ctx hctx;
+    memset(&hctx, 0, sizeof hctx);
+    hctx.o = &ho;
+    hctx.flags = rr->flags;
+    hctx.allow_hedge = false;
+    hctx.skip_mask = rr->skip_mask;
+
+    chunk_source hsrc = {.ctx = &hctx, .read = src_read, .sums = src_sums};
+    for (int i = 0; i < 16; i++)
+        snprintf(hsrc.name + 2 * i, sizeof hsrc.name - 2 * (size_t)i, "%02x", rr->oid[i]);
+    chunk_report rep;
+    memset(&rep, 0, sizeof rep);
+    int rc = chunk_read_range(&hsrc, &ho.g, ho.rec, rr->obj_off, rr->cell_len, rr->hedge_buf, rr->flags, &rep);
+
+    pthread_mutex_lock(&rr->mu);
+    rr->hedge_rc = rc;
+    rr->hedge_rep = rep;
+    rr->hedge_done = true;
+    pthread_cond_broadcast(&rr->cv);
+    race_unref_locked(rr);
+}
+
+/* Allocates optional sums copies for a non-RAW hedge (called before spawning race_hedge_run; primary never touches
+ * hedge_* or *_copy fields). Returns 0 on success, -1 on OOM. */
+static int race_prep_hedge(read_race *rr, const struct cold_obj *o, unsigned flags)
+{
+    rr->hedge_buf = malloc(rr->cell_len ? rr->cell_len : 1);
+    if (!rr->hedge_buf)
+        return -1;
+    if (!(flags & CHUNK_RR_RAW)) {
+        if (o->rec) {
+            size_t n = (size_t)chunk_sums_total(&o->g);
+            rr->rec_copy = malloc((n ? n : 1) * sizeof *rr->rec_copy);
+            if (!rr->rec_copy)
+                return -1;
+            memcpy(rr->rec_copy, o->rec, n * sizeof *rr->rec_copy);
+        } else {
+            for (unsigned p = 0; p < o->npos; p++) {
+                if (!o->sums[p])
+                    continue;
+                size_t n = (size_t)chunk_pos_cells(&o->g, p);
+                rr->sums_copy[p] = malloc((n ? n : 1) * sizeof *rr->sums_copy[p]);
+                if (!rr->sums_copy[p])
+                    return -1;
+                memcpy(rr->sums_copy[p], o->sums[p], n * sizeof *rr->sums_copy[p]);
+            }
+        }
     }
     return 0;
 }
 
+static int hedge_read_cell(read_ctx *rctx, unsigned pos, uint64_t off, void *buf, size_t len, bool is_direct)
+{
+    struct cold_obj *o = rctx->o;
+    if (pos >= o->npos)
+        return CHUNK_ST_ABSENT;
+    if (rctx->skip_mask & (1u << pos))
+        return CHUNK_ST_DOWN;
+    uint32_t node = o->node[pos];
+    /* Check read-avoid before o->st[pos] for positions skipped at open due to read-avoid, or normal OK positions. */
+    if ((o->st[pos] == CHUNK_ST_OK || o->avoided[pos]) && cp_peer_is_avoid(node, true)) {
+        rctx->had_avoid = true;
+        return chunkpeer_mutant == CP_MUT_HEDGECORRUPT ? CHUNK_ST_DAMAGED : CHUNK_ST_DOWN;
+    }
+    if (o->st[pos] != CHUNK_ST_OK)
+        return o->st[pos];
+
+    uint64_t stripe = off / o->g.cell, in_cell = off % o->g.cell;
+    uint64_t obj_off = (stripe * (uint64_t)o->g.k + (uint64_t)pos) * (uint64_t)o->g.cell + in_cell;
+    bool can_race = is_direct && o->g.m > 0 && in_cell + len <= o->g.cell && obj_off < o->g.len &&
+                    len <= o->g.len - obj_off;
+
+    if (!can_race) {
+        uint32_t hms = cp_peer_begin_read(node, false);
+        uint32_t lat_us = 0;
+        bool answered = false;
+        int st = direct_read_call(&o->net, o->timeout_ms, o->volume, o->epoch, o->vuuid, o->oid, pos, node, off, buf,
+                                  len, &lat_us, &answered);
+        if (st == CHUNK_ST_DOWN && !answered && lat_us >= hms * 1000u) {
+            cp_peer_record_timeout(node);
+            rctx->had_hedge_timeout = true;
+            if (chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+                return CHUNK_ST_DAMAGED;
+        }
+        return st;
+    }
+
+    uint32_t hms = cp_peer_begin_read(node, true);
+    read_race *rr = calloc(1, sizeof *rr);
+    if (!rr || !(rr->pri_buf = malloc(len ? len : 1))) {
+        free(rr);
+        return direct_read_call(&o->net, o->timeout_ms, o->volume, o->epoch, o->vuuid, o->oid, pos, node, off, buf, len,
+                                NULL, NULL);
+    }
+    pthread_mutex_init(&rr->mu, NULL);
+    tsdb_cond_init_mono(&rr->cv);
+    rr->refs = 2; /* caller + primary job */
+    rr->net = o->net;
+    rr->timeout_ms = o->timeout_ms;
+    rr->volume = o->volume;
+    rr->epoch = o->epoch;
+    memcpy(rr->vuuid, o->vuuid, 16);
+    memcpy(rr->oid, o->oid, 16);
+    rr->g = o->g;
+    rr->npos = o->npos;
+    memcpy(rr->node, o->node, sizeof rr->node);
+    memcpy(rr->st_open, o->st, sizeof rr->st_open);
+    memcpy(rr->avoided_open, o->avoided, sizeof rr->avoided_open);
+    rr->pos = pos;
+    rr->cell_off = off;
+    rr->obj_off = obj_off;
+    rr->cell_len = len;
+    rr->flags = rctx->flags;
+    rr->skip_mask = rctx->bad_mask | (1u << pos);
+    rr->pri_job = (cp_job){.fn = race_primary_run, .arg = rr};
+
+    if (pool_submit(&rr->pri_job) != 0) {
+        pthread_mutex_lock(&rr->mu);
+        rr->refs = 1;
+        race_unref_locked(rr);
+        return direct_read_call(&o->net, o->timeout_ms, o->volume, o->epoch, o->vuuid, o->oid, pos, node, off, buf, len,
+                                NULL, NULL);
+    }
+
+    pthread_mutex_lock(&rr->mu);
+    struct timespec dl;
+    tsdb_cond_deadline_ms(&dl, (int)hms);
+    while (!rr->pri_done) {
+        if (pthread_cond_timedwait(&rr->cv, &rr->mu, &dl) == ETIMEDOUT)
+            break;
+    }
+    if (rr->pri_done) {
+        int st = rr->pri_st;
+        if (st == CHUNK_ST_OK)
+            memcpy(buf, rr->pri_buf, len);
+        race_unref_locked(rr);
+        return st;
+    }
+
+    /* Hedge timer expired while primary is still in flight. */
+    cp_peer_record_timeout(node);
+    bool reserved = cp_peer_reserve_hedge(node);
+    if (!reserved) {
+        while (!rr->pri_done)
+            pthread_cond_wait(&rr->cv, &rr->mu);
+        int st = rr->pri_st;
+        if (st == CHUNK_ST_OK) {
+            memcpy(buf, rr->pri_buf, len);
+        } else if (st == CHUNK_ST_DOWN) {
+            rctx->had_hedge_timeout = true;
+            if (chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+                st = CHUNK_ST_DAMAGED;
+        }
+        race_unref_locked(rr);
+        return st;
+    }
+
+    /* Launch hedge decode from other positions while keeping primary running: first good answer wins. */
+    rctx->had_hedge_timeout = true;
+    pthread_mutex_unlock(&rr->mu);
+    int prep = race_prep_hedge(rr, o, rctx->flags);
+    pthread_mutex_lock(&rr->mu);
+    if (rr->pri_done && rr->pri_st == CHUNK_ST_OK) {
+        cp_peer_cancel_hedge(node);
+        memcpy(buf, rr->pri_buf, len);
+        race_unref_locked(rr);
+        return CHUNK_ST_OK;
+    }
+    if (prep == 0) {
+        rr->refs++;
+        rr->hedge_launched = true;
+        rr->hedge_job = (cp_job){.fn = race_hedge_run, .arg = rr};
+        if (pool_submit(&rr->hedge_job) == 0) {
+            cp_peer_commit_hedge(node);
+        } else {
+            rr->refs--;
+            rr->hedge_launched = false;
+            cp_peer_cancel_hedge(node);
+        }
+    } else {
+        cp_peer_cancel_hedge(node);
+    }
+    while (!(rr->pri_done && rr->pri_st == CHUNK_ST_OK) && !(rr->hedge_done && rr->hedge_rc == 0) &&
+           !(rr->pri_done && (!rr->hedge_launched || rr->hedge_done))) {
+        pthread_cond_wait(&rr->cv, &rr->mu);
+    }
+    int ret;
+    if (rr->pri_done && rr->pri_st == CHUNK_ST_OK) {
+        memcpy(buf, rr->pri_buf, len);
+        ret = CHUNK_ST_OK;
+    } else if (rr->hedge_done && rr->hedge_rc == 0) {
+        memcpy(buf, rr->hedge_buf, len);
+        rctx->hedged_decoded += rr->hedge_rep.decoded_cells ? rr->hedge_rep.decoded_cells : 1u;
+        cp_peer_add_decoded(node, 1);
+        ret = CHUNK_ST_OK;
+    } else {
+        int pri_st = rr->pri_st ? rr->pri_st : CHUNK_ST_DOWN;
+        if (rr->hedge_launched && rr->hedge_done &&
+            (rr->hedge_rc == TSDB_ERR_UNAVAILABLE || rr->hedge_rc == TSDB_ERR_CORRUPT)) {
+            /* The hedge already probed every other position of this stripe and proved < k good (or corrupt encoding):
+             * preserve the exact E15 result and avoid re-reading all survivors a second time in outer degrade(). */
+            unsigned ngood = 0, down = 0;
+            for (unsigned p = 0; p < o->npos; p++) {
+                int pst;
+                if (p == pos)
+                    pst = pri_st;
+                else if (rctx->bad_mask & (1u << p))
+                    pst = rctx->bad_st[p];
+                else
+                    pst = rr->hedge_rep.st[p];
+                if (pst == CHUNK_ST_OK || pst == CHUNK_ST_VIRTUAL)
+                    ngood++;
+                else if (pst == CHUNK_ST_DOWN)
+                    down++;
+            }
+            int fail_rc = (ngood < o->g.k && ngood + down >= o->g.k) ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+            if (fail_rc == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+                fail_rc = TSDB_ERR_CORRUPT;
+            rctx->stripe_failed = true;
+            rctx->stripe_fail_rc = fail_rc;
+        }
+        ret = pri_st;
+        if (ret == CHUNK_ST_DOWN && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+            ret = CHUNK_ST_DAMAGED;
+    }
+    race_unref_locked(rr);
+    return ret;
+}
+
+static int src_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
+{
+    read_ctx *rctx = ctx;
+    struct cold_obj *o = rctx->o;
+    uint64_t stripe = o->g.cell ? off / o->g.cell : 0;
+    if (!rctx->has_stripe || stripe != rctx->cur_stripe) {
+        rctx->has_stripe = true;
+        rctx->cur_stripe = stripe;
+        rctx->seen_direct_mask = 0;
+        rctx->bad_mask = 0;
+        memset(rctx->bad_st, 0, sizeof rctx->bad_st);
+        rctx->stripe_failed = false;
+        rctx->stripe_fail_rc = 0;
+    }
+    uint64_t c = stripe * (uint64_t)o->g.k + (uint64_t)pos;
+    bool is_direct = rctx->allow_hedge && pos < o->g.k && c >= rctx->c0 && c <= rctx->c1 &&
+                     !(rctx->seen_direct_mask & (1u << pos));
+    if (is_direct)
+        rctx->seen_direct_mask |= 1u << pos;
+
+    if (rctx->stripe_failed) {
+        int st = rctx->stripe_fail_rc == TSDB_ERR_UNAVAILABLE ? CHUNK_ST_DOWN : CHUNK_ST_DAMAGED;
+        if (st == CHUNK_ST_DOWN && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+            st = CHUNK_ST_DAMAGED;
+        if (pos < CHUNK_POS_MAX) {
+            rctx->bad_mask |= 1u << pos;
+            rctx->bad_st[pos] = st;
+        }
+        if (is_direct)
+            rctx->failed_direct[pos]++;
+        return st;
+    }
+
+    if (!is_direct && pos < CHUNK_POS_MAX && (rctx->bad_mask & (1u << pos)))
+        return rctx->bad_st[pos];
+
+    int st = hedge_read_cell(rctx, pos, off, buf, len, is_direct);
+    if (st != CHUNK_ST_OK) {
+        if (pos < CHUNK_POS_MAX) {
+            rctx->bad_mask |= 1u << pos;
+            rctx->bad_st[pos] = st;
+        }
+        if (is_direct)
+            rctx->failed_direct[pos]++;
+    }
+    return st;
+}
+
 static const uint64_t *src_sums(void *ctx, unsigned pos, int *status)
 {
-    struct cold_obj *o = ctx;
-    if (pos >= o->npos || o->st[pos] != CHUNK_ST_OK) {
-        *status = pos < o->npos ? o->st[pos] : CHUNK_ST_ABSENT;
+    read_ctx *rctx = ctx;
+    struct cold_obj *o = rctx->o;
+    if (pos >= o->npos || o->st[pos] != CHUNK_ST_OK || !o->sums[pos]) {
+        *status = pos < o->npos ? (o->st[pos] != CHUNK_ST_OK ? o->st[pos] : CHUNK_ST_DOWN) : CHUNK_ST_ABSENT;
         return NULL;
     }
     return o->sums[pos];
@@ -633,26 +1428,49 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
         p_obj_close(o);
         return TSDB_ERR_CORRUPT; /* an object record of more positions than the volume has members */
     }
-    fan *f = fan_new(p->cp, o->volume, o->epoch, o->node, o->npos);
-    if (!f) {
-        p_obj_close(o);
-        return TSDB_ERR_NOMEM;
-    }
-    memcpy(f->vuuid, o->vuuid, 16);
-    memcpy(f->oid, oid, 16);
-    f->has_expect = true;
-    f->expect = o->g;
-    ask a[CHUNK_POS_MAX];
-    /* k' positions are enough to read every byte: one that does not answer by then is DOWN for this handle */
-    fan_run(f, o->g.k, FAN_GRACE_MS, false, a, CHUNK_ST_DOWN);
-    unsigned ok = 0;
+    uint32_t active_nodes[CHUNK_POS_MAX];
+    unsigned active_pos[CHUNK_POS_MAX];
+    unsigned nactive = 0;
     for (unsigned i = 0; i < o->npos; i++) {
-        o->st[i] = a[i].st;
-        o->sums[i] = a[i].sums;
-        ok += o->st[i] == CHUNK_ST_OK;
+        if (cp_peer_is_avoid(o->node[i], false)) {
+            o->avoided[i] = true;
+            o->st[i] = rec_sums ? CHUNK_ST_OK : CHUNK_ST_DOWN;
+        } else {
+            active_nodes[nactive] = o->node[i];
+            active_pos[nactive] = i;
+            nactive++;
+        }
+    }
+    unsigned ok = 0;
+    if (nactive > 0) {
+        fan *f = fan_new(p->cp, o->volume, o->epoch, active_nodes, nactive);
+        if (!f) {
+            p_obj_close(o);
+            return TSDB_ERR_NOMEM;
+        }
+        for (unsigned j = 0; j < nactive; j++)
+            f->pos[j] = active_pos[j];
+        memcpy(f->vuuid, o->vuuid, 16);
+        memcpy(f->oid, oid, 16);
+        f->has_expect = true;
+        f->expect = o->g;
+        ask a[CHUNK_POS_MAX];
+        /* k' positions are enough to read every byte: one that does not answer by then is DOWN for this handle */
+        fan_run(f, o->g.k, FAN_GRACE_MS, false, a, CHUNK_ST_DOWN);
+        for (unsigned j = 0; j < nactive; j++) {
+            unsigned i = active_pos[j];
+            o->st[i] = a[j].st;
+            o->sums[i] = a[j].sums;
+            ok += o->st[i] == CHUNK_ST_OK;
+        }
     }
     if (ok == 0) {
-        int rc0 = none_ok(o->st, o->npos);
+        int st_all[CHUNK_POS_MAX];
+        for (unsigned i = 0; i < o->npos; i++)
+            st_all[i] = o->avoided[i] ? CHUNK_ST_DOWN : o->st[i];
+        int rc0 = none_ok(st_all, o->npos);
+        if (nactive < o->npos && rc0 == TSDB_ERR_UNAVAILABLE && chunkpeer_mutant == CP_MUT_HEDGECORRUPT)
+            rc0 = TSDB_ERR_CORRUPT;
         p_obj_close(o);
         return rc0;
     }
@@ -670,10 +1488,57 @@ static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect
 
 static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep)
 {
-    chunk_source src = {.ctx = o, .read = src_read, .sums = src_sums};
+    chunk_report local_rep;
+    if (!rep)
+        rep = &local_rep;
+    read_ctx rctx;
+    memset(&rctx, 0, sizeof rctx);
+    rctx.o = o;
+    rctx.flags = flags;
+    if (len > 0 && o->g.cell > 0) {
+        rctx.allow_hedge = true;
+        rctx.c0 = off / o->g.cell;
+        rctx.c1 = (off + len - 1) / o->g.cell;
+    }
+    chunk_source src = {.ctx = &rctx, .read = src_read, .sums = src_sums};
     for (int i = 0; i < 16; i++)
         snprintf(src.name + 2 * i, sizeof src.name - 2 * (size_t)i, "%02x", o->oid[i]);
-    return chunk_read_range(&src, &o->g, o->rec, off, len, buf, flags, rep);
+    int rc = chunk_read_range(&src, &o->g, o->rec, off, len, buf, flags, rep);
+    if (rc == 0) {
+        unsigned attr = 0;
+        if (rep->decoded_cells > 0) {
+            for (unsigned p = 0; p < o->g.k; p++) {
+                if (rctx.failed_direct[p] > 0) {
+                    cp_peer_add_decoded(o->node[p], rctx.failed_direct[p]);
+                    attr += rctx.failed_direct[p];
+                }
+            }
+            if (rep->decoded_cells > attr) {
+                unsigned rem = rep->decoded_cells - attr;
+                unsigned unattr[CHUNK_K_MAX], nun = 0;
+                for (unsigned p = 0; p < o->g.k; p++)
+                    if (rep->st[p] != CHUNK_ST_OK && rctx.failed_direct[p] == 0)
+                        unattr[nun++] = p;
+                if (nun == 0) {
+                    for (unsigned p = 0; p < o->g.k; p++)
+                        if (rep->st[p] != CHUNK_ST_OK)
+                            unattr[nun++] = p;
+                }
+                for (unsigned i = 0; i < nun && rem > 0; i++) {
+                    unsigned share = rem / (nun - i);
+                    if (share == 0)
+                        share = 1;
+                    cp_peer_add_decoded(o->node[unattr[i]], share);
+                    rem -= share;
+                }
+            }
+        }
+        rep->decoded_cells += rctx.hedged_decoded;
+    } else if (rc == TSDB_ERR_UNAVAILABLE && (rctx.had_hedge_timeout || rctx.had_avoid) &&
+               chunkpeer_mutant == CP_MUT_HEDGECORRUPT) {
+        rc = TSDB_ERR_CORRUPT;
+    }
+    return rc;
 }
 
 static const chunk_geom *p_obj_geom(const cold_obj *o) { return &o->g; }

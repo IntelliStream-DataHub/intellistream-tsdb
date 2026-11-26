@@ -58,11 +58,32 @@ struct fake {
     atomic_uint shortread;       /* bit i: member i answers a READ one byte short */
     atomic_uint ioerr;           /* bit i: member i answers every request with its store's IO error */
     atomic_uint garble;          /* bit i: member i's LIST pages say one entry fewer than they carry */
+    atomic_uint flip_byte;       /* bit i: XOR 0xff into byte 0 of member i's READ replies (silent rot) */
+    atomic_uint read_timeout;    /* bit i: after sleeping read_delay_ms[i], return TSDB_ERR_UNAVAILABLE on READ */
+    atomic_int read_delay_ms[NM + 1];
+    atomic_uint read_delay_max[NM + 1];  /* 0: unlimited; >0: delay only the first max READs to node */
+    atomic_uint read_delay_seen[NM + 1]; /* READs delayed so far on node */
+    atomic_uint read_calls[NM + 1];      /* total CS_OP_READ calls received by node */
+    atomic_int read_fail_stripe[NM + 1]; /* >=0: fail CS_OP_READ on this stripe index (cell_off / fail_cell) */
+    atomic_int read_delay_stripe[NM + 1]; /* >=0: apply read_delay_ms only on this stripe index; <0: all stripes */
+    atomic_uint fail_cell;               /* cell size used with read_fail_stripe / read_delay_stripe */
     pthread_cond_t hcv;
     struct chunkpeer_view view;
     pthread_mutex_t mu;
 };
 static struct fake F;
+
+#ifdef TSDB_TEST_HOOKS
+static _Atomic int64_t fake_clock_ms;
+static int64_t f_now_ms(void) { return atomic_load(&fake_clock_ms); }
+#endif
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
 
 static int f_call(void *arg, uint32_t node, const struct cs_req *r, int tmo, int32_t *rc, uint8_t **body, size_t *n)
 {
@@ -77,11 +98,32 @@ static int f_call(void *arg, uint32_t node, const struct cs_req *r, int tmo, int
         pthread_mutex_unlock(&F.mu);
         return TSDB_ERR_UNAVAILABLE;
     }
+    if (r->op == CS_OP_READ) {
+        atomic_fetch_add(&F.read_calls[node], 1);
+        int fs = atomic_load(&F.read_fail_stripe[node]);
+        uint32_t fc = atomic_load(&F.fail_cell);
+        if (fs >= 0 && fc > 0 && r->off / fc == (uint64_t)fs)
+            return TSDB_ERR_UNAVAILABLE;
+        int dms = atomic_load(&F.read_delay_ms[node]);
+        int ds = atomic_load(&F.read_delay_stripe[node]);
+        if (dms > 0 && (ds < 0 || (fc > 0 && r->off / fc == (uint64_t)ds))) {
+            unsigned max = atomic_load(&F.read_delay_max[node]);
+            bool do_delay = max == 0 || atomic_fetch_add(&F.read_delay_seen[node], 1) < max;
+            if (do_delay) {
+                struct timespec ts = {dms / 1000, (long)(dms % 1000) * 1000000L};
+                nanosleep(&ts, NULL);
+            }
+        }
+        if (atomic_load(&F.read_timeout) >> node & 1)
+            return TSDB_ERR_UNAVAILABLE;
+    }
     if (atomic_load(&F.ioerr) >> node & 1) {
         *rc = TSDB_ERR_IO;
         return 0;
     }
     int trc = chunkpeer_local_call(F.cs[node], 99, r, rc, body, n);
+    if (trc == 0 && *rc == 0 && r->op == CS_OP_READ && *n > 0 && (atomic_load(&F.flip_byte) >> node & 1))
+        (*body)[0] ^= 0xff;
     if (trc == 0 && *rc == 0 && r->op == CS_OP_READ && *n > 0 && (atomic_load(&F.shortread) >> node & 1))
         (*n)--;
     if (trc == 0 && *rc == 0 && r->op == CS_OP_LIST && *n >= 5 && (atomic_load(&F.garble) >> node & 1)) {
@@ -169,6 +211,22 @@ static void cluster_up(const char *name, char *dir, size_t cap)
     atomic_store(&F.shortread, 0);
     atomic_store(&F.ioerr, 0);
     atomic_store(&F.garble, 0);
+    atomic_store(&F.flip_byte, 0);
+    atomic_store(&F.read_timeout, 0);
+    atomic_store(&F.fail_cell, 0);
+    for (uint32_t i = 0; i <= NM; i++) {
+        atomic_store(&F.read_delay_ms[i], 0);
+        atomic_store(&F.read_delay_max[i], 0);
+        atomic_store(&F.read_delay_seen[i], 0);
+        atomic_store(&F.read_calls[i], 0);
+        atomic_store(&F.read_fail_stripe[i], -1);
+        atomic_store(&F.read_delay_stripe[i], -1);
+    }
+    chunkpeer_hedge_reset();
+#ifdef TSDB_TEST_HOOKS
+    chunkpeer_test_now_ms = NULL;
+    chunkpeer_test_avoid_ms = 0;
+#endif
     chunkpeer_test_list_max = CS_LIST_MAX;
     F.view = (struct chunkpeer_view){.caught_up = 1, .epoch = 5, .stripe_version = 1, .k = 4, .m = 2, .nstripe = NM};
     for (unsigned i = 0; i < NM; i++)
@@ -620,6 +678,552 @@ static void test_threads(void)
     cluster_down();
 }
 
+static bool peer_stat(uint32_t node, struct chunkpeer_peer_stats *out)
+{
+    struct chunkpeer_peer_stats all[32];
+    size_t n = chunkpeer_peer_stats_get(all, 32);
+    for (size_t i = 0; i < n; i++)
+        if (all[i].peer == node) {
+            *out = all[i];
+            return true;
+        }
+    memset(out, 0, sizeof *out);
+    return false;
+}
+
+/* E31: sliding p99, hedge timer clamp(2*p99, [20, 500]) ms, first-answer-wins race (hedge wins and primary wins) with
+ * late reply dropped cleanly. */
+static void test_hedge_timer(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgetimer", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 20);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+    uint8_t buf[4096];
+    chunk_report rep;
+    /* 1. Fast server -> p99 < 10 ms -> hedge timer clamped to 20 ms floor. */
+    for (int i = 0; i < 20; i++) {
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    }
+    struct chunkpeer_peer_stats st;
+    CHECK(peer_stat(1, &st) && st.hedge_ms == 20 && st.hedges == 0 && st.reads == 20);
+
+    /* 2. Hedge wins while primary is slow (200 ms): returns quickly with exact bytes; late primary dropped cleanly. */
+    atomic_store(&F.read_delay_ms[1], 200);
+    uint64_t t0 = mono_ms();
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    uint64_t dt = mono_ms() - t0;
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    CHECK(dt < 140);
+    CHECK(rep.decoded_cells >= 1);
+    CHECK(peer_stat(1, &st) && st.hedges == 1 && st.decoded_cells >= 1);
+    atomic_store(&F.read_delay_ms[1], 0);
+    chunkpeer_quiesce(); /* late primary finished cleanly */
+
+    /* 3. Primary wins AFTER hedge launched (primary 55 ms, parity node 5 220 ms -> hedge launches at 20 ms, primary
+     *    wins at ~55 ms, late hedge dropped cleanly). */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.read_delay_ms[1], 55);
+    atomic_store(&F.read_delay_ms[5], 220);
+    t0 = mono_ms();
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    dt = mono_ms() - t0;
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    CHECK(dt < 160 && rep.decoded_cells == 0);
+    CHECK(peer_stat(1, &st) && st.hedges == 1);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_delay_ms[5], 0);
+    chunkpeer_quiesce();
+
+    /* 4. Dynamic 2 * p99 in (20, 500) ms, then ceiling clamp at 500 ms. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.read_delay_ms[1], 45);
+    for (int i = 0; i < 4; i++) {
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    }
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.p99_ms >= 35.0 && st.hedge_ms >= 70 && st.hedge_ms <= 200);
+
+    atomic_store(&F.read_delay_ms[1], 320);
+    for (int i = 0; i < 3; i++) {
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    }
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.p99_ms >= 250.0 && st.hedge_ms == 500);
+
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* E31: 5% token bucket per server keeps total chunk reads <= 1.05x baseline (kills mutant hedgeall). */
+static void test_hedge_bucket(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgebucket", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 21);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+    uint8_t buf[4096];
+    chunk_report rep;
+
+    /* Baseline: 200 single-cell RAW reads spread across the 4 data positions (50 each). */
+    const unsigned N = 200;
+    for (unsigned i = 0; i < N; i++) {
+        uint64_t off = (uint64_t)(i % o.g.k) * o.g.cell;
+        CHECK(coldops_peer.obj_read(h, off, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes + off, sizeof buf) == 0);
+    }
+    unsigned base_reads = 0;
+    for (uint32_t n = 1; n <= NM; n++) {
+        base_reads += atomic_load(&F.read_calls[n]);
+        atomic_store(&F.read_calls[n], 0);
+    }
+    CHECK(base_reads == N);
+
+    /* Delay 6 reads on node 1 past the 500 ms ceiling (6 < 8 -> no read-avoid).
+     * With 5% bucket (cap 1): only 1 hedge fires (+4 reads -> 204/200 = 1.02x <= 1.05x).
+     * Without bucket (hedgeall): all 6 slow reads hedge (+24 reads -> 224/200 = 1.12x > 1.05x). */
+    atomic_store(&F.read_delay_ms[1], 550);
+    atomic_store(&F.read_delay_max[1], 6);
+    atomic_store(&F.read_delay_seen[1], 0);
+    for (unsigned i = 0; i < N; i++) {
+        uint64_t off = (uint64_t)(i % o.g.k) * o.g.cell;
+        CHECK(coldops_peer.obj_read(h, off, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes + off, sizeof buf) == 0);
+    }
+    chunkpeer_quiesce();
+    unsigned slow_reads = 0;
+    for (uint32_t n = 1; n <= NM; n++)
+        slow_reads += atomic_load(&F.read_calls[n]);
+    struct chunkpeer_peer_stats st;
+    CHECK(peer_stat(1, &st));
+    CHECK(slow_reads <= (base_reads * 105u) / 100u);
+    CHECK(st.hedges <= 3 && st.read_avoid == 0);
+
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* E31: 8 timeouts in 10 s enter read-avoid for 30 s (decoded around without waiting), then automatically recover
+ * (kills mutant noavoid). */
+static void test_hedge_avoid(void)
+{
+#ifndef TSDB_TEST_HOOKS
+    printf("  test_hedge_avoid: SKIPPED (TSDB_TEST_HOOKS=0)\n");
+    return;
+#else
+    char dir[PATH_MAX];
+    cluster_up("hedgeavoid", dir, sizeof dir);
+    atomic_store(&fake_clock_ms, 100000);
+    chunkpeer_test_now_ms = f_now_ms;
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 22);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+    uint8_t buf[4096];
+    chunk_report rep;
+
+    /* 7 timeouts in 10 s -> NOT yet in read-avoid. */
+    atomic_store(&F.read_delay_ms[1], 35);
+    atomic_store(&F.read_timeout, 1u << 1);
+    for (int i = 0; i < 7; i++) {
+        atomic_fetch_add(&fake_clock_ms, 100);
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    }
+    chunkpeer_quiesce();
+    struct chunkpeer_peer_stats st;
+    CHECK(peer_stat(1, &st) && st.read_avoid == 0);
+
+    /* Advance past the 10 s window: 1 more timeout does NOT trigger read-avoid (earlier 7 expired). */
+    atomic_fetch_add(&fake_clock_ms, 11000);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 0);
+
+    /* 7 more timeouts within 10 s (total 8 in 10 s) -> enters read-avoid for 30 s. */
+    for (int i = 0; i < 7; i++) {
+        atomic_fetch_add(&fake_clock_ms, 100);
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+    }
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+
+    /* While in read-avoid, even a 2 s delay on node 1 causes ZERO waits and ZERO reads to node 1. */
+    atomic_store(&F.read_timeout, 0);
+    atomic_store(&F.read_delay_ms[1], 2000);
+    unsigned calls_before = atomic_load(&F.read_calls[1]);
+    uint64_t t0 = mono_ms();
+    for (int i = 0; i < 10; i++) {
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+        CHECK(memcmp(buf, o.bytes, sizeof buf) == 0);
+        CHECK(rep.decoded_cells >= 1);
+    }
+    uint64_t dt = mono_ms() - t0;
+    CHECK(dt < 500);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before);
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1 && st.avoids >= 10 && st.decoded_cells >= 10);
+
+    /* Still in read-avoid at +29 s. */
+    atomic_fetch_add(&fake_clock_ms, 29000);
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+
+    /* At +30.001 s: automatically recovers and resumes direct reads to node 1. */
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_fetch_add(&fake_clock_ms, 1001);
+    CHECK(peer_stat(1, &st) && st.read_avoid == 0);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before + 1);
+
+    /* Short avoid duration (< 10 s window): timeouts arriving during read-avoid are ignored and expiry starts a
+     * fresh window so a single timeout right after expiry cannot immediately re-trigger read-avoid. */
+    chunkpeer_hedge_reset();
+    chunkpeer_test_avoid_ms = 2000;
+    atomic_store(&F.read_delay_ms[1], 35);
+    atomic_store(&F.read_timeout, 1u << 1);
+    for (int i = 0; i < 8; i++) {
+        atomic_fetch_add(&fake_clock_ms, 50);
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    }
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+    atomic_fetch_add(&fake_clock_ms, 2001); /* avoid expired, still < 10 s since earlier timeouts */
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 0);
+    chunkpeer_test_avoid_ms = 0;
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_timeout, 0);
+
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+#endif
+}
+
+/* E31: p_obj_open() while a peer is in read-avoid skips CS_OP_SUMS (no 200 ms FAN_GRACE_MS stall), handles both
+ * rec_sums != NULL and rec_sums == NULL, and resumes direct reads after read-avoid expires. */
+static void test_hedge_open_avoid(void)
+{
+#ifndef TSDB_TEST_HOOKS
+    printf("  test_hedge_open_avoid: SKIPPED (TSDB_TEST_HOOKS=0)\n");
+    return;
+#else
+    char dir[PATH_MAX];
+    cluster_up("hedgeopenav", dir, sizeof dir);
+    atomic_store(&fake_clock_ms, 200000);
+    chunkpeer_test_now_ms = f_now_ms;
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 25);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h0 = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h0) == 0 && h0);
+    uint8_t buf[4096];
+    chunk_report rep;
+
+    /* Drive node 1 into read-avoid. */
+    atomic_store(&F.read_delay_ms[1], 35);
+    atomic_store(&F.read_timeout, 1u << 1);
+    for (int i = 0; i < 8; i++) {
+        atomic_fetch_add(&fake_clock_ms, 100);
+        CHECK(coldops_peer.obj_read(h0, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    }
+    chunkpeer_quiesce();
+    coldops_peer.obj_close(h0);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_timeout, 0);
+    struct chunkpeer_peer_stats st;
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+
+    /* Hang node 1 completely: p_obj_open() MUST skip CS_OP_SUMS on node 1 (completing well below FAN_GRACE_MS=200ms). */
+    atomic_store(&F.hang, 1u << 1);
+    cold_obj *h_rec = NULL, *h_norec = NULL;
+    uint64_t t0 = mono_ms();
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h_rec) == 0 && h_rec);
+    uint64_t dt_rec = mono_ms() - t0;
+    CHECK(dt_rec < 150);
+
+    t0 = mono_ms();
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, NULL, &h_norec) == 0 && h_norec);
+    uint64_t dt_norec = mono_ms() - t0;
+    CHECK(dt_norec < 150);
+
+    /* Both handles decode around node 1 without calling node 1 while avoided. */
+    unsigned calls_before = atomic_load(&F.read_calls[1]);
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(coldops_peer.obj_read(h_norec, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before);
+
+    /* Release hang and expire read-avoid: h_rec (opened with rec_sums != NULL) resumes direct reads to node 1. */
+    pthread_mutex_lock(&F.mu);
+    atomic_store(&F.hang, 0);
+    pthread_cond_broadcast(&F.hcv);
+    pthread_mutex_unlock(&F.mu);
+    atomic_fetch_add(&fake_clock_ms, 30001);
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before + 1);
+    /* Non-RAW on h_rec also works directly (uses o->rec sums). */
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before + 2);
+
+    coldops_peer.obj_close(h_rec);
+    coldops_peer.obj_close(h_norec);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+#endif
+}
+
+/* Regression tests for degrade() isolation (exact decoded_cells attribution, zero nested hedges during degrade()),
+ * failed-hedge short-circuit (no duplicate reads of surviving positions), and per-stripe bad_mask reset. */
+static void test_hedge_degrade_and_stripes(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgedegrade", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+
+    /* 3-stripe object (cell = 64 KiB, k = 4, m = 2 -> 768 KiB total). */
+    obj o;
+    memset(&o, 0, sizeof o);
+    for (int i = 0; i < 16; i++)
+        o.oid[i] = (uint8_t)(26 * 16 + i);
+    uint32_t cell = 64u << 10;
+    uint64_t total_len = 3ull * 4ull * cell;
+    o.bytes = malloc(total_len);
+    for (uint64_t i = 0; i < total_len; i++)
+        o.bytes[i] = (uint8_t)(i % 251 == 0 ? rnd() : i * 11 + 26);
+    CHECK(chunk_geom_make(&o.g, 4, 2, cell, total_len) == 0);
+    o.sums = calloc(chunk_sums_total(&o.g), sizeof *o.sums);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+
+    uint8_t buf[4096];
+    chunk_report rep;
+    struct chunkpeer_peer_stats s1, s2;
+
+    /* 1. pos=0 (node 1) and pos=1 (node 2) both DOWN while reading ONLY pos=0:
+     *    decoded_cells must be attributed solely to node 1 (+1), NOT node 2 (+0). */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, (1u << 1) | (1u << 2));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 1);
+    CHECK(!peer_stat(2, &s2) || s2.decoded_cells == 0);
+
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 2);
+    CHECK(!peer_stat(2, &s2) || s2.decoded_cells == 0);
+
+    /* 2. pos=0 (node 1) DOWN, survivor pos=1 (node 2) SLOW (80 ms):
+     *    degrade() reads pos=1 synchronously -> ZERO nested hedges on node 2 and exact attribution on node 1. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, 1u << 1);
+    atomic_store(&F.read_delay_ms[2], 80);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 1);
+    CHECK(peer_stat(2, &s2) && s2.hedges == 0 && s2.decoded_cells == 0);
+    atomic_store(&F.read_delay_ms[2], 0);
+    atomic_store(&F.down, 0);
+
+    /* 3. Failed hedge does NOT re-read surviving positions a second time in outer degrade(). */
+    chunkpeer_hedge_reset();
+    for (uint32_t n = 1; n <= NM; n++)
+        atomic_store(&F.read_calls[n], 0);
+    atomic_store(&F.read_delay_ms[1], 50);
+    atomic_store(&F.read_timeout, (1u << 1) | (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunkpeer_quiesce();
+    for (uint32_t n = 1; n <= NM; n++)
+        CHECK(atomic_load(&F.read_calls[n]) <= 1);
+
+    /* E15 with failed hedge: primary fails with IOERR (not DOWN) while 2 survivors are DAMAGED -> CORRUPT. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.read_timeout, 0);
+    atomic_store(&F.ioerr, 1u << 1);
+    atomic_store(&F.flip_byte, (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == TSDB_ERR_CORRUPT);
+    chunkpeer_quiesce();
+    atomic_store(&F.ioerr, 0);
+    atomic_store(&F.flip_byte, 0);
+    atomic_store(&F.read_delay_ms[1], 0);
+
+    /* 4. Multi-stripe bad_mask reset: node 2 fails on stripe 0, node 3 fails on stripe 1, node 1 is slow (220 ms)
+     *    on stripe 2 -> bad_mask resets per stripe so stripe 2's hedge succeeds using healthy nodes 2..6. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.fail_cell, cell);
+    atomic_store(&F.read_fail_stripe[2], 0);
+    atomic_store(&F.read_fail_stripe[3], 1);
+    atomic_store(&F.read_delay_ms[1], 220);
+    atomic_store(&F.read_delay_stripe[1], 2);
+    uint8_t *big = malloc(total_len);
+    CHECK(big != NULL);
+    CHECK(coldops_peer.obj_read(h, 0, total_len, big, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(big, o.bytes, total_len) == 0);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &s1) && s1.hedges == 1 && s1.decoded_cells == 1);
+    free(big);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_delay_stripe[1], -1);
+    atomic_store(&F.read_fail_stripe[2], -1);
+    atomic_store(&F.read_fail_stripe[3], -1);
+    atomic_store(&F.fail_cell, 0);
+
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* E11 + E15: rot on a hedge survivor is repaired by whole-cell retry; >m rotted -> CORRUPT; hedge timeout with m
+ * down or m damaged -> UNAVAILABLE, never CORRUPT (kills mutant hedgecorrupt). */
+static void test_hedge_e15_e11(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgee15", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 23);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+    uint8_t buf[4096];
+    chunk_report rep;
+
+    /* E11: node 1 slow (hedged) + node 2 rotted -> RAW hedge produces bad bytes (caught by seam CRC), whole-cell
+     * retry (flags=0) verifies encode-time sums, discards node 2 and decodes exact bytes from nodes 3..6. */
+    atomic_store(&F.read_delay_ms[1], 150);
+    atomic_store(&F.flip_byte, 1u << 2);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) != 0); /* RAW cannot see rot: seam CRC triggers retry */
+    chunkpeer_quiesce();
+    chunkpeer_hedge_reset();
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells >= 1);
+    chunkpeer_quiesce();
+
+    /* E15: m + 1 = 3 positions rotted -> CORRUPT. */
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.flip_byte, (1u << 1) | (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == TSDB_ERR_CORRUPT);
+    atomic_store(&F.flip_byte, 0);
+
+    /* E15: 2 positions down + 1 hedge timeout -> UNAVAILABLE, NEVER CORRUPT (kills hedgecorrupt). */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, (1u << 2) | (1u << 3));
+    atomic_store(&F.read_delay_ms[1], 45);
+    atomic_store(&F.read_timeout, 1u << 1);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunkpeer_quiesce();
+
+    /* E15: 2 positions damaged + 1 hedge timeout -> UNAVAILABLE (3 good + 1 down = 4 >= k), NEVER CORRUPT. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, 0);
+    atomic_store(&F.flip_byte, (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunkpeer_quiesce();
+
+    atomic_store(&F.flip_byte, 0);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_timeout, 0);
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
+/* Concurrent hedged readers + read-avoid transitions + late replies dropped (TSan stress). */
+static cold_obj *HOBJ;
+static atomic_bool stop_hreaders;
+static void *hreader(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+    uint8_t buf[4096];
+    for (int i = 0; !atomic_load(&stop_hreaders) || i < 4; i++) {
+        uint64_t off = (uint64_t)((i + id) % RO.g.k) * RO.g.cell;
+        chunk_report rep;
+        int rc = coldops_peer.obj_read(HOBJ, off, sizeof buf, buf, (i & 3) == 0 ? 0 : CHUNK_RR_RAW, &rep);
+        CHECK(rc == 0);
+        if (rc == 0)
+            CHECK(memcmp(buf, RO.bytes + off, sizeof buf) == 0);
+    }
+    return NULL;
+}
+
+static void test_hedge_threads(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgethreads", dir, sizeof dir);
+#ifdef TSDB_TEST_HOOKS
+    atomic_store(&fake_clock_ms, 500000);
+    chunkpeer_test_now_ms = f_now_ms;
+#endif
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj_make(&RO, 1u << 20, 24);
+    CHECK(put(ctx, &RO, 5) == 0);
+    CHECK(coldops_peer.obj_open(ctx, RO.oid, &RO.g, RO.sums, &HOBJ) == 0 && HOBJ);
+    atomic_store(&stop_hreaders, false);
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++)
+        pthread_create(&th[i], NULL, hreader, (void *)(intptr_t)i);
+    atomic_store(&F.read_delay_ms[1], 45);
+    for (int k = 0; k < 10; k++) {
+        struct timespec ts = {0, 25 * 1000000L};
+        nanosleep(&ts, NULL);
+#ifdef TSDB_TEST_HOOKS
+        atomic_fetch_add(&fake_clock_ms, 500);
+#endif
+    }
+    atomic_store(&F.read_delay_ms[1], 0);
+#ifdef TSDB_TEST_HOOKS
+    atomic_fetch_add(&fake_clock_ms, 31000);
+#endif
+    struct timespec ts = {0, 50 * 1000000L};
+    nanosleep(&ts, NULL);
+    atomic_store(&stop_hreaders, true);
+    for (int i = 0; i < 4; i++)
+        pthread_join(th[i], NULL);
+    coldops_peer.obj_close(HOBJ);
+    HOBJ = NULL;
+    obj_free(&RO);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
 int main(int argc, char **argv)
 {
     const char *base = "/tmp";
@@ -648,6 +1252,13 @@ int main(int argc, char **argv)
     test_hang();
     test_list();
     test_threads();
+    test_hedge_timer();
+    test_hedge_bucket();
+    test_hedge_avoid();
+    test_hedge_open_avoid();
+    test_hedge_degrade_and_stripes();
+    test_hedge_e15_e11();
+    test_hedge_threads();
     char cmd[PATH_MAX + 16];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", S);
     if (system(cmd) != 0)
