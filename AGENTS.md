@@ -558,7 +558,7 @@ cgroup, so `nice` does not keep your work out of its way.
 - `server/chunksrv.[ch]`, `server/chunksrv_cluster.c` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on
   every cluster member with kinds `PL_KIND_CHUNK` (6, requests and answers, worked by 4 FIFO workers) and `PL_KIND_CHUNKB`
   (7, puts as bulk files under `--chunk-rate-mb-s`; the link's callbacks only queue, a put thread per peer does the store
-  I/O (peerlink.h:24-26), and the queue is bounded per peer at 16 MiB). Every request raises the volume's fence first
+  I/O (peerlink.h:24-26), and the put queue is bounded per peer at 16 MiB, with a 32 MiB shared request queue). Every request raises the volume's fence first
   (E14); an unsure store is raised only from `chunksrv_epoch_source` (`chunkpeer_epoch_source`, D9), and then to
   max(source, backend fence, every sure store's epoch), never from a request. LIST pages never split the copies of one
   (oid, pos). `chunksrv_cluster.c` opens `--chunk-dir` stores at start (`flock`, META checked against cluster UUID and
@@ -584,7 +584,7 @@ cgroup, so `nice` does not keep your work out of its way.
   xxh64 records, torn tail cut after `tail_confirm`, damage fails open, `fdatasync` + `eng_sync_dir` on first record
   before `db->diverged` is visible, fail-stop on write/sync error), read by `ecdiverge_open` before any engine thread
   starts. `tsdb DIR volume diverged [--clear]` prints or clears it (refused with `TSDB_ERR_LOCKED` while open, and with
-  `TSDB_ERR_INVALID` on cluster volumes `META_REQ_CLUSTER` until R4 rebuild). In `server/tsdbd.c`, one path
+  `TSDB_ERR_INVALID` on cluster volumes `META_REQ_CLUSTER`; use `tsdb cluster replica reset` to rebuild the replica instead). In `server/tsdbd.c`, one path
   `vol_diverged()` (`tsdb_volume_diverged` OR `dom.vol[v].diverged`), checked first in `vol_health`, drives `STATUS`,
   `UNAVAILABLE` (`TSDB_WHY_DIVERGED`, 60 s retry), `TOPOLOGY` and `tsdb_volume_diverged` metric (root volume included);
   `server/repld.c` stops a diverged replicated volume (`vol_fail`, leaves ISR, leader deposed) and `server/cvol.c`
@@ -931,12 +931,15 @@ cgroup, so `nice` does not keep your work out of its way.
     `settled_` files in an unarmed `digest_<key>_<z>` job file, `ecdigest_apply` arms it (`ECDJ_ARMED`, superseding
     earlier unarmed jobs of the key below `z` as `ECDJ_SUPERSEDED`), and `eckeep`'s thread verifies granule checksums
     and digests: a match writes `ECDJ_MATCHED` before release at `settle_keep_s` (unlink + `eng_sync_dir`, job file
-    removed after its last copy); a copy whose checksums fail (or is missing without `ECDJ_MATCHED`) while the object
-    matches its record is **D25 rot** (`ECKEEP_ROT`: logged, `eckeep_copies_lost++`, `.ec` served, released at deadline);
-    a mismatch with intact checksums triggers durable `DIVERGED` (`ec_diverge`, `src/ecdiverge.[ch]`): `DIVERGED` file is
-    synced before `db->diverged` is set, read at every open so restarts keep refusing the volume (`TSDB_ERR_UNAVAILABLE`,
-    `LOCAL_FAULT` in cluster heartbeats, `tsdb_volume_diverged` = 1), until `tsdb DIR volume diverged --clear` (refused
-    on cluster volumes until R4 rebuild, D23). `tests/test_ecdigest.c` (mutants `digestbytes digestnotomb
+    removed after its last copy). For **D25 rot** (`ECKEEP_ROT`: logged, `eckeep_copies_lost++`, `.ec` served, released
+    at deadline), leader/single-server byte-digest checks (`digest_part`) trigger it when the chunk object matches its
+    record while the kept `settled_` copy fails its checksums, whereas replica `MK_DIGEST` jobs (`ecdigest_job_check`)
+    verify the retired copies' checksums against `MK_DIGEST` without re-reading the chunk object (failing checksums or a
+    missing copy without `ECDJ_MATCHED` -> `ECKEEP_ROT`). A digest mismatch (or unreadable rows) with intact checksums
+    triggers durable `DIVERGED` (`ec_diverge`, `src/ecdiverge.[ch]`): `DIVERGED` file is synced before `db->diverged` is
+    set, read at every open so restarts keep refusing the volume (`TSDB_ERR_UNAVAILABLE`, `LOCAL_FAULT` in cluster
+    heartbeats, `tsdb_volume_diverged` = 1), until `tsdb DIR volume diverged --clear` (refused on cluster volumes, D23;
+    use `tsdb cluster replica reset` to rebuild the replica instead). `tests/test_ecdigest.c` (mutants `digestbytes digestnotomb
     digestnoretention digestbelowtrue digestnots digestfreezerows digestlocalbelow`), `test_ecapply --case digest|digestpower`
     (mutants `digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove
     digestjobnosync`), `test_keep` (mutants `divergemem clearcluster releasenosync rotdiverges`).
@@ -949,7 +952,8 @@ cgroup, so `nice` does not keep your work out of its way.
     across an encode, a put or a chunk delete.
   - **Refused where unbuilt**: parts without granules and v8 parts are never settled (a settle must also never take a
     part `rewrite_alone` would still take, `src/ecskip.h`: single-server `settleable` checks it only through
-    `merge_selectable`, while cluster `ec_cluster` explicitly requires `p->level > 0`, D18); a non-leader replica, a
+    `merge_selectable`, while the cluster branch of `ecpolicy_pick_locked` (`db->ec_cluster`) and `eng_settle` explicitly
+    require `p->level > 0`, D18); a non-leader replica, a
     follower (a running one that meets an `.ec` name fails its engine with one line), a build without `TSDB_EC` and a
     tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only
     for single servers until R15; cluster EC volumes require no test variable and attach `coldops_peer` via
@@ -958,7 +962,7 @@ cgroup, so `nice` does not keep your work out of its way.
     `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says
     `requires=tier` is then refused at open.
   - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); on a single
-    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ec_objects_max` or `> 10%` tombstones);
+    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones);
     cluster re-encode and redundancy conversion (`MK_UNSETTLE`, §6.4) stay with R10. Answers do not change
     (`tests/test_settle_oracle.c`).
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

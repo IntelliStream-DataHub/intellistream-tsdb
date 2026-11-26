@@ -309,15 +309,16 @@ bytes are stored and nothing else: same rows, same rank, same key. Step by step:
   leader's order with `Y` above them (`ppos = Z`), each `.ec` record's `min_block`, `max_block`, and `source` are
   rewritten to match (D5), and own parts with `ppos <= Z` are retired as `settled_<own part>` (D6). Any own part
   with `ppos > Z` or no PPOS record stops the apply and writes durable `DIVERGED` (`src/ecdiverge.[ch]`, D8: synced
-  before `db->diverged` is visible, `LOCAL_FAULT` in cluster heartbeats, refused until R4 rebuild; `--clear` refused
-  on cluster volumes, D23).
+  before `db->diverged` is visible, `LOCAL_FAULT` in cluster heartbeats; `--clear` is refused on cluster volumes, D23 —
+  use `tsdb cluster replica reset` to rebuild the replica instead).
 - **Step 7 (`src/ecdigest.c`, `src/eckeep.c`; E26, D7, D25):** The leader computes `ec_logical_digest` of `I ∪ Y` under
   `ret_lock` and appends `MK_DIGEST` (`now_ms`, `MKD_TOMBS`, canonical per-series tombstone union clipped to
   `[max(cutoff, key start), key end)` when `MKD_TOMBS` is set). Replicas bind retired copies in `digest_<key>_<z>` at
   COLD apply, arm them at `MK_DIGEST`, and release them after `settle_keep_s` once `ECDJ_MATCHED` is durable (unlink +
-  `eng_sync_dir`); checksum rot on a kept copy whose object matches (`ECKEEP_ROT`) logs, counts `eckeep_copies_lost`,
-  and serves the `.ec`, while a mismatch with intact checksums raises durable `DIVERGED`. Leader `settled_` files keep
-  R7's byte digest.
+  `eng_sync_dir`); checksum rot or a missing copy without `ECDJ_MATCHED` (`ECKEEP_ROT`) logs, counts
+  `eckeep_copies_lost`, and serves the `.ec` without re-reading the chunk object, while a mismatch (or unreadable rows)
+  with intact checksums raises durable `DIVERGED`. Leader `settled_` files keep R7's byte digest (D25 rot there checks
+  object == record and copy checksums).
 - **Chunk GC (`src/ecgc.c`, `src/ecgcmk.c`; E14, D13):** Cluster deletes go only through committed `MK_GC` (`MK_GC_RETIRED`
   after `obsolete_part_lifetime_s` with zero `part_open_ec` O(1) holds; `MK_GC_ORPHAN` meeting E14's four conditions
   when `gc_suspended` is false) and durable `GCMK` files on every member (`MK_GC_DONE` clears after `CHUNK_DEL` answers).
@@ -945,9 +946,9 @@ Track-days as in design-ha-modes.md §7 (build, review and fix rounds); gate hou
 
 *(2026-11-22: R7 as built leaves the replicated half to R8 (+3 track-days) and re-encode to R10 (+1.5). 2026-11-26: R8-1 (~24 track-days across 14 tracks + reviews) is done and R8-2 (4.5 track-days) is mostly done; D24 moved +5-6 track-days to R9, +1 to R13, and +3 to R15. Gate hours are unchanged.)*
 
-R5-R15: **~70-85 track-days** total (43-56 before the R8 scope and D24 split, of which R5, R6, R7, R8-1, most of R8-2, and single-server R10 are done; ~30-40 remaining across R8-2's hedging, R9, R12, R13, R14, R15, R10 cluster conversion, and R11), 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
+R5-R15: **~71-84 track-days** total (43-56 before the R8 scope and D24 split, of which R5, R6, R7, R8-1, most of R8-2, and single-server R10 are done; ~34-42 remaining across R8-2's hedging, R9, R12, R13, R14, R15, R10 cluster conversion, and R11), 84 gate hours (R11 is 1-2 since the guide moved to P5; *2026-11-11*: R13 6-8 and 16
 instead of 2-3 and 6, R15 5-6 and 10, E56; it was 30-40 and 64). P1-P6: **14-21 track-days**,
-117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: ~97-126 track-days (70-97 before R8-1/D24 scoping; ~44-61 remaining after R8-1) and 244 gate
+117 gate hours (P6 +2, *2026-11-11*). **Total for 0.11.0, with the prerequisites: ~98-125 track-days (70-97 before R8-1/D24 scoping; ~48-63 remaining after R8-1) and 244 gate
 hours (about 10.2 machine-days, 3 of them the soak) before reruns after fixes** (*2026-11-11*, with device classes as
 revised after review; it was 57-81 and 222) (2026-11-09, after the user's answers; it was 44-60
 track-days and 107 gate hours with R10 as the first cut and the cluster data a preview, and 59-84 and 226 in the

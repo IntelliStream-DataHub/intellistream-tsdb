@@ -9,14 +9,16 @@ visible, read at every open). `tsdb_volume_diverged` (`src/cvol.h`, `src/volumes
 reporting path `vol_diverged()` (`server/tsdbd.c`) feeds `STATUS`, `UNAVAILABLE` (`TSDB_WHY_DIVERGED`, 60 s retry),
 `TOPOLOGY`, and `tsdb_volume_diverged` metric for all volumes including root, while `server/repld.c` stops a diverged
 replicated volume (`vol_fail`) and `server/cvol.c` reports `CL_HEALTH_LOCAL_FAULT`. `tsdb DIR volume diverged [--clear]`
-inspects/clears it (refused on cluster volumes per D23 until R4's replica rebuild).
+inspects/clears it (refused on cluster volumes per D23; use `tsdb cluster replica reset` to rebuild the replica instead).
 
 ## Rot in the kept copy refuses the whole volume — Closed in R8-1 (`r8j-digest`, D25)
 
-In `src/eckeep.c` (cluster `MK_DIGEST` jobs and single-server `settled_` checks), when the object matches its record
-but the kept `settled_` copy fails its own granule checksums or cannot be opened as a part, the copy is counted lost
-(`ECKEEP_ROT`, `eckeep_copies_lost++`), logged, released at its deadline, and the `.ec` part keeps serving. Only a
-mismatch whose checksums hold sets `DIVERGED`.
+In `src/eckeep.c`, single-server and leader byte-digest checks (`digest_part`) trigger D25 rot when the chunk object
+matches its record while the kept `settled_` copy fails its own granule checksums, whereas replica `MK_DIGEST` jobs
+(`ecdigest_job_check`) verify the retired copies' checksums against `MK_DIGEST` without re-reading the chunk object
+(corrupt or missing copies without `ECDJ_MATCHED` -> `ECKEEP_ROT`). In both paths the rotted copy is counted lost
+(`eckeep_copies_lost++`), logged, released at its deadline, and the `.ec` part keeps serving; only a digest mismatch
+(or unreadable rows) whose checksums hold sets `DIVERGED`.
 
 ## Settles go on on a DIVERGED volume — Closed for clusters in R8-1 (`r8g-cut`, `src/ecpolicy.c:223-224`)
 

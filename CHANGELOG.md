@@ -25,10 +25,10 @@ orphan chunks by committed markers, and persist divergence across restarts:
   `test_eccold`, `test_ecapply`).
 - **Logical digest & copy-rot tolerance (E26, D25).** After the swap, the leader computes a logical digest of the visible
   rows (under the retention cutoff at `now_ms`, plus a canonical tombstone union when parts lie below) and appends
-  `MK_DIGEST` (13, `MK_TYPE_LAST`; 14-15 reserved for R10). Replicas verify their `settled_*` copies against `MK_DIGEST`
-  before releasing them at `--ec-settle-keep-s` (syncing the directory after unlink); rot in a kept `settled_*` file
-  whose `.ec` object matches its record logs and counts the copy lost while continuing to serve the `.ec` part
-  (`test_ecdigest`, `test_keep`).
+  `MK_DIGEST` (13, `MK_TYPE_LAST`; 14-15 reserved for R10). Replicas verify their `settled_*` copies' checksums and
+  logical digest against `MK_DIGEST` before releasing them at `--ec-settle-keep-s` (syncing the directory after unlink);
+  checksum rot in a kept `settled_*` copy (and on single-server/leader byte-digest checks, when the `.ec` object matches
+  its record) logs and counts the copy lost while continuing to serve the `.ec` part (`test_ecdigest`, `test_keep`).
 - **Epoch fencing & cluster chunk GC (`MK_GC`).** Chunk epochs follow the volume's metadata epoch (leaders pin their
   own `lead_epoch`, and unsure stores are raised only from a caught-up metadata copy). Direct chunk deletes and open
   sweeps are disabled on cluster EC volumes; chunks are deleted only after a committed `MK_GC` (12) marker recorded in
@@ -38,11 +38,12 @@ orphan chunks by committed markers, and persist divergence across restarts:
 - **Durable `DIVERGED` (`tsdb DIR volume diverged`).** Divergence from a failed digest or a cold-apply part above `Z` is
   written to a checksummed `DIVERGED` file before taking effect, survives restarts, stops replicated volumes (`LOCAL_FAULT`
   in heartbeats, `TSDB_WHY_DIVERGED` in `STATUS`/`TOPOLOGY`/`UNAVAILABLE`, `tsdb_volume_diverged` metric), and refuses
-  `--clear` on cluster volumes until R4 replica rebuild (`test_diverge`, `test_cluster diverged`, `fuzz_diverge`).
+  `--clear` on cluster volumes (use `tsdb cluster replica reset` to rebuild the replica instead; `test_diverge`,
+  `test_cluster diverged`, `fuzz_diverge`).
 - **Sequential granule cache prefetch & 22-node `16+4` testing (`r8p-prefetch`, `r8q-geom`).** Sequential misses in the
   EC granule cache read ahead 4 to 32 granules within a quarter of the cache budget (`test_seam`). `test_cluster ec16`
   and `jepsen_cluster --ec 4+2|16+4` (`partial`, `diskloss`, `rot`, live per-replica reads) verify both geometries.
-- **Single-server re-encode (`r10-reencode`).** Single-server tiers automatically combine keys exceeding `ec_objects_max`
+- **Single-server re-encode (`r10-reencode`).** Single-server tiers automatically combine keys exceeding `ecpolicy_objects_max`
   (4) objects or >10% hidden tombstone rows into one `.ec` part via intent v4 (`test_settle`, `test_ecswap`).
 
 **The cluster's metadata snapshot is now version 5 (R4: replica set changes).** A volume's record has a replica set

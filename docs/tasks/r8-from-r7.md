@@ -21,8 +21,9 @@ describes what is now built; below is the status of each R8 item.
 
 1. **Done (R8-1, `src/ppos.[ch]`): `ppos` and its durable home.** Checksummed, append-only per-volume `PPOS` sidecar
    (32-byte offset-seeded xxh64 records, torn tail cut, compacted at open) fed at all three memtable append sites via
-   a per-memtable `base_partition -> highest fno` map (`eng_ppos_note`), `jr_part_pos` on `COMMIT`, max over inputs on
-   merge (`src/merge.c`), and `Z` on settle. `PPOS_UNKNOWN` = `UINT64_MAX`. `.ec` record format v2 carries `ppos` and
+   a per-memtable `base_partition -> highest fno` map (`eng_ppos_rows` / `ppos_note`), `jr_part_pos` on `COMMIT`, max over inputs on
+   merge (`src/merge.c`), and `Z` on settle. `PPOS_UNKNOWN` = `UINT64_MAX`. `.ec` record format v1 (`EC_RECORD_VERSION` = 1,
+   unchanged; `record_valid` admits non-zero `ppos` and `stripe_version` on cluster EC volumes) carries `ppos` and
    `stripe_version`; `positions` (degraded settle mask) remains reserved for **R9**.
 2. **Done (R8-1, `src/eccold.[ch]`): the gate and the cut.** `lw_enter` takes `jr_serial` (FIFO ticket lock) + key-range
    fence over `MK_BUCKETS`, rotates/flushes overlapping memtable (`F`), waits for commit point past `L` (`eng_leader_wait`),
@@ -40,7 +41,8 @@ describes what is now built; below is the status of each R8 item.
 7. **Done (R8-1, `src/ecdiverge.[ch]`, `src/ecapply.c`, `server/tsdbd.c`, `server/repld.c`, `server/cvol.c`):** a replica
    part above `Z` (or missing `PPOS`) stops apply and writes durable `DIVERGED`, causing `tsdbd`/`repld` to fail the
    replica (`vol_fail`, leave ISR, `LOCAL_FAULT` heartbeat, `TSDB_WHY_DIVERGED`, `tsdb_volume_diverged`). `tsdb DIR
-   volume diverged --clear` refuses on cluster volumes (D23) until R4 rebuild replaces the member. Reverse intent (D5:
+   volume diverged --clear` is refused on cluster volumes (D23; use `tsdb cluster replica reset` to rebuild the replica
+   instead). Reverse intent (D5:
    swapping `settled_` back) moved to **R15** (D24).
 8. **Done (R8-1, `server/chunksrv.[ch]`, `server/chunkpeer.[ch]`):** leader writes stripe chunks to all positions over
    `PL_KIND_CHUNK`/`CHUNKB` and commits `MK_COLD`; members read through `coldops_peer` (`k' + 200 ms` grace). Degraded
@@ -87,8 +89,9 @@ runs `ycold`, `ecabovey`, `cutnogate`).
   at `tsdb chunk-store init` and verify META at open (`server/chunksrv_cluster.c`); single-server tier store META with
   `db_id` moves to **R15**.
 - **Moved to R9 (D24):** `eccache_reopen` call after a heal in `tsdbd` (`r7-seam #3`).
-- **Open (unit test) / Done (cluster):** `route_decide` with a diverged volume is covered by `test_cluster diverged` and
-  `jepsen-cluster-ec`; `tsdb_query_multi` over settled parts has no standalone seam test outside `test_settle_oracle`.
+- **Done (R8-1 / `r8p-prefetch`):** `route_decide` with a diverged volume is covered by `test_cluster diverged` and
+  `jepsen-cluster-ec`; `tsdb_query_multi` over settled parts has a standalone seam test (`tests/test_seam.c` `case_multi`,
+  added in `r8p-prefetch`).
 - **Done (R8-1):** `test_cluster` move/transfer of a settled EC volume (`test_cluster ecbasic|ec16`, `jepsen-cluster-ec`
   `VOLUME_TRANSFER`) and `MK_GC` coordination across leader drops/purges (`r8k-gc`, `test_ecgc`, `test_cluster ecgc`).
 
@@ -134,9 +137,11 @@ Harness and engine:
   (`ORACLE_PLAN=0` turns it off): decide which counters are the contract once settled parts read through the seam.
 - `-Wrestrict` false positives at -O1 in `tests/test_settle.c` `fresh()` and `tests/test_settle_oracle.c`.
 - A damaged `retired_*.ec` record fails the open with a line (r7-gc F6): decide whether that should refuse or log.
-- Single-server `settleable()` (`src/ecpolicy.c:293-308`) refuses v8 headers but not insert-written parts: it relies on
+- Single-server `settleable()` (`src/ecpolicy.c:147-151`, called from the single-server branches of `ecpolicy_pick_locked`
+  at `src/ecpolicy.c:293-308`) refuses v8 headers but not insert-written parts: it relies on
   `merge_selectable`, which is false with `merge_threads` 0, so then an insert-written part can settle on a single
-  server, against the rule of `src/ecskip.h` (cluster `ec_cluster` explicitly checks `p->level > 0`, D18). Layout only;
+  server, against the rule of `src/ecskip.h` (the cluster branch of `ecpolicy_pick_locked` (`db->ec_cluster`) and
+  `eng_settle` explicitly require `p->level > 0`, D18). Layout only;
   check `insert_written` in single-server `settleable`.
 - r7-jepsen's REPORT names a TSan report in `test_replica` (`replica.c`, `wal_off` read without its lock). Not confirmed
   fixed here (224fc8d, `ld_last` under `buf_lock`, may be the fix): rerun `make tsan TEST_TARGET=test-meta`'s replica
