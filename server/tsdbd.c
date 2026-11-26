@@ -397,20 +397,21 @@ static ev wake_ev = {EV_WAKE, NULL}, tick_ev = {EV_TICK, NULL};
 static conn *conns;
 static size_t nconns, max_conns = 10000;
 
-/* work queue: requests ready to run */
-static _Alignas(64) pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
-static req *work_head, *work_tail;
-static bool work_stop;
-
-/* A worker streaming to a client that does not read waits for output space.
- * Enough such clients would hold every worker and stop the server for
- * everyone else, so a worker about to wait while no other is free starts an
- * extra one (they leave again when the queue is empty), and a client that
- * reads nothing for send_timeout_s loses its connection. Under work_lock. */
+/* work queue: requests ready to run. Padded to whole 64-byte cache lines so unrelated statics cannot share its lines.
+ * A worker streaming to a client that does not read waits for output space. Enough such clients would hold every worker
+ * and stop the server for everyone else, so a worker about to wait while no other is free starts an extra one (they
+ * leave again when the queue is empty), and a client that reads nothing for send_timeout_s loses its connection.
+ * All fields below are under workq.lock. */
 #define MAX_EXTRA_WORKERS 256
-static int base_workers, running_workers, waiting_workers;
-static pthread_cond_t workers_gone_cv = PTHREAD_COND_INITIALIZER;
+static struct {
+    _Alignas(64) pthread_mutex_t lock;
+    req *head, *tail;
+    bool stop;
+    int base_workers, running_workers, waiting_workers;
+    pthread_cond_t cv;
+    pthread_cond_t gone_cv;
+} workq = {.lock = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .gone_cv = PTHREAD_COND_INITIALIZER};
+_Static_assert(sizeof(workq) % 64 == 0, "workq must fill whole cache lines");
 static int send_timeout_s = 60;
 /* A client has to read this many bytes a second of what the server has for it (averaged over --send-timeout), or
  * its connection is closed: 16 KB/s lets a 100 MB reply take under two hours, and holds a worker no longer. */
@@ -423,48 +424,54 @@ static size_t req_budget = (size_t)1024 << 20; /* at least; main raises it to an
 static int frame_timeout_s = 60;
 static pid_t start_ppid; /* --exit-with-parent: the parent at start; 0 without the flag */
 static int login_timeout_s = 10; /* --login-timeout */
-static _Alignas(64) atomic_size_t req_held;
+static struct {
+    _Alignas(64) atomic_size_t held;
+} req_mem;
+_Static_assert(sizeof(req_mem) == 64, "req_mem must occupy its own cache line");
 
 static size_t request_memory_now(void)
 {
-    return atomic_load_explicit(&req_held, memory_order_relaxed);
+    return atomic_load_explicit(&req_mem.held, memory_order_relaxed);
 }
 
 static void req_free(req *r)
 {
-    atomic_fetch_sub(&req_held, REQ_COST(r));
+    atomic_fetch_sub(&req_mem.held, REQ_COST(r));
     free(r->payload);
     free(r);
 }
 
-/* Packed inserts decompress to up to a frame's worth of arrays from a few kilobytes: counted in req_held with the
+/* Packed inserts decompress to up to a frame's worth of arrays from a few kilobytes: counted in req_mem.held with the
  * requests (so the server also reads less meanwhile) and waiting while the total would exceed the limit. One always
  * may when no other is decompressing, so this never waits on itself: the peak is the limit plus one insert. */
-static _Alignas(64) pthread_mutex_t inflate_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t inflate_cv = PTHREAD_COND_INITIALIZER;
-static size_t inflate_held, inflate_waiters;
+static struct {
+    _Alignas(64) pthread_mutex_t lock;
+    size_t held, waiters;
+    pthread_cond_t cv;
+} inflate_st = {.lock = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+_Static_assert(sizeof(inflate_st) % 64 == 0, "inflate_st must fill whole cache lines");
 
 static void inflate_acquire(size_t n)
 {
-    pthread_mutex_lock(&inflate_lock);
-    while (inflate_held && atomic_load_explicit(&req_held, memory_order_relaxed) + n > req_budget) {
-        inflate_waiters++;
-        pthread_cond_wait(&inflate_cv, &inflate_lock);
-        inflate_waiters--;
+    pthread_mutex_lock(&inflate_st.lock);
+    while (inflate_st.held && atomic_load_explicit(&req_mem.held, memory_order_relaxed) + n > req_budget) {
+        inflate_st.waiters++;
+        pthread_cond_wait(&inflate_st.cv, &inflate_st.lock);
+        inflate_st.waiters--;
     }
-    inflate_held += n;
-    atomic_fetch_add_explicit(&req_held, n, memory_order_relaxed);
-    pthread_mutex_unlock(&inflate_lock);
+    inflate_st.held += n;
+    atomic_fetch_add_explicit(&req_mem.held, n, memory_order_relaxed);
+    pthread_mutex_unlock(&inflate_st.lock);
 }
 
 static void inflate_release(size_t n)
 {
-    pthread_mutex_lock(&inflate_lock);
-    inflate_held -= n;
-    atomic_fetch_sub_explicit(&req_held, n, memory_order_relaxed);
-    if (inflate_waiters)
-        pthread_cond_broadcast(&inflate_cv);
-    pthread_mutex_unlock(&inflate_lock);
+    pthread_mutex_lock(&inflate_st.lock);
+    inflate_st.held -= n;
+    atomic_fetch_sub_explicit(&req_mem.held, n, memory_order_relaxed);
+    if (inflate_st.waiters)
+        pthread_cond_broadcast(&inflate_st.cv);
+    pthread_mutex_unlock(&inflate_st.lock);
 }
 
 /* Per-worker reusable scratch: zstd decompression context and capped grow-only buffers for insert_packed, plus the
@@ -472,7 +479,11 @@ static void inflate_release(size_t n)
  * pthread_key destructor / atexit for any other thread, such as fuzz_frames' main thread) so LSan reports zero leaks. */
 #define PACK_RAW_KEEP ((size_t)4 << 20)
 #define PACK_ARR_KEEP ((size_t)4 << 20)
-static _Alignas(64) size_t pack_raw_keep = PACK_RAW_KEEP, pack_arr_keep = PACK_ARR_KEEP;
+static struct {
+    _Alignas(64) size_t raw;
+    size_t arr;
+} pack_keep = {.raw = PACK_RAW_KEEP, .arr = PACK_ARR_KEEP};
+_Static_assert(sizeof(pack_keep) == 64, "pack_keep must occupy its own cache line");
 
 typedef struct worker_scratch {
     ZSTD_DCtx *dctx;
@@ -578,12 +589,12 @@ static void worker_waits(int delta)
         fwd_pool_waits(delta);
         return;
     }
-    pthread_mutex_lock(&work_lock);
-    waiting_workers += delta;
-    if (delta < 0 && running_workers > base_workers && running_workers - waiting_workers > 1)
-        pthread_cond_broadcast(&work_cv); /* an idle extra may leave now that this one is free */
-    if (delta > 0 && running_workers == waiting_workers && running_workers < base_workers + MAX_EXTRA_WORKERS &&
-        !work_stop) {
+    pthread_mutex_lock(&workq.lock);
+    workq.waiting_workers += delta;
+    if (delta < 0 && workq.running_workers > workq.base_workers && workq.running_workers - workq.waiting_workers > 1)
+        pthread_cond_broadcast(&workq.cv); /* an idle extra may leave now that this one is free */
+    if (delta > 0 && workq.running_workers == workq.waiting_workers &&
+        workq.running_workers < workq.base_workers + MAX_EXTRA_WORKERS && !workq.stop) {
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
@@ -592,10 +603,10 @@ static void worker_waits(int delta)
 #endif
         pthread_t t;
         if (pthread_create(&t, &at, worker_main, (void *)1) == 0)
-            running_workers++;
+            workq.running_workers++;
         pthread_attr_destroy(&at);
     }
-    pthread_mutex_unlock(&work_lock);
+    pthread_mutex_unlock(&workq.lock);
 }
 
 /* A small write waiting for a large write's publish (tsdb_set_write_wait_hook) holds its worker as long as that
@@ -911,12 +922,18 @@ static void hold_large(void *arg)
 
 /* events from workers to the main thread */
 /* Workers' notes to the main thread, a lock-free stack (each connection has its two notes; see notify). */
-static _Alignas(64) _Atomic(note *) note_top;
-static _Alignas(64) pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER; /* new_fds */
+static struct {
+    _Alignas(64) _Atomic(note *) top;
+} note_stack;
+_Static_assert(sizeof(note_stack) == 64, "note_stack must occupy its own cache line");
 
 /* connections the accept thread took, for the main thread to set up */
-static int *new_fds;
-static size_t nnew, new_cap;
+static struct {
+    _Alignas(64) pthread_mutex_t lock;
+    int *fds;
+    size_t n, cap;
+} new_conns = {.lock = PTHREAD_MUTEX_INITIALIZER};
+_Static_assert(sizeof(new_conns) % 64 == 0, "new_conns must fill whole cache lines");
 
 /* With many connections of short requests the workers met on a lock here for every reply, and the main thread spent
  * a quarter of its time waking the ones that waited for it; so the notes are a lock-free stack (Treiber), which the
@@ -930,10 +947,11 @@ static void notify(conn *c, bool done)
     if (!done && atomic_exchange(&c->out_queued, true))
         return;
     note *n = done ? &c->n_done : &c->n_out;
-    note *top = atomic_load_explicit(&note_top, memory_order_relaxed);
+    note *top = atomic_load_explicit(&note_stack.top, memory_order_relaxed);
     do
         n->next = top;
-    while (!atomic_compare_exchange_weak_explicit(&note_top, &top, n, memory_order_release, memory_order_relaxed));
+    while (!atomic_compare_exchange_weak_explicit(&note_stack.top, &top, n, memory_order_release,
+                                                  memory_order_relaxed));
     /* Whoever pushes onto an empty stack writes the eventfd; the main thread reads the eventfd before it takes the
      * stack, so a note pushed onto one not yet taken is seen without a write (a syscall saved per reply while the
      * main thread is busy). */
@@ -1636,10 +1654,10 @@ static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb
     size_t vals_need = (size_t)n * w + (size_t)n / 8 + 9; /* values, then the bitmap */
     size_t ser_need = many ? (size_t)n * 8 + 8 : 0;
     bool raw_tmp = false, ts_tmp = false, vals_tmp = false, ser_tmp = false;
-    uint8_t *raw = pack_buf_get(&ws->pack_raw, &ws->pack_raw_cap, raw_need, pack_raw_keep, &raw_tmp);
-    int64_t *ts = pack_buf_get(&ws->pack_ts, &ws->pack_ts_cap, ts_need, pack_arr_keep, &ts_tmp);
-    uint8_t *vals = pack_buf_get(&ws->pack_vals, &ws->pack_vals_cap, vals_need, pack_arr_keep, &vals_tmp);
-    tsdb_sid *series = many ? pack_buf_get(&ws->pack_series, &ws->pack_series_cap, ser_need, pack_arr_keep, &ser_tmp)
+    uint8_t *raw = pack_buf_get(&ws->pack_raw, &ws->pack_raw_cap, raw_need, pack_keep.raw, &raw_tmp);
+    int64_t *ts = pack_buf_get(&ws->pack_ts, &ws->pack_ts_cap, ts_need, pack_keep.arr, &ts_tmp);
+    uint8_t *vals = pack_buf_get(&ws->pack_vals, &ws->pack_vals_cap, vals_need, pack_keep.arr, &vals_tmp);
+    tsdb_sid *series = many ? pack_buf_get(&ws->pack_series, &ws->pack_series_cap, ser_need, pack_keep.arr, &ser_tmp)
                             : NULL;
     int rc = !raw || !ts || !vals || (many && !series) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
@@ -1952,11 +1970,11 @@ static void multi_on_wait(void *ctx, int delta)
 static int multi_budget_take(void *ctx, size_t n)
 {
     (void)ctx;
-    size_t cur = atomic_load_explicit(&req_held, memory_order_relaxed);
+    size_t cur = atomic_load_explicit(&req_mem.held, memory_order_relaxed);
     do {
         if (cur + n > req_budget)
             return 1;
-    } while (!atomic_compare_exchange_weak_explicit(&req_held, &cur, cur + n, memory_order_relaxed,
+    } while (!atomic_compare_exchange_weak_explicit(&req_mem.held, &cur, cur + n, memory_order_relaxed,
                                                     memory_order_relaxed));
     return 0;
 }
@@ -1964,7 +1982,7 @@ static int multi_budget_take(void *ctx, size_t n)
 static void multi_budget_give(void *ctx, size_t n)
 {
     (void)ctx;
-    atomic_fetch_sub_explicit(&req_held, n, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&req_mem.held, n, memory_order_relaxed);
 }
 
 static void multi_on_deferred(void *ctx)
@@ -3987,22 +4005,22 @@ static void *worker_main(void *arg)
     bool extra = arg != NULL; /* started while every worker waited: leaves when idle and another is free */
     tn_worker = true;
     for (;;) {
-        pthread_mutex_lock(&work_lock);
-        while (!work_head && !work_stop && (!extra || running_workers - waiting_workers <= 1))
-            pthread_cond_wait(&work_cv, &work_lock);
-        if (!work_head) {
+        pthread_mutex_lock(&workq.lock);
+        while (!workq.head && !workq.stop && (!extra || workq.running_workers - workq.waiting_workers <= 1))
+            pthread_cond_wait(&workq.cv, &workq.lock);
+        if (!workq.head) {
             worker_scratch_free();
-            if (--running_workers == 0)
-                pthread_cond_broadcast(&workers_gone_cv);
-            pthread_mutex_unlock(&work_lock);
+            if (--workq.running_workers == 0)
+                pthread_cond_broadcast(&workq.gone_cv);
+            pthread_mutex_unlock(&workq.lock);
             route_release();
             return NULL;
         }
-        req *r = work_head;
-        work_head = r->next;
-        if (!work_head)
-            work_tail = NULL;
-        pthread_mutex_unlock(&work_lock);
+        req *r = workq.head;
+        workq.head = r->next;
+        if (!workq.head)
+            workq.tail = NULL;
+        pthread_mutex_unlock(&workq.lock);
         int64_t began = metrics_request_begin(r->op);
         fwd_st.on = false;
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
@@ -4772,9 +4790,9 @@ static void in_account(conn *c)
 {
     size_t now = c->in.cap > IN_KEEP ? c->in.cap : 0;
     if (now > c->in_charged)
-        atomic_fetch_add(&req_held, now - c->in_charged);
+        atomic_fetch_add(&req_mem.held, now - c->in_charged);
     else if (now < c->in_charged)
-        atomic_fetch_sub(&req_held, c->in_charged - now);
+        atomic_fetch_sub(&req_mem.held, c->in_charged - now);
     c->in_charged = now;
 }
 
@@ -4933,7 +4951,7 @@ static bool submit_recv(conn *c)
         c->held = true;
         return true; /* on_wake resumes it as its requests run */
     }
-    if (c->q_head && atomic_load_explicit(&req_held, memory_order_relaxed) > req_budget) {
+    if (c->q_head && atomic_load_explicit(&req_mem.held, memory_order_relaxed) > req_budget) {
         park(c, false); /* its requests waiting are memory enough: read again once memory frees */
         return true;
     }
@@ -5047,16 +5065,16 @@ static void dispatch(conn *c)
     c->run_id = r->id;
     c->run_op = r->op;
     atomic_store(&c->cancel_running, r->cancelled);
-    pthread_mutex_lock(&work_lock);
-    if (work_tail)
-        work_tail->next = r;
+    pthread_mutex_lock(&workq.lock);
+    if (workq.tail)
+        workq.tail->next = r;
     else
-        work_head = r;
-    work_tail = r;
-    pthread_mutex_unlock(&work_lock);
+        workq.head = r;
+    workq.tail = r;
+    pthread_mutex_unlock(&workq.lock);
     /* after the unlock: a worker woken while the lock is held blocks on it at once, and the unlock must wake it a
      * second time (with many short requests a quarter of the event loop's time) */
-    pthread_cond_signal(&work_cv);
+    pthread_cond_signal(&workq.cv);
 }
 
 /* Closes the descriptor and frees c. A connection still in the epoll ready
@@ -5185,7 +5203,7 @@ static int parse(conn *c)
             }
             if (need > c->in.cap) {
                 if (need > IN_KEEP) {
-                    size_t held = atomic_load_explicit(&req_held, memory_order_relaxed) - c->in_charged;
+                    size_t held = atomic_load_explicit(&req_mem.held, memory_order_relaxed) - c->in_charged;
                     if (held && held + need > req_budget) {
                         rc = 1;
                         break;
@@ -5233,7 +5251,7 @@ static int parse(conn *c)
             return -1;
         }
         memcpy(r->payload, c->in.p + off + 9, r->len);
-        atomic_fetch_add_explicit(&req_held, REQ_COST(r), memory_order_relaxed);
+        atomic_fetch_add_explicit(&req_mem.held, REQ_COST(r), memory_order_relaxed);
         c->q_bytes += REQ_COST(r);
         if (c->q_tail)
             c->q_tail->next = r;
@@ -5334,7 +5352,7 @@ static void on_recv(conn *c, ssize_t res)
 static void unpark_some(void)
 {
     conn *last = park_tail;
-    while (park_head && atomic_load_explicit(&req_held, memory_order_relaxed) < req_budget) {
+    while (park_head && atomic_load_explicit(&req_mem.held, memory_order_relaxed) < req_budget) {
         conn *c = park_head;
         bool frame = c->park_frame, end = c == last;
         unpark(c);
@@ -5531,19 +5549,19 @@ static void on_accept(int fd)
 
 static void take_notes(void)
 {
-    note *top = atomic_exchange_explicit(&note_top, NULL, memory_order_acquire), *batch = NULL;
+    note *top = atomic_exchange_explicit(&note_stack.top, NULL, memory_order_acquire), *batch = NULL;
     while (top) { /* into the order of the pushes */
         note *next = top->next;
         top->next = batch;
         batch = top;
         top = next;
     }
-    pthread_mutex_lock(&note_lock);
-    int *fds = new_fds;
-    size_t nfds = nnew;
-    new_fds = NULL;
-    nnew = new_cap = 0;
-    pthread_mutex_unlock(&note_lock);
+    pthread_mutex_lock(&new_conns.lock);
+    int *fds = new_conns.fds;
+    size_t nfds = new_conns.n;
+    new_conns.fds = NULL;
+    new_conns.n = new_conns.cap = 0;
+    pthread_mutex_unlock(&new_conns.lock);
     for (size_t i = 0; i < nfds; i++)
         on_accept(fds[i]);
     free(fds);
@@ -5604,7 +5622,7 @@ static void on_wake(void)
  * such write. The eventfd is left alone here: a count it holds only makes a later on_wake find less to do. */
 static void notes_pending(void)
 {
-    if (atomic_load_explicit(&note_top, memory_order_relaxed))
+    if (atomic_load_explicit(&note_stack.top, memory_order_relaxed))
         take_notes();
 }
 
@@ -5785,9 +5803,9 @@ static void ep_loop(void)
 
 static size_t workers_now(void)
 {
-    pthread_mutex_lock(&work_lock);
-    size_t n = (size_t)running_workers;
-    pthread_mutex_unlock(&work_lock);
+    pthread_mutex_lock(&workq.lock);
+    size_t n = (size_t)workq.running_workers;
+    pthread_mutex_unlock(&workq.lock);
     return n;
 }
 
@@ -5831,15 +5849,15 @@ static void *accept_main(void *arg)
             }
             return NULL; /* EINVAL: shut down */
         }
-        pthread_mutex_lock(&note_lock);
-        if (nnew == new_cap) {
-            new_cap = new_cap ? new_cap * 2 : 64;
-            new_fds = realloc(new_fds, new_cap * sizeof *new_fds);
-            if (!new_fds)
+        pthread_mutex_lock(&new_conns.lock);
+        if (new_conns.n == new_conns.cap) {
+            new_conns.cap = new_conns.cap ? new_conns.cap * 2 : 64;
+            new_conns.fds = realloc(new_conns.fds, new_conns.cap * sizeof *new_conns.fds);
+            if (!new_conns.fds)
                 abort();
         }
-        new_fds[nnew++] = fd;
-        pthread_mutex_unlock(&note_lock);
+        new_conns.fds[new_conns.n++] = fd;
+        pthread_mutex_unlock(&new_conns.lock);
         wake_signal();
     }
 }
@@ -7031,7 +7049,7 @@ int main(int argc, char **argv)
      * take the server down */
     signal(SIGHUP, tenants_file ? on_hup : SIG_IGN);
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
-    base_workers = running_workers = nworkers;
+    workq.base_workers = workq.running_workers = nworkers;
     {
         /* Bound per-worker retained insert_packed scratch (4 arrays: raw, ts, vals, series) against req_budget
          * so many workers or a small --max-request-memory never permanently pin more than a quarter of it. */
@@ -7039,10 +7057,10 @@ int main(int argc, char **argv)
         if (max_w < 1)
             max_w = 1;
         size_t dyn = req_budget / (16 * max_w);
-        if (dyn < pack_raw_keep)
-            pack_raw_keep = dyn;
-        if (dyn < pack_arr_keep)
-            pack_arr_keep = dyn;
+        if (dyn < pack_keep.raw)
+            pack_keep.raw = dyn;
+        if (dyn < pack_keep.arr)
+            pack_keep.arr = dyn;
     }
     if (mfd >= 0) {
         metrics_cfg mc = {.db = db,
@@ -7248,10 +7266,10 @@ int main(int argc, char **argv)
         chunkpeer_cluster_stop(); /* its installer thread names the chunk server: before that is freed */
         cvol_stop(); /* after the cluster thread: no push or report reaches it any more */
     }
-    pthread_mutex_lock(&work_lock);
-    work_stop = true;
-    pthread_cond_broadcast(&work_cv);
-    pthread_mutex_unlock(&work_lock);
+    pthread_mutex_lock(&workq.lock);
+    workq.stop = true;
+    pthread_cond_broadcast(&workq.cv);
+    pthread_mutex_unlock(&workq.lock);
     for (conn *c = conns; c; c = c->next) { /* wake workers waiting for output space */
         pthread_mutex_lock(&c->lock);
         atomic_store(&c->closing, true);
@@ -7261,10 +7279,10 @@ int main(int argc, char **argv)
     for (int i = 0; i < nworkers; i++)
         pthread_join(workers[i], NULL);
     free(workers);
-    pthread_mutex_lock(&work_lock); /* and the extra ones, which are detached */
-    while (running_workers > 0)
-        pthread_cond_wait(&workers_gone_cv, &work_lock);
-    pthread_mutex_unlock(&work_lock);
+    pthread_mutex_lock(&workq.lock); /* and the extra ones, which are detached */
+    while (workq.running_workers > 0)
+        pthread_cond_wait(&workq.gone_cv, &workq.lock);
+    pthread_mutex_unlock(&workq.lock);
     if (cluster_on) {
         fwd_join(); /* the reserved workers of forwarded requests */
         fwd_cluster_free(); /* no worker can call into the forwarding links any more */
@@ -7293,9 +7311,9 @@ int main(int argc, char **argv)
     free(fd_conn);
     auth_shutdown(); /* after the connections, whose states it frees */
     tn_stop(); /* before the engine it sets tenants on */
-    for (size_t i = 0; i < nnew; i++)
-        close(new_fds[i]);
-    free(new_fds);
+    for (size_t i = 0; i < new_conns.n; i++)
+        close(new_conns.fds[i]);
+    free(new_conns.fds);
     dom_shutdown();
     /* A cluster volume its driver stopped on an engine failure (D13) is no failure of the server: it is closed first
      * (repld_close_failed), so that tsdb_close's result is the other volumes' alone. (tsdb_volume_failed is no test

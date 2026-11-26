@@ -88,6 +88,7 @@ typedef struct scratch {
 } scratch;
 static __thread scratch *scratch_tls;
 static pthread_key_t scratch_key;
+static bool scratch_key_ok;
 static pthread_once_t scratch_once = PTHREAD_ONCE_INIT;
 
 static void scratch_free(void *a)
@@ -105,24 +106,16 @@ static void scratch_free(void *a)
     free(sc);
 }
 
-static void scratch_atexit(void)
-{
-    scratch *sc = scratch_tls;
-    if (!sc)
-        return;
-    pthread_setspecific(scratch_key, NULL);
-    scratch_free(sc);
-}
-
 static void scratch_init(void)
 {
-    pthread_key_create(&scratch_key, scratch_free);
-    atexit(scratch_atexit);
+    scratch_key_ok = pthread_key_create(&scratch_key, scratch_free) == 0;
 }
 
 static scratch *scratch_alloc(void)
 {
     pthread_once(&scratch_once, scratch_init);
+    if (!scratch_key_ok)
+        return NULL;
     scratch *sc = calloc(1, sizeof *sc);
     if (!sc || pthread_setspecific(scratch_key, sc) != 0) {
         free(sc);
@@ -145,6 +138,7 @@ void *qscratch_get(int slot, size_t bytes)
             return malloc(bytes);
     }
     if (bytes > SCRATCH_KEEP_MAX) {
+        /* non-nested callers (agg_worker, twa_worker): a second simultaneous >2 MiB slot falls back to free() */
         void *p = malloc(bytes);
         if (p && !sc->big_p[slot]) {
             sc->big_p[slot] = p;

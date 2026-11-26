@@ -109,18 +109,32 @@ typedef struct metrics_totals {
 } metrics_totals;
 
 typedef struct {
-    _Alignas(64) atomic_uint_fast64_t conns_accepted, conns_rejected;
+    _Alignas(64) atomic_uint_fast64_t conns_accepted;
+    atomic_uint_fast64_t conns_rejected;
     atomic_int_fast64_t conns_active;
-    _Alignas(64) atomic_uint_fast64_t scrapes, scrape_rejects;
+    _Alignas(64) atomic_uint_fast64_t scrapes;
+    atomic_uint_fast64_t scrape_rejects;
 } global_counters;
+_Static_assert(sizeof(global_counters) == 128, "global_counters must occupy two cache lines");
 static global_counters M;
-static _Alignas(64) atomic_bool on; /* set by metrics_enable before the server starts; the hooks do nothing until then */
 
-static _Alignas(64) pthread_mutex_t shard_mu = PTHREAD_MUTEX_INITIALIZER;
-static metrics_shard *shards;
-static metrics_totals retired; /* folded counts of exited threads, protected by shard_mu */
+/* set by metrics_enable before the server starts; the hooks do nothing until then */
+static struct {
+    _Alignas(64) atomic_bool v;
+} metrics_on;
+_Static_assert(sizeof(metrics_on) == 64, "metrics_on must occupy its own cache line");
+
+static struct {
+    _Alignas(64) pthread_mutex_t mu;
+    metrics_shard *list;
+    metrics_totals retired; /* folded counts of exited threads, protected by mu */
+} shard_reg = {.mu = PTHREAD_MUTEX_INITIALIZER};
+_Static_assert(sizeof(shard_reg) % 64 == 0, "shard_reg must fill whole cache lines");
+
 static __thread metrics_shard *tls_shard;
+static __thread int tls_busy_counted;
 static pthread_key_t shard_key;
+static bool shard_key_ok;
 static pthread_once_t shard_once = PTHREAD_ONCE_INIT;
 
 /* Every TSDB_OP_* has a row here, made from the op list (TSDB_OPS in tsdb_protocol.h; test_metrics checks each
@@ -179,17 +193,19 @@ static void shard_dtor(void *p)
     metrics_shard *s = p;
     if (!s)
         return;
-    if (tls_shard == s)
+    if (tls_shard == s) {
         tls_shard = NULL;
-    pthread_mutex_lock(&shard_mu);
-    for (metrics_shard **pp = &shards; *pp; pp = &(*pp)->next) {
+        tls_busy_counted = 0;
+    }
+    pthread_mutex_lock(&shard_reg.mu);
+    for (metrics_shard **pp = &shard_reg.list; *pp; pp = &(*pp)->next) {
         if (*pp == s) {
             *pp = s->next;
             break;
         }
     }
-    shard_fold_into(&retired, s);
-    pthread_mutex_unlock(&shard_mu);
+    shard_fold_into(&shard_reg.retired, s);
+    pthread_mutex_unlock(&shard_reg.mu);
     free(s);
 }
 
@@ -198,19 +214,23 @@ static void shard_atexit(void)
     metrics_shard *s = tls_shard;
     if (!s)
         return;
-    pthread_setspecific(shard_key, NULL);
+    if (shard_key_ok)
+        pthread_setspecific(shard_key, NULL);
     shard_dtor(s);
 }
 
 static void shard_key_init(void)
 {
-    pthread_key_create(&shard_key, shard_dtor);
-    atexit(shard_atexit);
+    shard_key_ok = pthread_key_create(&shard_key, shard_dtor) == 0;
+    if (shard_key_ok)
+        atexit(shard_atexit);
 }
 
 static metrics_shard *shard_alloc(void)
 {
     pthread_once(&shard_once, shard_key_init);
+    if (!shard_key_ok)
+        return NULL;
     metrics_shard *s = aligned_alloc(64, sizeof *s);
     if (!s)
         return NULL;
@@ -219,10 +239,10 @@ static metrics_shard *shard_alloc(void)
         free(s);
         return NULL;
     }
-    pthread_mutex_lock(&shard_mu);
-    s->next = shards;
-    shards = s;
-    pthread_mutex_unlock(&shard_mu);
+    pthread_mutex_lock(&shard_reg.mu);
+    s->next = shard_reg.list;
+    shard_reg.list = s;
+    pthread_mutex_unlock(&shard_reg.mu);
     tls_shard = s;
     return s;
 }
@@ -235,15 +255,15 @@ static inline metrics_shard *shard_get(void)
 
 static void metrics_snapshot(metrics_totals *out)
 {
-    pthread_mutex_lock(&shard_mu);
-    *out = retired;
-    for (const metrics_shard *s = shards; s; s = s->next)
+    pthread_mutex_lock(&shard_reg.mu);
+    *out = shard_reg.retired;
+    for (const metrics_shard *s = shard_reg.list; s; s = s->next)
         shard_fold_into(out, s);
-    pthread_mutex_unlock(&shard_mu);
+    pthread_mutex_unlock(&shard_reg.mu);
 }
 
-void metrics_enable(void) { atomic_store(&on, true); }
-#define HOOK_OFF() if (!atomic_load_explicit(&on, memory_order_relaxed)) return
+void metrics_enable(void) { atomic_store(&metrics_on.v, true); }
+#define HOOK_OFF() if (!atomic_load_explicit(&metrics_on.v, memory_order_relaxed)) return
 
 void metrics_conn_opened(void)
 {
@@ -264,11 +284,13 @@ void metrics_conn_rejected(void)
 
 int64_t metrics_request_begin(uint8_t op)
 {
-    if (!atomic_load_explicit(&on, memory_order_relaxed))
+    if (!atomic_load_explicit(&metrics_on.v, memory_order_relaxed))
         return 0;
     metrics_shard *s = shard_get();
-    if (s)
+    if (s) {
         shard_add_i64(&s->workers_busy, 1);
+        tls_busy_counted++;
+    }
     return query_op_idx(op) >= 0 ? now_ns() : 0;
 }
 
@@ -289,7 +311,10 @@ void metrics_request_end(uint8_t op, int64_t began)
     metrics_shard *s = shard_get();
     if (!s)
         return;
-    shard_add_i64(&s->workers_busy, -1);
+    if (tls_busy_counted > 0) {
+        tls_busy_counted--;
+        shard_add_i64(&s->workers_busy, -1);
+    }
     shard_add(&s->requests[o], 1);
     if (q >= 0) {
         int b = metrics_bucket_for((double)ns / 1e9);

@@ -400,7 +400,7 @@ static void run_one(const uint8_t *in, size_t len)
     free(c->out.p);
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cv);
-    atomic_store(&note_top, NULL); /* it may point into c */
+    atomic_store(&note_stack.top, NULL); /* it may point into c */
     free(c);
     cur_in = NULL;
 }
