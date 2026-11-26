@@ -40,12 +40,14 @@ typedef struct lsrc {
     const uint8_t *v;
     size_t n;
     bool dec;                /* ts/v are the decoded granule (part) */
-    int64_t *dts;            /* owned buffers of dec */
+    int64_t *dts;            /* reusable owned buffers of dec (persist across series in lctx) */
     uint8_t *dv;
+    size_t dts_cap;          /* capacity of dts in int64_t elements */
+    size_t dv_cap;           /* capacity of dv in bytes */
     /* a part: granules [gi, gk) are not yet looked at; cur is the one in hand */
     uint32_t gi, gk, cur;
     bool idx;                /* cur is a plain granule below the bound: T is its ts_max, not decoded */
-    tomb_set h;              /* tombstones of the series that hide this part's rows */
+    tomb_set h;              /* tombstones of the series that hide this part's rows (reused across series) */
 } lsrc;
 
 typedef struct lctx {
@@ -59,8 +61,6 @@ typedef struct lctx {
     part **tp;  /* the parts with tombstones, by (partition, min_block) */
     size_t ntp;
     codec_ctx *cc;
-    mem_run *runs; /* the memtable runs of the series in hand */
-    size_t nruns;
     lsrc *src;
     size_t ns, cap;
 } lctx;
@@ -81,6 +81,21 @@ static int cmp_part_tomb(const void *a, const void *b)
     return (x->min_block > y->min_block) - (x->min_block < y->min_block);
 }
 
+static void src_reset(lsrc *s)
+{
+    s->p = NULL;
+    s->prio = 0;
+    s->have = false;
+    s->T = 0;
+    s->ts = NULL;
+    s->v = NULL;
+    s->n = 0;
+    s->dec = false;
+    s->gi = s->gk = s->cur = 0;
+    s->idx = false;
+    s->h.n = 0;
+}
+
 static void src_release(lsrc *s)
 {
     free(s->dts);
@@ -92,10 +107,8 @@ static void src_release(lsrc *s)
 static void ctx_reset_series(lctx *x)
 {
     for (size_t i = 0; i < x->ns; i++)
-        src_release(&x->src[i]);
+        src_reset(&x->src[i]);
     x->ns = 0;
-    for (size_t i = 0; i < x->nruns; i++)
-        mem_run_free(&x->runs[i]);
 }
 
 static lsrc *ctx_new_src(lctx *x)
@@ -105,12 +118,11 @@ static lsrc *ctx_new_src(lctx *x)
         lsrc *s = realloc(x->src, cap * sizeof *s);
         if (!s)
             return NULL;
+        memset(s + x->cap, 0, (cap - x->cap) * sizeof *s);
         x->src = s;
         x->cap = cap;
     }
-    lsrc *s = &x->src[x->ns++];
-    memset(s, 0, sizeof *s);
-    return s;
+    return &x->src[x->ns++];
 }
 
 /* The tombstones of `series` that hide rows of p: those of the parts of p's partition with a higher block. */
@@ -143,34 +155,42 @@ static int tombs_for(const lctx *x, const part *p, uint32_t series, tomb_set *h)
     return rc;
 }
 
-/* Decodes granule s->cur whole, without the rows its tombstones hide, as the source's rows. */
+/* Decodes granule s->cur whole, without the rows its tombstones hide, as the source's rows. Reuses s->dts/s->dv. */
 static int src_decode(lctx *x, lsrc *s, uint32_t series)
 {
     uint32_t cnt = gx_count(s->p, s->cur);
-    int64_t *ts = malloc((cnt ? cnt : 1) * sizeof *ts);
-    uint8_t *v = malloc((cnt ? cnt : 1) * x->w);
-    if (!ts || !v) {
-        free(ts);
-        free(v);
-        return TSDB_ERR_NOMEM;
+    size_t need_ts = cnt ? cnt : 1;
+    size_t need_v = need_ts * x->w;
+    if (need_ts > s->dts_cap) {
+        size_t cap = s->dts_cap ? s->dts_cap * 2 : 256;
+        while (cap < need_ts)
+            cap *= 2;
+        int64_t *ts = realloc(s->dts, cap * sizeof *ts);
+        if (!ts)
+            return TSDB_ERR_NOMEM;
+        s->dts = ts;
+        s->dts_cap = cap;
+    }
+    if (need_v > s->dv_cap) {
+        size_t cap = s->dv_cap ? s->dv_cap * 2 : 2048;
+        while (cap < need_v)
+            cap *= 2;
+        uint8_t *v = realloc(s->dv, cap);
+        if (!v)
+            return TSDB_ERR_NOMEM;
+        s->dv = v;
+        s->dv_cap = cap;
     }
     granule gb;
     gx_load(s->p, s->cur, GW_LOC, &gb);
-    int rc = granule_read(x->cc, s->p, &gb, x->type, ts, v, cnt, s->p->verify);
-    if (rc) {
-        free(ts);
-        free(v);
+    int rc = granule_read(x->cc, s->p, &gb, x->type, s->dts, s->dv, cnt, s->p->verify);
+    if (rc)
         return rc;
-    }
     size_t n = gb.count < cnt ? gb.count : cnt;
     if (s->h.n)
-        n = tomb_set_filter(&s->h, series, INT64_MIN, ts, v, x->w, n);
-    free(s->dts);
-    free(s->dv);
-    s->dts = ts;
-    s->dv = v;
-    s->ts = ts;
-    s->v = v;
+        n = tomb_set_filter(&s->h, series, INT64_MIN, s->dts, s->dv, x->w, n);
+    s->ts = s->dts;
+    s->v = s->dv;
     s->n = n;
     s->dec = true;
     s->idx = false;
@@ -277,39 +297,26 @@ typedef struct latest_hit {
 
 enum { LK_VALUE = 0, LK_NULL = 1, LK_NONE = 2 }; /* tsdb_latest_kind */
 
-static int latest_at(lctx *x, uint32_t series, int64_t lo, int64_t end, bool with_nulls, latest_hit *out)
+static int latest_at(lctx *x, uint32_t series, int64_t lo, int64_t end, bool with_nulls, const mem_run *runs, size_t nm,
+                     latest_hit *out)
 {
     *out = (latest_hit){LK_NONE, 0, 0};
     if (lo >= end)
         return 0;
     int rc = 0;
-    /* the memtables' rows of the series (tails first, then the flushing ones, then the active one) */
-    size_t nm = x->c.ntails + x->c.nms;
-    if (nm) {
-        bool locked = x->c.ntails || x->c.has_active;
-        if (locked)
-            pthread_mutex_lock(&x->db->buf_lock);
-        for (size_t i = 0; rc == 0 && i < nm; i++) {
-            bool tail = i < x->c.ntails;
-            const memtable *m = tail ? x->c.tails[i] : x->c.ms[i - x->c.ntails];
-            rc = mt_collect(m, series, x->w, lo, end, tail ? x->c.tail_visible : x->c.visible, &x->runs[i]);
+    for (size_t i = 0; rc == 0 && i < nm; i++) {
+        if (!runs[i].n)
+            continue;
+        lsrc *s = ctx_new_src(x);
+        if (!s) {
+            rc = TSDB_ERR_NOMEM;
+            break;
         }
-        if (locked)
-            pthread_mutex_unlock(&x->db->buf_lock);
-        for (size_t i = 0; rc == 0 && i < nm; i++) {
-            if (!x->runs[i].n)
-                continue;
-            lsrc *s = ctx_new_src(x);
-            if (!s) {
-                rc = TSDB_ERR_NOMEM;
-                break;
-            }
-            s->prio = UINT64_MAX - (nm - i);
-            s->ts = x->runs[i].ts;
-            s->v = x->runs[i].v;
-            s->n = x->runs[i].n;
-            rc = src_next(x, s, series, lo, end);
-        }
+        s->prio = UINT64_MAX - (nm - i);
+        s->ts = runs[i].ts;
+        s->v = runs[i].v;
+        s->n = runs[i].n;
+        rc = src_next(x, s, series, lo, end);
     }
     int64_t hi = end;
     size_t next = 0;
@@ -369,6 +376,7 @@ static int latest_at(lctx *x, uint32_t series, int64_t lo, int64_t end, bool wit
 
 /* The search of n ids on the cut `c` (which the caller owns and releases), with the lower bounds lo[] (the cutoffs,
  * read before the cut). out[i].status/type are set by the caller; ids with a status are skipped. */
+enum { LM_SLICE = 64, LM_SLICE_ROWS = 4096 };
 static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n, const int64_t *lo,
                          const int64_t *ends, int64_t end, bool with_nulls, latest_row *out)
 {
@@ -377,11 +385,14 @@ static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n
     x.c = *c;
     int rc = 0;
     x.np = x.c.np;
+    size_t nm = x.c.ntails + x.c.nms;
+    bool need_lock = x.c.ntails || x.c.has_active;
+    size_t slice_cap = need_lock ? MIN(n, (size_t)LM_SLICE) : 1;
     x.ord = malloc((x.np ? x.np : 1) * sizeof *x.ord);
     x.tp = malloc((x.np ? x.np : 1) * sizeof *x.tp);
-    x.runs = calloc(x.c.ntails + x.c.nms + 1, sizeof *x.runs);
-    x.nruns = x.c.ntails + x.c.nms;
-    if (!x.ord || !x.tp || !x.runs)
+    mem_run *sruns = nm ? calloc(slice_cap * nm, sizeof *sruns) : NULL;
+    bool *ssorted = (nm && need_lock) ? calloc(slice_cap * nm, sizeof *ssorted) : NULL;
+    if (!x.ord || !x.tp || (nm && !sruns) || (nm && need_lock && !ssorted))
         rc = TSDB_ERR_NOMEM;
     if (rc == 0) {
         memcpy(x.ord, x.c.parts, x.np * sizeof *x.ord);
@@ -394,30 +405,83 @@ static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n
         if (!x.cc)
             rc = TSDB_ERR_NOMEM;
     }
-    for (size_t i = 0; rc == 0 && i < n; i++) {
-        if (out[i].status)
-            continue;
-        x.type = out[i].type;
-        x.w = type_width(x.type);
-        x.null = type_null(x.type);
-        latest_hit h;
-        rc = latest_at(&x, local[i], lo[i], ends ? ends[i] : end, with_nulls, &h);
-        if (rc == 0) {
-            out[i].kind = (uint8_t)h.kind;
-            out[i].ts = h.ts;
-            out[i].slot = h.slot;
+    size_t nimm = x.c.nms - (x.c.has_active ? 1 : 0);
+    for (size_t a = 0; rc == 0 && a < n;) {
+        size_t b = a;
+        if (nm && need_lock) {
+            size_t copied = 0;
+            pthread_mutex_lock(&db->buf_lock);
+            while (b < n && (b - a) < slice_cap && (b == a || copied < LM_SLICE_ROWS)) {
+                size_t si = b - a;
+                if (out[b].status == 0) {
+                    int64_t lim = ends ? ends[b] : end;
+                    if (lo[b] < lim) {
+                        for (size_t j = 0; rc == 0 && j < x.c.ntails; j++) {
+                            mem_run *r = &sruns[si * nm + j];
+                            rc = mt_copy_raw(x.c.tails[j], local[b], lo[b], lim, x.c.tail_visible, r,
+                                             &ssorted[si * nm + j]);
+                            copied += r->n;
+                        }
+                        if (rc == 0 && x.c.has_active) {
+                            size_t j = nm - 1;
+                            mem_run *r = &sruns[si * nm + j];
+                            rc = mt_copy_raw(x.c.ms[x.c.nms - 1], local[b], lo[b], lim, x.c.visible, r,
+                                             &ssorted[si * nm + j]);
+                            copied += r->n;
+                        }
+                    }
+                }
+                b++;
+                if (rc)
+                    break;
+            }
+            pthread_mutex_unlock(&db->buf_lock);
+        } else {
+            b = a + 1;
         }
+        for (size_t i = a; i < b; i++) {
+            size_t si = need_lock ? (i - a) : 0;
+            mem_run *runs = nm ? &sruns[si * nm] : NULL;
+            if (rc == 0 && out[i].status == 0) {
+                x.type = out[i].type;
+                x.w = type_width(x.type);
+                x.null = type_null(x.type);
+                int64_t lim = ends ? ends[i] : end;
+                if (nm && lo[i] < lim) {
+                    if (need_lock) {
+                        const bool *sorted = &ssorted[si * nm];
+                        for (size_t j = 0; rc == 0 && j < x.c.ntails; j++)
+                            rc = mt_finish(&runs[j], x.w, sorted[j]);
+                        if (rc == 0 && x.c.has_active)
+                            rc = mt_finish(&runs[nm - 1], x.w, sorted[nm - 1]);
+                    }
+                    for (size_t j = 0; rc == 0 && j < nimm; j++)
+                        rc = mt_collect(x.c.ms[j], local[i], x.w, lo[i], lim, x.c.visible, &runs[x.c.ntails + j]);
+                }
+                if (rc == 0) {
+                    latest_hit h;
+                    rc = latest_at(&x, local[i], lo[i], lim, with_nulls, runs, nm, &h);
+                    if (rc == 0) {
+                        out[i].kind = (uint8_t)h.kind;
+                        out[i].ts = h.ts;
+                        out[i].slot = h.slot;
+                    }
+                }
+            }
+            for (size_t j = 0; j < nm; j++)
+                mem_run_free(&runs[j]);
+        }
+        a = b;
     }
-    if (rc)
-        ctx_reset_series(&x);
     if (x.cc)
         cc_put(db, x.cc);
-    for (size_t i = 0; i < x.ns; i++)
+    for (size_t i = 0; i < x.cap; i++)
         src_release(&x.src[i]);
     free(x.src);
     free(x.ord);
     free(x.tp);
-    free(x.runs);
+    free(sruns);
+    free(ssorted);
     return rc;
 }
 
@@ -428,6 +492,8 @@ int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *e
     int64_t *lo = malloc((n ? n : 1) * sizeof *lo);
     if (!lo)
         return TSDB_ERR_NOMEM;
+    bool has_ret = atomic_load_explicit(&db->has_retention, memory_order_relaxed);
+    int64_t now = has_ret ? eng_now_ms(db) : 0;
     for (size_t i = 0; i < n; i++) {
         out[i] = (latest_row){.kind = LK_NONE};
         int ty = eng_series_type(db, local[i]);
@@ -435,7 +501,7 @@ int eng_latest_search(eng *db, const uint32_t *local, size_t n, const int64_t *e
             out[i].status = TSDB_ERR_NOTFOUND;
         else
             out[i].type = (uint8_t)ty;
-        lo[i] = ty < 0 ? 0 : eng_cutoff(db, local[i]); /* before the cut, as a query reads it */
+        lo[i] = ty < 0 ? 0 : (has_ret ? eng_cutoff_at(db, local[i], now) : INT64_MIN); /* before the cut, as a query reads it */
     }
     qcut c;
     int rc = cut_take(db, &c);

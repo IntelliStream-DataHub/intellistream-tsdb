@@ -580,23 +580,86 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
     if (rc0)
         return rc0;
     int ucls = cls_uniform(db, m->ids, 0, m->nids);
-    uint32_t *s = malloc(m->rows * sizeof *s);
-    int64_t *t = malloc(m->rows * sizeof *t);
-    uint64_t *v = malloc(m->rows * sizeof *v);
-    uint32_t *ids = malloc((m->nids ? m->nids : 1) * sizeof *ids);
+    uint32_t tcnt[NTYPES] = {0};
+    size_t trows[NTYPES] = {0};
+    uint32_t nactive = 0;
+    for (uint32_t i = 0; i < m->nids; i++) {
+        uint32_t id = m->ids[i];
+        const mt_series *ms = &m->s[id];
+        if (ms->n == 0)
+            continue;
+        int ty = ms->fl ? (int)ms->type : series_type(&db->series, id);
+        if ((unsigned)ty < NTYPES) {
+            tcnt[ty]++;
+            trows[ty] += ms->n;
+            nactive++;
+        }
+    }
+    int ntypes_present = 0, only_type = -1;
+    size_t max_rows = 0;
+    for (int ty = 0; ty < NTYPES; ty++) {
+        if (tcnt[ty]) {
+            ntypes_present++;
+            only_type = ty;
+            if (trows[ty] > max_rows)
+                max_rows = trows[ty];
+        }
+    }
+    if (max_rows == 0)
+        return 0;
+    uint32_t *s = malloc(max_rows * sizeof *s);
+    int64_t *t = malloc(max_rows * sizeof *t);
+    uint64_t *v = malloc(max_rows * sizeof *v);
+    uint32_t *ids = malloc((nactive ? nactive : 1) * sizeof *ids);
     int rc = (!s || !t || !v || !ids) ? TSDB_ERR_NOMEM : 0;
+    uint32_t toff[NTYPES] = {0};
     if (rc == 0) {
-        memcpy(ids, m->ids, m->nids * sizeof *ids);
-        qsort(ids, m->nids, sizeof *ids, cmp_u32);
+        if (ntypes_present == 1) {
+            toff[only_type] = 0;
+            if (nactive == m->nids) {
+                memcpy(ids, m->ids, nactive * sizeof *ids);
+            } else {
+                uint32_t p = 0;
+                for (uint32_t i = 0; i < m->nids; i++) {
+                    uint32_t id = m->ids[i];
+                    if (m->s[id].n)
+                        ids[p++] = id;
+                }
+            }
+            qsort(ids, tcnt[only_type], sizeof *ids, cmp_u32);
+        } else {
+            uint32_t tpos[NTYPES];
+            uint32_t off = 0;
+            for (int ty = 0; ty < NTYPES; ty++) {
+                toff[ty] = off;
+                tpos[ty] = off;
+                off += tcnt[ty];
+            }
+            for (uint32_t i = 0; i < m->nids; i++) {
+                uint32_t id = m->ids[i];
+                const mt_series *ms = &m->s[id];
+                if (ms->n == 0)
+                    continue;
+                int ty = ms->fl ? (int)ms->type : series_type(&db->series, id);
+                if ((unsigned)ty < NTYPES)
+                    ids[tpos[ty]++] = id;
+            }
+            for (int ty = 0; ty < NTYPES; ty++)
+                if (tcnt[ty] > 1)
+                    qsort(ids + toff[ty], tcnt[ty], sizeof *ids, cmp_u32);
+        }
     }
     for (int type = 0; type < NTYPES && rc == 0; type++) {
+        if (!tcnt[type])
+            continue;
         size_t k = 0, w = type_width(type);
-        for (uint32_t i = 0; i < m->nids && rc == 0; i++) {
-            const mt_series *ms = &m->s[ids[i]];
-            if (series_type(&db->series, ids[i]) != type)
-                continue;
+        const uint32_t *tids = ids + toff[type];
+        uint32_t nt = tcnt[type];
+        for (uint32_t i = 0; i < nt && rc == 0; i++) {
+            uint32_t id = tids[i];
+            const mt_series *ms = &m->s[id];
             for (uint32_t j = 0; j < ms->n; j++)
-                s[k + j] = ids[i];
+                s[k + j] = id;
             memcpy(t + k, ms->ts, ms->n * sizeof *t);
             memcpy(v + k, ms->v, ms->n * sizeof *v);
             if (!ms->sorted)
@@ -615,10 +678,10 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
         rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL, NULL);
         cur_fno_lo = cur_fno_hi = 0;
     }
-    tsdb_free_big(s, m->rows * sizeof *s);
-    tsdb_free_big(t, m->rows * sizeof *t);
-    tsdb_free_big(v, m->rows * sizeof *v);
-    free(ids);
+    tsdb_free_big(s, max_rows * sizeof *s);
+    tsdb_free_big(t, max_rows * sizeof *t);
+    tsdb_free_big(v, max_rows * sizeof *v);
+    tsdb_free_big(ids, (size_t)(nactive ? nactive : 1) * sizeof *ids);
     return rc;
 }
 

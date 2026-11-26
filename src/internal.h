@@ -1132,17 +1132,33 @@ void pw_abort(part_writer *w);
 
 /* ---- series dictionary ---- */
 struct cls_table;
+/* Lock-free per-id snapshot arrays (names, lengths, types): grown by copy under d->lock; older snapshots stay alive
+ * until series_close so lock-free readers (series_type, series_name, series_check) never UAF. */
+typedef struct series_tab {
+    struct series_tab *older;
+    char **names;    /* [cap], inside this allocation (d->names mirrors the newest tab->names for db.c/volumes.c) */
+    uint16_t *lens;  /* [cap], name lengths (<= 32767) */
+    uint8_t *types;  /* [cap], tsdb_type per id */
+    uint32_t cap;
+    uint32_t pad;
+} series_tab;
+typedef struct series_slot {
+    uint32_t id1; /* id + 1, 0 = empty */
+    uint16_t len; /* name length */
+    uint16_t tag; /* upper 16 bits of hash: rejects mismatches without touching names[id] */
+} series_slot;
 typedef struct series_dict {
-    pthread_mutex_t lock;        /* the table and the names; never held across I/O */
+    pthread_mutex_t lock;        /* the hash table and appends into d->names/d->tab; never held across I/O */
     pthread_mutex_t append_lock; /* one append (or follower's reload) at a time, across its I/O; before lock */
     const char *file;
     int fd;
     bool fsync;
-    char **names;
-    uint8_t *types; /* tsdb_type per id */
+    _Atomic(series_tab *) tab; /* current lock-free snapshot; older snapshots freed by series_close */
+    char **names;              /* mirrors tab->names (under lock) for db.c/volumes.c name adoption/retirement */
+    uint8_t *types;            /* mirrors tab->types (under lock) */
     size_t cap;
     atomic_uint count;
-    uint32_t *table; /* open addressing; id + 1, 0 = empty */
+    series_slot *table; /* open addressing; id1 = id + 1, 0 = empty */
     size_t tcap;
     uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */

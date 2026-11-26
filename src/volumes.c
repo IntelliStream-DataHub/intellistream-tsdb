@@ -3049,15 +3049,31 @@ static void latest_worker(void *arg, int idx)
 {
     (void)idx;
     latest_job *j = arg;
+    uint32_t *local = NULL;
+    int64_t *ends = NULL;
+    latest_row *rows = NULL;
+    size_t cap = 0;
     size_t c;
     while ((c = atomic_fetch_add(&j->next, 1)) < j->nchunks) {
         if (atomic_load(&j->rc))
-            return;
+            break;
         size_t a = j->cstart[c], n = j->cstart[c + 1] - a;
-        uint32_t *local = malloc(n * sizeof *local);
-        int64_t *ends = j->ends ? malloc(n * sizeof *ends) : NULL;
-        latest_row *rows = malloc(n * sizeof *rows);
-        int rc = !local || !rows || (j->ends && !ends) ? TSDB_ERR_NOMEM : 0;
+        int rc = 0;
+        if (n > cap) {
+            uint32_t *nl = realloc(local, n * sizeof *nl);
+            if (nl)
+                local = nl;
+            int64_t *ne = j->ends ? realloc(ends, n * sizeof *ne) : NULL;
+            if (ne)
+                ends = ne;
+            latest_row *nr = realloc(rows, n * sizeof *nr);
+            if (nr)
+                rows = nr;
+            if (!nl || !nr || (j->ends && !ne))
+                rc = TSDB_ERR_NOMEM;
+            else
+                cap = n;
+        }
         for (size_t i = 0; rc == 0 && i < n; i++) {
             local[i] = j->it[a + i].local;
             if (ends)
@@ -3067,12 +3083,62 @@ static void latest_worker(void *arg, int idx)
             rc = eng_latest(j->it[a].e, local, n, ends, j->end, j->with_nulls, rows);
         for (size_t i = 0; rc == 0 && i < n; i++)
             latest_fill(&j->out[j->it[a + i].idx], &rows[i]);
-        free(local);
-        free(ends);
-        free(rows);
         if (rc)
             atomic_store(&j->rc, rc);
     }
+    free(local);
+    free(ends);
+    free(rows);
+}
+
+typedef struct lvol_ent {
+    uint32_t vol;
+    eng *e;       /* eng_ref held once while non-NULL */
+    uint32_t cnt; /* eng_series_count(e) */
+    int rc;       /* 0 or TSDB_ERR_UNAVAILABLE */
+    bool used;
+    bool refreshed; /* follower reloaded and found a new series on this volume */
+} lvol_ent;
+
+typedef struct lvol_map {
+    lvol_ent *e;
+    size_t cap, nused;
+    bool heap;
+} lvol_map;
+
+static lvol_ent *lvol_find(lvol_map *vm, uint32_t vol, bool insert)
+{
+    if (insert && (vm->nused + 1) * 2 > vm->cap) {
+        size_t ncap = vm->cap * 2;
+        lvol_ent *ne = calloc(ncap, sizeof *ne);
+        if (!ne)
+            return NULL;
+        for (size_t i = 0; i < vm->cap; i++) {
+            if (!vm->e[i].used)
+                continue;
+            size_t h = (size_t)(vm->e[i].vol * 2654435761u) & (ncap - 1);
+            while (ne[h].used)
+                h = (h + 1) & (ncap - 1);
+            ne[h] = vm->e[i];
+        }
+        if (vm->heap)
+            free(vm->e);
+        vm->e = ne;
+        vm->cap = ncap;
+        vm->heap = true;
+    }
+    size_t mask = vm->cap - 1;
+    size_t h = (size_t)(vol * 2654435761u) & mask;
+    while (vm->e[h].used) {
+        if (vm->e[h].vol == vol)
+            return &vm->e[h];
+        h = (h + 1) & mask;
+    }
+    if (!insert)
+        return NULL;
+    vm->e[h] = (lvol_ent){.vol = vol, .used = true};
+    vm->nused++;
+    return &vm->e[h];
 }
 
 int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out)
@@ -3093,42 +3159,190 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
         free(cstart);
         return TSDB_ERR_NOMEM;
     }
-    size_t m = 0;
-    for (size_t i = 0; i < n; i++) {
-        eng *e;
-        uint32_t local;
-        int rrc = 0;
-        if (sid_malformed(ids[i]))
-            continue;
-        if (route_q(t, ids[i], &e, &local, &rrc))
-            it[m++] = (latest_item){e, local, (uint32_t)i}; /* holds the engine's reference until the end */
-        else if (rrc)
-            out[i].status = rrc; /* a quiesced volume: UNAVAILABLE, not NOTFOUND (ha.md 15.5) */
-    }
-    qsort(it, m, sizeof *it, cmp_latest_item);
-    size_t nc = 0;
-    for (size_t i = 0; i < m; i++)
-        if (i == 0 || it[i].e != it[i - 1].e || (i - cstart[nc - 1]) >= LATEST_CHUNK)
-            cstart[nc++] = i;
-    cstart[nc] = m;
+    lvol_ent stack_vm[64];
+    memset(stack_vm, 0, sizeof stack_vm);
+    lvol_map vm = {.e = stack_vm, .cap = 64, .nused = 0, .heap = false};
+    size_t *miss = NULL, nmiss = 0, miss_cap = 0;
+    bool ro = t->opt.read_only;
     int rc = 0;
-    if (nc) {
-        latest_job j = {.it = it, .nchunks = nc, .cstart = cstart, .ends = opts ? opts->ends : NULL,
-                        .end = opts && !opts->ends ? opts->end : TSDB_TS_MAX, .with_nulls = opts && opts->with_nulls,
-                        .out = out};
-        atomic_init(&j.next, 0);
-        atomic_init(&j.rc, 0);
-        qrun qr;
-        qs_begin(t, &qr);
-        int want = opts && opts->threads > 0 ? opts->threads : 1 << 20; /* the group's cap clamps it */
-        if ((size_t)want > nc)
-            want = (int)nc;
-        sched_run(t->sched, want, latest_worker, &j);
-        rc = atomic_load(&j.rc);
-        qs_end(&qr, -1, m);
+    size_t m = 0;
+
+    /* Single read-lock pass: resolve and eng_ref once per distinct volume instead of per ID. */
+    pthread_rwlock_rdlock(&t->lock);
+    size_t nv = t->nvols;
+    uint32_t last_vol = UINT32_MAX;
+    lvol_ent *last_ent = NULL;
+    for (size_t i = 0; i < n; i++) {
+        int64_t v = sid_volume(ids[i]);
+        if (v < 0)
+            continue;
+        if ((size_t)v >= nv) {
+            if (ro) {
+                if (nmiss == miss_cap) {
+                    size_t nc = miss_cap ? miss_cap * 2 : 64;
+                    size_t *nm = realloc(miss, nc * sizeof *nm);
+                    if (!nm) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    miss = nm;
+                    miss_cap = nc;
+                }
+                miss[nmiss++] = i;
+            }
+            continue;
+        }
+        uint32_t vu = (uint32_t)v;
+        lvol_ent *ent = (vu == last_vol) ? last_ent : lvol_find(&vm, vu, false);
+        if (!ent) {
+            ent = lvol_find(&vm, vu, true);
+            if (!ent) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            eng *ve = t->vols[v];
+            if (!ve) {
+                ent->rc = (t->cluster && t->cnames[v]) ? TSDB_ERR_UNAVAILABLE : 0;
+            } else if (eng_refused(ve)) {
+                ent->rc = TSDB_ERR_UNAVAILABLE;
+            } else {
+                ent->e = eng_ref(ve);
+                ent->cnt = eng_series_count(ve);
+            }
+        }
+        last_vol = vu;
+        last_ent = ent;
+        if (ent->e) {
+            uint32_t local = TSDB_SID_LOCAL(ids[i]);
+            if (local < ent->cnt) {
+                it[m++] = (latest_item){ent->e, local, (uint32_t)i};
+            } else if (ro) {
+                if (nmiss == miss_cap) {
+                    size_t nc = miss_cap ? miss_cap * 2 : 64;
+                    size_t *nm = realloc(miss, nc * sizeof *nm);
+                    if (!nm) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    miss = nm;
+                    miss_cap = nc;
+                }
+                miss[nmiss++] = i;
+            }
+        } else if (ent->rc) {
+            out[i].status = ent->rc; /* a quiesced volume: UNAVAILABLE, not NOTFOUND (ha.md 15.5) */
+        } else if (ro) {
+            if (nmiss == miss_cap) {
+                size_t nc = miss_cap ? miss_cap * 2 : 64;
+                size_t *nm = realloc(miss, nc * sizeof *nm);
+                if (!nm) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                miss = nm;
+                miss_cap = nc;
+            }
+            miss[nmiss++] = i;
+        }
     }
-    for (size_t i = 0; i < m; i++)
-        eng_unref(&it[i].e);
+    pthread_rwlock_unlock(&t->lock);
+
+    /* Follower catch-up for any missed IDs: reload each distinct missed volume once, then re-resolve under one lock. */
+    if (rc == 0 && nmiss) {
+        uint32_t *mvols = malloc(nmiss * sizeof *mvols);
+        size_t nmvols = 0;
+        if (!mvols) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            for (size_t k = 0; k < nmiss; k++) {
+                uint32_t vu = (uint32_t)sid_volume(ids[miss[k]]);
+                bool seen = false;
+                for (size_t j = 0; j < nmvols; j++)
+                    if (mvols[j] == vu) {
+                        seen = true;
+                        break;
+                    }
+                if (!seen)
+                    mvols[nmvols++] = vu;
+            }
+            for (size_t j = 0; j < nmvols; j++) {
+                eng *ve = volume_at(t, mvols[j], true);
+                if (ve)
+                    (void)eng_series_reload(ve);
+            }
+            free(mvols);
+            pthread_rwlock_rdlock(&t->lock);
+            nv = t->nvols;
+            for (size_t k = 0; k < nmiss; k++) {
+                size_t idx = miss[k];
+                int64_t v = sid_volume(ids[idx]);
+                if (v < 0 || (size_t)v >= nv)
+                    continue;
+                uint32_t vu = (uint32_t)v;
+                lvol_ent *ent = lvol_find(&vm, vu, true);
+                if (!ent) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                if (!ent->e) {
+                    eng *ve = t->vols[v];
+                    if (!ve) {
+                        ent->rc = (t->cluster && t->cnames[v]) ? TSDB_ERR_UNAVAILABLE : 0;
+                    } else if (eng_refused(ve)) {
+                        ent->rc = TSDB_ERR_UNAVAILABLE;
+                    } else {
+                        ent->e = eng_ref(ve);
+                        ent->cnt = eng_series_count(ve);
+                    }
+                } else {
+                    ent->cnt = eng_series_count(ent->e);
+                }
+                if (ent->e) {
+                    uint32_t local = TSDB_SID_LOCAL(ids[idx]);
+                    if (local < ent->cnt) {
+                        it[m++] = (latest_item){ent->e, local, (uint32_t)idx};
+                        ent->refreshed = true;
+                    }
+                } else if (ent->rc) {
+                    out[idx].status = ent->rc;
+                }
+            }
+            pthread_rwlock_unlock(&t->lock);
+            for (size_t k = 0; rc == 0 && k < vm.cap; k++)
+                if (vm.e[k].used && vm.e[k].refreshed && vm.e[k].e)
+                    eng_refresh(vm.e[k].e);
+        }
+    }
+    free(miss);
+
+    if (rc == 0 && m) {
+        qsort(it, m, sizeof *it, cmp_latest_item);
+        size_t nc = 0;
+        for (size_t i = 0; i < m; i++)
+            if (i == 0 || it[i].e != it[i - 1].e || (i - cstart[nc - 1]) >= LATEST_CHUNK)
+                cstart[nc++] = i;
+        cstart[nc] = m;
+        if (nc) {
+            latest_job j = {.it = it, .nchunks = nc, .cstart = cstart, .ends = opts ? opts->ends : NULL,
+                            .end = opts && !opts->ends ? opts->end : TSDB_TS_MAX, .with_nulls = opts && opts->with_nulls,
+                            .out = out};
+            atomic_init(&j.next, 0);
+            atomic_init(&j.rc, 0);
+            qrun qr;
+            qs_begin(t, &qr);
+            int want = opts && opts->threads > 0 ? opts->threads : 1 << 20; /* the group's cap clamps it */
+            if ((size_t)want > nc)
+                want = (int)nc;
+            sched_run(t->sched, want, latest_worker, &j);
+            rc = atomic_load(&j.rc);
+            qs_end(&qr, -1, m);
+        }
+    }
+    for (size_t k = 0; k < vm.cap; k++)
+        if (vm.e[k].used && vm.e[k].e)
+            eng_unref(&vm.e[k].e);
+    if (vm.heap)
+        free(vm.e);
     free(it);
     free(cstart);
     return rc;
@@ -3489,11 +3703,43 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
             while (j < m && sid_volume(keys[j].id) == vol)
                 j++;
             eng *e EREFM = NULL;
-            uint32_t local, locals[SSTATS_CHUNK];
+            uint32_t cnt = 0;
+            if (vol >= 0) {
+                pthread_rwlock_rdlock(&t->lock);
+                if ((size_t)vol < t->nvols && t->vols[vol]) {
+                    e = eng_ref_meta(t->vols[vol]);
+                    cnt = eng_series_count(e);
+                }
+                pthread_rwlock_unlock(&t->lock);
+                if (t->opt.read_only) {
+                    if (!e && volume_at(t, (size_t)vol, true)) {
+                        pthread_rwlock_rdlock(&t->lock);
+                        if ((size_t)vol < t->nvols && t->vols[vol]) {
+                            e = eng_ref_meta(t->vols[vol]);
+                            cnt = eng_series_count(e);
+                        }
+                        pthread_rwlock_unlock(&t->lock);
+                    }
+                    if (e && TSDB_SID_LOCAL(keys[j - 1].id) >= cnt) {
+                        uint32_t old_cnt = cnt;
+                        (void)eng_series_reload(e);
+                        cnt = eng_series_count(e);
+                        if (cnt > old_cnt) {
+                            for (size_t q = i; q < j; q++) {
+                                uint32_t loc = TSDB_SID_LOCAL(keys[q].id);
+                                if (loc >= old_cnt && loc < cnt) {
+                                    eng_refresh(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            uint32_t locals[SSTATS_CHUNK];
             size_t at[SSTATS_CHUNK], k = 0;
             size_t dup[SSTATS_CHUNK][2], nd = 0, first_at = 0; /* [to, from]: a repeat gets the first's record */
             for (size_t q = i; q < j; q++) {
-                eng *e2 EREFM = NULL;
                 if (q > i && keys[q].id == keys[q - 1].id) {
                     /* a repeated id is answered once: it would repeat the same scan, and the cost bound counts
                      * the work done, not the ids asked for */
@@ -3502,11 +3748,8 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
                     continue;
                 }
                 first_at = keys[q].at;
-                if (route_meta(t, keys[q].id, &e2, &local)) { /* false: no such volume or id */
-                    if (!e) {
-                        e = e2;
-                        e2 = NULL;
-                    }
+                uint32_t local = TSDB_SID_LOCAL(keys[q].id);
+                if (e && local < cnt) {
                     locals[k] = local;
                     at[k++] = keys[q].at;
                 } else {
