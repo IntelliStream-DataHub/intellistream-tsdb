@@ -9193,6 +9193,21 @@ static void scen_keepfloor(void)
            " holds the leader's rows\n", nw);
 }
 
+static void metrics_get(int port, char *buf, size_t n);
+
+static uint64_t metrics_vol_u64(int port, uint32_t num, const char *metric)
+{
+    static char buf[1 << 20];
+    metrics_get(port, buf, sizeof buf);
+    char key[128];
+    snprintf(key, sizeof key, "\n%s{volume=\"%" PRIu32 "\",path=\"", metric, num);
+    const char *l = strstr(buf, key);
+    const char *e = l ? strstr(l + 1, "\"} ") : NULL;
+    if (!e)
+        die("metrics port %d: missing %s for volume %" PRIu32, port, metric, num);
+    return strtoull(e + 3, NULL, 10);
+}
+
 /* reopenhold: a replica killed with a COMMIT marker in its log whose file it has not staged starts its core with the
  * durable end below that marker (repl_durable.hold), never at its log end. It did start at the log end: its first ACK
  * after the restart claimed the whole log, the leader's keep bound passed the marker, the segment and the link the
@@ -9201,12 +9216,16 @@ static void scen_keepfloor(void)
  * file (dropbulk) and sends no FETCH (nofetch); its log passes the marker and the leader seals the marker's segment;
  * R is killed, and back its syncs wait 4 s (syncpause: its ACKs carry the durable end its core opened with) and it
  * fetches only 5 s late (fetchlate): time enough for the leader, which goes on writing, to save its keep bound by a
- * false ACK and drop the segment. Mutant opennohold. */
+ * false ACK and drop the segment. Also checks that a held replica does not spin WAL syncs while waiting for a missing
+ * file, and wakes promptly via IN_WAKE once the fetched file is staged. Mutant opennohold. */
 static void scen_reopenhold(void)
 {
     scenario("reopenhold");
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
+        penv[i] = "TSDB_REPLD_TEST=noclock";
         start(i);
+        penv[i] = NULL;
+    }
     init_cluster(0, 600);
     node_add(0, 1);
     node_add(0, 2);
@@ -9236,9 +9255,12 @@ static void scen_reopenhold(void)
     int R = (L + 1) % 3;
     stop(R, SIGKILL);
     await_isr(0, "plant", 2, 10000, "a replica killed");
-    penv[R] = "TSDB_REPLD_TEST=dropbulk,nofetch";
+    penv[R] = "TSDB_REPLD_TEST=noclock,dropbulk,nofetch";
+    xargs[R] = "--metrics-port auto";
     start(R);
     penv[R] = NULL;
+    xargs[R] = NULL;
+    int mport_r = th_mport;
     await_open_gen(L, "plant", R, 2, 0);
     struct rep_writer wb = {cports[L], id2, 2000000000, 0, 0, 0, 100000, 0}; /* above wal_max_batch_rows */
     rep_write_thread(&wb);
@@ -9267,10 +9289,17 @@ static void scen_reopenhold(void)
             die("a write after the large one: %s", ers(rc));
         n[0]++;
     }
+    /* while R is held by the missing COMMIT file and idle, do_sync must back off instead of spinning fdatasync() */
+    struct timespec ms200 = {0, 200000000};
+    nanosleep(&ms200, NULL);
+    uint64_t ws0 = metrics_vol_u64(mport_r, num, "tsdb_wal_syncs_total");
     struct timespec s15 = {1, 500000000};
     nanosleep(&s15, NULL);
+    uint64_t ws1 = metrics_vol_u64(mport_r, num, "tsdb_wal_syncs_total");
+    if (ws1 - ws0 > 2)
+        die("a held replica spun WAL syncs while waiting for a missing file: +%" PRIu64 " syncs in 1.5 s", ws1 - ws0);
     stop(R, SIGKILL);
-    penv[R] = "TSDB_REPLD_TEST=fetchlate,syncpause";
+    penv[R] = "TSDB_REPLD_TEST=noclock,fetchlate,syncpause";
     start(R);
     penv[R] = NULL;
     /* writes go on meanwhile: the leader saves its floor, and with it the keep bound, only as the commit point moves */
@@ -9298,11 +9327,57 @@ static void scen_reopenhold(void)
         die("a write with every replica back: %s", ers(rc));
     n[0]++;
     await_isr(0, "plant", 3, 30000, "every replica back");
+    /* IN_WAKE: when a replica in the ISR drops a bulk file and fetches it (with noclock so no NOW marker can mask a
+     * missed wake), staging must wake do_sync() promptly (well below the 1 s retry timer) without spinning WAL syncs */
+    stop(R, SIGKILL);
+    await_isr(0, "plant", 2, 10000, "a replica killed for wake check");
+    penv[R] = "TSDB_REPLD_TEST=noclock,dropbulk";
+    xargs[R] = "--metrics-port auto";
+    start(R);
+    penv[R] = NULL;
+    xargs[R] = NULL;
+    mport_r = th_mport;
+    await_open_gen(L, "plant", R, 4, 0);
+    t += 1000;
+    if ((rc = tsdbc_insert_series(c, id0, &t, &val, 1)) != 0)
+        die("a write before dropbulk wake check: %s", ers(rc));
+    n[0]++;
+    await_isr(0, "plant", 3, 10000, "replica ready for dropbulk wake");
+    int drops0 = log_count(R, "received and not staged (dropbulk)"), fetches0 = log_count(R, "fetches");
+    uint64_t ws2 = metrics_vol_u64(mport_r, num, "tsdb_wal_syncs_total");
+    struct rep_writer wb2 = {cports[L], id2, 3000000000, 0, 0, 0, 66000, 0}; /* above wal_max_batch_rows */
+    pthread_t thw;
+    if (pthread_create(&thw, NULL, rep_write_thread, &wb2) != 0)
+        die("pthread_create");
+    uint64_t t_fetch = 0;
+    for (uint64_t t0 = now_ms(); !__atomic_load_n(&wb2.done, __ATOMIC_ACQUIRE);) {
+        if (!t_fetch && log_count(R, "fetches") > fetches0)
+            t_fetch = now_ms();
+        if (now_ms() - t0 > 30000)
+            die("dropbulk wake write did not finish in 30 s");
+        struct timespec ms = {0, 5000000};
+        nanosleep(&ms, NULL);
+    }
+    uint64_t wake_ms = t_fetch ? now_ms() - t_fetch : 0;
+    pthread_join(thw, NULL);
+    uint64_t ws3 = metrics_vol_u64(mport_r, num, "tsdb_wal_syncs_total");
+    if (wb2.rc != 0)
+        die("a large write with dropbulk wake check: %s", ers(wb2.rc));
+    n[2] += 66000;
+    if (log_count(R, "received and not staged (dropbulk)") <= drops0 || log_count(R, "fetches") <= fetches0)
+        die("dropbulk wake check did not exercise drop + fetch on server %d", R);
+    if (isr_of(L, "plant", NULL) != 3)
+        die("replica dropped from ISR during dropbulk fetch/wake (wake %" PRIu64 " ms)", wake_ms);
+    if (wake_ms > 800)
+        die("dropbulk fetch + IN_WAKE took %" PRIu64 " ms (expected < 800 ms; IN_WAKE missed?)", wake_ms);
+    if (ws3 - ws2 > 10)
+        die("dropbulk fetch/wake spun WAL syncs: +%" PRIu64, ws3 - ws2);
     tsdbc_close(c);
     stop_all();
     rep_same(n, "after a clean stop");
     printf("  a replica killed with a COMMIT marker whose file it had not staged acknowledges below it when back; the"
-           " leader keeps the file, the replica fetches it and holds the leader's rows\n");
+           " leader keeps the file, the replica fetches it and holds the leader's rows (held syncs +%" PRIu64
+           ", dropbulk IN_WAKE %" PRIu64 " ms)\n", ws1 - ws0, wake_ms);
 }
 
 /* the part files in server i's copy of volume 1 (retired ones too: a merge leaves its sources under retired_) */

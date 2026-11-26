@@ -133,6 +133,7 @@ struct rvol {
     int cstall_said;
     uint64_t epoch_pos;  /* M_PROMOTING: the EPOCH marker's position */
     uint64_t fetch_ms;
+    uint64_t fetch_wait_until; /* do_sync back-off while waiting for a missing COMMIT/COLD file (cleared by IN_WAKE/write) */
     char fetch_name[RW_NAME_MAX + 1];
     uint64_t fetch_late_ms;                 /* fetchlate (tests): when fetch_late_name was found missing */
     uint64_t sync_pause_end;                /* syncpause (tests): a replica's syncs wait until then */
