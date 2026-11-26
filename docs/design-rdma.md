@@ -1,6 +1,6 @@
 # RDMA for the peer links
 
-Status: implemented on main through `rd-upgrade` (`--peer-check`, driver checks, `dlopen`-based verbs transport in `server/plrdma.c`, TCP-to-RDMA link upgrade, fallback/backoff, IPoIB refusal, config, and metrics; `rd-cm`, `rd-rxe`, and `rd-hw` remain). Design and measurements written on branch `rdma-design` from main at a06d4bb7 on 2026-11-24.
+Status: implemented on main through `rd-upgrade`, `rd-rxe`, and `rd-hw` (`--peer-check`, driver checks, `dlopen`-based verbs transport in `server/plrdma.c`, TCP-to-RDMA link upgrade, fallback/backoff, IPoIB refusal, config, metrics, active-device/Soft-RoCE test integration, QP-error fault injection, Jepsen RDMA support, and InfiniBand hardware verification/benchmarks; `rd-cm` remains). Design and measurements written on branch `rdma-design` from main at a06d4bb7 on 2026-11-24.
 Target release: **v0.11.0** (the build is the tracks of §9). Revised after an adversarial review the same day: the rate
 caps, the port shared with NFS over RDMA, the MAC's CPU, the upgrade's state machine, credits, registration, the
 build's header detection and where the RDMA tests can run.
@@ -340,6 +340,81 @@ the tracks after this one: the window should follow the kind (bulk, CHUNKB and S
 requests the default; open below §9, to be decided before rd-upgrade turns `auto` on), and a zero-copy path (frames encoded straight into registered slots) is what would move
 peerlink toward the 50 Gbit/s of §3.1. Every run ended with both pools whole (no slot lost) and the check of 2000
 frames both ways, every byte compared, passed.
+
+### 3.7 Cluster benchmarks and window-sizing evidence (rd-hw, 2026-11-26)
+
+Measured on two-socket Intel Xeon Gold 6148 servers (80 threads, AlmaLinux 10) with ConnectX-3 FDR InfiniBand
+(`mlx4_0`, port 1 active, MTU 4096, `rnr_retry=0`, epoll backend, `ulimit -l` 4 GiB). In the single-host 3-member
+cluster runs below, TCP uses kernel loopback while RDMA traverses the physical `mlx4_0` HCA on every data link
+(`tsdb_peer_links_transport{transport="rdma"}` = 72-76 across the 3 nodes, 0 TCP data links, 0 RNR retries, 0 QP
+errors).
+
+**1. 3-member cluster forwarding and replication (`tsdbc-bench via`, 4 connections, 100 rows per insert and read,
+3 reps x 3 s, 3-replica volume):**
+
+| config | direct req/s | direct write p50 (p99) ms | via req/s | via read p50 (p99) ms | read hop p50 ms | credit stalls |
+|---|---:|---:|---:|---:|---:|---:|
+| TCP, `--peer-check none` | 4,177 | 1.663 (4.654) | 3,504 | 0.295 (1.032) | +0.237 | — |
+| RDMA `32 KiB x 12`, `none` | 4,583 (+9.7%) | 1.560 (3.328) | 3,280 | 0.234 (0.498) | +0.173 (-27%) | 0 |
+| RDMA `64 KiB x 32`, `none` | 4,757 (+13.9%) | 1.492 (3.223) | 3,654 | 0.245 (0.525) | +0.187 (-21%) | 0 |
+| TCP, `--peer-check header` | 4,608 | 1.475 (3.893) | 3,683 | 0.225 (1.366) | +0.176 | — |
+| RDMA `32 KiB x 12`, `header` | 4,603 | 1.536 (3.677) | 3,486 | 0.244 (1.582) | +0.186 | 0 |
+| RDMA `64 KiB x 32`, `header` | 4,780 (+3.7%) | 1.501 (3.293) | 3,751 | 0.232 (0.902) | +0.176 | 0 |
+
+On replicated small writes, `fdatasync` dominates (~1.5 ms p50); RDMA over `mlx4_0` still lowers direct write p99 by
+28-31% under `none` and reduces the forwarded read hop p50 by 27% (and p99 by 52%) against TCP loopback. Both
+`--peer-check none` and `--peer-check header` stay within run-to-run variance. `32 KiB x 12` records zero credit
+stalls on LOG and FWD.
+
+**2. 3-member cluster bulk insert and snapshot rebuild** (30M rows in 60 x 500k-row batches bypassing WAL, producing
+188.7 MiB of compressed parts shipped over BULK to 2 replicas; followed by follower loss, `replica reset`, and full
+SNAP rebuild):
+
+| config | bulk insert (M rows/s) | rebuild wall time (ms) | snapshot install phase | credit stalls |
+|---|---:|---:|---:|---:|
+| TCP, `none`, `rebuild_mb_s=200` | 3.54 | 6,700 | 0.1 s | — |
+| RDMA `32 KiB x 12`, `none`, `rebuild_mb_s=200` | 3.64 | 6,971 | 0.1 s | 3,342 |
+| TCP, `none`, `rebuild_mb_s=4096` | 3.62 | 5,804 | 0.1 s | — |
+| RDMA `32 KiB x 12`, `none`, `rebuild_mb_s=4096` | 3.65 | 5,796 | 0.1 s | 4,156 |
+| RDMA `64 KiB x 32`, `none`, `rebuild_mb_s=4096` | 3.53 | 6,749 | 0.1 s | 195 |
+| TCP, `header`, `rebuild_mb_s=4096` | 3.62 | 5,040 | 0.1 s | — |
+| RDMA `32 KiB x 12`, `header`, `rebuild_mb_s=4096` | 3.65 | 7,059 | 0.1 s | 4,297 |
+| RDMA `64 KiB x 32`, `header`, `rebuild_mb_s=4096` | 3.65 | 6,957 | 0.2 s | 225 |
+
+End-to-end bulk insert (~3.65 M rows/s) is bound by part encoding and disk `fdatasync`, and snapshot rebuild wall
+time is bound by failure/ISR detection and metadata commit (the 188.7 MiB snapshot install itself takes 0.1-0.2 s).
+`64 KiB x 32` cuts bulk/snapshot credit stalls by ~20x (4,156 -> 195) without changing end-to-end throughput on
+local storage.
+
+**3. Single-link window-sizing sweep (`test_plrdma` on `mlx4_0`, `check=none`, `rnr_retry=0`, 1 GiB per frame size,
+unthrottled bulk link; every run ended with 0 lost slots):**
+
+| frame | TCP loopback | `32 KiB x 12` (1.0 MiB/conn, 384 KiB win) | `32 KiB x 24` (1.625 MiB/conn, 768 KiB win) | `64 KiB x 16` (2.25 MiB/conn, 1 MiB win) | `64 KiB x 32` (4.0 MiB/conn, 2 MiB win) |
+|---|---:|---:|---:|---:|---:|
+| 4 KiB | 15.39 Gbit/s | 19.45 (+26%) | 21.96 (+43%) | 19.64 (+28%) | 22.58 (+47%) |
+| 16 KiB | 22.67 Gbit/s | 32.49 (+43%) | 38.95 (+72%) | 32.82 (+45%) | 42.06 (+86%) |
+| 64 KiB | 28.47 Gbit/s | 31.53 (+11%) | 41.07 (+44%) | 37.17 (+31%) | 42.23 (+48%) |
+| 256 KiB (`PL_BULK_CHUNK`) | 27.91 Gbit/s | 26.45 (-5%) | **40.72 (+46%)** | 39.82 (+43%) | 41.86 (+50%) |
+| 1 MiB (FWDQ/CHUNK) | 26.40 Gbit/s | 26.99 (+2%) | 28.88 (+9%) | **33.84 (+28%)** | 32.64 (+24%) |
+| 4 MiB | 21.11 Gbit/s | 18.32 (-13%) | 20.58 (-3%) | **22.54 (+7%)** | 21.99 (+4%) |
+| Credit stalls (at 256 KiB) | — | 12,488 | 4,593 (-63%) | 3,953 (-68%) | 1,115 (-91%) |
+| Sender / receiver CPU s/GB (256 KiB) | 0.307 / 0.165 | 0.381 / 0.241 | 0.292 / 0.186 | 0.294 / 0.164 | 0.289 / 0.181 |
+
+**Window-sizing and pool recommendation (resolving §9's open question):**
+- With `check=none` (today's default since `rd-nocheck`), the link thread no longer spends 35 µs per MiB hashing every
+  frame, so §3.6's 23-41% deficit for `32 KiB x 12` at 1-4 MiB largely disappears: `32 KiB x 12` beats TCP at 4-64 KiB
+  and 1 MiB, trails by only 5% at 256 KiB, has zero credit stalls on LOG/FWD, and fits 64 connections inside the
+  default 64 MiB pool (a 5-node cluster uses ~37 connections/node = 37 MiB; an 8-node cluster with 56 connections uses
+  56 MiB). **Keep `32 KiB x 12` and `cluster.peer.rdma.pool_mb = 64` as the safe default for `auto` today.**
+- Do **not** switch uniformly to `64 KiB x 32` (4.0 MiB/conn): it costs 224 MiB for 56 connections (3.5x the default
+  pool) for zero benefit on latency kinds (LOG, FWD, CHUNK).
+- When raising bulk rate caps (D11) or adding zero copy, adopt **per-kind window sizing out of the single 32 KiB slot
+  pool**: keep `32 KiB x (12 + 4 + 16)` (1.0 MiB/conn) for latency kinds (LOG, FWD, CHUNK) and give bulk/streaming
+  kinds (BULK, SNAP, CHUNKB, FWDQ) `32 KiB x (24 + 4 + 24)` (1.625 MiB/conn, 768 KiB window). That delivers **40.72
+  Gbit/s at 256 KiB** (97% of `64 KiB x 32`'s 41.86 Gbit/s, +54% over `32 KiB x 12`) with one uniform slot size,
+  costing **76 MiB** across an 8-node cluster (24 x 1.0 + 32 x 1.625 MiB — fits `pool_mb = 96` or `128`, well under
+  `LimitMEMLOCK=256M` or `infinity`). Where 1-4 MiB cells dominate (cold CHUNK/FWDQ), `64 KiB x 16` (2.25 MiB/conn,
+  33.84 Gbit/s at 1 MiB) outperforms `64 KiB x 32` at 56% of its memory cost.
 
 ## 4. What RDMA would give each kind, and at what cost
 
@@ -892,9 +967,30 @@ line rate either way; a pair of servers was not measured).
   changes it), so a SEND that finds no posted receive fails the queue pair and the check: on real verbs the credit rule
   is then checked, not hidden by retries (the §3.6 numbers were taken with the default 3; with 0, one run of each
   window, the default at 4 KiB to 4 MiB frames and 64 KiB x 32 at 4 KiB to 1 MiB, 1 GiB per size: the check and the
-  bench passed, no queue pair failed, both pools whole). Not run on the hardware yet:
-  a queue pair that fails mid-stream, a peer killed with receives in flight, a drain after an error with unsignalled
-  sends in flight (how mlx4 reports flushed unsignalled work requests is checked only against the fake); rd-hw's.
+  bench passed, no queue pair failed, both pools whole).
+- **Verified on real hardware in rd-hw (2026-11-26)** on two-socket Xeon Gold 6148 servers with ConnectX-3 FDR
+  InfiniBand (`mlx4_0`, `rnr_retry=0`):
+  - Fault-injection hook `TSDB_PLRDMA_TEST` in `server/plrdma.c` (`qperr=N`, `qperr_file=PATH`, `rnr_retry=N`,
+    `slot/data/ctl/send` overrides; unit-tested in `test_plrdma testhook`) forces live QPs into `IBV_QPS_ERR`
+    mid-stream while unsignalled sends and posted receives are in flight, exercising real `mlx4` `IBV_WC_WR_FLUSH_ERR`
+    flushing, `ib_drain_qp` marker draining, pool slot return, and peerlink TCP fallback/backoff.
+  - `test_cluster` key scenarios (`replicate`, `forward`, `fwdlinks`, `fwdload`, `chunksrv`, `snaplarge`, `drvcheck`)
+    run with `TSDB_CLUSTER_PEER_RDMA=on` and `TSDB_PLRDMA_TEST=rnr_retry=0` over `mlx4_0`: all passed, 0 failures, 0
+    pool leaks.
+  - `jepsen_cluster` (`--peer-rdma on|auto`, `--peer-rdma-pool-mb N`, `--nemesis rdma-qperr`) on 5 nodes over `mlx4_0`
+    (`workload kv`, `rnr_retry=0`, 60 s each, 184 peak RDMA links across the 5 nodes):
+    - `kill` (`--peer-rdma on`): 24 SIGKILLs with receives and sends in flight, 5,965 writes acked, 3,088 reads, 304
+      filler batches, 0 violations, 0 pool leaks, 0 RNR retries.
+    - `partition` (`--peer-rdma on`): 15 partition rounds (421 proxied links held and reset on heal, tearing down live
+      QPs via TCP anchor reset), 29,185 writes acked, 14,331 reads, 705 filler batches, 0 violations, 0 pool leaks.
+    - `rdma-qperr` (`--peer-rdma on`): 33 forced mid-stream QP errors with unsignalled sends and receives in flight,
+      every QP drained cleanly and redialed back to RDMA, 28,460 writes acked, 14,305 reads, 655 filler batches, 0
+      violations, 0 pool leaks, 0 RNR retries.
+    - `rdma-qperr` (`--peer-rdma auto`): 31 forced mid-stream QP errors triggering 9 automatic TCP backoff fallbacks
+      (end state 166 RDMA, 18 TCP), 27,699 writes acked, 14,251 reads, 670 filler batches, 0 violations, 0 pool leaks.
+  - This closes the hardware fault-handling items above (mid-stream QP error, peer killed with receives in flight,
+    `mlx4` drain after error with unsignalled sends in flight). Still pending a production-like NFS/RDMA mount: NFS
+    read/write and WAL `fdatasync` latency under concurrent peer bulk load (D11).
 - `make test-spdx`, `make check-version` unchanged; `tools/check-glibc.sh` must still pass (no new linked library).
 
 ## 9. Track plan
@@ -903,19 +999,20 @@ line rate either way; a pair of servers was not measured).
 |---|---|---|---|---|
 | rd-mac | high | main | built (2026-11-24): server/plcheck.h (AGPL; XXH3-128, xxHash vendored unchanged under server/xxhash with `UPSTREAM`; SSE2 at v2, so no dispatch), server/peerlink.c (`frame_check` in place of `frame_tag`, the salt from the handshake's transcript, the check type negotiated in HELLO), `PL_CL_VERSION` 8 (`PL_CAP_RDMA` is rd-seam's), tools/mac_cands.c and `link-bench mac` / `run --mac` (every candidate, with known answers), tests/test_peerlink.c (the check's known answers in `codec`, every bit of a frame's length, type and check flipped, replays up to 2^63 frames back, the salts each handshake derives (`salts`), a raw acceptor that names an unoffered type (`dialtype`); mutants `notag noseq nosalt checktype samesalt notranscript dialanytype notype halfcmp seq8`), fuzz-replframe corpus; then D14's measurements | 3 |
 | rd-seam | medium | rd-mac | built (2026-11-25): server/pltransport.h (read, writev, poll_fds with `*ready`, poll_ready, close after on_link(down); no shutdown op until rd-upgrade gives it a caller), the TCP transport in server/peerlink.c with no change in behaviour, the capability byte of HELLO and HELLO_ACK (`PL_CAP_RDMA` sent 0), tests/pl_fake.h (an in-memory pair: level mode, and edge mode with one slot per read, news drained before the poll, two fds) under `peerlink_test_attach`; test_peerlink `fake`, `fakeready`, `fakeend`, mutants `noready closefirst wnoshort nhandall` | 1 |
-| rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
-| rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |
+| rd-verbs | high | rd-seam, D14 | built (2026-11-25): dlopen of rdma-core 61 (`server/plrdma_dl.c`, `tools/check-rdma-syms.sh`), `server/plrdma.[ch]` (one pool per tsdbd/device, per-connection rings, data/control credits, `ib_drain_qp` drain, completion fd in poll), Makefile header detection and `NO_RDMA`, `tests/test_plrdma.c` with fake fabric and mutants | 3 |
+| rd-upgrade | high | rd-verbs | built (2026-11-25): `server/peerlink.c` §5.1 state machine (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, 3-failure backoff, live re-offer, subnet decline, SL, IPoIB refusal (§5.3), config keys, metrics, `tsdb cluster status`, upgrade tests and mutants | 2 |
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |
-| rd-rxe | medium | rd-upgrade | built: `tests/rdma_dev.h` (active IB/rxe/siw discovery without root, `TSDB_RDMA_DEV`, `TSDB_RDMA_REQUIRED=1`), `tools/setup-rxe.sh` (`--check`/`--setup`/`--teardown` + memlock check), `TSDB_PLRDMA_TEST=rnr_retry=0` and compact small-pool slot scaling in `tsdbd.c`, non-zero GID scan in `plrdma_dl.c`, `test_peerlink --rdma` + `rdma` case, `test_cluster rdma` (in `CLUSTER_SCEN_3`), `make test-rdma` | 1 |
-| rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed (batched, buffers on both sides); on a production-like node NFS/RDMA and WAL `fdatasync` latency under peer bulk load at several caps, and the end-to-end rebuild rate (D11); results here | 1.5 |
+| rd-rxe | medium | rd-upgrade | built (2026-11-26): `tests/rdma_dev.h` (active IB/rxe/siw discovery without root, `TSDB_RDMA_DEV`, `TSDB_RDMA_REQUIRED=1`), `tools/setup-rxe.sh` (`--check`/`--setup`/`--teardown` + memlock check), `TSDB_PLRDMA_TEST=rnr_retry=0` and compact small-pool slot scaling in `tsdbd.c`, non-zero GID scan in `plrdma_dl.c`, `test_peerlink --rdma` + `rdma` case, `test_cluster rdma` (in `CLUSTER_SCEN_3`), `make test-rdma` | 1 |
+| rd-hw | low | rd-rxe | built & verified (2026-11-26): `TSDB_PLRDMA_TEST` mid-stream QP error hook (`server/plrdma.c`), `test_cluster` `TSDB_CLUSTER_PEER_RDMA` wiring, `jepsen_cluster` `--peer-rdma`/`--peer-rdma-pool-mb`/`rdma-qperr` nemesis; verified on ConnectX-3 FDR IB (`mlx4_0`, `rnr_retry=0`): `test_cluster` (7 scenarios), 4 x 60 s 5-node Jepsen runs (`kill`, `partition`, `rdma-qperr` `on` & `auto`, 0 violations, 0 pool leaks), 3-node `tsdbc-bench via` + bulk/snapshot + single-link window-sizing sweep (§3.7). Remaining for D11 cap increase: NFS/RDMA + WAL `fdatasync` co-existence on a production-like NFS/RDMA mount | 1.5 |
 
-Open before rd-upgrade turns `auto` on (D6), from §3.6: with the default connection (32 KiB slots, 12 data credits)
-bulk frames of 1 MiB and 4 MiB are 23% and 41% slower than checked TCP, and the window that wins (64 KiB x 32, about
-2 MiB in flight) does not fit D7's sizing (56 connections x (32 + 4 receive + 28 send) x 64 KiB is about 230 MiB
-against the default 64 MiB pool). A window per kind, the pool's size and the memlock it needs are to be decided
-first. rd-upgrade also creates the key `cluster.peer.rdma.pool_mb` under that name: the pool's error lines already
-name it. The pool's memlock check counts the pool alone; the queue pairs' buffers and io_uring's rings count against
-the same limit, which the line says.
+**Window-sizing resolution (closed in rd-hw, 2026-11-26; §3.7):** with `check=none` (default since `rd-nocheck`),
+`32 KiB x 12` (1.0 MiB/conn, 384 KiB window) beats TCP at 4-64 KiB and 1 MiB, has 0 credit stalls on LOG/FWD, and fits
+64 connections inside the default `cluster.peer.rdma.pool_mb = 64` (so `auto` is safe with the current default).
+Uniform `64 KiB x 32` (4.0 MiB/conn, 224 MiB for 56 connections) is not recommended. When raising D11 bulk rate caps,
+use per-kind window sizing from the single 32 KiB slot pool (`32 KiB x 12` for LOG/FWD/CHUNK, `32 KiB x 24` for
+BULK/SNAP/CHUNKB/FWDQ: 40.72 Gbit/s at 256 KiB, 76 MiB for an 8-node cluster, fitting `pool_mb = 96-128` under
+`LimitMEMLOCK=256M` or `infinity`). The pool's memlock check counts the pool alone; queue pair buffers and io_uring's
+rings count against the same limit, which the error line states.
 
 About 12 days; rd-mac stands alone and is worth merging first even if the rest waits, and D14's decision point
 follows it. The gates: the targeted tests of

@@ -23,8 +23,10 @@
  * --mutant NAME plants a bug of plrdma.h's list; each must fail this test.
  */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -683,6 +685,22 @@ static void test_pool(void)
         printf("  pool: %u data and %u control slots: %s\n", (unsigned)b.data_slots, (unsigned)b.ctl_slots,
                p ? "opened" : err);
         CHECK(!p && strstr(err, "control slots must be"));
+        if (p)
+            plr_pool_close(p);
+    }
+    /* rnr_retry above IB 3-bit range (0..7) and slot size above plr_ep_decode's 16 MiB cap must be refused */
+    {
+        struct plr_pool_cfg b = c;
+        b.rnr_retry = 8;
+        p = plr_pool_open(&pfk_ops, &b, err, sizeof err);
+        CHECK(!p && errno == EINVAL);
+        if (p)
+            plr_pool_close(p);
+        b = c;
+        b.slot = (1u << 24) + 64;
+        b.pool_bytes = (size_t)b.slot * (b.data_slots + b.ctl_slots + b.send_slots);
+        p = plr_pool_open(&pfk_ops, &b, err, sizeof err);
+        CHECK(!p && errno == EINVAL);
         if (p)
             plr_pool_close(p);
     }
@@ -1674,6 +1692,182 @@ static void test_upframes(void)
     free(a);
 }
 
+/* TSDB_PLRDMA_TEST fault-injection hooks: qperr=N and qperr_file=PATH force live QPs to error mid-stream with
+ * unsignalled sends and receives in flight, draining cleanly back to the pool and triggering TCP backoff/recovery. */
+static void test_testhook(void)
+{
+    const char *orig_env = getenv("TSDB_PLRDMA_TEST");
+    char *saved_env = orig_env ? strdup(orig_env) : NULL;
+    char err[256];
+    struct pfk_fab *f = pfk_new();
+    f->slow_flush = 1;
+    struct plr_pool_cfg pc = small_cfg();
+#ifndef TSDB_TEST_HOOKS
+    /* Release build (TSDB_TEST_HOOKS=0): TSDB_PLRDMA_TEST must be completely ignored. */
+    setenv("TSDB_PLRDMA_TEST", "rnr_retry=99,slot=999,ctl=999,qperr=abc", 1);
+    struct plr_pool *p = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    CHECK(p != NULL);
+    if (p)
+        plr_pool_close(p);
+    printf("  testhook: release build ignores TSDB_PLRDMA_TEST (ok)\n");
+#else
+    /* Case 0: valid overrides and strict bounds/wraparound/non-numeric/path-truncation rejection */
+    setenv("TSDB_PLRDMA_TEST", "rnr_retry=0,slot=8192,data=6,ctl=5,send=10", 1);
+    struct plr_pool *pov = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    CHECK(pov != NULL);
+    if (pov) {
+        struct plr_pool_stats st;
+        plr_pool_stats(pov, &st);
+        CHECK(st.slots == pc.pool_bytes / 8192);
+        plr_pool_close(pov);
+    }
+    static const char *const bad_envs[] = {
+        "rnr_retry=8",
+        "rnr_retry=256",
+        "rnr_retry=abc",
+        "rnr_retry=-1",
+        "rnr_retry=",
+        "slot=512",
+        "slot=4097",
+        "slot=33554432",
+        "slot=4294971392",
+        "slot=abc",
+        "data=0",
+        "data=65536",
+        "data=65537",
+        "data=abc",
+        "ctl=3",
+        "ctl=256",
+        "ctl=65540",
+        "ctl=abc",
+        "send=1",
+        "send=65536",
+        "send=65538",
+        "send=abc",
+        "qperr=abc",
+        "qperr=-1",
+        "qperr=",
+        "qperr=99999999999999999999999999",
+    };
+    for (size_t i = 0; i < sizeof bad_envs / sizeof bad_envs[0]; i++) {
+        setenv("TSDB_PLRDMA_TEST", bad_envs[i], 1);
+        errno = 0;
+        struct plr_pool *pb_bad = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+        CHECK(!pb_bad && errno == EINVAL);
+        if (pb_bad)
+            plr_pool_close(pb_bad);
+    }
+    /* Overlong qperr_file path (>= PATH_MAX) must be rejected cleanly rather than truncated before unlink() */
+    char *long_env = malloc(PATH_MAX + 64);
+    CHECK(long_env != NULL);
+    if (long_env) {
+        memcpy(long_env, "qperr_file=/", 12);
+        memset(long_env + 12, 'a', PATH_MAX);
+        long_env[12 + PATH_MAX] = '\0';
+        setenv("TSDB_PLRDMA_TEST", long_env, 1);
+        errno = 0;
+        struct plr_pool *pb_long = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+        CHECK(!pb_long && errno == EINVAL);
+        if (pb_long)
+            plr_pool_close(pb_long);
+        free(long_env);
+    }
+    unsetenv("TSDB_PLRDMA_TEST");
+
+    struct plr_pool *pa = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+
+    /* Case 1: qperr_file trigger consumes the file, forces QP error, drains cleanly, and redials */
+    char trig[128];
+    snprintf(trig, sizeof trig, "/tmp/tsdb_plrdma_qperr_%d", (int)getpid());
+    unlink(trig);
+    char envbuf[160];
+    snprintf(envbuf, sizeof envbuf, "qperr_file=%s,rnr_retry=0", trig);
+    setenv("TSDB_PLRDMA_TEST", envbuf, 1);
+    struct plr_pool *pb = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    unsetenv("TSDB_PLRDMA_TEST");
+    CHECK(pa && pb);
+    plr_pool_test_on_free(pa, on_free, f);
+    plr_pool_test_on_free(pb, on_free, f);
+
+    struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+    rcb.retry_ms = 200;
+    struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
+    struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
+    int port = peerlink_listen(a->pl, 0);
+    CHECK(port > 0);
+    char addr[64];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    CHECK(lb && WAIT_FOR(plink_up(lb) && plink_is_rdma(lb), 5000));
+    int fd = open(trig, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    if (fd >= 0)
+        close(fd);
+    uint64_t next = 0;
+    int d0 = atomic_load(&b->downs);
+    for (int i = 0; i < 40 && atomic_load(&b->downs) == d0; i++) {
+        uint8_t buf[512];
+        fill(buf, sizeof buf, next++);
+        (void)plink_send(lb, 1, buf, sizeof buf, 50);
+        usleep(5000);
+    }
+    CHECK(WAIT_FOR(access(trig, F_OK) != 0, 3000));
+    CHECK(WAIT_FOR(atomic_load(&b->downs) > d0, 3000));
+    CHECK(WAIT_FOR(plink_up(lb) && plink_is_rdma(lb), 5000)); /* recovered back to RDMA on redial */
+    unlink(trig);
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    check_pools_clean(f, pa, pb, "testhook-file");
+    plr_pool_close(pb);
+    free(a);
+    free(b);
+
+    /* Case 2: qperr=3 forces repeated QP errors -> 3 failures hit backoff -> link falls back to TCP cleanly */
+    setenv("TSDB_PLRDMA_TEST", "qperr=3,rnr_retry=0", 1);
+    pb = plr_pool_open(&pfk_ops, &pc, err, sizeof err);
+    unsetenv("TSDB_PLRDMA_TEST");
+    CHECK(pb != NULL);
+    plr_pool_test_on_free(pb, on_free, f);
+    rca = fast_rcfg(pa, PL_RDMA_AUTO);
+    rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+    rcb.stable_ms = 60000;
+    rcb.backoff_min_ms = 5000;
+    rcb.retry_ms = UINT64_MAX;
+    a = node_new_rdma(1, 100, 2000, PL_CHECK_NONE, &rca);
+    b = node_new_rdma(2, 100, 2000, PL_CHECK_NONE, &rcb);
+    port = peerlink_listen(a->pl, 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+    lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+    uint64_t t0 = now_ms();
+    int fell_back_tcp = 0;
+    while (now_ms() - t0 < 10000) {
+        if (plink_up(lb) && !plink_is_rdma(lb)) {
+            fell_back_tcp = 1;
+            break;
+        }
+        uint8_t buf[512];
+        fill(buf, sizeof buf, next++);
+        (void)plink_send(lb, 1, buf, sizeof buf, 20);
+        usleep(5000);
+    }
+    CHECK(fell_back_tcp);
+    peerlink_free(b->pl);
+    peerlink_free(a->pl);
+    check_pools_clean(f, pa, pb, "testhook-every");
+    plr_pool_close(pa);
+    plr_pool_close(pb);
+    free(a);
+    free(b);
+#endif
+    pfk_free(f);
+    if (saved_env) {
+        setenv("TSDB_PLRDMA_TEST", saved_env, 1);
+        free(saved_env);
+    } else {
+        unsetenv("TSDB_PLRDMA_TEST");
+    }
+}
+
 /* ------------------------------------------------------------------------------------------------- two hosts */
 /*
  * --verbs-listen ADDR --port-file F on one host, --verbs-dial ADDR:PORT on the other: the transport on real verbs
@@ -2095,7 +2289,8 @@ int main(int argc, char **argv)
                  {"wakeup", test_wakeup},     {"errors", test_errors},     {"upgrade", test_upgrade},
                  {"lateready", test_lateready}, {"abortseq", test_abortseq}, {"golost", test_golost},
                  {"declines", test_declines}, {"badauth", test_badauth},   {"backoff", test_backoff},
-                 {"keepqueue", test_keepqueue}, {"ipoib", test_ipoib},     {"upframes", test_upframes}};
+                 {"keepqueue", test_keepqueue}, {"ipoib", test_ipoib},     {"upframes", test_upframes},
+                 {"testhook", test_testhook}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && !strstr(only, cases[i].name))
             continue;

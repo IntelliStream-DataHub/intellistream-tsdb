@@ -300,7 +300,7 @@ static pid_t spawn_server(int i, char *pf, size_t pfn)
         }
         char state[PATH_MAX + 90];
         snprintf(state, sizeof state, "%s/state", dir);
-        const char *argv[48];
+        const char *argv[64];
         int n = 0;
         argv[n++] = "tsdbd";
         if (!auth_on[i])
@@ -332,9 +332,21 @@ static pid_t spawn_server(int i, char *pf, size_t pfn)
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
         }
+        if (getenv("TSDB_CLUSTER_PEER_RDMA") && *getenv("TSDB_CLUSTER_PEER_RDMA")) {
+            argv[n++] = "--peer-rdma";
+            argv[n++] = getenv("TSDB_CLUSTER_PEER_RDMA");
+        }
+        if (getenv("TSDB_CLUSTER_PEER_RDMA_POOL_MB") && *getenv("TSDB_CLUSTER_PEER_RDMA_POOL_MB")) {
+            argv[n++] = "--peer-rdma-pool-mb";
+            argv[n++] = getenv("TSDB_CLUSTER_PEER_RDMA_POOL_MB");
+        }
+        if (getenv("TSDB_CLUSTER_PEER_RDMA_DEV") && *getenv("TSDB_CLUSTER_PEER_RDMA_DEV")) {
+            argv[n++] = "--peer-rdma-device";
+            argv[n++] = getenv("TSDB_CLUSTER_PEER_RDMA_DEV");
+        }
         char extra[PATH_MAX + 512];
         snprintf(extra, sizeof extra, "%s", xargs[i] ? xargs[i] : "");
-        for (char *t = strtok(extra, " "); t && n < 46; t = strtok(NULL, " "))
+        for (char *t = strtok(extra, " "); t && n < 60; t = strtok(NULL, " "))
             argv[n++] = t;
         argv[n] = NULL;
         execv(bin, (char *const *)argv);
