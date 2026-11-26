@@ -661,11 +661,10 @@ static void test_inproc(const char *base)
     CHECK(wrong == 0);
     size_t capped = auth_map_total();
     CHECK(capped > 0 && capped <= (32 << 10) + 4096);
-    auth_map_budget = budget;
 
     /* P-24: auth_ids_mask must match auth_id bit-for-bit across mixed-tenant, cross-leaf (>4096), cross-L2
      * (second volume + high local ids), TSDB_SID_NONE, unknown/malformed ids, superuser, --no-auth, nogrant,
-     * NEED_ANY, R_INSERT, in-place own==ids, and past auth_map_budget. */
+     * NEED_ANY, R_INSERT, in-place own==ids, and past auth_map_budget (still capped at 32 KiB here). */
     char v2dir[PATH_MAX + 64];
     snprintf(v2dir, sizeof v2dir, "%s-vol2", dir);
     uint32_t v2num = 0;
@@ -769,6 +768,20 @@ static void test_inproc(const char *base)
         for (size_t j = 0; j < (mn + 7) / 8; j++)
             mask_wrong += mden[j] != 0;
     }
+    CHECK(mask_wrong == 0);
+    /* Still within the 32 KiB cap after all over-budget auth_ids_mask calls; then restore budget and re-verify
+     * with cached cross-L2/cross-leaf radix entries populated. */
+    CHECK(auth_map_total() <= (32 << 10) + 4096);
+    auth_map_budget = budget;
+    memset(mden, 0xaa, (mn + 7) / 8);
+    auth_ids_mask(&r, mids, mn, R_READ, mown, mden);
+    for (size_t i = 0; i < mn; i++) {
+        bool want_no = auth_id(&r, mids[i], R_READ) != 0;
+        bool got_no = ((mden[i >> 3] >> (i & 7)) & 1) != 0;
+        mask_wrong += (got_no != want_no) || (mown[i] != (want_no ? TSDB_SID_NONE : mids[i]));
+    }
+    if (mn & 7)
+        mask_wrong += (mden[mn >> 3] >> (mn & 7)) != 0;
     CHECK(mask_wrong == 0);
     auth_conn_free(&su);
     free(mids);

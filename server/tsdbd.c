@@ -468,8 +468,9 @@ static void inflate_release(size_t n)
 /* Per-worker reusable scratch: zstd decompression context and capped grow-only buffers for insert_packed, plus the
  * RAW_CHUNK_ROWS query output buffers (128 KiB + 130 KiB). Cleaned up deterministically on worker exit (and via a
  * pthread_key destructor / atexit for any other thread, such as fuzz_frames' main thread) so LSan reports zero leaks. */
-#define PACK_RAW_KEEP ((size_t)24 << 20)
-#define PACK_ARR_KEEP ((size_t)16 << 20)
+#define PACK_RAW_KEEP ((size_t)4 << 20)
+#define PACK_ARR_KEEP ((size_t)4 << 20)
+static size_t pack_raw_keep = PACK_RAW_KEEP, pack_arr_keep = PACK_ARR_KEEP;
 
 typedef struct worker_scratch {
     ZSTD_DCtx *dctx;
@@ -482,6 +483,7 @@ typedef struct worker_scratch {
 
 static __thread worker_scratch wscratch;
 static pthread_key_t wscratch_key;
+static bool wscratch_key_ok;
 static pthread_once_t wscratch_once = PTHREAD_ONCE_INIT;
 
 static void worker_scratch_reset(worker_scratch *s)
@@ -507,7 +509,7 @@ static void worker_scratch_free(void)
 
 static void worker_scratch_init_once(void)
 {
-    pthread_key_create(&wscratch_key, worker_scratch_dtor);
+    wscratch_key_ok = pthread_key_create(&wscratch_key, worker_scratch_dtor) == 0;
     atexit(worker_scratch_free);
 }
 
@@ -515,8 +517,8 @@ static worker_scratch *worker_scratch_get(void)
 {
     if (!wscratch.key_set) {
         pthread_once(&wscratch_once, worker_scratch_init_once);
-        pthread_setspecific(wscratch_key, &wscratch);
-        wscratch.key_set = true;
+        if (wscratch_key_ok && pthread_setspecific(wscratch_key, &wscratch) == 0)
+            wscratch.key_set = true;
     }
     return &wscratch;
 }
@@ -1632,10 +1634,10 @@ static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb
     size_t vals_need = (size_t)n * w + (size_t)n / 8 + 9; /* values, then the bitmap */
     size_t ser_need = many ? (size_t)n * 8 + 8 : 0;
     bool raw_tmp = false, ts_tmp = false, vals_tmp = false, ser_tmp = false;
-    uint8_t *raw = pack_buf_get(&ws->pack_raw, &ws->pack_raw_cap, raw_need, PACK_RAW_KEEP, &raw_tmp);
-    int64_t *ts = pack_buf_get(&ws->pack_ts, &ws->pack_ts_cap, ts_need, PACK_ARR_KEEP, &ts_tmp);
-    uint8_t *vals = pack_buf_get(&ws->pack_vals, &ws->pack_vals_cap, vals_need, PACK_ARR_KEEP, &vals_tmp);
-    tsdb_sid *series = many ? pack_buf_get(&ws->pack_series, &ws->pack_series_cap, ser_need, PACK_ARR_KEEP, &ser_tmp)
+    uint8_t *raw = pack_buf_get(&ws->pack_raw, &ws->pack_raw_cap, raw_need, pack_raw_keep, &raw_tmp);
+    int64_t *ts = pack_buf_get(&ws->pack_ts, &ws->pack_ts_cap, ts_need, pack_arr_keep, &ts_tmp);
+    uint8_t *vals = pack_buf_get(&ws->pack_vals, &ws->pack_vals_cap, vals_need, pack_arr_keep, &vals_tmp);
+    tsdb_sid *series = many ? pack_buf_get(&ws->pack_series, &ws->pack_series_cap, ser_need, pack_arr_keep, &ser_tmp)
                             : NULL;
     int rc = !raw || !ts || !vals || (many && !series) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
@@ -3982,10 +3984,10 @@ static void *worker_main(void *arg)
         while (!work_head && !work_stop && (!extra || running_workers - waiting_workers <= 1))
             pthread_cond_wait(&work_cv, &work_lock);
         if (!work_head) {
+            worker_scratch_free();
             if (--running_workers == 0)
                 pthread_cond_broadcast(&workers_gone_cv);
             pthread_mutex_unlock(&work_lock);
-            worker_scratch_free();
             route_release();
             return NULL;
         }
@@ -4538,10 +4540,10 @@ static void *fwd_worker_main(void *arg)
         while (!fq_head && !atomic_load(&fwd_stop) && (!extra || fwd_running - fwd_waiting <= 1))
             pthread_cond_wait(&fwd_cv, &fwd_lock);
         if (!fq_head || atomic_load(&fwd_stop)) {
+            worker_scratch_free();
             if (--fwd_running == 0)
                 pthread_cond_broadcast(&fwd_gone_cv);
             pthread_mutex_unlock(&fwd_lock);
-            worker_scratch_free();
             route_release();
             return NULL;
         }
@@ -6971,6 +6973,18 @@ int main(int argc, char **argv)
     signal(SIGHUP, tenants_file ? on_hup : SIG_IGN);
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
     base_workers = running_workers = nworkers;
+    {
+        /* Bound per-worker retained insert_packed scratch (4 arrays: raw, ts, vals, series) against req_budget
+         * so many workers or a small --max-request-memory never permanently pin more than a quarter of it. */
+        size_t max_w = (size_t)nworkers + (size_t)(cluster_on ? fwd_base : 0);
+        if (max_w < 1)
+            max_w = 1;
+        size_t dyn = req_budget / (16 * max_w);
+        if (dyn < pack_raw_keep)
+            pack_raw_keep = dyn;
+        if (dyn < pack_arr_keep)
+            pack_arr_keep = dyn;
+    }
     if (mfd >= 0) {
         metrics_cfg mc = {.db = db,
                           .listen_fd = mfd,
