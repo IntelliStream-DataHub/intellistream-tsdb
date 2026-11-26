@@ -2670,6 +2670,72 @@ static void scen_voterstale(void)
     printf("  a voter restarted while the group is away serves its copy, marked stale, then the live state\n");
 }
 
+/* Regression: a voter restarted from a snapshot whose C.sm holds stale peer ports for voters that restarted while it
+ * was down (or before C.sm applied past their MEMBER_ADDR) must prefer the fresher peer addresses from its watch probe
+ * (C.wsm) and persisted copy (C.cpy) instead of dialing dead ports forever. */
+static void scen_snapmove(void)
+{
+    scenario("snapmove");
+    for (int i = 0; i < 5; i++) {
+        envs[i] = "snap_every=2";
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters");
+    struct view x;
+    view(0, &x);
+    struct catch_up c = {x.m.applied, meta_hash(&x.m)};
+    view_free(&x);
+    await_view(1, p_caught_up, &c, "n1 caught up");
+    char snap[PATH_MAX];
+    snprintf(snap, sizeof snap, "%s/n1/state/snapshot", base);
+    for (uint64_t t0 = now_ms(); access(snap, F_OK) != 0; usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("n1 did not write %s", snap);
+    /* Stop n1 (its snapshot holds the original peer ports of n0, n2, n3, n4), then restart n0, n2, n3 one by one so
+     * each moves to a new ephemeral peer port while n4 stays at its original port (reachable by n1's watch probe). */
+    stop(1, SIGTERM);
+    int moved[3] = {0, 2, 3};
+    for (int k = 0; k < 3; k++) {
+        int i = moved[k];
+        struct state_want up = {ids[i], META_UP, 2};
+        stop(i, SIGTERM);
+        start(i);
+        await_view(4, p_member_state, &up, "moved voter back UP");
+    }
+    /* Ensure the Raft leader is one of the moved voters (0, 2, or 3), not n4: if n4 leads, pause it briefly so a
+     * moved voter wins leadership (quorum 3 of {0, 2, 3}), then unpause n4. */
+    view(4, &x);
+    uint32_t lead = x.st.leader;
+    view_free(&x);
+    if (lead == ids[4]) {
+        pause_server(4, 1);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            view(0, &x);
+            lead = x.st.leader;
+            view_free(&x);
+            if (lead == ids[0] || lead == ids[2] || lead == ids[3])
+                break;
+            if (now_ms() - t0 > 30000)
+                die("no moved voter led while n4 was paused (leader %" PRIu32 ")", lead);
+        }
+        pause_server(4, 0);
+    }
+    /* Now restart n1 at a new ephemeral peer port: the leader (a moved voter) only knows n1's old port, and n1's
+     * snapshot only knows the leader's old port; n1 must learn the leader's new port via its watch probe to n4. */
+    start(1);
+    struct state_want n1_up = {ids[1], META_UP, 2};
+    await_view(4, p_member_state, &n1_up, "restarted voter back UP after leader moved ports");
+    view(4, &x);
+    uint64_t app = x.m.applied;
+    view_free(&x);
+    await_view(1, p_fresh_from, &app, "restarted voter caught up with moved leader");
+    printf("  voter restarted from stale snapshot learned moved leader's new peer port via watch probe\n");
+}
+
 /* REVIEW 4: in shared mode a fault on the state directory ends the voter role only: tsdbd and its volumes go on. */
 static void scen_dirsync_shared(void)
 {
@@ -20726,7 +20792,7 @@ int main(int argc, char **argv)
                {"userstale", scen_userstale}, {"userpromote", scen_userpromote}, {"userreplay", scen_userreplay},
                {"userlease", scen_userlease},   {"flags", scen_flags},     {"hbsections", scen_hbsections},
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
-               {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
+               {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},

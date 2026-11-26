@@ -779,13 +779,25 @@ static void td_cancel(struct fake *f, uint64_t id, uint32_t peer)
     atomic_store(&td.canceled, 1);
 }
 
-/* R's frame stays above fwdr_run's until D is done, so a mutant run touches stale stack, never a reused one */
+/* Keep fwdr_run's stack frame (struct fwait w) 128 KiB below td_run's SP so that under --mutant teardown, td_run's
+ * atomic_load/usleep calls (which under TSan compile into runtime calls pushing frames onto the stack) never overlap
+ * w while td_deliver still holds w->sync->mu. */
+static __attribute__((noinline)) int td_call(struct run *r)
+{
+    volatile uint8_t pad[128 * 1024];
+    pad[0] = 0;
+    pad[sizeof pad - 1] = 0;
+    int res = fwdr_run(&r->o, r->f.tab, &r->q, &r->tail, &r->hop_ns);
+    pad[0] = (uint8_t)res;
+    return res;
+}
+
 static __attribute__((noinline)) int td_run(struct run *r, int *done_at_return)
 {
-    int res = fwdr_run(&r->o, r->f.tab, &r->q, &r->tail, &r->hop_ns);
+    int res = td_call(r);
     *done_at_return = atomic_load(&td.held_done);
-    for (uint64_t i = 0; i < 4000000000ull && !atomic_load(&td.d_done); i++) /* no calls: they would reuse the stack */
-        __asm__ volatile("" ::: "memory");
+    for (int i = 0; i < 5000 && !atomic_load(&td.d_done); i++)
+        usleep(1000);
     return res;
 }
 
