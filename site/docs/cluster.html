@@ -104,8 +104,8 @@ status 2
 # 6. A volume: in a cluster, data lives in volumes the group places, never in a server's own directory. Add one
 #    named plant with three copies, one per node, and wait until every node has made its directory (n1/data/v1, ...)
 #    and the group has recorded that it opened it (open_gen). Then write a day of readings into plant through its
-#    leader (the first of the three; only it takes writes) and read them back. The preview copies nothing yet:
-#    the other two copies stay empty.
+#    leader (only the leader takes writes directly; it replicates every write to the other two copies before answering,
+#    so all three copies hold the data) and read them back.
 build/tsdb cluster volume add $(peer 1) plant --replicas 3 --secret-file $D/secret
 for n in 1 2 3; do wait_for 1 "^replica volume 1 node $n rid [0-9a-f]* open_gen 1$"; done
 status 1 | grep '^volume\|^replica'

@@ -521,7 +521,7 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L477-L485">                    void *ctx);
+<pre><code class="language-c" data-src="include/tsdb.h#L479-L487">                    void *ctx);
 /* The same points newest first (TSDB_DESC), or only the first `limit` of them in that order: the choice
  * does not change, since it needs every point of the range anyway (opts NULL: as tsdb_query_lttb). Newest first
  * holds at most min(limit, threshold) chosen points in memory, and none where the threshold keeps every point
@@ -530,7 +530,7 @@ explains each.</p>
  * (--lttb-max-threshold, default 16,777,216). */
 int tsdb_query_lttb_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, size_t threshold,
                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L541-L551"> *    computed from exact moments, with a few roundings at the end (in long
+<pre><code class="language-c" data-src="include/tsdb.h#L543-L553"> *    computed from exact moments, with a few roundings at the end (in long
  *    double), and does not depend on the order of the rows.
  * Like every aggregate, the spread covers only the rows that are left: a
  * deleted, replaced-away or expired (retention) value is never part of it,
@@ -541,7 +541,7 @@ int tsdb_query_lttb_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, si
  * and tsdb_query_bounds; opts may be NULL. Free with free(). */
 typedef struct tsdb_spread_bucket {
     tsdb_bucket b;</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">double sum;
+<pre><code class="language-c" data-src="include/tsdb.h#L405-L406">double sum;
 double min, max;</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
@@ -640,7 +640,7 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">*  - trim (with bounds): TSDB_MULTI_TRIM_LO starts series i's bounds at the last one at or before its first row
+<pre><code class="language-c" data-src="include/tsdb.h#L643-L648">*  - trim (with bounds): TSDB_MULTI_TRIM_LO starts series i's bounds at the last one at or before its first row
 *    in range, TSDB_MULTI_TRIM_HI ends them at the last one at or before its last row (a series without rows then
 *    has no buckets). That is what a client does for local periods, so one union of bounds serves every series.
 *    The whole bounds must strictly increase, trimmed or not; if they do not, every series answers TSDB_ERR_INVALID.
@@ -698,10 +698,10 @@ for (int i = 0; i &lt; pumps.length; i++) {
 <button type="button" role="tab" data-key="java">Java</button>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
-<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
+<pre><code class="language-c" data-src="include/tsdb.h#L261-L263">* every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
 * directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses
 * (TSDB_ERR_LOCKED) while a writer holds one. Followers on other hosts cannot be seen and must be stopped first. Safe</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* volume follows the root). Refused (TSDB_ERR_INVALID) with wal_sync_ms = -1 and on a read-only handle.
+<pre><code class="language-c" data-src="include/tsdb.h#L274-L275">* volume follows the root). Refused (TSDB_ERR_INVALID) with wal_sync_ms = -1 and on a read-only handle.
 * tsdb_feed_new_id gives every volume a new feed_id and raises its numbers by 2^40: run it after a restore. */</code></pre>
 <p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
 </div>
