@@ -393,16 +393,17 @@ static double dec_sample_cost(const float *in, size_t n, int e, bool bits)
 {
     enum { RUNS = 4, RUN = 16 };
     size_t run = MIN((size_t)RUN, n), tried = 0, exc = 0;
+    size_t max_exc_all = n > run ? (size_t)RUNS * run : run;
     uint64_t maxz = 0;
     for (int r = 0; r < RUNS; r++) {
-        if (r == 1 && exc * 4 > tried)
-            return INFINITY; /* failing already: skip the other runs */
         size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
         int64_t prev = 0, k;
         bool have = false;
         for (size_t i = at; i < at + run; i++, tried++) {
             if (!dec_int(in[i], e, &k)) {
                 exc++;
+                if ((r == 0 && exc * 4 > run) || exc * 4 > max_exc_all)
+                    return INFINITY;
                 continue;
             }
             if (have)
@@ -419,22 +420,81 @@ static double dec_sample_cost(const float *in, size_t n, int e, bool bits)
     return w + 8.0 * (double)exc / (double)tried;
 }
 
-/* The integers of in at the best scale, as zigzag deltas z[0..n-1) (z[i] is
- * value i+1 minus value i), plus exceptions (u32 position, u32 raw bits each)
- * in exc. Returns false when the values are not fixed point. */
-typedef struct dec_res {
-    int e;
-    int64_t first;
-    uint64_t maxz;
-    size_t nexc;
-} dec_res;
+/* Picks the best fixed-point scale on the sample (or -1 if none applies). For binary scales 2^1..2^24, a single
+ * bit-twiddle pass over the sample computes the exact interval [lo, hi] of valid shifts for each value and skips
+ * every scale whose exception count exceeds dec_sample_cost's 25% cap. */
+static int dec_pick_scale(const float *in, size_t n, bool compact)
+{
+    int best_e = -1;
+    double best = INFINITY;
+    for (int e = 0; e < DEC_NDEC && best > 1.0; e++) { /* 1.0: 1-byte deltas, no exceptions */
+        double cost = dec_sample_cost(in, n, e, false);
+        if (cost < best - 1e-9) {
+            best = cost;
+            best_e = e;
+        }
+    }
+    if (best > 1.0) {
+        enum { RUNS = 4, RUN = 16 };
+        size_t run = MIN((size_t)RUN, n), tried = 0;
+        int diff0[DEC_NBIN + 2] = {0}, diff[DEC_NBIN + 2] = {0};
+        for (int r = 0; r < RUNS; r++) {
+            size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
+            for (size_t i = at; i < at + run; i++, tried++) {
+                uint32_t u;
+                memcpy(&u, &in[i], 4);
+                int lo, hi;
+                if (u == 0) {
+                    lo = 1;
+                    hi = DEC_NBIN;
+                } else {
+                    uint32_t exp = (u >> 23) & 0xff, mant = u & 0x7fffff;
+                    if (exp == 0 || exp == 0xff)
+                        continue;
+                    lo = 150 - (int)exp - __builtin_ctz(mant | (1u << 23));
+                    hi = 178 - (int)exp;
+                    if (lo < 1)
+                        lo = 1;
+                    if (hi > DEC_NBIN)
+                        hi = DEC_NBIN;
+                    if (lo > hi)
+                        continue;
+                }
+                diff[lo]++;
+                diff[hi + 1]--;
+                if (r == 0) {
+                    diff0[lo]++;
+                    diff0[hi + 1]--;
+                }
+            }
+            if (n <= run)
+                break;
+        }
+        int ok0 = 0, ok = 0;
+        for (int b = 1; b <= DEC_NBIN && best > 1.0; b++) {
+            ok0 += diff0[b];
+            ok += diff[b];
+            if ((run - (size_t)ok0) * 4 > run || (tried - (size_t)ok) * 4 > tried)
+                continue;
+            int e = DEC_NDEC - 1 + b;
+            double cost = dec_sample_cost(in, n, e, false);
+            if (cost < best - 1e-9) {
+                best = cost;
+                best_e = e;
+            }
+        }
+    }
+    if (best_e < 0 || best >= 4.5 || (compact && dec_sample_cost(in, n, best_e, true) >= 2.0))
+        return -1;
+    return best_e;
+}
 
 #ifdef DEC_AVX2
 /* 1.5 * 2^52 mantissa trick (matching f64_int4 in codec_typed.c): exact for |d| < 2^51 in round-to-nearest. */
 #define DEC_MAGIC_BITS INT64_C(0x4338000000000000)
 #define DEC_FAST_LIMIT 2251799813685248.0 /* 2^51 */
 
-static inline bool dec_int4(const float *in, __m256d vsc, __m256d vinv, int64_t *k)
+static inline __attribute__((always_inline)) bool dec_int4(const float *in, __m256d vsc, __m256d vinv, int64_t *k)
 {
     const __m256d magic = _mm256_castsi256_pd(_mm256_set1_epi64x(DEC_MAGIC_BITS));
     __m128 vf = _mm_loadu_ps(in);
@@ -454,159 +514,172 @@ static inline bool dec_int4(const float *in, __m256d vsc, __m256d vinv, int64_t 
 }
 #endif
 
-/* compact: only for deltas the sample puts under 16 bits (a block that bit-packs into 16 bits a value or less) */
-static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r, int64_t *keep, bool compact)
+#define DBP_VEC 1024
+#define DBP_REL_LIMIT 9007199254740992ll /* 2^53: integers up to it are exact doubles */
+_Static_assert(DBP_VEC <= 1024, "zz_prefix32 sums at most 1024 deltas");
+
+/* Converts a chunk of nv values starting at in[base] into zigzag deltas z[0..nv), updating prev, maxz, nexc,
+ * exc and (when has_keep) keep[base..base+nv). Always inlined so keep==NULL constant-propagates away. */
+static inline __attribute__((always_inline)) bool dec_chunk(const float *in, size_t base, size_t nv, int best_e,
+                                                            uint32_t *z, uint8_t *exc, size_t max_exc, size_t *nexc,
+                                                            int64_t *prevp, uint64_t *maxzp, uint32_t *allp,
+                                                            int64_t *keep, const bool has_keep)
 {
-    int best_e = -1;
-    double best = INFINITY;
-    for (int e = 0; e <= DEC_MAX_EXP && best > 1.0; e++) { /* 1.0: 1-byte deltas, no exceptions */
-        double cost = dec_sample_cost(in, n, e, false);
-        if (cost < best - 1e-9) {
-            best = cost;
-            best_e = e;
-        }
-    }
-    if (best_e < 0 || best >= 4.5 || (compact && dec_sample_cost(in, n, best_e, true) >= 2.0))
-        return false;
     const double sc = dec_scale[best_e], inv = dec_inv[best_e];
-    size_t max_exc = n / 16, nexc = 0;
-    int64_t prev = 0, first = 0;
-    uint64_t maxz = 0;
+    int64_t prev = *prevp;
+    uint64_t cmaxz = 0;
+    size_t nx = *nexc;
 #ifdef DEC_AVX2
     const __m256d vsc = _mm256_set1_pd(sc), vinv = _mm256_set1_pd(inv);
     size_t i = 0;
-    while (i < n) {
+    while (i < nv) {
         int64_t k4[4];
-        if (i + 4 <= n && dec_int4(&in[i], vsc, vinv, k4)) {
+        if (i + 4 <= nv && dec_int4(&in[base + i], vsc, vinv, k4)) {
             for (size_t j = 0; j < 4; j++, i++) {
                 int64_t k = k4[j];
-                if (keep)
-                    keep[i] = k;
-                if (i == 0) {
-                    first = k;
-                } else {
-                    uint64_t zz = zigzag(k - prev);
-                    maxz |= zz;
-                    z[i - 1] = (uint32_t)zz;
-                }
+                if (has_keep)
+                    keep[base + i] = k;
+                uint64_t zz = zigzag(k - prev);
+                cmaxz |= zz;
+                z[i] = (uint32_t)zz;
                 prev = k;
             }
             continue;
         }
-        size_t stop = MIN(i + 4, n);
+        size_t stop = MIN(i + 4, nv);
         for (; i < stop; i++) {
             int64_t k;
-            if (!dec_int(in[i], best_e, &k)) {
-                if (nexc == max_exc)
+            if (!dec_int(in[base + i], best_e, &k)) {
+                if (nx == max_exc)
                     return false;
-                store32(exc + 8 * nexc, (uint32_t)i);
-                memcpy(exc + 8 * nexc + 4, &in[i], 4);
-                nexc++;
-                k = i ? prev : 0; /* a zero delta keeps the stream smooth */
+                store32(exc + 8 * nx, (uint32_t)(base + i));
+                memcpy(exc + 8 * nx + 4, &in[base + i], 4);
+                nx++;
+                k = prev; /* a zero delta keeps the stream smooth */
             }
-            if (keep)
-                keep[i] = k;
-            if (i == 0) {
-                first = k;
-            } else {
-                uint64_t zz = zigzag(k - prev);
-                maxz |= zz;
-                z[i - 1] = (uint32_t)zz;
-            }
+            if (has_keep)
+                keep[base + i] = k;
+            uint64_t zz = zigzag(k - prev);
+            cmaxz |= zz;
+            z[i] = (uint32_t)zz;
             prev = k;
         }
     }
-    if (maxz >= (1ull << 32))
-        return false;
-    *r = (dec_res){best_e, first, maxz, nexc};
-    return true;
 #else
-    /* two loops: a branch-free one the compiler vectorizes (integer and
+    /* two loops over a stack-resident chunk: a branch-free one the compiler vectorizes (integer and
      * exactness of every value), then deltas and exceptions */
-    int64_t *kk = keep ? keep : malloc(n * sizeof *kk); /* small enough for malloc's fast path */
-    uint8_t *okv = malloc(n);
-    if (!kk || !okv) {
-        if (!keep)
-            free(kk);
-        free(okv);
-        return false;
-    }
-    for (size_t i = 0; i < n; i++) {
-        double d = (double)in[i] * sc;
+    int64_t kk[DBP_VEC];
+    uint8_t okv[DBP_VEC];
+    const float *src = in + base;
+    for (size_t i = 0; i < nv; i++) {
+        double d = (double)src[i] * sc;
         bool in_range = (d > -DEC_LIMIT) & (d < DEC_LIMIT); /* false for NaN too */
         int64_t k = (int64_t)__builtin_rint(in_range ? d : 0.0);
         /* rebuild from the integer, as the decoder will: -0.0 must not pass as 0 */
         float back = (float)((double)k * inv);
         uint32_t x, y;
         memcpy(&x, &back, 4);
-        memcpy(&y, &in[i], 4);
+        memcpy(&y, &src[i], 4);
         okv[i] = (x == y) & in_range;
         kk[i] = k;
     }
-    bool ok = true;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < nv; i++) {
         int64_t k = kk[i];
         if (UNLIKELY(!okv[i])) {
-            if (nexc == max_exc) {
-                ok = false;
-                break;
-            }
-            store32(exc + 8 * nexc, (uint32_t)i);
-            memcpy(exc + 8 * nexc + 4, &in[i], 4);
-            nexc++;
-            k = i ? prev : 0; /* a zero delta keeps the stream smooth */
-            kk[i] = k;
+            if (nx == max_exc)
+                return false;
+            store32(exc + 8 * nx, (uint32_t)(base + i));
+            memcpy(exc + 8 * nx + 4, &src[i], 4);
+            nx++;
+            k = prev;
         }
-        if (i == 0) {
-            first = k;
-        } else {
-            uint64_t zz = zigzag(k - prev);
-            maxz |= zz;
-            z[i - 1] = (uint32_t)zz;
-        }
+        if (has_keep)
+            keep[base + i] = k;
+        uint64_t zz = zigzag(k - prev);
+        cmaxz |= zz;
+        z[i] = (uint32_t)zz;
         prev = k;
     }
-    if (!keep)
-        free(kk);
-    free(okv);
-    if (!ok || maxz >= (1ull << 32))
-        return false;
-    *r = (dec_res){best_e, first, maxz, nexc};
-    return true;
 #endif
+    if (cmaxz >= (1ull << 32))
+        return false;
+    *prevp = prev;
+    *maxzp |= cmaxz;
+    *nexc = nx;
+    *allp = (uint32_t)cmaxz;
+    return true;
 }
 
 size_t decimal_encode(const float *in, size_t n, uint8_t *out)
 {
     if (n == 0)
         return 0;
-    uint32_t *z = malloc(n * sizeof *z);
-    uint8_t *exc = malloc((n / 16 + 1) * 8);
-    dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r, NULL, false)) {
-        free(z);
-        free(exc);
+    int best_e = dec_pick_scale(in, n, false);
+    if (best_e < 0)
+        return 0;
+    uint32_t z_stk[1024];
+    uint32_t *z = n <= 1024 ? z_stk : malloc(n * sizeof *z);
+    uint8_t exc_stk[513 * 8];
+    uint8_t *exc = n <= 8192 ? exc_stk : malloc((n / 16 + 1) * 8);
+    if (!z || !exc) {
+        if (z != z_stk)
+            free(z);
+        if (exc != exc_stk)
+            free(exc);
         return 0;
     }
-    int width = dec_width(r.maxz);
-    out[0] = (uint8_t)r.e;
+    size_t max_exc = n / 16, nexc = 0;
+    int64_t first = 0;
+    bool ok = true;
+    if (!dec_int(in[0], best_e, &first)) {
+        if (nexc == max_exc)
+            ok = false;
+        else {
+            store32(exc, 0);
+            memcpy(exc + 4, &in[0], 4);
+            nexc++;
+            first = 0;
+        }
+    }
+    int64_t prev = first;
+    uint64_t maxz = 0;
+    for (size_t v0 = 0; ok && v0 + 1 < n; v0 += DBP_VEC) {
+        size_t nv = MIN((size_t)DBP_VEC, n - 1 - v0);
+        uint32_t all;
+        ok = dec_chunk(in, v0 + 1, nv, best_e, z + v0, exc, max_exc, &nexc, &prev, &maxz, &all, NULL, false);
+    }
+    if (!ok) {
+        if (z != z_stk)
+            free(z);
+        if (exc != exc_stk)
+            free(exc);
+        return 0;
+    }
+    int width = dec_width(maxz);
+    out[0] = (uint8_t)best_e;
     out[1] = (uint8_t)width;
-    memcpy(out + 2, &r.first, 8);
-    store32(out + 10, (uint32_t)r.nexc);
+    memcpy(out + 2, &first, 8);
+    store32(out + 10, (uint32_t)nexc);
     uint8_t *o = out + DEC_HDR;
-    for (size_t i = 0; i + 1 < n; i++, o += width) {
-        if (width == 1)
-            *o = (uint8_t)z[i];
-        else if (width == 2) {
+    if (width == 1) {
+        for (size_t i = 0; i + 1 < n; i++)
+            o[i] = (uint8_t)z[i];
+        o += n - 1;
+    } else if (width == 2) {
+        for (size_t i = 0; i + 1 < n; i++, o += 2) {
             uint16_t z16 = (uint16_t)z[i];
             memcpy(o, &z16, 2);
-        } else
-            store32(o, z[i]);
+        }
+    } else {
+        memcpy(o, z, (n - 1) * 4);
+        o += (n - 1) * 4;
     }
-    memcpy(o, exc, r.nexc * 8);
-    o += r.nexc * 8;
-    free(z);
-    free(exc);
+    memcpy(o, exc, nexc * 8);
+    o += nexc * 8;
+    if (z != z_stk)
+        free(z);
+    if (exc != exc_stk)
+        free(exc);
     return (size_t)(o - out);
 }
 
@@ -617,10 +690,6 @@ size_t decimal_encode(const float *in, size_t n, uint8_t *out)
  *
  *   u8 scale | u8 0 | i64 first | u32 nexc | per vector: u8 bits, packed deltas | exceptions
  */
-#define DBP_VEC 1024
-#define DBP_REL_LIMIT 9007199254740992ll /* 2^53: integers up to it are exact doubles */
-_Static_assert(DBP_VEC <= 1024, "zz_prefix32 sums at most 1024 deltas");
-
 size_t decimal_bp_bound(size_t n) { return DEC_HDR + n * 4 + (n / DBP_VEC + 1) * 5 + (n / 16 + 1) * 8 + 16; }
 
 size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out)
@@ -629,39 +698,61 @@ size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out)
     return decimal_bp_encode_keep(in, n, out, NULL, &nexc);
 }
 
-/* compact: see dec_core */
-static size_t dbp_encode(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc, bool compact)
+/* compact: see dec_pick_scale. Encodes in 1024-value stack vectors with zero heap allocations for n <= 8192. */
+static size_t dbp_encode(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp, bool compact)
 {
     if (n < 2)
         return 0;
-    uint32_t *z = malloc(n * sizeof *z);
-    uint8_t *exc = malloc((n / 16 + 1) * 8);
-    dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r, keep, compact)) {
-        free(z);
-        free(exc);
+    int best_e = dec_pick_scale(in, n, compact);
+    if (best_e < 0)
         return 0;
+    size_t max_exc = n / 16, nexc = 0;
+    uint8_t exc_stk[513 * 8];
+    uint8_t *exc = n <= 8192 ? exc_stk : malloc((max_exc + 1) * 8);
+    if (!exc)
+        return 0;
+    int64_t first = 0;
+    if (!dec_int(in[0], best_e, &first)) {
+        if (nexc == max_exc) {
+            if (exc != exc_stk)
+                free(exc);
+            return 0;
+        }
+        store32(exc, 0);
+        memcpy(exc + 4, &in[0], 4);
+        nexc++;
+        first = 0;
     }
-    out[0] = (uint8_t)r.e;
-    out[1] = 0;
-    memcpy(out + 2, &r.first, 8);
-    store32(out + 10, (uint32_t)r.nexc);
+    if (keep)
+        keep[0] = first;
+    int64_t prev = first;
+    uint64_t maxz = 0;
+    uint32_t z[DBP_VEC];
     uint8_t *o = out + DEC_HDR;
     for (size_t v0 = 0; v0 + 1 < n; v0 += DBP_VEC) {
         size_t nv = MIN((size_t)DBP_VEC, n - 1 - v0);
-        uint32_t all = 0;
-        for (size_t i = 0; i < nv; i++)
-            all |= z[v0 + i];
+        uint32_t all;
+        bool ok = keep ? dec_chunk(in, v0 + 1, nv, best_e, z, exc, max_exc, &nexc, &prev, &maxz, &all, keep, true)
+                       : dec_chunk(in, v0 + 1, nv, best_e, z, exc, max_exc, &nexc, &prev, &maxz, &all, NULL, false);
+        if (!ok) {
+            if (exc != exc_stk)
+                free(exc);
+            return 0;
+        }
         int w = bits_for(all);
         *o++ = (uint8_t)w;
-        pack(z + v0, nv, w, o);
+        pack(z, nv, w, o);
         o += packed_bytes(nv, w);
     }
-    memcpy(o, exc, r.nexc * 8);
-    o += r.nexc * 8;
-    free(z);
-    free(exc);
-    *nexc = r.nexc;
+    out[0] = (uint8_t)best_e;
+    out[1] = 0;
+    memcpy(out + 2, &first, 8);
+    store32(out + 10, (uint32_t)nexc);
+    memcpy(o, exc, nexc * 8);
+    o += nexc * 8;
+    if (exc != exc_stk)
+        free(exc);
+    *nexcp = nexc;
     return (size_t)(o - out);
 }
 
@@ -800,12 +891,54 @@ int delta32_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
 
 size_t bytesplit_encode(const uint32_t *in, size_t n, uint8_t *out)
 {
-    for (size_t i = 0; i < n; i++) {
+    uint8_t *p0 = out, *p1 = out + n, *p2 = out + 2 * n, *p3 = out + 3 * n;
+    size_t i = 0;
+#if defined(__AVX2__)
+    const __m256i shuf = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                                          0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    for (; i + 32 <= n; i += 32) {
+        __m256i s0 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(in + i)), shuf);
+        __m256i s1 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(in + i + 8)), shuf);
+        __m256i s2 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(in + i + 16)), shuf);
+        __m256i s3 = _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(in + i + 24)), shuf);
+        __m256i a0 = _mm256_permute2x128_si256(s0, s1, 0x20);
+        __m256i a1 = _mm256_permute2x128_si256(s0, s1, 0x31);
+        __m256i a2 = _mm256_permute2x128_si256(s2, s3, 0x20);
+        __m256i a3 = _mm256_permute2x128_si256(s2, s3, 0x31);
+        __m256i b0 = _mm256_unpacklo_epi32(a0, a1);
+        __m256i b1 = _mm256_unpackhi_epi32(a0, a1);
+        __m256i b2 = _mm256_unpacklo_epi32(a2, a3);
+        __m256i b3 = _mm256_unpackhi_epi32(a2, a3);
+        _mm256_storeu_si256((__m256i *)(void *)(p0 + i), _mm256_permute4x64_epi64(_mm256_unpacklo_epi64(b0, b2), 0xd8));
+        _mm256_storeu_si256((__m256i *)(void *)(p1 + i), _mm256_permute4x64_epi64(_mm256_unpackhi_epi64(b0, b2), 0xd8));
+        _mm256_storeu_si256((__m256i *)(void *)(p2 + i), _mm256_permute4x64_epi64(_mm256_unpacklo_epi64(b1, b3), 0xd8));
+        _mm256_storeu_si256((__m256i *)(void *)(p3 + i), _mm256_permute4x64_epi64(_mm256_unpackhi_epi64(b1, b3), 0xd8));
+    }
+#endif
+#if defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(const void *)(in + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 4));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 8));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 12));
+        __m128i a0 = _mm_unpacklo_epi8(v0, v2), a1 = _mm_unpackhi_epi8(v0, v2);
+        __m128i a2 = _mm_unpacklo_epi8(v1, v3), a3 = _mm_unpackhi_epi8(v1, v3);
+        __m128i b0 = _mm_unpacklo_epi8(a0, a2), b1 = _mm_unpackhi_epi8(a0, a2);
+        __m128i b2 = _mm_unpacklo_epi8(a1, a3), b3 = _mm_unpackhi_epi8(a1, a3);
+        __m128i c0 = _mm_unpacklo_epi8(b0, b2), c1 = _mm_unpackhi_epi8(b0, b2);
+        __m128i c2 = _mm_unpacklo_epi8(b1, b3), c3 = _mm_unpackhi_epi8(b1, b3);
+        _mm_storeu_si128((__m128i *)(void *)(p0 + i), _mm_unpacklo_epi8(c0, c2));
+        _mm_storeu_si128((__m128i *)(void *)(p1 + i), _mm_unpackhi_epi8(c0, c2));
+        _mm_storeu_si128((__m128i *)(void *)(p2 + i), _mm_unpacklo_epi8(c1, c3));
+        _mm_storeu_si128((__m128i *)(void *)(p3 + i), _mm_unpackhi_epi8(c1, c3));
+    }
+#endif
+    for (; i < n; i++) {
         uint32_t x = in[i];
-        out[i] = (uint8_t)x;
-        out[n + i] = (uint8_t)(x >> 8);
-        out[2 * n + i] = (uint8_t)(x >> 16);
-        out[3 * n + i] = (uint8_t)(x >> 24);
+        p0[i] = (uint8_t)x;
+        p1[i] = (uint8_t)(x >> 8);
+        p2[i] = (uint8_t)(x >> 16);
+        p3[i] = (uint8_t)(x >> 24);
     }
     return 4 * n;
 }
@@ -814,9 +947,40 @@ int bytesplit_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
 {
     if (len != 4 * n)
         return TSDB_ERR_CORRUPT;
-    for (size_t i = 0; i < n; i++)
-        out[i] = (uint32_t)in[i] | (uint32_t)in[n + i] << 8 | (uint32_t)in[2 * n + i] << 16 |
-                 (uint32_t)in[3 * n + i] << 24;
+    const uint8_t *p0 = in, *p1 = in + n, *p2 = in + 2 * n, *p3 = in + 3 * n;
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 32 <= n; i += 32) {
+        __m256i r0 = _mm256_loadu_si256((const __m256i *)(const void *)(p0 + i));
+        __m256i r1 = _mm256_loadu_si256((const __m256i *)(const void *)(p1 + i));
+        __m256i r2 = _mm256_loadu_si256((const __m256i *)(const void *)(p2 + i));
+        __m256i r3 = _mm256_loadu_si256((const __m256i *)(const void *)(p3 + i));
+        __m256i l01 = _mm256_unpacklo_epi8(r0, r1), h01 = _mm256_unpackhi_epi8(r0, r1);
+        __m256i l23 = _mm256_unpacklo_epi8(r2, r3), h23 = _mm256_unpackhi_epi8(r2, r3);
+        __m256i a0 = _mm256_unpacklo_epi16(l01, l23), a1 = _mm256_unpackhi_epi16(l01, l23);
+        __m256i a2 = _mm256_unpacklo_epi16(h01, h23), a3 = _mm256_unpackhi_epi16(h01, h23);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i), _mm256_permute2x128_si256(a0, a1, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 8), _mm256_permute2x128_si256(a2, a3, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 16), _mm256_permute2x128_si256(a0, a1, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 24), _mm256_permute2x128_si256(a2, a3, 0x31));
+    }
+#endif
+#if defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i r0 = _mm_loadu_si128((const __m128i *)(const void *)(p0 + i));
+        __m128i r1 = _mm_loadu_si128((const __m128i *)(const void *)(p1 + i));
+        __m128i r2 = _mm_loadu_si128((const __m128i *)(const void *)(p2 + i));
+        __m128i r3 = _mm_loadu_si128((const __m128i *)(const void *)(p3 + i));
+        __m128i l01 = _mm_unpacklo_epi8(r0, r1), h01 = _mm_unpackhi_epi8(r0, r1);
+        __m128i l23 = _mm_unpacklo_epi8(r2, r3), h23 = _mm_unpackhi_epi8(r2, r3);
+        _mm_storeu_si128((__m128i *)(void *)(out + i), _mm_unpacklo_epi16(l01, l23));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 4), _mm_unpackhi_epi16(l01, l23));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 8), _mm_unpacklo_epi16(h01, h23));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 12), _mm_unpackhi_epi16(h01, h23));
+    }
+#endif
+    for (; i < n; i++)
+        out[i] = (uint32_t)p0[i] | (uint32_t)p1[i] << 8 | (uint32_t)p2[i] << 16 | (uint32_t)p3[i] << 24;
     return 0;
 }
 
@@ -904,35 +1068,6 @@ size_t tsfor_bound(size_t n) { return 25 + 8 * n; }
 
 static int for_width(uint64_t range) { return range < (1u << 8) ? 1 : range < (1u << 16) ? 2 : range < (1ull << 32) ? 4 : 8; }
 
-static void for_put(uint8_t *o, uint64_t x, int width)
-{
-    if (width == 1)
-        *o = (uint8_t)x;
-    else if (width == 2) {
-        uint16_t y = (uint16_t)x;
-        memcpy(o, &y, 2);
-    } else if (width == 4)
-        store32(o, (uint32_t)x);
-    else
-        memcpy(o, &x, 8);
-}
-
-static inline uint64_t for_get(const uint8_t *p, int width)
-{
-    if (width == 1)
-        return *p;
-    if (width == 2) {
-        uint16_t y;
-        memcpy(&y, p, 2);
-        return y;
-    }
-    if (width == 4)
-        return load32(p);
-    uint64_t y;
-    memcpy(&y, p, 8);
-    return y;
-}
-
 static inline uint64_t grid_at(uint64_t first, uint64_t step, size_t i) { return first + (uint64_t)i * step; }
 
 size_t ts_grid_encode(const int64_t *ts, size_t n, uint8_t *out)
@@ -955,9 +1090,25 @@ size_t ts_grid_encode(const int64_t *ts, size_t n, uint8_t *out)
     memcpy(out + 9, &step, 8);
     memcpy(out + 17, &lo, 8);
     uint8_t *o = out + 25;
-    for (size_t i = 0; i < n; i++, o += width)
-        for_put(o, (uint64_t)ts[i] - grid_at(first, step, i) - (uint64_t)lo, width);
-    return (size_t)(o - out);
+    uint64_t base = first + (uint64_t)lo;
+    if (width == 1) {
+        for (size_t i = 0; i < n; i++)
+            o[i] = (uint8_t)((uint64_t)ts[i] - base - (uint64_t)i * step);
+    } else if (width == 2) {
+        for (size_t i = 0; i < n; i++) {
+            uint16_t y = (uint16_t)((uint64_t)ts[i] - base - (uint64_t)i * step);
+            memcpy(o + 2 * i, &y, 2);
+        }
+    } else if (width == 4) {
+        for (size_t i = 0; i < n; i++)
+            store32(o + 4 * i, (uint32_t)((uint64_t)ts[i] - base - (uint64_t)i * step));
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            uint64_t y = (uint64_t)ts[i] - base - (uint64_t)i * step;
+            memcpy(o + 8 * i, &y, 8);
+        }
+    }
+    return 25 + n * (size_t)width;
 }
 
 static inline __attribute__((always_inline)) int ts_grid_dec(const uint8_t *in, size_t len, size_t n, int64_t *out,
@@ -973,13 +1124,26 @@ static inline __attribute__((always_inline)) int ts_grid_dec(const uint8_t *in, 
     if ((width != 1 && width != 2 && width != 4 && width != 8) || len != 25 + n * (size_t)width)
         return TSDB_ERR_CORRUPT;
     const uint8_t *p = in + 25;
-    uint64_t bad = 0;
-    if (width == 1)
+    uint64_t base = first + lo, bad = 0;
+    if (width == 1) {
         for (size_t i = 0; i < n; i++)
-            out[i] = (int64_t)(grid_at(first, step, i) + lo + p[i]);
-    else
+            out[i] = (int64_t)(base + (uint64_t)i * step + p[i]);
+    } else if (width == 2) {
+        for (size_t i = 0; i < n; i++) {
+            uint16_t y;
+            memcpy(&y, p + 2 * i, 2);
+            out[i] = (int64_t)(base + (uint64_t)i * step + y);
+        }
+    } else if (width == 4) {
         for (size_t i = 0; i < n; i++)
-            out[i] = (int64_t)(grid_at(first, step, i) + lo + for_get(p + i * (size_t)width, width));
+            out[i] = (int64_t)(base + (uint64_t)i * step + load32(p + 4 * i));
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            uint64_t y;
+            memcpy(&y, p + 8 * i, 8);
+            out[i] = (int64_t)(base + (uint64_t)i * step + y);
+        }
+    }
     /* a separate pass over the output, which is in L1: it vectorizes, and costs a third of rebuilding each pair from
      * the input (0.07 against 0.22 ns per row on 1 s with 20 ms jitter, Ryzen 9 7950X) */
     if (chk)
@@ -1013,10 +1177,57 @@ size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out)
     memcpy(out + 1, &ts[0], 8);
     memcpy(out + 9, &lo, 8);
     uint8_t *o = out + 17;
-    for (size_t i = 1; i < n; i++, o += width)
-        for_put(o, (uint64_t)ts[i] - (uint64_t)ts[i - 1] - (uint64_t)lo, width);
-    return (size_t)(o - out);
+    if (width == 1) {
+        for (size_t i = 1; i < n; i++)
+            o[i - 1] = (uint8_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1] - (uint64_t)lo);
+    } else if (width == 2) {
+        for (size_t i = 1; i < n; i++) {
+            uint16_t y = (uint16_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1] - (uint64_t)lo);
+            memcpy(o + 2 * (i - 1), &y, 2);
+        }
+    } else if (width == 4) {
+        for (size_t i = 1; i < n; i++)
+            store32(o + 4 * (i - 1), (uint32_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1] - (uint64_t)lo));
+    } else {
+        for (size_t i = 1; i < n; i++) {
+            uint64_t y = (uint64_t)ts[i] - (uint64_t)ts[i - 1] - (uint64_t)lo;
+            memcpy(o + 8 * (i - 1), &y, 8);
+        }
+    }
+    return 17 + (n - 1) * (size_t)width;
 }
+
+#if defined(__AVX2__)
+#define TS_DELTA_PREFIX4(LOAD_EXPR)                                                                                \
+    do {                                                                                                           \
+        const __m256i vlo = _mm256_set1_epi64x((long long)lo), zero = _mm256_setzero_si256();                      \
+        __m256i carry = _mm256_set1_epi64x((long long)cur);                                                        \
+        for (; i + 4 <= n; i += 4) {                                                                               \
+            __m256i x = _mm256_add_epi64((LOAD_EXPR), vlo);                                                        \
+            x = _mm256_add_epi64(x, _mm256_slli_si256(x, 8));                                                      \
+            __m128i lo128 = _mm256_castsi256_si128(x);                                                             \
+            x = _mm256_add_epi64(x, _mm256_inserti128_si256(zero, _mm_unpackhi_epi64(lo128, lo128), 1));           \
+            __m256i tot = _mm256_permute4x64_epi64(x, 0xff);                                                       \
+            _mm256_storeu_si256((__m256i *)(void *)(out + i), _mm256_add_epi64(x, carry));                         \
+            carry = _mm256_add_epi64(carry, tot);                                                                  \
+        }                                                                                                          \
+        cur = (uint64_t)_mm_cvtsi128_si64(_mm256_castsi256_si128(carry));                                          \
+    } while (0)
+#elif defined(__SSE2__)
+#define TS_DELTA_PREFIX2(LOAD_EXPR)                                                                                \
+    do {                                                                                                           \
+        const __m128i vlo = _mm_set1_epi64x((long long)lo);                                                        \
+        __m128i carry = _mm_set1_epi64x((long long)cur);                                                           \
+        for (; i + 2 <= n; i += 2) {                                                                               \
+            __m128i x = _mm_add_epi64((LOAD_EXPR), vlo);                                                           \
+            x = _mm_add_epi64(x, _mm_slli_si128(x, 8));                                                            \
+            x = _mm_add_epi64(x, carry);                                                                           \
+            _mm_storeu_si128((__m128i *)(void *)(out + i), x);                                                     \
+            carry = _mm_unpackhi_epi64(x, x);                                                                      \
+        }                                                                                                          \
+        cur = (uint64_t)_mm_cvtsi128_si64(carry);                                                                  \
+    } while (0)
+#endif
 
 static inline __attribute__((always_inline)) int ts_delta_dec(const uint8_t *in, size_t len, size_t n,
                                                               int64_t *out, const bool chk)
@@ -1034,15 +1245,61 @@ static inline __attribute__((always_inline)) int ts_delta_dec(const uint8_t *in,
     const uint8_t *p = in + 17;
     out[0] = (int64_t)cur;
     uint64_t bad = 0;
-    for (size_t i = 1; i < n; i++) {
-        cur += lo + for_get(p + (i - 1) * (size_t)width, width);
-        out[i] = (int64_t)cur;
+    size_t i = 1;
+    if (width == 1) {
+#if defined(__AVX2__)
+        TS_DELTA_PREFIX4(_mm256_cvtepu8_epi64(_mm_cvtsi32_si128((int)load32(p + i - 1))));
+#elif defined(__SSE2__)
+        TS_DELTA_PREFIX2(_mm_set_epi64x(p[i], p[i - 1]));
+#endif
+        for (; i < n; i++) {
+            cur += lo + p[i - 1];
+            out[i] = (int64_t)cur;
+        }
+    } else if (width == 2) {
+#if defined(__AVX2__)
+        TS_DELTA_PREFIX4(_mm256_cvtepu16_epi64(_mm_cvtsi64_si128((long long)rd64(p + 2 * (i - 1)))));
+#elif defined(__SSE2__)
+        TS_DELTA_PREFIX2(({
+            uint32_t u32_ = load32(p + 2 * (i - 1));
+            _mm_set_epi64x((long long)(u32_ >> 16), (long long)(u32_ & 0xffffu));
+        }));
+#endif
+        for (; i < n; i++) {
+            uint16_t y;
+            memcpy(&y, p + 2 * (i - 1), 2);
+            cur += lo + y;
+            out[i] = (int64_t)cur;
+        }
+    } else if (width == 4) {
+#if defined(__AVX2__)
+        TS_DELTA_PREFIX4(_mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i *)(const void *)(p + 4 * (i - 1)))));
+#elif defined(__SSE2__)
+        TS_DELTA_PREFIX2(({
+            uint64_t u64_ = rd64(p + 4 * (i - 1));
+            _mm_set_epi64x((long long)(u64_ >> 32), (long long)(uint32_t)u64_);
+        }));
+#endif
+        for (; i < n; i++) {
+            cur += lo + load32(p + 4 * (i - 1));
+            out[i] = (int64_t)cur;
+        }
+    } else {
+#if defined(__AVX2__)
+        TS_DELTA_PREFIX4(_mm256_loadu_si256((const __m256i *)(const void *)(p + 8 * (i - 1))));
+#elif defined(__SSE2__)
+        TS_DELTA_PREFIX2(_mm_loadu_si128((const __m128i *)(const void *)(p + 8 * (i - 1))));
+#endif
+        for (; i < n; i++) {
+            cur += lo + rd64(p + 8 * (i - 1));
+            out[i] = (int64_t)cur;
+        }
     }
     /* a separate pass, not a compare beside the serial sum: that one cost 0.39 ns per row on an i5-13400 (0.03 on
      * a Ryzen), this vectorized one 0.16 (0.07) */
     if (chk)
-        for (size_t i = 1; i < n; i++)
-            bad |= (uint64_t)(out[i] <= out[i - 1]);
+        for (size_t j = 1; j < n; j++)
+            bad |= (uint64_t)(out[j] <= out[j - 1]);
     return bad ? TSDB_ERR_CORRUPT : 0;
 }
 
@@ -1186,38 +1443,47 @@ size_t block_wrap_src(codec_ctx *c, int level, int kind, const uint8_t *src, siz
 static double entropy_bytes(const uint8_t *p, size_t len);
 static double entropy_words(const uint8_t *p, size_t len, size_t width);
 
-static size_t encode_ts_kind(codec_ctx *c, int kind, const int64_t *ts, size_t n)
+static size_t encode_ts_kind(int kind, const int64_t *ts, size_t n, uint8_t *dst)
 {
     switch (kind) {
-    case BLK_TS_GRID: return ts_grid_encode(ts, n, c->scratch);
-    case BLK_TS_DELTA: return ts_delta_encode(ts, n, c->scratch);
-    default: return dd_encode(ts, n, c->scratch);
+    case BLK_TS_GRID: return ts_grid_encode(ts, n, dst);
+    case BLK_TS_DELTA: return ts_delta_encode(ts, n, dst);
+    default: return dd_encode(ts, n, dst);
     }
 }
 
 /* DoubleDelta when the clock is regular (about a bit per row before ZSTD);
- * otherwise the candidate with the smallest estimated size. */
+ * otherwise the candidate with the smallest estimated size (kept in scratch/alt without re-encoding). */
 size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uint8_t *out)
 {
-    if (codec_scratch_reserve(c, MAX(dd_bound(n), tsfor_bound(n))) != 0)
+    size_t need = MAX(dd_bound(n), tsfor_bound(n));
+    if (codec_scratch_reserve(c, need) != 0)
         return 0;
     size_t dd = dd_encode(ts, n, c->scratch);
     if (level <= 0 || n < 2 || dd <= 24 + n / 8 + 8)
         return block_wrap(c, level, BLK_DD, dd, out);
+    if (codec_alt_reserve(c, need) != 0)
+        return 0;
     int best = BLK_DD;
-    double best_est = MIN((double)dd, entropy_bytes(c->scratch, dd));
+    size_t best_len = dd;
+    uint8_t *best_buf = c->scratch, *try_buf = c->alt;
+    double best_est = MIN((double)dd, entropy_bytes(best_buf, dd));
     static const int kinds[] = {BLK_TS_GRID, BLK_TS_DELTA};
     for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
-        size_t len = encode_ts_kind(c, kinds[k], ts, n);
+        size_t len = encode_ts_kind(kinds[k], ts, n, try_buf);
         size_t hdr = kinds[k] == BLK_TS_GRID ? 25 : 17;
-        double est = len > hdr ? MIN((double)len, hdr + entropy_words(c->scratch + hdr, len - hdr, c->scratch[0]))
+        double est = len > hdr ? MIN((double)len, hdr + entropy_words(try_buf + hdr, len - hdr, try_buf[0]))
                                : (double)len;
         if (len && est < best_est) {
             best_est = est;
             best = kinds[k];
+            best_len = len;
+            uint8_t *tmp = best_buf;
+            best_buf = try_buf;
+            try_buf = tmp;
         }
     }
-    return block_wrap(c, level, best, encode_ts_kind(c, best, ts, n), out);
+    return block_wrap_src(c, level, best, best_buf, best_len, out);
 }
 
 /* Encodes v with one transform into out; returns 0 if not applicable. */

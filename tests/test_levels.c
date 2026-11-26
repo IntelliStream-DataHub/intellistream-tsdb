@@ -862,6 +862,87 @@ static void crafted_unpack(rec *r)
             free(buf);
             free(exact);
         }
+
+    /* pack64 / unpack64 alone: exact write-pad (+7) and read-slack bounds at every width 1..64 and n = 1..70 */
+    for (int w = 1; w <= 64; w++)
+        for (size_t n = 1; n <= 70; n++) {
+            uint64_t top = w == 64 ? ~0ull : ((1ull << (w & 63)) - 1), in64[70], got64[70];
+            for (size_t i = 0; i < n; i++)
+                in64[i] = (s = ds_mix(s + i)) & top;
+            size_t pb = packed_bytes(n, w);
+            size_t spare = n >= 8 && w <= 57 ? MAX((size_t)(((6 * w) >> 3) + 16 - w), (size_t)7) : 7;
+            uint8_t *buf64 = malloc(pb + 7), *exact64 = malloc(pb + spare);
+            memset(buf64, 0xff, pb + 7);
+            pack64(in64, n, w, buf64); /* pack64 may write up to 7 bytes of padding */
+            memcpy(exact64, buf64, pb);
+            memset(exact64 + pb, 0xff, spare);
+            unpack64(exact64, n, w, got64);
+            if (memcmp(got64, in64, n * 8) != 0) {
+                fprintf(stderr, "unpack64 w %d n %zu: wrong values\n", w, n);
+                failures++;
+            }
+            free(buf64);
+            free(exact64);
+        }
+
+    /* bytesplit_encode/decode, ts_grid, ts_delta, zz_prefix32/64 at every length 0..70 (around 16/32 SIMD tails) */
+    for (size_t n = 0; n <= 70; n++) {
+        uint32_t u32[70], g32[70], z32[70], z32_ref[70];
+        uint64_t z64[70], z64_ref[70];
+        int64_t ts[70], ts_out[70];
+        uint8_t btmp[70 * 8 + 64];
+        int64_t cur = 1700000000000ll;
+        for (size_t i = 0; i < n; i++) {
+            u32[i] = (uint32_t)(s = ds_mix(s + i));
+            z32[i] = z32_ref[i] = u32[i];
+            z64[i] = z64_ref[i] = (s = ds_mix(s + i));
+            cur += 1000 + (int64_t)(s & 0x3ff);
+            ts[i] = cur;
+        }
+        size_t bl = bytesplit_encode(u32, n, btmp);
+        if (bl != 4 * n || bytesplit_decode(btmp, bl, n, g32) != 0 || (n && memcmp(u32, g32, n * 4) != 0)) {
+            fprintf(stderr, "bytesplit n %zu: round-trip failed\n", n);
+            failures++;
+        }
+        uint32_t acc32 = 0;
+        for (size_t i = 0; i < n; i++) {
+            acc32 += (z32_ref[i] >> 1) ^ (0u - (z32_ref[i] & 1));
+            z32_ref[i] = acc32;
+        }
+        if (zz_prefix32(z32, n) != acc32 || (n && memcmp(z32, z32_ref, n * 4) != 0)) {
+            fprintf(stderr, "zz_prefix32 n %zu: mismatch\n", n);
+            failures++;
+        }
+        uint64_t acc64 = 0;
+        for (size_t i = 0; i < n; i++) {
+            acc64 += (z64_ref[i] >> 1) ^ (0ull - (z64_ref[i] & 1));
+            z64_ref[i] = acc64;
+        }
+        if (zz_prefix64(z64, n) != acc64 || (n && memcmp(z64, z64_ref, n * 8) != 0)) {
+            fprintf(stderr, "zz_prefix64 n %zu: mismatch\n", n);
+            failures++;
+        }
+        if (n >= 2) {
+            for (int wcase = 0; wcase < 4; wcase++) {
+                int64_t step = wcase == 0 ? 10 : wcase == 1 ? 1000 : wcase == 2 ? 100000 : 10000000000ll;
+                ts[0] = 1700000000000ll;
+                for (size_t i = 1; i < n; i++)
+                    ts[i] = ts[i - 1] + 1000 + ((i & 1) ? step : 0);
+                size_t gl = ts_grid_encode(ts, n, btmp);
+                if (!gl || ts_grid_decode(btmp, gl, n, ts_out) != 0 || memcmp(ts, ts_out, n * 8) != 0 ||
+                    ts_grid_decode_sorted(btmp, gl, n, ts_out) != 0 || memcmp(ts, ts_out, n * 8) != 0) {
+                    fprintf(stderr, "ts_grid n %zu wcase %d: round-trip failed\n", n, wcase);
+                    failures++;
+                }
+                size_t dl = ts_delta_encode(ts, n, btmp);
+                if (!dl || ts_delta_decode(btmp, dl, n, ts_out) != 0 || memcmp(ts, ts_out, n * 8) != 0 ||
+                    ts_delta_decode_sorted(btmp, dl, n, ts_out) != 0 || memcmp(ts, ts_out, n * 8) != 0) {
+                    fprintf(stderr, "ts_delta n %zu wcase %d: round-trip failed\n", n, wcase);
+                    failures++;
+                }
+            }
+        }
+    }
 }
 
 /* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
