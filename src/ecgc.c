@@ -78,6 +78,7 @@ static pthread_once_t env_once = PTHREAD_ONCE_INIT;
 
 static void env_init_fn(void)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *m = getenv("TSDB_ECGC_MUTANT");
     if (m && *m) {
         int v = ecgc_mutant_parse(m);
@@ -105,6 +106,7 @@ static void env_init_fn(void)
                 ecgcmk_test_opt(tok);
         }
     }
+#endif
 }
 
 void ecgc_env_init(void) { pthread_once(&env_once, env_init_fn); }

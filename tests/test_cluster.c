@@ -8807,7 +8807,7 @@ static void scen_snapcatch(void)
     }
     unlink(ask);
     sleep(2);
-    if (log_count(s.R, "snapshot installed: P") != 1)
+    if (log_count(s.R, "snapshot installed: P") != installs)
         die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
     await_isr(0, "plant", 3, 60000, "the replica that refused a stale copy stays in the ISR");
     /* the log passes P between the check before the close and the close (planted: snapblind hides the log end from that
@@ -8820,7 +8820,7 @@ static void scen_snapcatch(void)
         die("%s, %s: %s", blind, ask, strerror(errno));
     t0 = now_ms();
     while (!log_has(s.R, "is stale and not installed after the close")) {
-        if (log_count(s.R, "snapshot installed: P") != 1)
+        if (log_count(s.R, "snapshot installed: P") != installs)
             die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
         if (log_count(s.R, "is below this replica's commit floor") != floor_refused)
             die("a replica in the ISR took a copy at or below the log end its stopped driver left to the install");
@@ -8832,13 +8832,13 @@ static void scen_snapcatch(void)
     unlink(ask);
     unlink(blind);
     await_isr(0, "plant", 3, 60000, "the replica that refused a stale copy after its close joins the ISR again");
-    if (log_count(s.R, "snapshot installed: P") != 1)
+    if (log_count(s.R, "snapshot installed: P") != installs)
         die("a replica in the ISR installed a copy at or below its log end (its log went back to P)");
     struct rsnap_stats sr;
     status_snap(s.R, &sr);
-    if (sr.refused_stale < 2 || sr.installed != 1)
-        die("STATUS of the receiver: installed %" PRIu64 ", refused_stale %" PRIu64 " (want 1 and >= 2)", sr.installed,
-            sr.refused_stale);
+    if (sr.refused_stale < 2 || sr.installed != (uint64_t)installs)
+        die("STATUS of the receiver: installed %" PRIu64 ", refused_stale %" PRIu64 " (want %d and >= 2)", sr.installed,
+            sr.refused_stale, installs);
     double last_s = status_install_s(s.R);
     if (last_s <= 0)
         die("STATUS of the receiver: snap.install_last_s %.3f after an install", last_s);
