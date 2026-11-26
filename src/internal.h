@@ -170,14 +170,41 @@ static inline void slot_put(void *v, size_t w, size_t i, uint64_t x)
 typedef struct qstats {
     atomic_uint_fast64_t rows_decoded, rows_from_stats, memtable_rows, bytes_read;
     atomic_uint_fast64_t parts, granules, granules_from_stats;
+    bool unshared; /* thread-private worker accumulator: avoids lock xadd on every granule */
 } qstats;
 extern __thread qstats *cur_qstats;
-#define QS_ADD(field, v)                                                                 \
-    do {                                                                                 \
-        qstats *q_ = cur_qstats;                                                         \
-        if (q_)                                                                          \
-            atomic_fetch_add_explicit(&q_->field, (uint64_t)(v), memory_order_relaxed); \
+#define QS_ADD(field, v)                                                                     \
+    do {                                                                                     \
+        qstats *q_ = cur_qstats;                                                             \
+        if (q_) {                                                                            \
+            uint64_t v_ = (uint64_t)(v);                                                     \
+            if (q_->unshared)                                                                \
+                atomic_store_explicit(&q_->field,                                            \
+                                      atomic_load_explicit(&q_->field, memory_order_relaxed) \
+                                          + v_,                                              \
+                                      memory_order_relaxed);                                 \
+            else                                                                             \
+                atomic_fetch_add_explicit(&q_->field, v_, memory_order_relaxed);             \
+        }                                                                                    \
     } while (0)
+static inline void qstats_fold(qstats *dst, const qstats *src)
+{
+    uint64_t v;
+    if ((v = atomic_load_explicit(&src->rows_decoded, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->rows_decoded, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->rows_from_stats, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->rows_from_stats, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->memtable_rows, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->memtable_rows, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->bytes_read, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->bytes_read, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->parts, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->parts, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->granules, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->granules, v, memory_order_relaxed);
+    if ((v = atomic_load_explicit(&src->granules_from_stats, memory_order_relaxed)))
+        atomic_fetch_add_explicit(&dst->granules_from_stats, v, memory_order_relaxed);
+}
 
 /* ---- hashing (xxhash64) ---- */
 uint64_t xxh64(const void *data, size_t len, uint64_t seed);
@@ -806,7 +833,12 @@ typedef struct part {
     bool verify; /* queries check each granule's checksum (tsdb_options.verify_checksums) */
     time_t created;
     time_t written; /* when its newest rows were inserted: a merge keeps its sources' (after a reopen, created) */
+    /* refs is bumped/dropped by every concurrent snapshot/query: explicit 64-byte padding keeps it off the
+     * cache lines of read-hot min_ts/max_ts/verify and the lock-protected fields below, without over-aligning
+     * struct part (which is allocated with calloc). */
+    char pad_refs_pre[64];
     atomic_int refs;
+    char pad_refs_post[64];
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
@@ -968,6 +1000,9 @@ int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t 
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
                     granule *g);
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
+#ifdef TSDB_TEST_HOOKS
+extern __thread uint64_t *cur_granule_checks; /* worker-local accumulator folded once on worker exit */
+#endif
 /* test hook: runs where a reader has used the counts of entries from i of p (without pin_index, in the mapping) and
  * is about to load them again (IX_*), so a test can change them in between, as a write to the file can */
 enum { IX_SRC, IX_VISIBLE, IX_FITS, IX_COPY };
@@ -1878,17 +1913,17 @@ typedef struct lfold {
 enum { LF_R = 1, LF_N = 2 };
 
 typedef struct ltab {
-    pthread_rwlock_t rw; /* latest_rw: entries, bitmaps, pages, drop_floor, pending and lgen */
+    _Alignas(64) pthread_rwlock_t rw; /* latest_rw: entries, bitmaps, pages, drop_floor, pending and lgen */
     uint64_t lgen;       /* bumped by every write section (rw); the warmer's stores check it */
     lt_page **pg;        /* LT_MAXPAGES slots, made in id order, never moved */
     uint32_t npg;        /* pages made: ids below npg * LT_PAGE have entries; ids above have none yet (empty) */
     bool capped;         /* the budget refused page npg: ids from npg * LT_PAGE have no entry (the slow path) */
     int64_t drop_floor;  /* a known entry below it reads as unknown (ts) (tsdb_drop_before) */
     atomic_bool pending; /* a large flush's unlocked stores are under way (3.2) */
-    pthread_mutex_t pmu; /* only for pcv */
-    pthread_cond_t pcv;
     size_t bytes;        /* budget taken (rw) */
-    /* the warmer: a thread of its own per volume, the only filler of entries */
+    /* window waits and the warmer: a thread of its own per volume, the only filler of entries */
+    _Alignas(64) pthread_mutex_t pmu; /* only for pcv */
+    pthread_cond_t pcv;
     pthread_mutex_t hmu; /* leaf */
     pthread_cond_t hcv;
     uint32_t *hint;      /* local ids whose unknown entries want a fill, at most LT_HINTS */
@@ -1897,8 +1932,11 @@ typedef struct ltab {
     bool walk_floor;     /* walk the known entries below drop_floor */
     bool wstop, has_warmer;
     pthread_t warmer;
-    atomic_uint_fast64_t st_table, st_search, st_floor, st_nn, st_fill_ok, st_fill_refused;
+    /* hot lookup hit counter isolated from rw/hmu and from miss/warmer counters */
+    _Alignas(64) atomic_uint_fast64_t st_table;
+    _Alignas(64) atomic_uint_fast64_t st_search, st_floor, st_nn, st_fill_ok, st_fill_refused;
 } ltab;
+_Static_assert(sizeof(ltab) % 64 == 0, "ltab must fill whole cache lines");
 #define LT_HINTS 65536
 
 /* a lookup that waits for a publisher's window or the warmer: test hooks (tests/test_latest.c) */
@@ -1947,10 +1985,10 @@ struct eng {
     unsigned stalled_next;
     int64_t stall_log_ms; /* when db_wait_merges last said that merges of a partition made no progress (db->lock) */
 
-    pthread_mutex_t cc_lock;
+    _Alignas(64) pthread_mutex_t cc_lock;
     codec_ctx *cc_free;
 
-    series_dict series;
+    _Alignas(64) series_dict series;
     series_dict states;
 
     /* retention (retention.c) */
@@ -2088,7 +2126,7 @@ struct eng {
     size_t wal_rec_at;             /* the offset of the last record in wal_buf */
     uint32_t wal_rec_rows;         /* its rows so far: put in its header when it closes (wal_rec_close) */
     bool wal_rec_open;             /* the last record in wal_buf is a rows record that takes more */
-    pthread_cond_t flush_cv;
+    _Alignas(64) pthread_cond_t flush_cv;
     uint64_t lw_wakeups;           /* wake-ups of small writes waiting for one (buf_lock; tests) */
     /* tsdb_set_write_wait_hook: around a small write's wait for a fence, so a server with a fixed set of threads
      * starts another (buf_lock; a wait keeps the hook it counted with for its -1) */
@@ -2163,7 +2201,12 @@ struct eng {
     int64_t last_wal_sync_ms;
     atomic_uint_fast64_t st_flusher_rounds, st_periodic_syncs;
     atomic_int_fast64_t st_sync_due0, st_sync_at[2];
-    int bg_error;
+    /* reusable scratch for mt_write (memtable.c), guarded by flush_lock and freed in wal_close via tsdb_free_big */
+    uint32_t *fl_s;
+    int64_t *fl_t;
+    uint64_t *fl_v;
+    uint32_t *fl_ids;
+    size_t fl_rows_cap, fl_ids_cap;
     bool flusher_stop;
     bool has_flusher;
     pthread_t flusher;
@@ -2211,28 +2254,33 @@ struct eng {
     _Atomic uint64_t tail_lsn; /* rows added to tails (written under buf_lock, release-stored per record): bounds snapshot_take and qcut */
 
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
-     * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
-    _Alignas(64) atomic_bool failed; /* read by every write (eng_check): on a line that nothing writes per call... */
+     * fail_lock before `failed` is stored, so whoever sees `failed` can read it.
+     * Read-mostly state (quiesced, diverged, bg_error, stats, lt) shares this line,
+     * which nothing mutates per call... */
+    _Alignas(64) atomic_bool failed;
+    atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced, also after
+                            * a restart (the DIVERGED file, src/ecdiverge.h) until `volume diverged --clear`
+                            * (tsdb_volume_resume does not clear it) */
+    int bg_error;
     /* statistics (stats.c): `stats` exists once the sweeper has started and is freed by eng_close; `stats_on` is
      * set (under db->lock, after `stats` is complete) while list changes push events into its ring */
     _Atomic(struct estats *) stats;
     atomic_bool stats_on;
     atomic_flag stats_starting;
-    /* ...not on the one of `refs`, which every call through the tsdb handle increments and decrements: `failed`
-     * shared that line, and each small write waited for it inside the critical section of buf_lock */
+    /* the latest table (latest.c): NULL without one (latest_cache 0, a follower or a read-only open) */
+    ltab *lt;
+    /* ...not on the lines of `refs` and `mrefs`, which every call/metadata lookup increments and decrements:
+     * each sits on its own cache line so hot refcount traffic never bounces read-mostly flags or each other */
     _Alignas(64) atomic_int refs; /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
-    atomic_int mrefs;      /* name, type and class lookups on it (route_meta): they never block a recovery's idle wait,
-                            * only the free of a retired engine (a steady stream of lookups must not starve it) */
-    int crefs;             /* request cuts (qcuts) holding parts of this engine (eng_cut_hold), under idle_mu: they keep
-                            * the engine's memory and directory alive past a recovery, never count in `refs` (a recovery
-                            * must not wait for a call that is stuck in another volume) */
+    _Alignas(64) atomic_int mrefs; /* name, type and class lookups on it (route_meta): they never block a recovery's idle wait,
+                                    * only the free of a retired engine (a steady stream of lookups must not starve it) */
+    _Alignas(64) int crefs; /* request cuts (qcuts) holding parts of this engine (eng_cut_hold), under idle_mu: they keep
+                             * the engine's memory and directory alive past a recovery, never count in `refs` (a recovery
+                             * must not wait for a call that is stuck in another volume) */
     bool retire_deferred;  /* tsdb_volume_reopen swapped it out while a cut was still held: the last cut retires it */
     void *retire_owner;    /* the tsdb handle it does that for */
     uint32_t adopted_series, adopted_states; /* the first names the next engine took over (eng_adopt_names) */
-    atomic_bool quiesced;  /* no new caller: the volume is being recovered */
-    atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced, also after
-                            * a restart (the DIVERGED file, src/ecdiverge.h) until `volume diverged --clear`
-                            * (tsdb_volume_resume does not clear it) */
 
     struct tlist *tl;       /* the tenant list the sweeper is to count by (stats_priv.h), under tl_mu */
     pthread_mutex_t tl_mu;  /* a leaf */
@@ -2241,11 +2289,10 @@ struct eng {
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
 
-    /* the latest table (latest.c): NULL without one (latest_cache 0, a follower or a read-only open) */
-    ltab *lt;
     latest_hook_fn lt_hook; /* test hook (tests/test_latest.c), NULL otherwise */
     void *lt_hook_arg;
 };
+_Static_assert(sizeof(struct eng) % 64 == 0, "eng must fill whole cache lines");
 
 /* the list functions' hooks (db.c): one branch while statistics are off */
 static inline void stats_ev_add(eng *db, part *p)
@@ -2353,9 +2400,9 @@ bool partition_dropping(const struct eng *db, int64_t key);
  * p has expired by retention "now" (INT64_MAX: never / not known). The TTL pass's and the cluster settle policy's. */
 void ttl_compute_locked(struct eng *db, struct part *p, uint32_t gen);
 int partition_class(const struct eng *db, int64_t key);
-/* Lists committed parts, taking over the caller's references, and rewrites
- * MANIFEST. Cannot fail: once listed, the parts are published and must not
- * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
+/* Lists committed parts, taking over the caller's references. Caller invokes
+ * manifest_publish(db) after releasing publish_lock. Cannot fail: once listed,
+ * the parts are published and must not be discarded. */
 void db_add_parts(struct eng *db, part **ps, size_t n);
 /* Standalone publisher gate against unlocked drop intent I/O (db.c): called under publish_lock before parts_commit
  * (never holding latest_rw) and ended under db->lock when listed (or via db_pub_end on error). */
@@ -2425,6 +2472,9 @@ typedef struct lw_fence {
 /* The thread's fence table (insert.c): taken until lw_table_put; NULL while taken (or on failure). */
 void *lw_table_take(size_t bytes);
 void lw_table_put(void);
+/* The thread's value-import scratch (insert.c -> volumes.c vals_import): NULL while taken (or on failure). */
+void *vals_scratch_take(size_t bytes);
+void vals_scratch_put(void);
 int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
 void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
 bool lw_enter(struct eng *db, lw_fence *f); /* returns whether the memtable holds rows to flush first */

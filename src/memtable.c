@@ -607,11 +607,42 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
     }
     if (max_rows == 0)
         return 0;
-    uint32_t *s = malloc(max_rows * sizeof *s);
-    int64_t *t = malloc(max_rows * sizeof *t);
-    uint64_t *v = malloc(max_rows * sizeof *v);
-    uint32_t *ids = malloc((nactive ? nactive : 1) * sizeof *ids);
-    int rc = (!s || !t || !v || !ids) ? TSDB_ERR_NOMEM : 0;
+    /* Reuse grow-only flush scratch on db (guarded by flush_lock, or single-threaded during wal_open;
+     * freed in wal_close via tsdb_free_big) so steady flushes avoid repeated multi-MB page faults and munmaps. */
+    if (max_rows > db->fl_rows_cap) {
+        tsdb_free_big(db->fl_s, db->fl_rows_cap * sizeof *db->fl_s);
+        tsdb_free_big(db->fl_t, db->fl_rows_cap * sizeof *db->fl_t);
+        tsdb_free_big(db->fl_v, db->fl_rows_cap * sizeof *db->fl_v);
+        db->fl_s = NULL;
+        db->fl_t = NULL;
+        db->fl_v = NULL;
+        db->fl_rows_cap = 0;
+        uint32_t *ns = malloc(max_rows * sizeof *ns);
+        int64_t *nt = ns ? malloc(max_rows * sizeof *nt) : NULL;
+        uint64_t *nv = nt ? malloc(max_rows * sizeof *nv) : NULL;
+        if (!nv) {
+            tsdb_free_big(ns, max_rows * sizeof *ns);
+            tsdb_free_big(nt, max_rows * sizeof *nt);
+            return TSDB_ERR_NOMEM;
+        }
+        db->fl_s = ns;
+        db->fl_t = nt;
+        db->fl_v = nv;
+        db->fl_rows_cap = max_rows;
+    }
+    size_t need_ids = nactive ? nactive : 1;
+    if (need_ids > db->fl_ids_cap) {
+        tsdb_free_big(db->fl_ids, db->fl_ids_cap * sizeof *db->fl_ids);
+        db->fl_ids = malloc(need_ids * sizeof *db->fl_ids);
+        db->fl_ids_cap = db->fl_ids ? need_ids : 0;
+        if (!db->fl_ids)
+            return TSDB_ERR_NOMEM;
+    }
+    uint32_t *s = db->fl_s;
+    int64_t *t = db->fl_t;
+    uint64_t *v = db->fl_v;
+    uint32_t *ids = db->fl_ids;
+    int rc = 0;
     uint32_t toff[NTYPES] = {0};
     if (rc == 0) {
         if (ntypes_present == 1) {
@@ -682,10 +713,6 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
         rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL, NULL);
         cur_fno_lo = cur_fno_hi = 0;
     }
-    tsdb_free_big(s, max_rows * sizeof *s);
-    tsdb_free_big(t, max_rows * sizeof *t);
-    tsdb_free_big(v, max_rows * sizeof *v);
-    tsdb_free_big(ids, (size_t)(nactive ? nactive : 1) * sizeof *ids);
     return rc;
 }
 
@@ -2709,6 +2736,14 @@ void wal_close(eng *db)
     tsdb_free_big(db->wal_spare, db->wal_spare_cap);
     db->wal_buf = db->wal_spare = NULL;
     db->wal_cap = db->wal_spare_cap = 0;
+    tsdb_free_big(db->fl_s, db->fl_rows_cap * sizeof *db->fl_s);
+    tsdb_free_big(db->fl_t, db->fl_rows_cap * sizeof *db->fl_t);
+    tsdb_free_big(db->fl_v, db->fl_rows_cap * sizeof *db->fl_v);
+    tsdb_free_big(db->fl_ids, db->fl_ids_cap * sizeof *db->fl_ids);
+    db->fl_s = db->fl_ids = NULL;
+    db->fl_t = NULL;
+    db->fl_v = NULL;
+    db->fl_rows_cap = db->fl_ids_cap = 0;
 }
 
 /* ------------------------------------------- recovery of a halted engine */

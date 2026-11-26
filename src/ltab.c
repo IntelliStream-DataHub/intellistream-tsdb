@@ -100,6 +100,29 @@ int lf_granule(lfold **lf, size_t *n, size_t *cap, uint32_t series, int type, co
 
 /* ---- pages and entries (the caller holds latest_rw; pages are made only for writing) ---- */
 
+/* Lazy-zero anonymous mapping on Linux so making pages under latest_rw never stalls concurrent
+ * QUERY_LATEST readers behind synchronous 1 MiB calloc zero-fills (or glibc heap growth). */
+static lt_page *lt_page_alloc(void)
+{
+#ifndef __APPLE__
+    void *p = mmap(NULL, LT_PAGE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#else
+    return calloc(1, LT_PAGE_BYTES);
+#endif
+}
+
+static void lt_page_free(lt_page *p)
+{
+    if (!p)
+        return;
+#ifndef __APPLE__
+    munmap(p, LT_PAGE_BYTES);
+#else
+    free(p);
+#endif
+}
+
 /* Makes pages up to and including page pi, in id order, within the budget. False: capped (a page was refused). */
 static bool lt_make_pages(eng *db, ltab *t, uint32_t pi)
 {
@@ -109,10 +132,10 @@ static bool lt_make_pages(eng *db, ltab *t, uint32_t pi)
         return false;
     while (t->npg <= pi) {
         size_t cap = db->opt.latest_cache;
-        size_t used = atomic_fetch_add(&lt_used, LT_PAGE_BYTES);
-        lt_page *p = used + LT_PAGE_BYTES <= cap ? calloc(1, LT_PAGE_BYTES) : NULL;
+        size_t used = atomic_fetch_add_explicit(&lt_used, LT_PAGE_BYTES, memory_order_relaxed);
+        lt_page *p = (used <= cap && cap - used >= LT_PAGE_BYTES) ? lt_page_alloc() : NULL;
         if (!p) {
-            atomic_fetch_sub(&lt_used, LT_PAGE_BYTES);
+            atomic_fetch_sub_explicit(&lt_used, LT_PAGE_BYTES, memory_order_relaxed);
             t->capped = true;
             return false;
         }
@@ -481,18 +504,26 @@ void lt_merge_marks(eng *db, lt_sec *sec, part **src, size_t k)
         return;
     for (size_t j = 0; j < k; j++) {
         const part *p = src[j];
-        for (uint32_t i = 0; i < p->ng; i++) {
-            uint32_t s = gx_series(p, i);
+        const gix *ix = &p->ix;
+        for (uint32_t r = 0; r < ix->nruns; r++) {
+            uint32_t s = ix->rser[r];
             lt_ent e;
             if (!lt_load(t, s, &e) || e.st != LE_KNOWN)
                 continue;
-            int64_t lo, hi;
-            gx_ts(p, i, &lo, &hi);
-            if (e.ts < lo || e.ts > hi)
-                continue;
-            lt_ent n = {LE_UNKNOWN, e.ts, 0};
-            lt_store(t, s, &n);
-            hints_add(sec, s);
+            uint32_t a = gix_rstart(ix, r);
+            uint32_t b = r + 1 < ix->nruns ? gix_rstart(ix, r + 1) : p->ng;
+            if (b > p->ng)
+                b = p->ng;
+            for (uint32_t i = a; i < b; i++) {
+                int64_t lo, hi;
+                gx_ts(p, i, &lo, &hi);
+                if (e.ts < lo || e.ts > hi)
+                    continue;
+                lt_ent n = {LE_UNKNOWN, e.ts, 0};
+                lt_store(t, s, &n);
+                hints_add(sec, s);
+                break; /* now LE_UNKNOWN: no later granule of s in p can match */
+            }
         }
     }
 }
@@ -518,9 +549,10 @@ int latest_open(eng *db)
     db->lt = NULL;
     if (db->opt.latest_cache == 0 || db->opt.read_only || db->opt.follow)
         return 0;
-    ltab *t = calloc(1, sizeof *t);
+    ltab *t = aligned_alloc(64, sizeof *t);
     if (!t)
         return TSDB_ERR_NOMEM;
+    memset(t, 0, sizeof *t);
     t->pg = calloc(LT_MAXPAGES, sizeof *t->pg);
     t->hint = malloc(LT_HINTS * sizeof *t->hint);
     pthread_rwlockattr_t at;
@@ -551,8 +583,8 @@ void latest_close(eng *db)
     latest_stop(db);
     db->lt = NULL;
     for (uint32_t i = 0; i < t->npg; i++)
-        free(t->pg[i]);
-    atomic_fetch_sub(&lt_used, t->bytes);
+        lt_page_free(t->pg[i]);
+    atomic_fetch_sub_explicit(&lt_used, t->bytes, memory_order_relaxed);
     free(t->pg);
     free(t->hint);
     pthread_rwlock_destroy(&t->rw);
@@ -835,7 +867,7 @@ typedef struct lhold { /* what one hold read for one id */
 
 /* Answers up to LH_MAX ids from the table and the memtables; ids it cannot decide are marked need[]. */
 static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t *ends, int64_t end, bool *need,
-                        latest_row *out, lt_sec *hints, bool *multi_flush)
+                        latest_row *out, lt_sec *hints, bool *multi_flush, uint64_t *n_nn, uint64_t *n_floor)
 {
     ltab *t = db->lt;
     lhold h[LH_MAX];
@@ -892,7 +924,7 @@ static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t 
             continue;
         }
         if (x->a.st == MC_SEARCH || x->f.st == MC_SEARCH) {
-            atomic_fetch_add(&t->st_nn, 1);
+            (*n_nn)++;
             need[i] = true;
             continue;
         }
@@ -921,7 +953,7 @@ static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t 
             bsrc = 3, bts = tts, bslot = x->e.x;
         }
         if (unk && (!bsrc || bts < ubound)) { /* no memtable row at or above the bound: the parts must be read */
-            atomic_fetch_add(&t->st_floor, 1);
+            (*n_floor)++;
             hints_add(hints, local[i]);
             need[i] = true;
             continue;
@@ -975,6 +1007,7 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
     uint32_t ids[LH_MAX];
     size_t pos[LH_MAX];
     size_t m = 0, nsearch = 0, nanswered = 0;
+    uint64_t n_nn = 0, n_floor = 0;
     for (size_t i = 0; i <= n; i++) {
         if (i < n && out[i].status == 0) {
             ids[m] = local[i];
@@ -989,7 +1022,7 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
             if (ends)
                 for (size_t k = 0; k < m; k++)
                     e2[k] = ends[pos[k]];
-            lookup_hold(db, ids, m, ends ? e2 : NULL, end, nd, tmp, &hints, &multi);
+            lookup_hold(db, ids, m, ends ? e2 : NULL, end, nd, tmp, &hints, &multi, &n_nn, &n_floor);
             for (size_t k = 0; k < m; k++) {
                 out[pos[k]] = tmp[k];
                 need[pos[k]] = nd[k];
@@ -999,8 +1032,14 @@ int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, in
             m = 0;
         }
     }
-    atomic_fetch_add(&t->st_table, nanswered - nsearch);
-    atomic_fetch_add(&t->st_search, nsearch);
+    if (nanswered > nsearch)
+        atomic_fetch_add_explicit(&t->st_table, nanswered - nsearch, memory_order_relaxed);
+    if (nsearch)
+        atomic_fetch_add_explicit(&t->st_search, nsearch, memory_order_relaxed);
+    if (n_nn)
+        atomic_fetch_add_explicit(&t->st_nn, n_nn, memory_order_relaxed);
+    if (n_floor)
+        atomic_fetch_add_explicit(&t->st_floor, n_floor, memory_order_relaxed);
     int rc = 0;
     if (nsearch) { /* the searches, on one cut taken after the holds, outside latest_rw */
         uint32_t *l2 = malloc(nsearch * sizeof *l2);
@@ -1110,9 +1149,10 @@ static int warm_batch(eng *db, ltab *t, uint32_t *ids, size_t n, bool floor_mode
         pthread_rwlock_unlock(&t->rw);
         free(out);
         warm_requeue(db, ids, n, floor_mode);
-        atomic_fetch_add(&t->st_fill_refused, 1);
+        atomic_fetch_add_explicit(&t->st_fill_refused, 1, memory_order_relaxed);
         return WS_REFUSED;
     }
+    uint64_t n_ok = 0;
     for (size_t i = 0; i < n; i++) {
         if (out[i].status)
             continue;
@@ -1123,10 +1163,12 @@ static int warm_batch(eng *db, ltab *t, uint32_t *ids, size_t n, bool floor_mode
             lt_store(t, ids[i], &(lt_ent){LE_EMPTY, INT64_MAX, 0});
         else if (!floor_mode)
             lt_store(t, ids[i], &(lt_ent){LE_KNOWN, out[i].ts, out[i].slot});
-        atomic_fetch_add(&t->st_fill_ok, 1);
+        n_ok++;
     }
     t->lgen++;
     pthread_rwlock_unlock(&t->rw);
+    if (n_ok)
+        atomic_fetch_add_explicit(&t->st_fill_ok, n_ok, memory_order_relaxed);
     free(out);
     return WS_OK;
 }
@@ -1269,11 +1311,11 @@ bool latest_info(eng *db, tsdb_latest_stats *st)
     if (!t)
         return false;
     st->enabled = 1;
-    st->table = atomic_load(&t->st_table);
-    st->searched = atomic_load(&t->st_search);
-    st->floor_reads = atomic_load(&t->st_floor);
-    st->fills_stored = atomic_load(&t->st_fill_ok);
-    st->fills_refused = atomic_load(&t->st_fill_refused);
+    st->table = atomic_load_explicit(&t->st_table, memory_order_relaxed);
+    st->searched = atomic_load_explicit(&t->st_search, memory_order_relaxed);
+    st->floor_reads = atomic_load_explicit(&t->st_floor, memory_order_relaxed);
+    st->fills_stored = atomic_load_explicit(&t->st_fill_ok, memory_order_relaxed);
+    st->fills_refused = atomic_load_explicit(&t->st_fill_refused, memory_order_relaxed);
     pthread_rwlock_rdlock(&t->rw);
     for (uint32_t i = 0; i < t->npg; i++)
         for (size_t w = 0; w < LT_PAGE / 64; w++)
@@ -1289,11 +1331,11 @@ bool latest_stats(eng *db, uint64_t out[6])
     ltab *t = db->lt;
     if (!t)
         return false;
-    out[0] = atomic_load(&t->st_table);
-    out[1] = atomic_load(&t->st_search);
-    out[2] = atomic_load(&t->st_floor);
-    out[3] = atomic_load(&t->st_fill_ok);
-    out[4] = atomic_load(&t->st_fill_refused);
+    out[0] = atomic_load_explicit(&t->st_table, memory_order_relaxed);
+    out[1] = atomic_load_explicit(&t->st_search, memory_order_relaxed);
+    out[2] = atomic_load_explicit(&t->st_floor, memory_order_relaxed);
+    out[3] = atomic_load_explicit(&t->st_fill_ok, memory_order_relaxed);
+    out[4] = atomic_load_explicit(&t->st_fill_refused, memory_order_relaxed);
     uint64_t unk = 0;
     pthread_rwlock_rdlock(&t->rw);
     for (uint32_t i = 0; i < t->npg; i++)

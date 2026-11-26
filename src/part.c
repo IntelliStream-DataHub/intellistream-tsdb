@@ -307,8 +307,11 @@ void part_unref(part *p)
     free(p);
 }
 
-atomic_uint_fast64_t granule_checks;
-atomic_uint hour_cut_min = HOUR_CUT_MIN;
+__attribute__((aligned(64))) atomic_uint_fast64_t granule_checks;
+#ifdef TSDB_TEST_HOOKS
+__thread uint64_t *cur_granule_checks;
+#endif
+__attribute__((aligned(64))) atomic_uint hour_cut_min = HOUR_CUT_MIN;
 void (*_Atomic index_reload_hook)(const part *p, uint32_t i, int at);
 
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
@@ -344,7 +347,13 @@ int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t 
     if (g->count == 0 || g->count > p->grows || g->count > cap)
         return TSDB_ERR_CORRUPT;
     if (verify) {
-        atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
+#ifdef TSDB_TEST_HOOKS
+        uint64_t *gc = cur_granule_checks;
+        if (gc)
+            (*gc)++;
+        else
+            atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
+#endif
         if ((uint32_t)xxh64(blk, len, 0) != g->crc)
             return TSDB_ERR_CORRUPT;
     }
