@@ -287,8 +287,125 @@ fn latest_by_name_looks_names_up_together() {
     }
     // the second call asks only the NOT FOUND name again: the others have ids
     c.latest_by_name(&refs, &LatestOpts::default()).unwrap();
+    // 100% cache hit fast path asks for zero SERIES lookups
+    let cached = ["n0", "n1", "n2", "flaky9"];
+    let hit = c.latest_by_name(&cached, &LatestOpts::default()).unwrap();
+    assert_eq!(hit.len(), cached.len());
+    for l in &hit {
+        assert_eq!(l.status, None);
+        assert_eq!(l.kind, LatestKind::None);
+    }
     c.close().unwrap();
     let (max_held, total) = h.join().unwrap();
     assert!(max_held >= 38, "the 38 sendable names of the window were held together, not {max_held}");
     assert_eq!(total, 38 + 1 + 1); // the window, the flaky name again, the NOT FOUND name in the second call
+}
+
+/// Exercises `read_body`'s >= 1 MiB `read_exact_uninit_unix` path with a non-empty `BufReader` prefix (a small
+/// first chunk coalesced with the head of a >3 MiB second chunk), verifying exact payload integrity,
+/// subsequent framing, and mid-frame EOF handling.
+#[test]
+fn large_reply_uninit_read_and_eof() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use tsdb_client::{Error, QueryOpts};
+
+    // 200_000 Int64 rows = 8 + 3_200_000 bytes (~3.05 MiB): even if BufReader fills its full 1 MiB buffer when
+    // reading the header, >2 MiB (>= READ_BUF) remains and must go through `read_exact_uninit_unix`.
+    const SMALL: usize = 10;
+    const ROWS: usize = 200_000;
+    let make_values_frame = |id: [u8; 4], last: u8, base: usize, rows: usize| -> Vec<u8> {
+        let blen = 8 + rows * 16;
+        let mut frame = Vec::with_capacity(13 + blen);
+        frame.extend_from_slice(&((9 + blen) as u32).to_le_bytes());
+        frame.extend_from_slice(&id);
+        frame.push(0); // OP_REPLY
+        frame.extend_from_slice(&0i32.to_le_bytes());
+        frame.extend_from_slice(&[last, 2, 0, 0]); // last, type=Int64 (2), flags=0
+        frame.extend_from_slice(&(rows as u32).to_le_bytes());
+        for i in base..base + rows {
+            let ts = (i as i64) * 17 + 3;
+            frame.extend_from_slice(&ts.to_le_bytes());
+        }
+        for i in base..base + rows {
+            let val = ((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x55aa_1234_5678_9abc) as i64;
+            frame.extend_from_slice(&val.to_le_bytes());
+        }
+        frame
+    };
+
+    let read_req = |s: &mut std::net::TcpStream| -> std::io::Result<([u8; 4], u8)> {
+        let mut h = [0u8; 9];
+        s.read_exact(&mut h)?;
+        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+        let mut p = vec![0u8; len - 5];
+        s.read_exact(&mut p)?;
+        Ok((h[4..8].try_into().unwrap(), h[8]))
+    };
+
+    let reply_ack = |id: [u8; 4], body: &[u8]| -> Vec<u8> {
+        let mut r = ((9 + body.len()) as u32).to_le_bytes().to_vec();
+        r.extend_from_slice(&id);
+        r.push(0);
+        r.extend_from_slice(&0i32.to_le_bytes());
+        r.extend_from_slice(body);
+        r
+    };
+
+    // Part 1: small chunk 0 coalesced with the head of >3 MiB chunk 1 so BufReader holds a non-empty prefix before
+    // `read_exact_uninit_unix` takes over.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let (hid, hop) = read_req(&mut s).unwrap();
+        assert_eq!(hop, 1); // HELLO
+        s.write_all(&reply_ack(hid, &[14u32.to_le_bytes(), [0; 4]].concat())).unwrap();
+        let (qid, qop) = read_req(&mut s).unwrap();
+        assert_eq!(qop, 15); // QUERY_VALUES
+        let mut head = make_values_frame(qid, 0, 0, SMALL);
+        let big = make_values_frame(qid, 1, SMALL, ROWS);
+        head.extend_from_slice(&big[..4096]);
+        s.write_all(&head).unwrap();
+        // Send the remainder in uneven chunks to exercise looped recv() accumulation.
+        for chunk in big[4096..].chunks(131_071) {
+            s.write_all(chunk).unwrap();
+        }
+        // Subsequent small request proves stream alignment stayed exact.
+        if let Ok((sid, sop)) = read_req(&mut s) {
+            assert_eq!(sop, 2); // SERIES
+            s.write_all(&reply_ack(sid, &((1u64 << 32) | 77).to_le_bytes())).unwrap();
+        }
+    });
+
+    let mut c = Client::connect(addr).unwrap();
+    let rows = c.query_rows((1u64 << 32) | 1, .., QueryOpts::asc()).unwrap();
+    assert_eq!(rows.len(), SMALL + ROWS);
+    for (i, (&ts, got)) in rows.ts.iter().zip(rows.values.iter::<i64>().expect("int64 column")).enumerate() {
+        assert_eq!(ts, (i as i64) * 17 + 3, "ts mismatch at {i}");
+        let want = ((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x55aa_1234_5678_9abc) as i64;
+        assert_eq!(got, Some(want), "val mismatch at {i}");
+    }
+    assert_eq!(c.series_lookup("after").unwrap(), (1u64 << 32) | 77);
+    c.close().unwrap();
+    h.join().unwrap();
+
+    // Part 2: mid-frame EOF while inside `read_exact_uninit_unix`.
+    let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = l2.local_addr().unwrap();
+    let h2 = std::thread::spawn(move || {
+        let (mut s, _) = l2.accept().unwrap();
+        let (hid, _) = read_req(&mut s).unwrap();
+        s.write_all(&reply_ack(hid, &[14u32.to_le_bytes(), [0; 4]].concat())).unwrap();
+        let (qid, _) = read_req(&mut s).unwrap();
+        let big = make_values_frame(qid, 1, 0, ROWS);
+        // Send header + 1.5 MiB (< 3.05 MiB) and drop the socket so `read_exact_uninit_unix` hits EOF.
+        let _ = s.write_all(&big[..1_500_000]);
+    });
+
+    let mut c2 = Client::connect(addr2).unwrap();
+    let err = c2.query_rows((1u64 << 32) | 1, .., QueryOpts::asc()).expect_err("truncated large frame must fail");
+    assert!(matches!(err, Error::Io(ref e) if e.kind() == ErrorKind::UnexpectedEof), "got {err:?}");
+    assert!(c2.is_broken());
+    h2.join().unwrap();
 }

@@ -114,6 +114,8 @@ impl Client {
                 out.list_hash = hash;
                 out.parts_counted = counted;
                 out.parts_listed = listed;
+                let min_row = TSTATS_ROW_HEAD + TSTATS_DATA_FIELDS * 8;
+                out.rows.reserve((count as usize).min(r.remaining() / min_row));
                 for _ in 0..count {
                     out.rows.push(tenant_row(&mut r, opts)?);
                 }

@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -905,6 +906,236 @@ static void test_pack_bit_exact(void)
     }
 }
 
+/* One QUERY_MULTI QUERY_VALUES chunk of n int64 rows (ts[i] = val[i] = ts0 + i), with optional TSDB_VALID bitmap. */
+static void multi_i64_chunk(int fd, uint32_t id, uint32_t ix, bool last, uint32_t n, int64_t ts0, const uint8_t *valid)
+{
+    size_t vlen = valid ? ((size_t)n + 7) / 8 : 0;
+    size_t len = TSDB_MULTI_PREFIX + 8 + (size_t)n * 16 + vlen;
+    uint8_t *b = calloc(len, 1);
+    if (!b)
+        return;
+    memcpy(b, &ix, 4);
+    b[TSDB_MULTI_PREFIX] = last;
+    b[TSDB_MULTI_PREFIX + 1] = TSDB_INT64;
+    b[TSDB_MULTI_PREFIX + 2] = valid ? TSDB_VALID : 0;
+    memcpy(b + TSDB_MULTI_PREFIX + 4, &n, 4);
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t v = ts0 + (int64_t)i;
+        memcpy(b + TSDB_MULTI_PREFIX + 8 + (size_t)i * 8, &v, 8);
+        memcpy(b + TSDB_MULTI_PREFIX + 8 + (size_t)n * 8 + (size_t)i * 8, &v, 8);
+    }
+    if (vlen)
+        memcpy(b + TSDB_MULTI_PREFIX + 8 + (size_t)n * 16, valid, vlen);
+    reply(fd, id, 0, b, len);
+    free(b);
+}
+
+/* Exercises collect_fn's lazy validity bitmap across non-byte-aligned chunks, first-null materialization,
+ * byte-aligned masking, realloc growth past 1024 rows, and all-non-null series with TSDB_VALID set. */
+static void multi_lazy_bitmap_server(int fd)
+{
+    uint8_t body[4096];
+    size_t n;
+    uint32_t id;
+    uint8_t op;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        if (op != TSDB_OP_QUERY_MULTI) {
+            uint64_t sid = 42;
+            reply(fd, id, 0, &sid, 8);
+            continue;
+        }
+        /* Series 0: all non-null, chunk 0 has TSDB_VALID all-ones with zero padding bits, chunk 1 has valid == NULL */
+        uint8_t ones13[2] = {0xff, 0x1f};
+        multi_i64_chunk(fd, id, 0, false, 13, 0, ones13);
+        multi_i64_chunk(fd, id, 0, true, 11, 13, NULL);
+
+        /* Series 1:
+         * - chunk 0: 13 non-null rows (o->n & 7 == 5), TSDB_VALID all-ones -> valid stays NULL
+         * - chunk 1: 19 rows with nulls at local bits 0, 7, 13 (overall 13, 20, 26) -> materializes & unaligned copy
+         * - chunk 2: 11 rows at o->n == 32 (aligned) with null at local bit 5 (overall 37) and dirty padding bits
+         * - chunk 3: 1050 non-null rows (valid == NULL) crossing cap 1024 -> 2048 realloc + bitmap_set_ones
+         * - chunk 4: 15 rows at o->n == 1093 (unaligned) with nulls at local bits 0, 14 (overall 1093, 1107) */
+        multi_i64_chunk(fd, id, 1, false, 13, 0, ones13);
+        uint8_t v1[3] = {0xff, 0xff, 0x07};
+        v1[0] &= (uint8_t)~((1u << 0) | (1u << 7));
+        v1[1] &= (uint8_t)~(1u << (13 - 8));
+        multi_i64_chunk(fd, id, 1, false, 19, 13, v1);
+        uint8_t v2[2] = {(uint8_t)(0xffu & ~(1u << 5)), 0xffu}; /* bits 3..7 of byte 1 are dirty padding */
+        multi_i64_chunk(fd, id, 1, false, 11, 32, v2);
+        multi_i64_chunk(fd, id, 1, false, 1050, 43, NULL);
+        uint8_t v4[2] = {(uint8_t)(0xffu & ~(1u << 0)), (uint8_t)(0x7fu & ~(1u << (14 - 8)))};
+        multi_i64_chunk(fd, id, 1, true, 15, 1093, v4);
+
+        /* Series 2: empty 0-row series */
+        multi_i64_chunk(fd, id, 2, true, 0, 0, NULL);
+
+        /* Series 3: all non-null across realloc (> 1024) with TSDB_VALID all-ones */
+        uint8_t ones600[75];
+        memset(ones600, 0xff, sizeof ones600);
+        multi_i64_chunk(fd, id, 3, false, 600, 0, ones600);
+        multi_i64_chunk(fd, id, 3, true, 600, 600, ones600);
+
+        multi_end(fd, id, 4);
+    }
+}
+
+static void test_multi_collect_lazy_bitmap(void)
+{
+    struct fake f;
+    fake_start(&f, multi_lazy_bitmap_server);
+    tsdbc *c;
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    tsdb_sid s[4] = {TSDB_SID(0, 1), TSDB_SID(0, 2), TSDB_SID(0, 3), TSDB_SID(0, 4)};
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
+    tsdb_series_result *r = NULL;
+    CHECK(tsdbc_query_multi_collect(c, &q, s, 4, NULL, &r) == 0);
+    if (r) {
+        CHECK(r[0].status == 0 && r[0].n == 24 && r[0].values.valid == NULL);
+        CHECK(r[1].status == 0 && r[1].n == 1108 && r[1].values.valid != NULL);
+        if (r[1].n == 1108 && r[1].values.valid) {
+            const int64_t *vals = r[1].values.values;
+            for (size_t i = 0; i < 1108; i++) {
+                bool want = i != 13 && i != 20 && i != 26 && i != 37 && i != 1093 && i != 1107;
+                bool got = ((r[1].values.valid[i >> 3] >> (i & 7)) & 1) != 0;
+                if (r[1].ts[i] != (int64_t)i || vals[i] != (int64_t)i || got != want) {
+                    fprintf(stderr, "lazy bitmap mismatch at row %zu: ts %lld v %lld got %d want %d\n", i,
+                            (long long)r[1].ts[i], (long long)vals[i], got, want);
+                    failures++;
+                    break;
+                }
+            }
+            /* Trailing padding bits in the final byte (1108 % 8 == 4 -> bits 4..7) stay zero. */
+            CHECK((r[1].values.valid[1108 >> 3] & 0xf0u) == 0);
+        }
+        CHECK(r[2].status == 0 && r[2].n == 0 && r[2].values.valid == NULL);
+        CHECK(r[3].status == 0 && r[3].n == 1200 && r[3].values.valid == NULL);
+    }
+    tsdbc_series_results_free(r, 4);
+    tsdb_sid id = 0;
+    CHECK(tsdbc_series(c, "after", 1, &id) == 0 && id == 42);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
+static atomic_int latest_heap_series_calls;
+
+/* Fake server for tsdbc_latest_by_name with n > 256: resolves "s<k>" -> TSDB_SID(0, k+1), "extra" -> TSDB_SID(0, 9999),
+ * "missing*" -> NOTFOUND, and answers QUERY_LATEST with deterministic INT64 values derived from id (and ends). */
+static void latest_heap_server(int fd)
+{
+    uint8_t *body = malloc(16384);
+    if (!body)
+        return;
+    size_t n;
+    uint32_t id;
+    uint8_t op;
+    while (read_req(fd, &id, &op, body, 16384, &n)) {
+        if (op == TSDB_OP_SERIES) {
+            atomic_fetch_add(&latest_heap_series_calls, 1);
+            uint16_t nl = 0;
+            memcpy(&nl, body + 1, 2);
+            char name[64];
+            size_t cp = nl < sizeof name - 1 ? nl : sizeof name - 1;
+            memcpy(name, body + 3, cp);
+            name[cp] = 0;
+            if (strncmp(name, "missing", 7) == 0) {
+                reply(fd, id, TSDB_ERR_NOTFOUND, NULL, 0);
+            } else {
+                uint32_t local = strcmp(name, "extra") == 0 ? 9999u : (uint32_t)atoi(name + 1) + 1u;
+                tsdb_sid sid = TSDB_SID(0, local);
+                reply(fd, id, 0, &sid, 8);
+            }
+        } else if (op == TSDB_OP_QUERY_LATEST) {
+            uint8_t flags = body[0];
+            uint32_t cnt = 0;
+            memcpy(&cnt, body + 4, 4);
+            bool per_end = (flags & TSDB_LATEST_PER_END) != 0;
+            size_t off = 16 + (per_end ? (size_t)cnt * 8 : 0);
+            size_t blen = 12 + (size_t)cnt * 24;
+            uint8_t *resp = calloc(1, blen);
+            if (!resp)
+                break;
+            memcpy(resp + 4, &cnt, 4);
+            resp[8] = 1; /* last frame */
+            for (uint32_t i = 0; i < cnt; i++) {
+                tsdb_sid sid;
+                memcpy(&sid, body + off + (size_t)i * 8, 8);
+                int64_t endv = 0;
+                if (per_end)
+                    memcpy(&endv, body + 16 + (size_t)i * 8, 8);
+                int64_t local = (int64_t)(sid & 0xffffffffu);
+                int64_t ts = local * 100 + endv;
+                uint8_t *rec = resp + 12 + (size_t)i * 24;
+                rec[4] = TSDB_LATEST_VALUE;
+                rec[5] = TSDB_INT64;
+                memcpy(rec + 8, &ts, 8);
+                memcpy(rec + 16, &local, 8);
+            }
+            reply(fd, id, 0, resp, blen);
+            free(resp);
+        } else {
+            reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
+        }
+    }
+    free(body);
+}
+
+static void test_latest_by_name_heap(void)
+{
+    enum { N = 300 }; /* > 256: exercises heap idv path and > 1 NAME_WINDOW */
+    atomic_store(&latest_heap_series_calls, 0);
+    struct fake f;
+    fake_start(&f, latest_heap_server);
+    tsdbc *c;
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    char names[N][16];
+    const char *p[N], *rev[N], *mix[N];
+    int64_t ends[N];
+    tsdb_latest_result out[N];
+    for (int i = 0; i < N; i++) {
+        snprintf(names[i], sizeof names[i], "s%d", i);
+        p[i] = names[i];
+        ends[i] = (int64_t)(i + 1);
+    }
+    for (int i = 0; i < N; i++)
+        rev[i] = names[N - 1 - i];
+
+    /* Cold resolution (n > 256): heap idv + 2 lookup windows + k == n direct latest_send */
+    CHECK(tsdbc_latest_by_name(c, p, N, NULL, out) == 0);
+    CHECK(atomic_load(&latest_heap_series_calls) == N);
+    for (int i = 0; i < N; i++) {
+        int64_t want = i + 1;
+        CHECK(out[i].status == 0 && out[i].kind == TSDB_LATEST_VALUE && out[i].type == TSDB_INT64 &&
+              out[i].ts == want * 100 && out[i].v.i64 == want);
+    }
+
+    /* 100% cache hit (n > 256) with per-series ends: zero new SERIES requests */
+    tsdb_latest_opts opts = {.ends = ends};
+    CHECK(tsdbc_latest_by_name(c, rev, N, &opts, out) == 0);
+    CHECK(atomic_load(&latest_heap_series_calls) == N);
+    for (int i = 0; i < N; i++) {
+        int64_t want = N - i;
+        CHECK(out[i].status == 0 && out[i].kind == TSDB_LATEST_VALUE && out[i].type == TSDB_INT64 &&
+              out[i].ts == want * 100 + ends[i] && out[i].v.i64 == want);
+    }
+
+    /* Mixed cached + miss + invalid + uncached (n > 256): scatter path */
+    for (int i = 0; i < N; i++)
+        mix[i] = names[i];
+    mix[5] = "missing5";
+    mix[200] = "";
+    mix[280] = "extra";
+    CHECK(tsdbc_latest_by_name(c, mix, N, NULL, out) == 0);
+    CHECK(atomic_load(&latest_heap_series_calls) == N + 2);
+    CHECK(out[5].status == TSDB_ERR_NOTFOUND && out[5].kind == TSDB_LATEST_NONE);
+    CHECK(out[200].status == TSDB_ERR_INVALID && out[200].kind == TSDB_LATEST_NONE);
+    CHECK(out[280].status == 0 && out[280].v.i64 == 9999 && out[280].ts == 999900);
+    CHECK(out[0].status == 0 && out[0].v.i64 == 1 && out[299].status == 0 && out[299].v.i64 == 300);
+
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
 int main(void)
 {
     th_watchdog("test_client", 1200);
@@ -919,6 +1150,8 @@ int main(void)
     test_timeout_in_large_body();
     test_values_stream_in_step();
     test_type_switch();
+    test_multi_collect_lazy_bitmap();
+    test_latest_by_name_heap();
     test_peer_closed();
 #ifdef __APPLE__
     fprintf(stderr, "test_connect_timeout: skipped on macOS (a full accept queue answers differently)\n");

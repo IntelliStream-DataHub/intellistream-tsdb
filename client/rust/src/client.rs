@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::{Duration, Instant};
@@ -2738,9 +2738,13 @@ impl Client {
         loop {
             let id = self.reply_id;
             let st = self.read_frame_raw()?;
+            if !retryable(st) || self.retry.is_none() || self.delivered == Some(id) {
+                self.delivered = Some(id);
+                return Ok(st);
+            }
             let alone = self.kept.iter().all(|k| k.id == id || (k.id.wrapping_sub(id) as i32) < 0)
                 && self.req_kept_id.is_none_or(|rid| rid == id || (rid.wrapping_sub(id) as i32) < 0);
-            if !retryable(st) || self.retry.is_none() || !alone || self.delivered == Some(id) {
+            if !alone {
                 self.delivered = Some(id);
                 return Ok(st);
             }
@@ -2762,6 +2766,43 @@ impl Client {
         }
     }
 
+    /// Reads `need` bytes into `self.body` without zero-filling spare capacity first.
+    fn read_body(&mut self, need: usize) -> io::Result<()> {
+        self.body.clear();
+        if need == 0 {
+            return Ok(());
+        }
+        self.body.reserve(need);
+        let mut rem = need;
+        let buffered = self.stream.buffer();
+        if !buffered.is_empty() {
+            let take = buffered.len().min(rem);
+            self.body.extend_from_slice(&buffered[..take]);
+            self.stream.consume(take);
+            rem -= take;
+        }
+        #[cfg(unix)]
+        if rem >= READ_BUF {
+            debug_assert!(self.stream.buffer().is_empty());
+            return read_exact_uninit_unix(self.stream.get_ref(), &mut self.body, rem);
+        }
+        while rem > 0 {
+            let buf = match self.stream.fill_buf() {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if buf.is_empty() {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            let take = buf.len().min(rem);
+            self.body.extend_from_slice(&buf[..take]);
+            self.stream.consume(take);
+            rem -= take;
+        }
+        Ok(())
+    }
+
     /// Reads the next reply frame, which must answer request `reply_id`, into
     /// `body`, and returns its status. The body of an UNAVAILABLE, MOVED, PARTIAL or DROPPED reply goes to
     /// `err`, and is cut from `body` (a streamed op's reader sees the empty chunk it expects).
@@ -2777,9 +2818,7 @@ impl Client {
         if id != self.reply_id {
             return Err(Error::Protocol(format!("reply for request {id}, expected {}", self.reply_id)));
         }
-        self.body.clear();
-        self.body.resize(len - 9, 0);
-        self.stream.read_exact(&mut self.body)?;
+        self.read_body(len - 9)?;
         let st = word(9) as i32;
         if (-13..=-10).contains(&st) {
             let op = if self.req_kept_id == Some(id) {
@@ -2795,6 +2834,38 @@ impl Client {
         }
         Ok(st)
     }
+}
+
+/// Reads `rem` bytes straight from `stream` into `dst`'s uninitialized spare capacity.
+/// On error or EOF, `dst` only exposes the bytes actually written by `recv`.
+#[cfg(unix)]
+fn read_exact_uninit_unix(stream: &TcpStream, dst: &mut Vec<u8>, mut rem: usize) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    while rem > 0 {
+        let spare = dst.spare_capacity_mut();
+        debug_assert!(spare.len() >= rem);
+        let want = rem.min(spare.len()).min(i32::MAX as usize);
+        // SAFETY: `spare` is valid writable memory of at least `want` bytes owned by `dst`,
+        // `fd` is an open socket, and `dst.set_len` below advances only by the bytes `recv` wrote.
+        let r = unsafe { libc::recv(fd, spare.as_mut_ptr().cast(), want, 0) };
+        if r > 0 {
+            let n = r as usize;
+            debug_assert!(n <= want);
+            let new_len = dst.len() + n;
+            // SAFETY: `recv` initialized `spare[..n]` and `new_len <= dst.capacity()`.
+            unsafe { dst.set_len(new_len) };
+            rem -= n;
+        } else if r == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A QUERY_BUCKETS or QUERY_BOUNDS reply.

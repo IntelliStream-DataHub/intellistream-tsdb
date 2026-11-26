@@ -553,13 +553,20 @@ static int read_reply_raw(tsdbc *c, int32_t *status, const uint8_t **body, size_
     memcpy(status, hdr + 9, 4);
     size_t n = len - 9;
     if (n > c->fcap) {
-        uint8_t *f = realloc(c->frame, n);
+        size_t maxf = (size_t)TSDB_MAX_FRAME + TSDB_MULTI_PREFIX;
+        size_t cap = c->fcap ? c->fcap : 4096;
+        while (cap < n)
+            cap = cap <= maxf / 2 ? cap * 2 : maxf;
+        free(c->frame);
+        c->frame = NULL;
+        c->fcap = 0;
+        uint8_t *f = malloc(cap);
         if (!f) {
             c->broken = true; /* the body stays unread */
             return TSDB_ERR_NOMEM;
         }
         c->frame = f;
-        c->fcap = n;
+        c->fcap = cap;
     }
     if ((rc = read_exact(c, c->frame, n)) != 0)
         return rc;
@@ -989,13 +996,13 @@ int tsdbc_wait(tsdbc *c)
 }
 
 /* A request whose reply is read right away (after any pipelined ones). */
-static int call(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b, size_t blen, const uint8_t **body,
-                size_t *n)
+static int call3(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b, size_t blen, const void *d,
+                 size_t dlen, const uint8_t **body, size_t *n)
 {
     int rc = tsdbc_wait(c);
     if (rc)
         return rc;
-    if ((rc = send_req(c, op, a, alen, b, blen, NULL, 0, NULL, 0)) != 0)
+    if ((rc = send_req(c, op, a, alen, b, blen, d, dlen, NULL, 0)) != 0)
         return rc;
     int32_t st;
     const uint8_t *bb;
@@ -1007,6 +1014,12 @@ static int call(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b,
         *n = nn;
     }
     return st;
+}
+
+static int call(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b, size_t blen, const uint8_t **body,
+                size_t *n)
+{
+    return call3(c, op, a, alen, b, blen, NULL, 0, body, n);
 }
 
 /* -------------------------------------------------------------- calls */
@@ -1308,15 +1321,9 @@ static int buckets_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, in
     memcpy(q + 38, &lim, 8);
     uint16_t z16 = (uint16_t)zl;
     memcpy(q + 46, &z16, 2);
-    uint8_t *tail = malloc(zl + 1);
-    if (!tail)
-        return TSDB_ERR_NOMEM;
-    memcpy(tail, zone, zl);
-    tail[zl] = fields;
     const uint8_t *b;
     size_t len;
-    int rc = call(c, TSDB_OP_QUERY_BUCKETS, q, sizeof q, tail, zl + (fields != 0), &b, &len);
-    free(tail);
+    int rc = call3(c, TSDB_OP_QUERY_BUCKETS, q, sizeof q, zone, zl, &fields, fields != 0 ? 1 : 0, &b, &len);
     return rc ? rc : read_buckets(b, len, fields, out, nout);
 }
 
@@ -1337,15 +1344,9 @@ static int bounds_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, con
     q[24] = opts && opts->order == TSDB_DESC;
     memcpy(q + 25, &lim, 8);
     memcpy(q + 33, &n32, 4);
-    uint8_t *tail = malloc(n * 8 + 1);
-    if (!tail)
-        return TSDB_ERR_NOMEM;
-    memcpy(tail, bounds, n * 8);
-    tail[n * 8] = fields;
     const uint8_t *b;
     size_t len;
-    int rc = call(c, TSDB_OP_QUERY_BOUNDS, q, sizeof q, tail, n * 8 + (fields != 0), &b, &len);
-    free(tail);
+    int rc = call3(c, TSDB_OP_QUERY_BOUNDS, q, sizeof q, bounds, n * 8, &fields, fields != 0 ? 1 : 0, &b, &len);
     return rc ? rc : read_buckets(b, len, fields, out, nout);
 }
 
@@ -2314,10 +2315,9 @@ int tsdbc_query_lttb_ex(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, s
 /* The chunks of a QUERY_VALUES or QUERY_LTTB reply, to fn. */
 static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
 {
+    _Static_assert(_Alignof(int64_t) <= 8 && _Alignof(double) <= 8 && _Alignof(float) <= 4 && _Alignof(uint32_t) <= 4,
+                   "QUERY_VALUES columns sit at 8-byte offsets in c->frame");
     int rc = 0;
-    int64_t *ts = NULL;
-    uint8_t *v = NULL;
-    size_t cap = 0;
     bool stopped = false;
     int type = -1; /* of the first frame: the series has one, and a callback may size its buffer by it */
     for (;;) {
@@ -2347,21 +2347,10 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
         if (!b[0])
             stream_more(c);
         if (n && !stopped) {
-            if (n > cap) { /* aligned copies of the columns */
-                free(ts);
-                free(v);
-                ts = malloc((size_t)n * 8);
-                v = malloc((size_t)n * 8 + (size_t)n / 8 + 1);
-                cap = ts && v ? n : 0;
-                if (!cap) {
-                    rc = TSDB_ERR_NOMEM;
-                    c->broken = !b[0]; /* the rest of the stream stays unread */
-                    break;
-                }
-            }
-            memcpy(ts, b + 8, (size_t)n * 8);
-            memcpy(v, b + 8 + (size_t)n * 8, (size_t)n * aw + valid);
-            tsdb_values col = {(tsdb_type)b[1], v, valid ? v + (size_t)n * aw : NULL};
+            /* c->frame comes from malloc (max_align_t >= 8), and both b + 8 and b + 8 + n * 8 are 8-byte aligned */
+            const int64_t *ts = (const int64_t *)(const void *)(b + 8);
+            const uint8_t *vp = b + 8 + (size_t)n * 8;
+            tsdb_values col = {(tsdb_type)b[1], vp, valid ? vp + (size_t)n * aw : NULL};
             stopped = fn(ctx, ts, &col, n) != 0; /* keep reading to the end of the stream */
         }
         if (b[0]) {
@@ -2369,8 +2358,6 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
             break;
         }
     }
-    free(ts);
-    free(v);
     return rc;
 }
 
@@ -2992,9 +2979,41 @@ typedef struct mcollect {
     tsdb_series_result *r;
     size_t stride; /* bytes per bucket; 0: rows */
     size_t *cap;   /* rows allocated per series */
-    bool *nulls;   /* the series had a null */
     int err;
 } mcollect;
+
+static bool has_null_bit(const uint8_t *valid, size_t n)
+{
+    if (!valid)
+        return false;
+    size_t full = n >> 3;
+    for (size_t i = 0; i < full; i++)
+        if (valid[i] != 0xff)
+            return true;
+    unsigned rem = (unsigned)(n & 7);
+    return rem && (valid[full] & ((1u << rem) - 1)) != ((1u << rem) - 1);
+}
+
+static void bitmap_set_ones(uint8_t *bits, size_t pos, size_t rem)
+{
+    if (!rem)
+        return;
+    if (pos & 7) {
+        unsigned take = 8 - (unsigned)(pos & 7);
+        if (take > rem)
+            take = (unsigned)rem;
+        bits[pos >> 3] |= (uint8_t)(((1u << take) - 1) << (pos & 7));
+        pos += take;
+        rem -= take;
+    }
+    if (rem >= 8) {
+        memset(bits + (pos >> 3), 0xff, rem >> 3);
+        pos += rem & ~(size_t)7;
+        rem &= 7;
+    }
+    if (rem)
+        bits[pos >> 3] |= (uint8_t)((1u << rem) - 1);
+}
 
 static int collect_fn(void *ctx, const tsdb_series_result *in)
 {
@@ -3028,22 +3047,43 @@ static int collect_fn(void *ctx, const tsdb_series_result *in)
         uint8_t *v = realloc((void *)o->values.values, nc * aw);
         if (v)
             o->values.values = v;
-        uint8_t *bits = realloc((void *)o->values.valid, (nc + 7) / 8);
-        if (bits)
+        if (o->values.valid) {
+            uint8_t *bits = realloc((void *)o->values.valid, (nc + 7) / 8);
+            if (!bits)
+                return k->err = TSDB_ERR_NOMEM;
+            memset(bits + (*cap + 7) / 8, 0, (nc + 7) / 8 - (*cap + 7) / 8);
             o->values.valid = bits;
-        if (!ts || !v || !bits)
+        }
+        if (!ts || !v)
             return k->err = TSDB_ERR_NOMEM;
-        memset(bits + (*cap + 7) / 8, 0, (nc + 7) / 8 - (*cap + 7) / 8);
         *cap = nc;
     }
-    uint8_t *bits = (uint8_t *)o->values.valid;
     memcpy((int64_t *)o->ts + o->n, in->ts, in->n * 8);
     memcpy((uint8_t *)o->values.values + o->n * aw, in->values.values, in->n * aw);
-    for (size_t i = 0; i < in->n; i++) {
-        bool known = !in->values.valid || ((in->values.valid[i >> 3] >> (i & 7)) & 1);
-        size_t j = o->n + i;
-        bits[j >> 3] = (uint8_t)((bits[j >> 3] & ~(1u << (j & 7))) | ((unsigned)known << (j & 7)));
-        k->nulls[in->index] |= !known;
+    /* Materialize the validity bitmap only on the first null; a series with no nulls keeps valid == NULL. */
+    if (!o->values.valid && has_null_bit(in->values.valid, in->n)) {
+        uint8_t *bits = calloc((*cap + 7) / 8, 1);
+        if (!bits)
+            return k->err = TSDB_ERR_NOMEM;
+        bitmap_set_ones(bits, 0, o->n);
+        o->values.valid = bits;
+    }
+    if (o->values.valid) {
+        uint8_t *bits = (uint8_t *)o->values.valid;
+        if (!in->values.valid) {
+            bitmap_set_ones(bits, o->n, in->n);
+        } else if ((o->n & 7) == 0) {
+            size_t bytes = (in->n + 7) >> 3;
+            memcpy(bits + (o->n >> 3), in->values.valid, bytes);
+            if (in->n & 7)
+                bits[(o->n >> 3) + bytes - 1] &= (uint8_t)((1u << (in->n & 7)) - 1);
+        } else {
+            for (size_t i = 0; i < in->n; i++) {
+                bool known = (in->values.valid[i >> 3] >> (i & 7)) & 1;
+                size_t j = o->n + i;
+                bits[j >> 3] = (uint8_t)((bits[j >> 3] & ~(1u << (j & 7))) | ((unsigned)known << (j & 7)));
+            }
+        }
     }
     o->values.type = in->values.type;
     o->n = need;
@@ -3056,12 +3096,12 @@ int tsdbc_query_multi_collect(tsdbc *c, const tsdb_multi_query *q, const tsdb_si
     *out = NULL;
     if (!q)
         return TSDB_ERR_INVALID;
-    mcollect k = {calloc(n ? n : 1, sizeof *k.r), 0, calloc(n ? n : 1, sizeof(size_t)), calloc(n ? n : 1, 1), 0};
+    mcollect k = {calloc(n ? n : 1, sizeof *k.r), 0, calloc(n ? n : 1, sizeof(size_t)), 0};
     k.stride = q->kind == TSDB_MULTI_TWA      ? sizeof(tsdb_twa_bucket)
                : q->kind == TSDB_MULTI_SPREAD ? sizeof(tsdb_spread_bucket)
                : q->kind == TSDB_MULTI_BUCKETS ? sizeof(tsdb_bucket)
                                                : 0;
-    int rc = k.r && k.cap && k.nulls ? 0 : TSDB_ERR_NOMEM;
+    int rc = k.r && k.cap ? 0 : TSDB_ERR_NOMEM;
     for (size_t i = 0; rc == 0 && i < n; i++) {
         k.r[i].index = i;
         k.r[i].series = series[i];
@@ -3071,13 +3111,7 @@ int tsdbc_query_multi_collect(tsdbc *c, const tsdb_multi_query *q, const tsdb_si
         rc = tsdbc_query_multi(c, q, series, n, mo, collect_fn, &k);
     if (rc == TSDB_ERR_STOPPED && k.err)
         rc = k.err;
-    for (size_t i = 0; k.r && k.nulls && i < n; i++)
-        if (!k.nulls[i]) { /* no nulls: no bitmap, as tsdb_values has it */
-            free((void *)k.r[i].values.valid);
-            k.r[i].values.valid = NULL;
-        }
     free(k.cap);
-    free(k.nulls);
     if (rc && rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_TOO_MANY_BUCKETS) {
         tsdbc_series_results_free(k.r, k.r ? n : 0);
         return rc;
@@ -3422,9 +3456,27 @@ void tsdbc_tenant_result_free(tsdbc_tenant_result *r)
 }
 
 /* Decodes the rows of one STATS_TENANTS reply (header already read) into r; false when the frame is malformed. */
-static bool tenant_rows(const uint8_t *b, size_t len, uint32_t count, int want, tsdbc_tenant_result *r)
+static bool tenant_rows(const uint8_t *b, size_t len, uint32_t count, int want, tsdbc_tenant_result *r, size_t *rcap)
 {
     size_t o = TSDB_TSTATS_HEADER;
+    size_t min_row = TSDB_TSTATS_ROW_HEAD + TSDB_TSTATS_DATA_FIELDS * 8;
+    if ((size_t)count > (len - o) / min_row)
+        return false;
+    if (count > 0) {
+        if ((size_t)count > SIZE_MAX / sizeof *r->rows - r->nrows)
+            return false;
+        size_t need = r->nrows + count;
+        if (need > *rcap) {
+            size_t cap = *rcap ? *rcap : 16;
+            while (cap < need)
+                cap = cap <= SIZE_MAX / (2 * sizeof *r->rows) ? cap * 2 : need;
+            tsdbc_tenant_row *nr = realloc(r->rows, cap * sizeof *nr);
+            if (!nr)
+                return false;
+            r->rows = nr;
+            *rcap = cap;
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
         if (len - o < TSDB_TSTATS_ROW_HEAD)
             return false;
@@ -3476,13 +3528,6 @@ static bool tenant_rows(const uint8_t *b, size_t len, uint32_t count, int want, 
             }
             row.nhot = nhot;
         }
-        tsdbc_tenant_row *nr = realloc(r->rows, (r->nrows + 1) * sizeof *nr);
-        if (!nr) {
-            free(row.prefix);
-            free(row.hot);
-            return false;
-        }
-        r->rows = nr;
         r->rows[r->nrows++] = row;
     }
     return o == len;
@@ -3519,6 +3564,7 @@ int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flag
     }
     uint32_t cursor = 0;
     int restarts = 0;
+    size_t rcap = 0;
     for (;;) {
         uint8_t h[16] = {0};
         uint16_t f = (uint16_t)flags, k16 = (uint16_t)k;
@@ -3550,6 +3596,7 @@ int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flag
             /* the tenant list changed between two replies (a SIGHUP or a settle): a cursor into the old list means
              * nothing, so ask again from the start, a few times at most */
             tsdbc_tenant_result_free(out);
+            rcap = 0;
             if (++restarts > 3) {
                 rc = TSDB_ERR_IO;
                 goto fail;
@@ -3562,7 +3609,7 @@ int tsdbc_tenant_stats(tsdbc *c, const char *const *prefixes, size_t n, int flag
         out->list_hash = hash;
         out->parts_counted = counted;
         out->parts_listed = listed;
-        if (!tenant_rows(b, len, count, flags, out))
+        if (!tenant_rows(b, len, count, flags, out, &rcap))
             goto corrupt;
         if (next == TSDB_TSTATS_DONE)
             break;
@@ -3760,21 +3807,40 @@ int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsd
         return 0;
     if (server_version(c) < 14)
         return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
-    tsdb_sid *ids = malloc(n * sizeof *ids);
-    size_t *at = malloc(n * sizeof *at); /* request slot -> index in names */
-    uint8_t *st = malloc(n);             /* 0: resolved (ids[i] holds the id), 1: to look up, 2: answered in out[i] */
-    tsdb_sid *idv = malloc(n * sizeof *idv);
-    int64_t *ends = opts && opts->ends ? malloc(n * sizeof *ends) : NULL;
-    if (!ids || !at || !st || !idv || (opts && opts->ends && !ends)) {
-        free(ids);
-        free(at);
-        free(st);
-        free(idv);
-        free(ends);
+    tsdb_sid idv_stack[256];
+    tsdb_sid *idv = n <= sizeof idv_stack / sizeof idv_stack[0] ? idv_stack : malloc(n * sizeof *idv);
+    if (!idv)
+        return TSDB_ERR_NOMEM;
+    /* Fast path: when every name hits the cache, send directly and decode straight into caller's out. */
+    size_t first_miss = n;
+    for (size_t i = 0; i < n; i++) {
+        if (!names[i] || !*names[i]) {
+            first_miss = i;
+            break;
+        }
+        struct name_ent *e = name_find(c, names[i], name_hash(names[i]));
+        if (!e) {
+            first_miss = i;
+            break;
+        }
+        idv[i] = e->id;
+    }
+    if (first_miss == n) {
+        rc = latest_send(c, idv, n, opts ? opts->ends : NULL, opts ? opts->end : INT64_MAX, opts && opts->with_nulls,
+                         opts ? opts->threads : 0, out);
+        if (idv != idv_stack)
+            free(idv);
+        return rc;
+    }
+    uint8_t *st = malloc(n); /* 0: resolved (idv[i] holds the id), 1: to look up, 2: answered in out[i] */
+    if (!st) {
+        if (idv != idv_stack)
+            free(idv);
         return TSDB_ERR_NOMEM;
     }
+    memset(st, 0, first_miss);
     bool miss = false;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = first_miss; i < n; i++) {
         if (!names[i] || !*names[i]) {
             out[i] = (tsdb_latest_result){.status = TSDB_ERR_INVALID, .kind = TSDB_LATEST_NONE};
             st[i] = 2;
@@ -3792,31 +3858,41 @@ int tsdbc_latest_by_name(tsdbc *c, const char *const *names, size_t n, const tsd
     if (miss)
         rc = names_resolve(c, names, n, st, idv, out);
     size_t k = 0;
-    for (size_t i = 0; rc == 0 && i < n; i++) {
-        if (st[i] != 0)
-            continue;
-        ids[k] = idv[i];
-        at[k] = i;
-        if (ends)
-            ends[k] = opts->ends[i];
-        k++;
-    }
-    if (rc == 0 && k) {
+    for (size_t i = 0; rc == 0 && i < n; i++)
+        k += st[i] == 0;
+    if (rc == 0 && k == n) {
+        rc = latest_send(c, idv, n, opts ? opts->ends : NULL, opts ? opts->end : INT64_MAX, opts && opts->with_nulls,
+                         opts ? opts->threads : 0, out);
+    } else if (rc == 0 && k) {
+        tsdb_sid *ids = malloc(k * sizeof *ids);
+        size_t *at = malloc(k * sizeof *at);
+        int64_t *ends = opts && opts->ends ? malloc(k * sizeof *ends) : NULL;
         tsdb_latest_result *r = malloc(k * sizeof *r);
-        if (!r) {
+        if (!ids || !at || !r || (opts && opts->ends && !ends)) {
             rc = TSDB_ERR_NOMEM;
         } else {
+            size_t j = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (st[i] != 0)
+                    continue;
+                ids[j] = idv[i];
+                at[j] = i;
+                if (ends)
+                    ends[j] = opts->ends[i];
+                j++;
+            }
             rc = latest_send(c, ids, k, ends, opts ? opts->end : INT64_MAX, opts && opts->with_nulls,
                              opts ? opts->threads : 0, r);
-            for (size_t j = 0; rc == 0 && j < k; j++)
-                out[at[j]] = r[j];
-            free(r);
+            for (size_t m = 0; rc == 0 && m < k; m++)
+                out[at[m]] = r[m];
         }
+        free(ids);
+        free(at);
+        free(ends);
+        free(r);
     }
-    free(ids);
-    free(at);
     free(st);
-    free(idv);
-    free(ends);
+    if (idv != idv_stack)
+        free(idv);
     return rc;
 }
