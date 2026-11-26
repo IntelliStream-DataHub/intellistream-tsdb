@@ -870,7 +870,7 @@ static void dict_full(const char *dir)
 #endif
     CHECK(series_get(&d2, "a", false, 0, &id) == 0 && id == 0);
     /* and the table is placed by it: "a", the first name, sits in its own slot */
-    CHECK(d.table[xxh64("a", 1, d.seed) & (d.tcap - 1)] == 1);
+    CHECK(d.table[xxh64("a", 1, d.seed) & (d.tcap - 1)].id1 == 1);
     /* a file that holds more names than a create may make is damage: refused at load, never stored past the end */
     OK(series_get(&d, "c", true, TSDB_FLOAT32, &id));
     uint32_t real2 = atomic_load(&d2.count);
