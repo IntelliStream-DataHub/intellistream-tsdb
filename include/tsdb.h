@@ -11,10 +11,11 @@
  * Storage: every insert writes an immutable, sorted "part" file. Parts are
  * grouped into time partitions and merged in the background, exactly like
  * MergeTree. Inside a part, rows are sorted by (series, ts) and cut into
- * granules of up to `granule_rows` rows. Timestamps are encoded with
- * DoubleDelta, values with Gorilla, and each block is then compressed with
- * ZSTD when that helps. Every granule carries min/max/sum/count, so aggregates
- * over fully covered granules never touch the compressed data.
+ * granules of up to `granule_rows` rows. Timestamps use grid or delta
+ * encoding, values use scaled decimal integers, XOR, bit deltas, byte-split,
+ * ALP_rd, or merge-time dictionaries (TSDB_VALUES_AUTO), and each block is
+ * compressed with ZSTD when that helps. Every granule carries min/max/sum/count,
+ * so aggregates over fully covered granules never touch the compressed data.
  *
  * All functions are thread safe. Time ranges are half open: [start, end).
  */
@@ -74,7 +75,8 @@ enum {
     TSDB_ERR_READONLY = -9,
     /* -10 to -15 are the HA track's (docs/ha.md); their wire bodies are defined once in tsdb_protocol.h (version 13) */
     TSDB_ERR_MOVED = -10,       /* tsdbd: another node owns the volume; definitely not applied (body: tsdb_wire.h) */
-    TSDB_ERR_UNAVAILABLE = -11, /* tsdbd: the volume's storage is unavailable; definitely not applied (ha.md 15.4) */
+    TSDB_ERR_UNAVAILABLE = -11, /* tsdbd: storage is unavailable, or embedded tsdb_stats_settle timeout /
+                                 * tsdb_volume_quiesce; definitely not applied (ha.md 15.4) */
     TSDB_ERR_PARTIAL = -12,     /* tsdbd: a frame spanning volumes was applied for some of them (per-row bits) */
     TSDB_ERR_DROPPED = -13,     /* tsdbd: below the volume's drop watermark; never applied, never resend (final) */
     TSDB_ERR_ABANDONED = -14,   /* a request that was parked on a stuck volume and discarded its work (ha.md 15.3) */
@@ -113,7 +115,7 @@ typedef struct tsdb_options {
     int merge_threads;       /* background merge threads; default 2, 0 disables merges */
     int query_threads;       /* threads of the database's query scheduler, the calling threads included (it
                               * starts query_threads - 1 helpers, shared by every volume); default: every
-                              * logical CPU */
+                              * logical CPU, capped at 256 */
     size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M */
     int flush_interval_ms;   /* memtable age before it is flushed into parts; default 5000 */
     int wal_sync_ms;         /* 0: every small write waits for fsync (group commit, default);
@@ -1057,14 +1059,27 @@ size_t tsdb_struct_size(int kind);
 
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
- * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 7 /* tsdb_latest, tsdb_latest_stats and tsdb_get_latest_stats (design-latest.md; the bindings call them). Before it, 6: Tenants: tsdb_options.stats_recompute_s, stats_resident_s, tenants, ntenants and tsdb_volume_stats.stats_tmap_bytes (design-stats.md steps 3-4). Before it, 5: The latest table: tsdb_options.latest_cache (design-latest.md). Before it, 4: Statistics: tsdb_options.stats and stats_sweep_mb_s (design-stats.md steps 1-2). Before it:  Storage domains and their health (docs/ha.md 15.2). A domain is what fails together (an NFS superblock, in the
- * expected topology one export of one pool). tsdb_health_open starts a monitor thread; every domain added gets a
- * probe thread that reads 4 KiB with O_DIRECT from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to
- * <dir>/PROBE.<node> every 5 s. Probes may hang for as long as the server is away; nothing else of the process
- * waits for them. States: UP, DEGRADED (slow, nothing refused), DOWN (a probe outstanding for down_ms, or three
- * failures in a row), RECOVERING (write probes good for recover_ms). ENOSPC or EDQUOT sets `full` and does not
- * take the domain down. Zero fields of the options take the defaults named below. */
+ * number they were written for when they load the library and refuse another.
+ *
+ * History:
+ *   7: tsdb_latest, tsdb_latest_stats and tsdb_get_latest_stats (design-latest.md; the bindings call them)
+ *   6: tenants (tsdb_options.stats_recompute_s, stats_resident_s, tenants, ntenants;
+ *      tsdb_volume_stats.stats_tmap_bytes; design-stats.md steps 3-4)
+ *   5: the latest table (tsdb_options.latest_cache; design-latest.md)
+ *   4: statistics (tsdb_options.stats and stats_sweep_mb_s; design-stats.md steps 1-2)
+ *   3: tsdb_options.insert_zstd_level (the struct grows by 8)
+ *   2: tsdb_options.pin_index (in what was padding) */
+#define TSDB_ABI_VERSION 7
+int tsdb_abi_version(void);
+
+/* ---- storage domains and their health (docs/ha.md 15.2) ----
+ * A domain is what fails together (an NFS superblock, in the expected topology one export of one pool).
+ * tsdb_health_open starts a monitor thread; every domain added gets a probe thread that reads 4 KiB with O_DIRECT
+ * from <dir>/PROBE every second and writes and fdatasyncs 4 KiB to <dir>/PROBE.<node> every 5 s. Probes may hang
+ * for as long as the server is away; nothing else of the process waits for them. States: UP, DEGRADED (slow, nothing
+ * refused), DOWN (a probe outstanding for down_ms, or three failures in a row), RECOVERING (write probes good for
+ * recover_ms). ENOSPC or EDQUOT sets `full` and does not take the domain down. Zero fields of the options take the
+ * defaults named below. */
 enum { TSDB_DOM_UP = 0, TSDB_DOM_DEGRADED = 1, TSDB_DOM_DOWN = 2, TSDB_DOM_RECOVERING = 3 };
 typedef struct tsdb_health tsdb_health;
 typedef struct tsdb_health_options {
@@ -1106,9 +1121,6 @@ int tsdb_health_state(tsdb_health *h, int domain); /* TSDB_DOM_*, -1 for an unkn
 void tsdb_health_probe_now(tsdb_health *h, int domain); /* after an EIO or ETIMEDOUT from the engine */
 void tsdb_health_set_up(tsdb_health *h, int domain);    /* RECOVERING -> UP: every volume of it is recovered */
 void tsdb_health_close(tsdb_health *h);
-
-/* 3: tsdb_options.insert_zstd_level (the struct grows by 8); 2: pin_index (in what was padding) */
-int tsdb_abi_version(void);
 
 #ifdef __cplusplus
 }

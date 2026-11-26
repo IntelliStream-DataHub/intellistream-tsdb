@@ -35,7 +35,7 @@ What the preview does **not** do yet. Please do not skip this list:
   every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
-  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 6 and its peer protocol version 8;
+  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 6 and its peer protocol version 10;
   a server that finds a state directory or a peer of another version stops, or refuses the peer, with a line naming both
   versions. The changes of replica sets, moves and rebuilds (R4) are in those versions, so a cluster made before them
   must be made again.
@@ -109,8 +109,8 @@ status 2
 # 6. A volume: in a cluster, data lives in volumes the group places, never in a server's own directory. Add one
 #    named plant with three copies, one per node, and wait until every node has made its directory (n1/data/v1, ...)
 #    and the group has recorded that it opened it (open_gen). Then write a day of readings into plant through its
-#    leader (the first of the three; only it takes writes) and read them back. The preview copies nothing yet:
-#    the other two copies stay empty.
+#    leader (only the leader takes writes directly; it replicates every write to the other two copies before answering,
+#    so all three copies hold the data) and read them back.
 build/tsdb cluster volume add $(peer 1) plant --replicas 3 --secret-file $D/secret
 for n in 1 2 3; do wait_for 1 "^replica volume 1 node $n rid [0-9a-f]* open_gen 1$"; done
 status 1 | grep '^volume\|^replica'
@@ -485,17 +485,18 @@ line until the group has confirmed it.
 |---|---|
 | `node N mode M role R term T leader L commit C applied A` | The server you asked. `N`: its member number (0: in no cluster). `M`: `none` (in no cluster), `core` (it runs a copy of the Raft group: a voter or a learner on its way to be one) or `watch` (it follows the group's state without voting). `R`: `follower`, `pre-candidate`, `candidate` or `leader` (`-` when it is not in the group). `T`: the election term, up by one at every new election. `L`: the leader's number, 0 when it knows none (an election is running). `C`, `A`: how far the group's log is committed, and how far this server has applied it. |
 | `stale ...` | This is the copy this server saved before a restart; no one has confirmed it yet. |
-| `cluster UUID replication ... lease_s ...` | The cluster's id and its settings (`init` fixes them; see the reference below). |
+| `cluster UUID replication ... mode M failover F read_barrier B lease_s ... restore_gen R` | The cluster's id, settings (`init` fixes them; see the reference below) and restore generation. |
 | `group voters 1,2,3 learners -` | Who votes, and who is catching up to join the vote. |
 | `member N STATE incarnation I addr A peer P rack R heard H feed F voter_ok V volumes_ok W core_dropped D read_barrier B` | One line per member. `STATE`: `up` or `down` (the group also knows `draining` and `out`, which nothing sets in the preview). `I`: how many times this member has started (it goes up at every restart). `A`: where clients reach it. `P`: where servers reach it. `R`, `F`: its `--rack` and `--power-feed`, `-` for none. `H`: how long ago the server you asked last heard from it. `V`, `W`: whether it may vote and may hold volumes (1/0; a witness has `volumes_ok 0`). `D`: 1 when its Raft core was dropped after a log fault (it goes on as a watcher). `B`: its read barrier setting; `?` when you have not heard it yet. |
 | `replicated lease_ms ...` | The settings of replicated volumes (`init` fixes them; see the reference below). |
 | `volume-report ...`, `domain-report ...` | Per member, what it says about its volumes and storage domains. |
-| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P]` | One line per cluster volume: its number and name, the node that leads it, and the nodes that hold its copies. `preferred P`: the node that should lead it (the first copy in the list); leadership goes back to it once it is in sync again. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
+| `volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P] redundancy ...` | One line per cluster volume: its number and name, the node that leads it, the nodes that hold its copies, and its redundancy (`replicas=N` or `ec=K+M stripe ... stripe_version V gc_suspended 0\|1`). `preferred P`: the node that should lead it (the first copy in the list); leadership goes back to it once it is in sync again. `I` goes up at every change of the in-sync set, `S` at every change of the set of copies (a copy added, removed or made again). |
 | `replica volume N node X rid R open_gen G [replaces Y]` | One line per copy: the copy's replica id (drawn once, when its directory is made; a new id means a new, empty copy) and its open generation (one more at every start of its server, recorded by the group before the copy answers). `replaces Y`: this copy is being built to take the place of node Y's copy (a move); it takes Y's position in the list once Y's copy is removed. |
-| `volumes N users M` | How many volumes and users the group holds (users: always 0 in the preview). |
+| `volumes N users M` | How many volumes and users the group holds. |
 | `transfers started S done D timed_out T cancelled C fell_back F balance B drains_timed_out D2 resumed_blind R ready Y cuts K` | Counters of leadership transfers, from the start of the server you ask: the ones the group's leader started and how they ended, `balance` of them started by the leader balance, and, on the server that led the volume, drains that gave up (`drains_timed_out`), records it accepted after the hard limit of a transfer's wait, 10 times `transfer_wait_ms` (`resumed_blind`: they may be cut), READYs sent, and log records a replica cut. |
 | `moves started S done D cancelled C` | On the group's leader: the copy moves it started, ended with the old copy removed, and ended by `--cancel`. They count from that server's start. |
 | `move volume N node A -> node B: STEP, T s` | On the group's leader, one line per move running: its step (`catch-up`, `transfer`, `shrink`, `remove`) and how long it has run. |
+| `peer links KIND: none N header N full N tcp N rdma N` | Active data-link counts by kind, check level (`none`, `header`, `full`), and transport (`tcp`, `rdma`). |
 
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or
 more (at most `--voters`). A member that does not vote watches.
@@ -623,11 +624,12 @@ The preview is the first step of a longer plan. The designs are written; the wor
   preview. The group's state machine (S1) and what a single server does while its storage
   is away (UNAVAILABLE, in N1) are already in 0.10.0, and users and grants kept in the group, with logins on every
   server ([Logins](#logins)), are in this preview; the proposer's rules for ownership and the time rules come with N7.
+- **Replicated mode (R1 to R4) and erasure coding (R5 to R8) are built**: each volume on servers with their own
+  disks, with replication, the in-sync set, promotion, transfer, move, snapshot rebuild, and erasure-coded settled
+  parts. Raft stays off the insert path.
 - **Shared mode** (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume,
   fenced by the group (the design of [ha.md](ha.md)); this is what production on NFSv4 needs first.
-- **Replicated mode** (R1 to R4): each volume on three servers with their own disks, with replication, the in-sync set,
-  promotion and rebuild. Raft stays off the insert path.
-- Then clients that talk to the owner directly, and a cold tier.
+- Then clients that talk to the volume leader directly, and device classes / storage tiers (R10, R14).
 
 Read more:
 

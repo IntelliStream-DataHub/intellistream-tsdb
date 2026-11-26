@@ -1,6 +1,7 @@
 # tsdb cluster: replicated volumes on servers with their own disks
 
-Status: design, not implemented. Branch `cluster-design`, written on 2026-11-05 from main at 9b00186. Code references
+Status: implemented on main (metadata group, replicated volumes R1–R4 with failover, transfer, move, and snapshot
+rebuild; `node drain`/`out` and shared mode remain unbuilt). Design written on branch `cluster-design` on 2026-11-05 from main at 9b00186. Code references
 are `file:line` at that commit. Builds after the 0.9.0 tag; what must be in 1.0 so that the cluster is an addition and
 not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below), and again on
 2026-11-06 when the user kept the NFS failover as a second HA mode (D3 replaced; [design-ha-modes.md](design-ha-modes.md)).

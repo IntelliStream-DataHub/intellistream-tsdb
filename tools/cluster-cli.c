@@ -29,8 +29,8 @@ int cluster_user_add_first(const char *addr, const uint8_t *secret, size_t slen,
 /* The one text of the cluster commands: `tsdb cluster` (or help, --help) prints it on stdout and exits 0; a mistake in
  * a command prints the same on stderr and exits 2. docs/cluster-preview.md has the longer story. */
 static const char cl_help[] =
-    "tsdb cluster: the commands of tsdbd's cluster (a preview: the metadata group only, no data replication and\n"
-    "no failover yet; docs/cluster-preview.md is the tutorial).\n"
+    "tsdb cluster: the commands of tsdbd's cluster (a 0.x preview: replicated and erasure-coded volumes,\n"
+    "failover and moves; docs/cluster-preview.md is the tutorial).\n"
     "\n"
     "usage: tsdb cluster secret FILE\n"
     "       tsdb cluster init PEER --secret-file F [options]\n"

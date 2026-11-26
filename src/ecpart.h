@@ -172,10 +172,9 @@ enum { EC_MARK_EC = 1, EC_MARK_SETTLING = 2 };
 int eng_test_mark_ec(eng *db, part *p, unsigned flags);
 
 /* ------------------------------------------------------------ call counters (tests/test_ecnames.c) */
-/* Every stub above and in src/{eccache,ecgc,eckeep,ecswap,settle,tier}.c bumps its counter on entry, so the test sees
- * that each dispatch in a shared file reaches it (a stub does what the old code did: without the counters nothing
- * could tell a missing branch). Whoever fills a stub keeps its EC_CALLED line. Relaxed increments, on R7's paths only
- * (a .part never reaches one). */
+/* Each entry point above and in src/{eccache,ecgc,eckeep,ecswap,settle,tier}.c bumps its counter on entry (`EC_CALLED`),
+ * so tests/test_ecnames.c verifies that each dispatch in a shared file reaches it. Relaxed increments, on R7's paths
+ * only (a .part never reaches one). */
 enum {
     EC_CALL_GRANULE_READ,   /* ec_granule_read (part.c granule_read) */
     EC_CALL_INDEX_INTACT,   /* ec_index_intact (part.c part_index_intact) */

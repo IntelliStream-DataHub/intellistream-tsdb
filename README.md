@@ -196,13 +196,15 @@ have to be unpacked are unpacked in parallel.
 
 More detail: [docs/design.md](docs/design.md).
 
-**Version 0.10.0** ([CHANGELOG.md](CHANGELOG.md)) follows 0.9.1. It changes the disk format (9) and the wire protocol
-(14, and it still talks to protocol 12); a 0.9.x database is carried over with `tsdb DIR upgrade` or export and import
-(see the changelog). It adds the latest value of every series, statistics of what is stored, and two things that are
-not for production yet: the change feed (off by default, nothing reads it) and the cluster's metadata group
-(`tsdbd --cluster`, a preview: no replication, no failover). The disk format and the wire protocol may still change in
-a 0.x release and freeze at 1.0; what that means for your data is in [docs/compatibility.md](docs/compatibility.md).
-`tsdbd --version` and `tsdb --version` print the version.
+**Version 0.11.0** ([CHANGELOG.md](CHANGELOG.md)) speaks wire protocol 15 (floor 12, talking to 0.9.x–0.11.x clients and
+servers) and keeps disk format 9 (0.10.x databases open as they are; a 0.9.x database carries over with
+`tsdb DIR upgrade` or export and import). Building on 0.10.x's latest-value cache, statistics and metadata group,
+0.11.0 adds replicated and erasure-coded cluster volumes with failover, leadership transfers, copy moves and snapshot
+rebuilds ([docs/cluster-preview.md](docs/cluster-preview.md), [docs/design-cluster-data.md](docs/design-cluster-data.md)),
+RDMA peer links ([docs/design-rdma.md](docs/design-rdma.md)), and per-series and per-tenant statistics over the wire
+(`STATS_SERIES` and `STATS_TENANTS`, [docs/design-stats.md](docs/design-stats.md)). The disk format and wire protocol
+may still change in a 0.x release and freeze at 1.0; what that means for your data is in
+[docs/compatibility.md](docs/compatibility.md). `tsdbd --version` and `tsdb --version` print the version.
 
 ## Getting started
 
@@ -563,10 +565,14 @@ for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists e
 
 ### Cluster (preview)
 
-`tsdbd --cluster` joins servers into a small Raft group that keeps the list of members, their state and the cluster's
-settings. It is a **preview**: it does not copy data between servers and does not fail over, and the client port works as
-without it. Do not run it in production. [docs/cluster-preview.md](docs/cluster-preview.md) is a ten-minute tutorial:
-three servers and a witness on one machine, a leader killed and restarted. `tsdb cluster` prints the commands.
+`tsdbd --cluster` joins servers into a Raft metadata group that manages replicated (`--replicas N`) and erasure-coded
+(`--redundancy ec=K+M` with `tsdb chunk-store init` and `tsdbd --chunk-dir`) cluster volumes with failover, leadership
+transfers, copy moves, snapshot rebuilds, and optional RDMA peer links ([docs/design-rdma.md](docs/design-rdma.md)).
+Clients route through any server (`--forward on`, the default) and log in with cluster-wide users.
+The metadata snapshot format and peer protocol may still change before 1.0 (clusters made on an earlier 0.x build
+must be re-initialised; see [docs/compatibility.md](docs/compatibility.md)).
+[docs/cluster-preview.md](docs/cluster-preview.md) is a ten-minute tutorial on one machine, and `tsdb cluster` prints
+the commands.
 
 ### Backup and moving to a new version
 
@@ -643,7 +649,7 @@ tsdbd:
 - **The client libraries** (C, Rust, Python and Java, over the network, and the Pulsar connector) are under the
   [Apache License 2.0](LICENSES/Apache-2.0.txt). Use them in any program.
 
-[LICENSING.md](LICENSING.md) lists every directory and says what links to what. Releases 0.9.0, 0.9.1 and 0.10.0 were
+[LICENSING.md](LICENSING.md) lists every directory and says what links to what. Releases 0.9.0, 0.9.1, 0.10.0 and 0.10.1 were
 published under the Apache License 2.0 and stay so. Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE). The
 libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
 

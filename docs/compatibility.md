@@ -8,7 +8,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.11.0 |
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 9 (0.10.0; 0.9.0 and 0.9.1 wrote 8) |
-| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 14 |
+| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 15 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
 | embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 7 |
 
@@ -16,24 +16,28 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 
 | release | reads disk format | wire protocol (floor) | embedded C ABI | clients it talks to |
 |---|---|---|---|---|
-| 0.11.0 | 9 | 14 (12) | 7 | clients and servers of protocol 12, 13 and 14 |
+| 0.11.0 | 9 | 15 (12) | 7 | clients and servers of protocol 12, 13, 14 and 15 |
+| 0.10.1 | 9 (a format-8 database after `tsdb <dir> upgrade`, below) | 14 (12) | 7 | clients and servers of protocol 12, 13 and 14 |
 | 0.10.0 | 9 (a format-8 database after `tsdb <dir> upgrade`, below) | 14 (12) | 7 | clients and servers of protocol 12, 13 and 14 |
 | 0.9.1 | 8 | 12 (12) | 3 | protocol 12 only |
 | 0.9.0 | 8 | 12 (12) | 3 | protocol 12 only |
 
 0.10.0 changed the disk format (8 to 9), the wire protocol (12 to 14: 13 adds the HA reply bodies of docs/ha.md section
-15.4, 14 adds QUERY_LATEST) and the C ABI (3 to 7: the statistics, the latest table and the tenants added fields to
+15.4, 14 adds `QUERY_LATEST`) and the C ABI (3 to 7: the statistics, the latest table and the tenants added fields to
 `tsdb_options` and `tsdb_volume_stats`, and the functions and structs of the change feed, the statistics and the latest
-table). Its floor stays 12: a client or server of 0.9.x speaks to it, with these limits. A client of 12 gets the bare
+table). 0.11.0 raises the wire protocol to 15 (`STATS_SERIES` and `STATS_TENANTS`, `docs/design-stats.md` 5.1) while
+keeping disk format 9 and C ABI 7. Its floor stays 12: a client or server of 0.9.x speaks to it, with these limits. A client of 12 gets the bare
 status codes it knew (the HA bodies only go to a client whose HELLO said 13), and a call that needs a newer server than
-the one connected (`latest` needs 14) fails with `TSDB_ERR_INVALID` without sending. A database of 0.9.x is refused by
-0.10.0 until it is upgraded, and a 0.10.0 database is refused by 0.9.x. A binary built for ABI 3 (an embedded
+the one connected (`latest` needs 14, `series_stats`/`tenant_stats` need 15) fails with `TSDB_ERR_INVALID` without sending. A database of 0.9.x is refused by
+0.10.0 and 0.11.0 until it is upgraded, and a format-9 database is refused by 0.9.x. A binary built for ABI 3 (an embedded
 program) must be rebuilt: the Rust and Java bindings check `tsdb_abi_version()` against the one they were written for and refuse a mismatch
 (Python goes through the Rust crate). Use the same release on the server and its clients all the same.
 
-Preview and off by default: the cluster (`tsdbd --cluster`, `tsdb cluster ...`) is the metadata group only, with no
-replication and no failover; its snapshot (version 2) and peer protocol (version 2) may change again before 1.0, and
-two builds of the preview that differ there do not talk. The change feed is off until `tsdb <dir> feed enable`; with it
+Cluster and off by default: the cluster (`tsdbd --cluster`, `tsdb cluster ...`) runs replicated (`--replicas`) and
+erasure-coded (`--redundancy ec=K+M`) cluster volumes with failover, leadership transfers, copy moves and snapshot
+rebuilds ([cluster-preview.md](cluster-preview.md), [design-cluster-data.md](design-cluster-data.md)); its metadata
+snapshot (version 6) and peer protocol (`PL_CL_VERSION`, version 10) may still change before 1.0, and builds that
+differ there refuse each other naming both versions. The change feed is off until `tsdb <dir> feed enable`; with it
 on, `META` says `requires=feed` and a binary without the feed refuses the directory.
 
 0.9.1 changed neither the disk format nor the protocol, and the C ABI stayed 3: it only added functions and structs

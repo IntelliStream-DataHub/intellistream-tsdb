@@ -236,7 +236,7 @@ refuses these calls.
 
 Series ids are 64-bit numbers in a `long`, handed out by the database: the volume in the high half, so every id is
 at least 2^32 and positive. Look them up by name and keep them in a `long`, never an `int`; do not count on them
-being 0, 1, 2 and so on. The client speaks protocol 14 (a server of 12 works too) and
+being 0, 1, 2 and so on. The client speaks protocol 15 (servers down to protocol 12 work too) and
 `TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers a version below 12.
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.
@@ -427,6 +427,38 @@ time. `EmbeddedDb` has the same methods.
 List<SeriesResult<Latest>> r = client.latestByName(new String[] {"pump0.flow", "pump1.flow"}, LatestOptions.defaults());
 Latest first = r.get(0).get();
 System.out.println(first.kind() + " " + first.ts());
+```
+
+## High availability and clusters
+
+`TsdbClient.connectNodes("host1:7070,host2:7070", options)` shuffles the nodes and connects to the first that answers.
+On `ERR_UNAVAILABLE` or `ERR_MOVED`, the client waits (`retry_after`) or follows `MOVED` within its retry budget
+(30 seconds by default; `setRetry(Duration)` changes it and `Duration.ZERO` disables retries). `lastError()` returns
+the latest `ErrorInfo` reply body, `topology()` returns the cluster's nodes and volume replicas (protocol 13), and
+`serverStatus()` returns the server's `key=value` status lines (superuser, protocol 13).
+
+```java
+try (TsdbClient c = TsdbClient.connectNodes("127.0.0.1:7070,127.0.0.1:7071", opts)) {
+    c.setRetry(Duration.ofSeconds(10));
+    Topology topo = c.topology();
+    System.out.println(topo.generation() + " " + topo.volumes().size());
+}
+```
+
+## Series and tenant statistics
+
+`seriesStats(ids, resident)` returns per-series storage numbers from the granule index and memtables (protocol 15;
+`resident=true` populates `residentBytes`). `tenantStats(prefixes, options)` returns per-tenant storage and activity
+numbers (protocol 15; `TenantOptions.defaults().withVolumes().withHot(5).withCaller()`).
+
+```java
+List<SeriesResult<SeriesStat>> stats = client.seriesStats(new long[] {flow}, false);
+SeriesStat st = stats.get(0).get();
+System.out.println(st.rows() + " rows, " + (st.tsBytes() + st.valueBytes()) + " bytes");
+
+TenantStats ts = client.tenantStats(null, TenantOptions.defaults().withVolumes().withHot(5).withCaller());
+for (TenantStats.Row row : ts.rows())
+    System.out.println(row.prefix() + ": " + row.numbers().rows());
 ```
 
 ## Errors

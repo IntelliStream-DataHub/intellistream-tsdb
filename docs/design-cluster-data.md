@@ -1,6 +1,7 @@
 # tsdb cluster data: erasure coding, 3 replicas, volume moves and failover
 
-Status: design, not implemented. Branch `cluster-data-design`, written on 2026-11-09 from main at 47ae317 (0.10.0),
+Status: partly implemented on main (R5–R8 erasure-coded cluster volumes, chunk stores, settle, EC read cache, and GC are
+on main; device classes R10/R14 and `storage.disks`/`storage.tiers` remain unbuilt). Design written on branch `cluster-data-design` on 2026-11-09 from main at 47ae317 (0.10.0),
 **revised the same day after two reviews** (durability and consistency; operations and performance at 10-100 TB per
 node): their findings are fixed below or answered with the reason, and §13 lists where. Code references are
 `file:line` at 47ae317 for tsdb (design-cluster.md and design-ha-modes.md as edited on this branch), and at 9c5f97d2

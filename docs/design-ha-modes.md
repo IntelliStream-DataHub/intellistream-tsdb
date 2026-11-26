@@ -1,6 +1,7 @@
 # tsdb HA modes: shared NFS storage and the shared-nothing cluster
 
-Status: design, not implemented. Branch `ha-modes`, written on 2026-11-06 from main at ea89968, with the metadata
+Status: partly implemented on main (metadata group, replicated mode R1–R4, and erasure coding R5–R8 are on main; shared
+mode N0, N2–N8 remains unbuilt). Design written on branch `ha-modes` on 2026-11-06 from main at ea89968, with the metadata
 group of cluster step 1 (branch `cluster-s1`, 35e1456 and ede84e5) in view; revised the same day after two reviews
 (fencing and control plane; sharing, cost and operations; what changed is listed under "Review of 2026-11-06" at the
 end), and again after two verification passes (NFS fencing and durability; control plane and operations, read against

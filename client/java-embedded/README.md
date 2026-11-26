@@ -65,8 +65,6 @@ The library is looked up in this order. The first match wins:
 Whichever it is, the binding asks the library for its ABI version (`tsdb_abi_version`, raised with every
 incompatible change of a struct or a function) and for the size of every public struct (`tsdb_struct_size`) when it
 loads it, and refuses one built from other headers with an `UnsatisfiedLinkError`, instead of corrupting memory.
-(The spread and TWA structs have no such size yet; the tests check them against the headers, and a library
-without their functions fails to load.)
 The library needs `libzstd.so.1` at run time (`apt install libzstd1`, `dnf install libzstd`).
 
 `EmbeddedDb.librarySource()` tells you which one was used. The bundled copy is whatever `build/libtsdb.so` was
@@ -114,7 +112,9 @@ machine's CPU (`-march=native`). For a jar that runs on other machines, build th
   `ERR_INVALID` in every query. A range with more local periods than the calendar computes fails with
   `ERR_TOO_MANY_BUCKETS`, as in every client.
 - **Embedded only.** `append`, `dropBefore`, `refresh`, `failed()`, `parts()`, `seriesPath`, `volumeCount`,
-  `volumePath`, `simdLevel()` and every field of `EmbeddedOptions` (`tsdb_options`).
+  `volumePath`, `simdLevel()`, `setTenants(...)`, and `EmbeddedOptions` (wraps `tsdb_options`, omitting
+  `stats_recompute_s`, `stats_resident_s`, `tenants`/`ntenants`, and the C callback `clock_ms`/`clock_arg`, and adding
+  Java's `scratchBytes`).
 
 ## Tests and benchmarks
 

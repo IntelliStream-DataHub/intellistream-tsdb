@@ -27,9 +27,6 @@ from typing_extensions import Buffer
 PROTOCOL_VERSION: int
 """The protocol version of the network client this Db mirrors."""
 
-
-"""The value types: ["float32", "float64", "int64", "bool", "state"]."""
-
 _Order = Literal["asc", "desc"]
 _Unit = Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"]
 _TwaMethod = Literal["step", "linear"]

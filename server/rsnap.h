@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
  * Snapshot transfer of a replicated volume (design-cluster.md §8.1, R4 plan D2-D7, D18): the replica's request, the
- * leader's send and the receiver's side on the kind-5 link (PL_KIND_SNAP); server/rsnap.c has the design. The install
- * and reopen (r4-xferinst) are not built: a received copy is removed.
+ * leader's send and the receiver's side on the kind-5 link (PL_KIND_SNAP); server/rsnap.c handles transfer and
+ * server/snapinst.c / server/snapinst_run.c handle install and reopen.
  */
 #ifndef TSDB_RSNAP_H
 #define TSDB_RSNAP_H
