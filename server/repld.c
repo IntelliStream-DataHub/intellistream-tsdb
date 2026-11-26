@@ -611,7 +611,7 @@ static int wal_batch_parse(struct wal_batch *wb, const uint8_t *buf, size_t len)
         }
         if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
             wb->has_class = 1;
-        wb->rows |= wr.kind == WAL_KIND_ROWS;
+        wb->rows |= wal_rec_is_rows(&wr);
         wb->recs[wb->nrec] = (struct repl_rec){.pos = wr.fno, .epoch = 0, .n = (uint32_t)wr.span};
         wb->lens[wb->nrec++] = (uint32_t)sz;
         o += sz;
@@ -767,7 +767,7 @@ static void late_bytes_hold(struct rvol *rv, const void *buf, size_t len, uint64
         size_t sz = wal_rec_hdr((const uint8_t *)buf + o, len - o, &wr);
         if (!sz)
             break;
-        rows |= wr.kind == WAL_KIND_ROWS;
+        rows |= wal_rec_is_rows(&wr);
         o += sz;
     }
     char f[sizeof G.dir + 16];

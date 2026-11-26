@@ -625,7 +625,9 @@ typedef struct rec {
     unsigned kind;
     uint32_t n;
     uint64_t fno;
-    uint32_t span; /* the numbers it takes: a marker's, else its rows */
+    uint32_t span;     /* the numbers it takes: a marker's, else its rows */
+    uint8_t col_flags; /* WAL_KIND_COL flags byte */
+    off_t off;         /* offset in segment 1 */
 } rec;
 
 static size_t read_records(const char *dir, rec *out, size_t cap)
@@ -646,8 +648,17 @@ static size_t read_records(const char *dir, rec *out, size_t cap)
         out[k].n = w & 0x0fffffffu;
         memcpy(&out[k].fno, h + 16, 8);
         out[k].span = out[k].n;
+        out[k].col_flags = 0;
+        out[k].off = pos;
         if (out[k].kind == WAL_KIND_MARKER && pread(fd, &out[k].span, 4, pos + 32 + 4) != 4)
             break;
+        if (out[k].kind == WAL_KIND_COL) {
+            uint8_t ch[5];
+            if (pread(fd, ch, sizeof ch, pos + 32) != (ssize_t)sizeof ch)
+                break;
+            memcpy(&out[k].span, ch, 4);
+            out[k].col_flags = ch[4];
+        }
         pos += 32 + (off_t)out[k].n * (out[k].kind == WAL_KIND_ROWS ? WAL_ROW : 1);
     }
     off_t end = fd >= 0 ? lseek(fd, 0, SEEK_END) : 0;
@@ -1076,11 +1087,383 @@ static void child_run(const char *kind, const char *dir, const char *ackfile)
         }
         _exit(0);
     }
+    if (strcmp(kind, "col") == 0) { /* compressed columnar WAL_KIND_COL batches + flush + power loss */
+        uint32_t s0 = 0, s1 = 0, s2 = 0;
+        if (eng_series(db, "c0", TSDB_FLOAT32, &s0) != 0 || eng_series(db, "c1", TSDB_FLOAT64, &s1) != 0 ||
+            eng_series(db, "c2", TSDB_FLOAT64, &s2) != 0)
+            _exit(4);
+        enum { CN = 512 };
+        int64_t ts[CN];
+        float vf[CN];
+        double vd[CN];
+        uint32_t ids[CN];
+        for (int b = 0; b < 3; b++) {
+            for (int i = 0; i < CN; i++) {
+                ts[i] = T0 + (int64_t)(b * CN + i) * 1000;
+                vf[i] = 20.0f + (float)(i % 50) * 0.1f;
+                vd[i] = 1000.0 + (double)(b * CN + i) * 0.01;
+                ids[i] = (i & 1) ? s2 : s1;
+            }
+            if (eng_insert_series(db, TSDB_FLOAT32, s0, ts, vf, CN) != 0)
+                _exit(5);
+            ack(ackfile, fno_of(db) - 1);
+            if (eng_insert(db, TSDB_FLOAT64, ids, ts, vd, CN) != 0)
+                _exit(5);
+            ack(ackfile, fno_of(db) - 1);
+        }
+        if (eng_flush(db) != 0)
+            _exit(5);
+        _exit(0);
+    }
     if (strcmp(kind, "open") == 0) { /* nothing but the open (the replay of what is there) and a clean close */
         eng_close(db);
         _exit(0);
     }
     _exit(6);
+}
+
+typedef struct col_got {
+    int64_t *ts;
+    uint64_t *v;
+    size_t n, cap, w;
+} col_got;
+
+static int col_collect(void *ctx, const int64_t *ts, const void *v, size_t n)
+{
+    col_got *g = ctx;
+    for (size_t i = 0; i < n; i++) {
+        if (g->n < g->cap) {
+            g->ts[g->n] = ts[i];
+            g->v[g->n] = slot_get(v, g->w, i);
+        }
+        g->n++;
+    }
+    return 0;
+}
+
+static void check_series_bits(eng *db, uint32_t sid, size_t w, const int64_t *exp_ts, const uint64_t *exp_v, size_t n,
+                              const char *tag)
+{
+    int64_t *gts = malloc(n * sizeof *gts);
+    uint64_t *gv = malloc(n * sizeof *gv);
+    CHECK(gts && gv);
+    col_got g = {.ts = gts, .v = gv, .n = 0, .cap = n, .w = w};
+    int rc = eng_query_raw_ex(db, sid, INT64_MIN, INT64_MAX, false, 0, col_collect, &g);
+    CHECK(rc == 0);
+    if (g.n != n) {
+        fprintf(stderr, "  wal_col %s: series %u got %zu rows, want %zu\n", tag, sid, g.n, n);
+        failures++;
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            if (gts[i] != exp_ts[i] || gv[i] != exp_v[i]) {
+                fprintf(stderr, "  wal_col %s: series %u row %zu mismatch: ts=%" PRId64 " vs %" PRId64
+                                " v=0x%" PRIx64 " vs 0x%" PRIx64 "\n",
+                        tag, sid, i, gts[i], exp_ts[i], gv[i], exp_v[i]);
+                failures++;
+                break;
+            }
+        }
+    }
+    free(gts);
+    free(gv);
+}
+
+/* Compressed columnar WAL_KIND_COL: single-series float32, multi-series float64, 64-bit timestamp jumps,
+ * incompressible random payload (!ZSTD), bool/state/nulls, interleaved ROWS+COL+MARKER, crash replay,
+ * read-only follower query verification, and corrupt rejection (direct + via eng_open). */
+static void test_wal_col(void)
+{
+    char dir[PATH_MAX + 32];
+    fresh("wal-col", dir, sizeof dir);
+
+    enum { N = 1024, NS512 = 512, NSMALL0 = 10, NSMALL1 = 7 };
+    int64_t exp_sf_ts[NSMALL0 + N + NSMALL1];
+    uint64_t exp_sf_v[NSMALL0 + N + NSMALL1];
+    int64_t exp_sd0_ts[N / 2], exp_sd1_ts[N / 2];
+    uint64_t exp_sd0_v[N / 2], exp_sd1_v[N / 2];
+    int64_t exp_s64_ts[N];
+    uint64_t exp_s64_v[N];
+    int64_t exp_srnd_ts[N];
+    uint64_t exp_srnd_v[N];
+    int64_t exp_sb_ts[NS512], exp_sst_ts[NS512];
+    uint64_t exp_sb_v[NS512], exp_sst_v[NS512];
+
+    /* Build deterministic expected arrays shared by child writer and parent verifier */
+    float sf_v0[NSMALL0], sf_vcol[N], sf_v1[NSMALL1];
+    int64_t sf_ts0[NSMALL0], sf_tscol[N], sf_ts1[NSMALL1];
+    for (int i = 0; i < NSMALL0; i++) {
+        sf_ts0[i] = T0 + (int64_t)i * 1000;
+        sf_v0[i] = 10.0f + (float)i;
+        exp_sf_ts[i] = sf_ts0[i];
+        uint32_t b = 0;
+        memcpy(&b, &sf_v0[i], 4);
+        exp_sf_v[i] = b;
+    }
+    for (int i = 0; i < N; i++) {
+        sf_tscol[i] = T0 + (int64_t)(NSMALL0 + i) * 1000;
+        uint32_t b;
+        if (i % 31 == 0) {
+            b = NULL_F32;
+            memcpy(&sf_vcol[i], &b, 4);
+        } else {
+            sf_vcol[i] = 25.0f + (float)(i % 20) * 0.1f;
+            memcpy(&b, &sf_vcol[i], 4);
+        }
+        exp_sf_ts[NSMALL0 + i] = sf_tscol[i];
+        exp_sf_v[NSMALL0 + i] = b;
+    }
+    for (int i = 0; i < NSMALL1; i++) {
+        sf_ts1[i] = T0 + (int64_t)(NSMALL0 + N + i) * 1000;
+        sf_v1[i] = 90.0f + (float)i;
+        exp_sf_ts[NSMALL0 + N + i] = sf_ts1[i];
+        uint32_t b = 0;
+        memcpy(&b, &sf_v1[i], 4);
+        exp_sf_v[NSMALL0 + N + i] = b;
+    }
+
+    int64_t md_ts[N];
+    double md_v[N];
+    for (int i = 0; i < N; i++) {
+        md_ts[i] = T0 + (int64_t)(i / 2) * 1000;
+        uint64_t b;
+        if (i % 29 == 0) {
+            b = NULL_F64;
+            memcpy(&md_v[i], &b, 8);
+        } else {
+            md_v[i] = 100.0 + (double)i * 0.25;
+            memcpy(&b, &md_v[i], 8);
+        }
+        if ((i & 1) == 0) {
+            exp_sd0_ts[i / 2] = md_ts[i];
+            exp_sd0_v[i / 2] = b;
+        } else {
+            exp_sd1_ts[i / 2] = md_ts[i];
+            exp_sd1_v[i / 2] = b;
+        }
+    }
+
+    int64_t s64_ts[N], s64_v[N];
+    for (int i = 0; i < N; i++) {
+        s64_ts[i] = T0 + ((i & 1) ? 5000000000LL : 0LL) + (int64_t)(i / 2) * 1000;
+        s64_v[i] = (i % 37 == 0) ? NULL_I64 : (int64_t)i * 1000 + 7;
+    }
+    /* Query returns sorted timestamps: even indices (T0..), then odd indices (T0+5e9..) */
+    for (int i = 0; i < N / 2; i++) {
+        exp_s64_ts[i] = s64_ts[2 * i];
+        exp_s64_v[i] = (uint64_t)s64_v[2 * i];
+        exp_s64_ts[N / 2 + i] = s64_ts[2 * i + 1];
+        exp_s64_v[N / 2 + i] = (uint64_t)s64_v[2 * i + 1];
+    }
+
+    int64_t rnd_ts[N];
+    double rnd_v[N];
+    uint64_t rng = 0x123456789abcdef0ull;
+    int64_t rt = T0;
+    for (int i = 0; i < N; i++) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        /* high-entropy strictly increasing deltas within one 24h partition so timestamps are incompressible too */
+        rt += 1 + (int64_t)(rng & 0xffffu);
+        rnd_ts[i] = rt;
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        uint64_t bits = (rng & 0x000fffffffffffffull) | 0x3ff0000000000000ull;
+        memcpy(&rnd_v[i], &bits, 8);
+        exp_srnd_ts[i] = rt;
+        exp_srnd_v[i] = bits;
+    }
+
+    int64_t sb_ts[NS512], sst_ts[NS512];
+    uint32_t sb_v[NS512], sst_v[NS512];
+    for (int i = 0; i < NS512; i++) {
+        sb_ts[i] = T0 + (int64_t)i * 1000;
+        sb_v[i] = (i % 17 == 0) ? NULL_BOOL : (uint32_t)(i & 1);
+        exp_sb_ts[i] = sb_ts[i];
+        exp_sb_v[i] = sb_v[i];
+        sst_ts[i] = T0 + (int64_t)i * 1000;
+        sst_v[i] = (i % 19 == 0) ? NULL_STATE : (uint32_t)(1 + (i % 3));
+        exp_sst_ts[i] = sst_ts[i];
+        exp_sst_v[i] = sst_v[i];
+    }
+
+    /* 1. Write interleaved ROWS + WAL_KIND_COL + MARKER batches (without clean close) */
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        eng *db;
+        if (open_eng(dir, false, false, &db) != 0)
+            _exit(2);
+        uint32_t sf = 0, sd0 = 0, sd1 = 0, s64 = 0, srnd = 0, sb = 0, sst = 0;
+        if (eng_series(db, "sf", TSDB_FLOAT32, &sf) != 0 || eng_series(db, "sd0", TSDB_FLOAT64, &sd0) != 0 ||
+            eng_series(db, "sd1", TSDB_FLOAT64, &sd1) != 0 || eng_series(db, "s64", TSDB_INT64, &s64) != 0 ||
+            eng_series(db, "srnd", TSDB_FLOAT64, &srnd) != 0 || eng_series(db, "sb", TSDB_BOOL, &sb) != 0 ||
+            eng_series(db, "sst", TSDB_STATE, &sst) != 0)
+            _exit(3);
+        uint32_t ids[N];
+        for (int i = 0; i < N; i++)
+            ids[i] = (i & 1) ? sd1 : sd0;
+        uint64_t mfno = 0;
+        uint32_t mbody[2] = {0x11223344u, 0x55667788u};
+        if (eng_insert_series(db, TSDB_FLOAT32, sf, sf_ts0, sf_v0, NSMALL0) != 0)
+            _exit(4);
+        if (eng_insert_series(db, TSDB_FLOAT32, sf, sf_tscol, sf_vcol, N) != 0)
+            _exit(4);
+        if (wal_marker(db, MK_NOW, 0, 1, mbody, sizeof mbody, &mfno) != 0)
+            _exit(5);
+        if (eng_insert(db, TSDB_FLOAT64, ids, md_ts, md_v, N) != 0)
+            _exit(5);
+        if (eng_insert_series(db, TSDB_INT64, s64, s64_ts, s64_v, N) != 0)
+            _exit(6);
+        if (eng_insert_series(db, TSDB_FLOAT64, srnd, rnd_ts, rnd_v, N) != 0)
+            _exit(7);
+        if (eng_insert_series(db, TSDB_BOOL, sb, sb_ts, sb_v, NS512) != 0)
+            _exit(8);
+        if (eng_insert_series(db, TSDB_STATE, sst, sst_ts, sst_v, NS512) != 0)
+            _exit(9);
+        if (eng_insert_series(db, TSDB_FLOAT32, sf, sf_ts1, sf_v1, NSMALL1) != 0)
+            _exit(10);
+        _exit(0); /* crash without close: WAL stays un-flushed */
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    rec r[16];
+    size_t nr = read_records(dir, r, 16);
+    CHECK(nr == 9);
+    if (nr == 9) {
+        CHECK(r[0].kind == WAL_KIND_ROWS && r[0].span == NSMALL0);
+        CHECK(r[1].kind == WAL_KIND_COL && r[1].span == N &&
+              r[1].col_flags == (WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_TS32 | WAL_COL_ZSTD));
+        CHECK(r[2].kind == WAL_KIND_MARKER && r[2].span == 1);
+        CHECK(r[3].kind == WAL_KIND_COL && r[3].span == N && r[3].col_flags == (WAL_COL_TS32 | WAL_COL_ZSTD));
+        CHECK(r[4].kind == WAL_KIND_COL && r[4].span == N &&
+              (r[4].col_flags & (WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_TS32)) == WAL_COL_SINGLE);
+        CHECK(r[5].kind == WAL_KIND_COL && r[5].span == N &&
+              r[5].col_flags == (WAL_COL_SINGLE | WAL_COL_TS32)); /* incompressible: !WAL_COL_ZSTD */
+        CHECK(r[6].kind == WAL_KIND_COL && r[6].span == NS512 &&
+              r[6].col_flags == (WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_TS32 | WAL_COL_ZSTD));
+        CHECK(r[7].kind == WAL_KIND_COL && r[7].span == NS512 &&
+              r[7].col_flags == (WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_TS32 | WAL_COL_ZSTD));
+        CHECK(r[8].kind == WAL_KIND_ROWS && r[8].span == NSMALL1);
+        /* contiguous fno across ROWS, COL, and MARKER */
+        uint64_t exp_fno = 1;
+        for (size_t i = 0; i < nr; i++) {
+            CHECK(r[i].fno == exp_fno);
+            exp_fno += r[i].span;
+        }
+        /* compressed batches far smaller than 1024 * 20 = 20480 bytes */
+        CHECK(r[1].n < 4096 && r[3].n < 6144);
+    }
+
+    /* 2. Read-only follower reads and queries every WAL_KIND_COL row before writer replays */
+    eng *ro = NULL;
+    CHECK(open_eng(dir, true, true, &ro) == 0);
+    if (ro) {
+        check_series_bits(ro, 0, 4, exp_sf_ts, exp_sf_v, NSMALL0 + N + NSMALL1, "ro/sf");
+        check_series_bits(ro, 1, 8, exp_sd0_ts, exp_sd0_v, N / 2, "ro/sd0");
+        check_series_bits(ro, 2, 8, exp_sd1_ts, exp_sd1_v, N / 2, "ro/sd1");
+        check_series_bits(ro, 3, 8, exp_s64_ts, exp_s64_v, N, "ro/s64");
+        check_series_bits(ro, 4, 8, exp_srnd_ts, exp_srnd_v, N, "ro/srnd");
+        check_series_bits(ro, 5, 4, exp_sb_ts, exp_sb_v, NS512, "ro/sb");
+        check_series_bits(ro, 6, 4, exp_sst_ts, exp_sst_v, NS512, "ro/sst");
+        CHECK(eng_close(ro) == 0);
+    }
+
+    /* 3. Reopen writer replays every record cleanly and preserves exact bits + fno */
+    eng *db = NULL;
+    CHECK(open_eng(dir, false, false, &db) == 0);
+    if (db) {
+        CHECK(fno_of(db) == 1 + NSMALL0 + N + 1 + N + N + N + NS512 + NS512 + NSMALL1);
+        check_series_bits(db, 0, 4, exp_sf_ts, exp_sf_v, NSMALL0 + N + NSMALL1, "rw/sf");
+        check_series_bits(db, 1, 8, exp_sd0_ts, exp_sd0_v, N / 2, "rw/sd0");
+        check_series_bits(db, 2, 8, exp_sd1_ts, exp_sd1_v, N / 2, "rw/sd1");
+        check_series_bits(db, 3, 8, exp_s64_ts, exp_s64_v, N, "rw/s64");
+        check_series_bits(db, 4, 8, exp_srnd_ts, exp_srnd_v, N, "rw/srnd");
+        check_series_bits(db, 5, 4, exp_sb_ts, exp_sb_v, NS512, "rw/sb");
+        check_series_bits(db, 6, 4, exp_sst_ts, exp_sst_v, NS512, "rw/sst");
+        CHECK(eng_close(db) == 0);
+    }
+
+    /* 4. Corrupt WAL_KIND_COL header/payload rejection (direct + via eng_open) */
+    uint8_t bad[WAL_COL_HDR + 32];
+    memset(bad, 0, sizeof bad);
+    store32(bad, 1); /* nrows = 1 */
+    bad[4] = WAL_COL_SINGLE | WAL_COL_VAL4;
+    store32(bad + 12, 12); /* 8 ts + 4 val */
+    uint32_t nr_out = 0;
+    CHECK(wal_col_header_valid(bad, WAL_COL_HDR + 12, &nr_out) && nr_out == 1);
+    bad[4] = 0x80; /* reserved flag bit */
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 12, &nr_out));
+    bad[4] = WAL_COL_SINGLE | WAL_COL_VAL4;
+    bad[5] = 4; /* pad > 3 */
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 16, &nr_out));
+    bad[5] = 0;
+    bad[6] = 1; /* reserved != 0 */
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 12, &nr_out));
+    bad[6] = 0;
+    store32(bad + 12, 16); /* wrong uncomp_len */
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 12, &nr_out));
+    store32(bad + 12, 12);
+    bad[4] = WAL_COL_VAL4; /* !SINGLE with cs != 0 */
+    store32(bad + 8, 5);
+    store32(bad + 12, 16);
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 16, &nr_out));
+    /* non-zero pad byte rejected */
+    memset(bad, 0, sizeof bad);
+    store32(bad, 1);
+    bad[4] = WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_ZSTD;
+    bad[5] = 1;
+    store32(bad + 12, 12);
+    bad[WAL_COL_HDR + 3] = 0x01;
+    CHECK(!wal_col_header_valid(bad, WAL_COL_HDR + 4, &nr_out));
+    /* corrupt ZSTD body rejected by wal_col_decode */
+    bad[WAL_COL_HDR + 3] = 0;
+    bad[WAL_COL_HDR] = 0xff;
+    wal_col_rows cr;
+    CHECK(wal_col_decode(bad, WAL_COL_HDR + 4, NULL, &cr) == TSDB_ERR_CORRUPT);
+
+    /* On-disk corrupt WAL_KIND_COL through eng_open: (a) resealed corrupt ZSTD body, (b) unknown series id */
+    for (int mode = 0; mode < 2; mode++) {
+        char cdir[PATH_MAX + 32];
+        fresh(mode == 0 ? "wal-col-badz" : "wal-col-badsid", cdir, sizeof cdir);
+        eng *cdb = NULL;
+        CHECK(open_eng(cdir, false, false, &cdb) == 0);
+        uint32_t sid0 = 0;
+        CHECK(eng_series(cdb, "s0", TSDB_FLOAT32, &sid0) == 0);
+        CHECK(eng_close(cdb) == 0);
+        char seg[PATH_MAX + 64];
+        snprintf(seg, sizeof seg, "%s/wal_0000000000000001.log", cdir);
+        uint8_t wrec[WAL_HDR + WAL_COL_HDR + 12];
+        memset(wrec, 0, sizeof wrec);
+        size_t plen = mode == 0 ? (WAL_COL_HDR + 4) : (WAL_COL_HDR + 12);
+        store32(wrec, (uint32_t)plen | ((uint32_t)WAL_KIND_COL << 28));
+        uint64_t f1 = 1;
+        memcpy(wrec + 16, &f1, 8);
+        uint8_t *ch = wrec + WAL_HDR;
+        store32(ch, 1);
+        if (mode == 0) {
+            ch[4] = WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_ZSTD;
+            store32(ch + 12, 12);
+            ch[WAL_COL_HDR] = 0xff; /* invalid ZSTD magic */
+        } else {
+            ch[4] = WAL_COL_SINGLE | WAL_COL_VAL4;
+            store32(ch + 8, 999); /* unknown series id */
+            store32(ch + 12, 12);
+        }
+        wal_reseal(wrec, 1, 0);
+        int wfd = open(seg, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        CHECK(wfd >= 0);
+        CHECK(write(wfd, wrec, WAL_HDR + plen) == (ssize_t)(WAL_HDR + plen));
+        close(wfd);
+        cdb = NULL;
+        CHECK(open_eng(cdir, false, false, &cdb) == TSDB_ERR_CORRUPT);
+        CHECK(cdb == NULL);
+    }
+
+    printf("  compressed columnar WAL_KIND_COL: single/multi-series, 64-bit ts, !ZSTD fallback, bool/state/nulls, "
+           "interleaved, replay, follower & eng_open corrupt checks ok\n");
 }
 
 /* After a power loss: the open works and the next number is above every number a caller was told. */
@@ -1146,8 +1529,23 @@ static void test_power_loss(void)
         bound_holds(dir, ackf, k, "open");
     }
     CHECK(finished && crashes > 5);
-    printf("  power lost at each of %d steps of rows, a flush, a drop and markers, and at each of %d steps of the "
-           "open that replays a segment of markers: the next number is above every acknowledged one\n", c1, crashes);
+    int c2 = crashes;
+    /* compressed columnar WAL_KIND_COL batches + flush under power loss with random tearing */
+    crashes = finished = 0;
+    for (int k = 0; k < 600 && !finished; k++) {
+        fresh("pl-col", dir, sizeof dir);
+        unlink(ackf);
+        int code = run_child("col", dir, ackf, true, k, k + 13);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        bound_holds(dir, ackf, k, "col");
+    }
+    CHECK(finished && crashes > 20);
+    printf("  power lost at each of %d steps of rows, a flush, a drop and markers, %d steps of open replay, and %d "
+           "steps of WAL_KIND_COL batches: the next number is above every acknowledged one\n", c1, c2, crashes);
 }
 
 static void set_mutant(const char *mutant)
@@ -1202,6 +1600,7 @@ int main(int argc, char **argv)
         test_history();
         test_replay_markers();
         test_wal_books();
+        test_wal_col();
         test_wal_split();
         test_wal_clock();
         test_wal_cadence();

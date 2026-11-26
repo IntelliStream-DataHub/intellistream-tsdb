@@ -3187,7 +3187,7 @@ static void test_volume_stats(const char *base)
     OK(tsdb_insert_series(db, id, ts, v, N));
     OK(tsdb_get_volume_stats(db, 0, &vs));
     CHECK(vs.memtable_rows == N && vs.rows == 0);
-    CHECK(vs.wal_bytes >= (uint64_t)N * 16); /* a WAL row is at least 16 bytes */
+    CHECK(vs.wal_bytes > WAL_HDR && vs.wal_bytes < (uint64_t)N * 10); /* compressed columnar WAL beats 20 B/row */
     CHECK(vs.wal_syncs >= 1);               /* sync mode: the insert returned after an fdatasync */
     uint64_t wal1 = vs.wal_bytes;
     OK(tsdb_flush(db));

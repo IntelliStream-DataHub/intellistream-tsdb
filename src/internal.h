@@ -1581,16 +1581,41 @@ int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_
 #define WAL_ROW 20
 #define WAL_KIND_ROWS 0
 #define WAL_KIND_MARKER 1
+#define WAL_KIND_COL 2
 #define WAL_MARKER_HDR 8 /* type, flags, span */
+/* WAL_KIND_COL payload:
+ *   [u32 nrows][u8 flags][u8 pad (0..3)][u16 rsv=0][u32 cs][u32 uncomp_len][body][zero pad]
+ * body (uncompressed): [u32 delta_ids[n] if !SINGLE] [i64 ts0 + (n-1) x (i32|i64) delta_ts] [vals[n * (4|8)]] */
+#define WAL_COL_HDR 16
+#define WAL_COL_SINGLE 1u
+#define WAL_COL_VAL4   2u
+#define WAL_COL_TS32   4u
+#define WAL_COL_ZSTD   8u
+#define WAL_COL_FLAGS_MASK (WAL_COL_SINGLE | WAL_COL_VAL4 | WAL_COL_TS32 | WAL_COL_ZSTD)
+#define WAL_COL_MIN_ROWS 256u
+#define WAL_COL_MAX_UNCOMP (32u << 20)
 typedef struct wal_rec {
     uint32_t kind;
-    uint32_t n;             /* rows, or payload bytes of a marker */
+    uint32_t n;             /* rows (ROWS), or payload bytes (MARKER, COL) */
     uint64_t fno;           /* the first number it takes */
-    uint64_t span;          /* how many: rows, or the marker's span */
+    uint64_t span;          /* how many: rows (ROWS, COL), or the marker's span */
     int64_t commit_ms;
-    const uint8_t *payload; /* the rows, or the marker's payload (type first) */
+    const uint8_t *payload; /* the rows, marker payload (type first), or columnar payload */
     uint16_t mtype, mflags; /* a marker's */
 } wal_rec;
+static inline bool wal_rec_is_rows(const wal_rec *r) { return r->kind == WAL_KIND_ROWS || r->kind == WAL_KIND_COL; }
+typedef struct wal_col_rows {
+    uint32_t nrows;
+    uint32_t cs;   /* valid when ids == NULL */
+    uint32_t *ids; /* NULL if WAL_COL_SINGLE; else nrows series ids */
+    int64_t *ts;   /* nrows timestamps */
+    void *vals;    /* nrows values of width w (4 or 8 bytes) */
+    size_t w;      /* 4 or 8 */
+    void *heap;    /* single backing allocation; release via wal_col_rows_free */
+} wal_col_rows;
+bool wal_col_header_valid(const uint8_t *payload, size_t payload_len, uint32_t *nrows_out);
+int wal_col_decode(const uint8_t *payload, size_t payload_len, void *dctx, wal_col_rows *out);
+void wal_col_rows_free(wal_col_rows *r);
 size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r);
 void wal_reseal(uint8_t *rec, uint64_t seq, uint64_t off); /* tests: a record changed or moved, sealed again */
 /* Whether a valid record starts anywhere in p[from, len) (p at segment offset
@@ -2258,6 +2283,15 @@ struct eng {
     bool wsegs_dirty; /* true if an allocation failed while updating wsegs: fall back to disk scan */
     uint8_t *wal_spare;
     size_t wal_spare_cap;
+#define WAL_ENC_SLOTS 32
+    struct wal_enc_slot {
+        _Alignas(64) atomic_bool busy;
+        void *cctx; /* ZSTD_CCtx* */
+        uint8_t *stage;
+        size_t stage_cap;
+        uint8_t *rec;
+        size_t rec_cap;
+    } wal_enc[WAL_ENC_SLOTS];
     /* FNO (fno.c): the file, the slot the newest store is in, its generation and the value it holds */
     int fno_fd, fno_slot;
     uint64_t fno_gen;

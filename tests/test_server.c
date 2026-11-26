@@ -3063,7 +3063,8 @@ static void test_metrics(const char *dir)
     CHECK(mval(&after, "tsdb_partitions", "volume=\"0\"") >= 1);
     CHECK(mval(&after, "tsdb_granules", "volume=\"0\"") >= 1);
     CHECK(mval(&after, "tsdb_disk_bytes", "volume=\"0\"") > 0);
-    CHECK(mval(&after, "tsdb_wal_bytes_total", "volume=\"0\"") >= rows * 16);
+    double wal_b = mval(&after, "tsdb_wal_bytes_total", "volume=\"0\"");
+    CHECK(wal_b > 0 && wal_b < rows * 10); /* 1000-row batches use compressed columnar WAL_KIND_COL */
     CHECK(mval(&after, "tsdb_failed", "volume=\"0\"") == 0);
     CHECK(mval(&after, "tsdb_metrics_scrapes_total", NULL) >= scrapes_during);
     CHECK(isnan(mval(&after, "tsdb_follow_refresh_age_seconds", NULL))); /* a writer has no lag */

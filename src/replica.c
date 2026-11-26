@@ -138,6 +138,7 @@ struct replica {
     _Atomic uint64_t kept_saved; /* RSTATE's `kept` as last saved (or loaded at the open) */
     uint64_t napplied;           /* records applied since the open (rp->mu; replica_test_napplied) */
     uint64_t open_first;         /* the first position the open's cursor read (replica_test_open_first) */
+    ZSTD_DCtx *wal_dctx;         /* reusable ZSTD context for decoding WAL_KIND_COL records */
 };
 
 /* The position of the COMMIT whose parts this thread commits (apply_commit) and its engine, for jr_part_pos */
@@ -535,6 +536,8 @@ void replica_free(eng *db)
         free(rp->cm[i].f);
     free(rp->cm);
     free(rp->rs.drops);
+    if (rp->wal_dctx)
+        ZSTD_freeDCtx(rp->wal_dctx);
     pthread_mutex_destroy(&rp->mu);
     pthread_mutex_destroy(&rp->segs_mu);
     pthread_mutex_destroy(&rp->unl_mu);
@@ -1836,6 +1839,51 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
      * wal_appended once the whole record is in place: a query sees a committed record whole or not at all, and
      * snapshot_take's captured wal_appended strictly fences concurrent apply_commit + apply_rows. So the rows are
      * collected first (the skip of a replay takes db->lock, which sits above buf_lock) and added in one step. */
+    wal_col_rows cr = {0};
+    bool is_col = wr->kind == WAL_KIND_COL;
+    if (is_col) {
+        if (!rp->wal_dctx)
+            rp->wal_dctx = ZSTD_createDCtx();
+        int drc = wal_col_decode(wr->payload, wr->n, rp->wal_dctx, &cr);
+        if (drc != 0)
+            return drc;
+    }
+    size_t nrows = is_col ? (size_t)cr.nrows : (size_t)wr->n;
+    /* rows older than a DROP that this replica applied already, in partitions that DROP retired, must not come back
+     * from a segment a replay reads again (the part that would have said so is gone with the partition) */
+    int64_t dmax = INT64_MIN;
+    bool dropped = false;
+    for (size_t i = 0; i < rp->rs.ndrops && eng_test_mutant != MUT_REPLICA_NO_DROP_SKIP; i++)
+        if (wr->fno + wr->span - 1 < rp->rs.drops[i].pos) {
+            dmax = dropped ? MAX(dmax, rp->rs.drops[i].until) : rp->rs.drops[i].until;
+            dropped = true;
+        }
+    uint32_t scount = eng_series_count(db);
+    /* Fast path for live single-series WAL_KIND_COL replication: zero per-row unpacking or temporary arrays. */
+    if (is_col && !cr.ids && !dropped && seq > pmax) {
+        if (cr.cs >= scount && (scount = eng_series_count(db)) <= cr.cs) {
+            fprintf(stderr, "tsdb: %s: the record at position %" PRIu64 " names series %" PRIu32 ", which this replica's "
+                            "SERIES lacks\n", db->dir, wr->fno, cr.cs);
+            wal_col_rows_free(&cr);
+            return TSDB_ERR_CORRUPT;
+        }
+        int ty = eng_series_type(db, cr.cs);
+        pthread_mutex_lock(&db->buf_lock);
+        uint64_t app = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
+        int rc = mt_reserve_rows(db->active, NULL, cr.cs, nrows);
+        if (rc == 0)
+            rc = mt_add(db->active, NULL, cr.cs, cr.ts, cr.vals, cr.w, nrows, app + 1, ty);
+        if (rc == 0) {
+            mt_note_fno(db->active, wr->fno, nrows);
+            eng_ppos_rows(db, db->active, PPOS_SITE_APPLY, cr.ts, nrows, wr->fno, NULL);
+            atomic_store_explicit(&db->wal_appended, app + nrows, memory_order_release);
+        }
+        pthread_mutex_unlock(&db->buf_lock);
+        wal_col_rows_free(&cr);
+        if (rc)
+            eng_fail(db, "applying a committed record to the memtable", ENOMEM);
+        return rc;
+    }
     enum { B = 256 };
     uint32_t ids_s[B];
     int64_t ts_s[B];
@@ -1847,44 +1895,42 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     uint64_t *sl = sl_s;
     int *ty = ty_s;
     void *heap = NULL;
-    if (wr->n > B) {
-        size_t n = wr->n;
-        heap = malloc(n * (sizeof *ids + sizeof *ts + sizeof *sl + sizeof *ty + sizeof *ix));
+    if (nrows > B) {
+        heap = malloc(nrows * (sizeof *ids + sizeof *ts + sizeof *sl + sizeof *ty + sizeof *ix));
         if (!heap) {
+            wal_col_rows_free(&cr);
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
             return TSDB_ERR_NOMEM;
         }
         sl = heap;
-        ts = (int64_t *)(sl + n);
-        ids = (uint32_t *)(ts + n);
-        ty = (int *)(ids + n);
-        ix = (uint32_t *)(ty + n);
+        ts = (int64_t *)(sl + nrows);
+        ids = (uint32_t *)(ts + nrows);
+        ty = (int *)(ids + nrows);
+        ix = (uint32_t *)(ty + nrows);
     }
     int64_t cached_p = 0;
     uint64_t cached_seq = 0;
     bool have = false;
-    uint32_t scount = eng_series_count(db);
     const uint8_t *r = wr->payload;
     size_t k = 0;
     int rc = 0;
-    /* rows older than a DROP that this replica applied already, in partitions that DROP retired, must not come back
-     * from a segment a replay reads again (the part that would have said so is gone with the partition) */
-    int64_t dmax = INT64_MIN;
-    bool dropped = false;
-    for (size_t i = 0; i < rp->rs.ndrops && eng_test_mutant != MUT_REPLICA_NO_DROP_SKIP; i++)
-        if (wr->fno + wr->span - 1 < rp->rs.drops[i].pos) {
-            dmax = dropped ? MAX(dmax, rp->rs.drops[i].until) : rp->rs.drops[i].until;
-            dropped = true;
-        }
-    for (size_t i = 0; i < wr->n; i++, r += WAL_ROW) {
+    for (size_t i = 0; i < nrows; i++) {
         uint32_t id;
         int64_t t;
         uint64_t slot;
-        wal_row(r, &id, &t, &slot);
+        if (is_col) {
+            id = cr.ids ? cr.ids[i] : cr.cs;
+            t = cr.ts[i];
+            slot = slot_get(cr.vals, cr.w, i);
+        } else {
+            wal_row(r, &id, &t, &slot);
+            r += WAL_ROW;
+        }
         if (id >= scount && (scount = eng_series_count(db)) <= id) {
             fprintf(stderr, "tsdb: %s: the record at position %" PRIu64 " names series %" PRIu32 ", which this replica's "
                             "SERIES lacks\n", db->dir, wr->fno, id);
             free(heap);
+            wal_col_rows_free(&cr);
             return TSDB_ERR_CORRUPT;
         }
         if (dropped) {
@@ -1920,7 +1966,7 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             a = b;
         }
         if (rc == 0) {
-            mt_note_fno(db->active, wr->fno, wr->n);
+            mt_note_fno(db->active, wr->fno, nrows);
             eng_ppos_rows(db, db->active, PPOS_SITE_APPLY, ts, k, wr->fno, ix);
             atomic_store_explicit(&db->wal_appended, app + k, memory_order_release);
         }
@@ -1929,6 +1975,7 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
             eng_fail(db, "applying a committed record to the memtable", ENOMEM);
     }
     free(heap);
+    wal_col_rows_free(&cr);
     return rc;
 }
 
@@ -2188,9 +2235,9 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
          * stamps commit_ms with its wall clock, which its retention clock (opt.clock_ms, the floor) need not follow. */
         if (eng_test_mutant == MUT_REPLICA_COMMIT_CLOCK) /* planted: the clock follows every record's commit_ms */
             replica_now_advance(db, wr.commit_ms);
-        if (wr.kind == WAL_KIND_ROWS)
+        if (wal_rec_is_rows(&wr))
             RP_HOOK(db, RH_ROWS_HELD);
-        rc = wr.kind == WAL_KIND_ROWS ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
+        rc = wal_rec_is_rows(&wr) ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
         if (rc == RP_AGAIN) { /* a cut came while the marker's slow part ran without rp->mu: read again from the cursor */
             rp->rbuf_len = 0;
             rc = 0;
@@ -2276,6 +2323,12 @@ size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r)
         span = load32(p + WAL_HDR + 4);
         if (span == 0)
             return 0;
+    } else if (kind == WAL_KIND_COL) {
+        uint32_t nrows = 0;
+        if (n > avail - WAL_HDR || !wal_col_header_valid(p + WAL_HDR, n, &nrows))
+            return 0;
+        body = n;
+        span = nrows;
     } else {
         return 0;
     }

@@ -8780,6 +8780,137 @@ static void case_wsegs_index(void)
     printf("  wsegs index: 20 rotations, random binary-search reads, retention prune, ENOENT fallback, reopen ok\n");
 }
 
+typedef struct wcol_buf {
+    int64_t *ts;
+    uint64_t *v;
+    size_t n, cap, w;
+} wcol_buf;
+
+static int wcol_qfn(void *ctx, const int64_t *ts, const void *v, size_t n)
+{
+    wcol_buf *b = ctx;
+    for (size_t i = 0; i < n; i++) {
+        if (b->n == b->cap) {
+            size_t nc = b->cap ? b->cap * 2 : 512;
+            int64_t *nt = realloc(b->ts, nc * sizeof *nt);
+            uint64_t *nv = realloc(b->v, nc * sizeof *nv);
+            if (!nt || !nv) {
+                free(nt);
+                free(nv);
+                return TSDB_ERR_NOMEM;
+            }
+            b->ts = nt;
+            b->v = nv;
+            b->cap = nc;
+        }
+        b->ts[b->n] = ts[i];
+        b->v[b->n] = slot_get(v, b->w, i);
+        b->n++;
+    }
+    return 0;
+}
+
+static void wcol_eq(eng *a, eng *b, uint32_t s, size_t w, const char *what)
+{
+    wcol_buf ba = {.w = w}, bb = {.w = w};
+    CHECK_EQ(eng_query_raw_ex(a, s, INT64_MIN, INT64_MAX, false, 0, wcol_qfn, &ba), 0);
+    CHECK_EQ(eng_query_raw_ex(b, s, INT64_MIN, INT64_MAX, false, 0, wcol_qfn, &bb), 0);
+    if (ba.n != bb.n || (ba.n && (memcmp(ba.ts, bb.ts, ba.n * sizeof *ba.ts) != 0 ||
+                                  memcmp(ba.v, bb.v, ba.n * sizeof *ba.v) != 0))) {
+        fprintf(stderr, "%s: series %u differs (leader %zu rows, replica %zu rows)\n", what, s, ba.n, bb.n);
+        failures++;
+    }
+    free(ba.ts);
+    free(ba.v);
+    free(bb.ts);
+    free(bb.v);
+}
+
+/* Replication of compressed columnar WAL_KIND_COL records: live single-series fast path, multi-series slow path,
+ * BOOL/STATE/NULLs, DROP skip, and seq <= pmax replay skip on replica reopen. */
+static void case_wal_col_repl(void)
+{
+    xport x;
+    xp_start(&x, "walcol");
+    x.ld->opt.wal_max_batch_rows = 65536;
+    uint32_t sf64a = 0, sf64b = 0, sb = 0, sst = 0;
+    CHECK_EQ(eng_series(x.ld, "f64a", TSDB_FLOAT64, &sf64a), 0);
+    CHECK_EQ(eng_series(x.ld, "f64b", TSDB_FLOAT64, &sf64b), 0);
+    CHECK_EQ(eng_series(x.ld, "b0", TSDB_BOOL, &sb), 0);
+    CHECK_EQ(eng_series(x.ld, "st0", TSDB_STATE, &sst), 0);
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+
+    enum { N = 600 };
+    int64_t ts[N];
+    float vf[N];
+    double vd[N];
+    uint32_t ids[N], vb[N], vst[N];
+    /* 1. Single-series FLOAT32 (live fast path) in day 0 and day 2 */
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + (i < N / 2 ? 0 : 2 * DAY_MS) + (int64_t)(i % (N / 2)) * 1000;
+        if (i % 23 == 0) {
+            uint32_t nb = NULL_F32;
+            memcpy(&vf[i], &nb, 4);
+        } else {
+            vf[i] = 12.5f + (float)i * 0.25f;
+        }
+    }
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, vf, N), 0);
+    /* 2. Multi-series FLOAT64 (slow path) */
+    for (int i = 0; i < N; i++) {
+        ids[i] = (i & 1) ? sf64b : sf64a;
+        ts[i] = T0 + 2 * DAY_MS + (int64_t)(i / 2) * 1000;
+        if (i % 19 == 0) {
+            uint64_t nb = NULL_F64;
+            memcpy(&vd[i], &nb, 8);
+        } else {
+            vd[i] = 1000.0 + (double)i * 0.5;
+        }
+    }
+    CHECK_EQ(eng_insert(x.ld, TSDB_FLOAT64, ids, ts, vd, N), 0);
+    /* 3. BOOL and STATE with NULLs */
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + 2 * DAY_MS + (int64_t)i * 1000;
+        vb[i] = (i % 17 == 0) ? NULL_BOOL : (uint32_t)(i & 1);
+        vst[i] = (i % 13 == 0) ? NULL_STATE : (uint32_t)(1 + (i % 4));
+    }
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_BOOL, sb, ts, vb, N), 0);
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_STATE, sst, ts, vst, N), 0);
+
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+    CHECK_EQ(replica_applied_end(x.rep), ld_last(&x));
+    wcol_eq(x.ld, x.rep, 0, 4, "walcol live f32");
+    wcol_eq(x.ld, x.rep, sf64a, 8, "walcol live f64a");
+    wcol_eq(x.ld, x.rep, sf64b, 8, "walcol live f64b");
+    wcol_eq(x.ld, x.rep, sb, 4, "walcol live bool");
+    wcol_eq(x.ld, x.rep, sst, 4, "walcol live state");
+
+    /* 4. Flush replica (parts at seq), drop day 0, write another COL batch, then reopen replica to exercise
+     *    both seq <= pmax replay skip and dropped skip over WAL_KIND_COL records. */
+    CHECK_EQ(eng_flush(x.rep), 0);
+    CHECK_EQ(eng_drop_before(x.ld, T0 + DAY_MS), 0);
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + 3 * DAY_MS + (int64_t)i * 1000;
+        vf[i] = 50.0f + (float)i;
+    }
+    CHECK_EQ(eng_insert_series(x.ld, TSDB_FLOAT32, 0, ts, vf, N), 0);
+    CHECK_EQ(xp_pump(&x, ld_last(&x)), 0);
+
+    char rd[PATH_MAX];
+    rdir(rd, sizeof rd, &x);
+    uint64_t fl = replica_applied_end(x.rep);
+    xp_reopen(&x, rd, fl);
+    CHECK_EQ(replica_apply(x.rep, fl), 0);
+    wcol_eq(x.ld, x.rep, 0, 4, "walcol reopen f32");
+    wcol_eq(x.ld, x.rep, sf64a, 8, "walcol reopen f64a");
+    wcol_eq(x.ld, x.rep, sf64b, 8, "walcol reopen f64b");
+    wcol_eq(x.ld, x.rep, sb, 4, "walcol reopen bool");
+    wcol_eq(x.ld, x.rep, sst, 4, "walcol reopen state");
+
+    xp_stop(&x);
+    printf("  wal_col_repl: single-series fast path, multi-series, bool/state/nulls, drop & reopen replay ok\n");
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -9099,6 +9230,7 @@ int main(int argc, char **argv)
     case_leader_prune();
     case_leader_read();
     case_wsegs_index();
+    case_wal_col_repl();
     case_link_sweep();
     case_keep_files();
     case_promote_refused();

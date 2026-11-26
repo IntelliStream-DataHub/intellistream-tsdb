@@ -25,7 +25,7 @@ static void reseal(uint8_t *b, size_t size)
         store32(b + q, w);
         uint32_t kind = w >> 28, n = w & 0x0fffffffu;
         size_t body = kind == WAL_KIND_ROWS ? (size_t)n * WAL_ROW : n;
-        if (kind > WAL_KIND_MARKER || n == 0 || body > size - q - WAL_HDR)
+        if (kind > WAL_KIND_COL || n == 0 || body > size - q - WAL_HDR)
             return;
         if (!keep) { /* wal_seal: the hash covers fno, commit_ms and the payload; the check binds segment and offset */
             uint64_t hash = xxh64(b + q + 16, 16 + body, 0);
@@ -105,4 +105,58 @@ void fuzz_seeds(const char *dir)
     fuzz_put(dir, "seed-wal-marker", buf, pos + WAL_HDR + pn);
     free(buf);
     free(pl);
+    /* a WAL_KIND_COL record (uncompressed single-series + ZSTD-compressed multi-series) */
+    uint8_t col_body[WAL_COL_HDR + 12];
+    memset(col_body, 0, sizeof col_body);
+    store32(col_body, 1);
+    col_body[4] = WAL_COL_SINGLE | WAL_COL_VAL4;
+    store32(col_body + 12, 12);
+    uint8_t *cbuf = calloc(1, WAL_HDR + sizeof col_body);
+    store32(cbuf, (uint32_t)sizeof col_body | ((uint32_t)WAL_KIND_COL << 28));
+    uint64_t one = 1;
+    memcpy(cbuf + 16, &one, 8);
+    memcpy(cbuf + WAL_HDR, col_body, sizeof col_body);
+    reseal(cbuf, WAL_HDR + sizeof col_body);
+    fuzz_put(dir, "seed-wal-col", cbuf, WAL_HDR + sizeof col_body);
+    free(cbuf);
+
+    enum { ZN = 16 };
+    uint8_t stage[ZN * 4 + 8 + (ZN - 1) * 4 + ZN * 8];
+    uint8_t *sp = stage;
+    uint32_t zprev = 0;
+    for (uint32_t i = 0; i < ZN; i++) {
+        uint32_t id = i & 1u, d = id - zprev;
+        memcpy(sp + i * 4, &d, 4);
+        zprev = id;
+    }
+    sp += ZN * 4;
+    int64_t zts0 = 1700000000000LL;
+    memcpy(sp, &zts0, 8);
+    sp += 8;
+    for (uint32_t i = 1; i < ZN; i++) {
+        int32_t dt = 1000;
+        memcpy(sp + (i - 1) * 4, &dt, 4);
+    }
+    sp += (ZN - 1) * 4;
+    for (uint32_t i = 0; i < ZN; i++) {
+        double v = 42.0 + (double)i * 0.5;
+        memcpy(sp + i * 8, &v, 8);
+    }
+    size_t zb = ZSTD_compressBound(sizeof stage);
+    uint8_t *zbuf = calloc(1, WAL_HDR + WAL_COL_HDR + zb + 4);
+    size_t zlen = ZSTD_compress(zbuf + WAL_HDR + WAL_COL_HDR, zb, stage, sizeof stage, -1);
+    if (!ZSTD_isError(zlen) && zlen > 0) {
+        uint8_t pad = (uint8_t)((4u - ((WAL_COL_HDR + zlen) & 3u)) & 3u);
+        size_t plen = WAL_COL_HDR + zlen + pad;
+        store32(zbuf, (uint32_t)plen | ((uint32_t)WAL_KIND_COL << 28));
+        memcpy(zbuf + 16, &one, 8);
+        uint8_t *ch = zbuf + WAL_HDR;
+        store32(ch, ZN);
+        ch[4] = WAL_COL_TS32 | WAL_COL_ZSTD;
+        ch[5] = pad;
+        store32(ch + 12, (uint32_t)sizeof stage);
+        reseal(zbuf, WAL_HDR + plen);
+        fuzz_put(dir, "seed-wal-col-zstd", zbuf, WAL_HDR + plen);
+    }
+    free(zbuf);
 }

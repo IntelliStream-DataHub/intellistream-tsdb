@@ -401,13 +401,24 @@ static int tail_segment_fd(eng *db, wal_tail *t, int fd, const char *name)
     wal_rec wr;
     /* a record that does not check out is still being written: next poll */
     while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, t->seq, t->off + pos, &wr)) != 0) {
-        n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker holds no rows: skipped, the position moves on */
+        wal_col_rows cr = {0};
+        if (wr.kind == WAL_KIND_COL) {
+            rc = wal_col_decode(wr.payload, wr.n, NULL, &cr);
+            if (rc != 0)
+                break;
+        }
+        n = wr.kind == WAL_KIND_ROWS ? wr.n : wr.kind == WAL_KIND_COL ? cr.nrows : 0;
         const uint8_t *r0 = wr.payload, *r = r0;
         uint32_t id;
         int64_t ts;
         uint64_t slot;
-        for (size_t i = 0; i < n && rc == 0 && !unknown; i++, r += WAL_ROW) {
-            wal_row(r, &id, &ts, &slot);
+        for (size_t i = 0; i < n && rc == 0 && !unknown; i++) {
+            if (wr.kind == WAL_KIND_COL) {
+                id = cr.ids ? cr.ids[i] : cr.cs;
+            } else {
+                wal_row(r, &id, &ts, &slot);
+                r += WAL_ROW;
+            }
             if (id >= eng_series_count(db) && !reloaded) {
                 /* created after our last look; without the names the rows would be lost */
                 rc = series_reload(&db->series, db->dirfd);
@@ -425,26 +436,42 @@ static int tail_segment_fd(eng *db, wal_tail *t, int fd, const char *name)
                 unknown_id = id;
             }
         }
-        if (rc || unknown)
+        if (rc || unknown) {
+            wal_col_rows_free(&cr);
             break;
+        }
         /* A record holds whole inserts (the writer appends an insert to the WAL
          * buffer in one step, and writes what it took of it as one record): its
          * rows become visible together, so queries never see part of an insert. */
         pthread_mutex_lock(&db->buf_lock);
         uint64_t base = atomic_load_explicit(&db->tail_lsn, memory_order_relaxed);
         uint64_t added = 0;
-        r = r0;
-        for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
-            wal_row(r, &id, &ts, &slot);
-            if (id < eng_series_count(db)) {
-                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, base + added + 1, -1);
-                if (rc == 0)
-                    added++;
+        if (wr.kind == WAL_KIND_COL) {
+            for (size_t i = 0; i < n && rc == 0; i++) {
+                id = cr.ids ? cr.ids[i] : cr.cs;
+                ts = cr.ts[i];
+                slot = slot_get(cr.vals, cr.w, i);
+                if (id < eng_series_count(db)) {
+                    rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, base + added + 1, -1);
+                    if (rc == 0)
+                        added++;
+                }
+            }
+        } else {
+            r = r0;
+            for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
+                wal_row(r, &id, &ts, &slot);
+                if (id < eng_series_count(db)) {
+                    rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, base + added + 1, -1);
+                    if (rc == 0)
+                        added++;
+                }
             }
         }
         if (rc == 0 && added)
             atomic_store_explicit(&db->tail_lsn, base + added, memory_order_release);
         pthread_mutex_unlock(&db->buf_lock);
+        wal_col_rows_free(&cr);
         pos += rec;
     }
     /* A bad record with a valid one after it is damage, unless the writer's

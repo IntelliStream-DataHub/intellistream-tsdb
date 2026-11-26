@@ -165,7 +165,8 @@ static int seg_fill(eng *db, fseg *s)
             break;
         }
         uint32_t w = load32(h), kind = w >> 28, n = w & 0x0fffffffu;
-        size_t body = kind == WAL_KIND_ROWS ? (size_t)n * WAL_ROW : kind == WAL_KIND_MARKER ? n : (size_t)-1;
+        size_t body = kind == WAL_KIND_ROWS ? (size_t)n * WAL_ROW
+                                            : (kind == WAL_KIND_MARKER || kind == WAL_KIND_COL) ? n : (size_t)-1;
         if (body == (size_t)-1 || (uint64_t)size - off < WAL_HDR + body)
             break; /* not a record: the end of the valid ones */
         if (!any)

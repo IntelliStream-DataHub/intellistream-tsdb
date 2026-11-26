@@ -882,6 +882,130 @@ static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, si
     return write_full(fd, buf, WAL_HDR + nrows * WAL_ROW);
 }
 
+bool wal_col_header_valid(const uint8_t *payload, size_t payload_len, uint32_t *nrows_out)
+{
+    if (payload_len < WAL_COL_HDR || (payload_len & 3u) != 0)
+        return false;
+    uint32_t nrows = load32(payload);
+    uint8_t flags = payload[4], pad = payload[5];
+    uint16_t rsv;
+    memcpy(&rsv, payload + 6, 2);
+    uint32_t cs = load32(payload + 8), uncomp_len = load32(payload + 12);
+    if (nrows == 0 || nrows >= (1u << 28) || (flags & ~WAL_COL_FLAGS_MASK) || pad > 3 || rsv != 0)
+        return false;
+    if (!(flags & WAL_COL_SINGLE) && cs != 0)
+        return false;
+    uint64_t id_bytes = (flags & WAL_COL_SINGLE) ? 0 : (uint64_t)nrows * 4;
+    uint64_t ts_bytes = (flags & WAL_COL_TS32) ? 8 + (uint64_t)(nrows - 1) * 4 : (uint64_t)nrows * 8;
+    uint64_t val_bytes = (uint64_t)nrows * ((flags & WAL_COL_VAL4) ? 4 : 8);
+    uint64_t expect = id_bytes + ts_bytes + val_bytes;
+    if (expect > WAL_COL_MAX_UNCOMP || (uint64_t)uncomp_len != expect)
+        return false;
+    if ((size_t)WAL_COL_HDR + (size_t)pad >= payload_len)
+        return false;
+    size_t comp_len = payload_len - WAL_COL_HDR - (size_t)pad;
+    if (!(flags & WAL_COL_ZSTD) && comp_len != (size_t)uncomp_len)
+        return false;
+    for (uint8_t i = 0; i < pad; i++)
+        if (payload[payload_len - 1 - i] != 0)
+            return false;
+    if (nrows_out)
+        *nrows_out = nrows;
+    return true;
+}
+
+void wal_col_rows_free(wal_col_rows *r)
+{
+    free(r->heap);
+    memset(r, 0, sizeof *r);
+}
+
+int wal_col_decode(const uint8_t *payload, size_t payload_len, void *dctx, wal_col_rows *out)
+{
+    memset(out, 0, sizeof *out);
+    uint32_t nrows = 0;
+    if (!wal_col_header_valid(payload, payload_len, &nrows))
+        return TSDB_ERR_CORRUPT;
+    uint8_t flags = payload[4], pad = payload[5];
+    uint32_t cs = load32(payload + 8), uncomp_len = load32(payload + 12);
+    size_t comp_len = payload_len - WAL_COL_HDR - (size_t)pad;
+    bool single = (flags & WAL_COL_SINGLE) != 0;
+    bool val4 = (flags & WAL_COL_VAL4) != 0;
+    bool ts32 = (flags & WAL_COL_TS32) != 0;
+    bool zstd = (flags & WAL_COL_ZSTD) != 0;
+    size_t n = nrows;
+    size_t id_sz = single ? 0 : n * 4;
+    size_t ts_sz = n * 8;
+    size_t w = val4 ? 4 : 8;
+    size_t val_sz = n * w;
+    /* Single 8-byte aligned backing allocation: [ts (8*n)] [vals (w*n)] [ids (4*n)] [raw (uncomp_len if zstd)] */
+    size_t off_vals = ts_sz;
+    size_t off_ids = (off_vals + val_sz + 7) & ~(size_t)7;
+    size_t off_raw = (off_ids + id_sz + 7) & ~(size_t)7;
+    size_t total = off_raw + (zstd ? (size_t)uncomp_len : 0);
+    uint8_t *heap = malloc(total ? total : 1);
+    if (!heap)
+        return TSDB_ERR_NOMEM;
+    const uint8_t *raw = payload + WAL_COL_HDR;
+    if (zstd) {
+        uint8_t *dst = heap + off_raw;
+        size_t r = dctx ? ZSTD_decompressDCtx((ZSTD_DCtx *)dctx, dst, uncomp_len, raw, comp_len)
+                        : ZSTD_decompress(dst, uncomp_len, raw, comp_len);
+        if (ZSTD_isError(r) || r != (size_t)uncomp_len) {
+            free(heap);
+            return TSDB_ERR_CORRUPT;
+        }
+        raw = dst;
+    }
+    const uint8_t *p = raw;
+    uint32_t *ids = NULL;
+    if (!single) {
+        ids = (uint32_t *)(void *)(heap + off_ids);
+        uint32_t cur;
+        memcpy(&cur, p, 4);
+        ids[0] = cur;
+        for (size_t i = 1; i < n; i++) {
+            uint32_t d;
+            memcpy(&d, p + i * 4, 4);
+            cur += d;
+            ids[i] = cur;
+        }
+        p += n * 4;
+    }
+    int64_t *ts = (int64_t *)(void *)heap;
+    uint64_t tcur;
+    memcpy(&tcur, p, 8);
+    p += 8;
+    ts[0] = (int64_t)tcur;
+    if (ts32) {
+        for (size_t i = 1; i < n; i++) {
+            int32_t d;
+            memcpy(&d, p + (i - 1) * 4, 4);
+            tcur += (uint64_t)(int64_t)d;
+            ts[i] = (int64_t)tcur;
+        }
+        p += (n - 1) * 4;
+    } else {
+        for (size_t i = 1; i < n; i++) {
+            uint64_t d;
+            memcpy(&d, p + (i - 1) * 8, 8);
+            tcur += d;
+            ts[i] = (int64_t)tcur;
+        }
+        p += (n - 1) * 8;
+    }
+    void *vals = heap + off_vals;
+    memcpy(vals, p, val_sz);
+    out->nrows = nrows;
+    out->cs = cs;
+    out->ids = ids;
+    out->ts = ts;
+    out->vals = vals;
+    out->w = w;
+    out->heap = heap;
+    return 0;
+}
+
 /* range: a number at or above FNO_LIMIT is not a record. The check of a writer's open passes false and judges the
  * range itself: a record whose checks pass but whose number is out of range is damage, not a torn tail. */
 static size_t wal_record_x(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, wal_rec *r, bool range)
@@ -911,6 +1035,12 @@ static size_t wal_record_x(const uint8_t *p, size_t avail, uint64_t seq, uint64_
         span = load32(p + WAL_HDR + 4);
         if (span == 0)
             return 0;
+    } else if (kind == WAL_KIND_COL) {
+        uint32_t nrows = 0;
+        if (n > avail - WAL_HDR || !wal_col_header_valid(p + WAL_HDR, n, &nrows))
+            return 0;
+        body = n;
+        span = nrows;
     } else {
         return 0;
     }
@@ -978,6 +1108,204 @@ static int leader_admit(eng *db, uint64_t fno, uint32_t span)
     if (atomic_load(&db->lead_deposed))
         return TSDB_ERR_UNAVAILABLE;
     return jr->admit ? jr->admit(jr->ctx, db, fno, span) : 0;
+}
+
+/* Reusable encoder scratch for building WAL_KIND_COL records outside buf_lock. */
+static struct wal_enc_slot *wal_enc_acquire(eng *db)
+{
+    for (size_t i = 0; i < WAL_ENC_SLOTS; i++) {
+        if (!atomic_load_explicit(&db->wal_enc[i].busy, memory_order_relaxed) &&
+            !atomic_exchange_explicit(&db->wal_enc[i].busy, true, memory_order_acquire))
+            return &db->wal_enc[i];
+    }
+    return NULL;
+}
+
+static void wal_enc_release(struct wal_enc_slot *s)
+{
+    if (s)
+        atomic_store_explicit(&s->busy, false, memory_order_release);
+}
+
+/* Encodes (series, cs, ts, v, w, n) into a ready-to-append WAL_KIND_COL record (with 32-byte header, fno=0
+ * placeholder) OUTSIDE buf_lock. Returns total record length (> 0) and sets *rec_out, or 0 to fall back to
+ * WAL_KIND_ROWS (also sets *owned_out = true if caller must free *rec_out). */
+static size_t wal_col_encode(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
+                             size_t n, struct wal_enc_slot **slot_out, uint8_t **rec_out, bool *owned_out)
+{
+    *slot_out = NULL;
+    *rec_out = NULL;
+    *owned_out = false;
+    if (n < WAL_COL_MIN_ROWS || n >= (1u << 28) || (w != 4 && w != 8))
+        return 0;
+    bool single = series == NULL;
+    bool val4 = w == 4;
+    uint64_t max_uncomp = (single ? 0 : (uint64_t)n * 4) + (uint64_t)n * 8 + (uint64_t)n * w;
+    if (max_uncomp > WAL_COL_MAX_UNCOMP)
+        return 0;
+
+    struct wal_enc_slot *slot = wal_enc_acquire(db);
+    ZSTD_CCtx *cctx = NULL;
+    bool own_cctx = false;
+    uint8_t *stage = NULL, *rec = NULL;
+    size_t zbound = ZSTD_compressBound((size_t)max_uncomp);
+    size_t rec_need = WAL_HDR + WAL_COL_HDR + MAX((size_t)max_uncomp, zbound) + 4;
+    if (slot) {
+        if (!slot->cctx)
+            slot->cctx = ZSTD_createCCtx();
+        cctx = (ZSTD_CCtx *)slot->cctx;
+        if (slot->stage_cap < (size_t)max_uncomp) {
+            uint8_t *nb = realloc(slot->stage, (size_t)max_uncomp);
+            if (!nb) {
+                wal_enc_release(slot);
+                return 0;
+            }
+            slot->stage = nb;
+            slot->stage_cap = (size_t)max_uncomp;
+        }
+        if (slot->rec_cap < rec_need) {
+            uint8_t *nb = realloc(slot->rec, rec_need);
+            if (!nb) {
+                wal_enc_release(slot);
+                return 0;
+            }
+            slot->rec = nb;
+            slot->rec_cap = rec_need;
+        }
+        stage = slot->stage;
+        rec = slot->rec;
+    } else {
+        cctx = ZSTD_createCCtx();
+        own_cctx = true;
+        stage = malloc((size_t)max_uncomp);
+        rec = malloc(rec_need);
+        if (!stage || !rec) {
+            free(stage);
+            free(rec);
+            if (cctx)
+                ZSTD_freeCCtx(cctx);
+            return 0;
+        }
+    }
+
+    uint8_t *p = stage;
+    if (!single) {
+        uint32_t prev = series[0];
+        memcpy(p, &prev, 4);
+        for (size_t i = 1; i < n; i++) {
+            uint32_t cur = series[i], d = cur - prev;
+            memcpy(p + i * 4, &d, 4);
+            prev = cur;
+        }
+        p += n * 4;
+    }
+    /* Timestamp deltas: check whether every consecutive delta fits in int32_t. */
+    uint64_t bad32 = 0;
+    for (size_t i = 1; i < n; i++) {
+        int64_t d = (int64_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1]);
+        bad32 |= (uint64_t)(d ^ (int64_t)(int32_t)d);
+    }
+    bool ts32 = bad32 == 0;
+    memcpy(p, &ts[0], 8);
+    p += 8;
+    if (ts32) {
+        for (size_t i = 1; i < n; i++) {
+            int32_t d = (int32_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1]);
+            memcpy(p + (i - 1) * 4, &d, 4);
+        }
+        p += (n - 1) * 4;
+    } else {
+        for (size_t i = 1; i < n; i++) {
+            int64_t d = (int64_t)((uint64_t)ts[i] - (uint64_t)ts[i - 1]);
+            memcpy(p + (i - 1) * 8, &d, 8);
+        }
+        p += (n - 1) * 8;
+    }
+    memcpy(p, v, n * w);
+    p += n * w;
+    size_t uncomp_len = (size_t)(p - stage);
+
+    uint8_t *body_dst = rec + WAL_HDR + WAL_COL_HDR;
+    size_t comp_len = uncomp_len;
+    bool use_zstd = false;
+    if (cctx) {
+        size_t zlen = ZSTD_compressCCtx(cctx, body_dst, zbound, stage, uncomp_len, -1);
+        if (!ZSTD_isError(zlen) && zlen > 0 && zlen + 16 < uncomp_len) {
+            comp_len = zlen;
+            use_zstd = true;
+        }
+    }
+    if (!use_zstd)
+        memcpy(body_dst, stage, uncomp_len);
+    uint8_t pad = (uint8_t)((4u - ((WAL_COL_HDR + comp_len) & 3u)) & 3u);
+    for (uint8_t i = 0; i < pad; i++)
+        body_dst[comp_len + i] = 0;
+    size_t payload_len = WAL_COL_HDR + comp_len + pad;
+    if (payload_len >= (1u << 28)) {
+        if (slot) {
+            wal_enc_release(slot);
+        } else {
+            free(stage);
+            free(rec);
+            if (own_cctx && cctx)
+                ZSTD_freeCCtx(cctx);
+        }
+        return 0;
+    }
+    memset(rec, 0, WAL_HDR);
+    store32(rec, (uint32_t)payload_len | ((uint32_t)WAL_KIND_COL << 28));
+    uint8_t *ch = rec + WAL_HDR;
+    store32(ch, (uint32_t)n);
+    ch[4] = (uint8_t)((single ? WAL_COL_SINGLE : 0u) | (val4 ? WAL_COL_VAL4 : 0u) | (ts32 ? WAL_COL_TS32 : 0u) |
+                      (use_zstd ? WAL_COL_ZSTD : 0u));
+    ch[5] = pad;
+    ch[6] = ch[7] = 0;
+    store32(ch + 8, single ? cs : 0u);
+    store32(ch + 12, (uint32_t)uncomp_len);
+
+    if (!slot) {
+        free(stage);
+        if (own_cctx && cctx)
+            ZSTD_freeCCtx(cctx);
+        *owned_out = true;
+    } else {
+        *slot_out = slot;
+    }
+    *rec_out = rec;
+    return WAL_HDR + payload_len;
+}
+
+/* Appends a pre-encoded WAL_KIND_COL record to the pending WAL buffer and stamps its fno; caller holds buf_lock. */
+static int wal_buffer_pre(eng *db, const uint8_t *rec, size_t rec_len, size_t n, uint64_t *fno0)
+{
+    if (db->fno_next >= FNO_BOUND_MAX - n) {
+        eng_fail(db, "WAL numbers", EOVERFLOW);
+        return TSDB_ERR_IO;
+    }
+    size_t need = db->wal_len + rec_len;
+    if (need > db->wal_cap) {
+        size_t cap = MAX(need, db->wal_cap * 2);
+        cap = MAX(cap, (size_t)65536);
+        uint8_t *b = realloc(db->wal_buf, cap);
+        if (!b)
+            return TSDB_ERR_NOMEM;
+        db->wal_buf = b;
+        db->wal_cap = cap;
+    }
+    int arc = eng_test_mutant == MUT_LEADER_ADMIT_AFTER ? 0 : leader_admit(db, db->fno_next, (uint32_t)n);
+    if (arc)
+        return arc;
+    wal_rec_close(db);
+    uint8_t *h = db->wal_buf + db->wal_len;
+    memcpy(h, rec, rec_len);
+    memcpy(h + 16, &db->fno_next, 8);
+    *fno0 = db->fno_next;
+    db->fno_next += n;
+    db->fno_rows_hi = db->fno_next - 1;
+    db->wal_len += rec_len;
+    if (eng_test_mutant == MUT_LEADER_ADMIT_AFTER) /* planted: the refusal comes with the batch already buffered */
+        return leader_admit(db, *fno0, (uint32_t)n);
+    return 0;
 }
 
 /* Appends rows to the pending WAL buffer and numbers them (*fno0 gets the first); caller holds buf_lock. Rows of
@@ -1615,6 +1943,17 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
      * not hold, having appended nothing. */
     if (db->rp) /* a replica's rows come from the leader's log, as records (replica.c) */
         return TSDB_ERR_READONLY;
+    bool want_col = false;
+    if (db->wal_enabled && n >= WAL_COL_MIN_ROWS) {
+        uint32_t rmax = atomic_load_explicit(&wal_rec_max_rows, memory_order_relaxed);
+        if (eng_jr(db))
+            rmax = MIN(rmax, atomic_load_explicit(&jr_rec_max_rows, memory_order_relaxed));
+        want_col = n < rmax;
+    }
+    struct wal_enc_slot *eslot = NULL;
+    uint8_t *pre_rec = NULL;
+    bool pre_owned = false;
+    size_t pre_len = 0;
     pthread_mutex_lock(&db->buf_lock);
     if (db->active->rows >= 2 * db->opt.buffer_rows) {
         pthread_mutex_unlock(&db->buf_lock);
@@ -1626,6 +1965,13 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         }
         if (frc)
             return frc;
+        if (want_col)
+            pre_len = wal_col_encode(db, series, cs, ts, v, w, n, &eslot, &pre_rec, &pre_owned);
+        pthread_mutex_lock(&db->buf_lock);
+    } else if (want_col) {
+        /* Encode large WAL batches into a compressed columnar WAL_KIND_COL record OUTSIDE buf_lock. */
+        pthread_mutex_unlock(&db->buf_lock);
+        pre_len = wal_col_encode(db, series, cs, ts, v, w, n, &eslot, &pre_rec, &pre_owned);
         pthread_mutex_lock(&db->buf_lock);
     }
     /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
@@ -1673,7 +2019,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     bool counted = rc == 0;
     uint64_t fno0 = 0;
     if (rc == 0 && db->wal_enabled) {
-        rc = wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* it can fail without side effects */
+        rc = pre_len ? wal_buffer_pre(db, pre_rec, pre_len, n, &fno0)
+                     : wal_buffer(db, series, cs, ts, v, w, n, &fno0); /* can fail without side effects */
         counted = rc == 0;
         if (rc && series)
             mt_unreserve(db->active, series, n); /* no mt_add clears the counts */
@@ -1700,6 +2047,10 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     if (rows >= db->opt.buffer_rows)
         pthread_cond_signal(&db->flush_cv);
     pthread_mutex_unlock(&db->buf_lock);
+    if (eslot)
+        wal_enc_release(eslot);
+    else if (pre_owned)
+        free(pre_rec);
     if (announced)
         hook(hook_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0) {
@@ -2383,7 +2734,6 @@ int wal_check_segment(eng *db, wal_seg *s)
     s->fno_first = s->fno_end = 0;
     while (rc == 0 && (rec = wal_record_x(buf + pos, len - pos, s->seq, pos, &wr, false)) != 0) {
         const uint8_t *r = wr.payload;
-        size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker holds no rows */
         if (wr.fno >= FNO_BOUND_MAX || wr.span >= FNO_BOUND_MAX - wr.fno) { /* numbers no writer could have given */
             fprintf(stderr, "tsdb: WAL segment %s: the record at offset %zu has number %" PRIu64 " (span %" PRIu64
                             "), beyond the limit of the log numbers: the log is damaged\n",
@@ -2400,21 +2750,53 @@ int wal_check_segment(eng *db, wal_seg *s)
         if (!s->fno_first)
             s->fno_first = wr.fno;
         s->fno_end = wr.fno + wr.span;
-        for (size_t i = 0; i < n; i++, r += WAL_ROW) {
-            uint32_t id;
-            int64_t ts;
-            uint64_t slot;
-            wal_row(r, &id, &ts, &slot);
-            /* a replica's log runs ahead of its dictionaries: a SERIES marker above its commit floor creates the id */
-            if (id >= count && !db->rp) {
-                fprintf(stderr,
-                        "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES has "
-                        "only %" PRIu32 ": SERIES is damaged. Nothing was changed: restore SERIES from a backup or "
-                        "snapshot, or move the segment out of the directory to accept the loss of its rows; tsdb "
-                        "export cannot read the database either until then\n",
-                        s->name, id, pos, count);
-                rc = TSDB_ERR_CORRUPT;
+        if (wr.kind == WAL_KIND_COL) {
+            wal_col_rows cr = {0};
+            rc = wal_col_decode(wr.payload, wr.n, NULL, &cr);
+            if (rc != 0) {
+                if (rc == TSDB_ERR_CORRUPT)
+                    fprintf(stderr,
+                            "tsdb: WAL segment %s: columnar record at offset %zu fails decode: the log is damaged\n",
+                            s->name, pos);
                 break;
+            }
+            if (!db->rp) {
+                size_t ni = cr.ids ? cr.nrows : 1;
+                for (size_t i = 0; i < ni; i++) {
+                    uint32_t id = cr.ids ? cr.ids[i] : cr.cs;
+                    if (id >= count) {
+                        fprintf(stderr,
+                                "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES has "
+                                "only %" PRIu32 ": SERIES is damaged. Nothing was changed: restore SERIES from a backup or "
+                                "snapshot, or move the segment out of the directory to accept the loss of its rows; tsdb "
+                                "export cannot read the database either until then\n",
+                                s->name, id, pos, count);
+                        rc = TSDB_ERR_CORRUPT;
+                        break;
+                    }
+                }
+            }
+            wal_col_rows_free(&cr);
+            if (rc)
+                break;
+        } else if (wr.kind == WAL_KIND_ROWS) {
+            size_t n = wr.n;
+            for (size_t i = 0; i < n; i++, r += WAL_ROW) {
+                uint32_t id;
+                int64_t ts;
+                uint64_t slot;
+                wal_row(r, &id, &ts, &slot);
+                /* a replica's log runs ahead of its dictionaries: a SERIES marker above its commit floor creates the id */
+                if (id >= count && !db->rp) {
+                    fprintf(stderr,
+                            "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES has "
+                            "only %" PRIu32 ": SERIES is damaged. Nothing was changed: restore SERIES from a backup or "
+                            "snapshot, or move the segment out of the directory to accept the loss of its rows; tsdb "
+                            "export cannot read the database either until then\n",
+                            s->name, id, pos, count);
+                    rc = TSDB_ERR_CORRUPT;
+                    break;
+                }
             }
         }
         pos += rec;
@@ -2684,7 +3066,14 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         bool have_cache = false, reloaded = false;
         while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &wr)) != 0) {
             const uint8_t *r = wr.payload;
-            size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : 0; /* a marker is skipped; its numbers are counted */
+            wal_col_rows cr = {0};
+            bool is_col = wr.kind == WAL_KIND_COL;
+            if (is_col) {
+                rc = wal_col_decode(wr.payload, wr.n, NULL, &cr);
+                if (rc != 0)
+                    break;
+            }
+            size_t n = wr.kind == WAL_KIND_ROWS ? wr.n : is_col ? cr.nrows : 0; /* a marker is skipped; its numbers are counted */
             if (eng_test_mutant == MUT_MARKER_ROWS && wr.kind == WAL_KIND_MARKER)
                 n = wr.n / WAL_ROW; /* planted: a marker's payload replayed as rows (tests/test_fno.c) */
             if (wr.kind == WAL_KIND_MARKER && !mk_type_admitted(wr.mtype, db->ec_req, db->tier_req)) {
@@ -2699,11 +3088,18 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                 rc = TSDB_ERR_CORRUPT;
                 break;
             }
-            for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
+            for (size_t i = 0; i < n && rc == 0; i++) {
                 uint32_t id;
                 int64_t ts;
                 uint64_t slot;
-                wal_row(r, &id, &ts, &slot);
+                if (is_col) {
+                    id = cr.ids ? cr.ids[i] : cr.cs;
+                    ts = cr.ts[i];
+                    slot = slot_get(cr.vals, cr.w, i);
+                } else {
+                    wal_row(r, &id, &ts, &slot);
+                    r += WAL_ROW;
+                }
                 if (id >= eng_series_count(db) && ro && !reloaded) {
                     /* a reader read SERIES before this segment: a writer may have created the series since */
                     rc = series_reload(&db->series, db->dirfd);
@@ -2736,6 +3132,7 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                     eng_ppos_rows(db, m, PPOS_SITE_REPLAY, &ts, 1, wr.fno + i, NULL);
                 }
             }
+            wal_col_rows_free(&cr);
             if (rc)
                 break;
             pos += rec;
@@ -2848,6 +3245,15 @@ void wal_close(eng *db)
     tsdb_free_big(db->wal_spare, db->wal_spare_cap);
     db->wal_buf = db->wal_spare = NULL;
     db->wal_cap = db->wal_spare_cap = 0;
+    for (size_t i = 0; i < WAL_ENC_SLOTS; i++) {
+        if (db->wal_enc[i].cctx)
+            ZSTD_freeCCtx((ZSTD_CCtx *)db->wal_enc[i].cctx);
+        tsdb_free_big(db->wal_enc[i].stage, db->wal_enc[i].stage_cap);
+        tsdb_free_big(db->wal_enc[i].rec, db->wal_enc[i].rec_cap);
+        db->wal_enc[i].cctx = NULL;
+        db->wal_enc[i].stage = db->wal_enc[i].rec = NULL;
+        db->wal_enc[i].stage_cap = db->wal_enc[i].rec_cap = 0;
+    }
     tsdb_free_big(db->fl_s, db->fl_rows_cap * sizeof *db->fl_s);
     tsdb_free_big(db->fl_t, db->fl_rows_cap * sizeof *db->fl_t);
     tsdb_free_big(db->fl_v, db->fl_rows_cap * sizeof *db->fl_v);
