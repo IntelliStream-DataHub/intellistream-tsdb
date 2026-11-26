@@ -1392,6 +1392,41 @@ static void cluster_gc_case(void)
                 CHECK(ecgcmk_pending_count(rep) == 0);
                 eng_close(rep);
             }
+            /* 4b. Empty MK_GC_DONE does not create GCMK; MK_GC_DONE also unlinks lingering retired_*.ec. */
+            {
+                char dir2[PATH_MAX], name2[96], rname2[128], dbp2[PATH_MAX + 8];
+                uint8_t oid2[16];
+                fresh("cg_done", dir2, sizeof dir2);
+                make_cluster_dir(dir2);
+                mock_jr mj2 = {0};
+                struct jr_ops jops2 = {0};
+                h x2 = {0};
+                CHECK(open_cluster_leader(&x2, dir2, 2, &mj2, &jops2) == 0);
+                if (x2.db) {
+                    write_day(x2.db, 0);
+                    write_day(x2.db, 1);
+                    settle_day(&x2, 0, oid2, name2);
+                    CHECK(eng_drop_before(x2.db, DAY) == 0); /* retires name2 -> retired_<name2>, GCMK not created yet */
+                    snprintf(rname2, sizeof rname2, "retired_%s", name2);
+                    CHECK(exists(dir2, rname2));
+                    CHECK(!exists(dir2, "GCMK"));
+                    h_close(&x2);
+                }
+                snprintf(dbp2, sizeof dbp2, "%s/db", dir2);
+                tier_want(rt, 1);
+                eng *rep2 = NULL;
+                CHECK(eng_open_replica(dbp2, &o, 0, &rep2) == 0 && rep2 != NULL);
+                tier_want(NULL, 0);
+                if (rep2) {
+                    CHECK(exists(dir2, rname2));
+                    CHECK(!exists(dir2, "GCMK"));
+                    mk dm = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_DONE, .noids = 1, .oids = oid2}};
+                    CHECK(ecgcmk_apply(rep2, 52, &dm) == 0);
+                    CHECK(!exists(dir2, "GCMK"));   /* empty MK_GC_DONE must not compact/create a 0-byte GCMK */
+                    CHECK(!exists(dir2, rname2));   /* lingering retired_*.ec unlinked on MK_GC_DONE */
+                    eng_close(rep2);
+                }
+            }
             tier_put(rt);
         }
     }

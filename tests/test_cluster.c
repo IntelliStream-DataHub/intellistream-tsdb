@@ -15455,8 +15455,80 @@ static void scen_ecgc(void)
         if (now_ms() - t0 > 120000)
             die("orphan from SIGSTOPped leader not swept in 120 s (%d .ec, %d chunks)", nec, nch);
     }
-    printf("  case 3 (SIGSTOP past failover + SIGCONT): old leader %d put refused FENCED (r8f F4), "
+    printf("  case 3a (SIGSTOP past failover + SIGCONT): old leader %d put refused FENCED (r8f F4), "
            "orphan swept by new leader %d\n",
+           oldL, L);
+
+    /* ---- Case 3b: SIGSTOP old leader right before CHUNK_DEL (pause_beforedel), failover, SIGCONT -> CHUNK_DEL
+     * refused FENCED (r8f F4, "stopping GC on this deposed leader"), new leader finishes deleting from GCMK. */
+    if (e.stripe[0] == ids[L]) {
+        /* Ensure position 0 is a remote chunk store so the new leader raises its EPOCH before oldL resumes. */
+        int target = reps[0] == L ? reps[1] : reps[0];
+        uint8_t tbody[8], *treply = NULL;
+        size_t trlen = 0, tblen = cluster_volume_force_encode(num, ids[target], tbody);
+        for (uint64_t t0 = now_ms();
+             (rc = admin(nonrep, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen)) != 0; usleep(200000)) {
+            if ((rc != CLUSTER_ERR_STATE && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+                die("transfer e42 off stripe[0] (%d -> %d): %s (%.*s)", L, target, cluster_strerror(rc), (int)trlen,
+                    treply ? (const char *)treply : "");
+            free(treply);
+            treply = NULL;
+        }
+        free(treply);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            L = ecgc_leader_of(num, nonrep, &e);
+            if (L == target)
+                break;
+            if (now_ms() - t0 > 30000)
+                die("transfer e42 to %d did not complete in 30 s (still %d)", target, L);
+        }
+    }
+    tsdb_sid id3[ECB_SERIES];
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecgc.d%d", s);
+        id3[s] = ecb_series(c, nm, "e42");
+    }
+    int nec_before_3b = ecb_ec_parts(L, num);
+    ecb_write_day(c, id3, day0 + 30 * 86400000LL);
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) <= nec_before_3b; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("day0+30 did not settle on leader %d within 120 s", L);
+    int pd0 = log_count(L, "paused before CHUNK_DEL (pause_beforedel)");
+    touch_file(trig_pausedel);
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, id3[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("set retention on id3 series %d: %s", s, ers(rc));
+    tsdbc_close(c);
+    c = NULL;
+    for (uint64_t t0 = now_ms(); log_count(L, "paused before CHUNK_DEL (pause_beforedel)") <= pd0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit pause_beforedel in 90 s", L);
+    pause_server(L, 1); /* SIGSTOP old leader right before CHUNK_DEL! */
+    unlink(trig_pausedel);
+    oldL = L;
+    L = ecgc_leader_of(num, nonrep, &e);
+    if (L == oldL)
+        die("leader did not move while oldL (%d) was SIGSTOPped before CHUNK_DEL", oldL);
+    int fd0 = log_count(oldL, "stopping GC on this deposed leader");
+    pause_server(oldL, 0); /* SIGCONT old leader: resumed CHUNK_DEL uses old lead_epoch -> FENCED! */
+    for (uint64_t t0 = now_ms(); log_count(oldL, "stopping GC on this deposed leader") <= fd0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("SIGCONTed old leader %d did not get FENCED on resumed CHUNK_DEL (r8f F4)", oldL);
+    await_isr(L, "e42", 3, 60000, "all 3 replicas in ISR after SIGCONT (del)");
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        if (nec == nec_before_3b && nch == nec * 6 && ecb_retired_ec(L, num) == 0 && ecb_retired_ec(oldL, num) == 0)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("new leader %d did not finish pending GCMK delete after case 3b (%d .ec, %d chunks, L ret %d, oldL ret %d)",
+                L, nec, nch, ecb_retired_ec(L, num), ecb_retired_ec(oldL, num));
+    }
+    printf("  case 3b (SIGSTOP before CHUNK_DEL + SIGCONT): old leader %d delete refused FENCED (r8f F4), "
+           "new leader %d drained GCMK\n",
            oldL, L);
 
     /* ---- Case 4: force-leader suspends orphan GC until `tsdb cluster volume gc resume`.

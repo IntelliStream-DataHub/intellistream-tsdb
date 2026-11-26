@@ -240,7 +240,7 @@ static int gcmk_compact_locked(eng *db, struct ecgcmk *g)
     } else {
         if (n)
             err = pwrite_all(fd, buf, n * GCMK_REC, 0);
-        if (err == 0 && db->opt.fsync && fdatasync(fd) != 0)
+        if (err == 0 && db->opt.fsync && tsdb_fdatasync(fd) != 0)
             err = errno;
         if (close(fd) != 0 && err == 0)
             err = errno;
@@ -300,7 +300,7 @@ static int gcmk_append_locked(eng *db, struct ecgcmk *g, uint64_t pos, uint32_t 
         rec_encode(buf + i * GCMK_REC, pos, op, oids[i], g->off + (uint64_t)i * GCMK_REC);
     int err = pwrite_all(g->fd, buf, noids * GCMK_REC, g->off);
     free(buf);
-    if (err == 0 && db->opt.fsync && fdatasync(g->fd) != 0)
+    if (err == 0 && db->opt.fsync && tsdb_fdatasync(g->fd) != 0)
         err = errno;
     if (err != 0) {
         g->broken = true;
@@ -394,7 +394,7 @@ int ecgcmk_open(eng *db)
         return rc;
     }
     if (good_end < sz) {
-        if (ftruncate(fd, (off_t)good_end) != 0 || (db->opt.fsync && fdatasync(fd) != 0)) {
+        if (ftruncate(fd, (off_t)good_end) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0)) {
             close(fd);
             return TSDB_ERR_IO;
         }
@@ -523,11 +523,43 @@ int ecgcmk_apply(eng *db, uint64_t pos, const mk *m)
                 (void)ent_del_locked(g, del[i]);
             size_t left = g->nents;
             pthread_mutex_unlock(&g->mu);
-            if (left == 0 || g->off >= GCMK_COMPACT_BYTES)
+            if (g->off > 0 && (left == 0 || g->off >= GCMK_COMPACT_BYTES))
                 rc = gcmk_compact_locked(db, g);
         }
         free(del);
         pthread_mutex_unlock(&g->fmu);
+        if (rc == 0) {
+            /* Also clean up any lingering retired_*.ec (e.g. ex-leader crashed after MK_GC_RETIRED committed before
+             * ecgcmk_apply ran and later reopened as a follower past RSTATE.kept). */
+            char (*unlinks)[256] = NULL;
+            size_t nunlinks = 0;
+            bool retired_listed = false;
+            lt_sec lsec;
+            lt_begin(db, &lsec);
+            pthread_mutex_lock(&db->lock);
+            rc = ecgc_collect_oids_locked(db, gc->oids, gc->noids, &unlinks, &nunlinks, &retired_listed);
+            pthread_mutex_unlock(&db->lock);
+            lt_end(db, &lsec);
+            uint64_t unlinked = 0;
+            for (size_t i = 0; rc == 0 && i < nunlinks; i++) {
+                if (unlinkat(db->dirfd, unlinks[i], 0) == 0) {
+                    unlinked++;
+                } else if (errno != ENOENT) {
+                    int err = errno;
+                    eng_fail(db, "unlink of retired .ec part by MK_GC{done}", err);
+                    rc = TSDB_ERR_IO;
+                }
+            }
+            free(unlinks);
+            if (rc == 0 && (unlinked > 0 || retired_listed)) {
+                if (db->opt.fsync)
+                    rc = eng_sync_dir(db, "fsync of the directory after MK_GC{done} unlinked retired parts");
+                if (unlinked > 0)
+                    ecgc_note_unlinked(db->tier, unlinked);
+            }
+            if (rc == 0 && retired_listed)
+                (void)manifest_publish(db);
+        }
         return rc;
     }
 
@@ -691,16 +723,18 @@ static int scan_wal_seg(eng *db, uint64_t seq, oid_vec *ov)
             }
             if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COLD || wr.mtype == MK_DIGEST)) {
                 mk m;
-                if (mk_decode(wr.payload, wr.n, &m) == 0) {
-                    if (m.type == MK_COLD) {
-                        size_t at = 0;
-                        mk_cold_obj o;
-                        while (mk_cold_obj_next(&m.u.cold, &at, &o) && rc == 0)
-                            rc = ov_push(ov, o.oid);
-                    } else if (m.type == MK_DIGEST) {
-                        for (uint32_t i = 0; i < m.u.digest.noids && rc == 0; i++)
-                            rc = ov_push(ov, mk_oid_at(m.u.digest.oids, i));
-                    }
+                if (mk_decode(wr.payload, wr.n, &m) != 0) {
+                    rc = TSDB_ERR_CORRUPT;
+                    break;
+                }
+                if (m.type == MK_COLD) {
+                    size_t at = 0;
+                    mk_cold_obj o;
+                    while (mk_cold_obj_next(&m.u.cold, &at, &o) && rc == 0)
+                        rc = ov_push(ov, o.oid);
+                } else if (m.type == MK_DIGEST) {
+                    for (uint32_t i = 0; i < m.u.digest.noids && rc == 0; i++)
+                        rc = ov_push(ov, mk_oid_at(m.u.digest.oids, i));
                 }
             }
             pos += sz;
@@ -799,6 +833,28 @@ static int append_and_apply_mkgc(eng *db, uint32_t reason, const uint8_t (*oids)
     return ecgcmk_apply(db, pos, &m);
 }
 
+static void maybe_crash_before_del(eng *db)
+{
+    if (test_crash_before_del[0] && access(test_crash_before_del, F_OK) == 0 &&
+        !atomic_exchange(&test_crash_fired, true)) {
+        fprintf(stderr, "tsdb: %s: test: ecgc: exiting before CHUNK_DEL (crash_before_del)\n", db->dir);
+        _exit(99);
+    }
+}
+
+static void maybe_pause_before_del(eng *db)
+{
+    if (test_pause_beforedel[0] && access(test_pause_beforedel, F_OK) == 0 &&
+        !atomic_exchange(&test_pause_fired, true)) {
+        fprintf(stderr, "tsdb: %s: test: ecgc: paused before CHUNK_DEL (pause_beforedel)\n", db->dir);
+        while (access(test_pause_beforedel, F_OK) == 0 && !atomic_load(&db->gcmk->stop)) {
+            struct timespec ts = {0, 50 * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+        fprintf(stderr, "tsdb: %s: test: ecgc: resumed before CHUNK_DEL\n", db->dir);
+    }
+}
+
 static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
 {
     struct ecgcmk *g = db->gcmk;
@@ -817,6 +873,8 @@ static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], ui
     for (unsigned pos = 0; pos < npos; pos++) {
         if (atomic_load(&g->stop) || eng_check(db))
             return TSDB_ERR_STOPPED;
+        if (pos == 0)
+            maybe_pause_before_del(db);
         int rc = cv->ops->del_gc ? cv->ops->del_gc(cv->ctx, oid, pos, epoch, mk_pos)
                                  : cv->ops->del(cv->ctx, oid, pos, epoch, COLD_DEL_MKGC);
         if (rc == CHUNK_ERR_FENCED) {
@@ -837,24 +895,6 @@ static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], ui
     return 0;
 }
 
-static void maybe_test_hooks_before_del(eng *db)
-{
-    if (test_crash_before_del[0] && access(test_crash_before_del, F_OK) == 0 &&
-        !atomic_exchange(&test_crash_fired, true)) {
-        fprintf(stderr, "tsdb: %s: test: ecgc: exiting before CHUNK_DEL (crash_before_del)\n", db->dir);
-        _exit(99);
-    }
-    if (test_pause_beforedel[0] && access(test_pause_beforedel, F_OK) == 0 &&
-        !atomic_exchange(&test_pause_fired, true)) {
-        fprintf(stderr, "tsdb: %s: test: ecgc: paused before CHUNK_DEL (pause_beforedel)\n", db->dir);
-        while (access(test_pause_beforedel, F_OK) == 0 && !atomic_load(&db->gcmk->stop)) {
-            struct timespec ts = {0, 50 * 1000000L};
-            nanosleep(&ts, NULL);
-        }
-        fprintf(stderr, "tsdb: %s: test: ecgc: resumed before CHUNK_DEL\n", db->dir);
-    }
-}
-
 static void process_pending(eng *db, coldvol *cv)
 {
     struct ecgcmk *g = db->gcmk;
@@ -869,7 +909,7 @@ static void process_pending(eng *db, coldvol *cv)
         return;
     }
 
-    maybe_test_hooks_before_del(db);
+    maybe_crash_before_del(db);
 
     uint8_t (*done)[16] = malloc(n * 16);
     if (!done) {
@@ -1111,13 +1151,15 @@ static void collect_orphans(eng *db, coldvol *cv)
                     break;
                 }
             }
+            bool queued = false;
             if (now - first >= grace) {
                 bool dup = false;
                 for (size_t d = 0; d < due.n && !dup; d++)
                     dup = memcmp(due.v[d], sc.e[i].oid, 16) == 0;
-                if (!dup && due.n < MK_FILES_MAX)
-                    (void)ov_push(&due, sc.e[i].oid);
-            } else {
+                if (dup || (due.n < MK_FILES_MAX && ov_push(&due, sc.e[i].oid) == 0))
+                    queued = true;
+            }
+            if (!queued) {
                 if (nnext == capnext) {
                     size_t nc = capnext ? capnext * 2 : 16;
                     gcmk_cand *p = realloc(next, nc * sizeof *p);

@@ -718,8 +718,7 @@ int tier_engine_attach(eng *db)
     cv->volume = vol;
     cv->epoch_fn = at.epoch;
     cv->epoch_arg = at.epoch_arg;
-    if (at.lead_epoch && db->leader_open)
-        atomic_init(&cv->lead_epoch, at.lead_epoch);
+    atomic_init(&cv->lead_epoch, (at.lead_epoch && db->leader_open) ? at.lead_epoch : 0);
     if (at.settings)
         cv->set = *at.settings;
     else
