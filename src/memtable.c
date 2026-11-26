@@ -1927,7 +1927,12 @@ static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
         }
     }
     if (rotated)
-        manifest_publish(db); /* followers start tailing the new segment (outside wal_writing) */
+        /* Publish MANIFEST outside wal_writing (still serialized under flush_lock, preserving
+         * flush_lock > manifest_lock > db->lock > buf_lock). A concurrent sync-mode append into
+         * the new segment may return before MANIFEST advertises wal_active = seq; explicit
+         * tsdb_flush() still publishes before returning, and followers poll asynchronously
+         * (docs/ha.md §7). */
+        manifest_publish(db);
 
     if (rc == 0)
         rc = flush_waiting(db);

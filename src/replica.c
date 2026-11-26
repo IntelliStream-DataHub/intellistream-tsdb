@@ -1820,9 +1820,10 @@ static int open_scan(eng *db, struct replica *rp)
 
 static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *wr, uint64_t pmax)
 {
-    /* One record is added under one hold of buf_lock: a replica's rows are visible at once (no lsn gating), and a query
-     * must see a committed record whole or not at all, as a sync-mode writer's rows are. So the rows are collected
-     * first (the skip of a replay takes db->lock, which sits above buf_lock) and added in one step. */
+    /* One record is added under one hold of buf_lock, stamped with monotonic non-zero LSNs and published via
+     * wal_appended once the whole record is in place: a query sees a committed record whole or not at all, and
+     * snapshot_take's captured wal_appended strictly fences concurrent apply_commit + apply_rows. So the rows are
+     * collected first (the skip of a replay takes db->lock, which sits above buf_lock) and added in one step. */
     enum { B = 256 };
     uint32_t ids_s[B];
     int64_t ts_s[B];
@@ -1897,17 +1898,19 @@ static int apply_rows(eng *db, struct replica *rp, uint64_t seq, const wal_rec *
     }
     if (k > 0) {
         pthread_mutex_lock(&db->buf_lock);
+        uint64_t app = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
         rc = mt_reserve_rows(db->active, ids, 0, k);
         for (size_t a = 0; rc == 0 && a < k;) {
             size_t b = a + 1;
             while (b < k && ty[b] == ty[a])
                 b++;
-            rc = mt_add(db->active, ids + a, 0, ts + a, sl + a, 8, b - a, 0, ty[a]);
+            rc = mt_add(db->active, ids + a, 0, ts + a, sl + a, 8, b - a, app + a + 1, ty[a]);
             a = b;
         }
         if (rc == 0) {
             mt_note_fno(db->active, wr->fno, wr->n);
             eng_ppos_rows(db, db->active, PPOS_SITE_APPLY, ts, k, wr->fno, ix);
+            atomic_store_explicit(&db->wal_appended, app + k, memory_order_release);
         }
         pthread_mutex_unlock(&db->buf_lock);
         if (rc)

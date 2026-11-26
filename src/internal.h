@@ -1621,6 +1621,7 @@ int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
 extern void (*mt_test_after_wal_enter)(struct eng *db);
+extern void (*snapshot_test_after_lock)(struct eng *db);
 /* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
  * lowest position any replica still needs: a replica's next `from` minus 1), at most the commit floor the driver saved.
  * A leader's flushed segment stays (a catch-up source, replica_read) until its last position is at or below
@@ -2156,7 +2157,7 @@ struct eng {
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
     size_t ntails;
-    uint64_t tail_lsn; /* rows added to tails (buf_lock): their lsn, so a cut (qcut) can bound them */
+    _Atomic uint64_t tail_lsn; /* rows added to tails (written under buf_lock, release-stored per record): bounds snapshot_take and qcut */
 
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */

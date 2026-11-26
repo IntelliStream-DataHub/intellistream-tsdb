@@ -32,6 +32,8 @@
 #define T0 1700000000000LL
 /* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
 int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at);
+struct eng;
+extern void (*snapshot_test_after_lock)(struct eng *db);
 
 typedef struct shared {
     atomic_int phase;          /* 1 appends, 2 batches, 3 done */
@@ -576,6 +578,172 @@ static void test_rowless_series(const char *base)
     printf("  a series created after the follower opened, with no rows, is found by name and by id\n");
 }
 
+/* Deterministic regression for follower snapshot isolation in snapshot_take():
+ * snapshot_take drops db->lock before copying tail memtables under buf_lock. If follow_refresh runs
+ * in that window, installing a new part (delete tombstone or large insert) without flushing the active
+ * WAL segment and then appending a newer WAL row into the kept tail, snapshot_take's captured tail_lsn
+ * must exclude that newer WAL row so the reader never sees post-delete/post-batch rows without the part. */
+typedef struct follow_snap_gate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool armed;
+    bool paused;
+    bool go;
+} follow_snap_gate;
+
+static follow_snap_gate fsg = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+
+static void follow_snap_hook(struct eng *db)
+{
+    (void)db;
+    pthread_mutex_lock(&fsg.mu);
+    if (fsg.armed) {
+        fsg.armed = false;
+        fsg.paused = true;
+        pthread_cond_signal(&fsg.cv);
+        while (!fsg.go)
+            pthread_cond_wait(&fsg.cv, &fsg.mu);
+    }
+    pthread_mutex_unlock(&fsg.mu);
+}
+
+typedef struct follow_reader_arg {
+    tsdb *db;
+    tsdb_sid id;
+    int rc;
+    tsdb_points pts;
+} follow_reader_arg;
+
+static void *follow_reader_fn(void *arg)
+{
+    follow_reader_arg *a = arg;
+    a->rc = tsdb_query_points(a->db, a->id, T0, T0 + 100000, &a->pts);
+    return NULL;
+}
+
+static void test_follow_snapshot_isolation(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-snapiso-%d", base, (int)getpid());
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.flush_interval_ms = 600000;
+    o.wal_max_batch_rows = 16; /* >16 rows commit straight to parts without flushing non-overlapping WAL */
+    tsdb *w = NULL, *r = NULL;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    tsdb_sid id;
+    CHECK(tsdb_series(w, "iso", &id) == 0);
+    /* P1 holds (T0, 1.0); flush opens empty WAL segment 2 (wal_flushed=1, wal_active=2). */
+    CHECK(tsdb_append(w, id, T0, 1.0f) == 0 && tsdb_flush(w) == 0);
+
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1; /* no polling thread: refreshes run explicitly */
+    CHECK(tsdb_open(dir, &ro, &r) == 0);
+    if (!r) {
+        tsdb_close(w);
+        return;
+    }
+
+    /* Case 1: active memtable is empty so tsdb_delete_range commits tombstone P_del for [T0, T0 + 1000)
+     * WITHOUT flushing segment 2 (wal_flushed stays 1, wal_active stays 2); then tsdb_append writes
+     * (T0 + 20000, 2.0) into the SAME tail memtable T_2 that r already holds. */
+    CHECK(tsdb_delete_range(w, id, T0, T0 + 1000) == 0);
+    CHECK(tsdb_append(w, id, T0 + 20000, 2.0f) == 0);
+
+    pthread_mutex_lock(&fsg.mu);
+    fsg.armed = true;
+    fsg.paused = false;
+    fsg.go = false;
+    pthread_mutex_unlock(&fsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, follow_snap_hook, __ATOMIC_RELEASE);
+
+    follow_reader_arg a = {.db = r, .id = id};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, follow_reader_fn, &a) == 0);
+    pthread_mutex_lock(&fsg.mu);
+    while (!fsg.paused)
+        pthread_cond_wait(&fsg.cv, &fsg.mu);
+    pthread_mutex_unlock(&fsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, NULL, __ATOMIC_RELEASE);
+
+    /* Refresh while reader is paused between db->lock and buf_lock */
+    CHECK(tsdb_refresh(r) == 0);
+
+    pthread_mutex_lock(&fsg.mu);
+    fsg.go = true;
+    pthread_cond_signal(&fsg.cv);
+    pthread_mutex_unlock(&fsg.mu);
+    pthread_join(th, NULL);
+
+    /* Reader must see pre-refresh snapshot: (T0, 1.0) ONLY — NOT (T0 + 20000, 2.0) alongside deleted T0 */
+    CHECK(a.rc == 0 && a.pts.n == 1 && a.pts.ts[0] == T0);
+    tsdb_points_free(&a.pts);
+
+    /* Post-refresh query sees delete applied and new WAL row */
+    tsdb_points p;
+    CHECK(tsdb_query_points(r, id, T0, T0 + 100000, &p) == 0);
+    CHECK(p.n == 1 && p.ts[0] == T0 + 20000 && p.values[0] == 2.0f);
+    tsdb_points_free(&p);
+
+    /* Case 2: flush segment 2 (now tail_lsn > 0 and empty segment 3 is active), refresh r so it holds T_3,
+     * then commit large insert P_new (20 rows at T0 + 2000..2019, no flush of segment 3) + WAL append (T0 + 30000, 3.0) */
+    CHECK(tsdb_flush(w) == 0);
+    CHECK(tsdb_refresh(r) == 0);
+    int64_t lts[20];
+    float lv[20];
+    for (int i = 0; i < 20; i++)
+        lts[i] = T0 + 2000 + i, lv[i] = 10.0f + (float)i;
+    CHECK(tsdb_insert_series(w, id, lts, lv, 20) == 0);
+    CHECK(tsdb_append(w, id, T0 + 30000, 3.0f) == 0);
+
+    pthread_mutex_lock(&fsg.mu);
+    fsg.armed = true;
+    fsg.paused = false;
+    fsg.go = false;
+    pthread_mutex_unlock(&fsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, follow_snap_hook, __ATOMIC_RELEASE);
+
+    a = (follow_reader_arg){.db = r, .id = id};
+    CHECK(pthread_create(&th, NULL, follow_reader_fn, &a) == 0);
+    pthread_mutex_lock(&fsg.mu);
+    while (!fsg.paused)
+        pthread_cond_wait(&fsg.cv, &fsg.mu);
+    pthread_mutex_unlock(&fsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, NULL, __ATOMIC_RELEASE);
+
+    CHECK(tsdb_refresh(r) == 0);
+
+    pthread_mutex_lock(&fsg.mu);
+    fsg.go = true;
+    pthread_cond_signal(&fsg.cv);
+    pthread_mutex_unlock(&fsg.mu);
+    pthread_join(th, NULL);
+
+    /* Reader must see pre-refresh snapshot: (T0 + 20000) ONLY — NOT (T0 + 30000) without P_new */
+    CHECK(a.rc == 0 && a.pts.n == 1 && a.pts.ts[0] == T0 + 20000);
+    tsdb_points_free(&a.pts);
+
+    /* Post-refresh query sees P_new (20 rows) + (T0 + 20000) + (T0 + 30000) = 22 rows */
+    CHECK(tsdb_query_points(r, id, T0, T0 + 100000, &p) == 0);
+    CHECK(p.n == 22 && p.ts[0] == T0 + 2000 && p.ts[21] == T0 + 30000 && p.values[21] == 3.0f);
+    tsdb_points_free(&p);
+
+    tsdb_close(r);
+    tsdb_close(w);
+    CHECK(system(cmd) == 0);
+    printf("  follower snapshot isolation across concurrent refresh + WAL tail\n");
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_follow", 1200);
@@ -695,6 +863,7 @@ int main(int argc, char **argv)
     test_writer_restart(argc > 1 ? argv[1] : "/tmp");
     test_class_follow(argc > 1 ? argv[1] : "/tmp");
     test_stale_manifest_classes(argc > 1 ? argv[1] : "/tmp");
+    test_follow_snapshot_isolation(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

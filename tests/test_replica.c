@@ -2810,6 +2810,156 @@ static void xp_stop(xport *x)
 
 static void rdir(char *out, size_t cap, const xport *x) { snprintf(out, cap, "%s_r", x->ldir); }
 
+/* Regression for replica snapshot isolation in snapshot_take():
+ * apply_commit adds parts to db->parts under db->lock without rotating db->active, and subsequent
+ * apply_rows records in the same segment append to db->active under buf_lock. With monotonic non-zero
+ * LSNs stamped in apply_rows and published via db->wal_appended, a concurrent reader paused between
+ * db->lock and buf_lock never sees post-COMMIT rows without the COMMIT's parts (and LSNs stay monotonic
+ * across memtable switches and flushes). */
+typedef struct rep_snap_gate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    eng *target;
+    bool armed;
+    bool paused;
+    bool go;
+} rep_snap_gate;
+
+static rep_snap_gate rsg = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+
+static void rep_snap_hook(eng *db)
+{
+    pthread_mutex_lock(&rsg.mu);
+    if (rsg.armed && db == rsg.target) {
+        rsg.armed = false;
+        rsg.paused = true;
+        pthread_cond_signal(&rsg.cv);
+        while (!rsg.go)
+            pthread_cond_wait(&rsg.cv, &rsg.mu);
+    }
+    pthread_mutex_unlock(&rsg.mu);
+}
+
+typedef struct rep_reader_arg {
+    eng *db;
+    int rc;
+    qctx q;
+} rep_reader_arg;
+
+static void *rep_reader_fn(void *arg)
+{
+    rep_reader_arg *a = arg;
+    a->q.n = 0;
+    a->rc = eng_query_raw_ex(a->db, 0, T0 - 1000, T0 + 1000LL * (NT + 1), false, 0, qfn, &a->q);
+    return NULL;
+}
+
+static void case_replica_snapshot_isolation(void)
+{
+    xport x;
+    xp_start(&x, "rsnap");
+    /* Round 1 (wal_appended == 0): P1 holds 20 rows (t=0..19) via COMMIT in segment 1; leader active memtable
+     * is empty, replica active memtable is already bound to segment 1 (empty). */
+    xp_rows(&x, 0, 0, 20, 10.0f);
+    xp_step(&x, "rsnap: initial");
+
+    /* Stage a second COMMIT (20-row large insert at t=20..39 in the SAME segment 1, no memtable rotation!)
+     * followed by a ROWS record (t=60, 30.0) in the SAME segment 1, without applying yet. */
+    x.noapply = true;
+    xp_rows(&x, 0, 20, 20, 100.0f);
+    xp_rows(&x, 0, 60, 1, 30.0f);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    x.noapply = false;
+
+    pthread_mutex_lock(&rsg.mu);
+    rsg.target = x.rep;
+    rsg.armed = true;
+    rsg.paused = false;
+    rsg.go = false;
+    pthread_mutex_unlock(&rsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, rep_snap_hook, __ATOMIC_RELEASE);
+
+    rep_reader_arg a = {.db = x.rep};
+    pthread_t th;
+    CHECK_EQ(pthread_create(&th, NULL, rep_reader_fn, &a), 0);
+    pthread_mutex_lock(&rsg.mu);
+    while (!rsg.paused)
+        pthread_cond_wait(&rsg.cv, &rsg.mu);
+    pthread_mutex_unlock(&rsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, NULL, __ATOMIC_RELEASE);
+
+    /* Apply COMMIT + post-COMMIT ROWS into the SAME db->active while reader is paused between db->lock and buf_lock */
+    CHECK_EQ(replica_apply(x.rep, ld_last(&x)), 0);
+
+    pthread_mutex_lock(&rsg.mu);
+    rsg.go = true;
+    pthread_cond_signal(&rsg.cv);
+    pthread_mutex_unlock(&rsg.mu);
+    pthread_join(th, NULL);
+
+    /* Reader must see pre-apply snapshot: t=0..19 (20 rows) ONLY — NOT (t=60) without t=20..39 */
+    CHECK_EQ(a.rc, 0);
+    CHECK_EQ(a.q.n, 20);
+    if (a.q.n == 20) {
+        CHECK_EQ(a.q.ts[0], T0);
+        CHECK_EQ(a.q.ts[19], T0 + 19000);
+    }
+    CHECK(xp_same(&x, "rsnap: post-commit"));
+
+    /* Round 2 (wal_appended > 0): flush segment 1 -> leader is on empty segment 2; commit one COMMIT in segment 2
+     * and apply it so replica's active memtable is already bound to segment 2 (wal_appended == 1).
+     * Then stage delete tombstone COMMIT for t=0 + ROWS (t=61, 40.0) in the SAME segment 2. */
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 40, 17, 200.0f);
+    xp_step(&x, "rsnap: seg2 commit");
+
+    x.noapply = true;
+    CHECK_EQ(eng_delete_range(x.ld, 0, T0, T0 + 1000), 0);
+    xp_rows(&x, 0, 61, 1, 40.0f);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    x.noapply = false;
+
+    pthread_mutex_lock(&rsg.mu);
+    rsg.target = x.rep;
+    rsg.armed = true;
+    rsg.paused = false;
+    rsg.go = false;
+    pthread_mutex_unlock(&rsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, rep_snap_hook, __ATOMIC_RELEASE);
+
+    a = (rep_reader_arg){.db = x.rep};
+    CHECK_EQ(pthread_create(&th, NULL, rep_reader_fn, &a), 0);
+    pthread_mutex_lock(&rsg.mu);
+    while (!rsg.paused)
+        pthread_cond_wait(&rsg.cv, &rsg.mu);
+    pthread_mutex_unlock(&rsg.mu);
+    __atomic_store_n(&snapshot_test_after_lock, NULL, __ATOMIC_RELEASE);
+
+    CHECK_EQ(replica_apply(x.rep, ld_last(&x)), 0);
+
+    pthread_mutex_lock(&rsg.mu);
+    rsg.go = true;
+    pthread_cond_signal(&rsg.cv);
+    pthread_mutex_unlock(&rsg.mu);
+    pthread_join(th, NULL);
+
+    /* Reader must see pre-delete 58 rows (t=0..56 + t=60, NOT t=61 alongside deleted t=0) */
+    CHECK_EQ(a.rc, 0);
+    CHECK_EQ(a.q.n, 58);
+    if (a.q.n == 58) {
+        CHECK_EQ(a.q.ts[0], T0);
+        CHECK_EQ(a.q.ts[57], T0 + 60000);
+    }
+    CHECK(xp_same(&x, "rsnap: post-delete"));
+
+    /* Round 3: verify LSN monotonicity across segment rotation (switch_memtable) + flush */
+    CHECK_EQ(eng_flush(x.ld), 0);
+    xp_rows(&x, 0, 62, 1, 50.0f);
+    xp_step(&x, "rsnap: after switch and flush");
+    xp_stop(&x);
+    printf("  replica snapshot isolation across concurrent apply_commit + apply_rows\n");
+}
+
 static void case_commit(void)
 {
     xport x;
@@ -8395,6 +8545,7 @@ int main(int argc, char **argv)
     }
     if (getenv("TEST_REPLICA_APPLY_ONLY")) { /* the quick run of the apply's cases (R2 REVIEW M1) */
         case_commit();
+        case_replica_snapshot_isolation();
         case_commit_cut();
         case_commit_hold_cut();
         case_apply_concurrent();
@@ -8510,6 +8661,7 @@ int main(int argc, char **argv)
     case_sync_cut();
     case_sealed_open();
     case_commit();
+    case_replica_snapshot_isolation();
     case_ro_open();
     case_ro_epoch_jump();
     case_commit_hold();

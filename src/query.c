@@ -128,7 +128,7 @@ int cut_take(eng *db, qcut *c)
         mt_ref(db->tails[i].m);
         c->tails[c->ntails++] = db->tails[i].m;
     }
-    c->tail_visible = db->tail_lsn;
+    c->tail_visible = atomic_load_explicit(&db->tail_lsn, memory_order_relaxed);
     pthread_mutex_unlock(&db->buf_lock);
     pthread_mutex_unlock(&db->lock);
     return 0;
@@ -235,6 +235,8 @@ static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64
     return rc;
 }
 
+void (*snapshot_test_after_lock)(eng *db);
+
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
 int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
@@ -255,13 +257,15 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     /* With a WAL synced on every write, a row is visible once it is durable:
      * no reader sees a write that a power failure could still take back. That
      * includes the flushing memtables: a flush rotates the active one before
-     * it writes and syncs the rest of its segment. Bound by wal_appended read
-     * under db->lock so rows appended after we drop db->lock (possibly after
-     * a newer large insert) stay outside this snapshot. */
+     * it writes and syncs the rest of its segment. Bound by wal_appended and
+     * tail_lsn read under db->lock so rows appended after we drop db->lock
+     * (possibly after a newer large insert, delete, COMMIT, or refresh) stay
+     * outside this snapshot. */
     uint64_t visible = eng_visible(db); /* a leader: no further than its commit point */
     uint64_t app = atomic_load_explicit(&db->wal_appended, memory_order_acquire);
     if (app < visible)
         visible = app;
+    uint64_t tail_vis = atomic_load_explicit(&db->tail_lsn, memory_order_acquire);
     s->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *s->parts);
     if (s->parts) {
         for (size_t i = 0; i < db->nparts; i++) {
@@ -290,6 +294,10 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     }
     pthread_mutex_unlock(&db->lock);
 
+    void (*snap_hook)(eng *) = __atomic_load_n(&snapshot_test_after_lock, __ATOMIC_ACQUIRE);
+    if (UNLIKELY(snap_hook != NULL))
+        snap_hook(db);
+
     /* Copy raw slices of mutable memtables under buf_lock alone, then drop buf_lock before sorting/deduping. */
     mem_run tails[MAX_TAILS];
     bool tail_sorted[MAX_TAILS];
@@ -299,7 +307,7 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     if (rc == 0 && (ntail_ms || active_m)) {
         pthread_mutex_lock(&db->buf_lock);
         for (size_t i = 0; rc == 0 && i < ntail_ms; i++)
-            rc = mt_copy_raw(tail_ms[i], series, start, end, UINT64_MAX, &tails[i], &tail_sorted[i]);
+            rc = mt_copy_raw(tail_ms[i], series, start, end, tail_vis, &tails[i], &tail_sorted[i]);
         if (rc == 0 && active_m)
             rc = mt_copy_raw(active_m, series, start, end, visible, &active, &act_sorted);
         pthread_mutex_unlock(&db->buf_lock);
