@@ -164,6 +164,46 @@ size_t partition_part_count_locked(eng *db, int64_t partition)
     return n;
 }
 
+/* Standalone publishers (parts_publish, flush_waiting, eng_replace_range) call this under publish_lock, before
+ * parts_commit and never holding latest_rw, so a concurrent write into a partition being dropped does not commit or
+ * list a part while drop_retire has an unlocked drop intent on disk. Writes to partitions > drop_pending_end never
+ * wait; replicated leaders (jr_serial > flush_lock) and replicas (apply_mu) are already serialized against drops.
+ * Blocks only once drop_settle_locked has finished (db->drop_settled), so holding publish_lock here can never
+ * deadlock an in-flight eng_reencode whose ec_swap_reencode needs publish_lock before drop_settle_locked returns. */
+void db_pub_begin(eng *db, part **ps, size_t n)
+{
+    if (n == 0 || eng_jr(db) || db->rp)
+        return;
+    int64_t min_end = INT64_MAX;
+    for (size_t i = 0; i < n; i++) {
+        int64_t lo, end;
+        partition_range(db, ps[i]->partition, &lo, &end);
+        min_end = MIN(min_end, end);
+    }
+    pthread_mutex_lock(&db->lock);
+    while (db->drop_settled && min_end <= db->drop_pending_end && !eng_check(db))
+        pthread_cond_wait(&db->merged_cv, &db->lock);
+    db->pub_active = true;
+    db->pub_min_end = min_end;
+    pthread_mutex_unlock(&db->lock);
+}
+
+void db_pub_end_locked(eng *db)
+{
+    if (!db->pub_active)
+        return;
+    db->pub_active = false;
+    db->pub_min_end = INT64_MAX;
+    pthread_cond_broadcast(&db->merged_cv);
+}
+
+void db_pub_end(eng *db)
+{
+    pthread_mutex_lock(&db->lock);
+    db_pub_end_locked(db);
+    pthread_mutex_unlock(&db->lock);
+}
+
 /* Publishes parts together: a query sees all of them or none. The result of
  * manifest_publish is not the caller's: its parts are committed and listed. */
 void db_add_parts(eng *db, part **ps, size_t n)
@@ -176,6 +216,7 @@ void db_add_parts(eng *db, part **ps, size_t n)
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < n; i++)
         db_parts_insert_locked(db, ps[i]);
+    db_pub_end_locked(db);
     pthread_cond_signal(&db->merge_cv);
     pthread_mutex_unlock(&db->lock);
     lt_end(db, &sec);
@@ -1626,6 +1667,8 @@ int eng_drop_before(eng *db, int64_t ts)
     else if (held) {
         pthread_mutex_lock(&db->lock);
         db->drop_pending = false; /* drop_retire did not run: it clears the intent on its every other way out */
+        db->drop_settled = false;
+        pthread_cond_broadcast(&db->merged_cv);
         pthread_mutex_unlock(&db->lock);
     }
     if (held)
@@ -1639,15 +1682,16 @@ int eng_drop_before(eng *db, int64_t ts)
 
 /* The part of tsdb_drop_before after the flush: retires every partition that ends at or before ts. A replica runs
  * it when it applies the DROP marker (replica.c), after it has flushed its sealed memtables. */
-/* db->lock held: publishes the drop's intent (no merge of a partition ending at or before ts is selected while it is
- * set) and waits until the merges of those partitions already in flight have listed their outputs. R7: never for a
- * settle (p->settling) of a single server's tier. Its encode can take minutes on a slow store and is nobody's
- * acknowledgement: the drop retires the settling part like any other, and the single-server swap (r7-swap items 2-4)
- * lists nothing: it checks under db->lock, in the hold of its renames, that every input is still listed and not
- * dropped, and its recovery rolls back an intent whose sources are retired or gone (the intent is durable before
- * that check, and a drop takes no publish_lock: the window that makes drops wait for merges). Those, with r7-swap's
- * swapnodropcheck mutant and power-loss test, keep a dropped part from coming back, not a wait here. A cluster
- * settle is different (design-cluster-data.md 2.3): there the drop waits at the settle gate for steps 3-6. */
+/* db->lock held: publishes the drop's intent (no merge or re-encode of a partition ending at or before ts is selected
+ * while it is set) and waits until the merges and R10 re-encodes of those partitions already in flight have listed
+ * their outputs. R7: never for a 1-to-1 settle (p->settling without p->reencoding) of a single server's tier. Its
+ * encode can take minutes on a slow store and is nobody's acknowledgement: the drop retires the settling part like
+ * any other, and the single-server swap (r7-swap items 2-4) lists nothing: it checks under db->lock, in the hold of
+ * its renames, that every input is still listed and not dropped, and its recovery rolls back an intent whose sources
+ * are retired or gone (the intent is durable before that check, and a drop takes no publish_lock: the window that
+ * makes drops wait for merges). R10 re-encode (p->reencoding) replaces multiple parts with a new-stem output, so like
+ * a merge it must finish before drop_intent_prepare runs unlocked. A cluster settle is different
+ * (design-cluster-data.md 2.3): there the drop waits at the settle gate for steps 3-6. */
 static void drop_settle_locked(eng *db, int64_t ts)
 {
     db->drop_pending = true;
@@ -1657,7 +1701,7 @@ static void drop_settle_locked(eng *db, int64_t ts)
         for (size_t i = 0; i < db->nparts && !busy; i++) {
             int64_t lo, end;
             partition_range(db, db->parts[i]->partition, &lo, &end);
-            busy = end <= ts && (db->parts[i]->merging ||
+            busy = end <= ts && (db->parts[i]->merging || db->parts[i]->reencoding ||
                                  (ecskip_mutant == ECSKIP_MUT_DROPWAITSETTLE && db->parts[i]->settling));
         }
         if (busy)
@@ -1665,64 +1709,215 @@ static void drop_settle_locked(eng *db, int64_t ts)
     }
 }
 
-int drop_retire(eng *db, int64_t ts)
+/* Collects the listed parts whose partition ends at or before ts (in list order: partition + block order).
+ * Caller holds db->lock. Returns 0 on success (*out = NULL when *nout == 0), or TSDB_ERR_NOMEM. */
+static int drop_collect_locked(eng *db, int64_t ts, part ***out, size_t *nout)
 {
-    int rc;
-    pthread_mutex_lock(&db->lock);
-    /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
-     * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
-     * acknowledgement would list it alone. So wait until the merge has listed it (the loop below retires it with
-     * the rest, by rename, before the fsync) and look again: the wait released db->lock. The intent is published
-     * first, so that no further merge of those partitions is selected meanwhile (select_merge_locked,
-     * ttl_select_locked, eng_optimize): the wait ends with the merges already in flight. Drops are serialized by
-     * drop_lock (tsdb_drop_before), so there is one intent at a time; it is cleared on every way out below. */
-    drop_settle_locked(db, ts);
-    /* The retiring and the latest table's drop floor are one section (latest_rw > db->lock, design-latest.md 3.6),
-     * entered after the wait: no merge of these partitions is selected while drop_pending is set, so none is in
-     * flight when db->lock is taken again */
-    pthread_mutex_unlock(&db->lock);
-    lt_sec lsec;
-    lt_begin(db, &lsec);
-    pthread_mutex_lock(&db->lock);
-    /* The parts are taken in list order (part_cmp: block order within a partition) and retired as one step through a
-     * drop intent (drop_retire_parts_locked): a crash between two renames is finished at the open, never left with
-     * a partition half retired. The intent is written inside this section, so the set it names is exactly what the
-     * drop floor below covers (latest_rw and db->lock are held across its fdatasync and directory fsync).
-     * R7: an .ec part goes the same way (db_retire_locked renames it retired_<name>.ec, its object goes with it,
-     * r7-gc), and so does a settling one: a single server's swap sees `dropped` under db->lock and lists nothing
-     * (drop_settle_locked) */
-    size_t n = 0, done = 0;
+    size_t n = 0;
     for (size_t i = 0; i < db->nparts; i++) {
         int64_t lo, end;
         partition_range(db, db->parts[i]->partition, &lo, &end);
         n += end <= ts;
     }
-    part **ps = n ? malloc(n * sizeof *ps) : NULL;
-    char intent[64] = "";
-    if (n && !ps) {
-        rc = TSDB_ERR_NOMEM;
-    } else {
-        for (size_t i = 0, j = 0; i < db->nparts; i++) {
-            int64_t lo, end;
-            partition_range(db, db->parts[i]->partition, &lo, &end);
-            if (end <= ts)
-                ps[j++] = db->parts[i];
-        }
-        rc = drop_retire_parts_locked(db, ps, n, intent, &done, drop_marker_logged(db));
+    *nout = n;
+    if (n == 0) {
+        *out = NULL;
+        return 0;
     }
+    part **ps = malloc(n * sizeof *ps);
+    if (!ps)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0, j = 0; i < db->nparts; i++) {
+        int64_t lo, end;
+        partition_range(db, db->parts[i]->partition, &lo, &end);
+        if (end <= ts)
+            ps[j++] = db->parts[i];
+    }
+    *out = ps;
+    return 0;
+}
+
+static int drop_copy_names(part *const *ps, size_t n, char (**out)[96], size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (!drop_needs_intent(n))
+        return 0;
+    char (*names)[96] = malloc(n * sizeof *names);
+    if (!names)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < n; i++)
+        snprintf(names[i], sizeof names[i], "%s", ps[i]->name);
+    *out = names;
+    *nout = n;
+    return 0;
+}
+
+static bool drop_names_match(part *const *ps, size_t n, char (*const names)[96], size_t nnames)
+{
+    if (n != nnames)
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(ps[i]->name, names[i]) != 0)
+            return false;
+    return true;
+}
+
+int drop_retire(eng *db, int64_t ts)
+{
+    int rc = 0;
+    size_t done = 0;
+    char intent[64] = "";
+    char (*inames)[96] = NULL;
+    size_t in = 0;
+    bool unlinked_stale = false;
+    const bool fail_stop = drop_marker_logged(db);
+
+    pthread_mutex_lock(&db->lock);
+    /* A merge or re-encode of a partition being dropped names its output (durably) before it takes db->lock to list
+     * it. Dropped meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
+     * acknowledgement would list it alone. So wait until the merge/re-encode has listed it (the loop below retires it
+     * with the rest, by rename, before the fsync) and look again: the wait released db->lock. The intent is published
+     * first, so that no further merge or re-encode of those partitions is selected meanwhile (select_merge_locked,
+     * ttl_select_locked, eng_optimize, eng_reencode): the wait ends with those already in flight. Drops are serialized
+     * by drop_lock (tsdb_drop_before), so there is one intent at a time; it is cleared on every way out below. */
+    drop_settle_locked(db, ts);
+    /* Once merges and re-encodes in partitions <= ts have settled, block new standalone publishers touching partitions
+     * <= ts (db_pub_begin) and drain any already-active standalone publisher touching <= ts before collecting the
+     * target part set and writing the unlocked drop intent. */
+    db->drop_settled = true;
+    while (!eng_jr(db) && !db->rp && db->pub_active && db->pub_min_end <= ts && !eng_check(db))
+        pthread_cond_wait(&db->merged_cv, &db->lock);
+    if (eng_check(db)) {
+        rc = TSDB_ERR_IO;
+        goto fail_locked;
+    }
+    part **ps = NULL;
+    size_t n = 0;
+    rc = drop_collect_locked(db, ts, &ps, &n);
+    if (rc == 0)
+        rc = drop_copy_names(ps, n, &inames, &in);
     free(ps);
-    db->drop_pending = false; /* also after a failed engine or intent: this is the only exit */
-    jr_commit(db, JR_DROP, &ts);
+    if (rc != 0)
+        goto fail_locked;
     pthread_mutex_unlock(&db->lock);
-    if (done)
-        lt_drop_floor(db, ts);
-    lt_end(db, &lsec);
-    if (rc)
-        return rc; /* nothing retired */
+
+    /* The retiring and the latest table's drop floor are one section (latest_rw > db->lock, design-latest.md 3.6),
+     * entered after the wait and after the drop intent's write, fdatasync and pre-rename directory fsync: those two
+     * syncs run without holding latest_rw or db->lock so NFS round trips do not stall snapshots, latest lookups, or
+     * writes to newer partitions. Once latest_rw and db->lock are acquired we check that the target part set (in list
+     * order, i.e. block order within a partition) is unchanged; if a concurrent R7 1-to-1 settle swap changed it, we
+     * unlink the unused intent and retry (falling back to the locked write after 8 retries to prevent starvation).
+     * R7: an .ec part goes the same way (db_retire_locked renames it retired_<name>.ec, its object goes with it,
+     * r7-gc), and so does a settling one: a single server's swap sees `dropped` under db->lock and lists nothing
+     * (drop_settle_locked). */
+    for (int tries = 0;; tries++) {
+        if (in > 0 && intent[0] == '\0') {
+            rc = drop_intent_prepare(db, inames, in, intent, fail_stop);
+            if (rc != 0)
+                goto fail_unlocked;
+            unlinked_stale = false;
+        }
+
+        lt_sec lsec;
+        lt_begin(db, &lsec);
+        pthread_mutex_lock(&db->lock);
+        if (eng_check(db)) {
+            rc = TSDB_ERR_IO;
+            pthread_mutex_unlock(&db->lock);
+            lt_end(db, &lsec);
+            goto fail_unlocked;
+        }
+        ps = NULL;
+        n = 0;
+        rc = drop_collect_locked(db, ts, &ps, &n);
+        if (rc != 0) {
+            pthread_mutex_unlock(&db->lock);
+            lt_end(db, &lsec);
+            goto fail_unlocked;
+        }
+
+        bool match = intent[0] ? drop_names_match(ps, n, inames, in) : !drop_needs_intent(n);
+        if (!match && tries < 8) {
+            char (*next_names)[96] = NULL;
+            size_t next_n = 0;
+            rc = drop_copy_names(ps, n, &next_names, &next_n);
+            free(ps);
+            if (rc != 0) {
+                pthread_mutex_unlock(&db->lock);
+                lt_end(db, &lsec);
+                goto fail_unlocked;
+            }
+            pthread_mutex_unlock(&db->lock);
+            lt_end(db, &lsec);
+            if (intent[0]) {
+                drop_intent_done(db, intent);
+                intent[0] = '\0';
+                unlinked_stale = true;
+            }
+            free(inames);
+            inames = next_names;
+            in = next_n;
+            continue;
+        }
+
+        if (!match) {
+            if (intent[0]) {
+                drop_intent_done(db, intent);
+                intent[0] = '\0';
+                unlinked_stale = true;
+            }
+            rc = drop_retire_parts_locked(db, ps, n, intent, &done, fail_stop);
+            free(ps);
+            if (rc != 0) {
+                pthread_mutex_unlock(&db->lock);
+                lt_end(db, &lsec);
+                goto fail_unlocked;
+            }
+        } else {
+            drop_retire_prepared_locked(db, ps, n, intent, &done);
+            free(ps);
+            rc = 0;
+        }
+        db->drop_pending = false;
+        db->drop_settled = false;
+        pthread_cond_broadcast(&db->merged_cv);
+        jr_commit(db, JR_DROP, &ts);
+        pthread_mutex_unlock(&db->lock);
+        if (done)
+            lt_drop_floor(db, ts);
+        lt_end(db, &lsec);
+        free(inames);
+        break;
+    }
+
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
         return rc; /* failed since the flush, here or elsewhere: the intent stays, the open finishes the drop */
     drop_intent_done(db, intent);
     return manifest_publish(db);
+
+fail_unlocked:
+    /* Remove any durable stale drop intent and sync the directory BEFORE clearing drop_pending/drop_settled, so no
+     * merge, re-encode, or standalone publisher can mutate these partitions while an unsynced unlink could be undone
+     * by a power cut. */
+    if (!eng_check(db)) {
+        if (intent[0]) {
+            drop_intent_done(db, intent);
+            intent[0] = '\0';
+            unlinked_stale = true;
+        }
+        if (unlinked_stale)
+            (void)eng_sync_dir(db, "fsync of the directory after discarding a stale drop intent");
+    }
+    pthread_mutex_lock(&db->lock);
+fail_locked:
+    db->drop_pending = false;
+    db->drop_settled = false;
+    pthread_cond_broadcast(&db->merged_cv);
+    jr_commit(db, JR_DROP, &ts);
+    pthread_mutex_unlock(&db->lock);
+    free(inames);
+    return rc;
 }
 
 /* The numbers of tsdb_stats in one pass over the parts; the volume statistics ask for the granule

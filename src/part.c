@@ -1207,6 +1207,7 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
 
 int drop_test_mutant;
 void (*drop_test_hook)(eng *db, const char *name, size_t at);
+void (*drop_test_intent_hook)(eng *db);
 void (*drop_test_presync)(eng *db);
 _Atomic int drop_test_intent_errno;
 _Atomic bool drop_test_marker;
@@ -1215,56 +1216,75 @@ _Atomic int drop_test_intent_fails;
 
 bool drop_marker_logged(eng *db) { return eng_jr(db) || db->rp || drop_test_marker; }
 
-static int drop_intent_write(eng *db, part **ps, size_t n, char intent[64], bool fail_stop)
+bool drop_needs_intent(size_t n)
 {
-    size_t cap = 32 + n * (sizeof ps[0]->name + 1), len = 0;
+    return n > (drop_test_mutant == DROP_MUT_TWO ? 2u : 1u) && drop_test_mutant != DROP_MUT_NO_INTENT;
+}
+
+int drop_intent_prepare(eng *db, char (*const names)[96], size_t n, char intent[64], bool fail_stop)
+{
+    intent[0] = '\0';
+    if (!drop_needs_intent(n))
+        return 0;
+    if (eng_check(db))
+        return TSDB_ERR_IO;
+    size_t cap = 32 + n * (sizeof names[0] + 1), len = 0;
     char *buf = malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
     len += (size_t)snprintf(buf + len, cap - len, DROP_INTENT_HEAD "%zu\n", n);
     for (size_t i = 0; i < n; i++)
-        len += (size_t)snprintf(buf + len, cap - len, "%s\n", ps[i]->name);
+        len += (size_t)snprintf(buf + len, cap - len, "%s\n", names[i]);
     len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
     snprintf(intent, 64, INTENT_PREFIX "%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
     const bool sync = db->opt.fsync && drop_test_mutant != DROP_MUT_NO_SYNC;
-    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    int rc = fd < 0 || write_all(fd, buf, len) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
-    int err = errno;
-    if (rc == 0 && drop_test_intent_errno) {
+    int inject = atomic_load(&drop_test_intent_errno);
+    int fd = -1;
+    int rc = 0, err = 0;
+    if (inject < 0) { /* tests: simulate openat failing (no file created, no dir sync here) */
         rc = TSDB_ERR_IO;
-        err = drop_test_intent_errno;
+        err = -inject;
         atomic_fetch_add(&drop_test_intent_fails, 1);
+    } else {
+        fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        rc = fd < 0 || write_all(fd, buf, len) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+        err = errno;
+        if (rc == 0 && inject > 0) {
+            rc = TSDB_ERR_IO;
+            err = inject;
+            atomic_fetch_add(&drop_test_intent_fails, 1);
+        }
+        if (fd >= 0 && close(fd) != 0 && rc == 0) { /* on NFS, close sends the data to the server */
+            rc = TSDB_ERR_IO;
+            err = errno;
+        }
     }
-    if (fd >= 0)
-        close(fd);
     free(buf);
-    if (rc) { /* nothing retired: the intent's name was not synced, and is gone now */
-        unlinkat(db->dirfd, intent, 0);
+    if (rc) { /* nothing retired: unlink the failed intent; on a non-fail-stop path a concurrent dir fsync may have
+               * persisted its directory entry after write_all, so sync the directory after unlinking it too */
+        if (fd >= 0)
+            unlinkat(db->dirfd, intent, 0);
         intent[0] = '\0';
-        if (fail_stop)
+        if (fail_stop) {
             eng_fail(db, "write of a drop's intent", err);
-        else
+        } else {
             fprintf(stderr, "tsdb: %s: write of a drop's intent: %s: nothing is dropped\n", db->dir, strerror(err));
+            if (fd >= 0 && !eng_check(db) && drop_test_mutant != DROP_MUT_NO_SYNC)
+                (void)eng_sync_dir(db, "fsync of the directory after unlinking a failed drop intent");
+        }
         return rc;
     }
+    if (drop_test_intent_hook)
+        drop_test_intent_hook(db);
     if (drop_test_mutant != DROP_MUT_NO_SYNC &&
         eng_sync_dir(db, "fsync of the directory after writing a drop's intent") != 0)
         return TSDB_ERR_IO; /* failed (fail-stop): the intent's name may be durable, the next open decides */
     return 0;
 }
 
-int drop_retire_parts_locked(eng *db, part **ps, size_t n, char intent[64], size_t *done, bool fail_stop)
+void drop_retire_prepared_locked(eng *db, part **ps, size_t n, char intent[64], size_t *done)
 {
-    intent[0] = '\0';
     *done = 0;
-    if (n == 0)
-        return 0;
-    if (eng_check(db))
-        return TSDB_ERR_IO;
-    int rc;
-    if (n > (drop_test_mutant == DROP_MUT_TWO ? 2u : 1u) && drop_test_mutant != DROP_MUT_NO_INTENT &&
-        (rc = drop_intent_write(db, ps, n, intent, fail_stop)) != 0)
-        return rc;
     for (size_t i = 0; i < n && !eng_check(db); i++) { /* a rename failed: the engine failed, the open finishes it */
         char name[sizeof ps[i]->name];
         snprintf(name, sizeof name, "%s", ps[i]->name); /* the list's reference goes in db_retire_locked */
@@ -1278,6 +1298,28 @@ int drop_retire_parts_locked(eng *db, part **ps, size_t n, char intent[64], size
         if (drop_test_hook)
             drop_test_hook(db, name, i);
     }
+}
+
+int drop_retire_parts_locked(eng *db, part **ps, size_t n, char intent[64], size_t *done, bool fail_stop)
+{
+    intent[0] = '\0';
+    *done = 0;
+    if (n == 0)
+        return 0;
+    if (eng_check(db))
+        return TSDB_ERR_IO;
+    if (drop_needs_intent(n)) {
+        char (*names)[sizeof ps[0]->name] = malloc(n * sizeof *names);
+        if (!names)
+            return TSDB_ERR_NOMEM;
+        for (size_t i = 0; i < n; i++)
+            snprintf(names[i], sizeof names[i], "%s", ps[i]->name);
+        int rc = drop_intent_prepare(db, names, n, intent, fail_stop);
+        free(names);
+        if (rc != 0)
+            return rc;
+    }
+    drop_retire_prepared_locked(db, ps, n, intent, done);
     return 0;
 }
 
@@ -1325,10 +1367,10 @@ static int drop_name_recover(eng *db, const char *file, const char *name, size_t
         return 0;
     }
     if (r == 0 && part_file_name(name) && drop_test_mutant != DROP_MUT_NO_SETTLED) {
+        size_t l = strlen(name) - (sizeof ".part" - 1);
+        snprintf(ec, sizeof ec, "%.*s.ec", (int)l, name);
         snprintf(settled, sizeof settled, "settled_%s", name);
-        if ((r = drop_name_at(db, settled)) == 1) {
-            size_t l = strlen(name) - (sizeof ".part" - 1);
-            snprintf(ec, sizeof ec, "%.*s.ec", (int)l, name);
+        if ((r = drop_name_at(db, settled)) == 1 || (r == 0 && (r = drop_name_at(db, ec)) == 1)) {
             fprintf(stderr, "tsdb: %s: drop intent %s: %s was settled: its .ec %s goes in its place\n", db->dir,
                     file, name, ec);
             return drop_name_recover(db, file, ec, cnt);

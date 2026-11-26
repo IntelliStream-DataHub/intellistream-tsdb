@@ -2252,6 +2252,142 @@ static int s_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsign
     return coldops_dir.obj_read(o, off, len, buf, flags, rep);
 }
 
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    eng *db;
+    part *sel[2];
+    bool in_swap;
+    bool release;
+    bool intent_early;
+    int intent_calls;
+    int reenc_rc;
+    int drop_rc;
+    size_t got;
+} rd_sync;
+
+static void reenc_drop_swap_hook(eng *db)
+{
+    (void)db;
+    pthread_mutex_lock(&rd_sync.mu);
+    rd_sync.in_swap = true;
+    pthread_cond_broadcast(&rd_sync.cv);
+    while (!rd_sync.release)
+        pthread_cond_wait(&rd_sync.cv, &rd_sync.mu);
+    pthread_mutex_unlock(&rd_sync.mu);
+}
+
+static void reenc_drop_intent_hook(eng *db)
+{
+    (void)db;
+    pthread_mutex_lock(&rd_sync.mu);
+    rd_sync.intent_calls++;
+    if (!rd_sync.release)
+        rd_sync.intent_early = true;
+    pthread_cond_broadcast(&rd_sync.cv);
+    pthread_mutex_unlock(&rd_sync.mu);
+}
+
+static void *reenc_drop_reenc_main(void *arg)
+{
+    (void)arg;
+    rd_sync.reenc_rc = eng_reencode(rd_sync.db, 0, rd_sync.sel, 2, &rd_sync.got);
+    return NULL;
+}
+
+static void *reenc_drop_drop_main(void *arg)
+{
+    (void)arg;
+    rd_sync.drop_rc = eng_drop_before(rd_sync.db, DAY);
+    return NULL;
+}
+
+static void reencode_drop_race_case(void)
+{
+    where w;
+    fresh("re-drop-race", &w);
+    tier_env(&w, QUIET_GRACE, 86400, 0);
+    atomic_store(&NOW, 1000);
+    eopts e = {.merge_threads = 0, .classes = 0, .lifetime_s = -1};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    uint32_t sd = 0;
+    CHECK(eng_series(d.db, "s", TSDB_FLOAT32, &sd) == 0);
+    /* Partition 0: [A.ec, B.part, C.part] (C overwrites A/B); partition 1: 1 .part kept across drop. */
+    write_rows(d.db, sd, 0, 2000, 1000, 1);
+    CHECK(eng_flush(d.db) == 0);
+    CHECK(settle_key(d.db, 0, NULL) == 0);
+    write_rows(d.db, sd, 500000, 2000, 1000, 2);
+    CHECK(eng_flush(d.db) == 0);
+    write_rows(d.db, sd, 0, 1500, 1000, 3);
+    CHECK(eng_flush(d.db) == 0);
+    write_rows(d.db, sd, DAY, 500, 1000, 9);
+    CHECK(eng_flush(d.db) == 0);
+
+    part *ps[8];
+    size_t np = key_parts(d.db, 0, ps, 8);
+    CHECK(np == 3);
+    if (np == 3) {
+        memset(&rd_sync, 0, sizeof rd_sync);
+        pthread_mutex_init(&rd_sync.mu, NULL);
+        pthread_cond_init(&rd_sync.cv, NULL);
+        rd_sync.db = d.db;
+        rd_sync.sel[0] = ps[0];
+        rd_sync.sel[1] = ps[1];
+
+        ec_swap_hook = reenc_drop_swap_hook;
+        drop_test_intent_hook = reenc_drop_intent_hook;
+        pthread_t th_re, th_dr;
+        CHECK(pthread_create(&th_re, NULL, reenc_drop_reenc_main, NULL) == 0);
+
+        /* Wait until eng_reencode has set p->reencoding and paused in ec_swap_hook. */
+        pthread_mutex_lock(&rd_sync.mu);
+        while (!rd_sync.in_swap)
+            pthread_cond_wait(&rd_sync.cv, &rd_sync.mu);
+        pthread_mutex_unlock(&rd_sync.mu);
+
+        /* Start eng_drop_before(DAY): drop_settle_locked must wait for p->reencoding instead of writing a drop
+         * intent while eng_reencode is in flight. */
+        CHECK(pthread_create(&th_dr, NULL, reenc_drop_drop_main, NULL) == 0);
+        bool saw_pending = false;
+        for (int i = 0; i < 500 && !saw_pending; i++) {
+            pthread_mutex_lock(&d.db->lock);
+            saw_pending = d.db->drop_pending;
+            pthread_mutex_unlock(&d.db->lock);
+            if (!saw_pending)
+                sleep_ms(10);
+        }
+        CHECK(saw_pending);
+        sleep_ms(60); /* without the fix, drop_intent_prepare runs immediately and sets intent_early */
+
+        pthread_mutex_lock(&rd_sync.mu);
+        rd_sync.release = true;
+        pthread_cond_broadcast(&rd_sync.cv);
+        pthread_mutex_unlock(&rd_sync.mu);
+
+        pthread_join(th_re, NULL);
+        pthread_join(th_dr, NULL);
+        ec_swap_hook = NULL;
+        drop_test_intent_hook = NULL;
+        pthread_cond_destroy(&rd_sync.cv);
+        pthread_mutex_destroy(&rd_sync.mu);
+
+        if (rd_sync.intent_early)
+            fprintf(stderr, "REENCODE DROP RACE: drop_intent_prepare ran while p->reencoding was active!\n");
+        CHECK(!rd_sync.intent_early && rd_sync.intent_calls == 1);
+        CHECK(rd_sync.reenc_rc == 0 && rd_sync.got == 2 && rd_sync.drop_rc == 0);
+        size_t a0 = 0, e0 = 0, a1 = 0, e1 = 0;
+        key_count(d.db, 0, &a0, &e0);
+        key_count(d.db, 1, &a1, &e1);
+        CHECK(a0 == 0 && e0 == 0 && a1 == 1 && e1 == 0);
+        CHECK(digest(d.db, "s").n == 500);
+    }
+    unref_all(ps, np);
+    CHECK(t_close(&d) == 0);
+}
+
 /* child for reencode crash points & crashfs power loss */
 static int child_reencode(const char *root)
 {
@@ -2821,6 +2957,11 @@ static void reencode_case(void)
             CHECK(finished && crashes > 20 && back > 0 && fwd > 0);
         }
     }
+    /* 9. Concurrent eng_reencode + eng_drop_before: drop_settle_locked must wait for p->reencoding before unlocked
+     * drop intent preparation so a drop intent and a re-encode intent never overlap on disk. */
+    if (!strcmp(mutant, "none"))
+        reencode_drop_race_case();
+
     printf("  reencode: multi-object E6 (>4 + eckeep pending + gc), tombstone-heavy (>10%% & 100%% empty .part), "
            "hidden-row tombstone & ranking, max_part_bytes cap, DOWN/CORRUPT without damaged/merge_fail_seq + backoff, "
            "backpressure, eager, crash points & power loss\n");

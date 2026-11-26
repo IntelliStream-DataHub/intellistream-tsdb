@@ -1070,12 +1070,17 @@ int intents_recover(struct eng *db);
 /* tests/test_intents.c: UNLINK_FIRST unlinks a rolled-forward intent before its renames are synced (the old order) */
 enum { INTENTS_MUT_NONE = 0, INTENTS_MUT_UNLINK_FIRST };
 extern int intents_test_mutant;
-/* A drop's parts (listed, in block order) retired as one step through a drop intent (part.c, "atomic drops"); caller
- * holds db->lock (and the latest table's write section where it folds the drop). 0 with *done renamed (a rename that
- * failed the engine stops there; the open finishes them) and `intent` the file to unlink with drop_intent_done after
- * the caller's directory fsync ("" when none was written: one part, or a failed engine); an error with nothing
+/* A drop's parts (listed, in block order) retired as one step through a drop intent (part.c, "atomic drops").
+ * drop_retire prepares the intent (write, fdatasync and pre-rename directory fsync) outside latest_rw and db->lock
+ * with drop_intent_prepare, then validates the part list and calls drop_retire_prepared_locked under those locks;
+ * drop_retire_parts_locked runs both together for callers that already hold db->lock. 0 with *done renamed (a rename
+ * that failed the engine stops there; the open finishes them) and `intent` the file to unlink with drop_intent_done
+ * after the caller's directory fsync ("" when none was written: one part, or a failed engine); an error with nothing
  * retired. `fail_stop`: a failed write of the intent fails the engine (drop_marker_logged: a DROP marker the replicas
  * carry out is already in the log); else it fails just the call. */
+bool drop_needs_intent(size_t n);
+int drop_intent_prepare(struct eng *db, char (*const names)[96], size_t n, char intent[64], bool fail_stop);
+void drop_retire_prepared_locked(struct eng *db, struct part **ps, size_t n, char intent[64], size_t *done);
 int drop_retire_parts_locked(struct eng *db, struct part **ps, size_t n, char intent[64], size_t *done,
                              bool fail_stop);
 void drop_intent_done(struct eng *db, const char *intent);
@@ -1091,6 +1096,7 @@ extern _Atomic bool drop_test_marker;
 extern const char *drop_test_eio_name;
 extern _Atomic int drop_test_intent_fails; /* how often drop_test_intent_errno failed a write */
 extern void (*drop_test_hook)(struct eng *db, const char *name, size_t at); /* after each rename of a drop */
+extern void (*drop_test_intent_hook)(struct eng *db); /* inside drop_intent_prepare, between fdatasync and dir fsync */
 /* tests/test_drops.c: the retention drop's renames are done, the directory fsync after them is next */
 extern void (*drop_test_presync)(struct eng *db);
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
@@ -1996,8 +2002,11 @@ struct eng {
     atomic_uint_fast64_t ret_len_gen; /* bumped (db->lock) when a change lowers a series' cutoff: a merge that spans one
                                        * lists across it in a latest_rw section, marking its entries (merge_commit_locked) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
-    bool drop_pending;               /* eng_drop_before is waiting for merges, then retiring (under lock) */
-    int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge of one is selected */
+    bool drop_pending;               /* eng_drop_before is waiting for merges/re-encodes, then retiring (under lock) */
+    bool drop_settled;               /* drop_settle_locked done: standalone publishers of <= drop_pending_end wait */
+    int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge/re-encode is selected */
+    bool pub_active;                 /* a standalone publisher is between parts_commit and listing (under lock) */
+    int64_t pub_min_end;             /* ...minimum partition end of its parts (INT64_MAX when none) */
     sched *sched;
     bool own_sched; /* opened alone (eng_open), not by a tsdb that shares its scheduler */
 
@@ -2291,6 +2300,11 @@ int partition_class(const struct eng *db, int64_t key);
  * MANIFEST. Cannot fail: once listed, the parts are published and must not
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
+/* Standalone publisher gate against unlocked drop intent I/O (db.c): called under publish_lock before parts_commit
+ * (never holding latest_rw) and ended under db->lock when listed (or via db_pub_end on error). */
+void db_pub_begin(struct eng *db, part **ps, size_t n);
+void db_pub_end_locked(struct eng *db);
+void db_pub_end(struct eng *db);
 void db_wait_merges(struct eng *db, int64_t partition);
 void db_stall_clear_locked(struct eng *db, int64_t partition); /* a merge of the partition committed */
 /* How long (ms) db_wait_merges lets a partition's part count stand while no merge of it runs, before an insert goes on;

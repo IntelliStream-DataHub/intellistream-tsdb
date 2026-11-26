@@ -1657,11 +1657,14 @@ int flush_waiting(eng *db)
         struct cls_wtail *wt = rc == 0 && db->cls_on ? cls_wal_tail_new(m) : NULL;
         if (rc == 0) {
             pthread_mutex_lock(&db->publish_lock); /* numbered, named and listed in one step */
+            db_pub_begin(db, pl.p, pl.n);
             rc = parts_commit(db, pl.p, pl.n);
-            if (rc)
+            if (rc) {
+                db_pub_end(db);
                 pthread_mutex_unlock(&db->publish_lock);
-            else
+            } else {
                 jr_commit(db, JR_FLUSHED, &pl);
+            }
         }
         if (db->ppos)
             ppos_flush_end(db, m);
@@ -1678,6 +1681,7 @@ int flush_waiting(eng *db)
         pthread_mutex_lock(&db->lock);
         for (size_t k = 0; k < pl.n; k++)
             db_parts_insert_locked(db, pl.p[k]);
+        db_pub_end_locked(db);
         memmove(db->flushing + i, db->flushing + i + 1, (db->nflushing - i - 1) * sizeof *db->flushing);
         db->nflushing--;
         db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
