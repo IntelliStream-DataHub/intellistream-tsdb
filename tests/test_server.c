@@ -4442,10 +4442,20 @@ int main(int argc, char **argv)
 #endif
     printf("small writes waiting for a large write leave workers for queries\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-fence-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+#ifdef TSDB_TEST_HOOKS
     test_fence_workers(dir);
+#else
+    printf("  (skipped: built without TSDB_TEST_HOOKS)\n");
+    (void)test_fence_workers;
+#endif
     printf("an error after rows: the error's frame carries none\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-ear-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+#ifdef TSDB_TEST_HOOKS
     test_error_after_rows(dir);
+#else
+    printf("  (skipped: built without TSDB_TEST_HOOKS)\n");
+    (void)test_error_after_rows;
+#endif
     printf("prometheus metrics\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_metrics(dir);

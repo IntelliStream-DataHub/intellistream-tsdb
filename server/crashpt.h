@@ -54,6 +54,7 @@ enum crash_point_id {
     CRASH_POINT_COUNT
 };
 
+#ifdef TSDB_TEST_HOOKS
 extern const char *const crash_point_names[CRASH_POINT_COUNT];
 /* -1: the environment is not read yet, 0: nothing armed, 1: a point is armed */
 extern _Atomic int crashpt_state;
@@ -65,5 +66,8 @@ static inline void crash_point(enum crash_point_id id)
     if (__builtin_expect(atomic_load_explicit(&crashpt_state, memory_order_relaxed) != 0, 0))
         crashpt_slow(id);
 }
+#else
+static inline void crash_point(enum crash_point_id id) { (void)id; }
+#endif
 
 #endif

@@ -91,6 +91,7 @@ int eccold_mutant_parse(const char *name)
     return -1;
 }
 
+#ifdef TSDB_TEST_HOOKS
 static pthread_once_t mut_once = PTHREAD_ONCE_INIT;
 static void mut_env(void)
 {
@@ -104,6 +105,9 @@ void eccold_mutant_init(void)
 {
     pthread_once(&mut_once, mut_env);
 }
+#else
+void eccold_mutant_init(void) {}
+#endif
 
 void eccold_test_last(eccold_cut *out)
 {

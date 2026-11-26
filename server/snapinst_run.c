@@ -78,6 +78,7 @@ static int repl_read(const char *vdir, struct replfile_state *st)
     return rc == 0 ? 1 : rc;
 }
 
+#ifdef TSDB_TEST_HOOKS
 /* the whole of a small file (DIVERGED), malloc'd; NULL when missing */
 static uint8_t *file_read(const char *path, size_t *n)
 {
@@ -102,6 +103,7 @@ static uint8_t *file_read(const char *path, size_t *n)
     fclose(f);
     return b;
 }
+#endif
 
 struct inst {
     const char *root, *staged;
@@ -153,21 +155,26 @@ static int inst_body(struct inst *in, const struct snap_ident *id, int had_engin
         in->out->stale = 1;
         return 1;
     }
+#ifdef TSDB_TEST_HOOKS
     size_t divn = 0;
     uint8_t *div = NULL;
     char divp[PATH_MAX + 16];
     snprintf(divp, sizeof divp, "%s/DIVERGED", vdir);
     if (G.mutant == RM_SNAPKEEPDIVERGED)
         div = file_read(divp, &divn);
+#endif
     __atomic_store_n(&snap_inst_hook, inst_hook, __ATOMIC_RELEASE);
     int rc = snap_install(in->root, in->number, in->staged, id, have ? &keep : NULL);
     replfile_state_free(&keep);
     if (rc != 0) {
         say("volume %" PRIu32 ": the install of %s failed: %s (%s)", in->number, in->staged, tsdb_strerror(rc),
             had_engine ? "its engine was open" : "no engine was open");
+#ifdef TSDB_TEST_HOOKS
         free(div);
+#endif
         return rc;
     }
+#ifdef TSDB_TEST_HOOKS
     if (div && divn) { /* planted: the diverged copy's flag carried into the fresh one */
         FILE *f = fopen(divp, "wb");
         if (f) {
@@ -179,6 +186,7 @@ static int inst_body(struct inst *in, const struct snap_ident *id, int had_engin
         }
     }
     free(div);
+#endif
     struct replfile_state st = {0};
     int dfd = open(vdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     struct replfile *rf = NULL;
@@ -226,6 +234,7 @@ int snapinst_install(const char *root, uint32_t number, const char *staged, uint
 {
     memset(out, 0, sizeof *out);
     struct inst in = {.root = root, .staged = staged, .number = number, .p = p, .p_epoch = p_epoch, .out = out};
+#ifdef TSDB_TEST_HOOKS
     if (G.mutant == RM_SNAPSTALEKEEP) { /* planted: keep read while the driver may still save REPL */
         char vdir[PATH_MAX];
         snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, number);
@@ -245,6 +254,7 @@ int snapinst_install(const char *root, uint32_t number, const char *staged, uint
     }
     if (power_at == 0)
         inst_hook(0);
+#endif
     int rc = cvol_install(number, inst_fn, &in);
     if (in.have_pre > 0)
         replfile_state_free(&in.pre);

@@ -188,6 +188,7 @@ static void *src_main(void *arg)
 
 int chunkpeer_cluster_start(const char *stage_dir)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *th = getenv("TSDB_CHUNKPEER_TEST");
     if (th && !strncmp(th, "holdput=", 8)) {
         hold_hook_ms = atoi(th + 8);
@@ -205,6 +206,7 @@ int chunkpeer_cluster_start(const char *stage_dir)
         chunkpeer_mutant = k;
         fprintf(stderr, "tsdbd: chunkpeer MUTANT %s (tests only)\n", mu);
     }
+#endif
     G.net = (struct chunkpeer_net){.call = net_call, .put = net_put, .arg = &G};
     G.view = view;
     G.view_arg = &G;

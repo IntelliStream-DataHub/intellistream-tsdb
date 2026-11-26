@@ -354,8 +354,12 @@ static bool user_same(const user *a, const user *b)
  * failure is safe. TSDB_AUTH_MUTANT=importmerge (tests only): differing users go in from the first file. */
 static int uimport(struct uctx *x, char **dirs, int nd, const char *from, uint32_t wait_ms)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *m = getenv("TSDB_AUTH_MUTANT");
     bool merge = m && !strcmp(m, "importmerge");
+#else
+    bool merge = false;
+#endif
     users *us = calloc((size_t)nd, sizeof *us);
     int fi = -1, ret = 0;
     if (!us)

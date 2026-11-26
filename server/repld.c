@@ -2492,6 +2492,7 @@ static int links_up(const struct cluster_vol_rec *r)
     pthread_mutex_unlock(&G.mu);
     return 0;
 }
+#ifdef TSDB_TEST_HOOKS
 /* a leader's settle (src/eccold.c): its MK_COLD marker appended and synced, its commit point not yet come */
 static void cold_marker_crash(struct eng *db, uint64_t pos)
 {
@@ -2507,9 +2508,14 @@ static void cold_apply_crash(struct eng *db, int which)
     (void)db;
     crash_point(which == ECAPPLY_CRASH_BEFORE_APPLY ? CP_COLD_BEFORE_APPLY : CP_COLD_MID_INTENT);
 }
+#endif
 
 void repld_init(tsdb *t, const char *dir)
 {
+    G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
+    G.inbox_bytes = INBOX_BYTES;
+    G.spill_bytes = SPILL_BYTES;
+#ifdef TSDB_TEST_HOOKS
     const char *mu = getenv("TSDB_REPLD_MUTANT");
     if (mu && !strcmp(mu, "replicadropsfloor")) /* the engine's mutant (src/replica.c), planted in tsdbd */
         tsdb_test_replica_drops_floor();
@@ -2613,7 +2619,6 @@ void repld_init(tsdb *t, const char *dir)
     G.set_stale = te && strstr(te, "setstale");
     G.keep_all = te && strstr(te, "keepall");
     G.set_drain_wait = te && strstr(te, "setdrainwait");
-    G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.late_wal = te && strstr(te, "latewal");
     G.late_bytes = te && strstr(te, "latebytes");
     G.no_clock = te && strstr(te, "noclock");
@@ -2641,7 +2646,8 @@ void repld_init(tsdb *t, const char *dir)
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */
         leader_test_marker_hook = eccold_after_append;
-    G.inbox_bytes = te && strstr(te, "smallinbox") ? 256u << 10 : INBOX_BYTES;
+    if (te && strstr(te, "smallinbox"))
+        G.inbox_bytes = 256u << 10;
     if (G.mutant == RM_NOINBOXBOUND)
         G.inbox_bytes = SIZE_MAX;
     G.stall_inbox = te && strstr(te, "stallinbox");
@@ -2654,9 +2660,11 @@ void repld_init(tsdb *t, const char *dir)
     G.late_tick = te && strstr(te, "latetick");
     G.slow_ack = te && strstr(te, "slowack");
     G.drain_hold = te && strstr(te, "drainhold");
-    G.spill_bytes = te && strstr(te, "spill") ? 64u << 10 : SPILL_BYTES;
+    if (te && strstr(te, "spill"))
+        G.spill_bytes = 64u << 10;
     if (G.mutant == RM_NOSPILL)
         G.spill_bytes = UINT64_MAX;
+#endif
     G.t = t;
     snprintf(G.dir, sizeof G.dir, "%s", dir);
 }

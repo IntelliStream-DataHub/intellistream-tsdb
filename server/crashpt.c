@@ -2,6 +2,7 @@
 /* Crash points: see crashpt.h. */
 #include "crashpt.h"
 
+#ifdef TSDB_TEST_HOOKS
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -113,3 +114,6 @@ void crashpt_slow(enum crash_point_id id)
         (void)!write(2, line, (size_t)len);
     power_cut_exit();
 }
+#else
+typedef int crashpt_disabled_t;
+#endif

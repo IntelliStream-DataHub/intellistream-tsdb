@@ -99,6 +99,7 @@ void (*ecswap_intent_fail_hook)(eng *db);
 /* ------------------------------------------------------------ crash points */
 
 enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+#ifdef TSDB_TEST_HOOKS
 static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
                                            "after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
@@ -153,7 +154,14 @@ static void sm_read(void)
     ecswap_mutant = SWAP_MUT_EARLY;
 }
 
+static inline void sm_init(void) { pthread_once(&sm_once, sm_read); }
+
 void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
+#else
+static inline void settle_crash(int point) { (void)point; }
+static inline void sm_init(void) {}
+void ecswap_crash_point(int which) { (void)which; }
+#endif
 
 /* ------------------------------------------------------------ names */
 
@@ -322,7 +330,7 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
-    pthread_once(&sm_once, sm_read);
+    sm_init();
     if (n == 0)
         return 0;
     if (db->opt.read_only || db->opt.follow)
@@ -575,7 +583,7 @@ static bool swap_renames_reencode(eng *db, part **in, size_t nin, part *out)
 
 int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
 {
-    pthread_once(&sm_once, sm_read);
+    sm_init();
     if (db->opt.read_only || db->opt.follow)
         return TSDB_ERR_READONLY;
     if (!reencode_args_valid(in, nin, out))

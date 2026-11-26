@@ -43,6 +43,17 @@ CFLAGS  ?= -O3 -g
 # level of `make dist` in use (src/levels.h).
 override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) -Iinclude -fPIC
 override CFLAGS += $(PLAT_CFLAGS)
+# Fault-injection, mutant, crash-point and test-only env hooks (TSDB_TEST_HOOKS): on by default for dev/test builds
+# so unit, integration, mutant and Jepsen suites work unchanged; off in release builds (TSDB_TEST_HOOKS=0, RELEASE=1,
+# and `make dist`).
+ifeq ($(RELEASE),1)
+TSDB_TEST_HOOKS ?= 0
+else
+TSDB_TEST_HOOKS ?= 1
+endif
+ifeq ($(TSDB_TEST_HOOKS),1)
+override CFLAGS += -DTSDB_TEST_HOOKS
+endif
 # `make dist` links these statically (-l:libzstd.a); glibc stays dynamic.
 ZSTD_LIB  ?= -lzstd
 URING_LIB ?= -luring
@@ -816,7 +827,8 @@ DIST_B     ?= build-dist
 DIST_ARCH  ?= -march=x86-64-v2 -mtune=generic
 GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
-              CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
+              CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc \
+              TSDB_TEST_HOOKS=0
 DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench fold-bench tsdb-bench insert-bench tsdbc-bench scale-bench
 DIST_TESTS  = test_tsdb test_types test_levels test_rs test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
@@ -840,6 +852,7 @@ dist:
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
 	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(DIST_B)/tsdbd
+	tools/check-release-hooks.sh $(DIST_B)/tsdbd $(DIST_B)/tsdb $(DIST_B)/libtsdb.$(SOEXT) $(DIST_B)/libtsdb.a $(DIST_B)/libtsdbclient.a
 	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
 # The tarball's own test suite on this machine, every CPU level included.
@@ -2213,9 +2226,14 @@ test: test-mutants-helper
 test-mutants-helper:
 	tests/test_mutants_helper.sh
 
+# Release binaries built with TSDB_TEST_HOOKS=0 must compile cleanly and carry no auth-bypass/mutant/crash env hooks.
+test: test-release-hooks
+test-release-hooks: $(B)/tsdbd $(B)/tsdb
+	B=$(B) CC="$(CC)" NO_URING="$(NO_URING)" NO_EC="$(NO_EC)" NO_RDMA="$(NO_RDMA)" PORTABLE="$(PORTABLE)" tests/test_release_hooks.sh
+
 # every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
 test: check-ci-groups
 check-ci-groups:
 	tests/check_ci_groups.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper tsan-par
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par

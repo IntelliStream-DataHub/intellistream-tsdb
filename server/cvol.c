@@ -446,12 +446,14 @@ int cvol_start(tsdb *t, const char *dir)
     M.t = t;
     snprintf(M.dir, sizeof M.dir, "%s", dir);
     repld_init(t, dir);
+    while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
+        ;
+    M.unreach_ms = UNREACH_MS;
+#ifdef TSDB_TEST_HOOKS
     const char *w = getenv("TSDB_CLUSTER_WRITES");
     M.writes = w && !strcmp(w, "1");
     const char *rr = getenv("TSDB_REPLICA_READS");
     M.replica_reads = rr && !strcmp(rr, "1");
-    while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
-        ;
     const char *rmu = getenv("TSDB_REPLD_MUTANT");
     M.divergeisr = rmu && !strcmp(rmu, "divergeisr");
     M.servebeforeopen = rmu && !strcmp(rmu, "snapservebeforeopen");
@@ -477,7 +479,6 @@ int cvol_start(tsdb *t, const char *dir)
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");
     const char *cv = getenv("TSDB_CVOL_TEST");
-    M.unreach_ms = UNREACH_MS;
     if (cv && sscanf(cv, "unreach_ms=%u", &M.unreach_ms) == 1)
         say("TSDB_CVOL_TEST: a peer is reported unreachable after %u ms (tests only)", M.unreach_ms);
     if (M.writes)
@@ -486,6 +487,7 @@ int cvol_start(tsdb *t, const char *dir)
         say("TSDB_REPLICA_READS=1: a replica holding a read lease answers reads, which may be stale (tests only)");
     if (M.mutant || cvolfs_test_mutant)
         say("MUTANT %s (tests only)", mu);
+#endif
     if (pthread_create(&M.th, NULL, mgr_main, NULL) != 0) {
         say("cannot start the volume manager thread");
         return -1;
