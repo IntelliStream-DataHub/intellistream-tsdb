@@ -19,6 +19,7 @@
  *   test_tenants --map-bench N [scratch dir]   the tenant map's memory with N series created across tenants
  */
 #include "internal.h"
+#include "stats_priv.h"
 #include "tsdb.h"
 
 #include <dirent.h>
@@ -1075,6 +1076,77 @@ static void map_bench(const char *base, size_t n)
     }
 }
 
+/* P-42: hotl_add_batch must produce bit-for-bit identical space-saving state to single hotl_add,
+ * including zero-weight entries, all-zero chunks (no epoch roll), evictions past SS_K, and epoch jumps. */
+static void check_hotl_equal(const hotl *a, const hotl *b)
+{
+    CHECK(a->epoch == b->epoch);
+    CHECK(a->cur == b->cur);
+    for (int w = 0; w < 2; w++) {
+        CHECK(a->w[w].n == b->w[w].n);
+        for (uint32_t i = 0; i < a->w[w].n && i < SS_K; i++) {
+            CHECK(a->w[w].e[i].id == b->w[w].e[i].id);
+            CHECK(a->w[w].e[i].est == b->w[w].e[i].est);
+            CHECK(a->w[w].e[i].err == b->w[w].e[i].err);
+        }
+    }
+}
+
+static void test_hotl_batch_parity(void)
+{
+    hotl *a = hotl_new(), *b = hotl_new();
+    CHECK(a != NULL && b != NULL);
+    enum { N = 6000 };
+    uint32_t *ids = malloc(N * sizeof *ids);
+    uint64_t *ws = malloc(N * sizeof *ws);
+    CHECK(ids != NULL && ws != NULL);
+    uint64_t rng = 0x123456789abcdef0ull;
+    for (size_t i = 0; i < N; i++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        ids[i] = (uint32_t)((rng >> 32) % 1000); /* > SS_K=256 to exercise evictions */
+        ws[i] = (i % 7 == 0) ? 0 : (1 + ((rng >> 16) % 50));
+    }
+
+    /* Phase 1: epoch 100 in varied chunk sizes (0, 1, 7, 128, 4096). */
+    const size_t chunks[] = {0, 1, 7, 128, 4096, 1768};
+    size_t off = 0;
+    for (size_t c = 0; c < sizeof chunks / sizeof chunks[0]; c++) {
+        size_t len = chunks[c];
+        for (size_t i = 0; i < len; i++)
+            if (ws[off + i])
+                hotl_add(a, 100, ids[off + i], ws[off + i]);
+        hotl_add_batch(b, 100, ids + off, ws + off, len);
+        off += len;
+        check_hotl_equal(a, b);
+    }
+
+    /* Phase 2: all-zero chunk at epoch 101 must NOT roll either list. */
+    uint32_t zids[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint64_t zws[8] = {0};
+    hotl_add_batch(b, 101, zids, zws, 8);
+    CHECK(b->epoch == 100);
+    check_hotl_equal(a, b);
+
+    /* Phase 3: epoch + 1 roll (101) swaps current/previous window cleanly. */
+    for (size_t i = 0; i < 500; i++)
+        if (ws[i])
+            hotl_add(a, 101, ids[i], ws[i]);
+    hotl_add_batch(b, 101, ids, ws, 500);
+    check_hotl_equal(a, b);
+
+    /* Phase 4: epoch jump (110) clears both windows identically. */
+    for (size_t i = 500; i < 1000; i++)
+        if (ws[i])
+            hotl_add(a, 110, ids[i], ws[i]);
+    hotl_add_batch(b, 110, ids + 500, ws + 500, 500);
+    check_hotl_equal(a, b);
+
+    free(ids);
+    free(ws);
+    hotl_free(a);
+    hotl_free(b);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_tenants", 1200);
@@ -1096,6 +1168,7 @@ int main(int argc, char **argv)
     test_ingest(base);
     test_hll(base);
     test_hot(base);
+    test_hotl_batch_parity();
     int residency_skipped = residency_with_fallback(base);
     test_lazy_and_races(base);
     test_set_races(base);

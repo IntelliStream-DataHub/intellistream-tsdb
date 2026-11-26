@@ -147,7 +147,7 @@ void ecpolicy_reencoded(eng *db, int64_t now_ms)
 static bool settleable(const part *p)
 {
     return !p->merging && !p->settling && !p->dropped && !part_is_ec(p) && !atomic_load(&p->damaged) && p->ng > 0 &&
-           p->hdr_len == sizeof(part_header) && !p->pending[0];
+           p->hdr_len == sizeof(part_header) && !p->pending;
 }
 
 /* A cluster leader's settle (R8, D21; eccold.c). Whether some row of parts[a, b) expires within margin of now (MK_NOW's
@@ -340,7 +340,7 @@ static bool reencodeable(const part *p)
     struct ecpart *ep = atomic_load_explicit(&((part *)p)->ec, memory_order_acquire);
     if (ep && ep->test_mark)
         return false;
-    return !p->merging && !p->settling && !p->dropped && !atomic_load(&p->damaged) && !p->pending[0] &&
+    return !p->merging && !p->settling && !p->dropped && !atomic_load(&p->damaged) && !p->pending &&
            (ep != NULL || p->hdr_len == sizeof(part_header));
 }
 

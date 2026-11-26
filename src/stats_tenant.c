@@ -1423,9 +1423,7 @@ void tenants_ingest(struct estats *es, part *p, const prec *r)
                 hll_add(&es->hll[t], hour, x->rser[k]);
         }
         pthread_mutex_unlock(&es->mu);
-        for (uint32_t k = k0; k < k1; k++)
-            if (es->runcnt[k])
-                hotl_add(es->hw, epoch, x->rser[k], es->runcnt[k]);
+        hotl_add_batch(es->hw, epoch, x->rser + k0, es->runcnt + k0, k1 - k0);
     }
 }
 

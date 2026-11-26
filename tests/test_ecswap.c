@@ -193,7 +193,7 @@ static part *make_ec(eng *db, part *p)
         return NULL;
     e->verify = p->verify;
     snprintf(e->name, sizeof e->name, "%.*s.ec", (int)(strlen(p->name) - 5), p->name);
-    snprintf(e->pending, sizeof e->pending, "%s", tmp);
+    CHECK(part_set_pending(e, tmp) == 0);
     struct ecpart *ep = calloc(1, sizeof *ep);
     CHECK(ep != NULL);
     ep->test_mark = true;
@@ -372,7 +372,7 @@ static void basic_case(void)
         part *p = db->parts[i];
         CHECK((p->partition == 2) == (p->ec != NULL));
         CHECK(i == 0 || db->parts[i - 1]->partition <= p->partition);
-        CHECK(!p->pending[0]);
+        CHECK(p->pending == NULL);
     }
     pthread_mutex_unlock(&db->lock);
     CHECK(!db->lt || lgen_of(db) > g0);
@@ -1075,7 +1075,7 @@ static part *make_reencode_ec(eng *db, part **in, size_t nin)
     char base[96];
     snprintf(base, sizeof base, "%s", e->name);
     snprintf(e->name, sizeof e->name, "%.*s.ec", (int)(strlen(base) - 5), base);
-    snprintf(e->pending, sizeof e->pending, "%s", tmp);
+    CHECK(part_set_pending(e, tmp) == 0);
     struct ecpart *ep = calloc(1, sizeof *ep);
     CHECK(ep != NULL);
     ep->test_mark = true;

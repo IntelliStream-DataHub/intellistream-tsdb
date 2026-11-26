@@ -376,6 +376,8 @@ int part_walk(struct estats *es, const part *p, prec *r, unsigned flags)
         es->runcnt = v;
         es->runcnt_cap = x->nruns;
     }
+    bpr_ent bpr_buf[256];
+    size_t nbpr = 0;
     for (uint32_t k = 0; k < x->nruns; k++) {
         uint32_t a = gix_rstart(x, k), b = k + 1 < x->nruns ? gix_rstart(x, k + 1) : x->n;
         if (b < a)
@@ -401,9 +403,16 @@ int part_walk(struct estats *es, const part *p, prec *r, unsigned flags)
             es->runcnt[k] = cnt;
         if (flags & WALK_SPLIT)
             tenant_walk_run(es, x->rser[k], cnt, nulls, logical, ts, val, (uint64_t)(b - a) * x->stride + 8, b - a);
-        if ((flags & WALK_BPR) && p->level > 0 && full && cnt) /* merges' output: where compression shows */
-            hot_bpr_run(es, x->rser[k], cnt, ts + val, true);
+        if ((flags & WALK_BPR) && p->level > 0 && full && cnt) { /* merges' output: where compression shows */
+            bpr_buf[nbpr++] = (bpr_ent){x->rser[k], (ts + val) * 1000 / cnt};
+            if (nbpr == sizeof bpr_buf / sizeof bpr_buf[0]) {
+                hot_bpr_batch(es, bpr_buf, nbpr);
+                nbpr = 0;
+            }
+        }
     }
+    if (nbpr)
+        hot_bpr_batch(es, bpr_buf, nbpr);
     r->index_bytes = (uint64_t)x->n * x->stride + 8ull * x->nruns;
     uint64_t used = r->ts_bytes + r->val_bytes + r->index_bytes; /* the tombstones are in "other": a part's four columns
                                                                     * add up to its file */

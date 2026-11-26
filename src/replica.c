@@ -1492,10 +1492,13 @@ static void prep_discard(eng *db, part **ps, size_t n)
 {
     for (size_t i = 0; i < n; i++)
         if (ps[i]) {
-            char tp[sizeof ps[i]->pending];
-            snprintf(tp, sizeof tp, "%s", ps[i]->pending);
+            char *tp = ps[i]->pending;
+            ps[i]->pending = NULL;
             part_unref(ps[i]);
-            unlinkat(db->dirfd, tp, 0);
+            if (tp) {
+                unlinkat(db->dirfd, tp, 0);
+                free(tp);
+            }
         }
 }
 
@@ -1543,7 +1546,11 @@ static int commit_prepare(eng *db, struct replica *rp, const wal_rec *wr, const 
             unlinkat(db->dirfd, tp, 0);
             break;
         }
-        snprintf(p->pending, sizeof p->pending, "%s", tp);
+        if ((rc = part_set_pending(p, tp)) != 0) {
+            part_unref(p);
+            unlinkat(db->dirfd, tp, 0);
+            break;
+        }
         ps[i] = p;
         mk_file mf;
         size_t pos = 0;
@@ -3266,7 +3273,7 @@ static int leader_commit(eng *db, const struct jr_commit_arg *ja)
     int rc = 0;
     for (size_t i = 0; i < ja->n && rc == 0; i++) {
         part *p = ja->ps[i];
-        if (!p->pending[0] || !p->map) {
+        if (!p->pending || !p->map) {
             rc = TSDB_ERR_INVALID; /* not a pending part */
             break;
         }

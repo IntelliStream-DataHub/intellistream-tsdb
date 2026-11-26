@@ -203,26 +203,72 @@ void db_parts_insert_locked(eng *db, part *p)
     stats_ev_add(db, p); /* statistics: two stores under the lock this holds; never more than this on the write path */
 }
 
+/* Half-open range [lo, hi) of parts in `partition` within sorted db->parts (db->lock held). */
+static void db_partition_bounds_locked(const eng *db, int64_t partition, size_t *lo_out, size_t *hi_out)
+{
+    size_t lo = 0, hi = db->nparts;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->parts[mid]->partition < partition)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    size_t start = lo;
+    hi = db->nparts;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->parts[mid]->partition <= partition)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    *lo_out = start;
+    *hi_out = lo;
+}
+
 /* Removes p from the list and drops the list's reference. */
 void db_parts_remove_locked(eng *db, part *p)
 {
-    for (size_t i = 0; i < db->nparts; i++) {
+    size_t lo = 0, hi = db->nparts;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (part_cmp(db->parts[mid], p) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    size_t idx = db->nparts;
+    for (size_t i = lo; i < db->nparts && part_cmp(db->parts[i], p) == 0; i++) {
         if (db->parts[i] == p) {
-            memmove(db->parts + i, db->parts + i + 1, (db->nparts - i - 1) * sizeof *db->parts);
-            db->nparts--;
-            stats_ev_remove(db, p);
-            part_unref(p);
-            return;
+            idx = i;
+            break;
         }
+    }
+    if (idx == db->nparts) {
+        /* Fallback when a test/mutant (e.g. SETTLE_MUT_RANKDOWN) mutated block numbers in place. */
+        size_t plo, phi;
+        db_partition_bounds_locked(db, p->partition, &plo, &phi);
+        for (size_t i = plo; i < phi; i++) {
+            if (db->parts[i] == p) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx < db->nparts) {
+        memmove(db->parts + idx, db->parts + idx + 1, (db->nparts - idx - 1) * sizeof *db->parts);
+        db->nparts--;
+        stats_ev_remove(db, p);
+        part_unref(p);
     }
 }
 
 size_t partition_part_count_locked(eng *db, int64_t partition)
 {
-    size_t n = 0;
-    for (size_t i = 0; i < db->nparts; i++)
-        n += db->parts[i]->partition == partition;
-    return n;
+    size_t lo, hi;
+    db_partition_bounds_locked(db, partition, &lo, &hi);
+    return hi - lo;
 }
 
 /* Standalone publishers (parts_publish, flush_waiting, eng_replace_range) call this under publish_lock, before
@@ -366,10 +412,10 @@ void db_wait_merges(eng *db, int64_t partition)
         size_t n = 0;
         bool merging = false, failed = false, pairs = false, prev_ok = false, settling = false, reencoding = false;
         part *bad = NULL;
-        for (size_t i = 0; i < db->nparts; i++) {
+        size_t lo, hi;
+        db_partition_bounds_locked(db, partition, &lo, &hi);
+        for (size_t i = lo; i < hi; i++) {
             part *p = db->parts[i];
-            if (p->partition != partition)
-                continue;
             if (!part_is_ec(p) || ecskip_mutant == ECSKIP_MUT_WAITCOUNTEC)
                 n++;
             merging |= p->merging || p->reencoding;

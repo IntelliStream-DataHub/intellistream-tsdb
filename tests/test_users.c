@@ -2146,6 +2146,8 @@ int main(int argc, char **argv)
     snprintf(cli, sizeof cli, "%s/tsdb", self);
     snprintf(shim, sizeof shim, "%s/libcrashfs.so", self);
     printf("test_users\n");
+    _Static_assert(sizeof(user_grant) == 40, "user_grant must stay packed at 40 bytes");
+    CHECK(sizeof(user_grant) == 40);
     names();
     verifier_bounds();
     normalize();

@@ -226,6 +226,7 @@ void mt_unref(memtable *m)
         ppos_mt_free(m);
     mt_s_free(m);
     tsdb_free_big(m->ids, (size_t)m->idcap * sizeof *m->ids);
+    tsdb_free_big(m->fresh_ids, (size_t)m->fresh_cap * sizeof *m->fresh_ids);
     free(m);
 }
 
@@ -1505,6 +1506,34 @@ static lw_fence *lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs,
 
 __thread const volatile int *cur_abandon;
 
+/* Records newly-registered series in m that are still undecided for partition classes (buf_lock held).
+ * On OOM growing fresh_ids, sets fresh_overflow so cls_classify_active safely falls back to scanning m->ids. */
+static void mt_note_fresh(eng *db, memtable *m, uint32_t nids0)
+{
+    if (m->fresh_overflow)
+        return;
+    for (uint32_t i = nids0; i < m->nids; i++) {
+        uint32_t id = m->ids[i];
+        if (cls_byte(db, id) & CLS_DECIDED)
+            continue;
+        if (m->nfresh == m->fresh_cap) {
+            if (m->fresh_cap > UINT32_MAX / 2) {
+                m->fresh_overflow = true;
+                return;
+            }
+            uint32_t c = m->fresh_cap ? m->fresh_cap * 2 : 32;
+            uint32_t *p = realloc(m->fresh_ids, (size_t)c * sizeof *p);
+            if (!p) {
+                m->fresh_overflow = true;
+                return;
+            }
+            m->fresh_ids = p;
+            m->fresh_cap = c;
+        }
+        m->fresh_ids[m->nfresh++] = id;
+    }
+}
+
 int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
                int type)
 {
@@ -1566,8 +1595,11 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         rc = eng_abandoned();
     /* wal_appended is the last position the WAL holds: a refusal before the append adds none, or a flush would wait
      * for rows that never come (wal_durable never reaches them) */
+    uint32_t nids0 = db->active->nids;
     if (rc == 0)
         rc = mt_reserve_rows(db->active, series, cs, n); /* before the WAL: after it, nothing may fail */
+    if (rc == 0 && db->cls_on && db->active->nids > nids0)
+        mt_note_fresh(db, db->active, nids0);
     bool counted = rc == 0;
     uint64_t fno0 = 0;
     if (rc == 0 && db->wal_enabled) {

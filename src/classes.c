@@ -793,32 +793,90 @@ int cls_classify_active(eng *db)
 {
     if (!db->cls_on || db->rp || !eng_jr(db))
         return 0;
-    pthread_mutex_lock(&db->buf_lock); /* the rows of fresh series only: rare, and copied out before the decision */
-    memtable *m = db->active;
-    size_t k = 0, cap = 0;
+    size_t cap = 0, k = 0;
     fstat_ *st = NULL;
     int rc = 0;
-    for (uint32_t i = 0; i < m->nids && rc == 0; i++) {
-        uint32_t id = m->ids[i];
-        if ((cls_byte(db, id) & CLS_DECIDED) || m->s[id].n == 0)
-            continue;
-        if (k == cap) {
-            size_t c = cap ? cap * 2 : 16;
-            fstat_ *p = realloc(st, c * sizeof *p);
-            if (!p) {
+    for (;;) {
+        pthread_mutex_lock(&db->buf_lock); /* O(1) when no fresh series; never reallocs under buf_lock */
+        memtable *m = db->active;
+        size_t want = 0;
+        if (!m->fresh_overflow) {
+            uint32_t keep = 0;
+            for (uint32_t i = 0; i < m->nfresh; i++) {
+                uint32_t id = m->fresh_ids[i];
+                if (cls_byte(db, id) & CLS_DECIDED)
+                    continue;
+                m->fresh_ids[keep++] = id;
+                if (m->s[id].n > 0)
+                    want++;
+            }
+            m->nfresh = keep;
+        } else {
+            for (uint32_t i = 0; i < m->nids; i++) {
+                uint32_t id = m->ids[i];
+                if (!(cls_byte(db, id) & CLS_DECIDED) && m->s[id].n > 0)
+                    want++;
+            }
+        }
+        if (want == 0) {
+            pthread_mutex_unlock(&db->buf_lock);
+            break;
+        }
+        if (want > cap) {
+            pthread_mutex_unlock(&db->buf_lock);
+            tsdb_free_big(st, cap * sizeof *st);
+            st = NULL;
+            cap = want + want / 4 + 16;
+            st = malloc(cap * sizeof *st);
+            if (!st) {
+                cap = 0;
                 rc = TSDB_ERR_NOMEM;
                 break;
             }
-            st = p, cap = c;
+            continue;
         }
-        st[k] = (fstat_){id, m->s[id].n, 0, 0};
-        run_stats(&m->s[id], &st[k].tmin, &st[k].tmax);
-        k++;
+        k = 0;
+        if (!m->fresh_overflow) {
+            for (uint32_t i = 0; i < m->nfresh && k < cap; i++) {
+                uint32_t id = m->fresh_ids[i];
+                if (m->s[id].n == 0)
+                    continue;
+                st[k] = (fstat_){id, m->s[id].n, 0, 0};
+                run_stats(&m->s[id], &st[k].tmin, &st[k].tmax);
+                k++;
+            }
+        } else {
+            for (uint32_t i = 0; i < m->nids && k < cap; i++) {
+                uint32_t id = m->ids[i];
+                if ((cls_byte(db, id) & CLS_DECIDED) || m->s[id].n == 0)
+                    continue;
+                st[k] = (fstat_){id, m->s[id].n, 0, 0};
+                run_stats(&m->s[id], &st[k].tmin, &st[k].tmax);
+                k++;
+            }
+        }
+        pthread_mutex_unlock(&db->buf_lock);
+        break;
     }
-    pthread_mutex_unlock(&db->buf_lock);
-    if (rc == 0 && k)
+    if (rc == 0 && k) {
         rc = decide_fresh(db, st, k);
-    free(st);
+        if (rc == 0) {
+            /* Drop newly-decided ids so any subsequent call on the same active memtable is O(1). */
+            pthread_mutex_lock(&db->buf_lock);
+            memtable *m = db->active;
+            if (!m->fresh_overflow && m->nfresh) {
+                uint32_t keep = 0;
+                for (uint32_t i = 0; i < m->nfresh; i++) {
+                    uint32_t id = m->fresh_ids[i];
+                    if (!(cls_byte(db, id) & CLS_DECIDED))
+                        m->fresh_ids[keep++] = id;
+                }
+                m->nfresh = keep;
+            }
+            pthread_mutex_unlock(&db->buf_lock);
+        }
+    }
+    tsdb_free_big(st, cap * sizeof *st);
     return rc;
 }
 

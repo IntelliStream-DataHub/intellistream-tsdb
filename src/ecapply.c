@@ -277,7 +277,13 @@ static int cold_ec_write(struct eng *db, cfile *x, uint64_t b)
         x->tmp[0] = '\0';
         return rc;
     }
-    snprintf(x->p->pending, sizeof x->p->pending, "%s", x->tmp);
+    if ((rc = part_set_pending(x->p, x->tmp)) != 0) {
+        part_unref(x->p);
+        x->p = NULL;
+        unlinkat(db->dirfd, x->tmp, 0);
+        x->tmp[0] = '\0';
+        return rc;
+    }
     return 0;
 }
 
@@ -377,7 +383,7 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
             snprintf(x->fin, sizeof x->fin, "p%" PRId64 "_%" PRIu64 "_%" PRIu64 "_%u.part", x->p->partition, b, b,
                      x->p->level);
             snprintf(x->p->name, sizeof x->p->name, "%s", x->fin);
-            snprintf(x->p->pending, sizeof x->p->pending, "%s", x->tmp);
+            rc = part_set_pending(x->p, x->tmp);
         }
     }
     if (rc == 0 && n) { /* the new names' positions, durable before any of them is (src/ppos.h) */
@@ -479,7 +485,7 @@ static int cold_apply(struct eng *db, uint64_t pos, const mk_cold *c)
             for (size_t i = 0; i < n; i++) {
                 part *p = ord[i]->p;
                 ord[i]->p = NULL;
-                p->pending[0] = '\0';
+                part_clear_pending(p);
                 if (ord[i]->kind == MK_FILE_Y && ecapply_mutant == ECAPPLY_MUT_YCOLD)
                     part_unref(p);
                 else

@@ -296,6 +296,7 @@ void part_unref(part *p)
     munmap((void *)p->map, p->map_len);
     free(p->icopy);
     free(p->lf);
+    free(p->pending);
     if (atomic_load(&p->obsolete) && !ecgc_owns_name(p)) { /* an .ec part's name goes after its chunks (r7-gc) */
         char retired[sizeof p->name + 8];
         if (p->retired)
@@ -1038,13 +1039,18 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             rc = part_open_written(db->dirfd, w->tmp_name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
                                    ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
+        if (rc == 0)
+            rc = part_set_pending(*out, w->tmp_name);
         if (rc == 0) {
             (*out)->verify = db->opt.verify_checksums;
-            snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
             (*out)->lf = w->lf; /* the publisher folds it into the latest table and frees it */
             (*out)->nlf = w->nlf;
             w->lf = NULL;
         } else {
+            if (*out) {
+                part_unref(*out);
+                *out = NULL;
+            }
             unlinkat(db->dirfd, w->tmp_name, 0);
         }
         free(trailer);
@@ -1142,7 +1148,7 @@ void parts_discard(eng *db, part **ps, size_t n)
     for (size_t i = 0; i < n; i++) {
         if (keep)
             ;
-        else if (ps[i]->pending[0])
+        else if (ps[i]->pending)
             unlinkat(db->dirfd, ps[i]->pending, 0);
         else
             atomic_store(&ps[i]->obsolete, true);
@@ -1156,6 +1162,9 @@ int parts_commit(eng *db, part **ps, size_t n)
         return 0;
     if (eng_check(db))
         return TSDB_ERR_IO;
+    for (size_t i = 0; i < n; i++)
+        if (!ps[i]->pending)
+            return TSDB_ERR_INVALID;
     /* block numbers in commit order: the caller publishes before anyone else commits */
     for (size_t i = 0; i < n; i++) {
         part *p = ps[i];
@@ -1218,7 +1227,7 @@ int parts_commit(eng *db, part **ps, size_t n)
             eng_fail(db, "rename of a new part", errno);
             return TSDB_ERR_IO;
         }
-        ps[i]->pending[0] = '\0';
+        part_clear_pending(ps[i]);
     }
     if (eng_sync_dir(db, "fsync of the directory after publishing parts") != 0)
         return TSDB_ERR_IO; /* not published; the next open lists the parts that made it */

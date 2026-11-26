@@ -355,6 +355,8 @@ static int cold_marker(eng *db, const eccold_cut *cut, const ec_record *recs, pa
         free(rb);
         uint64_t size = 0, sum = 0;
         size_t fi = tm == ECCOLD_TM_DUPEC && j == 1 ? 0 : i; /* the second .ec file named as the first */
+        if (rc == 0 && !ec[fi]->pending)
+            rc = TSDB_ERR_INVALID;
         if (rc == 0 && (rc = file_sum(db, ec[fi]->pending, &size, &sum)) == 0) {
             put_file(files, &flen, ec[fi]->name, size, sum, ec[fi]->index_hash, MK_FILE_EC);
             src[j] = ec[fi]->pending;
@@ -398,7 +400,8 @@ static void drop_ec(eng *db, part **ec, size_t n, bool discard)
         if (!ec[i])
             continue;
         if (discard) {
-            unlinkat(db->dirfd, ec[i]->pending, 0);
+            if (ec[i]->pending)
+                unlinkat(db->dirfd, ec[i]->pending, 0);
             ecgc_unlisted_object(db, ec[i]);
         }
         part_unref(ec[i]);

@@ -305,7 +305,7 @@ static int settle_day_ex(h *x, int d, uint8_t oid[16], char name[96], bool drop_
     part *e = NULL;
     CHECK(part_open_ec(db, tmp, name, &e) == 0);
     if (e) {
-        snprintf(e->pending, sizeof e->pending, "%s", tmp);
+        CHECK(part_set_pending(e, tmp) == 0);
         part *in[1] = {p}, *ec[1] = {e};
         if (drop_first)
             CHECK(eng_drop_before(db, (int64_t)(d + 1) * DAY) == 0);
