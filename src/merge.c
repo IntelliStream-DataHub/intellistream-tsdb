@@ -788,10 +788,7 @@ void *merge_thread_main(void *arg)
         if (!k) {
             if (dropped)
                 continue;
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
-            pthread_cond_timedwait(&db->merge_cv, &db->lock, &ts);
+            tsdb_cond_timedwait_ms(&db->merge_cv, &db->lock, 1000);
             continue;
         }
         pthread_mutex_unlock(&db->lock);
@@ -833,8 +830,7 @@ void *merge_thread_main(void *arg)
             /* back off instead of retrying a failing merge in a tight loop, but on the condition variable:
              * close must not wait out the back-off (tsdbd closes right after a storage failure) */
             struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += 1;
+            tsdb_cond_deadline_ms(&until, 1000);
             while (!atomic_load(&db->stop) && pthread_cond_timedwait(&db->merge_cv, &db->lock, &until) == 0) {
             }
         }

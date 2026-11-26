@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef __APPLE__
+#include <sys/random.h>
+#endif
 #include <unistd.h>
 
 #ifdef TSDB_EC
@@ -137,24 +140,42 @@ void chunk_oid_hex(const uint8_t oid[16], char out[33])
     out[32] = 0;
 }
 
-void chunk_random(void *buf, size_t n)
+int chunk_random(void *buf, size_t n)
 {
+    uint8_t *p = buf;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t r = getrandom(p, left, 0);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == ENOSYS)
+                break;
+            return TSDB_ERR_IO;
+        }
+        if (r == 0)
+            return TSDB_ERR_IO;
+        p += r;
+        left -= (size_t)r;
+    }
+    if (left == 0)
+        return 0;
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    size_t got = 0;
-    while (fd >= 0 && got < n) {
-        ssize_t r = read(fd, (uint8_t *)buf + got, n - got);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    while (left > 0) {
+        ssize_t r = read(fd, p, left);
         if (r < 0 && errno == EINTR)
             continue;
-        if (r <= 0)
-            break;
-        got += (size_t)r;
+        if (r <= 0) {
+            close(fd);
+            return TSDB_ERR_IO;
+        }
+        p += r;
+        left -= (size_t)r;
     }
-    if (fd >= 0)
-        close(fd);
-    if (got < n) { /* an id that repeats is worse than none */
-        fprintf(stderr, "tsdb: cannot read /dev/urandom: aborting\n");
-        abort();
-    }
+    close(fd);
+    return 0;
 }
 
 /* ---------------------------------------------------------------- the file format */

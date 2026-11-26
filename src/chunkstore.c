@@ -266,8 +266,10 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
     uint8_t sid[16];
     if (id)
         memcpy(sid, id, 16);
-    else
-        chunk_random(sid, 16);
+    else if (chunk_random(sid, 16) != 0) {
+        close(dirfd);
+        return TSDB_ERR_IO;
+    }
     char text[256];
     meta_text(text, sizeof text, sid, owner);
     /* a temporary file is always a new inode: one a failed write or sync left behind may have had its pages dropped

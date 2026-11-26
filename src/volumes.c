@@ -1162,7 +1162,14 @@ static bool eng_refused(eng *e)
 }
 
 static pthread_mutex_t idle_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t idle_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t idle_cv;
+static pthread_once_t idle_cv_once = PTHREAD_ONCE_INIT;
+static void idle_cv_init(void) { tsdb_cond_init_mono(&idle_cv); }
+static pthread_cond_t *idle_cv_get(void)
+{
+    pthread_once(&idle_cv_once, idle_cv_init);
+    return &idle_cv;
+}
 
 static eng *eng_ref(eng *e)
 {
@@ -1176,7 +1183,7 @@ static void eng_unref(eng **ep)
     if (e && atomic_fetch_sub_explicit(&e->refs, 1, memory_order_acq_rel) == 1 &&
         atomic_load_explicit(&e->quiesced, memory_order_acquire)) {
         pthread_mutex_lock(&idle_mu); /* a recovery waits for the count to reach 0 */
-        pthread_cond_broadcast(&idle_cv);
+        pthread_cond_broadcast(idle_cv_get());
         pthread_mutex_unlock(&idle_mu);
     }
     *ep = NULL;
@@ -1234,7 +1241,7 @@ static void eng_unref_meta(eng **ep)
     if (e && atomic_fetch_sub_explicit(&e->mrefs, 1, memory_order_acq_rel) == 1 &&
         atomic_load_explicit(&e->quiesced, memory_order_acquire)) {
         pthread_mutex_lock(&idle_mu);
-        pthread_cond_broadcast(&idle_cv);
+        pthread_cond_broadcast(idle_cv_get());
         pthread_mutex_unlock(&idle_mu);
     }
     *ep = NULL;
@@ -1955,17 +1962,15 @@ int tsdb_volume_idle(tsdb *t, size_t vol, int timeout_ms)
     if (!e)
         return TSDB_ERR_INVALID;
     struct timespec until;
-    clock_gettime(CLOCK_REALTIME, &until);
-    until.tv_sec += timeout_ms / 1000;
-    until.tv_nsec += (timeout_ms % 1000) * 1000000L;
-    if (until.tv_nsec >= 1000000000L)
-        until.tv_sec++, until.tv_nsec -= 1000000000L;
+    if (timeout_ms >= 0)
+        tsdb_cond_deadline_ms(&until, timeout_ms);
     int rc = 0;
+    pthread_cond_t *cv = idle_cv_get();
     pthread_mutex_lock(&idle_mu);
     while (rc == 0 && atomic_load_explicit(&e->refs, memory_order_acquire) > 0) {
         if (timeout_ms < 0)
-            pthread_cond_wait(&idle_cv, &idle_mu);
-        else if (pthread_cond_timedwait(&idle_cv, &idle_mu, &until) == ETIMEDOUT &&
+            pthread_cond_wait(cv, &idle_mu);
+        else if (pthread_cond_timedwait(cv, &idle_mu, &until) == ETIMEDOUT &&
                  atomic_load_explicit(&e->refs, memory_order_acquire) > 0)
             rc = 1;
     }
@@ -2140,7 +2145,7 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     pthread_mutex_lock(&idle_mu);
     while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0 ||
            atomic_load_explicit(&old->mrefs, memory_order_acquire) > 0)
-        pthread_cond_wait(&idle_cv, &idle_mu);
+        pthread_cond_wait(idle_cv_get(), &idle_mu);
     pthread_mutex_unlock(&idle_mu);
     /* cuts of a multi call still running keep the old engine: its last cut retires it (eng_cut_drop). Decided under
      * idle_mu, where the count changes. */
@@ -4206,14 +4211,7 @@ int tsdb_cvol_replace(tsdb *t, uint32_t number, int (*fn)(void *ctx, eng **old, 
     pthread_mutex_lock(&idle_mu);
     while (atomic_load_explicit(&old->refs, memory_order_acquire) > 0 ||
            atomic_load_explicit(&old->mrefs, memory_order_acquire) > 0 || old->crefs > 0) {
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += 10 * 1000000L;
-        if (until.tv_nsec >= 1000000000L) {
-            until.tv_sec++;
-            until.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&idle_cv, &idle_mu, &until);
+        tsdb_cond_timedwait_ms(idle_cv_get(), &idle_mu, 10);
     }
     pthread_mutex_unlock(&idle_mu);
     char **names = NULL;

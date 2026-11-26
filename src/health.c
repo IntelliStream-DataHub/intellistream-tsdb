@@ -336,16 +336,7 @@ static void *probe_main(void *p)
         int64_t now = mono_ms();
         while (!h->closing && !d->probe_now && now < d->next_read_ms && now < d->next_write_ms) {
             int64_t wake = d->next_read_ms < d->next_write_ms ? d->next_read_ms : d->next_write_ms;
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t add = wake - now;
-            ts.tv_sec += add / 1000;
-            ts.tv_nsec += (add % 1000) * 1000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
-            pthread_cond_timedwait(&h->cv, &h->mu, &ts);
+            tsdb_cond_timedwait_ms(&h->cv, &h->mu, wake - now);
             now = mono_ms();
         }
         bool closing = h->closing;
@@ -566,7 +557,7 @@ tsdb_health *tsdb_health_open(const tsdb_health_options *opts)
         snprintf(h->node, sizeof h->node, "%.40s-%d", host, (int)getpid());
     }
     pthread_mutex_init(&h->mu, NULL);
-    pthread_cond_init(&h->cv, NULL);
+    tsdb_cond_init_mono(&h->cv);
     if (pthread_create(&h->monitor, NULL, monitor_main, h) != 0) {
         free(h);
         return NULL;
@@ -687,8 +678,7 @@ void tsdb_health_close(tsdb_health *h)
         pthread_join(h->monitor, NULL);
     /* wait for the probe threads that are not stuck */
     struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_sec += 2;
+    tsdb_cond_deadline_ms(&dl, 2000);
     bool stuck = false;
     pthread_mutex_lock(&h->mu);
     for (int i = 0; i < h->ndoms; i++)

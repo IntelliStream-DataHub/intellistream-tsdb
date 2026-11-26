@@ -378,10 +378,7 @@ static void *cleaner_main(void *arg)
             break; /* a failed engine removes nothing more */
         if (db->cleaner_stop)
             break;
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 1;
-        pthread_cond_timedwait(&db->feed_cv, &db->feed_lock, &ts);
+        tsdb_cond_timedwait_ms(&db->feed_cv, &db->feed_lock, 1000);
     }
     pthread_mutex_unlock(&db->feed_lock);
     return NULL;

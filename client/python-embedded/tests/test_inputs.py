@@ -41,7 +41,30 @@ def big(a):
     return a.astype(a.dtype.newbyteorder(">"))
 
 
-FORMS = {"strided": strided, "column": column, "big-endian": big}
+def unaligned_numpy(a):
+    """C-contiguous numpy view starting at byte offset 1 (unaligned for >1-byte dtypes)."""
+    raw = np.empty(a.nbytes + 1, dtype=np.uint8)
+    u = np.ndarray(a.shape, dtype=a.dtype, buffer=raw[1:])
+    u[:] = a
+    if a.dtype.itemsize > 1:
+        assert u.ctypes.data % a.dtype.itemsize != 0
+    return u
+
+
+def unaligned_memview(a):
+    """C-contiguous typed memoryview starting at byte offset 1."""
+    raw = bytearray(a.nbytes + 1)
+    raw[1:] = a.tobytes()
+    return memoryview(raw)[1:].cast(a.dtype.char)
+
+
+FORMS = {
+    "strided": strided,
+    "column": column,
+    "big-endian": big,
+    "unaligned-numpy": unaligned_numpy,
+    "unaligned-memview": unaligned_memview,
+}
 
 
 def rows(c, s, a, b):

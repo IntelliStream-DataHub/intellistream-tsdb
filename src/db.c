@@ -321,10 +321,7 @@ void db_wait_merges(eng *db, int64_t partition)
             }
             break;
         }
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 1;
-        pthread_cond_timedwait(&db->merged_cv, &db->lock, &ts);
+        tsdb_cond_timedwait_ms(&db->merged_cv, &db->lock, 1000);
     }
     pthread_mutex_unlock(&db->lock);
 }
@@ -945,12 +942,12 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_mutex_init(&db->fno_lock, NULL);
     pthread_mutex_init(&db->dir_sync_lock, NULL);
     pthread_mutex_init(&db->feed_lock, NULL);
-    pthread_cond_init(&db->feed_cv, NULL);
+    tsdb_cond_init_mono(&db->feed_cv);
     db->fs_fd = -1;
     pthread_cond_init(&db->wal_cv, NULL);
-    pthread_cond_init(&db->merge_cv, NULL);
-    pthread_cond_init(&db->merged_cv, NULL);
-    pthread_cond_init(&db->flush_cv, NULL);
+    tsdb_cond_init_mono(&db->merge_cv);
+    tsdb_cond_init_mono(&db->merged_cv);
+    tsdb_cond_init_mono(&db->flush_cv);
 
     int rc;
     db->dir = strdup(dir);

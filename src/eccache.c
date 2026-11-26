@@ -1488,7 +1488,8 @@ int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out
         return TSDB_ERR_UNAVAILABLE;
     r.version = EC_RECORD_VERSION;
     r.class_check = EC_CLS_PASSED;
-    chunk_random(r.oid, sizeof r.oid);
+    if ((rc = chunk_random(r.oid, sizeof r.oid)) != 0)
+        return rc;
     r.key = p->partition;
     r.min_block = p->min_block;
     r.max_block = p->max_block;

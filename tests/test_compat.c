@@ -11,10 +11,12 @@
 #include <errno.h>
 #include "watchdog.h"
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/mount.h>
@@ -48,6 +50,64 @@ int fcntl(int fd, int cmd, ...)
     return REAL(fcntl)(fd, cmd, arg);
 }
 #endif
+
+static int64_t compat_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int ready;
+} cond_wake_arg;
+
+static void *cond_waker(void *p)
+{
+    cond_wake_arg *a = p;
+    struct timespec nap = {0, 15000000L};
+    nanosleep(&nap, NULL);
+    pthread_mutex_lock(&a->mu);
+    a->ready = 1;
+    pthread_cond_signal(&a->cv);
+    pthread_mutex_unlock(&a->mu);
+    return NULL;
+}
+
+static void test_cond_mono(void)
+{
+    cond_wake_arg a = {.ready = 0};
+    pthread_mutex_init(&a.mu, NULL);
+    CHECK(tsdb_cond_init_mono(&a.cv) == 0);
+    pthread_mutex_lock(&a.mu);
+    CHECK(tsdb_cond_timedwait_ms(&a.cv, &a.mu, 0) == ETIMEDOUT);
+    int64_t t0 = compat_mono_ms();
+    CHECK(tsdb_cond_timedwait_ms(&a.cv, &a.mu, 40) == ETIMEDOUT);
+    int64_t elapsed = compat_mono_ms() - t0;
+    CHECK(elapsed >= 30 && elapsed < 2000);
+    struct timespec dl;
+    tsdb_cond_deadline_ns(&dl, 20000000LL);
+    t0 = compat_mono_ms();
+    CHECK(pthread_cond_timedwait(&a.cv, &a.mu, &dl) == ETIMEDOUT);
+    elapsed = compat_mono_ms() - t0;
+    CHECK(elapsed >= 15 && elapsed < 2000);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, cond_waker, &a) == 0);
+    t0 = compat_mono_ms();
+    while (!a.ready) {
+        int rc = tsdb_cond_timedwait_ms(&a.cv, &a.mu, 5000);
+        if (rc == ETIMEDOUT)
+            break;
+    }
+    elapsed = compat_mono_ms() - t0;
+    pthread_mutex_unlock(&a.mu);
+    pthread_join(th, NULL);
+    CHECK(a.ready == 1 && elapsed < 2000);
+    pthread_cond_destroy(&a.cv);
+    pthread_mutex_destroy(&a.mu);
+}
 
 int main(int argc, char **argv)
 {
@@ -123,6 +183,7 @@ int main(int argc, char **argv)
     close(fd);
     close(dfd);
     unlink(path);
+    test_cond_mono();
     if (failures) {
         fprintf(stderr, "test_compat: %d failures\n", failures);
         return 1;

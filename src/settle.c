@@ -505,7 +505,8 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, in
         *epoch_out = epoch;
     r->version = EC_RECORD_VERSION;
     r->class_check = EC_CLS_PASSED;
-    chunk_random(r->oid, sizeof r->oid);
+    if ((rc = chunk_random(r->oid, sizeof r->oid)) != 0)
+        return rc;
     r->key = p->partition;
     r->min_block = p->min_block;
     r->max_block = p->max_block;
@@ -981,16 +982,7 @@ static void *settle_main(void *arg)
         atomic_fetch_add(&settle_rounds, 1);
         if (any || st->stop)
             continue;
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        int ms = atomic_load(&settle_poll_ms);
-        ts.tv_sec += ms / 1000;
-        ts.tv_nsec += (long)(ms % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&st->cv, &st->mu, &ts);
+        tsdb_cond_timedwait_ms(&st->cv, &st->mu, atomic_load(&settle_poll_ms));
     }
     pthread_mutex_unlock(&st->mu);
     return NULL;
@@ -1016,7 +1008,7 @@ int ecsettle_tier_open(struct tier *t)
         return TSDB_ERR_NOMEM;
     st->t = t;
     pthread_mutex_init(&st->mu, NULL);
-    pthread_cond_init(&st->cv, NULL);
+    tsdb_cond_init_mono(&st->cv);
     t->settle = st;
     if (tsdb_thread_create(&st->th, settle_main, st) != 0)
         return TSDB_ERR_NOMEM;
