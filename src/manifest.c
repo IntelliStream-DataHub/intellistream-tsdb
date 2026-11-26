@@ -431,12 +431,19 @@ static int tail_segment_fd(eng *db, wal_tail *t, int fd, const char *name)
          * buffer in one step, and writes what it took of it as one record): its
          * rows become visible together, so queries never see part of an insert. */
         pthread_mutex_lock(&db->buf_lock);
+        uint64_t base = atomic_load_explicit(&db->tail_lsn, memory_order_relaxed);
+        uint64_t added = 0;
         r = r0;
         for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
             wal_row(r, &id, &ts, &slot);
-            if (id < eng_series_count(db))
-                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, ++db->tail_lsn, -1);
+            if (id < eng_series_count(db)) {
+                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, base + added + 1, -1);
+                if (rc == 0)
+                    added++;
+            }
         }
+        if (rc == 0 && added)
+            atomic_store_explicit(&db->tail_lsn, base + added, memory_order_release);
         pthread_mutex_unlock(&db->buf_lock);
         pos += rec;
     }

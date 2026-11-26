@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Tests: codec round trips, and every query checked against a brute-force reference. */
 #include "internal.h"
+#include "feed.h"
 #include "samekeys.h"
 
 #include <dirent.h>
@@ -16,6 +17,7 @@
 #endif
 #include "portable.h"
 #include <math.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1068,7 +1070,7 @@ static int hold_armed; /* HOLD_*: hold the next such call */
 static int hold_begun, hold_ended, hold_go;
 static bool hold_others; /* only calls from threads other than hold_main */
 static pthread_t hold_main;
-enum { HOLD_FSYNC = 1, HOLD_FDATASYNC = 2 };
+enum { HOLD_FSYNC = 1, HOLD_FDATASYNC = 2, HOLD_WAL_ENTER = 4 };
 
 static void hold_point(int which)
 {
@@ -1163,6 +1165,12 @@ static float value_at(tsdb *db, int64_t t)
     return v;
 }
 
+static void hold_wal_enter(eng *db)
+{
+    (void)db;
+    hold_point(HOLD_WAL_ENTER);
+}
+
 /* Regression: with wal_sync_ms = 0 a row is visible once the WAL is synced up
  * to it. A memtable flush moved the active memtable to the flushing list and
  * only then wrote and synced the rest of its WAL segment, and queries read
@@ -1181,18 +1189,24 @@ static void test_flush_visibility(const char *dir)
     OK(tsdb_series(db, "s", &id));
     const int64_t t = 1700000000000;
     OK(tsdb_append(db, id, t, 1.0f));
-    /* the flush holds the WAL writer role while it creates the next segment
-     * (and fsyncs the directory): a row appended now waits for it */
-    hold_arm(HOLD_FSYNC);
+    /* Segment creation + dir fsync run before the flush takes the WAL writer role,
+     * so a concurrent sync append does not stall behind fsync(dirfd). Once the flush
+     * enters the WAL writer role, a subsequent append waits for it. */
+    hold_arm(HOLD_FSYNC | HOLD_WAL_ENTER);
+    __atomic_store_n(&mt_test_after_wal_enter, hold_wal_enter, __ATOMIC_RELEASE);
     pthread_t fl, wr;
     pthread_create(&fl, NULL, flush_main, db);
+    hold_wait();
+    OK(tsdb_append(db, id, t + 1, 1.5f)); /* completes without waiting for fsync(dirfd) */
+    CHECK(value_at(db, t + 1) == 1.5f);
+    hold_release(); /* lets dir fsync finish; fl enters WAL writer role and pauses */
     hold_wait();
     pthread_create(&wr, NULL, append_two, db);
     tsdb_stats st;
     do {
         usleep(1000);
         OK(tsdb_get_stats(db, &st));
-    } while (st.memtable_rows < 2);
+    } while (st.memtable_rows < 3);
     CHECK(value_at(db, t) == 1.0f); /* in the active memtable, not durable */
     /* the flush rotates the memtable, then syncs the rest of the old segment */
     hold_arm(HOLD_FDATASYNC);
@@ -1202,9 +1216,211 @@ static void test_flush_visibility(const char *dir)
     hold_release();
     pthread_join(wr, NULL);
     pthread_join(fl, NULL);
+    __atomic_store_n(&mt_test_after_wal_enter, NULL, __ATOMIC_RELEASE);
     CHECK(value_at(db, t) == 2.0f);
     OK(tsdb_close(db));
     printf("  a row in a memtable being flushed is not visible before its WAL record is durable\n");
+}
+
+/* Power-loss and pre-rotation failure regression for P-07 (pre-creating empty wal_<seq>.log before
+ * wal_writer_enter):
+ *  (a) under crashfs, power cuts right after wal_open_segment(seq=2) has durably created and dir-synced
+ *      empty wal_2.log while wal_1.log carries an unsynced or torn tail (both standalone and with feed_on):
+ *      reopen recovers all durable rows with zero loss and cleans up empty wal_2.log (never fwal_2.log).
+ *  (b) when the engine fails before rotation (after wal_open_segment), mt_flush_do closes newfd and frees
+ *      the pre-allocated memtable without leaking, and reopen recovers cleanly. */
+static const char *self_path;
+static const char *walrot_dir;
+static const char *walrot_mark;
+static int walrot_mode;
+
+static void walrot_power_hook(eng *db)
+{
+    char n1[64], n2[64], w1[600], w2[600];
+    wal_name(n1, sizeof n1, db->wal_seq);
+    wal_name(n2, sizeof n2, db->wal_seq + 1);
+    snprintf(w1, sizeof w1, "%s/%s", walrot_dir, n1);
+    snprintf(w2, sizeof w2, "%s/%s", walrot_dir, n2);
+    struct stat st2;
+    if (stat(w2, &st2) != 0 || st2.st_size != 0)
+        _exit(11); /* wal_open_segment(seq+1) must have created empty next segment before wal_writer_enter */
+    int fd = open(w1, O_WRONLY | O_APPEND);
+    if (fd < 0)
+        _exit(12);
+    /* Write a partial/torn WAL record tail (28 bytes < WAL_HDR + WAL_ROW, bad checksum).
+     * When mode & 2, fdatasync it so the torn tail survives power loss alongside empty next segment;
+     * otherwise leave it unsynced so crashfs rolls back the tail while keeping durable empty next segment. */
+    uint8_t torn[28];
+    memset(torn, 0x5a, sizeof torn);
+    if (write(fd, torn, sizeof torn) != (ssize_t)sizeof torn)
+        _exit(13);
+    if ((walrot_mode & 2) && fdatasync(fd) != 0)
+        _exit(14);
+    close(fd);
+    FILE *f = fopen(walrot_mark, "w");
+    if (f)
+        fclose(f);
+    /* Trigger immediate crashfs power_loss() -> _exit(99) on the next tracked syscall. */
+    raise(SIGUSR2);
+    int dfd = open(walrot_dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0)
+        close(dfd);
+    _exit(15); /* unreachable under crashfs */
+}
+
+static void wal_precreate_child(const char *dir, int mode, const char *mark)
+{
+#ifndef __APPLE__
+    sync_via_shim = true;
+#endif
+    walrot_dir = dir;
+    walrot_mark = mark;
+    walrot_mode = mode;
+    tsdb_options o = test_opts(0);
+    o.fsync = 1;
+    o.wal_sync_ms = 0;
+    o.flush_interval_ms = 1000000;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    if (mode & 1)
+        OK(eng_feed_enable(tsdb_test_engine(db, 0), NULL));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t0 = 1700000000000LL;
+    for (int i = 0; i < 5; i++)
+        OK(tsdb_append(db, id, t0 + i * 1000, (float)(i + 1)));
+    __atomic_store_n(&mt_test_after_wal_enter, walrot_power_hook, __ATOMIC_RELEASE);
+    (void)tsdb_flush(db);
+    _exit(16); /* unreachable: hook cuts power */
+}
+
+static bool walrot_fail_ran;
+static void walrot_fail_hook(eng *db)
+{
+    char n2[64], w2[600];
+    wal_name(n2, sizeof n2, db->wal_seq + 1);
+    snprintf(w2, sizeof w2, "%s/%s", walrot_dir, n2);
+    struct stat st2;
+    if (stat(w2, &st2) == 0 && st2.st_size == 0)
+        walrot_fail_ran = true;
+    eng_fail(db, "injected failure before rotation", EIO);
+}
+
+static void test_wal_precreate_power(const char *base)
+{
+    char shim[1024], shim_abs[PATH_MAX];
+    snprintf(shim, sizeof shim, "%.*s/libcrashfs.so",
+             (int)(strrchr(self_path, '/') ? strrchr(self_path, '/') - self_path : 1),
+             strrchr(self_path, '/') ? self_path : ".");
+    if (!realpath(shim, shim_abs)) {
+        failures += tr_crashfs_missing("power loss after WAL segment pre-create", shim);
+    } else {
+        /* modes: 0 = standalone + unsynced tail, 2 = standalone + torn tail, 3 = feed_on + torn tail */
+        const int modes[3] = {0, 2, 3};
+        char n2[64], fn2[64];
+        wal_name(n2, sizeof n2, 2);
+        fwal_name(fn2, sizeof fn2, 2);
+        for (int mi = 0; mi < 3; mi++) {
+            int mode = modes[mi];
+            char top[512], dir[560], mark[600], w2[700], fw2[700];
+            snprintf(top, sizeof top, "%s/tsdb-walrot-pl-%d-%d", base, (int)getpid(), mode);
+            snprintf(dir, sizeof dir, "%s/db", top);
+            snprintf(mark, sizeof mark, "%s.mark", top);
+            rm_rf(top);
+            unlink(mark);
+            CHECK(mkdir(top, 0755) == 0 && mkdir(dir, 0755) == 0);
+            char mstr[16];
+            snprintf(mstr, sizeof mstr, "%d", mode);
+            pid_t pid = fork();
+            if (pid == 0) {
+                char asan[512];
+                snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0",
+                         getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+                setenv("ASAN_OPTIONS", asan, 1);
+                setenv("LD_PRELOAD", shim_abs, 1);
+                setenv("CRASHFS_ROOT", top, 1);
+                setenv("CRASHFS_PROB", "0", 1);
+                setenv("CRASHFS_AT_EXIT", "1", 1);
+                execl(self_path, self_path, base, "walrot-child", dir, mstr, mark, (char *)NULL);
+                _exit(127);
+            }
+            int st = -1;
+            CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 99);
+            CHECK(access(mark, F_OK) == 0);
+            /* Empty wal_0000000000000002.log must have survived the power cut on disk */
+            snprintf(w2, sizeof w2, "%s/%s", dir, n2);
+            struct stat st2;
+            CHECK(stat(w2, &st2) == 0 && st2.st_size == 0);
+
+            tsdb_options o = test_opts(0);
+            o.fsync = 1;
+            o.wal_sync_ms = 0;
+            o.flush_interval_ms = 1000000;
+            tsdb *db = NULL;
+            CHECK(tsdb_open(dir, &o, &db) == 0);
+            if (db) {
+                tsdb_sid id;
+                OK(tsdb_series(db, "s", &id));
+                const int64_t t0 = 1700000000000LL;
+                tsdb_points pts;
+                OK(tsdb_query_points(db, id, t0, t0 + 10000, &pts));
+                CHECK(pts.n == 5);
+                for (size_t i = 0; i < pts.n; i++)
+                    CHECK(pts.ts[i] == t0 + (int64_t)i * 1000 && pts.values[i] == (float)(i + 1));
+                tsdb_points_free(&pts);
+                /* Empty segment 2 must be cleaned up, never kept as fwal_ even with feed_on */
+                snprintf(fw2, sizeof fw2, "%s/%s", dir, fn2);
+                CHECK(access(w2, F_OK) != 0);
+                CHECK(access(fw2, F_OK) != 0);
+                /* Follow-up append + flush works cleanly */
+                OK(tsdb_append(db, id, t0 + 5000, 6.0f));
+                OK(tsdb_flush(db));
+                OK(tsdb_query_points(db, id, t0, t0 + 10000, &pts));
+                CHECK(pts.n == 6 && pts.values[5] == 6.0f);
+                tsdb_points_free(&pts);
+                OK(tsdb_close(db));
+            }
+            rm_rf(top);
+            unlink(mark);
+        }
+        printf("  power loss after WAL segment pre-create with torn tail (standalone and feed)\n");
+    }
+
+    /* Part (b): engine fails before rotation -> unused pre-created newfd & memtable cleaned up cleanly */
+    char fdir[512];
+    snprintf(fdir, sizeof fdir, "%s/tsdb-walrot-fail-%d", base, (int)getpid());
+    rm_rf(fdir);
+    tsdb_options o = test_opts(0);
+    o.fsync = 1;
+    o.wal_sync_ms = 0;
+    o.flush_interval_ms = 1000000;
+    tsdb *db = NULL;
+    OK(tsdb_open(fdir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t0 = 1700000000000LL;
+    for (int i = 0; i < 3; i++)
+        OK(tsdb_append(db, id, t0 + i * 1000, (float)(i + 1)));
+    walrot_dir = fdir;
+    walrot_fail_ran = false;
+    __atomic_store_n(&mt_test_after_wal_enter, walrot_fail_hook, __ATOMIC_RELEASE);
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO);
+    __atomic_store_n(&mt_test_after_wal_enter, NULL, __ATOMIC_RELEASE);
+    CHECK(walrot_fail_ran);
+    CHECK(tsdb_close(db) == TSDB_ERR_IO);
+
+    /* Reopen recovers all 3 acknowledged rows and removes the unused empty wal_2.log */
+    OK(tsdb_open(fdir, &o, &db));
+    OK(tsdb_series(db, "s", &id));
+    tsdb_points pts;
+    OK(tsdb_query_points(db, id, t0, t0 + 10000, &pts));
+    CHECK(pts.n == 3 && pts.values[2] == 3.0f);
+    tsdb_points_free(&pts);
+    OK(tsdb_append(db, id, t0 + 3000, 4.0f));
+    OK(tsdb_flush(db));
+    OK(tsdb_close(db));
+    rm_rf(fdir);
+    printf("  unused pre-created WAL segment cleanup on pre-rotation failure\n");
 }
 
 typedef struct pins {
@@ -2636,7 +2852,6 @@ static void drop_vs_merge(const char *base, int point, int lifetime)
  * the child merges and drops as above, reports the acknowledged drop in a marker file, and exits without closing;
  * the shim then rolls back every directory change not made durable. The old code unlinked the merge output after
  * the acknowledgement with no directory fsync, so the open listed it again. */
-static const char *self_path;
 
 static void drop_vs_merge_child(const char *dir, int point, int lifetime, const char *mark)
 {
@@ -3153,6 +3368,8 @@ int main(int argc, char **argv)
     simd_init();
     if (argc > 6 && strcmp(argv[2], "dropmerge-child") == 0) /* under crashfs, from drop_vs_merge_power */
         drop_vs_merge_child(argv[3], atoi(argv[4]), atoi(argv[5]), argv[6]);
+    if (argc > 5 && strcmp(argv[2], "walrot-child") == 0) /* under crashfs, from test_wal_precreate_power */
+        wal_precreate_child(argv[3], atoi(argv[4]), argv[5]);
     if (argc > 2 && strcmp(argv[2], "samekeys") == 0) { /* just these, e.g. under a sanitizer */
         test_same_keys(base);
         printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
@@ -3183,6 +3400,7 @@ int main(int argc, char **argv)
     printf("write-ahead log\n");
     test_wal(dir);
     test_flush_visibility(dir);
+    test_wal_precreate_power(base);
     test_publish_then_merge(dir);
     printf("concurrency\n");
     test_concurrency(dir);

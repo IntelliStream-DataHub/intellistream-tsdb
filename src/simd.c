@@ -1229,7 +1229,7 @@ K_AVX2 __m256d twa_ld_avx2(int type, const void *v, size_t p, __m256i *ok)
     }
 }
 
-K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+K_AVX2 void twa_avx2_exact(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
 {
     const __m256i bias = _mm256_set1_epi64x(INT64_MIN);
     const __m256d half = _mm256_set1_pd(0.5);
@@ -1272,6 +1272,115 @@ K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, 
     twa_tail(type, ts, v, s, n, sl, ll, o, L64);
 }
 
+__attribute__((target("avx2"), noinline, cold)) static void twa_avx2_exact_any(int type, const int64_t *ts,
+                                                                               const void *v, size_t n, twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: twa_avx2_exact(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: twa_avx2_exact(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: twa_avx2_exact(TSDB_INT64, ts, v, n, o); break;
+    default: twa_avx2_exact(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+/* int64 lanes b (null where eq) as doubles, exact for [-2^51, 2^51); rng gets bits from 52 up for any other */
+K_AVX2 __m256d twa_i64_avx2(__m256i b, __m256i eq, __m256i *rng)
+{
+    __m256i y = _mm256_add_epi64(_mm256_andnot_si256(eq, b), _mm256_set1_epi64x(0x4338000000000000));
+    *rng = _mm256_or_si256(*rng, _mm256_xor_si256(y, _mm256_set1_epi64x(0x4330000000000000)));
+    return _mm256_sub_pd(_mm256_castsi256_pd(y), _mm256_set1_pd(0x1.8p52));
+}
+
+/* points p .. p + 3 as doubles and their null masks (all ones where null), converting each point once */
+K_AVX2 __m256d twa_cv_avx2(int type, const void *v, size_t p, __m256i *eq, __m256i *rng)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        __m128i b = _mm_loadu_si128((const __m128i *)((const uint32_t *)v + p));
+        *eq = _mm256_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_F32)));
+        return _mm256_cvtps_pd(_mm_castsi128_ps(b));
+    }
+    case TSDB_FLOAT64: {
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const uint64_t *)v + p));
+        *eq = _mm256_cmpeq_epi64(b, _mm256_set1_epi64x((long long)NULL_F64));
+        return _mm256_castsi256_pd(b);
+    }
+    case TSDB_INT64: {
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const int64_t *)v + p));
+        *eq = _mm256_cmpeq_epi64(b, _mm256_set1_epi64x(NULL_I64));
+        return twa_i64_avx2(b, *eq, rng);
+    }
+    default: {
+        __m128i b = _mm_loadu_si128((const __m128i *)((const uint32_t *)v + p));
+        *eq = _mm256_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_BOOL)));
+        return _mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(b, _mm_set1_epi32(INT32_MIN))), _mm256_set1_pd(0x1p31));
+    }
+    }
+}
+
+K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    if (n < 2) {
+        *o = (twa_sums){0};
+        return;
+    }
+    const __m256d half = _mm256_set1_pd(0.5);
+    const __m256d c52 = _mm256_set1_pd(0x1p52);
+    const __m256i i52 = _mm256_castpd_si256(c52);
+    __m256d st[4], li[4], gmax = _mm256_setzero_pd();
+    __m256i sms = _mm256_setzero_si256(), lms = sms, dtor = sms;
+    for (int q = 0; q < 4; q++)
+        st[q] = li[q] = _mm256_setzero_pd();
+    size_t s = 0;
+    if (n >= L64 + 4) {
+        __m256i eqc;
+        __m256d c = twa_cv_avx2(type, v, 0, &eqc, &dtor);
+        for (; s + L64 + 4 <= n; s += L64) {
+            _Pragma("GCC unroll 4") for (int q = 0; q < 4; q++) {
+                size_t p = s + 4 * (size_t)q;
+                __m256i dt = _mm256_sub_epi64(_mm256_loadu_si256((const __m256i *)(ts + p + 1)),
+                                              _mm256_loadu_si256((const __m256i *)(ts + p)));
+                __m256i eqn;
+                __m256d nx = twa_cv_avx2(type, v, p + 4, &eqn, &dtor);
+                __m256d x = _mm256_shuffle_pd(c, _mm256_permute2f128_pd(c, nx, 0x21), 0x5);
+                __m256i eqx = _mm256_alignr_epi8(_mm256_permute2x128_si256(eqc, eqn, 0x21), eqc, 8);
+                __m256i nb = _mm256_or_si256(eqc, eqx);
+                __m256d d = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_or_si256(dt, i52)), c52);
+                dtor = _mm256_or_si256(dtor, dt);
+                gmax = _mm256_max_pd(gmax, d);
+                st[q] = _mm256_add_pd(st[q], _mm256_andnot_pd(_mm256_castsi256_pd(eqc), _mm256_mul_pd(c, d)));
+                li[q] = _mm256_add_pd(li[q], _mm256_andnot_pd(_mm256_castsi256_pd(nb),
+                                                              _mm256_mul_pd(_mm256_mul_pd(_mm256_add_pd(c, x), half), d)));
+                sms = _mm256_add_epi64(sms, _mm256_andnot_si256(eqc, dt));
+                lms = _mm256_add_epi64(lms, _mm256_andnot_si256(nb, dt));
+                c = nx;
+                eqc = eqn;
+            }
+        }
+    }
+    if (UNLIKELY(!_mm256_testz_si256(dtor, _mm256_set1_epi64x((long long)(~0ull << 52))))) {
+        twa_avx2_exact_any(type, ts, v, n, o);
+        return;
+    }
+    double sl[L64], ll[L64], g[4];
+    uint64_t a[4], b[4];
+    for (int q = 0; q < 4; q++) {
+        _mm256_storeu_pd(sl + 4 * q, st[q]);
+        _mm256_storeu_pd(ll + 4 * q, li[q]);
+    }
+    _mm256_storeu_si256((__m256i *)a, sms);
+    _mm256_storeu_si256((__m256i *)b, lms);
+    _mm256_storeu_pd(g, gmax);
+    *o = (twa_sums){0};
+    for (int j = 0; j < 4; j++) {
+        o->sms += a[j];
+        o->lms += b[j];
+        uint64_t gj = (uint64_t)g[j];
+        o->gap = gj > o->gap ? gj : o->gap;
+    }
+    twa_tail(type, ts, v, s, n, sl, ll, o, L64);
+}
+
 __attribute__((target("avx2"))) static void twa_avx2(int type, const int64_t *ts, const void *v, size_t n,
                                                     twa_sums *o)
 {
@@ -1288,7 +1397,7 @@ K_AVX512 __m512d twa_ld_avx512(int type, const void *v, size_t p, __mmask8 *ok)
     switch (type) {
     case TSDB_FLOAT32: {
         __m256i b = _mm256_loadu_si256((const __m256i *)((const uint32_t *)v + p));
-        *ok = _mm512_cmpneq_epi64_mask(_mm512_cvtepu32_epi64(b), _mm512_set1_epi64(NULL_F32));
+        *ok = (__mmask8)_mm512_cmpneq_epi32_mask(_mm512_castsi256_si512(b), _mm512_set1_epi32((int)NULL_F32));
         return _mm512_cvtps_pd(_mm256_castsi256_ps(b));
     }
     case TSDB_FLOAT64: {
@@ -1302,15 +1411,19 @@ K_AVX512 __m512d twa_ld_avx512(int type, const void *v, size_t p, __mmask8 *ok)
         return _mm512_cvtepi64_pd(b);
     }
     default: {
-        __m512i b = _mm512_cvtepu32_epi64(_mm256_loadu_si256((const __m256i *)((const uint32_t *)v + p)));
-        *ok = _mm512_cmpneq_epi64_mask(b, _mm512_set1_epi64(NULL_BOOL));
-        return _mm512_cvtepu64_pd(b);
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const uint32_t *)v + p));
+        *ok = (__mmask8)_mm512_cmpneq_epi32_mask(_mm512_castsi256_si512(b), _mm512_set1_epi32((int)NULL_BOOL));
+        return _mm512_cvtepu32_pd(b);
     }
     }
 }
 
 K_AVX512 void twa_avx512_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
 {
+    if (n < 2) {
+        *o = (twa_sums){0};
+        return;
+    }
     const __m512d half = _mm512_set1_pd(0.5);
     __m512d st[2], li[2];
     __m512i sms = _mm512_setzero_si512(), lms = sms, gap = sms;
@@ -1327,8 +1440,8 @@ K_AVX512 void twa_avx512_impl(int type, const int64_t *ts, const void *v, size_t
             __m512d d = _mm512_cvtepu64_pd(dt);
             __mmask8 both = okp & ok;
             st[q] = _mm512_add_pd(st[q], _mm512_maskz_mov_pd(okp, _mm512_mul_pd(vp, d)));
-            li[q] = _mm512_add_pd(li[q],
-                                  _mm512_maskz_mov_pd(both, _mm512_mul_pd(_mm512_mul_pd(_mm512_add_pd(vp, x), half), d)));
+            li[q] = _mm512_add_pd(
+                li[q], _mm512_maskz_mov_pd(both, _mm512_mul_pd(_mm512_mul_pd(_mm512_add_pd(vp, x), half), d)));
             sms = _mm512_mask_add_epi64(sms, okp, sms, dt);
             lms = _mm512_mask_add_epi64(lms, both, lms, dt);
         }
