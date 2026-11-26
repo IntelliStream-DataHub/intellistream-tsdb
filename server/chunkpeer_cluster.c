@@ -55,6 +55,47 @@ static int hold_hook_ms;
 static char hold_hook_path[512];
 static atomic_bool hold_done;
 static char pause_midput_path[512];
+#ifdef TSDB_TEST_HOOKS
+/* TSDB_CHUNKPEER_TEST=read_delay=FILE: while FILE exists with "<node> <delay_ms> [max_count]", delays CS_OP_READ
+ * calls to `node` by `delay_ms` (up to `max_count` calls when > 0, else every call); changing FILE resets the count. */
+static char read_delay_path[512];
+static pthread_mutex_t read_delay_mu = PTHREAD_MUTEX_INITIALIZER;
+static char read_delay_last[128];
+static uint64_t read_delay_seen;
+
+static void read_delay_hook(uint32_t node)
+{
+    int fd = open(read_delay_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    unsigned target = 0;
+    int ms = 0;
+    unsigned long long max_cnt = 0;
+    if (sscanf(buf, "%u %d %llu", &target, &ms, &max_cnt) < 2 || ms <= 0 || target != node)
+        return;
+    bool do_sleep = false;
+    pthread_mutex_lock(&read_delay_mu);
+    if (strcmp(buf, read_delay_last) != 0) {
+        snprintf(read_delay_last, sizeof read_delay_last, "%s", buf);
+        read_delay_seen = 0;
+    }
+    if (max_cnt == 0 || read_delay_seen < max_cnt) {
+        read_delay_seen++;
+        do_sleep = true;
+    }
+    pthread_mutex_unlock(&read_delay_mu);
+    if (do_sleep) {
+        struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+#endif
 
 static void pause_midput_hook(unsigned pos)
 {
@@ -91,6 +132,10 @@ static int net_call(void *arg, uint32_t node, const struct cs_req *r, int timeou
                     size_t *body_len)
 {
     (void)arg;
+#ifdef TSDB_TEST_HOOKS
+    if (r->op == CS_OP_READ && read_delay_path[0])
+        read_delay_hook(node);
+#endif
     struct chunksrv *cs = chunksrv_cluster_hold(); /* the engines' threads call: tsdbd frees it before tsdb_close */
     if (!cs)
         return TSDB_ERR_UNAVAILABLE; /* no chunk server here (yet, or any more): every member is away as far as we know */
@@ -217,6 +262,8 @@ int chunkpeer_cluster_start(const char *stage_dir)
             snprintf(hold_hook_path, sizeof hold_hook_path, "%s", colon + 1);
     } else if (th && !strncmp(th, "pause_midput=", 13)) {
         snprintf(pause_midput_path, sizeof pause_midput_path, "%s", th + 13);
+    } else if (th && !strncmp(th, "read_delay=", 11)) {
+        snprintf(read_delay_path, sizeof read_delay_path, "%s", th + 11);
     }
     const char *mu = getenv("TSDB_CHUNKPEER_MUTANT");
     if (mu && *mu) {

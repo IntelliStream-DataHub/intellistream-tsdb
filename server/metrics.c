@@ -482,6 +482,34 @@ static void render(sb *b)
                    (unsigned)fp[i].peer, fp[i].p50_us / 1e6, (unsigned)fp[i].peer, fp[i].p99_us / 1e6);
     }
 
+    if (cfg.chunk_peers) { /* chunk read hedging and read-avoid per storage peer (R8-2, E31) */
+        metrics_chunk_peer cp[64];
+        size_t nc = cfg.chunk_peers(cp, sizeof cp / sizeof cp[0]);
+        family(b, "tsdb_chunk_reads_total", "counter", "Chunk cell read requests sent to this storage peer.");
+        for (size_t i = 0; i < nc; i++)
+            sb_add(b, "tsdb_chunk_reads_total{peer=\"%u\"} %llu\n", (unsigned)cp[i].peer,
+                   (unsigned long long)cp[i].reads);
+        family(b, "tsdb_chunk_read_hedges_total", "counter",
+               "Hedged chunk cell reads launched when this storage peer exceeded its hedge timer (E31).");
+        for (size_t i = 0; i < nc; i++)
+            sb_add(b, "tsdb_chunk_read_hedges_total{peer=\"%u\"} %llu\n", (unsigned)cp[i].peer,
+                   (unsigned long long)cp[i].hedges);
+        family(b, "tsdb_chunk_read_avoids_total", "counter",
+               "Chunk cell reads decoded around this storage peer without waiting while it was in read-avoid (E31).");
+        for (size_t i = 0; i < nc; i++)
+            sb_add(b, "tsdb_chunk_read_avoids_total{peer=\"%u\"} %llu\n", (unsigned)cp[i].peer,
+                   (unsigned long long)cp[i].avoids);
+        family(b, "tsdb_chunk_decoded_cells_total", "counter",
+               "Chunk cells decoded from other stripe positions in place of this storage peer.");
+        for (size_t i = 0; i < nc; i++)
+            sb_add(b, "tsdb_chunk_decoded_cells_total{peer=\"%u\"} %llu\n", (unsigned)cp[i].peer,
+                   (unsigned long long)cp[i].decoded_cells);
+        family(b, "tsdb_chunk_read_avoid", "gauge",
+               "1 while this storage peer is in read-avoid (decoded around without waiting), else 0 (E31).");
+        for (size_t i = 0; i < nc; i++)
+            sb_add(b, "tsdb_chunk_read_avoid{peer=\"%u\"} %d\n", (unsigned)cp[i].peer, cp[i].read_avoid ? 1 : 0);
+    }
+
     if (cfg.peer_links) { /* the peer links' frame check (--peer-check; a link runs at the stronger end's level) */
         static const char *const kname[8] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
         static const char *const cname[4] = {"", "none", "header", "full"};

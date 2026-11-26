@@ -3944,6 +3944,16 @@ static size_t fwd_metrics_rows(metrics_fwd_peer *out, size_t cap)
     return n;
 }
 
+static size_t chunk_peer_metrics_rows(metrics_chunk_peer *out, size_t cap)
+{
+    struct chunkpeer_peer_stats r[64];
+    size_t n = chunkpeer_peer_stats_get(r, cap < 64 ? cap : 64);
+    for (size_t i = 0; i < n; i++)
+        out[i] = (metrics_chunk_peer){r[i].peer, r[i].reads, r[i].hedges, r[i].avoids, r[i].decoded_cells,
+                                      r[i].read_avoid};
+    return n;
+}
+
 static void snap_metrics(metrics_snap *out)
 {
     struct rsnap_stats s;
@@ -6806,7 +6816,8 @@ int main(int argc, char **argv)
                           .vol_diverged = metrics_vol_diverged,
                           .margins = cluster_on ? metrics_margins : NULL,
                           .peer_links = cluster_on ? peerlink_up_by_check : NULL,
-                          .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL};
+                          .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL,
+                          .chunk_peers = cluster_on ? chunk_peer_metrics_rows : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));

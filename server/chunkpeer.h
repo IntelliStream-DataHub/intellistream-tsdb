@@ -103,18 +103,39 @@ struct chunkpeer *chunkpeer_cluster(void);
  * its META (synced), so that it attaches the peer cold ops; 0 for any other volume, else the line and an error. */
 int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);
 
-/* Planted bugs (tests/test_chunkpeer.c and test_cluster ecbasic --mutant; TSDB_CHUNKPEER_MUTANT in tsdbd). */
+/* Per-storage-server read hedging and read-avoid counters (E31; /metrics and unit tests). */
+struct chunkpeer_peer_stats {
+    uint32_t peer;
+    uint64_t reads;         /* CS_OP_READ calls sent to this peer */
+    uint64_t hedges;        /* hedged reads launched when this peer exceeded its hedge timer */
+    uint64_t avoids;        /* cell reads decoded around this peer while in read-avoid */
+    uint64_t decoded_cells; /* cells decoded from other positions in place of this peer */
+    uint32_t hedge_ms;      /* current hedge timer: clamp(2 * p99, 20, 500) ms */
+    double p99_ms;          /* sliding read latency p99 in ms */
+    int read_avoid;         /* 1 while currently in read-avoid, else 0 */
+};
+size_t chunkpeer_peer_stats_get(struct chunkpeer_peer_stats *out, size_t cap);
+void chunkpeer_hedge_reset(void); /* clears per-peer latency/bucket/avoid state (tests) */
+
+/* Planted bugs (tests/test_chunkpeer.c and test_cluster ecbasic/ecslow --mutant; TSDB_CHUNKPEER_MUTANT in tsdbd). */
 enum {
     CP_MUT_NONE = 0,
-    CP_MUT_OWNEPOCH = 1,    /* ownepoch: the epoch provider and source answer the stores' own fence (the writer's) */
-    CP_MUT_NOSUMCMP = 2,    /* nosumcmp: a PUT_OK's sum is not compared with the table sent */
-    CP_MUT_STALERAISE = 3,  /* staleraise: the source answers from a copy that is not caught up */
-    CP_MUT_DELBEFOREGC = 4, /* delbeforegc: deletes go through on a cluster volume before MK_GC exists */
-    CP_MUT_STICKY = 5,      /* sticky: a context unfenced at attach stays so for its life (never asked again) */
-    CP_MUT_UNSUREDOWN = 6,  /* unsuredown: all_up counts a member whose store is unsure as down */
+    CP_MUT_OWNEPOCH = 1,     /* ownepoch: the epoch provider and source answer the stores' own fence (the writer's) */
+    CP_MUT_NOSUMCMP = 2,     /* nosumcmp: a PUT_OK's sum is not compared with the table sent */
+    CP_MUT_STALERAISE = 3,   /* staleraise: the source answers from a copy that is not caught up */
+    CP_MUT_DELBEFOREGC = 4,  /* delbeforegc: deletes go through on a cluster volume before MK_GC exists */
+    CP_MUT_STICKY = 5,       /* sticky: a context unfenced at attach stays so for its life (never asked again) */
+    CP_MUT_UNSUREDOWN = 6,   /* unsuredown: all_up counts a member whose store is unsure as down */
+    CP_MUT_HEDGEALL = 7,     /* hedgeall: no 5% token bucket (every hedge timer expiry launches a hedge) */
+    CP_MUT_NOAVOID = 8,      /* noavoid: never enter read-avoid after 8 timeouts in 10 s */
+    CP_MUT_HEDGECORRUPT = 9, /* hedgecorrupt: report a hedge timeout as CORRUPT instead of UNAVAILABLE (breaks E15) */
 };
 extern int chunkpeer_mutant;
 extern uint32_t chunkpeer_test_list_max; /* entries per page of list_names (test_chunkpeer: pagination) */
+#ifdef TSDB_TEST_HOOKS
+extern int64_t (*chunkpeer_test_now_ms)(void); /* NULL: CLOCK_MONOTONIC ms (unit tests: window & avoid timers) */
+extern int chunkpeer_test_avoid_ms;            /* 0: default 30,000 ms */
+#endif
 int chunkpeer_mutant_parse(const char *name); /* CP_MUT_* or -1 */
 
 #endif
