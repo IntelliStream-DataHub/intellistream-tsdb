@@ -56,41 +56,111 @@ final class Pack {
         return o;
     }
 
+    /** Tile width for L1D-resident byte-plane transpose: 1024 values * 8 planes = 8 KiB. */
+    private static final int TILE = 1024;
+
     /** Byte planes of the little-endian wire values: plane b holds byte b of every value. */
     private static int planes(Column c, int off, int n, byte[] out, int o) {
+        if (n == 0)
+            return o;
+        int tileLen = Math.min(n, TILE);
         switch (c.type()) {
         case FLOAT32: {
             float[] v = c.floats;
-            for (int i = 0; i < n; i++) {
-                int x = Float.floatToRawIntBits(v[off + i]); /* raw: the null NaN payload must survive */
-                out[o + i] = (byte) x;
-                out[o + n + i] = (byte) (x >>> 8);
-                out[o + 2 * n + i] = (byte) (x >>> 16);
-                out[o + 3 * n + i] = (byte) (x >>> 24);
+            byte[] p0 = new byte[tileLen], p1 = new byte[tileLen], p2 = new byte[tileLen], p3 = new byte[tileLen];
+            for (int i0 = 0; i0 < n; i0 += TILE) {
+                int m = Math.min(TILE, n - i0);
+                int base = off + i0;
+                for (int j = 0; j < m; j++) {
+                    int x = Float.floatToRawIntBits(v[base + j]); /* raw: the null NaN payload must survive */
+                    p0[j] = (byte) x;
+                    p1[j] = (byte) (x >>> 8);
+                    p2[j] = (byte) (x >>> 16);
+                    p3[j] = (byte) (x >>> 24);
+                }
+                System.arraycopy(p0, 0, out, o + i0, m);
+                System.arraycopy(p1, 0, out, o + n + i0, m);
+                System.arraycopy(p2, 0, out, o + 2 * n + i0, m);
+                System.arraycopy(p3, 0, out, o + 3 * n + i0, m);
             }
             return o + 4 * n;
         }
         case STATE: {
             int[] v = c.states;
-            for (int i = 0; i < n; i++) {
-                int x = v[off + i];
-                out[o + i] = (byte) x;
-                out[o + n + i] = (byte) (x >>> 8);
-                out[o + 2 * n + i] = (byte) (x >>> 16);
-                out[o + 3 * n + i] = (byte) (x >>> 24);
+            byte[] p0 = new byte[tileLen], p1 = new byte[tileLen], p2 = new byte[tileLen], p3 = new byte[tileLen];
+            for (int i0 = 0; i0 < n; i0 += TILE) {
+                int m = Math.min(TILE, n - i0);
+                int base = off + i0;
+                for (int j = 0; j < m; j++) {
+                    int x = v[base + j];
+                    p0[j] = (byte) x;
+                    p1[j] = (byte) (x >>> 8);
+                    p2[j] = (byte) (x >>> 16);
+                    p3[j] = (byte) (x >>> 24);
+                }
+                System.arraycopy(p0, 0, out, o + i0, m);
+                System.arraycopy(p1, 0, out, o + n + i0, m);
+                System.arraycopy(p2, 0, out, o + 2 * n + i0, m);
+                System.arraycopy(p3, 0, out, o + 3 * n + i0, m);
             }
             return o + 4 * n;
         }
         case FLOAT64: {
             double[] v = c.doubles;
-            for (int i = 0; i < n; i++)
-                plane8(out, o, n, i, Double.doubleToRawLongBits(v[off + i]));
+            byte[] p0 = new byte[tileLen], p1 = new byte[tileLen], p2 = new byte[tileLen], p3 = new byte[tileLen];
+            byte[] p4 = new byte[tileLen], p5 = new byte[tileLen], p6 = new byte[tileLen], p7 = new byte[tileLen];
+            for (int i0 = 0; i0 < n; i0 += TILE) {
+                int m = Math.min(TILE, n - i0);
+                int base = off + i0;
+                for (int j = 0; j < m; j++) {
+                    long x = Double.doubleToRawLongBits(v[base + j]); /* raw: the null NaN payload must survive */
+                    p0[j] = (byte) x;
+                    p1[j] = (byte) (x >>> 8);
+                    p2[j] = (byte) (x >>> 16);
+                    p3[j] = (byte) (x >>> 24);
+                    p4[j] = (byte) (x >>> 32);
+                    p5[j] = (byte) (x >>> 40);
+                    p6[j] = (byte) (x >>> 48);
+                    p7[j] = (byte) (x >>> 56);
+                }
+                System.arraycopy(p0, 0, out, o + i0, m);
+                System.arraycopy(p1, 0, out, o + n + i0, m);
+                System.arraycopy(p2, 0, out, o + 2 * n + i0, m);
+                System.arraycopy(p3, 0, out, o + 3 * n + i0, m);
+                System.arraycopy(p4, 0, out, o + 4 * n + i0, m);
+                System.arraycopy(p5, 0, out, o + 5 * n + i0, m);
+                System.arraycopy(p6, 0, out, o + 6 * n + i0, m);
+                System.arraycopy(p7, 0, out, o + 7 * n + i0, m);
+            }
             return o + 8 * n;
         }
         case INT64: {
             long[] v = c.longs;
-            for (int i = 0; i < n; i++)
-                plane8(out, o, n, i, v[off + i]);
+            byte[] p0 = new byte[tileLen], p1 = new byte[tileLen], p2 = new byte[tileLen], p3 = new byte[tileLen];
+            byte[] p4 = new byte[tileLen], p5 = new byte[tileLen], p6 = new byte[tileLen], p7 = new byte[tileLen];
+            for (int i0 = 0; i0 < n; i0 += TILE) {
+                int m = Math.min(TILE, n - i0);
+                int base = off + i0;
+                for (int j = 0; j < m; j++) {
+                    long x = v[base + j];
+                    p0[j] = (byte) x;
+                    p1[j] = (byte) (x >>> 8);
+                    p2[j] = (byte) (x >>> 16);
+                    p3[j] = (byte) (x >>> 24);
+                    p4[j] = (byte) (x >>> 32);
+                    p5[j] = (byte) (x >>> 40);
+                    p6[j] = (byte) (x >>> 48);
+                    p7[j] = (byte) (x >>> 56);
+                }
+                System.arraycopy(p0, 0, out, o + i0, m);
+                System.arraycopy(p1, 0, out, o + n + i0, m);
+                System.arraycopy(p2, 0, out, o + 2 * n + i0, m);
+                System.arraycopy(p3, 0, out, o + 3 * n + i0, m);
+                System.arraycopy(p4, 0, out, o + 4 * n + i0, m);
+                System.arraycopy(p5, 0, out, o + 5 * n + i0, m);
+                System.arraycopy(p6, 0, out, o + 6 * n + i0, m);
+                System.arraycopy(p7, 0, out, o + 7 * n + i0, m);
+            }
             return o + 8 * n;
         }
         default: { /* BOOL: one plane */
@@ -100,11 +170,6 @@ final class Pack {
             return o + n;
         }
         }
-    }
-
-    private static void plane8(byte[] out, int o, int n, int i, long x) {
-        for (int b = 0; b < 8; b++, o += n)
-            out[o + i] = (byte) (x >>> (8 * b));
     }
 
     static long zigzag(long x) {

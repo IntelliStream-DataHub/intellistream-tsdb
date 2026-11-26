@@ -237,6 +237,16 @@ impl FrameBuf {
         &self.buf
     }
 
+    /// The already-finished frame bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Takes ownership of the underlying frame buffer (zero-copy promotion to the retry queue).
+    pub(crate) fn take_vec(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
     /// Releases memory after a large request, keeping a modest buffer.
     pub(crate) fn shrink(&mut self) {
         const KEEP: usize = 1 << 20;

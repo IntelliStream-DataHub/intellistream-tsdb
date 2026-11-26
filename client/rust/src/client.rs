@@ -61,7 +61,6 @@ pub const DEFAULT_COMPRESSION: i32 = 1;
 struct Packer {
     zc: zstd::bulk::Compressor<'static>,
     level: i32,
-    scratch: Vec<u8>,
     raw: Vec<u8>,
     z: Vec<u8>,
 }
@@ -70,7 +69,7 @@ impl Packer {
     /// Releases memory after a large insert, as `FrameBuf::shrink`.
     fn shrink(&mut self) {
         const KEEP: usize = 1 << 20;
-        for b in [&mut self.scratch, &mut self.raw, &mut self.z] {
+        for b in [&mut self.raw, &mut self.z] {
             if b.capacity() > KEEP {
                 *b = Vec::new();
             }
@@ -125,6 +124,9 @@ pub struct Client {
     /// and MOVED mean "not applied", and the request goes again from here.
     kept: VecDeque<Kept>,
     kept_bytes: usize,
+    /// When `Some(id)`, the retained frame for request `id` lives directly in `self.req` (no `to_vec()` clone on
+    /// single-flight calls); moved zero-copy into `self.kept` if pipelining or a reconnect needs `self.req`.
+    req_kept_id: Option<u32>,
     /// The op of the request sent last (where an error reply's body starts).
     last_op: u8,
     /// The body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED reply.
@@ -470,6 +472,7 @@ impl Client {
             retry: Some(DEFAULT_RETRY_BUDGET),
             kept: VecDeque::new(),
             kept_bytes: 0,
+            req_kept_id: None,
             last_op: 0,
             err: ErrorInfo::default(),
             refused: None,
@@ -724,7 +727,7 @@ impl Client {
     fn series_send(&mut self, name: &str, create: bool, path: Option<&str>) -> Result<()> {
         let name = wire_str("series name", name, false)?;
         let path = path.map(|p| wire_str("path", p, true)).transpose()?;
-        self.req.begin(self.next_id, Op::Series).u8(create as u8).u16(name.len() as u16).bytes(name);
+        self.req_begin(Op::Series).u8(create as u8).u16(name.len() as u16).bytes(name);
         if let Some(p) = path {
             self.req.u16(p.len() as u16).bytes(p);
         }
@@ -1034,7 +1037,13 @@ impl Client {
             if self.pending >= MAX_PIPELINE {
                 self.collect_ack()?;
             }
-            let f = self.req.begin(self.next_id, Op::Insert);
+            if self.retry.is_some()
+                && self.pending > 0
+                && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes_total() >= KEEP_BYTES)
+            {
+                self.drain()?;
+            }
+            let f = self.req_begin(Op::Insert);
             f.u32(m as u32).u32(0).u64(series.map_or(one, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
             Native::put(&values[off..off + m], f.raw());
             if let Some(s) = series {
@@ -1077,15 +1086,24 @@ impl Client {
             if self.pending >= MAX_PIPELINE {
                 self.collect_ack()?;
             }
-            let f = self.req.begin(self.next_id, Op::InsertValues);
-            f.u32(m as u32).u8(col.value_type().code()).u8(flags).u16(0).u64(series.map_or(one, |_| MANY_SERIES));
+            if self.retry.is_some()
+                && self.pending > 0
+                && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes_total() >= KEEP_BYTES)
+            {
+                self.drain()?;
+            }
+            self.req_begin(Op::InsertValues)
+                .u32(m as u32)
+                .u8(col.value_type().code())
+                .u8(flags)
+                .u16(0)
+                .u64(series.map_or(one, |_| MANY_SERIES));
             if packed {
                 let p = match &mut self.packer {
                     Some(p) => p,
                     p @ None => p.insert(Packer {
                         zc: zstd::bulk::Compressor::new(self.level)?,
                         level: self.level,
-                        scratch: Vec::new(),
                         raw: Vec::new(),
                         z: Vec::new(),
                     }),
@@ -1096,21 +1114,21 @@ impl Client {
                 }
                 p.raw.clear();
                 let valid = col.valid.map(Bitmap::as_bytes);
-                pack::reshape(ts, col.values, valid, series, off, off + m, &mut p.scratch, &mut p.raw);
+                pack::reshape(ts, col.values, valid, series, off, off + m, &mut p.raw);
                 debug_assert!(p.raw.len() <= pack::raw_bound(m, col.value_type(), valid.is_some(), series.is_some()));
                 p.z.clear();
                 p.z.reserve(zstd::zstd_safe::compress_bound(p.raw.len()));
                 p.zc.compress_to_buffer(&p.raw, &mut p.z)?;
-                f.u32(p.raw.len() as u32).bytes(&p.z);
+                self.req.u32(p.raw.len() as u32).bytes(&p.z);
                 p.shrink();
             } else {
-                f.i64s(&ts[off..off + m]);
-                col.values.put(f.raw(), off, off + m);
+                self.req.i64s(&ts[off..off + m]);
+                col.values.put(self.req.raw(), off, off + m);
                 if let Some(v) = col.valid {
-                    f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
+                    self.req.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
                 }
                 if let Some(s) = series {
-                    f.align8().sids(&s[off..off + m]);
+                    self.req.align8().sids(&s[off..off + m]);
                 }
             }
             self.send_insert()?;
@@ -1123,7 +1141,9 @@ impl Client {
 
     fn send_insert(&mut self) -> Result<()> {
         let sent = self.send();
-        self.req.shrink();
+        if self.req_kept_id.is_none() {
+            self.req.shrink();
+        }
         sent?;
         self.pending += 1;
         Ok(())
@@ -1136,7 +1156,8 @@ impl Client {
         let st = self.read_frame_raw()?;
         self.reply_id = self.reply_id.wrapping_add(1);
         self.pending -= 1;
-        if retryable(st) && self.retry.is_some() && self.kept.iter().any(|k| k.id == id) {
+        let is_kept = self.req_kept_id == Some(id) || self.kept.iter().any(|k| k.id == id);
+        if retryable(st) && self.retry.is_some() && is_kept {
             if self.refused.is_none() {
                 self.refused = Some(id);
                 self.refused_err = self.err.clone();
@@ -1165,10 +1186,16 @@ impl Client {
                 break;
             }
             self.reply_id = first;
-            let from = self.kept.iter().position(|k| k.id == first).unwrap_or(0);
-            for i in from..self.kept.len() {
-                self.write_kept(i)?;
+            if self.kept.is_empty() && self.req_kept_id == Some(first) {
+                self.write_req_kept()?;
                 self.pending += 1;
+            } else {
+                self.promote_req_kept();
+                let from = self.kept.iter().position(|k| k.id == first).unwrap_or(0);
+                for i in from..self.kept.len() {
+                    self.write_kept(i)?;
+                    self.pending += 1;
+                }
             }
         }
         self.trim();
@@ -1456,7 +1483,7 @@ impl Client {
             None => self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?,
             Some(t) => {
                 // order and limit only when they change something: the 32-byte form is the shortest
-                let f = self.req.begin(self.next_id, Op::QueryLttb).u64(series).i64(start).i64(end).u64(t);
+                let f = self.req_begin(Op::QueryLttb).u64(series).i64(start).i64(end).u64(t);
                 if opts.order == Order::Desc || opts.limit.is_some() {
                     f.u8((opts.order == Order::Desc) as u8).u64(limit);
                 }
@@ -1509,7 +1536,7 @@ impl Client {
         order: Order,
         limit: u64,
     ) -> Result<()> {
-        self.req.begin(self.next_id, op).u64(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
+        self.req_begin(op).u64(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
         self.send()
     }
 
@@ -2236,7 +2263,7 @@ impl Client {
     pub fn user_list(&mut self) -> Result<Vec<User>> {
         self.run(|c| {
             c.wait_inner()?;
-            c.req.begin(c.next_id, Op::UserList);
+            c.req_begin(Op::UserList);
             c.send()?;
             let mut users = Vec::new();
             // chunks of one reply: u8 last, u32 n, n users; an error status ends it
@@ -2385,10 +2412,31 @@ impl Client {
         }
     }
 
+    /// Total bytes retained for retry across `self.kept` and any single-flight frame still in `self.req`.
+    fn kept_bytes_total(&self) -> usize {
+        self.kept_bytes + self.req_kept_id.map_or(0, |_| self.req.len())
+    }
+
+    /// Moves a single-flight frame held in `self.req` into `self.kept` (zero-copy).
+    fn promote_req_kept(&mut self) {
+        if let Some(id) = self.req_kept_id.take() {
+            let frame = self.req.take_vec();
+            self.kept_bytes += frame.len();
+            self.kept.push_back(Kept { id, frame });
+        }
+    }
+
+    /// Starts a new request frame in `self.req`, promoting any still-in-flight single-flight frame to `self.kept` first.
+    fn req_begin(&mut self, op: Op) -> &mut FrameBuf {
+        self.trim();
+        self.promote_req_kept();
+        self.req.begin(self.next_id, op)
+    }
+
     /// Sends a request after collecting pending inserts, and reads its reply into `body`.
     fn request(&mut self, op: Op, build: impl FnOnce(&mut FrameBuf)) -> Result<()> {
         self.wait_inner()?;
-        build(self.req.begin(self.next_id, op));
+        build(self.req_begin(op));
         self.send()?;
         let st = self.read_frame()?;
         self.reply_id = self.reply_id.wrapping_add(1);
@@ -2404,12 +2452,21 @@ impl Client {
         if self.retry.is_some() && retained_op(self.last_op) {
             // the window: past it the acknowledgements are collected (and refused frames sent again) first
             if self.pending > 0 && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes >= KEEP_BYTES) {
-                self.drain()?;
+                let cur = self.req.take_vec();
+                let r = self.drain();
+                *self.req.raw() = cur;
+                r?;
             }
             self.trim();
-            let frame = self.req.finish();
-            self.kept_bytes += frame.len();
-            self.kept.push_back(Kept { id: self.next_id, frame: frame.to_vec() });
+            if self.kept.is_empty() && self.req_kept_id.is_none() {
+                // Single-flight: keep the frame in `self.req` without cloning `frame.to_vec()`.
+                self.req_kept_id = Some(self.next_id);
+            } else {
+                debug_assert!(self.req_kept_id.is_none());
+                let frame = self.req.finish();
+                self.kept_bytes += frame.len();
+                self.kept.push_back(Kept { id: self.next_id, frame: frame.to_vec() });
+            }
         }
         let frame = self.req.finish();
         let mut s: &TcpStream = self.stream.get_ref();
@@ -2432,12 +2489,28 @@ impl Client {
         if self.kept.is_empty() {
             self.kept_bytes = 0;
         }
+        if let Some(id) = self.req_kept_id
+            && (id.wrapping_sub(self.reply_id) as i32) < 0
+            && self.refused != Some(id)
+        {
+            self.req_kept_id = None;
+            self.req.shrink();
+        }
     }
 
     /// Sends the kept frame number `i` again (same id).
     fn write_kept(&mut self, i: usize) -> Result<()> {
         let mut s: &TcpStream = self.stream.get_ref();
         let frame = &self.kept[i].frame;
+        s.write_all(frame)?;
+        self.bytes_sent += frame.len() as u64;
+        Ok(())
+    }
+
+    /// Sends the single-flight kept frame in `self.req` again (same id).
+    fn write_req_kept(&mut self) -> Result<()> {
+        let mut s: &TcpStream = self.stream.get_ref();
+        let frame = self.req.as_bytes();
         s.write_all(frame)?;
         self.bytes_sent += frame.len() as u64;
         Ok(())
@@ -2461,6 +2534,9 @@ impl Client {
         if budget.is_none() {
             self.kept.clear();
             self.kept_bytes = 0;
+            if self.req_kept_id.take().is_some() {
+                self.req.shrink();
+            }
         }
     }
 
@@ -2560,6 +2636,7 @@ impl Client {
         let old_timeout = self.timeout();
         let old = std::mem::replace(&mut self.stream, BufReader::with_capacity(READ_BUF, stream));
         // the handshake's own ids: the server only echoes them; its calls trim the kept frames: hide them meanwhile
+        self.promote_req_kept();
         let (saved_reply, saved_pending, saved_next) = (self.reply_id, self.pending, self.next_id);
         let kept = std::mem::take(&mut self.kept);
         let kept_bytes = std::mem::take(&mut self.kept_bytes);
@@ -2661,21 +2738,27 @@ impl Client {
         loop {
             let id = self.reply_id;
             let st = self.read_frame_raw()?;
-            let alone = self.kept.iter().all(|k| k.id == id || (k.id.wrapping_sub(id) as i32) < 0);
+            let alone = self.kept.iter().all(|k| k.id == id || (k.id.wrapping_sub(id) as i32) < 0)
+                && self.req_kept_id.is_none_or(|rid| rid == id || (rid.wrapping_sub(id) as i32) < 0);
             if !retryable(st) || self.retry.is_none() || !alone || self.delivered == Some(id) {
                 self.delivered = Some(id);
                 return Ok(st);
             }
-            let Some(at) = self.kept.iter().position(|k| k.id == id) else {
+            let has_kept = self.req_kept_id == Some(id) || self.kept.iter().any(|k| k.id == id);
+            if !has_kept {
                 self.delivered = Some(id);
                 return Ok(st);
-            };
+            }
             let e = self.err.clone();
             if !self.retry_step(&e, &mut deadline, &mut moved_tries) {
                 self.delivered = Some(id);
                 return Ok(st);
             }
-            self.write_kept(at)?;
+            if self.req_kept_id == Some(id) {
+                self.write_req_kept()?;
+            } else if let Some(at) = self.kept.iter().position(|k| k.id == id) {
+                self.write_kept(at)?;
+            }
         }
     }
 
@@ -2699,7 +2782,11 @@ impl Client {
         self.stream.read_exact(&mut self.body)?;
         let st = word(9) as i32;
         if (-13..=-10).contains(&st) {
-            let op = self.kept.iter().find(|k| k.id == id).map_or(self.last_op, |k| k.frame[8]);
+            let op = if self.req_kept_id == Some(id) {
+                self.req.op()
+            } else {
+                self.kept.iter().find(|k| k.id == id).map_or(self.last_op, |k| k.frame[8])
+            };
             self.err = ha::error_info(st, &self.body, op);
             let shape = ha::error_shape(op);
             if op != Op::QueryMulti as u8 && shape > 0 && self.body.len() >= shape {

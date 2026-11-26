@@ -467,7 +467,7 @@ impl Client {
             if body > MAX_FRAME {
                 return Err(Error::Server(Status::TooManyBuckets)); // bounds that no frame carries
             }
-            let f = self.req.begin(self.next_id, Op::QueryMulti);
+            let f = self.req_begin(Op::QueryMulti);
             f.u8(op as u8).u8(flags).u16(m.threads).u32(k as u32).u64(left).u32(t.len() as u32).u32(0);
             if let Some(s) = m.starts {
                 f.i64s(&s[at..at + k]);

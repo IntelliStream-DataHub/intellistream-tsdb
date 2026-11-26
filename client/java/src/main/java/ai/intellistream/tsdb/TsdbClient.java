@@ -131,10 +131,13 @@ public final class TsdbClient implements AutoCloseable {
      * reply is read, so that a refused one can go again, with the same id. */
     private static final int KEEP_FRAMES = 1024;
     private static final int KEEP_BYTES = 128 << 20;
+    private static final int KEPT_REUSE_MAX = 64 << 20; /* reuse single-flight backing array up to 64 MiB */
     private static final Duration DEFAULT_RETRY = Duration.ofSeconds(30);
     private final ArrayDeque<Kept> kept = new ArrayDeque<>();
     private long keptBytes;
     private Kept cur;                            /* the frame being sent; null: not kept */
+    private byte[] keptReuse;                    /* reusable backing array for single-flight Kept */
+    private boolean keptReuseBusy;               /* true while an entry in kept borrows keptReuse */
     private byte lastOp;
     private long retryNanos = DEFAULT_RETRY.toNanos(); /* the time budget of one request's retries; 0: no retries */
     private ErrorInfo err = ErrorInfo.bare(0);   /* the body of the latest UNAVAILABLE, MOVED, PARTIAL or DROPPED */
@@ -152,12 +155,15 @@ public final class TsdbClient implements AutoCloseable {
     private static final class Kept {
         final int id;
         final byte op;
-        byte[] buf = new byte[256];
+        final boolean pooled;
+        byte[] buf;
         int len;
 
-        Kept(int id, byte op) {
+        Kept(int id, byte op, byte[] buf, boolean pooled) {
             this.id = id;
             this.op = op;
+            this.buf = buf;
+            this.pooled = pooled;
         }
 
         void append(ByteBuffer flipped) {
@@ -448,6 +454,11 @@ public final class TsdbClient implements AutoCloseable {
             }
         }
         closed = true;
+        kept.clear();
+        keptBytes = 0;
+        cur = null;
+        keptReuse = null;
+        keptReuseBusy = false;
         closeQuietly(ch);
         closeQuietly(selector);
         if (zstd != null)
@@ -541,6 +552,7 @@ public final class TsdbClient implements AutoCloseable {
             kept.clear();
             keptBytes = 0;
             cur = null;
+            keptReuseBusy = false;
         }
         retryNanos = n;
     }
@@ -3758,6 +3770,8 @@ public final class TsdbClient implements AutoCloseable {
             int w1 = Math.min(nm, w0 + NAME_WINDOW);
             request();
             int ns = 0, na = 0;
+            cur = null;
+            lastOp = Protocol.OP_SERIES;
             for (int m = w0; m < w1; m++) {
                 int i = misses[m];
                 byte[] nb;
@@ -3770,9 +3784,17 @@ public final class TsdbClient implements AutoCloseable {
                     res[i] = SeriesResult.failed(Status.ERR_INVALID, e.getMessage());
                     continue;
                 }
-                seriesSend(nb, false, null);
+                /* Coalesce the window's SERIES frames in `out` (one socket write per window, no per-name Kept:
+                 * UNAVAILABLE/MOVED replies are retried individually below via seriesRequest). */
+                int frameLen = 12 + nb.length;
+                if (out.remaining() < frameLen)
+                    send();
+                out.putInt(5 + 3 + nb.length).putInt(nextId++).put(Protocol.OP_SERIES);
+                out.put((byte) 0).putShort((short) nb.length).put(nb);
                 sent[ns++] = i;
             }
+            if (out.position() > 0)
+                send();
             TsdbException first = null;
             for (int x = 0; x < ns; x++) {
                 int i = sent[x];
@@ -3893,7 +3915,24 @@ public final class TsdbClient implements AutoCloseable {
         lastOp = op;
         if (retryNanos > 0 && retained(op)) {
             trim();
-            cur = new Kept(nextId, op);
+            int frameSize = (int) Math.min(payload + 9, (long) Protocol.MAX_FRAME + 4);
+            byte[] buf;
+            boolean pooled = false;
+            if (!keptReuseBusy && frameSize <= KEPT_REUSE_MAX) {
+                if (keptReuse == null || keptReuse.length < frameSize) {
+                    int cap = frameSize <= (1 << 20)
+                            ? Math.max(256, Integer.highestOneBit(frameSize - 1) << 1) : frameSize;
+                    if (cap > KEPT_REUSE_MAX || cap < frameSize)
+                        cap = frameSize;
+                    keptReuse = new byte[cap];
+                }
+                keptReuseBusy = true;
+                pooled = true;
+                buf = keptReuse;
+            } else {
+                buf = new byte[frameSize];
+            }
+            cur = new Kept(nextId, op, buf, pooled);
             kept.add(cur);
         } else {
             cur = null;
@@ -3916,6 +3955,8 @@ public final class TsdbClient implements AutoCloseable {
                 break;
             kept.removeFirst();
             keptBytes -= k.len;
+            if (k.pooled)
+                keptReuseBusy = false;
         }
         if (kept.isEmpty())
             keptBytes = 0;

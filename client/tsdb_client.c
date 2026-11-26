@@ -72,6 +72,9 @@ struct tsdbc {
         uint8_t *p;          /* the whole frame, header included */
     } *q;
     size_t qhead, qlen, qcap, qbytes;
+    uint8_t *kbuf;           /* reusable retain buffer for single-flight requests (capped by KBUF_MAX_KEEP) */
+    size_t kcap;
+    bool kbuf_busy;          /* true while an entry in c->q borrows c->kbuf */
     bool stream_valid;       /* a reply of stream_id has been delivered in part: it cannot be sent again */
     uint32_t stream_id;
     bool gave_up;            /* read_reply stopped retrying (the budget): drain must not start over */
@@ -92,6 +95,7 @@ struct tsdbc {
 
 #define QCAP_FRAMES 1024u            /* pipelined inserts kept for a resend: drain before there are more */
 #define QCAP_BYTES ((size_t)128 << 20)
+#define KBUF_MAX_KEEP ((size_t)64 << 20) /* reuse single-flight retain buffer up to 64 MiB; never pin 256 MiB */
 
 /* Waits up to ms (0: as long as the kernel does) for a connect to finish. */
 static int connect_within(int fd, const struct sockaddr *addr, socklen_t len, int ms)
@@ -274,8 +278,10 @@ void tsdbc_close(tsdbc *c)
         tsdbc_wait(c);
     close(c->fd);
     for (size_t i = 0; i < c->qlen; i++)
-        free(c->q[c->qhead + i].p);
+        if (c->q[c->qhead + i].p != c->kbuf)
+            free(c->q[c->qhead + i].p);
     free(c->q);
+    free(c->kbuf);
     for (size_t i = 0; i < c->nnodes; i++)
         free(c->nodes[i]);
     free(c->nodes);
@@ -335,7 +341,10 @@ static void q_trim(tsdbc *c)
 {
     while (c->qlen && (int32_t)(c->q[c->qhead].id - c->expect) < 0) {
         c->qbytes -= c->q[c->qhead].len;
-        free(c->q[c->qhead].p);
+        if (c->q[c->qhead].p == c->kbuf)
+            c->kbuf_busy = false;
+        else
+            free(c->q[c->qhead].p);
         c->qhead++;
         c->qlen--;
     }
@@ -357,9 +366,14 @@ static struct sent *q_find(tsdbc *c, uint32_t id)
     return NULL;
 }
 
-/* Keeps a copy of the frame about to be sent: header and the pieces iov[0..n) of its payload. */
-static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, int n)
+/* Keeps a copy of the frame about to be sent: header and the pieces iov[0..n) of its payload.
+ * When retained, writes the contiguous retained buffer and its byte length to *kept_out / *kept_len so the caller
+ * can send it in one contiguous write instead of scattering iov. */
+static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, int n, const uint8_t **kept_out,
+                  size_t *kept_len)
 {
+    *kept_out = NULL;
+    *kept_len = 0;
     c->last_op = op;
     if (c->retry_ms <= 0 || !retained_op(op))
         return 0;
@@ -372,9 +386,34 @@ static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, in
     size_t total = 0;
     for (int i = 0; i < n; i++)
         total += iov[i].iov_len;
-    uint8_t *p = malloc(total ? total : 1);
-    if (!p)
-        return TSDB_ERR_NOMEM;
+    size_t need = total ? total : 1;
+    uint8_t *p;
+    if (!c->kbuf_busy && need <= KBUF_MAX_KEEP) {
+        if (need > c->kcap) {
+            size_t cap;
+            if (need <= (size_t)1 << 20) {
+                cap = c->kcap ? c->kcap : 4096;
+                while (cap < need)
+                    cap *= 2;
+                if (cap > KBUF_MAX_KEEP)
+                    cap = KBUF_MAX_KEEP;
+            } else {
+                cap = need;
+            }
+            uint8_t *nb = malloc(cap);
+            if (!nb)
+                return TSDB_ERR_NOMEM;
+            free(c->kbuf);
+            c->kbuf = nb;
+            c->kcap = cap;
+        }
+        p = c->kbuf;
+        c->kbuf_busy = true;
+    } else {
+        p = malloc(need);
+        if (!p)
+            return TSDB_ERR_NOMEM;
+    }
     size_t at = 0;
     for (int i = 0; i < n; i++) {
         if (iov[i].iov_len)
@@ -389,7 +428,10 @@ static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, in
             size_t cap = c->qcap ? c->qcap * 2 : 16;
             struct sent *nq = realloc(c->q, cap * sizeof *nq);
             if (!nq) {
-                free(p);
+                if (p == c->kbuf)
+                    c->kbuf_busy = false;
+                else
+                    free(p);
                 return TSDB_ERR_NOMEM;
             }
             c->q = nq;
@@ -398,6 +440,8 @@ static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, in
     }
     c->q[c->qhead + c->qlen++] = (struct sent){id, op, total, p};
     c->qbytes += total;
+    *kept_out = p;
+    *kept_len = total;
     return 0;
 }
 
@@ -412,8 +456,16 @@ static int send_req(tsdbc *c, uint8_t op, const void *a, size_t alen, const void
     hdr[8] = op;
     struct iovec iov[5] = {{hdr, sizeof hdr}, {(void *)a, alen}, {(void *)b, blen}, {(void *)d, dlen},
                            {(void *)e, elen}};
-    int rc = q_keep(c, op, id, iov, 5);
-    return rc ? rc : send_iov(c, iov, 5);
+    const uint8_t *kp;
+    size_t klen;
+    int rc = q_keep(c, op, id, iov, 5, &kp, &klen);
+    if (rc)
+        return rc;
+    if (kp) {
+        struct iovec one = {(void *)kp, klen};
+        return send_iov(c, &one, 1);
+    }
+    return send_iov(c, iov, 5);
 }
 
 /* Sends one request frame made of the pieces parts[1..n) (parts[0] is filled
@@ -429,8 +481,16 @@ static int send_reqv(tsdbc *c, uint8_t op, struct iovec *parts, int n)
     memcpy(hdr + 4, &id, 4);
     hdr[8] = op;
     parts[0] = (struct iovec){hdr, sizeof hdr};
-    int rc = q_keep(c, op, id, parts, n);
-    return rc ? rc : send_iov(c, parts, n);
+    const uint8_t *kp;
+    size_t klen;
+    int rc = q_keep(c, op, id, parts, n, &kp, &klen);
+    if (rc)
+        return rc;
+    if (kp) {
+        struct iovec one = {(void *)kp, klen};
+        return send_iov(c, &one, 1);
+    }
+    return send_iov(c, parts, n);
 }
 
 static int read_exact(tsdbc *c, void *dst, size_t n)
@@ -3597,20 +3657,50 @@ static int names_resolve(tsdbc *c, const char *const *names, size_t n, uint8_t *
         if (rc)
             return rc;
         bool sent[NAME_WINDOW] = {false};
-        size_t nsent = 0;
+        size_t nlen[NAME_WINDOW];
+        size_t nsent = 0, total = 0;
         for (size_t k = 0; k < w; k++) { /* an INVALID name (too long) is not sent */
-            rc = series_send(c, names[win[k]], 0, NULL);
-            if (rc == 0) {
-                sent[k] = true;
-                nsent++;
-            } else if (rc == TSDB_ERR_INVALID) {
+            size_t len = strlen(names[win[k]]);
+            if (len == 0 || len > 65535) {
                 out[win[k]] = (tsdb_latest_result){.status = TSDB_ERR_INVALID, .kind = TSDB_LATEST_NONE};
                 st[win[k]] = 2;
-            } else {
-                if (nsent && !c->broken) /* replies of what was sent stay unread: the connection is out of step */
-                    c->broken = true;
-                return rc;
+                continue;
             }
+            sent[k] = true;
+            nlen[k] = len;
+            nsent++;
+            total += TSDB_FRAME_HEADER + 3 + len;
+        }
+        if (nsent) {
+            /* Coalesce the window's SERIES frames into a single contiguous write (no per-name sendmsg or q_keep:
+             * any UNAVAILABLE/MOVED reply is retried individually below via tsdbc_series). */
+            q_trim(c);
+            c->last_op = TSDB_OP_SERIES;
+            uint8_t stack[8192];
+            uint8_t *buf = total <= sizeof stack ? stack : malloc(total);
+            if (!buf)
+                return TSDB_ERR_NOMEM;
+            uint8_t *p = buf;
+            for (size_t k = 0; k < w; k++) {
+                if (!sent[k])
+                    continue;
+                size_t len = nlen[k];
+                uint32_t flen = (uint32_t)(5 + 3 + len), id = c->next_id++;
+                uint16_t l16 = (uint16_t)len;
+                memcpy(p, &flen, 4);
+                memcpy(p + 4, &id, 4);
+                p[8] = TSDB_OP_SERIES;
+                p[9] = 0; /* create = 0 */
+                memcpy(p + 10, &l16, 2);
+                memcpy(p + 12, names[win[k]], len);
+                p += 12 + len;
+            }
+            struct iovec iov = {buf, total};
+            rc = send_iov(c, &iov, 1);
+            if (buf != stack)
+                free(buf);
+            if (rc)
+                return rc;
         }
         int first = 0; /* the first hard error: the replies are all read first */
         bool again[NAME_WINDOW] = {false};

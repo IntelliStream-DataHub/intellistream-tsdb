@@ -7,7 +7,7 @@
 //! one call at a time cannot do past a few connections: each call crosses the GIL twice.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -54,7 +54,7 @@ pub(crate) struct Pool {
     pool: RwLock<Option<tc::Pool>>,
     addr: String,
     /// Series types, which never change: insert_many() converts values to them.
-    types: Mutex<HashMap<u64, ValueType>>,
+    types: RwLock<HashMap<u64, ValueType>>,
 }
 
 impl Pool {
@@ -76,28 +76,35 @@ impl Pool {
     /// The type of each series in `ids`, looked up once (a lookup that failed is an error of its
     /// own, not of the call: insert_many() reports it for the insert that needed it).
     fn types(&self, py: Python<'_>, ids: &[u64]) -> PyResult<Vec<tc::Result<ValueType>>> {
-        let known = self.types.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let missing: Vec<u64> = ids.iter().copied().filter(|id| !known.contains_key(id)).collect();
-        let mut found = HashMap::new();
+        let mut out: Vec<Option<tc::Result<ValueType>>> = Vec::with_capacity(ids.len());
+        let mut missing: Vec<(usize, u64)> = Vec::new();
+        {
+            let cache = self.types.read().unwrap_or_else(|e| e.into_inner());
+            for (i, &id) in ids.iter().enumerate() {
+                if let Some(&ty) = cache.get(&id) {
+                    out.push(Some(Ok(ty)));
+                } else {
+                    out.push(None);
+                    missing.push((i, id));
+                }
+            }
+        }
         if !missing.is_empty() {
             let got = self.with(py, |p| {
-                p.map_retry(missing.len(), |c, i| match c.series_type(missing[i]) {
+                p.map_retry(missing.len(), |c, i| match c.series_type(missing[i].1) {
                     Err(e) if c.is_broken() => Err(e), // retried once on a new connection
                     r => Ok(r),
                 })
             })?;
-            let mut cache = self.types.lock().unwrap_or_else(|e| e.into_inner());
-            for (&id, r) in missing.iter().zip(got) {
+            let mut cache = self.types.write().unwrap_or_else(|e| e.into_inner());
+            for ((idx, id), r) in missing.into_iter().zip(got) {
                 if let Ok(t) = &r {
                     cache.insert(id, *t);
                 }
-                found.insert(id, r);
+                out[idx] = Some(r);
             }
         }
-        Ok(ids
-            .iter()
-            .map(|id| known.get(id).copied().map(Ok).unwrap_or_else(|| found.remove(id).expect("looked up")))
-            .collect())
+        Ok(out.into_iter().map(|r| r.expect("looked up")).collect())
     }
 }
 
@@ -133,7 +140,7 @@ impl Pool {
         let pool = py
             .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, &opts, keepalive, retry)))
             .map_err(|e| to_pyerr(py, e))?;
-        Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}"), types: Mutex::default() })
+        Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}"), types: RwLock::default() })
     }
 
     /// Number of connections.
