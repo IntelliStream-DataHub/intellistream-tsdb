@@ -481,7 +481,7 @@ test-units-b: $(TEST_B_BINS_1) $(TEST_B_BINS_2)
 	$(if $(EC_OBJ),for c in header full; do ./$(B)/test_chunksrv $(SCRATCH) --net --check $$c || exit 1; done) # its peer links at the other check levels
 	$(if $(EC_OBJ),$(MUT) --name test_chunksrv --list "chunknofence chunkselfraise putokearly nocellcheck storeforeign nometacheck sumsonly noreqcheck noopmatch norespcheck" -- ./$(B)/test_chunksrv --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_chunkpeer $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_chunkpeer --list "ownepoch nosumcmp staleraise delbeforegc sticky unsuredown" -- ./$(B)/test_chunkpeer --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_chunkpeer --list "ownepoch nosumcmp staleraise delbeforegc sticky unsuredown hedgeall noavoid hedgecorrupt" -- ./$(B)/test_chunkpeer --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_chunk_heal $(SCRATCH)
 	./$(B)/test_ecnames $(SCRATCH)
 	$(MUT) --name test_ecnames --list "nameloose tierloose" -- ./$(B)/test_ecnames --mutant @M@ @D@ # each planted bug must fail it
@@ -639,7 +639,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ec16 ecgc r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1184,12 +1184,14 @@ rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 # the lease and liveness mutants (server/cluster.c TSDB_CLUSTER_MUTANT): each must fail its test_cluster scenario
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)
-# r8f: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail test_cluster
-# ecbasic (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
+# r8f + r8n: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail
+# test_cluster ecbasic or ecslow (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "chunkpeer-mutants: this build has no erasure codec (NO_EC=1): ecbasic skips, nothing to plant"; false)
 	$(MUT) --name ecbasic --list "ownepoch staleraise" -- env TSDB_CHUNKPEER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecbasic
+	$(MUT) --name ecslow --list "hedgeall noavoid hedgecorrupt" -- env TSDB_CHUNKPEER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecslow
 # r8k-gc: cluster EC GC planted bugs in tsdbd (TSDB_ECGC_MUTANT), each must fail test_cluster ecgc
 ecgc-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "ecgc-mutants: this build has no erasure codec (NO_EC=1): ecgc skips, nothing to plant"; false)

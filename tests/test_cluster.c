@@ -15193,6 +15193,389 @@ static void scen_ecbasic(void)
     printf("  a settle's put in flight at SIGTERM: the shutdown waited for it, exit 0\n");
 }
 
+/* ecslow (r8n-hedge, server/chunkpeer.c; design-cluster-data.md E11, E15, E31, §10.3): one stripe member's chunk
+ * replies delayed -> 5% hedge token bucket keeps total chunk reads <= 1.05x baseline (kills hedgeall), sustained
+ * slowness triggers read-avoid after 8 timeouts in 10 s so query p99 stays bounded (kills noavoid), m+1 away returns
+ * UNAVAILABLE never CORRUPT (kills hedgecorrupt), and read-avoid recovers automatically after 30 s. */
+#ifdef TSDB_EC
+static uint64_t ecslow_metric_peer(const char *buf, const char *family, uint32_t peer)
+{
+    char key[128];
+    snprintf(key, sizeof key, "\n%s{peer=\"%" PRIu32 "\"} ", family, peer);
+    const char *p = strstr(buf, key);
+    if (!p) {
+        snprintf(key, sizeof key, "%s{peer=\"%" PRIu32 "\"} ", family, peer);
+        if (strncmp(buf, key, strlen(key)) == 0)
+            p = buf;
+        else
+            return 0;
+    } else {
+        p++;
+    }
+    return strtoull(p + strlen(key) - (p == buf ? 0 : 1), NULL, 10);
+}
+
+static uint64_t ecslow_metric_sum(const char *buf, const char *family, const uint32_t *peers, unsigned n)
+{
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < n; i++)
+        sum += ecslow_metric_peer(buf, family, peers[i]);
+    return sum;
+}
+
+static void ecslow_write_delay(const char *path, uint32_t node, int ms, unsigned max_cnt)
+{
+    char tmp[PATH_MAX + 64];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        die("open %s: %s", tmp, strerror(errno));
+    fprintf(f, "%" PRIu32 " %d %u\n", node, ms, max_cnt);
+    fclose(f);
+    if (rename(tmp, path) != 0)
+        die("rename %s -> %s: %s", tmp, path, strerror(errno));
+}
+
+static int ecslow_cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static int ecslow_read_win(tsdbc *c, tsdb_sid id, int64_t t0, int64_t t1, struct ecb_sum *s)
+{
+    memset(s, 0, sizeof *s);
+    return tsdbc_query_raw(c, id, t0, t1, ecb_rows, s);
+}
+#endif
+
+#define ECS_SERIES 16
+#define ECS_WINS 10
+static void scen_ecslow(void)
+{
+    scenario("ecslow");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    static char dpath[PATH_MAX + 64], denv[PATH_MAX + 128];
+    snprintf(dpath, sizeof dpath, "%s/read_delay.cfg", base);
+    unlink(dpath);
+    snprintf(denv, sizeof denv, "TSDB_CHUNKPEER_TEST=read_delay=%s", dpath);
+    for (int i = 0; i < 6; i++) {
+        penv[i] = denv;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view vw;
+    view(0, &vw);
+    uint8_t uuid[16];
+    memcpy(uuid, vw.m.uuid, 16);
+    view_free(&vw);
+    static char xa[6][PATH_MAX + 256];
+    int mport[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                 "--ec-cache-mb 1 --merge-idle-s 1 --flush-interval-ms 200",
+                 sd);
+        restart_xargs(i, xa[i]);
+        mport[i] = th_mport;
+        if (mport[i] <= 0)
+            die("server %d: no metrics port reported", i);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 with six stores: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("the twin t42: %s", cluster_strerror(rc));
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of e42 with a leader 30 s after add");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("no record of t42 with a leader 30 s after add");
+    int L = server_of(e.leader), Lt = server_of(tv.leader), ml = leader_of(L);
+    if (L < 0 || Lt < 0)
+        die("e42 leader %d or t42 leader %d invalid", L, Lt);
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECS_SERIES], idt[ECS_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECS_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecs.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    for (int b = 0; b < 2; b++) {
+        for (int s = 0; s < ECS_SERIES; s++) {
+            static int64_t ts[ECB_ROWS];
+            static float val[ECB_ROWS];
+            ecb_rows_of(s, b, day0, ts, val);
+            for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(c, ide[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert e42: %s", ers(rc));
+            int trc;
+            for (uint64_t t0 = now_ms(); (trc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0; usleep(50000))
+                if ((trc != TSDB_ERR_UNAVAILABLE && trc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("insert t42: %s", ers(trc));
+        }
+        usleep(1000000);
+    }
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecslow: nothing settled in 120 s");
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecslow: .part files left after settle:%s", live);
+
+    /* Non-sequential granule windows (one granule per query, 160 total, > 1 MiB cache so each sweep misses). */
+    static const int worder[ECS_WINS] = {0, 5, 2, 7, 4, 9, 1, 6, 3, 8};
+    static struct ecb_sum oracle[ECS_SERIES][ECS_WINS];
+    for (int wi = 0; wi < ECS_WINS; wi++) {
+        int g = worder[wi];
+        int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL;
+        int64_t we = ws + 1000000LL;
+        for (int s = 0; s < ECS_SERIES; s++) {
+            if ((rc = ecslow_read_win(ct, idt[s], ws, we, &oracle[s][g])) != 0 || oracle[s][g].n == 0)
+                die("ecslow: oracle read s=%d g=%d: %s (n=%" PRIu64 ")", s, g, ers(rc), oracle[s][g].n);
+        }
+    }
+    tsdbc_close(ct);
+
+    /* Phase 1: Warmup sweep + Baseline sweep. */
+    static char mbuf[256 * 1024];
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t r0 = 0, per0[4] = {0};
+        if (pass == 1) {
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            r0 = ecslow_metric_sum(mbuf, "tsdb_chunk_reads_total", e.stripe, e.nstripe);
+            for (unsigned p = 0; p < 4; p++)
+                per0[p] = ecslow_metric_peer(mbuf, "tsdb_chunk_reads_total", e.stripe[p]);
+        }
+        for (int wi = 0; wi < ECS_WINS; wi++) {
+            int g = worder[wi];
+            int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+            for (int s = 0; s < ECS_SERIES; s++) {
+                struct ecb_sum a;
+                if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                    a.h != oracle[s][g].h)
+                    die("ecslow: baseline s=%d g=%d: %s (n=%" PRIu64 " want %" PRIu64 ")", s, g, ers(rc), a.n,
+                        oracle[s][g].n);
+            }
+        }
+        if (pass == 1) {
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            uint64_t base_reads = ecslow_metric_sum(mbuf, "tsdb_chunk_reads_total", e.stripe, e.nstripe) - r0;
+            /* Pick a data position (0..3) that is neither L nor ml and received the most reads. */
+            int slow_srv = -1;
+            uint32_t slow_node = 0;
+            uint64_t slow_best = 0;
+            for (unsigned p = 0; p < 4; p++) {
+                int sv = server_of(e.stripe[p]);
+                uint64_t d = ecslow_metric_peer(mbuf, "tsdb_chunk_reads_total", e.stripe[p]) - per0[p];
+                if (sv >= 0 && sv != L && sv != ml && d > slow_best) {
+                    slow_best = d;
+                    slow_srv = sv;
+                    slow_node = e.stripe[p];
+                }
+            }
+            if (slow_srv < 0 || base_reads < 80 || slow_best < 15)
+                die("ecslow: baseline too small (base_reads=%" PRIu64 ", slow_best=%" PRIu64 ", slow_srv=%d)",
+                    base_reads, slow_best, slow_srv);
+            printf("  baseline: %" PRIu64 " chunk reads (slow target server %d node %" PRIu32 ": %" PRIu64 " reads)\n",
+                   base_reads, slow_srv, slow_node, slow_best);
+
+            /* Phase 2: 5% token bucket cap (6 delayed reads < 8 -> no read-avoid; total reads <= 1.05x baseline;
+             * kills mutant hedgeall). */
+            uint64_t p2_r0 = ecslow_metric_sum(mbuf, "tsdb_chunk_reads_total", e.stripe, e.nstripe);
+            uint64_t p2_h0 = ecslow_metric_peer(mbuf, "tsdb_chunk_read_hedges_total", slow_node);
+            ecslow_write_delay(dpath, slow_node, 550, 6);
+            for (int wi = 0; wi < ECS_WINS; wi++) {
+                int g = worder[wi];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES; s++) {
+                    struct ecb_sum a;
+                    if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                        a.h != oracle[s][g].h)
+                        die("ecslow: phase2 s=%d g=%d: %s", s, g, ers(rc));
+                }
+            }
+            usleep(700000); /* let any late primary finish and record */
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            uint64_t p2_reads = ecslow_metric_sum(mbuf, "tsdb_chunk_reads_total", e.stripe, e.nstripe) - p2_r0;
+            uint64_t p2_hedges = ecslow_metric_peer(mbuf, "tsdb_chunk_read_hedges_total", slow_node) - p2_h0;
+            uint64_t p2_avoid = ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node);
+            printf("  bucket phase: %" PRIu64 " chunk reads (baseline %" PRIu64 ", ratio %.3fx), %" PRIu64
+                   " hedges, avoid=%" PRIu64 "\n",
+                   p2_reads, base_reads, (double)p2_reads / (double)base_reads, p2_hedges, p2_avoid);
+            if (p2_avoid != 0)
+                die("ecslow: entered read-avoid after only 6 delayed reads");
+            if (p2_hedges == 0)
+                die("ecslow: no hedge launched during delayed reads");
+            if (p2_reads > (base_reads * 105u) / 100u)
+                die("ecslow: total chunk reads %" PRIu64 " exceeded 1.05x baseline %" PRIu64 " (ratio %.3fx)", p2_reads,
+                    base_reads, (double)p2_reads / (double)base_reads);
+
+            /* Phase 3: Sustained delay (550 ms on every read to slow_node) -> enters read-avoid after 8 timeouts;
+             * query p99 stays bounded (kills mutant noavoid). */
+            ecslow_write_delay(dpath, slow_node, 550, 0);
+            uint64_t t_trig = now_ms();
+            int entered = 0;
+            for (int iter = 0; iter < 6 && !entered && now_ms() - t_trig < 20000; iter++) {
+                int g = worder[iter % ECS_WINS];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES && !entered; s++) {
+                    struct ecb_sum a;
+                    if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                        a.h != oracle[s][g].h)
+                        die("ecslow: trigger avoid s=%d g=%d: %s", s, g, ers(rc));
+                    metrics_get(mport[L], mbuf, sizeof mbuf);
+                    if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 1)
+                        entered = 1;
+                }
+            }
+            /* Timed query loop of 64 queries (4 windows x 16 series) to measure p99 latency. */
+            uint64_t lats[64];
+            int nlats = 0;
+            for (int wi = 4; wi < 8; wi++) {
+                int g = worder[wi];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES; s++) {
+                    struct ecb_sum a;
+                    uint64_t q0 = now_ms();
+                    if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                        a.h != oracle[s][g].h)
+                        die("ecslow: avoid loop s=%d g=%d: %s", s, g, ers(rc));
+                    lats[nlats++] = now_ms() - q0;
+                }
+            }
+            qsort(lats, (size_t)nlats, sizeof *lats, ecslow_cmp_u64);
+            uint64_t p99_ms = lats[(nlats * 99) / 100];
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            uint64_t av_now = ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node);
+            uint64_t av_cnt = ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoids_total", slow_node);
+            uint64_t dec_cnt = ecslow_metric_peer(mbuf, "tsdb_chunk_decoded_cells_total", slow_node);
+            printf("  read-avoid phase: entered=%d avoid_gauge=%" PRIu64 " avoids=%" PRIu64 " decoded=%" PRIu64
+                   " query p99=%" PRIu64 " ms\n",
+                   entered, av_now, av_cnt, dec_cnt, p99_ms);
+            if (!entered || av_now != 1 || av_cnt == 0 || dec_cnt == 0)
+                die("ecslow: slow node %" PRIu32 " did not enter read-avoid (entered=%d gauge=%" PRIu64
+                    " avoids=%" PRIu64 " decoded=%" PRIu64 ")",
+                    slow_node, entered, av_now, av_cnt, dec_cnt);
+            if (p99_ms >= 250)
+                die("ecslow: query p99 %" PRIu64 " ms exceeded 250 ms bound while slow node in read-avoid", p99_ms);
+
+            /* Phase 4: E15 check — kill 2 other stripe members while slow_node is in read-avoid (m+1=3 away).
+             * Must return UNAVAILABLE, never CORRUPT (kills mutant hedgecorrupt). */
+            int vict[2] = {-1, -1}, nv = 0;
+            for (int kpass = 0; kpass < 2 && nv < 2; kpass++)
+                for (int i = 0; i < 6 && nv < 2; i++)
+                    if (i != L && i != ml && i != slow_srv && ecb_is_rep(&e, i) == (kpass == 1))
+                        vict[nv++] = i;
+            if (nv < 2)
+                die("ecslow: fewer than 2 victims besides L=%d ml=%d slow=%d", L, ml, slow_srv);
+            stop(vict[0], SIGKILL);
+            stop(vict[1], SIGKILL);
+            int nun = 0;
+            for (int wi = 0; wi < 3; wi++) {
+                int g = worder[(8 + wi) % ECS_WINS];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES; s++) {
+                    struct ecb_sum a;
+                    rc = ecslow_read_win(c, ide[s], ws, we, &a);
+                    if (rc == TSDB_ERR_UNAVAILABLE) {
+                        nun++;
+                        continue;
+                    }
+                    if (rc != 0 || a.n != oracle[s][g].n || a.h != oracle[s][g].h)
+                        die("ecslow: 3 away (2 killed + 1 read-avoid) s=%d g=%d: %s (want UNAVAILABLE or exact)", s, g,
+                            ers(rc));
+                }
+            }
+            if (nun == 0)
+                die("ecslow: 3 away returned no UNAVAILABLE across 48 queries");
+            printf("  E15 check (2 killed + 1 read-avoid): %d UNAVAILABLE, 0 CORRUPT\n", nun);
+            start(vict[0]);
+            start(vict[1]);
+
+            /* Phase 5: Remove delay, wait for 30 s read-avoid to expire, verify automatic recovery. */
+            unlink(dpath);
+            int recovered = 0;
+            for (uint64_t t0 = now_ms(); now_ms() - t0 < 45000; usleep(500000)) {
+                metrics_get(mport[L], mbuf, sizeof mbuf);
+                if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoid", slow_node) == 0) {
+                    recovered = 1;
+                    break;
+                }
+            }
+            if (!recovered)
+                die("ecslow: slow node %" PRIu32 " did not recover from read-avoid within 45 s", slow_node);
+            /* Wait for restarted victims to serve again, then verify direct reads resume on slow_node. */
+            for (uint64_t t0 = now_ms();; usleep(200000)) {
+                struct ecb_sum a;
+                int g = worder[0];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                if (ecslow_read_win(c, ide[0], ws, we, &a) == 0)
+                    break;
+                if (now_ms() - t0 > 30000)
+                    die("ecslow: cluster did not become readable after restarting victims");
+            }
+            /* Run one sweep to clear any stale open handles, then measure a clean recovered sweep. */
+            for (int wi = 0; wi < 2; wi++) {
+                int g = worder[wi];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES; s++) {
+                    struct ecb_sum a;
+                    for (uint64_t t0 = now_ms(); (rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0; usleep(200000))
+                        if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 30000)
+                            die("ecslow: settle after restart s=%d g=%d: %s", s, g, ers(rc));
+                }
+            }
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            uint64_t rec_r0 = ecslow_metric_peer(mbuf, "tsdb_chunk_reads_total", slow_node);
+            uint64_t rec_av0 = ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoids_total", slow_node);
+            uint64_t rec_dec0 = ecslow_metric_peer(mbuf, "tsdb_chunk_decoded_cells_total", slow_node);
+            for (int wi = 0; wi < ECS_WINS; wi++) {
+                int g = worder[wi];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES; s++) {
+                    struct ecb_sum a;
+                    if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                        a.h != oracle[s][g].h)
+                        die("ecslow: recovered sweep s=%d g=%d: %s", s, g, ers(rc));
+                }
+            }
+            metrics_get(mport[L], mbuf, sizeof mbuf);
+            uint64_t rec_r1 = ecslow_metric_peer(mbuf, "tsdb_chunk_reads_total", slow_node);
+            uint64_t rec_av1 = ecslow_metric_peer(mbuf, "tsdb_chunk_read_avoids_total", slow_node);
+            uint64_t rec_dec1 = ecslow_metric_peer(mbuf, "tsdb_chunk_decoded_cells_total", slow_node);
+            printf("  recovered: slow node reads +%" PRIu64 ", avoids +%" PRIu64 ", decoded +%" PRIu64 "\n",
+                   rec_r1 - rec_r0, rec_av1 - rec_av0, rec_dec1 - rec_dec0);
+            if (rec_r1 <= rec_r0 || rec_av1 != rec_av0 || rec_dec1 != rec_dec0)
+                die("ecslow: slow node %" PRIu32 " did not resume clean direct reads (reads +%" PRIu64
+                    ", avoids +%" PRIu64 ", decoded +%" PRIu64 ")",
+                    slow_node, rec_r1 - rec_r0, rec_av1 - rec_av0, rec_dec1 - rec_dec0);
+        }
+    }
+    tsdbc_close(c);
+#endif
+}
+
 /* ec16 (R8-2, design-cluster-data.md §10.1): 22 nodes on one host (epoll on all but at most two), ec=16+4 volume
  * (5 log replicas, 20 stripe positions + 2 spares) settles, kill four stripe members -> read whole equal to twin;
  * kill five -> UNAVAILABLE (never CORRUPT); restart all five -> read whole again. Skips cleanly under NO_EC=1. */
@@ -20171,7 +20554,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}};
