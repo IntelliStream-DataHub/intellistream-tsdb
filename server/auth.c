@@ -1100,6 +1100,58 @@ int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
     return need == NEED_ANY ? ids_check(au, ids, n, need, true) : ids_check(au, ids, n, need, false);
 }
 
+/* Per-id allow/deny mask reusing ids_check's l2/leaf radix pointer caching (QUERY_LATEST, QUERY_MULTI,
+ * STATS_SERIES). Preserves auth_id() semantics for every id, including TSDB_SID_NONE and unknown ids. */
+static inline __attribute__((always_inline)) void ids_mask(auth_user *au, const tsdb_sid *ids, size_t n,
+                                                           uint8_t need, const bool any, tsdb_sid *own,
+                                                           uint8_t *denied)
+{
+    memset(denied, 0, (n + 7) / 8);
+    uint64_t lkey = UINT64_MAX, l2key = UINT64_MAX;
+    _Atomic uint8_t *leaf = NULL;
+    map_l2 *l2 = NULL;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        uint8_t b = 0;
+        if (__builtin_expect((id >> 12) == lkey, 1)) {
+            b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
+        } else {
+            map_l2 *t;
+            if ((id >> 22) != l2key && (t = map_l2_of(au, id)))
+                l2 = t, l2key = id >> 22;
+            _Atomic uint8_t *lf =
+                (id >> 22) == l2key ? atomic_load_explicit(&l2->leaf[(id >> 12) & 1023], memory_order_acquire) : NULL;
+            if (lf) {
+                leaf = lf, lkey = id >> 12;
+                b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
+            }
+        }
+        if (__builtin_expect(!b, 0))
+            b = rights_byte(au, id);
+        bool no = !b || (any ? !(b & R_EVERY) : (b & need) != need);
+        own[i] = no ? TSDB_SID_NONE : id;
+        if (__builtin_expect(no, 0))
+            denied[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+}
+
+void auth_ids_mask(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need, tsdb_sid *own, uint8_t *denied)
+{
+    if (n == 0)
+        return;
+    auth_user *au = a->au;
+    if (!au || enough(au->all, need)) {
+        if (own != ids)
+            memcpy(own, ids, n * sizeof *own);
+        memset(denied, 0, (n + 7) / 8);
+        return;
+    }
+    if (need == NEED_ANY)
+        ids_mask(au, ids, n, need, true, own, denied);
+    else
+        ids_mask(au, ids, n, need, false, own, denied);
+}
+
 /* What auth_check_login and auth_check_ids share: an error, 0 (decided: allowed), or 1 with the rights the op's series
  * need in *need (P_SERIES, no right on `all` that covers it). quiet: the second caller logs nothing. */
 static int check_pre(auth_conn *a, const auth_op *e, uint8_t op, const uint8_t *p, size_t len, uint8_t *need,

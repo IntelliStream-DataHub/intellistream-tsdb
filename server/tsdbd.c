@@ -440,13 +440,16 @@ static void req_free(req *r)
  * may when no other is decompressing, so this never waits on itself: the peak is the limit plus one insert. */
 static pthread_mutex_t inflate_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t inflate_cv = PTHREAD_COND_INITIALIZER;
-static size_t inflate_held;
+static size_t inflate_held, inflate_waiters;
 
 static void inflate_acquire(size_t n)
 {
     pthread_mutex_lock(&inflate_lock);
-    while (inflate_held && atomic_load_explicit(&req_held, memory_order_relaxed) + n > req_budget)
+    while (inflate_held && atomic_load_explicit(&req_held, memory_order_relaxed) + n > req_budget) {
+        inflate_waiters++;
         pthread_cond_wait(&inflate_cv, &inflate_lock);
+        inflate_waiters--;
+    }
     inflate_held += n;
     atomic_fetch_add_explicit(&req_held, n, memory_order_relaxed);
     pthread_mutex_unlock(&inflate_lock);
@@ -457,8 +460,104 @@ static void inflate_release(size_t n)
     pthread_mutex_lock(&inflate_lock);
     inflate_held -= n;
     atomic_fetch_sub_explicit(&req_held, n, memory_order_relaxed);
-    pthread_cond_broadcast(&inflate_cv);
+    if (inflate_waiters)
+        pthread_cond_broadcast(&inflate_cv);
     pthread_mutex_unlock(&inflate_lock);
+}
+
+/* Per-worker reusable scratch: zstd decompression context and capped grow-only buffers for insert_packed, plus the
+ * RAW_CHUNK_ROWS query output buffers (128 KiB + 130 KiB). Cleaned up deterministically on worker exit (and via a
+ * pthread_key destructor / atexit for any other thread, such as fuzz_frames' main thread) so LSan reports zero leaks. */
+#define PACK_RAW_KEEP ((size_t)24 << 20)
+#define PACK_ARR_KEEP ((size_t)16 << 20)
+
+typedef struct worker_scratch {
+    ZSTD_DCtx *dctx;
+    void *pack_raw, *pack_ts, *pack_vals, *pack_series;
+    size_t pack_raw_cap, pack_ts_cap, pack_vals_cap, pack_series_cap;
+    int64_t *qts;
+    uint8_t *qv;
+    bool key_set;
+} worker_scratch;
+
+static __thread worker_scratch wscratch;
+static pthread_key_t wscratch_key;
+static pthread_once_t wscratch_once = PTHREAD_ONCE_INIT;
+
+static void worker_scratch_reset(worker_scratch *s)
+{
+    ZSTD_freeDCtx(s->dctx);
+    tsdb_free_big(s->pack_raw, s->pack_raw_cap);
+    tsdb_free_big(s->pack_ts, s->pack_ts_cap);
+    tsdb_free_big(s->pack_vals, s->pack_vals_cap);
+    tsdb_free_big(s->pack_series, s->pack_series_cap);
+    free(s->qts);
+    free(s->qv);
+    memset(s, 0, sizeof *s);
+}
+
+static void worker_scratch_dtor(void *p) { worker_scratch_reset(p); }
+
+static void worker_scratch_free(void)
+{
+    if (wscratch.key_set)
+        pthread_setspecific(wscratch_key, NULL);
+    worker_scratch_reset(&wscratch);
+}
+
+static void worker_scratch_init_once(void)
+{
+    pthread_key_create(&wscratch_key, worker_scratch_dtor);
+    atexit(worker_scratch_free);
+}
+
+static worker_scratch *worker_scratch_get(void)
+{
+    if (!wscratch.key_set) {
+        pthread_once(&wscratch_once, worker_scratch_init_once);
+        pthread_setspecific(wscratch_key, &wscratch);
+        wscratch.key_set = true;
+    }
+    return &wscratch;
+}
+
+static bool worker_query_bufs(int64_t **ts, uint8_t **v)
+{
+    worker_scratch *s = worker_scratch_get();
+    if (!s->qts)
+        s->qts = malloc((size_t)RAW_CHUNK_ROWS * 8);
+    if (!s->qv)
+        s->qv = malloc((size_t)RAW_CHUNK_ROWS * 8 + RAW_CHUNK_ROWS / 8);
+    if (!s->qts || !s->qv)
+        return false;
+    *ts = s->qts;
+    *v = s->qv;
+    return true;
+}
+
+static void *pack_buf_get(void **slot, size_t *cap, size_t need, size_t keep_max, bool *is_tmp)
+{
+    if (need == 0)
+        need = 1;
+    if (need > keep_max) {
+        *is_tmp = true;
+        return malloc(need);
+    }
+    *is_tmp = false;
+    if (need > *cap) {
+        size_t ncap = *cap ? *cap * 2 : 65536;
+        while (ncap < need)
+            ncap *= 2;
+        if (ncap > keep_max)
+            ncap = keep_max;
+        void *np = malloc(ncap);
+        if (!np)
+            return NULL;
+        tsdb_free_big(*slot, *cap);
+        *slot = np;
+        *cap = ncap;
+    }
+    return *slot;
 }
 
 /* Forwarding one hop (S2-2, fwdreq.h; the code after worker_main). A reserved worker runs a forwarded request on its
@@ -1346,7 +1445,7 @@ static int raw_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
 typedef struct values_out {
     conn *c;
     uint32_t id;
-    uint8_t type, any_null;
+    uint8_t type, any_null, has_bits;
     int64_t *ts;
     uint8_t *v; /* values, then room for the bitmap */
     uint32_t n;
@@ -1354,6 +1453,76 @@ typedef struct values_out {
     obatch *ob;        /* QUERY_MULTI: frames gathered here, each with the series' index */
     const uint32_t *ix;
 } values_out;
+
+/* Sets bits [pos, pos + count) to 1 and keeps trailing unused high bits in the final partial byte 0. */
+static void bits_fill_ones(uint8_t *bits, uint32_t pos, uint32_t count)
+{
+    if (!count)
+        return;
+    uint32_t bit = pos & 7u;
+    if (bit) {
+        uint32_t room = 8u - bit;
+        uint32_t k = count < room ? count : room;
+        uint8_t mask = (uint8_t)(((1u << k) - 1u) << bit);
+        bits[pos >> 3] = (uint8_t)((bits[pos >> 3] & ((1u << bit) - 1u)) | mask);
+        pos += k;
+        count -= k;
+    }
+    if (count >= 8u) {
+        memset(bits + (pos >> 3), 0xff, count >> 3);
+        pos += count & ~7u;
+        count &= 7u;
+    }
+    if (count)
+        bits[pos >> 3] = (uint8_t)((1u << count) - 1u);
+}
+
+/* Copies `count` bits from src[src_pos..] to bits[dst_pos..], zeroing trailing unused high bits in the final
+ * partial byte. Returns true if any copied bit is 0. */
+static bool bits_copy(uint8_t *bits, uint32_t dst_pos, const uint8_t *src, size_t src_pos, uint32_t count)
+{
+    if (!count)
+        return false;
+    bool any_zero = false;
+    if ((dst_pos & 7u) == 0 && (src_pos & 7u) == 0) {
+        uint8_t *d = bits + (dst_pos >> 3);
+        const uint8_t *s = src + (src_pos >> 3);
+        uint32_t nb = count >> 3;
+        uint8_t all = 0xff;
+        for (uint32_t j = 0; j < nb; j++) {
+            d[j] = s[j];
+            all &= s[j];
+        }
+        if (all != 0xff)
+            any_zero = true;
+        uint32_t rem = count & 7u;
+        if (rem) {
+            uint8_t mask = (uint8_t)((1u << rem) - 1u);
+            uint8_t v = s[nb] & mask;
+            d[nb] = v;
+            if (v != mask)
+                any_zero = true;
+        }
+        return any_zero;
+    }
+    uint32_t first_byte = dst_pos >> 3;
+    uint32_t last_byte = (dst_pos + count - 1u) >> 3;
+    if (dst_pos & 7u) {
+        bits[first_byte] &= (uint8_t)((1u << (dst_pos & 7u)) - 1u);
+        if (last_byte > first_byte)
+            memset(bits + first_byte + 1, 0, last_byte - first_byte);
+    } else {
+        memset(bits + first_byte, 0, last_byte - first_byte + 1);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t dp = dst_pos + i;
+        size_t sp = src_pos + i;
+        uint8_t known = (src[sp >> 3] >> (sp & 7u)) & 1u;
+        bits[dp >> 3] |= (uint8_t)(known << (dp & 7u));
+        any_zero |= !known;
+    }
+    return any_zero;
+}
 
 static bool values_flush(values_out *o, bool last, int32_t status)
 {
@@ -1371,8 +1540,7 @@ static bool values_flush(values_out *o, bool last, int32_t status)
     bool ok = frame_put(o->c, o->ob, o->id, status, o->ix, h, 8, o->ts, (size_t)o->n * 8, o->v, vb + valid);
     o->n = 0;
     o->any_null = 0;
-    if (o->v) /* NULL for an error reply before any rows */
-        memset(o->v + (size_t)RAW_CHUNK_ROWS * 8, 0, RAW_CHUNK_ROWS / 8);
+    o->has_bits = 0;
     return ok;
 }
 
@@ -1381,13 +1549,27 @@ static int values_cb(void *ctx, const int64_t *ts, const tsdb_values *col, size_
     values_out *o = ctx;
     unsigned aw = tsdb_wire_width(o->type);
     uint8_t *bits = o->v + (size_t)RAW_CHUNK_ROWS * 8;
-    for (size_t i = 0; i < n; i++) {
-        bool known = !col->valid || ((col->valid[i >> 3] >> (i & 7)) & 1);
-        o->ts[o->n] = ts[i];
-        memcpy(o->v + (size_t)o->n * aw, (const uint8_t *)col->values + i * aw, aw);
-        bits[o->n >> 3] |= (uint8_t)(known << (o->n & 7));
-        o->any_null |= !known;
-        if (++o->n == RAW_CHUNK_ROWS && !values_flush(o, false, 0)) {
+    const uint8_t *src = col->values;
+    size_t off = 0;
+    while (off < n) {
+        size_t take = (size_t)(RAW_CHUNK_ROWS - o->n);
+        if (take > n - off)
+            take = n - off;
+        memcpy(o->ts + o->n, ts + off, take * 8);
+        memcpy(o->v + (size_t)o->n * aw, src + off * aw, take * aw);
+        if (col->valid) {
+            if (!o->has_bits) {
+                bits_fill_ones(bits, 0, o->n);
+                o->has_bits = 1;
+            }
+            if (bits_copy(bits, o->n, col->valid, off, (uint32_t)take))
+                o->any_null = 1;
+        } else if (o->has_bits) {
+            bits_fill_ones(bits, o->n, (uint32_t)take);
+        }
+        o->n += (uint32_t)take;
+        off += take;
+        if (o->n == RAW_CHUNK_ROWS && !values_flush(o, false, 0)) {
             o->gone = true;
             return 1; /* the client went away: stop the query */
         }
@@ -1444,13 +1626,23 @@ static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb
         return TSDB_ERR_INVALID;
     size_t held = raw_len + unpacked;
     inflate_acquire(held);
-    uint8_t *raw = malloc(raw_len ? raw_len : 1);
-    int64_t *ts = malloc((size_t)n * 8 + 8);
-    uint8_t *vals = malloc((size_t)n * w + (size_t)n / 8 + 9); /* values, then the bitmap */
-    tsdb_sid *series = many ? malloc((size_t)n * 8 + 8) : NULL;
+    worker_scratch *ws = worker_scratch_get();
+    size_t raw_need = raw_len ? raw_len : 1;
+    size_t ts_need = (size_t)n * 8 + 8;
+    size_t vals_need = (size_t)n * w + (size_t)n / 8 + 9; /* values, then the bitmap */
+    size_t ser_need = many ? (size_t)n * 8 + 8 : 0;
+    bool raw_tmp = false, ts_tmp = false, vals_tmp = false, ser_tmp = false;
+    uint8_t *raw = pack_buf_get(&ws->pack_raw, &ws->pack_raw_cap, raw_need, PACK_RAW_KEEP, &raw_tmp);
+    int64_t *ts = pack_buf_get(&ws->pack_ts, &ws->pack_ts_cap, ts_need, PACK_ARR_KEEP, &ts_tmp);
+    uint8_t *vals = pack_buf_get(&ws->pack_vals, &ws->pack_vals_cap, vals_need, PACK_ARR_KEEP, &vals_tmp);
+    tsdb_sid *series = many ? pack_buf_get(&ws->pack_series, &ws->pack_series_cap, ser_need, PACK_ARR_KEEP, &ser_tmp)
+                            : NULL;
     int rc = !raw || !ts || !vals || (many && !series) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
-        size_t got = ZSTD_decompress(raw, raw_len, z, zlen);
+        if (!ws->dctx)
+            ws->dctx = ZSTD_createDCtx();
+        size_t got = ws->dctx ? ZSTD_decompressDCtx(ws->dctx, raw, raw_len, z, zlen)
+                              : ZSTD_decompress(raw, raw_len, z, zlen);
         uint8_t *bits = vals + (size_t)n * w;
         if (ZSTD_isError(got) || got != raw_len ||
             tsdb_pack_unshape(raw, raw_len, n, type, valid, many, ts, vals, bits, series) != 0) {
@@ -1469,10 +1661,14 @@ static int insert_packed(conn *c, const uint8_t *p, size_t len, uint32_t n, tsdb
             }
         }
     }
-    free(raw);
-    free(ts);
-    free(vals);
-    free(series);
+    if (raw_tmp)
+        tsdb_free_big(raw, raw_need);
+    if (ts_tmp)
+        tsdb_free_big(ts, ts_need);
+    if (vals_tmp)
+        tsdb_free_big(vals, vals_need);
+    if (ser_tmp)
+        tsdb_free_big(series, ser_need);
     inflate_release(held);
     return rc;
 }
@@ -1882,24 +2078,20 @@ static void handle_multi(conn *c, req *r)
         /* a series the user may not read is asked as an id that names none (status INVALID, no rows), which
          * multi_fn turns into DENIED: unknown and foreign ids answer alike (A16) */
         own = malloc((size_t)n * sizeof *own);
-        denied = calloc(((size_t)n + 7) / 8, 1);
-        if (!own || !denied)
+        denied = malloc(((size_t)n + 7) / 8);
+        if (!own || !denied) {
             rc = TSDB_ERR_NOMEM;
-        for (uint32_t i = 0; rc == 0 && i < n; i++) {
-            bool no = auth_id(&c->auth, series[i], R_READ) != 0;
-            own[i] = no ? TSDB_SID_NONE : series[i];
-            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        } else {
+            auth_ids_mask(&c->auth, series, n, R_READ, own, denied);
+            series = own;
+            m.denied = denied;
         }
-        series = own;
-        m.denied = denied;
     }
     if (rc == 0) /* after the rights: a denied id says nothing about its volume (it is TSDB_SID_NONE now) */
         rc = cvol_lease_refuse_ids(series, n);
     if (rc == 0 && (m.op == TSDB_OP_QUERY_VALUES || m.op == TSDB_OP_QUERY_LTTB)) {
         m.vo = (values_out){.c = c, .id = r->id, .ob = &m.ob};
-        m.vo.ts = malloc(RAW_CHUNK_ROWS * 8);
-        m.vo.v = calloc((size_t)RAW_CHUNK_ROWS * 8 + RAW_CHUNK_ROWS / 8, 1);
-        if (!m.vo.ts || !m.vo.v)
+        if (!worker_query_bufs(&m.vo.ts, &m.vo.v))
             rc = TSDB_ERR_NOMEM;
     }
     if (rc == 0) {
@@ -1924,8 +2116,6 @@ static void handle_multi(conn *c, req *r)
         c->streaming = false;
     }
     qreq_free(&qr);
-    free(m.vo.ts);
-    free(m.vo.v);
     free(own);
     free(denied);
     metrics_multi_series(m.answered);
@@ -2015,15 +2205,13 @@ static void handle_latest(conn *c, req *r)
     uint8_t *denied = NULL;
     if (!auth_all(&c->auth, R_READ)) {
         own = malloc((size_t)n * sizeof *own);
-        denied = calloc(((size_t)n + 7) / 8, 1);
-        if (!own || !denied)
+        denied = malloc(((size_t)n + 7) / 8);
+        if (!own || !denied) {
             rc = TSDB_ERR_NOMEM;
-        for (uint32_t i = 0; rc == 0 && i < n; i++) {
-            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;
-            own[i] = no ? TSDB_SID_NONE : ids[i];
-            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        } else {
+            auth_ids_mask(&c->auth, ids, n, R_READ, own, denied);
+            ids = own;
         }
-        ids = own;
     }
     if (rc == 0) /* after the rights, as in QUERY_MULTI: a denied id says nothing about its volume */
         rc = cvol_lease_refuse_ids(ids, n);
@@ -2104,15 +2292,13 @@ static void handle_stats_series(conn *c, req *r)
     bool bounds = auth_all(&c->auth, R_READ); /* the error bounds of the hot lists: whoever reads everything */
     if (!bounds) {
         own = malloc((size_t)n * sizeof *own);
-        denied = calloc(((size_t)n + 7) / 8, 1);
-        if (!own || !denied)
+        denied = malloc(((size_t)n + 7) / 8);
+        if (!own || !denied) {
             rc = TSDB_ERR_NOMEM;
-        for (uint32_t i = 0; rc == 0 && i < n; i++) {
-            bool no = auth_id(&c->auth, ids[i], R_READ) != 0;
-            own[i] = no ? TSDB_SID_NONE : ids[i];
-            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        } else {
+            auth_ids_mask(&c->auth, ids, n, R_READ, own, denied);
+            ids = own;
         }
-        ids = own;
     }
     tsdb_series_stat *out = rc ? NULL : malloc((size_t)n * sizeof *out);
     if (rc == 0 && !out)
@@ -2447,7 +2633,7 @@ static void reply_error(conn *c, uint32_t id, uint8_t op, int32_t status)
         return;
     }
     case S_VALUES: {
-        values_out o = {c, id, 0, 0, NULL, NULL, 0, false, NULL, NULL};
+        values_out o = {.c = c, .id = id};
         values_flush(&o, true, status);
         return;
     }
@@ -3469,23 +3655,19 @@ static void handle_op(req *r)
             memcpy(&lim, p + 25, 8);
             q.limit = (size_t)lim;
         }
-        o.ts = malloc(RAW_CHUNK_ROWS * 8);
-        o.v = malloc(RAW_CHUNK_ROWS * 4);
-        if (!o.ts || !o.v) {
-            free(o.ts);
-            free(o.v);
+        uint8_t *qv = NULL;
+        if (!worker_query_bufs(&o.ts, &qv)) {
             o.ts = NULL;
             o.v = NULL;
             raw_flush(&o, true, TSDB_ERR_NOMEM);
             return;
         }
+        o.v = (float *)(void *)qv;
         rc = tsdb_query_raw_ex(db, s, start, end, &q, raw_cb, &o);
         if (rc == 0 && test_query_status)
             rc = test_query_status;
         if (!o.gone)
             raw_flush(&o, true, rc); /* the rest of the rows, or the error */
-        free(o.ts);
-        free(o.v);
         return;
     }
     case TSDB_OP_SERIES_CREATE: {
@@ -3569,7 +3751,7 @@ static void handle_op(req *r)
     case TSDB_OP_QUERY_VALUES:
     case TSDB_OP_QUERY_LTTB: { /* the same chunks: LTTB's points are rows of the series */
         bool lttb = r->op == TSDB_OP_QUERY_LTTB;
-        values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false, NULL, NULL};
+        values_out o = {.c = c, .id = r->id};
         qreq qr;
         if (parse_values(p, len, lttb, &qr) != 0) {
             values_flush(&o, true, TSDB_ERR_INVALID);
@@ -3579,11 +3761,7 @@ static void handle_op(req *r)
         tsdb_type t = TSDB_FLOAT32;
         tsdb_series_type(db, s, &t); /* an unknown series: no rows */
         o.type = (uint8_t)t;
-        o.ts = malloc(RAW_CHUNK_ROWS * 8);
-        o.v = calloc((size_t)RAW_CHUNK_ROWS * 8 + RAW_CHUNK_ROWS / 8, 1);
-        if (!o.ts || !o.v) {
-            free(o.ts);
-            free(o.v);
+        if (!worker_query_bufs(&o.ts, &o.v)) {
             o.ts = NULL;
             o.v = NULL;
             values_flush(&o, true, TSDB_ERR_NOMEM);
@@ -3597,8 +3775,6 @@ static void handle_op(req *r)
             rc = test_query_status;
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
-        free(o.ts);
-        free(o.v);
         return;
     }
     case TSDB_OP_STATE: {
@@ -3809,6 +3985,7 @@ static void *worker_main(void *arg)
             if (--running_workers == 0)
                 pthread_cond_broadcast(&workers_gone_cv);
             pthread_mutex_unlock(&work_lock);
+            worker_scratch_free();
             route_release();
             return NULL;
         }
@@ -4364,6 +4541,7 @@ static void *fwd_worker_main(void *arg)
             if (--fwd_running == 0)
                 pthread_cond_broadcast(&fwd_gone_cv);
             pthread_mutex_unlock(&fwd_lock);
+            worker_scratch_free();
             route_release();
             return NULL;
         }

@@ -640,6 +640,33 @@ static int collect_values(void *ctx, const int64_t *ts, const tsdb_values *col, 
     return 0;
 }
 
+typedef struct big_vrows {
+    size_t n, total;
+    int bad, desc;
+    const int64_t *ts, *iv;
+    const uint8_t *exp;
+} big_vrows;
+
+static int check_big_values(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    big_vrows *r = ctx;
+    const int64_t *iv = col->values;
+    if (col->type != TSDB_INT64)
+        r->bad++;
+    for (size_t k = 0; k < n; k++) {
+        if (r->n >= r->total) {
+            r->bad++;
+            return 1;
+        }
+        size_t ix = r->desc ? (r->total - 1 - r->n) : r->n;
+        bool known = !col->valid || ((col->valid[k >> 3] >> (k & 7)) & 1);
+        if (ts[k] != r->ts[ix] || known != (r->exp[ix] != 0) || (known && iv[k] != r->iv[ix]))
+            r->bad++;
+        r->n++;
+    }
+    return 0;
+}
+
 static void test_types(tsdbc *c)
 {
     tsdb_sid d, i, b, st, again;
@@ -753,6 +780,44 @@ static void test_types(tsdbc *c)
         CHECK(raw_reply(fd, &rid0, rest0, sizeof rest0, &nrest0) == TSDB_ERR_INVALID && rid0 == 40 + (uint32_t)bad);
     }
     close(fd);
+
+    /* P-23: QUERY_VALUES bulk copy + lazy validity bitmap across RAW_CHUNK_ROWS (16384) boundaries, unaligned
+     * chunk offsets, and transitions between valid==NULL and valid!=NULL parts/memtable. */
+    tsdb_sid mv;
+    OK(tsdbc_series_create(c, "t.values_chunks", TSDB_INT64, NULL, &mv));
+    enum { S1 = 17003, S2 = 17005, S3 = 5007, STOT = S1 + S2 + S3 };
+    int64_t *mts = malloc(STOT * sizeof *mts);
+    int64_t *miv = malloc(STOT * sizeof *miv);
+    uint8_t *mexp = malloc(STOT);
+    uint8_t *mval2 = malloc((S2 + 7) / 8);
+    CHECK(mts && miv && mexp && mval2);
+    memset(mval2, 0xff, (S2 + 7) / 8);
+    for (size_t k = 0; k < STOT; k++) {
+        mts[k] = T0 + (int64_t)k * 1000;
+        miv[k] = (int64_t)k * 17 - 1000;
+        mexp[k] = 1;
+    }
+    for (size_t k = 0; k < S2; k++) {
+        if (k == 0 || k == S2 - 1 || k % 13 == 0) {
+            mval2[k >> 3] &= (uint8_t)~(1u << (k & 7));
+            mexp[S1 + k] = 0;
+        }
+    }
+    OK(tsdbc_insert_series_values(c, mv, mts, &(tsdb_values){TSDB_INT64, miv, NULL}, S1));
+    OK(tsdbc_flush(c));
+    OK(tsdbc_insert_series_values(c, mv, mts + S1, &(tsdb_values){TSDB_INT64, miv + S1, mval2}, S2));
+    OK(tsdbc_flush(c));
+    OK(tsdbc_insert_series_values(c, mv, mts + S1 + S2, &(tsdb_values){TSDB_INT64, miv + S1 + S2, NULL}, S3));
+    for (int desc = 0; desc < 2; desc++) {
+        big_vrows br = {.n = 0, .total = STOT, .bad = 0, .desc = desc, .ts = mts, .iv = miv, .exp = mexp};
+        tsdb_query_opts qo = {desc ? TSDB_DESC : TSDB_ASC, 0};
+        OK(tsdbc_query_values(c, mv, INT64_MIN, INT64_MAX, &qo, check_big_values, &br));
+        CHECK(br.n == STOT && br.bad == 0);
+    }
+    free(mts);
+    free(miv);
+    free(mexp);
+    free(mval2);
 }
 
 /* NaN results through the server: one quiet NaN 0x7ff8000000000000, whatever payloads the data had; raw values
