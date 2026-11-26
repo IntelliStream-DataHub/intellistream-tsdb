@@ -766,7 +766,8 @@ static int read_all(int fd, uint8_t *p, size_t n, int64_t deadline_ms)
     return 0;
 }
 
-/* One frame: its type and payload (malloc'ed). 0 or -1. */
+/* One frame: its type and payload (malloc'ed). Valid frames are >= 5 bytes (u32 len >= 1 plus u8 type), so a
+ * malformed peer sending only 4 bytes with len == 0 or > FRAME_MAX hits deadline/EOF instead of EPROTO. 0 or -1. */
 static int read_frame(int fd, int64_t deadline_ms, uint8_t *type, uint8_t **payload, size_t *len)
 {
     uint8_t h[5];
@@ -1997,10 +1998,23 @@ struct cc_snap {
 struct cc_pad_long {
     _Alignas(64) atomic_long v;
 };
-static _Alignas(64) _Atomic(struct cc_snap *) cc_cur;
-static _Alignas(64) atomic_ulong cc_phase;
-static _Alignas(64) struct cc_pad_long cc_getting[2];
-static _Alignas(64) struct cc_snap *cc_retired; /* swapped out, the published reference still held; the swapping thread's */
+struct cc_pad_ulong {
+    _Alignas(64) atomic_ulong v;
+};
+struct cc_pad_asnap {
+    _Alignas(64) _Atomic(struct cc_snap *) v;
+};
+struct cc_pad_snap {
+    _Alignas(64) struct cc_snap *v;
+};
+_Static_assert(sizeof(struct cc_pad_long) == 64, "cc_pad_long must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_ulong) == 64, "cc_pad_ulong must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_asnap) == 64, "cc_pad_asnap must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_snap) == 64, "cc_pad_snap must occupy a full cache line");
+static struct cc_pad_asnap cc_cur;
+static struct cc_pad_ulong cc_phase;
+static struct cc_pad_long cc_getting[2];
+static struct cc_pad_snap cc_retired; /* swapped out, the published reference still held; the swapping thread's */
 static unsigned long cc_nretired, cc_nretired_max;
 static atomic_ulong cc_builds; /* snapshots published since the start (the hold check counts them) */
 
@@ -2034,13 +2048,13 @@ const struct cluster_copy *cluster_copy_get(void)
 {
     unsigned long p;
     for (;;) {
-        p = atomic_load(&cc_phase);
+        p = atomic_load(&cc_phase.v);
         atomic_fetch_add(&cc_getting[p & 1].v, 1);
-        if (atomic_load(&cc_phase) == p)
+        if (atomic_load(&cc_phase.v) == p)
             break;
         atomic_fetch_sub(&cc_getting[p & 1].v, 1); /* a swap flipped in between: count under the new parity */
     }
-    struct cc_snap *s = atomic_load(&cc_cur);
+    struct cc_snap *s = atomic_load(&cc_cur.v);
     if (s)
         atomic_fetch_add(&s->refs, 1);
     atomic_fetch_sub(&cc_getting[p & 1].v, 1);
@@ -2063,9 +2077,9 @@ void cluster_copy_put(const struct cluster_copy *c)
 static int cc_reclaim(void)
 {
     for (int pass = 0; pass < 2; pass++) {
-        unsigned long p = atomic_load(&cc_phase);
+        unsigned long p = atomic_load(&cc_phase.v);
         int drained = p > 0 && atomic_load(&cc_getting[(p - 1) & 1].v) == 0, current = 0;
-        for (struct cc_snap **pp = &cc_retired; *pp;) {
+        for (struct cc_snap **pp = &cc_retired.v; *pp;) {
             struct cc_snap *x = *pp;
             if (x->rp + 2 <= p || (x->rp + 1 == p && drained)) {
                 *pp = x->next;
@@ -2078,15 +2092,15 @@ static int cc_reclaim(void)
         }
         if (!current || atomic_load(&cc_getting[(p + 1) & 1].v) != 0)
             break;
-        atomic_store(&cc_phase, p + 1); /* the readers of phase p - 1 are out: their parity can be p + 1's */
+        atomic_store(&cc_phase.v, p + 1); /* the readers of phase p - 1 are out: their parity can be p + 1's */
     }
-    return cc_retired == NULL;
+    return cc_retired.v == NULL;
 }
 
 /* the cluster thread (and cluster_stop): s becomes the current snapshot (NULL: none); the old one is retired */
 static void cc_swap(struct cc_snap *s)
 {
-    struct cc_snap *old = atomic_exchange(&cc_cur, s);
+    struct cc_snap *old = atomic_exchange(&cc_cur.v, s);
     if (!old)
         return;
     if (cl_mutant() == CLM_CCNOWAIT) {
@@ -2094,14 +2108,14 @@ static void cc_swap(struct cc_snap *s)
         return;
     }
     if (cl_mutant() == CLM_CCONESLOT) { /* the old protocol: wait for the one counter every reader uses */
-        while (atomic_load(&cc_getting[atomic_load(&cc_phase) & 1].v))
+        while (atomic_load(&cc_getting[atomic_load(&cc_phase.v) & 1].v))
             sched_yield();
         cc_unref(old);
         return;
     }
-    old->rp = atomic_load(&cc_phase);
-    old->next = cc_retired;
-    cc_retired = old;
+    old->rp = atomic_load(&cc_phase.v);
+    old->next = cc_retired.v;
+    cc_retired.v = old;
     if (++cc_nretired > cc_nretired_max)
         cc_nretired_max = cc_nretired;
     cc_reclaim();
@@ -2119,12 +2133,12 @@ static void cc_clear(void)
  * restore): a new snapshot of C.sm. The cluster thread only. */
 static void copy_publish(void)
 {
-    if (cc_retired)
+    if (cc_retired.v)
         cc_reclaim();
     if (!C.sm.initialised || (C.hold_copy && access(C.holdcopyfile, F_OK) == 0))
         return;
     uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
-    struct cc_snap *cur = atomic_load(&cc_cur); /* ours: the published reference is the cluster thread's */
+    struct cc_snap *cur = atomic_load(&cc_cur.v); /* ours: the published reference is the cluster thread's */
     if (cur && cur->pub.applied == C.sm.applied && cur->pub.applied_term == C.sm.applied_term &&
         cur->pub.restore_gen == C.sm.restore_gen && cur->pub.self == self)
         return;
@@ -2319,7 +2333,7 @@ static void *ccst_reader(void *arg)
 
 int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn)
 {
-    if (atomic_load(&cc_cur)) {
+    if (atomic_load(&cc_cur.v)) {
         snprintf(why, wn, "a copy is published: the cluster runs in this process");
         return -1;
     }
@@ -2425,11 +2439,12 @@ void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_store
  * its arrival), at most 2 s. The cluster thread raises it; any thread reads it lock-free (single-writer seqlock with
  * atomic payload fields for race-free C11/TSan concurrent reads) and checks the deadline itself, so a stalled cluster
  * loop turns the answer to 0 once the lease has run out, while a new leader may commit a new epoch. */
-static _Alignas(64) struct {
-    _Atomic uint64_t seq;
+static struct {
+    _Alignas(64) _Atomic uint64_t seq;
     _Atomic uint64_t floor;
     _Atomic uint64_t until;
 } cfl;
+_Static_assert(sizeof(cfl) == 64, "cfl must occupy a full cache line");
 
 static void copy_floor_note(uint64_t commit, uint64_t until)
 {
@@ -2454,13 +2469,18 @@ int cluster_copy_caught_up_at(const struct cluster_copy *c)
     uint64_t floor, until;
     for (;;) {
         uint64_t s1 = atomic_load_explicit(&cfl.seq, memory_order_acquire);
-        if (s1 & 1)
-            continue;
-        floor = atomic_load_explicit(&cfl.floor, memory_order_relaxed);
-        until = atomic_load_explicit(&cfl.until, memory_order_relaxed);
-        atomic_thread_fence(memory_order_acquire);
-        if (atomic_load_explicit(&cfl.seq, memory_order_relaxed) == s1)
-            break;
+        if (!(s1 & 1)) {
+            floor = atomic_load_explicit(&cfl.floor, memory_order_relaxed);
+            until = atomic_load_explicit(&cfl.until, memory_order_relaxed);
+            atomic_thread_fence(memory_order_acquire);
+            if (atomic_load_explicit(&cfl.seq, memory_order_relaxed) == s1)
+                break;
+        }
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
     }
     if (!floor || (c->applied < floor && cl_mutant() != CLM_COPYNOFLOOR))
         return 0;

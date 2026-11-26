@@ -43,10 +43,11 @@
  * Written (D5). Bytes that writev took were posted: WRITTEN from that moment, whatever completion comes back later. A
  * flushed completion is no statement about what the peer received and changes nothing.
  *
- * Completions in the link's poll. One completion channel and one CQ per connection; poll_fds drains the CQ, arms it,
- * drains it again (an entry that came between the two raises no event) and returns the channel's descriptor and the
- * anchor's, the TCP connection of the handshake, kept in the poll set so that its end is the end of the connection
- * (design-rdma.md §5.1 step 8). The anchor carries nothing once the link is on the queue pair: a byte on it is an error.
+ * Completions in the link's poll. One completion channel and one CQ per connection; poll_fds drains the CQ, and only
+ * when the connection is not already ready for `want` does it arm the CQ and drain it again (an entry that came between
+ * the two raises no event), returning the channel's descriptor and the anchor's, the TCP connection of the handshake,
+ * kept in the poll set so that its end is the end of the connection (design-rdma.md §5.1 step 8). The anchor carries
+ * nothing once the link is on the queue pair: a byte on it is an error.
  *
  * Signalled sends. Every n-th send is signalled (and always the one that takes the last free send slot, so that a
  * completion always comes back to free them): a send slot goes back to the connection's free ring only at the next

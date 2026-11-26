@@ -146,6 +146,13 @@ static void slots_unref(const uint32_t *p)
 
 uint32_t *meta_slot_home_mut(struct meta_state *m)
 {
+    if (!m->slot_home) {
+        uint32_t *sh = slots_new();
+        for (uint32_t i = 0; i < META_SLOTS; i++)
+            sh[i] = META_NONE;
+        m->slot_home = sh;
+        return sh;
+    }
     struct slot_hdr *h = (struct slot_hdr *)(void *)m->slot_home - 1;
     if (__atomic_load_n(&h->refs, __ATOMIC_ACQUIRE) == 1)
         return (uint32_t *)(void *)m->slot_home;

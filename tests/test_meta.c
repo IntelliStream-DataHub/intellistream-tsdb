@@ -460,6 +460,13 @@ static void test_state_machine(void)
         meta_free(&cheat);
         meta_free(&unfrozen);
         meta_free(&prev);
+        /* COW slot_home: zero-init state allocates a META_NONE table safely */
+        struct meta_state zero = {0};
+        uint32_t *zsh = meta_slot_home_mut(&zero);
+        CHECK(zsh != NULL && zsh[0] == META_NONE && zsh[META_SLOTS - 1] == META_NONE);
+        zsh[42] = 7;
+        CHECK(zero.slot_home[42] == 7);
+        meta_free(&zero);
         /* COW slot_home: non-slot apply keeps the shared buffer, and a malformed entry after a slot write rolls back */
         meta_copy(&prev, &m);
         CHECK(prev.slot_home == m.slot_home);

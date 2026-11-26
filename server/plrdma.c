@@ -638,10 +638,10 @@ static void pump(struct plr_conn *c, int closing)
     while ((n = c->ops->poll(c->qp, wc, 16)) > 0)
         for (int j = 0; j < n; j++)
             complete(c, &wc[j], closing, rx_repost, &nrx);
-    if (nrx > 0 && !closing)
-        repost_batch(c, rx_repost, nrx);
     if (n < 0 && !closing)
         fail(c, errno);
+    if (nrx > 0 && !closing)
+        repost_batch(c, rx_repost, nrx);
 }
 
 /* one message out on the next send slot; the credit is the caller's */

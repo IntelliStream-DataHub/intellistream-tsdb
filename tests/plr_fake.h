@@ -615,7 +615,8 @@ static int pfk_post_recv(struct plr_qp *q, uint64_t id, void *p, uint32_t n, uin
 
 static const struct plr_ops pfk_ops = {"fake",   pfk_dev_open, pfk_dev_close, pfk_reg,  pfk_dereg,
                                        pfk_qp_new, pfk_qp_rts, pfk_qp_err,    pfk_qp_free, pfk_fd,
-                                       pfk_arm,  pfk_take_events, pfk_poll,   pfk_post_send, pfk_post_recv};
+                                       pfk_arm,  pfk_take_events, pfk_poll,   pfk_post_send, pfk_post_recv,
+                                       NULL, NULL};
 
 /* ------------------------------------------------------------------------------------------------- fake rdma_cm */
 

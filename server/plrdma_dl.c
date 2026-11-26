@@ -666,7 +666,13 @@ static int dl_post_send_batch(struct plr_qp *q, const struct plr_send_wr *in, in
         int e = ibv_post_send(q->qp, &wr[0], &bad);
         if (e) {
             errno = e;
-            int done = (bad && bad >= &wr[0] && bad < &wr[m]) ? (int)(bad - &wr[0]) : 0;
+            int done = 0;
+            for (int i = 0; i < m; i++) {
+                if (bad == &wr[i]) {
+                    done = i;
+                    break;
+                }
+            }
             return off + done;
         }
         off += m;
@@ -695,7 +701,13 @@ static int dl_post_recv_batch(struct plr_qp *q, const struct plr_recv_wr *in, in
         int e = ibv_post_recv(q->qp, &wr[0], &bad);
         if (e) {
             errno = e;
-            int done = (bad && bad >= &wr[0] && bad < &wr[m]) ? (int)(bad - &wr[0]) : 0;
+            int done = 0;
+            for (int i = 0; i < m; i++) {
+                if (bad == &wr[i]) {
+                    done = i;
+                    break;
+                }
+            }
             return off + done;
         }
         off += m;
