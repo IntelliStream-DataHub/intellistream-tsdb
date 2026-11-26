@@ -2054,8 +2054,9 @@ static void test_memtable_room_rollback(const char *base)
 }
 
 /* The capacity a series' arrays grow to, and when the slow path runs. Rows added one at a time to one series: the
- * first row grows the arrays to 64, and nothing more runs until row 65 (to 128), so a row inside the capacity never
- * leaves the inline check (the capacity is kept as a power of two, and an off-by-one there turns half of it away). */
+ * first row grows the arrays to MT_INIT_CAP (4), then doubling at each power-of-two boundary (8, 16, 32, 64, 128),
+ * so a row inside the capacity never leaves the inline check (the capacity is kept as a power of two, and an
+ * off-by-one there turns half of it away). */
 static void test_memtable_capacity(const char *base)
 {
     char name[600];
@@ -2065,9 +2066,9 @@ static void test_memtable_capacity(const char *base)
     OK(tsdb_series(db, "a", &a));
     OK(tsdb_series(db, "b", &b));
     const uint64_t calls0 = __atomic_load_n(&mt_test_reserve_calls, __ATOMIC_RELAXED);
-    const int rows[] = {1, 2, 32, 33, 63, 64, 65, 66, 127, 128};
-    const uint64_t want[] = {1, 1, 1, 1, 1, 1, 2, 2, 2, 2};
-    const size_t wcap[] = {64, 64, 64, 64, 64, 64, 128, 128, 128, 128};
+    const int rows[] = {1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128};
+    const uint64_t want[] = {1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6};
+    const size_t wcap[] = {4, 4, 4, 8, 8, 16, 16, 32, 32, 64, 64, 128, 128};
     int done = 0;
     for (size_t k = 0; k < sizeof rows / sizeof *rows; k++) {
         for (; done < rows[k]; done++)

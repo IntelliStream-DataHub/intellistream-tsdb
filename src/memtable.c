@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,15 +136,91 @@ static int mt_s_grow(memtable *m, uint32_t cap)
     return 0;
 }
 
+#define MT_ROW_BYTES (sizeof(int64_t) + sizeof(uint64_t) + sizeof(uint64_t)) /* 24 bytes: ts + v + lsn */
+#define MT_BIG_PAD 64u /* 1 cache-line stagger between ts, v, lsn in mt_big to avoid 4 KiB L1D set aliasing */
+#define MT_CHUNK_MIN ((size_t)64 << 10)  /* 64 KiB: small memtables stay small */
+#define MT_CHUNK_MAX ((size_t)4 << 20)   /* 4 MiB: 1M series x 4 rows (~96 MiB) = ~26 chunks */
+
+/* Allocates one packed row block (ts[cap], v[cap], lsn[cap]) from the memtable's arena (for cap <= 128) or as a
+ * standalone mt_big block. Does not zero fresh chunks: under buf_lock only the 32-byte header and the requested block
+ * are touched, keeping page faults incremental. */
+static void *mt_blk_alloc(memtable *m, size_t cap, uint8_t lg)
+{
+    if (lg <= MT_ARENA_MAX_LG) {
+        unsigned cls = lg - MT_INIT_LG;
+        if (m->free_blk[cls]) {
+            void *p = m->free_blk[cls];
+            memcpy(&m->free_blk[cls], p, sizeof(void *));
+            return p;
+        }
+        size_t bytes = cap * MT_ROW_BYTES;
+        mt_chunk *c = m->chunks;
+        if (!c || c->cap - c->used < bytes) {
+            size_t total = m->chunk_next ? m->chunk_next : MT_CHUNK_MIN;
+            while (total < sizeof(mt_chunk) + bytes)
+                total = total < MT_CHUNK_MAX / 4 ? total * 4 : MAX(MT_CHUNK_MAX, sizeof(mt_chunk) + bytes);
+            c = malloc(total);
+            if (!c)
+                return NULL;
+            c->next = m->chunks;
+            c->cap = total - sizeof *c;
+            c->used = 0;
+            m->chunks = c;
+            m->chunk_next = total < MT_CHUNK_MAX ? MIN(total * 4, MT_CHUNK_MAX) : MT_CHUNK_MAX;
+        }
+        void *p = c->data + c->used;
+        c->used += bytes;
+        return p;
+    }
+    if (cap > (SIZE_MAX - sizeof(mt_big) - 2 * MT_BIG_PAD) / MT_ROW_BYTES)
+        return NULL;
+    size_t total = sizeof(mt_big) + cap * MT_ROW_BYTES + 2 * MT_BIG_PAD;
+    mt_big *b = malloc(total);
+    if (!b)
+        return NULL;
+    b->prev = NULL;
+    b->next = m->big_head;
+    b->bytes = total;
+    if (m->big_head)
+        m->big_head->prev = b;
+    m->big_head = b;
+    return b->data;
+}
+
+static void mt_blk_free(memtable *m, void *blk, uint8_t lg)
+{
+    if (lg <= MT_ARENA_MAX_LG) {
+        unsigned cls = lg - MT_INIT_LG;
+        memcpy(blk, &m->free_blk[cls], sizeof(void *));
+        m->free_blk[cls] = blk;
+        return;
+    }
+    mt_big *b = (mt_big *)((uint8_t *)blk - offsetof(mt_big, data));
+    if (b->prev)
+        b->prev->next = b->next;
+    else
+        m->big_head = b->next;
+    if (b->next)
+        b->next->prev = b->prev;
+    tsdb_free_big(b, b->bytes);
+}
+
+void (*mt_test_unref_hook)(const memtable *m);
+
 void mt_unref(memtable *m)
 {
     if (!m || atomic_fetch_sub(&m->refs, 1) != 1)
         return;
-    for (uint32_t i = 0; i < m->nids; i++) {
-        mt_series *s = &m->s[m->ids[i]];
-        free(s->ts);
-        free(s->v);
-        free(s->lsn);
+    void (*hook)(const memtable *) = __atomic_load_n(&mt_test_unref_hook, __ATOMIC_ACQUIRE);
+    if (hook)
+        hook(m);
+    for (mt_big *b = m->big_head, *nx; b; b = nx) {
+        nx = b->next;
+        tsdb_free_big(b, b->bytes);
+    }
+    for (mt_chunk *c = m->chunks, *nx; c; c = nx) {
+        nx = c->next;
+        tsdb_free_big(c, sizeof *c + c->cap);
     }
     if (m->ppos)
         ppos_mt_free(m);
@@ -191,26 +268,32 @@ static int mt_reserve_to(memtable *m, uint32_t id, size_t extra)
         m->ids = ids;
         m->idcap = c;
     }
-    size_t cap = s->lgcap ? mt_cap(s) * 2 : 64;
+    size_t cap = s->lgcap ? mt_cap(s) * 2 : MT_INIT_CAP;
     while (cap < need)
         cap *= 2;
-    int64_t *t = realloc(s->ts, cap * sizeof *t);
-    if (!t)
+    uint8_t new_lg = (uint8_t)(__builtin_ctzll(cap) + 1);
+    void *blk = mt_blk_alloc(m, cap, new_lg);
+    if (!blk)
         return TSDB_ERR_NOMEM;
-    s->ts = t;
-    uint64_t *v = realloc(s->v, cap * sizeof *v);
-    if (!v)
-        return TSDB_ERR_NOMEM;
-    s->v = v;
-    uint64_t *l = realloc(s->lsn, cap * sizeof *l);
-    if (!l)
-        return TSDB_ERR_NOMEM;
-    s->lsn = l;
-    if (s->lgcap == 0) {
+    size_t pad = new_lg > MT_ARENA_MAX_LG ? MT_BIG_PAD : 0;
+    int64_t *t = (int64_t *)blk;
+    uint64_t *v = (uint64_t *)((uint8_t *)(t + cap) + pad);
+    uint64_t *l = (uint64_t *)((uint8_t *)(v + cap) + pad);
+    if (s->lgcap != 0) {
+        if (s->n) {
+            memcpy(t, s->ts, (size_t)s->n * sizeof *t);
+            memcpy(v, s->v, (size_t)s->n * sizeof *v);
+            memcpy(l, s->lsn, (size_t)s->n * sizeof *l);
+        }
+        mt_blk_free(m, s->ts, s->lgcap);
+    } else {
         m->ids[m->nids++] = id;
         s->sorted = true;
     }
-    s->lgcap = (uint8_t)(__builtin_ctzll(cap) + 1);
+    s->ts = t;
+    s->v = v;
+    s->lsn = l;
+    s->lgcap = new_lg;
     return 0;
 }
 
@@ -261,9 +344,8 @@ int mt_reserve_rows(memtable *m, const uint32_t *series, uint32_t cs, size_t n)
             mt_unreserve(m, series, k);
             for (uint32_t i = nids0; i < m->nids; i++) {
                 mt_series *s = &m->s[m->ids[i]];
-                free(s->ts);
-                free(s->v);
-                free(s->lsn);
+                if (s->lgcap)
+                    mt_blk_free(m, s->ts, s->lgcap);
                 s->ts = NULL, s->v = NULL, s->lsn = NULL;
                 s->lgcap = 0;
             }
@@ -1670,8 +1752,10 @@ void eng_leader_keep_floor(eng *db, uint64_t pos, uint64_t floor)
 }
 
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
- * failed stays in the list to be retried. Called with flush_lock held. */
-int flush_waiting(eng *db)
+ * failed stays in the list to be retried. Called with flush_lock held.
+ * When `retired` is provided, detached memtables are collected into it so the
+ * caller can call mt_unref() after releasing flush_lock. */
+static int flush_waiting_collect(eng *db, memtable **retired, size_t *nretired, size_t rcap)
 {
     int rc = 0;
     for (size_t i = 0; i < db->nflushing && rc == 0;) {
@@ -1750,11 +1834,16 @@ int flush_waiting(eng *db)
         }
         if (mrc == 0)
             mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
-        mt_unref(m);
+        if (retired && *nretired < rcap)
+            retired[(*nretired)++] = m;
+        else
+            mt_unref(m);
         rc = mrc;
     }
     return rc;
 }
+
+int flush_waiting(eng *db) { return flush_waiting_collect(db, NULL, NULL, 0); }
 
 void (*mt_test_before_seal)(eng *db);
 void (*mt_test_after_wal_enter)(eng *db);
@@ -1797,12 +1886,14 @@ static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
         if (mrc)
             return mrc;
     }
+    memtable *retired[MAX_FLUSHING * 2 + 1];
+    size_t nretired = 0;
     if (!held)
         pthread_mutex_lock(&db->flush_lock);
     /* a memtable whose write failed earlier holds older rows than the active
      * one: it is written first, and the active one after it all the same, or
      * a large insert that relies on this flush would be shadowed by it */
-    int rc = flush_waiting(db);
+    int rc = flush_waiting_collect(db, retired, &nretired, MAX_FLUSHING * 2);
     if (rc == 0)
         rc = cls_classify_active(db); /* a leader's fresh series: their CLASS markers go before the seal */
     void (*seal_hook)(eng *) = __atomic_load_n(&mt_test_before_seal, __ATOMIC_ACQUIRE);
@@ -1917,7 +2008,7 @@ static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
         wal_writer_leave(db);
     }
     if (nm)
-        mt_unref(nm);
+        retired[nretired++] = nm;
     if (newfd >= 0) {
         close(newfd);
         if (!eng_check(db)) {
@@ -1935,9 +2026,11 @@ static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
         manifest_publish(db);
 
     if (rc == 0)
-        rc = flush_waiting(db);
+        rc = flush_waiting_collect(db, retired, &nretired, MAX_FLUSHING * 2);
     if (!held)
         pthread_mutex_unlock(&db->flush_lock);
+    for (size_t i = 0; i < nretired; i++)
+        mt_unref(retired[i]);
     free(mbody);
     if (mlsn && rc == 0)
         rc = wal_commit(db, mlsn); /* the marker is durable before the caller goes on */

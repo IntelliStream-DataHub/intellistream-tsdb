@@ -1372,6 +1372,32 @@ struct cls_wtail {
     int64_t *max;
 };
 
+/* Per-memtable bump arena for series row arrays (ts, v, lsn packed into one cap * 24 B block).
+ * Small/medium capacities (4..128 rows) are carved from geometrically growing chunks (64 KiB..4 MiB) with
+ * per-size-class free lists for growth/rollback reuse; larger capacities use standalone mt_big blocks
+ * freed immediately on growth so high-rate series do not retain dead intermediate slabs. */
+#define MT_INIT_CAP 4u
+#define MT_INIT_LG 3u      /* mt_cap: (1 << 3) >> 1 == 4 */
+#define MT_ARENA_MAX_LG 8u /* mt_cap: (1 << 8) >> 1 == 128 (3 KiB per block) */
+#define MT_SLAB_N (MT_ARENA_MAX_LG - MT_INIT_LG + 1)
+
+typedef struct mt_chunk {
+    struct mt_chunk *next;
+    size_t cap;  /* usable bytes in data[] */
+    size_t used; /* bumped bytes in data[] */
+    uint64_t pad;
+    uint8_t data[];
+} mt_chunk;
+_Static_assert(sizeof(mt_chunk) == 32, "mt_chunk keeps 32-byte alignment");
+
+typedef struct mt_big {
+    struct mt_big *prev, *next;
+    size_t bytes; /* total allocation size (sizeof(mt_big) + cap * 24) */
+    uint64_t pad;
+    uint8_t data[];
+} mt_big;
+_Static_assert(sizeof(mt_big) == 32, "mt_big keeps 32-byte alignment");
+
 typedef struct memtable {
     atomic_int refs;
     mt_series *s; /* indexed by series id */
@@ -1379,6 +1405,10 @@ typedef struct memtable {
     bool s_map; /* s is an anonymous mapping (zero pages, grown by mremap: mt_reserve); else malloc'd */
     uint32_t *ids; /* series present, first-insert order */
     uint32_t nids, idcap;
+    mt_chunk *chunks;          /* arena chunks (head is active bump chunk), freed in bulk by mt_unref */
+    size_t chunk_next;         /* next chunk target size (64 KiB -> 256 KiB -> 1 MiB -> 4 MiB) */
+    void *free_blk[MT_SLAB_N]; /* recycled arena blocks per size class (4..128 rows) */
+    mt_big *big_head;          /* standalone blocks for series with cap > 128 */
     size_t rows;
     int64_t min_ts, max_ts;
     uint64_t wal_seq;
@@ -1387,6 +1417,8 @@ typedef struct memtable {
     uint64_t fno_end;        /* a sealed memtable: the next number at its seal, the end of its segment (FNO bound) */
     struct ppos_mt *ppos;    /* an ec cluster volume's: base partition -> highest fno of its rows (src/ppos.h, r8d) */
 } memtable;
+
+extern void (*mt_test_unref_hook)(const memtable *m); /* test hook (tests/test_flush_tail.c): runs on last mt_unref */
 
 /* Rows of one series copied out of a memtable: sorted, unique by ts; v in
  * slots of the series' type. */

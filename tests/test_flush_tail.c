@@ -15,13 +15,28 @@
 #include "internal.h"
 #include "tsdb.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include "watchdog.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #ifndef __APPLE__
 #include <sys/mman.h>
+#endif
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define UNDER_SAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define UNDER_SAN 1
+#else
+#define UNDER_SAN 0
+#endif
+#else
+#define UNDER_SAN 0
 #endif
 
 static int failures;
@@ -157,8 +172,164 @@ static void test_zap_page_size(void)
 #endif
 #endif
 
-int main(void)
+#ifndef OLD_CODE
+/* High-cardinality memtable footprint, arena slab growth/reuse, big-block transition (> 128 rows),
+ * and reservation rollback across both arena and big blocks. */
+extern int (*mt_test_reserve_fail)(uint32_t id);
+static uint32_t ft_fail_id;
+static int ft_fail_cb(uint32_t id) { return id == ft_fail_id; }
+
+static void test_arena_high_cardinality(void)
 {
+    const uint32_t NS = 250000;
+    long r0 = rss();
+    memtable *m = mt_new(1);
+    CHECK(m != NULL);
+    for (uint32_t id = 0; id < NS; id++) {
+        int64_t ts = 1000 + (int64_t)id;
+        double val = (double)id * 0.25;
+        uint64_t slot;
+        memcpy(&slot, &val, 8);
+        CHECK(mt_add(m, NULL, id, &ts, &slot, 8, 1, (uint64_t)id + 1, TSDB_FLOAT64) == 0);
+    }
+    long grown = rss() - r0;
+    /* Old code allocated 3 x 512 B per series (~388 MiB for 250K series); arena takes ~34 MiB. */
+    if (rss_ok && !UNDER_SAN) {
+        CHECK(grown < (96l << 20));
+        if (grown >= (96l << 20))
+            fprintf(stderr, "  250K-series memtable made %ld MiB resident (want < 96 MiB)\n", grown >> 20);
+    }
+    /* Grow a subset of series through slab classes (4 -> 8 -> 16 -> 64) and verify free-list reuse & values */
+    for (uint32_t r = 1; r < 20; r++) {
+        for (uint32_t id = 0; id < 1000; id++) {
+            int64_t ts = 1000 + (int64_t)id + (int64_t)r * 1000000LL;
+            double val = (double)id + (double)r;
+            uint64_t slot;
+            memcpy(&slot, &val, 8);
+            CHECK(mt_add(m, NULL, id, &ts, &slot, 8, 1, (uint64_t)NS + r * 1000 + id, TSDB_FLOAT64) == 0);
+        }
+    }
+    /* Grow two series past MT_ARENA_MAX_LG (128 -> 256 -> ... -> 16384) to exercise mt_big allocation and growth */
+    const uint32_t big_ids[2] = {5, 123456};
+    for (int b = 0; b < 2; b++) {
+        uint32_t id = big_ids[b];
+        for (uint32_t j = 0; j < 10000; j++) {
+            int64_t ts = 100000000LL + (int64_t)j * 10;
+            double val = (double)(b * 100000 + j);
+            uint64_t slot;
+            memcpy(&slot, &val, 8);
+            CHECK(mt_add(m, NULL, id, &ts, &slot, 8, 1, 0, TSDB_FLOAT64) == 0);
+        }
+    }
+    /* Verify samples across 1-row, 20-row, and 10000+-row series */
+    CHECK(has(m, 249999, 1000 + 249999, 249999.0 * 0.25));
+    CHECK(has(m, 50000, 1000 + 50000, 50000.0 * 0.25));
+    {
+        mem_run r = {0};
+        CHECK(mt_collect(m, 42, 8, INT64_MIN, INT64_MAX, UINT64_MAX, &r) == 0 && r.n == 20);
+        if (r.n == 20) {
+            double y;
+            memcpy(&y, r.v + 19 * 8, 8);
+            CHECK(y == 42.0 + 19.0);
+        }
+        mem_run_free(&r);
+    }
+    {
+        mem_run r = {0};
+        CHECK(mt_collect(m, big_ids[1], 8, INT64_MIN, INT64_MAX, UINT64_MAX, &r) == 0 && r.n == 10001);
+        if (r.n == 10001) {
+            double y;
+            memcpy(&y, r.v + 10000 * 8, 8);
+            CHECK(y == 100000.0 + 9999.0);
+        }
+        mem_run_free(&r);
+    }
+    /* Rollback test: failing reservation of a new series frees newly registered arena blocks cleanly */
+    {
+        uint32_t rids[3] = {NS + 1, NS + 2, NS + 3};
+        ft_fail_id = NS + 3;
+        mt_test_reserve_fail = ft_fail_cb;
+        CHECK(mt_reserve_rows(m, rids, 0, 3) == TSDB_ERR_NOMEM);
+        mt_test_reserve_fail = NULL;
+        CHECK(m->s[NS + 1].lgcap == 0 && m->s[NS + 2].lgcap == 0 && m->s[NS + 3].lgcap == 0);
+    }
+    mt_unref(m);
+}
+
+static eng *ft_unref_eng;
+static uint64_t ft_unref_seq;
+static int ft_unref_seen;
+static int ft_unref_lock_free;
+
+static void ft_unref_cb(const memtable *m)
+{
+    if (!ft_unref_eng || m->wal_seq != ft_unref_seq)
+        return;
+    ft_unref_seen++;
+    if (pthread_mutex_trylock(&ft_unref_eng->flush_lock) == 0) {
+        ft_unref_lock_free++;
+        pthread_mutex_unlock(&ft_unref_eng->flush_lock);
+    }
+}
+
+/* Retired memtables in mt_flush must be unref'd AFTER releasing flush_lock so teardown never stalls flush_lock. */
+static void test_flush_defer_unref(const char *base)
+{
+    char tmpl[512];
+    snprintf(tmpl, sizeof tmpl, "%s/flush-tail-XXXXXX", base);
+    char *dir = mkdtemp(tmpl);
+    CHECK(dir != NULL);
+    if (!dir)
+        return;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = false;
+    o.wal_sync_ms = 60000;
+    o.flush_interval_ms = 600000;
+    o.buffer_rows = 1 << 20;
+    o.merge_threads = 0;
+    tsdb *db = NULL;
+    CHECK(tsdb_open(dir, &o, &db) == 0 && db != NULL);
+    if (db) {
+        const size_t NS = 2000;
+        tsdb_sid *sids = malloc(NS * sizeof *sids);
+        int64_t *ts = malloc(NS * sizeof *ts);
+        float *v = malloc(NS * sizeof *v);
+        CHECK(sids && ts && v);
+        for (size_t i = 0; i < NS; i++) {
+            char name[32];
+            snprintf(name, sizeof name, "s.%zu", i);
+            CHECK(tsdb_series(db, name, &sids[i]) == 0);
+            ts[i] = 1700000000000LL + (int64_t)i;
+            v[i] = (float)i;
+        }
+        CHECK(tsdb_insert(db, sids, ts, v, NS) == 0);
+        eng *e = tsdb_test_engine(db, 0);
+        ft_unref_eng = e;
+        ft_unref_seq = e->active->wal_seq;
+        ft_unref_seen = 0;
+        ft_unref_lock_free = 0;
+        __atomic_store_n(&mt_test_unref_hook, ft_unref_cb, __ATOMIC_RELEASE);
+        CHECK(tsdb_flush(db) == 0);
+        __atomic_store_n(&mt_test_unref_hook, NULL, __ATOMIC_RELEASE);
+        ft_unref_eng = NULL;
+        CHECK(ft_unref_seen == 1);
+        CHECK(ft_unref_lock_free == 1);
+        free(sids);
+        free(ts);
+        free(v);
+        tsdb_close(db);
+    }
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0)
+        failures++;
+}
+#endif
+
+int main(int argc, char **argv)
+{
+    const char *base = argc > 1 ? argv[1] : "/tmp";
     th_watchdog("test_flush_tail", 1200);
     test_series_array();
 #ifndef OLD_CODE
@@ -168,6 +339,8 @@ int main(void)
 #else
     printf("test_flush_tail: RSS checks and the zap test skipped on macOS (no /proc, plain free)\n");
 #endif
+    test_arena_high_cardinality();
+    test_flush_defer_unref(base);
 #endif
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);
