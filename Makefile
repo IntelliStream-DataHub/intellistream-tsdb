@@ -618,7 +618,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ec16 r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1880,7 +1880,7 @@ jepsen-selftest-5:
 # front of every peer port, nemeses kill, partition, pause, midcommit (crash points, server/crashpt.h) and power
 # (crashfs), workloads meta and kv-local, a checker. One run per nemesis and backend; JEPSEN_SECONDS is the length of
 # each (default 30), JEPSEN_SEED the seed, JEPSEN_NODES the size (default 5). Its directory is per tree, like jepsen's.
-$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
+$(B)/jepsen_cluster: tests/jepsen/jepsen_cluster.c tests/jepsen/cluster_users.h tests/jepsen/cluster_ec.h tests/harness.h tests/cvol_check.h server/cluster.h server/meta.h \
     server/crashpt.h server/users.h $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -Isrc/raft/compat -Itests -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
@@ -1927,7 +1927,7 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	$(MAKE) --no-print-directory jepsen-cluster-ec
 
 # --ec (tests/jepsen/cluster_ec.h, row r8l-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
-# The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (it takes --ec-experimental: only then
+# The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (built with TSDB_EC: only then
 # is there a chunk to rot and a crash point of the settle to reach) to partition pause rot midcommit power as well;
 # JEPSEN_EC= (empty) leaves the runs out. Per io and workload (JEPSEN_EC_WORKLOADS).
 JEPSEN_EC ?= 4+2
@@ -1937,7 +1937,7 @@ JEPSEN_EC_NEMESES ?=
 jepsen-cluster-ec: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so
 	@if [ -z "$(JEPSEN_EC)" ]; then echo "jepsen-cluster-ec: off (JEPSEN_EC is empty)"; exit 0; fi; \
 	nems="$(JEPSEN_EC_NEMESES)"; if [ -z "$$nems" ]; then \
-	    if ./$(B)/tsdbd --help 2>&1 | grep -q -- --ec-experimental; then nems="kill partition partial pause diskloss rot midcommit power"; \
+	    if [ -n "$(EC_OBJ)" ]; then nems="kill partition partial pause diskloss rot midcommit power"; \
 	    else nems="kill partial diskloss"; fi; fi; \
 	for io in $(IO); do for wl in $(JEPSEN_EC_WORKLOADS); do for nem in $$nems; do \
 	    echo "== tsdbd --io $$io, workloads $$wl, --ec $(JEPSEN_EC) on $(JEPSEN_EC_NODES) nodes, nemesis $$nem"; \
@@ -2072,7 +2072,7 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	out=$$($$ecj --nemesis partial --mutant noop-partition 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'exchanged'; then \
 	        echo "jepsen-cluster-selftest: a partial partition that cut nothing went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
-	if ./$(B)/tsdbd --help 2>&1 | grep -q -- --ec-experimental; then \
+	if [ -n "$(EC_OBJ)" ]; then \
 	    out=$$($$ecj --mutant ec-nosettle 2>&1); rc=$$?; \
 	    if [ $$rc -ne 1 ] || ! echo "$$out" | grep -q 'nothing settled'; then \
 	        echo "jepsen-cluster-selftest: an ec run in which nothing settled went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
@@ -2084,7 +2084,7 @@ jepsen-cluster-selftest: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashf
 	                echo "jepsen-cluster-selftest: the server mutant $$m ($$var) went unnoticed in an ec run, or failed for another reason (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	        else echo "jepsen-cluster-selftest: the server mutant $$m skipped (tsdbd reads no $$var)"; fi; \
 	    done; \
-	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate skipped (this tsdbd has no --ec-experimental)"; fi; \
+	else echo "jepsen-cluster-selftest: ec-nosettle, ycold, ecabovey, cutnogate skipped (NO_EC=1)"; fi; \
 	out=$$($$j --selftest-replicas 2>&1); rc=$$?; \
 	    if [ $$rc -ne 0 ]; then \
 	        echo "jepsen-cluster-selftest: the comparison of replicas is wrong (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \

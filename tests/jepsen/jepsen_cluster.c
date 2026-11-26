@@ -154,12 +154,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 
-#define MAXN 8
+#define MAXN 22
 #define KEYS 40
 #define KV_BASE_TS 1700000000000LL
 #define RAFT_LEADER_ROLE 3
@@ -188,7 +190,7 @@ static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the
 static void ju_settled(void);
 static struct meta_settings S;
 static _Atomic uint64_t ec_replaces; /* --ec: the kv writers' replaces of one key (cluster_ec.h) */
-static int ec_experimental; /* the tsdbd under test has --ec-experimental (the leader's settle of an ec volume is built) */
+static int ec_settles; /* this build + tsdbd settles ec volumes (TSDB_EC compiled in, chunk stores supported) */
 static void ec_add_kvr(void);
 static void rmtree(const char *path);
 
@@ -283,6 +285,8 @@ struct node {
     char chunk[2][PATH_MAX + 32]; /* --ec: the node's two chunk stores ("" until made after the cluster has member ids) */
     int mport;                    /* its metrics port (--ec), from its port file */
     char octl[PATH_MAX + 32]; /* the outagefs shim's control socket of this node (--outagefs: the slow nemesis) */
+    _Atomic uint64_t peak_rss_kb; /* highest VmHWM/VmRSS seen for this node across the run */
+    _Atomic unsigned peak_fds;    /* highest open fd count seen for this node across the run */
 };
 static struct node nodes[MAXN];
 static pthread_mutex_t tbl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -570,6 +574,9 @@ static void *accept_thread(void *arg)
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+        pthread_attr_setstacksize(&at, 512 * 1024);
+#endif
         if (pthread_create(&t, &at, pconn, pc) != 0) {
             close(a);
             free(pc);
@@ -684,19 +691,18 @@ static void *pf_rewriter(void *arg)
     return NULL;
 }
 
-/* Starts node i. 0: it is up (the table has its ports, read from its port file and held by its pid). 1: it exited
- * before it listened, with *status as waitpid gave it (a crash point's 99). Anything else is a failed run. */
-static int start_node(int i, const char *crash_at, int *status)
+/* Spawns node i (fork + execve); writes its portfile path to `seen` and fork time to `*t_fork_out`. */
+static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap, int64_t *t_fork_out)
 {
     struct node *n = &nodes[i];
-    char pf[PATH_MAX + 128], seen[PATH_MAX + 136], flag[64], padv[64], state[PATH_MAX + 32], io[16];
+    char pf[PATH_MAX + 128], flag[64], padv[64], state[PATH_MAX + 32], io[16];
     th_portfile(pf, sizeof pf, n->dir);
-    snprintf(seen, sizeof seen, "%s", pf);
+    snprintf(seen, seen_cap, "%s", pf);
     th_follow_me(flag, sizeof flag);
     snprintf(padv, sizeof padv, "127.0.0.1:%d", n->proxy_port);
     snprintf(state, sizeof state, "%s/state", n->dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
-    const char *argv[48];
+    const char *argv[64];
     int na = 0;
     argv[na++] = "tsdbd";
     if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
@@ -729,19 +735,29 @@ static int start_node(int i, const char *crash_at, int *status)
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
+    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_form_stores); eager settle, bounded disk/RAM */
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
         argv[na++] = "--ec-settle-grace-s";
         argv[na++] = "3";
-        if (ec_experimental)
-            argv[na++] = "--ec-experimental";
+        argv[na++] = "--ec-settle-force-s";
+        argv[na++] = "5";
+        argv[na++] = "--ec-settle-keep-s";
+        argv[na++] = "30";
+        argv[na++] = "--ec-cache-mb";
+        argv[na++] = "16";
+        if (!want_classes) {
+            argv[na++] = "--flush-interval-ms";
+            argv[na++] = "500";
+            argv[na++] = "--merge-idle-s";
+            argv[na++] = "1";
+        }
         for (int k = 0; k < 2 && n->chunk[k][0]; k++) {
             argv[na++] = "--chunk-dir";
             argv[na++] = n->chunk[k];
         }
     }
-    if (want_ec_k && (n - nodes) >= 2) { /* D15: io_uring on at most two nodes of an --ec run (8 MB memlock per user), epoll on the rest */
+    if ((want_ec_k || nn > 6) && i >= 2) { /* D15: io_uring on at most two nodes (8 MB memlock per user), epoll on the rest */
         argv[na++] = "--io";
         argv[na++] = "epoll";
     } else if (getenv("TSDBD_IO") && *getenv("TSDBD_IO")) {
@@ -815,13 +831,40 @@ static int start_node(int i, const char *crash_at, int *status)
     if (!strcmp(mutant, "foreign-pid") && i == 1 && n->starts == 0) {
         struct pfcopy *c = malloc(sizeof *c);
         snprintf(c->from, sizeof c->from, "%s", pf);
-        snprintf(seen, sizeof seen, "%s.seen", pf);
+        snprintf(seen, seen_cap, "%s.seen", pf);
         snprintf(c->to, sizeof c->to, "%s", seen);
         pthread_t t;
         pthread_create(&t, NULL, pf_rewriter, c);
         pthread_detach(t);
     }
     n->starts++;
+    *t_fork_out = t_fork;
+    return pid;
+}
+
+static void record_node_up(int i, pid_t pid, int port, int mport, int pport, int64_t t_fork)
+{
+    struct node *n = &nodes[i];
+    if (!pport)
+        die(1, "node %d: the port file names no peer port", i);
+    pthread_mutex_lock(&tbl_mu);
+    n->pid = pid;
+    n->cport = port;
+    n->mport = mport;
+    n->pport = pport;
+    n->proc_ns = t_fork;
+    n->paused = 0;
+    pthread_mutex_unlock(&tbl_mu);
+    ev("node %d up, pid %d", i, (int)pid);
+}
+
+/* Starts node i. 0: it is up (the table has its ports, read from its port file and held by its pid). 1: it exited
+ * before it listened, with *status as waitpid gave it (a crash point's 99). Anything else is a failed run. */
+static int start_node(int i, const char *crash_at, int *status)
+{
+    char seen[PATH_MAX + 136];
+    int64_t t_fork = 0;
+    pid_t pid = spawn_node(i, crash_at, seen, sizeof seen, &t_fork);
     int port = th_await(seen, pid, 30000);
     if (port == TH_EXITED) {
         if (status)
@@ -833,18 +876,153 @@ static int start_node(int i, const char *crash_at, int *status)
         waitpid(pid, NULL, 0);
         die(1, "node %d: %s", i, th_why);
     }
-    if (!th_pport)
-        die(1, "node %d: the port file names no peer port", i);
-    pthread_mutex_lock(&tbl_mu);
-    n->pid = pid;
-    n->cport = port;
-    n->mport = th_mport;
-    n->pport = th_pport;
-    n->proc_ns = t_fork;
-    n->paused = 0;
-    pthread_mutex_unlock(&tbl_mu);
-    ev("node %d up, pid %d", i, (int)pid);
+    record_node_up(i, pid, port, th_mport, th_pport, t_fork);
     return 0;
+}
+
+/* One non-blocking poll of `portfile` for `child` (parallel start_nodes_par). Returns >0 port (with *mport, *pport set),
+ * 0 still waiting, TH_EXITED (reaped, *st set), or TH_BAD (foreign pid; why set). */
+static int poll_portfile(const char *portfile, pid_t child, int *mport_out, int *pport_out, int *st_out, char *why,
+                         size_t wn)
+{
+    int st = 0;
+    if (waitpid(child, &st, WNOHANG) == child) {
+        if (st_out)
+            *st_out = st;
+        return TH_EXITED;
+    }
+    FILE *f = fopen(portfile, "r");
+    if (!f)
+        return 0;
+    int port = 0, pid = 0, mport = 0, pport = 0;
+    int n = fscanf(f, "%d %d %d %d", &port, &pid, &mport, &pport);
+    fclose(f);
+    if (n < 2 || port <= 0)
+        return 0;
+    if (pid != (int)child) {
+        snprintf(why, wn, "harness: %.240s names pid %d, but the server started here is pid %d", portfile, pid, (int)child);
+        return TH_BAD;
+    }
+    if (!th_owns_port(child, port) || (n >= 3 && mport && !th_owns_port(child, mport)) ||
+        (n == 4 && !th_owns_port(child, pport))) {
+        if (waitpid(child, &st, WNOHANG) == child) {
+            if (st_out)
+                *st_out = st;
+            return TH_EXITED;
+        }
+        snprintf(why, wn, "harness: port %d is not held by the server started here (pid %d)", port, (int)child);
+        return 0;
+    }
+    *mport_out = n >= 3 ? mport : 0;
+    *pport_out = n == 4 ? pport : 0;
+    return port;
+}
+
+/* Starts all nn nodes in parallel: fork all first, then poll every port file together (up to 45 s). */
+static void start_nodes_par(const char *crash_at)
+{
+    static char seen[MAXN][PATH_MAX + 136];
+    pid_t pids[MAXN];
+    int64_t tfork[MAXN];
+    int ready[MAXN] = {0}, left = nn;
+    char why[MAXN][512];
+    memset(why, 0, sizeof why);
+    for (int i = 0; i < nn; i++)
+        pids[i] = spawn_node(i, crash_at, seen[i], sizeof seen[i], &tfork[i]);
+    int64_t t0 = now_ms();
+    while (left > 0 && now_ms() - t0 < 45000) {
+        for (int i = 0; i < nn; i++) {
+            if (ready[i])
+                continue;
+            int mp = 0, pp = 0, st = 0;
+            int port = poll_portfile(seen[i], pids[i], &mp, &pp, &st, why[i], sizeof why[i]);
+            if (port == TH_EXITED) {
+                for (int j = 0; j < nn; j++)
+                    if (!ready[j] && j != i) {
+                        signal_child(pids[j], SIGKILL);
+                        waitpid(pids[j], NULL, 0);
+                    }
+                die(1, "node %d exited with status 0x%x before it listened (log %s)", i, st, nodes[i].log);
+            }
+            if (port == TH_BAD) {
+                for (int j = 0; j < nn; j++)
+                    if (!ready[j]) {
+                        signal_child(pids[j], SIGKILL);
+                        waitpid(pids[j], NULL, 0);
+                    }
+                die(1, "node %d: %s", i, why[i]);
+            }
+            if (port > 0) {
+                record_node_up(i, pids[i], port, mp, pp, tfork[i]);
+                ready[i] = 1;
+                left--;
+            }
+        }
+        if (left > 0)
+            usleep(10000);
+    }
+    if (left > 0) {
+        int bad = -1;
+        for (int i = 0; i < nn; i++)
+            if (!ready[i]) {
+                if (bad < 0)
+                    bad = i;
+                signal_child(pids[i], SIGKILL);
+                waitpid(pids[i], NULL, 0);
+            }
+        die(1, "node %d: %s", bad, why[bad][0] ? why[bad] : "wrote no port file within 45000 ms");
+    }
+}
+
+/* Stops all nn nodes in parallel with SIGTERM and waits up to 20 s; returns the count of unclean stops. */
+static int stop_nodes_par(void)
+{
+    pid_t pids[MAXN] = {0};
+    int left = 0;
+    for (int i = 0; i < nn; i++) {
+        pthread_mutex_lock(&tbl_mu);
+        pids[i] = nodes[i].pid;
+        nodes[i].pid = 0;
+        nodes[i].cport = nodes[i].pport = 0;
+        int was_paused = nodes[i].paused;
+        nodes[i].paused = 0;
+        pthread_mutex_unlock(&tbl_mu);
+        if (pids[i] <= 0)
+            continue;
+        if (was_paused)
+            signal_child(pids[i], SIGCONT);
+        signal_child(pids[i], SIGTERM);
+        left++;
+    }
+    int unclean = 0;
+    int64_t t0 = now_ms();
+    while (left > 0 && now_ms() - t0 < 20000) {
+        for (int i = 0; i < nn; i++) {
+            if (pids[i] <= 0)
+                continue;
+            int st = 0;
+            pid_t r = waitpid(pids[i], &st, WNOHANG);
+            if (r == pids[i]) {
+                if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+                    fprintf(stderr, "jepsen-cluster: node %d did not stop cleanly on SIGTERM (status 0x%x)\n", i, st);
+                    unclean++;
+                }
+                pids[i] = 0;
+                left--;
+            } else if (r < 0)
+                die(2, "waitpid %d: %s", (int)pids[i], strerror(errno));
+        }
+        if (left > 0)
+            usleep(10000);
+    }
+    for (int i = 0; i < nn; i++)
+        if (pids[i] > 0) {
+            fprintf(stderr, "jepsen-cluster: node %d did not stop within 20 s of SIGTERM: killed (log %s)\n", i, nodes[i].log);
+            signal_child(pids[i], SIGKILL);
+            waitpid(pids[i], NULL, 0);
+            unclean++;
+        }
+    return unclean;
 }
 
 /* Stops node i with `sig` (SIGKILL, SIGTERM) and reaps it; the table forgets it first, so that nobody connects to a
@@ -1210,13 +1388,14 @@ struct obs {
 static struct obs *obs;
 static _Atomic uint32_t nobs;
 static _Atomic int sampler_run, last_leader = -1;
-/* kvr (kv, classes): its replicas, the leader that rep_setup found, and kv_leader: the node the record with the highest
- * epoch names as its leader, as the sampler last saw it (the clients follow it; epochs only grow, so a copy that lags
- * never moves it back). */
-static int rep_leader = -1, rep_nodes[3];
+/* kvr (kv, classes): its replicas (3 for replicas=3, m + 1 for --ec K+M), the leader that rep_setup found, and
+ * kv_leader: the node the record with the highest epoch names as its leader, as the sampler last saw it. */
+static int rep_n = 3;
+static int rep_leader = -1, rep_nodes[META_REPLICAS_MAX];
 static uint32_t rep_number;
 static _Atomic int kv_leader = -1;
 static uint64_t kv_epoch;
+static int rep_full_mask(void) { return (1 << rep_n) - 1; }
 
 static void kv_leader_see(const struct view *v)
 {
@@ -1239,10 +1418,71 @@ static void kv_leader_see(const struct view *v)
 static pthread_t sampler_th;
 static uint64_t samples_ok, samples_failed;
 
+/* Sample VmHWM/VmRSS and open FDs for a process (for resource reporting on large runs). */
+static unsigned proc_count_fds(pid_t pid)
+{
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/fd", (int)pid);
+    DIR *d = opendir(p);
+    if (!d)
+        return 0;
+    unsigned n = 0;
+    for (struct dirent *e; (e = readdir(d));)
+        if (e->d_name[0] != '.')
+            n++;
+    closedir(d);
+    return n;
+}
+
+static uint64_t proc_rss_kb(pid_t pid)
+{
+    char p[64], ln[256];
+    snprintf(p, sizeof p, "/proc/%d/status", (int)pid);
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return 0;
+    uint64_t hwm = 0, rss = 0;
+    while (fgets(ln, sizeof ln, f)) {
+        unsigned long long v = 0;
+        if (sscanf(ln, "VmHWM: %llu kB", &v) == 1)
+            hwm = (uint64_t)v;
+        else if (sscanf(ln, "VmRSS: %llu kB", &v) == 1)
+            rss = (uint64_t)v;
+    }
+    fclose(f);
+    return hwm > rss ? hwm : rss;
+}
+
+static _Atomic unsigned harness_peak_fds;
+static void proc_metrics_sample(void)
+{
+    unsigned hf = proc_count_fds(getpid());
+    unsigned prev_hf = atomic_load(&harness_peak_fds);
+    if (hf > prev_hf)
+        atomic_store(&harness_peak_fds, hf);
+    for (int i = 0; i < nn; i++) {
+        pid_t pid;
+        node_snap(i, &pid, NULL, NULL);
+        if (pid <= 0)
+            continue;
+        uint64_t rss = proc_rss_kb(pid);
+        if (rss > atomic_load(&nodes[i].peak_rss_kb))
+            atomic_store(&nodes[i].peak_rss_kb, rss);
+        unsigned nf = proc_count_fds(pid);
+        if (nf > atomic_load(&nodes[i].peak_fds))
+            atomic_store(&nodes[i].peak_fds, nf);
+    }
+}
+
 static void *sampler(void *arg)
 {
     (void)arg;
+    int64_t last_res = 0;
     while (atomic_load(&sampler_run)) {
+        if (now_ms() - last_res >= 1000) {
+            proc_metrics_sample();
+            last_res = now_ms();
+        }
         for (int i = 0; i < nn && atomic_load(&sampler_run); i++) {
             pid_t pid;
             node_snap(i, &pid, NULL, NULL);
@@ -1755,7 +1995,7 @@ static void kv_setup(void)
  * it takes is the terminal crash point (nem_terminal). */
 #define REP_HISTS 2
 #define FILL_BASE (KV_BASE_TS + 86400000LL) /* the filler's rows: a day after the keys, never a key */
-static char rep_dir[3][PATH_MAX + 32];
+static char rep_dir[META_REPLICAS_MAX][PATH_MAX + 32];
 static _Atomic uint64_t fill_ok, fill_err;
 /* The filler's batches in the order sent (one thread; read after kv_stop joined it): the timestamps [ts0, ts1] of each,
  * its row count and its outcome (WS_*). Batches never overlap (the frontier only moves ahead, also past a failed one),
@@ -1783,15 +2023,15 @@ static void rep_setup(void)
     for (int64_t t0 = now_ms(); rep_leader < 0; usleep(200000)) {
         struct view v;
         if (now_ms() - t0 > 60000)
-            die(1, "kv: the volume kvr was not opened on 3 replicas with a leader within 60 s");
+            die(1, "kv: the volume kvr was not opened on %d replicas with a leader within 60 s", rep_n);
         if (view_get(0, &v, 2000) != 0)
             continue;
         for (uint32_t k = 0; k < v.m.nvolumes; k++) {
             const struct meta_volume *mv = &v.m.volumes[k];
-            if (strcmp(mv->name, "kvr") || mv->nrep != 3 || !mv->leader)
+            if (strcmp(mv->name, "kvr") || mv->nrep != (uint32_t)rep_n || !mv->leader)
                 continue;
             int ok = 1, lead = -1;
-            for (int r = 0; r < 3; r++) {
+            for (int r = 0; r < rep_n; r++) {
                 rep_nodes[r] = -1;
                 for (int i = 0; i < nn; i++)
                     if (atomic_load(&nodes[i].id) == mv->rep[r].node)
@@ -1809,7 +2049,7 @@ static void rep_setup(void)
         }
         view_free(&v);
     }
-    for (int r = 0; r < 3; r++)
+    for (int r = 0; r < rep_n; r++)
         snprintf(rep_dir[r], sizeof rep_dir[r], "%s/v%" PRIu32, nodes[rep_nodes[r]].dir, rep_number);
     nhists = REP_HISTS;
     static const char *const names[REP_HISTS + 1] = {"kvr.a", "kvr.b", "kvr.fill"};
@@ -1849,8 +2089,10 @@ static void rep_setup(void)
         hist_node[i] = rep_leader; /* the leader may have moved since the first series */
     (void)rep_leader_refresh();
     kv_roam = 1;
-    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes %d, %d, %d; its leader is node %d; clients on random "
-           "members, moved to it\n", rep_number, rep_nodes[0], rep_nodes[1], rep_nodes[2], rep_leader);
+    printf("jepsen-cluster: kvr is volume %" PRIu32 " on nodes", rep_number);
+    for (int r = 0; r < rep_n; r++)
+        printf("%s %d", r ? "," : "", rep_nodes[r]);
+    printf("; its leader is node %d; clients on random members, moved to it\n", rep_leader);
 }
 
 /* kvr's ISR as the metadata group holds it: a mask of the replicas (bit r: rep_nodes[r]) in the record with the highest
@@ -1863,10 +2105,10 @@ static void rep_setup(void)
 static long long classes_most(void)
 {
     long long most = -1;
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < rep_n; r++) {
         struct stat cs;
-        char cl[PATH_MAX + 48];
-        snprintf(cl, sizeof cl, "%s/CLASSES", rep_dir[r]);
+        char cl[PATH_MAX + 64];
+        snprintf(cl, sizeof cl, "%.4096s/CLASSES", rep_dir[r]);
         if (stat(cl, &cs) == 0 && (long long)cs.st_size > most)
             most = (long long)cs.st_size;
     }
@@ -1977,12 +2219,12 @@ static void rep_setup_move(void)
 static int rep_sync_members(void)
 {
     struct rrec r;
-    if (rep_rec_get(&r) != 0 || r.nrep != 3)
+    if (rep_rec_get(&r) != 0 || r.nrep != rep_n)
         return 0;
-    for (int k = 0; k < 3; k++)
+    for (int k = 0; k < rep_n; k++)
         if (r.learner[k] || r.node[k] < 0)
             return 0;
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < rep_n; k++) {
         rep_nodes[k] = r.node[k];
         snprintf(rep_dir[k], sizeof rep_dir[k], "%s/v%" PRIu32, nodes[r.node[k]].dir, rep_number);
     }
@@ -2009,7 +2251,7 @@ static int rep_isr_mask(uint64_t *ver)
                 continue;
             *ver = mv->isr_version;
             mask = 0;
-            for (int r = 0; r < 3; r++)
+            for (int r = 0; r < rep_n; r++)
                 for (uint32_t j = 0; j < mv->nisr; j++)
                     if (mv->isr[j] == atomic_load(&nodes[rep_nodes[r]].id))
                         mask |= 1 << r;
@@ -2488,8 +2730,8 @@ static int snaps_diff(const struct snaps *a, const struct snaps *b, const char *
     }
     for (size_t i = 0; i < a->n; i++) {
         const struct snapshot *x = &a->s[i], *y = &b->s[i];
-        if (strcmp(x->name, y->name) || x->n != y->n || memcmp(x->ts, y->ts, x->n * sizeof *x->ts) ||
-            memcmp(x->v, y->v, x->n * sizeof *x->v)) {
+        if (strcmp(x->name, y->name) || x->n != y->n ||
+            (x->n && (memcmp(x->ts, y->ts, x->n * sizeof *x->ts) || memcmp(x->v, y->v, x->n * sizeof *x->v)))) {
             fprintf(stderr, "jepsen-cluster: series %s differs: %s has %zu rows, %s has %s %zu\n", x->name, la, x->n, lb,
                     y->name, y->n);
             diff++;
@@ -2539,7 +2781,7 @@ static int replicas_equal(const char *const *dirs, int n, int cluster)
 static int replica_dirs(const char **dirs, int max)
 {
     int n = 0;
-    for (int r = 0; want_rep && r < 3 && n < max; r++)
+    for (int r = 0; want_rep && r < rep_n && n < max; r++)
         dirs[n++] = rep_dir[r];
     return n;
 }
@@ -2600,7 +2842,7 @@ static int fill_check(const struct snaps *sn, int r, int in_isr, uint64_t *indet
                     cnt[b], (double)x->v[j], cnt[b] % 997);
         cnt[b]++;
     }
-    if (r == 2 && !strcmp(mutant, "rep-half-batch"))
+    if (r == rep_n - 1 && !strcmp(mutant, "rep-half-batch"))
         for (size_t i = 0; i < nfb; i++)
             if (fb[i].st == WS_OK && cnt[i] == fb[i].n) {
                 cnt[i] /= 2;
@@ -2634,12 +2876,12 @@ static int fill_check(const struct snaps *sn, int r, int in_isr, uint64_t *indet
  * the differences and violations. */
 static int rep_check(int terminal, int isr, int *viol)
 {
-    int bad = 0, plant = 2;
+    int bad = 0, plant = rep_n - 1;
     if (terminal)
-        for (int r = 0; r < 3; r++)
+        for (int r = 0; r < rep_n; r++)
             if (isr & 1 << r)
                 plant = r;
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < rep_n; r++) {
         int in_isr = !terminal || (isr & 1 << r);
         if (!in_isr)
             printf("jepsen-cluster: replica %s is not in kvr's last ISR: checked for validity and whole-or-absent large "
@@ -3022,15 +3264,23 @@ static unsigned long long vdir_ino(int i)
     return stat(vd, &sb) == 0 ? (unsigned long long)sb.st_ino : 0;
 }
 
-/* kvr whole again: 3 replicas, no learner, the ISR all of them. 1, or 0 after `ms`. */
+/* kvr whole again: rep_n replicas, no learner, the ISR all of them. 1, or 0 after `ms`. */
+static int rep_no_learners(const struct rrec *r)
+{
+    for (int k = 0; k < r->nrep; k++)
+        if (r->learner[k])
+            return 0;
+    return 1;
+}
+
 static int rep_wait_whole(int ms)
 {
     for (int64_t t0 = now_ms(); now_ms() - t0 < ms; usleep(300000)) {
         check_unexpected_exits();
         struct rrec r;
         uint64_t ver;
-        if (rep_rec_get(&r) == 0 && r.nrep == 3 && !r.moving && !r.learner[0] && !r.learner[1] && !r.learner[2] &&
-            rep_isr_mask(&ver) == 7)
+        if (rep_rec_get(&r) == 0 && r.nrep == rep_n && !r.moving && rep_no_learners(&r) &&
+            rep_isr_mask(&ver) == rep_full_mask())
             return 1;
     }
     return 0;
@@ -3039,8 +3289,8 @@ static int rep_wait_whole(int ms)
 /* a replica of kvr that does not lead it (the leader's own failover is the other nemeses' business): its node */
 static int rep_follower_pick(void)
 {
-    int l = atomic_load(&kv_leader), pick[3], np = 0;
-    for (int r = 0; r < 3; r++)
+    int l = atomic_load(&kv_leader), pick[META_REPLICAS_MAX], np = 0;
+    for (int r = 0; r < rep_n; r++)
         if (rep_nodes[r] != l)
             pick[np++] = rep_nodes[r];
     return np ? pick[rnd_range(0, np - 1)] : -1;
@@ -3053,12 +3303,12 @@ static int hold_hi(int cap_ms) { return seconds * 200 < 5000 ? 5000 : seconds * 
 static void nem_kill2(void)
 {
     int a = pick_node(1), b = -1;
-    /* The case this nemesis is for: two of kvr's three replicas down, so the volume has no quorum and the minority that
+    /* The case this nemesis is for: two of kvr's replicas down, so the volume has no quorum and the minority that
      * is left holds acknowledged writes. By chance that is about a third of the rounds, so the first round of a run
      * with kvr and every other one at even odds takes two of its replicas (counted, and required at the end). The
      * metadata group (5 nodes) keeps its majority under any two kills. */
     if (want_rep && (kill2_done == 0 || rnd() % 2 == 0)) {
-        int r1 = rnd_range(0, 2), r2 = (r1 + rnd_range(1, 2)) % 3;
+        int r1 = rnd_range(0, rep_n - 1), r2 = (r1 + rnd_range(1, rep_n - 1)) % rep_n;
         a = rep_nodes[r1];
         b = rep_nodes[r2];
         kill2_rep++;
@@ -3272,7 +3522,7 @@ static void churn_finish(int from, int to)
     for (;; usleep(300000)) {
         check_unexpected_exits();
         struct rrec q;
-        if (rep_rec_get(&q) == 0 && q.nrep == 3 && !q.moving && !q.learner[0] && !q.learner[1] && !q.learner[2])
+        if (rep_rec_get(&q) == 0 && q.nrep == rep_n && !q.moving && rep_no_learners(&q))
             break;
         if (now_ms() - t0 > 240000)
             die(1, "churn: the move of kvr from node %d to node %d did not end in 240 s", from, to);
@@ -3301,7 +3551,7 @@ enum { CH_ANY, CH_TRANSFER_PREF, CH_TRANSFER_ONLY, CH_MOVE_ONLY };
 static int churn_once(int from_pick, int mode, int wait)
 {
     struct rrec r;
-    for (int64_t t0 = now_ms(); rep_rec_get(&r) != 0 || r.nrep < 3 || r.moving || r.leader < 0; usleep(300000))
+    for (int64_t t0 = now_ms(); rep_rec_get(&r) != 0 || r.nrep < rep_n || r.moving || r.leader < 0; usleep(300000))
         if (now_ms() - t0 > 60000)
             die(1, "churn: no settled record of kvr within 60 s (a move that never ended?)");
     int lead = r.leader, cand[MAXN], nc = 0;
@@ -3541,9 +3791,9 @@ static void nem_terminal(void)
         int64_t tw = now_ms();
         uint64_t ver;
         int m;
-        while ((m = rep_isr_mask(&ver)) != 7 && now_ms() - tw < 60000)
+        while ((m = rep_isr_mask(&ver)) != rep_full_mask() && now_ms() - tw < 60000)
             usleep(200000);
-        if (m != 7)
+        if (m != rep_full_mask())
             fprintf(stderr, "jepsen-cluster: the ISR of kvr is not whole (mask %d) 60 s before the failover point %s\n", m,
                     cps[term_cp].name);
         ev("ISR of kvr mask %d before the failover point (%lld ms)", m, (long long)(now_ms() - tw));
@@ -3562,7 +3812,7 @@ static void nem_terminal(void)
     int ended[MAXN] = {0}, nend = 0, healed = !fo;
     int64_t t0 = now_ms(), first = -1;
     for (;;) {
-        for (int r = 0; r < 3; r++) {
+        for (int r = 0; r < rep_n; r++) {
             int i = rep_nodes[r];
             if (!fo && (cps[term_cp].leader == 3 ? i == L : i != L)) /* 3: a replica applying a COLD (cluster_ec.h) */
                 continue;
@@ -3633,8 +3883,8 @@ static int rep_final_check(void)
             fprintf(stderr, "jepsen-cluster: FAIL: the replica on node %d is still a learner of kvr at the end\n", r.node[k]);
             bad++;
         }
-    if (r.nrep != 3) {
-        fprintf(stderr, "jepsen-cluster: FAIL: kvr has %d replicas at the end, not 3\n", r.nrep);
+    if (r.nrep != rep_n) {
+        fprintf(stderr, "jepsen-cluster: FAIL: kvr has %d replicas at the end, not %d\n", r.nrep, rep_n);
         bad++;
     }
     if (!bad && r4_dynamic)
@@ -4260,8 +4510,72 @@ static void usage(void)
     exit(2);
 }
 
+static int check_limits(int nodes_n, const char *dir)
+{
+    /* File descriptors: proxy holds full-mesh peer links (~4k sockets at 22 nodes) + listeners + client sockets; each
+     * tsdbd inherits this limit (~650 FDs at 22 nodes). */
+    rlim_t need_fds = (rlim_t)(nodes_n > 8 ? (nodes_n * nodes_n * 12 + 1024) : 1024);
+    if (nodes_n > 8 && need_fds < 8192)
+        need_fds = 8192;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < need_fds) {
+        rlim_t want = (rl.rlim_max == RLIM_INFINITY || need_fds <= rl.rlim_max) ? need_fds : rl.rlim_max;
+        if (want > rl.rlim_cur) {
+            struct rlimit nr = {want, rl.rlim_max};
+            (void)setrlimit(RLIMIT_NOFILE, &nr);
+            (void)getrlimit(RLIMIT_NOFILE, &rl);
+        }
+        if (rl.rlim_cur < need_fds) {
+            fprintf(stderr, "jepsen-cluster: refused: open descriptor limit RLIMIT_NOFILE is %llu (hard %llu), "
+                            "%d nodes need at least %llu (raise with ulimit -n)\n",
+                    (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max, nodes_n,
+                    (unsigned long long)need_fds);
+            return -1;
+        }
+    }
+    /* Memory: check RLIMIT_AS and /proc/meminfo MemAvailable against a conservative per-node floor. */
+    uint64_t need_mb = (uint64_t)nodes_n * 64;
+    if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (256ULL << 20)) {
+        fprintf(stderr, "jepsen-cluster: refused: address space limit RLIMIT_AS is %llu MiB, need at least 256 MiB\n",
+                (unsigned long long)(rl.rlim_cur >> 20));
+        return -1;
+    }
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (mf) {
+        char ln[256];
+        uint64_t avail_kb = 0, free_kb = 0;
+        while (fgets(ln, sizeof ln, mf)) {
+            unsigned long long v = 0;
+            if (sscanf(ln, "MemAvailable: %llu kB", &v) == 1)
+                avail_kb = (uint64_t)v;
+            else if (sscanf(ln, "MemFree: %llu kB", &v) == 1)
+                free_kb = (uint64_t)v;
+        }
+        fclose(mf);
+        uint64_t mb = (avail_kb ? avail_kb : free_kb) / 1024;
+        if (mb && mb < need_mb) {
+            fprintf(stderr, "jepsen-cluster: refused: only %" PRIu64 " MiB RAM available, %d nodes need at least "
+                            "%" PRIu64 " MiB\n", mb, nodes_n, need_mb);
+            return -1;
+        }
+    }
+    /* Scratch space: check free space under opt_dir (default /var/tmp). */
+    struct statvfs sv;
+    if (dir && statvfs(dir, &sv) == 0) {
+        uint64_t avail_mb = ((uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize) >> 20;
+        uint64_t need_disk_mb = (uint64_t)nodes_n * 32;
+        if (avail_mb < need_disk_mb) {
+            fprintf(stderr, "jepsen-cluster: refused: only %" PRIu64 " MiB free on %s, %d nodes need at least "
+                            "%" PRIu64 " MiB\n", avail_mb, dir, nodes_n, need_disk_mb);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    int64_t wall_t0 = now_ms();
     signal(SIGPIPE, SIG_IGN);
     int self_replicas = 0, self_checker = 0;
     for (int a = 1; a < argc; a++) {
@@ -4298,9 +4612,10 @@ int main(int argc, char **argv)
         else if (!strcmp(k, "--mutant"))
             mutant = argv[++a];
         else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
-            if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 || want_ec_k > 16 ||
-                want_ec_m != 2) {
-                fprintf(stderr, "jepsen-cluster: --ec K+M: K 1 to 16 and M 2 (kvr has m + 1 = 3 replicas, as in every kv run)\n");
+            if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 ||
+                want_ec_k > META_EC_K_MAX || want_ec_m < 1 || want_ec_m > META_EC_M_MAX) {
+                fprintf(stderr, "jepsen-cluster: --ec K+M: K 1 to %d and M 1 to %d (kvr has m + 1 log replicas)\n",
+                        META_EC_K_MAX, META_EC_M_MAX);
                 return 2;
             }
         }
@@ -4372,6 +4687,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (want_ec_k) {
+        rep_n = want_ec_m + 1;
         ec_detect();
         if (!strcmp(mutant, "ec-diverged")) /* the plant of the server: a replica turns DIVERGED (cluster_ec.h ec_plant) */
             setenv("TSDB_REPLD_TEST", "plantdiverge", 1);
@@ -4384,13 +4700,20 @@ int main(int argc, char **argv)
                     want_ec_k + want_ec_m + 1);
             return 2;
         }
-        if ((nemeses & N_ROT) && !ec_experimental) {
-            fprintf(stderr, "jepsen-cluster: the rot nemesis needs a tsdbd that settles (--ec-experimental, not in this "
-                            "build): there is no chunk to flip a byte in\n");
+        if ((nemeses & N_ROT) && !ec_settles) {
+            fprintf(stderr, "jepsen-cluster: the rot nemesis needs a tsdbd built with TSDB_EC: there is no chunk to flip a byte in\n");
+            return 2;
+        }
+        if ((nemeses & N_ROT) && (nemeses & N_DISKLOSS)) {
+            fprintf(stderr, "jepsen-cluster: --nemesis rot and diskloss cannot be combined (each uses up to m fault positions)\n");
             return 2;
         }
     } else if (nemeses & N_EC) {
         fprintf(stderr, "jepsen-cluster: the partial, diskloss and rot nemeses need --ec K+M\n");
+        return 2;
+    }
+    if (want_users && nn > 12) {
+        fprintf(stderr, "jepsen-cluster: workload users supports at most 12 nodes (jm_clean_set is O(n^2 2^n)); got %d\n", nn);
         return 2;
     }
     if ((nemeses & N_FWDSTALL) && !want_via) {
@@ -4430,7 +4753,7 @@ int main(int argc, char **argv)
         for (int j = 0; j < CRASH_POINT_COUNT; j++)
             if (!strcmp(r4cp[k].name, crash_point_names[j]))
                 cps[ncps++] = (typeof(cps[0])){r4cp[k].name, 1, 90000, 3, r4cp[k].kind};
-    if (want_ec_k && ec_experimental) { /* the settle's crash points: the leader's marker, a replica's apply (leader 3) */
+    if (want_ec_k && ec_settles) { /* the settle's crash points: the leader's marker, a replica's apply (leader 3) */
         static const struct {
             const char *name;
             int leader;
@@ -4443,6 +4766,8 @@ int main(int argc, char **argv)
     rng_state = mix(seed * 0x2545f4914f6cdd1dULL + 7);
 
     mkdir(opt_dir, 0755);
+    if (!self_checker && !self_replicas && check_limits(nn, opt_dir) != 0)
+        return 2;
     snprintf(rundir, sizeof rundir, "%s/run.XXXXXX", opt_dir);
     if (!mkdtemp(rundir)) {
         fprintf(stderr, "jepsen-cluster: mkdtemp %s: %s\n", rundir, strerror(errno));
@@ -4491,11 +4816,7 @@ int main(int argc, char **argv)
         snprintf(term_trigger, sizeof term_trigger, "%s/terminal.trigger", rundir);
         snprintf(term_spec, sizeof term_spec, "%s:1@%s", cps[term_cp].name, term_trigger);
     }
-    for (int i = 0; i < nn; i++) {
-        int st = 0;
-        if (start_node(i, term_cp >= 0 ? term_spec : NULL, &st) != 0)
-            die(1, "node %d exited with status 0x%x before it listened (log %s)", i, st, nodes[i].log);
-    }
+    start_nodes_par(term_cp >= 0 ? term_spec : NULL);
     cluster_form();
     settle("the formation");
     if (want_ec_k)
@@ -4624,12 +4945,13 @@ int main(int argc, char **argv)
              * replica with the leader's final read, so it waits for that. One that never joins is a finding. */
             int64_t t0 = now_ms();
             uint64_t ver;
+            int full = rep_full_mask();
             int m = rep_isr_mask(&ver);
-            for (; m != 7 && now_ms() - t0 < 90000; m = rep_isr_mask(&ver))
+            for (; m != full && now_ms() - t0 < 90000; m = rep_isr_mask(&ver))
                 usleep(200000);
-            if (m != 7) {
+            if (m != full) {
                 fprintf(stderr, "jepsen-cluster: FAIL: the ISR of kvr is not whole 90 s after the last heal (mask %d, "
-                        "version %" PRIu64 "): a replica never caught up and joined again\n", m, ver);
+                        "want %d, version %" PRIu64 "): a replica never caught up and joined again\n", m, full, ver);
                 isr_short = 1;
             } else if (now_ms() - t0 > 200) {
                 printf("jepsen-cluster: kvr's ISR whole again %lld ms after the writers stopped\n",
@@ -4665,29 +4987,26 @@ int main(int argc, char **argv)
     }
     atomic_store(&sampler_run, 0);
     pthread_join(sampler_th, NULL);
+    proc_metrics_sample();
     unsigned terms, changes;
     int split = want_meta ? check_election_safety(&terms, &changes) : 0;
     if (!want_meta)
         terms = changes = 0;
     const char *dirs[MAXN * 3];
     int nd = replica_dirs(dirs, MAXN * 3);
-    int rdiff = isr_short, isr = 7;
+    int rdiff = isr_short, isr = rep_full_mask();
     if (want_ec_k)
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
-    /* a clean stop of every node: SIGTERM, status 0 */
-    int unclean = 0;
-    for (int i = 0; i < nn; i++) {
-        int st = stop_node(i, SIGTERM);
-        if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
-            fprintf(stderr, "jepsen-cluster: node %d did not stop cleanly on SIGTERM (status 0x%x)\n", i, st);
-            unclean++;
-        }
-    }
+    /* a clean stop of every node: SIGTERM, status 0 (parallel) */
+    int unclean = stop_nodes_par();
     if (foreign_pid > 0) {
         signal_child(foreign_pid, SIGTERM);
         waitpid(foreign_pid, NULL, 0);
     }
-    if (nd > 0) {
+    /* Non-EC volumes: read every replica directory in place read-only (cvol_check). EC volumes have META
+     * requires=tier and settled .ec parts backed by the chunk stores, so ec_members_check above already verified every
+     * replica live through leadership transfers (full series equality, final keys, and fill_check). */
+    if (nd > 0 && !want_ec_k) {
         rdiff += replicas_equal(dirs, nd, 1);
         rdiff += rep_check(0, isr, &viol);
         if (rdiff)
@@ -4872,6 +5191,25 @@ int main(int argc, char **argv)
     printf("effects: %u pauses seen silent by a live node of %u, %u leader cuts (%u with a new leader), %u delays "
            "(%" PRIu64 " bytes delayed)\n", pauses_seen, pauses_done, leader_cuts, leader_replaced, delays_applied,
            (uint64_t)atomic_load(&delayed_bytes));
+    {
+        uint64_t rss_max = 0, rss_sum = 0;
+        unsigned fd_max = 0, fd_sum = 0;
+        for (int i = 0; i < nn; i++) {
+            uint64_t r = atomic_load(&nodes[i].peak_rss_kb);
+            unsigned f = atomic_load(&nodes[i].peak_fds);
+            if (r > rss_max)
+                rss_max = r;
+            rss_sum += r;
+            if (f > fd_max)
+                fd_max = f;
+            fd_sum += f;
+        }
+        printf("resources: wall %.1f s; peak RSS per node: max %.1f MiB, mean %.1f MiB (sum %.1f MiB); "
+               "peak FDs per node: max %u, mean %.1f (harness %u)\n",
+               (double)(now_ms() - wall_t0) / 1000.0, (double)rss_max / 1024.0,
+               nn ? (double)rss_sum / (1024.0 * nn) : 0.0, (double)rss_sum / 1024.0, fd_max,
+               nn ? (double)fd_sum / nn : 0.0, (unsigned)atomic_load(&harness_peak_fds));
+    }
     if (atomic_load(&unmapped_links)) {
         fprintf(stderr, "jepsen-cluster: FAIL: %" PRIu64 " proxied link(s) came from a member id that the node table lacks: "
                 "they were neither cut nor counted\n", (uint64_t)atomic_load(&unmapped_links));
