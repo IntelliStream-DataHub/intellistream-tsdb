@@ -617,6 +617,129 @@ static void test_engine(const char *base)
     free(valid);
 }
 
+/* pw_finish / pw_finish_pending build the part handle directly from the encoded index and parsed gix without
+ * re-reading, re-hashing or re-parsing from disk. Verify the resulting part matches a fresh part_open in every
+ * field, with and without pin_index, with and without tombstones, and for empty keep_empty parts. */
+static void test_pw_direct_open(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/pw-direct", base);
+    for (int pin = 0; pin <= 1; pin++) {
+        for (int with_tombs = 0; with_tombs <= 1; with_tombs++) {
+            for (int pending = 0; pending <= 1; pending++) {
+                rm_rf(dir);
+                tsdb_options o;
+                tsdb_options_init(&o);
+                o.granule_rows = 32;
+                o.partition_classes = 0;
+                o.merge_threads = 0;
+                o.fsync = 0;
+                o.pin_index = pin;
+                eng *db = NULL;
+                OK(eng_open(dir, &o, &db));
+                uint32_t s0, s1;
+                OK(eng_series(db, "d.a", TSDB_FLOAT32, &s0));
+                OK(eng_series(db, "d.b", TSDB_FLOAT64, &s1));
+
+                int64_t ts[100];
+                float vf[100];
+                double vd[100];
+                for (int i = 0; i < 100; i++) {
+                    ts[i] = 1704067200000LL + i * 1000;
+                    vf[i] = 20.0f + (float)(i % 19) * 0.25f;
+                    vd[i] = 100.123456789 + (double)i * 0.01;
+                }
+                part_writer w;
+                OK(pw_begin(&w, db, 0, 7));
+                OK(pw_add(&w, s0, TSDB_FLOAT32, ts, vf, 100));
+                OK(pw_add(&w, s1, TSDB_FLOAT64, ts, vd, 100));
+                tomb tb[2] = {
+                    {.series = s0, .zero = 0, .start = ts[10], .end = ts[20]},
+                    {.series = s1, .zero = 0, .start = ts[30], .end = ts[50]},
+                };
+                if (with_tombs)
+                    OK(pw_set_tombs(&w, tb, 2));
+                part *p = NULL;
+                if (pending)
+                    OK(pw_finish_pending(&w, 0, 0, 0, &p));
+                else
+                    OK(pw_finish(&w, 1, 1, 0, &p));
+                CHECK(p != NULL);
+                if (p) {
+                    const char *disk_file = pending ? p->pending : p->name;
+                    part *q = NULL;
+                    OK(part_open_as(db->dirfd, disk_file, p->name, pin != 0, false, &q));
+                    CHECK(p->ng == q->ng && p->ng == 8);
+                    CHECK(p->nt == q->nt && p->nt == (uint32_t)(with_tombs ? 2 : 0));
+                    CHECK(p->rows == q->rows && p->rows == 200);
+                    CHECK(p->min_ts == q->min_ts && p->max_ts == q->max_ts);
+                    CHECK(p->index_off == q->index_off && p->index_len == q->index_len &&
+                          p->index_hash == q->index_hash);
+                    CHECK(p->map_len == q->map_len && p->hdr_len == q->hdr_len);
+                    CHECK(p->pinned == q->pinned && (pin ? p->icopy != NULL : p->icopy == NULL));
+                    CHECK(part_map_intact(p));
+                    for (uint32_t i = 0; i < p->ng; i++) {
+                        granule gp, gq;
+                        memset(&gp, 0, sizeof gp);
+                        memset(&gq, 0, sizeof gq);
+                        gx_load(p, i, GW_ALL, &gp);
+                        gx_load(q, i, GW_ALL, &gq);
+                        CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
+                    }
+                    for (uint32_t i = 0; i < p->nt; i++)
+                        CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
+                    if (pin) {
+                        /* Overwriting the on-disk index/trailer must not affect the pinned copy. */
+                        int fd = openat(db->dirfd, disk_file, O_RDWR | O_CLOEXEC);
+                        CHECK(fd >= 0);
+                        size_t clen = (size_t)(p->map_len - sizeof(part_footer) - p->index_off);
+                        uint8_t *junk = malloc(clen);
+                        memset(junk, 0xa5, clen);
+                        CHECK(fd >= 0 && pwrite(fd, junk, clen, (off_t)p->index_off) == (ssize_t)clen);
+                        free(junk);
+                        if (fd >= 0)
+                            close(fd);
+                        for (uint32_t i = 0; i < p->ng; i++) {
+                            granule gp, gq;
+                            memset(&gp, 0, sizeof gp);
+                            memset(&gq, 0, sizeof gq);
+                            gx_load(p, i, GW_ALL, &gp);
+                            gx_load(q, i, GW_ALL, &gq);
+                            CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
+                        }
+                        for (uint32_t i = 0; i < p->nt; i++)
+                            CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
+                    }
+                    part_unref(q);
+                    if (pending)
+                        unlinkat(db->dirfd, p->pending, 0);
+                    part_unref(p);
+                }
+
+                /* Also test keep_empty (0 granules, 0 tombstones) */
+                part_writer we;
+                OK(pw_begin(&we, db, 0, 9));
+                we.keep_empty = true;
+                we.empty_ts = 1704067200000LL;
+                part *pe = NULL;
+                OK(pw_finish(&we, 2, 2, 1, &pe));
+                CHECK(pe != NULL && pe->ng == 0 && pe->nt == 0 && pe->min_ts == 1704067200000LL &&
+                      pe->max_ts == 1704067200000LL && (pin ? pe->icopy != NULL : pe->icopy == NULL));
+                if (pe) {
+                    part *qe = NULL;
+                    OK(part_open_as(db->dirfd, pe->name, pe->name, pin != 0, false, &qe));
+                    CHECK(pe->index_hash == qe->index_hash && pe->index_len == qe->index_len &&
+                          pe->pinned == qe->pinned);
+                    part_unref(qe);
+                    part_unref(pe);
+                }
+                OK(eng_close(db));
+                rm_rf(dir);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_gindex", 1200);
@@ -631,6 +754,7 @@ int main(int argc, char **argv)
     test_random_fields();
     test_nan_ends();
     test_engine(base);
+    test_pw_direct_open(base);
     printf("%zu indexes round-tripped: %zu entries in %zu runs, %.1f bytes per entry\n", total_idx, total_entries,
            total_runs, total_entries ? (double)total_bytes / (double)total_entries : 0);
     rm_rf(base);

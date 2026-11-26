@@ -821,11 +821,125 @@ void pw_abort(part_writer *w)
     w->fd = -1;
 }
 
+/* Builds a part handle for a file just written by pw_finish_mode, reusing the already-computed header, footer,
+ * index_hash and parsed gix instead of re-reading, re-hashing and re-parsing from the mapping. When pin is true and
+ * tlen == 0, transfers ownership of *index_p into p->icopy (setting *index_p = NULL). */
+static int part_open_written(int dirfd, const char *file, const char *name, bool pin,
+                             const part_header *h, const part_footer *f,
+                             uint8_t **index_p, size_t ilen, const gix *parsed,
+                             size_t e_off, size_t rser_off, size_t rstart_off,
+                             const uint8_t *trailer, size_t tlen, uint32_t nt, part **out)
+{
+    *out = NULL;
+    part *p = calloc(1, sizeof *p);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    int consumed = 0;
+    if (strlen(name) >= sizeof p->name ||
+        sscanf(name, "p%" SCNd64 "_%" SCNu64 "_%" SCNu64 "_%u.part%n", &p->partition, &p->min_block,
+               &p->max_block, &p->level, &consumed) != 4 ||
+        name[consumed] != '\0') {
+        free(p);
+        return TSDB_ERR_INVALID;
+    }
+    snprintf(p->name, sizeof p->name, "%s", name);
+    p->dirfd = dirfd;
+
+    if (h->granule_rows == 0 || h->granule_rows > MAX_GRANULE_ROWS ||
+        h->fno_lo > h->fno_hi || (h->fno_lo == 0) != (h->fno_hi == 0) || h->fno_hi >= FNO_BOUND_MAX ||
+        f->index_off % 8 != 0 || f->index_len % 8 != 0 || f->index_off < sizeof *h ||
+        f->min_ts > f->max_ts) {
+        free(p);
+        return TSDB_ERR_CORRUPT;
+    }
+
+    int fd = openat(dirfd, file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        int err = errno;
+        free(p);
+        return err == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        free(p);
+        return TSDB_ERR_IO;
+    }
+    size_t size = (size_t)st.st_size;
+    if ((uint64_t)size != f->index_off + ilen + tlen + sizeof *f) {
+        close(fd);
+        free(p);
+        return TSDB_ERR_CORRUPT;
+    }
+    void *map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) {
+        free(p);
+        return TSDB_ERR_IO;
+    }
+    p->map = map;
+    p->map_len = size;
+    p->created = st.st_mtime;
+    p->written = st.st_mtime;
+    p->hdr_len = (uint32_t)sizeof *h;
+    p->fno_lo = h->fno_lo;
+    p->fno_hi = h->fno_hi;
+    p->written_ms = h->written_ms;
+    p->grows = h->granule_rows;
+    p->wal_seq = h->wal_seq;
+
+    const uint8_t *ib;
+    if (pin) {
+        if (tlen == 0) {
+            /* gix_encode_parsed allocates at least 16 zero bytes past ilen: transfer ownership directly. */
+            p->icopy = *index_p;
+            *index_p = NULL;
+            memset(p->icopy + ilen, 0, 8);
+        } else {
+            p->icopy = malloc(ilen + tlen + 8);
+            if (!p->icopy) {
+                munmap((void *)p->map, p->map_len);
+                free(p);
+                return TSDB_ERR_NOMEM;
+            }
+            memcpy(p->icopy, *index_p, ilen);
+            memcpy(p->icopy + ilen, trailer, tlen);
+            memset(p->icopy + ilen + tlen, 0, 8);
+        }
+        ib = p->icopy;
+        p->pinned = ilen + tlen + 8;
+    } else {
+        ib = p->map + f->index_off;
+    }
+    p->ix = *parsed;
+    p->ix.e = ib + e_off;
+    p->ix.rser = (const uint32_t *)(ib + rser_off);
+    p->ix.rstart = (const uint32_t *)(ib + rstart_off);
+    if (tlen) {
+        p->t = (const tomb *)(ib + ilen);
+        p->nt = nt;
+    }
+    p->ng = f->ngranules;
+    p->index_off = f->index_off;
+    p->index_len = f->index_len;
+    p->index_hash = f->index_hash;
+    p->rows = f->rows;
+    p->min_ts = f->min_ts;
+    p->max_ts = f->max_ts;
+    atomic_init(&p->refs, 1);
+    atomic_init(&p->obsolete, false);
+    *out = p;
+    return 0;
+}
+
 static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, bool pending,
                           part **out)
 {
     *out = NULL;
     eng *db = w->db;
+    uint8_t *index = NULL;
+    uint8_t *trailer = NULL;
+    size_t ilen = 0;
     int rc = pw_emit_pending(w);
     if (rc)
         goto fail;
@@ -849,25 +963,32 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         f.min_ts = f.max_ts = w->empty_ts;
     f.ngranules = (uint32_t)w->ng;
     f.version = FORMAT_VERSION;
-    uint8_t *index = NULL;
-    size_t ilen = 0;
-    if ((rc = gix_encode(w->idx, w->ng, &index, &ilen)) != 0)
+    gix parsed;
+    if ((rc = gix_encode_parsed(w->idx, w->ng, &index, &ilen, &parsed)) != 0)
         goto fail;
+    size_t ix_e_off = (size_t)(parsed.e - index);
+    size_t ix_rser_off = (size_t)((const uint8_t *)parsed.rser - index);
+    size_t ix_rstart_off = (size_t)((const uint8_t *)parsed.rstart - index);
     f.index_len = ilen;
     part_header h;
     pw_header(w, &h);
     size_t tlen = w->nt ? w->nt * sizeof(tomb) + 8 : 0;
-    uint8_t *trailer = tlen ? malloc(tlen) : NULL;
-    if (tlen && !trailer) {
-        free(index);
-        rc = TSDB_ERR_NOMEM;
-        goto fail;
-    }
+    uint32_t nt = 0;
     if (tlen) {
+        trailer = malloc(tlen);
+        if (!trailer) {
+            rc = TSDB_ERR_NOMEM;
+            goto fail;
+        }
         uint32_t cnt = (uint32_t)w->nt, magic = TOMB_MAGIC;
         memcpy(trailer, w->tombs, w->nt * sizeof(tomb));
         memcpy(trailer + tlen - 8, &cnt, 4);
         memcpy(trailer + tlen - 4, &magic, 4);
+        const tomb *dummy_t = NULL;
+        if (!trailer_parse(trailer, tlen, &dummy_t, &nt)) {
+            rc = TSDB_ERR_CORRUPT;
+            goto fail;
+        }
     }
     f.index_hash = part_hash(&h, sizeof h, index, ilen, trailer, tlen, &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
@@ -877,13 +998,14 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     if (rc == 0 && pwrite(w->fd, &h, sizeof h, 0) != (ssize_t)sizeof h)
         rc = TSDB_ERR_IO;
     if (rc != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
-        (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0) {
-        free(trailer);
-        free(index);
+        (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0)
         goto fail;
+    if (!db->opt.pin_index) {
+        free(trailer);
+        trailer = NULL;
+        tsdb_free_big(index, ilen);
+        index = NULL;
     }
-    free(trailer);
-    tsdb_free_big(index, ilen);
     /* a deferred sync starts the writeback now: the caller syncs all its parts after the last one is written,
      * by then mostly one journal commit for all of them instead of one each */
     if (db->opt.fsync && pending && w->defer_fd) {
@@ -904,16 +1026,19 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             close(w->fd);
         w->fd = -1; /* the tmp file stays */
-        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, db->parts_v8, out);
-        if (rc == 0)
-            (*out)->verify = db->opt.verify_checksums;
+        rc = part_open_written(db->dirfd, w->tmp_name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
+                               ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
         if (rc == 0) {
+            (*out)->verify = db->opt.verify_checksums;
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
             (*out)->lf = w->lf; /* the publisher folds it into the latest table and frees it */
             (*out)->nlf = w->nlf;
             w->lf = NULL;
-        } else
+        } else {
             unlinkat(db->dirfd, w->tmp_name, 0);
+        }
+        free(trailer);
+        tsdb_free_big(index, ilen);
         pw_abort(w);
         return rc;
     }
@@ -935,17 +1060,24 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     if (eng_sync_dir(db, "fsync of the directory after naming a merged part") != 0) {
         /* the caller (a merge) would retire the sources next */
         unlinkat(db->dirfd, name, 0);
+        free(trailer);
+        tsdb_free_big(index, ilen);
         pw_abort(w);
         return TSDB_ERR_IO;
     }
-    rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
+    rc = part_open_written(db->dirfd, name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
+                           ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
-    if (rc != 0)
+    else
         unlinkat(db->dirfd, name, 0);
+    free(trailer);
+    tsdb_free_big(index, ilen);
     pw_abort(w);
     return rc;
 fail:
+    free(trailer);
+    tsdb_free_big(index, ilen);
     pw_abort(w);
     return rc;
 }

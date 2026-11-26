@@ -152,36 +152,6 @@ int gix_parse(const uint8_t *b, size_t len, uint32_t n, gix *x)
 
 /* ------------------------------------------------------------------ writer */
 
-static uint64_t field_value(const granule *g, int f)
-{
-    uint64_t span = (uint64_t)g->ts_max - (uint64_t)g->ts_min;
-    switch (f) {
-    case GF_COUNT: return g->count;
-    case GF_TSMIN: return (uint64_t)g->ts_min;
-    case GF_SPAN: return span;
-    case GF_OFF: return g->off;
-    case GF_TSLEN: return g->ts_len;
-    case GF_VALLEN: return g->val_len;
-    case GF_NULLS: return g->nulls;
-    case GF_CRC: return g->crc;
-    case GF_MIN: return (uint64_t)g->imin;
-    case GF_MAX: return (uint64_t)g->imax;
-    case GF_SUM: return g->isum_lo;
-    case GF_ISUMHI: return (uint64_t)g->isum_hi;
-    case GF_M2: return g->isq0;
-    case GF_ISQ1: return g->isq1;
-    case GF_ISQ2: return g->isq2;
-    case GF_FIRST: { uint64_t u; memcpy(&u, &g->tw_first, 8); return u; }
-    case GF_LAST: { uint64_t u; memcpy(&u, &g->tw_last, 8); return u; }
-    case GF_STEP: { uint64_t u; memcpy(&u, &g->tw_step, 8); return u; }
-    case GF_LIN: { uint64_t u; memcpy(&u, &g->tw_lin, 8); return u; }
-    case GF_STEPMS: return span - g->tw_step_ms;
-    case GF_LINMS: return span - g->tw_lin_ms;
-    case GF_GAP: return g->tw_gap;
-    default: return g->tw_flags; /* GF_FLAGS; the derived bits are added by the caller */
-    }
-}
-
 static bool same_bits(double a, double b) { return memcmp(&a, &b, 8) == 0; }
 
 /* the float32 that the double with bits u is exactly, as its bits */
@@ -199,170 +169,302 @@ static bool as_f32(uint64_t u, uint32_t *out)
 
 static int bits_of(uint64_t v) { return v ? 64 - __builtin_clzll(v) : 0; }
 
-/* A frame of reference for r[0..n) (entries with skip[i] ignored): base, shift and width with the fewest bits,
- * in unsigned or signed order. */
-static void frame(const uint64_t *r, const uint8_t *skip, size_t n, gix_field *d)
+/* Derivable step and linear areas (bit 0: step, bit 1: lin). Never from a NaN: which payload an operation on two
+ * NaNs returns (first + last with both NaN) is not defined by IEEE 754, differs between compilers, optimization
+ * levels and CPUs, and the decoder (gix_dlin inlined in gx_load) need not evaluate it as this loop does, so the
+ * stored flag would decode to other bits and gix_encode's check would refuse the part. A NaN entry keeps its areas
+ * as explicit fields. */
+static inline uint8_t granule_skip(const granule *e)
 {
-    uint64_t umin = UINT64_MAX, umax = 0;
-    int64_t smin = INT64_MAX, smax = INT64_MIN;
-    size_t used = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (skip && skip[i])
-            continue;
-        used++;
-        umin = MIN(umin, r[i]);
-        umax = MAX(umax, r[i]);
-        smin = MIN(smin, (int64_t)r[i]);
-        smax = MAX(smax, (int64_t)r[i]);
+    bool nan = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
+    uint8_t s0 = !nan && same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
+    uint8_t s1 = !nan && same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
+    return (uint8_t)(s0 | (s1 << 1));
+}
+
+static inline void extract_fields(const granule *g, uint8_t sk, uint64_t fv[GF_N])
+{
+    uint64_t span = (uint64_t)g->ts_max - (uint64_t)g->ts_min;
+    fv[GF_COUNT] = g->count;
+    fv[GF_TSMIN] = (uint64_t)g->ts_min;
+    fv[GF_SPAN] = span;
+    fv[GF_OFF] = g->off;
+    fv[GF_TSLEN] = g->ts_len;
+    fv[GF_VALLEN] = g->val_len;
+    fv[GF_NULLS] = g->nulls;
+    fv[GF_CRC] = g->crc;
+    fv[GF_MIN] = (uint64_t)g->imin;
+    fv[GF_MAX] = (uint64_t)g->imax;
+    fv[GF_SUM] = g->isum_lo;
+    fv[GF_ISUMHI] = (uint64_t)g->isum_hi;
+    fv[GF_M2] = g->isq0;
+    fv[GF_ISQ1] = g->isq1;
+    fv[GF_ISQ2] = g->isq2;
+    memcpy(&fv[GF_FIRST], &g->tw_first, 8);
+    memcpy(&fv[GF_LAST], &g->tw_last, 8);
+    memcpy(&fv[GF_STEP], &g->tw_step, 8);
+    memcpy(&fv[GF_LIN], &g->tw_lin, 8);
+    fv[GF_STEPMS] = span - g->tw_step_ms;
+    fv[GF_LINMS] = span - g->tw_lin_ms;
+    fv[GF_GAP] = g->tw_gap;
+    fv[GF_FLAGS] = (uint64_t)g->tw_flags | ((uint64_t)(sk & 1) * GIX_STEP_DERIVED) |
+                   ((uint64_t)((sk >> 1) & 1) * GIX_LIN_DERIVED);
+}
+
+/* Single-pass frame-of-reference tracker: unsigned and signed bounds plus the OR of (v ^ first).
+ * For any base taken from the values, ctz(OR_i (v_i - base)) == ctz(OR_i (v_i ^ first)) because 2^s divides
+ * (v_i - base) for all i iff all v_i share the same low s bits, so one pass suffices for both orders and shift. */
+typedef struct ftrack {
+    uint64_t umin, umax;
+    int64_t smin, smax;
+    uint64_t first, any_xor;
+    bool used;
+} ftrack;
+
+static inline void ftrack_init(ftrack *t)
+{
+    t->umin = UINT64_MAX;
+    t->umax = 0;
+    t->smin = INT64_MAX;
+    t->smax = INT64_MIN;
+    t->first = 0;
+    t->any_xor = 0;
+    t->used = false;
+}
+
+static inline void ftrack_init_one(ftrack *t, uint64_t val)
+{
+    t->used = true;
+    t->first = val;
+    t->umin = t->umax = val;
+    t->smin = t->smax = (int64_t)val;
+    t->any_xor = 0;
+}
+
+static inline void ftrack_add_used(ftrack *t, uint64_t val)
+{
+    if (val < t->umin)
+        t->umin = val;
+    if (val > t->umax)
+        t->umax = val;
+    if ((int64_t)val < t->smin)
+        t->smin = (int64_t)val;
+    if ((int64_t)val > t->smax)
+        t->smax = (int64_t)val;
+    t->any_xor |= val ^ t->first;
+}
+
+static inline void ftrack_add(ftrack *t, uint64_t val)
+{
+    if (UNLIKELY(!t->used)) {
+        ftrack_init_one(t, val);
+        return;
     }
+    ftrack_add_used(t, val);
+}
+
+/* Float32 tracker: values are uint32_t bit patterns (always non-negative as int64_t, so unsigned order suffices). */
+typedef struct f32track {
+    uint32_t umin, umax, first, any_xor;
+    bool used;
+} f32track;
+
+static inline void f32track_init(f32track *t)
+{
+    t->umin = UINT32_MAX;
+    t->umax = 0;
+    t->first = 0;
+    t->any_xor = 0;
+    t->used = false;
+}
+
+static inline void f32track_add(f32track *t, uint32_t val)
+{
+    if (UNLIKELY(!t->used)) {
+        t->used = true;
+        t->first = val;
+        t->umin = t->umax = val;
+        return;
+    }
+    if (val < t->umin)
+        t->umin = val;
+    if (val > t->umax)
+        t->umax = val;
+    t->any_xor |= val ^ t->first;
+}
+
+static void f32track_finish(const f32track *t, gix_field *d)
+{
     d->width = 0;
     d->shift = 0;
     d->base = 0;
-    if (!used)
+    if (!t->used)
         return;
-    uint64_t bases[2] = {umin, (uint64_t)smin};
-    uint64_t ranges[2] = {umax - umin, (uint64_t)smax - (uint64_t)smin};
-    int best = -1;
-    for (int k = 0; k < 2; k++) {
-        if (k == 1 && ranges[1] >= ranges[0])
-            continue;
-        uint64_t any = 0;
-        for (size_t i = 0; i < n; i++)
-            if (!skip || !skip[i])
-                any |= r[i] - bases[k];
-        int sh = any ? __builtin_ctzll(any) : 0;
-        int w = bits_of(ranges[k] >> sh);
-        if (best < 0 || w < d->width) {
-            best = k;
-            d->base = bases[k];
-            d->shift = (uint8_t)(w ? sh : 0);
-            d->width = (uint8_t)w;
-        }
-    }
+    int sh = t->any_xor ? __builtin_ctz(t->any_xor) : 0;
+    uint32_t range = t->umax - t->umin;
+    int w = bits_of((uint64_t)(range >> sh));
+    d->base = t->umin;
+    d->shift = (uint8_t)(w ? sh : 0);
+    d->width = (uint8_t)w;
 }
 
-static int pack_field(const granule *g, size_t n, const uint8_t *skip, int f, uint64_t *v, uint64_t *r,
-                      gix_field *d, uint64_t *out_delta)
+static void ftrack_finish(const ftrack *t, gix_field *d)
 {
-    for (size_t i = 0; i < n; i++)
-        v[i] = field_value(&g[i], f);
-    if (f == GF_FLAGS)
-        for (size_t i = 0; i < n; i++)
-            v[i] |= (uint64_t)skip[2 * i] * GIX_STEP_DERIVED | (uint64_t)skip[2 * i + 1] * GIX_LIN_DERIVED;
-    const uint8_t *sk = NULL;
-    uint8_t *own = NULL;
-    if (f == GF_STEP || f == GF_LIN) {
-        if (!(own = malloc(n + 1)))
-            return TSDB_ERR_NOMEM;
-        for (size_t i = 0; i < n; i++)
-            own[i] = skip[2 * i + (f == GF_LIN)];
-        sk = own;
-    }
-    /* plain */
-    gix_field best = {0};
-    frame(v, sk, n, &best);
-    best.kind = GK_U64;
-    /* a line through the first and last value */
-    if (!sk && n > 2 && best.width) {
-        __int128 diff = (__int128)(int64_t)v[n - 1] - (int64_t)v[0];
-        int64_t slope = (int64_t)(diff / (__int128)(n - 1));
-        if (slope) {
-            for (size_t i = 0; i < n; i++)
-                r[i] = v[i] - (uint64_t)i * (uint64_t)slope;
-            gix_field c = {0};
-            frame(r, NULL, n, &c);
-            if (c.width < best.width) {
-                best = c;
-                best.slope = (uint64_t)slope;
-            }
+    d->width = 0;
+    d->shift = 0;
+    d->base = 0;
+    if (!t->used)
+        return;
+    int sh = t->any_xor ? __builtin_ctzll(t->any_xor) : 0;
+    uint64_t urange = t->umax - t->umin;
+    uint64_t srange = (uint64_t)t->smax - (uint64_t)t->smin;
+    int uw = bits_of(urange >> sh);
+    d->base = t->umin;
+    d->shift = (uint8_t)(uw ? sh : 0);
+    d->width = (uint8_t)uw;
+    if (srange < urange) {
+        int sw = bits_of(srange >> sh);
+        if (sw < uw) {
+            d->base = (uint64_t)t->smin;
+            d->shift = (uint8_t)(sw ? sh : 0);
+            d->width = (uint8_t)sw;
         }
     }
-    /* float32 */
-    if (field_float(f) && best.width > 0) {
-        size_t i;
-        for (i = 0; i < n; i++) {
-            uint32_t b32 = 0;
-            if (sk && sk[i])
-                r[i] = 0;
-            else if (!as_f32(v[i], &b32))
-                break;
-            r[i] = b32;
-        }
-        if (i == n) {
-            gix_field c = {0};
-            uint32_t umin = UINT32_MAX;
-            for (i = 0; i < n; i++)
-                if (!sk || !sk[i])
-                    umin = MIN(umin, (uint32_t)r[i]);
-            for (i = 0; i < n; i++)
-                if (sk && sk[i])
-                    r[i] = umin;
-            frame(r, sk, n, &c);
-            if (c.width < best.width) {
-                best = c;
-                best.kind = GK_F32;
-            }
-        }
-    }
-    best.mask = best.width == 64 ? UINT64_MAX : (1ull << best.width) - 1;
-    /* the deltas to store, in r */
-    for (size_t i = 0; i < n; i++) {
-        uint64_t val = v[i];
-        if (best.kind == GK_F32) {
-            uint32_t b32 = 0;
-            if (!sk || !sk[i])
-                as_f32(v[i], &b32);
-            else
-                b32 = (uint32_t)best.base;
-            val = b32;
-        } else if (sk && sk[i]) {
-            val = best.base + (uint64_t)i * best.slope;
-        }
-        out_delta[i] = (val - best.base - (uint64_t)i * best.slope) >> best.shift;
-    }
-    free(own);
-    *d = best;
-    return 0;
 }
 
-int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
+int gix_encode_parsed(const granule *g, size_t n, uint8_t **out, size_t *len, gix *parsed)
 {
     *out = NULL;
     *len = 0;
     if (n > UINT32_MAX)
         return TSDB_ERR_INVALID;
     int rc = TSDB_ERR_NOMEM;
-    uint64_t *v = malloc((n + 1) * sizeof *v), *r = malloc((n + 1) * sizeof *r);
-    uint64_t *delta = malloc((n + 1) * GF_N * sizeof *delta);
-    uint8_t *skip = calloc(2 * n + 2, 1);
+    uint8_t *skip = NULL;
     uint8_t *buf = NULL;
+    size_t cap = 0;
     gix x = {0}, y;
-    if (!v || !r || !delta || !skip)
-        goto out;
-    /* derivable step and linear areas. Never from a NaN: which payload an operation on two NaNs returns (first + last
-     * with both NaN) is not defined by IEEE 754, differs between compilers, optimization levels and CPUs, and the
-     * decoder (gix_dlin inlined in gx_load) need not evaluate it as this loop does, so the stored flag would decode
-     * to other bits and gix_encode's check would refuse the part. A NaN entry keeps its areas as explicit fields. */
-    for (size_t i = 0; i < n; i++) {
-        const granule *e = &g[i];
-        bool nan = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
-        skip[2 * i] = !nan && same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
-        skip[2 * i + 1] = !nan && same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
-    }
-    for (int f = 0; f < GF_N; f++)
-        if ((rc = pack_field(g, n, skip, f, v, r, &x.f[f], delta + (size_t)f * n)) != 0)
+    uint32_t nruns = 0;
+    if (n > 0) {
+        if (!(skip = malloc(n)))
             goto out;
+        uint64_t cand_slope[GF_N] = {0};
+        uint32_t slp_mask = 0;
+        if (n > 2) {
+            uint64_t fv0[GF_N], fvn[GF_N];
+            extract_fields(&g[0], granule_skip(&g[0]), fv0);
+            extract_fields(&g[n - 1], granule_skip(&g[n - 1]), fvn);
+            for (int f = 0; f < GF_N; f++) {
+                if (f == GF_STEP || f == GF_LIN)
+                    continue;
+                __int128 diff = (__int128)(int64_t)fvn[f] - (int64_t)fv0[f];
+                cand_slope[f] = (uint64_t)(int64_t)(diff / (__int128)(n - 1));
+                if (cand_slope[f])
+                    slp_mask |= 1u << f;
+            }
+        }
+        ftrack pln[GF_N], slp[GF_N];
+        f32track f32t[GF_N];
+        uint32_t f32_mask = 0;
+        for (int f = 0; f < GF_N; f++) {
+            ftrack_init(&pln[f]);
+            ftrack_init(&slp[f]);
+            f32track_init(&f32t[f]);
+            if (field_float(f))
+                f32_mask |= 1u << f;
+        }
+        /* Entry 0 initializes all non-skippable plain/slope trackers so i = 1..n-1 needs no !used check. */
+        uint32_t prev_series = g[0].series;
+        nruns = 1;
+        {
+            uint8_t sk = granule_skip(&g[0]);
+            skip[0] = sk;
+            uint64_t fv[GF_N];
+            extract_fields(&g[0], sk, fv);
+            for (int f = 0; f < GF_N; f++) {
+                if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
+                    continue;
+                ftrack_init_one(&pln[f], fv[f]);
+            }
+            for (uint32_t m = slp_mask; m; m &= m - 1) {
+                int f = __builtin_ctz(m);
+                ftrack_init_one(&slp[f], fv[f]);
+            }
+            for (uint32_t m = f32_mask; m; m &= m - 1) {
+                int f = __builtin_ctz(m);
+                if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
+                    continue;
+                uint32_t b32;
+                if (as_f32(fv[f], &b32))
+                    f32track_add(&f32t[f], b32);
+                else
+                    f32_mask &= ~(1u << f);
+            }
+        }
+        for (size_t i = 1; i < n; i++) {
+            const granule *e = &g[i];
+            if (UNLIKELY(e->series < prev_series)) {
+                rc = TSDB_ERR_INVALID;
+                goto out;
+            }
+            if (e->series != prev_series) {
+                nruns++;
+                prev_series = e->series;
+            }
+            uint8_t sk = granule_skip(e);
+            skip[i] = sk;
+            uint64_t fv[GF_N];
+            extract_fields(e, sk, fv);
+            _Static_assert(GF_LIN == GF_STEP + 1, "GF_STEP and GF_LIN must be adjacent");
+            for (int f = 0; f < GF_STEP; f++)
+                ftrack_add_used(&pln[f], fv[f]);
+            if (!(sk & 1))
+                ftrack_add(&pln[GF_STEP], fv[GF_STEP]);
+            if (!(sk & 2))
+                ftrack_add(&pln[GF_LIN], fv[GF_LIN]);
+            for (int f = GF_LIN + 1; f < GF_N; f++)
+                ftrack_add_used(&pln[f], fv[f]);
+            for (uint32_t m = slp_mask; m; m &= m - 1) {
+                int f = __builtin_ctz(m);
+                ftrack_add_used(&slp[f], fv[f] - (uint64_t)i * cand_slope[f]);
+            }
+            for (uint32_t m = f32_mask; m; m &= m - 1) {
+                int f = __builtin_ctz(m);
+                if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
+                    continue;
+                uint32_t b32;
+                if (as_f32(fv[f], &b32))
+                    f32track_add(&f32t[f], b32);
+                else
+                    f32_mask &= ~(1u << f);
+            }
+        }
+        for (int f = 0; f < GF_N; f++) {
+            gix_field best = {0};
+            ftrack_finish(&pln[f], &best);
+            best.kind = GK_U64;
+            if ((slp_mask & (1u << f)) && best.width) {
+                gix_field c = {0};
+                ftrack_finish(&slp[f], &c);
+                if (c.width < best.width) {
+                    best = c;
+                    best.slope = cand_slope[f];
+                }
+            }
+            if ((f32_mask & (1u << f)) && best.width > 0) {
+                gix_field c = {0};
+                f32track_finish(&f32t[f], &c);
+                if (c.width < best.width) {
+                    best = c;
+                    best.kind = GK_F32;
+                }
+            }
+            best.mask = best.width == 64 ? UINT64_MAX : (1ull << best.width) - 1;
+            x.f[f] = best;
+        }
+    }
     uint64_t bits = layout(&x);
     x.stride = (uint32_t)((bits + 7) / 8);
-    uint32_t nruns = 0;
-    for (size_t i = 0; i < n; i++)
-        nruns += i == 0 || g[i].series != g[i - 1].series;
-    for (size_t i = 1; i < n; i++)
-        if (g[i].series < g[i - 1].series) {
-            rc = TSDB_ERR_INVALID;
-            goto out;
-        }
-    size_t cap = 16 + GF_N * 22 + 4 + 8 * (size_t)nruns + n * (size_t)x.stride + 16;
+    cap = 16 + GF_N * 22 + 4 + 8 * (size_t)nruns + n * (size_t)x.stride + 16;
     rc = TSDB_ERR_NOMEM;
     if (!(buf = calloc(1, cap)))
         goto out;
@@ -376,25 +478,43 @@ int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
             pos += put_varint(buf + pos, (d->slope << 1) ^ (uint64_t)((int64_t)d->slope >> 63));
     }
     pos = (pos + 3) & ~(size_t)3;
-    uint32_t k = 0;
-    for (size_t i = 0; i < n; i++)
-        if (i == 0 || g[i].series != g[i - 1].series) {
-            memcpy(buf + pos + 4 * k, &g[i].series, 4);
-            uint32_t st = (uint32_t)i;
-            memcpy(buf + pos + 4 * ((size_t)nruns + k), &st, 4);
-            k++;
-        }
+    size_t rpos = pos;
     pos += 8 * (size_t)nruns;
     uint8_t *e = buf + pos;
+    int active[GF_N], na = 0;
+    for (int f = 0; f < GF_N; f++)
+        if (x.f[f].width)
+            active[na++] = f;
+    uint32_t k = 0;
     for (size_t i = 0; i < n; i++) {
-        uint8_t *q = e + i * x.stride;
-        for (int f = 0; f < GF_N; f++) {
-            const gix_field *d = &x.f[f];
-            if (!d->width)
+        if (i == 0 || g[i].series != g[i - 1].series) {
+            memcpy(buf + rpos + 4 * (size_t)k, &g[i].series, 4);
+            uint32_t st = (uint32_t)i;
+            memcpy(buf + rpos + 4 * ((size_t)nruns + k), &st, 4);
+            k++;
+        }
+        uint8_t sk = skip[i];
+        uint64_t fv[GF_N];
+        extract_fields(&g[i], sk, fv);
+        uint8_t *q = e + i * (size_t)x.stride;
+        for (int a = 0; a < na; a++) {
+            int f = active[a];
+            if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
                 continue;
+            const gix_field *d = &x.f[f];
+            uint64_t val = fv[f];
+            if (d->kind == GK_F32) {
+                double dv;
+                memcpy(&dv, &val, 8);
+                float fv32 = (float)dv;
+                uint32_t b32;
+                memcpy(&b32, &fv32, 4);
+                val = b32;
+            }
+            uint64_t delta = (val - d->base - (uint64_t)i * d->slope) >> d->shift;
             uint64_t w;
             memcpy(&w, q + d->byte, 8);
-            w |= delta[(size_t)f * n + i] << d->bit;
+            w |= delta << d->bit;
             memcpy(q + d->byte, &w, 8);
         }
     }
@@ -410,26 +530,37 @@ int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
     memset(&pp, 0, sizeof pp);
     pp.ix = y;
     pp.ng = (uint32_t)n;
+    uint32_t run = 0;
     for (size_t i = 0; i < n; i++) {
+        if (run + 1 < y.nruns && y.rstart[run + 1] == (uint32_t)i)
+            run++;
         granule d;
         memset(&d, 0, sizeof d);
-        gx_load(&pp, (uint32_t)i, GW_ALL, &d);
+        gx_load(&pp, (uint32_t)i, GW_ALL & ~GW_SERIES, &d);
+        d.series = y.rser[run];
         if (memcmp(&d, &g[i], sizeof d) != 0) {
             fprintf(stderr, "tsdb: the granule index encoder lost bits of entry %zu (series %u): part refused\n", i,
                     g[i].series);
             goto out;
         }
     }
+    if (n > 0 && run + 1 != y.nruns) {
+        fprintf(stderr, "tsdb: the granule index encoder run table mismatch: part refused\n");
+        goto out;
+    }
     *out = buf;
     *len = pos;
+    if (parsed)
+        *parsed = y;
     buf = NULL;
     rc = 0;
 out:
-    /* 184 MB of delta for 10^6 granules: see tsdb_free_big */
-    tsdb_free_big(v, (n + 1) * sizeof *v);
-    tsdb_free_big(r, (n + 1) * sizeof *r);
-    tsdb_free_big(delta, (n + 1) * GF_N * sizeof *delta);
-    tsdb_free_big(skip, 2 * n + 2);
-    free(buf);
+    tsdb_free_big(skip, n);
+    tsdb_free_big(buf, cap);
     return rc;
+}
+
+int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
+{
+    return gix_encode_parsed(g, n, out, len, NULL);
 }
