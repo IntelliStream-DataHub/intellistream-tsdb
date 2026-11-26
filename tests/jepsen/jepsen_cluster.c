@@ -185,6 +185,9 @@ static int want_rep, want_classes; /* workloads kv and classes: one volume of 3 
 static int want_via;               /* workload kv-via: kv, with the clients on entry nodes (forwarding), RYW, fwdstall */
 static int want_ec_k, want_ec_m; /* --ec K+M: kvr is an erasure-coded volume (cluster_ec.h) */
 static int want_auth, want_users; /* --auth: every tsdbd requires a login (a superuser from the init); workload users */
+static const char *opt_peer_rdma; /* --peer-rdma auto|on|off (NULL: tsdbd default) */
+static int opt_peer_rdma_pool_mb; /* --peer-rdma-pool-mb N (0: tsdbd default) */
+static const char *opt_peer_rdma_dev; /* --peer-rdma-device DEV[:PORT] */
 static void ju_fault(int i);      /* cluster_users.h: the nemeses tell the users workload which members may lag */
 static void ju_cut_done(const uint8_t in[MAXN][MAXN], int n); /* the members the cuts leave in step stop being exempt */
 static void ju_settled(void);
@@ -197,9 +200,10 @@ static void rmtree(const char *path);
 enum {
     N_KILL = 1, N_PARTITION = 2, N_PAUSE = 4, N_MIDCOMMIT = 8, N_POWER = 16, N_FWDSTALL = 32,
     N_KILL2 = 64, N_SLOW = 128, N_LONGDOWN = 256, N_REBUILD = 512, N_CHURN = 1024,
-    N_PARTIAL = 2048, N_DISKLOSS = 4096, N_ROT = 8192 /* --ec runs (cluster_ec.h) */
+    N_PARTIAL = 2048, N_DISKLOSS = 4096, N_ROT = 8192, /* --ec runs (cluster_ec.h) */
+    N_RDMA_QPERR = 16384 /* mid-stream RDMA QP error via TSDB_PLRDMA_TEST=qperr_file=... */
 };
-#define NNEM 14
+#define NNEM 15
 #define N_EC (N_PARTIAL | N_DISKLOSS | N_ROT)
 #define N_R4_KV (N_LONGDOWN | N_REBUILD | N_CHURN) /* these need kvr: workload kv, kv-via or classes */
 
@@ -703,6 +707,7 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     snprintf(state, sizeof state, "%s/state", n->dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
     const char *argv[64];
+    char rpool[24];
     int na = 0;
     argv[na++] = "tsdbd";
     if (!want_auth) /* --auth (and the users workload): every node requires a login, as production does */
@@ -721,6 +726,20 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     argv[na++] = state;
     argv[na++] = "--peer-advertise";
     argv[na++] = padv;
+    if (opt_peer_rdma) {
+        argv[na++] = "--peer-rdma";
+        argv[na++] = opt_peer_rdma;
+    }
+    if (opt_peer_rdma_pool_mb > 0) {
+        snprintf(rpool, sizeof rpool, "%d", opt_peer_rdma_pool_mb);
+        argv[na++] = "--peer-rdma-pool-mb";
+        argv[na++] = rpool;
+    }
+    if (opt_peer_rdma_dev) {
+        argv[na++] = "--peer-rdma-device";
+        argv[na++] = opt_peer_rdma_dev;
+    }
+    int rdma_metrics = (opt_peer_rdma && strcmp(opt_peer_rdma, "off") != 0) || (nemeses & N_RDMA_QPERR);
     if (want_rep) { /* large writes from 500 rows (the filler's go to parts: the driver ships them) */
         argv[na++] = "--wal-max-batch-rows";
         argv[na++] = "500";
@@ -735,9 +754,11 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
         argv[na++] = "--merge-idle-s";
         argv[na++] = "1";
     }
-    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_form_stores); eager settle, bounded disk/RAM */
+    if (want_ec_k || rdma_metrics) {
         argv[na++] = "--metrics-port";
         argv[na++] = "auto";
+    }
+    if (want_ec_k) { /* the stores exist once the cluster has member ids (ec_stores_make); settles are quick */
         argv[na++] = "--ec-settle-grace-s";
         argv[na++] = "3";
         argv[na++] = "--ec-settle-force-s";
@@ -769,12 +790,22 @@ static pid_t spawn_node(int i, const char *crash_at, char *seen, size_t seen_cap
     /* the environment is built before the fork: a child of a threaded process may only call async-signal-safe functions */
     char *envp[512];
     int ne = 0;
+    const char *orig_plrdma_test = getenv("TSDB_PLRDMA_TEST");
     for (char **e = environ; *e && ne < 500; e++)
         if (strncmp(*e, "TSDB_CLUSTER_TEST=", 18) && strncmp(*e, "TSDB_CRASH_AT=", 14) && strncmp(*e, "LD_PRELOAD=", 11) &&
             strncmp(*e, "CRASHFS_", 8) && strncmp(*e, "OUTAGEFS_", 9) && strncmp(*e, "TSDB_CLUSTER_WRITES=", 20) &&
-            strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21))
+            strncmp(*e, "TSDBD_TEST_FWD_STALL=", 21) &&
+            (!(nemeses & N_RDMA_QPERR) || strncmp(*e, "TSDB_PLRDMA_TEST=", 17)))
             envp[ne++] = *e;
-    char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64];
+    char e1[256], e2[2 * PATH_MAX + 64], e3[PATH_MAX + 64], e4[64], e5[PATH_MAX + 64], e6[PATH_MAX + 64], e7[PATH_MAX + 64],
+         e8[PATH_MAX + 256];
+    if (nemeses & N_RDMA_QPERR) {
+        if (orig_plrdma_test && *orig_plrdma_test)
+            snprintf(e8, sizeof e8, "TSDB_PLRDMA_TEST=%s,qperr_file=%s/rdma_qperr", orig_plrdma_test, n->dir);
+        else
+            snprintf(e8, sizeof e8, "TSDB_PLRDMA_TEST=qperr_file=%s/rdma_qperr", n->dir);
+        envp[ne++] = e8;
+    }
     if (want_via) { /* kv-via: the entry node stalls its forwards while this file exists (nem_fwdstall) */
         snprintf(e5, sizeof e5, "TSDBD_TEST_FWD_STALL=%s/fwd-stall", n->dir);
         envp[ne++] = e5;
@@ -4145,6 +4176,230 @@ static int r4_leftovers_check(void)
 
 #include "cluster_ec.h"
 
+/* ---- RDMA metrics probe and rdma-qperr nemesis (design-rdma.md §8, rd-hw) */
+
+struct rdma_mstat {
+    uint64_t up_rdma, up_tcp, qp_errors, credit_stalls, rnr_retries;
+    uint64_t fb_qperr, fb_backoff, fb_pool, fb_other;
+};
+static uint64_t rdma_max_up_links;
+static unsigned rdma_qperr_fired, rdma_backoff_rounds, rdma_pool_leaks;
+
+static int rdma_tracking(void)
+{
+    return (opt_peer_rdma && strcmp(opt_peer_rdma, "off") != 0) || (nemeses & N_RDMA_QPERR) != 0;
+}
+
+static int rdma_poll_node(pid_t pid, int port, struct rdma_mstat *out)
+{
+    memset(out, 0, sizeof *out);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    struct timeval tv = {1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    static const char rq[] = "GET /metrics HTTP/1.0\r\n\r\n";
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0 || !th_owns_port(pid, port)) {
+        close(fd);
+        return -1;
+    }
+    for (size_t off = 0; off < sizeof rq - 1;) {
+        ssize_t w = write(fd, rq + off, sizeof rq - 1 - off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    char chunk[4096], line[512];
+    size_t ln = 0;
+    int skipping = 0, got = 0, eof = 0;
+    for (;;) {
+        ssize_t r = read(fd, chunk, sizeof chunk);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (r == 0) {
+            eof = 1;
+            break;
+        }
+        got = 1;
+        for (ssize_t k = 0; k < r; k++) {
+            if (chunk[k] != '\n') {
+                if (ln + 1 < sizeof line)
+                    line[ln++] = chunk[k];
+                else
+                    skipping = 1;
+                continue;
+            }
+            line[ln] = 0;
+            if (!skipping) {
+                const char *sp = strrchr(line, ' ');
+                uint64_t v = sp ? strtoull(sp + 1, NULL, 10) : 0;
+                if (!strncmp(line, "tsdb_peer_links_transport{", 26)) {
+                    if (strstr(line, "transport=\"rdma\""))
+                        out->up_rdma += v;
+                    else if (strstr(line, "transport=\"tcp\""))
+                        out->up_tcp += v;
+                } else if (!strncmp(line, "tsdb_peer_rdma_qp_errors_total ", 31)) {
+                    out->qp_errors += v;
+                } else if (!strncmp(line, "tsdb_peer_rdma_credit_stalls_total ", 35)) {
+                    out->credit_stalls += v;
+                } else if (!strncmp(line, "tsdb_peer_rdma_rnr_retries_total ", 33)) {
+                    out->rnr_retries += v;
+                } else if (!strncmp(line, "tsdb_peer_rdma_fallbacks_total{", 31)) {
+                    if (strstr(line, "reason=\"qp_error\""))
+                        out->fb_qperr += v;
+                    else if (strstr(line, "reason=\"backoff\""))
+                        out->fb_backoff += v;
+                    else if (strstr(line, "reason=\"pool\""))
+                        out->fb_pool += v;
+                    else
+                        out->fb_other += v;
+                }
+            }
+            ln = 0;
+            skipping = 0;
+        }
+    }
+    close(fd);
+    return (got && eof) ? 0 : -1;
+}
+
+static void rdma_sample_all(struct rdma_mstat *sum)
+{
+    memset(sum, 0, sizeof *sum);
+    for (int i = 0; i < nn; i++) {
+        pthread_mutex_lock(&tbl_mu);
+        pid_t pid = nodes[i].pid;
+        int mport = nodes[i].mport;
+        int paused = nodes[i].paused;
+        pthread_mutex_unlock(&tbl_mu);
+        if (pid <= 0 || paused || mport <= 0)
+            continue;
+        struct rdma_mstat m;
+        if (rdma_poll_node(pid, mport, &m) == 0) {
+            sum->up_rdma += m.up_rdma;
+            sum->up_tcp += m.up_tcp;
+            sum->qp_errors += m.qp_errors;
+            sum->credit_stalls += m.credit_stalls;
+            sum->rnr_retries += m.rnr_retries;
+            sum->fb_qperr += m.fb_qperr;
+            sum->fb_backoff += m.fb_backoff;
+            sum->fb_pool += m.fb_pool;
+            sum->fb_other += m.fb_other;
+        }
+    }
+    if (sum->up_rdma > rdma_max_up_links)
+        rdma_max_up_links = sum->up_rdma;
+}
+
+static void nem_rdma_qperr(void)
+{
+    struct rdma_mstat st;
+    rdma_sample_all(&st);
+    /* Under --peer-rdma auto, if every RDMA link is already in TCP backoff, record the backoff round immediately. */
+    if (st.up_rdma == 0 && rdma_qperr_fired >= 3 && st.fb_backoff > 0) {
+        rdma_backoff_rounds++;
+        effect_seen = 1;
+        hold_ms(rnd_range(800, 1500));
+        return;
+    }
+    /* Probe kvr's active replica nodes first (rotated), then any remaining nodes, with a hard total time cap well
+     * below per_round (10 s) so backoff rounds on larger clusters never trip the idle-nemesis floor. */
+    int order[MAXN], norder = 0;
+    int seen[MAXN] = {0};
+    int start = pick_node(1);
+    if (start >= 0 && start < nn) {
+        order[norder++] = start;
+        seen[start] = 1;
+    }
+    if (want_rep && rep_n > 0) {
+        int r0 = (int)(rnd() % (uint64_t)rep_n);
+        for (int k = 0; k < rep_n; k++) {
+            int idx = rep_nodes[(r0 + k) % rep_n];
+            if (idx >= 0 && idx < nn && !seen[idx]) {
+                order[norder++] = idx;
+                seen[idx] = 1;
+            }
+        }
+    }
+    for (int off = 0; off < nn; off++) {
+        int i = (start + off) % nn;
+        if (!seen[i]) {
+            order[norder++] = i;
+            seen[i] = 1;
+        }
+    }
+    int in_backoff = rdma_qperr_fired >= 3 && st.fb_backoff > 0;
+    int64_t total_ms = in_backoff ? 1500 : 3500;
+    int64_t per_node_ms = in_backoff ? 500 : 1000;
+    int64_t deadline = now_ms() + total_ms;
+    for (int p = 0; p < norder; p++) {
+        int64_t rem = deadline - now_ms();
+        if (rem <= 0)
+            break;
+        int i = order[p];
+        pthread_mutex_lock(&tbl_mu);
+        pid_t pid = nodes[i].pid;
+        int paused = nodes[i].paused;
+        pthread_mutex_unlock(&tbl_mu);
+        if (pid <= 0 || paused)
+            continue;
+        char trig[PATH_MAX + 64];
+        snprintf(trig, sizeof trig, "%s/rdma_qperr", nodes[i].dir);
+        int fd = open(trig, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0)
+            continue;
+        close(fd);
+        int64_t wait_ms = rem < per_node_ms ? rem : per_node_ms;
+        int64_t t0 = now_ms();
+        while (access(trig, F_OK) == 0 && now_ms() - t0 < wait_ms) {
+            check_unexpected_exits();
+            usleep(25000);
+        }
+        if (access(trig, F_OK) != 0 || (unlink(trig) != 0 && errno == ENOENT)) {
+            rdma_qperr_fired++;
+            effect_seen = 1;
+            ev("node %d: rdma-qperr fired (%u total)", i, rdma_qperr_fired);
+            hold_ms(rnd_range(300, 1200));
+            return;
+        }
+    }
+    /* Under --peer-rdma auto, after 3 QP errors within 60 s links enter TCP backoff as designed: verify backoff. */
+    rdma_sample_all(&st);
+    if (rdma_qperr_fired >= 3 && st.fb_backoff > 0) {
+        rdma_backoff_rounds++;
+        effect_seen = 1;
+        hold_ms(rnd_range(800, 1500));
+    }
+}
+
+static unsigned rdma_check_logs_for_leaks(void)
+{
+    unsigned leaks = 0;
+    for (int i = 0; i < nn; i++) {
+        FILE *f = fopen(nodes[i].log, "r");
+        if (!f)
+            continue;
+        char ln[512];
+        while (fgets(ln, sizeof ln, f))
+            if (strstr(ln, "stay out of the pool") || strstr(ln, "the pool closed with ")) {
+                fprintf(stderr, "jepsen-cluster: FAIL: node %d RDMA pool leak/drain timeout: %s", i, ln);
+                leaks++;
+            }
+        fclose(f);
+    }
+    return leaks;
+}
+
 static unsigned leader_cuts, leader_replaced, delays_applied;
 
 static void nem_partition(void)
@@ -4503,8 +4758,9 @@ static void usage(void)
 {
     fprintf(stderr, "usage: jepsen_cluster --dir DIR [--nodes 5] [--seconds 30] [--seed N]\n"
                     "         [--nemesis kill,partition,pause,midcommit,power,fwdstall,kill2,slow,longdown,rebuild,churn,\n"
-                    "                    partial,diskloss,rot (the last three with --ec)] [--ec K+M]\n"
+                    "                    partial,diskloss,rot (the last three with --ec),rdma-qperr] [--ec K+M]\n"
                     "         [--workload meta,kv-local|kv|kv-via|classes|users] [--auth] [--retain-s S]\n"
+                    "         [--peer-rdma auto|on|off] [--peer-rdma-pool-mb N] [--peer-rdma-device DEV[:PORT]]\n"
                     "         [--crashfs build/libcrashfs.so] [--outagefs build/liboutagefs.so] [--mutant NAME]\n"
                     "         | --selftest-replicas | --selftest-checker | --built-nemeses\n");
     exit(2);
@@ -4611,7 +4867,21 @@ int main(int argc, char **argv)
             opt_retain_s = atoi(argv[++a]);
         else if (!strcmp(k, "--mutant"))
             mutant = argv[++a];
-        else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
+        else if (!strcmp(k, "--peer-rdma")) {
+            opt_peer_rdma = argv[++a];
+            if (strcmp(opt_peer_rdma, "auto") && strcmp(opt_peer_rdma, "on") && strcmp(opt_peer_rdma, "off")) {
+                fprintf(stderr, "jepsen-cluster: --peer-rdma %s: expected auto, on or off\n", opt_peer_rdma);
+                return 2;
+            }
+        } else if (!strcmp(k, "--peer-rdma-pool-mb")) {
+            opt_peer_rdma_pool_mb = atoi(argv[++a]);
+            if (opt_peer_rdma_pool_mb < 1 || opt_peer_rdma_pool_mb > 16384) {
+                fprintf(stderr, "jepsen-cluster: --peer-rdma-pool-mb must be 1 to 16384\n");
+                return 2;
+            }
+        } else if (!strcmp(k, "--peer-rdma-device")) {
+            opt_peer_rdma_dev = argv[++a];
+        } else if (!strcmp(k, "--ec")) { /* K+M: kvr is an erasure-coded volume (cluster_ec.h) */
             if (a + 1 >= argc || sscanf(argv[++a], "%d+%d", &want_ec_k, &want_ec_m) != 2 || want_ec_k < 1 ||
                 want_ec_k > META_EC_K_MAX || want_ec_m < 1 || want_ec_m > META_EC_M_MAX) {
                 fprintf(stderr, "jepsen-cluster: --ec K+M: K 1 to %d and M 1 to %d (kvr has m + 1 log replicas)\n",
@@ -4648,6 +4918,8 @@ int main(int argc, char **argv)
                     nemeses |= N_DISKLOSS;
                 else if (nem && !strcmp(t, "rot"))
                     nemeses |= N_ROT;
+                else if (nem && !strcmp(t, "rdma-qperr"))
+                    nemeses |= N_RDMA_QPERR;
                 else if (nem && !strcmp(t, "none"))
                     nemeses |= 0;
                 else if (!nem && !strcmp(t, "meta"))
@@ -4718,6 +4990,14 @@ int main(int argc, char **argv)
     }
     if ((nemeses & N_FWDSTALL) && !want_via) {
         fprintf(stderr, "jepsen-cluster: the fwdstall nemesis needs the workload kv-via\n");
+        return 2;
+    }
+    if ((nemeses & N_RDMA_QPERR) && opt_peer_rdma && !strcmp(opt_peer_rdma, "off")) {
+        fprintf(stderr, "jepsen-cluster: the rdma-qperr nemesis cannot run with --peer-rdma off\n");
+        return 2;
+    }
+    if ((nemeses & N_RDMA_QPERR) && !want_rep) {
+        fprintf(stderr, "jepsen-cluster: the rdma-qperr nemesis needs a replicated workload (kv, kv-via or classes)\n");
         return 2;
     }
     for (int k = 0; k < NR4NEM; k++) {
@@ -4825,6 +5105,10 @@ int main(int argc, char **argv)
         kv_setup();
     if (want_rep)
         rep_setup();
+    if (rdma_tracking()) {
+        struct rdma_mstat rms;
+        rdma_sample_all(&rms);
+    }
     atomic_store(&sampler_run, 1);
     pthread_create(&sampler_th, NULL, sampler, NULL);
     if (want_kv || want_rep)
@@ -4884,6 +5168,11 @@ int main(int argc, char **argv)
         case N_PARTIAL: faults[11]++; nem_partial(); break;
         case N_DISKLOSS: faults[12]++; nem_diskloss(); break;
         case N_ROT: faults[13]++; nem_rot(); break;
+        case N_RDMA_QPERR: faults[14]++; nem_rdma_qperr(); break;
+        }
+        if (rdma_tracking()) {
+            struct rdma_mstat rms;
+            rdma_sample_all(&rms);
         }
         if (!effect_seen)
             die(1, "the %s nemesis (round %u) had no effect: nothing was killed, stopped, cut, delayed or crashed",
@@ -4891,12 +5180,13 @@ int main(int argc, char **argv)
                 kind == N_MIDCOMMIT ? "midcommit" : kind == N_FWDSTALL ? "fwdstall" : kind == N_KILL2 ? "kill2" :
                 kind == N_SLOW ? "slow" : kind == N_LONGDOWN ? "longdown" : kind == N_REBUILD ? "rebuild" :
                 kind == N_CHURN ? "churn" : kind == N_PARTIAL ? "partial" : kind == N_DISKLOSS ? "diskloss" :
-                kind == N_ROT ? "rot" : "power", rounds);
+                kind == N_ROT ? "rot" : kind == N_RDMA_QPERR ? "rdma-qperr" : "power", rounds);
         settle(kind == N_KILL ? "a kill" : kind == N_PARTITION ? "a partition" : kind == N_PAUSE ? "a pause" :
                kind == N_MIDCOMMIT ? "a crash point" : kind == N_FWDSTALL ? "a forward stall" : kind == N_KILL2 ? "two kills" :
                kind == N_SLOW ? "a slow disk" : kind == N_LONGDOWN ? "a long outage" : kind == N_REBUILD ? "a rebuild" :
                kind == N_CHURN ? "a transfer or move" : kind == N_PARTIAL ? "a partial partition" :
-               kind == N_DISKLOSS ? "a disk loss" : kind == N_ROT ? "a rotted chunk" : "a power loss");
+               kind == N_DISKLOSS ? "a disk loss" : kind == N_ROT ? "a rotted chunk" :
+               kind == N_RDMA_QPERR ? "an RDMA QP error" : "a power loss");
         hold_ms(rnd_range(300, 1200));
     }
     if (term_cp >= 0 && !term_done) {
@@ -4997,8 +5287,14 @@ int main(int argc, char **argv)
     int rdiff = isr_short, isr = rep_full_mask();
     if (want_ec_k)
         r4_end_bad += ec_div_check(); /* its own FAIL line: not one of "the replicas differ" */
+    struct rdma_mstat rdma_end;
+    memset(&rdma_end, 0, sizeof rdma_end);
+    if (rdma_tracking())
+        rdma_sample_all(&rdma_end);
     /* a clean stop of every node: SIGTERM, status 0 (parallel) */
     int unclean = stop_nodes_par();
+    if (rdma_tracking())
+        rdma_pool_leaks = rdma_check_logs_for_leaks();
     if (foreign_pid > 0) {
         signal_child(foreign_pid, SIGTERM);
         waitpid(foreign_pid, NULL, 0);
@@ -5021,10 +5317,10 @@ int main(int argc, char **argv)
     for (int k = 0; k < NNEM; k++)
         total_faults += faults[k];
     printf("faults applied: kill %u, partition %u (cuts applied %d%s), pause %u, midcommit %u (crash points hit %u, %u of them while serving, "
-           "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses); restarts %u, rounds %u\n",
+           "never fired %u), power %u (losses %u, idle %u), fwdstall %u (%u writes held, %u misses), rdma-qperr %u; restarts %u, rounds %u\n",
            faults[0], faults[1], partitions_applied, partitions_planted_noop ? ", PLANTED NO-OP" : "", faults[2],
-           faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses, restarts,
-           rounds);
+           faults[3], cp_hits, cp_hits_serving, cp_unfired, faults[4], power_hits, power_idle, faults[5], fwd_stalls_held, fwd_stall_misses,
+           faults[14], restarts, rounds);
     if (nemeses & (N_KILL2 | N_SLOW | N_R4_KV))
         printf("r4: kill2 %u rounds (%u took two of kvr's replicas), slow %u, longdown %u (%u of them with a snapshot installed), "
                "rebuild %u (%u rebuilt, %u by a snapshot), churn %u (%u moves, %u transfers accepted of which %u landed, %u cancels, %u refused)\n",
@@ -5062,7 +5358,26 @@ int main(int argc, char **argv)
                "node\n", (uint64_t)atomic_load(&via_fwd),
                (uint64_t)atomic_load(&via_fwd_reads), (uint64_t)atomic_load(&via_ryw_reads), nstalls,
                (uint64_t)atomic_load(&via_aimed), (uint64_t)atomic_load(&via_picks));
+    if (rdma_tracking())
+        printf("rdma: mode %s, max rdma links %" PRIu64 " (end rdma %" PRIu64 ", tcp %" PRIu64 "), qperr_fired %u "
+               "(backoff rounds %u), qp_errors %" PRIu64 ", credit_stalls %" PRIu64 ", rnr_retries %" PRIu64
+               ", fallbacks(qp_error=%" PRIu64 " backoff=%" PRIu64 " pool=%" PRIu64 " other=%" PRIu64 "), pool_leaks %u\n",
+               opt_peer_rdma ? opt_peer_rdma : "auto", rdma_max_up_links, rdma_end.up_rdma, rdma_end.up_tcp,
+               rdma_qperr_fired, rdma_backoff_rounds, rdma_end.qp_errors, rdma_end.credit_stalls, rdma_end.rnr_retries,
+               rdma_end.fb_qperr, rdma_end.fb_backoff, rdma_end.fb_pool, rdma_end.fb_other, rdma_pool_leaks);
     int rc = 0;
+    if (opt_peer_rdma && !strcmp(opt_peer_rdma, "on") && rdma_max_up_links == 0) {
+        fprintf(stderr, "jepsen-cluster: FAIL: --peer-rdma on saw 0 RDMA links on /metrics\n");
+        rc = 1;
+    }
+    if ((nemeses & N_RDMA_QPERR) && rdma_qperr_fired == 0) {
+        fprintf(stderr, "jepsen-cluster: FAIL: rdma-qperr nemesis fired 0 QP errors\n");
+        rc = 1;
+    }
+    if (rdma_pool_leaks > 0) {
+        fprintf(stderr, "jepsen-cluster: FAIL: %u RDMA pool leak(s) / drain timeout(s) in server logs\n", rdma_pool_leaks);
+        rc = 1;
+    }
     if (viol) {
         fprintf(stderr, "jepsen-cluster: FAIL: %d violation(s):", viol);
         for (int k = 0; k < V_KINDS; k++)

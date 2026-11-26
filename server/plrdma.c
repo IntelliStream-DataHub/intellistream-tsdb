@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -52,6 +53,13 @@ struct plr_pool {
     uint32_t *free, nfree, nslots, lost, conns;
     void (*on_free)(void *arg, const void *slot, size_t n);
     void *on_free_arg;
+#ifdef TSDB_TEST_HOOKS
+    /* TSDB_PLRDMA_TEST hooks (qperr=N, qperr_file=PATH; 0/empty when unset) */
+    uint64_t test_qperr_every;
+    _Atomic uint64_t test_qperr_ctr;
+    _Atomic uint64_t test_qperr_chk_ns;
+    char test_qperr_file[PATH_MAX];
+#endif
 };
 
 struct rslot {
@@ -79,6 +87,9 @@ struct plr_conn {
     uint32_t *s_len;
     int cr_data, cr_ctl, owed_data, owed_ctl;
     int err, ended, want, ak;
+#ifdef TSDB_TEST_HOOKS
+    int test_qperr_arm, test_qperr_fired;
+#endif
     unsigned marks;
     struct pl_transport *anchor;
     uint32_t poll_us; /* busy-poll CQ before sleeping (cluster.peer.rdma.poll_us) */
@@ -109,11 +120,123 @@ static uint32_t get32(const uint8_t *p)
 
 /* ------------------------------------------------------------------------------------------------- the pool */
 
-struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_cfg *cfg, char *err, size_t errlen)
+static uint64_t mono_ns_rdma(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+#ifdef TSDB_TEST_HOOKS
+static int parse_u64_strict(const char *s, size_t len, uint64_t *out)
+{
+    if (!len || s[0] < '0' || s[0] > '9' || len >= 32)
+        return -1;
+    char tmp[32];
+    memcpy(tmp, s, len);
+    tmp[len] = '\0';
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(tmp, &end, 10);
+    if (errno == ERANGE || end != tmp + len)
+        return -1;
+    *out = (uint64_t)v;
+    return 0;
+}
+
+/* Parse TSDB_PLRDMA_TEST (comma-separated: qperr=N, qperr_file=PATH, rnr_retry=N, slot=N, data=N, ctl=N, send=N). */
+static int parse_test_env(struct plr_pool_cfg *cfg, uint64_t *qperr_every, char *qperr_file, size_t qf_len, char *err,
+                          size_t errlen)
+{
+    *qperr_every = 0;
+    qperr_file[0] = '\0';
+    const char *env = getenv("TSDB_PLRDMA_TEST");
+    if (!env || !*env)
+        return 0;
+    for (const char *p = env; *p;) {
+        const char *comma = strchr(p, ',');
+        size_t tlen = comma ? (size_t)(comma - p) : strlen(p);
+        if (tlen > 0) {
+            uint64_t v = 0;
+            if (tlen >= 6 && !strncmp(p, "qperr=", 6)) {
+                if (parse_u64_strict(p + 6, tlen - 6, &v) < 0) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid qperr value");
+                    goto bad;
+                }
+                *qperr_every = v;
+            } else if (tlen >= 11 && !strncmp(p, "qperr_file=", 11)) {
+                size_t plen = tlen - 11;
+                if (plen >= qf_len) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST qperr_file path exceeds %zu bytes", qf_len - 1);
+                    goto bad;
+                }
+                memcpy(qperr_file, p + 11, plen);
+                qperr_file[plen] = '\0';
+            } else if (tlen >= 10 && !strncmp(p, "rnr_retry=", 10)) {
+                if (parse_u64_strict(p + 10, tlen - 10, &v) < 0 || v > 7) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid rnr_retry (must be 0 to 7)");
+                    goto bad;
+                }
+                cfg->rnr_retry = (uint8_t)v;
+            } else if (tlen >= 5 && !strncmp(p, "slot=", 5)) {
+                if (parse_u64_strict(p + 5, tlen - 5, &v) < 0 || v < 1024 || v > (1u << 24) || (v % 64) != 0) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid slot (must be 1024 to %u, multiple of 64)",
+                             1u << 24);
+                    goto bad;
+                }
+                cfg->slot = (uint32_t)v;
+            } else if (tlen >= 5 && !strncmp(p, "data=", 5)) {
+                if (parse_u64_strict(p + 5, tlen - 5, &v) < 0 || v < 1 || v > 65535) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid data slots (must be 1 to 65535)");
+                    goto bad;
+                }
+                cfg->data_slots = (uint16_t)v;
+            } else if (tlen >= 4 && !strncmp(p, "ctl=", 4)) {
+                if (parse_u64_strict(p + 4, tlen - 4, &v) < 0 || v < PLR_CTL_MIN || v > PLR_CTL_MAX) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid ctl slots (must be %d to %d)", PLR_CTL_MIN,
+                             PLR_CTL_MAX);
+                    goto bad;
+                }
+                cfg->ctl_slots = (uint16_t)v;
+            } else if (tlen >= 5 && !strncmp(p, "send=", 5)) {
+                if (parse_u64_strict(p + 5, tlen - 5, &v) < 0 || v < 2 || v > 65535) {
+                    snprintf(err, errlen, "RDMA: TSDB_PLRDMA_TEST invalid send slots (must be 2 to 65535)");
+                    goto bad;
+                }
+                cfg->send_slots = (uint16_t)v;
+            }
+        }
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+    return 0;
+bad:
+    *qperr_every = 0;
+    qperr_file[0] = '\0';
+    errno = EINVAL;
+    return -1;
+}
+#endif
+
+struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_cfg *cfg_in, char *err, size_t errlen)
 {
     if (!ops) {
         snprintf(err, errlen, "RDMA: no verbs");
         errno = ENOSYS;
+        return NULL;
+    }
+    struct plr_pool_cfg lcfg = *cfg_in;
+    const struct plr_pool_cfg *cfg = &lcfg;
+#ifdef TSDB_TEST_HOOKS
+    uint64_t qperr_every = 0;
+    char qperr_file[PATH_MAX];
+    if (parse_test_env(&lcfg, &qperr_every, qperr_file, sizeof qperr_file, err, errlen) < 0)
+        return NULL;
+#endif
+    if (cfg->rnr_retry > 7) {
+        snprintf(err, errlen, "RDMA: rnr_retry %u must be 0 to 7", (unsigned)cfg->rnr_retry);
+        errno = EINVAL;
         return NULL;
     }
     if (cfg->ctl_slots < PLR_CTL_MIN || cfg->ctl_slots > PLR_CTL_MAX ||
@@ -125,7 +248,13 @@ struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_
         errno = EINVAL;
         return NULL;
     }
-    if (cfg->slot < 1024 || cfg->slot % 64 || cfg->data_slots < 1 || cfg->send_slots < 2 ||
+    if (cfg->slot < 1024 || cfg->slot > (1u << 24) || cfg->slot % 64) {
+        snprintf(err, errlen, "RDMA: slot size %u must be a multiple of 64 between 1024 and %u", (unsigned)cfg->slot,
+                 1u << 24);
+        errno = EINVAL;
+        return NULL;
+    }
+    if (cfg->data_slots < 1 || cfg->send_slots < 2 ||
         cfg->pool_bytes < (size_t)cfg->slot * (cfg->data_slots + cfg->ctl_slots + cfg->send_slots)) {
         snprintf(err, errlen, "RDMA: a pool of %zu bytes cannot hold one connection's slots (%u of %u bytes)",
                  cfg->pool_bytes, (unsigned)(cfg->data_slots + cfg->ctl_slots + cfg->send_slots), (unsigned)cfg->slot);
@@ -152,6 +281,14 @@ struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_
     p->cfg = *cfg;
     p->bytes = bytes;
     p->nslots = (uint32_t)(bytes / cfg->slot);
+#ifdef TSDB_TEST_HOOKS
+    p->test_qperr_every = qperr_every;
+    if (qperr_file[0]) {
+        int n = snprintf(p->test_qperr_file, sizeof p->test_qperr_file, "%s", qperr_file);
+        if (n < 0 || (size_t)n >= sizeof p->test_qperr_file)
+            p->test_qperr_file[0] = '\0';
+    }
+#endif
     pthread_mutex_init(&p->mu, NULL);
     if (ops->dev_open(cfg->dev, cfg->port, &p->dev, &p->port, err, errlen) < 0) {
         pthread_mutex_destroy(&p->mu);
@@ -416,6 +553,38 @@ static int send_msg(struct plr_conn *c, int type, uint32_t len, uint32_t stream)
     if (!(plrdma_mutant == PLR_MUT_UNSIGEARLY && !sig))
         c->s_n++; /* the mutant: the next message takes the same slot while this one may still be read by the NIC */
     ST_ADD(c, msgs_out, 1);
+#ifdef TSDB_TEST_HOOKS
+    /* TSDB_PLRDMA_TEST fault injection: force a live QP to error mid-stream (with unsignalled sends and receives in
+     * flight when sig_every > 1) so real HCA flush/drain, TCP fallback, backoff and recovery are exercised. */
+    if (type == MSG_DATA && c->started && !c->err && !c->test_qperr_fired &&
+        (c->pool->test_qperr_every || c->pool->test_qperr_file[0])) {
+        if (c->pool->test_qperr_every && !c->test_qperr_arm &&
+            (__atomic_add_fetch(&c->pool->test_qperr_ctr, 1, __ATOMIC_RELAXED) % c->pool->test_qperr_every) == 0)
+            c->test_qperr_arm = 1;
+        int fire = 0;
+        if (c->test_qperr_arm && (!sig || c->sig_every <= 1)) {
+            fire = 1;
+        } else if (c->pool->test_qperr_file[0] && (!sig || c->sig_every <= 1)) {
+            uint64_t now = mono_ns_rdma();
+            uint64_t prev = __atomic_load_n(&c->pool->test_qperr_chk_ns, __ATOMIC_RELAXED);
+            if (now >= prev + 5000000ull &&
+                __atomic_compare_exchange_n(&c->pool->test_qperr_chk_ns, &prev, now, 0, __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED)) {
+                if (unlink(c->pool->test_qperr_file) == 0)
+                    fire = 1;
+            }
+        }
+        if (fire) {
+            c->test_qperr_fired = 1;
+            c->test_qperr_arm = 0;
+            GST_INC(g_qp_errors);
+            fprintf(stderr, "peerlink: rdma: test hook forcing QP %u to error state (unsig=%u s_n=%u posted_rx=%d)\n",
+                    (unsigned)c->qpn, (unsigned)c->unsig, (unsigned)c->s_n, c->posted_rx);
+            if (c->ops->qp_err(c->qp) < 0)
+                fail(c, errno);
+        }
+    }
+#endif
     return 0;
 }
 
@@ -572,13 +741,6 @@ static void anchor_check(struct plr_conn *c)
         fail(c, EPROTO);
     } else if (errno != EAGAIN && errno != EINTR)
         fail(c, errno);
-}
-
-static uint64_t mono_ns_rdma(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
 static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int *ready)
