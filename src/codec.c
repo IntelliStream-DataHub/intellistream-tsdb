@@ -340,9 +340,13 @@ int gorilla_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
  *   u8 scale | u8 width | i64 first | u32 nexc | (n - 1) deltas | nexc x (u32 pos, u32 bits)
  */
 
-#define DEC_NDEC 11 /* 10^0 .. 10^10 */
-#define DEC_NBIN 24 /* 2^1 .. 2^24 */
-#define DEC_MAX_EXP (DEC_NDEC + DEC_NBIN - 1)
+#define DEC_NDEC 11     /* 10^0 .. 10^10 */
+#define DEC_NBIN 24     /* 2^1 .. 2^24 */
+#define DEC_NNEG_DEC 6  /* 10^-1 .. 10^-6 (dividing scales, appended above 34) */
+#define DEC_NNEG_BIN 10 /* 2^-1 .. 2^-10 (dividing scales, appended above 40) */
+#define DEC_NEG_DEC_OFF (DEC_NDEC + DEC_NBIN)
+#define DEC_NEG_BIN_OFF (DEC_NEG_DEC_OFF + DEC_NNEG_DEC)
+#define DEC_MAX_EXP (DEC_NEG_BIN_OFF + DEC_NNEG_BIN - 1)
 #define DEC_LIMIT 4503599627370496.0 /* 2^52: integers are exact in a double */
 #define DEC_HDR 14
 
@@ -356,12 +360,16 @@ int gorilla_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
 static const double dec_scale[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
                                    P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10),
                                    P2S(11), P2S(12), P2S(13), P2S(14), P2S(15), P2S(16), P2S(17), P2S(18), P2S(19), P2S(20),
-                                   P2S(21), P2S(22), P2S(23), P2S(24)};
+                                   P2S(21), P2S(22), P2S(23), P2S(24),
+                                   1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6,
+                                   P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10)};
 /* the decimal inverses are literals: the decoder multiplies by exactly these */
 static const double dec_inv[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10,
                                  P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10),
                                  P2I(11), P2I(12), P2I(13), P2I(14), P2I(15), P2I(16), P2I(17), P2I(18), P2I(19), P2I(20),
-                                 P2I(21), P2I(22), P2I(23), P2I(24)};
+                                 P2I(21), P2I(22), P2I(23), P2I(24),
+                                 1e1, 1e2, 1e3, 1e4, 1e5, 1e6,
+                                 P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10)};
 _Static_assert(sizeof dec_scale / sizeof *dec_scale == DEC_MAX_EXP + 1, "dec_scale");
 _Static_assert(sizeof dec_inv / sizeof *dec_inv == DEC_MAX_EXP + 1, "dec_inv");
 
@@ -481,6 +489,81 @@ static int dec_pick_scale(const float *in, size_t n, bool compact)
             if (cost < best - 1e-9) {
                 best = cost;
                 best_e = e;
+            }
+        }
+    }
+    /* Dividing scales (10^-1..10^-6, 2^-1..2^-10): any multiple of 10^f or 2^b is already an exact integer at e == 0,
+     * so probe them only when e == 0 won (zero cost on fractional or noisy floats). */
+    if (best_e == 0 && best < 4.5) {
+        double best_bits = dec_sample_cost(in, n, 0, true);
+        if (best_bits > 0.0) {
+            enum { RUNS = 4, RUN = 16 };
+            size_t run = MIN((size_t)RUN, n), tried = 0;
+            int d10_0[DEC_NNEG_DEC + 1] = {0}, d10[DEC_NNEG_DEC + 1] = {0};
+            int d2_0[DEC_NNEG_BIN + 1] = {0}, d2[DEC_NNEG_BIN + 1] = {0};
+            for (int r = 0; r < RUNS; r++) {
+                size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
+                for (size_t i = at; i < at + run; i++, tried++) {
+                    int64_t k;
+                    if (!dec_int(in[i], 0, &k))
+                        continue;
+                    int p10 = DEC_NNEG_DEC, p2 = DEC_NNEG_BIN;
+                    if (k != 0) {
+                        int64_t t = k;
+                        p10 = 0;
+                        while (p10 < DEC_NNEG_DEC && t % 10 == 0) {
+                            t /= 10;
+                            p10++;
+                        }
+                        p2 = __builtin_ctzll((uint64_t)k);
+                        if (p2 > DEC_NNEG_BIN)
+                            p2 = DEC_NNEG_BIN;
+                    }
+                    d10[p10]++;
+                    d2[p2]++;
+                    if (r == 0) {
+                        d10_0[p10]++;
+                        d2_0[p2]++;
+                    }
+                }
+                if (n <= run)
+                    break;
+            }
+            for (int f = DEC_NNEG_DEC - 1; f >= 1; f--) {
+                d10[f] += d10[f + 1];
+                d10_0[f] += d10_0[f + 1];
+            }
+            for (int b = DEC_NNEG_BIN - 1; b >= 1; b--) {
+                d2[b] += d2[b + 1];
+                d2_0[b] += d2_0[b + 1];
+            }
+            for (int f = 1; f <= DEC_NNEG_DEC && best_bits > 0.0; f++) {
+                if ((run - (size_t)d10_0[f]) * 4 > run || (tried - (size_t)d10[f]) * 4 > tried)
+                    continue;
+                int e = DEC_NEG_DEC_OFF + f - 1;
+                double cb = dec_sample_cost(in, n, e, true);
+                if (cb < best_bits - 1e-9) {
+                    double c = dec_sample_cost(in, n, e, false);
+                    if (c < 4.5) {
+                        best_bits = cb;
+                        best_e = e;
+                        best = c;
+                    }
+                }
+            }
+            for (int b = 1; b <= DEC_NNEG_BIN && best_bits > 0.0; b++) {
+                if ((run - (size_t)d2_0[b]) * 4 > run || (tried - (size_t)d2[b]) * 4 > tried)
+                    continue;
+                int e = DEC_NEG_BIN_OFF + b - 1;
+                double cb = dec_sample_cost(in, n, e, true);
+                if (cb < best_bits - 1e-9) {
+                    double c = dec_sample_cost(in, n, e, false);
+                    if (c < 4.5) {
+                        best_bits = cb;
+                        best_e = e;
+                        best = c;
+                    }
+                }
             }
         }
     }
@@ -1313,6 +1396,225 @@ int ts_delta_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out
     return ts_delta_dec(in, len, n, out, true);
 }
 
+/* ------------------------------------------- BLK_TS_FOR_BP (bit-packed ts) */
+/*
+ * Per-vector (1024 values) bit-packed frame-of-reference over grid residuals
+ * (mode 0: r[i] = ts[i] - (first + i * step)) or deltas (mode 1: d[i] = ts[i] - ts[i-1]).
+ * Packs jittered clocks (e.g. +-20 ms -> 6 bits, +-200 ms -> 9 bits) tightly without
+ * needing ZSTD's entropy coder, and tracks local clock drift via per-vector base `lo`.
+ *
+ *   mode 0 (grid):  u8 0 | u64 first | u64 step | per vector: u8 w (0..64) | u64 lo | packed_bytes(nv, w)
+ *   mode 1 (delta): u8 1 | u64 first            | per vector (v0 = 1..n): u8 w (0..64) | u64 lo | packed_bytes(nv, w)
+ */
+#define TS_FBP_VEC 1024
+
+size_t ts_for_bp_bound(size_t n) { return 17 + (n / TS_FBP_VEC + 1) * 9 + 8 * n + 16; }
+
+size_t ts_for_bp_encode(const int64_t *ts, size_t n, uint8_t *out)
+{
+    if (n < 2)
+        return 0;
+    uint64_t first = (uint64_t)ts[0];
+    int64_t span = (int64_t)((uint64_t)ts[n - 1] - first);
+    int64_t denom = (int64_t)(n - 1);
+    int64_t q = span / denom, rem = span % denom;
+    if (rem > denom / 2)
+        q++;
+    else if (rem < -(denom / 2))
+        q--;
+    uint64_t step = (uint64_t)q;
+
+    size_t grid_bytes = 17, delta_bytes = 9;
+    for (size_t v0 = 0; v0 < n; v0 += TS_FBP_VEC) {
+        size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (size_t j = 0; j < nv; j++) {
+            int64_t r = (int64_t)((uint64_t)ts[v0 + j] - grid_at(first, step, v0 + j));
+            lo = r < lo ? r : lo;
+            hi = r > hi ? r : hi;
+        }
+        grid_bytes += 9 + packed_bytes(nv, bits_for64((uint64_t)hi - (uint64_t)lo));
+    }
+    for (size_t v0 = 1; v0 < n; v0 += TS_FBP_VEC) {
+        size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (size_t j = 0; j < nv; j++) {
+            int64_t d = (int64_t)((uint64_t)ts[v0 + j] - (uint64_t)ts[v0 + j - 1]);
+            lo = d < lo ? d : lo;
+            hi = d > hi ? d : hi;
+        }
+        delta_bytes += 9 + packed_bytes(nv, bits_for64((uint64_t)hi - (uint64_t)lo));
+    }
+
+    uint32_t u32[TS_FBP_VEC];
+    uint64_t u64[TS_FBP_VEC];
+    uint8_t *o = out;
+    if (grid_bytes <= delta_bytes) {
+        *o++ = 0;
+        memcpy(o, &first, 8);
+        o += 8;
+        memcpy(o, &step, 8);
+        o += 8;
+        for (size_t v0 = 0; v0 < n; v0 += TS_FBP_VEC) {
+            size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+            int64_t lo = INT64_MAX, hi = INT64_MIN;
+            for (size_t j = 0; j < nv; j++) {
+                int64_t r = (int64_t)((uint64_t)ts[v0 + j] - grid_at(first, step, v0 + j));
+                lo = r < lo ? r : lo;
+                hi = r > hi ? r : hi;
+            }
+            int w = bits_for64((uint64_t)hi - (uint64_t)lo);
+            uint64_t lo_u = (uint64_t)lo, base = first + (uint64_t)v0 * step + lo_u;
+            *o++ = (uint8_t)w;
+            memcpy(o, &lo_u, 8);
+            o += 8;
+            if (w == 0)
+                continue;
+            if (w <= 32) {
+                for (size_t j = 0; j < nv; j++)
+                    u32[j] = (uint32_t)((uint64_t)ts[v0 + j] - base - (uint64_t)j * step);
+                pack(u32, nv, w, o);
+            } else {
+                for (size_t j = 0; j < nv; j++)
+                    u64[j] = (uint64_t)ts[v0 + j] - base - (uint64_t)j * step;
+                pack64(u64, nv, w, o);
+            }
+            o += packed_bytes(nv, w);
+        }
+    } else {
+        *o++ = 1;
+        memcpy(o, &first, 8);
+        o += 8;
+        for (size_t v0 = 1; v0 < n; v0 += TS_FBP_VEC) {
+            size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+            int64_t lo = INT64_MAX, hi = INT64_MIN;
+            for (size_t j = 0; j < nv; j++) {
+                int64_t d = (int64_t)((uint64_t)ts[v0 + j] - (uint64_t)ts[v0 + j - 1]);
+                lo = d < lo ? d : lo;
+                hi = d > hi ? d : hi;
+            }
+            int w = bits_for64((uint64_t)hi - (uint64_t)lo);
+            uint64_t lo_u = (uint64_t)lo;
+            *o++ = (uint8_t)w;
+            memcpy(o, &lo_u, 8);
+            o += 8;
+            if (w == 0)
+                continue;
+            if (w <= 32) {
+                for (size_t j = 0; j < nv; j++)
+                    u32[j] = (uint32_t)((uint64_t)ts[v0 + j] - (uint64_t)ts[v0 + j - 1] - lo_u);
+                pack(u32, nv, w, o);
+            } else {
+                for (size_t j = 0; j < nv; j++)
+                    u64[j] = (uint64_t)ts[v0 + j] - (uint64_t)ts[v0 + j - 1] - lo_u;
+                pack64(u64, nv, w, o);
+            }
+            o += packed_bytes(nv, w);
+        }
+    }
+    return (size_t)(o - out);
+}
+
+static inline __attribute__((always_inline)) int ts_for_bp_dec(const uint8_t *in, size_t len, size_t n, int64_t *out,
+                                                               const bool chk)
+{
+    if (n == 0)
+        return 0;
+    if (len < 1)
+        return TSDB_ERR_CORRUPT;
+    uint8_t mode = in[0];
+    const uint8_t *p = in + 1, *end = in + len;
+    uint32_t u32[TS_FBP_VEC];
+    uint64_t u64[TS_FBP_VEC];
+    if (mode == 0) {
+        if ((size_t)(end - p) < 16)
+            return TSDB_ERR_CORRUPT;
+        uint64_t first, step;
+        memcpy(&first, p, 8);
+        memcpy(&step, p + 8, 8);
+        p += 16;
+        for (size_t v0 = 0; v0 < n; v0 += TS_FBP_VEC) {
+            size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+            if ((size_t)(end - p) < 9 || p[0] > 64)
+                return TSDB_ERR_CORRUPT;
+            int w = p[0];
+            uint64_t lo;
+            memcpy(&lo, p + 1, 8);
+            p += 9;
+            size_t pb = packed_bytes(nv, w);
+            if ((size_t)(end - p) < pb)
+                return TSDB_ERR_CORRUPT;
+            uint64_t base = first + (uint64_t)v0 * step + lo;
+            if (w == 0) {
+                for (size_t j = 0; j < nv; j++)
+                    out[v0 + j] = (int64_t)(base + (uint64_t)j * step);
+            } else if (w <= 32) {
+                unpack(p, nv, w, u32);
+                for (size_t j = 0; j < nv; j++)
+                    out[v0 + j] = (int64_t)(base + (uint64_t)j * step + (uint64_t)u32[j]);
+            } else {
+                unpack64(p, nv, w, u64);
+                for (size_t j = 0; j < nv; j++)
+                    out[v0 + j] = (int64_t)(base + (uint64_t)j * step + u64[j]);
+            }
+            p += pb;
+        }
+    } else if (mode == 1) {
+        if ((size_t)(end - p) < 8)
+            return TSDB_ERR_CORRUPT;
+        uint64_t cur;
+        memcpy(&cur, p, 8);
+        p += 8;
+        out[0] = (int64_t)cur;
+        for (size_t v0 = 1; v0 < n; v0 += TS_FBP_VEC) {
+            size_t nv = MIN((size_t)TS_FBP_VEC, n - v0);
+            if ((size_t)(end - p) < 9 || p[0] > 64)
+                return TSDB_ERR_CORRUPT;
+            int w = p[0];
+            uint64_t lo;
+            memcpy(&lo, p + 1, 8);
+            p += 9;
+            size_t pb = packed_bytes(nv, w);
+            if ((size_t)(end - p) < pb)
+                return TSDB_ERR_CORRUPT;
+            if (w == 0) {
+                for (size_t j = 0; j < nv; j++)
+                    out[v0 + j] = (int64_t)(cur + (uint64_t)(j + 1) * lo);
+                cur += (uint64_t)nv * lo;
+            } else if (w <= 32) {
+                unpack(p, nv, w, u32);
+                cur = for_prefix_u32_to_i64(u32, nv, lo, cur, out + v0);
+            } else {
+                unpack64(p, nv, w, u64);
+                cur = for_prefix_u64_to_i64(u64, nv, lo, cur, out + v0);
+            }
+            p += pb;
+        }
+    } else {
+        return TSDB_ERR_CORRUPT;
+    }
+    if (p != end)
+        return TSDB_ERR_CORRUPT;
+    if (chk) {
+        uint64_t bad = 0;
+        for (size_t i = 1; i < n; i++)
+            bad |= (uint64_t)(out[i] <= out[i - 1]);
+        if (bad)
+            return TSDB_ERR_CORRUPT;
+    }
+    return 0;
+}
+
+int ts_for_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_for_bp_dec(in, len, n, out, false);
+}
+
+int ts_for_bp_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    return ts_for_bp_dec(in, len, n, out, true);
+}
+
 /* ---------------------------------------------------------------- blocks */
 /*
  * Block layout: 1 header byte (transform | BLK_ZSTD), then either the raw
@@ -1380,6 +1682,9 @@ static size_t inner_bound(int kind, size_t n)
     case BLK_INT: return int_bp_bound(n);
     case BLK_DELTA_BP: return MAX(delta_bp32_bound(n), delta_bp64_bound(n));
     case BLK_DICT: return dict_bound(n);
+    case BLK_INT_FOR: return int_for_bound(n);
+    case BLK_BOOL_PACK: return bool_pack_bound(n);
+    case BLK_TS_FOR_BP: return ts_for_bp_bound(n);
     default: return 0;
     }
 }
@@ -1390,7 +1695,7 @@ size_t block_bound(size_t n)
     inner = MAX(inner, MAX(alprd_bound(n), decimal_bp_bound(n)));
     inner = MAX(inner, MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), MAX(8 * n, int_bp_bound(n))));
     inner = MAX(inner, MAX(alprd64_bound(n), MAX(delta_bp32_bound(n), delta_bp64_bound(n))));
-    inner = MAX(inner, dict_bound(n));
+    inner = MAX(inner, MAX(dict_bound(n), MAX(int_for_bound(n), MAX(bool_pack_bound(n), ts_for_bp_bound(n)))));
     return 5 + ZSTD_compressBound(inner);
 }
 
@@ -1452,28 +1757,39 @@ static size_t encode_ts_kind(int kind, const int64_t *ts, size_t n, uint8_t *dst
     }
 }
 
+/* A ZSTD-wrapped timestamp block beats a raw one only when it saves at least 1/8 (matching blk_zstd_min_saving). */
+static inline bool ts_blk_better(size_t a_len, bool a_zstd, size_t b_len, bool b_zstd)
+{
+    if (a_zstd == b_zstd)
+        return a_len < b_len;
+    if (a_zstd)
+        return a_len < b_len - b_len / 8;
+    return b_len >= a_len - a_len / 8;
+}
+
 /* DoubleDelta when the clock is regular (about a bit per row before ZSTD);
- * otherwise the candidate with the smallest estimated size (kept in scratch/alt without re-encoding). */
+ * otherwise the best of DD / TS_GRID / TS_DELTA competes against bit-packed BLK_TS_FOR_BP. */
 size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uint8_t *out)
 {
-    size_t need = MAX(dd_bound(n), tsfor_bound(n));
+    size_t need = MAX(MAX(dd_bound(n), tsfor_bound(n)), ts_for_bp_bound(n));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
     size_t dd = dd_encode(ts, n, c->scratch);
     if (level <= 0 || n < 2 || dd <= 24 + n / 8 + 8)
         return block_wrap(c, level, BLK_DD, dd, out);
-    if (codec_alt_reserve(c, need) != 0)
+    if (codec_alt_reserve(c, MAX(need, block_bound(n))) != 0)
         return 0;
     int best = BLK_DD;
     size_t best_len = dd;
     uint8_t *best_buf = c->scratch, *try_buf = c->alt;
-    double best_est = MIN((double)dd, entropy_bytes(best_buf, dd));
+    double ed = entropy_bytes(best_buf, dd);
+    double best_est = ed < (double)dd - (double)(dd / 8) ? ed : (double)dd;
     static const int kinds[] = {BLK_TS_GRID, BLK_TS_DELTA};
     for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
         size_t len = encode_ts_kind(kinds[k], ts, n, try_buf);
         size_t hdr = kinds[k] == BLK_TS_GRID ? 25 : 17;
-        double est = len > hdr ? MIN((double)len, hdr + entropy_words(try_buf + hdr, len - hdr, try_buf[0]))
-                               : (double)len;
+        double e = len > hdr ? hdr + entropy_words(try_buf + hdr, len - hdr, try_buf[0]) : (double)len;
+        double est = e < (double)len - (double)(len / 8) ? e : (double)len;
         if (len && est < best_est) {
             best_est = est;
             best = kinds[k];
@@ -1483,7 +1799,16 @@ size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uin
             try_buf = tmp;
         }
     }
-    return block_wrap_src(c, level, best, best_buf, best_len, out);
+    size_t out_len = block_wrap_src(c, level, best, best_buf, best_len, out);
+    size_t fbp = ts_for_bp_encode(ts, n, c->scratch);
+    if (fbp) {
+        size_t fbp_blk = block_wrap_src(c, level, BLK_TS_FOR_BP, c->scratch, fbp, c->alt);
+        if (ts_blk_better(fbp_blk, (c->alt[0] & BLK_ZSTD) != 0, out_len, (out[0] & BLK_ZSTD) != 0)) {
+            memcpy(out, c->alt, fbp_blk);
+            out_len = fbp_blk;
+        }
+    }
+    return out_len;
 }
 
 /* Encodes v with one transform into out; returns 0 if not applicable. */
@@ -1660,6 +1985,7 @@ static inline __attribute__((always_inline)) int block_dec_ts(codec_ctx *c, cons
     case BLK_DD: return dd_dec(p, plen, n, out, chk);
     case BLK_TS_GRID: return ts_grid_dec(p, plen, n, out, chk);
     case BLK_TS_DELTA: return ts_delta_dec(p, plen, n, out, chk);
+    case BLK_TS_FOR_BP: return ts_for_bp_dec(p, plen, n, out, chk);
     default: return TSDB_ERR_CORRUPT;
     }
 }
