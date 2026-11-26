@@ -132,7 +132,7 @@ override CFLAGS += -DTSDB_EC
 endif
 EC_HDR := $(wildcard src/ec/*.h) $(wildcard src/ec/compat/*/*.h)
 # R7's headers (settled .ec parts, the tier; src/ecpart.h): every engine object may include them
-R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
+R7_HDR := src/ecpart.h src/tier.h src/eccache.h src/ecgc.h src/ecgcmk.h src/eckeep.h src/ecswap.h src/settle.h src/chunk.h src/ecskip.h src/ecdiverge.h
 # -mssse3: gf256.c's SSSE3 kernel has no target attribute (the copy is never edited), so a generic ARCH (PORTABLE=1,
 # make tsan, make asan) needs it; the dist build's x86-64-v2 has it already. -fno-tree-vectorize keeps the compiler from
 # using SSSE3 (pshufb) outside that kernel, in iso_gf256_init, which runs in every process that loads libtsdb, before
@@ -543,7 +543,7 @@ test-units-b3:
 	./$(B)/test_ecswap $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_ecswap --list "swapearly swappartial swapnodirsync swapnodropcheck swapnolisted swapnofailcheck swapnostats swapmanifestrc swapbackongone swaplostsettled swaploggedgc" -- ./$(B)/test_ecswap --quick --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_ecgc $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_ecgc --list "gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop noretrytimer gcuncommitted gcnamedorphan gcsuspendignored holdatretire gcreplicanoop" -- ./$(B)/test_ecgc --quick --mutant @M@ @D@) # each planted bug must fail it
 test-units-b4:
 	./$(B)/test_settle $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_settle --list "ecrankdown settlenocheck settletwopass settlebusy coarsewhole" -- ./$(B)/test_settle --quick --mutant @M@ @D@) # each planted bug must fail it
@@ -618,7 +618,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ec16 r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ec16 ecgc r4stubs addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1003,7 +1003,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: check-rdma-syms margin-mutants lease-mutants chunkpeer-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: check-rdma-syms margin-mutants lease-mutants chunkpeer-mutants ecgc-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1151,11 +1151,16 @@ rset-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/lease_mutants.sh $(SCRATCH)
 # r8f: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail test_cluster
-# ecbasic (nosumcmp only test_chunkpeer: a member that answers another sum needs its fake transport)
+# ecbasic (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "chunkpeer-mutants: this build has no erasure codec (NO_EC=1): ecbasic skips, nothing to plant"; false)
-	$(MUT) --name ecbasic --list "ownepoch staleraise delbeforegc" -- env TSDB_CHUNKPEER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	$(MUT) --name ecbasic --list "ownepoch staleraise" -- env TSDB_CHUNKPEER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecbasic
+# r8k-gc: cluster EC GC planted bugs in tsdbd (TSDB_ECGC_MUTANT), each must fail test_cluster ecgc
+ecgc-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	@$(if $(EC_OBJ),true,echo "ecgc-mutants: this build has no erasure codec (NO_EC=1): ecgc skips, nothing to plant"; false)
+	$(MUT) --name ecgc --list "gcsuspendignored gcreplicanoop" -- env TSDB_ECGC_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecgc
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)

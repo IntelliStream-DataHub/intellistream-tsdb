@@ -18,6 +18,7 @@
  */
 #include "ecpart.h"
 #include "chunk.h"
+#include "ecgc.h"
 #include "tier.h"
 
 #include <errno.h>
@@ -305,6 +306,15 @@ int part_open_ec(eng *db, const char *file, const char *name, part **out)
         struct ecpart *e = atomic_load(&(*out)->ec);
         e->tier = db->tier;
         e->volume = db->tier_vol;
+        /* r7-gc F5 / r8k-gc: hold the object from open (not only from retire), so a reopen's old engine still reading
+         * a part the new engine retires keeps its object alive. Planted bug holdatretire keeps the old behaviour. */
+        if (db->tier && !e->test_mark && ecgc_mutant != GC_MUT_HOLDATRET) {
+            rc = ecgc_hold(db->tier, *out, db->tier_vol, e->rec.oid);
+            if (rc != 0) {
+                part_unref(*out);
+                *out = NULL;
+            }
+        }
     }
     return rc;
 }

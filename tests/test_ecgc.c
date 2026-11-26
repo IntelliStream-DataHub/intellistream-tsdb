@@ -23,11 +23,15 @@
 #include "internal.h"
 #include "chunk.h"
 #include "chunk_priv.h"
+#include "coldops.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "ecgcmk.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
+#include "marker.h"
+#include "replica.h"
 #include "settle.h"
 #include "tier.h"
 
@@ -57,10 +61,23 @@ static int failures;
 static const struct {
     const char *name;
     int m;
-} MUTANTS[] = {{"none", GC_MUT_NONE},           {"gcunlinkfirst", GC_MUT_UNLINKFIRST}, {"gcunrefleak", GC_MUT_UNREFLEAK},
-               {"gcnohold", GC_MUT_NOHOLD},     {"sweeplive", GC_MUT_SWEEPLIVE},
-               {"sweepinflight", GC_MUT_SWEEPINFLIGHT}, {"sweepforeign", GC_MUT_SWEEPFOREIGN},
-               {"unlistednoop", GC_MUT_UNLISTEDNOOP}, {"noretrytimer", GC_MUT_NORETRYTIMER}, {"noafter", GC_MUT_NOAFTER}};
+} MUTANTS[] = {
+    {"none", GC_MUT_NONE},
+    {"gcunlinkfirst", GC_MUT_UNLINKFIRST},
+    {"gcunrefleak", GC_MUT_UNREFLEAK},
+    {"gcnohold", GC_MUT_NOHOLD},
+    {"sweeplive", GC_MUT_SWEEPLIVE},
+    {"sweepinflight", GC_MUT_SWEEPINFLIGHT},
+    {"sweepforeign", GC_MUT_SWEEPFOREIGN},
+    {"unlistednoop", GC_MUT_UNLISTEDNOOP},
+    {"noretrytimer", GC_MUT_NORETRYTIMER},
+    {"noafter", GC_MUT_NOAFTER},
+    {"gcuncommitted", GC_MUT_UNCOMMITTED},
+    {"gcnamedorphan", GC_MUT_NAMEDORPHAN},
+    {"gcsuspendignored", GC_MUT_SUSPENDIGNORED},
+    {"holdatretire", GC_MUT_HOLDATRET},
+    {"gcreplicanoop", GC_MUT_REPLICANOOP},
+};
 
 static const char *mutant_name(int m)
 {
@@ -271,13 +288,16 @@ static int settle_day_ex(h *x, int d, uint8_t oid[16], char name[96], bool drop_
     r.cell_bytes = g.cell;
     r.object_len = p->map_len;
     r.object_xxh64 = xxh64(p->map, p->map_len, 0);
-    r.writer_epoch = 1;
+    uint64_t ep = coldvol_epoch(tier_cold(db));
+    if (ep == 0)
+        ep = 1;
+    r.writer_epoch = ep;
     r.settle_ms = eng_now_ms(db);
     snprintf(r.source, sizeof r.source, "%s", p->name);
     r.nsums = chunk_sums_total(&g);
     r.sums = malloc(r.nsums * sizeof *r.sums);
-    CHECK(chunk_be_see_epoch(tier_backend(x->t), db->tier_vol, 1) == 0);
-    CHECK(chunk_be_put_object(tier_backend(x->t), db->tier_vol, tier_vuuid(db), r.oid, &g, 1, p->map, ~0u, r.sums) ==
+    CHECK(chunk_be_see_epoch(tier_backend(x->t), db->tier_vol, ep) == 0);
+    CHECK(chunk_be_put_object(tier_backend(x->t), db->tier_vol, tier_vuuid(db), r.oid, &g, ep, p->map, ~0u, r.sums) ==
           0);
     char tmp[96];
     CHECK(ec_index_write(db, p, &r, tmp) == 0);
@@ -394,7 +414,7 @@ static void hold_case(int lifetime)
     CHECK(!exists(dir, rname));
     ecgc_counters c;
     ecgc_get_counters(x.t, &c);
-    CHECK(c.unlinked == 1 && c.pending == 0 && c.holds == 0);
+    CHECK(c.unlinked == 1 && c.pending == 0 && c.holds == (ecgc_mutant == GC_MUT_HOLDATRET ? 0u : 1u));
 
     /* no reader: the deadline alone */
     char rname2[128];
@@ -408,6 +428,8 @@ static void hold_case(int lifetime)
     }
     h_gc(&x);
     CHECK(chunks(dir, oid2) == 0 && !exists(dir, rname2));
+    ecgc_get_counters(x.t, &c);
+    CHECK(c.holds == 0);
     h_close(&x);
     printf("  hold, lifetime %d s: a held part's chunks outlive its drop and deadline, its reads succeed; then the "
            "chunks go, then the name\n", lifetime);
@@ -716,7 +738,9 @@ static int child(const char *dir)
     return 0;
 }
 
-static int run_child(const char *dir, int warmup, int seed)
+static int child_gcmk(const char *dir);
+
+static int run_child_mode(const char *flag, const char *dir, int warmup, int seed)
 {
     pid_t pid = fork();
     if (pid == 0) {
@@ -738,7 +762,7 @@ static int run_child(const char *dir, int warmup, int seed)
             dup2(null, 1);
             dup2(null, 2);
         }
-        execl(SELF, "test_ecgc", "--child", dir, "--mutant", mutant_name(ecgc_mutant), (char *)NULL);
+        execl(SELF, "test_ecgc", flag, dir, "--mutant", mutant_name(ecgc_mutant), (char *)NULL);
         _exit(127);
     }
     int st = -1;
@@ -746,6 +770,8 @@ static int run_child(const char *dir, int warmup, int seed)
         return -1;
     return WEXITSTATUS(st);
 }
+
+static int run_child(const char *dir, int warmup, int seed) { return run_child_mode("--child", dir, warmup, seed); }
 
 static void power_case(void)
 {
@@ -797,10 +823,614 @@ static void power_case(void)
            "the retired name kept until its chunks went\n", crashes);
 }
 
+/* ------------------------------------------------------------ reopen hold (r7-gc F5) + O(1) 10k holds */
+
+static void reopen_hold_case(void)
+{
+    char dir[PATH_MAX], dbpath[PATH_MAX + 8], name[96], rname[128];
+    uint8_t oid[16];
+    fresh("reopen_hold", dir, sizeof dir);
+    snprintf(dbpath, sizeof dbpath, "%s/db", dir);
+    h x;
+    CHECK(h_open(&x, dir, 0) == 0);
+    if (!x.db)
+        return;
+    write_day(x.db, 0);
+    write_day(x.db, 1);
+    settle_day(&x, 0, oid, name);
+    snprintf(rname, sizeof rname, "retired_%s", name);
+    /* A reader on the OLD engine keeps a reference across a reopen: old_p is never retired on x.db! */
+    part *old_p = day_part(x.db, 0);
+    CHECK(old_p != NULL);
+    if (!old_p) {
+        h_close(&x);
+        return;
+    }
+    eng_halt(x.db);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.partition_classes = 0;
+    o.obsolete_part_lifetime_s = 0;
+    tier_want(x.t, 0);
+    eng *neu = NULL;
+    CHECK(eng_reopen(x.db, dbpath, &o, NULL, &neu, NULL, NULL) == 0 && neu != NULL);
+    tier_want(NULL, 0);
+    if (neu) {
+        /* New engine drops and retires day 0: new_p reaches refcount 0, but old_p still holds oid! */
+        CHECK(eng_drop_before(neu, DAY) == 0);
+        CHECK(exists(dir, rname));
+        graveyard_purge(neu, false);
+        ecgc_tier_work(x.t);
+        graveyard_purge(neu, false);
+        CHECK(chunks(dir, oid) == npos(oid)); /* fails with holdatretire (r7-gc F5)! */
+        CHECK(exists(dir, rname));
+        uint64_t rows = 0;
+        CHECK(read_all(&x, old_p, &rows) == 0 && rows == old_p->rows);
+        /* Close old engine (releasing its list ref); old_p still holds the reader's ref. */
+        eng_close(x.db);
+        x.db = NULL;
+        graveyard_purge(neu, false);
+        ecgc_tier_work(x.t);
+        graveyard_purge(neu, false);
+        CHECK(chunks(dir, oid) == npos(oid));
+        /* Reader lets go of old_p: now chunks and retired_ name go. */
+        part_unref(old_p);
+        graveyard_purge(neu, false);
+        ecgc_tier_work(x.t);
+        graveyard_purge(neu, false);
+        CHECK(chunks(dir, oid) == 0 && !exists(dir, rname));
+        eng_close(neu);
+    } else {
+        part_unref(old_p);
+        eng_close(x.db);
+        x.db = NULL;
+    }
+
+    /* O(1) hash check with 10,000 parts: hold, lookup, release in O(1) per op. */
+    enum { NH = 10000 };
+    part *pts = calloc(NH, sizeof *pts);
+    uint8_t (*oids)[16] = malloc(NH * 16);
+    CHECK(pts && oids);
+    if (pts && oids) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (size_t i = 0; i < NH; i++) {
+            memset(oids[i], 0, 16);
+            memcpy(oids[i], &i, sizeof i);
+            struct ecpart *ep = calloc(1, sizeof *ep);
+            ep->tier = x.t;
+            ep->volume = 0;
+            memcpy(ep->rec.oid, oids[i], 16);
+            atomic_init(&pts[i].ec, ep);
+            CHECK(ecgc_hold(x.t, &pts[i], 0, oids[i]) == 0);
+        }
+        ecgc_counters c;
+        ecgc_get_counters(x.t, &c);
+        CHECK(c.holds == NH);
+        for (size_t i = 0; i < NH; i++)
+            CHECK(ecgc_held(x.t, 0, oids[i]));
+        for (size_t i = 0; i < NH; i++) {
+            ecgc_last_unref(&pts[i]);
+            if (ecgc_mutant != GC_MUT_UNREFLEAK)
+                CHECK(!ecgc_held(x.t, 0, oids[i]));
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        ecgc_get_counters(x.t, &c);
+        if (ecgc_mutant != GC_MUT_UNREFLEAK)
+            CHECK(c.holds == 0);
+        printf("  reopen_hold: old engine reader kept chunks across reopen & retire; %d O(1) holds/unrefs in %lld ms\n",
+               NH, (long long)ms);
+    }
+    free(pts);
+    free(oids);
+    tier_put(x.t);
+    x.t = NULL;
+}
+
+/* ------------------------------------------------------------ GCMK crashfs power loss */
+
+static char GPBASE[PATH_MAX];
+static uint8_t GP_OIDS[3][16];
+
+static void make_gcmk_base(void)
+{
+    char name0[96], name1[96];
+    fresh("gpbase", GPBASE, sizeof GPBASE);
+    h x;
+    CHECK(h_open(&x, GPBASE, 3600) == 0);
+    if (!x.db)
+        return;
+    write_day(x.db, 0);
+    write_day(x.db, 1);
+    write_day(x.db, 2);
+    settle_day(&x, 0, GP_OIDS[0], name0);
+    settle_day(&x, 1, GP_OIDS[1], name1);
+    chunk_random(GP_OIDS[2], 16);
+    CHECK(eng_drop_before(x.db, DAY) == 0); /* day 0 retired_, day 1 still listed */
+    h_close(&x);
+}
+
+static int child_gcmk(const char *dir)
+{
+    h x;
+    atomic_store(&ecgc_test_nosweep, true);
+    int rc = h_open(&x, dir, 3600);
+    atomic_store(&ecgc_test_nosweep, false);
+    if (rc != 0)
+        return 3;
+    uint8_t oids[3][16];
+    /* Read oids from a small side file written by parent so child uses exact same oids */
+    char opath[PATH_MAX + 32];
+    snprintf(opath, sizeof opath, "%s/oids.bin", dir);
+    int fd = open(opath, O_RDONLY);
+    if (fd < 0 || read(fd, oids, sizeof oids) != (ssize_t)sizeof oids) {
+        if (fd >= 0)
+            close(fd);
+        h_close(&x);
+        return 4;
+    }
+    close(fd);
+    mk m = {.type = MK_GC, .span = 1};
+    m.u.gc = (mk_gc){.reason = MK_GC_RETIRED, .noids = 3, .oids = (const uint8_t *)oids};
+    if (ecgcmk_apply(x.db, 10, &m) != 0) {
+        h_close(&x);
+        return 5;
+    }
+    mk d1 = {.type = MK_GC, .span = 1};
+    d1.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 2, .oids = (const uint8_t *)oids};
+    if (ecgcmk_apply(x.db, 11, &d1) != 0) {
+        h_close(&x);
+        return 6;
+    }
+    mk d2 = {.type = MK_GC, .span = 1};
+    d2.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 1, .oids = (const uint8_t *)&oids[2]};
+    if (ecgcmk_apply(x.db, 12, &d2) != 0) {
+        h_close(&x);
+        return 7;
+    }
+    h_close(&x);
+    return 0;
+}
+
+static void gcmk_power_case(void)
+{
+    /* Mid-file corruption check first (works even without crashfs) */
+    {
+        char dir[PATH_MAX];
+        fresh("gpcorr", dir, sizeof dir);
+        h x;
+        CHECK(h_open(&x, dir, 3600) == 0);
+        if (x.db) {
+            uint8_t o[2][16];
+            chunk_random(o[0], 16);
+            chunk_random(o[1], 16);
+            mk m = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_ORPHAN, .noids = 2, .oids = (const uint8_t *)o}};
+            CHECK(ecgcmk_apply(x.db, 5, &m) == 0);
+            CHECK(ecgcmk_pending_count(x.db) == 2 && ecgcmk_pending_has(x.db, o[0]) && ecgcmk_pending_has(x.db, o[1]));
+            h_close(&x);
+            /* Corrupt record 0 while record 1 stays valid -> open must return TSDB_ERR_CORRUPT */
+            char gp[PATH_MAX + 32];
+            snprintf(gp, sizeof gp, "%s/db/GCMK", dir);
+            int fd = open(gp, O_RDWR);
+            CHECK(fd >= 0);
+            if (fd >= 0) {
+                uint8_t b = 0;
+                CHECK(pread(fd, &b, 1, 20) == 1);
+                b ^= 0xff;
+                CHECK(pwrite(fd, &b, 1, 20) == 1);
+                close(fd);
+            }
+            CHECK(h_open(&x, dir, 3600) == TSDB_ERR_CORRUPT);
+        }
+    }
+    if (access(SHIM, R_OK) != 0) {
+        printf("  gcmk_power: skipped crashfs loop (no %s)\n", SHIM);
+        return;
+    }
+    make_gcmk_base();
+    char opath[PATH_MAX + 32];
+    snprintf(opath, sizeof opath, "%s/oids.bin", GPBASE);
+    int ofd = open(opath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(ofd >= 0 && write(ofd, GP_OIDS, sizeof GP_OIDS) == (ssize_t)sizeof GP_OIDS);
+    if (ofd >= 0)
+        close(ofd);
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/gpl", S);
+    int crashes = 0, seeds = quick ? 2 : 3;
+    bool finished = false;
+    for (int k = 0; k < 400 && !finished; k++) {
+        for (int sd = 0; sd < seeds; sd++) {
+            sh("rm -rf '%s'; cp -a '%s' '%s'", dir, GPBASE, dir);
+            int code = run_child_mode("--child-gcmk", dir, k, k * 13 + sd + 1);
+            CHECK(code == 99 || code == 0);
+            if (code != 99 && code != 0) {
+                fprintf(stderr, "  (gcmk power loss at step %d: child said %d)\n", k, code);
+                k = 1 << 20;
+                break;
+            }
+            crashes += code == 99;
+            finished = code == 0;
+            /* Clean reopen must succeed (torn tail truncated) and idempotently replay MK_GC + DONE */
+            h x;
+            atomic_store(&ecgc_test_nosweep, true);
+            int orc = h_open(&x, dir, 3600);
+            atomic_store(&ecgc_test_nosweep, false);
+            CHECK(orc == 0);
+            if (orc != 0 || !x.db) {
+                k = 1 << 20;
+                break;
+            }
+            mk m = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_RETIRED, .noids = 3, .oids = (const uint8_t *)GP_OIDS}};
+            CHECK(ecgcmk_apply(x.db, 10, &m) == 0);
+            CHECK(ecgcmk_pending_count(x.db) == 3);
+            mk d = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_DONE, .noids = 3, .oids = (const uint8_t *)GP_OIDS}};
+            CHECK(ecgcmk_apply(x.db, 12, &d) == 0);
+            CHECK(ecgcmk_pending_count(x.db) == 0);
+            h_close(&x);
+        }
+    }
+    CHECK(finished);
+    printf("  gcmk_power: %d crashfs power losses across GCMK append/done/compact + mid-file corruption check OK\n",
+           crashes);
+}
+
+/* ------------------------------------------------------------ cluster MK_GC unit tests (kills all 4 cluster mutants) */
+
+typedef struct mock_jr {
+    atomic_bool withhold_commit;
+    atomic_int mkgc_appends;
+} mock_jr;
+
+static int mj_admit(void *ctx, eng *db, uint64_t fno, uint32_t n)
+{
+    (void)ctx, (void)db, (void)fno, (void)n;
+    return 0;
+}
+static void mj_bytes(void *ctx, eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len, uint64_t first,
+                     uint64_t last_fno)
+{
+    (void)first;
+    mock_jr *m = ctx;
+    uint64_t last = last_fno;
+    for (size_t at = 0; at < len;) {
+        wal_rec wr;
+        size_t sz = wal_record((const uint8_t *)buf + at, len - at, seq, off + at, &wr);
+        if (!sz)
+            break;
+        if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_GC)
+            atomic_fetch_add(&m->mkgc_appends, 1);
+        last = wr.fno + wr.span - 1;
+        at += sz;
+    }
+    if (last && !atomic_load(&m->withhold_commit))
+        eng_leader_commit(db, last);
+}
+static void mj_synced(void *ctx, eng *db, uint64_t fno) { (void)ctx, (void)db, (void)fno; }
+static int mj_wait(void *ctx, eng *db, uint64_t pos)
+{
+    mock_jr *m = ctx;
+    (void)pos;
+    if (atomic_load(&m->withhold_commit)) {
+        eng_leader_depose(db);
+        return TSDB_ERR_INDETERMINATE;
+    }
+    return 0;
+}
+static int mj_ship(void *ctx, eng *db, const char *s, const char *n, uint64_t sz)
+{
+    (void)ctx, (void)db, (void)s, (void)n, (void)sz;
+    return 0;
+}
+
+typedef struct mock_cops_state {
+    atomic_bool suspended;
+    _Atomic uint64_t copy_epoch;
+} mock_cops_state;
+
+static mock_cops_state MC;
+
+static uint64_t mc_epoch_fn(void *arg, uint32_t vol)
+{
+    (void)arg, (void)vol;
+    return atomic_load(&MC.copy_epoch);
+}
+static bool mc_suspended(void *ctx)
+{
+    (void)ctx;
+    return atomic_load(&MC.suspended);
+}
+static int mc_del_gc(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch, uint64_t mk_pos)
+{
+    if (mk_pos == 0 || epoch == 0)
+        return TSDB_ERR_INVALID;
+    return coldops_dir.del(ctx, oid, pos, epoch, COLD_DEL_MKGC);
+}
+static cold_ops MC_OPS;
+
+static void make_cluster_dir(const char *dir)
+{
+    char dbp[PATH_MAX + 8];
+    snprintf(dbp, sizeof dbp, "%s/db", dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.partition_classes = 0;
+    o.wal_sync_ms = 0;
+    eng *db = NULL;
+    CHECK(eng_open(dbp, &o, &db) == 0 && db != NULL);
+    if (db)
+        eng_close(db);
+    int fd = open(dbp, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0 && meta_require(fd, true, META_REQ_CLUSTER | META_REQ_REPLICA | META_REQ_EC) == 0);
+    if (fd >= 0)
+        close(fd);
+    char mp[PATH_MAX + 32];
+    snprintf(mp, sizeof mp, "%s/META", dbp);
+    FILE *mf = fopen(mp, "a");
+    CHECK(mf != NULL);
+    if (mf) {
+        fputs("volume_uuid=7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b\n", mf);
+        fclose(mf);
+    }
+}
+
+static int open_cluster_leader(h *x, const char *dir, uint64_t lead_epoch, mock_jr *mj, struct jr_ops *jops)
+{
+    MC_OPS = coldops_dir;
+    MC_OPS.del_gc = mc_del_gc;
+    MC_OPS.gc_suspended = mc_suspended;
+    atomic_store(&MC.copy_epoch, lead_epoch);
+    char dbp[PATH_MAX + 8], spec[8192];
+    snprintf(dbp, sizeof dbp, "%s/db", dir);
+    int n = snprintf(spec, sizeof spec, "k=%d,m=%d,cache_mb=64,dirs=", K, M);
+    for (int i = 0; i < NST; i++)
+        n += snprintf(spec + n, sizeof spec - (size_t)n, "%s%s/st%d", i ? ":" : "", dir, i);
+    setenv("TSDB_TEST_TIER", spec, 1);
+    setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+    atomic_store(&ecgc_test_manual, true);
+    int rc = tier_open(dbp, NULL, &x->t);
+    unsetenv("TSDB_TEST_TIER");
+    unsetenv("TSDB_TEST_TIER_I_KNOW");
+    if (rc)
+        return rc;
+    ecsettle_tier_quiesce(x->t);
+    x->rounds = atomic_load(&settle_rounds);
+    atomic_store(&eckeep_test_pause, true);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.partition_classes = 0;
+    o.wal_sync_ms = 0;
+    o.obsolete_part_lifetime_s = 0;
+    tier_attach at = {.ops = &MC_OPS, .make = coldops_dir_make, .epoch = mc_epoch_fn, .lead_epoch = lead_epoch};
+    tier_want_attach(x->t, 0, &at);
+    rc = eng_open_leader(dbp, &o, &x->db);
+    tier_want(NULL, 0);
+    if (rc) {
+        tier_put(x->t);
+        x->t = NULL;
+        return rc;
+    }
+    *jops = (struct jr_ops){.ctx = mj, .admit = mj_admit, .bytes = mj_bytes, .synced = mj_synced, .wait = mj_wait,
+                            .ship = mj_ship};
+    rc = eng_leader_attach(x->db, jops);
+    if (rc == 0)
+        eng_leader_commit(x->db, x->db->fno_next - 1);
+    return rc;
+}
+
+static void put_object_epoch(h *x, uint64_t epoch, const uint8_t *b, size_t len, uint8_t oid[16])
+{
+    chunk_geom g;
+    CHECK(chunk_geom_derive(&g, K, M, len) == 0);
+    uint64_t *sums = malloc(chunk_sums_total(&g) * sizeof *sums);
+    chunk_random(oid, 16);
+    CHECK(chunk_be_see_epoch(tier_backend(x->t), x->db->tier_vol, epoch) == 0);
+    CHECK(chunk_be_put_object(tier_backend(x->t), x->db->tier_vol, tier_vuuid(x->db), oid, &g, epoch, b, ~0u, sums) ==
+          0);
+    note(oid, (int)(g.k + g.m));
+    free(sums);
+}
+
+static void cluster_gc_case(void)
+{
+    meta_cluster_open_allow(true);
+    atomic_store(&ecgc_test_orphan_grace_ms, 0);
+    static uint8_t junk[200000];
+    memset(junk, 0x3c, sizeof junk);
+
+    /* 1. Uncommitted MK_GC must NEVER delete chunks (kills gcuncommitted). */
+    {
+        char dir[PATH_MAX], name[96];
+        uint8_t oid[16];
+        fresh("cg_uncom", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            write_day(x.db, 0);
+            write_day(x.db, 1);
+            settle_day(&x, 0, oid, name);
+            CHECK(eng_drop_before(x.db, DAY) == 0);
+            atomic_store(&mj.withhold_commit, true);
+            ecgc_tier_work(x.t);
+            CHECK(chunks(dir, oid) == npos(oid)); /* fails with gcuncommitted! */
+            h_close(&x);
+        }
+    }
+
+    /* 2. WAL record naming an object (MK_COLD, no listed .ec on disk) protects it from orphan sweep (kills gcnamedorphan). */
+    {
+        char dir[PATH_MAX];
+        uint8_t oid_log[16], oid_orph[16];
+        fresh("cg_wal", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        atomic_store(&MC.suspended, false);
+        /* Epoch 1 writes two objects (no .ec files); then epoch 2 takes over. */
+        CHECK(open_cluster_leader(&x, dir, 1, &mj, &jops) == 0);
+        if (x.db) {
+            put_object_epoch(&x, 1, junk, sizeof junk, oid_log);
+            put_object_epoch(&x, 1, junk, sizeof junk, oid_orph);
+            h_close(&x);
+        }
+        memset(&mj, 0, sizeof mj);
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            CHECK(chunk_be_see_epoch(tier_backend(x.t), x.db->tier_vol, 2) == 0);
+            /* Append an MK_COLD naming oid_log (no .ec file on disk) into the leader's WAL. */
+            uint8_t obuf[64];
+            uint8_t dummy_rec[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            size_t olen = mk_cold_obj_put(obuf, oid_log, dummy_rec, sizeof dummy_rec);
+            mk cm = {.type = MK_COLD, .span = 1};
+            cm.u.cold = (mk_cold){.z = 1, .flush_through = 0, .stripe_version = 1, .key = 0, .nobjs = 1,
+                                  .objs = obuf, .objs_len = olen};
+            uint64_t cpos = 0;
+            CHECK(jr_markers_append(x.db, &cm, 1, "test cold", &cpos) == 0 && cpos > 0);
+            CHECK(jr_markers_wait(x.db, cpos, "test cold") == 0);
+            ecgc_tier_work(x.t);
+            CHECK(chunks(dir, oid_orph) == 0);
+            CHECK(chunks(dir, oid_log) == npos(oid_log)); /* fails with gcnamedorphan! */
+            CHECK(ecgcmk_pending_count(x.db) == 0);
+            h_close(&x);
+        }
+    }
+
+    /* 3. gc_suspended stops orphan GC while retired-object GC continues (kills gcsuspendignored). */
+    {
+        char dir[PATH_MAX], name[96];
+        uint8_t oid_susp[16], oid_ret[16];
+        fresh("cg_susp", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        atomic_store(&MC.suspended, true);
+        CHECK(open_cluster_leader(&x, dir, 1, &mj, &jops) == 0);
+        if (x.db) {
+            put_object_epoch(&x, 1, junk, sizeof junk, oid_susp);
+            h_close(&x);
+        }
+        memset(&mj, 0, sizeof mj);
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            CHECK(chunk_be_see_epoch(tier_backend(x.t), x.db->tier_vol, 2) == 0);
+            write_day(x.db, 0);
+            write_day(x.db, 1);
+            settle_day(&x, 0, oid_ret, name);
+            CHECK(eng_drop_before(x.db, DAY) == 0);
+            ecgc_tier_work(x.t);
+            CHECK(chunks(dir, oid_ret) == 0);               /* retired GC runs while suspended */
+            CHECK(chunks(dir, oid_susp) == npos(oid_susp)); /* orphan kept while suspended; fails gcsuspendignored! */
+            atomic_store(&MC.suspended, false);
+            ecgc_tier_work(x.t);
+            CHECK(chunks(dir, oid_susp) == 0); /* resumed: orphan deleted */
+            h_close(&x);
+        }
+    }
+
+    /* 4. Replica ecgcmk_apply retires still-listed .ec, unlinks retired_, records GCMK (kills gcreplicanoop). */
+    {
+        char dir[PATH_MAX], name[96], dbp[PATH_MAX + 8];
+        uint8_t oid[16];
+        fresh("cg_rep", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            write_day(x.db, 0);
+            settle_day(&x, 0, oid, name); /* .ec stays LISTED on disk */
+            h_close(&x);
+        }
+        /* Reopen directory as a replica (TTL behind: .ec is still listed) and apply MK_GC. */
+        snprintf(dbp, sizeof dbp, "%s/db", dir);
+        char spec[8192];
+        int n = snprintf(spec, sizeof spec, "k=%d,m=%d,cache_mb=64,dirs=", K, M);
+        for (int i = 0; i < NST; i++)
+            n += snprintf(spec + n, sizeof spec - (size_t)n, "%s%s/st%d", i ? ":" : "", dir, i);
+        setenv("TSDB_TEST_TIER", spec, 1);
+        setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+        atomic_store(&ecgc_test_manual, true);
+        tier *rt = NULL;
+        CHECK(tier_open(dbp, NULL, &rt) == 0);
+        unsetenv("TSDB_TEST_TIER");
+        unsetenv("TSDB_TEST_TIER_I_KNOW");
+        if (rt) {
+            ecsettle_tier_quiesce(rt);
+            tsdb_options o;
+            tsdb_options_init(&o);
+            o.merge_threads = 0;
+            o.create_volumes = 0;
+            o.partition_classes = 0;
+            o.wal_sync_ms = 0;
+            tier_want(rt, 0);
+            eng *rep = NULL;
+            CHECK(eng_open_replica(dbp, &o, 0, &rep) == 0 && rep != NULL);
+            tier_want(NULL, 0);
+            if (rep) {
+                CHECK(exists(dir, name));
+                mk gm = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_RETIRED, .noids = 1, .oids = oid}};
+                CHECK(ecgcmk_apply(rep, 50, &gm) == 0);
+                CHECK(!exists(dir, name)); /* fails with gcreplicanoop! */
+                char rname[128];
+                snprintf(rname, sizeof rname, "retired_%s", name);
+                CHECK(!exists(dir, rname));
+                CHECK(ecgcmk_pending_has(rep, oid)); /* fails with gcreplicanoop! */
+                mk dm = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_DONE, .noids = 1, .oids = oid}};
+                CHECK(ecgcmk_apply(rep, 51, &dm) == 0);
+                CHECK(ecgcmk_pending_count(rep) == 0);
+                eng_close(rep);
+            }
+            tier_put(rt);
+        }
+    }
+
+    /* 5. FENCED stops GC + r8f F4 (deposed leader with caught-up copy still uses its own lead_epoch). */
+    {
+        char dir[PATH_MAX];
+        uint8_t oid[16];
+        fresh("cg_fence", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            put_object_epoch(&x, 2, junk, sizeof junk, oid);
+            /* Simulate failover: metadata copy jumps to epoch 3 and chunk stores advance to epoch 3! */
+            atomic_store(&MC.copy_epoch, 3);
+            CHECK(coldvol_epoch(tier_cold(x.db)) == 2); /* r8f F4: still pinned to own lead epoch 2! */
+            CHECK(chunk_be_see_epoch(tier_backend(x.t), x.db->tier_vol, 3) == 0);
+            mk gm = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_ORPHAN, .noids = 1, .oids = oid}};
+            CHECK(ecgcmk_apply(x.db, 77, &gm) == 0);
+            ecgc_tier_work(x.t);
+            CHECK(ecgcmk_is_fenced(x.db));
+            CHECK(chunks(dir, oid) == npos(oid)); /* refused FENCED, chunks intact */
+            CHECK(ecgcmk_pending_has(x.db, oid)); /* kept on pending list */
+            h_close(&x);
+        }
+    }
+    atomic_store(&ecgc_test_orphan_grace_ms, -1);
+    meta_cluster_open_allow(false);
+    printf("  cluster_gc: uncommitted gate, WAL log scan, gc_suspended, replica apply, FENCED + r8f F4 OK\n");
+}
+
 static void run(void)
 {
     hold_case(0);
     hold_case(1);
+    reopen_hold_case();
     sweep_case();
     down_case();
     thread_case();
@@ -809,12 +1439,14 @@ static void run(void)
     midround_case();
     retry_case();
     power_case();
+    gcmk_power_case();
+    cluster_gc_case();
 }
 #endif
 
 int main(int argc, char **argv)
 {
-    const char *child_dir = NULL, *scratch = NULL;
+    const char *child_dir = NULL, *child_gcmk_dir = NULL, *scratch = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutant") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -823,12 +1455,13 @@ int main(int argc, char **argv)
                 if (!strcmp(MUTANTS[j].name, m))
                     ecgc_mutant = MUTANTS[j].m, ok = true;
             if (!ok) {
-                fprintf(stderr, "usage: test_ecgc [--quick] [--mutant gcunlinkfirst|gcunrefleak|gcnohold|sweeplive|"
-                                "sweepinflight|sweepforeign|unlistednoop|noretrytimer|noafter] [SCRATCH]\n");
+                fprintf(stderr, "usage: test_ecgc [--quick] [--mutant NAME] [SCRATCH]\n");
                 return 2;
             }
         } else if (!strcmp(argv[i], "--child") && i + 1 < argc) {
             child_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--child-gcmk") && i + 1 < argc) {
+            child_gcmk_dir = argv[++i];
         } else if (!strcmp(argv[i], "--quick")) {
 #ifdef TSDB_EC
             quick = true;
@@ -839,6 +1472,7 @@ int main(int argc, char **argv)
     }
 #ifndef TSDB_EC
     (void)child_dir;
+    (void)child_gcmk_dir;
     (void)scratch;
     (void)mutant_name;
     printf("test_ecgc: skipped: no TSDB_EC in this build\n");
@@ -846,6 +1480,8 @@ int main(int argc, char **argv)
 #else
     if (child_dir)
         return child(child_dir);
+    if (child_gcmk_dir)
+        return child_gcmk(child_gcmk_dir);
     if (!realpath(argv[0], SELF))
         snprintf(SELF, sizeof SELF, "%s", argv[0]);
     const char *slash = strrchr(SELF, '/');

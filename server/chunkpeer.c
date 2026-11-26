@@ -687,9 +687,9 @@ static int p_del(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch,
     pctx *p = ctx;
     if (chunkpeer_mutant != CP_MUT_DELBEFOREGC) {
         if (!atomic_exchange(&p->del_said, true))
-            fprintf(stderr, "tsdbd: volume %" PRIu32 ": chunks of a cluster volume are deleted only by a committed MK_GC, "
-                            "which this build does not have: the %s is kept for later\n", p->volume,
-                    reason == COLD_DEL_SWEEP ? "open's sweep of orphans" : "delete of a retired part's object");
+            fprintf(stderr, "tsdbd: volume %" PRIu32 ": direct chunk deletes on a cluster volume are refused "
+                            "(chunks are deleted only by a committed MK_GC): %s refused\n", p->volume,
+                    reason == COLD_DEL_SWEEP ? "open's sweep of orphans" : "direct delete");
         return TSDB_ERR_UNAVAILABLE;
     }
     struct chunkpeer_view v; /* planted: R7's delete, through to the member */
@@ -708,14 +708,44 @@ static int p_del(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch,
     return rc ? rc : arc;
 }
 
+static int p_del_gc(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch, uint64_t mk_pos)
+{
+    pctx *p = ctx;
+    if (mk_pos == 0 || epoch == 0)
+        return TSDB_ERR_INVALID;
+    if (!p_writable(p))
+        return TSDB_ERR_UNAVAILABLE;
+    struct chunkpeer_view v;
+    int rc = view_of(p, &v);
+    if (rc)
+        return rc;
+    if (pos >= v.nstripe)
+        return TSDB_ERR_NOTFOUND;
+    struct cs_req r;
+    req_init(&r, CS_OP_DEL, p->volume, epoch, p->vuuid, oid, pos);
+    int32_t arc = 0;
+    uint8_t *b = NULL;
+    size_t bn = 0;
+    rc = p->cp->net.call(p->cp->net.arg, v.stripe[pos], &r, timeout_of(p->cp), &arc, &b, &bn);
+    free(b);
+    int res = rc ? rc : arc;
+    if (res == 0)
+        see_fence(p, epoch);
+    return res;
+}
+
 /* ---------------------------------------------------------------- list */
 static int list_entry(const uint8_t *e, chunk_listed *c, uint8_t vuuid[16])
 {
     memset(c, 0, sizeof *c);
     memcpy(c->oid, e, 16);
     c->pos = get16(e + 16);
+    c->size = get64(e + 18);
+    c->epoch = get64(e + 26);
+    memcpy(c->vuuid, e + 34, 16);
     if (vuuid)
-        memcpy(vuuid, e + 34, 16);
+        memcpy(vuuid, c->vuuid, 16);
+    c->status = e[50];
     return e[50]; /* the entry's status */
 }
 
@@ -761,7 +791,6 @@ static int p_list_names(void *ctx, chunk_list_fn fn, void *fctx)
             for (uint32_t j = 0; j < n && rc == 0; j++) {
                 chunk_listed c;
                 list_entry(b + 5 + (size_t)j * CS_LIST_ENTRY, &c, NULL);
-                c.status = CHUNK_ST_OK;
                 c.store = (int)v.stripe[i]; /* our token: the member (owner asks it) */
                 rc = fn(fctx, &c);
                 memcpy(coid, c.oid, 16);
@@ -938,6 +967,18 @@ static uint64_t p_stripe_version(void *ctx)
     return view_of(ctx, &v) == 0 ? v.stripe_version : 0;
 }
 
+static bool p_gc_suspended(void *ctx)
+{
+    struct chunkpeer_view v;
+    return view_of(ctx, &v) != 0 || v.gc_suspended != 0;
+}
+
+static unsigned p_nstripe(void *ctx)
+{
+    struct chunkpeer_view v;
+    return view_of(ctx, &v) == 0 ? v.nstripe : 0;
+}
+
 static void p_free(void *ctx) { free(ctx); }
 
 const cold_ops coldops_peer = {
@@ -956,6 +997,9 @@ const cold_ops coldops_peer = {
     .all_up = p_all_up,
     .ctx_free = p_free,
     .stripe_version = p_stripe_version,
+    .del_gc = p_del_gc,
+    .gc_suspended = p_gc_suspended,
+    .nstripe = p_nstripe,
 };
 
 /* ---------------------------------------------------------------- in-process delivery */

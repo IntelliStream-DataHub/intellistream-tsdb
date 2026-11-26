@@ -31,8 +31,12 @@
 
 typedef struct cold_obj cold_obj; /* an object open for reading: the ops' own type */
 
-/* Why an object's chunks are deleted (for the ops' log lines and, in a cluster, their refusal until MK_GC). */
-enum { COLD_DEL_GC = 1 /* a retired .ec part's object */, COLD_DEL_SWEEP /* the open's sweep of orphans */ };
+/* Why an object's chunks are deleted (for the ops' log lines and, in a cluster, their refusal for direct deletes). */
+enum {
+    COLD_DEL_GC = 1,    /* a retired .ec part's object (R7 single server) */
+    COLD_DEL_SWEEP = 2, /* the open's sweep of orphans (R7 single server) */
+    COLD_DEL_MKGC = 3,  /* a committed MK_GC marker (R8 cluster volume, r8k-gc) */
+};
 
 typedef struct cold_ops {
     const char *name; /* "dir", "peer": for messages */
@@ -72,6 +76,17 @@ typedef struct cold_ops {
      * a leader's settle puts under one and carries it in MK_COLD only while it is still the copy's. NULL: 0 (the
      * directory ops, one server: the list never changes). */
     uint64_t (*stripe_version)(void *ctx);
+    /* R8 (r8k-gc, E14, D13): delete position `pos` of `oid` at `epoch` under a committed MK_GC at log position `mk_pos`
+     * (must be > 0). Returns 0, TSDB_ERR_NOTFOUND (ABSENT counts as gone), CHUNK_ERR_FENCED (caller stops GC), or
+     * another error (kept for retry). NULL: fall back to `del(..., COLD_DEL_MKGC)`. */
+    int (*del_gc)(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t epoch, uint64_t mk_pos);
+    /* R8 (r8k-gc, E14): whether orphan collection is suspended for this volume (`gc_suspended` in the metadata copy:
+     * set by force-leader / restore until `volume gc resume`). NULL: false. */
+    bool (*gc_suspended)(void *ctx);
+    /* R8 (r8k-gc): number of positions in the volume's stripe group (0 if unknown). NULL: use settings k + m. */
+    unsigned (*nstripe)(void *ctx);
+    /* R8 (r8k-gc): read a listed chunk's vuuid and writer epoch when list_names does not fill them (directory ops). */
+    int (*chunk_info)(void *ctx, const chunk_listed *c, uint8_t vuuid[16], uint64_t *epoch);
 } cold_ops;
 
 /* ------------------------------------------------------------ the directory ops (src/coldops_dir.c) */

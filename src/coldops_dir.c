@@ -103,6 +103,22 @@ static int d_owner(void *ctx, const chunk_listed *c, uint8_t vuuid[16])
     return rc;
 }
 
+static int d_chunk_info(void *ctx, const chunk_listed *c, uint8_t vuuid[16], uint64_t *epoch)
+{
+    dirctx *d = ctx;
+    chunk_backend *be = wbe(d);
+    chunk_store *st = be ? chunk_be_open_store(be, c->store) : NULL;
+    chunk_hdr h;
+    int rc = st ? chunk_store_peek(st, d->volume, c->oid, c->pos, &h) : TSDB_ERR_UNAVAILABLE;
+    if (rc == 0) {
+        if (vuuid)
+            memcpy(vuuid, h.vuuid, 16);
+        if (epoch)
+            *epoch = h.epoch;
+    }
+    return rc;
+}
+
 static bool d_all_up(void *ctx)
 {
     dirctx *d = ctx;
@@ -189,6 +205,7 @@ const cold_ops coldops_dir = {
     .writable = d_writable,
     .all_up = d_all_up,
     .ctx_free = d_free,
+    .chunk_info = d_chunk_info,
 };
 
 int coldops_dir_make(void *arg, struct tier *t, uint32_t volume, const uint8_t vuuid[16], void **ctx)

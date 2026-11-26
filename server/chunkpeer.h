@@ -60,6 +60,7 @@ struct chunkpeer_view {
     int caught_up; /* cluster_copy_caught_up_at of that copy */
     uint64_t epoch, stripe_version;
     unsigned k, m, nstripe;
+    uint8_t gc_suspended; /* R8 (E14): orphan collection suspended until GC_RESUME */
     uint32_t stripe[CHUNK_POS_MAX]; /* position -> member */
 };
 /* 0 with *v, TSDB_ERR_NOTFOUND when there is no copy or it does not hold `volume` as an ec volume. Any thread. */

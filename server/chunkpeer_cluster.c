@@ -21,6 +21,7 @@
 #include "chunksrv.h"
 #include "cluster.h"
 #include "meta.h"
+#include "repld.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -53,6 +54,19 @@ static uint32_t self_id(const struct cluster_copy *c) { return c ? c->self : 0; 
 static int hold_hook_ms;
 static char hold_hook_path[512];
 static atomic_bool hold_done;
+static char pause_midput_path[512];
+
+static void pause_midput_hook(unsigned pos)
+{
+    if (pos != 0 || !pause_midput_path[0] || access(pause_midput_path, F_OK) != 0)
+        return;
+    fprintf(stderr, "tsdbd: test: pause_midput: paused after position 0\n");
+    while (access(pause_midput_path, F_OK) == 0) {
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "tsdbd: test: pause_midput: resumed before position 1\n");
+}
 
 static void hold_hook(struct chunksrv *cs)
 {
@@ -115,6 +129,8 @@ static int net_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd
     if (hold_hook_ms > 0) /* TSDB_CHUNKPEER_TEST=holdput=MS: a put in flight across tsdbd's shutdown (test_cluster) */
         hold_hook(cs);
     chunksrv_cluster_release();
+    if (rc == 0 && pause_midput_path[0])
+        pause_midput_hook(m->pos);
     return rc;
 }
 
@@ -134,6 +150,7 @@ static int view(void *arg, uint32_t volume, struct chunkpeer_view *v)
         v->k = cv->ec_k;
         v->m = cv->ec_m;
         v->nstripe = cv->nstripe;
+        v->gc_suspended = cv->gc_suspended;
         memcpy(v->stripe, cv->stripe, cv->nstripe * sizeof *cv->stripe);
         rc = 0;
     }
@@ -162,6 +179,9 @@ static int attach(void *arg, uint32_t volume, tier_attach *a, tier_settings *s)
     a->make_arg = cp;
     a->epoch = chunkpeer_epoch;
     a->epoch_arg = cp;
+    uint64_t le = 0;
+    if (repld_leading(volume, &le) > 0 && le > 0)
+        a->lead_epoch = le; /* r8f F4: pin this leader's own epoch, never a newer leader's from the copy */
     return 0;
 }
 
@@ -194,6 +214,8 @@ int chunkpeer_cluster_start(const char *stage_dir)
         const char *colon = strchr(th + 8, ':');
         if (colon)
             snprintf(hold_hook_path, sizeof hold_hook_path, "%s", colon + 1);
+    } else if (th && !strncmp(th, "pause_midput=", 13)) {
+        snprintf(pause_midput_path, sizeof pause_midput_path, "%s", th + 13);
     }
     const char *mu = getenv("TSDB_CHUNKPEER_MUTANT");
     if (mu && *mu) {

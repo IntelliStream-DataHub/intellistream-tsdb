@@ -14915,7 +14915,7 @@ static void scen_ecbasic(void)
     printf("  the copy caught up raises it: the next day settles\n");
 
     /* D13: chunks of a cluster volume are deleted only by a committed MK_GC (r8k). The rows expired, the .ec parts
-     * are retired, and every chunk stays (mutant delbeforegc deletes them). */
+     * are retired, and within obsolete_part_lifetime_s (480 s) every chunk stays (no direct delete). */
     int nch = ecb_chunks(num);
     if (nch == 0)
         die("no chunk files of e42 in the stores");
@@ -14923,16 +14923,14 @@ static void scen_ecbasic(void)
         for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
             if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
                 die("retention of e42's series %d: %s", s, ers(rc));
-    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) != 0 || !log_has(L, "deleted only by a committed MK_GC");
-         usleep(200000))
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) != 0; usleep(200000))
         if (now_ms() - t0 > 60000)
-            die("e42's expired .ec parts: %d still listed, the delete %s refused in 60 s", ecb_ec_parts(L, num),
-                log_has(L, "deleted only by a committed MK_GC") ? "was" : "not");
-    usleep(2000000); /* the gc worker's retries */
+            die("e42's expired .ec parts: %d still listed 60 s after retention", ecb_ec_parts(L, num));
+    usleep(2000000); /* within obsolete_part_lifetime_s: no direct delete */
     int nch2 = ecb_chunks(num);
     if (nch2 != nch)
-        die("e42's chunks: %d before the drop, %d after: deleted with no MK_GC", nch, nch2);
-    printf("  the .ec parts dropped by retention: the delete refused, %d chunk files kept\n", nch);
+        die("e42's chunks: %d before the drop, %d after: deleted before lifetime", nch, nch2);
+    printf("  the .ec parts dropped by retention: retired cleanly, %d chunk files kept within lifetime\n", nch);
 
     /* A settle's put in flight at SIGTERM (the r8f review's F3): the engines' threads call into the chunk server until
      * tsdb_close, after tsdbd frees it, so the free waits for every call holding it. The hook holds the first put once
@@ -15158,6 +15156,406 @@ static void scen_ec16(void)
     printf("  all five stripe members back: reads whole and equal to twin\n");
     tsdbc_close(ct);
     tsdbc_close(c);
+}
+
+/* Count retired_*.ec files in server i's v<num>. */
+static int ecb_retired_ec(int i, uint32_t num)
+{
+    char d[PATH_MAX + 80], p[PATH_MAX + 120];
+    server_dir(i, d, sizeof d);
+    snprintf(p, sizeof p, "%s/v%" PRIu32, d, num);
+    DIR *dd = opendir(p);
+    if (!dd)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(dd));) {
+        size_t l = strlen(e->d_name);
+        n += l > 11 && strncmp(e->d_name, "retired_", 8) == 0 && strcmp(e->d_name + l - 3, ".ec") == 0;
+    }
+    closedir(dd);
+    return n;
+}
+
+static void touch_file(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        die("touch %s: %s", path, strerror(errno));
+    fclose(f);
+}
+
+static int ecgc_leader_of(uint32_t num, int via, struct meta_volume *out)
+{
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(via, "e42", out) && out->leader) {
+            int s = server_of(out->leader);
+            if (s >= 0 && pids[s] > 0 && !stopped[s]) {
+                char lead[96];
+                snprintf(lead, sizeof lead, "volume %" PRIu32 ": leads epoch %" PRIu64 " ", num, out->epoch);
+                if (log_has(s, lead))
+                    return s;
+            }
+        }
+        if (now_ms() - t0 > 60000)
+            die("no active leader of e42 (volume %" PRIu32 ") after 60 s", num);
+    }
+}
+
+/* r8k-gc: cluster EC garbage collection via committed MK_GC (E14, §5.7, D13):
+ * 1. Kill leader between puts and MK_COLD commit (marker in replica log -> chunks kept; no marker -> orphan swept).
+ * 2. Failover after MK_GC commits and before CHUNK_DEL + replica whose TTL is behind lists .ec at MK_GC.
+ * 3. SIGSTOP old leader past failover, SIGCONT: puts and deletes refused FENCED (r8f F4), chunks become orphans.
+ * 4. force-leader suspends orphan GC until `tsdb cluster volume gc resume`. */
+static void scen_ecgc(void)
+{
+    scenario("ecgc");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#endif
+    static char trig_cold[PATH_MAX + 64], trig_midput[PATH_MAX + 64], trig_crashdel[PATH_MAX + 64],
+        trig_pausedel[PATH_MAX + 64];
+    snprintf(trig_cold, sizeof trig_cold, "%s/trig_cold", base);
+    snprintf(trig_midput, sizeof trig_midput, "%s/trig_midput", base);
+    snprintf(trig_crashdel, sizeof trig_crashdel, "%s/trig_crashdel", base);
+    snprintf(trig_pausedel, sizeof trig_pausedel, "%s/trig_pausedel", base);
+
+    static char penv_all[4 * PATH_MAX + 512];
+    snprintf(penv_all, sizeof penv_all,
+             "TSDB_REPLD_TEST=cutlinks,keepall "
+             "TSDB_ECGC_TEST=orphan_grace_ms=1000,poll_ms=200,lifetime_s=1,crash_before_del=%s,pause_beforedel=%s "
+             "TSDB_CHUNKPEER_TEST=pause_midput=%s TSDB_CRASH_AT=cold-after-marker:1@%s",
+             trig_crashdel, trig_pausedel, trig_midput, trig_cold);
+
+    for (int i = 0; i < 6; i++) {
+        envs[i] = "copy_probe=1";
+        penv[i] = penv_all;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+    struct view v;
+    view(0, &v);
+    uint8_t uuid[16];
+    memcpy(uuid, v.m.uuid, 16);
+    view_free(&v);
+
+    static char xa[6][PATH_MAX + 256];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i],
+                 "--chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200",
+                 sd);
+        restart_xargs(i, xa[i]);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+
+    uint32_t num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ec=4+2 add: %s (%s)", cluster_strerror(rc), text);
+
+    struct meta_volume e;
+    int L = ecgc_leader_of(num, 0, &e);
+    int reps[3], nreps = 0;
+    for (uint32_t k = 0; k < e.nrep && nreps < 3; k++)
+        reps[nreps++] = server_of(e.rep[k].node);
+    if (nreps != 3)
+        die("e42 has %d replicas, want 3", nreps);
+    int nonrep = -1;
+    for (int i = 0; i < 6; i++)
+        if (!ecb_is_rep(&e, i)) {
+            nonrep = i;
+            break;
+        }
+    printf("  e42 (volume %" PRIu32 ") led by server %d (replicas %d,%d,%d)\n", num, L, reps[0], reps[1], reps[2]);
+
+    tsdbc *c = client(L);
+    tsdb_sid ide[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL; /* 2024-01-01 */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecgc.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+    }
+
+    /* ---- Case 1a: Kill leader right after MK_COLD append (before commit).
+     * Replicas that received the marker keep its chunks (new leader commits it and serves all rows); if no replica
+     * received it before the crash, the new leader sweeps its orphan chunks via committed MK_GC and still serves
+     * every row from the young parts! Either way, all rows survive and no dangling orphan remains. */
+    touch_file(trig_cold);
+    ecb_write_day(c, ide, day0);
+    tsdbc_close(c);
+    c = NULL;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[L], &st, WNOHANG) == pids[L]) {
+            pids[L] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit cold-after-marker in 90 s", L);
+    }
+    unlink(trig_cold);
+    int oldL = L;
+    L = ecgc_leader_of(num, nonrep, &e);
+    if (L == oldL)
+        die("leader did not move after crash");
+    start(oldL);
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a;
+        for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 60000)
+                die("read series %d after cold-after-marker failover: %s", s, ers(rc));
+        if (a.n != 2 * ECB_ROWS)
+            die("series %d after cold-after-marker failover: %" PRIu64 " rows, want %d", s, a.n, 2 * ECB_ROWS);
+    }
+    /* Wait until day0 is settled on the new leader (either via the old MK_COLD or a fresh settle). */
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == 0; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("day0 not settled on new leader %d within 120 s", L);
+    printf("  case 1a (kill after MK_COLD append): new leader %d serves all rows (%d .ec, %d chunks)\n", L,
+           ecb_ec_parts(L, num), ecb_chunks(num));
+
+    /* ---- Case 1b: Kill leader mid-put (before MK_COLD is ever appended): orphan chunk swept by new leader via MK_GC. */
+    int ch_before_orph = ecb_chunks(num);
+    int pm0 = log_count(L, "pause_midput: paused after position 0");
+    touch_file(trig_midput);
+    ecb_write_day(c, ide, day0 + 2 * 86400000LL);
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_midput: paused after position 0") <= pm0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit pause_midput in 90 s", L);
+    if (ecb_chunks(num) <= ch_before_orph)
+        die("expected orphan chunk after pos 0 put (before %d, now %d)", ch_before_orph, ecb_chunks(num));
+    tsdbc_close(c);
+    c = NULL;
+    stop(L, SIGKILL);
+    unlink(trig_midput);
+    oldL = L;
+    L = ecgc_leader_of(num, nonrep, &e);
+    start(oldL);
+    await_isr(L, "e42", 3, 60000, "all 3 replicas back in ISR");
+    /* Wait for day0+2 to settle AND for the orphan chunk from oldL's killed put to be swept by MK_GC!
+     * Two settled days (day0 and day0+2) have exactly 12 chunks (2 * 6) — or 6 per .ec part. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        if (nec >= 2 && nch == nec * 6)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("orphan from killed mid-put not swept in 120 s (%d .ec parts, %d chunks)", nec, nch);
+    }
+    printf("  case 1b (kill mid-put before MK_COLD): new leader %d swept orphan via MK_GC (%d .ec, %d chunks)\n", L,
+           ecb_ec_parts(L, num), ecb_chunks(num));
+
+    /* ---- Case 2: Failover after MK_GC commits and before CHUNK_DEL + replica whose TTL is behind.
+     * Pause one follower R3 so R3 still lists its .ec parts when MK_GC commits; arm crash_before_del on leader L;
+     * expire all settled days by retention. L commits MK_GC{RETIRED} (ISR {L, R2}) and exits 99 before CHUNK_DEL.
+     * R2 promotes, deletes all chunks from its durable GCMK list, and commits MK_GC{DONE}. Then L restarts and R3
+     * resumes: R3 catches up, applies MK_GC while still listing .ec (retiring it first), and all retired_ names go. */
+    int R2 = -1, R3 = -1;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L)
+            *(R2 < 0 ? &R2 : &R3) = reps[k];
+    /* Ensure R3 lists the .ec parts before pausing it. */
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(R3, num) < 2; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("replica %d has %d .ec parts, want >= 2", R3, ecb_ec_parts(R3, num));
+    pause_server(R3, 1); /* R3's TTL cannot run: it keeps listing the .ec parts */
+    touch_file(trig_crashdel);
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++)
+        for (uint64_t t0 = now_ms(); (rc = tsdbc_set_retention(c, ide[s], 86400000LL)) != 0; usleep(50000))
+            if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                die("set retention on series %d: %s", s, ers(rc));
+    tsdbc_close(c);
+    c = NULL;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[L], &st, WNOHANG) == pids[L]) {
+            pids[L] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit crash_before_del after MK_GC commit in 90 s", L);
+    }
+    unlink(trig_crashdel);
+    if (!log_has(L, "exiting before CHUNK_DEL"))
+        die("leader %d exited without hitting crash_before_del", L);
+    /* R2 promotes while oldL is dead and R3 is paused; chunks must still be present (oldL exited before CHUNK_DEL). */
+    oldL = L;
+    L = ecgc_leader_of(num, nonrep, &e);
+    if (L != R2)
+        die("expected R2 (%d) to promote while R3 (%d) paused, got %d", R2, R3, L);
+    int ch_at_failover = ecb_chunks(num);
+    if (ch_at_failover == 0)
+        die("chunks already deleted before failover despite crash_before_del (gcuncommitted?)");
+    /* Bring oldL and R3 back so all 6 stripe members are UP and ISR >= min_isr: R2 finishes CHUNK_DEL from its durable
+     * GCMK list and commits MK_GC{DONE}; R3 catches up and applies MK_GC (retiring still-listed .ec if TTL lags). */
+    start(oldL);
+    pause_server(R3, 0);
+    for (uint64_t t0 = now_ms(); ecb_chunks(num) != 0 || ecb_retired_ec(L, num) != 0 || ecb_ec_parts(R3, num) != 0 ||
+                                 ecb_retired_ec(R3, num) != 0 || ecb_retired_ec(oldL, num) != 0;
+         usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("promoted leader %d / replicas did not finish pending GCMK deletes in 120 s "
+                "(%d chunks; L ret %d; R3 ec %d ret %d; oldL ret %d)",
+                L, ecb_chunks(num), ecb_retired_ec(L, num), ecb_ec_parts(R3, num), ecb_retired_ec(R3, num),
+                ecb_retired_ec(oldL, num));
+    await_isr(L, "e42", 3, 60000, "all 3 replicas in ISR after case 2");
+    printf("  case 2 (failover before CHUNK_DEL + TTL-behind replica): %d chunks at failover; promoted leader %d deleted "
+           "all chunks; R3 still-listed retired=%d; all retired_ gone\n",
+           ch_at_failover, L, log_has(R3, "retired still-listed .ec part") ? 1 : 0);
+    fflush(stdout);
+
+    /* ---- Case 3: SIGSTOP old leader past failover, SIGCONT -> puts refused FENCED (r8f F4), chunks become orphans.
+     * Use fresh series with no retention so the new day settles cleanly. */
+    tsdb_sid id2[ECB_SERIES];
+    c = client(L);
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "ecgc.p%d", s);
+        id2[s] = ecb_series(c, nm, "e42");
+    }
+    pm0 = log_count(L, "pause_midput: paused after position 0");
+    touch_file(trig_midput);
+    ecb_write_day(c, id2, day0 + 4 * 86400000LL);
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_midput: paused after position 0") <= pm0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit pause_midput for SIGSTOP case in 90 s", L);
+    tsdbc_close(c);
+    c = NULL;
+    pause_server(L, 1); /* SIGSTOP old leader mid-settle! */
+    unlink(trig_midput);
+    oldL = L;
+    L = ecgc_leader_of(num, nonrep, &e);
+    if (L == oldL)
+        die("leader did not move while oldL (%d) was SIGSTOPped", oldL);
+    int fn0 = log_count(oldL, "fenced: below the member's epoch");
+    pause_server(oldL, 0); /* SIGCONT old leader: its copy catches up to new epoch, yet its put uses old lead epoch! */
+    for (uint64_t t0 = now_ms(); log_count(oldL, "fenced: below the member's epoch") <= fn0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("SIGCONTed old leader %d did not get FENCED on its resumed put (r8f F4)", oldL);
+    await_isr(L, "e42", 3, 60000, "all 3 replicas in ISR after SIGCONT");
+    /* New leader settles day0+4 (6 chunks) and sweeps oldL's pos-0 orphan chunk via MK_GC -> total chunks == nec * 6. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        if (nec >= 1 && nch == nec * 6)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("orphan from SIGSTOPped leader not swept in 120 s (%d .ec, %d chunks)", nec, nch);
+    }
+    printf("  case 3 (SIGSTOP past failover + SIGCONT): old leader %d put refused FENCED (r8f F4), "
+           "orphan swept by new leader %d\n",
+           oldL, L);
+
+    /* ---- Case 4: force-leader suspends orphan GC until `tsdb cluster volume gc resume`.
+     * First leave a real orphan chunk on the stores (by pausing a new settle after pos 0 on L, cutting Cs off out of
+     * ISR, killing L and B, then force-leader onto Cs!). */
+    int Cs = -1, B = -1;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L)
+            *(Cs < 0 ? &Cs : &B) = reps[k];
+    /* Cut Cs off and drop it from ISR (same as scen_ecadd), with a fresh settle creating an orphan on L before kill! */
+    cut_file(L, Cs, 1);
+    cut_file(Cs, L, 1);
+    c = client(L);
+    int64_t ts1 = day0 + 6 * 86400000LL;
+    float v1 = 42.0f;
+    if ((rc = tsdbc_insert_series(c, id2[0], &ts1, &v1, 1)) != 0)
+        die("write after cutting Cs off: %s", ers(rc));
+    await_isr(L, "e42", 2, 30000, "Cs out of e42's ISR");
+    /* Make sure L has a fresh pause_midput (restart? No, L is the 3rd leader, never fired pause_midput yet; just in
+     * case, check if L already fired it). */
+    int ch_before_fl = ecb_chunks(num);
+    pm0 = log_count(L, "pause_midput: paused after position 0");
+    touch_file(trig_midput);
+    ecb_write_day(c, id2, day0 + 8 * 86400000LL);
+    for (uint64_t t0 = now_ms(); log_count(L, "pause_midput: paused after position 0") <= pm0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("leader %d did not hit pause_midput before force-leader in 90 s", L);
+    tsdbc_close(c);
+    c = NULL;
+    int ch_with_orph = ecb_chunks(num);
+    if (ch_with_orph <= ch_before_fl)
+        die("expected orphan chunk before force-leader (before %d, now %d)", ch_before_fl, ch_with_orph);
+    uint64_t e0 = e.epoch;
+    uint32_t old_id = e.leader;
+    stop(L, SIGKILL);
+    stop(B, SIGKILL);
+    unlink(trig_midput);
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        view(nonrep, &v);
+        int ok = v.st.leader && v.st.leader != ids[L] && v.st.leader != ids[B];
+        view_free(&v);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("metadata leader did not move off killed servers");
+    }
+    uint8_t req[8], *reply = NULL;
+    size_t rlen = 0, rl = cluster_volume_force_encode(num, ids[Cs], req);
+    for (uint64_t t0 = now_ms(); (rc = admin(nonrep, CLUSTER_OP_VOLUME_FORCE, req, rl, 1, &reply, &rlen)) != 0;
+         usleep(200000)) {
+        if (rc != CLUSTER_ERR_STATE || now_ms() - t0 > 30000)
+            die("force-leader of e42 to %d: %s (%.*s)", Cs, cluster_strerror(rc), (int)rlen,
+                reply ? (const char *)reply : "");
+        free(reply);
+        reply = NULL;
+    }
+    free(reply);
+    struct meta_volume f;
+    if (await_promoted(nonrep, "e42", old_id, e0, &f) != Cs || !f.gc_suspended)
+        die("after force-leader: leader %u (want %u), gc_suspended %u", f.leader, ids[Cs], f.gc_suspended);
+    /* Restart L and B (clear cuts): they diverged from Cs (a cut below applied); wait for ISR={Cs}, then reset both
+     * diverged replicas so they rebuild from Cs and restore ISR=3 (>= min_isr=2). Then all 6 stripe members are UP
+     * and writes commit, so orphan GC WOULD run if gc_suspended=1 were not honoured! */
+    cut_file(L, Cs, 0);
+    cut_file(Cs, L, 0);
+    start(L);
+    start(B);
+    await_isr(nonrep, "e42", 1, 30000, "ISR shrunk to Cs after force-leader");
+    char args[PATH_MAX * 2 + 128], out[16384], paddr[META_ADDR_MAX + 1];
+    peer_of(nonrep, paddr, sizeof paddr);
+    for (int k = 0; k < 2; k++) {
+        int who = k ? B : L;
+        snprintf(args, sizeof args, "cluster replica reset %s %" PRIu32 " %" PRIu32 " --secret-file %s", paddr, num,
+                 ids[who], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("tsdb %s: %s", args, out);
+    }
+    await_isr(nonrep, "e42", 3, 90000, "all 3 replicas in ISR after replica reset");
+    /* Wait well past orphan_grace_ms (1000 ms) + several poll intervals: orphan chunk MUST stay while suspended! */
+    usleep(3500000);
+    int ch_susp = ecb_chunks(num), nec_susp = ecb_ec_parts(Cs, num);
+    if (ch_susp <= nec_susp * 6)
+        die("orphan chunk deleted while gc_suspended=1 (%d .ec, %d chunks; gcsuspendignored!)", nec_susp, ch_susp);
+    printf("  case 4a (force-leader gc_suspended=1): orphan chunk kept (%d .ec, %d chunks)\n", nec_susp, ch_susp);
+    fflush(stdout);
+    /* Resume orphan GC via CLI: orphan chunk MUST now be collected via committed MK_GC! */
+    snprintf(args, sizeof args, "cluster volume gc resume %s e42 --secret-file %s", paddr, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "orphan collection resumed"))
+        die("tsdb %s: %s", args, out);
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int nec = ecb_ec_parts(Cs, num);
+        int nch = ecb_chunks(num);
+        if (nch == nec * 6)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("orphan chunk not swept after gc resume (%d .ec, %d chunks)", nec, nch);
+    }
+    printf("  case 4b (gc resume): orphan chunk swept via MK_GC (%d .ec, %d chunks)\n", ecb_ec_parts(Cs, num),
+           ecb_chunks(num));
 }
 
 static void scen_ecadd(void)
@@ -19275,7 +19673,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ec16", scen_ec16}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}};

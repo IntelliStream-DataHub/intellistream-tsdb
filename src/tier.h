@@ -158,6 +158,7 @@ typedef struct tier_attach {
     tier_epoch_fn epoch;
     void *epoch_arg;
     const tier_settings *settings; /* copied at attach */
+    uint64_t lead_epoch;           /* R8 (r8f F4, r8k-gc): if non-zero, pins this leader engine's own lead epoch */
 } tier_attach;
 
 /* R8 (r8f): a cluster tsdbd's ec volumes. Set once before tsdb_open (server/chunkpeer_cluster.c). With no
@@ -184,6 +185,7 @@ typedef struct coldvol {
     void *ctx;
     tier_epoch_fn epoch_fn;
     void *epoch_arg;
+    _Atomic uint64_t lead_epoch; /* R8 (r8f F4): non-zero on a cluster leader: puts/deletes always use this epoch */
     tier_settings set;
 } coldvol;
 /* The engine's (no reference taken: valid while it is attached); NULL without a tier. */

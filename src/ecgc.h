@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Retired .ec parts and their objects (R7, r7-gc; design-cluster-data.md E14, 2.4, 15.7; the plan's D6): retired_*.ec
- * in the graveyard (GY_EC), the delete queue of objects whose last reference went, and the sweep of orphan chunks at
- * open, before the merge and settle threads start. src/ecgc.c has the design.
+ * Retired .ec parts and their objects (R7, r7-gc; R8, r8k-gc; design-cluster-data.md E14, 2.4, 15.7; the plan's D6,
+ * D13): retired_*.ec in the graveyard (GY_EC), the delete queue of objects whose last reference went, the O(1) hash of
+ * holds taken at part_open_ec, the sweep of orphan chunks at open on single-server tiers, and the tier worker that
+ * drives cluster MK_GC (src/ecgcmk.h). src/ecgc.c has the design.
  */
 #ifndef TSDB_ECGC_H
 #define TSDB_ECGC_H
@@ -13,15 +14,21 @@
  * graveyard entry (GY_EC) with a whole lifetime again, or none with obsolete_part_lifetime_s <= 0 (due at once). A
  * record that cannot be read fails the open (damage is never silent); a read-only open leaves the file alone. */
 int ecgc_load_retired(eng *db, const char *name, bool read_only);
-/* db_retire_locked is retiring the .ec part p (renamed retired_<name>, db->lock held): its object is held until p's
- * last part_unref, and with obsolete_part_lifetime_s <= 0 its graveyard entry (due now) is added here. */
+/* db_retire_locked is retiring the .ec part p (renamed retired_<name>, db->lock held): records the retired name for
+ * GC, and with obsolete_part_lifetime_s <= 0 adds its graveyard entry (due now). The hold itself is taken in
+ * part_open_ec (ecgc_hold) so a reopen's old engine reading p keeps its object alive. */
 void ecgc_retire_locked(eng *db, part *p);
-/* graveyard_purge, for a GY_EC entry (db->lock held): true when the entry is done and leaves the list. Once due and
- * no part of the object is referenced (in any engine of the tier) the object goes to the tier's delete queue; once
- * the queue has deleted every chunk, the name is unlinked and the directory synced (eng_sync_dir), and only then does
- * the entry leave. No I/O on the chunk stores here. A test-marked part (no object) is unlinked once due. */
+/* graveyard_purge, for a GY_EC entry (db->lock held): true when the entry is done and leaves the list. On a single
+ * server: once due and no part of the object is referenced (in any engine of the tier) the object goes to the tier's
+ * delete queue; once the queue has deleted every chunk, the name is unlinked and only then does the entry leave. On a
+ * cluster EC volume: returns false (cluster retired objects are collected by the leader's MK_GC, src/ecgcmk.h). No
+ * I/O on the chunk stores here. A test-marked part (no object) is unlinked once due. */
 bool ecgc_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now);
-/* part_unref's last reference of an .ec part: lets go of the hold ecgc_retire_locked took (no I/O: the purge queues
+/* part_open_ec: takes a hold for p on (volume, oid) in the tier's O(1) hash (r7-gc F5 / r8k-gc). */
+int ecgc_hold(struct tier *t, const part *p, uint32_t volume, const uint8_t oid[16]);
+/* Whether any open .ec part in the tier holds (volume, oid). */
+bool ecgc_held(struct tier *t, uint32_t volume, const uint8_t oid[16]);
+/* part_unref's last reference of an .ec part: lets go of the hold part_open_ec took (no I/O: the purge / MK_GC queues
  * the deletion once the deadline passed too). Also called for parts that were never listed and parts that are only
  * closed (no hold: nothing). It runs after munmap: never touch p->map. p->ec->tier holds no reference of its own (the
  * engine's does; eng_close puts it after its parts went). Frees p->ec. */
@@ -35,27 +42,35 @@ bool ecgc_owns_name(const part *p);
 void ecgc_unlisted_object(eng *db, const part *p);
 
 /* An object that no file names and never will (an abandoned settle, r7-settle): its npos positions are deleted by the
- * queue. No I/O here; TSDB_ERR_NOMEM (its chunks then stay for the next open's sweep), TSDB_ERR_INVALID without a
- * tier. */
+ * queue (single server) or queued as a cluster orphan for MK_GC (cluster EC volume). No I/O here; TSDB_ERR_NOMEM,
+ * TSDB_ERR_INVALID without a tier. */
 int ecgc_queue_object(eng *db, const uint8_t oid[16], unsigned npos);
 
-/* The tier's and the engine's hooks (src/tier.h): t->gc (the queue, its worker thread and the holds), db->ecstate->gc
- * (the retired names of the engine). */
+/* The tier's and the engine's hooks (src/tier.h): t->gc (the queue, its worker thread, the O(1) holds hash, and the
+ * registry of cluster EC engines), db->ecstate->gc (the retired names of the engine). */
 int ecgc_tier_open(struct tier *t);
+void ecgc_tier_quiesce(struct tier *t);
 void ecgc_tier_close(struct tier *t);
 int ecgc_eng_open(eng *db);
+void ecgc_eng_ready(eng *db); /* registers a cluster EC engine with the tier's GC worker */
+void ecgc_eng_stop(eng *db);  /* unregisters and waits for any in-flight cluster GC round on db */
 void ecgc_eng_close(eng *db);
 /* D6's sweep of the engine's orphan chunks: eng_open_sched calls it after recovery, load_parts and the CLASSES check,
  * before the merge, flush and settle threads start, for a writer with a tier (never a read-only open or a follower).
- * The objects of the volume that no listed .ec part and no retired_*.ec names are queued; only with every store UP
- * (tier_writable), else skipped with a line. The count goes to stderr. Non-zero fails the open (TSDB_ERR_NOMEM only:
- * a store that cannot be listed skips the sweep, which the next open runs again). */
+ * Skipped on cluster EC volumes (orphans are collected by the leader via committed MK_GC, E14). */
 int ecgc_open_sweep(eng *db);
 
-/* Works the tier's delete queue once (the worker thread does, every second or when woken): per object, every chunk is
- * deleted (NOTFOUND counts as gone) with every store UP before and after; else the entry stays for a later round.
- * Returns the entries left. Never touches an engine. */
+/* Works the tier's delete queue once (and cluster MK_GC on registered cluster EC engines). Returns entries left in
+ * the single-server queue. */
 size_t ecgc_tier_work(struct tier *t);
+void ecgc_kick_tier(struct tier *t);
+
+/* Helpers for src/ecgcmk.c (cluster EC MK_GC). */
+int ecgc_take_due_retired(eng *db, int64_t now, uint8_t (**oids_out)[16], size_t *n_out);
+int ecgc_collect_oids_locked(eng *db, const uint8_t *oids, size_t noids, char (**unlinks_out)[256],
+                             size_t *nunlinks_out, bool *retired_listed_out);
+int ecgc_list_retired_locked(eng *db, uint8_t (**oids_out)[16], size_t *n_out);
+void ecgc_note_unlinked(struct tier *t, uint64_t n);
 
 /* tests */
 typedef struct ecgc_counters {
@@ -78,14 +93,11 @@ extern atomic_bool ecgc_test_nosweep;
 extern atomic_int ecgc_test_del_fail;
 /* Called by the worker after each position's delete (a test fails a store in the middle of a round). */
 extern void (*ecgc_test_after_del)(struct tier *t, unsigned pos);
-/* Planted bugs (tests/test_ecgc.c --mutant NAME; the Makefile requires each to fail it): the purge unlinks the retired
- * name before the chunks are deleted (gcunlinkfirst); the last part_unref keeps its hold, so the object never goes
- * (gcunrefleak); the purge ignores the holds, deleting the chunks of a part a query still reads (gcnohold); the sweep
- * ignores the retired names (sweeplive); the sweep lists the stores at the first round of the queue, after the threads
- * started, instead of in the open (sweepinflight); the sweep takes another volume's objects for orphans
- * (sweepforeign); a refused swap's object is not queued (unlistednoop); the worker waits only for a new entry, never
- * retrying a kept one (noretrytimer). Not required to fail (no path reaches it today, see delete_object): the round
- * trusts its deletes without asking tier_writable after them (noafter). */
+/* Test overrides read from TSDB_ECGC_TEST (once per process; or set directly in unit tests). */
+extern _Atomic int64_t ecgc_test_orphan_grace_ms; /* -1: default (60000 ms) */
+extern _Atomic int64_t ecgc_test_poll_ms;         /* -1: default (2000 ms) */
+extern _Atomic int64_t ecgc_test_lifetime_s;      /* -1: use db->opt.obsolete_part_lifetime_s */
+/* Planted bugs (tests/test_ecgc.c --mutant NAME, or TSDB_ECGC_MUTANT=NAME in tsdbd). */
 enum {
     GC_MUT_NONE = 0,
     GC_MUT_UNLINKFIRST,
@@ -97,6 +109,14 @@ enum {
     GC_MUT_UNLISTEDNOOP,
     GC_MUT_NORETRYTIMER,
     GC_MUT_NOAFTER,
+    /* R8 (r8k-gc) planted bugs: */
+    GC_MUT_UNCOMMITTED,    /* gcuncommitted: leader deletes chunks without waiting for MK_GC to commit */
+    GC_MUT_NAMEDORPHAN,    /* gcnamedorphan: cluster orphan sweep ignores oids named by records in the WAL */
+    GC_MUT_SUSPENDIGNORED, /* gcsuspendignored: cluster orphan sweep ignores gc_suspended */
+    GC_MUT_HOLDATRET,      /* holdatretire: holds taken at ecgc_retire_locked instead of part_open_ec */
+    GC_MUT_REPLICANOOP,    /* gcreplicanoop: ecgcmk_apply on a replica is a no-op */
 };
 extern int ecgc_mutant;
+int ecgc_mutant_parse(const char *name); /* GC_MUT_* or -1 */
+void ecgc_env_init(void);                /* reads TSDB_ECGC_MUTANT and TSDB_ECGC_TEST once */
 #endif
