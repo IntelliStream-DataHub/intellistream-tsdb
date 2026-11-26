@@ -262,6 +262,7 @@ int chunkpeer_cluster_start(const char *stage_dir)
             snprintf(hold_hook_path, sizeof hold_hook_path, "%s", colon + 1);
     } else if (th && !strncmp(th, "pause_midput=", 13)) {
         snprintf(pause_midput_path, sizeof pause_midput_path, "%s", th + 13);
+        chunkpeer_test_serial_put = 1;
     } else if (th && !strncmp(th, "read_delay=", 11)) {
         snprintf(read_delay_path, sizeof read_delay_path, "%s", th + 11);
     }

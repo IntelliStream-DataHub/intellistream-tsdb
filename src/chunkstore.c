@@ -1532,7 +1532,20 @@ int chunk_be_put(chunk_backend *be, int store, const chunk_ident *id, const chun
 int chunk_be_rd_open(chunk_backend *be, const chunk_ident *id, chunk_rd **out)
 {
     int worst = TSDB_ERR_NOTFOUND;
+    int primary = chunk_be_place(be, id->oid, id->pos);
+    if (primary >= 0 && primary < be->n) {
+        chunk_store *st = chunk_be_open_store(be, primary);
+        if (st) {
+            int rc = chunk_rd_open(st, id, out);
+            if (rc == 0)
+                return 0;
+            if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
+                worst = rc;
+        }
+    }
     for (int i = 0; i < be->n; i++) {
+        if (i == primary)
+            continue;
         chunk_store *st = chunk_be_open_store(be, i);
         if (!st)
             continue;

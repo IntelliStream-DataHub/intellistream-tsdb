@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -321,6 +324,8 @@ int chunksrv_st(int rc)
 }
 
 /* ---------------------------------------------------------------- the server */
+#define CS_PEND_BUCKETS 512u
+
 struct cs_job {
     struct cs_job *next;
     int commit;          /* 1: put is to be committed; 0: a request frame */
@@ -329,15 +334,18 @@ struct cs_job {
     uint64_t gen;
     uint32_t peer;
     size_t n;
-    uint8_t p[];
+    struct cs_req req;   /* decoded and checked once in on_frame_chunk */
 };
 
 struct cs_pend {
     struct cs_pend *next;
+    pthread_cond_t cv; /* per-request CLOCK_MONOTONIC condvar */
+    struct plink *link;
+    uint64_t gen;
     uint64_t rid;
     uint8_t op; /* the answer's op must be this one */
     int refs; /* the caller, and a bulk job while it lives */
-    bool done, job_done;
+    bool done, aborted, job_done;
     int job_status;
     int32_t rc;
     uint8_t *body;
@@ -401,14 +409,19 @@ struct chunksrv {
     pthread_t *workers;
     int nworkers;
     pthread_mutex_t cmu; /* pending calls, peers, link contexts */
-    pthread_cond_t ccv;
-    struct cs_pend *pend;
+    struct cs_pend *pend[CS_PEND_BUCKETS];
     struct cs_peer *peers;
     size_t npeers, cpeers;
     struct cs_lctx *lctx;
     _Atomic uint64_t rid;
     bool listening;
 };
+
+static inline size_t pend_bucket(uint64_t rid)
+{
+    uint64_t h = rid * 0x9e3779b97f4a7c15ull;
+    return (size_t)((h ^ (h >> 32)) & (CS_PEND_BUCKETS - 1u));
+}
 
 #define STAT(cs, f) __atomic_add_fetch(&(cs)->st.f, 1, __ATOMIC_RELAXED)
 #define STATN(cs, f, v) __atomic_add_fetch(&(cs)->st.f, (v), __ATOMIC_RELAXED)
@@ -426,7 +439,6 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     pthread_mutex_init(&cs->qmu, NULL);
     pthread_cond_init(&cs->qcv, NULL);
     pthread_mutex_init(&cs->cmu, NULL);
-    tsdb_cond_init_mono(&cs->ccv);
     uint64_t r;
     if (chunk_random(&r, sizeof r) != 0) { /* a restarted client's ids never meet a late answer to its previous life */
         snprintf(err, errlen, "cannot read random bytes");
@@ -467,7 +479,6 @@ void chunksrv_close(struct chunksrv *cs)
     pthread_mutex_destroy(&cs->qmu);
     pthread_cond_destroy(&cs->qcv);
     pthread_mutex_destroy(&cs->cmu);
-    pthread_cond_destroy(&cs->ccv);
     free(cs);
 }
 
@@ -798,47 +809,52 @@ static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
     free(b);
 }
 
-int chunksrv_handle(struct chunksrv *cs, uint32_t peer, const uint8_t *p, size_t n, cs_reply_fn reply, void *arg)
+static int chunksrv_handle_req(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, cs_reply_fn reply, void *arg)
 {
     (void)peer;
+    STAT(cs, requests);
+    if (!cs->be) {
+        reply_rc(reply, arg, r->rid, r->op, TSDB_ERR_UNAVAILABLE, NULL, 0);
+        return 0;
+    }
+    bool mutating = r->op == CS_OP_DEL;
+    int rc = cs_see(cs, r->volume, r->epoch, mutating);
+    if (rc != 0) {
+        reply_rc(reply, arg, r->rid, r->op, rc, NULL, 0);
+        return 0;
+    }
+    switch (r->op) {
+    case CS_OP_READ: do_read(cs, r, reply, arg); break;
+    case CS_OP_SUMS: do_sums(cs, r, reply, arg); break;
+    case CS_OP_LIST: do_list(cs, r, reply, arg); break;
+    case CS_OP_DEL: {
+        chunk_ident id;
+        ident_of(r, &id);
+        rc = chunk_be_del(cs->be, &id, act_epoch(cs, r->volume, r->epoch));
+        if (rc == CHUNK_ERR_FENCED)
+            STAT(cs, fenced);
+        reply_rc(reply, arg, r->rid, CS_OP_DEL, rc, NULL, 0);
+        break;
+    }
+    case CS_OP_EPOCH: {
+        uint8_t b[9];
+        put64(b, chunk_be_epoch(cs->be, r->volume));
+        b[8] = any_unsure(cs, r->volume);
+        reply_rc(reply, arg, r->rid, CS_OP_EPOCH, 0, b, sizeof b);
+        break;
+    }
+    }
+    return 0;
+}
+
+int chunksrv_handle(struct chunksrv *cs, uint32_t peer, const uint8_t *p, size_t n, cs_reply_fn reply, void *arg)
+{
     struct cs_req r;
     if (cs_req_decode(p, n, &r) != 0) {
         STAT(cs, malformed);
         return -1;
     }
-    STAT(cs, requests);
-    if (!cs->be) {
-        reply_rc(reply, arg, r.rid, r.op, TSDB_ERR_UNAVAILABLE, NULL, 0);
-        return 0;
-    }
-    bool mutating = r.op == CS_OP_DEL;
-    int rc = cs_see(cs, r.volume, r.epoch, mutating);
-    if (rc != 0) {
-        reply_rc(reply, arg, r.rid, r.op, rc, NULL, 0);
-        return 0;
-    }
-    switch (r.op) {
-    case CS_OP_READ: do_read(cs, &r, reply, arg); break;
-    case CS_OP_SUMS: do_sums(cs, &r, reply, arg); break;
-    case CS_OP_LIST: do_list(cs, &r, reply, arg); break;
-    case CS_OP_DEL: {
-        chunk_ident id;
-        ident_of(&r, &id);
-        rc = chunk_be_del(cs->be, &id, act_epoch(cs, r.volume, r.epoch));
-        if (rc == CHUNK_ERR_FENCED)
-            STAT(cs, fenced);
-        reply_rc(reply, arg, r.rid, CS_OP_DEL, rc, NULL, 0);
-        break;
-    }
-    case CS_OP_EPOCH: {
-        uint8_t b[9];
-        put64(b, chunk_be_epoch(cs->be, r.volume));
-        b[8] = any_unsure(cs, r.volume);
-        reply_rc(reply, arg, r.rid, CS_OP_EPOCH, 0, b, sizeof b);
-        break;
-    }
-    }
-    return 0;
+    return chunksrv_handle_req(cs, peer, &r, reply, arg);
 }
 
 /* ---------------------------------------------------------------- puts */
@@ -1068,13 +1084,29 @@ static void *worker_main(void *arg)
             chunksrv_put_end(j->put, 0);
         } else {
             struct rctx c = {.l = j->l, .gen = j->gen};
-            chunksrv_handle(cs, j->peer, j->p, j->n, reply_link, &c);
+            chunksrv_handle_req(cs, j->peer, &j->req, reply_link, &c);
         }
         free(j);
         pthread_mutex_lock(&cs->qmu);
     }
     pthread_mutex_unlock(&cs->qmu);
     return NULL;
+}
+
+static void on_link_chunk(void *arg, struct plink *l, int up)
+{
+    if (up || plink_kind(l) != PL_KIND_CHUNK)
+        return;
+    struct chunksrv *cs = arg;
+    uint64_t gen = plink_gen(l);
+    pthread_mutex_lock(&cs->cmu);
+    for (size_t b = 0; b < CS_PEND_BUCKETS; b++)
+        for (struct cs_pend *q = cs->pend[b]; q; q = q->next)
+            if (q->link == l && q->gen == gen && !q->done && !q->aborted) {
+                q->aborted = true;
+                pthread_cond_signal(&q->cv);
+            }
+    pthread_mutex_unlock(&cs->cmu);
 }
 
 static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8_t type, const uint8_t *p, size_t n);
@@ -1098,11 +1130,10 @@ static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8
         struct cs_req r;
         if (cs_req_decode(p, n, &r) != 0)
             goto bad;
-        struct cs_job *j = malloc(sizeof *j + n);
+        struct cs_job *j = malloc(sizeof *j);
         if (!j)
             return; /* the requester times out */
-        *j = (struct cs_job){.l = l, .gen = plink_gen(l), .peer = plink_peer(l), .n = n};
-        memcpy(j->p, p, n);
+        *j = (struct cs_job){.l = l, .gen = plink_gen(l), .peer = plink_peer(l), .n = n, .req = r};
         q_push(cs, j, l);
         return;
     }
@@ -1111,7 +1142,7 @@ static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8
         if (cs_resp_decode(p, n, &r) != 0)
             goto bad;
         pthread_mutex_lock(&cs->cmu);
-        for (struct cs_pend *q = cs->pend; q; q = q->next)
+        for (struct cs_pend *q = cs->pend[pend_bucket(r.rid)]; q; q = q->next)
             if (q->rid == r.rid && !q->done) {
                 if (q->op != r.op && chunksrv_mutant != CS_MUT_NOOPMATCH) {
                     /* another call's answer (a changed rid or op): neither call takes it, the link ends. The
@@ -1130,7 +1161,7 @@ static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8
                     memcpy(q->body, r.body, r.body_len);
                 q->body_len = q->body ? r.body_len : 0;
                 q->done = true;
-                pthread_cond_broadcast(&cs->ccv);
+                pthread_cond_signal(&q->cv);
                 break;
             }
         pthread_mutex_unlock(&cs->cmu); /* an answer nobody waits for (a call that timed out) is dropped */
@@ -1293,8 +1324,8 @@ int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
     for (; started < cs->nworkers; started++)
         if (pthread_create(&cs->workers[started], NULL, worker_main, cs) != 0)
             break;
-    struct pl_cfg pc = {.secret = cfg->secret, .secret_len = cfg->secret_len, .arg = cs, .on_frame = on_frame,
-                        .bulk = {.open = b_open, .data = b_data, .end = b_end},
+    struct pl_cfg pc = {.secret = cfg->secret, .secret_len = cfg->secret_len, .arg = cs, .on_link = on_link_chunk,
+                        .on_frame = on_frame, .bulk = {.open = b_open, .data = b_data, .end = b_end},
                         .bulk_rate = cfg->rate, .dead_ms = cfg->dead_ms, .ping_ms = cfg->ping_ms};
     pc.self.id = cfg->self_id;
     memcpy(pc.self.uuid, cfg->uuid, 16);
@@ -1367,12 +1398,15 @@ void chunksrv_unlisten(struct chunksrv *cs)
         free(x);
     }
     cs->lctx = NULL;
-    for (struct cs_pend *q = cs->pend, *nx; q; q = nx) { /* bulk jobs ended with the links (done ran) */
-        nx = q->next;
-        free(q->body);
-        free(q);
+    for (size_t b = 0; b < CS_PEND_BUCKETS; b++) {
+        for (struct cs_pend *q = cs->pend[b], *nx; q; q = nx) { /* bulk jobs ended with the links (done ran) */
+            nx = q->next;
+            pthread_cond_destroy(&q->cv);
+            free(q->body);
+            free(q);
+        }
+        cs->pend[b] = NULL;
     }
-    cs->pend = NULL;
     free(cs->peers);
     cs->peers = NULL;
     cs->npeers = cs->cpeers = 0;
@@ -1463,12 +1497,14 @@ static struct cs_pend *pend_add(struct chunksrv *cs, uint64_t rid, int refs, uin
     struct cs_pend *q = calloc(1, sizeof *q);
     if (!q)
         return NULL;
+    tsdb_cond_init_mono(&q->cv);
     q->rid = rid;
     q->op = op;
     q->refs = refs;
+    size_t b = pend_bucket(rid);
     pthread_mutex_lock(&cs->cmu);
-    q->next = cs->pend;
-    cs->pend = q;
+    q->next = cs->pend[b];
+    cs->pend[b] = q;
     pthread_mutex_unlock(&cs->cmu);
     return q;
 }
@@ -1478,32 +1514,35 @@ static void pend_unref(struct chunksrv *cs, struct cs_pend *q)
 {
     if (--q->refs > 0)
         return;
-    for (struct cs_pend **pp = &cs->pend; *pp; pp = &(*pp)->next)
+    size_t b = pend_bucket(q->rid);
+    for (struct cs_pend **pp = &cs->pend[b]; *pp; pp = &(*pp)->next)
         if (*pp == q) {
             *pp = q->next;
             break;
         }
+    pthread_cond_destroy(&q->cv);
     free(q->body);
     free(q);
 }
 
-/* wait in bounded slices on the monotonic condvar clock */
-static void wait_slice(struct chunksrv *cs, uint64_t deadline)
+/* wait on the request's own monotonic condvar until target_ns (CLOCK_MONOTONIC ns) */
+static void wait_until_ns(struct chunksrv *cs, struct cs_pend *pd, uint64_t target_ns)
 {
-    uint64_t now = now_ns(), left = deadline > now ? deadline - now : 0;
-    if (left > 50000000ull)
-        left = 50000000ull;
+    uint64_t now = now_ns(), left = target_ns > now ? target_ns - now : 0;
     struct timespec t;
     tsdb_cond_deadline_ns(&t, (int64_t)left);
-    pthread_cond_timedwait(&cs->ccv, &cs->cmu, &t);
+    pthread_cond_timedwait(&pd->cv, &cs->cmu, &t);
 }
 
-static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t deadline)
+static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t deadline, uint64_t *gen_out)
 {
     for (;;) {
-        int rc = plink_send(l, CS_T_REQ, p, n, 100);
-        if (rc == PL_OK)
+        uint64_t gen = plink_gen(l);
+        int rc = gen ? plink_send_gen(l, gen, CS_T_REQ, p, n, 100) : PL_E_DOWN;
+        if (rc == PL_OK) {
+            *gen_out = gen;
             return 0;
+        }
         if (rc != PL_E_DOWN && rc != PL_E_FULL)
             return -1;
         if (now_ns() >= deadline)
@@ -1530,10 +1569,17 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     struct cs_pend *pd = pend_add(cs, q.rid, 1, q.op);
     if (!pd)
         return TSDB_ERR_NOMEM;
-    int ret = send_until(lc, buf, n, deadline) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
+    uint64_t gen = 0;
+    int ret = send_until(lc, buf, n, deadline, &gen) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
     pthread_mutex_lock(&cs->cmu);
-    while (ret == 0 && !pd->done && now_ns() < deadline)
-        wait_slice(cs, deadline);
+    if (ret == 0) {
+        pd->link = lc;
+        pd->gen = gen;
+        if (!pd->done && (!plink_up(lc) || plink_gen(lc) != gen))
+            pd->aborted = true;
+    }
+    while (ret == 0 && !pd->done && !pd->aborted && now_ns() < deadline)
+        wait_until_ns(cs, pd, deadline);
     if (ret == 0 && !pd->done)
         ret = TSDB_ERR_UNAVAILABLE;
     if (ret == 0) {
@@ -1563,7 +1609,7 @@ static void put_job_done(void *arg, uint64_t file, int status, uint64_t sent)
     ja->pd->job_done = true;
     ja->pd->job_status = status;
     clock_gettime(CLOCK_MONOTONIC, &ja->pd->job_at);
-    pthread_cond_broadcast(&cs->ccv);
+    pthread_cond_signal(&ja->pd->cv);
     pend_unref(cs, ja->pd);
     pthread_mutex_unlock(&cs->cmu);
     free(ja);
@@ -1619,14 +1665,18 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
             ret = TSDB_ERR_UNAVAILABLE;
             break;
         }
+        uint64_t wait_target = deadline;
         if (pd->job_done && pd->job_status != PL_OK) { /* the refusal's reason may still be on its way on CHUNK */
             uint64_t at = (uint64_t)pd->job_at.tv_sec * 1000000000ull + (uint64_t)pd->job_at.tv_nsec;
-            if (now > at + 1000000000ull) {
+            uint64_t grace = at + 1000000000ull;
+            if (now >= grace) {
                 ret = pd->job_status == PL_E_REFUSED || pd->job_status == PL_E_IO ? TSDB_ERR_IO : TSDB_ERR_UNAVAILABLE;
                 break;
             }
+            if (grace < wait_target)
+                wait_target = grace;
         }
-        wait_slice(cs, deadline);
+        wait_until_ns(cs, pd, wait_target);
     }
     if (ret == 0) {
         if (pd->rc != 0)
@@ -1641,35 +1691,58 @@ int chunksrv_put_remote(struct chunksrv *cs, uint32_t peer, const struct cs_put_
     return ret;
 }
 
-int chunksrv_stage(const char *dir, const chunk_geom *g, unsigned pos, const void *cells, const uint64_t *sums)
+#define CS_STAGE_MEMFD_MAX (16u << 20)
+
+static int stage_wr_full(int fd, const void *buf, size_t n)
 {
-    char path[4096];
-    snprintf(path, sizeof path, "%s/chunkput.XXXXXX", dir);
-    int fd = mkstemp(path);
-    if (fd < 0)
-        return TSDB_ERR_IO;
-    unlink(path);
-    uint64_t nc = chunk_pos_cells(g, pos), len = chunk_pos_len(g, pos);
-    uint8_t *b = malloc(8 * nc + len);
-    if (!b) {
-        close(fd);
-        return TSDB_ERR_NOMEM;
-    }
-    for (uint64_t i = 0; i < nc; i++)
-        put64(b + 8 * i, sums[i]);
-    memcpy(b + 8 * nc, cells, len);
-    size_t off = 0, tot = 8 * nc + len;
-    while (off < tot) {
-        ssize_t w = write(fd, b + off, tot - off);
+    const uint8_t *p = buf;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, p + off, n - off);
         if (w < 0 && errno == EINTR)
             continue;
-        if (w <= 0) {
-            free(b);
+        if (w <= 0)
+            return TSDB_ERR_IO;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+int chunksrv_stage(const char *dir, const chunk_geom *g, unsigned pos, const void *cells, const uint64_t *sums)
+{
+    uint64_t nc = chunk_pos_cells(g, pos), len = chunk_pos_len(g, pos);
+    uint64_t tot = 8 * nc + len;
+    int fd = -1;
+#if defined(__linux__) && defined(SYS_memfd_create)
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+    if (tot <= CS_STAGE_MEMFD_MAX)
+        fd = (int)syscall(SYS_memfd_create, "tsdb-chunkput", (unsigned)MFD_CLOEXEC);
+#endif
+    if (fd < 0) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/chunkput.XXXXXX", dir);
+        fd = mkstemp(path);
+        if (fd < 0)
+            return TSDB_ERR_IO;
+        unlink(path);
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    uint8_t sbuf[8 * 512];
+    for (uint64_t i = 0; i < nc;) {
+        uint64_t c = nc - i < 512 ? nc - i : 512;
+        for (uint64_t j = 0; j < c; j++)
+            put64(sbuf + 8 * j, sums[i + j]);
+        if (stage_wr_full(fd, sbuf, (size_t)(8 * c)) != 0) {
             close(fd);
             return TSDB_ERR_IO;
         }
-        off += (size_t)w;
+        i += c;
     }
-    free(b);
+    if (len > 0 && stage_wr_full(fd, cells, (size_t)len) != 0) {
+        close(fd);
+        return TSDB_ERR_IO;
+    }
     return fd;
 }

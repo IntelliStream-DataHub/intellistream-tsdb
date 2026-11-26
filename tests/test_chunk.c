@@ -2409,6 +2409,89 @@ static void test_chunk_random_emfile(void)
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
+/* P-26: primary-store probe + fallback in chunk_be_rd_open, lazy parity open in chunk_obj_open, and parallel
+ * multi-chunk reads (healthy + degraded fallback). */
+static void test_p26_open_and_par_read(void)
+{
+    /* 1. chunk_be_rd_open probes primary store first, and still falls back when chunk lives on another store. */
+    fx f;
+    fx_make(&f, "fx-p26-fb", 6, 4, 2, 4096, 4096 * 8, 1);
+    uint8_t alt_oid[16];
+    chunk_random(alt_oid, 16);
+    chunk_geom ag;
+    CHECK(chunk_geom_make(&ag, 2, 1, 4096, 4096 * 2) == 0);
+    chunk_ident aid = {.volume = f.vol, .pos = 0};
+    memcpy(aid.vuuid, f.vuuid, 16);
+    memcpy(aid.oid, alt_oid, 16);
+    int primary = chunk_be_place(f.be, alt_oid, 0);
+    int other = (primary + 3) % 6;
+    uint8_t cell[4096];
+    fill(cell, sizeof cell);
+    CHECK(chunk_be_put(f.be, other, &aid, &ag, 2, cell, NULL) == 0);
+    chunk_rd *rd = NULL;
+    CHECK(chunk_be_rd_open(f.be, &aid, &rd) == 0 && rd != NULL);
+    if (rd) {
+        uint8_t got[4096];
+        CHECK(chunk_rd_read(rd, 0, got, sizeof got) == 0 && memcmp(got, cell, sizeof cell) == 0);
+        chunk_rd_close(rd);
+    }
+    fx_free(&f);
+
+    /* 2. Lazy parity open: healthy open does not open parity FDs; deleting parity after open still lets healthy
+     * multi-chunk parallel read succeed; corrupting a data chunk after open triggers lazy parity open in degrade(). */
+    fx_make(&f, "fx-p26-lazy", 6, 4, 2, 65536, 65536 * 12 + 1234, 1);
+    chunk_obj *o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, &f.g, f.rec, &o) == 0 && o != NULL);
+    uint8_t *buf = malloc(f.g.len);
+    chunk_report rep;
+    /* Healthy multi-chunk parallel read (checked and RAW) */
+    CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
+          rep.decoded_cells == 0);
+    memset(buf, 0, f.g.len);
+    CHECK(chunk_obj_read(o, 0, f.g.len, buf, CHUNK_RR_RAW, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
+          rep.decoded_cells == 0);
+    /* Flip a byte in data chunk 1 on disk (triggers checksum mismatch in parallel path -> fallback to degrade() ->
+     * lazily opens parity position 4 and reconstructs bit-exact!) */
+    char p1[PATH_MAX + 128];
+    fx_path(&f, 1, p1, sizeof p1);
+    size_t n1 = 0;
+    uint8_t *raw1 = slurp(p1, &n1);
+    CHECK(raw1 && n1 > CHUNK_HDR_BYTES + 100);
+    raw1[CHUNK_HDR_BYTES + 100] ^= 0xff;
+    spit(p1, raw1, n1);
+    free(raw1);
+    memset(buf, 0, f.g.len);
+    CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
+          rep.decoded_cells > 0);
+    chunk_obj_close(o);
+    free(buf);
+    fx_free(&f);
+
+    /* 3. All data chunks missing BEFORE open (k=2, m=2): both expect==NULL and expect!=NULL must fall back to
+     * scanning parity positions to discover geometry and open surviving parity chunks. */
+    fx_make(&f, "fx-p26-alldata", 4, 2, 2, 4096, 4096 * 6 + 77, 1);
+    for (unsigned dp = 0; dp < 2; dp++) {
+        char dpth[PATH_MAX + 128];
+        fx_path(&f, dp, dpth, sizeof dpth);
+        CHECK(unlink(dpth) == 0);
+    }
+    buf = malloc(f.g.len);
+    for (int with_expect = 0; with_expect < 2; with_expect++) {
+        o = NULL;
+        CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, with_expect ? &f.g : NULL, f.rec, &o) == 0 && o != NULL);
+        if (o) {
+            CHECK(chunk_obj_geom(o)->k == 2 && chunk_obj_geom(o)->m == 2 && chunk_obj_geom(o)->len == f.g.len);
+            memset(buf, 0, f.g.len);
+            CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
+                  rep.decoded_cells > 0);
+            chunk_obj_close(o);
+        }
+    }
+    free(buf);
+    fx_free(&f);
+    printf("  P-26: primary-first open + fallback, lazy parity open, all-data-lost open, and parallel multi-chunk read\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
@@ -2472,6 +2555,7 @@ int main(int argc, char **argv)
     test_two_encodings();
     test_degraded_backend();
     test_stream_put();
+    test_p26_open_and_par_read();
     test_threads();
     test_crashfs();
     if (failures) {
