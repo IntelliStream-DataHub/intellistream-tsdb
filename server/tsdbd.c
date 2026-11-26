@@ -212,8 +212,10 @@ static inline bool cancelable(uint8_t op)
            op == TSDB_OP_STATS_TENANTS;
 }
 /* A receive buffer up to this size is not counted in the request memory; a frame larger than it gets a buffer of
- * its own size, which is (see the file header). */
+ * its own size (plus IN_HDR_PAD leading bytes so the 9-byte frame header ends on a 16-byte boundary for zero-copy
+ * ownership transfer to req), which is counted (see the file header). */
 #define IN_KEEP (64u << 10)
+#define IN_HDR_PAD 7
 
 typedef struct buf {
     uint8_t *p;
@@ -255,22 +257,39 @@ typedef struct ev {
     struct conn *c;
 } ev;
 
-typedef struct req {
-    struct req *next;
-    struct conn *c;
-    uint32_t id;
-    uint8_t op;
-    uint8_t *payload; /* malloc'd, so 16-byte aligned */
-    size_t len;
-    bool cancelled; /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */
-    struct req *mnext; /* the next QUERY_MULTI in the connection's queue (main thread) */
+#define REQ_FIELDS                                                                                                     \
+    struct req *next;                                                                                                  \
+    struct conn *c;                                                                                                    \
+    uint32_t id;                                                                                                       \
+    uint8_t op;                                                                                                        \
+    bool cancelled;     /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */                           \
+    uint8_t *payload;   /* 16-byte aligned: inline_data[], owned_buf + IN_HDR_PAD + 9, or fjob payload */              \
+    uint8_t *owned_buf; /* non-NULL on zero-copy large-frame transfer: freed via tsdb_free_big */                      \
+    size_t owned_cap;   /* allocation size of owned_buf (for tsdb_free_big and req_mem.held) */                        \
+    size_t len;                                                                                                        \
+    struct req *mnext; /* the next QUERY_MULTI in the connection's queue (main thread) */                              \
     int64_t t_arr;     /* when the event loop read it (CLOCK_MONOTONIC ns): a forward's age counts from here */
-} req;
 
-/* What a request costs beyond its payload: the struct and two allocations. Counted with the payload, so frames
+struct req_fields {
+    REQ_FIELDS
+};
+
+typedef struct req {
+    REQ_FIELDS
+    /* Pad so inline_data is 16-byte aligned when malloc returns 16-byte aligned memory. */
+    uint8_t align_pad[16 - (sizeof(struct req_fields) % 16)];
+    uint8_t inline_data[];
+} req;
+_Static_assert(offsetof(req, inline_data) % 16 == 0, "req inline_data must be 16-byte aligned");
+
+/* What a request costs beyond its payload: the struct and allocation overhead. Counted with the payload, so frames
  * without one (9 bytes on the wire) cannot pile up uncounted. */
 #define REQ_OVERHEAD (sizeof(req) + 64)
-#define REQ_COST(r) ((r)->len + REQ_OVERHEAD)
+static inline size_t req_cost(const req *r)
+{
+    return (r->owned_buf ? r->owned_cap : r->len) + REQ_OVERHEAD;
+}
+#define REQ_COST(r) req_cost(r)
 /* What a worker tells the main thread about a connection: output is waiting, or its request finished. */
 typedef struct note {
     struct note *next;
@@ -279,64 +298,87 @@ typedef struct note {
 } note;
 
 typedef struct conn {
-    struct conn *prev, *next; /* all connections, for shutdown (main thread) */
+    /* Read-mostly / immutable after on_accept (shared cleanly by event loop and workers without invalidation). */
     int fd;
+    struct fwdo *fwdo; /* a forwarded request's pseudo-connection on its owner (fd -1): replies go back on the link */
     ev recv_ev, send_ev;
-    /* main thread only */
+    atomic_uint proto;    /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
+    atomic_bool authed;   /* logged in (or --no-auth): parse() takes every op */
+    atomic_bool auth_end; /* a failed login or a dropped user: close once the requests received are answered */
+    atomic_bool closing;
+    atomic_bool peer_eof; /* event loop saw EOF (on_recv res == 0) or EPOLLRDHUP/HUP/ERR; read lock-free by fe_gone */
+    int64_t t_open;       /* accepted at (monotonic s), for --login-timeout (main thread) */
+
+    char pad_ro_loop[64];
+
+    /* Event-loop-only mutated fields (main thread). */
+    struct conn *prev, *next; /* all connections, for shutdown (main thread) */
     buf in;
+    uint8_t in_pad;     /* leading alignment headroom in in.p (0 or IN_HDR_PAD for large frames) */
+    size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
     req *q_head, *q_tail;
     req *mq_head, *mq_tail; /* the QUERY_MULTIs in q, in order (through mnext), for CANCEL */
     size_t q_multi;         /* how many */
-    bool busy;          /* a worker owns this connection's current request */
-    bool recv_inflight, send_inflight, closed;
-    bool eof;           /* the client sent everything it will: reply to it, then close */
+    size_t q_bytes;         /* REQ_COST of the requests in q */
     buf sending;
     size_t sent;
     int64_t tx_t0;      /* start of the progress window of the output (monotonic ms), see on_tick */
     int64_t tx_base;    /* what the client had consumed (tx_total - SIOCOUTQ) at tx_t0, -1: not read yet */
-    bool tx_win;        /* a progress window is open: a send is in flight */
-    _Atomic int64_t tx_total; /* bytes handed to the socket so far, by the loop or by a worker (out_send) */
-    size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
-    size_t q_bytes;     /* REQ_COST of the requests in q */
     int64_t frame_t0;   /* when the partial frame in `in` was started (monotonic s), 0: none */
-    bool parked;        /* not read from until memory frees (park list); park_frame: to grow for a frame */
-    bool park_frame;
-    bool held;          /* the server stopped reading it (parked or PIPE_CAP): its frame deadline restarts */
     struct conn *park_prev, *park_next;
-    bool readable, writable, rdhup; /* epoll: what the socket can do, as far as we know */
-    bool in_ready, dead;            /* epoll: in the ready list; freed while in it */
     struct conn *ready_next;
     uint32_t run_id;    /* the request a worker runs (while busy), for CANCEL */
     uint8_t run_op;
-    /* shared with the worker */
+    bool busy;          /* a worker owns this connection's current request */
+    bool recv_inflight, send_inflight, closed;
+    bool eof;           /* the client sent everything it will: reply to it, then close */
+    bool tx_win;        /* a progress window is open: a send is in flight */
+    bool parked;        /* not read from until memory frees (park list); park_frame: to grow for a frame */
+    bool park_frame;
+    bool held;          /* the server stopped reading it (parked or PIPE_CAP): its frame deadline restarts */
+    bool readable, writable, rdhup; /* epoll: what the socket can do, as far as we know */
+    bool in_ready, dead;            /* epoll: in the ready list; freed while in it */
+    bool auth_hold;     /* an AUTH_CONTINUE waits or runs: nothing more is read until it is answered (main) */
+    atomic_bool recv_armed;     /* mirrors recv_inflight for workers: fe_gone falls back to poll(0) only while false */
     atomic_bool cancel_running; /* CANCEL named the running QUERY_MULTI */
+
+    char pad_loop_worker[64];
+
+    /* Worker-mutated and shared output/synchronization fields. */
     pthread_mutex_t lock;
     pthread_cond_t cv;
     buf out;
-    atomic_bool closing;
-    atomic_bool peer_eof;   /* event loop saw EOF (on_recv res == 0) or EPOLLRDHUP/HUP/ERR; read lock-free by fe_gone */
-    atomic_bool recv_armed; /* mirrors recv_inflight for workers: fe_gone falls back to poll(0) only while false */
-    atomic_uint proto;  /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
-    atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
-    _Atomic int64_t nonup_since; /* when this request first waited for output inside a domain that is not UP
-                            (monotonic ms), 0: not yet; reset by handle() for every request (out_wait) */
+    size_t out_waiters; /* workers blocked in out_wait (under lock); broadcast cv only when > 0 */
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
                            send left in `out` or handed it (out_put); the worker only appends until the main thread
                            drained it all */
     bool tx_worker;     /* the worker sends from the front of `out` itself (out_send): nobody else touches `out` */
     bool streaming;     /* the worker runs a QUERY_MULTI, whose batches go out while it computes (worker only) */
+    atomic_bool out_pending;  /* true whenever c->out has bytes the event loop has not yet taken (set/cleared under lock) */
+    _Atomic int64_t tx_total; /* bytes handed to the socket so far, by the loop or by a worker (out_send) */
+    atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
+    _Atomic int64_t nonup_since; /* when this request first waited for output inside a domain that is not UP
+                            (monotonic ms), 0: not yet; reset by handle() for every request (out_wait) */
     note n_out, n_done; /* in note_top while queued for the main thread */
     atomic_bool out_queued; /* n_out is in note_top or not yet handled */
     tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
-    /* login: the worker sets these, the main thread reads them */
-    atomic_bool authed;   /* logged in (or --no-auth): parse() takes every op */
-    atomic_bool auth_end; /* a failed login or a dropped user: close once the requests received are answered */
-    int64_t t_open;       /* accepted at (monotonic s), for --login-timeout (main thread) */
-    bool auth_hold;       /* an AUTH_CONTINUE waits or runs: nothing more is read until it is answered (main) */
     auth_conn auth;       /* the worker running this connection's request (one at a time) */
-    struct fwdo *fwdo;    /* a forwarded request's pseudo-connection on its owner (fd -1): replies go back on the link */
 } conn;
+_Static_assert(offsetof(conn, prev) >= offsetof(conn, t_open) + sizeof(int64_t) + 64,
+               "conn read-mostly and event-loop sections must be separated by a cache line");
+_Static_assert(offsetof(conn, lock) >= offsetof(conn, cancel_running) + sizeof(atomic_bool) + 64,
+               "conn event-loop and worker sections must be separated by a cache line");
+
+static conn *conn_alloc(void)
+{
+    size_t sz = (sizeof(conn) + 63u) & ~(size_t)63u;
+    void *p = NULL;
+    if (posix_memalign(&p, 64, sz) != 0)
+        return NULL;
+    memset(p, 0, sz);
+    return p;
+}
 
 /* ------------------------------------------------------------ globals */
 
@@ -436,8 +478,9 @@ static size_t request_memory_now(void)
 
 static void req_free(req *r)
 {
-    atomic_fetch_sub(&req_mem.held, REQ_COST(r));
-    free(r->payload);
+    atomic_fetch_sub_explicit(&req_mem.held, REQ_COST(r), memory_order_relaxed);
+    if (r->owned_buf)
+        tsdb_free_big(r->owned_buf, r->owned_cap);
     free(r);
 }
 
@@ -932,6 +975,7 @@ static struct {
     _Alignas(64) pthread_mutex_t lock;
     int *fds;
     size_t n, cap;
+    atomic_bool has_fds; /* release-stored under lock in accept_main; acquire-checked lock-free in take_notes */
 } new_conns = {.lock = PTHREAD_MUTEX_INITIALIZER};
 _Static_assert(sizeof(new_conns) % 64 == 0, "new_conns must fill whole cache lines");
 
@@ -1004,6 +1048,7 @@ static void conn_cv_init(pthread_cond_t *cv)
 static void out_wait(conn *c)
 {
     worker_waits(1);
+    c->out_waiters++;
     while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
         bool nonup = dom.ndoms > 0 && dom_inside_nonup(atomic_load(&c->dom_v));
         if (!nonup) {
@@ -1033,6 +1078,7 @@ static void out_wait(conn *c)
         at.tv_sec += 1;
         pthread_cond_timedwait(&c->cv, &c->lock, &at);
     }
+    c->out_waiters--;
     worker_waits(-1);
 }
 #endif
@@ -1062,13 +1108,17 @@ static bool out_send(conn *c)
     if (done && done < len)
         memmove(c->out.p, c->out.p + done, len - done);
     c->out.len = len - done;
+    if (c->out.len == 0 && c->out.cap > BUF_KEEP)
+        buf_shrink(&c->out);
     atomic_fetch_add_explicit(&c->tx_total, (int64_t)done, memory_order_relaxed);
     pthread_mutex_lock(&c->lock);
     c->tx_worker = false;
     /* What the socket did not take now waits for it to drain: the main thread sends it, and everything appended
      * until it has drained the output, rather than this worker trying again (an EAGAIN and a move per piece). */
-    if (c->out.len)
+    if (c->out.len) {
         c->tx_loop = true;
+        atomic_store_explicit(&c->out_pending, true, memory_order_release);
+    }
     bool wake = c->out.len && !c->notified;
     if (wake)
         c->notified = true;
@@ -1147,6 +1197,7 @@ static bool out_put(conn *c, const struct iovec *iov, int n)
             if (direct) {
                 c->tx_worker = true;
             } else {
+                atomic_store_explicit(&c->out_pending, true, memory_order_release);
                 wake = !c->notified;
                 c->notified = true;
             }
@@ -4796,14 +4847,34 @@ static void in_account(conn *c)
     c->in_charged = now;
 }
 
+/* Ensures c->in has room for `extra` bytes beyond c->in_pad + c->in.len. */
+static int in_reserve(conn *c, size_t extra)
+{
+    size_t used = (size_t)c->in_pad + c->in.len;
+    if (used + extra <= c->in.cap)
+        return 0;
+    size_t cap = c->in.cap ? c->in.cap : 4096;
+    while (cap < used + extra)
+        cap *= 2;
+    uint8_t *p = realloc(c->in.p, cap);
+    if (!p)
+        return -1;
+    c->in.p = p;
+    c->in.cap = cap;
+    return 0;
+}
+
 /* Gives back a receive buffer grown for a large frame, unless one is being received into it. No recv may be in
  * flight. */
 static void in_shrink(conn *c)
 {
     uint32_t flen;
     if (c->in.cap <= IN_KEEP || c->in.len > IN_KEEP / 2 ||
-        (c->in.len >= 4 && (memcpy(&flen, c->in.p, 4), 4 + (size_t)flen > IN_KEEP)))
+        (c->in.len >= 4 && (memcpy(&flen, c->in.p + c->in_pad, 4), 4 + (size_t)flen > IN_KEEP)))
         return;
+    if (c->in_pad && c->in.len)
+        memmove(c->in.p, c->in.p + c->in_pad, c->in.len);
+    c->in_pad = 0;
     uint8_t *p = realloc(c->in.p, IN_KEEP);
     if (p) {
         c->in.p = p;
@@ -4958,13 +5029,13 @@ static bool submit_recv(conn *c)
     in_shrink(c);
     size_t want = RECV_MIN_FREE;
     uint32_t flen;
-    if (c->in.len >= 4 && (memcpy(&flen, c->in.p, 4), 4 + (size_t)flen > c->in.len)) {
+    if (c->in.len >= 4 && (memcpy(&flen, c->in.p + c->in_pad, 4), 4 + (size_t)flen > c->in.len)) {
         size_t rest = 4 + (size_t)flen - c->in.len;
         /* a large frame: the rest, into the buffer reserved for it; a small one: room for at least its rest,
          * which parse reserved, so the buffer never grows past IN_KEEP uncounted */
         want = 4 + (size_t)flen > IN_KEEP || rest < want ? rest : want;
     }
-    if (buf_reserve(&c->in, want) != 0)
+    if (in_reserve(c, want) != 0)
         return true;
     in_account(c);
     if (c->held) { /* the wait was the server's: the client gets the whole deadline again */
@@ -4986,7 +5057,8 @@ static bool submit_recv(conn *c)
         return false;
     }
     atomic_store_explicit(&c->recv_armed, true, memory_order_release);
-    io_uring_prep_recv(sqe, c->fd, c->in.p + c->in.len, c->in.cap - c->in.len, 0);
+    io_uring_prep_recv(sqe, c->fd, c->in.p + c->in_pad + c->in.len,
+                       c->in.cap - (size_t)c->in_pad - c->in.len, 0);
     io_uring_sqe_set_data(sqe, &c->recv_ev);
 #endif
     return true;
@@ -5007,13 +5079,19 @@ static bool submit_send(conn *c)
             c->sent = c->sending.len = 0;
             return true;
         }
-        buf t = c->sending;
-        c->sending = c->out;
-        c->out = t;
-        c->out.len = 0;
+        if (c->out.len > 0) {
+            buf t = c->sending;
+            c->sending = c->out;
+            c->out = t;
+            c->out.len = 0;
+        } else {
+            c->sending.len = 0;
+        }
         c->notified = false;
         c->tx_loop = c->sending.len > 0;
-        pthread_cond_broadcast(&c->cv);
+        atomic_store_explicit(&c->out_pending, false, memory_order_relaxed);
+        if (c->out_waiters > 0)
+            pthread_cond_broadcast(&c->cv);
         pthread_mutex_unlock(&c->lock);
         c->sent = 0;
         if (c->sending.len == 0) {
@@ -5097,8 +5175,9 @@ static void conn_free(conn *c)
     c->q_tail = c->mq_head = c->mq_tail = NULL;
     c->q_multi = 0;
     unpark(c);
-    free(c->in.p);
+    tsdb_free_big(c->in.p, c->in.cap);
     c->in = (buf){0};
+    c->in_pad = 0;
     in_account(c);
     if (io == IO_EPOLL && (size_t)c->fd < fd_conn_cap)
         fd_conn[c->fd] = NULL; /* before close: the number may come back for the next connection */
@@ -5124,7 +5203,8 @@ static void conn_close(conn *c)
         c->closed = true;
         pthread_mutex_lock(&c->lock);
         atomic_store(&c->closing, true);
-        pthread_cond_broadcast(&c->cv); /* a worker waiting for output space gives up */
+        if (c->out_waiters > 0)
+            pthread_cond_broadcast(&c->cv); /* a worker waiting for output space gives up */
         pthread_mutex_unlock(&c->lock);
         shutdown(c->fd, SHUT_RDWR); /* completes the outstanding recv (io_uring) */
         if (io == IO_EPOLL) {
@@ -5178,12 +5258,14 @@ static int parse(conn *c)
          * the note was answered AUTH again, and the connection stayed open as long as the client kept sending. */
         c->eof = true;
         c->in.len = 0;
+        c->in_pad = 0;
         c->frame_t0 = 0;
         return 0;
     }
     while (c->in.len - off >= 4) {
+        uint8_t *base = c->in.p + c->in_pad;
         uint32_t flen;
-        memcpy(&flen, c->in.p + off, 4);
+        memcpy(&flen, base + off, 4);
         if (flen < 5 || flen > TSDB_MAX_FRAME)
             return -1;
         bool pre = !atomic_load(&c->authed); /* before login (A5) */
@@ -5195,39 +5277,45 @@ static int parse(conn *c)
             break; /* read on once the login has moved on (on_wake) */
         size_t need = 4 + (size_t)flen;
         if (c->in.len - off < need) {
-            /* make room for the whole frame up front: exactly, for a large one, which request memory counts */
+            /* make room for the whole frame up front: exactly (+ IN_HDR_PAD for 16-byte payload alignment), for a
+             * large one, which request memory counts */
             if (off) {
-                memmove(c->in.p, c->in.p + off, c->in.len - off);
+                memmove(base, base + off, c->in.len - off);
                 c->in.len -= off;
                 off = 0;
             }
-            if (need > c->in.cap) {
+            if ((size_t)c->in_pad + need > c->in.cap) {
                 if (need > IN_KEEP) {
+                    size_t alloc_sz = IN_HDR_PAD + need;
                     size_t held = atomic_load_explicit(&req_mem.held, memory_order_relaxed) - c->in_charged;
-                    if (held && held + need > req_budget) {
+                    if (held && held + alloc_sz > req_budget) {
                         rc = 1;
                         break;
                     }
-                    uint8_t *p = realloc(c->in.p, need);
+                    uint8_t *p = malloc(alloc_sz);
                     if (!p)
                         return -1;
+                    if (c->in.len)
+                        memcpy(p + IN_HDR_PAD, c->in.p + c->in_pad, c->in.len);
+                    tsdb_free_big(c->in.p, c->in.cap);
                     c->in.p = p;
-                    c->in.cap = need;
-                } else if (buf_reserve(&c->in, need - c->in.len) != 0) {
+                    c->in.cap = alloc_sz;
+                    c->in_pad = IN_HDR_PAD;
+                } else if (in_reserve(c, need - c->in.len) != 0) {
                     return -1;
                 }
                 in_account(c);
             }
             break;
         }
-        if (pre && c->in.p[off + 8] == TSDB_OP_CANCEL) {
+        if (pre && base[off + 8] == TSDB_OP_CANCEL) {
             metrics_login(METRICS_LOGIN_REFUSED); /* nothing to cancel before login: a client that does not speak it */
             return -1;
         }
-        if (c->in.p[off + 8] == TSDB_OP_CANCEL) { /* no reply, and it must not wait behind the query it stops */
+        if (base[off + 8] == TSDB_OP_CANCEL) { /* no reply, and it must not wait behind the query it stops */
             if (flen == 9) {
                 uint32_t target;
-                memcpy(&target, c->in.p + off + 9, 4);
+                memcpy(&target, base + off + 9, 4);
                 cancel_multi(c, target);
             } else {
                 metrics_error(TSDB_ERR_INVALID); /* no reply to send it in, but a client's bug shows */
@@ -5237,22 +5325,41 @@ static int parse(conn *c)
             consumed = true;
             continue;
         }
-        req *r = calloc(1, sizeof *r);
-        if (!r)
-            return -1;
-        r->c = c;
-        r->t_arr = now_ns();
-        memcpy(&r->id, c->in.p + off + 4, 4);
-        r->op = c->in.p[off + 8];
-        r->len = flen - 5;
-        r->payload = malloc(r->len ? r->len : 1);
-        if (!r->payload) {
-            free(r);
-            return -1;
+        size_t plen = (size_t)flen - 5;
+        uint32_t rid;
+        memcpy(&rid, base + off + 4, 4);
+        uint8_t rop = base[off + 8];
+        req *r;
+        bool zerocopy = need > IN_KEEP && off == 0 && c->in.len == need &&
+                        ((uintptr_t)(base + 9) & 15u) == 0;
+        if (zerocopy) {
+            /* Transfer ownership of the whole large receive buffer directly to r with zero copy. */
+            r = malloc(sizeof *r);
+            if (!r)
+                return -1;
+            *r = (req){.c = c, .id = rid, .op = rop, .payload = base + 9,
+                       .owned_buf = c->in.p, .owned_cap = c->in.cap, .len = plen, .t_arr = now_ns()};
+            c->in = (buf){0};
+            c->in_pad = 0;
+            size_t cost = REQ_COST(r);
+            if (cost >= c->in_charged)
+                atomic_fetch_add_explicit(&req_mem.held, cost - c->in_charged, memory_order_relaxed);
+            else
+                atomic_fetch_sub_explicit(&req_mem.held, c->in_charged - cost, memory_order_relaxed);
+            c->in_charged = 0;
+            c->q_bytes += cost;
+        } else {
+            /* Single allocation with inline 16-byte aligned payload for normal and pipelined frames. */
+            r = malloc(sizeof *r + (plen ? plen : 1));
+            if (!r)
+                return -1;
+            *r = (req){.c = c, .id = rid, .op = rop, .payload = r->inline_data, .len = plen, .t_arr = now_ns()};
+            if (plen)
+                memcpy(r->payload, base + off + 9, plen);
+            size_t cost = REQ_COST(r);
+            atomic_fetch_add_explicit(&req_mem.held, cost, memory_order_relaxed);
+            c->q_bytes += cost;
         }
-        memcpy(r->payload, c->in.p + off + 9, r->len);
-        atomic_fetch_add_explicit(&req_mem.held, REQ_COST(r), memory_order_relaxed);
-        c->q_bytes += REQ_COST(r);
         if (c->q_tail)
             c->q_tail->next = r;
         else
@@ -5266,8 +5373,9 @@ static int parse(conn *c)
             c->mq_tail = r;
             c->q_multi++;
         }
-        off += need;
         consumed = true;
+        if (!zerocopy)
+            off += need;
         if ((r->op == TSDB_OP_HELLO && hello_refused(r->payload, r->len)) ||
             (pre && r->op != TSDB_OP_HELLO && r->op != TSDB_OP_AUTH_START && r->op != TSDB_OP_AUTH_CONTINUE)) {
             /* an older client: nothing it sends after this can be read right. It hears INVALID, then the
@@ -5281,9 +5389,14 @@ static int parse(conn *c)
             c->auth_hold = true; /* what follows is read as the login's outcome allows */
             break;
         }
+        if (zerocopy)
+            break;
     }
     if (off) {
-        memmove(c->in.p, c->in.p + off, c->in.len - off);
+        if (c->in.len > off)
+            memmove(c->in.p + c->in_pad, c->in.p + c->in_pad + off, c->in.len - off);
+        else
+            c->in_pad = 0;
         c->in.len -= off;
     }
     /* the deadline runs from the first byte of each frame */
@@ -5496,7 +5609,7 @@ static void on_accept(int fd)
     }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    conn *c = calloc(1, sizeof *c);
+    conn *c = conn_alloc();
     if (!c) {
         drop_new_conn(fd, "connection", ENOMEM);
         return;
@@ -5556,15 +5669,18 @@ static void take_notes(void)
         batch = top;
         top = next;
     }
-    pthread_mutex_lock(&new_conns.lock);
-    int *fds = new_conns.fds;
-    size_t nfds = new_conns.n;
-    new_conns.fds = NULL;
-    new_conns.n = new_conns.cap = 0;
-    pthread_mutex_unlock(&new_conns.lock);
-    for (size_t i = 0; i < nfds; i++)
-        on_accept(fds[i]);
-    free(fds);
+    if (atomic_load_explicit(&new_conns.has_fds, memory_order_acquire)) {
+        pthread_mutex_lock(&new_conns.lock);
+        int *fds = new_conns.fds;
+        size_t nfds = new_conns.n;
+        new_conns.fds = NULL;
+        new_conns.n = new_conns.cap = 0;
+        atomic_store_explicit(&new_conns.has_fds, false, memory_order_relaxed);
+        pthread_mutex_unlock(&new_conns.lock);
+        for (size_t i = 0; i < nfds; i++)
+            on_accept(fds[i]);
+        free(fds);
+    }
     for (note *nt = batch, *next; nt; nt = next) {
         next = nt->next; /* nt may be pushed again once handled */
         conn *c = nt->c;
@@ -5589,9 +5705,16 @@ static void take_notes(void)
             if (pr > 0)
                 park(c, true);
         }
-        if (!submit_send(c)) {
-            conn_close(c);
-            continue;
+        /* Fast path on n_done: when no send is in flight, no buffered bytes remain in sending, and the worker did not
+         * leave pending bytes in c->out (out_pending is release-stored under c->lock before notify(c, true)), skip
+         * submit_send() completely — avoiding c->lock and cv broadcast on every worker-sent reply. */
+        if (!c->send_inflight &&
+            (!done || c->sent < c->sending.len ||
+             atomic_load_explicit(&c->out_pending, memory_order_acquire))) {
+            if (!submit_send(c)) {
+                conn_close(c);
+                continue;
+            }
         }
         if (done) {
             dispatch(c);
@@ -5717,8 +5840,10 @@ static void uring_loop(void)
 #endif
 
 /* epoll: one round over the connections that were ready when it started.
- * in_ready stays set while one is handled, so it is not queued twice and a
- * close leaves the freeing to this loop. */
+ * Each ready socket drains up to EP_DRAIN_MAX non-blocking recv/send calls until EAGAIN, short recv,
+ * backpressure (recv_inflight/send_inflight cleared) or close, amortizing epoll_wait without starving others.
+ * in_ready stays set while one is handled, so it is not queued twice and a close leaves the freeing to this loop. */
+#define EP_DRAIN_MAX 8
 static void ep_round(void)
 {
     for (size_t n = nready; n > 0 && ready_head; n--) {
@@ -5727,25 +5852,30 @@ static void ep_round(void)
         if (!ready_head)
             ready_tail = NULL;
         nready--;
-        if (!c->dead && c->recv_inflight && c->readable) {
-            size_t room = c->in.cap - c->in.len;
-            ssize_t r = recv(c->fd, c->in.p + c->in.len, room, MSG_DONTWAIT);
+        for (int iter = 0; iter < EP_DRAIN_MAX && !c->dead && c->recv_inflight && c->readable; iter++) {
+            size_t room = c->in.cap - (size_t)c->in_pad - c->in.len;
+            ssize_t r = recv(c->fd, c->in.p + c->in_pad + c->in.len, room, MSG_DONTWAIT);
             int err = errno;
-            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK))
+            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK)) {
                 c->readable = false;
-            else if (r >= 0 || err != EINTR) {
-                if (r == 0 || (r > 0 && (size_t)r < room && !c->rdhup))
-                    c->readable = false;
-                on_recv(c, r < 0 ? -err : r);
+                break;
             }
+            if (r < 0 && err == EINTR)
+                continue;
+            if (r == 0 || (r > 0 && (size_t)r < room && !c->rdhup))
+                c->readable = false;
+            on_recv(c, r < 0 ? -err : r);
         }
-        if (!c->dead && c->send_inflight && c->writable) {
+        for (int iter = 0; iter < EP_DRAIN_MAX && !c->dead && c->send_inflight && c->writable; iter++) {
             ssize_t r = send(c->fd, c->sending.p + c->sent, c->sending.len - c->sent, MSG_NOSIGNAL | MSG_DONTWAIT);
             int err = errno;
-            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK))
+            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK)) {
                 c->writable = false;
-            else if (r >= 0 || err != EINTR)
-                on_send(c, r < 0 ? -err : r);
+                break;
+            }
+            if (r < 0 && err == EINTR)
+                continue;
+            on_send(c, r < 0 ? -err : r);
         }
         c->in_ready = false;
         if (c->dead)
@@ -5857,6 +5987,7 @@ static void *accept_main(void *arg)
                 abort();
         }
         new_conns.fds[new_conns.n++] = fd;
+        atomic_store_explicit(&new_conns.has_fds, true, memory_order_release);
         pthread_mutex_unlock(&new_conns.lock);
         wake_signal();
     }
@@ -7273,7 +7404,8 @@ int main(int argc, char **argv)
     for (conn *c = conns; c; c = c->next) { /* wake workers waiting for output space */
         pthread_mutex_lock(&c->lock);
         atomic_store(&c->closing, true);
-        pthread_cond_broadcast(&c->cv);
+        if (c->out_waiters > 0)
+            pthread_cond_broadcast(&c->cv);
         pthread_mutex_unlock(&c->lock);
     }
     for (int i = 0; i < nworkers; i++)

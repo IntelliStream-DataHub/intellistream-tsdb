@@ -324,17 +324,18 @@ static void check_replies(conn *c, uint32_t seq, uint8_t op)
  * false: the connection closed (or parked for memory, which only a large frame's partial header can be here). */
 static bool feed(conn *c, const uint8_t *p, size_t n, uint32_t *seq)
 {
-    if (buf_reserve(&c->in, n) != 0)
+    if (in_reserve(c, n) != 0)
         abort();
-    memcpy(c->in.p + c->in.len, p, n);
+    memcpy(c->in.p + c->in_pad + c->in.len, p, n);
     c->in.len += n;
+    in_account(c);
     bool ok = parse(c) == 0;
     while (c->q_head) {
         req *r = c->q_head;
         c->q_head = r->next;
         if (!c->q_head)
             c->q_tail = NULL;
-        c->q_bytes -= r->len;
+        c->q_bytes -= REQ_COST(r);
         atomic_store(&c->cancel_running, r->cancelled); /* as dispatch() does: a CANCEL that came first */
         uint8_t op = r->op;
         r->id = *seq;
@@ -394,8 +395,9 @@ static void run_one(const uint8_t *in, size_t len)
     auth_conn_free(&c->auth);
     if (users_dirty)
         users_reset();
-    free(c->in.p);
+    tsdb_free_big(c->in.p, c->in.cap);
     c->in = (buf){0};
+    c->in_pad = 0;
     in_account(c);
     free(c->out.p);
     pthread_mutex_destroy(&c->lock);
