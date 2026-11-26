@@ -2802,6 +2802,150 @@ static int hosts_run(const struct hosts_opt *o)
     return failures ? 1 : 0;
 }
 
+/* Batched WR posting and conditional CQ arming (P-38): wrap pfk_ops with post_send_batch/post_recv_batch and
+ * counters, verify multi-slot sends/receives hit batched doorbells, partial batch failure preserves D5 byte count
+ * and drains cleanly, and rd_poll_fds skips arm() when already ready. */
+static _Atomic uint64_t b_send_calls, b_send_wrs, b_recv_calls, b_recv_wrs, b_arm_calls;
+static _Atomic int b_fail_send_after;
+
+static int b_arm(struct plr_qp *q)
+{
+    atomic_fetch_add(&b_arm_calls, 1);
+    return pfk_arm(q);
+}
+
+static int b_post_send_batch(struct plr_qp *q, const struct plr_send_wr *wrs, int count)
+{
+    atomic_fetch_add(&b_send_calls, 1);
+    atomic_fetch_add(&b_send_wrs, (uint64_t)count);
+    int lim = atomic_load(&b_fail_send_after);
+    for (int i = 0; i < count; i++) {
+        if (lim > 0 && i == lim) {
+            errno = EIO;
+            return i;
+        }
+        if (pfk_post_send(q, wrs[i].id, wrs[i].p, wrs[i].n, wrs[i].lkey, wrs[i].signaled) < 0)
+            return i;
+    }
+    return count;
+}
+
+static int b_post_recv_batch(struct plr_qp *q, const struct plr_recv_wr *wrs, int count)
+{
+    atomic_fetch_add(&b_recv_calls, 1);
+    atomic_fetch_add(&b_recv_wrs, (uint64_t)count);
+    for (int i = 0; i < count; i++) {
+        if (pfk_post_recv(q, wrs[i].id, wrs[i].p, wrs[i].n, wrs[i].lkey) < 0)
+            return i;
+    }
+    return count;
+}
+
+static const struct plr_ops pfk_batch_ops = {
+    "fake-batch",   pfk_dev_open,      pfk_dev_close, pfk_reg,        pfk_dereg,          pfk_qp_new,
+    pfk_qp_rts,     pfk_qp_err,        pfk_qp_free,   pfk_fd,         b_arm,              pfk_take_events,
+    pfk_poll,       pfk_post_send,     pfk_post_recv, b_post_send_batch, b_post_recv_batch};
+
+static void test_batch(void)
+{
+    atomic_store(&b_send_calls, 0);
+    atomic_store(&b_send_wrs, 0);
+    atomic_store(&b_recv_calls, 0);
+    atomic_store(&b_recv_wrs, 0);
+    atomic_store(&b_arm_calls, 0);
+    atomic_store(&b_fail_send_after, 0);
+    char err[256];
+    struct plr_pool_cfg c = small_cfg();
+    c.data_slots = 8;
+    c.send_slots = 12;
+    struct rig r;
+    memset(&r, 0, sizeof r);
+    r.f = pfk_new();
+    r.f->slow_flush = 1;
+    r.pa = plr_pool_open(&pfk_batch_ops, &c, err, sizeof err);
+    r.pb = plr_pool_open(&pfk_batch_ops, &c, err, sizeof err);
+    CHECK(r.pa && r.pb);
+    if (!r.pa || !r.pb) {
+        pfk_free(r.f);
+        return;
+    }
+    plr_pool_test_on_free(r.pa, on_free, r.f);
+    plr_pool_test_on_free(r.pb, on_free, r.f);
+    r.a = node_new(1, 100, 2000);
+    r.b = node_new(2, 100, 2000);
+    attach(&r);
+    struct plink *la = link_of(r.a, 2), *lb = link_of(r.b, 1);
+    CHECK(la && lb);
+    if (la && lb) {
+        int n = quick ? 80 : 200;
+        uint64_t na = 0, nb = 0, s1 = 31, s2 = 37;
+        send_frames(la, &na, n, &s1);
+        send_frames(lb, &nb, n, &s2);
+        CHECK(WAIT_FOR(atomic_load(&r.a->in) == (uint64_t)n && atomic_load(&r.b->in) == (uint64_t)n, 20000));
+        uint64_t sc = atomic_load(&b_send_calls), sw = atomic_load(&b_send_wrs);
+        uint64_t rc = atomic_load(&b_recv_calls), rw = atomic_load(&b_recv_wrs);
+        printf("  batch: send batches %" PRIu64 " (%" PRIu64 " WRs), recv batches %" PRIu64 " (%" PRIu64 " WRs)\n", sc,
+               sw, rc, rw);
+        CHECK(atomic_load(&r.a->bad) == 0 && atomic_load(&r.b->bad) == 0);
+        CHECK(atomic_load(&r.a->downs) == 0 && atomic_load(&r.b->downs) == 0);
+        CHECK(sc > 0 && sw > sc);
+        CHECK(rc > 0 && rw > rc);
+    }
+    rig_down(&r, "batch-link");
+
+    /* Conditional CQ arming + partial post_send_batch failure */
+    struct pfk_fab *f = pfk_new();
+    f->slow_flush = 1;
+    struct plr_pool *pa = plr_pool_open(&pfk_batch_ops, &c, err, sizeof err);
+    struct plr_pool *pb = plr_pool_open(&pfk_batch_ops, &c, err, sizeof err);
+    CHECK(pa && pb);
+    if (pa && pb) {
+        plr_pool_test_on_free(pa, on_free, f);
+        plr_pool_test_on_free(pb, on_free, f);
+        struct plr_conn *ca = plr_conn_new(pa, err, sizeof err), *cb = plr_conn_new(pb, err, sizeof err);
+        CHECK(ca && cb);
+        if (ca && cb) {
+            struct plr_ep ea, eb;
+            plr_conn_ep(ca, &ea);
+            plr_conn_ep(cb, &eb);
+            CHECK(plr_conn_start(ca, &eb, err, sizeof err) == 0);
+            CHECK(plr_conn_start(cb, &ea, err, sizeof err) == 0);
+            struct pl_transport *ta = plr_conn_transport(ca, NULL);
+            struct pl_transport *tb = plr_conn_transport(cb, NULL);
+            /* ready != 0 (PL_TR_OUT available) must NOT call arm() */
+            struct pollfd pf[PL_TR_POLL_MAX];
+            int ready = 0;
+            uint64_t a0 = atomic_load(&b_arm_calls);
+            CHECK(ta->ops->poll_fds(ta, PL_TR_OUT, pf, &ready) >= 1 && (ready & PL_TR_OUT));
+            CHECK(atomic_load(&b_arm_calls) == a0);
+            /* ready == 0 (PL_TR_IN with nothing received) MUST call arm() */
+            CHECK(ta->ops->poll_fds(ta, PL_TR_IN, pf, &ready) >= 1 && ready == 0);
+            CHECK(atomic_load(&b_arm_calls) == a0 + 1);
+            /* Partial post_send_batch failure after 2 of 4 slots: writev returns exactly 2 * room bytes */
+            uint32_t room = c.slot - PLR_HDR;
+            uint8_t *buf = calloc(4, room);
+            struct iovec iov = {buf, (size_t)4 * room};
+            atomic_store(&b_fail_send_after, 2);
+            ssize_t w = ta->ops->writev(ta, &iov, 1);
+            atomic_store(&b_fail_send_after, 0);
+            CHECK(w == (ssize_t)(2 * room));
+            CHECK(ta->ops->writev(ta, &iov, 1) < 0 && errno == EIO);
+            free(buf);
+            ta->ops->close(ta);
+            tb->ops->close(tb);
+        }
+        struct plr_pool_stats sa, sb;
+        plr_pool_stats(pa, &sa);
+        plr_pool_stats(pb, &sb);
+        CHECK(sa.free == sa.slots && sb.free == sb.slots && sa.lost == 0 && sb.lost == 0);
+        plr_pool_close(pa);
+        plr_pool_close(pb);
+    }
+    CHECK(pfk_live_qps(f) == 0 && atomic_load(&f->violations) == 0 && atomic_load(&early_frees) == 0);
+    pfk_free(f);
+    atomic_store(&early_frees, 0);
+}
+
 static const struct {
     const char *name;
     int m;
@@ -2895,7 +3039,7 @@ int main(int argc, char **argv)
                  {"lateready", test_lateready}, {"abortseq", test_abortseq}, {"golost", test_golost},
                  {"declines", test_declines}, {"badauth", test_badauth},   {"backoff", test_backoff},
                  {"keepqueue", test_keepqueue}, {"ipoib", test_ipoib},     {"upframes", test_upframes},
-                 {"testhook", test_testhook},
+                 {"testhook", test_testhook}, {"batch", test_batch},
                  {"cmupgrade", test_cm_upgrade}, {"cmbadauth", test_cm_badauth}, {"cmfallback", test_cm_fallback}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && !strstr(only, cases[i].name))

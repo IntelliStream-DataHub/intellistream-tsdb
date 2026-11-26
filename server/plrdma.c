@@ -493,6 +493,8 @@ static void fail(struct plr_conn *c, int e)
         c->err = e ? e : EIO;
 }
 
+#define PLR_BATCH_MAX 32
+
 static void repost(struct plr_conn *c, uint32_t i)
 {
     if (c->ops->post_recv(c->qp, WR(WR_RECV, i), slot_at(c, i), c->pool->cfg.slot, c->pool->lkey) < 0) {
@@ -502,7 +504,48 @@ static void repost(struct plr_conn *c, uint32_t i)
     c->posted_rx++;
 }
 
-static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
+static void repost_batch(struct plr_conn *c, const uint16_t *idxs, int count)
+{
+    if (count <= 0 || c->err)
+        return;
+    if (count == 1 || !c->ops->post_recv_batch) {
+        for (int i = 0; i < count && !c->err; i++)
+            repost(c, idxs[i]);
+        return;
+    }
+    int off = 0;
+    while (off < count && !c->err) {
+        int m = count - off;
+        if (m > PLR_BATCH_MAX)
+            m = PLR_BATCH_MAX;
+        struct plr_recv_wr wrs[PLR_BATCH_MAX];
+        for (int i = 0; i < m; i++) {
+            uint32_t idx = idxs[off + i];
+            wrs[i] = (struct plr_recv_wr){WR(WR_RECV, idx), slot_at(c, idx), c->pool->cfg.slot, c->pool->lkey};
+        }
+        int done = c->ops->post_recv_batch(c->qp, wrs, m);
+        if (done > 0)
+            c->posted_rx += done;
+        if (done < m) {
+            fail(c, errno);
+            return;
+        }
+        off += m;
+    }
+}
+
+static int post_sends(struct plr_conn *c, const struct plr_send_wr *wrs, int count)
+{
+    if (count > 1 && c->ops->post_send_batch)
+        return c->ops->post_send_batch(c->qp, wrs, count);
+    for (int i = 0; i < count; i++) {
+        if (c->ops->post_send(c->qp, wrs[i].id, wrs[i].p, wrs[i].n, wrs[i].lkey, wrs[i].signaled) < 0)
+            return i;
+    }
+    return count;
+}
+
+static void complete(struct plr_conn *c, const struct plr_wc *w, int closing, uint16_t *rx_repost, int *nrx)
 {
     unsigned kind = (unsigned)(w->wr_id >> 32);
     uint32_t i = (uint32_t)w->wr_id;
@@ -571,7 +614,12 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
     if (h[0] == MSG_CREDIT) {
         ST_ADD(c, credit_in, 1);
         if (plrdma_mutant != PLR_MUT_PAUSECTL) {
-            repost(c, i); /* at once, paused or not: control credits are never withheld */
+            /* at once, paused or not: control credits are never withheld (batched by pump) */
+            rx_repost[(*nrx)++] = (uint16_t)i;
+            if (*nrx == PLR_BATCH_MAX) {
+                repost_batch(c, rx_repost, *nrx);
+                *nrx = 0;
+            }
             c->owed_ctl++;
             return;
         }
@@ -585,10 +633,13 @@ static void complete(struct plr_conn *c, const struct plr_wc *w, int closing)
 static void pump(struct plr_conn *c, int closing)
 {
     struct plr_wc wc[16];
-    int n;
+    uint16_t rx_repost[PLR_BATCH_MAX];
+    int nrx = 0, n;
     while ((n = c->ops->poll(c->qp, wc, 16)) > 0)
         for (int j = 0; j < n; j++)
-            complete(c, &wc[j], closing);
+            complete(c, &wc[j], closing, rx_repost, &nrx);
+    if (nrx > 0 && !closing)
+        repost_batch(c, rx_repost, nrx);
     if (n < 0 && !closing)
         fail(c, errno);
 }
@@ -689,6 +740,8 @@ static ssize_t rd_read(struct pl_transport *t, void *out, size_t n)
     struct plr_conn *c = (struct plr_conn *)t;
     if (!c->rq_n && !c->err)
         pump(c, 0);
+    uint16_t rx_repost[PLR_BATCH_MAX];
+    int nrx = 0;
     size_t got = 0;
     while (got < n && c->rq_n) {
         uint16_t i = c->rq[c->rq_head];
@@ -703,14 +756,21 @@ static ssize_t rd_read(struct pl_transport *t, void *out, size_t n)
             int was_ctl = s->len == 0; /* only PLR_MUT_PAUSECTL queues a CREDIT's slot */
             c->rq_head = (uint16_t)((c->rq_head + 1) % c->R);
             c->rq_n--;
-            if (!c->err)
-                repost(c, i);
+            if (!c->err) {
+                rx_repost[nrx++] = i;
+                if (nrx == PLR_BATCH_MAX) {
+                    repost_batch(c, rx_repost, nrx);
+                    nrx = 0;
+                }
+            }
             if (was_ctl)
                 c->owed_ctl++;
             else
                 c->owed_data++;
         }
     }
+    if (nrx > 0 && !c->err)
+        repost_batch(c, rx_repost, nrx);
     if (got) {
         ST_ADD(c, bytes_in, got);
         return (ssize_t)got;
@@ -744,6 +804,11 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
         vo -= iov[vi].iov_len;
         vi++;
     }
+    int force_single = 0;
+#ifdef TSDB_TEST_HOOKS
+    if (c->pool->test_qperr_every || c->pool->test_qperr_file[0])
+        force_single = 1;
+#endif
     while (pos < total && !c->err) {
         if ((c->cr_data <= 0 && plrdma_mutant != PLR_MUT_NOCREDIT) || c->s_n >= c->S) {
             if (c->cr_data <= 0) {
@@ -752,28 +817,103 @@ static ssize_t rd_writev(struct pl_transport *t, const struct iovec *iov, int n)
             }
             break;
         }
-        uint32_t k = (uint32_t)(total - pos < c->room ? total - pos : c->room);
-        uint8_t *b = slot_at(c, c->R + (c->s_head + c->s_n) % c->S) + PLR_HDR;
-        for (uint32_t got = 0; got < k;) {
-            size_t m = iov[vi].iov_len - vo;
-            if (m > k - got)
-                m = k - got;
-            memcpy(b + got, (const uint8_t *)iov[vi].iov_base + vo, m);
-            got += (uint32_t)m;
-            vo += m;
-            if (vo == iov[vi].iov_len) {
-                vi++;
-                vo = 0;
+        if (force_single) {
+            uint32_t k = (uint32_t)(total - pos < c->room ? total - pos : c->room);
+            uint8_t *b = slot_at(c, c->R + (c->s_head + c->s_n) % c->S) + PLR_HDR;
+            for (uint32_t got = 0; got < k;) {
+                size_t m = iov[vi].iov_len - vo;
+                if (m > k - got)
+                    m = k - got;
+                memcpy(b + got, (const uint8_t *)iov[vi].iov_base + vo, m);
+                got += (uint32_t)m;
+                vo += m;
+                if (vo == iov[vi].iov_len) {
+                    vi++;
+                    vo = 0;
+                }
             }
+            uint32_t wire = plrdma_mutant == PLR_MUT_SPLITOFF && k == c->room ? k - 1 : k;
+            if (send_msg(c, MSG_DATA, wire, k) < 0)
+                break;
+            if (plrdma_mutant != PLR_MUT_NOCREDIT || c->cr_data > 0)
+                c->cr_data--;
+            ST_SET(c, credits, c->cr_data);
+            pos += k;
+            posted += k;
+            continue;
         }
-        uint32_t wire = plrdma_mutant == PLR_MUT_SPLITOFF && k == c->room ? k - 1 : k;
-        if (send_msg(c, MSG_DATA, wire, k) < 0)
+        struct plr_send_wr wrs[PLR_BATCH_MAX];
+        uint16_t b_si[PLR_BATCH_MAX], b_unsig[PLR_BATCH_MAX];
+        int b_ctl[PLR_BATCH_MAX], b_data[PLR_BATCH_MAX], b_sig[PLR_BATCH_MAX];
+        uint32_t b_stream[PLR_BATCH_MAX];
+        int nb = 0;
+        int cur_cr = c->cr_data, cur_owed_ctl = c->owed_ctl, cur_owed_data = c->owed_data;
+        uint16_t cur_sn = c->s_n, cur_unsig = c->unsig;
+        while (pos < total && nb < PLR_BATCH_MAX) {
+            if ((cur_cr <= 0 && plrdma_mutant != PLR_MUT_NOCREDIT) || cur_sn >= c->S)
+                break;
+            uint32_t k = (uint32_t)(total - pos < c->room ? total - pos : c->room);
+            uint16_t si = (uint16_t)((c->s_head + cur_sn) % c->S);
+            uint8_t *slot = slot_at(c, c->R + si);
+            uint8_t *b = slot + PLR_HDR;
+            for (uint32_t got = 0; got < k;) {
+                size_t m = iov[vi].iov_len - vo;
+                if (m > k - got)
+                    m = k - got;
+                memcpy(b + got, (const uint8_t *)iov[vi].iov_base + vo, m);
+                got += (uint32_t)m;
+                vo += m;
+                if (vo == iov[vi].iov_len) {
+                    vi++;
+                    vo = 0;
+                }
+            }
+            uint32_t wire = plrdma_mutant == PLR_MUT_SPLITOFF && k == c->room ? k - 1 : k;
+            int ctl = cur_owed_ctl > 255 ? 255 : cur_owed_ctl;
+            int data = cur_owed_data > 65535 ? 65535 : cur_owed_data;
+            slot[0] = MSG_DATA;
+            slot[1] = (uint8_t)ctl;
+            put16(slot + 2, (uint16_t)data);
+            put32(slot + 4, wire);
+            cur_owed_ctl -= ctl;
+            cur_owed_data -= data;
+            int sig = plrdma_mutant == PLR_MUT_WRITTENCQE || ++cur_unsig >= c->sig_every || cur_sn + 1 == c->S;
+            if (sig)
+                cur_unsig = 0;
+            wrs[nb] = (struct plr_send_wr){WR(WR_SEND, si), slot, PLR_HDR + wire, c->pool->lkey, sig};
+            b_si[nb] = si;
+            b_ctl[nb] = ctl;
+            b_data[nb] = data;
+            b_unsig[nb] = cur_unsig;
+            b_stream[nb] = k;
+            b_sig[nb] = sig;
+            nb++;
+            if (!(plrdma_mutant == PLR_MUT_UNSIGEARLY && !sig))
+                cur_sn++;
+            if (plrdma_mutant != PLR_MUT_NOCREDIT || cur_cr > 0)
+                cur_cr--;
+            pos += k;
+        }
+        int done = post_sends(c, wrs, nb);
+        for (int j = 0; j < done; j++) {
+            c->owed_ctl -= b_ctl[j];
+            c->owed_data -= b_data[j];
+            c->unsig = b_unsig[j];
+            c->s_len[b_si[j]] = b_stream[j];
+            if (!(plrdma_mutant == PLR_MUT_UNSIGEARLY && !b_sig[j]))
+                c->s_n++;
+            if (plrdma_mutant != PLR_MUT_NOCREDIT || c->cr_data > 0)
+                c->cr_data--;
+            posted += b_stream[j];
+        }
+        if (done > 0) {
+            ST_ADD(c, msgs_out, done);
+            ST_SET(c, credits, c->cr_data);
+        }
+        if (done < nb) {
+            fail(c, errno);
             break;
-        if (plrdma_mutant != PLR_MUT_NOCREDIT || c->cr_data > 0)
-            c->cr_data--;
-        ST_SET(c, credits, c->cr_data);
-        pos += k;
-        posted += k;
+        }
     }
     ST_ADD(c, bytes_out, posted);
     size_t taken = posted;
@@ -817,11 +957,16 @@ static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int 
             while (!c->rq_n && !c->err && !c->ended && mono_ns_rdma() < until)
                 pump(c, 0);
         }
-        if (c->ops->arm(c->qp) < 0)
-            fail(c, errno);
-        if (plrdma_mutant != PLR_MUT_NOREARM)
-            pump(c, 0); /* a completion between the drain and the arm raises no event */
         maybe_credit(c);
+        /* Only arm CQ when the link thread will actually sleep in poll(); when ready != 0 peerlink uses timeout 0. */
+        if (!c->err && ready_mask(c, want) == 0) {
+            if (c->ops->arm(c->qp) < 0)
+                fail(c, errno);
+            if (!c->err && plrdma_mutant != PLR_MUT_NOREARM) {
+                pump(c, 0); /* a completion between the drain and the arm raises no event */
+                maybe_credit(c);
+            }
+        }
     }
     pf[0] = (struct pollfd){c->ops->fd(c->qp), POLLIN, 0};
     int k = 1;
@@ -1042,8 +1187,13 @@ struct plr_conn *plr_conn_new(struct plr_pool *p, char *err, size_t errlen)
         return NULL;
     }
     c->psn = new_psn();
-    for (uint32_t i = 0; i < c->R && !c->err; i++)
-        repost(c, i);
+    for (uint32_t off = 0; off < c->R && !c->err;) {
+        uint16_t idxs[PLR_BATCH_MAX];
+        int m = 0;
+        while (off < c->R && m < PLR_BATCH_MAX)
+            idxs[m++] = (uint16_t)off++;
+        repost_batch(c, idxs, m);
+    }
     if (c->err) {
         snprintf(err, errlen, "RDMA: posting the receives failed: %s", strerror(c->err));
         conn_release(c);
@@ -1196,8 +1346,13 @@ struct plr_conn *plr_conn_new_cm(struct plr_pool *p, const struct plr_cm_ops *cm
         conn_release(c); /* c->cm_id is still NULL: caller retains cm_id on failure */
         return NULL;
     }
-    for (uint32_t i = 0; i < c->R && !c->err; i++)
-        repost(c, i);
+    for (uint32_t off = 0; off < c->R && !c->err;) {
+        uint16_t idxs[PLR_BATCH_MAX];
+        int m = 0;
+        while (off < c->R && m < PLR_BATCH_MAX)
+            idxs[m++] = (uint16_t)off++;
+        repost_batch(c, idxs, m);
+    }
     if (c->err) {
         snprintf(err, errlen, "RDMA CM: posting the receives failed: %s", strerror(c->err));
         conn_release(c); /* c->cm_id is still NULL: caller retains cm_id on failure */

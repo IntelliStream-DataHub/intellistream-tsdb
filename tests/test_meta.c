@@ -450,7 +450,9 @@ static void test_state_machine(void)
         meta_copy(&unfrozen, &prev);
         unfrozen.pend[0].freeze_epoch = 0; /* the freeze never committed */
         meta_copy(&cheat, &prev);
-        cheat.slot_home[100] = 1;
+        CHECK(cheat.slot_home == prev.slot_home && unfrozen.slot_home == prev.slot_home);
+        meta_slot_home_mut(&cheat)[100] = 1;
+        CHECK(cheat.slot_home != prev.slot_home && prev.slot_home[100] == 0 && unfrozen.slot_home[100] == 0);
         cheat.npend = 0;
         CHECK(meta_check_step(&unfrozen, &cheat, why, sizeof why) != 0);
         unfrozen.npend = 0; /* no pending move at all */
@@ -458,6 +460,24 @@ static void test_state_machine(void)
         meta_free(&cheat);
         meta_free(&unfrozen);
         meta_free(&prev);
+        /* COW slot_home: non-slot apply keeps the shared buffer, and a malformed entry after a slot write rolls back */
+        meta_copy(&prev, &m);
+        CHECK(prev.slot_home == m.slot_home);
+        meta_op_member_flags(&e, 2, meta_member(&m, 2)->incarnation, META_MF_ALL);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        CHECK(prev.slot_home == m.slot_home);
+        meta_free(&prev);
+        /* rollback on META_ERR_FORMAT after mutating slot_home in scratch */
+        uint32_t h100_before = m.slot_home[100];
+        meta_op_slot_move_pending(&e, 100, h100_before, h100_before ^ 1);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_slot_freeze(&e, 100, h100_before, meta_volume(&m, h100_before)->epoch);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK);
+        meta_op_slot_move(&e, 100, h100_before ^ 1);
+        meta_op_domain_state(&e, "bad", 9); /* triggers META_ERR_FORMAT after scratch cloned & mutated slot_home */
+        CHECK(apply1(&m, &e, res, 8) == META_ERR_FORMAT && m.slot_home[100] == h100_before);
+        meta_op_slot_move_cancel(&e, 100);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && m.slot_home[100] == h100_before);
         /* a move that is cancelled leaves the home and the chain as they were */
         meta_op_slot_move_pending(&e, 200, 0, 1);
         meta_op_slot_move_cancel(&e, 200);

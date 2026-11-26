@@ -119,6 +119,21 @@ struct plr_wc {
     uint8_t rnr; /* 1 when RNR retry limit was exceeded */
 };
 
+struct plr_send_wr {
+    uint64_t id;
+    const void *p;
+    uint32_t n;
+    uint32_t lkey;
+    int signaled;
+};
+
+struct plr_recv_wr {
+    uint64_t id;
+    void *p;
+    uint32_t n;
+    uint32_t lkey;
+};
+
 /* The verbs, as the transport uses them. Every call is made by one thread at a time per queue pair (the link
  * thread's), dev_open, reg and dereg by the pool's opener. -1 with errno, or NULL with errno, on failure. */
 struct plr_ops {
@@ -141,6 +156,10 @@ struct plr_ops {
     /* n 0 and p NULL: a marker with no scatter entry */
     int (*post_send)(struct plr_qp *q, uint64_t id, const void *p, uint32_t n, uint32_t lkey, int signaled);
     int (*post_recv)(struct plr_qp *q, uint64_t id, void *p, uint32_t n, uint32_t lkey);
+    /* Optional batched posting (NULL falls back to post_send/post_recv): chains WRs into one doorbell.
+     * Returns the count of WRs successfully posted (0..count); if < count, errno holds the failure cause. */
+    int (*post_send_batch)(struct plr_qp *q, const struct plr_send_wr *wrs, int count);
+    int (*post_recv_batch)(struct plr_qp *q, const struct plr_recv_wr *wrs, int count);
 };
 
 struct plr_pool_cfg {
