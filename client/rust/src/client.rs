@@ -1037,7 +1037,9 @@ impl Client {
             if self.pending >= MAX_PIPELINE {
                 self.collect_ack()?;
             }
-            if self.retry.is_some() && self.pending > 0 && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes >= KEEP_BYTES)
+            if self.retry.is_some()
+                && self.pending > 0
+                && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes_total() >= KEEP_BYTES)
             {
                 self.drain()?;
             }
@@ -1084,7 +1086,9 @@ impl Client {
             if self.pending >= MAX_PIPELINE {
                 self.collect_ack()?;
             }
-            if self.retry.is_some() && self.pending > 0 && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes >= KEEP_BYTES)
+            if self.retry.is_some()
+                && self.pending > 0
+                && (self.kept.len() >= KEEP_FRAMES || self.kept_bytes_total() >= KEEP_BYTES)
             {
                 self.drain()?;
             }
@@ -2408,6 +2412,11 @@ impl Client {
         }
     }
 
+    /// Total bytes retained for retry across `self.kept` and any single-flight frame still in `self.req`.
+    fn kept_bytes_total(&self) -> usize {
+        self.kept_bytes + self.req_kept_id.map_or(0, |_| self.req.len())
+    }
+
     /// Moves a single-flight frame held in `self.req` into `self.kept` (zero-copy).
     fn promote_req_kept(&mut self) {
         if let Some(id) = self.req_kept_id.take() {
@@ -2453,7 +2462,7 @@ impl Client {
                 // Single-flight: keep the frame in `self.req` without cloning `frame.to_vec()`.
                 self.req_kept_id = Some(self.next_id);
             } else {
-                self.promote_req_kept();
+                debug_assert!(self.req_kept_id.is_none());
                 let frame = self.req.finish();
                 self.kept_bytes += frame.len();
                 self.kept.push_back(Kept { id: self.next_id, frame: frame.to_vec() });

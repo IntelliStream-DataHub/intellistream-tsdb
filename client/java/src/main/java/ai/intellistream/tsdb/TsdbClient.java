@@ -454,6 +454,11 @@ public final class TsdbClient implements AutoCloseable {
             }
         }
         closed = true;
+        kept.clear();
+        keptBytes = 0;
+        cur = null;
+        keptReuse = null;
+        keptReuseBusy = false;
         closeQuietly(ch);
         closeQuietly(selector);
         if (zstd != null)

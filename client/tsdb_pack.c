@@ -32,14 +32,14 @@ static void transpose_to_planes(const uint8_t *v, uint8_t *o, size_t n, unsigned
 #if defined(__SSE2__)
             for (; j + 16 <= m; j += 16) {
                 const uint8_t *s = src + j * 8;
-                __m128i p0 = _mm_loadu_si128((const __m128i *)(s + 0));
-                __m128i p1 = _mm_loadu_si128((const __m128i *)(s + 16));
-                __m128i p2 = _mm_loadu_si128((const __m128i *)(s + 32));
-                __m128i p3 = _mm_loadu_si128((const __m128i *)(s + 48));
-                __m128i p4 = _mm_loadu_si128((const __m128i *)(s + 64));
-                __m128i p5 = _mm_loadu_si128((const __m128i *)(s + 80));
-                __m128i p6 = _mm_loadu_si128((const __m128i *)(s + 96));
-                __m128i p7 = _mm_loadu_si128((const __m128i *)(s + 112));
+                __m128i p0 = _mm_loadu_si128((const __m128i *)(const void *)(s + 0));
+                __m128i p1 = _mm_loadu_si128((const __m128i *)(const void *)(s + 16));
+                __m128i p2 = _mm_loadu_si128((const __m128i *)(const void *)(s + 32));
+                __m128i p3 = _mm_loadu_si128((const __m128i *)(const void *)(s + 48));
+                __m128i p4 = _mm_loadu_si128((const __m128i *)(const void *)(s + 64));
+                __m128i p5 = _mm_loadu_si128((const __m128i *)(const void *)(s + 80));
+                __m128i p6 = _mm_loadu_si128((const __m128i *)(const void *)(s + 96));
+                __m128i p7 = _mm_loadu_si128((const __m128i *)(const void *)(s + 112));
 
                 __m128i u0 = _mm_unpacklo_epi64(p0, p4);
                 __m128i u1 = _mm_unpackhi_epi64(p0, p4);
@@ -77,14 +77,14 @@ static void transpose_to_planes(const uint8_t *v, uint8_t *o, size_t n, unsigned
                 __m128i f2 = _mm_unpacklo_epi32(d1, d3);
                 __m128i f3 = _mm_unpackhi_epi32(d1, d3);
 
-                _mm_storeu_si128((__m128i *)(tile[0] + j), _mm_unpacklo_epi64(e0, f0));
-                _mm_storeu_si128((__m128i *)(tile[1] + j), _mm_unpackhi_epi64(e0, f0));
-                _mm_storeu_si128((__m128i *)(tile[2] + j), _mm_unpacklo_epi64(e1, f1));
-                _mm_storeu_si128((__m128i *)(tile[3] + j), _mm_unpackhi_epi64(e1, f1));
-                _mm_storeu_si128((__m128i *)(tile[4] + j), _mm_unpacklo_epi64(e2, f2));
-                _mm_storeu_si128((__m128i *)(tile[5] + j), _mm_unpackhi_epi64(e2, f2));
-                _mm_storeu_si128((__m128i *)(tile[6] + j), _mm_unpacklo_epi64(e3, f3));
-                _mm_storeu_si128((__m128i *)(tile[7] + j), _mm_unpackhi_epi64(e3, f3));
+                _mm_storeu_si128((__m128i *)(void *)(tile[0] + j), _mm_unpacklo_epi64(e0, f0));
+                _mm_storeu_si128((__m128i *)(void *)(tile[1] + j), _mm_unpackhi_epi64(e0, f0));
+                _mm_storeu_si128((__m128i *)(void *)(tile[2] + j), _mm_unpacklo_epi64(e1, f1));
+                _mm_storeu_si128((__m128i *)(void *)(tile[3] + j), _mm_unpackhi_epi64(e1, f1));
+                _mm_storeu_si128((__m128i *)(void *)(tile[4] + j), _mm_unpacklo_epi64(e2, f2));
+                _mm_storeu_si128((__m128i *)(void *)(tile[5] + j), _mm_unpackhi_epi64(e2, f2));
+                _mm_storeu_si128((__m128i *)(void *)(tile[6] + j), _mm_unpacklo_epi64(e3, f3));
+                _mm_storeu_si128((__m128i *)(void *)(tile[7] + j), _mm_unpackhi_epi64(e3, f3));
             }
 #endif
             for (; j < m; j++) {
@@ -102,10 +102,10 @@ static void transpose_to_planes(const uint8_t *v, uint8_t *o, size_t n, unsigned
 #if defined(__SSE2__)
             for (; j + 16 <= m; j += 16) {
                 const uint8_t *s = src + j * 4;
-                __m128i x0 = _mm_loadu_si128((const __m128i *)(s + 0));
-                __m128i x1 = _mm_loadu_si128((const __m128i *)(s + 16));
-                __m128i x2 = _mm_loadu_si128((const __m128i *)(s + 32));
-                __m128i x3 = _mm_loadu_si128((const __m128i *)(s + 48));
+                __m128i x0 = _mm_loadu_si128((const __m128i *)(const void *)(s + 0));
+                __m128i x1 = _mm_loadu_si128((const __m128i *)(const void *)(s + 16));
+                __m128i x2 = _mm_loadu_si128((const __m128i *)(const void *)(s + 32));
+                __m128i x3 = _mm_loadu_si128((const __m128i *)(const void *)(s + 48));
 
                 __m128i c0 = _mm_unpacklo_epi32(x0, x2);
                 __m128i c1 = _mm_unpackhi_epi32(x0, x2);
@@ -132,10 +132,10 @@ static void transpose_to_planes(const uint8_t *v, uint8_t *o, size_t n, unsigned
                 __m128i g2 = _mm_unpacklo_epi32(f1, f3);
                 __m128i g3 = _mm_unpackhi_epi32(f1, f3);
 
-                _mm_storeu_si128((__m128i *)(tile[0] + j), _mm_unpacklo_epi64(g0, g2));
-                _mm_storeu_si128((__m128i *)(tile[1] + j), _mm_unpackhi_epi64(g0, g2));
-                _mm_storeu_si128((__m128i *)(tile[2] + j), _mm_unpacklo_epi64(g1, g3));
-                _mm_storeu_si128((__m128i *)(tile[3] + j), _mm_unpackhi_epi64(g1, g3));
+                _mm_storeu_si128((__m128i *)(void *)(tile[0] + j), _mm_unpacklo_epi64(g0, g2));
+                _mm_storeu_si128((__m128i *)(void *)(tile[1] + j), _mm_unpackhi_epi64(g0, g2));
+                _mm_storeu_si128((__m128i *)(void *)(tile[2] + j), _mm_unpacklo_epi64(g1, g3));
+                _mm_storeu_si128((__m128i *)(void *)(tile[3] + j), _mm_unpackhi_epi64(g1, g3));
             }
 #endif
             for (; j < m; j++) {
@@ -173,14 +173,14 @@ static void transpose_from_planes(const uint8_t *p, uint8_t *values, size_t n, u
         if (w == 8) {
 #if defined(__SSE2__)
             for (; j + 16 <= m; j += 16) {
-                __m128i p0 = _mm_loadu_si128((const __m128i *)(tile[0] + j));
-                __m128i p1 = _mm_loadu_si128((const __m128i *)(tile[1] + j));
-                __m128i p2 = _mm_loadu_si128((const __m128i *)(tile[2] + j));
-                __m128i p3 = _mm_loadu_si128((const __m128i *)(tile[3] + j));
-                __m128i p4 = _mm_loadu_si128((const __m128i *)(tile[4] + j));
-                __m128i p5 = _mm_loadu_si128((const __m128i *)(tile[5] + j));
-                __m128i p6 = _mm_loadu_si128((const __m128i *)(tile[6] + j));
-                __m128i p7 = _mm_loadu_si128((const __m128i *)(tile[7] + j));
+                __m128i p0 = _mm_loadu_si128((const __m128i *)(const void *)(tile[0] + j));
+                __m128i p1 = _mm_loadu_si128((const __m128i *)(const void *)(tile[1] + j));
+                __m128i p2 = _mm_loadu_si128((const __m128i *)(const void *)(tile[2] + j));
+                __m128i p3 = _mm_loadu_si128((const __m128i *)(const void *)(tile[3] + j));
+                __m128i p4 = _mm_loadu_si128((const __m128i *)(const void *)(tile[4] + j));
+                __m128i p5 = _mm_loadu_si128((const __m128i *)(const void *)(tile[5] + j));
+                __m128i p6 = _mm_loadu_si128((const __m128i *)(const void *)(tile[6] + j));
+                __m128i p7 = _mm_loadu_si128((const __m128i *)(const void *)(tile[7] + j));
 
                 __m128i a0 = _mm_unpacklo_epi8(p0, p1);
                 __m128i b0 = _mm_unpackhi_epi8(p0, p1);
@@ -201,14 +201,14 @@ static void transpose_from_planes(const uint8_t *p, uint8_t *values, size_t n, u
                 __m128i d3 = _mm_unpackhi_epi16(b2, b3);
 
                 uint8_t *d = dst + j * 8;
-                _mm_storeu_si128((__m128i *)(d + 0), _mm_unpacklo_epi32(c0, c2));
-                _mm_storeu_si128((__m128i *)(d + 16), _mm_unpackhi_epi32(c0, c2));
-                _mm_storeu_si128((__m128i *)(d + 32), _mm_unpacklo_epi32(c1, c3));
-                _mm_storeu_si128((__m128i *)(d + 48), _mm_unpackhi_epi32(c1, c3));
-                _mm_storeu_si128((__m128i *)(d + 64), _mm_unpacklo_epi32(d0, d2));
-                _mm_storeu_si128((__m128i *)(d + 80), _mm_unpackhi_epi32(d0, d2));
-                _mm_storeu_si128((__m128i *)(d + 96), _mm_unpacklo_epi32(d1, d3));
-                _mm_storeu_si128((__m128i *)(d + 112), _mm_unpackhi_epi32(d1, d3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 0), _mm_unpacklo_epi32(c0, c2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 16), _mm_unpackhi_epi32(c0, c2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 32), _mm_unpacklo_epi32(c1, c3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 48), _mm_unpackhi_epi32(c1, c3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 64), _mm_unpacklo_epi32(d0, d2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 80), _mm_unpackhi_epi32(d0, d2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 96), _mm_unpacklo_epi32(d1, d3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 112), _mm_unpackhi_epi32(d1, d3));
             }
 #endif
             for (; j < m; j++) {
@@ -225,10 +225,10 @@ static void transpose_from_planes(const uint8_t *p, uint8_t *values, size_t n, u
         } else if (w == 4) {
 #if defined(__SSE2__)
             for (; j + 16 <= m; j += 16) {
-                __m128i p0 = _mm_loadu_si128((const __m128i *)(tile[0] + j));
-                __m128i p1 = _mm_loadu_si128((const __m128i *)(tile[1] + j));
-                __m128i p2 = _mm_loadu_si128((const __m128i *)(tile[2] + j));
-                __m128i p3 = _mm_loadu_si128((const __m128i *)(tile[3] + j));
+                __m128i p0 = _mm_loadu_si128((const __m128i *)(const void *)(tile[0] + j));
+                __m128i p1 = _mm_loadu_si128((const __m128i *)(const void *)(tile[1] + j));
+                __m128i p2 = _mm_loadu_si128((const __m128i *)(const void *)(tile[2] + j));
+                __m128i p3 = _mm_loadu_si128((const __m128i *)(const void *)(tile[3] + j));
 
                 __m128i a0 = _mm_unpacklo_epi8(p0, p1);
                 __m128i a1 = _mm_unpackhi_epi8(p0, p1);
@@ -236,10 +236,10 @@ static void transpose_from_planes(const uint8_t *p, uint8_t *values, size_t n, u
                 __m128i a3 = _mm_unpackhi_epi8(p2, p3);
 
                 uint8_t *d = dst + j * 4;
-                _mm_storeu_si128((__m128i *)(d + 0), _mm_unpacklo_epi16(a0, a2));
-                _mm_storeu_si128((__m128i *)(d + 16), _mm_unpackhi_epi16(a0, a2));
-                _mm_storeu_si128((__m128i *)(d + 32), _mm_unpacklo_epi16(a1, a3));
-                _mm_storeu_si128((__m128i *)(d + 48), _mm_unpackhi_epi16(a1, a3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 0), _mm_unpacklo_epi16(a0, a2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 16), _mm_unpackhi_epi16(a0, a2));
+                _mm_storeu_si128((__m128i *)(void *)(d + 32), _mm_unpacklo_epi16(a1, a3));
+                _mm_storeu_si128((__m128i *)(void *)(d + 48), _mm_unpackhi_epi16(a1, a3));
             }
 #endif
             for (; j < m; j++) {

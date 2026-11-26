@@ -831,8 +831,8 @@ static void test_pack_bit_exact(void)
             size_t vb = (n + 7) / 8;
             int64_t *ts = malloc((n ? n : 1) * sizeof *ts);
             int64_t *ts2 = malloc((n ? n : 1) * sizeof *ts2);
-            uint8_t *v = malloc(n ? n * w : 1);
-            uint8_t *v2 = malloc(n ? n * w : 1);
+            uint8_t *v_buf = malloc((n ? n * w : 1) + 1);
+            uint8_t *v2_buf = malloc((n ? n * w : 1) + 3);
             uint8_t *bits = calloc(vb ? vb : 1, 1);
             uint8_t *bits2 = calloc(vb ? vb : 1, 1);
             uint64_t *sv = malloc((n ? n : 1) * sizeof *sv);
@@ -841,58 +841,65 @@ static void test_pack_bit_exact(void)
                 r = r * 6364136223846793005ULL + 1442695040888963407ULL;
                 ts[i] = (i % 19 == 0) ? (int64_t)r : 1700000000000LL + (int64_t)i * 1000;
                 for (unsigned b = 0; b < w; b++)
-                    v[i * w + b] = (uint8_t)(r >> (8 * b));
+                    v_buf[i * w + b] = (uint8_t)(r >> (8 * b));
                 if (type == TSDB_BOOL)
-                    v[i] &= 1;
+                    v_buf[i] &= 1;
                 if (type == TSDB_FLOAT32 && i % 13 == 0) {
                     uint32_t nanbits = 0x7fc01001u ^ (uint32_t)(i & 0xff);
-                    memcpy(v + i * 4, &nanbits, 4);
+                    memcpy(v_buf + i * 4, &nanbits, 4);
                 } else if (type == TSDB_FLOAT64 && i % 13 == 0) {
                     uint64_t nanbits = 0x7ff8000000001001ULL ^ (uint64_t)(i & 0xff);
-                    memcpy(v + i * 8, &nanbits, 8);
+                    memcpy(v_buf + i * 8, &nanbits, 8);
                 }
                 if (valid && ((r >> 11) & 1))
                     bits[i / 8] |= (uint8_t)(1u << (i % 8));
                 sv[i] = (i % 3 == 0) ? UINT64_MAX - i : (r ^ (uint64_t)i);
             }
             size_t bound = tsdb_pack_raw_bound(n, type, valid, many);
-            uint8_t *got = malloc(bound + 1);
+            uint8_t *got_buf = malloc(bound + 2);
             uint8_t *want = malloc(bound + 1);
-            size_t glen = tsdb_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, got);
-            size_t wlen = ref_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, want);
-            CHECK(glen == wlen && glen <= bound);
-            if (glen == wlen && glen > 0)
-                CHECK(memcmp(got, want, glen) == 0);
-            memset(ts2, 0xaa, (n ? n : 1) * sizeof *ts2);
-            memset(v2, 0x55, n ? n * w : 1);
-            memset(bits2, 0xcc, vb ? vb : 1);
-            memset(sv2, 0x33, (n ? n : 1) * sizeof *sv2);
-            CHECK(tsdb_pack_unshape(got, glen, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
-                                    many ? sv2 : NULL) == 0);
-            if (n) {
-                CHECK(memcmp(ts, ts2, n * sizeof *ts) == 0);
-                CHECK(memcmp(v, v2, n * w) == 0);
-                if (valid)
-                    CHECK(memcmp(bits, bits2, vb) == 0);
-                if (many)
-                    CHECK(memcmp(sv, sv2, n * sizeof *sv) == 0);
-            }
-            if (glen) {
-                CHECK(tsdb_pack_unshape(got, glen - 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
-                                        many ? sv2 : NULL) != 0);
-                got[glen] = 0;
-                CHECK(tsdb_pack_unshape(got, glen + 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
-                                        many ? sv2 : NULL) != 0);
+            size_t wlen = ref_pack_reshape(n, type, ts, v_buf, valid ? bits : NULL, many ? sv : NULL, want);
+            for (int unaligned = 0; unaligned < 2; unaligned++) {
+                if (unaligned)
+                    memmove(v_buf + 1, v_buf, n * w);
+                uint8_t *v = v_buf + (unaligned ? 1 : 0);
+                uint8_t *v2 = v2_buf + (unaligned ? 3 : 0);
+                uint8_t *got = got_buf + (unaligned ? 1 : 0);
+                size_t glen = tsdb_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, got);
+                CHECK(glen == wlen && glen <= bound);
+                if (glen == wlen && glen > 0)
+                    CHECK(memcmp(got, want, glen) == 0);
+                memset(ts2, 0xaa, (n ? n : 1) * sizeof *ts2);
+                memset(v2, 0x55, n ? n * w : 1);
+                memset(bits2, 0xcc, vb ? vb : 1);
+                memset(sv2, 0x33, (n ? n : 1) * sizeof *sv2);
+                CHECK(tsdb_pack_unshape(got, glen, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                        many ? sv2 : NULL) == 0);
+                if (n) {
+                    CHECK(memcmp(ts, ts2, n * sizeof *ts) == 0);
+                    CHECK(memcmp(v, v2, n * w) == 0);
+                    if (valid)
+                        CHECK(memcmp(bits, bits2, vb) == 0);
+                    if (many)
+                        CHECK(memcmp(sv, sv2, n * sizeof *sv) == 0);
+                }
+                if (glen) {
+                    CHECK(tsdb_pack_unshape(got, glen - 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                            many ? sv2 : NULL) != 0);
+                    got[glen] = 0;
+                    CHECK(tsdb_pack_unshape(got, glen + 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                            many ? sv2 : NULL) != 0);
+                }
             }
             free(ts);
             free(ts2);
-            free(v);
-            free(v2);
+            free(v_buf);
+            free(v2_buf);
             free(bits);
             free(bits2);
             free(sv);
             free(sv2);
-            free(got);
+            free(got_buf);
             free(want);
         }
     }
