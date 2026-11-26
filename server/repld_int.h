@@ -156,7 +156,7 @@ struct rvol {
     int snap_said; /* the SNAPSHOT notice was said */
     /* slowack (tests): the durable ends of its last ACKs and when they were sent; the one it reported last */
     uint64_t sa_ms[SLOW_ACK_RING], sa_dur[SLOW_ACK_RING], sa_last;
-    unsigned sa_n;
+    uint64_t sa_n;
     /* R4's state, each owned by its file (NULL: nothing in progress); under mu like the rest */
     struct rsnap *snap; /* rsnap.c */
     struct rset *set;   /* rset.c */

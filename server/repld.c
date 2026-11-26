@@ -453,14 +453,14 @@ static void slow_ack(struct rvol *rv, struct repl_msg *m)
 {
     uint64_t now = now_ms(), lag = rv->sa_last;
     if (rv->sa_n > 0 && rv->sa_ms[(rv->sa_n - 1) % SLOW_ACK_RING] == now) {
-        unsigned idx = (rv->sa_n - 1) % SLOW_ACK_RING;
+        uint64_t idx = (rv->sa_n - 1) % SLOW_ACK_RING;
         if (m->durable > rv->sa_dur[idx])
             rv->sa_dur[idx] = m->durable;
     } else {
         rv->sa_ms[rv->sa_n % SLOW_ACK_RING] = now;
         rv->sa_dur[rv->sa_n++ % SLOW_ACK_RING] = m->durable;
     }
-    for (unsigned i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
+    for (uint64_t i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
         if (rv->sa_ms[i] + SLOW_ACK_MS <= now && rv->sa_dur[i] > lag)
             lag = rv->sa_dur[i];
     rv->sa_last = lag;
@@ -878,6 +878,7 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
         if (nsent < nt) {
             uint64_t now = now_ms();
             pthread_mutex_lock(&rv->mu);
+            int rolled = 0;
             if (!rv->stop && rv->core && rv->rec.set_version == snap_rec_setv &&
                 repl_epoch(rv->core) == snap_epoch && rv->self == snap_self) {
                 for (int t = 0; t < nt; t++) {
@@ -887,9 +888,12 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
                     if (p->sent == last) {
                         p->sent = first - 1;
                         ahead_mark(p, now);
+                        rolled = 1;
                     }
                 }
             }
+            if (rolled)
+                pthread_cond_signal(&rv->cv);
             pthread_mutex_unlock(&rv->mu);
         }
     }
@@ -2803,8 +2807,11 @@ static void *vol_main(void *arg)
             uint64_t due = (woke - next_tick) / TICK_MS + 1;
             uint64_t skip = due < (uint64_t)(dt - 1) ? due : (uint64_t)(dt - 1);
             /* Ensure periodic housekeeping in the tick branch (e.g. DIVERGED polling) still runs at least every
-             * 200 ms on an idle follower woken continuously by 100 ms leader heartbeats, with zero extra wakeups. */
-            if (woke >= last_tick_ms + 200 && skip == due && skip > 0)
+             * 200 ms on an idle follower woken continuously by 100 ms leader heartbeats, with zero extra wakeups.
+             * Also if op_admit()/op_synced() updated the core mid-sleep, leave the current tick unskipped so
+             * repl_tick() runs immediately at `woke` without violating repl_advance_idle()'s contract. */
+            if ((woke >= last_tick_ms + 200 || repl_written(rv->core) != snap_written ||
+                 repl_next_tick(rv->core) == 1) && skip == due && skip > 0)
                 skip--;
             if (skip > 0) {
                 repl_advance_idle(rv->core, (uint32_t)skip, snap_written);

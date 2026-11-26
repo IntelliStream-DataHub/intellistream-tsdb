@@ -8741,6 +8741,40 @@ static void case_wsegs_index(void)
         CHECK_EQ(replica_read(x.ld, seg_first[15], &buf, &len, 1 << 20, &seq, &off, &last), 0);
         CHECK(len > 0);
         free(buf);
+
+        /* Read-only non-replica engine never populates db->wsegs: log_start/epochs must return -1 (fallback). */
+        tsdb_options ro;
+        tsdb_options_init(&ro);
+        ro.read_only = 1;
+        ro.merge_threads = 0;
+        ro.latest_cache = 0;
+        ro.stats = -1;
+        eng *rodb = NULL;
+        CHECK_EQ(eng_open(x.ldir, &ro, &rodb), 0);
+        if (rodb) {
+            uint64_t rf = 123;
+            uint32_t rnh = 1;
+            CHECK_EQ(replica_log_start(rodb, &rf), -1);
+            CHECK_EQ(replica_log_epochs(rodb, eps, sts, 16, &rnh, &rf), -1);
+            CHECK_EQ(eng_close(rodb), 0);
+        }
+
+        /* Active-segment (ws.seq == cur) external ENOENT must mark wsegs_dirty so later reads fall back to disk. */
+        uint64_t live_f0 = ld_last(&x) + 1;
+        xp_rows(&x, 0, 700, 3, 77.0f);
+        xp_step(&x, "WS: active ENOENT");
+        CHECK_EQ(replica_read(x.ld, live_f0, &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK(len > 0 && seq == x.ld->wal_seq);
+        free(buf);
+        char sp[PATH_MAX + 64];
+        snprintf(sp, sizeof sp, "%s/wal_%016" PRIx64 ".log", x.ldir, seq);
+        CHECK_EQ(unlink(sp), 0);
+        CHECK_EQ(replica_read(x.ld, live_f0, &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_NOTFOUND);
+        free(buf);
+        pthread_mutex_lock(&x.ld->wsegs_mu);
+        bool dirty = x.ld->wsegs_dirty;
+        pthread_mutex_unlock(&x.ld->wsegs_mu);
+        CHECK(dirty);
     }
     xp_stop(&x);
     printf("  wsegs index: 20 rotations, random binary-search reads, retention prune, ENOENT fallback, reopen ok\n");

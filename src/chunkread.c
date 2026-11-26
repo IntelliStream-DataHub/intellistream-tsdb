@@ -229,9 +229,10 @@ static uint8_t *cr_tls_slot(cr_tls_pool *p, unsigned pos, size_t need)
         return NULL;
     if (p->cap[pos] >= need)
         return p->slot[pos];
-    size_t new_total = p->total - p->cap[pos] + need;
-    if (new_total > CR_TLS_MAX_BYTES)
+    size_t other = p->total - p->cap[pos];
+    if (need > CR_TLS_MAX_BYTES - other)
         return NULL;
+    size_t new_total = other + need;
     uint8_t *b = malloc(need);
     if (!b)
         return NULL;
@@ -258,6 +259,7 @@ typedef struct rr {
     iso_rs *rs;
     iso_rs_plan *plan;            /* cached RS decode plan for plan_mask across stripes; freed unconditionally on exit */
     uint32_t plan_mask;
+    _Static_assert(CHUNK_POS_MAX <= 32, "plan_mask is uint32_t");
 #endif
     uint8_t zero_[1];
 } rr;
@@ -409,8 +411,8 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
                     away ? "unavailable while they are" : "not readable");
         return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
-    /* the buffers the decode fills: every absent data position gets one of its own */
-    for (unsigned p = 0; p < k + m; p++)
+    /* the buffers the decode fills: every absent data position gets one of its own (data_only=true never writes parity) */
+    for (unsigned p = 0; p < k; p++)
         if (!present[p]) {
             shards[p] = rr_slot(r, p, need);
             if (!shards[p])

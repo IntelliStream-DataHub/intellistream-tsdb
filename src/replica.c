@@ -2798,6 +2798,11 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
             if (fd < 0) {
                 if (errno == ENOENT) {
                     wsegs_remove(db, ws.seq);
+                    if (ws.seq == cur) {
+                        pthread_mutex_lock(&db->wsegs_mu);
+                        db->wsegs_dirty = true;
+                        pthread_mutex_unlock(&db->wsegs_mu);
+                    }
                     return TSDB_ERR_NOTFOUND;
                 }
                 return TSDB_ERR_IO;
@@ -2985,6 +2990,8 @@ int replica_log_start(eng *db, uint64_t *first)
         pthread_mutex_unlock(&rp->segs_mu);
         return 0;
     }
+    if (!db->wal_enabled || db->opt.read_only)
+        return -1;
     pthread_mutex_lock(&db->wsegs_mu);
     bool dirty = db->wsegs_dirty;
     if (!dirty && db->nwsegs > 0)
@@ -3018,6 +3025,8 @@ int replica_log_epochs(eng *db, uint64_t *epochs, uint64_t *starts, uint32_t max
         pthread_mutex_unlock(&rp->segs_mu);
         return 0;
     }
+    if (!db->wal_enabled || db->opt.read_only)
+        return -1;
     pthread_mutex_lock(&db->wsegs_mu);
     bool dirty = db->wsegs_dirty;
     if (!dirty) {
