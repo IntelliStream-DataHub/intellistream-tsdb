@@ -110,6 +110,9 @@ int auth_check_ids(auth_conn *a, uint8_t op, const uint8_t *p, size_t len);
 /* The rights on one id / every id of a request (all or nothing, A16): 0 or TSDB_ERR_DENIED. */
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need);
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need);
+/* Per-id mask for multi-series reads (QUERY_LATEST, QUERY_MULTI, STATS_SERIES): sets own[i] to ids[i] when
+ * allowed or TSDB_SID_NONE when denied, and bit i of denied (cleared first) when denied. */
+void auth_ids_mask(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need, tsdb_sid *own, uint8_t *denied);
 /* The connection may see operator details (volume paths in TOPOLOGY): a superuser, or no login at all (--no-auth). */
 bool auth_conn_super(const auth_conn *a);
 /* Tenants (docs/design-stats.md section 4): the connection's tenant slot (0: "(none)"; --no-auth: 0), whether it sees

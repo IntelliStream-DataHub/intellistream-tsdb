@@ -315,27 +315,61 @@ static void hs_mac(const uint8_t *secret, size_t slen, const char *label, const 
 
 /* ------------------------------------------------------------------ the frame codec */
 
-int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own)
+#define PL_DECODE_KEEP (4u << 20)
+#define PL_ZBUF_KEEP ((4u << 20) + (64u << 10))
+
+static int pl_msg_decode_with(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own,
+                              ZSTD_DCtx **dctxp, uint8_t **dbufp, size_t *dcap)
 {
     memset(m, 0, sizeof *m);
     if (own)
         *own = NULL;
     if (type & 0x80) {
         type &= 0x7f;
-        if (type == 0 || type > PL_USER_TYPE_MAX || n < 4 + 1 || !own)
+        if (type == 0 || type > PL_USER_TYPE_MAX || n < 4 + 1 || (!own && !dbufp))
             return -1;
         uint32_t raw = le32(p);
         if (raw == 0 || raw > PL_FRAME_MAX)
             return -1;
-        uint8_t *d = malloc(raw);
-        if (!d)
-            return -1;
-        size_t got = ZSTD_decompress(d, raw, p + 4, n - 4);
+        uint8_t *d = NULL;
+        int owned = 0;
+        if (dbufp && dcap && raw <= PL_DECODE_KEEP) {
+            if (raw > *dcap) {
+                size_t ncap = *dcap ? *dcap * 2 : 4096;
+                while (ncap < raw)
+                    ncap *= 2;
+                if (ncap > PL_DECODE_KEEP)
+                    ncap = PL_DECODE_KEEP;
+                uint8_t *np = malloc(ncap);
+                if (!np)
+                    return -1;
+                free(*dbufp);
+                *dbufp = np;
+                *dcap = ncap;
+            }
+            d = *dbufp;
+        } else {
+            if (!own)
+                return -1;
+            d = malloc(raw);
+            if (!d)
+                return -1;
+            owned = 1;
+        }
+        ZSTD_DCtx *dc = NULL;
+        if (dctxp) {
+            if (!*dctxp)
+                *dctxp = ZSTD_createDCtx();
+            dc = *dctxp;
+        }
+        size_t got = dc ? ZSTD_decompressDCtx(dc, d, raw, p + 4, n - 4) : ZSTD_decompress(d, raw, p + 4, n - 4);
         if (ZSTD_isError(got) || (got != raw && peerlink_mutant != PL_MUT_ZSTDSIZE)) {
-            free(d);
+            if (owned)
+                free(d);
             return -1;
         }
-        *own = d;
+        if (owned)
+            *own = d;
         p = d;
         n = raw;
     }
@@ -420,6 +454,11 @@ int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, ui
     }
 }
 
+int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, uint8_t **own)
+{
+    return pl_msg_decode_with(type, p, n, m, own, NULL, NULL, NULL);
+}
+
 /* [u32 len][type][hdr][payload][check] appended to b; `hdr` is the compression header (then lp, ln is the payload
  * before compression, for PL_CHECK_HEADER) or a control frame's fields (lp NULL); the check as long as its type says
  * (none: no bytes) */
@@ -447,22 +486,47 @@ static void frame_put(struct buf *b, const struct fck *k, uint64_t *seq, uint8_t
     (*seq)++;
 }
 
-/* a driver frame, compressed when it pays; `zc` is the thread's zstd context (NULL: a one-off) */
-static void frame_user(struct buf *b, const struct fck *k, uint64_t *seq, ZSTD_CCtx *zc, int compress, uint8_t type,
-                       const void *p, size_t n)
+/* a driver frame, compressed when it pays; `zc` and `zbufp`/`zcap` are the thread's zstd context and scratch
+ * buffer (NULL: a one-off) */
+static void frame_user(struct buf *b, const struct fck *k, uint64_t *seq, ZSTD_CCtx *zc, uint8_t **zbufp, size_t *zcap,
+                       int compress, uint8_t type, const void *p, size_t n)
 {
     if (compress && n >= COMPRESS_MIN) {
         size_t bound = ZSTD_compressBound(n);
-        uint8_t *z = malloc(bound);
+        uint8_t *z = NULL;
+        int owned = 0;
+        if (zbufp && zcap && bound <= PL_ZBUF_KEEP) {
+            if (bound > *zcap) {
+                size_t ncap = *zcap ? *zcap * 2 : 4096;
+                while (ncap < bound)
+                    ncap *= 2;
+                if (ncap > PL_ZBUF_KEEP)
+                    ncap = PL_ZBUF_KEEP;
+                uint8_t *np = malloc(ncap);
+                if (np) {
+                    free(*zbufp);
+                    *zbufp = np;
+                    *zcap = ncap;
+                }
+            }
+            if (bound <= *zcap)
+                z = *zbufp;
+        }
+        if (!z) {
+            z = malloc(bound);
+            owned = 1;
+        }
         if (z) {
             size_t zn = zc ? ZSTD_compressCCtx(zc, z, bound, p, n, 1) : ZSTD_compress(z, bound, p, n, 1);
             if (!ZSTD_isError(zn) && zn + 4 + n / 8 < n) {
                 uint8_t h[4] = {(uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24)};
                 frame_put(b, k, seq, type | 0x80, h, 4, z, zn, p, n);
-                free(z);
+                if (owned)
+                    free(z);
                 return;
             }
-            free(z);
+            if (owned)
+                free(z);
         }
     }
     frame_put(b, k, seq, type, "", 0, p, n, NULL, 0);
@@ -473,7 +537,7 @@ size_t pl_frame_encode(int check, uint64_t salt, uint64_t *seq, int compress, ui
 {
     struct fck k = {check, salt};
     struct buf b = {0};
-    frame_user(&b, &k, seq, NULL, compress, type, p, n);
+    frame_user(&b, &k, seq, NULL, NULL, NULL, compress, type, p, n);
     *out = b.p;
     return b.len;
 }
@@ -483,6 +547,9 @@ struct pl_reader {
     int skip, bad;
     uint64_t seq;
     struct buf rb;
+    ZSTD_DCtx *dctx;
+    uint8_t *dbuf;
+    size_t dcap;
 };
 
 struct pl_reader *pl_reader_new(int check, uint64_t salt, int skip_tag)
@@ -500,6 +567,8 @@ void pl_reader_free(struct pl_reader *r)
     if (!r)
         return;
     buf_free(&r->rb);
+    ZSTD_freeDCtx(r->dctx);
+    free(r->dbuf);
     free(r);
 }
 
@@ -534,7 +603,7 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
         }
         struct pl_msg m;
         uint8_t *own = NULL;
-        if (pl_msg_decode(f[0], f + 1, body - 1, &m, &own) != 0) {
+        if (pl_msg_decode_with(f[0], f + 1, body - 1, &m, &own, &r->dctx, &r->dbuf, &r->dcap) != 0) {
             r->bad = 1;
             break;
         }
@@ -556,6 +625,9 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
     }
     if (r->bad) {
         buf_free(&r->rb);
+        free(r->dbuf);
+        r->dbuf = NULL;
+        r->dcap = 0;
         return -1;
     }
     return 0;
@@ -1704,6 +1776,8 @@ struct conn {
     struct pl_reader *rd;
     struct buf wb;
     ZSTD_CCtx *zc;
+    uint8_t *zbuf;
+    size_t zcap;
     uint64_t last_rx, last_ping;
     uint8_t *cbuf; /* a chunk's read buffer */
 
@@ -3097,7 +3171,8 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                     continue;
                 }
                 size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
-                frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, l->kind != PL_KIND_BULK, f->type, f->p, f->n);
+                frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, &c.zbuf, &c.zcap, l->kind != PL_KIND_BULK, f->type,
+                           f->p, f->n);
                 if (f->tracked) {
                     if (c.trk_n == c.trk_cap) {
                         if (c.trk_h) {
@@ -3384,6 +3459,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         c.t->ops->close(c.t); /* last (pltransport.h): the driver saw the down before a verbs transport's slots go */
     pl_reader_free(c.rd);
     ZSTD_freeCCtx(c.zc);
+    free(c.zbuf);
     buf_free(&c.wb);
     free(c.cbuf);
     free(c.hbuf);

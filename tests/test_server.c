@@ -640,6 +640,45 @@ static int collect_values(void *ctx, const int64_t *ts, const tsdb_values *col, 
     return 0;
 }
 
+typedef struct big_vrows {
+    size_t n, total;
+    int bad, desc, check_valid_flag;
+    int chunks_valid_null, chunks_valid_nonnull;
+    const int64_t *ts, *iv;
+    const uint8_t *exp;
+} big_vrows;
+
+static int check_big_values(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    big_vrows *r = ctx;
+    const int64_t *iv = col->values;
+    if (col->type != TSDB_INT64)
+        r->bad++;
+    bool chunk_has_null = false;
+    for (size_t k = 0; k < n; k++) {
+        if (r->n >= r->total) {
+            r->bad++;
+            return 1;
+        }
+        size_t ix = r->desc ? (r->total - 1 - r->n) : r->n;
+        bool known = !col->valid || ((col->valid[k >> 3] >> (k & 7)) & 1);
+        if (!r->exp[ix])
+            chunk_has_null = true;
+        if (ts[k] != r->ts[ix] || known != (r->exp[ix] != 0) || (known && iv[k] != r->iv[ix]))
+            r->bad++;
+        r->n++;
+    }
+    if (r->check_valid_flag) {
+        if (chunk_has_null != (col->valid != NULL))
+            r->bad++;
+        if (col->valid)
+            r->chunks_valid_nonnull++;
+        else
+            r->chunks_valid_null++;
+    }
+    return 0;
+}
+
 static void test_types(tsdbc *c)
 {
     tsdb_sid d, i, b, st, again;
@@ -753,6 +792,112 @@ static void test_types(tsdbc *c)
         CHECK(raw_reply(fd, &rid0, rest0, sizeof rest0, &nrest0) == TSDB_ERR_INVALID && rid0 == 40 + (uint32_t)bad);
     }
     close(fd);
+
+    /* P-23: QUERY_VALUES bulk copy + lazy validity bitmap across RAW_CHUNK_ROWS (16384) boundaries, unaligned
+     * chunk offsets, and transitions between valid==NULL and valid!=NULL parts/memtable. */
+    tsdb_sid mv;
+    OK(tsdbc_series_create(c, "t.values_chunks", TSDB_INT64, NULL, &mv));
+    enum { S1 = 17003, S2 = 17005, S3 = 5007, STOT = S1 + S2 + S3 };
+    int64_t *mts = malloc(STOT * sizeof *mts);
+    int64_t *miv = malloc(STOT * sizeof *miv);
+    uint8_t *mexp = malloc(STOT);
+    uint8_t *mval2 = malloc((S2 + 7) / 8);
+    CHECK(mts && miv && mexp && mval2);
+    memset(mval2, 0xff, (S2 + 7) / 8);
+    for (size_t k = 0; k < STOT; k++) {
+        mts[k] = T0 + (int64_t)k * 1000;
+        miv[k] = (int64_t)k * 17 - 1000;
+        mexp[k] = 1;
+    }
+    for (size_t k = 0; k < S2; k++) {
+        if (k == 0 || k == S2 - 1 || k % 13 == 0) {
+            mval2[k >> 3] &= (uint8_t)~(1u << (k & 7));
+            mexp[S1 + k] = 0;
+        }
+    }
+    OK(tsdbc_insert_series_values(c, mv, mts, &(tsdb_values){TSDB_INT64, miv, NULL}, S1));
+    OK(tsdbc_flush(c));
+    OK(tsdbc_insert_series_values(c, mv, mts + S1, &(tsdb_values){TSDB_INT64, miv + S1, mval2}, S2));
+    OK(tsdbc_flush(c));
+    OK(tsdbc_insert_series_values(c, mv, mts + S1 + S2, &(tsdb_values){TSDB_INT64, miv + S1 + S2, NULL}, S3));
+    for (int desc = 0; desc < 2; desc++) {
+        big_vrows br = {.n = 0, .total = STOT, .bad = 0, .desc = desc, .check_valid_flag = 1,
+                        .ts = mts, .iv = miv, .exp = mexp};
+        tsdb_query_opts qo = {desc ? TSDB_DESC : TSDB_ASC, 0};
+        OK(tsdbc_query_values(c, mv, INT64_MIN, INT64_MAX, &qo, check_big_values, &br));
+        CHECK(br.n == STOT && br.bad == 0 && br.chunks_valid_nonnull > 0);
+    }
+
+    /* P-23 sub-case: col->valid != NULL chunk whose slice in a RAW_CHUNK_ROWS frame is all-1 bits
+     * (has_bits == 1 && any_null == 0) must keep TSDB_VALID clear (client receives col->valid == NULL),
+     * tested both before flush (memtable single-chunk delivery) and after flush (part granule straddling 16384). */
+    tsdb_sid mv2;
+    OK(tsdbc_series_create(c, "t.values_all1", TSDB_INT64, NULL, &mv2));
+    enum { A1 = 100, A2 = 17000, ATOT = A1 + A2 };
+    int64_t *ats = malloc(ATOT * sizeof *ats);
+    int64_t *aiv = malloc(ATOT * sizeof *aiv);
+    uint8_t *aexp = malloc(ATOT);
+    uint8_t *aval2 = malloc((A2 + 7) / 8);
+    CHECK(ats && aiv && aexp && aval2);
+    memset(aval2, 0xff, (A2 + 7) / 8);
+    for (size_t k = 0; k < ATOT; k++) {
+        ats[k] = T0 + (int64_t)k * 1000;
+        aiv[k] = (int64_t)k * 23 + 7;
+        aexp[k] = 1;
+    }
+    /* Single null at offset 16200 (global row 16300, 84 rows before RAW_CHUNK_ROWS=16384) */
+    aval2[16200 >> 3] &= (uint8_t)~(1u << (16200 & 7));
+    aexp[A1 + 16200] = 0;
+    OK(tsdbc_insert_series_values(c, mv2, ats, &(tsdb_values){TSDB_INT64, aiv, NULL}, A1));
+    OK(tsdbc_flush(c));
+    OK(tsdbc_insert_series_values(c, mv2, ats + A1, &(tsdb_values){TSDB_INT64, aiv + A1, aval2}, A2));
+    for (int flushed = 0; flushed < 2; flushed++) {
+        if (flushed)
+            OK(tsdbc_flush(c));
+        for (int desc = 0; desc < 2; desc++) {
+            big_vrows br = {.n = 0, .total = ATOT, .bad = 0, .desc = desc, .check_valid_flag = 1,
+                            .ts = ats, .iv = aiv, .exp = aexp};
+            tsdb_query_opts qo = {desc ? TSDB_DESC : TSDB_ASC, 0};
+            OK(tsdbc_query_values(c, mv2, INT64_MIN, INT64_MAX, &qo, check_big_values, &br));
+            CHECK(br.n == ATOT && br.bad == 0 && br.chunks_valid_nonnull == 1 && br.chunks_valid_null == 1);
+        }
+    }
+
+    /* P-23 sub-case: QUERY_MULTI VALUES multi-chunk across both series in ASC and DESC */
+    for (int desc = 0; desc < 2; desc++) {
+        tsdb_multi_query mq = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX,
+                               .opts = {desc ? TSDB_DESC : TSDB_ASC, 0}};
+        tsdb_sid sids[2] = {mv, mv2};
+        tsdb_series_result *mres = NULL;
+        OK(tsdbc_query_multi_collect(c, &mq, sids, 2, NULL, &mres));
+        const size_t exp_n[2] = {STOT, ATOT};
+        const int64_t *exp_ts[2] = {mts, ats};
+        const int64_t *exp_iv[2] = {miv, aiv};
+        const uint8_t *exp_v[2] = {mexp, aexp};
+        int mbad = 0;
+        for (int sidx = 0; sidx < 2; sidx++) {
+            CHECK(mres[sidx].status == 0 && mres[sidx].n == exp_n[sidx] && mres[sidx].values.type == TSDB_INT64);
+            const int64_t *got_iv = mres[sidx].values.values;
+            for (size_t k = 0; k < mres[sidx].n && k < exp_n[sidx]; k++) {
+                size_t ix = desc ? (exp_n[sidx] - 1 - k) : k;
+                bool known = !mres[sidx].values.valid || ((mres[sidx].values.valid[k >> 3] >> (k & 7)) & 1);
+                if (mres[sidx].ts[k] != exp_ts[sidx][ix] || known != (exp_v[sidx][ix] != 0) ||
+                    (known && got_iv[k] != exp_iv[sidx][ix]))
+                    mbad++;
+            }
+        }
+        CHECK(mbad == 0);
+        tsdbc_series_results_free(mres, 2);
+    }
+
+    free(ats);
+    free(aiv);
+    free(aexp);
+    free(aval2);
+    free(mts);
+    free(miv);
+    free(mexp);
+    free(mval2);
 }
 
 /* NaN results through the server: one quiet NaN 0x7ff8000000000000, whatever payloads the data had; raw values

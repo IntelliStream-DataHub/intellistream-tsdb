@@ -661,7 +661,132 @@ static void test_inproc(const char *base)
     CHECK(wrong == 0);
     size_t capped = auth_map_total();
     CHECK(capped > 0 && capped <= (32 << 10) + 4096);
+
+    /* P-24: auth_ids_mask must match auth_id bit-for-bit across mixed-tenant, cross-leaf (>4096), cross-L2
+     * (second volume + high local ids), TSDB_SID_NONE, unknown/malformed ids, superuser, --no-auth, nogrant,
+     * NEED_ANY, R_INSERT, in-place own==ids, and past auth_map_budget (still capped at 32 KiB here). */
+    char v2dir[PATH_MAX + 64];
+    snprintf(v2dir, sizeof v2dir, "%s-vol2", dir);
+    uint32_t v2num = 0;
+    OK(tsdb_volume_add(db, v2dir, &v2num));
+    tsdb_sid v2_ids[64];
+    for (uint32_t i = 0; i < 64; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "%s/v2_%u", (i % 3 == 0) ? "acme" : "globex", i);
+        OK(tsdb_series_create(db, nm, TSDB_FLOAT32, v2dir, &v2_ids[i]));
+    }
+    enum { M_EXTRA = 64 + 12 };
+    size_t mn = (size_t)N + M_EXTRA;
+    tsdb_sid *mids = malloc(mn * sizeof *mids);
+    tsdb_sid *mown = malloc(mn * sizeof *mown);
+    uint8_t *mden = malloc((mn + 7) / 8);
+    CHECK(mids && mown && mden);
+    /* Interleave leaves and volumes so both lkey (>>12) and l2key (>>22) switch repeatedly */
+    for (uint32_t i = 0; i < N; i++)
+        mids[i] = ids[i];
+    size_t mp = N;
+    for (uint32_t i = 0; i < 64; i++)
+        mids[mp++] = v2_ids[i];
+    mids[mp++] = TSDB_SID_NONE;
+    mids[mp++] = TSDB_SID(0, (1u << 22) + 7);   /* cross-L2 unknown in vol 0 */
+    mids[mp++] = TSDB_SID(0, (2u << 22) + 3);   /* another L2 unknown in vol 0 */
+    mids[mp++] = TSDB_SID(5, 10);               /* unknown volume */
+    mids[mp++] = 0x0000000000000001ull;         /* raw vol 0 (invalid) */
+    mids[mp++] = (1ull << 50) | 1ull;           /* high bits set (invalid) */
+    mids[mp++] = TSDB_SID(0, 1u << 31);         /* local >= 2^31 (invalid) */
+    mids[mp++] = ids[0];                        /* valid acme after invalid ids */
+    mids[mp++] = v2_ids[0];                     /* valid acme in vol2 (cross-L2) */
+    mids[mp++] = ids[4097];                     /* valid acme in leaf 1 */
+    mids[mp++] = v2_ids[1];                     /* foreign globex in vol2 */
+    mids[mp++] = TSDB_SID_NONE;                 /* trailing TSDB_SID_NONE */
+    CHECK(mp == mn);
+
+    /* Non-superuser with R_READ on prefix:acme/ (pre-fill mden with 0xaa to verify clearing & zero pad bits) */
+    memset(mden, 0xaa, (mn + 7) / 8);
+    auth_ids_mask(&r, mids, mn, R_READ, mown, mden);
+    int mask_wrong = 0;
+    for (size_t i = 0; i < mn; i++) {
+        bool want_no = auth_id(&r, mids[i], R_READ) != 0;
+        bool got_no = ((mden[i >> 3] >> (i & 7)) & 1) != 0;
+        tsdb_sid want_own = want_no ? TSDB_SID_NONE : mids[i];
+        mask_wrong += (got_no != want_no) || (mown[i] != want_own);
+    }
+    if (mn & 7)
+        mask_wrong += (mden[mn >> 3] >> (mn & 7)) != 0; /* trailing padding bits must be 0 */
+    CHECK(mask_wrong == 0);
+
+    /* NEED_ANY matches R_READ for acme/r; R_INSERT denies all */
+    memset(mden, 0x55, (mn + 7) / 8);
+    auth_ids_mask(&r, mids, mn, NEED_ANY, mown, mden);
+    for (size_t i = 0; i < mn; i++) {
+        bool want_no = auth_id(&r, mids[i], NEED_ANY) != 0;
+        mask_wrong += (((mden[i >> 3] >> (i & 7)) & 1) != want_no) || (mown[i] != (want_no ? TSDB_SID_NONE : mids[i]));
+    }
+    memset(mden, 0x00, (mn + 7) / 8);
+    auth_ids_mask(&r, mids, 17, R_INSERT, mown, mden);
+    for (size_t i = 0; i < 17; i++)
+        mask_wrong += (((mden[i >> 3] >> (i & 7)) & 1) != 1) || (mown[i] != TSDB_SID_NONE);
+    mask_wrong += (mden[2] & ~1u) != 0;
+    CHECK(mask_wrong == 0);
+
+    /* Short edge lengths (0, 1, 7, 8, 9) and in-place own == ids */
+    for (size_t k = 0; k <= 9; k++) {
+        tsdb_sid tmp[9] = {ids[0], ids[1], v2_ids[0], v2_ids[1], TSDB_SID_NONE, ids[4096], ids[4097], v2_ids[3],
+                           TSDB_SID(0, (1u << 22) + 9)};
+        tsdb_sid orig[9];
+        memcpy(orig, tmp, sizeof orig);
+        uint8_t d2[2] = {0xff, 0xff};
+        auth_ids_mask(&r, tmp, k, R_READ, tmp, d2);
+        for (size_t i = 0; i < k; i++) {
+            bool want_no = auth_id(&r, orig[i], R_READ) != 0;
+            mask_wrong += (((d2[i >> 3] >> (i & 7)) & 1) != want_no) || (tmp[i] != (want_no ? TSDB_SID_NONE : orig[i]));
+        }
+        if (k & 7)
+            mask_wrong += (d2[k >> 3] >> (k & 7)) != 0;
+    }
+    CHECK(mask_wrong == 0);
+
+    /* nogrant user: every id denied */
+    memset(mden, 0, (mn + 7) / 8);
+    auth_ids_mask(&ng, mids, 32, R_READ, mown, mden);
+    for (size_t i = 0; i < 32; i++)
+        mask_wrong += (((mden[i >> 3] >> (i & 7)) & 1) != 1) || (mown[i] != TSDB_SID_NONE);
+    CHECK(mask_wrong == 0);
+
+    /* Superuser and --no-auth (au == NULL): every id allowed, even TSDB_SID_NONE and unknown ids */
+    auth_conn su, noa;
+    CHECK(inproc_login(&su, "root", "pw", NULL, NULL) == 0);
+    memset(&noa, 0, sizeof noa);
+    noa.state = AS_IN;
+    for (int mode = 0; mode < 2; mode++) {
+        auth_conn *ac = mode == 0 ? &su : &noa;
+        memset(mden, 0xff, (mn + 7) / 8);
+        memset(mown, 0, mn * sizeof *mown);
+        auth_ids_mask(ac, mids, mn, R_READ, mown, mden);
+        for (size_t i = 0; i < mn; i++)
+            mask_wrong += (mown[i] != mids[i]) || (((mden[i >> 3] >> (i & 7)) & 1) != 0);
+        for (size_t j = 0; j < (mn + 7) / 8; j++)
+            mask_wrong += mden[j] != 0;
+    }
+    CHECK(mask_wrong == 0);
+    /* Still within the 32 KiB cap after all over-budget auth_ids_mask calls; then restore budget and re-verify
+     * with cached cross-L2/cross-leaf radix entries populated. */
+    CHECK(auth_map_total() <= (32 << 10) + 4096);
     auth_map_budget = budget;
+    memset(mden, 0xaa, (mn + 7) / 8);
+    auth_ids_mask(&r, mids, mn, R_READ, mown, mden);
+    for (size_t i = 0; i < mn; i++) {
+        bool want_no = auth_id(&r, mids[i], R_READ) != 0;
+        bool got_no = ((mden[i >> 3] >> (i & 7)) & 1) != 0;
+        mask_wrong += (got_no != want_no) || (mown[i] != (want_no ? TSDB_SID_NONE : mids[i]));
+    }
+    if (mn & 7)
+        mask_wrong += (mden[mn >> 3] >> (mn & 7)) != 0;
+    CHECK(mask_wrong == 0);
+    auth_conn_free(&su);
+    free(mids);
+    free(mown);
+    free(mden);
 
     /* #2 */
     during d = {.in = &r, .own = own[0], .foreign = ids[1], .login = -1};
@@ -692,6 +817,10 @@ static void test_inproc(const char *base)
     auth_conn_free(&r);
     auth_shutdown();
     tsdb_close(db);
+    char rm_v2[PATH_MAX + 96];
+    snprintf(rm_v2, sizeof rm_v2, "rm -rf '%s'", v2dir);
+    if (system(rm_v2) != 0)
+        fprintf(stderr, "test_auth: could not remove %s\n", v2dir);
     printf("  in process: the same HMACs for a known and an unknown name (%u, %u); %d ids probed without a grant: "
            "map %zu bytes; past a 32 KiB budget (%zu bytes) every answer right; a login and checks answer while a "
            "reload hangs in USERS\n", hs[0], hc[0], N, probed, capped);
