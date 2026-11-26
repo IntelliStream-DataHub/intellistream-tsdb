@@ -14,12 +14,17 @@
  * away, not lost). Never wrong bytes, and never part_mark_payload: an .ec part is never merged (r7-skip), and an
  * unreadable granule there says nothing about the part's index.
  *
- * The cache's mutex is a leaf (AGENTS.md "Lock order"): it is never held across I/O, an object's open or close, or a
- * decode. Entries live under a byte budget (cache_mb of TSDB_TEST_TIER, 0: 10% of RAM), LRU; a granule larger than
- * the budget is read, used by its reader and dropped. Objects (chunk_obj, one fd per chunk found) live under an fd
- * budget, LRU; an object a reader holds is never closed under it. Two readers that miss the same granule or object
- * read it once: the second waits for the first (on the cache's cv) and then hits. Every fill and open broadcasts on
- * that one cv, so each wakes every waiter (cheap at tens of threads; per-entry waits if it ever shows up).
+ * The cache's mutexes are leaves (AGENTS.md "Lock order"): none is ever held across I/O, an object's open or close,
+ * a decode, or alongside another cache mutex. Granule entries are sharded into 64 stripes keyed by hash(oid, off),
+ * each with its own hash table, LRU, object-group table, mutex and condvar, so concurrent cache hits never serialize
+ * across stripes or wake unrelated waiters. Entries live under a global byte budget (cache_mb of TSDB_TEST_TIER, 0:
+ * 10% of RAM) distributed across shards with cross-shard clock eviction when a shard or small test budget overflows;
+ * a granule larger than the whole budget is read, used by its reader and dropped. Objects (chunk_obj, one fd per chunk
+ * found) live under their own leaf lock and fd budget, LRU; an object a reader holds is never closed under it. Two
+ * readers that miss the same granule or object read it once: the second waits for the first on that stripe's (or the
+ * object table's) cv and then hits. Prefetched windows in fill_ahead are backed by a single refcounted shared slab so
+ * cached slices point directly into the read buffer with zero memcpy; if a single slice outlives its siblings in a
+ * large slab, its next uncontended hit detaches it to a standalone buffer and frees the slab immediately.
  * The budget is per tier, so per handle: an embedded process with several handles has one cache each.
  *
  * No read here runs under db->lock, latest_rw, buf_lock or publish_lock: every caller of granule_read reads a
@@ -54,9 +59,12 @@ struct chunk_backend;
 struct ec_record;
 
 /* granule_read for an .ec part (p->ec set): the same contract (src/internal.h). A test-marked part (eng_test_mark_ec)
- * still reads its map. */
+ * still reads its map. ec_granule_read_at accepts the caller's known granule index gi (SIZE_MAX if unknown) to avoid
+ * a binary search in pf_plan / corrupt_line. */
 int ec_granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
                     bool verify);
+int ec_granule_read_at(codec_ctx *c, const part *p, const granule *g, size_t gi, int type, int64_t *ts, void *v,
+                       size_t cap, bool verify);
 /* The bytes an .ec part counts as its file in part_walk (statistics: the four byte columns add up to it): the
  * object's length. Runs under db->lock as well (stats_walk, eng_foreach_part): a number the part keeps. */
 uint64_t eccache_part_bytes(const part *p);
@@ -129,9 +137,10 @@ void eccache_test_drop(struct tier *t);
 void eccache_test_drop_entries(struct tier *t);
 /* Called (when set) after an object's open, before it is listed open, and after a granule's fill, before it is listed
  * READY; for a window read ahead, after its granules are chosen, before they are listed (PFPLAN), and after its range
- * read, before its granules are listed READY (PFREAD): a test forgets the object there to run its race without
- * threads. No lock of the cache is held. */
-enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED, ECC_HOOK_PFPLAN, ECC_HOOK_PFREAD };
+ * read, before its granules are listed READY (PFREAD); and in drop_object after sweeping all shards, before
+ * forget_active clears (FORGET_SWEPT): a test uses these to drive races deterministically. No lock of the cache is
+ * held. */
+enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED, ECC_HOOK_PFPLAN, ECC_HOOK_PFREAD, ECC_HOOK_FORGET_SWEPT };
 extern void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 /* r7-seam's test hook (r7-keep, r7-gc, r7-oracle use it): encodes the bytes of p, a listed .part of db, into the

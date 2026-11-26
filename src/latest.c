@@ -155,8 +155,7 @@ static int src_decode(lctx *x, lsrc *s, uint32_t series)
         return TSDB_ERR_NOMEM;
     }
     granule gb;
-    gx_load(s->p, s->cur, GW_LOC, &gb);
-    int rc = granule_read(x->cc, s->p, &gb, x->type, ts, v, cnt, s->p->verify);
+    int rc = granule_read_at(x->cc, s->p, s->cur, x->type, ts, v, cnt, s->p->verify, &gb);
     if (rc) {
         free(ts);
         free(v);

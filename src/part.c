@@ -315,7 +315,9 @@ int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *
                     granule *g)
 {
     gx_load(p, i, GW_LOC, g);
-    return granule_read(c, p, g, type, ts, v, cap, verify);
+    if (p->ec)
+        return ec_granule_read_at(c, p, g, i, type, ts, v, cap, verify); /* R7: the bytes come from the chunk store */
+    return granule_read_map(c, p, g, type, ts, v, cap, verify);
 }
 
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,

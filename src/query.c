@@ -27,6 +27,7 @@
  * nulls, and a bucket whose rows are all null is reported with count 0.
  */
 #include "internal.h"
+#include "eccache.h"
 
 #include <float.h>
 #include <math.h>
@@ -465,7 +466,8 @@ static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, 
         const granule *g = &gb;
         int64_t *ts = out->ts + out->n;
         uint8_t *v = out->v + out->n * w;
-        int rc = granule_read(cc, p, g, type, ts, v, total - out->n, p->verify); /* counts loaded again */
+        int rc = p->ec ? ec_granule_read_at(cc, p, g, x, type, ts, v, total - out->n, p->verify)
+                       : granule_read_map(cc, p, g, type, ts, v, total - out->n, p->verify); /* counts loaded again */
         if (rc)
             return rc;
         size_t lo = lower_bound_i64(ts, g->count, start), hi = lower_bound_i64(ts, g->count, end);
@@ -646,9 +648,11 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
     }
     while (c->gi < c->gj) {
         granule gb;
-        gx_load(c->p, c->gi++, GW_LOC | GW_TIME, &gb);
+        uint32_t idx = c->gi++;
+        gx_load(c->p, idx, GW_LOC | GW_TIME, &gb);
         const granule *g = &gb;
-        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->cap, c->p->verify);
+        int rc = c->p->ec ? ec_granule_read_at(cc, c->p, g, idx, c->type, c->ts, c->v, c->cap, c->p->verify)
+                          : granule_read_map(cc, c->p, g, c->type, c->ts, c->v, c->cap, c->p->verify);
         if (rc)
             return rc;
         c->pos = g->ts_min >= start ? 0 : lower_bound_i64(c->ts, g->count, start);

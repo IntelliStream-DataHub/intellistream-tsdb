@@ -891,6 +891,55 @@ static void fg_hook(struct tier *t, int where, const uint8_t oid[16])
     eccache_forget(t, 0, oid);
 }
 
+/* Deterministic concurrent reader vs eccache_forget race (M-1): while drop_object has finished sweeping shards
+ * (ECC_HOOK_FORGET_SWEPT) and chunks are already hidden on disk, wake a concurrent reader thread to miss and call
+ * ec_granule_read; because drop_object removed `co` under obj_mu BEFORE sweeping shards, the reader cannot reuse the
+ * pre-forget `co` and cannot leave a granule of the forgotten object cached. */
+static pthread_mutex_t fgr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fgr_cv = PTHREAD_COND_INITIALIZER;
+static int fgr_go, fgr_done, fgr_rc;
+static const part *fgr_part;
+static int fgr_type;
+
+static void fg_swept_hook(struct tier *t, int where, const uint8_t oid[16])
+{
+    (void)t;
+    if (fg_done || where != ECC_HOOK_FORGET_SWEPT || memcmp(oid, fg_oid, 16) != 0)
+        return;
+    fg_done = 1;
+    pthread_mutex_lock(&fgr_mu);
+    fgr_go = 1;
+    pthread_cond_broadcast(&fgr_cv);
+    while (!fgr_done)
+        pthread_cond_wait(&fgr_cv, &fgr_mu);
+    pthread_mutex_unlock(&fgr_mu);
+}
+
+static void *fgr_thr(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&fgr_mu);
+    while (!fgr_go)
+        pthread_cond_wait(&fgr_cv, &fgr_mu);
+    pthread_mutex_unlock(&fgr_mu);
+    codec_ctx *cx = codec_new();
+    size_t cap = fgr_part->grows + 64;
+    int64_t *ts = malloc(cap * sizeof *ts);
+    uint8_t *v = malloc(cap * 8);
+    granule g0;
+    gx_load(fgr_part, 0, GW_LOC, &g0);
+    int rc = ec_granule_read_at(cx, fgr_part, &g0, 0, fgr_type, ts, v, cap, false);
+    free(ts);
+    free(v);
+    codec_free(cx);
+    pthread_mutex_lock(&fgr_mu);
+    fgr_rc = rc;
+    fgr_done = 1;
+    pthread_cond_broadcast(&fgr_cv);
+    pthread_mutex_unlock(&fgr_mu);
+    return NULL;
+}
+
 static void *fg_thr(void *arg)
 {
     const part *p = arg;
@@ -963,7 +1012,37 @@ static void case_forget(h *x)
     fg_hide(objs[3].rec.oid, false);
     hsum o;
     CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h && o.n == want.n); /* back: opened again */
-    printf("test_seam: forget: nothing of the object left after a forget during its open, its fill, 8 readers\n");
+    /* Deterministic concurrent reader racing with eccache_forget after shard sweep (M-1): keep `co` open in c->oh
+     * while entries are dropped, hide chunks on disk, then trigger a concurrent reader at ECC_HOOK_FORGET_SWEPT. */
+    eccache_test_drop_entries(x->t);
+    CHECK(fds_on(objs[3].rec.oid) > 0 && eccache_resident(p, 0, p->map_len) == 0);
+    fg_hide(objs[3].rec.oid, true);
+    fg_oid = objs[3].rec.oid;
+    fg_done = 0;
+    fgr_go = 0;
+    fgr_done = 0;
+    fgr_rc = 0;
+    fgr_part = p;
+    fgr_type = types[s];
+    pthread_t rth;
+    CHECK(pthread_create(&rth, NULL, fgr_thr, NULL) == 0);
+    eccache_test_hook = fg_swept_hook;
+    cap_begin(log);
+    eccache_forget(x->t, 0, objs[3].rec.oid);
+    pthread_mutex_lock(&fgr_mu); /* wake rth even if hook skipped (ECC_MUT_FORGETNOOP) so join cannot hang */
+    fgr_go = 1;
+    pthread_cond_broadcast(&fgr_cv);
+    pthread_mutex_unlock(&fgr_mu);
+    pthread_join(rth, NULL);
+    cap_end();
+    eccache_test_hook = NULL;
+    CHECK(fg_done == 1 && fgr_rc == TSDB_ERR_CORRUPT);
+    CHECK(eccache_resident(p, 0, p->map_len) == 0);
+    CHECK(fds_on(objs[3].rec.oid) == 0);
+    fg_hide(objs[3].rec.oid, false);
+    CHECK(read_part(x->db, p, s, &o) == 0 && o.h == want.h && o.n == want.n);
+    printf("test_seam: forget: nothing of the object left after a forget during its open, its fill, 8 readers, "
+           "concurrent race\n");
 }
 
 /* more than m chunks of one object gone: CORRUPT, with the line; the other parts still answer */
@@ -1961,6 +2040,141 @@ static void case_multi(void)
     CHECK(tsdb_close(db) == 0);
 }
 
+/* Shared-slab partial eviction, ec_granule_read_at index hint/fallback, and 16-thread sharded hit+stream stress */
+static void case_shard_slab(void)
+{
+    char dir[800];
+    snprintf(dir, sizeof dir, "%s/slab", base);
+    h x;
+    CHECK(h_open(&x, dir, NULL) == 0);
+    if (!x.db)
+        return;
+    uint32_t s;
+    CHECK(eng_series(x.db, "sl", TSDB_FLOAT32, &s) == 0);
+    enum { N = 200000 }; /* ~25 granules in one part so prefetch fills multi-granule shared slabs */
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    for (size_t i = 0; i < N; i++) {
+        ts[i] = (int64_t)i * 400 + (int64_t)(xs() % 50);
+        v[i] = (float)(10.0 + (double)(i % 4096) / 100.0);
+    }
+    CHECK(eng_insert_series(x.db, TSDB_FLOAT32, s, ts, v, N) == 0);
+    CHECK(eng_flush(x.db) == 0);
+    free(ts);
+    free(v);
+    part *ps[MAXP];
+    size_t np = list_parts(x.db, ps, MAXP);
+    part *p = NULL;
+    for (size_t i = 0; i < np; i++)
+        if (ps[i]->ix.n >= 16) {
+            p = ps[i];
+            break;
+        }
+    CHECK(p != NULL);
+    if (!p) {
+        h_close(&x);
+        return;
+    }
+    buf want = {0};
+    int rc = 0;
+    raw_all(x.db, s, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &want, &rc);
+    CHECK(rc == 0 && want.n > 0);
+    CHECK(ec_test_attach(x.db, p, NULL) == 0);
+
+    /* 1: ec_granule_read_at with exact index, SIZE_MAX fallback, and mismatched index fallback */
+    codec_ctx *cx = codec_new();
+    int64_t *gts = malloc((p->grows + 64) * sizeof *gts);
+    float *gv0 = malloc((p->grows + 64) * sizeof *gv0);
+    float *gv1 = malloc((p->grows + 64) * sizeof *gv1);
+    granule g0;
+    gx_load(p, 0, GW_LOC, &g0);
+    CHECK(ec_granule_read_at(cx, p, &g0, 0, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    eccache_test_drop_entries(x.t);
+    CHECK(ec_granule_read_at(cx, p, &g0, SIZE_MAX, TSDB_FLOAT32, gts, gv1, p->grows + 64, false) == 0);
+    CHECK(memcmp(gv0, gv1, g0.count * sizeof *gv0) == 0);
+    eccache_test_drop_entries(x.t);
+    /* Wrong index hint (p->ix.n - 1) must safely fall back to gran_index(p, g->off) */
+    CHECK(ec_granule_read_at(cx, p, &g0, p->ix.n - 1, TSDB_FLOAT32, gts, gv1, p->grows + 64, false) == 0);
+    CHECK(memcmp(gv0, gv1, g0.count * sizeof *gv0) == 0);
+
+    /* 2: Fill a shared slab via prefetch (granule 0, then 1 triggers window 2..5), pin middle slice (granule 3),
+     * drop all other slices, then decode granule 3 from the still-alive slab and unpin it (ASan/LSan checks no UAF/leak) */
+    eccache_test_drop(x.t);
+    granule g1, g3;
+    gx_load(p, 1, GW_LOC, &g1);
+    gx_load(p, 3, GW_LOC, &g3);
+    CHECK(ec_granule_read_at(cx, p, &g0, 0, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    CHECK(ec_granule_read_at(cx, p, &g1, 1, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    void *pin3 = eccache_test_pin(x.t, p->ec->rec.oid, g3.off);
+    CHECK(pin3 != NULL);
+    eccache_test_drop_entries(x.t); /* evicts granule 0, 1, 2, 4, 5 — only pinned slice 3 keeps the slab alive */
+    eccache_counters k;
+    eccache_get_counters(x.t, &k);
+    CHECK(k.entries == 1);
+    CHECK(ec_granule_read_at(cx, p, &g3, 3, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    if (pin3)
+        eccache_test_unpin(x.t, pin3);
+    /* Uncontended re-hit of the sole surviving slice detaches it from the large shared slab (S-2) */
+    CHECK(ec_granule_read_at(cx, p, &g3, 3, TSDB_FLOAT32, gts, gv1, p->grows + 64, false) == 0);
+    CHECK(memcmp(gv0, gv1, g3.count * sizeof *gv0) == 0);
+    eccache_get_counters(x.t, &k);
+    CHECK(k.entries == 1);
+    eccache_test_drop_entries(x.t); /* now detached standalone entry frees cleanly */
+    eccache_get_counters(x.t, &k);
+    CHECK(k.entries == 0 && k.bytes == 0 && k.pf_bytes == 0);
+
+    /* 3: Small-budget unpin (s->cap < ce_cost(x)): evicts older entries on other shards before the just-used MRU
+     * entry (S-1) while keeping total bytes within budget */
+    eccache_test_prefetch(x.t, 0);
+    eccache_test_drop(x.t);
+    uint64_t max_cost = 0;
+    for (uint32_t j = 0; j < 8; j++) {
+        granule gj;
+        gx_load(p, j, GW_LOC, &gj);
+        uint64_t c = (uint64_t)gj.ts_len + gj.val_len + ECCACHE_ENTRY_OVERHEAD;
+        if (c > max_cost)
+            max_cost = c;
+    }
+    eccache_test_budget(x.t, max_cost * 4);
+    for (uint32_t j = 0; j < 8; j++) {
+        granule gj;
+        gx_load(p, j, GW_LOC, &gj);
+        CHECK(ec_granule_read_at(cx, p, &gj, j, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+        uint64_t gl = (uint64_t)gj.ts_len + gj.val_len;
+        CHECK(eccache_resident(p, gj.off, gl) == gl); /* just-used MRU entry must not self-evict on unpin */
+    }
+    eccache_get_counters(x.t, &k);
+    CHECK(k.bytes <= max_cost * 4 && k.evictions > 0);
+    eccache_test_budget(x.t, 64ull << 20);
+    eccache_test_prefetch(x.t, ECCACHE_PF_CAP);
+
+    /* 4: 16 threads concurrently reading warm cache hits across all shards */
+    CHECK(raw_same(x.db, s, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &want, "slab warm prime"));
+    eccache_counters kw0, kw1;
+    eccache_get_counters(x.t, &kw0);
+    pf_conc_arg args[16];
+    pthread_t th[16];
+    for (int i = 0; i < 16; i++) {
+        args[i] = (pf_conc_arg){.db = x.db, .sid = s, .want = &want, .ok = false};
+        CHECK(pthread_create(&th[i], NULL, pf_conc_fn, &args[i]) == 0);
+    }
+    for (int i = 0; i < 16; i++) {
+        CHECK(pthread_join(th[i], NULL) == 0);
+        CHECK(args[i].ok);
+    }
+    eccache_get_counters(x.t, &kw1);
+    CHECK(kw1.hits > kw0.hits && kw1.misses == kw0.misses && kw1.corrupt == 0);
+    printf("test_seam: shard_slab: index hint/fallback, partial slab eviction & 16-thread warm hits ok (%" PRIu64
+           " hits)\n", kw1.hits - kw0.hits);
+
+    free(gts);
+    free(gv0);
+    free(gv1);
+    codec_free(cx);
+    free(want.b);
+    h_close(&x);
+}
+
 static void run(void)
 {
     snprintf(base, sizeof base, "%s/test_seam_%d", scratch, (int)getpid());
@@ -1995,6 +2209,7 @@ static void run(void)
     case_bad();
     case_prefetch();
     case_multi();
+    case_shard_slab();
     free_objs();
     free(ref.b);
     if (!failures)
