@@ -634,7 +634,7 @@ CLUSTER_SCEN_3 := ecbasic ec16 r4stubs addreplica setnext addswitch removereplic
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
-    writerdepose lease hungloop leasedown leasequorum hardslot repcheck
+    writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -651,6 +651,13 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	./$(B)/test_fwd
 	$(MUT) --name test_fwd --list "noage retry unavonbreak teardown" -- ./$(B)/test_fwd --mutant @M@ # each planted bug must fail it
 	$(MAKE) cluster-mutants
+
+# Real-verbs RDMA tests (docs/design-rdma.md §8, track rd-rxe): runs test_peerlink --rdma and test_cluster rdma
+# over an active InfiniBand HCA or Soft-RoCE (rxe*) device (tools/setup-rxe.sh). Skips cleanly when no device is
+# present or built with NO_RDMA=1; set TSDB_RDMA_REQUIRED=1 to fail instead of skipping.
+test-rdma: $(B)/test_peerlink $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	./$(B)/test_peerlink $(SCRATCH) --rdma
+	TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster $(SCRATCH) rdma
 
 # all of them, one after the other (what `make test` runs as its test-meta groups, and what a hand run wants)
 test-meta:
@@ -1016,7 +1023,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: check-rdma-syms margin-mutants lease-mutants chunkpeer-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms margin-mutants lease-mutants chunkpeer-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1106,8 +1113,8 @@ $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h
 $(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
-$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h tests/rdma_dev.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 # the replication driver's check (server/replwire.h, rd-drvcheck)
 $(B)/test_replwire: tests/test_replwire.c $(B)/replwire.o server/replwire.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ $< $(B)/replwire.o
@@ -1134,11 +1141,11 @@ META_SOAK_FIRST   ?= 1000
 # cvol_check.o opens a replica directory in-process (the engine's headers; test_cluster speaks the client's)
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h server/cluster.h server/crashpt.h server/meta.h server/peerlink.h \
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h tests/rdma_dev.h server/cluster.h server/crashpt.h server/meta.h server/peerlink.h server/plrdma.h \
     $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
-	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(ZSTD_LIB) -lpthread -lm
+	    $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 rewind-mutants:
 	tests/rewind_mutants.sh $(or $(REWIND_DIR),/var/tmp/rewind-mutants-$$$$)
 meta-mutants: $(B)/test_meta_mut

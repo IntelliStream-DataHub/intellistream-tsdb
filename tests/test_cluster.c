@@ -36,6 +36,8 @@
 #include "harness.h"
 #include "meta.h"
 #include "peerlink.h"
+#include "plrdma.h"
+#include "rdma_dev.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
 #include "snapshot.h"
@@ -19234,6 +19236,195 @@ static void scen_moveold(void)
            A, B, s1);
 }
 
+/* Reads one integer Prometheus metric line starting with `prefix` from `buf` (-1 if missing). */
+static long long rdma_metric_val(const char *buf, const char *prefix)
+{
+    size_t pl = strlen(prefix);
+    for (const char *p = buf; p && *p; ) {
+        if (!strncmp(p, prefix, pl))
+            return strtoll(p + pl, NULL, 10);
+        p = strchr(p, '\n');
+        if (p)
+            p++;
+    }
+    return -1;
+}
+
+/* rdma (docs/design-rdma.md §8, track rd-rxe): 3-node cluster over real verbs (InfiniBand HCA or Soft-RoCE rxe*) with
+ * --peer-rdma on, --peer-rdma-pool-mb 1, and TSDB_PLRDMA_TEST=rnr_retry=0 so any credit bug fails the QP loudly.
+ * Writes and replicates small (LOG) and large (BULK) batches, runs forwarded writes (FWD) and forwarded reads (FWDQ),
+ * and checks client STATUS, `tsdb cluster status`, and /metrics confirm rdma > 0, tcp == 0, fallbacks == 0,
+ * rnr_retries == 0, and qp_errors == 0. Skips cleanly (exit 0) when built with NO_RDMA=1 or no active verbs device is
+ * present, unless TSDB_RDMA_REQUIRED=1 is set (which fails instead of skipping). */
+static void scen_rdma(void)
+{
+    scenario("rdma");
+    struct rdma_dev_info di;
+    char reason[256];
+    if (!rdma_dev_discover(&di, reason, sizeof reason)) {
+        if (rdma_dev_required())
+            die("TSDB_RDMA_REQUIRED=1 but no RDMA verbs device is usable (%s)", reason);
+        printf("  rdma: skipped (%s)\n", reason);
+        return;
+    }
+    printf("  rdma: using %s (%s)\n", di.spec[0] ? di.spec : "auto-ib",
+           di.link_layer == PLR_LL_IB ? "InfiniBand" : "Ethernet/RoCE");
+    strict_reads = 1;
+    fwd_on = 1;
+    static char xa[256];
+    if (di.spec[0])
+        snprintf(xa, sizeof xa, "--peer-rdma on --peer-rdma-pool-mb 1 --peer-rdma-device %s --metrics-port auto --workers 2",
+                 di.spec);
+    else
+        snprintf(xa, sizeof xa, "--peer-rdma on --peer-rdma-pool-mb 1 --metrics-port auto --workers 2");
+    int mports[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        xargs[i] = xa;
+        penv[i] = "TSDB_PLRDMA_TEST=rnr_retry=0";
+        start(i);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("server %d: no metrics port reported", i);
+    }
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("volume add plant: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "plant", i, 1, 0);
+    await_isr(0, "plant", 3, WAIT_MS, "plant with 3 replicas in ISR");
+    struct meta_volume v;
+    if (!vol_rec(0, "plant", &v))
+        die("no record of plant");
+    int L = server_of(v.leader), R = (L + 1) % 3;
+    if (L < 0 || L > 2)
+        die("leader of plant is node %" PRIu32, v.leader);
+
+    /* Write small batches (LOG) and one large batch straight to parts (BULK) on leader L. */
+    tsdbc *cl = client(L);
+    tsdb_sid s_log = rep_series(cl, "rdma.log", "plant", 30000);
+    tsdb_sid s_bulk = rep_series(cl, "rdma.bulk", "plant", 30000);
+    for (int j = 0; j < 100; j++) {
+        int64_t ts = 1000 + 1000LL * j;
+        float val = (float)j;
+        if ((rc = tsdbc_insert_series(cl, s_log, &ts, &val, 1)) != 0)
+            die("small insert %d: %s", j, ers(rc));
+    }
+    enum { BIG = 70000 };
+    int64_t *bts = malloc(BIG * sizeof *bts);
+    float *bval = malloc(BIG * sizeof *bval);
+    if (!bts || !bval)
+        die("out of memory");
+    for (int j = 0; j < BIG; j++)
+        bts[j] = 1000 + 1000LL * j, bval[j] = (float)(j % 977);
+    if ((rc = tsdbc_insert_series(cl, s_bulk, bts, bval, BIG)) != 0)
+        die("large insert: %s", ers(rc));
+    free(bts);
+    free(bval);
+
+    /* Forwarded writes (FWD) and forwarded reads (FWDQ) through follower R to leader L. */
+    tsdbc *cr = client(R);
+    for (int j = 0; j < 50; j++) {
+        int64_t ts = 1000 + 1000LL * (100 + j);
+        float val = (float)(100 + j);
+        if ((rc = tsdbc_insert_series(cr, s_log, &ts, &val, 1)) != 0)
+            die("forwarded insert %d via server %d: %s", j, R, ers(rc));
+    }
+    int r_log = rows_of(cr, s_log), r_bulk = rows_of(cr, s_bulk);
+    int l_log = rows_of(cl, s_log), l_bulk = rows_of(cl, s_bulk);
+    tsdbc_close(cr);
+    tsdbc_close(cl);
+    if (r_log != 150 || l_log != 150 || r_bulk != BIG || l_bulk != BIG)
+        die("row counts mismatch: leader (%d, %d) vs forwarded (%d, %d), want (150, %d)", l_log, l_bulk, r_log, r_bulk,
+            BIG);
+
+    /* Verify STATUS on all 3 nodes: rdma > 0 and tcp == 0 for log, bulk, fwd, fwdq. */
+    static const char *const kinds[] = {"log", "bulk", "fwd", "fwdq"};
+    for (int i = 0; i < 3; i++) {
+        for (int k = 0; k < 4; k++) {
+            char kr[64], kt[64], vr[32], vt[32];
+            snprintf(kr, sizeof kr, "links.%s.rdma", kinds[k]);
+            snprintf(kt, sizeof kt, "links.%s.tcp", kinds[k]);
+            int nr = -1, nt = -1;
+            for (uint64_t t0 = now_ms();; usleep(50000)) {
+                nr = status_key(i, kr, vr, sizeof vr) ? atoi(vr) : -1;
+                nt = status_key(i, kt, vt, sizeof vt) ? atoi(vt) : -1;
+                if (nr >= 2 && nt == 0)
+                    break;
+                if (now_ms() - t0 > WAIT_MS)
+                    die("server %d: STATUS says %s=%d %s=%d, want rdma >= 2 and tcp == 0", i, kr, nr, kt, nt);
+            }
+        }
+        if (!log_has(i, "rnr_retry=0"))
+            die("server %d: log does not confirm TSDB_PLRDMA_TEST rnr_retry=0", i);
+    }
+
+    /* Verify `tsdb cluster status` CLI reports rdma links > 0 and tcp 0. */
+    char pL[META_ADDR_MAX], args[PATH_MAX + 256], out[16384];
+    peer_of(L, pL, sizeof pL);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", pL, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("tsdb cluster status failed: %s", out);
+    for (int k = 0; k < 4; k++) {
+        char head[64];
+        snprintf(head, sizeof head, "peer links %s:", kinds[k]);
+        const char *ln = strstr(out, head);
+        if (!ln)
+            die("tsdb cluster status missing '%s':\n%s", head, out);
+        const char *eol = strchr(ln, '\n');
+        size_t ll = eol ? (size_t)(eol - ln) : strlen(ln);
+        char line[256];
+        snprintf(line, sizeof line, "%.*s", (int)(ll < sizeof line - 1 ? ll : sizeof line - 1), ln);
+        const char *tp = strstr(line, " tcp "), *rp = strstr(line, " rdma ");
+        if (!tp || !rp || atoi(tp + 5) != 0 || atoi(rp + 6) < 2)
+            die("tsdb cluster status unexpected line '%s' (want tcp 0 and rdma >= 2)", line);
+    }
+
+    /* Verify /metrics on all 3 nodes: rdma > 0, tcp == 0, fallbacks == 0, rnr_retries == 0, qp_errors == 0. */
+    char mbuf[65536];
+    for (int i = 0; i < 3; i++) {
+        metrics_get(mports[i], mbuf, sizeof mbuf);
+        for (int k = 0; k < 4; k++) {
+            char mrdma[128], mtcp[128];
+            snprintf(mrdma, sizeof mrdma, "tsdb_peer_links_transport{kind=\"%s\",transport=\"rdma\"} ", kinds[k]);
+            snprintf(mtcp, sizeof mtcp, "tsdb_peer_links_transport{kind=\"%s\",transport=\"tcp\"} ", kinds[k]);
+            long long vr = rdma_metric_val(mbuf, mrdma), vt = rdma_metric_val(mbuf, mtcp);
+            if (vr < 2 || vt != 0)
+                die("server %d /metrics: %s%lld, %s%lld (want rdma >= 2, tcp == 0)", i, mrdma, vr, mtcp, vt);
+        }
+        /* Every fallback reason counter must be 0. */
+        int fb_seen = 0;
+        for (const char *p = mbuf; p && *p; ) {
+            static const char fbp[] = "tsdb_peer_rdma_fallbacks_total{";
+            if (!strncmp(p, fbp, sizeof fbp - 1)) {
+                fb_seen++;
+                const char *sp = strchr(p, ' ');
+                if (!sp || strtoll(sp + 1, NULL, 10) != 0)
+                    die("server %d /metrics: non-zero RDMA fallback: %.120s", i, p);
+            }
+            p = strchr(p, '\n');
+            if (p)
+                p++;
+        }
+        if (fb_seen == 0)
+            die("server %d /metrics: missing tsdb_peer_rdma_fallbacks_total", i);
+        long long rnr = rdma_metric_val(mbuf, "tsdb_peer_rdma_rnr_retries_total ");
+        long long qpe = rdma_metric_val(mbuf, "tsdb_peer_rdma_qp_errors_total ");
+        if (rnr != 0 || qpe != 0)
+            die("server %d /metrics: rnr_retries=%lld qp_errors=%lld (want 0, 0)", i, rnr, qpe);
+    }
+
+    stop_all();
+    printf("  rdma: 3 nodes on %s, replicated + forwarded %d rows; STATUS, CLI and /metrics confirm rdma >= 2, tcp 0, "
+           "fallbacks 0, rnr_retries 0, qp_errors 0\n",
+           di.spec[0] ? di.spec : "auto-ib", 150 + BIG);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -19278,7 +19469,7 @@ int main(int argc, char **argv)
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ec16", scen_ec16}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
-               {"repcheck", scen_repcheck}};
+               {"repcheck", scen_repcheck}, {"rdma", scen_rdma}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

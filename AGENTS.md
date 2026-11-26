@@ -100,6 +100,10 @@ make meta-soak            # the metadata simulator (tests/test_meta.c) over META
 make check-version        # VERSION, tsdb.h, tsdbd/tsdb --version and the client manifests agree (make test runs it)
 make test-clients         # Rust, Python and Java clients (network and embedded) against build/tsdbd, and test-licenses
                           # (needs cargo, python3, mvn); make test-spdx: the licence line of every file (part of make test)
+make test-rdma            # real-verbs RDMA tests (test_peerlink --rdma and test_cluster rdma; docs/design-rdma.md §8):
+                          # uses an active IB HCA or Soft-RoCE rxe* device (tests/rdma_dev.h, tools/setup-rxe.sh), with
+                          # pool_mb 1-2 and TSDB_PLRDMA_TEST=rnr_retry=0; skips cleanly on NO_RDMA=1 or without a device
+                          # unless TSDB_RDMA_REQUIRED=1 is set (which fails instead of skipping; TSDB_RDMA_DEV=DEV[:PORT] pins one)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
                           # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/;

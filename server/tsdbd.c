@@ -5604,6 +5604,35 @@ static void on_signal(int sig)
     wake_signal();
 }
 
+static void apply_plrdma_test(struct plr_pool_cfg *pc)
+{
+    const char *env = getenv("TSDB_PLRDMA_TEST");
+    if (!env || !*env)
+        return;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", env);
+    for (char *sv = NULL, *tok = strtok_r(buf, ",", &sv); tok; tok = strtok_r(NULL, ",", &sv)) {
+        char *eq = strchr(tok, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        unsigned long v = strtoul(eq + 1, NULL, 10);
+        if (!strcmp(tok, "rnr_retry") && v <= 7)
+            pc->rnr_retry = (uint8_t)v;
+        else if (!strcmp(tok, "slot") && v >= 1024 && v <= (16u << 20) && (v % 64) == 0)
+            pc->slot = (uint32_t)v;
+        else if (!strcmp(tok, "data_slots") && v >= 1 && v <= 65535)
+            pc->data_slots = (uint16_t)v;
+        else if (!strcmp(tok, "ctl_slots") && v >= PLR_CTL_MIN && v <= PLR_CTL_MAX)
+            pc->ctl_slots = (uint16_t)v;
+        else if (!strcmp(tok, "send_slots") && v >= 2 && v <= 65535)
+            pc->send_slots = (uint16_t)v;
+    }
+    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST=%s (slot=%u data=%u ctl=%u send=%u rnr_retry=%u)\n", env,
+            (unsigned)pc->slot, (unsigned)pc->data_slots, (unsigned)pc->ctl_slots, (unsigned)pc->send_slots,
+            (unsigned)pc->rnr_retry);
+}
+
 static void tsdbd_peer_rdma_metrics(metrics_peer_rdma *out)
 {
     peerlink_up_by_transport(out->up);
@@ -6703,6 +6732,19 @@ int main(int argc, char **argv)
                     pc.dev = rdma_ndevs ? rdma_devs[i].name : NULL;
                     pc.port = rdma_ndevs ? rdma_devs[i].port : 0;
                     pc.pool_bytes = (size_t)rdma_pool_mb << 20;
+                    if (rdma_pool_mb <= 2) {
+                        /* Small pool (e.g. 1-2 MiB under an 8 MiB memlock limit): 32 KiB/conn fits 32-64 links. */
+                        pc.slot = 2048;
+                        pc.data_slots = 4;
+                        pc.ctl_slots = 4;
+                        pc.send_slots = 8;
+                    } else if (rdma_pool_mb < 16) {
+                        pc.slot = 8192;
+                        pc.data_slots = 6;
+                        pc.ctl_slots = 4;
+                        pc.send_slots = 10;
+                    }
+                    apply_plrdma_test(&pc);
                     struct plr_pool *pool = plr_pool_open(rops, &pc, rerr, sizeof rerr);
                     if (!pool) {
                         if (rdma_mode == PL_RDMA_ON) {
