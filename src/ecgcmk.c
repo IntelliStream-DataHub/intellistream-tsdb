@@ -842,7 +842,7 @@ static void maybe_crash_before_del(eng *db)
     }
 }
 
-static void maybe_pause_before_del(eng *db)
+static bool maybe_pause_before_del(eng *db)
 {
     if (test_pause_beforedel[0] && access(test_pause_beforedel, F_OK) == 0 &&
         !atomic_exchange(&test_pause_fired, true)) {
@@ -852,7 +852,9 @@ static void maybe_pause_before_del(eng *db)
             nanosleep(&ts, NULL);
         }
         fprintf(stderr, "tsdb: %s: test: ecgc: resumed before CHUNK_DEL\n", db->dir);
+        return true;
     }
+    return false;
 }
 
 static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
@@ -873,10 +875,19 @@ static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], ui
     for (unsigned pos = 0; pos < npos; pos++) {
         if (atomic_load(&g->stop) || eng_check(db))
             return TSDB_ERR_STOPPED;
-        if (pos == 0)
-            maybe_pause_before_del(db);
+        bool paused = pos == 0 && maybe_pause_before_del(db);
         int rc = cv->ops->del_gc ? cv->ops->del_gc(cv->ctx, oid, pos, epoch, mk_pos)
                                  : cv->ops->del(cv->ctx, oid, pos, epoch, COLD_DEL_MKGC);
+        if (paused && rc == TSDB_ERR_UNAVAILABLE) {
+            /* After SIGSTOP/SIGCONT past peerlink dead_ms, the first send can hit a half-closed socket before the
+             * link reconnects; retry with the same old epoch so the remote store gets to evaluate and FENCE it. */
+            for (int tries = 0; tries < 100 && rc == TSDB_ERR_UNAVAILABLE; tries++) {
+                struct timespec ts = {0, 100 * 1000000L};
+                nanosleep(&ts, NULL);
+                rc = cv->ops->del_gc ? cv->ops->del_gc(cv->ctx, oid, pos, epoch, mk_pos)
+                                     : cv->ops->del(cv->ctx, oid, pos, epoch, COLD_DEL_MKGC);
+            }
+        }
         if (rc == CHUNK_ERR_FENCED) {
             fprintf(stderr,
                     "tsdb: %s: chunk delete of position %u at epoch %" PRIu64

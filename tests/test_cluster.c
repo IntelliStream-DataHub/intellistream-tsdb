@@ -15996,11 +15996,15 @@ static void scen_ecgc(void)
     /* ---- Case 1a: Kill leader right after MK_COLD append (before commit).
      * Replicas that received the marker keep its chunks (new leader commits it and serves all rows); if no replica
      * received it before the crash, the new leader sweeps its orphan chunks via committed MK_GC and still serves
-     * every row from the young parts! Either way, all rows survive and no dangling orphan remains. */
-    touch_file(trig_cold);
+     * every row from the young parts! Either way, all rows survive and no dangling orphan remains.
+     * Hold settle at pause_midput during the initial day0 inserts so slow builds (TSan) never hit cold-after-marker
+     * mid-insert before ecb_write_day finishes; then arm cold-after-marker and release pause_midput. */
+    touch_file(trig_midput);
     ecb_write_day(c, ide, day0);
     tsdbc_close(c);
     c = NULL;
+    touch_file(trig_cold);
+    unlink(trig_midput);
     for (uint64_t t0 = now_ms();; usleep(100000)) {
         int st = 0;
         if (waitpid(pids[L], &st, WNOHANG) == pids[L]) {
@@ -16025,14 +16029,20 @@ static void scen_ecgc(void)
         if (a.n != 2 * ECB_ROWS)
             die("series %d after cold-after-marker failover: %" PRIu64 " rows, want %d", s, a.n, 2 * ECB_ROWS);
     }
-    /* Wait until day0 is settled on the new leader (either via the old MK_COLD or a fresh settle). */
-    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) == 0; usleep(200000))
+    /* Wait until day0 is settled on the new leader and any orphan from the killed settle is swept. */
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        if (nec > 0 && nch == nec * 6)
+            break;
         if (now_ms() - t0 > 120000)
-            die("day0 not settled on new leader %d within 120 s", L);
+            die("day0 not settled cleanly on new leader %d within 120 s (%d .ec, %d chunks)", L, nec, nch);
+    }
     printf("  case 1a (kill after MK_COLD append): new leader %d serves all rows (%d .ec, %d chunks)\n", L,
            ecb_ec_parts(L, num), ecb_chunks(num));
 
     /* ---- Case 1b: Kill leader mid-put (before MK_COLD is ever appended): orphan chunk swept by new leader via MK_GC. */
+    int nec_before_1b = ecb_ec_parts(L, num);
     int ch_before_orph = ecb_chunks(num);
     int pm0 = log_count(L, "pause_midput: paused after position 0");
     touch_file(trig_midput);
@@ -16051,11 +16061,11 @@ static void scen_ecgc(void)
     start(oldL);
     await_isr(L, "e42", 3, 60000, "all 3 replicas back in ISR");
     /* Wait for day0+2 to settle AND for the orphan chunk from oldL's killed put to be swept by MK_GC!
-     * Two settled days (day0 and day0+2) have exactly 12 chunks (2 * 6) — or 6 per .ec part. */
+     * Each settled .ec part has 6 chunks. */
     for (uint64_t t0 = now_ms();; usleep(200000)) {
         int nec = ecb_ec_parts(L, num);
         int nch = ecb_chunks(num);
-        if (nec >= 2 && nch == nec * 6)
+        if (nec > nec_before_1b && nch == nec * 6)
             break;
         if (now_ms() - t0 > 120000)
             die("orphan from killed mid-put not swept in 120 s (%d .ec parts, %d chunks)", nec, nch);

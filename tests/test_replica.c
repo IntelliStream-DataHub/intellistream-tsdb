@@ -2229,8 +2229,9 @@ static int power_child(const char *dir, const char *ackfile)
                 return 5;
             write_ack(ackfile, replica_durable_end(db));
             break;
-        case 2: { /* a cut inside the unsynced tail, then the acknowledgement of what stays */
-            size_t j = l.n - 2;
+        case 2: { /* a cut: alternating between the unsynced tail (what stays must be synced before ack) and the durable
+                   * prefix (the truncation itself must be synced so cut durable records never reappear) */
+            size_t j = ((round / 4) & 1) && l.n >= 5 ? l.n - 5 : l.n - 2;
             uint64_t last = l.r[j].last;
             if (last < replica_durable_end(db))
                 write_ack(ackfile, last); /* the positions above it are given up before the cut */
@@ -2256,7 +2257,8 @@ static int power_child(const char *dir, const char *ackfile)
     return 0;
 }
 
-static int run_power_child_as(const char *mode, const char *dir, const char *root, const char *ackfile, int warmup, int seed)
+static int run_power_child_opts(const char *mode, const char *dir, const char *root, const char *ackfile, int warmup,
+                                int seed, bool tear)
 {
     pid_t pid = fork();
     if (pid == 0) {
@@ -2272,7 +2274,7 @@ static int run_power_child_as(const char *mode, const char *dir, const char *roo
         setenv("CRASHFS_PROB", "1", 1);
         setenv("CRASHFS_WARMUP", w, 1);
         setenv("CRASHFS_AT_EXIT", "1", 1);
-        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_TEAR", tear ? "1" : "0", 1);
         setenv("CRASHFS_SEED", sd, 1);
         int null = open("/dev/null", O_WRONLY);
         if (null >= 0 && !getenv("TEST_REPLICA_CHILD_OUTPUT")) /* (set it to see why a child ended) */
@@ -2286,18 +2288,14 @@ static int run_power_child_as(const char *mode, const char *dir, const char *roo
     return WEXITSTATUS(st);
 }
 
-static int run_power_child(const char *dir, const char *ackfile, int warmup, int seed)
+static int run_power_child_as(const char *mode, const char *dir, const char *root, const char *ackfile, int warmup, int seed)
 {
-    return run_power_child_as("--power", dir, dir, ackfile, warmup, seed);
+    return run_power_child_opts(mode, dir, root, ackfile, warmup, seed, true);
 }
 
 /* (the ack files are named so that no root of crashfs, a path prefix, covers them: S/pl is the root) */
-static void case_power(void)
+static void case_power_mode(bool tear)
 {
-    if (access(SHIM, R_OK) != 0) {
-        printf("  power loss: skipped (no %s)\n", SHIM);
-        return;
-    }
     char dir[PATH_MAX], ack[PATH_MAX + 16];
     snprintf(ack, sizeof ack, "%s/acks-of-pl.ack", S);
     int crashes = 0;
@@ -2308,9 +2306,9 @@ static void case_power(void)
         char hif[PATH_MAX + 24];
         snprintf(hif, sizeof hif, "%s.hi", ack);
         unlink(hif);
-        int code = run_power_child(dir, ack, k, k + 1);
+        int code = run_power_child_opts("--power", dir, dir, ack, k, k + 1, tear);
         if (code != 99 && code != 0)
-            fprintf(stderr, "P: step %d: the child ended with status %d\n", k, code);
+            fprintf(stderr, "P(%s): step %d: the child ended with status %d\n", tear ? "tear" : "strict", k, code);
         CHECK(code == 99 || code == 0);
         if (code != 99 && code != 0)
             break;
@@ -2333,29 +2331,41 @@ static void case_power(void)
         eng *db;
         int rc = open_replica(dir, 0, &db);
         if (rc != 0) {
-            fprintf(stderr, "P: step %d: the open failed: %d\n", k, rc);
+            fprintf(stderr, "P(%s): step %d: the open failed: %d\n", tear ? "tear" : "strict", k, rc);
             failures++;
             continue;
         }
         if (replica_log_end(db) < acked) {
-            fprintf(stderr, "P: step %d: acknowledged %" PRIu64 ", the log ends at %" PRIu64 "\n", k, acked,
-                    replica_log_end(db));
+            fprintf(stderr, "P(%s): step %d: acknowledged %" PRIu64 ", the log ends at %" PRIu64 "\n",
+                    tear ? "tear" : "strict", k, acked, replica_log_end(db));
             failures++;
         }
         if (replica_log_end(db) > hi) { /* a cut that was not durable: the records above it came back */
-            fprintf(stderr, "P: step %d: the log ends at %" PRIu64 ", above anything the history holds (%" PRIu64 ")\n", k,
-                    replica_log_end(db), hi);
+            fprintf(stderr, "P(%s): step %d: the log ends at %" PRIu64 ", above anything the history holds (%" PRIu64 ")\n",
+                    tear ? "tear" : "strict", k, replica_log_end(db), hi);
             failures++;
         }
         if (replica_apply(db, acked) != 0) {
-            fprintf(stderr, "P: step %d: the acknowledged log does not apply\n", k);
+            fprintf(stderr, "P(%s): step %d: the acknowledged log does not apply\n", tear ? "tear" : "strict", k);
             failures++;
         }
         eng_close(db);
     }
     CHECK(finished && crashes > 50);
-    printf("  power lost at each of %d steps of appends, syncs, restarts and cuts: every acknowledged position is on "
-           "disk\n", crashes);
+    printf("  power lost (%s) at each of %d steps of appends, syncs, restarts and cuts: every acknowledged position is on "
+           "disk\n", tear ? "tear" : "strict", crashes);
+}
+
+static void case_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  power loss: skipped (no %s)\n", SHIM);
+        return;
+    }
+    /* Strict rollback catches every missing fsync/fdatasync deterministically (zero RNG luck); tear mode also catches
+     * reordered unsynced directory ops (cutdirsync) and torn partial tails. */
+    case_power_mode(false);
+    case_power_mode(true);
 }
 
 
