@@ -14141,15 +14141,16 @@ static int vol_add_ec(int i, const char *name, uint32_t replicas, uint8_t k, uin
 /* server i restarted with the extra arguments xa (its chunk store) or none, and back UP */
 static void restart_xargs(int i, const char *xa)
 {
+    int peer = i == 0 ? 1 : 0;
     struct view v;
-    view((i + 1) % 6, &v);
+    view(peer, &v);
     const struct meta_member *mb = meta_member(&v.m, ids[i]);
     struct state_want up = {ids[i], META_UP, mb ? mb->incarnation + 1 : 1};
     view_free(&v);
     stop(i, SIGTERM);
     xargs[i] = xa;
     start(i);
-    await_view((i + 1) % 6, p_member_state, &up, xa ? "the server back with a chunk store" : "the server back without one");
+    await_view(peer, p_member_state, &up, xa ? "the server back with a chunk store" : "the server back without one");
 }
 
 static void restart_with_store(int i, const uint8_t uuid[16], char *xa, size_t xn)
@@ -14964,7 +14965,7 @@ static void scen_ecbasic(void)
  * (5 log replicas, 20 stripe positions + 2 spares) settles, kill four stripe members -> read whole equal to twin;
  * kill five -> UNAVAILABLE (never CORRUPT); restart all five -> read whole again. Skips cleanly under NO_EC=1. */
 #define EC16_NODES 22
-#define EC16_SERIES 16
+#define EC16_SERIES 24
 static void scen_ec16(void)
 {
     scenario("ec16");
@@ -15113,19 +15114,19 @@ static void scen_ec16(void)
         die("only %d non-voter stripe members besides L available to kill (want 5)", nv);
     for (int k = 0; k < 4; k++)
         stop(victims[k], SIGKILL);
-    for (int s = 4; s < 8; s++) {
+    for (int s = 4; s < 16; s++) {
         struct ecb_sum a, b = twin[s];
         if ((rc = ecb_read(c, ide[s], &a)) != 0)
             die("read of series %d with four stripe members killed: %s", s, ers(rc));
         if (a.n != b.n || a.h != b.h)
             die("series %d with four stripe members away: %" PRIu64 " rows, the twin %" PRIu64, s, a.n, b.n);
     }
-    printf("  four stripe members killed (servers %d %d %d %d): reads decode around all four, equal to twin\n",
+    printf("  four stripe members killed (servers %d %d %d %d): 12 unread series decode around all four, equal to twin\n",
            victims[0], victims[1], victims[2], victims[3]);
     stop(victims[4], SIGKILL);
     {
         int nun = 0;
-        for (int s = 8; s < EC16_SERIES; s++) {
+        for (int s = 16; s < EC16_SERIES; s++) {
             struct ecb_sum a, b = twin[s];
             rc = ecb_read(c, ide[s], &a);
             if (rc == TSDB_ERR_UNAVAILABLE) {
@@ -15138,15 +15139,15 @@ static void scen_ec16(void)
         }
         if (nun == 0) {
             int nl = ecb_live_parts(L, num, live, sizeof live);
-            die("series 8-%d with five stripe members away (servers %d %d %d %d %d): every one read whole, none "
+            die("series 16-%d with five stripe members away (servers %d %d %d %d %d): every one read whole, none "
                 "UNAVAILABLE (%d .ec, %d .part:%s)", EC16_SERIES - 1, victims[0], victims[1], victims[2], victims[3],
                 victims[4], ecb_ec_parts(L, num), nl, live);
         }
         printf("  five stripe members killed (+ server %d): UNAVAILABLE for %d of %d series, the rest whole\n",
-               victims[4], nun, EC16_SERIES - 8);
+               victims[4], nun, EC16_SERIES - 16);
     }
     start_many(victims, 5);
-    for (int s = 8; s < EC16_SERIES; s++) {
+    for (int s = 16; s < EC16_SERIES; s++) {
         struct ecb_sum a, b = twin[s];
         for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &a)) != 0; usleep(200000))
             if (rc != TSDB_ERR_UNAVAILABLE || now_ms() - t0 > 60000)

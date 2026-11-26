@@ -5,9 +5,9 @@
  *
  * What is different in an --ec run.
  *  - Setup: every node gets two chunk stores (`tsdb chunk-store init PATH --cluster UUID --node ID`) once the cluster has
- *    member ids, and is restarted with --chunk-dir for both, --metrics-port auto and --ec-settle-grace-s 3 (and
- *    --ec-experimental when this tsdbd has it: `ec_experimental`, found from its --help). kvr is then added with
- *    VOLUME_ADD_EC (m = 2, so 3 replicas as in every kv run), and the workloads of kv, kv-via and classes run on it:
+ *    member ids, and is restarted with --chunk-dir for both, --metrics-port auto and --ec-settle-grace-s 3 (when this
+ *    tsdbd settles ec volumes: `ec_settles`, found from `TSDB_EC` and its --help). kvr is then added with
+ *    VOLUME_ADD_EC (m + 1 log replicas, 3 for m = 2 and 5 for m = 4), and the workloads of kv, kv-via and classes run on it:
  *    their keys are back-dated (KV_BASE_TS is in 2023), so their partition ended long before the grace and settles while
  *    the writers go on with late rows into it, and (--ec only) a third of the single-key writes are replaces of that key
  *    (a tombstone and a row in one commit: the young part with a tombstone above a settled object, E6); the filler's
@@ -21,7 +21,7 @@
  *    not polled (STATUS); the stop of another volume is not seen, and a log a power loss cut loses its line). A leader whose digest or cut is wrong
  *    tends to end as a DIVERGED replica while its own answers stay right: a checker that only counts lost writes passes it.
  *  - Check E2, settles: after the run the replicas hold `.ec` parts (counted in the replica directories, with the parts
- *    per partition). A run with none fails when this tsdbd settles at all (`ec_experimental`).
+ *    per partition). A run with none fails when this tsdbd settles at all (`ec_settles`).
  *  - Check E3, every member: after the final read leadership moves to each ISR member in turn (VOLUME_TRANSFER, as churn
  *    does) and every key is read again through it: the answers must equal the final read. A member that settled
  *    differently, or one whose cut or Y is wrong, answers otherwise. A transfer that did not land within 30 s fails (reads
@@ -287,9 +287,11 @@ static int ec_div_check(void)
     return bad;
 }
 
-/* Live snapshot of every series of kvr (kvr.a, kvr.b, kvr.fill) through member `to` (which currently leads kvr and
- * reads its own young parts + settled .ec parts through the live chunk tier). Retries up to 30 s while a freshly
- * transferred leader finishes reopening kvr. Returns 0 on success, -1 on failure. */
+/* Live snapshot of the known series of kvr (kvr.a, kvr.b, kvr.fill; unlike offline cvol_rows which enumerates all
+ * series in DICT) through member `to` (which currently leads kvr and reads its own DICT, young parts and settled .ec
+ * parts through the live chunk tier). Resolves every series name on `to` via tsdbc_series() so each replica's DICT is
+ * verified rather than bypassed through cached hist_sid[]. Retries up to 60 s while a freshly transferred leader
+ * finishes reopening kvr. Returns 0 on success, -1 on failure. */
 static int ec_live_snap(int to, struct snaps *out, int *last_rc)
 {
     static const char *const snames[REP_HISTS + 1] = {"kvr.a", "kvr.b", "kvr.fill"};
@@ -305,12 +307,21 @@ static int ec_live_snap(int to, struct snaps *out, int *last_rc)
         snaps_free(out);
         for (int i = 0; i <= REP_HISTS && ok; i++) {
             tsdb_sid sid = 0;
-            int rc = i < REP_HISTS ? kv_resolve(c, i, &sid) : tsdbc_series(c, snames[i], 0, &sid);
+            int rc = tsdbc_series(c, snames[i], 0, &sid);
             if (rc != 0) {
                 if (last_rc)
                     *last_rc = rc;
                 ok = 0;
                 break;
+            }
+            if (i < REP_HISTS && hist_sid[i] && sid != hist_sid[i]) {
+                fprintf(stderr, "jepsen-cluster: FAIL: ec: member node %d resolved %s to sid %" PRIu64 ", expected %" PRIu64 "\n",
+                        to, snames[i], (uint64_t)sid, (uint64_t)hist_sid[i]);
+                if (last_rc)
+                    *last_rc = TSDB_ERR_CORRUPT;
+                snaps_free(out);
+                tsdbc_close(c);
+                return -1;
             }
             tsdb_points p;
             memset(&p, 0, sizeof p);
@@ -345,8 +356,9 @@ static int ec_live_snap(int to, struct snaps *out, int *last_rc)
 }
 
 /* E3 + full replica verification (replaces offline read-only cvol_rows, which cannot open META requires=tier volumes):
- * transfers leadership of kvr to each ISR member in turn, reads every series (kvr.a, kvr.b, kvr.fill) directly from
- * that member as leader, and checks:
+ * transfers leadership of kvr to each ISR member in turn, verifies that the target leads kvr immediately before AND at
+ * the same epoch immediately after ec_live_snap() (so a replica that stepped down and forwarded reads cannot pass
+ * undetected), reads every known series (kvr.a, kvr.b, kvr.fill) directly from that member as leader, and checks:
  *  - every key of every history equals kv_final (no stray timestamps; supports ec-member-differs and rep-lost-write),
  *  - all series and rows are bit-for-bit identical across all replicas (snaps_diff),
  *  - every filler batch in kvr.fill is whole or absent, whole when acknowledged, absent when refused (fill_check). */
@@ -357,12 +369,17 @@ static int ec_members_check(void)
         fprintf(stderr, "jepsen-cluster: FAIL: ec: no record of kvr for the per-member reads\n");
         return 1;
     }
-    int bad = 0, diff = 0, order[META_REPLICAS_MAX], no = 0;
-    /* Read the current leader first so we never transfer away from a member and immediately back while it reopens. */
+    int bad = 0, diff = 0, target_node[META_REPLICAS_MAX], no = 0;
+    uint32_t target_id[META_REPLICAS_MAX];
+    /* Copy the target list out of `r` so subsequent rep_rec_get() calls never overwrite loop state; read the current
+     * leader first so we never transfer away from a member and immediately back while it reopens. */
     for (int pass = 0; pass < 2; pass++)
         for (int k = 0; k < r.nrep; k++)
-            if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0 && ((r.node[k] == r.leader) == (pass == 0)))
-                order[no++] = k;
+            if (r.isr_has[k] && !r.learner[k] && r.node[k] >= 0 && ((r.node[k] == r.leader) == (pass == 0))) {
+                target_node[no] = r.node[k];
+                target_id[no] = r.id[k];
+                no++;
+            }
     if (no != rep_n) {
         fprintf(stderr, "jepsen-cluster: FAIL: ec: only %d of %d replicas in kvr's ISR for the per-member reads\n", no,
                 rep_n);
@@ -373,17 +390,23 @@ static int ec_members_check(void)
     int have_first = 0;
     char first_lbl[64] = "";
     for (int q = 0; q < no; q++) {
-        int k = order[q], to = r.node[k];
+        int to = target_node[q];
+        uint32_t tid = target_id[q];
         int rslot = q;
         for (int s = 0; s < rep_n; s++)
             if (rep_nodes[s] == to) {
                 rslot = s;
                 break;
             }
-        rep_rec_get(&r); /* the leader may have moved by the last transfer */
-        if (r.leader != to) {
+        struct rrec cur;
+        if (rep_rec_get(&cur) != 0) {
+            fprintf(stderr, "jepsen-cluster: FAIL: ec: no record of kvr before per-member read of node %d\n", to);
+            bad++;
+            continue;
+        }
+        if (cur.leader != to) {
             uint8_t body[16];
-            size_t bl = cluster_volume_force_encode(rep_number, r.id[k], body);
+            size_t bl = cluster_volume_force_encode(rep_number, tid, body);
             int rc = 0;
             if (strcmp(mutant, "ec-notransfer") != 0) { /* planted: none is made */
                 /* Retry up to 30 s: a target that was recently deposed or a new leader still warming may briefly
@@ -401,9 +424,12 @@ static int ec_members_check(void)
             /* tsdbd forwards by default: a read through a member that does not lead is answered by the leader, so a
              * transfer that did not land would make this check read the old leader and pass by construction */
             int64_t t0 = now_ms();
-            while (now_ms() - t0 < 30000 && atomic_load(&kv_leader) != to)
+            while (now_ms() - t0 < 30000) {
+                if (rep_rec_get(&cur) == 0 && cur.leader == to)
+                    break;
                 usleep(200000);
-            if (atomic_load(&kv_leader) != to) {
+            }
+            if (cur.leader != to) {
                 fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr did not move to node %d within 30 s of its transfer: its "
                         "reads would be the old leader's\n", to);
                 bad++;
@@ -411,11 +437,28 @@ static int ec_members_check(void)
             }
             ec_transfers++;
         }
+        /* Re-check (leader, epoch) immediately before ec_live_snap() for every q (including q == 0) */
+        if (rep_rec_get(&cur) != 0 || cur.leader != to) {
+            fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr leader is node %d (want %d) immediately before reading node %d\n",
+                    cur.leader, to, to);
+            bad++;
+            continue;
+        }
         struct snaps sn;
         int lrc = 0;
         if (ec_live_snap(to, &sn, &lrc) != 0) {
             fprintf(stderr, "jepsen-cluster: FAIL: ec: no live read of kvr through member node %d (%s)\n", to,
                     lrc ? tsdbc_strerror(lrc) : "unreachable");
+            bad++;
+            continue;
+        }
+        /* Verify leadership did not leave `to` or advance epoch during ec_live_snap() (forwarding blind spot) */
+        struct rrec after;
+        if (rep_rec_get(&after) != 0 || after.leader != to || after.epoch != cur.epoch) {
+            fprintf(stderr, "jepsen-cluster: FAIL: ec: kvr leadership changed during live read of node %d "
+                    "(before: leader=%d epoch=%" PRIu64 ", after: leader=%d epoch=%" PRIu64 "): read may have been forwarded\n",
+                    to, cur.leader, cur.epoch, after.leader, after.epoch);
+            snaps_free(&sn);
             bad++;
             continue;
         }
@@ -644,10 +687,12 @@ static void ec_rot_heal_idx(int idx)
 {
     struct ec_rot_rec *r = &ec_rot_tab[idx];
     int fd = open(r->path, O_RDWR);
+    if (fd < 0 && errno != ENOENT)
+        die(2, "ec: rot heal: cannot open %s: %s", r->path, strerror(errno));
     if (fd >= 0) {
         for (int k = r->nflips - 1; k >= 0; k--)
             if (pwrite(fd, &r->orig[k], 1, r->off[k]) != 1)
-                break;
+                die(2, "ec: rot heal: write to %s: %s", r->path, strerror(errno));
         fsync(fd);
         close(fd);
     }
@@ -670,10 +715,11 @@ static void nem_rot(void)
     int seen = 0, node = -1;
     for (int tries = 0; tries < 30 && !path[0]; tries++) {
         int i = rnd_range(0, nn - 1);
+        int c0 = (int)(rnd() % 2);
         seen = 0;
-        ec_chunk_find(nodes[i].chunk[rnd() % 2], 0, path, sizeof path, &seen);
+        ec_chunk_find(nodes[i].chunk[c0], 0, path, sizeof path, &seen);
         if (!path[0])
-            ec_chunk_find(nodes[i].chunk[0], 0, path, sizeof path, &seen);
+            ec_chunk_find(nodes[i].chunk[1 - c0], 0, path, sizeof path, &seen);
         if (path[0])
             node = i;
         else

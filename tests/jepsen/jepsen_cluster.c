@@ -574,6 +574,9 @@ static void *accept_thread(void *arg)
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+        pthread_attr_setstacksize(&at, 512 * 1024);
+#endif
         if (pthread_create(&t, &at, pconn, pc) != 0) {
             close(a);
             free(pc);
@@ -2727,8 +2730,8 @@ static int snaps_diff(const struct snaps *a, const struct snaps *b, const char *
     }
     for (size_t i = 0; i < a->n; i++) {
         const struct snapshot *x = &a->s[i], *y = &b->s[i];
-        if (strcmp(x->name, y->name) || x->n != y->n || memcmp(x->ts, y->ts, x->n * sizeof *x->ts) ||
-            memcmp(x->v, y->v, x->n * sizeof *x->v)) {
+        if (strcmp(x->name, y->name) || x->n != y->n ||
+            (x->n && (memcmp(x->ts, y->ts, x->n * sizeof *x->ts) || memcmp(x->v, y->v, x->n * sizeof *x->v)))) {
             fprintf(stderr, "jepsen-cluster: series %s differs: %s has %zu rows, %s has %s %zu\n", x->name, la, x->n, lb,
                     y->name, y->n);
             diff++;
@@ -4701,8 +4704,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "jepsen-cluster: the rot nemesis needs a tsdbd built with TSDB_EC: there is no chunk to flip a byte in\n");
             return 2;
         }
+        if ((nemeses & N_ROT) && (nemeses & N_DISKLOSS)) {
+            fprintf(stderr, "jepsen-cluster: --nemesis rot and diskloss cannot be combined (each uses up to m fault positions)\n");
+            return 2;
+        }
     } else if (nemeses & N_EC) {
         fprintf(stderr, "jepsen-cluster: the partial, diskloss and rot nemeses need --ec K+M\n");
+        return 2;
+    }
+    if (want_users && nn > 12) {
+        fprintf(stderr, "jepsen-cluster: workload users supports at most 12 nodes (jm_clean_set is O(n^2 2^n)); got %d\n", nn);
         return 2;
     }
     if ((nemeses & N_FWDSTALL) && !want_via) {

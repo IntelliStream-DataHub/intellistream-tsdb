@@ -1918,7 +1918,7 @@ jepsen-cluster: $(B)/jepsen_cluster $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so $(B)
 	$(MAKE) --no-print-directory jepsen-cluster-ec
 
 # --ec (tests/jepsen/cluster_ec.h, row r8l-jc): kvr as an erasure-coded volume on JEPSEN_EC_NODES nodes with two chunk stores each.
-# The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (it takes --ec-experimental: only then
+# The nemeses default to kill partial diskloss, and, when this tsdbd settles ec volumes (built with TSDB_EC: only then
 # is there a chunk to rot and a crash point of the settle to reach) to partition pause rot midcommit power as well;
 # JEPSEN_EC= (empty) leaves the runs out. Per io and workload (JEPSEN_EC_WORKLOADS).
 JEPSEN_EC ?= 4+2
