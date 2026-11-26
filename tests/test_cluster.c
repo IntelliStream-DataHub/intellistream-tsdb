@@ -2690,7 +2690,7 @@ static void scen_snapmove(void)
     struct catch_up c = {x.m.applied, meta_hash(&x.m)};
     view_free(&x);
     await_view(1, p_caught_up, &c, "n1 caught up");
-    char snap[PATH_MAX];
+    char snap[PATH_MAX + 128];
     snprintf(snap, sizeof snap, "%s/n1/state/snapshot", base);
     for (uint64_t t0 = now_ms(); access(snap, F_OK) != 0; usleep(50000))
         if (now_ms() - t0 > 15000)
@@ -2711,7 +2711,7 @@ static void scen_snapmove(void)
     view(4, &x);
     uint32_t lead = x.st.leader;
     view_free(&x);
-    if (lead == ids[4]) {
+    if (lead != ids[0] && lead != ids[2] && lead != ids[3]) {
         pause_server(4, 1);
         for (uint64_t t0 = now_ms();; usleep(100000)) {
             view(0, &x);

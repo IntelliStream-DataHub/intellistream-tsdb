@@ -3580,6 +3580,7 @@ static void core_stop(struct meta_state *next)
     raft_log_close(C.log);
     C.log = NULL;
     C.role = RAFT_FOLLOWER;
+    C.probe_at_start = 0;
     if (next) {
         meta_free(&C.sm);
         C.sm = *next;
@@ -7000,10 +7001,11 @@ static void watch_duty(uint64_t now)
     conn_send(c, 0);
 }
 
-/* NODE's seeds follow the voters' peer addresses as the applied state names them. A server that restarts knows the
- * others only from NODE until a leader reaches it (a core applies nothing before that, a watcher has no stream yet):
- * the seeds a JOIN wrote (or none, on the server that ran INIT) go stale as the group changes, and a server that
- * finds none of them is cut off for good. Hints only: a failed write keeps the old file and is tried again later. */
+/* NODE's seeds follow the voters' peer addresses as view_state() names them (the freshest of C.sm and C.cpy). A server
+ * that restarts knows the others only from NODE until a leader reaches it (a core applies nothing before that, a
+ * watcher has no stream yet): the seeds a JOIN wrote (or none, on the server that ran INIT) go stale as the group
+ * changes, and a server that finds none of them is cut off for good. Hints only: a failed write keeps the old file and
+ * is tried again later. */
 static void seeds_refresh(uint64_t now)
 {
     static uint64_t retry_ns;
