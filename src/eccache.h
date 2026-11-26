@@ -23,7 +23,8 @@
  * found) live under their own leaf lock and fd budget, LRU; an object a reader holds is never closed under it. Two
  * readers that miss the same granule or object read it once: the second waits for the first on that stripe's (or the
  * object table's) cv and then hits. Prefetched windows in fill_ahead are backed by a single refcounted shared slab so
- * cached slices point directly into the read buffer with zero memcpy.
+ * cached slices point directly into the read buffer with zero memcpy; if a single slice outlives its siblings in a
+ * large slab, its next uncontended hit detaches it to a standalone buffer and frees the slab immediately.
  * The budget is per tier, so per handle: an embedded process with several handles has one cache each.
  *
  * No read here runs under db->lock, latest_rw, buf_lock or publish_lock: every caller of granule_read reads a
@@ -136,9 +137,10 @@ void eccache_test_drop(struct tier *t);
 void eccache_test_drop_entries(struct tier *t);
 /* Called (when set) after an object's open, before it is listed open, and after a granule's fill, before it is listed
  * READY; for a window read ahead, after its granules are chosen, before they are listed (PFPLAN), and after its range
- * read, before its granules are listed READY (PFREAD): a test forgets the object there to run its race without
- * threads. No lock of the cache is held. */
-enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED, ECC_HOOK_PFPLAN, ECC_HOOK_PFREAD };
+ * read, before its granules are listed READY (PFREAD); and in drop_object after sweeping all shards, before
+ * forget_active clears (FORGET_SWEPT): a test uses these to drive races deterministically. No lock of the cache is
+ * held. */
+enum { ECC_HOOK_OPENED = 1, ECC_HOOK_FILLED, ECC_HOOK_PFPLAN, ECC_HOOK_PFREAD, ECC_HOOK_FORGET_SWEPT };
 extern void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 /* r7-seam's test hook (r7-keep, r7-gc, r7-oracle use it): encodes the bytes of p, a listed .part of db, into the

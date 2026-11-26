@@ -40,13 +40,16 @@ void (*eccache_test_hook)(struct tier *t, int where, const uint8_t oid[16]);
 
 #define ECCACHE_SHARD_BITS 6
 #define ECCACHE_SHARDS (1u << ECCACHE_SHARD_BITS) /* 64 stripes */
+_Static_assert(ECCACHE_SHARDS <= 64, "eccache_resident uses a 64-bit shard mask");
 
 enum { CE_LOADING = 0, CE_READY };
 
 struct og;
 
 /* Refcounted shared buffer backing a prefetched window in fill_ahead. Trailing BLK_SLACK bytes at buf + total are
- * zeroed so every slice [at, at + len) has >= BLK_SLACK readable initialized bytes past its end. */
+ * zeroed so every slice [at, at + len) has >= BLK_SLACK readable initialized bytes past its end. When a single hot
+ * slice outlives all its siblings (refs == 1) in a slab larger than 4 * (len + BLK_SLACK), its next uncontended hit
+ * copies it to a standalone buffer and drops the slab so 1 surviving slice cannot pin a multi-MiB slab indefinitely. */
 typedef struct ec_slab {
     _Atomic uint32_t refs;
     size_t bytes; /* total allocation size (sizeof(ec_slab) + total + BLK_SLACK) */
@@ -143,17 +146,19 @@ struct eccache_tier {
     ec_shard *shards; /* ECCACHE_SHARDS 64-byte aligned stripes */
 
     /* Read-mostly configuration (own cache line: never dirtied on hits or misses) */
-    _Alignas(64) _Atomic uint64_t budget;
-    _Atomic unsigned pf_cap;     /* granules read ahead per read at most; 0: no prefetch */
-    _Atomic(chunk_backend *) be; /* the tier's: not owned, not closed here */
+    _Alignas(64) _Atomic unsigned pf_cap; /* granules read ahead per read at most; 0: no prefetch */
+    _Atomic(chunk_backend *) be;          /* the tier's: not owned, not closed here */
 
-    /* Global byte, prefetch and forget coordination (never written on warm cache hits) */
-    _Alignas(64) _Atomic uint64_t total_bytes;
-    _Atomic uint64_t pf_bytes;
+    /* Dedicated budget and occupancy line (read on unpin; isolated from miss-dirtied globals below) */
+    _Alignas(64) _Atomic uint64_t budget;
+    _Atomic uint64_t total_bytes;
+
+    /* Prefetch, eviction-hand, forget and read-count coordination (never touched on warm cache hits) */
+    _Alignas(64) _Atomic uint64_t pf_bytes;
     _Atomic uint64_t pf_peak;
     _Atomic uint32_t evict_hand;
-    _Atomic uint64_t forget_seq;
     _Atomic uint32_t forget_active;
+    _Atomic uint64_t forget_seq;
     _Atomic uint64_t nreads; /* obj_read calls (counted outside any lock) */
 
     /* Open objects and prefetch walk/degraded tracking (touched only on misses, forget, reopen) */
@@ -425,8 +430,9 @@ static void ce_evict_to_limit(struct eccache_tier *c, ec_shard *s, uint64_t limi
 
 /* Cross-shard clock sweep when total_bytes exceeds budget (no shard lock held). Pass 1 trims shards above their
  * per-shard cap; pass 2 absorbs slack from any non-empty shard when pinned entries hold another shard over cap or when
- * the total budget is small relative to ECCACHE_SHARDS. */
-static void ce_evict_global(struct eccache_tier *c, ce **vict, bool window)
+ * the total budget is small relative to ECCACHE_SHARDS. When `avoid_shard >= 0` (unpin under a small budget), that
+ * shard is deferred until last so older entries on other shards evict before the just-used MRU entry. */
+static void ce_evict_global(struct eccache_tier *c, ce **vict, bool window, int avoid_shard)
 {
     uint64_t budget = atomic_load_explicit(&c->budget, memory_order_acquire);
     if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) <= budget)
@@ -438,7 +444,10 @@ static void ce_evict_global(struct eccache_tier *c, ce **vict, bool window)
         if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) <= budget)
             break;
         visited = i + 1;
-        ec_shard *s = &c->shards[(start + i) & (ECCACHE_SHARDS - 1)];
+        uint32_t si = (start + i) & (ECCACHE_SHARDS - 1);
+        if ((int)si == avoid_shard)
+            continue;
+        ec_shard *s = &c->shards[si];
         uint64_t cap = atomic_load_explicit(&s->cap, memory_order_relaxed);
         if (atomic_load_explicit(&s->bytes, memory_order_relaxed) <= cap)
             continue;
@@ -450,9 +459,20 @@ static void ce_evict_global(struct eccache_tier *c, ce **vict, bool window)
         for (uint32_t i = 0; i < ECCACHE_SHARDS; i++) {
             if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) <= budget)
                 break;
-            ec_shard *s = &c->shards[(start + i) & (ECCACHE_SHARDS - 1)];
+            uint32_t si = (start + i) & (ECCACHE_SHARDS - 1);
+            if ((int)si == avoid_shard)
+                continue;
+            ec_shard *s = &c->shards[si];
             if (atomic_load_explicit(&s->bytes, memory_order_relaxed) == 0)
                 continue;
+            pthread_mutex_lock(&s->mu);
+            ce_evict_shard(c, s, budget, 0, vict, any);
+            pthread_mutex_unlock(&s->mu);
+        }
+    }
+    if (avoid_shard >= 0 && atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget) {
+        ec_shard *s = &c->shards[avoid_shard];
+        if (atomic_load_explicit(&s->bytes, memory_order_relaxed) > 0) {
             pthread_mutex_lock(&s->mu);
             ce_evict_shard(c, s, budget, 0, vict, any);
             pthread_mutex_unlock(&s->mu);
@@ -930,7 +950,9 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
     unsigned n = 0;
     pthread_mutex_lock(&c->obj_mu);
     unsigned cap = MIN(atomic_load_explicit(&c->pf_cap, memory_order_relaxed), (unsigned)wcap);
-    if (cap && pf_is_degraded_locked(c, oid)) {
+    if (cap && (pf_is_degraded_locked(c, oid) ||
+                atomic_load_explicit(&c->forget_active, memory_order_seq_cst) != 0 ||
+                !atomic_load_explicit(&x->listed, memory_order_acquire))) {
         pthread_mutex_unlock(&c->obj_mu);
         return 0;
     }
@@ -977,6 +999,7 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
         eccache_test_hook(c->t, ECC_HOOK_PFPLAN, oid);
 
     size_t k = 0;
+    ce *y = NULL;
     og *spare = NULL; /* allocated lazily only if a destination shard has no group for oid yet */
     uint64_t fseq = atomic_load_explicit(&c->forget_seq, memory_order_seq_cst);
     if (atomic_load_explicit(&c->forget_active, memory_order_seq_cst) == 0 &&
@@ -986,44 +1009,21 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
             uint64_t pfb = atomic_load_explicit(&c->budget, memory_order_acquire) / 4;
             if (atomic_load_explicit(&c->pf_bytes, memory_order_relaxed) + cost > pfb)
                 break;
+            if (!y) {
+                y = calloc(1, sizeof *y);
+                if (!y)
+                    break;
+            }
             uint64_t h = ce_hash64(oid, cands[k].off);
             size_t si = ce_shard_idx(h);
             ec_shard *sh = &c->shards[si];
-
-            /* Check cache presence and forget state before allocating ce or og */
-            pthread_mutex_lock(&sh->mu);
-            bool stop = atomic_load_explicit(&c->forget_active, memory_order_seq_cst) != 0 ||
-                        atomic_load_explicit(&c->forget_seq, memory_order_seq_cst) != fseq ||
-                        !atomic_load_explicit(&x->listed, memory_order_acquire) ||
-                        (eccache_mutant != ECC_MUT_PFDUPKEY && ce_find(sh, oid, cands[k].off, h) != NULL);
-            bool need_og = !stop && og_find(sh, oid) == NULL;
-            pthread_mutex_unlock(&sh->mu);
-            if (stop)
-                break;
-
-            ce *y = calloc(1, sizeof *y);
-            if (!y)
-                break;
-            if (need_og && !spare) {
-                spare = calloc(1, sizeof *spare);
-                if (!spare) {
-                    free(y);
-                    break;
-                }
-            }
-            memcpy(y->oid, oid, 16);
-            y->off = cands[k].off;
-            y->len = cands[k].len;
-            y->crc = cands[k].crc;
-            y->shard = (uint8_t)si;
-
             bool inserted = false;
             for (;;) {
                 pthread_mutex_lock(&sh->mu);
                 if (atomic_load_explicit(&c->forget_active, memory_order_seq_cst) != 0 ||
                     atomic_load_explicit(&c->forget_seq, memory_order_seq_cst) != fseq ||
                     !atomic_load_explicit(&x->listed, memory_order_acquire) ||
-                    (eccache_mutant != ECC_MUT_PFDUPKEY && ce_find(sh, oid, y->off, h) != NULL)) {
+                    (eccache_mutant != ECC_MUT_PFDUPKEY && ce_find(sh, oid, cands[k].off, h) != NULL)) {
                     pthread_mutex_unlock(&sh->mu);
                     break;
                 }
@@ -1039,29 +1039,37 @@ static size_t pf_plan(struct eccache_tier *c, const part *p, const struct ecpart
                     pthread_mutex_unlock(&sh->mu);
                     break;
                 }
+                memcpy(y->oid, oid, 16);
+                y->off = cands[k].off;
+                y->len = cands[k].len;
+                y->crc = cands[k].crc;
+                y->shard = (uint8_t)si;
                 y->state = CE_LOADING;
                 y->pins = 1;
                 y->pf = true;
                 ce_insert(sh, y, h, &spare);
                 pthread_mutex_unlock(&sh->mu);
+                win[k] = y;
+                y = NULL;
                 inserted = true;
                 break;
             }
-            if (!inserted) {
-                free(y);
+            if (!inserted)
                 break;
-            }
-            win[k] = y;
         }
     }
+    free(y);
     free(spare);
     if (k > 0) {
         pthread_mutex_lock(&c->obj_mu);
-        for (int q = 0; q < PF_STREAMS; q++) /* the walk continues after the window */
-            if (c->pfs[q].stamp && c->pfs[q].next == i + 1 && !memcmp(c->pfs[q].oid, oid, 16)) {
-                c->pfs[q].next = i + 1 + (uint32_t)k;
-                break;
-            }
+        if (atomic_load_explicit(&c->forget_active, memory_order_seq_cst) == 0 &&
+            atomic_load_explicit(&x->listed, memory_order_acquire)) {
+            for (int q = 0; q < PF_STREAMS; q++) /* the walk continues after the window */
+                if (c->pfs[q].stamp && c->pfs[q].next == i + 1 && !memcmp(c->pfs[q].oid, oid, 16)) {
+                    c->pfs[q].next = i + 1 + (uint32_t)k;
+                    break;
+                }
+        }
         pthread_mutex_unlock(&c->obj_mu);
     }
     return k;
@@ -1105,7 +1113,7 @@ static void pf_finish(struct eccache_tier *c, ce **win, const bool *ok, size_t k
             pthread_cond_broadcast(&sh->cv);
         pthread_mutex_unlock(&sh->mu);
     }
-    ce_evict_global(c, &vict, true);
+    ce_evict_global(c, &vict, true, -1);
     ce_free_list(vict);
 }
 
@@ -1121,12 +1129,15 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
     uint64_t total = x->len;
     for (size_t q = 0; q < k; q++)
         total += win[q]->len;
-    size_t slab_bytes = sizeof(ec_slab) + (size_t)total + BLK_SLACK;
-    ec_slab *sl = malloc(slab_bytes);
-    if (sl) {
-        atomic_init(&sl->refs, 1);
-        sl->bytes = slab_bytes;
-        memset(sl->buf + total, 0, BLK_SLACK);
+    ec_slab *sl = NULL;
+    if (total <= SIZE_MAX - sizeof(ec_slab) - BLK_SLACK) {
+        size_t slab_bytes = sizeof(ec_slab) + (size_t)total + BLK_SLACK;
+        sl = malloc(slab_bytes);
+        if (sl) {
+            atomic_init(&sl->refs, 1);
+            sl->bytes = slab_bytes;
+            memset(sl->buf + total, 0, BLK_SLACK);
+        }
     }
     co *o = NULL;
     int rc = sl ? obj_get(c, e, x, &o) : TSDB_ERR_NOMEM;
@@ -1213,6 +1224,7 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
     og *spare = NULL;
     unsigned pfcap = 0;
     bool loader = false;
+    bool try_detach = false;
     pthread_mutex_lock(&sh->mu);
     for (;;) {
         x = ce_find(sh, e->rec.oid, g->off, h);
@@ -1231,6 +1243,9 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
                 atomic_fetch_sub_explicit(&c->pf_bytes, ce_cost(x), memory_order_acq_rel);
                 sh->pf_used++;
             }
+            if (x->slab && atomic_load_explicit(&x->slab->refs, memory_order_relaxed) == 1 &&
+                x->slab->bytes > 4 * (x->len + BLK_SLACK))
+                try_detach = true;
             lru_front(sh, x);
             break;
         }
@@ -1299,7 +1314,7 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
             pthread_cond_broadcast(&sh->cv);
         pthread_mutex_unlock(&sh->mu);
         if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget)
-            ce_evict_global(c, &vict, false);
+            ce_evict_global(c, &vict, false, -1);
         ce_free_list(vict);
         vict = NULL;
     } else if (x->len != len || x->crc != g->crc) {
@@ -1309,20 +1324,41 @@ int ec_granule_read_at(codec_ctx *cx, const part *p, const granule *g, size_t gi
     }
     if (rc == 0)
         rc = granule_decode(cx, p, g, x->data, type, ts, v, cap, false); /* from the pinned entry */
+    uint8_t *detach_buf = NULL;
+    if (rc == 0 && try_detach) {
+        /* Sole surviving slice of a large shared slab: copy to a standalone buffer outside the lock and swap on unpin
+         * when uncontended (x->pins == 1) so 1 hot granule cannot pin a multi-MiB slab indefinitely. */
+        detach_buf = malloc((size_t)x->len + BLK_SLACK);
+        if (detach_buf) {
+            memcpy(detach_buf, x->data, (size_t)x->len);
+            memset(detach_buf + x->len, 0, BLK_SLACK);
+        }
+    }
     uint64_t budget = atomic_load_explicit(&c->budget, memory_order_relaxed);
+    ec_slab *old_slab = NULL;
     bool over = false;
     pthread_mutex_lock(&sh->mu);
+    if (detach_buf && x->pins == 1 && atomic_load_explicit(&x->listed, memory_order_relaxed) && x->slab) {
+        old_slab = x->slab;
+        x->data = detach_buf;
+        x->slab = NULL;
+        detach_buf = NULL;
+    }
     x->pins--;
     if (x->pins == 0 && !atomic_load_explicit(&x->listed, memory_order_relaxed)) {
         x->hnext = vict;
         vict = x;
     } else if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget) {
-        ce_evict_shard(c, sh, budget, atomic_load_explicit(&sh->cap, memory_order_relaxed), &vict, false);
+        uint64_t limit = MAX(atomic_load_explicit(&sh->cap, memory_order_relaxed), ce_cost(x));
+        ce_evict_shard(c, sh, budget, limit, &vict, false);
         over = atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget;
     }
     pthread_mutex_unlock(&sh->mu);
+    if (old_slab)
+        slab_unref(old_slab);
+    free(detach_buf);
     if (over)
-        ce_evict_global(c, &vict, false);
+        ce_evict_global(c, &vict, false, (int)si);
     if (vict)
         ce_free_list(vict);
     return rc;
@@ -1546,8 +1582,11 @@ void eccache_vuuid(struct tier *t, uint32_t volume, uint8_t out[16])
     tier_cold_put(cv);
 }
 
-/* Takes the object's entries out (each freed now, or by its reader: a fill in flight goes on to its reader and is
- * never cached) and the object out of the table, opening or open (closed now, or by its last reader). */
+/* Takes the object out of the table (opening or open; closed now, or by its last reader) and then, when `entries` is
+ * set, sweeps all shards to remove its granule entries (each freed now, or by its reader: a fill in flight goes on to
+ * its reader and is never cached). Removing `co` under obj_mu BEFORE sweeping shards linearizes concurrent readers: any
+ * reader that obtained the pre-forget `co` already inserted its `ce` into its shard before calling obj_get, so the
+ * subsequent shard sweep is guaranteed to unhash it. */
 static void drop_object(struct eccache_tier *c, uint32_t volume, const uint8_t oid[16], bool entries)
 {
     ce *vict = NULL;
@@ -1556,6 +1595,22 @@ static void drop_object(struct eccache_tier *c, uint32_t volume, const uint8_t o
     if (drop_ce) {
         atomic_fetch_add_explicit(&c->forget_active, 1, memory_order_seq_cst);
         atomic_fetch_add_explicit(&c->forget_seq, 1, memory_order_seq_cst);
+    }
+    pthread_mutex_lock(&c->obj_mu);
+    co *o = eccache_mutant != ECC_MUT_FORGETNOOP ? co_find(c, volume, oid) : NULL;
+    if (o) {
+        co_remove(c, o);
+        if (o->pins == 0) {
+            o->hnext = NULL;
+            ov = o;
+        }
+        if (c->obj_waiters)
+            pthread_cond_broadcast(&c->obj_cv);
+    }
+    if (eccache_mutant != ECC_MUT_FORGETNOOP)
+        pf_reset_locked(c, oid);
+    pthread_mutex_unlock(&c->obj_mu);
+    if (drop_ce) {
         for (size_t si = 0; si < ECCACHE_SHARDS; si++) {
             ec_shard *s = &c->shards[si];
             pthread_mutex_lock(&s->mu);
@@ -1577,23 +1632,10 @@ static void drop_object(struct eccache_tier *c, uint32_t volume, const uint8_t o
                 pthread_cond_broadcast(&s->cv);
             pthread_mutex_unlock(&s->mu);
         }
-    }
-    pthread_mutex_lock(&c->obj_mu);
-    co *o = eccache_mutant != ECC_MUT_FORGETNOOP ? co_find(c, volume, oid) : NULL;
-    if (o) {
-        co_remove(c, o);
-        if (o->pins == 0) {
-            o->hnext = NULL;
-            ov = o;
-        }
-        if (c->obj_waiters)
-            pthread_cond_broadcast(&c->obj_cv);
-    }
-    if (eccache_mutant != ECC_MUT_FORGETNOOP)
-        pf_reset_locked(c, oid);
-    pthread_mutex_unlock(&c->obj_mu);
-    if (drop_ce)
+        if (eccache_test_hook)
+            eccache_test_hook(c->t, ECC_HOOK_FORGET_SWEPT, oid);
         atomic_fetch_sub_explicit(&c->forget_active, 1, memory_order_seq_cst);
+    }
     ce_free_list(vict);
     co_close_list(c, ov);
 }
@@ -1724,7 +1766,8 @@ void eccache_test_unpin(struct tier *t, void *entry)
 {
     struct eccache_tier *c = t->cache;
     ce *x = entry, *vict = NULL;
-    ec_shard *sh = &c->shards[x->shard];
+    int shard = (int)x->shard;
+    ec_shard *sh = &c->shards[shard];
     uint64_t budget = atomic_load_explicit(&c->budget, memory_order_acquire);
     bool over = false;
     pthread_mutex_lock(&sh->mu);
@@ -1733,12 +1776,13 @@ void eccache_test_unpin(struct tier *t, void *entry)
         x->hnext = NULL;
         vict = x;
     } else if (atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget) {
-        ce_evict_shard(c, sh, budget, atomic_load_explicit(&sh->cap, memory_order_relaxed), &vict, false);
+        uint64_t limit = MAX(atomic_load_explicit(&sh->cap, memory_order_relaxed), ce_cost(x));
+        ce_evict_shard(c, sh, budget, limit, &vict, false);
         over = atomic_load_explicit(&c->total_bytes, memory_order_relaxed) > budget;
     }
     pthread_mutex_unlock(&sh->mu);
     if (over)
-        ce_evict_global(c, &vict, false);
+        ce_evict_global(c, &vict, false, shard);
     ce_free_list(vict);
 }
 
@@ -1754,7 +1798,7 @@ void eccache_test_budget(struct tier *t, uint64_t bytes)
         ce_evict_to_limit(c, s, atomic_load_explicit(&s->cap, memory_order_relaxed), &vict);
         pthread_mutex_unlock(&s->mu);
     }
-    ce_evict_global(c, &vict, false);
+    ce_evict_global(c, &vict, false, -1);
     ce_free_list(vict);
 }
 
