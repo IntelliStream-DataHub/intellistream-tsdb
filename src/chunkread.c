@@ -24,13 +24,151 @@
 #include "chunk.h"
 #include "chunk_priv.h"
 
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef TSDB_EC
 #include "ec/rs.h"
 #endif
+
+/* Bounded joinable I/O worker pool owned by chunk_backend (lazily initialized on first multi-chunk parallel read,
+ * drained and pthread_join()'d in chunk_be_close()). Never spawns threads for single-chunk reads; falls back inline
+ * when saturated, stopping, or forked. */
+#define CR_POOL_MAX 8
+#define CR_PAR_MIN_BYTES (32u << 10)
+
+typedef struct cr_job {
+    void (*fn)(void *);
+    void *arg;
+    struct cr_job *next;
+} cr_job;
+
+struct chunk_rpool {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    cr_job *head, *tail;
+    int busy, queued, nthreads;
+    bool stopping;
+    pid_t pid;
+    pthread_t threads[CR_POOL_MAX];
+};
+
+static void *cr_pool_worker_main(void *arg)
+{
+    chunk_rpool *p = arg;
+    pthread_mutex_lock(&p->mu);
+    for (;;) {
+        while (!p->head && !p->stopping)
+            pthread_cond_wait(&p->cv, &p->mu);
+        if (p->head) {
+            cr_job *j = p->head;
+            p->head = j->next;
+            if (!p->head)
+                p->tail = NULL;
+            p->queued--;
+            p->busy++;
+            pthread_mutex_unlock(&p->mu);
+            j->fn(j->arg);
+            pthread_mutex_lock(&p->mu);
+            p->busy--;
+            continue;
+        }
+        if (p->stopping)
+            break;
+    }
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
+}
+
+static chunk_rpool *cr_pool_get(chunk_backend *be)
+{
+    if (!be)
+        return NULL;
+    chunk_rpool *p = atomic_load_explicit(&be->rpool, memory_order_acquire);
+    if (p)
+        return p;
+    pthread_mutex_lock(&be->mu);
+    p = atomic_load_explicit(&be->rpool, memory_order_relaxed);
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        if (p) {
+            pthread_mutex_init(&p->mu, NULL);
+            pthread_cond_init(&p->cv, NULL);
+            p->pid = getpid();
+            atomic_store_explicit(&be->rpool, p, memory_order_release);
+        }
+    }
+    pthread_mutex_unlock(&be->mu);
+    return p;
+}
+
+static int cr_pool_submit(chunk_backend *be, cr_job *j)
+{
+    chunk_rpool *p = cr_pool_get(be);
+    if (!p || getpid() != p->pid)
+        return -1;
+    j->next = NULL;
+    pthread_mutex_lock(&p->mu);
+    if (p->stopping) {
+        pthread_mutex_unlock(&p->mu);
+        return -1;
+    }
+    int avail = p->nthreads - p->busy;
+    if (p->queued >= avail && p->nthreads < CR_POOL_MAX) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+#ifdef __APPLE__
+        pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+#endif
+        pthread_t th;
+        int e = pthread_create(&th, &at, cr_pool_worker_main, p);
+        pthread_attr_destroy(&at);
+        if (e == 0) {
+            p->threads[p->nthreads++] = th;
+            avail++;
+        }
+    }
+    if (p->queued >= avail) {
+        pthread_mutex_unlock(&p->mu);
+        return -1;
+    }
+    if (p->tail)
+        p->tail->next = j;
+    else
+        p->head = j;
+    p->tail = j;
+    p->queued++;
+    pthread_cond_signal(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    return 0;
+}
+
+void chunk_rpool_destroy(chunk_rpool *p)
+{
+    if (!p)
+        return;
+    if (getpid() == p->pid) {
+        pthread_mutex_lock(&p->mu);
+        p->stopping = true;
+        pthread_cond_broadcast(&p->cv);
+        int n = p->nthreads;
+        pthread_mutex_unlock(&p->mu);
+        for (int i = 0; i < n; i++)
+            pthread_join(p->threads[i], NULL);
+        pthread_cond_destroy(&p->cv);
+        pthread_mutex_destroy(&p->mu);
+    }
+    free(p);
+}
+
+static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len);
+static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos);
+static chunk_backend *obj_backend(const chunk_obj *o);
 
 enum { PS_UNKNOWN = 0, PS_GOOD, PS_BAD };
 
@@ -199,6 +337,174 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
 #endif
 }
 
+typedef struct cr_pos_task {
+    cr_job job;
+    pthread_mutex_t *mu;
+    pthread_cond_t *cv;
+    unsigned *left;
+    const chunk_obj *o;
+    const chunk_geom *g;
+    const uint64_t *rec;
+    uint64_t base;
+    uint64_t off, len;
+    uint64_t s0, s1, c0, c1;
+    uint8_t *buf;
+    unsigned pos;
+    size_t cap;
+    bool raw;
+    bool failed;
+} cr_pos_task;
+
+static void cr_pos_run(cr_pos_task *t)
+{
+    const chunk_geom *g = t->g;
+    unsigned k = g->k, pos = t->pos;
+    uint8_t *slot = NULL;
+    if (!t->raw) {
+        slot = malloc(t->cap ? t->cap : 1);
+        if (!slot) {
+            t->failed = true;
+            return;
+        }
+    }
+    const uint64_t *sums = NULL;
+    if (!t->raw && !t->rec) {
+        sums = chunk_obj_pos_sums(t->o, pos);
+        if (!sums) {
+            free(slot);
+            t->failed = true;
+            return;
+        }
+    }
+    bool failed = false;
+    for (uint64_t s = t->s0; s <= t->s1 && !failed; s++) {
+        uint64_t c = s * k + pos;
+        if (c < t->c0 || c > t->c1)
+            continue;
+        uint64_t cs = c * g->cell, cl = chunk_cell_len(g, c);
+        uint64_t a = t->off > cs ? t->off : cs;
+        uint64_t b = t->off + t->len < cs + cl ? t->off + t->len : cs + cl;
+        uint64_t x = a - cs, y = b - cs;
+        uint8_t *dst = t->buf + (a - t->off);
+        if (t->raw) {
+            if (obj_read((void *)t->o, pos, s * g->cell + x, dst, (size_t)(y - x)) != 0)
+                failed = true;
+        } else {
+            uint64_t want = t->rec ? t->rec[t->base + s] : sums[s];
+            if (obj_read((void *)t->o, pos, s * g->cell, slot, (size_t)cl) != 0) {
+                failed = true;
+            } else if (xxh64(slot, (size_t)cl, 0) != want && chunk_mutant != CHUNK_MUT_NOSUMS) {
+                failed = true;
+            } else {
+                copy_out(slot, x, y, dst);
+            }
+        }
+    }
+    free(slot);
+    t->failed = failed;
+}
+
+static void cr_pos_work(void *arg)
+{
+    cr_pos_task *t = arg;
+    cr_pos_run(t);
+    pthread_mutex_lock(t->mu);
+    (*t->left)--;
+    if (*t->left == 0)
+        pthread_cond_signal(t->cv);
+    pthread_mutex_unlock(t->mu);
+}
+
+/* Parallel healthy fast path for local chunk_obj multi-chunk reads: runs one task per touched data position across
+ * [s0, s1] (pos 0 inline, others on the cached I/O pool). Returns true when every cell succeeded; returns false to
+ * fall back to the exact stripe-by-stripe degraded path (zero change to degrade/report/error semantics). */
+static bool try_read_parallel(const chunk_obj *o, const chunk_geom *g, const uint64_t *rec_sums, uint64_t off,
+                              uint64_t len, uint8_t *buf, bool raw, uint64_t c0, uint64_t c1)
+{
+    unsigned k = g->k;
+    uint64_t s0 = c0 / k, s1 = c1 / k;
+    unsigned pos_list[CHUNK_K_MAX], npos = 0;
+    for (unsigned i = 0; i < k; i++) {
+        uint64_t first = s0 * k + i;
+        if (first < c0)
+            first += k;
+        if (first <= c1) {
+            if (!obj_healthy_pos_ready(o, i))
+                return false; /* missing/damaged data chunk: let stripe-by-stripe degrade() handle it */
+            pos_list[npos++] = i;
+        }
+    }
+    if (npos < 2)
+        return false;
+
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    unsigned left = 0;
+    cr_pos_task tasks[CHUNK_K_MAX];
+    bool inline_run[CHUNK_K_MAX] = {false};
+    size_t cap = g->cell < g->len ? g->cell : (size_t)g->len;
+
+    for (unsigned idx = 0; idx < npos; idx++) {
+        unsigned p = pos_list[idx];
+        tasks[idx] = (cr_pos_task){
+            .job = {.fn = cr_pos_work, .arg = &tasks[idx]},
+            .mu = &mu,
+            .cv = &cv,
+            .left = &left,
+            .o = o,
+            .g = g,
+            .rec = rec_sums,
+            .base = chunk_sums_base(g, p),
+            .off = off,
+            .len = len,
+            .s0 = s0,
+            .s1 = s1,
+            .c0 = c0,
+            .c1 = c1,
+            .buf = buf,
+            .pos = p,
+            .cap = cap,
+            .raw = raw,
+        };
+    }
+
+    inline_run[0] = true; /* calling thread handles first position inline */
+    pthread_mutex_lock(&mu);
+    for (unsigned idx = 1; idx < npos; idx++)
+        left++;
+    pthread_mutex_unlock(&mu);
+
+    unsigned failed_submits = 0;
+    chunk_backend *be = obj_backend(o);
+    for (unsigned idx = 1; idx < npos; idx++) {
+        if (cr_pool_submit(be, &tasks[idx].job) != 0) {
+            inline_run[idx] = true;
+            failed_submits++;
+        }
+    }
+    if (failed_submits > 0) {
+        pthread_mutex_lock(&mu);
+        left -= failed_submits;
+        pthread_mutex_unlock(&mu);
+    }
+
+    for (unsigned idx = 0; idx < npos; idx++)
+        if (inline_run[idx])
+            cr_pos_run(&tasks[idx]);
+
+    pthread_mutex_lock(&mu);
+    while (left > 0)
+        pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    pthread_cond_destroy(&cv);
+    pthread_mutex_destroy(&mu);
+
+    for (unsigned idx = 0; idx < npos; idx++)
+        if (tasks[idx].failed)
+            return false;
+    return true;
+}
+
 int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_t *rec_sums, uint64_t off,
                      uint64_t len, void *vbuf, unsigned flags, chunk_report *rep)
 {
@@ -211,18 +517,23 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
     if (len == 0)
         return 0;
     uint8_t *buf = vbuf;
+    unsigned k = g->k;
+    uint64_t c0 = off / g->cell, c1 = (off + len - 1) / g->cell;
+    bool raw = (flags & CHUNK_RR_RAW) != 0;
+    if (src->read == obj_read && k > 1 && c1 > c0 && len >= CR_PAR_MIN_BYTES && chunk_fault_read == 0) {
+        if (try_read_parallel((const chunk_obj *)src->ctx, g, rec_sums, off, len, buf, raw, c0, c1))
+            return 0;
+    }
     rr r;
     memset(&r, 0, sizeof r);
     r.src = src;
     r.g = g;
     r.rec = rec_sums;
     r.rep = rep;
-    r.raw = (flags & CHUNK_RR_RAW) != 0;
+    r.raw = raw;
     r.cap = g->cell < g->len ? g->cell : (size_t)g->len;
     for (unsigned p = 0; p < chunk_npos(g); p++)
         r.base[p] = chunk_sums_base(g, p);
-    unsigned k = g->k;
-    uint64_t c0 = off / g->cell, c1 = (off + len - 1) / g->cell;
     int rc = 0;
     for (uint64_t s = c0 / k; s <= c1 / k && rc == 0; s++) {
         bool bad[CHUNK_K_MAX] = {false}, have[CHUNK_K_MAX] = {false};
@@ -264,18 +575,89 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
 
 /* ---------------------------------------------------------------- an object in a backend */
 struct chunk_obj {
+    chunk_backend *be;
+    uint32_t volume;
+    uint8_t vuuid[16], oid[16];
     chunk_geom g;
+    pthread_mutex_t mu;               /* serializes lazy open of deferred parity positions */
+    atomic_bool tried[CHUNK_POS_MAX]; /* release-stored once rd[p]/st[p] are populated */
     chunk_rd *rd[CHUNK_POS_MAX];
     int st[CHUNK_POS_MAX];
     const uint64_t *rec;
     char name[40];
 };
 
+static int st_of(int rc)
+{
+    return rc == TSDB_ERR_NOTFOUND ? CHUNK_ST_ABSENT : rc == TSDB_ERR_CORRUPT ? CHUNK_ST_DAMAGED : CHUNK_ST_IOERR;
+}
+
+static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos)
+{
+    return pos < CHUNK_POS_MAX && atomic_load_explicit(&((chunk_obj *)o)->tried[pos], memory_order_acquire) &&
+           o->rd[pos] != NULL;
+}
+
+static chunk_backend *obj_backend(const chunk_obj *o)
+{
+    return o ? o->be : NULL;
+}
+
+static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
+{
+    chunk_ident id = {.volume = o->volume, .pos = (uint16_t)p};
+    memcpy(id.vuuid, o->vuuid, 16);
+    memcpy(id.oid, o->oid, 16);
+    chunk_rd *rd = NULL;
+    int rc = chunk_be_rd_open(o->be, &id, &rd);
+    if (rc == 0) {
+        const chunk_geom *hg = &chunk_rd_hdr(rd)->g;
+        if (!*have) { /* the geometry is the first valid chunk's: the object's own, recorded in every header */
+            o->g = *hg;
+            *have = true;
+        }
+        if (memcmp(hg, &o->g, sizeof *hg) != 0) { /* another encoding's chunk: not this object's */
+            chunk_rd_close(rd);
+            o->st[p] = CHUNK_ST_DAMAGED;
+            return TSDB_ERR_CORRUPT;
+        }
+        o->rd[p] = rd;
+        o->st[p] = CHUNK_ST_OK;
+        return 0;
+    }
+    o->st[p] = st_of(rc);
+    if (worst && (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && *worst != TSDB_ERR_IO)))
+        *worst = rc;
+    return rc;
+}
+
+/* Lazily opens a deferred parity position (k .. k+m-1) on first use (degrade() or heal); lock-free once tried. */
+static void obj_ensure_pos(chunk_obj *o, unsigned pos)
+{
+    if (pos >= CHUNK_POS_MAX || atomic_load_explicit(&o->tried[pos], memory_order_acquire))
+        return;
+    pthread_mutex_lock(&o->mu);
+    if (!atomic_load_explicit(&o->tried[pos], memory_order_relaxed)) {
+        if (pos < chunk_npos(&o->g)) {
+            bool have = true;
+            (void)obj_open_pos(o, pos, &have, NULL);
+            if (!o->rd[pos] && o->st[pos] == CHUNK_ST_ABSENT &&
+                chunk_be_store_state(o->be, chunk_be_pos_store(o->be, o->oid, pos)) != CHUNK_STORE_UP)
+                o->st[pos] = CHUNK_ST_DOWN;
+        } else {
+            o->st[pos] = CHUNK_ST_ABSENT;
+        }
+        atomic_store_explicit(&o->tried[pos], true, memory_order_release);
+    }
+    pthread_mutex_unlock(&o->mu);
+}
+
 static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len)
 {
     chunk_obj *o = ctx;
     if (pos >= CHUNK_POS_MAX)
         return CHUNK_ST_IOERR;
+    obj_ensure_pos(o, pos);
     if (!o->rd[pos])
         return o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
     return chunk_rd_read(o->rd[pos], off, buf, len) == 0 ? 0 : CHUNK_ST_IOERR;
@@ -284,16 +666,16 @@ static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len
 static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
 {
     chunk_obj *o = ctx;
-    if (pos >= CHUNK_POS_MAX || !o->rd[pos]) {
-        *status = pos < CHUNK_POS_MAX && o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
+    if (pos >= CHUNK_POS_MAX) {
+        *status = CHUNK_ST_ABSENT;
+        return NULL;
+    }
+    obj_ensure_pos(o, pos);
+    if (!o->rd[pos]) {
+        *status = o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
         return NULL;
     }
     return chunk_rd_sums(o->rd[pos]);
-}
-
-static int st_of(int rc)
-{
-    return rc == TSDB_ERR_NOTFOUND ? CHUNK_ST_ABSENT : rc == TSDB_ERR_CORRUPT ? CHUNK_ST_DAMAGED : CHUNK_ST_IOERR;
 }
 
 int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
@@ -302,41 +684,32 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
     chunk_obj *o = calloc(1, sizeof *o);
     if (!o)
         return TSDB_ERR_NOMEM;
+    o->be = be;
+    o->volume = volume;
+    memcpy(o->vuuid, vuuid, 16);
+    memcpy(o->oid, oid, 16);
     o->rec = rec_sums;
+    pthread_mutex_init(&o->mu, NULL);
     chunk_oid_hex(oid, o->name);
     bool have = expect != NULL;
     if (have)
         o->g = *expect;
     bool alive = false;
     int worst = TSDB_ERR_NOTFOUND;
-    for (unsigned p = 0; p < CHUNK_POS_MAX; p++) {
+    /* Healthy path: open only data positions 0 .. k-1; parity positions k .. k+m-1 open lazily in obj_ensure_pos()
+     * when degrade() or heal actually needs them. If geometry is unknown (!have), scan until the first valid header
+     * discovers o->g (then finish up to k-1). If all data positions failed (!alive), scan parity too so an object
+     * surviving only on parity chunks still opens. */
+    unsigned p = 0;
+    for (; p < CHUNK_POS_MAX; p++) {
+        if (have && alive && p >= o->g.k)
+            break;
         if (have && p >= chunk_npos(&o->g))
             break;
-        chunk_ident id = {.volume = volume, .pos = (uint16_t)p};
-        memcpy(id.vuuid, vuuid, 16);
-        memcpy(id.oid, oid, 16);
-        chunk_rd *rd;
-        int rc = chunk_be_rd_open(be, &id, &rd);
-        if (rc == 0) {
-            const chunk_geom *hg = &chunk_rd_hdr(rd)->g;
-            if (!have) { /* the geometry is the first valid chunk's: the object's own, recorded in every header */
-                o->g = *hg;
-                have = true;
-            }
-            if (memcmp(hg, &o->g, sizeof *hg) != 0) { /* another encoding's chunk: not this object's */
-                chunk_rd_close(rd);
-                o->st[p] = CHUNK_ST_DAMAGED;
-                continue;
-            }
-            o->rd[p] = rd;
+        int rc = obj_open_pos(o, p, &have, &worst);
+        atomic_store_explicit(&o->tried[p], true, memory_order_relaxed);
+        if (rc == 0)
             alive = true;
-        } else {
-            o->st[p] = st_of(rc);
-            if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
-                worst = rc;
-        }
-        if (!have && o->st[p] == CHUNK_ST_ABSENT && p + 1 >= CHUNK_POS_MAX)
-            break;
     }
     bool away = false; /* a store that is not UP: what it holds may be what this object lacks */
     for (int i = 0; i < chunk_be_nstores(be); i++)
@@ -352,10 +725,10 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
         return worst == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_CORRUPT;
     }
     if (away)
-        for (unsigned p = 0; p < chunk_npos(&o->g); p++)
-            if (!o->rd[p] && o->st[p] == CHUNK_ST_ABSENT &&
-                chunk_be_store_state(be, chunk_be_pos_store(be, oid, p)) != CHUNK_STORE_UP)
-                o->st[p] = CHUNK_ST_DOWN; /* it may be there: it comes back with its store (or its heal) */
+        for (unsigned i = 0; i < p; i++)
+            if (!o->rd[i] && o->st[i] == CHUNK_ST_ABSENT &&
+                chunk_be_store_state(be, chunk_be_pos_store(be, oid, i)) != CHUNK_STORE_UP)
+                o->st[i] = CHUNK_ST_DOWN; /* it may be there: it comes back with its store (or its heal) */
     if (chunk_mutant == CHUNK_MUT_SETTINGS) { /* planted: the layout taken from today's settings, not from the object */
         chunk_geom t;
         if (chunk_geom_derive(&t, chunk_settings_k, chunk_settings_m, o->g.len) == 0)
@@ -371,6 +744,7 @@ void chunk_obj_close(chunk_obj *o)
         return;
     for (unsigned p = 0; p < CHUNK_POS_MAX; p++)
         chunk_rd_close(o->rd[p]);
+    pthread_mutex_destroy(&o->mu);
     free(o);
 }
 
@@ -378,20 +752,29 @@ const chunk_geom *chunk_obj_geom(const chunk_obj *o) { return &o->g; }
 
 const uint64_t *chunk_obj_pos_sums(const chunk_obj *o, unsigned pos)
 {
-    return pos < CHUNK_POS_MAX && o->rd[pos] ? chunk_rd_sums(o->rd[pos]) : NULL;
+    if (pos >= CHUNK_POS_MAX)
+        return NULL;
+    obj_ensure_pos((chunk_obj *)o, pos);
+    return o->rd[pos] ? chunk_rd_sums(o->rd[pos]) : NULL;
 }
 
 int chunk_obj_pos_status(const chunk_obj *o, unsigned pos)
 {
-    return pos >= CHUNK_POS_MAX ? CHUNK_ST_ABSENT : o->rd[pos] ? CHUNK_ST_OK : o->st[pos];
+    if (pos >= CHUNK_POS_MAX)
+        return CHUNK_ST_ABSENT;
+    obj_ensure_pos((chunk_obj *)o, pos);
+    return o->rd[pos] ? CHUNK_ST_OK : o->st[pos];
 }
 
 uint64_t chunk_obj_epoch(const chunk_obj *o)
 {
     uint64_t e = 0;
-    for (unsigned p = 0; p < CHUNK_POS_MAX; p++)
+    unsigned n = chunk_npos(&o->g);
+    for (unsigned p = 0; p < n; p++) {
+        obj_ensure_pos((chunk_obj *)o, p);
         if (o->rd[p] && chunk_rd_hdr(o->rd[p])->epoch > e)
             e = chunk_rd_hdr(o->rd[p])->epoch;
+    }
     return e;
 }
 

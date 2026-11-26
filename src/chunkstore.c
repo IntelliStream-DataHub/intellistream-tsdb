@@ -1414,6 +1414,9 @@ void chunk_be_close(chunk_backend *be)
 {
     if (!be)
         return;
+    chunk_rpool *rp = atomic_load_explicit(&be->rpool, memory_order_acquire);
+    if (rp)
+        chunk_rpool_destroy(rp);
     for (int i = 0; i < be->n; i++) {
         chunk_store_close(atomic_load(&be->st[i])); /* NULL for a store opened as down */
         free(be->path[i]);
@@ -1532,7 +1535,20 @@ int chunk_be_put(chunk_backend *be, int store, const chunk_ident *id, const chun
 int chunk_be_rd_open(chunk_backend *be, const chunk_ident *id, chunk_rd **out)
 {
     int worst = TSDB_ERR_NOTFOUND;
+    int primary = be->n > 0 ? chunk_be_place(be, id->oid, id->pos) : -1;
+    if (primary >= 0 && primary < be->n) {
+        chunk_store *st = chunk_be_open_store(be, primary);
+        if (st) {
+            int rc = chunk_rd_open(st, id, out);
+            if (rc == 0)
+                return 0;
+            if (rc == TSDB_ERR_IO || (rc == TSDB_ERR_CORRUPT && worst != TSDB_ERR_IO))
+                worst = rc;
+        }
+    }
     for (int i = 0; i < be->n; i++) {
+        if (i == primary)
+            continue;
         chunk_store *st = chunk_be_open_store(be, i);
         if (!st)
             continue;

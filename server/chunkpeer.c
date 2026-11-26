@@ -20,6 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -28,7 +31,16 @@ uint32_t chunkpeer_test_list_max = CS_LIST_MAX;
 #ifdef TSDB_TEST_HOOKS
 int64_t (*chunkpeer_test_now_ms)(void);
 int chunkpeer_test_avoid_ms;
+int chunkpeer_test_serial_put;
 #endif
+
+typedef struct cp_job {
+    void (*fn)(void *);
+    void *arg;
+    struct cp_job *next;
+} cp_job;
+
+static int pool_submit(cp_job *j);
 
 int chunkpeer_mutant_parse(const char *name)
 {
@@ -187,6 +199,101 @@ static int stage_sums(int fd, const uint64_t *sums, uint64_t n)
     return 0;
 }
 
+#define CP_MEMFD_MAX (16u << 20)
+
+static int stage_open_fd(const char *stage_dir, bool use_memfd)
+{
+#if defined(__linux__) && defined(SYS_memfd_create)
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+    if (use_memfd) {
+        int fd = (int)syscall(SYS_memfd_create, "tsdb-chunkstage", (unsigned)MFD_CLOEXEC);
+        if (fd >= 0)
+            return fd;
+    }
+#else
+    (void)use_memfd;
+#endif
+    /* mkstemp and unlink, never O_TMPFILE: macOS has none, and NFS (tsdbd's root in production) refuses it */
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s/chunkstage.XXXXXX", stage_dir);
+    int fd = mkstemp(path);
+    if (fd >= 0) {
+        unlink(path);
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    return fd;
+}
+
+typedef struct put_batch put_batch;
+typedef struct put_pos_job {
+    cp_job job;
+    put_batch *b;
+    unsigned i;
+} put_pos_job;
+
+struct put_batch {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    unsigned done;
+    struct chunkpeer *cp;
+    uint32_t volume;
+    uint64_t epoch;
+    const uint8_t *vuuid;
+    const uint8_t *oid;
+    const chunk_geom *g;
+    const uint32_t *stripe;
+    const int *fds;
+    const uint64_t *sums;
+    int rc[CHUNK_POS_MAX];
+    uint64_t answered[CHUNK_POS_MAX];
+    uint64_t sum_hash[CHUNK_POS_MAX];
+    uint8_t meta[CHUNK_POS_MAX][CS_PUT_META_LEN];
+    put_pos_job jobs[CHUNK_POS_MAX];
+};
+
+static void put_pos_run(put_batch *b, unsigned i)
+{
+    struct cs_put_meta m = {.volume = b->volume, .epoch = b->epoch, .pos = (uint16_t)i, .g = *b->g};
+    memcpy(m.vuuid, b->vuuid, 16);
+    memcpy(m.oid, b->oid, 16);
+    uint64_t sum = cs_sums_hash(b->sums + chunk_sums_base(b->g, i), chunk_pos_cells(b->g, i)), answered = 0;
+    cs_put_meta_encode(&m, b->meta[i]);
+    b->sum_hash[i] = sum;
+    b->rc[i] = b->cp->net.put(b->cp->net.arg, b->stripe[i], &m, b->fds[i], 0, sum, timeout_of(b->cp), &answered);
+    b->answered[i] = answered;
+}
+
+static void put_pos_work(void *arg)
+{
+    put_pos_job *j = arg;
+    put_batch *b = j->b;
+    put_pos_run(b, j->i);
+    pthread_mutex_lock(&b->mu);
+    b->done++;
+    pthread_cond_signal(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+
+static int put_check_pos(pctx *p, const put_batch *b, unsigned i)
+{
+    int r = b->rc[i];
+    /* the answer covers the identity the member took (volume, epoch, position, oid) as well as the sums */
+    if (r == 0 && b->answered[i] != cs_put_answer_hash(b->meta[i], b->sum_hash[i]) &&
+        chunkpeer_mutant != CP_MUT_NOSUMCMP) {
+        fprintf(stderr, "tsdbd: volume %" PRIu32 ": member %" PRIu32 " answered the put of position %u with "
+                        "another sum than the chunk's: the put fails\n", p->volume, b->stripe[i], i);
+        r = TSDB_ERR_IO;
+    }
+    if (r)
+        fprintf(stderr, "tsdbd: volume %" PRIu32 ": the put of position %u on member %" PRIu32 " failed (%s): "
+                        "the settle fails\n", p->volume, i, b->stripe[i], err_name(r));
+    else if (b->epoch)
+        see_fence(p, b->epoch);
+    return r;
+}
+
 static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, uint64_t epoch,
                         const chunk_put_src *src, uint64_t *sums_out)
 {
@@ -207,18 +314,16 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
     uint64_t *own = NULL;
     if (!sums_out && !(sums_out = own = malloc(chunk_sums_total(g) * sizeof *own)))
         return TSDB_ERR_NOMEM;
+    uint64_t total_stage = 0;
+    for (unsigned i = 0; i < npos; i++)
+        total_stage += 8 * chunk_pos_cells(g, i) + chunk_pos_len(g, i);
+    bool use_memfd = total_stage <= CP_MEMFD_MAX;
     stage s = {.g = g, .npos = npos};
     for (unsigned i = 0; i < npos; i++)
         s.fd[i] = -1;
     for (unsigned i = 0; i < npos && rc == 0; i++) {
-        /* mkstemp and unlink, never O_TMPFILE: macOS has none, and NFS (tsdbd's root in production) refuses it */
-        char path[PATH_MAX + 32];
-        snprintf(path, sizeof path, "%s/chunkstage.XXXXXX", cp->stage_dir);
-        s.fd[i] = mkstemp(path);
-        if (s.fd[i] >= 0) {
-            unlink(path);
-            (void)fcntl(s.fd[i], F_SETFD, FD_CLOEXEC);
-        } else {
+        s.fd[i] = stage_open_fd(cp->stage_dir, use_memfd);
+        if (s.fd[i] < 0) {
             fprintf(stderr, "tsdbd: volume %" PRIu32 ": a put cannot be staged in %s: %s\n", p->volume, cp->stage_dir,
                     strerror(errno));
             rc = TSDB_ERR_IO;
@@ -228,26 +333,57 @@ static int p_put_stream(void *ctx, const uint8_t oid[16], const chunk_geom *g, u
         rc = chunk_encode_stream(g, src, stage_cell, &s, sums_out);
     for (unsigned i = 0; i < npos && rc == 0; i++)
         rc = stage_sums(s.fd[i], sums_out + chunk_sums_base(g, i), chunk_pos_cells(g, i));
-    /* One position after the other: every one must be committed before the settle goes on (no degraded settle). */
-    for (unsigned i = 0; i < npos && rc == 0; i++) {
-        struct cs_put_meta m = {.volume = p->volume, .epoch = epoch, .pos = (uint16_t)i, .g = *g};
-        memcpy(m.vuuid, p->vuuid, 16);
-        memcpy(m.oid, oid, 16);
-        uint64_t sum = cs_sums_hash(sums_out + chunk_sums_base(g, i), chunk_pos_cells(g, i)), answered = 0;
-        uint8_t meta[CS_PUT_META_LEN];
-        cs_put_meta_encode(&m, meta);
-        rc = cp->net.put(cp->net.arg, v.stripe[i], &m, s.fd[i], 0, sum, timeout_of(cp), &answered);
-        /* the answer covers the identity the member took (volume, epoch, position, oid) as well as the sums */
-        if (rc == 0 && answered != cs_put_answer_hash(meta, sum) && chunkpeer_mutant != CP_MUT_NOSUMCMP) {
-            fprintf(stderr, "tsdbd: volume %" PRIu32 ": member %" PRIu32 " answered the put of position %u with "
-                            "another sum than the chunk's: the put fails\n", p->volume, v.stripe[i], i);
-            rc = TSDB_ERR_IO;
+    /* Upload all k+m positions concurrently; every position must commit before the settle goes on (no degraded settle). */
+    if (rc == 0 && npos > 0) {
+        put_batch b;
+        memset(&b, 0, sizeof b);
+        pthread_mutex_init(&b.mu, NULL);
+        pthread_cond_init(&b.cv, NULL);
+        b.cp = cp;
+        b.volume = p->volume;
+        b.epoch = epoch;
+        b.vuuid = p->vuuid;
+        b.oid = oid;
+        b.g = g;
+        b.stripe = v.stripe;
+        b.fds = s.fd;
+        b.sums = sums_out;
+        unsigned start = 0;
+#ifdef TSDB_TEST_HOOKS
+        if (chunkpeer_test_serial_put) {
+            put_pos_run(&b, 0);
+            rc = put_check_pos(p, &b, 0);
+            start = 1;
         }
-        if (rc)
-            fprintf(stderr, "tsdbd: volume %" PRIu32 ": the put of position %u on member %" PRIu32 " failed (%s): "
-                            "the settle fails\n", p->volume, i, v.stripe[i], err_name(rc));
-        else if (epoch)
-            see_fence(p, epoch);
+#endif
+        if (rc == 0 && start < npos) {
+            unsigned submitted = 0;
+            bool inline_run[CHUNK_POS_MAX] = {false};
+            inline_run[start] = true;
+            for (unsigned i = start + 1; i < npos; i++) {
+                b.jobs[i] = (put_pos_job){.job = {.fn = put_pos_work, .arg = &b.jobs[i]}, .b = &b, .i = i};
+                if (pool_submit(&b.jobs[i].job) == 0)
+                    submitted++;
+                else
+                    inline_run[i] = true;
+            }
+            for (unsigned i = start; i < npos; i++)
+                if (inline_run[i])
+                    put_pos_run(&b, i);
+            if (submitted > 0) {
+                pthread_mutex_lock(&b.mu);
+                while (b.done < submitted)
+                    pthread_cond_wait(&b.cv, &b.mu);
+                pthread_mutex_unlock(&b.mu);
+            }
+            for (unsigned i = start; i < npos; i++) {
+                int r = put_check_pos(p, &b, i);
+                if (r && rc == 0)
+                    rc = r;
+            }
+        }
+        pthread_cond_destroy(&b.cv);
+        pthread_mutex_destroy(&b.mu);
     }
     for (unsigned i = 0; i < npos; i++)
         if (s.fd[i] >= 0)
@@ -625,6 +761,7 @@ typedef struct ask {
 
 typedef struct fan fan;
 typedef struct fan_job {
+    cp_job job;
     fan *f;
     unsigned i;
 } fan_job;
@@ -702,16 +839,15 @@ static void fan_record(fan *f, unsigned i, ask *a)
     pthread_cond_broadcast(&f->cv);
 }
 
-static void *fan_main(void *arg)
+static void fan_work(void *arg)
 {
     fan_job *j = arg;
     fan *f = j->f;
+    unsigned i = j->i;
     ask a;
-    fan_one(f, j->i, &a);
-    fan_record(f, j->i, &a);
-    fan_unref_locked(f);
-    atomic_fetch_sub(&fan_threads, 1);
-    return NULL;
+    fan_one(f, i, &a);
+    fan_record(f, i, &a);
+    fan_unref_locked(f); /* may free f (and j embedded in f): never touch j after this */
 }
 
 /* Asks positions 0..n-1 of f and waits until all answered, or `need` (> 0) are OK and FAN_GRACE_MS more passed (0
@@ -723,16 +859,8 @@ static void fan_run(fan *f, unsigned need, int grace_ms, bool stop_on_fail, ask 
     tsdb_cond_init_mono(&f->cv);
     f->refs = 1 + (int)f->n;
     for (unsigned i = 0; i < f->n; i++) {
-        f->job[i] = (fan_job){f, i};
-        pthread_attr_t at;
-        pthread_t th;
-        pthread_attr_init(&at);
-        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        atomic_fetch_add(&fan_threads, 1);
-        int e = pthread_create(&th, &at, fan_main, &f->job[i]);
-        pthread_attr_destroy(&at);
-        if (e != 0) { /* no thread: asked here, in turn */
-            atomic_fetch_sub(&fan_threads, 1);
+        f->job[i] = (fan_job){.job = {.fn = fan_work, .arg = &f->job[i]}, .f = f, .i = i};
+        if (pool_submit(&f->job[i].job) != 0) { /* no thread: asked here, in turn */
             ask a;
             fan_one(f, i, &a);
             fan_record(f, i, &a);
@@ -783,16 +911,11 @@ static fan *fan_new(const struct chunkpeer *cp, uint32_t volume, uint64_t epoch,
     return f;
 }
 
-/* Small cached pool of detached workers for read_race primary/hedge tasks: avoids pthread_create per healthy direct
- * cell read while still spawning overflow threads when peers hang (never starves). */
-#define CP_POOL_MAX 16
+/* Cached pool of detached workers shared by p_put_stream, fan_run, and read_race primary/hedge tasks: avoids
+ * pthread_create per healthy put/open/read while still spawning overflow threads when peers hang (never starves or
+ * deadlocks on nested calls). */
+#define CP_POOL_MAX 32
 #define CP_POOL_IDLE_MS 5000
-
-typedef struct cp_job {
-    void (*fn)(void *);
-    void *arg;
-    struct cp_job *next;
-} cp_job;
 
 static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_cv;
@@ -887,6 +1010,9 @@ static int pool_submit(cp_job *j)
     pthread_t th;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#ifdef __APPLE__
+    pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+#endif
     int e = pthread_create(&th, &at, pooled ? pool_worker_main : pool_oneshot_main, j);
     pthread_attr_destroy(&at);
     if (e != 0) {

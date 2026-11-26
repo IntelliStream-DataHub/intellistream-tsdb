@@ -61,6 +61,7 @@ struct fake {
     atomic_uint flip_byte;       /* bit i: XOR 0xff into byte 0 of member i's READ replies (silent rot) */
     atomic_uint read_timeout;    /* bit i: after sleeping read_delay_ms[i], return TSDB_ERR_UNAVAILABLE on READ */
     atomic_int read_delay_ms[NM + 1];
+    atomic_int put_delay_ms[NM + 1];
     atomic_uint read_delay_max[NM + 1];  /* 0: unlimited; >0: delay only the first max READs to node */
     atomic_uint read_delay_seen[NM + 1]; /* READs delayed so far on node */
     atomic_uint read_calls[NM + 1];      /* total CS_OP_READ calls received by node */
@@ -143,6 +144,11 @@ static int f_put(void *arg, uint32_t node, const struct cs_put_meta *m, int fd, 
     (void)arg, (void)sum, (void)tmo;
     if (node == 0 || node > NM || (atomic_load(&F.down) >> node & 1))
         return TSDB_ERR_UNAVAILABLE;
+    int pdms = atomic_load(&F.put_delay_ms[node]);
+    if (pdms > 0) {
+        struct timespec ts = {pdms / 1000, (long)(pdms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
     int rc = chunkpeer_local_put(F.cs[node], 99, m, fd, base, answered);
     if (rc == 0 && (atomic_load(&F.liar) >> node & 1))
         *answered ^= 1; /* a member of another version, or a bug there: what it stored is not what was sent */
@@ -216,6 +222,7 @@ static void cluster_up(const char *name, char *dir, size_t cap)
     atomic_store(&F.fail_cell, 0);
     for (uint32_t i = 0; i <= NM; i++) {
         atomic_store(&F.read_delay_ms[i], 0);
+        atomic_store(&F.put_delay_ms[i], 0);
         atomic_store(&F.read_delay_max[i], 0);
         atomic_store(&F.read_delay_seen[i], 0);
         atomic_store(&F.read_calls[i], 0);
@@ -1224,6 +1231,37 @@ static void test_hedge_threads(void)
     cluster_down();
 }
 
+/* P-27: parallel p_put_stream uploads all k+m positions concurrently; pool-backed fan_run reuses threads. */
+static void test_parallel_put(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("parput", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 128u << 10, 31);
+    for (uint32_t i = 1; i <= NM; i++)
+        atomic_store(&F.put_delay_ms[i], 120);
+    uint64_t t0 = mono_ms();
+    CHECK(put(ctx, &o, 5) == 0);
+    uint64_t dt = mono_ms() - t0;
+    /* Serial 6 x 120 ms = 720+ ms; parallel completes in ~120 ms (generous 500 ms cap for TSan/slow-disk headroom). */
+    CHECK(dt < 500);
+    for (uint32_t i = 1; i <= NM; i++)
+        atomic_store(&F.put_delay_ms[i], 0);
+    chunk_report rep;
+    CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells == 0);
+    /* Repeated opens exercise pooled fan_run with both expect!=NULL and expect==NULL. */
+    for (int i = 0; i < 20; i++) {
+        cold_obj *h = NULL;
+        CHECK(coldops_peer.obj_open(ctx, o.oid, (i & 1) ? &o.g : NULL, (i & 1) ? o.sums : NULL, &h) == 0 && h);
+        coldops_peer.obj_close(h);
+    }
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
 int main(int argc, char **argv)
 {
     const char *base = "/tmp";
@@ -1245,6 +1283,7 @@ int main(int argc, char **argv)
         return 1;
     }
     test_put_read();
+    test_parallel_put();
     test_sum();
     test_fence_del();
     test_unsure();

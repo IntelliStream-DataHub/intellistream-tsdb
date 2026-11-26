@@ -1258,11 +1258,11 @@ static void test_net(void)
     CHECK(chunksrv_set_peer(a, 2, addr) == 0);
     snprintf(addr, sizeof addr, "127.0.0.1:%d", pa);
     CHECK(chunksrv_set_peer(b, 1, addr) == 0);
-    enum { NT = 4 };
+    enum { NT = 16 };
     struct net_arg na[NT];
     pthread_t th[NT];
     for (int t = 0; t < NT; t++) {
-        na[t] = (struct net_arg){.a = a, .peer = 2, .t = t, .n = quick ? 3 : 8, .dir = dir};
+        na[t] = (struct net_arg){.a = a, .peer = 2, .t = t, .n = quick ? 2 : 6, .dir = dir};
         pthread_create(&th[t], NULL, net_thread, &na[t]);
     }
     for (int t = 0; t < NT; t++) {

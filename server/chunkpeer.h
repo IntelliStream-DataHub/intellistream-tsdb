@@ -136,6 +136,7 @@ extern uint32_t chunkpeer_test_list_max; /* entries per page of list_names (test
 #ifdef TSDB_TEST_HOOKS
 extern int64_t (*chunkpeer_test_now_ms)(void); /* NULL: CLOCK_MONOTONIC ms (unit tests: window & avoid timers) */
 extern int chunkpeer_test_avoid_ms;            /* 0: default 30,000 ms */
+extern int chunkpeer_test_serial_put;          /* non-zero: run position 0 before 1..n-1 (pause_midput hook) */
 #endif
 int chunkpeer_mutant_parse(const char *name); /* CP_MUT_* or -1 */
 
