@@ -3531,6 +3531,141 @@ static void test_series_lockfree_mt(const char *base)
     rm_rf(dir);
 }
 
+/* P-31 + P-32 + P-45: high-fan-in merge (>8 interleaved parts with multi-way ties and tombstones),
+ * TLS codec_ctx lifecycle across short-lived threads + deferred cc_get on empty/memtable raw queries,
+ * and disjoint raw_range buffer reuse across parts of growing granule sizes. */
+typedef struct { tsdb *db; tsdb_sid id; int ok; } cc_thr_arg;
+static int cc_noop_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    (void)ts; (void)v;
+    *(size_t *)ctx += n;
+    return 0;
+}
+static void *cc_worker_fn(void *arg)
+{
+    cc_thr_arg *a = arg;
+    size_t rows = 0;
+    for (int i = 0; i < 20; i++) {
+        if (tsdb_query_raw(a->db, a->id, 0, INT64_MAX, cc_noop_cb, &rows) != 0)
+            return NULL;
+    }
+    a->ok = rows > 0;
+    return NULL;
+}
+
+static void test_query_fastpaths(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-qfp-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o = test_opts(0);
+    o.granule_rows = 64;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid s1, s2;
+    OK(tsdb_series(db, "fanin", &s1));
+    OK(tsdb_series(db, "disjoint", &s2));
+
+    /* P-32: empty raw query and memtable-only raw query must not acquire a codec_ctx */
+    size_t before = cc_gets, rows = 0;
+    OK(tsdb_query_raw(db, s1, 0, INT64_MAX, cc_noop_cb, &rows));
+    CHECK(rows == 0 && cc_gets == before);
+    int64_t mt_ts[3] = {10, 20, 30};
+    float mt_v[3] = {1.0f, 2.0f, 3.0f};
+    OK(tsdb_insert_series(db, s1, mt_ts, mt_v, 3));
+    before = cc_gets;
+    rows = 0;
+    OK(tsdb_query_raw(db, s1, 0, INT64_MAX, cc_noop_cb, &rows));
+    CHECK(rows == 3 && cc_gets == before);
+    OK(tsdb_delete_range(db, s1, 0, 100));
+    OK(tsdb_flush(db));
+
+    /* P-31: 20 interleaved overlapping parts (> 8 heap threshold) with multi-way ties and a tombstone */
+    const int KP = 20, PER = 200;
+    ref r = {0};
+    const int64_t t0 = 1700000000000LL;
+    for (int p = 0; p < KP; p++) {
+        int64_t ts[200];
+        float v[200];
+        for (int i = 0; i < PER; i++) {
+            /* Mix of unique timestamps per part and multi-way shared timestamps (every 5th row) */
+            ts[i] = t0 + (i % 5 == 0 ? (int64_t)i * 1000 : (int64_t)i * 1000 + (p + 1) * 10);
+            v[i] = (float)(p * 1000 + i);
+            ref_add(&r, s1, ts[i], v[i]);
+        }
+        OK(tsdb_insert_series(db, s1, ts, v, PER));
+        OK(tsdb_flush(db));
+        if (p == 10) {
+            /* Delete a slice of older parts; parts 11..19 will still write newer rows into/around it */
+            OK(tsdb_delete_range(db, s1, t0 + 40000, t0 + 60000));
+            size_t kept = 0;
+            for (size_t j = 0; j < r.n; j++)
+                if (r.r[j].t < t0 + 40000 || r.r[j].t >= t0 + 60000)
+                    r.r[kept++] = r.r[j];
+            r.n = kept;
+            r.stale = true;
+        }
+    }
+    /* Verify merge_stream (> 8 heap) before optimize, then merge_parts (> 8 heap) after optimize */
+    tsdb_points pts1 = {0}, pts2 = {0};
+    OK(tsdb_query_points(db, s1, t0 - 1000, t0 + 500000, &pts1));
+    ref_final(&r);
+    CHECK(pts1.n == r.nfin);
+    for (size_t i = 0; i < pts1.n && i < r.nfin; i++)
+        CHECK(pts1.ts[i] == r.fin[i].t && pts1.values[i] == r.fin[i].v);
+    OK(tsdb_optimize(db));
+    OK(tsdb_query_points(db, s1, t0 - 1000, t0 + 500000, &pts2));
+    CHECK(pts2.n == pts1.n && memcmp(pts2.ts, pts1.ts, pts1.n * sizeof *pts1.ts) == 0 &&
+          memcmp(pts2.values, pts1.values, pts1.n * sizeof *pts1.values) == 0);
+    tsdb_points_free(&pts1);
+    tsdb_points_free(&pts2);
+    free(r.r);
+    free(r.fin);
+
+    /* P-45: disjoint raw_range buffer reuse across 16 parts of growing granule sizes */
+    size_t total_disjoint = 0;
+    for (int p = 0; p < 16; p++) {
+        size_t n = (size_t)(4 + p * 12); /* grows from 4 up to 184 (> granule_rows = 64) */
+        int64_t *ts = malloc(n * sizeof *ts);
+        float *v = malloc(n * sizeof *v);
+        int64_t base_ts = (int64_t)(p + 1) * 86400000LL;
+        for (size_t i = 0; i < n; i++) {
+            ts[i] = base_ts + (int64_t)i * 1000;
+            v[i] = (float)(p * 1000 + (int)i);
+        }
+        OK(tsdb_insert_series(db, s2, ts, v, n));
+        OK(tsdb_flush(db));
+        free(ts);
+        free(v);
+        total_disjoint += n;
+    }
+    tsdb_points dpts = {0};
+    OK(tsdb_query_points(db, s2, 0, INT64_MAX, &dpts));
+    CHECK(dpts.n == total_disjoint);
+    size_t idx = 0;
+    for (int p = 0; p < 16 && idx < dpts.n; p++) {
+        size_t n = (size_t)(4 + p * 12);
+        int64_t base_ts = (int64_t)(p + 1) * 86400000LL;
+        for (size_t i = 0; i < n && idx < dpts.n; i++, idx++)
+            CHECK(dpts.ts[idx] == base_ts + (int64_t)i * 1000 && dpts.values[idx] == (float)(p * 1000 + (int)i));
+    }
+    tsdb_points_free(&dpts);
+
+    /* P-32: multi-threaded TLS codec_ctx reuse and thread-exit destructor cleanup */
+    pthread_t th[8];
+    cc_thr_arg args[8];
+    for (int i = 0; i < 8; i++) {
+        args[i] = (cc_thr_arg){db, s2, 0};
+        CHECK(pthread_create(&th[i], NULL, cc_worker_fn, &args[i]) == 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(args[i].ok);
+    }
+    OK(tsdb_close(db));
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_tsdb", 1200);
@@ -3596,6 +3731,8 @@ int main(int argc, char **argv)
     test_raw_many_parts(base);
     printf("lock-free series dictionary and mixed mt_write\n");
     test_series_lockfree_mt(base);
+    printf("query & merge fast paths (P-31/P-32/P-45)\n");
+    test_query_fastpaths(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

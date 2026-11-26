@@ -1075,10 +1075,328 @@ static void bounds(const char *base)
     }
 }
 
+/* P-29 + P-36: multi-series over >64 parts (heap & inline snapshot_cut, uniform & per-series ranges,
+ * tombstones, memtable rows, TWA with/without max_gap, and collect_fn zero-copy bucket transfer with budget hooks). */
+static void many_parts_and_collect(const char *base)
+{
+    char d0[600], d1[600], cmd[1400];
+    snprintf(d0, sizeof d0, "%s/test_multi_mp0-%d", base, (int)getpid());
+    snprintf(d1, sizeof d1, "%s/test_multi_mp1-%d", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", d0, d1);
+    if (system(cmd)) {
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.query_threads = 8;
+    o.granule_rows = 64;
+    o.partition_ms = 86400000;
+    tsdb *db = NULL;
+    OK(tsdb_open(d0, &o, &db));
+    const size_t NS = 12;
+    tsdb_sid sids[12];
+    for (size_t i = 0; i < NS; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "mp_%zu", i);
+        OK(tsdb_series_create(db, nm, (tsdb_type)(i % 4), i >= 6 ? d1 : NULL, &sids[i]));
+    }
+    /* 70 disjoint daily parts (> 64 inline_parts threshold) */
+    for (int p = 0; p < 70; p++) {
+        int64_t b = (int64_t)p * 86400000LL;
+        for (size_t i = 0; i < NS; i++) {
+            int64_t ts[4] = {b + 1000, b + 61000, b + 121000, b + 181000};
+            put(db, sids[i], (tsdb_type)(i % 4), ts, 4, p + (int)i, p % 5 == 0);
+        }
+        OK(tsdb_flush(db));
+    }
+    /* Tombstones on both volumes + active memtable rows */
+    OK(tsdb_delete_range(db, sids[0], 10LL * 86400000LL, 12LL * 86400000LL));
+    OK(tsdb_delete_range(db, sids[7], 30LL * 86400000LL, 32LL * 86400000LL));
+    for (size_t i = 0; i < NS; i++) {
+        int64_t ts[2] = {70LL * 86400000LL + 1000, 70LL * 86400000LL + 61000};
+        put(db, sids[i], (tsdb_type)(i % 4), ts, 2, 999 + (int)i, 0);
+    }
+
+    budget bgt = {0};
+    tsdb_multi_opts mo = {.threads = 4, .max_held_bytes = 4096, .budget_take = b_take, .budget_give = b_give,
+                          .hook_ctx = &bgt};
+    /* 1. Uniform full range (> 64 parts), BUCKETS + SPREAD + TWA (max_gap=0 and max_gap>0) via collect */
+    const int kinds_list[4] = {TSDB_MULTI_BUCKETS, TSDB_MULTI_SPREAD, TSDB_MULTI_TWA, TSDB_MULTI_TWA};
+    for (int k = 0; k < 4; k++) {
+        tsdb_multi_query mq = {.kind = kinds_list[k], .start = 0, .end = 71LL * 86400000LL, .interval_ms = 86400000};
+        if (k == 3)
+            mq.twa.max_gap_ms = 120000;
+        atomic_store(&bgt.out, 0);
+        tsdb_series_result *res = NULL;
+        OK(tsdb_query_multi_collect(db, &mq, sids, NS, &mo, &res));
+        CHECK(atomic_load(&bgt.out) == 0); /* zero-copy transfer still released full budget */
+        for (size_t i = 0; i < NS; i++) {
+            CHECK(res[i].status == 0);
+            if (mq.kind == TSDB_MULTI_BUCKETS) {
+                tsdb_bucket *ref = NULL;
+                size_t nr = 0;
+                OK(tsdb_query_agg_ex(db, sids[i], mq.start, mq.end, mq.interval_ms, NULL, &ref, &nr));
+                CHECK(res[i].n == nr && (nr == 0 || memcmp(res[i].buckets, ref, nr * sizeof *ref) == 0));
+                free(ref);
+            } else if (mq.kind == TSDB_MULTI_SPREAD) {
+                tsdb_spread_bucket *ref = NULL;
+                size_t nr = 0;
+                OK(tsdb_query_spread(db, sids[i], mq.start, mq.end, mq.interval_ms, NULL, &ref, &nr));
+                CHECK(res[i].n == nr && (nr == 0 || memcmp(res[i].buckets, ref, nr * sizeof *ref) == 0));
+                free(ref);
+            } else {
+                tsdb_twa_bucket *ref = NULL;
+                size_t nr = 0;
+                OK(tsdb_query_twa(db, sids[i], mq.start, mq.end, mq.interval_ms, &mq.twa, &ref, &nr));
+                CHECK(res[i].n == nr && (nr == 0 || memcmp(res[i].buckets, ref, nr * sizeof *ref) == 0));
+                free(ref);
+            }
+        }
+        tsdb_series_results_free(res, NS);
+    }
+
+    /* 2. Narrow uniform range (2 parts out of 70) + per-series starts/ends (non-uniform) */
+    int64_t starts[12], ends[12];
+    for (size_t i = 0; i < NS; i++) {
+        starts[i] = (int64_t)(i * 5) * 86400000LL;
+        ends[i] = starts[i] + 3LL * 86400000LL;
+    }
+    tsdb_multi_query mq_var = {.kind = TSDB_MULTI_BUCKETS, .starts = starts, .ends = ends, .interval_ms = 60000};
+    tsdb_series_result *vres = NULL;
+    OK(tsdb_query_multi_collect(db, &mq_var, sids, NS, &mo, &vres));
+    CHECK(atomic_load(&bgt.out) == 0);
+    for (size_t i = 0; i < NS; i++) {
+        tsdb_bucket *ref = NULL;
+        size_t nr = 0;
+        OK(tsdb_query_agg_ex(db, sids[i], starts[i], ends[i], 60000, NULL, &ref, &nr));
+        CHECK(vres[i].status == 0 && vres[i].n == nr &&
+              (nr == 0 || memcmp(vres[i].buckets, ref, nr * sizeof *ref) == 0));
+        free(ref);
+    }
+    tsdb_series_results_free(vres, NS);
+
+    /* 3. max_rows abort mid-collect: must not leak transferred or untransferred buckets */
+    tsdb_multi_opts mo_cut = {.threads = 4, .max_rows = 5, .budget_take = b_take, .budget_give = b_give,
+                              .hook_ctx = &bgt};
+    tsdb_multi_query mq_cut = {.kind = TSDB_MULTI_BUCKETS, .start = 0, .end = 71LL * 86400000LL, .interval_ms = 60000};
+    tsdb_series_result *cres = NULL;
+    CHECK(tsdb_query_multi_collect(db, &mq_cut, sids, NS, &mo_cut, &cres) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(atomic_load(&bgt.out) == 0);
+    tsdb_series_results_free(cres, NS);
+
+    OK(tsdb_close(db));
+    if (system(cmd)) {
+    }
+}
+
+/* Regression (route_q eng_ref leak): when a thread inside tsdb_query_multi has volume v cached in
+ * cur_route (cache->depth == 0) and the next series on volume v has loc >= eng_series_count(cache->e)
+ * (a newly created series on a read-only follower or concurrent writer), route_q must release the
+ * cached eng_ref before falling through to route_opt; otherwise the previous ref is overwritten and
+ * leaked permanently, hanging tsdb_volume_idle / reopen. */
+typedef struct rc_creator {
+    tsdb *db;
+    const char *vol_dir;
+    atomic_int stop;
+    atomic_uint created;
+} rc_creator;
+
+static void *rc_create_thread(void *arg)
+{
+    rc_creator *c = arg;
+    for (unsigned i = 0; i < 100 && !atomic_load(&c->stop); i++) {
+        char name[64];
+        snprintf(name, sizeof name, "rc.conc.%u", i);
+        tsdb_sid id;
+        OK(tsdb_series_at(c->db, name, c->vol_dir, &id));
+        atomic_fetch_add(&c->created, 1);
+    }
+    return NULL;
+}
+
+static void route_cache_reload(const char *base)
+{
+    char r[512], v1[512], cmd[1200];
+    snprintf(r, sizeof r, "%s/test_multi-rc-%d-root", base, (int)getpid());
+    snprintf(v1, sizeof v1, "%s/test_multi-rc-%d-vol1", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", r, v1);
+    if (system(cmd)) {
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.query_threads = 4;
+    o.granule_rows = 128;
+
+    tsdb *w;
+    OK(tsdb_open(r, &o, &w));
+    tsdb_sid s0, s1, s2;
+    OK(tsdb_series_at(w, "rc.0", v1, &s0));
+    int64_t ts[10];
+    float vals[10];
+    for (int i = 0; i < 10; i++) {
+        ts[i] = T0 + i * 1000;
+        vals[i] = (float)(i + 1);
+    }
+    OK(tsdb_insert_series(w, s0, ts, vals, 10));
+    OK(tsdb_flush(w));
+
+    /* Open read-only handle (no background follow thread) so its SERIES count on volume 1 stays at 1. */
+    tsdb_options fo = o;
+    fo.read_only = 1;
+    fo.follow = 0;
+    tsdb *f;
+    OK(tsdb_open(r, &fo, &f));
+
+    /* Create a new series on the same volume in the writer and flush it. */
+    OK(tsdb_series_at(w, "rc.1", v1, &s1));
+    OK(tsdb_insert_series(w, s1, ts, vals, 10));
+    OK(tsdb_flush(w));
+
+    /* Series 0 caches volume 1 in cur_route (depth returns to 0 after collect_fn); series 1 hits the
+     * loc >= eng_series_count(cache->e) miss path on the same volume and reloads SERIES via route_opt.
+     * The call's cut for volume 1 was taken on series 0 (before route_opt's eng_refresh), so series 1
+     * resolves cleanly with status 0 and its rows appear on the next call. */
+    tsdb_sid sids2[2] = {s0, s1};
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
+    tsdb_multi_opts mo1 = {.threads = 1};
+    tsdb_series_result *out = NULL;
+    OK(tsdb_query_multi_collect(f, &q, sids2, 2, &mo1, &out));
+    CHECK(out[0].status == 0 && out[0].n == 10);
+    CHECK(out[1].status == 0);
+    tsdb_series_results_free(out, 2);
+
+    /* A leaked eng_ref in route_q keeps e->refs > 0 forever and makes tsdb_volume_idle time out. */
+    OK(tsdb_volume_quiesce(f, 1));
+    CHECK(tsdb_volume_idle(f, 1, 500) == 0);
+    OK(tsdb_volume_resume(f, 1));
+
+    /* Also exercise the multi-threaded bucket path with another newly created series on volume 1. */
+    OK(tsdb_series_at(w, "rc.2", v1, &s2));
+    OK(tsdb_insert_series(w, s2, ts, vals, 10));
+    OK(tsdb_flush(w));
+    tsdb_sid sids3[3] = {s0, s1, s2};
+    tsdb_multi_query qb = {.kind = TSDB_MULTI_BUCKETS, .start = T0, .end = T0 + 20000, .interval_ms = 5000};
+    tsdb_multi_opts mo4 = {.threads = 4};
+    out = NULL;
+    OK(tsdb_query_multi_collect(f, &qb, sids3, 3, &mo4, &out));
+    CHECK(out[0].status == 0 && out[0].n == 2);
+    CHECK(out[1].status == 0 && out[1].n == 2);
+    CHECK(out[2].status == 0);
+    tsdb_series_results_free(out, 3);
+    OK(tsdb_volume_quiesce(f, 1));
+    CHECK(tsdb_volume_idle(f, 1, 500) == 0);
+    OK(tsdb_close(f));
+
+    /* Concurrent series creation on a writer while tsdb_query_multi queries across cached volume 1. */
+    rc_creator cr = {.db = w, .vol_dir = v1};
+    atomic_init(&cr.stop, 0);
+    atomic_init(&cr.created, 0);
+    pthread_t cth;
+    CHECK(pthread_create(&cth, NULL, rc_create_thread, &cr) == 0);
+    for (int iter = 0; iter < 50; iter++) {
+        unsigned cur = atomic_load(&cr.created);
+        tsdb_sid pair[2] = {s0, TSDB_SID(1, 3 + cur)};
+        out = NULL;
+        OK(tsdb_query_multi_collect(w, &q, pair, 2, &mo4, &out));
+        CHECK(out[0].status == 0 && out[0].n == 10);
+        tsdb_series_results_free(out, 2);
+    }
+    atomic_store(&cr.stop, 1);
+    pthread_join(cth, NULL);
+    OK(tsdb_volume_quiesce(w, 1));
+    CHECK(tsdb_volume_idle(w, 1, 500) == 0);
+    OK(tsdb_close(w));
+
+    if (system(cmd)) {
+    }
+}
+
+/* Regression (bq_dense threads == 1 cancel): single-threaded bq_dense must still honour
+ * sched_cancel() per granule when cur_cuts != NULL (i.e. inside tsdb_query_multi). */
+static void dense_cancel_single(const char *base)
+{
+    char r[512], cmd[1200];
+    snprintf(r, sizeof r, "%s/test_multi-dc-%d", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", r);
+    if (system(cmd)) {
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.query_threads = 4;
+    o.granule_rows = 64;
+
+    tsdb *db;
+    OK(tsdb_open(r, &o, &db));
+    tsdb_sid s0, s1;
+    OK(tsdb_series(db, "dc.small", &s0));
+    OK(tsdb_series(db, "dc.heavy", &s1));
+
+    const size_t N = 200 * 64; /* 200 granules, each spanning >6 buckets at interval 1000ms -> all decoded */
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *vals = malloc(N * sizeof *vals);
+    CHECK(ts && vals);
+    for (size_t i = 0; i < N; i++) {
+        ts[i] = T0 + (int64_t)i * 100;
+        vals[i] = (float)(i % 100);
+    }
+    OK(tsdb_insert_series(db, s0, ts, vals, 10));
+    OK(tsdb_insert_series(db, s1, ts, vals, N));
+    OK(tsdb_flush(db));
+    free(ts);
+    free(vals);
+
+    /* Deterministic check: pre-cancelled group with cur_cuts != NULL and threads == 1 forced. */
+    uint64_t saved_rpt = query_rows_per_thread;
+    query_rows_per_thread = UINT64_MAX;
+    qcuts cuts;
+    qcuts_init_range(&cuts, true, T0, T0 + (int64_t)N * 100 + 1000);
+    qrun qr;
+    query_run_begin(db, &qr, 1);
+    qcuts *saved_cuts = cur_cuts;
+    cur_cuts = &cuts;
+    sched_cancel(&qr.g);
+    tsdb_bucket *b = NULL;
+    size_t nb = 0;
+    int rc = tsdb_query_agg_ex(db, s1, T0, T0 + (int64_t)N * 100 + 1000, 1000, NULL, &b, &nb);
+    cur_cuts = saved_cuts;
+    query_run_end(&qr, -1, 0);
+    qcuts_free(&cuts);
+    free(b);
+    CHECK(rc == TSDB_ERR_STOPPED);
+    tsdb_query_stats st;
+    tsdb_last_query_stats(&st);
+    CHECK(st.rows_decoded < N);
+
+    /* End-to-end tsdb_query_multi cancellation on dense buckets with threads == 1 per series. */
+    tsdb_sid sids[2] = {s0, s1};
+    tsdb_multi_query mq = {.kind = TSDB_MULTI_BUCKETS, .start = T0, .end = T0 + (int64_t)N * 100 + 1000,
+                           .interval_ms = 1000};
+    tsdb_multi_opts mo = {.threads = 2};
+    counter c = {.stop_at = 1};
+    CHECK(tsdb_query_multi(db, &mq, sids, 2, &mo, count_fn, &c) == TSDB_ERR_STOPPED);
+    CHECK(c.lasts == 1 && c.last_index == 0);
+    query_rows_per_thread = saved_rpt;
+
+    OK(tsdb_close(db));
+    if (system(cmd)) {
+    }
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_multi", 1200);
     const char *base = argc > 1 ? argv[1] : "/tmp";
+    many_parts_and_collect(base);
+    printf("  >64 parts cut & zero-copy collect: ok\n");
+    route_cache_reload(base);
+    printf("  route_cache reload & quiesce/idle: ok\n");
+    dense_cancel_single(base);
+    printf("  bq_dense threads==1 cancel under cur_cuts: ok\n");
     snprintf(root, sizeof root, "%s/test_multi-%d", base, (int)getpid());
     snprintf(vol2, sizeof vol2, "%s/test_multi-%d-vol2", base, (int)getpid());
     char cmd[1200];

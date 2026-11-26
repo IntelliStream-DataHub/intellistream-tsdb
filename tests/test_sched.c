@@ -449,13 +449,17 @@ static void cancel_fn(void *arg, int i)
 
 static void test_cancel(void)
 {
+    CHECK(!sched_cancelled());
     sched *s = sched_new(4, 0);
     sgroup g;
     sched_group_begin(s, &g, 0);
+    CHECK(!sched_cancelled());
     cancel_arg c = {.s = s, .g = &g};
     job_init(&c.j, 100000, 50);
     sched_run(s, 4, cancel_fn, &c);
+    CHECK(sched_cancelled());
     sched_group_end(&g);
+    CHECK(!sched_cancelled());
     CHECK(atomic_load(&c.j.stopped) == 1);
     CHECK(atomic_load(&c.j.done) < 100);
     sched_free(s);

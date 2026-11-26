@@ -321,12 +321,13 @@ static inline __attribute__((always_inline)) void feed_rows_as(const twa_q *q, t
     *c = l;
 }
 
-/* The per-row loop, once per method and for float32 on its own: with those known, the compiler keeps the loop's
- * state in registers instead of leaving it to its inlining budget for the whole file. */
+/* The per-row loop, once per method and specialized for float32, float64 and int64: with those known at compile
+ * time, the compiler eliminates the per-row type switch and keeps the loop's state in registers. */
 static void feed_rows(const twa_q *q, twa_cur *c, const int64_t *ts, const uint8_t *v, size_t n)
 {
     twa_q l = *q;
-    if (q->type == TSDB_FLOAT32) {
+    switch (q->type) {
+    case TSDB_FLOAT32:
         l.type = TSDB_FLOAT32;
         l.w = 4;
         if (q->linear) {
@@ -336,12 +337,38 @@ static void feed_rows(const twa_q *q, twa_cur *c, const int64_t *ts, const uint8
             l.linear = false;
             feed_rows_as(&l, c, ts, v, n);
         }
-    } else if (q->linear) {
-        l.linear = true;
-        feed_rows_as(&l, c, ts, v, n);
-    } else {
-        l.linear = false;
-        feed_rows_as(&l, c, ts, v, n);
+        break;
+    case TSDB_FLOAT64:
+        l.type = TSDB_FLOAT64;
+        l.w = 8;
+        if (q->linear) {
+            l.linear = true;
+            feed_rows_as(&l, c, ts, v, n);
+        } else {
+            l.linear = false;
+            feed_rows_as(&l, c, ts, v, n);
+        }
+        break;
+    case TSDB_INT64:
+        l.type = TSDB_INT64;
+        l.w = 8;
+        if (q->linear) {
+            l.linear = true;
+            feed_rows_as(&l, c, ts, v, n);
+        } else {
+            l.linear = false;
+            feed_rows_as(&l, c, ts, v, n);
+        }
+        break;
+    default:
+        if (q->linear) {
+            l.linear = true;
+            feed_rows_as(&l, c, ts, v, n);
+        } else {
+            l.linear = false;
+            feed_rows_as(&l, c, ts, v, n);
+        }
+        break;
     }
 }
 

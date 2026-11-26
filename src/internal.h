@@ -1352,6 +1352,8 @@ void sched_close(sjob *j);
 /* After each item of fn: 0 go on; 1 return now (a helper another group needs); TSDB_ERR_STOPPED the group was
  * cancelled. */
 int sched_leave(void);
+/* Lightweight cancellation check without helper rebalancing side effects. */
+bool sched_cancelled(void);
 /* Decode buffers: cached per helper thread (helpers join and leave often), malloc'd elsewhere. One slot per
  * buffer that is live at once (0..3). */
 void *qscratch_get(int slot, size_t bytes);
@@ -2580,6 +2582,10 @@ typedef struct snapshot {
     uint64_t *mprio; /* per run: its priority on equal timestamps */
     size_t nmem;
     int64_t start, end; /* the range gi/gj were found for */
+    bool borrowed;      /* parts[0..np) are pinned by a qcut: do not part_ref / part_unref */
+    bool parts_owned;   /* parts array itself is heap-allocated and freed on release */
+    part *inline_parts[64];
+    uint32_t inline_gi[64], inline_gj[64];
 } snapshot;
 int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
 void snapshot_release(snapshot *s);
@@ -2592,6 +2598,8 @@ typedef struct qcut {
     struct eng *db;
     part **parts;
     size_t np;
+    bool has_range;
+    int64_t rstart, rend;
     memtable *ms[MAX_FLUSHING + 1]; /* the flushing memtables, oldest first, then the active one */
     size_t nms;
     bool has_active;               /* ms[nms - 1] was the active memtable: read under buf_lock */
@@ -2603,7 +2611,22 @@ typedef struct qcuts {
     pthread_mutex_t lock;
     qcut **c; /* each cut on its own: a pointer handed out stays valid while the array grows */
     size_t n, cap;
+    bool has_range;
+    int64_t rstart, rend;
 } qcuts;
+/* Per-thread route and cut cache during tsdb_query_multi (volumes.c / query.c / multi.c): holds one eng_ref on the
+ * current volume while executing a run of series so consecutive series on the same volume skip t->lock, eng_ref/unref,
+ * and cur_cuts->lock. Released before any blocking wait, user callback delivery, volume switch, or worker exit. */
+typedef struct route_cache {
+    struct tsdb *t;
+    struct eng *e;
+    uint32_t vol;
+    int depth;
+    qcuts *cuts;
+    qcut *cut;
+} route_cache;
+extern __thread route_cache *cur_route;
+void route_cache_release(route_cache *rc);
 /* One engine's cut on its own (latest.c): taken, then released, by the caller; the qcut is not heap-allocated. */
 int cut_take(struct eng *db, qcut *c);
 void cut_release(qcut *c);
@@ -2613,6 +2636,7 @@ void eng_cut_hold(struct eng *db);
 void eng_cut_drop(struct eng *db);
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
 void qcuts_init(qcuts *cs);
+void qcuts_init_range(qcuts *cs, bool has_range, int64_t rstart, int64_t rend);
 void qcuts_free(qcuts *cs);
 uint64_t mem_prio(const snapshot *sn, size_t i);
 /* whether mem run i came from a memtable, not from part granules decoded around tombstones */

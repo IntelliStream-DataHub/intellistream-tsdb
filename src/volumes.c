@@ -1336,12 +1336,77 @@ static bool route_opt(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, bool live)
  * which answer an unknown series with nothing but must not answer a quiesced one that way. */
 static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, true); }
 static bool route_meta(tsdb *t, tsdb_sid id, eng **e, uint32_t *local) { return route_opt(t, id, e, local, false); }
-static bool route_q(tsdb *t, tsdb_sid id, eng **e, uint32_t *local, int *rc)
+
+__thread route_cache *cur_route;
+
+void route_cache_release(route_cache *rc)
 {
-    bool ok = route_opt(t, id, e, local, true);
-    if (!ok && route_rc)
-        *rc = route_rc;
-    return ok;
+    if (!rc)
+        return;
+    if (rc->e)
+        eng_unref(&rc->e);
+    rc->cut = NULL;
+    rc->cuts = NULL;
+}
+
+typedef struct eroute {
+    eng *e;
+    bool own;
+} eroute;
+
+static void eroute_put(eroute *er)
+{
+    if (!er->e)
+        return;
+    if (er->own)
+        eng_unref(&er->e);
+    else {
+        cur_route->depth--;
+        er->e = NULL;
+    }
+}
+#define EROUTE __attribute__((cleanup(eroute_put)))
+
+static bool route_q(tsdb *t, tsdb_sid id, eroute *er, uint32_t *local, int *rc)
+{
+    route_cache *cache = cur_route;
+    int64_t v = sid_volume(id);
+    if (cache && cache->t == t && v >= 0) {
+        if (cache->e && cache->vol == (uint32_t)v && !eng_refused(cache->e)) {
+            uint32_t loc = TSDB_SID_LOCAL(id);
+            if (loc < eng_series_count(cache->e)) {
+                er->e = cache->e;
+                er->own = false;
+                cache->depth++;
+                *local = loc;
+                return true;
+            }
+        }
+        if (cache->depth == 0)
+            route_cache_release(cache);
+    }
+    eng *e = NULL;
+    bool ok = route_opt(t, id, &e, local, true);
+    if (!ok) {
+        if (route_rc)
+            *rc = route_rc;
+        return false;
+    }
+    if (cache && cache->t == t && cache->depth == 0 && v >= 0) {
+        if (cache->e)
+            route_cache_release(cache);
+        cache->e = e;
+        cache->vol = (uint32_t)v;
+        cache->cut = NULL;
+        cache->cuts = NULL;
+        cache->depth = 1;
+        er->e = e;
+        er->own = false;
+    } else {
+        er->e = e;
+        er->own = true;
+    }
+    return true;
 }
 
 /* A follower asked for a name its writer may have created a moment ago: SERIES of the volumes from `from` on,
@@ -2896,18 +2961,18 @@ static int f32_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 int tsdb_query_raw_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_raw_fn fn, void *ctx)
 {
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     qr.sid = series; /* a candidate for the hot-reads list */
     f32_out o = {fn, ctx, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
-        if (eng_series_type(e, local) != TSDB_FLOAT32)
+    if (rc == 0 && route_q(t, series, &er, &local, &rc)) {
+        if (eng_series_type(er.e, local) != TSDB_FLOAT32)
             rc = TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
         else
-            rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+            rc = eng_query_raw_ex(er.e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                                   f32_cb, &o);
     }
     qs_end(&qr, TSDB_FLOAT32, o.rows);
@@ -3003,15 +3068,15 @@ static int vals_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx)
 {
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     qr.sid = series; /* a candidate for the hot-reads list */
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc) && (o.type = eng_series_type(e, local)) >= 0)
-        rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
+    if (rc == 0 && route_q(t, series, &er, &local, &rc) && (o.type = eng_series_type(er.e, local)) >= 0)
+        rc = eng_query_raw_ex(er.e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
                               &o);
     qs_end(&qr, o.type, o.rows);
     free(o.valid);
@@ -3371,7 +3436,7 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
 {
     if (threshold < 3)
         return TSDB_ERR_INVALID;
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
@@ -3380,8 +3445,8 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
     lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
     bool desc = opts && opts->order == TSDB_DESC;
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc) && (o.type = eng_series_type(e, local)) >= 0) {
-        rc = eng_query_lttb(e, local, start, end, threshold, desc, l.limit, l.limit ? lttb_limit_cb : vals_cb,
+    if (rc == 0 && route_q(t, series, &er, &local, &rc) && (o.type = eng_series_type(er.e, local)) >= 0) {
+        rc = eng_query_lttb(er.e, local, start, end, threshold, desc, l.limit, l.limit ? lttb_limit_cb : vals_cb,
                             l.limit ? (void *)&l : &o);
         if (rc == TSDB_ERR_STOPPED && l.limit && l.sent >= l.limit && !l.stopped)
             rc = 0; /* stopped at the limit */
@@ -3403,15 +3468,15 @@ int tsdb_query_lttb(tsdb *t, tsdb_sid series, int64_t start, int64_t end, size_t
 static int query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
-        type = eng_series_type(e, local);
-        rc = eng_query_group(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+    if (rc == 0 && route_q(t, series, &er, &local, &rc)) {
+        type = eng_series_type(er.e, local);
+        rc = eng_query_group(er.e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                              out, nout);
     }
     qs_end(&qr, type, *nout);
@@ -3455,7 +3520,7 @@ int tsdb_query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
 static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                      const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     tsdb_twa_opts def = {0};
     if (!opts)
@@ -3464,9 +3529,9 @@ static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
     qs_begin(t, &qr);
     qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
-        type = eng_series_type(e, local);
-        rc = eng_query_twa(e, local, start, end, bk, opts, out, nout);
+    if (rc == 0 && route_q(t, series, &er, &local, &rc)) {
+        type = eng_series_type(er.e, local);
+        rc = eng_query_twa(er.e, local, start, end, bk, opts, out, nout);
     }
     qs_end(&qr, type, *nout);
     return rc;
@@ -3515,15 +3580,15 @@ int tsdb_query_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
 static int query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                         const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
-    eng *e EREF = NULL;
+    eroute er EROUTE = {0};
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
     qr.sid = series; /* a candidate for the hot-reads list */
     int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
-    if (rc == 0 && route_q(t, series, &e, &local, &rc)) {
-        type = eng_series_type(e, local);
-        rc = eng_query_spread(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+    if (rc == 0 && route_q(t, series, &er, &local, &rc)) {
+        type = eng_series_type(er.e, local);
+        rc = eng_query_spread(er.e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                               out, nout);
     }
     qs_end(&qr, type, *nout);
