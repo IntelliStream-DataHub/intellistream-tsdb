@@ -570,8 +570,13 @@ static int settle_index_as(eng *db, part *p, const ec_record *r, part **out, int
             ecsettle_gc_object(db, r);
         return rc;
     }
-    if (!e->pending[0])
-        snprintf(e->pending, sizeof e->pending, "%.63s", tmp); /* tmp_<pid>_<n>.ec: short */
+    if (!e->pending && (rc = part_set_pending(e, tmp)) != 0) {
+        part_unref(e);
+        unlinkat(db->dirfd, tmp, 0);
+        if (settle_mutant != SETTLE_MUT_GCSKIPOPEN)
+            ecsettle_gc_object(db, r);
+        return rc;
+    }
     *out = e;
     return 0;
 }
@@ -642,7 +647,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
                 dup |= pin[j] == p;
             /* a v8 part (hdr_len) is rewritten alone first (src/merge.c rewrite_alone); ec_index_write refuses it */
             if (dup || p->partition != partition || p->merging || p->settling || p->dropped || part_is_ec(p) ||
-                atomic_load(&p->damaged) || p->ng == 0 || p->hdr_len != sizeof(part_header) || p->pending[0] ||
+                atomic_load(&p->damaged) || p->ng == 0 || p->hdr_len != sizeof(part_header) || p->pending ||
                 (cold && p->level == 0) || !listed_locked(db, p)) /* D18: never an insert-written part in a cluster */
                 continue;
             p->settling = true;
@@ -670,7 +675,8 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         }
         if (rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_READONLY)
             for (size_t i = 0; i < np; i++) { /* nothing written: the temporaries and objects are ours to remove */
-                unlinkat(db->dirfd, ec[i]->pending, 0);
+                if (ec[i]->pending)
+                    unlinkat(db->dirfd, ec[i]->pending, 0);
                 if (settle_mutant != SETTLE_MUT_GCSKIPSWAP)
                     ecgc_unlisted_object(db, ec[i]);
             }
@@ -680,7 +686,8 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         /* STOPPED: the swap unlinked the temporaries and handed their objects to r7-gc; IO: the next open decides */
     } else {
         for (size_t i = 0; i < nec; i++) { /* the ones written before the failure */
-            unlinkat(db->dirfd, ec[i]->pending, 0);
+            if (ec[i]->pending)
+                unlinkat(db->dirfd, ec[i]->pending, 0);
             if (settle_mutant != SETTLE_MUT_GCSKIPELSE)
                 ecgc_unlisted_object(db, ec[i]);
         }
@@ -757,7 +764,7 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
             part *p = sel[i];
             struct ecpart *ep = p ? atomic_load_explicit(&p->ec, memory_order_acquire) : NULL;
             if (!p || p->partition != partition || p->merging || p->settling || p->dropped ||
-                atomic_load(&p->damaged) || p->pending[0] || (ep && ep->test_mark) ||
+                atomic_load(&p->damaged) || p->pending || (ep && ep->test_mark) ||
                 (!ep && p->hdr_len != sizeof(part_header))) {
                 np = 0;
                 break;
@@ -829,7 +836,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
     if (rc == 0 && merged) {
         if (merged->ng > 0) {
             rc = settle_one(db, merged, &out);
-            unlinkat(db->dirfd, merged->pending, 0);
+            if (merged->pending)
+                unlinkat(db->dirfd, merged->pending, 0);
             if (rc == 0 && out)
                 out->written = merged->written;
             part_unref(merged);
@@ -868,7 +876,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
             pthread_mutex_unlock(&db->lock);
         }
         if (rc == TSDB_ERR_INVALID || rc == TSDB_ERR_NOMEM || rc == TSDB_ERR_READONLY) {
-            unlinkat(db->dirfd, out->pending, 0);
+            if (out->pending)
+                unlinkat(db->dirfd, out->pending, 0);
             struct ecpart *ep = atomic_load(&out->ec);
             if (ep) {
                 eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
@@ -876,7 +885,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
             }
         }
     } else if (out) {
-        unlinkat(db->dirfd, out->pending, 0);
+        if (out->pending)
+            unlinkat(db->dirfd, out->pending, 0);
         struct ecpart *ep = atomic_load(&out->ec);
         if (ep) {
             eccache_forget(db->tier, db->tier_vol, ep->rec.oid);
@@ -884,7 +894,8 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
         }
     }
     if (merged) {
-        unlinkat(db->dirfd, merged->pending, 0);
+        if (merged->pending)
+            unlinkat(db->dirfd, merged->pending, 0);
         part_unref(merged);
     }
 

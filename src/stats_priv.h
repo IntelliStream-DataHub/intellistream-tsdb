@@ -49,6 +49,7 @@ typedef struct hotl {
 hotl *hotl_new(void);
 void hotl_free(hotl *h);
 void hotl_add(hotl *h, int64_t epoch, uint64_t id, uint64_t w);
+void hotl_add_batch(hotl *h, int64_t epoch, const uint32_t *ids, const uint64_t *ws, size_t n);
 int64_t hot_now_ms(void); /* wall clock in ms (tests may move it: stats_hot_clock_ms) */
 
 /* A merge of several lists (the mergeable-summaries rule): an id absent from a full list weighs at most that
@@ -273,7 +274,12 @@ void tenant_res_add(struct estats *es, uint32_t t, uint64_t bytes, bool add); /*
 void tenants_grow_to(struct estats *es, uint32_t maxno);                      /* es->mu not held */
 
 /* stats_hot.c */
+typedef struct bpr_ent {
+    uint32_t id;
+    uint64_t val; /* bytes * 1000 / rows */
+} bpr_ent;
 void hot_bpr_run(struct estats *es, uint32_t id, uint64_t rows, uint64_t bytes, bool full);
+void hot_bpr_batch(struct estats *es, const bpr_ent *e, size_t n);
 size_t resident_bytes_range(const uint8_t *p, size_t len); /* bytes of [p, p+len) in the page cache */
 void residency_step(struct estats *es);
 void residency_forget(struct estats *es, prec *r); /* takes its sample out of the tenant totals */

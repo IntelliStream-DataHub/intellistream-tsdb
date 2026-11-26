@@ -3666,6 +3666,192 @@ static void test_query_fastpaths(const char *base)
     rm_rf(dir);
 }
 
+/* P-42 + P-44: db->parts binary search (many parts, duplicate (partition, min_block, max_block),
+ * in-place block-number mutation fallback), cls_classify_active fresh_ids steady-state & transitions,
+ * and struct part layout/isolation checks. */
+static part *make_synth_part(int64_t partition, uint64_t min_b, uint64_t max_b)
+{
+    part *p = calloc(1, sizeof *p);
+    if (!p)
+        return NULL;
+    p->partition = partition;
+    p->min_block = min_b;
+    p->max_block = max_b;
+    p->dirfd = -1;
+    atomic_init(&p->refs, 1);
+    return p;
+}
+
+static void test_parts_bsearch_and_cls(const char *base)
+{
+    /* P-44 layout assertions */
+    CHECK(sizeof(part) <= 1280);
+    CHECK(offsetof(part, min_ts) < 64 && offsetof(part, max_ts) < 64);
+    CHECK(offsetof(part, partition) < 64 && offsetof(part, max_block) < 64);
+    CHECK(offsetof(part, map) < 64 && offsetof(part, verify) < 64);
+    CHECK(offsetof(part, ix) == 64);
+    CHECK(offsetof(part, refs) >= offsetof(part, name) + sizeof(((part *)0)->name) + 64);
+    CHECK(offsetof(part, fail_seq) >= offsetof(part, refs) + sizeof(((part *)0)->refs) + 64);
+
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s/tsdb-p42-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.stats = -1;
+    o.latest_cache = 0;
+    o.merge_threads = 0;
+    o.partition_classes = 1;
+    o.buffer_rows = 1u << 22;
+    o.flush_interval_ms = 600000;
+    eng *db = NULL;
+    OK(eng_open(dir, &o, &db));
+
+    /* 1. db->parts binary search with 200 partitions x 5 parts = 1,000 parts,
+     * including duplicate (partition, min_block, max_block) and same (partition, min_block) with varying max_block. */
+    enum { NPARTITIONS = 200, PER_PART = 5, TOTAL_PARTS = NPARTITIONS * PER_PART };
+    part **ps = calloc(TOTAL_PARTS, sizeof *ps);
+    CHECK(ps != NULL);
+    for (int k = 0; k < NPARTITIONS; k++) {
+        int64_t pk = (int64_t)(k * 4);
+        /* 3 exact duplicates (pk, 10, 20), 1 narrower (pk, 10, 15), 1 higher (pk, 25, 30) */
+        ps[k * PER_PART + 0] = make_synth_part(pk, 10, 20);
+        ps[k * PER_PART + 1] = make_synth_part(pk, 10, 20);
+        ps[k * PER_PART + 2] = make_synth_part(pk, 10, 20);
+        ps[k * PER_PART + 3] = make_synth_part(pk, 10, 15);
+        ps[k * PER_PART + 4] = make_synth_part(pk, 25, 30);
+    }
+    /* Insert in scrambled order via db_parts_insert_locked. */
+    pthread_mutex_lock(&db->lock);
+    for (int i = 0; i < TOTAL_PARTS; i++) {
+        int idx = (i * 397) % TOTAL_PARTS;
+        db_parts_insert_locked(db, ps[idx]);
+    }
+    CHECK(db->nparts == TOTAL_PARTS);
+    /* Verify counts for every existing partition and boundary/gap non-existent partitions. */
+    CHECK(partition_part_count_locked(db, -4) == 0);
+    CHECK(partition_part_count_locked(db, 1) == 0);
+    CHECK(partition_part_count_locked(db, (int64_t)(NPARTITIONS * 4)) == 0);
+    for (int k = 0; k < NPARTITIONS; k++) {
+        CHECK(partition_part_count_locked(db, (int64_t)(k * 4)) == PER_PART);
+        CHECK(partition_part_count_locked(db, (int64_t)(k * 4 + 2)) == 0);
+    }
+    /* Remove middle, first, then last of duplicate (pk, 10, 20) group on partition 400 (k = 100). */
+    part *d0 = ps[100 * PER_PART + 0];
+    part *d1 = ps[100 * PER_PART + 1];
+    part *d2 = ps[100 * PER_PART + 2];
+    db_parts_remove_locked(db, d1);
+    CHECK(partition_part_count_locked(db, 400) == 4);
+    db_parts_remove_locked(db, d0);
+    CHECK(partition_part_count_locked(db, 400) == 3);
+    db_parts_remove_locked(db, d2);
+    CHECK(partition_part_count_locked(db, 400) == 2);
+    /* Removing an already-removed/unlisted part is a safe no-op. */
+    part *ghost = make_synth_part(400, 10, 20);
+    db_parts_remove_locked(db, ghost);
+    CHECK(partition_part_count_locked(db, 400) == 2);
+    part_unref(ghost);
+    /* Defensive fallback: mutate min_block/max_block in place (like SETTLE_MUT_RANKDOWN) and remove. */
+    part *mutp = ps[100 * PER_PART + 4];
+    mutp->min_block = 0;
+    mutp->max_block = 0;
+    db_parts_remove_locked(db, mutp);
+    CHECK(partition_part_count_locked(db, 400) == 1);
+    /* Clean up all remaining synthetic parts before closing db. */
+    while (db->nparts > 0)
+        db_parts_remove_locked(db, db->parts[0]);
+    CHECK(db->nparts == 0);
+    pthread_mutex_unlock(&db->lock);
+    free(ps);
+
+    /* 2. cls_classify_active fresh_ids steady-state, new-series transitions, and overflow fallback. */
+    const uint32_t N0 = 500;
+    uint32_t *ids = malloc(N0 * sizeof *ids);
+    int64_t *ts = malloc(N0 * sizeof *ts);
+    float *vals = malloc(N0 * sizeof *vals);
+    for (uint32_t i = 0; i < N0; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "f.%u", i);
+        OK(eng_series(db, nm, TSDB_FLOAT32, &ids[i]));
+        ts[i] = 1704067200000LL;
+        vals[i] = (float)i;
+    }
+    OK(mem_insert(db, ids, 0, ts, vals, 4, N0, TSDB_FLOAT32));
+    pthread_mutex_lock(&db->buf_lock);
+    CHECK(db->active->nfresh == N0 && !db->active->fresh_overflow);
+    pthread_mutex_unlock(&db->buf_lock);
+
+    static const struct jr_ops dummy_jr = {0};
+    eng_leader_commit(db, UINT64_MAX); /* leader_marker_wait returns immediately for CLASS markers */
+    __atomic_store_n(&db->jr, &dummy_jr, __ATOMIC_RELEASE);
+    OK(cls_classify_active(db));
+    pthread_mutex_lock(&db->buf_lock);
+    CHECK(db->active->nfresh == 0); /* steady state: all 500 decided and pruned */
+    pthread_mutex_unlock(&db->buf_lock);
+    for (uint32_t i = 0; i < N0; i++)
+        CHECK((cls_byte(db, ids[i]) & CLS_DECIDED) != 0);
+
+    /* Appending more rows to decided series keeps nfresh == 0 (O(1) steady state). */
+    __atomic_store_n(&db->jr, NULL, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < N0; i++)
+        ts[i] += 1000;
+    OK(mem_insert(db, ids, 0, ts, vals, 4, N0, TSDB_FLOAT32));
+    pthread_mutex_lock(&db->buf_lock);
+    CHECK(db->active->nfresh == 0);
+    pthread_mutex_unlock(&db->buf_lock);
+    __atomic_store_n(&db->jr, &dummy_jr, __ATOMIC_RELEASE);
+    OK(cls_classify_active(db));
+    __atomic_store_n(&db->jr, NULL, __ATOMIC_RELEASE);
+
+    /* New-series transitions: 1 slow series (80 rows @ 10 min -> class > 0) + 5 short series (1 row -> class 0). */
+    uint32_t slow_id = 0, short_ids[5];
+    OK(eng_series(db, "f.slow", TSDB_FLOAT32, &slow_id));
+    for (int i = 0; i < 5; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "f.short.%d", i);
+        OK(eng_series(db, nm, TSDB_FLOAT32, &short_ids[i]));
+    }
+    int64_t slow_ts[80];
+    float slow_v[80];
+    for (int i = 0; i < 80; i++) {
+        slow_ts[i] = 1704067200000LL + (int64_t)i * 600000LL; /* 1 row / 10 min */
+        slow_v[i] = (float)i;
+    }
+    OK(mem_insert(db, NULL, slow_id, slow_ts, slow_v, 4, 80, TSDB_FLOAT32));
+    int64_t st5[5] = {1704067200000LL, 1704067200000LL, 1704067200000LL, 1704067200000LL, 1704067200000LL};
+    float sv5[5] = {1, 2, 3, 4, 5};
+    OK(mem_insert(db, short_ids, 0, st5, sv5, 4, 5, TSDB_FLOAT32));
+    pthread_mutex_lock(&db->buf_lock);
+    CHECK(db->active->nfresh == 6); /* only the 6 newly added series, not the 500 decided ones */
+    pthread_mutex_unlock(&db->buf_lock);
+    __atomic_store_n(&db->jr, &dummy_jr, __ATOMIC_RELEASE);
+    OK(cls_classify_active(db));
+    __atomic_store_n(&db->jr, NULL, __ATOMIC_RELEASE);
+    CHECK((cls_byte(db, slow_id) & CLS_DECIDED) != 0 && (cls_byte(db, slow_id) & CLS_MASK) > 0);
+    for (int i = 0; i < 5; i++)
+        CHECK((cls_byte(db, short_ids[i]) & CLS_DECIDED) != 0 && (cls_byte(db, short_ids[i]) & CLS_MASK) == 0);
+    pthread_mutex_lock(&db->buf_lock);
+    CHECK(db->active->nfresh == 0);
+    /* Verify fresh_overflow fallback still classifies new series cleanly. */
+    db->active->fresh_overflow = true;
+    pthread_mutex_unlock(&db->buf_lock);
+    uint32_t ov_id = 0;
+    OK(eng_series(db, "f.overflow", TSDB_FLOAT32, &ov_id));
+    OK(mem_insert(db, NULL, ov_id, slow_ts, slow_v, 4, 80, TSDB_FLOAT32));
+    __atomic_store_n(&db->jr, &dummy_jr, __ATOMIC_RELEASE);
+    OK(cls_classify_active(db));
+    __atomic_store_n(&db->jr, NULL, __ATOMIC_RELEASE);
+    CHECK((cls_byte(db, ov_id) & CLS_DECIDED) != 0 && (cls_byte(db, ov_id) & CLS_MASK) > 0);
+
+    __atomic_store_n(&db->jr, NULL, __ATOMIC_RELEASE);
+    free(ids);
+    free(ts);
+    free(vals);
+    OK(eng_close(db));
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_tsdb", 1200);
@@ -3733,6 +3919,8 @@ int main(int argc, char **argv)
     test_series_lockfree_mt(base);
     printf("query & merge fast paths (P-31/P-32/P-45)\n");
     test_query_fastpaths(base);
+    printf("parts bsearch, cls fresh_ids, and struct part layout (P-42/P-44)\n");
+    test_parts_bsearch_and_cls(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

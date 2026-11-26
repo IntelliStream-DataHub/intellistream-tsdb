@@ -2180,6 +2180,157 @@ static void test_large_insert_reuses_buffers(const char *base)
 #define HUNG_FS_TEST(fn, base) fn(base)
 #endif
 
+typedef struct mv_thr_arg {
+    tsdb *db;
+    tsdb_sid sids[4];
+    int tid;
+    atomic_bool *stop;
+    atomic_int *ok_cnt;
+    atomic_int *unavail_cnt;
+    atomic_int *bad_rc;
+} mv_thr_arg;
+
+static void *mv_writer_fn(void *arg)
+{
+    mv_thr_arg *a = arg;
+    enum { BATCH = 128 };
+    tsdb_sid s[BATCH];
+    int64_t t[BATCH];
+    float v[BATCH];
+    int64_t seq = (int64_t)(a->tid + 1) * 1000000ll;
+    while (!atomic_load_explicit(a->stop, memory_order_relaxed)) {
+        for (int i = 0; i < BATCH; i++) {
+            s[i] = a->sids[i & 3];
+            t[i] = T0 + seq++;
+            v[i] = (float)(i + a->tid);
+        }
+        int rc = tsdb_insert(a->db, s, t, v, BATCH);
+        if (rc == 0)
+            atomic_fetch_add_explicit(a->ok_cnt, 1, memory_order_relaxed);
+        else if (rc == TSDB_ERR_UNAVAILABLE)
+            atomic_fetch_add_explicit(a->unavail_cnt, 1, memory_order_relaxed);
+        else
+            atomic_store_explicit(a->bad_rc, rc, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+/* P-33: multi-volume insert_slots outside t->lock under error paths, >64 volumes, and concurrent quiesce/idle
+ * (verifying zero eng_ref leaks on any refusal or race). */
+static void test_multivol_insert_quiesce(const char *base)
+{
+    char top[512], root[600], vdir[640];
+    snprintf(top, sizeof top, "%s/tsdb-mvq-%d", base, (int)getpid());
+    remove_tree(top);
+    CHECK(mkdir(top, 0755) == 0);
+    snprintf(root, sizeof root, "%s/root", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.stats = -1;
+    o.wal_sync_ms = 100;
+    o.merge_threads = 0;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+
+    tsdb_sid sids[4];
+    for (int i = 0; i < 4; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "mv.s%d", i);
+        if (i == 0) {
+            OK(tsdb_series_at(db, nm, NULL, &sids[i]));
+        } else {
+            snprintf(vdir, sizeof vdir, "%s/v%d", top, i);
+            OK(tsdb_series_at(db, nm, vdir, &sids[i]));
+        }
+    }
+
+    /* Refusal on quiesced volume mid-batch must release eng_ref on earlier volumes and write nothing. */
+    OK(tsdb_volume_quiesce(db, 2));
+    CHECK(tsdb_volume_idle(db, 2, 2000) == 0);
+    tsdb_sid bs[4] = {sids[1], sids[2], sids[3], sids[0]};
+    int64_t bt[4] = {T0, T0 + 1, T0 + 2, T0 + 3};
+    float bv[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    CHECK(tsdb_insert(db, bs, bt, bv, 4) == TSDB_ERR_UNAVAILABLE);
+    /* If vol 1 leaked an eng_ref when vol 2 refused, quiesce+idle on vol 1 would time out. */
+    OK(tsdb_volume_quiesce(db, 1));
+    CHECK(tsdb_volume_idle(db, 1, 2000) == 0);
+    OK(tsdb_volume_resume(db, 1));
+    OK(tsdb_volume_resume(db, 2));
+    for (int i = 0; i < 4; i++) {
+        tsdb_points pts;
+        OK(tsdb_query_points(db, sids[i], INT64_MIN, INT64_MAX, &pts));
+        CHECK(pts.n == 0);
+        tsdb_points_free(&pts);
+    }
+
+    /* Invalid local ID and out-of-range volume ID in multi-volume batch: zero writes, zero eng_ref leaks. */
+    tsdb_sid bad_loc[2] = {sids[1], TSDB_SID(3, 9999)};
+    CHECK(tsdb_insert(db, bad_loc, bt, bv, 2) == TSDB_ERR_INVALID);
+    tsdb_sid bad_vol[2] = {sids[1], TSDB_SID(99, 0)};
+    CHECK(tsdb_insert(db, bad_vol, bt, bv, 2) == TSDB_ERR_INVALID);
+    OK(tsdb_volume_quiesce(db, 1));
+    CHECK(tsdb_volume_idle(db, 1, 2000) == 0);
+    OK(tsdb_volume_resume(db, 1));
+
+    /* Concurrent multi-volume writers racing repeated quiesce/idle/resume across volumes 1..3. */
+    atomic_bool stop = false;
+    atomic_int ok_cnt = 0, unavail_cnt = 0, bad_rc = 0;
+    pthread_t th[4];
+    mv_thr_arg args[4];
+    for (int i = 0; i < 4; i++) {
+        args[i] = (mv_thr_arg){.db = db, .tid = i, .stop = &stop, .ok_cnt = &ok_cnt, .unavail_cnt = &unavail_cnt,
+                               .bad_rc = &bad_rc};
+        memcpy(args[i].sids, sids, sizeof sids);
+        CHECK(pthread_create(&th[i], NULL, mv_writer_fn, &args[i]) == 0);
+    }
+    for (int round = 0; round < 18; round++) {
+        size_t v = (size_t)(1 + (round % 3));
+        OK(tsdb_volume_quiesce(db, v));
+        CHECK(tsdb_volume_idle(db, v, 5000) == 0);
+        usleep(1000);
+        OK(tsdb_volume_resume(db, v));
+        usleep(1000);
+    }
+    atomic_store(&stop, true);
+    for (int i = 0; i < 4; i++)
+        pthread_join(th[i], NULL);
+    CHECK(atomic_load(&bad_rc) == 0);
+    CHECK(atomic_load(&ok_cnt) > 0);
+    for (size_t v = 1; v <= 3; v++) {
+        OK(tsdb_volume_quiesce(db, v));
+        CHECK(tsdb_volume_idle(db, v, 5000) == 0);
+        OK(tsdb_volume_resume(db, v));
+    }
+
+    /* Exercise the nv > 64 heap-allocation path in insert_slots. */
+    tsdb_sid s67 = 0;
+    for (int v = 4; v <= 67; v++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "mv.h%d", v);
+        snprintf(vdir, sizeof vdir, "%s/v%d", top, v);
+        tsdb_sid tmp = 0;
+        OK(tsdb_series_at(db, nm, vdir, &tmp));
+        if (v == 67)
+            s67 = tmp;
+    }
+    tsdb_sid hs[2] = {sids[0], s67};
+    int64_t ht[2] = {T0 + 50000000ll, T0 + 50000001ll};
+    float hv[2] = {11.5f, 22.5f};
+    OK(tsdb_insert(db, hs, ht, hv, 2));
+    tsdb_points pts;
+    OK(tsdb_query_points(db, s67, INT64_MIN, INT64_MAX, &pts));
+    CHECK(pts.n == 1 && pts.values[0] == 22.5f);
+    tsdb_points_free(&pts);
+    OK(tsdb_volume_quiesce(db, 67));
+    CHECK(tsdb_volume_idle(db, 67, 2000) == 0);
+    OK(tsdb_volume_resume(db, 67));
+
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  multi-volume insert_slots under concurrent quiesce/idle and >64 volumes: zero eng_ref leaks\n");
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_volumes", 1200);
@@ -2480,6 +2631,7 @@ int main(int argc, char **argv)
     test_duplicate_name(base);
     test_wal_replay(base);
     test_large_insert_reuses_buffers(base);
+    test_multivol_insert_quiesce(base);
 
     if (system(cmd) != 0)
         return 1;

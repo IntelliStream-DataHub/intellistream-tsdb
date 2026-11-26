@@ -260,15 +260,15 @@ typedef struct ev {
 #define REQ_FIELDS                                                                                                     \
     struct req *next;                                                                                                  \
     struct conn *c;                                                                                                    \
-    uint32_t id;                                                                                                       \
-    uint8_t op;                                                                                                        \
-    bool cancelled;     /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */                           \
     uint8_t *payload;   /* 16-byte aligned: inline_data[], owned_buf + IN_HDR_PAD + 9, or fjob payload */              \
     uint8_t *owned_buf; /* non-NULL on zero-copy large-frame transfer: freed via tsdb_free_big */                      \
     size_t owned_cap;   /* allocation size of owned_buf (for tsdb_free_big and req_mem.held) */                        \
     size_t len;                                                                                                        \
     struct req *mnext; /* the next QUERY_MULTI in the connection's queue (main thread) */                              \
-    int64_t t_arr;     /* when the event loop read it (CLOCK_MONOTONIC ns): a forward's age counts from here */
+    int64_t t_arr;     /* when the event loop read it (CLOCK_MONOTONIC ns): a forward's age counts from here */        \
+    uint32_t id;                                                                                                       \
+    uint8_t op;                                                                                                        \
+    bool cancelled; /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */
 
 struct req_fields {
     REQ_FIELDS
@@ -277,10 +277,11 @@ struct req_fields {
 typedef struct req {
     REQ_FIELDS
     /* Pad so inline_data is 16-byte aligned when malloc returns 16-byte aligned memory. */
-    uint8_t align_pad[16 - (sizeof(struct req_fields) % 16)];
+    uint8_t align_pad[16 - ((offsetof(struct req_fields, cancelled) + sizeof(bool)) % 16)];
     uint8_t inline_data[];
 } req;
 _Static_assert(offsetof(req, inline_data) % 16 == 0, "req inline_data must be 16-byte aligned");
+_Static_assert(offsetof(req, inline_data) == 80, "req header size regression");
 
 /* What a request costs beyond its payload: the struct and allocation overhead. Counted with the payload, so frames
  * without one (9 bytes on the wire) cannot pile up uncounted. */

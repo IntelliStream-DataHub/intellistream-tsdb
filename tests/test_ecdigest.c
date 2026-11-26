@@ -354,7 +354,7 @@ static int settle_first(tw *x)
     if (rc == 0)
         CHECK((rc = part_open_ec(db, tmp, ecname, &e)) == 0 && e);
     if (rc == 0) {
-        snprintf(e->pending, sizeof e->pending, "%.63s", tmp);
+        CHECK(part_set_pending(e, tmp) == 0);
         CHECK((rc = ec_swap_commit(db, &p, &e, 1)) == 0);
         part_unref(e);
     }

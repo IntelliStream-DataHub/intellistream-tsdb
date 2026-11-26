@@ -822,57 +822,12 @@ static inline uint32_t gix_run_of(const gix *x, uint32_t i)
 }
 
 typedef struct part {
-    char name[96];
-    int dirfd;
+    /* Query-hot read-only fields packed into cache line 0 (bytes 0..63), followed immediately by
+     * gix ix whose run-table pointers (e, rser, rstart, n, nruns, stride) sit in cache line 1 (P-44). */
+    int64_t min_ts, max_ts;
     int64_t partition;
     uint64_t min_block, max_block;
-    uint32_t level;
-    uint32_t grows; /* granule_rows the part was written with */
-    uint64_t wal_seq;
-    uint64_t fno_lo, fno_hi; /* the header's position range of the rows (0, 0: none); 0 in a format-8 part */
-    int64_t written_ms;      /* the header's write time; 0 in a format-8 part */
-    uint32_t hdr_len;        /* sizeof(part_header), or PART_HDR_V8 for a part an upgrade carried over */
     const uint8_t *map;
-    size_t map_len;
-    gix ix; /* the granule index, in the map */
-    uint32_t ng;
-    const tomb *t; /* the part's tombstones (in the map, or in icopy); NULL when none */
-    uint8_t *icopy; /* pin_index: the index and tombstones, copied when checked; NULL: read in the map */
-    size_t pinned;  /* bytes of icopy */
-    uint32_t nt;
-    uint64_t index_off, index_len, index_hash; /* as the open checked them (part_index_intact) */
-    uint64_t rows;
-    int64_t min_ts, max_ts;
-    bool verify; /* queries check each granule's checksum (tsdb_options.verify_checksums) */
-    time_t created;
-    time_t written; /* when its newest rows were inserted: a merge keeps its sources' (after a reopen, created) */
-    /* refs is bumped/dropped by every concurrent snapshot/query: explicit 64-byte padding keeps it off the
-     * cache lines of read-hot min_ts/max_ts/verify and the lock-protected fields below, without over-aligning
-     * struct part (which is allocated with calloc). */
-    char pad_refs_pre[64];
-    atomic_int refs;
-    char pad_refs_post[64];
-    /* protected by tsdb.lock */
-    bool merging;
-    bool dropped;
-    bool settling; /* R7: a settle has taken it (db->lock, like merging): out of merges, rewrites and TTL selection until
-                    * the swap lists its .ec or the settle is abandoned */
-    bool reencoding; /* R10: a re-encode has taken it (db->lock, with settling set too): counted as a merge in
-                      * db_wait_merges backpressure while normal merges still treat it as a barrier */
-    atomic_bool damaged; /* its index no longer matches the open's checksum, or a merge could not decode one of its
-                          * granules: out of merges and drops (part_checked, part_mark_payload) */
-    atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
-    uint64_t fail_seq;       /* db->merge_fail_seq when a merge that took it as a source last failed (db->lock) */
-    uint64_t merge_len_gen;  /* db->ret_len_gen when a merge selected it (db->lock) */
-    uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
-    int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
-    atomic_bool obsolete; /* delete the file when the last reference goes */
-    bool retired; /* set before obsolete: the file is retired_<name> (db_retire_locked), not <name> */
-    char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
-    /* the latest table's fold list (latest.c): per series of this pending part, its newest non-null row and the range
-     * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
-    struct lfold *lf;
-    size_t nlf;
     /* R7 (src/ecpart.h): NULL for a .part. Set for an .ec part, whose map holds the source's header, index, tombstones
      * and footer verbatim (the granule bytes are in the chunk store, read through ec_granule_read), and for a part
      * eng_test_mark_ec marked in a test (its bytes are still in the map). Set before the part is listed and, but for
@@ -880,7 +835,83 @@ typedef struct part {
      * statistics' sweeper and sampler, queries, merges): NULL or the whole ecpart. Freed by part_unref
      * (ecgc_last_unref). */
     _Atomic(struct ecpart *) ec;
+    uint32_t hdr_len; /* sizeof(part_header), or PART_HDR_V8 for a part an upgrade carried over */
+    bool verify;      /* queries check each granule's checksum (tsdb_options.verify_checksums) */
+    gix ix;           /* the granule index, in the map */
+    /* Secondary / open-time read-only fields (descending alignment: 8 B -> 4 B -> 1 B) */
+    size_t map_len;
+    const tomb *t;  /* the part's tombstones (in the map, or in icopy); NULL when none */
+    uint8_t *icopy; /* pin_index: the index and tombstones, copied when checked; NULL: read in the map */
+    size_t pinned;  /* bytes of icopy */
+    uint64_t index_off, index_len, index_hash; /* as the open checked them (part_index_intact) */
+    uint64_t rows;
+    uint64_t wal_seq;
+    uint64_t fno_lo, fno_hi; /* the header's position range of the rows (0, 0: none); 0 in a format-8 part */
+    int64_t written_ms;      /* the header's write time; 0 in a format-8 part */
+    time_t created;
+    time_t written; /* when its newest rows were inserted: a merge keeps its sources' (after a reopen, created) */
+    /* the latest table's fold list (latest.c): per series of this pending part, its newest non-null row and the range
+     * of its nulls, made by the part writer; the publisher folds and frees it (NULL when the table is off) */
+    struct lfold *lf;
+    size_t nlf;
+    char *pending; /* heap-allocated tmp file name while awaiting commit, freed and NULL after commit */
+    uint32_t ng;
+    uint32_t nt;
+    uint32_t level;
+    uint32_t grows; /* granule_rows the part was written with */
+    int dirfd;
+    char name[96];
+    /* refs is bumped/dropped by every concurrent snapshot/query: explicit 64-byte padding keeps it off the
+     * cache lines of read-only fields above and the lock-protected fields below, without over-aligning
+     * struct part (which is allocated with calloc). */
+    char pad_refs_pre[64];
+    atomic_int refs;
+    char pad_refs_post[64];
+    /* protected by db->lock or atomic (descending alignment: 8 B -> 4 B -> 1 B) */
+    uint64_t fail_seq;      /* db->merge_fail_seq when a merge that took it as a source last failed (db->lock) */
+    uint64_t merge_len_gen; /* db->ret_len_gen when a merge selected it (db->lock) */
+    int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
+    uint32_t ttl_gen;         /* retention generation ttl_any/ttl_all were computed for; 0: never */
+    bool merging;
+    bool dropped;
+    bool settling;   /* R7: a settle has taken it (db->lock, like merging): out of merges, rewrites and TTL selection until
+                      * the swap lists its .ec or the settle is abandoned */
+    bool reencoding; /* R10: a re-encode has taken it (db->lock, with settling set too): counted as a merge in
+                      * db_wait_merges backpressure while normal merges still treat it as a barrier */
+    atomic_bool damaged;     /* its index no longer matches the open's checksum, or a merge could not decode one of its
+                              * granules: out of merges and drops (part_checked, part_mark_payload) */
+    atomic_bool wait_logged; /* db_wait_merges said once that inserts no longer wait for this damaged part's partition */
+    atomic_bool obsolete;    /* delete the file when the last reference goes */
+    bool retired;            /* set before obsolete: the file is retired_<name> (db_retire_locked), not <name> */
 } part;
+_Static_assert(sizeof(part) <= 1280, "struct part layout regression");
+_Static_assert(offsetof(part, verify) < 64, "query-hot part fields must sit in cache line 0");
+_Static_assert(offsetof(part, ix) == 64, "part.ix must start on cache line 1");
+_Static_assert(offsetof(part, refs) >= offsetof(part, name) + sizeof(((part *)0)->name) + 64,
+               "part.refs must stay isolated from read-only fields");
+_Static_assert(offsetof(part, fail_seq) >= offsetof(part, refs) + sizeof(((part *)0)->refs) + 64,
+               "part.refs must stay isolated from mutable fields");
+
+/* Sets p->pending to a heap copy of `name` (or frees and NULLs it when name is NULL or empty). */
+static inline int part_set_pending(part *p, const char *name)
+{
+    free(p->pending);
+    p->pending = NULL;
+    if (!name || !*name)
+        return 0;
+    size_t n = strlen(name) + 1;
+    p->pending = malloc(n);
+    if (!p->pending)
+        return TSDB_ERR_NOMEM;
+    memcpy(p->pending, name, n);
+    return 0;
+}
+
+static inline void part_clear_pending(part *p)
+{
+    free(p->pending);
+    p->pending = NULL;
+}
 
 
 /* What gx_load decodes besides the count: the fields a reader uses, so a hot loop pays only for those (each field
@@ -1484,6 +1515,9 @@ typedef struct memtable {
     bool s_map; /* s is an anonymous mapping (zero pages, grown by mremap: mt_reserve); else malloc'd */
     uint32_t *ids; /* series present, first-insert order */
     uint32_t nids, idcap;
+    uint32_t *fresh_ids;       /* undecided series registered in m (cls_classify_active O(1) steady state, P-42) */
+    uint32_t nfresh, fresh_cap;
+    bool fresh_overflow;       /* OOM growing fresh_ids: fall back to scanning ids */
     mt_chunk *chunks;          /* arena chunks (head is active bump chunk), freed in bulk by mt_unref */
     size_t chunk_next;         /* next chunk target size (64 KiB -> 256 KiB -> 1 MiB -> 4 MiB) */
     void *free_blk[MT_SLAB_N]; /* recycled arena blocks per size class (4..128 rows) */

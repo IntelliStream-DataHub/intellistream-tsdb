@@ -95,7 +95,11 @@ struct tsdb {
      * back, each engine holds its own (tier_want before every engine open below) */
     struct tier *tier;
     uint64_t id;
+    /* Keep t->lock on its own 64-byte cache line away from read-only handle fields above and
+     * read-hot vols/paths/nvols below (explicit padding keeps calloc UBSan-clean). */
+    char pad_lock_pre[64];
     pthread_rwlock_t lock; /* the arrays below; written when volumes are added */
+    char pad_lock_post[64];
     eng **vols;
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
@@ -143,6 +147,10 @@ struct tsdb {
     void (*test_precommit)(void *); /* tsdb_test_precommit (lock), copied to every volume */
     void *test_precommit_arg;
 };
+_Static_assert(offsetof(struct tsdb, lock) >= offsetof(struct tsdb, id) + sizeof(((struct tsdb *)0)->id) + 64,
+               "tsdb.lock must stay isolated from preceding fields");
+_Static_assert(offsetof(struct tsdb, vols) >= offsetof(struct tsdb, lock) + sizeof(((struct tsdb *)0)->lock) + 64,
+               "tsdb.lock must stay isolated from hot vols/nvols fields");
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -2575,51 +2583,46 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     uint32_t *ls = eng_insert_scratch(0, n * sizeof *ls);
     if (!ls)
         return TSDB_ERR_NOMEM;
-    pthread_rwlock_rdlock(&t->lock);
-    size_t nv = t->nvols;
-    /* every id first: an unknown one fails the whole batch before any volume writes a row */
+    /* Run the single-volume narrowing pass before acquiring t->lock so O(N) work never holds
+     * the handle rwlock (P-33). */
     bool one = true; /* every row in one volume: the engine takes it as it is, with the ids narrowed */
+    int64_t v0 = 0;
+    uint32_t top = 0;
     if (n) {
         /* the usual batch, every row in the first row's volume: one pass that vectorizes, then one check */
         uint64_t hi = series[0] >> 32, diff = 0;
-        uint32_t top = 0;
         for (size_t i = 0; i < n; i++) {
             ls[i] = TSDB_SID_LOCAL(series[i]);
             top = ls[i] > top ? ls[i] : top;
             diff |= (series[i] >> 32) ^ hi;
         }
-        int64_t v0 = sid_volume(series[0]);
+        v0 = sid_volume(series[0]);
         one = diff == 0;
-        if (one && v0 >= 0 && (size_t)v0 < nv && !t->vols[v0]) {
-            pthread_rwlock_unlock(&t->lock);
-            return t->cluster && t->cnames[v0] ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
-        }
-        if (one && (v0 < 0 || (size_t)v0 >= nv || top >= eng_series_count(t->vols[v0]))) {
-            pthread_rwlock_unlock(&t->lock);
-            return TSDB_ERR_INVALID;
-        }
-    }
-    /* rows of several volumes: each id on its own; counts only grow, so one read per run of rows in a volume does */
-    int64_t lastv = -1;
-    uint32_t lim = 0;
-    for (size_t i = 0; !one && i < n; i++) {
-        int64_t v = sid_volume(series[i]);
-        if (v != lastv) {
-            if (v < 0 || (size_t)v >= nv || !t->vols[v]) {
-                bool held_elsewhere = v >= 0 && (size_t)v < nv && t->cluster && t->cnames[v];
-                pthread_rwlock_unlock(&t->lock);
-                return held_elsewhere ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
-            }
-            lim = eng_series_count(t->vols[v]);
-            lastv = v;
-        }
-        if (TSDB_SID_LOCAL(series[i]) >= lim) {
-            pthread_rwlock_unlock(&t->lock);
-            return TSDB_ERR_INVALID;
-        }
     }
     if (one) {
-        eng *e EREF = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
+        if (n && v0 < 0)
+            return TSDB_ERR_INVALID;
+        pthread_rwlock_rdlock(&t->lock);
+        size_t nv = t->nvols;
+        size_t vi = n ? (size_t)v0 : 0;
+        if (n && vi >= nv) {
+            pthread_rwlock_unlock(&t->lock);
+            return TSDB_ERR_INVALID;
+        }
+        if (n && !t->vols[vi]) {
+            bool held_elsewhere = t->cluster && t->cnames[vi];
+            pthread_rwlock_unlock(&t->lock);
+            return held_elsewhere ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
+        }
+        if (n && top >= eng_series_count(t->vols[vi])) {
+            pthread_rwlock_unlock(&t->lock);
+            return TSDB_ERR_INVALID;
+        }
+        eng *e EREF = vi < nv ? t->vols[vi] : NULL;
+        if (!e) {
+            pthread_rwlock_unlock(&t->lock);
+            return 0;
+        }
         if (eng_refused(e))
             e = NULL, route_rc = TSDB_ERR_UNAVAILABLE;
         else
@@ -2627,59 +2630,144 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         pthread_rwlock_unlock(&t->lock);
         return e ? eng_insert(e, type, ls, ts, values, n) : TSDB_ERR_UNAVAILABLE;
     }
-    size_t *cnt = calloc(nv + 1, sizeof *cnt);
+    /* Multi-volume batch (!one, n >= 2): count rows and max local id per volume outside t->lock,
+     * briefly lock t->lock only to validate touched volumes and take eng_ref()s, then unlock
+     * immediately before running the O(N) scatter passes and eng_insert() calls. */
+    size_t nv = 0;
+    size_t cnt_s[65], pos_s[64];
+    uint32_t max_loc_s[64], touched_s[64];
+    eng *vols_s[64];
+    size_t *cnt = NULL, *pos = NULL;
+    uint32_t *max_loc = NULL, *touched = NULL;
+    eng **vols = NULL;
+    size_t ntouched = 0, nrefd = 0;
+    int rc = 0;
+    for (;;) {
+        pthread_rwlock_rdlock(&t->lock);
+        nv = t->nvols;
+        pthread_rwlock_unlock(&t->lock);
+        if (nv <= 64) {
+            cnt = cnt_s;
+            max_loc = max_loc_s;
+            touched = touched_s;
+            vols = vols_s;
+            pos = pos_s;
+            memset(cnt, 0, (nv + 1) * sizeof *cnt);
+            if (nv)
+                memset(vols, 0, nv * sizeof *vols);
+        } else {
+            cnt = calloc(nv + 1, sizeof *cnt);
+            max_loc = malloc(nv * sizeof *max_loc);
+            touched = malloc(nv * sizeof *touched);
+            vols = calloc(nv, sizeof *vols);
+            pos = malloc(nv * sizeof *pos);
+            if (!cnt || !max_loc || !touched || !vols || !pos) {
+                rc = TSDB_ERR_NOMEM;
+                goto cleanup;
+            }
+        }
+        ntouched = 0;
+        bool saw_oob = false;
+        for (size_t i = 0; i < n; i++) {
+            int64_t v = sid_volume(series[i]);
+            if (v < 0) {
+                rc = TSDB_ERR_INVALID;
+                break;
+            }
+            if ((size_t)v >= nv) {
+                saw_oob = true;
+                break;
+            }
+            uint32_t loc = TSDB_SID_LOCAL(series[i]);
+            if (cnt[v + 1] == 0) {
+                touched[ntouched++] = (uint32_t)v;
+                max_loc[v] = loc;
+            } else if (loc > max_loc[v]) {
+                max_loc[v] = loc;
+            }
+            cnt[v + 1]++;
+        }
+        if (rc != 0)
+            goto cleanup;
+        pthread_rwlock_rdlock(&t->lock);
+        if (saw_oob && t->nvols > nv) {
+            /* A volume was added concurrently while we counted; retry with the larger nv. */
+            pthread_rwlock_unlock(&t->lock);
+            if (nv > 64) {
+                free(cnt);
+                free(max_loc);
+                free(touched);
+                free(vols);
+                free(pos);
+                cnt = NULL, max_loc = NULL, touched = NULL, vols = NULL, pos = NULL;
+            }
+            continue;
+        }
+        /* every id first: an unknown one fails the whole batch before any volume writes a row */
+        for (size_t ti = 0; ti < ntouched; ti++) {
+            uint32_t v = touched[ti];
+            if (!t->vols[v]) {
+                rc = (t->cluster && t->cnames[v]) ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_INVALID;
+                break;
+            }
+            if (max_loc[v] >= eng_series_count(t->vols[v])) {
+                rc = TSDB_ERR_INVALID;
+                break;
+            }
+        }
+        if (rc == 0 && saw_oob)
+            rc = TSDB_ERR_INVALID;
+        /* a reference on every volume that has rows; one quiesced, or a cluster volume held here as a replica
+         * (it takes records only), refuses the call before any volume is written */
+        if (rc == 0) {
+            for (size_t ti = 0; ti < ntouched; ti++) {
+                uint32_t v = touched[ti];
+                eng *e = t->vols[v];
+                if (t->crole && t->crole[v] == CVOL_REPLICA) {
+                    rc = TSDB_ERR_READONLY;
+                    break;
+                }
+                if (eng_refused(e)) {
+                    rc = TSDB_ERR_UNAVAILABLE;
+                    break;
+                }
+                vols[v] = eng_ref(e);
+                nrefd = ti + 1;
+            }
+        }
+        pthread_rwlock_unlock(&t->lock);
+        break;
+    }
+    if (rc != 0)
+        goto cleanup;
     int64_t *lt = eng_insert_scratch(1, n * sizeof *lt);
     uint8_t *lv = eng_insert_scratch(2, n * w);
-    int rc = (!cnt || !lt || !lv) ? TSDB_ERR_NOMEM : 0;
-    if (rc == 0) {
-        for (size_t i = 0; i < n; i++)
-            cnt[TSDB_SID_VOLUME(series[i]) + 1]++;
-        for (size_t v = 1; v <= nv; v++)
-            cnt[v] += cnt[v - 1];
-        size_t *pos = malloc(nv * sizeof *pos);
-        if (!pos) {
-            rc = TSDB_ERR_NOMEM;
-        } else {
-            memcpy(pos, cnt, nv * sizeof *pos);
-            for (size_t i = 0; i < n; i++) { /* stable: later rows stay later */
-                size_t o = pos[TSDB_SID_VOLUME(series[i])]++;
-                ls[o] = TSDB_SID_LOCAL(series[i]);
-                lt[o] = ts[i];
-                memcpy(lv + o * w, (const uint8_t *)values + i * w, w);
-            }
-            free(pos);
-        }
-    }
-    eng **vols = malloc(nv * sizeof *vols);
-    bool *refd = calloc(nv, sizeof *refd);
-    if (vols && refd)
-        memcpy(vols, t->vols, nv * sizeof *vols);
-    /* a reference on every volume that has rows; one quiesced, or a cluster volume held here as a replica (it takes
-     * records only), refuses the call before any volume is written */
-    for (size_t v = 0; vols && refd && v < nv; v++) {
-        if (cnt[v + 1] == cnt[v])
-            continue;
-        if (t->crole && t->crole[v] == CVOL_REPLICA)
-            rc = rc ? rc : TSDB_ERR_READONLY;
-        else if (eng_refused(vols[v]))
-            rc = rc ? rc : TSDB_ERR_UNAVAILABLE;
-        else
-            eng_ref(vols[v]), refd[v] = true;
-    }
-    if (!refd)
-        free(vols), vols = NULL;
-    pthread_rwlock_unlock(&t->lock);
-    for (size_t v = 0; rc == 0 && vols && v < nv; v++)
-        if (refd[v])
-            rc = eng_insert(vols[v], type, ls + cnt[v], lt + cnt[v], lv + cnt[v] * w, cnt[v + 1] - cnt[v]);
-    if (!vols && rc == 0)
+    if (!lt || !lv) {
         rc = TSDB_ERR_NOMEM;
-    for (size_t v = 0; vols && v < nv; v++)
-        if (refd[v])
-            eng_unref(&vols[v]);
-    free(refd);
-    free(vols);
-    free(cnt);
+        goto cleanup;
+    }
+    for (size_t v = 1; v <= nv; v++)
+        cnt[v] += cnt[v - 1];
+    memcpy(pos, cnt, nv * sizeof *pos);
+    for (size_t i = 0; i < n; i++) { /* stable: later rows stay later */
+        size_t o = pos[TSDB_SID_VOLUME(series[i])]++;
+        ls[o] = TSDB_SID_LOCAL(series[i]);
+        lt[o] = ts[i];
+        memcpy(lv + o * w, (const uint8_t *)values + i * w, w);
+    }
+    for (size_t v = 0; rc == 0 && v < nv; v++)
+        if (vols[v])
+            rc = eng_insert(vols[v], type, ls + cnt[v], lt + cnt[v], lv + cnt[v] * w, cnt[v + 1] - cnt[v]);
+cleanup:
+    for (size_t ti = 0; ti < nrefd; ti++)
+        eng_unref(&vols[touched[ti]]);
+    if (nv > 64) {
+        free(cnt);
+        free(max_loc);
+        free(touched);
+        free(vols);
+        free(pos);
+    }
     return rc;
 }
 

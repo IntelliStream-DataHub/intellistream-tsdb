@@ -177,9 +177,8 @@ void hotl_free(hotl *h)
     free(h);
 }
 
-void hotl_add(hotl *h, int64_t epoch, uint64_t id, uint64_t w)
+static void hotl_roll_locked(hotl *h, int64_t epoch)
 {
-    pthread_mutex_lock(&h->mu);
     if (epoch != h->epoch) {
         if (epoch == h->epoch + 1) {
             h->cur ^= 1; /* the old current window is the previous one now; the old previous one is reused */
@@ -190,7 +189,31 @@ void hotl_add(hotl *h, int64_t epoch, uint64_t id, uint64_t w)
         }
         h->epoch = epoch;
     }
+}
+
+void hotl_add(hotl *h, int64_t epoch, uint64_t id, uint64_t w)
+{
+    pthread_mutex_lock(&h->mu);
+    hotl_roll_locked(h, epoch);
     ss_add(&h->w[h->cur], id, w);
+    pthread_mutex_unlock(&h->mu);
+}
+
+void hotl_add_batch(hotl *h, int64_t epoch, const uint32_t *ids, const uint64_t *ws, size_t n)
+{
+    if (n == 0)
+        return;
+    pthread_mutex_lock(&h->mu);
+    bool rolled = false;
+    for (size_t i = 0; i < n; i++) {
+        if (!ws[i])
+            continue;
+        if (!rolled) {
+            hotl_roll_locked(h, epoch);
+            rolled = true;
+        }
+        ss_add(&h->w[h->cur], ids[i], ws[i]);
+    }
     pthread_mutex_unlock(&h->mu);
 }
 
@@ -337,6 +360,16 @@ void hot_bpr_run(struct estats *es, uint32_t id, uint64_t rows, uint64_t bytes, 
         return;
     pthread_mutex_lock(&es->mu);
     ss_set(&es->bpr, id, bytes * 1000 / rows);
+    pthread_mutex_unlock(&es->mu);
+}
+
+void hot_bpr_batch(struct estats *es, const bpr_ent *e, size_t n)
+{
+    if (n == 0)
+        return;
+    pthread_mutex_lock(&es->mu);
+    for (size_t i = 0; i < n; i++)
+        ss_set(&es->bpr, e[i].id, e[i].val);
     pthread_mutex_unlock(&es->mu);
 }
 

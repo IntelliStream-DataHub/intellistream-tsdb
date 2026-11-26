@@ -1142,7 +1142,12 @@ static int swap_first_p0(eng *db)
     }
     ec->verify = in->verify;
     snprintf(ec->name, sizeof ec->name, "%.*s.ec", (int)(strlen(in->name) - 5), in->name);
-    snprintf(ec->pending, sizeof ec->pending, "%s", tmp);
+    if (part_set_pending(ec, tmp) != 0) {
+        unlinkat(db->dirfd, tmp, 0);
+        part_unref(ec);
+        part_unref(in);
+        return TSDB_ERR_NOMEM;
+    }
     struct ecpart *ep = calloc(1, sizeof *ep);
     if (!ep) {
         unlinkat(db->dirfd, tmp, 0);

@@ -249,7 +249,7 @@ static bool args_valid(part **in, part **ec, size_t n)
     int64_t key = 0;
     for (size_t i = 0; i < n; i++) {
         part *p = in[i], *e = ec[i];
-        if (!p || !e || p == e || !part_file_name(p->name) || !ec_tmp_name(e->pending) || !ec_file_name(e->name) ||
+        if (!p || !e || p == e || !part_file_name(p->name) || !e->pending || !ec_tmp_name(e->pending) || !ec_file_name(e->name) ||
             !same_stem(p->name, e->name) || !atomic_load(&e->ec) || atomic_load(&p->ec) ||
             p->partition != e->partition || p->min_block != e->min_block || p->max_block != e->max_block ||
             p->level != e->level)
@@ -280,7 +280,8 @@ static void swap_discard(eng *db, const char *intent, part **ec, size_t n)
     if (eng_check(db))
         return;
     for (size_t i = 0; i < n; i++) {
-        unlinkat(db->dirfd, ec[i]->pending, 0);
+        if (ec[i]->pending)
+            unlinkat(db->dirfd, ec[i]->pending, 0);
         if (settle_mutant == SETTLE_MUT_GCEARLY) /* the bug: the chunks go while the intent can still roll forward */
             ecgc_unlisted_object(db, ec[i]);
     }
@@ -418,7 +419,7 @@ int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
     if (renamed) {
         for (size_t i = 0; i < n; i++) {
             part_ref(ec[i]);
-            ec[i]->pending[0] = '\0';
+            part_clear_pending(ec[i]);
             if (at[i] < db->nparts && db->parts[at[i]] == in[i]) {
                 db->parts[at[i]] = ec[i]; /* the same key and block range: the same place in the order */
                 if (ecswap_mutant != SWAP_MUT_NOSTATS) { /* the third change of the list beside insert and remove */
@@ -482,10 +483,10 @@ static bool reencode_args_valid(part **in, size_t nin, part *out)
         return false;
     bool out_ec = atomic_load(&out->ec) != NULL;
     if (out_ec) {
-        if (!ec_tmp_name(out->pending) || !ec_file_name(out->name))
+        if (!out->pending || !ec_tmp_name(out->pending) || !ec_file_name(out->name))
             return false;
     } else {
-        if (out->ng != 0 || !part_tmp_name(out->pending) || !part_file_name(out->name))
+        if (out->ng != 0 || !out->pending || !part_tmp_name(out->pending) || !part_file_name(out->name))
             return false;
     }
     uint64_t min_b = UINT64_MAX, max_b = 0;
@@ -545,7 +546,8 @@ static void swap_discard_reencode(eng *db, part *out)
 {
     if (eng_check(db))
         return;
-    unlinkat(db->dirfd, out->pending, 0);
+    if (out->pending)
+        unlinkat(db->dirfd, out->pending, 0);
     if (ecswap_discard_hook)
         ecswap_discard_hook(db);
     struct ecpart *ep = atomic_load(&out->ec);
@@ -671,7 +673,7 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
             part_unref(in[i]); /* the list's reference; caller holds its own */
         }
         part_ref(out);
-        out->pending[0] = '\0';
+        part_clear_pending(out);
         if (base + nin <= db->nparts) {
             db->parts[base] = out;
             if (nin > 1)

@@ -38,15 +38,16 @@ typedef struct user_verifier {
 /* A grant, normalized: a glob that is a name or a prefix is stored as one (A24), a run of '*' as one '*', and only
  * '*', '?' and '\' escaped, so that two globs of one set compare equal more often (never less soundly). */
 typedef struct user_grant {
-    uint8_t kind, rights;
-    uint16_t len;
-    char *sel;       /* NUL-terminated; a glob in its escaped form */
-    char *lit;       /* glob: the literal prefix (bytes before the first wildcard), unescaped */
-    uint16_t lit_len;
-    char *suf;       /* glob: the literal suffix (bytes after the last wildcard), unescaped */
-    uint16_t suf_len;
+    char *sel;              /* NUL-terminated; a glob in its escaped form */
+    char *lit;              /* glob: the literal prefix (bytes before the first wildcard), unescaped */
+    char *suf;              /* glob: the literal suffix (bytes after the last wildcard), unescaped */
     struct glob_prog *prog; /* glob: compiled for glob_match's linear run (users.c) */
+    uint16_t len;
+    uint16_t lit_len;
+    uint16_t suf_len;
+    uint8_t kind, rights;
 } user_grant;
+_Static_assert(sizeof(user_grant) == 40, "user_grant must stay packed without padding holes");
 
 struct umatch;
 struct glob_prog;
