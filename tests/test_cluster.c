@@ -20686,16 +20686,28 @@ static void scen_rdma(void)
            di.spec[0] ? di.spec : "auto-ib", 150 + BIG);
 }
 
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define OPENFAST_SAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define OPENFAST_SAN 1
+#else
+#define OPENFAST_SAN 0
+#endif
+#else
+#define OPENFAST_SAN 0
+#endif
+
 /* openfast: a restarted replica reports its new open_gen promptly (cluster_beat_soon in cvol.c:prepare) instead of
- * waiting a full heartbeat_ms, and the Raft leader proposes REPLICA_OPEN for a newly reported replica on the next duty
- * tick instead of blocking behind a global 1 s opens_ns throttle from another replica's earlier proposal. */
+ * waiting a full heartbeat_ms, and the Raft leader proposes REPLICA_OPEN for newly reported replicas on the next duty
+ * tick instead of blocking behind a global 1 s opens_ns throttle from an earlier proposal. */
 static void scen_openfast(void)
 {
     scenario("openfast");
     for (int i = 0; i < 3; i++)
         start(i);
-    init_heartbeat_ms = 3000;
-    init_node_timeout_ms = 15000;
+    init_heartbeat_ms = 5000;
+    init_node_timeout_ms = 25000;
     init_cluster(0, 600);
     init_heartbeat_ms = 0;
     init_node_timeout_ms = 0;
@@ -20709,10 +20721,10 @@ static void scen_openfast(void)
         die("volume add fast: %s, number %" PRIu32, cluster_strerror(rc), num);
     for (int i = 0; i < 3; i++)
         await_open_gen(0, "fast", i, 1, 0);
-    /* Kill both followers so the second restart runs immediately after the first's REPLICA_OPEN proposal. */
+    /* Part 1: kill only follower 1 so Raft quorum stays intact (no election interference) and check that prepare()
+     * wakes heartbeat immediately instead of waiting heartbeat_ms (5000 ms). */
     stop(1, SIGKILL);
-    stop(2, SIGKILL);
-    struct timespec w20 = {0, 20000000}, w50 = {0, 50000000};
+    struct timespec w20 = {0, 20000000};
     start(1);
     await_log_count(1, "open generation 2, waiting", 1, 15000);
     uint64_t t1 = now_ms();
@@ -20726,34 +20738,50 @@ static void scen_openfast(void)
         nanosleep(&w20, NULL);
     }
     uint64_t dt1 = now_ms() - t1;
-    if (dt1 > 1500)
-        die("node 1 open_gen 2 took %" PRIu64 " ms (> 1500 ms with heartbeat_ms=3000): prepare() did not wake heartbeat",
-            dt1);
-    nanosleep(&w50, NULL);
-    start(2);
-    await_log_count(2, "open generation 2, waiting", 1, 15000);
+    uint64_t cap1 = OPENFAST_SAN ? 3000 : 2000;
+    if (dt1 > cap1)
+        die("node 1 open_gen 2 took %" PRIu64 " ms (> %" PRIu64
+            " ms with heartbeat_ms=5000): prepare() did not wake heartbeat",
+            dt1, cap1);
+    /* Part 2: with all 3 nodes up (quorum intact, no process restart latency), create 6 sequential 3-replica volumes,
+     * waiting for every replica to record open_gen 1 before creating the next. Under the old global 1 s opens_ns gate
+     * in propose_opens(), each volume after the first waits at least 1000 ms (strict lower bound >= 5000 ms total). */
     uint64_t t2 = now_ms();
-    for (;;) {
-        struct meta_volume v;
-        const struct meta_replica *r;
-        if (vol_rec(0, "fast", &v) && (r = rep_of(&v, 2)) && r->open_gen >= 2)
-            break;
-        if (now_ms() - t2 > 15000)
-            die("node 2 never recorded open_gen 2 within 15 s");
-        nanosleep(&w20, NULL);
+    for (int k = 1; k <= 6; k++) {
+        char vn[16];
+        snprintf(vn, sizeof vn, "fast%d", k);
+        uint32_t vnum = 0;
+        rc = vol_add(0, vn, 3, &vnum);
+        if (rc != 0)
+            die("volume add %s: %s", vn, cluster_strerror(rc));
+        for (;;) {
+            struct meta_volume v;
+            int all_open = 1;
+            if (vol_rec(0, vn, &v)) {
+                for (int i = 0; i < 3; i++) {
+                    const struct meta_replica *r = rep_of(&v, i);
+                    if (!r || r->open_gen < 1)
+                        all_open = 0;
+                }
+            } else {
+                all_open = 0;
+            }
+            if (all_open)
+                break;
+            if (now_ms() - t2 > 30000)
+                die("%s never recorded open_gen 1 on all 3 replicas within 30 s", vn);
+            nanosleep(&w20, NULL);
+        }
     }
     uint64_t dt2 = now_ms() - t2;
-    uint64_t cap2 = 750;
-#if defined(__SANITIZE_THREAD__)
-    cap2 = 900;
-#endif
+    uint64_t cap2 = OPENFAST_SAN ? 4500 : 3500;
     if (dt2 > cap2)
-        die("node 2 open_gen 2 took %" PRIu64 " ms (> %" PRIu64
-            " ms immediately after node 1's proposal): propose_opens() global throttle?",
+        die("6 sequential volumes took %" PRIu64 " ms (> %" PRIu64
+            " ms): propose_opens() global throttle?",
             dt2, cap2);
     stop_all();
-    printf("  openfast: restarted followers recorded open_gen 2 in %" PRIu64 " ms and %" PRIu64
-           " ms (heartbeat_ms=3000)\n",
+    printf("  openfast: restarted follower recorded open_gen 2 in %" PRIu64 " ms (heartbeat_ms=5000); 6 sequential "
+           "volumes opened all 3 replicas in %" PRIu64 " ms\n",
            dt1, dt2);
 }
 

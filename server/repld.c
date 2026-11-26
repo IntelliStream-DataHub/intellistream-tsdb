@@ -100,6 +100,7 @@
 #include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1672,9 +1673,11 @@ static void on_link(void *arg, struct plink *l, int up)
         for (uint32_t i = 0; i < nw; i++) {
             struct rvol *rv = wake_vols[i];
             pthread_mutex_lock(&rv->mu);
-            int wake = rv->mode == M_REPLICA && rv->fetch_wait_until != 0 && rv->rec.leader == peer;
-            if (wake)
+            int wake = 0;
+            if (rv->mode == M_REPLICA && rv->rec.leader == peer) {
                 rv->fetch_ms = 0;
+                wake = rv->fetch_wait_until != 0;
+            }
             pthread_mutex_unlock(&rv->mu);
             if (wake)
                 post(rv, IN_WAKE, 0, NULL, 0);
@@ -2458,8 +2461,9 @@ static void do_sync(struct rvol *rv)
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
         missing = 0;
     }
-    int fetch_sent = 0;
-    if (missing && (strcmp(name, rv->fetch_name) || now - rv->fetch_ms >= 1000)) {
+    bool fetch_tried = false, fetch_sent = false;
+    if (missing && (strcmp(name, rv->fetch_name) != 0 || rv->fetch_ms == 0 || now - rv->fetch_ms >= 1000)) {
+        fetch_tried = true;
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
         uint8_t b[RW_NAME_MAX + 24 + RW_CHECK];
@@ -2470,7 +2474,7 @@ static void do_sync(struct rvol *rv)
                     mpos, rv->rec.leader);
             snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
             rv->fetch_ms = now;
-            fetch_sent = 1;
+            fetch_sent = true;
         }
     }
     if (still_missing && rv->mode == M_REPLICA) {
@@ -2478,7 +2482,7 @@ static void do_sync(struct rvol *rv)
          * leader link reconnect), new WAL appends/cuts, leader changes (IN_META), or the retry timer wake it. */
         if (G.fetch_late && now < rv->fetch_late_ms + FETCH_LATE_MS) {
             rv->fetch_wait_until = rv->fetch_late_ms + FETCH_LATE_MS;
-        } else if (missing && !fetch_sent && strcmp(name, rv->fetch_name) != 0) {
+        } else if (fetch_tried && !fetch_sent) {
             rv->fetch_wait_until = now + 100;
         } else {
             uint64_t next = rv->fetch_ms + 1000;

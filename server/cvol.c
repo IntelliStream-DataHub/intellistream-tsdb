@@ -174,15 +174,19 @@ static void prepare(const struct cluster_vol_rec *r)
                 r->number, r->name, m.gen);
         }
     }
+    int stored = 0;
     pthread_mutex_lock(&M.mu);
     struct mvol *old = mv_get(r->number); /* MV_REPREP: prepared again after an install */
     if (old) {
         m.installed = old->installed;
         *old = m;
-    } else if (M.nvols < CLUSTER_REPORT_VOLS)
+        stored = 1;
+    } else if (M.nvols < CLUSTER_REPORT_VOLS) {
         M.vols[M.nvols++] = m;
+        stored = 1;
+    }
     pthread_mutex_unlock(&M.mu);
-    if (m.state == MV_WAIT)
+    if (stored && m.state == MV_WAIT)
         cluster_beat_soon(); /* report the new open generation at the next duty tick instead of waiting heartbeat_ms */
 }
 

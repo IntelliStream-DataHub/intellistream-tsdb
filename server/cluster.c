@@ -6049,6 +6049,7 @@ struct open_sent {
 };
 static struct open_sent open_sent[OPEN_SENT_CAP];
 static uint32_t nopen_sent, open_sent_rot;
+static uint64_t open_sent_term;
 
 static void propose_opens(uint64_t now)
 {
@@ -6057,13 +6058,28 @@ static void propose_opens(uint64_t now)
     if (C.hold_opens && access(C.holdopensfile, F_OK) == 0)
         return; /* tests: a replica that opened before the group recorded its generation is caught here */
     uint64_t term = raft_get_term(C.r);
+    if (term != open_sent_term) {
+        nopen_sent = 0;
+        open_sent_rot = 0;
+        open_sent_term = term;
+    } else if (nopen_sent) {
+        uint32_t dst = 0;
+        for (uint32_t j = 0; j < nopen_sent; j++)
+            if (open_sent[j].term == term && since(now, open_sent[j].ns) < OPEN_RETRY_NS)
+                open_sent[dst++] = open_sent[j];
+        nopen_sent = dst;
+        if (nopen_sent < OPEN_SENT_CAP)
+            open_sent_rot = 0;
+    }
     static struct cluster_report own;
     int have_own = 0;
-    for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
+    for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER && raft_get_term(C.r) == term;
+         i++) {
         const struct meta_volume *v = &C.sm.volumes[i];
         if (v->kind != META_VOL_REPLICATED)
             continue;
-        for (uint32_t k = 0; k < v->nrep; k++) {
+        for (uint32_t k = 0; k < v->nrep && C.r && raft_get_role(C.r) == RAFT_LEADER && raft_get_term(C.r) == term;
+             k++) {
             const struct meta_replica *rp = &v->rep[k];
             const struct cluster_vol_report *vr = NULL;
             if (rp->node == C.id) {
@@ -7173,6 +7189,9 @@ static void *cluster_main(void *arg)
 int cluster_start(const struct cluster_cfg *cfg)
 {
     memset(&C, 0, sizeof C);
+    nopen_sent = 0;
+    open_sent_rot = 0;
+    open_sent_term = 0;
     atomic_store(&g_users_ok, cl_mutant() == CLM_CAUGHTUPEARLY);
     if (cfg->secret_len < CLUSTER_SECRET_MIN || cfg->secret_len > CLUSTER_SECRET_MAX) {
         fprintf(stderr, "tsdbd: cluster: the secret must have %d to %d bytes\n", CLUSTER_SECRET_MIN,

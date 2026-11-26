@@ -2147,9 +2147,9 @@ static long long classes_most(void)
 }
 
 /* kvr's replica set as the metadata group holds it (R4: it changes under churn and a reset): the record of the copy
- * with the highest (set_version, epoch) among the running nodes' copies. node[k] is the index of rep[k]'s node in the
- * table (-1: not in it), learner[k] its learner flag, isr_has[k] whether it is in the ISR. 0, or -1 when no node
- * answered or the volume is not in the copy. */
+ * with the highest (set_version, epoch, applied) among the running nodes' copies. node[k] is the index of rep[k]'s
+ * node in the table (-1: not in it), learner[k] its learner flag, isr_has[k] whether it is in the ISR. 0, or -1 when
+ * no node answered or the volume is not in the copy. */
 struct rrec {
     int nrep, node[META_REPLICAS_MAX], learner[META_REPLICAS_MAX], isr_has[META_REPLICAS_MAX], leader;
     int moving; /* a learner with `replaces` is in the set: a move is in flight */
@@ -2170,6 +2170,7 @@ static int rep_rec_get(struct rrec *o)
     memset(o, 0, sizeof *o);
     o->leader = -1;
     int have = 0;
+    uint64_t best_applied = 0;
     for (int i = 0; i < nn; i++) {
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
@@ -2178,10 +2179,14 @@ static int rep_rec_get(struct rrec *o)
             continue;
         for (uint32_t k = 0; k < v.m.nvolumes; k++) {
             const struct meta_volume *mv = &v.m.volumes[k];
-            if (mv->number != rep_number || (have && (mv->set_version < o->set_version ||
-                                                      (mv->set_version == o->set_version && mv->epoch <= o->epoch))))
+            if (mv->number != rep_number)
+                continue;
+            if (have && (mv->set_version < o->set_version ||
+                         (mv->set_version == o->set_version &&
+                          (mv->epoch < o->epoch || (mv->epoch == o->epoch && v.m.applied <= best_applied)))))
                 continue;
             have = 1;
+            best_applied = v.m.applied;
             memset(o, 0, sizeof *o);
             o->set_version = mv->set_version;
             o->epoch = mv->epoch;
@@ -3333,6 +3338,14 @@ static int rep_follower_pick(void)
 
 static int hold_hi(int cap_ms) { return seconds * 200 < 5000 ? 5000 : seconds * 200 > cap_ms ? cap_ms : seconds * 200; }
 
+static int is_rep_node(int node)
+{
+    for (int r = 0; r < rep_n; r++)
+        if (rep_nodes[r] == node)
+            return 1;
+    return 0;
+}
+
 static uint64_t rrec_open_gen(const struct rrec *r, int node)
 {
     for (int k = 0; k < r->nrep && k < META_REPLICAS_MAX; k++)
@@ -3345,7 +3358,7 @@ static uint64_t rrec_open_gen(const struct rrec *r, int node)
  * meanwhile; once both are back every acknowledged write must be there: the checks of the workload and the end. */
 static void nem_kill2(void)
 {
-    int a = pick_node(1), b = -1, hit_rep = 0;
+    int a = pick_node(1), b = -1;
     /* The case this nemesis is for: two of kvr's replicas down, so the volume has no quorum and the minority that
      * is left holds acknowledged writes. By chance that is about a third of the rounds, so the first round of a run
      * with kvr and every other one at even odds takes two of its replicas (counted, and required at the end). The
@@ -3354,20 +3367,28 @@ static void nem_kill2(void)
         int r1 = rnd_range(0, rep_n - 1), r2 = (r1 + rnd_range(1, rep_n - 1)) % rep_n;
         a = rep_nodes[r1];
         b = rep_nodes[r2];
-        kill2_rep++;
-        hit_rep = 1;
     }
     for (int t = 0; t < 8 && (b < 0 || b == a); t++)
         b = pick_node(0);
     if (b < 0 || b == a)
         b = (a + rnd_range(1, nn - 1)) % nn;
+    int hit_rep = want_rep && is_rep_node(a) && is_rep_node(b);
+    if (hit_rep)
+        kill2_rep++;
     uint64_t ga = 0, gb = 0;
     if (hit_rep) {
         struct rrec pre;
-        if (rep_rec_get(&pre) == 0) {
-            ga = rrec_open_gen(&pre, a);
-            gb = rrec_open_gen(&pre, b);
+        for (int t = 0; t < 25 && (ga == 0 || gb == 0); t++) {
+            check_unexpected_exits();
+            if (rep_rec_get(&pre) == 0) {
+                ga = rrec_open_gen(&pre, a);
+                gb = rrec_open_gen(&pre, b);
+            }
+            if (ga == 0 || gb == 0)
+                usleep(200000);
         }
+        if (ga == 0 || gb == 0)
+            die(1, "kill2: could not read pre-kill open_gen for kvr replicas %d and %d", a, b);
     }
     pid_t pa, pb;
     node_snap(a, &pa, NULL, NULL);
