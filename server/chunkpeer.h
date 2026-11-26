@@ -104,6 +104,7 @@ struct chunkpeer *chunkpeer_cluster(void);
 int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);
 
 /* Per-storage-server read hedging and read-avoid counters (E31; /metrics and unit tests). */
+#define CHUNKPEER_PEERS_MAX 256
 struct chunkpeer_peer_stats {
     uint32_t peer;
     uint64_t reads;         /* CS_OP_READ calls sent to this peer */

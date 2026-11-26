@@ -64,6 +64,9 @@ struct fake {
     atomic_uint read_delay_max[NM + 1];  /* 0: unlimited; >0: delay only the first max READs to node */
     atomic_uint read_delay_seen[NM + 1]; /* READs delayed so far on node */
     atomic_uint read_calls[NM + 1];      /* total CS_OP_READ calls received by node */
+    atomic_int read_fail_stripe[NM + 1]; /* >=0: fail CS_OP_READ on this stripe index (cell_off / fail_cell) */
+    atomic_int read_delay_stripe[NM + 1]; /* >=0: apply read_delay_ms only on this stripe index; <0: all stripes */
+    atomic_uint fail_cell;               /* cell size used with read_fail_stripe / read_delay_stripe */
     pthread_cond_t hcv;
     struct chunkpeer_view view;
     pthread_mutex_t mu;
@@ -97,8 +100,13 @@ static int f_call(void *arg, uint32_t node, const struct cs_req *r, int tmo, int
     }
     if (r->op == CS_OP_READ) {
         atomic_fetch_add(&F.read_calls[node], 1);
+        int fs = atomic_load(&F.read_fail_stripe[node]);
+        uint32_t fc = atomic_load(&F.fail_cell);
+        if (fs >= 0 && fc > 0 && r->off / fc == (uint64_t)fs)
+            return TSDB_ERR_UNAVAILABLE;
         int dms = atomic_load(&F.read_delay_ms[node]);
-        if (dms > 0) {
+        int ds = atomic_load(&F.read_delay_stripe[node]);
+        if (dms > 0 && (ds < 0 || (fc > 0 && r->off / fc == (uint64_t)ds))) {
             unsigned max = atomic_load(&F.read_delay_max[node]);
             bool do_delay = max == 0 || atomic_fetch_add(&F.read_delay_seen[node], 1) < max;
             if (do_delay) {
@@ -205,11 +213,14 @@ static void cluster_up(const char *name, char *dir, size_t cap)
     atomic_store(&F.garble, 0);
     atomic_store(&F.flip_byte, 0);
     atomic_store(&F.read_timeout, 0);
+    atomic_store(&F.fail_cell, 0);
     for (uint32_t i = 0; i <= NM; i++) {
         atomic_store(&F.read_delay_ms[i], 0);
         atomic_store(&F.read_delay_max[i], 0);
         atomic_store(&F.read_delay_seen[i], 0);
         atomic_store(&F.read_calls[i], 0);
+        atomic_store(&F.read_fail_stripe[i], -1);
+        atomic_store(&F.read_delay_stripe[i], -1);
     }
     chunkpeer_hedge_reset();
 #ifdef TSDB_TEST_HOOKS
@@ -814,6 +825,7 @@ static void test_hedge_bucket(void)
 static void test_hedge_avoid(void)
 {
 #ifndef TSDB_TEST_HOOKS
+    printf("  test_hedge_avoid: SKIPPED (TSDB_TEST_HOOKS=0)\n");
     return;
 #else
     char dir[PATH_MAX];
@@ -884,11 +896,215 @@ static void test_hedge_avoid(void)
     CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
     CHECK(atomic_load(&F.read_calls[1]) == calls_before + 1);
 
+    /* Short avoid duration (< 10 s window): timeouts arriving during read-avoid are ignored and expiry starts a
+     * fresh window so a single timeout right after expiry cannot immediately re-trigger read-avoid. */
+    chunkpeer_hedge_reset();
+    chunkpeer_test_avoid_ms = 2000;
+    atomic_store(&F.read_delay_ms[1], 35);
+    atomic_store(&F.read_timeout, 1u << 1);
+    for (int i = 0; i < 8; i++) {
+        atomic_fetch_add(&fake_clock_ms, 50);
+        CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    }
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+    atomic_fetch_add(&fake_clock_ms, 2001); /* avoid expired, still < 10 s since earlier timeouts */
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &st) && st.read_avoid == 0);
+    chunkpeer_test_avoid_ms = 0;
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_timeout, 0);
+
     coldops_peer.obj_close(h);
     obj_free(&o);
     coldops_peer.ctx_free(ctx);
     cluster_down();
 #endif
+}
+
+/* E31: p_obj_open() while a peer is in read-avoid skips CS_OP_SUMS (no 200 ms FAN_GRACE_MS stall), handles both
+ * rec_sums != NULL and rec_sums == NULL, and resumes direct reads after read-avoid expires. */
+static void test_hedge_open_avoid(void)
+{
+#ifndef TSDB_TEST_HOOKS
+    printf("  test_hedge_open_avoid: SKIPPED (TSDB_TEST_HOOKS=0)\n");
+    return;
+#else
+    char dir[PATH_MAX];
+    cluster_up("hedgeopenav", dir, sizeof dir);
+    atomic_store(&fake_clock_ms, 200000);
+    chunkpeer_test_now_ms = f_now_ms;
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+    obj o;
+    obj_make(&o, 2u << 20, 25);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h0 = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h0) == 0 && h0);
+    uint8_t buf[4096];
+    chunk_report rep;
+
+    /* Drive node 1 into read-avoid. */
+    atomic_store(&F.read_delay_ms[1], 35);
+    atomic_store(&F.read_timeout, 1u << 1);
+    for (int i = 0; i < 8; i++) {
+        atomic_fetch_add(&fake_clock_ms, 100);
+        CHECK(coldops_peer.obj_read(h0, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    }
+    chunkpeer_quiesce();
+    coldops_peer.obj_close(h0);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_timeout, 0);
+    struct chunkpeer_peer_stats st;
+    CHECK(peer_stat(1, &st) && st.read_avoid == 1);
+
+    /* Hang node 1 completely: p_obj_open() MUST skip CS_OP_SUMS on node 1 (completing well below FAN_GRACE_MS=200ms). */
+    atomic_store(&F.hang, 1u << 1);
+    cold_obj *h_rec = NULL, *h_norec = NULL;
+    uint64_t t0 = mono_ms();
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h_rec) == 0 && h_rec);
+    uint64_t dt_rec = mono_ms() - t0;
+    CHECK(dt_rec < 150);
+
+    t0 = mono_ms();
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, NULL, &h_norec) == 0 && h_norec);
+    uint64_t dt_norec = mono_ms() - t0;
+    CHECK(dt_norec < 150);
+
+    /* Both handles decode around node 1 without calling node 1 while avoided. */
+    unsigned calls_before = atomic_load(&F.read_calls[1]);
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(coldops_peer.obj_read(h_norec, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before);
+
+    /* Release hang and expire read-avoid: h_rec (opened with rec_sums != NULL) resumes direct reads to node 1. */
+    pthread_mutex_lock(&F.mu);
+    atomic_store(&F.hang, 0);
+    pthread_cond_broadcast(&F.hcv);
+    pthread_mutex_unlock(&F.mu);
+    atomic_fetch_add(&fake_clock_ms, 30001);
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before + 1);
+    /* Non-RAW on h_rec also works directly (uses o->rec sums). */
+    CHECK(coldops_peer.obj_read(h_rec, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 0);
+    CHECK(atomic_load(&F.read_calls[1]) == calls_before + 2);
+
+    coldops_peer.obj_close(h_rec);
+    coldops_peer.obj_close(h_norec);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+#endif
+}
+
+/* Regression tests for degrade() isolation (exact decoded_cells attribution, zero nested hedges during degrade()),
+ * failed-hedge short-circuit (no duplicate reads of surviving positions), and per-stripe bad_mask reset. */
+static void test_hedge_degrade_and_stripes(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("hedgedegrade", dir, sizeof dir);
+    void *ctx = make_ctx();
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+
+    /* 3-stripe object (cell = 64 KiB, k = 4, m = 2 -> 768 KiB total). */
+    obj o;
+    memset(&o, 0, sizeof o);
+    for (int i = 0; i < 16; i++)
+        o.oid[i] = (uint8_t)(26 * 16 + i);
+    uint32_t cell = 64u << 10;
+    uint64_t total_len = 3ull * 4ull * cell;
+    o.bytes = malloc(total_len);
+    for (uint64_t i = 0; i < total_len; i++)
+        o.bytes[i] = (uint8_t)(i % 251 == 0 ? rnd() : i * 11 + 26);
+    CHECK(chunk_geom_make(&o.g, 4, 2, cell, total_len) == 0);
+    o.sums = calloc(chunk_sums_total(&o.g), sizeof *o.sums);
+    CHECK(put(ctx, &o, 5) == 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open(ctx, o.oid, &o.g, o.sums, &h) == 0 && h);
+
+    uint8_t buf[4096];
+    chunk_report rep;
+    struct chunkpeer_peer_stats s1, s2;
+
+    /* 1. pos=0 (node 1) and pos=1 (node 2) both DOWN while reading ONLY pos=0:
+     *    decoded_cells must be attributed solely to node 1 (+1), NOT node 2 (+0). */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, (1u << 1) | (1u << 2));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 1);
+    CHECK(!peer_stat(2, &s2) || s2.decoded_cells == 0);
+
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 2);
+    CHECK(!peer_stat(2, &s2) || s2.decoded_cells == 0);
+
+    /* 2. pos=0 (node 1) DOWN, survivor pos=1 (node 2) SLOW (80 ms):
+     *    degrade() reads pos=1 synchronously -> ZERO nested hedges on node 2 and exact attribution on node 1. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.down, 1u << 1);
+    atomic_store(&F.read_delay_ms[2], 80);
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(buf, o.bytes, sizeof buf) == 0 && rep.decoded_cells == 1);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &s1) && s1.decoded_cells == 1);
+    CHECK(peer_stat(2, &s2) && s2.hedges == 0 && s2.decoded_cells == 0);
+    atomic_store(&F.read_delay_ms[2], 0);
+    atomic_store(&F.down, 0);
+
+    /* 3. Failed hedge does NOT re-read surviving positions a second time in outer degrade(). */
+    chunkpeer_hedge_reset();
+    for (uint32_t n = 1; n <= NM; n++)
+        atomic_store(&F.read_calls[n], 0);
+    atomic_store(&F.read_delay_ms[1], 50);
+    atomic_store(&F.read_timeout, (1u << 1) | (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, CHUNK_RR_RAW, &rep) == TSDB_ERR_UNAVAILABLE);
+    chunkpeer_quiesce();
+    for (uint32_t n = 1; n <= NM; n++)
+        CHECK(atomic_load(&F.read_calls[n]) <= 1);
+
+    /* E15 with failed hedge: primary fails with IOERR (not DOWN) while 2 survivors are DAMAGED -> CORRUPT. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.read_timeout, 0);
+    atomic_store(&F.ioerr, 1u << 1);
+    atomic_store(&F.flip_byte, (1u << 2) | (1u << 3));
+    CHECK(coldops_peer.obj_read(h, 0, sizeof buf, buf, 0, &rep) == TSDB_ERR_CORRUPT);
+    chunkpeer_quiesce();
+    atomic_store(&F.ioerr, 0);
+    atomic_store(&F.flip_byte, 0);
+    atomic_store(&F.read_delay_ms[1], 0);
+
+    /* 4. Multi-stripe bad_mask reset: node 2 fails on stripe 0, node 3 fails on stripe 1, node 1 is slow (220 ms)
+     *    on stripe 2 -> bad_mask resets per stripe so stripe 2's hedge succeeds using healthy nodes 2..6. */
+    chunkpeer_hedge_reset();
+    atomic_store(&F.fail_cell, cell);
+    atomic_store(&F.read_fail_stripe[2], 0);
+    atomic_store(&F.read_fail_stripe[3], 1);
+    atomic_store(&F.read_delay_ms[1], 220);
+    atomic_store(&F.read_delay_stripe[1], 2);
+    uint8_t *big = malloc(total_len);
+    CHECK(big != NULL);
+    CHECK(coldops_peer.obj_read(h, 0, total_len, big, CHUNK_RR_RAW, &rep) == 0);
+    CHECK(memcmp(big, o.bytes, total_len) == 0);
+    chunkpeer_quiesce();
+    CHECK(peer_stat(1, &s1) && s1.hedges == 1 && s1.decoded_cells == 1);
+    free(big);
+    atomic_store(&F.read_delay_ms[1], 0);
+    atomic_store(&F.read_delay_stripe[1], -1);
+    atomic_store(&F.read_fail_stripe[2], -1);
+    atomic_store(&F.read_fail_stripe[3], -1);
+    atomic_store(&F.fail_cell, 0);
+
+    coldops_peer.obj_close(h);
+    obj_free(&o);
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
 }
 
 /* E11 + E15: rot on a hedge survivor is repaired by whole-cell retry; >m rotted -> CORRUPT; hedge timeout with m
@@ -1039,6 +1255,8 @@ int main(int argc, char **argv)
     test_hedge_timer();
     test_hedge_bucket();
     test_hedge_avoid();
+    test_hedge_open_avoid();
+    test_hedge_degrade_and_stripes();
     test_hedge_e15_e11();
     test_hedge_threads();
     char cmd[PATH_MAX + 16];

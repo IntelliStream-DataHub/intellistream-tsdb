@@ -3944,13 +3944,20 @@ static size_t fwd_metrics_rows(metrics_fwd_peer *out, size_t cap)
     return n;
 }
 
+_Static_assert(METRICS_CHUNK_PEERS_MAX == CHUNKPEER_PEERS_MAX, "metrics chunk peer cap mismatch");
+
 static size_t chunk_peer_metrics_rows(metrics_chunk_peer *out, size_t cap)
 {
-    struct chunkpeer_peer_stats r[64];
-    size_t n = chunkpeer_peer_stats_get(r, cap < 64 ? cap : 64);
+    if (cap > CHUNKPEER_PEERS_MAX)
+        cap = CHUNKPEER_PEERS_MAX;
+    struct chunkpeer_peer_stats *r = malloc(cap * sizeof *r);
+    if (!r)
+        return 0;
+    size_t n = chunkpeer_peer_stats_get(r, cap);
     for (size_t i = 0; i < n; i++)
         out[i] = (metrics_chunk_peer){r[i].peer, r[i].reads, r[i].hedges, r[i].avoids, r[i].decoded_cells,
                                       r[i].read_avoid};
+    free(r);
     return n;
 }
 
@@ -7061,6 +7068,8 @@ int main(int argc, char **argv)
      * of the others: a slot with no engine, such as a cluster volume refused at its open, answers TSDB_ERR_INVALID.) */
     repld_close_failed();
     rc = tsdb_close(db);
+    if (cluster_on)
+        chunkpeer_quiesce(); /* wait for any detached fan, primary or hedge threads before process exit */
     if (atomic_load(&db_failed))
         return 1; /* close failed too, by design: nothing more was written */
     if (rc)

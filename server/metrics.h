@@ -39,6 +39,7 @@ typedef struct metrics_margin {
 } metrics_margin;
 
 /* chunk read hedging and read-avoid counters per storage peer (R8-2, E31; server/chunkpeer.h) */
+#define METRICS_CHUNK_PEERS_MAX 256
 typedef struct metrics_chunk_peer {
     uint32_t peer;
     uint64_t reads, hedges, avoids, decoded_cells;

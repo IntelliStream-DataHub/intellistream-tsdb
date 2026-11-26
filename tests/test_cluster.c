@@ -15570,9 +15570,41 @@ static void scen_ecslow(void)
                 die("ecslow: slow node %" PRIu32 " did not resume clean direct reads (reads +%" PRIu64
                     ", avoids +%" PRIu64 ", decoded +%" PRIu64 ")",
                     slow_node, rec_r1 - rec_r0, rec_av1 - rec_av0, rec_dec1 - rec_dec0);
+
+            /* Phase 6: Clean SIGTERM while a hedged primary thread is still sleeping in read_delay_hook ->
+             * tsdbd must wait in chunkpeer_quiesce() and exit 0 (regression test for shutdown quiesce). */
+            uint64_t q_h0 = ecslow_metric_peer(mbuf, "tsdb_chunk_read_hedges_total", slow_node);
+            ecslow_write_delay(dpath, slow_node, 1500, 1);
+            int q_hedged = 0;
+            for (int wi = 0; wi < ECS_WINS && !q_hedged; wi++) {
+                int g = worder[wi];
+                int64_t ws = day0 + (int64_t)g * 8192000LL + 1000LL, we = ws + 1000000LL;
+                for (int s = 0; s < ECS_SERIES && !q_hedged; s++) {
+                    struct ecb_sum a;
+                    if ((rc = ecslow_read_win(c, ide[s], ws, we, &a)) != 0 || a.n != oracle[s][g].n ||
+                        a.h != oracle[s][g].h)
+                        die("ecslow: quiesce trigger s=%d g=%d: %s", s, g, ers(rc));
+                    metrics_get(mport[L], mbuf, sizeof mbuf);
+                    if (ecslow_metric_peer(mbuf, "tsdb_chunk_read_hedges_total", slow_node) > q_h0)
+                        q_hedged = 1;
+                }
+            }
+            if (!q_hedged)
+                die("ecslow: failed to launch a hedge before SIGTERM quiesce check");
+            tsdbc_close(c);
+            c = NULL;
+            uint64_t t_stop = now_ms();
+            stop(L, SIGTERM); /* requires exit status 0 */
+            uint64_t stop_ms = now_ms() - t_stop;
+            unlink(dpath);
+            printf("  shutdown quiesce with hedged primary in flight: stop took %" PRIu64 " ms, exit 0\n", stop_ms);
+            if (stop_ms < 500)
+                die("ecslow: tsdbd exited in %" PRIu64 " ms without waiting for in-flight detached primary thread",
+                    stop_ms);
         }
     }
-    tsdbc_close(c);
+    if (c)
+        tsdbc_close(c);
 #endif
 }
 
