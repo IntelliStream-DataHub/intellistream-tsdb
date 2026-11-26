@@ -15,8 +15,8 @@ series store underneath; tsdb does not duplicate it.
   `tsdbd --tenants`, `tsdb stats ... --server`, in all four clients and the embedded bindings; docs/design-stats.md step 5),
   replicated cluster volumes with data replication, failover, leadership transfers, copy moves, and snapshot rebuilds
   (R1–R4, docs/design-cluster.md), erasure-coded cluster volumes (`--redundancy ec=K+M`, `tsdb chunk-store init`,
-  `tsdbd --chunk-dir`, settled-part EC and tiering, R5–R8, docs/design-cluster-data.md), and RDMA peer links
-  (`server/plrdma.c`, `dlopen` of libibverbs, `--peer-check`, docs/design-rdma.md).
+  `tsdbd --chunk-dir`, settled-part EC, re-encode, and tiering, R5–R8/R10, docs/design-cluster-data.md), and RDMA peer links
+  (`server/plrdma.c`, `dlopen` of libibverbs, `--peer-check`, `--peer-rdma` TCP-to-verbs upgrade, docs/design-rdma.md).
 - 0.10.1 (2026-11-17, CHANGELOG.md): patch release fixing refused-write recovery, flusher backpressure, dropped-user
   connection handling, and C client `UNAVAILABLE` handling in raw/values queries.
 - 0.10.0 (2026-11-08), a minor release that changes the disk format (9: a log number in every WAL record, a 48-byte
@@ -108,8 +108,8 @@ What remains on the road to 1.0. The format and the protocol freeze at 1.0, so w
 2. Shared mode (`--mode shared`, docs/ha.md, docs/design-ha-modes.md steps N0, N2–N8) and what 0.9.1 left of NFS
    outage handling (docs/ha.md section 15): discovery of domains from mounts, parked requests with a deadline, a bounded
    queue per volume, and SIGTERM while a call is stuck.
-3. Device classes / storage tiers (`storage.disks`, `storage.tiers`, R10 re-encode, R14, docs/design-cluster-data.md §15)
-   and the remaining cluster ops (`node drain`/`out`, `restore`, `adopt`, RDMA link upgrade `rd-upgrade`).
+3. Device classes / storage tiers (`storage.disks`, `storage.tiers`, R14, docs/design-cluster-data.md §15)
+   and the remaining cluster/RDMA ops (`node drain`/`out`, `restore`, `adopt`, `rd-cm`, `rd-rxe`, `rd-hw`).
 4. TLS for the client port (and the metrics port), with `SCRAM-SHA-256-PLUS` channel binding: the one thing logins
    still lack (SECURITY.md). It needs no protocol break (a flag), so it may come after 1.0.
 5. The comparison of the CPU unpack kernels on the machines the user measures on (Zen 4 and Zen 5 at v4, with the

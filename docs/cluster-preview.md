@@ -496,6 +496,7 @@ line until the group has confirmed it.
 | `transfers started S done D timed_out T cancelled C fell_back F balance B drains_timed_out D2 resumed_blind R ready Y cuts K` | Counters of leadership transfers, from the start of the server you ask: the ones the group's leader started and how they ended, `balance` of them started by the leader balance, and, on the server that led the volume, drains that gave up (`drains_timed_out`), records it accepted after the hard limit of a transfer's wait, 10 times `transfer_wait_ms` (`resumed_blind`: they may be cut), READYs sent, and log records a replica cut. |
 | `moves started S done D cancelled C` | On the group's leader: the copy moves it started, ended with the old copy removed, and ended by `--cancel`. They count from that server's start. |
 | `move volume N node A -> node B: STEP, T s` | On the group's leader, one line per move running: its step (`catch-up`, `transfer`, `shrink`, `remove`) and how long it has run. |
+| `peer links KIND: none N header N full N tcp N rdma N` | Active data-link counts by kind, check level (`none`, `header`, `full`), and transport (`tcp`, `rdma`). |
 
 How many voters? The group has one voter with one or two members, three with three or four, and five with five or
 more (at most `--voters`). A member that does not vote watches.

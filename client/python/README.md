@@ -490,7 +490,8 @@ the first insert after a restart can fail; send it again.
 `Client.connect_nodes("host1:7070,host2:7070", ...)` shuffles the node list and connects to the first node that
 answers. When a server replies `ERR_UNAVAILABLE` or `ERR_MOVED`, `Client` waits (`retry_after`) or follows `MOVED`
 within its retry budget (30 seconds by default; `set_retry(seconds)` changes it and `0` disables retries). When retries
-are exhausted, `TsdbUnavailable` or `TsdbMoved` exposes `.entries`, `.retry_after`, and `.has_body`. `topology()`
+are exhausted, `TsdbUnavailable` exposes `.entries`, `.retry_after`, and `.has_body`, while `TsdbMoved` exposes
+`.moved`. `topology()`
 returns the cluster's nodes and volume replicas (protocol 13), and `status()` returns the server's `key=value` status
 text (superuser, protocol 13).
 
@@ -507,7 +508,7 @@ with tsdb_client.Client.connect_nodes(
 
 ## Series and tenant statistics
 
-`series_stats(ids, resident=False)` returns per-series storage numbers from the granule index and memtables
+`series_stats(series, *, resident=False, ...)` returns per-series storage numbers from the granule index and memtables
 (protocol 15; `resident=True` fills `resident_bytes`). `tenant_stats(prefixes=None, *, volumes=False, hot=0,
 caller=False)` returns per-tenant storage and caller activity numbers (protocol 15).
 

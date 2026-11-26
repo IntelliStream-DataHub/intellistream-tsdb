@@ -1,6 +1,6 @@
 # RDMA for the peer links
 
-Status: partly implemented on main (`--peer-check`, driver checks, and the `dlopen`-based verbs transport in `server/plrdma.c` are on main; TCP-to-RDMA link upgrade `rd-upgrade` remains unbuilt). Design and measurements written on branch `rdma-design` from main at a06d4bb7 on 2026-11-24.
+Status: implemented on main through `rd-upgrade` (`--peer-check`, driver checks, `dlopen`-based verbs transport in `server/plrdma.c`, TCP-to-RDMA link upgrade, fallback/backoff, IPoIB refusal, config, and metrics; `rd-cm`, `rd-rxe`, and `rd-hw` remain). Design and measurements written on branch `rdma-design` from main at a06d4bb7 on 2026-11-24.
 Target release: **v0.11.0** (the build is the tracks of §9). Revised after an adversarial review the same day: the rate
 caps, the port shared with NFS over RDMA, the MAC's CPU, the upgrade's state machine, credits, registration, the
 build's header detection and where the RDMA tests can run.
