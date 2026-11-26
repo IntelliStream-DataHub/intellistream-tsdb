@@ -130,9 +130,6 @@
 
 struct repld_g G = {.mu = PTHREAD_MUTEX_INITIALIZER};
 
-/* Internal engine fast path (src/replica.c): appends WAL bytes already validated by wal_record() in msg_refused(). */
-extern int replica_append_verified(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
-
 /* Guards unlocked plink_send/plink_sendv calls against repld_stop() -> peerlink_free(G.pl).
  * Dekker seq_cst fence: senders increment pl_inflight before checking pl_stopping; repld_stop() sets pl_stopping = 1
  * before waiting for pl_inflight == 0, establishing happens-before between every unlocked send and peerlink_free(). */
@@ -152,54 +149,6 @@ static int pl_send_enter(void)
 static void pl_send_leave(void)
 {
     atomic_fetch_sub_explicit(&pl_inflight, 1, memory_order_seq_cst);
-}
-
-/* Header-only parse of a WAL record already sealed by wal_seal() or verified by wal_record().
- * Avoids redundant xxh64 recomputation on the leader and catch-up send paths. */
-static size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r)
-{
-    if (avail < WAL_HDR)
-        return 0;
-    uint32_t w;
-    memcpy(&w, p, 4);
-    uint32_t kind = w >> 28, n = w & 0x0fffffffu;
-    uint64_t fno;
-    int64_t commit_ms;
-    memcpy(&fno, p + 16, 8);
-    memcpy(&commit_ms, p + 24, 8);
-    size_t body;
-    uint64_t span;
-    uint16_t mtype = 0, mflags = 0;
-    if (kind == WAL_KIND_ROWS) {
-        if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW)
-            return 0;
-        body = (size_t)n * WAL_ROW;
-        span = n;
-    } else if (kind == WAL_KIND_MARKER) {
-        if (n < WAL_MARKER_HDR || n % 4 != 0 || n > avail - WAL_HDR)
-            return 0;
-        body = n;
-        memcpy(&mtype, p + WAL_HDR, 2);
-        memcpy(&mflags, p + WAL_HDR + 2, 2);
-        uint32_t sp;
-        memcpy(&sp, p + WAL_HDR + 4, 4);
-        span = sp;
-        if (span == 0)
-            return 0;
-    } else {
-        return 0;
-    }
-    if (fno == 0 || fno >= FNO_LIMIT)
-        return 0;
-    r->kind = kind;
-    r->n = n;
-    r->fno = fno;
-    r->span = span;
-    r->commit_ms = commit_ms;
-    r->payload = p + WAL_HDR;
-    r->mtype = mtype;
-    r->mflags = mflags;
-    return WAL_HDR + body;
 }
 
 void say(const char *fmt, ...)
@@ -598,9 +547,6 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
     }
 }
 
-_Static_assert(REPL_MAX_NODES == 8 && RW_HEAD == 212 && RW_APPEND_HEAD == 16 && RW_DESC == 24 && RW_CHECK == 8,
-               "encode_append_hdr layout matches server/replwire.c");
-
 enum { SEND_STACK_RECS = 64 };
 
 struct wal_batch {
@@ -665,75 +611,6 @@ static int wal_batch_parse(struct wal_batch *wb, const uint8_t *buf, size_t len)
     return 0;
 }
 
-/* Encodes the header, descriptors and driver check of a non-empty REPL_M_APPEND (everything before the WAL bytes),
- * matching rw_encode_msg() byte for byte. Caller scatters [hdr, buf] via plink_sendv() with zero payload copy, and
- * retargets to additional peers via append_hdr_set_to(). */
-static size_t encode_append_hdr(uint8_t *out, size_t cap, uint32_t volume, int from, int to, uint64_t epoch,
-                                uint64_t prev_pos, uint64_t prev_epoch, uint64_t commit, uint64_t set_version,
-                                uint64_t seq, uint64_t off, const struct repl_rec *recs, const uint32_t *lens,
-                                uint32_t nrec, size_t nbytes)
-{
-    const uint64_t pos_limit = (uint64_t)1 << 62;
-    if (!nrec || from < -1 || from >= REPL_MAX_NODES || to < -1 || to >= REPL_MAX_NODES || prev_pos >= pos_limit)
-        return 0;
-    size_t at = RW_HEAD + RW_APPEND_HEAD + (size_t)nrec * RW_DESC;
-    if (at + RW_CHECK > cap)
-        return 0;
-    uint64_t next = prev_pos + 1, sum = 0;
-    for (uint32_t i = 0; i < nrec; i++) {
-        if (recs[i].pos != next || recs[i].n == 0 || lens[i] == 0 || recs[i].pos >= pos_limit ||
-            pos_limit - recs[i].pos < recs[i].n)
-            return 0;
-        next = recs[i].pos + recs[i].n;
-        sum += lens[i];
-    }
-    if (sum != nbytes)
-        return 0;
-    memset(out, 0, RW_HEAD);
-    out[0] = RW_VERSION;
-    out[1] = (uint8_t)REPL_M_APPEND;
-    uint32_t u32;
-    u32 = volume;
-    memcpy(out + 4, &u32, 4);
-    u32 = (uint32_t)from;
-    memcpy(out + 8, &u32, 4);
-    u32 = (uint32_t)to;
-    memcpy(out + 12, &u32, 4);
-    u32 = (uint32_t)from; /* leader == from */
-    memcpy(out + 16, &u32, 4);
-    memcpy(out + 20, &epoch, 8);
-    memcpy(out + 28, &prev_pos, 8);
-    memcpy(out + 36, &prev_epoch, 8);
-    memcpy(out + 44, &commit, 8);
-    memcpy(out + 100, &set_version, 8);
-    u32 = (uint32_t)-1;
-    memcpy(out + 132, &u32, 4); /* meta.leader = -1 */
-    memcpy(out + 208, &nrec, 4);
-    memcpy(out + RW_HEAD, &seq, 8);
-    memcpy(out + RW_HEAD + 8, &off, 8);
-    uint8_t *d = out + RW_HEAD + RW_APPEND_HEAD;
-    for (uint32_t i = 0; i < nrec; i++, d += RW_DESC) {
-        memcpy(d, &recs[i].pos, 8);
-        memcpy(d + 8, &recs[i].epoch, 8);
-        memcpy(d + 16, &recs[i].n, 4);
-        memcpy(d + 20, &lens[i], 4);
-    }
-    size_t cov = rw_mutant == RW_MUT_SHORT && at > RW_HEAD ? RW_HEAD : at;
-    uint64_t ck = rw_check(RW_K_MSG, out, cov);
-    memcpy(out + at, &ck, 8);
-    return at + RW_CHECK;
-}
-
-static void append_hdr_set_to(uint8_t *hdr, size_t hdr_len, int to)
-{
-    uint32_t u32 = (uint32_t)to;
-    memcpy(hdr + 12, &u32, 4);
-    size_t at = hdr_len - RW_CHECK;
-    size_t cov = rw_mutant == RW_MUT_SHORT && at > RW_HEAD ? RW_HEAD : at;
-    uint64_t ck = rw_check(RW_K_MSG, hdr, cov);
-    memcpy(hdr + at, &ck, 8);
-}
-
 struct send_target {
     int idx;
     uint32_t node;
@@ -755,13 +632,24 @@ static int send_append_unlocked(uint32_t volume, int from, uint64_t epoch, uint6
     uint8_t *hdr = hcap <= sizeof shdr ? shdr : malloc(hcap);
     if (!hdr)
         return 0;
-    size_t hlen = encode_append_hdr(hdr, hcap, volume, from, targets[0].idx, epoch, prev_pos, prev_epoch, commit,
-                                    set_version, seq, off, recs, lens, nrec, len);
+    struct repl_msg m = {.type = REPL_M_APPEND,
+                         .from = from,
+                         .to = targets[0].idx,
+                         .leader = from,
+                         .epoch = epoch,
+                         .prev_pos = prev_pos,
+                         .prev_epoch = prev_epoch,
+                         .commit = commit,
+                         .set_version = set_version,
+                         .meta.leader = -1,
+                         .rec = recs,
+                         .nrec = nrec};
+    size_t hlen = rw_encode_append_hdr(hdr, hcap, volume, &m, lens, seq, off, len);
     int nsent = 0;
     if (hlen && pl_send_enter()) {
         for (int t = 0; t < nt; t++) {
             if (t > 0)
-                append_hdr_set_to(hdr, hlen, targets[t].idx);
+                rw_append_hdr_set_to(hdr, hlen, targets[t].idx);
             struct plink *l = link_of(targets[t].node, 0);
             if (l && plink_sendv(l, 0, RW_T_MSG, hdr, hlen, buf, len, 0, 0, 0, 0) == PL_OK) {
                 targets[t].sent_ok = 1;
@@ -962,7 +850,11 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
                 /* Advance p->sent before unlocking rv->mu so catch_up() on vol_main does not race to re-read and
                  * duplicate-send [first..last] from disk while plink_sendv() is running. Because db->wal_writing
                  * serializes op_bytes() and no record > last exists in the WAL yet, no later send can overtake us;
-                 * on the rare send failure (PL_E_FULL/PL_E_DOWN), p->sent is rolled back below. */
+                 * on the rare send failure (PL_E_FULL/PL_E_DOWN), p->sent is rolled back below. Two benign races are
+                 * possible while unlocked: (1) a heartbeat on vol_main may see p->sent == last and advertise
+                 * prev_pos = last before [first..last] arrives (or when send fails), triggering at most a harmless
+                 * ACK(resync=1); (2) if rset_apply() bumps set_version during a failed send, the set_version guard
+                 * skips rollback of the remapped peer's p->sent, which self-heals via resync ACK after RESEND_MS. */
                 for (int t = 0; t < nt; t++) {
                     struct rpeer *p = &rv->peer[targets[t].idx];
                     p->sent = last;
@@ -1892,25 +1784,8 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 hist_note(rv, a->rec.epoch, pos);
                 idx_push(rv, pos, pos);
             }
-        } else if (a->idx < rv->cur.m.nrec) {
-            uint32_t i = a->idx;
-            wal_rec wr;
-            /* the core's position is the descriptor's; the engine's is the record's own header: they must agree */
-            if (wal_record(rv->cur.bytes + rv->coff[i], rv->cur.lens[i], rv->cur.seq, rv->cur.off + rv->coff[i],
-                           &wr) != rv->cur.lens[i] ||
-                wr.fno != a->rec.pos || wr.span != a->rec.n) {
-                vol_fail(rv, "a record's header does not match its descriptor");
-                break;
-            }
-            pthread_mutex_unlock(&rv->mu);
-            rc = replica_append(db, rv->cur.seq, rv->cur.off + rv->coff[i], rv->cur.bytes + rv->coff[i],
-                                rv->cur.lens[i]);
-            pthread_mutex_lock(&rv->mu);
-            if (rc == 0) {
-                hist_note(rv, a->rec.epoch, a->rec.pos);
-                idx_push(rv, a->rec.pos, a->rec.pos + a->rec.n - 1);
-            }
         } else {
+            /* Valid REPL_SRC_MSG writes are batched by drain_msgs() -> exec_write_batch(); anything else is invalid. */
             rc = TSDB_ERR_INVALID;
         }
         if (rc != 0) {

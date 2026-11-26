@@ -163,6 +163,32 @@ static void t_append(void)
         b[i] ^= 0x10;
     }
     CHECK(dropped == 0, "%d flips of record bytes were refused by the driver check", dropped);
+    /* rw_encode_append_hdr() + rw_append_hdr_set_to() must match rw_encode_msg() byte for byte */
+    uint8_t hdr[RW_HEAD + RW_APPEND_HEAD + 3 * RW_DESC + RW_CHECK];
+    size_t hlen = rw_encode_append_hdr(hdr, sizeof hdr, 4, &ap, rl, 1ull << 40, 4096, 96);
+    CHECK(hlen == at + RW_CHECK, "rw_encode_append_hdr returned %zu, expected %zu", hlen, at + RW_CHECK);
+    CHECK(memcmp(hdr, b, hlen) == 0, "rw_encode_append_hdr bytes differ from rw_encode_msg");
+    rw_append_hdr_set_to(hdr, hlen, 1);
+    struct repl_msg ap1 = ap;
+    ap1.to = 1;
+    uint8_t b1[sizeof b];
+    size_t n1 = rw_encode_msg(b1, sizeof b1, 4, &ap1, rl, 1ull << 40, 4096, text, 96);
+    CHECK(n1 == sizeof b1 && memcmp(hdr, b1, hlen) == 0, "rw_append_hdr_set_to bytes differ from rw_encode_msg");
+    uint8_t scat[sizeof b];
+    memcpy(scat, hdr, hlen);
+    memcpy(scat + hlen, text, 96);
+    CHECK(dec(scat, sizeof scat, &m) == 0 && m.m.to == 1 && m.m.nrec == 3 && !memcmp(m.bytes, text, 96),
+          "scattered append header after rw_append_hdr_set_to failed to decode");
+    CHECK(rw_encode_append_hdr(hdr, hlen - 1, 4, &ap, rl, 1ull << 40, 4096, 96) == 0,
+          "rw_encode_append_hdr accepted short cap");
+    struct repl_msg empty_ap = ap;
+    empty_ap.nrec = 0;
+    empty_ap.rec = NULL;
+    CHECK(rw_encode_append_hdr(hdr, sizeof hdr, 4, &empty_ap, NULL, 0, 0, 0) == 0,
+          "rw_encode_append_hdr accepted empty APPEND");
+    struct repl_msg not_ap = {.type = REPL_M_ACK, .from = 0, .to = 1, .leader = -1, .meta.leader = -1};
+    CHECK(rw_encode_append_hdr(hdr, sizeof hdr, 4, &not_ap, NULL, 0, 0, 0) == 0,
+          "rw_encode_append_hdr accepted non-APPEND message");
 }
 
 static void t_fetch(void)

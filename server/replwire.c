@@ -156,8 +156,10 @@ static int recs_ok(const struct repl_msg *m, const uint32_t *lens, size_t nbytes
     return sum == nbytes;
 }
 
-size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
-                     uint64_t seq, uint64_t off, const void *bytes, size_t nbytes)
+#define RW_OFF_TO 12 /* byte offset of m->to in RW_HEAD: version(1)+type(1)+flags(2)+volume(4)+from(4) */
+
+static size_t encode_msg_hdr(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
+                             uint64_t seq, uint64_t off, size_t nbytes)
 {
     if (m->type < REPL_M_APPEND || m->type > REPL_M_SNAPSHOT || !node_ok(m->from) || !node_ok(m->to) ||
         !node_ok(m->leader) || !node_ok(m->meta.leader) || (m->nrec && !m->rec) || !recs_ok(m, lens, nbytes))
@@ -168,6 +170,7 @@ size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct rep
     w16(&w, m->resync ? 1 : 0);
     w32(&w, volume);
     w32(&w, (uint32_t)m->from);
+    /* w.n == RW_OFF_TO */
     w32(&w, (uint32_t)m->to);
     w32(&w, (uint32_t)m->leader);
     const uint64_t f[12] = {m->epoch, m->prev_pos, m->prev_epoch, m->commit, m->durable,     m->written,
@@ -195,9 +198,41 @@ size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct rep
     if (w.n + RW_CHECK > cap)
         return 0;
     w64(&w, rw_check(RW_K_MSG, out, covered(w.n)));
-    if (m->type == REPL_M_APPEND && m->nrec)
-        wbytes(&w, bytes, nbytes);
     return w.n <= cap ? w.n : 0;
+}
+
+size_t rw_encode_append_hdr(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
+                            uint64_t seq, uint64_t off, size_t nbytes)
+{
+    if (m->type != REPL_M_APPEND || !m->nrec)
+        return 0;
+    return encode_msg_hdr(out, cap, volume, m, lens, seq, off, nbytes);
+}
+
+void rw_append_hdr_set_to(uint8_t *hdr, size_t hdr_len, int to)
+{
+    if (hdr_len < RW_HEAD + RW_CHECK || !node_ok(to))
+        return;
+    uint32_t u32 = (uint32_t)to;
+    memcpy(hdr + RW_OFF_TO, &u32, 4);
+    size_t at = hdr_len - RW_CHECK;
+    uint64_t ck = rw_check(RW_K_MSG, hdr, covered(at));
+    memcpy(hdr + at, &ck, 8);
+}
+
+size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
+                     uint64_t seq, uint64_t off, const void *bytes, size_t nbytes)
+{
+    size_t hlen = encode_msg_hdr(out, cap, volume, m, lens, seq, off, nbytes);
+    if (!hlen)
+        return 0;
+    if (m->type == REPL_M_APPEND && m->nrec) {
+        if (nbytes > cap - hlen)
+            return 0;
+        memcpy(out + hlen, bytes, nbytes);
+        return hlen + nbytes;
+    }
+    return hlen;
 }
 
 int rw_decode_msg(const uint8_t *p, size_t n, struct rw_msg *out, struct repl_rec *recs, uint32_t *lens, uint32_t cap)

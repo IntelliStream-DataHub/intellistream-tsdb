@@ -8407,8 +8407,6 @@ static void case_apply_buffered(void)
 /* P-04 regression: batched multi-record replica_append_verified() (rows + MK_NOW + MK_COMMIT + trailing rows) tracks
  * COMMIT hold caps without recomputing xxh64, rejects non-contiguous fno/wrong offset, while replica_append() still
  * catches corrupted bytes in a multi-record batch. */
-extern int replica_append_verified(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
-
 static void case_append_verified(void)
 {
     char dir[PATH_MAX];

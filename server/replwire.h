@@ -86,6 +86,14 @@ uint64_t rw_check(int kind, const void *p, size_t n);
  * it does not fit or the message breaks the rules above (the encoder checks what the decoder checks). */
 size_t rw_encode_msg(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
                      uint64_t seq, uint64_t off, const void *bytes, size_t nbytes);
+/* Encodes everything before the WAL bytes of a non-empty REPL_M_APPEND (the fixed head, seq/off, descriptors, and
+ * driver check) into out (cap bytes), matching rw_encode_msg() byte for byte. Caller scatters [hdr, bytes] without
+ * copying payload bytes, and updates `to` for additional peers via rw_append_hdr_set_to(). Returns the header length
+ * (RW_HEAD + RW_APPEND_HEAD + nrec * RW_DESC + RW_CHECK), or 0 if invalid or it does not fit. */
+size_t rw_encode_append_hdr(uint8_t *out, size_t cap, uint32_t volume, const struct repl_msg *m, const uint32_t *lens,
+                            uint64_t seq, uint64_t off, size_t nbytes);
+/* Updates the `to` node field of an encoded REPL_M_APPEND header in place and recomputes its driver check. */
+void rw_append_hdr_set_to(uint8_t *hdr, size_t hdr_len, int to);
 /* Decodes p[0, n). recs and lens are arrays of cap entries (an APPEND with more records is refused). 0, or -1 when the
  * bytes are not a well formed message, RW_E_CHECK when its check does not hold (verified before any field is read
  * into *out). Pointers in *out point into p. */

@@ -2236,9 +2236,9 @@ uint64_t replica_applied_end(eng *db) { return atomic_load(&db->rp->apply_next) 
 
 /* ----------------------------------------------------------------- append */
 
-/* Header-only parse of a WAL record already validated by wal_record() (e.g., by replica_append's first pass or
- * repld's msg_refused). Checks structural bounds without recomputing xxh64 or the header check. */
-static size_t wal_rec_hdr_fast(const uint8_t *p, size_t avail, wal_rec *r)
+/* Header-only parse of a WAL record already sealed by wal_seal() or verified by wal_record(). Checks structural bounds
+ * without recomputing xxh64 or the header check. */
+size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r)
 {
     if (avail < WAL_HDR)
         return 0;
@@ -2294,7 +2294,7 @@ static int replica_append_impl(eng *db, uint64_t seq, uint64_t off, const void *
     bool has_ship = false;
     for (size_t pos = 0; rc == 0 && pos < len;) {
         wal_rec wr;
-        size_t sz = verified ? wal_rec_hdr_fast(p + pos, len - pos, &wr)
+        size_t sz = verified ? wal_rec_hdr(p + pos, len - pos, &wr)
                              : wal_record(p + pos, len - pos, seq, off + pos, &wr);
         if (sz == 0) {
             rc = TSDB_ERR_CORRUPT; /* a record that fails its checks is not the leader's: refused whole */
@@ -2370,7 +2370,7 @@ static int replica_append_impl(eng *db, uint64_t seq, uint64_t off, const void *
         if (has_ship) {
             for (size_t pos = 0; pos < len && rc == 0;) {
                 wal_rec wr;
-                size_t sz = wal_rec_hdr_fast(p + pos, len - pos, &wr);
+                size_t sz = wal_rec_hdr(p + pos, len - pos, &wr);
                 mk m;
                 if (wr.kind == WAL_KIND_MARKER && (wr.mtype == MK_COMMIT || wr.mtype == MK_COLD) &&
                     (rc = mk_decode(wr.payload, wr.n, &m)) == 0 && mk_ships(&m))
@@ -2394,10 +2394,6 @@ int replica_append(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t 
     return replica_append_impl(db, seq, off, buf, len, false);
 }
 
-/* Same as replica_append(), for callers (server/repld.c) that already validated every WAL record in buf[0, len)
- * against (seq, off) via wal_record() on the same immutable buffer. Still checks fno contiguity, segment/offset rules,
- * and tracks COMMIT/COLD markers. */
-int replica_append_verified(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
 int replica_append_verified(eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len)
 {
     return replica_append_impl(db, seq, off, buf, len, true);
