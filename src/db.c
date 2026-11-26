@@ -1098,7 +1098,8 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         }
     }
     if (db->wal_enabled) /* positions are log numbers: what the open found is the durable end (eng_leader_commit) */
-        db->wal_appended = db->fno_next - 1, atomic_store(&db->wal_durable, db->fno_next - 1);
+        atomic_store_explicit(&db->wal_appended, db->fno_next - 1, memory_order_relaxed),
+            atomic_store(&db->wal_durable, db->fno_next - 1);
     if (!ro) {
         if (!db->rp)
             db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
@@ -1617,7 +1618,7 @@ int eng_commit(eng *db)
     if (db->opt.read_only)
         return 0;
     pthread_mutex_lock(&db->buf_lock);
-    uint64_t target = db->wal_appended;
+    uint64_t target = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
     int rc = db->bg_error;
     db->bg_error = 0;
     pthread_mutex_unlock(&db->buf_lock);

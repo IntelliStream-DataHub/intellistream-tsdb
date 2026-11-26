@@ -1068,7 +1068,7 @@ static int hold_armed; /* HOLD_*: hold the next such call */
 static int hold_begun, hold_ended, hold_go;
 static bool hold_others; /* only calls from threads other than hold_main */
 static pthread_t hold_main;
-enum { HOLD_FSYNC = 1, HOLD_FDATASYNC = 2 };
+enum { HOLD_FSYNC = 1, HOLD_FDATASYNC = 2, HOLD_WAL_ENTER = 4 };
 
 static void hold_point(int which)
 {
@@ -1163,6 +1163,12 @@ static float value_at(tsdb *db, int64_t t)
     return v;
 }
 
+static void hold_wal_enter(eng *db)
+{
+    (void)db;
+    hold_point(HOLD_WAL_ENTER);
+}
+
 /* Regression: with wal_sync_ms = 0 a row is visible once the WAL is synced up
  * to it. A memtable flush moved the active memtable to the flushing list and
  * only then wrote and synced the rest of its WAL segment, and queries read
@@ -1181,18 +1187,24 @@ static void test_flush_visibility(const char *dir)
     OK(tsdb_series(db, "s", &id));
     const int64_t t = 1700000000000;
     OK(tsdb_append(db, id, t, 1.0f));
-    /* the flush holds the WAL writer role while it creates the next segment
-     * (and fsyncs the directory): a row appended now waits for it */
-    hold_arm(HOLD_FSYNC);
+    /* Segment creation + dir fsync run before the flush takes the WAL writer role,
+     * so a concurrent sync append does not stall behind fsync(dirfd). Once the flush
+     * enters the WAL writer role, a subsequent append waits for it. */
+    hold_arm(HOLD_FSYNC | HOLD_WAL_ENTER);
+    __atomic_store_n(&mt_test_after_wal_enter, hold_wal_enter, __ATOMIC_RELEASE);
     pthread_t fl, wr;
     pthread_create(&fl, NULL, flush_main, db);
+    hold_wait();
+    OK(tsdb_append(db, id, t + 1, 1.5f)); /* completes without waiting for fsync(dirfd) */
+    CHECK(value_at(db, t + 1) == 1.5f);
+    hold_release(); /* lets dir fsync finish; fl enters WAL writer role and pauses */
     hold_wait();
     pthread_create(&wr, NULL, append_two, db);
     tsdb_stats st;
     do {
         usleep(1000);
         OK(tsdb_get_stats(db, &st));
-    } while (st.memtable_rows < 2);
+    } while (st.memtable_rows < 3);
     CHECK(value_at(db, t) == 1.0f); /* in the active memtable, not durable */
     /* the flush rotates the memtable, then syncs the rest of the old segment */
     hold_arm(HOLD_FDATASYNC);
@@ -1202,6 +1214,7 @@ static void test_flush_visibility(const char *dir)
     hold_release();
     pthread_join(wr, NULL);
     pthread_join(fl, NULL);
+    __atomic_store_n(&mt_test_after_wal_enter, NULL, __ATOMIC_RELEASE);
     CHECK(value_at(db, t) == 2.0f);
     OK(tsdb_close(db));
     printf("  a row in a memtable being flushed is not visible before its WAL record is durable\n");

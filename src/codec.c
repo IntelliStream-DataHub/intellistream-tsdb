@@ -16,6 +16,14 @@
 #include <math.h>
 #include <stdlib.h>
 
+/* AVX2 without AVX-512DQ (the v3 level, and -march=native on AVX2-only CPUs): there is no int64 <-> double
+ * conversion below AVX-512DQ, so dec_core stays scalar without the 1.5 * 2^52 mantissa trick (as f64_int4
+ * in codec_typed.c). With AVX-512DQ GCC auto-vectorizes dec_core directly with vcvtpd2qq. */
+#if defined(__AVX2__) && !defined(__AVX512DQ__)
+#define DEC_AVX2 1
+#include <immintrin.h>
+#endif
+
 /* ---------------------------------------------------------------- xxh64 */
 
 #define P1 11400714785074694791ULL
@@ -421,6 +429,31 @@ typedef struct dec_res {
     size_t nexc;
 } dec_res;
 
+#ifdef DEC_AVX2
+/* 1.5 * 2^52 mantissa trick (matching f64_int4 in codec_typed.c): exact for |d| < 2^51 in round-to-nearest. */
+#define DEC_MAGIC_BITS INT64_C(0x4338000000000000)
+#define DEC_FAST_LIMIT 2251799813685248.0 /* 2^51 */
+
+static inline bool dec_int4(const float *in, __m256d vsc, __m256d vinv, int64_t *k)
+{
+    const __m256d magic = _mm256_castsi256_pd(_mm256_set1_epi64x(DEC_MAGIC_BITS));
+    __m128 vf = _mm_loadu_ps(in);
+    __m256d d = _mm256_mul_pd(_mm256_cvtps_pd(vf), vsc);
+    __m256d inr = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), d), _mm256_set1_pd(DEC_FAST_LIMIT), _CMP_LT_OQ);
+    if (_mm256_movemask_pd(inr) != 15)
+        return false;
+    __m256d t = _mm256_add_pd(d, magic);
+    __m256d kd = _mm256_sub_pd(t, magic); /* exact rounded integer */
+    __m128 back = _mm256_cvtpd_ps(_mm256_mul_pd(kd, vinv));
+    __m128i same = _mm_cmpeq_epi32(_mm_castps_si128(back), _mm_castps_si128(vf));
+    if (_mm_movemask_ps(_mm_castsi128_ps(same)) != 15)
+        return false;
+    _mm256_storeu_si256((__m256i *)(void *)k,
+                        _mm256_sub_epi64(_mm256_castpd_si256(t), _mm256_set1_epi64x(DEC_MAGIC_BITS)));
+    return true;
+}
+#endif
+
 /* compact: only for deltas the sample puts under 16 bits (a block that bit-packs into 16 bits a value or less) */
 static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r, int64_t *keep, bool compact)
 {
@@ -435,6 +468,59 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
     }
     if (best_e < 0 || best >= 4.5 || (compact && dec_sample_cost(in, n, best_e, true) >= 2.0))
         return false;
+    const double sc = dec_scale[best_e], inv = dec_inv[best_e];
+    size_t max_exc = n / 16, nexc = 0;
+    int64_t prev = 0, first = 0;
+    uint64_t maxz = 0;
+#ifdef DEC_AVX2
+    const __m256d vsc = _mm256_set1_pd(sc), vinv = _mm256_set1_pd(inv);
+    size_t i = 0;
+    while (i < n) {
+        int64_t k4[4];
+        if (i + 4 <= n && dec_int4(&in[i], vsc, vinv, k4)) {
+            for (size_t j = 0; j < 4; j++, i++) {
+                int64_t k = k4[j];
+                if (keep)
+                    keep[i] = k;
+                if (i == 0) {
+                    first = k;
+                } else {
+                    uint64_t zz = zigzag(k - prev);
+                    maxz |= zz;
+                    z[i - 1] = (uint32_t)zz;
+                }
+                prev = k;
+            }
+            continue;
+        }
+        size_t stop = MIN(i + 4, n);
+        for (; i < stop; i++) {
+            int64_t k;
+            if (!dec_int(in[i], best_e, &k)) {
+                if (nexc == max_exc)
+                    return false;
+                store32(exc + 8 * nexc, (uint32_t)i);
+                memcpy(exc + 8 * nexc + 4, &in[i], 4);
+                nexc++;
+                k = i ? prev : 0; /* a zero delta keeps the stream smooth */
+            }
+            if (keep)
+                keep[i] = k;
+            if (i == 0) {
+                first = k;
+            } else {
+                uint64_t zz = zigzag(k - prev);
+                maxz |= zz;
+                z[i - 1] = (uint32_t)zz;
+            }
+            prev = k;
+        }
+    }
+    if (maxz >= (1ull << 32))
+        return false;
+    *r = (dec_res){best_e, first, maxz, nexc};
+    return true;
+#else
     /* two loops: a branch-free one the compiler vectorizes (integer and
      * exactness of every value), then deltas and exceptions */
     int64_t *kk = keep ? keep : malloc(n * sizeof *kk); /* small enough for malloc's fast path */
@@ -445,7 +531,6 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
         free(okv);
         return false;
     }
-    const double sc = dec_scale[best_e], inv = dec_inv[best_e];
     for (size_t i = 0; i < n; i++) {
         double d = (double)in[i] * sc;
         bool in_range = (d > -DEC_LIMIT) & (d < DEC_LIMIT); /* false for NaN too */
@@ -458,9 +543,6 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
         okv[i] = (x == y) & in_range;
         kk[i] = k;
     }
-    size_t max_exc = n / 16, nexc = 0;
-    int64_t prev = 0, first = 0;
-    uint64_t maxz = 0;
     bool ok = true;
     for (size_t i = 0; i < n; i++) {
         int64_t k = kk[i];
@@ -491,6 +573,7 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
         return false;
     *r = (dec_res){best_e, first, maxz, nexc};
     return true;
+#endif
 }
 
 size_t decimal_encode(const float *in, size_t n, uint8_t *out)

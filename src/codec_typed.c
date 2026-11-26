@@ -29,6 +29,7 @@
 #include "internal.h"
 
 #include "bitpack.h"
+#include "bits.h"
 #include "fpmode.h"
 
 #include <float.h>
@@ -476,62 +477,6 @@ int delta_bp64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
 
 /* ---------------------------------------------------------------- BLK_XOR64 */
 
-typedef struct bitw {
-    uint8_t *p;
-    uint64_t acc;
-    int bits;
-} bitw;
-
-static inline void bw_put(bitw *w, uint64_t v, int n) /* n <= 64, MSB first */
-{
-    if (n == 0)
-        return;
-    if (n < 64)
-        v &= (1ull << n) - 1;
-    int room = 64 - w->bits;
-    if (n <= room) {
-        w->acc = n == 64 ? v : (w->acc << n) | v;
-        w->bits += n;
-    } else {
-        w->acc = (w->acc << room) | (v >> (n - room));
-        for (int b = 7; b >= 0; b--)
-            *w->p++ = (uint8_t)(w->acc >> (8 * b));
-        w->acc = v;
-        w->bits = n - room;
-    }
-    if (w->bits == 64) {
-        for (int b = 7; b >= 0; b--)
-            *w->p++ = (uint8_t)(w->acc >> (8 * b));
-        w->acc = 0;
-        w->bits = 0;
-    }
-}
-
-static inline void bw_flush(bitw *w)
-{
-    while (w->bits > 0) {
-        int take = w->bits >= 8 ? 8 : w->bits;
-        *w->p++ = (uint8_t)((w->acc >> (w->bits - take)) << (8 - take));
-        w->bits -= take;
-    }
-}
-
-typedef struct bitr {
-    const uint8_t *p, *end;
-    uint64_t pos; /* bit position */
-} bitr;
-
-static inline bool br_get(bitr *r, int n, uint64_t *out)
-{
-    uint64_t v = 0;
-    if (r->pos + (uint64_t)n > (uint64_t)(r->end - r->p) * 8)
-        return false;
-    for (int i = 0; i < n; i++, r->pos++)
-        v = (v << 1) | ((r->p[r->pos >> 3] >> (7 - (r->pos & 7))) & 1);
-    *out = v;
-    return true;
-}
-
 size_t xor64_bound(size_t n) { return 8 + (n * 78 + 7) / 8 + 16; }
 
 size_t xor64_encode(const uint64_t *in, size_t n, uint8_t *out)
@@ -539,32 +484,46 @@ size_t xor64_encode(const uint64_t *in, size_t n, uint8_t *out)
     if (n == 0)
         return 0;
     memcpy(out, &in[0], 8);
-    bitw w = {out + 8, 0, 0};
+    bitwriter w;
+    bw_init(&w, out + 8);
+    uint64_t prev = in[0];
     int lead = -1, trail = 0;
+    size_t zeros = 0;
     for (size_t i = 1; i < n; i++) {
-        uint64_t x = in[i] ^ in[i - 1];
+        uint64_t x = in[i] ^ prev;
+        prev = in[i];
         if (!x) {
-            bw_put(&w, 0, 1);
+            zeros++;
             continue;
         }
+        if (zeros) {
+            bw_zeros(&w, zeros);
+            zeros = 0;
+        }
         int l = __builtin_clzll(x), t = __builtin_ctzll(x);
-        if (l > 63)
-            l = 63;
         if (lead >= 0 && l >= lead && t >= trail) {
-            bw_put(&w, 2, 2); /* 10: inside the previous window */
-            bw_put(&w, x >> trail, 64 - lead - trail);
+            int bits = 64 - lead - trail;
+            if (bits <= 62) {
+                bw_put(&w, (0x2ull << bits) | (x >> trail), 2 + bits);
+            } else {
+                bw_put(&w, 2, 2); /* 10: inside the previous window */
+                bw_put(&w, x >> trail, bits);
+            }
         } else {
-            bw_put(&w, 3, 2); /* 11: new window */
-            bw_put(&w, (uint64_t)l, 6);
             int len = 64 - l - t;
-            bw_put(&w, (uint64_t)(len - 1), 6);
-            bw_put(&w, x >> t, len);
+            uint64_t hdr = (0x3ull << 12) | ((uint64_t)l << 6) | (uint64_t)(len - 1);
+            if (len <= 50) {
+                bw_put(&w, (hdr << len) | (x >> t), 14 + len);
+            } else {
+                bw_put(&w, hdr, 14); /* 11 + l(6) + (len-1)(6) */
+                bw_put(&w, x >> t, len);
+            }
             lead = l;
             trail = t;
         }
     }
-    bw_flush(&w);
-    return (size_t)(w.p - out);
+    bw_zeros(&w, zeros);
+    return 8 + bw_finish(&w);
 }
 
 int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
@@ -573,36 +532,74 @@ int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
         return 0;
     if (len < 8)
         return TSDB_ERR_CORRUPT;
-    memcpy(&out[0], in, 8);
-    bitr r = {in + 8, in + len, 0};
-    int lead = -1, trail = 0;
-    for (size_t i = 1; i < n; i++) {
-        uint64_t b, x;
-        if (!br_get(&r, 1, &b))
+    uint64_t prev;
+    memcpy(&prev, in, 8);
+    out[0] = prev;
+    const uint8_t *b = in + 8;
+    const uint64_t limit = (uint64_t)(len - 8) * 8;
+    uint64_t pos = 0;
+    int trail = 0, bits = 0;
+    size_t i = 1;
+    while (i < n) {
+        if (UNLIKELY(pos >= limit))
             return TSDB_ERR_CORRUPT;
-        if (!b) {
-            out[i] = out[i - 1];
+        uint64_t w = br_peek(b, pos);
+        if (!(w >> 63)) {
+            size_t z = w ? (size_t)__builtin_clzll(w) : 64;
+            if (z > 57)
+                z = 57;
+            size_t r = MIN(z, n - i);
+            for (size_t j = 0; j < r; j++)
+                out[i + j] = prev;
+            i += r;
+            pos += r;
             continue;
         }
-        if (!br_get(&r, 1, &b))
-            return TSDB_ERR_CORRUPT;
-        if (b) {
-            uint64_t l, m;
-            if (!br_get(&r, 6, &l) || !br_get(&r, 6, &m))
+        uint64_t x;
+        if (!((w >> 62) & 1)) { /* 10: reuse the previous window */
+            if (UNLIKELY(!bits))
                 return TSDB_ERR_CORRUPT;
-            int len2 = (int)m + 1;
-            if ((int)l + len2 > 64)
+            if (bits <= 55) {
+                x = (w << 2) >> (64 - bits);
+                pos += 2 + (uint64_t)bits;
+            } else {
+                uint64_t p0 = pos + 2;
+                if (UNLIKELY(p0 + (uint64_t)bits > limit))
+                    return TSDB_ERR_CORRUPT;
+                uint64_t hi = br_peek(b, p0) >> 32;
+                int rem = bits - 32;
+                uint64_t lo = br_peek(b, p0 + 32) >> (64 - rem);
+                x = (hi << rem) | lo;
+                pos = p0 + (uint64_t)bits;
+            }
+        } else { /* 11: l6 (bits-1)6 data */
+            int l = (int)((w >> 56) & 0x3f);
+            bits = (int)((w >> 50) & 0x3f) + 1;
+            if (UNLIKELY(l + bits > 64))
                 return TSDB_ERR_CORRUPT;
-            lead = (int)l;
-            trail = 64 - lead - len2;
-        } else if (lead < 0) {
-            return TSDB_ERR_CORRUPT;
+            trail = 64 - l - bits;
+            if (bits <= 43) {
+                x = (w << 14) >> (64 - bits);
+                pos += 14 + (uint64_t)bits;
+            } else {
+                uint64_t p0 = pos + 14;
+                if (UNLIKELY(p0 + (uint64_t)bits > limit))
+                    return TSDB_ERR_CORRUPT;
+                if (bits <= 57) {
+                    x = br_peek(b, p0) >> (64 - bits);
+                } else {
+                    uint64_t hi = br_peek(b, p0) >> 32;
+                    int rem = bits - 32;
+                    uint64_t lo = br_peek(b, p0 + 32) >> (64 - rem);
+                    x = (hi << rem) | lo;
+                }
+                pos = p0 + (uint64_t)bits;
+            }
         }
-        if (!br_get(&r, 64 - lead - trail, &x))
-            return TSDB_ERR_CORRUPT;
-        out[i] = out[i - 1] ^ (x << trail);
+        prev ^= x << trail;
+        out[i++] = prev;
     }
-    return 0;
+    return pos <= limit ? 0 : TSDB_ERR_CORRUPT;
 }
 
 /* ------------------------------------------------------------------ blocks */

@@ -1411,6 +1411,9 @@ void mt_unref(memtable *m);
 int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
            uint64_t lsn0, int type);
 /* only rows with a WAL sequence <= visible; values as slots of width w */
+int mt_copy_raw(const memtable *m, uint32_t id, int64_t start, int64_t end, uint64_t visible, mem_run *out,
+                bool *sorted_out);
+int mt_finish(mem_run *out, size_t w, bool sorted);
 int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out);
 void mem_run_free(mem_run *r);
 void mt_note_fno(memtable *m, uint64_t first, size_t n);
@@ -1617,6 +1620,7 @@ extern void (*cls_test_after_switch)(struct eng *db);
 int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
 /* test hook: called by a leader's flush after cls_classify_active, before the seal (src/memtable.c) */
 extern void (*mt_test_before_seal)(struct eng *db);
+extern void (*mt_test_after_wal_enter)(struct eng *db);
 /* The driver's keep bound (design-cluster.md 8.3), inclusive: the highest position every replica has (one below the
  * lowest position any replica still needs: a replica's next `from` minus 1), at most the commit floor the driver saved.
  * A leader's flushed segment stays (a catch-up source, replica_read) until its last position is at or below
@@ -2024,7 +2028,7 @@ struct eng {
     _Alignas(64) pthread_mutex_t buf_lock; /* active memtable and pending WAL bytes */
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
     memtable *active;
-    uint64_t wal_appended;         /* the last position appended: an fno with the WAL on, else a count (buf_lock) */
+    _Atomic uint64_t wal_appended; /* the last position appended: an fno with the WAL on, else a count (buf_lock) */
     _Alignas(64) uint8_t *wal_buf; /* the pending WAL bytes: this field and the five below, under buf_lock */
     size_t wal_len, wal_cap;
     uint64_t fno_next;             /* the next record number to assign */

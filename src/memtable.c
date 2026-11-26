@@ -383,11 +383,14 @@ static void narrow(mem_run *out, size_t w)
     }
 }
 
-/* Copies the rows of series id in [start, end): sorted by time, last write
- * per timestamp. Reads only; the caller holds buf_lock when m is active. */
-int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out)
+/* Copies the raw rows of series id in [start, end) with lsn <= visible into out
+ * (values remain 8-byte slots, possibly unsorted/undeduplicated when !*sorted_out).
+ * Fast enough to run under buf_lock; call mt_finish() unlocked to sort, dedup, and narrow. */
+int mt_copy_raw(const memtable *m, uint32_t id, int64_t start, int64_t end, uint64_t visible, mem_run *out,
+                bool *sorted_out)
 {
     memset(out, 0, sizeof *out);
+    *sorted_out = true;
     if (id >= m->scap || m->s[id].n == 0)
         return 0;
     const mt_series *s = &m->s[id];
@@ -406,28 +409,36 @@ int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t 
         if (!vn)
             return 0;
     }
-    size_t lo = 0, hi = vn;
     if (s->sorted) {
-        lo = lower_bound_i64(s->ts, vn, start);
-        hi = lower_bound_i64(s->ts, vn, end);
+        size_t lo = lower_bound_i64(s->ts, vn, start);
+        size_t hi = lower_bound_i64(s->ts, vn, end);
         if (lo >= hi)
             return 0;
+        size_t cnt = hi - lo;
+        out->ts = malloc(cnt * sizeof *out->ts);
+        out->v = malloc(cnt * sizeof(uint64_t));
+        if (!out->ts || !out->v) {
+            mem_run_free(out);
+            return TSDB_ERR_NOMEM;
+        }
+        out->n = cnt;
+        memcpy(out->ts, s->ts + lo, cnt * sizeof *out->ts);
+        memcpy(out->v, s->v + lo, cnt * sizeof(uint64_t));
+        *sorted_out = true;
+        return 0;
     }
-    out->ts = malloc((hi - lo) * sizeof *out->ts);
-    out->v = malloc((hi - lo) * sizeof(uint64_t));
+    size_t cnt = 0;
+    for (size_t i = 0; i < vn; i++)
+        cnt += (size_t)(s->ts[i] >= start && s->ts[i] < end);
+    if (!cnt)
+        return 0;
+    out->ts = malloc(cnt * sizeof *out->ts);
+    out->v = malloc(cnt * sizeof(uint64_t));
     if (!out->ts || !out->v) {
         mem_run_free(out);
         return TSDB_ERR_NOMEM;
     }
     uint64_t *ov = (uint64_t *)(void *)out->v;
-    if (s->sorted) {
-        out->n = hi - lo;
-        memcpy(out->ts, s->ts + lo, out->n * sizeof *out->ts);
-        memcpy(ov, s->v + lo, out->n * sizeof *ov);
-        out->n = keep_last(out->ts, ov, out->n);
-        narrow(out, w);
-        return 0;
-    }
     for (size_t i = 0; i < vn; i++) {
         if (s->ts[i] >= start && s->ts[i] < end) {
             out->ts[out->n] = s->ts[i];
@@ -435,10 +446,33 @@ int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t 
             out->n++;
         }
     }
-    int rc = sort_by_time(out->ts, ov, out->n);
+    *sorted_out = false;
+    return 0;
+}
+
+/* Unlocked post-processing for a run copied by mt_copy_raw: sort, keep last per ts, narrow to w. */
+int mt_finish(mem_run *out, size_t w, bool sorted)
+{
+    if (!out->n)
+        return 0;
+    uint64_t *ov = (uint64_t *)(void *)out->v;
+    int rc = sorted ? 0 : sort_by_time(out->ts, ov, out->n);
+    if (rc) {
+        mem_run_free(out);
+        return rc;
+    }
     out->n = keep_last(out->ts, ov, out->n);
     narrow(out, w);
-    return rc;
+    return 0;
+}
+
+/* Copies the rows of series id in [start, end): sorted by time, last write
+ * per timestamp. Reads only; the caller holds buf_lock when m is active. */
+int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out)
+{
+    bool sorted;
+    int rc = mt_copy_raw(m, id, start, end, visible, out, &sorted);
+    return rc ? rc : mt_finish(out, w, sorted);
 }
 
 void mem_run_free(mem_run *r)
@@ -826,7 +860,8 @@ static int wal_markers_locked(eng *db, const wal_mrec *r, size_t n, uint64_t *fn
             db->fno_next += r[i].span;
             db->wal_len += WAL_HDR + plen;
         }
-        lsn = db->wal_appended = db->fno_next - 1; /* its last position (eng_leader_commit) */
+        lsn = db->fno_next - 1; /* its last position (eng_leader_commit) */
+        atomic_store_explicit(&db->wal_appended, lsn, memory_order_release);
     }
     *lsn_out = lsn;
     return rc;
@@ -999,7 +1034,7 @@ int wal_commit(eng *db, uint64_t target)
         pthread_mutex_lock(&db->buf_lock);
         uint8_t *buf = db->wal_buf;
         size_t cap = db->wal_cap, len = db->wal_len;
-        uint64_t upto = db->wal_appended;
+        uint64_t upto = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
         int fd = db->wal_fd;
         uint64_t seq = db->wal_seq;
         wal_rec_close(db);
@@ -1365,8 +1400,9 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         if (rc && series)
             mt_unreserve(db->active, series, n); /* no mt_add clears the counts */
     }
+    uint64_t app = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
     if (rc == 0) {
-        const uint64_t f0 = db->wal_enabled ? fno0 : db->wal_appended + 1;
+        const uint64_t f0 = db->wal_enabled ? fno0 : app + 1;
         rc = mt_add(db->active, series, cs, ts, v, w, n, f0, type);
         if (rc == 0)
             eng_ppos_rows(db, db->active, PPOS_SITE_INSERT, ts, n, f0, NULL);
@@ -1377,9 +1413,11 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
      * when it is sealed (mt_flush: db->fno_rows_hi), not a store of both on the memtable's line with every call */
     if (rc == 0 && fno0 && !db->active->fno_lo)
         db->active->fno_lo = fno0;
-    if (counted) /* the last position: with the WAL on, the batch's last fno (the leader's commit point is one too) */
-        db->wal_appended = db->wal_enabled ? fno0 + n - 1 : db->wal_appended + n;
-    uint64_t lsn = db->wal_appended;
+    uint64_t lsn = app;
+    if (counted) { /* the last position: with the WAL on, the batch's last fno (the leader's commit point is one too) */
+        lsn = db->wal_enabled ? fno0 + n - 1 : app + n;
+        atomic_store_explicit(&db->wal_appended, lsn, memory_order_release);
+    }
     size_t rows = db->active->rows;
     if (rows >= db->opt.buffer_rows)
         pthread_cond_signal(&db->flush_cv);
@@ -1719,6 +1757,7 @@ int flush_waiting(eng *db)
 }
 
 void (*mt_test_before_seal)(eng *db);
+void (*mt_test_after_wal_enter)(eng *db);
 
 /* Turns the active memtable into parts. Rows stay visible throughout: the
  * memtable is moved to the flushing list and only leaves it together with
@@ -1769,79 +1808,126 @@ static int mt_flush_do(eng *db, const mk *marker, uint64_t *fno, bool held)
     void (*seal_hook)(eng *) = __atomic_load_n(&mt_test_before_seal, __ATOMIC_ACQUIRE);
     if (rc == 0 && seal_hook)
         seal_hook(db);
-    wal_writer_enter(db); /* no commit may write to the segment being retired */
-    pthread_mutex_lock(&db->buf_lock);
-    bool empty = db->active->rows == 0;
-    if (marker && rc == 0 && empty && eng_check(db) == 0) { /* in the same hold as the check: no row slips in before it */
-        uint32_t span;
-        memcpy(&span, mbody + 4, 4);
-        rc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno, &mlsn);
-        marker = NULL; /* done */
-    }
-    pthread_mutex_unlock(&db->buf_lock);
-    if (rc == 0)
-        rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
-    if (rc == 0 && !empty && db->nflushing == 0) {
-        uint64_t seq = db->wal_seq + 1;
-        int newfd = -1;
-        memtable *nm = mt_new(seq);
-        if (!nm)
-            rc = TSDB_ERR_NOMEM;
-        else if (db->wal_enabled)
-            rc = wal_open_segment(db, seq, &newfd);
-        if (rc) {
-            mt_unref(nm);
-        } else {
-            pthread_mutex_lock(&db->lock);
-            pthread_mutex_lock(&db->buf_lock);
-            memtable *m = db->active;
-            db->active = nm;
-            if (m->fno_lo) /* it took rows records, and the last of them is the last the WAL took (all under buf_lock) */
-                m->fno_hi = MAX(m->fno_hi, db->fno_rows_hi);
-            if (eng_test_mutant != MUT_FLUSH_NOCLOSE) /* planted: the tail keeps a header with no count (test_fno) */
-                wal_rec_close(db);
-            uint8_t *buf = db->wal_buf;
-            size_t len = db->wal_len;
-            uint64_t upto = db->wal_appended;
-            int oldfd = db->wal_fd;
-            uint64_t oldseq = db->wal_seq, oldoff = db->wal_off;
-            db->wal_off = 0;
-            db->wal_buf = NULL;
-            db->wal_cap = db->wal_len = 0;
-            m->fno_end = db->fno_next; /* the end of the old segment: FNO holds it before the segment goes */
-            db->wal_fd = newfd;
-            db->wal_seq = seq;
-            db->flushing[db->nflushing++] = m;
-            int mrc = 0; /* the marker's own result: the old segment's write below must not hide a refusal (admit) */
-            if (marker) { /* the first record of the new segment */
-                uint32_t span;
-                memcpy(&span, mbody + 4, 4);
-                mrc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno,
-                                        &mlsn);
-                marker = NULL;
+    /* Pre-allocate the next memtable and open/dir-sync the next WAL segment before taking the
+     * WAL writer role: flush_lock already prevents db->wal_seq and db->nflushing from changing,
+     * so concurrent wal_commit() callers are not stalled on openat() / fsync(dirfd). */
+    uint64_t seq = db->wal_seq + 1;
+    memtable *nm = NULL;
+    int newfd = -1;
+    if (rc == 0 && eng_check(db) == 0 && db->nflushing == 0) {
+        pthread_mutex_lock(&db->buf_lock);
+        bool pre_empty = db->active->rows == 0;
+        pthread_mutex_unlock(&db->buf_lock);
+        if (!pre_empty) {
+            nm = mt_new(seq);
+            if (!nm)
+                rc = TSDB_ERR_NOMEM;
+            else if (db->wal_enabled) {
+                rc = wal_open_segment(db, seq, &newfd);
+                if (rc) {
+                    mt_unref(nm);
+                    nm = NULL;
+                }
             }
-            pthread_mutex_unlock(&db->buf_lock);
-            pthread_mutex_unlock(&db->lock);
-            if (db->wal_enabled) {
-                /* the rest of the old segment; a part will hold these rows, but
-                 * until then the segment is what makes them durable */
-                rc = wal_write_sync(db, oldfd, oldseq, &oldoff, buf, len, upto);
-                close(oldfd);
-                if (rc == 0)
-                    wal_durable_set(db, upto);
-            }
-            free(buf);
-            manifest_publish(db); /* followers start tailing the new segment */
-            /* a marker refused here (a leader's admission: min_isr, not leading, deposed) was not appended: the call
-             * fails, the sealed memtable stays in flushing for the next flush (a DROP never retires without its
-             * marker) */
-            if (rc == 0 && eng_test_mutant != MUT_LEADER_MARKER_RC)
-                rc = mrc;
         }
     }
-    if (marker && rc == 0)
-        rc = TSDB_ERR_IO; /* no marker was appended (a memtable still waiting to flush): the caller must not go on */
-    wal_writer_leave(db);
+    bool rotated = false;
+    if (rc == 0) {
+        wal_writer_enter(db); /* no commit may write to the segment being retired */
+        void (*after_enter)(eng *) = __atomic_load_n(&mt_test_after_wal_enter, __ATOMIC_ACQUIRE);
+        if (UNLIKELY(after_enter != NULL))
+            after_enter(db);
+        pthread_mutex_lock(&db->buf_lock);
+        bool empty = db->active->rows == 0;
+        if (marker && empty && eng_check(db) == 0) { /* in the same hold as the check: no row slips in before it */
+            uint32_t span;
+            memcpy(&span, mbody + 4, 4);
+            rc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno, &mlsn);
+            marker = NULL; /* done */
+        }
+        pthread_mutex_unlock(&db->buf_lock);
+        if (rc == 0)
+            rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
+        if (rc == 0 && !empty && db->nflushing == 0) {
+            /* rare case: active was empty at pre-peek and a row arrived before wal_writer_enter */
+            if (!nm) {
+                nm = mt_new(seq);
+                if (!nm)
+                    rc = TSDB_ERR_NOMEM;
+                else if (db->wal_enabled)
+                    rc = wal_open_segment(db, seq, &newfd);
+            }
+            if (rc == 0) {
+                pthread_mutex_lock(&db->lock);
+                pthread_mutex_lock(&db->buf_lock);
+                memtable *m = db->active;
+                db->active = nm;
+                nm = NULL;
+                if (m->fno_lo) /* it took rows records, and the last of them is the last the WAL took (all under buf_lock) */
+                    m->fno_hi = MAX(m->fno_hi, db->fno_rows_hi);
+                if (eng_test_mutant != MUT_FLUSH_NOCLOSE) /* planted: the tail keeps a header with no count (test_fno) */
+                    wal_rec_close(db);
+                uint8_t *buf = db->wal_buf;
+                size_t cap = db->wal_cap, len = db->wal_len;
+                uint64_t upto = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
+                int oldfd = db->wal_fd;
+                uint64_t oldseq = db->wal_seq, oldoff = db->wal_off;
+                db->wal_off = 0;
+                /* recycle wal_spare as wal_commit does: avoid discarding and re-faulting wal_buf under buf_lock */
+                db->wal_buf = db->wal_spare;
+                db->wal_cap = db->wal_spare_cap;
+                db->wal_len = 0;
+                db->wal_spare = NULL;
+                db->wal_spare_cap = 0;
+                m->fno_end = db->fno_next; /* the end of the old segment: FNO holds it before the segment goes */
+                db->wal_fd = newfd;
+                newfd = -1;
+                db->wal_seq = seq;
+                db->flushing[db->nflushing++] = m;
+                int mrc = 0; /* the marker's own result: the old segment's write below must not hide a refusal (admit) */
+                if (marker) { /* the first record of the new segment */
+                    uint32_t span;
+                    memcpy(&span, mbody + 4, 4);
+                    mrc = wal_marker_locked(db, marker->type, marker->flags, span, mbody + MK_HDR, mlen - MK_HDR, fno,
+                                            &mlsn);
+                    marker = NULL;
+                }
+                pthread_mutex_unlock(&db->buf_lock);
+                pthread_mutex_unlock(&db->lock);
+                if (db->wal_enabled) {
+                    /* the rest of the old segment; a part will hold these rows, but
+                     * until then the segment is what makes them durable */
+                    rc = wal_write_sync(db, oldfd, oldseq, &oldoff, buf, len, upto);
+                    close(oldfd);
+                    if (rc == 0)
+                        wal_durable_set(db, upto);
+                }
+                db->wal_spare = buf;
+                db->wal_spare_cap = cap;
+                rotated = true;
+                /* a marker refused here (a leader's admission: min_isr, not leading, deposed) was not appended: the call
+                 * fails, the sealed memtable stays in flushing for the next flush (a DROP never retires without its
+                 * marker) */
+                if (rc == 0 && eng_test_mutant != MUT_LEADER_MARKER_RC)
+                    rc = mrc;
+            }
+        }
+        if (marker && rc == 0)
+            rc = TSDB_ERR_IO; /* no marker was appended (a memtable still waiting to flush): the caller must not go on */
+        wal_writer_leave(db);
+    }
+    if (nm)
+        mt_unref(nm);
+    if (newfd >= 0) {
+        close(newfd);
+        if (!eng_check(db)) {
+            char name[64];
+            wal_name(name, sizeof name, seq);
+            (void)unlinkat(db->dirfd, name, 0);
+        }
+    }
+    if (rotated)
+        manifest_publish(db); /* followers start tailing the new segment (outside wal_writing) */
 
     if (rc == 0)
         rc = flush_waiting(db);
@@ -1891,7 +1977,7 @@ void *flusher_main(void *arg)
         bool flush = db->active->rows &&
                      (db->active->rows >= db->opt.buffer_rows || now - db->active->created_ms >= interval);
         bool sync = db->opt.wal_sync_ms > 0 && now - db->last_wal_sync_ms >= db->opt.wal_sync_ms;
-        uint64_t target = db->wal_appended;
+        uint64_t target = atomic_load_explicit(&db->wal_appended, memory_order_relaxed);
         lead = eng_jr(db) && !db->rp;
         now_every = atomic_load(&db->lead_now_ms);
         seal_ms = atomic_load(&db->lead_seal_ms);
@@ -2454,9 +2540,10 @@ void wal_close(eng *db)
     mt_unref(db->active);
     db->active = NULL;
     replica_free(db);
-    free(db->wal_buf);
-    free(db->wal_spare);
+    tsdb_free_big(db->wal_buf, db->wal_cap);
+    tsdb_free_big(db->wal_spare, db->wal_spare_cap);
     db->wal_buf = db->wal_spare = NULL;
+    db->wal_cap = db->wal_spare_cap = 0;
 }
 
 /* ------------------------------------------- recovery of a halted engine */

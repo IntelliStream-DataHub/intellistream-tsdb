@@ -118,7 +118,7 @@ int cut_take(eng *db, qcut *c)
     }
     uint64_t visible = eng_visible(db); /* a leader: no further than its commit point */
     pthread_mutex_lock(&db->buf_lock);
-    c->visible = MIN(visible, db->wal_appended);
+    c->visible = MIN(visible, atomic_load_explicit(&db->wal_appended, memory_order_relaxed));
     if (db->active) {
         mt_ref(db->active);
         c->ms[c->nms++] = db->active;
@@ -188,21 +188,46 @@ static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64
             s->parts[s->np++] = p;
         }
     }
-    bool locked = rc == 0 && (c->ntails || c->has_active);
-    if (locked)
-        pthread_mutex_lock(&db->buf_lock); /* tails and the active memtable may still grow */
-    for (size_t i = 0; rc == 0 && i < c->ntails + c->nms; i++) {
-        bool tail = i < c->ntails;
-        const memtable *m = tail ? c->tails[i] : c->ms[i - c->ntails];
+    mem_run tail_raw[MAX_TAILS];
+    bool tail_sorted[MAX_TAILS];
+    memset(tail_raw, 0, sizeof tail_raw);
+    mem_run act_raw = {0};
+    bool act_sorted = true;
+    /* Only tails and the active memtable may still grow: copy their raw slices under buf_lock,
+     * then sort/dedup and read immutable flushing memtables completely unlocked. */
+    if (rc == 0 && (c->ntails || c->has_active)) {
+        pthread_mutex_lock(&db->buf_lock);
+        for (size_t i = 0; rc == 0 && i < c->ntails; i++)
+            rc = mt_copy_raw(c->tails[i], series, start, end, c->tail_visible, &tail_raw[i], &tail_sorted[i]);
+        if (rc == 0 && c->has_active)
+            rc = mt_copy_raw(c->ms[c->nms - 1], series, start, end, c->visible, &act_raw, &act_sorted);
+        pthread_mutex_unlock(&db->buf_lock);
+    }
+    for (size_t i = 0; i < c->ntails; i++) {
+        if (rc == 0)
+            rc = mt_finish(&tail_raw[i], w, tail_sorted[i]);
+        if (rc == 0 && tail_raw[i].n)
+            s->mem[s->nmem++] = tail_raw[i];
+        else
+            mem_run_free(&tail_raw[i]);
+    }
+    size_t nflush = c->nms - (c->has_active ? 1 : 0);
+    for (size_t i = 0; rc == 0 && i < nflush; i++) {
         mem_run r = {0};
-        rc = mt_collect(m, series, w, start, end, tail ? c->tail_visible : c->visible, &r);
-        if (r.n)
+        rc = mt_collect(c->ms[i], series, w, start, end, c->visible, &r);
+        if (rc == 0 && r.n)
             s->mem[s->nmem++] = r;
         else
             mem_run_free(&r);
     }
-    if (locked)
-        pthread_mutex_unlock(&db->buf_lock);
+    if (c->has_active) {
+        if (rc == 0)
+            rc = mt_finish(&act_raw, w, act_sorted);
+        if (rc == 0 && act_raw.n)
+            s->mem[s->nmem++] = act_raw;
+        else
+            mem_run_free(&act_raw);
+    }
     if (rc == 0)
         rc = snapshot_prepare(db, s, series, start, end);
     if (rc)
@@ -222,14 +247,21 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     }
     memtable *ms[MAX_FLUSHING];
     size_t nms = 0;
+    memtable *tail_ms[MAX_TAILS];
+    size_t ntail_ms = 0;
+    memtable *active_m = NULL;
     int rc = 0;
-    mem_run active = {0};
     pthread_mutex_lock(&db->lock);
     /* With a WAL synced on every write, a row is visible once it is durable:
      * no reader sees a write that a power failure could still take back. That
      * includes the flushing memtables: a flush rotates the active one before
-     * it writes and syncs the rest of its segment. */
+     * it writes and syncs the rest of its segment. Bound by wal_appended read
+     * under db->lock so rows appended after we drop db->lock (possibly after
+     * a newer large insert) stay outside this snapshot. */
     uint64_t visible = eng_visible(db); /* a leader: no further than its commit point */
+    uint64_t app = atomic_load_explicit(&db->wal_appended, memory_order_acquire);
+    if (app < visible)
+        visible = app;
     s->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *s->parts);
     if (s->parts) {
         for (size_t i = 0; i < db->nparts; i++) {
@@ -246,45 +278,61 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
         mt_ref(db->flushing[i]);
         ms[nms++] = db->flushing[i];
     }
-    /* a follower's WAL tails: written to by the follower thread, so read under buf_lock */
-    mem_run tails[MAX_TAILS];
-    size_t ntails = 0;
-    if (rc == 0 && (db->active || db->ntails)) {
-        pthread_mutex_lock(&db->buf_lock);
-        for (size_t i = 0; rc == 0 && i < db->ntails; i++) {
-            rc = mt_collect(db->tails[i].m, series, w, start, end, UINT64_MAX, &tails[ntails]);
-            if (tails[ntails].n)
-                ntails++;
-            else
-                mem_run_free(&tails[ntails]);
+    if (rc == 0) {
+        for (size_t i = 0; i < db->ntails; i++) {
+            mt_ref(db->tails[i].m);
+            tail_ms[ntail_ms++] = db->tails[i].m;
         }
-        if (rc == 0 && db->active)
-            rc = mt_collect(db->active, series, w, start, end, visible, &active);
-        pthread_mutex_unlock(&db->buf_lock);
+        if (db->active) {
+            mt_ref(db->active);
+            active_m = db->active;
+        }
     }
     pthread_mutex_unlock(&db->lock);
 
-    s->mem = calloc(nms + ntails + 1, sizeof *s->mem);
-    for (size_t i = 0; i < ntails; i++) { /* oldest first, like the writer's memtables */
-        if (s->mem)
+    /* Copy raw slices of mutable memtables under buf_lock alone, then drop buf_lock before sorting/deduping. */
+    mem_run tails[MAX_TAILS];
+    bool tail_sorted[MAX_TAILS];
+    memset(tails, 0, sizeof tails);
+    mem_run active = {0};
+    bool act_sorted = true;
+    if (rc == 0 && (ntail_ms || active_m)) {
+        pthread_mutex_lock(&db->buf_lock);
+        for (size_t i = 0; rc == 0 && i < ntail_ms; i++)
+            rc = mt_copy_raw(tail_ms[i], series, start, end, UINT64_MAX, &tails[i], &tail_sorted[i]);
+        if (rc == 0 && active_m)
+            rc = mt_copy_raw(active_m, series, start, end, visible, &active, &act_sorted);
+        pthread_mutex_unlock(&db->buf_lock);
+    }
+    for (size_t i = 0; i < ntail_ms; i++)
+        mt_unref(tail_ms[i]);
+    mt_unref(active_m);
+
+    s->mem = calloc(nms + ntail_ms + 1, sizeof *s->mem);
+    if (!s->mem && rc == 0)
+        rc = TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < ntail_ms; i++) { /* oldest first, like the writer's memtables */
+        if (rc == 0)
+            rc = mt_finish(&tails[i], w, tail_sorted[i]);
+        if (rc == 0 && tails[i].n && s->mem)
             s->mem[s->nmem++] = tails[i];
         else
             mem_run_free(&tails[i]);
     }
-    if (!s->mem && rc == 0)
-        rc = TSDB_ERR_NOMEM;
     for (size_t i = 0; i < nms; i++) {
         /* flushing memtables are immutable: read them without locks */
         mem_run r = {0};
         if (rc == 0)
             rc = mt_collect(ms[i], series, w, start, end, visible, &r);
-        if (r.n && s->mem)
+        if (rc == 0 && r.n && s->mem)
             s->mem[s->nmem++] = r;
         else
             mem_run_free(&r);
         mt_unref(ms[i]);
     }
-    if (active.n && s->mem)
+    if (rc == 0)
+        rc = mt_finish(&active, w, act_sorted);
+    if (rc == 0 && active.n && s->mem)
         s->mem[s->nmem++] = active;
     else
         mem_run_free(&active);
