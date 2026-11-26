@@ -289,6 +289,8 @@ static int rd_choose(const void *in, int width, size_t n, int rmin, uint16_t *di
     return best_r;
 }
 
+#define RD_CHUNK 1024 /* multiple of 8: packed b-bit and r-bit streams are byte-aligned per chunk */
+
 size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
 {
     if (n == 0)
@@ -296,30 +298,39 @@ size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
     int nd;
     uint16_t dict[RD_DICT];
     int r = rd_choose(in, 4, n, 16, dict, &nd), b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
-    uint32_t *idx = malloc(n * sizeof *idx), *right = malloc(n * sizeof *right);
-    uint8_t *exc = malloc(n * 4);
-    if (!idx || !right || !exc) {
-        free(idx);
-        free(right);
-        free(exc);
-        return 0;
-    }
+    size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
+    uint8_t *oi = out + RD_HDR, *or_ = oi + pi, *ox = or_ + pr + 8; /* +8 clears pack()'s <=3-byte pad */
+    uint8_t saved_or[8] = {0};
+    uint32_t idx[RD_CHUNK], right[RD_CHUNK];
+    const uint32_t low = r == 32 ? UINT32_MAX : (1u << r) - 1;
     uint32_t nexc = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint16_t left = (uint16_t)(in[i] >> r);
-        int k = 0;
-        while (k < nd && dict[k] != left)
-            k++;
-        if (k == nd) {
-            uint16_t pos16 = (uint16_t)i, lv = left;
-            memcpy(exc + 4 * nexc, &pos16, 2); /* granules are at most 65536 rows */
-            memcpy(exc + 4 * nexc + 2, &lv, 2);
-            nexc++;
-            k = 0;
+    for (size_t v0 = 0; v0 < n; v0 += RD_CHUNK) {
+        size_t nv = n - v0 < RD_CHUNK ? n - v0 : RD_CHUNK;
+        for (size_t i = 0; i < nv; i++) {
+            uint32_t v = in[v0 + i];
+            uint16_t left = (uint16_t)(v >> r);
+            int k = 0;
+            while (k < nd && dict[k] != left)
+                k++;
+            if (k == nd) {
+                uint16_t pos16 = (uint16_t)(v0 + i), lv = left;
+                memcpy(ox + 4 * (size_t)nexc, &pos16, 2); /* granules are at most 65536 rows */
+                memcpy(ox + 4 * (size_t)nexc + 2, &lv, 2);
+                nexc++;
+                k = 0;
+            }
+            idx[i] = (uint32_t)k;
+            right[i] = v & low;
         }
-        idx[i] = (uint32_t)k;
-        right[i] = r == 32 ? in[i] : in[i] & ((1u << r) - 1);
+        pack(idx, nv, b, oi + (v0 >> 3) * (size_t)b);
+        pack(right, nv, r, or_ + (v0 >> 3) * (size_t)r);
+        if (v0 == 0 && n > RD_CHUNK)
+            memcpy(saved_or, or_, 8); /* later chunks of oi may pad up to 3 bytes into or_[0..2] */
     }
+    if (n > RD_CHUNK)
+        memcpy(or_, saved_or, 8);
+    if (nexc)
+        memmove(or_ + pr, ox, (size_t)nexc * 4);
     out[0] = (uint8_t)r;
     out[1] = (uint8_t)b;
     out[2] = (uint8_t)nd;
@@ -327,18 +338,7 @@ size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
     memset(out + 4, 0, 16);
     memcpy(out + 4, dict, (size_t)nd * 2);
     store32(out + 20, nexc);
-    uint8_t *o = out + RD_HDR;
-    size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
-    pack(idx, n, b, o);
-    o += pi;
-    pack(right, n, r, o);
-    o += pr;
-    memcpy(o, exc, (size_t)nexc * 4);
-    o += (size_t)nexc * 4;
-    free(idx);
-    free(right);
-    free(exc);
-    return (size_t)(o - out);
+    return RD_HDR + pi + pr + (size_t)nexc * 4;
 }
 
 int alprd_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
@@ -354,26 +354,34 @@ int alprd_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
     size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
     if (r < 1 || r > 31 || b > 3 || nd > RD_DICT || nexc > n || len != RD_HDR + pi + pr + (size_t)nexc * 4)
         return TSDB_ERR_CORRUPT;
-    uint32_t *idx = malloc(n * sizeof *idx);
-    if (!idx)
-        return TSDB_ERR_NOMEM;
     const uint8_t *p = in + RD_HDR;
-    unpack(p, n, b, idx);
-    unpack(p + pi, n, r, out); /* the low parts, high parts OR'd in below */
     uint32_t left[RD_DICT];
     for (int k = 0; k < RD_DICT; k++)
         left[k] = k < nd ? (uint32_t)dict[k] << r : 0;
-    for (size_t i = 0; i < n; i++)
-        out[i] |= left[idx[i] & (RD_DICT - 1)];
-    free(idx);
+    if (b == 0) {
+        unpack(p + pi, n, r, out);
+        uint32_t l0 = left[0];
+        for (size_t i = 0; i < n; i++)
+            out[i] |= l0;
+    } else {
+        uint32_t idx[RD_CHUNK];
+        for (size_t v0 = 0; v0 < n; v0 += RD_CHUNK) {
+            size_t nv = n - v0 < RD_CHUNK ? n - v0 : RD_CHUNK;
+            unpack(p + (v0 >> 3) * (size_t)b, nv, b, idx);
+            unpack(p + pi + (v0 >> 3) * (size_t)r, nv, r, out + v0);
+            for (size_t i = 0; i < nv; i++)
+                out[v0 + i] |= left[idx[i] & (RD_DICT - 1)];
+        }
+    }
     const uint8_t *x = p + pi + pr;
+    const uint32_t low = (1u << r) - 1;
     for (uint32_t j = 0; j < nexc; j++) {
         uint16_t pos, lv;
         memcpy(&pos, x + 4 * j, 2);
         memcpy(&lv, x + 4 * j + 2, 2);
         if (pos >= n)
             return TSDB_ERR_CORRUPT;
-        out[pos] = ((uint32_t)lv << r) | (out[pos] & ((1u << r) - 1));
+        out[pos] = ((uint32_t)lv << r) | (out[pos] & low);
     }
     return 0;
 }
@@ -399,32 +407,40 @@ size_t alprd64_encode(const uint64_t *in, size_t n, uint8_t *out)
     int nd;
     uint16_t dict[RD_DICT];
     int r = rd_choose(in, 8, n, 48, dict, &nd), b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
-    uint32_t *idx = malloc(n * sizeof *idx);
-    uint64_t *right = malloc(n * sizeof *right);
-    uint8_t *exc = malloc(n * 4);
-    if (!idx || !right || !exc) {
-        free(idx);
-        free(right);
-        free(exc);
-        return 0;
-    }
+    size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
+    uint8_t *oi = out + RD_HDR, *or_ = oi + pi, *ox = or_ + pr + 8; /* +8 clears pack64()'s <=7-byte pad */
+    uint8_t saved_or[8] = {0};
+    uint32_t idx[RD_CHUNK];
+    uint64_t right[RD_CHUNK];
     uint32_t nexc = 0;
     const uint64_t low = (1ull << r) - 1;
-    for (size_t i = 0; i < n; i++) {
-        uint16_t left = (uint16_t)(in[i] >> r);
-        int k = 0;
-        while (k < nd && dict[k] != left)
-            k++;
-        if (k == nd) {
-            uint16_t pos16 = (uint16_t)i, lv = left;
-            memcpy(exc + 4 * nexc, &pos16, 2);
-            memcpy(exc + 4 * nexc + 2, &lv, 2);
-            nexc++;
-            k = 0;
+    for (size_t v0 = 0; v0 < n; v0 += RD_CHUNK) {
+        size_t nv = n - v0 < RD_CHUNK ? n - v0 : RD_CHUNK;
+        for (size_t i = 0; i < nv; i++) {
+            uint64_t v = in[v0 + i];
+            uint16_t left = (uint16_t)(v >> r);
+            int k = 0;
+            while (k < nd && dict[k] != left)
+                k++;
+            if (k == nd) {
+                uint16_t pos16 = (uint16_t)(v0 + i), lv = left;
+                memcpy(ox + 4 * (size_t)nexc, &pos16, 2);
+                memcpy(ox + 4 * (size_t)nexc + 2, &lv, 2);
+                nexc++;
+                k = 0;
+            }
+            idx[i] = (uint32_t)k;
+            right[i] = v & low;
         }
-        idx[i] = (uint32_t)k;
-        right[i] = in[i] & low;
+        pack(idx, nv, b, oi + (v0 >> 3) * (size_t)b);
+        pack64(right, nv, r, or_ + (v0 >> 3) * (size_t)r);
+        if (v0 == 0 && n > RD_CHUNK)
+            memcpy(saved_or, or_, 8);
     }
+    if (n > RD_CHUNK)
+        memcpy(or_, saved_or, 8);
+    if (nexc)
+        memmove(or_ + pr, ox, (size_t)nexc * 4);
     out[0] = (uint8_t)r;
     out[1] = (uint8_t)b;
     out[2] = (uint8_t)nd;
@@ -432,17 +448,7 @@ size_t alprd64_encode(const uint64_t *in, size_t n, uint8_t *out)
     memset(out + 4, 0, 16);
     memcpy(out + 4, dict, (size_t)nd * 2);
     store32(out + 20, nexc);
-    uint8_t *o = out + RD_HDR;
-    pack(idx, n, b, o);
-    o += packed_bytes(n, b);
-    pack64(right, n, r, o);
-    o += packed_bytes(n, r);
-    memcpy(o, exc, (size_t)nexc * 4);
-    o += (size_t)nexc * 4;
-    free(idx);
-    free(right);
-    free(exc);
-    return (size_t)(o - out);
+    return RD_HDR + pi + pr + (size_t)nexc * 4;
 }
 
 int alprd64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
@@ -458,18 +464,25 @@ int alprd64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
     size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
     if (r < 48 || r > 63 || b > 3 || nd > RD_DICT || nexc > n || len != RD_HDR + pi + pr + (size_t)nexc * 4)
         return TSDB_ERR_CORRUPT;
-    uint32_t *idx = malloc(n * sizeof *idx);
-    if (!idx)
-        return TSDB_ERR_NOMEM;
     const uint8_t *p = in + RD_HDR;
-    unpack(p, n, b, idx);
-    unpack64(p + pi, n, r, out); /* the low parts, high parts OR'd in below */
     uint64_t left[RD_DICT];
     for (int k = 0; k < RD_DICT; k++)
         left[k] = k < nd ? (uint64_t)dict[k] << r : 0;
-    for (size_t i = 0; i < n; i++)
-        out[i] |= left[idx[i] & (RD_DICT - 1)];
-    free(idx);
+    if (b == 0) {
+        unpack64(p + pi, n, r, out);
+        uint64_t l0 = left[0];
+        for (size_t i = 0; i < n; i++)
+            out[i] |= l0;
+    } else {
+        uint32_t idx[RD_CHUNK];
+        for (size_t v0 = 0; v0 < n; v0 += RD_CHUNK) {
+            size_t nv = n - v0 < RD_CHUNK ? n - v0 : RD_CHUNK;
+            unpack(p + (v0 >> 3) * (size_t)b, nv, b, idx);
+            unpack64(p + pi + (v0 >> 3) * (size_t)r, nv, r, out + v0);
+            for (size_t i = 0; i < nv; i++)
+                out[v0 + i] |= left[idx[i] & (RD_DICT - 1)];
+        }
+    }
     const uint8_t *x = p + pi + pr;
     const uint64_t low = (1ull << r) - 1;
     for (uint32_t j = 0; j < nexc; j++) {

@@ -135,6 +135,87 @@ static size_t int_bp_decode_prefix(const uint8_t *in, size_t len, size_t n, int6
     return (size_t)(p - in);
 }
 
+static size_t int_bp_encode_u32(const uint32_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0)
+        return 0;
+    int64_t first = (int64_t)in[0];
+    memcpy(out, &first, 8);
+    uint8_t *o = out + 8;
+    uint64_t z[IBP_VEC];
+    uint32_t z32[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        uint64_t all = 0;
+        for (size_t i = 0; i < nv; i++) {
+            z[i] = zz((int64_t)in[v0 + i] - (int64_t)in[v0 + i - 1]);
+            all |= z[i];
+        }
+        if (all >> 32) {
+            *o++ = 64;
+            memcpy(o, z, nv * 8);
+            o += nv * 8;
+            continue;
+        }
+        int w = bits_for((uint32_t)all);
+        *o++ = (uint8_t)w;
+        for (size_t i = 0; i < nv; i++)
+            z32[i] = (uint32_t)z[i];
+        pack(z32, nv, w, o);
+        o += packed_bytes(nv, w);
+    }
+    return (size_t)(o - out);
+}
+
+static int int_bp_decode_u32(const uint8_t *in, size_t len, size_t n, uint32_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < 8)
+        return TSDB_ERR_CORRUPT;
+    int64_t k;
+    memcpy(&k, in, 8);
+    out[0] = (uint32_t)k;
+    const uint8_t *p = in + 8, *end = in + len;
+    uint32_t z[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        if (p >= end)
+            return TSDB_ERR_CORRUPT;
+        int w = *p++;
+        if (w == 64) {
+            if ((size_t)(end - p) < nv * 8)
+                return TSDB_ERR_CORRUPT;
+            for (size_t i = 0; i < nv; i++) {
+                uint64_t zi;
+                memcpy(&zi, p + 8 * i, 8);
+                k = (int64_t)((uint64_t)k + (uint64_t)unzz(zi));
+                out[v0 + i] = (uint32_t)k;
+            }
+            p += nv * 8;
+            continue;
+        }
+        size_t pb = packed_bytes(nv, w);
+        if (w > 32 || (size_t)(end - p) < pb)
+            return TSDB_ERR_CORRUPT;
+        unpack(p, nv, w, z);
+        p += pb;
+        if (w <= ZZ_PREFIX32_MAX_W) {
+            uint32_t total = zz_prefix32(z, nv);
+            uint32_t k32 = (uint32_t)k;
+            for (size_t i = 0; i < nv; i++)
+                out[v0 + i] = k32 + z[i];
+            k = (int64_t)((uint64_t)k + (uint64_t)(int64_t)(int32_t)total);
+            continue;
+        }
+        for (size_t i = 0; i < nv; i++) {
+            k = (int64_t)((uint64_t)k + (uint64_t)unzz(z[i]));
+            out[v0 + i] = (uint32_t)k;
+        }
+    }
+    return p == end ? 0 : TSDB_ERR_CORRUPT;
+}
+
 int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
 {
     if (n == 0)
@@ -189,7 +270,27 @@ static inline bool f64_int(double v, int e, bool mul, int64_t *k)
     return a == b; /* bitwise: -0.0 and NaN (nulls too) become exceptions */
 }
 
-#ifdef F64_AVX2
+#if defined(__AVX512DQ__) && defined(__AVX512VL__)
+#define F64_VEC_ENC 1
+#include <immintrin.h>
+
+static inline __attribute__((always_inline)) bool f64_int4(const double *in, __m256d vsc, __m256d vinv, const bool mul,
+                                                           int64_t *k)
+{
+    __m256d v = _mm256_loadu_pd(in);
+    __m256d d = _mm256_mul_pd(v, vsc);
+    if (_mm256_cmp_pd_mask(_mm256_andnot_pd(_mm256_set1_pd(-0.0), d), _mm256_set1_pd(F64_LIMIT), _CMP_LT_OQ) != 15)
+        return false;
+    __m256i ki = _mm256_cvtpd_epi64(d);
+    __m256d kd = _mm256_cvtepi64_pd(ki);
+    __m256d back = mul ? _mm256_mul_pd(kd, vinv) : _mm256_div_pd(kd, vsc);
+    if (_mm256_cmpeq_epi64_mask(_mm256_castpd_si256(back), _mm256_castpd_si256(v)) != 15)
+        return false;
+    _mm256_storeu_si256((__m256i *)(void *)k, ki);
+    return true;
+}
+#elif defined(F64_AVX2)
+#define F64_VEC_ENC 1
 /* Integers of magnitude below 2^51 convert exactly through the mantissa: 1.5 * 2^52 plus k is the double
  * 0x4338000000000000 + k, and adding a double d to 1.5 * 2^52 rounds it to the nearest integer (ties to even,
  * as llrint does in the default rounding mode) for |d| < 2^51. Both give what the scalar code gives. */
@@ -198,17 +299,18 @@ static inline bool f64_int(double v, int e, bool mul, int64_t *k)
 
 /* Four values at once: true, with their integers in k, if every lane is in range and rebuilds its value bit for
  * bit (-0.0, NaN and the rest are left to f64_int, one at a time, as exceptions). */
-static inline bool f64_int4(const double *in, int e, bool mul, int64_t *k)
+static inline __attribute__((always_inline)) bool f64_int4(const double *in, __m256d vsc, __m256d vinv, const bool mul,
+                                                           int64_t *k)
 {
     const __m256d magic = _mm256_castsi256_pd(_mm256_set1_epi64x(F64_MAGIC_BITS));
     __m256d v = _mm256_loadu_pd(in);
-    __m256d d = _mm256_mul_pd(v, _mm256_set1_pd(f64_scale[e])); /* a separate multiply: no FMA */
+    __m256d d = _mm256_mul_pd(v, vsc); /* a separate multiply: no FMA */
     __m256d inr = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), d), _mm256_set1_pd(F64_FAST_LIMIT), _CMP_LT_OQ);
     if (_mm256_movemask_pd(inr) != 15)
         return false;
     __m256d t = _mm256_add_pd(d, magic);
     __m256d kd = _mm256_sub_pd(t, magic); /* the rounded integer, exact */
-    __m256d back = mul ? _mm256_mul_pd(kd, _mm256_set1_pd(f64_inv[e])) : _mm256_div_pd(kd, _mm256_set1_pd(f64_scale[e]));
+    __m256d back = mul ? _mm256_mul_pd(kd, vinv) : _mm256_div_pd(kd, vsc);
     __m256i same = _mm256_cmpeq_epi64(_mm256_castpd_si256(back), _mm256_castpd_si256(v));
     if (_mm256_movemask_pd(_mm256_castsi256_pd(same)) != 15)
         return false;
@@ -217,22 +319,6 @@ static inline bool f64_int4(const double *in, int e, bool mul, int64_t *k)
     return true;
 }
 #endif
-
-/* One value: its integer into k[i], or an exception record at *xp. False when there are too many exceptions. */
-static inline bool f64_enc_one(const double *in, size_t i, int e, bool mul, int64_t *k, uint8_t **xp, size_t *nexc,
-                               size_t max_exc)
-{
-    if (f64_int(in[i], e, mul, &k[i]))
-        return true;
-    if (*nexc == max_exc)
-        return false;
-    store32(*xp, (uint32_t)i);
-    memcpy(*xp + 4, &in[i], 8);
-    *xp += 12;
-    (*nexc)++;
-    k[i] = i ? k[i - 1] : 0; /* a zero delta keeps the stream smooth */
-    return true;
-}
 
 /* In place: the n integers in out (read as int64) become the doubles they stand for. */
 static void f64_back_all(double *out, size_t n, int e, bool mul)
@@ -287,16 +373,17 @@ static double f64_sample_cost(const double *in, size_t n, int e, bool mul)
 {
     enum { RUNS = 4, RUN = 16 };
     size_t run = MIN((size_t)RUN, n), tried = 0, exc = 0;
+    size_t max_exc_all = n > run ? (size_t)RUNS * run : run;
     uint64_t maxz = 0;
     for (int r = 0; r < RUNS; r++) {
-        if (r == 1 && exc * 4 > tried)
-            return INFINITY; /* failing already: skip the other runs */
         size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
         int64_t prev = 0, k;
         bool have = false;
         for (size_t i = at; i < at + run; i++, tried++) {
             if (!f64_int(in[i], e, mul, &k)) {
                 exc++;
+                if ((r == 0 && exc * 4 > run) || exc * 8 > max_exc_all)
+                    return INFINITY;
                 continue;
             }
             if (have)
@@ -313,22 +400,159 @@ static double f64_sample_cost(const double *in, size_t n, int e, bool mul)
     return (double)width + 96.0 * (double)exc / (double)tried;
 }
 
-/* The cheapest scale and way of rebuilding; -1 if none is close to fixed point. */
+/* Fused sample cost for a decimal scale e < F64_NDEC: computes d = v * 10^e and k = llrint(d) once for both
+ * k / 10^e (div) and k * 10^-e (mul), stopping each way as soon as its exceptions exceed the threshold. */
+static void f64_sample_cost_dec(const double *in, size_t n, int e, double *cdiv, double *cmul)
+{
+    enum { RUNS = 4, RUN = 16 };
+    const double sc = f64_scale[e], inv = f64_inv[e];
+    size_t run = MIN((size_t)RUN, n), tried = 0;
+    size_t max_exc_all = n > run ? (size_t)RUNS * run : run;
+    size_t exc0 = 0, exc1 = 0;
+    uint64_t maxz0 = 0, maxz1 = 0;
+    bool live0 = true, live1 = e > 0; /* e == 0: 10^0 == 1.0, div and mul are identical */
+    for (int r = 0; r < RUNS && (live0 || live1); r++) {
+        size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
+        int64_t prev0 = 0, prev1 = 0;
+        bool have0 = false, have1 = false;
+        for (size_t i = at; i < at + run; i++, tried++) {
+            double v = in[i], d = v * sc;
+            bool inr = d > -F64_LIMIT && d < F64_LIMIT;
+            int64_t k = inr ? (int64_t)__builtin_llrint(d) : 0;
+            uint64_t vb;
+            memcpy(&vb, &v, 8);
+            if (live0) {
+                bool ok0 = false;
+                if (inr) {
+                    double b0 = (double)k / sc;
+                    uint64_t ab;
+                    memcpy(&ab, &b0, 8);
+                    ok0 = ab == vb;
+                }
+                if (!ok0) {
+                    exc0++;
+                    if ((r == 0 && exc0 * 4 > run) || exc0 * 8 > max_exc_all)
+                        live0 = false;
+                } else {
+                    if (have0)
+                        maxz0 |= zz((int64_t)((uint64_t)k - (uint64_t)prev0));
+                    prev0 = k;
+                    have0 = true;
+                }
+            }
+            if (live1) {
+                bool ok1 = false;
+                if (inr) {
+                    double b1 = (double)k * inv;
+                    uint64_t ab;
+                    memcpy(&ab, &b1, 8);
+                    ok1 = ab == vb;
+                }
+                if (!ok1) {
+                    exc1++;
+                    if ((r == 0 && exc1 * 4 > run) || exc1 * 8 > max_exc_all)
+                        live1 = false;
+                } else {
+                    if (have1)
+                        maxz1 |= zz((int64_t)((uint64_t)k - (uint64_t)prev1));
+                    prev1 = k;
+                    have1 = true;
+                }
+            }
+            if (!live0 && !live1) {
+                *cdiv = INFINITY;
+                *cmul = INFINITY;
+                return;
+            }
+        }
+        if (n <= run)
+            break;
+    }
+    if (live0 && exc0 * 8 <= tried) {
+        int w0 = maxz0 >> 32 ? 64 : bits_for((uint32_t)maxz0);
+        *cdiv = (double)w0 + 96.0 * (double)exc0 / (double)tried;
+    } else {
+        *cdiv = INFINITY;
+    }
+    if (live1 && exc1 * 8 <= tried) {
+        int w1 = maxz1 >> 32 ? 64 : bits_for((uint32_t)maxz1);
+        *cmul = (double)w1 + 96.0 * (double)exc1 / (double)tried;
+    } else {
+        *cmul = INFINITY;
+    }
+}
+
+/* The cheapest scale and way of rebuilding; -1 if none is close to fixed point. Binary scales 2^1..2^30 are
+ * filtered by an exact IEEE-754 mantissa/exponent interval histogram over the sample. */
 static int f64_pick_scale(const double *in, size_t n, bool *mul)
 {
     int best_e = -1;
     double best = INFINITY;
-    for (int e = 0; e <= F64_MAX_EXP && best > 0; e++)
-        for (int m = 0; m < 2; m++) {
-            if (e >= F64_NDEC && m) /* binary scales rebuild exactly either way */
+    for (int e = 0; e < F64_NDEC && best > 0; e++) {
+        double cdiv, cmul;
+        f64_sample_cost_dec(in, n, e, &cdiv, &cmul);
+        if (cdiv < best - 1e-9) {
+            best = cdiv;
+            best_e = e;
+            *mul = false;
+        }
+        if (cmul < best - 1e-9) {
+            best = cmul;
+            best_e = e;
+            *mul = true;
+        }
+    }
+    if (best > 0) {
+        enum { RUNS = 4, RUN = 16 };
+        size_t run = MIN((size_t)RUN, n), tried = 0;
+        int diff0[F64_NBIN + 2] = {0}, diff[F64_NBIN + 2] = {0};
+        for (int r = 0; r < RUNS; r++) {
+            size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
+            for (size_t i = at; i < at + run; i++, tried++) {
+                uint64_t u;
+                memcpy(&u, &in[i], 8);
+                int lo, hi;
+                if (u == 0) {
+                    lo = 1;
+                    hi = F64_NBIN;
+                } else {
+                    uint64_t exp = (u >> 52) & 0x7ff, mant = u & 0x000fffffffffffffull;
+                    if (exp == 0 || exp == 0x7ff)
+                        continue;
+                    lo = 1075 - (int)exp - __builtin_ctzll(mant | (1ull << 52));
+                    hi = 1074 - (int)exp;
+                    if (lo < 1)
+                        lo = 1;
+                    if (hi > F64_NBIN)
+                        hi = F64_NBIN;
+                    if (lo > hi)
+                        continue;
+                }
+                diff[lo]++;
+                diff[hi + 1]--;
+                if (r == 0) {
+                    diff0[lo]++;
+                    diff0[hi + 1]--;
+                }
+            }
+            if (n <= run)
+                break;
+        }
+        int ok0 = 0, ok = 0;
+        for (int b = 1; b <= F64_NBIN && best > 0; b++) {
+            ok0 += diff0[b];
+            ok += diff[b];
+            if ((run - (size_t)ok0) * 4 > run || (tried - (size_t)ok) * 8 > tried)
                 continue;
-            double cost = f64_sample_cost(in, n, e, m);
+            int e = F64_NDEC - 1 + b;
+            double cost = f64_sample_cost(in, n, e, false);
             if (cost < best - 1e-9) {
                 best = cost;
                 best_e = e;
-                *mul = m;
+                *mul = false;
             }
         }
+    }
     if (best >= 48)
         return -1; /* beyond that, XOR or byte split do better */
     if (best_e < F64_NDEC) {
@@ -351,6 +575,68 @@ size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out)
     return f64_decimal_encode_keep(in, n, out, NULL, &nexc);
 }
 
+/* Packs one vector of nv int64 values in kv relative to *prevp into o (same format as int_bp_encode).
+ * Independent adjacent differences kv[i] - kv[i-1] so the delta+zigzag loop auto-vectorizes. */
+static inline __attribute__((always_inline)) uint8_t *ibp_put_vec(const int64_t *kv, size_t nv, int64_t *prevp,
+                                                                  uint8_t *o)
+{
+    uint64_t z[IBP_VEC];
+    uint32_t z32[IBP_VEC];
+    z[0] = zz((int64_t)((uint64_t)kv[0] - (uint64_t)*prevp));
+    uint64_t all = z[0];
+    for (size_t i = 1; i < nv; i++) {
+        z[i] = zz((int64_t)((uint64_t)kv[i] - (uint64_t)kv[i - 1]));
+        all |= z[i];
+    }
+    *prevp = kv[nv - 1];
+    if (all >> 32) {
+        *o++ = 64;
+        memcpy(o, z, nv * 8);
+        return o + nv * 8;
+    }
+    int w = bits_for((uint32_t)all);
+    *o++ = (uint8_t)w;
+    for (size_t i = 0; i < nv; i++)
+        z32[i] = (uint32_t)z[i];
+    pack(z32, nv, w, o);
+    return o + packed_bytes(nv, w);
+}
+
+/* Converts nv doubles starting at in[base] into kv[0..nv), recording exceptions at *xp; mul is a compile-time
+ * constant so the vector loop runs branch-free with vsc/vinv hoisted into registers. */
+static inline __attribute__((always_inline)) bool f64_conv_run(const double *in, size_t base, size_t nv, int e,
+                                                               const bool mul, int64_t prev, int64_t *kv, uint8_t **xp,
+                                                               size_t *nexc, size_t max_exc)
+{
+#ifdef F64_VEC_ENC
+    const __m256d vsc = _mm256_set1_pd(f64_scale[e]), vinv = _mm256_set1_pd(f64_inv[e]);
+#endif
+    size_t j = 0;
+    while (j < nv) {
+#ifdef F64_VEC_ENC
+        if (j + 4 <= nv && f64_int4(&in[base + j], vsc, vinv, mul, &kv[j])) {
+            j += 4;
+            continue;
+        }
+        size_t stop = MIN(j + 4, nv);
+#else
+        size_t stop = nv;
+#endif
+        for (; j < stop; j++) {
+            if (!f64_int(in[base + j], e, mul, &kv[j])) {
+                if (*nexc == max_exc)
+                    return false;
+                store32(*xp, (uint32_t)(base + j));
+                memcpy(*xp + 4, &in[base + j], 8);
+                *xp += 12;
+                (*nexc)++;
+                kv[j] = j ? kv[j - 1] : prev;
+            }
+        }
+    }
+    return true;
+}
+
 size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp)
 {
     if (n < 2)
@@ -359,37 +645,50 @@ size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t
     int e = f64_pick_scale(in, n, &mul);
     if (e < 0)
         return 0;
-    int64_t *k = keep ? keep : malloc(n * sizeof *k);
-    if (!k)
-        return 0;
     size_t max_exc = n / 16, nexc = 0;
     uint8_t *x = out + 5;
-    size_t i = 0;
-    while (i < n) {
-#ifdef F64_AVX2
-        if (i + 4 <= n && f64_int4(&in[i], e, mul, &k[i])) {
-            i += 4;
-            continue;
-        }
-        /* a lane that is not a clean integer: these four one at a time, the exceptions in order */
-        size_t stop = MIN(i + 4, n);
-#else
-        size_t stop = n;
-#endif
-        for (; i < stop; i++)
-            if (!f64_enc_one(in, i, e, mul, k, &x, &nexc, max_exc)) {
-                if (!keep)
-                    free(k);
-                return 0;
-            }
+    if (keep) {
+        bool ok = mul ? f64_conv_run(in, 0, n, e, true, 0, keep, &x, &nexc, max_exc)
+                      : f64_conv_run(in, 0, n, e, false, 0, keep, &x, &nexc, max_exc);
+        if (!ok)
+            return 0;
+        out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
+        store32(out + 1, (uint32_t)nexc);
+        size_t len = int_bp_encode(keep, n, x);
+        *nexcp = nexc;
+        return len ? (size_t)(x - out) + len : 0;
     }
+    /* No caller-provided keep[]: encode in 1024-value stack vectors with zero heap allocation. The BLK_INT stream
+     * is written after the max exception area (f64_decimal_bound reserves both) and slid down once nexc is known. */
+    uint8_t *ib_start = x + max_exc * 12, *o = ib_start;
+    int64_t prev = 0;
+    if (!f64_int(in[0], e, mul, &prev)) {
+        if (nexc == max_exc)
+            return 0;
+        store32(x, 0);
+        memcpy(x + 4, &in[0], 8);
+        x += 12;
+        nexc++;
+        prev = 0;
+    }
+    memcpy(o, &prev, 8);
+    o += 8;
+    int64_t kv[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        bool ok = mul ? f64_conv_run(in, v0, nv, e, true, prev, kv, &x, &nexc, max_exc)
+                      : f64_conv_run(in, v0, nv, e, false, prev, kv, &x, &nexc, max_exc);
+        if (!ok)
+            return 0;
+        o = ibp_put_vec(kv, nv, &prev, o);
+    }
+    size_t ib_len = (size_t)(o - ib_start);
+    if (x != ib_start)
+        memmove(x, ib_start, ib_len);
     out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
     store32(out + 1, (uint32_t)nexc);
-    size_t len = int_bp_encode(k, n, x);
-    if (!keep)
-        free(k);
     *nexcp = nexc;
-    return len ? (size_t)(x - out) + len : 0;
+    return (size_t)(x - out) + ib_len;
 }
 
 int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out)
@@ -606,21 +905,157 @@ int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
 
 static void bytesplit64(const uint64_t *in, size_t n, uint8_t *out)
 {
-    for (size_t i = 0; i < n; i++)
-        for (int b = 0; b < 8; b++)
-            out[(size_t)b * n + i] = (uint8_t)(in[i] >> (8 * b));
+    uint8_t *p0 = out, *p1 = out + n, *p2 = out + 2 * n, *p3 = out + 3 * n;
+    uint8_t *p4 = out + 4 * n, *p5 = out + 5 * n, *p6 = out + 6 * n, *p7 = out + 7 * n;
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 32 <= n; i += 32) {
+        /* low 128-bit lane holds values [i+2k, i+2k+1], high 128-bit lane holds [i+16+2k, i+16+2k+1]:
+         * the 4-stage butterfly produces each plane's 32 bytes [i..i+31] in order with no cross-lane fixup */
+#define BS64_LD(K)                                                                                      \
+    _mm256_inserti128_si256(                                                                            \
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)(in + i + 2 * (K)))),     \
+        _mm_loadu_si128((const __m128i *)(const void *)(in + i + 16 + 2 * (K))), 1)
+        __m256i v0 = BS64_LD(0), v1 = BS64_LD(1), v2 = BS64_LD(2), v3 = BS64_LD(3);
+        __m256i v4 = BS64_LD(4), v5 = BS64_LD(5), v6 = BS64_LD(6), v7 = BS64_LD(7);
+#undef BS64_LD
+        __m256i a0 = _mm256_unpacklo_epi8(v0, v4), a1 = _mm256_unpackhi_epi8(v0, v4);
+        __m256i a2 = _mm256_unpacklo_epi8(v1, v5), a3 = _mm256_unpackhi_epi8(v1, v5);
+        __m256i a4 = _mm256_unpacklo_epi8(v2, v6), a5 = _mm256_unpackhi_epi8(v2, v6);
+        __m256i a6 = _mm256_unpacklo_epi8(v3, v7), a7 = _mm256_unpackhi_epi8(v3, v7);
+        __m256i b0 = _mm256_unpacklo_epi8(a0, a4), b1 = _mm256_unpackhi_epi8(a0, a4);
+        __m256i b2 = _mm256_unpacklo_epi8(a1, a5), b3 = _mm256_unpackhi_epi8(a1, a5);
+        __m256i b4 = _mm256_unpacklo_epi8(a2, a6), b5 = _mm256_unpackhi_epi8(a2, a6);
+        __m256i b6 = _mm256_unpacklo_epi8(a3, a7), b7 = _mm256_unpackhi_epi8(a3, a7);
+        __m256i c0 = _mm256_unpacklo_epi8(b0, b4), c1 = _mm256_unpackhi_epi8(b0, b4);
+        __m256i c2 = _mm256_unpacklo_epi8(b1, b5), c3 = _mm256_unpackhi_epi8(b1, b5);
+        __m256i c4 = _mm256_unpacklo_epi8(b2, b6), c5 = _mm256_unpackhi_epi8(b2, b6);
+        __m256i c6 = _mm256_unpacklo_epi8(b3, b7), c7 = _mm256_unpackhi_epi8(b3, b7);
+        _mm256_storeu_si256((__m256i *)(void *)(p0 + i), _mm256_unpacklo_epi8(c0, c4));
+        _mm256_storeu_si256((__m256i *)(void *)(p1 + i), _mm256_unpackhi_epi8(c0, c4));
+        _mm256_storeu_si256((__m256i *)(void *)(p2 + i), _mm256_unpacklo_epi8(c1, c5));
+        _mm256_storeu_si256((__m256i *)(void *)(p3 + i), _mm256_unpackhi_epi8(c1, c5));
+        _mm256_storeu_si256((__m256i *)(void *)(p4 + i), _mm256_unpacklo_epi8(c2, c6));
+        _mm256_storeu_si256((__m256i *)(void *)(p5 + i), _mm256_unpackhi_epi8(c2, c6));
+        _mm256_storeu_si256((__m256i *)(void *)(p6 + i), _mm256_unpacklo_epi8(c3, c7));
+        _mm256_storeu_si256((__m256i *)(void *)(p7 + i), _mm256_unpackhi_epi8(c3, c7));
+    }
+#endif
+#if defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(const void *)(in + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 2));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 4));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 6));
+        __m128i v4 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 8));
+        __m128i v5 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 10));
+        __m128i v6 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 12));
+        __m128i v7 = _mm_loadu_si128((const __m128i *)(const void *)(in + i + 14));
+        __m128i a0 = _mm_unpacklo_epi8(v0, v4), a1 = _mm_unpackhi_epi8(v0, v4);
+        __m128i a2 = _mm_unpacklo_epi8(v1, v5), a3 = _mm_unpackhi_epi8(v1, v5);
+        __m128i a4 = _mm_unpacklo_epi8(v2, v6), a5 = _mm_unpackhi_epi8(v2, v6);
+        __m128i a6 = _mm_unpacklo_epi8(v3, v7), a7 = _mm_unpackhi_epi8(v3, v7);
+        __m128i b0 = _mm_unpacklo_epi8(a0, a4), b1 = _mm_unpackhi_epi8(a0, a4);
+        __m128i b2 = _mm_unpacklo_epi8(a1, a5), b3 = _mm_unpackhi_epi8(a1, a5);
+        __m128i b4 = _mm_unpacklo_epi8(a2, a6), b5 = _mm_unpackhi_epi8(a2, a6);
+        __m128i b6 = _mm_unpacklo_epi8(a3, a7), b7 = _mm_unpackhi_epi8(a3, a7);
+        __m128i c0 = _mm_unpacklo_epi8(b0, b4), c1 = _mm_unpackhi_epi8(b0, b4);
+        __m128i c2 = _mm_unpacklo_epi8(b1, b5), c3 = _mm_unpackhi_epi8(b1, b5);
+        __m128i c4 = _mm_unpacklo_epi8(b2, b6), c5 = _mm_unpackhi_epi8(b2, b6);
+        __m128i c6 = _mm_unpacklo_epi8(b3, b7), c7 = _mm_unpackhi_epi8(b3, b7);
+        _mm_storeu_si128((__m128i *)(void *)(p0 + i), _mm_unpacklo_epi8(c0, c4));
+        _mm_storeu_si128((__m128i *)(void *)(p1 + i), _mm_unpackhi_epi8(c0, c4));
+        _mm_storeu_si128((__m128i *)(void *)(p2 + i), _mm_unpacklo_epi8(c1, c5));
+        _mm_storeu_si128((__m128i *)(void *)(p3 + i), _mm_unpackhi_epi8(c1, c5));
+        _mm_storeu_si128((__m128i *)(void *)(p4 + i), _mm_unpacklo_epi8(c2, c6));
+        _mm_storeu_si128((__m128i *)(void *)(p5 + i), _mm_unpackhi_epi8(c2, c6));
+        _mm_storeu_si128((__m128i *)(void *)(p6 + i), _mm_unpacklo_epi8(c3, c7));
+        _mm_storeu_si128((__m128i *)(void *)(p7 + i), _mm_unpackhi_epi8(c3, c7));
+    }
+#endif
+    for (; i < n; i++) {
+        uint64_t x = in[i];
+        p0[i] = (uint8_t)x;
+        p1[i] = (uint8_t)(x >> 8);
+        p2[i] = (uint8_t)(x >> 16);
+        p3[i] = (uint8_t)(x >> 24);
+        p4[i] = (uint8_t)(x >> 32);
+        p5[i] = (uint8_t)(x >> 40);
+        p6[i] = (uint8_t)(x >> 48);
+        p7[i] = (uint8_t)(x >> 56);
+    }
 }
 
 static int unsplit64(const uint8_t *in, size_t len, size_t n, uint64_t *out)
 {
     if (len != 8 * n)
         return TSDB_ERR_CORRUPT;
-    for (size_t i = 0; i < n; i++) {
-        uint64_t x = 0;
-        for (int b = 0; b < 8; b++)
-            x |= (uint64_t)in[(size_t)b * n + i] << (8 * b);
-        out[i] = x;
+    const uint8_t *p0 = in, *p1 = in + n, *p2 = in + 2 * n, *p3 = in + 3 * n;
+    const uint8_t *p4 = in + 4 * n, *p5 = in + 5 * n, *p6 = in + 6 * n, *p7 = in + 7 * n;
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 32 <= n; i += 32) {
+        __m256i r0 = _mm256_loadu_si256((const __m256i *)(const void *)(p0 + i));
+        __m256i r1 = _mm256_loadu_si256((const __m256i *)(const void *)(p1 + i));
+        __m256i r2 = _mm256_loadu_si256((const __m256i *)(const void *)(p2 + i));
+        __m256i r3 = _mm256_loadu_si256((const __m256i *)(const void *)(p3 + i));
+        __m256i r4 = _mm256_loadu_si256((const __m256i *)(const void *)(p4 + i));
+        __m256i r5 = _mm256_loadu_si256((const __m256i *)(const void *)(p5 + i));
+        __m256i r6 = _mm256_loadu_si256((const __m256i *)(const void *)(p6 + i));
+        __m256i r7 = _mm256_loadu_si256((const __m256i *)(const void *)(p7 + i));
+        __m256i l01 = _mm256_unpacklo_epi8(r0, r1), h01 = _mm256_unpackhi_epi8(r0, r1);
+        __m256i l23 = _mm256_unpacklo_epi8(r2, r3), h23 = _mm256_unpackhi_epi8(r2, r3);
+        __m256i l45 = _mm256_unpacklo_epi8(r4, r5), h45 = _mm256_unpackhi_epi8(r4, r5);
+        __m256i l67 = _mm256_unpacklo_epi8(r6, r7), h67 = _mm256_unpackhi_epi8(r6, r7);
+        __m256i a0 = _mm256_unpacklo_epi16(l01, l23), a1 = _mm256_unpackhi_epi16(l01, l23);
+        __m256i a2 = _mm256_unpacklo_epi16(h01, h23), a3 = _mm256_unpackhi_epi16(h01, h23);
+        __m256i b0 = _mm256_unpacklo_epi16(l45, l67), b1 = _mm256_unpackhi_epi16(l45, l67);
+        __m256i b2 = _mm256_unpacklo_epi16(h45, h67), b3 = _mm256_unpackhi_epi16(h45, h67);
+        __m256i q0 = _mm256_unpacklo_epi32(a0, b0), q1 = _mm256_unpackhi_epi32(a0, b0);
+        __m256i q2 = _mm256_unpacklo_epi32(a1, b1), q3 = _mm256_unpackhi_epi32(a1, b1);
+        __m256i q4 = _mm256_unpacklo_epi32(a2, b2), q5 = _mm256_unpackhi_epi32(a2, b2);
+        __m256i q6 = _mm256_unpacklo_epi32(a3, b3), q7 = _mm256_unpackhi_epi32(a3, b3);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i), _mm256_permute2x128_si256(q0, q1, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 4), _mm256_permute2x128_si256(q2, q3, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 8), _mm256_permute2x128_si256(q4, q5, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 12), _mm256_permute2x128_si256(q6, q7, 0x20));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 16), _mm256_permute2x128_si256(q0, q1, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 20), _mm256_permute2x128_si256(q2, q3, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 24), _mm256_permute2x128_si256(q4, q5, 0x31));
+        _mm256_storeu_si256((__m256i *)(void *)(out + i + 28), _mm256_permute2x128_si256(q6, q7, 0x31));
     }
+#endif
+#if defined(__SSE2__)
+    for (; i + 16 <= n; i += 16) {
+        __m128i r0 = _mm_loadu_si128((const __m128i *)(const void *)(p0 + i));
+        __m128i r1 = _mm_loadu_si128((const __m128i *)(const void *)(p1 + i));
+        __m128i r2 = _mm_loadu_si128((const __m128i *)(const void *)(p2 + i));
+        __m128i r3 = _mm_loadu_si128((const __m128i *)(const void *)(p3 + i));
+        __m128i r4 = _mm_loadu_si128((const __m128i *)(const void *)(p4 + i));
+        __m128i r5 = _mm_loadu_si128((const __m128i *)(const void *)(p5 + i));
+        __m128i r6 = _mm_loadu_si128((const __m128i *)(const void *)(p6 + i));
+        __m128i r7 = _mm_loadu_si128((const __m128i *)(const void *)(p7 + i));
+        __m128i l01 = _mm_unpacklo_epi8(r0, r1), h01 = _mm_unpackhi_epi8(r0, r1);
+        __m128i l23 = _mm_unpacklo_epi8(r2, r3), h23 = _mm_unpackhi_epi8(r2, r3);
+        __m128i l45 = _mm_unpacklo_epi8(r4, r5), h45 = _mm_unpackhi_epi8(r4, r5);
+        __m128i l67 = _mm_unpacklo_epi8(r6, r7), h67 = _mm_unpackhi_epi8(r6, r7);
+        __m128i a0 = _mm_unpacklo_epi16(l01, l23), a1 = _mm_unpackhi_epi16(l01, l23);
+        __m128i a2 = _mm_unpacklo_epi16(h01, h23), a3 = _mm_unpackhi_epi16(h01, h23);
+        __m128i b0 = _mm_unpacklo_epi16(l45, l67), b1 = _mm_unpackhi_epi16(l45, l67);
+        __m128i b2 = _mm_unpacklo_epi16(h45, h67), b3 = _mm_unpackhi_epi16(h45, h67);
+        _mm_storeu_si128((__m128i *)(void *)(out + i), _mm_unpacklo_epi32(a0, b0));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 2), _mm_unpackhi_epi32(a0, b0));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 4), _mm_unpacklo_epi32(a1, b1));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 6), _mm_unpackhi_epi32(a1, b1));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 8), _mm_unpacklo_epi32(a2, b2));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 10), _mm_unpackhi_epi32(a2, b2));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 12), _mm_unpacklo_epi32(a3, b3));
+        _mm_storeu_si128((__m128i *)(void *)(out + i + 14), _mm_unpackhi_epi32(a3, b3));
+    }
+#endif
+    for (; i < n; i++)
+        out[i] = (uint64_t)p0[i] | (uint64_t)p1[i] << 8 | (uint64_t)p2[i] << 16 | (uint64_t)p3[i] << 24 |
+                 (uint64_t)p4[i] << 32 | (uint64_t)p5[i] << 40 | (uint64_t)p6[i] << 48 | (uint64_t)p7[i] << 56;
     return 0;
 }
 
@@ -1346,18 +1781,11 @@ static __attribute__((noinline)) size_t block_encode_vals_nearest(codec_ctx *c, 
     case TSDB_FLOAT32: return block_encode_f32(c, level, value_codec, v, n, out);
     case TSDB_FLOAT64: return encode_f64(c, level, v, n, out);
     case TSDB_INT64: return encode_int(c, level, v, n, out);
-    default: {
-        /* bool and state: 4-byte slots, coded as integers */
-        int64_t *w = malloc(n * sizeof *w);
-        if (!w)
+    default:
+        /* bool and state: 4-byte slots, coded directly as BLK_INT without widening to int64[] */
+        if (codec_scratch_reserve(c, int_bp_bound(n)) != 0)
             return 0;
-        const uint32_t *u = v;
-        for (size_t i = 0; i < n; i++)
-            w[i] = u[i];
-        size_t len = encode_int(c, level, w, n, out);
-        free(w);
-        return len;
-    }
+        return block_wrap(c, level, BLK_INT, int_bp_encode_u32(v, n, c->scratch), out);
     }
 }
 
@@ -1403,15 +1831,7 @@ static __attribute__((noinline)) int block_decode_vals_nearest(codec_ctx *c, int
         return TSDB_ERR_CORRUPT;
     if (type == TSDB_INT64)
         return int_bp_decode(p, plen, n, out);
-    int64_t *w = malloc(n * sizeof *w);
-    if (!w)
-        return TSDB_ERR_NOMEM;
-    rc = int_bp_decode(p, plen, n, w);
-    uint32_t *u = out;
-    for (size_t i = 0; rc == 0 && i < n; i++)
-        u[i] = (uint32_t)w[i];
-    free(w);
-    return rc;
+    return int_bp_decode_u32(p, plen, n, out);
 }
 
 /* run with round-to-nearest, the caller's mode put back (fpmode.h) */
