@@ -4569,9 +4569,17 @@ static unsigned uring_drain_cq(void)
         if (n == 0)
             break;
         if (uring_defer_n + n > uring_defer_cap) {
-            size_t ncap = uring_defer_cap ? uring_defer_cap * 2 : 256;
-            while (ncap < uring_defer_n + n)
+            size_t need = uring_defer_n + n;
+            if (need > SIZE_MAX / sizeof *uring_defer)
+                break;
+            size_t ncap = uring_defer_cap ? uring_defer_cap : 256;
+            while (ncap < need) {
+                if (ncap > SIZE_MAX / 2 / sizeof *uring_defer) {
+                    ncap = need;
+                    break;
+                }
                 ncap *= 2;
+            }
             uring_ev *np = realloc(uring_defer, ncap * sizeof *np);
             if (!np)
                 break;

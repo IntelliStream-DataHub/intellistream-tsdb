@@ -99,7 +99,7 @@ impl<T: Element + Copy> Col<T> {
 /// A column of series ids (`series_column` in lib.rs).
 pub type SidCol = Col<u64>;
 
-/// Typed insert values: read in place when the buffer has the series' type, else a `Column`.
+/// Typed insert values: snapshotted under the GIL when the buffer has the series' type, else a `Column`.
 pub enum ValCol {
     F32(Col<f32>),
     F64(Col<f64>),

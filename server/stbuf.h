@@ -45,7 +45,7 @@ static inline void st_putf(st_buf *b, const char *fmt, ...)
     va_list ap, ap2;
     va_start(ap, fmt);
     va_copy(ap2, ap);
-    size_t avail = b->cap > b->len ? b->cap - b->len : 0;
+    size_t avail = (b->p && b->cap > b->len) ? b->cap - b->len : 0;
     int n = vsnprintf(b->p ? b->p + b->len : NULL, avail, fmt, ap);
     va_end(ap);
     if (n < 0) {
