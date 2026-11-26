@@ -1095,14 +1095,23 @@ What tsdb takes from ALP, codec by codec:
 | packed bit delta | kind 15, an AUTO candidate | bit-packing per vector of 1024 | zigzag deltas of the raw bit patterns, float32 and float64 |
 | dictionary | kind 16, a merge candidate | bit-packing per vector of 1024 | ranks among the distinct values, float32 and float64 |
 | float32 in float64 | kind 17, tried after float64 fixed point | | a float32 block inside a float64 one, for widened float32 readings |
+| integer FOR + PFOR (`BLK_INT_FOR`) | kind 18, competes with `BLK_INT` for `int64` | bit-packing per vector of 1024; outlier patching | per-vector delta-FOR or direct-FOR, 0..64-bit packing (`pack64`), outlier patching up to `nv/32` |
+| bool/state pack (`BLK_BOOL_PACK`) | kind 19, competes with `BLK_INT` for `bool`/`state` | bit-packing per vector of 1024 | direct `uint32` bit-pack with optional base, or varint RLE |
+| bit-packed timestamps (`BLK_TS_FOR_BP`) | kind 20, competes with DD / grid / delta | bit-packing per vector of 1024 | per-vector bit-packed grid or delta FOR residuals for jittered clocks |
 | `decimal` | kind 3, still read | sampling; exceptions | 1/2/4-byte deltas left to ZSTD; AUTO no longer writes it |
 
 #### Fixed point: `decimal_bp` (src/codec.c)
 
 A granule is fixed point with scale `s` if every value is
-`(float)((double)k * s)` for an integer `k`. There are 35 scales: 10^0 to
-10^-10, and 2^-1 to 2^-24. The binary ones are ours; they catch ADC counts
-(the vibration data set is counts times 2^-13), for which ALP has no exponent.
+`(float)((double)k * s)` for an integer `k`. There are 51 scales: 10^0 to
+10^-10 (0..10), 2^-1 to 2^-24 (11..34), and dividing scales 10^1 to 10^6
+(35..40) and 2^1 to 2^10 (41..50; appended above the existing indices so older
+blocks decode identically). The binary ones catch ADC counts (the vibration
+data set is counts times 2^-13) and power-of-two multiples; the dividing scales
+catch large multiples of 10^f or 2^b (probed only when scale `10^0` already
+succeeded on the sample, so fractional and noisy floats pay nothing). `BLK_F64_DECIMAL`
+appends the same dividing scales above index 45 (46..51 for 10^1..10^6 and
+52..61 for 2^1..2^10, rebuilt with multiplication `k * inv`).
 
 **Choosing the scale** (`dec_sample_cost`) uses ALP's idea of sampling, on
 four runs of 16 consecutive values spread over the granule. A scale costs the
@@ -1576,11 +1585,35 @@ Block kinds name the transform; for kinds that exist at both widths (ALP_rd,
 the packed bit delta) the series' type, which lives in the SERIES dictionary,
 gives the width.
 
-**int64, bool and state codes**: zigzag deltas bit-packed per vector of 1024
-values. Counters, codes that rarely change and flags come down to a few bits a
-value and constant runs to none. `build/type-bench` measures these: a
-totalizer in liters 1.18 bits a value, a sequence 0.04, a door contact
-sampled at 1 Hz 0.06, a machine mode 0.13.
+**int64, bool and state codes**: `BLK_INT` (kind 14) stores zigzag deltas
+bit-packed per vector of 1024 values, and competes with two specialized kinds:
+
+- **`BLK_INT_FOR` (kind 18, `src/codec_typed.c`)**: for `int64`, each 1024-value
+  vector independently chooses delta frame-of-reference (`d[i] - base`) or
+  direct frame-of-reference (`v[i] - base`), packs offsets at 0..64 bits (using
+  `pack64` for 33..63 bits instead of jumping from 32 to 64), and optionally
+  patches up to `nv/32` low/high outliers (`(u16 pos, u64 full_u)`) when PFOR
+  saves at least 16 bytes. Steady-slope counters, counters with occasional
+  resets/spikes/nulls, stationary ranges, and 33..63-bit deltas shrink sharply
+  and decode via SIMD `unpack`/`unpack64` + prefix sum (`for_prefix_u32_to_i64` /
+  `for_prefix_u64_to_i64`).
+- **`BLK_BOOL_PACK` (kind 19, `src/codec_typed.c`)**: for `bool` and `state`
+  (`uint32` slots), picks the smaller of per-vector direct bit-packing with an
+  optional base (mode 0: 1 bit/val raw for coin flips, 2 bits/val with nulls)
+  and varint RLE `(uvarint32 val, uvarint32 run_len - 1)` (mode 1: long steady
+  runs such as door contacts and machine modes), avoiding ZSTD entropy decoding.
+- **`BLK_TS_FOR_BP` (kind 20, `src/codec.c`)**: for jittered or irregular
+  timestamps, per-vector (1024 values) bit-packed frame-of-reference over grid
+  residuals (mode 0, using a nearest-integer rounded grid step and per-vector
+  base to track local drift) or deltas (mode 1). Competes in `block_encode_ts()`
+  with DoubleDelta, `BLK_TS_GRID` and `BLK_TS_DELTA` under the timestamp 1/8
+  ZSTD saving rule (`blk_zstd_min_saving`), keeping jittered clocks uncompressed
+  at their exact bit width (e.g. 6 bits at +-20 ms, 9 bits at +-200 ms) for
+  2-3x faster sorted decoding.
+
+`build/type-bench` measures these: a totalizer in liters 0.93 bits a value,
+random 50k-70k rates 15.09, a sequence 0.05, a door contact sampled at 1 Hz
+0.02, coin flips 1.01, a machine mode 0.06.
 
 ### SIMD
 

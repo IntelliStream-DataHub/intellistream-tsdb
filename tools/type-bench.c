@@ -33,6 +33,9 @@ static const char *kind_name(int k)
     case BLK_ALPRD: return "alp_rd";
     case BLK_DICT: return "dict";
     case BLK_F32_WIDE: return "float32";
+    case BLK_INT_FOR: return "int-for";
+    case BLK_BOOL_PACK: return "bool-pack";
+    case BLK_TS_FOR_BP: return "ts-for-bp";
     default: return "?";
     }
 }

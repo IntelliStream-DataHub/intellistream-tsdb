@@ -602,4 +602,77 @@ static inline uint64_t zz_prefix64(uint64_t *z, size_t n)
     return acc;
 }
 
+/* Prefix sum of (base + u[i]) starting from cur, modulo 2^64, writing int64_t out[0..n); returns final cur. */
+static inline uint64_t for_prefix_u32_to_i64(const uint32_t *u, size_t n, uint64_t base, uint64_t cur, int64_t *out)
+{
+    size_t i = 0;
+#if defined(__AVX2__)
+    const __m256i vbase = _mm256_set1_epi64x((long long)base), zero = _mm256_setzero_si256();
+    __m256i carry = _mm256_set1_epi64x((long long)cur);
+    for (; i + 4 <= n; i += 4) {
+        __m256i x = _mm256_add_epi64(_mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i *)(const void *)(u + i))), vbase);
+        x = _mm256_add_epi64(x, _mm256_slli_si256(x, 8));
+        __m128i lo = _mm256_castsi256_si128(x);
+        x = _mm256_add_epi64(x, _mm256_inserti128_si256(zero, _mm_unpackhi_epi64(lo, lo), 1));
+        __m256i tot = _mm256_permute4x64_epi64(x, 0xff);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i), _mm256_add_epi64(x, carry));
+        carry = _mm256_add_epi64(carry, tot);
+    }
+    cur = (uint64_t)_mm_cvtsi128_si64(_mm256_castsi256_si128(carry));
+#elif defined(__SSE2__)
+    const __m128i vbase = _mm_set1_epi64x((long long)base);
+    __m128i carry = _mm_set1_epi64x((long long)cur);
+    for (; i + 2 <= n; i += 2) {
+        uint64_t q;
+        memcpy(&q, u + i, 8);
+        __m128i x = _mm_add_epi64(_mm_set_epi64x((long long)(q >> 32), (long long)(uint32_t)q), vbase);
+        x = _mm_add_epi64(x, _mm_slli_si128(x, 8));
+        x = _mm_add_epi64(x, carry);
+        _mm_storeu_si128((__m128i *)(void *)(out + i), x);
+        carry = _mm_unpackhi_epi64(x, x);
+    }
+    cur = (uint64_t)_mm_cvtsi128_si64(carry);
+#endif
+    for (; i < n; i++) {
+        cur += base + (uint64_t)u[i];
+        out[i] = (int64_t)cur;
+    }
+    return cur;
+}
+
+static inline uint64_t for_prefix_u64_to_i64(const uint64_t *u, size_t n, uint64_t base, uint64_t cur, int64_t *out)
+{
+    size_t i = 0;
+#if defined(__AVX2__)
+    const __m256i vbase = _mm256_set1_epi64x((long long)base), zero = _mm256_setzero_si256();
+    __m256i carry = _mm256_set1_epi64x((long long)cur);
+    for (; i + 4 <= n; i += 4) {
+        __m256i x = _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)(const void *)(u + i)), vbase);
+        x = _mm256_add_epi64(x, _mm256_slli_si256(x, 8));
+        __m128i lo = _mm256_castsi256_si128(x);
+        x = _mm256_add_epi64(x, _mm256_inserti128_si256(zero, _mm_unpackhi_epi64(lo, lo), 1));
+        __m256i tot = _mm256_permute4x64_epi64(x, 0xff);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i), _mm256_add_epi64(x, carry));
+        carry = _mm256_add_epi64(carry, tot);
+    }
+    cur = (uint64_t)_mm_cvtsi128_si64(_mm256_castsi256_si128(carry));
+#elif defined(__SSE2__)
+    const __m128i vbase = _mm_set1_epi64x((long long)base);
+    __m128i carry = _mm_set1_epi64x((long long)cur);
+    for (; i + 2 <= n; i += 2) {
+        __m128i x = _mm_add_epi64(_mm_loadu_si128((const __m128i *)(const void *)(u + i)), vbase);
+        x = _mm_add_epi64(x, _mm_slli_si128(x, 8));
+        x = _mm_add_epi64(x, carry);
+        _mm_storeu_si128((__m128i *)(void *)(out + i), x);
+        carry = _mm_unpackhi_epi64(x, x);
+    }
+    cur = (uint64_t)_mm_cvtsi128_si64(carry);
+#endif
+    for (; i < n; i++) {
+        cur += base + u[i];
+        out[i] = (int64_t)cur;
+    }
+    return cur;
+}
+
 #endif

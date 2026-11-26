@@ -5,487 +5,496 @@ ec	12	feeeb6c814f995e8
 running sums	600	28710e94fb0ad505
 integers	400	3005f77ee2015809
 int_bp	1056	4bc9afe911856b59
-f32 hdd_temp	1371	cb17465eb5c122ec
-f64 hdd_temp	1345	ee7e68621350ddf3
-f32 cpu_temp	1371	abc97d2738349780
-f64 cpu_temp	1345	7475c3f326f38f08
-f32 tank_bar	1371	e3dc8a871d65aef7
-f64 tank_bar	1345	90882799da3d6948
-f32 tank_psi	1369	1a7df29aaee29b0b
-f64 tank_psi	1343	d523d292d6a79151
-f32 vibration	1369	fa7628c838de9813
-f64 vibration	1344	ced81ab57e91a31f
-f32 flow_rate	1371	42dc05c3e4f4a9aa
-f64 flow_rate	1344	f006f4cc57b8e969
-f32 flow_total	1369	6cd36661aed1b815
-f64 flow_total	1344	fc1d5224ace7789c
-f32 random	1369	30de01fce205ab47
-f64 random	1343	b09ac8a05b7f74c7
-int64 totalizer	1339	3d6d3df6f9afe9df
-int64 random rate	1339	75d582e57654d9da
-int64 sequence	1339	c249f3438a295f9c
-int64 extremes	1195	f474808a57e81a5e
-int64 random bits	1339	7c6a113e9b1b50fa
-int64 nulls	1193	47f44955bbe84bb7
-int64 int32 range with nulls, 8192	1199	829bb2b5f763b733
-int64 just past int32, 8192	1339	df525db5f5b10740
-int64 just below int32, 8192	1339	36c1f7f92ffc23aa
-int64 most negative, 8192	1195	cb2f3b5647232796
-int64 most positive, 8192	1339	f726578270746fc2
-int64 int32 range with nulls, 1000	1223	feb8080ab1c1bf20
-int64 just past int32, 1000	1339	c28369e47197aac9
-int64 just below int32, 1000	1339	c1e8bbed98852727
-int64 most negative, 1000	1193	187d5984473b47f4
-int64 most positive, 1000	1339	362b992553baaab4
-int64 int32 range with nulls, 33	565	9902f7e271909c9b
-int64 just past int32, 33	619	15a083786bd6ef90
-int64 just below int32, 33	619	a2bbc86b39f11f02
-int64 most negative, 33	559	07e92330ba550067
-int64 most positive, 33	619	893572b4af278202
-int64 int32 range with nulls, 32	545	d314f09dac0d0ef4
-int64 just past int32, 32	601	d30d6819121a5c25
-int64 just below int32, 32	601	1aec2c1f516ab233
-int64 most negative, 32	547	9536e16f21c0c8eb
-int64 most positive, 32	601	2cdecb1a17f14db7
-int64 int32 range with nulls, 31	529	d2319c834226dca0
-int64 just past int32, 31	583	57a40628b4cbfc37
-int64 just below int32, 31	583	456b323d3c0e029e
-int64 most negative, 31	523	b7ab4b6a5ab5c6d9
-int64 most positive, 31	583	71c970c09de0e1d1
-int64 int32 range with nulls, 17	305	d8ef4a362ace67b7
-int64 just past int32, 17	331	1fe2e1bf777efea8
-int64 just below int32, 17	331	693db3a75aadec77
-int64 most negative, 17	305	a2a98d38e611d155
-int64 most positive, 17	331	7543f0902119e173
-int64 int32 range with nulls, 16	297	5ebc2a53fe21fbff
-int64 just past int32, 16	313	8a6669b734d806e2
-int64 just below int32, 16	313	817edd95266757a4
-int64 most negative, 16	291	c477ecc42949e213
-int64 most positive, 16	313	a81e95e5ea00151d
-int64 int32 range with nulls, 15	295	0abdd9a0b75987d3
-int64 just past int32, 15	295	07105b4be145efa5
-int64 just below int32, 15	295	e6772269a6c0098a
-int64 most negative, 15	277	d473d96484a5245a
-int64 most positive, 15	295	8a2d7f41e69dfa82
-int64 int32 range with nulls, 9	181	b815a70a2bb7a48f
-int64 just past int32, 9	187	af9a9662fcdf6d85
-int64 just below int32, 9	187	4a08bcbc41b12d8f
-int64 most negative, 9	169	33ad7e0a4cb34db1
-int64 most positive, 9	187	7b6d32a0833cd1fa
-int64 int32 range with nulls, 8	153	a91b891c664faa78
-int64 just past int32, 8	169	cf26ea7c28da183f
-int64 just below int32, 8	169	7347e081975b95a6
-int64 most negative, 8	169	57cffa488a531666
-int64 most positive, 8	169	409a83d6c14984cc
-int64 int32 range with nulls, 7	139	cbd3675cf878308c
-int64 just past int32, 7	151	0a99767e6edee66f
-int64 just below int32, 7	151	25294e029a999b47
-int64 most negative, 7	151	bcacf2d38cabeace
-int64 most positive, 7	151	8ad15fa8d1f4b458
-int64 int32 range with nulls, 1	41	969e03f15cb0ed54
-int64 just past int32, 1	41	c010a6698493cb38
-int64 just below int32, 1	41	b9cb9fc2e1b4b43d
-int64 most negative, 1	41	0953380b09338ebd
-int64 most positive, 1	41	8c03f44fe1e487fc
-int64 around 2^51	1201	61daa6badd734fa0
-int64 around -2^51	1205	aff77d2c044916f3
-int64 only nulls	1097	211bb779aace249d
-bool door	1335	dc51d94402158d4f
-bool coin with nulls	1193	95993b3fac026229
-state machine mode	1047	f9c5f71faf690080
-state with nulls	905	19cdb6e414ef7b25
-state near 2^32 with nulls, 8192	909	256fc651e5c7b111
-bool odd values with nulls, 8192	1191	db2ef39d357005cd
-state near 2^32 with nulls, 1000	903	5bfa1a90158945ca
-bool odd values with nulls, 1000	1189	dc725e6ed9b744cf
-state near 2^32 with nulls, 33	427	f18607c17cd19bfa
-bool odd values with nulls, 33	551	947d0b8514f7acb7
-state near 2^32 with nulls, 32	411	1239bef61af8da3c
-bool odd values with nulls, 32	535	8e5b2139327f4acc
-state near 2^32 with nulls, 31	411	2550687664703648
-bool odd values with nulls, 31	527	25c1d5191f29c7e0
-state near 2^32 with nulls, 17	233	fa6d6125d0a4c2e1
-bool odd values with nulls, 17	301	37a6dbca46ab587e
-state near 2^32 with nulls, 16	219	8a85c80b866e5fe7
-bool odd values with nulls, 16	285	a4acd3186aac0346
-state near 2^32 with nulls, 15	205	7bc8cf609b0b4d5e
-bool odd values with nulls, 15	261	eacdd4aa49714208
-state near 2^32 with nulls, 9	145	cbcc0d90c81255ed
-bool odd values with nulls, 9	173	309fa64c24c85f29
-state near 2^32 with nulls, 8	121	2c1dc3d9e55e89c1
-bool odd values with nulls, 8	163	f6ccf10da5718b1e
-state near 2^32 with nulls, 7	115	184f989883da1862
-bool odd values with nulls, 7	139	f8a377e25ee3cc02
-state near 2^32 with nulls, 1	37	b1e9bf9923be77f2
-bool odd values with nulls, 1	37	09616b18d8fbf49e
-state only nulls	829	2b96c4f7f05230ac
-bool only nulls	1093	d490267e6e40076c
-f32 specials, 1	69	9235771b3098cf4c
-f32 decimals with nulls, 1	71	bdb4df0cc4a5bb47
-f32 specials, 2	89	b1642df8484cd3eb
-f32 decimals with nulls, 2	92	9b8c475bc6ffcab3
-f32 specials, 3	107	61bad7f535213a1c
-f32 decimals with nulls, 3	105	068dc11b9651162d
-f32 specials, 15	323	4bfee2dbd1e8c692
-f32 decimals with nulls, 15	294	2e89e38edc5390cb
-f32 specials, 16	341	e1c15a90a47eab78
-f32 decimals with nulls, 16	313	3fa5719151113b30
-f32 specials, 17	359	698fb8e718a6527e
-f32 decimals with nulls, 17	341	2a11499eef3d1d66
-f32 specials, 31	611	5420c002c85dae5a
-f32 decimals with nulls, 31	563	72d47ca6b2d8df36
-f32 specials, 33	647	28e1e8c94b2242a7
-f32 decimals with nulls, 33	595	be41d5d9e35fccf5
-f32 specials, 1000	1367	b993ce3ccefe1e22
-f32 decimals with nulls, 1000	1221	1847c3b1dfee5ce8
-f32 specials, 8191	1367	59d8b14841b3672c
-f32 decimals with nulls, 8191	1221	510bac85c58d8325
-f32 specials, 8192	1367	23cd871fc3851700
-f32 decimals with nulls, 8192	1231	2bc29d490e89d9fa
-f32 zeros	1371	14352f3f5c23c332
-f32 -0	1371	14352f3f5c23c332
-f32 2^24 counter	1369	0068b92d320c07c1
-f32 beyond 2^24	1369	5532c05e74d19fb9
-f32 tiny	1367	bcc1fb221573f727
-f32 huge	1367	8c6c32ca0f5e2391
-f32 0.1 steps	1370	f2d0f79503bffb6e
-f32 -1e9 ramp	1369	e6deecf60a24a747
-f32 random bits	1367	f3c1004feebb4897
-f32 random exponents, 8192	1367	c60aa1261889b4f9
-f32 random exponents, 64	1205	ddef3ec5edcf1979
-f32 random exponents, 31	611	2bb4b1f7146540e3
-f32 random exponents, 33	647	7e9dde40fbe8dfc7
-f32 random exponents, 47	899	8b120003d82f1b41
-f32 random exponents, 95	1259	19b77e1209015b74
-f32 random exponents, 1000	1367	b98df74cdeae8837
-f32 random exponents with nulls, 8192	1231	d764f3f078feb8cf
-f64 random exponents with nulls, 8192	1197	8024e6df23f66720
-f32 random exponents with nulls, 1000	1227	126816cff0bf40a1
-f64 random exponents with nulls, 1000	1199	665ea47ae2c2865f
-f32 random exponents with nulls, 95	1133	d6323533d7110ec5
-f64 random exponents with nulls, 95	1105	379698fcbb6bdb46
-f32 random exponents with nulls, 64	1081	1bfbbbd4cbc54776
-f64 random exponents with nulls, 64	1053	dc61ee768de7c527
-f32 random exponents with nulls, 47	809	e97411c94535ec4f
-f64 random exponents with nulls, 47	781	76d4ea0e09d8cda9
-f32 random exponents with nulls, 33	597	27c43ec52bf997e8
-f64 random exponents with nulls, 33	561	7ae1f944265939c0
-f32 random exponents with nulls, 32	593	da5459f310819e80
-f64 random exponents with nulls, 32	541	669f43de7cd4ce69
-f32 random exponents with nulls, 31	553	4849d735a26a43ca
-f64 random exponents with nulls, 31	541	6a48b5ff883b27e4
-f32 random exponents with nulls, 17	331	dc80071f184d7abb
-f64 random exponents with nulls, 17	311	ae351baf1892aaef
-f32 random exponents with nulls, 16	309	94f8d7c1853bf4f2
-f64 random exponents with nulls, 16	289	8e466a64c7c2acd2
-f32 random exponents with nulls, 15	319	df11f3913b0d3231
-f64 random exponents with nulls, 15	275	7bb3a6ac40e7e59f
-f32 random exponents with nulls, 1	67	b056a3084815c809
-f64 random exponents with nulls, 1	45	519ff9ff07a8c235
-f32 only nulls	1126	31129c10f7b471d5
-f64 only nulls	1102	32cb63a8156b7fe9
-f32 NaN, inf and nulls	1158	8ad137a7c354e1e7
-f64 -0 and +0 with nulls	1102	8095d4559ca00c9c
-f32 -0 and +0	1261	bdc7b748d4598529
-f64 specials, 1	45	67c12f8ec2d74a49
-f64 decimals, 1	45	a61ee14e8c4a852c
-f64 specials, 2	65	847b3ee558346b6d
-f64 decimals, 2	66	d3cc87dcc9bd793e
-f64 specials, 3	83	2b1ec8ddc35d27db
-f64 decimals, 3	84	88e2f70e4ee930fa
-f64 specials, 15	281	d3d4395dd7a6965a
-f64 decimals, 15	269	c62068c04a9b6909
-f64 specials, 16	307	d3a9a465bd7543ba
-f64 decimals, 16	285	72c2d2ce85cca8ad
-f64 specials, 17	327	971cbd03d4d39a4c
-f64 decimals, 17	314	12ab0ab940264bd0
-f64 specials, 31	583	e03b663612d2ea74
-f64 decimals, 31	545	aa8d67b5f2635b8b
-f64 specials, 33	559	18999f0a12ac247b
-f64 decimals, 33	557	80904de6a286e26f
-f64 specials, 1000	1210	7bd6e9d42a3f9730
-f64 decimals, 1000	1229	dcf67404811fd6ce
-f64 specials, 8191	1202	0f36e79526082939
-f64 decimals, 8191	1229	0b749adcb869e1d0
-f64 specials, 8192	1224	440c22a486ad01b9
-f64 decimals, 8192	1223	76d66ad3cb2df37c
-f64 decimal scale 1e0 div, 4	101	52f3ec91f5272586
-f64 decimal scale 1e0 mul, 5	120	957b1e51d7f8b61c
-f64 decimal scale 1e0 div, 6	137	50cbc2666836f852
-f64 decimal scale 1e0 mul, 7	155	57e84bcb7f569c2a
-f64 decimal scale 1e1 div, 8	173	e9b908c55b3a7089
-f64 decimal scale 1e1 mul, 9	192	80fdafc8429cbe47
-f64 decimal scale 1e1 div, 13	263	ff1b9b1bb7a759a2
-f64 decimal scale 1e1 mul, 33	575	04c41693856dd9ff
-f64 decimal scale 1e2 div, 1001	1244	4480dd1b997e0327
-f64 decimal scale 1e2 mul, 4	102	74578d856dee5e3f
-f64 decimal scale 1e2 div, 5	120	9f2ece04888850d7
-f64 decimal scale 1e2 mul, 6	138	d668450371a87a71
-f64 decimal scale 1e3 div, 7	155	91cdd4835ee0635b
-f64 decimal scale 1e3 mul, 8	174	521bfd62df226fe7
-f64 decimal scale 1e3 div, 9	183	b1dbe9e7f4af6c01
-f64 decimal scale 1e3 mul, 13	263	7e0816cd1c9813c7
-f64 decimal scale 1e4 div, 33	576	f3deb5ac9279d086
-f64 decimal scale 1e4 mul, 1001	1209	1c567e6d887a78f8
-f64 decimal scale 1e4 div, 4	99	9f1cc7422c361963
-f64 decimal scale 1e4 mul, 5	113	d8253f6b85e8c66d
-f64 decimal scale 1e5 div, 6	138	fa6247dba7f14f14
-f64 decimal scale 1e5 mul, 7	143	9990e17c1c751522
-f64 decimal scale 1e5 div, 8	174	9e0b8670c6b6046e
-f64 decimal scale 1e5 mul, 9	192	44eff86bddaaf07b
-f64 decimal scale 1e6 div, 13	239	4e0001ca0b68f122
-f64 decimal scale 1e6 mul, 33	594	716c4c5fabbc2fb8
-f64 decimal scale 1e6 div, 1001	1198	96663e7c77eff66a
-f64 decimal scale 1e6 mul, 4	95	d22231af24a25732
-f64 decimal scale 1e7 div, 5	115	a8e384a3506829ed
-f64 decimal scale 1e7 mul, 6	137	a6d7264b5e8fe047
-f64 decimal scale 1e7 div, 7	155	8384050e7c4dc8b4
-f64 decimal scale 1e7 mul, 8	174	1686b72778518aec
-f64 decimal scale 1e8 div, 9	192	daf377059b9513d5
-f64 decimal scale 1e8 mul, 13	239	b7aeffdfc037ab1b
-f64 decimal scale 1e8 div, 33	624	e2994e99ec960391
-f64 decimal scale 1e8 mul, 1001	1319	c4872ddf0f0f366d
-f64 decimal scale 1e9 div, 4	102	064d86711dd5b94b
-f64 decimal scale 1e9 mul, 5	120	b28fa7bd1f4f6ff1
-f64 decimal scale 1e9 div, 6	138	c4d851f40755abdc
-f64 decimal scale 1e9 mul, 7	155	aaaf3ffd5358deb4
-f64 decimal scale 1e10 div, 8	174	a706935734893a3d
-f64 decimal scale 1e10 mul, 9	192	e47c1bc659d5b528
-f64 decimal scale 1e10 div, 13	263	28a237f494655ec5
-f64 decimal scale 1e10 mul, 33	624	d4a07e36e1dec53e
-f64 decimal scale 1e11 div, 1001	1204	632fa54df2eacf86
-f64 decimal scale 1e11 mul, 4	102	c36df062b615b795
-f64 decimal scale 1e11 div, 5	120	20410fae6c7e1380
-f64 decimal scale 1e11 mul, 6	138	bd204dc68fada4f4
-f64 decimal scale 1e12 div, 7	155	a63ff88a3ddce89b
-f64 decimal scale 1e12 mul, 8	173	23b510159ae986f8
-f64 decimal scale 1e12 div, 9	192	8f9902c705a4ef69
-f64 decimal scale 1e12 mul, 13	263	0a3ead45ab3e5875
-f64 decimal scale 1e13 div, 33	578	7de68dd116f2b000
-f64 decimal scale 1e13 mul, 1001	1243	826ef8089ca46ed4
-f64 decimal scale 1e13 div, 4	99	5695fe0ceda2cb64
-f64 decimal scale 1e13 mul, 5	120	d67fdbdafd444d82
-f64 decimal scale 1e14 div, 6	138	981076dfc6eb5787
-f64 decimal scale 1e14 mul, 7	149	82a65a0871cd0d53
-f64 decimal scale 1e14 div, 8	174	b8df7c11469b5c33
-f64 decimal scale 1e14 mul, 9	191	8404755dce627854
-f64 decimal scale 1e15 div, 13	239	809672715bef65f6
-f64 decimal scale 1e15 mul, 33	574	a08dee69737242ab
-f64 decimal scale 1e15 div, 1001	1291	310ca8b81904b2ba
-f64 decimal scale 1e15 mul, 4	93	9507a1842262770f
-f64 decimal scale 2^1 div, 5	120	eef52ebc35c525cd
-f64 decimal scale 2^2 mul, 6	138	a9bd83049b77d635
-f64 decimal scale 2^3 div, 7	155	a048b2f95f3b004a
-f64 decimal scale 2^4 mul, 8	174	0aa33a3237828c47
-f64 decimal scale 2^5 div, 9	191	3d1e7ffafeaf5d02
-f64 decimal scale 2^6 mul, 13	241	4f46154ce51f201b
-f64 decimal scale 2^7 div, 33	624	6c838a1f4d6613af
-f64 decimal scale 2^8 mul, 1001	1202	612b864a2285d01d
-f64 decimal scale 2^9 div, 4	102	7e65747facef52b7
-f64 decimal scale 2^10 mul, 5	120	d11351d7836e2522
-f64 decimal scale 2^11 div, 6	138	b16a7d3ad0a755e6
-f64 decimal scale 2^12 mul, 7	147	7c1426c8d061ab8f
-f64 decimal scale 2^13 div, 8	173	51abf4495d4a49ea
-f64 decimal scale 2^14 mul, 9	192	5d5f33985cf8a581
-f64 decimal scale 2^15 div, 13	249	5c53d5d8bd146fe2
-f64 decimal scale 2^16 mul, 33	602	86ece92ad48b28b1
-f64 decimal scale 2^17 div, 1001	1260	fd490df17b7620cc
-f64 decimal scale 2^18 mul, 4	101	0f86cae6897c734e
-f64 decimal scale 2^19 div, 5	120	62b90d424759ed18
-f64 decimal scale 2^20 mul, 6	137	df8550e56e065d2f
-f64 decimal scale 2^21 div, 7	155	d843e3fd4911029c
-f64 decimal scale 2^22 mul, 8	174	5e9c69f1c27df5e9
-f64 decimal scale 2^23 div, 9	192	3748da08af36147a
-f64 decimal scale 2^24 mul, 13	263	829a5a7848781c32
-f64 decimal scale 2^25 div, 33	610	f89446b5cfd75a5b
-f64 decimal scale 2^26 mul, 1001	1330	8785b578ab20c762
-f64 decimal scale 2^27 div, 4	101	5f8bde17a8334248
-f64 decimal scale 2^28 mul, 5	120	ab5cb6addd508db2
-f64 integers near 2^51 and 2^52, 5 from 2251799813685242	120	b52cbfcad91dae96
-f64 integers near 2^51 and 2^52, 9 from 2251799813685242	192	97b7bed32d225ead
-f64 integers near 2^51 and 2^52, 5 from 2251799813685246	120	d4f179466108490a
-f64 integers near 2^51 and 2^52, 9 from 2251799813685246	192	f275c779db92dc0d
-f64 integers near 2^51 and 2^52, 5 from 2251799813685247	120	1941e04a2447c079
-f64 integers near 2^51 and 2^52, 9 from 2251799813685247	192	c044bd19ad4557c1
-f64 integers near 2^51 and 2^52, 5 from 2251799813685248	120	1084f78134830b49
-f64 integers near 2^51 and 2^52, 9 from 2251799813685248	192	1fd10354a60183e2
-f64 integers near 2^51 and 2^52, 5 from 4503599627370486	120	df7a3b50f9123b2a
-f64 integers near 2^51 and 2^52, 9 from 4503599627370486	192	51d47ff8e014891b
-f64 integers near 2^51 and 2^52, 5 from 4503599627370494	120	1ca80f59f5fe105f
-f64 integers near 2^51 and 2^52, 9 from 4503599627370494	192	e8021d2f62b7e90e
-f64 integers near 2^51 and 2^52, 5 from 4503599627370496	119	15b8242c78557cb3
-f64 integers near 2^51 and 2^52, 9 from 4503599627370496	191	274f93b9ffb98780
-f64 integers near 2^51 and 2^52, 5 from -2251799813685242	120	0978d1b969581350
-f64 integers near 2^51 and 2^52, 9 from -2251799813685242	192	582c498364a25393
-f64 integers near 2^51 and 2^52, 5 from -2251799813685248	120	ba90fc5b6b1fa5f0
-f64 integers near 2^51 and 2^52, 9 from -2251799813685248	192	94d595fdc6ce2f7a
-f64 integers near 2^51 and 2^52, 5 from -4503599627370486	120	8755c5d9474e8ea3
-f64 integers near 2^51 and 2^52, 9 from -4503599627370486	192	f0e0048b271d0f01
-f64 2^53 counter	1343	0d7a903c2134e043
-f64 1e15 decimals	1344	a51d1f21dd917205
-f64 1e300 ramp	1343	4a6d35051b23040d
-f64 0.1 steps	1344	1ca710a4db3cf50e
-f64 random bits	1343	4082369981104965
-f64 short specials 0	585	7d4f1bbd9736e93a
-f64 short specials 1	583	fb5cda8130f9f98b
-f64 short specials 2	581	a254b4dea2fa96bb
-f64 short specials 3	579	1941008f24de96ec
-f64 short specials 4	577	b5150514a016391b
-f64 short specials 5	575	06a9e1d3e5c866d5
-f64 short specials 6	573	a7546dd7d5ec85ef
-f64 short specials 7	593	f2cf7c58bd141943
-f64 short specials 8	591	bd86e3eb95cfb851
-f64 short specials 9	589	17ff57ad005e9e2c
-f64 short specials 10	587	02558aeeed509fff
-f64 short specials 11	574	a8626e22f9b5ae51
-f64 short specials 12	576	96238cd878eacebd
-f64 short specials 13	623	44ed688b86e38016
-f64 short specials 14	577	011a7e6b7f92acc5
-f32 short specials 0	609	f7a04b807f92b67a
-f32 short specials 1	607	a65a5ae5fbf7dc04
-f32 short specials 2	605	103e42dd20ef8930
-f32 short specials 3	603	3bc0af0e46da835f
-f32 short specials 4	601	b7d0a6be5e246395
-f32 short specials 5	599	9362f6e6278341ee
-f32 short specials 6	597	03f3e7be8a2b01d7
-f32 short specials 7	617	ce135fe59a6521cd
-f32 short specials 8	615	e3fd33c31bf20efb
-f32 short specials 9	613	01a84e27fe0b44ac
-f32 short specials 10	611	7dd10d5d6c8bb266
-f32 short specials 11	604	b9c5c7ef82dbda22
-f32 short specials 12	601	3a572997bd1affcb
-f32 short specials 13	619	250eeae939c459a6
-f32 short specials 14	605	cce56c7ee02a7701
-f64 zero ties 0	643	3998283fdca3591c
-f64 zero ties 1	575	4c6a4512cf85732b
-f64 zero ties 2	574	db022aa783a9f2d4
-f64 zero ties 3	574	bceac36caea06418
-f64 zero ties 4	574	96da9efdfa08cd41
-f64 zero ties 5	574	f45d72b2a075c0e5
-f64 zero ties 6	574	dcd7f566a00d5fe4
-f64 zero ties 7	574	e784cb7bff87dabc
-f64 zero ties 8	574	0d6ed9bbc5bc0c4d
-f64 zero ties 9	574	5fd36dfa4a3a2ba6
-f64 zero ties 10	574	94e1a0be9102b03a
-f64 zero ties 11	574	591dcc60a4dfbe2f
-f64 zero ties 12	574	a741815bd2b6d47d
-f64 zero ties 13	574	89f36520090d2de7
-f64 zero ties 14	574	c47e891544d2e475
-f64 zero ties 15	574	199d0042844b97bb
-f32 zero ties 0	669	6f95bf8544532d93
-f32 zero ties 1	601	dc87bd54bdd2062d
-f32 zero ties 2	599	acd2fb6be69edc56
-f32 zero ties 3	599	6892e73064d8dbb8
-f32 zero ties 4	599	2f935ca773c83cc8
-f32 zero ties 5	599	fa83d2fa408e62ab
-f32 zero ties 6	599	bafc44d1239878f5
-f32 zero ties 7	599	51383ad6fdc4efca
-f32 zero ties 8	599	9cfd5d773f5e6faa
-f32 zero ties 9	599	8b2a0652f1cb9a94
-f32 zero ties 10	599	18ed88da06e47997
-f32 zero ties 11	599	6eda951b3eb3decc
-f32 zero ties 12	599	62feac987bdc2462
-f32 zero ties 13	599	b0dcc08161a890d9
-f32 zero ties 14	599	97fa3d8ae52dd179
-f32 zero ties 15	599	59dc55a2bbfcb3b2
-f32 PS3 bar	1371	8eac6d494b10dcbd
-f32 PS3 psi	1368	cec4c8d66a5819df
-f32 edge values cycling	1368	9ca26789f21ffa68
-f32 2049 distinct	1368	33e870b3efa97ea8
-f64 PS3 bar	1345	1c24759f8804a8b4
-f64 PS3 psi	1344	f8b4269e68fd3a27
-f64 edge values cycling	1344	05ba48448133356c
-f64 2049 distinct	1343	dfb1f11467d6d07c
-f64 widened hdd_temp	1345	3be06cedc3159deb
-f64 widened cpu_temp	1345	376710e0f66be64c
-f64 widened tank_bar	1345	999e896f06e253cb
-f64 widened tank_psi	1344	62597a469f757d7e
-f64 widened vibration	1344	87c4e81b87eefbfc
-f64 widened flow_rate	1344	28ee8d705475191c
-f64 widened flow_total	1344	0bfefea00c1d68d0
-f64 widened random	1344	d8559c591ba7c598
-f64 widened specials	1200	7674e075a50af019
-f64 widened specials and a double	1214	201be70137b48063
-ts jitter	1339	086ca80f59c2fd37
-ts random gaps and duplicates	1339	6d682aae1b14649e
-ts negative	1339	b87ce5e888019943
-ts extremes	115	734f9f44c5044df0
+f32 hdd_temp	1373	7c6c1cbda9035d3a
+f64 hdd_temp	1347	92de087263fd0b34
+f32 cpu_temp	1373	3909e67ce9d4d9ed
+f64 cpu_temp	1347	7c8bae0bc90e7300
+f32 tank_bar	1373	8e6a575688a65d01
+f64 tank_bar	1347	09f6432a9d77152d
+f32 tank_psi	1371	3820b1e2fc8264cd
+f64 tank_psi	1345	c21c91ce2a7c69e7
+f32 vibration	1371	2cec63ba9242ff5c
+f64 vibration	1346	bd009e6495248eff
+f32 flow_rate	1373	25cfeba0c56b244f
+f64 flow_rate	1346	872515f096fa111e
+f32 flow_total	1371	687ea0dfd4802a9d
+f64 flow_total	1346	8741f95f86c164fa
+f32 random	1371	d2203e48437e5840
+f64 random	1345	7ac94339330f7f2c
+int64 totalizer	1343	65f37f05d1bc258a
+int64 random rate	1343	0e741c5091fde112
+int64 sequence	1343	5f04d0d6b1af75eb
+int64 extremes	1199	1e2625d6fb5097ea
+int64 random bits	1343	0e001a30473d3931
+int64 nulls	1197	3c8954286849597d
+int64 int32 range with nulls, 8192	1203	6ec83f42d2ff18fb
+int64 just past int32, 8192	1343	0fe1cf040ba57ffa
+int64 just below int32, 8192	1343	f6fcc5447da0dd6f
+int64 most negative, 8192	1199	65c914b667ff4ee4
+int64 most positive, 8192	1343	b80f6eaeb421cbbc
+int64 int32 range with nulls, 1000	1227	5e3c2467e704abd6
+int64 just past int32, 1000	1343	1336f201f485cd68
+int64 just below int32, 1000	1343	f7e69682c1f3bd6e
+int64 most negative, 1000	1197	476cb643cef339ed
+int64 most positive, 1000	1343	abdd3196f38d3322
+int64 int32 range with nulls, 33	569	8f4fc712c99407a7
+int64 just past int32, 33	623	d796ae80511ae61e
+int64 just below int32, 33	623	1c233ea012da6421
+int64 most negative, 33	563	1d4d5c825347338b
+int64 most positive, 33	623	f0e7ea6062aa85cb
+int64 int32 range with nulls, 32	549	cf7946bc0feafafe
+int64 just past int32, 32	605	fcb72cf79c6ef47b
+int64 just below int32, 32	605	72720743d9c78d12
+int64 most negative, 32	551	34befc1160ec912f
+int64 most positive, 32	605	f24fa6eb93530bc7
+int64 int32 range with nulls, 31	533	4f72d4b6946a253e
+int64 just past int32, 31	587	d88e119d290ce9e4
+int64 just below int32, 31	587	ff1e4e73e53877a1
+int64 most negative, 31	527	bc39106ef1ff9f25
+int64 most positive, 31	587	450fe9ba68fd4bdc
+int64 int32 range with nulls, 17	309	2fe66b0a13987363
+int64 just past int32, 17	335	7e95e57199430e83
+int64 just below int32, 17	335	fcfeae00bb28186b
+int64 most negative, 17	309	27bf34dac4dc4ce8
+int64 most positive, 17	335	fda0860421f70319
+int64 int32 range with nulls, 16	301	8a002f8b9180a86d
+int64 just past int32, 16	317	b7ba91ddd2709221
+int64 just below int32, 16	317	ff49814926388f29
+int64 most negative, 16	295	b71edaff476a93c6
+int64 most positive, 16	317	97db37c3f7a38e4d
+int64 int32 range with nulls, 15	299	8252085a9f1ab2e5
+int64 just past int32, 15	299	2f1d608b25ab9fcc
+int64 just below int32, 15	299	26c5e47d19cf5fdb
+int64 most negative, 15	281	6f49e12a45de9438
+int64 most positive, 15	299	61fb63d656f414dd
+int64 int32 range with nulls, 9	185	5f5fa9f04a084c55
+int64 just past int32, 9	191	7ac3c8ed177d039b
+int64 just below int32, 9	191	4d759b287e547d9d
+int64 most negative, 9	173	599c2cdeda474304
+int64 most positive, 9	191	625ef55f6f2c0755
+int64 int32 range with nulls, 8	157	75d0f9812dd23fc1
+int64 just past int32, 8	173	4305070e1178d69e
+int64 just below int32, 8	173	24720f018a9c4eb8
+int64 most negative, 8	173	d8659802f8288183
+int64 most positive, 8	173	f1f56caf9ad521ba
+int64 int32 range with nulls, 7	143	b7487d7c773b8c90
+int64 just past int32, 7	155	6358215786c58144
+int64 just below int32, 7	155	601097dcf673b29c
+int64 most negative, 7	155	eadb21342419fa5f
+int64 most positive, 7	155	2b5a2e9ba8ac140a
+int64 int32 range with nulls, 1	44	3c7d29adda30b0a5
+int64 just past int32, 1	44	d4a9084e603974d9
+int64 just below int32, 1	44	2999b3371ae4712c
+int64 most negative, 1	44	655fe686e342e0f4
+int64 most positive, 1	44	d963e270557080ad
+int64 around 2^51	1205	ddca36e0d3fa197e
+int64 around -2^51	1209	af3b7fbd2c5b65c4
+int64 only nulls	1101	d7907de2c9dea15f
+bool door	1339	10b1537e6ad380c5
+bool coin with nulls	1197	e6a8c41c0d9acfe5
+state machine mode	1051	3ae3b4bd8b57162b
+state with nulls	909	674f7094a9baae53
+state near 2^32 with nulls, 8192	913	fc3940a5a5dcfa74
+bool odd values with nulls, 8192	1195	4d641d51d067c101
+state near 2^32 with nulls, 1000	907	3aa729a287910193
+bool odd values with nulls, 1000	1193	82e32c3fe27ffcdc
+state near 2^32 with nulls, 33	431	80ec5677670e4c5a
+bool odd values with nulls, 33	555	ee4f6f0e3b571bba
+state near 2^32 with nulls, 32	415	919022f3275753cc
+bool odd values with nulls, 32	539	913222708aba8d4d
+state near 2^32 with nulls, 31	415	be52b4b4f8ca318d
+bool odd values with nulls, 31	531	402a15edea4fe539
+state near 2^32 with nulls, 17	237	33865207764215ab
+bool odd values with nulls, 17	305	b29ad86687e9a00f
+state near 2^32 with nulls, 16	223	e00c15a2cb71a058
+bool odd values with nulls, 16	289	c7570538684e8849
+state near 2^32 with nulls, 15	209	6c4bffb34c822090
+bool odd values with nulls, 15	265	846314fdd11901f4
+state near 2^32 with nulls, 9	149	4fc0898a678e77db
+bool odd values with nulls, 9	177	773c2d736db117be
+state near 2^32 with nulls, 8	125	00b226cef3f04187
+bool odd values with nulls, 8	167	3c8f24d43c773e03
+state near 2^32 with nulls, 7	119	802a20be16f7d8ab
+bool odd values with nulls, 7	143	5f0c4f05fe20b205
+state near 2^32 with nulls, 1	40	d7975be7f5a2e960
+bool odd values with nulls, 1	40	f6349cda7174d09e
+state only nulls	833	a9d36d995a36a41d
+bool only nulls	1097	d5325986ea3c6aa9
+f32 specials, 1	70	26e98f8277fb44c9
+f32 decimals with nulls, 1	72	72eca84953e94a6e
+f32 specials, 2	91	329444623435ad00
+f32 decimals with nulls, 2	94	cde694f683653f84
+f32 specials, 3	109	4d64d3d0f52bbc27
+f32 decimals with nulls, 3	107	a2b4db290069c69a
+f32 specials, 15	325	1051945a8ca62490
+f32 decimals with nulls, 15	296	3372e1790ffc4889
+f32 specials, 16	343	04bbaefb7724661f
+f32 decimals with nulls, 16	315	d886aa16b6d958f7
+f32 specials, 17	361	d00f13754e349536
+f32 decimals with nulls, 17	343	88409245c9d119ee
+f32 specials, 31	613	304fe55982f2d007
+f32 decimals with nulls, 31	565	b1a9355f2ae6ce43
+f32 specials, 33	649	2ef74583cc8bc341
+f32 decimals with nulls, 33	597	980d5552bb58b94f
+f32 specials, 1000	1369	e126af461ecd0e68
+f32 decimals with nulls, 1000	1223	dbf504fbde1b3d0a
+f32 specials, 8191	1369	df6af10b82112d6c
+f32 decimals with nulls, 8191	1223	0e59bc523e29cfb5
+f32 specials, 8192	1369	e127df09c1eb36d1
+f32 decimals with nulls, 8192	1233	4704e2f6f2e914d3
+f32 zeros	1373	c6eb5fb961bcc4eb
+f32 -0	1373	c6eb5fb961bcc4eb
+f32 2^24 counter	1371	d5b704217fea60b8
+f32 beyond 2^24	1371	f6d9c206ac26df31
+f32 tiny	1369	61049997ec2ca016
+f32 huge	1369	9b421e2da99d4784
+f32 0.1 steps	1372	084c65b4c1e5898b
+f32 -1e9 ramp	1371	eaf56d9d9e9f93b9
+f32 random bits	1369	c2a2a84b3e5ac57a
+f32 random exponents, 8192	1369	3b3269fa72c0e0b0
+f32 random exponents, 64	1207	d7a3578d5d874dc4
+f32 random exponents, 31	613	fc7858f41be737de
+f32 random exponents, 33	649	7c74dbd4d31a9169
+f32 random exponents, 47	901	464f24d346ed8358
+f32 random exponents, 95	1261	5324440d53d9c1e1
+f32 random exponents, 1000	1369	4c9bd11ffb6dc5c1
+f32 random exponents with nulls, 8192	1233	ce6b6371aa4894a6
+f64 random exponents with nulls, 8192	1199	635245b4bfdd4e19
+f32 random exponents with nulls, 1000	1229	9b85dcf30d803127
+f64 random exponents with nulls, 1000	1201	206bb617cd05fec5
+f32 random exponents with nulls, 95	1135	a125d4f0bb052bb8
+f64 random exponents with nulls, 95	1107	799f73edb0d0f64b
+f32 random exponents with nulls, 64	1083	8be13df75e724c2f
+f64 random exponents with nulls, 64	1055	f412a56c934272ba
+f32 random exponents with nulls, 47	811	73a55ba8b9a50896
+f64 random exponents with nulls, 47	783	8e2133eb12208f88
+f32 random exponents with nulls, 33	599	66617bc9ddf57106
+f64 random exponents with nulls, 33	563	c090ce7c3125a93e
+f32 random exponents with nulls, 32	595	170ed94b259d4494
+f64 random exponents with nulls, 32	543	e6c8f1f677fed29d
+f32 random exponents with nulls, 31	555	ee9d540801d2cc63
+f64 random exponents with nulls, 31	543	0bd122cd01b6abed
+f32 random exponents with nulls, 17	333	484bd4e71524dff3
+f64 random exponents with nulls, 17	313	96e21b7f6eea5067
+f32 random exponents with nulls, 16	311	101704135e751f55
+f64 random exponents with nulls, 16	291	beab96bf8586ddf9
+f32 random exponents with nulls, 15	321	079b31d3a7ce2797
+f64 random exponents with nulls, 15	277	3f8c940077fb1e2d
+f32 random exponents with nulls, 1	68	8376f865d50c3378
+f64 random exponents with nulls, 1	46	f8334ccf4d7f88ac
+f32 only nulls	1128	7fbed9158525b2b1
+f64 only nulls	1104	d52946d861945471
+f32 NaN, inf and nulls	1160	edc036fbb6e564bb
+f64 -0 and +0 with nulls	1104	ffc98aa817f1526c
+f32 -0 and +0	1263	ed3c3f514a34a145
+f64 specials, 1	46	21a83ecc0bedb22c
+f64 decimals, 1	46	658e1a0b53dfd47d
+f64 specials, 2	67	f05f439ed068e446
+f64 decimals, 2	68	81c672b65bbf3d29
+f64 specials, 3	85	ce2d760ca1aadf38
+f64 decimals, 3	86	b3ac9bba41363649
+f64 specials, 15	283	094323915b409868
+f64 decimals, 15	271	94c96329bbaa4c1b
+f64 specials, 16	309	4bffb3735e345001
+f64 decimals, 16	287	5e424572900aae06
+f64 specials, 17	329	27d9dcb6ae62e214
+f64 decimals, 17	316	332e12c99cbdd0f8
+f64 specials, 31	585	e054a96e8d6a9a29
+f64 decimals, 31	547	e650edae1308f9da
+f64 specials, 33	561	083ad55a111f0829
+f64 decimals, 33	559	987846fc5b6b42b5
+f64 specials, 1000	1212	f1cbf75a4cda3ae6
+f64 decimals, 1000	1231	9ac9ff38b8810da4
+f64 specials, 8191	1204	7ed406be2ea69d79
+f64 decimals, 8191	1231	c546df19acc99b8c
+f64 specials, 8192	1226	ce53b9911de42f98
+f64 decimals, 8192	1225	e33637b810739205
+f64 decimal scale 1e0 div, 4	103	b0ec7f488c81856d
+f64 decimal scale 1e0 mul, 5	122	eeffdd61e5cefbd3
+f64 decimal scale 1e0 div, 6	139	f95d5899cdf26ae7
+f64 decimal scale 1e0 mul, 7	157	37f1d588f6c1b5f0
+f64 decimal scale 1e1 div, 8	175	99a4cda4db1f2cf1
+f64 decimal scale 1e1 mul, 9	194	aa2f14cf37b5e604
+f64 decimal scale 1e1 div, 13	265	72dfa3d870ac862e
+f64 decimal scale 1e1 mul, 33	577	9ad257ada892d951
+f64 decimal scale 1e2 div, 1001	1246	fd01cecf5a181a3f
+f64 decimal scale 1e2 mul, 4	104	63bf419c268ff5a0
+f64 decimal scale 1e2 div, 5	122	ad08c2e15725b71c
+f64 decimal scale 1e2 mul, 6	140	be271d75ce614e90
+f64 decimal scale 1e3 div, 7	157	fa26953e71ee8081
+f64 decimal scale 1e3 mul, 8	176	6ac74f4e92ab6e9f
+f64 decimal scale 1e3 div, 9	185	19a734575b72c666
+f64 decimal scale 1e3 mul, 13	265	b27f9a1a260b92d3
+f64 decimal scale 1e4 div, 33	578	c7015bdb32dcde70
+f64 decimal scale 1e4 mul, 1001	1211	4bd1639cef9aa824
+f64 decimal scale 1e4 div, 4	101	bfaadf116b49aff8
+f64 decimal scale 1e4 mul, 5	115	a946e2a2fd806296
+f64 decimal scale 1e5 div, 6	140	6bc624993a29c7d1
+f64 decimal scale 1e5 mul, 7	145	afd2bea18a1a4878
+f64 decimal scale 1e5 div, 8	176	81a947f00be980b6
+f64 decimal scale 1e5 mul, 9	194	a74b641f421e5ca4
+f64 decimal scale 1e6 div, 13	241	67605dea2910e89e
+f64 decimal scale 1e6 mul, 33	596	99329e88ee9a1c4a
+f64 decimal scale 1e6 div, 1001	1200	515826cac3c40982
+f64 decimal scale 1e6 mul, 4	97	0e193f28dcfe263d
+f64 decimal scale 1e7 div, 5	117	8819a83799b2a3b6
+f64 decimal scale 1e7 mul, 6	139	dac0b4299ade391e
+f64 decimal scale 1e7 div, 7	157	d9d76035fdff3e0e
+f64 decimal scale 1e7 mul, 8	176	1d18b164a1ad3494
+f64 decimal scale 1e8 div, 9	194	cf8b78eafb37b746
+f64 decimal scale 1e8 mul, 13	241	a497b325c0f27c2f
+f64 decimal scale 1e8 div, 33	626	93a7eb3b33477b3f
+f64 decimal scale 1e8 mul, 1001	1321	de24e9bf510525f5
+f64 decimal scale 1e9 div, 4	104	f2617700e90f5ca8
+f64 decimal scale 1e9 mul, 5	122	ac873d447aac4e7a
+f64 decimal scale 1e9 div, 6	140	0cfe846c03fe2761
+f64 decimal scale 1e9 mul, 7	157	399d4557adab69ce
+f64 decimal scale 1e10 div, 8	176	1c02c8616a1ec04d
+f64 decimal scale 1e10 mul, 9	194	176560841ecb7797
+f64 decimal scale 1e10 div, 13	265	2757a40d5be770a1
+f64 decimal scale 1e10 mul, 33	626	aa7990fe1e3ae328
+f64 decimal scale 1e11 div, 1001	1206	364d9228c03122fa
+f64 decimal scale 1e11 mul, 4	104	28237b95bcd8149e
+f64 decimal scale 1e11 div, 5	122	4dab1f6e5660f4fb
+f64 decimal scale 1e11 mul, 6	140	8922a9fa4fbda865
+f64 decimal scale 1e12 div, 7	157	1b3941ac2c5d867d
+f64 decimal scale 1e12 mul, 8	175	82a95e4392ff7370
+f64 decimal scale 1e12 div, 9	194	ebd0ed455aa7291a
+f64 decimal scale 1e12 mul, 13	265	bc2a2e4973fdfc21
+f64 decimal scale 1e13 div, 33	580	ac778e159ea57f7e
+f64 decimal scale 1e13 mul, 1001	1245	a44ca33904c4c2fc
+f64 decimal scale 1e13 div, 4	101	5e552ecc2fde9e23
+f64 decimal scale 1e13 mul, 5	122	dcc81968720c117d
+f64 decimal scale 1e14 div, 6	140	e1724692f6d1cc9e
+f64 decimal scale 1e14 mul, 7	151	54d3c111970e7b8d
+f64 decimal scale 1e14 div, 8	176	1bd0db87e0b29e3b
+f64 decimal scale 1e14 mul, 9	193	edc209f3997c3a73
+f64 decimal scale 1e15 div, 13	241	f3a775d3cad19e42
+f64 decimal scale 1e15 mul, 33	576	2c342f9632d4e1c9
+f64 decimal scale 1e15 div, 1001	1293	7ec97e267d6c55a2
+f64 decimal scale 1e15 mul, 4	95	aaeb4872d03ea914
+f64 decimal scale 2^1 div, 5	122	0f281c1a25e3741a
+f64 decimal scale 2^2 mul, 6	140	748dc50525259504
+f64 decimal scale 2^3 div, 7	157	2d844309530f883c
+f64 decimal scale 2^4 mul, 8	176	b4354202cc7aeb97
+f64 decimal scale 2^5 div, 9	193	251eeb1e85423665
+f64 decimal scale 2^6 mul, 13	243	c43291a9cc64c83f
+f64 decimal scale 2^7 div, 33	626	8d476b46eb7a527d
+f64 decimal scale 2^8 mul, 1001	1204	9ae34bd14c0bd945
+f64 decimal scale 2^9 div, 4	104	acdef895cbbf6ae8
+f64 decimal scale 2^10 mul, 5	122	03be4373a9ed2651
+f64 decimal scale 2^11 div, 6	140	bc731f1dfb7bc957
+f64 decimal scale 2^12 mul, 7	149	d233812372a65b69
+f64 decimal scale 2^13 div, 8	175	40811626482fdd92
+f64 decimal scale 2^14 mul, 9	194	5ef35e5ad7364cbe
+f64 decimal scale 2^15 div, 13	251	f52218b0d817acee
+f64 decimal scale 2^16 mul, 33	604	a045974848c3d28f
+f64 decimal scale 2^17 div, 1001	1262	95e0869c21045c04
+f64 decimal scale 2^18 mul, 4	103	9b53c25a9f4d08e1
+f64 decimal scale 2^19 div, 5	122	cbdb888df2e88547
+f64 decimal scale 2^20 mul, 6	139	fe90595c0d1fbf06
+f64 decimal scale 2^21 div, 7	157	7e155deb4f3524ba
+f64 decimal scale 2^22 mul, 8	176	34dd74f607db8c59
+f64 decimal scale 2^23 div, 9	194	24b9ccd73b37c65d
+f64 decimal scale 2^24 mul, 13	265	5770920d85de3086
+f64 decimal scale 2^25 div, 33	612	b23db634f8e49a21
+f64 decimal scale 2^26 mul, 1001	1332	9c9e7be69708272a
+f64 decimal scale 2^27 div, 4	103	e810277e245a357f
+f64 decimal scale 2^28 mul, 5	122	f0b32e0d83c1a661
+f64 integers near 2^51 and 2^52, 5 from 2251799813685242	122	7ecf6259d67d194d
+f64 integers near 2^51 and 2^52, 9 from 2251799813685242	194	9d174b2a27e6a69a
+f64 integers near 2^51 and 2^52, 5 from 2251799813685246	122	7f5a0f43a246f9cd
+f64 integers near 2^51 and 2^52, 9 from 2251799813685246	194	dece84f93a86b826
+f64 integers near 2^51 and 2^52, 5 from 2251799813685247	122	846b37ee04cea432
+f64 integers near 2^51 and 2^52, 9 from 2251799813685247	194	55de5b4705be40f2
+f64 integers near 2^51 and 2^52, 5 from 2251799813685248	122	b9c1c5a6a506adee
+f64 integers near 2^51 and 2^52, 9 from 2251799813685248	194	1cf807abf33ef4f1
+f64 integers near 2^51 and 2^52, 5 from 4503599627370486	122	1f6016f4e190ec11
+f64 integers near 2^51 and 2^52, 9 from 4503599627370486	194	251131ae6e0436f4
+f64 integers near 2^51 and 2^52, 5 from 4503599627370494	122	e52494ed787139bc
+f64 integers near 2^51 and 2^52, 9 from 4503599627370494	194	2f9b002af80e8265
+f64 integers near 2^51 and 2^52, 5 from 4503599627370496	121	e5b14b6c90cffa08
+f64 integers near 2^51 and 2^52, 9 from 4503599627370496	193	303345f12fcced4b
+f64 integers near 2^51 and 2^52, 5 from -2251799813685242	122	e25df1e55fc4e01b
+f64 integers near 2^51 and 2^52, 9 from -2251799813685242	194	ed02c0dd710ceca4
+f64 integers near 2^51 and 2^52, 5 from -2251799813685248	122	4937dd275ed5901f
+f64 integers near 2^51 and 2^52, 9 from -2251799813685248	194	41079423e4a189cd
+f64 integers near 2^51 and 2^52, 5 from -4503599627370486	122	2db22a79e58d6b64
+f64 integers near 2^51 and 2^52, 9 from -4503599627370486	194	bc25900f7e8cc5b2
+f64 2^53 counter	1345	849cdf182782b1f2
+f64 1e15 decimals	1346	f07c6670911ba39c
+f64 1e300 ramp	1345	2e12c6f1ede0f4ac
+f64 0.1 steps	1346	02065aab94959153
+f64 random bits	1345	4e7303aaae882880
+f64 short specials 0	587	b40d47ca95d92281
+f64 short specials 1	585	a57d984a44fcd28c
+f64 short specials 2	583	505fb3bb24abf93c
+f64 short specials 3	581	48c082c9da92373f
+f64 short specials 4	579	a7929c7fa980c8c8
+f64 short specials 5	577	c15fa2259180ee6e
+f64 short specials 6	575	365b5575e0182444
+f64 short specials 7	595	74136a7559933bf4
+f64 short specials 8	593	2cd8b9bb713b3322
+f64 short specials 9	591	36940d22388fe263
+f64 short specials 10	589	ed05a07f05acf9f0
+f64 short specials 11	576	7ccd44ad1037071a
+f64 short specials 12	578	b23b34a904a44c16
+f64 short specials 13	625	33c6f579c6cc4031
+f64 short specials 14	579	49f6fc84fda64e0e
+f32 short specials 0	611	47c0f7950c4e2e35
+f32 short specials 1	609	92b88fb7f7e321bf
+f32 short specials 2	607	9095a45960928a87
+f32 short specials 3	605	41e0b3e29d230310
+f32 short specials 4	603	c1901e0996c38dd2
+f32 short specials 5	601	b2b4213ff810fd11
+f32 short specials 6	599	645b909e810d2318
+f32 short specials 7	619	1df6b6e36e668042
+f32 short specials 8	617	ab13e22af16357bc
+f32 short specials 9	615	c70ac5ac2b08d46f
+f32 short specials 10	613	7593ad9f95879e0d
+f32 short specials 11	606	66d7e0331eeab191
+f32 short specials 12	603	c6f84549a8936118
+f32 short specials 13	621	894b625547272479
+f32 short specials 14	607	c5b181ba4155b40e
+f64 zero ties 0	645	0840a718905123b3
+f64 zero ties 1	577	f40adef100a8efcc
+f64 zero ties 2	576	d3c17efce9ea18d3
+f64 zero ties 3	576	86a37064f78d97b7
+f64 zero ties 4	576	c92dce0846838dbe
+f64 zero ties 5	576	935e5d1298dde33a
+f64 zero ties 6	576	e3ca466a7dbf52df
+f64 zero ties 7	576	261a948897b9e423
+f64 zero ties 8	576	a9718094fde6a7c2
+f64 zero ties 9	576	31ba3dd121565be1
+f64 zero ties 10	576	568f42b46bd5dfa9
+f64 zero ties 11	576	aa82ac112aee40a0
+f64 zero ties 12	576	e377785cd5bb0a06
+f64 zero ties 13	576	575ea37c2fb6a458
+f64 zero ties 14	576	a2296e29967e2cd6
+f64 zero ties 15	576	46fa978bee59486c
+f32 zero ties 0	671	760583410e6e4374
+f32 zero ties 1	603	31e626a691f46f9a
+f32 zero ties 2	601	b640f0078da5becd
+f32 zero ties 3	601	c9f91214932a157b
+f32 zero ties 4	601	7d63557c482fd31b
+f32 zero ties 5	601	41226f002c30c754
+f32 zero ties 6	601	032a8e511a867a06
+f32 zero ties 7	601	db934faea99ff39d
+f32 zero ties 8	601	6f1a8b8165de7f8d
+f32 zero ties 9	601	79216e98c4733eef
+f32 zero ties 10	601	bc9c9d3fbcf81c1c
+f32 zero ties 11	601	f889f0be7878adf7
+f32 zero ties 12	601	171f4aed633321c5
+f32 zero ties 13	601	73b6c9a6566b763e
+f32 zero ties 14	601	37eb0a4e35710fda
+f32 zero ties 15	601	db8c7b197d8b9af1
+f32 PS3 bar	1373	fb35427b9f1da7f0
+f32 PS3 psi	1370	a67e6892c7501a32
+f32 edge values cycling	1370	a7772940bb52f8ad
+f32 2049 distinct	1370	3ede02453e023ad6
+f64 PS3 bar	1347	a9a62ef43980eb8d
+f64 PS3 psi	1346	ba6ca4f7d56a1032
+f64 edge values cycling	1346	d57fa58790d3d9b5
+f64 2049 distinct	1345	272c8acff6a43b22
+f64 widened hdd_temp	1347	81702867806c7669
+f64 widened cpu_temp	1347	7c10b5b7a0d59ce7
+f64 widened tank_bar	1347	4537eab160670a34
+f64 widened tank_psi	1346	3f8f37915127eced
+f64 widened vibration	1346	151a4d9cbd1c41bb
+f64 widened flow_rate	1346	b2660f8f27e8a422
+f64 widened flow_total	1346	b6f8495dab1c18ac
+f64 widened random	1346	fc02586059ec6e89
+f64 widened specials	1202	db3da7141e5a8844
+f64 widened specials and a double	1216	98ccdfdef126ca8a
+ts jitter	1343	b8c3061839247cd7
+ts random gaps and duplicates	1343	23efc8960507b7fa
+ts negative	1343	ffb29152445942b6
+ts extremes	119	03a8c6dec750913f
+int64 steady +1000	1343	55ea213da38be8ef
+int64 counter resets nulls	1307	0b0ab3a2ea3bbc84
+int64 40-bit deltas	1343	4b12564982b64435
+bool coin flips	1339	bbcb84d0b21e42a1
+ts jitter 200ms	1343	248170ed93865418
+f32 multiples of 1000	1237	439fd1381bbad25e
+f64 multiples of 1000	1211	6ae1ce4e858509b5
+f32 multiples of 256	1373	aef7c6b984609f0e
+f64 multiples of 256	1347	6d9f56fc83a26b1f
 libzstd	1.5.7
 zstd f32 hdd_temp	7	843c4013d2ea3d76
 zstd f64 hdd_temp	3	8b8bd2d5a62c4b90
-zstd f32 cpu_temp	7	242e8d8e05afe9c7
-zstd f64 cpu_temp	3	399fe032510b1ae4
-zstd f32 tank_bar	7	5bb0d12d44cf76d4
-zstd f64 tank_bar	3	bda437fca3713930
-zstd f32 tank_psi	7	92f019b285bb9cba
-zstd f64 tank_psi	3	4e268ed5b229afa5
+zstd f32 cpu_temp	7	1561a331401ff60c
+zstd f64 cpu_temp	3	cb15921e17bab626
+zstd f32 tank_bar	7	b9d152dce79ac422
+zstd f64 tank_bar	3	b759318d2944e649
+zstd f32 tank_psi	7	896bf5ac0bab3fd1
+zstd f64 tank_psi	3	ac2b903130620dc9
 zstd f32 vibration	7	cbc757e3654dd8dc
 zstd f64 vibration	3	a522f2f556b70b9e
-zstd f32 flow_rate	7	81270c7bf3049964
-zstd f64 flow_rate	3	6c20575c6a3ba880
-zstd f32 flow_total	7	dbab40a976c975b9
-zstd f64 flow_total	3	f080d08eacde0b51
-zstd f32 random	7	931af93a9c3c2c5f
-zstd f64 random	3	21d4a2377186276c
-zstd int64 totalizer	3	e9f523ba9241e6bd
-zstd int64 random rate	3	5d9bbf666b60c3e1
-zstd int64 sequence	3	b3b3fbb972f345f9
+zstd f32 flow_rate	7	9e38465c76d44e95
+zstd f64 flow_rate	3	1af7197e4113d2ac
+zstd f32 flow_total	7	401850142db89db0
+zstd f64 flow_total	3	ba4822d55cab4d5e
+zstd f32 random	7	3355070579218b33
+zstd f64 random	3	5c2610d2fa30ac22
+zstd int64 totalizer	3	1b2a463d4856d17d
+zstd int64 random rate	3	c38dd64485c10a5d
+zstd int64 sequence	3	54f11dd6e3f15a3d
 zstd int64 extremes	3	98eceb5b1751dbf5
 zstd int64 random bits	3	e3f7cf28d98fa935
 zstd int64 nulls	3	7793d89772c37a73
 zstd int64 int32 range with nulls, 8192	3	c807c77a6c59be8d
-zstd int64 just past int32, 8192	3	88ef0dbd746dd47d
-zstd int64 just below int32, 8192	3	2d381ac28653cfbd
-zstd int64 most negative, 8192	3	a77850023ff08d31
-zstd int64 most positive, 8192	3	8b102f06f4ba1085
+zstd int64 just past int32, 8192	3	97f4ed35097ef405
+zstd int64 just below int32, 8192	3	ae85aab70d9dd6e9
+zstd int64 most negative, 8192	3	61cedb4538015f3d
+zstd int64 most positive, 8192	3	7deb5ec4d2182bbd
 zstd int64 int32 range with nulls, 1000	3	2598816be0c8e13b
-zstd int64 just past int32, 1000	3	157580b2286d5f53
-zstd int64 just below int32, 1000	3	72d70439fd7fd737
-zstd int64 most negative, 1000	3	6a9fc3c3aa6a1f4b
-zstd int64 most positive, 1000	3	d9b165062556672f
+zstd int64 just past int32, 1000	3	712cdb77a30c2167
+zstd int64 just below int32, 1000	3	c9e3536db1b8677b
+zstd int64 most negative, 1000	3	ccd6c0f12450289b
+zstd int64 most positive, 1000	3	ba9bcbb3e663118f
 zstd int64 int32 range with nulls, 33	3	222e0761af938cc7
-zstd int64 just past int32, 33	3	827140484fd7380b
-zstd int64 just below int32, 33	3	7b9c5ba5904d4c83
+zstd int64 just past int32, 33	3	bb68419132b16ac3
+zstd int64 just below int32, 33	3	5afb3b1912d9d303
 zstd int64 most negative, 33	3	4970c59213c984a3
 zstd int64 most positive, 33	3	29d2b7298584f567
 zstd int64 int32 range with nulls, 32	3	5b5c3ad7f8b34ef7
-zstd int64 just past int32, 32	3	3207be095c3f5be7
-zstd int64 just below int32, 32	3	61c3e8cffdcf9cab
+zstd int64 just past int32, 32	3	79130ce066ef2803
+zstd int64 just below int32, 32	3	5ac9e21998e2f66f
 zstd int64 most negative, 32	3	a4731b616449367f
 zstd int64 most positive, 32	3	dcc23b3171f3a53b
 zstd int64 int32 range with nulls, 31	3	59bf880dc41afeb3
-zstd int64 just past int32, 31	3	f69d77fca899f28b
-zstd int64 just below int32, 31	3	8cc75a281f7ef1b3
+zstd int64 just past int32, 31	3	7078210a8400a40f
+zstd int64 just below int32, 31	3	8cf7e779c29be163
 zstd int64 most negative, 31	3	3482e5de74e7dc5b
 zstd int64 most positive, 31	3	6938435b620809f3
 zstd int64 int32 range with nulls, 17	3	95fe0680179e2dec
-zstd int64 just past int32, 17	3	a172cbcd360193c0
-zstd int64 just below int32, 17	3	489ee708c2428370
+zstd int64 just past int32, 17	3	93b3abc1481c34d8
+zstd int64 just below int32, 17	3	a2d602d3cf0cc4a8
 zstd int64 most negative, 17	3	bb227878768ef66c
 zstd int64 most positive, 17	3	fc30381bc6f84dc4
 zstd int64 int32 range with nulls, 16	3	74e824a2dc651fd0
-zstd int64 just past int32, 16	3	977fe2369a0dec04
-zstd int64 just below int32, 16	3	b129a0253ee7c080
+zstd int64 just past int32, 16	3	e10258379b2a80ec
+zstd int64 just below int32, 16	3	4ce43419211abe90
 zstd int64 most negative, 16	3	9032841c26a67a9c
 zstd int64 most positive, 16	3	be9918363350a8e4
-zstd int64 int32 range with nulls, 15	3	3153c4e3e05c61cc
-zstd int64 just past int32, 15	3	7acc9d63b1516d78
-zstd int64 just below int32, 15	3	faff99e52164b67c
+zstd int64 int32 range with nulls, 15	3	b78f41273a158854
+zstd int64 just past int32, 15	3	8b9ee41b3ff88a78
+zstd int64 just below int32, 15	3	0e2ffa621c845864
 zstd int64 most negative, 15	3	46538f9a15c80270
 zstd int64 most positive, 15	3	efe40321206a4e6c
 zstd int64 int32 range with nulls, 9	3	c1f3f27712bea7fb
-zstd int64 just past int32, 9	3	07bb82c76b1b14bb
-zstd int64 just below int32, 9	3	ddb79b1d5fceecf7
+zstd int64 just past int32, 9	3	5fb4c02b7501432f
+zstd int64 just below int32, 9	3	981c6bd0b5631cdb
 zstd int64 most negative, 9	3	5cae2076aca3488f
 zstd int64 most positive, 9	3	9a1a4865c4515317
 zstd int64 int32 range with nulls, 8	3	03a858be088e7957
-zstd int64 just past int32, 8	3	659f9b4918ad26d3
-zstd int64 just below int32, 8	3	4f81020bbbe13a9b
+zstd int64 just past int32, 8	3	652875423bf56cb3
+zstd int64 just below int32, 8	3	72ad2a9699604393
 zstd int64 most negative, 8	3	cc5bc80507a91913
 zstd int64 most positive, 8	3	e53683b5ad3b88f7
 zstd int64 int32 range with nulls, 7	3	860d559bc2ff4b63
-zstd int64 just past int32, 7	3	aadce199f91f3887
-zstd int64 just below int32, 7	3	e30d01d47793e333
+zstd int64 just past int32, 7	3	9f8cc889202e6a03
+zstd int64 just below int32, 7	3	32bc72a2692c8993
 zstd int64 most negative, 7	3	cc5bc80507a91913
 zstd int64 most positive, 7	3	7fe65888091970f3
 zstd int64 int32 range with nulls, 1	3	06799aaaefa2ed0b
@@ -496,36 +505,36 @@ zstd int64 most positive, 1	3	85e222a5707e131f
 zstd int64 around 2^51	3	0a48dcdfc918f9b3
 zstd int64 around -2^51	3	45e1bb1b4ddad957
 zstd int64 only nulls	3	d51cc49f1929dcf2
-zstd bool door	3	efe0b7b14cff1bd5
-zstd bool coin with nulls	3	d0d1130789fa231d
-zstd state machine mode	3	148ea612441f089d
-zstd state with nulls	3	ab12240218b29482
-zstd state near 2^32 with nulls, 8192	3	bd835f9b3d915bfd
-zstd bool odd values with nulls, 8192	3	44e9fb9733c74c19
-zstd state near 2^32 with nulls, 1000	3	761be59cdc9e087b
-zstd bool odd values with nulls, 1000	3	4f864b74bdbf8653
-zstd state near 2^32 with nulls, 33	3	1c7ac0665f1ca59b
-zstd bool odd values with nulls, 33	3	4c376f85cc3aaf43
-zstd state near 2^32 with nulls, 32	3	79b762c96b78c887
-zstd bool odd values with nulls, 32	3	65f70508527ab117
-zstd state near 2^32 with nulls, 31	3	4497a4ecea78e05b
-zstd bool odd values with nulls, 31	3	96730ff0c52761fb
-zstd state near 2^32 with nulls, 17	3	99064725d7c5aa54
-zstd bool odd values with nulls, 17	3	69e4a9b08ba004a4
-zstd state near 2^32 with nulls, 16	3	1c107f883f75d404
-zstd bool odd values with nulls, 16	3	c437a712e6abe4c0
-zstd state near 2^32 with nulls, 15	3	7ee72834dbae9194
-zstd bool odd values with nulls, 15	3	1aac23045bb0f52c
-zstd state near 2^32 with nulls, 9	3	89806b24de49b8ff
-zstd bool odd values with nulls, 9	3	bf9d13cb56b66fcb
-zstd state near 2^32 with nulls, 8	3	107eda4143bf53e7
-zstd bool odd values with nulls, 8	3	5a2f3b9e20dad11f
-zstd state near 2^32 with nulls, 7	3	bce9d5462c32c06b
-zstd bool odd values with nulls, 7	3	dce47fa3048538a3
-zstd state near 2^32 with nulls, 1	3	75f64d078e46cbb7
-zstd bool odd values with nulls, 1	3	b9bc6a3f1a095533
-zstd state only nulls	3	931f8b3ab6e83426
-zstd bool only nulls	3	7ad242cf55524d96
+zstd bool door	3	04a810db4714ff7d
+zstd bool coin with nulls	3	e37dc7fb18c01ec5
+zstd state machine mode	3	618ccf4f5b256e15
+zstd state with nulls	3	ce1bc6a312a0e2b2
+zstd state near 2^32 with nulls, 8192	3	a383cf5631fd16dd
+zstd bool odd values with nulls, 8192	3	da5c42f4ec73ff2d
+zstd state near 2^32 with nulls, 1000	3	d090723a0d451c33
+zstd bool odd values with nulls, 1000	3	6ad140289c5d8153
+zstd state near 2^32 with nulls, 33	3	01b2d84c4f461f9b
+zstd bool odd values with nulls, 33	3	b9aec56eabcbafbb
+zstd state near 2^32 with nulls, 32	3	dd6fdd0f9e228cb3
+zstd bool odd values with nulls, 32	3	74eb18be250e95db
+zstd state near 2^32 with nulls, 31	3	f876380653f43bd7
+zstd bool odd values with nulls, 31	3	cbd9ce4c806bd86f
+zstd state near 2^32 with nulls, 17	3	017642d7f0816034
+zstd bool odd values with nulls, 17	3	c3d701eef7c57d54
+zstd state near 2^32 with nulls, 16	3	4a085db86286b274
+zstd bool odd values with nulls, 16	3	f24a2bad960bfc4c
+zstd state near 2^32 with nulls, 15	3	96b986172669dfb8
+zstd bool odd values with nulls, 15	3	257f2e067e830ec4
+zstd state near 2^32 with nulls, 9	3	7ea6bf213a5d586b
+zstd bool odd values with nulls, 9	3	a062de3e92947a3b
+zstd state near 2^32 with nulls, 8	3	8f03d6eab416d21f
+zstd bool odd values with nulls, 8	3	db8ec54cced7b707
+zstd state near 2^32 with nulls, 7	3	e594e6ff48658a1b
+zstd bool odd values with nulls, 7	3	c716cca85ff8486b
+zstd state near 2^32 with nulls, 1	3	910269cf0d17a727
+zstd bool odd values with nulls, 1	3	aa620087dcd4dcc7
+zstd state only nulls	3	14b9f65086d5249e
+zstd bool only nulls	3	5eaec9ea09e26162
 zstd f32 specials, 1	7	9916da63297b7c8f
 zstd f32 decimals with nulls, 1	7	752d9938352ee413
 zstd f32 specials, 2	7	1caafe88adaa6d3b
@@ -551,11 +560,11 @@ zstd f32 decimals with nulls, 8192	7	abfe6eeaa98a734d
 zstd f32 zeros	7	ee270726d3733595
 zstd f32 -0	7	ee270726d3733595
 zstd f32 2^24 counter	7	46ed6042888ead8d
-zstd f32 beyond 2^24	7	62bb1f6c2ffe08e1
+zstd f32 beyond 2^24	7	38e013f2002be335
 zstd f32 tiny	7	c2f4312e34bce005
 zstd f32 huge	7	4ddbc1fa3e120bc9
 zstd f32 0.1 steps	7	3b7b6020f22d65b5
-zstd f32 -1e9 ramp	7	dcd41fe9b805de01
+zstd f32 -1e9 ramp	7	0dd3f7cf64ede07d
 zstd f32 random bits	7	ccf4cc11ccb3fa6d
 zstd f32 random exponents, 8192	7	ca7eae4153861a9d
 zstd f32 random exponents, 64	7	ace3f93485edca4b
@@ -803,16 +812,25 @@ zstd f64 PS3 psi	3	3d12ef28dcf084f3
 zstd f64 edge values cycling	3	d57eb61854165112
 zstd f64 2049 distinct	3	a0c322559175bf1d
 zstd f64 widened hdd_temp	3	fcfa8b06d657ed7e
-zstd f64 widened cpu_temp	3	8e385ce0a835f1ce
-zstd f64 widened tank_bar	3	d9a0bd615bfd7312
-zstd f64 widened tank_psi	3	bae7d35ec622d4c2
+zstd f64 widened cpu_temp	3	22ca50307e8f6ee1
+zstd f64 widened tank_bar	3	18dc419790d2c5de
+zstd f64 widened tank_psi	3	6552a63eb8d2e8eb
 zstd f64 widened vibration	3	13c5cd090087102c
-zstd f64 widened flow_rate	3	47c9f3f30f6b0ae3
-zstd f64 widened flow_total	3	728af7c29d57f128
-zstd f64 widened random	3	1b22860153ea5c02
+zstd f64 widened flow_rate	3	803f699d3018c9a5
+zstd f64 widened flow_total	3	27af1ed68b9996ff
+zstd f64 widened random	3	ba63706be753b429
 zstd f64 widened specials	3	1792f62e898931f1
 zstd f64 widened specials and a double	3	ae1067ffb5229f5e
-zstd ts jitter	3	7489cce55a20f305
-zstd ts random gaps and duplicates	3	a0608532d2fd9815
+zstd ts jitter	3	c48da77e604cc0ea
+zstd ts random gaps and duplicates	3	dd118acf4cf5b9d2
 zstd ts negative	3	e30cc6701aeac785
 zstd ts extremes	3	7f517a1b404fee68
+zstd int64 steady +1000	3	74f621d5fb9bc0ed
+zstd int64 counter resets nulls	3	74f6fe37f9dc7f01
+zstd int64 40-bit deltas	3	0acaa949dc5030f5
+zstd bool coin flips	3	2364e77396086eed
+zstd ts jitter 200ms	3	e2e650f64def1911
+zstd f32 multiples of 1000	7	717d70e69a425115
+zstd f64 multiples of 1000	3	3dd91f0b45ee894d
+zstd f32 multiples of 256	7	dcc65d802f8bfbe9
+zstd f64 multiples of 256	3	a01ce9021551e3c9

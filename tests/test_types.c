@@ -1477,7 +1477,7 @@ static void test_ts_zstd_rule(void)
     uint8_t *src = malloc(INNER), *blk = malloc(ZSTD_compressBound(INNER) + 5 + BLK_SLACK);
     size_t tmp_cap = ZSTD_compressBound(block_bound(8192));
     uint8_t *tmp = malloc(tmp_cap);
-    static const int ts_kinds[] = {BLK_DD, BLK_TS_DELTA, BLK_TS_GRID};
+    static const int ts_kinds[] = {BLK_DD, BLK_TS_DELTA, BLK_TS_GRID, BLK_TS_FOR_BP};
     for (int zeros_pct = 10; zeros_pct <= 40; zeros_pct += 30) { /* random bytes, then a run of zeros ZSTD removes */
         for (size_t i = 0; i < INNER; i++)
             src[i] = i < INNER * (size_t)(100 - zeros_pct) / 100 ? (uint8_t)rnd() : 0;
@@ -1532,6 +1532,228 @@ static void test_ts_zstd_rule(void)
     codec_free(c);
 }
 
+/* Format-level codecs: BLK_INT_FOR (kind 18), BLK_BOOL_PACK (kind 19), BLK_TS_FOR_BP (kind 20),
+ * and dividing decimal/binary scales in BLK_DECIMAL_BP / BLK_F64_DECIMAL. */
+static void test_format_codecs(void)
+{
+    enum { N = 8192 };
+    codec_ctx *c = codec_new();
+    int64_t *iv = malloc(N * sizeof *iv), *io = malloc(N * sizeof *io + BLK_SLACK);
+    uint32_t *uv = malloc(N * sizeof *uv), *uo = malloc(N * sizeof *uo + BLK_SLACK);
+    float *fv = malloc(N * sizeof *fv), *fo = malloc(N * sizeof *fo + BLK_SLACK);
+    double *dv = malloc(N * sizeof *dv), *do_ = malloc(N * sizeof *do_ + BLK_SLACK);
+    uint8_t *blk = malloc(block_bound(N) + BLK_SLACK), *bad = malloc(block_bound(N) + BLK_SLACK);
+
+    /* 1. BLK_INT_FOR: steady counter (+998..+1002), resets/spikes/nulls (PFOR), 40-bit deltas, stationary direct FOR */
+    iv[0] = 1000000;
+    for (size_t i = 1; i < N; i++)
+        iv[i] = iv[i - 1] + 998 + (int64_t)(rnd() % 5);
+    size_t len = roundtrip(TSDB_INT64, iv, N, 0, "int64 steady +1000");
+    CHECK(blk_kind(TSDB_INT64, iv, N) == BLK_INT_FOR && len * 8 < N * 4);
+    /* counter with resets, spikes and 1% NULL_I64: PFOR patches outliers */
+    iv[0] = 5000000;
+    for (size_t i = 1; i < N; i++) {
+        if (i % 500 == 123)
+            iv[i] = 0; /* counter reset -> large negative delta */
+        else if (i % 700 == 333)
+            iv[i] = iv[i - 1] + 900000000ll; /* positive spike */
+        else if (i % 200 == 55)
+            iv[i] = NULL_I64; /* null -> two 64-bit deltas */
+        else
+            iv[i] = (iv[i - 1] == NULL_I64 ? 5000000 + (int64_t)i * 1000 : iv[i - 1]) + 1000 + (int64_t)(rnd() % 4);
+    }
+    len = roundtrip(TSDB_INT64, iv, N, 0, "int64 counter with resets/spikes/nulls");
+    CHECK(blk_kind(TSDB_INT64, iv, N) == BLK_INT_FOR && len * 8 < N * 8);
+    /* 40-bit deltas: pack64 instead of jumping from 32 to 64 */
+    iv[0] = 0;
+    for (size_t i = 1; i < N; i++)
+        iv[i] = iv[i - 1] + (int64_t)(rnd() & ((1ull << 40) - 1));
+    len = roundtrip(TSDB_INT64, iv, N, 0, "int64 40-bit deltas");
+    CHECK(blk_kind(TSDB_INT64, iv, N) == BLK_INT_FOR && len * 8 < N * 42);
+    /* stationary random 50k..70k: direct FOR (15 bits) beats zigzag delta (16 bits) */
+    for (size_t i = 0; i < N; i++)
+        iv[i] = 50000 + (int64_t)(rnd() % 20000);
+    len = roundtrip(TSDB_INT64, iv, N, 0, "int64 random 50k-70k direct FOR");
+    CHECK(blk_kind(TSDB_INT64, iv, N) == BLK_INT_FOR && len * 8 < (size_t)(N * 15.2));
+    /* constant step sequence: w = 0 delta FOR, < 0.1 bits/val raw */
+    for (size_t i = 0; i < N; i++)
+        iv[i] = 9000000000000ll + (int64_t)i * 3;
+    len = roundtrip(TSDB_INT64, iv, N, 0, "int64 sequence raw");
+    CHECK(blk_kind(TSDB_INT64, iv, N) == BLK_INT_FOR && len * 8 < N / 8);
+    /* int_for corrupt inputs & wrong type rejection */
+    size_t raw_if = int_for_encode(iv, 64, blk);
+    CHECK(raw_if >= 18 && int_for_decode(blk, raw_if, 64, io) == 0);
+    CHECK(int_for_decode(blk, raw_if - 1, 64, io) != 0);
+    memcpy(bad, blk, raw_if);
+    bad[raw_if] = 0;
+    CHECK(int_for_decode(bad, raw_if + 1, 64, io) != 0); /* trailing byte */
+    bad[8] = 0x04; /* reserved flag bit */
+    CHECK(int_for_decode(bad, raw_if, 64, io) != 0);
+    bad[8] = 0;
+    bad[9] = 65; /* w > 64 */
+    CHECK(int_for_decode(bad, raw_if, 64, io) != 0);
+    /* has_exc with nexc == 0 and pos >= nv */
+    bad[8] = 2;
+    bad[9] = 0;
+    memset(bad + 18, 0, 2); /* nexc = 0 */
+    CHECK(int_for_decode(bad, 20, 64, io) != 0);
+    uint16_t one = 1, badpos = 63; /* nv = 63 (indices 0..62) */
+    memcpy(bad + 18, &one, 2);
+    memcpy(bad + 20, &badpos, 2);
+    memset(bad + 22, 0, 8);
+    CHECK(int_for_decode(bad, 30, 64, io) != 0);
+    /* wrong type rejects BLK_INT_FOR */
+    size_t bl_if = block_encode_vals(c, 0, TSDB_VALUES_AUTO, TSDB_INT64, iv, 64, blk);
+    CHECK((blk[0] & BLK_KIND_MASK) == BLK_INT_FOR);
+    CHECK(block_decode_vals(c, TSDB_BOOL, blk, bl_if, 64, uo) != 0);
+    CHECK(block_decode_vals(c, TSDB_STATE, blk, bl_if, 64, uo) != 0);
+    CHECK(block_decode_vals(c, TSDB_FLOAT64, blk, bl_if, 64, do_) != 0);
+
+    /* 2. BLK_BOOL_PACK: coin flips (1 bit raw), with nulls (2 bits), steady runs (RLE raw), shifted states */
+    for (size_t i = 0; i < N; i++)
+        uv[i] = (uint32_t)(rnd() & 1);
+    len = roundtrip(TSDB_BOOL, uv, N, 1, "bool coin flips");
+    CHECK(blk_kind(TSDB_BOOL, uv, N) == BLK_BOOL_PACK && len * 8 < (size_t)(N * 1.05));
+    for (size_t i = 0; i < N; i++)
+        uv[i] = (uint32_t)(rnd() % 3);
+    len = roundtrip(TSDB_BOOL, uv, N, 0, "bool random with nulls");
+    CHECK(blk_kind(TSDB_BOOL, uv, N) == BLK_BOOL_PACK && len * 8 < (size_t)(N * 2.05));
+    for (size_t i = 0; i < N; i++)
+        uv[i] = i ? (rnd() % 1200 == 0 ? !uv[i - 1] : uv[i - 1]) : 0;
+    len = roundtrip(TSDB_BOOL, uv, N, 1, "bool door RLE");
+    CHECK(blk_kind(TSDB_BOOL, uv, N) == BLK_BOOL_PACK && len * 8 < N / 8);
+    for (size_t i = 0; i < N; i++)
+        uv[i] = i ? (rnd() % 300 == 0 ? 1 + (uint32_t)(rnd() % 5) : uv[i - 1]) : 1;
+    len = roundtrip(TSDB_STATE, uv, N, 1, "state machine mode RLE");
+    CHECK(blk_kind(TSDB_STATE, uv, N) == BLK_BOOL_PACK && len * 8 < N / 4);
+    for (size_t i = 0; i < N; i++)
+        uv[i] = 100 + (uint32_t)(rnd() % 4);
+    len = roundtrip(TSDB_STATE, uv, N, 0, "state shifted base 100..103");
+    CHECK(blk_kind(TSDB_STATE, uv, N) == BLK_BOOL_PACK && len * 8 < (size_t)(N * 2.1));
+    for (size_t i = 0; i < N; i++)
+        uv[i] = UINT32_MAX - (uint32_t)(rnd() % 3);
+    both_levels(TSDB_STATE, uv, N, "state near UINT32_MAX");
+    /* incrementing state codes fall back to BLK_INT */
+    for (size_t i = 0; i < N; i++)
+        uv[i] = (uint32_t)(1 + i);
+    both_levels(TSDB_STATE, uv, N, "state incrementing");
+    CHECK(blk_kind(TSDB_STATE, uv, N) == BLK_INT);
+    /* bool_pack corrupt inputs & wrong type rejection */
+    for (size_t i = 0; i < 64; i++)
+        uv[i] = (uint32_t)(i & 1);
+    size_t raw_bp = bool_pack_encode(uv, 64, blk);
+    CHECK(raw_bp > 1 && bool_pack_decode(blk, raw_bp, 64, uo) == 0);
+    CHECK(bool_pack_decode(blk, raw_bp - 1, 64, uo) != 0);
+    memcpy(bad, blk, raw_bp);
+    bad[0] = 2; /* invalid mode */
+    CHECK(bool_pack_decode(bad, raw_bp, 64, uo) != 0);
+    bad[0] = 0;
+    bad[1] = 33; /* w > 32 */
+    CHECK(bool_pack_decode(bad, raw_bp, 64, uo) != 0);
+    /* RLE corrupt: run exceeds n, varint overflow */
+    uint8_t rle_bad1[] = {1, 0, 64}; /* lm1 = 64 -> run = 65 > 64 */
+    CHECK(bool_pack_decode(rle_bad1, sizeof rle_bad1, 64, uo) != 0);
+    uint8_t rle_bad2[] = {1, 0x80, 0x80, 0x80, 0x80, 0x10, 0}; /* uint32 varint overflow */
+    CHECK(bool_pack_decode(rle_bad2, sizeof rle_bad2, 64, uo) != 0);
+    size_t bl_bp = block_encode_vals(c, 0, TSDB_VALUES_AUTO, TSDB_BOOL, uv, 64, blk);
+    CHECK((blk[0] & BLK_KIND_MASK) == BLK_BOOL_PACK);
+    CHECK(block_decode_vals(c, TSDB_INT64, blk, bl_bp, 64, io) != 0);
+
+    /* 3. BLK_TS_FOR_BP: jittered clocks (+-20ms, +-200ms), drift, random gaps, sorted check */
+    static const int jits[] = {5, 20, 50, 200};
+    for (size_t j = 0; j < sizeof jits / sizeof *jits; j++) {
+        int jit = jits[j];
+        for (size_t i = 0; i < N; i++)
+            iv[i] = 1700000000000ll + (int64_t)i * 1000 + (int64_t)(rnd() % (uint64_t)(2 * jit + 1)) - jit;
+        size_t tl = block_encode_ts(c, 1, iv, N, blk);
+        CHECK(tl > 0 && (blk[0] & BLK_KIND_MASK) == BLK_TS_FOR_BP && !(blk[0] & BLK_ZSTD));
+        CHECK(block_decode_ts_sorted(c, blk, tl, N, io) == 0 && memcmp(iv, io, N * 8) == 0);
+        int want_bits = bits_for((uint32_t)(2 * jit));
+        CHECK(tl * 8 < (size_t)(N * (want_bits + 0.25)));
+    }
+    /* random gaps -> delta mode (mode 1) */
+    iv[0] = 1700000000000ll;
+    for (size_t i = 1; i < N; i++)
+        iv[i] = iv[i - 1] + 100 + (int64_t)(rnd() % 50000);
+    size_t raw_tf = ts_for_bp_encode(iv, N, blk);
+    CHECK(raw_tf > 1 && blk[0] == 1);
+    CHECK(ts_for_bp_decode_sorted(blk, raw_tf, N, io) == 0 && memcmp(iv, io, N * 8) == 0);
+    /* sorted check rejects duplicates, decreases and int64 overflow in both grid and delta modes */
+    int64_t ts_dup[8] = {1000, 2000, 3000, 3000, 4000, 5000, 6000, 7000};
+    int64_t ts_dec[8] = {1000, 2000, 3000, 2999, 4000, 5000, 6000, 7000};
+    int64_t ts_ovf[4] = {INT64_MAX - 10, INT64_MAX, INT64_MIN, INT64_MIN + 10};
+    raw_tf = ts_for_bp_encode(ts_dup, 8, blk);
+    CHECK(ts_for_bp_decode(blk, raw_tf, 8, io) == 0 && ts_for_bp_decode_sorted(blk, raw_tf, 8, io) == TSDB_ERR_CORRUPT);
+    raw_tf = ts_for_bp_encode(ts_dec, 8, blk);
+    CHECK(ts_for_bp_decode(blk, raw_tf, 8, io) == 0 && ts_for_bp_decode_sorted(blk, raw_tf, 8, io) == TSDB_ERR_CORRUPT);
+    raw_tf = ts_for_bp_encode(ts_ovf, 4, blk);
+    CHECK(ts_for_bp_decode(blk, raw_tf, 4, io) == 0 && ts_for_bp_decode_sorted(blk, raw_tf, 4, io) == TSDB_ERR_CORRUPT);
+    /* corrupt ts_for_bp */
+    CHECK(ts_for_bp_decode(blk, raw_tf - 1, 4, io) != 0);
+    memcpy(bad, blk, raw_tf);
+    bad[0] = 2; /* bad mode */
+    CHECK(ts_for_bp_decode(bad, raw_tf, 4, io) != 0);
+
+    /* 4. Dividing decimal (10^-1..10^-6) and binary (2^-1..2^-10) scales for float32 & float64 */
+    static const double dec_mults[] = {1e1, 1e2, 1e3, 1e4, 1e5, 1e6};
+    for (size_t m = 0; m < sizeof dec_mults / sizeof *dec_mults; m++) {
+        int64_t cur = 100;
+        for (size_t i = 0; i < N; i++) {
+            cur += (int64_t)(rnd() % 7) - 3;
+            dv[i] = (double)cur * dec_mults[m];
+            fv[i] = (float)dv[i];
+            if (i % 131 == 7) {
+                uint32_t nf32 = NULL_F32;
+                uint64_t nf64 = NULL_F64;
+                memcpy(&fv[i], &nf32, 4);
+                memcpy(&dv[i], &nf64, 8);
+            } else if (i % 257 == 11) {
+                fv[i] = -0.0f;
+                dv[i] = -0.0;
+            }
+        }
+        size_t fl = decimal_bp_encode(fv, N, blk);
+        CHECK(fl > 14 && blk[0] == 35 + m);
+        CHECK(decimal_bp_decode(blk, fl, N, fo) == 0 && memcmp(fv, fo, N * 4) == 0);
+        CHECK(fl * 8 < N * 5); /* ~3-bit deltas + <1% exceptions */
+        size_t dl = f64_decimal_encode(dv, N, blk);
+        CHECK(dl > 5 && (blk[0] & ~0x80) == 46 + m && (blk[0] & 0x80));
+        CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
+        CHECK(dl * 8 < N * 6);
+        both_levels(TSDB_FLOAT32, fv, N, "f32 dividing decimal");
+        both_levels(TSDB_FLOAT64, dv, N, "f64 dividing decimal");
+    }
+    for (int b = 1; b <= 10; b++) {
+        double mul2 = (double)(1L << b);
+        int64_t cur = 50;
+        for (size_t i = 0; i < N; i++) {
+            cur += (int64_t)(rnd() % 5) - 2;
+            dv[i] = (double)cur * mul2;
+            fv[i] = (float)dv[i];
+        }
+        size_t fl = decimal_bp_encode(fv, N, blk);
+        CHECK(fl > 14 && blk[0] >= 41 && blk[0] <= 50);
+        CHECK(decimal_bp_decode(blk, fl, N, fo) == 0 && memcmp(fv, fo, N * 4) == 0);
+        CHECK(fl * 8 < N * 4);
+        size_t dl = f64_decimal_encode(dv, N, blk);
+        CHECK(dl > 5 && (blk[0] & ~0x80) >= 52 && (blk[0] & ~0x80) <= 61 && (blk[0] & 0x80));
+        CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
+        CHECK(dl * 8 < N * 4);
+    }
+
+    free(iv);
+    free(io);
+    free(uv);
+    free(uo);
+    free(fv);
+    free(fo);
+    free(dv);
+    free(do_);
+    free(blk);
+    free(bad);
+    codec_free(c);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_types", 1200);
@@ -1544,6 +1766,7 @@ int main(int argc, char **argv)
     }
     test_dict();
     test_ts_zstd_rule();
+    test_format_codecs();
     test_exceptions_rt();
     test_f32_wide();
     test_engine(base);

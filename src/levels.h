@@ -68,6 +68,11 @@
     X(int, ts_delta_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))       \
     X(int, ts_delta_decode_sorted, (const uint8_t *in, size_t len, size_t n, int64_t *out),                   \
       (in, len, n, out))                                                                                      \
+    X(size_t, ts_for_bp_bound, (size_t n), (n))                                                               \
+    X(size_t, ts_for_bp_encode, (const int64_t *ts, size_t n, uint8_t *out), (ts, n, out))                    \
+    X(int, ts_for_bp_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))      \
+    X(int, ts_for_bp_decode_sorted, (const uint8_t *in, size_t len, size_t n, int64_t *out),                  \
+      (in, len, n, out))                                                                                      \
     X(size_t, decimal_bp_bound, (size_t n), (n))                                                              \
     X(size_t, decimal_bp_encode, (const float *in, size_t n, uint8_t *out), (in, n, out))                     \
     X(int, decimal_bp_decode, (const uint8_t *in, size_t len, size_t n, float *out), (in, len, n, out))       \
@@ -128,6 +133,12 @@
     X(size_t, int_bp_bound, (size_t n), (n))                                                                  \
     X(size_t, int_bp_encode, (const int64_t *in, size_t n, uint8_t *out), (in, n, out))                       \
     X(int, int_bp_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))         \
+    X(size_t, int_for_bound, (size_t n), (n))                                                                 \
+    X(size_t, int_for_encode, (const int64_t *in, size_t n, uint8_t *out), (in, n, out))                      \
+    X(int, int_for_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))        \
+    X(size_t, bool_pack_bound, (size_t n), (n))                                                               \
+    X(size_t, bool_pack_encode, (const uint32_t *in, size_t n, uint8_t *out), (in, n, out))                   \
+    X(int, bool_pack_decode, (const uint8_t *in, size_t len, size_t n, uint32_t *out), (in, len, n, out))     \
     X(size_t, dict_bound, (size_t n), (n))                                                                    \
     X(size_t, dict_encode, (const void *v, size_t n, int width, uint8_t *out), (v, n, width, out))            \
     X(int, dict_decode, (const uint8_t *in, size_t len, size_t n, int width, void *out),                      \

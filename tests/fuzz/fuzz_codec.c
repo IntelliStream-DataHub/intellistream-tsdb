@@ -26,13 +26,14 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     return cc && out ? 0 : -1;
 }
 
-enum { NSEL = 27 };
+enum { NSEL = 30 };
 
 #ifdef CODEC_EXACT_OUT
 /* the bytes per output value of each selector */
 static size_t width(int sel)
 {
-    static const unsigned char w[NSEL] = {8, 0, 0, 0, 0, 0, 8, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 4, 8, 8, 8, 4, 8, 8, 4, 8};
+    static const unsigned char w[NSEL] = {8, 0, 0, 0, 0, 0, 8, 4, 4, 4, 4, 4, 4, 8, 8,
+                                          4, 4, 4, 4, 8, 8, 8, 4, 8, 8, 4, 8, 8, 4, 8};
     return sel >= 1 && sel <= 5 ? type_width(sel - 1) : w[sel];
 }
 #endif
@@ -46,7 +47,8 @@ static int ts_sorted(int sel, const uint8_t *p, size_t len, size_t n, int rc)
         return rc;
     int rs = sel == 0 ? block_decode_ts_sorted(cc, p, len, n, b) : sel == 6 ? dd_decode_sorted(p, len, n, b)
              : sel == 13                                          ? ts_grid_decode_sorted(p, len, n, b)
-                                                                  : ts_delta_decode_sorted(p, len, n, b);
+             : sel == 14                                          ? ts_delta_decode_sorted(p, len, n, b)
+                                                                  : ts_for_bp_decode_sorted(p, len, n, b);
     bool inc = true;
     for (size_t i = 1; rc == 0 && i < n; i++)
         inc &= a[i] > a[i - 1];
@@ -59,10 +61,11 @@ static int ts_sorted(int sel, const uint8_t *p, size_t len, size_t n, int rc)
 static int decode(int sel, const uint8_t *p, size_t len, size_t n)
 {
     switch (sel) {
-    case 0: case 6: case 13: case 14: {
+    case 0: case 6: case 13: case 14: case 29: {
         int rc = sel == 0 ? block_decode_ts(cc, p, len, n, out) : sel == 6 ? dd_decode(p, len, n, out)
                  : sel == 13                                       ? ts_grid_decode(p, len, n, out)
-                                                                   : ts_delta_decode(p, len, n, out);
+                 : sel == 14                                       ? ts_delta_decode(p, len, n, out)
+                                                                   : ts_for_bp_decode(p, len, n, out);
         return ts_sorted(sel, p, len, n, rc);
     }
     case 1: case 2: case 3: case 4: case 5: return block_decode_vals(cc, sel - 1, p, len, n, out);
@@ -83,7 +86,9 @@ static int decode(int sel, const uint8_t *p, size_t len, size_t n)
     case 23: return delta_bp64_decode(p, len, n, out);
     case 24: return alprd64_decode(p, len, n, out);
     case 25: return dict_decode(p, len, n, 4, out);
-    default: return dict_decode(p, len, n, 8, out);
+    case 26: return dict_decode(p, len, n, 8, out);
+    case 27: return int_for_decode(p, len, n, out);
+    default: return bool_pack_decode(p, len, n, out);
     }
 }
 
@@ -147,6 +152,9 @@ static int raw_sel(int kind, int type)
     case BLK_INT: return 19;
     case BLK_DICT: return f64 ? 26 : 25;
     case BLK_F32_WIDE: return 1 + TSDB_FLOAT32; /* a float32 block inside */
+    case BLK_INT_FOR: return 27;
+    case BLK_BOOL_PACK: return 28;
+    case BLK_TS_FOR_BP: return 29;
     default: return -1;
     }
 }
@@ -254,5 +262,43 @@ void fuzz_seeds(const char *dir)
         size_t len = block_encode_vals(cc, k & 1, 0, TSDB_FLOAT64, d, N, blk);
         seed_block(dir, 1 + TSDB_FLOAT64, N, blk, len);
     }
+    /* BLK_INT_FOR (steady, PFOR outliers, 40-bit), BLK_BOOL_PACK (direct + RLE), BLK_TS_FOR_BP (grid + delta),
+     * and dividing decimal/binary scales */
+    iv[0] = 1000000;
+    ts[0] = 1700000000000ll;
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        if (i) {
+            iv[i] = i == 77 ? 0 : i == 140 ? NULL_I64 : iv[i - 1] + 1000 + (int64_t)(r & 3);
+            ts[i] = 1700000000000ll + (int64_t)i * 1000 + (int64_t)((r >> 48) % 401) - 200;
+        }
+        st[i] = (uint32_t)(r & 1);
+        d[i] = (double)(100 + (i % 30)) * 1000.0;
+        f[i] = (float)d[i];
+    }
+    seed(dir, 27, N, blk, int_for_encode(iv, N, blk));
+    seed(dir, 28, N, blk, bool_pack_encode(st, N, blk));
+    seed(dir, 29, N, blk, ts_for_bp_encode(ts, N, blk));
+    for (int lvl = 0; lvl <= 1; lvl++) {
+        seed_block(dir, 0, N, blk, block_encode_ts(cc, lvl, ts, N, blk));
+        seed_block(dir, 1 + TSDB_INT64, N, blk, block_encode_vals(cc, lvl, 0, TSDB_INT64, iv, N, blk));
+        seed_block(dir, 1 + TSDB_BOOL, N, blk, block_encode_vals(cc, lvl, 0, TSDB_BOOL, st, N, blk));
+        seed_block(dir, 1 + TSDB_FLOAT32, N, blk, block_encode_vals(cc, lvl, 0, TSDB_FLOAT32, f, N, blk));
+        seed_block(dir, 1 + TSDB_FLOAT64, N, blk, block_encode_vals(cc, lvl, 0, TSDB_FLOAT64, d, N, blk));
+    }
+    /* RLE bool/state + delta-mode ts_for_bp + 40-bit int_for */
+    ts[0] = 1700000000000ll;
+    iv[0] = 0;
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        st[i] = (uint32_t)(1 + (i / 60));
+        if (i) {
+            ts[i] = ts[i - 1] + 100 + (int64_t)((r >> 20) % 50000);
+            iv[i] = iv[i - 1] + (int64_t)(r & ((1ull << 40) - 1));
+        }
+    }
+    seed(dir, 27, N, blk, int_for_encode(iv, N, blk));
+    seed(dir, 28, N, blk, bool_pack_encode(st, N, blk));
+    seed(dir, 29, N, blk, ts_for_bp_encode(ts, N, blk));
     free(blk);
 }

@@ -541,6 +541,74 @@ static void make_inputs(void)
     x = add("ts extremes", TSDB_INT64, 5);
     int64_t te[] = {INT64_MIN + 1, -1, 0, 1, INT64_MAX};
     memcpy(x->ts, te, sizeof te);
+
+    /* format-level codecs: BLK_INT_FOR (steady, PFOR outliers, 40-bit), BLK_TS_FOR_BP (+-200 ms),
+     * BLK_BOOL_PACK (coin flips), and dividing decimal/binary scales (f32 and f64) */
+    x = add("int64 steady +1000", TSDB_INT64, GR);
+    ((int64_t *)x->v)[0] = 1000000;
+    for (size_t i = 1; i < GR; i++)
+        ((int64_t *)x->v)[i] = ((int64_t *)x->v)[i - 1] + 998 + (int64_t)(next() % 5);
+    x = add("int64 counter resets nulls", TSDB_INT64, GR);
+    ((int64_t *)x->v)[0] = 5000000;
+    for (size_t i = 1; i < GR; i++) {
+        int64_t prev = ((int64_t *)x->v)[i - 1];
+        if (i % 500 == 123)
+            ((int64_t *)x->v)[i] = 0;
+        else if (i % 700 == 333)
+            ((int64_t *)x->v)[i] = prev + 900000000ll;
+        else if (i % 200 == 55)
+            ((int64_t *)x->v)[i] = NULL_I64;
+        else
+            ((int64_t *)x->v)[i] = (prev == NULL_I64 ? 5000000 + (int64_t)i * 1000 : prev) + 1000 + (int64_t)(next() % 4);
+    }
+    x = add("int64 40-bit deltas", TSDB_INT64, GR);
+    ((int64_t *)x->v)[0] = 0;
+    for (size_t i = 1; i < GR; i++)
+        ((int64_t *)x->v)[i] = ((int64_t *)x->v)[i - 1] + (int64_t)(next() & ((1ull << 40) - 1));
+    x = add("bool coin flips", TSDB_BOOL, GR);
+    for (size_t i = 0; i < GR; i++)
+        ((uint32_t *)x->v)[i] = (uint32_t)(next() & 1);
+    x = add("ts jitter 200ms", TSDB_INT64, GR);
+    for (size_t i = 0; i < GR; i++)
+        x->ts[i] = 1700000000000ll + (int64_t)i * 1000 + (int64_t)(next() % 401) - 200;
+    x = add("f32 multiples of 1000", TSDB_FLOAT32, GR);
+    {
+        int64_t cur = 23;
+        for (size_t i = 0; i < GR; i++) {
+            cur += (int64_t)(next() % 7) - 3;
+            float f = (float)((double)cur * 1000.0);
+            memcpy((float *)x->v + i, &f, 4);
+            if (i % 137 == 5)
+                ((uint32_t *)x->v)[i] = NULL_F32;
+        }
+    }
+    x = add("f64 multiples of 1000", TSDB_FLOAT64, GR);
+    {
+        int64_t cur = 23;
+        for (size_t i = 0; i < GR; i++) {
+            cur += (int64_t)(next() % 7) - 3;
+            double d = (double)cur * 1000.0;
+            memcpy((double *)x->v + i, &d, 8);
+            if (i % 137 == 5)
+                ((uint64_t *)x->v)[i] = NULL_F64;
+        }
+    }
+    x = add("f32 multiples of 256", TSDB_FLOAT32, GR);
+    {
+        int64_t cur = 50;
+        for (size_t i = 0; i < GR; i++) {
+            cur += (int64_t)(next() % 5) - 2;
+            ((float *)x->v)[i] = (float)((double)cur * 256.0);
+        }
+    }
+    x = add("f64 multiples of 256", TSDB_FLOAT64, GR);
+    {
+        int64_t cur = 50;
+        for (size_t i = 0; i < GR; i++) {
+            cur += (int64_t)(next() % 5) - 2;
+            ((double *)x->v)[i] = (double)cur * 256.0;
+        }
+    }
 }
 
 /* ---- one configuration: everything into r ---- */
@@ -1194,6 +1262,7 @@ static void run(rec *r, codec_ctx *c)
         CODEC(dd, x->ts, 8);
         CODEC(ts_grid, x->ts, 8);
         CODEC(ts_delta, x->ts, 8);
+        CODEC(ts_for_bp, x->ts, 8);
         switch (x->type) {
         case TSDB_FLOAT32:
             CODEC(gorilla, x->v, 4);
@@ -1218,7 +1287,12 @@ static void run(rec *r, codec_ctx *c)
             break;
         case TSDB_INT64:
             CODEC(int_bp, x->v, 8);
+            CODEC(int_for, x->v, 8);
             CODEC(dd, x->v, 8);
+            break;
+        case TSDB_BOOL:
+        case TSDB_STATE:
+            CODEC(bool_pack, x->v, 4);
             break;
         }
         /* aggregates: whole, every short prefix (the kernels' tails, the short runs), and the statistics parts

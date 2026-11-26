@@ -224,11 +224,467 @@ int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
     return used && used == len ? 0 : TSDB_ERR_CORRUPT;
 }
 
+/* --------------------------------------------------------------- BLK_INT_FOR */
+/*
+ * Frame-of-reference integer codec for TSDB_INT64, per vector of 1024 values:
+ * each vector independently chooses delta-FOR (d[i] = v[i] - v[i-1]) or
+ * direct-FOR (v[i] - base), packs offsets at 0..64 bits (pack for <= 32,
+ * pack64 for 33..63, raw for 64), and optionally patches up to nv/32 outliers
+ * (PFOR: zeroed in the packed stream, stored as (u16 pos, u64 full_u)).
+ *
+ *   i64 first
+ *   per vector (v0 = 1..n):
+ *     u8 flags (bit 0: direct, bit 1: has_exc) | u8 w (0..64) | u64 base
+ *     packed_bytes(nv, w) bytes
+ *     if has_exc: u16 nexc (1..nv) | nexc x (u16 pos, u64 full_u)
+ */
+#define IFOR_F_DIRECT 1u
+#define IFOR_F_EXC    2u
+
+size_t int_for_bound(size_t n) { return 8 + (n / IBP_VEC + 1) * 12 + 8 * n + 16; }
+
+typedef struct int_for_plan {
+    uint64_t base;
+    size_t cost;
+    int w;
+    uint16_t nexc;
+    bool direct;
+} int_for_plan;
+
+static void int_for_plan_vec(const int64_t *x, size_t nv, bool direct, int_for_plan *out)
+{
+    int64_t lo = x[0], hi = x[0];
+    for (size_t i = 1; i < nv; i++) {
+        lo = x[i] < lo ? x[i] : lo;
+        hi = x[i] > hi ? x[i] : hi;
+    }
+    int w = bits_for64((uint64_t)hi - (uint64_t)lo);
+    size_t raw_cost = packed_bytes(nv, w);
+    *out = (int_for_plan){.base = (uint64_t)lo, .cost = raw_cost, .w = w, .nexc = 0, .direct = direct};
+    if (w <= 6 || nv < 32)
+        return;
+
+    /* Outlier-robust base from a deterministic 32-element sample: catches both low (resets, NULL_I64)
+     * and high (spikes) outliers without sorting the whole vector. */
+    int64_t s[32];
+    for (size_t k = 0; k < 32; k++)
+        s[k] = x[k * nv / 32];
+    for (size_t i = 1; i < 32; i++) {
+        int64_t v = s[i];
+        size_t j = i;
+        while (j > 0 && s[j - 1] > v) {
+            s[j] = s[j - 1];
+            j--;
+        }
+        s[j] = v;
+    }
+    uint64_t span = (uint64_t)s[29] - (uint64_t)s[2];
+    uint64_t base2 = (uint64_t)lo;
+    uint64_t lo_gap = (uint64_t)s[2] - (uint64_t)lo;
+    if (lo_gap > span && bits_for64((uint64_t)s[29] - (uint64_t)lo) > bits_for64(span) + 1) {
+        uint64_t margin = span <= (UINT64_MAX - 16) / 2 ? span * 2 + 16 : UINT64_MAX;
+        uint64_t dist_min = (uint64_t)s[2] - (uint64_t)INT64_MIN;
+        int64_t cutoff = margin >= dist_min ? INT64_MIN : (int64_t)((uint64_t)s[2] - margin);
+        int64_t b2 = INT64_MAX;
+        for (size_t i = 0; i < nv; i++)
+            if (x[i] >= cutoff && x[i] < b2)
+                b2 = x[i];
+        base2 = (uint64_t)b2;
+    } else if (bits_for64(span) >= w) {
+        return; /* middle ~87% already requires w bits: <= 3% exceptions cannot narrow it */
+    }
+
+    uint16_t hist[65] = {0};
+    for (size_t i = 0; i < nv; i++)
+        hist[bits_for64((uint64_t)x[i] - base2)]++;
+
+    size_t max_exc = nv / 32, exc = 0;
+    for (int wp = 63; wp >= 0; wp--) {
+        exc += hist[wp + 1];
+        if (exc > max_exc)
+            break;
+        if (exc == 0)
+            continue;
+        size_t c = packed_bytes(nv, wp) + 2 + exc * 10;
+        if (c + 16 <= raw_cost && c < out->cost) {
+            out->base = base2;
+            out->w = wp;
+            out->nexc = (uint16_t)exc;
+            out->cost = c;
+        }
+    }
+}
+
+size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0)
+        return 0;
+    memcpy(out, &in[0], 8);
+    uint8_t *o = out + 8;
+    int64_t d[IBP_VEC];
+    uint32_t u32[IBP_VEC];
+    uint64_t u64[IBP_VEC];
+    uint16_t epos[IBP_VEC / 32 + 1];
+    uint64_t eval[IBP_VEC / 32 + 1];
+
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        for (size_t i = 0; i < nv; i++)
+            d[i] = (int64_t)((uint64_t)in[v0 + i] - (uint64_t)in[v0 + i - 1]);
+        int_for_plan pd, pv;
+        int_for_plan_vec(d, nv, false, &pd);
+        const int_for_plan *p = &pd;
+        if (pd.cost > 0) {
+            int_for_plan_vec(in + v0, nv, true, &pv);
+            /* prefer direct on tie: decodes without a prefix sum */
+            if (pv.cost <= pd.cost)
+                p = &pv;
+        }
+        const int64_t *src = p->direct ? (in + v0) : d;
+
+        *o++ = (uint8_t)((p->direct ? IFOR_F_DIRECT : 0u) | (p->nexc ? IFOR_F_EXC : 0u));
+        *o++ = (uint8_t)p->w;
+        memcpy(o, &p->base, 8);
+        o += 8;
+
+        if (p->nexc == 0) {
+            if (p->w > 0) {
+                if (p->w <= 32) {
+                    for (size_t i = 0; i < nv; i++)
+                        u32[i] = (uint32_t)((uint64_t)src[i] - p->base);
+                    pack(u32, nv, p->w, o);
+                } else {
+                    for (size_t i = 0; i < nv; i++)
+                        u64[i] = (uint64_t)src[i] - p->base;
+                    pack64(u64, nv, p->w, o);
+                }
+                o += packed_bytes(nv, p->w);
+            }
+        } else {
+            uint16_t nx = 0;
+            for (size_t i = 0; i < nv; i++) {
+                uint64_t u = (uint64_t)src[i] - p->base;
+                if ((u >> p->w) != 0) {
+                    epos[nx] = (uint16_t)i;
+                    eval[nx] = u;
+                    nx++;
+                    u = 0;
+                }
+                if (p->w <= 32)
+                    u32[i] = (uint32_t)u;
+                else
+                    u64[i] = u;
+            }
+            if (p->w > 0) {
+                if (p->w <= 32)
+                    pack(u32, nv, p->w, o);
+                else
+                    pack64(u64, nv, p->w, o);
+                o += packed_bytes(nv, p->w);
+            }
+            memcpy(o, &nx, 2);
+            o += 2;
+            for (uint16_t k = 0; k < nx; k++) {
+                memcpy(o, &epos[k], 2);
+                memcpy(o + 2, &eval[k], 8);
+                o += 10;
+            }
+        }
+    }
+    return (size_t)(o - out);
+}
+
+int int_for_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < 8)
+        return TSDB_ERR_CORRUPT;
+    uint64_t cur;
+    memcpy(&cur, in, 8);
+    out[0] = (int64_t)cur;
+    const uint8_t *p = in + 8, *end = in + len;
+    uint32_t u32[IBP_VEC];
+    uint64_t u64[IBP_VEC];
+
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        if ((size_t)(end - p) < 10)
+            return TSDB_ERR_CORRUPT;
+        uint8_t flags = p[0], w = p[1];
+        if ((flags & ~(IFOR_F_DIRECT | IFOR_F_EXC)) || w > 64)
+            return TSDB_ERR_CORRUPT;
+        uint64_t base;
+        memcpy(&base, p + 2, 8);
+        p += 10;
+        size_t pb = packed_bytes(nv, w);
+        if ((size_t)(end - p) < pb)
+            return TSDB_ERR_CORRUPT;
+        bool direct = (flags & IFOR_F_DIRECT) != 0;
+        bool has_exc = (flags & IFOR_F_EXC) != 0;
+
+        if (!has_exc && w == 0) {
+            if (direct) {
+                for (size_t i = 0; i < nv; i++)
+                    out[v0 + i] = (int64_t)base;
+                cur = base;
+            } else {
+                for (size_t i = 0; i < nv; i++)
+                    out[v0 + i] = (int64_t)(cur + (uint64_t)(i + 1) * base);
+                cur += (uint64_t)nv * base;
+            }
+            continue;
+        }
+        if (!has_exc && w <= 32) {
+            unpack(p, nv, w, u32);
+            p += pb;
+            if (direct) {
+                for (size_t i = 0; i < nv; i++)
+                    out[v0 + i] = (int64_t)(base + (uint64_t)u32[i]);
+                cur = (uint64_t)out[v0 + nv - 1];
+            } else {
+                cur = for_prefix_u32_to_i64(u32, nv, base, cur, out + v0);
+            }
+            continue;
+        }
+        if (w <= 32) {
+            unpack(p, nv, w, u32);
+            for (size_t i = 0; i < nv; i++)
+                u64[i] = u32[i];
+        } else {
+            unpack64(p, nv, w, u64);
+        }
+        p += pb;
+        if (has_exc) {
+            if ((size_t)(end - p) < 2)
+                return TSDB_ERR_CORRUPT;
+            uint16_t nexc;
+            memcpy(&nexc, p, 2);
+            p += 2;
+            if (nexc == 0 || nexc > nv || (size_t)(end - p) < (size_t)nexc * 10)
+                return TSDB_ERR_CORRUPT;
+            for (uint16_t k = 0; k < nexc; k++, p += 10) {
+                uint16_t pos;
+                uint64_t val;
+                memcpy(&pos, p, 2);
+                memcpy(&val, p + 2, 8);
+                if (pos >= nv)
+                    return TSDB_ERR_CORRUPT;
+                u64[pos] = val;
+            }
+        }
+        if (direct) {
+            for (size_t i = 0; i < nv; i++)
+                out[v0 + i] = (int64_t)(base + u64[i]);
+            cur = (uint64_t)out[v0 + nv - 1];
+        } else {
+            cur = for_prefix_u64_to_i64(u64, nv, base, cur, out + v0);
+        }
+    }
+    return p == end ? 0 : TSDB_ERR_CORRUPT;
+}
+
+/* ------------------------------------------------------------- BLK_BOOL_PACK */
+/*
+ * Direct bit-pack (mode 0) or RLE (mode 1) for 4-byte uint32 values
+ * (TSDB_BOOL: 0/1/NULL_BOOL, TSDB_STATE: small codes or long steady runs).
+ *
+ *   mode 0 (direct): u8 0 | per vector (1024): u8 (w | 0x80*has_base) | [u32 base] | packed_bytes(nv, w)
+ *   mode 1 (RLE):    u8 1 | (uvarint32 val, uvarint32 run_len - 1)... until n values decoded
+ */
+size_t bool_pack_bound(size_t n) { return 1 + (n / IBP_VEC + 1) * 5 + 4 * n + 8; }
+
+static inline size_t bp_uvarint_len(uint32_t v)
+{
+    size_t k = 1;
+    while (v >= 0x80u) {
+        v >>= 7;
+        k++;
+    }
+    return k;
+}
+
+static inline uint8_t *bp_put_uvarint(uint8_t *o, uint32_t v)
+{
+    while (v >= 0x80u) {
+        *o++ = (uint8_t)((v & 0x7fu) | 0x80u);
+        v >>= 7;
+    }
+    *o++ = (uint8_t)v;
+    return o;
+}
+
+static inline bool bp_get_uvarint(const uint8_t **pp, const uint8_t *end, uint32_t *out)
+{
+    const uint8_t *p = *pp;
+    uint32_t v = 0;
+    for (unsigned sh = 0; sh < 35; sh += 7) {
+        if (p >= end)
+            return false;
+        uint8_t b = *p++;
+        if (sh == 28 && b >= 0x10u)
+            return false;
+        v |= (uint32_t)(b & 0x7fu) << sh;
+        if (!(b & 0x80u)) {
+            *pp = p;
+            *out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t bool_pack_encode(const uint32_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0)
+        return 0;
+    /* Compute Mode 0 (direct bit-pack) exact size without packing yet */
+    size_t direct_len = 1;
+    for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        uint32_t lo = in[v0], hi = in[v0];
+        for (size_t i = 1; i < nv; i++) {
+            uint32_t x = in[v0 + i];
+            lo = x < lo ? x : lo;
+            hi = x > hi ? x : hi;
+        }
+        uint32_t range = hi - lo;
+        int wr = bits_for(range), wh = bits_for(hi);
+        bool has_base = lo != 0 && (wr < wh || range == 0);
+        int w = has_base ? wr : wh;
+        direct_len += 1 + (has_base ? 4u : 0u) + packed_bytes(nv, w);
+    }
+
+    /* Mode 1: RLE (only written when strictly smaller than direct; aborts early on high-churn data) */
+    size_t rle_len = 1;
+    bool use_rle = true;
+    for (size_t i = 0; i < n;) {
+        uint32_t val = in[i];
+        size_t j = i + 1;
+        while (j < n && in[j] == val)
+            j++;
+        rle_len += bp_uvarint_len(val) + bp_uvarint_len((uint32_t)(j - i - 1));
+        if (rle_len >= direct_len) {
+            use_rle = false;
+            break;
+        }
+        i = j;
+    }
+    if (use_rle) {
+        out[0] = 1;
+        uint8_t *o = out + 1;
+        for (size_t i = 0; i < n;) {
+            uint32_t val = in[i];
+            size_t j = i + 1;
+            while (j < n && in[j] == val)
+                j++;
+            o = bp_put_uvarint(o, val);
+            o = bp_put_uvarint(o, (uint32_t)(j - i - 1));
+            i = j;
+        }
+        return (size_t)(o - out);
+    }
+
+    uint32_t u32[IBP_VEC];
+    out[0] = 0;
+    uint8_t *o = out + 1;
+    for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        uint32_t lo = in[v0], hi = in[v0];
+        for (size_t i = 1; i < nv; i++) {
+            uint32_t x = in[v0 + i];
+            lo = x < lo ? x : lo;
+            hi = x > hi ? x : hi;
+        }
+        uint32_t range = hi - lo;
+        int wr = bits_for(range), wh = bits_for(hi);
+        bool has_base = lo != 0 && (wr < wh || range == 0);
+        int w = has_base ? wr : wh;
+        *o++ = (uint8_t)((unsigned)w | (has_base ? 0x80u : 0u));
+        if (has_base) {
+            store32(o, lo);
+            o += 4;
+        }
+        if (w > 0) {
+            if (!has_base) {
+                pack(in + v0, nv, w, o);
+            } else {
+                for (size_t i = 0; i < nv; i++)
+                    u32[i] = in[v0 + i] - lo;
+                pack(u32, nv, w, o);
+            }
+            o += packed_bytes(nv, w);
+        }
+    }
+    return (size_t)(o - out);
+}
+
+int bool_pack_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < 1)
+        return TSDB_ERR_CORRUPT;
+    uint8_t mode = in[0];
+    const uint8_t *p = in + 1, *end = in + len;
+    if (mode == 0) {
+        for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+            size_t nv = MIN((size_t)IBP_VEC, n - v0);
+            if (p >= end)
+                return TSDB_ERR_CORRUPT;
+            uint8_t tag = *p++;
+            int w = tag & 0x7f;
+            bool has_base = (tag & 0x80) != 0;
+            if (w > 32)
+                return TSDB_ERR_CORRUPT;
+            uint32_t base = 0;
+            if (has_base) {
+                if ((size_t)(end - p) < 4)
+                    return TSDB_ERR_CORRUPT;
+                base = load32(p);
+                p += 4;
+            }
+            size_t pb = packed_bytes(nv, w);
+            if ((size_t)(end - p) < pb)
+                return TSDB_ERR_CORRUPT;
+            if (w == 0) {
+                for (size_t j = 0; j < nv; j++)
+                    out[v0 + j] = base;
+            } else {
+                unpack(p, nv, w, out + v0);
+                if (has_base)
+                    for (size_t j = 0; j < nv; j++)
+                        out[v0 + j] += base;
+            }
+            p += pb;
+        }
+        return p == end ? 0 : TSDB_ERR_CORRUPT;
+    }
+    if (mode == 1) {
+        size_t i = 0;
+        while (i < n) {
+            uint32_t val, lm1;
+            if (!bp_get_uvarint(&p, end, &val) || !bp_get_uvarint(&p, end, &lm1) || (size_t)lm1 >= n - i)
+                return TSDB_ERR_CORRUPT;
+            size_t run = (size_t)lm1 + 1;
+            for (size_t j = 0; j < run; j++)
+                out[i + j] = val;
+            i += run;
+        }
+        return p == end ? 0 : TSDB_ERR_CORRUPT;
+    }
+    return TSDB_ERR_CORRUPT;
+}
+
 /* ---------------------------------------------------------- BLK_F64_DECIMAL */
 
-#define F64_NDEC 16 /* 10^0 .. 10^15 */
-#define F64_NBIN 30 /* 2^1 .. 2^30 */
-#define F64_MAX_EXP (F64_NDEC + F64_NBIN - 1)
+#define F64_NDEC 16     /* 10^0 .. 10^15 */
+#define F64_NBIN 30     /* 2^1 .. 2^30 */
+#define F64_NNEG_DEC 6  /* 10^-1 .. 10^-6 (dividing scales, appended above 45) */
+#define F64_NNEG_BIN 10 /* 2^-1 .. 2^-10 (dividing scales, appended above 51) */
+#define F64_NEG_DEC_OFF (F64_NDEC + F64_NBIN)
+#define F64_NEG_BIN_OFF (F64_NEG_DEC_OFF + F64_NNEG_DEC)
+#define F64_MAX_EXP (F64_NEG_BIN_OFF + F64_NNEG_BIN - 1)
 #define F64_LIMIT 4503599627370496.0 /* 2^52 */
 
 #define F64_MUL 0x80 /* scale byte: rebuild as k * 10^-e rather than k / 10^e */
@@ -241,13 +697,17 @@ static const double f64_scale[] = {1e0, 1e1, 1e2,  1e3,  1e4,  1e5,  1e6,  1e7,
                                    1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
                                    P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10),
                                    P2S(11), P2S(12), P2S(13), P2S(14), P2S(15), P2S(16), P2S(17), P2S(18), P2S(19), P2S(20),
-                                   P2S(21), P2S(22), P2S(23), P2S(24), P2S(25), P2S(26), P2S(27), P2S(28), P2S(29), P2S(30)};
+                                   P2S(21), P2S(22), P2S(23), P2S(24), P2S(25), P2S(26), P2S(27), P2S(28), P2S(29), P2S(30),
+                                   1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6,
+                                   P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10)};
 /* decimal inverses are literals: the nearest doubles, as a program computing k * 0.1 has */
 static const double f64_inv[] = {1e0,  1e-1, 1e-2,  1e-3,  1e-4,  1e-5,  1e-6,  1e-7,
                                  1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15,
                                  P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10),
                                  P2I(11), P2I(12), P2I(13), P2I(14), P2I(15), P2I(16), P2I(17), P2I(18), P2I(19), P2I(20),
-                                 P2I(21), P2I(22), P2I(23), P2I(24), P2I(25), P2I(26), P2I(27), P2I(28), P2I(29), P2I(30)};
+                                 P2I(21), P2I(22), P2I(23), P2I(24), P2I(25), P2I(26), P2I(27), P2I(28), P2I(29), P2I(30),
+                                 1e1, 1e2, 1e3, 1e4, 1e5, 1e6,
+                                 P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10)};
 _Static_assert(sizeof f64_scale / sizeof *f64_scale == F64_MAX_EXP + 1, "f64_scale");
 _Static_assert(sizeof f64_inv / sizeof *f64_inv == F64_MAX_EXP + 1, "f64_inv");
 
@@ -550,6 +1010,73 @@ static int f64_pick_scale(const double *in, size_t n, bool *mul)
                 best = cost;
                 best_e = e;
                 *mul = false;
+            }
+        }
+    }
+    /* Dividing scales (10^-1..10^-6, 2^-1..2^-10): any multiple of 10^f or 2^b is already an exact integer at e == 0,
+     * so probe them only when e == 0 won (zero cost on fractional or noisy doubles). Rebuilt with mul = true (k * 10^f
+     * or k * 2^b), which is exact in double and avoids division. */
+    if (best_e == 0 && best > 0 && best < 48) {
+        enum { RUNS = 4, RUN = 16 };
+        size_t run = MIN((size_t)RUN, n), tried = 0;
+        int d10_0[F64_NNEG_DEC + 1] = {0}, d10[F64_NNEG_DEC + 1] = {0};
+        int d2_0[F64_NNEG_BIN + 1] = {0}, d2[F64_NNEG_BIN + 1] = {0};
+        for (int r = 0; r < RUNS; r++) {
+            size_t at = n > run ? (n - run) * (size_t)r / (RUNS - 1) : 0;
+            for (size_t i = at; i < at + run; i++, tried++) {
+                int64_t k;
+                if (!f64_int(in[i], 0, false, &k))
+                    continue;
+                int p10 = F64_NNEG_DEC, p2 = F64_NNEG_BIN;
+                if (k != 0) {
+                    int64_t t = k;
+                    p10 = 0;
+                    while (p10 < F64_NNEG_DEC && t % 10 == 0) {
+                        t /= 10;
+                        p10++;
+                    }
+                    p2 = __builtin_ctzll((uint64_t)k);
+                    if (p2 > F64_NNEG_BIN)
+                        p2 = F64_NNEG_BIN;
+                }
+                d10[p10]++;
+                d2[p2]++;
+                if (r == 0) {
+                    d10_0[p10]++;
+                    d2_0[p2]++;
+                }
+            }
+            if (n <= run)
+                break;
+        }
+        for (int f = F64_NNEG_DEC - 1; f >= 1; f--) {
+            d10[f] += d10[f + 1];
+            d10_0[f] += d10_0[f + 1];
+        }
+        for (int b = F64_NNEG_BIN - 1; b >= 1; b--) {
+            d2[b] += d2[b + 1];
+            d2_0[b] += d2_0[b + 1];
+        }
+        for (int f = 1; f <= F64_NNEG_DEC && best > 0; f++) {
+            if ((run - (size_t)d10_0[f]) * 4 > run || (tried - (size_t)d10[f]) * 8 > tried)
+                continue;
+            int e = F64_NEG_DEC_OFF + f - 1;
+            double cost = f64_sample_cost(in, n, e, true);
+            if (cost < best - 1e-9) {
+                best = cost;
+                best_e = e;
+                *mul = true;
+            }
+        }
+        for (int b = 1; b <= F64_NNEG_BIN && best > 0; b++) {
+            if ((run - (size_t)d2_0[b]) * 4 > run || (tried - (size_t)d2[b]) * 8 > tried)
+                continue;
+            int e = F64_NEG_BIN_OFF + b - 1;
+            double cost = f64_sample_cost(in, n, e, true);
+            if (cost < best - 1e-9) {
+                best = cost;
+                best_e = e;
+                *mul = true;
             }
         }
     }
@@ -1768,9 +2295,18 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
 
 static size_t encode_int(codec_ctx *c, int level, const int64_t *v, size_t n, uint8_t *out)
 {
-    if (codec_scratch_reserve(c, int_bp_bound(n)) != 0)
+    size_t need = MAX(int_bp_bound(n), int_for_bound(n));
+    if (codec_scratch_reserve(c, need) != 0)
         return 0;
-    return block_wrap(c, level, BLK_INT, int_bp_encode(v, n, c->scratch), out);
+    size_t bp = int_bp_encode(v, n, c->scratch);
+    if (n < 2)
+        return block_wrap(c, level, BLK_INT, bp, out);
+    if (codec_alt_reserve(c, need) != 0)
+        return 0;
+    size_t fo = int_for_encode(v, n, c->alt);
+    if (fo && fo < bp)
+        return block_wrap_src(c, level, BLK_INT_FOR, c->alt, fo, out);
+    return block_wrap(c, level, BLK_INT, bp, out);
 }
 
 static __attribute__((noinline)) size_t block_encode_vals_nearest(codec_ctx *c, int level, int value_codec,
@@ -1781,11 +2317,24 @@ static __attribute__((noinline)) size_t block_encode_vals_nearest(codec_ctx *c, 
     case TSDB_FLOAT32: return block_encode_f32(c, level, value_codec, v, n, out);
     case TSDB_FLOAT64: return encode_f64(c, level, v, n, out);
     case TSDB_INT64: return encode_int(c, level, v, n, out);
-    default:
-        /* bool and state: 4-byte slots, coded directly as BLK_INT without widening to int64[] */
-        if (codec_scratch_reserve(c, int_bp_bound(n)) != 0)
+    default: {
+        /* bool and state: 4-byte slots; pick smaller of BLK_BOOL_PACK (direct bit-pack / RLE) and BLK_INT */
+        size_t need = MAX(int_bp_bound(n), bool_pack_bound(n));
+        if (codec_scratch_reserve(c, need) != 0)
             return 0;
-        return block_wrap(c, level, BLK_INT, int_bp_encode_u32(v, n, c->scratch), out);
+        if (n == 0)
+            return block_wrap(c, level, BLK_INT, 0, out);
+        size_t bp = bool_pack_encode(v, n, c->scratch);
+        /* RLE (already < direct) and small bool blocks (<= 2 bits/val) cannot be beaten by zigzag deltas */
+        if (c->scratch[0] == 1 || (type == TSDB_BOOL && bp <= n / 4 + 32))
+            return block_wrap(c, level, BLK_BOOL_PACK, bp, out);
+        if (codec_alt_reserve(c, need) != 0)
+            return 0;
+        size_t ib = int_bp_encode_u32(v, n, c->alt);
+        if (bp <= ib)
+            return block_wrap(c, level, BLK_BOOL_PACK, bp, out);
+        return block_wrap_src(c, level, BLK_INT, c->alt, ib, out);
+    }
     }
 }
 
@@ -1827,11 +2376,18 @@ static __attribute__((noinline)) int block_decode_vals_nearest(codec_ctx *c, int
         default: return TSDB_ERR_CORRUPT;
         }
     }
-    if (kind != BLK_INT)
+    if (type == TSDB_INT64) {
+        if (kind == BLK_INT)
+            return int_bp_decode(p, plen, n, out);
+        if (kind == BLK_INT_FOR)
+            return int_for_decode(p, plen, n, out);
         return TSDB_ERR_CORRUPT;
-    if (type == TSDB_INT64)
-        return int_bp_decode(p, plen, n, out);
-    return int_bp_decode_u32(p, plen, n, out);
+    }
+    if (kind == BLK_BOOL_PACK)
+        return bool_pack_decode(p, plen, n, out);
+    if (kind == BLK_INT)
+        return int_bp_decode_u32(p, plen, n, out);
+    return TSDB_ERR_CORRUPT;
 }
 
 /* run with round-to-nearest, the caller's mode put back (fpmode.h) */

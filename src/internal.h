@@ -200,6 +200,9 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_DELTA_BP 15    /* float32 or float64: zigzag deltas of the bit patterns, bit-packed per 1024 */
 #define BLK_DICT 16        /* float32 or float64: sorted distinct values, ranks as bit-packed zigzag deltas */
 #define BLK_F32_WIDE 17    /* float64 that are all float32 values: a float32 block (never ZSTD-wrapped itself) */
+#define BLK_INT_FOR 18     /* int64: per-vector FOR (delta or direct), 0..64-bit packed, optional PFOR exceptions */
+#define BLK_BOOL_PACK 19   /* bool/state (uint32): per-vector direct bit-pack or RLE */
+#define BLK_TS_FOR_BP 20   /* int64 timestamps: per-vector bit-packed grid or delta residuals */
 /* A kind names the transform; the series' type gives the width where both exist (BLK_ALPRD, BLK_DELTA_BP,
  * BLK_DICT). The header byte holds the kind in its low 7 bits (format 6; 4 bits before). */
 #define BLK_KIND_MASK 0x7f
@@ -212,7 +215,7 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
  * (the user's decision, 2026-11-02). Integer arithmetic on the kind: every CPU level keeps the same blocks. */
 static inline size_t blk_zstd_min_saving(int kind, size_t inner)
 {
-    bool ts = kind == BLK_DD || kind == BLK_TS_DELTA || kind == BLK_TS_GRID;
+    bool ts = kind == BLK_DD || kind == BLK_TS_DELTA || kind == BLK_TS_GRID || kind == BLK_TS_FOR_BP;
     return inner / (ts ? 8 : 32);
 }
 
@@ -268,6 +271,10 @@ int ts_grid_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out)
 size_t ts_delta_encode(const int64_t *ts, size_t n, uint8_t *out);
 int ts_delta_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
 int ts_delta_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
+size_t ts_for_bp_bound(size_t n);
+size_t ts_for_bp_encode(const int64_t *ts, size_t n, uint8_t *out);
+int ts_for_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+int ts_for_bp_decode_sorted(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t decimal_bp_bound(size_t n);
 size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out);
 int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out);
@@ -326,6 +333,12 @@ size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *
 size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc);
 size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out);
 int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+size_t int_for_bound(size_t n);
+size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out);
+int int_for_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+size_t bool_pack_bound(size_t n);
+size_t bool_pack_encode(const uint32_t *in, size_t n, uint8_t *out);
+int bool_pack_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t f64_decimal_bound(size_t n);
 size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out); /* 0 if not decimal */
 int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out);

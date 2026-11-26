@@ -8,6 +8,21 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Codec format improvements (`BLK_INT_FOR`, `BLK_BOOL_PACK`, `BLK_TS_FOR_BP`, dividing decimal/binary scales).**
+  No format bump (format 9 is unreleased; all existing block kinds `0..17` and scale indices decode bit-for-bit identically):
+  - `BLK_INT_FOR` (kind 18) adds per-vector delta/direct frame-of-reference, 33–63-bit `pack64`, and PFOR outlier
+    patching (up to `nv/32` low/high exceptions) for `TSDB_INT64`, shrinking steady counters (-20% to -42%), counters
+    with resets/spikes/nulls (-35%, 9.7x faster decode), stationary rates (-6%, 1.7x faster decode), and 40-bit deltas
+    (-19%, 11x faster decode).
+  - `BLK_BOOL_PACK` (kind 19) adds direct per-vector `uint32` bit-packing and varint RLE for `TSDB_BOOL` and
+    `TSDB_STATE`: coin flips drop from 1.29 to 1.01 bits/val raw (6x faster decode), steady door/machine-mode runs drop
+    54–67% to 0.02–0.06 bits/val raw (7x faster decode, no ZSTD).
+  - `BLK_TS_FOR_BP` (kind 20) adds per-vector bit-packed grid/delta FOR for jittered timestamps under the 1/8 timestamp
+    ZSTD threshold, shrinking +-50..200 ms jitter by 5–19% while decoding 1.5–3.4x faster without ZSTD.
+  - Dividing decimal (`10^-1..10^-6`) and binary (`2^-1..2^-10`) scales appended to `BLK_DECIMAL_BP` (indices 35..50)
+    and `BLK_F64_DECIMAL` (indices 46..61), probed only when `10^0` already passes (zero cost on fractional/noisy
+    floats), shrinking multiples of `10^f`/`2^b` by 43–54% and decoding 2.6–2.9x faster.
+
 **Erasure-coded cluster volumes settle, check, and collect chunks across replicas (R8-1, production in 0.11.0).**
 Erasure-coded volumes (`--redundancy ec=k+m`, no `--ec-experimental` flag) now settle whole partition keys across the
 cluster's log replicas and chunk stores, check their retired copies with a logical digest, garbage-collect retired and
