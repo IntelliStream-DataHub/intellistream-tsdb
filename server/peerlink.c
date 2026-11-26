@@ -761,7 +761,9 @@ static void wake_read(struct plink *l)
 /* Unconditional wake for cold paths (e.g. rdma_cm callbacks whose queue is outside plink). */
 static void wake_force(struct plink *l)
 {
-    atomic_store_explicit(&l->wake_state, WAKE_SIGNALED, memory_order_release);
+    int st = WAKE_SLEEPING;
+    atomic_compare_exchange_strong_explicit(&l->wake_state, &st, WAKE_SIGNALED, memory_order_seq_cst,
+                                            memory_order_relaxed);
     wake_write(l);
 }
 
@@ -3260,6 +3262,8 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 if (freed)
                     atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) - freed,
                                           memory_order_release);
+                if (!l->qh)
+                    atomic_store_explicit(&l->qdl_min, 0, memory_order_release);
                 qmore = l->qh != NULL;
                 if (batch_h && l->qwaiters > 0)
                     pthread_cond_broadcast(&l->cv);
@@ -3447,9 +3451,9 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 tmo = 0;
             } else if (qdl) { /* a queued frame's deadline */
                 uint64_t t = now_ns();
-                int d = qdl <= t ? 0 : (int)((qdl - t) / MS) + 1;
-                if (d < tmo)
-                    tmo = d;
+                uint64_t d = qdl <= t ? 0 : (qdl - t) / MS + 1;
+                if (d < (uint64_t)tmo)
+                    tmo = (int)d;
             }
             if (tmo == 0) {
                 atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);

@@ -309,7 +309,7 @@ int fwdr_run(const struct fwdr_ops *o, struct fwdr_tab *t, const struct fwdr_req
     int64_t t0 = o->now_ns(o->arg), send_by = t0 + (int64_t)q->wait_ms * 1000000;
     struct fwait_sync *sync = fwait_sync_get();
     struct fwait w = {.frame_id = q->frame_id, .peer = q->peer, .sync = sync, .sent = -1};
-    uint32_t credit_batch = q->credit_batch ? q->credit_batch : (FWD_CREDIT_DEFAULT >= 2 ? FWD_CREDIT_DEFAULT / 2 : 1);
+    uint32_t credit_batch = q->credit_batch ? q->credit_batch : 1;
     uint32_t uncredited = 0;
     int64_t sent_at = 0;
     int res = FWDR_INDET;

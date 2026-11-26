@@ -2730,6 +2730,17 @@ static void test_fwd(void)
     CHECK(fwd_send(A, 2, &m, 5, in_ms(2000)) == FWD_OK);
     CHECK(WAIT_FOR(frec_find(&ra, FWD_EV_REPLY, 5, 0, NULL) >= 0, 3000));
 
+    /* fwd_credit0: returns default when cfg.credit == 0 and the configured credit otherwise */
+    CHECK(fwd_credit0(A) == FWD_CREDIT_DEFAULT);
+    CHECK(fwd_credit0(NULL) == FWD_CREDIT_DEFAULT);
+    static struct frec rc1;
+    memset(&rc1, 0, sizeof rc1);
+    int pc1 = 0;
+    struct fwd_cfg c1over = {.credit = 1};
+    struct fwd *C1 = fwd_node_with(9, &rc1, &pc1, &c1over);
+    CHECK(C1 && fwd_credit0(C1) == 1);
+    fwd_free(C1);
+
     /* fwd_sendv: scatter header + payload arrives concatenated; oversized header is refused */
     uint8_t big_hdr[FWD_HDR_EXTRA_MAX + 1] = {0};
     CHECK(fwd_sendv(A, 2, PL_KIND_FWD, big_hdr, sizeof big_hdr, "x", 1, 31, 0) == FWD_E_INVALID);

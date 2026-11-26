@@ -314,7 +314,8 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
-    atomic_bool peer_eof; /* event loop saw EOF (res == 0) on recv; read lock-free by fe_gone */
+    atomic_bool peer_eof;   /* event loop saw EOF (on_recv res == 0) or EPOLLRDHUP/HUP/ERR; read lock-free by fe_gone */
+    atomic_bool recv_armed; /* mirrors recv_inflight for workers: fe_gone falls back to poll(0) only while false */
     atomic_uint proto;  /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
     atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
     _Atomic int64_t nonup_since; /* when this request first waited for output inside a domain that is not UP
@@ -4112,6 +4113,8 @@ static void fwd_peer_note(uint32_t peer, size_t bytes, uint64_t hop_ns)
 
 static double fwd_pct(const uint64_t *h, uint64_t total, double q) /* the bucket's upper end, us */
 {
+    if (!total)
+        return 0;
     uint64_t want = (uint64_t)((double)total * q + 0.5), seen = 0;
     if (want == 0)
         want = 1;
@@ -4132,10 +4135,12 @@ static size_t fwd_peer_rows(struct fwd_peer_row *out, size_t cap)
             break;
         uint64_t frames = atomic_load_explicit(&fwd_peers[i].frames, memory_order_relaxed);
         uint64_t bytes = atomic_load_explicit(&fwd_peers[i].bytes, memory_order_relaxed);
-        uint64_t hist[FWD_HB];
-        for (int b = 0; b < FWD_HB; b++)
+        uint64_t hist[FWD_HB], htotal = 0;
+        for (int b = 0; b < FWD_HB; b++) {
             hist[b] = atomic_load_explicit(&fwd_peers[i].hist[b], memory_order_relaxed);
-        out[n++] = (struct fwd_peer_row){peer, frames, bytes, fwd_pct(hist, frames, 0.50), fwd_pct(hist, frames, 0.99)};
+            htotal += hist[b];
+        }
+        out[n++] = (struct fwd_peer_row){peer, frames, bytes, fwd_pct(hist, htotal, 0.50), fwd_pct(hist, htotal, 0.99)};
     }
     return n;
 }
@@ -4218,8 +4223,14 @@ static bool fe_gone(void *a)
     conn *c = ((struct fwd_ectx *)a)->c;
     if (fwdx_mutant == FWM_GONE)
         return false;
-    return atomic_load_explicit(&c->closing, memory_order_acquire) ||
-           atomic_load_explicit(&c->peer_eof, memory_order_acquire);
+    if (atomic_load_explicit(&c->closing, memory_order_acquire) ||
+        atomic_load_explicit(&c->peer_eof, memory_order_acquire))
+        return true;
+    if (atomic_load_explicit(&c->recv_armed, memory_order_acquire))
+        return false;
+    /* recv is paused/parked (e.g. PIPE_CAP, MULTI_QUEUED, memory budget): check the socket directly */
+    struct pollfd pf = {.fd = c->fd, .events = POLLRDHUP};
+    return poll(&pf, 1, 0) > 0 && (pf.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
 }
 static int fe_send(void *a, uint32_t peer, int kind, const void *p, size_t n, uint64_t id, uint64_t dl)
 {
@@ -4248,13 +4259,11 @@ static int fwd_entry(req *r, uint32_t v)
 {
     struct fwd *f = fwd_cluster();
     const struct cluster_copy *cp = route_copy();
-    const struct cluster_copy_vol *cv = cluster_copy_vol(cp, v);
-    const struct cluster_copy_member *cm = cv && cv->leader ? cluster_copy_member(cp, cv->leader) : NULL;
-    if (fwd_off || !f || !fwd_tab || !cm || cm->state != META_UP || (cp->self && cm->id == cp->self) ||
-        cv->epoch >= META_EPOCH_LIMIT)
+    uint32_t node = 0;
+    uint64_t epoch = 0;
+    if (fwd_off || !f || !fwd_tab || cluster_copy_vol_owner(cp, v, &node, &epoch, NULL, 0) != 1 ||
+        epoch >= META_EPOCH_LIMIT)
         return 0;
-    uint32_t node = cm->id;
-    uint64_t epoch = cv->epoch;
     conn *c = r->c;
     size_t n = FWDR_ENV + FWDR_INNER + r->len;
     if (n > FWD_MSG_MAX)
@@ -4274,8 +4283,9 @@ static int fwd_entry(req *r, uint32_t v)
     bool rd = !(auth_ops[r->op].need & R_WRITE);
     if (fwd_knob("opkind"))
         rd = !rd; /* as a flipped op would arrive: the owner must refuse it on this link */
+    uint32_t c0 = fwd_credit0(f);
     struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = env, .n = sizeof env,
-                         .payload = r->payload, .payload_len = r->len,
+                         .payload = r->payload, .payload_len = r->len, .credit_batch = c0 >= 2 ? c0 / 2 : 1,
                          .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1,
                          .arrival_ns = fwdx_mutant == FWM_ARRIVAL ? now_ns() : r->t_arr,
                          .max_age_ms = fwd_max_age_ms, .wait_ms = fwd_wait_ms, .reply_ms = fwd_reply_ms,
@@ -4410,21 +4420,19 @@ static void fwdo_finish(conn *c, struct fwdr_tail *tl)
         fwd_reply(o->f, &o->from, o->frame_id, c->out.p, c->out.len);
 }
 
-struct fjob_fields {
-    struct fjob *next;
-    struct fwd_from from;
-    uint64_t frame_id;
-    int kind;
-    int64_t t_in;
+#define FJOB_FIELDS                                                                                                    \
+    struct fjob *next;                                                                                                 \
+    struct fwd_from from;                                                                                              \
+    uint64_t frame_id;                                                                                                 \
+    int kind;                                                                                                          \
+    int64_t t_in; /* when the dispatcher queued it (ns) */                                                             \
     size_t n;
+
+struct fjob_fields {
+    FJOB_FIELDS
 };
 struct fjob {
-    struct fjob *next;
-    struct fwd_from from;
-    uint64_t frame_id;
-    int kind;
-    int64_t t_in; /* when the dispatcher queued it (ns) */
-    size_t n;
+    FJOB_FIELDS
     /* Pad so p + FWDR_ENV + FWDR_INNER (45) is 16-byte aligned when malloc returns 16-byte aligned memory, allowing
      * fwd_serve to pass e.payload directly as r.payload with zero copy while keeping aligned casts valid under UBSan. */
     uint8_t align_pad[16 - ((sizeof(struct fjob_fields) + FWDR_ENV + FWDR_INNER) % 16)];
@@ -4948,6 +4956,7 @@ static bool submit_recv(conn *c)
     }
     c->recv_inflight = true;
     if (io == IO_EPOLL) {
+        atomic_store_explicit(&c->recv_armed, true, memory_order_release);
         ep_want(c);
         return true;
     }
@@ -4958,6 +4967,7 @@ static bool submit_recv(conn *c)
         sqe_log_exhausted("recv");
         return false;
     }
+    atomic_store_explicit(&c->recv_armed, true, memory_order_release);
     io_uring_prep_recv(sqe, c->fd, c->in.p + c->in.len, c->in.cap - c->in.len, 0);
     io_uring_sqe_set_data(sqe, &c->recv_ev);
 #endif
@@ -5099,8 +5109,10 @@ static void conn_close(conn *c)
         pthread_cond_broadcast(&c->cv); /* a worker waiting for output space gives up */
         pthread_mutex_unlock(&c->lock);
         shutdown(c->fd, SHUT_RDWR); /* completes the outstanding recv (io_uring) */
-        if (io == IO_EPOLL)
+        if (io == IO_EPOLL) {
             c->recv_inflight = c->send_inflight = false; /* only wanted: nothing in the kernel to complete */
+            atomic_store_explicit(&c->recv_armed, false, memory_order_release);
+        }
     }
     dispatch(c);
     if (!c->busy && !c->q_head && !c->recv_inflight && !c->send_inflight)
@@ -5282,6 +5294,7 @@ static int pre_reparse(conn *c)
 static void on_recv(conn *c, ssize_t res)
 {
     c->recv_inflight = false;
+    atomic_store_explicit(&c->recv_armed, false, memory_order_release);
     if (res == 0 && !c->closed) { /* end of stream: what was received still gets its replies */
         if (getenv("TSDBD_DEBUG"))
             fprintf(stderr, "tsdbd: connection %d: recv end\n", c->fd);
@@ -5752,8 +5765,10 @@ static void ep_loop(void)
             if (!c)
                 continue;
             uint32_t m = evs[i].events;
-            if (m & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+            if (m & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                 c->rdhup = true; /* recv no longer blocks, and no further edge may come */
+                atomic_store_explicit(&c->peer_eof, true, memory_order_release);
+            }
             if (m & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))
                 c->readable = true;
             if (m & (EPOLLOUT | EPOLLHUP | EPOLLERR))

@@ -2217,18 +2217,27 @@ int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node)
     return TSDB_ROLE_NONE;
 }
 
-int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap)
+int cluster_copy_vol_owner(const struct cluster_copy *c, uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr,
+                           size_t cap)
 {
-    const struct cluster_copy *c = cluster_copy_get();
     const struct cluster_copy_vol *v = cluster_copy_vol(c, vol);
     const struct cluster_copy_member *m = v && v->leader ? cluster_copy_member(c, v->leader) : NULL;
     int ok = m && m->state == META_UP ? (c->self && m->id == c->self && cl_mutant() != CLM_OWNERSELF ? 2 : 1) : 0;
     if (ok) {
-        *node = m->id;
-        *epoch = v->epoch;
+        if (node)
+            *node = m->id;
+        if (epoch)
+            *epoch = v->epoch;
         if (addr && cap)
             snprintf(addr, cap, "%s", cl_mutant() == CLM_MOVEDPEERADDR ? m->peer : m->addr);
     }
+    return ok;
+}
+
+int cluster_vol_owner(uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr, size_t cap)
+{
+    const struct cluster_copy *c = cluster_copy_get();
+    int ok = cluster_copy_vol_owner(c, vol, node, epoch, addr, cap);
     cluster_copy_put(c);
     return ok;
 }

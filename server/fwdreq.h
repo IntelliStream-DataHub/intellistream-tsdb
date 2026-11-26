@@ -13,9 +13,9 @@
  *     answered UNAVAILABLE, definite), a client that has gone is never sent for (GONE: no answer, nobody reads it);
  *   - a send the link refuses (down, full) is tried again until fwd_wait_ms from the decision (UNREACH: UNAVAILABLE,
  *     definite); a frame still unwritten at that deadline is canceled: taken back (UNREACH) or not (INDET);
- *   - once written: the reply, relayed as it is (a query's chunks as they come, a credit granted per chunk the client
- *     took), or LOST / TIMEOUT (fwd_reply_ms) of the link: INDET, the client's connection is closed without an answer
- *     (D12: its outcome is unknown); a reply that comes later is dropped by fwd.c;
+ *   - once written: the reply, relayed as it is (a query's chunks as they come, credits granted every credit_batch
+ *     chunks the client took, default 1), or LOST / TIMEOUT (fwd_reply_ms) of the link: INDET, the client's connection
+ *     is closed without an answer (D12: its outcome is unknown); a reply that comes later is dropped by fwd.c;
  *   - never a second send of a frame once fwd.c took it (D30: the client resends, through any node).
  *
  * The owner checks the envelope again (fwdr_env_decode; hops 1, its age with the time it waited there), and answers a
@@ -111,7 +111,8 @@ struct fwdr_req {
     size_t n;
     const uint8_t *payload; /* optional payload for o->sendv (NULL when concatenated into msg) */
     size_t payload_len;
-    uint32_t credit_batch;  /* FWDQ credit batch size (0: FWD_CREDIT_DEFAULT / 2) */
+    uint32_t credit_batch;  /* FWDQ credit batch size (0: 1; must satisfy 1 <= credit_batch <= fwd_cfg.credit,
+                             * recommended <= fwd_credit0(f) / 2 to keep the stream pipelined without deadlock) */
     uint64_t frame_id;
     int64_t arrival_ns; /* when the event loop read the frame */
     uint32_t max_age_ms, wait_ms, reply_ms; /* fwd_max_age, fwd_wait_ms, fwd_reply_ms (0: no reply deadline) */

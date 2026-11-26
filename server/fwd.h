@@ -119,6 +119,8 @@ struct fwd *fwd_new(const struct fwd_cfg *cfg);
 void fwd_free(struct fwd *f);
 /* the peerlink the acceptor hands FWD and FWDQ sockets to */
 struct peerlink *fwd_peerlink(struct fwd *f);
+/* initial query stream credit (fwd_cfg.credit, or FWD_CREDIT_DEFAULT when 0) */
+uint32_t fwd_credit0(const struct fwd *f);
 
 struct fwd_member {
     uint32_t id;

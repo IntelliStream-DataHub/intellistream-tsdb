@@ -22,7 +22,8 @@
  *   cancelnw   no outcome by wait_ms, the cancel takes it back: UNREACH
  *   cancelwr   no outcome by wait_ms, the cancel says written: INDET
  *   cancelinv  no outcome by wait_ms, the cancel finds nothing in flight, the outcome follows: it decides
- *   chunks     a read: chunks relayed in order, one credit per chunk taken but the last, tail stats
+ *   chunks     a read: chunks relayed in order, credits granted per credit_batch, tail stats
+ *   credit1    fwd_cfg.credit == 1 with default credit_batch == 0: multi-chunk stream completes without deadlock
  *   relayfail  the client's connection goes mid-stream: the owner's stream is canceled, INDET
  *   clientgone written, the client goes while the reply is awaited: canceled, INDET
  *   notail     a last piece without a tail: relayed whole, the client's connection is closed
@@ -31,6 +32,7 @@
  *   late       events of frames nobody waits for (late replies) are dropped and counted
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -521,13 +523,24 @@ static void t_chunks(struct fwdr_tab *tab)
     run_go(&r);
     CHECK(r.res == FWDR_DONE);
     CHECK(r.f.nrel == 13 && !memcmp(r.f.relayed, "one,two,three", 13));
-    /* Default credit_batch = FWD_CREDIT_DEFAULT / 2 (2): 2 non-last chunks -> 1 batched credit of 2. */
-    CHECK(r.f.credits_n == 1 && r.f.credits == 2);
+    /* Default credit_batch = 0 (safe default 1): 2 non-last chunks -> 2 credit calls of 1. */
+    CHECK(r.f.credits_n == 2 && r.f.credits == 2);
     CHECK(r.tail.st.rows == 1000 && r.tail.st.result_rows == 500);
     CHECK(r.f.depth == 0);
 
-    /* 5 chunks (4 non-last) -> 2 batched credit calls of 2 (4 total). */
+    /* Explicit credit_batch = 2: 2 non-last chunks -> 1 batched credit call of 2. */
     run_init(&r, tab, PL_KIND_FWDQ);
+    r.q.credit_batch = 2;
+    r.f.on_send = chunks3;
+    run_go(&r);
+    CHECK(r.res == FWDR_DONE);
+    CHECK(r.f.nrel == 13 && !memcmp(r.f.relayed, "one,two,three", 13));
+    CHECK(r.f.credits_n == 1 && r.f.credits == 2);
+    CHECK(r.f.depth == 0);
+
+    /* 5 chunks (4 non-last) with credit_batch = 2 -> 2 batched credit calls of 2 (4 total). */
+    run_init(&r, tab, PL_KIND_FWDQ);
+    r.q.credit_batch = 2;
     r.f.on_send = chunks5;
     run_go(&r);
     CHECK(r.res == FWDR_DONE);
@@ -535,14 +548,117 @@ static void t_chunks(struct fwdr_tab *tab)
     CHECK(r.f.credits_n == 2 && r.f.credits == 4);
     CHECK(r.tail.st.rows == 2000 && r.tail.st.result_rows == 1000);
     CHECK(r.f.depth == 0);
+}
 
-    /* Explicit credit_batch = 1 grants 1 per non-last chunk. */
+/* credit1: enforces an initial credit window of 1 (as with fwd_cfg.credit == 1). With default credit_batch == 0,
+ * fwdr_run must grant credit after each chunk instead of batching >= 2 and deadlocking the stream. */
+struct c1_ctx {
+    struct fwdr_tab *tab;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    uint32_t credit;
+    uint64_t id;
+    uint32_t peer;
+    int kind;
+    int timed_out;
+    pthread_t th;
+    int started;
+};
+
+static int c1_credit(void *a, uint32_t peer, uint64_t frame_id, uint32_t chunks)
+{
+    struct c1_ctx *c1 = a;
+    (void)peer, (void)frame_id;
+    pthread_mutex_lock(&c1->mu);
+    c1->credit += chunks;
+    pthread_cond_signal(&c1->cv);
+    pthread_mutex_unlock(&c1->mu);
+    return FWD_OK;
+}
+
+static void *c1_owner(void *a)
+{
+    struct c1_ctx *c1 = a;
+    static const char *const parts[4] = {"a,", "b,", "c,", "d"};
+    struct fwd_ev sev = {.type = FWD_EV_SENT, .kind = c1->kind, .peer = c1->peer, .frame_id = c1->id,
+                         .outcome = FWD_WRITTEN};
+    fwdr_on_event(c1->tab, &sev);
+    for (int i = 0; i < 4; i++) {
+        struct timespec dl;
+        clock_gettime(CLOCK_MONOTONIC, &dl);
+        dl.tv_sec += 2;
+        pthread_mutex_lock(&c1->mu);
+        while (c1->credit == 0) {
+            if (pthread_cond_timedwait(&c1->cv, &c1->mu, &dl) == ETIMEDOUT) {
+                c1->timed_out = 1;
+                pthread_mutex_unlock(&c1->mu);
+                struct fwd_ev tev = {.type = FWD_EV_TIMEOUT, .kind = c1->kind, .peer = c1->peer, .frame_id = c1->id};
+                fwdr_on_event(c1->tab, &tev);
+                return NULL;
+            }
+        }
+        c1->credit--;
+        pthread_mutex_unlock(&c1->mu);
+        uint8_t b[256];
+        size_t n = i == 3 ? with_tail(b, parts[i], FWDR_T_STATS, 400) : strlen(parts[i]);
+        if (i < 3)
+            memcpy(b, parts[i], n);
+        struct fwd_ev cev = {.type = FWD_EV_CHUNK, .kind = c1->kind, .peer = c1->peer, .frame_id = c1->id,
+                             .last = i == 3, .p = b, .n = n};
+        fwdr_on_event(c1->tab, &cev);
+    }
+    return NULL;
+}
+
+static struct c1_ctx *g_c1;
+
+static int c1_send(void *a, uint32_t peer, int kind, const void *p, size_t n, uint64_t frame_id, uint64_t deadline_ns)
+{
+    int rc = f_send(a, peer, kind, p, n, frame_id, deadline_ns);
+    if (rc == FWD_OK) {
+        g_c1->id = frame_id;
+        g_c1->peer = peer;
+        g_c1->kind = kind;
+        g_c1->started = pthread_create(&g_c1->th, NULL, c1_owner, g_c1) == 0;
+    }
+    return rc;
+}
+
+static int c1_credit_op(void *a, uint32_t peer, uint64_t frame_id, uint32_t chunks)
+{
+    f_credit(a, peer, frame_id, chunks);
+    return c1_credit(g_c1, peer, frame_id, chunks);
+}
+
+static void t_credit1(struct fwdr_tab *tab)
+{
+    struct c1_ctx c1 = {.tab = tab, .credit = 1};
+    pthread_mutex_init(&c1.mu, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&c1.cv, &ca);
+    pthread_condattr_destroy(&ca);
+    g_c1 = &c1;
+
+    struct run r;
     run_init(&r, tab, PL_KIND_FWDQ);
-    r.q.credit_batch = 1;
-    r.f.on_send = chunks3;
+    r.q.credit_batch = 0; /* default: must not deadlock when owner starts with credit == 1 */
+    r.q.reply_ms = 2500;
+    r.o.send = c1_send;
+    r.o.credit = c1_credit_op;
     run_go(&r);
+    if (c1.started)
+        pthread_join(c1.th, NULL);
+    g_c1 = NULL;
+    pthread_cond_destroy(&c1.cv);
+    pthread_mutex_destroy(&c1.mu);
+
+    CHECK(!c1.timed_out);
     CHECK(r.res == FWDR_DONE);
-    CHECK(r.f.credits_n == 2 && r.f.credits == 2);
+    CHECK(r.f.nrel == 7 && !memcmp(r.f.relayed, "a,b,c,d", 7));
+    CHECK(r.f.credits_n == 3 && r.f.credits == 3);
+    CHECK(r.tail.st.rows == 400);
 }
 
 static void t_relayfail(struct fwdr_tab *tab)
@@ -709,8 +825,8 @@ static const struct {
     {"stall", t_stall},       {"gone", t_gone},           {"unreach", t_unreach},     {"refusedok", t_refusedok},
     {"toobig", t_toobig},     {"neverwr", t_neverwr},     {"lost", t_lost},           {"timeout", t_timeout},
     {"cancelnw", t_cancelnw}, {"cancelwr", t_cancelwr},   {"cancelinv", t_cancelinv}, {"chunks", t_chunks},
-    {"relayfail", t_relayfail}, {"clientgone", t_clientgone}, {"notail", t_notail},   {"late", t_late},
-    {"teardown", t_teardown},
+    {"credit1", t_credit1},   {"relayfail", t_relayfail}, {"clientgone", t_clientgone}, {"notail", t_notail},
+    {"late", t_late},         {"teardown", t_teardown},
 };
 
 int main(int argc, char **argv)

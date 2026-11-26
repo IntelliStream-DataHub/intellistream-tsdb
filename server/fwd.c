@@ -207,7 +207,8 @@ static struct timespec ts_at(uint64_t ns)
 
 static int kslot(int kind) { return kind == PL_KIND_FWDQ; }
 static size_t inbox_cap(const struct fwd *f) { return f->cfg.inbox_bytes ? f->cfg.inbox_bytes : FWD_INBOX_BYTES; }
-static uint64_t credit0(const struct fwd *f) { return f->cfg.credit ? f->cfg.credit : FWD_CREDIT_DEFAULT; }
+uint32_t fwd_credit0(const struct fwd *f) { return f && f->cfg.credit ? f->cfg.credit : FWD_CREDIT_DEFAULT; }
+static uint64_t credit0(const struct fwd *f) { return fwd_credit0(f); }
 
 /* f->mu held: a written frame's deadline is set or moved */
 static void arm(struct fwd *f, uint64_t dl)
