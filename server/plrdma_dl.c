@@ -560,16 +560,27 @@ static int dl_arm(struct plr_qp *q)
 
 static int dl_take_events(struct plr_qp *q)
 {
-    int n = 0;
-    struct ibv_cq *cq;
+    int total = 0;
+    unsigned int n = 0;
+    struct ibv_cq *cq = NULL, *last = NULL;
     void *ctx;
     while (V.get_cq_event(q->ch, &cq, &ctx) == 0) {
-        V.ack_cq_events(cq, 1); /* at once: ibv_destroy_cq waits for every event to be acknowledged */
+        if (last && cq != last) {
+            V.ack_cq_events(last, n);
+            n = 0;
+        }
+        last = cq;
         n++;
+        total++;
     }
-    if (errno != EAGAIN && errno != EWOULDBLOCK)
+    int e = errno;
+    if (last && n)
+        V.ack_cq_events(last, n); /* once for the batch: ibv_destroy_cq waits for every event to be acknowledged */
+    if (e != EAGAIN && e != EWOULDBLOCK) {
+        errno = e;
         return -1;
-    return n;
+    }
+    return total;
 }
 
 static int dl_poll(struct plr_qp *q, struct plr_wc *out, int n)
@@ -630,9 +641,85 @@ static int dl_post_recv(struct plr_qp *q, uint64_t id, void *p, uint32_t n, uint
     return 0;
 }
 
-static const struct plr_ops dl_ops = {"verbs",     dl_dev_open, dl_dev_close,   dl_reg,  dl_dereg,
-                                      dl_qp_new,   dl_qp_rts,   dl_qp_err,      dl_qp_free, dl_fd,
-                                      dl_arm,      dl_take_events, dl_poll,     dl_post_send, dl_post_recv};
+#define DL_BATCH_MAX 32
+
+static int dl_post_send_batch(struct plr_qp *q, const struct plr_send_wr *in, int count)
+{
+    int off = 0;
+    while (off < count) {
+        int m = count - off;
+        if (m > DL_BATCH_MAX)
+            m = DL_BATCH_MAX;
+        struct ibv_sge sge[DL_BATCH_MAX];
+        struct ibv_send_wr wr[DL_BATCH_MAX], *bad = NULL;
+        memset(wr, 0, (size_t)m * sizeof wr[0]);
+        for (int i = 0; i < m; i++) {
+            const struct plr_send_wr *w = &in[off + i];
+            sge[i] = (struct ibv_sge){(uintptr_t)w->p, w->n, w->lkey};
+            wr[i].wr_id = w->id;
+            wr[i].sg_list = w->n ? &sge[i] : NULL;
+            wr[i].num_sge = w->n ? 1 : 0;
+            wr[i].opcode = IBV_WR_SEND;
+            wr[i].send_flags = (w->signaled || q->d->is_iwarp) ? IBV_SEND_SIGNALED : 0;
+            wr[i].next = (i + 1 < m) ? &wr[i + 1] : NULL;
+        }
+        int e = ibv_post_send(q->qp, &wr[0], &bad);
+        if (e) {
+            errno = e;
+            int done = 0;
+            for (int i = 0; i < m; i++) {
+                if (bad == &wr[i]) {
+                    done = i;
+                    break;
+                }
+            }
+            return off + done;
+        }
+        off += m;
+    }
+    return count;
+}
+
+static int dl_post_recv_batch(struct plr_qp *q, const struct plr_recv_wr *in, int count)
+{
+    int off = 0;
+    while (off < count) {
+        int m = count - off;
+        if (m > DL_BATCH_MAX)
+            m = DL_BATCH_MAX;
+        struct ibv_sge sge[DL_BATCH_MAX];
+        struct ibv_recv_wr wr[DL_BATCH_MAX], *bad = NULL;
+        memset(wr, 0, (size_t)m * sizeof wr[0]);
+        for (int i = 0; i < m; i++) {
+            const struct plr_recv_wr *w = &in[off + i];
+            sge[i] = (struct ibv_sge){(uintptr_t)w->p, w->n, w->lkey};
+            wr[i].wr_id = w->id;
+            wr[i].sg_list = w->n ? &sge[i] : NULL;
+            wr[i].num_sge = w->n ? 1 : 0;
+            wr[i].next = (i + 1 < m) ? &wr[i + 1] : NULL;
+        }
+        int e = ibv_post_recv(q->qp, &wr[0], &bad);
+        if (e) {
+            errno = e;
+            int done = 0;
+            for (int i = 0; i < m; i++) {
+                if (bad == &wr[i]) {
+                    done = i;
+                    break;
+                }
+            }
+            return off + done;
+        }
+        off += m;
+    }
+    return count;
+}
+
+static const struct plr_ops dl_ops = {"verbs",           dl_dev_open,        dl_dev_close,      dl_reg,
+                                      dl_dereg,          dl_qp_new,          dl_qp_rts,         dl_qp_err,
+                                      dl_qp_free,        dl_fd,              dl_arm,            dl_take_events,
+                                      dl_poll,           dl_post_send,       dl_post_recv,      dl_post_send_batch,
+                                      dl_post_recv_batch};
 
 const struct plr_ops *plrdma_verbs(char *err, size_t errlen)
 {
@@ -695,9 +782,10 @@ static int dl_cm_dev_open(const char *dev, int port, struct plr_dev **out, struc
     return rc;
 }
 
-static const struct plr_ops dl_cm_verbs_ops = {"verbs-cm",   dl_cm_dev_open, dl_dev_close,  dl_reg,        dl_dereg,
-                                               dl_qp_new,    dl_qp_rts,      dl_qp_err,     dl_qp_free,    dl_fd,
-                                               dl_arm,       dl_take_events, dl_poll,       dl_post_send,  dl_post_recv};
+static const struct plr_ops dl_cm_verbs_ops = {
+    "verbs-cm",         dl_cm_dev_open, dl_dev_close,  dl_reg,           dl_dereg,          dl_qp_new,
+    dl_qp_rts,          dl_qp_err,      dl_qp_free,    dl_fd,            dl_arm,            dl_take_events,
+    dl_poll,            dl_post_send,   dl_post_recv,  dl_post_send_batch, dl_post_recv_batch};
 
 static int cm_addr_to_sa(const struct plr_cm_addr *a, struct sockaddr_storage *ss)
 {

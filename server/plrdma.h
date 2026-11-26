@@ -43,10 +43,11 @@
  * Written (D5). Bytes that writev took were posted: WRITTEN from that moment, whatever completion comes back later. A
  * flushed completion is no statement about what the peer received and changes nothing.
  *
- * Completions in the link's poll. One completion channel and one CQ per connection; poll_fds drains the CQ, arms it,
- * drains it again (an entry that came between the two raises no event) and returns the channel's descriptor and the
- * anchor's, the TCP connection of the handshake, kept in the poll set so that its end is the end of the connection
- * (design-rdma.md §5.1 step 8). The anchor carries nothing once the link is on the queue pair: a byte on it is an error.
+ * Completions in the link's poll. One completion channel and one CQ per connection; poll_fds drains the CQ, and only
+ * when the connection is not already ready for `want` does it arm the CQ and drain it again (an entry that came between
+ * the two raises no event), returning the channel's descriptor and the anchor's, the TCP connection of the handshake,
+ * kept in the poll set so that its end is the end of the connection (design-rdma.md §5.1 step 8). The anchor carries
+ * nothing once the link is on the queue pair: a byte on it is an error.
  *
  * Signalled sends. Every n-th send is signalled (and always the one that takes the last free send slot, so that a
  * completion always comes back to free them): a send slot goes back to the connection's free ring only at the next
@@ -119,6 +120,21 @@ struct plr_wc {
     uint8_t rnr; /* 1 when RNR retry limit was exceeded */
 };
 
+struct plr_send_wr {
+    uint64_t id;
+    const void *p;
+    uint32_t n;
+    uint32_t lkey;
+    int signaled;
+};
+
+struct plr_recv_wr {
+    uint64_t id;
+    void *p;
+    uint32_t n;
+    uint32_t lkey;
+};
+
 /* The verbs, as the transport uses them. Every call is made by one thread at a time per queue pair (the link
  * thread's), dev_open, reg and dereg by the pool's opener. -1 with errno, or NULL with errno, on failure. */
 struct plr_ops {
@@ -141,6 +157,10 @@ struct plr_ops {
     /* n 0 and p NULL: a marker with no scatter entry */
     int (*post_send)(struct plr_qp *q, uint64_t id, const void *p, uint32_t n, uint32_t lkey, int signaled);
     int (*post_recv)(struct plr_qp *q, uint64_t id, void *p, uint32_t n, uint32_t lkey);
+    /* Optional batched posting (NULL falls back to post_send/post_recv): chains WRs into one doorbell.
+     * Returns the count of WRs successfully posted (0..count); if < count, errno holds the failure cause. */
+    int (*post_send_batch)(struct plr_qp *q, const struct plr_send_wr *wrs, int count);
+    int (*post_recv_batch)(struct plr_qp *q, const struct plr_recv_wr *wrs, int count);
 };
 
 struct plr_pool_cfg {

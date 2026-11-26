@@ -310,7 +310,7 @@ struct meta_state {
     struct meta_volume *volumes; /* ascending by number */
     uint32_t ndomains, domains_cap;
     struct meta_domain *domains; /* ascending by name */
-    uint32_t *slot_home;         /* META_SLOTS entries */
+    const uint32_t *slot_home;   /* META_SLOTS entries (COW refcounted; mutate via meta_slot_home_mut) */
     uint32_t nsince, since_cap;
     struct meta_since_run *since; /* ascending by first; every slot with a home is in one run */
     uint32_t nmoves, moves_cap;
@@ -569,5 +569,7 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
 
 /* A deep copy (the simulator keeps the states of a history). */
 void meta_copy(struct meta_state *dst, const struct meta_state *src);
+/* Detaches slot_home for writing (copy-on-write when shared with another copy of the state). */
+uint32_t *meta_slot_home_mut(struct meta_state *m);
 
 #endif

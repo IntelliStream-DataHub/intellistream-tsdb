@@ -391,6 +391,18 @@ static void frame_tag(const uint8_t key[32], uint64_t seq, const uint8_t *body, 
     cluster_hmac_parts(key, 32, 2, part, len, out);
 }
 
+/* the same when the type byte is separate from the payload (no copy to join them) */
+static void frame_tag_tp(const uint8_t key[32], uint64_t seq, uint8_t type, const uint8_t *payload, size_t n,
+                         uint8_t out[32])
+{
+    uint8_t s[8];
+    for (int i = 0; i < 8; i++)
+        s[i] = (uint8_t)(seq >> (8 * i));
+    const void *part[3] = {s, &type, payload};
+    size_t len[3] = {8, 1, n};
+    cluster_hmac_parts(key, 32, n ? 3 : 2, part, len, out);
+}
+
 /* an untagged frame ([len][type][payload]) appended to `to` with its tag */
 static void put_tagged(struct buf *to, const uint8_t key[32], uint64_t *seq, const uint8_t *frame, size_t flen)
 {
@@ -754,19 +766,18 @@ static int read_all(int fd, uint8_t *p, size_t n, int64_t deadline_ms)
     return 0;
 }
 
-/* One frame: its type and payload (malloc'ed). 0 or -1. */
+/* One frame: its type and payload (malloc'ed). Valid frames are >= 5 bytes (u32 len >= 1 plus u8 type), so a
+ * malformed peer sending only 4 bytes with len == 0 or > FRAME_MAX hits deadline/EOF instead of EPROTO. 0 or -1. */
 static int read_frame(int fd, int64_t deadline_ms, uint8_t *type, uint8_t **payload, size_t *len)
 {
     uint8_t h[5];
-    if (read_all(fd, h, 4, deadline_ms) != 0)
+    if (read_all(fd, h, 5, deadline_ms) != 0)
         return -1;
     uint32_t n = le32(h);
     if (n == 0 || n > FRAME_MAX) {
         errno = EPROTO;
         return -1;
     }
-    if (read_all(fd, h + 4, 1, deadline_ms) != 0)
-        return -1;
     uint8_t *p = malloc(n);
     if (!p)
         return -1;
@@ -861,16 +872,8 @@ int cluster_admin(const char *addr, const uint8_t *secret, size_t secret_len, in
             snprintf(err, errn, "a frame from %s is too short", addr);
             goto out;
         }
-        /* the tag covers the type and the payload: rebuild them in one piece */
-        uint8_t *body = malloc(n + 1);
-        if (!body)
-            goto out;
-        body[0] = type;
-        memcpy(body + 1, p, n);
-        frame_tag(kin, seq_in++, body, n + 1 - TAG, t);
-        int good = tsdb_ct_equal(t, body + n + 1 - TAG, TAG);
-        free(body);
-        if (!good) {
+        frame_tag_tp(kin, seq_in++, type, p, n - TAG, t);
+        if (!tsdb_ct_equal(t, p + n - TAG, TAG)) {
             snprintf(err, errn, "a frame from %s does not authenticate", addr);
             goto out;
         }
@@ -1992,10 +1995,26 @@ struct cc_snap {
     struct cc_snap *next; /* on the retired list */
     unsigned long rp;     /* cc_phase when it was swapped out */
 };
-static _Atomic(struct cc_snap *) cc_cur;
-static atomic_ulong cc_phase;
-static atomic_long cc_getting[2];
-static struct cc_snap *cc_retired; /* swapped out, the published reference still held; the swapping thread's */
+struct cc_pad_long {
+    _Alignas(64) atomic_long v;
+};
+struct cc_pad_ulong {
+    _Alignas(64) atomic_ulong v;
+};
+struct cc_pad_asnap {
+    _Alignas(64) _Atomic(struct cc_snap *) v;
+};
+struct cc_pad_snap {
+    _Alignas(64) struct cc_snap *v;
+};
+_Static_assert(sizeof(struct cc_pad_long) == 64, "cc_pad_long must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_ulong) == 64, "cc_pad_ulong must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_asnap) == 64, "cc_pad_asnap must occupy a full cache line");
+_Static_assert(sizeof(struct cc_pad_snap) == 64, "cc_pad_snap must occupy a full cache line");
+static struct cc_pad_asnap cc_cur;
+static struct cc_pad_ulong cc_phase;
+static struct cc_pad_long cc_getting[2];
+static struct cc_pad_snap cc_retired; /* swapped out, the published reference still held; the swapping thread's */
 static unsigned long cc_nretired, cc_nretired_max;
 static atomic_ulong cc_builds; /* snapshots published since the start (the hold check counts them) */
 
@@ -2029,16 +2048,16 @@ const struct cluster_copy *cluster_copy_get(void)
 {
     unsigned long p;
     for (;;) {
-        p = atomic_load(&cc_phase);
-        atomic_fetch_add(&cc_getting[p & 1], 1);
-        if (atomic_load(&cc_phase) == p)
+        p = atomic_load(&cc_phase.v);
+        atomic_fetch_add(&cc_getting[p & 1].v, 1);
+        if (atomic_load(&cc_phase.v) == p)
             break;
-        atomic_fetch_sub(&cc_getting[p & 1], 1); /* a swap flipped in between: count under the new parity */
+        atomic_fetch_sub(&cc_getting[p & 1].v, 1); /* a swap flipped in between: count under the new parity */
     }
-    struct cc_snap *s = atomic_load(&cc_cur);
+    struct cc_snap *s = atomic_load(&cc_cur.v);
     if (s)
         atomic_fetch_add(&s->refs, 1);
-    atomic_fetch_sub(&cc_getting[p & 1], 1);
+    atomic_fetch_sub(&cc_getting[p & 1].v, 1);
     return s ? &s->pub : NULL;
 }
 
@@ -2058,9 +2077,9 @@ void cluster_copy_put(const struct cluster_copy *c)
 static int cc_reclaim(void)
 {
     for (int pass = 0; pass < 2; pass++) {
-        unsigned long p = atomic_load(&cc_phase);
-        int drained = p > 0 && atomic_load(&cc_getting[(p - 1) & 1]) == 0, current = 0;
-        for (struct cc_snap **pp = &cc_retired; *pp;) {
+        unsigned long p = atomic_load(&cc_phase.v);
+        int drained = p > 0 && atomic_load(&cc_getting[(p - 1) & 1].v) == 0, current = 0;
+        for (struct cc_snap **pp = &cc_retired.v; *pp;) {
             struct cc_snap *x = *pp;
             if (x->rp + 2 <= p || (x->rp + 1 == p && drained)) {
                 *pp = x->next;
@@ -2071,17 +2090,17 @@ static int cc_reclaim(void)
                 pp = &x->next;
             }
         }
-        if (!current || atomic_load(&cc_getting[(p + 1) & 1]) != 0)
+        if (!current || atomic_load(&cc_getting[(p + 1) & 1].v) != 0)
             break;
-        atomic_store(&cc_phase, p + 1); /* the readers of phase p - 1 are out: their parity can be p + 1's */
+        atomic_store(&cc_phase.v, p + 1); /* the readers of phase p - 1 are out: their parity can be p + 1's */
     }
-    return cc_retired == NULL;
+    return cc_retired.v == NULL;
 }
 
 /* the cluster thread (and cluster_stop): s becomes the current snapshot (NULL: none); the old one is retired */
 static void cc_swap(struct cc_snap *s)
 {
-    struct cc_snap *old = atomic_exchange(&cc_cur, s);
+    struct cc_snap *old = atomic_exchange(&cc_cur.v, s);
     if (!old)
         return;
     if (cl_mutant() == CLM_CCNOWAIT) {
@@ -2089,14 +2108,14 @@ static void cc_swap(struct cc_snap *s)
         return;
     }
     if (cl_mutant() == CLM_CCONESLOT) { /* the old protocol: wait for the one counter every reader uses */
-        while (atomic_load(&cc_getting[atomic_load(&cc_phase) & 1]))
+        while (atomic_load(&cc_getting[atomic_load(&cc_phase.v) & 1].v))
             sched_yield();
         cc_unref(old);
         return;
     }
-    old->rp = atomic_load(&cc_phase);
-    old->next = cc_retired;
-    cc_retired = old;
+    old->rp = atomic_load(&cc_phase.v);
+    old->next = cc_retired.v;
+    cc_retired.v = old;
     if (++cc_nretired > cc_nretired_max)
         cc_nretired_max = cc_nretired;
     cc_reclaim();
@@ -2114,12 +2133,12 @@ static void cc_clear(void)
  * restore): a new snapshot of C.sm. The cluster thread only. */
 static void copy_publish(void)
 {
-    if (cc_retired)
+    if (cc_retired.v)
         cc_reclaim();
     if (!C.sm.initialised || (C.hold_copy && access(C.holdcopyfile, F_OK) == 0))
         return;
     uint32_t self = cl_mutant() == CLM_SELFONE ? 1 : C.have_node ? C.id : 0;
-    struct cc_snap *cur = atomic_load(&cc_cur); /* ours: the published reference is the cluster thread's */
+    struct cc_snap *cur = atomic_load(&cc_cur.v); /* ours: the published reference is the cluster thread's */
     if (cur && cur->pub.applied == C.sm.applied && cur->pub.applied_term == C.sm.applied_term &&
         cur->pub.restore_gen == C.sm.restore_gen && cur->pub.self == self)
         return;
@@ -2314,7 +2333,7 @@ static void *ccst_reader(void *arg)
 
 int cluster_copy_stress(unsigned readers, unsigned long publishes, unsigned ms, char *why, size_t wn)
 {
-    if (atomic_load(&cc_cur)) {
+    if (atomic_load(&cc_cur.v)) {
         snprintf(why, wn, "a copy is published: the cluster runs in this process");
         return -1;
     }
@@ -2417,29 +2436,52 @@ void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_store
 
 /* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
  * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
- * its arrival), at most 2 s. The cluster thread raises it; any thread reads it and checks the deadline itself, so a
- * stalled cluster loop turns the answer to 0 once the lease has run out, while a new leader may commit a new epoch.
- * cfl_mu is a leaf. */
-static pthread_mutex_t cfl_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t cfl_floor, cfl_until;
+ * its arrival), at most 2 s. The cluster thread raises it; any thread reads it lock-free (single-writer seqlock with
+ * atomic payload fields for race-free C11/TSan concurrent reads) and checks the deadline itself, so a stalled cluster
+ * loop turns the answer to 0 once the lease has run out, while a new leader may commit a new epoch. */
+static struct {
+    _Alignas(64) _Atomic uint64_t seq;
+    _Atomic uint64_t floor;
+    _Atomic uint64_t until;
+} cfl;
+_Static_assert(sizeof(cfl) == 64, "cfl must occupy a full cache line");
 
 static void copy_floor_note(uint64_t commit, uint64_t until)
 {
-    pthread_mutex_lock(&cfl_mu);
-    if (commit > cfl_floor) /* the leader's commit index only grows; a late ack of an older beat must not lower it */
-        cfl_floor = commit;
-    if (until > cfl_until)
-        cfl_until = until;
-    pthread_mutex_unlock(&cfl_mu);
+    uint64_t cur_floor = atomic_load_explicit(&cfl.floor, memory_order_relaxed);
+    uint64_t cur_until = atomic_load_explicit(&cfl.until, memory_order_relaxed);
+    if (commit <= cur_floor && until <= cur_until)
+        return;
+    uint64_t s = atomic_load_explicit(&cfl.seq, memory_order_relaxed);
+    atomic_store_explicit(&cfl.seq, s + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    if (commit > cur_floor) /* the leader's commit index only grows; a late ack of an older beat must not lower it */
+        atomic_store_explicit(&cfl.floor, commit, memory_order_relaxed);
+    if (until > cur_until)
+        atomic_store_explicit(&cfl.until, until, memory_order_relaxed);
+    atomic_store_explicit(&cfl.seq, s + 2, memory_order_release);
 }
 
 int cluster_copy_caught_up_at(const struct cluster_copy *c)
 {
     if (!c)
         return 0;
-    pthread_mutex_lock(&cfl_mu);
-    uint64_t floor = cfl_floor, until = cfl_until;
-    pthread_mutex_unlock(&cfl_mu);
+    uint64_t floor, until;
+    for (;;) {
+        uint64_t s1 = atomic_load_explicit(&cfl.seq, memory_order_acquire);
+        if (!(s1 & 1)) {
+            floor = atomic_load_explicit(&cfl.floor, memory_order_relaxed);
+            until = atomic_load_explicit(&cfl.until, memory_order_relaxed);
+            atomic_thread_fence(memory_order_acquire);
+            if (atomic_load_explicit(&cfl.seq, memory_order_relaxed) == s1)
+                break;
+        }
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
     if (!floor || (c->applied < floor && cl_mutant() != CLM_COPYNOFLOOR))
         return 0;
     return iso_now_ns() < until || cl_mutant() == CLM_COPYNODEADLINE;
@@ -5585,10 +5627,10 @@ static uint64_t state_free_bytes(void)
 
 /* this server's flags (item 6): a witness holds no volumes; a node whose state directory is nearly full, whose core
  * was dropped or that carries a `retired` mark may not be a voter */
-static uint8_t my_flags(void)
+static uint8_t my_flags_at(uint64_t free_bytes)
 {
     uint8_t f = 0;
-    if (!C.retired && !C.core_dropped && state_free_bytes() >= C.free_min)
+    if (!C.retired && !C.core_dropped && free_bytes >= C.free_min)
         f |= META_MF_VOTER_OK;
     if (!C.witness)
         f |= META_MF_VOLUMES_OK;
@@ -5597,13 +5639,16 @@ static uint8_t my_flags(void)
     return f;
 }
 
+static uint8_t my_flags(void) { return my_flags_at(state_free_bytes()); }
+
 static void put_sections(struct buf *b, uint64_t now)
 {
+    uint64_t free_bytes = state_free_bytes();
     size_t at = sec_begin(b, HBS_NODE);
-    put8(b, my_flags());
+    put8(b, my_flags_at(free_bytes));
     put8(b, (uint8_t)(C.core_dropped || C.retired));
     put8(b, (uint8_t)(!C.rb_off));
-    put64(b, state_free_bytes());
+    put64(b, free_bytes);
     sec_end(b, at);
     static struct cluster_report rep;
     memset(&rep, 0, sizeof rep);

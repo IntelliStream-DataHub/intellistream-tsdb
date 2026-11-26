@@ -115,16 +115,63 @@ static void copy_n(void *dst, const void *src, size_t n)
         memcpy(dst, src, n);
 }
 
+/* The 65,536-entry slot_home table (256 KiB) is shared copy-on-write across copies of the state (meta_copy runs on
+ * every applied entry, and almost no entry changes slot homes). A refcount header precedes the entries, like ublob;
+ * any writer detaches via meta_slot_home_mut() when refs > 1. */
+struct slot_hdr {
+    uint32_t refs, pad;
+};
+
+static uint32_t *slots_new(void)
+{
+    struct slot_hdr *h = malloc(sizeof *h + META_SLOTS * sizeof(uint32_t));
+    if (!h)
+        abort();
+    h->refs = 1;
+    h->pad = 0;
+    return (uint32_t *)(h + 1);
+}
+
+static void slots_ref(const uint32_t *p)
+{
+    if (p)
+        __atomic_add_fetch(&((struct slot_hdr *)(void *)p - 1)->refs, 1, __ATOMIC_RELAXED);
+}
+
+static void slots_unref(const uint32_t *p)
+{
+    if (p && __atomic_sub_fetch(&((struct slot_hdr *)(void *)p - 1)->refs, 1, __ATOMIC_ACQ_REL) == 0)
+        free((struct slot_hdr *)(void *)p - 1);
+}
+
+uint32_t *meta_slot_home_mut(struct meta_state *m)
+{
+    if (!m->slot_home) {
+        uint32_t *sh = slots_new();
+        for (uint32_t i = 0; i < META_SLOTS; i++)
+            sh[i] = META_NONE;
+        m->slot_home = sh;
+        return sh;
+    }
+    struct slot_hdr *h = (struct slot_hdr *)(void *)m->slot_home - 1;
+    if (__atomic_load_n(&h->refs, __ATOMIC_ACQUIRE) == 1)
+        return (uint32_t *)(void *)m->slot_home;
+    uint32_t *copy = slots_new();
+    memcpy(copy, m->slot_home, META_SLOTS * sizeof *copy);
+    slots_unref(m->slot_home);
+    m->slot_home = copy;
+    return copy;
+}
+
 void meta_init(struct meta_state *m)
 {
     memset(m, 0, sizeof *m);
     meta_settings_default(&m->set);
     m->next_member = 1;
-    m->slot_home = malloc(META_SLOTS * sizeof *m->slot_home);
-    if (!m->slot_home)
-        abort();
+    uint32_t *sh = slots_new();
     for (uint32_t i = 0; i < META_SLOTS; i++)
-        m->slot_home[i] = META_NONE;
+        sh[i] = META_NONE;
+    m->slot_home = sh;
 }
 
 /* A user's blob is shared by every copy of the state (meta_copy runs once per entry: copying megabytes of users each
@@ -172,7 +219,7 @@ void meta_free(struct meta_state *m)
     free(m->pend);
     free(m->members);
     free(m->volumes);
-    free(m->slot_home);
+    slots_unref(m->slot_home);
     free(m->moves);
     free(m->users);
     memset(m, 0, sizeof *m);
@@ -202,9 +249,7 @@ void meta_copy(struct meta_state *dst, const struct meta_state *src)
     dst->domains = malloc((src->ndomains + 1) * sizeof *dst->domains);
     dst->since = malloc((src->nsince + 1) * sizeof *dst->since);
     dst->pend = malloc((src->npend + 1) * sizeof *dst->pend);
-    dst->slot_home = malloc(META_SLOTS * sizeof *dst->slot_home);
-    if (!dst->members || !dst->volumes || !dst->moves || !dst->users || !dst->slot_home || !dst->domains ||
-        !dst->since || !dst->pend)
+    if (!dst->members || !dst->volumes || !dst->moves || !dst->users || !dst->domains || !dst->since || !dst->pend)
         abort();
     dst->domains_cap = src->ndomains + 1;
     dst->since_cap = src->nsince + 1;
@@ -220,7 +265,8 @@ void meta_copy(struct meta_state *dst, const struct meta_state *src)
     copy_n(dst->volumes, src->volumes, src->nvolumes * sizeof *dst->volumes);
     copy_n(dst->moves, src->moves, src->nmoves * sizeof *dst->moves);
     copy_n(dst->users, src->users, src->nusers * sizeof *dst->users);
-    memcpy(dst->slot_home, src->slot_home, META_SLOTS * sizeof *dst->slot_home);
+    dst->slot_home = src->slot_home;
+    slots_ref(dst->slot_home);
     for (uint32_t i = 0; i < src->nvolumes; i++) {
         struct meta_volume *v = &dst->volumes[i];
         v->hist = malloc((v->nhist + 1) * sizeof *v->hist);
@@ -1915,17 +1961,24 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
         if (volume_at(m, vol) < 0)
             return META_ERR_NOTFOUND;
         /* only slots without a home get one here; a slot that has one moves by the freeze protocol (§5.7) */
-        for (uint32_t s = first; s < first + count; s++)
+        int any = 0;
+        for (uint32_t s = first; s < first + count; s++) {
             if (m->slot_home[s] != META_NONE && m->slot_home[s] != vol)
                 return META_ERR_INVALID;
+            if (m->slot_home[s] == META_NONE)
+                any = 1;
+        }
+        if (!any)
+            return META_OK;
+        uint32_t *sh = meta_slot_home_mut(m);
         for (uint32_t s = first; s < first + count;) {
-            if (m->slot_home[s] != META_NONE) {
+            if (sh[s] != META_NONE) {
                 s++;
                 continue;
             }
             uint32_t e = s;
-            while (e < first + count && m->slot_home[e] == META_NONE)
-                m->slot_home[e++] = vol;
+            while (e < first + count && sh[e] == META_NONE)
+                sh[e++] = vol;
             since_set(m, s, e - s, m->applied);
             s = e;
         }
@@ -1989,7 +2042,7 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_ERR_INVALID;
         m->moves = grow(m->moves, &m->moves_cap, m->nmoves + 1, sizeof *m->moves);
         m->moves[m->nmoves++] = (struct meta_slot_move){slot, m->pend[at].from, meta_slot_since(m, slot)};
-        m->slot_home[slot] = to;
+        meta_slot_home_mut(m)[slot] = to;
         since_set(m, slot, 1, m->applied);
         slot_pend_remove(m, at);
         touched[(*ntouched)++] = SLOT_TAG | slot;
@@ -2509,12 +2562,13 @@ static int decode_body(struct rd *r, struct meta_state *m)
         m->ndomains = i + 1;
     }
     uint32_t nruns = get32(r), s = 0;
+    uint32_t *sh = meta_slot_home_mut(m);
     for (uint32_t i = 0; i < nruns && !r->bad; i++) {
         uint32_t cnt = get32(r), home = get32(r);
         if (cnt > META_SLOTS - s)
             return -1;
         for (uint32_t j = 0; j < cnt; j++)
-            m->slot_home[s++] = home;
+            sh[s++] = home;
     }
     if (s != META_SLOTS)
         return -1;
@@ -2933,7 +2987,8 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
     if (next->next_member < prev->next_member || next->next_volume < prev->next_volume)
         FAIL("an id counter went back");
     /* a slot changes home only from a freeze committed in an earlier entry, under the epoch its old home had then */
-    if (memcmp(prev->slot_home, next->slot_home, META_SLOTS * sizeof *prev->slot_home) != 0)
+    if (prev->slot_home != next->slot_home &&
+        memcmp(prev->slot_home, next->slot_home, META_SLOTS * sizeof *prev->slot_home) != 0)
         for (uint32_t s = 0; s < META_SLOTS; s++) {
             if (prev->slot_home[s] == next->slot_home[s] || prev->slot_home[s] == META_NONE)
                 continue;
