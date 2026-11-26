@@ -228,16 +228,49 @@ int chunk_hdr_decode(const uint8_t in[CHUNK_HDR_BYTES], chunk_hdr *h)
     return 0;
 }
 
-/* The footer's hash: the header and the sums table as they lie in the file (little endian). */
+/* The footer's hash: xxh64 (seed 0) over the header and the sums table as they lie in the file (little endian),
+ * streamed directly without allocating or copying. */
+static const uint64_t FTR_P1 = 11400714785074694791ULL;
+static const uint64_t FTR_P2 = 14029467366897019727ULL;
+static const uint64_t FTR_P3 = 1609587929392839161ULL;
+static const uint64_t FTR_P4 = 9650029242287828579ULL;
+
+static inline uint64_t ftr_rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+static inline uint64_t ftr_round(uint64_t acc, uint64_t in) { return ftr_rotl64(acc + in * FTR_P2, 31) * FTR_P1; }
+static inline uint64_t ftr_merge(uint64_t acc, uint64_t v) { return (acc ^ ftr_round(0, v)) * FTR_P1 + FTR_P4; }
+
 static uint64_t ftr_hash(const uint8_t *hdr, const uint8_t *table, uint64_t ncells)
 {
-    uint8_t *b = malloc(CHUNK_HDR_BYTES + 8 * ncells);
-    if (!b)
-        return 0; /* the caller's comparison fails: an allocation failure reads as damage, never as a pass */
-    memcpy(b, hdr, CHUNK_HDR_BYTES);
-    memcpy(b + CHUNK_HDR_BYTES, table, 8 * ncells);
-    uint64_t h = xxh64(b, CHUNK_HDR_BYTES + 8 * ncells, 0);
-    free(b);
+    _Static_assert(CHUNK_HDR_BYTES >= 32 && CHUNK_HDR_BYTES % 32 == 0,
+                   "CHUNK_HDR_BYTES must be a positive multiple of 32");
+    uint64_t v1 = FTR_P1 + FTR_P2, v2 = FTR_P2, v3 = 0, v4 = (uint64_t)0 - FTR_P1;
+    for (size_t off = 0; off < CHUNK_HDR_BYTES; off += 32) {
+        v1 = ftr_round(v1, get64(hdr + off));
+        v2 = ftr_round(v2, get64(hdr + off + 8));
+        v3 = ftr_round(v3, get64(hdr + off + 16));
+        v4 = ftr_round(v4, get64(hdr + off + 24));
+    }
+    uint64_t i = 0;
+    for (; i + 4 <= ncells; i += 4) {
+        const uint8_t *p = table + 8 * i;
+        v1 = ftr_round(v1, get64(p));
+        v2 = ftr_round(v2, get64(p + 8));
+        v3 = ftr_round(v3, get64(p + 16));
+        v4 = ftr_round(v4, get64(p + 24));
+    }
+    uint64_t h = ftr_rotl64(v1, 1) + ftr_rotl64(v2, 7) + ftr_rotl64(v3, 12) + ftr_rotl64(v4, 18);
+    h = ftr_merge(h, v1);
+    h = ftr_merge(h, v2);
+    h = ftr_merge(h, v3);
+    h = ftr_merge(h, v4);
+    h += (uint64_t)CHUNK_HDR_BYTES + 8 * ncells;
+    for (; i < ncells; i++)
+        h = ftr_rotl64(h ^ ftr_round(0, get64(table + 8 * i)), 27) * FTR_P1 + FTR_P4;
+    h ^= h >> 33;
+    h *= FTR_P2;
+    h ^= h >> 29;
+    h *= FTR_P3;
+    h ^= h >> 32;
     return h;
 }
 
@@ -246,8 +279,7 @@ int chunk_ftr_check(const uint8_t *hdr, const uint8_t *table, uint64_t ncells, c
 {
     if (memcmp(ftr + 12, FTR_MAGIC, 4) != 0 || get32(ftr + 8) != ncells)
         return TSDB_ERR_CORRUPT;
-    uint64_t want = ftr_hash(hdr, table, ncells);
-    return want != 0 && want == get64(ftr) ? 0 : TSDB_ERR_CORRUPT;
+    return ftr_hash(hdr, table, ncells) == get64(ftr) ? 0 : TSDB_ERR_CORRUPT;
 }
 
 int chunk_image_parse(const uint8_t *buf, size_t n, bool check_cells, chunk_hdr *h, const uint8_t **cells,

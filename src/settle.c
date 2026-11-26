@@ -317,16 +317,29 @@ static int check_stripe(sfill *f, const uint8_t *b, uint64_t off, size_t len)
     }
     for (; f->gi < f->ng && f->g[f->gi].off < end; f->gi++) {
         gran *x = &f->g[f->gi];
-        uint64_t ge = x->off + x->len, a = MAX(off, x->off), z = MIN(end, ge);
-        memcpy(f->asmb + (a - x->off), b + (a - off), z - a);
-        if (ge > end)
-            break; /* the rest comes with the next stripe */
-        if ((uint32_t)xxh64(f->asmb, x->len, 0) != x->crc)
+        uint64_t ge = x->off + x->len;
+        const uint8_t *gbuf;
+        if (x->off >= off && ge <= end) {
+            /* fast path: granule lies wholly inside the current stripe buffer b; hash directly without memcpy */
+            gbuf = b + (x->off - off);
+        } else {
+            uint64_t a = MAX(off, x->off), z = MIN(end, ge);
+            memcpy(f->asmb + (a - x->off), b + (a - off), (size_t)(z - a));
+            if (ge > end)
+                break; /* the rest comes with the next stripe */
+            gbuf = f->asmb;
+        }
+        if ((uint32_t)xxh64(gbuf, x->len, 0) != x->crc)
             return fail_part(f, TSDB_ERR_CORRUPT, "granule %u at %" PRIu64 " does not match its checksum", x->idx,
                              x->off);
-        int rc;
-        if (x->decode && (rc = judge_rows(f, x)) != 0)
-            return rc;
+        if (x->decode) {
+            /* judge_rows decodes from f->asmb, which always carries BLK_SLACK trailing readable bytes */
+            if (gbuf != f->asmb)
+                memcpy(f->asmb, gbuf, x->len);
+            int rc = judge_rows(f, x);
+            if (rc != 0)
+                return rc;
+        }
     }
     return 0;
 }

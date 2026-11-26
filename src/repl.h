@@ -220,6 +220,14 @@ int repl_write(struct repl *r, uint32_t n, uint64_t *pos);
 void repl_synced(struct repl *r, uint64_t end);
 void repl_recv(struct repl *r, const struct repl_msg *m);
 void repl_tick(struct repl *r);
+/* Minimum number of ticks (>= 1) until repl_tick(r) can emit any action or change state beyond r->now and r->wend[],
+ * or UINT32_MAX when no timer-driven event is scheduled (e.g. an idle follower with no pending floor save). Drivers
+ * use this to sleep until the next real deadline instead of polling every tick. */
+uint32_t repl_next_tick(const struct repl *r);
+/* Fast-forward n guaranteed-idle ticks (0 <= n < repl_next_tick(r)) without emitting actions: advances r->now by n
+ * and records `written` (captured before sleeping, in case concurrent writes arrived) in the skipped leader wend[]
+ * slots. */
+void repl_advance_idle(struct repl *r, uint32_t n, uint64_t written);
 /* The next action, 1; or 0 if there is none. */
 int repl_next_action(struct repl *r, struct repl_action *a);
 /* The driver removed the log's positions below `start` (its segments went into parts and their removal is durable:

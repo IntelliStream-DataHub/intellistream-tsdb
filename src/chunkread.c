@@ -172,6 +172,77 @@ static chunk_backend *obj_backend(const chunk_obj *o);
 
 enum { PS_UNKNOWN = 0, PS_GOOD, PS_BAD };
 
+/* Per-thread cache of cell scratch buffers for chunk_read_range / cr_pos_run: avoids multi-MiB mmap/munmap churn
+ * across consecutive reads on the same thread. Bounded to CR_TLS_MAX_BYTES per thread, freed on thread exit via
+ * pthread_key_t destructor (never registers atexit() inside libtsdb.so). */
+#define CR_TLS_MAX_BYTES ((size_t)8 << 20)
+
+typedef struct cr_tls_pool {
+    uint8_t *slot[CHUNK_POS_MAX];
+    size_t cap[CHUNK_POS_MAX];
+    size_t total;
+    bool in_use;
+} cr_tls_pool;
+
+static __thread cr_tls_pool *cr_tls;
+static pthread_key_t cr_tls_key;
+static bool cr_tls_key_ok;
+static pthread_once_t cr_tls_once = PTHREAD_ONCE_INIT;
+
+static void cr_tls_free(void *arg)
+{
+    cr_tls_pool *p = arg;
+    if (!p)
+        return;
+    if (cr_tls == p)
+        cr_tls = NULL;
+    for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
+        free(p->slot[i]);
+    free(p);
+}
+
+static void cr_tls_init(void) { cr_tls_key_ok = pthread_key_create(&cr_tls_key, cr_tls_free) == 0; }
+
+static cr_tls_pool *cr_tls_acquire(void)
+{
+    cr_tls_pool *p = cr_tls;
+    if (!p) {
+        pthread_once(&cr_tls_once, cr_tls_init);
+        if (!cr_tls_key_ok)
+            return NULL;
+        p = calloc(1, sizeof *p);
+        if (!p || pthread_setspecific(cr_tls_key, p) != 0) {
+            free(p);
+            return NULL;
+        }
+        cr_tls = p;
+    }
+    if (p->in_use)
+        return NULL;
+    p->in_use = true;
+    return p;
+}
+
+static uint8_t *cr_tls_slot(cr_tls_pool *p, unsigned pos, size_t need)
+{
+    if (!p || pos >= CHUNK_POS_MAX)
+        return NULL;
+    if (p->cap[pos] >= need)
+        return p->slot[pos];
+    size_t other = p->total - p->cap[pos];
+    if (need > CR_TLS_MAX_BYTES - other)
+        return NULL;
+    size_t new_total = other + need;
+    uint8_t *b = malloc(need);
+    if (!b)
+        return NULL;
+    free(p->slot[pos]);
+    p->slot[pos] = b;
+    p->cap[pos] = need;
+    p->total = new_total;
+    return b;
+}
+
 typedef struct rr {
     const chunk_source *src;
     const chunk_geom *g;
@@ -179,8 +250,17 @@ typedef struct rr {
     chunk_report *rep;
     bool raw;
     uint64_t base[CHUNK_POS_MAX];
+    cr_tls_pool *tls;             /* borrowed per-thread scratch pool, NULL if nested/unavailable */
     uint8_t *slot[CHUNK_POS_MAX]; /* a buffer of one cell per position, made when first used, kept for the call */
+    size_t slot_cap[CHUNK_POS_MAX];
+    bool owned[CHUNK_POS_MAX];    /* true when slot[p] was heap-allocated outside tls and must be freed on exit */
     size_t cap;
+#ifdef TSDB_EC
+    iso_rs *rs;
+    iso_rs_plan *plan;            /* cached RS decode plan for plan_mask across stripes; freed unconditionally on exit */
+    uint32_t plan_mask;
+    _Static_assert(CHUNK_POS_MAX <= 32, "plan_mask is uint32_t");
+#endif
     uint8_t zero_[1];
 } rr;
 
@@ -190,11 +270,32 @@ static void note(rr *r, unsigned pos, int st)
     r->rep->bad_cells++;
 }
 
-static uint8_t *rr_slot(rr *r, unsigned pos)
+static uint8_t *rr_slot(rr *r, unsigned pos, size_t need)
 {
-    if (!r->slot[pos])
-        r->slot[pos] = malloc(r->cap ? r->cap : 1);
-    return r->slot[pos];
+    if (need == 0)
+        need = 1;
+    if (r->slot[pos] && r->slot_cap[pos] >= need)
+        return r->slot[pos];
+    if (r->owned[pos]) {
+        free(r->slot[pos]);
+        r->slot[pos] = NULL;
+        r->slot_cap[pos] = 0;
+        r->owned[pos] = false;
+    }
+    uint8_t *b = cr_tls_slot(r->tls, pos, need);
+    if (b) {
+        r->slot[pos] = b;
+        r->slot_cap[pos] = r->tls->cap[pos];
+        r->owned[pos] = false;
+        return b;
+    }
+    b = malloc(need);
+    if (!b)
+        return NULL;
+    r->slot[pos] = b;
+    r->slot_cap[pos] = need;
+    r->owned[pos] = true;
+    return b;
 }
 
 /* Reads cell `idx` of chunk `pos` whole into dst (len bytes) and checks it: 0 or a CHUNK_ST_* status. */
@@ -248,6 +349,7 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
     uint8_t *shards[CHUNK_POS_MAX];
     bool present[CHUNK_POS_MAX], isbad[CHUNK_POS_MAX];
     unsigned ngood = 0;
+    uint32_t pmask = 0;
     memset(shards, 0, sizeof shards);
     memset(isbad, 0, sizeof isbad);
     for (unsigned i = 0; i < k; i++)
@@ -255,11 +357,12 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
     for (unsigned p = 0; p < k + m; p++)
         present[p] = false;
     int sts[CHUNK_POS_MAX] = {0};
+    size_t need = r->raw ? w : r->cap;
     for (unsigned p = 0; p < k + m && ngood < k; p++) { /* data first, then parity */
         if (isbad[p])
             continue;
         uint64_t c = p < k ? s * k + p : 0, cl = p < k ? chunk_cell_len(g, c) : Ls;
-        uint8_t *b = rr_slot(r, p);
+        uint8_t *b = rr_slot(r, p, need);
         if (!b)
             return TSDB_ERR_NOMEM;
         if (!r->raw && p < k && have[p]) { /* the direct pass read and checked it whole: only the padding is left */
@@ -287,6 +390,7 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
         }
         shards[p] = b;
         present[p] = true;
+        pmask |= 1u << p;
         ngood++;
     }
     if (ngood < k) {
@@ -307,18 +411,26 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
                     away ? "unavailable while they are" : "not readable");
         return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
-    /* the buffers the decode fills: every absent data position gets one of its own */
-    for (unsigned p = 0; p < k + m; p++)
+    /* the buffers the decode fills: every absent data position gets one of its own (data_only=true never writes parity) */
+    for (unsigned p = 0; p < k; p++)
         if (!present[p]) {
-            shards[p] = rr_slot(r, p);
+            shards[p] = rr_slot(r, p, need);
             if (!shards[p])
                 return TSDB_ERR_NOMEM;
         }
-    iso_rs *rs = chunk_rs_get(k, m);
-    if (!rs)
-        return TSDB_ERR_NOMEM;
-    if (iso_rs_decode_data(rs, shards, present, w) != ISO_OK)
-        return TSDB_ERR_CORRUPT;
+    if (!r->rs) {
+        r->rs = chunk_rs_get(k, m);
+        if (!r->rs)
+            return TSDB_ERR_NOMEM;
+    }
+    if (!r->plan || r->plan_mask != pmask) {
+        iso_rs_plan_free(r->plan);
+        r->plan = iso_rs_plan_new(r->rs, present, true);
+        if (!r->plan)
+            return TSDB_ERR_NOMEM;
+        r->plan_mask = pmask;
+    }
+    iso_rs_plan_apply(r->plan, shards, w);
     for (unsigned i = 0; i < k; i++) {
         if (!bad[i])
             continue;
@@ -359,10 +471,20 @@ static void cr_pos_run(cr_pos_task *t)
 {
     const chunk_geom *g = t->g;
     unsigned k = g->k, pos = t->pos;
+    cr_tls_pool *tls = NULL;
     uint8_t *slot = NULL;
+    bool slot_owned = false;
     if (!t->raw) {
-        slot = malloc(t->cap ? t->cap : 1);
+        size_t need = t->cap ? t->cap : 1;
+        tls = cr_tls_acquire();
+        slot = cr_tls_slot(tls, 0, need);
         if (!slot) {
+            slot = malloc(need);
+            slot_owned = true;
+        }
+        if (!slot) {
+            if (tls)
+                tls->in_use = false;
             t->failed = true;
             return;
         }
@@ -371,7 +493,10 @@ static void cr_pos_run(cr_pos_task *t)
     if (!t->raw && !t->rec) {
         sums = chunk_obj_pos_sums(t->o, pos);
         if (!sums) {
-            free(slot);
+            if (slot_owned)
+                free(slot);
+            if (tls)
+                tls->in_use = false;
             t->failed = true;
             return;
         }
@@ -400,7 +525,10 @@ static void cr_pos_run(cr_pos_task *t)
             }
         }
     }
-    free(slot);
+    if (slot_owned)
+        free(slot);
+    if (tls)
+        tls->in_use = false;
     t->failed = failed;
 }
 
@@ -532,6 +660,7 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
     r.rep = rep;
     r.raw = raw;
     r.cap = g->cell < g->len ? g->cell : (size_t)g->len;
+    r.tls = cr_tls_acquire();
     for (unsigned p = 0; p < chunk_npos(g); p++)
         r.base[p] = chunk_sums_base(g, p);
     int rc = 0;
@@ -552,7 +681,7 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
             if (r.raw) {
                 st = src->read(src->ctx, i, s * g->cell + xs[i], dst, (size_t)(ys[i] - xs[i]));
             } else {
-                uint8_t *slot = rr_slot(&r, i);
+                uint8_t *slot = rr_slot(&r, i, r.cap);
                 st = slot ? fetch_checked(&r, i, s, (size_t)cl, slot) : CHUNK_ST_IOERR;
                 if (st == 0) {
                     copy_out(slot, xs[i], ys[i], dst);
@@ -568,8 +697,14 @@ int chunk_read_range(const chunk_source *src, const chunk_geom *g, const uint64_
         if (any)
             rc = degrade(&r, s, off, bad, have, xs, ys, buf);
     }
+#ifdef TSDB_EC
+    iso_rs_plan_free(r.plan);
+#endif
     for (unsigned p = 0; p < CHUNK_POS_MAX; p++)
-        free(r.slot[p]);
+        if (r.owned[p])
+            free(r.slot[p]);
+    if (r.tls)
+        r.tls->in_use = false;
     return rc;
 }
 

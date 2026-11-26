@@ -448,13 +448,20 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
 static void cvol_close(uint32_t v);
 
 /* slowack (tests): the ACK reports the highest durable end an ACK of SLOW_ACK_MS ago had, never more than it has now
- * (a lower durable end is always true) */
+ * (a lower durable end is always true). Coalesces multiple ACKs within the same millisecond so high write rates
+ * (> SLOW_ACK_RING / SLOW_ACK_MS = 5120 ACKs/s) do not wrap the ring before SLOW_ACK_MS elapses. */
 static void slow_ack(struct rvol *rv, struct repl_msg *m)
 {
     uint64_t now = now_ms(), lag = rv->sa_last;
-    rv->sa_ms[rv->sa_n % SLOW_ACK_RING] = now;
-    rv->sa_dur[rv->sa_n++ % SLOW_ACK_RING] = m->durable;
-    for (unsigned i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
+    if (rv->sa_n > 0 && rv->sa_ms[(rv->sa_n - 1) % SLOW_ACK_RING] == now) {
+        uint64_t idx = (rv->sa_n - 1) % SLOW_ACK_RING;
+        if (m->durable > rv->sa_dur[idx])
+            rv->sa_dur[idx] = m->durable;
+    } else {
+        rv->sa_ms[rv->sa_n % SLOW_ACK_RING] = now;
+        rv->sa_dur[rv->sa_n++ % SLOW_ACK_RING] = m->durable;
+    }
+    for (uint64_t i = 0; i < SLOW_ACK_RING && i < rv->sa_n; i++)
         if (rv->sa_ms[i] + SLOW_ACK_MS <= now && rv->sa_dur[i] > lag)
             lag = rv->sa_dur[i];
     rv->sa_last = lag;
@@ -872,6 +879,7 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
         if (nsent < nt) {
             uint64_t now = now_ms();
             pthread_mutex_lock(&rv->mu);
+            int rolled = 0;
             if (!rv->stop && rv->core && rv->rec.set_version == snap_rec_setv &&
                 repl_epoch(rv->core) == snap_epoch && rv->self == snap_self) {
                 for (int t = 0; t < nt; t++) {
@@ -881,9 +889,12 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
                     if (p->sent == last) {
                         p->sent = first - 1;
                         ahead_mark(p, now);
+                        rolled = 1;
                     }
                 }
             }
+            if (rolled)
+                pthread_cond_signal(&rv->cv);
             pthread_mutex_unlock(&rv->mu);
         }
     }
@@ -1753,21 +1764,25 @@ int save_repl(struct rvol *rv, uint64_t fence, uint64_t led, uint64_t floor)
 /* The log's start moved (segments in parts went): the core and the index hear it. */
 static void log_start_check(struct rvol *rv)
 {
-    struct repl_epoch h[REPLFILE_MAX_HIST];
-    uint32_t nh;
-    uint64_t first;
+    uint64_t first = 0;
     pthread_mutex_unlock(&rv->mu);
-    int rc = scan_segments(rv, h, &nh, &first);
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    int rc = db ? replica_log_start(db, &first) : -1;
+    if (rc != 0) {
+        struct repl_epoch h[REPLFILE_MAX_HIST];
+        uint32_t nh = 0;
+        rc = scan_segments(rv, h, &nh, &first);
+    }
+    uint64_t rstart = db ? replica_replay_start(db) : 0;
+    tsdb_cvol_unref(&db);
     pthread_mutex_lock(&rv->mu);
     if (rc == 0 && first > rv->log_start) {
         rv->log_start = first;
         repl_log_start(rv->core, first);
         idx_trim(rv, first);
     }
-    struct eng *db = tsdb_cvol_ref(G.t, rv->number); /* the replay start the ACK carries (D17; r4-replay makes it real) */
-    if (db && rv->core)
-        repl_replay_start(rv->core, replica_replay_start(db));
-    tsdb_cvol_unref(&db);
+    if (rstart && rv->core)
+        repl_replay_start(rv->core, rstart);
 }
 
 static int isr_short_locked(const struct rvol *rv);
@@ -2612,10 +2627,62 @@ static void long_step(struct rvol *rv, uint64_t t0, uint64_t *next_tick)
     }
 }
 
+/* Max idle sleep of vol_main (ms): strictly below STALL_MS (250 ms) so repld_unreachable() never mistakes a sleeping
+ * idle follower for a stalled thread, and above IDLE_HEARTBEAT_MS (100 ms) so an idle leader wakes on its real
+ * heartbeat deadline and idle followers wake on incoming heartbeats rather than polling every TICK_MS (5 ms). */
+#define IDLE_MAX_MS 150
+
+static uint32_t vol_clamp_tick_deadline(uint32_t dt, uint64_t next_tick, uint64_t deadline)
+{
+    if (deadline <= next_tick)
+        return 1;
+    uint64_t ticks = (deadline - next_tick) / TICK_MS + 1;
+    return ticks < dt ? (uint32_t)ticks : dt;
+}
+
+/* Computes how many ticks (>= 1) vol_main may sleep past next_tick before the next real core or driver deadline, and
+ * the wall-clock wakeup target *wait_until_out (monotonic ms). rv->mu held. */
+static uint32_t vol_idle_deadline(struct rvol *rv, uint64_t now, uint64_t next_tick, uint64_t *wait_until_out)
+{
+    (void)now;
+    uint32_t max_dt = IDLE_MAX_MS / TICK_MS;
+    if (max_dt < 1)
+        max_dt = 1;
+    if (!rv->core || rv->mode == M_PROMOTING || rv->snap || rtr_draining(rv) || rset_pending(rv) || rv->sync_late ||
+        (rv->sync_paused && G.sync_hold) || G.plant_diverge || G.snap_ask || G.late_tick || G.slow_tick ||
+        G.mutant == RM_TICKSTRETCH || G.mutant == RM_STALLCATCHUP) {
+        *wait_until_out = next_tick;
+        return 1;
+    }
+    if (rv->mode == M_WRITER) {
+        for (uint32_t i = 0; i < rv->rec.nrep && i < REPL_MAX_NODES; i++)
+            if ((int)i != rv->self && rv->peer[i].sent < rv->peer[i].want) {
+                *wait_until_out = next_tick;
+                return 1;
+            }
+    }
+    uint32_t dt = repl_next_tick(rv->core);
+    if (dt < 1)
+        dt = 1;
+    if (dt > max_dt)
+        dt = max_dt;
+    if (rv->sync_paused && G.sync_pause)
+        dt = vol_clamp_tick_deadline(dt, next_tick, rv->sync_pause_end);
+    if (rv->mode == M_WRITER && !rv->cstall_said && repl_written(rv->core) > repl_commit(rv->core))
+        dt = vol_clamp_tick_deadline(dt, next_tick, rv->cstall_ms + COMMIT_STALL_MS);
+    if (G.trace)
+        dt = vol_clamp_tick_deadline(dt, next_tick, rv->trace_ms + 2000);
+    uint64_t wait_until = next_tick + (uint64_t)(dt - 1) * TICK_MS;
+    if (rv->sync_wanted && rv->fetch_wait_until && rv->fetch_wait_until < wait_until)
+        wait_until = rv->fetch_wait_until;
+    *wait_until_out = wait_until;
+    return dt;
+}
+
 static void *vol_main(void *arg)
 {
     struct rvol *rv = arg;
-    uint64_t next_tick = now_ms() + TICK_MS, slice = 0;
+    uint64_t next_tick = now_ms() + TICK_MS, slice = 0, last_tick_ms = now_ms();
     pthread_mutex_lock(&rv->mu);
     while (!rv->stop) {
         drain(rv);
@@ -2698,6 +2765,7 @@ static void *vol_main(void *arg)
             }
             if (G.snap_ask)
                 rsnap_rebuild(rv); /* TSDB_REPLD_TEST=snapask */
+            last_tick_ms = now;
             repl_tick(rv->core);
             commit_watch(rv, now);
             next_tick += TICK_MS;
@@ -2751,16 +2819,35 @@ static void *vol_main(void *arg)
             slice = now_ms() + TICK_MS;
             continue;
         }
-        tsdb_cond_timedwait_ms(&rv->cv, &rv->mu, (int64_t)(next_tick - now));
+        uint64_t wait_until = next_tick;
+        uint32_t dt = vol_idle_deadline(rv, now, next_tick, &wait_until);
+        uint64_t snap_written = rv->core ? repl_written(rv->core) : 0;
+        int64_t sleep_ms = wait_until > now ? (int64_t)(wait_until - now) : 0;
+        if (sleep_ms > 0)
+            tsdb_cond_timedwait_ms(&rv->cv, &rv->mu, sleep_ms);
         /* A wait that returns STALL_MS past its deadline was a stop of the whole process (the pause scenario stops a
          * leader and a replica together for 1.5 s): the time is not caught up in ticks, which would count every peer
          * silent for TICK_BACKLOG_MS and ask for an ISR of one, and repld_unreachable counts its peers as heard at
          * the resume, or this member names the leader it was stopped together with and a cut deposes it (test_cluster
          * jointpause, mutant stallcatchup). A busy step is not a stall: tickwall's slow reads are caught up. */
         uint64_t woke = now_ms();
-        if (woke > next_tick + STALL_MS && G.mutant != RM_STALLCATCHUP) {
+        if (woke > wait_until + STALL_MS && G.mutant != RM_STALLCATCHUP) {
             next_tick = woke;
             rv->resumed_ms = woke;
+        } else if (rv->core && dt > 1 && woke >= next_tick) {
+            uint64_t due = (woke - next_tick) / TICK_MS + 1;
+            uint64_t skip = due < (uint64_t)(dt - 1) ? due : (uint64_t)(dt - 1);
+            /* Ensure periodic housekeeping in the tick branch (e.g. DIVERGED polling) still runs at least every
+             * 200 ms on an idle follower woken continuously by 100 ms leader heartbeats, with zero extra wakeups.
+             * Also if op_admit()/op_synced() updated the core mid-sleep, leave the current tick unskipped so
+             * repl_tick() runs immediately at `woke` without violating repl_advance_idle()'s contract. */
+            if ((woke >= last_tick_ms + 200 || repl_written(rv->core) != snap_written ||
+                 repl_next_tick(rv->core) == 1) && skip == due && skip > 0)
+                skip--;
+            if (skip > 0) {
+                repl_advance_idle(rv->core, (uint32_t)skip, snap_written);
+                next_tick += skip * TICK_MS;
+            }
         }
     }
     pthread_mutex_unlock(&rv->mu);
@@ -3010,8 +3097,14 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
     struct repl_epoch h[REPLFILE_MAX_HIST];
     uint32_t nh = 0;
     uint64_t first = 0;
-    scan_segments(rv, h, &nh, &first);
     struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    uint64_t eps[REPLFILE_MAX_HIST], sts[REPLFILE_MAX_HIST];
+    if (db && replica_log_epochs(db, eps, sts, REPLFILE_MAX_HIST, &nh, &first) == 0) {
+        for (uint32_t i = 0; i < nh; i++)
+            h[i] = (struct repl_epoch){.epoch = eps[i], .start = sts[i]};
+    } else {
+        scan_segments(rv, h, &nh, &first);
+    }
     uint64_t log_end = db ? replica_log_end(db) : 0;
     *log_end_out = log_end;
     /* the durable end the core starts from: below a COMMIT marker whose files are not staged (replica.c's hold), not

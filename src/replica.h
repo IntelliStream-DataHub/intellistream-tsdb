@@ -98,6 +98,13 @@ extern void (*leader_test_marker_hook)(struct eng *db, uint64_t fno); /* test ho
                                                                          * synced, before leader_commit goes on */
 int replica_read(struct eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap, uint64_t *seq, uint64_t *off,
                  uint64_t *last);
+/* First position currently retained in db's WAL segments (0 if none), from the in-memory segment index without
+ * directory scans. Returns 0 on success, -1 if the index is unavailable (caller should fall back to scanning disk). */
+int replica_log_start(struct eng *db, uint64_t *first);
+/* Epoch history (epoch, first fno) and first retained position from db's in-memory WAL segment index (0 syscalls).
+ * Writes at most max_h entries to epochs[]/starts[]. Returns 0 on success, -1 if fallback to disk scan is needed. */
+int replica_log_epochs(struct eng *db, uint64_t *epochs, uint64_t *starts, uint32_t max_h, uint32_t *nh,
+                       uint64_t *first);
 
 /* Promotion (design-cluster.md 6.2): the new leader appends its EPOCH marker (epoch >= 1: the segment epoch << 40, above
  * every segment of the log; its position is *pos) after the log it holds, tail included; the driver ships the log and

@@ -2643,13 +2643,8 @@ struct segrd {
     uint8_t *out;
 };
 
-static int seg_scan(eng *db, struct segrd *r)
+static int seg_scan_fd(int fd, struct segrd *r)
 {
-    char name[64];
-    wal_name(name, sizeof name, r->seq);
-    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
     size_t flen = r->flen, pos0 = r->pos0, cap = r->cap;
     uint64_t from = r->from;
     size_t win = MAX(cap, replica_read_win_min);
@@ -2721,6 +2716,17 @@ static int seg_scan(eng *db, struct segrd *r)
         pos0 += pos;
     }
     free(fb);
+    return rc;
+}
+
+static int seg_scan(eng *db, struct segrd *r)
+{
+    char name[64];
+    wal_name(name, sizeof name, r->seq);
+    int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    int rc = seg_scan_fd(fd, r);
     close(fd);
     return rc;
 }
@@ -2765,6 +2771,83 @@ static int leader_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_
     if (from == 0 || from > next)
         return TSDB_ERR_INVALID;
     *last = from - 1, *seq = cur, *off = 0;
+    /* Fast path: O(log S) lookup in db->wsegs + single openat/seg_scan_fd instead of linear reverse probing.
+     * Bypassed for MUT_LEADER_READ_NO_GAP (so the mutant still exercises the fallback gap check) or if wsegs
+     * hit an OOM while growing. */
+    if (eng_test_mutant != MUT_LEADER_READ_NO_GAP) {
+        wseg ws = {0};
+        bool found = false, is_last = false, dirty = false;
+        pthread_mutex_lock(&db->wsegs_mu);
+        dirty = db->wsegs_dirty;
+        if (!dirty && db->nwsegs > 0 && db->wsegs[0].first <= from) {
+            size_t lo = 0, hi = db->nwsegs;
+            while (hi - lo > 1) {
+                size_t mid = lo + (hi - lo) / 2;
+                if (db->wsegs[mid].first <= from)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            ws = db->wsegs[lo];
+            found = true;
+            is_last = (lo + 1 == db->nwsegs);
+        }
+        pthread_mutex_unlock(&db->wsegs_mu);
+        if (!dirty) {
+            if (!found)
+                return TSDB_ERR_NOTFOUND;
+            bool newest = ws.seq + 1 >= cur;
+            if (newest && is_last && ws.last && from > ws.last)
+                return 0; /* not written yet */
+            char name[64];
+            wal_name(name, sizeof name, ws.seq);
+            int fd = openat(db->dirfd, name, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                if (errno == ENOENT) {
+                    wsegs_remove(db, ws.seq);
+                    if (ws.seq == cur) {
+                        pthread_mutex_lock(&db->wsegs_mu);
+                        db->wsegs_dirty = true;
+                        pthread_mutex_unlock(&db->wsegs_mu);
+                    }
+                    return TSDB_ERR_NOTFOUND;
+                }
+                return TSDB_ERR_IO;
+            }
+            struct stat st;
+            if (fstat(fd, &st) != 0) {
+                close(fd);
+                return TSDB_ERR_IO;
+            }
+            if (!newest && st.st_size != 0 && (size_t)st.st_size < WAL_HDR) {
+                close(fd);
+                return TSDB_ERR_CORRUPT;
+            }
+            pthread_mutex_lock(&db->lead_mu);
+            bool behind = db->lrd_next <= from || eng_test_mutant == MUT_LEADER_READ_CURSOR_ANY;
+            size_t pos0 = db->lrd_seq == ws.seq && db->lrd_next && behind && db->lrd_off <= (uint64_t)st.st_size
+                              ? (size_t)db->lrd_off
+                              : 0;
+            pthread_mutex_unlock(&db->lead_mu);
+            struct segrd r = {.seq = ws.seq, .flen = (size_t)st.st_size, .pos0 = pos0, .from = from, .cap = cap,
+                              .tail_ok = newest || eng_test_mutant == MUT_LEADER_READ_TAILOK_SEALED};
+            int rc = seg_scan_fd(fd, &r);
+            close(fd);
+            if (rc == 0 && !r.found && !newest && eng_test_mutant != MUT_LEADER_READ_NOTFOUND_SEALED)
+                rc = TSDB_ERR_INVALID;
+            if (rc) {
+                free(r.out);
+                return rc;
+            }
+            if (!r.found)
+                return 0; /* not written yet */
+            *buf = r.out, *len = r.outlen, *seq = ws.seq, *off = r.start, *last = r.last;
+            pthread_mutex_lock(&db->lead_mu);
+            db->lrd_seq = ws.seq, db->lrd_off = r.next_off, db->lrd_next = r.last + 1;
+            pthread_mutex_unlock(&db->lead_mu);
+            return 0;
+        }
+    }
     for (uint64_t sq = cur; sq > 0; sq--) {
         char name[64];
         wal_name(name, sizeof name, sq);
@@ -2852,12 +2935,25 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
     rseg s;
     bool ok = false;
     pthread_mutex_lock(&rp->segs_mu);
-    for (size_t i = rp->nsegs; i-- > 0;)
-        if (rp->segs[i].first && rp->segs[i].first <= from) {
-            s = rp->segs[i];
-            ok = true;
-            break;
+    {
+        /* Binary search rp->segs[] (ascending seq, strictly ascending non-zero first; empty segments have first == 0). */
+        size_t lo = 0, hi = rp->nsegs;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            size_t k = mid;
+            while (k > lo && rp->segs[k].first == 0)
+                k--;
+            if (rp->segs[k].first == 0) {
+                lo = mid + 1;
+            } else if (rp->segs[k].first <= from) {
+                s = rp->segs[k];
+                ok = true;
+                lo = mid + 1;
+            } else {
+                hi = k;
+            }
         }
+    }
     pthread_mutex_unlock(&rp->segs_mu);
     if (!ok) {
         pthread_mutex_unlock(&rp->mu);
@@ -2882,6 +2978,81 @@ int replica_read(eng *db, uint64_t from, uint8_t **buf, size_t *len, size_t cap,
     }
     pthread_mutex_unlock(&rp->mu);
     return rc;
+}
+
+int replica_log_start(eng *db, uint64_t *first)
+{
+    *first = 0;
+    if (!db)
+        return -1;
+    if (db->rp) {
+        struct replica *rp = db->rp;
+        pthread_mutex_lock(&rp->segs_mu);
+        for (size_t i = 0; i < rp->nsegs; i++) {
+            if (rp->segs[i].first) {
+                *first = rp->segs[i].first;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&rp->segs_mu);
+        return 0;
+    }
+    if (!db->wal_enabled || db->opt.read_only)
+        return -1;
+    pthread_mutex_lock(&db->wsegs_mu);
+    bool dirty = db->wsegs_dirty;
+    if (!dirty && db->nwsegs > 0)
+        *first = db->wsegs[0].first;
+    pthread_mutex_unlock(&db->wsegs_mu);
+    return dirty ? -1 : 0;
+}
+
+int replica_log_epochs(eng *db, uint64_t *epochs, uint64_t *starts, uint32_t max_h, uint32_t *nh, uint64_t *first)
+{
+    *nh = 0;
+    *first = 0;
+    if (!db)
+        return -1;
+    if (db->rp) {
+        struct replica *rp = db->rp;
+        pthread_mutex_lock(&rp->segs_mu);
+        for (size_t i = 0; i < rp->nsegs; i++) {
+            uint64_t fno = rp->segs[i].first;
+            if (!fno)
+                continue;
+            if (!*first)
+                *first = fno;
+            uint64_t ep = rp->segs[i].seq >> 40;
+            if (ep && (*nh == 0 || epochs[*nh - 1] < ep) && *nh < max_h) {
+                epochs[*nh] = ep;
+                starts[*nh] = fno;
+                (*nh)++;
+            }
+        }
+        pthread_mutex_unlock(&rp->segs_mu);
+        return 0;
+    }
+    if (!db->wal_enabled || db->opt.read_only)
+        return -1;
+    pthread_mutex_lock(&db->wsegs_mu);
+    bool dirty = db->wsegs_dirty;
+    if (!dirty) {
+        for (size_t i = 0; i < db->nwsegs; i++) {
+            uint64_t fno = db->wsegs[i].first;
+            if (!fno)
+                continue;
+            if (!*first)
+                *first = fno;
+            uint64_t ep = db->wsegs[i].seq >> 40;
+            if (ep && (*nh == 0 || epochs[*nh - 1] < ep) && *nh < max_h) {
+                epochs[*nh] = ep;
+                starts[*nh] = fno;
+                (*nh)++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&db->wsegs_mu);
+    return dirty ? -1 : 0;
 }
 
 /* -------------------------------------------------------------------- promotion (design-cluster.md 6.2 steps 3-4) */

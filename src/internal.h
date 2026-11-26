@@ -1843,6 +1843,15 @@ typedef struct wal_seg {
     size_t len; /* and the segment's size */
     char name[256];
 } wal_seg;
+/* In-memory index of non-empty WAL segments on a writer (ascending seq, strictly ascending first > 0), updated on
+ * wal_open, wal_write_sync, and segment retirement/unlink; guarded by eng.wsegs_mu (a leaf lock). */
+typedef struct wseg {
+    uint64_t seq;
+    uint64_t first;
+    uint64_t last;
+} wseg;
+void wsegs_add(struct eng *db, uint64_t seq, uint64_t first, uint64_t last);
+void wsegs_remove(struct eng *db, uint64_t seq);
 struct memtable;
 void wal_name(char *buf, size_t len, uint64_t seq);
 int wal_open_segment(struct eng *db, uint64_t seq, int *fd);
@@ -2132,6 +2141,7 @@ struct eng {
     bool ec_req;
     bool tier_req;
     bool ec_cluster;
+    int8_t meta_tier_cache; /* load_parts batch cache for meta_says_tier(): 0=off, 1=active/unread, 2=no, 3=yes */
     struct ppos *ppos;
     struct eccold *cold;
     struct ecdiverge *diverge;
@@ -2242,6 +2252,10 @@ struct eng {
     /* the last record whose write and sync succeeded, in any segment (the WAL writer role; read once the engine is
      * halted): revalidation after an outage finds it again, byte for byte, before it trusts the log (ha.md 15.5) */
     uint64_t wal_last_seq, wal_last_off, wal_last_len, wal_last_hash;
+    pthread_mutex_t wsegs_mu; /* leaf: guards wsegs/nwsegs/capwsegs/wsegs_dirty */
+    wseg *wsegs;
+    size_t nwsegs, capwsegs;
+    bool wsegs_dirty; /* true if an allocation failed while updating wsegs: fall back to disk scan */
     uint8_t *wal_spare;
     size_t wal_spare_cap;
     /* FNO (fno.c): the file, the slot the newest store is in, its generation and the value it holds */

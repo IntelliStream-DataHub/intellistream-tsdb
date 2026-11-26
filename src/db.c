@@ -839,6 +839,7 @@ static int load_parts(eng *db, bool read_only)
     rewinddir(d); /* the dup shares its offset with dirfd, which an earlier scan moved */
     struct dirent *e;
     int rc = 0;
+    db->meta_tier_cache = 1; /* cache meta_says_tier() across all .ec parts opened in this scan */
     /* errno is cleared before every readdir: NULL with errno set is a read error, never the end (a hung or failing
      * NFS server must not look like a directory with fewer parts) */
     for (errno = 0; (e = readdir(d)) != NULL; errno = 0) {
@@ -916,6 +917,7 @@ static int load_parts(eng *db, bool read_only)
          * covers (below) is removed again by an event */
         stats_ev_add(db, p);
     }
+    db->meta_tier_cache = 0;
     if (rc == 0 && errno != 0) {
         fprintf(stderr, "tsdb: reading the directory failed: %s: the open fails\n", strerror(errno));
         rc = TSDB_ERR_IO;
@@ -1087,6 +1089,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_cond_init(&db->jr_serial.cv, NULL);
     pthread_mutex_init(&db->lead_mu, NULL);
     pthread_mutex_init(&db->lrq_mu, NULL);
+    pthread_mutex_init(&db->wsegs_mu, NULL);
     pthread_cond_init(&db->lead_cv, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
@@ -1488,6 +1491,8 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->lead_mu);
     pthread_mutex_destroy(&db->lrq_mu);
     free(db->lrq);
+    pthread_mutex_destroy(&db->wsegs_mu);
+    free(db->wsegs);
     pthread_cond_destroy(&db->lead_cv);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
