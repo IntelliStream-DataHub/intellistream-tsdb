@@ -422,6 +422,8 @@ refused "trailing comma --peer-rdma-sl" '--peer-rdma-sl' "$B/tsdbd" --no-config 
 refused "empty --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "" --check-config
 refused "trailing comma --peer-rdma-device" '--peer-rdma-device' "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-device "mlx5_0," --check-config
 "$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-retry-s 5000000 --check-config > /dev/null 2>&1 || fail "--peer-rdma-retry-s 5000000 refused"
+out=$("$B/tsdbd" --no-config --dir "$dir/db" --cluster --cluster-secret-file "$dir/pa.secret" --state-dir "$dir/pa-st" --peer-rdma-cm --check-config 2>&1) || fail "--peer-rdma-cm refused: $out"
+check "--peer-rdma-cm effective value" "$(echo "$out" | grep '^cluster.peer.rdma.cm = ')" "cluster.peer.rdma.cm = true"
 
 if [ $errors = 0 ]; then echo "test_config: ok"; else echo "test_config: $errors failure(s)"; fi
 exit $((errors > 0))

@@ -133,6 +133,9 @@ static const struct cfg_key tsdbd_keys[] = {
          "the live link (0 disables re-offers)."),
     CK_I("cluster.peer.rdma.poll_us", "peer-rdma-poll-us", "0",
          "Microseconds to busy-poll an RDMA completion queue before sleeping on completion events (0 to 10000)."),
+    CK_B("cluster.peer.rdma.cm", "peer-rdma-cm", "false",
+         "Use rdma_cm (Option C, dynamically loading librdmacm) to establish RDMA connections instead of exchanging QP "
+         "numbers over TCP; required for iWARP and optional on InfiniBand/RoCE."),
     CK_B("cluster.peer.allow_ipoib", "peer-allow-ipoib", "false",
          "true lets the TCP peer address bind or dial through an IPoIB interface (ARPHRD_INFINIBAND); off by default "
          "so no TCP runs over IPoIB."),

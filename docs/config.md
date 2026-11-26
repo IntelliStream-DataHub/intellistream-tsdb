@@ -164,6 +164,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `cluster.peer.rdma.sl` | `--peer-rdma-sl` | list | 0 | InfiniBand service level (0 to 15) of RDMA queue pairs: one number for every kind, or KIND=SL entries (log=1,bulk=2,snap=2). |
 | `cluster.peer.rdma.retry_s` | `--peer-rdma-retry-s` | duration (plain: s) | 600s | How long a data link that settled on TCP after a transient RDMA failure waits before offering RDMA again on the live link (0 disables re-offers). |
 | `cluster.peer.rdma.poll_us` | `--peer-rdma-poll-us` | integer | 0 | Microseconds to busy-poll an RDMA completion queue before sleeping on completion events (0 to 10000). |
+| `cluster.peer.rdma.cm` | `--peer-rdma-cm` | boolean | false | Use rdma_cm (Option C, dynamically loading librdmacm) to establish RDMA connections instead of exchanging QP numbers over TCP; required for iWARP and optional on InfiniBand/RoCE. |
 | `cluster.peer.allow_ipoib` | `--peer-allow-ipoib` | boolean | false | true lets the TCP peer address bind or dial through an IPoIB interface (ARPHRD_INFINIBAND); off by default so no TCP runs over IPoIB. |
 | `cluster.forward` | `--forward` | on,off | on | Whether a request for a volume another member leads is forwarded there (on) or answered MOVED to it (off). |
 | `cluster.fwd.wait` | `--fwd-wait-ms` | duration (plain: ms) | 2s | How long a request for a volume another member leads may wait to be sent there (forwarded) before it is answered UNAVAILABLE (definite: nothing reached the leader). |

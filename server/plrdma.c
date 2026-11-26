@@ -92,6 +92,8 @@ struct plr_conn {
 #endif
     unsigned marks;
     struct pl_transport *anchor;
+    const struct plr_cm_ops *cm_ops; /* non-NULL when QP was set up via rdma_cm (Option C) */
+    struct plr_cm_id *cm_id;
     uint32_t poll_us; /* busy-poll CQ before sleeping (cluster.peer.rdma.poll_us) */
     uint64_t ahead, done_unrep; /* PLR_MUT_WRITTENCQE */
     struct plr_conn_stats st;
@@ -116,6 +118,22 @@ static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t get32(const uint8_t *p)
 {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint64_t get64(const uint8_t *p) { return (uint64_t)get32(p) | ((uint64_t)get32(p + 4) << 32); }
+
+static int ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    volatile uint8_t d = 0;
+    for (size_t i = 0; i < n; i++)
+        d = (uint8_t)(d | (a[i] ^ b[i]));
+    return d == 0;
+}
+
+static void wipe_bytes(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+    for (size_t i = 0; i < n; i++)
+        v[i] = 0;
 }
 
 /* ------------------------------------------------------------------------------------------------- the pool */
@@ -396,6 +414,7 @@ void plr_ep_encode(const struct plr_ep *e, uint8_t out[PLR_EP_LEN])
     put32(out + 30, e->slot);
     put16(out + 34, e->data);
     put16(out + 36, e->ctl);
+    out[38] = e->flags;
 }
 
 int plr_ep_decode(struct plr_ep *e, const uint8_t *in, size_t n)
@@ -412,10 +431,54 @@ int plr_ep_decode(struct plr_ep *e, const uint8_t *in, size_t n)
     e->slot = get32(in + 30);
     e->data = get16(in + 34);
     e->ctl = get16(in + 36);
+    e->flags = in[38];
     if (e->mtu < 1 || e->mtu > 5 || (e->link_layer != PLR_LL_IB && e->link_layer != PLR_LL_ETH) ||
         e->qpn >= 1u << 24 || e->psn >= 1u << 24 || e->slot < 1024 || e->slot > (1u << 24) || !e->data ||
-        e->ctl < PLR_CTL_MIN || e->ctl > PLR_CTL_MAX || (uint32_t)e->data + e->ctl > 65535)
+        e->ctl < PLR_CTL_MIN || e->ctl > PLR_CTL_MAX || (uint32_t)e->data + e->ctl > 65535 ||
+        (e->flags & ~PLR_EP_F_CM) != 0)
         goto bad;
+    return 0;
+bad:
+    errno = EPROTO;
+    return -1;
+}
+
+void plr_pool_ep(const struct plr_pool *p, uint8_t flags, struct plr_ep *o)
+{
+    memset(o, 0, sizeof *o);
+    o->lid = p->port.lid;
+    memcpy(o->gid, p->port.gid, 16);
+    o->mtu = p->port.mtu;
+    o->link_layer = p->port.link_layer;
+    o->port = p->port.port;
+    o->slot = p->cfg.slot;
+    o->data = p->cfg.data_slots;
+    o->ctl = p->cfg.ctl_slots;
+    o->flags = flags;
+}
+
+void plr_cm_addr_encode(const struct plr_cm_addr *a, uint8_t out[PLR_CM_ADDR_LEN])
+{
+    memset(out, 0, PLR_CM_ADDR_LEN);
+    out[0] = a->af;
+    put16(out + 2, a->port);
+    memcpy(out + 4, a->ip, a->af == 4 ? 4 : 16);
+}
+
+int plr_cm_addr_decode(struct plr_cm_addr *a, const uint8_t *in, size_t n)
+{
+    if (n < PLR_CM_ADDR_LEN)
+        goto bad;
+    a->af = in[0];
+    a->port = get16(in + 2);
+    memcpy(a->ip, in + 4, 16);
+    if ((a->af != 4 && a->af != 6) || !a->port)
+        goto bad;
+    if (a->af == 4) {
+        for (int i = 4; i < 16; i++)
+            if (a->ip[i] != 0)
+                goto bad;
+    }
     return 0;
 bad:
     errno = EPROTO;
@@ -761,11 +824,14 @@ static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int 
         maybe_credit(c);
     }
     pf[0] = (struct pollfd){c->ops->fd(c->qp), POLLIN, 0};
+    int k = 1;
+    if (c->cm_id)
+        pf[k++] = (struct pollfd){c->cm_ops->fd(c->cm_id), POLLIN, 0};
     c->ak = 0;
     if (c->anchor) {
         int ar = 0;
-        c->ak = c->anchor->ops->poll_fds(c->anchor, PL_TR_IN, pf + 1, &ar);
-        if (c->ak < 0 || c->ak > PL_TR_POLL_MAX - 1) {
+        c->ak = c->anchor->ops->poll_fds(c->anchor, PL_TR_IN, pf + k, &ar);
+        if (c->ak < 0 || c->ak > PL_TR_POLL_MAX - k) {
             fail(c, EPROTO);
             c->ak = 0;
         }
@@ -773,7 +839,21 @@ static int rd_poll_fds(struct pl_transport *t, int want, struct pollfd *pf, int 
             anchor_check(c);
     }
     *ready = ready_mask(c, want);
-    return 1 + c->ak;
+    return k + c->ak;
+}
+
+static void cm_check_settled(struct plr_conn *c)
+{
+    struct plr_cm_ev ev;
+    int r;
+    while ((r = c->cm_ops->next_event(c->cm_id, &ev)) == 1) {
+        if (ev.type == PLR_CM_EV_DISCONNECTED)
+            c->ended = 1;
+        else if (ev.type == PLR_CM_EV_ERR || ev.type == PLR_CM_EV_REJECTED)
+            fail(c, ECONNRESET);
+    }
+    if (r < 0)
+        fail(c, errno);
 }
 
 static int rd_poll_ready(struct pl_transport *t, const struct pollfd *pf, int k)
@@ -785,7 +865,13 @@ static int rd_poll_ready(struct pl_transport *t, const struct pollfd *pf, int k)
         pump(c, 0);
         maybe_credit(c);
     }
-    if (c->anchor && k > 1 && (c->anchor->ops->poll_ready(c->anchor, pf + 1, k - 1) & PL_TR_IN))
+    int off = 1;
+    if (c->cm_id) {
+        if (k > 1 && pf[1].revents && !c->err)
+            cm_check_settled(c);
+        off = 2;
+    }
+    if (c->anchor && k > off && (c->anchor->ops->poll_ready(c->anchor, pf + off, k - off) & PL_TR_IN))
         anchor_check(c);
     return ready_mask(c, c->want);
 }
@@ -797,32 +883,58 @@ static long ms_since(const struct timespec *t0)
     return (t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
-/* the queue pair to the error state and every work request back (flushed or not), then destroyed; 1 if drained */
-static int drain(struct plr_conn *c)
+static int drain_wait(struct plr_conn *c, unsigned want, const struct timespec *t0)
 {
-    if (c->ops->qp_err(c->qp) < 0)
-        return 0;
-    if (c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0 ||
-        c->ops->post_recv(c->qp, WR(WR_MARK, MARK_RECV), NULL, 0, 0) < 0)
-        return 0;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         pump(c, 1);
-        if (c->marks == (MARK_SEND | MARK_RECV) || (plrdma_mutant == PLR_MUT_NORECVMARK && (c->marks & MARK_SEND)))
+        if ((c->marks & want) == want)
             return 1;
-        long left = plrdma_drain_ms - ms_since(&t0);
+        long left = plrdma_drain_ms - ms_since(t0);
         if (left <= 0)
             return 0;
         if (c->ops->arm(c->qp) < 0)
             return 0;
         pump(c, 1);
-        if (c->marks == (MARK_SEND | MARK_RECV))
+        if ((c->marks & want) == want)
             return 1;
         struct pollfd pf = {c->ops->fd(c->qp), POLLIN, 0};
         if (poll(&pf, 1, left < 50 ? (int)left : 50) > 0 && c->ops->take_events(c->qp) < 0)
             return 0;
     }
+}
+
+/* the queue pair to the error state and every work request back (flushed or not), then destroyed; 1 if drained */
+static int drain(struct plr_conn *c)
+{
+    if (c->ops->qp_err(c->qp) < 0)
+        return 0;
+    /* Drain already-completed CQEs first (providers like libirdma only issue a software re-flush when the
+     * userspace ring looks empty), then drain the RQ completely before posting MARK_SEND: on iWARP (irdma),
+     * an immediate post_send(MARK_SEND) on an empty SQ triggers irdma_issue_flush(sq=1, rq=0) which can race
+     * with and suppress the initial modify_qp(ERR) RQ flush. */
+    pump(c, 1);
+    /* A CM QP that never reached ESTABLISHED (e.g. rejected or aborted before RTS, or repost() failed in
+     * plr_conn_new_cm() before c->cm_id was assigned) never posted any send WRs; on iWARP (irdma) an INIT->ERR
+     * QP flushes only RQ markers and never a send marker. */
+    unsigned need_send = (c->cm_ops && !c->started && c->s_n == 0) ? 0 : MARK_SEND;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (plrdma_mutant == PLR_MUT_NORECVMARK && need_send) {
+        if (c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0)
+            return 0;
+        return drain_wait(c, MARK_SEND, &t0);
+    }
+    if (c->ops->post_recv(c->qp, WR(WR_MARK, MARK_RECV), NULL, 0, 0) < 0)
+        return 0;
+    if (!drain_wait(c, MARK_RECV, &t0))
+        return 0;
+    if (need_send) {
+        if (c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0)
+            return 0;
+        if (!drain_wait(c, MARK_SEND, &t0))
+            return 0;
+    }
+    return 1;
 }
 
 static void conn_release(struct plr_conn *c)
@@ -833,9 +945,17 @@ static void conn_release(struct plr_conn *c)
             pool_give(c->pool, c->slots, n, 0); /* the mutant: back before anything the queue pair holds came back */
             c->have_slots = 0;
             c->ops->qp_free(c->qp);
+            if (c->cm_id) {
+                c->cm_ops->destroy(c->cm_id);
+                c->cm_id = NULL;
+            }
         } else {
             int ok = drain(c);
             c->ops->qp_free(c->qp);
+            if (c->cm_id) {
+                c->cm_ops->destroy(c->cm_id);
+                c->cm_id = NULL;
+            }
             if (!ok)
                 fprintf(stderr,
                         "peerlink: rdma: a queue pair did not drain within %d ms: its %u slots stay out of the pool\n",
@@ -844,6 +964,10 @@ static void conn_release(struct plr_conn *c)
                 pool_give(c->pool, c->slots, n, !ok);
             c->have_slots = 0;
         }
+    }
+    if (c->cm_id) {
+        c->cm_ops->destroy(c->cm_id);
+        c->cm_id = NULL;
     }
     if (c->have_slots)
         pool_give(c->pool, c->slots, n, 0);
@@ -1013,6 +1137,364 @@ void plr_conn_free(struct plr_conn *c)
 {
     if (c)
         conn_release(c);
+}
+
+/* ---- Option C: rdma_cm connection setup and authenticated listener */
+
+struct plr_conn *plr_conn_new_cm(struct plr_pool *p, const struct plr_cm_ops *cm_ops, struct plr_cm_id *cm_id,
+                                 const struct plr_ep *peer, uint32_t poll_us, char *err, size_t errlen)
+{
+    if (!p || !cm_ops || !cm_id || !peer) {
+        snprintf(err, errlen, "RDMA CM: invalid arguments");
+        errno = EINVAL;
+        return NULL;
+    }
+    const struct plr_port *pp = &p->port;
+    if (peer->link_layer != pp->link_layer) {
+        snprintf(err, errlen, "RDMA CM: the peer's port is %s, ours %s",
+                 peer->link_layer == PLR_LL_IB ? "InfiniBand" : "Ethernet",
+                 pp->link_layer == PLR_LL_IB ? "InfiniBand" : "Ethernet");
+        errno = EPROTO;
+        return NULL;
+    }
+    struct plr_conn *c = calloc(1, sizeof *c);
+    if (!c) {
+        snprintf(err, errlen, "RDMA CM: out of memory");
+        return NULL;
+    }
+    c->t.ops = &rd_ops;
+    c->pool = p;
+    c->ops = p->ops;
+    c->cm_ops = cm_ops;
+    c->D = p->cfg.data_slots;
+    c->K = p->cfg.ctl_slots;
+    c->R = (uint16_t)(c->D + c->K);
+    c->S = p->cfg.send_slots;
+    c->sig_every = c->S / 4 ? c->S / 4 : 1;
+    c->slots = malloc(sizeof *c->slots * (c->R + c->S));
+    c->rs = calloc(c->R, sizeof *c->rs);
+    c->rq = calloc(c->R, sizeof *c->rq);
+    c->s_len = calloc(c->S, sizeof *c->s_len);
+    if (!c->slots || !c->rs || !c->rq || !c->s_len) {
+        snprintf(err, errlen, "RDMA CM: out of memory");
+        conn_release(c);
+        return NULL;
+    }
+    if (pool_take(p, c->slots, (uint32_t)c->R + c->S) < 0) {
+        struct plr_pool_stats st;
+        plr_pool_stats(p, &st);
+        snprintf(err, errlen, "RDMA CM: the pool has %u free slots, a connection needs %u (cluster.peer.rdma.pool_mb)",
+                 (unsigned)st.free, (unsigned)(c->R + c->S));
+        errno = ENOBUFS;
+        conn_release(c);
+        return NULL;
+    }
+    c->have_slots = 1;
+    c->qp = cm_ops->qp_create(cm_id, p->dev, c->S + 1, c->R + 1, &c->qpn);
+    if (!c->qp) {
+        snprintf(err, errlen, "RDMA CM: creating a queue pair failed: %s", strerror(errno));
+        conn_release(c); /* c->cm_id is still NULL: caller retains cm_id on failure */
+        return NULL;
+    }
+    for (uint32_t i = 0; i < c->R && !c->err; i++)
+        repost(c, i);
+    if (c->err) {
+        snprintf(err, errlen, "RDMA CM: posting the receives failed: %s", strerror(c->err));
+        conn_release(c); /* c->cm_id is still NULL: caller retains cm_id on failure */
+        return NULL;
+    }
+    const struct plr_pool_cfg *pc = &p->cfg;
+    c->cm_id = cm_id; /* ownership transferred on success */
+    c->peer = *peer;
+    c->poll_us = poll_us;
+    c->cr_data = plrdma_mutant == PLR_MUT_CROWN ? pc->data_slots : peer->data;
+    c->cr_ctl = peer->ctl;
+    ST_SET(c, credits, c->cr_data);
+    uint32_t m = peer->slot < pc->slot && plrdma_mutant != PLR_MUT_ROOM ? peer->slot : pc->slot;
+    c->room = m - PLR_HDR;
+    return c;
+}
+
+int plr_conn_cm_connect(struct plr_conn *c, const void *pd, uint8_t pd_len, char *err, size_t errlen)
+{
+    if (!c || !c->cm_id || !c->cm_ops) {
+        snprintf(err, errlen, "RDMA CM: not a CM connection");
+        errno = EINVAL;
+        return -1;
+    }
+    if (c->cm_ops->connect(c->cm_id, pd, pd_len, c->pool->cfg.rnr_retry, c->pool->cfg.retry_cnt) != 0) {
+        snprintf(err, errlen, "RDMA CM: connect failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int plr_conn_cm_accept(struct plr_conn *c, char *err, size_t errlen)
+{
+    if (!c || !c->cm_id || !c->cm_ops) {
+        snprintf(err, errlen, "RDMA CM: not a CM connection");
+        errno = EINVAL;
+        return -1;
+    }
+    if (c->cm_ops->accept(c->cm_id, c->pool->cfg.rnr_retry) != 0) {
+        snprintf(err, errlen, "RDMA CM: accept failed: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+void plr_conn_cm_established(struct plr_conn *c)
+{
+    if (c)
+        c->started = 1;
+}
+
+int plr_conn_cm_fd(const struct plr_conn *c)
+{
+    return (c && c->cm_id && c->cm_ops) ? c->cm_ops->fd(c->cm_id) : -1;
+}
+
+int plr_conn_cm_poll(struct plr_conn *c)
+{
+    if (!c || !c->cm_id || !c->cm_ops)
+        return -1;
+    struct plr_cm_ev ev;
+    int r = c->cm_ops->next_event(c->cm_id, &ev);
+    if (r < 0)
+        return -1;
+    return r == 0 ? PLR_CM_EV_NONE : ev.type;
+}
+
+struct plr_cm_token {
+    struct plr_cm_token *next;
+    uint64_t nonce;
+    uint8_t tag[32];
+    void (*wake_fn)(void *);
+    void *wake_arg;
+    struct plr_cm_id *cm_id;
+    int claimed;
+};
+
+struct plr_cm_listener {
+    const struct plr_cm_ops *ops;
+    struct plr_cm_id *id;
+    struct plr_cm_addr addr;
+    int stop_pipe[2];
+    _Atomic int stop;
+    _Atomic uint64_t rejected;
+    pthread_mutex_t mu;
+    struct plr_cm_token *tokens;
+    pthread_t th;
+};
+
+static void *cm_lis_main(void *arg)
+{
+    struct plr_cm_listener *lis = arg;
+    int lfd = lis->ops->fd(lis->id);
+    while (!__atomic_load_n(&lis->stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd pf[2] = {{lfd, POLLIN, 0}, {lis->stop_pipe[0], POLLIN, 0}};
+        int pr = poll(pf, 2, 50);
+        if (pr <= 0)
+            continue;
+        if (pf[1].revents & POLLIN) {
+            char b[16];
+            while (read(lis->stop_pipe[0], b, sizeof b) > 0)
+                ;
+            if (__atomic_load_n(&lis->stop, __ATOMIC_ACQUIRE))
+                break;
+        }
+        if (!(pf[0].revents & (POLLIN | POLLERR | POLLHUP)))
+            continue;
+        struct plr_cm_ev ev;
+        while (lis->ops->next_event(lis->id, &ev) == 1) {
+            if (ev.type != PLR_CM_EV_CONNECT_REQUEST || !ev.req_id)
+                continue;
+            struct plr_cm_token *match = NULL;
+            pthread_mutex_lock(&lis->mu);
+            if (plrdma_mutant == PLR_MUT_CM_NOAUTH) {
+                /* planted bug: skip private_data verification and accept the first unclaimed pending token */
+                for (struct plr_cm_token *t = lis->tokens; t; t = t->next) {
+                    if (!t->claimed) {
+                        match = t;
+                        break;
+                    }
+                }
+            } else if (ev.pd_len >= PLR_CM_PD_LEN && ev.pd_len <= PLR_CM_PD_MAX && get32(ev.pd) == PLR_CM_PD_MAGIC) {
+                /* IB CM REQ MADs carry a fixed 56-byte private_data field (trailing bytes zero-padded);
+                 * iWARP/RoCE may report the exact PLR_CM_PD_LEN (44 bytes). Reject oversize private_data. */
+                uint64_t nonce = get64(ev.pd + 4);
+                for (struct plr_cm_token *t = lis->tokens; t; t = t->next) {
+                    if (!t->claimed && t->nonce == nonce && ct_eq(t->tag, ev.pd + 12, 32)) {
+                        match = t;
+                        break;
+                    }
+                }
+            }
+            if (match) {
+                match->claimed = 1;
+                match->cm_id = ev.req_id;
+                if (match->wake_fn)
+                    match->wake_fn(match->wake_arg);
+                pthread_mutex_unlock(&lis->mu);
+            } else {
+                pthread_mutex_unlock(&lis->mu);
+                uint64_t rej = __atomic_add_fetch(&lis->rejected, 1, __ATOMIC_RELAXED);
+                if (rej <= 10 || rej % 1000 == 0)
+                    fprintf(stderr,
+                            "peerlink: rdma-cm: rejected unauthorized connection request (private_data len %u, total %" PRIu64 ")\n",
+                            (unsigned)ev.pd_len, rej);
+                lis->ops->reject(ev.req_id);
+            }
+        }
+    }
+    return NULL;
+}
+
+struct plr_cm_listener *plr_cm_listen(const struct plr_cm_ops *ops, const struct plr_cm_addr *bind, char *err,
+                                      size_t errlen)
+{
+    if (!ops) {
+        snprintf(err, errlen, "RDMA CM: no CM ops");
+        errno = ENOSYS;
+        return NULL;
+    }
+    struct plr_cm_listener *lis = calloc(1, sizeof *lis);
+    if (!lis) {
+        snprintf(err, errlen, "RDMA CM: out of memory");
+        return NULL;
+    }
+    lis->ops = ops;
+    lis->stop_pipe[0] = lis->stop_pipe[1] = -1;
+    if (pipe(lis->stop_pipe) != 0) {
+        snprintf(err, errlen, "RDMA CM: pipe failed: %s", strerror(errno));
+        free(lis);
+        return NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        fcntl(lis->stop_pipe[i], F_SETFL, fcntl(lis->stop_pipe[i], F_GETFL) | O_NONBLOCK);
+        fcntl(lis->stop_pipe[i], F_SETFD, FD_CLOEXEC);
+    }
+    lis->id = ops->listen(bind, &lis->addr, err, errlen);
+    if (!lis->id) {
+        close(lis->stop_pipe[0]);
+        close(lis->stop_pipe[1]);
+        free(lis);
+        return NULL;
+    }
+    pthread_mutex_init(&lis->mu, NULL);
+    if (pthread_create(&lis->th, NULL, cm_lis_main, lis) != 0) {
+        snprintf(err, errlen, "RDMA CM: listener thread failed: %s", strerror(errno));
+        pthread_mutex_destroy(&lis->mu);
+        ops->destroy(lis->id);
+        close(lis->stop_pipe[0]);
+        close(lis->stop_pipe[1]);
+        free(lis);
+        return NULL;
+    }
+    return lis;
+}
+
+void plr_cm_listener_close(struct plr_cm_listener *lis)
+{
+    if (!lis)
+        return;
+    __atomic_store_n(&lis->stop, 1, __ATOMIC_RELEASE);
+    char one = 1;
+    if (write(lis->stop_pipe[1], &one, 1) < 0) {
+        /* pipe full */
+    }
+    pthread_join(lis->th, NULL);
+    struct plr_cm_token *t = lis->tokens;
+    lis->tokens = NULL;
+    while (t) {
+        struct plr_cm_token *nx = t->next;
+        if (t->cm_id)
+            lis->ops->reject(t->cm_id);
+        wipe_bytes(t->tag, sizeof t->tag);
+        free(t);
+        t = nx;
+    }
+    lis->ops->destroy(lis->id);
+    close(lis->stop_pipe[0]);
+    close(lis->stop_pipe[1]);
+    pthread_mutex_destroy(&lis->mu);
+    free(lis);
+}
+
+void plr_cm_listener_addr(const struct plr_cm_listener *lis, struct plr_cm_addr *out)
+{
+    memset(out, 0, sizeof *out);
+    if (lis)
+        *out = lis->addr;
+}
+
+uint64_t plr_cm_listener_rejected(const struct plr_cm_listener *lis)
+{
+    return lis ? __atomic_load_n(&lis->rejected, __ATOMIC_RELAXED) : 0;
+}
+
+struct plr_cm_token *plr_cm_expect(struct plr_cm_listener *lis, uint64_t nonce, const uint8_t tag[32],
+                                   void (*wake_fn)(void *), void *wake_arg)
+{
+    if (!lis)
+        return NULL;
+    struct plr_cm_token *t = calloc(1, sizeof *t);
+    if (!t)
+        return NULL;
+    t->nonce = nonce;
+    memcpy(t->tag, tag, 32);
+    t->wake_fn = wake_fn;
+    t->wake_arg = wake_arg;
+    pthread_mutex_lock(&lis->mu);
+    t->next = lis->tokens;
+    lis->tokens = t;
+    pthread_mutex_unlock(&lis->mu);
+    return t;
+}
+
+struct plr_cm_id *plr_cm_take(struct plr_cm_listener *lis, struct plr_cm_token *tok)
+{
+    if (!lis || !tok)
+        return NULL;
+    struct plr_cm_id *got = NULL;
+    pthread_mutex_lock(&lis->mu);
+    if (tok->claimed && tok->cm_id) {
+        got = tok->cm_id;
+        tok->cm_id = NULL;
+        for (struct plr_cm_token **pp = &lis->tokens; *pp; pp = &(*pp)->next) {
+            if (*pp == tok) {
+                *pp = tok->next;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lis->mu);
+    if (got) {
+        wipe_bytes(tok->tag, sizeof tok->tag);
+        free(tok);
+    }
+    return got;
+}
+
+void plr_cm_cancel(struct plr_cm_listener *lis, struct plr_cm_token *tok)
+{
+    if (!lis || !tok)
+        return;
+    struct plr_cm_id *stray = NULL;
+    pthread_mutex_lock(&lis->mu);
+    for (struct plr_cm_token **pp = &lis->tokens; *pp; pp = &(*pp)->next) {
+        if (*pp == tok) {
+            *pp = tok->next;
+            break;
+        }
+    }
+    stray = tok->cm_id;
+    tok->cm_id = NULL;
+    pthread_mutex_unlock(&lis->mu);
+    if (stray)
+        lis->ops->reject(stray);
+    wipe_bytes(tok->tag, sizeof tok->tag);
+    free(tok);
 }
 
 void plr_conn_stats(const struct pl_transport *t, struct plr_conn_stats *st)

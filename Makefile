@@ -105,7 +105,17 @@ ifeq ($(NO_RDMA),1)
 $(warning RDMA: rdma-core's headers (infiniband/verbs.h) not found: tsdbd is built without the verbs transport (NO_RDMA=1))
 endif
 endif
-RDMA_FLAGS := $(if $(filter 1,$(NO_RDMA)),,-DTSDB_RDMA $(RDMA_CFLAGS))
+ifeq ($(filter 1,$(NO_RDMA)),)
+ifeq ($(NO_RDMA_CM),)
+NO_RDMA_CM := $(shell echo 'int x;' | $(CC) $(RDMA_CFLAGS) -include rdma/rdma_cma.h -E -x c - >/dev/null 2>&1 && echo 0 || echo 1)
+ifeq ($(NO_RDMA_CM),1)
+$(warning RDMA CM: rdma-core's CM header (rdma/rdma_cma.h) not found: tsdbd is built without Option C rdma_cm (NO_RDMA_CM=1))
+endif
+endif
+else
+NO_RDMA_CM := 1
+endif
+RDMA_FLAGS := $(if $(filter 1,$(NO_RDMA)),,-DTSDB_RDMA $(if $(filter 1,$(NO_RDMA_CM)),,-DTSDB_RDMA_CM) $(RDMA_CFLAGS))
 # plrdma_dl.c's dlopen and dlsym live in libdl before glibc 2.34 (EL8, Debian 11); --as-needed keeps it out of the
 # links where libc has them (check-glibc.sh allows libdl either way)
 LDLIBS += $(if $(filter 1,$(NO_RDMA)),,-Wl,--push-state,--as-needed -ldl -Wl,--pop-state)
@@ -645,7 +655,7 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	./$(B)/test_margins
 	$(MUT) --name test_margins --list "marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost" -- ./$(B)/test_margins --mutant @M@ # each planted bug must fail it
 	./$(B)/test_plrdma $(SCRATCH)
-	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte settleready noauth keepqueue seqbump nobackoff noipoib" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_plrdma --list "writtencqe noctl ctlstorm pausectl nodrain unsigearly nocredit splitoff room crown norecvmark norearm anchorbyte settleready noauth keepqueue seqbump nobackoff noipoib cmnoauth cmnofallback" -- ./$(B)/test_plrdma @D@ --quick --mutant @M@ # each planted bug must fail it
 	./$(B)/test_replwire
 	$(MUT) --name test_replwire --list "checknocmp checkshort" -- ./$(B)/test_replwire --mutant @M@ # each planted bug must fail it
 	./$(B)/test_fwd
@@ -850,6 +860,10 @@ dist:
 	    echo "dist: rdma-core's headers (infiniband/verbs.h) not found: install libibverbs-dev or rdma-core-devel," \
 	         "or give RDMA_CFLAGS=-I<dir>, or NO_RDMA=1 for a tarball without the verbs transport" >&2; exit 1; \
 	fi
+	@if [ "$(NO_RDMA)" != 1 ] && [ "$(NO_RDMA_CM)" = 1 ] && [ "$(origin NO_RDMA_CM)" = file ]; then \
+	    echo "dist: rdma-core's CM header (rdma/rdma_cma.h) not found: install librdmacm-dev or rdma-core-devel," \
+	         "or give RDMA_CFLAGS=-I<dir>, or NO_RDMA_CM=1 for a tarball without rdma_cm" >&2; exit 1; \
+	fi
 	@sig="$(DIST_SIG)"; \
 	if [ "$$(cat $(DIST_B)/.flags 2>/dev/null)" != "$$sig" ]; then \
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
@@ -858,7 +872,7 @@ dist:
 	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
-	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(DIST_B)/tsdbd
+	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(if $(filter 1,$(NO_RDMA_CM)),,--rdma-cm) $(DIST_B)/tsdbd
 	tools/check-release-hooks.sh $(DIST_B)/tsdbd $(DIST_B)/tsdb $(DIST_B)/libtsdb.$(SOEXT) $(DIST_B)/libtsdb.a $(DIST_B)/libtsdbclient.a
 	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
@@ -1110,8 +1124,8 @@ $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h $(RAFT_HD
 $(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
-$(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+$(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/rdma.flags $(LIB)
+	$(CC) $(CFLAGS) $(RDMA_FLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 $(B)/test_peerlink: tests/test_peerlink.c tests/pl_fake.h tests/rdma_dev.h server/pltransport.h server/peerlink.h server/plrdma.h $(PLCHECK_HDR) server/fwd.h $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -Isrc -o $@ $< $(B)/peerlink.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/fwd.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
@@ -2194,7 +2208,7 @@ test: check-version check-rdma-syms
 # tsdbd names no ibv_ or rdma_ symbol and needs no RDMA library (dlopen, docs/design-rdma.md §5.4); --rdma: the
 # transport is in it
 check-rdma-syms: $(B)/tsdbd
-	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(B)/tsdbd
+	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(if $(filter 1,$(NO_RDMA_CM)),,--rdma-cm) $(B)/tsdbd
 check-version: $(B)/tsdbd $(B)/tsdb
 	tools/check-version.sh $(B)
 
