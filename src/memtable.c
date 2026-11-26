@@ -720,6 +720,74 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
 
 void wal_name(char *buf, size_t len, uint64_t seq) { snprintf(buf, len, "wal_%016" PRIx64 ".log", seq); }
 
+void wsegs_add(eng *db, uint64_t seq, uint64_t first, uint64_t last)
+{
+    if (!first)
+        return;
+    if (last < first)
+        last = first;
+    pthread_mutex_lock(&db->wsegs_mu);
+    if (db->nwsegs > 0 && db->wsegs[db->nwsegs - 1].seq == seq) {
+        if (first < db->wsegs[db->nwsegs - 1].first)
+            db->wsegs[db->nwsegs - 1].first = first;
+        if (last > db->wsegs[db->nwsegs - 1].last)
+            db->wsegs[db->nwsegs - 1].last = last;
+        pthread_mutex_unlock(&db->wsegs_mu);
+        return;
+    }
+    size_t lo = 0, hi = db->nwsegs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->wsegs[mid].seq < seq)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < db->nwsegs && db->wsegs[lo].seq == seq) {
+        if (first < db->wsegs[lo].first)
+            db->wsegs[lo].first = first;
+        if (last > db->wsegs[lo].last)
+            db->wsegs[lo].last = last;
+        pthread_mutex_unlock(&db->wsegs_mu);
+        return;
+    }
+    if (db->nwsegs == db->capwsegs) {
+        size_t nc = db->capwsegs ? db->capwsegs * 2 : 16;
+        wseg *nw = realloc(db->wsegs, nc * sizeof *nw);
+        if (!nw) {
+            db->wsegs_dirty = true;
+            pthread_mutex_unlock(&db->wsegs_mu);
+            return;
+        }
+        db->wsegs = nw;
+        db->capwsegs = nc;
+    }
+    if (lo < db->nwsegs)
+        memmove(db->wsegs + lo + 1, db->wsegs + lo, (db->nwsegs - lo) * sizeof *db->wsegs);
+    db->wsegs[lo] = (wseg){.seq = seq, .first = first, .last = last};
+    db->nwsegs++;
+    pthread_mutex_unlock(&db->wsegs_mu);
+}
+
+void wsegs_remove(eng *db, uint64_t seq)
+{
+    pthread_mutex_lock(&db->wsegs_mu);
+    size_t lo = 0, hi = db->nwsegs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (db->wsegs[mid].seq < seq)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < db->nwsegs && db->wsegs[lo].seq == seq) {
+        if (lo + 1 < db->nwsegs)
+            memmove(db->wsegs + lo, db->wsegs + lo + 1, (db->nwsegs - lo - 1) * sizeof *db->wsegs);
+        db->nwsegs--;
+    }
+    pthread_mutex_unlock(&db->wsegs_mu);
+}
+
 int wal_open_segment(eng *db, uint64_t seq, int *fd)
 {
     char name[64];
@@ -1151,8 +1219,10 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
     const struct jr_ops *jr = eng_jr(db);
     bool bytes = jr && jr->bytes;
     uint64_t first = 0;
-    if (bytes)
+    if (len >= WAL_HDR) {
         memcpy(&first, buf + 16, 8);
+        wsegs_add(db, seq, first, last);
+    }
     if (bytes && eng_test_mutant != MUT_LEADER_BYTES_AFTER_SYNC)
         jr->bytes(jr->ctx, db, seq, *off, buf, len, first, last);
     void (*sh)(eng *) = __atomic_load_n(&wal_test_sync_hook, __ATOMIC_RELAXED);
@@ -1676,6 +1746,7 @@ static void wal_unlink_upto(eng *db, uint64_t seq, const fseg *info)
                 db->wal_unlink_next = s;
                 return;
             }
+            wsegs_remove(db, s);
         }
         db->wal_unlink_next = 0;
     }
@@ -1715,6 +1786,7 @@ static void lk_unlink_upto(eng *db, uint64_t bound)
             db->lk_failed = s;
             break;
         }
+        wsegs_remove(db, s);
         n++;
     }
     if (n == 0)
@@ -2555,8 +2627,12 @@ int wal_open(eng *db, int (*before_replay)(eng *))
         if (segs[k].seq <= kept) {
             /* not replayed: a drop after their flush took rows out of parts, which a replay would bring back; kept
              * for the leader's replicas (eng_leader_keep), removed by a writer that is not one at its next flush */
-            if (!ro && (rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1)) == 0)
+            if (!ro && (rc = lk_push(db, segs[k].seq, segs[k].fno_end ? segs[k].fno_end : 1)) == 0) {
                 db->wal_open_removed = MIN(db->wal_open_removed, db->lk[0].seq - 1); /* wal_removed passes none */
+                if (segs[k].fno_first)
+                    wsegs_add(db, segs[k].seq, segs[k].fno_first,
+                              segs[k].fno_end ? segs[k].fno_end - 1 : segs[k].fno_first);
+            }
             continue;
         }
         if ((rc = read_file(db->dirfd, segs[k].name, &buf, &len)) != 0)
@@ -2683,6 +2759,9 @@ int wal_open(eng *db, int (*before_replay)(eng *))
                 db->wal_unlink_next = segs[k].seq;
                 db->wal_open_removed = MIN(db->wal_open_removed, segs[k].seq - 1);
             }
+            if (rc == 0 && stuck && segs[k].fno_first)
+                wsegs_add(db, segs[k].seq, segs[k].fno_first,
+                          segs[k].fno_end ? segs[k].fno_end - 1 : segs[k].fno_first);
         }
     }
     free(segs);
@@ -2719,6 +2798,7 @@ void wal_close(eng *db)
                     wal_retire_name(db, db->wal_seq, true, NULL);
                 else
                     unlinkat(db->dirfd, name, 0);
+                wsegs_remove(db, db->wal_seq);
             }
         }
     }

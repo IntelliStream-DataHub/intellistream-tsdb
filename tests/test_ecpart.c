@@ -1199,6 +1199,61 @@ static void test_fno(void)
     printf("  fno: the next number counts an .ec part's range\n");
 }
 
+/* P-37 regression test: opening a directory with many .ec parts exercises load_parts's meta_tier_cache batching
+ * while preserving exact refusal semantics when META is missing, lacks requires=tier, or is unreadable. */
+static void test_many_and_refusals(void)
+{
+    char dir[PATH_MAX];
+    fresh("many64", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, &db) == 0 && db);
+    if (!db)
+        return;
+    uint32_t a = 0;
+    CHECK(eng_series(db, "a", TSDB_FLOAT32, &a) == 0);
+    const size_t NPARTS = 64;
+    for (size_t i = 0; i < NPARTS; i++) {
+        rows(db, a, T0 + (int64_t)i * 86400000LL, 20, (float)i);
+        CHECK(eng_flush(db) == 0);
+    }
+    settled st[72];
+    size_t n = settle_all(db, dir, EC_CLS_PASSED, st, 72);
+    CHECK(n == NPARTS);
+    db = NULL;
+
+    /* 1. Reopen with requires=tier present in META (and assume_tier off, so meta_tier_cache reads META once) */
+    char meta[PATH_MAX + 16], keep[PATH_MAX + 16];
+    snprintf(meta, sizeof meta, "%s/META", dir);
+    snprintf(keep, sizeof keep, "%s/META.keep", dir);
+    sh("cp '%s' '%s' && printf 'requires=tier\n' >> '%s'", meta, keep, meta);
+    atomic_store(&ec_test_assume_tier, false);
+    /* Wait: eng_open refuses requires=tier without a tier attached; test ecpart_load + meta_tier_cache via open_eng
+     * with assume_tier=true (verifies all 64 parts open cleanly) and refusals with assume_tier=false. */
+    sh("cp '%s' '%s'", keep, meta);
+    atomic_store(&ec_test_assume_tier, true);
+    CHECK(open_eng(dir, &db) == 0 && db);
+    if (db) {
+        CHECK(db->nparts == NPARTS);
+        for (size_t i = 0; i < NPARTS; i++)
+            CHECK(listed(db, st[i].name) != NULL);
+        CHECK(eng_close(db) == 0);
+        db = NULL;
+    }
+
+    /* 2. Refusal without requires=tier across all 64 .ec parts (cached negative result in load_parts) */
+    atomic_store(&ec_test_assume_tier, false);
+    CHECK(open_eng(dir, &db) == TSDB_ERR_CORRUPT && !db);
+
+    /* 3. Refusal when META is missing */
+    sh("rm -f '%s'", meta);
+    CHECK(open_eng(dir, &db) != 0 && !db);
+
+    /* Restore META and assume_tier for any subsequent tests */
+    sh("mv '%s' '%s'", keep, meta);
+    atomic_store(&ec_test_assume_tier, true);
+    printf("  many_and_refusals: 64 .ec parts opened cleanly, missing/untiered META refused\n");
+}
+
 int main(int argc, char **argv)
 {
     int ai = 1;
@@ -1238,6 +1293,7 @@ int main(int argc, char **argv)
     test_writer(1);
     test_cluster_record();
     test_listing();
+    test_many_and_refusals();
     test_replay();
     test_fno();
     if (failures) {

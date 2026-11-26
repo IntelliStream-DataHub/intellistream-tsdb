@@ -504,14 +504,22 @@ fail:
 }
 
 /* Whether META's requires= line names "tier" (r7-tier writes it before the first .ec file can exist): 1 or 0, or
- * TSDB_ERR_IO (named) when META cannot be read. Read again here: load_parts meets .ec names before the tier's attach. */
+ * TSDB_ERR_IO (named) when META cannot be read. Uses db->tier_req (already set by tier_engine_attach before
+ * load_parts) and a per-load_parts cache (db->meta_tier_cache) to avoid re-opening META for every .ec file at open. */
 static int meta_says_tier(eng *db)
 {
-    if (atomic_load(&ec_test_assume_tier))
+    if (db->tier_req || atomic_load(&ec_test_assume_tier))
+        return 1;
+    if (db->meta_tier_cache == 2)
+        return 0;
+    if (db->meta_tier_cache == 3)
         return 1;
     int fd = openat(db->dirfd, "META", O_RDONLY | O_CLOEXEC);
-    if (fd < 0 && errno == ENOENT)
+    if (fd < 0 && errno == ENOENT) {
+        if (db->meta_tier_cache == 1)
+            db->meta_tier_cache = 2;
         return 0;
+    }
     char buf[65536];
     size_t n = 0;
     ssize_t k = fd < 0 ? -1 : 0;
@@ -527,7 +535,10 @@ static int meta_says_tier(eng *db)
     buf[n] = '\0';
     unsigned feats = 0;
     meta_requires_parse(buf, &feats, NULL, 0); /* the one parser of requires= (an unknown word failed the open before) */
-    return (feats & META_REQ_TIER) != 0;
+    int has = (feats & META_REQ_TIER) != 0;
+    if (db->meta_tier_cache == 1)
+        db->meta_tier_cache = has ? 3 : 2;
+    return has;
 }
 
 int ecpart_load(eng *db, const char *name, bool read_only, part **out)

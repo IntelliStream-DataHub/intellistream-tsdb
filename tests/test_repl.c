@@ -1715,6 +1715,162 @@ static void debug_trunc(void)
     repl_free(r);
 }
 
+/* P-40 regression test: repl_next_tick() + repl_advance_idle() match tick-by-tick repl_tick() bit-for-bit across
+ * idle leader (idle_heartbeat_ticks), idle follower (UINT32_MAX), pending floor save, F_TRUNC resend, and lagging
+ * peer, while skipping idle ticks instead of waking every TICK_MS. */
+static void idle_deadline(void)
+{
+    /* 1. Idle leader: repl_next_tick == idle_heartbeat_ticks (20), fast-forward matches 20x repl_tick */
+    static struct drv d1, d2;
+    struct repl_config c1, c2;
+    struct repl *r1 = join_leader(&d1, &c1); /* 3 nodes, ISR {0,2}, node 1 is a caught-up learner */
+    struct repl *r2 = join_leader(&d2, &c2);
+    CHECK(r1 && r2, "idle_deadline: open leaders");
+    /* Put all 3 nodes in ISR so the leader is genuinely idle */
+    struct repl_msg all_isr = meta_msg(0, 2, 0, 0x7, 0);
+    all_isr.meta.isr_version = 10;
+    all_isr.meta.rid[0] = 11;
+    all_isr.meta.rid[1] = 22;
+    all_isr.meta.rid[2] = 33;
+    repl_recv(r1, &all_isr);
+    repl_recv(r2, &all_isr);
+    drain(r1, &d1, NULL);
+    drain(r2, &d2, NULL);
+    /* Save floor and ACK from both peers at written end so nothing is pending */
+    struct repl_msg a1 = ack_msg(1, 0, repl_written(r1), 22, 1, 0);
+    struct repl_msg a2 = ack_msg(2, 0, repl_written(r1), 33, 1, 0);
+    repl_recv(r1, &a1);
+    repl_recv(r1, &a2);
+    repl_recv(r2, &a1);
+    repl_recv(r2, &a2);
+    drain(r1, &d1, NULL);
+    drain(r2, &d2, NULL);
+    /* Run one heartbeat cycle tick-by-tick to align last_send and floor_saved */
+    for (int t = 0; t < 25; t++) {
+        repl_tick(r1);
+        repl_tick(r2);
+        drain(r1, &d1, NULL);
+        drain(r2, &d2, NULL);
+        repl_recv(r1, &a1);
+        repl_recv(r1, &a2);
+        repl_recv(r2, &a1);
+        repl_recv(r2, &a2);
+        drain(r1, &d1, NULL);
+        drain(r2, &d2, NULL);
+    }
+    /* Now both leaders are completely idle right after a heartbeat (idle_heartbeat_ticks = 20 in join_leader? Check!) */
+    uint32_t dt = repl_next_tick(r1);
+    CHECK(dt >= 1 && dt < UINT32_MAX, "idle leader next_tick=%u", dt);
+    /* Fast-forward r1 by dt - 1 idle ticks + 1 real tick; step r2 tick-by-tick dt times */
+    int actions_before = 0;
+    repl_advance_idle(r1, dt - 1, repl_written(r1));
+    repl_tick(r1);
+    d1.nact = 0;
+    drain(r1, &d1, NULL);
+    d2.nact = 0;
+    for (uint32_t t = 0; t < dt; t++) {
+        if (t + 1 < dt) {
+            repl_tick(r2);
+            d2.nact = 0;
+            drain(r2, &d2, NULL);
+            actions_before += d2.nact;
+        } else {
+            repl_tick(r2);
+            d2.nact = 0;
+            drain(r2, &d2, NULL);
+        }
+    }
+    CHECK(actions_before == 0, "skipped ticks were not idle: %d actions emitted before dt=%u", actions_before, dt);
+    CHECK(d1.nact == d2.nact && d1.nact > 0, "action count mismatch: fast=%d vs tick=%d", d1.nact, d2.nact);
+    CHECK(repl_commit(r1) == repl_commit(r2) && repl_written(r1) == repl_written(r2), "leader state mismatch");
+    repl_free(r1);
+    repl_free(r2);
+
+    /* 2. Idle leader with explicit idle_heartbeat_ticks = 20 returns exactly 20 */
+    static struct drv d3;
+    memset(&d3, 0, sizeof d3);
+    d3.start = 1;
+    struct repl_config c3 = {.self = 0, .nnodes = 3, .min_isr = 2, .isr_lag_ticks = 200, .resend_ticks = 40,
+                             .heartbeat_ticks = 1, .idle_heartbeat_ticks = 20, .floor_ticks = 200,
+                             .max_batch = 100, .window = 1000, .rec_find = rec_find, .ctx = &d3};
+    struct repl_durable dur3 = {.rid = 11, .log_start = 1};
+    struct repl *r3 = repl_open(&c3, &dur3);
+    CHECK(r3 != NULL, "open r3");
+    struct repl_msg m3 = meta_msg(0, 1, 0, 0x7, 0);
+    m3.meta.rid[0] = 11;
+    m3.meta.rid[1] = 22;
+    m3.meta.rid[2] = 33;
+    repl_recv(r3, &m3);
+    drain(r3, &d3, NULL);
+    repl_synced(r3, repl_written(r3));
+    drain(r3, &d3, NULL);
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 1, .leader = -1, .durable = 1,
+                          .written = 1, .rid = 22, .start = 1, .replay = 1};
+    struct repl_msg k2 = k1;
+    k2.from = 2;
+    k2.rid = 33;
+    repl_recv(r3, &k1);
+    repl_recv(r3, &k2);
+    drain(r3, &d3, NULL);
+    /* Commit moved to 1, commit_sent was 0 -> next tick sends heartbeat with commit=1 */
+    CHECK(repl_next_tick(r3) == 1, "commit news must wake at tick 1, got %u", repl_next_tick(r3));
+    repl_tick(r3);
+    drain(r3, &d3, NULL);
+    /* Now commit_sent == commit == 1 and all peers caught up; floor still needs saving at floor_ticks (200) ->
+     * next event is idle_heartbeat_ticks (20)! */
+    CHECK(repl_next_tick(r3) == 20, "idle leader expected 20 ticks, got %u", repl_next_tick(r3));
+    /* Write a new record -> peer lags written -> repl_next_tick returns 1 */
+    uint64_t pos = 0;
+    CHECK(repl_write(r3, 1, &pos) == REPL_OK, "write");
+    drain(r3, &d3, NULL);
+    CHECK(repl_next_tick(r3) == 1, "lagging peer expected 1 tick, got %u", repl_next_tick(r3));
+    repl_free(r3);
+
+    /* 3. Idle follower (F_FOLLOW, floor saved) returns UINT32_MAX; pending floor save returns exact ticks */
+    static struct drv df;
+    memset(&df, 0, sizeof df);
+    df.start = 1;
+    struct repl_config cf = c3;
+    cf.self = 1;
+    cf.ctx = &df;
+    struct repl_durable durf = {.rid = 22, .log_start = 1};
+    struct repl *rf = repl_open(&cf, &durf);
+    CHECK(rf != NULL, "open follower");
+    /* Before any leader message: F_IDLE, nothing pending -> UINT32_MAX */
+    CHECK(repl_next_tick(rf) == UINT32_MAX, "idle follower expected UINT32_MAX, got %u", repl_next_tick(rf));
+    /* Follow epoch 1 -> F_TRUNC, resend_ticks = 40 */
+    struct repl_msg mf = meta_msg(1, 1, 0, 0x7, 0);
+    repl_recv(rf, &mf);
+    drain(rf, &df, NULL);
+    CHECK(repl_next_tick(rf) == 40, "F_TRUNC expected resend_ticks=40, got %u", repl_next_tick(rf));
+    /* Answer query -> F_FOLLOW, nothing applied above floor -> UINT32_MAX */
+    struct repl_msg ans = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 1, .leader = 0};
+    repl_recv(rf, &ans);
+    drain(rf, &df, NULL);
+    CHECK(repl_next_tick(rf) == UINT32_MAX, "F_FOLLOW idle expected UINT32_MAX, got %u", repl_next_tick(rf));
+    /* Append + sync + commit record 1 -> applied=1 > floor_saved=0 -> floor_ticks=200 */
+    struct repl_rec rec = {.pos = 1, .epoch = 1, .n = 1};
+    struct repl_msg app = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 1, .leader = 0, .commit = 1,
+                           .nrec = 1, .rec = &rec};
+    repl_recv(rf, &app);
+    drain(rf, &df, NULL);
+    repl_synced(rf, 1);
+    drain(rf, &df, NULL);
+    uint32_t ft = repl_next_tick(rf);
+    CHECK(ft == 200, "pending floor save expected 200, got %u", ft);
+    repl_advance_idle(rf, ft - 1, 0);
+    df.nact = 0;
+    repl_tick(rf);
+    drain(rf, &df, NULL);
+    int saw_save = 0;
+    for (int i = 0; i < df.nact; i++)
+        if (df.act[i].type == REPL_A_SAVE)
+            saw_save = 1;
+    CHECK(saw_save, "expected REPL_A_SAVE on exact floor_ticks deadline");
+    CHECK(repl_next_tick(rf) == UINT32_MAX, "post-save idle follower expected UINT32_MAX, got %u", repl_next_tick(rf));
+    repl_free(rf);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
@@ -1772,6 +1928,7 @@ int main(int argc, char **argv)
     stale_rid();
     stale_epoch();
     debug_trunc();
+    idle_deadline();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

@@ -1097,6 +1097,113 @@ void repl_tick(struct repl *r)
         save(r);
 }
 
+static uint32_t ticks_until(uint64_t now, uint64_t base, uint32_t period)
+{
+    uint64_t target = base + period;
+    if (now + 1 >= target)
+        return 1;
+    uint64_t d = target - now;
+    return d > UINT32_MAX ? UINT32_MAX : (uint32_t)d;
+}
+
+static uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+static uint32_t max_u32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+
+uint32_t repl_next_tick(const struct repl *r)
+{
+    if (r->failed)
+        return UINT32_MAX;
+    uint64_t now = r->now;
+    uint32_t next = UINT32_MAX;
+    if (r->leading) {
+        for (int i = 0; i < r->cfg.nnodes; i++) {
+            if (i == r->cfg.self)
+                continue;
+            const struct peer *p = &r->peer[i];
+            if (!MUT(27) && p->next && p->next > p->acked + 1)
+                next = min_u32(next, ticks_until(now, p->last_ack, r->cfg.resend_ticks));
+            if (p->next && p->next <= r->written)
+                return 1;
+            uint32_t hb = r->cfg.heartbeat_ticks;
+            if (p->commit_sent == r->commit && r->cfg.idle_heartbeat_ticks > hb)
+                hb = r->cfg.idle_heartbeat_ticks;
+            next = min_u32(next, ticks_until(now, p->last_send, hb));
+        }
+        if (r->isr_busy && (!r->meta_hold || MUT(51)))
+            next = min_u32(next, ticks_until(now, r->isr_sent, r->cfg.resend_ticks));
+        /* isr_check() deadlines */
+        if (r->join >= 0) {
+            const struct peer *p = &r->peer[r->join];
+            if ((r->meta.isr & (1u << r->join)) || r->meta.epoch != r->epoch || p->rid != r->join_rid)
+                return 1;
+            next = min_u32(next, ticks_until(now, r->join_tick, r->cfg.join_hold_ticks));
+        }
+        if (!r->isr_busy && r->meta.epoch == r->epoch && !r->meta_hold) {
+            uint32_t isr = r->meta.isr;
+            uint32_t k_lag = ticks_until(now, r->lead_tick, r->cfg.isr_lag_ticks);
+            uint32_t k_grace = r->cfg.unanswered_ticks && !MUT(37)
+                                   ? ticks_until(now, r->lead_tick, r->cfg.unanswered_ticks)
+                                   : UINT32_MAX;
+            for (int i = 0; i < r->cfg.nnodes; i++) {
+                if (i == r->cfg.self || !(isr & (1u << i)))
+                    continue;
+                const struct peer *p = &r->peer[i];
+                if (p->rid && p->rid != r->meta.rid[i])
+                    return 1;
+                if (!MUT(29)) {
+                    if (p->rid != r->meta.rid[i])
+                        next = min_u32(next, k_lag);
+                    if (p->match < r->written)
+                        return 1; /* peer lags written: wend[] window may trigger drop */
+                    if (!MUT(40))
+                        next = min_u32(next, max_u32(k_lag, ticks_until(now, p->last_heard, r->cfg.isr_lag_ticks)));
+                }
+                if (k_grace != UINT32_MAX && (r->unans & (1u << i)) && !p->rid)
+                    next = min_u32(next, k_grace);
+            }
+            if (r->leave >= 0 && (isr & (1u << r->leave)) &&
+                (MUT(49) || popcount32(isr & ~(1u << r->leave)) >= (int)r->leave_min))
+                return 1;
+            uint64_t start = r->nhist ? r->hist[r->nhist - 1].start : 0;
+            for (int i = 0; i < r->cfg.nnodes; i++) {
+                if (i == r->cfg.self || (isr & (1u << i)) || (i == r->leave && !MUT(48)))
+                    continue;
+                const struct peer *p = &r->peer[i];
+                if (!p->rid)
+                    continue;
+                if (p->match >= r->commit && (p->match >= start || MUT(12)))
+                    return 1;
+                if (r->cfg.join_hold_ticks && !MUT(42) && r->join < 0 && p->match >= start)
+                    return 1;
+            }
+        }
+    } else if (r->fstate == F_TRUNC && !MUT(28)) {
+        next = min_u32(next, ticks_until(now, r->last_query, r->cfg.resend_ticks));
+    } else if (r->resigning) {
+        next = min_u32(next, ticks_until(now, r->last_resign, r->cfg.resend_ticks));
+    }
+    if (r->applied > r->floor_saved)
+        next = min_u32(next, ticks_until(now, r->floor_tick, r->cfg.floor_ticks));
+    return next;
+}
+
+void repl_advance_idle(struct repl *r, uint32_t n, uint64_t written)
+{
+    if (r->failed || n == 0)
+        return;
+    if (r->leading) {
+        if (n >= r->nwend) {
+            for (uint32_t i = 0; i < r->nwend; i++)
+                r->wend[i] = written;
+        } else {
+            uint64_t t = r->now;
+            for (uint32_t i = 1; i <= n; i++)
+                r->wend[(t + i) % r->nwend] = written;
+        }
+    }
+    r->now += n;
+}
+
 int repl_next_action(struct repl *r, struct repl_action *a)
 {
     if (r->failed && !r->fail_told) {

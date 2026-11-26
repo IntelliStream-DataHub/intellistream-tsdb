@@ -259,6 +259,8 @@ int rset_msg_ok(struct rvol *rv, const struct repl_msg *m)
 
 void rset_stamp(struct rvol *rv, struct repl_msg *m) { m->set_version = repl_get_set_version(rv->core); }
 
+int rset_pending(const struct rvol *rv) { return rv->set && rv->set->pending ? 1 : 0; }
+
 uint64_t rset_dropped(const struct rvol *rv) { return rv->set ? rv->set->dropped : 0; }
 
 /* DROP_MEMBER (D11; cmove.c): {epoch, node, arg = Raft term << 8 | min_isr}; node 0 cancels (repl_leave(-1)). Only the

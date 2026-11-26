@@ -2547,6 +2547,125 @@ static void test_p26_open_and_par_read(void)
     printf("  P-26: primary-first open + fallback, lazy parity open, all-data-lost open, and parallel multi-chunk read\n");
 }
 
+/* P-37 regression tests:
+ *  1) streaming chunk_ftr_make / chunk_ftr_check bit-identity against xxh64(hdr || table) across varied cell counts,
+ *  2) cached iso_rs_plan reuse across multiple degraded stripes with both constant and changing per-stripe erasure
+ *     masks, plus CHUNK_RR_RAW degraded reads spanning cell boundaries. */
+static void test_p37_ftr_and_plan_cache(void)
+{
+    /* 1. ftr_hash bit-identity across tail/lane edge cases */
+    static const uint64_t counts[] = {0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 100, 1025};
+    uint8_t hdr[CHUNK_HDR_BYTES];
+    fill(hdr, sizeof hdr);
+    for (size_t ci = 0; ci < sizeof counts / sizeof counts[0]; ci++) {
+        uint64_t nc = counts[ci];
+        size_t tlen = (size_t)(nc * 8);
+        uint8_t *tab = malloc(tlen ? tlen : 1);
+        uint8_t *cat = malloc(CHUNK_HDR_BYTES + tlen);
+        CHECK(tab && cat);
+        if (tlen)
+            fill(tab, tlen);
+        memcpy(cat, hdr, CHUNK_HDR_BYTES);
+        if (tlen)
+            memcpy(cat + CHUNK_HDR_BYTES, tab, tlen);
+        uint64_t want = xxh64(cat, CHUNK_HDR_BYTES + tlen, 0);
+        uint8_t ftr[CHUNK_FTR_BYTES];
+        chunk_ftr_make(ftr, hdr, tab, nc);
+        CHECK(chunk_le64(ftr) == want);
+        CHECK(chunk_ftr_check(hdr, tab, nc, ftr) == 0);
+        /* Flip one bit in header -> must fail */
+        hdr[nc % CHUNK_HDR_BYTES] ^= 1;
+        CHECK(chunk_ftr_check(hdr, tab, nc, ftr) != 0);
+        hdr[nc % CHUNK_HDR_BYTES] ^= 1;
+        /* Flip one bit in sums table -> must fail */
+        if (tlen) {
+            tab[(nc * 5) % tlen] ^= 1;
+            CHECK(chunk_ftr_check(hdr, tab, nc, ftr) != 0);
+            tab[(nc * 5) % tlen] ^= 1;
+        }
+        free(cat);
+        free(tab);
+    }
+
+    /* 2. Multi-stripe degraded reads: constant erasure mask + per-stripe changing erasure masks + raw cross-cell */
+    const unsigned k = 8, m = 4;
+    const uint32_t cell = 4096;
+    const uint64_t nstripes = 6;
+    const uint64_t obj_len = (uint64_t)k * cell * nstripes;
+    fx f;
+    fx_make(&f, "fx-p37", 6, k, m, cell, obj_len, 1);
+
+    /* (a) Constant erasure mask across all 6 stripes (unlink pos 1 and pos 6) */
+    char p1[PATH_MAX + 128], p6[PATH_MAX + 128];
+    fx_path(&f, 1, p1, sizeof p1);
+    fx_path(&f, 6, p6, sizeof p6);
+    size_t n1 = 0, n6 = 0;
+    uint8_t *b1 = slurp(p1, &n1);
+    uint8_t *b6 = slurp(p6, &n6);
+    CHECK(unlink(p1) == 0 && unlink(p6) == 0);
+
+    chunk_obj *o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, NULL, f.rec, &o) == 0 && o);
+    uint8_t *out = malloc(obj_len);
+    CHECK(out != NULL);
+    chunk_report rep;
+    CHECK(chunk_obj_read(o, 0, obj_len, out, 0, &rep) == 0);
+    CHECK(memcmp(out, f.obj, obj_len) == 0);
+    CHECK(rep.decoded_cells == nstripes * 2);
+
+    /* Raw-mode degraded read spanning two erased cells near opposite edges of a cell boundary */
+    for (uint64_t s = 0; s < nstripes; s++) {
+        uint64_t base_off = s * k * cell;
+        /* Spans cell 1 (erased, offset cell-13..cell) and cell 2 (present, 0..27) */
+        uint64_t roff = base_off + cell + (cell - 13);
+        uint64_t rlen = 40;
+        uint8_t rbuf[40];
+        CHECK(chunk_obj_read(o, roff, rlen, rbuf, CHUNK_RR_RAW, NULL) == 0);
+        CHECK(memcmp(rbuf, f.obj + roff, rlen) == 0);
+        /* Spans from cell 1 (erased, end) all the way through cell 6 (erased, start) */
+        uint64_t roff2 = base_off + cell + (cell - 7);
+        uint64_t rlen2 = 7 + 4 * (uint64_t)cell + 19;
+        CHECK(chunk_obj_read(o, roff2, rlen2, out, CHUNK_RR_RAW, NULL) == 0);
+        CHECK(memcmp(out, f.obj + roff2, rlen2) == 0);
+    }
+    chunk_obj_close(o);
+    spit(p1, b1, n1);
+    spit(p6, b6, n6);
+    free(b1);
+    free(b6);
+
+    /* (b) Changing per-stripe erasure masks: corrupt a DIFFERENT pair of positions in each of the 6 stripes */
+    static const unsigned bad_pair[6][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 8}, {1, 11}};
+    for (uint64_t s = 0; s < nstripes; s++) {
+        for (int j = 0; j < 2; j++) {
+            char cp[PATH_MAX + 128];
+            fx_path(&f, bad_pair[s][j], cp, sizeof cp);
+            int fd = open(cp, O_RDWR);
+            CHECK(fd >= 0);
+            if (fd >= 0) {
+                off_t at = (off_t)(CHUNK_HDR_BYTES + s * cell + 17);
+                uint8_t byte = 0;
+                CHECK(pread(fd, &byte, 1, at) == 1);
+                byte ^= 0x3c;
+                CHECK(pwrite(fd, &byte, 1, at) == 1);
+                close(fd);
+            }
+        }
+    }
+    o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, NULL, f.rec, &o) == 0 && o);
+    memset(out, 0, obj_len);
+    memset(&rep, 0, sizeof rep);
+    CHECK(chunk_obj_read(o, 0, obj_len, out, 0, &rep) == 0);
+    CHECK(memcmp(out, f.obj, obj_len) == 0);
+    CHECK(rep.decoded_cells >= 10);
+    chunk_obj_close(o);
+
+    free(out);
+    fx_free(&f);
+    printf("  p37: ftr_hash bit-identity (12 shapes) + cached RS plan across constant and changing stripe masks\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
@@ -2611,6 +2730,7 @@ int main(int argc, char **argv)
     test_degraded_backend();
     test_stream_put();
     test_p26_open_and_par_read();
+    test_p37_ftr_and_plan_cache();
     test_threads();
     test_crashfs();
     if (failures) {

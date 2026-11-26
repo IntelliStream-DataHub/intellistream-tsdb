@@ -8639,6 +8639,113 @@ static void case_append_verified(void)
     printf("  append_verified: 4-record mixed batch (rows + NOW + COMMIT hold + rows) verified\n");
 }
 
+/* P-40 regression test: in-memory WAL segment index (db->wsegs) across rotation, binary-search leader_read in
+ * random order, retention/deletion via eng_leader_keep, external ENOENT removal, replica_log_start/epochs, and
+ * leader reopen with kept segments. */
+static void case_wsegs_index(void)
+{
+    xport x;
+    xp_start(&x, "wsegs");
+    const size_t NSEGS = 20;
+    uint64_t seg_first[24], seg_last[24];
+    size_t nseg = 0;
+    for (size_t i = 0; i < NSEGS; i++) {
+        uint64_t f0 = ld_last(&x) + 1;
+        xp_rows(&x, 0, (int)(i * 10), 5, (float)(i + 1));
+        xp_step(&x, "WS: batch");
+        uint64_t f1 = ld_last(&x);
+        seg_first[nseg] = f0;
+        seg_last[nseg] = f1;
+        nseg++;
+        CHECK_EQ(eng_flush(x.ld), 0);
+    }
+    /* One more live tail write in the current segment */
+    uint64_t tail_f0 = ld_last(&x) + 1;
+    xp_rows(&x, 0, 500, 4, 99.0f);
+    xp_step(&x, "WS: live tail");
+    uint64_t tail_f1 = ld_last(&x);
+
+    /* replica_log_start / replica_log_epochs match the oldest retained segment */
+    uint64_t lstart = 0;
+    CHECK_EQ(replica_log_start(x.ld, &lstart), 0);
+    CHECK(lstart > 0 && lstart <= seg_first[0]);
+    uint64_t eps[16], sts[16];
+    uint32_t nh = 0;
+    uint64_t efirst = 0;
+    CHECK_EQ(replica_log_epochs(x.ld, eps, sts, 16, &nh, &efirst), 0);
+    CHECK_EQ(efirst, lstart);
+
+    /* Random-order replica_read across all 20 sealed segments + live tail + not-written-yet */
+    uint64_t rng = 0x123456789abcdef0ull;
+    for (int k = 0; k < 80; k++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        size_t idx = (size_t)((rng >> 32) % (nseg + 1));
+        uint64_t from = idx < nseg ? seg_first[idx] : tail_f0;
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        uint64_t seq = 0, off = 0, last = 0;
+        CHECK_EQ(replica_read(x.ld, from, &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK(len > 0 && last >= from);
+        free(buf);
+    }
+    /* Not-written-yet: from == next returns 0 with len == 0 */
+    {
+        uint8_t *buf = NULL;
+        size_t len = 1;
+        uint64_t seq = 0, off = 0, last = 0;
+        CHECK_EQ(replica_read(x.ld, tail_f1 + 1, &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK_EQ(len, 0);
+        free(buf);
+    }
+
+    /* Retention pruning: advance keep bound past the first 10 segments */
+    eng_leader_commit(x.ld, tail_f1);
+    eng_leader_keep(x.ld, seg_last[9]);
+    uint64_t lstart2 = 0;
+    CHECK_EQ(replica_log_start(x.ld, &lstart2), 0);
+    CHECK(lstart2 > seg_last[9] && lstart2 <= seg_first[10]);
+    {
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        uint64_t seq = 0, off = 0, last = 0;
+        CHECK_EQ(replica_read(x.ld, seg_first[0], &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_NOTFOUND);
+        free(buf);
+        CHECK_EQ(replica_read(x.ld, seg_first[10], &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK(len > 0);
+        free(buf);
+        /* External ENOENT removal: unlink seg 12 behind the engine's back -> NOTFOUND and index drops it */
+        CHECK_EQ(replica_read(x.ld, seg_first[12], &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        free(buf);
+        char sp[PATH_MAX + 64];
+        snprintf(sp, sizeof sp, "%s/wal_%016" PRIx64 ".log", x.ldir, seq);
+        CHECK_EQ(unlink(sp), 0);
+        CHECK_EQ(replica_read(x.ld, seg_first[12], &buf, &len, 1 << 20, &seq, &off, &last), TSDB_ERR_NOTFOUND);
+        free(buf);
+        /* Segment 13 still resolves cleanly via binary search */
+        CHECK_EQ(replica_read(x.ld, seg_first[13], &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK(len > 0);
+        free(buf);
+    }
+
+    /* Reopen as leader: kept segments repopulate wsegs on wal_open and leader_read works */
+    eng_close(x.ld);
+    x.ld = NULL;
+    xp_open_leader(&x);
+    {
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        uint64_t seq = 0, off = 0, last = 0;
+        uint64_t lstart3 = 0;
+        CHECK_EQ(replica_log_start(x.ld, &lstart3), 0);
+        CHECK(lstart3 > seg_last[9] && lstart3 <= seg_first[10]);
+        CHECK_EQ(replica_read(x.ld, seg_first[15], &buf, &len, 1 << 20, &seq, &off, &last), 0);
+        CHECK(len > 0);
+        free(buf);
+    }
+    xp_stop(&x);
+    printf("  wsegs index: 20 rotations, random binary-search reads, retention prune, ENOENT fallback, reopen ok\n");
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -8957,6 +9064,7 @@ int main(int argc, char **argv)
     case_link_pos();
     case_leader_prune();
     case_leader_read();
+    case_wsegs_index();
     case_link_sweep();
     case_keep_files();
     case_promote_refused();

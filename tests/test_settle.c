@@ -2967,6 +2967,105 @@ static void reencode_case(void)
            "backpressure, eager, crash points & power loss\n");
 }
 
+/* P-37 regression test: check_stripe zero-copy fast path (granules wholly inside a stripe) vs cross-stripe assembly
+ * buffer (granules spanning stripe boundaries), including corrupt-CRC detection in both paths. */
+static void zc_stripe_case(void)
+{
+    where w;
+    fresh("zcstripe", &w);
+    tier_env(&w, 3600, 86400, 0);
+    eopts e = {.merge_threads = 0, .classes = 1};
+    tdb d;
+    CHECK(t_open(&w, &e, &d) == 0);
+    if (!d.db)
+        return;
+    /* Write enough rows across multiple series so the part has many granules (several > 4 KiB) spanning multiple
+     * stripes, exercising both in-stripe zero-copy hashing and cross-stripe f->asmb assembly + class decode. */
+    for (int si = 0; si < 6; si++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "zc_%d", si);
+        uint32_t s = 0;
+        CHECK(eng_series(d.db, nm, TSDB_FLOAT32, &s) == 0);
+        write_rows(d.db, s, 0, 20000, 1000, si * 100);
+    }
+    CHECK(eng_flush(d.db) == 0);
+    acc want[6];
+    for (int si = 0; si < 6; si++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "zc_%d", si);
+        want[si] = digest(d.db, nm);
+    }
+    part *p[4];
+    size_t n = key_parts(d.db, 0, p, 4);
+    CHECK(n == 1 && p[0]->ng >= 10);
+    CHECK(eng_settle(d.db, 0, p, n, NULL) == 0);
+    unref_all(p, n);
+    for (int si = 0; si < 6; si++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "zc_%d", si);
+        CHECK(same(digest(d.db, nm), want[si]));
+    }
+    /* Now write a second partition with many granules, corrupt one wholly-in-stripe granule and one cross-stripe
+     * boundary granule (in separate runs), and verify both fail with TSDB_ERR_CORRUPT. */
+    for (int mode = 0; mode < 2; mode++) {
+        where w2;
+        fresh(mode == 0 ? "zc_bad_in" : "zc_bad_span", &w2);
+        tier_env(&w2, 3600, 86400, 0);
+        tdb d2;
+        CHECK(t_open(&w2, &e, &d2) == 0);
+        if (!d2.db)
+            continue;
+        uint32_t s = 0;
+        CHECK(eng_series(d2.db, "s", TSDB_FLOAT64, &s) == 0);
+        const size_t NR = 40000;
+        int64_t *ts = malloc(NR * sizeof *ts);
+        double *vs = malloc(NR * sizeof *vs);
+        CHECK(ts && vs);
+        uint64_t rng = 0x9e3779b97f4a7c15ull;
+        for (size_t i = 0; i < NR; i++) {
+            rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            ts[i] = (int64_t)i * 1000 + (int64_t)(rng & 511);
+            vs[i] = (double)(int64_t)rng * 1e-12;
+        }
+        CHECK(eng_insert_series(d2.db, TSDB_FLOAT64, s, ts, vs, NR) == 0);
+        free(ts);
+        free(vs);
+        CHECK(eng_flush(d2.db) == 0);
+        part *p2[4];
+        size_t n2 = key_parts(d2.db, 0, p2, 4);
+        CHECK(n2 == 1 && p2[0]->ng >= 4);
+        if (n2 == 1) {
+            chunk_geom g;
+            CHECK(chunk_geom_derive(&g, 2, 1, p2[0]->map_len) == 0);
+            uint64_t sw = (uint64_t)g.k * g.cell;
+            uint32_t target_g = 0;
+            bool found_g = false;
+            for (uint32_t gi = 0; gi < p2[0]->ng; gi++) {
+                granule gr;
+                gx_load(p2[0], gi, GW_LOC | GW_TIME, &gr);
+                uint64_t goff = gr.off;
+                uint64_t gend = goff + gr.ts_len + gr.val_len;
+                bool spans = (goff / sw) != ((gend - 1) / sw);
+                if ((mode == 0 && !spans) || (mode == 1 && spans)) {
+                    target_g = gi;
+                    found_g = true;
+                    break;
+                }
+            }
+            CHECK(found_g);
+            if (found_g) {
+                flip(w2.db, p2[0]->name, gran_byte(p2[0], target_g));
+                CHECK(eng_settle(d2.db, 0, p2, 1, NULL) == TSDB_ERR_CORRUPT);
+                CHECK(atomic_load(&p2[0]->damaged));
+            }
+        }
+        unref_all(p2, n2);
+        t_close(&d2);
+    }
+    t_close(&d);
+    printf("  zc_stripe: in-stripe zero-copy and cross-stripe granule CRC + class-decode checks ok\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", *child = NULL, *rchild = NULL;
@@ -3004,6 +3103,7 @@ int main(int argc, char **argv)
     printf("test_settle%s%s\n", m ? " --mutant " : "", m ? mutant : "");
 #define RUN(name) (!only || !strcmp(only, #name) ? name##_case() : (void)0)
     RUN(basic);
+    RUN(zc_stripe);
     RUN(corrupt);
     RUN(flip);
     RUN(hash);

@@ -17,6 +17,8 @@ int rset_change(struct rvol *rv, const struct cluster_vol_rec *r);
  * nothing waits, 1 it still waits (a snapshot in progress, actions still queued, this server not named), 2 applied now
  * (the caller hands the core the record: a META). */
 int rset_apply(struct rvol *rv);
+/* 1 if a replica set change is waiting for rset_apply(), 0 otherwise. rv->mu held. */
+int rset_pending(const struct rvol *rv);
 /* peer messages dropped for another set version (the trace line) */
 uint64_t rset_dropped(const struct rvol *rv);
 /* A peer message of this volume, decoded and checked to be from `from` to this replica: 1 to hand it to the core, 0 to

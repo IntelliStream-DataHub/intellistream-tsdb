@@ -228,16 +228,50 @@ int chunk_hdr_decode(const uint8_t in[CHUNK_HDR_BYTES], chunk_hdr *h)
     return 0;
 }
 
-/* The footer's hash: the header and the sums table as they lie in the file (little endian). */
+/* The footer's hash: xxh64 (seed 0) over the header and the sums table as they lie in the file (little endian),
+ * streamed directly without allocating or copying. */
 static uint64_t ftr_hash(const uint8_t *hdr, const uint8_t *table, uint64_t ncells)
 {
-    uint8_t *b = malloc(CHUNK_HDR_BYTES + 8 * ncells);
-    if (!b)
-        return 0; /* the caller's comparison fails: an allocation failure reads as damage, never as a pass */
-    memcpy(b, hdr, CHUNK_HDR_BYTES);
-    memcpy(b + CHUNK_HDR_BYTES, table, 8 * ncells);
-    uint64_t h = xxh64(b, CHUNK_HDR_BYTES + 8 * ncells, 0);
-    free(b);
+    _Static_assert(CHUNK_HDR_BYTES >= 32 && CHUNK_HDR_BYTES % 32 == 0,
+                   "CHUNK_HDR_BYTES must be a positive multiple of 32");
+    static const uint64_t P1 = 11400714785074694791ULL;
+    static const uint64_t P2 = 14029467366897019727ULL;
+    static const uint64_t P3 = 1609587929392839161ULL;
+    static const uint64_t P4 = 9650029242287828579ULL;
+    uint64_t v1 = P1 + P2, v2 = P2, v3 = 0, v4 = (uint64_t)0 - P1;
+#define FTR_ROTL(x, r) (((x) << (r)) | ((x) >> (64 - (r))))
+#define FTR_ROUND(acc, in) (FTR_ROTL((acc) + (in) * P2, 31) * P1)
+#define FTR_MERGE(acc, v) (((acc) ^ FTR_ROUND(0, (v))) * P1 + P4)
+    for (size_t off = 0; off < CHUNK_HDR_BYTES; off += 32) {
+        v1 = FTR_ROUND(v1, get64(hdr + off));
+        v2 = FTR_ROUND(v2, get64(hdr + off + 8));
+        v3 = FTR_ROUND(v3, get64(hdr + off + 16));
+        v4 = FTR_ROUND(v4, get64(hdr + off + 24));
+    }
+    uint64_t i = 0;
+    for (; i + 4 <= ncells; i += 4) {
+        const uint8_t *p = table + 8 * i;
+        v1 = FTR_ROUND(v1, get64(p));
+        v2 = FTR_ROUND(v2, get64(p + 8));
+        v3 = FTR_ROUND(v3, get64(p + 16));
+        v4 = FTR_ROUND(v4, get64(p + 24));
+    }
+    uint64_t h = FTR_ROTL(v1, 1) + FTR_ROTL(v2, 7) + FTR_ROTL(v3, 12) + FTR_ROTL(v4, 18);
+    h = FTR_MERGE(h, v1);
+    h = FTR_MERGE(h, v2);
+    h = FTR_MERGE(h, v3);
+    h = FTR_MERGE(h, v4);
+    h += (uint64_t)CHUNK_HDR_BYTES + 8 * ncells;
+    for (; i < ncells; i++)
+        h = FTR_ROTL(h ^ FTR_ROUND(0, get64(table + 8 * i)), 27) * P1 + P4;
+    h ^= h >> 33;
+    h *= P2;
+    h ^= h >> 29;
+    h *= P3;
+    h ^= h >> 32;
+#undef FTR_ROTL
+#undef FTR_ROUND
+#undef FTR_MERGE
     return h;
 }
 
@@ -246,8 +280,7 @@ int chunk_ftr_check(const uint8_t *hdr, const uint8_t *table, uint64_t ncells, c
 {
     if (memcmp(ftr + 12, FTR_MAGIC, 4) != 0 || get32(ftr + 8) != ncells)
         return TSDB_ERR_CORRUPT;
-    uint64_t want = ftr_hash(hdr, table, ncells);
-    return want != 0 && want == get64(ftr) ? 0 : TSDB_ERR_CORRUPT;
+    return ftr_hash(hdr, table, ncells) == get64(ftr) ? 0 : TSDB_ERR_CORRUPT;
 }
 
 int chunk_image_parse(const uint8_t *buf, size_t n, bool check_cells, chunk_hdr *h, const uint8_t **cells,
