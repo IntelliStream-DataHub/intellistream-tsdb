@@ -42,7 +42,7 @@ cannot clash with another library's in the program that links it
 
 ## Why hand-written
 
-The API is about fifty functions and ten structs, and it changes rarely.
+The API is about seventy-five functions and twenty structs, and it changes rarely.
 Hand-written declarations need no libclang at build time and read like the
 header; `tests/layout.rs` compares the size and every field offset of each
 struct with what the C compiler says (`layout.c`), so a header change that

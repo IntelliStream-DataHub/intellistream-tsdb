@@ -88,7 +88,7 @@ volume path, for example, changes both). So:
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:
 
   ```
-  tsdb: the database has disk format version 7; tsdb 0.10.0 reads version 9 only. Export the data with the
+  tsdb: the database has disk format version 7; tsdb 0.11.0 reads version 9 only. Export the data with the
   release that wrote it and import it here (docs/compatibility.md)
   ```
 

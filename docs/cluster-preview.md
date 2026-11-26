@@ -49,8 +49,8 @@ If you do not use `--cluster`, none of this runs, and nothing about your server 
 ## What you need
 
 - A checkout of tsdb, built with `make` (the first step below does it). Linux. No root.
-- Three free ports for the servers' client side (17081 to 17083; the witness of step 9 has none) and four for their
-  peer side (17091 to 17094), on `127.0.0.1`. If something else uses one of them, change the numbers in the two
+- Four free ports for the servers' client side (17081 to 17083 and 17085; the witness of step 9 has none) and five for their
+  peer side (17091 to 17095), on `127.0.0.1`. If something else uses one of them, change the numbers in the two
   lines marked `# ports` in step 3: they are the only place where the block writes a port.
 - Nothing else. The block only writes under `/tmp/tsdb-cluster`.
 
@@ -524,7 +524,7 @@ more (at most `--voters`). A member that does not vote watches.
   whether a user was dropped meanwhile. It lets logins in once it has caught up; connect again then, or to another
   server (the clients do not retry a login by themselves).
 - **The block fails in the middle and servers keep running**: stop them by process id:
-  `for n in 1 2 3 4; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
+  `for n in 1 2 3 4 5; do kill $(cat /tmp/tsdb-cluster/n$n/pid); done`. Do not use `pkill` or `killall`: they stop every
   process with that name, also ones that are not yours.
 - **Two of the three nodes are gone**: the third has no majority. Its role stays `pre-candidate`, it shows `leader 0`,
   and the dead members stay `up` in its view: nobody is left to mark them down. The group changes nothing until

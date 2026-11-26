@@ -15,7 +15,7 @@ open an issue: read [SECURITY.md](SECURITY.md).
 - [docs/design.md](docs/design.md) explains how the storage works.
 - [docs/roadmap.md](docs/roadmap.md) says what is planned. For a big change, open an issue first so we can agree
   on the idea before you write the code.
-- [docs/compatibility.md](docs/compatibility.md) says what 0.9.x promises about the disk format and the wire
+- [docs/compatibility.md](docs/compatibility.md) says what 0.x promises about the disk format and the wire
   protocol (not much: both may still change before 1.0).
 
 ## Build
