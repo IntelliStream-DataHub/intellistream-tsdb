@@ -1502,6 +1502,55 @@ static void case_prefetch(void)
     printf("test_seam: prefetch: budget %" PRIu64 " (%" PRIu64 " ahead): peak %" PRIu64 " ahead, %" PRIu64
            " used, %" PRIu64 " wasted, the pinned entry kept\n", k2.budget, k2.pf_budget, k2.pf_peak, k2.pf_used,
            k2.pf_wasted);
+    /* 2b: pinned entries spread across shards exceeding a tight budget: pf_finish's cross-shard eviction sweep must
+     * traverse every shard and still evict zero pinned entries (deterministic across 64 shards, catches
+     * prefetchevictpinned regardless of evict_hand position) */
+    eccache_test_budget(x.t, 64ull << 20);
+    eccache_test_drop(x.t);
+    o = (buf){0};
+    raw_all(x.db, s[1], ty[1], 0, DAY - 1, &o, &rc);
+    free(o.b);
+    CHECK(rc == 0);
+    enum { MAX_PF_PINS = 64 };
+    void *pins[MAX_PF_PINS];
+    uint64_t poffs[MAX_PF_PINS], plens[MAX_PF_PINS];
+    size_t npins = 0;
+    uint64_t pinned_bytes = 0;
+    for (uint32_t j = 0; j < pb0->ix.n && npins < MAX_PF_PINS; j++) {
+        granule gj;
+        gx_load(pb0, j, GW_LOC, &gj);
+        uint64_t gl = (uint64_t)gj.ts_len + gj.val_len;
+        void *pe = eccache_test_pin(x.t, pb0->ec->rec.oid, gj.off);
+        if (pe) {
+            pins[npins] = pe;
+            poffs[npins] = gj.off;
+            plens[npins] = gl;
+            pinned_bytes += gl + ECCACHE_ENTRY_OVERHEAD;
+            npins++;
+        }
+    }
+    CHECK(npins >= 16 && pinned_bytes > 20 * avg);
+    uint64_t tight = pinned_bytes > avg ? pinned_bytes - avg : avg;
+    eccache_test_budget(x.t, tight);
+    eccache_test_prefetch(x.t, ECCACHE_PF_CAP);
+    for (size_t j = 0; j < npins; j++)
+        CHECK(eccache_resident(pb0, poffs[j], plens[j]) == plens[j]);
+    eccache_get_counters(x.t, &k0);
+    CHECK(raw_same(x.db, s[0], ty[0], 0, DAY - 1, &wa[0], "pa0, pinned over budget"));
+    eccache_get_counters(x.t, &k1);
+    CHECK(k1.pf_reads > k0.pf_reads && k1.evictions > k0.evictions && k1.pf_peak <= k1.pf_budget);
+    size_t kept = 0;
+    for (size_t j = 0; j < npins; j++) {
+        uint64_t r = eccache_resident(pb0, poffs[j], plens[j]);
+        CHECK(r == plens[j]);
+        if (r == plens[j]) {
+            kept++;
+            eccache_test_unpin(x.t, pins[j]); /* (a pinned entry the mutant evicted was freed: left alone) */
+        }
+    }
+    eccache_get_counters(x.t, &k2);
+    if (kept == npins)
+        CHECK(k2.bytes <= tight);
     eccache_test_budget(x.t, 64ull << 20);
 
     /* 3: the damaged granule 3 of pd's day 1 is in the window of granule 1's miss: dropped, then refused alone */

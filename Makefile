@@ -631,7 +631,7 @@ test-meta-1 test-meta-2: test-meta-%: $(B)/test_meta
 # table's order: `make test-meta` does not, it runs these)
 CLUSTER_SCEN_1 := secret relay initcrash dirsync exitthreads install reseed torn rebase slowinstall ids watch stall witness users \
     login userimport userstale userpromote userreplay userlease flags hbsections retired feed syncrace power \
-    powersnap life copyback voterstale dirsyncshared installshared powervote pendshared copyfault volumes \
+    powersnap life copyback voterstale snapmove dirsyncshared installshared powervote pendshared copyfault volumes \
     volrefuse snapversion links fwdlinks replicate replindet replfail replflip replepoch repldesc drvcheck replmeta replbulk failover failoverkeep fencecrash \
     promotecrash deposecrash pause promoteslow openread openreadlead
 CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail readdepose oneway oneway2 cutstuck manystuck \

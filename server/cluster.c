@@ -1602,18 +1602,29 @@ static struct addr_e *addr_entry(uint32_t id)
     return NULL;
 }
 
+static const struct meta_state *peer_state(void);
+
 static const char *peer_of(uint32_t id)
 {
-    const struct meta_member *m = meta_member(&C.sm, id);
+    const struct meta_state *s = peer_state();
+    const struct meta_member *m = meta_member(s, id);
     if (m && m->peer[0]) {
         addr_learn(id, m->peer); /* keeps the dial clock in one place */
         return m->peer;
     }
-    /* a core that restarted applies nothing until a leader reaches it; its probe's watch stream knows the others */
-    m = C.wsm_on ? meta_member(&C.wsm, id) : NULL;
-    if (m && m->peer[0]) {
-        addr_learn(id, m->peer);
-        return m->peer;
+    if (s != &C.sm) {
+        m = meta_member(&C.sm, id);
+        if (m && m->peer[0]) {
+            addr_learn(id, m->peer);
+            return m->peer;
+        }
+    }
+    if (C.wsm_on && s != &C.wsm) {
+        m = meta_member(&C.wsm, id);
+        if (m && m->peer[0]) {
+            addr_learn(id, m->peer);
+            return m->peer;
+        }
     }
     struct addr_e *a = addr_entry(id);
     return a ? a->peer : NULL;
@@ -3611,6 +3622,7 @@ static void core_stop(struct meta_state *next)
     raft_log_close(C.log);
     C.log = NULL;
     C.role = RAFT_FOLLOWER;
+    C.probe_at_start = 0;
     if (next) {
         meta_free(&C.sm);
         C.sm = *next;
@@ -3889,6 +3901,19 @@ static const struct meta_state *view_state(void)
     return cpy_ahead() ? &C.cpy : &C.sm;
 }
 
+/* The freshest metadata state for locating peers: C.sm, upgraded to C.cpy when ahead (unless CLM_PROBELATE is planted,
+ * which tests learning peer addresses from the probe watch stream rather than local state), and upgraded to C.wsm when
+ * the watch stream is ahead of that. */
+static const struct meta_state *peer_state(void)
+{
+    const struct meta_state *s = &C.sm;
+    if (C.cpy_on && cl_mutant() != CLM_PROBELATE && state_after(&C.cpy, s))
+        s = &C.cpy;
+    if (C.wsm_on && state_after(&C.wsm, s))
+        s = &C.wsm;
+    return s;
+}
+
 /* Item 8, for every member (a voter writes its copy after it applied, a watcher after its stream moved it), on the
  * disk worker. The file never goes back: an image below the file's index under the same restore generation is not
  * written (a restarted voter applies from its snapshot up, behind the copy it loaded), and an equal one is not
@@ -4077,7 +4102,7 @@ static void put_status(struct buf *b)
 static const char *leader_peer(void)
 {
     uint32_t l = C.r ? raft_get_leader(C.r) : C.hint_leader;
-    const struct meta_member *m = l ? meta_member(&C.sm, l) : NULL;
+    const struct meta_member *m = l ? meta_member(peer_state(), l) : NULL;
     return m ? m->peer : "";
 }
 
@@ -6946,7 +6971,8 @@ static void watch_duty(uint64_t now)
      * empty state named nobody to answer; never dropping its core, it sat as a follower of no configuration). */
     if (C.probe_at_start && C.r) {
         raft_config own;
-        if (raft_get_leader(C.r) && config_of(&C.sm, &own) && in_config(&own, C.id))
+        if (raft_get_leader(C.r) && config_of(&C.sm, &own) && in_config(&own, C.id) &&
+            !cpy_ahead() && (!C.wsm_on || !state_after(&C.wsm, &C.sm)))
             C.probe_at_start = 0;
     }
     int early = C.probe_at_start && cl_mutant() != CLM_PROBELATE;
@@ -6990,13 +7016,14 @@ static void watch_duty(uint64_t now)
         C.wsm_on = 1;
     }
     struct meta_state *st = C.r ? &C.wsm : &C.sm;
-    /* where to watch: the servers in the group as this state knows them, else the seeds */
+    /* where to watch: the servers in the group as the freshest known state names them, else the seeds */
     const char *cand[RAFT_MEMBERS_MAX + 16];
     unsigned n = 0;
+    const struct meta_state *cs = cl_mutant() == CLM_PROBELATE ? &C.sm : peer_state();
     raft_config cfg;
-    if (config_of(&C.sm, &cfg))
+    if (config_of(cs, &cfg))
         for (unsigned i = 0; i < cfg.n; i++) {
-            const struct meta_member *m = meta_member(&C.sm, cfg.m[i].id);
+            const struct meta_member *m = meta_member(cs, cfg.m[i].id);
             if (m && m->id != C.id && m->peer[0])
                 cand[n++] = m->peer;
         }
@@ -7019,21 +7046,23 @@ static void watch_duty(uint64_t now)
     conn_send(c, 0);
 }
 
-/* NODE's seeds follow the voters' peer addresses as the applied state names them. A server that restarts knows the
- * others only from NODE until a leader reaches it (a core applies nothing before that, a watcher has no stream yet):
- * the seeds a JOIN wrote (or none, on the server that ran INIT) go stale as the group changes, and a server that
- * finds none of them is cut off for good. Hints only: a failed write keeps the old file and is tried again later. */
+/* NODE's seeds follow the voters' peer addresses as view_state() names them (the freshest of C.sm and C.cpy). A server
+ * that restarts knows the others only from NODE until a leader reaches it (a core applies nothing before that, a
+ * watcher has no stream yet): the seeds a JOIN wrote (or none, on the server that ran INIT) go stale as the group
+ * changes, and a server that finds none of them is cut off for good. Hints only: a failed write keeps the old file and
+ * is tried again later. */
 static void seeds_refresh(uint64_t now)
 {
     static uint64_t retry_ns;
-    if (!C.have_node || !C.sm.initialised || (retry_ns && now < retry_ns))
+    const struct meta_state *S = view_state();
+    if (!C.have_node || !S->initialised || (retry_ns && now < retry_ns))
         return;
     raft_config cfg;
-    if (!config_of(&C.sm, &cfg))
+    if (!config_of(S, &cfg))
         return;
     char seeds[sizeof C.seeds] = "";
     for (unsigned i = 0; i < cfg.n; i++) {
-        const struct meta_member *m = meta_member(&C.sm, cfg.m[i].id);
+        const struct meta_member *m = meta_member(S, cfg.m[i].id);
         if (!m || cfg.m[i].learner || !m->peer[0] || strlen(seeds) + strlen(m->peer) + 2 >= sizeof seeds)
             continue;
         if (seeds[0])
