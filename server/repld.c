@@ -1780,6 +1780,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 rc = TSDB_ERR_CORRUPT;
             if (rc == 0) {
                 rv->mode = M_PROMOTING;
+                rv->fetch_wait_until = 0;
                 rv->epoch_pos = pos;
                 hist_note(rv, a->rec.epoch, pos);
                 idx_push(rv, pos, pos);
@@ -1830,6 +1831,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
         }
         if (a->pos < rv->idx_end)
             rtr_note_cut();
+        rv->fetch_wait_until = 0;
         idx_cut(rv, a->pos);
         hist_cut(rv, a->pos);
         break;
@@ -2057,6 +2059,7 @@ static void exec_write_batch(struct rvol *rv, uint32_t i0, const struct repl_rec
                           : replica_append(db, seq, seg_off, bytes, blen);
     pthread_mutex_lock(&rv->mu);
     if (rc == 0) {
+        rv->fetch_wait_until = 0;
         for (uint32_t k = 0; k < cnt; k++) {
             hist_note(rv, brecs[k].epoch, brecs[k].pos);
             idx_push(rv, brecs[k].pos, brecs[k].pos + brecs[k].n - 1);
@@ -2195,6 +2198,12 @@ static struct repl_vmeta vmeta_of(const struct rvol *rv)
 
 static void handle(struct rvol *rv, struct item *it)
 {
+    if (it->kind == IN_WAKE) {
+        rv->fetch_wait_until = 0;
+        if (rv->mode == M_REPLICA)
+            rv->sync_wanted = 1;
+        return;
+    }
     if (it->kind == IN_FENCE) { /* design-cluster.md 6.2 step 1: the core saves it (SAVE) before it replies */
         uint64_t fence;
         if (it->n != sizeof fence)
@@ -2208,6 +2217,7 @@ static void handle(struct rvol *rv, struct item *it)
         return;
     }
     if (it->kind == IN_META) {
+        rv->fetch_wait_until = 0;
         rset_apply(rv); /* a set change first: the META below is in the core's set version (src/repl.h) */
         struct repl_msg m = {.type = REPL_M_META, .from = REPL_META, .to = rv->self, .leader = -1};
         m.meta = vmeta_of(rv);
@@ -2385,6 +2395,7 @@ static int sync_held(void)
 static void do_sync(struct rvol *rv)
 {
     rv->sync_wanted = 0;
+    rv->fetch_wait_until = 0;
     if (rv->mode == M_REPLICA &&
         ((G.sync_pause && now_ms() < rv->sync_pause_end) || (G.sync_hold && sync_held()))) {
         rv->sync_paused = 1; /* the tick hands it back once the pause/hold is over */
@@ -2400,6 +2411,7 @@ static void do_sync(struct rvol *rv)
     char name[RW_NAME_MAX + 1] = "";
     uint64_t size = 0, mpos = 0;
     int missing = d < w && replica_missing(db, &mpos, name, sizeof name, &size) == 1;
+    int still_missing = missing;
     if (ab && !missing)
         d = w; /* written, never synced, reported durable */
     tsdb_cvol_unref(&db);
@@ -2434,6 +2446,17 @@ static void do_sync(struct rvol *rv)
             plink_send(l, RW_T_FETCH, b, n, 0);
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
         rv->fetch_ms = now_ms();
+    }
+    if (still_missing && rv->mode == M_REPLICA) {
+        /* Avoid busy-looping do_sync + flooding duplicate ACKs while waiting for a fetched file: IN_WAKE (on stage),
+         * new WAL appends/cuts, leader changes (IN_META), or the 1 s retry timer wake it. */
+        uint64_t now = now_ms();
+        if (G.fetch_late && now < rv->fetch_late_ms + FETCH_LATE_MS) {
+            rv->fetch_wait_until = rv->fetch_late_ms + FETCH_LATE_MS;
+        } else {
+            uint64_t next = rv->fetch_ms + 1000;
+            rv->fetch_wait_until = next > now ? next : now + 1000;
+        }
     }
 }
 
@@ -2505,6 +2528,7 @@ static void demote(struct rvol *rv)
     tsdb_cvol_unref(&db);
     rv->core = NULL;
     rv->mode = M_REPLICA;
+    rv->fetch_wait_until = 0;
     rv->isr_want = 0;
     rv->synced_rep = rv->held_commit = rv->epoch_pos = 0;
     rv->cstall_at = rv->cstall_ms = 0;
@@ -2598,7 +2622,7 @@ static void *vol_main(void *arg)
             long_step(rv, h0, &next_tick);
             continue;
         }
-        if (rv->sync_wanted && mine) {
+        if (rv->sync_wanted && (!rv->fetch_wait_until || now >= rv->fetch_wait_until) && mine) {
             uint64_t h0 = now_ms();
             do_sync(rv);
             long_step(rv, h0, &next_tick);

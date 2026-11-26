@@ -2292,19 +2292,20 @@ static int rep_isr_mask(uint64_t *ver)
     return mask;
 }
 
-/* The filler: inserts of 50-1550 rows to "kvr.fill" at a frontier that only moves ahead, a row every 1, 3, 8 or 50 ms
- * of timestamps for a minute of them at a time (classes: the series' class follows its rate), most of them large
+/* The filler: inserts of 50-1550 rows to "kvr.fill" at a frontier that only moves ahead, cycling through spacings of
+ * 1, 50, 3 and 8 ms every 16 acknowledged batches (classes: each phase crosses out of the previous class's band within
+ * seconds, avoiding long in-band streaks at 1 ms where 60 s of timestamps takes ~75 batches), most of them large
  * writes that the driver ships as files (prepared-before-commit). Each batch is recorded (fbatch) and checked in every
  * replica directory at the end (fill_check): whole or absent, whole when acknowledged, absent when refused. */
 static void *fill_writer(void *arg)
 {
     (void)arg;
-    static const int spacing[4] = {1, 3, 8, 50};
+    static const int spacing[4] = {1, 50, 3, 8};
     int64_t *ts = malloc(1600 * sizeof *ts), front = FILL_BASE;
     float *val = malloc(1600 * sizeof *val);
     if (!ts || !val)
         die(2, "out of memory");
-    uint64_t r = mix(seed * 77 + 5);
+    uint64_t r = mix(seed * 77 + 5), ok_n = 0;
     tsdbc *c = NULL;
     tsdb_sid sid = 0;
     while (atomic_load(&kv_run)) {
@@ -2318,10 +2319,11 @@ static void *fill_writer(void *arg)
             }
         }
         int n = 50 + (int)(mix(r += 1) % 1501);
+        int sp = spacing[(ok_n / 16 + seed) % 4];
         for (int j = 0; j < n; j++) {
             ts[j] = front;
             val[j] = (float)(j % 997);
-            front += spacing[mix(seed + (uint64_t)((front - FILL_BASE) / 60000)) % 4];
+            front += sp;
         }
         if (nfb == cfb) {
             cfb = cfb ? 2 * cfb : 1024;
@@ -2333,6 +2335,7 @@ static void *fill_writer(void *arg)
         int rc = tsdbc_insert_series(c, sid, ts, val, (size_t)n);
         if (rc == 0) {
             b->st = WS_OK;
+            ok_n++;
             atomic_fetch_add(&fill_ok, 1);
         } else {
             if (rc == TSDB_ERR_UNAVAILABLE || rc == TSDB_ERR_MOVED || rc == TSDB_ERR_INVALID || rc == TSDB_ERR_DROPPED ||
@@ -3840,13 +3843,14 @@ static void nem_terminal(void)
                 net_cut(L, j, 1);
         net_cut_done();
     }
-    int ended[MAXN] = {0}, nend = 0, healed = !fo;
+    int ended[MAXN] = {0}, nend = 0, healed = !fo, kill_n = -1;
     int64_t t0 = now_ms(), first = -1;
     for (;;) {
+        L = atomic_load(&kv_leader);
+        /* Poll every replica of kvr: leadership may have moved since the prior midcommit round (or move while we wait),
+         * and leader-only / replica-only crash points are only reachable on the member playing that role. */
         for (int r = 0; r < rep_n; r++) {
             int i = rep_nodes[r];
-            if (!fo && (cps[term_cp].leader == 3 ? i == L : i != L)) /* 3: a replica applying a COLD (cluster_ec.h) */
-                continue;
             pid_t pid;
             node_snap(i, &pid, NULL, NULL);
             if (pid <= 0 || ended[i])
@@ -3874,26 +3878,30 @@ static void nem_terminal(void)
     }
     if (!healed)
         net_heal();
+    L = atomic_load(&kv_leader);
     if (first < 0) {
         unlink(term_trigger);
         cp_unfired++;
         snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired on %s within %d ms of its "
                  "trigger", cps[term_cp].name, fo ? "any node of kvr (its leader cut from the others)" :
                  "kvr's leader", win);
-        if (!fo)
-            stop_node(L, SIGKILL);
+        if (!fo) {
+            kill_n = L;
+            stop_node(kill_n, SIGKILL);
+        }
     } else {
         cp_hits += (unsigned)nend;
         cp_hits_serving += (unsigned)nend;
         term_fired = 1;
         printf("jepsen-cluster: terminal crash point %s: %d node(s) ended there, %s%s\n", cps[term_cp].name, nend,
-               ended[L] ? "the leader" : "not the leader", fo ? " (failover)" : "");
+               (ended[L] || (!fo && cps[term_cp].leader == 1)) ? "the leader" : "not the leader",
+               fo ? " (failover)" : "");
     }
     effect_seen = 1;
     term_done = 1;
     hold_ms(rnd_range(200, 800));
     for (int i = 0; i < nn; i++)
-        if (ended[i] || (first < 0 && !fo && i == L))
+        if (ended[i] || (first < 0 && !fo && i == kill_n))
             restart_node(i);
 }
 

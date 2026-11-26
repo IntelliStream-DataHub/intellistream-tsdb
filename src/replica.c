@@ -89,6 +89,7 @@ struct replica {
     _Atomic uint64_t apply_next; /* the next position to apply (written under mu, read anywhere) */
     uint64_t act_seq;    /* the segment the active memtable holds (0: none yet) */
     uint64_t sealed_seq; /* the highest segment whose memtable was sealed: records of it or below are refused */
+    uint64_t synced_next;          /* positions below this have been fdatasynced in the WAL (mu; before hold_cap) */
     _Atomic uint64_t durable_next; /* positions below this are durable (written under mu, read anywhere) */
     _Atomic uint64_t log_next;     /* db->fno_next, for readers without a lock (written under mu) */
     uint64_t cut_gen, last_cut_next;
@@ -447,6 +448,7 @@ int replica_open_log(eng *db, uint64_t floor, int (*cut_tails)(eng *))
     /* segments up to parts_seq are in parts (flushes go in segment order; a large write's parts carry no segment):
      * MANIFEST says so, or a reader of the directory would take the rows of a kept segment over a later delete */
     db->wal_flushed = MAX(db->wal_open_removed, parts_seq);
+    rp->synced_next = db->fno_next;
     rp->durable_next = db->fno_next; /* synced above (fsync on): the files' bytes are durable now */
     rp->log_next = db->fno_next;
     /* The segments up to RSTATE's `kept` are wholly in parts and applied (kept_save names no other): neither replayed
@@ -795,8 +797,11 @@ static int kept_save(eng *db, struct replica *rp)
         rp->nkq -= n;
     }
     pthread_mutex_unlock(&rp->unl_mu);
-    if (seq <= rp->rs.kept)
+    if (seq <= rp->rs.kept) {
+        if (seq > atomic_load(&rp->kept_saved))
+            atomic_store(&rp->kept_saved, seq);
         return 0;
+    }
     rp->rs.kept = seq;
     if (eng_test_mutant == MUT_REPLAY_START_UNSAVED) /* planted: told before the save is durable */
         atomic_store(&rp->kept_saved, seq);
@@ -2327,6 +2332,8 @@ static int replica_append_impl(eng *db, uint64_t seq, uint64_t off, const void *
                 eng_fail(db, "replica WAL fdatasync", errno);
                 rc = TSDB_ERR_IO;
             } else {
+                if (first > rp->synced_next)
+                    rp->synced_next = first;
                 durable_raise(rp, first);
                 close(db->wal_fd);
                 db->wal_fd = -1;
@@ -2412,6 +2419,11 @@ int replica_sync(eng *db)
         pthread_mutex_unlock(&rp->mu);
         return rc;
     }
+    if (rp->synced_next >= db->fno_next) {
+        durable_raise(rp, rp->synced_next);
+        pthread_mutex_unlock(&rp->mu);
+        return 0;
+    }
     int fd = db->opt.fsync ? dup(db->wal_fd) : -1;
     uint64_t target = db->fno_next, gen = rp->cut_gen;
     pthread_mutex_unlock(&rp->mu);
@@ -2431,7 +2443,9 @@ int replica_sync(eng *db)
     /* gaps 9 and 12: a sync that began before a cut does not cover what was written again after it */
     uint64_t end = rp->cut_gen == gen || eng_test_mutant == MUT_REPLICA_NO_CUT_GEN ? target : MIN(target, rp->last_cut_next);
     end = MIN(end, db->fno_next);
-    durable_raise(rp, end);
+    if (end > rp->synced_next)
+        rp->synced_next = end;
+    durable_raise(rp, rp->synced_next);
     pthread_mutex_unlock(&rp->mu);
     return 0;
 }
@@ -2578,6 +2592,7 @@ int replica_cut(eng *db, uint64_t last)
                 cm_remove(db, rp, i, false);
         /* what stays was synced (the cut's own sync, the rotations'), but a COMMIT marker below the cut whose files are
          * not staged still holds it: a cut never acknowledges a marker without its files (r3e: the apply then failed) */
+        rp->synced_next = last + 1;
         rp->durable_next = eng_test_mutant == MUT_REPLICA_CUT_NO_HOLD ? last + 1 : MIN(last + 1, hold_cap(rp));
         rp->cut_gen++;
         rp->last_cut_next = last + 1;
