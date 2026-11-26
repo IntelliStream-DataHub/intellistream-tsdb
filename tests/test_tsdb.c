@@ -3359,6 +3359,178 @@ static void test_raw_many_parts(const char *base)
     rm_rf(dir);
 }
 
+/* Lock-free series_dict snapshots (series_type, series_name, series_check) under concurrent growth across all 5 value
+ * types + single-pass type partitioning in mt_write (both single-type and multi-type flushes). */
+typedef struct {
+    tsdb *db;
+    int tid;
+    int per_thread;
+    int total;
+    _Atomic tsdb_sid *sids;
+    _Atomic int *stop;
+} slf_ctx;
+
+static void *slf_creator(void *arg)
+{
+    slf_ctx *c = arg;
+    for (int i = 0; i < c->per_thread; i++) {
+        int idx = c->tid * c->per_thread + i;
+        char nm[64];
+        snprintf(nm, sizeof nm, "slf.t%d.s%04d", c->tid, i);
+        tsdb_type ty = (tsdb_type)(idx % NTYPES);
+        tsdb_sid id = 0;
+        OK(tsdb_series_create(c->db, nm, ty, NULL, &id));
+        atomic_store_explicit(&c->sids[idx], id, memory_order_release);
+        if ((i & 31) == 31) {
+            /* unsorted multi-series insert of the same type: exercises lock-free series_check */
+            tsdb_sid sv[8];
+            int64_t tv[8];
+            float f32[8];
+            double f64[8];
+            int64_t i64[8];
+            uint8_t b8[8];
+            uint32_t st[8];
+            size_t m = 0;
+            for (int k = i; k >= 0 && m < 8; k--) {
+                int j = c->tid * c->per_thread + k;
+                if ((tsdb_type)(j % NTYPES) != ty)
+                    continue;
+                tsdb_sid s = atomic_load_explicit(&c->sids[j], memory_order_acquire);
+                if (!s)
+                    continue;
+                sv[m] = s;
+                tv[m] = 1000000 + (int64_t)(idx * 10 + (int)m);
+                f32[m] = (float)(j + 1);
+                f64[m] = (double)(j + 1);
+                i64[m] = (int64_t)(j + 1);
+                b8[m] = (uint8_t)(j & 1);
+                st[m] = 1;
+                m++;
+            }
+            if (m) {
+                tsdb_values v = {.type = ty,
+                                 .values = ty == TSDB_FLOAT32   ? (const void *)f32
+                                           : ty == TSDB_FLOAT64 ? (const void *)f64
+                                           : ty == TSDB_INT64   ? (const void *)i64
+                                           : ty == TSDB_BOOL    ? (const void *)b8
+                                                                : (const void *)st,
+                                 .valid = NULL};
+                OK(tsdb_insert_values(c->db, sv, tv, &v, m));
+            }
+        }
+    }
+    return NULL;
+}
+
+static void *slf_reader(void *arg)
+{
+    slf_ctx *c = arg;
+    int total = c->total;
+    uint64_t r = 0x123456789abcdef0ull ^ (uint64_t)(c->tid + 1) * 0x9e3779b97f4a7c15ull;
+    while (!atomic_load_explicit(c->stop, memory_order_acquire)) {
+        for (int k = 0; k < 64; k++) {
+            r ^= r << 13, r ^= r >> 7, r ^= r << 17;
+            int idx = (int)(r % (uint64_t)total);
+            tsdb_sid id = atomic_load_explicit(&c->sids[idx], memory_order_acquire);
+            if (!id)
+                continue;
+            tsdb_type ty = TSDB_FLOAT32;
+            OK(tsdb_series_type(c->db, id, &ty));
+            CHECK(ty == (tsdb_type)(idx % NTYPES));
+            const char *nm = tsdb_series_name(c->db, id);
+            CHECK(nm != NULL && strncmp(nm, "slf.t", 5) == 0);
+            tsdb_sid looked = 0;
+            OK(tsdb_series_lookup(c->db, nm, &looked));
+            CHECK(looked == id);
+        }
+    }
+    return NULL;
+}
+
+static void test_series_lockfree_mt(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-slf-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 1;
+    o.buffer_rows = 4096;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    enum { NTH = 4, PER = 600, TOTAL = NTH * PER };
+    _Atomic tsdb_sid *sids = calloc(TOTAL, sizeof *sids);
+    CHECK(sids != NULL);
+    _Atomic int stop = 0;
+    slf_ctx cctx[NTH], rctx[NTH];
+    pthread_t ct[NTH], rt[NTH];
+    for (int i = 0; i < NTH; i++) {
+        cctx[i] = (slf_ctx){db, i, PER, TOTAL, sids, &stop};
+        rctx[i] = (slf_ctx){db, i, PER, TOTAL, sids, &stop};
+        CHECK(pthread_create(&rt[i], NULL, slf_reader, &rctx[i]) == 0);
+        CHECK(pthread_create(&ct[i], NULL, slf_creator, &cctx[i]) == 0);
+    }
+    for (int i = 0; i < NTH; i++)
+        pthread_join(ct[i], NULL);
+    atomic_store_explicit(&stop, 1, memory_order_release);
+    for (int i = 0; i < NTH; i++)
+        pthread_join(rt[i], NULL);
+    /* Write one row of each of the 5 types into the same memtable and flush (multi-type mt_write). */
+    for (int i = 0; i < 50; i++) {
+        tsdb_sid id = atomic_load(&sids[i]);
+        tsdb_type ty = (tsdb_type)(i % NTYPES);
+        int64_t ts = 2000000 + i;
+        float f32 = (float)(i + 10);
+        double f64 = (double)(i + 10);
+        int64_t i64 = i + 10;
+        uint8_t b8 = (uint8_t)(i & 1);
+        uint32_t st = 0;
+        if (ty == TSDB_STATE)
+            OK(tsdb_state(db, id, "ok", &st));
+        tsdb_values v = {.type = ty,
+                         .values = ty == TSDB_FLOAT32   ? (const void *)&f32
+                                   : ty == TSDB_FLOAT64 ? (const void *)&f64
+                                   : ty == TSDB_INT64   ? (const void *)&i64
+                                   : ty == TSDB_BOOL    ? (const void *)&b8
+                                                        : (const void *)&st,
+                         .valid = NULL};
+        OK(tsdb_insert_series_values(db, id, &ts, &v, 1));
+    }
+    OK(tsdb_flush(db));
+    /* Single-type memtable flush fast path too. */
+    for (int i = 0; i < 50; i += NTYPES) {
+        tsdb_sid id = atomic_load(&sids[i]);
+        int64_t ts = 3000000 + i;
+        float f32 = (float)(i + 100);
+        OK(tsdb_insert_series(db, id, &ts, &f32, 1));
+    }
+    OK(tsdb_flush(db));
+    /* Verify every created series still resolves cleanly before and after reopen. */
+    for (int i = 0; i < TOTAL; i++) {
+        tsdb_sid id = atomic_load(&sids[i]);
+        tsdb_type ty = TSDB_FLOAT32;
+        OK(tsdb_series_type(db, id, &ty));
+        CHECK(ty == (tsdb_type)(i % NTYPES));
+        CHECK(tsdb_series_name(db, id) != NULL);
+    }
+    OK(tsdb_close(db));
+    OK(tsdb_open(dir, &o, &db));
+    for (int i = 0; i < 50; i++) {
+        tsdb_sid id = atomic_load(&sids[i]);
+        tsdb_latest_result r;
+        OK(tsdb_latest(db, &id, 1, NULL, &r));
+        CHECK(r.status == 0 && r.kind == TSDB_LATEST_VALUE);
+        if (i % NTYPES == 0)
+            CHECK(r.ts == 3000000 + i && r.v.f32 == (float)(i + 100));
+        else
+            CHECK(r.ts == 2000000 + i);
+    }
+    OK(tsdb_close(db));
+    free(sids);
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_tsdb", 1200);
@@ -3422,6 +3594,8 @@ int main(int argc, char **argv)
     test_merging_parts(base);
     printf("raw queries over many parts\n");
     test_raw_many_parts(base);
+    printf("lock-free series dictionary and mixed mt_write\n");
+    test_series_lockfree_mt(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

@@ -858,11 +858,14 @@ static void lookup_hold(eng *db, const uint32_t *local, size_t m, const int64_t 
     }
     pthread_mutex_unlock(&db->buf_lock);
     pthread_mutex_unlock(&db->lock);
+    int64_t floor = t->drop_floor;
+    bool has_ret = atomic_load_explicit(&db->has_retention, memory_order_relaxed);
+    int64_t now = has_ret ? eng_now_ms(db) : 0;
     for (size_t i = 0; i < m; i++) {
         lhold *x = &h[i];
         x->has_entry = lt_load(t, local[i], &x->e);
-        x->floor = t->drop_floor;
-        x->cutoff = eng_cutoff(db, local[i]); /* inside the hold: a lengthened limit marks entries in one section */
+        x->floor = floor;
+        x->cutoff = has_ret ? eng_cutoff_at(db, local[i], now) : INT64_MIN; /* inside the hold: a lengthened limit marks entries in one section */
         lmc_read(fl, local[i], visible, &x->f);
     }
     lt_hook(db, LH_LOOKUP_AFTER_ENTRY);

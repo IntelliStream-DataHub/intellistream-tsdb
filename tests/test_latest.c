@@ -2090,6 +2090,218 @@ static void test_lf_free_unlocked(void)
     tsdb_test_latest_window(50000);
 }
 
+/* Multi-volume batched routing in tsdb_latest & tsdb_series_stats, quiesced volumes, follower catch-up, and slow-path
+ * scratch reuse + batched mt_copy_raw across > LM_SLICE series with active memtable, parts and tombstones. */
+static void test_latest_multivol_batch(void)
+{
+    char dir[700], v1[720], v2[720], v3[720];
+    snprintf(dir, sizeof dir, "%s/latest_mvb", root);
+    snprintf(v1, sizeof v1, "%s/latest_mvb_v1", root);
+    snprintf(v2, sizeof v2, "%s/latest_mvb_v2", root);
+    snprintf(v3, sizeof v3, "%s/latest_mvb_v3", root);
+    rmrf(dir), rmrf(v1), rmrf(v2), rmrf(v3);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.granule_rows = 16;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t vi1 = 0, vi2 = 0, vi3 = 0;
+    OK(tsdb_volume_add(db, v1, &vi1));
+    OK(tsdb_volume_add(db, v2, &vi2));
+    CHECK(vi1 == 1 && vi2 == 2);
+    const char *vpaths[3] = {NULL, v1, v2};
+    enum { NS = 240 }; /* > LM_SLICE (64) per volume to cross multiple slices */
+    tsdb_sid sids[NS];
+    for (int i = 0; i < NS; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "mvb.s%03d", i);
+        OK(tsdb_series_create(db, nm, TSDB_FLOAT64, vpaths[i % 3], &sids[i]));
+        put_f64(db, sids[i], 100, (double)(i + 1), false);
+        put_f64(db, sids[i], 200, (double)(i + 1000), false);
+    }
+    OK(tsdb_flush(db));
+    /* Delete ts=200 on every 5th series (tombstones in parts), and write active memtable rows on every 2nd series. */
+    for (int i = 0; i < NS; i++) {
+        if (i % 5 == 0)
+            OK(tsdb_delete_range(db, sids[i], 200, 201));
+        if (i % 2 == 0)
+            put_f64(db, sids[i], 300, (double)(i + 3000), (i % 6 == 0)); /* some nulls in active memtable */
+    }
+    /* Mixed query array: all 240 interleaved valid IDs + duplicates + malformed + nonexistent local + nonexistent vol */
+    enum { QN = NS + 8 };
+    tsdb_sid q[QN];
+    for (int i = 0; i < NS; i++)
+        q[i] = sids[i];
+    q[NS + 0] = sids[0];                 /* duplicate */
+    q[NS + 1] = sids[1];                 /* duplicate */
+    q[NS + 2] = 0;                       /* malformed */
+    q[NS + 3] = (uint64_t)1 << 50;       /* malformed */
+    q[NS + 4] = TSDB_SID(0, 99999);      /* nonexistent local in vol 0 */
+    q[NS + 5] = TSDB_SID(1, 99999);      /* nonexistent local in vol 1 */
+    q[NS + 6] = TSDB_SID(99, 0);         /* nonexistent vol */
+    q[NS + 7] = sids[2];                 /* duplicate */
+    tsdb_latest_result res[QN];
+    for (int wn = 0; wn < 2; wn++) {
+        tsdb_latest_opts lo = {.end = TSDB_TS_MAX, .with_nulls = wn};
+        OK(tsdb_latest(db, q, QN, &lo, res));
+        for (int i = 0; i < NS; i++) {
+            CHECK(res[i].status == 0);
+            if (i % 2 == 0 && i % 6 == 0) {
+                if (wn)
+                    CHECK(res[i].kind == TSDB_LATEST_NULL && res[i].ts == 300);
+                else if (i % 5 == 0)
+                    CHECK(res[i].kind == TSDB_LATEST_VALUE && res[i].ts == 100 && res[i].v.f64 == (double)(i + 1));
+                else
+                    CHECK(res[i].kind == TSDB_LATEST_VALUE && res[i].ts == 200 && res[i].v.f64 == (double)(i + 1000));
+            } else if (i % 2 == 0) {
+                CHECK(res[i].kind == TSDB_LATEST_VALUE && res[i].ts == 300 && res[i].v.f64 == (double)(i + 3000));
+            } else if (i % 5 == 0) {
+                CHECK(res[i].kind == TSDB_LATEST_VALUE && res[i].ts == 100 && res[i].v.f64 == (double)(i + 1));
+            } else {
+                CHECK(res[i].kind == TSDB_LATEST_VALUE && res[i].ts == 200 && res[i].v.f64 == (double)(i + 1000));
+            }
+        }
+        CHECK(res[NS + 0].status == 0 && res[NS + 0].kind == res[0].kind && res[NS + 0].ts == res[0].ts);
+        CHECK(res[NS + 1].status == 0 && res[NS + 1].kind == res[1].kind && res[NS + 1].ts == res[1].ts);
+        CHECK(res[NS + 2].status == TSDB_ERR_NOTFOUND);
+        CHECK(res[NS + 3].status == TSDB_ERR_NOTFOUND);
+        CHECK(res[NS + 4].status == TSDB_ERR_NOTFOUND);
+        CHECK(res[NS + 5].status == TSDB_ERR_NOTFOUND);
+        CHECK(res[NS + 6].status == TSDB_ERR_NOTFOUND);
+        CHECK(res[NS + 7].status == 0 && res[NS + 7].kind == res[2].kind && res[NS + 7].ts == res[2].ts);
+    }
+    /* Quiesce volume 1: its IDs must return UNAVAILABLE while volumes 0 and 2 still succeed. */
+    OK(tsdb_volume_quiesce(db, 1));
+    OK(tsdb_latest(db, q, QN, NULL, res));
+    for (int i = 0; i < NS; i++) {
+        if (i % 3 == 1)
+            CHECK(res[i].status == TSDB_ERR_UNAVAILABLE);
+        else
+            CHECK(res[i].status == 0 && res[i].kind == TSDB_LATEST_VALUE);
+    }
+    CHECK(res[NS + 1].status == TSDB_ERR_UNAVAILABLE);
+    CHECK(res[NS + 5].status == TSDB_ERR_UNAVAILABLE); /* quiesced vol even for unknown local */
+    OK(tsdb_volume_resume(db, 1));
+    OK(tsdb_flush(db));
+    /* Follower catch-up on newly created series (in vol 0) and newly added volume 3, for both tsdb_latest and
+     * tsdb_series_stats. */
+    tsdb_options fo;
+    tsdb_options_init(&fo);
+    fo.read_only = 1;
+    tsdb *f = NULL;
+    OK(tsdb_open(dir, &fo, &f));
+    tsdb_sid s_new0 = 0, s_new3 = 0;
+    OK(tsdb_series_create(db, "mvb.late0", TSDB_FLOAT64, NULL, &s_new0));
+    put_f64(db, s_new0, 555, 42.5, false);
+    OK(tsdb_volume_add(db, v3, &vi3));
+    CHECK(vi3 == 3);
+    OK(tsdb_series_create(db, "mvb.late3", TSDB_FLOAT64, v3, &s_new3));
+    put_f64(db, s_new3, 777, 99.25, false);
+    OK(tsdb_flush(db));
+    tsdb_sid fq[6] = {sids[0], s_new0, s_new3, s_new3, TSDB_SID(0, 88888), 0};
+    tsdb_latest_result fres[6];
+    OK(tsdb_latest(f, fq, 6, NULL, fres));
+    CHECK(fres[0].status == 0 && fres[0].kind == TSDB_LATEST_VALUE);
+    CHECK(fres[1].status == 0 && fres[1].kind == TSDB_LATEST_VALUE && fres[1].ts == 555 && fres[1].v.f64 == 42.5);
+    CHECK(fres[2].status == 0 && fres[2].kind == TSDB_LATEST_VALUE && fres[2].ts == 777 && fres[2].v.f64 == 99.25);
+    CHECK(fres[3].status == 0 && fres[3].kind == TSDB_LATEST_VALUE && fres[3].ts == 777 && fres[3].v.f64 == 99.25);
+    CHECK(fres[4].status == TSDB_ERR_NOTFOUND);
+    CHECK(fres[5].status == TSDB_ERR_NOTFOUND);
+    /* Also verify tsdb_series_stats follower catch-up on a fresh read-only handle */
+    OK(tsdb_close(f));
+    OK(tsdb_open(dir, &fo, &f));
+    tsdb_sid s_new0b = 0;
+    OK(tsdb_series_create(db, "mvb.late0b", TSDB_FLOAT64, NULL, &s_new0b));
+    put_f64(db, s_new0b, 888, 12.0, false);
+    OK(tsdb_flush(db));
+    tsdb_sid sq[6] = {sids[0], s_new0b, s_new0b, s_new3, TSDB_SID(3, 99999), 0};
+    tsdb_series_stat sres[6];
+    size_t done = 0;
+    OK(tsdb_series_stats(f, sq, 6, 0, sres, &done));
+    CHECK(done == 6);
+    CHECK(sres[0].status == 0 && sres[0].rows >= 1);
+    CHECK(sres[1].status == 0 && sres[1].rows == 1);
+    CHECK(sres[2].status == 0 && sres[2].rows == 1);
+    CHECK(sres[3].status == 0 && sres[3].rows == 1);
+    CHECK(sres[4].status == TSDB_ERR_NOTFOUND);
+    CHECK(sres[5].status == TSDB_ERR_NOTFOUND);
+    OK(tsdb_close(f));
+    OK(tsdb_close(db));
+    rmrf(dir), rmrf(v1), rmrf(v2), rmrf(v3);
+}
+
+/* Exercises search_on_cut with: (1) a single series holding > LM_SLICE_ROWS (5000) rows in the active memtable
+ * (both sorted and unsorted, plus trailing null and a second series right after it in the same batch), and
+ * (2) n == 0 with an active memtable (need_lock == true) so calloc(0, ...) is never called. */
+static void test_latest_large_active_and_empty(void)
+{
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_large_active", root);
+    rmrf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.latest_cache = 0; /* force slow path search_on_cut */
+    o.buffer_rows = 1u << 16;
+    o.wal_max_batch_rows = 1u << 15;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid big = 0, big_unsorted = 0, after = 0;
+    OK(tsdb_series_create(db, "la.big", TSDB_FLOAT64, NULL, &big));
+    OK(tsdb_series_create(db, "la.big_unsorted", TSDB_FLOAT64, NULL, &big_unsorted));
+    OK(tsdb_series_create(db, "la.after", TSDB_FLOAT64, NULL, &after));
+
+    enum { NROWS = 5000 }; /* > LM_SLICE_ROWS (4096) */
+    int64_t *ts = malloc(NROWS * sizeof *ts);
+    double *vals = malloc(NROWS * sizeof *vals);
+    CHECK(ts && vals);
+    for (int i = 0; i < NROWS; i++) {
+        ts[i] = 10000 + i;
+        vals[i] = (double)(i + 1) * 0.5;
+    }
+    tsdb_values col = {TSDB_FLOAT64, vals, NULL};
+    OK(tsdb_insert_series_values(db, big, ts, &col, NROWS));
+    put_f64(db, big, 10000 + NROWS, 0.0, true); /* trailing null at newest ts */
+
+    /* Second > 4096-row series inserted out of order to exercise mt_copy_raw + mt_finish sort path */
+    for (int i = 0; i < NROWS; i++) {
+        ts[i] = 10000 + (NROWS - 1 - i);
+        vals[i] = (double)(NROWS - i);
+    }
+    OK(tsdb_insert_series_values(db, big_unsorted, ts, &col, NROWS));
+    put_f64(db, after, 99999, 123.75, false);
+
+    /* n == 0 via public API and directly via eng_latest_search while active memtable is non-empty */
+    OK(tsdb_latest(db, NULL, 0, NULL, NULL));
+    eng *e = tsdb_test_engine(db, 0);
+    CHECK(e != NULL);
+    OK(eng_latest_search(e, NULL, 0, NULL, TSDB_TS_MAX, false, NULL));
+
+    tsdb_sid q[3] = {big, big_unsorted, after};
+    tsdb_latest_result res[3];
+    tsdb_latest_opts lo = {.end = TSDB_TS_MAX, .with_nulls = 0};
+    OK(tsdb_latest(db, q, 3, &lo, res));
+    CHECK(res[0].status == 0 && res[0].kind == TSDB_LATEST_VALUE && res[0].ts == 10000 + NROWS - 1 &&
+          res[0].v.f64 == (double)NROWS * 0.5);
+    CHECK(res[1].status == 0 && res[1].kind == TSDB_LATEST_VALUE && res[1].ts == 10000 + NROWS - 1 &&
+          res[1].v.f64 == (double)NROWS);
+    CHECK(res[2].status == 0 && res[2].kind == TSDB_LATEST_VALUE && res[2].ts == 99999 && res[2].v.f64 == 123.75);
+
+    lo.with_nulls = 1;
+    OK(tsdb_latest(db, q, 3, &lo, res));
+    CHECK(res[0].status == 0 && res[0].kind == TSDB_LATEST_NULL && res[0].ts == 10000 + NROWS);
+    CHECK(res[1].status == 0 && res[1].kind == TSDB_LATEST_VALUE && res[1].ts == 10000 + NROWS - 1);
+    CHECK(res[2].status == 0 && res[2].kind == TSDB_LATEST_VALUE && res[2].ts == 99999);
+
+    free(ts);
+    free(vals);
+    OK(tsdb_close(db));
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_latest", 1200);
@@ -2209,6 +2421,10 @@ int main(int argc, char **argv)
     conc_flush_every = 50;
     tsdb_test_latest_window(50000);
     printf("concurrent with windows ok\n");
+    test_latest_multivol_batch();
+    printf("multivol batch ok\n");
+    test_latest_large_active_and_empty();
+    printf("large active and empty ok\n");
     rmrf(root);
     printf("test_latest ok\n");
     return 0;
