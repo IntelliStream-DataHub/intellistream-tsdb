@@ -89,7 +89,8 @@ public final class TsdbClient implements AutoCloseable {
     /** The most insert frames {@code insertAsync} leaves unacknowledged. */
     public static final int MAX_IN_FLIGHT = 4096;
 
-    private static final int BUF = 1 << 20;               /* send buffer; receive buffer between large replies */
+    private static final int BUF = 1 << 20;               /* send buffer; base receive buffer */
+    private static final int IN_KEEP = 16 << 20;          /* retain grown receive buffers up to 16 MiB */
     private static final int INSERT_FRAME_ROWS = 8 << 20; /* as the C client: under 256 MiB for any value type */
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
@@ -107,7 +108,8 @@ public final class TsdbClient implements AutoCloseable {
     private SelectionKey key;
     private long timeoutNanos;                   /* of each wait for the server; 0: forever */
     private final ByteBuffer out = direct(BUF);  /* write mode; empty between requests */
-    private ByteBuffer in = direct(BUF).flip();  /* read mode: [position, limit) is received, unread data */
+    private final ByteBuffer inBase = direct(BUF); /* persistent base receive buffer */
+    private ByteBuffer in = inBase.flip();       /* read mode: [position, limit) is received, unread data */
     private int bodyLen, bodyEnd;                /* of the reply frame being read */
     private int nextId;                          /* id of the next request */
     private int ackId;                           /* id of the oldest request whose (last) reply is unread */
@@ -459,6 +461,8 @@ public final class TsdbClient implements AutoCloseable {
         cur = null;
         keptReuse = null;
         keptReuseBusy = false;
+        inBase.clear().flip();
+        in = inBase;
         closeQuietly(ch);
         closeQuietly(selector);
         if (zstd != null)
@@ -3707,12 +3711,29 @@ public final class TsdbClient implements AutoCloseable {
         if (n == 0)
             return List.of();
         latestVersion();
-        SeriesResult<Latest>[] res = newResults(n);
         long[] got = new long[n];
-        boolean[] have = new boolean[n];
-        int[] misses = new int[n];
-        int nm = 0;
+        int firstMiss = -1;
         for (int i = 0; i < n; i++) {
+            String name = Objects.requireNonNull(names[i], "name");
+            if (name.isEmpty()) {
+                firstMiss = i;
+                break;
+            }
+            Long id = latestNames.get(name);
+            if (id == null) {
+                firstMiss = i;
+                break;
+            }
+            got[i] = id;
+        }
+        if (firstMiss < 0)
+            return latestRequest(got, o);
+        SeriesResult<Latest>[] res = newResults(n);
+        boolean[] have = new boolean[n];
+        Arrays.fill(have, 0, firstMiss, true);
+        int[] misses = new int[n - firstMiss];
+        int nm = 0;
+        for (int i = firstMiss; i < n; i++) {
             String name = Objects.requireNonNull(names[i], "name");
             if (name.isEmpty()) {
                 res[i] = SeriesResult.failed(Status.ERR_INVALID, "empty series name");
@@ -3727,27 +3748,33 @@ public final class TsdbClient implements AutoCloseable {
             }
         }
         resolveNames(names, misses, nm, got, have, res);
-        long[] ids = new long[n];
-        int[] at = new int[n];
         int k = 0;
-        for (int i = 0; i < n; i++) {
-            if (have[i]) {
-                ids[k] = got[i];
-                at[k++] = i;
-            }
-        }
+        for (int i = 0; i < n; i++)
+            if (have[i])
+                k++;
+        if (k == n)
+            return latestRequest(got, o);
         if (k > 0) {
+            long[] ids = new long[k];
+            int[] at = new int[k];
+            int j = 0;
+            for (int i = 0; i < n; i++) {
+                if (have[i]) {
+                    ids[j] = got[i];
+                    at[j++] = i;
+                }
+            }
             long[] ends = o.ends();
             LatestOptions q = o;
             if (ends != null) {
                 long[] e = new long[k];
-                for (int j = 0; j < k; j++)
-                    e[j] = ends[at[j]];
+                for (int m = 0; m < k; m++)
+                    e[m] = ends[at[m]];
                 q = o.ends(e);
             }
-            List<SeriesResult<Latest>> answers = latestRequest(k == n ? ids : Arrays.copyOf(ids, k), q);
-            for (int j = 0; j < k; j++)
-                res[at[j]] = answers.get(j);
+            List<SeriesResult<Latest>> answers = latestRequest(ids, q);
+            for (int m = 0; m < k; m++)
+                res[at[m]] = answers.get(m);
         }
         return Collections.unmodifiableList(Arrays.asList(res));
     }
@@ -4305,7 +4332,9 @@ public final class TsdbClient implements AutoCloseable {
         selector = t.selector;
         key = t.key;
         t.closed = true; /* its channel is ours now */
-        in = direct(BUF).flip();
+        if (in.capacity() > IN_KEEP)
+            in = inBase;
+        in.clear().flip();
         serverVersion = t.serverVersion;
         loginRequired = t.loginRequired;
         scram = t.scram;
@@ -4326,12 +4355,19 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
+    /** Current receive buffer capacity (for tests). */
+    int inCapacity() {
+        return in.capacity();
+    }
+
     /** Finishes the last reply frame of a request. */
     private void endReply() {
         in.position(bodyEnd);
         ackId++;
-        if (in.capacity() > BUF && !in.hasRemaining())
-            in = direct(BUF).flip(); /* give a large reply's buffer back */
+        if (in.capacity() > IN_KEEP && !in.hasRemaining()) {
+            inBase.clear().flip();
+            in = inBase; /* release an oversized reply buffer without allocating a new base buffer */
+        }
     }
 
     /**

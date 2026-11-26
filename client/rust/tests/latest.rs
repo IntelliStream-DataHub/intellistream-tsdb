@@ -287,6 +287,14 @@ fn latest_by_name_looks_names_up_together() {
     }
     // the second call asks only the NOT FOUND name again: the others have ids
     c.latest_by_name(&refs, &LatestOpts::default()).unwrap();
+    // 100% cache hit fast path asks for zero SERIES lookups
+    let cached = ["n0", "n1", "n2", "flaky9"];
+    let hit = c.latest_by_name(&cached, &LatestOpts::default()).unwrap();
+    assert_eq!(hit.len(), cached.len());
+    for l in &hit {
+        assert_eq!(l.status, None);
+        assert_eq!(l.kind, LatestKind::None);
+    }
     c.close().unwrap();
     let (max_held, total) = h.join().unwrap();
     assert!(max_held >= 38, "the 38 sendable names of the window were held together, not {max_held}");

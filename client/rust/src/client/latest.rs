@@ -59,25 +59,48 @@ impl Client {
                 return Ok(Vec::new());
             }
             c.latest_version()?;
+            // Fast path: 100% cache hit goes straight to latest_req without intermediate Option/index vecs.
+            let mut ids = Vec::with_capacity(names.len());
+            let mut first_miss = None;
+            for (i, name) in names.iter().enumerate() {
+                if !name.is_empty()
+                    && let Some(&id) = c.names.get(*name)
+                {
+                    ids.push(id);
+                } else {
+                    first_miss = Some(i);
+                    break;
+                }
+            }
+            let Some(fm) = first_miss else {
+                return c.latest_req(&ids, opts);
+            };
             let mut out = vec![None; names.len()];
             let mut resolved: Vec<Option<SeriesId>> = vec![None; names.len()];
+            for (dst, &id) in resolved[..fm].iter_mut().zip(&ids) {
+                *dst = Some(id);
+            }
             let mut misses = Vec::new();
-            for (i, name) in names.iter().enumerate() {
+            for (i, name) in names.iter().enumerate().skip(fm) {
                 if name.is_empty() {
                     out[i] = Some(Latest::missing(Status::Invalid));
-                } else if let Some(id) = c.names.get(*name) {
-                    resolved[i] = Some(*id);
+                } else if let Some(&id) = c.names.get(*name) {
+                    resolved[i] = Some(id);
                 } else {
                     misses.push(i);
                 }
             }
             c.names_resolve(names, &misses, &mut resolved, &mut out)?;
-            let (mut ids, mut at) = (Vec::with_capacity(names.len()), Vec::with_capacity(names.len()));
+            ids.clear();
+            let mut at = Vec::with_capacity(names.len());
             for (i, id) in resolved.iter().enumerate() {
                 if let Some(id) = id {
                     ids.push(*id);
                     at.push(i);
                 }
+            }
+            if ids.len() == names.len() {
+                return c.latest_req(&ids, opts);
             }
             if !ids.is_empty() {
                 let sub =

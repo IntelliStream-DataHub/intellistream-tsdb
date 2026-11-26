@@ -133,6 +133,24 @@ class LatestNamesTest {
             assertTrue(f.maxHeld.get() >= 38, "the 38 sendable names were held together, not " + f.maxHeld.get());
             c.latestByName(names, LatestOptions.defaults()); /* only the NOTFOUND name is asked again */
             assertEquals(38 + 1 + 1, f.total.get(), "the window, the flaky name again, the NOTFOUND name once more");
+            /* 100% cache hit fast path sends zero SERIES requests */
+            String[] cached = new String[] {"n0", "n1", "n2", "flaky9"};
+            List<SeriesResult<Latest>> hit = c.latestByName(cached, LatestOptions.defaults());
+            assertEquals(cached.length, hit.size());
+            for (SeriesResult<Latest> e : hit)
+                assertTrue(e.ok());
+            assertEquals(38 + 1 + 1, f.total.get(), "all-hit fast path sent no SERIES lookups");
+            /* >1 MiB QUERY_LATEST (65536 * 24 + 12 = 1.5 MiB) retains the grown receive buffer up to IN_KEEP */
+            long[] bigIds = new long[65_536];
+            for (int i = 0; i < bigIds.length; i++)
+                bigIds[i] = (1L << 32) | (i + 1);
+            List<SeriesResult<Latest>> big1 = c.latest(bigIds, LatestOptions.defaults());
+            assertEquals(bigIds.length, big1.size());
+            int capAfterFirst = c.inCapacity();
+            assertTrue(capAfterFirst >= 12 + bigIds.length * 24, "grew to hold >1 MiB reply: " + capAfterFirst);
+            List<SeriesResult<Latest>> big2 = c.latest(bigIds, LatestOptions.defaults());
+            assertEquals(bigIds.length, big2.size());
+            assertEquals(capAfterFirst, c.inCapacity(), "retained receive buffer across repeated >1 MiB replies");
         }
     }
 }
