@@ -70,6 +70,10 @@
 
 #define PLR_HDR 8          /* bytes of the header of every message */
 #define PLR_EP_LEN 40      /* an encoded endpoint (plr_ep_encode) */
+#define PLR_CM_ADDR_LEN 20 /* an encoded rdma_cm address (af, pad, port, ip[16]) */
+#define PLR_CM_PD_LEN 44   /* rdma_cm private_data: magic(4) + nonce(8) + HMAC-SHA256 tag(32) <= 56 B IB CM limit */
+#define PLR_CM_PD_MAGIC 0x314d4354u /* "TCM1" */
+#define PLR_EP_F_CM 0x01u  /* plr_ep.flags: connect via rdma_cm (Option C) instead of direct verbs */
 #define PLR_DRAIN_MS 5000  /* the most close waits for the drain's markers */
 /* Control slots of a connection (K) and of a peer: at least 4, so that a CREDIT is sent for K/2 >= 2 owed control
  * credits. With a threshold of 1 every CREDIT sent only to return control credits makes the peer owe one, which it
@@ -90,6 +94,8 @@ struct plr_port {
     uint8_t mtu; /* the active MTU as verbs number it: 1 = 256 ... 5 = 4096 */
     uint8_t link_layer;
     uint8_t port;
+    uint8_t cm_af;     /* 4 = IPv4, 6 = IPv6, 0 = none (netdev IP for rdma_cm Option C) */
+    uint8_t cm_ip[16]; /* IPv4 in [0..3], or IPv6 in [0..15] */
 };
 
 /* the peer's numbers for a queue pair's move to RTR and RTS */
@@ -172,13 +178,84 @@ struct plr_ep {
     uint8_t mtu, link_layer, port;
     uint32_t slot;       /* its receive slots' size: the most one of my messages may carry */
     uint16_t data, ctl;  /* its receive slots: my credits */
+    uint8_t flags;       /* 0: direct verbs (Option D); PLR_EP_F_CM: rdma_cm (Option C) */
 };
 void plr_ep_encode(const struct plr_ep *e, uint8_t out[PLR_EP_LEN]);
 /* -1 (EPROTO) for numbers no peer of this code sends (a slot below 1 KiB, no credits, a QPN above 2^24) */
 int plr_ep_decode(struct plr_ep *e, const uint8_t *in, size_t n);
+/* Fills `out` with pool's port, slot, credit parameters and `flags` (qpn=0, psn=0; used by rdma_cm OFFER/ACCEPT). */
+void plr_pool_ep(const struct plr_pool *p, uint8_t flags, struct plr_ep *out);
 
 /* 1 if peer's link layer and (for InfiniBand) 8-byte GID subnet prefix match local port, else 0. */
 int plr_port_subnet_match(const struct plr_port *local, const struct plr_ep *peer);
+
+/* ---- Option C: rdma_cm connection setup (docs/design-rdma.md §5.1, §5.2, §5.5; track rd-cm) */
+
+struct plr_cm_addr {
+    uint8_t af;     /* 4 = IPv4, 6 = IPv6, 0 = unset */
+    uint16_t port;  /* host byte order */
+    uint8_t ip[16]; /* IPv4 in [0..3] (rest 0), or IPv6 in [0..15]; all-zero = wildcard */
+};
+void plr_cm_addr_encode(const struct plr_cm_addr *a, uint8_t out[PLR_CM_ADDR_LEN]);
+int plr_cm_addr_decode(struct plr_cm_addr *a, const uint8_t *in, size_t n);
+
+enum {
+    PLR_CM_EV_NONE = 0,
+    PLR_CM_EV_ADDR_RESOLVED = 1,
+    PLR_CM_EV_ROUTE_RESOLVED = 2,
+    PLR_CM_EV_CONNECT_REQUEST = 3,
+    PLR_CM_EV_ESTABLISHED = 4,
+    PLR_CM_EV_DISCONNECTED = 5,
+    PLR_CM_EV_REJECTED = 6,
+    PLR_CM_EV_ERR = 7,
+};
+
+struct plr_cm_id; /* one rdma_cm_id and its own non-blocking event channel (the ops' own) */
+
+struct plr_cm_ev {
+    int type; /* PLR_CM_EV_* */
+    int status;
+    struct plr_cm_id *req_id; /* PLR_CM_EV_CONNECT_REQUEST only: child id migrated to its own channel */
+    uint8_t pd[64];           /* private_data copied out before ack_cm_event */
+    uint8_t pd_len;
+};
+
+/* The rdma_cm operations behind a table, so server/plrdma.c and server/peerlink.c compile without rdma_cma.h and
+ * tests run over the fake fabric (tests/plr_fake.h). Real implementation in server/plrdma_dl.c via dlopen. */
+struct plr_cm_ops {
+    const char *name;
+    /* Verbs ops whose dev_open uses librdmacm's shared device contexts (rdma_get_devices), so pool PDs match
+     * rdma_cm_id->verbs when rdma_create_qp runs. */
+    const struct plr_ops *verbs;
+    struct plr_cm_id *(*listen)(const struct plr_cm_addr *bind, struct plr_cm_addr *bound, char *err, size_t errlen);
+    struct plr_cm_id *(*dial)(const struct plr_cm_addr *dst, int timeout_ms, char *err, size_t errlen);
+    int (*resolve_route)(struct plr_cm_id *id, int timeout_ms);
+    struct plr_qp *(*qp_create)(struct plr_cm_id *id, struct plr_dev *d, int sq, int rq, uint32_t *qpn);
+    int (*connect)(struct plr_cm_id *id, const void *pd, uint8_t pd_len, uint8_t rnr_retry, uint8_t retry_cnt);
+    int (*accept)(struct plr_cm_id *id, uint8_t rnr_retry);
+    void (*reject)(struct plr_cm_id *id);
+    int (*fd)(struct plr_cm_id *id);
+    int (*next_event)(struct plr_cm_id *id, struct plr_cm_ev *ev);
+    int (*disconnect)(struct plr_cm_id *id);
+    void (*destroy)(struct plr_cm_id *id);
+    int (*set_sl)(struct plr_cm_id *id, uint8_t sl);
+};
+
+struct plr_cm_listener;
+struct plr_cm_token;
+/* Binds and listens with rdma_cm on `bind` (NULL or zero ip/port: 0.0.0.0:0) and starts the CM listener thread. */
+struct plr_cm_listener *plr_cm_listen(const struct plr_cm_ops *ops, const struct plr_cm_addr *bind, char *err,
+                                      size_t errlen);
+void plr_cm_listener_close(struct plr_cm_listener *lis);
+void plr_cm_listener_addr(const struct plr_cm_listener *lis, struct plr_cm_addr *out);
+uint64_t plr_cm_listener_rejected(const struct plr_cm_listener *lis);
+/* Registers a single-use authentication token (nonce + 32-byte HMAC tag) verified constant-time before accept. */
+struct plr_cm_token *plr_cm_expect(struct plr_cm_listener *lis, uint64_t nonce, const uint8_t tag[32],
+                                   void (*wake_fn)(void *), void *wake_arg);
+/* Non-blocking: returns the authenticated cm_id if arrived (freeing tok), else NULL. */
+struct plr_cm_id *plr_cm_take(struct plr_cm_listener *lis, struct plr_cm_token *tok);
+/* Cancels a pending token (rejecting and destroying any already-arrived cm_id cleanly). */
+void plr_cm_cancel(struct plr_cm_listener *lis, struct plr_cm_token *tok);
 
 struct plr_conn;
 /* A queue pair in INIT with every receive posted, its slots taken from the pool. NULL with a line in err. */
@@ -196,6 +273,15 @@ struct pl_transport *plr_conn_transport(struct plr_conn *c, struct pl_transport 
 void plr_conn_set_anchor(struct plr_conn *c, struct pl_transport *anchor);
 /* A connection that never became a transport: drained and freed (its slots back to the pool). */
 void plr_conn_free(struct plr_conn *c);
+/* Option C (rdma_cm): creates a connection on `cm_id` (taking slots, creating QP via cm_ops->qp_create, posting all
+ * receives BEFORE connect/accept). Takes ownership of `cm_id` on success; on failure caller destroys/rejects `cm_id`. */
+struct plr_conn *plr_conn_new_cm(struct plr_pool *p, const struct plr_cm_ops *cm_ops, struct plr_cm_id *cm_id,
+                                 const struct plr_ep *peer, uint32_t poll_us, char *err, size_t errlen);
+int plr_conn_cm_connect(struct plr_conn *c, const void *pd, uint8_t pd_len, char *err, size_t errlen);
+int plr_conn_cm_accept(struct plr_conn *c, char *err, size_t errlen);
+void plr_conn_cm_established(struct plr_conn *c);
+int plr_conn_cm_fd(const struct plr_conn *c);
+int plr_conn_cm_poll(struct plr_conn *c);
 /* tests and stats: what the connection did */
 struct plr_conn_stats {
     uint64_t msgs_out, msgs_in, credit_out, credit_in, bytes_out, bytes_in;
@@ -227,11 +313,15 @@ enum {
     PLR_MUT_NORECVMARK, /* the drain waits for the send marker only (the receive queue may still be flushing) */
     PLR_MUT_NOREARM,    /* poll_fds does not look again after arming: a completion in between is a lost wakeup */
     PLR_MUT_ANCHORBYTE, /* a byte on the anchor is ignored */
+    PLR_MUT_CM_NOAUTH,  /* rdma_cm listener skips private_data nonce/HMAC verification before rdma_accept */
 };
 extern int plrdma_mutant;
 extern int plrdma_drain_ms; /* tests: PLR_DRAIN_MS */
 
 /* server/plrdma_dl.c: libibverbs through dlopen (NULL with a line where it is not built or not installed) */
 const struct plr_ops *plrdma_verbs(char *err, size_t errlen);
+/* server/plrdma_dl.c: librdmacm + libibverbs through dlopen (NULL with a line where not built or not installed;
+ * absence of librdmacm does not affect plrdma_verbs) */
+const struct plr_cm_ops *plrdma_cm(char *err, size_t errlen);
 
 #endif

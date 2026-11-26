@@ -145,6 +145,8 @@ enum {
 #define PL_RDMA_POOLS_MAX 8
 
 struct plr_pool;
+struct plr_cm_ops;
+struct plr_cm_listener;
 struct sockaddr;
 
 struct pl_rdma_cfg {
@@ -155,6 +157,9 @@ struct pl_rdma_cfg {
     uint32_t poll_us;                        /* busy-poll CQ before sleeping (0: none) */
     struct plr_pool *pools[PL_RDMA_POOLS_MAX]; /* registered memory pools, shared across peerlinks (D7) */
     int npools;
+    int cm;                                  /* 1: Option C rdma_cm setup (cluster.peer.rdma.cm / --peer-rdma-cm) */
+    const struct plr_cm_ops *cm_ops;         /* rdma_cm ops table when cm=1 (plrdma_cm() or fake) */
+    struct plr_cm_listener *cm_lis;          /* process-wide rdma_cm listener when cm=1 */
     /* test overrides (0: design-rdma.md §5 defaults: 2000, 4000, 60000, 60000, 600000 ms) */
     uint32_t offer_timeout_ms;
     uint32_t accept_timeout_ms;
@@ -446,6 +451,7 @@ enum {
     PL_MUT_RDMA_SEQBUMP = 36,     /* RDMA_HELLO / RDMA_READY bumps the stream sequence number (breaks TCP fallback) */
     PL_MUT_RDMA_NOBACKOFF = 37,   /* RDMA upgrade backoff after 3 failures is ignored */
     PL_MUT_NOIPOIB = 38,          /* IPoIB interface check is skipped */
+    PL_MUT_RDMA_CM_NOFALLBACK = 39, /* rdma_cm failure fails to fall back to TCP in auto mode */
 };
 /* Queues any frame type (a link's own ones too) on an open link, for the tests that play a peer that holds the secret
  * and misbehaves. */
@@ -459,6 +465,7 @@ extern int peerlink_test_rdma_abort_before_hello; /* dialer sends ABORT right af
 extern int peerlink_test_rdma_fail_after_hello;   /* dialer posts HELLO on QP then sends ABORT on TCP */
 extern int peerlink_test_rdma_skip_go;            /* dialer neither sends GO nor ABORT after READY (tests acceptor timeout) */
 extern int peerlink_test_rdma_bad_auth;           /* 1: bad HELLO mac, 2: bad READY mac, 3: bad HELLO nonce, 4: bad READY nonce */
+extern int peerlink_test_rdma_cm_bad_pd;          /* 1: bad CM private_data tag, 2: bad nonce, 3: empty private_data */
 extern uint64_t peerlink_test_rdma_offers;        /* atomic counter of RDMA_OFFER frames sent */
 /* Test hook (rsnap's TSDB_REPLD_TEST=snapcutdone): > 0 cuts the connection of a kind-5 link once, at the n-th file
  * that ends whole, after the receiver's end callback and before its DONE goes out (a DONE lost to a reconnect). */

@@ -62,6 +62,7 @@ int peerlink_test_rdma_abort_before_hello;
 int peerlink_test_rdma_fail_after_hello;
 int peerlink_test_rdma_skip_go;
 int peerlink_test_rdma_bad_auth;
+int peerlink_test_rdma_cm_bad_pd;
 uint64_t peerlink_test_rdma_offers;
 int peerlink_test_cut_end;
 int32_t peerlink_test_done_status;
@@ -396,10 +397,10 @@ int pl_msg_decode(uint8_t type, const uint8_t *p, size_t n, struct pl_msg *m, ui
         m->a = le64(p + PLR_EP_LEN);
         return 0;
     case PLT_RDMA_ACCEPT:
-        if (n != PLR_EP_LEN)
+        if (n != PLR_EP_LEN && n != PLR_EP_LEN + PLR_CM_ADDR_LEN)
             return -1;
         m->data = p;
-        m->data_len = PLR_EP_LEN;
+        m->data_len = n;
         return 0;
     case PLT_RDMA_DECLINE:
         if (n != 1)
@@ -1541,6 +1542,8 @@ static int dial_can_try_rdma(const struct plink *l, const struct pl_rdma_cfg *rc
         return 0;
     if (rc->mode == PL_RDMA_OFF || rc->npools <= 0)
         return 0;
+    if (rc->cm && !rc->cm_ops)
+        return 0;
     if (!(rc->kinds & (1u << l->kind)))
         return 0;
     if (rc->mode != PL_RDMA_ON && peerlink_mutant != PL_MUT_RDMA_NOBACKOFF && l->rdma_until_ns && now < l->rdma_until_ns)
@@ -1674,9 +1677,12 @@ enum { HP_RX = 1, HP_TX };
 enum {
     UP_IDLE = 0,
     UP_D_WAIT_ACCEPT, /* dialer sent OFFER on TCP; waiting for ACCEPT or DECLINE */
+    UP_D_WAIT_CM,     /* dialer dialing rdma_cm (resolve_addr -> resolve_route -> connect -> ESTABLISHED) */
     UP_D_WAIT_READY,  /* dialer sent HELLO on QP; waiting for READY on QP */
     UP_A_WAIT_OFFER,  /* acceptor saw PL_CAP_RDMA_TRY; waiting for initial OFFER or ABORT on TCP */
-    UP_A_WAIT_HELLO,  /* acceptor sent ACCEPT on TCP; waiting for HELLO on QP or ABORT on TCP */
+    UP_A_WAIT_CM,     /* acceptor sent CM ACCEPT on TCP; waiting for authenticated CONNECT_REQUEST or ABORT */
+    UP_A_WAIT_CM_EST, /* acceptor called rdma_accept; waiting for ESTABLISHED or ABORT on TCP */
+    UP_A_WAIT_HELLO,  /* acceptor sent ACCEPT on TCP (or CM established); waiting for HELLO on QP or ABORT on TCP */
     UP_A_WAIT_GO,     /* acceptor sent READY on QP; waiting for GO on QP or ABORT on TCP */
 };
 
@@ -1707,6 +1713,12 @@ struct conn {
     int up_aborted_wait, up_declined_wait, up_fail_after_hello;
     struct plr_conn *up_conn;
     struct pl_transport *up_t;
+    struct plr_pool *up_pool;
+    struct plr_ep up_peer_ep;
+    struct plr_cm_id *up_cm_id;      /* dialer's cm_id before plr_conn_new_cm takes ownership */
+    struct plr_cm_token *up_cm_tok;  /* acceptor's pending auth token on cm_lis */
+    uint8_t up_cm_pd[PLR_CM_PD_LEN]; /* dialer's private_data for rdma_connect */
+    int up_cm_mode;                  /* 1: current upgrade attempt uses rdma_cm (Option C) */
     struct buf up_wb, up_rb;
     uint64_t up_nonce, up_self_seq, up_peer_seq, up_deadline, up_ready_at;
     uint64_t rdma_settled_ns, next_reoffer_ns;
@@ -1876,8 +1888,82 @@ static void up_rdma_mac(const uint8_t key[32], uint8_t type, uint64_t seq, uint6
     tsdb_wipe(&hk, sizeof hk);
 }
 
+/* Connection-derived HMAC tag carried in rdma_conn_param.private_data (Option C, design-rdma.md §5.5). */
+static void up_rdma_cm_mac(const uint8_t key[32], uint64_t offer_seq, uint64_t nonce, uint8_t out[32])
+{
+    static const char dom[16] = "tsdb-rdma-cm-req";
+    uint8_t msg[16];
+    for (int i = 0; i < 8; i++) {
+        msg[i] = (uint8_t)(offer_seq >> (8 * i));
+        msg[8 + i] = (uint8_t)(nonce >> (8 * i));
+    }
+    struct hk hk;
+    hk_init(&hk, key, 32);
+    hk_mac(&hk, dom, sizeof dom, msg, sizeof msg, "", 0, "", 0, out);
+    tsdb_wipe(&hk, sizeof hk);
+}
+
+static void up_cm_build_pd(const struct conn *c, uint8_t out[PLR_CM_PD_LEN])
+{
+    uint32_t magic = PLR_CM_PD_MAGIC;
+    for (int i = 0; i < 4; i++)
+        out[i] = (uint8_t)(magic >> (8 * i));
+    for (int i = 0; i < 8; i++)
+        out[4 + i] = (uint8_t)(c->up_nonce >> (8 * i));
+    up_rdma_cm_mac(c->keys.rdma_key, c->up_self_seq, c->up_nonce, out + 12);
+    int bp = __atomic_load_n(&peerlink_test_rdma_cm_bad_pd, __ATOMIC_RELAXED);
+    if (bp == 1)
+        out[12] ^= 0xff; /* corrupt HMAC tag */
+    else if (bp == 2)
+        out[4] ^= 0x01; /* corrupt nonce */
+}
+
+static int cm_ip_is_zero(const uint8_t ip[16])
+{
+    for (int i = 0; i < 16; i++)
+        if (ip[i])
+            return 0;
+    return 1;
+}
+
+static void cm_fill_ip_from_tcp(const struct pl_transport *t, int peer, struct plr_cm_addr *a)
+{
+    if (!t || t->ops != &tcp_ops)
+        return;
+    int fd = ((const struct pl_tcp *)t)->fd;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if ((peer ? getpeername(fd, (struct sockaddr *)&ss, &sl) : getsockname(fd, (struct sockaddr *)&ss, &sl)) != 0)
+        return;
+    if (ss.ss_family == AF_INET) {
+        a->af = 4;
+        memset(a->ip, 0, 16);
+        memcpy(a->ip, &((const struct sockaddr_in *)&ss)->sin_addr, 4);
+    } else if (ss.ss_family == AF_INET6) {
+        const struct in6_addr *v6 = &((const struct sockaddr_in6 *)&ss)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(v6)) {
+            a->af = 4;
+            memset(a->ip, 0, 16);
+            memcpy(a->ip, v6->s6_addr + 12, 4);
+        } else {
+            a->af = 6;
+            memcpy(a->ip, v6, 16);
+        }
+    }
+}
+
+static void cm_wake_cb(void *arg) { wake((struct plink *)arg); }
+
 static void up_cleanup(struct conn *c)
 {
+    if (c->up_cm_tok) {
+        plr_cm_cancel(c->rcfg.cm_lis, c->up_cm_tok);
+        c->up_cm_tok = NULL;
+    }
+    if (c->up_cm_id) {
+        c->rcfg.cm_ops->destroy(c->up_cm_id);
+        c->up_cm_id = NULL;
+    }
     if (c->up_t) {
         c->up_t->ops->close(c->up_t); /* anchor is NULL, so c->t (TCP) is untouched */
         c->up_t = NULL;
@@ -1886,6 +1972,8 @@ static void up_cleanup(struct conn *c)
         plr_conn_free(c->up_conn);
         c->up_conn = NULL;
     }
+    c->up_pool = NULL;
+    c->up_cm_mode = 0;
     c->up_ready_at = 0;
     c->up_fail_after_hello = 0;
     buf_free(&c->up_wb);
@@ -1986,7 +2074,7 @@ static void up_dial_abort(struct conn *c, int fb_reason, int send_abort)
     int was_wait_accept = c->up_state == UP_D_WAIT_ACCEPT;
     up_cleanup(c);
     up_record_fail(c, fb_reason);
-    if (c->rcfg.mode == PL_RDMA_ON) {
+    if (c->rcfg.mode == PL_RDMA_ON || (c->rcfg.cm && peerlink_mutant == PL_MUT_RDMA_CM_NOFALLBACK)) {
         fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s upgrade failed (%s): ending connection\n",
                 c->keys.peer, kname_tab[c->l->kind], peerlink_rdma_fb_name(fb_reason));
         c->up_state = UP_IDLE;
@@ -2006,31 +2094,50 @@ static void up_dial_abort(struct conn *c, int fb_reason, int send_abort)
 static void up_dial_start_offer(struct conn *c, int initial)
 {
     char err[256] = "no RDMA pool";
-    struct plr_conn *conn = NULL;
     c->up_aborted_wait = 0;
     int np = c->rcfg.npools;
     int start = np > 0 ? c->l->rdma_pool_idx % np : 0;
-    for (int i = 0; i < np && !conn; i++) {
-        int idx = (start + i) % np;
-        if (c->rcfg.pools[idx]) {
-            conn = plr_conn_new(c->rcfg.pools[idx], err, sizeof err);
-            if (conn)
-                c->l->rdma_pool_idx = idx;
-        }
-    }
-    if (!conn) {
-        fprintf(stderr, "peerlink: rdma: %s\n", err);
-        up_dial_abort(c, PL_RDMA_FB_POOL, initial && c->keys.try_rdma);
-        return;
-    }
     struct plr_ep ep;
-    plr_conn_ep(conn, &ep);
+    if (c->rcfg.cm) {
+        struct plr_pool *pool = NULL;
+        for (int i = 0; i < np && !pool; i++) {
+            int idx = (start + i) % np;
+            if (c->rcfg.pools[idx]) {
+                pool = c->rcfg.pools[idx];
+                c->l->rdma_pool_idx = idx;
+            }
+        }
+        if (!pool || !c->rcfg.cm_ops) {
+            up_dial_abort(c, !c->rcfg.cm_ops ? PL_RDMA_FB_NOT_BUILT : PL_RDMA_FB_POOL, initial && c->keys.try_rdma);
+            return;
+        }
+        plr_pool_ep(pool, PLR_EP_F_CM, &ep);
+        c->up_pool = pool;
+        c->up_cm_mode = 1;
+    } else {
+        struct plr_conn *conn = NULL;
+        for (int i = 0; i < np && !conn; i++) {
+            int idx = (start + i) % np;
+            if (c->rcfg.pools[idx]) {
+                conn = plr_conn_new(c->rcfg.pools[idx], err, sizeof err);
+                if (conn)
+                    c->l->rdma_pool_idx = idx;
+            }
+        }
+        if (!conn) {
+            fprintf(stderr, "peerlink: rdma: %s\n", err);
+            up_dial_abort(c, PL_RDMA_FB_POOL, initial && c->keys.try_rdma);
+            return;
+        }
+        plr_conn_ep(conn, &ep);
+        c->up_conn = conn;
+        c->up_cm_mode = 0;
+    }
     uint8_t payload[PLR_EP_LEN + 8];
     plr_ep_encode(&ep, payload);
     tsdb_random(&c->up_nonce, sizeof c->up_nonce);
     for (int i = 0; i < 8; i++)
         payload[PLR_EP_LEN + i] = (uint8_t)(c->up_nonce >> (8 * i));
-    c->up_conn = conn;
     c->up_self_seq = c->seq_out;
     send_ctl_now(c, PLT_RDMA_OFFER, payload, sizeof payload);
     __atomic_add_fetch(&peerlink_test_rdma_offers, 1, __ATOMIC_RELAXED);
@@ -2071,6 +2178,8 @@ static int up_switch_to_rdma(struct conn *c, int send_go)
     c->t = c->up_t;
     c->up_t = NULL;
     c->up_conn = NULL;
+    c->up_pool = NULL;
+    c->up_cm_mode = 0;
     c->up_state = UP_IDLE;
     c->up_ready_at = 0;
     c->next_reoffer_ns = 0;
@@ -2131,36 +2240,84 @@ static int up_handle_offer(struct conn *c, const struct pl_msg *m)
             decl = PL_RDMA_DECL_SUBNET;
     }
     if (!decl) {
-        char err[256];
-        struct plr_conn *conn = plr_conn_new(pool, err, sizeof err);
-        if (!conn) {
-            fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
-            decl = PL_RDMA_DECL_POOL;
-        } else if (plr_conn_start_opt(conn, &peer_ep, c->rcfg.sl[c->l->kind], c->rcfg.poll_us, err, sizeof err) != 0) {
-            fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
-            plr_conn_free(conn);
-            decl = PL_RDMA_DECL_QP;
+        int want_cm = !!(peer_ep.flags & PLR_EP_F_CM);
+        if (want_cm) {
+            if (!c->rcfg.cm)
+                decl = PL_RDMA_DECL_OFF;
+            else if (!c->rcfg.cm_ops || !c->rcfg.cm_lis)
+                decl = PL_RDMA_DECL_QP;
+            else {
+                uint64_t offer_seq = c->rd->seq - 1;
+                uint8_t want_tag[32];
+                up_rdma_cm_mac(c->keys.rdma_key, offer_seq, m->a, want_tag);
+                struct plr_cm_token *tok = plr_cm_expect(c->rcfg.cm_lis, m->a, want_tag, cm_wake_cb, c->l);
+                tsdb_wipe(want_tag, sizeof want_tag);
+                if (!tok) {
+                    decl = PL_RDMA_DECL_QP;
+                } else {
+                    struct plr_ep my_ep;
+                    struct plr_cm_addr my_addr;
+                    plr_pool_ep(pool, PLR_EP_F_CM, &my_ep);
+                    plr_cm_listener_addr(c->rcfg.cm_lis, &my_addr);
+                    if (cm_ip_is_zero(my_addr.ip)) {
+                        const struct plr_port *pp = plr_pool_port(pool);
+                        if (pp && pp->cm_af) {
+                            my_addr.af = pp->cm_af;
+                            memcpy(my_addr.ip, pp->cm_ip, 16);
+                        } else {
+                            cm_fill_ip_from_tcp(c->t, 0, &my_addr);
+                        }
+                    }
+                    uint8_t acc_bytes[PLR_EP_LEN + PLR_CM_ADDR_LEN];
+                    plr_ep_encode(&my_ep, acc_bytes);
+                    plr_cm_addr_encode(&my_addr, acc_bytes + PLR_EP_LEN);
+                    c->up_cm_tok = tok;
+                    c->up_pool = pool;
+                    c->up_peer_ep = peer_ep;
+                    c->up_peer_seq = offer_seq;
+                    c->up_nonce = m->a;
+                    c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
+                    c->up_cm_mode = 1;
+                    send_ctl_now(c, PLT_RDMA_ACCEPT, acc_bytes, sizeof acc_bytes);
+                    uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
+                    c->up_deadline = now_ns() + atmo;
+                    c->up_state = UP_A_WAIT_CM;
+                    return 0;
+                }
+            }
         } else {
-            struct plr_ep my_ep;
-            uint8_t ep_bytes[PLR_EP_LEN];
-            plr_conn_ep(conn, &my_ep);
-            plr_ep_encode(&my_ep, ep_bytes);
-            c->up_conn = conn;
-            c->up_t = plr_conn_transport(conn, NULL);
-            c->up_peer_seq = c->rd->seq - 1; /* seq of RDMA_OFFER */
-            c->up_nonce = m->a;
-            c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
-            send_ctl_now(c, PLT_RDMA_ACCEPT, ep_bytes, sizeof ep_bytes);
-            uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
-            c->up_deadline = now_ns() + atmo;
-            c->up_state = UP_A_WAIT_HELLO;
-            return 0;
+            char err[256];
+            struct plr_conn *conn = plr_conn_new(pool, err, sizeof err);
+            if (!conn) {
+                fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
+                decl = PL_RDMA_DECL_POOL;
+            } else if (plr_conn_start_opt(conn, &peer_ep, c->rcfg.sl[c->l->kind], c->rcfg.poll_us, err, sizeof err) != 0) {
+                fprintf(stderr, "peerlink: rdma: accept: %s\n", err);
+                plr_conn_free(conn);
+                decl = PL_RDMA_DECL_QP;
+            } else {
+                struct plr_ep my_ep;
+                uint8_t ep_bytes[PLR_EP_LEN];
+                plr_conn_ep(conn, &my_ep);
+                plr_ep_encode(&my_ep, ep_bytes);
+                c->up_conn = conn;
+                c->up_t = plr_conn_transport(conn, NULL);
+                c->up_peer_seq = c->rd->seq - 1; /* seq of RDMA_OFFER */
+                c->up_nonce = m->a;
+                c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
+                c->up_cm_mode = 0;
+                send_ctl_now(c, PLT_RDMA_ACCEPT, ep_bytes, sizeof ep_bytes);
+                uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
+                c->up_deadline = now_ns() + atmo;
+                c->up_state = UP_A_WAIT_HELLO;
+                return 0;
+            }
         }
     }
     uint8_t r = (uint8_t)decl;
     send_ctl_now(c, PLT_RDMA_DECLINE, &r, 1);
     c->up_state = UP_IDLE;
-    if (acc_requires_rdma(c)) {
+    if (acc_requires_rdma(c) || (c->rcfg.cm && peerlink_mutant == PL_MUT_RDMA_CM_NOFALLBACK)) {
         int fb = decl_to_fb(decl);
         fb_count(fb);
         fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s declined upgrade (%s): ending connection\n",
@@ -2179,8 +2336,10 @@ static int up_handle_accept(struct conn *c, const struct pl_msg *m)
         c->up_aborted_wait = 0; /* late ACCEPT racing with dialer's timeout ABORT */
         return 0;
     }
-    if (!c->l->dialed || c->up_state != UP_D_WAIT_ACCEPT || !c->up_conn)
+    if (!c->l->dialed || c->up_state != UP_D_WAIT_ACCEPT || (!c->up_cm_mode && !c->up_conn))
         return -1;
+    /* ACCEPT was received and consumed: any abort from here on must NOT set up_aborted_wait (no late ACCEPT pending). */
+    c->up_state = c->up_cm_mode ? UP_D_WAIT_CM : UP_D_WAIT_READY;
     struct plr_ep peer_ep;
     char err[256];
     if (plr_ep_decode(&peer_ep, m->data, m->data_len) != 0) {
@@ -2189,6 +2348,32 @@ static int up_handle_accept(struct conn *c, const struct pl_msg *m)
     }
     if (__atomic_load_n(&peerlink_test_rdma_abort_before_hello, __ATOMIC_RELAXED)) {
         up_dial_abort(c, PL_RDMA_FB_QP, 1);
+        return 0;
+    }
+    if (c->up_cm_mode) {
+        struct plr_cm_addr cm_addr;
+        if (!(peer_ep.flags & PLR_EP_F_CM) || m->data_len != PLR_EP_LEN + PLR_CM_ADDR_LEN ||
+            plr_cm_addr_decode(&cm_addr, m->data + PLR_EP_LEN, PLR_CM_ADDR_LEN) != 0) {
+            up_dial_abort(c, PL_RDMA_FB_BAD, 1);
+            return 0;
+        }
+        if (cm_ip_is_zero(cm_addr.ip))
+            cm_fill_ip_from_tcp(c->t, 1, &cm_addr);
+        up_cm_build_pd(c, c->up_cm_pd);
+        int otmo_ms = (int)(c->rcfg.offer_timeout_ms ? c->rcfg.offer_timeout_ms : 2000u);
+        c->up_cm_id = c->rcfg.cm_ops->dial(&cm_addr, otmo_ms, err, sizeof err);
+        if (!c->up_cm_id) {
+            fprintf(stderr, "peerlink: rdma-cm: dial: %s\n", err);
+            up_dial_abort(c, PL_RDMA_FB_QP, 1);
+            return 0;
+        }
+        c->up_peer_ep = peer_ep;
+        c->up_peer_seq = c->rd->seq - 1; /* seq of RDMA_ACCEPT */
+        c->up_state = UP_D_WAIT_CM;
+        return 0;
+    }
+    if (m->data_len != PLR_EP_LEN || (peer_ep.flags & PLR_EP_F_CM)) {
+        up_dial_abort(c, PL_RDMA_FB_BAD, 1);
         return 0;
     }
     if (plr_conn_start_opt(c->up_conn, &peer_ep, c->rcfg.sl[c->l->kind], c->rcfg.poll_us, err, sizeof err) != 0) {
@@ -2221,7 +2406,7 @@ static int up_handle_decline(struct conn *c, const struct pl_msg *m)
     if (final) {
         fb_count(fb);
         c->rdma_final_decline = 1;
-        if (c->rcfg.mode == PL_RDMA_ON) {
+        if (c->rcfg.mode == PL_RDMA_ON || (c->rcfg.cm && peerlink_mutant == PL_MUT_RDMA_CM_NOFALLBACK)) {
             fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s declined (%s): ending connection\n",
                     c->keys.peer, kname_tab[c->l->kind], peerlink_rdma_fb_name(fb));
             c->up_state = UP_IDLE;
@@ -2245,11 +2430,12 @@ static int up_handle_abort(struct conn *c)
         c->up_declined_wait = 0; /* racing dialer timeout ABORT after acceptor sent DECLINE */
         return 0;
     }
-    if (c->up_state != UP_A_WAIT_OFFER && c->up_state != UP_A_WAIT_HELLO && c->up_state != UP_A_WAIT_GO)
+    if (c->up_state != UP_A_WAIT_OFFER && c->up_state != UP_A_WAIT_CM && c->up_state != UP_A_WAIT_CM_EST &&
+        c->up_state != UP_A_WAIT_HELLO && c->up_state != UP_A_WAIT_GO)
         return -1;
     up_cleanup(c);
     c->up_state = UP_IDLE;
-    if (acc_requires_rdma(c)) {
+    if (acc_requires_rdma(c) || (c->rcfg.cm && peerlink_mutant == PL_MUT_RDMA_CM_NOFALLBACK)) {
         fb_count(PL_RDMA_FB_QP);
         fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s aborted upgrade: ending connection\n",
                 c->keys.peer, kname_tab[c->l->kind]);
@@ -2258,6 +2444,83 @@ static int up_handle_abort(struct conn *c)
     }
     conn_settle(c, 0);
     return 0;
+}
+
+/* Advances Option C (rdma_cm) non-blocking CM events on dialer (UP_D_WAIT_CM) or acceptor (UP_A_WAIT_CM_EST). */
+static void up_step_cm(struct conn *c)
+{
+    char err[256];
+    for (;;) {
+        int ev = PLR_CM_EV_NONE;
+        if (c->up_state == UP_D_WAIT_CM) {
+            if (c->up_conn) {
+                ev = plr_conn_cm_poll(c->up_conn);
+            } else if (c->up_cm_id) {
+                struct plr_cm_ev cev;
+                int r = c->rcfg.cm_ops->next_event(c->up_cm_id, &cev);
+                ev = r < 0 ? -1 : r == 0 ? PLR_CM_EV_NONE : cev.type;
+            }
+            if (ev == PLR_CM_EV_NONE)
+                return;
+            if (ev == PLR_CM_EV_ADDR_RESOLVED && c->up_cm_id && !c->up_conn) {
+                if (c->rcfg.cm_ops->set_sl)
+                    c->rcfg.cm_ops->set_sl(c->up_cm_id, c->rcfg.sl[c->l->kind]);
+                int otmo_ms = (int)(c->rcfg.offer_timeout_ms ? c->rcfg.offer_timeout_ms : 2000u);
+                if (c->rcfg.cm_ops->resolve_route(c->up_cm_id, otmo_ms) != 0) {
+                    fprintf(stderr, "peerlink: rdma-cm: resolve_route failed: %s\n", strerror(errno));
+                    up_dial_abort(c, PL_RDMA_FB_QP, 1);
+                    return;
+                }
+                continue;
+            }
+            if (ev == PLR_CM_EV_ROUTE_RESOLVED && c->up_cm_id && !c->up_conn) {
+                c->up_conn = plr_conn_new_cm(c->up_pool, c->rcfg.cm_ops, c->up_cm_id, &c->up_peer_ep, c->rcfg.poll_us,
+                                             err, sizeof err);
+                if (!c->up_conn) {
+                    fprintf(stderr, "peerlink: rdma-cm: dial: %s\n", err);
+                    up_dial_abort(c, PL_RDMA_FB_QP, 1);
+                    return;
+                }
+                c->up_cm_id = NULL; /* ownership transferred into c->up_conn */
+                int bp = __atomic_load_n(&peerlink_test_rdma_cm_bad_pd, __ATOMIC_RELAXED);
+                uint8_t pd_len = bp == 3 ? 0 : (uint8_t)PLR_CM_PD_LEN;
+                if (plr_conn_cm_connect(c->up_conn, pd_len ? c->up_cm_pd : NULL, pd_len, err, sizeof err) != 0) {
+                    fprintf(stderr, "peerlink: rdma-cm: %s\n", err);
+                    up_dial_abort(c, PL_RDMA_FB_QP, 1);
+                    return;
+                }
+                continue;
+            }
+            if (ev == PLR_CM_EV_ESTABLISHED && c->up_conn) {
+                plr_conn_cm_established(c->up_conn);
+                c->up_t = plr_conn_transport(c->up_conn, NULL);
+                up_encode_qp_probe(c, PLT_RDMA_HELLO, c->up_self_seq, c->up_nonce);
+                c->up_fail_after_hello = __atomic_load_n(&peerlink_test_rdma_fail_after_hello, __ATOMIC_RELAXED);
+                c->up_state = UP_D_WAIT_READY;
+                return;
+            }
+            if (ev == PLR_CM_EV_REJECTED) {
+                up_dial_abort(c, PL_RDMA_FB_AUTH, 1);
+                return;
+            }
+            up_dial_abort(c, PL_RDMA_FB_QP, 1);
+            return;
+        }
+        if (c->up_state == UP_A_WAIT_CM_EST && c->up_conn) {
+            ev = plr_conn_cm_poll(c->up_conn);
+            if (ev == PLR_CM_EV_NONE)
+                return;
+            if (ev == PLR_CM_EV_ESTABLISHED) {
+                plr_conn_cm_established(c->up_conn);
+                c->up_t = plr_conn_transport(c->up_conn, NULL);
+                c->up_state = UP_A_WAIT_HELLO;
+                return;
+            }
+            up_cleanup(c); /* acceptor keeps waiting on TCP for ABORT or 4 s timeout */
+            return;
+        }
+        return;
+    }
 }
 
 /* Parses upgrade frames (RDMA_HELLO, RDMA_READY, RDMA_GO) arriving on c->up_t in c->up_rb. */
@@ -2655,11 +2918,15 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         up_dial_start_offer(&c, 1);
     } else if (l->dialed && c.rcfg.mode == PL_RDMA_ON && (c.rcfg.kinds & (1u << l->kind))) {
         int fb = !(keys->peer_caps & PL_CAP_RDMA) ? PL_RDMA_FB_NOT_BUILT
+                 : (c.rcfg.cm && !c.rcfg.cm_ops)  ? PL_RDMA_FB_NOT_BUILT
                  : c.rcfg.npools <= 0             ? PL_RDMA_FB_POOL
                                                   : PL_RDMA_FB_BACKOFF;
         fb_count(fb);
         fprintf(stderr, "peerlink: rdma: mode on: peer %" PRIu32 " kind %s cannot upgrade (%s): ending connection\n",
                 keys->peer, kname_tab[l->kind], peerlink_rdma_fb_name(fb));
+        c.dead = 1;
+    } else if (l->dialed && c.rcfg.mode == PL_RDMA_AUTO && c.rcfg.cm && !c.rcfg.cm_ops &&
+               peerlink_mutant == PL_MUT_RDMA_CM_NOFALLBACK) {
         c.dead = 1;
     } else if (!l->dialed && keys->try_rdma) {
         uint64_t otmo = (uint64_t)(c.rcfg.offer_timeout_ms ? c.rcfg.offer_timeout_ms : 2000u) * MS;
@@ -2730,8 +2997,26 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                     up_switch_to_rdma(&c, 0);
             }
         }
+        if (c.up_state == UP_A_WAIT_CM && c.up_cm_tok) {
+            struct plr_cm_id *cid = plr_cm_take(c.rcfg.cm_lis, c.up_cm_tok);
+            if (cid) {
+                c.up_cm_tok = NULL;
+                char err[256];
+                c.up_conn = plr_conn_new_cm(c.up_pool, c.rcfg.cm_ops, cid, &c.up_peer_ep, c.rcfg.poll_us, err, sizeof err);
+                if (!c.up_conn) {
+                    fprintf(stderr, "peerlink: rdma-cm: accept: %s\n", err);
+                    c.rcfg.cm_ops->reject(cid);
+                } else if (plr_conn_cm_accept(c.up_conn, err, sizeof err) != 0) {
+                    fprintf(stderr, "peerlink: rdma-cm: %s\n", err);
+                    up_cleanup(&c);
+                } else {
+                    c.up_state = UP_A_WAIT_CM_EST;
+                    up_step_cm(&c);
+                }
+            }
+        }
         if (c.up_state != UP_IDLE && now >= c.up_deadline) {
-            if (c.up_state == UP_D_WAIT_ACCEPT || c.up_state == UP_D_WAIT_READY) {
+            if (c.up_state == UP_D_WAIT_ACCEPT || c.up_state == UP_D_WAIT_CM || c.up_state == UP_D_WAIT_READY) {
                 up_dial_abort(&c, PL_RDMA_FB_TIMEOUT, 1);
             } else {
                 fprintf(stderr, "peerlink: rdma: acceptor timed out waiting for peer %" PRIu32 " kind %s: closing\n",
@@ -2903,7 +3188,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         }
         /* paused: no reading (a hangup or an error is still reported, and read); bytes left in the write buffer:
          * come back as soon as the transport takes more */
-        struct pollfd pf[PL_TR_POLL_MAX * 2 + 1];
+        struct pollfd pf[PL_TR_POLL_MAX * 2 + 2];
         int ready = 0, want = ((paused && c.up_state == UP_IDLE) ? 0 : PL_TR_IN) | (c.wb.len > c.wb.off ? PL_TR_OUT : 0);
         int nt = c.t->ops->poll_fds(c.t, want, pf, &ready);
         if (nt < 0 || nt > PL_TR_POLL_MAX) {
@@ -2923,16 +3208,29 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                     up_cleanup(&c);
             }
         }
-        pf[nt + nu] = (struct pollfd){l->evfd, POLLIN, 0};
+        int ncm = 0;
+        if (c.up_state == UP_D_WAIT_CM || c.up_state == UP_A_WAIT_CM_EST) {
+            int cm_fd = c.up_conn ? plr_conn_cm_fd(c.up_conn) : (c.up_cm_id ? c.rcfg.cm_ops->fd(c.up_cm_id) : -1);
+            if (cm_fd >= 0) {
+                pf[nt + nu] = (struct pollfd){cm_fd, POLLIN, 0};
+                ncm = 1;
+            }
+        }
+        pf[nt + nu + ncm] = (struct pollfd){l->evfd, POLLIN, 0};
         if ((ready || uready) && peerlink_mutant != PL_MUT_NOREADY)
             tmo = 0; /* the transport holds what we want already */
-        int pr = poll(pf, (nfds_t)(nt + nu + 1), tmo);
+        int pr = poll(pf, (nfds_t)(nt + nu + ncm + 1), tmo);
         if (pr < 0 && errno != EINTR)
             break;
         if (pr <= 0 && !ready && !uready)
             continue;
-        if (pr > 0 && (pf[nt + nu].revents & POLLIN))
+        if (pr > 0 && (pf[nt + nu + ncm].revents & POLLIN))
             drain_evfd(l);
+        if (pr > 0 && ncm && (pf[nt + nu].revents & (POLLIN | POLLERR | POLLHUP))) {
+            up_step_cm(&c);
+            if (c.dead)
+                break;
+        }
         int tr = ready | (pr > 0 ? c.t->ops->poll_ready(c.t, pf, nt) : 0);
         int utr = c.up_t ? (uready | (pr > 0 && nu > 0 ? c.up_t->ops->poll_ready(c.up_t, pf + nt, nu) : 0)) : 0;
         if (tr & PL_TR_IN) {
