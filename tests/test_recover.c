@@ -659,23 +659,26 @@ static void series_stats_reopen(void)
     snprintf(root, sizeof root, "%s/sstats_root", scratch);
     snprintf(vol, sizeof vol, "%s/sstats_vol", scratch);
     sh("rm -rf '%s' '%s'", root, vol);
-    tsdb_sid s;
-    tsdb *db = reval_open(root, vol, &s, "sstats_s");
+    tsdb_sid s[2];
+    tsdb *db = reval_open(root, vol, &s[0], "sstats_s0");
+    OK(tsdb_series_at(db, "sstats_s1", vol, &s[1]));
+    CHECK(TSDB_SID_VOLUME(s[0]) == 1 && TSDB_SID_VOLUME(s[1]) == 1 && s[0] != s[1]);
     int64_t ts[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     float v[10] = {0};
-    OK(tsdb_insert_series(db, s, ts, v, 10));
-    tsdb_series_stat st;
+    OK(tsdb_insert_series(db, s[0], ts, v, 10));
+    OK(tsdb_insert_series(db, s[1], ts, v, 10));
+    tsdb_series_stat st[2];
     size_t done = 0;
-    OK(tsdb_series_stats(db, &s, 1, 0, &st, &done));
-    CHECK(done == 1 && st.status == 0 && st.rows == 10);
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
     /* Quiesce, inspect again while quiesced (must not touch refs), then reopen (would fail INVALID or hang on mrefs). */
     stop_volume(db);
-    OK(tsdb_series_stats(db, &s, 1, 0, &st, &done));
-    CHECK(done == 1 && st.status == 0 && st.rows == 10);
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
     OK(tsdb_volume_reopen(db, 1, NULL));
     OK(tsdb_volume_resume(db, 1));
-    OK(tsdb_series_stats(db, &s, 1, 0, &st, &done));
-    CHECK(done == 1 && st.status == 0 && st.rows == 10);
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
     tsdb_close(db);
 }
 

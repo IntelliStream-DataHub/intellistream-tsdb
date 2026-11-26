@@ -441,7 +441,7 @@ static void slot_release(mcall *c, mslot *sl)
 {
     const tsdb_multi_opts *mo = c->mo;
     c->held -= sl->r.bytes;
-    if (c->headonly && c->held <= c->max_held / 2) {
+    if (c->headonly && c->headonly_at == SIZE_MAX && c->held <= c->max_held / 2) {
         c->headonly = false;
         c->starved = true;
     }

@@ -750,16 +750,13 @@ static void many_volumes(const char *base)
  * helpers run the others ahead (at most W = 2 x threads). Budget hooks count what results ahead hold. */
 typedef struct {
     atomic_long out, peak, takes, small_takes, deferred;
-    atomic_long fail_first; /* when > 0: first fail_first calls to b_take return -1 (transient external budget) */
+    atomic_int deny; /* when non-zero: b_take returns -1 (transient external budget refusal) */
 } budget;
 static int b_take(void *ctx, size_t n)
 {
     budget *b = ctx;
-    long f = atomic_load(&b->fail_first);
-    while (f > 0) {
-        if (atomic_compare_exchange_weak(&b->fail_first, &f, f - 1))
-            return -1;
-    }
+    if (atomic_load(&b->deny))
+        return -1;
     long o = atomic_fetch_add(&b->out, (long)n) + (long)n, p = atomic_load(&b->peak);
     while (o > p && !atomic_compare_exchange_weak(&b->peak, &p, o)) {
     }
@@ -782,10 +779,12 @@ typedef struct {
     atomic_long *gate;
     int gate_hit;
     /* optional second gate on a later series (P-10 headonly recovery): holds at index `gate2_idx` until `*gate2`
-     * exceeds its snapshot at arrival, proving helpers resumed lookahead after pressure cleared. */
+     * reaches 1, proving helpers resumed lookahead after pressure cleared. */
     size_t gate2_idx;
     atomic_long *gate2;
     int gate2_hit;
+    /* optional external-budget deny flag cleared once series 1 finishes at the head */
+    atomic_int *clear_deny;
 } slow_ctx;
 static atomic_long gate_open = 1;
 static void late_conductor(void) { usleep(20000); } /* the helpers run first */
@@ -802,6 +801,8 @@ static int slow_head(void *ctx, const tsdb_series_result *r)
             s->gate_hit += atomic_load(s->gate) >= 1;
         }
     }
+    if (s->clear_deny && r->index == 1 && r->last)
+        atomic_store(s->clear_deny, 0);
     if (s->gate2 && r->index == s->gate2_idx && r->last) {
         for (int i = 0; i < 5000 && atomic_load(s->gate2) < 1; i++)
             usleep(1000);
@@ -959,24 +960,29 @@ static void bounds(const char *base)
     CHECK(ahead_after >= 1);
     CHECK(atomic_load(&b.out) == 0);
 
-    /* P-10 regression: transient external budget_take refusal while held == 0 also recovers after cooldown. */
+    /* P-10 regression: transient external budget_take refusal while held == 0 honors the W-series cooldown and
+     * recovers parallel lookahead afterward. Use 2 threads (1 helper, W = 4) with an atomic deny flag cleared at
+     * index 1 so zero takes can succeed before recovery and zero can fail after cooldown ends at head == 4. */
     tsdb_sid ext_list[40];
     for (int i = 0; i < 40; i++)
         ext_list[i] = tiny;
     memset(&b, 0, sizeof b);
     memset(&sc, 0, sizeof sc);
-    atomic_store(&b.fail_first, 2); /* at most 2 waves refused (headonly_at <= 16), then budget allows */
-    mo.threads = 4;                 /* W = 8 */
+    atomic_store(&b.deny, 1);
+    mo.threads = 2; /* 1 helper, W = 4 */
     mo.max_held_bytes = 0;
     sc.gate = &b.deferred;
-    sc.gate2_idx = 20; /* guaranteed past at most 2 cooldown windows (2 * W = 16) */
+    sc.clear_deny = &b.deny;
+    sc.gate2_idx = 5; /* past cooldown (headonly_at == 4) */
     sc.gate2 = &b.small_takes;
     OK(tsdb_query_multi(db, &qv, ext_list, 40, &mo, slow_head, &sc));
     CHECK(sc.gate_hit == 1);
     CHECK(sc.gate2_hit == 1);
     CHECK(sc.rows == 40 * 10);
+    for (int i = 0; i < 4; i++)
+        CHECK(sc.calls[i] > 1); /* series 0..3 ran at the head during the W = 4 cooldown */
     ahead_after = 0;
-    for (int i = 20; i < 40; i++)
+    for (int i = 4; i < 40; i++)
         ahead_after += sc.calls[i] == 1;
     CHECK(ahead_after >= 1);
     CHECK(atomic_load(&b.out) == 0);
