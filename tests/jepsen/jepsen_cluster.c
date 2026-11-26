@@ -64,8 +64,8 @@
  *  5 monotonic reads: a session's later read is not older than an earlier one at any key.
  * kv and classes (not with kv-local in one run: kv-local's nodes run with TSDB_CLUSTER_WRITES=1, these with the
  * replication driver): one cluster volume "kvr" of 3 replicas, two series with a writer and a reader each through its
- * leader (checks 1-5 as above) and a filler series of inserts of 50-1550 rows at a frontier whose rate changes every
- * minute of timestamps (most of them large writes, shipped as files); classes adds small partitions and granules,
+ * leader (checks 1-5 as above) and a filler series of inserts of 50-1550 rows at a frontier whose spacing cycles
+ * every 16 acknowledged batches (most of them large writes, shipped as files); classes adds small partitions and granules,
  * quick flushes and idle merges so that series switch partition classes (CLASS markers in the stream). A replica silent
  * for isr_lag_ms (1 s) leaves kvr's ISR and the writes go on without it (one it held up until then may time out:
  * indeterminate, never a failure); it joins again once caught up. kvr's leader is a target of kill, power, pause and
@@ -3885,7 +3885,7 @@ static void nem_terminal(void)
         snprintf(unfired_msg, sizeof unfired_msg, "the armed crash point %s never fired on %s within %d ms of its "
                  "trigger", cps[term_cp].name, fo ? "any node of kvr (its leader cut from the others)" :
                  "kvr's leader", win);
-        if (!fo) {
+        if (!fo && L >= 0 && L < nn) {
             kill_n = L;
             stop_node(kill_n, SIGKILL);
         }
@@ -3894,7 +3894,7 @@ static void nem_terminal(void)
         cp_hits_serving += (unsigned)nend;
         term_fired = 1;
         printf("jepsen-cluster: terminal crash point %s: %d node(s) ended there, %s%s\n", cps[term_cp].name, nend,
-               (ended[L] || (!fo && cps[term_cp].leader == 1)) ? "the leader" : "not the leader",
+               ((L >= 0 && L < nn && ended[L]) || (!fo && cps[term_cp].leader == 1)) ? "the leader" : "not the leader",
                fo ? " (failover)" : "");
     }
     effect_seen = 1;

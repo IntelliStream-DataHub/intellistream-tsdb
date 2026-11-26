@@ -3644,6 +3644,90 @@ static void case_commit_hold_cut(void)
     xp_stop(&x);
 }
 
+/* While durable_next is held below fno_next by an unstaged COMMIT file, replica_sync() syncs the WAL once (raising
+ * synced_next) and subsequent calls do not re-sync; replica_cut() rewinds synced_next so re-appended bytes are synced;
+ * once staged, replica_sync() raises durable_next to synced_next without an extra fdatasync(). */
+static void case_commit_hold_sync(void)
+{
+    xport x;
+    char rd[PATH_MAX], name[64];
+    uint64_t sz, mpos;
+    xp_start(&x, "khs");
+    rdir(rd, sizeof rd, &x);
+    xp_rows(&x, 0, 0, 10, 100);
+    xp_step(&x, "KHS: before");
+    x.withhold = true;
+    x.noship = true;
+    x.noapply = true;
+    xp_rows(&x, 0, 5, 40, 2000); /* COMMIT marker whose file is withheld */
+    uint64_t last = ld_last(&x);
+    uint64_t s0 = atomic_load(&x.rep->st_wal_syncs);
+    CHECK_EQ(xp_ship_logs(&x), 0); /* appends COMMIT marker and calls replica_sync() once */
+    uint64_t s1 = atomic_load(&x.rep->st_wal_syncs);
+    CHECK_EQ(s1, s0 + 1);
+    CHECK_EQ(replica_log_end(x.rep), last);
+    CHECK(replica_durable_end(x.rep) < last);
+    CHECK_EQ(replica_missing(x.rep, &mpos, name, sizeof name, &sz), 1);
+    for (int i = 0; i < 5; i++)
+        CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(atomic_load(&x.rep->st_wal_syncs), s1); /* synced_next == fno_next: no redundant fdatasync */
+    CHECK(replica_durable_end(x.rep) < last);
+    /* append above the held marker, cut back to mid, then re-append to verify replica_cut() rewound synced_next */
+    xp_rows(&x, 1, 0, 3, 300);
+    uint64_t mid = ld_last(&x);
+    xp_rows(&x, 1, 3, 3, 400);
+    uint64_t top = ld_last(&x);
+    CHECK(mid > mpos && top > mid);
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    uint64_t s2 = atomic_load(&x.rep->st_wal_syncs);
+    CHECK_EQ(s2, s1 + 1);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(atomic_load(&x.rep->st_wal_syncs), s2);
+    CHECK_EQ(replica_cut(x.rep, mid), 0);
+    CHECK_EQ(replica_log_end(x.rep), mid);
+    CHECK(replica_durable_end(x.rep) < mpos);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(atomic_load(&x.rep->st_wal_syncs), s2); /* cut already synced through mid */
+    /* re-ship records above mid: synced_next was rewound to mid + 1, so replica_sync() must sync them once */
+    {
+        char p[PATH_MAX + 80], nm[64];
+        DIR *d = opendir(rd);
+        struct dirent *e;
+        uint64_t best = 0;
+        while (d && (e = readdir(d))) {
+            uint64_t seq;
+            int c = 0;
+            if (wal_file_name(e->d_name) && sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &c) == 1 && seq >= best)
+                best = seq;
+        }
+        if (d)
+            closedir(d);
+        wal_name(nm, sizeof nm, best);
+        snprintf(p, sizeof p, "%s/%s", rd, nm);
+        struct stat st;
+        CHECK_EQ(stat(p, &st), 0);
+        x.cseq = best;
+        x.coff = (uint64_t)st.st_size;
+    }
+    CHECK_EQ(xp_ship_logs(&x), 0);
+    uint64_t s3 = atomic_load(&x.rep->st_wal_syncs);
+    CHECK_EQ(s3, s2 + 1);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(atomic_load(&x.rep->st_wal_syncs), s3);
+    /* staging the missing file lets replica_sync() raise durable_next to synced_next without another fdatasync */
+    CHECK_EQ(replica_stage(x.rep, x.held_name, x.held, x.held_len), 0);
+    CHECK_EQ(replica_sync(x.rep), 0);
+    CHECK_EQ(replica_durable_end(x.rep), top);
+    CHECK_EQ(atomic_load(&x.rep->st_wal_syncs), s3);
+    CHECK_EQ(replica_apply(x.rep, top), 0);
+    CHECK_EQ(replica_applied_end(x.rep), top);
+    x.withhold = false;
+    x.noship = false;
+    x.noapply = false;
+    CHECK(xp_same(&x, "KHS: after stage and apply"));
+    xp_stop(&x);
+}
+
 /* a cut removes the files of the markers it removes */
 static void case_commit_cut(void)
 {
@@ -8157,6 +8241,61 @@ static void case_leader_replay(void)
            told, c2);
 }
 
+/* When a deposed leader with RSTATE.kept >= S reopens as a replica at a floor below S's end, replica_open_log() clamps
+ * kept_saved below S while rs.kept still holds S. Once S is applied, flushed, and covered by replica_floor_saved(),
+ * kept_save() must raise kept_saved to S (and replica_replay_start() past S) even though seq <= rp->rs.kept. */
+static void case_kept_clamped_advance(void)
+{
+    xport x;
+    xp_start(&x, "kca");
+    eng_close(x.rep);
+    x.rep = NULL;
+    x.noship = true;
+    for (int k = 0; k < 4; k++)
+        xp_rows(&x, 0, 10 * k, 5, 100 + 10 * k);
+    uint64_t c1 = ld_last(&x);
+    CHECK_EQ(eng_flush(x.ld), 0); /* segment 1 flushed -> RSTATE.kept = 1 */
+    eng_leader_keep_floor(x.ld, c1, c1);
+    for (int k = 0; k < 4; k++)
+        xp_rows(&x, 1, 10 * k, 5, 200 + 10 * k);
+    uint64_t c2 = ld_last(&x);
+    CHECK_EQ(eng_flush(x.ld), 0); /* segment 2 flushed -> RSTATE.kept = 2, while saved floor stays c1 */
+    xp_rows(&x, 0, 50, 4, 300);   /* segment 3 (unflushed), starts at c2 + 1 */
+    uint64_t c3 = ld_last(&x);
+    CHECK(c2 > c1 && c3 > c2);
+    eng_leader_depose(x.ld);
+    CHECK_EQ(eng_close(x.ld), 0);
+    x.ld = NULL;
+
+    eng *ex = NULL;
+    replica_keep_next(0, 3600 * 1000);
+    CHECK_EQ(open_replica(x.ldir, c1, &ex), 0);
+    if (!ex)
+        exit(2);
+    uint64_t k0 = replica_kept_seq(ex);
+    uint64_t rs0 = replica_replay_start(ex);
+    CHECK(k0 > 0);
+    CHECK_EQ(rs0, c1 + 1); /* segment 2 exceeds floor c1, so kept_saved was clamped below rs.kept */
+    CHECK_EQ(replica_apply(ex, c3), 0); /* applies segment 2 and starts segment 3, sealing segment 2 */
+    CHECK_EQ(mt_flush(ex), 0);          /* flushes segment 2 -> queued in rp->kq */
+    CHECK_EQ(replica_kept_seq(ex), k0); /* floor still c1: kept_saved must not rise yet */
+    CHECK_EQ(replica_replay_start(ex), rs0);
+    CHECK_EQ(replica_floor_saved(ex, c2), 0); /* floor now covers segment 2: kept_save() must raise kept_saved */
+    CHECK(replica_kept_seq(ex) > k0);
+    CHECK_EQ(replica_replay_start(ex), c2 + 1);
+    CHECK_EQ(eng_close(ex), 0);
+
+    /* reopen at floor c2: replays from c2 + 1 (matching the advertised replay start) */
+    ex = NULL;
+    replica_keep_next(0, 3600 * 1000);
+    CHECK_EQ(open_replica(x.ldir, c2, &ex), 0);
+    if (ex) {
+        CHECK_EQ(replica_test_open_first(ex), c2 + 1);
+        CHECK_EQ(eng_close(ex), 0);
+    }
+    xp_stop(&x);
+}
+
 /* PL (D17, REVIEW F2): power lost at every step of a leader that writes, flushes, has its commit floor saved (lagging
  * a round, sometimes covering the segment it is about to flush) and restarts. The replay start told before the loss
  * (also from inside the save of `kept`) is never above the first position the directory, reopened as a replica at the
@@ -8632,6 +8771,7 @@ int main(int argc, char **argv)
         case_replica_snapshot_isolation();
         case_commit_cut();
         case_commit_hold_cut();
+        case_commit_hold_sync();
         case_apply_concurrent();
         case_apply_cut_race(0);
         case_apply_cut_race(1);
@@ -8657,6 +8797,7 @@ int main(int argc, char **argv)
     if (getenv("TEST_REPLICA_KEPT_ONLY")) { /* the quick run of D17's cases (RSTATE kept, the replay start) */
         case_replaykept();
         case_leader_replay();
+        case_kept_clamped_advance();
         case_power_kept();
         case_power_leader_kept();
         sh("rm -rf '%s'", S);
@@ -8727,6 +8868,7 @@ int main(int argc, char **argv)
     case_keepcap();
     case_replaykept();
     case_leader_replay();
+    case_kept_clamped_advance();
     case_cut();
     case_cut_publish();
     case_refused();
@@ -8756,6 +8898,7 @@ int main(int argc, char **argv)
     case_ppos_parity();
     case_commit_cut();
     case_commit_hold_cut();
+    case_commit_hold_sync();
     case_apply_concurrent();
     case_apply_cut_race(0);
     case_apply_cut_race(1);

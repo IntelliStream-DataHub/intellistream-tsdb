@@ -2421,11 +2421,12 @@ static void do_sync(struct rvol *rv)
         return;
     }
     repl_synced(rv->core, d);
+    uint64_t now = now_ms();
     if (missing && G.fetch_late && strcmp(name, rv->fetch_late_name)) { /* a new name: its first FETCH waits */
         snprintf(rv->fetch_late_name, sizeof rv->fetch_late_name, "%s", name);
-        rv->fetch_late_ms = now_ms();
+        rv->fetch_late_ms = now;
     }
-    if (missing && G.fetch_late && now_ms() - rv->fetch_late_ms < FETCH_LATE_MS)
+    if (missing && G.fetch_late && now - rv->fetch_late_ms < FETCH_LATE_MS)
         missing = 0;
     if (missing && G.no_fetch) {
         if (strcmp(name, rv->fetch_name))
@@ -2434,7 +2435,7 @@ static void do_sync(struct rvol *rv)
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
         missing = 0;
     }
-    if (missing && (strcmp(name, rv->fetch_name) || now_ms() - rv->fetch_ms >= 1000)) {
+    if (missing && (strcmp(name, rv->fetch_name) || now - rv->fetch_ms >= 1000)) {
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
         uint8_t b[RW_NAME_MAX + 24 + RW_CHECK];
@@ -2445,12 +2446,11 @@ static void do_sync(struct rvol *rv)
         if (l && n)
             plink_send(l, RW_T_FETCH, b, n, 0);
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
-        rv->fetch_ms = now_ms();
+        rv->fetch_ms = now;
     }
     if (still_missing && rv->mode == M_REPLICA) {
         /* Avoid busy-looping do_sync + flooding duplicate ACKs while waiting for a fetched file: IN_WAKE (on stage),
          * new WAL appends/cuts, leader changes (IN_META), or the 1 s retry timer wake it. */
-        uint64_t now = now_ms();
         if (G.fetch_late && now < rv->fetch_late_ms + FETCH_LATE_MS) {
             rv->fetch_wait_until = rv->fetch_late_ms + FETCH_LATE_MS;
         } else {
