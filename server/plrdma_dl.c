@@ -156,8 +156,25 @@ static int dl_dev_open(const char *dev, int port, struct plr_dev **out, struct p
             if (!dev && !ib)
                 continue; /* D10: RoCE and iWARP only when named */
             union ibv_gid gid;
+            int gid_idx = 0;
             if (V.query_gid(ctx, (uint8_t)p, 0, &gid) != 0)
                 continue;
+            static const uint8_t zero_gid[16];
+            if (memcmp(gid.raw, zero_gid, 16) == 0 && pa.gid_tbl_len > 1) {
+                int lim = pa.gid_tbl_len < 256 ? pa.gid_tbl_len : 256;
+                for (int g = 1; g < lim; g++) {
+                    union ibv_gid cand;
+                    if (V.query_gid(ctx, (uint8_t)p, g, &cand) == 0 && memcmp(cand.raw, zero_gid, 16) != 0) {
+                        gid = cand;
+                        gid_idx = g;
+                        break;
+                    }
+                }
+            }
+            if (!ib && memcmp(gid.raw, zero_gid, 16) == 0) {
+                snprintf(err, errlen, "RDMA: %s port %d has no non-zero GID (assign an IP address)", name, p);
+                continue;
+            }
             struct ibv_pd *pd = V.alloc_pd(ctx);
             if (!pd) {
                 snprintf(err, errlen, "RDMA: %s: no protection domain (%s)", name, strerror(errno));
@@ -171,6 +188,7 @@ static int dl_dev_open(const char *dev, int port, struct plr_dev **out, struct p
             d->ctx = ctx;
             d->pd = pd;
             d->port = (uint8_t)p;
+            d->gid_index = gid_idx;
             memset(pi, 0, sizeof *pi);
             pi->lid = pa.lid;
             memcpy(pi->gid, gid.raw, 16);

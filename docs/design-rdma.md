@@ -857,16 +857,19 @@ line rate either way; a pair of servers was not measured).
   `retry_s` on the live link); an offer from another IB subnet. Further mutants: a control credit returned by a frame
   of its own (a storm), a pause that withholds control credits, a slot returned before its flush completion, an
   unsignalled send's slot returned early, the acceptor settling on READY instead of GO.
-- **Soft-RoCE where it exists**: the dev machine (Ubuntu kernel) has `rdma_rxe` and `siw` (neither loaded today), so
-  `test_peerlink` and `test_cluster` run every existing case once more with `--peer-rdma on` over an rxe device. Making
-  the device needs root (`modprobe rdma_rxe; rdma link add rxe0 type rxe netdev IF` on an Ethernet or veth interface),
-  so the tests never make it: they use a device that exists and print that they are skipped otherwise. A suite that
-  skips everywhere has no teeth, so the setup is named: the **weekly gate on the dev machine** makes the device once
-  per boot (a step of the gate's script run with sudo by the owner, or a systemd unit) and runs with
-  `TSDB_RDMA_REQUIRED=1`, which turns "skipped" into a failure. rxe pins registered pages against `RLIMIT_MEMLOCK`
-  (8 MB hard on the dev machine), and test_cluster starts 3-5 tsdbd: the tests run with `pool_mb` 1 and
-  `rnr_retry` 0. CI (ubuntu-24.04, Azure kernel) may not load `rdma_rxe` (it lives in linux-modules-extra): rd-rxe
-  finds out; if it cannot, CI runs the fake only and says so. AlmaLinux 10 has neither module: those runs say skipped.
+- **Soft-RoCE where it exists (built in rd-rxe)**: `tests/rdma_dev.h` discovers an active verbs device without requiring
+  root (`TSDB_RDMA_DEV=DEV[:PORT]` pins one; otherwise prefers an active InfiniBand HCA port, then `rxe*`, then `siw*`).
+  When built with `NO_RDMA=1` or when no active verbs device exists, the real-verbs tests print `skipped (...)` and exit
+  0 — unless `TSDB_RDMA_REQUIRED=1` is set, which turns a skip into a failure so a gate never silently skips.
+  `tools/setup-rxe.sh` checks devices, kernel module availability and `RLIMIT_MEMLOCK` without root (`--check`), and
+  provides `--setup` / `--teardown` for sudo/weekly-gate hosts with `rdma_rxe` (e.g. Ubuntu with `linux-modules-extra`;
+  AlmaLinux 10 omits `rdma_rxe` and `siw`). `test_peerlink --rdma` (and its `rdma` case) and `test_cluster rdma` (in
+  `CLUSTER_SCEN_3`, also runnable via `make test-rdma`) run over real verbs with `--peer-rdma on --peer-rdma-pool-mb 1`
+  (tsdbd scales slot geometry to 2 KiB slots for small 1-2 MiB pools so 32-64 connections fit inside an 8 MiB memlock
+  limit) and `TSDB_PLRDMA_TEST=rnr_retry=0` so any credit bug fails the QP loudly instead of hiding behind retries, then
+  assert `tsdb cluster status` and `/metrics` confirm `rdma > 0`, `tcp == 0`, 0 fallbacks, 0 RNR retries and 0 QP errors.
+  CI (`ubuntu-24.04`, Azure kernel) lacks `rdma_rxe` in its default kernel modules, so CI runs the fake transport and
+  cleanly skips the real-verbs cases (printing `skipped`).
 - **The test servers** for real hardware, by hand and in the weekly gate when they are free: `test_cluster` scenarios
   over IB (replicate, fwd, chunksrv, a snapshot), `jepsen-cluster --peer-rdma on` with a nemesis that breaks only the
   RDMA path (a QP forced to error through a test hook, `TSDB_PLRDMA_TEST`), and the §10.3 measurements of
@@ -903,7 +906,7 @@ line rate either way; a pair of servers was not measured).
 | rd-verbs | high | rd-seam, D14 | a spike first (dlopen of rdma-core 61, `tools/check-rdma-syms.sh`); new server/plrdma.[ch] (the pool per tsdbd, SRQs or rings, QP setup from exchanged numbers, data and control credits, SEND/RECV slots, frames split over slots, the drain before destroy, completion fd in the link's poll), server/plrdma_dl.c, Makefile header detection and `NO_RDMA`, ci.yml packages, the release image, AGENTS.md Requirements, docs/macos.md; tests/test_plrdma.c with the fake and its mutants | 3 |
 | rd-upgrade | high | rd-verbs | peerlink.c: the state machine of §5.1 (`RDMA_OFFER/ACCEPT/DECLINE/HELLO/READY/GO/ABORT`), fallback, the backoff that counts QP failures after READY, the re-offer on a live link, the subnet decline, the SL, on_link after each side settles; the refusal of a peer address on an IPoIB interface (§5.3); tsdbd_keys.h rows, docs/config.md, metrics, `tsdb cluster status`; test_peerlink cases over the fake | 2 |
 | rd-cm | medium | rd-upgrade | option C: the rdma_cm listener and dial (`cluster.peer.rdma.cm`), the nonce in private data; tests over rxe/siw (siw is iWARP-like) | 0.75 |
-| rd-rxe | medium | rd-upgrade | tests: a helper that finds an rxe device (or says skipped; `TSDB_RDMA_REQUIRED=1` fails instead), the weekly gate's setup step on the dev machine (the device, memlock), test_peerlink and test_cluster `rdma` runs with a tiny pool and `rnr_retry` 0, whether CI can load rdma_rxe and the CI job if it can | 1 |
+| rd-rxe | medium | rd-upgrade | built: `tests/rdma_dev.h` (active IB/rxe/siw discovery without root, `TSDB_RDMA_DEV`, `TSDB_RDMA_REQUIRED=1`), `tools/setup-rxe.sh` (`--check`/`--setup`/`--teardown` + memlock check), `TSDB_PLRDMA_TEST=rnr_retry=0` and compact small-pool slot scaling in `tsdbd.c`, non-zero GID scan in `plrdma_dl.c`, `test_peerlink --rdma` + `rdma` case, `test_cluster rdma` (in `CLUSTER_SCEN_3`), `make test-rdma` | 1 |
 | rd-hw | low | rd-rxe | runs on the test servers: test_cluster and jepsen-cluster over IB, tsdbc-bench `via` and insert-bench on 3 members, TCP against IB, this document's §3 again with the MAC fixed (batched, buffers on both sides); on a production-like node NFS/RDMA and WAL `fdatasync` latency under peer bulk load at several caps, and the end-to-end rebuild rate (D11); results here | 1.5 |
 
 Open before rd-upgrade turns `auto` on (D6), from §3.6: with the default connection (32 KiB slots, 12 data credits)

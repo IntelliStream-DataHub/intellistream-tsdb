@@ -56,6 +56,8 @@
 #include "internal.h"
 #include "peerlink.h"
 #include "plcheck.h"
+#include "plrdma.h"
+#include "rdma_dev.h"
 #include "fwd.h"
 #include "tsdb_crypto.h"
 #include "pl_fake.h"
@@ -474,8 +476,8 @@ struct node {
     _Atomic uint64_t frames_in, bad_frames, order_bad;
     uint64_t last_seq;
     int have_seq;
-    int strict;       /* seq must be last + 1 */
-    int echo;         /* a type 2 frame is answered with type 3 */
+    _Atomic int strict; /* seq must be last + 1 */
+    _Atomic int echo;   /* a type 2 frame is answered with type 3 */
     int gate_closed;  /* on_frame blocks while set */
     int gate_kind;    /* ...on links of this kind only (0: every link) */
     _Atomic int t6;   /* type 6 frames seen */
@@ -493,7 +495,7 @@ struct node {
     char path[600];
     _Atomic int fd; /* the receiver's file: its link thread opens it, a test thread polls its size */
     int discard; /* bench: the bytes go nowhere and a resume starts over */
-    unsigned delay_us;
+    _Atomic unsigned delay_us;
     _Atomic uint64_t opens, last_resume, data_bytes, ends;
     _Atomic int last_end;
     _Atomic int meta_bad;
@@ -578,8 +580,15 @@ static int b_open(void *arg, struct plink *l, uint64_t file, const void *meta, s
 {
     (void)l;
     struct node *nd = arg;
-    if (nd->want_meta[0] && (meta_len != strlen(nd->want_meta) || memcmp(meta, nd->want_meta, meta_len) != 0 ||
-                             file != 77 || total != nd->want_total))
+    char path[600], want_meta[64];
+    uint64_t want_total;
+    pthread_mutex_lock(&nd->mu);
+    snprintf(path, sizeof path, "%s", nd->path);
+    snprintf(want_meta, sizeof want_meta, "%s", nd->want_meta);
+    want_total = nd->want_total;
+    pthread_mutex_unlock(&nd->mu);
+    if (want_meta[0] && (meta_len != strlen(want_meta) || memcmp(meta, want_meta, meta_len) != 0 ||
+                         file != 77 || total != want_total))
         nd->meta_bad++;
     uint64_t n = atomic_fetch_add(&nd->opens, 1);
     if (nd->discard) {
@@ -590,7 +599,7 @@ static int b_open(void *arg, struct plink *l, uint64_t file, const void *meta, s
     if (nd->fake_pfd >= 0) { /* a resume prefix that is not the sender's bytes */
         if (nd->fd >= 0)
             close(nd->fd);
-        nd->fd = open(nd->path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        nd->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
         *resume = nd->fake_resume;
         *prefix_fd = nd->fake_pfd;
         return nd->fd < 0 ? -1 : 0;
@@ -599,7 +608,7 @@ static int b_open(void *arg, struct plink *l, uint64_t file, const void *meta, s
         nd->cur_file = file;
         if (nd->fd >= 0)
             close(nd->fd);
-        nd->fd = open(nd->path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        nd->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (nd->fd < 0)
             return -1;
         *resume = 0;
@@ -712,6 +721,26 @@ static void node_free(struct node *nd)
     if (nd->fd >= 0)
         close(nd->fd);
     free(nd);
+}
+
+static void node_reset_seq(struct node *nd)
+{
+    pthread_mutex_lock(&nd->mu);
+    nd->have_seq = 0;
+    pthread_mutex_unlock(&nd->mu);
+}
+
+static void node_set_bulk(struct node *nd, const char *path, const char *want_meta, uint64_t want_total)
+{
+    pthread_mutex_lock(&nd->mu);
+    if (path)
+        snprintf(nd->path, sizeof nd->path, "%s", path);
+    if (want_meta)
+        snprintf(nd->want_meta, sizeof nd->want_meta, "%s", want_meta);
+    else
+        nd->want_meta[0] = 0;
+    nd->want_total = want_total;
+    pthread_mutex_unlock(&nd->mu);
 }
 
 static void set_gate(struct node *nd, int closed)
@@ -1012,7 +1041,7 @@ static void test_log(void)
     /* the acceptor sends to the dialer on its own accepted link */
     struct plink *al = peerlink_find(a->pl, 2, PL_KIND_LOG);
     CHECK(al != NULL);
-    b->have_seq = 0;
+    node_reset_seq(b);
     if (al) {
         CHECK(send_frames(al, 1, 0, 50, 500, 1000) == PL_OK);
         CHECK(WAIT_FOR(b->frames_in == 50, 3000));
@@ -1049,7 +1078,9 @@ static void test_bulk(void)
     uint64_t t0 = now_ms();
     CHECK(bulk_send(l, sfd, size, a->want_meta, &r) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&r.done), 30000));
-    CHECK(now_ms() - t0 < 2000); /* an unthrottled file runs at the socket's pace, not the ping timer's */
+    /* an unthrottled file runs at the link's pace, not the 5 s ping timer's (allow margin under RDMA/Soft-RoCE + TSan) */
+    uint64_t bulk_lim_ms = plink_is_rdma(l) ? 10000 : 2000;
+    CHECK(now_ms() - t0 < bulk_lim_ms);
     CHECK(r.status == PL_OK);
     CHECK(WAIT_FOR(a->ends == 1, 3000) && a->last_end == PL_OK);
     CHECK(a->meta_bad == 0 && a->opens == 1);
@@ -1057,7 +1088,7 @@ static void test_bulk(void)
     CHECK(same_file(sfd, a->fd, size));
     /* a second file on the same link; a refused one */
     struct jres r2 = {0};
-    a->want_meta[0] = 0;
+    node_set_bulk(a, NULL, NULL, 0);
     CHECK(bulk_send_id(l, 78, sfd, 1000, "second", &r2) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&r2.done), 10000) && r2.status == PL_OK);
     struct pl_stats sb;
@@ -2347,18 +2378,26 @@ static void test_chunk(void)
     size_t size = 4u << 20;
     int sfd = open(src, O_RDWR | O_CREAT | O_TRUNC, 0644);
     CHECK(sfd >= 0 && ftruncate(sfd, (off_t)size) == 0);
-    snprintf(a->path, sizeof a->path, "%s", dst);
-    strcpy(a->want_meta, "chunk");
-    a->want_total = size;
+    node_set_bulk(a, dst, "chunk", size);
     struct jres r = {0};
     uint64_t w0 = atomic_load(&px->bytes[0]);
-    CHECK(bulk_send(b, sfd, size, a->want_meta, &r) == PL_OK);
+    CHECK(bulk_send(b, sfd, size, "chunk", &r) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&r.done), 10000) && r.status == PL_OK);
     CHECK(WAIT_FOR(a->ends == 1, 3000) && a->last_end == PL_OK);
     CHECK(a->meta_bad == 0 && same_file(sfd, a->fd, size));
     uint64_t w = atomic_load(&px->bytes[0]) - w0;
-    printf("  chunk: a CHUNKB file of %zu zero bytes took %" PRIu64 " bytes on the wire\n", size, w);
-    CHECK(w >= size);
+    if (plink_is_rdma(b)) {
+        struct pl_stats s1;
+        peerlink_stats(d->pl, &s1);
+        printf("  chunk: a CHUNKB file of %zu zero bytes moved %" PRIu64 " bulk bytes on RDMA (%" PRIu64
+               " on TCP anchor)\n",
+               size, s1.bulk_bytes - s0.bulk_bytes, w);
+        CHECK(w == 0);
+        CHECK(s1.bulk_bytes - s0.bulk_bytes >= size);
+    } else {
+        printf("  chunk: a CHUNKB file of %zu zero bytes took %" PRIu64 " bytes on the wire\n", size, w);
+        CHECK(w >= size);
+    }
     uint8_t *big = calloc(1, PL_FRAME_MAX + 1);
     CHECK(plink_send(c, 5, big, PL_FRAME_MAX + 1, 0) == PL_E_TOOBIG);
     free(big);
@@ -3091,13 +3130,13 @@ static void test_fake(void)
     uint64_t t0 = now_ns();
     CHECK(plink_send(l, 2, &t0, 8, 1000) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&b->nrtt) == 1, 3000));
-    b->have_seq = 0;
+    node_reset_seq(b);
     CHECK(send_frames(al, 1, 0, 50, 500, 1000) == PL_OK);
     CHECK(WAIT_FOR(b->frames_in == 50, 3000));
     CHECK(b->bad_frames == 0 && b->order_bad == 0);
 
     /* held back for longer than dead_ms (1 s): a receiver in its callback, then a paused one; neither link ends */
-    a->have_seq = 0;
+    node_reset_seq(a);
     set_gate(a, 1);
     uint64_t f0 = a->frames_in;
     CHECK(send_frames(l, 1, 0, 32, 65536, 2000) == PL_OK);
@@ -3270,6 +3309,120 @@ static void test_fakeend(void)
     node_free(a);
 }
 
+static struct plr_pool *g_rdma_pool; /* non-NULL under --rdma: shared real-verbs pool */
+static struct rdma_dev_info g_rdma_dev;
+
+/* Real-verbs link test (docs/design-rdma.md §8, track rd-rxe): upgrades LOG, BULK, FWD and FWDQ over a real HCA or
+ * Soft-RoCE device with rnr_retry=0, checks plink_is_rdma(l) == 1 on both ends, moves multi-slot frames both ways and
+ * a bulk file, and verifies 0 RNR retries, 0 QP errors and 100% pool recovery. Skips cleanly when no verbs device is
+ * present (or built with NO_RDMA=1) unless TSDB_RDMA_REQUIRED=1 is set. */
+static void test_rdma(void)
+{
+    struct plr_pool *pool = g_rdma_pool;
+    struct rdma_dev_info di = g_rdma_dev;
+    int own_pool = 0;
+    if (!pool) {
+        char reason[256];
+        if (!rdma_dev_discover(&di, reason, sizeof reason)) {
+            if (rdma_dev_required()) {
+                fprintf(stderr, "test_peerlink [rdma]: FAIL: TSDB_RDMA_REQUIRED=1 (%s)\n", reason);
+                failures++;
+            } else {
+                printf("  rdma: skipped (%s)\n", reason);
+            }
+            return;
+        }
+        char err[256];
+        const struct plr_ops *ops = plrdma_verbs(err, sizeof err);
+        CHECK(ops != NULL);
+        if (!ops)
+            return;
+        struct plr_pool_cfg pc = PLR_POOL_CFG_DEFAULT;
+        pc.dev = di.dev[0] ? di.dev : NULL;
+        pc.port = di.port;
+        pc.pool_bytes = (size_t)1 << 20;
+        pc.slot = 2048;
+        pc.data_slots = 4;
+        pc.ctl_slots = 4;
+        pc.send_slots = 8;
+        pc.rnr_retry = 0;
+        pool = plr_pool_open(ops, &pc, err, sizeof err);
+        if (!pool) {
+            fprintf(stderr, "test_peerlink [rdma]: plr_pool_open(%s): %s\n", di.spec[0] ? di.spec : "auto", err);
+            failures++;
+            return;
+        }
+        own_pool = 1;
+    }
+    struct plr_global_stats gs0, gs1;
+    plr_global_stats(&gs0);
+    struct pl_cfg over;
+    memset(&over, 0, sizeof over);
+    over.has_rdma = 1;
+    over.rdma.mode = PL_RDMA_ON;
+    over.rdma.pools[0] = pool;
+    over.rdma.npools = 1;
+    struct node *a = node_new(1, SECRET, &over, 1), *b = node_new(2, SECRET, &over, 0);
+    a->strict = 0;
+    b->strict = 0;
+    static const int kinds[] = {PL_KIND_LOG, PL_KIND_BULK, PL_KIND_FWD, PL_KIND_FWDQ};
+    struct plink *dl[4] = {0}, *al[4] = {0};
+    for (int k = 0; k < 4; k++)
+        dl[k] = dial(b, 1, a->port, kinds[k]);
+    for (int k = 0; k < 4; k++) {
+        CHECK(WAIT_FOR(plink_up(dl[k]) && plink_is_rdma(dl[k]), 5000));
+        CHECK(WAIT_FOR((al[k] = peerlink_find(a->pl, 2, kinds[k])) != NULL && plink_up(al[k]) && plink_is_rdma(al[k]),
+                       5000));
+    }
+    /* Multi-slot frames both ways on LOG, FWD and FWDQ (slot = 2048 -> 10 KiB spans 5+ slots). */
+    a->echo = 0;
+    b->echo = 0;
+    int nf = quick ? 20 : 60;
+    CHECK(send_frames(dl[0], 1, 0, nf, 10000, 5000) == PL_OK);
+    CHECK(send_frames(al[0], 1, 0, nf, 10000, 5000) == PL_OK);
+    CHECK(send_frames(dl[2], 1, 0, nf / 2, 4096, 5000) == PL_OK);
+    CHECK(send_frames(dl[3], 1, 0, nf / 2, 16384, 5000) == PL_OK);
+    CHECK(WAIT_FOR(a->frames_in == (uint64_t)(nf + (nf / 2) * 2) && b->frames_in == (uint64_t)nf, 10000));
+    CHECK(a->bad_frames == 0 && b->bad_frames == 0);
+    /* Bulk file transfer over real verbs. */
+    char src[600], dst[600];
+    pathf(src, sizeof src, "rdma-src");
+    pathf(dst, sizeof dst, "rdma-dst");
+    size_t sz = quick ? 512u * 1024 + 123 : 2u * 1024 * 1024 + 321;
+    int sfd = (int)make_file(src, sz, 77);
+    node_set_bulk(a, dst, NULL, 0);
+    struct jres jr = {0};
+    CHECK(bulk_send(dl[1], sfd, sz, "rdma-file", &jr) == PL_OK);
+    CHECK(WAIT_FOR(atomic_load(&jr.done), 15000));
+    CHECK(jr.status == PL_OK);
+    CHECK(WAIT_FOR(a->ends == 1, 5000) && a->last_end == PL_OK);
+    CHECK(same_file(sfd, a->fd, sz));
+    close(sfd);
+    if (a->fd >= 0) {
+        close(a->fd);
+        a->fd = -1;
+    }
+    unlink(src);
+    unlink(dst);
+    uint64_t af = a->frames_in, bf = b->frames_in;
+    node_free(b);
+    node_free(a);
+    plr_global_stats(&gs1);
+    CHECK(gs1.rnr_retries == gs0.rnr_retries);
+    CHECK(gs1.qp_errors == gs0.qp_errors);
+    if (own_pool) {
+        struct plr_pool_stats ps;
+        plr_pool_stats(pool, &ps);
+        CHECK(ps.free == ps.slots && ps.lost == 0 && ps.conns == 0);
+        printf("  rdma: %s (%s), 4 kinds on rdma, %" PRIu64 "+%" PRIu64 " frames + %zu B bulk; pool %u/%u free, rnr %" PRIu64
+               ", qperr %" PRIu64 "\n",
+               di.spec[0] ? di.spec : "auto-ib", di.link_layer == PLR_LL_IB ? "InfiniBand" : "Ethernet/RoCE",
+               af, bf, sz, (unsigned)ps.free, (unsigned)ps.slots,
+               gs1.rnr_retries - gs0.rnr_retries, gs1.qp_errors - gs0.qp_errors);
+        plr_pool_close(pool);
+    }
+}
+
 /* --only NAME[,NAME...] */
 static int only_has(const char *only, const char *name)
 {
@@ -3283,12 +3436,14 @@ static int only_has(const char *only, const char *name)
 int main(int argc, char **argv)
 {
     const char *only = NULL;
-    int do_bench = 0;
+    int do_bench = 0, do_rdma = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick"))
             quick = 1;
         else if (!strcmp(argv[i], "--bench"))
             do_bench = 1;
+        else if (!strcmp(argv[i], "--rdma"))
+            do_rdma = 1;
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
             only = argv[++i];
         else if (!strcmp(argv[i], "--check") && i + 1 < argc) {
@@ -3420,7 +3575,7 @@ int main(int argc, char **argv)
         } else if (argv[i][0] != '-')
             scratch = argv[i];
         else {
-            fprintf(stderr, "usage: test_peerlink [DIR] [--quick] [--only NAME] [--mutant M] [--bench]\n");
+            fprintf(stderr, "usage: test_peerlink [DIR] [--quick] [--rdma] [--only NAME] [--mutant M] [--bench]\n");
             return 2;
         }
     }
@@ -3428,6 +3583,50 @@ int main(int argc, char **argv)
     if (do_bench) {
         bench();
         return 0;
+    }
+    struct plr_global_stats rdma_gs0 = {0};
+    if (do_rdma) {
+        char reason[256];
+        if (!rdma_dev_discover(&g_rdma_dev, reason, sizeof reason)) {
+            if (rdma_dev_required()) {
+                fprintf(stderr, "test_peerlink --rdma: FAIL: TSDB_RDMA_REQUIRED=1 (%s)\n", reason);
+                return 1;
+            }
+            printf("test_peerlink --rdma: skipped (%s)\n", reason);
+            return 0;
+        }
+        char err[256];
+        const struct plr_ops *ops = plrdma_verbs(err, sizeof err);
+        if (!ops) {
+            fprintf(stderr, "test_peerlink --rdma: %s\n", err);
+            return 1;
+        }
+        struct plr_pool_cfg pc = PLR_POOL_CFG_DEFAULT;
+        pc.dev = g_rdma_dev.dev[0] ? g_rdma_dev.dev : NULL;
+        pc.port = g_rdma_dev.port;
+        pc.pool_bytes = (size_t)2 << 20;
+        pc.slot = 2048;
+        pc.data_slots = 4;
+        pc.ctl_slots = 4;
+        pc.send_slots = 8;
+        pc.rnr_retry = 0;
+        g_rdma_pool = plr_pool_open(ops, &pc, err, sizeof err);
+        if (!g_rdma_pool) {
+            fprintf(stderr, "test_peerlink --rdma: plr_pool_open: %s\n", err);
+            return 1;
+        }
+        struct pl_rdma_cfg rcfg;
+        memset(&rcfg, 0, sizeof rcfg);
+        rcfg.mode = PL_RDMA_ON;
+        rcfg.pools[0] = g_rdma_pool;
+        rcfg.npools = 1;
+        peerlink_set_rdma(&rcfg);
+        plr_global_stats(&rdma_gs0);
+        printf("test_peerlink --rdma: using %s (%s), pool 2 MiB, rnr_retry 0\n",
+               g_rdma_dev.spec[0] ? g_rdma_dev.spec : "auto-ib",
+               g_rdma_dev.link_layer == PLR_LL_IB ? "InfiniBand" : "Ethernet/RoCE");
+        if (!only)
+            only = "log,bulk,resume,levels,backpressure,latency,kinds,chunk,written,fwd,fwdstream,rdma";
     }
     static const struct tcase cases[] = {
         {"codec", test_codec},   {"log", test_log},         {"bulk", test_bulk},
@@ -3437,7 +3636,7 @@ int main(int argc, char **argv)
         {"gen", test_gen}, {"kinds", test_kinds}, {"chunk", test_chunk}, {"toobig", test_toobig}, {"written", test_written},
         {"fwdstall", test_fwdstall}, {"fwd", test_fwd}, {"fwdgrow", test_fwdgrow}, {"fwdredial", test_fwdredial},
         {"fwdslow", test_fwdslow}, {"fwdstream", test_fwdstream}, {"fwdflip", test_fwdflip}, {"wbcut", test_wbcut}, {"fake", test_fake},
-        {"fakeready", test_fakeready}, {"fakeend", test_fakeend},
+        {"fakeready", test_fakeready}, {"fakeend", test_fakeend}, {"rdma", test_rdma},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (only && !only_has(only, cases[i].name))
@@ -3447,6 +3646,21 @@ int main(int argc, char **argv)
         cases[i].fn();
         printf("%-13s %s (%.1f s)\n", cases[i].name, failures == f0 ? "ok" : "FAILED", secs(t));
         fflush(stdout);
+    }
+    if (g_rdma_pool) {
+        peerlink_set_rdma(NULL);
+        struct plr_pool_stats ps;
+        plr_pool_stats(g_rdma_pool, &ps);
+        struct plr_global_stats rdma_gs1;
+        plr_global_stats(&rdma_gs1);
+        printf("rdma pool: %u/%u free, lost %u, conns %u, rnr_retries %" PRIu64 ", qp_errors %" PRIu64 "\n",
+               (unsigned)ps.free, (unsigned)ps.slots, (unsigned)ps.lost, (unsigned)ps.conns,
+               rdma_gs1.rnr_retries - rdma_gs0.rnr_retries, rdma_gs1.qp_errors - rdma_gs0.qp_errors);
+        CHECK(ps.free == ps.slots && ps.lost == 0 && ps.conns == 0);
+        CHECK(rdma_gs1.rnr_retries == rdma_gs0.rnr_retries);
+        CHECK(rdma_gs1.qp_errors == rdma_gs0.qp_errors);
+        plr_pool_close(g_rdma_pool);
+        g_rdma_pool = NULL;
     }
     if (failures) {
         fprintf(stderr, "test_peerlink: %d failures\n", failures);

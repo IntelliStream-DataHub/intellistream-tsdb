@@ -35,6 +35,7 @@ FORBIDDEN_STRINGS=(
     TSDB_CHUNKPEER_MUTANT
     TSDB_CHUNKPEER_TEST
     TSDB_CHUNKSRV_TEST
+    TSDB_PLRDMA_TEST
     fwdnouser
     noguard
     authlocalusers
