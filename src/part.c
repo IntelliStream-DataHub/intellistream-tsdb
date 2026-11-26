@@ -1238,24 +1238,40 @@ int drop_intent_prepare(eng *db, char (*const names)[96], size_t n, char intent[
     len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
     snprintf(intent, 64, INTENT_PREFIX "%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
     const bool sync = db->opt.fsync && drop_test_mutant != DROP_MUT_NO_SYNC;
-    int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    int rc = fd < 0 || write_all(fd, buf, len) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
-    int err = errno;
-    if (rc == 0 && drop_test_intent_errno) {
+    int inject = atomic_load(&drop_test_intent_errno);
+    int fd = -1;
+    int rc = 0, err = 0;
+    if (inject < 0) { /* tests: simulate openat failing (no file created, no dir sync here) */
         rc = TSDB_ERR_IO;
-        err = drop_test_intent_errno;
+        err = -inject;
         atomic_fetch_add(&drop_test_intent_fails, 1);
+    } else {
+        fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        rc = fd < 0 || write_all(fd, buf, len) != 0 || (sync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+        err = errno;
+        if (rc == 0 && inject > 0) {
+            rc = TSDB_ERR_IO;
+            err = inject;
+            atomic_fetch_add(&drop_test_intent_fails, 1);
+        }
+        if (fd >= 0 && close(fd) != 0 && rc == 0) { /* on NFS, close sends the data to the server */
+            rc = TSDB_ERR_IO;
+            err = errno;
+        }
     }
-    if (fd >= 0)
-        close(fd);
     free(buf);
-    if (rc) { /* nothing retired: the intent's name was not synced, and is gone now */
-        unlinkat(db->dirfd, intent, 0);
+    if (rc) { /* nothing retired: unlink the failed intent; on a non-fail-stop path a concurrent dir fsync may have
+               * persisted its directory entry after write_all, so sync the directory after unlinking it too */
+        if (fd >= 0)
+            unlinkat(db->dirfd, intent, 0);
         intent[0] = '\0';
-        if (fail_stop)
+        if (fail_stop) {
             eng_fail(db, "write of a drop's intent", err);
-        else
+        } else {
             fprintf(stderr, "tsdb: %s: write of a drop's intent: %s: nothing is dropped\n", db->dir, strerror(err));
+            if (fd >= 0 && !eng_check(db) && drop_test_mutant != DROP_MUT_NO_SYNC)
+                (void)eng_sync_dir(db, "fsync of the directory after unlinking a failed drop intent");
+        }
         return rc;
     }
     if (drop_test_intent_hook)

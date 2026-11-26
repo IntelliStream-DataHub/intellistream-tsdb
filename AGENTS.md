@@ -638,8 +638,13 @@ cgroup, so `nice` does not keep your work out of its way.
   for a settle, and a swap rolled forward hands the drop its `.ec` (a listed source found `settled_` is retired through
   its `.ec`); a torn one retired nothing; one whose checksum holds but names no part (MANIFEST, a path), or an existence
   check that fails with EIO, fails the open. The renames still go in block order, oldest first
-  (the TTL drop went newest first): a prefix keeps every key at its newest value. `latest_rw` and `db->lock` are held
-  across the intent's fdatasync and directory fsync. A failed intent write (a full disk: a drop of two parts or more
+  (the TTL drop went newest first): a prefix keeps every key at its newest value. `drop_retire` prepares the intent
+  (write, `fdatasync`, and pre-rename directory `fsync`) outside `latest_rw` and `db->lock` (`drop_intent_prepare`)
+  after waiting for in-flight merges, re-encodes, and active standalone publishers touching partitions `<= ts`
+  (`db->drop_settled` blocks new standalone publishers touching those partitions while readers, writes to newer
+  partitions, and R7 1-to-1 settle swaps run unblocked), then takes `latest_rw` and `db->lock` for the part-set check
+  and renames (retrying on a concurrent settle swap); `ttl_select_locked` still runs `drop_retire_parts_locked` under
+  `db->lock`. A failed intent write (a full disk: a drop of two parts or more
   needs a new file) fails just the call, except for `tsdb_drop_before` on a leader or a replica (the DROP marker is in
   the log, `drop_marker_logged`): fail-stop; a retention pass logs no marker and is never fail-stop there.
   `tests/test_drops.c` (kill, crashfs for the drop, the open and the retention drop, beside a swap intent, bad names,
@@ -1010,8 +1015,9 @@ cgroup, so `nice` does not keep your work out of its way.
   already expired) must bump `lgen` in a write section and make the entries it may affect unknown. The table must
   always give the slow path's answer (`tests/test_latest.c` compares both after every random step). Entry words are
   loaded and stored with relaxed atomics (lookups race the window's stores on purpose); test hooks go through atomics.
-  `latest_rw` is held across no I/O but `tsdb_drop_before`'s drop intent and renames of the partitions it retires
-  (`drop_retire_parts_locked`, in its write section; `db->lock` is held across them too), the settle swap's 2n renames (`ec_swap_commit`,
+  `latest_rw` is held across no I/O but `tsdb_drop_before`'s renames of the partitions it retires
+  (`drop_retire_prepared_locked`, in its write section; `db->lock` is held across them too, while `drop_intent_prepare`'s
+  write, `fdatasync`, and pre-rename directory `fsync` run outside both locks except on the retry-cap fallback), the settle swap's 2n renames (`ec_swap_commit`,
   `src/ecswap.c`: its input check and renames are one step against a drop, which takes no `publish_lock`; on NFS,
   snapshots and lookups of the volume wait for those round trips) and a replica's cold apply (`src/ecapply.c`: its
   check of its own parts, the v5 intent's write and fdatasync, two directory fsyncs and n + nown renames, one step

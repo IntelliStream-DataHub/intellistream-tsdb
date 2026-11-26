@@ -598,8 +598,9 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out)
         ec_swap_hook(db);
 
     /* Hold latest_rw > db->lock across the input check, intent write, L rename+sync, R renames, list update and
-     * lt_merge_marks: a drop also takes latest_rw > db->lock, so a drop intent and a re-encode intent never overlap on
-     * disk. */
+     * lt_merge_marks: TTL drops run under db->lock, and drop_retire (whose intent preparation runs unlocked) waits in
+     * drop_settle_locked for every p->reencoding in partitions <= ts while eng_reencode refuses partition_dropping, so
+     * a drop intent and a re-encode intent never overlap on disk. */
     lt_sec lsec;
     lt_begin(db, &lsec);
     pthread_mutex_lock(&db->lock);

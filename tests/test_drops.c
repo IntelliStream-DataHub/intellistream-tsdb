@@ -41,6 +41,10 @@
  */
 #define _GNU_SOURCE
 #include "internal.h"
+#ifdef TSDB_EC
+#include "ecpart.h"
+#include "ecswap.h"
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -360,9 +364,15 @@ static void hook_presync(eng *db)
 
 /* --child-drop DIR ACK: open, drop, acknowledge; --child-open DIR -: the open alone; --child-ttl DIR ACK: open with a
  * merge thread (the retention limit is set already) and wait until its retention drop has retired every part;
- * --child-ttl-cut DIR ACK: the same, the power lost before the directory fsync after its renames */
+ * --child-ttl-cut DIR ACK: the same, the power lost before the directory fsync after its renames;
+ * --child-stale-discard DIR -: drop fails on retry with openat ENOSPC after unlinking a synced stale intent, then
+ * immediately cuts power via SIGUSR2 to verify the stale intent's unlink was dir-synced before returning. */
+static int child_stale_discard(const char *dir);
+
 static int child_main(int mode, const char *dir, const char *ack)
 {
+    if (mode == 4)
+        return child_stale_discard(dir);
     if (mode == 3) {
         drop_test_presync = hook_presync;
         mode = 2;
@@ -823,14 +833,17 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     tsdb *db;
+    eng *edb;
     tsdb_sid ids[2];
     bool go;
     bool done;
     bool stop;
     bool timed_out;
     bool ok;
+    bool blocked_ok;
     int calls;
     int writer_rc;
+    int mode;
     bool inject_enospc;
 } conc;
 
@@ -839,6 +852,19 @@ static struct timespec wait_deadline(int secs)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += secs;
+    return ts;
+}
+
+static struct timespec wait_deadline_ms(int ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
     return ts;
 }
 
@@ -854,7 +880,8 @@ static void *unlocked_reader_main(void *arg)
         return NULL;
 
     /* Run while drop_intent_prepare is paused between fdatasync and dir fsync: both latest_rw (read) and db->lock
-     * must be free so lookups, snapshots and stats complete immediately instead of blocking on NFS round trips. */
+     * must be free so lookups, snapshots, stats, and writes to partitions > ts complete immediately instead of
+     * blocking on NFS round trips. */
     bool ok = true;
     tsdb_latest_result res[2];
     if (tsdb_latest(conc.db, conc.ids, 2, NULL, res) != 0 || res[0].status != 0 ||
@@ -874,6 +901,10 @@ static void *unlocked_reader_main(void *arg)
     if (tsdb_get_stats(conc.db, &st) != 0 || st.parts < 4)
         ok = false;
 
+    /* A standalone write to a partition > ts (day 2) must also complete without blocking on drop_intent_prepare. */
+    if (put(conc.db, conc.ids[0], 2 * DAY, 0, 100, 7) != 0)
+        ok = false;
+
     pthread_mutex_lock(&conc.mu);
     conc.ok = ok;
     conc.done = true;
@@ -889,7 +920,7 @@ static void hook_unlocked_io(eng *db)
     conc.calls++;
     conc.go = true;
     pthread_cond_broadcast(&conc.cv);
-    struct timespec dl = wait_deadline(2);
+    struct timespec dl = wait_deadline(5);
     while (!conc.done) {
         if (pthread_cond_timedwait(&conc.cv, &conc.mu, &dl) == ETIMEDOUT) {
             conc.timed_out = true;
@@ -899,8 +930,9 @@ static void hook_unlocked_io(eng *db)
     pthread_mutex_unlock(&conc.mu);
 }
 
-/* Verifies that concurrent latest lookups, point queries and stats calls are NOT blocked while drop_intent_prepare
- * runs its fdatasync and pre-rename directory fsync (fails with a 2 s timeout if latest_rw or db->lock is held). */
+/* Verifies that concurrent latest lookups, point queries, stats calls, and writes to partitions > ts are NOT blocked
+ * while drop_intent_prepare runs its fdatasync and pre-rename directory fsync (fails on a 5 s timeout if latest_rw or
+ * db->lock is held). */
 static void unlocked_intent_io(void)
 {
     char work[PATH_MAX];
@@ -951,29 +983,37 @@ static void unlocked_intent_io(void)
 
     tsdb_latest_result after[2];
     CHECK(tsdb_latest(db, ids, 2, NULL, after) == 0 && after[0].status == 0 &&
-          after[0].kind == TSDB_LATEST_VALUE && after[0].v.f32 == 9.0f && after[1].status == 0 &&
+          after[0].kind == TSDB_LATEST_VALUE &&
+          after[0].v.f32 == (drop_test_mutant == DROP_MUT_NO_INTENT ? 9.0f : 7.0f) && after[1].status == 0 &&
           after[1].kind == TSDB_LATEST_NONE);
     tsdb_close(db);
     CHECK(judge(work) == V_GONE);
-    printf("  concurrent lookups and queries during drop intent I/O: %s (hook calls=%d)\n",
+    printf("  concurrent lookups, queries, and newer-partition writes during drop intent I/O: %s (hook calls=%d)\n",
            !conc.timed_out && conc.ok ? "unblocked" : "BLOCKED", conc.calls);
 }
 
-static void *retry_writer_main(void *arg)
+static void *blocked_writer_main(void *arg)
 {
     (void)arg;
     pthread_mutex_lock(&conc.mu);
     while (!conc.go && !conc.stop)
         pthread_cond_wait(&conc.cv, &conc.mu);
     bool run = conc.go;
-    bool set_enospc = conc.inject_enospc;
+    int mode = conc.mode;
     pthread_mutex_unlock(&conc.mu);
     if (!run)
         return NULL;
 
-    int rc = put(conc.db, conc.ids[0], 0, 1500, 2000, 4);
-    if (set_enospc)
-        drop_test_intent_errno = ENOSPC;
+    int rc = 0;
+    if (mode == 0) {
+        rc = put(conc.db, conc.ids[0], 0, 1500, 2000, 4); /* large insert -> parts_publish */
+    } else if (mode == 1) {
+        rc = put(conc.db, conc.ids[0], 0, 1500, 1700, 4); /* small insert -> memtable -> tsdb_flush */
+        if (rc == 0)
+            rc = tsdb_flush(conc.db);
+    } else {
+        rc = tsdb_delete_range(conc.db, conc.ids[0], 0, 500000); /* eng_replace_range -> delete.c */
+    }
 
     pthread_mutex_lock(&conc.mu);
     conc.writer_rc = rc;
@@ -983,36 +1023,39 @@ static void *retry_writer_main(void *arg)
     return NULL;
 }
 
-static void hook_retry_change(eng *db)
+static void hook_block_pub(eng *db)
 {
     (void)db;
     pthread_mutex_lock(&conc.mu);
-    int c = ++conc.calls;
-    if (c == 1) {
-        conc.go = true;
-        pthread_cond_broadcast(&conc.cv);
-        struct timespec dl = wait_deadline(2);
-        while (!conc.done) {
-            if (pthread_cond_timedwait(&conc.cv, &conc.mu, &dl) == ETIMEDOUT) {
-                conc.timed_out = true;
-                break;
-            }
-        }
+    conc.calls++;
+    conc.go = true;
+    pthread_cond_broadcast(&conc.cv);
+    /* Wait 60 ms: a standalone publisher touching partition 0 must stay blocked in db_pub_begin while drop_retire
+     * holds db->drop_settled across drop_intent_prepare, and must NOT complete before drop_retire finishes. */
+    struct timespec dl = wait_deadline_ms(60);
+    while (!conc.done) {
+        if (pthread_cond_timedwait(&conc.cv, &conc.mu, &dl) == ETIMEDOUT)
+            break;
     }
+    conc.blocked_ok = !conc.done;
     pthread_mutex_unlock(&conc.mu);
 }
 
-/* Verifies the retry path when a concurrent writer adds a part to a partition being dropped while drop_intent_prepare
- * runs without locks: (a) the stale intent is unlinked, a fresh intent is written for the updated part set, and all
- * parts are dropped atomically; (b) if the retry's intent write fails with ENOSPC, the stale intent is durably
- * removed so reopening keeps all parts intact and a later drop succeeds. */
-static void retry_on_change(void)
+/* Verifies that standalone publications touching a dropping partition (large insert, memtable flush, range delete)
+ * wait in db_pub_begin until drop_retire finishes, so they linearize cleanly after tsdb_drop_before and never commit
+ * a part alongside a durable drop intent. */
+static void standalone_pub_blocked(void)
 {
-    for (int fail_retry = 0; fail_retry < 2; fail_retry++) {
+    if (drop_test_mutant == DROP_MUT_NO_INTENT)
+        return;
+    const char *mname[] = {"large insert", "memtable flush", "range delete"};
+    for (int mode = 0; mode < 3; mode++) {
         char work[PATH_MAX];
-        snprintf(work, sizeof work, "%s/retry%d", S, fail_retry);
+        snprintf(work, sizeof work, "%s/pubblock%d", S, mode);
         make_fixture(work);
         tsdb_options o = opts(0);
+        if (mode == 1)
+            o.wal_max_batch_rows = 10000; /* keep the 200-row write in the memtable until tsdb_flush */
         tsdb *db = NULL;
         CHECK(tsdb_open(work, &o, &db) == 0);
         if (!db)
@@ -1025,10 +1068,164 @@ static void retry_on_change(void)
         pthread_cond_init(&conc.cv, NULL);
         conc.db = db;
         conc.ids[0] = id_s;
+        conc.mode = mode;
+
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, blocked_writer_main, NULL) == 0);
+        drop_test_intent_hook = hook_block_pub;
+        int rc = tsdb_drop_before(db, DAY);
+        drop_test_intent_hook = NULL;
+
+        pthread_mutex_lock(&conc.mu);
+        conc.stop = true;
+        pthread_cond_broadcast(&conc.cv);
+        pthread_mutex_unlock(&conc.mu);
+        pthread_join(th, NULL);
+        pthread_cond_destroy(&conc.cv);
+        pthread_mutex_destroy(&conc.mu);
+
+        CHECK(rc == 0 && conc.calls == 1 && conc.blocked_ok && conc.done && conc.writer_rc == 0);
+        tsdb_points p = {0};
+        CHECK(tsdb_query_points(db, id_s, 0, DAY, &p) == 0);
+        size_t want = mode == 0 ? 500 : mode == 1 ? 200 : 0;
+        bool vals_ok = p.n == want;
+        for (size_t i = 0; vals_ok && i < p.n; i++)
+            vals_ok = p.ts[i] == (int64_t)(1500 + i) * 1000 && p.values[i] == 4.0f;
+        CHECK(vals_ok);
+        tsdb_points_free(&p);
+        tsdb_close(db);
+        CHECK(count_prefix(work, "txn_", NULL, 0) == 0);
+        printf("  standalone %s touching dropping partition blocked until drop finished: %s (rows=%zu)\n", mname[mode],
+               conc.blocked_ok && vals_ok ? "ok" : "FAILED", want);
+    }
+}
+
+#ifdef TSDB_EC
+static atomic_uint test_ec_seq;
+
+/* Makes a fake .ec stand-in for listed .part p (as tests/test_ecswap.c make_ec) and commits a 1-to-1 R7 settle swap
+ * via ec_swap_commit, which runs concurrently with drop_intent_prepare without waiting on db->drop_settled. */
+static int swap_first_p0(eng *db)
+{
+    part *in = NULL;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        if (db->parts[i]->partition == 0 && part_file_name(db->parts[i]->name)) {
+            in = db->parts[i];
+            part_ref(in);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (!in)
+        return TSDB_ERR_NOTFOUND;
+    char tmp[64];
+    snprintf(tmp, sizeof tmp, "tmp_%d_%u.ec", (int)getpid(), 800000 + atomic_fetch_add(&test_ec_seq, 1));
+    int fd = openat(db->dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        part_unref(in);
+        return TSDB_ERR_IO;
+    }
+    bool ok = write(fd, in->map, in->map_len) == (ssize_t)in->map_len && fsync(fd) == 0;
+    close(fd);
+    if (!ok) {
+        unlinkat(db->dirfd, tmp, 0);
+        part_unref(in);
+        return TSDB_ERR_IO;
+    }
+    part *ec = NULL;
+    int rc = part_open_as(db->dirfd, tmp, in->name, false, false, &ec);
+    if (rc != 0 || !ec) {
+        unlinkat(db->dirfd, tmp, 0);
+        part_unref(in);
+        return rc ? rc : TSDB_ERR_IO;
+    }
+    ec->verify = in->verify;
+    snprintf(ec->name, sizeof ec->name, "%.*s.ec", (int)(strlen(in->name) - 5), in->name);
+    snprintf(ec->pending, sizeof ec->pending, "%s", tmp);
+    struct ecpart *ep = calloc(1, sizeof *ep);
+    if (!ep) {
+        unlinkat(db->dirfd, tmp, 0);
+        part_unref(ec);
+        part_unref(in);
+        return TSDB_ERR_NOMEM;
+    }
+    ep->test_mark = true;
+    atomic_store(&ec->ec, ep);
+    rc = ec_swap_commit(db, &in, &ec, 1);
+    part_unref(ec);
+    part_unref(in);
+    return rc;
+}
+
+static void *retry_swapper_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&conc.mu);
+    while (!conc.go && !conc.stop)
+        pthread_cond_wait(&conc.cv, &conc.mu);
+    bool run = conc.go;
+    eng *edb = conc.edb;
+    bool set_enospc = conc.inject_enospc;
+    pthread_mutex_unlock(&conc.mu);
+    if (!run)
+        return NULL;
+
+    int rc = swap_first_p0(edb);
+    if (set_enospc)
+        drop_test_intent_errno = -ENOSPC; /* fail retry openat so only fail_unlocked's eng_sync_dir syncs unlink */
+
+    pthread_mutex_lock(&conc.mu);
+    conc.writer_rc = rc;
+    conc.done = true;
+    pthread_cond_broadcast(&conc.cv);
+    pthread_mutex_unlock(&conc.mu);
+    return NULL;
+}
+
+static void hook_retry_change(eng *db)
+{
+    pthread_mutex_lock(&conc.mu);
+    int c = ++conc.calls;
+    if (c == 1) {
+        conc.edb = db;
+        conc.go = true;
+        pthread_cond_broadcast(&conc.cv);
+        struct timespec dl = wait_deadline(5);
+        while (!conc.done) {
+            if (pthread_cond_timedwait(&conc.cv, &conc.mu, &dl) == ETIMEDOUT) {
+                conc.timed_out = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&conc.mu);
+}
+
+/* Verifies the retry path when a concurrent R7 1-to-1 settle swap replaces a .part with its .ec while
+ * drop_intent_prepare runs without locks: (a) the stale intent is unlinked, a fresh intent is written for the
+ * updated part set, and all 3 parts are dropped atomically; (b) if the retry fails on openat (ENOSPC), the stale
+ * intent is durably removed before drop_pending clears so all 3 parts stay intact and a later drop succeeds. */
+static void retry_on_change(void)
+{
+    for (int fail_retry = 0; fail_retry < 2; fail_retry++) {
+        char work[PATH_MAX];
+        snprintf(work, sizeof work, "%s/retry%d", S, fail_retry);
+        make_fixture(work);
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        CHECK(tsdb_open(work, &o, &db) == 0);
+        if (!db)
+            return;
+
+        memset(&conc, 0, sizeof conc);
+        pthread_mutex_init(&conc.mu, NULL);
+        pthread_cond_init(&conc.cv, NULL);
+        conc.db = db;
         conc.inject_enospc = fail_retry == 1;
 
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, retry_writer_main, NULL) == 0);
+        CHECK(pthread_create(&th, NULL, retry_swapper_main, NULL) == 0);
         drop_test_intent_hook = hook_retry_change;
         int rc = tsdb_drop_before(db, DAY);
         drop_test_intent_hook = NULL;
@@ -1047,30 +1244,107 @@ static void retry_on_change(void)
             if (!fail_retry) {
                 CHECK(conc.calls == 2 && rc == 0 && listed_p0(work) == 0 && count_prefix(work, "txn_", NULL, 0) == 0);
             } else {
-                CHECK(conc.calls == 1 && rc != 0 && !failed(db) && listed_p0(work) == 4 &&
+                CHECK(conc.calls == 1 && rc != 0 && !failed(db) && listed_p0(work) == 3 &&
+                      count_prefix(work, "txn_", NULL, 0) == 0);
+                /* A retry drop now retires all 3 parts (.ec + 2 .part) cleanly. */
+                CHECK(tsdb_drop_before(db, DAY) == 0 && listed_p0(work) == 0 &&
                       count_prefix(work, "txn_", NULL, 0) == 0);
             }
         }
         tsdb_close(db);
-
-        if (!fail_retry) {
-            CHECK(judge(work) == V_GONE);
-        } else if (drop_test_mutant != DROP_MUT_NO_INTENT) {
-            /* Reopen: the discarded stale intent must not have survived to roll forward; all 4 parts stay intact,
-             * and a retry drop retires all 4 cleanly. */
-            db = NULL;
-            CHECK(tsdb_open(work, &o, &db) == 0);
-            CHECK(listed_p0(work) == 4);
-            if (db) {
-                CHECK(tsdb_drop_before(db, DAY) == 0);
-                tsdb_close(db);
-            }
-            CHECK(listed_p0(work) == 0 && judge(work) == V_GONE);
-        }
-        printf("  part set changed during drop intent I/O (%s): ok (hook calls=%d)\n",
-               fail_retry ? "retry ENOSPC cleans stale intent" : "retried and dropped all 4 parts", conc.calls);
+        CHECK(judge(work) == V_GONE);
+        printf("  part set changed by settle swap during drop intent I/O (%s): ok (hook calls=%d)\n",
+               fail_retry ? "retry ENOSPC cleans stale intent" : "retried and dropped all 3 parts", conc.calls);
     }
 }
+
+static void hook_stale_discard(eng *db)
+{
+    if (swap_first_p0(db) == 0)
+        drop_test_intent_errno = -ENOSPC;
+}
+
+/* Child for stale_discard_power: triggers a stale-intent discard on retry openat ENOSPC, then immediately pulls the
+ * plug via SIGUSR2 under crashfs so any missing eng_sync_dir after unlinking the stale intent resurrects it. */
+static int child_stale_discard(const char *dir)
+{
+    tsdb_options o = opts(0);
+    tsdb *db = NULL;
+    if (tsdb_open(dir, &o, &db) != 0)
+        return 2;
+    drop_test_intent_hook = hook_stale_discard;
+    int rc = tsdb_drop_before(db, DAY);
+    drop_test_intent_hook = NULL;
+    drop_test_intent_errno = 0;
+    if (rc == 0 || failed(db))
+        return 3;
+    raise(SIGUSR2);
+    int fd = open(dir, O_RDONLY);
+    if (fd >= 0) {
+        (void)fsync(fd);
+        close(fd);
+    }
+    tsdb_close(db);
+    return 4;
+}
+
+/* Crashfs power-loss test for stale-intent dir-sync in drop_retire: if eng_sync_dir after unlinking the stale intent
+ * is omitted, CRASHFS_UNDO_ONE undoes the unlink, leaving the stale intent on disk to roll forward at the next open. */
+static void stale_discard_power(void)
+{
+    if (drop_test_mutant != DROP_MUT_NONE)
+        return;
+    char src[PATH_MAX], work[PATH_MAX], ack[PATH_MAX + 8], count[PATH_MAX + 8];
+    snprintf(src, sizeof src, "%s/stale-src", S);
+    snprintf(work, sizeof work, "%s/stale-work", S);
+    snprintf(ack, sizeof ack, "%s/stale-ack", S);
+    snprintf(count, sizeof count, "%s/stale-undo", S);
+    make_fixture(src);
+    int runs = 0;
+    for (int undo = 0, nundo = 1; undo < nundo; undo++) {
+        sh("rm -rf '%s'%s", work, "");
+        sh("cp -a '%s' '%s'", src, work);
+        unlink(count);
+        int st = run_child("--child-stale-discard", work, ack, 1 << 20, 0, undo, count);
+        if (undo == 0) {
+            FILE *cf = fopen(count, "r");
+            if (!cf || fscanf(cf, "%d", &nundo) != 1 || nundo < 1)
+                nundo = 1;
+            if (cf)
+                fclose(cf);
+        }
+        CHECK(st == 99);
+        runs++;
+        size_t intents = count_prefix(work, "txn_", NULL, 0);
+        /* Open (may fail after intents_recover because of the stand-in .ec) and verify nothing was retired. */
+        tsdb_options o = opts(0);
+        tsdb *db = NULL;
+        (void)tsdb_open(work, &o, &db);
+        if (db)
+            tsdb_close(db);
+        size_t p0 = listed_p0(work);
+        if (intents != 0 || p0 != 3)
+            printf("  STALE INTENT SURVIVED POWER LOSS (undo %d): %zu txn_ files, %zu listed in p0\n", undo, intents,
+                   p0);
+        CHECK(intents == 0 && p0 == 3);
+    }
+    printf("  stale drop intent discard under crashfs (%d undo runs): stale intent durably removed\n", runs);
+}
+#else
+static int child_stale_discard(const char *dir)
+{
+    (void)dir;
+    return 0;
+}
+static void retry_on_change(void)
+{
+    printf("  part set changed by settle swap during drop intent I/O: skipped (NO_EC)\n");
+}
+static void stale_discard_power(void)
+{
+    printf("  stale drop intent discard under crashfs: skipped (NO_EC)\n");
+}
+#endif
 
 /* A drop intent naming a .part whose settle swap finished and whose settled_ source was already purged before a crash
  * still retires the .ec file at open (same stem, block numbers are never reused). */
@@ -1117,11 +1391,13 @@ int main(int argc, char **argv)
     if (getenv("TSDB_DROP_MUTANT"))
         drop_test_mutant = parse_mutant(getenv("TSDB_DROP_MUTANT"));
     if (argc == 4 && (strcmp(argv[1], "--child-drop") == 0 || strcmp(argv[1], "--child-open") == 0 ||
-                      strcmp(argv[1], "--child-ttl") == 0 || strcmp(argv[1], "--child-ttl-cut") == 0))
-        return child_main(strcmp(argv[1], "--child-drop") == 0      ? 1
-                          : strcmp(argv[1], "--child-ttl") == 0     ? 2
-                          : strcmp(argv[1], "--child-ttl-cut") == 0 ? 3
-                                                                    : 0,
+                      strcmp(argv[1], "--child-ttl") == 0 || strcmp(argv[1], "--child-ttl-cut") == 0 ||
+                      strcmp(argv[1], "--child-stale-discard") == 0))
+        return child_main(strcmp(argv[1], "--child-drop") == 0            ? 1
+                          : strcmp(argv[1], "--child-ttl") == 0           ? 2
+                          : strcmp(argv[1], "--child-ttl-cut") == 0       ? 3
+                          : strcmp(argv[1], "--child-stale-discard") == 0 ? 4
+                                                                          : 0,
                           argv[2], argv[3]);
     const char *scratch = "/tmp";
     for (int i = 1; i < argc; i++) {
@@ -1160,9 +1436,11 @@ int main(int argc, char **argv)
     deleted_before();
     no_space();
     unlocked_intent_io();
+    standalone_pub_blocked();
     retry_on_change();
     settled_purged_recover();
     if (access(SHIM, R_OK) == 0) {
+        stale_discard_power();
         sweep(SW_DROP);
         sweep(SW_OPEN);
         sweep(SW_TTL);

@@ -2002,8 +2002,11 @@ struct eng {
     atomic_uint_fast64_t ret_len_gen; /* bumped (db->lock) when a change lowers a series' cutoff: a merge that spans one
                                        * lists across it in a latest_rw section, marking its entries (merge_commit_locked) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
-    bool drop_pending;               /* eng_drop_before is waiting for merges, then retiring (under lock) */
-    int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge of one is selected */
+    bool drop_pending;               /* eng_drop_before is waiting for merges/re-encodes, then retiring (under lock) */
+    bool drop_settled;               /* drop_settle_locked done: standalone publishers of <= drop_pending_end wait */
+    int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge/re-encode is selected */
+    bool pub_active;                 /* a standalone publisher is between parts_commit and listing (under lock) */
+    int64_t pub_min_end;             /* ...minimum partition end of its parts (INT64_MAX when none) */
     sched *sched;
     bool own_sched; /* opened alone (eng_open), not by a tsdb that shares its scheduler */
 
@@ -2297,6 +2300,11 @@ int partition_class(const struct eng *db, int64_t key);
  * MANIFEST. Cannot fail: once listed, the parts are published and must not
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
+/* Standalone publisher gate against unlocked drop intent I/O (db.c): called under publish_lock before parts_commit
+ * (never holding latest_rw) and ended under db->lock when listed (or via db_pub_end on error). */
+void db_pub_begin(struct eng *db, part **ps, size_t n);
+void db_pub_end_locked(struct eng *db);
+void db_pub_end(struct eng *db);
 void db_wait_merges(struct eng *db, int64_t partition);
 void db_stall_clear_locked(struct eng *db, int64_t partition); /* a merge of the partition committed */
 /* How long (ms) db_wait_merges lets a partition's part count stand while no merge of it runs, before an insert goes on;

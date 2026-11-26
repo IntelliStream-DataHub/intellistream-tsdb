@@ -179,10 +179,15 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
             rc = TSDB_ERR_NOMEM;
         }
     }
+    bool pub = false;
     if (rc == 0) {
         for (size_t i = 0; i < rows.n; i++)
             all.p[all.n++] = rows.p[i]; /* after the tombstones: newer */
         rows.n = 0; /* `all` owns them now */
+        if (all.n) {
+            db_pub_begin(db, all.p, all.n);
+            pub = true;
+        }
         rc = eng_abandoned(); /* see cur_abandon: before any block number is taken */
         if (rc == 0)
             rc = jr_precommit(db, all.n); /* a leader: RSTATE says `doing` before a block is taken (replica.c) */
@@ -198,11 +203,15 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         pthread_mutex_lock(&db->lock);
         for (size_t i = 0; i < all.n; i++)
             db_parts_insert_locked(db, all.p[i]);
+        db_pub_end_locked(db);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         lt_end(db, &lsec);
-    } else if (marked) {
-        eng_fail(db, "a publish after its committed COMMIT marker", rc == TSDB_ERR_ABANDONED ? ECANCELED : EIO);
+    } else {
+        if (pub)
+            db_pub_end(db);
+        if (marked)
+            eng_fail(db, "a publish after its committed COMMIT marker", rc == TSDB_ERR_ABANDONED ? ECANCELED : EIO);
     }
     pthread_mutex_unlock(&db->publish_lock);
     lw_leave(db, &f); /* published (newer small writes win from now on) or failed */
