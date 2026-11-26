@@ -2364,8 +2364,10 @@ static void case_power(void)
     }
     /* Strict rollback catches every missing fsync/fdatasync deterministically (zero RNG luck); tear mode also catches
      * reordered unsynced directory ops (cutdirsync) and torn partial tails. */
+    int before = failures;
     case_power_mode(false);
-    case_power_mode(true);
+    if (failures == before)
+        case_power_mode(true);
 }
 
 
