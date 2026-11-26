@@ -43,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef TSDB_TEST_HOOKS
 /* TSDB_FAST_FSYNC, read once. One variable per binary (weak: every file that includes this shares it), so that the
  * warning below comes once: the variable is easily left exported in a shell, and then real data would lose the drive
  * cache flush without a word. */
@@ -62,6 +63,9 @@ static inline int tsdb_fast_fsync(void)
     }
     return m;
 }
+#else
+static inline int tsdb_fast_fsync(void) { return 0; }
+#endif
 
 /* Durable sync: the real call first (the one tests interpose, and what Linux does), then the drive's cache flush.
  * A file system without F_FULLFSYNC (it answers ENOTSUP, EINVAL or ENOTTY) has only the first. Any other error,

@@ -99,6 +99,7 @@ static void check_late(const struct cluster_self *me)
  * the volume raised to 5, then a put at 3 and a delete at 4 must be FENCED and the chunk still whole. check (after
  * PEER was killed with SIGKILL and restarted): the fence is still 5, the chunk reads back whole, a put at 4 is FENCED
  * (both were durable before their answers). The result is one log line: "chunksrv test: pass MODE" or "... FAIL". */
+#ifdef TSDB_TEST_HOOKS
 enum { ST_VOL = 7, ST_POS = 1 };
 static const uint8_t st_vuuid[16] = {0x5e, 0x1f, 0x7e, 0x57, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
 
@@ -246,13 +247,17 @@ static void *selftest_main(void *arg)
     selftest(arg, getenv("TSDB_CHUNKSRV_TEST"));
     return NULL;
 }
+#endif
 
 static void *cc_main(void *arg)
 {
     (void)arg;
     unsigned long seen = 0;
-    int have = 0, tested = 0;
+    int have = 0;
+#ifdef TSDB_TEST_HOOKS
+    int tested = 0;
     pthread_t st_thr;
+#endif
     uint32_t self = 0;
     while (!atomic_load(&G.stop)) {
         struct chunksrv *cs = atomic_load(&G.pub);
@@ -292,16 +297,20 @@ static void *cc_main(void *arg)
                     cluster_copy_put(c);
                     seen = b;
                     have = 1;
+#ifdef TSDB_TEST_HOOKS
                     if (getenv("TSDB_CHUNKSRV_TEST") && !tested) /* on its own thread: peers keep moving */
                         tested = pthread_create(&st_thr, NULL, selftest_main, cs) == 0;
+#endif
                 }
             }
             report_up(cs);
         }
         nanosleep(&(struct timespec){0, 100 * 1000000L}, NULL);
     }
+#ifdef TSDB_TEST_HOOKS
     if (tested)
         pthread_join(st_thr, NULL);
+#endif
     return NULL;
 }
 

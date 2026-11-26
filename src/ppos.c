@@ -555,9 +555,11 @@ int ppos_open(struct eng *db)
 {
     if (!db->ec_cluster || db->ppos)
         return 0;
+#ifdef TSDB_TEST_HOOKS
     const char *e = getenv("TSDB_PPOS_MUTANT"); /* the test's children run the same bug */
     if (e && *e && ppos_mutant == PPOS_MUT_NONE)
         ppos_mutant = atoi(e);
+#endif
     bool ro = db->opt.read_only;
     struct ppos *p = calloc(1, sizeof *p);
     if (!p)

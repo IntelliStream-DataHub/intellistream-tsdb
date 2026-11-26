@@ -791,6 +791,7 @@ found:
     return e;
 }
 
+#ifdef TSDB_TEST_HOOKS
 /* Tests (TSDBD_TEST_HOLD_LARGE_MS): every large insert, replace and delete sleeps that long after writing its parts,
  * before it publishes them, so a test can write into its keys while it is in flight. */
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg); /* the library's test hook (src/internal.h) */
@@ -801,6 +802,7 @@ static void hold_large(void *arg)
     struct timespec d = {hold_large_ms / 1000, (long)(hold_large_ms % 1000) * 1000000};
     nanosleep(&d, NULL);
 }
+#endif
 
 /* events from workers to the main thread */
 /* Workers' notes to the main thread, a lock-free stack (each connection has its two notes; see notify). */
@@ -5865,10 +5867,14 @@ int main(int argc, char **argv)
         else if (!cfg_path && harness) {
             /* A file that exists and is not read must be seen: a service started with the harness flag by mistake would
              * run on defaults without a word. One line, naming the file and the way to use it. */
+#ifdef TSDB_TEST_HOOKS
             const char *dflt = getenv("TSDBD_DEFAULT_CONFIG");
-            struct stat cst;
             if (!dflt || !*dflt)
                 dflt = CONFIG_DEFAULT;
+#else
+            const char *dflt = CONFIG_DEFAULT;
+#endif
+            struct stat cst;
             if (stat(dflt, &cst) == 0)
                 fprintf(stderr, "tsdbd: --exit-with-parent: %s exists and is not read (a test server reads no default "
                                 "file); pass it with --config %s to use it\n", dflt, dflt);
@@ -5876,9 +5882,13 @@ int main(int argc, char **argv)
             /* The place the unit reads. Not under --exit-with-parent, the flag of the test harnesses (AGENTS.md): a
              * test's server must not take the metrics port, the login, the fsync or the cluster of the service that is
              * installed on the machine; a harness that wants a file names it. */
+#ifdef TSDB_TEST_HOOKS
             const char *dflt = getenv("TSDBD_DEFAULT_CONFIG"); /* where the tests put one without /etc */
             if (!dflt || !*dflt)
                 dflt = CONFIG_DEFAULT;
+#else
+            const char *dflt = CONFIG_DEFAULT;
+#endif
             struct stat cst;
             if (stat(dflt, &cst) == 0)
                 cfg_path = dflt;
@@ -6124,6 +6134,7 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
+#ifdef TSDB_TEST_HOOKS
     /* For tests only (the client suites start tsdbd themselves and cannot all take a flag): the backend of a start
      * without --io. production runs epoll on RHEL-family systems and io_uring elsewhere; both are tested. */
     const char *test_io = getenv("TSDBD_TEST_IO");
@@ -6137,6 +6148,7 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+#endif
     if (cluster_opts && !cluster_on) { /* name what asked for the cluster, and where it was set */
         char list[768];
         size_t lw = 0;
@@ -6346,6 +6358,7 @@ int main(int argc, char **argv)
         tsdb_close(db);
         return 1;
     }
+#ifdef TSDB_TEST_HOOKS
     if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
         tsdb_test_precommit(db, hold_large, NULL);
     test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
@@ -6397,6 +6410,7 @@ int main(int argc, char **argv)
     test_lead_now = rmu && !strcmp(rmu, "leadnow");
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
+#endif
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max; /* one descriptor per connection */

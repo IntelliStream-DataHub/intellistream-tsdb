@@ -23,6 +23,7 @@
  * snap_leftovers (exists, then an open) is an I/O error: refused as it would be (review F1; mutant snapdropafter) */
 static int leftovers_race(const char *root, uint32_t number)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *te = getenv("TSDB_REPLD_TEST");
     if (!te || !strstr(te, "snapleftoversrace"))
         return 0;
@@ -38,13 +39,20 @@ static int leftovers_race(const char *root, uint32_t number)
     cvolfs_say("TEST: volume %" PRIu32 ": %s was removed by another thread during its leftovers (snapleftoversrace)",
                number, snap);
     return TSDB_ERR_IO;
+#else
+    (void)root;
+    (void)number;
+    return 0;
+#endif
 }
 
 int snapinst_leftovers(const char *root, uint32_t number)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *mu = getenv("TSDB_REPLD_MUTANT");
     if (mu && !strcmp(mu, "snapnoleftovers"))
         return 0; /* planted: a crash's v<N>.snap, v<N>.old left as they are */
+#endif
     int rc = leftovers_race(root, number);
     if (rc == 0)
         rc = snap_leftovers(root, number);

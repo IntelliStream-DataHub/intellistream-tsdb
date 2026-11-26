@@ -67,6 +67,7 @@
 enum { MM_NONE = 0, MM_SHRINKFIRST, MM_NOREPLACES, MM_REMOVEBEFORESHRINK, MM_LEADERFIRST, MM_NOMINISR };
 static int mv_mutant(void)
 {
+#ifdef TSDB_TEST_HOOKS
     static int m = -1; /* the cluster thread's */
     if (m < 0) {
         const char *e = getenv("TSDB_CLUSTER_MUTANT");
@@ -81,6 +82,9 @@ static int mv_mutant(void)
             cl_say("MUTANT %s (tests only)", e);
     }
     return m;
+#else
+    return MM_NONE;
+#endif
 }
 
 enum { ST_CATCHUP = 0, ST_TRANSFER, ST_SHRINK, ST_REMOVE };
@@ -109,6 +113,7 @@ static struct {
 } T;
 static void test_read(void)
 {
+#ifdef TSDB_TEST_HOOKS
     if (T.read)
         return;
     T.read = 1;
@@ -120,6 +125,7 @@ static void test_read(void)
     const char *h = strstr(e, "hold_shrink=");
     if (h && h[12])
         T.hold = h + 12;
+#endif
 }
 static int shrink_held(void)
 {

@@ -99,6 +99,7 @@ void (*ecswap_intent_fail_hook)(eng *db);
 /* ------------------------------------------------------------ crash points */
 
 enum { SC_AFTER_INTENT, SC_BETWEEN_RENAMES, SC_BEFORE_UNLINK, SC_AFTER_PUT, SC_AFTER_EC_TMP, SC_N };
+#ifdef TSDB_TEST_HOOKS
 static const char *const sc_names[SC_N] = {"after-intent", "between-renames", "before-unlink", "after-put",
                                            "after-ec-tmp"};
 static pthread_once_t sc_once = PTHREAD_ONCE_INIT;
@@ -154,6 +155,10 @@ static void sm_read(void)
 }
 
 void ecswap_crash_point(int which) { settle_crash(which == ECSWAP_CRASH_AFTER_PUT ? SC_AFTER_PUT : SC_AFTER_EC_TMP); }
+#else
+static inline void settle_crash(int point) { (void)point; }
+void ecswap_crash_point(int which) { (void)which; }
+#endif
 
 /* ------------------------------------------------------------ names */
 
@@ -322,7 +327,9 @@ static bool swap_renames(eng *db, part **in, part **ec, size_t n)
 
 int ec_swap_commit(eng *db, part **in, part **ec, size_t n)
 {
+#ifdef TSDB_TEST_HOOKS
     pthread_once(&sm_once, sm_read);
+#endif
     if (n == 0)
         return 0;
     if (db->opt.read_only || db->opt.follow)

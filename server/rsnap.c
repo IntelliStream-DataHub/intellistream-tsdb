@@ -159,6 +159,7 @@ static pthread_once_t hooks_once = PTHREAD_ONCE_INIT;
 
 static void hooks_read(void)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *te = getenv("TSDB_REPLD_TEST");
     if (!te)
         return;
@@ -180,6 +181,7 @@ static void hooks_read(void)
     for (size_t i = 0; i < sizeof ms / sizeof ms[0]; i++)
         if ((f = strstr(te, ms[i].k)))
             *ms[i].v = strtoull(f + strlen(ms[i].k), NULL, 10);
+#endif
 }
 
 /* TSDB_REPLD_TEST=snapfakesrc: one source job more while <dir>/snapfakesrc exists (read before S.mu is taken) */

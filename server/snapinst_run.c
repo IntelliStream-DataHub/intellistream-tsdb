@@ -233,6 +233,7 @@ int snapinst_install(const char *root, uint32_t number, const char *staged, uint
         in.have_pre = h > 0 ? 1 : h == 0 ? -1 : 0;
         say("MUTANT: volume %" PRIu32 ": the old REPL read before the close (snapstalekeep)", number);
     }
+#ifdef TSDB_TEST_HOOKS
     const char *te = getenv("TSDB_REPLD_TEST");
     const char *pa = te ? strstr(te, "snappowerat=") : NULL;
     if (pa)
@@ -245,6 +246,7 @@ int snapinst_install(const char *root, uint32_t number, const char *staged, uint
     }
     if (power_at == 0)
         inst_hook(0);
+#endif
     int rc = cvol_install(number, inst_fn, &in);
     if (in.have_pre > 0)
         replfile_state_free(&in.pre);

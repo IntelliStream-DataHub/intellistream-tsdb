@@ -83,6 +83,7 @@ enum { CTM_NONE, CTM_ANYCAND, CTM_FEWREPLIES, CTM_BALANCEFLAP, CTM_NOCANCEL, CTM
 /* TSDB_CLUSTER_MUTANT's names of this file (cluster.c's parser knows none of them) */
 static int ctr_mutant(void)
 {
+#ifdef TSDB_TEST_HOOKS
     static int m = -1; /* the cluster thread's */
     if (m < 0) {
         const char *e = getenv("TSDB_CLUSTER_MUTANT");
@@ -104,6 +105,9 @@ static int ctr_mutant(void)
             cl_say("MUTANT %s (tests only)", e);
     }
     return m;
+#else
+    return CTM_NONE;
+#endif
 }
 
 static uint64_t since(uint64_t now, uint64_t t) { return now > t ? now - t : 0; }

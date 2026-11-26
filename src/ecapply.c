@@ -48,6 +48,7 @@ void (*_Atomic ecapply_crash_hook)(struct eng *db, int which);
 void (*_Atomic ecapply_test_hook)(struct eng *db, int step);
 _Atomic uint64_t ecapply_test_ft;
 
+#ifdef TSDB_EC
 static void crash_at(struct eng *db, int which)
 {
     void (*h)(struct eng *, int) = atomic_load(&ecapply_crash_hook);
@@ -55,7 +56,6 @@ static void crash_at(struct eng *db, int which)
         h(db, which);
 }
 
-#ifdef TSDB_EC
 /* one file of the marker */
 typedef struct {
     char name[128]; /* the leader's name */

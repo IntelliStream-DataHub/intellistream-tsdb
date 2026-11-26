@@ -54,5 +54,9 @@ for w in "^source   https://github.com/" "^zstd     [0-9]" "^liburing [0-9]"; do
 done
 grep -q "github.com/IntelliStream-DataHub/intellistream-tsdb" "$stage/README.dist" \
     || { echo "mkdist: README.dist does not say where the source is" >&2; exit 1; }
+"$(dirname "$0")/check-release-hooks.sh" "$b/tsdbd" "$b/tsdb"
+if [ -f "$b/libtsdb.so" ]; then
+    "$(dirname "$0")/check-release-hooks.sh" "$b/libtsdb.so"
+fi
 tar -C "$b" -czf "$b/$name.tar.gz" "$name"
 echo "$b/$name.tar.gz"

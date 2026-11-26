@@ -437,6 +437,7 @@ static int publish(void)
 void auth_set_group(const auth_group_ops *ops)
 {
     group = ops;
+#ifdef TSDB_TEST_HOOKS
     const char *m = getenv("TSDB_AUTH_MUTANT");
     mutant = !m ? 0 : !strcmp(m, "authlocalusers") ? MUT_LOCALUSERS : !strcmp(m, "adminlocal") ? MUT_ADMINLOCAL
                    : !strcmp(m, "loginbeforecatchup") ? MUT_EARLYLOGIN
@@ -454,6 +455,7 @@ void auth_set_group(const auth_group_ops *ops)
         snprintf(failpush_file, sizeof failpush_file, "%s", t + 14);
     if (mutant == MUT_LOCALUSERS)
         group = NULL;
+#endif
 }
 
 /* The copy's users, on the cluster thread (cluster_set_users_watch): no I/O under users_mu in a group store, so the

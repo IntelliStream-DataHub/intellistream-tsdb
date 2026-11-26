@@ -31,8 +31,13 @@
  * the reset never applies) */
 static int cset_mutant(const char *name)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *m = getenv("TSDB_CLUSTER_MUTANT");
     return m && !strcmp(m, name);
+#else
+    (void)name;
+    return 0;
+#endif
 }
 
 /* a rid no member of v holds (nor 0) */

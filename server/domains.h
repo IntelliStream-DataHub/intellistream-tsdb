@@ -413,6 +413,7 @@ static void dom_on_change(void *ctx, int d, int old_state, int new_state)
 /* "key=value,..." from TSDBD_TEST_HEALTH: the thresholds scaled down, for tests only. */
 static void dom_test_options(tsdb_health_options *o)
 {
+#ifdef TSDB_TEST_HOOKS
     const char *s = getenv("TSDBD_TEST_HEALTH");
     if (!s)
         return;
@@ -439,6 +440,9 @@ static void dom_test_options(tsdb_health_options *o)
             o->spawn_ms = val;
     }
     free(copy);
+#else
+    (void)o;
+#endif
 }
 
 /* Registers the prefixes and starts the monitor. Returns 0, or -1 with a message. */

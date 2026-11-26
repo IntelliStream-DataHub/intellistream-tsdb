@@ -1391,11 +1391,12 @@ static int ident_load(char *err, size_t errn)
 
 static void test_knobs(void)
 {
-    const char *t = getenv("TSDB_CLUSTER_TEST");
     C.snap_every = SNAP_EVERY;
     C.ring_max = RING_BYTES;
     C.free_min = FREE_MIN_DEFAULT;
     C.stall_ns = SYNC_STALL_NS;
+#ifdef TSDB_TEST_HOOKS
+    const char *t = getenv("TSDB_CLUSTER_TEST");
     for (const char *p = t; p && *p;) {
         unsigned long long v = 0;
         unsigned a = 0, b = 0, c = 0, ep = 0;
@@ -1487,6 +1488,7 @@ static void test_knobs(void)
         if (p)
             p++;
     }
+#endif
 }
 
 static int exists(const char *p)
@@ -1775,6 +1777,7 @@ enum cl_mutant {
 };
 static int cl_mutant(void)
 {
+#ifdef TSDB_TEST_HOOKS
     static atomic_int m = -1; /* parsed once; a race parses the same string twice */
     int v = atomic_load_explicit(&m, memory_order_relaxed);
     if (v < 0) {
@@ -1821,6 +1824,9 @@ static int cl_mutant(void)
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
     return v;
+#else
+    return CLM_NONE;
+#endif
 }
 
 /* the cluster thread's clock (CLOCK_BOOTTIME: a suspend counts), for the stamp and the lease on any thread */
@@ -4253,8 +4259,12 @@ static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int e
     }
     /* an EC volume's log group is m + 1 replicas (E3); fewer only in the test mode of TSDB_CLUSTER_WRITES=1 (cvol.c),
      * so that a 1-replica EC volume can be tested */
+#ifdef TSDB_TEST_HOOKS
     const char *tw = getenv("TSDB_CLUSTER_WRITES");
     if (ek && n != (uint32_t)em + 1 && !(n < (uint32_t)em + 1 && tw && !strcmp(tw, "1"))) {
+#else
+    if (ek && n != (uint32_t)em + 1) {
+#endif
         char msg[160];
         int ml = snprintf(msg, sizeof msg, "an ec=%u+%u volume has %u replicas (m + 1), not %" PRIu32, ek, em, em + 1, n);
         say("volume add %s: %s", a.name, msg);

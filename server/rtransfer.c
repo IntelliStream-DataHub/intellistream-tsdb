@@ -71,6 +71,7 @@ enum { RTM_NONE, RTM_NODRAIN, RTM_ADMIT, RTM_RESUME, RTM_PINNED, RTM_NOTARGET, R
  * instead of the current one */
 static int rtr_mutant(void)
 {
+#ifdef TSDB_TEST_HOOKS
     static atomic_int m = -1;
     int v = atomic_load_explicit(&m, memory_order_relaxed);
     if (v < 0) {
@@ -88,6 +89,9 @@ static int rtr_mutant(void)
         atomic_store_explicit(&m, v, memory_order_relaxed);
     }
     return v;
+#else
+    return RTM_NONE;
+#endif
 }
 
 static uint64_t mono_ms(void)
