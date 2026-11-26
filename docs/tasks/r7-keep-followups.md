@@ -1,44 +1,41 @@
 # Settled sources and their digest (src/eckeep.c): what R7 left open
 
-**Open (from the r7-keep review, 2026-11-20). Owners: R8, R15. The E26 difference is recorded in design-cluster-data.md 2.3 and docs/tasks/r8-from-r7.md.**
+**Mostly closed in R8-1 (2026-11-26; see [AGENTS.md](../../AGENTS.md) "Settled parts", [docs/design-cluster-data.md](../design-cluster-data.md) §2.3, [docs/tasks/r8-from-r7.md](r8-from-r7.md)).**
 
-## tsdbd cannot see a DIVERGED engine (R15, or before tiers reach tsdbd)
+## tsdbd cannot see a DIVERGED engine — Closed in R8-1 (`r8i-diverged`)
 
-A digest that does not match sets `db->diverged` (in memory only: an in-process reopen carries it, a restart clears it,
-and the new engine then serves the `.ec` part until its open digest has run and failed again, which waits while a store
-is not UP; R8 or R15 makes it durable or makes the open refuse until the digest has run), and the `route()` family answers `TSDB_ERR_UNAVAILABLE` for the
-volume. There is no accessor for the flag, so tsdbd's `unav_entry` and `vol_health` (server/tsdbd.c) report
-`TSDB_WHY_DIVERGED` with its 60 s retry only for `dom.vol[v].diverged` (a reopen's report). A volume refused by eckeep
-answers UNAVAILABLE with reason RECOVERING or NONE and a 1 s retry, clients retry every second for their 30 s budget, and
-STATUS and the metrics show the volume AVAILABLE. Wanted: `tsdb_volume_diverged(t, v)` (or the flag in
-`tsdb_volume_report` / the health call) and tsdbd saying DIVERGED. In R7 the tier is test-only (`TSDB_TEST_TIER`), so
-this bites r7-jepsen's runs of tsdbd first.
+`src/ecdiverge.[ch]` makes `DIVERGED` durable (48-byte checksummed append-only records, synced before `db->diverged` is
+visible, read at every open). `tsdb_volume_diverged` (`src/cvol.h`, `src/volumes.c`) exposes it to `tsdbd`: one
+reporting path `vol_diverged()` (`server/tsdbd.c`) feeds `STATUS`, `UNAVAILABLE` (`TSDB_WHY_DIVERGED`, 60 s retry),
+`TOPOLOGY`, and `tsdb_volume_diverged` metric for all volumes including root, while `server/repld.c` stops a diverged
+replicated volume (`vol_fail`) and `server/cvol.c` reports `CL_HEALTH_LOCAL_FAULT`. `tsdb DIR volume diverged [--clear]`
+inspects/clears it (refused on cluster volumes per D23; use `tsdb cluster replica reset` to rebuild the replica instead).
 
-## Rot in the kept copy refuses the whole volume (design, E26 / D5)
+## Rot in the kept copy refuses the whole volume — Closed in R8-1 (`r8j-digest`, D25)
 
-When only the settled_ file's hash differs (the object's equals the record's), the cause may be rot in the kept copy on
-local disk while the `.ec` part is right; the volume is still refused. The settled_ file is a whole part: its footer
-hash and granule checksums could tell rot of the copy from a settle that encoded other bytes. Decide whether that case
-keeps the file, logs and serves.
+In `src/eckeep.c`, single-server and leader byte-digest checks (`digest_part`) trigger D25 rot when the chunk object
+matches its record while the kept `settled_` copy fails its own granule checksums, whereas replica `MK_DIGEST` jobs
+(`ecdigest_job_check`) verify the retired copies' checksums against `MK_DIGEST` without re-reading the chunk object
+(corrupt or missing copies without `ECDJ_MATCHED` -> `ECKEEP_ROT`). In both paths the rotted copy is counted lost
+(`eckeep_copies_lost++`), logged, released at its deadline, and the `.ec` part keeps serving; only a digest mismatch
+(or unreadable rows) whose checksums hold sets `DIVERGED`.
 
-## Settles go on on a DIVERGED volume (r7-settle)
+## Settles go on on a DIVERGED volume — Closed for clusters in R8-1 (`r8g-cut`, `src/ecpolicy.c:223-224`)
 
-Only the route() family checks the flag. The settle thread keeps settling partitions of a volume whose last settle
-failed its digest, and each swap renames more sources to settled_ (each held until its own digest matched). Should the
-settle policy skip a diverged engine?
+The cluster settle policy skips diverged engines (`if (cluster && atomic_load(&db->diverged)) return 0;`). Note: the
+single-server R7 branch still leaves `db->diverged` unchecked by `ecpolicy_pick_locked` until R15 adds the reverse
+intent (`settled_` back).
 
-## E26 describes a logical digest; R7 built a byte digest (r7-docs)
+## E26 describes a logical digest; R7 built a byte digest — Closed for clusters in R8-1 (`r8j-digest`)
 
-design-cluster-data.md E26 specifies a logical digest of the retired rows (rows per series and an xxh64 over the
-visible rows, `MK_DIGEST`, compared per log replica). R7 compares the object read back whole (every cell checked, a bad
-one rebuilt) and the settled_ file with the record's `object_xxh64`. E26 must not read as built: record the difference.
+`src/ecdigest.[ch]` implements E26's logical digest (`ec_logical_digest`, `MK_DIGEST` with `now_ms`, `MKD_TOMBS`,
+canonical tombstone union, and `digest_<key>_<z>` job files on replicas). Single-server tiers and leader `settled_`
+copies keep R7's byte digest.
 
-## No fault run reaches eckeep (r7-jepsen)
+## No fault run reaches eckeep — Closed in R8-1 (`r8j-digest`, `r8l-jc`, `r8q-geom`)
 
-`make jepsen` runs no tier, so no eckeep code runs under kill, power loss or EIO there, and test_keep has no crashfs
-case. The release is a plain unlink (no directory fsync): a file that comes back after a power loss is digested again,
-and ecswap's recovery takes a settled_ name as "the swap stands". A tier workload with releases under power loss
-belongs in r7-jepsen.
+`test_keep` (`relpower` under crashfs), `test_ecapply` (`digestpower` under crashfs), and `jepsen-cluster --ec` (`rot`
+and `power` nemeses) now exercise digest matching, copy rot, and durable release unlinks under power loss.
 
 ## Not covered by test_keep
 

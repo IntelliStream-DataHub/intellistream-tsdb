@@ -1,127 +1,108 @@
 # R8 takes what R7 left out
 
-**Open. Owner: R8 (docs/design-cluster-data.md §11, about 9-11 track-days instead of 6-8).** R7 was built as the settle
-of ONE server with a directory backend (the plan's decisions D1-D11, 2026-11-17): `.ec` parts that keep their source's
-name and block range, intent v4, the read seam, `settled_*` with a digest, the delete queue. Everything that needs a
-second member of a replica group was left for R8. `AGENTS.md` "Settled parts" says what exists; this file says what
-does not, and what R8 must not take for granted.
+**R8-1 done (2026-11-26); remaining items split across R8-2, R9, R10, R11, R13, R15 ([design-cluster-data.md](../design-cluster-data.md) §11).**
+R7 was built as the settle of ONE server with a directory backend (D1-D11, 2026-11-17). R8-1 implemented the replicated
+cluster half: `PPOS`, the settle gate and cut, `Y`, `MK_COLD`, `MK_DIGEST` with E26's logical digest and D25 rot
+handling, replica apply with intent v5, durable `DIVERGED`, epoch-fenced chunk servers/clients (`chunksrv`/`chunkpeer`),
+and `MK_GC`/`GCMK` garbage collection. R8-2 tracks `r8p-prefetch` (done), `r8o-margins` (STATUS/metrics done; TOPOLOGY
+waits for protocol 16), `r8q-geom` (done), and `r8n-hedge` (remaining). D24 moved degraded settles, per-part cluster
+settles, and `eccache_reopen` after a heal to **R9**, server roles (`compute`/`storage`/`both`) to **R13**, and reverse
+intent (`settled_` back), tier store `db_id`, and followers over a tier to **R15**. `AGENTS.md` "Settled parts"
+describes what is now built; below is the status of each R8 item.
 
-## What R7 refuses today (D1, D7)
+## What R7 refused today (D1, D7)
 
-A settle never runs, and a tier never opens, on a volume whose META says `requires=cluster` or `requires=replica`, on a
-read-only open, on a follower, and in a build without `TSDB_EC`. `eng_settle` and `tier_engine_attach` carry the
-refusals (`tests/test_tier.c` `refuse`, `test_settle.c`). R8 removes the first one, for a leader and for a replica, in
-`src/db.c`, `src/replica.c`, `src/memtable.c` and `server/repld.c`, which no R7 track touched.
+- **Done (R8-1):** cluster EC volumes (`requires=cluster,tier,ec`) open and settle via `eccold_settle` (`src/eccold.c`),
+  `ecapply_*` (`src/ecapply.c`), `src/db.c`, `src/replica.c`, `server/chunkpeer_cluster.c`, and `server/repld.c`.
+- **Remaining:** read-only opens, followers (`D7` -> **R15**), single-server tiers without `TSDB_TEST_TIER` (**R15**),
+  and builds with `NO_EC=1` still refuse tiers and `.ec` parts.
 
 ## D1: the replicated half
 
-1. **`ppos` and its durable home.** The design says "recorded in its MANIFEST entry" (§2.3). MANIFEST names parts and
-   nothing else: `manifest_publish` writes a line per part name, rewrites the file in place without a sync, and the
-   writer never reads it at open (FNO is the durable bound for exactly that reason). Choose the home first: a checksummed
-   sidecar, or the part header (48 bytes with `fno_lo`, `fno_hi`, `written_ms`: no room, so a layout change that E17's
-   "no new format number" must allow). The memtable keeps the per-key maximum position as it appends. The `.ec` record
-   has `ppos` and `stripe_version` (written as 0, refused when not, `record_valid` in `src/ecpart.c`: bump
-   `EC_RECORD_VERSION` or teach the check) and `positions` (a mask of the positions written, 0: all, for E10's
-   degraded settle).
-2. **The gate and the cut** (§2.3 steps 3-4): close P's settle gate before `lw_enter`, register the large-write fence
-   over P's key range, wait for the commit point, flush through, take Z and `Y`. On one server the swap's input check
-   under `db->lock` replaced all of it; on a leader the check must stay (a drop takes no `publish_lock`) and the gate
-   comes on top. Lock order: `jr_serial` first, as for a large write.
-3. **`Y`** and its shipping to the log replicas as pending files. A part written during steps 1-3 ranks above the `.ec`
-   by its block number on the leader; on a replica the block numbers are the replica's own.
-4. **Names on a replica.** §2.3 step 6 lists the `.ec` files under fresh block numbers in the leader's order; R7's D2
-   keeps the source's name. Decide which holds on a replica (its `.ec` takes its own copy's name, or fresh numbers with
-   `Y` renamed above). Whatever is chosen, the swap's input check and recovery rules (`src/ecswap.c` header) apply to the
-   replica's apply, which is one intent as in step 6.
-5. **`MK_COLD` and `MK_DIGEST`** (markers 11 and the digest; `src/marker.h`, `MK_COLD = MK_TYPE_LAST` reserved in format
-   9), with the object records, names, sizes and xxh64 of the `.ec` and `Y` files, and the oids a re-encode retires
-   (R10).
-6. **E26's logical digest.** R7 built a byte digest: the object read whole, its xxh64 against the record's
-   `object_xxh64` and against the `settled_` file's (`src/eckeep.c`). E26 specifies the rows per series and an xxh64 over
-   the visible rows of the retired parts, compared between log replicas. A byte digest cannot be compared across
-   replicas (their files differ); R8 owns it (docs/tasks/r10-reencode.md uses it and does not build it). Until then E26 must not read as built.
-7. **DIVERGED on a part above Z** (a replica whose part has `ppos` between Z and the marker stops and is rebuilt) and the
-   way out of DIVERGED in general. R7's is a flag on the engine (`db->diverged`) kept in memory only: a restart clears it, and the new
-   engine serves the `.ec` part until its open digest has run and failed again, which waits while any store is not UP
-   (an in-process reopen carries the flag, `src/volumes.c`; a restart does not). Make it durable, or make the open
-   refuse until the digest has run. tsdbd cannot even say DIVERGED (docs/tasks/r7-keep-followups.md: `unav_entry`, `vol_health`). D5 deferred "a reverse intent
-   that swaps `settled_` back" to R15, and a cluster needs it earlier than a test-only tier does: decide with R15.
-8. **Shipping `.ec` files** over the bulk link, and a replica that misses one fetching it before it acknowledges the
-   marker (§2.3 "Crash and failover"); the leader keeps what a marker names until its segment leaves retention.
-9. **Settle on a replica's volume while the digest of an earlier one is pending.** `eng_settle` does not look at
-   `db->diverged`: on a volume whose digest failed the settle thread goes on settling and each swap renames more
-   sources to `settled_` (each held until its own digest matches). Decide whether the policy skips a diverged engine.
+1. **Done (R8-1, `src/ppos.[ch]`): `ppos` and its durable home.** Checksummed, append-only per-volume `PPOS` sidecar
+   (32-byte offset-seeded xxh64 records, torn tail cut, compacted at open) fed at all three memtable append sites via
+   a per-memtable `base_partition -> highest fno` map (`eng_ppos_rows` / `ppos_note`), `jr_part_pos` on `COMMIT`, max over inputs on
+   merge (`src/merge.c`), and `Z` on settle. `PPOS_UNKNOWN` = `UINT64_MAX`. `.ec` record format v1 (`EC_RECORD_VERSION` = 1,
+   unchanged; `record_valid` admits non-zero `ppos` and `stripe_version` on cluster EC volumes) carries `ppos` and
+   `stripe_version`; `positions` (degraded settle mask) remains reserved for **R9**.
+2. **Done (R8-1, `src/eccold.[ch]`): the gate and the cut.** `lw_enter` takes `jr_serial` (FIFO ticket lock) + key-range
+   fence over `MK_BUCKETS`, rotates/flushes overlapping memtable (`F`), waits for commit point past `L` (`eng_leader_wait`),
+   takes `Z`, collects `Y` (`test_eccold`). Swap keeps its input check under `db->lock`.
+3. **Done (R8-1, `src/eccold.c`, `src/ecapply.c`):** on the leader, `Y` ranks above `.ec` by block numbers; on a replica,
+   COLD apply gives `.ec` parts fresh block numbers in the leader's order and renumbers `Y` above `.ec`.
+4. **Done (R8-1, `src/ecapply.c`, `src/ecswap.c` intent v5):** replicas apply `MK_COLD` with fresh `.ec` block numbers,
+   updated `.ec` record metadata (`min_block`, `max_block`, `source`), and **intent v5** (`N`, `Y`, `R`, `end <xxh64>`).
+5. **Done (R8-1, `src/marker.[ch]`):** `MK_COLD` (11), `MK_GC` (12), and `MK_DIGEST` (13 = `MK_TYPE_LAST`) implemented;
+   types `14..15` (`MK_DROP_OBJ`, `MK_UNSETTLE`) remain reserved for **R10**.
+6. **Done (R8-1, `src/ecdigest.[ch]`, `src/eckeep.c`):** E26 logical digest (`ec_logical_digest` over visible rows in
+   `(series, ts)` order + clipped canonical tombstone union when `MKD_TOMBS` is set) compared against committed
+   `MK_DIGEST`; D25 distinguishes checksum rot (`ECKEEP_ROT`: `eckeep_copies_lost++`, serve `.ec`) from logical mismatch
+   (durable `DIVERGED`). Single-server and leader `settled_` files keep R7's byte digest.
+7. **Done (R8-1, `src/ecdiverge.[ch]`, `src/ecapply.c`, `server/tsdbd.c`, `server/repld.c`, `server/cvol.c`):** a replica
+   part above `Z` (or missing `PPOS`) stops apply and writes durable `DIVERGED`, causing `tsdbd`/`repld` to fail the
+   replica (`vol_fail`, leave ISR, `LOCAL_FAULT` heartbeat, `TSDB_WHY_DIVERGED`, `tsdb_volume_diverged`). `tsdb DIR
+   volume diverged --clear` is refused on cluster volumes (D23; use `tsdb cluster replica reset` to rebuild the replica
+   instead). Reverse intent (D5:
+   swapping `settled_` back) moved to **R15** (D24).
+8. **Done (R8-1, `server/chunksrv.[ch]`, `server/chunkpeer.[ch]`):** leader writes stripe chunks to all positions over
+   `PL_KIND_CHUNK`/`CHUNKB` and commits `MK_COLD`; members read through `coldops_peer` (`k' + 200 ms` grace). Degraded
+   settles (E10) moved to **R9** (D24).
+9. **Done (R8-1, `src/ecpolicy.c`):** cluster policy skips diverged engines (`db->diverged`), settles whole keys only
+   (D21 -> per-part moves to **R9**), and requires `p->level > 0` (D18).
 
 ## D4: the epoch authority
 
-R7's chunk epoch is the constant 1, raised in every store at open (`chunk_be_see_epoch(be, vol, 1)`, `tier_engine_attach`),
-and a store with one damaged EPOCH slot is raised by itself (`tierfence`, `noselfraise` pinned this). Nothing fences a
-second writer of the stores except the `flock` of `chunk_store_open`. In a cluster the epoch comes from the metadata
-group (§5.7): a leader writes under its volume epoch, a deposed one is refused by the stores, and an unsure store gets
-the group's epoch, never its own. R8 replaces the constant, keeps "never from the writer's own epoch" and tests a leader
-change in the middle of a settle (the orphans' rule E14 and the `MK_GC` of a committed marker).
+**Done (R8-1, `server/chunkpeer_cluster.c`, `server/chunksrv.c`, `src/ecgc.c`, `src/ecgcmk.c`):** leader puts/deletes use
+`coldvol.lead_epoch` (`wal_open` / attach); unsure chunk stores raise epoch only from `chunksrv_epoch_source`
+(`chunkpeer_epoch_source` when metadata copy is caught up), never from requests or own store; `MK_GC` (`MK_GC_RETIRED`,
+`MK_GC_ORPHAN`, `MK_GC_DONE`) + durable `GCMK` implement E14 cluster orphan & retired collection across leader changes.
 
 ## D7: followers
 
-A follower, and a build without `TSDB_EC`, refuse a tier today; a running follower that meets an `.ec` name fails its
-engine with one line (`tier_follower_ec`; an embedded follower keeps answering from its last view, because no query path
-checks `eng_fail`). Opening the stores read-only for a follower (`chunk_store_open` with no `flock` and no EPOCH write,
-and `ecpart_follower_open`, a stub that returns CORRUPT) is R8 or R15, with the rule that a follower on another host needs
-the stores on shared storage.
+**Moved to R15 (D24):** followers over a tier (`chunk_store_open` read-only and `ecpart_follower_open`, shared storage)
+remain unbuilt (`server/tsdbd.c` / engine still fail a follower that opens a tier or meets an `.ec` name).
 
 ## D8: prefetch
 
-The seam reads a granule's bytes on a miss and fills the cache entry (keyed (oid, offset)); nothing reads ahead. A
-query over a long range pays one range read per granule not cached (`ec_granule_read`). Prefetch the next granules of the
-same series and part when a read is sequential, with a budget in the cache, and measure it on a real drive (R11 owns the
-numbers: nothing is claimed without one).
+**Done (R8-2 `r8p-prefetch`, `src/eccache.c`); real-drive tuning -> R11:** sequential granule prefetch (16 stream slots,
+`4..32` granules per RAW range read, `budget/4` and 4 MiB caps) is built with mutants in `test_seam`. Real-drive
+throughput measurements belong to **R11**.
 
 ## The `Y` mutant
 
-R7's gate said "the `Y` mutant" and could not have it: there is no `Y` on one server. R8 plants it in the apply (step 6):
-a settle that retires a part of `Y` with the parts of I (or lists the `.ec` above `Y`), which loses the rows written
-during steps 1-3 or ranks the old rows over them. `test_cluster` / `jepsen-cluster` with writes into settling keys must
-fail with it, in the pattern of R6 (an enum in the code, `--mutant NAME`, a Makefile line that requires the failure),
-beside `ecrankdown` and `swapnodropcheck`, which R7's tests already catch on one server.
+**Done (R8-1):** planted in `src/ecapply.c` / `src/eccold.c` (`ycold`, `ecabovey`, `cutnogate`, `coldnoflushthrough`,
+`checkz`, `noyhcheck`, etc.) and tested by `test_eccold`, `test_ecapply`, and `make jepsen-cluster-ec` (`jepsen-cluster-selftest`
+runs `ycold`, `ecabovey`, `cutnogate`).
 
 ## Open items of the R7 reports that fall to R8
 
-- tsdbd and DIVERGED: no accessor for `db->diverged`; STATUS and the metrics show the volume AVAILABLE
-  (r7-keep-followups.md). The flag is carried across `tsdb_volume_reopen` and `tsdb_cvol_replace` (the second untested:
-  cluster volumes had no tier).
-- A hold across a volume reopen: holds on an object are taken at retire only; a reopen whose old engine
-  still has a reader on a part the new engine retires is not held (r7-gc F5). Plan: take the hold in `part_open_ec`,
-  drop the one in `ecgc_retire_locked`, key holds by part pointer in a hash (O(1) at each unref with 10k parts).
-- `ecgc` runs its own worker thread; r7-settle could call `ecgc_tier_work` from the settle thread (r7-gc item 2).
-- `src/ecswap.c` holds `latest_rw` and `db->lock` across 2n renames (r7-swap M2, kept as the task said): on NFS,
-  snapshots and latest lookups wait for those round trips. The alternative (mark the inputs `merging`, rename unlocked,
-  relist) needs the swap to refuse under `drop_pending` as well, because `drop_retire` lets go of `db->lock` between its
-  merging wait and its retire. R8 meets NFS tiers first; decide there.
-- The tier's stores are not bound to a database (no `db_id`, store ids not pinned: `chunk_be_open2` is given NULL ids), so
-  a disk that comes back as another store is not detected, and a copy of a database directory on the same stores shares
-  the vuuid, which the sweep's rule cannot tell from itself. R15 adds `db_id` and store META (design §15.7); a cluster
-  member needs it first if a server's disks move.
-- The seam's fallback backend states and `eccache_reopen` for heal/replace/settle are in place but nothing calls them
-  after a heal in tsdbd (r7-seam #3).
-- `tsdb_query_multi` over settled parts has no seam test of its own (the oracle covers it end to end); the cluster's
-  `route_decide` is not exercised with a diverged volume.
-
-- **Done (snap-ec, 2026-11-25): a snapshot carries `.ec` parts.** Was: `snap_make` refused a volume that listed one, so a
-  log replica of an erasure-coded volume could not be moved, reset or rebuilt past the caps once it had settled a key.
-  Now the make carries the cut's `.ec` parts (index file and object record; the chunks stay on the stores) with their
-  PPOS records (SNAPMAN version 3), the install verifies each `.ec` and writes PPOS before SNAPDONE; `settled_` and
-  `retired_` files never travel (src/snapshot.c header, "Settled parts"). Tests: `test_snapshot --only ec` (install with a
-  settled key, rows equal to the leader's, read through the seam on the new replica, power loss at each step of the
-  install), mutants `snapinstnoppos snappposafter snapcarrysettled snapskipec`. Still open: a `test_cluster` move or
-  reset of such a volume end to end, which needs tsdbd to make an EC cluster volume (`requires=ec` on a cluster volume
-  and cold ops over the chunk servers); and r8k's MK_GC: an `.ec` listed at P and dropped by the leader after P can
-  lose its chunks to the leader's purge before the receiver replays the DROP, as for any replica behind such a drop.
+- **Done (R8-1):** `tsdbd` and `DIVERGED`: `tsdb_volume_diverged` accessor, `STATUS`, `UNAVAILABLE` (`TSDB_WHY_DIVERGED`),
+  `tsdb_volume_diverged` metric, `repld` `vol_fail`, and `LOCAL_FAULT` heartbeat are built and tested (`test_diverge`,
+  `test_cluster diverged`).
+- **Done (R8-1, `r8k-gc`):** hold across a volume reopen (`F5`): holds are taken in `part_open_ec` (`ecgc_hold`) and
+  dropped in `ecgc_last_unref`, stored in O(1) open-addressing hash tables keyed by `const part *` and `(volume, oid)`.
+- **Open (design choice):** `ecgc` still runs its own tier worker thread (calling `ecgc_tier_work`, which also drives
+  `ecgcmk_work`), rather than piggybacking on the settle thread.
+- **Moved to R15:** `src/ecswap.c` holds `latest_rw` and `db->lock` across `2n` renames (r7-swap M2): decide when NFS
+  tiers arrive in R15.
+- **Done for cluster / moved to R15 for single server (D24):** cluster `chunksrv` stores bind to cluster UUID + node ID
+  at `tsdb chunk-store init` and verify META at open (`server/chunksrv_cluster.c`); single-server tier store META with
+  `db_id` moves to **R15**.
+- **Moved to R9 (D24):** `eccache_reopen` call after a heal in `tsdbd` (`r7-seam #3`).
+- **Done (R8-1 / `r8p-prefetch`):** `route_decide` with a diverged volume is covered by `test_cluster diverged` and
+  `jepsen-cluster-ec`; `tsdb_query_multi` over settled parts has a standalone seam test (`tests/test_seam.c` `case_multi`,
+  added in `r8p-prefetch`).
+- **Done (R8-1):** `test_cluster` move/transfer of a settled EC volume (`test_cluster ecbasic|ec16`, `jepsen-cluster-ec`
+  `VOLUME_TRANSFER`) and `MK_GC` coordination across leader drops/purges (`r8k-gc`, `test_ecgc`, `test_cluster ecgc`).
 
 ## What R8 inherits and must keep (do not weaken)
 
 The settle checks the bytes it encodes, once. The seam always checks. A drop and a swap meet under `db->lock`. The
-sweep runs before the threads. A retired `.ec` keeps its name until its chunks are gone. A key is settled all or nothing.
-`make test NO_EC=1` passes. These each have a mutant in `Makefile` that fails a test; list them in R8's review.
+sweep runs before the threads (skipped on cluster EC volumes in favour of `MK_GC`). A retired `.ec` keeps its name until
+its chunks are gone (or `MK_GC` deletes them on every member). A key is settled all or nothing. `make test NO_EC=1`
+passes. All enforced by the `Makefile` mutant loops (`test_ppos`, `test_eccold`, `test_ecapply`, `test_ecdigest`,
+`test_diverge`, `test_ecgc`, `test_ecswap`, `test_settle`, `test_seam`, `test_chunksrv`, `test_chunkpeer`, `test_margins`,
+`jepsen-cluster-selftest`).
 
 ## Other open items of the R7 reports (no owner yet; whoever next touches the file)
 
@@ -131,19 +112,19 @@ Tests that were not written:
   `timeorder`, `outside`, `overlap` (they need a rewritten packed index and footer hash; the open's own checks stand in
   front of them), and the policy's `testmark` and `poldropping`.
 - A settle test on the real v8 fixture (`tests/test_upgrade.c`'s database with a tier); the 4 GiB part
-  (`TSDB_TEST_BIG=1`); a settle's cost per GiB at each geometry; the open's orphan sweep with 10k and 100k objects; the
+  (`TSDB_TEST_BIG=1`); a settle's cost per GiB at each geometry (**R11**); the open's orphan sweep with 10k and 100k objects; the
   digest's throttle (`eckeep_digest_mb_s`) against a real disk; the cost of `chunk_be_put_object`'s extra copy
   (+6-7% measured, within noise; `put_object` could call `chunk_encode` directly if heal throughput matters).
 - `eckeep`: `each()`, `feed_engines` and `cvol_series_make` have no test; a store going away in the middle of a digest read
-  cannot be tested (no runtime UP -> not-UP transition exists in R6's backend); no crashfs case for the release of a
+  cannot be tested in R6's directory backend (covered on cluster volumes via `chunksrv`); no crashfs case for the release of a
   `settled_` file (a plain unlink: a file that comes back after a power loss is digested again, and `ecswap_recover` takes
   a `settled_` name as "the swap stands"). `make jepsen`'s tier runs now settle under kill, power, eio and `settle-steps`,
   but their release deadline (`keep_s` 5) is the only exercise of it.
 - `tier`: the directory fsync of `meta_edit` is unobserved (the open's later directory fsyncs cover it); the reopen test
   is in-process, not under outagefs; META is read in 512-byte pieces; a read-only open is refused rather than served.
 - `ecpart`: `cell_bytes` is not capped below `CHUNK_CELL_LIMIT` (chunk.h: a recorded cell may be any size, E2).
-- The seam: `cache_mb` is a key of `TSDB_TEST_TIER` and is not in docs/config.md (it joins `storage.` with R15); the
-  byte columns of statistics use `eccache_part_bytes` for an `.ec` part.
+- The seam: `cache_mb` is a key of `TSDB_TEST_TIER` (cluster builds expose `ec.cache` in `docs/config.md`; single-server
+  tiers join `storage.` with **R15**); the byte columns of statistics use `eccache_part_bytes` for an `.ec` part.
 
 Harness and engine:
 - `settle-steps` does not judge a server's exit status (only power does): a transient exit 1 at start passes unnoticed;
@@ -156,9 +137,12 @@ Harness and engine:
   (`ORACLE_PLAN=0` turns it off): decide which counters are the contract once settled parts read through the seam.
 - `-Wrestrict` false positives at -O1 in `tests/test_settle.c` `fresh()` and `tests/test_settle_oracle.c`.
 - A damaged `retired_*.ec` record fails the open with a line (r7-gc F6): decide whether that should refuse or log.
-- `settleable()` (`src/ecpolicy.c`) refuses v8 headers but not insert-written parts: it relies on `merge_selectable`,
-  which is false with `merge_threads` 0, so then an insert-written part can settle, against the rule of `src/ecskip.h`
-  (such parts keep their fast-codec blocks for ever once `.ec`). Layout only; check `insert_written` in `settleable`.
+- Single-server `settleable()` (`src/ecpolicy.c:147-151`, called from the single-server branches of `ecpolicy_pick_locked`
+  at `src/ecpolicy.c:293-308`) refuses v8 headers but not insert-written parts: it relies on
+  `merge_selectable`, which is false with `merge_threads` 0, so then an insert-written part can settle on a single
+  server, against the rule of `src/ecskip.h` (the cluster branch of `ecpolicy_pick_locked` (`db->ec_cluster`) and
+  `eng_settle` explicitly require `p->level > 0`, D18). Layout only;
+  check `insert_written` in single-server `settleable`.
 - r7-jepsen's REPORT names a TSan report in `test_replica` (`replica.c`, `wal_off` read without its lock). Not confirmed
   fixed here (224fc8d, `ld_last` under `buf_lock`, may be the fix): rerun `make tsan TEST_TARGET=test-meta`'s replica
   group before relying on it.

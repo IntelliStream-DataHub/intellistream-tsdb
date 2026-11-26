@@ -8,6 +8,44 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+**Erasure-coded cluster volumes settle, check, and collect chunks across replicas (R8-1, production in 0.11.0).**
+Erasure-coded volumes (`--redundancy ec=k+m`, no `--ec-experimental` flag) now settle whole partition keys across the
+cluster's log replicas and chunk stores, check their retired copies with a logical digest, garbage-collect retired and
+orphan chunks by committed markers, and persist divergence across restarts:
+
+- **Cluster settle cut (`PPOS`, `MK_COLD`, intent v5).** A volume leader settles whole keys past `--ec-settle-grace-s`
+  (no per-part, coarse, or eager mode; level-0 insert-written parts rewritten first; skipping keys near retention expiry
+  or on diverged engines; waiting up to `--ec-settle-wait-max-s` for a dropped stripe position and flushing active
+  memtable rows after `--ec-settle-force-s`). It encodes and puts chunks over `CHUNKB` (`--chunk-rate-mb-s`), closes
+  writes into the key's days via the settle gate (`jr_serial`), cuts at log position `Z`, writes `.ec` index files
+  (`requires=cluster,tier,ec` in META, `FORMAT_VERSION` still 9), and ships `.ec` + late `Y` parts with `MK_COLD`.
+  Every log replica applies `MK_COLD` via intent v5 (listing `.ec` parts under fresh block numbers in the leader's order
+  with `Y` above them, retiring own parts with `ppos <= Z` as `settled_*`, stopping `DIVERGED` at any part above `Z`).
+  Every cluster EC volume maintains a checksummed append-only `PPOS` file tracking each part's log position (`tests/test_ppos.c`,
+  `test_eccold`, `test_ecapply`).
+- **Logical digest & copy-rot tolerance (E26, D25).** After the swap, the leader computes a logical digest of the visible
+  rows (under the retention cutoff at `now_ms`, plus a canonical tombstone union when parts lie below) and appends
+  `MK_DIGEST` (13, `MK_TYPE_LAST`; 14-15 reserved for R10). Replicas verify their `settled_*` copies' checksums and
+  logical digest against `MK_DIGEST` before releasing them at `--ec-settle-keep-s` (syncing the directory after unlink);
+  checksum rot in a kept `settled_*` copy (and on single-server/leader byte-digest checks, when the `.ec` object matches
+  its record) logs and counts the copy lost while continuing to serve the `.ec` part (`test_ecdigest`, `test_keep`).
+- **Epoch fencing & cluster chunk GC (`MK_GC`).** Chunk epochs follow the volume's metadata epoch (leaders pin their
+  own `lead_epoch`, and unsure stores are raised only from a caught-up metadata copy). Direct chunk deletes and open
+  sweeps are disabled on cluster EC volumes; chunks are deleted only after a committed `MK_GC` (12) marker recorded in
+  each member's durable `GCMK` file (`MK_GC_RETIRED` past `obsolete_part_lifetime_s` with zero O(1) open holds;
+  `MK_GC_ORPHAN` under E14's four conditions while `gc_suspended` is false; `MK_GC_DONE` after `CHUNK_DEL` across the
+  stripe). `test_chunkpeer`, `test_ecgc`, `test_cluster ecbasic|ecgc`.
+- **Durable `DIVERGED` (`tsdb DIR volume diverged`).** Divergence from a failed digest or a cold-apply part above `Z` is
+  written to a checksummed `DIVERGED` file before taking effect, survives restarts, stops replicated volumes (`LOCAL_FAULT`
+  in heartbeats, `TSDB_WHY_DIVERGED` in `STATUS`/`TOPOLOGY`/`UNAVAILABLE`, `tsdb_volume_diverged` metric), and refuses
+  `--clear` on cluster volumes (use `tsdb cluster replica reset` to rebuild the replica instead; `test_diverge`,
+  `test_cluster diverged`, `fuzz_diverge`).
+- **Sequential granule cache prefetch & 22-node `16+4` testing (`r8p-prefetch`, `r8q-geom`).** Sequential misses in the
+  EC granule cache read ahead 4 to 32 granules within a quarter of the cache budget (`test_seam`). `test_cluster ec16`
+  and `jepsen_cluster --ec 4+2|16+4` (`partial`, `diskloss`, `rot`, live per-replica reads) verify both geometries.
+- **Single-server re-encode (`r10-reencode`).** Single-server tiers automatically combine keys exceeding `ecpolicy_objects_max`
+  (4) objects or >10% hidden tombstone rows into one `.ec` part via intent v4 (`test_settle`, `test_ecswap`).
+
 **The cluster's metadata snapshot is now version 5 (R4: replica set changes).** A volume's record has a replica set
 version, a move in progress (`replaces`), the target of a planned transfer and four new settings (`rebuild_mb_s`,
 `rebuild_max`, `transfer_wait_ms`, `leader_balance_s`, off by default); `REPLICA_RESET` is a new metadata operation.
