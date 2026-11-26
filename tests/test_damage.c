@@ -537,7 +537,11 @@ static void test_parts(const char *scratch)
     /* undamaged: verify on checks every granule, off checks none */
     make_part(dir, part, sizeof part);
     query_part(dir, 1, &rc, &checks);
+#ifdef TSDB_TEST_HOOKS
     CHECK(rc == 0 && checks == (PART_ROWS + 63) / 64);
+#else
+    CHECK(rc == 0);
+#endif
     query_part(dir, 0, &rc, &checks);
     CHECK(rc == 0 && checks == 0);
 
@@ -549,7 +553,9 @@ static void test_parts(const char *scratch)
     flip(dir, part, (off_t)(sizeof(part_header) + ft.index_off) / 2);
     query_part(dir, 1, &rc, &checks);
     RC(rc, TSDB_ERR_CORRUPT);
+#ifdef TSDB_TEST_HOOKS
     CHECK(checks > 0);
+#endif
     query_part(dir, 0, &rc, &checks);
     CHECK(checks == 0);
 

@@ -347,13 +347,7 @@ int granule_decode(codec_ctx *c, const part *p, const granule *g, const uint8_t 
     if (g->count == 0 || g->count > p->grows || g->count > cap)
         return TSDB_ERR_CORRUPT;
     if (verify) {
-#ifdef TSDB_TEST_HOOKS
-        uint64_t *gc = cur_granule_checks;
-        if (gc)
-            (*gc)++;
-        else
-            atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
-#endif
+        granule_checks_add(1);
         if ((uint32_t)xxh64(blk, len, 0) != g->crc)
             return TSDB_ERR_CORRUPT;
     }

@@ -1002,6 +1002,16 @@ int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
 #ifdef TSDB_TEST_HOOKS
 extern __thread uint64_t *cur_granule_checks; /* worker-local accumulator folded once on worker exit */
+static inline void granule_checks_add(uint64_t n)
+{
+    uint64_t *gc = cur_granule_checks;
+    if (gc)
+        *gc += n;
+    else
+        atomic_fetch_add_explicit(&granule_checks, n, memory_order_relaxed);
+}
+#else
+static inline void granule_checks_add(uint64_t n) { (void)n; }
 #endif
 /* test hook: runs where a reader has used the counts of entries from i of p (without pin_index, in the mapping) and
  * is about to load them again (IX_*), so a test can change them in between, as a write to the file can */

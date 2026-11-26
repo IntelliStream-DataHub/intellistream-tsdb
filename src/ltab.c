@@ -21,6 +21,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifndef __APPLE__
+#include <sys/mman.h>
+#endif
 
 enum { LE_EMPTY = 0, LE_KNOWN = 1, LE_UNKNOWN = 2 };
 typedef struct lt_ent {
