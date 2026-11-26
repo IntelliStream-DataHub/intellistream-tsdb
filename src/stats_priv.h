@@ -167,7 +167,10 @@ struct mgroup { /* moves[first .. first + n) all go from one tenant to one other
 struct estats {
     eng *db;
     stat_ev ring[RING_N];
-    atomic_uint_fast64_t head, tail;
+    uint8_t pad_head_[64]; /* keep SPSC head and tail on separate cache lines without raising alignof(estats) */
+    atomic_uint_fast64_t head;
+    uint8_t pad_tail_[64];
+    atomic_uint_fast64_t tail;
     atomic_bool overflow, swapped, stop;
     atomic_bool opened; /* the open has finished: only then may the sweeper read db->parts (load_parts changes it unlocked) */
     atomic_uint_fast64_t overflows, cpu_ns;

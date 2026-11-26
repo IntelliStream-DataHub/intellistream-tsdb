@@ -92,8 +92,10 @@ void metrics_enable(void);
 void metrics_conn_opened(void);
 void metrics_conn_closed(void);
 void metrics_conn_rejected(void);
-/* A worker starts / finishes a request; begin returns the start time to pass to end. */
-int64_t metrics_request_begin(void);
+/* A worker starts / finishes a request; begin returns the start time for query ops (0 otherwise) to pass to end.
+ * Both calls must be paired on the same thread with the same op (workers_busy is tracked per thread and only query
+ * ops carry a monotonic timestamp in began). */
+int64_t metrics_request_begin(uint8_t op);
 void metrics_request_end(uint8_t op, int64_t began);
 /* The histogram bucket for a duration: 0..14 for the `le` bounds 0.5 ms .. 30 s, 15 for +Inf. */
 int metrics_bucket_for(double seconds);

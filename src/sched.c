@@ -38,82 +38,149 @@
 #include <stdlib.h>
 
 typedef struct helper {
-    pthread_t th;
+    _Alignas(64) pthread_t th;
     pthread_cond_t cv;
     bool wake;
     struct helper *next_idle;
     struct sched *s;
 } helper;
+_Static_assert(sizeof(helper) % 64 == 0, "helper must fill whole cache lines");
 
 struct sched {
-    pthread_mutex_t m;
+    /* read-only after sched_new() */
     helper *h;
     int nh;
+    int request_threads;
+
+    /* lock-protected scheduler state */
+    _Alignas(64) pthread_mutex_t m;
     helper *idle; /* a stack: the most recently idle helper is the warmest */
     int nidle;
     sgroup *groups; /* groups with open or running jobs */
     int ngroups;
     uint64_t seq;
-    atomic_uint_fast64_t gen;
-    atomic_int live; /* outermost groups begun and not ended: requests in flight */
-    int request_threads;
     bool stop;
+
+    /* read by helpers on every sched_leave(); bumped only on contention */
+    _Alignas(64) atomic_uint_fast64_t gen;
+
+    /* updated on every outermost query begin/end */
+    _Alignas(64) atomic_int live; /* outermost groups begun and not ended: requests in flight */
 };
+_Static_assert(sizeof(struct sched) % 64 == 0, "sched must fill whole cache lines");
 
 __thread sgroup *cur_group;
 static __thread sjob *cur_job;
 static __thread bool cur_helper; /* a helper of cur_job (not its caller) */
 static __thread bool cur_left;   /* sched_leave told this helper to go */
 static __thread uint64_t seen_gen;
-static __thread bool is_helper_thread;
 
 /* ------------------------------------------------------------ scratch */
 
 #define SCRATCH_SLOTS 4
+#define SCRATCH_KEEP_MAX ((size_t)2 << 20)
 typedef struct scratch {
     void *p[SCRATCH_SLOTS];
     size_t cap[SCRATCH_SLOTS];
+    bool in_use[SCRATCH_SLOTS];
+    void *big_p[SCRATCH_SLOTS];
+    size_t big_sz[SCRATCH_SLOTS];
 } scratch;
+static __thread scratch *scratch_tls;
 static pthread_key_t scratch_key;
+static bool scratch_key_ok;
 static pthread_once_t scratch_once = PTHREAD_ONCE_INIT;
 
 static void scratch_free(void *a)
 {
     scratch *sc = a;
-    for (int i = 0; i < SCRATCH_SLOTS; i++)
+    if (!sc)
+        return;
+    if (scratch_tls == sc)
+        scratch_tls = NULL;
+    for (int i = 0; i < SCRATCH_SLOTS; i++) {
         free(sc->p[i]);
+        if (sc->big_p[i])
+            tsdb_free_big(sc->big_p[i], sc->big_sz[i]);
+    }
     free(sc);
 }
 
-static void scratch_init(void) { pthread_key_create(&scratch_key, scratch_free); }
+static void scratch_init(void)
+{
+    scratch_key_ok = pthread_key_create(&scratch_key, scratch_free) == 0;
+}
+
+static scratch *scratch_alloc(void)
+{
+    pthread_once(&scratch_once, scratch_init);
+    if (!scratch_key_ok)
+        return NULL;
+    scratch *sc = calloc(1, sizeof *sc);
+    if (!sc || pthread_setspecific(scratch_key, sc) != 0) {
+        free(sc);
+        return NULL;
+    }
+    scratch_tls = sc;
+    return sc;
+}
 
 void *qscratch_get(int slot, size_t bytes)
 {
-    if (!is_helper_thread)
-        return malloc(bytes ? bytes : 1);
-    pthread_once(&scratch_once, scratch_init);
-    scratch *sc = pthread_getspecific(scratch_key);
+    if (bytes == 0)
+        bytes = 1;
+    if (slot < 0 || slot >= SCRATCH_SLOTS)
+        return malloc(bytes);
+    scratch *sc = scratch_tls;
     if (!sc) {
-        sc = calloc(1, sizeof *sc);
-        if (!sc || pthread_setspecific(scratch_key, sc) != 0) {
-            free(sc);
-            return NULL;
-        }
+        sc = scratch_alloc();
+        if (!sc)
+            return malloc(bytes);
     }
+    if (bytes > SCRATCH_KEEP_MAX) {
+        /* non-nested callers (agg_worker, twa_worker): a second simultaneous >2 MiB slot falls back to free() */
+        void *p = malloc(bytes);
+        if (p && !sc->big_p[slot]) {
+            sc->big_p[slot] = p;
+            sc->big_sz[slot] = bytes;
+        }
+        return p;
+    }
+    if (sc->in_use[slot])
+        return malloc(bytes);
     if (sc->cap[slot] < bytes) {
-        void *p = realloc(sc->p[slot], bytes);
+        void *p = malloc(bytes);
         if (!p)
             return NULL;
+        free(sc->p[slot]);
         sc->p[slot] = p;
         sc->cap[slot] = bytes;
     }
+    sc->in_use[slot] = true;
     return sc->p[slot];
 }
 
 void qscratch_put(void *p)
 {
-    if (!is_helper_thread)
-        free(p);
+    if (!p)
+        return;
+    scratch *sc = scratch_tls;
+    if (sc) {
+        for (int i = 0; i < SCRATCH_SLOTS; i++) {
+            if (sc->p[i] == p) {
+                sc->in_use[i] = false;
+                return;
+            }
+            if (sc->big_p[i] == p) {
+                size_t sz = sc->big_sz[i];
+                sc->big_p[i] = NULL;
+                sc->big_sz[i] = 0;
+                tsdb_free_big(p, sz);
+                return;
+            }
+        }
+    }
+    free(p);
 }
 
 /* ------------------------------------------------------------ groups */
@@ -210,7 +277,6 @@ static void *helper_main(void *a)
 {
     helper *h = a;
     sched *s = h->s;
-    is_helper_thread = true;
     /* Named for top -H and for tests that count the helpers (test_sched's test_volumes). */
     tsdb_thread_name("tsdb-query");
     pthread_mutex_lock(&s->m);
@@ -430,9 +496,10 @@ int sched_leave(void)
 
 sched *sched_new(int query_threads, int request_threads)
 {
-    sched *s = calloc(1, sizeof *s);
+    sched *s = aligned_alloc(64, sizeof *s);
     if (!s)
         return NULL;
+    memset(s, 0, sizeof *s);
     pthread_mutex_init(&s->m, NULL);
     atomic_init(&s->gen, 0);
     atomic_init(&s->live, 0);
@@ -440,7 +507,9 @@ sched *sched_new(int query_threads, int request_threads)
         query_threads = 1;
     s->request_threads = request_threads > 0 ? MIN(request_threads, query_threads) : query_threads;
     int want = query_threads - 1;
-    s->h = want ? calloc((size_t)want, sizeof *s->h) : NULL;
+    s->h = want ? aligned_alloc(64, (size_t)want * sizeof *s->h) : NULL;
+    if (s->h)
+        memset(s->h, 0, (size_t)want * sizeof *s->h);
     for (int i = 0; s->h && i < want; i++) {
         helper *h = &s->h[s->nh];
         h->s = s;

@@ -603,6 +603,62 @@ static void test_volumes(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* Calling threads reuse cached qscratch buffers (<= 2 MiB), free oversized buffers on put, handle nested
+ * same-slot requests without aliasing, and release TLS buffers cleanly on thread exit (LSan). */
+static void *scratch_thread(void *arg)
+{
+    int iters = *(int *)arg;
+    void *first0 = NULL, *first2 = NULL;
+    for (int i = 0; i < iters; i++) {
+        void *a = qscratch_get(0, 64 * 1024);
+        void *b = qscratch_get(1, 64 * 1024);
+        void *c = qscratch_get(2, 448 * 1024);
+        void *d = qscratch_get(3, 192 * 1024);
+        CHECK(a && b && c && d);
+        CHECK(a != b && a != c && a != d && b != c && b != d && c != d);
+        if (i == 0) {
+            first0 = a;
+            first2 = c;
+        } else {
+            CHECK(a == first0);
+            CHECK(c == first2);
+        }
+        /* defensive nested same-slot get must return a distinct buffer and not clobber the cached one */
+        void *nested = qscratch_get(0, 4096);
+        CHECK(nested && nested != a);
+        memset(nested, 0x5a, 4096);
+        qscratch_put(nested);
+        memset(a, (int)(i & 0xff), 64 * 1024);
+        memset(c, (int)((i + 1) & 0xff), 448 * 1024);
+        qscratch_put(a);
+        qscratch_put(b);
+        qscratch_put(c);
+        qscratch_put(d);
+    }
+    /* oversized (> 2 MiB) buffer is not cached; normal slot remains reusable afterwards */
+    void *big = qscratch_get(2, (3u << 20));
+    CHECK(big && big != first2);
+    memset(big, 0x3c, 4096);
+    qscratch_put(big);
+    void *again = qscratch_get(2, 448 * 1024);
+    CHECK(again == first2);
+    qscratch_put(again);
+    qscratch_put(NULL);
+    return NULL;
+}
+
+static void test_qscratch(void)
+{
+    int iters = 16;
+    /* exercise on main thread (atexit cleanup) and on secondary threads (pthread_key destructor cleanup) */
+    scratch_thread(&iters);
+    pthread_t th[8];
+    for (int i = 0; i < 8; i++)
+        CHECK(pthread_create(&th[i], NULL, scratch_thread, &iters) == 0);
+    for (int i = 0; i < 8; i++)
+        pthread_join(th[i], NULL);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_sched", 1200);
@@ -616,6 +672,7 @@ int main(int argc, char **argv)
     test_tiny();
     test_cancel();
     test_reopen();
+    test_qscratch();
     test_volumes(base);
     printf("test_sched: ok\n");
     return 0;

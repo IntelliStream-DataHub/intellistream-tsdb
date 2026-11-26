@@ -22,6 +22,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <zstd.h>
@@ -2669,6 +2670,190 @@ static void test_metrics_buckets(void)
     CHECK(metrics_bucket_for(30.1) == 15 && metrics_bucket_for(1e9) == 15);
 }
 
+/* Unit test for per-worker TLS metric shards: verifies non-query ops skip clock_gettime, workers_busy is exact
+ * while threads are active, concurrent scrapes stay monotone while ephemeral threads allocate and retire shards,
+ * and exited threads fold their counters cleanly into retired totals without losing counts or leaking under LSan. */
+typedef struct {
+    int iters;
+    pthread_barrier_t *bar_in, *bar_out;
+    int bad;
+} mshard_arg;
+
+static void *mshard_worker(void *arg)
+{
+    mshard_arg *a = arg;
+    /* pause mid-request so the main thread can scrape an exact workers_busy gauge */
+    int64_t b0 = metrics_request_begin(TSDB_OP_INSERT);
+    if (b0 != 0) /* non-query ops must skip clock_gettime */
+        a->bad++;
+    if (a->bar_in)
+        pthread_barrier_wait(a->bar_in);
+    if (a->bar_out)
+        pthread_barrier_wait(a->bar_out);
+    metrics_request_end(TSDB_OP_INSERT, b0);
+
+    for (int i = 0; i < a->iters; i++) {
+        int64_t bi = metrics_request_begin(TSDB_OP_INSERT);
+        if (bi != 0)
+            a->bad++;
+        metrics_rows_inserted(10);
+        metrics_request_end(TSDB_OP_INSERT, bi);
+
+        int64_t bs = metrics_request_begin(TSDB_OP_SERIES);
+        if (bs != 0)
+            a->bad++;
+        metrics_request_end(TSDB_OP_SERIES, bs);
+
+        int64_t bq = metrics_request_begin(TSDB_OP_QUERY_LATEST);
+        if (bq <= 0) /* query ops must timestamp for the latency histogram */
+            a->bad++;
+        metrics_request_end(TSDB_OP_QUERY_LATEST, bq);
+
+        metrics_error(TSDB_ERR_NOTFOUND);
+        metrics_login(METRICS_LOGIN_OK);
+        metrics_multi_series(3);
+        metrics_multi_deferred();
+    }
+    return NULL;
+}
+
+typedef struct {
+    int waves, nw, iters;
+    atomic_bool done;
+    int bad;
+} mshard_churn_arg;
+
+static void *mshard_churn_main(void *arg)
+{
+    mshard_churn_arg *c = arg;
+    pthread_t th[16];
+    mshard_arg wa[16];
+    bool created[16];
+    for (int w = 0; w < c->waves; w++) {
+        for (int i = 0; i < c->nw; i++) {
+            wa[i] = (mshard_arg){.iters = c->iters, .bar_in = NULL, .bar_out = NULL, .bad = 0};
+            created[i] = pthread_create(&th[i], NULL, mshard_worker, &wa[i]) == 0;
+            if (!created[i])
+                c->bad++;
+        }
+        for (int i = 0; i < c->nw; i++) {
+            if (created[i]) {
+                pthread_join(th[i], NULL);
+                c->bad += wa[i].bad;
+            }
+        }
+    }
+    atomic_store_explicit(&c->done, true, memory_order_release);
+    return NULL;
+}
+
+static size_t mshard_workers_cb(void) { return 8; }
+
+static void test_metrics_shards(const char *dir)
+{
+    char sdir[600], cmd[700];
+    snprintf(sdir, sizeof sdir, "%s.mshards", dir);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", sdir);
+    CHECK(system(cmd) == 0);
+
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.stats = -1;
+    tsdb *ldb = NULL;
+    OK(tsdb_open(sdir, &o, &ldb));
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(lfd >= 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = 0};
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0);
+    socklen_t sl = sizeof sa;
+    CHECK(getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    CHECK(listen(lfd, 16) == 0);
+
+    metrics_enable();
+    metrics_cfg mc = {.db = ldb, .listen_fd = lfd, .io = "epoll", .role = "writer", .max_conns = 100,
+                      .workers = mshard_workers_cb};
+    CHECK(metrics_start(&mc) == 0);
+    int saved_mport = mport;
+    mport = ntohs(sa.sin_port);
+
+    enum { NW = 8, ITERS = 500, CHURN_WAVES = 6, CHURN_NW = 4, CHURN_ITERS = 200 };
+    pthread_barrier_t bar_in, bar_out;
+    pthread_barrier_init(&bar_in, NULL, NW + 1);
+    pthread_barrier_init(&bar_out, NULL, NW + 1);
+    mshard_arg wa[NW];
+    pthread_t th[NW];
+    for (int i = 0; i < NW; i++) {
+        wa[i] = (mshard_arg){.iters = ITERS, .bar_in = &bar_in, .bar_out = &bar_out, .bad = 0};
+        CHECK(pthread_create(&th[i], NULL, mshard_worker, &wa[i]) == 0);
+    }
+
+    pthread_barrier_wait(&bar_in);
+    mset mid;
+    CHECK(scrape(&mid));
+    CHECK(mval(&mid, "tsdb_workers_busy", NULL) == NW);
+    mset_free(&mid);
+    pthread_barrier_wait(&bar_out);
+    for (int i = 0; i < NW; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(wa[i].bad == 0);
+    }
+    pthread_barrier_destroy(&bar_in);
+    pthread_barrier_destroy(&bar_out);
+
+    /* Concurrent scraping while ephemeral waves allocate shards, update counters, and exit through shard_dtor. */
+    mshard_churn_arg ca = {.waves = CHURN_WAVES, .nw = CHURN_NW, .iters = CHURN_ITERS, .bad = 0};
+    atomic_init(&ca.done, false);
+    pthread_t spawner;
+    CHECK(pthread_create(&spawner, NULL, mshard_churn_main, &ca) == 0);
+    mset prev;
+    CHECK(scrape(&prev));
+    int live_scrapes = 0;
+    do {
+        mset cur;
+        if (scrape(&cur)) {
+            check_monotone(&prev, &cur);
+            double wb = mval(&cur, "tsdb_workers_busy", NULL);
+            CHECK(wb >= 0 && wb <= CHURN_NW);
+            mset_free(&prev);
+            prev = cur;
+            live_scrapes++;
+        }
+    } while (!atomic_load_explicit(&ca.done, memory_order_acquire));
+    mset_free(&prev);
+    pthread_join(spawner, NULL);
+    CHECK(ca.bad == 0);
+    CHECK(live_scrapes >= 1);
+
+    /* Exercise main-thread shard allocation so shard_atexit() runs cleanly on process exit (LSan). */
+    int64_t bm = metrics_request_begin(TSDB_OP_INSERT);
+    CHECK(bm == 0);
+    metrics_rows_inserted(7);
+    metrics_request_end(TSDB_OP_INSERT, bm);
+
+    mset fin;
+    CHECK(scrape(&fin));
+    double total_threads = (double)(NW + CHURN_WAVES * CHURN_NW);
+    double total_iters = (double)(NW * ITERS + CHURN_WAVES * CHURN_NW * CHURN_ITERS);
+    CHECK(mval(&fin, "tsdb_workers_busy", NULL) == 0);
+    CHECK(mval(&fin, "tsdb_requests_total", "op=\"insert\"") == total_iters + total_threads + 1);
+    CHECK(mval(&fin, "tsdb_requests_total", "op=\"series\"") == total_iters);
+    CHECK(mval(&fin, "tsdb_requests_total", "op=\"query_latest\"") == total_iters);
+    CHECK(mval(&fin, "tsdb_query_duration_seconds_count", "op=\"query_latest\"") == total_iters);
+    CHECK(mval(&fin, "tsdb_query_duration_seconds_sum", "op=\"query_latest\"") >= 0);
+    CHECK(mval(&fin, "tsdb_inserted_rows_total", NULL) == total_iters * 10 + 7);
+    CHECK(mval(&fin, "tsdb_request_errors_total", "code=\"notfound\"") == total_iters);
+    CHECK(mval(&fin, "tsdb_logins_total", "result=\"ok\"") == total_iters);
+    CHECK(mval(&fin, "tsdb_multi_series_total", NULL) == total_iters * 3);
+    CHECK(mval(&fin, "tsdb_multi_deferred_total", NULL) == total_iters);
+    mset_free(&fin);
+
+    mport = saved_mport;
+    metrics_stop();
+    OK(tsdb_close(ldb));
+    CHECK(system(cmd) == 0);
+}
+
 /* A query that fails after earlier frames (r8f-final3: an .ec granule whose stores went away, after 32768 rows): the
  * error's frame carried the rows still gathered and the UNAVAILABLE body after them, which the C client took as
  * corrupt (TSDB_ERR_CORRUPT, the connection broken). TSDBD_TEST_QUERY_STATUS ends a whole answer with that status. */
@@ -2727,6 +2912,7 @@ static void test_error_after_rows(const char *dir)
 static void test_metrics(const char *dir)
 {
     test_metrics_buckets();
+    test_metrics_shards(dir);
     char cmd[1200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0) {

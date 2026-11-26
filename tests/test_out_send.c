@@ -115,7 +115,7 @@ static void out_wait_deadline(void)
     pthread_mutex_init(&c->lock, NULL);
     conn_cv_init(&c->cv);
     send_timeout_s = 2;
-    base_workers = running_workers = 8; /* worker_waits must not start an extra worker */
+    workq.base_workers = workq.running_workers = 8; /* worker_waits must not start an extra worker */
     dom.ndoms = 1;
     atomic_store(&dom.vol[1].dom, 0);
     atomic_store(&dom.nonup[0], true);
@@ -194,7 +194,7 @@ int main(void)
     CHECK(!c->tx_worker);
     CHECK(c->tx_loop);
     CHECK(c->notified);
-    CHECK(atomic_load(&note_top) == &c->n_out && atomic_load(&c->out_queued));
+    CHECK(atomic_load(&note_stack.top) == &c->n_out && atomic_load(&c->out_queued));
 
     /* The socket has room again, but the loop owns the output: the next reply is appended, not sent. */
     v = (struct iovec){data + BIG, MORE};
@@ -233,7 +233,7 @@ int main(void)
      * next series (one connection lost 28% of its windows/s when the worker sent each batch itself): nothing leaves
      * from the worker's thread, though the socket has room. A smaller batch costs less to send than a wakeup of the
      * loop: the worker sends that. */
-    atomic_store(&note_top, NULL);
+    atomic_store(&note_stack.top, NULL);
     atomic_store(&c->out_queued, false);
     c->streaming = true;
     atomic_store(&streaming_conns, 1);
@@ -246,13 +246,13 @@ int main(void)
     CHECK(drain(sv[1], got, BIG + MORE + SMALL) == 0);
     CHECK(c->out.len == HANDOFF_MIN && memcmp(c->out.p, data, HANDOFF_MIN) == 0);
     CHECK(c->tx_loop && !c->tx_worker && c->notified);
-    CHECK(atomic_load(&note_top) == &c->n_out && atomic_load(&c->out_queued));
+    CHECK(atomic_load(&note_stack.top) == &c->n_out && atomic_load(&c->out_queued));
     /* the loop sent it (here: dropped) and drained the output */
     pthread_mutex_lock(&c->lock);
     c->out.len = 0;
     c->tx_loop = c->notified = false;
     pthread_mutex_unlock(&c->lock);
-    atomic_store(&note_top, NULL);
+    atomic_store(&note_stack.top, NULL);
     atomic_store(&c->out_queued, false);
     /* With a second connection streaming, one loop thread would send for all of them: the worker sends again. */
     atomic_store(&streaming_conns, 2);
@@ -267,10 +267,10 @@ int main(void)
     CHECK(out_put(c, &v, 1));
     CHECK(c->out.len == 0 && !c->tx_loop && !c->tx_worker && !c->notified);
     CHECK(drain(sv[1], got, BIG + MORE + SMALL) == SMALL && memcmp(got, data + 2 * SMALL, SMALL) == 0);
-    CHECK(atomic_load(&note_top) == NULL);
+    CHECK(atomic_load(&note_stack.top) == NULL);
     atomic_store(&streaming_conns, 0);
 
-    atomic_store(&note_top, NULL);
+    atomic_store(&note_stack.top, NULL);
     free(c->out.p);
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cv);
