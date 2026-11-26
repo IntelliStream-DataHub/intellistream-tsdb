@@ -2643,16 +2643,20 @@ static iso_err hard_current(raft_log *l, raft_hard_state *cur, bool *any, char *
 	memset(cur, 0, sizeof *cur);
 	*any = false;
 	if (l->hard_fd < 0) {
-		l->hard_fd = openat(l->dirfd, "hard", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-		if (l->hard_fd < 0) {
+		int fd = openat(l->dirfd, "hard", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+		if (fd < 0) {
 			iso_err rc = io_err(err, errsize, "opening", "hard");
 			return rc != ISO_OK ? rc : ISO_ERR_IO; /* whatever errno said */
 		}
 		struct stat hst;
-		if (fstat(l->hard_fd, &hst) == 0 && S_ISREG(hst.st_mode) && (hst.st_mode & 077)) {
-			if (fchmod(l->hard_fd, 0600) != 0)
-				return io_err(err, errsize, "setting permissions on", "hard");
+		if (fstat(fd, &hst) == 0 && S_ISREG(hst.st_mode) && (hst.st_mode & 077)) {
+			if (fchmod(fd, 0600) != 0) {
+				iso_err prc = io_err(err, errsize, "setting permissions on", "hard");
+				close(fd);
+				return prc;
+			}
 		}
+		l->hard_fd = fd;
 	}
 	uint64_t seq = 0;
 	iso_err rc = hard_read(l->hard_fd, hard_base(l), in_region(l) ? log_name(l) : "raft/hard",

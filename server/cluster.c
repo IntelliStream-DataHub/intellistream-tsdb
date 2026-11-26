@@ -4538,6 +4538,7 @@ static void *copy_probe_main(void *arg)
         const struct cluster_copy *c = cluster_copy_get();
         struct buf b = {0};
         char line[600];
+        line[0] = '\0';
         snprintf(line, sizeof line, "caught %d applied %" PRIu64 "\n", cluster_copy_caught_up_at(c),
                  c ? c->applied : 0);
         put(&b, line, strlen(line));
@@ -4545,6 +4546,7 @@ static void *copy_probe_main(void *arg)
             const struct cluster_copy_vol *v = &c->volumes[i];
             if (v->redundancy != META_RED_EC)
                 continue;
+            line[0] = '\0';
             int r = snprintf(line, sizeof line, "vol %s k %u m %u stripe_version %" PRIu64 " gc %u stripe", v->name,
                              v->ec_k, v->ec_m, v->stripe_version, v->gc_suspended);
             size_t n = r > 0 ? ((size_t)r < sizeof line ? (size_t)r : sizeof line - 1) : 0;
@@ -7219,14 +7221,19 @@ int cluster_start(const struct cluster_cfg *cfg)
         close(dfd);
         const char *const files[] = {C.identfile, C.nodefile, C.snapfile, C.pendfile, C.copyfile, C.retiredfile};
         for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
-            int fd = open(files[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            int fd = open(files[i], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
             if (fd < 0) {
                 if (errno == ENOENT)
                     continue;
                 fprintf(stderr, "tsdbd: cluster: cannot open %s: %s\n", files[i], strerror(errno));
                 return -1;
             }
-            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 077)) {
+            if (fstat(fd, &st) != 0) {
+                fprintf(stderr, "tsdbd: cluster: cannot stat %s: %s\n", files[i], strerror(errno));
+                close(fd);
+                return -1;
+            }
+            if (S_ISREG(st.st_mode) && (st.st_mode & 077)) {
                 if (fchmod(fd, 0600) != 0) {
                     fprintf(stderr, "tsdbd: cluster: %s has mode %03o (readable by others) and cannot be set to 0600: "
                                     "%s\n",

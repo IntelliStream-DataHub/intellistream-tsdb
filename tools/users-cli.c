@@ -378,8 +378,8 @@ int user_main(const char *dir, int argc, char **argv)
         } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
             char *end;
             iterations = strtol(argv[++i], &end, 10);
-            if (*end || iterations < ITER_MIN || iterations > 100000000) {
-                fprintf(stderr, "tsdb: --iterations: %d to 100000000\n", ITER_MIN);
+            if (*end || iterations < ITER_MIN || iterations > (long)ITER_MAX) {
+                fprintf(stderr, "tsdb: --iterations: %d to %u\n", ITER_MIN, ITER_MAX);
                 return 2;
             }
         } else if (strncmp(argv[i], "--password", 10) == 0 && strcmp(argv[i], "--password-file") != 0) {

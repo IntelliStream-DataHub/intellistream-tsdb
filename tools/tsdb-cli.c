@@ -797,12 +797,24 @@ static void drop_root(const char *dir)
             exit(1);
         }
         char *s = strrchr(p, '/');
-        if (!s)
+        if (!s) {
             snprintf(p, sizeof p, ".");
-        else if (s == p)
-            p[1] = '\0';
-        else
-            *s = '\0';
+        } else {
+            while (s > p && s[-1] == '/')
+                s--;
+            if (s == p)
+                p[1] = '\0';
+            else
+                *s = '\0';
+        }
+    }
+    if (st.st_uid == 0 && S_ISLNK(st.st_mode)) {
+        struct stat tst;
+        if (stat(p, &tst) != 0) {
+            fprintf(stderr, "tsdb: %s: %s\n", p, strerror(errno));
+            exit(1);
+        }
+        st = tst;
     }
     if (st.st_uid == 0)
         return;

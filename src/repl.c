@@ -1362,6 +1362,7 @@ unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap)
 {
     if (!cap)
         return 0;
+    buf[0] = '\0';
     size_t pos = 0;
     int k = snprintf(buf, cap, "epoch %llu leader %d leading %d fstate %d written %llu durable %llu applied %llu "
                      "commit %llu verified %llu now %llu lastq %llu failed %d", (unsigned long long)r->epoch, r->leader,

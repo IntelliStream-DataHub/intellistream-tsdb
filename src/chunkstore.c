@@ -275,12 +275,14 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
         return TSDB_ERR_IO;
     }
     int dirfd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    free(pcopy);
-    if (dirfd < 0)
+    if (dirfd < 0) {
+        free(pcopy);
         return TSDB_ERR_IO;
+    }
     int rc = 0;
     if (faccessat(dirfd, "META", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
         close(dirfd);
+        free(pcopy);
         return TSDB_ERR_INVALID; /* already a store: its id is not replaced */
     }
     uint8_t sid[16];
@@ -309,7 +311,8 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
         rc = TSDB_ERR_IO;
     close(dirfd);
     if (rc == 0 && made)
-        rc = sync_dir_path_parent(path);
+        rc = sync_dir_path_parent(p);
+    free(pcopy);
     if (rc == 0 && id_out)
         memcpy(id_out, sid, 16);
     return rc;
