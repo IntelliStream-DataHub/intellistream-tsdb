@@ -119,7 +119,7 @@ What remains on the road to 1.0. The format and the protocol freeze at 1.0, so w
    (docs/tasks/pre-1.0-v8-parts.md), and anything from field use that changes the format or the protocol, and the
    VALUE_PROPOSITION.md above.
 
-After 1.0: failover with one writer per volume, then the rows of the next table.
+After 1.0: the rows of the next table.
 
 ## After the first release
 

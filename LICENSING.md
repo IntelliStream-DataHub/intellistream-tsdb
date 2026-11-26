@@ -48,7 +48,7 @@ a `#!` line), and in the `license` field of its manifest.
 
 ## What changes for you, and what does not
 
-The releases 0.9.0, 0.9.1 and 0.10.0 were published under Apache-2.0 and stay so: the code of those releases may be
+The releases 0.9.0, 0.9.1, 0.10.0 and 0.10.1 were published under Apache-2.0 and stay so: the code of those releases may be
 used under the Apache License forever. The AGPL applies to the work from 0.11.0 on (and to later changes, which are
 not available under Apache-2.0).
 
