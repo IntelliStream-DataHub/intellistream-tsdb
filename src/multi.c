@@ -70,7 +70,8 @@ typedef struct mcall {
     size_t W;
     size_t head, next; /* next: the first series nobody claimed */
     size_t held, max_held;
-    bool headonly, stop;
+    size_t headonly_at; /* when headonly was set with held == 0: retry lookahead once head reaches this */
+    bool headonly, stop, starved, waiting;
     uint64_t rows_sent, max_rows; /* the conductor's */
     int bounds_rc; /* q's bounds checked once for the call (bounds_check), not by each series' query */
     sjob job;
@@ -391,10 +392,15 @@ static void run_ahead(mcall *c, size_t i)
         sl->state = S_DONE;
     } else {
         sl->state = S_DEFERRED;
-        if (refused)
-            c->headonly = true; /* the memory for results ahead is gone: one series at a time */
+        if (refused) {
+            /* Pause lookahead until held memory drains back under half of max_held (or after W series when an
+             * external budget refused while held was already 0), then resume parallel lookahead. */
+            c->headonly = true;
+            c->headonly_at = c->held > 0 ? SIZE_MAX : c->head + c->W;
+        }
     }
-    pthread_cond_broadcast(&c->cv);
+    if (c->waiting && i == c->head)
+        pthread_cond_signal(&c->cv);
     pthread_mutex_unlock(&c->m);
     if (!ok && mo && mo->on_deferred)
         mo->on_deferred(mo->hook_ctx);
@@ -415,14 +421,17 @@ static void task_fn(void *arg, int id)
     cur_cuts = c->cuts;
     pthread_mutex_lock(&c->m);
     size_t i;
+    int lv = 0;
     while (claim_ahead(c, &i)) {
         pthread_mutex_unlock(&c->m);
         run_ahead(c, i);
-        int lv = sched_leave(); /* another request may need this helper, or the call was stopped */
+        lv = sched_leave(); /* another request may need this helper, or the call was stopped */
         pthread_mutex_lock(&c->m);
         if (lv)
             break;
     }
+    if (!lv && !c->stop)
+        c->starved = true;
     pthread_mutex_unlock(&c->m);
     cur_qstats = saved_qs;
     cur_cuts = saved_cuts;
@@ -432,19 +441,31 @@ static void slot_release(mcall *c, mslot *sl)
 {
     const tsdb_multi_opts *mo = c->mo;
     c->held -= sl->r.bytes;
+    if (c->headonly && c->headonly_at == SIZE_MAX && c->held <= c->max_held / 2) {
+        c->headonly = false;
+        c->starved = true;
+    }
     if (sl->r.charged)
         mo->budget_give(mo->hook_ctx, sl->r.bytes);
     mres_free(&sl->r);
     sl->state = S_FREE;
 }
 
-static void reopen(mcall *c)
+/* Under c->m: advance head, recover from headonly if memory drained (or cooldown passed), and report whether helpers
+ * stopped claiming and should be reopened. */
+static bool advance_head(mcall *c, int rc)
 {
-    pthread_mutex_lock(&c->m);
-    bool more = !c->stop && !c->headonly && c->next < c->n && c->next < c->head + c->W && c->held < c->max_held;
-    pthread_mutex_unlock(&c->m);
-    if (more)
-        sched_reopen(&c->job);
+    c->head++;
+    if (c->headonly && c->head >= c->headonly_at && c->held <= c->max_held / 2) {
+        c->headonly = false;
+        c->starved = true;
+    }
+    if (!rc && c->starved && !c->stop && !c->headonly && c->next < c->n && c->next < c->head + c->W &&
+        c->held < c->max_held) {
+        c->starved = false;
+        return true;
+    }
+    return false;
 }
 
 static int conduct(mcall *c)
@@ -463,6 +484,7 @@ static int conduct(mcall *c)
         }
         size_t h = c->head;
         mslot *sl = &c->slots[h % c->W];
+        bool need_reopen = false;
         if (sl->state == S_FREE || sl->state == S_DEFERRED) {
             if (sl->state == S_FREE && c->next == h)
                 c->next++; /* nobody claimed it: head == next (but series 0, which the caller claimed at the start) */
@@ -471,7 +493,7 @@ static int conduct(mcall *c)
             rc = run_head(c, h);
             pthread_mutex_lock(&c->m);
             sl->state = S_FREE;
-            c->head++;
+            need_reopen = advance_head(c, rc);
             pthread_mutex_unlock(&c->m);
         } else if (sl->state == S_DONE) {
             mres r = sl->r;
@@ -479,7 +501,7 @@ static int conduct(mcall *c)
             rc = deliver(c, h, &r);
             pthread_mutex_lock(&c->m);
             slot_release(c, sl);
-            c->head++;
+            need_reopen = advance_head(c, rc);
             pthread_mutex_unlock(&c->m);
         } else {
             size_t i;
@@ -492,8 +514,10 @@ static int conduct(mcall *c)
             if (mo && mo->on_wait)
                 mo->on_wait(mo->hook_ctx, 1);
             pthread_mutex_lock(&c->m);
+            c->waiting = true;
             while (sl->state == S_RUNNING)
                 pthread_cond_wait(&c->cv, &c->m);
+            c->waiting = false;
             pthread_mutex_unlock(&c->m);
             if (mo && mo->on_wait)
                 mo->on_wait(mo->hook_ctx, -1);
@@ -501,7 +525,8 @@ static int conduct(mcall *c)
         }
         if (rc)
             break;
-        reopen(c);
+        if (need_reopen)
+            sched_reopen(&c->job);
     }
     return rc;
 }

@@ -1669,6 +1669,7 @@ uint64_t replica_replay_start(struct eng *db);
 uint64_t replica_kept_seq(struct eng *db);
 /* tests: the records a replica's applier applied since its open (the open's replay included) */
 uint64_t replica_test_napplied(struct eng *db);
+uint64_t replica_test_apply_reads(struct eng *db); /* tests: pread() calls made by replica_apply since open */
 uint64_t replica_test_open_first(struct eng *db); /* tests: the first position the open's cursor read */
 bool replica_test_mu_free(struct eng *db); /* tests: rp->mu is not held (by this thread or another) */
 /* Waits until the commit point is >= pos: 0; TSDB_ERR_INDETERMINATE once the leader is deposed or the engine failed

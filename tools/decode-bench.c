@@ -9,13 +9,12 @@
  * interleaved in every round:
  *   loops   bitpack.h's portable loops (unpack_fn): one 8-byte load, shift and mask per value
  *   kernel  unpack(): what this build uses (the AVX2 shuffle kernel where bitpack.h compiles it in)
- *   avx2    the shuffle kernel itself, where compiled in (v3 build, or -DTSDB_UNPACK_AVX2)
+ *   avx2    the shuffle kernel itself, where compiled in (any AVX2 build: v3, v4, or -march=native on AVX2/AVX-512)
  *   pdep    BMI2 PDEP, widths up to 16 (the alternative tried and not used; fast on Intel since Haswell and on AMD
  *           since Zen 3, microcoded before), where this build has BMI2
  * codecs: int_bp decode and the float64 decimal encode and decode of one granule of 8192 values, at the CPU level
  * in use (TSDB_CPU=v2|v3|v4 in a build with CPU_LEVELS).
- * The unpack variants are compiled into this tool with the flags of the build (-march=native by default): build
- * with the CPU's own flags, and with -DTSDB_UNPACK_AVX2 to see the shuffle kernel on an AVX-512 CPU.
+ * The unpack variants are compiled into this tool with the flags of the build (-march=native by default).
  */
 #include "../src/internal.h"
 #include "common.h"

@@ -651,6 +651,37 @@ static void multi_cut_holds_volume(void)
     tsdb_close(db);
 }
 
+/* Bonus P-05 regression: tsdb_series_stats routes with route_meta (mrefs) and must release with EREFM, never EREF
+ * (which underflowed refs and leaked mrefs, breaking/hanging a subsequent tsdb_volume_reopen). */
+static void series_stats_reopen(void)
+{
+    char root[1024], vol[1024];
+    snprintf(root, sizeof root, "%s/sstats_root", scratch);
+    snprintf(vol, sizeof vol, "%s/sstats_vol", scratch);
+    sh("rm -rf '%s' '%s'", root, vol);
+    tsdb_sid s[2];
+    tsdb *db = reval_open(root, vol, &s[0], "sstats_s0");
+    OK(tsdb_series_at(db, "sstats_s1", vol, &s[1]));
+    CHECK(TSDB_SID_VOLUME(s[0]) == 1 && TSDB_SID_VOLUME(s[1]) == 1 && s[0] != s[1]);
+    int64_t ts[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    float v[10] = {0};
+    OK(tsdb_insert_series(db, s[0], ts, v, 10));
+    OK(tsdb_insert_series(db, s[1], ts, v, 10));
+    tsdb_series_stat st[2];
+    size_t done = 0;
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
+    /* Quiesce, inspect again while quiesced (must not touch refs), then reopen (would fail INVALID or hang on mrefs). */
+    stop_volume(db);
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
+    OK(tsdb_volume_reopen(db, 1, NULL));
+    OK(tsdb_volume_resume(db, 1));
+    OK(tsdb_series_stats(db, s, 2, 0, st, &done));
+    CHECK(done == 2 && st[0].status == 0 && st[0].rows == 10 && st[1].status == 0 && st[1].rows == 10);
+    tsdb_close(db);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_recover", 1200);
@@ -737,6 +768,7 @@ int main(int argc, char **argv)
     names_not_kept();
     lookups_do_not_starve_idle();
     multi_cut_holds_volume();
+    series_stats_reopen();
     scratch_done(failures);
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);

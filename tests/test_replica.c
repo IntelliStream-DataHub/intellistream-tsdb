@@ -8114,6 +8114,146 @@ static void case_power_leader_kept(void)
            "told is never above what its directory replays as a replica\n", crashes);
 }
 
+/* P-02 regression: replica_apply reuses its RP_CHUNK read buffer across consecutive small WAL records instead of
+ * issuing a 1 MiB pread() per record, and invalidates the buffer cleanly across segment switches and replica_cut(). */
+static void case_apply_buffered(void)
+{
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/apply_buffered", S);
+    sh("rm -rf '%s'", dir);
+    mkseries(dir);
+
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.create_volumes = 0;
+    o.wal_sync_ms = 0;
+    o.fsync = 0;
+    o.buffer_rows = 1000000;
+    eng *db = NULL;
+    CHECK_EQ(eng_open_replica(dir, &o, 0, &db), 0);
+    if (!db)
+        return;
+
+    const size_t N1 = 25000, N2 = 5000; /* 25,000 * 52 B = 1.3 MiB (> 1 MiB RP_CHUNK) + segment roll + 5,000 */
+    const size_t rsz = WAL_HDR + WAL_ROW;
+    uint8_t *b1 = calloc(N1, rsz);
+    uint8_t *b2 = calloc(N2, rsz);
+    CHECK(b1 && b2);
+    uint64_t fno = 1;
+    uint64_t off = 0;
+    for (size_t i = 0; i < N1; i++, fno++) {
+        uint8_t *r = b1 + i * rsz;
+        uint32_t w = 1u | ((uint32_t)WAL_KIND_ROWS << 28);
+        int64_t cms = T0 + (int64_t)fno;
+        uint32_t id = 0;
+        int64_t ts = T0 + (int64_t)i * 1000;
+        float fv = (float)(i + 1);
+        uint64_t slot = 0;
+        memcpy(&slot, &fv, 4);
+        memcpy(r, &w, 4);
+        memcpy(r + 16, &fno, 8);
+        memcpy(r + 24, &cms, 8);
+        memcpy(r + WAL_HDR, &id, 4);
+        memcpy(r + WAL_HDR + 4, &ts, 8);
+        memcpy(r + WAL_HDR + 12, &slot, 8);
+        wal_reseal(r, 1, off);
+        off += rsz;
+    }
+    CHECK_EQ(replica_append(db, 1, 0, b1, N1 * rsz), 0);
+    off = 0;
+    for (size_t i = 0; i < N2; i++, fno++) {
+        uint8_t *r = b2 + i * rsz;
+        uint32_t w = 1u | ((uint32_t)WAL_KIND_ROWS << 28);
+        int64_t cms = T0 + (int64_t)fno;
+        uint32_t id = 0;
+        int64_t ts = T0 + (int64_t)(N1 + i) * 1000;
+        float fv = (float)(N1 + i + 1);
+        uint64_t slot = 0;
+        memcpy(&slot, &fv, 4);
+        memcpy(r, &w, 4);
+        memcpy(r + 16, &fno, 8);
+        memcpy(r + 24, &cms, 8);
+        memcpy(r + WAL_HDR, &id, 4);
+        memcpy(r + WAL_HDR + 4, &ts, 8);
+        memcpy(r + WAL_HDR + 12, &slot, 8);
+        wal_reseal(r, 2, off);
+        off += rsz;
+    }
+    CHECK_EQ(replica_append(db, 2, 0, b2, N2 * rsz), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    uint64_t r0 = replica_test_apply_reads(db);
+    CHECK_EQ(replica_apply(db, N1 + N2), 0);
+    uint64_t reads = replica_test_apply_reads(db) - r0;
+    CHECK_EQ(replica_test_napplied(db), (uint64_t)(N1 + N2));
+    CHECK(reads <= 10); /* 1.3 MiB -> 2 chunks, 260 KiB -> 1 chunk (3 preads vs 30,000 before fix) */
+    free(b1);
+    free(b2);
+
+    /* Cut inside the currently buffered segment: buffered bytes above the cut must never be reused. */
+    const size_t N3 = 100;
+    uint8_t *b3 = calloc(N3, rsz);
+    CHECK(b3 != NULL);
+    uint64_t fno_base = fno;
+    uint64_t off_base = off;
+    for (size_t i = 0; i < N3; i++) {
+        uint8_t *r = b3 + i * rsz;
+        uint32_t w = 1u | ((uint32_t)WAL_KIND_ROWS << 28);
+        uint64_t fn = fno_base + i;
+        int64_t cms = T0 + (int64_t)fn;
+        uint32_t id = 1;
+        int64_t ts = T0 + (int64_t)i * 1000;
+        float fv = (float)(1000 + i);
+        uint64_t slot = 0;
+        memcpy(&slot, &fv, 4);
+        memcpy(r, &w, 4);
+        memcpy(r + 16, &fn, 8);
+        memcpy(r + 24, &cms, 8);
+        memcpy(r + WAL_HDR, &id, 4);
+        memcpy(r + WAL_HDR + 4, &ts, 8);
+        memcpy(r + WAL_HDR + 12, &slot, 8);
+        wal_reseal(r, 2, off_base + i * rsz);
+    }
+    CHECK_EQ(replica_append(db, 2, off_base, b3, N3 * rsz), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    /* Apply only the first 10 of N3: rbuf now holds all 100 records in memory. */
+    CHECK_EQ(replica_apply(db, fno_base + 9), 0);
+    CHECK_EQ(replica_cut(db, fno_base + 9), 0);
+    /* Rewrite records 10..99 with distinct values (2000 + i) at the same segment offsets. */
+    for (size_t i = 10; i < N3; i++) {
+        uint8_t *r = b3 + i * rsz;
+        uint32_t w = 1u | ((uint32_t)WAL_KIND_ROWS << 28);
+        uint64_t fn = fno_base + i;
+        int64_t cms = T0 + (int64_t)fn;
+        uint32_t id = 1;
+        int64_t ts = T0 + (int64_t)i * 1000;
+        float fv = (float)(2000 + i);
+        uint64_t slot = 0;
+        memcpy(&slot, &fv, 4);
+        memcpy(r, &w, 4);
+        memcpy(r + 16, &fn, 8);
+        memcpy(r + 24, &cms, 8);
+        memcpy(r + WAL_HDR, &id, 4);
+        memcpy(r + WAL_HDR + 4, &ts, 8);
+        memcpy(r + WAL_HDR + 12, &slot, 8);
+        wal_reseal(r, 2, off_base + i * rsz);
+    }
+    CHECK_EQ(replica_append(db, 2, off_base + 10 * rsz, b3 + 10 * rsz, (N3 - 10) * rsz), 0);
+    CHECK_EQ(replica_sync(db), 0);
+    CHECK_EQ(replica_apply(db, fno_base + N3 - 1), 0);
+    qctx q = {.n = 0};
+    CHECK_EQ(eng_query_raw_ex(db, 1, T0, T0 + (int64_t)N3 * 1000, false, 0, qfn, &q), 0);
+    CHECK_EQ(q.n, N3);
+    for (size_t i = 0; i < N3; i++) {
+        float want = i < 10 ? (float)(1000 + i) : (float)(2000 + i);
+        CHECK(q.v[i] == want);
+    }
+    free(b3);
+    CHECK_EQ(eng_close(db), 0);
+    printf("  apply_buffered: %zu records applied in %" PRIu64 " preads (cut invalidation verified)\n",
+           N1 + N2, reads);
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -8347,6 +8487,7 @@ int main(int argc, char **argv)
         return failures != 0;
     }
     case_basic();
+    case_apply_buffered();
     case_keepcap();
     case_replaykept();
     case_leader_replay();

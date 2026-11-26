@@ -4507,6 +4507,19 @@ static void scen_volumes(void)
     tsdb_sid id = write_read(c, "plant", 1000);
     if (TSDB_SID_VOLUME(id) != 1 || rows_of(c, id) != 3)
         die("the leader: id %" PRIx64 " or the rows read back are wrong", (uint64_t)id);
+    /* P-03: many-series batch on the leader succeeds (cvol_refuse_ids deduplicates volume 1) */
+    {
+        tsdb_sid mids[64];
+        int64_t mts[64];
+        float mval[64];
+        for (int k = 0; k < 64; k++) {
+            mids[k] = id;
+            mts[k] = 10000 + k;
+            mval[k] = (float)(10 + k);
+        }
+        if ((rc = tsdbc_insert(c, mids, mts, mval, 64)) != 0 || rows_of(c, id) != 67)
+            die("many-series insert on leader: %s (rows %" PRIu64 ")", ers(rc), rows_of(c, id));
+    }
     tsdb_sid x;
     if ((rc = tsdbc_series_at(c, "pump7.flow", "nosuch", &x)) != TSDB_ERR_NOTFOUND)
         die("a series in an unknown volume: %s, not NOTFOUND", ers(rc));
@@ -4533,6 +4546,20 @@ static void scen_volumes(void)
         tsdb_values tv = {TSDB_FLOAT32, val2, NULL};
         rc = tsdbc_insert_values(c, ids2, ts2, &tv, 2);
         expect_moved(c, rc, 1, v.leader, L, "a packed typed insert on a replica");
+        /* P-03: interleaved batch (skipped/malformed ids mixed with cluster vol-1 id, and 64-row multi-series batch)
+         * still catches volume 1 after deduplication -> MOVED; spanning vol 0 (local) + vol 1 (remote) -> INVALID. */
+        tsdb_sid mix_ids[8] = {0, 1, id, 0, id, 1, id, id};
+        int64_t mix_ts[8] = {5010, 5011, 5012, 5013, 5014, 5015, 5016, 5017};
+        float mix_v[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        rc = tsdbc_insert(c, mix_ids, mix_ts, mix_v, 8);
+        expect_moved(c, rc, 1, v.leader, L, "interleaved skipped+vol1 insert on a replica");
+        tsdb_values mix_tv = {TSDB_FLOAT32, mix_v, NULL};
+        rc = tsdbc_insert_values(c, mix_ids, mix_ts, &mix_tv, 8);
+        expect_moved(c, rc, 1, v.leader, L, "interleaved skipped+vol1 typed insert on a replica");
+        tsdb_sid span_ids[4] = {TSDB_SID(0, 0), id, TSDB_SID(0, 0), id};
+        rc = tsdbc_insert(c, span_ids, mix_ts, mix_v, 4);
+        if (rc != TSDB_ERR_INVALID)
+            die("spanning vol 0 + vol 1 insert on a replica: %s, want INVALID", ers(rc));
         tsdbc_close(c);
     }
     printf("  the leader takes writes and reads them back, the replicas move them to it (MOVED)\n");
@@ -4559,7 +4586,7 @@ static void scen_volumes(void)
                 gen, rids[i]);
     }
     c = client(L);
-    if (rows_of(c, id) != 3)
+    if (rows_of(c, id) != 67)
         die("the leader lost its rows across a restart");
     tsdbc_close(c);
     printf("  every restart keeps the rid, raises the generation to 2 and the group records it\n");

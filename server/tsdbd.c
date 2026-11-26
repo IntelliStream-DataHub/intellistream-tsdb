@@ -1119,13 +1119,25 @@ static uint64_t lguard_tok(uint16_t vol, const tsdb_sid *ids, size_t n, bool *le
         }
         return tok;
     }
+    uint16_t seen[64];
+    size_t ns = 0;
     uint32_t last = UINT32_MAX;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
         if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
             TSDB_SID_VOLUME(id) == last)
             continue;
-        last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once */
+        last = (uint32_t)TSDB_SID_VOLUME(id);
+        bool dup = false;
+        for (size_t j = 0; j < ns; j++)
+            if (seen[j] == (uint16_t)last) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+        if (ns < sizeof seen / sizeof seen[0])
+            seen[ns++] = (uint16_t)last;
         if (cvol_lead(last, &e)) {
             *led = true;
             tok = lg_mix(tok + lg_mix(((uint64_t)last << 1) | 1) + e);
@@ -2511,14 +2523,29 @@ static int cvol_refuse_ids(const tsdb_sid *ids, size_t n)
 {
     if (!cvol_active())
         return 0;
+    uint16_t seen[64];
+    size_t ns = 0;
+    uint32_t last = UINT32_MAX;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
-        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY)
-            continue; /* the library refuses it */
-        if (cvol_why((uint32_t)TSDB_SID_VOLUME(id)) >= 0) {
-            unav_vol = (uint16_t)TSDB_SID_VOLUME(id);
+        if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
+            TSDB_SID_VOLUME(id) == last)
+            continue; /* the library refuses it, or already checked */
+        last = (uint32_t)TSDB_SID_VOLUME(id);
+        bool dup = false;
+        for (size_t j = 0; j < ns; j++)
+            if (seen[j] == (uint16_t)last) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+        if (cvol_why(last) >= 0) {
+            unav_vol = (uint16_t)last;
             return TSDB_ERR_UNAVAILABLE;
         }
+        if (ns < sizeof seen / sizeof seen[0])
+            seen[ns++] = (uint16_t)last;
     }
     return 0;
 }
@@ -2533,18 +2560,30 @@ static int cvol_lease_refuse_ids(const tsdb_sid *ids, size_t n)
     uint64_t gen = cluster_lease_gen();
     bool lease = cluster_lease_valid(), led = false;
     uint64_t tok = lease && !lguard.on ? lguard_tok(TSDB_VOL_ANY, ids, n, &led) : 0; /* before cvol_why: lguard */
+    uint16_t seen[64];
+    size_t ns = 0;
     uint32_t last = UINT32_MAX;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
         if (id < ((tsdb_sid)1 << 32) || (id >> 48) != 0 || TSDB_SID_VOLUME(id) >= TSDB_VOL_ANY ||
             TSDB_SID_VOLUME(id) == last)
             continue;
-        last = (uint32_t)TSDB_SID_VOLUME(id); /* each run of one volume asked once (cvol_why locks) */
+        last = (uint32_t)TSDB_SID_VOLUME(id); /* each distinct volume asked once (cvol_why locks) */
+        bool dup = false;
+        for (size_t j = 0; j < ns; j++)
+            if (seen[j] == (uint16_t)last) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
         int cw = cvol_why(last);
         if (cw >= 0 && !(cw == TSDB_WHY_FENCED && lease && cvol_replica_reads())) {
             unav_vol = (uint16_t)TSDB_SID_VOLUME(id); /* as in handle() (test_cluster lease, phase b; staleread) */
             return TSDB_ERR_UNAVAILABLE;
         }
+        if (ns < sizeof seen / sizeof seen[0])
+            seen[ns++] = (uint16_t)last;
     }
     if (lease && !lguard.on) {
         lguard = (__typeof__(lguard)){.on = true, .led = led, .gen = gen, .tok = tok, .vol = TSDB_VOL_ANY, .ids = ids,
