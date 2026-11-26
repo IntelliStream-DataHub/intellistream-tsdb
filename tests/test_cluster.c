@@ -19360,8 +19360,10 @@ static void scen_rdma(void)
                     die("server %d: STATUS says %s=%d %s=%d, want rdma >= 2 and tcp == 0", i, kr, nr, kt, nt);
             }
         }
+#ifdef TSDB_TEST_HOOKS
         if (!log_has(i, "rnr_retry=0"))
             die("server %d: log does not confirm TSDB_PLRDMA_TEST rnr_retry=0", i);
+#endif
     }
 
     /* Verify `tsdb cluster status` CLI reports rdma links > 0 and tcp 0. */
@@ -19386,7 +19388,7 @@ static void scen_rdma(void)
     }
 
     /* Verify /metrics on all 3 nodes: rdma > 0, tcp == 0, fallbacks == 0, rnr_retries == 0, qp_errors == 0. */
-    char mbuf[65536];
+    static char mbuf[1 << 20];
     for (int i = 0; i < 3; i++) {
         metrics_get(mports[i], mbuf, sizeof mbuf);
         for (int k = 0; k < 4; k++) {
@@ -19400,16 +19402,15 @@ static void scen_rdma(void)
         /* Every fallback reason counter must be 0. */
         int fb_seen = 0;
         for (const char *p = mbuf; p && *p; ) {
+            const char *eol = strchr(p, '\n');
             static const char fbp[] = "tsdb_peer_rdma_fallbacks_total{";
             if (!strncmp(p, fbp, sizeof fbp - 1)) {
                 fb_seen++;
-                const char *sp = strchr(p, ' ');
+                const char *sp = memchr(p, ' ', eol ? (size_t)(eol - p) : strlen(p));
                 if (!sp || strtoll(sp + 1, NULL, 10) != 0)
                     die("server %d /metrics: non-zero RDMA fallback: %.120s", i, p);
             }
-            p = strchr(p, '\n');
-            if (p)
-                p++;
+            p = eol ? eol + 1 : NULL;
         }
         if (fb_seen == 0)
             die("server %d /metrics: missing tsdb_peer_rdma_fallbacks_total", i);

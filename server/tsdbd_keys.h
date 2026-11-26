@@ -123,7 +123,8 @@ static const struct cfg_key tsdbd_keys[] = {
          "Data link kinds that upgrade to RDMA (comma-separated; the metadata link always stays TCP)."),
     CK_Z("cluster.peer.rdma.pool_mb", "peer-rdma-pool-mb", "MB", "64",
          "Registered memory per tsdbd and RDMA device, shared by its peerlinks (default 64 MiB: 32 KiB slots, 1 MiB "
-         "per connection; needs LimitMEMLOCK above this plus QP and io_uring rings)."),
+         "per connection; pools under 16 MiB use compact slots automatically; needs LimitMEMLOCK above this plus QP "
+         "and io_uring rings)."),
     CK_L("cluster.peer.rdma.sl", "peer-rdma-sl", "0",
          "InfiniBand service level (0 to 15) of RDMA queue pairs: one number for every kind, or KIND=SL entries "
          "(log=1,bulk=2,snap=2)."),

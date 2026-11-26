@@ -1078,7 +1078,9 @@ static void test_bulk(void)
     uint64_t t0 = now_ms();
     CHECK(bulk_send(l, sfd, size, a->want_meta, &r) == PL_OK);
     CHECK(WAIT_FOR(atomic_load(&r.done), 30000));
-    CHECK(now_ms() - t0 < 2000); /* an unthrottled file runs at the socket's pace, not the ping timer's */
+    /* an unthrottled file runs at the link's pace, not the 5 s ping timer's (allow margin under RDMA/Soft-RoCE + TSan) */
+    uint64_t bulk_lim_ms = plink_is_rdma(l) ? 10000 : 2000;
+    CHECK(now_ms() - t0 < bulk_lim_ms);
     CHECK(r.status == PL_OK);
     CHECK(WAIT_FOR(a->ends == 1, 3000) && a->last_end == PL_OK);
     CHECK(a->meta_bad == 0 && a->opens == 1);

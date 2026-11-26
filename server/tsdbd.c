@@ -5604,34 +5604,104 @@ static void on_signal(int sig)
     wake_signal();
 }
 
-static void apply_plrdma_test(struct plr_pool_cfg *pc)
+#ifdef TSDB_TEST_HOOKS
+static int apply_plrdma_test(struct plr_pool_cfg *pc, int verbose)
 {
     const char *env = getenv("TSDB_PLRDMA_TEST");
     if (!env || !*env)
-        return;
-    char buf[256];
-    snprintf(buf, sizeof buf, "%s", env);
-    for (char *sv = NULL, *tok = strtok_r(buf, ",", &sv); tok; tok = strtok_r(NULL, ",", &sv)) {
-        char *eq = strchr(tok, '=');
-        if (!eq)
-            continue;
-        *eq = '\0';
-        unsigned long v = strtoul(eq + 1, NULL, 10);
-        if (!strcmp(tok, "rnr_retry") && v <= 7)
-            pc->rnr_retry = (uint8_t)v;
-        else if (!strcmp(tok, "slot") && v >= 1024 && v <= (16u << 20) && (v % 64) == 0)
-            pc->slot = (uint32_t)v;
-        else if (!strcmp(tok, "data_slots") && v >= 1 && v <= 65535)
-            pc->data_slots = (uint16_t)v;
-        else if (!strcmp(tok, "ctl_slots") && v >= PLR_CTL_MIN && v <= PLR_CTL_MAX)
-            pc->ctl_slots = (uint16_t)v;
-        else if (!strcmp(tok, "send_slots") && v >= 2 && v <= 65535)
-            pc->send_slots = (uint16_t)v;
+        return 0;
+    char *copy = strdup(env);
+    if (!copy) {
+        fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: out of memory\n");
+        return -1;
     }
-    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST=%s (slot=%u data=%u ctl=%u send=%u rnr_retry=%u)\n", env,
-            (unsigned)pc->slot, (unsigned)pc->data_slots, (unsigned)pc->ctl_slots, (unsigned)pc->send_slots,
-            (unsigned)pc->rnr_retry);
+    int rc = 0;
+    for (char *p = copy;;) {
+        char *comma = strchr(p, ',');
+        if (comma)
+            *comma = '\0';
+        char *eq = strchr(p, '=');
+        if (!*p || !eq || eq == p) {
+            fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: malformed token '%s'\n", p);
+            rc = -1;
+            break;
+        }
+        *eq = '\0';
+        const char *key = p;
+        const char *val = eq + 1;
+        if (!strcmp(key, "qperr") || !strcmp(key, "qperr_file")) {
+            /* handled in server/plrdma.c */
+        } else {
+            if (val[0] < '0' || val[0] > '9') {
+                fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: invalid value for '%s': '%s'\n", key, val);
+                rc = -1;
+                break;
+            }
+            errno = 0;
+            char *end = NULL;
+            unsigned long v = strtoul(val, &end, 10);
+            if (errno == ERANGE || !end || *end != '\0') {
+                fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: invalid value for '%s': '%s'\n", key, val);
+                rc = -1;
+                break;
+            }
+            if (!strcmp(key, "rnr_retry")) {
+                if (v > 7) {
+                    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: rnr_retry=%lu out of range (0..7)\n", v);
+                    rc = -1;
+                    break;
+                }
+                pc->rnr_retry = (uint8_t)v;
+            } else if (!strcmp(key, "slot")) {
+                if (v < 1024 || v > (16u << 20) || (v % 64) != 0) {
+                    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: slot=%lu out of range (1024..16777216, multiple of 64)\n",
+                            v);
+                    rc = -1;
+                    break;
+                }
+                pc->slot = (uint32_t)v;
+            } else if (!strcmp(key, "data_slots")) {
+                if (v < 1 || v > 65535) {
+                    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: data_slots=%lu out of range (1..65535)\n", v);
+                    rc = -1;
+                    break;
+                }
+                pc->data_slots = (uint16_t)v;
+            } else if (!strcmp(key, "ctl_slots")) {
+                if (v < PLR_CTL_MIN || v > PLR_CTL_MAX) {
+                    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: ctl_slots=%lu out of range (%u..%u)\n", v,
+                            (unsigned)PLR_CTL_MIN, (unsigned)PLR_CTL_MAX);
+                    rc = -1;
+                    break;
+                }
+                pc->ctl_slots = (uint16_t)v;
+            } else if (!strcmp(key, "send_slots")) {
+                if (v < 2 || v > 65535) {
+                    fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: send_slots=%lu out of range (2..65535)\n", v);
+                    rc = -1;
+                    break;
+                }
+                pc->send_slots = (uint16_t)v;
+            } else {
+                fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST: unknown key '%s'\n", key);
+                rc = -1;
+                break;
+            }
+        }
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+    free(copy);
+    if (rc != 0)
+        return -1;
+    if (verbose)
+        fprintf(stderr, "tsdbd: TSDB_PLRDMA_TEST=%s (slot=%u data=%u ctl=%u send=%u rnr_retry=%u)\n", env,
+                (unsigned)pc->slot, (unsigned)pc->data_slots, (unsigned)pc->ctl_slots, (unsigned)pc->send_slots,
+                (unsigned)pc->rnr_retry);
+    return 0;
 }
+#endif
 
 static void tsdbd_peer_rdma_metrics(metrics_peer_rdma *out)
 {
@@ -6440,6 +6510,11 @@ int main(int argc, char **argv)
     test_lead_now = rmu && !strcmp(rmu, "leadnow");
     if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
         test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
+    {
+        struct plr_pool_cfg pc_chk = PLR_POOL_CFG_DEFAULT;
+        if (apply_plrdma_test(&pc_chk, 0) != 0)
+            return 2;
+    }
 #endif
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len = 0;
@@ -6744,7 +6819,13 @@ int main(int argc, char **argv)
                         pc.ctl_slots = 4;
                         pc.send_slots = 10;
                     }
-                    apply_plrdma_test(&pc);
+#ifdef TSDB_TEST_HOOKS
+                    if (apply_plrdma_test(&pc, 1) != 0) {
+                        for (int j = 0; j < rdma_npools; j++)
+                            plr_pool_close(rdma_pools[j]);
+                        return 2;
+                    }
+#endif
                     struct plr_pool *pool = plr_pool_open(rops, &pc, rerr, sizeof rerr);
                     if (!pool) {
                         if (rdma_mode == PL_RDMA_ON) {

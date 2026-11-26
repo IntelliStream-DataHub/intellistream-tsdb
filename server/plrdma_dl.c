@@ -161,7 +161,7 @@ static int dl_dev_open(const char *dev, int port, struct plr_dev **out, struct p
                 continue;
             static const uint8_t zero_gid[16];
             if (memcmp(gid.raw, zero_gid, 16) == 0 && pa.gid_tbl_len > 1) {
-                int lim = pa.gid_tbl_len < 16 ? pa.gid_tbl_len : 16;
+                int lim = pa.gid_tbl_len < 256 ? pa.gid_tbl_len : 256;
                 for (int g = 1; g < lim; g++) {
                     union ibv_gid cand;
                     if (V.query_gid(ctx, (uint8_t)p, g, &cand) == 0 && memcmp(cand.raw, zero_gid, 16) != 0) {
@@ -170,6 +170,10 @@ static int dl_dev_open(const char *dev, int port, struct plr_dev **out, struct p
                         break;
                     }
                 }
+            }
+            if (!ib && memcmp(gid.raw, zero_gid, 16) == 0) {
+                snprintf(err, errlen, "RDMA: %s port %d has no non-zero GID (assign an IP address)", name, p);
+                continue;
             }
             struct ibv_pd *pd = V.alloc_pd(ctx);
             if (!pd) {

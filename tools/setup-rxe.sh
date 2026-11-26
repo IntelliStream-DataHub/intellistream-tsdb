@@ -30,10 +30,16 @@ while [ $# -gt 0 ]; do
     --teardown) mode=teardown ;;
     --dev)
         [ $# -ge 2 ] || { echo "setup-rxe: --dev needs a name" >&2; exit 2; }
-        dev=$2; shift ;;
+        dev=$2; shift
+        if ! [[ "$dev" =~ ^[a-zA-Z0-9._-]+$ ]] || [ "$dev" = "." ] || [ "$dev" = ".." ]; then
+            echo "setup-rxe: invalid --dev name '$dev'" >&2; exit 2
+        fi ;;
     --netdev)
         [ $# -ge 2 ] || { echo "setup-rxe: --netdev needs an interface" >&2; exit 2; }
-        netdev=$2; shift ;;
+        netdev=$2; shift
+        if ! [[ "$netdev" =~ ^[a-zA-Z0-9._-]+$ ]] || [ "$netdev" = "." ] || [ "$netdev" = ".." ]; then
+            echo "setup-rxe: invalid --netdev name '$netdev'" >&2; exit 2
+        fi ;;
     -h | --help) usage; exit 0 ;;
     *) echo "setup-rxe: unknown option '$1'" >&2; usage >&2; exit 2 ;;
     esac
@@ -59,18 +65,29 @@ do_check() {
     if [ -d /sys/class/infiniband ] && [ -n "$(ls -A /sys/class/infiniband 2>/dev/null)" ]; then
         echo "RDMA devices in /sys/class/infiniband:"
         for d in /sys/class/infiniband/*; do
-            local name st ll
+            [ -e "$d" ] || continue
+            local name p pnum st ll
             name=$(basename "$d")
-            st=$(cat "$d/ports/1/state" 2>/dev/null || echo unknown)
-            ll=$(cat "$d/ports/1/link_layer" 2>/dev/null || echo unknown)
-            echo "  $name: port 1 state=[$st] link_layer=[$ll]"
+            for p in "$d"/ports/*; do
+                [ -e "$p" ] || continue
+                pnum=$(basename "$p")
+                st=$(cat "$p/state" 2>/dev/null || echo unknown)
+                ll=$(cat "$p/link_layer" 2>/dev/null || echo unknown)
+                echo "  $name: port $pnum state=[$st] link_layer=[$ll]"
+            done
         done
     else
         echo "RDMA devices in /sys/class/infiniband: none"
     fi
     if command -v rdma >/dev/null 2>&1; then
         echo "rdma link:"
-        rdma link show 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+        local rlinks
+        rlinks=$(rdma link show 2>/dev/null || true)
+        if [ -n "$rlinks" ]; then
+            printf '%s\n' "$rlinks" | sed 's/^/  /'
+        else
+            echo "  (none)"
+        fi
     else
         echo "rdma tool: not installed (install iproute2)"
     fi
@@ -90,21 +107,25 @@ pick_netdev() {
     if [ -n "$netdev" ]; then
         return 0
     fi
-    # Prefer an existing UP non-loopback Ethernet interface with an address.
+    # Prefer an existing UP non-loopback Ethernet interface with a non-tentative IP address.
     local iface
     for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
-        case "$iface" in lo | docker* | podman* | br-* | veth* | ib*) continue ;; esac
+        case "$iface" in lo | docker* | podman* | br-* | veth* | ib* | virbr* | cni* | flannel* | tun* | tap*) continue ;; esac
         if [ -r "/sys/class/net/$iface/type" ] && [ "$(cat "/sys/class/net/$iface/type")" = 1 ]; then
-            netdev=$iface
-            return 0
+            if ip -o addr show dev "$iface" 2>/dev/null | grep -v 'tentative' | grep -qE '\binet6?\b'; then
+                netdev=$iface
+                return 0
+            fi
         fi
     done
-    # Fallback: create a dedicated veth pair with link-local IPv6 / private IPv4.
+    # Fallback: create a dedicated veth pair with link-local IPv4 addresses (avoids IPv6-disabled hosts and DAD races).
     if ! ip link show "$veth_a" >/dev/null 2>&1; then
         ip link add "$veth_a" type veth peer name "$veth_b"
-        ip link set "$veth_a" up
-        ip link set "$veth_b" up
     fi
+    ip addr replace 169.254.99.1/30 dev "$veth_a"
+    ip addr replace 169.254.99.2/30 dev "$veth_b"
+    ip link set "$veth_a" up
+    ip link set "$veth_b" up
     netdev=$veth_a
 }
 
