@@ -617,8 +617,8 @@ size_t decimal_encode(const float *in, size_t n, uint8_t *out)
     int best_e = dec_pick_scale(in, n, false);
     if (best_e < 0)
         return 0;
-    uint32_t z_stk[8192];
-    uint32_t *z = n <= 8192 ? z_stk : malloc(n * sizeof *z);
+    uint32_t z_stk[1024];
+    uint32_t *z = n <= 1024 ? z_stk : malloc(n * sizeof *z);
     uint8_t exc_stk[513 * 8];
     uint8_t *exc = n <= 8192 ? exc_stk : malloc((n / 16 + 1) * 8);
     if (!z || !exc) {

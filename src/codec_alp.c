@@ -293,7 +293,7 @@ static int rd_choose(const void *in, int width, size_t n, int rmin, uint16_t *di
 
 size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
 {
-    if (n == 0)
+    if (n == 0 || n > 65536) /* u16 exception positions */
         return 0;
     int nd;
     uint16_t dict[RD_DICT];
