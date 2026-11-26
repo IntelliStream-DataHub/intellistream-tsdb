@@ -1087,11 +1087,12 @@ static int cmp_fname(const void *a, const void *b)
 }
 
 /* The names the install writes itself: a SNAPMAN that lists one is refused, so a received copy never carries the mark
- * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO, LOCK or PPOS of the
- * sender (the install writes PPOS from SNAPMAN's ppos fields) */
+ * that the install finished (SNAPDONE, which snap_leftovers trusts by its name) or a REPL, FNO, LOCK, PPOS or GCMK of
+ * the sender (the install writes PPOS from SNAPMAN's ppos fields) */
 static bool snap_name_reserved(const char *n)
 {
-    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp", "PPOS", "PPOS.tmp"};
+    static const char *const r[] = {SNAP_DONE, REPLFILE_NAME, FNO_FILE, "LOCK", "META.tmp", "PPOS", "PPOS.tmp",
+                                    "GCMK",    "GCMK.tmp"};
     if (snap_mutant == SNAP_MUT_NORESERVED) /* planted: no name is the install's own */
         return false;
     for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)

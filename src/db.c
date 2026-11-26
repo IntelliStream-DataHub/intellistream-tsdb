@@ -5,6 +5,7 @@
 #include "ppos.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "ecgcmk.h"
 #include "eckeep.h"
 #include "ecdiverge.h"
 #include "ecpart.h"
@@ -1075,7 +1076,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             test_before_parts(test_before_parts_arg);
         if ((rc = load_parts(db, ro)) != 0 || (rc = parts_check_series(db, ro)) != 0 ||
             (rc = cls_check_parts(db)) != 0 || (rc = latest_build(db)) != 0 ||
-            (rc = ppos_open(db)) != 0) /* an ec cluster volume's PPOS: a record per listed part (src/ppos.h) */
+            (rc = ppos_open(db)) != 0 || (rc = ecgcmk_open(db)) != 0) /* PPOS & GCMK before WAL/replica replay */
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
            after the WAL's checks too, just before the replay writes anything */
@@ -1087,6 +1088,14 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             rc = open_cut_tails(db);
         if (rc != 0)
             goto fail;
+        /* R8 (r8f F4, r8k-gc): a promoted cluster EC leader pins its own lead epoch (wal_seq >> 40) on its coldvol,
+         * so even if deposed with an up-to-date metadata copy, puts and deletes carry its own lead epoch, never the
+         * new leader's. */
+        if (!replica && db->ec_cluster && db->ecstate && db->ecstate->cold) {
+            uint64_t le = db->wal_seq >> 40;
+            if (le > 0)
+                atomic_store_explicit(&db->ecstate->cold->lead_epoch, le, memory_order_release);
+        }
     }
     if (db->wal_enabled) /* positions are log numbers: what the open found is the durable end (eng_leader_commit) */
         db->wal_appended = db->fno_next - 1, atomic_store(&db->wal_durable, db->fno_next - 1);
@@ -1148,8 +1157,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
     latest_start(db);
-    if (!ro && db->tier)
+    if (!ro && db->tier) {
         ecsettle_eng_ready(db); /* R7: the settle thread may take this engine from here on */
+        ecgc_eng_ready(db);     /* R8: the GC worker may take this cluster EC engine from here on */
+    }
     *out = db;
     return 0;
 fail:
@@ -1190,6 +1201,7 @@ void eng_halt(eng *db)
     db->nmergers = 0;
     if (settle_mutant != SETTLE_MUT_NOHALTSTOP)
         ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
+    ecgc_eng_stop(db);         /* R8: no cluster GC round of this engine runs from here on */
     if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
         eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */
 }
@@ -1291,6 +1303,7 @@ int eng_close(eng *db)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
     ecsettle_eng_stop(db); /* R7: before the parts go: a settle of this engine is abandoned or waited for */
+    ecgc_eng_stop(db);     /* R8: before the parts and GCMK go */
     eckeep_eng_stop(db); /* R7: before the parts go (the digest thread references them and takes db->lock) */
     stats_stop(db);
     latest_close(db); /* after the final flush: it folds into the table too */
@@ -1317,6 +1330,7 @@ int eng_close(eng *db)
     if (db->cls_fd != -2)
         cls_close(db);
     ppos_close(db);
+    ecgcmk_close(db);
     while (db->cc_free) {
         codec_ctx *c = db->cc_free;
         db->cc_free = c->next;

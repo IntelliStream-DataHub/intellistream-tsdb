@@ -1,43 +1,25 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * Retired .ec parts and their objects (src/ecgc.h; R7, design-cluster-data.md E14, 2.4, 15.7; the plan's D6).
+ * Retired .ec parts and their objects (src/ecgc.h; R7, R8 r8k-gc, design-cluster-data.md E14, 2.4, 15.7; D6, D13).
  *
- * An .ec part's rows live in its object's chunks, which no file system removes for us: whoever takes the part out of
- * service must delete them, and must not do it while anything may still read them. Three rules:
+ * Single-server tiers keep R7's three rules:
+ * 1. A retired .ec part keeps its name retired_<name>.ec until every chunk of its object is deleted.
+ * 2. Nothing is deleted while any part of the object is referenced. Holds are taken in part_open_ec (ecgc_hold) and
+ *    dropped in ecgc_last_unref, keyed by part pointer in an O(1) hash paired with an O(1) (volume, oid) refcount hash
+ *    in the tier, so a reopen's old engine still reading a part the new engine retires keeps its object alive (r7-gc F5).
+ * 3. Chunk I/O runs on the tier's worker, never under an engine lock.
  *
- * 1. A name stays until the chunks are gone. A retired .ec part keeps its name retired_<name>.ec (or retired_<name>
- *    for a part with an attached object) until every chunk of its object is deleted; only then is the name unlinked
- *    (with no directory fsync: a name that comes back is collected again). So a crash at any step leaves either the
- *    name (and the next open, which reads the object's id from it, deletes again: NOTFOUND counts as gone) or no
- *    chunk at all. part_unref leaves such a name alone (ecgc_owns_name).
+ * Cluster EC volumes (db->ec_cluster): never delete directly through R7's queue or open sweep; registered cluster EC
+ * engines are worked by the same tier GC thread through ecgcmk_work (src/ecgcmk.c), which commits MK_GC before any
+ * CHUNK_DEL and MK_GC{done} after every position answers.
  *
- * 2. Nothing is deleted while a part of the object is referenced. db_retire_locked takes a hold for the part
- *    (ecgc_retire_locked) in the tier, keyed by (volume, oid), which the part's last part_unref lets go of (no I/O
- *    there). The graveyard entry of the name (GY_EC; with obsolete_part_lifetime_s <= 0 due at once) is purged only
- *    once its deadline passed and no hold names its object: the hold is the tier's and not the engine's, so a reopened
- *    engine's purge also waits for a query that still holds the retired engine's part.
- *
- * 3. The chunk I/O runs on the tier's worker, never under an engine lock, and the worker never touches an engine:
- *    the purge (graveyard_purge, under db->lock) queues the object with a ticket, the worker deletes every position
- *    (the volume's cold_ops del, which skips a DOWN store, so its writable is asked before and after: a store not UP
- *    keeps the entry for a later round) and marks the ticket; the next purge of that engine sees the ticket and
- *    unlinks the name. An engine that closes meanwhile drops its tickets; its names stay for the next open.
- *
- * The sweep (D6) runs in the open after recovery and load_parts and before any thread of the engine starts: a settle
- * puts its chunks before any file names them, so a sweep later than that could delete a live settle's object. It
- * queues every object of the volume that no listed .ec part and no retired name names (the objects of abandoned
- * settles, of swaps refused or cut by a power loss, of parts attached in memory by tests), only with every store UP.
- * It lists file names only and reads one chunk header per object nothing names: an object is queued only when that
- * header names this volume's uuid, since another database on the same stores lists the same volume numbers (and
- * chunk_store_del refuses a chunk of another uuid as well).
- *
- * The queue is worked by a thread of the tier (nice 19, woken by every enqueue, and every 2 s while entries wait).
  * Lock order: db->lock > the tier gc mutex (a leaf: never held across I/O or another lock).
  */
 #include "ecgc.h"
 #include "chunk.h"
 #include "coldops.h"
 #include "eccache.h"
+#include "ecgcmk.h"
 #include "ecpart.h"
 #include "tier.h"
 
@@ -56,8 +38,92 @@ atomic_bool ecgc_test_manual;
 atomic_bool ecgc_test_nosweep;
 atomic_int ecgc_test_del_fail;
 void (*ecgc_test_after_del)(struct tier *t, unsigned pos);
+_Atomic int64_t ecgc_test_orphan_grace_ms = -1;
+_Atomic int64_t ecgc_test_poll_ms = -1;
+_Atomic int64_t ecgc_test_lifetime_s = -1;
 
 #define GC_RETIRED "retired_"
+
+int ecgc_mutant_parse(const char *name)
+{
+    static const struct {
+        const char *name;
+        int m;
+    } tbl[] = {
+        {"none", GC_MUT_NONE},
+        {"gcunlinkfirst", GC_MUT_UNLINKFIRST},
+        {"gcunrefleak", GC_MUT_UNREFLEAK},
+        {"gcnohold", GC_MUT_NOHOLD},
+        {"sweeplive", GC_MUT_SWEEPLIVE},
+        {"sweepinflight", GC_MUT_SWEEPINFLIGHT},
+        {"sweepforeign", GC_MUT_SWEEPFOREIGN},
+        {"unlistednoop", GC_MUT_UNLISTEDNOOP},
+        {"noretrytimer", GC_MUT_NORETRYTIMER},
+        {"noafter", GC_MUT_NOAFTER},
+        {"gcuncommitted", GC_MUT_UNCOMMITTED},
+        {"gcnamedorphan", GC_MUT_NAMEDORPHAN},
+        {"gcsuspendignored", GC_MUT_SUSPENDIGNORED},
+        {"holdatretire", GC_MUT_HOLDATRET},
+        {"gcreplicanoop", GC_MUT_REPLICANOOP},
+    };
+    if (!name)
+        return -1;
+    for (size_t i = 0; i < sizeof tbl / sizeof *tbl; i++)
+        if (strcmp(name, tbl[i].name) == 0)
+            return tbl[i].m;
+    return -1;
+}
+
+static pthread_once_t env_once = PTHREAD_ONCE_INIT;
+
+static void env_init_fn(void)
+{
+    const char *m = getenv("TSDB_ECGC_MUTANT");
+    if (m && *m) {
+        int v = ecgc_mutant_parse(m);
+        if (v < 0) {
+            fprintf(stderr, "tsdb: TSDB_ECGC_MUTANT=%s names no mutant: exiting with status 2\n", m);
+            _exit(2);
+        }
+        if (ecgc_mutant == GC_MUT_NONE)
+            ecgc_mutant = v;
+        fprintf(stderr, "tsdb: ecgc MUTANT %s (tests only)\n", m);
+    }
+    const char *t = getenv("TSDB_ECGC_TEST");
+    if (t && *t) {
+        char buf[1024];
+        snprintf(buf, sizeof buf, "%s", t);
+        char *sp = NULL;
+        for (char *tok = strtok_r(buf, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+            if (strncmp(tok, "orphan_grace_ms=", 16) == 0)
+                atomic_store(&ecgc_test_orphan_grace_ms, strtoll(tok + 16, NULL, 10));
+            else if (strncmp(tok, "poll_ms=", 8) == 0)
+                atomic_store(&ecgc_test_poll_ms, strtoll(tok + 8, NULL, 10));
+            else if (strncmp(tok, "lifetime_s=", 11) == 0)
+                atomic_store(&ecgc_test_lifetime_s, strtoll(tok + 11, NULL, 10));
+            else
+                ecgcmk_test_opt(tok);
+        }
+    }
+}
+
+void ecgc_env_init(void) { pthread_once(&env_once, env_init_fn); }
+
+static int64_t gc_life_ms(const eng *db)
+{
+    ecgc_env_init();
+    int64_t ov = atomic_load(&ecgc_test_lifetime_s);
+    if (ov >= 0)
+        return ov * 1000;
+    return db->opt.obsolete_part_lifetime_s > 0 ? (int64_t)db->opt.obsolete_part_lifetime_s * 1000 : 0;
+}
+
+static int64_t gc_poll_ms(void)
+{
+    ecgc_env_init();
+    int64_t ov = atomic_load(&ecgc_test_poll_ms);
+    return ov > 0 ? ov : 2000;
+}
 
 enum { TK_WAITING = 0, TK_QUEUED = 1, TK_DELETED = 2 };
 
@@ -79,11 +145,18 @@ typedef struct gc_item {
     gc_ticket *tk; /* NULL: nobody waits for it (an orphan, an unlisted object) */
 } gc_item;
 
-typedef struct gc_hold {
+/* O(1) hold tables under g->mu: ptab keyed by part pointer, otab keyed by (volume, oid) with refcount. */
+typedef struct gc_phold {
     const part *p;
     uint32_t volume;
     uint8_t oid[16];
-} gc_hold;
+} gc_phold;
+
+typedef struct gc_ohold {
+    uint32_t volume;
+    uint32_t count;
+    uint8_t oid[16];
+} gc_ohold;
 
 /* sweepinflight's deferred listing (a mutant only) */
 typedef struct gc_deferred {
@@ -93,15 +166,25 @@ typedef struct gc_deferred {
     size_t nnamed;
 } gc_deferred;
 
+typedef struct gc_eng {
+    eng *db;
+    unsigned active;
+    bool stopping;
+} gc_eng;
+
 struct ecgc_tier {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     gc_item *q; /* the entries are q[qh .. nq): a pop moves qh, a push compacts only once qh is half of nq */
     size_t qh, nq, capq;
-    gc_hold *holds;
-    size_t nholds, capholds;
+    gc_phold *ptab;
+    size_t nholds, pcap;
+    gc_ohold *otab;
+    size_t noholds, ocap;
     gc_deferred *def;
     size_t ndef;
+    gc_eng *engs; /* registered cluster EC engines */
+    size_t neng, capeng;
     pthread_t thread;
     bool has_thread, stop, kick;
     atomic_uint_fast64_t queued, deleted, retries, swept, sweeps, sweeps_skipped, unlinked;
@@ -113,6 +196,7 @@ typedef struct gc_rec {
     uint8_t oid[16];
     uint16_t npos;
     bool object;
+    int64_t deadline; /* monotonic ms: when cluster MK_GC may collect this retired object */
     gc_ticket *tk;
 } gc_rec;
 
@@ -121,7 +205,213 @@ struct ecgc_eng {
     size_t n, cap;
 };
 
-/* ------------------------------------------------------------ the tier's queue and holds */
+/* ------------------------------------------------------------ O(1) holds hash (under g->mu) */
+
+static size_t ptr_hash(const part *p, size_t cap)
+{
+    uint64_t h = (uint64_t)(uintptr_t)p;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (size_t)h & (cap - 1);
+}
+
+static size_t oid_hash(uint32_t volume, const uint8_t oid[16], size_t cap)
+{
+    uint64_t a, b;
+    memcpy(&a, oid, 8);
+    memcpy(&b, oid + 8, 8);
+    uint64_t h = a ^ (b * 0x9e3779b97f4a7c15ULL) ^ ((uint64_t)volume * 0xbf58476d1ce4e5b9ULL);
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    return (size_t)h & (cap - 1);
+}
+
+static int ptab_grow(struct ecgc_tier *g)
+{
+    if ((g->nholds + 1) * 2 <= g->pcap)
+        return 0;
+    size_t ncap = g->pcap ? g->pcap * 2 : 64;
+    gc_phold *nt = calloc(ncap, sizeof *nt);
+    if (!nt)
+        return TSDB_ERR_NOMEM;
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < g->pcap; i++) {
+        if (!g->ptab[i].p)
+            continue;
+        size_t j = ptr_hash(g->ptab[i].p, ncap);
+        while (nt[j].p)
+            j = (j + 1) & mask;
+        nt[j] = g->ptab[i];
+    }
+    free(g->ptab);
+    g->ptab = nt;
+    g->pcap = ncap;
+    return 0;
+}
+
+static int otab_grow(struct ecgc_tier *g)
+{
+    if ((g->noholds + 1) * 2 <= g->ocap)
+        return 0;
+    size_t ncap = g->ocap ? g->ocap * 2 : 64;
+    gc_ohold *nt = calloc(ncap, sizeof *nt);
+    if (!nt)
+        return TSDB_ERR_NOMEM;
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < g->ocap; i++) {
+        if (!g->otab[i].count)
+            continue;
+        size_t j = oid_hash(g->otab[i].volume, g->otab[i].oid, ncap);
+        while (nt[j].count)
+            j = (j + 1) & mask;
+        nt[j] = g->otab[i];
+    }
+    free(g->otab);
+    g->otab = nt;
+    g->ocap = ncap;
+    return 0;
+}
+
+static void otab_inc(struct ecgc_tier *g, uint32_t volume, const uint8_t oid[16])
+{
+    size_t mask = g->ocap - 1;
+    size_t i = oid_hash(volume, oid, g->ocap);
+    while (g->otab[i].count) {
+        if (g->otab[i].volume == volume && memcmp(g->otab[i].oid, oid, 16) == 0) {
+            g->otab[i].count++;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+    g->otab[i].volume = volume;
+    g->otab[i].count = 1;
+    memcpy(g->otab[i].oid, oid, 16);
+    g->noholds++;
+}
+
+static void otab_dec(struct ecgc_tier *g, uint32_t volume, const uint8_t oid[16])
+{
+    if (!g->ocap)
+        return;
+    size_t mask = g->ocap - 1;
+    size_t i = oid_hash(volume, oid, g->ocap);
+    while (g->otab[i].count) {
+        if (g->otab[i].volume == volume && memcmp(g->otab[i].oid, oid, 16) == 0) {
+            if (--g->otab[i].count > 0)
+                return;
+            g->noholds--;
+            size_t j = (i + 1) & mask;
+            while (g->otab[j].count) {
+                size_t k = oid_hash(g->otab[j].volume, g->otab[j].oid, g->ocap);
+                if (((j - k) & mask) >= ((j - i) & mask)) {
+                    g->otab[i] = g->otab[j];
+                    g->otab[j].count = 0;
+                    i = j;
+                }
+                j = (j + 1) & mask;
+            }
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static bool held_locked(const struct ecgc_tier *g, uint32_t volume, const uint8_t oid[16])
+{
+    if (!g->ocap)
+        return false;
+    size_t mask = g->ocap - 1;
+    size_t i = oid_hash(volume, oid, g->ocap);
+    while (g->otab[i].count) {
+        if (g->otab[i].volume == volume && memcmp(g->otab[i].oid, oid, 16) == 0)
+            return true;
+        i = (i + 1) & mask;
+    }
+    return false;
+}
+
+bool ecgc_held(tier *t, uint32_t volume, const uint8_t oid[16])
+{
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g)
+        return false;
+    pthread_mutex_lock(&g->mu);
+    bool h = held_locked(g, volume, oid);
+    pthread_mutex_unlock(&g->mu);
+    return h;
+}
+
+int ecgc_hold(tier *t, const part *p, uint32_t volume, const uint8_t oid[16])
+{
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g || !p)
+        return 0;
+    pthread_mutex_lock(&g->mu);
+    if (g->pcap) {
+        size_t mask = g->pcap - 1;
+        size_t i = ptr_hash(p, g->pcap);
+        while (g->ptab[i].p) {
+            if (g->ptab[i].p == p) {
+                pthread_mutex_unlock(&g->mu);
+                return 0; /* already held */
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    int rc = ptab_grow(g);
+    if (rc == 0)
+        rc = otab_grow(g);
+    if (rc == 0) {
+        size_t mask = g->pcap - 1;
+        size_t i = ptr_hash(p, g->pcap);
+        while (g->ptab[i].p)
+            i = (i + 1) & mask;
+        g->ptab[i].p = p;
+        g->ptab[i].volume = volume;
+        memcpy(g->ptab[i].oid, oid, 16);
+        g->nholds++;
+        otab_inc(g, volume, oid);
+    }
+    pthread_mutex_unlock(&g->mu);
+    return rc;
+}
+
+static void release(tier *t, const part *p)
+{
+    struct ecgc_tier *g = t->gc;
+    pthread_mutex_lock(&g->mu);
+    if (g->pcap) {
+        size_t mask = g->pcap - 1;
+        size_t i = ptr_hash(p, g->pcap);
+        while (g->ptab[i].p) {
+            if (g->ptab[i].p == p) {
+                uint32_t vol = g->ptab[i].volume;
+                uint8_t oid[16];
+                memcpy(oid, g->ptab[i].oid, 16);
+                g->ptab[i].p = NULL;
+                g->nholds--;
+                size_t j = (i + 1) & mask;
+                while (g->ptab[j].p) {
+                    size_t k = ptr_hash(g->ptab[j].p, g->pcap);
+                    if (((j - k) & mask) >= ((j - i) & mask)) {
+                        g->ptab[i] = g->ptab[j];
+                        g->ptab[j].p = NULL;
+                        i = j;
+                    }
+                    j = (j + 1) & mask;
+                }
+                otab_dec(g, vol, oid);
+                break;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    pthread_mutex_unlock(&g->mu);
+}
+
+/* ------------------------------------------------------------ the tier's queue */
 
 static size_t qlen(const struct ecgc_tier *g) { return g->nq - g->qh; }
 
@@ -169,59 +459,26 @@ static int enqueue(tier *t, uint32_t volume, const uint8_t vuuid[16], const uint
     return rc;
 }
 
-static bool held(tier *t, uint32_t volume, const uint8_t oid[16])
+void ecgc_kick_tier(tier *t)
 {
-    struct ecgc_tier *g = t->gc;
-    bool h = false;
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g)
+        return;
     pthread_mutex_lock(&g->mu);
-    for (size_t i = 0; i < g->nholds && !h; i++)
-        h = g->holds[i].volume == volume && !memcmp(g->holds[i].oid, oid, 16);
+    g->kick = true;
+    pthread_cond_signal(&g->cv);
     pthread_mutex_unlock(&g->mu);
-    return h;
 }
 
-static int hold(tier *t, const part *p, uint32_t volume, const uint8_t oid[16])
+void ecgc_note_unlinked(tier *t, uint64_t n)
 {
-    struct ecgc_tier *g = t->gc;
-    int rc = 0;
-    pthread_mutex_lock(&g->mu);
-    if (g->nholds == g->capholds) {
-        size_t cap = g->capholds ? 2 * g->capholds : 16;
-        gc_hold *h = realloc(g->holds, cap * sizeof *h);
-        if (h) {
-            g->holds = h;
-            g->capholds = cap;
-        } else {
-            rc = TSDB_ERR_NOMEM;
-        }
-    }
-    if (rc == 0) {
-        gc_hold *h = &g->holds[g->nholds++];
-        h->p = p;
-        h->volume = volume;
-        memcpy(h->oid, oid, 16);
-    }
-    pthread_mutex_unlock(&g->mu);
-    return rc;
-}
-
-static void release(tier *t, const part *p)
-{
-    struct ecgc_tier *g = t->gc;
-    pthread_mutex_lock(&g->mu);
-    for (size_t i = 0; i < g->nholds; i++)
-        if (g->holds[i].p == p) {
-            g->holds[i] = g->holds[--g->nholds];
-            break;
-        }
-    pthread_mutex_unlock(&g->mu);
+    if (t && t->gc && n)
+        atomic_fetch_add(&t->gc->unlinked, n);
 }
 
 static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it);
 
-/* every position of one object; true when all are gone with every store UP throughout. Through the volume's ops of its
- * latest attach (the tier keeps them until it closes, so an item queued by an engine that closed since finds them),
- * at the epoch of its provider (D4: 1 on a single server; a delete above a store's epoch would raise it). */
+/* every position of one object; true when all are gone with every store UP throughout. */
 static bool delete_object(tier *t, const gc_item *it)
 {
     coldvol *cv = tier_cold_get(t, it->volume);
@@ -246,9 +503,6 @@ static bool delete_object_cv(tier *t, coldvol *cv, const gc_item *it)
         if (ecgc_test_after_del)
             ecgc_test_after_del(t, pos);
     }
-    /* A backstop: chunk_be_del skips a store that holds no open store (DOWN), and counts the skip as NOTFOUND. No store
-     * goes from open to DOWN in service today (a failed one stays open and refuses, a replaced one is swapped for the
-     * new one), so nothing reaches this but a future change of the backend; the noafter mutant cannot be killed. */
     return ecgc_mutant == GC_MUT_NOAFTER || cv->ops->writable(cv->ctx);
 }
 
@@ -274,7 +528,7 @@ size_t ecgc_tier_work(tier *t)
     size_t round = qlen(g);
     pthread_mutex_unlock(&g->mu);
 
-    /* one round: the entries there before it, each once; a kept one goes to the back */
+    /* one round of R7 single-server deletes: the entries there before it, each once; a kept one goes to the back */
     for (size_t k = 0; k < round; k++) {
         pthread_mutex_lock(&g->mu);
         if (qlen(g) == 0 || g->stop) {
@@ -299,7 +553,34 @@ size_t ecgc_tier_work(tier *t)
         if (rc)
             tk_put(it.tk);
     }
+
+    /* R8 cluster EC engines: MK_GC (retired objects, pending deletes, orphans) */
     pthread_mutex_lock(&g->mu);
+    for (size_t i = 0; !g->stop && i < g->neng;) {
+        if (g->engs[i].stopping) {
+            i++;
+            continue;
+        }
+        eng *db = g->engs[i].db;
+        g->engs[i].active++;
+        pthread_mutex_unlock(&g->mu);
+        ecgcmk_work(db);
+        pthread_mutex_lock(&g->mu);
+        size_t idx = SIZE_MAX;
+        for (size_t j = 0; j < g->neng; j++)
+            if (g->engs[j].db == db) {
+                idx = j;
+                break;
+            }
+        if (idx != SIZE_MAX) {
+            g->engs[idx].active--;
+            if (g->engs[idx].active == 0 && g->engs[idx].stopping)
+                pthread_cond_broadcast(&g->cv);
+            i = idx + 1;
+        } else {
+            i = 0;
+        }
+    }
     size_t left = qlen(g);
     pthread_mutex_unlock(&g->mu);
     return left;
@@ -309,15 +590,21 @@ static void *gc_main(void *arg)
 {
     tier *t = arg;
     struct ecgc_tier *g = t->gc;
+    ecgc_env_init();
+#ifdef __linux__
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only, as D11's settle thread */
+#endif
     pthread_mutex_lock(&g->mu);
     while (!g->stop) {
-        if (!g->kick && ((qlen(g) == 0 && g->ndef == 0) || ecgc_mutant == GC_MUT_NORETRYTIMER)) {
+        bool has_work = qlen(g) != 0 || g->ndef != 0;
+        bool has_cluster = g->neng != 0;
+        if (!g->kick && ((!has_work && !has_cluster) || (!has_cluster && ecgc_mutant == GC_MUT_NORETRYTIMER))) {
             pthread_cond_wait(&g->cv, &g->mu);
             continue;
         }
-        if (!g->kick) { /* entries kept from the last round (a transient error): again in 2 s */
-            tsdb_cond_timedwait_ms(&g->cv, &g->mu, 2000);
+        if (!g->kick) {
+            int64_t ms = has_cluster ? gc_poll_ms() : 2000;
+            tsdb_cond_timedwait_ms(&g->cv, &g->mu, (uint64_t)ms);
             if (g->stop)
                 break;
         }
@@ -333,6 +620,7 @@ static void *gc_main(void *arg)
 int ecgc_tier_open(tier *t)
 {
     EC_CALLED(EC_CALL_TIER_OPEN);
+    ecgc_env_init();
     struct ecgc_tier *g = calloc(1, sizeof *g);
     if (!g)
         return TSDB_ERR_NOMEM;
@@ -347,9 +635,8 @@ int ecgc_tier_open(tier *t)
     return 0;
 }
 
-void ecgc_tier_close(tier *t)
+void ecgc_tier_quiesce(tier *t)
 {
-    EC_CALLED(EC_CALL_TIER_CLOSE);
     struct ecgc_tier *g = t ? t->gc : NULL;
     if (!g)
         return;
@@ -357,13 +644,26 @@ void ecgc_tier_close(tier *t)
     g->stop = true;
     pthread_cond_broadcast(&g->cv);
     pthread_mutex_unlock(&g->mu);
-    if (g->has_thread)
+    if (g->has_thread) {
         pthread_join(g->thread, NULL);
+        g->has_thread = false;
+    }
+}
+
+void ecgc_tier_close(tier *t)
+{
+    EC_CALLED(EC_CALL_TIER_CLOSE);
+    struct ecgc_tier *g = t ? t->gc : NULL;
+    if (!g)
+        return;
+    ecgc_tier_quiesce(t);
     /* what is left stays on the stores: named objects for the next open's purge, the rest for its sweep */
     for (size_t i = g->qh; i < g->nq; i++)
         tk_put(g->q[i].tk);
     free(g->q);
-    free(g->holds);
+    free(g->ptab);
+    free(g->otab);
+    free(g->engs);
     for (size_t i = 0; i < g->ndef; i++)
         free(g->def[i].named);
     free(g->def);
@@ -371,6 +671,62 @@ void ecgc_tier_close(tier *t)
     pthread_cond_destroy(&g->cv);
     free(g);
     t->gc = NULL;
+}
+
+void ecgc_eng_ready(eng *db)
+{
+    if (!db || !db->ec_cluster || !db->tier || !db->tier->gc)
+        return;
+    struct ecgc_tier *g = db->tier->gc;
+    pthread_mutex_lock(&g->mu);
+    for (size_t i = 0; i < g->neng; i++)
+        if (g->engs[i].db == db) {
+            g->engs[i].stopping = false;
+            g->kick = true;
+            pthread_cond_signal(&g->cv);
+            pthread_mutex_unlock(&g->mu);
+            return;
+        }
+    if (g->neng == g->capeng) {
+        size_t cap = g->capeng ? g->capeng * 2 : 8;
+        gc_eng *e = realloc(g->engs, cap * sizeof *e);
+        if (e) {
+            g->engs = e;
+            g->capeng = cap;
+        }
+    }
+    if (g->neng < g->capeng) {
+        g->engs[g->neng++] = (gc_eng){.db = db};
+        g->kick = true;
+        pthread_cond_signal(&g->cv);
+    }
+    pthread_mutex_unlock(&g->mu);
+}
+
+void ecgc_eng_stop(eng *db)
+{
+    if (!db || !db->tier || !db->tier->gc)
+        return;
+    ecgcmk_stop(db);
+    struct ecgc_tier *g = db->tier->gc;
+    pthread_mutex_lock(&g->mu);
+    for (;;) {
+        size_t idx = SIZE_MAX;
+        for (size_t i = 0; i < g->neng; i++)
+            if (g->engs[i].db == db) {
+                idx = i;
+                break;
+            }
+        if (idx == SIZE_MAX)
+            break;
+        g->engs[idx].stopping = true;
+        if (g->engs[idx].active == 0) {
+            g->engs[idx] = g->engs[--g->neng];
+            break;
+        }
+        pthread_cond_wait(&g->cv, &g->mu);
+    }
+    pthread_mutex_unlock(&g->mu);
 }
 
 void ecgc_get_counters(tier *t, ecgc_counters *out)
@@ -397,6 +753,7 @@ void ecgc_get_counters(tier *t, ecgc_counters *out)
 int ecgc_eng_open(eng *db)
 {
     EC_CALLED(EC_CALL_ENG_OPEN);
+    ecgc_env_init();
     struct ecgc_eng *e = calloc(1, sizeof *e);
     if (!e)
         return TSDB_ERR_NOMEM;
@@ -433,7 +790,8 @@ static void rec_remove(struct ecgc_eng *e, gc_rec *r)
     *r = e->r[--e->n];
 }
 
-static gc_rec *rec_add(struct ecgc_eng *e, const char *name, const uint8_t *oid, unsigned npos, bool object)
+static gc_rec *rec_add(struct ecgc_eng *e, const char *name, const uint8_t *oid, unsigned npos, bool object,
+                       int64_t deadline)
 {
     if (e->n == e->cap) {
         size_t cap = e->cap ? 2 * e->cap : 16;
@@ -455,6 +813,7 @@ static gc_rec *rec_add(struct ecgc_eng *e, const char *name, const uint8_t *oid,
         memcpy(r->oid, oid, 16);
     r->npos = (uint16_t)npos;
     r->object = object;
+    r->deadline = deadline;
     r->tk = tk;
     return r;
 }
@@ -486,9 +845,9 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only)
     uint8_t oid[16];
     memcpy(oid, ep->rec.oid, 16);
     unsigned npos = (unsigned)ep->rec.k + ep->rec.m;
-    part_unref(p); /* never listed: no hold, nothing queued */
-    int64_t life = db->opt.obsolete_part_lifetime_s > 0 ? (int64_t)db->opt.obsolete_part_lifetime_s * 1000 : 0;
-    if (!rec_add(e, name, oid, npos, true) || graveyard_add(db, name, GY_EC, eng_mono_ms() + life) != 0)
+    part_unref(p); /* drops the temporary hold taken by part_open_ec */
+    int64_t deadline = eng_mono_ms() + gc_life_ms(db);
+    if (!rec_add(e, name, oid, npos, true, deadline) || graveyard_add(db, name, GY_EC, deadline) != 0)
         return TSDB_ERR_NOMEM;
     return 0;
 }
@@ -503,19 +862,24 @@ void ecgc_retire_locked(eng *db, part *p)
     char retired[sizeof p->name + sizeof GC_RETIRED];
     snprintf(retired, sizeof retired, GC_RETIRED "%s", p->name);
     bool object = !ep->test_mark;
-    gc_rec *r = rec_add(e, retired, object ? ep->rec.oid : NULL, object ? (unsigned)ep->rec.k + ep->rec.m : 0,
-                        object);
+    int64_t now = eng_mono_ms();
+    int64_t deadline = now + gc_life_ms(db);
+    gc_rec *r = rec_add(e, retired, object ? ep->rec.oid : NULL, object ? (unsigned)ep->rec.k + ep->rec.m : 0, object,
+                        deadline);
     /* out of memory: no record, and a GY_EC entry without one is kept (its name stays for the next open) */
     if (!r)
         return;
-    if (object && hold(db->tier, p, db->tier_vol, ep->rec.oid) != 0) {
-        rec_remove(e, r); /* no hold, no record: nothing deletes the object while p is read */
+    /* Holds are taken in part_open_ec; holdatretire plants the old r7-gc F5 bug of taking them only here. */
+    if (object && ecgc_mutant == GC_MUT_HOLDATRET && ecgc_hold(db->tier, p, db->tier_vol, ep->rec.oid) != 0) {
+        rec_remove(e, r);
         return;
     }
     /* db_retire_locked adds the entry of a lifetime; with none it is due now, and the name is still ours to unlink
      * (ecgc_owns_name). Unrecorded (out of memory): the next open. */
     if (object && db->opt.obsolete_part_lifetime_s <= 0)
-        (void)graveyard_add(db, retired, GY_EC, eng_mono_ms());
+        (void)graveyard_add(db, retired, GY_EC, now);
+    if (object && db->ec_cluster && deadline <= now)
+        ecgc_kick_tier(db->tier);
 }
 
 bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
@@ -531,14 +895,22 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
         unlinkat(db->dirfd, ge->name, 0);
         return true;
     }
-    if (!all && ge->deadline > now)
+    if (!all && !db->ec_cluster && ge->deadline > now)
         return false;
     if (!r->object) { /* a test-marked part: a file and nothing else */
+        if (!all && ge->deadline > now)
+            return false;
         unlinkat(db->dirfd, ge->name, 0);
         rec_remove(e, r);
         return true;
     }
-    if (ecgc_mutant != GC_MUT_NOHOLD && held(db->tier, db->tier_vol, r->oid))
+    /* Cluster EC volume (E14, D13): never directly delete chunks; retired objects go only via committed MK_GC. */
+    if (db->ec_cluster) {
+        if (!db->rp && r->deadline <= now && (ecgc_mutant == GC_MUT_NOHOLD || !ecgc_held(db->tier, db->tier_vol, r->oid)))
+            ecgc_kick_tier(db->tier);
+        return false;
+    }
+    if (ecgc_mutant != GC_MUT_NOHOLD && ecgc_held(db->tier, db->tier_vol, r->oid))
         return false;
     switch (atomic_load(&r->tk->state)) {
     case TK_WAITING:
@@ -579,6 +951,12 @@ int ecgc_queue_object(eng *db, const uint8_t oid[16], unsigned npos)
 {
     if (!db->tier)
         return TSDB_ERR_INVALID;
+    if (db->ec_cluster) {
+        int rc = ecgcmk_queue_orphan(db, oid);
+        if (rc == 0)
+            ecgc_kick_tier(db->tier);
+        return rc;
+    }
     return enqueue(db->tier, db->tier_vol, tier_vuuid(db), oid, npos, NULL);
 }
 
@@ -590,10 +968,158 @@ void ecgc_unlisted_object(eng *db, const part *p)
     (void)ecgc_queue_object(db, e->rec.oid, (unsigned)e->rec.k + e->rec.m); /* unqueued: the next open's sweep */
 }
 
-/* ------------------------------------------------------------ the sweep (D6) */
+/* ------------------------------------------------------------ helpers for cluster MK_GC (src/ecgcmk.c) */
 
-/* A chunk that no listed or retired name names: its object is ours to delete only if a header says it is this volume's
- * (another database on the same stores lists the same volume number: rev F1). */
+static bool oid_in_packed(const uint8_t oid[16], const uint8_t *oids, size_t noids)
+{
+    for (size_t i = 0; i < noids; i++)
+        if (memcmp(oid, oids + i * 16, 16) == 0)
+            return true;
+    return false;
+}
+
+int ecgc_take_due_retired(eng *db, int64_t now, uint8_t (**oids_out)[16], size_t *n_out)
+{
+    *oids_out = NULL;
+    *n_out = 0;
+    struct ecgc_eng *e = eng_gc(db);
+    if (!e || !db->tier)
+        return 0;
+    pthread_mutex_lock(&db->lock);
+    size_t cap = e->n < MK_FILES_MAX ? e->n : MK_FILES_MAX;
+    uint8_t (*oids)[16] = cap ? malloc(cap * 16) : NULL;
+    if (cap && !oids) {
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < e->n && n < MK_FILES_MAX; i++) {
+        if (!e->r[i].object || e->r[i].deadline > now)
+            continue;
+        if (ecgc_mutant != GC_MUT_NOHOLD && ecgc_held(db->tier, db->tier_vol, e->r[i].oid))
+            continue;
+        bool dup = false;
+        for (size_t j = 0; j < n && !dup; j++)
+            dup = memcmp(oids[j], e->r[i].oid, 16) == 0;
+        if (!dup)
+            memcpy(oids[n++], e->r[i].oid, 16);
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (n == 0) {
+        free(oids);
+        oids = NULL;
+    }
+    *oids_out = oids;
+    *n_out = n;
+    return 0;
+}
+
+static int push_unlink(char (**arr)[256], size_t *n, size_t *cap, const char *name)
+{
+    for (size_t i = 0; i < *n; i++)
+        if (strcmp((*arr)[i], name) == 0)
+            return 0;
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        char (*p)[256] = realloc(*arr, nc * sizeof *p);
+        if (!p)
+            return TSDB_ERR_NOMEM;
+        *arr = p;
+        *cap = nc;
+    }
+    snprintf((*arr)[(*n)++], 256, "%s", name);
+    return 0;
+}
+
+/* Under db->lock: retires any listed .ec part whose oid is in oids[0..noids), collects all retired_ names for those
+ * oids (both newly retired and already in ecgc_eng), and removes their ecgc_eng and GY_EC graveyard entries. */
+int ecgc_collect_oids_locked(eng *db, const uint8_t *oids, size_t noids, char (**unlinks_out)[256],
+                             size_t *nunlinks_out, bool *retired_listed_out)
+{
+    *unlinks_out = NULL;
+    *nunlinks_out = 0;
+    *retired_listed_out = false;
+    char (*unlinks)[256] = NULL;
+    size_t nu = 0, capu = 0;
+    int rc = 0;
+
+    /* 1. Any .ec of those oids still listed (a replica whose TTL is behind): retire it first so a promotion never
+     *    lists an .ec whose chunks are going. */
+    for (size_t i = 0; i < db->nparts && rc == 0;) {
+        part *p = db->parts[i];
+        struct ecpart *ep = atomic_load(&p->ec);
+        if (!ep || ep->test_mark || !oid_in_packed(ep->rec.oid, oids, noids)) {
+            i++;
+            continue;
+        }
+        char retired[sizeof p->name + sizeof GC_RETIRED];
+        snprintf(retired, sizeof retired, GC_RETIRED "%s", p->name);
+        p->dropped = true;
+        cls_dropped_note(db, p);
+        if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0 && errno != ENOENT) {
+            eng_fail(db, "rename of an MK_GC .ec part to retired_", errno);
+            rc = TSDB_ERR_IO;
+            break;
+        }
+        p->retired = true;
+        atomic_store(&p->obsolete, true);
+        rc = push_unlink(&unlinks, &nu, &capu, retired);
+        db_parts_remove_locked(db, p);
+        *retired_listed_out = true;
+    }
+
+    /* 2. Collect and remove matching retired_ records from ecgc_eng and their GY_EC graveyard entries. */
+    struct ecgc_eng *e = eng_gc(db);
+    for (size_t i = 0; e && i < e->n && rc == 0;) {
+        if (!e->r[i].object || !oid_in_packed(e->r[i].oid, oids, noids)) {
+            i++;
+            continue;
+        }
+        rc = push_unlink(&unlinks, &nu, &capu, e->r[i].name);
+        if (rc == 0) {
+            for (size_t g = 0; g < db->ngraveyard;) {
+                if (db->graveyard[g].kind == GY_EC && strcmp(db->graveyard[g].name, e->r[i].name) == 0)
+                    db->graveyard[g] = db->graveyard[--db->ngraveyard];
+                else
+                    g++;
+            }
+            rec_remove(e, &e->r[i]);
+        }
+    }
+    if (rc) {
+        free(unlinks);
+        return rc;
+    }
+    *unlinks_out = unlinks;
+    *nunlinks_out = nu;
+    return 0;
+}
+
+int ecgc_list_retired_locked(eng *db, uint8_t (**oids_out)[16], size_t *n_out)
+{
+    *oids_out = NULL;
+    *n_out = 0;
+    struct ecgc_eng *e = eng_gc(db);
+    if (!e || e->n == 0)
+        return 0;
+    uint8_t (*oids)[16] = malloc(e->n * 16);
+    if (!oids)
+        return TSDB_ERR_NOMEM;
+    size_t n = 0;
+    for (size_t i = 0; i < e->n; i++)
+        if (e->r[i].object)
+            memcpy(oids[n++], e->r[i].oid, 16);
+    if (n == 0) {
+        free(oids);
+        oids = NULL;
+    }
+    *oids_out = oids;
+    *n_out = n;
+    return 0;
+}
+
+/* ------------------------------------------------------------ the sweep (D6, single server) */
+
 typedef struct sweep_ent {
     uint8_t oid[16];
     uint16_t pos;
@@ -652,8 +1178,6 @@ static int obj_owner(coldvol *cv, const uint8_t vuuid[16], const sweep_ent *e, s
     return -1;
 }
 
-/* Lists the volume's chunks by name (no file opened), reads one header per object nothing names, and queues those
- * this volume wrote. TSDB_ERR_NOMEM, or 0 (a skip says why on stderr). */
 static int sweep_cv(tier *t, coldvol *cv, uint32_t volume, const uint8_t vuuid[16], uint8_t (*named)[16],
                     size_t nnamed);
 
@@ -734,10 +1258,9 @@ int ecgc_open_sweep(eng *db)
     if (!t || !t->gc || !e || atomic_load(&ecgc_test_nosweep))
         return 0;
     /* An ec cluster volume (PPOS: src/ppos.h): an object no file of this member names may be one a COLD marker names
-     * that is not yet applied here (a leader that lost power between its marker and its swap, or after a swap intent
-     * that rolled back, reopens as a replica and lists the object from its staged .ec file; r8h). Its orphans are
-     * the leader's to delete by a committed MK_GC (E14), never this member's by file name. */
-    if (db->ppos) {
+     * that is not yet applied here. Its orphans are the leader's to delete by a committed MK_GC (E14), never this
+     * member's by file name. */
+    if (db->ppos || db->ec_cluster) {
         atomic_fetch_add(&t->gc->sweeps_skipped, 1);
         return 0;
     }

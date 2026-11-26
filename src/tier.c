@@ -442,8 +442,10 @@ void tier_put(tier *t)
 
 void tier_quiesce(tier *t)
 {
-    if (t)
+    if (t) {
         ecsettle_tier_quiesce(t);
+        ecgc_tier_quiesce(t);
+    }
 }
 
 const tier_cfg *tier_config(const tier *t) { return t ? &t->cfg : NULL; }
@@ -638,6 +640,9 @@ uint64_t coldvol_epoch(const coldvol *cv)
 {
     if (!cv)
         return 0;
+    uint64_t le = atomic_load_explicit(&((coldvol *)cv)->lead_epoch, memory_order_acquire);
+    if (le)
+        return le;
     return cv->epoch_fn ? cv->epoch_fn(cv->epoch_arg, cv->volume) : 1; /* D4: the constant 1 on a single server */
 }
 
@@ -756,6 +761,7 @@ int tier_engine_attach(eng *db)
     cv->volume = vol;
     cv->epoch_fn = at.epoch;
     cv->epoch_arg = at.epoch_arg;
+    atomic_init(&cv->lead_epoch, (at.lead_epoch && db->leader_open) ? at.lead_epoch : 0);
     if (at.settings)
         cv->set = *at.settings;
     else

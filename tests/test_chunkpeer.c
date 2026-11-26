@@ -370,7 +370,7 @@ static void test_fence_del(void)
     CHECK(coldops_peer.del(ctx, o.oid, 0, 7, COLD_DEL_SWEEP) == TSDB_ERR_UNAVAILABLE);
     chunk_report rep;
     CHECK(read_back(ctx, &o, &rep) == 0 && rep.decoded_cells == 0); /* every position still there */
-    /* the listing: every position once, and each one's header names the volume */
+    /* the listing: every position once, and each one's header names the volume and writer epoch */
     struct lst {
         unsigned n;
         unsigned pos_seen;
@@ -379,6 +379,24 @@ static void test_fence_del(void)
     owner_ctx = ctx;
     CHECK(coldops_peer.list_names(ctx, lf, &l) == 0);
     CHECK(l.n == chunk_npos(&o.g) && l.pos_seen == (1u << chunk_npos(&o.g)) - 1);
+    /* r8k-gc: nstripe, gc_suspended, and del_gc (requires mk_pos > 0 and valid epoch) */
+    CHECK(coldops_peer.nstripe(ctx) == 6);
+    CHECK(!coldops_peer.gc_suspended(ctx));
+    pthread_mutex_lock(&F.mu);
+    F.view.gc_suspended = 1;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.gc_suspended(ctx));
+    pthread_mutex_lock(&F.mu);
+    F.view.gc_suspended = 0;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.del_gc(ctx, o.oid, 0, 7, 0) == TSDB_ERR_INVALID);
+    CHECK(coldops_peer.del_gc(ctx, o.oid, 0, 6, 42) == CHUNK_ERR_FENCED);
+    for (unsigned pos = 0; pos < 6; pos++) {
+        int drc = coldops_peer.del_gc(ctx, o.oid, pos, 7, 42);
+        CHECK(drc == 0 || drc == TSDB_ERR_NOTFOUND);
+    }
+    CHECK(coldops_peer.del_gc(ctx, o.oid, 0, 7, 42) == TSDB_ERR_NOTFOUND);
+    CHECK(coldops_peer.obj_open(ctx, o.oid, NULL, NULL, &(cold_obj *){NULL}) == TSDB_ERR_NOTFOUND);
     obj_free(&o);
     coldops_peer.ctx_free(ctx);
     cluster_down();
@@ -391,6 +409,7 @@ int lf(void *c, const chunk_listed *e)
     } *l = c;
     l->n++;
     l->pos_seen |= 1u << e->pos;
+    CHECK(e->epoch == 7 && memcmp(e->vuuid, VUUID, 16) == 0 && e->status == CHUNK_ST_OK);
     uint8_t v[16] = {0};
     int rc = coldops_peer.owner(owner_ctx, e, v);
     if (rc != 0 || memcmp(v, VUUID, 16))
