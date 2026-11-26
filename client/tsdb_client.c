@@ -3467,7 +3467,7 @@ static bool tenant_rows(const uint8_t *b, size_t len, uint32_t count, int want, 
             return false;
         size_t need = r->nrows + count;
         if (need > *rcap) {
-            size_t cap = *rcap ? *rcap * 2 : 16;
+            size_t cap = *rcap ? *rcap : 16;
             while (cap < need)
                 cap = cap <= SIZE_MAX / (2 * sizeof *r->rows) ? cap * 2 : need;
             tsdbc_tenant_row *nr = realloc(r->rows, cap * sizeof *nr);

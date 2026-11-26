@@ -101,6 +101,32 @@ class LatestNamesTest {
                         for (int i = 0; i < n; i++)
                             b.putInt(0).put((byte) 2).position(12 + (i + 1) * 24);
                         reply(out, id, 0, b.array());
+                    } else if (op == Protocol.OP_QUERY_VALUES) {
+                        long series = pb.getLong(0);
+                        int n = series == ((1L << 32) | 999) ? 1_100_000 : 5; /* 17.6 MiB > IN_KEEP (16 MiB) vs small */
+                        int blen = 8 + n * 16;
+                        ByteBuffer hdr = ByteBuffer.allocate(13 + 8).order(ByteOrder.LITTLE_ENDIAN);
+                        hdr.putInt(9 + blen).putInt(id).put(Protocol.OP_REPLY).putInt(0);
+                        hdr.put((byte) 1).put((byte) 2).put((byte) 0).put((byte) 0).putInt(n); /* last=1, INT64 */
+                        out.write(hdr.array());
+                        byte[] chunk = new byte[64 * 1024];
+                        ByteBuffer cb = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN);
+                        for (int off = 0; off < n;) {
+                            int m = Math.min(n - off, chunk.length / 8);
+                            cb.clear();
+                            for (int i = 0; i < m; i++)
+                                cb.putLong(off + i);
+                            out.write(chunk, 0, m * 8);
+                            off += m;
+                        }
+                        for (int off = 0; off < n;) {
+                            int m = Math.min(n - off, chunk.length / 8);
+                            cb.clear();
+                            for (int i = 0; i < m; i++)
+                                cb.putLong((off + i) * 3L + 7L);
+                            out.write(chunk, 0, m * 8);
+                            off += m;
+                        }
                     } else {
                         reply(out, id, Status.ERR_INVALID, new byte[0]);
                     }
@@ -151,6 +177,39 @@ class LatestNamesTest {
             List<SeriesResult<Latest>> big2 = c.latest(bigIds, LatestOptions.defaults());
             assertEquals(bigIds.length, big2.size());
             assertEquals(capAfterFirst, c.inCapacity(), "retained receive buffer across repeated >1 MiB replies");
+
+            /* >16 MiB (IN_KEEP) reply grows receive buffer above 16 MiB and shrinks back to inBase (1 MiB) on endReply */
+            int[] peakCap = new int[1];
+            int[] gotRows = new int[1];
+            c.queryValues((1L << 32) | 999, 0, Long.MAX_VALUE, (ts, col, n) -> {
+                peakCap[0] = Math.max(peakCap[0], c.inCapacity());
+                long[] vals = col.longs();
+                for (int i = 0; i < n; i++) {
+                    long row = gotRows[0] + i;
+                    assertEquals(row, ts[i], "ts at " + row);
+                    assertEquals(row * 3L + 7L, vals[i], "val at " + row);
+                }
+                gotRows[0] += n;
+                return true;
+            });
+            assertEquals(1_100_000, gotRows[0]);
+            assertTrue(peakCap[0] > (16 << 20), "grew past IN_KEEP (16 MiB): " + peakCap[0]);
+            assertEquals(1 << 20, c.inCapacity(), "shrunk back to inBase (1 MiB) after oversized reply");
+
+            /* Subsequent reads on the same connection stay intact and keep inBase */
+            ValuePoints after = c.queryValues((1L << 32) | 1, 0, Long.MAX_VALUE);
+            assertEquals(5, after.size());
+            long[] afterTs = after.timestamps();
+            long[] afterVals = after.values().longs();
+            for (int i = 0; i < 5; i++) {
+                assertEquals(i, afterTs[i]);
+                assertEquals(i * 3L + 7L, afterVals[i]);
+            }
+            List<SeriesResult<Latest>> afterLatest = c.latestByName(cached, LatestOptions.defaults());
+            assertEquals(cached.length, afterLatest.size());
+            for (SeriesResult<Latest> e : afterLatest)
+                assertTrue(e.ok());
+            assertEquals(1 << 20, c.inCapacity(), "stayed on inBase after subsequent small replies");
         }
     }
 }

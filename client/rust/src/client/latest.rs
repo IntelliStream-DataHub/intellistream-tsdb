@@ -92,17 +92,17 @@ impl Client {
             }
             c.names_resolve(names, &misses, &mut resolved, &mut out)?;
             ids.clear();
-            let mut at = Vec::with_capacity(names.len());
-            for (i, id) in resolved.iter().enumerate() {
-                if let Some(id) = id {
-                    ids.push(*id);
-                    at.push(i);
-                }
-            }
+            ids.extend(resolved.iter().flatten().copied());
             if ids.len() == names.len() {
                 return c.latest_req(&ids, opts);
             }
             if !ids.is_empty() {
+                let mut at = Vec::with_capacity(ids.len());
+                for (i, id) in resolved.iter().enumerate() {
+                    if id.is_some() {
+                        at.push(i);
+                    }
+                }
                 let sub =
                     LatestOpts { ends: opts.ends.as_ref().map(|e| at.iter().map(|&i| e[i]).collect()), ..opts.clone() };
                 for (r, i) in c.latest_req(&ids, &sub)?.into_iter().zip(at) {

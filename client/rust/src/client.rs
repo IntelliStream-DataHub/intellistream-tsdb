@@ -2783,6 +2783,7 @@ impl Client {
         }
         #[cfg(unix)]
         if rem >= READ_BUF {
+            debug_assert!(self.stream.buffer().is_empty());
             return read_exact_uninit_unix(self.stream.get_ref(), &mut self.body, rem);
         }
         while rem > 0 {
@@ -2843,7 +2844,8 @@ fn read_exact_uninit_unix(stream: &TcpStream, dst: &mut Vec<u8>, mut rem: usize)
     let fd = stream.as_raw_fd();
     while rem > 0 {
         let spare = dst.spare_capacity_mut();
-        let want = rem.min(spare.len()).min(isize::MAX as usize);
+        debug_assert!(spare.len() >= rem);
+        let want = rem.min(spare.len()).min(i32::MAX as usize);
         // SAFETY: `spare` is valid writable memory of at least `want` bytes owned by `dst`,
         // `fd` is an open socket, and `dst.set_len` below advances only by the bytes `recv` wrote.
         let r = unsafe { libc::recv(fd, spare.as_mut_ptr().cast(), want, 0) };
