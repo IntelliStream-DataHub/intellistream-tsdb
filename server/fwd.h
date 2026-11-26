@@ -45,6 +45,7 @@
 
 #define FWD_HDR 16 /* the frame id and its check word (fwd_id_check) before every body: with the link's frame check
                     * off, a flipped id must not land a reply on another frame in flight, so a mismatch ends the link */
+#define FWD_HDR_EXTRA_MAX 64 /* max inline envelope prefix accepted by fwd_sendv */
 #define FWD_MSG_MAX (PL_FRAME_MAX - FWD_HDR)   /* a request or reply body: the whole frame fits one peerlink frame */
 #define FWD_CHUNK_MAX (1u << 20)               /* a streamed reply's chunk */
 #define FWD_CREDIT_DEFAULT 4                   /* chunks granted when a query stream starts */
@@ -143,6 +144,10 @@ struct fwd_msg {
  * chunk, its connection, or fwd_cancel. A negative return is NEVER_WRITTEN at once (no event follows). Any thread;
  * never blocks (a full queue is FWD_E_FULL). */
 int fwd_send(struct fwd *f, uint32_t peer, const struct fwd_msg *msg, uint64_t frame_id, uint64_t deadline_ns);
+/* Scatter variant of fwd_send: prepends hdr[0, hn) (at most FWD_HDR_EXTRA_MAX) before p[0, n) without an intermediate
+ * copy (hn + n <= FWD_MSG_MAX). */
+int fwd_sendv(struct fwd *f, uint32_t peer, int kind, const void *hdr, size_t hn, const void *p, size_t n,
+              uint64_t frame_id, uint64_t deadline_ns);
 /* The reply to a FWD request, on the connection it came on (FWD_E_DOWN once that connection is gone). Any thread. */
 int fwd_reply(struct fwd *f, const struct fwd_from *from, uint64_t frame_id, const void *p, size_t n);
 /* A request that must not be served on the connection it came on (a write op on FWDQ, a read on FWD: a flipped op

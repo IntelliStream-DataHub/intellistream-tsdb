@@ -501,6 +501,18 @@ static void chunks3(struct fake *f, uint64_t id, uint32_t peer, int kind)
     ev_at(f, 35, FWD_EV_CHUNK, kind, peer, id, 0, 1, b, n);
 }
 
+static void chunks5(struct fake *f, uint64_t id, uint32_t peer, int kind)
+{
+    uint8_t b[256];
+    ev_at(f, 5, FWD_EV_SENT, kind, peer, id, FWD_WRITTEN, 0, NULL, 0);
+    ev_at(f, 10, FWD_EV_CHUNK, kind, peer, id, 0, 0, "c1,", 3);
+    ev_at(f, 15, FWD_EV_CHUNK, kind, peer, id, 0, 0, "c2,", 3);
+    ev_at(f, 20, FWD_EV_CHUNK, kind, peer, id, 0, 0, "c3,", 3);
+    ev_at(f, 25, FWD_EV_CHUNK, kind, peer, id, 0, 0, "c4,", 3);
+    size_t n = with_tail(b, "c5", FWDR_T_STATS, 2000);
+    ev_at(f, 30, FWD_EV_CHUNK, kind, peer, id, 0, 1, b, n);
+}
+
 static void t_chunks(struct fwdr_tab *tab)
 {
     struct run r;
@@ -509,9 +521,28 @@ static void t_chunks(struct fwdr_tab *tab)
     run_go(&r);
     CHECK(r.res == FWDR_DONE);
     CHECK(r.f.nrel == 13 && !memcmp(r.f.relayed, "one,two,three", 13));
-    CHECK(r.f.credits_n == 2 && r.f.credits == 2);
+    /* Default credit_batch = FWD_CREDIT_DEFAULT / 2 (2): 2 non-last chunks -> 1 batched credit of 2. */
+    CHECK(r.f.credits_n == 1 && r.f.credits == 2);
     CHECK(r.tail.st.rows == 1000 && r.tail.st.result_rows == 500);
     CHECK(r.f.depth == 0);
+
+    /* 5 chunks (4 non-last) -> 2 batched credit calls of 2 (4 total). */
+    run_init(&r, tab, PL_KIND_FWDQ);
+    r.f.on_send = chunks5;
+    run_go(&r);
+    CHECK(r.res == FWDR_DONE);
+    CHECK(r.f.nrel == 14 && !memcmp(r.f.relayed, "c1,c2,c3,c4,c5", 14));
+    CHECK(r.f.credits_n == 2 && r.f.credits == 4);
+    CHECK(r.tail.st.rows == 2000 && r.tail.st.result_rows == 1000);
+    CHECK(r.f.depth == 0);
+
+    /* Explicit credit_batch = 1 grants 1 per non-last chunk. */
+    run_init(&r, tab, PL_KIND_FWDQ);
+    r.q.credit_batch = 1;
+    r.f.on_send = chunks3;
+    run_go(&r);
+    CHECK(r.res == FWDR_DONE);
+    CHECK(r.f.credits_n == 2 && r.f.credits == 2);
 }
 
 static void t_relayfail(struct fwdr_tab *tab)

@@ -95,6 +95,9 @@ struct fwdr_ops {
     void (*stall)(void *arg);            /* tests: just before each send attempt; NULL none */
     bool (*client_gone)(void *arg);
     int (*send)(void *arg, uint32_t peer, int kind, const void *p, size_t n, uint64_t frame_id, uint64_t deadline_ns);
+    /* Optional scatter send (msg[0..n) followed by payload[0..payload_len)); NULL falls back to send(). */
+    int (*sendv)(void *arg, uint32_t peer, int kind, const void *hdr, size_t hn, const void *p, size_t n,
+                 uint64_t frame_id, uint64_t deadline_ns);
     int (*cancel)(void *arg, uint32_t peer, uint64_t frame_id);
     int (*credit)(void *arg, uint32_t peer, uint64_t frame_id, uint32_t chunks);
     /* reply bytes for the client, in order; false: its connection is going away */
@@ -104,8 +107,11 @@ struct fwdr_ops {
 struct fwdr_req {
     uint32_t peer;
     int kind;           /* PL_KIND_FWD (a write: one reply) or PL_KIND_FWDQ (a read: chunks under credit) */
-    uint8_t *msg;       /* envelope + frame; age_ms is stamped at FWDR_AGE_AT before each attempt */
+    uint8_t *msg;       /* envelope (+ frame, or envelope+inner alone when o->sendv is set); age_ms stamped at FWDR_AGE_AT */
     size_t n;
+    const uint8_t *payload; /* optional payload for o->sendv (NULL when concatenated into msg) */
+    size_t payload_len;
+    uint32_t credit_batch;  /* FWDQ credit batch size (0: FWD_CREDIT_DEFAULT / 2) */
     uint64_t frame_id;
     int64_t arrival_ns; /* when the event loop read the frame */
     uint32_t max_age_ms, wait_ms, reply_ms; /* fwd_max_age, fwd_wait_ms, fwd_reply_ms (0: no reply deadline) */

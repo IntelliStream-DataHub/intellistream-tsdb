@@ -314,6 +314,7 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
+    atomic_bool peer_eof; /* event loop saw EOF (res == 0) on recv; read lock-free by fe_gone */
     atomic_uint proto;  /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
     atomic_int dom_v;   /* the volume the request now running is inside (handle), -1: any (it names none), 0: none */
     _Atomic int64_t nonup_since; /* when this request first waited for output inside a domain that is not UP
@@ -578,7 +579,7 @@ static void worker_waits(int delta)
     }
     pthread_mutex_lock(&work_lock);
     waiting_workers += delta;
-    if (delta < 0)
+    if (delta < 0 && running_workers > base_workers && running_workers - waiting_workers > 1)
         pthread_cond_broadcast(&work_cv); /* an idle extra may leave now that this one is free */
     if (delta > 0 && running_workers == waiting_workers && running_workers < base_workers + MAX_EXTRA_WORKERS &&
         !work_stop) {
@@ -3841,9 +3842,14 @@ static void handle_op(req *r)
         break;
     }
     case TSDB_OP_LAST_STATS: {
-        pthread_mutex_lock(&c->lock);
-        tsdb_query_stats st = c->last_stats;
-        pthread_mutex_unlock(&c->lock);
+        tsdb_query_stats st;
+        if (c->fwdo) {
+            st = c->last_stats;
+        } else {
+            pthread_mutex_lock(&c->lock);
+            st = c->last_stats;
+            pthread_mutex_unlock(&c->lock);
+        }
         uint64_t v[10] = {st.rows,  st.rows_decoded, st.rows_from_stats, st.memtable_rows,       st.bytes,
                           st.bytes_read, st.parts,  st.granules,        st.granules_from_stats, st.result_rows};
         reply(c, r->id, 0, &st.elapsed_s, 8, v, sizeof v, NULL, 0);
@@ -4065,10 +4071,10 @@ static bool fwd_knob(const char *name)
 #define FWD_HB 96
 #define FWD_STEP 1.189207115002721 /* 2^(1/4) */
 static struct fwd_peer_st {
-    uint32_t peer;
-    uint64_t frames, bytes, hist[FWD_HB];
+    _Atomic uint32_t peer;
+    _Atomic uint64_t frames, bytes, hist[FWD_HB];
 } fwd_peers[64];
-static pthread_mutex_t fwd_st_mu = PTHREAD_MUTEX_INITIALIZER; /* a leaf */
+static pthread_mutex_t fwd_st_mu = PTHREAD_MUTEX_INITIALIZER; /* a leaf, only when adding a new peer slot */
 
 static void fwd_peer_note(uint32_t peer, size_t bytes, uint64_t hop_ns)
 {
@@ -4076,15 +4082,31 @@ static void fwd_peer_note(uint32_t peer, size_t bytes, uint64_t hop_ns)
     int b = 0;
     while (b < FWD_HB - 1 && us >= up)
         b++, up *= FWD_STEP;
-    pthread_mutex_lock(&fwd_st_mu);
-    for (size_t i = 0; i < sizeof fwd_peers / sizeof fwd_peers[0]; i++)
-        if (fwd_peers[i].peer == peer || fwd_peers[i].peer == 0) {
-            fwd_peers[i].peer = peer;
-            fwd_peers[i].frames++;
-            fwd_peers[i].bytes += bytes;
-            fwd_peers[i].hist[b]++;
-            break;
+    size_t cap = sizeof fwd_peers / sizeof fwd_peers[0];
+    for (size_t i = 0; i < cap; i++) {
+        uint32_t p = atomic_load_explicit(&fwd_peers[i].peer, memory_order_acquire);
+        if (p == peer) {
+            atomic_fetch_add_explicit(&fwd_peers[i].frames, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&fwd_peers[i].bytes, bytes, memory_order_relaxed);
+            atomic_fetch_add_explicit(&fwd_peers[i].hist[b], 1, memory_order_relaxed);
+            return;
         }
+        if (p == 0)
+            break;
+    }
+    pthread_mutex_lock(&fwd_st_mu);
+    for (size_t i = 0; i < cap; i++) {
+        uint32_t p = atomic_load_explicit(&fwd_peers[i].peer, memory_order_relaxed);
+        if (p == peer || p == 0) {
+            if (p == 0)
+                atomic_store_explicit(&fwd_peers[i].peer, peer, memory_order_release);
+            pthread_mutex_unlock(&fwd_st_mu);
+            atomic_fetch_add_explicit(&fwd_peers[i].frames, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&fwd_peers[i].bytes, bytes, memory_order_relaxed);
+            atomic_fetch_add_explicit(&fwd_peers[i].hist[b], 1, memory_order_relaxed);
+            return;
+        }
+    }
     pthread_mutex_unlock(&fwd_st_mu);
 }
 
@@ -4104,13 +4126,17 @@ static double fwd_pct(const uint64_t *h, uint64_t total, double q) /* the bucket
 static size_t fwd_peer_rows(struct fwd_peer_row *out, size_t cap)
 {
     size_t n = 0;
-    pthread_mutex_lock(&fwd_st_mu);
-    for (size_t i = 0; i < sizeof fwd_peers / sizeof fwd_peers[0] && fwd_peers[i].peer && n < cap; i++) {
-        const struct fwd_peer_st *p = &fwd_peers[i];
-        out[n++] = (struct fwd_peer_row){p->peer, p->frames, p->bytes, fwd_pct(p->hist, p->frames, 0.50),
-                                         fwd_pct(p->hist, p->frames, 0.99)};
+    for (size_t i = 0; i < sizeof fwd_peers / sizeof fwd_peers[0] && n < cap; i++) {
+        uint32_t peer = atomic_load_explicit(&fwd_peers[i].peer, memory_order_acquire);
+        if (!peer)
+            break;
+        uint64_t frames = atomic_load_explicit(&fwd_peers[i].frames, memory_order_relaxed);
+        uint64_t bytes = atomic_load_explicit(&fwd_peers[i].bytes, memory_order_relaxed);
+        uint64_t hist[FWD_HB];
+        for (int b = 0; b < FWD_HB; b++)
+            hist[b] = atomic_load_explicit(&fwd_peers[i].hist[b], memory_order_relaxed);
+        out[n++] = (struct fwd_peer_row){peer, frames, bytes, fwd_pct(hist, frames, 0.50), fwd_pct(hist, frames, 0.99)};
     }
-    pthread_mutex_unlock(&fwd_st_mu);
     return n;
 }
 
@@ -4192,15 +4218,18 @@ static bool fe_gone(void *a)
     conn *c = ((struct fwd_ectx *)a)->c;
     if (fwdx_mutant == FWM_GONE)
         return false;
-    if (atomic_load(&c->closing))
-        return true;
-    struct pollfd pf = {.fd = c->fd, .events = POLLRDHUP};
-    return poll(&pf, 1, 0) > 0 && (pf.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
+    return atomic_load_explicit(&c->closing, memory_order_acquire) ||
+           atomic_load_explicit(&c->peer_eof, memory_order_acquire);
 }
 static int fe_send(void *a, uint32_t peer, int kind, const void *p, size_t n, uint64_t id, uint64_t dl)
 {
     struct fwd_msg m = {.kind = kind, .p = p, .n = n};
     return fwd_send(((struct fwd_ectx *)a)->f, peer, &m, id, dl);
+}
+static int fe_sendv(void *a, uint32_t peer, int kind, const void *hdr, size_t hn, const void *p, size_t n, uint64_t id,
+                    uint64_t dl)
+{
+    return fwd_sendv(((struct fwd_ectx *)a)->f, peer, kind, hdr, hn, p, n, id, dl);
 }
 static int fe_cancel(void *a, uint32_t peer, uint64_t id) { return fwd_cancel(((struct fwd_ectx *)a)->f, peer, id); }
 static int fe_credit(void *a, uint32_t peer, uint64_t id, uint32_t k)
@@ -4218,12 +4247,14 @@ static bool fe_relay(void *a, const uint8_t *p, size_t n)
 static int fwd_entry(req *r, uint32_t v)
 {
     struct fwd *f = fwd_cluster();
-    uint32_t node = 0;
-    uint64_t epoch = 0;
-    char addr[META_ADDR_MAX];
-    if (fwd_off || !f || !fwd_tab || cluster_vol_owner(v, &node, &epoch, addr, sizeof addr) != 1 ||
-        epoch >= META_EPOCH_LIMIT)
+    const struct cluster_copy *cp = route_copy();
+    const struct cluster_copy_vol *cv = cluster_copy_vol(cp, v);
+    const struct cluster_copy_member *cm = cv && cv->leader ? cluster_copy_member(cp, cv->leader) : NULL;
+    if (fwd_off || !f || !fwd_tab || !cm || cm->state != META_UP || (cp->self && cm->id == cp->self) ||
+        cv->epoch >= META_EPOCH_LIMIT)
         return 0;
+    uint32_t node = cm->id;
+    uint64_t epoch = cv->epoch;
     conn *c = r->c;
     size_t n = FWDR_ENV + FWDR_INNER + r->len;
     if (n > FWD_MSG_MAX)
@@ -4232,25 +4263,19 @@ static int fwd_entry(req *r, uint32_t v)
         fe_sleep(NULL, 10);
     if (fwd_knob("epoch"))
         epoch++;
-    uint8_t *m = malloc(n);
-    if (!m) {
-        reply_error(c, r->id, r->op, TSDB_ERR_NOMEM);
-        return 1;
-    }
-    const struct cluster_copy *cp = route_copy();
+    uint8_t env[FWDR_ENV + FWDR_INNER];
     uint32_t uid = auth_uid(&c->auth);
     struct fwdr_env e = {.epoch = (uint32_t)epoch, .hops = 1, .flags = uid ? FWDR_F_USER : 0,
-                         .origin = cp ? cp->self : 0, .uid = uid, .proto = atomic_load(&c->proto),
+                         .origin = cp->self, .uid = uid, .proto = atomic_load(&c->proto),
                          .vol = (uint16_t)v, .users_applied = auth_users_applied(), .id = r->id, .op = r->op};
-    fwdr_env_encode(m, &e);
+    fwdr_env_encode(env, &e);
     if (fwd_knob("badenv"))
-        m[0] ^= 0xff; /* another magic */
-    if (r->len)
-        memcpy(m + FWDR_ENV + FWDR_INNER, r->payload, r->len);
+        env[0] ^= 0xff; /* another magic */
     bool rd = !(auth_ops[r->op].need & R_WRITE);
     if (fwd_knob("opkind"))
         rd = !rd; /* as a flipped op would arrive: the owner must refuse it on this link */
-    struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = m, .n = n,
+    struct fwdr_req q = {.peer = node, .kind = rd ? PL_KIND_FWDQ : PL_KIND_FWD, .msg = env, .n = sizeof env,
+                         .payload = r->payload, .payload_len = r->len,
                          .frame_id = atomic_fetch_add(&fwd_seq, 1) + 1,
                          .arrival_ns = fwdx_mutant == FWM_ARRIVAL ? now_ns() : r->t_arr,
                          .max_age_ms = fwd_max_age_ms, .wait_ms = fwd_wait_ms, .reply_ms = fwd_reply_ms,
@@ -4259,13 +4284,12 @@ static int fwd_entry(req *r, uint32_t v)
     struct fwd_ectx x = {c, f};
     struct fwdr_ops o = {.arg = &x, .now_ns = fe_now, .sleep_ms = fe_sleep, .waits = fe_waits,
                          .stall = test_fwd_stall ? fe_stall : NULL, .client_gone = fe_gone, .send = fe_send,
-                         .cancel = fe_cancel, .credit = fe_credit, .relay = fe_relay};
+                         .sendv = fe_sendv, .cancel = fe_cancel, .credit = fe_credit, .relay = fe_relay};
     struct fwdr_tail tl;
     uint64_t hop = 0;
     atomic_fetch_add(&fwd_inflight, 1);
     int res = fwdr_run(&o, fwd_tab, &q, &tl, &hop);
     atomic_fetch_sub(&fwd_inflight, 1);
-    free(m);
     switch (res) {
     case FWDR_DONE:
         fwd_peer_note(node, n, hop);
@@ -4386,6 +4410,14 @@ static void fwdo_finish(conn *c, struct fwdr_tail *tl)
         fwd_reply(o->f, &o->from, o->frame_id, c->out.p, c->out.len);
 }
 
+struct fjob_fields {
+    struct fjob *next;
+    struct fwd_from from;
+    uint64_t frame_id;
+    int kind;
+    int64_t t_in;
+    size_t n;
+};
 struct fjob {
     struct fjob *next;
     struct fwd_from from;
@@ -4393,8 +4425,12 @@ struct fjob {
     int kind;
     int64_t t_in; /* when the dispatcher queued it (ns) */
     size_t n;
+    /* Pad so p + FWDR_ENV + FWDR_INNER (45) is 16-byte aligned when malloc returns 16-byte aligned memory, allowing
+     * fwd_serve to pass e.payload directly as r.payload with zero copy while keeping aligned casts valid under UBSan. */
+    uint8_t align_pad[16 - ((sizeof(struct fjob_fields) + FWDR_ENV + FWDR_INNER) % 16)];
     uint8_t p[];
 };
+_Static_assert((offsetof(struct fjob, p) + FWDR_ENV + FWDR_INNER) % 16 == 0, "fjob payload must be 16-byte aligned");
 static pthread_mutex_t fwd_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t fwd_cv = PTHREAD_COND_INITIALIZER, fwd_gone_cv = PTHREAD_COND_INITIALIZER;
 static struct fjob *fq_head, *fq_tail;
@@ -4420,7 +4456,7 @@ static void fwd_pool_waits(int delta)
 {
     pthread_mutex_lock(&fwd_lock);
     fwd_waiting += delta;
-    if (delta < 0)
+    if (delta < 0 && fwd_running > fwd_base && fwd_running - fwd_waiting > 1)
         pthread_cond_broadcast(&fwd_cv);
     if (delta > 0 && fwd_running == fwd_waiting && fwd_running < fwd_base + MAX_EXTRA_WORKERS &&
         !atomic_load(&fwd_stop))
@@ -4469,11 +4505,9 @@ static void fwd_serve(struct fjob *j)
     conn pc;
     memset(&pc, 0, sizeof pc);
     pc.fd = -1;
-    pthread_mutex_init(&pc.lock, NULL);
-    conn_cv_init(&pc.cv);
     auth_conn_init(&pc.auth);
     struct fwdo o = {.f = fwd_cluster(), .from = j->from, .frame_id = j->frame_id, .kind = j->kind};
-    pc.fwdo = &o;
+    pc.fwdo = &o; /* pc.lock/pc.cv are never used when pc.fwdo != NULL */
     struct fwdr_tail tl = {0};
     struct fwdr_env e;
     req r = {.c = &pc, .t_arr = j->t_in};
@@ -4496,13 +4530,8 @@ static void fwd_serve(struct fjob *j)
     }
     atomic_store(&pc.proto, e.proto);
     atomic_store(&pc.authed, true);
-    r.id = e.id, r.op = e.op, r.len = e.len;
-    if (!(r.payload = malloc(e.len ? e.len : 1))) {
-        atomic_store(&pc.closing, true);
-        goto done;
-    }
-    if (e.len)
-        memcpy(r.payload, e.payload, e.len);
+    /* e.payload points into j->p + FWDR_ENV + FWDR_INNER (16-byte aligned by fjob.align_pad) and is read-only. */
+    r.id = e.id, r.op = e.op, r.len = e.len, r.payload = (uint8_t *)e.payload;
     unav_vol = e.vol;
     while (fwd_knob("ownerstall"))
         fe_sleep(NULL, 10);
@@ -4540,11 +4569,8 @@ static void fwd_serve(struct fjob *j)
 done:
     if (o.f)
         fwdo_finish(&pc, &tl);
-    free(r.payload);
     auth_conn_free(&pc.auth);
     free(pc.out.p);
-    pthread_cond_destroy(&pc.cv);
-    pthread_mutex_destroy(&pc.lock);
 }
 
 static void *fwd_worker_main(void *arg)
@@ -5260,6 +5286,7 @@ static void on_recv(conn *c, ssize_t res)
         if (getenv("TSDBD_DEBUG"))
             fprintf(stderr, "tsdbd: connection %d: recv end\n", c->fd);
         c->eof = true;
+        atomic_store_explicit(&c->peer_eof, true, memory_order_release);
         finish_if_drained(c);
         return;
     }

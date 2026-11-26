@@ -45,6 +45,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -572,12 +575,10 @@ void pl_reader_free(struct pl_reader *r)
     free(r);
 }
 
-int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(void *arg, const struct pl_msg *m),
-                   void *arg)
+static int pl_reader_drain(struct pl_reader *r, int (*fn)(void *arg, const struct pl_msg *m), void *arg)
 {
     if (r->bad)
         return -1;
-    put(&r->rb, p, n);
     while (r->rb.len - r->rb.off >= 4) {
         const uint8_t *at = r->rb.p + r->rb.off;
         uint32_t len = le32(at);
@@ -633,6 +634,15 @@ int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(vo
     return 0;
 }
 
+int pl_reader_feed(struct pl_reader *r, const uint8_t *p, size_t n, int (*fn)(void *arg, const struct pl_msg *m),
+                   void *arg)
+{
+    if (r->bad)
+        return -1;
+    put(&r->rb, p, n);
+    return pl_reader_drain(r, fn, arg);
+}
+
 /* ------------------------------------------------------------------ the links */
 
 struct qf {
@@ -661,6 +671,7 @@ struct plink {
     _Atomic int transport; /* 0: down, 1: tcp, 2: rdma */
     void *arg;
     int evfd, evw;
+    _Atomic int wake_state; /* WAKE_AWAKE, WAKE_SLEEPING, WAKE_SIGNALED */
     pthread_t thr; /* a dialed link's thread (accepted ones run on detached threads, counted in pl->helpers) */
     int thr_valid;
     /* RDMA upgrade backoff state (dialed links, owned by dial_main / conn_run thread) */
@@ -672,22 +683,23 @@ struct plink {
     /* under pl->mu: accepted links. adopt_seq bumps when a connection that passed the handshake claims the link
      * (never before: a peer that fails AUTH replaces nothing); the connection running it, and any older one waiting
      * for it to leave, sees the bump and leaves. running: a connection's thread is inside conn_run. */
-    uint64_t adopt_seq;
+    _Atomic uint64_t adopt_seq;
     int running;
 
     pthread_mutex_t mu;
     pthread_cond_t cv;
+    int qwaiters; /* threads blocked in send_impl2 waiting for queue room (under mu) */
     int up;   /* a connection is established (from before on_link(up) runs) */
     int open; /* the driver may send: set once on_link(up) has returned (that thread may send from inside it) */
     pthread_t io_thr;
     int io_set;
     uint64_t gen;
     struct qf *qh, *qt;
-    size_t qbytes;
+    _Atomic size_t qbytes;
     struct jobq *jh, *jt;
-    int njobs;
-    uint64_t qdl_min;   /* the earliest deadline of a tracked frame in the queue (0: none; may be early, never late) */
-    uint64_t reset_gen; /* plink_reset: the connection to end */
+    _Atomic int njobs;
+    _Atomic uint64_t qdl_min;   /* the earliest deadline of a tracked frame in the queue (0: none; may be early, never late) */
+    _Atomic uint64_t reset_gen; /* plink_reset: the connection to end */
     _Atomic int stopped; /* plink_stop */
     _Atomic int paused;  /* plink_pause: the link's thread reads nothing from the socket meanwhile */
 };
@@ -714,20 +726,62 @@ struct peerlink {
 
 #define ST(pl, f, n) __atomic_add_fetch(&(pl)->st.f, (n), __ATOMIC_RELAXED)
 
-/* the wake-up of a link's thread: a nonblocking pipe (evfd the read end), portable where eventfd is not */
-static void wake(struct plink *l)
+enum { WAKE_AWAKE = 0, WAKE_SLEEPING = 1, WAKE_SIGNALED = 2 };
+
+/* the wake-up of a link's thread: eventfd on Linux, a nonblocking pipe elsewhere */
+static void wake_write(struct plink *l)
 {
+#ifdef __linux__
+    uint64_t one = 1;
+    if (write(l->evfd, &one, sizeof one) < 0) {
+        /* EAGAIN: the counter is saturated, so it is signalled */
+    }
+#else
     char one = 1;
     if (write(l->evw, &one, 1) < 0) {
         /* EAGAIN: the pipe is full, so it is signalled */
     }
+#endif
+}
+
+static void wake_read(struct plink *l)
+{
+#ifdef __linux__
+    uint64_t v;
+    if (read(l->evfd, &v, sizeof v) < 0) {
+        /* EAGAIN: already drained */
+    }
+#else
+    char v[64];
+    while (read(l->evfd, v, sizeof v) > 0)
+        ;
+#endif
+}
+
+/* Unconditional wake for cold paths (e.g. rdma_cm callbacks whose queue is outside plink). */
+static void wake_force(struct plink *l)
+{
+    atomic_store_explicit(&l->wake_state, WAKE_SIGNALED, memory_order_release);
+    wake_write(l);
+}
+
+/* Coalesced wake: skips the syscall while the link thread is awake or already signalled.
+ * Dekker seq_cst fence pairs with conn_run / dial_main storing WAKE_SLEEPING (seq_cst) before re-checking state. */
+static void wake(struct plink *l)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    int st = atomic_load_explicit(&l->wake_state, memory_order_seq_cst);
+    if (st != WAKE_SLEEPING)
+        return;
+    if (atomic_compare_exchange_strong_explicit(&l->wake_state, &st, WAKE_SIGNALED, memory_order_seq_cst,
+                                                memory_order_relaxed))
+        wake_write(l);
 }
 
 static void drain_evfd(struct plink *l)
 {
-    char v[64];
-    while (read(l->evfd, v, sizeof v) > 0)
-        ;
+    atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
+    wake_read(l);
 }
 
 static struct plink *link_new(struct peerlink *pl, int kind, int dialed)
@@ -738,6 +792,14 @@ static struct plink *link_new(struct peerlink *pl, int kind, int dialed)
     l->pl = pl;
     l->kind = kind;
     l->dialed = dialed;
+#ifdef __linux__
+    l->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    l->evw = -1;
+    if (l->evfd < 0) {
+        free(l);
+        return NULL;
+    }
+#else
     int pp[2] = {-1, -1};
     if (pipe(pp) != 0) {
         free(l);
@@ -749,6 +811,7 @@ static struct plink *link_new(struct peerlink *pl, int kind, int dialed)
     }
     l->evfd = pp[0];
     l->evw = pp[1];
+#endif
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
@@ -790,10 +853,7 @@ uint64_t plink_gen(const struct plink *l)
 
 size_t plink_queued(struct plink *l)
 {
-    pthread_mutex_lock(&l->mu);
-    size_t n = l->qbytes;
-    pthread_mutex_unlock(&l->mu);
-    return n;
+    return atomic_load_explicit(&l->qbytes, memory_order_relaxed);
 }
 
 static int send_impl2(struct plink *l, uint64_t gen, uint8_t type, const void *hdr, size_t hn, const void *p,
@@ -820,13 +880,7 @@ static int send_impl2(struct plink *l, uint64_t gen, uint8_t type, const void *h
     f->n = n;
     size_t cost = n + 48, cap = pl->cfg.queue_bytes ? pl->cfg.queue_bytes : PL_QUEUE_BYTES;
     struct timespec dl;
-    clock_gettime(CLOCK_MONOTONIC, &dl);
-    dl.tv_sec += timeout_ms / 1000;
-    dl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-    if (dl.tv_nsec >= 1000000000L) {
-        dl.tv_sec++;
-        dl.tv_nsec -= 1000000000L;
-    }
+    int dl_set = 0;
     int rc = PL_OK;
     pthread_mutex_lock(&l->mu);
     for (;;) {
@@ -844,9 +898,27 @@ static int send_impl2(struct plink *l, uint64_t gen, uint8_t type, const void *h
             break;
         }
         /* a frame larger than the whole queue still goes in when the queue is empty */
-        if (peerlink_mutant == PL_MUT_NOBACKPRESSURE || l->qbytes == 0 || l->qbytes + cost <= cap)
+        size_t qb = atomic_load_explicit(&l->qbytes, memory_order_relaxed);
+        if (peerlink_mutant == PL_MUT_NOBACKPRESSURE || qb == 0 || qb + cost <= cap)
             break;
-        if (timeout_ms <= 0 || pthread_cond_timedwait(&l->cv, &l->mu, &dl) != 0) {
+        if (timeout_ms <= 0) {
+            rc = PL_E_FULL;
+            break;
+        }
+        if (!dl_set) {
+            clock_gettime(CLOCK_MONOTONIC, &dl);
+            dl.tv_sec += timeout_ms / 1000;
+            dl.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+            if (dl.tv_nsec >= 1000000000L) {
+                dl.tv_sec++;
+                dl.tv_nsec -= 1000000000L;
+            }
+            dl_set = 1;
+        }
+        l->qwaiters++;
+        int wrc = pthread_cond_timedwait(&l->cv, &l->mu, &dl);
+        l->qwaiters--;
+        if (wrc != 0) {
             rc = PL_E_FULL;
             break;
         }
@@ -857,9 +929,11 @@ static int send_impl2(struct plink *l, uint64_t gen, uint8_t type, const void *h
         else
             l->qh = f;
         l->qt = f;
-        l->qbytes += cost;
-        if (f->deadline && (!l->qdl_min || f->deadline < l->qdl_min))
-            l->qdl_min = f->deadline;
+        atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) + cost,
+                              memory_order_release);
+        uint64_t qdl = atomic_load_explicit(&l->qdl_min, memory_order_relaxed);
+        if (f->deadline && (!qdl || f->deadline < qdl))
+            atomic_store_explicit(&l->qdl_min, f->deadline, memory_order_release);
     }
     pthread_mutex_unlock(&l->mu);
     if (rc != PL_OK) {
@@ -892,7 +966,7 @@ void plink_reset_gen(struct plink *l, uint64_t gen)
 {
     pthread_mutex_lock(&l->mu);
     if (l->up && (!gen || l->gen == gen))
-        l->reset_gen = l->gen;
+        atomic_store_explicit(&l->reset_gen, l->gen, memory_order_release);
     pthread_mutex_unlock(&l->mu);
     wake(l);
 }
@@ -914,8 +988,10 @@ int plink_unqueue(struct plink *l, uint64_t token)
         *pp = f->next;
         if (l->qt == f)
             l->qt = prev;
-        l->qbytes -= f->n + 48;
-        pthread_cond_broadcast(&l->cv);
+        atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) - (f->n + 48),
+                              memory_order_release);
+        if (l->qwaiters > 0)
+            pthread_cond_broadcast(&l->cv);
         free(f); /* qdl_min may now be early, which it is allowed to be */
         found = 1;
         break;
@@ -953,7 +1029,8 @@ int plink_test_ctl(struct plink *l, uint8_t type, const void *p, size_t n)
     else
         l->qh = f;
     l->qt = f;
-    l->qbytes += n + 48;
+    atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) + n + 48,
+                          memory_order_release);
     pthread_mutex_unlock(&l->mu);
     wake(l);
     return PL_OK;
@@ -979,9 +1056,10 @@ int plink_bulk_send(struct plink *l, const struct pl_job *job)
         q->j.max_attempts = 5;
     int rc = PL_OK;
     pthread_mutex_lock(&l->mu);
+    int nj = atomic_load_explicit(&l->njobs, memory_order_relaxed);
     if (atomic_load(&l->pl->closing))
         rc = PL_E_CLOSED;
-    else if (l->njobs >= MAX_JOBS)
+    else if (nj >= MAX_JOBS)
         rc = PL_E_FULL;
     else {
         if (l->jt)
@@ -989,7 +1067,7 @@ int plink_bulk_send(struct plink *l, const struct pl_job *job)
         else
             l->jh = q;
         l->jt = q;
-        l->njobs++;
+        atomic_store_explicit(&l->njobs, nj + 1, memory_order_release);
     }
     pthread_mutex_unlock(&l->mu);
     if (rc != PL_OK) {
@@ -1856,11 +1934,12 @@ static struct qf *q_expire(struct plink *l, uint64_t now)
 {
     struct qf *gone = NULL, **pp = &l->qh, *last = NULL;
     uint64_t min = 0;
+    size_t freed = 0;
     while (*pp) {
         struct qf *f = *pp;
         if (f->tracked && f->deadline && f->deadline <= now) {
             *pp = f->next;
-            l->qbytes -= f->n + 48;
+            freed += f->n + 48;
             f->next = gone;
             gone = f;
             continue;
@@ -1871,8 +1950,11 @@ static struct qf *q_expire(struct plink *l, uint64_t now)
         pp = &f->next;
     }
     l->qt = last;
-    l->qdl_min = min;
-    if (gone)
+    if (freed)
+        atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) - freed,
+                              memory_order_release);
+    atomic_store_explicit(&l->qdl_min, min, memory_order_release);
+    if (gone && l->qwaiters > 0)
         pthread_cond_broadcast(&l->cv);
     return gone;
 }
@@ -2026,7 +2108,7 @@ static void cm_fill_ip_from_tcp(const struct pl_transport *t, int peer, struct p
     }
 }
 
-static void cm_wake_cb(void *arg) { wake((struct plink *)arg); }
+static void cm_wake_cb(void *arg) { wake_force((struct plink *)arg); }
 
 static void up_cleanup(struct conn *c)
 {
@@ -2275,6 +2357,7 @@ static int up_switch_to_rdma(struct conn *c, int send_go)
         memcpy(tmp, c->up_rb.p + c->up_rb.off, nl);
         buf_free(&c->up_rb);
         int fr = pl_reader_feed(c->rd, tmp, nl, conn_msg, c);
+        c->last_rx = now_ns();
         free(tmp);
         if (fr != 0) {
             c->dead = 1;
@@ -2785,7 +2868,6 @@ static int conn_msg(void *arg, const struct pl_msg *m)
 {
     struct conn *c = arg;
     struct peerlink *pl = c->pl;
-    c->last_rx = now_ns();
     int is_up = m->type == PLT_RDMA_OFFER || m->type == PLT_RDMA_ACCEPT || m->type == PLT_RDMA_DECLINE ||
                 m->type == PLT_RDMA_ABORT;
     if (!is_up && (!c->settled || (c->up_state != UP_IDLE && c->up_state != UP_D_WAIT_ACCEPT)))
@@ -2914,13 +2996,16 @@ static void job_start(struct conn *c)
 {
     struct plink *l = c->l;
     while (!c->job) {
+        if (atomic_load_explicit(&l->njobs, memory_order_acquire) == 0)
+            return;
         pthread_mutex_lock(&l->mu);
         struct jobq *q = l->jh;
         if (q) {
             l->jh = q->next;
             if (!l->jh)
                 l->jt = NULL;
-            l->njobs--;
+            atomic_store_explicit(&l->njobs, atomic_load_explicit(&l->njobs, memory_order_relaxed) - 1,
+                                  memory_order_release);
         }
         pthread_mutex_unlock(&l->mu);
         if (!q)
@@ -3009,9 +3094,6 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     if (!c.rd || !c.zc)
         oom();
     c.rd->key = keys->in;
-    uint8_t *rbuf = malloc(READ_BUF);
-    if (!rbuf)
-        oom();
     drain_evfd(l);
     c.last_rx = c.last_ping = now_ns();
     /* Decide initial RDMA upgrade state before calling on_link(up) (design-rdma.md §5.1):
@@ -3058,16 +3140,19 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     int reset_seen = 0;
 
     while (!c.dead && !atomic_load(&pl->closing) && !atomic_load(&l->stopped)) {
-        pthread_mutex_lock(&pl->mu);
-        int kicked = !l->dialed && l->adopt_seq != my_seq;
-        pthread_mutex_unlock(&pl->mu);
-        if (kicked)
+        if (!l->dialed && atomic_load_explicit(&l->adopt_seq, memory_order_acquire) != my_seq)
             break;
         uint64_t now = now_ns();
-        pthread_mutex_lock(&l->mu);
-        int reset = c.settled && l->reset_gen == c.gen;
-        struct qf *expired = l->qdl_min && l->qdl_min <= now ? q_expire(l, now) : NULL;
-        pthread_mutex_unlock(&l->mu);
+        int reset = c.settled && atomic_load_explicit(&l->reset_gen, memory_order_acquire) == c.gen;
+        struct qf *expired = NULL;
+        uint64_t qdl0 = atomic_load_explicit(&l->qdl_min, memory_order_relaxed);
+        if (qdl0 && qdl0 <= now) {
+            pthread_mutex_lock(&l->mu);
+            uint64_t qdl1 = atomic_load_explicit(&l->qdl_min, memory_order_relaxed);
+            if (qdl1 && qdl1 <= now)
+                expired = q_expire(l, now);
+            pthread_mutex_unlock(&l->mu);
+        }
         while (expired) {
             struct qf *nx = expired->next;
             sent_cb(&c, expired->token, 0);
@@ -3151,47 +3236,64 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 break;
         }
         /* queued frames of the driver (held in l->qh while an upgrade is in flight: §5.1) */
+        int qmore = 0;
         if (c.up_state == UP_IDLE && c.settled) {
-            while (c.wb.len - c.wb.off < WB_HIGH) {
+            size_t pend = c.wb.len - c.wb.off;
+            if (pend < WB_HIGH && atomic_load_explicit(&l->qbytes, memory_order_acquire) > 0) {
+                struct qf *batch_h = NULL, *batch_t = NULL;
+                size_t want = WB_HIGH - pend, taken = 0, freed = 0;
                 pthread_mutex_lock(&l->mu);
-                struct qf *f = l->qh;
-                if (f) {
+                while (l->qh && taken < want) {
+                    struct qf *f = l->qh;
                     l->qh = f->next;
                     if (!l->qh)
                         l->qt = NULL;
-                    l->qbytes -= f->n + 48;
+                    freed += f->n + 48;
+                    f->next = NULL;
+                    if (batch_t)
+                        batch_t->next = f;
+                    else
+                        batch_h = f;
+                    batch_t = f;
+                    taken += f->n + 16;
+                }
+                if (freed)
+                    atomic_store_explicit(&l->qbytes, atomic_load_explicit(&l->qbytes, memory_order_relaxed) - freed,
+                                          memory_order_release);
+                qmore = l->qh != NULL;
+                if (batch_h && l->qwaiters > 0)
                     pthread_cond_broadcast(&l->cv);
-                }
                 pthread_mutex_unlock(&l->mu);
-                if (!f)
-                    break;
-                if (f->tracked && f->deadline && f->deadline <= now) {
-                    sent_cb(&c, f->token, 0);
-                    free(f);
-                    continue;
-                }
-                size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
-                frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, &c.zbuf, &c.zcap, l->kind != PL_KIND_BULK, f->type,
-                           f->p, f->n);
-                if (f->tracked) {
-                    if (c.trk_n == c.trk_cap) {
-                        if (c.trk_h) {
-                            memmove(c.trk, c.trk + c.trk_h, (c.trk_n - c.trk_h) * sizeof *c.trk);
-                            c.trk_n -= c.trk_h;
-                            c.trk_h = 0;
-                        } else {
-                            c.trk_cap = c.trk_cap ? c.trk_cap * 2 : 64;
-                            c.trk = realloc(c.trk, c.trk_cap * sizeof *c.trk);
-                            if (!c.trk)
-                                oom();
-                        }
+                for (struct qf *f = batch_h, *nx; f; f = nx) {
+                    nx = f->next;
+                    if (f->tracked && f->deadline && f->deadline <= now) {
+                        sent_cb(&c, f->token, 0);
+                        free(f);
+                        continue;
                     }
-                    c.trk[c.trk_n++] = (struct trk){f->token, c.wdone + pend0, c.wdone + (c.wb.len - c.wb.off)};
+                    size_t before = c.wb.len, pend0 = c.wb.len - c.wb.off;
+                    frame_user(&c.wb, &c.keys.out, &c.seq_out, c.zc, &c.zbuf, &c.zcap, l->kind != PL_KIND_BULK, f->type,
+                               f->p, f->n);
+                    if (f->tracked) {
+                        if (c.trk_n == c.trk_cap) {
+                            if (c.trk_h) {
+                                memmove(c.trk, c.trk + c.trk_h, (c.trk_n - c.trk_h) * sizeof *c.trk);
+                                c.trk_n -= c.trk_h;
+                                c.trk_h = 0;
+                            } else {
+                                c.trk_cap = c.trk_cap ? c.trk_cap * 2 : 64;
+                                c.trk = realloc(c.trk, c.trk_cap * sizeof *c.trk);
+                                if (!c.trk)
+                                    oom();
+                            }
+                        }
+                        c.trk[c.trk_n++] = (struct trk){f->token, c.wdone + pend0, c.wdone + (c.wb.len - c.wb.off)};
+                    }
+                    ST(pl, frames_out, 1);
+                    ST(pl, bytes_out, c.wb.len - before);
+                    ST(pl, raw_out, f->n);
+                    free(f);
                 }
-                ST(pl, frames_out, 1);
-                ST(pl, bytes_out, c.wb.len - before);
-                ST(pl, raw_out, f->n);
-                free(f);
             }
             job_start(&c);
             if (c.hp.active)
@@ -3273,7 +3375,7 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         /* a file with more to send, not held by the bucket, and nothing left to write: fill the buffer again at
          * once (with data in the buffer the POLLOUT below wakes us when the socket drains) */
         if (c.up_state == UP_IDLE && c.settled && c.wb.len == c.wb.off &&
-            (full || (!bwait && c.job && c.jstate == J_SEND)))
+            (full || qmore || (!bwait && c.job && c.jstate == J_SEND)))
             tmo = 0;
         if (c.up_state == UP_IDLE && c.settled && c.hp.active && !c.dead)
             tmo = 0; /* the next megabyte of a prefix */
@@ -3292,15 +3394,6 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             uint64_t rem = c.next_reoffer_ns <= t ? 0 : (c.next_reoffer_ns - t) / MS + 1;
             if (rem < (uint64_t)tmo)
                 tmo = (int)rem;
-        }
-        pthread_mutex_lock(&l->mu);
-        uint64_t qdl = l->qdl_min;
-        pthread_mutex_unlock(&l->mu);
-        if (qdl) { /* a queued frame's deadline */
-            uint64_t t = now_ns();
-            int d = qdl <= t ? 0 : (int)((qdl - t) / MS) + 1;
-            if (d < tmo)
-                tmo = d;
         }
         /* paused: no reading (a hangup or an error is still reported, and read); bytes left in the write buffer:
          * come back as soon as the transport takes more */
@@ -3335,13 +3428,43 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         pf[nt + nu + ncm] = (struct pollfd){l->evfd, POLLIN, 0};
         if ((ready || uready) && peerlink_mutant != PL_MUT_NOREADY)
             tmo = 0; /* the transport holds what we want already */
+        int armed_sleep = 0;
+        if (tmo > 0) {
+            /* Arm sleep before re-checking all wakeable state (Dekker seq_cst pair with wake()). */
+            atomic_store_explicit(&l->wake_state, WAKE_SLEEPING, memory_order_seq_cst);
+            armed_sleep = 1;
+            uint64_t qdl = atomic_load_explicit(&l->qdl_min, memory_order_seq_cst);
+            int need_wake = atomic_load_explicit(&pl->closing, memory_order_seq_cst) ||
+                            atomic_load_explicit(&l->stopped, memory_order_seq_cst) ||
+                            (!l->dialed && atomic_load_explicit(&l->adopt_seq, memory_order_seq_cst) != my_seq) ||
+                            atomic_load_explicit(&l->paused, memory_order_seq_cst) != paused ||
+                            (c.settled && atomic_load_explicit(&l->reset_gen, memory_order_seq_cst) == c.gen) ||
+                            (c.up_state == UP_IDLE && c.settled &&
+                             ((c.wb.len - c.wb.off < WB_HIGH &&
+                               atomic_load_explicit(&l->qbytes, memory_order_seq_cst) > 0) ||
+                              (!c.job && atomic_load_explicit(&l->njobs, memory_order_seq_cst) > 0)));
+            if (need_wake) {
+                tmo = 0;
+            } else if (qdl) { /* a queued frame's deadline */
+                uint64_t t = now_ns();
+                int d = qdl <= t ? 0 : (int)((qdl - t) / MS) + 1;
+                if (d < tmo)
+                    tmo = d;
+            }
+            if (tmo == 0) {
+                atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
+                armed_sleep = 0;
+            }
+        }
         int pr = poll(pf, (nfds_t)(nt + nu + ncm + 1), tmo);
+        if (armed_sleep)
+            atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
         if (pr < 0 && errno != EINTR)
             break;
         if (pr <= 0 && !ready && !uready)
             continue;
         if (pr > 0 && (pf[nt + nu + ncm].revents & POLLIN))
-            drain_evfd(l);
+            wake_read(l);
         if (pr > 0 && ncm && (pf[nt + nu].revents & (POLLIN | POLLERR | POLLHUP))) {
             up_step_cm(&c);
             if (c.dead)
@@ -3350,24 +3473,53 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         int tr = ready | (pr > 0 ? c.t->ops->poll_ready(c.t, pf, nt) : 0);
         int utr = c.up_t ? (uready | (pr > 0 && nu > 0 ? c.up_t->ops->poll_ready(c.up_t, pf + nt, nu) : 0)) : 0;
         if (tr & PL_TR_IN) {
-            ssize_t r = c.t->ops->read(c.t, rbuf, READ_BUF);
-            if (r > 0) {
-                c.last_rx = now_ns();
-                int fr = pl_reader_feed(c.rd, rbuf, (size_t)r, conn_msg, &c);
-                c.last_rx = now_ns(); /* our own callbacks' time is not the peer's silence */
-                if (fr != 0) {
-                    ST(pl, drops, 1);
-                    break;
+            int is_tcp = c.t->ops == &tcp_ops;
+            size_t budget = READ_BUF * 4, total = 0;
+            int rdead = 0;
+            for (;;) {
+                buf_reserve(&c.rd->rb, READ_BUF);
+                size_t avail = c.rd->rb.cap - c.rd->rb.len;
+                if (avail > READ_BUF)
+                    avail = READ_BUF;
+                ssize_t r = c.t->ops->read(c.t, c.rd->rb.p + c.rd->rb.len, avail);
+                if (r > 0) {
+                    c.rd->rb.len += (size_t)r;
+                    c.last_rx = now_ns();
+                    int fr = pl_reader_drain(c.rd, conn_msg, &c);
+                    c.last_rx = now_ns(); /* our own callbacks' time is not the peer's silence */
+                    if (fr != 0) {
+                        rdead = 1;
+                        break;
+                    }
+                    total += (size_t)r;
+                    /* On TCP, keep draining directly into rb while the read filled avail (up to budget); a short
+                     * read (< avail) already drained the kernel socket buffer, avoiding a guaranteed EAGAIN syscall.
+                     * Non-TCP transports (verbs, edge-mode fake) keep one read per poll turn so *ready stays exact. */
+                    if (!is_tcp || (size_t)r < avail || c.dead || c.t->ops != &tcp_ops || c.up_state != UP_IDLE ||
+                        total >= budget || c.wb.len > c.wb.off ||
+                        atomic_load_explicit(&l->paused, memory_order_relaxed) ||
+                        atomic_load_explicit(&pl->closing, memory_order_relaxed) ||
+                        atomic_load_explicit(&l->stopped, memory_order_relaxed))
+                        break;
+                    continue;
                 }
-            } else if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
+                if (r < 0 && errno == EINTR)
+                    continue;
+                if (r < 0 && errno == EAGAIN)
+                    break;
+                rdead = 1;
+                break;
+            }
+            if (rdead) {
                 ST(pl, drops, 1);
                 break;
             }
         }
         if (c.up_t && !c.dead && (utr & PL_TR_IN)) {
-            ssize_t r = c.up_t->ops->read(c.up_t, rbuf, READ_BUF);
+            buf_reserve(&c.up_rb, READ_BUF);
+            ssize_t r = c.up_t->ops->read(c.up_t, c.up_rb.p + c.up_rb.len, READ_BUF);
             if (r > 0) {
-                put(&c.up_rb, rbuf, (size_t)r);
+                c.up_rb.len += (size_t)r;
                 if (up_feed_qp(&c) != 0) {
                     if (c.up_state == UP_D_WAIT_READY)
                         up_dial_abort(&c, PL_RDMA_FB_QP_ERROR, 1);
@@ -3405,10 +3557,11 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
         if (!(peerlink_mutant == PL_MUT_RDMA_KEEPQUEUE && c.on_rdma)) {
             f = l->qh;
             l->qh = l->qt = NULL;
-            l->qbytes = 0;
-            l->qdl_min = 0;
+            atomic_store_explicit(&l->qbytes, 0, memory_order_release);
+            atomic_store_explicit(&l->qdl_min, 0, memory_order_release);
         }
-        pthread_cond_broadcast(&l->cv);
+        if (l->qwaiters > 0)
+            pthread_cond_broadcast(&l->cv);
         pthread_mutex_unlock(&l->mu);
     }
     /* the tracked frames still in wb: written if any of their bytes went (the mutant: all of them), else not; then
@@ -3438,7 +3591,8 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
             l->jh = q;
             if (!l->jt)
                 l->jt = q;
-            l->njobs++;
+            atomic_store_explicit(&l->njobs, atomic_load_explicit(&l->njobs, memory_order_relaxed) + 1,
+                                  memory_order_release);
             pthread_mutex_unlock(&l->mu);
         }
     }
@@ -3463,7 +3617,6 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
     buf_free(&c.wb);
     free(c.cbuf);
     free(c.hbuf);
-    free(rbuf);
     tsdb_wipe(&c.keys, sizeof c.keys);
 }
 
@@ -3495,10 +3648,16 @@ static void *dial_main(void *arg)
         tsdb_random(&rnd, sizeof rnd);
         uint64_t until = now_ns() + gap / 2 + rnd % (gap / 2 + 1);
         while (!atomic_load(&pl->closing) && !atomic_load(&l->stopped) && now_ns() < until) {
+            atomic_store_explicit(&l->wake_state, WAKE_SLEEPING, memory_order_seq_cst);
+            if (atomic_load(&pl->closing) || atomic_load(&l->stopped)) {
+                atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
+                break;
+            }
             struct pollfd pf = {l->evfd, POLLIN, 0};
             poll(&pf, 1, 20);
+            atomic_store_explicit(&l->wake_state, WAKE_AWAKE, memory_order_relaxed);
             if (pf.revents & POLLIN)
-                drain_evfd(l);
+                wake_read(l);
         }
         gap = gap * 2 > hi ? hi : gap * 2;
     }
@@ -3546,12 +3705,16 @@ static void claim_run(struct peerlink *pl, int ok, int hand, uint32_t peer, int 
     struct plink *l = ok && !atomic_load(&pl->closing) ? accepted_link(pl, peer, kind) : NULL;
     uint64_t my = 0;
     if (l) {
-        my = peerlink_mutant == PL_MUT_NOKICK ? l->adopt_seq : ++l->adopt_seq;
+        uint64_t cur = atomic_load_explicit(&l->adopt_seq, memory_order_relaxed);
+        my = peerlink_mutant == PL_MUT_NOKICK ? cur : cur + 1;
+        if (peerlink_mutant != PL_MUT_NOKICK)
+            atomic_store_explicit(&l->adopt_seq, my, memory_order_release);
         wake(l);
         pthread_cond_broadcast(&pl->acv);
-        while (l->running && l->adopt_seq == my && !atomic_load(&pl->closing))
+        while (l->running && atomic_load_explicit(&l->adopt_seq, memory_order_relaxed) == my &&
+               !atomic_load(&pl->closing))
             pthread_cond_wait(&pl->acv, &pl->mu);
-        if (l->adopt_seq != my || atomic_load(&pl->closing))
+        if (atomic_load_explicit(&l->adopt_seq, memory_order_relaxed) != my || atomic_load(&pl->closing))
             l = NULL;
         else
             l->running = 1;
@@ -3739,7 +3902,8 @@ struct plink *peerlink_dial(struct peerlink *pl, uint32_t want_id, const char *a
     if (pthread_create(&l->thr, NULL, dial_main, l) != 0) {
         pthread_mutex_unlock(&pl->mu);
         close(l->evfd);
-        close(l->evw);
+        if (l->evw >= 0)
+            close(l->evw);
         free(l);
         return NULL;
     }
@@ -3885,7 +4049,8 @@ void peerlink_free(struct peerlink *pl)
     for (struct plink *l = pl->links; l; l = l->next) {
         wake(l);
         pthread_mutex_lock(&l->mu);
-        pthread_cond_broadcast(&l->cv);
+        if (l->qwaiters > 0)
+            pthread_cond_broadcast(&l->cv);
         pthread_mutex_unlock(&l->mu);
     }
     pthread_mutex_unlock(&pl->mu);
@@ -3911,7 +4076,8 @@ void peerlink_free(struct peerlink *pl)
             q = n;
         }
         close(l->evfd);
-        close(l->evw);
+        if (l->evw >= 0)
+            close(l->evw);
         pthread_cond_destroy(&l->cv);
         pthread_mutex_destroy(&l->mu);
         free(l);
