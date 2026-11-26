@@ -53,6 +53,7 @@
         tsdb_test_midplace;
         tsdb_test_observe;
         tsdb_test_precommit;
+        tsdb_test_reencode;
         tsdb_test_reopen_hook;
         tsdb_test_replica_drops_files;
         tsdb_test_replica_drops_floor;
