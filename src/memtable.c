@@ -622,7 +622,11 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 uint32_t p = 0;
                 for (uint32_t i = 0; i < m->nids; i++) {
                     uint32_t id = m->ids[i];
-                    if (m->s[id].n)
+                    const mt_series *ms = &m->s[id];
+                    if (ms->n == 0)
+                        continue;
+                    int ty = ms->fl ? (int)ms->type : series_type(&db->series, id);
+                    if (ty == only_type)
                         ids[p++] = id;
                 }
             }

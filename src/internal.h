@@ -1175,7 +1175,8 @@ typedef struct series_dict {
      * non-zero refuses the create with nothing written and the id not taken */
     int (*before_append)(void *arg, uint32_t id, const char *name, size_t len, int type);
     void *before_arg;
-    bool keep_names;   /* series_close leaves the name strings: tsdb_series_name pointers outlive a retired engine */
+    bool keep_names;      /* series_close leaves the name strings: tsdb_series_name pointers outlive a retired engine */
+    uint32_t keep_prefix; /* series_close leaves [0..keep_prefix): borrowed from or handed to another engine */
 } series_dict;
 enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 
@@ -2439,10 +2440,6 @@ int eng_close(eng *db);
 /* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
  * `tsdb_series_name` pointers callers hold until tsdb_close. */
 int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept);
-/* The new engine of a reopen takes over the name strings of the old one that it also has (same name at the same
- * index; the dictionaries are append-only), frees its own copies, and eng_retire(old) then keeps only the rest: the
- * pointers tsdb_series_name handed out stay valid, and a recovery adds no names to kept_names. Before neu is listed. */
-void eng_adopt_names(eng *neu, eng *old);
 /* Recovery of a halted engine (revalidate.c, ha.md 15.5 step 3 and 4); see tsdb_volume_reopen. */
 int wal_verify_tail(eng *db, const char *dir); /* 0 intact, 1 the storage lost what was durable, <0 error */
 int wal_relog(eng *db, const char *dir, uint64_t *rows); /* the rows memory holds into a new segment */

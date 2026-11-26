@@ -380,6 +380,8 @@ enum { LM_SLICE = 64, LM_SLICE_ROWS = 4096 };
 static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n, const int64_t *lo,
                          const int64_t *ends, int64_t end, bool with_nulls, latest_row *out)
 {
+    if (n == 0)
+        return 0;
     lctx x = {0};
     x.db = db;
     x.c = *c;
@@ -387,7 +389,7 @@ static int search_on_cut(eng *db, const qcut *c, const uint32_t *local, size_t n
     x.np = x.c.np;
     size_t nm = x.c.ntails + x.c.nms;
     bool need_lock = x.c.ntails || x.c.has_active;
-    size_t slice_cap = need_lock ? MIN(n, (size_t)LM_SLICE) : 1;
+    size_t slice_cap = need_lock ? MIN(n ? n : 1, (size_t)LM_SLICE) : 1;
     x.ord = malloc((x.np ? x.np : 1) * sizeof *x.ord);
     x.tp = malloc((x.np ? x.np : 1) * sizeof *x.tp);
     mem_run *sruns = nm ? calloc(slice_cap * nm, sizeof *sruns) : NULL;

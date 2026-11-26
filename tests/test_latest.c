@@ -2232,6 +2232,76 @@ static void test_latest_multivol_batch(void)
     rmrf(dir), rmrf(v1), rmrf(v2), rmrf(v3);
 }
 
+/* Exercises search_on_cut with: (1) a single series holding > LM_SLICE_ROWS (5000) rows in the active memtable
+ * (both sorted and unsorted, plus trailing null and a second series right after it in the same batch), and
+ * (2) n == 0 with an active memtable (need_lock == true) so calloc(0, ...) is never called. */
+static void test_latest_large_active_and_empty(void)
+{
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/latest_large_active", root);
+    rmrf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.latest_cache = 0; /* force slow path search_on_cut */
+    o.buffer_rows = 1u << 16;
+    o.wal_max_batch_rows = 1u << 15;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid big = 0, big_unsorted = 0, after = 0;
+    OK(tsdb_series_create(db, "la.big", TSDB_FLOAT64, NULL, &big));
+    OK(tsdb_series_create(db, "la.big_unsorted", TSDB_FLOAT64, NULL, &big_unsorted));
+    OK(tsdb_series_create(db, "la.after", TSDB_FLOAT64, NULL, &after));
+
+    enum { NROWS = 5000 }; /* > LM_SLICE_ROWS (4096) */
+    int64_t *ts = malloc(NROWS * sizeof *ts);
+    double *vals = malloc(NROWS * sizeof *vals);
+    CHECK(ts && vals);
+    for (int i = 0; i < NROWS; i++) {
+        ts[i] = 10000 + i;
+        vals[i] = (double)(i + 1) * 0.5;
+    }
+    tsdb_values col = {TSDB_FLOAT64, vals, NULL};
+    OK(tsdb_insert_series_values(db, big, ts, &col, NROWS));
+    put_f64(db, big, 10000 + NROWS, 0.0, true); /* trailing null at newest ts */
+
+    /* Second > 4096-row series inserted out of order to exercise mt_copy_raw + mt_finish sort path */
+    for (int i = 0; i < NROWS; i++) {
+        ts[i] = 10000 + (NROWS - 1 - i);
+        vals[i] = (double)(NROWS - i);
+    }
+    OK(tsdb_insert_series_values(db, big_unsorted, ts, &col, NROWS));
+    put_f64(db, after, 99999, 123.75, false);
+
+    /* n == 0 via public API and directly via eng_latest_search while active memtable is non-empty */
+    OK(tsdb_latest(db, NULL, 0, NULL, NULL));
+    eng *e = tsdb_test_engine(db, 0);
+    CHECK(e != NULL);
+    OK(eng_latest_search(e, NULL, 0, NULL, TSDB_TS_MAX, false, NULL));
+
+    tsdb_sid q[3] = {big, big_unsorted, after};
+    tsdb_latest_result res[3];
+    tsdb_latest_opts lo = {.end = TSDB_TS_MAX, .with_nulls = 0};
+    OK(tsdb_latest(db, q, 3, &lo, res));
+    CHECK(res[0].status == 0 && res[0].kind == TSDB_LATEST_VALUE && res[0].ts == 10000 + NROWS - 1 &&
+          res[0].v.f64 == (double)NROWS * 0.5);
+    CHECK(res[1].status == 0 && res[1].kind == TSDB_LATEST_VALUE && res[1].ts == 10000 + NROWS - 1 &&
+          res[1].v.f64 == (double)NROWS);
+    CHECK(res[2].status == 0 && res[2].kind == TSDB_LATEST_VALUE && res[2].ts == 99999 && res[2].v.f64 == 123.75);
+
+    lo.with_nulls = 1;
+    OK(tsdb_latest(db, q, 3, &lo, res));
+    CHECK(res[0].status == 0 && res[0].kind == TSDB_LATEST_NULL && res[0].ts == 10000 + NROWS);
+    CHECK(res[1].status == 0 && res[1].kind == TSDB_LATEST_VALUE && res[1].ts == 10000 + NROWS - 1);
+    CHECK(res[2].status == 0 && res[2].kind == TSDB_LATEST_VALUE && res[2].ts == 99999);
+
+    free(ts);
+    free(vals);
+    OK(tsdb_close(db));
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_latest", 1200);
@@ -2353,6 +2423,8 @@ int main(int argc, char **argv)
     printf("concurrent with windows ok\n");
     test_latest_multivol_batch();
     printf("multivol batch ok\n");
+    test_latest_large_active_and_empty();
+    printf("large active and empty ok\n");
     rmrf(root);
     printf("test_latest ok\n");
     return 0;

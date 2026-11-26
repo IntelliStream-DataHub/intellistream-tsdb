@@ -682,6 +682,105 @@ static void series_stats_reopen(void)
     tsdb_close(db);
 }
 
+/* Regression for dict_adopt vs lock-free series_name under eager stats (o.stats = 1) + tenants:
+ * creates > 256 series (multiple series_tab growths on open), tests concurrent name reads across reopens,
+ * and exercises a failed tsdb_volume_reopen after dict_adopt (load_parts failure on a corrupt part) followed
+ * by a clean retry so old's strings are neither double-freed nor lost. */
+static void reopen_with_stats_and_tenants(void)
+{
+    char root[1024], vol[1024], badpart[1100];
+    snprintf(root, sizeof root, "%s/stats_reopen_root", scratch);
+    snprintf(vol, sizeof vol, "%s/stats_reopen_vol", scratch);
+    snprintf(badpart, sizeof badpart, "%s/p0_9999_9999_0.part", vol);
+    sh("rm -rf '%s' '%s'", root, vol);
+
+    const char *tenants[] = {"alpha.", "beta."};
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 1;
+    o.stats = 1; /* eager sweeper: runs during eng_open_sched */
+    o.tenants = tenants;
+    o.ntenants = 2;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    uint32_t vi = 0;
+    OK(tsdb_volume_add(db, vol, &vi));
+    CHECK(vi == 1);
+
+    enum { N = 600 }; /* > 256 so series_open grows series_tab multiple times */
+    tsdb_sid ids[N];
+    const char *before[N];
+    for (int i = 0; i < N; i++) {
+        char nm[64];
+        const char *pfx = (i % 3 == 0) ? "alpha." : (i % 3 == 1) ? "beta." : "other.";
+        snprintf(nm, sizeof nm, "%ss%04d", pfx, i);
+        OK(tsdb_series_create(db, nm, i == 0 ? TSDB_STATE : TSDB_FLOAT32, vol, &ids[i]));
+        before[i] = tsdb_series_name(db, ids[i]);
+        CHECK(before[i] != NULL && strcmp(before[i], nm) == 0);
+        int64_t ts = 1000 + i;
+        if (i == 0) {
+            uint32_t st = 0;
+            OK(tsdb_state(db, ids[0], "running", &st));
+            tsdb_values v = {TSDB_STATE, &st, NULL};
+            OK(tsdb_insert_series_values(db, ids[0], &ts, &v, 1));
+        } else {
+            float fv = (float)i;
+            OK(tsdb_insert_series(db, ids[i], &ts, &fv, 1));
+        }
+    }
+    OK(tsdb_flush(db));
+
+    /* Reopen repeatedly with eager stats sweeper active on the new engine. */
+    for (int round = 0; round < 3; round++) {
+        stop_volume(db);
+        tsdb_volume_report rep;
+        OK(tsdb_volume_reopen(db, 1, &rep));
+        CHECK(!rep.diverged);
+        OK(tsdb_volume_resume(db, 1));
+    }
+    CHECK(tsdb_test_kept_names(db) == 0);
+    for (int i = 0; i < N; i++) {
+        char nm[64];
+        const char *pfx = (i % 3 == 0) ? "alpha." : (i % 3 == 1) ? "beta." : "other.";
+        snprintf(nm, sizeof nm, "%ss%04d", pfx, i);
+        CHECK(strcmp(before[i], nm) == 0);
+        CHECK(tsdb_series_name(db, ids[i]) == before[i]);
+    }
+
+    /* Inject a corrupt part so eng_reopen fails in load_parts AFTER series_open + dict_adopt + stats_start:
+     * eng_close(neu) must NOT free old's strings, and a subsequent retry must succeed cleanly. */
+    stop_volume(db);
+    FILE *fp = fopen(badpart, "wb");
+    CHECK(fp != NULL);
+    if (fp) {
+        static const char junk[16] = "corruptpartdata!";
+        CHECK(fwrite(junk, 1, sizeof junk, fp) == sizeof junk);
+        fclose(fp);
+    }
+    CHECK(tsdb_volume_reopen(db, 1, NULL) != 0);
+    for (int i = 0; i < N; i++) {
+        char nm[64];
+        const char *pfx = (i % 3 == 0) ? "alpha." : (i % 3 == 1) ? "beta." : "other.";
+        snprintf(nm, sizeof nm, "%ss%04d", pfx, i);
+        CHECK(strcmp(before[i], nm) == 0); /* old still owns its strings (ASan: not freed) */
+    }
+    CHECK(unlink(badpart) == 0);
+    tsdb_volume_report rep;
+    OK(tsdb_volume_reopen(db, 1, &rep));
+    CHECK(!rep.diverged);
+    OK(tsdb_volume_resume(db, 1));
+    CHECK(tsdb_test_kept_names(db) == 0);
+    for (int i = 0; i < N; i++)
+        CHECK(tsdb_series_name(db, ids[i]) == before[i]);
+
+    tsdb_tenant_stats ta, tb, tn;
+    OK(tsdb_tenant_stats_get(db, "alpha.", 1, &ta));
+    OK(tsdb_tenant_stats_get(db, "beta.", 1, &tb));
+    OK(tsdb_tenant_stats_get(db, NULL, 1, &tn));
+    OK(tsdb_close(db));
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_recover", 1200);
@@ -769,6 +868,7 @@ int main(int argc, char **argv)
     lookups_do_not_starve_idle();
     multi_cut_holds_volume();
     series_stats_reopen();
+    reopen_with_stats_and_tenants();
     scratch_done(failures);
     if (failures) {
         fprintf(stderr, "test_recover: %d failures\n", failures);

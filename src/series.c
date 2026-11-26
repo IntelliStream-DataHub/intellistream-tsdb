@@ -318,6 +318,15 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
         d->last_check = load32(buf + pos);
         pos += rec;
     }
+    /* Single-threaded open: no lock-free reader exists yet, so discard intermediate growth snapshots. */
+    series_tab *cur = atomic_load_explicit(&d->tab, memory_order_relaxed);
+    if (cur) {
+        for (series_tab *t = cur->older, *o; t; t = o) {
+            o = t->older;
+            free(t);
+        }
+        cur->older = NULL;
+    }
     if (rc == 0 && pos != size && valid_after(buf, pos, size, 0)) {
         fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", file, pos);
         rc = TSDB_ERR_CORRUPT;
@@ -429,7 +438,8 @@ void series_close(series_dict *d)
 {
     uint32_t n = atomic_load_explicit(&d->count, memory_order_acquire);
     series_tab *cur = atomic_load_explicit(&d->tab, memory_order_acquire);
-    for (uint32_t i = 0; !d->keep_names && cur && i < n; i++)
+    uint32_t start = d->keep_names ? n : d->keep_prefix;
+    for (uint32_t i = start; cur && i < n; i++)
         free(cur->names[i]);
     for (series_tab *t = cur, *o; t; t = o) {
         o = t->older;

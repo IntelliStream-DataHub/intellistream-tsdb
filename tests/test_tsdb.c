@@ -3365,6 +3365,7 @@ typedef struct {
     tsdb *db;
     int tid;
     int per_thread;
+    int total;
     _Atomic tsdb_sid *sids;
     _Atomic int *stop;
 } slf_ctx;
@@ -3424,7 +3425,7 @@ static void *slf_creator(void *arg)
 static void *slf_reader(void *arg)
 {
     slf_ctx *c = arg;
-    int total = 4 * c->per_thread;
+    int total = c->total;
     uint64_t r = 0x123456789abcdef0ull ^ (uint64_t)(c->tid + 1) * 0x9e3779b97f4a7c15ull;
     while (!atomic_load_explicit(c->stop, memory_order_acquire)) {
         for (int k = 0; k < 64; k++) {
@@ -3465,8 +3466,8 @@ static void test_series_lockfree_mt(const char *base)
     slf_ctx cctx[NTH], rctx[NTH];
     pthread_t ct[NTH], rt[NTH];
     for (int i = 0; i < NTH; i++) {
-        cctx[i] = (slf_ctx){db, i, PER, sids, &stop};
-        rctx[i] = (slf_ctx){db, i, PER, sids, &stop};
+        cctx[i] = (slf_ctx){db, i, PER, TOTAL, sids, &stop};
+        rctx[i] = (slf_ctx){db, i, PER, TOTAL, sids, &stop};
         CHECK(pthread_create(&rt[i], NULL, slf_reader, &rctx[i]) == 0);
         CHECK(pthread_create(&ct[i], NULL, slf_creator, &cctx[i]) == 0);
     }

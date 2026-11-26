@@ -2130,7 +2130,7 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
  the old engine's digest thread, so its flag is final. */
     if (atomic_load_explicit(&old->diverged, memory_order_acquire))
         atomic_store_explicit(&e->diverged, true, memory_order_release);
-    eng_adopt_names(e, old); /* before anyone can see e: its own copies of the names go, the handed-out ones stay */
+    /* eng_reopen already adopted old's handed-out name pointers before starting e's threads */
     pthread_mutex_lock(&t->set_mu); /* from the catch-up to the swap: a list set in between would miss e */
     tenants_catch_up(t, e, tlgen);
     pthread_rwlock_wrlock(&t->lock);
@@ -3141,6 +3141,20 @@ static lvol_ent *lvol_find(lvol_map *vm, uint32_t vol, bool insert)
     return &vm->e[h];
 }
 
+static int miss_push(size_t **miss, size_t *nmiss, size_t *cap, size_t idx)
+{
+    if (*nmiss == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        size_t *nm = realloc(*miss, nc * sizeof *nm);
+        if (!nm)
+            return TSDB_ERR_NOMEM;
+        *miss = nm;
+        *cap = nc;
+    }
+    (*miss)[(*nmiss)++] = idx;
+    return 0;
+}
+
 int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *opts, tsdb_latest_result *out)
 {
     if (n > (size_t)1 << 20)
@@ -3177,19 +3191,8 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
         if (v < 0)
             continue;
         if ((size_t)v >= nv) {
-            if (ro) {
-                if (nmiss == miss_cap) {
-                    size_t nc = miss_cap ? miss_cap * 2 : 64;
-                    size_t *nm = realloc(miss, nc * sizeof *nm);
-                    if (!nm) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    miss = nm;
-                    miss_cap = nc;
-                }
-                miss[nmiss++] = i;
-            }
+            if (ro && (rc = miss_push(&miss, &nmiss, &miss_cap, i)) != 0)
+                break;
             continue;
         }
         uint32_t vu = (uint32_t)v;
@@ -3216,102 +3219,72 @@ int tsdb_latest(tsdb *t, const tsdb_sid *ids, size_t n, const tsdb_latest_opts *
             uint32_t local = TSDB_SID_LOCAL(ids[i]);
             if (local < ent->cnt) {
                 it[m++] = (latest_item){ent->e, local, (uint32_t)i};
-            } else if (ro) {
-                if (nmiss == miss_cap) {
-                    size_t nc = miss_cap ? miss_cap * 2 : 64;
-                    size_t *nm = realloc(miss, nc * sizeof *nm);
-                    if (!nm) {
-                        rc = TSDB_ERR_NOMEM;
-                        break;
-                    }
-                    miss = nm;
-                    miss_cap = nc;
-                }
-                miss[nmiss++] = i;
+            } else if (ro && (rc = miss_push(&miss, &nmiss, &miss_cap, i)) != 0) {
+                break;
             }
         } else if (ent->rc) {
             out[i].status = ent->rc; /* a quiesced volume: UNAVAILABLE, not NOTFOUND (ha.md 15.5) */
-        } else if (ro) {
-            if (nmiss == miss_cap) {
-                size_t nc = miss_cap ? miss_cap * 2 : 64;
-                size_t *nm = realloc(miss, nc * sizeof *nm);
-                if (!nm) {
-                    rc = TSDB_ERR_NOMEM;
-                    break;
-                }
-                miss = nm;
-                miss_cap = nc;
-            }
-            miss[nmiss++] = i;
+        } else if (ro && (rc = miss_push(&miss, &nmiss, &miss_cap, i)) != 0) {
+            break;
         }
     }
     pthread_rwlock_unlock(&t->lock);
 
     /* Follower catch-up for any missed IDs: reload each distinct missed volume once, then re-resolve under one lock. */
     if (rc == 0 && nmiss) {
-        uint32_t *mvols = malloc(nmiss * sizeof *mvols);
-        size_t nmvols = 0;
-        if (!mvols) {
-            rc = TSDB_ERR_NOMEM;
-        } else {
-            for (size_t k = 0; k < nmiss; k++) {
-                uint32_t vu = (uint32_t)sid_volume(ids[miss[k]]);
-                bool seen = false;
-                for (size_t j = 0; j < nmvols; j++)
-                    if (mvols[j] == vu) {
-                        seen = true;
-                        break;
-                    }
-                if (!seen)
-                    mvols[nmvols++] = vu;
-            }
-            for (size_t j = 0; j < nmvols; j++) {
-                eng *ve = volume_at(t, mvols[j], true);
-                if (ve)
-                    (void)eng_series_reload(ve);
-            }
-            free(mvols);
-            pthread_rwlock_rdlock(&t->lock);
-            nv = t->nvols;
-            for (size_t k = 0; k < nmiss; k++) {
-                size_t idx = miss[k];
-                int64_t v = sid_volume(ids[idx]);
-                if (v < 0 || (size_t)v >= nv)
-                    continue;
-                uint32_t vu = (uint32_t)v;
-                lvol_ent *ent = lvol_find(&vm, vu, true);
-                if (!ent) {
-                    rc = TSDB_ERR_NOMEM;
-                    break;
-                }
-                if (!ent->e) {
-                    eng *ve = t->vols[v];
-                    if (!ve) {
-                        ent->rc = (t->cluster && t->cnames[v]) ? TSDB_ERR_UNAVAILABLE : 0;
-                    } else if (eng_refused(ve)) {
-                        ent->rc = TSDB_ERR_UNAVAILABLE;
-                    } else {
-                        ent->e = eng_ref(ve);
-                        ent->cnt = eng_series_count(ve);
-                    }
-                } else {
-                    ent->cnt = eng_series_count(ent->e);
-                }
-                if (ent->e) {
-                    uint32_t local = TSDB_SID_LOCAL(ids[idx]);
-                    if (local < ent->cnt) {
-                        it[m++] = (latest_item){ent->e, local, (uint32_t)idx};
-                        ent->refreshed = true;
-                    }
-                } else if (ent->rc) {
-                    out[idx].status = ent->rc;
-                }
-            }
-            pthread_rwlock_unlock(&t->lock);
-            for (size_t k = 0; rc == 0 && k < vm.cap; k++)
-                if (vm.e[k].used && vm.e[k].refreshed && vm.e[k].e)
-                    eng_refresh(vm.e[k].e);
+        uint64_t seen[1024] = {0}; /* sid_volume() returns 0..65534 (< 65536) */
+        for (size_t k = 0; k < nmiss; k++) {
+            uint32_t vu = (uint32_t)sid_volume(ids[miss[k]]);
+            if (vu >= 65536)
+                continue;
+            uint64_t bit = (uint64_t)1 << (vu & 63);
+            if (seen[vu >> 6] & bit)
+                continue;
+            seen[vu >> 6] |= bit;
+            eng *ve = volume_at(t, vu, true);
+            if (ve)
+                (void)eng_series_reload(ve);
         }
+        pthread_rwlock_rdlock(&t->lock);
+        nv = t->nvols;
+        for (size_t k = 0; k < nmiss; k++) {
+            size_t idx = miss[k];
+            int64_t v = sid_volume(ids[idx]);
+            if (v < 0 || (size_t)v >= nv)
+                continue;
+            uint32_t vu = (uint32_t)v;
+            lvol_ent *ent = lvol_find(&vm, vu, true);
+            if (!ent) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            if (!ent->e) {
+                eng *ve = t->vols[v];
+                if (!ve) {
+                    ent->rc = (t->cluster && t->cnames[v]) ? TSDB_ERR_UNAVAILABLE : 0;
+                } else if (eng_refused(ve)) {
+                    ent->rc = TSDB_ERR_UNAVAILABLE;
+                } else {
+                    ent->e = eng_ref(ve);
+                    ent->cnt = eng_series_count(ve);
+                }
+            } else {
+                ent->cnt = eng_series_count(ent->e);
+            }
+            if (ent->e) {
+                uint32_t local = TSDB_SID_LOCAL(ids[idx]);
+                if (local < ent->cnt) {
+                    it[m++] = (latest_item){ent->e, local, (uint32_t)idx};
+                    ent->refreshed = true;
+                }
+            } else if (ent->rc) {
+                out[idx].status = ent->rc;
+            }
+        }
+        pthread_rwlock_unlock(&t->lock);
+        for (size_t k = 0; rc == 0 && k < vm.cap; k++)
+            if (vm.e[k].used && vm.e[k].refreshed && vm.e[k].e)
+                eng_refresh(vm.e[k].e);
     }
     free(miss);
 

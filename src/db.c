@@ -873,16 +873,20 @@ int eng_open_leader(const char *dir, const tsdb_options *opts, eng **out)
 }
 
 static __thread int adopt_lockfd = -1;
+static __thread eng *adopt_from;
 /* A check of the opened engine (eng_reopen), run by the open once nothing can fail any more and before the engine's
  * own threads start: they change the parts list (a merge, a flush), which the check reads without a lock. */
 static __thread void (*open_check)(const eng *, void *);
 static __thread void *open_check_arg;
+
+static uint32_t dict_adopt(series_dict *neu, series_dict *old);
 
 int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, eng **out,
                void (*check)(const eng *neu, void *arg), void *arg)
 {
     open_check = check; /* taken by the open; cleared below when it failed before that */
     open_check_arg = arg;
+    adopt_from = old;
     int rc;
     if (old->lockfd < 0) {
         rc = eng_open_sched(dir, opts, qs, out);
@@ -890,6 +894,7 @@ int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, e
         int fd = fcntl(old->lockfd, F_DUPFD_CLOEXEC, 3); /* the new engine owns this copy; the old one keeps its own */
         if (fd < 0) {
             open_check = NULL;
+            adopt_from = NULL;
             return TSDB_ERR_IO;
         }
         adopt_lockfd = fd;
@@ -900,6 +905,7 @@ int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, sched *qs, e
         }
     }
     open_check = NULL;
+    adopt_from = NULL;
     return rc;
 }
 
@@ -908,6 +914,8 @@ int eng_test_flusher_fail;
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
+    eng *old_eng = adopt_from;
+    adopt_from = NULL;
     feed_opts feed_wanted; /* taken before any failure point: see eng_take_open_feed_want */
     int feed_want = eng_take_open_feed_want(&feed_wanted);
     bool replica = replica_want;
@@ -1043,6 +1051,16 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     db->series.before_arg = db;
     db->states.before_append = jr_dict_state;
     db->states.before_arg = db;
+    uint32_t adopted_series = 0, adopted_states = 0;
+    if (old_eng) {
+        /* Adopt old_eng's handed-out name pointers before stats_start() or any other thread can read db->series
+         * lock-free via series_name(). Until open succeeds, old_eng retains ownership of [0..adopted_*), so
+         * eng_close(db) on any later failure leaves old_eng's strings untouched. */
+        adopted_series = dict_adopt(&db->series, &old_eng->series);
+        adopted_states = dict_adopt(&db->states, &old_eng->states);
+        db->series.keep_prefix = adopted_series;
+        db->states.keep_prefix = adopted_states;
+    }
     if (db->opt.stats > 0)
         stats_start(db, false); /* follows the open: load_parts hands it each part as it reads it */
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
@@ -1162,6 +1180,15 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         ecsettle_eng_ready(db); /* R7: the settle thread may take this engine from here on */
         ecgc_eng_ready(db);     /* R8: the GC worker may take this cluster EC engine from here on */
     }
+    if (old_eng) {
+        /* Commit name ownership transfer: db now owns [0..adopted_*); old_eng skips freeing them. */
+        db->series.keep_prefix = 0;
+        db->states.keep_prefix = 0;
+        old_eng->adopted_series = adopted_series;
+        old_eng->adopted_states = adopted_states;
+        old_eng->series.keep_prefix = adopted_series;
+        old_eng->states.keep_prefix = adopted_states;
+    }
     *out = db;
     return 0;
 fail:
@@ -1209,14 +1236,18 @@ void eng_halt(eng *db)
 
 /* The names of `old` that `neu` also holds at the same index become `neu`'s: it frees its own copy and keeps the
  * pointer the old engine handed out. Only a prefix (the dictionaries are append-only, so a recovered one is the same
- * names): the first difference stops it, and the rest is kept by eng_retire as before. Returns how many. */
+ * names): the first difference stops it, and the rest is kept by eng_retire as before. Returns how many.
+ * Runs single-threaded on `neu` inside eng_open_sched before any thread starts (and after series_open discarded
+ * open-time older snapshots), so lock-free series_name() readers on `neu` cannot race with it. */
 static uint32_t dict_adopt(series_dict *neu, series_dict *old)
 {
     if (!neu->file || !old->file)
         return 0;
     pthread_mutex_lock(&old->lock); /* both are leaf locks taken only here together: no order to keep */
     pthread_mutex_lock(&neu->lock);
-    uint32_t n = MIN(atomic_load(&old->count), atomic_load(&neu->count)), i = 0;
+    uint32_t n = MIN(atomic_load_explicit(&old->count, memory_order_acquire),
+                     atomic_load_explicit(&neu->count, memory_order_relaxed)),
+             i = 0;
     for (; i < n && strcmp(old->names[i], neu->names[i]) == 0; i++) {
         if (old->names[i] != neu->names[i]) {
             free(neu->names[i]);
@@ -1226,12 +1257,6 @@ static uint32_t dict_adopt(series_dict *neu, series_dict *old)
     pthread_mutex_unlock(&neu->lock);
     pthread_mutex_unlock(&old->lock);
     return i;
-}
-
-void eng_adopt_names(eng *neu, eng *old)
-{
-    old->adopted_series = dict_adopt(&neu->series, &old->series);
-    old->adopted_states = dict_adopt(&neu->states, &old->states);
 }
 
 /* Appends the name strings of d from index `from` on to *vec (freed by the owner of the vector, at tsdb_close). */
