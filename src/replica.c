@@ -106,6 +106,9 @@ struct replica {
     uint64_t rfd_seq;
     uint8_t *rbuf;
     size_t rcap;
+    uint64_t rbuf_seq, rbuf_off; /* segment and offset currently cached in rbuf (rbuf_len == 0: empty) */
+    size_t rbuf_len;
+    uint64_t apply_reads; /* pread() calls made by rp_read_at since open (rp->mu; replica_test_apply_reads) */
     /* the sender's cursor (replica_read): where the last read ended */
     uint64_t rd_seq, rd_off, rd_next;
     /* files the leader shipped for its COMMIT markers (replica_stage), and the COMMIT markers appended and not yet
@@ -227,6 +230,9 @@ static void rfd_close(struct replica *rp)
         close(rp->rfd);
     rp->rfd = -1;
     rp->rfd_seq = 0;
+    rp->rbuf_seq = 0;
+    rp->rbuf_off = 0;
+    rp->rbuf_len = 0;
 }
 
 /* ------------------------------------------------------------------- open */
@@ -2052,6 +2058,7 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
 
 static int rp_read_at(eng *db, struct replica *rp, uint64_t seq, uint64_t off, size_t want)
 {
+    rp->rbuf_len = 0;
     if (rp->rfd < 0 || rp->rfd_seq != seq) {
         rfd_close(rp);
         char name[64];
@@ -2075,8 +2082,12 @@ static int rp_read_at(eng *db, struct replica *rp, uint64_t seq, uint64_t off, s
             continue;
         if (r <= 0)
             return TSDB_ERR_IO;
+        rp->apply_reads++;
         got += (size_t)r;
     }
+    rp->rbuf_seq = seq;
+    rp->rbuf_off = off;
+    rp->rbuf_len = want;
     return 0;
 }
 
@@ -2104,17 +2115,33 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             rp->apply_off = 0;
             continue;
         }
-        size_t want = (size_t)MIN((uint64_t)RP_CHUNK, cur.len - rp->apply_off);
-        if ((rc = rp_read_at(db, rp, cur.seq, rp->apply_off, want)) != 0)
-            break;
         wal_rec wr;
-        size_t sz = wal_record(rp->rbuf, want, cur.seq, rp->apply_off, &wr);
-        if (sz == 0 && want >= WAL_HDR) { /* a record larger than the chunk */
-            size_t need = rec_size(rp->rbuf);
-            if (need > want && rp->apply_off + need <= cur.len) {
-                if ((rc = rp_read_at(db, rp, cur.seq, rp->apply_off, need)) != 0)
-                    break;
-                sz = wal_record(rp->rbuf, need, cur.seq, rp->apply_off, &wr);
+        size_t sz = 0;
+        /* Reuse the buffered RP_CHUNK window across consecutive records of the same segment; only refill when
+         * apply_off leaves the window or the next record extends past the buffered bytes (e.g. chunk boundary or
+         * record > RP_CHUNK). replica_cut() clears rbuf_len via rfd_close(). */
+        if (rp->rbuf_len > 0 && rp->rbuf_seq == cur.seq && rp->apply_off >= rp->rbuf_off &&
+            rp->apply_off < rp->rbuf_off + rp->rbuf_len) {
+            size_t delta = (size_t)(rp->apply_off - rp->rbuf_off);
+            size_t avail = (size_t)MIN((uint64_t)(rp->rbuf_len - delta), cur.len - rp->apply_off);
+            const uint8_t *rec = rp->rbuf + delta;
+            if (avail >= WAL_HDR && rec_size(rec) <= avail)
+                sz = wal_record(rec, avail, cur.seq, rp->apply_off, &wr);
+        }
+        if (sz == 0) {
+            size_t want = (size_t)MIN((uint64_t)RP_CHUNK, cur.len - rp->apply_off);
+            bool have_at = rp->rbuf_len >= want && rp->rbuf_seq == cur.seq && rp->rbuf_off == rp->apply_off;
+            if (!have_at && (rc = rp_read_at(db, rp, cur.seq, rp->apply_off, want)) != 0)
+                break;
+            size_t avail = (size_t)MIN((uint64_t)rp->rbuf_len, cur.len - rp->apply_off);
+            sz = wal_record(rp->rbuf, avail, cur.seq, rp->apply_off, &wr);
+            if (sz == 0 && avail >= WAL_HDR) { /* a record larger than the chunk */
+                size_t need = rec_size(rp->rbuf);
+                if (need > avail && rp->apply_off + need <= cur.len) {
+                    if ((rc = rp_read_at(db, rp, cur.seq, rp->apply_off, need)) != 0)
+                        break;
+                    sz = wal_record(rp->rbuf, need, cur.seq, rp->apply_off, &wr);
+                }
             }
         }
         if (sz == 0) {
@@ -2150,6 +2177,7 @@ static int replica_apply_locked(eng *db, struct replica *rp, uint64_t commit)
             RP_HOOK(db, RH_ROWS_HELD);
         rc = wr.kind == WAL_KIND_ROWS ? apply_rows(db, rp, cur.seq, &wr, pmax) : apply_marker(db, rp, cur.seq, &wr);
         if (rc == RP_AGAIN) { /* a cut came while the marker's slow part ran without rp->mu: read again from the cursor */
+            rp->rbuf_len = 0;
             rc = 0;
             continue;
         }
@@ -3722,6 +3750,17 @@ uint64_t replica_test_napplied(eng *db)
         return 0;
     pthread_mutex_lock(&rp->mu);
     uint64_t n = rp->napplied;
+    pthread_mutex_unlock(&rp->mu);
+    return n;
+}
+
+uint64_t replica_test_apply_reads(eng *db)
+{
+    struct replica *rp = db->rp;
+    if (!rp)
+        return 0;
+    pthread_mutex_lock(&rp->mu);
+    uint64_t n = rp->apply_reads;
     pthread_mutex_unlock(&rp->mu);
     return n;
 }

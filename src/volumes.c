@@ -3440,12 +3440,12 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
             size_t j = i;
             while (j < m && sid_volume(keys[j].id) == vol)
                 j++;
-            eng *e EREF = NULL;
+            eng *e EREFM = NULL;
             uint32_t local, locals[SSTATS_CHUNK];
             size_t at[SSTATS_CHUNK], k = 0;
             size_t dup[SSTATS_CHUNK][2], nd = 0, first_at = 0; /* [to, from]: a repeat gets the first's record */
             for (size_t q = i; q < j; q++) {
-                eng *e2 EREF = NULL;
+                eng *e2 EREFM = NULL;
                 if (q > i && keys[q].id == keys[q - 1].id) {
                     /* a repeated id is answered once: it would repeat the same scan, and the cost bound counts
                      * the work done, not the ids asked for */
@@ -3455,8 +3455,10 @@ int tsdb_series_stats(tsdb *t, const tsdb_sid *ids, size_t n, int flags, tsdb_se
                 }
                 first_at = keys[q].at;
                 if (route_meta(t, keys[q].id, &e2, &local)) { /* false: no such volume or id */
-                    if (!e)
-                        e = eng_ref(e2);
+                    if (!e) {
+                        e = e2;
+                        e2 = NULL;
+                    }
                     locals[k] = local;
                     at[k++] = keys[q].at;
                 } else {

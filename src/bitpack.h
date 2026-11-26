@@ -8,10 +8,9 @@
 #if defined(__SSE2__)
 #include <emmintrin.h> /* x86-64 baseline: every CPU level has it */
 #endif
-/* AVX2 unpack (below): the v3 level, and -march=native on CPUs without AVX-512BW. The v4 level keeps the
- * portable loops: it has not been measured against them (no AVX-512 machine at the time of writing).
- * -DTSDB_UNPACK_AVX2 takes the kernel at v4 too, to measure it there (tools/decode-bench.c, tests/test_levels.c). */
-#if defined(__AVX2__) && (!defined(__AVX512BW__) || defined(TSDB_UNPACK_AVX2))
+/* AVX2 unpack (below): every AVX2 build (the v3 and v4 levels, and -march=native on AVX2 and AVX-512 CPUs).
+ * 256-bit vpshufb/vpsrlvd uses no 512-bit lanes and matches v4's -mprefer-vector-width=256. */
+#if defined(__AVX2__)
 #define BITPACK_AVX2 1
 #include <immintrin.h>
 #endif

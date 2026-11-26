@@ -24,6 +24,9 @@
  */
 #include "internal.h"
 #include "bitpack.h"
+#if defined(__AVX2__) && !defined(BITPACK_AVX2)
+#error "BITPACK_AVX2 must be enabled on all AVX2 builds (including AVX-512 / v4)"
+#endif
 #include "fpmode.h"
 #include "../tools/datasets.h"
 #include "hydraulic_psi.h"

@@ -749,15 +749,23 @@ static void many_volumes(const char *base)
 /* The memory bounds of one request and a series that fails ahead of the head. The head's first delivery waits, so
  * helpers run the others ahead (at most W = 2 x threads). Budget hooks count what results ahead hold. */
 typedef struct {
-    atomic_long out, peak, takes, deferred;
+    atomic_long out, peak, takes, small_takes, deferred;
+    atomic_long fail_first; /* when > 0: first fail_first calls to b_take return -1 (transient external budget) */
 } budget;
 static int b_take(void *ctx, size_t n)
 {
     budget *b = ctx;
+    long f = atomic_load(&b->fail_first);
+    while (f > 0) {
+        if (atomic_compare_exchange_weak(&b->fail_first, &f, f - 1))
+            return -1;
+    }
     long o = atomic_fetch_add(&b->out, (long)n) + (long)n, p = atomic_load(&b->peak);
     while (o > p && !atomic_compare_exchange_weak(&b->peak, &p, o)) {
     }
     atomic_fetch_add(&b->takes, 1);
+    if (n < (64 << 10))
+        atomic_fetch_add(&b->small_takes, 1);
     return 0;
 }
 static void b_give(void *ctx, size_t n) { atomic_fetch_sub(&((budget *)ctx)->out, (long)n); }
@@ -773,6 +781,11 @@ typedef struct {
      * the waits that ended by the counter rather than by the deadline. */
     atomic_long *gate;
     int gate_hit;
+    /* optional second gate on a later series (P-10 headonly recovery): holds at index `gate2_idx` until `*gate2`
+     * exceeds its snapshot at arrival, proving helpers resumed lookahead after pressure cleared. */
+    size_t gate2_idx;
+    atomic_long *gate2;
+    int gate2_hit;
 } slow_ctx;
 static atomic_long gate_open = 1;
 static void late_conductor(void) { usleep(20000); } /* the helpers run first */
@@ -788,6 +801,11 @@ static int slow_head(void *ctx, const tsdb_series_result *r)
                 usleep(1000);
             s->gate_hit += atomic_load(s->gate) >= 1;
         }
+    }
+    if (s->gate2 && r->index == s->gate2_idx && r->last) {
+        for (int i = 0; i < 5000 && atomic_load(s->gate2) < 1; i++)
+            usleep(1000);
+        s->gate2_hit += atomic_load(s->gate2) >= 1;
     }
     s->rows += r->status ? 0 : r->n;
     if (r->index < 64)
@@ -829,7 +847,7 @@ static void bounds(const char *base)
     o.granule_rows = 1024;
     tsdb *db;
     OK(tsdb_open(r, &o, &db));
-    tsdb_sid good[8], wide, bad;
+    tsdb_sid good[8], wide, bad, tiny;
     int64_t *ts = malloc(ROWS * sizeof *ts);
     float *v = malloc(ROWS * sizeof *v);
     CHECK(ts && v);
@@ -841,6 +859,8 @@ static void bounds(const char *base)
         OK(tsdb_series_create(db, name, TSDB_FLOAT32, NULL, &good[k]));
         OK(tsdb_insert_series(db, good[k], ts, v, ROWS));
     }
+    OK(tsdb_series_create(db, "bd_tiny", TSDB_FLOAT32, NULL, &tiny));
+    OK(tsdb_insert_series(db, tiny, ts, v, 10));
     OK(tsdb_series_create(db, "bd_bad", TSDB_FLOAT32, vol, &bad)); /* alone in its volume: one part to damage */
     OK(tsdb_insert_series(db, bad, ts, v, ROWS));
     int64_t two[2] = {T0, T0 + 20000000};
@@ -916,6 +936,51 @@ static void bounds(const char *base)
     /* each helper takes its result's 384 KiB before the check against max_held and gives it back when refused */
     CHECK(atomic_load(&b.peak) <= (long)mo.max_held_bytes + 8 * (400 << 10));
     CHECK(atomic_load(&b.deferred) >= 1 && atomic_load(&b.out) == 0); /* refused, not merely held less */
+
+    /* P-10 regression: after max_held pressure sets headonly, draining held back under max_held / 2 recovers
+     * parallel lookahead for subsequent small series (calls[i] == 1 means collected ahead by a helper). */
+    tsdb_sid rec_list[32];
+    for (int i = 0; i < 8; i++)
+        rec_list[i] = good[i];
+    for (int i = 8; i < 32; i++)
+        rec_list[i] = tiny;
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    sc.gate = &b.deferred;
+    sc.gate2_idx = 8;
+    sc.gate2 = &b.small_takes;
+    OK(tsdb_query_multi(db, &qv, rec_list, 32, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1);  /* headonly was tripped during the heavy prefix */
+    CHECK(sc.gate2_hit == 1); /* helpers resumed running small series ahead once held drained */
+    CHECK(sc.rows == 8 * (uint64_t)ROWS + 24 * 10);
+    int ahead_after = 0;
+    for (int i = 8; i < 32; i++)
+        ahead_after += sc.calls[i] == 1;
+    CHECK(ahead_after >= 1);
+    CHECK(atomic_load(&b.out) == 0);
+
+    /* P-10 regression: transient external budget_take refusal while held == 0 also recovers after cooldown. */
+    tsdb_sid ext_list[40];
+    for (int i = 0; i < 40; i++)
+        ext_list[i] = tiny;
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    atomic_store(&b.fail_first, 2); /* at most 2 waves refused (headonly_at <= 16), then budget allows */
+    mo.threads = 4;                 /* W = 8 */
+    mo.max_held_bytes = 0;
+    sc.gate = &b.deferred;
+    sc.gate2_idx = 20; /* guaranteed past at most 2 cooldown windows (2 * W = 16) */
+    sc.gate2 = &b.small_takes;
+    OK(tsdb_query_multi(db, &qv, ext_list, 40, &mo, slow_head, &sc));
+    CHECK(sc.gate_hit == 1);
+    CHECK(sc.gate2_hit == 1);
+    CHECK(sc.rows == 40 * 10);
+    ahead_after = 0;
+    for (int i = 20; i < 40; i++)
+        ahead_after += sc.calls[i] == 1;
+    CHECK(ahead_after >= 1);
+    CHECK(atomic_load(&b.out) == 0);
+    mo.threads = 8;
     mo.max_held_bytes = 0;
 
     /* bucket accumulators over multi_defer_bytes ahead of the head defer to its turn, before allocating */
