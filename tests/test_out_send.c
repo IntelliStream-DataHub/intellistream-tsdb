@@ -108,8 +108,15 @@ static int waits_until_cut(conn *c, int max_ms)
 static void out_wait_deadline(void)
 {
     int sv[2];
+#ifdef __APPLE__
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return;
+    tsdb_sock_flags(sv[0], SOCK_CLOEXEC | SOCK_NONBLOCK);
+    tsdb_sock_flags(sv[1], SOCK_CLOEXEC);
+#else
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
         return;
+#endif
     conn *c = calloc(1, sizeof *c);
     c->fd = sv[0];
     pthread_mutex_init(&c->lock, NULL);
@@ -309,8 +316,15 @@ static void *out_waiter_thread(void *arg)
 static void test_out_waiters_wakeup(void)
 {
     int sv[2];
+#ifdef __APPLE__
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return;
+    tsdb_sock_flags(sv[0], SOCK_CLOEXEC | SOCK_NONBLOCK);
+    tsdb_sock_flags(sv[1], SOCK_CLOEXEC);
+#else
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
         return;
+#endif
     conn *c = conn_alloc();
     c->fd = sv[0];
     pthread_mutex_init(&c->lock, NULL);

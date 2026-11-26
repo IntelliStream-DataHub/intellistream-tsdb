@@ -5079,10 +5079,14 @@ static bool submit_send(conn *c)
             c->sent = c->sending.len = 0;
             return true;
         }
-        buf t = c->sending;
-        c->sending = c->out;
-        c->out = t;
-        c->out.len = 0;
+        if (c->out.len > 0) {
+            buf t = c->sending;
+            c->sending = c->out;
+            c->out = t;
+            c->out.len = 0;
+        } else {
+            c->sending.len = 0;
+        }
         c->notified = false;
         c->tx_loop = c->sending.len > 0;
         atomic_store_explicit(&c->out_pending, false, memory_order_relaxed);
