@@ -316,7 +316,6 @@ typedef struct mcollect {
     size_t cur_index;
     bool have;
     bool took_buckets; /* collect_fn transferred ownership of r->buckets without copying */
-    size_t row;
     int rc;
 } mcollect;
 
@@ -705,9 +704,6 @@ int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const tsdb_sid
         return TSDB_ERR_INVALID;
     mcollect k = {0};
     k.cur.type = -1;
-    k.row = q->kind == TSDB_MULTI_BUCKETS  ? sizeof(tsdb_bucket)
-            : q->kind == TSDB_MULTI_SPREAD ? sizeof(tsdb_spread_bucket)
-                                           : sizeof(tsdb_twa_bucket);
     k.out = calloc(n ? n : 1, sizeof *k.out);
     if (!k.out)
         return TSDB_ERR_NOMEM;

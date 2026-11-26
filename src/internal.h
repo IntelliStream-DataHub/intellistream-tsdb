@@ -1352,6 +1352,8 @@ void sched_close(sjob *j);
 /* After each item of fn: 0 go on; 1 return now (a helper another group needs); TSDB_ERR_STOPPED the group was
  * cancelled. */
 int sched_leave(void);
+/* Lightweight cancellation check without helper rebalancing side effects. */
+bool sched_cancelled(void);
 /* Decode buffers: cached per helper thread (helpers join and leave often), malloc'd elsewhere. One slot per
  * buffer that is live at once (0..3). */
 void *qscratch_get(int slot, size_t bytes);

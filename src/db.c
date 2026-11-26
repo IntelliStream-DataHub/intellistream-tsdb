@@ -135,13 +135,12 @@ codec_ctx *cc_get(eng *db)
     cc_gets++;
     cc_tls_slot *s = cc_tls_get_slot();
     if (LIKELY(s && !s->in_use)) {
-        if (!s->c) {
+        if (!s->c)
             s->c = codec_new();
-            if (!s->c)
-                return NULL;
+        if (LIKELY(s->c != NULL)) {
+            s->in_use = true;
+            return s->c;
         }
-        s->in_use = true;
-        return s->c;
     }
     pthread_mutex_lock(&db->cc_lock);
     codec_ctx *c = db->cc_free;

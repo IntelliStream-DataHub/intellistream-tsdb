@@ -210,6 +210,11 @@ void sched_group_end(sgroup *g)
 
 void sched_cancel(sgroup *g) { atomic_store(&g->cancel, 1); }
 
+bool sched_cancelled(void)
+{
+    return cur_group && atomic_load_explicit(&cur_group->cancel, memory_order_relaxed);
+}
+
 static void group_link(sched *s, sgroup *g)
 {
     if (g->linked)

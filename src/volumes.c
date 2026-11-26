@@ -1372,22 +1372,18 @@ static bool route_q(tsdb *t, tsdb_sid id, eroute *er, uint32_t *local, int *rc)
     route_cache *cache = cur_route;
     int64_t v = sid_volume(id);
     if (cache && cache->t == t && v >= 0) {
-        if (cache->e && cache->vol == (uint32_t)v) {
-            if (!eng_refused(cache->e)) {
-                uint32_t loc = TSDB_SID_LOCAL(id);
-                if (loc < eng_series_count(cache->e)) {
-                    er->e = cache->e;
-                    er->own = false;
-                    cache->depth++;
-                    *local = loc;
-                    return true;
-                }
-            } else if (cache->depth == 0) {
-                route_cache_release(cache);
+        if (cache->e && cache->vol == (uint32_t)v && !eng_refused(cache->e)) {
+            uint32_t loc = TSDB_SID_LOCAL(id);
+            if (loc < eng_series_count(cache->e)) {
+                er->e = cache->e;
+                er->own = false;
+                cache->depth++;
+                *local = loc;
+                return true;
             }
-        } else if (cache->depth == 0) {
-            route_cache_release(cache);
         }
+        if (cache->depth == 0)
+            route_cache_release(cache);
     }
     eng *e = NULL;
     bool ok = route_opt(t, id, &e, local, true);
@@ -1397,6 +1393,8 @@ static bool route_q(tsdb *t, tsdb_sid id, eroute *er, uint32_t *local, int *rc)
         return false;
     }
     if (cache && cache->t == t && cache->depth == 0 && v >= 0) {
+        if (cache->e)
+            route_cache_release(cache);
         cache->e = e;
         cache->vol = (uint32_t)v;
         cache->cut = NULL;

@@ -1952,12 +1952,9 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
                                           localx);
                     if (nl)
                         fold_into(&t, local, localx, nl);
-                    if (!cur_cuts) {
-                        int lv = sched_leave();
-                        if (lv < 0) {
-                            rc = lv;
-                            break;
-                        }
+                    if (sched_cancelled()) {
+                        rc = TSDB_ERR_STOPPED;
+                        break;
                     }
                 }
             }
@@ -2306,7 +2303,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
                 }
                 c->ts = rts;
                 c->v = rv;
-                c->cap = rcap;
+                c->cap = rows;
                 c->own = true;
                 IX_HOOK(c->p, c->gi, IX_SRC);
             }
