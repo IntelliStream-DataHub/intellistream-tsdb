@@ -100,6 +100,9 @@ static void mut_env(void)
     if (m > 0)
         settle_mutant = m;
 }
+static inline void mut_init(void) { pthread_once(&mut_once, mut_env); }
+#else
+static inline void mut_init(void) {}
 #endif
 
 /* ------------------------------------------------------------ a streaming xxh64 (the same digest as xxh64()) */
@@ -606,9 +609,7 @@ static bool listed_locked(eng *db, const part *p)
 
 int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled)
 {
-#ifdef TSDB_TEST_HOOKS
-    pthread_once(&mut_once, mut_env);
-#endif
+    mut_init();
     if (settled)
         *settled = 0;
     /* D1: R7 settles on one server only; R8 (D21) also on the leader of a cluster ec volume, through eccold_settle */
@@ -721,7 +722,7 @@ static int cmp_part_block(const void *a, const void *b)
 
 int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reencoded)
 {
-    pthread_once(&mut_once, mut_env);
+    mut_init();
     if (reencoded)
         *reencoded = 0;
     if (!db->tier || !db->ecstate || !db->ecstate->settle || db->ec_cluster || db->replica_req || db->cluster_req ||
@@ -966,9 +967,7 @@ static bool settle_engine(eng *db)
 static void *settle_main(void *arg)
 {
     struct ecsettle_tier *st = arg;
-#ifdef TSDB_TEST_HOOKS
-    pthread_once(&mut_once, mut_env);
-#endif
+    mut_init();
 #ifdef __linux__
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only (D11) */
 #endif

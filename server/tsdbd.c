@@ -6225,6 +6225,59 @@ int main(int argc, char **argv)
         cfg_print_effective(stdout, g_cfg.path ? &g_cfg : NULL, tsdbd_keys, TSDBD_NKEYS, orig_argc, orig_argv);
         return 0;
     }
+#ifdef TSDB_TEST_HOOKS
+    /* Parse and validate mutant / test env hooks before opening the database or spawning background threads so an
+     * unknown mutant name exits cleanly with status 2 under ASan/LSan and TSan. */
+    test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
+    test_read_stall = getenv("TSDBD_TEST_READ_STALL");
+    test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
+    test_cold = getenv("TSDBD_TEST_COLD") && *getenv("TSDBD_TEST_COLD") ? getenv("TSDBD_TEST_COLD") : NULL;
+    if ((margin_mutant = margin_mutant_parse(getenv("TSDBD_MARGIN_MUTANT"))) < 0) {
+        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s: no such mutant\n", getenv("TSDBD_MARGIN_MUTANT"));
+        return 2;
+    }
+    if (margin_mutant)
+        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s\n", getenv("TSDBD_MARGIN_MUTANT"));
+    test_query_status = getenv("TSDBD_TEST_QUERY_STATUS") ? atoi(getenv("TSDBD_TEST_QUERY_STATUS")) : 0;
+    if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
+        static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
+                                            "replicaread", "spanaccepted",      "nocopyserved"};
+        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
+            if (strcmp(getenv("TSDB_ROUTE_MUTANT"), names[i]) == 0)
+                route_mutant = i;
+        if (!route_mutant) {
+            fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s: no such mutant\n", getenv("TSDB_ROUTE_MUTANT"));
+            return 2;
+        }
+        fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s\n", names[route_mutant]);
+    }
+    if (getenv("TSDBD_FWD_MUTANT") && *getenv("TSDBD_FWD_MUTANT")) {
+        static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
+                                            "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
+                                            "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
+                                            "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
+                                            "fwdcreateread", "fwdopkind", "fwdopkindread"};
+        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
+            if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
+                fwdx_mutant = i;
+        if (!fwdx_mutant) {
+            fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s: no such mutant\n", getenv("TSDBD_FWD_MUTANT"));
+            return 2;
+        }
+        fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s\n", names[fwdx_mutant]);
+    }
+    test_fwd_stall = getenv("TSDBD_TEST_FWD_STALL") && *getenv("TSDBD_TEST_FWD_STALL") ? getenv("TSDBD_TEST_FWD_STALL")
+                                                                                          : NULL;
+    test_fwd_knobs = getenv("TSDBD_TEST_FWD_KNOBS") && *getenv("TSDBD_TEST_FWD_KNOBS") ? getenv("TSDBD_TEST_FWD_KNOBS")
+                                                                                        : NULL;
+    /* also as TSDB_REPLD_MUTANT names, so that tests/repld_mutants.sh plants them like the driver's */
+    const char *rmu = getenv("TSDB_REPLD_MUTANT");
+    test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL || (rmu && !strcmp(rmu, "nomoved"));
+    test_depose_moved = getenv("TSDBD_TEST_DEPOSE_MOVED") != NULL || (rmu && !strcmp(rmu, "deposemoved"));
+    test_lead_now = rmu && !strcmp(rmu, "leadnow");
+    if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
+        test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
+#endif
     uint8_t secret[CLUSTER_SECRET_MAX];
     size_t secret_len = 0;
     if (cluster_on) {
@@ -6361,55 +6414,6 @@ int main(int argc, char **argv)
 #ifdef TSDB_TEST_HOOKS
     if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
         tsdb_test_precommit(db, hold_large, NULL);
-    test_loop_stall = getenv("TSDBD_TEST_LOOP_STALL");
-    test_read_stall = getenv("TSDBD_TEST_READ_STALL");
-    test_route_moved = getenv("TSDBD_TEST_ROUTE_MOVED") ? atoi(getenv("TSDBD_TEST_ROUTE_MOVED")) : 0;
-    test_cold = getenv("TSDBD_TEST_COLD") && *getenv("TSDBD_TEST_COLD") ? getenv("TSDBD_TEST_COLD") : NULL;
-    if ((margin_mutant = margin_mutant_parse(getenv("TSDBD_MARGIN_MUTANT"))) < 0) {
-        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s: no such mutant\n", getenv("TSDBD_MARGIN_MUTANT"));
-        return 2;
-    }
-    if (margin_mutant)
-        fprintf(stderr, "tsdbd: TSDBD_MARGIN_MUTANT=%s\n", getenv("TSDBD_MARGIN_MUTANT"));
-    test_query_status = getenv("TSDBD_TEST_QUERY_STATUS") ? atoi(getenv("TSDBD_TEST_QUERY_STATUS")) : 0;
-    if (getenv("TSDB_ROUTE_MUTANT") && *getenv("TSDB_ROUTE_MUTANT")) { /* "" is unset (an exported empty name) */
-        static const char *const names[] = {"",           "rightsbeforeroute", "movedoffcopy",
-                                            "replicaread", "spanaccepted",      "nocopyserved"};
-        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
-            if (strcmp(getenv("TSDB_ROUTE_MUTANT"), names[i]) == 0)
-                route_mutant = i;
-        if (!route_mutant) {
-            fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s: no such mutant\n", getenv("TSDB_ROUTE_MUTANT"));
-            return 2;
-        }
-        fprintf(stderr, "tsdbd: TSDB_ROUTE_MUTANT=%s\n", names[route_mutant]);
-    }
-    if (getenv("TSDBD_FWD_MUTANT") && *getenv("TSDBD_FWD_MUTANT")) {
-        static const char *const names[] = {"",        "fwdtwice", "fwdoldframe", "fwdunavonbreak", "fwdnouser",
-                                            "fwdretry", "fwdnolease", "fwdnowait", "fwdauthlag",
-                                            "fwdchunknowait", "fwdinline", "fwdownerage", "fwdarrival",
-                                            "fwdgone", "fwdownerclose", "fwdtailclose", "fwdepoch",
-                                            "fwdcreateread", "fwdopkind", "fwdopkindread"};
-        for (int i = 1; i < (int)(sizeof names / sizeof names[0]); i++)
-            if (strcmp(getenv("TSDBD_FWD_MUTANT"), names[i]) == 0)
-                fwdx_mutant = i;
-        if (!fwdx_mutant) {
-            fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s: no such mutant\n", getenv("TSDBD_FWD_MUTANT"));
-            return 2;
-        }
-        fprintf(stderr, "tsdbd: TSDBD_FWD_MUTANT=%s\n", names[fwdx_mutant]);
-    }
-    test_fwd_stall = getenv("TSDBD_TEST_FWD_STALL") && *getenv("TSDBD_TEST_FWD_STALL") ? getenv("TSDBD_TEST_FWD_STALL")
-                                                                                          : NULL;
-    test_fwd_knobs = getenv("TSDBD_TEST_FWD_KNOBS") && *getenv("TSDBD_TEST_FWD_KNOBS") ? getenv("TSDBD_TEST_FWD_KNOBS")
-                                                                                        : NULL;
-    /* also as TSDB_REPLD_MUTANT names, so that tests/repld_mutants.sh plants them like the driver's */
-    const char *rmu = getenv("TSDB_REPLD_MUTANT");
-    test_no_moved = getenv("TSDBD_TEST_NO_MOVED") != NULL || (rmu && !strcmp(rmu, "nomoved"));
-    test_depose_moved = getenv("TSDBD_TEST_DEPOSE_MOVED") != NULL || (rmu && !strcmp(rmu, "deposemoved"));
-    test_lead_now = rmu && !strcmp(rmu, "leadnow");
-    if (getenv("TSDBD_TEST_AUTH_DELAY_MS"))
-        test_auth_delay_ms = atoi(getenv("TSDBD_TEST_AUTH_DELAY_MS"));
 #endif
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {

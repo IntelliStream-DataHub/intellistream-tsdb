@@ -199,6 +199,7 @@ out:
     return 0;
 }
 
+#ifdef TSDB_TEST_HOOKS
 /* tier_from_strings, its lines naming the database (dir; NULL: none) */
 static int tier_decide(const char *dir, const char *spec, const char *iknow, tier_cfg *c)
 {
@@ -219,15 +220,30 @@ static int tier_decide(const char *dir, const char *spec, const char *iknow, tie
         fprintf(stderr, "tsdb: %s%sTSDB_TEST_TIER: %s: the open fails\n", dir, sep, err);
     return rc;
 }
+#endif
 
-int tier_from_strings(const char *spec, const char *iknow, tier_cfg *c) { return tier_decide(NULL, spec, iknow, c); }
+int tier_from_strings(const char *spec, const char *iknow, tier_cfg *c)
+{
+#ifdef TSDB_TEST_HOOKS
+    return tier_decide(NULL, spec, iknow, c);
+#else
+    (void)iknow;
+    memset(c, 0, sizeof *c);
+    return spec && *spec ? TSDB_ERR_INVALID : 0;
+#endif
+}
 
 int tier_from_env(tier_cfg *c)
 {
+#ifdef TSDB_TEST_HOOKS
     return tier_from_strings(getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), c);
+#else
+    memset(c, 0, sizeof *c);
+    return 0;
+#endif
 }
 
-#ifdef TSDB_EC
+#if defined(TSDB_EC) && defined(TSDB_TEST_HOOKS)
 /* Whether the store at path holds a volume (an s<number> directory), or might: anything but a clean "no" says yes. */
 static bool store_has_volumes(const char *path)
 {
@@ -330,10 +346,12 @@ void tier_set_cluster(tier_cluster_fn fn, void *arg, uint64_t cache_mb)
 int tier_open(const char *dir, const tsdb_options *opt, tier **out)
 {
     *out = NULL;
-    tier_cfg c;
+    tier_cfg c = {0};
+#ifdef TSDB_TEST_HOOKS
     int rc = tier_decide(dir, getenv("TSDB_TEST_TIER"), getenv("TSDB_TEST_TIER_I_KNOW"), &c);
     if (rc)
         return rc;
+#endif
     if (!c.set) {
 #ifdef TSDB_EC
         /* r8f: a cluster tsdbd's tier, for its ec volumes only (no stores: their cold ops reach the stripe group) */
@@ -341,16 +359,23 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
             return 0;
         c.cache_mb = cluster_cache_mb;
 #else
+        (void)dir;
+        (void)opt;
         return 0;
 #endif
     }
 #ifndef TSDB_EC
+#ifdef TSDB_TEST_HOOKS
     (void)opt;
     fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set, but this build has no erasure codec (TSDB_EC): the open fails\n",
             dir);
     tier_cfg_free(&c);
     return TSDB_ERR_INVALID;
 #else
+    return 0;
+#endif
+#else
+#ifdef TSDB_TEST_HOOKS
     if (c.set && opt && (opt->read_only || opt->follow)) {
         /* the writer holds the stores (flock), and a follower does not read .ec parts (D7) */
         fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set on a read-only open or a follower: only a writer opens a "
@@ -358,6 +383,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         tier_cfg_free(&c);
         return TSDB_ERR_INVALID;
     }
+#endif
     tier *t = calloc(1, sizeof *t);
     if (!t) {
         tier_cfg_free(&c);
@@ -367,13 +393,19 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     atomic_init(&t->halted, false);
     pthread_mutex_init(&t->cmu, NULL);
     t->cfg = c;
-    if (c.set && tier_mutant != TIER_MUT_PERENGINE && (rc = tier_be_open(t, dir)) != 0) {
+    int open_rc = 0;
+#ifdef TSDB_TEST_HOOKS
+    if (c.set && tier_mutant != TIER_MUT_PERENGINE && (open_rc = tier_be_open(t, dir)) != 0) {
         tier_put(t);
-        return rc;
+        return open_rc;
     }
-    if ((rc = eccache_tier_open(t)) != 0 || (rc = ecgc_tier_open(t)) != 0 || (rc = ecsettle_tier_open(t)) != 0) {
+#else
+    (void)dir;
+#endif
+    if ((open_rc = eccache_tier_open(t)) != 0 || (open_rc = ecgc_tier_open(t)) != 0 ||
+        (open_rc = ecsettle_tier_open(t)) != 0) {
         tier_put(t); /* every close, the failed owner's included */
-        return rc;
+        return open_rc;
     }
     /* the cache reads through this backend, never one of its own (its stores' flocks would make that one BUSY) */
     eccache_set_backend(t, t->be);
@@ -661,8 +693,12 @@ int tier_engine_attach(eng *db)
             return TSDB_ERR_INVALID;
         }
         if (!t) {
+#ifdef TSDB_TEST_HOOKS
             fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured (TSDB_TEST_TIER with "
                             "TSDB_TEST_TIER_I_KNOW=1): the open fails\n", db->dir);
+#else
+            fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured: the open fails\n", db->dir);
+#endif
             return TSDB_ERR_INVALID;
         }
     }

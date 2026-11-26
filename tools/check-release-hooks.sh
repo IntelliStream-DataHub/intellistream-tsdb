@@ -4,6 +4,7 @@
 # auth-bypass, crash-point, durability-bypass, or mutant/test-only environment hooks.
 set -u
 [ $# -ge 1 ] || { echo "usage: $0 BINARY..." >&2; exit 2; }
+command -v strings >/dev/null 2>&1 || { echo "check-release-hooks: strings not found" >&2; exit 2; }
 
 FORBIDDEN_STRINGS=(
     TSDBD_FWD_MUTANT
@@ -25,6 +26,8 @@ FORBIDDEN_STRINGS=(
     TSDBD_MARGIN_MUTANT
     TSDBD_DEFAULT_CONFIG
     TSDBD_TEST_
+    TSDB_TEST_TIER
+    TSDB_TEST_TIER_I_KNOW
     TSDB_SWAP_MUTANT
     TSDB_SETTLE_MUTANT
     TSDB_ECCOLD_MUTANT

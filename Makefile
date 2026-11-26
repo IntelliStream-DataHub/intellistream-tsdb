@@ -852,7 +852,7 @@ dist:
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
 	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(DIST_B)/tsdbd
-	tools/check-release-hooks.sh $(DIST_B)/tsdbd $(DIST_B)/tsdb $(DIST_B)/libtsdb.$(SOEXT)
+	tools/check-release-hooks.sh $(DIST_B)/tsdbd $(DIST_B)/tsdb $(DIST_B)/libtsdb.$(SOEXT) $(DIST_B)/libtsdb.a $(DIST_B)/libtsdbclient.a
 	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
 # The tarball's own test suite on this machine, every CPU level included.
@@ -2229,7 +2229,7 @@ test-mutants-helper:
 # Release binaries built with TSDB_TEST_HOOKS=0 must compile cleanly and carry no auth-bypass/mutant/crash env hooks.
 test: test-release-hooks
 test-release-hooks: $(B)/tsdbd $(B)/tsdb
-	B=$(B) CC="$(CC)" tests/test_release_hooks.sh
+	B=$(B) CC="$(CC)" NO_URING="$(NO_URING)" NO_EC="$(NO_EC)" NO_RDMA="$(NO_RDMA)" PORTABLE="$(PORTABLE)" tests/test_release_hooks.sh
 
 # every group above is a matrix entry of the sanitizer jobs in .github/workflows/ci.yml
 test: check-ci-groups

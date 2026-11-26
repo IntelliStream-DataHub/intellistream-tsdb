@@ -37,23 +37,29 @@ fi
 rel="$tmp/build-rel"
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 wlog="$tmp/build.err"
+make_opts=()
+[ "${NO_URING:-}" = 1 ] && make_opts+=(NO_URING=1)
+[ "${NO_EC:-}" = 1 ] && make_opts+=(NO_EC=1)
+[ "${NO_RDMA:-}" = 1 ] && make_opts+=(NO_RDMA=1)
+[ "${PORTABLE:-}" = 1 ] && make_opts+=(PORTABLE=1)
 unset MAKEFLAGS MFLAGS MAKEOVERRIDES
-make -j"$jobs" B="$rel" CC="$CC_ARG" TSDB_TEST_HOOKS=0 \
-    "$rel/tsdbd" "$rel/tsdb" "$rel/libtsdb.$SOEXT" >"$tmp/build.out" 2>"$wlog"
+make -j"$jobs" B="$rel" CC="$CC_ARG" TSDB_TEST_HOOKS=0 ${make_opts[@]+"${make_opts[@]}"} \
+    "$rel/tsdbd" "$rel/tsdb" "$rel/libtsdb.$SOEXT" "$rel/libtsdb.a" "$rel/libtsdbclient.a" >"$tmp/build.out" 2>"$wlog"
 if grep -E 'warning:.*-Wunused' "$wlog" >/dev/null 2>&1; then
     echo "test_release_hooks: FAIL: TSDB_TEST_HOOKS=0 build emitted unused warnings:" >&2
     cat "$wlog" >&2
     exit 1
 fi
 
-# 3. Release binaries must pass check-release-hooks.sh.
-tools/check-release-hooks.sh "$rel/tsdbd" "$rel/tsdb" "$rel/libtsdb.$SOEXT"
+# 3. Release binaries and static archives must pass check-release-hooks.sh.
+tools/check-release-hooks.sh "$rel/tsdbd" "$rel/tsdb" "$rel/libtsdb.$SOEXT" "$rel/libtsdb.a" "$rel/libtsdbclient.a"
 
-# 4. Runtime check: release tsdbd ignores TSDB_CRASH_AT and TSDBD_FWD_MUTANT, while dev tsdbd honors them.
-me=$BASHPID
+# 4. Runtime check: release tsdbd ignores TSDB_CRASH_AT, TSDBD_FWD_MUTANT, TSDB_AUTH_MUTANT, and TSDB_TEST_TIER,
+#    while dev tsdbd honors them.
+me=${BASHPID:-$(exec sh -c 'echo $PPID')}
 mkdir -p "$tmp/db-rel"
 pf="$tmp/rel.port"
-TSDB_CRASH_AT=serving TSDBD_FWD_MUTANT=bogus TSDB_AUTH_MUTANT=noguard \
+TSDB_CRASH_AT=serving TSDBD_FWD_MUTANT=bogus TSDB_AUTH_MUTANT=noguard TSDB_TEST_TIER=bogus \
     "$rel/tsdbd" --no-auth --dir "$tmp/db-rel" --port 0 --port-file "$pf" --exit-with-parent="$me" \
     >"$tmp/rel.log" 2>&1 &
 srv_pid=$!
