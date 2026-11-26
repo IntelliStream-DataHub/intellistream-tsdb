@@ -1010,6 +1010,9 @@ static int pool_submit(cp_job *j)
     pthread_t th;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+#ifdef __APPLE__
+    pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+#endif
     int e = pthread_create(&th, &at, pooled ? pool_worker_main : pool_oneshot_main, j);
     pthread_attr_destroy(&at);
     if (e != 0) {

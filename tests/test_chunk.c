@@ -2409,6 +2409,31 @@ static void test_chunk_random_emfile(void)
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
+/* Concurrent degraded reader worker for test_p26_open_and_par_read: races obj_ensure_pos() across threads. */
+typedef struct p26_rd_arg {
+    chunk_obj *o;
+    const uint8_t *want;
+    size_t len;
+    int ok;
+} p26_rd_arg;
+
+static void *p26_degrade_worker(void *v)
+{
+    p26_rd_arg *a = v;
+    uint8_t *buf = malloc(a->len);
+    int ok = buf != NULL;
+    for (int i = 0; ok && i < 4; i++) {
+        chunk_report rep;
+        memset(buf, 0, a->len);
+        if (chunk_obj_read(a->o, 0, a->len, buf, 0, &rep) != 0 || memcmp(buf, a->want, a->len) != 0 ||
+            rep.decoded_cells == 0)
+            ok = 0;
+    }
+    free(buf);
+    a->ok = ok;
+    return NULL;
+}
+
 /* P-26: primary-store probe + fallback in chunk_be_rd_open, lazy parity open in chunk_obj_open, and parallel
  * multi-chunk reads (healthy + degraded fallback). */
 static void test_p26_open_and_par_read(void)
@@ -2438,20 +2463,24 @@ static void test_p26_open_and_par_read(void)
     fx_free(&f);
 
     /* 2. Lazy parity open: healthy open does not open parity FDs; deleting parity after open still lets healthy
-     * multi-chunk parallel read succeed; corrupting a data chunk after open triggers lazy parity open in degrade(). */
+     * multi-chunk parallel read succeed (and leaves the deleted parity absent when lazily probed); corrupting a data
+     * chunk after open triggers lazy parity open in degrade() across surviving parity. */
     fx_make(&f, "fx-p26-lazy", 6, 4, 2, 65536, 65536 * 12 + 1234, 1);
     chunk_obj *o = NULL;
     CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, &f.g, f.rec, &o) == 0 && o != NULL);
+    char p5[PATH_MAX + 128];
+    fx_path(&f, 5, p5, sizeof p5);
+    CHECK(unlink(p5) == 0); /* parity 5 unlinked after open: proves healthy open did not hold it open */
     uint8_t *buf = malloc(f.g.len);
     chunk_report rep;
-    /* Healthy multi-chunk parallel read (checked and RAW) */
+    /* Healthy multi-chunk parallel read (checked and RAW) succeeds without touching parity */
     CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
           rep.decoded_cells == 0);
     memset(buf, 0, f.g.len);
     CHECK(chunk_obj_read(o, 0, f.g.len, buf, CHUNK_RR_RAW, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
           rep.decoded_cells == 0);
     /* Flip a byte in data chunk 1 on disk (triggers checksum mismatch in parallel path -> fallback to degrade() ->
-     * lazily opens parity position 4 and reconstructs bit-exact!) */
+     * lazily opens parity position 4 and reconstructs bit-exact while parity 5 is absent!) */
     char p1[PATH_MAX + 128];
     fx_path(&f, 1, p1, sizeof p1);
     size_t n1 = 0;
@@ -2463,8 +2492,34 @@ static void test_p26_open_and_par_read(void)
     memset(buf, 0, f.g.len);
     CHECK(chunk_obj_read(o, 0, f.g.len, buf, 0, &rep) == 0 && memcmp(buf, f.obj, f.g.len) == 0 &&
           rep.decoded_cells > 0);
+    CHECK(chunk_obj_pos_status(o, 5) == CHUNK_ST_ABSENT); /* parity 5 was not open at chunk_obj_open */
     chunk_obj_close(o);
     free(buf);
+    fx_free(&f);
+
+    /* 2b. Concurrent multi-threaded lazy parity open (obj_ensure_pos under contention). */
+    fx_make(&f, "fx-p26-race", 6, 4, 2, 65536, 65536 * 8 + 321, 1);
+    o = NULL;
+    CHECK(chunk_obj_open(f.be, f.vol, f.vuuid, f.oid, &f.g, f.rec, &o) == 0 && o != NULL);
+    char p0[PATH_MAX + 128];
+    fx_path(&f, 0, p0, sizeof p0);
+    size_t n0 = 0;
+    uint8_t *raw0 = slurp(p0, &n0);
+    CHECK(raw0 && n0 > CHUNK_HDR_BYTES + 50);
+    raw0[CHUNK_HDR_BYTES + 50] ^= 0x55;
+    spit(p0, raw0, n0);
+    free(raw0);
+    pthread_t th[4];
+    p26_rd_arg args[4];
+    for (int i = 0; i < 4; i++) {
+        args[i] = (p26_rd_arg){.o = o, .want = f.obj, .len = f.g.len, .ok = 0};
+        CHECK(pthread_create(&th[i], NULL, p26_degrade_worker, &args[i]) == 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(args[i].ok == 1);
+    }
+    chunk_obj_close(o);
     fx_free(&f);
 
     /* 3. All data chunks missing BEFORE open (k=2, m=2): both expect==NULL and expect!=NULL must fall back to

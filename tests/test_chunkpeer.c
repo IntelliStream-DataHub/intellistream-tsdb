@@ -1239,14 +1239,14 @@ static void test_parallel_put(void)
     void *ctx = make_ctx();
     CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
     obj o;
-    obj_make(&o, 1u << 20, 31);
+    obj_make(&o, 128u << 10, 31);
     for (uint32_t i = 1; i <= NM; i++)
-        atomic_store(&F.put_delay_ms[i], 60);
+        atomic_store(&F.put_delay_ms[i], 120);
     uint64_t t0 = mono_ms();
     CHECK(put(ctx, &o, 5) == 0);
     uint64_t dt = mono_ms() - t0;
-    /* Serial 6 x 60 ms = 360+ ms; parallel completes in ~60 ms (generous 250 ms cap for slow/sanitized builds). */
-    CHECK(dt < 250);
+    /* Serial 6 x 120 ms = 720+ ms; parallel completes in ~120 ms (generous 500 ms cap for TSan/slow-disk headroom). */
+    CHECK(dt < 500);
     for (uint32_t i = 1; i <= NM; i++)
         atomic_store(&F.put_delay_ms[i], 0);
     chunk_report rep;

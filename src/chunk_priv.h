@@ -31,6 +31,10 @@ int chunk_store_see(chunk_store *st, uint32_t volume, uint64_t e);
 void chunk_store_test_fail(chunk_store *st);                    /* test hook: the store failed in service */
 int chunk_store_test_flip(chunk_store *st, const chunk_ident *id); /* test hook: one byte of the first cell flipped */
 
+/* A backend's lazy joinable I/O worker pool (chunkread.c), torn down in chunk_be_close. */
+typedef struct chunk_rpool chunk_rpool;
+void chunk_rpool_destroy(chunk_rpool *p);
+
 /* A backend's stores (chunkstore.c) as the heal code (chunkheal.c) needs them. */
 struct chunk_backend {
     int n;
@@ -46,6 +50,7 @@ struct chunk_backend {
         uint64_t epoch;
     } *f;
     size_t nf, capf;
+    _Atomic(chunk_rpool *) rpool; /* lazy joinable I/O worker pool for parallel chunk_obj reads (chunkread.c) */
 };
 /* The store the position `pos` of the object is placed on: (chunk_be_place + pos) mod n. */
 int chunk_be_pos_store(const chunk_backend *be, const uint8_t oid[16], unsigned pos);

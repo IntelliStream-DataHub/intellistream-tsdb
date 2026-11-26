@@ -1102,7 +1102,7 @@ static void on_link_chunk(void *arg, struct plink *l, int up)
     pthread_mutex_lock(&cs->cmu);
     for (size_t b = 0; b < CS_PEND_BUCKETS; b++)
         for (struct cs_pend *q = cs->pend[b]; q; q = q->next)
-            if (q->link == l && q->gen == gen && !q->done && !q->aborted) {
+            if (q->link == l && q->gen <= gen && !q->done && !q->aborted) {
                 q->aborted = true;
                 pthread_cond_signal(&q->cv);
             }
@@ -1540,7 +1540,8 @@ static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t dead
         uint64_t gen = plink_gen(l);
         int rc = gen ? plink_send_gen(l, gen, CS_T_REQ, p, n, 100) : PL_E_DOWN;
         if (rc == PL_OK) {
-            *gen_out = gen;
+            if (gen_out)
+                *gen_out = gen;
             return 0;
         }
         if (rc != PL_E_DOWN && rc != PL_E_FULL)
@@ -1575,8 +1576,13 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     if (ret == 0) {
         pd->link = lc;
         pd->gen = gen;
-        if (!pd->done && (!plink_up(lc) || plink_gen(lc) != gen))
-            pd->aborted = true;
+        if (!pd->done) {
+            pthread_mutex_unlock(&cs->cmu);
+            bool alive = plink_up(lc) && plink_gen(lc) == gen;
+            pthread_mutex_lock(&cs->cmu);
+            if (!alive && !pd->done)
+                pd->aborted = true;
+        }
     }
     while (ret == 0 && !pd->done && !pd->aborted && now_ns() < deadline)
         wait_until_ns(cs, pd, deadline);
@@ -1711,12 +1717,12 @@ static int stage_wr_full(int fd, const void *buf, size_t n)
 int chunksrv_stage(const char *dir, const chunk_geom *g, unsigned pos, const void *cells, const uint64_t *sums)
 {
     uint64_t nc = chunk_pos_cells(g, pos), len = chunk_pos_len(g, pos);
-    uint64_t tot = 8 * nc + len;
     int fd = -1;
 #if defined(__linux__) && defined(SYS_memfd_create)
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
+    uint64_t tot = 8 * nc + len;
     if (tot <= CS_STAGE_MEMFD_MAX)
         fd = (int)syscall(SYS_memfd_create, "tsdb-chunkput", (unsigned)MFD_CLOEXEC);
 #endif

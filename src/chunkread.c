@@ -36,10 +36,10 @@
 #include "ec/rs.h"
 #endif
 
-/* Bounded cached I/O worker pool for concurrent multi-chunk local preads in chunk_read_range.
- * Never spawns threads for single-chunk reads; falls back inline when saturated, draining, or forked. */
+/* Bounded joinable I/O worker pool owned by chunk_backend (lazily initialized on first multi-chunk parallel read,
+ * drained and pthread_join()'d in chunk_be_close()). Never spawns threads for single-chunk reads; falls back inline
+ * when saturated, stopping, or forked. */
 #define CR_POOL_MAX 8
-#define CR_POOL_IDLE_MS 2000
 #define CR_PAR_MIN_BYTES (32u << 10)
 
 typedef struct cr_job {
@@ -48,133 +48,127 @@ typedef struct cr_job {
     struct cr_job *next;
 } cr_job;
 
-static pthread_mutex_t cr_pool_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cr_pool_cv;
-static pthread_once_t cr_pool_once = PTHREAD_ONCE_INIT;
-static atomic_bool cr_pool_inited;
-static pid_t cr_pool_pid;
-static cr_job *cr_pool_head, *cr_pool_tail;
-static int cr_pool_idle, cr_pool_queued, cr_pool_total;
-static bool cr_pool_draining;
-
-static void cr_pool_init_once(void)
-{
-    tsdb_cond_init_mono(&cr_pool_cv);
-    cr_pool_pid = getpid();
-    atomic_store_explicit(&cr_pool_inited, true, memory_order_release);
-}
+struct chunk_rpool {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    cr_job *head, *tail;
+    int busy, queued, nthreads;
+    bool stopping;
+    pid_t pid;
+    pthread_t threads[CR_POOL_MAX];
+};
 
 static void *cr_pool_worker_main(void *arg)
 {
-    cr_job *j = arg;
+    chunk_rpool *p = arg;
+    pthread_mutex_lock(&p->mu);
     for (;;) {
-        void (*fn)(void *) = j->fn;
-        void *a = j->arg;
-        fn(a);
-        pthread_mutex_lock(&cr_pool_mu);
-        if (cr_pool_head) {
-            j = cr_pool_head;
-            cr_pool_head = j->next;
-            if (!cr_pool_head)
-                cr_pool_tail = NULL;
-            cr_pool_queued--;
-            pthread_mutex_unlock(&cr_pool_mu);
+        while (!p->head && !p->stopping)
+            pthread_cond_wait(&p->cv, &p->mu);
+        if (p->head) {
+            cr_job *j = p->head;
+            p->head = j->next;
+            if (!p->head)
+                p->tail = NULL;
+            p->queued--;
+            p->busy++;
+            pthread_mutex_unlock(&p->mu);
+            j->fn(j->arg);
+            pthread_mutex_lock(&p->mu);
+            p->busy--;
             continue;
         }
-        if (cr_pool_draining) {
-            cr_pool_total--;
-            pthread_cond_broadcast(&cr_pool_cv);
-            pthread_mutex_unlock(&cr_pool_mu);
-            return NULL;
-        }
-        cr_pool_idle++;
-        struct timespec dl;
-        tsdb_cond_deadline_ms(&dl, CR_POOL_IDLE_MS);
-        while (!cr_pool_head && !cr_pool_draining) {
-            if (pthread_cond_timedwait(&cr_pool_cv, &cr_pool_mu, &dl) == ETIMEDOUT)
-                break;
-        }
-        cr_pool_idle--;
-        if (cr_pool_head) {
-            j = cr_pool_head;
-            cr_pool_head = j->next;
-            if (!cr_pool_head)
-                cr_pool_tail = NULL;
-            cr_pool_queued--;
-            pthread_mutex_unlock(&cr_pool_mu);
-            continue;
-        }
-        cr_pool_total--;
-        pthread_cond_broadcast(&cr_pool_cv);
-        pthread_mutex_unlock(&cr_pool_mu);
-        return NULL;
+        if (p->stopping)
+            break;
     }
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
 }
 
-static int cr_pool_submit(cr_job *j)
+static chunk_rpool *cr_pool_get(chunk_backend *be)
 {
-    pthread_once(&cr_pool_once, cr_pool_init_once);
-    if (getpid() != cr_pool_pid)
+    if (!be)
+        return NULL;
+    chunk_rpool *p = atomic_load_explicit(&be->rpool, memory_order_acquire);
+    if (p)
+        return p;
+    pthread_mutex_lock(&be->mu);
+    p = atomic_load_explicit(&be->rpool, memory_order_relaxed);
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        if (p) {
+            pthread_mutex_init(&p->mu, NULL);
+            pthread_cond_init(&p->cv, NULL);
+            p->pid = getpid();
+            atomic_store_explicit(&be->rpool, p, memory_order_release);
+        }
+    }
+    pthread_mutex_unlock(&be->mu);
+    return p;
+}
+
+static int cr_pool_submit(chunk_backend *be, cr_job *j)
+{
+    chunk_rpool *p = cr_pool_get(be);
+    if (!p || getpid() != p->pid)
         return -1;
     j->next = NULL;
-    pthread_mutex_lock(&cr_pool_mu);
-    if (cr_pool_draining) {
-        pthread_mutex_unlock(&cr_pool_mu);
+    pthread_mutex_lock(&p->mu);
+    if (p->stopping) {
+        pthread_mutex_unlock(&p->mu);
         return -1;
     }
-    if (cr_pool_idle > cr_pool_queued) {
-        if (cr_pool_tail)
-            cr_pool_tail->next = j;
-        else
-            cr_pool_head = j;
-        cr_pool_tail = j;
-        cr_pool_queued++;
-        pthread_cond_signal(&cr_pool_cv);
-        pthread_mutex_unlock(&cr_pool_mu);
-        return 0;
-    }
-    if (cr_pool_total >= CR_POOL_MAX) {
-        pthread_mutex_unlock(&cr_pool_mu);
-        return -1;
-    }
-    cr_pool_total++;
-    pthread_mutex_unlock(&cr_pool_mu);
-
-    pthread_attr_t at;
-    pthread_t th;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int avail = p->nthreads - p->busy;
+    if (p->queued >= avail && p->nthreads < CR_POOL_MAX) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
 #ifdef __APPLE__
-    pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
+        pthread_attr_setstacksize(&at, TSDB_THREAD_STACK);
 #endif
-    int e = pthread_create(&th, &at, cr_pool_worker_main, j);
-    pthread_attr_destroy(&at);
-    if (e != 0) {
-        pthread_mutex_lock(&cr_pool_mu);
-        cr_pool_total--;
-        pthread_cond_broadcast(&cr_pool_cv);
-        pthread_mutex_unlock(&cr_pool_mu);
+        pthread_t th;
+        int e = pthread_create(&th, &at, cr_pool_worker_main, p);
+        pthread_attr_destroy(&at);
+        if (e == 0) {
+            p->threads[p->nthreads++] = th;
+            avail++;
+        }
+    }
+    if (p->queued >= avail) {
+        pthread_mutex_unlock(&p->mu);
         return -1;
     }
+    if (p->tail)
+        p->tail->next = j;
+    else
+        p->head = j;
+    p->tail = j;
+    p->queued++;
+    pthread_cond_signal(&p->cv);
+    pthread_mutex_unlock(&p->mu);
     return 0;
 }
 
-__attribute__((destructor)) static void cr_pool_fini(void)
+void chunk_rpool_destroy(chunk_rpool *p)
 {
-    if (!atomic_load_explicit(&cr_pool_inited, memory_order_acquire))
+    if (!p)
         return;
-    if (getpid() != cr_pool_pid)
-        return;
-    pthread_mutex_lock(&cr_pool_mu);
-    cr_pool_draining = true;
-    pthread_cond_broadcast(&cr_pool_cv);
-    while (cr_pool_total > 0)
-        pthread_cond_wait(&cr_pool_cv, &cr_pool_mu);
-    pthread_mutex_unlock(&cr_pool_mu);
+    if (getpid() == p->pid) {
+        pthread_mutex_lock(&p->mu);
+        p->stopping = true;
+        pthread_cond_broadcast(&p->cv);
+        int n = p->nthreads;
+        pthread_mutex_unlock(&p->mu);
+        for (int i = 0; i < n; i++)
+            pthread_join(p->threads[i], NULL);
+        pthread_cond_destroy(&p->cv);
+        pthread_mutex_destroy(&p->mu);
+    }
+    free(p);
 }
 
 static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len);
 static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos);
+static chunk_backend *obj_backend(const chunk_obj *o);
 
 enum { PS_UNKNOWN = 0, PS_GOOD, PS_BAD };
 
@@ -375,10 +369,8 @@ static void cr_pos_run(cr_pos_task *t)
     }
     const uint64_t *sums = NULL;
     if (!t->raw && !t->rec) {
-        int st = 0;
         sums = chunk_obj_pos_sums(t->o, pos);
         if (!sums) {
-            (void)st;
             free(slot);
             t->failed = true;
             return;
@@ -483,8 +475,9 @@ static bool try_read_parallel(const chunk_obj *o, const chunk_geom *g, const uin
     pthread_mutex_unlock(&mu);
 
     unsigned failed_submits = 0;
+    chunk_backend *be = obj_backend(o);
     for (unsigned idx = 1; idx < npos; idx++) {
-        if (cr_pool_submit(&tasks[idx].job) != 0) {
+        if (cr_pool_submit(be, &tasks[idx].job) != 0) {
             inline_run[idx] = true;
             failed_submits++;
         }
@@ -603,6 +596,11 @@ static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos)
 {
     return pos < CHUNK_POS_MAX && atomic_load_explicit(&((chunk_obj *)o)->tried[pos], memory_order_acquire) &&
            o->rd[pos] != NULL;
+}
+
+static chunk_backend *obj_backend(const chunk_obj *o)
+{
+    return o ? o->be : NULL;
 }
 
 static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
