@@ -71,7 +71,8 @@
 #define PLR_HDR 8          /* bytes of the header of every message */
 #define PLR_EP_LEN 40      /* an encoded endpoint (plr_ep_encode) */
 #define PLR_CM_ADDR_LEN 20 /* an encoded rdma_cm address (af, pad, port, ip[16]) */
-#define PLR_CM_PD_LEN 44   /* rdma_cm private_data: magic(4) + nonce(8) + HMAC-SHA256 tag(32) <= 56 B IB CM limit */
+#define PLR_CM_PD_LEN 44   /* rdma_cm private_data: magic(4) + nonce(8) + HMAC-SHA256 tag(32) */
+#define PLR_CM_PD_MAX 56   /* IB CM REQ MAD private_data maximum (trailing zero padding allowed up to 56 B) */
 #define PLR_CM_PD_MAGIC 0x314d4354u /* "TCM1" */
 #define PLR_EP_F_CM 0x01u  /* plr_ep.flags: connect via rdma_cm (Option C) instead of direct verbs */
 #define PLR_DRAIN_MS 5000  /* the most close waits for the drain's markers */
@@ -217,7 +218,7 @@ struct plr_cm_ev {
     int status;
     struct plr_cm_id *req_id; /* PLR_CM_EV_CONNECT_REQUEST only: child id migrated to its own channel */
     uint8_t pd[64];           /* private_data copied out before ack_cm_event */
-    uint8_t pd_len;
+    uint16_t pd_len;          /* untruncated private_data_len from the CM event */
 };
 
 /* The rdma_cm operations behind a table, so server/plrdma.c and server/peerlink.c compile without rdma_cma.h and

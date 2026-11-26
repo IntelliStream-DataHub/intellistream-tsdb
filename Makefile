@@ -95,7 +95,12 @@ $(warning RDMA: rdma-core's headers (infiniband/verbs.h) not found: tsdbd is bui
 endif
 endif
 ifeq ($(filter 1,$(NO_RDMA)),)
+ifeq ($(NO_RDMA_CM),)
 NO_RDMA_CM := $(shell echo 'int x;' | $(CC) $(RDMA_CFLAGS) -include rdma/rdma_cma.h -E -x c - >/dev/null 2>&1 && echo 0 || echo 1)
+ifeq ($(NO_RDMA_CM),1)
+$(warning RDMA CM: rdma-core's CM header (rdma/rdma_cma.h) not found: tsdbd is built without Option C rdma_cm (NO_RDMA_CM=1))
+endif
+endif
 else
 NO_RDMA_CM := 1
 endif
@@ -827,6 +832,10 @@ dist:
 	    echo "dist: rdma-core's headers (infiniband/verbs.h) not found: install libibverbs-dev or rdma-core-devel," \
 	         "or give RDMA_CFLAGS=-I<dir>, or NO_RDMA=1 for a tarball without the verbs transport" >&2; exit 1; \
 	fi
+	@if [ "$(NO_RDMA)" != 1 ] && [ "$(NO_RDMA_CM)" = 1 ] && [ "$(origin NO_RDMA_CM)" = file ]; then \
+	    echo "dist: rdma-core's CM header (rdma/rdma_cma.h) not found: install librdmacm-dev or rdma-core-devel," \
+	         "or give RDMA_CFLAGS=-I<dir>, or NO_RDMA_CM=1 for a tarball without rdma_cm" >&2; exit 1; \
+	fi
 	@sig="$(DIST_SIG)"; \
 	if [ "$$(cat $(DIST_B)/.flags 2>/dev/null)" != "$$sig" ]; then \
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
@@ -835,7 +844,7 @@ dist:
 	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
-	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(DIST_B)/tsdbd
+	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(if $(filter 1,$(NO_RDMA_CM)),,--rdma-cm) $(DIST_B)/tsdbd
 	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
 # The tarball's own test suite on this machine, every CPU level included.
@@ -2165,7 +2174,7 @@ test: check-version check-rdma-syms
 # tsdbd names no ibv_ or rdma_ symbol and needs no RDMA library (dlopen, docs/design-rdma.md §5.4); --rdma: the
 # transport is in it
 check-rdma-syms: $(B)/tsdbd
-	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(B)/tsdbd
+	tools/check-rdma-syms.sh $(if $(filter 1,$(NO_RDMA)),,--rdma) $(if $(filter 1,$(NO_RDMA_CM)),,--rdma-cm) $(B)/tsdbd
 check-version: $(B)/tsdbd $(B)/tsdb
 	tools/check-version.sh $(B)
 

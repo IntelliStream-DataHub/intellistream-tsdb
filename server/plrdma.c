@@ -118,6 +118,13 @@ static int ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
     return d == 0;
 }
 
+static void wipe_bytes(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+    for (size_t i = 0; i < n; i++)
+        v[i] = 0;
+}
+
 /* ------------------------------------------------------------------------------------------------- the pool */
 
 struct plr_pool *plr_pool_open(const struct plr_ops *ops, const struct plr_pool_cfg *cfg, char *err, size_t errlen)
@@ -318,7 +325,7 @@ void plr_cm_addr_encode(const struct plr_cm_addr *a, uint8_t out[PLR_CM_ADDR_LEN
     memset(out, 0, PLR_CM_ADDR_LEN);
     out[0] = a->af;
     put16(out + 2, a->port);
-    memcpy(out + 4, a->ip, 16);
+    memcpy(out + 4, a->ip, a->af == 4 ? 4 : 16);
 }
 
 int plr_cm_addr_decode(struct plr_cm_addr *a, const uint8_t *in, size_t n)
@@ -714,37 +721,58 @@ static long ms_since(const struct timespec *t0)
     return (t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
-/* the queue pair to the error state and every work request back (flushed or not), then destroyed; 1 if drained */
-static int drain(struct plr_conn *c)
+static int drain_wait(struct plr_conn *c, unsigned want, const struct timespec *t0)
 {
-    if (c->ops->qp_err(c->qp) < 0)
-        return 0;
-    /* A CM QP that never reached ESTABLISHED (e.g. rejected or aborted before RTS) never posted any
-     * send WRs; on iWARP (irdma) an INIT->ERR QP flushes only RQ markers and never a send marker. */
-    unsigned need = MARK_RECV | ((c->cm_id && !c->started && c->s_n == 0) ? 0 : MARK_SEND);
-    if ((need & MARK_SEND) && c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0)
-        return 0;
-    if (c->ops->post_recv(c->qp, WR(WR_MARK, MARK_RECV), NULL, 0, 0) < 0)
-        return 0;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         pump(c, 1);
-        if ((c->marks & need) == need ||
-            (plrdma_mutant == PLR_MUT_NORECVMARK && (need & MARK_SEND) && (c->marks & MARK_SEND)))
+        if ((c->marks & want) == want)
             return 1;
-        long left = plrdma_drain_ms - ms_since(&t0);
+        long left = plrdma_drain_ms - ms_since(t0);
         if (left <= 0)
             return 0;
         if (c->ops->arm(c->qp) < 0)
             return 0;
         pump(c, 1);
-        if ((c->marks & need) == need)
+        if ((c->marks & want) == want)
             return 1;
         struct pollfd pf = {c->ops->fd(c->qp), POLLIN, 0};
         if (poll(&pf, 1, left < 50 ? (int)left : 50) > 0 && c->ops->take_events(c->qp) < 0)
             return 0;
     }
+}
+
+/* the queue pair to the error state and every work request back (flushed or not), then destroyed; 1 if drained */
+static int drain(struct plr_conn *c)
+{
+    if (c->ops->qp_err(c->qp) < 0)
+        return 0;
+    /* Drain already-completed CQEs first (providers like libirdma only issue a software re-flush when the
+     * userspace ring looks empty), then drain the RQ completely before posting MARK_SEND: on iWARP (irdma),
+     * an immediate post_send(MARK_SEND) on an empty SQ triggers irdma_issue_flush(sq=1, rq=0) which can race
+     * with and suppress the initial modify_qp(ERR) RQ flush. */
+    pump(c, 1);
+    /* A CM QP that never reached ESTABLISHED (e.g. rejected or aborted before RTS, or repost() failed in
+     * plr_conn_new_cm() before c->cm_id was assigned) never posted any send WRs; on iWARP (irdma) an INIT->ERR
+     * QP flushes only RQ markers and never a send marker. */
+    unsigned need_send = (c->cm_ops && !c->started && c->s_n == 0) ? 0 : MARK_SEND;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (plrdma_mutant == PLR_MUT_NORECVMARK && need_send) {
+        if (c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0)
+            return 0;
+        return drain_wait(c, MARK_SEND, &t0);
+    }
+    if (c->ops->post_recv(c->qp, WR(WR_MARK, MARK_RECV), NULL, 0, 0) < 0)
+        return 0;
+    if (!drain_wait(c, MARK_RECV, &t0))
+        return 0;
+    if (need_send) {
+        if (c->ops->post_send(c->qp, WR(WR_MARK, MARK_SEND), NULL, 0, 0, 1) < 0)
+            return 0;
+        if (!drain_wait(c, MARK_SEND, &t0))
+            return 0;
+    }
+    return 1;
 }
 
 static void conn_release(struct plr_conn *c)
@@ -1129,9 +1157,9 @@ static void *cm_lis_main(void *arg)
                         break;
                     }
                 }
-            } else if (ev.pd_len >= PLR_CM_PD_LEN && get32(ev.pd) == PLR_CM_PD_MAGIC) {
+            } else if (ev.pd_len >= PLR_CM_PD_LEN && ev.pd_len <= PLR_CM_PD_MAX && get32(ev.pd) == PLR_CM_PD_MAGIC) {
                 /* IB CM REQ MADs carry a fixed 56-byte private_data field (trailing bytes zero-padded);
-                 * iWARP/RoCE may report the exact PLR_CM_PD_LEN (44 bytes). */
+                 * iWARP/RoCE may report the exact PLR_CM_PD_LEN (44 bytes). Reject oversize private_data. */
                 uint64_t nonce = get64(ev.pd + 4);
                 for (struct plr_cm_token *t = lis->tokens; t; t = t->next) {
                     if (!t->claimed && t->nonce == nonce && ct_eq(t->tag, ev.pd + 12, 32)) {
@@ -1148,9 +1176,11 @@ static void *cm_lis_main(void *arg)
                 pthread_mutex_unlock(&lis->mu);
             } else {
                 pthread_mutex_unlock(&lis->mu);
-                __atomic_add_fetch(&lis->rejected, 1, __ATOMIC_RELAXED);
-                fprintf(stderr, "peerlink: rdma-cm: rejected unauthorized connection request (private_data len %u)\n",
-                        (unsigned)ev.pd_len);
+                uint64_t rej = __atomic_add_fetch(&lis->rejected, 1, __ATOMIC_RELAXED);
+                if (rej <= 10 || rej % 1000 == 0)
+                    fprintf(stderr,
+                            "peerlink: rdma-cm: rejected unauthorized connection request (private_data len %u, total %" PRIu64 ")\n",
+                            (unsigned)ev.pd_len, rej);
                 lis->ops->reject(ev.req_id);
             }
         }
@@ -1218,6 +1248,7 @@ void plr_cm_listener_close(struct plr_cm_listener *lis)
         struct plr_cm_token *nx = t->next;
         if (t->cm_id)
             lis->ops->reject(t->cm_id);
+        wipe_bytes(t->tag, sizeof t->tag);
         free(t);
         t = nx;
     }
@@ -1276,8 +1307,10 @@ struct plr_cm_id *plr_cm_take(struct plr_cm_listener *lis, struct plr_cm_token *
         }
     }
     pthread_mutex_unlock(&lis->mu);
-    if (got)
+    if (got) {
+        wipe_bytes(tok->tag, sizeof tok->tag);
         free(tok);
+    }
     return got;
 }
 
@@ -1298,6 +1331,7 @@ void plr_cm_cancel(struct plr_cm_listener *lis, struct plr_cm_token *tok)
     pthread_mutex_unlock(&lis->mu);
     if (stray)
         lis->ops->reject(stray);
+    wipe_bytes(tok->tag, sizeof tok->tag);
     free(tok);
 }
 

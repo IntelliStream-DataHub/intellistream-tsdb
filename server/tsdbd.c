@@ -6590,8 +6590,15 @@ int main(int argc, char **argv)
                     fprintf(stderr, "tsdbd: no RDMA pool opened; data links stay on TCP\n");
                 } else if (rdma_cm) {
                     struct plr_cm_addr bind = {0};
-                    const char *pa = peer_addr ? peer_addr : addr;
-                    bind.af = (pa && strchr(pa, ':')) ? 6 : 4;
+                    for (int j = 0; j < rdma_npools && !bind.af; j++) {
+                        const struct plr_port *pp = plr_pool_port(rdma_pools[j]);
+                        if (pp && pp->cm_af)
+                            bind.af = pp->cm_af;
+                    }
+                    if (!bind.af) {
+                        const char *pa = peer_addr ? peer_addr : addr;
+                        bind.af = (pa && strchr(pa, ':')) ? 6 : 4;
+                    }
                     rdma_cm_lis = plr_cm_listen(cm_ops, &bind, rerr, sizeof rerr);
                     if (!rdma_cm_lis) {
                         if (rdma_mode == PL_RDMA_ON) {

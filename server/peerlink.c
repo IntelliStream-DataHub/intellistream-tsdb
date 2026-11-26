@@ -1891,7 +1891,7 @@ static void up_rdma_mac(const uint8_t key[32], uint8_t type, uint64_t seq, uint6
 /* Connection-derived HMAC tag carried in rdma_conn_param.private_data (Option C, design-rdma.md §5.5). */
 static void up_rdma_cm_mac(const uint8_t key[32], uint64_t offer_seq, uint64_t nonce, uint8_t out[32])
 {
-    static const char dom[16] = "tsdb-rdma-cm-req";
+    static const char dom[] = "tsdb-rdma-cm-req";
     uint8_t msg[16];
     for (int i = 0; i < 8; i++) {
         msg[i] = (uint8_t)(offer_seq >> (8 * i));
@@ -1899,7 +1899,7 @@ static void up_rdma_cm_mac(const uint8_t key[32], uint64_t offer_seq, uint64_t n
     }
     struct hk hk;
     hk_init(&hk, key, 32);
-    hk_mac(&hk, dom, sizeof dom, msg, sizeof msg, "", 0, "", 0, out);
+    hk_mac(&hk, dom, sizeof dom - 1, msg, sizeof msg, "", 0, "", 0, out);
     tsdb_wipe(&hk, sizeof hk);
 }
 
@@ -1974,6 +1974,7 @@ static void up_cleanup(struct conn *c)
     }
     c->up_pool = NULL;
     c->up_cm_mode = 0;
+    tsdb_wipe(c->up_cm_pd, sizeof c->up_cm_pd);
     c->up_ready_at = 0;
     c->up_fail_after_hello = 0;
     buf_free(&c->up_wb);
@@ -2180,6 +2181,7 @@ static int up_switch_to_rdma(struct conn *c, int send_go)
     c->up_conn = NULL;
     c->up_pool = NULL;
     c->up_cm_mode = 0;
+    tsdb_wipe(c->up_cm_pd, sizeof c->up_cm_pd);
     c->up_state = UP_IDLE;
     c->up_ready_at = 0;
     c->next_reoffer_ns = 0;
@@ -2247,44 +2249,57 @@ static int up_handle_offer(struct conn *c, const struct pl_msg *m)
             else if (!c->rcfg.cm_ops || !c->rcfg.cm_lis)
                 decl = PL_RDMA_DECL_QP;
             else {
-                uint64_t offer_seq = c->rd->seq - 1;
-                uint8_t want_tag[32];
-                up_rdma_cm_mac(c->keys.rdma_key, offer_seq, m->a, want_tag);
-                struct plr_cm_token *tok = plr_cm_expect(c->rcfg.cm_lis, m->a, want_tag, cm_wake_cb, c->l);
-                tsdb_wipe(want_tag, sizeof want_tag);
-                if (!tok) {
-                    decl = PL_RDMA_DECL_QP;
-                } else {
-                    struct plr_ep my_ep;
-                    struct plr_cm_addr my_addr;
-                    plr_pool_ep(pool, PLR_EP_F_CM, &my_ep);
-                    plr_cm_listener_addr(c->rcfg.cm_lis, &my_addr);
-                    if (cm_ip_is_zero(my_addr.ip)) {
-                        const struct plr_port *pp = plr_pool_port(pool);
-                        if (pp && pp->cm_af) {
-                            my_addr.af = pp->cm_af;
-                            memcpy(my_addr.ip, pp->cm_ip, 16);
-                        } else {
-                            cm_fill_ip_from_tcp(c->t, 0, &my_addr);
-                        }
+                struct plr_cm_addr my_addr;
+                plr_cm_listener_addr(c->rcfg.cm_lis, &my_addr);
+                int af_mismatch = 0;
+                if (cm_ip_is_zero(my_addr.ip)) {
+                    uint8_t lis_af = my_addr.af;
+                    const struct plr_port *pp = plr_pool_port(pool);
+                    if (pp && pp->cm_af && (!lis_af || pp->cm_af == lis_af)) {
+                        my_addr.af = pp->cm_af;
+                        memcpy(my_addr.ip, pp->cm_ip, 16);
+                    } else {
+                        struct plr_cm_addr tcp_addr = my_addr;
+                        cm_fill_ip_from_tcp(c->t, 0, &tcp_addr);
+                        if (!lis_af || tcp_addr.af == lis_af)
+                            my_addr = tcp_addr;
+                        else
+                            af_mismatch = 1;
                     }
-                    uint8_t acc_bytes[PLR_EP_LEN + PLR_CM_ADDR_LEN];
-                    plr_ep_encode(&my_ep, acc_bytes);
-                    plr_cm_addr_encode(&my_addr, acc_bytes + PLR_EP_LEN);
-                    c->up_cm_tok = tok;
-                    c->up_pool = pool;
-                    c->up_peer_ep = peer_ep;
-                    c->up_peer_seq = offer_seq;
-                    c->up_nonce = m->a;
-                    c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
-                    c->up_cm_mode = 1;
-                    send_ctl_now(c, PLT_RDMA_ACCEPT, acc_bytes, sizeof acc_bytes);
-                    uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
-                    c->up_deadline = now_ns() + atmo;
-                    c->up_state = UP_A_WAIT_CM;
-                    return 0;
+                }
+                if (af_mismatch) {
+                    decl = PL_RDMA_DECL_SUBNET;
+                } else {
+                    uint64_t offer_seq = c->rd->seq - 1;
+                    uint8_t want_tag[32];
+                    up_rdma_cm_mac(c->keys.rdma_key, offer_seq, m->a, want_tag);
+                    struct plr_cm_token *tok = plr_cm_expect(c->rcfg.cm_lis, m->a, want_tag, cm_wake_cb, c->l);
+                    tsdb_wipe(want_tag, sizeof want_tag);
+                    if (!tok) {
+                        decl = PL_RDMA_DECL_QP;
+                    } else {
+                        struct plr_ep my_ep;
+                        plr_pool_ep(pool, PLR_EP_F_CM, &my_ep);
+                        uint8_t acc_bytes[PLR_EP_LEN + PLR_CM_ADDR_LEN];
+                        plr_ep_encode(&my_ep, acc_bytes);
+                        plr_cm_addr_encode(&my_addr, acc_bytes + PLR_EP_LEN);
+                        c->up_cm_tok = tok;
+                        c->up_pool = pool;
+                        c->up_peer_ep = peer_ep;
+                        c->up_peer_seq = offer_seq;
+                        c->up_nonce = m->a;
+                        c->up_self_seq = c->seq_out; /* seq of RDMA_ACCEPT */
+                        c->up_cm_mode = 1;
+                        send_ctl_now(c, PLT_RDMA_ACCEPT, acc_bytes, sizeof acc_bytes);
+                        uint64_t atmo = (uint64_t)(c->rcfg.accept_timeout_ms ? c->rcfg.accept_timeout_ms : 4000u) * MS;
+                        c->up_deadline = now_ns() + atmo;
+                        c->up_state = UP_A_WAIT_CM;
+                        return 0;
+                    }
                 }
             }
+        } else if (c->rcfg.cm) {
+            decl = PL_RDMA_DECL_OFF;
         } else {
             char err[256];
             struct plr_conn *conn = plr_conn_new(pool, err, sizeof err);
@@ -2476,7 +2491,23 @@ static void up_step_cm(struct conn *c)
             if (ev == PLR_CM_EV_ROUTE_RESOLVED && c->up_cm_id && !c->up_conn) {
                 c->up_conn = plr_conn_new_cm(c->up_pool, c->rcfg.cm_ops, c->up_cm_id, &c->up_peer_ep, c->rcfg.poll_us,
                                              err, sizeof err);
+                if (!c->up_conn && errno == EXDEV && c->rcfg.npools > 1) {
+                    /* Multi-HCA Ethernet: route resolved to another pool's device; try the remaining pools. */
+                    for (int i = 0; i < c->rcfg.npools && !c->up_conn; i++) {
+                        struct plr_pool *alt = c->rcfg.pools[i];
+                        if (!alt || alt == c->up_pool)
+                            continue;
+                        c->up_conn = plr_conn_new_cm(alt, c->rcfg.cm_ops, c->up_cm_id, &c->up_peer_ep, c->rcfg.poll_us,
+                                                     err, sizeof err);
+                        if (c->up_conn) {
+                            c->up_pool = alt;
+                            c->l->rdma_pool_idx = i;
+                        }
+                    }
+                }
                 if (!c->up_conn) {
+                    if (errno == EXDEV && c->rcfg.npools > 1)
+                        c->l->rdma_pool_idx = (c->l->rdma_pool_idx + 1) % c->rcfg.npools;
                     fprintf(stderr, "peerlink: rdma-cm: dial: %s\n", err);
                     up_dial_abort(c, PL_RDMA_FB_QP, 1);
                     return;
@@ -3003,6 +3034,16 @@ static void conn_run(struct plink *l, struct pl_transport *t, struct keys *keys,
                 c.up_cm_tok = NULL;
                 char err[256];
                 c.up_conn = plr_conn_new_cm(c.up_pool, c.rcfg.cm_ops, cid, &c.up_peer_ep, c.rcfg.poll_us, err, sizeof err);
+                if (!c.up_conn && errno == EXDEV && c.rcfg.npools > 1) {
+                    for (int i = 0; i < c.rcfg.npools && !c.up_conn; i++) {
+                        struct plr_pool *alt = c.rcfg.pools[i];
+                        if (!alt || alt == c.up_pool)
+                            continue;
+                        c.up_conn = plr_conn_new_cm(alt, c.rcfg.cm_ops, cid, &c.up_peer_ep, c.rcfg.poll_us, err, sizeof err);
+                        if (c.up_conn)
+                            c.up_pool = alt;
+                    }
+                }
                 if (!c.up_conn) {
                     fprintf(stderr, "peerlink: rdma-cm: accept: %s\n", err);
                     c.rcfg.cm_ops->reject(cid);

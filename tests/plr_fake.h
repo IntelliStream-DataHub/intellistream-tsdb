@@ -788,9 +788,9 @@ static int pfk_cm_connect(struct plr_cm_id *id, const void *pd, uint8_t pd_len, 
     ev.type = PLR_CM_EV_CONNECT_REQUEST;
     ev.req_id = req;
     if (pd && pd_len) {
-        uint8_t n = pd_len > sizeof ev.pd ? (uint8_t)sizeof ev.pd : pd_len;
-        memcpy(ev.pd, pd, n);
-        ev.pd_len = n;
+        size_t copy = pd_len > sizeof ev.pd ? sizeof ev.pd : pd_len;
+        memcpy(ev.pd, pd, copy);
+        ev.pd_len = pd_len;
     }
     pfk_cm_push_locked(lis, ev);
     pthread_mutex_unlock(&f->mu);

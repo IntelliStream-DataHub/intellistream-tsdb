@@ -541,7 +541,7 @@ per link in step 2. New keys (tsdbd_keys.h rows, docs/config.md):
 | `cluster.peer.rdma.sl` | `--peer-rdma-sl` | `0` | the InfiniBand service level of the QPs: one number, or `KIND=SL,...` (`log=1,bulk=2,snap=2`); effective only where the subnet manager maps SLs to VLs (§4 "Sharing the port", D13) |
 | `cluster.peer.rdma.retry_s` | `--peer-rdma-retry-s` | 600 | a link that settled on TCP after a failure (not a decline for `not_built`, `off` or `kind`) offers again after this long (§5.3) |
 | `cluster.peer.rdma.poll_us` | `--peer-rdma-poll-us` | 0 | busy poll before sleeping on completion events |
-| `cluster.peer.rdma.cm` | `--peer-rdma-cm` | (unset) | `ADDR[:PORT]`: also listen with rdma_cm (option C; iWARP) |
+| `cluster.peer.rdma.cm` | `--peer-rdma-cm` | `false` | boolean (*as built*, rd-cm): establish RDMA connections via rdma_cm (option C, dynamically loading `librdmacm`; required for iWARP, optional on IB/RoCE; ephemeral CM port advertised inside `RDMA_ACCEPT`) |
 | `cluster.peer.allow_ipoib` | `--peer-allow-ipoib` | `false` | `true` lets the TCP peer address be on an IPoIB interface (§5.3); off by default because no TCP should run over IPoIB |
 
 An offer is declined (`subnet`) when the offered GID's subnet prefix matches none of the acceptor's chosen ports: a host

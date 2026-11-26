@@ -7,13 +7,14 @@
 # Always: the C build (gcc, make, binutils for objdump in `make dist`), libzstd (the dev package also has the static
 # libzstd.a that `make dist` links), liburing (liburing.a for `make dist` too), pkg-config and python3 (the
 # integration harness and several helpers), curl and jq (the release workflow's API calls and their test in
-# `make test`; the runner has both, this only says so), libibverbs-dev (rdma-core's headers: tsdbd's verbs transport
-# is built against them and loads libibverbs with dlopen, nothing is linked; `make dist` refuses without them).
+# `make test`; the runner has both, this only says so), libibverbs-dev and librdmacm-dev (rdma-core's headers: tsdbd's
+# verbs and rdma_cm transports are built against them and load libibverbs/librdmacm with dlopen, nothing is linked;
+# `make dist` refuses without them).
 # With "clients": what `make test-clients` and `make integration-tests` use on top: a venv for maturin and pytest,
 # and the Python headers PyO3 looks for. Rust, Java and Maven come from their own steps in the workflow
 # (rust-toolchain, setup-java; Maven is preinstalled on the runner).
 set -eu
-pkgs="build-essential binutils libzstd-dev liburing-dev libibverbs-dev pkg-config python3 curl jq"
+pkgs="build-essential binutils libzstd-dev liburing-dev libibverbs-dev librdmacm-dev pkg-config python3 curl jq"
 for g in "$@"; do
     case $g in
     clients) pkgs="$pkgs python3-venv python3-dev python3-pip" ;;

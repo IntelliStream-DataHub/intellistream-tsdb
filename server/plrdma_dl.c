@@ -51,6 +51,7 @@ const struct plr_cm_ops *plrdma_cm(char *err, size_t errlen)
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <infiniband/verbs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -238,18 +239,29 @@ static void dev_find_cm_ip(const char *dev_name, uint8_t port, int is_ib, uint8_
         snprintf(path, sizeof path, "/sys/class/infiniband/%s/device/net", dev_name);
         DIR *dir = opendir(path);
         if (dir) {
+            char fallback[64] = "";
             struct dirent *de;
             while ((de = readdir(dir)) != NULL) {
                 if (de->d_name[0] == '.')
                     continue;
                 char tp[320], tbuf[32];
                 snprintf(tp, sizeof tp, "/sys/class/net/%s/type", de->d_name);
-                if (read_sysfs_line(tp, tbuf, sizeof tbuf) == 0 && atoi(tbuf) == 32) {
-                    snprintf(ifname, sizeof ifname, "%s", de->d_name);
-                    break;
+                if (read_sysfs_line(tp, tbuf, sizeof tbuf) != 0 || atoi(tbuf) != 32)
+                    continue;
+                char dp[320], dbuf[32];
+                snprintf(dp, sizeof dp, "/sys/class/net/%s/dev_port", de->d_name);
+                if (read_sysfs_line(dp, dbuf, sizeof dbuf) == 0) {
+                    if (port > 0 && atoi(dbuf) == (int)(port - 1)) {
+                        snprintf(ifname, sizeof ifname, "%s", de->d_name);
+                        break;
+                    }
+                } else if (!fallback[0]) {
+                    snprintf(fallback, sizeof fallback, "%s", de->d_name);
                 }
             }
             closedir(dir);
+            if (!ifname[0] && fallback[0])
+                snprintf(ifname, sizeof ifname, "%s", fallback);
         }
     }
     if (!ifname[0])
@@ -258,10 +270,11 @@ static void dev_find_cm_ip(const char *dev_name, uint8_t port, int is_ib, uint8_
     if (getifaddrs(&iflist) != 0)
         return;
     for (struct ifaddrs *ifa = iflist; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, ifname) != 0)
+        if (!ifa->ifa_addr || !ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || strcmp(ifa->ifa_name, ifname) != 0)
             continue;
         if (ifa->ifa_addr->sa_family == AF_INET) {
             *af_out = 4;
+            memset(ip_out, 0, 16);
             memcpy(ip_out, &((const struct sockaddr_in *)ifa->ifa_addr)->sin_addr, 4);
             break;
         }
@@ -911,11 +924,10 @@ static int dl_cm_next_event(struct plr_cm_id *cid, struct plr_cm_ev *out)
     enum rdma_cm_event_type et = ev->event;
     struct rdma_cm_id *req_raw = (et == RDMA_CM_EVENT_CONNECT_REQUEST) ? ev->id : NULL;
     if (et == RDMA_CM_EVENT_CONNECT_REQUEST && ev->param.conn.private_data && ev->param.conn.private_data_len) {
-        uint8_t n = ev->param.conn.private_data_len;
-        if (n > sizeof out->pd)
-            n = (uint8_t)sizeof out->pd;
-        memcpy(out->pd, ev->param.conn.private_data, n);
-        out->pd_len = n;
+        size_t len = ev->param.conn.private_data_len;
+        size_t copy = len > sizeof out->pd ? sizeof out->pd : len;
+        memcpy(out->pd, ev->param.conn.private_data, copy);
+        out->pd_len = (uint16_t)len;
     }
     CM.ack_cm_event(ev);
     switch (et) {
@@ -934,7 +946,8 @@ static int dl_cm_next_event(struct plr_cm_id *cid, struct plr_cm_ev *out)
             if (rch)
                 CM.destroy_event_channel(rch);
             free(req);
-            return 0;
+            out->type = PLR_CM_EV_NONE;
+            return 1;
         }
         req->ch = rch;
         req->id = req_raw;
@@ -972,7 +985,10 @@ static int dl_cm_disconnect(struct plr_cm_id *cid)
 
 static int dl_cm_set_sl(struct plr_cm_id *cid, uint8_t sl)
 {
-    uint8_t tos = (uint8_t)((sl & 0x0f) << 5);
+    if (!sl)
+        return 0;
+    /* Encode 4-bit SL (1..15) in the 6-bit DSCP field (bits 2..7, ECN bits 0..1 clear) without aliasing 8..15. */
+    uint8_t tos = (uint8_t)((sl & 0x0f) << 2);
     (void)CM.set_option(cid->id, RDMA_OPTION_ID, RDMA_OPTION_ID_TOS, &tos, sizeof tos);
     return 0;
 }

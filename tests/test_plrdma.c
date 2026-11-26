@@ -1702,10 +1702,30 @@ static void test_upframes(void)
 
 /* ------------------------------------------------------------------------------------------------- Option C (rdma_cm) */
 
-/* Full Option C (rdma_cm) upgrade happy path: listener, dial, private_data auth, SL, poll_us, bidirectional traffic. */
+/* Full Option C (rdma_cm) upgrade across all check modes (none/header/full), cm_addr IPv4 tail-byte hygiene,
+ * SL, poll_us, bidirectional traffic, and Option C/D mismatch fallback in both directions. */
 static void test_cm_upgrade(void)
 {
     char err[256];
+    /* 0. plr_cm_addr_encode zeroes IPv4 tail bytes [4..15]; plr_cm_addr_decode rejects non-zero IPv4 tail bytes */
+    {
+        struct plr_cm_addr a = {0}, b = {0};
+        uint8_t wire[PLR_CM_ADDR_LEN];
+        a.af = 4;
+        a.port = 12345;
+        a.ip[0] = 10;
+        a.ip[3] = 1;
+        memset(a.ip + 4, 0xee, 12); /* stale IPv6 tail bytes */
+        plr_cm_addr_encode(&a, wire);
+        CHECK(plr_cm_addr_decode(&b, wire, sizeof wire) == 0);
+        CHECK(b.af == 4 && b.port == 12345 && b.ip[0] == 10 && b.ip[3] == 1);
+        for (int i = 4; i < 16; i++)
+            CHECK(b.ip[i] == 0);
+        wire[19] = 1; /* non-zero tail byte in IPv4 address */
+        errno = 0;
+        CHECK(plr_cm_addr_decode(&b, wire, sizeof wire) < 0 && errno == EPROTO);
+    }
+
     struct pfk_fab *f = pfk_new();
     f->slow_flush = 1;
     struct plr_pool_cfg pc = small_cfg();
@@ -1718,52 +1738,99 @@ static void test_cm_upgrade(void)
     struct plr_cm_listener *lisb = plr_cm_listen(&pfk_cm_ops, NULL, err, sizeof err);
     CHECK(lisa && lisb);
 
-    struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
-    rca.cm = 1;
-    rca.cm_ops = &pfk_cm_ops;
-    rca.cm_lis = lisa;
-    rca.sl[PL_KIND_LOG] = 3;
-    rca.poll_us = 10;
-    rcb.cm = 1;
-    rcb.cm_ops = &pfk_cm_ops;
-    rcb.cm_lis = lisb;
-    rcb.sl[PL_KIND_LOG] = 3;
-    rcb.poll_us = 10;
-    struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
-    struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
-    int port = peerlink_listen(a->pl, 0);
-    CHECK(port > 0);
-    char addr[64];
-    snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
-    struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
-    CHECK(lb != NULL);
-    CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 5000));
-    struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
-    CHECK(la != NULL);
-    if (la && lb) {
-        CHECK(plink_is_rdma(la) && plink_is_rdma(lb));
-        CHECK(!strcmp(plink_transport(la), "rdma") && !strcmp(plink_transport(lb), "rdma"));
-        CHECK(atomic_load(&f->last_sl) == 3);
-        CHECK(plr_cm_listener_rejected(lisa) == 0);
-        uint64_t na = 0, nb = 0, s1 = 17, s2 = 31;
-        int n = quick ? 100 : 300;
-        send_frames(la, &na, n, &s1);
-        send_frames(lb, &nb, n, &s2);
-        CHECK(WAIT_FOR(atomic_load(&a->in) == (uint64_t)n && atomic_load(&b->in) == (uint64_t)n, 15000));
-        CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0);
-        CHECK(atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1);
-        CHECK(atomic_load(&a->downs) == 0 && atomic_load(&b->downs) == 0);
+    /* 1. Happy path across all check modes: none, header, full */
+    static const int checks[] = {PL_CHECK_NONE, PL_CHECK_HEADER, PL_CHECK_FULL};
+    for (size_t ci = 0; ci < sizeof checks / sizeof checks[0]; ci++) {
+        struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+        rca.cm = 1;
+        rca.cm_ops = &pfk_cm_ops;
+        rca.cm_lis = lisa;
+        rca.sl[PL_KIND_LOG] = 3;
+        rca.poll_us = 10;
+        rcb.cm = 1;
+        rcb.cm_ops = &pfk_cm_ops;
+        rcb.cm_lis = lisb;
+        rcb.sl[PL_KIND_LOG] = 3;
+        rcb.poll_us = 10;
+        struct node *a = node_new_rdma(1, 100, 2000, checks[ci], &rca);
+        struct node *b = node_new_rdma(2, 100, 2000, checks[ci], &rcb);
+        int port = peerlink_listen(a->pl, 0);
+        CHECK(port > 0);
+        char addr[64];
+        snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+        struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+        CHECK(lb != NULL);
+        CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 5000));
+        struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
+        CHECK(la != NULL);
+        if (la && lb) {
+            CHECK(plink_is_rdma(la) && plink_is_rdma(lb));
+            CHECK(!strcmp(plink_transport(la), "rdma") && !strcmp(plink_transport(lb), "rdma"));
+            CHECK(atomic_load(&f->last_sl) == 3);
+            CHECK(plr_cm_listener_rejected(lisa) == 0);
+            uint64_t na = 0, nb = 0, s1 = 17 + ci, s2 = 31 + ci;
+            int n = (ci == 2 && !quick) ? 300 : 50;
+            send_frames(la, &na, n, &s1);
+            send_frames(lb, &nb, n, &s2);
+            CHECK(WAIT_FOR(atomic_load(&a->in) == (uint64_t)n && atomic_load(&b->in) == (uint64_t)n, 15000));
+            CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0);
+            CHECK(atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1);
+            CHECK(atomic_load(&a->downs) == 0 && atomic_load(&b->downs) == 0);
+        }
+        peerlink_free(b->pl);
+        peerlink_free(a->pl);
+        free(a);
+        free(b);
     }
-    peerlink_free(b->pl);
-    peerlink_free(a->pl);
+
+    /* 2. Option C/D mismatch in both directions -> clean final PL_RDMA_DECL_OFF decline and immediate TCP settle */
+    for (int dir = 0; dir < 2; dir++) {
+        /* dir=0: dialer cm=1, acceptor cm=0; dir=1: dialer cm=0, acceptor cm=1 */
+        struct pl_rdma_cfg rca = fast_rcfg(pa, PL_RDMA_AUTO), rcb = fast_rcfg(pb, PL_RDMA_AUTO);
+        rca.cm = (dir == 1);
+        rca.cm_ops = rca.cm ? &pfk_cm_ops : NULL;
+        rca.cm_lis = rca.cm ? lisa : NULL;
+        rcb.cm = (dir == 0);
+        rcb.cm_ops = rcb.cm ? &pfk_cm_ops : NULL;
+        rcb.cm_lis = rcb.cm ? lisb : NULL;
+        rcb.retry_ms = 50; /* final decline must NOT re-offer */
+        uint64_t fb0[PL_RDMA_FB_MAX], fb1[PL_RDMA_FB_MAX];
+        peerlink_rdma_fallbacks(fb0);
+        uint64_t offers0 = __atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED);
+        struct node *a = node_new_rdma(1, 100, 2000, PL_CHECK_FULL, &rca);
+        struct node *b = node_new_rdma(2, 100, 2000, PL_CHECK_FULL, &rcb);
+        int port = peerlink_listen(a->pl, 0);
+        CHECK(port > 0);
+        char addr[64];
+        snprintf(addr, sizeof addr, "127.0.0.1:%d", port);
+        struct plink *lb = peerlink_dial(b->pl, 1, addr, PL_KIND_LOG);
+        CHECK(lb != NULL);
+        CHECK(WAIT_FOR(plink_up(lb) && atomic_load(&a->ups) == 1 && atomic_load(&b->ups) == 1, 5000));
+        struct plink *la = peerlink_find(a->pl, 2, PL_KIND_LOG);
+        CHECK(la != NULL && !plink_is_rdma(la) && !plink_is_rdma(lb));
+        peerlink_rdma_fallbacks(fb1);
+        CHECK(fb1[PL_RDMA_FB_OFF] > fb0[PL_RDMA_FB_OFF]);
+        usleep(120000); /* > 2 * retry_ms: final decline suppresses re-offers */
+        CHECK(__atomic_load_n(&peerlink_test_rdma_offers, __ATOMIC_RELAXED) == offers0 + 1);
+        if (la && lb) {
+            uint64_t na = 0, nb = 0, s1 = 41 + (uint64_t)dir, s2 = 53 + (uint64_t)dir;
+            send_frames(la, &na, 10, &s1);
+            send_frames(lb, &nb, 10, &s2);
+            CHECK(WAIT_FOR(atomic_load(&a->in) == 10 && atomic_load(&b->in) == 10, 5000));
+            CHECK(atomic_load(&a->bad) == 0 && atomic_load(&b->bad) == 0);
+        }
+        peerlink_free(b->pl);
+        peerlink_free(a->pl);
+        free(a);
+        free(b);
+    }
+
     plr_cm_listener_close(lisa);
     plr_cm_listener_close(lisb);
     check_pools_clean(f, pa, pb, "cmupgrade");
     plr_pool_close(pa);
     plr_pool_close(pb);
     pfk_free(f);
-    free(a);
-    free(b);
 }
 
 /* Helper: dial a CM listener directly with arbitrary private_data and wait for REJECTED (or timeout). */
@@ -1842,9 +1909,9 @@ static void test_cm_badauth(void)
     laddr.ip[0] = 127;
     laddr.ip[3] = 1;
 
-    uint8_t pd[PLR_CM_PD_LEN];
+    uint8_t pd[64];
     uint32_t magic = PLR_CM_PD_MAGIC;
-    for (int sub = 0; sub < 4; sub++) {
+    for (int sub = 0; sub < 6; sub++) {
         memset(pd, 0, sizeof pd);
         for (int i = 0; i < 4; i++)
             pd[i] = (uint8_t)(magic >> (8 * i));
@@ -1858,11 +1925,16 @@ static void test_cm_badauth(void)
             pd[4] ^= 0x01; /* wrong nonce */
         else if (sub == 2)
             plen = 0; /* empty private_data */
-        else
+        else if (sub == 3)
             pd[0] ^= 0x01; /* wrong magic */
+        else if (sub == 4)
+            plen = PLR_CM_PD_LEN - 1; /* 43-byte truncated private_data */
+        else
+            plen = PLR_CM_PD_MAX + 1; /* 57-byte oversize private_data (valid 44-byte HMAC prefix) */
         uint64_t rej0 = plr_cm_listener_rejected(lis);
         int ev = cm_direct_probe(&pfk_cm_ops, pb, &laddr, plen ? pd : NULL, plen);
-        printf("  cmbadauth direct[%d]: ev=%d rejected=%" PRIu64 "\n", sub, ev, plr_cm_listener_rejected(lis) - rej0);
+        printf("  cmbadauth direct[%d] (len=%u): ev=%d rejected=%" PRIu64 "\n", sub, (unsigned)plen, ev,
+               plr_cm_listener_rejected(lis) - rej0);
         CHECK(ev == PLR_CM_EV_REJECTED);
         CHECK(plr_cm_listener_rejected(lis) == rej0 + 1);
         CHECK(plr_cm_take(lis, tok) == NULL); /* pending token must still be unclaimed */
@@ -2132,7 +2204,10 @@ static int cm_self_run(const char *dev_spec)
             plr_pool_close(pa);
         return 2;
     }
-    struct plr_cm_listener *lis = plr_cm_listen(cm_ops, NULL, err, sizeof err);
+    const struct plr_port *pp = plr_pool_port(pa);
+    struct plr_cm_addr bind = {0};
+    bind.af = pp->cm_af ? pp->cm_af : 4;
+    struct plr_cm_listener *lis = plr_cm_listen(cm_ops, &bind, err, sizeof err);
     if (!lis) {
         fprintf(stderr, "cm-self: listen: %s\n", err);
         plr_pool_close(pa);
@@ -2141,7 +2216,6 @@ static int cm_self_run(const char *dev_spec)
     }
     struct plr_cm_addr laddr;
     plr_cm_listener_addr(lis, &laddr);
-    const struct plr_port *pp = plr_pool_port(pa);
     if (pp->cm_af) {
         laddr.af = pp->cm_af;
         memcpy(laddr.ip, pp->cm_ip, 16);
