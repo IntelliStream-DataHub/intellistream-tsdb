@@ -1961,6 +1961,111 @@ static void case_multi(void)
     CHECK(tsdb_close(db) == 0);
 }
 
+/* Shared-slab partial eviction, ec_granule_read_at index hint/fallback, and 16-thread sharded hit+stream stress */
+static void case_shard_slab(void)
+{
+    char dir[800];
+    snprintf(dir, sizeof dir, "%s/slab", base);
+    h x;
+    CHECK(h_open(&x, dir, NULL) == 0);
+    if (!x.db)
+        return;
+    uint32_t s;
+    CHECK(eng_series(x.db, "sl", TSDB_FLOAT32, &s) == 0);
+    enum { N = 200000 }; /* ~25 granules in one part so prefetch fills multi-granule shared slabs */
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    for (size_t i = 0; i < N; i++) {
+        ts[i] = (int64_t)i * 400 + (int64_t)(xs() % 50);
+        v[i] = (float)(10.0 + (double)(i % 4096) / 100.0);
+    }
+    CHECK(eng_insert_series(x.db, TSDB_FLOAT32, s, ts, v, N) == 0);
+    CHECK(eng_flush(x.db) == 0);
+    free(ts);
+    free(v);
+    part *ps[MAXP];
+    size_t np = list_parts(x.db, ps, MAXP);
+    part *p = NULL;
+    for (size_t i = 0; i < np; i++)
+        if (ps[i]->ix.n >= 16) {
+            p = ps[i];
+            break;
+        }
+    CHECK(p != NULL);
+    if (!p) {
+        h_close(&x);
+        return;
+    }
+    buf want = {0};
+    int rc = 0;
+    raw_all(x.db, s, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &want, &rc);
+    CHECK(rc == 0 && want.n > 0);
+    CHECK(ec_test_attach(x.db, p, NULL) == 0);
+
+    /* 1: ec_granule_read_at with exact index, SIZE_MAX fallback, and mismatched index fallback */
+    codec_ctx *cx = codec_new();
+    int64_t *gts = malloc((p->grows + 64) * sizeof *gts);
+    float *gv0 = malloc((p->grows + 64) * sizeof *gv0);
+    float *gv1 = malloc((p->grows + 64) * sizeof *gv1);
+    granule g0;
+    gx_load(p, 0, GW_LOC, &g0);
+    CHECK(ec_granule_read_at(cx, p, &g0, 0, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    eccache_test_drop_entries(x.t);
+    CHECK(ec_granule_read_at(cx, p, &g0, SIZE_MAX, TSDB_FLOAT32, gts, gv1, p->grows + 64, false) == 0);
+    CHECK(memcmp(gv0, gv1, g0.count * sizeof *gv0) == 0);
+    eccache_test_drop_entries(x.t);
+    /* Wrong index hint (p->ix.n - 1) must safely fall back to gran_index(p, g->off) */
+    CHECK(ec_granule_read_at(cx, p, &g0, p->ix.n - 1, TSDB_FLOAT32, gts, gv1, p->grows + 64, false) == 0);
+    CHECK(memcmp(gv0, gv1, g0.count * sizeof *gv0) == 0);
+
+    /* 2: Fill a shared slab via prefetch (granule 0, then 1 triggers window 2..5), pin middle slice (granule 3),
+     * drop all other slices, then decode granule 3 from the still-alive slab and unpin it (ASan/LSan checks no UAF/leak) */
+    eccache_test_drop(x.t);
+    granule g1, g3;
+    gx_load(p, 1, GW_LOC, &g1);
+    gx_load(p, 3, GW_LOC, &g3);
+    CHECK(ec_granule_read_at(cx, p, &g0, 0, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    CHECK(ec_granule_read_at(cx, p, &g1, 1, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    void *pin3 = eccache_test_pin(x.t, p->ec->rec.oid, g3.off);
+    CHECK(pin3 != NULL);
+    eccache_test_drop_entries(x.t); /* evicts granule 0, 1, 2, 4, 5 — only pinned slice 3 keeps the slab alive */
+    eccache_counters k;
+    eccache_get_counters(x.t, &k);
+    CHECK(k.entries == 1);
+    CHECK(ec_granule_read_at(cx, p, &g3, 3, TSDB_FLOAT32, gts, gv0, p->grows + 64, false) == 0);
+    if (pin3)
+        eccache_test_unpin(x.t, pin3);
+    eccache_test_drop_entries(x.t); /* now slab refcount hits 0 and frees */
+    eccache_get_counters(x.t, &k);
+    CHECK(k.entries == 0 && k.bytes == 0 && k.pf_bytes == 0);
+
+    /* 3: 16 threads concurrently reading warm cache hits across all shards */
+    CHECK(raw_same(x.db, s, TSDB_FLOAT32, INT64_MIN, INT64_MAX, &want, "slab warm prime"));
+    eccache_counters kw0, kw1;
+    eccache_get_counters(x.t, &kw0);
+    pf_conc_arg args[16];
+    pthread_t th[16];
+    for (int i = 0; i < 16; i++) {
+        args[i] = (pf_conc_arg){.db = x.db, .sid = s, .want = &want, .ok = false};
+        CHECK(pthread_create(&th[i], NULL, pf_conc_fn, &args[i]) == 0);
+    }
+    for (int i = 0; i < 16; i++) {
+        CHECK(pthread_join(th[i], NULL) == 0);
+        CHECK(args[i].ok);
+    }
+    eccache_get_counters(x.t, &kw1);
+    CHECK(kw1.hits > kw0.hits && kw1.misses == kw0.misses && kw1.corrupt == 0);
+    printf("test_seam: shard_slab: index hint/fallback, partial slab eviction & 16-thread warm hits ok (%" PRIu64
+           " hits)\n", kw1.hits - kw0.hits);
+
+    free(gts);
+    free(gv0);
+    free(gv1);
+    codec_free(cx);
+    free(want.b);
+    h_close(&x);
+}
+
 static void run(void)
 {
     snprintf(base, sizeof base, "%s/test_seam_%d", scratch, (int)getpid());
@@ -1995,6 +2100,7 @@ static void run(void)
     case_bad();
     case_prefetch();
     case_multi();
+    case_shard_slab();
     free_objs();
     free(ref.b);
     if (!failures)
