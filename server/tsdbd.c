@@ -398,7 +398,7 @@ static conn *conns;
 static size_t nconns, max_conns = 10000;
 
 /* work queue: requests ready to run */
-static pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Alignas(64) pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
 static req *work_head, *work_tail;
 static bool work_stop;
@@ -420,10 +420,10 @@ static void *worker_main(void *arg);
 /* Bytes of requests held (see the file header): receive buffers grown for large frames, and payloads from
  * parsing until a worker has run them. Changed by the main thread and the workers. */
 static size_t req_budget = (size_t)1024 << 20; /* at least; main raises it to an eighth of the RAM */
-static atomic_size_t req_held;
 static int frame_timeout_s = 60;
 static pid_t start_ppid; /* --exit-with-parent: the parent at start; 0 without the flag */
 static int login_timeout_s = 10; /* --login-timeout */
+static _Alignas(64) atomic_size_t req_held;
 
 static size_t request_memory_now(void)
 {
@@ -440,7 +440,7 @@ static void req_free(req *r)
 /* Packed inserts decompress to up to a frame's worth of arrays from a few kilobytes: counted in req_held with the
  * requests (so the server also reads less meanwhile) and waiting while the total would exceed the limit. One always
  * may when no other is decompressing, so this never waits on itself: the peak is the limit plus one insert. */
-static pthread_mutex_t inflate_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Alignas(64) pthread_mutex_t inflate_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t inflate_cv = PTHREAD_COND_INITIALIZER;
 static size_t inflate_held, inflate_waiters;
 
@@ -472,7 +472,7 @@ static void inflate_release(size_t n)
  * pthread_key destructor / atexit for any other thread, such as fuzz_frames' main thread) so LSan reports zero leaks. */
 #define PACK_RAW_KEEP ((size_t)4 << 20)
 #define PACK_ARR_KEEP ((size_t)4 << 20)
-static size_t pack_raw_keep = PACK_RAW_KEEP, pack_arr_keep = PACK_ARR_KEEP;
+static _Alignas(64) size_t pack_raw_keep = PACK_RAW_KEEP, pack_arr_keep = PACK_ARR_KEEP;
 
 typedef struct worker_scratch {
     ZSTD_DCtx *dctx;
@@ -911,8 +911,8 @@ static void hold_large(void *arg)
 
 /* events from workers to the main thread */
 /* Workers' notes to the main thread, a lock-free stack (each connection has its two notes; see notify). */
-static _Atomic(note *) note_top;
-static pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER; /* new_fds */
+static _Alignas(64) _Atomic(note *) note_top;
+static _Alignas(64) pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER; /* new_fds */
 
 /* connections the accept thread took, for the main thread to set up */
 static int *new_fds;
@@ -4003,7 +4003,7 @@ static void *worker_main(void *arg)
         if (!work_head)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
-        int64_t began = metrics_request_begin();
+        int64_t began = metrics_request_begin(r->op);
         fwd_st.on = false;
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         metrics_request_end(r->op, began);
@@ -5214,7 +5214,7 @@ static int parse(conn *c)
             } else {
                 metrics_error(TSDB_ERR_INVALID); /* no reply to send it in, but a client's bug shows */
             }
-            metrics_request_end(TSDB_OP_CANCEL, metrics_request_begin());
+            metrics_request_end(TSDB_OP_CANCEL, metrics_request_begin(TSDB_OP_CANCEL));
             off += need;
             consumed = true;
             continue;

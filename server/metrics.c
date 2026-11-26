@@ -67,20 +67,61 @@ static const double bucket_le[NBUCKETS] = {0.0005, 0.001, 0.0025, 0.005, 0.01, 0
 static const char *const bucket_str[NBUCKETS] = {"0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1",
                                                  "0.25",   "0.5",   "1",      "2.5",   "5",    "10",    "30"};
 
-typedef struct {
-    atomic_uint_fast64_t requests[NOPS + 1];
-    atomic_uint_fast64_t hist[NOPS + 1][NBUCKETS + 1]; /* per bucket, not cumulative; the last is above 30 s */
-    atomic_uint_fast64_t hist_sum_ns[NOPS + 1];
-    atomic_uint_fast64_t errors[NERR];
-    atomic_uint_fast64_t conns_accepted, conns_rejected;
-    atomic_int_fast64_t conns_active, workers_busy;
+enum { QOP_RAW, QOP_VALUES, QOP_BUCKETS, QOP_BOUNDS, QOP_LTTB, QOP_TWA, QOP_MULTI, QOP_LATEST, NQOPS };
+
+static int query_op_idx(unsigned o)
+{
+    switch (o) {
+    case TSDB_OP_QUERY_RAW: return QOP_RAW;
+    case TSDB_OP_QUERY_VALUES: return QOP_VALUES;
+    case TSDB_OP_QUERY_BUCKETS: return QOP_BUCKETS;
+    case TSDB_OP_QUERY_BOUNDS: return QOP_BOUNDS;
+    case TSDB_OP_QUERY_LTTB: return QOP_LTTB;
+    case TSDB_OP_QUERY_TWA: return QOP_TWA;
+    case TSDB_OP_QUERY_MULTI: return QOP_MULTI;
+    case TSDB_OP_QUERY_LATEST: return QOP_LATEST;
+    default: return -1;
+    }
+}
+
+typedef struct metrics_shard {
+    _Alignas(64) struct metrics_shard *next; /* protected by shard_mu */
+    atomic_int_fast64_t workers_busy;        /* per-thread busy count; summed on scrape */
     atomic_uint_fast64_t rows_inserted;
     atomic_uint_fast64_t multi_series, multi_deferred;
-    atomic_uint_fast64_t scrapes, scrape_rejects;
     atomic_uint_fast64_t logins[METRICS_LOGIN_KINDS];
-} counters;
-static counters M;
-static atomic_bool on; /* set by metrics_enable before the server starts; the hooks do nothing until then */
+    atomic_uint_fast64_t errors[NERR];
+    atomic_uint_fast64_t requests[NOPS + 1];
+    atomic_uint_fast64_t hist_sum_ns[NQOPS];
+    atomic_uint_fast64_t hist[NQOPS][NBUCKETS + 1]; /* per bucket, not cumulative; the last is above 30 s */
+} metrics_shard;
+_Static_assert(sizeof(metrics_shard) % 64 == 0, "metrics_shard must fill whole cache lines");
+
+typedef struct metrics_totals {
+    uint64_t requests[NOPS + 1];
+    uint64_t hist[NQOPS][NBUCKETS + 1];
+    uint64_t hist_sum_ns[NQOPS];
+    uint64_t errors[NERR];
+    uint64_t rows_inserted;
+    uint64_t multi_series, multi_deferred;
+    uint64_t logins[METRICS_LOGIN_KINDS];
+    int64_t workers_busy;
+} metrics_totals;
+
+typedef struct {
+    _Alignas(64) atomic_uint_fast64_t conns_accepted, conns_rejected;
+    atomic_int_fast64_t conns_active;
+    _Alignas(64) atomic_uint_fast64_t scrapes, scrape_rejects;
+} global_counters;
+static global_counters M;
+static _Alignas(64) atomic_bool on; /* set by metrics_enable before the server starts; the hooks do nothing until then */
+
+static _Alignas(64) pthread_mutex_t shard_mu = PTHREAD_MUTEX_INITIALIZER;
+static metrics_shard *shards;
+static metrics_totals retired; /* folded counts of exited threads, protected by shard_mu */
+static __thread metrics_shard *tls_shard;
+static pthread_key_t shard_key;
+static pthread_once_t shard_once = PTHREAD_ONCE_INIT;
 
 /* Every TSDB_OP_* has a row here, made from the op list (TSDB_OPS in tsdb_protocol.h; test_metrics checks each
  * appears). `query` ops get a latency histogram. */
@@ -92,13 +133,6 @@ static struct {
 #undef OP_NAME_
 _Static_assert(TSDB_OP_USER_LIST < NOPS, "an op number past the metrics table");
 
-static bool is_query_op(unsigned o)
-{
-    return o == TSDB_OP_QUERY_RAW || o == TSDB_OP_QUERY_VALUES || o == TSDB_OP_QUERY_BUCKETS ||
-           o == TSDB_OP_QUERY_BOUNDS || o == TSDB_OP_QUERY_LTTB || o == TSDB_OP_QUERY_TWA || o == TSDB_OP_QUERY_MULTI ||
-           o == TSDB_OP_QUERY_LATEST;
-}
-
 /* by -TSDB_ERR_*; NULL slots (-10 to -15, ha.md's) are counted as "other" until they exist */
 static const char *const err_name[NERR] = {"other",  "io",      "nomem",   "corrupt", "invalid", "locked",
                                            "notfound", "too_many_buckets", "stopped", "readonly", NULL, NULL,
@@ -109,6 +143,103 @@ static int64_t now_ns(void)
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+static inline void shard_add(atomic_uint_fast64_t *p, uint64_t n)
+{
+    atomic_store_explicit(p, atomic_load_explicit(p, memory_order_relaxed) + n, memory_order_relaxed);
+}
+
+static inline void shard_add_i64(atomic_int_fast64_t *p, int64_t d)
+{
+    atomic_store_explicit(p, atomic_load_explicit(p, memory_order_relaxed) + d, memory_order_relaxed);
+}
+
+static void shard_fold_into(metrics_totals *dst, const metrics_shard *s)
+{
+    dst->workers_busy += atomic_load_explicit(&s->workers_busy, memory_order_relaxed);
+    dst->rows_inserted += atomic_load_explicit(&s->rows_inserted, memory_order_relaxed);
+    dst->multi_series += atomic_load_explicit(&s->multi_series, memory_order_relaxed);
+    dst->multi_deferred += atomic_load_explicit(&s->multi_deferred, memory_order_relaxed);
+    for (int k = 0; k < METRICS_LOGIN_KINDS; k++)
+        dst->logins[k] += atomic_load_explicit(&s->logins[k], memory_order_relaxed);
+    for (unsigned k = 0; k < NERR; k++)
+        dst->errors[k] += atomic_load_explicit(&s->errors[k], memory_order_relaxed);
+    for (unsigned o = 0; o <= NOPS; o++)
+        dst->requests[o] += atomic_load_explicit(&s->requests[o], memory_order_relaxed);
+    for (int q = 0; q < NQOPS; q++) {
+        dst->hist_sum_ns[q] += atomic_load_explicit(&s->hist_sum_ns[q], memory_order_relaxed);
+        for (int b = 0; b <= NBUCKETS; b++)
+            dst->hist[q][b] += atomic_load_explicit(&s->hist[q][b], memory_order_relaxed);
+    }
+}
+
+static void shard_dtor(void *p)
+{
+    metrics_shard *s = p;
+    if (!s)
+        return;
+    if (tls_shard == s)
+        tls_shard = NULL;
+    pthread_mutex_lock(&shard_mu);
+    for (metrics_shard **pp = &shards; *pp; pp = &(*pp)->next) {
+        if (*pp == s) {
+            *pp = s->next;
+            break;
+        }
+    }
+    shard_fold_into(&retired, s);
+    pthread_mutex_unlock(&shard_mu);
+    free(s);
+}
+
+static void shard_atexit(void)
+{
+    metrics_shard *s = tls_shard;
+    if (!s)
+        return;
+    pthread_setspecific(shard_key, NULL);
+    shard_dtor(s);
+}
+
+static void shard_key_init(void)
+{
+    pthread_key_create(&shard_key, shard_dtor);
+    atexit(shard_atexit);
+}
+
+static metrics_shard *shard_alloc(void)
+{
+    pthread_once(&shard_once, shard_key_init);
+    metrics_shard *s = aligned_alloc(64, sizeof *s);
+    if (!s)
+        return NULL;
+    memset(s, 0, sizeof *s);
+    if (pthread_setspecific(shard_key, s) != 0) {
+        free(s);
+        return NULL;
+    }
+    pthread_mutex_lock(&shard_mu);
+    s->next = shards;
+    shards = s;
+    pthread_mutex_unlock(&shard_mu);
+    tls_shard = s;
+    return s;
+}
+
+static inline metrics_shard *shard_get(void)
+{
+    metrics_shard *s = tls_shard;
+    return s ? s : shard_alloc();
+}
+
+static void metrics_snapshot(metrics_totals *out)
+{
+    pthread_mutex_lock(&shard_mu);
+    *out = retired;
+    for (const metrics_shard *s = shards; s; s = s->next)
+        shard_fold_into(out, s);
+    pthread_mutex_unlock(&shard_mu);
 }
 
 void metrics_enable(void) { atomic_store(&on, true); }
@@ -131,12 +262,14 @@ void metrics_conn_rejected(void)
     atomic_fetch_add_explicit(&M.conns_rejected, 1, memory_order_relaxed);
 }
 
-int64_t metrics_request_begin(void)
+int64_t metrics_request_begin(uint8_t op)
 {
     if (!atomic_load_explicit(&on, memory_order_relaxed))
         return 0;
-    atomic_fetch_add_explicit(&M.workers_busy, 1, memory_order_relaxed);
-    return now_ns();
+    metrics_shard *s = shard_get();
+    if (s)
+        shard_add_i64(&s->workers_busy, 1);
+    return query_op_idx(op) >= 0 ? now_ns() : 0;
 }
 
 int metrics_bucket_for(double seconds)
@@ -150,48 +283,64 @@ int metrics_bucket_for(double seconds)
 void metrics_request_end(uint8_t op, int64_t began)
 {
     HOOK_OFF();
-    int64_t ns = now_ns() - began;
-    atomic_fetch_sub_explicit(&M.workers_busy, 1, memory_order_relaxed);
     unsigned o = op < NOPS && ops[op].name ? op : OP_OTHER;
-    atomic_fetch_add_explicit(&M.requests[o], 1, memory_order_relaxed);
-    if (is_query_op(o)) {
+    int q = query_op_idx(o);
+    int64_t ns = q >= 0 ? now_ns() - began : 0;
+    metrics_shard *s = shard_get();
+    if (!s)
+        return;
+    shard_add_i64(&s->workers_busy, -1);
+    shard_add(&s->requests[o], 1);
+    if (q >= 0) {
         int b = metrics_bucket_for((double)ns / 1e9);
-        atomic_fetch_add_explicit(&M.hist[o][b], 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&M.hist_sum_ns[o], ns > 0 ? (uint64_t)ns : 0, memory_order_relaxed);
+        shard_add(&s->hist[q][b], 1);
+        shard_add(&s->hist_sum_ns[q], ns > 0 ? (uint64_t)ns : 0);
     }
 }
 
 void metrics_error(int32_t status)
 {
     HOOK_OFF();
+    metrics_shard *s = shard_get();
+    if (!s)
+        return;
     int64_t k = -(int64_t)status;
     unsigned i = k >= 1 && k < NERR && err_name[k] ? (unsigned)k : 0;
-    atomic_fetch_add_explicit(&M.errors[i], 1, memory_order_relaxed);
+    shard_add(&s->errors[i], 1);
 }
 
 void metrics_login(int what)
 {
     HOOK_OFF();
-    if (what >= 0 && what < METRICS_LOGIN_KINDS)
-        atomic_fetch_add_explicit(&M.logins[what], 1, memory_order_relaxed);
+    if (what >= 0 && what < METRICS_LOGIN_KINDS) {
+        metrics_shard *s = shard_get();
+        if (s)
+            shard_add(&s->logins[what], 1);
+    }
 }
 
 void metrics_rows_inserted(uint64_t n)
 {
     HOOK_OFF();
-    atomic_fetch_add_explicit(&M.rows_inserted, n, memory_order_relaxed);
+    metrics_shard *s = shard_get();
+    if (s)
+        shard_add(&s->rows_inserted, n);
 }
 
 void metrics_multi_series(uint64_t n)
 {
     HOOK_OFF();
-    atomic_fetch_add_explicit(&M.multi_series, n, memory_order_relaxed);
+    metrics_shard *s = shard_get();
+    if (s)
+        shard_add(&s->multi_series, n);
 }
 
 void metrics_multi_deferred(void)
 {
     HOOK_OFF();
-    atomic_fetch_add_explicit(&M.multi_deferred, 1, memory_order_relaxed);
+    metrics_shard *s = shard_get();
+    if (s)
+        shard_add(&s->multi_deferred, 1);
 }
 
 /* ------------------------------------------------------ text rendering */
@@ -435,35 +584,32 @@ static void render(sb *b)
         sb_add(b, "tsdb_major_faults_total %llu\n", (unsigned long long)ru.ru_majflt);
     }
 
+    metrics_totals tot;
+    metrics_snapshot(&tot);
+
     family(b, "tsdb_requests_total", "counter", "Requests handled by the main port, by operation.");
     for (unsigned o = 1; o <= NOPS; o++)
         if (o == OP_OTHER || ops[o].name)
             sb_add(b, "tsdb_requests_total{op=\"%s\"} %llu\n", o == OP_OTHER ? "other" : ops[o].name,
-                   (unsigned long long)atomic_load_explicit(&M.requests[o], memory_order_relaxed));
+                   (unsigned long long)tot.requests[o]);
     family(b, "tsdb_inserted_rows_total", "counter", "Rows accepted by successful insert requests.");
-    sb_add(b, "tsdb_inserted_rows_total %llu\n",
-           (unsigned long long)atomic_load_explicit(&M.rows_inserted, memory_order_relaxed));
+    sb_add(b, "tsdb_inserted_rows_total %llu\n", (unsigned long long)tot.rows_inserted);
     family(b, "tsdb_multi_series_total", "counter", "Series answered by QUERY_MULTI requests.");
-    sb_add(b, "tsdb_multi_series_total %llu\n",
-           (unsigned long long)atomic_load_explicit(&M.multi_series, memory_order_relaxed));
+    sb_add(b, "tsdb_multi_series_total %llu\n", (unsigned long long)tot.multi_series);
     family(b, "tsdb_multi_deferred_total", "counter",
            "QUERY_MULTI series too large to hold ahead of their turn, run again at it.");
-    sb_add(b, "tsdb_multi_deferred_total %llu\n",
-           (unsigned long long)atomic_load_explicit(&M.multi_deferred, memory_order_relaxed));
+    sb_add(b, "tsdb_multi_deferred_total %llu\n", (unsigned long long)tot.multi_deferred);
     family(b, "tsdb_request_errors_total", "counter", "Replies with an error status, by TSDB_ERR_* code.");
     for (unsigned k = 1; k < NERR; k++)
         if (err_name[k])
-            sb_add(b, "tsdb_request_errors_total{code=\"%s\"} %llu\n", err_name[k],
-                   (unsigned long long)atomic_load_explicit(&M.errors[k], memory_order_relaxed));
-    sb_add(b, "tsdb_request_errors_total{code=\"other\"} %llu\n",
-           (unsigned long long)atomic_load_explicit(&M.errors[0], memory_order_relaxed));
+            sb_add(b, "tsdb_request_errors_total{code=\"%s\"} %llu\n", err_name[k], (unsigned long long)tot.errors[k]);
+    sb_add(b, "tsdb_request_errors_total{code=\"other\"} %llu\n", (unsigned long long)tot.errors[0]);
     family(b, "tsdb_logins_total", "counter",
            "Login attempts by outcome: ok, failed (wrong password, unknown user or a malformed exchange), "
            "timeout (not logged in within --login-timeout), refused (another op or a frame too large before login).");
     static const char *const login_name[METRICS_LOGIN_KINDS] = {"ok", "failed", "timeout", "refused"};
     for (int k = 0; k < METRICS_LOGIN_KINDS; k++)
-        sb_add(b, "tsdb_logins_total{result=\"%s\"} %llu\n", login_name[k],
-               (unsigned long long)atomic_load_explicit(&M.logins[k], memory_order_relaxed));
+        sb_add(b, "tsdb_logins_total{result=\"%s\"} %llu\n", login_name[k], (unsigned long long)tot.logins[k]);
 
     if (cfg.fwd_peers) { /* forwarding one hop (S2-2): per member this server forwarded requests to */
         metrics_fwd_peer fp[64];
@@ -619,19 +765,20 @@ static void render(sb *b)
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");
     for (unsigned o = 1; o < NOPS; o++) {
-        if (!is_query_op(o))
+        int q = query_op_idx(o);
+        if (q < 0)
             continue;
         uint64_t cum = 0;
         for (int k = 0; k < NBUCKETS; k++) {
-            cum += atomic_load_explicit(&M.hist[o][k], memory_order_relaxed);
+            cum += tot.hist[q][k];
             sb_add(b, "tsdb_query_duration_seconds_bucket{op=\"%s\",le=\"%s\"} %llu\n", ops[o].name, bucket_str[k],
                    (unsigned long long)cum);
         }
-        cum += atomic_load_explicit(&M.hist[o][NBUCKETS], memory_order_relaxed);
+        cum += tot.hist[q][NBUCKETS];
         sb_add(b, "tsdb_query_duration_seconds_bucket{op=\"%s\",le=\"+Inf\"} %llu\n", ops[o].name,
                (unsigned long long)cum);
         sb_add(b, "tsdb_query_duration_seconds_sum{op=\"%s\"} %.9g\n", ops[o].name,
-               (double)atomic_load_explicit(&M.hist_sum_ns[o], memory_order_relaxed) / 1e9);
+               (double)tot.hist_sum_ns[q] / 1e9);
         sb_add(b, "tsdb_query_duration_seconds_count{op=\"%s\"} %llu\n", ops[o].name, (unsigned long long)cum);
     }
 
@@ -646,7 +793,7 @@ static void render(sb *b)
     family(b, "tsdb_connections_rejected_total", "counter", "Connections closed at once for the connection limit.");
     sb_add(b, "tsdb_connections_rejected_total %llu\n",
            (unsigned long long)atomic_load_explicit(&M.conns_rejected, memory_order_relaxed));
-    int64_t busy = atomic_load_explicit(&M.workers_busy, memory_order_relaxed);
+    int64_t busy = tot.workers_busy;
     family(b, "tsdb_workers", "gauge", "Worker threads (the --workers count, plus extras started for slow clients).");
     sb_add(b, "tsdb_workers %zu\n", cfg.workers ? cfg.workers() : 0);
     family(b, "tsdb_request_memory_bytes", "gauge",
