@@ -8404,6 +8404,92 @@ static void case_apply_buffered(void)
            N1 + N2, reads);
 }
 
+/* P-04 regression: batched multi-record replica_append_verified() (rows + MK_NOW + MK_COMMIT + trailing rows) tracks
+ * COMMIT hold caps without recomputing xxh64, rejects non-contiguous fno/wrong offset, while replica_append() still
+ * catches corrupted bytes in a multi-record batch. */
+extern int replica_append_verified(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
+
+static void case_append_verified(void)
+{
+    char dir[PATH_MAX];
+    fresh(dir, "av");
+    leader l;
+    unsigned rng = 42;
+    leader_init(&l);
+    leader_rows(&l, 4, &rng); /* r[0]: fno 1..4 */
+    mk mnow = {.type = MK_NOW, .span = 1, .u.now.now_ms = T0 + 50000};
+    leader_marker(&l, &mnow, T0 + 50000); /* r[1]: fno 5 */
+    const char *fname = "p0_1_1_0.part";
+    mk_file mf = {.name = fname, .name_len = (uint32_t)strlen(fname), .size = 64, .xxh64 = 0x123456789abcdef0ull};
+    uint8_t fbuf[256];
+    size_t flen = mk_file_put(fbuf, &mf);
+    mk mcm = {.type = MK_COMMIT, .span = 1, .u.commit = {.op = MK_OP_INSERT, .keys_form = MK_KEYS_NONE, .nfiles = 1,
+                                                         .rows = 1, .events = 1, .files = fbuf, .files_len = flen}};
+    leader_marker(&l, &mcm, T0 + 51000); /* r[2]: fno 6 (unstaged file -> holds durable_end at 5) */
+    leader_rows(&l, 3, &rng); /* r[3]: fno 7..9 */
+
+    /* Concatenate r[0..3] into one contiguous segment-1 batch */
+    size_t total = l.r[0].size + l.r[1].size + l.r[2].size + l.r[3].size;
+    uint8_t *batch = malloc(total);
+    CHECK(batch != NULL);
+    size_t pos = 0;
+    for (int i = 0; i < 4; i++) {
+        memcpy(batch + pos, l.r[i].bytes, l.r[i].size);
+        pos += l.r[i].size;
+    }
+
+    eng *db = NULL;
+    CHECK_EQ(open_replica(dir, 0, &db), 0);
+    if (!db) {
+        free(batch);
+        leader_free(&l);
+        return;
+    }
+    /* replica_append() still rejects a flipped byte inside a multi-record batch without writing anything */
+    batch[l.r[0].size + l.r[1].size + WAL_HDR + 10] ^= 0x20;
+    CHECK_EQ(replica_append(db, 1, 0, batch, total), TSDB_ERR_CORRUPT);
+    CHECK_EQ(replica_log_end(db), 0);
+    batch[l.r[0].size + l.r[1].size + WAL_HDR + 10] ^= 0x20;
+
+    /* replica_append_verified() still rejects wrong offset without writing anything */
+    CHECK_EQ(replica_append_verified(db, 1, 16, batch, total), TSDB_ERR_INVALID);
+    CHECK_EQ(replica_log_end(db), 0);
+
+    /* Single batched verified append of all 4 records */
+    CHECK_EQ(replica_append_verified(db, 1, 0, batch, total), 0);
+    CHECK_EQ(replica_log_end(db), l.r[3].last);
+    CHECK_EQ(replica_sync(db), 0);
+    /* COMMIT at r[2] has unstaged file: durable_end must stop strictly before r[2].fno (at r[1].last == 5) */
+    CHECK_EQ(replica_durable_end(db), l.r[1].last);
+    char mname[64];
+    uint64_t mpos = 0, msz = 0;
+    CHECK_EQ(replica_missing(db, &mpos, mname, sizeof mname, &msz), 1);
+    CHECK_EQ(mpos, l.r[2].fno);
+    CHECK(strcmp(mname, fname) == 0);
+    CHECK_EQ(msz, 64);
+
+    /* Non-contiguous fno still rejected by replica_append_verified() */
+    leader_rows(&l, 2, &rng); /* r[4]: fno 10..11 */
+    uint8_t *bad = malloc(l.r[4].size);
+    CHECK(bad != NULL);
+    memcpy(bad, l.r[4].bytes, l.r[4].size);
+    uint64_t bad_fno = l.r[4].fno + 5;
+    memcpy(bad + 16, &bad_fno, 8);
+    CHECK_EQ(replica_append_verified(db, 1, total, bad, l.r[4].size), TSDB_ERR_INVALID);
+    CHECK_EQ(replica_log_end(db), l.r[3].last);
+    free(bad);
+
+    /* Apply up to durable_end (r[0] rows + r[1] MK_NOW) and verify clock + rows */
+    CHECK_EQ(replica_apply(db, replica_durable_end(db)), 0);
+    CHECK_EQ(replica_applied_end(db), l.r[1].last);
+    CHECK_EQ(replica_now_ms(db), T0 + 50000);
+
+    free(batch);
+    CHECK_EQ(eng_close(db), 0);
+    leader_free(&l);
+    printf("  append_verified: 4-record mixed batch (rows + NOW + COMMIT hold + rows) verified\n");
+}
+
 int main(int argc, char **argv)
 {
     int a = 1;
@@ -8639,6 +8725,7 @@ int main(int argc, char **argv)
     }
     case_basic();
     case_apply_buffered();
+    case_append_verified();
     case_keepcap();
     case_replaykept();
     case_leader_replay();

@@ -97,6 +97,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -128,6 +129,78 @@
 #include "rtransfer.h"
 
 struct repld_g G = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+/* Internal engine fast path (src/replica.c): appends WAL bytes already validated by wal_record() in msg_refused(). */
+extern int replica_append_verified(struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len);
+
+/* Guards unlocked plink_send/plink_sendv calls against repld_stop() -> peerlink_free(G.pl).
+ * Dekker seq_cst fence: senders increment pl_inflight before checking pl_stopping; repld_stop() sets pl_stopping = 1
+ * before waiting for pl_inflight == 0, establishing happens-before between every unlocked send and peerlink_free(). */
+static _Atomic uint32_t pl_inflight;
+static _Atomic int pl_stopping;
+
+static int pl_send_enter(void)
+{
+    atomic_fetch_add_explicit(&pl_inflight, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&pl_stopping, memory_order_seq_cst)) {
+        atomic_fetch_sub_explicit(&pl_inflight, 1, memory_order_release);
+        return 0;
+    }
+    return 1;
+}
+
+static void pl_send_leave(void)
+{
+    atomic_fetch_sub_explicit(&pl_inflight, 1, memory_order_seq_cst);
+}
+
+/* Header-only parse of a WAL record already sealed by wal_seal() or verified by wal_record().
+ * Avoids redundant xxh64 recomputation on the leader and catch-up send paths. */
+static size_t wal_rec_hdr(const uint8_t *p, size_t avail, wal_rec *r)
+{
+    if (avail < WAL_HDR)
+        return 0;
+    uint32_t w;
+    memcpy(&w, p, 4);
+    uint32_t kind = w >> 28, n = w & 0x0fffffffu;
+    uint64_t fno;
+    int64_t commit_ms;
+    memcpy(&fno, p + 16, 8);
+    memcpy(&commit_ms, p + 24, 8);
+    size_t body;
+    uint64_t span;
+    uint16_t mtype = 0, mflags = 0;
+    if (kind == WAL_KIND_ROWS) {
+        if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW)
+            return 0;
+        body = (size_t)n * WAL_ROW;
+        span = n;
+    } else if (kind == WAL_KIND_MARKER) {
+        if (n < WAL_MARKER_HDR || n % 4 != 0 || n > avail - WAL_HDR)
+            return 0;
+        body = n;
+        memcpy(&mtype, p + WAL_HDR, 2);
+        memcpy(&mflags, p + WAL_HDR + 2, 2);
+        uint32_t sp;
+        memcpy(&sp, p + WAL_HDR + 4, 4);
+        span = sp;
+        if (span == 0)
+            return 0;
+    } else {
+        return 0;
+    }
+    if (fno == 0 || fno >= FNO_LIMIT)
+        return 0;
+    r->kind = kind;
+    r->n = n;
+    r->fno = fno;
+    r->span = span;
+    r->commit_ms = commit_ms;
+    r->payload = p + WAL_HDR;
+    r->mtype = mtype;
+    r->mflags = mflags;
+    return WAL_HDR + body;
+}
 
 void say(const char *fmt, ...)
 {
@@ -388,7 +461,7 @@ static void index_log(struct rvol *rv, struct eng *db, uint64_t from, uint64_t e
         size_t o = 0;
         while (o < len) {
             wal_rec wr;
-            size_t sz = wal_record(buf + o, len - o, seq, off + o, &wr);
+            size_t sz = wal_rec_hdr(buf + o, len - o, &wr);
             if (!sz)
                 break;
             idx_push(rv, wr.fno, wr.fno + wr.span - 1);
@@ -405,13 +478,21 @@ static void send_msg(struct rvol *rv, const struct repl_msg *m)
 {
     if (m->to < 0 || (uint32_t)m->to >= rv->rec.nrep)
         return; /* the metadata group's messages go through the cluster thread (ISR changes: not wired yet) */
-    struct plink *l = link_of(rv->rec.rep[m->to].node, 0);
+    uint32_t node = rv->rec.rep[m->to].node;
+    uint32_t vol = rv->number;
     /* the core's own messages: it stamps its set version (src/repl.h), and one queued before a reconfiguration is in the
      * old record's indexes, so it must keep the old version (rset.h: rset_stamp is for what the driver builds) */
+    struct repl_msg copy = *m;
+    pthread_mutex_unlock(&rv->mu);
     uint8_t b[RW_HEAD + RW_CHECK];
-    size_t n = rw_encode_msg(b, sizeof b, rv->number, m, NULL, 0, 0, NULL, 0);
-    if (l && n)
-        plink_send(l, RW_T_MSG, b, n, 0);
+    size_t n = rw_encode_msg(b, sizeof b, vol, &copy, NULL, 0, 0, NULL, 0);
+    if (n && pl_send_enter()) {
+        struct plink *l = link_of(node, 0);
+        if (l)
+            plink_send(l, RW_T_MSG, b, n, 0);
+        pl_send_leave();
+    }
+    pthread_mutex_lock(&rv->mu);
 }
 
 static void cvol_close(uint32_t v);
@@ -517,61 +598,186 @@ static void meta_msg(struct rvol *rv, const struct repl_msg *m)
     }
 }
 
-/* An APPEND to peer `to` of the records [buf, buf + len) of segment seq at off (whole WAL records), positions
- * first .. last. Under rv->mu. 0 once queued. */
-static int send_records(struct rvol *rv, int to, uint64_t seq, uint64_t off, const uint8_t *buf, size_t len,
-                        uint64_t first)
+_Static_assert(REPL_MAX_NODES == 8 && RW_HEAD == 212 && RW_APPEND_HEAD == 16 && RW_DESC == 24 && RW_CHECK == 8,
+               "encode_append_hdr layout matches server/replwire.c");
+
+enum { SEND_STACK_RECS = 64 };
+
+struct wal_batch {
+    struct repl_rec srec[SEND_STACK_RECS];
+    uint32_t slen[SEND_STACK_RECS];
+    struct repl_rec *recs;
+    uint32_t *lens;
+    uint32_t nrec, cap;
+    int rows, has_class;
+};
+
+static void wal_batch_init(struct wal_batch *wb)
 {
-    struct plink *l = link_of(rv->rec.rep[to].node, 0);
-    if (!l)
-        return -1;
-    uint32_t nrec = 0;
+    wb->recs = wb->srec;
+    wb->lens = wb->slen;
+    wb->nrec = 0;
+    wb->cap = SEND_STACK_RECS;
+    wb->rows = 0;
+    wb->has_class = 0;
+}
+
+static void wal_batch_free(struct wal_batch *wb)
+{
+    if (wb->recs != wb->srec)
+        free(wb->recs);
+    if (wb->lens != wb->slen)
+        free(wb->lens);
+}
+
+/* Parses WAL record headers in buf[0, len) once without re-hashing xxh64 (caller's bytes were just sealed by wal_seal
+ * or already verified by replica_read). Returns 0 on success, -1 on OOM or malformed record. */
+static int wal_batch_parse(struct wal_batch *wb, const uint8_t *buf, size_t len)
+{
     for (size_t o = 0; o < len;) {
         wal_rec wr;
-        size_t sz = wal_record(buf + o, len - o, seq, off + o, &wr);
+        size_t sz = wal_rec_hdr(buf + o, len - o, &wr);
         if (!sz)
             return -1;
-        if (nrec == rv->crec) {
-            uint32_t c = rv->crec ? rv->crec * 2 : 256;
-            struct repl_rec *r = realloc(rv->recs, c * sizeof *r);
-            if (r)
-                rv->recs = r;
-            uint32_t *ln = realloc(rv->lens, c * sizeof *ln);
-            if (ln)
-                rv->lens = ln;
-            uint64_t *co = realloc(rv->coff, c * sizeof *co);
-            if (co)
-                rv->coff = co;
-            if (!r || !ln || !co)
+        if (wb->nrec == wb->cap) {
+            uint32_t nc = wb->cap * 2;
+            struct repl_rec *nr = wb->recs == wb->srec ? malloc(nc * sizeof *nr) : realloc(wb->recs, nc * sizeof *nr);
+            if (!nr)
                 return -1;
-            rv->crec = c;
+            if (wb->recs == wb->srec)
+                memcpy(nr, wb->srec, wb->nrec * sizeof *nr);
+            wb->recs = nr;
+            uint32_t *nl = wb->lens == wb->slen ? malloc(nc * sizeof *nl) : realloc(wb->lens, nc * sizeof *nl);
+            if (!nl)
+                return -1;
+            if (wb->lens == wb->slen)
+                memcpy(nl, wb->slen, wb->nrec * sizeof *nl);
+            wb->lens = nl;
+            wb->cap = nc;
         }
-        rv->recs[nrec] = (struct repl_rec){.pos = wr.fno, .epoch = epoch_at(rv, wr.fno), .n = (uint32_t)wr.span};
-        rv->lens[nrec++] = (uint32_t)sz;
+        if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
+            wb->has_class = 1;
+        wb->rows |= wr.kind == WAL_KIND_ROWS;
+        wb->recs[wb->nrec] = (struct repl_rec){.pos = wr.fno, .epoch = 0, .n = (uint32_t)wr.span};
+        wb->lens[wb->nrec++] = (uint32_t)sz;
         o += sz;
     }
-    if (!nrec || rv->recs[0].pos != first)
-        return -1;
-    struct repl_msg m = {.type = REPL_M_APPEND, .from = rv->self, .to = to, .epoch = repl_epoch(rv->core),
-                         .leader = rv->self, .prev_pos = first - 1, .prev_epoch = epoch_at(rv, first - 1),
-                         .commit = repl_commit(rv->core), .nrec = nrec, .rec = rv->recs, .meta.leader = -1};
-    rset_stamp(rv, &m);
-    size_t cap = rw_msg_size(nrec, len);
-    if (cap > PL_FRAME_MAX) {
-        if (nrec == 1) /* never sent, so never committed: a backstop for jr_rec_max_rows (src/internal.h) */
-            vol_fail(rv, "a WAL record larger than a peer frame");
-        return -1;
+    return 0;
+}
+
+/* Encodes the header, descriptors and driver check of a non-empty REPL_M_APPEND (everything before the WAL bytes),
+ * matching rw_encode_msg() byte for byte. Caller scatters [hdr, buf] via plink_sendv() with zero payload copy, and
+ * retargets to additional peers via append_hdr_set_to(). */
+static size_t encode_append_hdr(uint8_t *out, size_t cap, uint32_t volume, int from, int to, uint64_t epoch,
+                                uint64_t prev_pos, uint64_t prev_epoch, uint64_t commit, uint64_t set_version,
+                                uint64_t seq, uint64_t off, const struct repl_rec *recs, const uint32_t *lens,
+                                uint32_t nrec, size_t nbytes)
+{
+    const uint64_t pos_limit = (uint64_t)1 << 62;
+    if (!nrec || from < -1 || from >= REPL_MAX_NODES || to < -1 || to >= REPL_MAX_NODES || prev_pos >= pos_limit)
+        return 0;
+    size_t at = RW_HEAD + RW_APPEND_HEAD + (size_t)nrec * RW_DESC;
+    if (at + RW_CHECK > cap)
+        return 0;
+    uint64_t next = prev_pos + 1, sum = 0;
+    for (uint32_t i = 0; i < nrec; i++) {
+        if (recs[i].pos != next || recs[i].n == 0 || lens[i] == 0 || recs[i].pos >= pos_limit ||
+            pos_limit - recs[i].pos < recs[i].n)
+            return 0;
+        next = recs[i].pos + recs[i].n;
+        sum += lens[i];
     }
-    uint8_t *b = malloc(cap);
-    size_t n = b ? rw_encode_msg(b, cap, rv->number, &m, rv->lens, seq, off, buf, len) : 0;
-    int rc = n ? plink_send(l, RW_T_MSG, b, n, 0) : -1;
-    if (G.bulk_frame && n && ++rv->peer[to].bulk_n % 16 == 0) { /* a frame on the wrong link (test_cluster replbulk) */
-        struct plink *bl = link_of(rv->rec.rep[to].node, 1);
-        if (bl)
-            plink_send(bl, RW_T_MSG, b, n, 0);
+    if (sum != nbytes)
+        return 0;
+    memset(out, 0, RW_HEAD);
+    out[0] = RW_VERSION;
+    out[1] = (uint8_t)REPL_M_APPEND;
+    uint32_t u32;
+    u32 = volume;
+    memcpy(out + 4, &u32, 4);
+    u32 = (uint32_t)from;
+    memcpy(out + 8, &u32, 4);
+    u32 = (uint32_t)to;
+    memcpy(out + 12, &u32, 4);
+    u32 = (uint32_t)from; /* leader == from */
+    memcpy(out + 16, &u32, 4);
+    memcpy(out + 20, &epoch, 8);
+    memcpy(out + 28, &prev_pos, 8);
+    memcpy(out + 36, &prev_epoch, 8);
+    memcpy(out + 44, &commit, 8);
+    memcpy(out + 100, &set_version, 8);
+    u32 = (uint32_t)-1;
+    memcpy(out + 132, &u32, 4); /* meta.leader = -1 */
+    memcpy(out + 208, &nrec, 4);
+    memcpy(out + RW_HEAD, &seq, 8);
+    memcpy(out + RW_HEAD + 8, &off, 8);
+    uint8_t *d = out + RW_HEAD + RW_APPEND_HEAD;
+    for (uint32_t i = 0; i < nrec; i++, d += RW_DESC) {
+        memcpy(d, &recs[i].pos, 8);
+        memcpy(d + 8, &recs[i].epoch, 8);
+        memcpy(d + 16, &recs[i].n, 4);
+        memcpy(d + 20, &lens[i], 4);
     }
-    free(b);
-    return rc == PL_OK ? 0 : -1;
+    size_t cov = rw_mutant == RW_MUT_SHORT && at > RW_HEAD ? RW_HEAD : at;
+    uint64_t ck = rw_check(RW_K_MSG, out, cov);
+    memcpy(out + at, &ck, 8);
+    return at + RW_CHECK;
+}
+
+static void append_hdr_set_to(uint8_t *hdr, size_t hdr_len, int to)
+{
+    uint32_t u32 = (uint32_t)to;
+    memcpy(hdr + 12, &u32, 4);
+    size_t at = hdr_len - RW_CHECK;
+    size_t cov = rw_mutant == RW_MUT_SHORT && at > RW_HEAD ? RW_HEAD : at;
+    uint64_t ck = rw_check(RW_K_MSG, hdr, cov);
+    memcpy(hdr + at, &ck, 8);
+}
+
+struct send_target {
+    int idx;
+    uint32_t node;
+    int also_bulk;
+    int sent_ok;
+};
+
+/* Encodes the APPEND header once and scatters [hdr, buf] to targets[0..nt-1] outside rv->mu.
+ * Returns the number of targets queued successfully (each marked in targets[t].sent_ok). */
+static int send_append_unlocked(uint32_t volume, int from, uint64_t epoch, uint64_t prev_pos, uint64_t prev_epoch,
+                                uint64_t commit, uint64_t set_version, uint64_t seq, uint64_t off,
+                                const struct repl_rec *recs, const uint32_t *lens, uint32_t nrec, const uint8_t *buf,
+                                size_t len, struct send_target *targets, int nt)
+{
+    if (nt <= 0 || !nrec)
+        return 0;
+    size_t hcap = RW_HEAD + RW_APPEND_HEAD + (size_t)nrec * RW_DESC + RW_CHECK;
+    uint8_t shdr[RW_HEAD + RW_APPEND_HEAD + SEND_STACK_RECS * RW_DESC + RW_CHECK];
+    uint8_t *hdr = hcap <= sizeof shdr ? shdr : malloc(hcap);
+    if (!hdr)
+        return 0;
+    size_t hlen = encode_append_hdr(hdr, hcap, volume, from, targets[0].idx, epoch, prev_pos, prev_epoch, commit,
+                                    set_version, seq, off, recs, lens, nrec, len);
+    int nsent = 0;
+    if (hlen && pl_send_enter()) {
+        for (int t = 0; t < nt; t++) {
+            if (t > 0)
+                append_hdr_set_to(hdr, hlen, targets[t].idx);
+            struct plink *l = link_of(targets[t].node, 0);
+            if (l && plink_sendv(l, 0, RW_T_MSG, hdr, hlen, buf, len, 0, 0, 0, 0) == PL_OK) {
+                targets[t].sent_ok = 1;
+                nsent++;
+            }
+            if (targets[t].also_bulk) { /* a frame on the wrong link (test_cluster replbulk) */
+                struct plink *bl = link_of(targets[t].node, 1);
+                if (bl)
+                    plink_sendv(bl, 0, RW_T_MSG, hdr, hlen, buf, len, 0, 0, 0, 0);
+            }
+        }
+        pl_send_leave();
+    }
+    if (hdr != shdr)
+        free(hdr);
+    return nsent;
 }
 
 /* After `sent` or `wrote` changed: whether the cursor is ahead of what the peer acknowledged having, and since when */
@@ -586,7 +792,7 @@ static void ahead_mark(struct rpeer *p, uint64_t now)
 /* Catch-up of the peers whose cursor is behind what the core wants them to have: one read per peer per call. */
 static void catch_up(struct rvol *rv, struct eng *db)
 {
-    for (int i = 0; i < (int)rv->rec.nrep; i++) {
+    for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
         struct rpeer *p = &rv->peer[i];
         if (i == rv->self || p->sent >= p->want)
             continue;
@@ -600,6 +806,9 @@ static void catch_up(struct rvol *rv, struct eng *db)
             struct timespec sl = {0, SLOW_READ_MS * 1000000L};
             nanosleep(&sl, NULL);
         }
+        struct wal_batch wb;
+        wal_batch_init(&wb);
+        int parsed = rc == 0 && len ? (wal_batch_parse(&wb, buf, len) == 0 && wb.nrec > 0) : 0;
         pthread_mutex_lock(&rv->mu);
         if (rc < 0 && rc != TSDB_ERR_NOTFOUND) { /* NOTFOUND: in parts, the core sends a snapshot */
             uint64_t now = now_ms();
@@ -610,11 +819,41 @@ static void catch_up(struct rvol *rv, struct eng *db)
                 p->rderr_ms = now;
             }
         }
-        if (rc == 0 && len && p->sent + 1 == from && send_records(rv, i, seq, off, buf, len, from) == 0) {
-            p->sent = last;
-            p->sent_ms = now_ms();
-            ahead_mark(p, p->sent_ms);
+        if (parsed && !rv->stop && rv->core && i < (int)rv->rec.nrep && rv->peer[i].sent + 1 == from &&
+            wb.recs[0].pos == from) {
+            size_t cap = rw_msg_size(wb.nrec, len);
+            if (cap > PL_FRAME_MAX) {
+                if (wb.nrec == 1) /* never sent, so never committed: a backstop for jr_rec_max_rows (src/internal.h) */
+                    vol_fail(rv, "a WAL record larger than a peer frame");
+            } else {
+                int snap_self = rv->self;
+                uint64_t snap_epoch = repl_epoch(rv->core);
+                uint64_t snap_commit = repl_commit(rv->core);
+                uint64_t snap_setv = repl_get_set_version(rv->core);
+                uint64_t snap_rec_setv = rv->rec.set_version;
+                uint64_t snap_prev_epoch = epoch_at(rv, from - 1);
+                for (uint32_t k = 0; k < wb.nrec; k++)
+                    wb.recs[k].epoch = epoch_at(rv, wb.recs[k].pos);
+                struct send_target tgt = {.idx = i, .node = rv->rec.rep[i].node,
+                                          .also_bulk = G.bulk_frame && ++rv->peer[i].bulk_n % 16 == 0};
+                uint32_t vol = rv->number;
+                pthread_mutex_unlock(&rv->mu);
+                int nsent = send_append_unlocked(vol, snap_self, snap_epoch, from - 1, snap_prev_epoch, snap_commit,
+                                                 snap_setv, seq, off, wb.recs, wb.lens, wb.nrec, buf, len, &tgt, 1);
+                pthread_mutex_lock(&rv->mu);
+                if (nsent && !rv->stop && rv->core && rv->rec.set_version == snap_rec_setv &&
+                    repl_epoch(rv->core) == snap_epoch && rv->self == snap_self && i < (int)rv->rec.nrep) {
+                    struct rpeer *pp = &rv->peer[i];
+                    if (pp->sent >= from - 1 && pp->sent < last) {
+                        uint64_t now = now_ms();
+                        pp->sent = last;
+                        pp->sent_ms = now;
+                        ahead_mark(pp, now);
+                    }
+                }
+            }
         }
+        wal_batch_free(&wb);
         free(buf);
     }
 }
@@ -625,10 +864,11 @@ static void catch_up(struct rvol *rv, struct eng *db)
 static void late_bytes_hold(struct rvol *rv, const void *buf, size_t len, uint64_t seq, uint64_t off, uint64_t first,
                             uint64_t last)
 {
+    (void)seq, (void)off;
     int rows = 0;
     for (size_t o = 0; o < len;) {
         wal_rec wr;
-        size_t sz = wal_record((const uint8_t *)buf + o, len - o, seq, off + o, &wr);
+        size_t sz = wal_rec_hdr((const uint8_t *)buf + o, len - o, &wr);
         if (!sz)
             break;
         rows |= wr.kind == WAL_KIND_ROWS;
@@ -654,7 +894,9 @@ static void late_bytes_hold(struct rvol *rv, const void *buf, size_t len, uint64
         now_ms() - t0 > 30000 ? "go on after 30 s" : "released by the demote");
 }
 
-/* jr_ops.bytes: the writer's records, before its fdatasync; out at once to every peer whose cursor is at them */
+/* jr_ops.bytes: the writer's records, before its fdatasync; out at once to every peer whose cursor is at them.
+ * WAL headers are parsed once outside rv->mu, targets are snapshotted under a brief lock, and the APPEND header is
+ * encoded once and scattered with buf via plink_sendv() outside rv->mu (no payload copy, no lock held across send). */
 static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, const void *buf, size_t len,
                      uint64_t first, uint64_t last)
 {
@@ -664,23 +906,22 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
      * bytes with a client's rows (r3d-isr review L3: the NOW markers, one a second, and the idle seal took the hit
      * when no write was pending); class-switch when a CLASS marker is among the records (the switch's record in the
      * log, its CLASSES record not yet) */
-    int rows = 0;
     if (G.late_bytes)
         late_bytes_hold(rv, buf, len, seq, off, first, last);
-    pthread_mutex_lock(&rv->mu);
-    for (size_t o = 0; o < len;) {
-        wal_rec wr;
-        size_t sz = wal_record((const uint8_t *)buf + o, len - o, seq, off + o, &wr);
-        if (!sz)
-            break;
-        if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_CLASS)
-            crash_point(CP_CLASS_SWITCH);
-        rows |= wr.kind == WAL_KIND_ROWS;
-        idx_push(rv, wr.fno, wr.fno + wr.span - 1);
-        o += sz;
-    }
-    if (rows)
+    struct wal_batch wb;
+    wal_batch_init(&wb);
+    int parsed = wal_batch_parse(&wb, buf, len) == 0;
+    if (wb.has_class)
+        crash_point(CP_CLASS_SWITCH);
+    if (wb.rows)
         crash_point(CP_WAL_BEFORE_SEND);
+    struct send_target targets[REPL_MAX_NODES];
+    int nt = 0, snap_self = 0;
+    uint64_t snap_epoch = 0, snap_commit = 0, snap_setv = 0, snap_rec_setv = 0, snap_prev_epoch = 0;
+    uint32_t vol = rv->number;
+    pthread_mutex_lock(&rv->mu);
+    for (uint32_t k = 0; k < wb.nrec; k++)
+        idx_push(rv, wb.recs[k].pos, wb.recs[k].pos + wb.recs[k].n - 1);
     /* Stopped (repld_stop): the links are freed or about to be. The engine may still write: a record admitted before
      * the depose, a NOW marker of the flusher; its bytes stay in the WAL for the next epoch. */
     if (G.late_wal && rv->stop && !atomic_exchange(&G.said_late, 1)) {
@@ -690,16 +931,70 @@ static void op_bytes(void *ctx, struct eng *db, uint64_t seq, uint64_t off, cons
         say("test: volume %" PRIu32 " writes WAL records %" PRIu64 "..%" PRIu64 " after its driver stopped (%d peers"
             " were at them)", rv->number, first, last, at);
     }
-    for (int i = 0; !rv->stop && i < (int)rv->rec.nrep; i++) {
-        struct rpeer *p = &rv->peer[i];
-        if (i != rv->self && p->sent + 1 == first && G.mutant != RM_NOFASTPATH &&
-            send_records(rv, i, seq, off, buf, len, first) == 0) {
-            p->sent = last;
-            p->sent_ms = now_ms();
-            ahead_mark(p, p->sent_ms);
+    if (!rv->stop && rv->core && parsed && wb.nrec && wb.recs[0].pos == first && G.mutant != RM_NOFASTPATH) {
+        size_t cap = rw_msg_size(wb.nrec, len);
+        if (cap > PL_FRAME_MAX) {
+            for (int i = 0; i < (int)rv->rec.nrep; i++)
+                if (i != rv->self && rv->peer[i].sent + 1 == first) {
+                    if (wb.nrec == 1) /* never sent, so never committed: a backstop for jr_rec_max_rows */
+                        vol_fail(rv, "a WAL record larger than a peer frame");
+                    break;
+                }
+        } else {
+            for (int i = 0; i < (int)rv->rec.nrep && nt < REPL_MAX_NODES; i++) {
+                struct rpeer *p = &rv->peer[i];
+                if (i != rv->self && p->sent + 1 == first) {
+                    targets[nt++] = (struct send_target){
+                        .idx = i, .node = rv->rec.rep[i].node,
+                        .also_bulk = G.bulk_frame && ++p->bulk_n % 16 == 0};
+                }
+            }
+            if (nt > 0) {
+                uint64_t now = now_ms();
+                snap_self = rv->self;
+                snap_epoch = repl_epoch(rv->core);
+                snap_commit = repl_commit(rv->core);
+                snap_setv = repl_get_set_version(rv->core);
+                snap_rec_setv = rv->rec.set_version;
+                snap_prev_epoch = epoch_at(rv, first - 1);
+                for (uint32_t k = 0; k < wb.nrec; k++)
+                    wb.recs[k].epoch = epoch_at(rv, wb.recs[k].pos);
+                /* Advance p->sent before unlocking rv->mu so catch_up() on vol_main does not race to re-read and
+                 * duplicate-send [first..last] from disk while plink_sendv() is running. Because db->wal_writing
+                 * serializes op_bytes() and no record > last exists in the WAL yet, no later send can overtake us;
+                 * on the rare send failure (PL_E_FULL/PL_E_DOWN), p->sent is rolled back below. */
+                for (int t = 0; t < nt; t++) {
+                    struct rpeer *p = &rv->peer[targets[t].idx];
+                    p->sent = last;
+                    p->sent_ms = now;
+                    ahead_mark(p, now);
+                }
+            }
         }
     }
     pthread_mutex_unlock(&rv->mu);
+    if (nt > 0) {
+        int nsent = send_append_unlocked(vol, snap_self, snap_epoch, first - 1, snap_prev_epoch, snap_commit, snap_setv,
+                                         seq, off, wb.recs, wb.lens, wb.nrec, buf, len, targets, nt);
+        if (nsent < nt) {
+            uint64_t now = now_ms();
+            pthread_mutex_lock(&rv->mu);
+            if (!rv->stop && rv->core && rv->rec.set_version == snap_rec_setv &&
+                repl_epoch(rv->core) == snap_epoch && rv->self == snap_self) {
+                for (int t = 0; t < nt; t++) {
+                    if (targets[t].sent_ok || targets[t].idx >= (int)rv->rec.nrep)
+                        continue;
+                    struct rpeer *p = &rv->peer[targets[t].idx];
+                    if (p->sent == last) {
+                        p->sent = first - 1;
+                        ahead_mark(p, now);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&rv->mu);
+        }
+    }
+    wal_batch_free(&wb);
 }
 
 /* TSDB_REPLD_TEST=admithold: once <dir>/admithold holds a marker type (src/marker.h), the next admit of a marker of
@@ -1845,13 +2140,114 @@ static void exec(struct rvol *rv, struct repl_action *a)
     tsdb_cvol_unref(&db);
 }
 
+/* Appends a contiguous run of REPL_A_WRITE (REPL_SRC_MSG) records i0 .. i0 + cnt - 1 from rv->cur in one
+ * replica_append() call. When cur_verified is set, msg_refused() already validated every record in rv->cur with
+ * wal_record() against (seq, off) and compared its header with its descriptor, so redundant xxh64 passes are skipped. */
+static void exec_write_batch(struct rvol *rv, uint32_t i0, const struct repl_rec *brecs, uint32_t cnt, int cur_verified)
+{
+    struct eng *db = tsdb_cvol_ref(G.t, rv->number);
+    if (!db) {
+        vol_fail(rv, "the engine went away under a write");
+        return;
+    }
+    if (cur_verified) {
+        for (uint32_t k = 0; k < cnt; k++) {
+            uint32_t i = i0 + k;
+            if (rv->cur.m.rec[i].pos != brecs[k].pos || rv->cur.m.rec[i].n != brecs[k].n) {
+                vol_fail(rv, "a record's header does not match its descriptor");
+                tsdb_cvol_unref(&db);
+                return;
+            }
+        }
+    } else {
+        for (uint32_t k = 0; k < cnt; k++) {
+            uint32_t i = i0 + k;
+            wal_rec wr;
+            /* the core's position is the descriptor's; the engine's is the record's own header: they must agree */
+            if (wal_record(rv->cur.bytes + rv->coff[i], rv->cur.lens[i], rv->cur.seq, rv->cur.off + rv->coff[i],
+                           &wr) != rv->cur.lens[i] ||
+                wr.fno != brecs[k].pos || wr.span != brecs[k].n) {
+                vol_fail(rv, "a record's header does not match its descriptor");
+                tsdb_cvol_unref(&db);
+                return;
+            }
+        }
+    }
+    uint64_t boff = rv->coff[i0];
+    size_t blen = (size_t)(rv->coff[i0 + cnt - 1] + rv->cur.lens[i0 + cnt - 1] - boff);
+    uint64_t seq = rv->cur.seq, seg_off = rv->cur.off + boff;
+    const uint8_t *bytes = rv->cur.bytes + boff;
+    pthread_mutex_unlock(&rv->mu);
+    int rc = cur_verified ? replica_append_verified(db, seq, seg_off, bytes, blen)
+                          : replica_append(db, seq, seg_off, bytes, blen);
+    pthread_mutex_lock(&rv->mu);
+    if (rc == 0) {
+        for (uint32_t k = 0; k < cnt; k++) {
+            hist_note(rv, brecs[k].epoch, brecs[k].pos);
+            idx_push(rv, brecs[k].pos, brecs[k].pos + brecs[k].n - 1);
+        }
+    } else {
+        char why[96];
+        snprintf(why, sizeof why, "a write of the log failed: %s", tsdb_strerror(rc));
+        vol_fail(rv, why);
+    }
+    tsdb_cvol_unref(&db);
+}
+
+static void drain_msgs(struct rvol *rv, int cur_verified)
+{
+    struct repl_action a, next;
+    int have = 0;
+    while (!rv->failed && rv->core) {
+        if (have) {
+            a = next;
+            have = 0;
+        } else if (!repl_next_action(rv->core, &a)) {
+            break;
+        }
+        if (a.type == REPL_A_WRITE && a.src == REPL_SRC_MSG && a.idx < rv->cur.m.nrec) {
+            uint32_t i0 = a.idx, cnt = 1, cap = SEND_STACK_RECS;
+            struct repl_rec sbrecs[SEND_STACK_RECS];
+            struct repl_rec *brecs = sbrecs;
+            brecs[0] = a.rec;
+            while (repl_next_action(rv->core, &next)) {
+                if (next.type == REPL_A_WRITE && next.src == REPL_SRC_MSG && next.idx == i0 + cnt &&
+                    next.idx < rv->cur.m.nrec) {
+                    if (cnt == cap) {
+                        uint32_t nc = cap * 2;
+                        struct repl_rec *nr =
+                            brecs == sbrecs ? malloc(nc * sizeof *nr) : realloc(brecs, nc * sizeof *nr);
+                        if (!nr) {
+                            have = 1; /* flush what we collected so far, then process next */
+                            break;
+                        }
+                        if (brecs == sbrecs)
+                            memcpy(nr, sbrecs, cnt * sizeof *nr);
+                        brecs = nr;
+                        cap = nc;
+                    }
+                    brecs[cnt++] = next.rec;
+                } else {
+                    have = 1;
+                    break;
+                }
+            }
+            exec_write_batch(rv, i0, brecs, cnt, cur_verified);
+            if (brecs != sbrecs)
+                free(brecs);
+            if (rv->core)
+                rv->epoch = repl_epoch(rv->core);
+            continue;
+        }
+        exec(rv, &a);
+        if (rv->core)
+            rv->epoch = repl_epoch(rv->core);
+    }
+}
+
 void drain(struct rvol *rv)
 {
-    struct repl_action a;
-    while (!rv->failed && rv->core && repl_next_action(rv->core, &a)) {
-        exec(rv, &a);
-        rv->epoch = repl_epoch(rv->core);
-    }
+    drain_msgs(rv, 0);
 }
 
 /* ------------------------------------------------------------------ events */
@@ -2083,8 +2479,9 @@ static void handle(struct rvol *rv, struct item *it)
         }
         ahead_mark(p, now_ms());
     }
+    int cur_verified = G.mutant != RM_NOMSGCHECK && G.mutant != RM_NODESCCMP;
     repl_recv(rv->core, &rv->cur.m);
-    drain(rv);
+    drain_msgs(rv, cur_verified);
     rv->cur.m.nrec = 0;
     if (flipped && rv->cur.m.type == REPL_M_ACK)
         say("volume %" PRIu32 ": flipraw: a flipped ACK reached the core: node %" PRIu32 "'s durable end %" PRIu64
@@ -2516,6 +2913,7 @@ static void cold_apply_crash(struct eng *db, int which)
 
 void repld_init(tsdb *t, const char *dir)
 {
+    atomic_store_explicit(&pl_stopping, 0, memory_order_relaxed);
     G.trace = getenv("TSDB_REPLD_TRACE") != NULL;
     G.inbox_bytes = INBOX_BYTES;
     G.spill_bytes = SPILL_BYTES;
@@ -3152,6 +3550,10 @@ void repld_stop(void)
         tsdb_cvol_unref(&db);
     }
     rsnap_quiesce(); /* the snapshot worker sends on the links: stopped before they go */
+    /* Wait for any unlocked plink_send/plink_sendv (e.g. op_bytes on a writer thread) before freeing the links. */
+    atomic_store_explicit(&pl_stopping, 1, memory_order_seq_cst);
+    while (atomic_load_explicit(&pl_inflight, memory_order_seq_cst) != 0)
+        sched_yield();
     /* the cluster thread is stopped (tsdbd stops it first): nothing hands a socket to the peerlink any more */
     if (G.pl) {
         cluster_set_peerlink(NULL);
