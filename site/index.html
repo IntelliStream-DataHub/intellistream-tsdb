@@ -88,27 +88,28 @@
 <div class="hero-text">
 <h1 id="hero-title">A time series database built for speed.</h1>
 <p class="lead">tsdb stores sensor readings in about a tenth of their raw size and answers "the 5-minute averages of
-this sensor yesterday" in 0.09 milliseconds. One small program in C: run it as a server, or put it inside your own
-program.</p>
+this sensor yesterday" in 0.08 milliseconds. One small program in C: run it as a server, a replicated cluster, or put it
+inside your own program.</p>
 <div class="actions">
 <a class="btn filled" href="docs/quickstart.html">Get started</a>
 <a class="btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>
 </div>
 </div>
 </section>
-<section class="stats" aria-label="tsdb 0.9.0 in four numbers">
+<section class="stats" aria-label="tsdb 0.11.0 in four numbers">
 <div class="wrap stats-in">
-<div class="stat c1"><p class="big">97×</p><p>faster than ClickHouse for one day of 100 sensors in 288 buckets each:
-1.29 ms against 125 ms.</p></div>
-<div class="stat c2"><p class="big">0.09 ms</p><p>for one day of one sensor in 5-minute buckets, over TCP.
+<div class="stat c1"><p class="big">135×</p><p>faster than ClickHouse for one day of 100 sensors in 288 buckets each:
+0.93 ms against 125 ms.</p></div>
+<div class="stat c2"><p class="big">0.08 ms</p><p>for one day of one sensor in 5-minute buckets, over TCP.
 ClickHouse takes 3.09 ms.</p></div>
-<div class="stat c3"><p class="big">114 MB</p><p>for 100 million readings: about a tenth of the raw size, and less
-than half the disk ClickHouse needs.</p></div>
-<div class="stat c4"><p class="big">2.0 GB</p><p>the most memory tsdb used in the whole benchmark, without the file
-cache. Others ran out of their 48 GB with 32 clients.</p></div>
+<div class="stat c3"><p class="big">116 MB</p><p>for 100 million readings: about a tenth of the raw size, and a third
+of the disk ClickHouse needs (median over 31 datasets).</p></div>
+<div class="stat c4"><p class="big">190 M/s</p><p>durable 3×-replicated cluster ingest on 4 NVMe nodes over
+InfiniBand RDMA (2.0 GB max single-node memory).</p></div>
 </div>
-<p class="wrap stats-src">tsdb 0.9.0 against ClickHouse on one machine, every answer checked first. All
-numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md">the 0.9.0 results</a>.</p>
+<p class="wrap stats-src">tsdb 0.11.0 against ClickHouse on one machine (every answer checked first) and 4-node NVMe
+cluster ingest. All numbers:
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.11.0.md">the 0.11.0 results</a>.</p>
 </section>
 <section class="section" aria-labelledby="features">
 <div class="wrap">
@@ -159,7 +160,7 @@ summaries without unpacking.</p>
 <section class="section" aria-labelledby="compare">
 <div class="wrap">
 <h2 id="compare">How it compares</h2>
-<p class="intro">tsdb 0.9.0 against ClickHouse, InfluxDB 2 and 3, VictoriaMetrics, QuestDB, TimescaleDB, IoTDB,
+<p class="intro">tsdb 0.11.0 against ClickHouse, InfluxDB 2 and 3, VictoriaMetrics, QuestDB, TimescaleDB, IoTDB,
 TDengine and Prometheus on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a time, with the same data:
 100 sensors with 1 million readings each. Every answer was checked against tsdb's before it was timed, and every
 timing was repeated 5 times.</p>
@@ -171,16 +172,16 @@ timing was repeated 5 times.</p>
 <div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">bytes per reading; times tsdb's size; shorter is better</th></tr></thead>
 <tbody>
-<tr class="us" data-len="0.0155"><th scope="row">tsdb</th><td>0.78</td></tr>
-<tr data-len="0.0499"><th scope="row">ClickHouse</th><td>3.2× (2.51)</td></tr>
-<tr data-len="0.6859"><th scope="row">InfluxDB 2</th><td>44× (34.5)</td></tr>
+<tr class="us" data-len="0.0159"><th scope="row">tsdb</th><td>0.80</td></tr>
+<tr data-len="0.0499"><th scope="row">ClickHouse</th><td>3.1× (2.51)</td></tr>
+<tr data-len="0.6859"><th scope="row">InfluxDB 2</th><td>43× (34.5)</td></tr>
 <tr data-len="0.1907"><th scope="row">InfluxDB 3</th><td>12× (9.59)</td></tr>
-<tr data-len="0.0318"><th scope="row">VictoriaMetrics</th><td>2.1× (1.60)</td></tr>
-<tr data-len="1.0000"><th scope="row">QuestDB*</th><td>64× (50.3)</td></tr>
-<tr data-len="0.0680"><th scope="row">TimescaleDB</th><td>4.4× (3.42)</td></tr>
-<tr data-len="0.0517"><th scope="row">IoTDB</th><td>3.3× (2.60)</td></tr>
-<tr data-len="0.0539"><th scope="row">TDengine</th><td>3.5× (2.71)</td></tr>
-<tr data-len="0.0563"><th scope="row">Prometheus</th><td>3.6× (2.83)</td></tr>
+<tr data-len="0.0318"><th scope="row">VictoriaMetrics</th><td>2.0× (1.60)</td></tr>
+<tr data-len="1.0000"><th scope="row">QuestDB*</th><td>63× (50.3)</td></tr>
+<tr data-len="0.0680"><th scope="row">TimescaleDB</th><td>4.3× (3.42)</td></tr>
+<tr data-len="0.0517"><th scope="row">IoTDB</th><td>3.2× (2.60)</td></tr>
+<tr data-len="0.0539"><th scope="row">TDengine</th><td>3.4× (2.71)</td></tr>
+<tr data-len="0.0563"><th scope="row">Prometheus</th><td>3.5× (2.83)</td></tr>
 </tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-2">
@@ -189,16 +190,16 @@ timing was repeated 5 times.</p>
 <div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
-<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>85.8 M rows/s</td></tr>
-<tr data-len="0.5556"><th scope="row">ClickHouse</th><td>1.8× slower (47.5 M rows/s)</td></tr>
-<tr data-len="0.0417"><th scope="row">InfluxDB 2</th><td>24× slower (3.59 M rows/s)</td></tr>
-<tr data-len="0.0156"><th scope="row">InfluxDB 3</th><td>64× slower (1.34 M rows/s)</td></tr>
-<tr data-len="0.3846"><th scope="row">VictoriaMetrics</th><td>2.6× slower (33.4 M rows/s)</td></tr>
-<tr data-len="0.3846"><th scope="row">QuestDB*</th><td>2.6× slower (32.9 M rows/s)</td></tr>
-<tr data-len="0.0400"><th scope="row">TimescaleDB</th><td>25× slower (3.49 M rows/s)</td></tr>
-<tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (4.19 M rows/s)</td></tr>
-<tr data-len="0.0500"><th scope="row">TDengine</th><td>20× slower (4.22 M rows/s)</td></tr>
-<tr data-len="0.1099"><th scope="row">Prometheus</th><td>9.1× slower (9.46 M rows/s)</td></tr>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>89.9 M rows/s</td></tr>
+<tr data-len="0.5263"><th scope="row">ClickHouse</th><td>1.9× slower (47.5 M rows/s)</td></tr>
+<tr data-len="0.0400"><th scope="row">InfluxDB 2</th><td>25× slower (3.59 M rows/s)</td></tr>
+<tr data-len="0.0149"><th scope="row">InfluxDB 3</th><td>67× slower (1.34 M rows/s)</td></tr>
+<tr data-len="0.3704"><th scope="row">VictoriaMetrics</th><td>2.7× slower (33.4 M rows/s)</td></tr>
+<tr data-len="0.3704"><th scope="row">QuestDB*</th><td>2.7× slower (32.9 M rows/s)</td></tr>
+<tr data-len="0.0385"><th scope="row">TimescaleDB</th><td>26× slower (3.49 M rows/s)</td></tr>
+<tr data-len="0.0476"><th scope="row">IoTDB</th><td>21× slower (4.19 M rows/s)</td></tr>
+<tr data-len="0.0476"><th scope="row">TDengine</th><td>21× slower (4.22 M rows/s)</td></tr>
+<tr data-len="0.1053"><th scope="row">Prometheus</th><td>9.5× slower (9.46 M rows/s)</td></tr>
 </tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-3">
@@ -207,16 +208,16 @@ timing was repeated 5 times.</p>
 <div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
-<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,524 M rows/s</td></tr>
+<tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,511 M rows/s</td></tr>
 <tr data-len="0.1754"><th scope="row">ClickHouse</th><td>5.7× slower (265 M rows/s)</td></tr>
-<tr data-len="0.0096"><th scope="row">InfluxDB 2</th><td>104× slower (14.6 M rows/s)</td></tr>
-<tr data-len="0.0015"><th scope="row">InfluxDB 3</th><td>685× slower (2.23 M rows/s)</td></tr>
+<tr data-len="0.0097"><th scope="row">InfluxDB 2</th><td>103× slower (14.6 M rows/s)</td></tr>
+<tr data-len="0.0015"><th scope="row">InfluxDB 3</th><td>677× slower (2.23 M rows/s)</td></tr>
 <tr data-len="0.0714"><th scope="row">VictoriaMetrics</th><td>14× slower (106 M rows/s)</td></tr>
 <tr data-len="0.0500"><th scope="row">QuestDB*</th><td>20× slower (75.8 M rows/s)</td></tr>
-<tr data-len="0.0154"><th scope="row">TimescaleDB</th><td>65× slower (23.6 M rows/s)</td></tr>
+<tr data-len="0.0156"><th scope="row">TimescaleDB</th><td>64× slower (23.6 M rows/s)</td></tr>
 <tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (76.1 M rows/s)</td></tr>
 <tr data-len="0.1010"><th scope="row">TDengine</th><td>9.9× slower (153 M rows/s)</td></tr>
-<tr data-len="0.0038"><th scope="row">Prometheus</th><td>261× slower (5.84 M rows/s)</td></tr>
+<tr data-len="0.0039"><th scope="row">Prometheus</th><td>259× slower (5.84 M rows/s)</td></tr>
 </tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-4">
@@ -225,15 +226,15 @@ timing was repeated 5 times.</p>
 <div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
-<tr class="us" data-len="0.0004"><th scope="row">tsdb</th><td>36.4 ms</td></tr>
-<tr data-len="0.0120"><th scope="row">ClickHouse</th><td>29× slower (1,063 ms)</td></tr>
+<tr class="us" data-len="0.0003"><th scope="row">tsdb</th><td>23.5 ms</td></tr>
+<tr data-len="0.0120"><th scope="row">ClickHouse</th><td>45× slower (1,063 ms)</td></tr>
 <tr data-none="not measured: other answers"><th scope="row">InfluxDB 2</th><td>not measured: other answers</td></tr>
-<tr data-len="0.0962"><th scope="row">InfluxDB 3</th><td>233× slower (8,488 ms)</td></tr>
+<tr data-len="0.0962"><th scope="row">InfluxDB 3</th><td>361× slower (8,488 ms)</td></tr>
 <tr data-none="no such function"><th scope="row">VictoriaMetrics</th><td>no such function</td></tr>
-<tr data-len="0.0153"><th scope="row">QuestDB*</th><td>37× slower (1,336 ms)</td></tr>
-<tr data-len="0.2592"><th scope="row">TimescaleDB</th><td>628× slower (22,869 ms)</td></tr>
-<tr data-len="1.0000"><th scope="row">IoTDB</th><td>2,423× slower (88,214 ms)</td></tr>
-<tr data-len="0.4903"><th scope="row">TDengine</th><td>1,188× slower (43,254 ms)</td></tr>
+<tr data-len="0.0152"><th scope="row">QuestDB*</th><td>57× slower (1,336 ms)</td></tr>
+<tr data-len="0.2592"><th scope="row">TimescaleDB</th><td>973× slower (22,869 ms)</td></tr>
+<tr data-len="1.0000"><th scope="row">IoTDB</th><td>3,754× slower (88,214 ms)</td></tr>
+<tr data-len="0.4904"><th scope="row">TDengine</th><td>1,841× slower (43,254 ms)</td></tr>
 <tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>
 </tbody></table></div>
 </figure>
@@ -243,13 +244,13 @@ timing was repeated 5 times.</p>
 <div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
-<tr class="us" data-len="0.0370"><th scope="row">tsdb</th><td>456 ms</td></tr>
-<tr data-len="0.0444"><th scope="row">ClickHouse</th><td>1.2× slower (540 ms)</td></tr>
+<tr class="us" data-len="0.0312"><th scope="row">tsdb</th><td>378 ms</td></tr>
+<tr data-len="0.0437"><th scope="row">ClickHouse</th><td>1.4× slower (540 ms)</td></tr>
 <tr data-none="not measured"><th scope="row">InfluxDB 2</th><td>not measured</td></tr>
 <tr data-none="not measured"><th scope="row">InfluxDB 3</th><td>not measured</td></tr>
 <tr data-none="no such function"><th scope="row">VictoriaMetrics</th><td>no such function</td></tr>
 <tr data-none="not measured"><th scope="row">QuestDB*</th><td>not measured</td></tr>
-<tr data-len="1.0000"><th scope="row">TimescaleDB</th><td>27× slower (12,256 ms)</td></tr>
+<tr data-len="1.0000"><th scope="row">TimescaleDB</th><td>32× slower (12,256 ms)</td></tr>
 <tr data-none="no such function"><th scope="row">IoTDB</th><td>no such function</td></tr>
 <tr data-none="no such function"><th scope="row">TDengine</th><td>no such function</td></tr>
 <tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>

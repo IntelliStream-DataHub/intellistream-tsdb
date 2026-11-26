@@ -1,22 +1,22 @@
 # tsdb benchmarks
 
-This page explains how fast tsdb 0.9.0 is, and how small it stores data, next to other time series databases. The
-[README](README.md#how-it-compares) has the short summary. The release record, with every system's version,
-settings and memory limit, is [bench/dbcmp/results/0.9.0.md](bench/dbcmp/results/0.9.0.md). Every single
-measurement, with its spread and number of runs, is in
+This page explains how fast **tsdb 0.11.0** is, and how small it stores data, next to other time series databases, and
+adds v0.11.0 measurements for multi-CPU SIMD codec throughput and durable multi-node cluster ingestion. The
+[README](README.md#how-it-compares) has the short summary. The v0.11.0 record is
+[bench/dbcmp/results/0.11.0.md](bench/dbcmp/results/0.11.0.md). The full 0.9.0 comparison record, with every other
+system's version, settings, memory limit, spread and number of runs, is
+[bench/dbcmp/results/0.9.0.md](bench/dbcmp/results/0.9.0.md) and
 [bench/dbcmp/results/0.9.0-tables.md](bench/dbcmp/results/0.9.0-tables.md).
 
 ## How it was run
 
 - **One machine:** AMD Ryzen 9 7950X (16 cores, 32 threads), 64 GB RAM, an NVMe disk. One database at a time,
-  every server in Podman on 127.0.0.1. Measured from 2026-10-29 to 2026-11-04.
-- **The released 0.9.0 differs a little:** the comparison ran on tsdb as of 2026-11-04 (3bd4e96). tsdb's own
-  benchmark suite (`tools/bench-tsdb.sh --standard`, 5 runs each) on that code and on the release (90e3b94): no
-  query or insert got slower except two answered from block summaries (one bucket over the whole range -20%, 15-minute
-  buckets -5%), many got faster (32 connections: raw readings 2.2x, a week in hourly buckets 2.5x; durable inserts of
-  100,000 rows a call 1.9x), and the release stores about 2% more bytes per reading on this data (1.397 -> 1.427):
-  hour cuts, which cut blocks at UTC hours so that hourly buckets need no decoding. So tsdb's sizes below are about 2%
-  low for 0.9.0, and its speeds are as measured or better.
+  every server in Podman on 127.0.0.1. The eleven other databases were measured from 2026-10-29 to 2026-11-04;
+  **tsdb 0.11.0** (`1171dfff`, disk format 9 with UTC hour-cut granules and AVX-512 SIMD codecs) was re-measured on
+  2026-11-26 on the exact same machine, input files, and query specifications (0 answer mismatches against the 0.9.0
+  reference dumps).
+- **100 billion rows:** the 100-billion-row comparison against ClickHouse remains the 0.9.0 baseline (not re-run for
+  0.11.0).
 - **The same memory for everyone:** every server, tsdb's too, ran with a hard limit of 48 GB and no swap. InfluxDB 2
   had 24 GB (it used at most 8.3 GB). A server that ran out, or refused a question because of its own limit, is
   shown as such: that is a result.
@@ -41,24 +41,25 @@ measurement, with its spread and number of runs, is in
 
 ## The summary
 
-We ran tsdb 0.9.0 and the other databases on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
-time, on the same data, with the same memory limit of 48 GB. Every answer was checked against tsdb's before it was
-timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took than tsdb.
+We ran **tsdb 0.11.0** and the other databases (0.9.0 baselines) on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe
+disk), one at a time, on the same data, with the same memory limit of 48 GB. Every answer was checked against tsdb's
+before it was timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took
+than tsdb.
 
 **Servers: 100 million readings** (100 sensors, 1 million readings each). tsdb ran as a server, over TCP.
 
 | database | size, bytes per reading | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **0.78** | **15.4x** | **85.8 M** | | **1,524 M** | | **36.4 ms** | | **456 ms** | | **2.0 GB** |
-| ClickHouse | 2.51 | 4.8x | 47.5 M | 1.8x | 265 M | 5.7x | 1,063 ms | 29x | 540 ms | 1.2x | 43.1 GB [1] |
-| InfluxDB 2 [2] | 34.5 | 0.3x | 3.59 M | 24x | 14.6 M | 104x | not measured [3] | | not measured | | 7.9 GB |
-| InfluxDB 3 | 9.59 | 1.3x | 1.34 M | 64x | 2.23 M | 685x | 8,488 ms | 233x | not measured | | 48 GB (limit, ran out) [4] |
-| VictoriaMetrics | 1.60 | 7.5x | 33.4 M | 2.6x | 106 M | 14x | no function | | no function | | 5.9 GB |
-| QuestDB [5] | 50.3 | 0.2x | 32.9 M | 2.6x | 75.8 M | 20x | 1,336 ms | 37x | not measured | | 47.9 GB [6] |
-| TimescaleDB | 3.42 | 3.5x | 3.49 M | 25x | 23.6 M | 65x | 22,869 ms | 628x | 12,256 ms | 27x | 48 GB (limit, ran out) [4] |
-| IoTDB | 2.60 | 4.6x | 4.19 M | 20x | 76.1 M | 20x | 88,214 ms | 2,423x | no function | | 18.6 GB |
-| TDengine | 2.71 | 4.4x | 4.22 M | 20x | 153 M | 9.9x | 43,254 ms | 1,188x | no function | | 48 GB (limit, failed) [4] |
-| Prometheus [7] | 2.83 | 4.2x | 9.46 M | 9.1x | 5.84 M | 261x | not measured | | not measured | | 1.1 GB |
+| **tsdb 0.11.0** | **0.80** | **15.1x** | **89.9 M** | | **1,511 M** | | **23.5 ms** | | **378 ms** | | **2.0 GB** |
+| ClickHouse | 2.51 | 4.8x | 47.5 M | 1.9x | 265 M | 5.7x | 1,063 ms | 45x | 540 ms | 1.4x | 43.1 GB [1] |
+| InfluxDB 2 [2] | 34.5 | 0.3x | 3.59 M | 25x | 14.6 M | 103x | not measured [3] | | not measured | | 7.9 GB |
+| InfluxDB 3 | 9.59 | 1.3x | 1.34 M | 67x | 2.23 M | 677x | 8,488 ms | 361x | not measured | | 48 GB (limit, ran out) [4] |
+| VictoriaMetrics | 1.60 | 7.5x | 33.4 M | 2.7x | 106 M | 14x | no function | | no function | | 5.9 GB |
+| QuestDB [5] | 50.3 | 0.2x | 32.9 M | 2.7x | 75.8 M | 20x | 1,336 ms | 57x | not measured | | 47.9 GB [6] |
+| TimescaleDB | 3.42 | 3.5x | 3.49 M | 26x | 23.6 M | 64x | 22,869 ms | 973x | 12,256 ms | 32x | 48 GB (limit, ran out) [4] |
+| IoTDB | 2.60 | 4.6x | 4.19 M | 21x | 76.1 M | 20x | 88,214 ms | 3,754x | no function | | 18.6 GB |
+| TDengine | 2.71 | 4.4x | 4.22 M | 21x | 153 M | 9.9x | 43,254 ms | 1,841x | no function | | 48 GB (limit, failed) [4] |
+| Prometheus [7] | 2.83 | 4.2x | 9.46 M | 9.5x | 5.84 M | 259x | not measured | | not measured | | 1.1 GB |
 
 - **Size:** bytes on disk per reading, the median over the 31 data sets we test with (8 made-up sensor kinds and
   23 real sensors from a hydraulic test rig).
@@ -92,15 +93,15 @@ is ClickHouse as a library.
 
 | database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **114 MB** | **10.5x** | **144.8 M** | | **1,697 M** | | **38.7 ms** | | **404 ms** | | not measured |
-| chDB | 219 MB | 5.5x | 62.5 M | 2.3x | 23.9 M | 71x | 1,054 ms | 27x | 432 ms | 1.1x | not measured |
-| DuckDB | 306 MB | 3.9x | 27.5 M | 5.3x | 23.9 M | 71x | 1,820 ms | 47x | not measured | | not measured |
+| **tsdb 0.11.0** | **116 MB** | **10.4x** | **179.3 M** | | **2,465 M** | | **21.1 ms** | | **340 ms** | | not measured |
+| chDB | 219 MB | 5.5x | 62.5 M | 2.9x | 23.9 M | 103x | 1,054 ms | 50x | 432 ms | 1.3x | not measured |
+| DuckDB | 306 MB | 3.9x | 27.5 M | 6.5x | 23.9 M | 103x | 1,820 ms | 86x | not measured | | not measured |
 
 - **Size:** the 100 million readings on disk, after each library's final merge. **Read:** rows summed up per
   second while answering random days of one sensor in 5-minute buckets, one call at a time. tsdb uses one thread
   per call; chDB and DuckDB use 32. TWA and LTTB as above. DuckDB got its readings sorted beforehand (not counted).
 
-**100 billion readings: tsdb and ClickHouse** (10,000 sensors, 10 million readings each, loaded by 8 streams).
+**100 billion readings: tsdb and ClickHouse** (0.9.0 baseline; 10,000 sensors, 10 million readings each, loaded by 8 streams).
 
 | database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -118,17 +119,17 @@ this data. It does not sync a write to disk before it answers.
 
 - **Size:** the median over the 31 data sets is 2.9 times tsdb's (with ZSTD(22) after OPTIMIZE FINAL, its smallest
   setting: 2.6 times).
-- **Load:** 2.11 s for the 100 million readings, then 0.22 s to sync; its merges settled 24.9 s later. tsdb: 1.17 s,
-  every write synced.
+- **Load:** 2.11 s for the 100 million readings, then 0.22 s to sync; its merges settled 24.9 s later. tsdb 0.11.0:
+  1.11 s (5-run mean, median 1.04 s), every write synced.
 
 **Where tsdb is furthest ahead of ClickHouse** (one client):
 
 | question | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|
-| one day of 100 sensors | **1.29 ms** | 125 ms | 97x |
-| one week of 100 sensors | **4.89 ms** | 274 ms | 56x |
-| one week of one sensor | **0.125 ms** | 5.60 ms | 45x |
-| one day of one sensor | **0.090 ms** | 3.09 ms | 34x |
+| one week of 100 sensors | **1.56 ms** | 274 ms | 176x |
+| one day of 100 sensors | **0.927 ms** | 125 ms | 135x |
+| 3,600 raw readings of 100 sensors | **0.916 ms** | 64.6 ms | 71x |
+| whole history of 100 sensors, buckets of 3,600 | **3.7 ms** | 191 ms | 52x |
 
 The gap is largest when one request names many sensors: tsdb answers all 100 in one go.
 
@@ -136,46 +137,46 @@ All questions, median time of one request:
 
 | question | clients | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 191 ms | 23x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 377 ms | 5.7x |
-| one day of one series | 1 | **0.090 ms** | 3.09 ms | 34x |
-| one day of one series | 32 | **0.466 ms** | 8.92 ms | 19x |
-| one week of one series | 1 | **0.125 ms** | 5.60 ms | 45x |
-| one week of one series | 32 | **1.45 ms** | 29.9 ms | 21x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 1.46 ms | 33x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 3.89 ms | 11x |
-| one reading | 1 | **0.032 ms** | 1.06 ms | 33x |
-| one reading | 32 | **0.237 ms** | 2.88 ms | 12x |
-| one day of 100 series | 1 | **1.29 ms** | 125 ms | 97x |
-| one day of 100 series | 32 | **28.6 ms** | 808 ms | 28x |
-| one day of 100 series | 16 | **18.3 ms** | 398 ms | 22x |
-| one week of 100 series | 1 | **4.89 ms** | 274 ms | 56x |
-| one week of 100 series | 32 | **137 ms** | 3.71 s | 27x |
-| one week of 100 series | 16 | **74.3 ms** | 1.91 s | 26x |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 64.6 ms | 53x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 283 ms | 11x |
-| 3,600 raw readings of 100 series | 16 | **14.1 ms** | 274 ms | 20x |
-| one reading of 100 series | 32 | **2.67 ms** | 186 ms | 70x |
-| one reading of 100 series | 16 | **1.61 ms** | 102 ms | 63x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 191 ms | 52x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 377 ms | 5.7x |
+| one day of one series | 1 | **0.079 ms** | 3.09 ms | 39x |
+| one day of one series | 32 | **0.268 ms** | 8.92 ms | 33x |
+| one week of one series | 1 | **0.154 ms** | 5.60 ms | 36x |
+| one week of one series | 32 | **0.554 ms** | 29.9 ms | 54x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 1.46 ms | 41x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 3.89 ms | 27x |
+| one reading | 1 | **0.024 ms** | 1.06 ms | 44x |
+| one reading | 32 | **0.086 ms** | 2.88 ms | 33x |
+| one day of 100 series | 1 | **0.927 ms** | 125 ms | 135x |
+| one day of 100 series | 32 | **17.9 ms** | 808 ms | 45x |
+| one day of 100 series | 16 | **11.9 ms** | 398 ms | 33x |
+| one week of 100 series | 1 | **1.56 ms** | 274 ms | 176x |
+| one week of 100 series | 32 | **31.1 ms** | 3.71 s | 119x |
+| one week of 100 series | 16 | **16.9 ms** | 1.91 s | 113x |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 64.6 ms | 71x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 283 ms | 52x |
+| 3,600 raw readings of 100 series | 16 | **4.22 ms** | 274 ms | 65x |
+| one reading of 100 series | 32 | **0.865 ms** | 186 ms | 215x |
+| one reading of 100 series | 16 | **0.520 ms** | 102 ms | 196x |
 
 **Time-weighted averages.** ClickHouse has no time-weighted average function, so it gets the same calculation
 written in SQL with window functions. Its answers agreed with tsdb's.
 
 | question | clients | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 sensors, hourly, step | 1 | **36.4 ms** | 1,063 ms | 29x |
-| whole history of 100 sensors, hourly, linear | 1 | **43.3 ms** | 1,747 ms | 40x |
-| 10 one-day windows | 1 | **0.843 ms** | 63.7 ms | 76x |
-| 100 one-day windows | 1 | **3.62 ms** | 896 ms | 248x |
-| | 32 | **96.1 ms** | 7.39 s | 77x |
-| | 16 | **50.2 ms** | 5.63 s | 112x |
-| 10 one-week windows | 1 | **1.98 ms** | 102 ms | 52x |
-| 100 one-week windows | 1 | **18.0 ms** | 1.30 s | 72x |
-| | 32 | **550 ms** | failed [c] | |
-| | 16 | **279 ms** | 11.0 s | 39x |
+| whole history of 100 sensors, hourly, step | 1 | **23.5 ms** | 1,063 ms | 45x |
+| whole history of 100 sensors, hourly, linear | 1 | **25.5 ms** | 1,747 ms | 69x |
+| 10 one-day windows | 1 | **0.421 ms** | 63.7 ms | 151x |
+| 100 one-day windows | 1 | **3.21 ms** | 896 ms | 279x |
+| | 32 | **90.7 ms** | 7.39 s | 81x |
+| | 16 | **47.1 ms** | 5.63 s | 119x |
+| 10 one-week windows | 1 | **0.929 ms** | 102 ms | 110x |
+| 100 one-week windows | 1 | **8.37 ms** | 1.30 s | 156x |
+| | 32 | **249 ms** | failed [c] | |
+| | 16 | **125 ms** | 11.0 s | 88x |
 
-**LTTB** (all 100 sensors downsampled to 1,000 points each): tsdb 456 ms with one request per sensor on one
-connection, ClickHouse 540 ms in one query (tsdb 1.2x faster).
+**LTTB** (all 100 sensors downsampled to 1,000 points each): tsdb 378 ms with one request per sensor on one
+connection, ClickHouse 540 ms in one query (tsdb 1.4x faster).
 
 **Memory:** at most 5.6 GB without the file cache over a pass of every question; 43.1 GB in the failed batch [c].
 
@@ -193,9 +194,9 @@ that its background work ends sooner. Like tsdb, it syncs a write to disk before
 limit and used at most 7.9 GB (8.3 GB with the file cache). It has two query languages, InfluxQL (Q) and Flux (F);
 each time below is the faster of the two.
 
-- **Size:** the median over the 31 data sets is 20.4 times tsdb's (5.2 to 400 times). At its best it needs 4.8
-  bytes per reading where tsdb needs 0.93; at its worst 256 bytes where tsdb needs 0.64.
-- **Load:** 27.9 s (tsdb 1.17 s, 24x faster), then 664 s until its compactions went quiet (tsdb 0.05 s). Its five
+- **Size:** the median over the 31 data sets is 20.1 times tsdb's (5.1 to 386 times). At its best it needs 4.8
+  bytes per reading where tsdb needs 0.94; at its worst 256 bytes where tsdb needs 0.66.
+- **Load:** 27.9 s (tsdb 1.11 s, 25x faster), then 664 s until its compactions went quiet (tsdb 0.00 s). Its five
   runs logged different background-work steps, but these times agree.
 - **Time-weighted averages:** its `timeWeightedAvg` interpolates only inside each bucket, so a third of the buckets
   differ from tsdb's. Not timed. **LTTB:** not measured.
@@ -203,30 +204,30 @@ each time below is the faster of the two.
 
 | question | clients | tsdb | InfluxDB 2 | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s (F) | 284x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 6.85 s (F) | 104x |
-| one day of one series | 1 | **0.090 ms** | 5.04 ms (F) | 56x |
-| one day of one series | 32 | **0.466 ms** | 33.6 ms (Q) | 72x |
-| one week of one series | 1 | **0.125 ms** | 8.43 ms (F) | 67x |
-| one week of one series | 32 | **1.45 ms** | 79.7 ms (F) | 55x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 2.23 ms (Q) | 51x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 6.74 ms (Q) | 20x |
-| one reading | 1 | **0.032 ms** | 0.291 ms (Q) | 9.1x |
-| one reading | 32 | **0.237 ms** | 0.831 ms (Q) | 3.5x |
-| one day of 100 series | 1 | **1.29 ms** | 293 ms (F) | 227x |
-| one day of 100 series | 32 | **28.6 ms** | 3.34 s (Q) | 117x |
-| one week of 100 series | 1 | **4.89 ms** | 348 ms (F) | 71x |
-| one week of 100 series | 32 | **137 ms** | 9.04 s (F) | 66x |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 207 ms (Q) | 169x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 648 ms (Q) | 25x |
-| one reading of 100 series | 32 | **2.67 ms** | 62.4 ms (Q) | 23x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 2.36 s (F) | 637x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 6.85 s (F) | 104x |
+| one day of one series | 1 | **0.079 ms** | 5.04 ms (F) | 64x |
+| one day of one series | 32 | **0.268 ms** | 33.6 ms (Q) | 125x |
+| one week of one series | 1 | **0.154 ms** | 8.43 ms (F) | 55x |
+| one week of one series | 32 | **0.554 ms** | 79.7 ms (F) | 144x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 2.23 ms (Q) | 62x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 6.74 ms (Q) | 47x |
+| one reading | 1 | **0.024 ms** | 0.291 ms (Q) | 12x |
+| one reading | 32 | **0.086 ms** | 0.831 ms (Q) | 9.7x |
+| one day of 100 series | 1 | **0.927 ms** | 293 ms (F) | 316x |
+| one day of 100 series | 32 | **17.9 ms** | 3.34 s (Q) | 187x |
+| one week of 100 series | 1 | **1.56 ms** | 348 ms (F) | 223x |
+| one week of 100 series | 32 | **31.1 ms** | 9.04 s (F) | 291x |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 207 ms (Q) | 226x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 648 ms (Q) | 119x |
+| one reading of 100 series | 32 | **0.865 ms** | 62.4 ms (Q) | 72x |
 
 **InfluxDB 3 Core 3.12.0**, queried with SQL once its Parquet files were written. It had 48 GB of memory (an
 earlier attempt used 28 GB).
 
-- **Size:** the median over the 31 data sets is 10.3 times tsdb's (4.4 to 977 times).
-- **Load:** 74.7 s (tsdb 64x faster).
-- **Time-weighted averages,** whole history, hourly: step 8.49 s (tsdb 233x faster), linear 9.03 s (209x). Its
+- **Size:** the median over the 31 data sets is 10.0 times tsdb's (4.4 to 977 times).
+- **Load:** 74.7 s (tsdb 67x faster).
+- **Time-weighted averages,** whole history, hourly: step 8.49 s (tsdb 361x faster), linear 9.03 s (354x). Its
   batches were not run: the check of a single window did not finish within an hour.
 - **LTTB:** not measured. **100-series batches:** not measured.
 - **Failures:** with 32 clients asking for 10 one-week windows each, the kernel stopped it at the 48 GB limit in 4
@@ -234,48 +235,48 @@ earlier attempt used 28 GB).
 
 | question | clients | tsdb | InfluxDB 3 | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 44.6 s | 5,374x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 44.9 s | 685x |
-| one day of one series | 1 | **0.090 ms** | 13.7 ms | 153x |
-| one day of one series | 32 | **0.466 ms** | 346 ms | 742x |
-| one week of one series | 1 | **0.125 ms** | 55.8 ms | 446x |
-| one week of one series | 32 | **1.45 ms** | 1.67 s | 1,148x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 4.40 ms | 100x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 29.2 ms | 86x |
-| one reading | 1 | **0.032 ms** | 1.37 ms | 43x |
-| one reading | 32 | **0.237 ms** | 5.04 ms | 21x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 44.6 s | 12,055x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 44.9 s | 678x |
+| one day of one series | 1 | **0.079 ms** | 13.7 ms | 173x |
+| one day of one series | 32 | **0.268 ms** | 346 ms | 1,291x |
+| one week of one series | 1 | **0.154 ms** | 55.8 ms | 362x |
+| one week of one series | 32 | **0.554 ms** | 1.67 s | 3,005x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 4.40 ms | 122x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 29.2 ms | 204x |
+| one reading | 1 | **0.024 ms** | 1.37 ms | 57x |
+| one reading | 32 | **0.086 ms** | 5.04 ms | 59x |
 
 ## VictoriaMetrics
 
 VictoriaMetrics v1.154.0 (single node), a fast database for monitoring metrics, loaded by Prometheus remote
 write. It answers a write from memory and writes it to disk within 5 seconds.
 
-- **Size:** the median over the 31 data sets is 2.1 times tsdb's (1.2 to 2.6 times), the closest of the servers
+- **Size:** the median over the 31 data sets is 2.0 times tsdb's (1.1 to 2.6 times), the closest of the servers
   in their default setup.
-- **Load:** 3.00 s, then 1.54 s to flush and sync (tsdb 1.17 s, 2.6x faster).
+- **Load:** 3.00 s, then 1.54 s to flush and sync (tsdb 1.11 s, 2.7x faster).
 - **Time-weighted averages and LTTB:** its query language, MetricsQL, has neither (its `integrate()` is a step
   integral without the covered time).
 - **Memory:** at most 5.9 GB. **Failures:** none.
 
 | question | clients | tsdb | VictoriaMetrics | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 208 ms | 25x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 947 ms | 14x |
-| one day of one series | 1 | **0.090 ms** | 4.95 ms | 55x |
-| one day of one series | 32 | **0.466 ms** | 61.1 ms | 131x |
-| one week of one series | 1 | **0.125 ms** | 21.9 ms | 175x |
-| one week of one series | 32 | **1.45 ms** | 172 ms | 118x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 0.876 ms | 20x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 6.97 ms | 21x |
-| one reading | 1 | **0.032 ms** | 0.408 ms | 13x |
-| one reading | 32 | **0.237 ms** | 1.19 ms | 5.0x |
-| one day of 100 series | 1 | **1.29 ms** | 613 ms | 474x |
-| one day of 100 series | 32 | **28.6 ms** | 5.11 s | 179x |
-| one week of 100 series | 1 | **4.89 ms** | 2.40 s | 492x |
-| one week of 100 series | 32 | **137 ms** | 14.8 s | 108x |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 99.0 ms | 81x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 574 ms | 22x |
-| one reading of 100 series | 32 | **2.67 ms** | 133 ms | 50x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 208 ms | 56x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 947 ms | 14x |
+| one day of one series | 1 | **0.079 ms** | 4.95 ms | 63x |
+| one day of one series | 32 | **0.268 ms** | 61.1 ms | 228x |
+| one week of one series | 1 | **0.154 ms** | 21.9 ms | 142x |
+| one week of one series | 32 | **0.554 ms** | 172 ms | 310x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 0.876 ms | 24x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 6.97 ms | 49x |
+| one reading | 1 | **0.024 ms** | 0.408 ms | 17x |
+| one reading | 32 | **0.086 ms** | 1.19 ms | 14x |
+| one day of 100 series | 1 | **0.927 ms** | 613 ms | 661x |
+| one day of 100 series | 32 | **17.9 ms** | 5.11 s | 286x |
+| one week of 100 series | 1 | **1.56 ms** | 2.40 s | 1,540x |
+| one week of 100 series | 32 | **31.1 ms** | 14.8 s | 477x |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 99.0 ms | 108x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 574 ms | 105x |
+| one reading of 100 series | 32 | **0.865 ms** | 133 ms | 154x |
 
 ## QuestDB
 
@@ -287,19 +288,19 @@ QuestDB 10.0.1, a fast SQL database for time series. It does not sync a write to
   to Parquet with ZSTD took 28 minutes (1,702 s after the load); with LZ4 3 s. Converting partitions
   automatically as they age ([storage policies](https://questdb.com/docs/concepts/storage-policy/)) is a feature of QuestDB's paid Enterprise
   edition.
-- **Load:** 3.04 s, then 2.9 s until its WAL was applied and 1.6 s to sync (tsdb 1.17 s, 2.6x faster).
+- **Load:** 3.04 s, then 2.9 s until its WAL was applied and 1.6 s to sync (tsdb 1.11 s, 2.7x faster).
 - **Memory:** close to the 48 GB limit (47.9 GB without the file cache): it keeps memory from earlier questions.
 
 **Time-weighted averages** (a better query was written for it during the run; the older rows are not used):
 
 | question | clients | tsdb | QuestDB | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 sensors, hourly, step | 1 | **36.4 ms** | 1,336 ms | 37x |
-| 10 one-day windows | 1 | **0.843 ms** | 576 ms | 683x |
-| 100 one-day windows | 1 | **3.62 ms** | 6.90 s | 1,908x |
-| | 32 and 16 | **96.1 / 50.2 ms** | refused [d] | |
-| 10 one-week windows | 1 | **1.98 ms** | 4.51 s | 2,284x |
-| 100 one-week windows | 1 | **18.0 ms** | failed its answer check (Java heap space) | |
+| whole history of 100 sensors, hourly, step | 1 | **23.5 ms** | 1,336 ms | 57x |
+| 10 one-day windows | 1 | **0.421 ms** | 576 ms | 1,368x |
+| 100 one-day windows | 1 | **3.21 ms** | 6.90 s | 2,151x |
+| | 32 and 16 | **90.7 / 47.1 ms** | refused [d] | |
+| 10 one-week windows | 1 | **0.929 ms** | 4.51 s | 4,858x |
+| 100 one-week windows | 1 | **8.37 ms** | failed its answer check (Java heap space) | |
 
 The linear form was not timed: the server was down or timed out when it was checked. **LTTB:** not measured.
 
@@ -307,27 +308,27 @@ Its default format, median time of one request:
 
 | question | clients | tsdb | QuestDB | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 266 ms | 32x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 1.32 s | 20x |
-| one day of one series | 1 | **0.090 ms** | 5.61 ms | 62x |
-| one day of one series | 32 | **0.466 ms** | 56.7 ms | 122x |
-| one week of one series | 1 | **0.125 ms** | 11.0 ms | 88x |
-| one week of one series | 32 | **1.45 ms** | 166 ms | 114x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 1.19 ms | 27x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 2.47 ms | 7.3x |
-| one reading | 1 | **0.032 ms** | 0.209 ms | 6.5x |
-| one reading | 32 | **0.237 ms** | 0.309 ms | 1.3x |
-| one day of 100 series | 1 | **1.29 ms** | 500 ms | 387x |
-| one day of 100 series | 32 | **28.6 ms** | refused [a] | |
-| one day of 100 series | 16 | **18.3 ms** | 2.75 s | 151x |
-| one week of 100 series | 1 | **4.89 ms** | 702 ms | 144x |
-| one week of 100 series | 32 | **137 ms** | refused [a] | |
-| one week of 100 series | 16 | **74.3 ms** | refused [a] | |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 313 ms | 256x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 580 ms | 22x |
-| 3,600 raw readings of 100 series | 16 | **14.1 ms** | 339 ms | 24x |
-| one reading of 100 series | 32 | **2.67 ms** | 11.1 ms | 4.1x |
-| one reading of 100 series | 16 | **1.61 ms** | 5.73 ms | 3.6x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 266 ms | 72x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 1.32 s | 20x |
+| one day of one series | 1 | **0.079 ms** | 5.61 ms | 71x |
+| one day of one series | 32 | **0.268 ms** | 56.7 ms | 212x |
+| one week of one series | 1 | **0.154 ms** | 11.0 ms | 71x |
+| one week of one series | 32 | **0.554 ms** | 166 ms | 300x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 1.19 ms | 33x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 2.47 ms | 17x |
+| one reading | 1 | **0.024 ms** | 0.209 ms | 8.7x |
+| one reading | 32 | **0.086 ms** | 0.309 ms | 3.6x |
+| one day of 100 series | 1 | **0.927 ms** | 500 ms | 539x |
+| one day of 100 series | 32 | **17.9 ms** | refused [a] | |
+| one day of 100 series | 16 | **11.9 ms** | 2.75 s | 231x |
+| one week of 100 series | 1 | **1.56 ms** | 702 ms | 450x |
+| one week of 100 series | 32 | **31.1 ms** | refused [a] | |
+| one week of 100 series | 16 | **16.9 ms** | refused [a] | |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 313 ms | 342x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 580 ms | 106x |
+| 3,600 raw readings of 100 series | 16 | **4.22 ms** | 339 ms | 80x |
+| one reading of 100 series | 32 | **0.865 ms** | 11.1 ms | 13x |
+| one reading of 100 series | 16 | **0.520 ms** | 5.73 ms | 11x |
 
 [a] QuestDB refused every run: "global RSS memory limit exceeded", its own limit. At 32 clients it held 19.4 GB,
 15.7 GB of it from earlier questions.
@@ -337,7 +338,7 @@ not its memory.
 **Parquet formats**, one client: one day of one sensor 8.64 ms (LZ4) and 11.3 ms (ZSTD); one reading 0.54 ms and
 1.35 ms; whole history in buckets of 3,600 readings 372 ms and 613 ms; time-weighted averages of the whole history
 1,475 ms and 1,271 ms. With 32 clients asking about 100 sensors, some runs were stopped by the kernel at 48 GB;
-at 16 clients the ZSTD variant answered one day of 100 sensors in 9.76 s (tsdb 18.3 ms). The LZ4 variant failed at
+at 16 clients the ZSTD variant answered one day of 100 sensors in 9.76 s (tsdb 11.9 ms). The LZ4 variant failed at
 16 clients: one of five runs of one day of 100 sensors ("could not mmap"), and a week and single readings of 100
 sensors, where no run finished (the server dropped the connection or stopped).
 
@@ -348,36 +349,36 @@ timescaledb-tune. Like tsdb, it syncs a write to disk before it answers. Time-we
 its toolkit (the timescaledb-ha image).
 
 - **Size:** the median over the 31 data sets is 3.9 times tsdb's (1.9 to 293 times).
-- **Load:** 28.6 s with 16 workers, then 12.3 s to compress 696 chunks (tsdb 1.17 s).
-- **Time-weighted averages:** whole history of 100 sensors, hourly: step 22.9 s (tsdb 628x faster), linear 22.9 s
-  (528x). 10 one-day windows 1.25 s (tsdb 0.843 ms); 100 one-day windows 15.7 s (tsdb 3.62 ms); 100 one-week
-  windows 68.8 s (tsdb 18.0 ms). With 16 or 32 clients, batches of 100 ran out of memory [a].
-- **LTTB:** 12.3 s (tsdb 456 ms, 27x faster).
+- **Load:** 28.6 s with 16 workers, then 12.3 s to compress 696 chunks (tsdb 1.11 s).
+- **Time-weighted averages:** whole history of 100 sensors, hourly: step 22.9 s (tsdb 973x faster), linear 22.9 s
+  (896x). 10 one-day windows 1.25 s (tsdb 0.421 ms); 100 one-day windows 15.7 s (tsdb 3.21 ms); 100 one-week
+  windows 68.8 s (tsdb 8.37 ms). With 16 or 32 clients, batches of 100 ran out of memory [a].
+- **LTTB:** 12.3 s (tsdb 378 ms, 32x faster).
 - **Memory:** it reached the 48 GB limit with many clients.
 
 | question | clients | tsdb | TimescaleDB | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 3.60 s | 434x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 4.24 s | 65x |
-| one day of one series | 1 | **0.090 ms** | 4.91 ms | 55x |
-| one day of one series | 32 | **0.466 ms** | 8.66 ms | 19x |
-| one week of one series | 1 | **0.125 ms** | 29.8 ms | 239x |
-| one week of one series | 32 | **1.45 ms** | 55.0 ms | 38x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 0.934 ms | 21x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 2.00 ms | 5.9x |
-| one reading | 1 | **0.032 ms** | 0.287 ms | 9.0x |
-| one reading | 32 | **0.237 ms** | 0.449 ms | 1.9x |
-| one day of 100 series | 1 | **1.29 ms** | 463 ms | 358x |
-| one day of 100 series | 32 | **28.6 ms** | 1.55 s | 54x |
-| one day of 100 series | 16 | **18.3 ms** | 980 ms | 54x |
-| one week of 100 series | 1 | **4.89 ms** | 2.74 s | 560x |
-| one week of 100 series | 32 | **137 ms** | ran out of memory [a] | |
-| one week of 100 series | 16 | **74.3 ms** | 5.77 s [b] | 78x |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 108 ms | 88x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 244 ms | 9.4x |
-| 3,600 raw readings of 100 series | 16 | **14.1 ms** | 147 ms | 10x |
-| one reading of 100 series | 32 | **2.67 ms** | 46.8 ms | 18x |
-| one reading of 100 series | 16 | **1.61 ms** | 28.2 ms | 17x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 3.60 s | 974x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 4.24 s | 64x |
+| one day of one series | 1 | **0.079 ms** | 4.91 ms | 62x |
+| one day of one series | 32 | **0.268 ms** | 8.66 ms | 32x |
+| one week of one series | 1 | **0.154 ms** | 29.8 ms | 194x |
+| one week of one series | 32 | **0.554 ms** | 55.0 ms | 99x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 0.934 ms | 26x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 2.00 ms | 14x |
+| one reading | 1 | **0.024 ms** | 0.287 ms | 12x |
+| one reading | 32 | **0.086 ms** | 0.449 ms | 5.2x |
+| one day of 100 series | 1 | **0.927 ms** | 463 ms | 499x |
+| one day of 100 series | 32 | **17.9 ms** | 1.55 s | 86x |
+| one day of 100 series | 16 | **11.9 ms** | 980 ms | 82x |
+| one week of 100 series | 1 | **1.56 ms** | 2.74 s | 1,754x |
+| one week of 100 series | 32 | **31.1 ms** | ran out of memory [a] | |
+| one week of 100 series | 16 | **16.9 ms** | 5.77 s [b] | 341x |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 108 ms | 118x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 244 ms | 45x |
+| 3,600 raw readings of 100 series | 16 | **4.22 ms** | 147 ms | 35x |
+| one reading of 100 series | 32 | **0.865 ms** | 46.8 ms | 54x |
+| one reading of 100 series | 16 | **0.520 ms** | 28.2 ms | 54x |
 
 [a] With 32 clients asking for a week of 100 sensors, the kernel stopped the server at the 48 GB limit twice, so
 the question was stopped. At 32 clients it ran out of memory with 2, 1 and 0 parallel workers per query, so it
@@ -392,10 +393,10 @@ its WAL synced. **TDengine 3.4.2.8** (community edition), loaded by line protoco
 
 - **Size:** IoTDB's median over the 31 data sets is 3.1 times tsdb's (with CHIMP + ZSTD: 1.9 times). TDengine's
   is 3.1 times (with zstd: 2.4 times).
-- **Load:** IoTDB 23.9 s, TDengine 23.7 s (tsdb 1.17 s, 20x faster).
-- **Time-weighted averages,** whole history, hourly, step: IoTDB 88.2 s (tsdb 2,423x faster), TDengine 43.3 s
-  (1,188x). IoTDB's linear form: 107 s. TDengine's linear form gives other answers in 1,583 of 339,774 buckets:
-  not timed. 10 one-day windows: IoTDB 371 ms, TDengine 596 ms (tsdb 0.843 ms).
+- **Load:** IoTDB 23.9 s, TDengine 23.7 s (tsdb 1.11 s, 21x faster).
+- **Time-weighted averages,** whole history, hourly, step: IoTDB 88.2 s (tsdb 3,754x faster), TDengine 43.3 s
+  (1,841x). IoTDB's linear form: 107 s (4,200x). TDengine's linear form gives other answers in 1,583 of 339,774 buckets:
+  not timed. 10 one-day windows: IoTDB 371 ms, TDengine 596 ms (tsdb 0.421 ms).
 - **LTTB:** neither has the function.
 - **Memory:** IoTDB at most 18.6 GB, TDengine 28.6 GB, and 48 GB where it failed.
 - **Failures:** IoTDB refused the 32-client day and week batches of 100 sensors with its own memory pool (code
@@ -406,101 +407,102 @@ IoTDB:
 
 | question | clients | tsdb | IoTDB | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 275 ms | 33x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 1.31 s | 20x |
-| one day of one series | 1 | **0.090 ms** | 3.33 ms | 37x |
-| one day of one series | 32 | **0.466 ms** | 7.91 ms | 17x |
-| one week of one series | 1 | **0.125 ms** | 13.2 ms | 106x |
-| one week of one series | 32 | **1.45 ms** | 28.7 ms | 20x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 1.54 ms | 35x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 4.52 ms | 13x |
-| one reading | 1 | **0.032 ms** | 0.929 ms | 29x |
-| one reading | 32 | **0.237 ms** | 2.62 ms | 11x |
-| one day of 100 series | 1 | **1.29 ms** | 312 ms | 241x |
-| one day of 100 series | 32 | **28.6 ms** | refused [a] | |
-| one week of 100 series | 1 | **4.89 ms** | 376 ms | 77x |
-| one week of 100 series | 32 | **137 ms** | refused [a] | |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 201 ms | 165x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 989 ms | 38x |
-| one reading of 100 series | 32 | **2.67 ms** | 666 ms | 249x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 275 ms | 74x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 1.31 s | 20x |
+| one day of one series | 1 | **0.079 ms** | 3.33 ms | 42x |
+| one day of one series | 32 | **0.268 ms** | 7.91 ms | 30x |
+| one week of one series | 1 | **0.154 ms** | 13.2 ms | 86x |
+| one week of one series | 32 | **0.554 ms** | 28.7 ms | 52x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 1.54 ms | 43x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 4.52 ms | 32x |
+| one reading | 1 | **0.024 ms** | 0.929 ms | 39x |
+| one reading | 32 | **0.086 ms** | 2.62 ms | 30x |
+| one day of 100 series | 1 | **0.927 ms** | 312 ms | 337x |
+| one day of 100 series | 32 | **17.9 ms** | refused [a] | |
+| one week of 100 series | 1 | **1.56 ms** | 376 ms | 241x |
+| one week of 100 series | 32 | **31.1 ms** | refused [a] | |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 201 ms | 219x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 989 ms | 181x |
+| one reading of 100 series | 32 | **0.865 ms** | 666 ms | 770x |
 
 TDengine:
 
 | question | clients | tsdb | TDengine | slower |
 |---|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 124 ms | 15x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 652 ms | 9.9x |
-| one day of one series | 1 | **0.090 ms** | 2.73 ms | 30x |
-| one day of one series | 32 | **0.466 ms** | 10.3 ms | 22x |
-| one week of one series | 1 | **0.125 ms** | 8.29 ms | 66x |
-| one week of one series | 32 | **1.45 ms** | 20.0 ms | 14x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 2.17 ms | 49x |
-| 3,600 raw readings of one series | 32 | **0.339 ms** | 8.61 ms | 25x |
-| one reading | 1 | **0.032 ms** | 1.33 ms | 42x |
-| one reading | 32 | **0.237 ms** | 6.42 ms | 27x |
-| one day of 100 series | 1 | **1.29 ms** | 100 ms | 78x |
-| one day of 100 series | 32 | **28.6 ms** | 1.23 s | 43x |
-| one week of 100 series | 1 | **4.89 ms** | 147 ms | 30x |
-| one week of 100 series | 32 | **137 ms** | 2.41 s | 18x |
-| 3,600 raw readings of 100 series | 1 | **1.22 ms** | 113 ms | 92x |
-| 3,600 raw readings of 100 series | 32 | **25.8 ms** | 1.06 s | 41x |
-| one reading of 100 series | 32 | **2.67 ms** | 733 ms | 274x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 124 ms | 34x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 652 ms | 9.8x |
+| one day of one series | 1 | **0.079 ms** | 2.73 ms | 35x |
+| one day of one series | 32 | **0.268 ms** | 10.3 ms | 38x |
+| one week of one series | 1 | **0.154 ms** | 8.29 ms | 54x |
+| one week of one series | 32 | **0.554 ms** | 20.0 ms | 36x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 2.17 ms | 60x |
+| 3,600 raw readings of one series | 32 | **0.143 ms** | 8.61 ms | 60x |
+| one reading | 1 | **0.024 ms** | 1.33 ms | 55x |
+| one reading | 32 | **0.086 ms** | 6.42 ms | 75x |
+| one day of 100 series | 1 | **0.927 ms** | 100 ms | 108x |
+| one day of 100 series | 32 | **17.9 ms** | 1.23 s | 69x |
+| one week of 100 series | 1 | **1.56 ms** | 147 ms | 94x |
+| one week of 100 series | 32 | **31.1 ms** | 2.41 s | 77x |
+| 3,600 raw readings of 100 series | 1 | **0.916 ms** | 113 ms | 123x |
+| 3,600 raw readings of 100 series | 32 | **5.45 ms** | 1.06 s | 195x |
+| one reading of 100 series | 32 | **0.865 ms** | 733 ms | 847x |
 
 ## Prometheus
 
-Prometheus v3.15.0, loaded two ways: backfilled with promtool (595 s), and by remote write (10.6 s, tsdb 9.1x
+Prometheus v3.15.0, loaded two ways: backfilled with promtool (595 s), and by remote write (10.6 s, tsdb 9.5x
 faster). Remote write acknowledges from its head without syncing every request.
 
-- **Size:** the median over the 31 data sets is 3.7 times tsdb's (backfilled blocks).
+- **Size:** the median over the 31 data sets is 3.6 times tsdb's (backfilled blocks).
 - **Time-weighted averages and LTTB:** not measured. **Memory:** at most 1.1 GB. **Failures:** none.
 
 | question | clients | tsdb | backfilled | remote write | slower (backfilled) |
 |---|---:|---:|---:|---:|---:|
-| whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 13.7 s | 15.6 s | 1,656x |
-| whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 15.2 s | 17.1 s | 231x |
-| one day of one series | 1 | **0.090 ms** | 15.2 ms | 31.0 ms | 169x |
-| one day of one series | 32 | **0.466 ms** | 47.1 ms | 138 ms | 101x |
-| one week of one series | 1 | **0.125 ms** | 84.1 ms | 107 ms | 673x |
-| 3,600 raw readings of one series | 1 | **0.044 ms** | 0.537 ms | 1.17 ms | 12x |
-| one reading | 1 | **0.032 ms** | 0.213 ms | 0.771 ms | 6.7x |
-| one reading | 32 | **0.237 ms** | 2.88 ms | 9.49 ms | 12x |
+| whole history of 100 series, buckets of 3,600 readings | 1 | **3.7 ms** | 13.7 s | 15.6 s | 3,714x |
+| whole history of 100 series, buckets of 60 readings | 1 | **66.2 ms** | 15.2 s | 17.1 s | 229x |
+| one day of one series | 1 | **0.079 ms** | 15.2 ms | 31.0 ms | 192x |
+| one day of one series | 32 | **0.268 ms** | 47.1 ms | 138 ms | 176x |
+| one week of one series | 1 | **0.154 ms** | 84.1 ms | 107 ms | 546x |
+| 3,600 raw readings of one series | 1 | **0.036 ms** | 0.537 ms | 1.17 ms | 15x |
+| one reading | 1 | **0.024 ms** | 0.213 ms | 0.771 ms | 8.9x |
+| one reading | 32 | **0.086 ms** | 2.88 ms | 9.49 ms | 33x |
 
 ## Size per kind of sensor
 
 Bytes per reading on disk over 31 data sets: 8 generated sensor kinds of 1 million readings each, and 23 real
-sensors from a hydraulic test rig. Each size compared to tsdb's (tsdb = 1x). tsdb is the smallest on all 31.
-Measured on disk format 7; format 8 did not change a part's bytes per row.
+sensors from a hydraulic test rig. Each size compared to tsdb 0.11.0's (tsdb = 1x). tsdb is the smallest on all 31.
+tsdb 0.11.0 was measured on disk format 9 (with UTC hour-cut granules enabled, median **0.80** bytes/reading); the
+other databases' sizes are unchanged from the 0.9.0 release run.
 
 | database | smallest | largest | median |
 |---|---:|---:|---:|
-| **tsdb** | **1x** | **1x** | **1x** |
+| **tsdb 0.11.0** | **1x** | **1x** | **1x** |
 | QuestDB, Parquet ZSTD (converted by hand) | 1.0x | 7.4x | 1.2x |
 | IoTDB, CHIMP + ZSTD | 1.2x | 3.9x | 1.9x |
-| VictoriaMetrics | 1.2x | 2.6x | 2.1x |
-| TDengine, zstd | 1.1x | 5.7x | 2.4x |
+| VictoriaMetrics | 1.1x | 2.6x | 2.0x |
+| TDengine, zstd | 1.1x | 5.5x | 2.4x |
 | ClickHouse, ZSTD(22) after OPTIMIZE FINAL | 1.2x | 4.4x | 2.6x |
 | ClickHouse, its best codecs | 1.2x | 4.8x | 2.9x |
-| IoTDB (default) | 1.3x | 5.4x | 3.1x |
 | TDengine (default) | 1.2x | 9.5x | 3.1x |
-| Prometheus (backfilled) | 1.4x | 6.6x | 3.7x |
+| IoTDB (default) | 1.3x | 5.4x | 3.1x |
+| Prometheus (backfilled) | 1.4x | 6.6x | 3.6x |
 | TimescaleDB (compressed) | 1.9x | 293x | 3.9x |
 | DuckDB | 1.2x | 9.1x | 4.4x |
-| InfluxDB 3 | 4.4x | 977x | 10.3x |
-| InfluxDB 2 | 5.2x | 400x | 20.4x |
-| QuestDB (default format) | 19x | 611x | 56x |
+| InfluxDB 3 | 4.4x | 977x | 10.0x |
+| InfluxDB 2 | 5.1x | 386x | 20.1x |
+| QuestDB (default format) | 19x | 589x | 56x |
 
 The generated sensor kinds, bytes per reading (raw: 12):
 
-| sensor | tsdb | ClickHouse | VictoriaMetrics | QuestDB, Parquet ZSTD | IoTDB, CHIMP + ZSTD | TDengine, zstd | TimescaleDB | InfluxDB 2 |
+| sensor | tsdb 0.11.0 | ClickHouse | VictoriaMetrics | QuestDB, Parquet ZSTD | IoTDB, CHIMP + ZSTD | TDengine, zstd | TimescaleDB | InfluxDB 2 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | disk temperature, 0.1 °C, every 60 s | **0.175** | 0.449 | 0.260 | 1.286 | 0.675 | 0.879 | 51.2 | 34.5 |
-| CPU temperature with spikes, every 1 s | **1.124** | 2.438 | 1.806 | 1.895 | 2.248 | 2.595 | 7.04 | 37.3 |
+| CPU temperature with spikes, every 1 s | **1.168** | 2.438 | 1.806 | 1.895 | 2.248 | 2.595 | 7.04 | 37.3 |
 | tank pressure, 0.001 bar, every 10 s | **0.248** | 1.185 | 0.538 | 0.642 | 0.946 | 1.312 | 9.61 | 35.0 |
 | tank pressure in psi (not rounded) | **2.202** | 3.032 | 5.031 | 3.731 | 2.540 | 2.655 | 16.2 | 36.7 |
-| vibration, 16-bit sensor at 1,000 readings/s | **1.760** | 2.800 | 4.436 | 2.307 | 3.875 | 2.370 | 3.42 | 36.6 |
-| pipeline flow rate, 0.01 m³/h | **1.850** | 3.914 | 3.232 | 2.658 | 3.089 | 3.234 | 6.96 | 37.8 |
-| pipeline flow totalizer, m³ | **0.724** | 2.039 | 0.835 | 2.161 | 1.326 | 1.694 | 5.92 | 36.9 |
-| random numbers | **3.426** | 4.058 | 8.887 | 4.017 | 4.114 | 3.730 | 6.97 | 38.2 |
+| vibration, 16-bit sensor at 1,000 readings/s | **1.761** | 2.800 | 4.436 | 2.307 | 3.875 | 2.370 | 3.42 | 36.6 |
+| pipeline flow rate, 0.01 m³/h | **1.874** | 3.914 | 3.232 | 2.658 | 3.089 | 3.234 | 6.96 | 37.8 |
+| pipeline flow totalizer, m³ | **0.750** | 2.039 | 0.835 | 2.161 | 1.326 | 1.694 | 5.92 | 36.9 |
+| random numbers | **3.435** | 4.058 | 8.887 | 4.017 | 4.114 | 3.730 | 6.97 | 38.2 |
 
 The more regular the sensor, the bigger the gain. Random numbers have no pattern to remove, so every database is
 close there.
@@ -547,25 +549,26 @@ The same 100 million readings in one process, through each library's C API. chDB
 its codecs). DuckDB got its readings sorted by sensor and time first (0.68 s, not counted), so its indexes help it;
 it has no primary key, so a newer reading does not replace an older one with the same time.
 
-| | tsdb | chDB | DuckDB |
+| | tsdb 0.11.0 | chDB | DuckDB |
 |---|---:|---:|---:|
-| load 100 million readings | **0.70 s** (4 threads, synced) | 1.60 s | 3.65 s (4 appenders) |
-| merging afterwards | 0.64 s | 5.05 s (OPTIMIZE FINAL) | 0.02 s (CHECKPOINT) |
-| size on disk | **114 MB** | 219 MB (1.9x) | 306 MB (2.7x) |
+| load 100 million readings | **0.56 s** (4 threads, synced) | 1.60 s | 3.65 s (4 appenders) |
+| merging afterwards | 0.31 s | 5.05 s (OPTIMIZE FINAL) | 0.02 s (CHECKPOINT) |
+| size on disk | **116 MB** | 219 MB (1.9x) | 306 MB (2.6x) |
 
 Median time of one call, one thread (chDB and DuckDB run each query on 32 threads):
 
-| question | tsdb | chDB | DuckDB | slower (the faster of chDB and DuckDB) |
+| question | tsdb 0.11.0 | chDB | DuckDB | slower (the faster of chDB and DuckDB) |
 |---|---:|---:|---:|---:|
-| one day of one sensor | **0.050 ms** | 3.63 ms | 3.63 ms | 73x |
-| one week of one sensor | **0.085 ms** | 4.94 ms | 5.50 ms | 58x |
-| 3,600 raw readings of one sensor | **0.014 ms** | 1.54 ms | 0.826 ms | 59x |
-| one reading | **0.010 ms** | 1.23 ms | 0.715 ms | 72x |
-| time-weighted averages, whole history, hourly | **38.7 ms** | 1,054 ms | 1,820 ms | 27x |
-| LTTB, whole history | **404 ms** | 432 ms | not measured | 1.1x |
+| one day of one sensor | **0.035 ms** | 3.63 ms | 3.63 ms | 104x |
+| one week of one sensor | **0.058 ms** | 4.94 ms | 5.50 ms | 85x |
+| 3,600 raw readings of one sensor | **0.009 ms** | 1.54 ms | 0.826 ms | 92x |
+| one reading | **0.004 ms** | 1.23 ms | 0.715 ms | 179x |
+| time-weighted averages, whole history, hourly | **21.1 ms** | 1,054 ms | 1,820 ms | 50x |
+| LTTB, whole history | **340 ms** | 432 ms | not measured | 1.3x |
 
-With 32 calling threads, one day of one sensor: tsdb 120,182 calls per second, chDB 4,334, DuckDB 2,998. chDB with
-its default LZ4 instead of codecs needs 513 MB.
+With 32 calling threads, one day of one sensor: tsdb 0.11.0 **191,680 calls per second**, chDB 4,334, DuckDB 2,998.
+Whole table in buckets of 60 readings (embedded): **33.1 ms** (3,021 M rows/s) on 1 thread, **11.7 ms**
+(**8,547 M rows/s**) on 32 threads. chDB with its default LZ4 instead of codecs needs 513 MB.
 
 ## Memory
 
@@ -586,8 +589,9 @@ that sets these runs every question once, one after another, so memory left over
 | TimescaleDB | 48 GB | 48.0 / 48.0 GB (ran out) |
 | Prometheus (remote write) | 48 GB | 1.1 / 2.5 GB, the load included |
 
-Including the load, tsdb peaked at 1.9 / 2.0 GB as well. In the timed runs, the most tsdb held was 2.0 GB
-without the file cache (2.2 GB with it). The highest in timed runs elsewhere: ClickHouse 43.1 GB in the batch it
+Including the load, tsdb peaked at 1.9 / 2.0 GB as well in the 0.9.0 memory sweep (not re-run for 0.11.0; across
+all 0.11.0 timed classes, `tsdbd` peaked at 1.86 GB anonymous RSS and 1.99 GB `VmHWM`). In the 0.9.0 timed runs,
+the most tsdb held was 2.0 GB without the file cache (2.2 GB with it). The highest in timed runs elsewhere: ClickHouse 43.1 GB in the batch it
 refused, QuestDB 47.2 GB, TDengine and TimescaleDB 48 GB where they failed. At 100 billion rows, tsdb held at
 most 1.1 GB and ClickHouse 5.9 GB without the file cache; with it, both fill the memory they have, since the data
 is larger than the machine's RAM. The embedded libraries' memory was not measured. Every class's peak, run by run,
@@ -613,6 +617,61 @@ clients, the chart tags the bar.
 
 (\*) Four of its five runs, from their memory files (p2/ts/p6/ts.agg7d.b100.c16.2-5.mem: at most 43.7 GB). The
 fifth reached the 48 GB limit, was killed and run again; the class's row in the tables shows 48.00 GB for it.
+
+## Codec throughput across CPUs (v0.11.0)
+
+Version 0.11.0 adds AVX2/AVX-512 bit-unpacking kernels, faster prefix-sum and decimal reconstruction, and format-9
+encodings (`int-for` frame-of-reference bitpacking for `int64`, `bool-pack` 1-bit/RLE packing for `bool` and `state`,
+`ts-for-bp` for jittery timestamps, and dividing scales). Single-thread throughput (pinned to CPU 0, mean of 5 rounds
+on quiet machines, M values/s) comparing pre-0.11.0 code against v0.11.0:
+
+| benchmark (1 thread, M values/s) | AMD Ryzen 9 7950X (AVX-512) | Intel Xeon Gold 6148 (Skylake, AVX2 kernels) | Intel Xeon E5-2697 v4 (Broadwell, AVX2) |
+|---|---:|---:|---:|
+| bit-unpack kernel (w=1..25) | **18,989–21,163** (5.5–8.6x) | **9,794–10,892** (4.4–8.2x) | **7,099–8,546** |
+| `int_bp` granule decode | **4,710** (2.87x) | **1,998** (2.37x) | **1,667** (1.05x) |
+| float64 decimal decode | **2,437** (1.98x) | **938** (1.67x) | **520** (1.01x) |
+| float64 decimal encode | **1,323** (2.33x) | **544** (2.06x) | **296** |
+| float32 `auto` decode (codec alone) | **3,702** (2.48x) | **1,565** (2.03x) | **1,456** (1.04x) |
+| float32 `auto` encode (codec alone) | **1,061** (1.34x) | **473** (1.25x) | **447** (2.03x) |
+| float32 `auto` decode (+ ZSTD 1) | **2,474** (2.33x) | **1,169** (2.27x) | **1,086** (1.11x) |
+| float32 `auto` encode (+ ZSTD 1) | **446** (1.14x) | **210** (1.11x) | **190** (1.43x) |
+
+Typed compression (`build/type-bench`, 1 thread, after ZSTD 1):
+
+| dataset | type | bits/val (0.9.x -> 0.11.0) | codec (0.11.0) | Ryzen 9 7950X dec M/s | Xeon Gold 6148 dec M/s | Xeon E5-2697 v4 dec M/s |
+|---|---|---:|---|---:|---:|---:|
+| disk temperature, 0.1 °C | float64 | 0.88 -> **0.88** | decimal | **1,346** (1.55x) | **610** (1.40x) | **436** (1.03x) |
+| totalizer in whole liters | int64 | 1.17 -> **0.93** (-20.5%) | `int-for` | **1,590** (3.03x) | **775** (2.84x) | **606** (2.10x) |
+| rate, random 50k–70k | int64 | 16.01 -> **15.09** (-5.7%) | `int-for` | **4,769** (3.12x) | **2,285** (2.67x) | **1,175** (1.19x) |
+| event sequence | int64 | 0.03 -> **0.05** | `int-for` | **5,415** (4.02x) | **2,151** (3.07x) | **1,446** (1.46x) |
+| door, a few changes/hour | bool | 0.06 -> **0.02** (-67%) | `bool-pack` | **12,142** (7.43x) | **4,846** (5.56x) | **4,187** (4.59x) |
+| coin flips | bool | 1.29 -> **1.01** (-21.7%) | `bool-pack` | **10,440** (9.74x) | **4,692** (8.16x) | **3,361** (5.22x) |
+| machine mode (5 states) | state | 0.13 -> **0.06** (-54%) | `bool-pack` | **9,811** (7.86x) | **4,808** (7.42x) | **3,810** (4.99x) |
+
+## Multi-node cluster ingestion (v0.11.0)
+
+Version 0.11.0 adds replicated cluster volumes and native InfiniBand RDMA peer links. Sustained durable writes
+(`tsdbd --cluster --io uring --workers 32`, `fsync` on every batch before acknowledgement, 2 leader volumes per node,
+client drivers on separate hosts over 40 GbE Ethernet, batches of 250,000 rows, 4 pipelined batches per connection,
+12 s sustained, **0 errors** across all runs). Full breakdown: [bench/dbcmp/results/0.11.0.md](bench/dbcmp/results/0.11.0.md).
+
+**4-node homogeneous all-NVMe cluster** (4× dual-socket Intel Xeon Gold 6148, NVMe, 8 volumes):
+
+| configuration | wire | aggregate net throughput | physical replica writes | rows (12 s) | median p50 | max node p99 |
+|---|---|---:|---:|---:|---:|---:|
+| `replication = 3`, 40 GbE TCP | ZSTD | **185.5 M rows/s** | ~556 M/s | 2.25 B | 180.9 ms | 319.2 ms |
+| `replication = 3`, 56 Gbps IB RDMA | ZSTD | **189.9 M rows/s** | ~570 M/s | 2.30 B | 181.9 ms | **228.2 ms** (-29%) |
+| `replication = 3`, 40 GbE TCP | raw | **153.8 M rows/s** | ~461 M/s | 1.87 B | 245.5 ms | 469.0 ms |
+| `replication = 3`, 56 Gbps IB RDMA | raw | **156.1 M rows/s** | ~468 M/s | 1.90 B | 247.3 ms | **286.0 ms** (-39%) |
+
+**5-node mixed-storage cluster** (4× Xeon Gold 6148 NVMe + 1× Xeon E5-2697 v4 SATA SSD, 10 volumes):
+
+| configuration | wire | aggregate net throughput | rows (12 s) | wire bandwidth | notes |
+|---|---|---:|---:|---:|---|
+| `replication = 1`, 40 GbE TCP | ZSTD | **388.5 M rows/s** | 4.69 B | 545 MB/s | 4 NVMe nodes: 352.7 M/s (78.0–97.2 M/s each); SATA SSD node: 35.7 M/s |
+| `replication = 1`, 40 GbE TCP | raw | **352.6 M rows/s** | 4.26 B | 4,035 MB/s (32.3 Gbps) | 4 NVMe nodes: 69.8–91.0 M/s each; SATA SSD node: 25.8 M/s |
+| `replication = 3`, 40 GbE TCP | ZSTD | **132.6 M rows/s** | 1.62 B | 186 MB/s | 2 pure-NVMe leaders: 46.6–48.4 M/s; 3 leaders with SATA replica: 10.9–15.8 M/s |
+| `replication = 3`, 56 Gbps IB RDMA | ZSTD | **132.9 M rows/s** | 1.62 B | 187 MB/s | 2 pure-NVMe leaders: 46.7–48.6 M/s (p99 183–188 ms vs 213 ms TCP) |
 
 ## Login and access control
 

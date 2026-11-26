@@ -21,7 +21,7 @@ values? tsdb is the result. We built it to:
 - **cost less to run** than a ClickHouse cluster: one small program that works
   well with its defaults, and no cluster to look after;
 - **answer time series questions faster**: "the 5-minute averages of this
-  sensor yesterday" takes 0.09 ms, 34 times faster than ClickHouse.
+  sensor yesterday" takes 0.08 ms, 39 times faster than ClickHouse.
 
 We compared it with ClickHouse, InfluxDB, VictoriaMetrics, QuestDB, TimescaleDB
 and others on the same machine and the same data; the numbers are below.
@@ -86,7 +86,7 @@ performance optimizations for different CPU architectures.
 
 ## How it compares
 
-We ran tsdb 0.9.0 and the other databases on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
+We ran **tsdb 0.11.0** (re-measured on disk format 9) against the eleven other databases (0.9.0 release baselines) on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
 time, on the same data, with the same memory limit of 48 GB (InfluxDB 2: 24 GB; it used at most 7.9). Every answer was checked against tsdb's before it was
 timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took than tsdb.
 
@@ -94,7 +94,7 @@ timed. Every timing was repeated 5 times. "slower" says how many times longer th
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/bench-servers-dark.svg">
-  <img src="docs/img/bench-servers-light.svg" width="830" alt="Servers, 100 million readings: tsdb needs 0.78 bytes per reading (ClickHouse 2.51), ingests 85.8 million rows/s (ClickHouse 1.8 times slower, the others 2.6 to 64 times), reads 1,524 million rows/s (the others 5.7 to 685 times slower), runs time-weighted averages in 36.4 ms (29 to 2,423 times slower) and LTTB in 456 ms (ClickHouse 1.2 times slower), and held at most 2.0 GB of memory over the runs that finished (Prometheus 1.1 GB, the others 5.9 to 47.9 GB); at 32 clients ClickHouse, QuestDB and IoTDB refused questions, InfluxDB 3 and TimescaleDB ran out of memory and TDengine failed.">
+  <img src="docs/img/bench-servers-light.svg" width="830" alt="Servers, 100 million readings: tsdb 0.11.0 needs 0.80 bytes per reading (ClickHouse 2.51), ingests 89.9 million rows/s (ClickHouse 1.9 times slower, the others 2.7 to 67 times), reads 1,511 million rows/s (the others 5.7 to 677 times slower), runs time-weighted averages in 23.5 ms (45 to 3,754 times slower) and LTTB in 378 ms (ClickHouse 1.4 times slower), and held at most 2.0 GB of memory over the runs that finished (Prometheus 1.1 GB, the others 5.9 to 47.9 GB); at 32 clients ClickHouse, QuestDB and IoTDB refused questions, InfluxDB 3 and TimescaleDB ran out of memory and TDengine failed.">
 </picture>
 
 - **Size:** bytes on disk per reading, the median over 31 data sets (8 made-up sensor kinds, 23 real sensors).
@@ -118,14 +118,14 @@ is ClickHouse as a library.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/bench-embedded-dark.svg">
-  <img src="docs/img/bench-embedded-light.svg" width="830" alt="Embedded, 100 million readings: tsdb takes 114 MB on disk (chDB 219 MB, DuckDB 306 MB), ingests 144.8 million rows/s (chDB 2.3 and DuckDB 5.3 times slower), reads 1,697 million rows/s (both 71 times slower), runs time-weighted averages in 38.7 ms (27 and 47 times slower) and LTTB in 404 ms (chDB 1.1 times slower).">
+  <img src="docs/img/bench-embedded-light.svg" width="830" alt="Embedded, 100 million readings: tsdb 0.11.0 takes 116 MB on disk (chDB 219 MB, DuckDB 306 MB), ingests 179.3 million rows/s (chDB 2.9 and DuckDB 6.5 times slower), reads 2,465 million rows/s (both 103 times slower), runs time-weighted averages in 21.1 ms (50 and 86 times slower) and LTTB in 340 ms (chDB 1.3 times slower).">
 </picture>
 
 - **Size:** after each library's final merge. **Read:** random days of one sensor in 5-minute buckets, one call
   at a time; tsdb uses one thread per call, chDB and DuckDB 32. Memory was not measured here. DuckDB got its
   readings sorted beforehand (not counted).
 
-**100 billion readings: tsdb and ClickHouse** (10,000 sensors, 10 million readings each, loaded by 8 streams).
+**100 billion readings: tsdb and ClickHouse** (0.9.0 baseline; 10,000 sensors, 10 million readings each, loaded by 8 streams).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/bench-100b-dark.svg">
@@ -134,6 +134,11 @@ is ClickHouse as a library.
 
 - **Read:** the whole table in hourly buckets. Time-weighted averages and LTTB were not measured at this size.
 
+**Cluster ingestion (v0.11.0):** on a 4-node all-NVMe cluster (`replication = 3`, durable `fsync` on), tsdb 0.11.0
+sustains **189.9 M net replicated rows/s** (~570 M physical replica writes/s) over 56 Gbps InfiniBand RDMA
+(**185.5 M rows/s** over 40 GbE TCP, with RDMA cutting max p99 latency by 29%). On a 5-node cluster at
+`replication = 1`, it sustains **388.5 M rows/s** compressed (**352.6 M rows/s** raw at 32.3 Gbps).
+
 Exact numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
 We left out the questions that tsdb answers from the summaries it stores, such as a count over all the data: they
@@ -141,9 +146,10 @@ measure a lookup, not reading data. The test data behaves like real sensors: slo
 fill and drain, a fast vibration sensor, flows with shutdowns, and clocks that are a few milliseconds off.
 
 More in [BENCHMARKS.md](BENCHMARKS.md): every database question by question, time-weighted averages in batches,
-failures and their reasons, memory, and how to run the benchmarks yourself. The release record, with every
-system's settings, is [bench/dbcmp/results/0.9.0.md](bench/dbcmp/results/0.9.0.md), and every single measurement is
-in [bench/dbcmp/results/0.9.0-tables.md](bench/dbcmp/results/0.9.0-tables.md).
+failures and their reasons, memory, v0.11.0 codec throughput across three CPUs, multi-node cluster ingestion, and how
+to run the benchmarks yourself. The v0.11.0 record is [bench/dbcmp/results/0.11.0.md](bench/dbcmp/results/0.11.0.md);
+the full 0.9.0 comparison record is [bench/dbcmp/results/0.9.0.md](bench/dbcmp/results/0.9.0.md) and
+[bench/dbcmp/results/0.9.0-tables.md](bench/dbcmp/results/0.9.0-tables.md).
 
 ## How the compression works
 
@@ -353,7 +359,7 @@ A series gets its type when you create it, and keeps it. Series created without 
 |---|---|---|
 | most sensors: temperatures, pressures, flows, levels (a PLC's REAL, most OPC UA values) | **float32** (the default) | smallest and fastest; about 7 significant digits, more than a sensor delivers |
 | values that need more than 7 significant digits: a totalizer at 12,345,678.9 m³, energy counters, long running sums | **float64** | about 15 significant digits |
-| counters and amounts in a fixed unit: liters, Wh, events | **int64** | exact, sums included; a totalizer in whole liters takes about 1.2 bits per reading |
+| counters and amounts in a fixed unit: liters, Wh, events | **int64** | exact, sums included; a totalizer in whole liters takes under 1 bit per reading (0.93 bits in 0.11.0) |
 | on/off, open/closed | **bool** | |
 | modes and status: "running", "stopped", "fault" | **state** | stored as small codes, with the names kept once |
 

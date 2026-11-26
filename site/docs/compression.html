@@ -101,10 +101,12 @@ one it estimates to be smallest:</p>
 step taken from the first and last time. Store how far each reading is from its grid point. That is just the wobble,
 a few milliseconds.</li>
 <li><strong>Steps.</strong> Store each step minus the smallest step in the granule, with no second subtraction.</li>
+<li><strong>Bit-packed frame-of-reference (v0.11.0).</strong> Bit-pack the grid or step residuals at their exact bit width
+(<code>BLK_TS_FOR_BP</code>) rather than rounding up to whole bytes, which saves bits on noisy clocks while unpacking
+through the same SIMD bit-unpacking kernel.</li>
 </ul>
-<p>Both write whole 1-, 2-, 4- or 8-byte words, the narrowest that fits the largest number, and leave the rest to zstd.
-So the times of a jittery clock are not bit-packed: they are bytes. The layouts are tried only when the block is written
-with zstd on, which by default means the background merge (see <a href="#zstd">zstd</a>).</p>
+<p>The byte-aligned layouts are tried when the block is written with zstd on (by default in background merges);
+the bit-packed layout also works without zstd.</p>
 
 <h2 id="values">Float values: whole-number steps</h2>
 <p>Values are float32 unless you say otherwise (<a href="concepts.html#types">value types</a>). Raw, a float32 takes 32
@@ -213,14 +215,15 @@ float32 first (widened by a collector), a merge stores the block as a float32 bl
 values are fixed steps), but storing the right type from the start is still better: see
 <a href="concepts.html#types">value types</a>. When the values are not fixed steps,
 inserts try Gorilla and byte split; merges also try packed bit delta, ALP_rd and the dictionary.</li>
-<li><strong>int64</strong> goes through the same integer coder as the fixed-step codec: zigzag changes in groups of 1,024
-at a fixed width. It stores plain changes between neighbours, so what a value costs depends on how big the change is, not on how
-steady: a counter that grows by 1 each time costs a few bits, one that grows by about 1,000 needs about 11 bits before
-zstd (a steady increment helps only through zstd), and a group of equal values costs one byte. A group whose changes
-need more than 32 bits is stored with its changes (zigzag) at 64 bits each, not packed.</li>
-<li><strong>bool</strong> and <strong>state</strong> are small whole numbers and use the integer coder too. A door that
-changes a few times an hour, or a machine mode that changes every few minutes, comes down to a fraction of a bit per
-value (see <a href="#numbers">numbers</a>).</li>
+<li><strong>int64</strong> uses either zigzag neighbour changes (<code>int-bp</code>) or, since v0.11.0,
+<strong>frame-of-reference bitpacking</strong> (<code>int-for</code>): for each group of 1,024 values, tsdb subtracts the
+group minimum (or encodes linear/delta residuals) and packs at the exact bit width. A counter that grows steadily, or a
+rate fluctuating within a narrow band (such as 50,000–70,000), drops in both size and decode cost because unpacking runs
+through the SIMD bit-unpacking kernel without a prefix-sum dependency chain. A group of equal values costs one byte.</li>
+<li><strong>bool</strong> and <strong>state</strong> use dedicated packing in v0.11.0 (<code>bool-pack</code>): raw 1-bit
+bitmaps for high-entropy streams like coin flips (1.01 bits/value), or run-length/constant groups for sparse signals
+like doors and machine modes (0.02–0.06 bits/value), decoding at 9.8–12.1 billion values/s per core on AVX-512
+(see <a href="#numbers">numbers</a> and <a href="benchmarks.html#codecs">codec throughput across CPUs</a>).</li>
 </ul>
 
 <h2 id="zstd">zstd, only where it still helps</h2>
@@ -274,9 +277,9 @@ fixed order, and the codecs run in round-to-nearest mode and put the caller's mo
 <h2 id="numbers">Numbers</h2>
 <p>Bits per value after coding and zstd, in granules of 8,192 values, on the generated sensor data of the benchmark tool (<code>tools/datasets.h</code>). A
 float32 takes 32 bits raw. The columns are Gorilla and Chimp (the two well-known methods, for float32) and tsdb's
-automatic choice. Source: <code>build/codec-bench</code> at release 0.9.1;
-<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a> has an
-older run of the same table, with slightly different numbers.</p>
+automatic choice. Source: <code>build/codec-bench</code> at release 0.11.0 (float32 bit rates are unchanged from 0.9.1,
+while v0.11.0 SIMD kernels raised single-thread <code>auto</code> decode + ZSTD from 1,060 to <strong>2,474 M values/s</strong>
+on Ryzen 9 7950X; see <a href="benchmarks.html#codecs">codec throughput across CPUs</a>).</p>
 <div class="table-wrap"><table>
 <thead><tr><th scope="col">Sensor</th><th scope="col" class="num">Gorilla</th><th scope="col" class="num">Chimp</th><th scope="col" class="num">tsdb</th><th scope="col">What tsdb used</th></tr></thead>
 <tbody>
@@ -292,19 +295,20 @@ older run of the same table, with slightly different numbers.</p>
 <p>Random numbers have no pattern to find, so they hardly shrink: that row is the floor. The psi row shows what happens
 when values are no longer steps. The "what tsdb used" column is from the section "How AUTO picks" of
 <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design.md">docs/design.md</a>.</p>
-<p>The other types, in bits per value after zstd, from <code>build/type-bench</code> at release 0.9.1 (the "Value codecs"
-section of <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/AGENTS.md">AGENTS.md</a> has an
-earlier run, with 1.18 and 0.04 for the two int64 rows below):</p>
+<p>The other types, in bits per value after zstd and single-thread decode speed on AMD Ryzen 9 7950X, from
+<code>build/type-bench</code> at <strong>version 0.11.0</strong> (format 9's <code>int-for</code> and
+<code>bool-pack</code> cut bool/state sizes by 22–67% and int64 totalizer size by 21%, while speeding up decoding
+3.0–9.7× compared to 0.9.x):</p>
 <div class="table-wrap"><table>
-<thead><tr><th scope="col">Data</th><th scope="col">Type</th><th scope="col" class="num">Bits per value</th></tr></thead>
+<thead><tr><th scope="col">Data</th><th scope="col">Type</th><th scope="col" class="num">Bits/value (0.9.x → 0.11.0)</th><th scope="col" class="num">Decode (1 thread)</th><th scope="col">Codec (0.11.0)</th></tr></thead>
 <tbody>
-<tr><td>disk temperature, 0.1 °C</td><td>float64</td><td class="num">0.88</td></tr>
-<tr><td>totalizer in whole liters</td><td>int64</td><td class="num">1.17</td></tr>
-<tr><td>a rate, random between 50,000 and 70,000</td><td>int64</td><td class="num">16.01</td></tr>
-<tr><td>an event sequence</td><td>int64</td><td class="num">0.03</td></tr>
-<tr><td>a door, a few changes an hour</td><td>bool</td><td class="num">0.06</td></tr>
-<tr><td>coin flips</td><td>bool</td><td class="num">1.29</td></tr>
-<tr><td>a machine mode of 5 states</td><td>state</td><td class="num">0.13</td></tr>
+<tr><td>disk temperature, 0.1 °C</td><td>float64</td><td class="num">0.88 → <strong>0.88</strong></td><td class="num">1,346 M/s</td><td>decimal</td></tr>
+<tr><td>totalizer in whole liters</td><td>int64</td><td class="num">1.17 → <strong>0.93</strong></td><td class="num">1,590 M/s</td><td>int-for</td></tr>
+<tr><td>a rate, random between 50,000 and 70,000</td><td>int64</td><td class="num">16.01 → <strong>15.09</strong></td><td class="num">4,769 M/s</td><td>int-for</td></tr>
+<tr><td>an event sequence</td><td>int64</td><td class="num">0.03 → <strong>0.05</strong></td><td class="num">5,415 M/s</td><td>int-for</td></tr>
+<tr><td>a door, a few changes an hour</td><td>bool</td><td class="num">0.06 → <strong>0.02</strong></td><td class="num">12,142 M/s</td><td>bool-pack</td></tr>
+<tr><td>coin flips</td><td>bool</td><td class="num">1.29 → <strong>1.01</strong></td><td class="num">10,440 M/s</td><td>bool-pack</td></tr>
+<tr><td>a machine mode of 5 states</td><td>state</td><td class="num">0.13 → <strong>0.06</strong></td><td class="num">9,811 M/s</td><td>bool-pack</td></tr>
 </tbody></table></div>
 <p>All together, on 100 million readings of the seven sensor kinds, each at its own rate: 1.19 bytes per reading in
 all, times and values
