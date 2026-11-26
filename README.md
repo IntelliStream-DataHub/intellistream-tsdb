@@ -578,7 +578,7 @@ the commands.
 
 `export` writes the whole database (or some series) into one file; `import` reads it into another database.
 Use it for backups, to move a database to another disk or machine, and when a new tsdb version cannot open
-the files of an older one (before 1.0 that can happen in a 0.9.x release; the release notes say so):
+the files of an older one (before 1.0 that can happen in a 0.x release; the release notes say so):
 
 ```sh
 build/tsdb /data/sensors export -o sensors.tsdbdump      # with the OLD tsdb; also while tsdbd is running

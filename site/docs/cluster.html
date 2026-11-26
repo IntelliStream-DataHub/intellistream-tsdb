@@ -27,23 +27,29 @@
 <aside class="sidebar" id="sidebar"><nav aria-label="Documentation"><h2>Start</h2><ul><li><a href="index.html">What tsdb is</a></li><li><a href="install.html">Install and build</a></li><li><a href="quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="concepts.html">Concepts</a></li><li><a href="compression.html">Compression</a></li><li><a href="clients.html">Clients</a></li><li><a href="cli.html">Command line</a></li><li><a href="server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="operations.html">Operations</a></li><li><a href="cluster.html" aria-current="page">Cluster (preview)</a></li><li><a href="benchmarks.html">Benchmarks</a></li></ul></nav></aside>
 <main id="main" class="doc">
 <h1>Cluster preview</h1>
-<p class="lead">Release 0.10.0 has the first piece of tsdb's cluster: a small group of servers that agree on who the
-members are. This page sets one up on one machine, looks at it, kills the leader and starts it again. About ten
-minutes.</p>
+<p class="lead">Release 0.11.0 adds replicated and erasure-coded cluster volumes on top of 0.10.0's metadata group.
+This page sets up a small cluster on one machine, creates a volume, kills the leader, starts it again, and
+transfers, moves and resets replicas. About ten minutes.</p>
 
 <h2 id="what">What this is, and what it is not</h2>
 <p>The <strong>metadata group</strong> is a few servers that agree, with the Raft protocol, on a list of facts: which
 servers are <strong>members</strong>, whether they are up or down, which are <strong>voters</strong> (they decide) and
-which only <strong>watch</strong>, and the settings of the cluster. A <strong>witness</strong> is a member with no data:
-it keeps the list and can vote, a cheap third or fifth vote. It also keeps the cluster's users and their grants
-(<a href="#logins">Logins</a>), and has places for volumes, owners, epochs and in-sync sets, which later steps fill.</p>
-<div class="note"><p>It is a <strong>preview</strong>. It <strong>does not copy your data</strong>: a row written to one server stays
-on that server. It <strong>does not fail over</strong>: when a server dies, the group marks it down and nothing takes
-over its data. It does not move volumes. The client port and the protocol work as without <code>--cluster</code>; logins use the
-cluster's users, the same on every server. Do not run it in production. The metadata format and the peer protocol may change in a later 0.x release;
-you then start the cluster again with <code>tsdb cluster init</code>, you do not upgrade it.</p></div>
-<p>Why ship it? The group is the part everything else stands on, and the hardest to get right. It has its own
-simulator, a checker and fault tests, and now you can run it yourself. Without <code>--cluster</code> none of it runs.</p>
+which only <strong>watch</strong>, the cluster's settings, its users and their grants (<a href="#logins">Logins</a>),
+and the places where <strong>volumes</strong>, <strong>owners</strong>, <strong>epochs</strong> and <strong>in-sync
+sets</strong> are kept. A <strong>witness</strong> is a member with no data: it keeps the list and can vote, a cheap
+third or fifth vote.</p>
+<p>With <code>tsdb cluster volume add</code>, the group places a volume on N servers (its <strong>copies</strong>) or
+as an erasure-coded stripe (<code>--redundancy ec=K+M</code>). The leader replicates every write to the in-sync copies
+before answering; when the leader dies, another copy takes over; copies can be moved, leadership transferred, and lost
+disks rebuilt from a snapshot.</p>
+<div class="note"><p>It is still a <strong>0.x preview</strong>. It does not place or move volumes by itself when a
+server is lost for good (you run <code>volume transfer</code>, <code>volume move</code> or <code>replica reset</code>),
+and there is no <code>node drain</code> yet. Clients name the volume (<code>tsdbc_series_at</code>) and may send
+requests to any server. Do not run it in production: the metadata format (version 6) and peer protocol (version 10)
+may change in a later 0.x release; you then start the cluster again with <code>tsdb cluster init</code>, you do not
+upgrade it.</p></div>
+<p>Why ship it? The group and replicated volume path are tested with simulators, checkers and fault injection, and now
+you can run them yourself. Without <code>--cluster</code> none of it runs.</p>
 
 <h2 id="need">What you need</h2>
 <ul>
@@ -335,11 +341,16 @@ agree, up to a moment's delay. A server that has just restarted may show its sav
 <tbody>
 <tr><td><code>node N mode M role R term T leader L commit C applied A</code></td><td>The server you asked. <code>N</code>: its member number (0: in no cluster). <code>M</code>: <code>none</code>, <code>core</code> (it runs a copy of the Raft group: a voter, or a learner on its way to be one) or <code>watch</code> (it follows the group's state without voting). <code>R</code>: <code>follower</code>, <code>pre-candidate</code>, <code>candidate</code> or <code>leader</code> (<code>-</code> outside the group). <code>T</code>: the election term, up by one at every election. <code>L</code>: the leader's number, 0 when it knows none. <code>C</code>, <code>A</code>: how far the log is committed, and how far this server has applied it.</td></tr>
 <tr><td><code>stale ...</code></td><td>The copy this server saved before a restart; no one has confirmed it yet.</td></tr>
-<tr><td><code>cluster UUID replication ...</code></td><td>The cluster's id and its settings (<code>init</code> fixes them).</td></tr>
+<tr><td><code>cluster UUID replication ... mode M failover F read_barrier B lease_s ... restore_gen R</code></td><td>The cluster's id, settings (<code>init</code> fixes them) and restore generation.</td></tr>
 <tr><td><code>group voters 1,2,3 learners -</code></td><td>Who votes, and who is catching up to join the vote.</td></tr>
 <tr><td><code>member N STATE incarnation I addr A peer P rack R heard H ...</code></td><td>One line per member. <code>STATE</code>: <code>up</code> or <code>down</code> (the group also knows <code>draining</code> and <code>out</code>, which nothing sets in the preview). <code>I</code>: how many times it has started. <code>A</code>: where clients reach it. <code>P</code>: where servers reach it. <code>H</code>: how long ago the server you asked last heard from it. <code>voter_ok</code> and <code>volumes_ok</code>: whether it may vote and may hold volumes (a witness has <code>volumes_ok 0</code>). <code>core_dropped 1</code>: its Raft core was dropped after a log fault; it goes on as a watcher.</td></tr>
-<tr><td><code>volume-report ...</code>, <code>domain-report ...</code></td><td>What a member says about its volumes and storage domains. None in the preview: no volumes exist.</td></tr>
-<tr><td><code>volumes N users M</code></td><td>How many volumes and users the group holds. Always 0 in the preview.</td></tr>
+<tr><td><code>replicated lease_ms ...</code></td><td>The settings of replicated volumes (<code>init</code> fixes them).</td></tr>
+<tr><td><code>volume-report ...</code>, <code>domain-report ...</code></td><td>Per member, what it says about its volumes and storage domains.</td></tr>
+<tr><td><code>volume N name V uuid U leader L epoch E min_isr M replicas A,B,C isr ... isr_version I set_version S [preferred P] redundancy ...</code></td><td>One line per cluster volume: its number and name, leader, copies, in-sync set and redundancy (<code>replicas=N</code> or <code>ec=K+M stripe ...</code>).</td></tr>
+<tr><td><code>replica volume N node X rid R open_gen G [replaces Y]</code></td><td>One line per copy: its replica id and open generation (<code>replaces Y</code> while a move is in progress).</td></tr>
+<tr><td><code>volumes N users M</code></td><td>How many volumes and users the group holds.</td></tr>
+<tr><td><code>transfers started ...</code>, <code>moves started ...</code></td><td>Leadership transfer and copy move counters from the start of the server you ask.</td></tr>
+<tr><td><code>peer links KIND: ...</code></td><td>Active data-link counts by kind, check level (<code>none</code>, <code>header</code>, <code>full</code>) and transport (<code>tcp</code>, <code>rdma</code>).</td></tr>
 </tbody></table></div>
 <p>How many voters? One with one or two members, three with three or four, five with five or more (at most
 <code>--voters</code>). A member that does not vote watches.</p>
@@ -401,10 +412,16 @@ before.</p>
 <tr><td><code>tsdb cluster secret FILE</code></td><td>Make a new secret: 32 random bytes as hex, mode 0600. Never overwrites a file.</td></tr>
 <tr><td><code>tsdb cluster init PEER --secret-file F [options]</code></td><td>Make the cluster on one server that is in no cluster yet. It becomes node 1 and the leader. The options fix the settings.</td></tr>
 <tr><td><code>tsdb cluster node add PEER NEW_PEER --secret-file F</code></td><td>Add the server at <code>NEW_PEER</code> (running with <code>--cluster</code>, in no cluster yet). <code>PEER</code> is any member; the command follows to the leader. Adding a member again does no harm.</td></tr>
+<tr><td><code>tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M] --secret-file F</code></td><td>Add a replicated or erasure-coded cluster volume and open it on the chosen members.</td></tr>
+<tr><td><code>tsdb cluster volume transfer|move|force-leader|gc resume ...</code></td><td>Hand over leadership, move a copy in the background, force a leader, or resume EC orphan collection.</td></tr>
+<tr><td><code>tsdb cluster replica reset PEER VOLUME NODE --secret-file F</code></td><td>Give a lost or untrusted copy a new replica id and rebuild it from a snapshot.</td></tr>
+<tr><td><code>tsdb cluster user add|passwd|drop|grant|revoke|list|import ...</code></td><td>Manage cluster-wide users and grants, or import local <code>USERS</code> files.</td></tr>
 <tr><td><code>tsdb cluster status PEER --secret-file F</code></td><td>What that server knows (see above).</td></tr>
 </tbody></table></div>
-<p>Options of <code>init</code>; each number is a whole number above 0. The settings are stored and shown; in the preview
-nothing acts on those about volumes and failover yet.</p>
+<p>Options of <code>init</code>; each number is a whole number above 0. Settings for replication, leases, rebuilds and
+transfers are acted on; those for shared mode (<code>--mode shared</code>, <code>--failover</code>,
+<code>--lease-s</code>, <code>--read-barrier</code>), <code>--out-after-s</code> and <code>--volumes-per-server</code>
+are only stored.</p>
 <div class="table-wrap"><table>
 <thead><tr><th scope="col">Option</th><th scope="col">Default</th><th scope="col">What it does</th></tr></thead>
 <tbody>
@@ -412,7 +429,7 @@ nothing acts on those about volumes and failover yet.</p>
 <tr><td><code>--min-isr N</code></td><td>1</td><td>Copies that must be in sync for a write to count. At most <code>--replication</code>.</td></tr>
 <tr><td><code>--node-timeout-ms MS</code></td><td>3000</td><td>A server is marked down after this long without a heartbeat.</td></tr>
 <tr><td><code>--heartbeat-ms MS</code></td><td>500</td><td>How often servers report. Below <code>--node-timeout-ms</code>.</td></tr>
-<tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set. Stored; nothing acts on it in the preview.</td></tr>
+<tr><td><code>--isr-lag-ms MS</code></td><td>1000</td><td>A copy this far behind leaves the in-sync set, and comes back once it has caught up.</td></tr>
 <tr><td><code>--out-after-s S</code></td><td>1800</td><td>A server down this long is marked <code>out</code>. Stored; in the preview no server is ever marked <code>out</code>.</td></tr>
 <tr><td><code>--voter-replace-s S</code></td><td>600</td><td>A voter down this long is replaced by another member.</td></tr>
 <tr><td><code>--voters N</code></td><td>5</td><td>The most voters the group has (an even number counts as one less).</td></tr>
@@ -422,8 +439,8 @@ nothing acts on those about volumes and failover yet.</p>
 <tr><td><code>--read-barrier on|off</code></td><td>on</td><td>Owners answer reads only behind a fenced write (shared mode).</td></tr>
 <tr><td><code>--lease-s S</code></td><td>10</td><td>The lease of a shared volume.</td></tr>
 </tbody></table></div>
-<p>The designs list more commands (<code>node drain</code> and <code>out</code>, <code>volume add</code> and
-<code>move</code>, <code>user</code>, <code>restore</code>, <code>adopt</code>). They are not built.</p>
+<p>The designs list more commands (<code>node drain</code> and <code>out</code>, <code>restore</code>, <code>adopt</code>).
+They are not built: <code>tsdb cluster</code> prints what exists.</p>
 
 <h2 id="next">What's next</h2>
 <p>The designs are written; the work goes in this order:</p>
@@ -432,11 +449,12 @@ nothing acts on those about volumes and failover yet.</p>
 requests, and names that are unique across the cluster. The group's state machine (S1) and what a single server does
 while its storage is away (UNAVAILABLE, N1) are already in 0.10.0, and users and grants kept in the group are in this
 preview; the rules for ownership and time come with N7.</li>
+<li><strong>Replicated mode (R1 to R4) and erasure coding (R5 to R8) are built</strong>: each volume on servers with their own
+disks, with replication, the in-sync set, promotion, transfer, move, snapshot rebuild, and erasure-coded settled
+parts. Raft stays off the insert path.</li>
 <li><strong>Shared mode</strong> (N0, N2 to N8): a go/no-go measurement (N0), then failover on NFS storage with one writer per volume, fenced by the group.
 Production on NFSv4 needs this first.</li>
-<li><strong>Replicated mode</strong> (R1 to R4): each volume on three servers with their own disks, with replication,
-the in-sync set, promotion and rebuild. Raft stays off the insert path.</li>
-<li>Then clients that talk to the owner directly, and a cold tier.</li>
+<li>Then clients that talk to the volume leader directly, and device classes / storage tiers (R10, R14).</li>
 </ul>
 <p>Read more on GitHub:
 <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/design-ha-modes.md">design-ha-modes.md</a>

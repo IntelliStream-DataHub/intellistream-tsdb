@@ -30,7 +30,7 @@ directory) and `path`.
 
 | metric | type | meaning |
 |---|---|---|
-| `tsdb_build_info{version,build,simd,cpu_level}` | gauge | always 1; `version` is the release (0.9.0), `build` the git describe of the build; `cpu_level` is `native`, or the codec level of a portable build |
+| `tsdb_build_info{version,build,simd,cpu_level}` | gauge | always 1; `version` is the release (e.g. 0.11.0), `build` the git describe of the build; `cpu_level` is `native`, or the codec level of a portable build |
 | `tsdb_io_backend_info{backend}` | gauge | `io_uring` or `epoll` |
 | `tsdb_role_info{role}` | gauge | `writer`, `read-only` or `follower` |
 | `tsdb_start_time_seconds` | gauge | Unix time of the start |
@@ -47,7 +47,7 @@ directory) and `path`.
 | `tsdb_ts_bytes`, `tsdb_value_bytes`, `tsdb_index_bytes`, `tsdb_other_bytes` | gauge | where the part bytes go: compressed timestamps, compressed values, granule index entries, and headers, footers, tombstones and the fixed part of each index |
 | `tsdb_stats_parts_counted`, `tsdb_stats_parts_listed` | gauge | parts the statistics sweeper has counted, and parts listed: the five numbers above are exact once the two are equal (they differ for a moment after a flush or merge, or for a while after the open of a large database) |
 | `tsdb_stats_ring_overflows_total`, `tsdb_stats_cpu_seconds_total` | counter | part events the sweeper's ring dropped (it then compared its records with the part list: still exact, just later), and the CPU time of the sweeper thread |
-| `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors and tsdbd exits; alert on it |
+| `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors; alert on it. A root failure, a failure on a volume outside `--health-domain` and not in a cluster, or an unreported failure exits tsdbd; volumes under `--health-domain` recover in place and cluster volumes are quiesced while tsdbd keeps serving other volumes |
 | `tsdb_volume_diverged` | gauge | 1 while the volume is DIVERGED (its DIVERGED file, written when a settled copy failed its digest or a cold apply met a part above Z, or an outage reopen that found acknowledged data gone): refused with UNAVAILABLE (DIVERGED), out of a cluster volume's ISR (`LOCAL_FAULT`), until an operator acts (`tsdb DIR volume diverged`; `--clear` is refused on cluster volumes — use `tsdb cluster replica reset` to rebuild the replica); alert on it |
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |
 | `tsdb_queries_total` | counter | outermost queries the engine ran, all volumes (a QUERY_MULTI counts once). 0 with `--no-stats`; the `tsdb_query_*_total` families too |

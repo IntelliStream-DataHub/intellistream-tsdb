@@ -27,7 +27,7 @@ Edit `VERSION`, then the other places that must say the same:
   that depends on the client; `cargo build --locked` there fails when it still names the old version)
 - `client/java/pom.xml`, `client/java-embedded/pom.xml` (its version and its dependency on `tsdb-client`),
   `connectors/pulsar/pom.xml` (its version and `tsdb-client.version`)
-- the version in the READMEs' jar names (`grep -rn "tsdb-client-0\." --include=*.md .`)
+- the version in the READMEs' jar and nar names (`grep -rnE "tsdb-(client|embedded|pulsar-sink)-0\." --include=*.md .`)
 
 Then `make check-version`. It compares all of them with `VERSION`, and with what `build/tsdbd --version`
 and `build/tsdb --version` print; `make test` runs it too.
