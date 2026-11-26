@@ -1602,14 +1602,15 @@ bit-packed per vector of 1024 values, and competes with two specialized kinds:
   optional base (mode 0: 1 bit/val raw for coin flips, 2 bits/val with nulls)
   and varint RLE `(uvarint32 val, uvarint32 run_len - 1)` (mode 1: long steady
   runs such as door contacts and machine modes), avoiding ZSTD entropy decoding.
-- **`BLK_TS_FOR_BP` (kind 20, `src/codec.c`)**: for jittered or irregular
-  timestamps, per-vector (1024 values) bit-packed frame-of-reference over grid
-  residuals (mode 0, using a nearest-integer rounded grid step and per-vector
-  base to track local drift) or deltas (mode 1). Competes in `block_encode_ts()`
-  with DoubleDelta, `BLK_TS_GRID` and `BLK_TS_DELTA` under the timestamp 1/8
-  ZSTD saving rule (`blk_zstd_min_saving`), keeping jittered clocks uncompressed
-  at their exact bit width (e.g. 6 bits at +-20 ms, 9 bits at +-200 ms) for
-  2-3x faster sorted decoding.
+
+**Jittered timestamps**: **`BLK_TS_FOR_BP` (kind 20, `src/codec.c`)** stores
+per-vector (1024 values) bit-packed frame-of-reference over grid residuals
+(mode 0, using a nearest-integer rounded grid step and per-vector base to track
+local drift) or deltas (mode 1). It competes in `block_encode_ts()` with
+DoubleDelta, `BLK_TS_GRID` and `BLK_TS_DELTA` under the timestamp 1/8 ZSTD
+saving rule (`blk_zstd_min_saving`), keeping jittered clocks uncompressed at
+their exact bit width (e.g. 6 bits at +-20 ms, 9 bits at +-200 ms) for 2-3x
+faster sorted decoding.
 
 `build/type-bench` measures these: a totalizer in liters 0.93 bits a value,
 random 50k-70k rates 15.09, a sequence 0.05, a door contact sampled at 1 Hz

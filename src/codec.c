@@ -543,9 +543,12 @@ static int dec_pick_scale(const float *in, size_t n, bool compact)
                 int e = DEC_NEG_DEC_OFF + f - 1;
                 double cb = dec_sample_cost(in, n, e, true);
                 if (cb < best_bits - 1e-9) {
-                    best_bits = cb;
-                    best_e = e;
-                    best = dec_sample_cost(in, n, e, false);
+                    double c = dec_sample_cost(in, n, e, false);
+                    if (c < 4.5) {
+                        best_bits = cb;
+                        best_e = e;
+                        best = c;
+                    }
                 }
             }
             for (int b = 1; b <= DEC_NNEG_BIN && best_bits > 0.0; b++) {
@@ -554,9 +557,12 @@ static int dec_pick_scale(const float *in, size_t n, bool compact)
                 int e = DEC_NEG_BIN_OFF + b - 1;
                 double cb = dec_sample_cost(in, n, e, true);
                 if (cb < best_bits - 1e-9) {
-                    best_bits = cb;
-                    best_e = e;
-                    best = dec_sample_cost(in, n, e, false);
+                    double c = dec_sample_cost(in, n, e, false);
+                    if (c < 4.5) {
+                        best_bits = cb;
+                        best_e = e;
+                        best = c;
+                    }
                 }
             }
         }
