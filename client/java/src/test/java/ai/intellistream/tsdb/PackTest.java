@@ -116,4 +116,96 @@ class PackTest {
         assertEquals(1 * (10 + 1) + 10, Pack.rawBound(1, ValueType.BOOL, false, true));
         assertEquals(1 * (10 + 4) + (1 + 7) / 8 + 10, Pack.rawBound(1, ValueType.FLOAT32, true, true));
     }
+
+    /** Naive byte-plane reference for Pack.reshape, to check the tiled transpose bit for bit. */
+    private static byte[] refReshape(long[] ts, Column col, long[] series, int off, int n) {
+        byte[] valid = Values.validity(col, off, n);
+        byte[] out = new byte[(int) Pack.rawBound(n, col.type(), valid != null, series != null)];
+        int o = 0;
+        long prev = 0;
+        for (int i = off, end = off + n; i < end; i++) {
+            long t = ts[i];
+            o = Pack.putVarint(out, o, Pack.zigzag(t - prev));
+            prev = t;
+        }
+        switch (col.type()) {
+        case FLOAT32:
+            for (int b = 0; b < 4; b++, o += n)
+                for (int i = 0; i < n; i++)
+                    out[o + i] = (byte) (Float.floatToRawIntBits(col.floats[off + i]) >>> (8 * b));
+            break;
+        case STATE:
+            for (int b = 0; b < 4; b++, o += n)
+                for (int i = 0; i < n; i++)
+                    out[o + i] = (byte) (col.states[off + i] >>> (8 * b));
+            break;
+        case FLOAT64:
+            for (int b = 0; b < 8; b++, o += n)
+                for (int i = 0; i < n; i++)
+                    out[o + i] = (byte) (Double.doubleToRawLongBits(col.doubles[off + i]) >>> (8 * b));
+            break;
+        case INT64:
+            for (int b = 0; b < 8; b++, o += n)
+                for (int i = 0; i < n; i++)
+                    out[o + i] = (byte) (col.longs[off + i] >>> (8 * b));
+            break;
+        default:
+            for (int i = 0; i < n; i++)
+                out[o + i] = (byte) (col.bools[off + i] ? 1 : 0);
+            o += n;
+            break;
+        }
+        if (valid != null) {
+            System.arraycopy(valid, 0, out, o, valid.length);
+            o += valid.length;
+        }
+        if (series != null) {
+            long ps = 0;
+            for (int i = off, end = off + n; i < end; i++) {
+                long s = series[i];
+                o = Pack.putVarint(out, o, Pack.zigzag(s - ps));
+                ps = s;
+            }
+        }
+        return Arrays.copyOf(out, o);
+    }
+
+    @Test
+    void bitExactAcrossTileBoundaries() {
+        int max = 3008;
+        long r = 0x9e3779b97f4a7c15L;
+        long[] ts = new long[max];
+        float[] f32 = new float[max];
+        double[] f64 = new double[max];
+        long[] i64 = new long[max];
+        boolean[] bools = new boolean[max];
+        int[] states = new int[max];
+        long[] sids = new long[max];
+        BitSet nulls = new BitSet();
+        for (int i = 0; i < max; i++) {
+            r = r * 6364136223846793005L + 1442695040888963407L;
+            ts[i] = i % 17 == 0 ? r : 1_700_000_000_000L + (long) i * 1000L;
+            f32[i] = i % 13 == 0 ? Float.intBitsToFloat(0x7fc01001 ^ (i & 0xff)) : Float.intBitsToFloat((int) r);
+            f64[i] = i % 13 == 0 ? Double.longBitsToDouble(0x7ff8000000001001L ^ (i & 0xff)) : Double.longBitsToDouble(r);
+            i64[i] = r;
+            bools[i] = (r & 1) != 0;
+            states[i] = (int) (r >>> 32);
+            sids[i] = r ^ i;
+            if (((r >>> 7) & 1) != 0)
+                nulls.set(i);
+        }
+        Column[] cols = {
+            Column.ofBools(bools), Column.ofFloats(f32).withNulls(nulls), Column.ofStates(states),
+            Column.ofDoubles(f64).withNulls(nulls), Column.ofLongs(i64)
+        };
+        int[] sizes = {0, 1, 2, 7, 8, 15, 16, 17, 63, 64, 65, 1023, 1024, 1025, 2047, 2048, 2049, 3000};
+        for (int si = 0; si < sizes.length; si++) {
+            int n = sizes[si];
+            int off = (si & 1) == 0 ? 0 : 8;
+            long[] ser = (si & 2) != 0 ? sids : null;
+            for (Column col : cols)
+                assertArrayEquals(refReshape(ts, col, ser, off, n), reshape(ts, col, ser, off, n),
+                        col.type() + " n=" + n + " off=" + off);
+        }
+    }
 }

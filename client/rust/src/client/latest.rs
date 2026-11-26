@@ -103,15 +103,36 @@ impl Client {
         out: &mut [Option<Latest>],
     ) -> Result<()> {
         let refused = |s: &Status| matches!(s, Status::NotFound | Status::Denied | Status::Invalid);
+        let mut batch = Vec::new();
         for window in misses.chunks(NAME_WINDOW) {
             self.wait_inner()?;
+            self.trim();
+            batch.clear();
             let mut sent = Vec::with_capacity(window.len());
             for &i in window {
-                match self.series_send(names[i], false, None) {
-                    Ok(()) => sent.push(i),
+                match wire_str("series name", names[i], false) {
+                    Ok(name) => {
+                        let flen = (5 + 3 + name.len()) as u32;
+                        batch.extend_from_slice(&flen.to_le_bytes());
+                        batch.extend_from_slice(&self.next_id.to_le_bytes());
+                        batch.push(Op::Series as u8);
+                        batch.push(0); // create = false
+                        batch.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                        batch.extend_from_slice(name);
+                        self.next_id = self.next_id.wrapping_add(1);
+                        sent.push(i);
+                    }
                     Err(Error::InvalidArgument(_)) => out[i] = Some(Latest::missing(Status::Invalid)),
                     Err(e) => return Err(e),
                 }
+            }
+            if !batch.is_empty() {
+                // Coalesce the window's SERIES frames into one contiguous write (no per-name write_all or kept
+                // copy: any UNAVAILABLE/MOVED reply is retried individually below via series_req).
+                self.last_op = Op::Series as u8;
+                let mut s: &TcpStream = self.stream.get_ref();
+                s.write_all(&batch)?;
+                self.bytes_sent += batch.len() as u64;
             }
             let (mut again, mut first) = (Vec::new(), None);
             for &i in &sent {
@@ -233,7 +254,7 @@ impl Client {
 
     /// Sends a request and leaves its reply to the caller (a streamed one).
     fn request_begin(&mut self, op: Op, build: impl FnOnce(&mut FrameBuf)) -> Result<()> {
-        build(self.req.begin(self.next_id, op));
+        build(self.req_begin(op));
         self.send()
     }
 }

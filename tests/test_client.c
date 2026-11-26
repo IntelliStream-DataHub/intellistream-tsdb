@@ -773,9 +773,135 @@ static void test_pack_wide_ids(void)
     }
 }
 
+/* Naive scalar reference for tsdb_pack_reshape: must match the tiled/SSE2 implementation bit for bit. */
+static size_t ref_pack_reshape(size_t n, unsigned type, const int64_t *ts, const void *values, const uint8_t *valid,
+                               const uint64_t *series, uint8_t *out)
+{
+    uint8_t *o = out;
+    int64_t prev = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t z = ((uint64_t)((int64_t)((uint64_t)ts[i] - (uint64_t)prev)) << 1) ^
+                     (uint64_t)(((int64_t)((uint64_t)ts[i] - (uint64_t)prev)) >> 63);
+        while (z >= 0x80) {
+            *o++ = (uint8_t)(z | 0x80);
+            z >>= 7;
+        }
+        *o++ = (uint8_t)z;
+        prev = ts[i];
+    }
+    unsigned w = tsdb_wire_width(type);
+    const uint8_t *v = values;
+    for (unsigned b = 0; b < w; b++, o += n)
+        for (size_t i = 0; i < n; i++)
+            o[i] = v[i * w + b];
+    if (valid) {
+        memcpy(o, valid, (n + 7) / 8);
+        o += (n + 7) / 8;
+    }
+    if (series) {
+        uint64_t ps = 0;
+        for (size_t i = 0; i < n; i++) {
+            int64_t d = (int64_t)(series[i] - ps);
+            uint64_t z = ((uint64_t)d << 1) ^ (uint64_t)(d >> 63);
+            while (z >= 0x80) {
+                *o++ = (uint8_t)(z | 0x80);
+                z >>= 7;
+            }
+            *o++ = (uint8_t)z;
+            ps = series[i];
+        }
+    }
+    return (size_t)(o - out);
+}
+
+/* Bit-exact reshape + unshape across all wire types (w=1, 4, 8) and edge/tile/SIMD boundary sizes. */
+static void test_pack_bit_exact(void)
+{
+    static const unsigned types[] = {TSDB_BOOL, TSDB_FLOAT32, TSDB_STATE, TSDB_FLOAT64, TSDB_INT64};
+    static const size_t sizes[] = {0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+                                   1023, 1024, 1025, 2047, 2048, 2049, 4096, 4097};
+    uint64_t r = 0x9e3779b97f4a7c15ULL;
+    for (size_t ti = 0; ti < sizeof types / sizeof types[0]; ti++) {
+        unsigned type = types[ti];
+        unsigned w = tsdb_wire_width(type);
+        for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            size_t n = sizes[si];
+            int valid = (si & 1) != 0;
+            int many = (si & 2) != 0;
+            size_t vb = (n + 7) / 8;
+            int64_t *ts = malloc((n ? n : 1) * sizeof *ts);
+            int64_t *ts2 = malloc((n ? n : 1) * sizeof *ts2);
+            uint8_t *v = malloc(n ? n * w : 1);
+            uint8_t *v2 = malloc(n ? n * w : 1);
+            uint8_t *bits = calloc(vb ? vb : 1, 1);
+            uint8_t *bits2 = calloc(vb ? vb : 1, 1);
+            uint64_t *sv = malloc((n ? n : 1) * sizeof *sv);
+            uint64_t *sv2 = malloc((n ? n : 1) * sizeof *sv2);
+            for (size_t i = 0; i < n; i++) {
+                r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+                ts[i] = (i % 19 == 0) ? (int64_t)r : 1700000000000LL + (int64_t)i * 1000;
+                for (unsigned b = 0; b < w; b++)
+                    v[i * w + b] = (uint8_t)(r >> (8 * b));
+                if (type == TSDB_BOOL)
+                    v[i] &= 1;
+                if (type == TSDB_FLOAT32 && i % 13 == 0) {
+                    uint32_t nanbits = 0x7fc01001u ^ (uint32_t)(i & 0xff);
+                    memcpy(v + i * 4, &nanbits, 4);
+                } else if (type == TSDB_FLOAT64 && i % 13 == 0) {
+                    uint64_t nanbits = 0x7ff8000000001001ULL ^ (uint64_t)(i & 0xff);
+                    memcpy(v + i * 8, &nanbits, 8);
+                }
+                if (valid && ((r >> 11) & 1))
+                    bits[i / 8] |= (uint8_t)(1u << (i % 8));
+                sv[i] = (i % 3 == 0) ? UINT64_MAX - i : (r ^ (uint64_t)i);
+            }
+            size_t bound = tsdb_pack_raw_bound(n, type, valid, many);
+            uint8_t *got = malloc(bound + 1);
+            uint8_t *want = malloc(bound + 1);
+            size_t glen = tsdb_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, got);
+            size_t wlen = ref_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, want);
+            CHECK(glen == wlen && glen <= bound);
+            if (glen == wlen && glen > 0)
+                CHECK(memcmp(got, want, glen) == 0);
+            memset(ts2, 0xaa, (n ? n : 1) * sizeof *ts2);
+            memset(v2, 0x55, n ? n * w : 1);
+            memset(bits2, 0xcc, vb ? vb : 1);
+            memset(sv2, 0x33, (n ? n : 1) * sizeof *sv2);
+            CHECK(tsdb_pack_unshape(got, glen, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                    many ? sv2 : NULL) == 0);
+            if (n) {
+                CHECK(memcmp(ts, ts2, n * sizeof *ts) == 0);
+                CHECK(memcmp(v, v2, n * w) == 0);
+                if (valid)
+                    CHECK(memcmp(bits, bits2, vb) == 0);
+                if (many)
+                    CHECK(memcmp(sv, sv2, n * sizeof *sv) == 0);
+            }
+            if (glen) {
+                CHECK(tsdb_pack_unshape(got, glen - 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                        many ? sv2 : NULL) != 0);
+                got[glen] = 0;
+                CHECK(tsdb_pack_unshape(got, glen + 1, n, type, valid, many, ts2, v2, valid ? bits2 : NULL,
+                                        many ? sv2 : NULL) != 0);
+            }
+            free(ts);
+            free(ts2);
+            free(v);
+            free(v2);
+            free(bits);
+            free(bits2);
+            free(sv);
+            free(sv2);
+            free(got);
+            free(want);
+        }
+    }
+}
+
 int main(void)
 {
     th_watchdog("test_client", 1200);
+    test_pack_bit_exact();
     test_pack_wide_ids();
     test_wide_ids();
     test_timeout_breaks_connection();
