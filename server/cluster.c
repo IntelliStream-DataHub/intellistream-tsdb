@@ -6038,16 +6038,25 @@ static void vol_watch_duty(void)
 }
 
 /* REPLICA_OPEN (§8.5): a replica raises its directory's generation at every open and reports it; the leader commits
- * it, and the replica serves only once its copy shows the generation. A proposal is retried once a second while the
- * report stays above the record (a lost leadership or a full pipeline drops it); the apply refuses a stale one. */
-static uint64_t opens_ns;
+ * it, and the replica serves only once its copy shows the generation. Each replica's proposal is retried once a second
+ * while the report stays above the record (a lost leadership or a full pipeline drops it), while a newly reported
+ * generation is proposed on the next duty tick; the apply refuses a stale one. */
+#define OPEN_RETRY_NS (1000 * MS)
+#define OPEN_SENT_CAP (CLUSTER_REPORT_VOLS * META_REPLICAS_MAX)
+struct open_sent {
+    uint32_t volume, node;
+    uint64_t term, rid, open_gen, open_nonce, ns;
+};
+static struct open_sent open_sent[OPEN_SENT_CAP];
+static uint32_t nopen_sent, open_sent_rot;
+
 static void propose_opens(uint64_t now)
 {
-    if (since(now, opens_ns) < 1000 * MS && opens_ns)
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
         return;
-    opens_ns = now;
     if (C.hold_opens && access(C.holdopensfile, F_OK) == 0)
         return; /* tests: a replica that opened before the group recorded its generation is caught here */
+    uint64_t term = raft_get_term(C.r);
     static struct cluster_report own;
     int have_own = 0;
     for (uint32_t i = 0; i < C.sm.nvolumes && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
@@ -6075,12 +6084,27 @@ static void propose_opens(uint64_t now)
             }
             if (!vr || vr->rid != rp->rid || vr->open_gen <= rp->open_gen)
                 continue;
+            struct open_sent *s = NULL;
+            for (uint32_t j = 0; j < nopen_sent && !s; j++)
+                if (open_sent[j].volume == v->number && open_sent[j].node == rp->node)
+                    s = &open_sent[j];
+            if (s && s->term == term && s->rid == rp->rid && s->open_gen == vr->open_gen &&
+                s->open_nonce == vr->open_nonce && since(now, s->ns) < OPEN_RETRY_NS)
+                continue;
             struct meta_entry e;
             meta_entry_init(&e);
             meta_op_replica_open(&e, v->number, rp->node, rp->rid, vr->open_gen, vr->open_nonce);
-            if (propose(&e, 0, 0, 0) == ISO_OK)
+            if (propose(&e, 0, 0, 0) == ISO_OK) {
+                if (!s) {
+                    if (nopen_sent < OPEN_SENT_CAP)
+                        s = &open_sent[nopen_sent++];
+                    else
+                        s = &open_sent[open_sent_rot++ % OPEN_SENT_CAP];
+                }
+                *s = (struct open_sent){v->number, rp->node, term, rp->rid, vr->open_gen, vr->open_nonce, now};
                 say("proposes volume %" PRIu32 " replica on node %" PRIu32 " open generation %" PRIu64, v->number,
                     rp->node, vr->open_gen);
+            }
         }
     }
 }

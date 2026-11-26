@@ -760,6 +760,7 @@ static void node_add(int via, int newi)
 
 static uint32_t init_min_isr; /* nonzero: INIT's min_isr (the volumes' min_isr, at most their replicas) */
 static uint32_t init_node_timeout_ms; /* > 0: init_mode sets node_timeout to this instead of 1.5 s */
+static uint32_t init_heartbeat_ms;    /* > 0: init_mode sets heartbeat_ms to this instead of 200 ms */
 static uint32_t init_retain_s; /* nonzero: INIT's repl_retain_s */
 static int init_r4_set; /* nonzero: INIT's four settings of R4 off their defaults (snapversion reads them back) */
 static uint32_t init_isr_lag_ms; /* nonzero: INIT's isr_lag_ms */
@@ -783,7 +784,7 @@ static void init_mode(int i, uint32_t replace_s, int mode)
     if (init_rebuild_max)
         s.rebuild_max = init_rebuild_max;
     s.node_timeout_ms = init_node_timeout_ms ? init_node_timeout_ms : 1500;
-    s.heartbeat_ms = 200;
+    s.heartbeat_ms = init_heartbeat_ms ? init_heartbeat_ms : 200;
     s.voter_replace_s = replace_s;
     if (init_transfer_wait_ms)
         s.transfer_wait_ms = init_transfer_wait_ms;
@@ -20685,6 +20686,77 @@ static void scen_rdma(void)
            di.spec[0] ? di.spec : "auto-ib", 150 + BIG);
 }
 
+/* openfast: a restarted replica reports its new open_gen promptly (cluster_beat_soon in cvol.c:prepare) instead of
+ * waiting a full heartbeat_ms, and the Raft leader proposes REPLICA_OPEN for a newly reported replica on the next duty
+ * tick instead of blocking behind a global 1 s opens_ns throttle from another replica's earlier proposal. */
+static void scen_openfast(void)
+{
+    scenario("openfast");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_heartbeat_ms = 3000;
+    init_node_timeout_ms = 15000;
+    init_cluster(0, 600);
+    init_heartbeat_ms = 0;
+    init_node_timeout_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+    uint32_t num;
+    int rc = vol_add(0, "fast", 3, &num);
+    if (rc != 0 || num != 1)
+        die("volume add fast: %s, number %" PRIu32, cluster_strerror(rc), num);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "fast", i, 1, 0);
+    /* Kill both followers so the second restart runs immediately after the first's REPLICA_OPEN proposal. */
+    stop(1, SIGKILL);
+    stop(2, SIGKILL);
+    struct timespec w20 = {0, 20000000}, w50 = {0, 50000000};
+    start(1);
+    await_log_count(1, "open generation 2, waiting", 1, 15000);
+    uint64_t t1 = now_ms();
+    for (;;) {
+        struct meta_volume v;
+        const struct meta_replica *r;
+        if (vol_rec(0, "fast", &v) && (r = rep_of(&v, 1)) && r->open_gen >= 2)
+            break;
+        if (now_ms() - t1 > 15000)
+            die("node 1 never recorded open_gen 2 within 15 s");
+        nanosleep(&w20, NULL);
+    }
+    uint64_t dt1 = now_ms() - t1;
+    if (dt1 > 1500)
+        die("node 1 open_gen 2 took %" PRIu64 " ms (> 1500 ms with heartbeat_ms=3000): prepare() did not wake heartbeat",
+            dt1);
+    nanosleep(&w50, NULL);
+    start(2);
+    await_log_count(2, "open generation 2, waiting", 1, 15000);
+    uint64_t t2 = now_ms();
+    for (;;) {
+        struct meta_volume v;
+        const struct meta_replica *r;
+        if (vol_rec(0, "fast", &v) && (r = rep_of(&v, 2)) && r->open_gen >= 2)
+            break;
+        if (now_ms() - t2 > 15000)
+            die("node 2 never recorded open_gen 2 within 15 s");
+        nanosleep(&w20, NULL);
+    }
+    uint64_t dt2 = now_ms() - t2;
+    uint64_t cap2 = 750;
+#if defined(__SANITIZE_THREAD__)
+    cap2 = 900;
+#endif
+    if (dt2 > cap2)
+        die("node 2 open_gen 2 took %" PRIu64 " ms (> %" PRIu64
+            " ms immediately after node 1's proposal): propose_opens() global throttle?",
+            dt2, cap2);
+    stop_all();
+    printf("  openfast: restarted followers recorded open_gen 2 in %" PRIu64 " ms and %" PRIu64
+           " ms (heartbeat_ms=3000)\n",
+           dt1, dt2);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -20731,7 +20803,7 @@ int main(int argc, char **argv)
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
-               {"repcheck", scen_repcheck}, {"rdma", scen_rdma}};
+               {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

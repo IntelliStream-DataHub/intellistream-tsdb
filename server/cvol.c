@@ -182,6 +182,8 @@ static void prepare(const struct cluster_vol_rec *r)
     } else if (M.nvols < CLUSTER_REPORT_VOLS)
         M.vols[M.nvols++] = m;
     pthread_mutex_unlock(&M.mu);
+    if (m.state == MV_WAIT)
+        cluster_beat_soon(); /* report the new open generation at the next duty tick instead of waiting heartbeat_ms */
 }
 
 /* step 3 once the generation is recorded */
