@@ -4541,6 +4541,154 @@ static void test_uring_pressure(const char *dir)
     CHECK(system(cmd) == 0);
 }
 
+typedef struct {
+    tsdb_sid id;
+    int ops;
+    int errors;
+} burst_job;
+
+static void *burst_worker(void *arg)
+{
+    burst_job *j = arg;
+    tsdbc *c = NULL;
+    if (tsdbc_connect("127.0.0.1", port, &c) != 0) {
+        j->errors++;
+        return NULL;
+    }
+    tsdb_latest_result res;
+    for (int i = 0; i < j->ops; i++) {
+        if (tsdbc_latest(c, &j->id, 1, NULL, &res) != 0 || res.status != 0 || res.kind != TSDB_LATEST_VALUE) {
+            j->errors++;
+            break;
+        }
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+
+/* Exercises zero-copy large-frame (> IN_KEEP) ownership transfer, pipelined small+large+small frames,
+ * output backpressure (out_waiters > 0 wakeup when reply > OUT_CAP), and a high-concurrency short-request burst
+ * on whichever IO backend TSDBD_IO selects (uring and epoll). */
+static void test_zerocopy_and_backpressure(const char *dir)
+{
+    char cmd[1300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    pid_t srv = start_server(dir);
+
+    tsdbc *c = NULL;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    tsdb_sid s_big = 0, s_pipe = 0;
+    OK(tsdbc_series(c, "zc.big", 1, &s_big));
+    OK(tsdbc_series(c, "zc.pipe", 1, &s_pipe));
+
+    /* 1. Large uncompressed INSERT (> IN_KEEP: ~2.4 MiB) via raw socket, pipelined with a small STATS frame
+     *    before it and a small STATS frame immediately after it, plus a standalone large INSERT (> IN_KEEP). */
+    enum { N_BIG = 200000 }; /* 200k rows * 12 bytes = 2.4 MiB >> IN_KEEP (64 KiB) */
+    size_t pl_len = 16 + (size_t)N_BIG * 12;
+    uint8_t *pl = calloc(pl_len, 1);
+    CHECK(pl != NULL);
+    uint32_t nrows = N_BIG;
+    memcpy(pl, &nrows, 4);
+    memcpy(pl + 8, &s_big, 8);
+    int64_t *pts = (int64_t *)(void *)(pl + 16);
+    float *pvs = (float *)(void *)(pl + 16 + (size_t)N_BIG * 8);
+    for (uint32_t i = 0; i < N_BIG; i++) {
+        pts[i] = T0 + (int64_t)i * 1000;
+        pvs[i] = (float)(i % 1024) * 0.25f;
+    }
+
+    int fd = raw_connect();
+    /* Standalone large frame (hits zero-copy transfer) */
+    raw_send(fd, 1, TSDB_OP_INSERT, pl, (uint32_t)pl_len);
+    uint32_t rid = 0;
+    uint8_t rest[256];
+    size_t nrest = 0;
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 1);
+
+    /* Pipelined small + large (> IN_KEEP) + small on one corked connection */
+    memcpy(pl + 8, &s_pipe, 8);
+    raw_cork(fd, 1);
+    raw_send(fd, 2, TSDB_OP_STATS, NULL, 0);
+    raw_send(fd, 3, TSDB_OP_INSERT, pl, (uint32_t)pl_len);
+    raw_send(fd, 4, TSDB_OP_STATS, NULL, 0);
+    raw_cork(fd, 0);
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 2);
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 3);
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 4);
+    close(fd);
+    free(pl);
+
+    /* Verify every single row of both large inserts landed intact. */
+    CHECK(count_of(c, s_big) == N_BIG);
+    CHECK(count_of(c, s_pipe) == N_BIG);
+
+    /* 2. Backpressure (out_waiters > 0): insert enough rows for a >12 MiB QUERY_RAW reply (> OUT_CAP = 8 MiB),
+     *    send QUERY_RAW, pause reading briefly so the worker blocks in out_wait, then drain the full stream. */
+    enum { N_BP = 1200000 }; /* 1.2M rows -> ~14.4 MiB raw reply (> OUT_CAP 8 MiB) */
+    tsdb_sid s_bp = 0;
+    OK(tsdbc_series(c, "zc.bp", 1, &s_bp));
+    int64_t *bpts = malloc((size_t)N_BP * sizeof *bpts);
+    float *bpvs = malloc((size_t)N_BP * sizeof *bpvs);
+    CHECK(bpts != NULL && bpvs != NULL);
+    for (int i = 0; i < N_BP; i++) {
+        bpts[i] = T0 + (int64_t)i * 1000;
+        bpvs[i] = (float)(i & 255);
+    }
+    OK(tsdbc_insert_series(c, s_bp, bpts, bpvs, N_BP));
+    free(bpts);
+    free(bpvs);
+
+    int bpfd = raw_connect();
+    int small_rcv = 16384;
+    setsockopt(bpfd, SOL_SOCKET, SO_RCVBUF, &small_rcv, sizeof small_rcv);
+    uint8_t q[24];
+    int64_t q0 = INT64_MIN, q1 = INT64_MAX;
+    memcpy(q, &s_bp, 8);
+    memcpy(q + 8, &q0, 8);
+    memcpy(q + 16, &q1, 8);
+    raw_send(bpfd, 77, TSDB_OP_QUERY_RAW, q, sizeof q);
+    /* Pause 150 ms without reading so socket buffer + c->sending + c->out fill past OUT_CAP -> worker waits. */
+    usleep(150000);
+    uint64_t got_rows = 0;
+    bool got_last = false;
+    enum { CHUNK_CAP = 256u << 10 };
+    uint8_t *chunk = malloc(CHUNK_CAP);
+    CHECK(chunk != NULL);
+    while (!got_last) {
+        size_t nr = 0;
+        uint32_t id = 0;
+        int32_t st = raw_reply(bpfd, &id, chunk, CHUNK_CAP, &nr);
+        CHECK(st == 0 && id == 77 && nr >= 5);
+        if (st != 0 || nr < 5)
+            break;
+        got_last = chunk[0] != 0;
+        uint32_t cn = 0;
+        memcpy(&cn, chunk + 1, 4);
+        got_rows += cn;
+    }
+    CHECK(got_last && got_rows == N_BP);
+    free(chunk);
+    close(bpfd);
+
+    /* 3. High-concurrency short-request burst (32 concurrent clients x 200 latest queries). */
+    enum { NB = 32, OPS = 200 };
+    pthread_t bth[NB];
+    burst_job bj[NB];
+    for (int i = 0; i < NB; i++) {
+        bj[i] = (burst_job){.id = s_big, .ops = OPS, .errors = 0};
+        CHECK(pthread_create(&bth[i], NULL, burst_worker, &bj[i]) == 0);
+    }
+    for (int i = 0; i < NB; i++) {
+        pthread_join(bth[i], NULL);
+        CHECK(bj[i].errors == 0);
+    }
+
+    tsdbc_close(c);
+    stop_server(srv);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
@@ -4804,6 +4952,9 @@ int main(int argc, char **argv)
     printf("high connection / SQE burst pressure\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-burst-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_uring_pressure(dir);
+    printf("zero-copy large frames, backpressure wakeups, and short-request burst\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-zc-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_zerocopy_and_backpressure(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;
