@@ -347,11 +347,15 @@ int gix_encode_parsed(const granule *g, size_t n, uint8_t **out, size_t *len, gi
     if (n > 0) {
         if (!(skip = malloc(n)))
             goto out;
+        _Static_assert(GF_N <= 32, "field bitmasks require GF_N <= 32");
+        uint8_t sk0 = granule_skip(&g[0]);
+        skip[0] = sk0;
+        uint64_t fv0[GF_N];
+        extract_fields(&g[0], sk0, fv0);
         uint64_t cand_slope[GF_N] = {0};
         uint32_t slp_mask = 0;
         if (n > 2) {
-            uint64_t fv0[GF_N], fvn[GF_N];
-            extract_fields(&g[0], granule_skip(&g[0]), fv0);
+            uint64_t fvn[GF_N];
             extract_fields(&g[n - 1], granule_skip(&g[n - 1]), fvn);
             for (int f = 0; f < GF_N; f++) {
                 if (f == GF_STEP || f == GF_LIN)
@@ -375,30 +379,24 @@ int gix_encode_parsed(const granule *g, size_t n, uint8_t **out, size_t *len, gi
         /* Entry 0 initializes all non-skippable plain/slope trackers so i = 1..n-1 needs no !used check. */
         uint32_t prev_series = g[0].series;
         nruns = 1;
-        {
-            uint8_t sk = granule_skip(&g[0]);
-            skip[0] = sk;
-            uint64_t fv[GF_N];
-            extract_fields(&g[0], sk, fv);
-            for (int f = 0; f < GF_N; f++) {
-                if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
-                    continue;
-                ftrack_init_one(&pln[f], fv[f]);
-            }
-            for (uint32_t m = slp_mask; m; m &= m - 1) {
-                int f = __builtin_ctz(m);
-                ftrack_init_one(&slp[f], fv[f]);
-            }
-            for (uint32_t m = f32_mask; m; m &= m - 1) {
-                int f = __builtin_ctz(m);
-                if ((f == GF_STEP && (sk & 1)) || (f == GF_LIN && (sk & 2)))
-                    continue;
-                uint32_t b32;
-                if (as_f32(fv[f], &b32))
-                    f32track_add(&f32t[f], b32);
-                else
-                    f32_mask &= ~(1u << f);
-            }
+        for (int f = 0; f < GF_N; f++) {
+            if ((f == GF_STEP && (sk0 & 1)) || (f == GF_LIN && (sk0 & 2)))
+                continue;
+            ftrack_init_one(&pln[f], fv0[f]);
+        }
+        for (uint32_t m = slp_mask; m; m &= m - 1) {
+            int f = __builtin_ctz(m);
+            ftrack_init_one(&slp[f], fv0[f]);
+        }
+        for (uint32_t m = f32_mask; m; m &= m - 1) {
+            int f = __builtin_ctz(m);
+            if ((f == GF_STEP && (sk0 & 1)) || (f == GF_LIN && (sk0 & 2)))
+                continue;
+            uint32_t b32;
+            if (as_f32(fv0[f], &b32))
+                f32track_add(&f32t[f], b32);
+            else
+                f32_mask &= ~(1u << f);
         }
         for (size_t i = 1; i < n; i++) {
             const granule *e = &g[i];

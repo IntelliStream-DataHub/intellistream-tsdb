@@ -822,8 +822,10 @@ void pw_abort(part_writer *w)
 }
 
 /* Builds a part handle for a file just written by pw_finish_mode, reusing the already-computed header, footer,
- * index_hash and parsed gix instead of re-reading, re-hashing and re-parsing from the mapping. When pin is true and
- * tlen == 0, transfers ownership of *index_p into p->icopy (setting *index_p = NULL). */
+ * index_hash and parsed gix instead of re-reading, re-hashing and re-parsing from the mapping. Only called when
+ * verify_checksums == 0 (trusting page-cache integrity of the just-written bytes on reliable/checksummed storage;
+ * when verify_checksums != 0, pw_finish_mode falls back to part_open_as to verify the mapped bytes on disk).
+ * When pin is true and tlen == 0, transfers ownership of *index_p into p->icopy (setting *index_p = NULL). */
 static int part_open_written(int dirfd, const char *file, const char *name, bool pin,
                              const part_header *h, const part_footer *f,
                              uint8_t **index_p, size_t ilen, const gix *parsed,
@@ -1000,7 +1002,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     if (rc != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
         (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0)
         goto fail;
-    if (!db->opt.pin_index) {
+    if (!db->opt.pin_index || db->opt.verify_checksums) {
         free(trailer);
         trailer = NULL;
         tsdb_free_big(index, ilen);
@@ -1026,8 +1028,11 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             close(w->fd);
         w->fd = -1; /* the tmp file stays */
-        rc = part_open_written(db->dirfd, w->tmp_name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
-                               ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
+        if (db->opt.verify_checksums)
+            rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, db->parts_v8, out);
+        else
+            rc = part_open_written(db->dirfd, w->tmp_name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
+                                   ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
         if (rc == 0) {
             (*out)->verify = db->opt.verify_checksums;
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
@@ -1065,8 +1070,11 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return TSDB_ERR_IO;
     }
-    rc = part_open_written(db->dirfd, name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
-                           ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
+    if (db->opt.verify_checksums)
+        rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
+    else
+        rc = part_open_written(db->dirfd, name, name, db->opt.pin_index, &h, &f, &index, ilen, &parsed,
+                               ix_e_off, ix_rser_off, ix_rstart_off, trailer, tlen, nt, out);
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
     else

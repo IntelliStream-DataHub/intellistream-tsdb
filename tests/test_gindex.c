@@ -22,10 +22,12 @@
 
 #include <dirent.h>
 #include "watchdog.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <float.h>
 #include <ftw.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -617,125 +619,286 @@ static void test_engine(const char *base)
     free(valid);
 }
 
-/* pw_finish / pw_finish_pending build the part handle directly from the encoded index and parsed gix without
- * re-reading, re-hashing or re-parsing from disk. Verify the resulting part matches a fresh part_open in every
- * field, with and without pin_index, with and without tombstones, and for empty keep_empty parts. */
+static void check_part_parity(const part *p, const part *q, bool pin, bool verify)
+{
+    CHECK(p->partition == q->partition);
+    CHECK(p->min_block == q->min_block && p->max_block == q->max_block);
+    CHECK(p->level == q->level);
+    CHECK(p->grows == q->grows);
+    CHECK(p->wal_seq == q->wal_seq);
+    CHECK(p->fno_lo == q->fno_lo && p->fno_hi == q->fno_hi);
+    CHECK(p->written_ms == q->written_ms);
+    CHECK(p->hdr_len == q->hdr_len);
+    CHECK(p->map_len == q->map_len);
+    CHECK(p->ng == q->ng && p->nt == q->nt);
+    CHECK(p->rows == q->rows);
+    CHECK(p->min_ts == q->min_ts && p->max_ts == q->max_ts);
+    CHECK(p->index_off == q->index_off && p->index_len == q->index_len && p->index_hash == q->index_hash);
+    CHECK(p->pinned == q->pinned);
+    CHECK(p->verify == verify);
+    CHECK(pin ? p->icopy != NULL : p->icopy == NULL);
+    const uint8_t *ib = pin ? p->icopy : p->map + p->index_off;
+    const uint8_t *qib = pin ? q->icopy : q->map + q->index_off;
+    CHECK(p->ix.e >= ib && p->ix.e <= ib + p->index_len);
+    CHECK((const uint8_t *)p->ix.rser >= ib && (const uint8_t *)p->ix.rser <= ib + p->index_len);
+    CHECK((const uint8_t *)p->ix.rstart >= ib && (const uint8_t *)p->ix.rstart <= ib + p->index_len);
+    CHECK(p->ix.n == q->ix.n && p->ix.nruns == q->ix.nruns && p->ix.stride == q->ix.stride);
+    CHECK((size_t)(p->ix.e - ib) == (size_t)(q->ix.e - qib));
+    CHECK((size_t)((const uint8_t *)p->ix.rser - ib) == (size_t)((const uint8_t *)q->ix.rser - qib));
+    CHECK((size_t)((const uint8_t *)p->ix.rstart - ib) == (size_t)((const uint8_t *)q->ix.rstart - qib));
+    if (p->nt)
+        CHECK((const uint8_t *)p->t == ib + p->index_len);
+    else
+        CHECK(p->t == NULL);
+    CHECK(part_map_intact(p));
+    for (uint32_t i = 0; i < p->ng; i++) {
+        granule gp, gq;
+        memset(&gp, 0, sizeof gp);
+        memset(&gq, 0, sizeof gq);
+        gx_load(p, i, GW_ALL, &gp);
+        gx_load(q, i, GW_ALL, &gq);
+        CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
+    }
+    for (uint32_t i = 0; i < p->nt; i++)
+        CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
+}
+
+static void check_pin_disk_overwrite(eng *db, const char *disk_file, const part *p, const part *q)
+{
+    /* Overwriting the on-disk index/trailer must not affect the pinned copy. */
+    int fd = openat(db->dirfd, disk_file, O_RDWR | O_CLOEXEC);
+    CHECK(fd >= 0);
+    size_t clen = (size_t)(p->map_len - sizeof(part_footer) - p->index_off);
+    uint8_t *junk = malloc(clen);
+    CHECK(junk != NULL);
+    if (junk) {
+        memset(junk, 0xa5, clen);
+        CHECK(fd >= 0 && pwrite(fd, junk, clen, (off_t)p->index_off) == (ssize_t)clen);
+        free(junk);
+    }
+    if (fd >= 0)
+        close(fd);
+    for (uint32_t i = 0; i < p->ng; i++) {
+        granule gp, gq;
+        memset(&gp, 0, sizeof gp);
+        memset(&gq, 0, sizeof gq);
+        gx_load(p, i, GW_ALL, &gp);
+        gx_load(q, i, GW_ALL, &gq);
+        CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
+    }
+    for (uint32_t i = 0; i < p->nt; i++)
+        CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
+}
+
+/* pw_finish / pw_finish_pending build the part handle directly from the encoded index and parsed gix when
+ * verify_checksums == 0 (or via part_open_as when verify_checksums != 0). Verify the resulting part matches a
+ * fresh part_open_as in every struct part field and pointer residency, across pin_index={0,1}, verify={0,1},
+ * with/without tombstones, tombstone-only (ng==0, nt>0), and keep_empty (ng==0, nt==0) parts. */
 static void test_pw_direct_open(const char *base)
 {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/pw-direct", base);
-    for (int pin = 0; pin <= 1; pin++) {
-        for (int with_tombs = 0; with_tombs <= 1; with_tombs++) {
-            for (int pending = 0; pending <= 1; pending++) {
-                rm_rf(dir);
-                tsdb_options o;
-                tsdb_options_init(&o);
-                o.granule_rows = 32;
-                o.partition_classes = 0;
-                o.merge_threads = 0;
-                o.fsync = 0;
-                o.pin_index = pin;
-                eng *db = NULL;
-                OK(eng_open(dir, &o, &db));
-                uint32_t s0, s1;
-                OK(eng_series(db, "d.a", TSDB_FLOAT32, &s0));
-                OK(eng_series(db, "d.b", TSDB_FLOAT64, &s1));
+    for (int verify = 0; verify <= 1; verify++) {
+        for (int pin = 0; pin <= 1; pin++) {
+            for (int with_tombs = 0; with_tombs <= 1; with_tombs++) {
+                for (int pending = 0; pending <= 1; pending++) {
+                    rm_rf(dir);
+                    tsdb_options o;
+                    tsdb_options_init(&o);
+                    o.granule_rows = 32;
+                    o.partition_classes = 0;
+                    o.merge_threads = 0;
+                    o.fsync = 0;
+                    o.pin_index = pin;
+                    o.verify_checksums = verify;
+                    eng *db = NULL;
+                    OK(eng_open(dir, &o, &db));
+                    uint32_t s0, s1;
+                    OK(eng_series(db, "d.a", TSDB_FLOAT32, &s0));
+                    OK(eng_series(db, "d.b", TSDB_FLOAT64, &s1));
 
-                int64_t ts[100];
-                float vf[100];
-                double vd[100];
-                for (int i = 0; i < 100; i++) {
-                    ts[i] = 1704067200000LL + i * 1000;
-                    vf[i] = 20.0f + (float)(i % 19) * 0.25f;
-                    vd[i] = 100.123456789 + (double)i * 0.01;
-                }
-                part_writer w;
-                OK(pw_begin(&w, db, 0, 7));
-                OK(pw_add(&w, s0, TSDB_FLOAT32, ts, vf, 100));
-                OK(pw_add(&w, s1, TSDB_FLOAT64, ts, vd, 100));
-                tomb tb[2] = {
-                    {.series = s0, .zero = 0, .start = ts[10], .end = ts[20]},
-                    {.series = s1, .zero = 0, .start = ts[30], .end = ts[50]},
-                };
-                if (with_tombs)
-                    OK(pw_set_tombs(&w, tb, 2));
-                part *p = NULL;
-                if (pending)
-                    OK(pw_finish_pending(&w, 0, 0, 0, &p));
-                else
-                    OK(pw_finish(&w, 1, 1, 0, &p));
-                CHECK(p != NULL);
-                if (p) {
-                    const char *disk_file = pending ? p->pending : p->name;
-                    part *q = NULL;
-                    OK(part_open_as(db->dirfd, disk_file, p->name, pin != 0, false, &q));
-                    CHECK(p->ng == q->ng && p->ng == 8);
-                    CHECK(p->nt == q->nt && p->nt == (uint32_t)(with_tombs ? 2 : 0));
-                    CHECK(p->rows == q->rows && p->rows == 200);
-                    CHECK(p->min_ts == q->min_ts && p->max_ts == q->max_ts);
-                    CHECK(p->index_off == q->index_off && p->index_len == q->index_len &&
-                          p->index_hash == q->index_hash);
-                    CHECK(p->map_len == q->map_len && p->hdr_len == q->hdr_len);
-                    CHECK(p->pinned == q->pinned && (pin ? p->icopy != NULL : p->icopy == NULL));
-                    CHECK(part_map_intact(p));
-                    for (uint32_t i = 0; i < p->ng; i++) {
-                        granule gp, gq;
-                        memset(&gp, 0, sizeof gp);
-                        memset(&gq, 0, sizeof gq);
-                        gx_load(p, i, GW_ALL, &gp);
-                        gx_load(q, i, GW_ALL, &gq);
-                        CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
+                    int64_t ts[100];
+                    float vf[100];
+                    double vd[100];
+                    for (int i = 0; i < 100; i++) {
+                        ts[i] = 1704067200000LL + i * 1000;
+                        vf[i] = 20.0f + (float)(i % 19) * 0.25f;
+                        vd[i] = 100.123456789 + (double)i * 0.01;
                     }
-                    for (uint32_t i = 0; i < p->nt; i++)
-                        CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
-                    if (pin) {
-                        /* Overwriting the on-disk index/trailer must not affect the pinned copy. */
-                        int fd = openat(db->dirfd, disk_file, O_RDWR | O_CLOEXEC);
-                        CHECK(fd >= 0);
-                        size_t clen = (size_t)(p->map_len - sizeof(part_footer) - p->index_off);
-                        uint8_t *junk = malloc(clen);
-                        memset(junk, 0xa5, clen);
-                        CHECK(fd >= 0 && pwrite(fd, junk, clen, (off_t)p->index_off) == (ssize_t)clen);
-                        free(junk);
-                        if (fd >= 0)
-                            close(fd);
-                        for (uint32_t i = 0; i < p->ng; i++) {
-                            granule gp, gq;
-                            memset(&gp, 0, sizeof gp);
-                            memset(&gq, 0, sizeof gq);
-                            gx_load(p, i, GW_ALL, &gp);
-                            gx_load(q, i, GW_ALL, &gq);
-                            CHECK(memcmp(&gp, &gq, sizeof gp) == 0);
-                        }
-                        for (uint32_t i = 0; i < p->nt; i++)
-                            CHECK(memcmp(&p->t[i], &q->t[i], sizeof(tomb)) == 0);
-                    }
-                    part_unref(q);
+                    cur_fno_lo = 11;
+                    cur_fno_hi = 19;
+                    part_writer w;
+                    OK(pw_begin(&w, db, 0, 7));
+                    OK(pw_add(&w, s0, TSDB_FLOAT32, ts, vf, 100));
+                    OK(pw_add(&w, s1, TSDB_FLOAT64, ts, vd, 100));
+                    tomb tb[2] = {
+                        {.series = s0, .zero = 0, .start = ts[10], .end = ts[20]},
+                        {.series = s1, .zero = 0, .start = ts[30], .end = ts[50]},
+                    };
+                    if (with_tombs)
+                        OK(pw_set_tombs(&w, tb, 2));
+                    part *p = NULL;
                     if (pending)
-                        unlinkat(db->dirfd, p->pending, 0);
-                    part_unref(p);
-                }
+                        OK(pw_finish_pending(&w, 0, 0, 0, &p));
+                    else
+                        OK(pw_finish(&w, 1, 1, 0, &p));
+                    CHECK(p != NULL);
+                    if (p) {
+                        const char *disk_file = pending ? p->pending : p->name;
+                        part *q = NULL;
+                        OK(part_open_as(db->dirfd, disk_file, p->name, pin != 0, false, &q));
+                        CHECK(p->ng == 8 && p->nt == (uint32_t)(with_tombs ? 2 : 0) && p->rows == 200);
+                        CHECK(p->fno_lo == 11 && p->fno_hi == 19 && p->wal_seq == 7);
+                        check_part_parity(p, q, pin != 0, verify != 0);
+                        if (pin)
+                            check_pin_disk_overwrite(db, disk_file, p, q);
+                        part_unref(q);
+                        if (pending)
+                            unlinkat(db->dirfd, p->pending, 0);
+                        part_unref(p);
+                    }
 
-                /* Also test keep_empty (0 granules, 0 tombstones) */
-                part_writer we;
-                OK(pw_begin(&we, db, 0, 9));
-                we.keep_empty = true;
-                we.empty_ts = 1704067200000LL;
-                part *pe = NULL;
-                OK(pw_finish(&we, 2, 2, 1, &pe));
-                CHECK(pe != NULL && pe->ng == 0 && pe->nt == 0 && pe->min_ts == 1704067200000LL &&
-                      pe->max_ts == 1704067200000LL && (pin ? pe->icopy != NULL : pe->icopy == NULL));
-                if (pe) {
-                    part *qe = NULL;
-                    OK(part_open_as(db->dirfd, pe->name, pe->name, pin != 0, false, &qe));
-                    CHECK(pe->index_hash == qe->index_hash && pe->index_len == qe->index_len &&
-                          pe->pinned == qe->pinned);
-                    part_unref(qe);
-                    part_unref(pe);
+                    /* Tombstone-only part (ng == 0, nt > 0, as written by delete.c). */
+                    cur_fno_lo = 0;
+                    cur_fno_hi = 0;
+                    part_writer wt;
+                    OK(pw_begin(&wt, db, 0, 8));
+                    OK(pw_set_tombs(&wt, tb, 2));
+                    part *pt = NULL;
+                    if (pending)
+                        OK(pw_finish_pending(&wt, 0, 0, 0, &pt));
+                    else
+                        OK(pw_finish(&wt, 3, 3, 0, &pt));
+                    CHECK(pt != NULL);
+                    if (pt) {
+                        const char *disk_file = pending ? pt->pending : pt->name;
+                        part *qt = NULL;
+                        OK(part_open_as(db->dirfd, disk_file, pt->name, pin != 0, false, &qt));
+                        CHECK(pt->ng == 0 && pt->nt == 2 && pt->rows == 0);
+                        CHECK(pt->min_ts == ts[10] && pt->max_ts == ts[50] - 1);
+                        check_part_parity(pt, qt, pin != 0, verify != 0);
+                        if (pin)
+                            check_pin_disk_overwrite(db, disk_file, pt, qt);
+                        part_unref(qt);
+                        if (pending)
+                            unlinkat(db->dirfd, pt->pending, 0);
+                        part_unref(pt);
+                    }
+
+                    /* Empty keep_empty part (ng == 0, nt == 0). */
+                    part_writer we;
+                    OK(pw_begin(&we, db, 0, 9));
+                    we.keep_empty = true;
+                    we.empty_ts = 1704067200000LL;
+                    part *pe = NULL;
+                    OK(pw_finish(&we, 2, 2, 1, &pe));
+                    CHECK(pe != NULL);
+                    if (pe) {
+                        part *qe = NULL;
+                        OK(part_open_as(db->dirfd, pe->name, pe->name, pin != 0, false, &qe));
+                        CHECK(pe->ng == 0 && pe->nt == 0 && pe->rows == 0 &&
+                              pe->min_ts == 1704067200000LL && pe->max_ts == 1704067200000LL);
+                        check_part_parity(pe, qe, pin != 0, verify != 0);
+                        part_unref(qe);
+                        part_unref(pe);
+                    }
+                    OK(eng_close(db));
+                    rm_rf(dir);
                 }
-                OK(eng_close(db));
-                rm_rf(dir);
             }
+        }
+    }
+    cur_fno_lo = 0;
+    cur_fno_hi = 0;
+}
+
+static char corrupt_tmp_name[64];
+static int corrupt_target; /* 0: header, 1: index, 2: trailer, 3: footer */
+static int corrupt_fired;
+
+static void corrupt_before_open_hook(eng *db, const char *first, size_t n, uint64_t pos)
+{
+    (void)first;
+    (void)n;
+    (void)pos;
+    int fd = openat(db->dirfd, corrupt_tmp_name, O_RDWR | O_CLOEXEC);
+    CHECK(fd >= 0);
+    if (fd < 0)
+        return;
+    struct stat st;
+    CHECK(fstat(fd, &st) == 0 && (size_t)st.st_size >= sizeof(part_header) + sizeof(part_footer));
+    size_t sz = (size_t)st.st_size;
+    part_footer f;
+    CHECK(pread(fd, &f, sizeof f, (off_t)(sz - sizeof f)) == (ssize_t)sizeof f);
+    off_t off = 0;
+    switch (corrupt_target) {
+    case 0: /* header (non-magic field so only hash detects it) */
+        off = (off_t)offsetof(part_header, written_ms);
+        break;
+    case 1: /* index */
+        off = (off_t)f.index_off;
+        break;
+    case 2: /* tombstone trailer */
+        off = (off_t)(f.index_off + f.index_len);
+        break;
+    default: /* footer index_hash */
+        off = (off_t)(sz - sizeof f + offsetof(part_footer, index_hash));
+        break;
+    }
+    uint8_t b = 0;
+    CHECK(pread(fd, &b, 1, off) == 1);
+    b ^= 0x01;
+    CHECK(pwrite(fd, &b, 1, off) == 1);
+    close(fd);
+    corrupt_fired++;
+}
+
+/* Regression test for MF-1: when verify_checksums == 1, pw_finish_mode must verify the on-disk mapped file
+ * (falling back to part_open_as) so misdirected writes or corruption of header/index/trailer/footer are caught
+ * with TSDB_ERR_CORRUPT for both pin_index=0 and pin_index=1, and the corrupt part is unlinked. */
+static void test_pw_verify_corrupt(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/pw-verify-corrupt", base);
+    for (int pin = 0; pin <= 1; pin++) {
+        for (int target = 0; target < 4; target++) {
+            rm_rf(dir);
+            tsdb_options o;
+            tsdb_options_init(&o);
+            o.granule_rows = 32;
+            o.partition_classes = 0;
+            o.merge_threads = 0;
+            o.fsync = 0;
+            o.pin_index = pin;
+            o.verify_checksums = 1;
+            eng *db = NULL;
+            OK(eng_open(dir, &o, &db));
+            uint32_t s0;
+            OK(eng_series(db, "c.a", TSDB_FLOAT64, &s0));
+            int64_t ts[64];
+            double v[64];
+            for (int i = 0; i < 64; i++) {
+                ts[i] = 1704067200000LL + i * 1000;
+                v[i] = 10.5 + (double)i * 0.25;
+            }
+            tomb tb = {.series = s0, .zero = 0, .start = ts[5], .end = ts[15]};
+            part_writer w;
+            OK(pw_begin(&w, db, 0, 1));
+            OK(pw_add(&w, s0, TSDB_FLOAT64, ts, v, 64));
+            OK(pw_set_tombs(&w, &tb, 1));
+            snprintf(corrupt_tmp_name, sizeof corrupt_tmp_name, "%s", w.tmp_name);
+            corrupt_target = target;
+            corrupt_fired = 0;
+            ppos_test_record = corrupt_before_open_hook;
+            part *p = NULL;
+            int rc = pw_finish(&w, 1, 1, 0, &p);
+            ppos_test_record = NULL;
+            CHECK(corrupt_fired == 1);
+            CHECK(rc == TSDB_ERR_CORRUPT);
+            CHECK(p == NULL);
+            CHECK(faccessat(db->dirfd, "p0_1_1_0.part", F_OK, 0) != 0 && errno == ENOENT);
+            OK(eng_close(db));
+            rm_rf(dir);
         }
     }
 }
@@ -755,6 +918,7 @@ int main(int argc, char **argv)
     test_nan_ends();
     test_engine(base);
     test_pw_direct_open(base);
+    test_pw_verify_corrupt(base);
     printf("%zu indexes round-tripped: %zu entries in %zu runs, %.1f bytes per entry\n", total_idx, total_entries,
            total_runs, total_entries ? (double)total_bytes / (double)total_entries : 0);
     rm_rf(base);
