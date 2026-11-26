@@ -309,7 +309,18 @@ static int run_one(mcall *c, size_t i, msink *k)
 }
 
 /* hands a finished result to fn: one call with last = 1 */
-static int deliver(mcall *c, size_t i, const mres *r)
+static int collect_fn(void *ctx, const tsdb_series_result *r);
+typedef struct mcollect {
+    tsdb_series_result *out;
+    mres cur; /* the rows of the series being streamed */
+    size_t cur_index;
+    bool have;
+    bool took_buckets; /* collect_fn transferred ownership of r->buckets without copying */
+    size_t row;
+    int rc;
+} mcollect;
+
+static int deliver(mcall *c, size_t i, mres *r)
 {
     uint64_t n = rows_of(r);
     if (c->max_rows && c->rows_sent + n > c->max_rows)
@@ -323,7 +334,16 @@ static int deliver(mcall *c, size_t i, const mres *r)
         x.values.valid = r->valid;
         x.buckets = r->buckets;
     }
-    return c->fn(c->ctx, &x) ? TSDB_ERR_STOPPED : 0;
+    if (c->fn(c->ctx, &x))
+        return TSDB_ERR_STOPPED;
+    if (c->fn == collect_fn) {
+        mcollect *mc = c->ctx;
+        if (mc->took_buckets) {
+            mc->took_buckets = false;
+            r->buckets = NULL;
+        }
+    }
+    return 0;
 }
 
 /* the head, on the conductor without a budget: rows stream as in a single request */
@@ -332,6 +352,8 @@ static int run_head(mcall *c, size_t i)
     mres r = {.type = -1};
     msink k = {c, i, true, &r, 0};
     int st = run_one(c, i, &k);
+    if (c->fn != collect_fn)
+        route_cache_release(cur_route); /* never hold a volume ref across a user callback that may block */
     int rc;
     if (k.cb_rc == TSDB_ERR_STOPPED || k.cb_rc == TSDB_ERR_TOO_MANY_BUCKETS)
         rc = k.cb_rc; /* fn stopped the call, or max_rows did */
@@ -417,8 +439,11 @@ static void task_fn(void *arg, int id)
     mcall *c = arg;
     qstats *saved_qs = cur_qstats;
     qcuts *saved_cuts = cur_cuts;
+    route_cache *saved_route = cur_route;
+    route_cache rc_cache = {.t = c->db};
     cur_qstats = c->qs;
     cur_cuts = c->cuts;
+    cur_route = &rc_cache;
     pthread_mutex_lock(&c->m);
     size_t i;
     int lv = 0;
@@ -433,6 +458,8 @@ static void task_fn(void *arg, int id)
     if (!lv && !c->stop)
         c->starved = true;
     pthread_mutex_unlock(&c->m);
+    route_cache_release(&rc_cache);
+    cur_route = saved_route;
     cur_qstats = saved_qs;
     cur_cuts = saved_cuts;
 }
@@ -471,6 +498,9 @@ static bool advance_head(mcall *c, int rc)
 static int conduct(mcall *c)
 {
     const tsdb_multi_opts *mo = c->mo;
+    route_cache *saved_route = cur_route;
+    route_cache rc_cache = {.t = c->db};
+    cur_route = &rc_cache;
     int rc = 0;
     for (;;) {
         if (mo && mo->cancelled && mo->cancelled(mo->hook_ctx)) {
@@ -498,8 +528,11 @@ static int conduct(mcall *c)
         } else if (sl->state == S_DONE) {
             mres r = sl->r;
             pthread_mutex_unlock(&c->m);
+            if (c->fn != collect_fn)
+                route_cache_release(&rc_cache); /* never hold a volume ref across a user callback */
             rc = deliver(c, h, &r);
             pthread_mutex_lock(&c->m);
+            sl->r.buckets = r.buckets; /* NULL if collect_fn transferred ownership */
             slot_release(c, sl);
             need_reopen = advance_head(c, rc);
             pthread_mutex_unlock(&c->m);
@@ -511,6 +544,7 @@ static int conduct(mcall *c)
                 continue;
             }
             pthread_mutex_unlock(&c->m);
+            route_cache_release(&rc_cache); /* never hold a volume ref while waiting on a helper */
             if (mo && mo->on_wait)
                 mo->on_wait(mo->hook_ctx, 1);
             pthread_mutex_lock(&c->m);
@@ -528,6 +562,8 @@ static int conduct(mcall *c)
         if (need_reopen)
             sched_reopen(&c->job);
     }
+    route_cache_release(&rc_cache);
+    cur_route = saved_route;
     return rc;
 }
 
@@ -561,8 +597,22 @@ int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series
     /* one series alone reads one snapshot anyway, unless trimming reads it three times */
     qcuts cuts;
     bool cut = n > 1 || (q->trim && q->nbounds);
-    if (cut)
-        qcuts_init(&cuts);
+    if (cut) {
+        bool cut_range = false;
+        int64_t cr_start = INT64_MIN, cr_end = INT64_MAX;
+        if (!q->starts && !q->ends) {
+            if (q->kind != TSDB_MULTI_TWA) {
+                cut_range = true;
+                cr_start = q->start;
+                cr_end = q->end;
+            } else if (q->twa.max_gap_ms > 0 && !q->group) {
+                cut_range = true;
+                cr_start = sat_add(q->start, -q->twa.max_gap_ms);
+                cr_end = sat_add(sat_add(q->end, q->twa.max_gap_ms), 1);
+            }
+        }
+        qcuts_init_range(&cuts, cut_range, cr_start, cr_end);
+    }
     qstats *saved_qs = cur_qstats;
     qcuts *saved_cuts = cur_cuts;
     const qbudget *saved_budget = cur_budget;
@@ -607,15 +657,6 @@ int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series
 
 /* ------------------------------------------------------------ collect */
 
-typedef struct mcollect {
-    tsdb_series_result *out;
-    mres cur; /* the rows of the series being streamed */
-    size_t cur_index;
-    bool have;
-    size_t row;
-    int rc;
-} mcollect;
-
 static int collect_fn(void *ctx, const tsdb_series_result *r)
 {
     mcollect *k = ctx;
@@ -640,14 +681,10 @@ static int collect_fn(void *ctx, const tsdb_series_result *r)
     o->status = r->status;
     o->last = 1;
     if (r->buckets && r->n) {
-        void *b = malloc(r->n * k->row);
-        if (!b) {
-            k->rc = TSDB_ERR_NOMEM;
-            return 1;
-        }
-        memcpy(b, r->buckets, r->n * k->row);
-        o->buckets = b;
+        /* Transfer ownership directly from mres (deliver nulls r->buckets after we return). */
+        o->buckets = r->buckets;
         o->n = r->n;
+        k->took_buckets = true;
     } else if (k->cur.n) {
         o->n = k->cur.n;
         o->ts = k->cur.ts;

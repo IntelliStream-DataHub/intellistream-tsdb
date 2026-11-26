@@ -164,6 +164,10 @@ typedef struct cursor {
     int type;   /* of the loaded granule's series */
     tomb_set hide; /* tombstones of newer sources */
     uint32_t series, run_end; /* the series of the run holding gi, which ends before entry run_end (0: unknown) */
+    uint32_t cut_series;      /* series whose cutoff is cached in g_cut (UINT32_MAX: none) */
+    int64_t g_cut;            /* cached retention cutoff for cut_series */
+    granule gb;               /* cached GW_TIME + series for current granule gi */
+    bool g_filter;            /* cached (g_cut > gb.ts_min || tomb_set_hits) for current granule gi */
 } cursor;
 
 static inline bool cur_done(const cursor *c) { return c->gi >= c->p->ng; }
@@ -180,16 +184,60 @@ static inline uint32_t cur_series(cursor *c)
     return c->series;
 }
 
-/* Smallest remaining key; for an undecoded granule its first row is (series, ts_min). */
-static inline void cur_key(cursor *c, uint32_t *s, int64_t *t)
-{
-    *s = cur_series(c);
-    *t = c->loaded ? c->ts[c->pos] : gx_ts_min(c->p, c->gi);
-}
+/* Smallest remaining timestamp; for an undecoded granule its first row is gb.ts_min (cached on granule advance). */
+static inline int64_t cur_ts(const cursor *c) { return c->loaded ? c->ts[c->pos] : c->gb.ts_min; }
 
 static inline bool key_lt(uint32_t s1, int64_t t1, uint32_t s2, int64_t t2)
 {
     return s1 < s2 || (s1 == s2 && t1 < t2);
+}
+
+/* Strict total order matching the linear scan: smallest (series, ts), then highest max_block (newest part wins),
+ * then earlier cursor pointer on identical max_block. */
+static inline bool cur_before(const cursor *a, const cursor *b)
+{
+    if (a->series != b->series)
+        return a->series < b->series;
+    int64_t ta = cur_ts(a), tb = cur_ts(b);
+    if (ta != tb)
+        return ta < tb;
+    if (a->p->max_block != b->p->max_block)
+        return a->p->max_block > b->p->max_block;
+    return a < b;
+}
+
+static inline void cur_heap_sift_down(cursor **h, size_t n, size_t i)
+{
+    cursor *x = h[i];
+    for (;;) {
+        size_t l = 2 * i + 1;
+        if (l >= n)
+            break;
+        size_t r = l + 1;
+        size_t best = (r < n && cur_before(h[r], h[l])) ? r : l;
+        if (!cur_before(h[best], x))
+            break;
+        h[i] = h[best];
+        i = best;
+    }
+    h[i] = x;
+}
+
+static int64_t cut_of_frozen(const ecd_cut *cuts, size_t ncuts, uint32_t series);
+
+/* Refreshes the cached granule metadata (GW_TIME, series, cutoff, tombstone hit) once when entering granule gi. */
+static inline void cur_refresh(eng *db, cursor *c, bool ttl, bool reencode, const ecd_cut *cuts, size_t ncuts,
+                               int64_t now)
+{
+    uint32_t s = cur_series(c);
+    gx_load(c->p, c->gi, GW_TIME, &c->gb);
+    c->gb.series = s;
+    if (ttl && s != c->cut_series) {
+        c->cut_series = s;
+        c->g_cut = reencode ? cut_of_frozen(cuts, ncuts, s) : eng_cutoff_at(db, s, now);
+    }
+    int64_t gcut = ttl ? c->g_cut : INT64_MIN;
+    c->g_filter = gcut > c->gb.ts_min || (c->hide.n && tomb_set_hits(&c->hide, s, c->gb.ts_min, c->gb.ts_max));
 }
 
 static int cur_load(eng *db, codec_ctx *cc, cursor *c, bool reencode)
@@ -203,7 +251,7 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c, bool reencode)
     granule gb;
     gx_load(c->p, c->gi, GW_LOC, &gb);
     const granule *g = &gb;
-    c->type = series_type(&db->series, cur_series(c));
+    c->type = series_type(&db->series, c->series);
     if (c->type < 0)
         return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
     int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->grows, true);
@@ -340,14 +388,41 @@ static int merge_parts_ex(eng *db, part **src, size_t k, bool pending, bool reen
             rc = pw_set_tombs(&w, keep.t, o);
         tomb_set_free(&keep);
     }
-    uint32_t cut_series = UINT32_MAX;
-    int64_t cut = INT64_MIN;
     int64_t *fts = NULL;
     uint8_t *fv = NULL;
     codec_ctx *cc = cc_get(db);
     uint64_t rows = 0, copied = 0;
     if (!cc)
         rc = TSDB_ERR_NOMEM;
+
+    cursor *heap_buf[128];
+    cursor **heap = NULL;
+    size_t hn = 0;
+    bool use_heap = false;
+    if (rc == 0) {
+        size_t active = 0;
+        for (size_t i = 0; i < k; i++) {
+            cur[i].cut_series = UINT32_MAX;
+            cur[i].g_cut = INT64_MIN;
+            if (!cur_done(&cur[i])) {
+                cur_refresh(db, &cur[i], ttl, reencode, cuts, ncuts, now);
+                active++;
+            }
+        }
+        use_heap = active > 8;
+        if (use_heap) {
+            heap = active <= sizeof heap_buf / sizeof heap_buf[0] ? heap_buf : malloc(active * sizeof *heap);
+            if (!heap) {
+                rc = TSDB_ERR_NOMEM;
+            } else {
+                for (size_t i = 0; i < k; i++)
+                    if (!cur_done(&cur[i]))
+                        heap[hn++] = &cur[i];
+                for (size_t i = hn / 2; i > 0; i--)
+                    cur_heap_sift_down(heap, hn, i - 1);
+            }
+        }
+    }
 
     while (rc == 0) {
         if (atomic_load_explicit(&db->stop, memory_order_relaxed) || (reencode && ecsettle_stopping(db))) {
@@ -361,41 +436,47 @@ static int merge_parts_ex(eng *db, part **src, size_t k, bool pending, bool reen
         uint32_t cs = 0, bs = UINT32_MAX;
         int64_t ct = 0, bt = INT64_MAX;
         bool has_bound = false;
-        for (size_t i = 0; i < k; i++) {
-            if (cur_done(&cur[i]))
-                continue;
-            uint32_t s;
-            int64_t t;
-            cur_key(&cur[i], &s, &t);
-            bool better = !c || key_lt(s, t, cs, ct) ||
-                          (s == cs && t == ct && cur[i].p->max_block > c->p->max_block);
-            if (better) {
-                if (c) {
-                    bs = cs;
-                    bt = ct;
-                    has_bound = true;
-                }
-                c = &cur[i];
-                cs = s;
-                ct = t;
-            } else if (!has_bound || key_lt(s, t, bs, bt)) {
-                bs = s;
-                bt = t;
+        if (use_heap) {
+            if (hn == 0)
+                break;
+            c = heap[0];
+            cs = c->series;
+            ct = cur_ts(c);
+            if (hn > 1) {
+                cursor *b = (hn == 2 || cur_before(heap[1], heap[2])) ? heap[1] : heap[2];
+                bs = b->series;
+                bt = cur_ts(b);
                 has_bound = true;
             }
+        } else {
+            for (size_t i = 0; i < k; i++) {
+                if (cur_done(&cur[i]))
+                    continue;
+                uint32_t s = cur[i].series;
+                int64_t t = cur_ts(&cur[i]);
+                bool better = !c || key_lt(s, t, cs, ct) ||
+                              (s == cs && t == ct && cur[i].p->max_block > c->p->max_block);
+                if (better) {
+                    if (c) {
+                        bs = cs;
+                        bt = ct;
+                        has_bound = true;
+                    }
+                    c = &cur[i];
+                    cs = s;
+                    ct = t;
+                } else if (!has_bound || key_lt(s, t, bs, bt)) {
+                    bs = s;
+                    bt = t;
+                    has_bound = true;
+                }
+            }
+            if (!c)
+                break;
         }
-        if (!c)
-            break;
-        granule gb;
-        gx_load(c->p, c->gi, GW_TIME, &gb);
-        gb.series = cur_series(c);
-        const granule *g = &gb;
-        if (ttl && g->series != cut_series) {
-            cut_series = g->series;
-            cut = reencode ? cut_of_frozen(cuts, ncuts, g->series) : eng_cutoff_at(db, g->series, now);
-        }
-        int64_t gcut = ttl ? cut : INT64_MIN;
-        bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
+        const granule *g = &c->gb;
+        int64_t gcut = ttl ? c->g_cut : INT64_MIN;
+        bool filter = c->g_filter;
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
             /* Copied only where one writer given these rows would cut them the same way (pw_copy_fits): a granule
@@ -435,6 +516,17 @@ static int merge_parts_ex(eng *db, part **src, size_t k, bool pending, bool reen
                 rows += g->count;
                 copied++;
                 c->gi++;
+                if (!cur_done(c))
+                    cur_refresh(db, c, ttl, reencode, cuts, ncuts, now);
+                if (use_heap) {
+                    if (cur_done(c)) {
+                        heap[0] = heap[--hn];
+                        if (hn)
+                            cur_heap_sift_down(heap, hn, 0);
+                    } else {
+                        cur_heap_sift_down(heap, hn, 0);
+                    }
+                }
                 continue;
             }
             if ((rc = cur_load(db, cc, c, reencode)) != 0)
@@ -469,17 +561,49 @@ static int merge_parts_ex(eng *db, part **src, size_t k, bool pending, bool reen
         if (c->pos == c->n) {
             c->loaded = false;
             c->gi++;
+            if (!cur_done(c))
+                cur_refresh(db, c, ttl, reencode, cuts, ncuts, now);
         }
-        for (size_t i = 0; tie && rc == 0 && i < k; i++) {
-            if (&cur[i] == c || cur_done(&cur[i]))
-                continue;
-            uint32_t s;
-            int64_t t;
-            cur_key(&cur[i], &s, &t);
-            if (s == bs && t == bt)
-                rc = cur_skip(db, cc, &cur[i], reencode);
+        if (use_heap) {
+            if (cur_done(c)) {
+                heap[0] = heap[--hn];
+                if (hn)
+                    cur_heap_sift_down(heap, hn, 0);
+            } else {
+                cur_heap_sift_down(heap, hn, 0);
+            }
+            while (tie && rc == 0 && hn > 0) {
+                cursor *d = heap[0];
+                if (d->series != bs || cur_ts(d) != bt)
+                    break;
+                rc = cur_skip(db, cc, d, reencode);
+                if (rc)
+                    break;
+                if (cur_done(d)) {
+                    heap[0] = heap[--hn];
+                    if (hn)
+                        cur_heap_sift_down(heap, hn, 0);
+                } else {
+                    if (!d->loaded)
+                        cur_refresh(db, d, ttl, reencode, cuts, ncuts, now);
+                    cur_heap_sift_down(heap, hn, 0);
+                }
+            }
+        } else {
+            for (size_t i = 0; tie && rc == 0 && i < k; i++) {
+                if (&cur[i] == c || cur_done(&cur[i]))
+                    continue;
+                if (cur[i].series == bs && cur_ts(&cur[i]) == bt) {
+                    rc = cur_skip(db, cc, &cur[i], reencode);
+                    if (rc == 0 && !cur[i].loaded && !cur_done(&cur[i]))
+                        cur_refresh(db, &cur[i], ttl, reencode, cuts, ncuts, now);
+                }
+            }
         }
     }
+
+    if (heap != heap_buf)
+        free(heap);
 
     if (cc)
         cc_put(db, cc);

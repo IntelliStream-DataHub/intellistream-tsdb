@@ -51,14 +51,26 @@
 /* --------------------------------------------------------------- snapshot */
 
 
+static void snap_free_parts(part **parts, size_t np, bool borrowed, bool owned)
+{
+    if (!borrowed) {
+        for (size_t i = 0; i < np; i++)
+            part_unref(parts[i]);
+    }
+    if (owned)
+        free(parts);
+}
+
 void snapshot_release(snapshot *s)
 {
-    db_release(s->parts, s->np);
+    snap_free_parts(s->parts, s->np, s->borrowed, s->parts_owned);
     for (size_t i = 0; i < s->nmem; i++)
         mem_run_free(&s->mem[i]);
     free(s->mem);
-    free(s->gi);
-    free(s->gj);
+    if (s->gi != s->inline_gi)
+        free(s->gi);
+    if (s->gj != s->inline_gj)
+        free(s->gj);
     free(s->mprio);
     memset(s, 0, sizeof *s);
 }
@@ -69,11 +81,16 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
 
 __thread qcuts *cur_cuts;
 
-void qcuts_init(qcuts *cs)
+void qcuts_init_range(qcuts *cs, bool has_range, int64_t rstart, int64_t rend)
 {
     memset(cs, 0, sizeof *cs);
+    cs->has_range = has_range;
+    cs->rstart = rstart;
+    cs->rend = rend;
     pthread_mutex_init(&cs->lock, NULL);
 }
+
+void qcuts_init(qcuts *cs) { qcuts_init_range(cs, false, 0, 0); }
 
 void cut_release(qcut *c)
 {
@@ -97,21 +114,35 @@ void qcuts_free(qcuts *cs)
     memset(cs, 0, sizeof *cs);
 }
 
-/* The engine as snapshot_take sees it, for every series and time (TWA reads before its start): what a later
- * snapshot_take would add is a newer part, a new memtable, or rows with a higher lsn. */
-int cut_take(eng *db, qcut *c)
+/* The engine as snapshot_take sees it, for every series and time (or pre-filtered to [rstart, rend) when uniform
+ * across a multi-series call): what a later snapshot_take would add is a newer part, a new memtable, or rows with
+ * a higher lsn. */
+static int cut_take_range(eng *db, qcut *c, bool has_range, int64_t rstart, int64_t rend)
 {
     memset(c, 0, sizeof *c);
     c->db = db;
+    c->has_range = has_range;
+    c->rstart = rstart;
+    c->rend = rend;
     pthread_mutex_lock(&db->lock);
-    c->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *c->parts);
+    size_t want = db->nparts;
+    if (has_range) {
+        want = 0;
+        for (size_t i = 0; i < db->nparts; i++)
+            if (db->parts[i]->max_ts >= rstart && db->parts[i]->min_ts < rend)
+                want++;
+    }
+    c->parts = malloc((want ? want : 1) * sizeof *c->parts);
     if (!c->parts) {
         pthread_mutex_unlock(&db->lock);
         return TSDB_ERR_NOMEM;
     }
     for (size_t i = 0; i < db->nparts; i++) {
-        part_ref(db->parts[i]);
-        c->parts[c->np++] = db->parts[i];
+        part *p = db->parts[i];
+        if (!has_range || (p->max_ts >= rstart && p->min_ts < rend)) {
+            part_ref(p);
+            c->parts[c->np++] = p;
+        }
     }
     for (size_t i = 0; i < db->nflushing; i++) {
         mt_ref(db->flushing[i]);
@@ -135,10 +166,17 @@ int cut_take(eng *db, qcut *c)
     return 0;
 }
 
+int cut_take(eng *db, qcut *c) { return cut_take_range(db, c, false, 0, 0); }
+
 /* The request's cut of db, taken by its first series there. Each cut is allocated on its own: threads read theirs
  * after the lock is dropped while another volume's first series grows the array of pointers. */
 static int cut_get(qcuts *cs, eng *db, qcut **out)
 {
+    route_cache *rc_cache = cur_route;
+    if (rc_cache && rc_cache->cuts == cs && rc_cache->cut && rc_cache->cut->db == db) {
+        *out = rc_cache->cut;
+        return 0;
+    }
     int rc = 0;
     pthread_mutex_lock(&cs->lock);
     size_t i = 0;
@@ -158,7 +196,7 @@ static int cut_get(qcuts *cs, eng *db, qcut **out)
         qcut *c = rc ? NULL : calloc(1, sizeof *c);
         if (rc == 0 && !c)
             rc = TSDB_ERR_NOMEM;
-        if (rc == 0 && (rc = cut_take(db, c)) == 0) {
+        if (rc == 0 && (rc = cut_take_range(db, c, cs->has_range, cs->rstart, cs->rend)) == 0) {
             /* The cut holds parts of this engine until the request ends: it holds a reference too (the request's
              * series each hold one while they run, which is how this thread is here), so a recovery waits for the
              * request instead of replacing the engine under its parts (part_unref of an obsolete part unlinks
@@ -170,28 +208,51 @@ static int cut_get(qcuts *cs, eng *db, qcut **out)
     }
     *out = rc ? NULL : cs->c[i];
     pthread_mutex_unlock(&cs->lock);
+    if (rc == 0 && rc_cache && rc_cache->e == db) {
+        rc_cache->cuts = cs;
+        rc_cache->cut = *out;
+    }
     return rc;
 }
 
-/* snapshot_take from a cut: the same memtable order (tails, flushing, active), each bounded by the cut's lsn */
+/* snapshot_take from a cut: the same memtable order (tails, flushing, active), each bounded by the cut's lsn.
+ * The cut already pins every c->parts[i] for the lifetime of the request, so we borrow them without per-series
+ * atomic part_ref/part_unref traffic. */
 static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64_t start, int64_t end,
                         snapshot *s)
 {
     int rc = 0;
-    s->parts = malloc((c->np ? c->np : 1) * sizeof *s->parts);
-    s->mem = calloc(c->ntails + c->nms + 1, sizeof *s->mem);
-    if (!s->parts || !s->mem)
-        rc = TSDB_ERR_NOMEM;
-    for (size_t i = 0; rc == 0 && i < c->np; i++) {
-        part *p = c->parts[i];
-        if (p->max_ts >= start && p->min_ts < end) {
-            part_ref(p);
-            s->parts[s->np++] = p;
+    s->borrowed = true;
+    if (c->np == 0) {
+        s->parts = NULL;
+        s->parts_owned = false;
+    } else if (c->has_range && start == c->rstart && end == c->rend) {
+        /* Every part in c was already filtered for [start, end): borrow c->parts directly with zero scan/copy. */
+        s->parts = c->parts;
+        s->np = c->np;
+        s->parts_owned = false;
+    } else {
+        if (c->np <= sizeof s->inline_parts / sizeof s->inline_parts[0]) {
+            s->parts = s->inline_parts;
+            s->parts_owned = false;
+        } else {
+            s->parts = malloc(c->np * sizeof *s->parts);
+            s->parts_owned = s->parts != NULL;
+            if (!s->parts)
+                rc = TSDB_ERR_NOMEM;
+        }
+        for (size_t i = 0; rc == 0 && i < c->np; i++) {
+            part *p = c->parts[i];
+            if (p->max_ts >= start && p->min_ts < end)
+                s->parts[s->np++] = p;
         }
     }
+    mem_run runs[MAX_TAILS + MAX_FLUSHING + 1];
+    size_t nruns = 0;
     mem_run tail_raw[MAX_TAILS];
     bool tail_sorted[MAX_TAILS];
-    memset(tail_raw, 0, sizeof tail_raw);
+    if (c->ntails)
+        memset(tail_raw, 0, c->ntails * sizeof tail_raw[0]);
     mem_run act_raw = {0};
     bool act_sorted = true;
     /* Only tails and the active memtable may still grow: copy their raw slices under buf_lock,
@@ -208,7 +269,7 @@ static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64
         if (rc == 0)
             rc = mt_finish(&tail_raw[i], w, tail_sorted[i]);
         if (rc == 0 && tail_raw[i].n)
-            s->mem[s->nmem++] = tail_raw[i];
+            runs[nruns++] = tail_raw[i];
         else
             mem_run_free(&tail_raw[i]);
     }
@@ -217,7 +278,7 @@ static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64
         mem_run r = {0};
         rc = mt_collect(c->ms[i], series, w, start, end, c->visible, &r);
         if (rc == 0 && r.n)
-            s->mem[s->nmem++] = r;
+            runs[nruns++] = r;
         else
             mem_run_free(&r);
     }
@@ -225,9 +286,22 @@ static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64
         if (rc == 0)
             rc = mt_finish(&act_raw, w, act_sorted);
         if (rc == 0 && act_raw.n)
-            s->mem[s->nmem++] = act_raw;
+            runs[nruns++] = act_raw;
         else
             mem_run_free(&act_raw);
+    }
+    if (rc == 0 && nruns) {
+        s->mem = malloc(nruns * sizeof *s->mem);
+        if (!s->mem) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            memcpy(s->mem, runs, nruns * sizeof *s->mem);
+            s->nmem = nruns;
+        }
+    }
+    if (rc && !s->mem) {
+        for (size_t i = 0; i < nruns; i++)
+            mem_run_free(&runs[i]);
     }
     if (rc == 0)
         rc = snapshot_prepare(db, s, series, start, end);
@@ -243,7 +317,7 @@ void (*snapshot_test_after_lock)(eng *db);
 int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
-    if (cur_cuts) {
+    if (cur_cuts && (!cur_cuts->has_range || (start >= cur_cuts->rstart && end <= cur_cuts->rend))) {
         qcut *c;
         int rc = cut_get(cur_cuts, db, &c);
         return rc ? rc : snapshot_cut(db, c, series, w, start, end, s);
@@ -267,7 +341,13 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     if (app < visible)
         visible = app;
     uint64_t tail_vis = atomic_load_explicit(&db->tail_lsn, memory_order_acquire);
-    s->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *s->parts);
+    if (db->nparts <= sizeof s->inline_parts / sizeof s->inline_parts[0]) {
+        s->parts = s->inline_parts;
+        s->parts_owned = false;
+    } else {
+        s->parts = malloc(db->nparts * sizeof *s->parts);
+        s->parts_owned = s->parts != NULL;
+    }
     if (s->parts) {
         for (size_t i = 0; i < db->nparts; i++) {
             part *p = db->parts[i];
@@ -302,7 +382,8 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
     /* Copy raw slices of mutable memtables under buf_lock alone, then drop buf_lock before sorting/deduping. */
     mem_run tails[MAX_TAILS];
     bool tail_sorted[MAX_TAILS];
-    memset(tails, 0, sizeof tails);
+    if (ntail_ms)
+        memset(tails, 0, ntail_ms * sizeof tails[0]);
     mem_run active = {0};
     bool act_sorted = true;
     if (rc == 0 && (ntail_ms || active_m)) {
@@ -317,14 +398,13 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
         mt_unref(tail_ms[i]);
     mt_unref(active_m);
 
-    s->mem = calloc(nms + ntail_ms + 1, sizeof *s->mem);
-    if (!s->mem && rc == 0)
-        rc = TSDB_ERR_NOMEM;
+    mem_run runs[MAX_TAILS + MAX_FLUSHING + 1];
+    size_t nruns = 0;
     for (size_t i = 0; i < ntail_ms; i++) { /* oldest first, like the writer's memtables */
         if (rc == 0)
             rc = mt_finish(&tails[i], w, tail_sorted[i]);
-        if (rc == 0 && tails[i].n && s->mem)
-            s->mem[s->nmem++] = tails[i];
+        if (rc == 0 && tails[i].n)
+            runs[nruns++] = tails[i];
         else
             mem_run_free(&tails[i]);
     }
@@ -333,18 +413,31 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
         mem_run r = {0};
         if (rc == 0)
             rc = mt_collect(ms[i], series, w, start, end, visible, &r);
-        if (rc == 0 && r.n && s->mem)
-            s->mem[s->nmem++] = r;
+        if (rc == 0 && r.n)
+            runs[nruns++] = r;
         else
             mem_run_free(&r);
         mt_unref(ms[i]);
     }
     if (rc == 0)
         rc = mt_finish(&active, w, act_sorted);
-    if (rc == 0 && active.n && s->mem)
-        s->mem[s->nmem++] = active;
+    if (rc == 0 && active.n)
+        runs[nruns++] = active;
     else
         mem_run_free(&active);
+    if (rc == 0 && nruns) {
+        s->mem = malloc(nruns * sizeof *s->mem);
+        if (!s->mem) {
+            rc = TSDB_ERR_NOMEM;
+        } else {
+            memcpy(s->mem, runs, nruns * sizeof *s->mem);
+            s->nmem = nruns;
+        }
+    }
+    if (rc && !s->mem) {
+        for (size_t i = 0; i < nruns; i++)
+            mem_run_free(&runs[i]);
+    }
     if (rc == 0)
         rc = snapshot_prepare(db, s, series, start, end);
     if (rc)
@@ -402,7 +495,7 @@ typedef struct snap_build {
     size_t nmem, mcap;
 } snap_build;
 
-static int sb_part(snap_build *b, part *p, uint32_t gi, uint32_t gj)
+static int sb_part(snap_build *b, part *p, uint32_t gi, uint32_t gj, bool borrowed)
 {
     if (b->np == b->pcap) {
         size_t cap = b->pcap ? b->pcap * 2 : 16;
@@ -419,7 +512,8 @@ static int sb_part(snap_build *b, part *p, uint32_t gi, uint32_t gj)
             return TSDB_ERR_NOMEM;
         b->pcap = cap;
     }
-    part_ref(p);
+    if (!borrowed)
+        part_ref(p);
     b->parts[b->np] = p;
     b->gi[b->np] = gi;
     b->gj[b->np] = gj;
@@ -491,13 +585,22 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
 {
     s->start = start;
     s->end = end;
-    s->gi = malloc((s->np + 1) * sizeof *s->gi);
-    s->gj = malloc((s->np + 1) * sizeof *s->gj);
-    s->mprio = malloc((s->nmem + 1) * sizeof *s->mprio);
-    if (!s->gi || !s->gj || !s->mprio)
-        return TSDB_ERR_NOMEM;
-    for (size_t i = 0; i < s->nmem; i++)
-        s->mprio[i] = UINT64_MAX - (s->nmem - i); /* memtables are newer than every part */
+    if (s->np <= sizeof s->inline_gi / sizeof s->inline_gi[0]) {
+        s->gi = s->inline_gi;
+        s->gj = s->inline_gj;
+    } else {
+        s->gi = malloc(s->np * sizeof *s->gi);
+        s->gj = malloc(s->np * sizeof *s->gj);
+        if (!s->gi || !s->gj)
+            return TSDB_ERR_NOMEM;
+    }
+    if (s->nmem) {
+        s->mprio = malloc(s->nmem * sizeof *s->mprio);
+        if (!s->mprio)
+            return TSDB_ERR_NOMEM;
+        for (size_t i = 0; i < s->nmem; i++)
+            s->mprio[i] = UINT64_MAX - (s->nmem - i); /* memtables are newer than every part */
+    }
     bool tombs = false;
     for (size_t i = 0; i < s->np; i++) {
         part_find(s->parts[i], series, start, end, &s->gi[i], &s->gj[i]);
@@ -523,14 +626,14 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
         }
         tomb_set_finish(&h);
         if (rc == 0 && h.n == 0) {
-            rc = sb_part(&b, p, s->gi[i], s->gj[i]);
+            rc = sb_part(&b, p, s->gi[i], s->gj[i], s->borrowed);
         } else {
             for (uint32_t k = s->gi[i], e; rc == 0 && k < s->gj[i]; k = e) {
                 bool dirty = tomb_set_hits(&h, series, gx_ts_min(p, k), gx_ts_max(p, k));
                 for (e = k + 1; e < s->gj[i] && tomb_set_hits(&h, series, gx_ts_min(p, e), gx_ts_max(p, e)) == dirty;)
                     e++;
                 if (!dirty) {
-                    rc = sb_part(&b, p, k, e);
+                    rc = sb_part(&b, p, k, e, s->borrowed);
                     continue;
                 }
                 if (!cc && !(cc = cc_get(db))) {
@@ -555,7 +658,7 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
             s->mem[i] = (mem_run){0}; /* moved */
     }
     if (rc) {
-        db_release(b.parts, b.np);
+        snap_free_parts(b.parts, b.np, s->borrowed, b.parts != NULL);
         for (size_t i = 0; i < b.nmem; i++)
             if (b.mprio[i] < UINT64_MAX - s->nmem) /* decoded here; memtable runs stay with s */
                 mem_run_free(&b.mem[i]);
@@ -568,12 +671,15 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
         free(b.mprio);
         return rc;
     }
-    db_release(s->parts, s->np);
-    free(s->gi);
-    free(s->gj);
+    snap_free_parts(s->parts, s->np, s->borrowed, s->parts_owned);
+    if (s->gi != s->inline_gi)
+        free(s->gi);
+    if (s->gj != s->inline_gj)
+        free(s->gj);
     free(s->mem);
     free(s->mprio);
     s->parts = b.parts;
+    s->parts_owned = b.parts != NULL;
     s->gi = b.gi;
     s->gj = b.gj;
     s->np = b.np;
@@ -675,52 +781,147 @@ static int src_advance(codec_ctx *cc, src *c, size_t rows, int64_t start, int64_
 }
 
 
+static inline bool src_before(const src *a, const src *b)
+{
+    int64_t ta = a->ts[a->pos], tb = b->ts[b->pos];
+    if (ta != tb)
+        return ta < tb;
+    if (a->prio != b->prio)
+        return a->prio > b->prio;
+    return a < b;
+}
+
+static inline void src_heap_sift_down(src **h, size_t n, size_t i)
+{
+    src *x = h[i];
+    for (;;) {
+        size_t l = 2 * i + 1;
+        if (l >= n)
+            break;
+        size_t r = l + 1;
+        size_t best = (r < n && src_before(h[r], h[l])) ? r : l;
+        if (!src_before(h[best], x))
+            break;
+        h[i] = h[best];
+        i = best;
+    }
+    h[i] = x;
+}
+
 /* Emits the union of the sources in time order, one row per timestamp: the
  * row of the source with the highest priority. Every live source is kept
- * decoded, so the head timestamps are exact. */
+ * decoded, so the head timestamps are exact. Uses a binary min-heap when
+ * more than 8 sources are active, keeping a tiny linear scan for <= 8. */
 int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
 {
     int rc = 0;
-    for (size_t i = 0; i < nc && rc == 0; i++)
+    size_t hn = 0;
+    for (size_t i = 0; i < nc && rc == 0; i++) {
         rc = src_fill(cc, &cur[i], start, end);
-    while (rc == 0) {
-        src *c = NULL;
-        int64_t bound = INT64_MAX;
-        bool has_bound = false;
-        for (size_t i = 0; i < nc; i++) {
-            src *x = &cur[i];
-            if (!x->loaded)
-                continue;
-            int64_t t = x->ts[x->pos];
-            if (!c || t < c->ts[c->pos] || (t == c->ts[c->pos] && x->prio > c->prio)) {
-                if (c) {
-                    int64_t ct = c->ts[c->pos];
-                    if (!has_bound || ct < bound)
-                        bound = ct;
+        if (rc == 0 && cur[i].loaded)
+            hn++;
+    }
+    if (rc || hn == 0)
+        return rc;
+    if (hn <= 8) {
+        while (rc == 0) {
+            src *c = NULL;
+            int64_t bound = INT64_MAX;
+            bool has_bound = false;
+            for (size_t i = 0; i < nc; i++) {
+                src *x = &cur[i];
+                if (!x->loaded)
+                    continue;
+                int64_t t = x->ts[x->pos];
+                if (!c || t < c->ts[c->pos] || (t == c->ts[c->pos] && x->prio > c->prio)) {
+                    if (c) {
+                        int64_t ct = c->ts[c->pos];
+                        if (!has_bound || ct < bound)
+                            bound = ct;
+                        has_bound = true;
+                    }
+                    c = x;
+                } else if (!has_bound || t < bound) {
+                    bound = t;
                     has_bound = true;
                 }
-                c = x;
-            } else if (!has_bound || t < bound) {
-                bound = t;
-                has_bound = true;
+            }
+            if (!c)
+                break;
+            int64_t head = c->ts[c->pos];
+            size_t e = c->n;
+            if (has_bound)
+                e = head < bound ? c->pos + lower_bound_i64(c->ts + c->pos, c->n - c->pos, bound) : c->pos + 1;
+            if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, e - c->pos))
+                return TSDB_ERR_STOPPED;
+            rc = src_advance(cc, c, e - c->pos, start, end);
+            if (has_bound && head == bound) {
+                /* the same timestamp in older sources: replaced, drop it */
+                for (size_t i = 0; i < nc && rc == 0; i++)
+                    if (&cur[i] != c && cur[i].loaded && cur[i].ts[cur[i].pos] == head)
+                        rc = src_advance(cc, &cur[i], 1, start, end);
             }
         }
-        if (!c)
-            break;
+        return rc;
+    }
+
+    src *heap_buf[64];
+    src **heap = hn <= sizeof heap_buf / sizeof heap_buf[0] ? heap_buf : malloc(hn * sizeof *heap);
+    if (!heap)
+        return TSDB_ERR_NOMEM;
+    size_t j = 0;
+    for (size_t i = 0; i < nc; i++)
+        if (cur[i].loaded)
+            heap[j++] = &cur[i];
+    for (size_t i = hn / 2; i > 0; i--)
+        src_heap_sift_down(heap, hn, i - 1);
+
+    while (rc == 0 && hn > 0) {
+        src *c = heap[0];
         int64_t head = c->ts[c->pos];
+        int64_t bound = INT64_MAX;
+        bool has_bound = hn > 1;
+        if (hn == 2) {
+            bound = heap[1]->ts[heap[1]->pos];
+        } else if (hn >= 3) {
+            int64_t t1 = heap[1]->ts[heap[1]->pos], t2 = heap[2]->ts[heap[2]->pos];
+            bound = t1 < t2 ? t1 : t2;
+        }
         size_t e = c->n;
         if (has_bound)
             e = head < bound ? c->pos + lower_bound_i64(c->ts + c->pos, c->n - c->pos, bound) : c->pos + 1;
-        if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, e - c->pos))
-            return TSDB_ERR_STOPPED;
+        if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, e - c->pos)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
         rc = src_advance(cc, c, e - c->pos, start, end);
+        if (rc)
+            break;
+        if (!c->loaded) {
+            heap[0] = heap[--hn];
+            if (hn)
+                src_heap_sift_down(heap, hn, 0);
+        } else {
+            src_heap_sift_down(heap, hn, 0);
+        }
         if (has_bound && head == bound) {
-            /* the same timestamp in older sources: replaced, drop it */
-            for (size_t i = 0; i < nc && rc == 0; i++)
-                if (&cur[i] != c && cur[i].loaded && cur[i].ts[cur[i].pos] == head)
-                    rc = src_advance(cc, &cur[i], 1, start, end);
+            while (rc == 0 && hn > 0 && heap[0]->ts[heap[0]->pos] == head) {
+                src *d = heap[0];
+                rc = src_advance(cc, d, 1, start, end);
+                if (rc)
+                    break;
+                if (!d->loaded) {
+                    heap[0] = heap[--hn];
+                    if (hn)
+                        src_heap_sift_down(heap, hn, 0);
+                } else {
+                    src_heap_sift_down(heap, hn, 0);
+                }
+            }
         }
     }
+    if (heap != heap_buf)
+        free(heap);
     return rc;
 }
 
@@ -1177,6 +1378,11 @@ static void dense_run(eng *db, size_t n, size_t chunk, void (*fn)(void *ctx, siz
         fn(ctx, 0, n);
         return;
     }
+    if (db->opt.query_threads <= 1) {
+        for (size_t lo = 0; lo < n; lo += chunk)
+            fn(ctx, lo, MIN(lo + chunk, n));
+        return;
+    }
     dense_job j = {.n = n, .chunk = chunk, .fn = fn, .ctx = ctx};
     atomic_init(&j.next, 0);
     sched_run(db->sched, (int)MIN(chunks, (size_t)db->opt.query_threads), dense_worker, &j);
@@ -1620,7 +1826,9 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
     *nout = 0;
     agg_state *acc = NULL;
     agg_dev *accx = NULL;
+    gref work_buf[64];
     gref *work = NULL;
+    src srcs_buf[64];
     src *srcs = NULL;
     codec_ctx *cc = NULL;
     fold_ctx fc = {0};
@@ -1629,8 +1837,9 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
     __atomic_fetch_add(&agg_dense_states, nb, __ATOMIC_RELAXED);
     acc = malloc(nb * sizeof *acc);
     accx = q->spread ? malloc(nb * sizeof *accx) : NULL;
-    work = malloc(nin * sizeof *work);
-    srcs = malloc((sn->np + sn->nmem) * sizeof *srcs);
+    work = nin <= sizeof work_buf / sizeof work_buf[0] ? work_buf : malloc(nin * sizeof *work);
+    size_t nsrc_cap = sn->np + sn->nmem;
+    srcs = nsrc_cap <= sizeof srcs_buf / sizeof srcs_buf[0] ? srcs_buf : malloc(nsrc_cap * sizeof *srcs);
     /* the codec context only once a cluster's sources overlap (merge_stream; the granules decoded alone take the
      * workers' own): an answer from statistics and memtable rows never meets other queries on cc_lock */
     if (!acc || (q->spread && !accx) || !work || !srcs) {
@@ -1711,63 +1920,111 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
             src_free(&srcs[k]);
     }
     if (rc == 0 && nwork) {
-        j = aligned_alloc(64, sizeof *j);
-        agg_edge *edge = j && !accx ? aligned_alloc(64, nwork * sizeof *edge) : NULL;
-        agg_edge_dev *edged = j && accx ? aligned_alloc(64, nwork * sizeof *edged) : NULL;
-        if (!j || (!accx && !edge) || (accx && !edged)) {
-            free(edge);
-            free(edged);
-            rc = TSDB_ERR_NOMEM;
-            goto done;
-        }
-        memset(j, 0, sizeof *j);
-        if (edge)
-            memset(edge, 0, nwork * sizeof *edge);
-        if (edged)
-            memset(edged, 0, nwork * sizeof *edged);
-        j->db = db;
-        j->qs = cur_qstats;
-        j->work = work;
-        j->nwork = nwork;
-        j->t = t;
-        j->edge = edge;
-        j->edged = edged;
-        atomic_init(&j->next, 0);
-        atomic_init(&j->err, 0);
-        for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_init(&j->locks[k].m, NULL);
         uint64_t rows = 0;
         for (size_t w = 0; w < nwork; w++)
             rows += gx_count(work[w].p, work[w].k);
-        sched_run(db->sched, query_threads_for(db, rows, nwork), agg_worker, j);
-        for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_destroy(&j->locks[k].m);
-        rc = atomic_load(&j->err);
-        if (rc == 0) {
-            if (edged) {
-                for (size_t w = 0; w < nwork; w++) {
-                    const agg_edge_dev *ed = &edged[w];
-                    for (uint8_t k = 0; k < ed->n; k++) {
-                        local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
-                        fold_into(&t, &lb, &ed->x[k], 1);
-                    }
-                }
+        int threads = query_threads_for(db, rows, nwork);
+        if (threads == 1) {
+            /* Direct single-threaded fast path: fold straight into &t with zero agg_job/edge allocs,
+             * zero stripe mutex init/destroy/lock/unlock, and zero sched_run barriers. */
+            if (!cc && !(cc = cc_get(db))) {
+                rc = TSDB_ERR_NOMEM;
+                goto done;
+            }
+            size_t cap = db->granule_rows;
+            int64_t *ts = qscratch_get(0, cap * sizeof *ts);
+            uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
+            local_bucket *local = qscratch_get(2, cap * sizeof *local);
+            agg_dev *localx = accx ? qscratch_get(3, cap * sizeof *localx) : NULL;
+            if (!ts || !v || !local || (accx && !localx)) {
+                rc = TSDB_ERR_NOMEM;
             } else {
                 for (size_t w = 0; w < nwork; w++) {
-                    const agg_edge *ed = &edge[w];
-                    for (uint8_t k = 0; k < ed->n; k++) {
-                        local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
-                        fold_into(&t, &lb, NULL, 1);
+                    const gref *r = &work[w];
+                    granule gb;
+                    rc = granule_read_at(cc, r->p, r->k, type, ts, v, cap, r->p->verify, &gb);
+                    if (rc)
+                        break;
+                    size_t n = gb.count;
+                    size_t lo = lower_bound_i64(ts, n, start);
+                    size_t hi = lower_bound_i64(ts, n, end);
+                    size_t nl = fold_rows(&t, ts + lo, v + lo * wd, hi > lo ? hi - lo : 0, gb.nulls > 0, local,
+                                          localx);
+                    if (nl)
+                        fold_into(&t, local, localx, nl);
+                    if (!cur_cuts) {
+                        int lv = sched_leave();
+                        if (lv < 0) {
+                            rc = lv;
+                            break;
+                        }
                     }
                 }
             }
+            qscratch_put(ts);
+            qscratch_put(v);
+            qscratch_put(local);
+            qscratch_put(localx);
+        } else {
+            j = aligned_alloc(64, sizeof *j);
+            agg_edge *edge = j && !accx ? aligned_alloc(64, nwork * sizeof *edge) : NULL;
+            agg_edge_dev *edged = j && accx ? aligned_alloc(64, nwork * sizeof *edged) : NULL;
+            if (!j || (!accx && !edge) || (accx && !edged)) {
+                free(edge);
+                free(edged);
+                rc = TSDB_ERR_NOMEM;
+                goto done;
+            }
+            memset(j, 0, sizeof *j);
+            if (edge)
+                memset(edge, 0, nwork * sizeof *edge);
+            if (edged)
+                memset(edged, 0, nwork * sizeof *edged);
+            j->db = db;
+            j->qs = cur_qstats;
+            j->work = work;
+            j->nwork = nwork;
+            j->t = t;
+            j->edge = edge;
+            j->edged = edged;
+            atomic_init(&j->next, 0);
+            atomic_init(&j->err, 0);
+            for (int k = 0; k < AGG_STRIPES; k++)
+                pthread_mutex_init(&j->locks[k].m, NULL);
+            sched_run(db->sched, threads, agg_worker, j);
+            for (int k = 0; k < AGG_STRIPES; k++)
+                pthread_mutex_destroy(&j->locks[k].m);
+            rc = atomic_load(&j->err);
+            if (rc == 0) {
+                if (edged) {
+                    for (size_t w = 0; w < nwork; w++) {
+                        const agg_edge_dev *ed = &edged[w];
+                        for (uint8_t k = 0; k < ed->n; k++) {
+                            local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
+                            fold_into(&t, &lb, &ed->x[k], 1);
+                        }
+                    }
+                } else {
+                    for (size_t w = 0; w < nwork; w++) {
+                        const agg_edge *ed = &edge[w];
+                        for (uint8_t k = 0; k < ed->n; k++) {
+                            local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
+                            fold_into(&t, &lb, NULL, 1);
+                        }
+                    }
+                }
+            }
+            free(edge);
+            free(edged);
         }
-        free(edge);
-        free(edged);
     }
     if (rc == 0) {
         size_t nchunks = (nb + chunk - 1) / chunk;
-        dense_out o = {.t = &t, .chunk = chunk, .nonempty = malloc((nchunks ? nchunks : 1) * sizeof(size_t)),
+        size_t nonempty_buf[64];
+        size_t *nonempty_arr = nchunks <= sizeof nonempty_buf / sizeof nonempty_buf[0]
+                                   ? nonempty_buf
+                                   : malloc((nchunks ? nchunks : 1) * sizeof(size_t));
+        dense_out o = {.t = &t, .chunk = chunk, .nonempty = nonempty_arr,
                        .row = q->spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket)};
         if (!o.nonempty) {
             rc = TSDB_ERR_NOMEM;
@@ -1788,7 +2045,8 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
             *out = o.res;
             *nout = nonempty;
         }
-        free(o.nonempty);
+        if (o.nonempty != nonempty_buf)
+            free(o.nonempty);
     }
 done:
     if (cc)
@@ -1798,8 +2056,10 @@ done:
     free(fc.scratchx);
     free(acc);
     free(accx);
-    free(work);
-    free(srcs);
+    if (work != work_buf)
+        free(work);
+    if (srcs != srcs_buf)
+        free(srcs);
     return rc;
 }
 
@@ -1835,9 +2095,16 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
     bq_clusters(q, start, end, &c0, &c1);
     size_t nin = 0;
     int64_t dmin = INT64_MAX, dmax = INT64_MIN;
-    uint8_t *seen = calloc(sn->np + 1, 1);
-    if (!seen)
-        return TSDB_ERR_NOMEM;
+    uint8_t seen_buf[256];
+    uint8_t *seen;
+    if (sn->np < sizeof seen_buf) {
+        memset(seen_buf, 0, sn->np + 1);
+        seen = seen_buf;
+    } else {
+        seen = calloc(sn->np + 1, 1);
+        if (!seen)
+            return TSDB_ERR_NOMEM;
+    }
     for (size_t k = c0 < c1 ? q->cl[c0].a : 0; c0 < c1 && k < q->cl[c1 - 1].b; k++) {
         const item *it = &items[k];
         if (it->hi < start || it->lo >= end)
@@ -1854,7 +2121,8 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
             QS_ADD(memtable_rows, run_cut(&sn->mem[it->src - sn->np], start, end, wd).n);
         }
     }
-    free(seen);
+    if (seen != seen_buf)
+        free(seen);
     if (nin == 0)
         return 0;
     if (bk->kind == BK_ONE)
@@ -1972,7 +2240,9 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
                      int64_t end, slot_fn fn, void *ctx)
 {
     size_t w = type_width(type);
-    src *cur = calloc(sn->np + sn->nmem + 1, sizeof *cur);
+    src cur_buf[64];
+    size_t cur_need = sn->np + sn->nmem;
+    src *cur = cur_need <= sizeof cur_buf / sizeof cur_buf[0] ? cur_buf : calloc(cur_need + 1, sizeof *cur);
     size_t nc = 0;
     int rc = cur ? 0 : TSDB_ERR_NOMEM;
     (void)db;
@@ -1986,7 +2256,8 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         }
     }
     /* memtable runs were cut to the snapshot's range: cut them to this one */
-    mem_run *clipped = calloc(sn->nmem + 1, sizeof *clipped);
+    mem_run clip_buf[16];
+    mem_run *clipped = sn->nmem <= sizeof clip_buf / sizeof clip_buf[0] ? clip_buf : calloc(sn->nmem + 1, sizeof *clipped);
     if (!clipped)
         rc = TSDB_ERR_NOMEM;
     for (size_t i = 0; rc == 0 && i < sn->nmem; i++) {
@@ -2008,9 +2279,37 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         if (src_last_ts(&cur[i - 1]) >= src_first_ts(&cur[i]))
             disjoint = false;
     if (disjoint) {
-        /* no timestamp can appear twice: stream the sources one after another */
+        /* no timestamp can appear twice: stream the sources one after another, reusing one decode buffer pair
+         * across disjoint parts instead of malloc/free per part */
+        int64_t *rts = NULL;
+        uint8_t *rv = NULL;
+        uint32_t rcap = 0;
         for (size_t i = 0; i < nc && rc == 0; i++) {
             src *c = &cur[i];
+            if (c->p && c->gi < c->gj) {
+                uint32_t rows = 1;
+                for (uint32_t k = c->gi; k < c->gj; k++)
+                    rows = MAX(rows, gx_count(c->p, k));
+                rows = MIN(rows, c->p->grows);
+                if (rows > rcap) {
+                    int64_t *nt = realloc(rts, rows * sizeof *nt);
+                    if (nt)
+                        rts = nt;
+                    uint8_t *nv = realloc(rv, rows * w);
+                    if (nv)
+                        rv = nv;
+                    if (!nt || !nv) {
+                        rc = TSDB_ERR_NOMEM;
+                        break;
+                    }
+                    rcap = rows;
+                }
+                c->ts = rts;
+                c->v = rv;
+                c->cap = rcap;
+                c->own = true;
+                IX_HOOK(c->p, c->gi, IX_SRC);
+            }
             rc = src_fill(cc, c, start, end);
             while (rc == 0 && c->loaded) {
                 if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, c->n - c->pos)) {
@@ -2019,20 +2318,24 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
                 }
                 rc = src_advance(cc, c, c->n - c->pos, start, end);
             }
-            /* drained: its buffers go back now, for the next source's malloc to reuse (kept to the end, a query
-               over thousands of small parts grew the heap by all of them, and the trim after it faulted them in
-               again on the next query) */
-            src_free(c);
-            c->own = false;
+            if (c->p) {
+                c->ts = NULL;
+                c->v = NULL;
+                c->own = false;
+            }
         }
+        free(rts);
+        free(rv);
     } else {
         rc = merge_stream(cc, cur, nc, start, end, fn, ctx);
     }
 out:
     for (size_t i = 0; i < nc; i++)
         src_free(&cur[i]);
-    free(cur);
-    free(clipped);
+    if (cur != cur_buf)
+        free(cur);
+    if (clipped != clip_buf)
+        free(clipped);
     return rc;
 }
 
@@ -2192,6 +2495,14 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
     return rc;
 }
 
+static bool snap_has_part_granules(const snapshot *sn)
+{
+    for (size_t i = 0; i < sn->np; i++)
+        if (sn->gi[i] < sn->gj[i])
+            return true;
+    return false;
+}
+
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx)
 {
@@ -2203,8 +2514,13 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
     int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
     if (rc)
         return rc;
-    codec_ctx *cc = cc_get(db);
-    if (!cc) {
+    bool has_parts = snap_has_part_granules(&sn);
+    if (!has_parts && sn.nmem == 0) {
+        snapshot_release(&sn);
+        return 0;
+    }
+    codec_ctx *cc = NULL;
+    if (has_parts && !(cc = cc_get(db))) {
         snapshot_release(&sn);
         return TSDB_ERR_NOMEM;
     }
@@ -2218,7 +2534,8 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
     } else {
         rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
     }
-    cc_put(db, cc);
+    if (cc)
+        cc_put(db, cc);
     snapshot_release(&sn);
     return rc;
 }
@@ -2239,13 +2556,19 @@ int eng_query_raw_parts(eng *db, part **parts, size_t np, uint32_t series, int64
     int rc = snapshot_cut(db, &c, series, type_width(type), start, end, &sn);
     if (rc)
         return rc;
-    codec_ctx *cc = cc_get(db);
-    if (!cc) {
+    bool has_parts = snap_has_part_granules(&sn);
+    if (!has_parts && sn.nmem == 0) {
+        snapshot_release(&sn);
+        return 0;
+    }
+    codec_ctx *cc = NULL;
+    if (has_parts && !(cc = cc_get(db))) {
         snapshot_release(&sn);
         return TSDB_ERR_NOMEM;
     }
     rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
-    cc_put(db, cc);
+    if (cc)
+        cc_put(db, cc);
     snapshot_release(&sn);
     return rc;
 }
@@ -2415,35 +2738,38 @@ static int lttb_finish_bucket(lttb_run *r)
     return 0;
 }
 
-static int lttb_point(lttb_run *r, int64_t ts, uint64_t v, double y)
+enum { LTTB_MODE_BUFFERED = 0, LTTB_MODE_PASS1 = 1, LTTB_MODE_PASS2 = 2 };
+
+static inline __attribute__((always_inline)) int lttb_point_mode(lttb_run *r, int64_t ts, uint64_t v, double y,
+                                                                 int mode)
 {
     uint64_t i = r->i++;
     r->lts = ts;
     r->lv = v;
-    if (i >= r->n) {
+    if (UNLIKELY(i >= r->n)) {
         r->err = TSDB_ERR_CORRUPT; /* the count disagrees with the rows */
         return 1;
     }
-    if (i == 0) {
+    if (UNLIKELY(i == 0)) {
         r->t0 = ts;
         r->ax = 0;
         r->ay = y;
         r->b = 0;
         r->bend = lttb_start(r, 1);
         r->best = -1;
-        return r->pass == 1 ? 0 : lttb_emit(r, ts, v);
+        return mode == LTTB_MODE_PASS1 ? 0 : lttb_emit(r, ts, v);
     }
-    if (i == r->bend) {
+    if (UNLIKELY(i == r->bend)) {
         if (lttb_finish_bucket(r))
             return 1;
         r->b++;
         r->bend = r->b < r->nb ? lttb_start(r, r->b + 1) : r->n;
     }
     double x = lttb_x(r, ts);
-    if (r->buffered) {
+    if (mode == LTTB_MODE_BUFFERED) {
         r->nxt.ts[r->nxt.n] = ts;
         r->nxt.v[r->nxt.n++] = v;
-    } else if (r->pass == 2 && r->b < r->nb) {
+    } else if (mode == LTTB_MODE_PASS2 && r->b < r->nb) {
         double a = lttb_area(r->ax, r->ay, r->mx[r->b], r->my[r->b], x, y);
         if (a > r->best || r->cnt == 0) { /* the first of equal areas wins */
             r->best = a > r->best ? a : r->best;
@@ -2459,17 +2785,38 @@ static int lttb_point(lttb_run *r, int64_t ts, uint64_t v, double y)
     return 0;
 }
 
-/* raw rows to lttb_point, without nulls, NaN and infinities */
-static int lttb_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+static inline __attribute__((always_inline)) int lttb_loop(lttb_run *r, const int64_t *ts, const void *v, size_t n,
+                                                           int type, int mode)
 {
-    lttb_run *r = arg;
+    size_t w = type_width(type);
     for (size_t k = 0; k < n; k++) {
-        uint64_t x = slot_get(v, r->w, k);
+        uint64_t x = slot_get(v, w, k);
         double y;
-        if (lttb_value(r->type, x, &y) && lttb_point(r, ts[k], x, y))
+        if (lttb_value(type, x, &y) && lttb_point_mode(r, ts[k], x, y, mode))
             return 1;
     }
     return 0;
+}
+
+static int lttb_cb_mode(lttb_run *r, const int64_t *ts, const void *v, size_t n, int mode)
+{
+    switch (r->type) {
+    case TSDB_FLOAT32: return lttb_loop(r, ts, v, n, TSDB_FLOAT32, mode);
+    case TSDB_FLOAT64: return lttb_loop(r, ts, v, n, TSDB_FLOAT64, mode);
+    case TSDB_INT64:   return lttb_loop(r, ts, v, n, TSDB_INT64, mode);
+    default:           return lttb_loop(r, ts, v, n, TSDB_BOOL, mode);
+    }
+}
+
+/* raw rows to lttb_point, without nulls, NaN and infinities; type and mode hoisted outside the row loop */
+static int lttb_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    if (r->buffered)
+        return lttb_cb_mode(r, ts, v, n, LTTB_MODE_BUFFERED);
+    if (r->pass == 1)
+        return lttb_cb_mode(r, ts, v, n, LTTB_MODE_PASS1);
+    return lttb_cb_mode(r, ts, v, n, LTTB_MODE_PASS2);
 }
 
 /* n <= threshold: every point, in runs straight from the decode buffers */
@@ -2495,12 +2842,26 @@ static int lttb_all_cb(void *arg, const int64_t *ts, const void *v, size_t n)
     return 0;
 }
 
-static int lttb_count_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+static inline __attribute__((always_inline)) uint64_t lttb_count_loop(const void *v, size_t n, int type)
 {
-    lttb_run *r = arg;
+    size_t w = type_width(type);
+    uint64_t cnt = 0;
     for (size_t k = 0; k < n; k++) {
         double y;
-        r->n += lttb_value(r->type, slot_get(v, r->w, k), &y);
+        cnt += lttb_value(type, slot_get(v, w, k), &y);
+    }
+    return cnt;
+}
+
+static int lttb_count_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    (void)ts;
+    lttb_run *r = arg;
+    switch (r->type) {
+    case TSDB_FLOAT32: r->n += lttb_count_loop(v, n, TSDB_FLOAT32); break;
+    case TSDB_FLOAT64: r->n += lttb_count_loop(v, n, TSDB_FLOAT64); break;
+    case TSDB_INT64:   r->n += lttb_count_loop(v, n, TSDB_INT64); break;
+    default:           r->n += lttb_count_loop(v, n, TSDB_BOOL); break;
     }
     return 0;
 }
@@ -2654,8 +3015,13 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
     int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
     if (rc)
         return rc;
-    codec_ctx *cc = cc_get(db);
-    if (!cc) {
+    bool has_parts = snap_has_part_granules(&sn);
+    if (!has_parts && sn.nmem == 0) {
+        snapshot_release(&sn);
+        return 0;
+    }
+    codec_ctx *cc = NULL;
+    if (has_parts && !(cc = cc_get(db))) {
         snapshot_release(&sn);
         return TSDB_ERR_NOMEM;
     }
@@ -2750,7 +3116,8 @@ out:
         free(r->my);
         free(r);
     }
-    cc_put(db, cc);
+    if (cc)
+        cc_put(db, cc);
     snapshot_release(&sn);
     return rc;
 }

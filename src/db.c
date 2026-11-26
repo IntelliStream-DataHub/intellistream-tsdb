@@ -84,11 +84,65 @@ void tsdb_options_init(tsdb_options *o)
 
 __thread size_t cc_gets; /* per thread: a shared counter would be one more line every reader writes */
 
-/* cc_lock is one mutex per volume that every reader meets: take a context only for work that decodes (the bucket
- * and TWA paths take theirs lazily), or queries answered from statistics alone queue here at many connections */
+/* One volume-independent codec_ctx cached per thread via pthread_key_t TLS (destructor frees on thread exit;
+ * no atexit() inside libtsdb.so). Nested callers on the same thread (e.g. merge_parts holding a part_writer's
+ * context and a read context at once) or key creation failure fall back to the volume's cc_lock pool. */
+typedef struct cc_tls_slot {
+    codec_ctx *c;
+    bool in_use;
+} cc_tls_slot;
+
+static __thread cc_tls_slot *cc_tls;
+static pthread_key_t cc_key;
+static bool cc_key_ok;
+static pthread_once_t cc_once = PTHREAD_ONCE_INIT;
+
+static void cc_tls_free(void *arg)
+{
+    cc_tls_slot *s = arg;
+    if (!s)
+        return;
+    if (cc_tls == s)
+        cc_tls = NULL;
+    if (s->c && !s->in_use)
+        codec_free(s->c);
+    free(s);
+}
+
+static void cc_tls_init(void) { cc_key_ok = pthread_key_create(&cc_key, cc_tls_free) == 0; }
+
+static cc_tls_slot *cc_tls_get_slot(void)
+{
+    cc_tls_slot *s = cc_tls;
+    if (LIKELY(s != NULL))
+        return s;
+    pthread_once(&cc_once, cc_tls_init);
+    if (!cc_key_ok)
+        return NULL;
+    s = calloc(1, sizeof *s);
+    if (!s || pthread_setspecific(cc_key, s) != 0) {
+        free(s);
+        return NULL;
+    }
+    cc_tls = s;
+    return s;
+}
+
+/* cc_lock is one mutex per volume that every reader meets when TLS is busy: take a context only for work that
+ * decodes (the bucket, TWA and raw paths take theirs lazily), so queries from statistics alone take none */
 codec_ctx *cc_get(eng *db)
 {
     cc_gets++;
+    cc_tls_slot *s = cc_tls_get_slot();
+    if (LIKELY(s && !s->in_use)) {
+        if (!s->c) {
+            s->c = codec_new();
+            if (!s->c)
+                return NULL;
+        }
+        s->in_use = true;
+        return s->c;
+    }
     pthread_mutex_lock(&db->cc_lock);
     codec_ctx *c = db->cc_free;
     if (c)
@@ -99,6 +153,13 @@ codec_ctx *cc_get(eng *db)
 
 void cc_put(eng *db, codec_ctx *c)
 {
+    if (!c)
+        return;
+    cc_tls_slot *s = cc_tls;
+    if (LIKELY(s && s->c == c)) {
+        s->in_use = false;
+        return;
+    }
     pthread_mutex_lock(&db->cc_lock);
     c->next = db->cc_free;
     db->cc_free = c;

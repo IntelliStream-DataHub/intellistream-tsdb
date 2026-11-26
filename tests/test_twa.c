@@ -1080,6 +1080,56 @@ static void test_retention_carry(void)
     rmrf(dir);
 }
 
+/* P-35: specialized feed_rows for FLOAT64 and INT64 (with nulls, STEP and LINEAR, decoded vs stats). */
+static void test_typed_feed(void)
+{
+    char dir[600];
+    tsdb *db = open_db("typed_feed", 64, dir);
+    tsdb_sid sf64, si64;
+    OK(tsdb_series_create(db, "f64", TSDB_FLOAT64, NULL, &sf64));
+    OK(tsdb_series_create(db, "i64", TSDB_INT64, NULL, &si64));
+    const size_t N = 2000;
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *vf = malloc(N * sizeof *vf);
+    int64_t *vi = malloc(N * sizeof *vi);
+    uint8_t *val = calloc((N + 7) / 8, 1);
+    for (size_t i = 0; i < N; i++) {
+        ts[i] = (int64_t)i * 1000 + (int64_t)(i % 5) * 100;
+        vf[i] = (double)(i % 97) * 1.125 - 50.0;
+        vi[i] = (int64_t)(i % 97) * 100000LL - 5000000LL;
+        if (i % 19 != 7)
+            val[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+    OK(tsdb_insert_series_values(db, sf64, ts, &(tsdb_values){TSDB_FLOAT64, vf, val}, N));
+    OK(tsdb_insert_series_values(db, si64, ts, &(tsdb_values){TSDB_INT64, vi, val}, N));
+    OK(tsdb_flush(db));
+    tsdb_sid both[2] = {sf64, si64};
+    for (int s = 0; s < 2; s++) {
+        for (int m = 0; m < 2; m++) {
+            tsdb_twa_opts o_fast = {.method = m};
+            tsdb_twa_opts o_dec = {.method = m, .no_stats = 1};
+            tsdb_twa_bucket *bf = NULL, *bd = NULL;
+            size_t nf = 0, nd = 0;
+            OK(tsdb_query_twa(db, both[s], 0, (int64_t)N * 1000, 128000, &o_fast, &bf, &nf));
+            OK(tsdb_query_twa(db, both[s], 0, (int64_t)N * 1000, 128000, &o_dec, &bd, &nd));
+            CHECK(nf == nd && nf > 0);
+            for (size_t k = 0; k < nf && k < nd; k++) {
+                CHECK(bf[k].start == bd[k].start && bf[k].covered_ms == bd[k].covered_ms &&
+                      bf[k].count == bd[k].count);
+                CHECK(near(bf[k].area, bd[k].area) && near(bf[k].twa, bd[k].twa));
+            }
+            free(bf);
+            free(bd);
+        }
+    }
+    OK(tsdb_close(db));
+    free(ts);
+    free(vf);
+    free(vi);
+    free(val);
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_twa", 1200);
@@ -1091,6 +1141,7 @@ int main(int argc, char **argv)
         return 1;
     test_rules();
     test_stats_only();
+    test_typed_feed();
     test_history(0);
     test_history(1);
     test_long_gap();
