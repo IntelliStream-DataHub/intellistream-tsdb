@@ -76,6 +76,13 @@ make jepsen-cluster       # 5 tsdbd (a proxy of the harness in front of every pe
                           # learner and no v<N>.snap, v<N>.old, v<N>.removed-* or snap_* on any node. make jepsen-cluster runs them
                           # after the others on kv and classes (JEPSEN_R4_WORKLOADS, JEPSEN_R4_NEMESES, `none` leaves them out): IO x 2 x
                           # the built ones more runs of JEPSEN_SECONDS: 20 runs, about 100 min at 300 s)
+                          # `jepsen-cluster-ec` (`JEPSEN_EC=4+2`, `JEPSEN_EC_NODES=7`; `JEPSEN_EC=` skips): runs `--ec K+M`
+                          # (`tests/jepsen/cluster_ec.h`, `nodes >= 2` use `--io epoll` per D15), two chunk stores per node,
+                          # nemeses `kill partition partial pause diskloss rot midcommit power` (when `TSDB_EC` is built),
+                          # live per-replica verification across all ISR members via `VOLUME_TRANSFER`, `kvr.fill` batch
+                          # check, and settled `.ec` part count; selftest checks `ec-diverged`, `ec-member-differs`,
+                          # `ec-notransfer`, `ec-nosettle`, and server mutants `ycold`, `ecabovey`, `cutnogate`;
+                          # `jepsen_cluster --ec 16+4 --nodes 22` tests 22-node geometry (2 io_uring + 20 epoll)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
@@ -203,7 +210,10 @@ cgroup, so `nice` does not keep your work out of its way.
   setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). `TSDB_REPLD_TEST=keepall` keeps every
   leader segment, for the tests that fill a learner from the log (a fresh learner otherwise gets a snapshot, below).
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
-  decoder; the `jr_intent`/`jr_commit` hook that will carry them is in `src/internal.h`, a no-op).
+  decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13 = `MK_TYPE_LAST`, `MK_EC_LATER_LO..HI` = 14..15 reserved
+  for R10 and admitted nowhere; `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
+  mutants `mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired`; `jr_intent`/`jr_commit` and `jr_cold`/
+  `jr_markers_append`/`jr_markers_wait` in `src/replica.c` carry them).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
   per-partition vectors, the HyperLogLogs of active series, the hot lists (reads, writes, bytes per row) and the
   sampled page-cache residency; `tests/test_tenants.c` is their oracle, `tests/test_cli_stats.sh` the CLI's test.
@@ -389,19 +399,27 @@ cgroup, so `nice` does not keep your work out of its way.
   (heal, repair, settle, attach, replace: rebuilt chunks are checked against the survivors' sums, written as new files at
   the object's epoch, never from fewer than k' positions, never for what `live` says is deleted; a new store gets every
   fence before its first chunk). `tests/test_chunk.c`, `tests/test_chunk_heal.c` (mutants in the Makefile).
-- `src/ecgc.c` (R7, r7-gc): the objects of retired `.ec` parts and orphans. A retired `.ec` keeps its `retired_` name
-  until every chunk of its object is deleted (`part_unref` leaves it: `ecgc_owns_name`); nothing is deleted while a part
-  of the object is referenced (holds in the tier, keyed (volume, oid)); the chunk I/O runs on the tier's worker, never
-  under an engine lock. The open sweeps (D6: after recovery, before any thread of the engine starts) the objects no
-  listed or retired name names, by file name only, reading one header per such object: only those whose header names
-  the volume's uuid are queued (another database on the same stores is left alone; `chunk_store_del` too refuses a
-  chunk of another vuuid as NOTFOUND). A test that puts objects named by no `.ec` file and reopens sets
-  `ecgc_test_nosweep` (test_seam, test_tier). `tests/test_ecgc.c` (mutants in the Makefile). The sweep is skipped on
-  every ec cluster volume (`db->ppos`), leaders included: on a replica it would delete the objects of a COLD not yet
-  applied (with the sweep there, test_ecapply `apply` loses its rows); a leader's crash orphans (chunks put, no marker) stay until r8k's
-  MK_GC rules. Also r8k's (D13): a replica now lists `.ec` parts, and its own retention drop retires them through the
-  R7 purge (`ecgc_retire_locked` -> `ecgc_purge_entry`), which deletes the shared object's chunks with no committed
-  MK_GC; nothing gates that on a cluster volume yet.
+- `src/ecgc.c`, `src/ecgcmk.c` (R7, r7-gc; R8, r8k-gc; D6, D13, E14): retired `.ec` parts and their objects. Single-server
+  tiers keep R7's rules: a retired `.ec` keeps its `retired_` name until every chunk of its object is deleted
+  (`part_unref` leaves it: `ecgc_owns_name`); nothing is deleted while any `.ec` part of the object is open (holds in
+  the tier acquired in `part_open_ec` via `ecgc_hold` and dropped in `ecgc_last_unref`, keyed by `const part *` and
+  `(volume, oid)` in O(1) open-addressing hash tables); chunk I/O runs on the tier's worker, never under an engine lock;
+  the open sweeps orphans (D6: after recovery, before any thread starts) by file name, reading one header per object to
+  check `vuuid`. On cluster EC volumes (`db->ec_cluster`): `ecgc_purge_entry` returns false and `ecgc_open_sweep` is
+  skipped; deletes go exclusively through committed `MK_GC` via `ecgcmk_work` on the tier's GC worker (`ecgc_tier_work`).
+  The leader appends `MK_GC` (`MK_GC_RETIRED` for retired `.ec` objects past `obsolete_part_lifetime_s` with zero holds,
+  even when `gc_suspended`; `MK_GC_ORPHAN` for orphans meeting E14's four conditions: not named by any listed or retired
+  `.ec` or any WAL `MK_COLD`/`MK_DIGEST` record committed or uncommitted, written in an earlier epoch `< leader_epoch`,
+  older than `GCMK_ORPHAN_GRACE_DEFAULT_MS` 60000 ms, and `gc_suspended` false), waits for commit, issues `CHUNK_DEL` to
+  all stripe positions with its `lead_epoch` (`coldvol_epoch`) and the `MK_GC` marker's position (`mk_pos > 0`; `ABSENT`
+  counts as deleted), and appends `MK_GC_DONE` once every position answers; `CHUNK_ERR_FENCED` stops GC on a deposed
+  leader (`fenced`). Every member applies `MK_GC` in `ecgcmk_apply`: retires any still-listed `.ec` of those oids first,
+  records pending oids in the durable checksummed `GCMK` file (48-byte offset-bound xxh64 records, torn tail cut,
+  compacted via `GCMK.tmp` + `tsdb_fdatasync` + `rename` + dir fsync), unlinks `retired_` names with directory fsync,
+  and clears `GCMK` + lingering `retired_` entries on `MK_GC_DONE`; a promoted leader drains pending oids from `GCMK`.
+  `tests/test_ecgc.c` (mutants `gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop
+  noretrytimer gcuncommitted gcnamedorphan gcsuspendignored holdatretire gcreplicanoop`), `test_cluster ecgc`, and
+  `make ecgc-mutants` (`gcsuspendignored gcreplicanoop`).
 - `src/snapshot.[ch]` (R4 D3, D4; design-cluster.md 5.2-5.3, 8.1): the make side of a leader's snapshot. `snap_make`
   takes the cut P (the commit point) under `flush_lock` then `publish_lock` with no I/O (the part list, the memtables'
   segments and S, RSTATE, the COMMIT markers' files), releases both, hard links every part before it reads any (by its
@@ -537,16 +555,50 @@ cgroup, so `nice` does not keep your work out of its way.
   file name against every predicate, `make NO_EC=1`), `test_settle.c`, `test_settle_oracle.c`, `test_ecgc.c`, each with
   its planted bugs (`--mutant NAME`, a Makefile loop that requires each to fail). A test that cannot run without the codec
   prints that it is skipped.
-- `server/chunksrv.[ch]` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on every cluster member with
-  kinds CHUNK (6, requests and answers, worked by 4 FIFO workers) and CHUNKB (7, puts as bulk files; the link's callbacks
-  only queue, a put thread per peer does the store I/O (peerlink.h:24-26), and the queue is bounded per peer). Every
-  request raises the volume's fence first (E14); an unsure store is raised only from `chunksrv_epoch_source` (r8f's
-  hook, D9), and then to the highest epoch the member's sure stores hold, never below it. LIST pages never split the
-  copies of one (oid, pos). `server/chunksrv_cluster.c` opens `--chunk-dir` stores at start (META's cluster and node:
-  `tsdb chunk-store init`), listens once a member, follows the members (`chunksrv_keep_peers` stops those that left);
-  `TSDB_CHUNKSRV_TEST` is its test hook for `test_cluster chunksrv`. `tests/test_chunksrv.c` (mutants in the Makefile),
+- `server/chunksrv.[ch]`, `server/chunksrv_cluster.c` (R8 D9-D11, E14, E26, E27): the chunk server, a peerlink of its own on
+  every cluster member with kinds `PL_KIND_CHUNK` (6, requests and answers, worked by 4 FIFO workers) and `PL_KIND_CHUNKB`
+  (7, puts as bulk files under `--chunk-rate-mb-s`; the link's callbacks only queue, a put thread per peer does the store
+  I/O (peerlink.h:24-26), and the queue is bounded per peer at 16 MiB). Every request raises the volume's fence first
+  (E14); an unsure store is raised only from `chunksrv_epoch_source` (`chunkpeer_epoch_source`, D9), and then to
+  max(source, backend fence, every sure store's epoch), never from a request. LIST pages never split the copies of one
+  (oid, pos). `chunksrv_cluster.c` opens `--chunk-dir` stores at start (`flock`, META checked against cluster UUID and
+  node ID from `tsdb chunk-store init PATH --cluster UUID --node ID`), listens once a member, follows the members
+  (`chunksrv_keep_peers` stops those that left); EC cluster volumes are production in 0.11.0 (no `--ec-experimental`
+  flag). `TSDB_CHUNKSRV_TEST` is its test hook for `test_cluster chunksrv`. `tests/test_chunksrv.c` (mutants
+  `chunknofence chunkselfraise putokearly nocellcheck storeforeign nometacheck sumsonly noreqcheck noopmatch norespcheck`),
   `test_peerlink chunk`, `tests/test_cli_chunkstore.sh`, fuzz-replframe mode 9. Open: a store that hangs (not fails) in
   fdatasync holds the backend's fence mutex and stalls every request (R13's health domains).
+- `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
+  cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
+  position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally
+  and sends others over `CHUNKB`, comparing every `PUT_OK`'s `cs_put_answer_hash` (no degraded settle in R8: E10 is
+  R9's); `obj_open`/`obj_read` fan out per position on detached threads (`k' + 200 ms` grace, `UNAVAILABLE` vs `CORRUPT`
+  per E15); `del` (R7 queue/sweep) refuses on cluster volumes while `del_gc` sends `CHUNK_DEL` only with a committed
+  `MK_GC` position (`mk_pos > 0`); `see_epoch` / `writable` re-check unfenced or unsure members at most once a second.
+  Epoch provider: `coldvol.lead_epoch` when leading (set at attach and `wal_open`, so a deposed leader with a current
+  copy still puts/deletes at its own epoch and is fenced), else `chunkpeer_epoch` (copy's epoch); `chunkpeer_epoch_source`
+  answers only while `cluster_copy_caught_up_at()`. `chunksrv_cluster_hold`/`release` guard shutdown. `tests/test_chunkpeer.c`
+  (mutants `ownepoch nosumcmp staleraise delbeforegc sticky unsuredown`), `test_cluster ecbasic|ec16`,
+  `make chunkpeer-mutants` (`ownepoch staleraise`).
+- `src/ecdiverge.[ch]` (R8 r8i; D8, D23, E26): durable `DIVERGED` file in the volume directory (48-byte offset-bound
+  xxh64 records, torn tail cut after `tail_confirm`, damage fails open, `fdatasync` + `eng_sync_dir` on first record
+  before `db->diverged` is visible, fail-stop on write/sync error), read by `ecdiverge_open` before any engine thread
+  starts. `tsdb DIR volume diverged [--clear]` prints or clears it (refused with `TSDB_ERR_LOCKED` while open, and with
+  `TSDB_ERR_INVALID` on cluster volumes `META_REQ_CLUSTER` until R4 rebuild). In `server/tsdbd.c`, one path
+  `vol_diverged()` (`tsdb_volume_diverged` OR `dom.vol[v].diverged`), checked first in `vol_health`, drives `STATUS`,
+  `UNAVAILABLE` (`TSDB_WHY_DIVERGED`, 60 s retry), `TOPOLOGY` and `tsdb_volume_diverged` metric (root volume included);
+  `server/repld.c` stops a diverged replicated volume (`vol_fail`, leaves ISR, leader deposed) and `server/cvol.c`
+  `on_report` sets `CL_HEALTH_LOCAL_FAULT` from the first heartbeat. `tests/test_diverge.c` (mutants `nocorrupt seed0
+  nocut notailconfirm readerrend nofail nodirsync nofdatasync metaopen`), `fuzz_diverge`, `test_keep` (`divergemem`,
+  `clearcluster`), `test_cluster diverged` (`TSDB_REPLD_TEST=plantdiverge`, `repld_mutants` `divergeisr`),
+  `test_cli_diverged.sh`.
+- `server/margins.[ch]` (R8 r8o; E15, E24): `margins_of` computes `young_margin` (`nisr - 1`, omitted for shared volumes)
+  and, for EC volumes, `settled_margin` (present stripe positions minus `k`, counting UP/DRAINING members not declared
+  destroyed) and `settled_state` (`ok`, `unavailable`, `corrupt`, `lost`). Exposed in `STATUS` and metrics
+  (`tsdb_volume_young_margin`, `tsdb_volume_settled_margin`, `tsdb_volume_settled_state`, `tsdb_volume_margins_missing`;
+  TOPOLOGY waits for protocol 16). `TSDB_WHY_LOST` = 18 (`TSDB_RETRY_MAX_MS`, never retried by the four clients).
+  `tests/test_margins.c` (mutants `marginoff youngrep lostasdown sharedcopies corruptfirst jepsenlost`), `test_cluster
+  margins`, `make margin-mutants` (`marginoff youngrep lostasdown lostnowait youngcorrupt`).
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
@@ -789,37 +841,67 @@ cgroup, so `nice` does not keep your work out of its way.
   a `v<N>` the record does not name is never opened, and one that is missing while the group recorded an open of it is
   refused, never made again by itself. One move per volume; a move's shrink never takes the ISR below the size it had
   before the new member joined (`repl_leave`, `min_isr`).
-- **Settled parts** (R7; `src/ecpart.c`, `src/ecswap.c`, `src/settle.c`, `src/eckeep.c`, `src/ecgc.c`; design-cluster-data.md
-  §2.3 as it applies on one server). A settle turns the `p<K>_<A>_<B>_<L>.part` of a key into the `.ec` of the same name:
-  the file keeps its source's name and block range (D2), so it has the same rows, the same rank and the same key, and a
-  settle needs no gate, cut, marker or `ppos` (D1). Every path that takes a part out of the list must respect that:
+- **Settled parts** (R7 single-server, R8-1 cluster EC, R10 single-server re-encode; `src/ecpart.c`, `src/ecswap.c`,
+  `src/settle.c`, `src/eccold.c`, `src/ecapply.c`, `src/ppos.c`, `src/ecdigest.c`, `src/ecdiverge.c`, `src/eckeep.c`,
+  `src/ecgc.c`, `src/ecgcmk.c`; `docs/design-cluster-data.md` §2.3). On one server (R7, D2) a settle turns
+  `p<K>_<A>_<B>_<L>.part` into `.ec` of the same name and block range (no gate, cut, marker or `ppos`); on a cluster
+  EC volume (R8-1) the leader settles whole keys at a cut `Z` with `MK_COLD`, `PPOS`, `MK_DIGEST`, `MK_GC`, and durable
+  `DIVERGED`. Every path that takes a part out of the list must respect that:
   - **Never a merge input.** An `.ec` part and a `settling` one are barriers in merge selection, rewrites, `tsdb_optimize`
     and the TTL rewrite (`part_merge_barrier`), never a source of `pw_copy_granule`; an `.ec` part is not counted in
     `partition_parts` (a settling part still counts: it is a `.part` until the swap), and in `db_wait_merges` (backpressure) it is a wall, not a pair, so an insert never waits for a
-    settle in flight when no pair is left. A drop retires them (a settling part without waiting for the settle).
+    settle in flight when no pair is left. A drop retires them (a settling part without waiting for the settle). On a
+    cluster EC leader (`db->ec_cluster`), `ttl_select_locked` (`src/merge.c`) also skips a key with a settling part
+    (mutant `ttlsettling`).
   - **The swap checks its inputs under `db->lock`, in the hold of its renames** (`ec_swap_commit`): every source still
     listed, not dropped, not merging; else `TSDB_ERR_STOPPED`, nothing renamed, the temporaries unlinked and the objects
     handed to r7-gc. On a failed engine the answer is `TSDB_ERR_IO` and nothing is renamed or removed: the next open
     decides (only 0 means the `.ec` parts are listed; after IO a caller must not treat them as never listed). A drop takes no `publish_lock` (`drop_retire` takes `latest_rw` and
     `db->lock`), so a check made before those locks would list an `.ec` for a part the drop retired and bring its rows
     back (mutant `swapnodropcheck`). The swap is **intent v4** (`tsdb-intent 4 n`, n `L tmp final` lines, n `R part
-    settled_part` lines, a hash), written and synced with its directory before any rename. Recovery asks one question:
+    settled_part` lines, a hash; R10 single-server re-encode `ec_swap_reencode` uses `tsdb-intent 4 1 <nin>` with `R
+    <p.ec> <retired_p.ec>` for `.ec` sources and `lt_merge_marks` in its write section), written and synced with its
+    directory before any rename. Recovery asks one question:
     did the swap rename anything? Any `.ec` (under its name or `retired_`) or `settled_` name on disk means the check
     passed and the swap stands (a drop after it retires only the `.ec` parts), and a missing source then proves nothing;
     nothing renamed with every tmp and source present rolls forward, with one missing rolls back; damage (a sealed
     intent that breaks the name rules, an `.ec` under no name while its source is still `.part`, a source under
     `retired_` and not `settled_` although the swap renamed, a lookup error that is not ENOENT) fails the open with the intent kept. The directory is synced before the intent is unlinked, as every
-    rolled-forward intent now is (`tests/test_intents.c`). On an ec cluster volume (R8) every `.ec` name gets its PPOS
-    record (`src/ppos.h`: the object record's `ppos`, the cut Z) appended and synced before the intent is written
-    (`ecapply_swap_pre`), never after the renames: the open fails on a listed part without one (`test_eccold swappower`,
-    crashfs at every step of a settle, a drop of its `.ec` and a compacting open; mutants `pposswapnone pposswapafter`).
+    rolled-forward intent now is (`tests/test_intents.c`). On a cluster EC volume (R8) `ecapply_swap_pre` sets
+    `*logged` (so a refusal from there on fails the engine and never hands objects to `r7-gc` or the caller: mutant
+    `swaploggedgc`), records `PPOS` for every `.ec` name at `Z` (`src/ppos.h`, never after the renames: mutants
+    `pposswapnone`, `pposswapafter`), and records leader RSTATE `doing` (`jr_cold_precommit`) before the intent's commit
+    point, then `ecapply_swap_post` writes `done` (`jr_cold_commit`) after the renames (`test_eccold swappower`,
+    `test_ecapply`, mutant `leaderswapnors`).
+  - **`PPOS` (R8, `src/ppos.[ch]`; D2, D3).** Cluster EC volumes (`db->ec_cluster`) keep a per-volume checksummed
+    append-only `PPOS` file (32-byte records `{name xxh64, ppos, flags, 0, offset-seeded xxh64}`, torn tail cut at open,
+    bad record before a valid one fails open, compacted via `PPOS.tmp` when > half dead). Every listed part (`.ec` too)
+    must have a record at open (`TSDB_ERR_CORRUPT` otherwise); `PPOS_UNKNOWN` (`UINT64_MAX`) marks parts of unknown
+    position. Appended and `fdatasync`ed before the part name is visible: a flush gets each part's `ppos` from a
+    per-memtable map `base_partition -> highest fno` fed under `buf_lock` at all three append sites (`mem_insert`, replay,
+    `apply_rows` via `eng_ppos_rows`; fallback `fno_hi` if map lost), `parts_commit` uses `jr_part_pos(db)`, merges take
+    the max `ppos_of` over inputs, and settles use `Z`. `tests/test_ppos.c` (crashfs at every step, mutants `pposafter
+    pposnosync pposflushhi pposreplay pposunknown0 pposfallback0 pposnofail pposnobadgood pposflags`).
+  - **The leader's settle cut (R8, `src/eccold.[ch]`, `src/ecpolicy.c`; D4, D18, D21).** The cluster policy settles
+    whole keys only of any class (no per-part, coarse or eager settle) once `phi + grace_s <= now` (by `MK_NOW`), no
+    merge is selectable, no row expires within `keep_s + retain_s + 1 h` (`expires_within`), level > 0 only (D18), never
+    on a diverged engine, waiting for natural flushes until `grace_s + force_s`, and capped per marker (`MK_FILES_MAX`).
+    `eccold_settle`: (1) pin `I` (`settling`); (2) encode & put objects outside every lock (epoch `coldvol_epoch()`,
+    `sv0`), waiting for positions only if they dropped during puts (up to `settle_wait_max_s`, never under the gate;
+    gives up at once if a position is down before the first put); (3) close gate `lw_enter` (`jr_serial` + fence over
+    all `MK_BUCKETS` series buckets of key's time range), `L = log_end`, rotate/flush memtable if overlapping P (`F =
+    wal_flushed`), `eng_leader_wait(L)`, `Z = log_end`, re-check stripe; (4) `Y` = listed non-.ec parts of P not in `I`
+    (merging -> `STOPPED`); (5) write `.ec` files (`ppos = Z`, `stripe_version = sv0`) and append/wait `MK_COLD` via
+    `jr_cold` (crash point `cold-after-marker` right after append; `INDETERMINATE` if deposed: engine runs on); (6)
+    `ec_swap_commit` (non-zero after committed marker fails the engine), then `lw_leave`. `tests/test_eccold.c` (mutants
+    `cutnogate cutnowait ttlsettling cutnorotate fencekeyonly stripewaitfenced pposswapnone pposswapafter jrbarge`).
   - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
     marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
     check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's
     order), records PPOS for every new name at Z (Y too, which design 2.3 lets keep the leader's ppos: at Z is
     conservative for the `<= Z` rule) and RSTATE `doing` before the intent, then under `publish_lock`, `latest_rw` and
     `db->lock` checks its own parts of the key (any with a ppos above Z, or with no PPOS record, which is unknown: nothing
-    retired, DIVERGED; none listed: the key was dropped, nothing listed) and writes **intent v5** (`N tmp final` per
+    retired, durable `DIVERGED`; none listed: the key was dropped, nothing listed) and writes **intent v5** (`N tmp final` per
     `.ec`, `Y tmp final`, `R part settled_part` per own part, a hash), fdatasyncs it and the directory, renames N, Y, R and
     syncs the directory. A merge of its own parts in flight finds them `dropped` and drops its output. Recovery
     (`ecapply_recover`, first pass of `intents_recover`): any new name on disk means the apply stands; nothing renamed
@@ -828,39 +910,57 @@ cgroup, so `nice` does not keep your work out of its way.
     reported by the generic path with insert wording. `ecapply_cold_decide` (RSTATE `doing` at a replay, on a leader too:
     its swap records the COLD): every oid listed is done, none is not, some or one twice is damage. Crash points
     `cold-before-apply`, `cold-mid-intent` (after the `.ec` renames). `tests/test_ecapply.c` (power loss at every step
-    of the apply and of the recovering open, a tampered marker, several objects, a second COLD of a key; mutants in the
-    Makefile).
+    of the apply and of the recovering open, a tampered marker, several objects, a second COLD of a key; 17 mutants in the
+    Makefile: `recnodirsync v5nodirsync coldnoflushthrough ycold ecabovey pposignored leaderswapnors pposafterswap
+    mergekept notfoundzero noorder checkz seenskip noyhcheck decidesome recrollmissing recnodiverge`).
   - **The settle reads each byte once.** `eng_settle` checks the granule crcs, the footer hash and the class judgement on
     the stripe copy it then encodes (`chunk_be_put_stream`): a check on a second read could pass on bytes that differ
     from the encoded ones (mutant `settletwopass`). A CORRUPT check marks the part damaged and writes no chunk.
   - **The read seam always checks**, with `verify_checksums` off too (above): an `.ec` granule is never decoded from
     bytes nobody checked, so a damaged chunk is an erasure and never wrong values (mutants `seamnoverify`, `cachekeyoff`).
+    `src/eccache.c` also runs sequential granule prefetch (R8 D19, `r8p-prefetch`): a miss continuing a walk in 16
+    per-cache stream slots reads `N` = 4..32 granules in one RAW range read (bounded by `budget/4` and 4 MiB, pinned
+    entries never evicted, falling back to single demand reads on range failure; `test_seam` mutants `prefetchnocheck
+    prefetchevictpinned prefetchnodouble prefetchdupkey prefetchforgetlive prefetchnofallback`).
   - **The source stays for `keep_s` from the record's `settle_ms`**, and for as long as its digest has not matched.
-    A digest that does not match sets `db->diverged`: the volume answers `TSDB_ERR_UNAVAILABLE`, the `settled_` files are
-    kept. The way out (a reverse intent that swaps `settled_` back, an operator command) comes with R15: in R7 the tier
-    is test-only, and tsdbd cannot yet say DIVERGED for it (docs/tasks/r7-keep-followups.md). The flag is in memory
-    only: an in-process reopen carries it, but a restart clears it, and the new engine then serves the `.ec` part until
-    its open digest has run and failed again (that digest waits while any store is not UP, so indefinitely with a store
-    down). A restart is not a way out; making the flag durable, or the open refuse until the digest has run, is R15's
-    (or R8's) job. E26's logical digest of the
-    visible rows is not built; R7's is a byte digest of the object (docs/tasks/r8-from-r7.md).
+    On one server (and for a cluster leader's own `settled_` files), `src/eckeep.c` runs R7's byte digest; in a cluster
+    (R8, `src/ecdigest.[ch]`, `src/eckeep.c`; E26, D6, D7, D25), the leader computes `ec_logical_digest` of `I ∪ Y`
+    (rows per series in `(series, ts)` order visible under the retention cutoff at `now_ms` without clamping, plus
+    canonical per-series tombstone union clipped to `[max(cutoff, key start), key end)` when `MKD_TOMBS` is set under
+    `ret_lock`) and appends `MK_DIGEST` (`now_ms`, `MKD_TOMBS`, oids, digest). A replica's COLD apply binds its retired
+    `settled_` files in an unarmed `digest_<key>_<z>` job file, `ecdigest_apply` arms it (`ECDJ_ARMED`, superseding
+    earlier unarmed jobs of the key below `z` as `ECDJ_SUPERSEDED`), and `eckeep`'s thread verifies granule checksums
+    and digests: a match writes `ECDJ_MATCHED` before release at `settle_keep_s` (unlink + `eng_sync_dir`, job file
+    removed after its last copy); a copy whose checksums fail (or is missing without `ECDJ_MATCHED`) while the object
+    matches its record is **D25 rot** (`ECKEEP_ROT`: logged, `eckeep_copies_lost++`, `.ec` served, released at deadline);
+    a mismatch with intact checksums triggers durable `DIVERGED` (`ec_diverge`, `src/ecdiverge.[ch]`): `DIVERGED` file is
+    synced before `db->diverged` is set, read at every open so restarts keep refusing the volume (`TSDB_ERR_UNAVAILABLE`,
+    `LOCAL_FAULT` in cluster heartbeats, `tsdb_volume_diverged` = 1), until `tsdb DIR volume diverged --clear` (refused
+    on cluster volumes until R4 rebuild, D23). `tests/test_ecdigest.c` (mutants `digestbytes digestnotomb
+    digestnoretention digestbelowtrue digestnots digestfreezerows digestlocalbelow`), `test_ecapply --case digest|digestpower`
+    (mutants `digestnocompare digestanyz digestnosupersede digestnocrcwalk digestrotmatches digestnojobremove
+    digestjobnosync`), `test_keep` (mutants `divergemem clearcluster releasenosync rotdiverges`).
   - **Chunks are deleted at the last reference.** A retired `.ec` keeps its `retired_` name until every chunk of its
-    object is gone, and nothing is deleted while any part of the object is referenced (`part_unref` -> `ecgc_last_unref`,
-    holds in the tier keyed (volume, oid)). The orphan sweep (D6) runs in the engine open after recovery and before any
-    thread of the engine starts, by file name, and queues only objects whose header names this volume's uuid; never put
-    chunks in a store before the sweep without `ecgc_test_nosweep`. No engine lock is held across an encode, a put or a
-    chunk delete.
+    object is gone, and nothing is deleted while any `.ec` part of the object is open (`part_open_ec` -> `ecgc_hold`,
+    `part_unref` -> `ecgc_last_unref`, O(1) holds in the tier keyed by part pointer and `(volume, oid)`). On a single
+    server the open sweeps orphans (`ecgc_open_sweep`, D6) before any engine thread starts; on a cluster EC volume both
+    R7's purge and open sweep are skipped and deletes go solely through committed `MK_GC` (`src/ecgcmk.c`, E14, D13).
+    Never put chunks in a single-server store before the sweep without `ecgc_test_nosweep`. No engine lock is held
+    across an encode, a put or a chunk delete.
   - **Refused where unbuilt**: parts without granules and v8 parts are never settled (a settle must also never take a
-    part `rewrite_alone` would still take, `src/ecskip.h`: `settleable` checks it only through `merge_selectable`, which
-    is false without a merge thread, so with `merge_threads` 0 an insert-written part can settle: layout only, recorded); a cluster or replica volume, a
+    part `rewrite_alone` would still take, `src/ecskip.h`: single-server `settleable` checks it only through
+    `merge_selectable`, while cluster `ec_cluster` explicitly requires `p->level > 0`, D18); a non-leader replica, a
     follower (a running one that meets an `.ec` name fails its engine with one line), a build without `TSDB_EC` and a
-    tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only until
-    R15. A volume opened for writing with the tier carries `requires=tier` from the attach on, before anything is
-    settled; from then on every read-only or follower open (`tsdb DIR export`, the CLI's read commands), every open
-    with no tier configured and every build without `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says `requires=tier` is then refused at open.
-  - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); until R10
-    re-encodes, such a key reads more objects and tombstones in young parts hide rows the reader still decodes. Answers
-    do not change (`tests/test_settle_oracle.c`).
+    tier with a store that is not UP settle nothing. `TSDB_TEST_TIER` needs `TSDB_TEST_TIER_I_KNOW=1` and is test-only
+    for single servers until R15; cluster EC volumes require no test variable and attach `coldops_peer` via
+    `chunkpeer_cluster_prepare` (`requires=cluster,tier,ec` in META). From `requires=tier` on, every read-only or
+    follower open (`tsdb DIR export`, the CLI's read commands), every open with no tier configured and every build without
+    `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says
+    `requires=tier` is then refused at open.
+  - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); on a single
+    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ec_objects_max` or `> 10%` tombstones);
+    cluster re-encode and redundancy conversion (`MK_UNSETTLE`, §6.4) stay with R10. Answers do not change
+    (`tests/test_settle_oracle.c`).
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
@@ -1027,7 +1127,17 @@ cgroup, so `nice` does not keep your work out of its way.
   check of its own parts, the v5 intent's write and fdatasync, two directory fsyncs and n + nown renames, one step
   against a drop or merge; reads of a replica volume wait for them once per COLD), and never across a lookup's reads of granules. Followers have no table.
 - **Lock order:** (a leader of a replicated volume, `db->jr`: `jr_serial` first, held by a large write from `lw_enter` to `lw_leave` and by `eng_drop_before` across its marker and retire, so marker order is effect order; it is a ticket lock (`jr_serial_lock`, taken in arrival order: a plain mutex let a thread writing back to back starve the settle's gate and the other large writers for tens of seconds, `test_eccold ticket|turns`, mutant `jrbarge`; `lw_leave` lets go of it by `lw_enter`'s decision, `lw_fence.serial`, never by `db->jr` again, which `eng_leader_attach` sets while the engine runs: a turn never let go of, or let go of twice, stops every later large write, drop and settle of the volume, `test_eccold jrpair`; TSan's lock-order checks do not see it); that drop also holds `flush_lock` under `jr_serial` across its marker, flush and retire, so no flush lists rows written after the marker before the retire; a replica's `apply_mu` (one applier) is outermost of the replica's own locks, then `stage_mu`, then its `mu`, which the applier lets go of across a COMMIT's flush and staging and a CLASS marker's purge, and checks `cut_gen` after) `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
-  `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
+  `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`;
+  R8 additions: a leader's settle (`src/eccold.c`, `src/settle.h`, `src/settle.c`) takes `jr_serial` (from `lw_enter`)
+  > `flush_lock` > `cls_rw` (when rotating a memtable) > `lead_mu` (`eng_leader_wait`) > the WAL writer role and
+  `buf_lock` (`jr_cold`) > `publish_lock` > `ppos_mu` / `latest_rw` > `db->lock` (the stripe check and bounded wait run
+  before `lw_enter`, never under the fence; no engine lock is held across chunk puts); `PPOS` (`src/ppos.h`) takes
+  `publish_lock` > `ppos_mu` (its append, `fdatasync` and creation `eng_sync_dir`) > `ppos` map mutex (a leaf, never
+  held across I/O; `ppos_of` takes only it), and `ppos_mu` is never taken under `db->lock`, `latest_rw` or `buf_lock`
+  (records go out before those are taken); `DIVERGED` (`src/ecdiverge.h`) takes its mutex > `dir_sync_lock` > `fail_lock`
+  under no engine lock; `GCMK` (`src/ecgcmk.c`) takes `apply_mu` > `rp->mu` (or leader GC worker `wmu`) > `g->fmu` >
+  `g->mu` (leaf), and `latest_rw` > `db->lock` > `ecgc_tier.mu` (a leaf: never held across I/O or another lock).
+  `cls_mu` (the class history map)
   is a leaf, and so are the granule cache's mutex (`src/eccache.c`: never held across I/O, an open or close, a decode or
   another lock: a fill waits on its entry, not on the mutex), the digest's (`src/eckeep.c`), the tier's gc mutex (`src/ecgc.c`: the purge takes it under `db->lock`; never held across I/O), the tier's registry of
   cold volumes (`t->cmu`, `src/tier.c`: only around the array; the last put, which frees a context, outside it)
@@ -1035,8 +1145,8 @@ cgroup, so `nice` does not keep your work out of its way.
   sweeper takes `db->lock` only with it released). R7's settle: the policy's `ps->pmu` (`src/ecpolicy.c`: its fail list and eager count, taken under
   `db->lock` while the settle thread picks) is a leaf; the tier's settle mutex `st->mu` (`src/settle.c`) is never held
   across an engine call (the thread lets go of it around a settle), and `eng_halt`/`eng_close` wait on its cv with no
-  engine lock held; no engine lock is held across a settle's encode or put, a chunk delete, a cache fill or a digest read (they
-  run on the settle thread, the gc worker, the digest thread or the reader's own thread, with the part pinned by a reference).
+  engine lock held; no engine lock is held across a single-server settle's encode or put, a chunk delete, a cache fill or a digest read (they
+  run on the settle thread, the gc worker, the digest thread or the reader's own thread, with the part pinned by a reference; a cluster leader's settle holds `jr_serial` only from the gate `lw_enter` through the swap).
   A leader's snapshot (`src/snapshot.c`) adds no edge: its cut takes `flush_lock` > `publish_lock` (and inside them
   `db->lock`, `buf_lock`, `lead_mu` briefly), and after releasing them its barrier takes each dictionary's `append_lock`,
   `ret_lock` and `class_lock` one at a time, alone, under no other engine lock.
