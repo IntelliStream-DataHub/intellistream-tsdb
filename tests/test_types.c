@@ -1717,7 +1717,7 @@ static void test_format_codecs(void)
         CHECK(decimal_bp_decode(blk, fl, N, fo) == 0 && memcmp(fv, fo, N * 4) == 0);
         CHECK(fl * 8 < N * 5); /* ~3-bit deltas + <1% exceptions */
         size_t dl = f64_decimal_encode(dv, N, blk);
-        CHECK(dl > 5 && (blk[0] & ~0x80) == 46 + m && (blk[0] & 0x80));
+        CHECK(dl > 5 && (blk[0] & 0x3f) == 46 + m && (blk[0] & 0x80));
         CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
         CHECK(dl * 8 < N * 6);
         both_levels(TSDB_FLOAT32, fv, N, "f32 dividing decimal");
@@ -1736,9 +1736,126 @@ static void test_format_codecs(void)
         CHECK(decimal_bp_decode(blk, fl, N, fo) == 0 && memcmp(fv, fo, N * 4) == 0);
         CHECK(fl * 8 < N * 4);
         size_t dl = f64_decimal_encode(dv, N, blk);
-        CHECK(dl > 5 && (blk[0] & ~0x80) >= 52 && (blk[0] & ~0x80) <= 61 && (blk[0] & 0x80));
+        CHECK(dl > 5 && (blk[0] & 0x3f) >= 52 && (blk[0] & 0x3f) <= 61 && (blk[0] & 0x80));
         CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
         CHECK(dl * 8 < N * 4);
+    }
+
+    /* 5. BLK_F64_DECIMAL with F64_FOR (0x40) + nibble/byte alignment for peaked ZSTD blocks */
+    /* 5a. Steady big-step float64 counter (+99.8..+100.2 at 0.1): delta-FOR crushes zigzag int_bp */
+    {
+        double cur = 1000000.0;
+        for (size_t i = 0; i < N; i++) {
+            if (i)
+                cur += 99.8 + (double)(rnd() % 5) * 0.1;
+            dv[i] = round(cur * 10.0) / 10.0;
+        }
+        size_t dl = f64_decimal_encode(dv, N, blk);
+        CHECK(dl > 5 && (blk[0] & 0x40) != 0);
+        CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
+        CHECK(dl * 8 < N * 4); /* ~3.1 b/v raw vs ~11 b/v with int_bp */
+        len = roundtrip(TSDB_FLOAT64, dv, N, 1, "f64 steady counter F64_FOR");
+        CHECK(blk_kind(TSDB_FLOAT64, dv, N) == BLK_F64_DECIMAL && len * 8 < N * 3);
+        both_levels(TSDB_FLOAT64, dv, N, "f64 steady counter");
+    }
+    /* 5b. Spiky float64 sensor with resets, spikes, NULL_F64 and -0.0: PFOR + exception table */
+    {
+        double cur = 25.0;
+        for (size_t i = 0; i < N; i++) {
+            if (i % 400 == 17) {
+                dv[i] = 9999.99; /* large spike patched by PFOR */
+            } else if (i % 500 == 31) {
+                uint64_t nf = NULL_F64;
+                memcpy(&dv[i], &nf, 8); /* exception */
+            } else if (i % 600 == 43) {
+                dv[i] = -0.0; /* exception */
+            } else {
+                cur += (double)((int64_t)(rnd() % 5) - 2) * 0.01;
+                dv[i] = round(cur * 100.0) / 100.0;
+            }
+        }
+        size_t dl = f64_decimal_encode(dv, N, blk);
+        CHECK(dl > 5 && (blk[0] & 0x40) != 0);
+        CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
+        CHECK(dl * 8 < N * 5); /* ~3.7 b/v raw vs ~21 b/v with int_bp */
+        len = roundtrip(TSDB_FLOAT64, dv, N, 1, "f64 spiky F64_FOR");
+        CHECK(blk_kind(TSDB_FLOAT64, dv, N) == BLK_F64_DECIMAL && len * 8 < (size_t)(N * 3.8));
+        both_levels(TSDB_FLOAT64, dv, N, "f64 spiky");
+    }
+    /* 5c. Stationary bounded float64 rate (500.00..700.00): direct-FOR beats zigzag delta */
+    {
+        for (size_t i = 0; i < N; i++)
+            dv[i] = round((500.0 + (double)(rnd() % 20000) * 0.01) * 100.0) / 100.0;
+        size_t dl = f64_decimal_encode(dv, N, blk);
+        CHECK(dl > 5 && (blk[0] & 0x40) != 0);
+        CHECK(f64_decimal_decode(blk, dl, N, do_) == 0 && memcmp(dv, do_, N * 8) == 0);
+        CHECK(dl * 8 < (size_t)(N * 15.2));
+        both_levels(TSDB_FLOAT64, dv, N, "f64 bounded rate");
+    }
+    /* 5d. Peaked tank_bar-style stream compresses strictly tighter with nibble alignment under ZSTD */
+    {
+        ds_state s;
+        ds_init(&s, DS_TANK_BAR, 0, 1700000000000ll);
+        for (size_t i = 0; i < N; i++) {
+            int64_t ts;
+            ds_next_f64(&s, &ts, &dv[i]);
+        }
+        len = roundtrip(TSDB_FLOAT64, dv, N, 1, "f64 tank_bar nibble-aligned");
+        CHECK(blk_kind(TSDB_FLOAT64, dv, N) == BLK_F64_DECIMAL && len * 8 < (size_t)(N * 1.72));
+    }
+    /* 5e. Backwards-compat decoding (F64_FOR == 0) and corrupt F64_FOR header/payload rejection */
+    {
+        for (size_t i = 0; i < 64; i++)
+            dv[i] = round((100.0 + (double)i * 1.25) * 100.0) / 100.0;
+        size_t dl = f64_decimal_encode(dv, 64, blk);
+        CHECK(dl > 13 && (blk[0] & 0x40) != 0);
+        CHECK(f64_decimal_decode(blk, dl, 64, do_) == 0 && memcmp(dv, do_, 64 * 8) == 0);
+        CHECK(f64_decimal_decode(blk, dl - 1, 64, do_) != 0); /* truncated int_for */
+        memcpy(bad, blk, dl);
+        bad[dl] = 0;
+        CHECK(f64_decimal_decode(bad, dl + 1, 64, do_) != 0); /* trailing byte */
+        bad[0] = (uint8_t)(62 | 0x40); /* invalid scale > F64_MAX_EXP with F64_FOR */
+        CHECK(f64_decimal_decode(bad, dl, 64, do_) != 0);
+        bad[0] = blk[0];
+        bad[5 + 8] = 0xff; /* invalid int_for flags */
+        CHECK(f64_decimal_decode(bad, dl, 64, do_) != 0);
+        /* Legacy F64_FOR == 0 stream decodes identically */
+        int64_t kv[64];
+        for (size_t i = 0; i < 64; i++)
+            kv[i] = (int64_t)llround(dv[i] * 100.0);
+        bad[0] = 2; /* 10^2 div, F64_FOR = 0 */
+        memset(bad + 1, 0, 4); /* nexc = 0 */
+        size_t ibl = int_bp_encode(kv, 64, bad + 5);
+        CHECK(f64_decimal_decode(bad, 5 + ibl, 64, do_) == 0 && memcmp(dv, do_, 64 * 8) == 0);
+    }
+    /* 5f. Exact f64_decimal_bound(n) + unaligned offsets (0..7) + both CODEC_FAST & CODEC_MERGE */
+    {
+        static const size_t lens[] = {2, 3, 1023, 1024, 1025, 2047};
+        for (size_t li = 0; li < sizeof lens / sizeof *lens; li++) {
+            size_t m = lens[li];
+            for (size_t i = 0; i < m; i++) {
+                if (i % 16 == 15) {
+                    uint64_t nf = NULL_F64;
+                    memcpy(&dv[i], &nf, 8);
+                } else {
+                    dv[i] = (double)(1000000ll + (int64_t)i * 1000ll + (int64_t)(rnd() % 5)) / 10.0;
+                }
+            }
+            size_t bnd = f64_decimal_bound(m);
+            uint8_t *raw = malloc(bnd + 8);
+            CHECK(raw != NULL);
+            for (size_t off = 0; off < 8; off++) {
+                size_t dl = f64_decimal_encode(dv, m, raw + off);
+                CHECK(dl > 5 && dl <= bnd);
+                CHECK(f64_decimal_decode(raw + off, dl, m, do_) == 0 && memcmp(dv, do_, m * 8) == 0);
+            }
+            free(raw);
+            for (int ef = CODEC_FAST; ef <= CODEC_MERGE; ef++) {
+                effort = ef;
+                both_levels(TSDB_FLOAT64, dv, m, "f64 exact bound");
+            }
+        }
+        effort = CODEC_MERGE;
     }
 
     free(iv);

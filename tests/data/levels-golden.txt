@@ -18,7 +18,7 @@ f64 vibration	1346	bd009e6495248eff
 f32 flow_rate	1373	25cfeba0c56b244f
 f64 flow_rate	1346	872515f096fa111e
 f32 flow_total	1371	687ea0dfd4802a9d
-f64 flow_total	1346	8741f95f86c164fa
+f64 flow_total	1346	6b01252be7fa9afc
 f32 random	1371	d2203e48437e5840
 f64 random	1345	7ac94339330f7f2c
 int64 totalizer	1343	65f37f05d1bc258a
@@ -217,7 +217,7 @@ f64 decimal scale 1e1 div, 8	175	99a4cda4db1f2cf1
 f64 decimal scale 1e1 mul, 9	194	aa2f14cf37b5e604
 f64 decimal scale 1e1 div, 13	265	72dfa3d870ac862e
 f64 decimal scale 1e1 mul, 33	577	9ad257ada892d951
-f64 decimal scale 1e2 div, 1001	1246	fd01cecf5a181a3f
+f64 decimal scale 1e2 div, 1001	1246	1afdf98ae7a895a9
 f64 decimal scale 1e2 mul, 4	104	63bf419c268ff5a0
 f64 decimal scale 1e2 div, 5	122	ad08c2e15725b71c
 f64 decimal scale 1e2 mul, 6	140	be271d75ce614e90
@@ -225,7 +225,7 @@ f64 decimal scale 1e3 div, 7	157	fa26953e71ee8081
 f64 decimal scale 1e3 mul, 8	176	6ac74f4e92ab6e9f
 f64 decimal scale 1e3 div, 9	185	19a734575b72c666
 f64 decimal scale 1e3 mul, 13	265	b27f9a1a260b92d3
-f64 decimal scale 1e4 div, 33	578	c7015bdb32dcde70
+f64 decimal scale 1e4 div, 33	578	2377a6f514c6e49f
 f64 decimal scale 1e4 mul, 1001	1211	4bd1639cef9aa824
 f64 decimal scale 1e4 div, 4	101	bfaadf116b49aff8
 f64 decimal scale 1e4 mul, 5	115	a946e2a2fd806296
@@ -234,8 +234,8 @@ f64 decimal scale 1e5 mul, 7	145	afd2bea18a1a4878
 f64 decimal scale 1e5 div, 8	176	81a947f00be980b6
 f64 decimal scale 1e5 mul, 9	194	a74b641f421e5ca4
 f64 decimal scale 1e6 div, 13	241	67605dea2910e89e
-f64 decimal scale 1e6 mul, 33	596	99329e88ee9a1c4a
-f64 decimal scale 1e6 div, 1001	1200	515826cac3c40982
+f64 decimal scale 1e6 mul, 33	596	344c787020edfb4c
+f64 decimal scale 1e6 div, 1001	1200	2765e908a3bf593d
 f64 decimal scale 1e6 mul, 4	97	0e193f28dcfe263d
 f64 decimal scale 1e7 div, 5	117	8819a83799b2a3b6
 f64 decimal scale 1e7 mul, 6	139	dac0b4299ade391e
@@ -253,7 +253,7 @@ f64 decimal scale 1e10 div, 8	176	1c02c8616a1ec04d
 f64 decimal scale 1e10 mul, 9	194	176560841ecb7797
 f64 decimal scale 1e10 div, 13	265	2757a40d5be770a1
 f64 decimal scale 1e10 mul, 33	626	aa7990fe1e3ae328
-f64 decimal scale 1e11 div, 1001	1206	364d9228c03122fa
+f64 decimal scale 1e11 div, 1001	1206	e5ee95f6c8adb002
 f64 decimal scale 1e11 mul, 4	104	28237b95bcd8149e
 f64 decimal scale 1e11 div, 5	122	4dab1f6e5660f4fb
 f64 decimal scale 1e11 mul, 6	140	8922a9fa4fbda865
@@ -279,8 +279,8 @@ f64 decimal scale 2^3 div, 7	157	2d844309530f883c
 f64 decimal scale 2^4 mul, 8	176	b4354202cc7aeb97
 f64 decimal scale 2^5 div, 9	193	251eeb1e85423665
 f64 decimal scale 2^6 mul, 13	243	c43291a9cc64c83f
-f64 decimal scale 2^7 div, 33	626	8d476b46eb7a527d
-f64 decimal scale 2^8 mul, 1001	1204	9ae34bd14c0bd945
+f64 decimal scale 2^7 div, 33	626	c1ee3a6daf029f5b
+f64 decimal scale 2^8 mul, 1001	1204	bbfa6fbd450a7586
 f64 decimal scale 2^9 div, 4	104	acdef895cbbf6ae8
 f64 decimal scale 2^10 mul, 5	122	03be4373a9ed2651
 f64 decimal scale 2^11 div, 6	140	bc731f1dfb7bc957
@@ -289,7 +289,7 @@ f64 decimal scale 2^13 div, 8	175	40811626482fdd92
 f64 decimal scale 2^14 mul, 9	194	5ef35e5ad7364cbe
 f64 decimal scale 2^15 div, 13	251	f52218b0d817acee
 f64 decimal scale 2^16 mul, 33	604	a045974848c3d28f
-f64 decimal scale 2^17 div, 1001	1262	95e0869c21045c04
+f64 decimal scale 2^17 div, 1001	1262	3aff3cbbabeb6ab4
 f64 decimal scale 2^18 mul, 4	103	9b53c25a9f4d08e1
 f64 decimal scale 2^19 div, 5	122	cbdb888df2e88547
 f64 decimal scale 2^20 mul, 6	139	fe90595c0d1fbf06
@@ -297,8 +297,8 @@ f64 decimal scale 2^21 div, 7	157	7e155deb4f3524ba
 f64 decimal scale 2^22 mul, 8	176	34dd74f607db8c59
 f64 decimal scale 2^23 div, 9	194	24b9ccd73b37c65d
 f64 decimal scale 2^24 mul, 13	265	5770920d85de3086
-f64 decimal scale 2^25 div, 33	612	b23db634f8e49a21
-f64 decimal scale 2^26 mul, 1001	1332	9c9e7be69708272a
+f64 decimal scale 2^25 div, 33	612	46add7aaf2909b41
+f64 decimal scale 2^26 mul, 1001	1332	edf65c5109add632
 f64 decimal scale 2^27 div, 4	103	e810277e245a357f
 f64 decimal scale 2^28 mul, 5	122	f0b32e0d83c1a661
 f64 integers near 2^51 and 2^52, 5 from 2251799813685242	122	7ecf6259d67d194d
@@ -324,7 +324,7 @@ f64 integers near 2^51 and 2^52, 9 from -4503599627370486	194	bc25900f7e8cc5b2
 f64 2^53 counter	1345	849cdf182782b1f2
 f64 1e15 decimals	1346	f07c6670911ba39c
 f64 1e300 ramp	1345	2e12c6f1ede0f4ac
-f64 0.1 steps	1346	02065aab94959153
+f64 0.1 steps	1346	b052b1dd8e139c0b
 f64 random bits	1345	4e7303aaae882880
 f64 short specials 0	587	b40d47ca95d92281
 f64 short specials 1	585	a57d984a44fcd28c
@@ -392,18 +392,18 @@ f32 PS3 bar	1373	fb35427b9f1da7f0
 f32 PS3 psi	1370	a67e6892c7501a32
 f32 edge values cycling	1370	a7772940bb52f8ad
 f32 2049 distinct	1370	3ede02453e023ad6
-f64 PS3 bar	1347	a9a62ef43980eb8d
+f64 PS3 bar	1347	a458820c05f9045f
 f64 PS3 psi	1346	ba6ca4f7d56a1032
 f64 edge values cycling	1346	d57fa58790d3d9b5
 f64 2049 distinct	1345	272c8acff6a43b22
 f64 widened hdd_temp	1347	81702867806c7669
-f64 widened cpu_temp	1347	7c10b5b7a0d59ce7
-f64 widened tank_bar	1347	4537eab160670a34
-f64 widened tank_psi	1346	3f8f37915127eced
+f64 widened cpu_temp	1347	685db382ddbb7702
+f64 widened tank_bar	1347	25667ef05b17c587
+f64 widened tank_psi	1346	b9d7ca8ae45515b5
 f64 widened vibration	1346	151a4d9cbd1c41bb
-f64 widened flow_rate	1346	b2660f8f27e8a422
-f64 widened flow_total	1346	b6f8495dab1c18ac
-f64 widened random	1346	fc02586059ec6e89
+f64 widened flow_rate	1346	8d8764b4f4e57427
+f64 widened flow_total	1346	c4bf9898ad4cb018
+f64 widened random	1346	48a45cca6d7905e0
 f64 widened specials	1202	db3da7141e5a8844
 f64 widened specials and a double	1216	98ccdfdef126ca8a
 ts jitter	1343	b8c3061839247cd7
@@ -416,7 +416,7 @@ int64 40-bit deltas	1343	4b12564982b64435
 bool coin flips	1339	bbcb84d0b21e42a1
 ts jitter 200ms	1343	248170ed93865418
 f32 multiples of 1000	1237	439fd1381bbad25e
-f64 multiples of 1000	1211	6ae1ce4e858509b5
+f64 multiples of 1000	1211	2806738f01121750
 f32 multiples of 256	1373	aef7c6b984609f0e
 f64 multiples of 256	1347	6d9f56fc83a26b1f
 libzstd	1.5.7
@@ -425,7 +425,7 @@ zstd f64 hdd_temp	3	8b8bd2d5a62c4b90
 zstd f32 cpu_temp	7	1561a331401ff60c
 zstd f64 cpu_temp	3	cb15921e17bab626
 zstd f32 tank_bar	7	b9d152dce79ac422
-zstd f64 tank_bar	3	b759318d2944e649
+zstd f64 tank_bar	3	a1a1b7cc82a50911
 zstd f32 tank_psi	7	896bf5ac0bab3fd1
 zstd f64 tank_psi	3	ac2b903130620dc9
 zstd f32 vibration	7	cbc757e3654dd8dc
@@ -433,7 +433,7 @@ zstd f64 vibration	3	a522f2f556b70b9e
 zstd f32 flow_rate	7	9e38465c76d44e95
 zstd f64 flow_rate	3	1af7197e4113d2ac
 zstd f32 flow_total	7	401850142db89db0
-zstd f64 flow_total	3	ba4822d55cab4d5e
+zstd f64 flow_total	3	9bab19cffc56fc0e
 zstd f32 random	7	3355070579218b33
 zstd f64 random	3	5c2610d2fa30ac22
 zstd int64 totalizer	3	1b2a463d4856d17d
@@ -456,22 +456,22 @@ zstd int64 int32 range with nulls, 33	3	222e0761af938cc7
 zstd int64 just past int32, 33	3	bb68419132b16ac3
 zstd int64 just below int32, 33	3	5afb3b1912d9d303
 zstd int64 most negative, 33	3	4970c59213c984a3
-zstd int64 most positive, 33	3	29d2b7298584f567
+zstd int64 most positive, 33	3	f1431bdb899a33e3
 zstd int64 int32 range with nulls, 32	3	5b5c3ad7f8b34ef7
 zstd int64 just past int32, 32	3	79130ce066ef2803
 zstd int64 just below int32, 32	3	5ac9e21998e2f66f
 zstd int64 most negative, 32	3	a4731b616449367f
-zstd int64 most positive, 32	3	dcc23b3171f3a53b
+zstd int64 most positive, 32	3	da11886aca7e1a0b
 zstd int64 int32 range with nulls, 31	3	59bf880dc41afeb3
 zstd int64 just past int32, 31	3	7078210a8400a40f
 zstd int64 just below int32, 31	3	8cf7e779c29be163
 zstd int64 most negative, 31	3	3482e5de74e7dc5b
-zstd int64 most positive, 31	3	6938435b620809f3
+zstd int64 most positive, 31	3	0b0ed1c7dfe504f3
 zstd int64 int32 range with nulls, 17	3	95fe0680179e2dec
 zstd int64 just past int32, 17	3	93b3abc1481c34d8
 zstd int64 just below int32, 17	3	a2d602d3cf0cc4a8
 zstd int64 most negative, 17	3	bb227878768ef66c
-zstd int64 most positive, 17	3	fc30381bc6f84dc4
+zstd int64 most positive, 17	3	100f742c6ff4ad94
 zstd int64 int32 range with nulls, 16	3	74e824a2dc651fd0
 zstd int64 just past int32, 16	3	e10258379b2a80ec
 zstd int64 just below int32, 16	3	4ce43419211abe90
@@ -640,7 +640,7 @@ zstd f64 decimal scale 1e3 div, 7	3	316d32ca42b6d97f
 zstd f64 decimal scale 1e3 mul, 8	3	623641980a9bad0f
 zstd f64 decimal scale 1e3 div, 9	3	bbe0ea41694d990f
 zstd f64 decimal scale 1e3 mul, 13	3	30881d2f95b7f0f8
-zstd f64 decimal scale 1e4 div, 33	3	23c955debc6934a3
+zstd f64 decimal scale 1e4 div, 33	3	f7ba8d372cb3134b
 zstd f64 decimal scale 1e4 mul, 1001	3	61e51f8edb90aaff
 zstd f64 decimal scale 1e4 div, 4	3	b2801b35c8aef29f
 zstd f64 decimal scale 1e4 mul, 5	3	9a43df53efd285b3
@@ -649,8 +649,8 @@ zstd f64 decimal scale 1e5 mul, 7	3	db236af2d362f1f7
 zstd f64 decimal scale 1e5 div, 8	3	1b3fc7c38a4ff9a3
 zstd f64 decimal scale 1e5 mul, 9	3	7c80eeead8d79323
 zstd f64 decimal scale 1e6 div, 13	3	43df6ab29d59e271
-zstd f64 decimal scale 1e6 mul, 33	3	a1c5c3374eec58c3
-zstd f64 decimal scale 1e6 div, 1001	3	70bf188ad7ff58cf
+zstd f64 decimal scale 1e6 mul, 33	3	051a49d6c2c45c33
+zstd f64 decimal scale 1e6 div, 1001	3	3bfa7fff30cdd953
 zstd f64 decimal scale 1e6 mul, 4	3	4f9e1d117df9f853
 zstd f64 decimal scale 1e7 div, 5	3	b0a0e7387bc90453
 zstd f64 decimal scale 1e7 mul, 6	3	c6cc257e3a9215f7
@@ -658,7 +658,7 @@ zstd f64 decimal scale 1e7 div, 7	3	063ab672c5f8dc1f
 zstd f64 decimal scale 1e7 mul, 8	3	649a2e8ab94b5793
 zstd f64 decimal scale 1e8 div, 9	3	fbe3d2f58817190b
 zstd f64 decimal scale 1e8 mul, 13	3	5a1838553a485b94
-zstd f64 decimal scale 1e8 div, 33	3	fff3cc98d9318d8b
+zstd f64 decimal scale 1e8 div, 33	3	38265e8059ce0503
 zstd f64 decimal scale 1e8 mul, 1001	3	fd3cce66865f9de4
 zstd f64 decimal scale 1e9 div, 4	3	5fe77972fc4d7773
 zstd f64 decimal scale 1e9 mul, 5	3	f5cd2c24cb890bc3
@@ -667,8 +667,8 @@ zstd f64 decimal scale 1e9 mul, 7	3	256886dca723af3b
 zstd f64 decimal scale 1e10 div, 8	3	6f51002930c90fe3
 zstd f64 decimal scale 1e10 mul, 9	3	93ba549f64d0b773
 zstd f64 decimal scale 1e10 div, 13	3	4dab2e81250b0dc4
-zstd f64 decimal scale 1e10 mul, 33	3	4567206a0541f7f3
-zstd f64 decimal scale 1e11 div, 1001	3	a3e173b4cf5f92d3
+zstd f64 decimal scale 1e10 mul, 33	3	f0900d1899ca1fff
+zstd f64 decimal scale 1e11 div, 1001	3	63069d8565b370db
 zstd f64 decimal scale 1e11 mul, 4	3	4a6bb197386ce5eb
 zstd f64 decimal scale 1e11 div, 5	3	38979819a2d87813
 zstd f64 decimal scale 1e11 mul, 6	3	0647a6c654a84623
@@ -676,7 +676,7 @@ zstd f64 decimal scale 1e12 div, 7	3	f4fc153afdaa9ec5
 zstd f64 decimal scale 1e12 mul, 8	3	d771725801912923
 zstd f64 decimal scale 1e12 div, 9	3	4063685f8beba75f
 zstd f64 decimal scale 1e12 mul, 13	3	6bf27f1db46bd5e4
-zstd f64 decimal scale 1e13 div, 33	3	5b816cbd74e5e75b
+zstd f64 decimal scale 1e13 div, 33	3	cb4ae2da11ffbeab
 zstd f64 decimal scale 1e13 mul, 1001	3	80cc5fecf13dd023
 zstd f64 decimal scale 1e13 div, 4	3	393a1d39fbb70c87
 zstd f64 decimal scale 1e13 mul, 5	3	42ce5423e7cb3887
@@ -685,7 +685,7 @@ zstd f64 decimal scale 1e14 mul, 7	3	7b27a8fe56c5ab7b
 zstd f64 decimal scale 1e14 div, 8	3	4b6823b09e2a0867
 zstd f64 decimal scale 1e14 mul, 9	3	373fa616d7aa850b
 zstd f64 decimal scale 1e15 div, 13	3	9b1a1cd90044d3c4
-zstd f64 decimal scale 1e15 mul, 33	3	16a5961cb282bec3
+zstd f64 decimal scale 1e15 mul, 33	3	db3f840588dab943
 zstd f64 decimal scale 1e15 div, 1001	3	5c02ce6b96475f4c
 zstd f64 decimal scale 1e15 mul, 4	3	f9d1aac6f2c9274b
 zstd f64 decimal scale 2^1 div, 5	3	a26167dfed4ba458
@@ -694,7 +694,7 @@ zstd f64 decimal scale 2^3 div, 7	3	c934e59d2d9212fb
 zstd f64 decimal scale 2^4 mul, 8	3	d118c42b1689587f
 zstd f64 decimal scale 2^5 div, 9	3	0e30d0df0f67519b
 zstd f64 decimal scale 2^6 mul, 13	3	6910b2f6ae8c1de2
-zstd f64 decimal scale 2^7 div, 33	3	2cee8f250dbe3007
+zstd f64 decimal scale 2^7 div, 33	3	5fe08b3a44d5342e
 zstd f64 decimal scale 2^8 mul, 1001	3	c4bfa2bd5230f94f
 zstd f64 decimal scale 2^9 div, 4	3	4b061a111d36a6cb
 zstd f64 decimal scale 2^10 mul, 5	3	621793cfd56575bc
@@ -704,7 +704,7 @@ zstd f64 decimal scale 2^13 div, 8	3	f625d69ba816d4a8
 zstd f64 decimal scale 2^14 mul, 9	3	7a56bbcaa5b94e75
 zstd f64 decimal scale 2^15 div, 13	3	821aea50de8bf8b0
 zstd f64 decimal scale 2^16 mul, 33	3	225064e8629b6cbb
-zstd f64 decimal scale 2^17 div, 1001	3	498869101c8ed7df
+zstd f64 decimal scale 2^17 div, 1001	3	e294c4c396d1fb4f
 zstd f64 decimal scale 2^18 mul, 4	3	2cea45ba4cfdb7f7
 zstd f64 decimal scale 2^19 div, 5	3	4e2f1c01b52c33dd
 zstd f64 decimal scale 2^20 mul, 6	3	ce93e75c860ea026
@@ -712,8 +712,8 @@ zstd f64 decimal scale 2^21 div, 7	3	2a97689deef0cb9b
 zstd f64 decimal scale 2^22 mul, 8	3	8473656fad0706b4
 zstd f64 decimal scale 2^23 div, 9	3	77ce4df543cea97f
 zstd f64 decimal scale 2^24 mul, 13	3	9c458e85e7ec07ec
-zstd f64 decimal scale 2^25 div, 33	3	53b003fe67e30da0
-zstd f64 decimal scale 2^26 mul, 1001	3	1353dd26e5d2bcfb
+zstd f64 decimal scale 2^25 div, 33	3	99c991e0561c4bd6
+zstd f64 decimal scale 2^26 mul, 1001	3	ba0e8d50ad65ac33
 zstd f64 decimal scale 2^27 div, 4	3	628095a76c8f6723
 zstd f64 decimal scale 2^28 mul, 5	3	aa483ea9d98eeb89
 zstd f64 integers near 2^51 and 2^52, 5 from 2251799813685242	3	647babf4e2fbcbdc
@@ -739,7 +739,7 @@ zstd f64 integers near 2^51 and 2^52, 9 from -4503599627370486	3	9795f7d4a25f911
 zstd f64 2^53 counter	3	a9006d19fd5674e9
 zstd f64 1e15 decimals	3	06ae19089aeec66a
 zstd f64 1e300 ramp	3	5f586ed71fb5ade8
-zstd f64 0.1 steps	3	91d6d2697789b8f9
+zstd f64 0.1 steps	3	0b59d5cf866d3915
 zstd f64 random bits	3	61023d1fa7e87c51
 zstd f64 short specials 0	3	c68987a6cfd4baa2
 zstd f64 short specials 1	3	ee3e7ad69781d76b
@@ -814,10 +814,10 @@ zstd f64 2049 distinct	3	a0c322559175bf1d
 zstd f64 widened hdd_temp	3	fcfa8b06d657ed7e
 zstd f64 widened cpu_temp	3	22ca50307e8f6ee1
 zstd f64 widened tank_bar	3	18dc419790d2c5de
-zstd f64 widened tank_psi	3	6552a63eb8d2e8eb
+zstd f64 widened tank_psi	3	830c807ac2747356
 zstd f64 widened vibration	3	13c5cd090087102c
 zstd f64 widened flow_rate	3	803f699d3018c9a5
-zstd f64 widened flow_total	3	27af1ed68b9996ff
+zstd f64 widened flow_total	3	69f7b3622d40fe27
 zstd f64 widened random	3	ba63706be753b429
 zstd f64 widened specials	3	1792f62e898931f1
 zstd f64 widened specials and a double	3	ae1067ffb5229f5e
@@ -825,7 +825,7 @@ zstd ts jitter	3	c48da77e604cc0ea
 zstd ts random gaps and duplicates	3	dd118acf4cf5b9d2
 zstd ts negative	3	e30cc6701aeac785
 zstd ts extremes	3	7f517a1b404fee68
-zstd int64 steady +1000	3	74f621d5fb9bc0ed
+zstd int64 steady +1000	3	973aded0eb3ddb69
 zstd int64 counter resets nulls	3	74f6fe37f9dc7f01
 zstd int64 40-bit deltas	3	0acaa949dc5030f5
 zstd bool coin flips	3	2364e77396086eed
@@ -833,4 +833,4 @@ zstd ts jitter 200ms	3	e2e650f64def1911
 zstd f32 multiples of 1000	7	717d70e69a425115
 zstd f64 multiples of 1000	3	3dd91f0b45ee894d
 zstd f32 multiples of 256	7	dcc65d802f8bfbe9
-zstd f64 multiples of 256	3	a01ce9021551e3c9
+zstd f64 multiples of 256	3	bb23616db5733389

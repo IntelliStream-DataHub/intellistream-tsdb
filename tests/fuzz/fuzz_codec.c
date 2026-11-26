@@ -300,5 +300,20 @@ void fuzz_seeds(const char *dir)
     seed(dir, 27, N, blk, int_for_encode(iv, N, blk));
     seed(dir, 28, N, blk, bool_pack_encode(st, N, blk));
     seed(dir, 29, N, blk, ts_for_bp_encode(ts, N, blk));
+    /* BLK_F64_DECIMAL with F64_FOR (steady counter + spike + exception) */
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        if (i == 99) {
+            uint64_t nf = NULL_F64;
+            memcpy(&d[i], &nf, 8);
+        } else if (i == 150) {
+            d[i] = 99999.9;
+        } else {
+            d[i] = (double)(100000 + i * 999 + (int)((r >> 60) & 3)) / 10.0;
+        }
+    }
+    seed(dir, 20, N, blk, f64_decimal_encode(d, N, blk));
+    for (int lvl = 0; lvl <= 1; lvl++)
+        seed_block(dir, 1 + TSDB_FLOAT64, N, blk, block_encode_vals(cc, lvl, 0, TSDB_FLOAT64, d, N, blk));
     free(blk);
 }

@@ -11,12 +11,12 @@
  *
  * float64:
  *  - BLK_F64_DECIMAL: values that are exact decimals (or binary fractions) at
- *    one scale, as integers in BLK_INT form, with exceptions. A value is
+ *    one scale, as integers in BLK_INT or BLK_INT_FOR form, with exceptions. A value is
  *    rebuilt from its integer k one of two ways, whichever the block records:
  *    k / 10^e, correctly rounded, matches values parsed from decimal text;
  *    k * 10^-e (the double nearest), matches values computed as count times
  *    resolution, as instruments and converters often do.
- *      u8 scale | 0x80 for the second way | u32 nexc | nexc x (u32 pos, u64 bits) | BLK_INT stream
+ *      u8 scale | 0x80 (mul) | 0x40 (int_for) | u32 nexc | nexc x (u32 pos, u64 bits) | integer stream
  *  - BLK_XOR64: Gorilla's XOR encoding of the 64-bit patterns.
  *  - BLK_BYTESPLIT64: the eight byte planes, for ZSTD.
  *  - BLK_DELTA_BP: zigzag deltas of the 64-bit patterns, packed per vector of
@@ -54,7 +54,28 @@ static inline int64_t unzz(uint64_t z) { return (int64_t)(z >> 1) ^ -(int64_t)(z
 
 size_t int_bp_bound(size_t n) { return 8 + (n / IBP_VEC + 1) * (1 + 8 * IBP_VEC) + 8; }
 
-size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out)
+/* When ZSTD will follow, padding a peaked vector's non-byte-aligned width (3 -> 4, 5..7 -> 8) puts
+ * symbols on nibble/byte boundaries so FSE/LZ77 compresses tighter while unpack stays fast.
+ * Uniform vectors (MAD >= 0.20 * 2^w) keep their minimal width so raw blocks stay small and fast. */
+static inline int align_peaked_w(const uint32_t *u, size_t nv, int w)
+{
+    if (nv < 16 || (w != 3 && (w < 5 || w > 7)))
+        return w;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < nv; i++)
+        sum += u[i];
+    int64_t mean = (int64_t)(sum / nv);
+    uint64_t dev = 0;
+    for (size_t i = 0; i < nv; i++) {
+        int64_t d = (int64_t)u[i] - mean;
+        dev += (uint64_t)(d < 0 ? -d : d);
+    }
+    if (dev * 5 < ((uint64_t)nv << w))
+        return w == 3 ? 4 : 8;
+    return w;
+}
+
+static size_t int_bp_encode_opt(const int64_t *in, size_t n, uint8_t *out, bool zstd_align)
 {
     if (n == 0)
         return 0;
@@ -77,14 +98,18 @@ size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out)
             continue;
         }
         int w = bits_for((uint32_t)all);
-        *o++ = (uint8_t)w;
         for (size_t i = 0; i < nv; i++)
             z32[i] = (uint32_t)z[i];
+        if (zstd_align)
+            w = align_peaked_w(z32, nv, w);
+        *o++ = (uint8_t)w;
         pack(z32, nv, w, o);
         o += packed_bytes(nv, w);
     }
     return (size_t)(o - out);
 }
+
+size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out) { return int_bp_encode_opt(in, n, out, false); }
 
 /* Decodes n integers; returns the bytes consumed, or 0 if corrupt. */
 static size_t int_bp_decode_prefix(const uint8_t *in, size_t len, size_t n, int64_t *out)
@@ -315,7 +340,62 @@ static void int_for_plan_vec(const int64_t *x, size_t nv, bool direct, int_for_p
     }
 }
 
-size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out)
+/* True if int_for_encode(in, n, ...) is expected to emit strictly fewer bytes than int_bp_encode(in, n, ...);
+ * fast-skips PFOR probing on narrow-delta vectors (w_bp <= 3, w_d >= w_bp, w_v >= w_bp) to keep encode fast. */
+static bool int_for_smaller(const int64_t *in, size_t n)
+{
+    size_t bp = 8, fo = 8;
+    int64_t d[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        int64_t dlo = (int64_t)((uint64_t)in[v0] - (uint64_t)in[v0 - 1]), dhi = dlo;
+        int64_t vlo = in[v0], vhi = vlo;
+        d[0] = dlo;
+        uint64_t all = zz(dlo);
+        for (size_t i = 1; i < nv; i++) {
+            int64_t di = (int64_t)((uint64_t)in[v0 + i] - (uint64_t)in[v0 + i - 1]);
+            d[i] = di;
+            all |= zz(di);
+            dlo = di < dlo ? di : dlo;
+            dhi = di > dhi ? di : dhi;
+            vlo = in[v0 + i] < vlo ? in[v0 + i] : vlo;
+            vhi = in[v0 + i] > vhi ? in[v0 + i] : vhi;
+        }
+        int w_bp = all >> 32 ? 64 : bits_for((uint32_t)all);
+        bp += 1 + packed_bytes(nv, w_bp);
+        int w_d = bits_for64((uint64_t)dhi - (uint64_t)dlo);
+        int w_v = bits_for64((uint64_t)vhi - (uint64_t)vlo);
+        /* Fast skip when delta-FOR cannot narrow w_bp and direct-FOR cannot beat small w_bp via PFOR. */
+        if (w_bp <= 6 && w_d >= w_bp && w_v >= w_bp && (w_bp <= 3 || w_v <= 6)) {
+            fo += 10 + packed_bytes(nv, w_d);
+            continue;
+        }
+        size_t best;
+        if (w_d <= 6 || nv < 32) {
+            best = packed_bytes(nv, w_d);
+        } else {
+            int_for_plan pd;
+            int_for_plan_vec(d, nv, false, &pd);
+            best = pd.cost;
+        }
+        if (best > 0) {
+            size_t vc;
+            if (w_v <= 6 || nv < 32) {
+                vc = packed_bytes(nv, w_v);
+            } else {
+                int_for_plan pv;
+                int_for_plan_vec(in + v0, nv, true, &pv);
+                vc = pv.cost;
+            }
+            if (vc < best)
+                best = vc;
+        }
+        fo += 10 + best;
+    }
+    return fo < bp;
+}
+
+static size_t int_for_encode_opt(const int64_t *in, size_t n, uint8_t *out, bool zstd_align)
 {
     if (n == 0)
         return 0;
@@ -341,46 +421,58 @@ size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out)
                 p = &pv;
         }
         const int64_t *src = p->direct ? (in + v0) : d;
-
-        *o++ = (uint8_t)((p->direct ? IFOR_F_DIRECT : 0u) | (p->nexc ? IFOR_F_EXC : 0u));
-        *o++ = (uint8_t)p->w;
-        memcpy(o, &p->base, 8);
-        o += 8;
+        int w = p->w;
 
         if (p->nexc == 0) {
-            if (p->w > 0) {
-                if (p->w <= 32) {
+            if (w > 0) {
+                if (w <= 32) {
                     for (size_t i = 0; i < nv; i++)
                         u32[i] = (uint32_t)((uint64_t)src[i] - p->base);
-                    pack(u32, nv, p->w, o);
+                    if (zstd_align)
+                        w = align_peaked_w(u32, nv, w);
                 } else {
                     for (size_t i = 0; i < nv; i++)
                         u64[i] = (uint64_t)src[i] - p->base;
-                    pack64(u64, nv, p->w, o);
                 }
-                o += packed_bytes(nv, p->w);
+            }
+            *o++ = (uint8_t)(p->direct ? IFOR_F_DIRECT : 0u);
+            *o++ = (uint8_t)w;
+            memcpy(o, &p->base, 8);
+            o += 8;
+            if (w > 0) {
+                if (w <= 32)
+                    pack(u32, nv, w, o);
+                else
+                    pack64(u64, nv, w, o);
+                o += packed_bytes(nv, w);
             }
         } else {
             uint16_t nx = 0;
             for (size_t i = 0; i < nv; i++) {
                 uint64_t u = (uint64_t)src[i] - p->base;
-                if ((u >> p->w) != 0) {
+                if ((u >> w) != 0) {
                     epos[nx] = (uint16_t)i;
                     eval[nx] = u;
                     nx++;
                     u = 0;
                 }
-                if (p->w <= 32)
+                if (w <= 32)
                     u32[i] = (uint32_t)u;
                 else
                     u64[i] = u;
             }
-            if (p->w > 0) {
-                if (p->w <= 32)
-                    pack(u32, nv, p->w, o);
+            if (zstd_align && w > 0 && w <= 32)
+                w = align_peaked_w(u32, nv, w);
+            *o++ = (uint8_t)((p->direct ? IFOR_F_DIRECT : 0u) | IFOR_F_EXC);
+            *o++ = (uint8_t)w;
+            memcpy(o, &p->base, 8);
+            o += 8;
+            if (w > 0) {
+                if (w <= 32)
+                    pack(u32, nv, w, o);
                 else
-                    pack64(u64, nv, p->w, o);
-                o += packed_bytes(nv, p->w);
+                    pack64(u64, nv, w, o);
+                o += packed_bytes(nv, w);
             }
             memcpy(o, &nx, 2);
             o += 2;
@@ -393,6 +485,8 @@ size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out)
     }
     return (size_t)(o - out);
 }
+
+size_t int_for_encode(const int64_t *in, size_t n, uint8_t *out) { return int_for_encode_opt(in, n, out, false); }
 
 int int_for_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
 {
@@ -687,7 +781,10 @@ int bool_pack_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
 #define F64_MAX_EXP (F64_NEG_BIN_OFF + F64_NNEG_BIN - 1)
 #define F64_LIMIT 4503599627370496.0 /* 2^52 */
 
-#define F64_MUL 0x80 /* scale byte: rebuild as k * 10^-e rather than k / 10^e */
+#define F64_MUL      0x80 /* scale byte: rebuild as k * 10^-e rather than k / 10^e */
+#define F64_FOR      0x40 /* scale byte: integer stream is int_for rather than int_bp */
+#define F64_EXP_MASK 0x3f
+_Static_assert(F64_MAX_EXP <= F64_EXP_MASK, "F64_MAX_EXP");
 
 /* Constants rather than a constructor's tables: see dec_scale in codec.c (levels). */
 #define P2S(b) ((double)(1L << (b)))
@@ -825,7 +922,7 @@ static void f64_back_all(double *out, size_t n, int e, bool mul)
     }
 }
 
-size_t f64_decimal_bound(size_t n) { return 5 + (n / 16 + 1) * 12 + int_bp_bound(n); }
+size_t f64_decimal_bound(size_t n) { return 5 + (n / 16 + 1) * 12 + MAX(int_bp_bound(n), int_for_bound(n)); }
 
 /* Cost in bits a value of scale e (and way of rebuilding), on a few runs of
  * consecutive values: the width of their deltas plus 96 per exception. */
@@ -1102,33 +1199,6 @@ size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out)
     return f64_decimal_encode_keep(in, n, out, NULL, &nexc);
 }
 
-/* Packs one vector of nv int64 values in kv relative to *prevp into o (same format as int_bp_encode).
- * Independent adjacent differences kv[i] - kv[i-1] so the delta+zigzag loop auto-vectorizes. */
-static inline __attribute__((always_inline)) uint8_t *ibp_put_vec(const int64_t *kv, size_t nv, int64_t *prevp,
-                                                                  uint8_t *o)
-{
-    uint64_t z[IBP_VEC];
-    uint32_t z32[IBP_VEC];
-    z[0] = zz((int64_t)((uint64_t)kv[0] - (uint64_t)*prevp));
-    uint64_t all = z[0];
-    for (size_t i = 1; i < nv; i++) {
-        z[i] = zz((int64_t)((uint64_t)kv[i] - (uint64_t)kv[i - 1]));
-        all |= z[i];
-    }
-    *prevp = kv[nv - 1];
-    if (all >> 32) {
-        *o++ = 64;
-        memcpy(o, z, nv * 8);
-        return o + nv * 8;
-    }
-    int w = bits_for((uint32_t)all);
-    *o++ = (uint8_t)w;
-    for (size_t i = 0; i < nv; i++)
-        z32[i] = (uint32_t)z[i];
-    pack(z32, nv, w, o);
-    return o + packed_bytes(nv, w);
-}
-
 /* Converts nv doubles starting at in[base] into kv[0..nv), recording exceptions at *xp; mul is a compile-time
  * constant so the vector loop runs branch-free with vsc/vinv hoisted into registers. */
 static inline __attribute__((always_inline)) bool f64_conv_run(const double *in, size_t base, size_t nv, int e,
@@ -1164,8 +1234,11 @@ static inline __attribute__((always_inline)) bool f64_conv_run(const double *in,
     return true;
 }
 
-size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp)
+static size_t f64_decimal_encode_opt(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp,
+                                     bool zstd_align, bool *want_forp)
 {
+    if (want_forp)
+        *want_forp = false;
     if (n < 2)
         return 0;
     bool mul = false;
@@ -1174,48 +1247,34 @@ size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t
         return 0;
     size_t max_exc = n / 16, nexc = 0;
     uint8_t *x = out + 5;
-    if (keep) {
-        bool ok = mul ? f64_conv_run(in, 0, n, e, true, 0, keep, &x, &nexc, max_exc)
-                      : f64_conv_run(in, 0, n, e, false, 0, keep, &x, &nexc, max_exc);
-        if (!ok)
-            return 0;
-        out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
-        store32(out + 1, (uint32_t)nexc);
-        size_t len = int_bp_encode(keep, n, x);
-        *nexcp = nexc;
-        return len ? (size_t)(x - out) + len : 0;
+    /* When keep is NULL, stage the scaled integers at the aligned tail of out (reserved by f64_decimal_bound):
+     * [out + 5, out + 5 + max_exc * 12) stays strictly below kv, and int_bp/int_for emit each vector strictly
+     * below &kv[v0 + nv - 1] after reading kv[v0 - 1 .. v0 + nv - 1] into stack temporaries. */
+    int64_t *kv = keep;
+    if (!kv) {
+        uintptr_t end = (uintptr_t)(out + f64_decimal_bound(n));
+        kv = (int64_t *)(void *)((end - n * sizeof(int64_t)) & ~(uintptr_t)7);
     }
-    /* No caller-provided keep[]: encode in 1024-value stack vectors with zero heap allocation. The BLK_INT stream
-     * is written after the max exception area (f64_decimal_bound reserves both) and slid down once nexc is known. */
-    uint8_t *ib_start = x + max_exc * 12, *o = ib_start;
-    int64_t prev = 0;
-    if (!f64_int(in[0], e, mul, &prev)) {
-        if (nexc == max_exc)
-            return 0;
-        store32(x, 0);
-        memcpy(x + 4, &in[0], 8);
-        x += 12;
-        nexc++;
-        prev = 0;
-    }
-    memcpy(o, &prev, 8);
-    o += 8;
-    int64_t kv[IBP_VEC];
-    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
-        size_t nv = MIN((size_t)IBP_VEC, n - v0);
-        bool ok = mul ? f64_conv_run(in, v0, nv, e, true, prev, kv, &x, &nexc, max_exc)
-                      : f64_conv_run(in, v0, nv, e, false, prev, kv, &x, &nexc, max_exc);
-        if (!ok)
-            return 0;
-        o = ibp_put_vec(kv, nv, &prev, o);
-    }
-    size_t ib_len = (size_t)(o - ib_start);
-    if (x != ib_start)
-        memmove(x, ib_start, ib_len);
-    out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
+    bool ok = mul ? f64_conv_run(in, 0, n, e, true, 0, kv, &x, &nexc, max_exc)
+                  : f64_conv_run(in, 0, n, e, false, 0, kv, &x, &nexc, max_exc);
+    if (!ok)
+        return 0;
+    bool smaller_for = int_for_smaller(kv, n);
+    bool use_for = !zstd_align && smaller_for;
+    if (want_forp)
+        *want_forp = zstd_align && smaller_for && keep != NULL;
+    size_t len = use_for ? int_for_encode_opt(kv, n, x, false) : int_bp_encode_opt(kv, n, x, zstd_align);
+    if (!len)
+        return 0;
+    out[0] = (uint8_t)(e | (mul ? F64_MUL : 0) | (use_for ? F64_FOR : 0));
     store32(out + 1, (uint32_t)nexc);
     *nexcp = nexc;
-    return (size_t)(x - out) + ib_len;
+    return (size_t)(x - out) + len;
+}
+
+size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp)
+{
+    return f64_decimal_encode_opt(in, n, out, keep, nexcp, false, NULL);
 }
 
 int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out)
@@ -1224,14 +1283,17 @@ int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out)
         return 0;
     if (len < 5)
         return TSDB_ERR_CORRUPT;
-    int e = in[0] & ~F64_MUL;
-    bool mul = in[0] & F64_MUL;
+    int e = in[0] & F64_EXP_MASK;
+    bool mul = (in[0] & F64_MUL) != 0;
+    bool use_for = (in[0] & F64_FOR) != 0;
     uint32_t nexc = load32(in + 1);
     if (e > F64_MAX_EXP || nexc > n || 5 + (size_t)nexc * 12 > len)
         return TSDB_ERR_CORRUPT;
     const uint8_t *x = in + 5, *ints = x + (size_t)nexc * 12;
     /* same size: the integers are decoded into out, then turned into doubles in place */
-    if (int_bp_decode(ints, len - (size_t)(ints - in), n, (int64_t *)(void *)out) != 0)
+    int rc = use_for ? int_for_decode(ints, len - (size_t)(ints - in), n, (int64_t *)(void *)out)
+                     : int_bp_decode(ints, len - (size_t)(ints - in), n, (int64_t *)(void *)out);
+    if (rc != 0)
         return TSDB_ERR_CORRUPT;
     f64_back_all(out, n, e, mul);
     for (uint32_t j = 0; j < nexc; j++, x += 12) {
@@ -2085,10 +2147,9 @@ static bool dict_dense(const int64_t *q, size_t n)
  * (dict_dense) are kept at once; otherwise the dictionary is built from the integers, and it is
  * compressed and compared only if it came out small enough to have a chance.
  */
-size_t fixed_or_dict(codec_ctx *c, int level, int pre_kind, size_t pre_inner, const int64_t *q, size_t nexc,
-                     const void *v, size_t n, int width, uint8_t *out)
+static size_t fixed_or_dict_wrapped(codec_ctx *c, int level, int pre_kind, size_t pre_inner, size_t len,
+                                    const int64_t *q, size_t nexc, const void *v, size_t n, int width, uint8_t *out)
 {
-    size_t len = block_wrap(c, level, pre_kind, pre_inner, out);
     if (len == 0 || !q || n < 64 || n > 65535 || c->work_cap < DICT_WORK(n) || dict_dense(q, n))
         return len;
     int64_t lo = q[0], hi = q[0];
@@ -2115,6 +2176,13 @@ size_t fixed_or_dict(codec_ctx *c, int level, int pre_kind, size_t pre_inner, co
         len = dl;
     }
     return len;
+}
+
+size_t fixed_or_dict(codec_ctx *c, int level, int pre_kind, size_t pre_inner, const int64_t *q, size_t nexc,
+                     const void *v, size_t n, int width, uint8_t *out)
+{
+    size_t len = block_wrap(c, level, pre_kind, pre_inner, out);
+    return fixed_or_dict_wrapped(c, level, pre_kind, pre_inner, len, q, nexc, v, n, width, out);
 }
 
 /*
@@ -2275,8 +2343,39 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
     bool merge = c->effort == CODEC_MERGE;
-    int64_t *q = merge && codec_work_reserve(c, DICT_WORK(n)) == 0 ? (int64_t *)(void *)c->work : NULL;
-    size_t nexc = 0, inner = f64_decimal_encode_keep(v, n, c->scratch, q, &nexc);
+    size_t work_need = merge ? DICT_WORK(n) : n * sizeof(int64_t);
+    int64_t *q = codec_work_reserve(c, work_need) == 0 ? (int64_t *)(void *)c->work : NULL;
+    size_t nexc = 0;
+    bool want_for = false;
+    size_t inner = f64_decimal_encode_opt(v, n, c->scratch, q, &nexc, level > 0, &want_for);
+    if (inner && level > 0 && want_for && codec_alt_reserve(c, block_bound(n)) == 0) {
+        /* Compare int_bp vs int_for after ZSTD (keeping int_for on tie for faster decode),
+         * reusing the already-converted integers q[0..n) and exception table at c->scratch[5..]. */
+        size_t hdr = 5 + nexc * 12;
+        size_t len_bp = block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
+        size_t flen = int_for_encode_opt(q, n, c->scratch + hdr, true);
+        size_t inner_for = flen ? hdr + flen : 0;
+        if (inner_for) {
+            c->scratch[0] |= F64_FOR;
+            size_t len_for = block_wrap(c, level, BLK_F64_DECIMAL, inner_for, c->alt);
+            if (len_for && (!len_bp || len_for <= len_bp)) {
+                if (inner_for * 8 <= 16 * n || inner * 8 <= 16 * n) {
+                    memcpy(out, c->alt, len_for);
+                    return merge ? fixed_or_dict_wrapped(c, level, BLK_F64_DECIMAL, inner_for, len_for, q, nexc, v, n,
+                                                         8, out)
+                                 : len_for;
+                }
+                inner = inner_for;
+            } else {
+                if (inner * 8 <= 16 * n)
+                    return merge ? fixed_or_dict_wrapped(c, level, BLK_F64_DECIMAL, inner, len_bp, q, nexc, v, n, 8,
+                                                         out)
+                                 : len_bp;
+                c->scratch[0] &= (uint8_t)~F64_FOR;
+                inner = hdr + int_bp_encode_opt(q, n, c->scratch + hdr, true);
+            }
+        }
+    }
     if (inner && inner * 8 <= 16 * n)
         return merge ? fixed_or_dict(c, level, BLK_F64_DECIMAL, inner, q, nexc, v, n, 8, out)
                      : block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
@@ -2284,8 +2383,21 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
     size_t wide = f32_wide(c, level, v, n, out, inner, &tried);
     if (wide)
         return wide;
-    if (inner && tried) /* the float32 encoder wrote over it */
-        inner = f64_decimal_encode_keep(v, n, c->scratch, q, &nexc);
+    if (inner && tried) { /* the float32 encoder wrote over it */
+        q = c->work_cap >= work_need ? (int64_t *)(void *)c->work : NULL;
+        bool wf = false;
+        inner = f64_decimal_encode_opt(v, n, c->scratch, q, &nexc, level > 0, &wf);
+        if (inner && wf) {
+            size_t hdr = 5 + nexc * 12;
+            size_t flen = int_for_encode_opt(q, n, c->scratch + hdr, true);
+            if (flen && hdr + flen < inner) {
+                c->scratch[0] |= F64_FOR;
+                inner = hdr + flen;
+            } else {
+                inner = hdr + int_bp_encode_opt(q, n, c->scratch + hdr, true);
+            }
+        }
+    }
     if (!merge)
         return f64_fast(c, level, v, n, inner, out);
     static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
@@ -2298,12 +2410,13 @@ static size_t encode_int(codec_ctx *c, int level, const int64_t *v, size_t n, ui
     size_t need = MAX(int_bp_bound(n), int_for_bound(n));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
-    size_t bp = int_bp_encode(v, n, c->scratch);
+    bool align = level > 0;
+    size_t bp = int_bp_encode_opt(v, n, c->scratch, align);
     if (n < 2)
         return block_wrap(c, level, BLK_INT, bp, out);
     if (codec_alt_reserve(c, need) != 0)
         return 0;
-    size_t fo = int_for_encode(v, n, c->alt);
+    size_t fo = int_for_encode_opt(v, n, c->alt, align);
     if (fo && fo < bp)
         return block_wrap_src(c, level, BLK_INT_FOR, c->alt, fo, out);
     return block_wrap(c, level, BLK_INT, bp, out);
