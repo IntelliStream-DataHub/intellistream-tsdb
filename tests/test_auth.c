@@ -1031,6 +1031,101 @@ static void test_rfc7677_server(const char *base)
     printf("  RFC 7677 §3, tsdbd's server side: server-first and server-final byte for byte\n");
 }
 
+/* SEC-04: server-side upper bound on SCRAM PBKDF2 iterations in auth_admin (get_verifier + users.c). */
+static void test_iter_cap(const char *base)
+{
+    char dir[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s-itercap", base);
+    mkdir(dir, 0755);
+    users u;
+    OK(users_open(&u, dir, true));
+    user_verifier v = {.iterations = ITER_MIN, .salt_len = SALT_MIN};
+    memcpy(v.salt, "0123456789abcdef", SALT_MIN);
+    tsdb_scram_keys("rootpw", 6, v.salt, SALT_MIN, ITER_MIN, NULL, v.stored_key, v.server_key);
+    OK(users_create(&u, 0, "root", USER_SUPERUSER, &v, NULL));
+    users_close(&u);
+    CHECK(auth_init(dir, true, true, NULL) == 0);
+
+    auth_conn a;
+    CHECK(inproc_login(&a, "root", "rootpw", NULL, NULL) == 0);
+    CHECK(a.state == AS_IN && a.au);
+
+    /* Raw USER_CREATE / USER_PASSWORD payloads: u16 name_len, name, [u8 flags], u32 iter, u8 salt_len, salt, keys[64] */
+    int bad_pw_accepted = 0;
+    uint32_t bad_iters[2] = {ITER_MAX + 1, UINT32_MAX};
+    for (int k = 0; k < 2; k++) {
+        uint8_t req[256];
+        size_t o = 0;
+        const char *nm = k == 0 ? "bad1" : "bad2";
+        uint16_t nl = (uint16_t)strlen(nm);
+        memcpy(req + o, &nl, 2);
+        o += 2;
+        memcpy(req + o, nm, nl);
+        o += nl;
+        req[o++] = 0;
+        memcpy(req + o, &bad_iters[k], 4);
+        o += 4;
+        req[o++] = SALT_MIN;
+        memset(req + o, 0x55, SALT_MIN + 64);
+        o += SALT_MIN + 64;
+        uint8_t *rep = NULL;
+        size_t rl = 0;
+        CHECK(auth_admin(&a, TSDB_OP_USER_CREATE, req, o, &rep, &rl) == TSDB_ERR_INVALID);
+        free(rep);
+
+        o = 0;
+        nl = 4;
+        memcpy(req + o, &nl, 2);
+        o += 2;
+        memcpy(req + o, "root", 4);
+        o += 4;
+        memcpy(req + o, &bad_iters[k], 4);
+        o += 4;
+        req[o++] = SALT_MIN;
+        memset(req + o, 0x66, SALT_MIN + 64);
+        o += SALT_MIN + 64;
+        int prc = auth_admin(&a, TSDB_OP_USER_PASSWORD, req, o, &rep, &rl);
+        CHECK(prc == TSDB_ERR_INVALID);
+        if (prc == 0)
+            bad_pw_accepted = 1;
+        free(rep);
+    }
+
+    /* Boundary: ITER_MAX is accepted, and root's password still works unchanged */
+    {
+        uint8_t req[256];
+        size_t o = 0;
+        uint16_t nl = 5;
+        memcpy(req + o, &nl, 2);
+        o += 2;
+        memcpy(req + o, "maxok", 5);
+        o += 5;
+        req[o++] = 0;
+        uint32_t it = ITER_MAX;
+        memcpy(req + o, &it, 4);
+        o += 4;
+        req[o++] = SALT_MIN;
+        memset(req + o, 0x77, SALT_MIN + 64);
+        o += SALT_MIN + 64;
+        uint8_t *rep = NULL;
+        size_t rl = 0;
+        CHECK(auth_admin(&a, TSDB_OP_USER_CREATE, req, o, &rep, &rl) == 0);
+        free(rep);
+    }
+    if (!bad_pw_accepted) {
+        auth_conn a2;
+        CHECK(inproc_login(&a2, "root", "rootpw", NULL, NULL) == 0);
+        auth_conn_free(&a2);
+    }
+    auth_conn_free(&a);
+    auth_shutdown();
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0)
+        fprintf(stderr, "test_auth: could not remove %s\n", dir);
+    printf("  iter cap: USER_CREATE and USER_PASSWORD reject iterations > %u and accept %u\n", ITER_MAX, ITER_MAX);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1043,6 +1138,7 @@ int main(int argc, char **argv)
     test_rfc7677_client();
     test_rfc7677_server(dir);
     test_inproc(dir);
+    test_iter_cap(dir);
     test_no_auth(dir);
 
     int before = failures; /* a failure above does not stop the server tests: only the CLI's own */

@@ -944,6 +944,16 @@ static void test_stores(void)
     spit(meta, m, n);
     CHECK(chunk_store_open(sp, id, &st) == 0);
     chunk_store_close(st);
+    /* SEC-05: chunk_store_init2 must refuse symlinked target directories (with or without trailing slash) */
+    char target[PATH_MAX + 64], link[PATH_MAX + 64], link_sl[PATH_MAX + 66], tmeta[PATH_MAX + 80];
+    snprintf(target, sizeof target, "%s/real_dir", dir);
+    snprintf(link, sizeof link, "%s/sym_dir", dir);
+    snprintf(link_sl, sizeof link_sl, "%s/sym_dir/", dir);
+    snprintf(tmeta, sizeof tmeta, "%s/META", target);
+    CHECK(mkdir(target, 0755) == 0 && symlink(target, link) == 0);
+    CHECK(chunk_store_init(link, NULL, other) == TSDB_ERR_IO);
+    CHECK(chunk_store_init(link_sl, NULL, other) == TSDB_ERR_IO);
+    CHECK(access(tmeta, F_OK) != 0);
     free(m);
 
     /* EPOCH: raised durably, never lowered, torn slots */

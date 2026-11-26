@@ -55,6 +55,16 @@ refused "an unknown option" init "$dir/bad" --cluster $uuid --node 1 --force
 err=$(cs init "$dir/bad" --cluster nope --node 1 2>&1)
 echo "$err" | grep -q "nope is not a cluster uuid" || fail "a bad uuid's message does not name it: $err"
 
+# SEC-05: symlinked target directories (with or without trailing slash, or dangling) are refused
+mkdir "$dir/real_target"
+ln -s "$dir/real_target" "$dir/sym_store"
+ln -s "$dir/nonexistent_target" "$dir/sym_dangle"
+cs init "$dir/sym_store" --cluster $uuid --node 1 >/dev/null 2>&1 && fail "symlinked store path was accepted"
+cs init "$dir/sym_store/" --cluster $uuid --node 1 >/dev/null 2>&1 && fail "symlinked store path with slash was accepted"
+cs init "$dir/sym_dangle" --cluster $uuid --node 1 >/dev/null 2>&1 && fail "dangling symlink store path was accepted"
+[ ! -e "$dir/real_target/META" ] || fail "symlinked init created META in real_target"
+[ ! -e "$dir/nonexistent_target" ] || fail "dangling symlink init created nonexistent_target"
+
 if [ $errors -ne 0 ]; then
     echo "test_cli_chunkstore: $errors failure(s)"
     exit 1

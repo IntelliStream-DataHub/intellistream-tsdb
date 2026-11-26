@@ -186,6 +186,12 @@ static int name_at(eng *db, const char *intent, const char *name)
 
 /* ------------------------------------------------------------ the commit */
 
+static inline void sn_add(size_t *len, size_t cap, int r)
+{
+    if (r > 0 && *len < cap)
+        *len += (size_t)r < cap - *len ? (size_t)r : cap - *len - 1;
+}
+
 static int intent_write(eng *db, const char *intent, part **in, part **ec, size_t n)
 {
     size_t cap = 64, len = 0; /* the lines' own lengths: no bound on a name's length is assumed */
@@ -197,12 +203,12 @@ static int intent_write(eng *db, const char *intent, part **in, part **ec, size_
     char *buf = fail == ECSWAP_FAIL_INTENT_NOMEM ? NULL : malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
-    len += (size_t)snprintf(buf + len, cap - len, INTENT_V4_HEAD "%zu\n", n);
+    sn_add(&len, cap, snprintf(buf + len, cap - len, INTENT_V4_HEAD "%zu\n", n));
     for (size_t i = 0; i < n; i++)
-        len += (size_t)snprintf(buf + len, cap - len, "L %s %s\n", ec[i]->pending, ec[i]->name);
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "L %s %s\n", ec[i]->pending, ec[i]->name));
     for (size_t i = 0; i < n; i++)
-        len += (size_t)snprintf(buf + len, cap - len, "R %s settled_%s\n", in[i]->name, in[i]->name);
-    len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+        sn_add(&len, cap, snprintf(buf + len, cap - len, "R %s settled_%s\n", in[i]->name, in[i]->name));
+    sn_add(&len, cap, snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0)));
     int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int rc = fd < 0 || write_full(fd, buf, len) != 0 || (db->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
     if (fd >= 0 && close(fd) != 0 && rc == 0) /* on NFS, close sends the data to the server */

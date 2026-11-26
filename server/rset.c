@@ -197,14 +197,20 @@ again:
     char nodes[REPL_MAX_NODES * 48 + 1];
     size_t o = 0;
     nodes[0] = 0;
-    for (uint32_t i = 0; i < n->nrep && o < sizeof nodes - 48; i++) {
-        o += (size_t)snprintf(nodes + o, sizeof nodes - o, "%s%" PRIu32, i ? ", " : "", n->rep[i].node);
-        if ((int)i == self)
-            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (this)");
-        else if (old_of[i] < 0)
-            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (new)");
-        else
-            o += (size_t)snprintf(nodes + o, sizeof nodes - o, " (acked %" PRIu64 ")", rv->peer[i].acked);
+    for (uint32_t i = 0; i < n->nrep && o + 48 < sizeof nodes; i++) {
+        int r = snprintf(nodes + o, sizeof nodes - o, "%s%" PRIu32, i ? ", " : "", n->rep[i].node);
+        if (r > 0)
+            o += (size_t)r < sizeof nodes - o ? (size_t)r : sizeof nodes - o - 1;
+        if (o + 1 < sizeof nodes) {
+            if ((int)i == self)
+                r = snprintf(nodes + o, sizeof nodes - o, " (this)");
+            else if (old_of[i] < 0)
+                r = snprintf(nodes + o, sizeof nodes - o, " (new)");
+            else
+                r = snprintf(nodes + o, sizeof nodes - o, " (acked %" PRIu64 ")", rv->peer[i].acked);
+            if (r > 0)
+                o += (size_t)r < sizeof nodes - o ? (size_t)r : sizeof nodes - o - 1;
+        }
     }
     rec_set(rv, n);
     rv->self = self;

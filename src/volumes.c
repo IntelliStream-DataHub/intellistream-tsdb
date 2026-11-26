@@ -545,7 +545,9 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
         }
     }
     free(txt);
-    n += (size_t)snprintf(buf + n, 32, "volume=%u\n", index);
+    int r = snprintf(buf + n, 32, "volume=%u\n", index);
+    if (r > 0)
+        n += (size_t)r < 32 ? (size_t)r : 31;
     char tmp[128];
     meta_tmp_make(tmp, sizeof tmp); /* our own: another add of this directory may be writing META right now */
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -3727,18 +3729,36 @@ static int up_manifest(const up_dir *d, bool write)
         return TSDB_ERR_CORRUPT;
     }
     parts++;
-    char *out = malloc(blen + 64);
+    size_t cap = blen + 64;
+    char *out = malloc(cap);
     if (!out) {
         free(txt);
         return TSDB_ERR_NOMEM;
     }
-    size_t n = (size_t)snprintf(out, 32, "tsdb-manifest %d", FORMAT_VERSION);
-    memcpy(out + n, nl, (size_t)(parts - nl)); /* from the newline of the first line to the start of `parts` */
-    n += (size_t)(parts - nl);
-    n += (size_t)snprintf(out + n, 32, "fno_next 1\n");
-    memcpy(out + n, parts, (size_t)(body_end - parts));
-    n += (size_t)(body_end - parts);
-    n += (size_t)snprintf(out + n, 40, "checksum %016" PRIx64 "\n", xxh64(out, n, 0));
+    size_t n = 0;
+    int r = snprintf(out, cap, "tsdb-manifest %d", FORMAT_VERSION);
+    if (r > 0)
+        n = (size_t)r < cap ? (size_t)r : cap - 1;
+    size_t c1 = (size_t)(parts - nl);
+    if (n + c1 < cap) {
+        memcpy(out + n, nl, c1); /* from the newline of the first line to the start of `parts` */
+        n += c1;
+    }
+    if (n + 1 < cap) {
+        r = snprintf(out + n, cap - n, "fno_next 1\n");
+        if (r > 0)
+            n += (size_t)r < cap - n ? (size_t)r : cap - n - 1;
+    }
+    size_t c2 = (size_t)(body_end - parts);
+    if (n + c2 < cap) {
+        memcpy(out + n, parts, c2);
+        n += c2;
+    }
+    if (n + 1 < cap) {
+        r = snprintf(out + n, cap - n, "checksum %016" PRIx64 "\n", xxh64(out, n, 0));
+        if (r > 0)
+            n += (size_t)r < cap - n ? (size_t)r : cap - n - 1;
+    }
     rc = up_put(d->dirfd, "MANIFEST.tmp", "MANIFEST", out, n);
     free(out);
     free(txt);
@@ -3757,9 +3777,11 @@ static int up_meta(const up_dir *d, const char *txt)
     for (const char *l = txt; *l;) {
         const char *e = strchr(l, '\n');
         size_t ll = e ? (size_t)(e - l) + 1 : strlen(l);
-        if (strncmp(l, "version=", 8) == 0)
-            n += (size_t)snprintf(out + n, cap - n, "version=%d\n", FORMAT_VERSION);
-        else if (strncmp(l, "parts_v8=", 9) != 0) {
+        if (strncmp(l, "version=", 8) == 0 && n + 1 < cap) {
+            int r = snprintf(out + n, cap - n, "version=%d\n", FORMAT_VERSION);
+            if (r > 0)
+                n += (size_t)r < cap - n ? (size_t)r : cap - n - 1;
+        } else if (strncmp(l, "parts_v8=", 9) != 0 && n + ll + (e ? 0 : 1) < cap) {
             memcpy(out + n, l, ll);
             n += ll;
             if (!e)
@@ -3767,7 +3789,11 @@ static int up_meta(const up_dir *d, const char *txt)
         }
         l += ll;
     }
-    n += (size_t)snprintf(out + n, cap - n, "parts_v8=1\n");
+    if (n + 1 < cap) {
+        int r = snprintf(out + n, cap - n, "parts_v8=1\n");
+        if (r > 0)
+            n += (size_t)r < cap - n ? (size_t)r : cap - n - 1;
+    }
     char tmp[256];
     meta_tmp_make(tmp, sizeof tmp);
     int rc = up_put(d->dirfd, tmp, "META", out, n);

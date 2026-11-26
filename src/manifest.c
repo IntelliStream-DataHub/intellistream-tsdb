@@ -97,16 +97,25 @@ int manifest_publish(eng *db)
      * unless it lands in that window, and a mutant of the read alone passed 5 of 5 runs (no test of the read side) */
     if (eng_test_mutant == MUT_REPLICA_WALSEQ_UNLOCKED)
         wal_active = db->wal_enabled || db->rp ? db->wal_seq : db->wal_flushed;
-    len += (size_t)snprintf(buf + len, cap - len,
-                            "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
-                            "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
-                            FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
-                            wal_active, db->opt.fsync ? 1 : 0,
-                            atomic_load(&db->states.count), fno_next, db->nparts);
-    for (size_t i = 0; i < db->nparts; i++)
-        len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
+    int r = snprintf(buf + len, cap - len,
+                     "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
+                     "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nfno_next %" PRIu64 "\nparts %zu\n",
+                     FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
+                     wal_active, db->opt.fsync ? 1 : 0,
+                     atomic_load(&db->states.count), fno_next, db->nparts);
+    if (r > 0)
+        len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    for (size_t i = 0; i < db->nparts && len + 1 < cap; i++) {
+        r = snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
+        if (r > 0)
+            len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    }
     pthread_mutex_unlock(&db->lock);
-    len += (size_t)snprintf(buf + len, cap - len, "checksum %016" PRIx64 "\n", xxh64(buf, len, 0));
+    if (len + 1 < cap) {
+        r = snprintf(buf + len, cap - len, "checksum %016" PRIx64 "\n", xxh64(buf, len, 0));
+        if (r > 0)
+            len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    }
 
     /* in place, never renamed: see the comment at the top */
     int rc = 0;

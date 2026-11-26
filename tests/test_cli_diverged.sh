@@ -35,14 +35,24 @@ err=$("$B/tsdb" "$dir/db" volume diverged "$dir/cv" 2>&1 >/dev/null) && fail "ac
 err=$("$B/tsdb" "$dir/db" volume diverged "$dir/other" --clear 2>&1 >/dev/null) && fail "accepted another db as volume"
 [[ $err == *"not a volume"* ]] || fail "other db refusal message: $err"
 
-# A real volume added to $dir/db (plus explicit DIR, symlink, and trailing slash) is accepted
+# A real volume added to $dir/db (plus explicit DIR and trailing slash) is accepted; symlinks are refused (SEC-05)
 "$B/tsdb" "$dir/db" volume add "$dir/v1" >/dev/null || fail "volume add v1"
 ln -s "$dir/v1" "$dir/v1_link"
-for p in "$dir/db" "$dir/db/" "$dir/v1" "$dir/v1/" "$dir/v1_link"; do
+for p in "$dir/db" "$dir/db/" "$dir/v1" "$dir/v1/"; do
     out=$("$B/tsdb" "$dir/db" volume diverged "$p") || fail "volume diverged on $p: exit $?"
     [[ $out == *"not diverged"* ]] || fail "volume diverged on $p said: $out"
     "$B/tsdb" "$dir/db" volume diverged "$p" --clear >/dev/null || fail "--clear on valid volume $p"
 done
+for p in "$dir/v1_link" "$dir/v1_link/"; do
+    "$B/tsdb" "$dir/db" volume diverged "$p" >/dev/null 2>&1 && fail "accepted symlinked volume PATH $p"
+    "$B/tsdb" "$dir/db" volume diverged "$p" --clear >/dev/null 2>&1 && fail "accepted symlinked volume PATH $p --clear"
+done
+# Symlinked LOCK or META inside a volume directory is refused and leaves the target untouched
+rm -f "$dir/v1/LOCK"
+ln -s "$dir/lock_victim" "$dir/v1/LOCK"
+"$B/tsdb" "$dir/db" volume diverged "$dir/v1" --clear >/dev/null 2>&1 && fail "accepted symlinked LOCK"
+[ ! -e "$dir/lock_victim" ] || fail "symlinked LOCK created lock_victim"
+rm -f "$dir/v1/LOCK"
 
 # Non-existent PATH, non-directory PATH (ENOTDIR), relative PATH, and corrupted VOLUMES checksum
 err=$("$B/tsdb" "$dir/db" volume diverged "$dir/nope" 2>&1 >/dev/null) && fail "accepted non-existent PATH"

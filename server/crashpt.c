@@ -31,8 +31,10 @@ static void say(const char *msg, const char *name, long n)
 {
     char line[200];
     int len = snprintf(line, sizeof line, "tsdbd: crash point %s (%s %ld)\n", name, msg, n);
-    if (len > 0)
-        (void)!write(2, line, (size_t)len);
+    if (len > 0) {
+        size_t w = (size_t)len < sizeof line ? (size_t)len : sizeof line - 1;
+        (void)!write(2, line, w);
+    }
 }
 
 /* Reads TSDB_CRASH_AT once (pthread_once: the points sit in several threads, and `armed_id` is written here only). */
@@ -109,7 +111,9 @@ void crashpt_slow(enum crash_point_id id)
     char line[200];
     int len = snprintf(line, sizeof line, "tsdbd: crash point %s (hit %ld): exiting with status %d\n",
                        crash_point_names[id], h, CRASH_EXIT_STATUS);
-    if (len > 0)
-        (void)!write(2, line, (size_t)len);
+    if (len > 0) {
+        size_t w = (size_t)len < sizeof line ? (size_t)len : sizeof line - 1;
+        (void)!write(2, line, w);
+    }
     power_cut_exit();
 }

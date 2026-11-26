@@ -2092,6 +2092,47 @@ static void group_set(void)
     printf("  group set: a blob of another name or uid, and a uid given twice, are left out and counted\n");
 }
 
+static void verifier_bounds(void)
+{
+    user_verifier v;
+    memset(&v, 0, sizeof v);
+    v.salt_len = SALT_MIN;
+    memset(v.salt, 0x42, v.salt_len);
+    memset(v.stored_key, 0x11, 32);
+    memset(v.server_key, 0x22, 32);
+
+    v.iterations = ITER_MIN - 1;
+    CHECK(!verifier_valid(&v));
+    v.iterations = ITER_MIN;
+    CHECK(verifier_valid(&v));
+    v.iterations = ITER_MAX;
+    CHECK(verifier_valid(&v));
+    v.iterations = ITER_MAX + 1;
+    CHECK(!verifier_valid(&v));
+    v.iterations = UINT32_MAX;
+    CHECK(!verifier_valid(&v));
+
+    char d[4096];
+    fresh("iterbounds", d, sizeof d);
+    users u;
+    OK(users_open(&u, d, true));
+    v.iterations = ITER_MIN;
+    OK(users_create(&u, 0, "root", USER_SUPERUSER, &v, NULL));
+    v.iterations = ITER_MAX;
+    OK(users_create(&u, 0, "maxok", 0, &v, NULL));
+    v.iterations = ITER_MAX + 1;
+    CHECK(users_create(&u, 0, "toohigh", 0, &v, NULL) == TSDB_ERR_INVALID);
+    CHECK(!users_find(&u, "toohigh"));
+    v.iterations = UINT32_MAX;
+    CHECK(users_create(&u, 0, "u32max", 0, &v, NULL) == TSDB_ERR_INVALID);
+    CHECK(users_set_verifier(&u, 0, "root", &v) == TSDB_ERR_INVALID);
+    const user *rt = users_find(&u, "root");
+    CHECK(rt && rt->v.iterations == ITER_MIN);
+    users_close(&u);
+    cleanup(d);
+    printf("  verifier bounds: iterations capped at %u (rejects %u and UINT32_MAX)\n", ITER_MAX, ITER_MAX + 1);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_users", 1200);
@@ -2106,6 +2147,7 @@ int main(int argc, char **argv)
     snprintf(shim, sizeof shim, "%s/libcrashfs.so", self);
     printf("test_users\n");
     names();
+    verifier_bounds();
     normalize();
     globs();
     globs_linear();

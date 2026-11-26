@@ -260,12 +260,17 @@ static bool take_varint(cur *c, uint64_t *v)
 /* Names in messages: escaped like the CLI prints them, so a control byte cannot forge a line. */
 static const char *esc(const char *s, char *out, size_t len)
 {
+    if (!len)
+        return out;
     size_t o = 0;
     for (const unsigned char *p = (const unsigned char *)s; *p && o + 5 < len; p++) {
-        if (*p < 0x20 || *p == 0x7f || *p == '\\')
-            o += (size_t)snprintf(out + o, len - o, *p == '\\' ? "\\\\" : "\\x%02x", *p);
-        else
+        if (*p < 0x20 || *p == 0x7f || *p == '\\') {
+            int r = snprintf(out + o, len - o, *p == '\\' ? "\\\\" : "\\x%02x", *p);
+            if (r > 0)
+                o += (size_t)r < len - o ? (size_t)r : len - o - 1;
+        } else {
             out[o++] = (char)*p;
+        }
     }
     out[o] = 0;
     return out;
@@ -597,10 +602,12 @@ int dump_export_main(const char *dir, int argc, char **argv)
     char *tmp = NULL;
     FILE *out = stdout;
     if (out_name && strcmp(out_name, "-") != 0) {
-        /* an existing FILE.partial may be another export writing it now: not truncated without --force */
+        /* an existing FILE.partial may be another export writing it now: not truncated without --force. With --force,
+         * unlink first and create exclusively with O_NOFOLLOW so a symlink at FILE.partial is never followed. */
         int fd = -1;
         if (asprintf(&tmp, "%s.partial", out_name) < 0 ||
-            (fd = open(tmp, O_WRONLY | O_CREAT | O_CLOEXEC | (force ? O_TRUNC : O_EXCL), 0644)) < 0 ||
+            (force && unlink(tmp) != 0 && errno != ENOENT) ||
+            (fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644)) < 0 ||
             !(out = fdopen(fd, "wb"))) {
             if (errno == EEXIST)
                 fprintf(stderr, "tsdb: export: %s exists: another export may be writing it, or one was "

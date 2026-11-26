@@ -517,10 +517,17 @@ static int tier_meta_write(eng *db, const char *txt, uint8_t u[16])
         return TSDB_ERR_IO;
     }
     char line[48];
-    int n = snprintf(line, sizeof line, "vuuid=");
-    for (int i = 0; i < 16; i++)
-        n += snprintf(line + n, sizeof line - (size_t)n, "%02x", u[i]);
-    snprintf(line + n, sizeof line - (size_t)n, "\n");
+    size_t n = 0;
+    int r = snprintf(line, sizeof line, "vuuid=");
+    if (r > 0)
+        n = (size_t)r < sizeof line ? (size_t)r : sizeof line - 1;
+    for (int i = 0; i < 16 && n + 1 < sizeof line; i++) {
+        r = snprintf(line + n, sizeof line - n, "%02x", u[i]);
+        if (r > 0)
+            n += (size_t)r < sizeof line - n ? (size_t)r : sizeof line - n - 1;
+    }
+    if (n + 1 < sizeof line)
+        snprintf(line + n, sizeof line - n, "\n");
     if ((rc = meta_tier_require(db->dirfd, db->opt.fsync, line)) != 0)
         fprintf(stderr, "tsdb: %s: META could not be given requires=tier and vuuid= (%s): the open fails\n", db->dir,
                 tsdb_strerror(rc));
