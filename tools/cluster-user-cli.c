@@ -525,7 +525,7 @@ int cluster_user_cli(int argc, char **argv)
             super = 1;
         else if (!strcmp(argv[i], "--iterations") && i + 1 < argc) {
             iterations = strtol(argv[++i], &end, 10);
-            if (*end || iterations < ITER_MIN || iterations > 100000000)
+            if (*end || iterations < ITER_MIN || iterations > (long)ITER_MAX)
                 return uusage();
         } else if (!strcmp(argv[i], "--wait-ms") && i + 1 < argc) {
             wait_ms = strtol(argv[++i], &end, 10);

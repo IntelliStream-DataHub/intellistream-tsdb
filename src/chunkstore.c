@@ -151,13 +151,16 @@ static void meta_text(char *out, size_t cap, const uint8_t id[16], const chunk_s
 {
     char hex[33], body[192];
     chunk_oid_hex(id, hex);
-    int n = snprintf(body, sizeof body, "tsdb chunk store %d\nid=%s\n", CHUNK_STORE_VERSION, hex);
-    if (ow && ow->set) { /* D11: the cluster and the node the store belongs to (a disk moved between them is refused) */
+    int r = snprintf(body, sizeof body, "tsdb chunk store %d\nid=%s\n", CHUNK_STORE_VERSION, hex);
+    size_t n = r > 0 ? ((size_t)r < sizeof body ? (size_t)r : sizeof body - 1) : 0;
+    if (ow && ow->set && n + 1 < sizeof body) { /* D11: the cluster and the node the store belongs to (a disk moved between them is refused) */
         char ch[33];
         chunk_oid_hex(ow->cluster, ch);
-        n += snprintf(body + n, sizeof body - (size_t)n, "cluster=%s\nnode=%" PRIu32 "\n", ch, ow->node);
+        r = snprintf(body + n, sizeof body - n, "cluster=%s\nnode=%" PRIu32 "\n", ch, ow->node);
+        if (r > 0)
+            n += (size_t)r < sizeof body - n ? (size_t)r : sizeof body - n - 1;
     }
-    snprintf(out, cap, "%ssum=%016" PRIx64 "\n", body, xxh64(body, (size_t)n, 0));
+    snprintf(out, cap, "%ssum=%016" PRIx64 "\n", body, xxh64(body, n, 0));
 }
 
 static int meta_read(int dirfd, uint8_t id[16], chunk_store_owner *ow)
@@ -252,15 +255,34 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
 {
     if (!path || !*path)
         return TSDB_ERR_INVALID;
-    bool made = mkdir(path, 0755) == 0;
-    if (!made && errno != EEXIST)
+    /* Strip trailing slashes (except "/") so O_NOFOLLOW catches symlinked target directories too. */
+    size_t plen = strlen(path);
+    while (plen > 1 && path[plen - 1] == '/')
+        plen--;
+    char *pcopy = NULL;
+    const char *p = path;
+    if (path[plen] != '\0') {
+        pcopy = malloc(plen + 1);
+        if (!pcopy)
+            return TSDB_ERR_NOMEM;
+        memcpy(pcopy, path, plen);
+        pcopy[plen] = '\0';
+        p = pcopy;
+    }
+    bool made = mkdir(p, 0755) == 0;
+    if (!made && errno != EEXIST) {
+        free(pcopy);
         return TSDB_ERR_IO;
-    int dirfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dirfd < 0)
+    }
+    int dirfd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dirfd < 0) {
+        free(pcopy);
         return TSDB_ERR_IO;
+    }
     int rc = 0;
     if (faccessat(dirfd, "META", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
         close(dirfd);
+        free(pcopy);
         return TSDB_ERR_INVALID; /* already a store: its id is not replaced */
     }
     uint8_t sid[16];
@@ -275,7 +297,7 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
     /* a temporary file is always a new inode: one a failed write or sync left behind may have had its pages dropped
      * (the kernel reports that once), so it is never reused */
     unlinkat(dirfd, "META.tmp", 0);
-    int fd = openat(dirfd, "META.tmp", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    int fd = openat(dirfd, "META.tmp", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0)
         rc = TSDB_ERR_IO;
     else {
@@ -291,7 +313,8 @@ int chunk_store_init2(const char *path, const uint8_t *id, const chunk_store_own
         rc = TSDB_ERR_IO;
     close(dirfd);
     if (rc == 0 && made)
-        rc = sync_dir_path_parent(path);
+        rc = sync_dir_path_parent(p);
+    free(pcopy);
     if (rc == 0 && id_out)
         memcpy(id_out, sid, 16);
     return rc;
@@ -1345,10 +1368,13 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
         char names[512] = "";
         size_t len = 0;
         for (int i = 0; i < n && len + 80 < sizeof names; i++)
-            if (atomic_load(&be->state[i]) != CHUNK_STORE_UP)
-                len += (size_t)snprintf(names + len, sizeof names - len, "%s#%d %s (%s)", len ? ", " : "", i,
-                                        be->path[i] ? be->path[i] : "-",
-                                        chunk_store_state_name(atomic_load(&be->state[i])));
+            if (atomic_load(&be->state[i]) != CHUNK_STORE_UP) {
+                int r = snprintf(names + len, sizeof names - len, "%s#%d %s (%s)", len ? ", " : "", i,
+                                 be->path[i] ? be->path[i] : "-",
+                                 chunk_store_state_name(atomic_load(&be->state[i])));
+                if (r > 0)
+                    len += (size_t)r < sizeof names - len ? (size_t)r : sizeof names - len - 1;
+            }
         fprintf(stderr, "tsdb: chunk backend: %d of %d stores are up, %d are needed: down: %s\n", up, n, need, names);
         rc = TSDB_ERR_UNAVAILABLE;
     }

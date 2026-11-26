@@ -138,7 +138,7 @@ int ecdiverge_parse(const uint8_t *buf, size_t len, size_t *n)
  * one). `confirm`: a writer's open confirms a torn tail by a second read before it may be cut. */
 static int load(int dirfd, const char *dir, struct ecdiverge *d, bool confirm)
 {
-    int fd = openat(dirfd, DIV_FILE, O_RDONLY | O_CLOEXEC);
+    int fd = openat(dirfd, DIV_FILE, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return errno == ENOENT ? 0 : TSDB_ERR_IO;
     struct stat st;
@@ -300,10 +300,26 @@ done:
 
 int ecdiverge_cli(const char *dir, bool clear, FILE *out)
 {
-    int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    /* Strip trailing slashes (except "/") so O_NOFOLLOW refuses symlinked target directories too. */
+    size_t dlen = strlen(dir);
+    while (dlen > 1 && dir[dlen - 1] == '/')
+        dlen--;
+    char *dcopy = NULL;
+    const char *p = dir;
+    if (dir[dlen] != '\0') {
+        dcopy = malloc(dlen + 1);
+        if (!dcopy)
+            return TSDB_ERR_NOMEM;
+        memcpy(dcopy, dir, dlen);
+        dcopy[dlen] = '\0';
+        p = dcopy;
+    }
+    int dirfd = open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int oerr = errno;
+    free(dcopy);
     if (dirfd < 0) {
-        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(errno));
-        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+        fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(oerr));
+        return oerr == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
     }
     /* --clear decides from META whether this is a cluster volume (D23): a META that cannot be read refuses, never
      * counts as "not a cluster volume"; it also says that DIR is a database directory at all. The writer's LOCK is
@@ -313,7 +329,7 @@ int ecdiverge_cli(const char *dir, bool clear, FILE *out)
     if (clear) {
         char meta[4096];
         ssize_t n = -1;
-        int mfd = openat(dirfd, "META", O_RDONLY | O_CLOEXEC);
+        int mfd = openat(dirfd, "META", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (mfd >= 0) {
             n = read(mfd, meta, sizeof meta - 1);
             close(mfd);
@@ -336,7 +352,7 @@ int ecdiverge_cli(const char *dir, bool clear, FILE *out)
         rc = TSDB_ERR_INVALID;
     }
     if (rc == 0 && clear) {
-        lockfd = openat(dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        lockfd = openat(dirfd, "LOCK", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
         if (lockfd < 0 || flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
             fprintf(stderr, "tsdb: %s: a writer (tsdbd, or another tsdb command) holds the directory: stop it first; "
                             "nothing is cleared\n", dir);

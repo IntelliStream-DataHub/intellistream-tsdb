@@ -1373,7 +1373,15 @@ static void scen_secret(void)
         die("a made secret does not read back: %s", err);
     if (cluster_make_secret(p, err, sizeof err) == 0)
         die("cluster_make_secret overwrote an existing file");
-    printf("  a secret file of mode 0644 is refused; a made one is 0600 and reads back\n");
+    /* SEC-07: cluster_read_secret must refuse symlinks (O_NOFOLLOW) */
+    char lp[sizeof base + 32];
+    snprintf(lp, sizeof lp, "%s/link-secret", base);
+    if (symlink(p, lp) != 0)
+        die("symlink %s -> %s: %s", lp, p, strerror(errno));
+    if (cluster_read_secret(lp, buf, sizeof buf, &len, err, sizeof err) == 0)
+        die("cluster_read_secret followed a symlink to a 0600 secret file");
+    unlink(lp);
+    printf("  a secret file of mode 0644 or a symlink is refused; a made one is 0600 and reads back\n");
 }
 
 static void scen_relay(void)
@@ -1507,6 +1515,15 @@ static int crashpt_child(void)
     crash_point(CP_SERVING);
     return 5; /* the point did not fire */
 }
+static int crashpt_long_child(void)
+{
+    char big[600];
+    memset(big, 'a', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    setenv("TSDB_CRASH_AT", big, 1);
+    crash_point(CP_SERVING);
+    return 5; /* unknown name must exit(2) */
+}
 #endif
 
 static void scen_exitthreads(void)
@@ -1533,6 +1550,43 @@ static void scen_exitthreads(void)
             "report at exit)",
             st, CRASH_EXIT_STATUS);
     printf("  a crash point ends with %d beside a finished thread nobody joined\n", CRASH_EXIT_STATUS);
+
+    /* SEC-03: a long TSDB_CRASH_AT value must clamp say() output to its stack buffer (no stack over-read) */
+    int pfd[2];
+    if (pipe(pfd) != 0)
+        die("pipe: %s", strerror(errno));
+    pid = fork();
+    if (pid < 0)
+        die("fork: %s", strerror(errno));
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], 2);
+        close(pfd[1]);
+        execl(self, self, "crashpt-long-child", (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    char ebuf[1024];
+    size_t egot = 0;
+    for (;;) {
+        ssize_t r = read(pfd[0], ebuf + egot, sizeof ebuf - egot);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break;
+        egot += (size_t)r;
+        if (egot == sizeof ebuf)
+            break;
+    }
+    close(pfd[0]);
+    st = -1;
+    if (waitpid(pid, &st, 0) != pid)
+        die("waitpid: %s", strerror(errno));
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 2)
+        die("long TSDB_CRASH_AT ended with status 0x%x, not 2 (ASan stack over-read?)", st);
+    if (egot == 0 || egot >= 200)
+        die("long TSDB_CRASH_AT wrote %zu bytes to stderr (expected 1..199, clamped to stack buffer)", egot);
+    printf("  a 600-byte TSDB_CRASH_AT exited 2 and wrote %zu clamped bytes to stderr\n", egot);
 #else
     printf("  skipped: the crash point's child (a thread's /proc/self/task entry; Linux only)\n");
 #endif
@@ -3057,9 +3111,51 @@ static void await_probe(int i, const char *name, const char *want, const char *w
  * OK (mutant dropnotcommitted: OK at propose). The watch ring drops entries past its bytes. A restarted member whose
  * Raft core is held reports users_caught_up only after it heard a leader's commit index and applied that far (mutants
  * caughtupearly: true from the start; floornoapplied: true once the commit index is heard). */
+/* SEC-01: assert state dir and raft/ dir are 0700 and every file under them (snapshots, NODE, IDENT, hard, segments)
+ * has no group/other permission bits (mode & 077 == 0). */
+static void check_state_perms(int i)
+{
+    char sdir[PATH_MAX + 64], rdir[PATH_MAX + 80];
+    server_dir(i, sdir, sizeof sdir);
+    strcat(sdir, "/state");
+    snprintf(rdir, sizeof rdir, "%s/raft", sdir);
+    struct stat st;
+    if (stat(sdir, &st) != 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 077) != 0)
+        die("server %d: state dir %s has mode %03o (want 0700)", i, sdir, (unsigned)(st.st_mode & 0777));
+    if (stat(rdir, &st) != 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 077) != 0)
+        die("server %d: raft dir %s has mode %03o (want 0700)", i, rdir, (unsigned)(st.st_mode & 0777));
+    int saw_snap = 0, saw_hard = 0, saw_seg = 0;
+    const char *dirs[2] = {sdir, rdir};
+    for (int d = 0; d < 2; d++) {
+        DIR *dp = opendir(dirs[d]);
+        if (!dp)
+            die("opendir %s: %s", dirs[d], strerror(errno));
+        for (struct dirent *e; (e = readdir(dp));) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+            char fp[PATH_MAX + 384];
+            snprintf(fp, sizeof fp, "%s/%s", dirs[d], e->d_name);
+            if (lstat(fp, &st) != 0)
+                continue;
+            if (S_ISREG(st.st_mode) && (st.st_mode & 077) != 0)
+                die("server %d: %s has mode %03o (group/other bits set)", i, fp, (unsigned)(st.st_mode & 0777));
+            if (d == 0 && !strcmp(e->d_name, "snapshot"))
+                saw_snap = 1;
+            if (d == 1 && !strcmp(e->d_name, "hard"))
+                saw_hard = 1;
+            if (d == 1 && !strncmp(e->d_name, "log-", 4))
+                saw_seg = 1;
+        }
+        closedir(dp);
+    }
+    if (!saw_snap || !saw_hard || !saw_seg)
+        die("server %d: missing expected state files (snap=%d hard=%d seg=%d)", i, saw_snap, saw_hard, saw_seg);
+}
+
 static void scen_users(void)
 {
     scenario("users");
+    mode_t old_umask = umask(0022); /* SEC-01: verify 0700/0600 even under default 0022 umask */
     strict_reads = 1; /* a replica moves reads to the leader (D5), as in production */
     /* frequent snapshots: the member restarted below loads its copy (members, addresses, carol) from one, so it reaches
      * the leader with its Raft core held; server 1 registers a users watch and drops probe-drop through
@@ -3324,6 +3420,42 @@ static void scen_users(void)
     struct users_want root_only = {{"root", NULL, NULL}, "carol"};
     await_view(x, p_users, &root_only, "the restarted copy without carol");
     printf("  restarted member caught up only after hearing the leader\n");
+
+    /* SEC-01: state dirs are 0700 and snapshots, NODE, IDENT, Raft hard/segments are 0600 (even under umask 0022),
+     * and overly permissive existing state dirs/files are tightened on reopen. */
+    for (int i = 0; i < 3; i++)
+        check_state_perms(i);
+    stop(x, SIGTERM);
+    {
+        char sdir[PATH_MAX + 64], rdir[PATH_MAX + 80], fp[PATH_MAX + 384];
+        server_dir(x, sdir, sizeof sdir);
+        strcat(sdir, "/state");
+        snprintf(rdir, sizeof rdir, "%s/raft", sdir);
+        if (chmod(sdir, 0755) != 0 || chmod(rdir, 0755) != 0)
+            die("chmod state/raft dir: %s", strerror(errno));
+        snprintf(fp, sizeof fp, "%s/snapshot", sdir);
+        if (chmod(fp, 0644) != 0)
+            die("chmod snapshot: %s", strerror(errno));
+        snprintf(fp, sizeof fp, "%s/hard", rdir);
+        if (chmod(fp, 0644) != 0)
+            die("chmod hard: %s", strerror(errno));
+        DIR *dp = opendir(rdir);
+        if (dp) {
+            for (struct dirent *e; (e = readdir(dp));) {
+                if (!strncmp(e->d_name, "log-", 4)) {
+                    snprintf(fp, sizeof fp, "%s/%s", rdir, e->d_name);
+                    (void)chmod(fp, 0644);
+                }
+            }
+            closedir(dp);
+        }
+    }
+    envs[x] = "snap_every=2";
+    start(x);
+    await_view(x, p_users_caught_up, NULL, "reopened member caught up after chmod tightening");
+    check_state_perms(x);
+    umask(old_umask);
+    printf("  SEC-01: cluster state dir (0700) and Raft/snapshot files (0600) verified, including tighten-on-reopen\n");
 }
 
 /* writes `text` and a newline to base/NAME; its path in out */
@@ -3878,6 +4010,67 @@ static void scen_userstale(void)
             "no-op's OK did not wait for the members", ers(rc));
     printf("  a no-op through server 2 with server 1 paused: OK after %" PRIu64 " ms, %" PRIu64 " ms after server 1 "
            "resumed\n", done - t0, done - resumed);
+
+    /* SEC-09: TSDB_OP_USER_LIST runs a cluster read barrier (group_sync), so a lagging or partitioned node never
+     * serves a stale user list after an acknowledged create/drop. */
+    put_file("failpush", "", fp, sizeof fp);
+    if ((rc = tsdbc_user_create(r0, "list_seen", "list-pw", 0, 0)) != 0)
+        die("create list_seen through server 0: %s", ers(rc));
+    {
+        pthread_t ul_thr;
+        if (pthread_create(&ul_thr, NULL, unlink_later, failpush) != 0)
+            die("pthread_create");
+        tsdbc_user *list = NULL;
+        size_t nlist = 0;
+        rc = tsdbc_user_list(r2, &list, &nlist);
+        pthread_join(ul_thr, NULL);
+        if (rc != 0)
+            die("USER_LIST through lagging server 2: %s", ers(rc));
+        int found = 0;
+        for (size_t i = 0; i < nlist; i++)
+            if (!strcmp(list[i].name, "list_seen"))
+                found = 1;
+        tsdbc_users_free(list, nlist);
+        if (!found)
+            die("USER_LIST through lagging server 2 missed list_seen: answered from its stale copy");
+    }
+    put_file("failpush", "", fp, sizeof fp);
+    if ((rc = tsdbc_user_drop(r0, "list_seen")) != 0)
+        die("drop list_seen through server 0: %s", ers(rc));
+    {
+        pthread_t ul_thr;
+        if (pthread_create(&ul_thr, NULL, unlink_later, failpush) != 0)
+            die("pthread_create");
+        tsdbc_user *list = NULL;
+        size_t nlist = 0;
+        rc = tsdbc_user_list(r2, &list, &nlist);
+        pthread_join(ul_thr, NULL);
+        if (rc != 0)
+            die("USER_LIST after drop through lagging server 2: %s", ers(rc));
+        int found = 0;
+        for (size_t i = 0; i < nlist; i++)
+            if (!strcmp(list[i].name, "list_seen"))
+                found = 1;
+        tsdbc_users_free(list, nlist);
+        if (found)
+            die("USER_LIST through lagging server 2 still listed dropped list_seen: answered from its stale copy");
+    }
+    /* No quorum: server 2 cut off from the majority must refuse USER_LIST with UNAVAILABLE, never stale OK */
+    pause_server(0, 1);
+    pause_server(1, 1);
+    {
+        tsdbc_user *list = NULL;
+        size_t nlist = 0;
+        rc = tsdbc_user_list(r2, &list, &nlist);
+        tsdbc_users_free(list, nlist);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("USER_LIST on server 2 with no quorum returned %s, not UNAVAILABLE: answered from its stale copy",
+                ers(rc));
+    }
+    pause_server(0, 0);
+    pause_server(1, 0);
+    printf("  SEC-09: USER_LIST waits for read barrier on lagging follower and returns UNAVAILABLE without quorum\n");
+
     tsdbc_close(r0);
     tsdbc_close(r2);
 }
@@ -19447,6 +19640,8 @@ int main(int argc, char **argv)
 #ifdef __linux__
     if (argc == 2 && !strcmp(argv[1], "crashpt-child"))
         return crashpt_child();
+    if (argc == 2 && !strcmp(argv[1], "crashpt-long-child"))
+        return crashpt_long_child();
 #endif
     /* TMPDIR when no directory is given: /tmp is often a RAM tmpfs, and a 22-node run writes to /var/tmp */
     const char *scratch = argc > 1 && *argv[1] ? argv[1] : getenv("TMPDIR");

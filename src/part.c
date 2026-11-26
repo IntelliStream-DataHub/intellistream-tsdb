@@ -1041,10 +1041,19 @@ int parts_commit(eng *db, part **ps, size_t n)
         char *buf = malloc(cap);
         if (!buf)
             return TSDB_ERR_NOMEM;
-        len += (size_t)snprintf(buf + len, cap - len, "tsdb-intent 3 %zu\n", n);
-        for (size_t i = 0; i < n; i++)
-            len += (size_t)snprintf(buf + len, cap - len, "%s %s\n", ps[i]->pending, ps[i]->name);
-        len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+        int r = snprintf(buf + len, cap - len, "tsdb-intent 3 %zu\n", n);
+        if (r > 0)
+            len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+        for (size_t i = 0; i < n && len + 1 < cap; i++) {
+            r = snprintf(buf + len, cap - len, "%s %s\n", ps[i]->pending, ps[i]->name);
+            if (r > 0)
+                len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+        }
+        if (len + 1 < cap) {
+            r = snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+            if (r > 0)
+                len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+        }
         snprintf(intent, sizeof intent, INTENT_PREFIX "%d_%u.intent", (int)getpid(),
                  atomic_fetch_add(&db->tmp_counter, 1));
         int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -1232,10 +1241,19 @@ int drop_intent_prepare(eng *db, char (*const names)[96], size_t n, char intent[
     char *buf = malloc(cap);
     if (!buf)
         return TSDB_ERR_NOMEM;
-    len += (size_t)snprintf(buf + len, cap - len, DROP_INTENT_HEAD "%zu\n", n);
-    for (size_t i = 0; i < n; i++)
-        len += (size_t)snprintf(buf + len, cap - len, "%s\n", names[i]);
-    len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+    int r = snprintf(buf + len, cap - len, DROP_INTENT_HEAD "%zu\n", n);
+    if (r > 0)
+        len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    for (size_t i = 0; i < n && len + 1 < cap; i++) {
+        r = snprintf(buf + len, cap - len, "%s\n", names[i]);
+        if (r > 0)
+            len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    }
+    if (len + 1 < cap) {
+        r = snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
+        if (r > 0)
+            len += (size_t)r < cap - len ? (size_t)r : cap - len - 1;
+    }
     snprintf(intent, 64, INTENT_PREFIX "%d_%u.intent", (int)getpid(), atomic_fetch_add(&db->tmp_counter, 1));
     const bool sync = db->opt.fsync && drop_test_mutant != DROP_MUT_NO_SYNC;
     int inject = atomic_load(&drop_test_intent_errno);

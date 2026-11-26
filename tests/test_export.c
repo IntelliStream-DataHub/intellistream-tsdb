@@ -1554,6 +1554,15 @@ static void test_volumes(void)
     free(s);
     CHECK(RUN(NULL, NULL, src, "export", "-o", out, "--force") == 0);
     CHECK(access(out, F_OK) == 0 && access(part, F_OK) != 0);
+    /* SEC-07: --force must unlink FILE.partial instead of following a symlink and overwriting its target */
+    char *out2 = path("p2.dump"), *part2 = path("p2.dump.partial"), *victim = path("p2.victim");
+    spit(victim, "keep", 4);
+    CHECK(symlink(victim, part2) == 0);
+    CHECK(RUN(NULL, NULL, src, "export", "-o", out2, "--force") == 0);
+    CHECK(access(out2, F_OK) == 0 && access(part2, F_OK) != 0);
+    s = (uint8_t *)slurp(victim, &n);
+    CHECK(n == 4 && memcmp(s, "keep", 4) == 0);
+    free(s);
     printf("volumes, shared dictionaries, partial files: ok\n");
 }
 

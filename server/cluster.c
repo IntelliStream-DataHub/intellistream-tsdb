@@ -602,7 +602,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
 
 int cluster_read_secret(const char *path, uint8_t *out, size_t cap, size_t *len, char *err, size_t errn)
 {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) {
         snprintf(err, errn, "cannot open the secret file %s: %s", path, strerror(errno));
@@ -1264,9 +1264,15 @@ static int write_durable(const char *path, const void *data, size_t len)
 {
     char tmp[1100];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0)
         return -1;
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(tmp);
+        return -1;
+    }
     const uint8_t *p = data;
     size_t n = len;
     while (n) {
@@ -4478,12 +4484,21 @@ static void probe_write(const char *name, const char *text)
     char path[1200], tmp[1210];
     snprintf(path, sizeof path, "%s/%s", C.metadir, name);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "w");
-    if (!f)
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!f) {
+        if (fd >= 0) {
+            close(fd);
+            unlink(tmp);
+        }
         return;
+    }
     fputs(text, f);
     if (fclose(f) == 0)
         rename(tmp, path);
+    else
+        unlink(tmp);
 }
 
 static void *probe_drop(void *arg)
@@ -4533,6 +4548,7 @@ static void *copy_probe_main(void *arg)
         const struct cluster_copy *c = cluster_copy_get();
         struct buf b = {0};
         char line[600];
+        line[0] = '\0';
         snprintf(line, sizeof line, "caught %d applied %" PRIu64 "\n", cluster_copy_caught_up_at(c),
                  c ? c->applied : 0);
         put(&b, line, strlen(line));
@@ -4540,10 +4556,15 @@ static void *copy_probe_main(void *arg)
             const struct cluster_copy_vol *v = &c->volumes[i];
             if (v->redundancy != META_RED_EC)
                 continue;
-            int n = snprintf(line, sizeof line, "vol %s k %u m %u stripe_version %" PRIu64 " gc %u stripe", v->name,
+            line[0] = '\0';
+            int r = snprintf(line, sizeof line, "vol %s k %u m %u stripe_version %" PRIu64 " gc %u stripe", v->name,
                              v->ec_k, v->ec_m, v->stripe_version, v->gc_suspended);
-            for (uint32_t k = 0; k < v->nstripe && n > 0 && (size_t)n < sizeof line; k++)
-                n += snprintf(line + n, sizeof line - (size_t)n, " %" PRIu32, v->stripe[k]);
+            size_t n = r > 0 ? ((size_t)r < sizeof line ? (size_t)r : sizeof line - 1) : 0;
+            for (uint32_t k = 0; k < v->nstripe && n + 1 < sizeof line; k++) {
+                r = snprintf(line + n, sizeof line - n, " %" PRIu32, v->stripe[k]);
+                if (r > 0)
+                    n += (size_t)r < sizeof line - n ? (size_t)r : sizeof line - n - 1;
+            }
             put(&b, line, strlen(line));
             put(&b, "\n", 1);
         }
@@ -7173,7 +7194,7 @@ int cluster_start(const struct cluster_cfg *cfg)
         cluster_set_users_watch(users_probe_watch, NULL);
     meta_init(&C.sm);
     meta_init(&C.wsm);
-    if (mkdir(C.metadir, 0755) == 0) {
+    if (mkdir(C.metadir, 0700) == 0) {
         /* the parent of the state directory is made durable: a new directory's name lives there */
         char parent[sizeof C.metadir + 4];
         snprintf(parent, sizeof parent, "%s/..", C.metadir);
@@ -7184,6 +7205,57 @@ int cluster_start(const struct cluster_cfg *cfg)
     } else if (errno != EEXIST) {
         fprintf(stderr, "tsdbd: cluster: cannot make %s: %s\n", C.metadir, strerror(errno));
         return -1;
+    }
+    /* The state directory and its snapshots carry every cluster user's SCRAM verifiers (salt, stored_key, server_key),
+     * so they get the same owner-only mode as standalone USERS (0700 / 0600); tighten existing files on reopen. */
+    {
+        int dfd = open(C.metadir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat st;
+        if (dfd < 0 || fstat(dfd, &st) != 0) {
+            fprintf(stderr, "tsdbd: cluster: cannot open %s: %s\n", C.metadir, strerror(errno));
+            if (dfd >= 0)
+                close(dfd);
+            return -1;
+        }
+        if (st.st_mode & 077) {
+            if (fchmod(dfd, 0700) != 0) {
+                fprintf(stderr, "tsdbd: cluster: %s has mode %03o (accessible to group or others) and cannot be set to "
+                                "0700: %s\n",
+                        C.metadir, (unsigned)(st.st_mode & 0777), strerror(errno));
+                close(dfd);
+                return -1;
+            }
+            fprintf(stderr, "tsdbd: cluster: %s had mode %03o: set to 0700\n", C.metadir,
+                    (unsigned)(st.st_mode & 0777));
+        }
+        close(dfd);
+        const char *const files[] = {C.identfile, C.nodefile, C.snapfile, C.pendfile, C.copyfile, C.retiredfile};
+        for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+            int fd = open(files[i], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0) {
+                if (errno == ENOENT)
+                    continue;
+                fprintf(stderr, "tsdbd: cluster: cannot open %s: %s\n", files[i], strerror(errno));
+                return -1;
+            }
+            if (fstat(fd, &st) != 0) {
+                fprintf(stderr, "tsdbd: cluster: cannot stat %s: %s\n", files[i], strerror(errno));
+                close(fd);
+                return -1;
+            }
+            if (S_ISREG(st.st_mode) && (st.st_mode & 077)) {
+                if (fchmod(fd, 0600) != 0) {
+                    fprintf(stderr, "tsdbd: cluster: %s has mode %03o (readable by others) and cannot be set to 0600: "
+                                    "%s\n",
+                            files[i], (unsigned)(st.st_mode & 0777), strerror(errno));
+                    close(fd);
+                    return -1;
+                }
+                fprintf(stderr, "tsdbd: cluster: %s had mode %03o: set to 0600\n", files[i],
+                        (unsigned)(st.st_mode & 0777));
+            }
+            close(fd);
+        }
     }
 #ifdef __linux__
     {

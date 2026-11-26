@@ -1360,18 +1360,26 @@ void repl_free(struct repl *r)
 /* A line of the core's state for a driver's trace (TSDB_REPLD_TRACE, tests and debugging only). */
 unsigned long repl_debug(const struct repl *r, char *buf, unsigned long cap)
 {
+    if (!cap)
+        return 0;
+    buf[0] = '\0';
+    size_t pos = 0;
     int k = snprintf(buf, cap, "epoch %llu leader %d leading %d fstate %d written %llu durable %llu applied %llu "
                      "commit %llu verified %llu now %llu lastq %llu failed %d", (unsigned long long)r->epoch, r->leader,
                      r->leading, r->fstate, (unsigned long long)r->written, (unsigned long long)r->durable,
                      (unsigned long long)r->applied, (unsigned long long)r->commit, (unsigned long long)r->verified,
                      (unsigned long long)r->now, (unsigned long long)r->last_query, r->failed);
-    for (int i = 0; r->leading && i < r->cfg.nnodes && k > 0 && (size_t)k < cap; i++) {
+    if (k > 0)
+        pos = (size_t)k < cap ? (size_t)k : cap - 1;
+    for (int i = 0; r->leading && i < r->cfg.nnodes && pos + 1 < cap; i++) {
         const struct peer *p = &r->peer[i];
-        k += snprintf(buf + k, cap - (size_t)k, " | p%d next %llu match %llu acked %llu rid %llx ls %llu la %llu", i,
-                      (unsigned long long)p->next, (unsigned long long)p->match, (unsigned long long)p->acked,
-                      (unsigned long long)p->rid, (unsigned long long)p->last_send, (unsigned long long)p->last_ack);
+        k = snprintf(buf + pos, cap - pos, " | p%d next %llu match %llu acked %llu rid %llx ls %llu la %llu", i,
+                     (unsigned long long)p->next, (unsigned long long)p->match, (unsigned long long)p->acked,
+                     (unsigned long long)p->rid, (unsigned long long)p->last_send, (unsigned long long)p->last_ack);
+        if (k > 0)
+            pos += (size_t)k < cap - pos ? (size_t)k : cap - pos - 1;
     }
-    return k > 0 ? (size_t)k : 0;
+    return pos;
 }
 
 int repl_is_leader(const struct repl *r) { return r->leading; }

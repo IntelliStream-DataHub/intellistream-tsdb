@@ -483,17 +483,32 @@ void cmove_trace(const struct meta_state *sm, uint64_t index, const char *path)
         last[k].sv = v->set_version, last[k].epoch = v->epoch, last[k].iv = v->isr_version;
         last[k].leader = v->leader, last[k].nisr = v->nisr;
         char line[1024];
-        size_t o = (size_t)snprintf(line, sizeof line, "%" PRIu64 " v%" PRIu32 " set %" PRIu64 " epoch %" PRIu64
-                                    " leader %" PRIu32 " isrv %" PRIu64 " isr ", index, v->number, v->set_version,
-                                    v->epoch, v->leader, v->isr_version);
-        for (uint32_t j = 0; j < v->nisr && o < sizeof line - 64; j++)
-            o += (size_t)snprintf(line + o, sizeof line - o, "%s%" PRIu32, j ? "," : "", v->isr[j]);
-        o += (size_t)snprintf(line + o, sizeof line - o, " rep ");
-        for (uint32_t j = 0; j < v->nrep && o < sizeof line - 64; j++) {
-            o += (size_t)snprintf(line + o, sizeof line - o, "%s%" PRIu32 "%s", j ? "," : "", v->rep[j].node,
-                                  v->rep[j].learner ? ":L" : "");
-            if (v->rep[j].replaces)
-                o += (size_t)snprintf(line + o, sizeof line - o, "<%" PRIu32, v->rep[j].replaces);
+        size_t o = 0;
+        int r = snprintf(line, sizeof line, "%" PRIu64 " v%" PRIu32 " set %" PRIu64 " epoch %" PRIu64
+                         " leader %" PRIu32 " isrv %" PRIu64 " isr ", index, v->number, v->set_version,
+                         v->epoch, v->leader, v->isr_version);
+        if (r > 0)
+            o = (size_t)r < sizeof line ? (size_t)r : sizeof line - 1;
+        for (uint32_t j = 0; j < v->nisr && o + 64 < sizeof line; j++) {
+            r = snprintf(line + o, sizeof line - o, "%s%" PRIu32, j ? "," : "", v->isr[j]);
+            if (r > 0)
+                o += (size_t)r < sizeof line - o ? (size_t)r : sizeof line - o - 1;
+        }
+        if (o + 1 < sizeof line) {
+            r = snprintf(line + o, sizeof line - o, " rep ");
+            if (r > 0)
+                o += (size_t)r < sizeof line - o ? (size_t)r : sizeof line - o - 1;
+        }
+        for (uint32_t j = 0; j < v->nrep && o + 64 < sizeof line; j++) {
+            r = snprintf(line + o, sizeof line - o, "%s%" PRIu32 "%s", j ? "," : "", v->rep[j].node,
+                         v->rep[j].learner ? ":L" : "");
+            if (r > 0)
+                o += (size_t)r < sizeof line - o ? (size_t)r : sizeof line - o - 1;
+            if (v->rep[j].replaces && o + 1 < sizeof line) {
+                r = snprintf(line + o, sizeof line - o, "<%" PRIu32, v->rep[j].replaces);
+                if (r > 0)
+                    o += (size_t)r < sizeof line - o ? (size_t)r : sizeof line - o - 1;
+            }
         }
         FILE *f = fopen(path, "a");
         if (f) {

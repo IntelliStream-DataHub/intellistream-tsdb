@@ -39,6 +39,8 @@ static int uuid_parse(const char *s, uint8_t out[16])
     return n == 32 ? 0 : -1;
 }
 
+static void drop_root(const char *dir);
+
 /* `tsdb chunk-store init PATH --cluster UUID --node ID` (design-cluster-data.md R8 D11): makes a chunk store whose
  * META names the cluster and the node it belongs to; tsdbd --chunk-dir refuses at start a store of another one. */
 static int chunk_store_cli(int argc, char **argv)
@@ -71,6 +73,7 @@ static int chunk_store_cli(int argc, char **argv)
         return 2;
     }
     o.node = (uint32_t)id;
+    drop_root(path);
     uint8_t sid[16];
     int rc = chunk_store_init2(path, NULL, &o, sid);
     if (rc != 0) {
@@ -785,18 +788,33 @@ static void drop_root(const char *dir)
         die(dir, TSDB_ERR_INVALID);
     snprintf(p, sizeof p, "%s", dir);
     struct stat st;
-    while (stat(p, &st) != 0) {
+    size_t pl = strlen(p);
+    while (pl > 1 && p[pl - 1] == '/')
+        p[--pl] = '\0';
+    while (lstat(p, &st) != 0) {
         if (errno != ENOENT || strcmp(p, ".") == 0 || strcmp(p, "/") == 0) {
             fprintf(stderr, "tsdb: %s: %s\n", p, strerror(errno));
             exit(1);
         }
         char *s = strrchr(p, '/');
-        if (!s)
+        if (!s) {
             snprintf(p, sizeof p, ".");
-        else if (s == p)
-            p[1] = '\0';
-        else
-            *s = '\0';
+        } else {
+            while (s > p && s[-1] == '/')
+                s--;
+            if (s == p)
+                p[1] = '\0';
+            else
+                *s = '\0';
+        }
+    }
+    if (st.st_uid == 0 && S_ISLNK(st.st_mode)) {
+        struct stat tst;
+        if (stat(p, &tst) != 0) {
+            fprintf(stderr, "tsdb: %s: %s\n", p, strerror(errno));
+            exit(1);
+        }
+        st = tst;
     }
     if (st.st_uid == 0)
         return;
@@ -1451,8 +1469,26 @@ static int check_volume_of_dir(const char *dir, const char *path)
         fprintf(stderr, "tsdb: %s: %s\n", dir, strerror(ENOTDIR));
         return 1;
     }
-    if (stat(path, &spath) != 0) {
+    size_t plen = strlen(path);
+    while (plen > 1 && path[plen - 1] == '/')
+        plen--;
+    char pbuf[PATH_MAX];
+    const char *pp = path;
+    if (path[plen] != '\0') {
+        if (plen >= sizeof pbuf) {
+            fprintf(stderr, "tsdb: %s: %s\n", path, strerror(ENAMETOOLONG));
+            return 1;
+        }
+        memcpy(pbuf, path, plen);
+        pbuf[plen] = '\0';
+        pp = pbuf;
+    }
+    if (lstat(pp, &spath) != 0) {
         fprintf(stderr, "tsdb: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (S_ISLNK(spath.st_mode)) {
+        fprintf(stderr, "tsdb: %s: %s\n", path, strerror(ELOOP));
         return 1;
     }
     if (!S_ISDIR(spath.st_mode)) {
@@ -1668,8 +1704,11 @@ int main(int argc, char **argv)
             else
                 usage();
         }
-        if (path != dir && check_volume_of_dir(dir, path) != 0)
-            return 1;
+        if (path != dir) {
+            if (check_volume_of_dir(dir, path) != 0)
+                return 1;
+            drop_root(path);
+        }
         int rc = ecdiverge_cli(path, clear, stdout);
         if (rc < 0)
             die(path, rc);

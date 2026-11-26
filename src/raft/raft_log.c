@@ -693,7 +693,7 @@ static iso_err seg_create(raft_log *l, raft_index first, raft_term prev_term, ch
 			return io_err(err, errsize, "writing", log_name(l));
 		}
 	} else {
-		fd = openat(l->dirfd, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+		fd = openat(l->dirfd, name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
 		if (fd < 0)
 			return io_err(err, errsize, "creating", name);
 		bool wrote = pwrite(fd, h, SEG_HEADER, 0) == SEG_HEADER;
@@ -1292,9 +1292,19 @@ static iso_err open_listed(raft_log *l, const uint64_t *firsts, size_t n, raft_i
 		}
 		char name[64];
 		seg_name(name, sizeof name, firsts[k]);
-		int fd = openat(l->dirfd, name, O_RDWR | O_CLOEXEC);
+		int fd = openat(l->dirfd, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
 		if (fd < 0)
 			return io_err(err, errsize, "opening", name);
+		{
+			struct stat pst;
+			if (fstat(fd, &pst) == 0 && S_ISREG(pst.st_mode) && (pst.st_mode & 077)) {
+				if (fchmod(fd, 0600) != 0) {
+					iso_err prc = io_err(err, errsize, "setting permissions on", name);
+					close(fd);
+					return prc;
+				}
+			}
+		}
 		/* Only the newest segment is settled. Every other one was synced at its roll before
 		 * the next segment was made (#296), and a roll whose sync failed faulted the log
 		 * before it made one, so that segment is the newest here; a sealed segment is never
@@ -1574,7 +1584,7 @@ iso_err raft_log_open(const char *dir, const raft_log_opts *opts, raft_index bas
 		if (rc == ISO_OK)
 			rc = open_region(l, err, errsize);
 	} else {
-		if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+		if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
 			rc = io_err(err, errsize, "creating", dir);
 			raft_log_close(l);
 			return rc;
@@ -1595,6 +1605,16 @@ iso_err raft_log_open(const char *dir, const raft_log_opts *opts, raft_index bas
 			rc = io_err(err, errsize, "opening", dir);
 			raft_log_close(l);
 			return rc;
+		}
+		{
+			struct stat dst;
+			if (fstat(l->dirfd, &dst) == 0 && (dst.st_mode & 077)) {
+				if (fchmod(l->dirfd, 0700) != 0) {
+					rc = io_err(err, errsize, "setting permissions on", dir);
+					raft_log_close(l);
+					return rc;
+				}
+			}
 		}
 		l->dir = iso_xstrdup(dir);
 		rc = floor_load(l, err, errsize);
@@ -2591,7 +2611,7 @@ iso_err raft_log_hard_load(const char *dir, raft_hard_state *out, char *err, siz
 	char path[4096];
 	if (snprintf(path, sizeof path, "%s/hard", dir) >= (int)sizeof path)
 		return iso_errf(err, errsize, ISO_ERR_INVAL, "raft directory path too long");
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return ISO_ERR_NOTFOUND;
@@ -2623,11 +2643,20 @@ static iso_err hard_current(raft_log *l, raft_hard_state *cur, bool *any, char *
 	memset(cur, 0, sizeof *cur);
 	*any = false;
 	if (l->hard_fd < 0) {
-		l->hard_fd = openat(l->dirfd, "hard", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-		if (l->hard_fd < 0) {
+		int fd = openat(l->dirfd, "hard", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+		if (fd < 0) {
 			iso_err rc = io_err(err, errsize, "opening", "hard");
 			return rc != ISO_OK ? rc : ISO_ERR_IO; /* whatever errno said */
 		}
+		struct stat hst;
+		if (fstat(fd, &hst) == 0 && S_ISREG(hst.st_mode) && (hst.st_mode & 077)) {
+			if (fchmod(fd, 0600) != 0) {
+				iso_err prc = io_err(err, errsize, "setting permissions on", "hard");
+				close(fd);
+				return prc;
+			}
+		}
+		l->hard_fd = fd;
 	}
 	uint64_t seq = 0;
 	iso_err rc = hard_read(l->hard_fd, hard_base(l), in_region(l) ? log_name(l) : "raft/hard",
@@ -2828,9 +2857,17 @@ static iso_err floor_refuse(raft_log *l, const char *what, char *err, size_t err
 static iso_err floor_load(raft_log *l, char *err, size_t errsize)
 {
 	if (l->hard_fd < 0) {
-		int fd = openat(l->dirfd, "hard", O_RDWR | O_CLOEXEC);
+		int fd = openat(l->dirfd, "hard", O_RDWR | O_NOFOLLOW | O_CLOEXEC);
 		if (fd < 0)
 			return errno == ENOENT ? ISO_OK : io_err(err, errsize, "opening", "hard");
+		struct stat hst;
+		if (fstat(fd, &hst) == 0 && S_ISREG(hst.st_mode) && (hst.st_mode & 077)) {
+			if (fchmod(fd, 0600) != 0) {
+				iso_err prc = io_err(err, errsize, "setting permissions on", "hard");
+				close(fd);
+				return prc;
+			}
+		}
 		l->hard_fd = fd;
 		/* What a previous life left unsynced is made durable, or refused, before the floor
 		 * is trusted (`settle`, #832); a region's ring is settled with the region. */
@@ -2936,7 +2973,7 @@ static void floor_hand(raft_log *l, raft_log_sync *out)
 		return;
 	if (l->floor_fd < 0) {
 		l->floor_fd = in_region(l) ? iso_fd_reopen(l->hard_fd, O_RDWR)
-					   : openat(l->dirfd, "hard", O_RDWR | O_CLOEXEC);
+					   : openat(l->dirfd, "hard", O_RDWR | O_NOFOLLOW | O_CLOEXEC);
 		if (l->floor_fd < 0)
 			return;
 	}

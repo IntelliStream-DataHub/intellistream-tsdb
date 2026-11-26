@@ -1676,6 +1676,45 @@ static void stale_epoch(void)
     repl_free(r);
 }
 
+/* repl_debug must never underflow cap - pos or return a length >= cap when truncated (SEC-03). */
+static void debug_trunc(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    fill(&d, 1, 100, 1, 1);
+    struct repl_epoch h[1] = {{.epoch = 1, .start = 1}};
+    struct repl_config c = config(0, &d);
+    struct repl_durable du = {.rid = 11, .fence = 1, .floor = 100, .log_start = 1, .log_end = 100, .hist = h, .nhist = 1};
+    struct repl *r = repl_open(&c, &du);
+    CHECK(r && !repl_failed(r), "open");
+    struct repl_msg m = meta_msg(0, 2, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r));
+    drain(r, &d, NULL);
+    CHECK(repl_is_leader(r), "not leader");
+
+    static const unsigned long caps[] = {0, 1, 2, 16, 64, 128, 180, 256, 1024};
+    for (size_t i = 0; i < sizeof caps / sizeof caps[0]; i++) {
+        unsigned long cap = caps[i];
+        char raw[1040];
+        memset(raw, 0x5a, sizeof raw);
+        char *buf = raw + 8;
+        unsigned long n = repl_debug(r, buf, cap);
+        for (int k = 0; k < 8; k++)
+            CHECK((unsigned char)raw[k] == 0x5a, "cap %lu: underflow before buffer", cap);
+        for (size_t k = 8 + cap; k < sizeof raw; k++)
+            CHECK((unsigned char)raw[k] == 0x5a, "cap %lu: overflow past buffer at %zu", cap, k - 8);
+        if (cap == 0) {
+            CHECK(n == 0, "cap 0 returned %lu", n);
+        } else {
+            CHECK(n < cap, "cap %lu returned %lu >= cap", cap, n);
+            CHECK(buf[n] == '\0' && strlen(buf) == n, "cap %lu: returned %lu, strlen %zu", cap, n, strlen(buf));
+        }
+    }
+    repl_free(r);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
@@ -1732,6 +1771,7 @@ int main(int argc, char **argv)
     stale_replay();
     stale_rid();
     stale_epoch();
+    debug_trunc();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

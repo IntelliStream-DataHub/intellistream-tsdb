@@ -439,9 +439,27 @@ static void case_cli(void)
     CHECK(ecdiverge_cli(dir, false, null) == 1); /* listing needs no META */
     CHECK(sh("mv '%s/META.x' '%s/META'", dir, dir) == 0);
     CHECK(ecdiverge_cli(dir, true, null) == 1 && fsize(dir) == -1);
+    /* SEC-05: ecdiverge_cli refuses symlinked directory (with or without trailing slash) and symlinked META/LOCK */
+    with_records("cli-sym", dir, sizeof dir, 1);
+    char sym[PATH_MAX + 48], symsl[PATH_MAX + 52];
+    snprintf(sym, sizeof sym, "%s.link", dir);
+    snprintf(symsl, sizeof symsl, "%s.link/", dir);
+    CHECK(symlink(dir, sym) == 0);
+    CHECK(ecdiverge_cli(sym, false, null) == TSDB_ERR_IO);
+    CHECK(ecdiverge_cli(sym, true, null) == TSDB_ERR_IO && fsize(dir) == REC);
+    CHECK(ecdiverge_cli(symsl, true, null) == TSDB_ERR_IO && fsize(dir) == REC);
+    unlink(sym);
+    char vlock[PATH_MAX + 64], lpath[PATH_MAX + 64];
+    snprintf(vlock, sizeof vlock, "%s.victim", dir);
+    snprintf(lpath, sizeof lpath, "%s/LOCK", dir);
+    unlink(lpath);
+    CHECK(symlink(vlock, lpath) == 0);
+    CHECK(ecdiverge_cli(dir, true, null) == TSDB_ERR_IO && fsize(dir) == REC);
+    CHECK(access(vlock, F_OK) != 0);
+    unlink(lpath);
     if (null)
         fclose(null);
-    printf("  cli: --clear refuses without a readable META, clears with one\n");
+    printf("  cli: --clear refuses without a readable META, refuses symlinks, clears with one\n");
 }
 
 /* ---------------------------------------------------------------- tsdbd */

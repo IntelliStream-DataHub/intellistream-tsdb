@@ -447,11 +447,15 @@ static void trace_isr_req(struct rvol *rv, const struct repl_vmeta *q)
     static const char *const why[] = {"none", "drop", "join", "leave"};
     int w = repl_isr_why(rv->core);
     char line[512];
-    int o = snprintf(line, sizeof line, "req v%" PRIu32 " epoch %" PRIu64 " isrv %" PRIu64 " why %s isr ", rv->number,
+    int r = snprintf(line, sizeof line, "req v%" PRIu32 " epoch %" PRIu64 " isrv %" PRIu64 " why %s isr ", rv->number,
                      q->epoch, q->isr_version, w >= 0 && w <= REPL_WHY_LEAVE ? why[w] : "?");
-    for (uint32_t k = 0, n = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX && o < (int)sizeof line - 16; k++)
-        if (q->isr & (1u << k))
-            o += snprintf(line + o, sizeof line - (size_t)o, "%s%" PRIu32, n++ ? "," : "", rv->rec.rep[k].node);
+    size_t o = r > 0 ? ((size_t)r < sizeof line ? (size_t)r : sizeof line - 1) : 0;
+    for (uint32_t k = 0, n = 0; k < rv->rec.nrep && k < META_REPLICAS_MAX && o + 16 < sizeof line; k++)
+        if (q->isr & (1u << k)) {
+            r = snprintf(line + o, sizeof line - o, "%s%" PRIu32, n++ ? "," : "", rv->rec.rep[k].node);
+            if (r > 0)
+                o += (size_t)r < sizeof line - o ? (size_t)r : sizeof line - o - 1;
+        }
     FILE *f = fopen(path, "a");
     if (f) {
         fprintf(f, "%s\n", line);

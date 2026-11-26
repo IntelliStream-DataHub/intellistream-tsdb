@@ -25,6 +25,8 @@ enum { R_READ = 1, R_INSERT = 2, R_DELETE = 4, R_ADMIN = 8, R_WRITE = R_INSERT |
 #define SALT_MIN 16
 #define SALT_MAX 64
 #define ITER_MIN 4096
+#define TSDB_SCRAM_MAX_ITER 100000000u
+#define ITER_MAX TSDB_SCRAM_MAX_ITER
 
 typedef struct user_verifier {
     uint32_t iterations;

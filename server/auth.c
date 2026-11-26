@@ -1251,7 +1251,8 @@ static const uint8_t *get_verifier(const uint8_t *p, const uint8_t *end, user_ve
     memset(v, 0, sizeof *v);
     memcpy(&v->iterations, p, 4);
     v->salt_len = p[4];
-    if (v->salt_len > SALT_MAX || (size_t)(end - p) < 5u + v->salt_len + 64)
+    if (v->iterations < ITER_MIN || v->iterations > ITER_MAX || v->salt_len < SALT_MIN || v->salt_len > SALT_MAX ||
+        (size_t)(end - p) < 5u + v->salt_len + 64)
         return NULL;
     memcpy(v->salt, p + 5, v->salt_len);
     memcpy(v->stored_key, p + 5 + v->salt_len, 32);
@@ -1505,10 +1506,15 @@ int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, c
     wbuf b = {0};
     uint32_t *ends = NULL, n = 0;
     int rc = 0;
+    if (!a->au)
+        return TSDB_ERR_DENIED; /* --no-auth (auth_check refuses first) */
+    if (group && mutant != MUT_NOOPLOCAL) {
+        int s = group_sync(false);
+        if (s != 0)
+            return s;
+    }
     pthread_mutex_lock(&users_mu);
-    if (!a->au) {
-        rc = TSDB_ERR_DENIED; /* --no-auth (auth_check refuses first) */
-    } else if (!us_open) {
+    if (!us_open) {
         rc = TSDB_ERR_CORRUPT;
     } else {
         const user *x = users_by_uid(&us, a->au->uid);

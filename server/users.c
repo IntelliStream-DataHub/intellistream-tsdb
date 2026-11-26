@@ -100,7 +100,8 @@ bool user_name_valid(const char *name, size_t len)
 
 bool verifier_valid(const user_verifier *v)
 {
-    return v->salt_len >= SALT_MIN && v->salt_len <= SALT_MAX && v->iterations >= ITER_MIN;
+    return v->salt_len >= SALT_MIN && v->salt_len <= SALT_MAX && v->iterations >= ITER_MIN &&
+           v->iterations <= ITER_MAX;
 }
 
 static bool special(char c) { return c == '*' || c == '?' || c == '\\'; }
@@ -237,10 +238,13 @@ const char *rights_text(uint8_t r, char buf[RIGHTS_TEXT_MAX])
 {
     size_t n = 0;
     buf[0] = '\0';
-    for (size_t i = 0; i < 4; i++)
-        if (r & right_words[i].r)
-            n += (size_t)snprintf(buf + n, RIGHTS_TEXT_MAX - n, "%s%s", n ? "," : "", right_words[i].w);
-    if (r & ~R_EVERY)
+    for (size_t i = 0; i < 4 && n + 1 < RIGHTS_TEXT_MAX; i++)
+        if (r & right_words[i].r) {
+            int k = snprintf(buf + n, RIGHTS_TEXT_MAX - n, "%s%s", n ? "," : "", right_words[i].w);
+            if (k > 0)
+                n += (size_t)k < RIGHTS_TEXT_MAX - n ? (size_t)k : RIGHTS_TEXT_MAX - n - 1;
+        }
+    if ((r & ~R_EVERY) && n + 1 < RIGHTS_TEXT_MAX)
         snprintf(buf + n, RIGHTS_TEXT_MAX - n, "%s0x%02x", n ? "," : "", r & ~R_EVERY);
     else if (!r)
         snprintf(buf, RIGHTS_TEXT_MAX, "none");

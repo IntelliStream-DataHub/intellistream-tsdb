@@ -94,6 +94,43 @@ add "$T" "$S/d9" > "$S/d9.err" 2>&1 || fail "user add in root's directory"
 grep -q "running as" "$S/d9.err" && fail "root's own directory: said it runs as another user"
 [ "$(stat -c '%u %a' "$S/d9/USERS")" = "0 600" ] || fail "USERS in root's directory"
 
+# 8. SEC-05: `tsdb chunk-store init` as root drops to target owner and refuses symlinks
+mkdb d10
+"$T" chunk-store init "$S/d10/cs" --cluster 0123456789abcdef0123456789abcdef --node 1 > "$S/d10.out" 2> "$S/d10.err" || fail "chunk-store init as root"
+grep -q "running as uid $O" "$S/d10.err" || fail "chunk-store init as root did not drop to uid $O"
+[ -z "$(find "$S/d10/cs" ! -user $O)" ] || fail "chunk-store init made non-owner files: $(find "$S/d10/cs" ! -user $O)"
+as_owner ln -s "$out" "$S/d10/cs_link"
+"$T" chunk-store init "$S/d10/cs_link" --cluster 0123456789abcdef0123456789abcdef --node 1 > /dev/null 2>&1 && fail "chunk-store init followed symlink to root dir"
+[ ! -e "$out/META" ] || fail "chunk-store init created META in root dir"
+"$T" chunk-store init "$S/d10/cs_link//newdir" --cluster 0123456789abcdef0123456789abcdef --node 1 > /dev/null 2> "$S/d10dbl.err" && fail "chunk-store init followed double-slash symlink to root dir"
+grep -q "running as uid $O" "$S/d10dbl.err" || fail "chunk-store init double-slash symlink did not drop to uid $O"
+[ ! -e "$out/newdir" ] && [ ! -e "$out/newdir/META" ] || fail "chunk-store init created newdir or META in root dir via double slash"
+
+# 9. SEC-05: `tsdb <root-dir> volume diverged <owner-vol> --clear` drops to volume owner and refuses symlinks
+mkdir "$S/rootdb"
+"$T" "$S/rootdb" create r1 > /dev/null 2>&1 || fail "create in rootdb"
+mkdb vol1
+"$T" "$S/rootdb" volume add "$S/vol1" > /dev/null 2>&1 || fail "volume add owner vol1"
+chown -R $O:$O "$S/vol1"
+rm -f "$S/vol1/LOCK"
+"$T" "$S/rootdb" volume diverged "$S/vol1" --clear > /dev/null 2> "$S/vol1.err" || fail "volume diverged --clear as root"
+grep -q "running as uid $O" "$S/vol1.err" || fail "volume diverged secondary PATH did not drop to uid $O"
+[ "$(stat -c %u "$S/vol1/LOCK" 2> /dev/null)" = $O ] || fail "volume diverged created LOCK not owned by $O"
+as_owner rm -f "$S/vol1/LOCK"
+as_owner ln -s "$out/vol_lock" "$S/vol1/LOCK"
+"$T" "$S/rootdb" volume diverged "$S/vol1" --clear > /dev/null 2>&1 && fail "volume diverged followed LOCK symlink"
+[ ! -e "$out/vol_lock" ] || fail "volume diverged created LOCK target outside vol1"
+
+# 10. root-owned symlink to an owner's database directory (and non-existent child) still drops to the owner
+mkdb d11
+ln -s "$S/d11" "$S/d11_rootlink"
+"$T" "$S/d11_rootlink" create s1 > /dev/null 2> "$S/d11.err" || fail "create through root-owned symlink"
+grep -q "running as uid $O" "$S/d11.err" || fail "root-owned symlink to owner dir did not drop to uid $O"
+[ -z "$(find "$S/d11" ! -user $O)" ] || fail "create through root-owned symlink made non-owner files: $(find "$S/d11" ! -user $O)"
+"$T" "$S/d11_rootlink/sub" create s1 > /dev/null 2> "$S/d11sub.err" || fail "new db under root-owned symlink"
+grep -q "running as uid $O" "$S/d11sub.err" || fail "new db under root-owned symlink did not drop to uid $O"
+[ -z "$(find "$S/d11/sub" ! -user $O)" ] || fail "new db under root-owned symlink made non-owner files: $(find "$S/d11/sub" ! -user $O)"
+
 [ "$before" = "$(snapshot)" ] || fail "files outside the database changed: $(diff <(echo "$before") <(snapshot))"
 [ "$(ls "$out" | wc -l)" = 3 ] || fail "files outside the database were made: $(ls "$out")"
 [ "$errors" = 0 ] && echo "test_cli_root: ok" || { echo "test_cli_root: $errors failures" >&2; exit 1; }
