@@ -74,6 +74,7 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_D("merge.idle", "merge-idle-s", "s", "300s",
        "Merge a partition completely once it has had no new rows for this long; -1 never."),
     CK_D("flush.interval", "flush-interval-ms", "ms", "5s", "How long rows stay in memory before they are flushed to a part."),
+    CK_I("flush.buffer.rows", "buffer-rows", "1048576", "Memtable rows per volume before it is flushed to a part."),
     CK_I("insert.zstd.level", "insert-zstd-level", "0",
        "The zstd level of parts that inserts and flushes write; 0 none, -1 the level merges use."),
     /* query */

@@ -6419,6 +6419,7 @@ int main(int argc, char **argv)
                                    {"merge-idle-s", required_argument, 0, 'G'},
                                    {"insert-zstd-level", required_argument, 0, 'Z'},
                                    {"flush-interval-ms", required_argument, 0, 'H'},
+                                   {"buffer-rows", required_argument, 0, 0x126},
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
                                    {"verify-checksums", no_argument, 0, 'V'},
@@ -6640,6 +6641,7 @@ int main(int argc, char **argv)
         case 'G': o.merge_idle_s = (int)num_arg("merge-idle-s", optarg, -1, 86400 * 365); break;
         case 'Z': o.insert_zstd_level = (int)num_arg("insert-zstd-level", optarg, -1, 22); break;
         case 'H': o.flush_interval_ms = (int)num_arg("flush-interval-ms", optarg, 1, 86400000); break;
+        case 0x126: o.buffer_rows = (size_t)num_arg("buffer-rows", optarg, 1, 1LL << 30); break;
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
@@ -6865,7 +6867,7 @@ int main(int argc, char **argv)
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
                         "             [--lttb-max-threshold 16777216]\n"
-                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
+                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--buffer-rows 1048576] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
                         "             [--health-domain PREFIX]... [--no-stats] [--latest-cache BYTES]\n"
                         "             [--tenants FILE] [--tenants-settle 30]\n"
