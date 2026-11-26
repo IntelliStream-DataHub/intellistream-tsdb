@@ -871,7 +871,7 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
     if (!skip_raw) {
         rc = o->ops->obj_read(o->o, x->off, x->len, x->data, CHUNK_RR_RAW, &rep);
         atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
+        granule_checks_add(1);
         ok = rc == 0 && (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(x->data, x->len, 0) == x->crc);
     }
     bool retried = false;
@@ -1155,7 +1155,7 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
         atomic_fetch_add_explicit(&c->nreads, 1, memory_order_relaxed);
         bool bad_crc = false;
         if (rc == 0) {
-            atomic_fetch_add_explicit(&granule_checks, 1 + k, memory_order_relaxed);
+            granule_checks_add(1 + k);
             uint32_t add_refs = 0;
             if (eccache_mutant == ECC_MUT_NOVERIFY || (uint32_t)xxh64(sl->buf, x->len, 0) == x->crc) {
                 x->data = sl->buf;

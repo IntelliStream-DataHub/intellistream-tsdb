@@ -325,6 +325,139 @@ static void test_flush_defer_unref(const char *base)
     if (system(cmd) != 0)
         failures++;
 }
+typedef struct scratch_worker_arg {
+    tsdb *db;
+    tsdb_sid *sids;
+    size_t nseries;
+    int rc;
+} scratch_worker_arg;
+
+/* Runs on a dedicated pthread so scratch_free() destructor executes on thread exit (LSan/ASan check). */
+static void *scratch_worker(void *arg)
+{
+    scratch_worker_arg *a = arg;
+    const size_t N = 120000; /* > buffer_rows so tsdb_insert_values takes the large-insert path */
+    tsdb_sid *sv = malloc(N * sizeof *sv);
+    int64_t *tv = malloc(N * sizeof *tv);
+    double *vv = malloc(N * sizeof *vv);
+    uint8_t *valid = malloc((N + 7) / 8);
+    if (!sv || !tv || !vv || !valid) {
+        free(sv);
+        free(tv);
+        free(vv);
+        free(valid);
+        a->rc = TSDB_ERR_NOMEM;
+        return NULL;
+    }
+    /* 3 repeated large nullable batches across 4 partitions with unsorted + duplicate timestamps:
+     * exercises SCR_VALS (vals_import), SCR_PK/SCR_CNT (sort_and_write), and SCR_DUP_T/V (add_run_unique). */
+    for (int round = 0; round < 3; round++) {
+        memset(valid, 0xff, (N + 7) / 8);
+        for (size_t i = 0; i < N; i++) {
+            size_t sid_i = (i * 37 + (size_t)round) % a->nseries;
+            int part_day = (int)((N - 1 - i) % 4);
+            /* intentional duplicates every 100 rows so add_run_unique runs its dedup scratch path */
+            int64_t base_ts = 1700000000000LL + (int64_t)part_day * 86400000LL + (int64_t)round * 2000000LL;
+            int64_t off = (int64_t)((i / 100) * 100 + (i % 100 == 50 ? 49 : i % 100));
+            sv[i] = a->sids[sid_i];
+            tv[i] = base_ts + off;
+            vv[i] = (double)(round * 1000000 + (int)i);
+            if (i % 13 == 0)
+                valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
+        }
+        tsdb_values vals = {TSDB_FLOAT64, vv, valid};
+        int rc = tsdb_insert_values(a->db, sv, tv, &vals, N);
+        if (rc != 0) {
+            a->rc = rc;
+            break;
+        }
+    }
+    free(sv);
+    free(tv);
+    free(vv);
+    free(valid);
+    return NULL;
+}
+
+/* Verify insert/vals_import/flush scratch reuse and clean teardown across repeated batches and flushes. */
+static void test_scratch_reuse(const char *base)
+{
+    char tmpl[512];
+    snprintf(tmpl, sizeof tmpl, "%s/flush-scratch-XXXXXX", base);
+    char *dir = mkdtemp(tmpl);
+    CHECK(dir != NULL);
+    if (!dir)
+        return;
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = false;
+    o.wal_sync_ms = 60000;
+    o.flush_interval_ms = 600000;
+    o.buffer_rows = 60000; /* large batches of 120k go straight to parts; 30k go through memtable + flush */
+    o.merge_threads = 0;
+    tsdb *db = NULL;
+    CHECK(tsdb_open(dir, &o, &db) == 0 && db != NULL);
+    if (db) {
+        const size_t NS = 64;
+        tsdb_sid *sids = malloc(NS * sizeof *sids);
+        CHECK(sids != NULL);
+        for (size_t i = 0; i < NS; i++) {
+            char name[32];
+            snprintf(name, sizeof name, "sc.%zu", i);
+            CHECK(tsdb_series_create(db, name, TSDB_FLOAT64, NULL, &sids[i]) == 0);
+        }
+        scratch_worker_arg wa = {.db = db, .sids = sids, .nseries = NS, .rc = 0};
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, scratch_worker, &wa) == 0);
+        pthread_join(th, NULL);
+        CHECK(wa.rc == 0);
+
+        /* 3 repeated memtable flushes of 30k rows: verify eng->fl_* pointers are reused after round 1. */
+        const size_t FN = 30000;
+        tsdb_sid *fsv = malloc(FN * sizeof *fsv);
+        int64_t *ftv = malloc(FN * sizeof *ftv);
+        double *fvv = malloc(FN * sizeof *fvv);
+        CHECK(fsv && ftv && fvv);
+        eng *e = tsdb_test_engine(db, 0);
+        uint32_t *first_fl_s = NULL;
+        int64_t *first_fl_t = NULL;
+        uint64_t *first_fl_v = NULL;
+        for (int round = 0; round < 3; round++) {
+            for (size_t i = 0; i < FN; i++) {
+                fsv[i] = sids[i % NS];
+                ftv[i] = 1701000000000LL + (int64_t)round * 100000LL + (int64_t)i;
+                fvv[i] = (double)(round * 100000 + (int)i);
+            }
+            tsdb_values vals = {TSDB_FLOAT64, fvv, NULL};
+            CHECK(tsdb_insert_values(db, fsv, ftv, &vals, FN) == 0);
+            CHECK(tsdb_flush(db) == 0);
+            if (round == 0) {
+                first_fl_s = e->fl_s;
+                first_fl_t = e->fl_t;
+                first_fl_v = e->fl_v;
+                CHECK(first_fl_s != NULL && first_fl_t != NULL && first_fl_v != NULL);
+                CHECK(e->fl_rows_cap >= FN);
+            } else {
+                CHECK(e->fl_s == first_fl_s && e->fl_t == first_fl_t && e->fl_v == first_fl_v);
+            }
+        }
+        /* Sanity check queried row count matches all flushed + inserted rows for sids[0]. */
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdb_query_agg(db, sids[0], INT64_MIN, INT64_MAX, 0, &b, &nb) == 0);
+        CHECK(nb == 1 && b[0].count > 0);
+        free(b);
+        free(fsv);
+        free(ftv);
+        free(fvv);
+        free(sids);
+        tsdb_close(db);
+    }
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0)
+        failures++;
+}
 #endif
 
 int main(int argc, char **argv)
@@ -341,6 +474,7 @@ int main(int argc, char **argv)
 #endif
     test_arena_high_cardinality();
     test_flush_defer_unref(base);
+    test_scratch_reuse(base);
 #endif
     if (failures) {
         fprintf(stderr, "%d failures\n", failures);

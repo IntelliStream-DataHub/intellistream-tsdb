@@ -20,32 +20,53 @@
 
 #define SORT_CHUNK_ROWS (8u << 20) /* bounds sort memory to ~256 MiB */
 
-/* Grow-only per-thread buffers for sorting, so steady inserts do not fault
- * in fresh pages every batch. Freed when the thread exits. SCR_IN_* are the
- * caller's (eng_insert_scratch) and never touched inside eng_insert; SCR_FENCE
- * is the table of lw_fence_rows, reached only through lw_table_take. */
-enum { SCR_A, SCR_B, SCR_S, SCR_T, SCR_V, SCR_CNT, SCR_IN_S, SCR_IN_T, SCR_IN_V, SCR_FENCE, SCR_N };
+/* Grow-only per-thread buffers for sorting and import, so steady inserts do not fault
+ * in fresh pages every batch. Freed via tsdb_free_big when growing or when the thread exits.
+ * SCR_IN_* are the caller's (eng_insert_scratch) and never touched inside eng_insert; SCR_FENCE
+ * is the table of lw_fence_rows (lw_table_take); SCR_VALS is vals_import's (vals_scratch_take). */
+enum {
+    SCR_A,
+    SCR_B,
+    SCR_S,
+    SCR_T,
+    SCR_V,
+    SCR_CNT,
+    SCR_PK,
+    SCR_DUP_T,
+    SCR_DUP_V,
+    SCR_IN_S,
+    SCR_IN_T,
+    SCR_IN_V,
+    SCR_FENCE,
+    SCR_VALS,
+    SCR_N
+};
 typedef struct scratch {
     void *p[SCR_N];
     size_t cap[SCR_N];
 } scratch;
 
 static pthread_key_t scratch_key;
+static bool scratch_key_ok;
 static pthread_once_t scratch_once = PTHREAD_ONCE_INIT;
 
 static void scratch_free(void *arg)
 {
     scratch *s = arg;
     for (int i = 0; i < SCR_N; i++)
-        free(s->p[i]);
+        tsdb_free_big(s->p[i], s->cap[i]);
     free(s);
 }
 
-static void scratch_init(void) { pthread_key_create(&scratch_key, scratch_free); }
+static void scratch_init(void) { scratch_key_ok = pthread_key_create(&scratch_key, scratch_free) == 0; }
 
 static void *scratch_get(int slot, size_t bytes)
 {
+    if (bytes == 0)
+        bytes = 1;
     pthread_once(&scratch_once, scratch_init);
+    if (!scratch_key_ok)
+        return NULL;
     scratch *s = pthread_getspecific(scratch_key);
     if (!s) {
         s = calloc(1, sizeof *s);
@@ -55,7 +76,7 @@ static void *scratch_get(int slot, size_t bytes)
         }
     }
     if (s->cap[slot] < bytes) {
-        free(s->p[slot]);
+        tsdb_free_big(s->p[slot], s->cap[slot]);
         s->p[slot] = malloc(bytes);
         s->cap[slot] = s->p[slot] ? bytes : 0;
     }
@@ -81,6 +102,19 @@ void *lw_table_take(size_t bytes)
 }
 
 void lw_table_put(void) { fence_taken = false; }
+
+static __thread bool vals_taken;
+
+void *vals_scratch_take(size_t bytes)
+{
+    if (vals_taken)
+        return NULL;
+    void *p = scratch_get(SCR_VALS, bytes);
+    vals_taken = p != NULL;
+    return p;
+}
+
+void vals_scratch_put(void) { vals_taken = false; }
 
 typedef struct rec {
     int64_t ts;
@@ -190,23 +224,19 @@ static int add_run_unique(part_writer *w, uint32_t s, int type, const int64_t *t
         dup++;
     if (dup >= n)
         return pw_add(w, s, type, ts, v, n); /* the common case: no duplicates */
-    int64_t *t2 = malloc(n * sizeof *t2);
-    uint8_t *v2 = malloc(n * wd);
-    int rc = TSDB_ERR_NOMEM;
-    if (t2 && v2) {
-        size_t o = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (o && t2[o - 1] == ts[i])
-                o--;
-            t2[o] = ts[i];
-            memcpy(v2 + o * wd, v + i * wd, wd);
-            o++;
-        }
-        rc = pw_add(w, s, type, t2, v2, o);
+    int64_t *t2 = scratch_get(SCR_DUP_T, n * sizeof *t2);
+    uint8_t *v2 = scratch_get(SCR_DUP_V, n * wd);
+    if (!t2 || !v2)
+        return TSDB_ERR_NOMEM;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (o && t2[o - 1] == ts[i])
+            o--;
+        t2[o] = ts[i];
+        memcpy(v2 + o * wd, v + i * wd, wd);
+        o++;
     }
-    free(t2);
-    free(v2);
-    return rc;
+    return pw_add(w, s, type, t2, v2, o);
 }
 
 /* fdatasyncs and closes the parts' files whose sync write_sorted deferred; the first error wins */
@@ -527,10 +557,11 @@ static int sort_and_write(const pctx *x, int type, const uint32_t *series, uint3
             ot[i] = res[i].ts;
         }
         gather(res, n, v, wd, ov);
-    } else if (np <= (1u << 20) && (pk = malloc(n * sizeof *pk)) != NULL) {
-        size_t *cnt = calloc(np + 1, sizeof *cnt);
+    } else if (np <= (1u << 20) && (pk = scratch_get(SCR_PK, n * sizeof *pk)) != NULL) {
+        size_t *cnt = scratch_get(SCR_CNT, (2 * np + 1) * sizeof *cnt);
         if (!cnt)
             goto out;
+        memset(cnt, 0, (np + 1) * sizeof *cnt);
         prange r = {.lo = INT64_MAX, .hi = INT64_MIN};
         uint32_t rs = 0;
         for (size_t i = 0; i < n; i++) {
@@ -541,15 +572,10 @@ static int sort_and_write(const pctx *x, int type, const uint32_t *series, uint3
         }
         for (uint64_t k = 1; k <= np; k++)
             cnt[k] += cnt[k - 1];
-        size_t *pos = malloc(np * sizeof *pos);
-        if (!pos) {
-            free(cnt);
-            goto out;
-        }
+        size_t *pos = cnt + np + 1;
         memcpy(pos, cnt, np * sizeof *pos);
         for (size_t i = 0; i < n; i++)
             b[pos[pk[i]]++] = a[i];
-        free(pos);
         for (uint64_t k = 0; k < np; k++) {
             size_t lo = cnt[k], len = cnt[k + 1] - lo;
             if (!len)
@@ -561,7 +587,6 @@ static int sort_and_write(const pctx *x, int type, const uint32_t *series, uint3
             }
             gather(res, len, v, wd, ov + lo * wd);
         }
-        free(cnt);
     } else {
         res = merge_sort_recs(x, a, b, n);
         for (size_t i = 0; i < n; i++) {
@@ -572,7 +597,6 @@ static int sort_and_write(const pctx *x, int type, const uint32_t *series, uint3
     }
     rc = write_sorted(x, type, os, 0, ot, ov, n, wal_seq, collect);
 out:
-    free(pk);
     return rc;
 }
 
@@ -653,6 +677,8 @@ int parts_publish(eng *db, part **ps, size_t n)
         }
     }
     pthread_mutex_unlock(&db->publish_lock);
+    if (rc == 0)
+        manifest_publish(db); /* published: whatever happens to MANIFEST (it fails the engine), do not discard */
     return rc;
 }
 

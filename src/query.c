@@ -1085,23 +1085,46 @@ typedef struct gref {
     uint32_t k; /* the entry */
 } gref;
 
+typedef struct agg_stripe_lock {
+    _Alignas(64) pthread_mutex_t m;
+} agg_stripe_lock;
+_Static_assert(sizeof(agg_stripe_lock) % 64 == 0, "agg_stripe_lock must fill whole cache lines");
+
+/* Per-work-item edge buckets on exclusive cache lines so parallel workers never false-share adjacent slots. */
+typedef struct agg_edge {
+    _Alignas(64) agg_state a[2];
+    int64_t b[2];
+    uint8_t n;
+} agg_edge;
+_Static_assert(sizeof(agg_edge) % 64 == 0, "agg_edge must fill whole cache lines");
+
+typedef struct agg_edge_dev {
+    _Alignas(64) agg_state a[2];
+    agg_dev x[2];
+    int64_t b[2];
+    uint8_t n;
+} agg_edge_dev;
+_Static_assert(sizeof(agg_edge_dev) % 64 == 0, "agg_edge_dev must fill whole cache lines");
+
 typedef struct agg_job {
+    /* read-only during worker execution (err is written only on error) */
     eng *db;
-    qstats *qs; /* the caller's: workers count into it too */
+    qstats *qs; /* the caller's: workers accumulate locally and fold once on exit */
     const gref *work;
     size_t nwork;
-    atomic_size_t next;
     agg_target t;
-    /* striped by bucket range: workers decoding different time ranges rarely meet */
-    pthread_mutex_t locks[AGG_STRIPES];
     /* Each granule's first and last bucket, the only ones other items may share, folded in work order once
      * the workers are done: a bucket's states combine in one order, however the threads ran (the spread and
      * float sums depend on it), and a window of the range (bucket_windows) combines as the whole range. */
-    local_bucket *edge; /* 2 per work item, nedge of them set (a count, not a key sentinel: every int64 is a key) */
-    agg_dev *edgex;
-    uint8_t *nedge;
+    agg_edge *edge;      /* when !t.accx */
+    agg_edge_dev *edged; /* when t.accx */
     atomic_int err;
+    /* claimed by every worker per granule: isolated from read-only fields and stripe locks */
+    _Alignas(64) atomic_size_t next;
+    /* striped by bucket range: each lock on its own cache line so adjacent stripes never false-share */
+    _Alignas(64) agg_stripe_lock locks[AGG_STRIPES];
 } agg_job;
+_Static_assert(sizeof(agg_job) % 64 == 0, "agg_job must fill whole cache lines");
 
 uint64_t query_rows_per_thread = QUERY_ROWS_PER_THREAD;
 _Atomic int query_threads_peak;
@@ -1207,8 +1230,18 @@ static void agg_worker(void *arg, int idx)
     (void)idx;
     agg_job *j = arg;
     eng *db = j->db;
+    qstats local_qs;
+    if (j->qs) {
+        memset(&local_qs, 0, sizeof local_qs);
+        local_qs.unshared = true;
+    }
     qstats *mine = cur_qstats;
-    cur_qstats = j->qs;
+    cur_qstats = j->qs ? &local_qs : NULL;
+#ifdef TSDB_TEST_HOOKS
+    uint64_t local_gc = 0;
+    uint64_t *prev_gc = cur_granule_checks;
+    cur_granule_checks = &local_gc;
+#endif
     codec_ctx *cc = NULL; /* taken with the first granule: a helper that finds the work gone takes none */
     size_t cap = db->granule_rows;
     int64_t *ts = qscratch_get(0, cap * sizeof *ts);
@@ -1239,16 +1272,32 @@ static void agg_worker(void *arg, int idx)
         size_t hi = lower_bound_i64(ts, n, j->t.end);
         size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, gb.nulls > 0, local,
                               localx);
-        j->nedge[w] = nl > 1 ? 2 : (uint8_t)nl;
-        if (nl) {
-            j->edge[2 * w] = local[0];
-            if (localx)
-                j->edgex[2 * w] = localx[0];
-            if (nl > 1) {
-                j->edge[2 * w + 1] = local[nl - 1];
-                if (localx)
-                    j->edgex[2 * w + 1] = localx[nl - 1];
+        if (localx) {
+            agg_edge_dev *ed = &j->edged[w];
+            ed->n = nl > 1 ? 2 : (uint8_t)nl;
+            if (nl) {
+                ed->b[0] = local[0].b;
+                ed->a[0] = local[0].a;
+                ed->x[0] = localx[0];
+                if (nl > 1) {
+                    ed->b[1] = local[nl - 1].b;
+                    ed->a[1] = local[nl - 1].a;
+                    ed->x[1] = localx[nl - 1];
+                }
             }
+        } else {
+            agg_edge *ed = &j->edge[w];
+            ed->n = nl > 1 ? 2 : (uint8_t)nl;
+            if (nl) {
+                ed->b[0] = local[0].b;
+                ed->a[0] = local[0].a;
+                if (nl > 1) {
+                    ed->b[1] = local[nl - 1].b;
+                    ed->a[1] = local[nl - 1].a;
+                }
+            }
+        }
+        if (nl) {
             /* local buckets ascend: fold each run that falls in one stripe under its lock (the buckets between
              * the edges are this granule's alone: anything else with rows there would overlap it) */
             for (size_t a = 1; a + 1 < nl;) {
@@ -1256,7 +1305,7 @@ static void agg_worker(void *arg, int idx)
                 size_t e = a + 1;
                 while (e + 1 < nl && (size_t)((local[e].b - j->t.b0) >> AGG_STRIPE_SHIFT) == stripe)
                     e++;
-                pthread_mutex_t *m = &j->locks[stripe % AGG_STRIPES];
+                pthread_mutex_t *m = &j->locks[stripe % AGG_STRIPES].m;
                 pthread_mutex_lock(m);
                 fold_into(&j->t, local + a, localx ? localx + a : NULL, e - a);
                 pthread_mutex_unlock(m);
@@ -1276,7 +1325,14 @@ out:
     qscratch_put(v);
     qscratch_put(local);
     qscratch_put(localx);
+    if (j->qs)
+        qstats_fold(j->qs, &local_qs);
     cur_qstats = mine;
+#ifdef TSDB_TEST_HOOKS
+    if (local_gc)
+        atomic_fetch_add_explicit(&granule_checks, local_gc, memory_order_relaxed);
+    cur_granule_checks = prev_gc;
+#endif
 }
 
 /* One granule, or one memtable run, with its time range and source. */
@@ -1655,36 +1711,59 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
             src_free(&srcs[k]);
     }
     if (rc == 0 && nwork) {
-        j = calloc(1, sizeof *j);
-        local_bucket *edge = j ? malloc(2 * nwork * sizeof *edge) : NULL;
-        agg_dev *edgex = j && accx ? malloc(2 * nwork * sizeof *edgex) : NULL;
-        uint8_t *nedge = j ? calloc(nwork, 1) : NULL;
-        if (!edge || !nedge || (accx && !edgex)) {
+        j = aligned_alloc(64, sizeof *j);
+        agg_edge *edge = j && !accx ? aligned_alloc(64, nwork * sizeof *edge) : NULL;
+        agg_edge_dev *edged = j && accx ? aligned_alloc(64, nwork * sizeof *edged) : NULL;
+        if (!j || (!accx && !edge) || (accx && !edged)) {
             free(edge);
-            free(edgex);
-            free(nedge);
+            free(edged);
             rc = TSDB_ERR_NOMEM;
             goto done;
         }
-        *j = (agg_job){.db = db, .qs = cur_qstats, .work = work, .nwork = nwork, .t = t, .edge = edge,
-                       .edgex = edgex, .nedge = nedge};
+        memset(j, 0, sizeof *j);
+        if (edge)
+            memset(edge, 0, nwork * sizeof *edge);
+        if (edged)
+            memset(edged, 0, nwork * sizeof *edged);
+        j->db = db;
+        j->qs = cur_qstats;
+        j->work = work;
+        j->nwork = nwork;
+        j->t = t;
+        j->edge = edge;
+        j->edged = edged;
         atomic_init(&j->next, 0);
         atomic_init(&j->err, 0);
         for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_init(&j->locks[k], NULL);
+            pthread_mutex_init(&j->locks[k].m, NULL);
         uint64_t rows = 0;
         for (size_t w = 0; w < nwork; w++)
             rows += gx_count(work[w].p, work[w].k);
         sched_run(db->sched, query_threads_for(db, rows, nwork), agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_destroy(&j->locks[k]);
+            pthread_mutex_destroy(&j->locks[k].m);
         rc = atomic_load(&j->err);
-        for (size_t w = 0; rc == 0 && w < nwork; w++)
-            for (size_t k = 2 * w; k < 2 * w + nedge[w]; k++)
-                fold_into(&t, &edge[k], edgex ? &edgex[k] : NULL, 1);
+        if (rc == 0) {
+            if (edged) {
+                for (size_t w = 0; w < nwork; w++) {
+                    const agg_edge_dev *ed = &edged[w];
+                    for (uint8_t k = 0; k < ed->n; k++) {
+                        local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
+                        fold_into(&t, &lb, &ed->x[k], 1);
+                    }
+                }
+            } else {
+                for (size_t w = 0; w < nwork; w++) {
+                    const agg_edge *ed = &edge[w];
+                    for (uint8_t k = 0; k < ed->n; k++) {
+                        local_bucket lb = {.b = ed->b[k], .a = ed->a[k]};
+                        fold_into(&t, &lb, NULL, 1);
+                    }
+                }
+            }
+        }
         free(edge);
-        free(edgex);
-        free(nedge);
+        free(edged);
     }
     if (rc == 0) {
         size_t nchunks = (nb + chunk - 1) / chunk;

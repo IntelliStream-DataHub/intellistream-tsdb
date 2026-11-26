@@ -205,8 +205,9 @@ void db_pub_end(eng *db)
     pthread_mutex_unlock(&db->lock);
 }
 
-/* Publishes parts together: a query sees all of them or none. The result of
- * manifest_publish is not the caller's: its parts are committed and listed. */
+/* Publishes parts together: a query sees all of them or none. Caller invokes
+ * manifest_publish(db) after releasing publish_lock so MANIFEST I/O does not
+ * serialize concurrent publishers. */
 void db_add_parts(eng *db, part **ps, size_t n)
 {
     if (n == 0)
@@ -221,7 +222,6 @@ void db_add_parts(eng *db, part **ps, size_t n)
     pthread_cond_signal(&db->merge_cv);
     pthread_mutex_unlock(&db->lock);
     lt_end(db, &sec);
-    manifest_publish(db);
 }
 
 atomic_int wait_stall_ms = 30000;

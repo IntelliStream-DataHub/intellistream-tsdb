@@ -269,6 +269,71 @@ int main(int argc, char **argv)
     }
     query_rows_per_thread = QUERY_ROWS_PER_THREAD;
     free(ref.p);
+
+    /* Verify worker-local qstats and granule_checks folding produce identical counters at 1 vs 8 threads. */
+    {
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.clock_ms = clock_at_end;
+        o.fsync = 0;
+        o.merge_threads = 0;
+        o.verify_checksums = 1;
+        tsdb_sid s = TSDB_SID(0, 0);
+        int64_t start = 6 * GR * 1000LL + 12345, end = start + 33LL * GR * 1000;
+        tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
+        tsdb_query_stats q1[3], q8[3];
+        uint64_t gc1[3] = {0}, gc8[3] = {0};
+        void *r1[3] = {0}, *r8[3] = {0};
+        size_t n1[3] = {0}, n8[3] = {0};
+
+        query_rows_per_thread = GR;
+        for (int pass = 0; pass < 2; pass++) {
+            o.query_threads = pass == 0 ? 1 : 8;
+            tsdb *vdb = NULL;
+            must(tsdb_open(dir, &o, &vdb), pass == 0 ? "open verify 1" : "open verify 8");
+            tsdb_query_stats *qs = pass == 0 ? q1 : q8;
+            uint64_t *gc = pass == 0 ? gc1 : gc8;
+            void **res = pass == 0 ? r1 : r8;
+            size_t *ns = pass == 0 ? n1 : n8;
+
+            uint64_t b = atomic_load(&granule_checks);
+            must(tsdb_query_agg(vdb, s, start, end, 420000, (tsdb_bucket **)&res[0], &ns[0]), "agg verify");
+            gc[0] = atomic_load(&granule_checks) - b;
+            tsdb_last_query_stats(&qs[0]);
+
+            b = atomic_load(&granule_checks);
+            must(tsdb_query_spread(vdb, s, start, end, 420000, NULL, (tsdb_spread_bucket **)&res[1], &ns[1]),
+                 "spread verify");
+            gc[1] = atomic_load(&granule_checks) - b;
+            tsdb_last_query_stats(&qs[1]);
+
+            b = atomic_load(&granule_checks);
+            must(tsdb_query_twa(vdb, s, start, end, 420000, &to, (tsdb_twa_bucket **)&res[2], &ns[2]), "twa verify");
+            gc[2] = atomic_load(&granule_checks) - b;
+            tsdb_last_query_stats(&qs[2]);
+
+            tsdb_close(vdb);
+        }
+
+        static const size_t rsz[3] = {sizeof(tsdb_bucket), sizeof(tsdb_spread_bucket), sizeof(tsdb_twa_bucket)};
+        static const char *const kname[3] = {"agg", "spread", "twa"};
+        for (int k = 0; k < 3; k++) {
+            CHECK(n1[k] == n8[k] && memcmp(r1[k], r8[k], n1[k] * rsz[k]) == 0, "%s verify results differ", kname[k]);
+            CHECK(q1[k].rows_decoded == q8[k].rows_decoded && q1[k].bytes_read == q8[k].bytes_read &&
+                      q1[k].rows_decoded > 0,
+                  "%s verify qstats differ: %llu/%llu vs %llu/%llu", kname[k], (unsigned long long)q1[k].rows_decoded,
+                  (unsigned long long)q1[k].bytes_read, (unsigned long long)q8[k].rows_decoded,
+                  (unsigned long long)q8[k].bytes_read);
+#ifdef TSDB_TEST_HOOKS
+            CHECK(gc1[k] == gc8[k] && gc1[k] > 0, "%s verify granule_checks differ: %llu vs %llu", kname[k],
+                  (unsigned long long)gc1[k], (unsigned long long)gc8[k]);
+#endif
+            free(r1[k]);
+            free(r8[k]);
+        }
+        query_rows_per_thread = QUERY_ROWS_PER_THREAD;
+    }
+
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd)) {

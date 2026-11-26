@@ -413,16 +413,29 @@ typedef struct twa_job {
     twa_piece *pc;
     size_t *work;
     size_t nwork;
-    atomic_size_t next;
     atomic_int err;
+    /* stack-allocated in twa_window: explicit 64-byte padding isolates next without over-aligning on ASan's fake stack */
+    char pad_next_pre[64];
+    atomic_size_t next;
+    char pad_next_post[64];
 } twa_job;
 
 static void twa_worker(void *arg, int idx)
 {
     (void)idx;
     twa_job *j = arg;
+    qstats local_qs;
+    if (j->qs) {
+        memset(&local_qs, 0, sizeof local_qs);
+        local_qs.unshared = true;
+    }
     qstats *mine = cur_qstats;
-    cur_qstats = j->qs;
+    cur_qstats = j->qs ? &local_qs : NULL;
+#ifdef TSDB_TEST_HOOKS
+    uint64_t local_gc = 0;
+    uint64_t *prev_gc = cur_granule_checks;
+    cur_granule_checks = &local_gc;
+#endif
     codec_ctx *cc = NULL; /* taken with the first granule: a helper that finds the work gone takes none */
     size_t cap = j->db->granule_rows;
     int64_t *ts = qscratch_get(0, cap * sizeof *ts);
@@ -473,7 +486,14 @@ out:
         cc_put(j->db, cc);
     qscratch_put(ts);
     qscratch_put(v);
+    if (j->qs)
+        qstats_fold(j->qs, &local_qs);
     cur_qstats = mine;
+#ifdef TSDB_TEST_HOOKS
+    if (local_gc)
+        atomic_fetch_add_explicit(&granule_checks, local_gc, memory_order_relaxed);
+    cur_granule_checks = prev_gc;
+#endif
 }
 
 /* One TWA query over one snapshot, window by window (bucket_windows in query.c: order, limit, early stop).

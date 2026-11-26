@@ -2433,21 +2433,49 @@ const char *tsdb_series_path(tsdb *t, tsdb_sid id)
 
 /* ---------------------------------------------------------------- writes */
 
-/* A column as slots of its type: the caller's array when it already is one
- * (no nulls, not bool), else a converted copy in *owned. */
-static int vals_import(const tsdb_values *in, size_t n, const void **slots, void **owned)
+typedef struct vals_buf {
+    const void *slots;
+    void *heap;
+    size_t heap_bytes;
+    bool scratch;
+} vals_buf;
+
+static void vals_release(vals_buf *b)
 {
-    *owned = NULL;
+    if (b->scratch) {
+        vals_scratch_put();
+        b->scratch = false;
+    } else if (b->heap) {
+        tsdb_free_big(b->heap, b->heap_bytes);
+        b->heap = NULL;
+    }
+}
+
+/* A column as slots of its type: the caller's array when it already is one
+ * (no nulls, not bool), else a converted copy in the thread's scratch (or heap). */
+static int vals_import(const tsdb_values *in, size_t n, vals_buf *out)
+{
+    memset(out, 0, sizeof *out);
     if (!in || !type_valid(in->type) || (n && !in->values))
         return TSDB_ERR_INVALID;
     if (!in->valid && in->type != TSDB_BOOL) {
-        *slots = in->values;
+        out->slots = in->values;
         return 0;
     }
     size_t w = type_width(in->type);
-    uint8_t *o = malloc(n ? n * w : 1);
-    if (!o)
+    if (n > SIZE_MAX / w)
         return TSDB_ERR_NOMEM;
+    size_t bytes = n ? n * w : 1;
+    uint8_t *o = vals_scratch_take(bytes);
+    if (o) {
+        out->scratch = true;
+    } else {
+        o = malloc(bytes);
+        if (!o)
+            return TSDB_ERR_NOMEM;
+        out->heap = o;
+        out->heap_bytes = bytes;
+    }
     uint64_t null = type_null(in->type);
     for (size_t i = 0; i < n; i++) {
         uint64_t x = in->type == TSDB_BOOL ? ((const uint8_t *)in->values)[i] != 0 : slot_get(in->values, w, i);
@@ -2455,8 +2483,7 @@ static int vals_import(const tsdb_values *in, size_t n, const void **slots, void
             x = null;
         slot_put(o, w, i, x);
     }
-    *slots = o;
-    *owned = o;
+    out->slots = o;
     return 0;
 }
 
@@ -2608,23 +2635,21 @@ int tsdb_insert(tsdb *t, const tsdb_sid *series, const int64_t *ts, const float 
 
 int tsdb_insert_values(tsdb *t, const tsdb_sid *series, const int64_t *ts, const tsdb_values *values, size_t n)
 {
-    const void *slots;
-    void *owned;
-    int rc = vals_import(values, n, &slots, &owned);
+    vals_buf vb;
+    int rc = vals_import(values, n, &vb);
     if (rc == 0)
-        rc = insert_slots(t, values->type, series, ts, slots, n);
-    free(owned);
+        rc = insert_slots(t, values->type, series, ts, vb.slots, n);
+    vals_release(&vb);
     return rc;
 }
 
 int tsdb_insert_series_values(tsdb *t, tsdb_sid series, const int64_t *ts, const tsdb_values *values, size_t n)
 {
-    const void *slots;
-    void *owned;
-    int rc = vals_import(values, n, &slots, &owned);
+    vals_buf vb;
+    int rc = vals_import(values, n, &vb);
     if (rc == 0)
-        rc = insert_series_slots(t, values->type, series, ts, slots, n);
-    free(owned);
+        rc = insert_series_slots(t, values->type, series, ts, vb.slots, n);
+    vals_release(&vb);
     return rc;
 }
 
@@ -2650,12 +2675,11 @@ int tsdb_replace_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end, con
         return route_fail(TSDB_ERR_INVALID);
     if (n == 0)
         return eng_delete_range(e, local, start, end);
-    const void *slots;
-    void *owned;
-    int rc = vals_import(values, n, &slots, &owned);
+    vals_buf vb;
+    int rc = vals_import(values, n, &vb);
     if (rc == 0)
-        rc = eng_replace_range(e, values->type, local, start, end, ts, slots, n);
-    free(owned);
+        rc = eng_replace_range(e, values->type, local, start, end, ts, vb.slots, n);
+    vals_release(&vb);
     return rc;
 }
 
