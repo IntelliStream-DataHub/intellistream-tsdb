@@ -710,6 +710,8 @@ int gix_parse(const uint8_t *b, size_t len, uint32_t n, gix *x);
 /* The packed index of g[0..n) (sorted by series), malloc'd, *len a multiple of 8; decoded again and compared
  * with g before it is returned: an encoder bug fails the write, it never stores a wrong statistic. */
 int gix_encode(const struct granule *g, size_t n, uint8_t **out, size_t *len);
+/* As gix_encode, also returning the parsed gix (its pointers into *out) when parsed is non-NULL. */
+int gix_encode_parsed(const struct granule *g, size_t n, uint8_t **out, size_t *len, gix *parsed);
 /* tw_step and tw_lin of a granule on a regular grid of gap ms without nulls, from its sum, first and last value:
  * stored as a flag when these give exactly the bits granule_twa computed (the writer checks each entry). */
 static inline double gix_dstep(double sum, double last, uint32_t gap) { return (sum - last) * (double)gap; }
