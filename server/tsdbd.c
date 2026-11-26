@@ -162,6 +162,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -190,6 +191,7 @@
 #include <unistd.h>
 
 #include "../src/compat.h" /* macOS: accept4, SOCK_CLOEXEC, thread stacks; nothing on Linux */
+#include "stbuf.h"
 
 #define RECV_MIN_FREE (16u << 10) /* per connection; grows for large frames */
 #define BUF_KEEP (256u << 10)      /* buffers grown past this shrink back when idle */
@@ -2965,18 +2967,17 @@ static void handle_status(req *r)
     uint32_t nv = tsdb_volume_count(db);
     /* a cluster node: its own id and its peers from the metadata copy (0 and none before it has one) */
     const struct cluster_copy *cp = cvol_active() ? cluster_copy_get() : NULL;
-    size_t cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
-                 (cp ? (size_t)cp->nmembers * (64 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 200 + 64 + 480 +
-                           PL_NKINDS * 100
-                     : 0);
-    char *t = malloc(cap + 4);
-    if (!t) {
+    size_t init_cap = 512 + (size_t)nv * 128 + (size_t)(dom.ndoms > 0 ? dom.ndoms : 0) * 256 +
+                      (cp ? (size_t)cp->nmembers * (128 + 2 * META_ADDR_MAX) + (size_t)cp->nvolumes * 160 + 64 * 256 +
+                                1024 + PL_NKINDS * 160
+                          : 0);
+    st_buf sb = {.p = malloc(init_cap + 4), .len = 4, .cap = init_cap + 4, .oom = false};
+    if (!sb.p) {
         cluster_copy_put(cp);
         reply_status(c, r->id, TSDB_ERR_NOMEM);
         return;
     }
-    size_t at = 4;
-#define ST_PUT(...) (at += (size_t)snprintf(t + at, cap - at, __VA_ARGS__))
+#define ST_PUT(...) st_putf(&sb, __VA_ARGS__)
     ST_PUT("node.id=%u\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", cp ? (unsigned)cp->self : cvol_active() ? 0u : 1u,
            g_reader_only ? "follower" : "owner", TSDB_PROTOCOL_VERSION, (unsigned)nv);
     if (cp) {
@@ -3005,7 +3006,7 @@ static void handle_status(req *r)
         cluster_copy_put(cp);
         struct fwd_peer_row fr[64]; /* forwarding one hop (ha.md 15.4 STATUS): per peer forwarded to */
         size_t nf = fwd_peer_rows(fr, sizeof fr / sizeof fr[0]);
-        for (size_t i = 0; i < nf && at + 200 < cap; i++)
+        for (size_t i = 0; i < nf; i++)
             ST_PUT("peer.%u.fwd.frames=%llu\npeer.%u.fwd.bytes=%llu\npeer.%u.fwd.hop_p50_us=%.0f\n"
                    "peer.%u.fwd.hop_p99_us=%.0f\n", (unsigned)fr[i].peer, (unsigned long long)fr[i].frames,
                    (unsigned)fr[i].peer, (unsigned long long)fr[i].bytes, (unsigned)fr[i].peer, fr[i].p50_us,
@@ -3027,12 +3028,12 @@ static void handle_status(req *r)
         static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
         uint64_t lup[PL_NKINDS][4];
         peerlink_up_by_check(lup);
-        for (int k = 1; k < PL_NKINDS && at + 160 < cap; k++)
+        for (int k = 1; k < PL_NKINDS; k++)
             ST_PUT("links.%s.none=%llu\nlinks.%s.header=%llu\nlinks.%s.full=%llu\n", lkind[k],
                    (unsigned long long)lup[k][1], lkind[k], (unsigned long long)lup[k][2], lkind[k],
                    (unsigned long long)lup[k][3]);
     }
-    for (uint32_t v = 0; v < nv && at + 160 < cap; v++) {
+    for (uint32_t v = 0; v < nv; v++) {
         uint8_t health, reason;
         int64_t since;
         uint64_t outage;
@@ -3043,7 +3044,7 @@ static void handle_status(req *r)
                health == TSDB_HEALTH_AVAILABLE ? "available" : health == TSDB_HEALTH_DEGRADED ? "degraded" : "unavailable",
                (unsigned)v, why_name(reason));
     }
-    for (int d = 0; dom.health && d < dom.ndoms && at + 256 < cap; d++) {
+    for (int d = 0; dom.health && d < dom.ndoms; d++) {
         tsdb_domain_info di;
         if (tsdb_health_info(dom.health, d, &di) != 0)
             continue;
@@ -3053,11 +3054,14 @@ static void handle_status(req *r)
                (unsigned long long)di.outage_id, d, di.write_ms);
     }
 #undef ST_PUT
-    if (at > cap)
-        at = cap; /* snprintf truncated: cannot happen with the margins above */
-    tsdb_wire_wr32((uint8_t *)t, (uint32_t)(at - 4));
-    reply(c, r->id, 0, t, at, NULL, 0, NULL, 0);
-    free(t);
+    if (sb.oom || sb.len - 4 > UINT32_MAX) {
+        free(sb.p);
+        reply_status(c, r->id, TSDB_ERR_NOMEM);
+        return;
+    }
+    tsdb_wire_wr32((uint8_t *)sb.p, (uint32_t)(sb.len - 4));
+    reply(c, r->id, 0, sb.p, sb.len, NULL, 0, NULL, 0);
+    free(sb.p);
 }
 
 static void handle_op(req *r);
@@ -4545,14 +4549,77 @@ static void unpark(conn *c)
 }
 
 #ifndef TSDBD_NO_URING
+typedef struct {
+    ev *e;
+    int32_t res;
+    uint32_t flags;
+} uring_ev;
+
+static uring_ev *uring_defer;
+static size_t uring_defer_n, uring_defer_cap;
+
+/* Moves ready CQEs out of the kernel ring into uring_defer and advances the CQ head immediately.
+ * Called both from uring_loop() and from sqe_get() when io_uring_submit() hits -EBUSY (CQ full). */
+static unsigned uring_drain_cq(void)
+{
+    unsigned total = 0;
+    struct io_uring_cqe *cqes[256];
+    for (;;) {
+        unsigned n = io_uring_peek_batch_cqe(&ring, cqes, 256);
+        if (n == 0)
+            break;
+        if (uring_defer_n + n > uring_defer_cap) {
+            size_t ncap = uring_defer_cap ? uring_defer_cap * 2 : 256;
+            while (ncap < uring_defer_n + n)
+                ncap *= 2;
+            uring_ev *np = realloc(uring_defer, ncap * sizeof *np);
+            if (!np)
+                break;
+            uring_defer = np;
+            uring_defer_cap = ncap;
+        }
+        for (unsigned i = 0; i < n; i++)
+            uring_defer[uring_defer_n++] =
+                (uring_ev){.e = io_uring_cqe_get_data(cqes[i]), .res = cqes[i]->res, .flags = cqes[i]->flags};
+        io_uring_cq_advance(&ring, n);
+        total += n;
+    }
+    return total;
+}
+
 static struct io_uring_sqe *sqe_get(void)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        io_uring_submit(&ring);
+    if (sqe)
+        return sqe;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        int rc = io_uring_submit(&ring);
+        if (rc == -EINTR)
+            continue;
+        if (rc == -EBUSY || rc == -EAGAIN) {
+            if (uring_drain_cq() == 0 && rc == -EBUSY)
+                break;
+            continue;
+        }
+        if (rc < 0)
+            break;
         sqe = io_uring_get_sqe(&ring);
+        if (sqe)
+            return sqe;
+        if (uring_drain_cq() == 0 && rc == 0)
+            break;
     }
-    return sqe;
+    return io_uring_get_sqe(&ring);
+}
+
+static void sqe_log_exhausted(const char *op)
+{
+    static time_t last;
+    time_t t = time(NULL);
+    if (t != last) {
+        last = t;
+        fprintf(stderr, "tsdbd: io_uring: no SQE available for %s; closing connection\n", op);
+    }
 }
 #endif
 
@@ -4573,18 +4640,18 @@ static void ep_want(conn *c)
 
 static size_t pre_queued(const conn *c);
 
-static void submit_recv(conn *c)
+static bool submit_recv(conn *c)
 {
     if (c->recv_inflight || c->closed || c->eof || c->parked)
-        return;
+        return true;
     if (c->q_bytes > PIPE_CAP || c->q_multi >= MULTI_QUEUED ||
         (!atomic_load(&c->authed) && (c->auth_hold || pre_queued(c) >= 2))) {
         c->held = true;
-        return; /* on_wake resumes it as its requests run */
+        return true; /* on_wake resumes it as its requests run */
     }
     if (c->q_head && atomic_load_explicit(&req_held, memory_order_relaxed) > req_budget) {
         park(c, false); /* its requests waiting are memory enough: read again once memory frees */
-        return;
+        return true;
     }
     in_shrink(c);
     size_t want = RECV_MIN_FREE;
@@ -4596,7 +4663,7 @@ static void submit_recv(conn *c)
         want = 4 + (size_t)flen > IN_KEEP || rest < want ? rest : want;
     }
     if (buf_reserve(&c->in, want) != 0)
-        return;
+        return true;
     in_account(c);
     if (c->held) { /* the wait was the server's: the client gets the whole deadline again */
         c->held = false;
@@ -4606,19 +4673,25 @@ static void submit_recv(conn *c)
     c->recv_inflight = true;
     if (io == IO_EPOLL) {
         ep_want(c);
-        return;
+        return true;
     }
 #ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
+    if (!sqe) {
+        c->recv_inflight = false;
+        sqe_log_exhausted("recv");
+        return false;
+    }
     io_uring_prep_recv(sqe, c->fd, c->in.p + c->in.len, c->in.cap - c->in.len, 0);
     io_uring_sqe_set_data(sqe, &c->recv_ev);
 #endif
+    return true;
 }
 
-static void submit_send(conn *c)
+static bool submit_send(conn *c)
 {
     if (c->send_inflight || c->closed)
-        return;
+        return true;
     if (c->sent == c->sending.len) {
         /* take whatever the worker produced since the last send */
         pthread_mutex_lock(&c->lock);
@@ -4628,7 +4701,7 @@ static void submit_send(conn *c)
             c->tx_loop = false;
             pthread_mutex_unlock(&c->lock);
             c->sent = c->sending.len = 0;
-            return;
+            return true;
         }
         buf t = c->sending;
         c->sending = c->out;
@@ -4641,7 +4714,7 @@ static void submit_send(conn *c)
         c->sent = 0;
         if (c->sending.len == 0) {
             buf_shrink(&c->sending);
-            return;
+            return true;
         }
     }
     c->send_inflight = true;
@@ -4652,13 +4725,19 @@ static void submit_send(conn *c)
     }
     if (io == IO_EPOLL) {
         ep_want(c);
-        return;
+        return true;
     }
 #ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
+    if (!sqe) {
+        c->send_inflight = false;
+        sqe_log_exhausted("send");
+        return false;
+    }
     io_uring_prep_send(sqe, c->fd, c->sending.p + c->sent, c->sending.len - c->sent, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, &c->send_ev);
 #endif
+    return true;
 }
 
 static void dispatch(conn *c)
@@ -4956,7 +5035,8 @@ static void on_recv(conn *c, ssize_t res)
         conn_close(c);
         return;
     }
-    submit_recv(c);
+    if (!submit_recv(c))
+        conn_close(c);
 }
 
 /* Reads again from parked connections while request memory allows: each at most once a call (one that still
@@ -4975,7 +5055,8 @@ static void unpark_some(void)
             if (pr > 0)
                 park(c, true);
             dispatch(c);
-            submit_recv(c);
+            if (!submit_recv(c))
+                conn_close(c);
         }
         if (end)
             break;
@@ -5077,7 +5158,10 @@ static void on_send(conn *c, ssize_t res)
     }
     c->sent += (size_t)res;
     atomic_fetch_add_explicit(&c->tx_total, (int64_t)res, memory_order_relaxed);
-    submit_send(c);
+    if (!submit_send(c)) {
+        conn_close(c);
+        return;
+    }
     finish_if_drained(c);
 }
 
@@ -5151,7 +5235,8 @@ static void on_accept(int fd)
     conns = c;
     nconns++;
     metrics_conn_opened();
-    submit_recv(c);
+    if (!submit_recv(c))
+        conn_close(c);
 }
 
 static void take_notes(void)
@@ -5196,14 +5281,20 @@ static void take_notes(void)
             if (pr > 0)
                 park(c, true);
         }
-        submit_send(c);
+        if (!submit_send(c)) {
+            conn_close(c);
+            continue;
+        }
         if (done) {
             dispatch(c);
             if (pre_reparse(c) < 0) {
                 conn_close(c);
                 continue;
             }
-            submit_recv(c); /* its pipeline may have room again */
+            if (!submit_recv(c)) { /* its pipeline may have room again */
+                conn_close(c);
+                continue;
+            }
         }
         finish_if_drained(c);
     }
@@ -5228,50 +5319,92 @@ static void notes_pending(void)
 }
 
 #ifndef TSDBD_NO_URING
-static void uring_loop(void)
+static bool uring_arm_poll(int fd, ev *e, bool *armed)
 {
     struct io_uring_sqe *sqe = sqe_get();
-    io_uring_prep_poll_multishot(sqe, wake_fd, POLLIN);
-    io_uring_sqe_set_data(sqe, &wake_ev);
-    sqe = sqe_get();
-    io_uring_prep_poll_multishot(sqe, tick_fd, POLLIN);
-    io_uring_sqe_set_data(sqe, &tick_ev);
+    if (!sqe)
+        return false;
+    io_uring_prep_poll_multishot(sqe, fd, POLLIN);
+    io_uring_sqe_set_data(sqe, e);
+    *armed = true;
+    return true;
+}
+
+static void uring_loop(void)
+{
+    bool wake_armed = false, tick_armed = false;
     while (!stopping) {
-        io_uring_submit_and_wait(&ring, 1);
-        cluster_loop_stamp(); /* the loop runs: heartbeats may go out (D8) */
-        struct io_uring_cqe *cqe;
-        unsigned head, seen = 0;
+        if (!wake_armed && !uring_arm_poll(wake_fd, &wake_ev, &wake_armed)) {
+            fprintf(stderr, "tsdbd: io_uring: cannot arm wake poll\n");
+            stopping = 1;
+            break;
+        }
+        if (!tick_armed && !uring_arm_poll(tick_fd, &tick_ev, &tick_armed)) {
+            fprintf(stderr, "tsdbd: io_uring: cannot arm tick poll\n");
+            stopping = 1;
+            break;
+        }
+        if (uring_defer_n == 0) {
+            int rc = io_uring_submit_and_wait(&ring, 1);
+            cluster_loop_stamp(); /* the loop runs: heartbeats may go out (D8) */
+            if (rc < 0) {
+                if (rc == -EINTR)
+                    continue;
+                if (rc == -EAGAIN) {
+                    if (io_uring_cq_ready(&ring) == 0) {
+                        struct timespec nap = {0, 1000000L};
+                        nanosleep(&nap, NULL);
+                        continue;
+                    }
+                } else if (rc != -EBUSY) {
+                    fprintf(stderr, "tsdbd: io_uring_submit_and_wait: %s\n", strerror(-rc));
+                    stopping = 1;
+                    break;
+                }
+            }
+        } else {
+            cluster_loop_stamp();
+        }
+        uring_drain_cq();
+        size_t n = uring_defer_n, bcap = uring_defer_cap;
+        uring_ev *batch = uring_defer;
+        uring_defer = NULL;
+        uring_defer_n = uring_defer_cap = 0;
         bool tick = false;
-        io_uring_for_each_cqe(&ring, head, cqe)
-        {
-            seen++;
-            ev *e = io_uring_cqe_get_data(cqe);
+        for (size_t i = 0; i < n; i++) {
+            ev *e = batch[i].e;
             switch (e->type) {
             case EV_WAKE:
                 on_wake();
-                if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                    struct io_uring_sqe *s2 = sqe_get();
-                    io_uring_prep_poll_multishot(s2, wake_fd, POLLIN);
-                    io_uring_sqe_set_data(s2, &wake_ev);
+                if (!(batch[i].flags & IORING_CQE_F_MORE)) {
+                    wake_armed = false;
+                    (void)uring_arm_poll(wake_fd, &wake_ev, &wake_armed);
                 }
                 break;
             case EV_TICK:
                 tick = true;
-                if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                    struct io_uring_sqe *s2 = sqe_get();
-                    io_uring_prep_poll_multishot(s2, tick_fd, POLLIN);
-                    io_uring_sqe_set_data(s2, &tick_ev);
+                if (!(batch[i].flags & IORING_CQE_F_MORE)) {
+                    tick_armed = false;
+                    (void)uring_arm_poll(tick_fd, &tick_ev, &tick_armed);
                 }
                 break;
-            case EV_RECV: on_recv(e->c, cqe->res); break;
-            case EV_SEND: on_send(e->c, cqe->res); break;
+            case EV_RECV: on_recv(e->c, batch[i].res); break;
+            case EV_SEND: on_send(e->c, batch[i].res); break;
             }
         }
-        io_uring_cq_advance(&ring, seen);
+        if (!uring_defer) {
+            uring_defer = batch;
+            uring_defer_cap = bcap;
+        } else {
+            free(batch);
+        }
         if (tick) /* after the batch, as in ep_loop: sends and recvs completed with it count */
             on_tick();
         notes_pending();
     }
+    free(uring_defer);
+    uring_defer = NULL;
+    uring_defer_n = uring_defer_cap = 0;
 }
 #endif
 
@@ -5918,15 +6051,15 @@ int main(int argc, char **argv)
         char list[768];
         size_t lw = 0;
         list[0] = 0;
-        for (size_t i = 0; i < TSDBD_NKEYS && lw + 160 < sizeof list; i++) {
+        for (size_t i = 0; i < TSDBD_NKEYS && lw < sizeof list - 1; i++) {
             const struct cfg_key *k = &tsdbd_keys[i];
             char wb[256];
             if (!k->key || k->kind == CFG_RESERVED || strncmp(k->key, "cluster.", 8) || !strcmp(k->opt, "cluster"))
                 continue;
             if (cfg_on_cmdline(orig_argc, orig_argv, k, NULL))
-                lw += (size_t)snprintf(list + lw, sizeof list - lw, "%s--%s", lw ? ", " : "", k->opt);
+                str_appendf(list, sizeof list, &lw, "%s--%s", lw ? ", " : "", k->opt);
             else if (cfg_where_opt(g_cfg.path ? &g_cfg : NULL, orig_argc, orig_argv, k->opt, wb, sizeof wb))
-                lw += (size_t)snprintf(list + lw, sizeof list - lw, "%s%s", lw ? ", " : "", wb);
+                str_appendf(list, sizeof list, &lw, "%s%s", lw ? ", " : "", wb);
         }
         fprintf(stderr, "tsdbd: cluster settings are given (%s) but the cluster is off: add --cluster (cluster.enabled "
                         "= true), or remove them\n", list);

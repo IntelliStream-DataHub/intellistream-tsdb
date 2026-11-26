@@ -418,10 +418,7 @@ int part_walk(struct estats *es, const part *p, prec *r, unsigned flags)
 static void sleep_cv(struct estats *es, int64_t ns)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    int64_t t = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec + ns;
-    ts.tv_sec = t / 1000000000;
-    ts.tv_nsec = t % 1000000000;
+    tsdb_cond_deadline_ns(&ts, ns);
     pthread_cond_timedwait(&es->cv, &es->mu, &ts);
 }
 
@@ -840,8 +837,8 @@ void stats_start(eng *db, bool reconcile_first)
     es->res_period_ns = (int64_t)(db->opt.stats_resident_s == 0 ? 600 : db->opt.stats_resident_s) * 1000000000;
     es->hw = hotl_new();
     pthread_mutex_init(&es->mu, NULL);
-    pthread_cond_init(&es->cv, NULL);
-    pthread_cond_init(&es->done_cv, NULL);
+    tsdb_cond_init_mono(&es->cv);
+    tsdb_cond_init_mono(&es->done_cv);
     tenants_init(es);
     if (reconcile_first) { /* a start after the open (lazy, or a follower's) */
         atomic_store(&es->swapped, true);
@@ -942,10 +939,7 @@ int stats_settle(eng *db, int timeout_ms)
     uint64_t req = atomic_fetch_add(&es->settle_req, 1) + 1;
     pthread_cond_broadcast(&es->cv);
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    int64_t t = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec + (int64_t)timeout_ms * 1000000;
-    ts.tv_sec = t / 1000000000;
-    ts.tv_nsec = t % 1000000000;
+    tsdb_cond_deadline_ms(&ts, timeout_ms);
     int rc = 0;
     while (atomic_load(&es->settle_done) < req && rc == 0)
         rc = pthread_cond_timedwait(&es->done_cv, &es->mu, &ts);

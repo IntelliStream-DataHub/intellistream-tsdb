@@ -103,6 +103,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#include "../src/compat.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -818,7 +820,7 @@ static struct shipwait *ship_new(int fd)
     if (!w)
         return NULL;
     pthread_mutex_init(&w->mu, NULL);
-    pthread_cond_init(&w->cv, NULL);
+    tsdb_cond_init_mono(&w->cv);
     w->fd = fd;
     return w;
 }
@@ -943,12 +945,7 @@ static int ship_wait_one(struct rvol *rv, struct shipwait *w, uint64_t deadline)
         }
         /* woken by a done; the ISR is looked at again every 100 ms */
         uint64_t slice = deadline - now < 100 ? deadline - now : 100;
-        struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        dl.tv_nsec += (long)(slice * 1000000);
-        dl.tv_sec += dl.tv_nsec / 1000000000;
-        dl.tv_nsec %= 1000000000;
-        pthread_cond_timedwait(&w->cv, &w->mu, &dl);
+        tsdb_cond_timedwait_ms(&w->cv, &w->mu, (int64_t)slice);
         pthread_mutex_unlock(&w->mu);
     }
 }
@@ -1014,8 +1011,7 @@ static int op_ship(void *ctx, struct eng *db, const char *file, const char *mnam
     if (G.mutant == RM_SHIPPERFILE) { /* planted: the code before the review's M2, 30 s for each file */
         pthread_mutex_lock(&w->mu);
         struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        dl.tv_sec += 30;
+        tsdb_cond_deadline_ms(&dl, 30000);
         while (w->pending > 0 && pthread_cond_timedwait(&w->cv, &w->mu, &dl) != ETIMEDOUT)
             ;
         pthread_mutex_unlock(&w->mu);
@@ -1243,10 +1239,7 @@ static int inbox_room(struct rvol *rv, size_t need)
     if (rv->in_full && G.mutant != RM_INBOXWAITALL)
         return 0;
     struct timespec dl;
-    clock_gettime(CLOCK_REALTIME, &dl);
-    dl.tv_nsec += INBOX_WAIT_MS * 1000000L;
-    dl.tv_sec += dl.tv_nsec / 1000000000L;
-    dl.tv_nsec %= 1000000000L;
+    tsdb_cond_deadline_ms(&dl, INBOX_WAIT_MS);
     while (!rv->stop && !rv->failed && rv->in_bytes && rv->in_bytes + need > G.inbox_bytes) {
         rv->in_waiters++;
         int rc = pthread_cond_timedwait(&rv->in_space, &rv->mu, &dl);
@@ -2301,10 +2294,7 @@ static void *vol_main(void *arg)
                 continue;
             }
             rsnap_rebuild(rv); /* D8: a DIVERGED replica is rebuilt by a snapshot; asked again until installed */
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += 1;
-            pthread_cond_timedwait(&rv->cv, &rv->mu, &until);
+            tsdb_cond_timedwait_ms(&rv->cv, &rv->mu, 1000);
             continue;
         }
         if ((rv->mode == M_WRITER || rv->mode == M_PROMOTING) && !repl_is_leader(rv->core)) {
@@ -2430,12 +2420,7 @@ static void *vol_main(void *arg)
             slice = now_ms() + TICK_MS;
             continue;
         }
-        struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        uint64_t ns = (uint64_t)dl.tv_nsec + (next_tick - now) * 1000000ull;
-        dl.tv_sec += (time_t)(ns / 1000000000ull);
-        dl.tv_nsec = (long)(ns % 1000000000ull);
-        pthread_cond_timedwait(&rv->cv, &rv->mu, &dl);
+        tsdb_cond_timedwait_ms(&rv->cv, &rv->mu, (int64_t)(next_tick - now));
         /* A wait that returns STALL_MS past its deadline was a stop of the whole process (the pause scenario stops a
          * leader and a replica together for 1.5 s): the time is not caught up in ticks, which would count every peer
          * silent for TICK_BACKLOG_MS and ask for an ISR of one, and repld_unreachable counts its peers as heard at
@@ -2784,8 +2769,8 @@ int repld_open(const struct cluster_vol_rec *r)
     rv->self = node_index(rv, G.self);
     rv->nnodes = (int)r->nrep;
     pthread_mutex_init(&rv->mu, NULL);
-    pthread_cond_init(&rv->cv, NULL);
-    pthread_cond_init(&rv->in_space, NULL);
+    tsdb_cond_init_mono(&rv->cv);
+    tsdb_cond_init_mono(&rv->in_space);
     rv->ops = (struct jr_ops){.ctx = rv, .ship = op_ship, .ship_wait = op_ship_wait, .admit = op_admit,
                               .bytes = op_bytes, .synced = op_synced};
     int dfd = open(rv->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);

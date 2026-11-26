@@ -10,6 +10,7 @@
 #include "chunkpeer.h"
 
 #include "../include/tsdb.h"
+#include "../src/compat.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -453,7 +454,7 @@ static void *fan_main(void *arg)
 static void fan_run(fan *f, unsigned need, int grace_ms, bool stop_on_fail, ask *out, int unfinished)
 {
     pthread_mutex_init(&f->mu, NULL);
-    pthread_cond_init(&f->cv, NULL);
+    tsdb_cond_init_mono(&f->cv);
     f->refs = 1 + (int)f->n;
     for (unsigned i = 0; i < f->n; i++) {
         f->job[i] = (fan_job){f, i};
@@ -479,11 +480,7 @@ static void fan_run(fan *f, unsigned need, int grace_ms, bool stop_on_fail, ask 
     while (f->done < f->n && !(stop_on_fail && f->done > f->ok)) {
         if (need && f->ok >= need) {
             if (!armed) {
-                clock_gettime(CLOCK_REALTIME, &dl);
-                dl.tv_sec += grace_ms / 1000;
-                dl.tv_nsec += (long)(grace_ms % 1000) * 1000000L;
-                if (dl.tv_nsec >= 1000000000L)
-                    dl.tv_sec++, dl.tv_nsec -= 1000000000L;
+                tsdb_cond_deadline_ms(&dl, grace_ms);
                 armed = true;
             }
             if (pthread_cond_timedwait(&f->cv, &f->mu, &dl) == ETIMEDOUT)

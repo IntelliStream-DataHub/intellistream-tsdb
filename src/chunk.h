@@ -94,7 +94,7 @@ typedef struct chunk_ident {
 } chunk_ident;
 
 void chunk_oid_hex(const uint8_t oid[16], char out[33]);
-void chunk_random(void *buf, size_t n); /* store ids, object ids: /dev/urandom (never a timestamp or a counter) */
+int chunk_random(void *buf, size_t n); /* store ids, object ids: getrandom (never a timestamp or a counter) */
 
 /* ---------------------------------------------------------------- chunk file format */
 typedef struct chunk_hdr {

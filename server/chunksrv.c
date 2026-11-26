@@ -426,9 +426,13 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     pthread_mutex_init(&cs->qmu, NULL);
     pthread_cond_init(&cs->qcv, NULL);
     pthread_mutex_init(&cs->cmu, NULL);
-    pthread_cond_init(&cs->ccv, NULL);
+    tsdb_cond_init_mono(&cs->ccv);
     uint64_t r;
-    chunk_random(&r, sizeof r); /* a restarted client's ids never meet a late answer to its previous life */
+    if (chunk_random(&r, sizeof r) != 0) { /* a restarted client's ids never meet a late answer to its previous life */
+        snprintf(err, errlen, "cannot read random bytes");
+        chunksrv_close(cs);
+        return NULL;
+    }
     atomic_store(&cs->rid, r);
     if (n > 0) {
         cs->paths = calloc((size_t)n, sizeof *cs->paths);
@@ -1483,17 +1487,14 @@ static void pend_unref(struct chunksrv *cs, struct cs_pend *q)
     free(q);
 }
 
-/* cond waits on a realtime clock: the deadline is kept in monotonic ns and the wait is in slices */
+/* wait in bounded slices on the monotonic condvar clock */
 static void wait_slice(struct chunksrv *cs, uint64_t deadline)
 {
     uint64_t now = now_ns(), left = deadline > now ? deadline - now : 0;
     if (left > 50000000ull)
         left = 50000000ull;
     struct timespec t;
-    clock_gettime(CLOCK_REALTIME, &t);
-    uint64_t ns = (uint64_t)t.tv_nsec + left;
-    t.tv_sec += (time_t)(ns / 1000000000ull);
-    t.tv_nsec = (long)(ns % 1000000000ull);
+    tsdb_cond_deadline_ns(&t, (int64_t)left);
     pthread_cond_timedwait(&cs->ccv, &cs->cmu, &t);
 }
 

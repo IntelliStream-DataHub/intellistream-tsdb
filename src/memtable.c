@@ -1880,15 +1880,7 @@ void *flusher_main(void *arg)
         if (lead && seal_ms && db->active->rows)
             due = MIN(due, db->idle_since + (int64_t)seal_ms);
         int64_t wait = MAX(due - mono_ms(), (int64_t)1);
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += wait / 1000;
-        ts.tv_nsec += (wait % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&db->flush_cv, &db->buf_lock, &ts);
+        tsdb_cond_timedwait_ms(&db->flush_cv, &db->buf_lock, wait);
         if (db->flusher_stop)
             break;
         int64_t now = mono_ms();

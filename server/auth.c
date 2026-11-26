@@ -160,7 +160,14 @@ static size_t nreg, reg_cap, ndead, dead_cap;
 static pthread_t reload_thread;
 static bool reload_running;
 static pthread_mutex_t stop_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t stop_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t stop_cv;
+static pthread_once_t stop_cv_once = PTHREAD_ONCE_INIT;
+static void stop_cv_init(void) { tsdb_cond_init_mono(&stop_cv); }
+static pthread_cond_t *stop_cv_get(void)
+{
+    pthread_once(&stop_cv_once, stop_cv_init);
+    return &stop_cv;
+}
 static bool stop_flag;
 const char *auth_test_nonce;
 /* The cluster store (auth_set_group): the watch replaces `us` (a group store) and publishes under users_mu; the
@@ -608,10 +615,7 @@ static void *reload_main(void *arg)
     (void)arg;
     pthread_mutex_lock(&stop_mu);
     while (!stop_flag) {
-        struct timespec t;
-        clock_gettime(CLOCK_REALTIME, &t);
-        t.tv_sec += 1;
-        pthread_cond_timedwait(&stop_cv, &stop_mu, &t);
+        tsdb_cond_timedwait_ms(stop_cv_get(), &stop_mu, 1000);
         if (stop_flag)
             break;
         pthread_mutex_unlock(&stop_mu);
@@ -638,7 +642,7 @@ void auth_shutdown(void)
     if (reload_running) {
         pthread_mutex_lock(&stop_mu);
         stop_flag = true;
-        pthread_cond_broadcast(&stop_cv);
+        pthread_cond_broadcast(stop_cv_get());
         pthread_mutex_unlock(&stop_mu);
         pthread_join(reload_thread, NULL);
         reload_running = false;

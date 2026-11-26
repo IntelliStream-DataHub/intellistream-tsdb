@@ -43,6 +43,7 @@ int main(void)
 #else
 #include <dirent.h>
 #include <errno.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -2359,6 +2360,45 @@ static void cleanup_scratch(void)
     }
 }
 
+static void test_chunk_random_emfile(void)
+{
+    printf("  chunk_random under EMFILE\n");
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+            _exit(2);
+        rlim_t lim = rl.rlim_cur < 64 ? rl.rlim_cur : 64;
+        struct rlimit small = {.rlim_cur = lim, .rlim_max = rl.rlim_max};
+        if (setrlimit(RLIMIT_NOFILE, &small) != 0)
+            _exit(3);
+        int held[64], nheld = 0;
+        while (nheld < 64) {
+            int fd = dup(0);
+            if (fd < 0)
+                break;
+            held[nheld++] = fd;
+        }
+        int probe = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (probe >= 0 || errno != EMFILE) {
+            if (probe >= 0)
+                close(probe);
+            _exit(4);
+        }
+        uint8_t a[32] = {0}, b[32] = {0}, z[32] = {0};
+        int r1 = chunk_random(a, sizeof a);
+        int r2 = chunk_random(b, sizeof b);
+        for (int i = 0; i < nheld; i++)
+            close(held[i]);
+        if (r1 != 0 || r2 != 0 || memcmp(a, z, sizeof a) == 0 || memcmp(a, b, sizeof a) == 0)
+            _exit(5);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 5 && strcmp(argv[1], "--child") == 0) {
@@ -2400,6 +2440,7 @@ int main(int argc, char **argv)
     ERR = fdopen(dup(2), "w");
     setvbuf(ERR, NULL, _IONBF, 0);
     test_geometry();
+    test_chunk_random_emfile();
     test_image();
     quiet(true);
     test_memory();

@@ -7,6 +7,7 @@
 #include "tsdb_protocol.h"
 #include "tsdb_wire.h"
 #include "metrics.h"
+#include "stbuf.h"
 #include "samekeys.h"
 #include "lttb_ref.h"
 #include "harness.h"
@@ -26,6 +27,7 @@
 #include <zstd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -3907,6 +3909,307 @@ static void test_latest_by_name_lookup(void)
     close(lfd);
 }
 
+static void test_status_buf_and_wire(const char *dir)
+{
+    /* 1. str_appendf must clamp safely at cap - 1 and never underflow cap - *pos. */
+    char small[64];
+    size_t pos = 0;
+    small[0] = 0;
+    char chunk[256];
+    memset(chunk, 'A', sizeof chunk - 1);
+    chunk[sizeof chunk - 1] = 0;
+    for (int i = 0; i < 6; i++)
+        str_appendf(small, sizeof small, &pos, "%s%s", pos ? ", " : "", chunk);
+    CHECK(pos == sizeof small - 1);
+    CHECK(small[sizeof small - 1] == '\0');
+
+    /* 2. st_putf must dynamically grow without truncating or overflowing on max-length peer/counter fields. */
+    st_buf sb = {.p = malloc(32), .len = 4, .cap = 32, .oom = false};
+    CHECK(sb.p != NULL);
+    char addr[128];
+    memset(addr, 'x', sizeof addr - 1);
+    addr[sizeof addr - 1] = 0;
+    for (unsigned i = 0; i < 32; i++)
+        st_putf(&sb, "peer.%u.addr=%s\npeer.%u.peer=%s\npeer.%u.alive=%d\n", UINT32_MAX - i, addr, UINT32_MAX - i,
+                addr, UINT32_MAX - i, 1);
+    st_putf(&sb,
+            "snap.asked=%llu\nsnap.sent=%llu\nsnap.received=%llu\nsnap.bytes_sent=%llu\nsnap.bytes_received=%llu\n"
+            "links.chunkb.none=%llu\nlinks.chunkb.header=%llu\nlinks.chunkb.full=%llu\n",
+            (unsigned long long)UINT64_MAX, (unsigned long long)UINT64_MAX, (unsigned long long)UINT64_MAX,
+            (unsigned long long)UINT64_MAX, (unsigned long long)UINT64_MAX, (unsigned long long)UINT64_MAX,
+            (unsigned long long)UINT64_MAX, (unsigned long long)UINT64_MAX);
+    CHECK(!sb.oom && sb.len > 32 * (2 * 127 + 60));
+    CHECK(strstr(sb.p + 4, "links.chunkb.full=18446744073709551615\n") != NULL);
+    free(sb.p);
+
+    /* 3. Cluster-option mismatch diagnostic with a long config file path (>210 bytes) must exit 2 cleanly. */
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    CHECK(mkdir(dir, 0755) == 0);
+    char ldir[700], ldir2[800], cfgpath[920];
+    snprintf(ldir, sizeof ldir, "%s/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", dir);
+    CHECK(mkdir(ldir, 0755) == 0);
+    snprintf(ldir2, sizeof ldir2, "%s/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", ldir);
+    CHECK(mkdir(ldir2, 0755) == 0);
+    snprintf(cfgpath, sizeof cfgpath,
+             "%s/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.properties", ldir2);
+    FILE *cf = fopen(cfgpath, "w");
+    CHECK(cf != NULL);
+    if (cf) {
+        fprintf(cf,
+                "cluster.node.id = 1\n"
+                "cluster.peer.listen = 127.0.0.1:19999\n"
+                "cluster.peer.advertise = 127.0.0.1:19999\n"
+                "cluster.client.advertise = 127.0.0.1:19998\n"
+                "cluster.state.dir = %s/state\n"
+                "cluster.secret.file = %s/secret\n"
+                "cluster.witness = false\n"
+                "cluster.peer.check = header\n",
+                dir, dir);
+        fclose(cf);
+    }
+    const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+    pid_t cp = fork();
+    if (cp == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            close(devnull);
+        }
+        const char *argv[] = {"tsdbd", "--config", cfgpath, "--dir", dir, "--no-auth", NULL};
+        execv(bin, (char *const *)argv);
+        _exit(127);
+    }
+    int cst = 0;
+    CHECK(waitpid(cp, &cst, 0) == cp && WIFEXITED(cst) && WEXITSTATUS(cst) == 2);
+
+    /* 4. Live TSDB_OP_STATUS with 49 volumes returns every volume without truncation. */
+    char dbdir[600];
+    snprintf(dbdir, sizeof dbdir, "%s/db", dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *t = NULL;
+    CHECK(tsdb_open(dbdir, &o, &t) == 0 && t != NULL);
+    if (t)
+        tsdb_close(t);
+    for (int i = 1; i <= 48; i++) {
+        char vp[640];
+        snprintf(vp, sizeof vp, "%s/vol_%02d", dir, i);
+        uint32_t vn = 0;
+        CHECK(tsdb_volume_add_dir(dbdir, vp, &vn) == 0 && vn == (uint32_t)i);
+    }
+    pid_t srv = start_server(dbdir);
+    int fd = raw_connect();
+    raw_send(fd, 401, TSDB_OP_STATUS, NULL, 0);
+    uint8_t *resp = malloc(65536);
+    CHECK(resp != NULL);
+    if (resp) {
+        uint32_t rid = 0;
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, resp, 65535, &nrest) == 0 && rid == 401 && nrest >= 4);
+        if (nrest >= 4) {
+            uint32_t tlen = tsdb_wire_rd32(resp);
+            CHECK(tlen == nrest - 4);
+            resp[4 + tlen] = '\0';
+            const char *txt = (const char *)(resp + 4);
+            CHECK(strstr(txt, "volumes=49\n") != NULL);
+            CHECK(strstr(txt, "vol.0.health=available\n") != NULL);
+            CHECK(strstr(txt, "vol.48.health=available\n") != NULL);
+            CHECK(strstr(txt, "vol.48.reason=none\n") != NULL);
+        }
+        free(resp);
+    }
+    close(fd);
+    stop_server(srv);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
+static void test_uring_pressure(const char *dir)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    struct rlimit rl, orig_rl;
+    bool restored = false;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        orig_rl = rl;
+        rlim_t want = 8192;
+        if (rl.rlim_cur < want && rl.rlim_max > rl.rlim_cur) {
+            rl.rlim_cur = rl.rlim_max < want ? rl.rlim_max : want;
+            if (setrlimit(RLIMIT_NOFILE, &rl) == 0)
+                restored = true;
+        }
+        getrlimit(RLIMIT_NOFILE, &rl);
+    } else {
+        rl.rlim_cur = 1024;
+    }
+    int max_by_fd = rl.rlim_cur > 300 ? (int)((rl.rlim_cur - 300) / 2) : 64;
+#if defined(__SANITIZE_THREAD__)
+    int nconns = max_by_fd < 256 ? max_by_fd : 256;
+#else
+    int nconns = max_by_fd < 2400 ? max_by_fd : 2400;
+#endif
+    if (nconns < 64)
+        nconns = 64;
+    const char *extra[] = {"--max-connections", "6000", NULL};
+    pid_t srv = start_server_with(dir, extra);
+
+    /* Build two pipelined HELLO frames (2 * 13 = 26 bytes) to drive >4800 concurrent SQEs/CQEs on io_uring. */
+    uint8_t reqbuf[26];
+    uint32_t ver = TSDB_PROTOCOL_VERSION;
+    for (uint32_t k = 0; k < 2; k++) {
+        uint8_t *p = reqbuf + k * 13;
+        uint32_t flen = 9, id = k + 1;
+        memcpy(p, &flen, 4);
+        memcpy(p + 4, &id, 4);
+        p[8] = TSDB_OP_HELLO;
+        memcpy(p + 9, &ver, 4);
+    }
+
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    typedef struct {
+        int fd;
+        size_t sent, rlen;
+        int got_replies;
+        bool done;
+        uint8_t rbuf[128];
+    } pconn;
+    pconn *pc = calloc((size_t)nconns, sizeof *pc);
+    struct pollfd *pfds = calloc((size_t)nconns, sizeof *pfds);
+    CHECK(pc != NULL && pfds != NULL);
+    int active = 0, ok_conns = 0;
+    for (int i = 0; pc && pfds && i < nconns; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+            break;
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0)
+            fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+        if (rc != 0 && errno != EINPROGRESS) {
+            close(fd);
+            break;
+        }
+        pc[active].fd = fd;
+        active++;
+    }
+    CHECK(active >= 64);
+
+    int remaining = active;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (remaining > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - t0.tv_sec > 30)
+            break;
+        int np = 0;
+        for (int i = 0; i < active; i++) {
+            if (pc[i].done)
+                continue;
+            pfds[np].fd = pc[i].fd;
+            pfds[np].events = (short)((pc[i].sent < sizeof reqbuf ? POLLOUT : 0) | POLLIN);
+            pfds[np].revents = 0;
+            np++;
+        }
+        int pr = poll(pfds, (nfds_t)np, 100);
+        if (pr <= 0)
+            continue;
+        int idx = 0;
+        for (int i = 0; i < active; i++) {
+            if (pc[i].done)
+                continue;
+            short re = pfds[idx++].revents;
+            if (!re)
+                continue;
+            if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+                close(pc[i].fd);
+                pc[i].fd = -1;
+                pc[i].done = true;
+                remaining--;
+                continue;
+            }
+            if ((re & POLLOUT) && pc[i].sent < sizeof reqbuf) {
+                ssize_t w = send(pc[i].fd, reqbuf + pc[i].sent, sizeof reqbuf - pc[i].sent, MSG_NOSIGNAL);
+                if (w > 0)
+                    pc[i].sent += (size_t)w;
+                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    close(pc[i].fd);
+                    pc[i].fd = -1;
+                    pc[i].done = true;
+                    remaining--;
+                    continue;
+                }
+            }
+            if (re & POLLIN) {
+                ssize_t r = recv(pc[i].fd, pc[i].rbuf + pc[i].rlen, sizeof pc[i].rbuf - pc[i].rlen, 0);
+                if (r > 0) {
+                    pc[i].rlen += (size_t)r;
+                    for (;;) {
+                        if (pc[i].rlen < 4)
+                            break;
+                        uint32_t flen = 0;
+                        memcpy(&flen, pc[i].rbuf, 4);
+                        if (flen < 5 || 4 + (size_t)flen > sizeof pc[i].rbuf) {
+                            close(pc[i].fd);
+                            pc[i].fd = -1;
+                            pc[i].done = true;
+                            remaining--;
+                            break;
+                        }
+                        if (pc[i].rlen < 4 + (size_t)flen)
+                            break;
+                        uint32_t rid = 0;
+                        memcpy(&rid, pc[i].rbuf + 4, 4);
+                        uint8_t st = pc[i].rbuf[8];
+                        if (st == 0 && rid == (uint32_t)(pc[i].got_replies + 1))
+                            pc[i].got_replies++;
+                        size_t used = 4 + (size_t)flen;
+                        memmove(pc[i].rbuf, pc[i].rbuf + used, pc[i].rlen - used);
+                        pc[i].rlen -= used;
+                        if (pc[i].got_replies == 2) {
+                            ok_conns++;
+                            close(pc[i].fd);
+                            pc[i].fd = -1;
+                            pc[i].done = true;
+                            remaining--;
+                            break;
+                        }
+                    }
+                } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    close(pc[i].fd);
+                    pc[i].fd = -1;
+                    pc[i].done = true;
+                    remaining--;
+                }
+            }
+        }
+    }
+    for (int i = 0; pc && i < active; i++)
+        if (pc[i].fd >= 0)
+            close(pc[i].fd);
+    free(pc);
+    free(pfds);
+    CHECK(ok_conns == active);
+
+    /* Server must remain responsive after the burst. */
+    tsdbc *c = NULL;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    tsdb_stats st;
+    OK(tsdbc_stats(c, &st));
+    tsdbc_close(c);
+    stop_server(srv);
+    if (restored)
+        setrlimit(RLIMIT_NOFILE, &orig_rl);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
@@ -4154,6 +4457,12 @@ int main(int argc, char **argv)
     printf("the LTTB threshold cap\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-lttbcap-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_lttb_cap(dir);
+    printf("STATUS buffer growth and wire output\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-status-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_status_buf_and_wire(dir);
+    printf("high connection / SQE burst pressure\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-burst-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_uring_pressure(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

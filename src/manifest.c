@@ -716,15 +716,7 @@ void *follower_main(void *arg)
     tsdb_thread_name("tsdb-follow");
     pthread_mutex_lock(&db->buf_lock);
     while (!db->follower_stop) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += ms / 1000;
-        ts.tv_nsec += (ms % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&db->flush_cv, &db->buf_lock, &ts);
+        tsdb_cond_timedwait_ms(&db->flush_cv, &db->buf_lock, ms);
         if (db->follower_stop)
             break;
         pthread_mutex_unlock(&db->buf_lock);

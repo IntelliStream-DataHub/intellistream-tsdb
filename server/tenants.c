@@ -15,6 +15,7 @@
  */
 #include "tenants.h"
 
+#include "../src/compat.h"
 #include "tsdb_protocol.h"
 
 #include <errno.h>
@@ -147,7 +148,14 @@ static atomic_bool hup;
 static tsdb *tdb;
 static pthread_t tn_thread;
 static bool tn_running;
-static pthread_cond_t stop_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t stop_cv;
+static pthread_once_t stop_cv_once = PTHREAD_ONCE_INIT;
+static void stop_cv_init(void) { tsdb_cond_init_mono(&stop_cv); }
+static pthread_cond_t *stop_cv_get(void)
+{
+    pthread_once(&stop_cv_once, stop_cv_init);
+    return &stop_cv;
+}
 static bool stop_flag;
 
 static int str_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
@@ -619,12 +627,7 @@ static void *tn_main(void *arg)
     (void)arg;
     pthread_mutex_lock(&tn_mu);
     while (!stop_flag) {
-        struct timespec d;
-        clock_gettime(CLOCK_REALTIME, &d);
-        d.tv_nsec += 100000000;
-        if (d.tv_nsec >= 1000000000)
-            d.tv_sec++, d.tv_nsec -= 1000000000;
-        pthread_cond_timedwait(&stop_cv, &tn_mu, &d);
+        tsdb_cond_timedwait_ms(stop_cv_get(), &tn_mu, 100);
         if (stop_flag)
             break;
         pthread_mutex_unlock(&tn_mu);
@@ -651,7 +654,7 @@ void tn_stop(void)
         return;
     pthread_mutex_lock(&tn_mu);
     stop_flag = true;
-    pthread_cond_signal(&stop_cv);
+    pthread_cond_signal(stop_cv_get());
     pthread_mutex_unlock(&tn_mu);
     pthread_join(tn_thread, NULL);
     tn_running = false;

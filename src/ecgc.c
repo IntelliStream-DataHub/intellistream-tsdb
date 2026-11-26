@@ -317,10 +317,7 @@ static void *gc_main(void *arg)
             continue;
         }
         if (!g->kick) { /* entries kept from the last round (a transient error): again in 2 s */
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 2;
-            pthread_cond_timedwait(&g->cv, &g->mu, &ts);
+            tsdb_cond_timedwait_ms(&g->cv, &g->mu, 2000);
             if (g->stop)
                 break;
         }
@@ -340,7 +337,7 @@ int ecgc_tier_open(tier *t)
     if (!g)
         return TSDB_ERR_NOMEM;
     pthread_mutex_init(&g->mu, NULL);
-    pthread_cond_init(&g->cv, NULL);
+    tsdb_cond_init_mono(&g->cv);
     t->gc = g;
     if (!atomic_load(&ecgc_test_manual)) {
         if (tsdb_thread_create(&g->thread, gc_main, t) != 0)

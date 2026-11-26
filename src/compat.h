@@ -19,6 +19,8 @@
  *  - MSG_NOSIGNAL        0, with SO_NOSIGPIPE on the socket (tsdb_nosigpipe)
  *  - thread stacks       8 MB: macOS gives a secondary thread 512 KB, Linux 8 MB
  *  - mincore             tsdb_mincore: the residency vector is a char array there (statistics, residency)
+ *  - condvar clock       tsdb_cond_init_mono: CLOCK_MONOTONIC on Linux; macOS has no pthread_condattr_setclock and
+ *                        falls back to CLOCK_REALTIME
  *  - fsync, fdatasync    tsdb_fsync and tsdb_fdatasync: macOS's fsync only hands the data to the drive, whose cache a
  *                        power loss empties, so they follow the real call with fcntl(F_FULLFSYNC) (the drive's own
  *                        cache flush; slower, tens of ms for a call on some SSDs). TSDB_FAST_FSYNC=1 in the
@@ -196,14 +198,33 @@ static inline void tsdb_thread_name(const char *name) { pthread_setname_np(name)
 #include <sys/mman.h>
 static inline int tsdb_mincore(void *addr, size_t len, unsigned char *vec) { return mincore(addr, len, (char *)vec); }
 
+#define TSDB_COND_CLOCK CLOCK_REALTIME
+static inline int tsdb_cond_init_mono(pthread_cond_t *cv) { return pthread_cond_init(cv, NULL); }
+
 #else /* Linux and the rest: the defaults are right */
 
 #include <pthread.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
+
+#define TSDB_COND_CLOCK CLOCK_MONOTONIC
+static inline int tsdb_cond_init_mono(pthread_cond_t *cv)
+{
+    pthread_condattr_t at;
+    int rc = pthread_condattr_init(&at);
+    if (rc != 0)
+        return rc;
+    rc = pthread_condattr_setclock(&at, CLOCK_MONOTONIC);
+    if (rc == 0)
+        rc = pthread_cond_init(cv, &at);
+    pthread_condattr_destroy(&at);
+    return rc;
+}
 
 static inline int tsdb_mincore(void *addr, size_t len, unsigned char *vec) { return mincore(addr, len, vec); }
 
@@ -236,6 +257,39 @@ static inline int tsdb_rename_noreplace(int dirfd, const char *from, const char 
 #define tsdb_thread_name(name) pthread_setname_np(pthread_self(), (name)) /* a macro: needs _GNU_SOURCE where used */
 
 #endif /* __APPLE__ */
+
+static inline void tsdb_cond_deadline_ns(struct timespec *ts, int64_t ns)
+{
+    clock_gettime(TSDB_COND_CLOCK, ts);
+    if (ns <= 0)
+        return;
+    ts->tv_sec += (time_t)(ns / 1000000000LL);
+    ts->tv_nsec += (long)(ns % 1000000000LL);
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static inline void tsdb_cond_deadline_ms(struct timespec *ts, int64_t ms)
+{
+    clock_gettime(TSDB_COND_CLOCK, ts);
+    if (ms <= 0)
+        return;
+    ts->tv_sec += (time_t)(ms / 1000);
+    ts->tv_nsec += (long)((ms % 1000) * 1000000L);
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static inline int tsdb_cond_timedwait_ms(pthread_cond_t *cv, pthread_mutex_t *mu, int64_t ms)
+{
+    struct timespec ts;
+    tsdb_cond_deadline_ms(&ts, ms);
+    return pthread_cond_timedwait(cv, mu, &ts);
+}
 
 /* free(p) for a block of n bytes (n at most what was allocated), without a long stall for the other threads.
  * munmap of a large block takes the process's mmap lock for writing for as long as it takes to hand the pages back
