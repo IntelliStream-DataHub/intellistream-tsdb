@@ -2147,13 +2147,13 @@ static long long classes_most(void)
 }
 
 /* kvr's replica set as the metadata group holds it (R4: it changes under churn and a reset): the record of the copy
- * with the highest (set_version, epoch) among the running nodes' copies. node[k] is the index of rep[k]'s node in the
- * table (-1: not in it), learner[k] its learner flag, isr_has[k] whether it is in the ISR. 0, or -1 when no node
- * answered or the volume is not in the copy. */
+ * with the highest (set_version, epoch, applied) among the running nodes' copies. node[k] is the index of rep[k]'s
+ * node in the table (-1: not in it), learner[k] its learner flag, isr_has[k] whether it is in the ISR. 0, or -1 when
+ * no node answered or the volume is not in the copy. */
 struct rrec {
     int nrep, node[META_REPLICAS_MAX], learner[META_REPLICAS_MAX], isr_has[META_REPLICAS_MAX], leader;
     int moving; /* a learner with `replaces` is in the set: a move is in flight */
-    uint64_t set_version, epoch, rid[META_REPLICAS_MAX];
+    uint64_t set_version, epoch, rid[META_REPLICAS_MAX], open_gen[META_REPLICAS_MAX];
     uint32_t id[META_REPLICAS_MAX];
 };
 
@@ -2170,6 +2170,7 @@ static int rep_rec_get(struct rrec *o)
     memset(o, 0, sizeof *o);
     o->leader = -1;
     int have = 0;
+    uint64_t best_applied = 0;
     for (int i = 0; i < nn; i++) {
         pid_t pid;
         node_snap(i, &pid, NULL, NULL);
@@ -2178,10 +2179,14 @@ static int rep_rec_get(struct rrec *o)
             continue;
         for (uint32_t k = 0; k < v.m.nvolumes; k++) {
             const struct meta_volume *mv = &v.m.volumes[k];
-            if (mv->number != rep_number || (have && (mv->set_version < o->set_version ||
-                                                      (mv->set_version == o->set_version && mv->epoch <= o->epoch))))
+            if (mv->number != rep_number)
+                continue;
+            if (have && (mv->set_version < o->set_version ||
+                         (mv->set_version == o->set_version &&
+                          (mv->epoch < o->epoch || (mv->epoch == o->epoch && v.m.applied <= best_applied)))))
                 continue;
             have = 1;
+            best_applied = v.m.applied;
             memset(o, 0, sizeof *o);
             o->set_version = mv->set_version;
             o->epoch = mv->epoch;
@@ -2192,6 +2197,7 @@ static int rep_rec_get(struct rrec *o)
                 o->node[r] = node_by_id(mv->rep[r].node);
                 o->learner[r] = mv->rep[r].learner;
                 o->rid[r] = mv->rep[r].rid;
+                o->open_gen[r] = mv->rep[r].open_gen;
                 o->moving |= mv->rep[r].learner && mv->rep[r].replaces;
                 for (uint32_t j = 0; j < mv->nisr; j++)
                     o->isr_has[r] |= mv->isr[j] == mv->rep[r].node;
@@ -3332,6 +3338,22 @@ static int rep_follower_pick(void)
 
 static int hold_hi(int cap_ms) { return seconds * 200 < 5000 ? 5000 : seconds * 200 > cap_ms ? cap_ms : seconds * 200; }
 
+static int is_rep_node(int node)
+{
+    for (int r = 0; r < rep_n; r++)
+        if (rep_nodes[r] == node)
+            return 1;
+    return 0;
+}
+
+static uint64_t rrec_open_gen(const struct rrec *r, int node)
+{
+    for (int k = 0; k < r->nrep && k < META_REPLICAS_MAX; k++)
+        if (r->node[k] == node)
+            return r->open_gen[k];
+    return 0;
+}
+
 /* kill2: two servers SIGKILLed at once, restarted after 5 to 60 s (less in a short run). A volume may be unavailable
  * meanwhile; once both are back every acknowledged write must be there: the checks of the workload and the end. */
 static void nem_kill2(void)
@@ -3345,12 +3367,29 @@ static void nem_kill2(void)
         int r1 = rnd_range(0, rep_n - 1), r2 = (r1 + rnd_range(1, rep_n - 1)) % rep_n;
         a = rep_nodes[r1];
         b = rep_nodes[r2];
-        kill2_rep++;
     }
     for (int t = 0; t < 8 && (b < 0 || b == a); t++)
         b = pick_node(0);
     if (b < 0 || b == a)
         b = (a + rnd_range(1, nn - 1)) % nn;
+    int hit_rep = want_rep && is_rep_node(a) && is_rep_node(b);
+    if (hit_rep)
+        kill2_rep++;
+    uint64_t ga = 0, gb = 0;
+    if (hit_rep) {
+        struct rrec pre;
+        for (int t = 0; t < 25 && (ga == 0 || gb == 0); t++) {
+            check_unexpected_exits();
+            if (rep_rec_get(&pre) == 0) {
+                ga = rrec_open_gen(&pre, a);
+                gb = rrec_open_gen(&pre, b);
+            }
+            if (ga == 0 || gb == 0)
+                usleep(200000);
+        }
+        if (ga == 0 || gb == 0)
+            die(1, "kill2: could not read pre-kill open_gen for kvr replicas %d and %d", a, b);
+    }
     pid_t pa, pb;
     node_snap(a, &pa, NULL, NULL);
     node_snap(b, &pb, NULL, NULL);
@@ -3363,10 +3402,34 @@ static void nem_kill2(void)
     ev("kill2: nodes %d and %d", a, b);
     int hi = hold_hi(60000);
     hold_ms(rnd_range(hi < 5000 ? hi : 5000, hi));
+    uint64_t ok0 = atomic_load(&kv_ok);
     restart_node(a);
     if (!planted)
         restart_node(b);
     kill2_done++;
+    if (hit_rep && !planted) {
+        /* Wait for both restarted replicas to record their new open_gen and rejoin a whole ISR before the next round
+         * can kill two replicas again: otherwise settle() only checks metadata Raft convergence, and consecutive
+         * rounds in a 30 s run can kill kvr back-to-back before failover finishes reopening as writer. */
+        int whole = 0;
+        for (int64_t t0 = now_ms(); now_ms() - t0 < 60000; usleep(200000)) {
+            check_unexpected_exits();
+            struct rrec post;
+            uint64_t ver;
+            if (rep_rec_get(&post) == 0 && post.nrep == rep_n && !post.moving && rep_no_learners(&post) &&
+                post.leader >= 0 && rrec_open_gen(&post, a) > ga && rrec_open_gen(&post, b) > gb &&
+                rep_isr_mask(&ver) == rep_full_mask()) {
+                whole = 1;
+                break;
+            }
+        }
+        if (!whole)
+            die(1, "kill2: kvr did not recover with whole ISR 60 s after nodes %d and %d came back", a, b);
+        /* Let the writers acknowledge at least one write after recovery before the next round fires. */
+        for (int64_t t0 = now_ms(); atomic_load(&kv_run) && atomic_load(&kv_ok) == ok0 && now_ms() - t0 < 3000;
+             usleep(50000))
+            check_unexpected_exits();
+    }
 }
 
 /* The shim's answer for node i: its directory (the prefix the commands name) and the delay it is under. 0 or -1. */

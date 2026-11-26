@@ -644,7 +644,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc r4stubs addreplica setnext addswitch 
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
-    writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma
+    writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 

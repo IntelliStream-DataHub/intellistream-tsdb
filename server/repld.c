@@ -100,6 +100,7 @@
 #include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1658,6 +1659,31 @@ static void on_link(void *arg, struct plink *l, int up)
     (void)arg;
     if (up && G.snap_dial && plink_kind(l) == PL_KIND_SNAP) /* TSDB_REPLD_TEST=snapdial: one frame on the new link */
         plink_send(l, 1, "snapdial", 8, 0);
+    if (up && (plink_kind(l) == PL_KIND_LOG || plink_kind(l) == PL_KIND_BULK)) {
+        /* A replica waiting to retry a missing-part fetch wakes immediately when its leader's link comes up. */
+        uint32_t peer = plink_peer(l);
+        struct rvol *wake_vols[CLUSTER_REPORT_VOLS];
+        uint32_t nw = 0;
+        pthread_mutex_lock(&G.mu);
+        for (uint32_t i = 0; i < G.nvols && nw < CLUSTER_REPORT_VOLS; i++) {
+            G.vols[i]->refs++;
+            wake_vols[nw++] = G.vols[i];
+        }
+        pthread_mutex_unlock(&G.mu);
+        for (uint32_t i = 0; i < nw; i++) {
+            struct rvol *rv = wake_vols[i];
+            pthread_mutex_lock(&rv->mu);
+            int wake = 0;
+            if (rv->mode == M_REPLICA && rv->rec.leader == peer) {
+                rv->fetch_ms = 0;
+                wake = rv->fetch_wait_until != 0;
+            }
+            pthread_mutex_unlock(&rv->mu);
+            if (wake)
+                post(rv, IN_WAKE, 0, NULL, 0);
+            vol_put(rv);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ actions */
@@ -2435,24 +2461,29 @@ static void do_sync(struct rvol *rv)
         snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
         missing = 0;
     }
-    if (missing && (strcmp(name, rv->fetch_name) || now - rv->fetch_ms >= 1000)) {
+    bool fetch_tried = false, fetch_sent = false;
+    if (missing && (strcmp(name, rv->fetch_name) != 0 || rv->fetch_ms == 0 || now - rv->fetch_ms >= 1000)) {
+        fetch_tried = true;
         int ld = node_index(rv, rv->rec.leader);
         struct plink *l = ld >= 0 ? link_of(rv->rec.rep[ld].node, 0) : NULL;
         uint8_t b[RW_NAME_MAX + 24 + RW_CHECK];
         size_t n = rw_encode_fetch(b, sizeof b, rv->number, mpos, name);
-        if (l && n && strcmp(name, rv->fetch_name) != 0)
-            say("volume %" PRIu32 ": fetches %s (the marker at %" PRIu64 ") from node %" PRIu32, rv->number, name, mpos,
-                rv->rec.leader);
-        if (l && n)
-            plink_send(l, RW_T_FETCH, b, n, 0);
-        snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
-        rv->fetch_ms = now;
+        if (l && n && plink_send(l, RW_T_FETCH, b, n, 0) == PL_OK) {
+            if (strcmp(name, rv->fetch_name) != 0)
+                say("volume %" PRIu32 ": fetches %s (the marker at %" PRIu64 ") from node %" PRIu32, rv->number, name,
+                    mpos, rv->rec.leader);
+            snprintf(rv->fetch_name, sizeof rv->fetch_name, "%s", name);
+            rv->fetch_ms = now;
+            fetch_sent = true;
+        }
     }
     if (still_missing && rv->mode == M_REPLICA) {
-        /* Avoid busy-looping do_sync + flooding duplicate ACKs while waiting for a fetched file: IN_WAKE (on stage),
-         * new WAL appends/cuts, leader changes (IN_META), or the 1 s retry timer wake it. */
+        /* Avoid busy-looping do_sync + flooding duplicate ACKs while waiting for a fetched file: IN_WAKE (on stage or
+         * leader link reconnect), new WAL appends/cuts, leader changes (IN_META), or the retry timer wake it. */
         if (G.fetch_late && now < rv->fetch_late_ms + FETCH_LATE_MS) {
             rv->fetch_wait_until = rv->fetch_late_ms + FETCH_LATE_MS;
+        } else if (fetch_tried && !fetch_sent) {
+            rv->fetch_wait_until = now + 100;
         } else {
             uint64_t next = rv->fetch_ms + 1000;
             rv->fetch_wait_until = next > now ? next : now + 1000;
