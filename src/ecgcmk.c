@@ -47,18 +47,24 @@
 
 enum { GCMK_OP_ADD = 1, GCMK_OP_DONE = 2 };
 
+#ifdef TSDB_TEST_HOOKS
 /* Test hooks configured by TSDB_ECGC_TEST (parsed via ecgc_env_init). */
 static char test_crash_before_del[512];
 static char test_pause_beforedel[512];
 static atomic_bool test_crash_fired;
 static atomic_bool test_pause_fired;
+#endif
 
 void ecgcmk_test_opt(const char *tok)
 {
+#ifdef TSDB_TEST_HOOKS
     if (strncmp(tok, "crash_before_del=", 17) == 0)
         snprintf(test_crash_before_del, sizeof test_crash_before_del, "%s", tok + 17);
     else if (strncmp(tok, "pause_beforedel=", 16) == 0)
         snprintf(test_pause_beforedel, sizeof test_pause_beforedel, "%s", tok + 16);
+#else
+    (void)tok;
+#endif
 }
 
 static int64_t orphan_grace_ms(void)
@@ -833,6 +839,7 @@ static int append_and_apply_mkgc(eng *db, uint32_t reason, const uint8_t (*oids)
     return ecgcmk_apply(db, pos, &m);
 }
 
+#ifdef TSDB_TEST_HOOKS
 static void maybe_crash_before_del(eng *db)
 {
     if (test_crash_before_del[0] && access(test_crash_before_del, F_OK) == 0 &&
@@ -842,7 +849,7 @@ static void maybe_crash_before_del(eng *db)
     }
 }
 
-static void maybe_pause_before_del(eng *db)
+static bool maybe_pause_before_del(eng *db)
 {
     if (test_pause_beforedel[0] && access(test_pause_beforedel, F_OK) == 0 &&
         !atomic_exchange(&test_pause_fired, true)) {
@@ -852,8 +859,11 @@ static void maybe_pause_before_del(eng *db)
             nanosleep(&ts, NULL);
         }
         fprintf(stderr, "tsdb: %s: test: ecgc: resumed before CHUNK_DEL\n", db->dir);
+        return access(test_pause_beforedel, F_OK) != 0;
     }
+    return false;
 }
+#endif
 
 static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], uint64_t mk_pos)
 {
@@ -873,10 +883,24 @@ static int delete_cluster_object(eng *db, coldvol *cv, const uint8_t oid[16], ui
     for (unsigned pos = 0; pos < npos; pos++) {
         if (atomic_load(&g->stop) || eng_check(db))
             return TSDB_ERR_STOPPED;
-        if (pos == 0)
-            maybe_pause_before_del(db);
+#ifdef TSDB_TEST_HOOKS
+        bool paused = pos == 0 && maybe_pause_before_del(db);
+#endif
         int rc = cv->ops->del_gc ? cv->ops->del_gc(cv->ctx, oid, pos, epoch, mk_pos)
                                  : cv->ops->del(cv->ctx, oid, pos, epoch, COLD_DEL_MKGC);
+#ifdef TSDB_TEST_HOOKS
+        if (paused && rc == TSDB_ERR_UNAVAILABLE) {
+            /* After SIGSTOP/SIGCONT past peerlink dead_ms, the first send can hit a half-closed socket before the
+             * link reconnects; retry with the same old epoch so the remote store gets to evaluate and FENCE it. */
+            int64_t t0 = eng_mono_ms();
+            while (rc == TSDB_ERR_UNAVAILABLE && !eng_check(db) && eng_mono_ms() - t0 < 15000) {
+                struct timespec ts = {0, 100 * 1000000L};
+                nanosleep(&ts, NULL);
+                rc = cv->ops->del_gc ? cv->ops->del_gc(cv->ctx, oid, pos, epoch, mk_pos)
+                                     : cv->ops->del(cv->ctx, oid, pos, epoch, COLD_DEL_MKGC);
+            }
+        }
+#endif
         if (rc == CHUNK_ERR_FENCED) {
             fprintf(stderr,
                     "tsdb: %s: chunk delete of position %u at epoch %" PRIu64
@@ -909,7 +933,9 @@ static void process_pending(eng *db, coldvol *cv)
         return;
     }
 
+#ifdef TSDB_TEST_HOOKS
     maybe_crash_before_del(db);
+#endif
 
     uint8_t (*done)[16] = malloc(n * 16);
     if (!done) {

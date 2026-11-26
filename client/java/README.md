@@ -438,6 +438,7 @@ the latest `ErrorInfo` reply body, `topology()` returns the cluster's nodes and 
 `serverStatus()` returns the server's `key=value` status lines (superuser, protocol 13).
 
 ```java
+ConnectOptions opts = ConnectOptions.defaults().user("admin").passwordFile(Path.of("/tmp/tsdb-demo/password"));
 try (TsdbClient c = TsdbClient.connectNodes("127.0.0.1:7070,127.0.0.1:7071", opts)) {
     c.setRetry(Duration.ofSeconds(10));
     Topology topo = c.topology();

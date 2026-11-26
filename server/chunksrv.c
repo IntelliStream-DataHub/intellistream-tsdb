@@ -745,7 +745,8 @@ static void do_list(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn rep
     uint8_t *b = NULL;
     size_t bl = 0;
     if (rc == 0) {
-        qsort(lv.v, lv.n, sizeof *lv.v, lcmp);
+        if (lv.n > 1)
+            qsort(lv.v, lv.n, sizeof *lv.v, lcmp);
         size_t i = 0;
         if (r->has_cursor)
             while (i < lv.n && lcmp_key(lv.v[i].oid, lv.v[i].pos, r->oid, r->pos) <= 0)
@@ -1498,12 +1499,16 @@ static void wait_slice(struct chunksrv *cs, uint64_t deadline)
     pthread_cond_timedwait(&cs->ccv, &cs->cmu, &t);
 }
 
-static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t deadline)
+static int send_until(struct plink *l, const uint8_t *p, size_t n, uint64_t deadline, uint64_t *gen_out)
 {
     for (;;) {
-        int rc = plink_send(l, CS_T_REQ, p, n, 100);
-        if (rc == PL_OK)
+        uint64_t gen = plink_gen(l);
+        int rc = gen ? plink_send_gen(l, gen, CS_T_REQ, p, n, 100) : PL_E_DOWN;
+        if (rc == PL_OK) {
+            if (gen_out)
+                *gen_out = gen;
             return 0;
+        }
         if (rc != PL_E_DOWN && rc != PL_E_FULL)
             return -1;
         if (now_ns() >= deadline)
@@ -1530,10 +1535,23 @@ int chunksrv_call(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, in
     struct cs_pend *pd = pend_add(cs, q.rid, 1, q.op);
     if (!pd)
         return TSDB_ERR_NOMEM;
-    int ret = send_until(lc, buf, n, deadline) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
+    uint64_t gen = 0;
+    int ret = send_until(lc, buf, n, deadline, &gen) == 0 ? 0 : TSDB_ERR_UNAVAILABLE;
     pthread_mutex_lock(&cs->cmu);
-    while (ret == 0 && !pd->done && now_ns() < deadline)
+    while (ret == 0 && !pd->done && now_ns() < deadline) {
         wait_slice(cs, deadline);
+        if (pd->done)
+            break;
+        /* reply_link binds its response to the connection generation that carried the request; once that connection
+         * drops, no answer can arrive for this rid, so fail fast instead of hanging until deadline. */
+        pthread_mutex_unlock(&cs->cmu);
+        bool alive = plink_up(lc) && plink_gen(lc) == gen;
+        pthread_mutex_lock(&cs->cmu);
+        if (!pd->done && !alive) {
+            ret = TSDB_ERR_UNAVAILABLE;
+            break;
+        }
+    }
     if (ret == 0 && !pd->done)
         ret = TSDB_ERR_UNAVAILABLE;
     if (ret == 0) {
