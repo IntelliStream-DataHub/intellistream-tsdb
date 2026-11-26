@@ -2,14 +2,13 @@
 //! Columns in and out without work under the GIL.
 //!
 //! In: a C-contiguous buffer of the right element type in native byte order (a numpy array,
-//! `array.array`) is kept as a buffer export, which keeps the exporter from freeing or resizing
-//! it, and copied once with the GIL released, where the call uses it (`Col::snap`). The engine
-//! and the network only ever read that copy: another thread may write the array meanwhile
-//! (another Python thread, or numpy's own loops, which run without the GIL), and the engine
-//! reads some inputs twice (a series id checked, then used as an index), so reading the
-//! caller's memory in place could let it act on two different values of one element. Anything
-//! else (other dtypes, strided views, masked arrays, sequences, big-endian arrays) is converted
-//! into a Rust vector while the GIL is held, as before.
+//! `array.array`, or a typed `memoryview`) is snapshotted once into a Rust vector while the GIL
+//! is held, using byte-wise copying so arbitrary buffer alignments are safe and Python threads
+//! cannot race with the copy. The engine and the network only ever read that owned copy with the
+//! GIL released: the engine reads some inputs twice (a series id checked, then used as an index),
+//! so reading the caller's memory in place could let it act on two different values of one
+//! element. Anything else (other dtypes, strided views, masked arrays, sequences, big-endian
+//! arrays) is converted into a Rust vector while the GIL is held as well.
 //!
 //! Out: query results are vectors filled with the GIL released; numpy takes them over without a
 //! copy (`IntoPyArray`: the array's base owns the vector). Aggregates come back as `Buckets`, a
@@ -49,53 +48,50 @@ pub fn native<T: Element>(obj: &Bound<'_, PyAny>) -> Option<PyBuffer<T>> {
     }
 }
 
-/// A column kept as a Python buffer (copied where it is used), or converted into a vector.
+/// A column snapshotted into an owned vector while the GIL is held.
 pub enum Col<T: Element> {
-    Borrowed(PyBuffer<T>),
     Owned(Vec<T>),
 }
 
 impl<T: Element + Copy> Col<T> {
-    /// `obj` as a buffer of T: kept when C-contiguous, else copied; `None` for an object that
-    /// is not a native buffer of T.
+    /// `obj` copied into a vector of T while the GIL is held; `None` for an object that is not a
+    /// native buffer of T.
     pub fn buffer(obj: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
         match native::<T>(obj) {
-            Some(b) if b.is_c_contiguous() => Ok(Some(Col::Borrowed(b))),
+            Some(b) if b.is_c_contiguous() => {
+                let n = b.item_count();
+                if n == 0 {
+                    return Ok(Some(Col::Owned(Vec::new())));
+                }
+                let bytes = n.checked_mul(std::mem::size_of::<T>()).expect("buffer byte length fits in usize");
+                let mut v = Vec::<T>::with_capacity(n);
+                // SAFETY: `native()` verified element type and native byte order, `b.is_c_contiguous()`
+                // guarantees `bytes` contiguous readable bytes at `b.buf_ptr()`, `n > 0` guarantees
+                // non-null pointers, and copying as `*const u8` -> `*mut u8` has alignment requirement 1
+                // (safe for unaligned memoryview / numpy structured views). The copy runs while the GIL
+                // is held, preventing data races with Python threads mutating the buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b.buf_ptr() as *const u8, v.as_mut_ptr() as *mut u8, bytes);
+                    v.set_len(n);
+                }
+                Ok(Some(Col::Owned(v)))
+            }
             Some(b) => Ok(Some(Col::Owned(b.to_vec(obj.py())?))),
             None => Ok(None),
         }
     }
 
-    /// The column, read once: a buffer is copied (one memcpy). Call it where the column is
-    /// used, with the GIL released, and pass on only the result (see the file header).
+    /// The snapshotted column slice.
     pub fn snap(&self) -> Cow<'_, [T]> {
         match self {
             Col::Owned(v) => Cow::Borrowed(v),
-            Col::Borrowed(b) if b.item_count() == 0 => Cow::Owned(Vec::new()),
-            Col::Borrowed(b) => {
-                let n = b.item_count();
-                let mut v = Vec::<T>::with_capacity(n);
-                // SAFETY: native() checked the element type and alignment, and buffer() keeps only
-                // a C-contiguous buffer, so it holds n Ts at buf_ptr(); the export lasts as long as
-                // self, so the exporter can neither free nor resize it. The bytes are copied through
-                // raw pointers, never a reference into memory another thread may be writing; a racing
-                // write leaves an element old, new or torn, each a valid i64, u32, f32 or f64.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(b.buf_ptr() as *const T, v.as_mut_ptr(), n);
-                    v.set_len(n);
-                }
-                Cow::Owned(v)
-            }
         }
     }
 
-    /// The first element, read once.
+    /// The first element, if any.
     pub fn first(&self) -> Option<T> {
         match self {
             Col::Owned(v) => v.first().copied(),
-            Col::Borrowed(b) if b.item_count() == 0 => None,
-            // SAFETY: as in snap(), for one element
-            Col::Borrowed(b) => Some(unsafe { std::ptr::read(b.buf_ptr() as *const T) }),
         }
     }
 }
