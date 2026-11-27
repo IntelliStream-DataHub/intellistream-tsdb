@@ -2980,6 +2980,66 @@ static void test_r13_meta(void)
         ((struct meta_member *)meta_member(&bad, 3))->capability = META_CAP_BOTH;
         CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
         meta_free(&bad);
+
+        /* (f) Log replica placed on a --role storage member (even with NVMe disks or 0 disks; R13 r13-place) */
+        {
+            struct meta_state mrole;
+            meta_copy(&mrole, &m);
+            meta_op_member_role(&e, 4, META_ROLE_STORAGE); /* node 4 has NVMe(LOG|CHUNK), narrowed to storage */
+            meta_op_member_role(&e, 6, META_ROLE_STORAGE); /* node 6 has 0 disks, narrowed to storage */
+            CHECK(apply1(&mrole, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK);
+
+            /* Planted REPLICA_ADD on storage-role node 4 (has NVMe, but role forbids compute) */
+            meta_copy(&bad, &mrole);
+            struct meta_volume *vb = (struct meta_volume *)meta_volume(&bad, 1);
+            CHECK(vb != NULL && vb->nrep < META_REPLICAS_MAX);
+            if (vb && vb->nrep < META_REPLICAS_MAX) {
+                vb->rep[vb->nrep++] = (struct meta_replica){.node = 4, .learner = 1, .rid = 99991};
+                vb->set_version++;
+                CHECK(meta_check_step(&mrole, &bad, why, sizeof why) != 0 && strstr(why, "without compute capability"));
+            }
+            meta_free(&bad);
+
+            /* Planted REPLICA_ADD on storage-role node 6 (ndisks == 0, but role forbids compute) */
+            meta_copy(&bad, &mrole);
+            vb = (struct meta_volume *)meta_volume(&bad, 0);
+            CHECK(vb != NULL && vb->nrep < META_REPLICAS_MAX);
+            if (vb && vb->nrep < META_REPLICAS_MAX) {
+                vb->rep[vb->nrep++] = (struct meta_replica){.node = 6, .learner = 1, .rid = 99992};
+                vb->set_version++;
+                CHECK(meta_check_step(&mrole, &bad, why, sizeof why) != 0 && strstr(why, "without compute capability"));
+            }
+            meta_free(&bad);
+
+            /* Planted duplicate log replica on the same node (distinct rids -> violates one replica per node) */
+            meta_copy(&bad, &mrole);
+            vb = (struct meta_volume *)meta_volume(&bad, 1);
+            CHECK(vb != NULL && vb->nrep < META_REPLICAS_MAX);
+            if (vb && vb->nrep < META_REPLICAS_MAX) {
+                uint32_t dup_node = vb->rep[0].node;
+                vb->rep[vb->nrep++] = (struct meta_replica){.node = dup_node, .learner = 0, .rid = 99993};
+                vb->set_version++;
+                CHECK(meta_check_step(&mrole, &bad, why, sizeof why) != 0);
+                /* Also bypass one_set_op (e.g. multi-op entry raising set_version by 2): caught by duplicate-node check */
+                vb->set_version++;
+                CHECK(meta_check_step(&mrole, &bad, why, sizeof why) != 0 && strstr(why, "holds two replicas"));
+            }
+            meta_free(&bad);
+
+            /* Planted EC stripe position on compute-only member 5 (log-only NVMe) */
+            meta_copy(&bad, &mrole);
+            struct meta_volume *vec = (struct meta_volume *)meta_volume(&bad, 2);
+            CHECK(vec != NULL && vec->redundancy == META_RED_EC && vec->nstripe >= 3);
+            if (vec && vec->redundancy == META_RED_EC && vec->nstripe >= 3) {
+                vec->stripe[2] = 5;
+                vec->stripe_version++;
+                vec->stripe_pos[2].set_ver = vec->stripe_version;
+                CHECK(meta_check_step(&mrole, &bad, why, sizeof why) != 0 && strstr(why, "without storage capability"));
+            }
+            meta_free(&bad);
+
+            meta_free(&mrole);
+        }
     }
 
     meta_entry_free(&e);

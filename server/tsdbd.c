@@ -3430,6 +3430,9 @@ static void handle_status(req *r)
             if (m.tier != MARGIN_TIER_NONE)
                 ST_PUT("vol.%u.settled_margin=%d\nvol.%u.tier=%s\n", (unsigned)v->number, m.settled,
                        (unsigned)v->number, margin_tier_name(m.tier));
+            if (v->redundancy == META_RED_EC && cluster_copy_stripe_mixed(cp, v))
+                ST_PUT("vol.%u.mixed_class=1\nhealth.mixed_class.vol.%u=%s\n", (unsigned)v->number,
+                       (unsigned)v->number, v->name);
             ST_PUT("vol.%u.full=%d\nvol.%u.full_refusals=%llu\n", (unsigned)v->number, repld_full(v->number),
                    (unsigned)v->number, (unsigned long long)repld_full_refusals(v->number));
         }

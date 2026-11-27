@@ -4481,10 +4481,13 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                 FAIL("volume %u: replica %u is marked unanswered but not in the ISR", b->number, b->rep[j].node);
             if (b->rep[j].learner && meta_volume_in_isr(b, b->rep[j].node))
                 FAIL("volume %u: learner %u is in the ISR", b->number, b->rep[j].node);
-            for (uint32_t k = 0; k < j && b->kind == META_VOL_REPLICATED; k++)
-                if (b->rep[k].rid == b->rep[j].rid)
+            for (uint32_t k = 0; k < j; k++) {
+                if (b->rep[k].node == b->rep[j].node)
+                    FAIL("volume %u: node %u holds two replicas (%u and %u)", b->number, b->rep[j].node, k, j);
+                if (b->kind == META_VOL_REPLICATED && b->rep[k].rid == b->rep[j].rid)
                     FAIL("volume %u: replicas %u and %u share instance %llu", b->number, b->rep[k].node,
                          b->rep[j].node, (unsigned long long)b->rep[j].rid);
+            }
             if (b->kind == META_VOL_REPLICATED && !b->rep[j].rid)
                 FAIL("volume %u: replica %u has no instance", b->number, b->rep[j].node);
             /* R13 (E49, E50, D15): a newly placed log replica must land on a compute-capable member (or one with 0

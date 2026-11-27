@@ -47,6 +47,7 @@ void place_settings_default(struct place_settings *s)
         .out_guard_pct = 25,
         .out_guard_hold_s = 7200,
         .repl_retain_down_gb = 64,
+        .young_move_pct = 80,
         .young_high_pct = 90,
         .balance_mb_s = 0,
         .rebuild_concurrency = 4,
@@ -133,6 +134,12 @@ int place_mutant_parse(const char *name)
         return PLACE_MUT_FAILSTOP_SLOW;
     if (!strcmp(name, "balanceunbounded"))
         return PLACE_MUT_BALANCE_UNBOUNDED;
+    if (!strcmp(name, "loghdd"))
+        return PLACE_MUT_LOG_HDD;
+    if (!strcmp(name, "mixstripe"))
+        return PLACE_MUT_MIX_STRIPE;
+    if (!strcmp(name, "placefull"))
+        return PLACE_MUT_PLACE_FULL;
     return -1;
 }
 
@@ -217,6 +224,344 @@ static int member_placeable(const struct place_in *in, const struct meta_member 
     return member_heard_fresh(in, mb->id);
 }
 
+/* ------------------------------------------------------------------ R13 capability, class & fill helpers */
+
+static uint64_t sat_add_u64(uint64_t a, uint64_t b)
+{
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint32_t effective_young_move_pct(const struct place_in *in)
+{
+    if (in && in->set.young_move_pct)
+        return in->set.young_move_pct;
+    if (in && in->sm && in->sm->set.young_move_pct)
+        return in->sm->set.young_move_pct;
+    return 80u;
+}
+
+static const struct place_disk_usage *find_disk_usage(const struct place_member *pm, const uint8_t store_id[16])
+{
+    if (!pm || !pm->disks || pm->ndisks == 0)
+        return NULL;
+    for (uint32_t i = 0; i < pm->ndisks; i++)
+        if (memcmp(pm->disks[i].store_id, store_id, 16) == 0)
+            return &pm->disks[i];
+    return NULL;
+}
+
+uint8_t place_disks_chunk_class(const struct meta_disk *disks, uint32_t ndisks)
+{
+    if (!disks || ndisks == 0)
+        return META_DISK_NONE;
+    uint8_t cls = META_DISK_NONE;
+    for (uint32_t i = 0; i < ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &disks[i];
+        if (d->state != META_STORE_UP || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        if (d->disk_class > cls)
+            cls = d->disk_class; /* HDD(3) > SSD(2) > NVME(1) */
+    }
+    if (cls != META_DISK_NONE)
+        return cls;
+    /* Fallback to non-DESTROYED chunk disks so transient store DOWN does not erase class identity in STATUS. */
+    for (uint32_t i = 0; i < ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &disks[i];
+        if (d->state == META_STORE_DESTROYED || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        if (d->disk_class > cls)
+            cls = d->disk_class;
+    }
+    return cls;
+}
+
+uint8_t place_member_chunk_class(const struct meta_member *mb)
+{
+    return mb ? place_disks_chunk_class(mb->disks, mb->ndisks) : META_DISK_NONE;
+}
+
+int place_stripe_mixed_class(const struct meta_state *sm, const struct meta_volume *v)
+{
+    if (!sm || !v || v->redundancy != META_RED_EC)
+        return 0;
+    uint32_t active = (uint32_t)v->ec_k + v->ec_m;
+    if (active > v->nstripe)
+        active = v->nstripe;
+    if (active > META_STRIPE_MAX)
+        active = META_STRIPE_MAX;
+    uint8_t first = META_DISK_NONE;
+    for (uint32_t p = 0; p < active; p++) {
+        const struct meta_member *mb = meta_member(sm, v->stripe[p]);
+        uint8_t cls = place_member_chunk_class(mb);
+        if (cls == META_DISK_NONE)
+            continue;
+        if (first == META_DISK_NONE)
+            first = cls;
+        else if (cls != first)
+            return 1;
+    }
+    return 0;
+}
+
+/* Compute cluster-wide chunk store fill mark in ppm (0..1000000) per §5.6 / E53:
+ *   mark = full * (1 - largest_domain_share), with full = 95% (950000 ppm; rebuilds may use up to full),
+ *   fallback 90% if only 1 failure domain exists. */
+static uint64_t chunk_fill_mark_ppm(const struct place_in *in)
+{
+    if (!in || !in->sm || in->sm->nmembers == 0)
+        return 900000ull;
+    const struct meta_state *sm = in->sm;
+    uint32_t nm = sm->nmembers;
+    int all_racked = 1;
+    uint64_t total_cap = 0;
+    uint32_t nstorage = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *mb = &sm->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        const struct place_member *pm = find_pm(in, mb->id);
+        uint64_t mcap = 0;
+        for (uint32_t d = 0; d < mb->ndisks && d < META_DISKS_MAX; d++) {
+            const struct meta_disk *dk = &mb->disks[d];
+            if (dk->state != META_STORE_UP || !(dk->uses & META_DISK_USE_CHUNK))
+                continue;
+            const struct place_disk_usage *du = find_disk_usage(pm, dk->store_id);
+            uint64_t sz = (du && du->size_bytes > 0) ? du->size_bytes : dk->size_bytes;
+            mcap = sat_add_u64(mcap, sz);
+        }
+        if (mcap == 0)
+            continue;
+        nstorage++;
+        total_cap = sat_add_u64(total_cap, mcap);
+        if (!mb->rack[0])
+            all_racked = 0;
+    }
+    if (total_cap == 0 || nstorage <= 1)
+        return 900000ull;
+    uint64_t max_dom = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *mb = &sm->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        uint64_t dcap = 0;
+        if (all_racked) {
+            /* Sum every storage member sharing mb->rack (only once per distinct rack). */
+            int seen = 0;
+            for (uint32_t j = 0; j < i; j++) {
+                if (sm->members[j].state < META_OUT && sm->members[j].role != META_ROLE_COMPUTE &&
+                    sm->members[j].ndisks > 0 && !strcmp(sm->members[j].rack, mb->rack)) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (seen)
+                continue;
+            for (uint32_t j = i; j < nm; j++) {
+                const struct meta_member *mj = &sm->members[j];
+                if (mj->state >= META_OUT || mj->role == META_ROLE_COMPUTE || mj->ndisks == 0 ||
+                    strcmp(mj->rack, mb->rack) != 0)
+                    continue;
+                const struct place_member *pm = find_pm(in, mj->id);
+                for (uint32_t d = 0; d < mj->ndisks && d < META_DISKS_MAX; d++) {
+                    const struct meta_disk *dk = &mj->disks[d];
+                    if (dk->state != META_STORE_UP || !(dk->uses & META_DISK_USE_CHUNK))
+                        continue;
+                    const struct place_disk_usage *du = find_disk_usage(pm, dk->store_id);
+                    uint64_t sz = (du && du->size_bytes > 0) ? du->size_bytes : dk->size_bytes;
+                    dcap = sat_add_u64(dcap, sz);
+                }
+            }
+        } else {
+            const struct place_member *pm = find_pm(in, mb->id);
+            for (uint32_t d = 0; d < mb->ndisks && d < META_DISKS_MAX; d++) {
+                const struct meta_disk *dk = &mb->disks[d];
+                if (dk->state != META_STORE_UP || !(dk->uses & META_DISK_USE_CHUNK))
+                    continue;
+                const struct place_disk_usage *du = find_disk_usage(pm, dk->store_id);
+                uint64_t sz = (du && du->size_bytes > 0) ? du->size_bytes : dk->size_bytes;
+                dcap = sat_add_u64(dcap, sz);
+            }
+        }
+        if (dcap > max_dom)
+            max_dom = dcap;
+    }
+    if (max_dom >= total_cap)
+        return 900000ull;
+    return (uint64_t)(((__uint128_t)950000ull * (total_cap - max_dom)) / total_cap);
+}
+
+static int member_log_eval(const struct place_in *in, const struct meta_member *mb, uint64_t add_bytes, int *fast_out,
+                           uint64_t *young_ppm_out, const char **why_out)
+{
+    if (fast_out)
+        *fast_out = 1;
+    if (young_ppm_out)
+        *young_ppm_out = 0;
+    if (!in || !in->sm || !mb) {
+        if (why_out)
+            *why_out = "unknown member";
+        return 0;
+    }
+    int has_fast = (mb->ndisks == 0) || meta_member_has_fast_disk(mb);
+    if (fast_out)
+        *fast_out = has_fast;
+    if (in->mutant != PLACE_MUT_LOG_HDD) {
+        if (mb->role == META_ROLE_STORAGE) {
+            if (why_out)
+                *why_out = "the node's role is storage-only";
+            return 0;
+        }
+        if (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_COMPUTE)) {
+            if (why_out)
+                *why_out = "the node is not compute-capable";
+            return 0;
+        }
+    }
+    if (mb->ndisks == 0)
+        return 1;
+
+    uint32_t mark = effective_young_move_pct(in);
+    const struct place_member *pm = find_pm(in, mb->id);
+    /* has_fast == meta_member_has_fast_disk(mb) here since mb->ndisks > 0. */
+    int use_fast = has_fast;
+    uint32_t n_elig = 0, n_avail = 0;
+    int have_ppm = 0;
+    uint64_t best_ppm = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP)
+            continue;
+        if (use_fast) {
+            if (!meta_disk_class_fast(d->disk_class))
+                continue;
+        } else if (in->sm->set.log_on_hdd || in->mutant == PLACE_MUT_LOG_HDD) {
+            if (d->disk_class != META_DISK_HDD)
+                continue;
+        } else {
+            continue;
+        }
+        n_elig++;
+        const struct place_disk_usage *du = find_disk_usage(pm, d->store_id);
+        if (!du || !du->have_usage || du->size_bytes == 0) {
+            n_avail++;
+            continue;
+        }
+        /* E53 / §15.4: young marks on a shared disk (LOG|CHUNK) are of the room its chunks leave. */
+        uint64_t denom = du->size_bytes;
+        if ((d->uses & META_DISK_USE_CHUNK) && du->chunk_bytes > 0)
+            denom = du->size_bytes > du->chunk_bytes ? du->size_bytes - du->chunk_bytes : 0;
+        uint64_t proj = sat_add_u64(du->young_bytes, add_bytes);
+        int full = (denom == 0) || ((__uint128_t)proj * 100u >= (__uint128_t)mark * denom);
+        uint64_t ppm = denom ? (uint64_t)(((__uint128_t)proj * 1000000ull) / denom) : 1000000ull;
+        if (ppm > 1000000ull)
+            ppm = 1000000ull;
+        if (!full || in->mutant == PLACE_MUT_PLACE_FULL) {
+            n_avail++;
+            if (!have_ppm || ppm < best_ppm) {
+                best_ppm = ppm;
+                have_ppm = 1;
+            }
+        }
+    }
+    if (n_elig > 0 && n_avail == 0) {
+        if (why_out)
+            *why_out = "all eligible fast disks are at or above young_move_pct";
+        return 0;
+    }
+    if (have_ppm && young_ppm_out)
+        *young_ppm_out = best_ppm;
+    return 1;
+}
+
+int place_member_log_ok(const struct place_in *in, const struct meta_member *mb, uint64_t add_bytes,
+                        const char **why_out)
+{
+    return member_log_eval(in, mb, add_bytes, NULL, NULL, why_out);
+}
+
+static int member_stripe_eval(const struct place_in *in, const struct meta_member *mb, int is_rebuild,
+                              uint64_t mark_ppm, uint64_t *chunk_ppm_out, const char **why_out)
+{
+    if (chunk_ppm_out)
+        *chunk_ppm_out = 0;
+    if (!in || !in->sm || !mb) {
+        if (why_out)
+            *why_out = "unknown member";
+        return 0;
+    }
+    if (mb->role == META_ROLE_COMPUTE) {
+        if (why_out)
+            *why_out = "the node's role is compute-only";
+        return 0;
+    }
+    if (mb->ndisks > 0 && !(meta_member_effective_cap(mb) & META_CAP_STORAGE)) {
+        if (why_out)
+            *why_out = "the node is not storage-capable";
+        return 0;
+    }
+    if (member_chunk_stores(in, mb->id) == 0) {
+        if (why_out)
+            *why_out = "the node has no chunk stores up";
+        return 0;
+    }
+    if (mb->ndisks == 0)
+        return 1;
+
+    uint64_t eff_mark = is_rebuild ? 950000ull : mark_ppm;
+    const struct place_member *pm = find_pm(in, mb->id);
+    uint32_t n_elig = 0, n_avail = 0;
+    int have_ppm = 0;
+    uint64_t best_ppm = 0;
+    for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+        const struct meta_disk *d = &mb->disks[i];
+        if (d->state != META_STORE_UP || !(d->uses & META_DISK_USE_CHUNK))
+            continue;
+        n_elig++;
+        const struct place_disk_usage *du = find_disk_usage(pm, d->store_id);
+        if (!du || !du->have_usage || du->size_bytes == 0) {
+            n_avail++;
+            continue;
+        }
+        uint64_t cppm = (uint64_t)(((__uint128_t)du->chunk_bytes * 1000000ull) / du->size_bytes);
+        if (cppm > 1000000ull)
+            cppm = 1000000ull;
+        int full = (cppm >= eff_mark);
+        /* Shared disk (LOG|CHUNK) young reserve (E50, §15.4): keep >= max(10% of size, 2 * young_bytes;
+         * uses current young_bytes until r13-fill reports the 7-day peak). A member remains eligible while
+         * at least one UP chunk store is below the mark (r13-fill / chunksrv steers puts away from full stores). */
+        if (!full && !is_rebuild && (d->uses & META_DISK_USE_LOG)) {
+            uint64_t reserve = du->size_bytes / 10u;
+            uint64_t y2 = du->young_bytes > (UINT64_MAX / 2u) ? UINT64_MAX : du->young_bytes * 2u;
+            if (y2 > reserve)
+                reserve = y2;
+            if (du->size_bytes <= du->chunk_bytes || (du->size_bytes - du->chunk_bytes) < reserve)
+                full = 1;
+        }
+        if (!full || in->mutant == PLACE_MUT_PLACE_FULL) {
+            n_avail++;
+            if (!have_ppm || cppm < best_ppm) {
+                best_ppm = cppm;
+                have_ppm = 1;
+            }
+        }
+    }
+    if (n_elig > 0 && n_avail == 0) {
+        if (why_out)
+            *why_out = "all chunk stores are past the fill mark";
+        return 0;
+    }
+    if (have_ppm && chunk_ppm_out)
+        *chunk_ppm_out = best_ppm;
+    return 1;
+}
+
+int place_member_stripe_ok(const struct place_in *in, const struct meta_member *mb, int is_rebuild,
+                           const char **why_out)
+{
+    uint64_t mark_ppm = is_rebuild ? 950000ull : chunk_fill_mark_ppm(in);
+    return member_stripe_eval(in, mb, is_rebuild, mark_ppm, NULL, why_out);
+}
+
 static int vol_has_rep(const struct meta_volume *v, uint32_t node)
 {
     for (uint32_t i = 0; i < v->nrep; i++)
@@ -293,21 +638,29 @@ int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes)
     uint32_t *cand = calloc(nm, sizeof *cand);
     uint32_t *leads = calloc(nm, sizeof *leads);
     uint32_t *holds = calloc(nm, sizeof *holds);
+    uint8_t *fast = calloc(nm, sizeof *fast);
+    uint64_t *yppm = calloc(nm, sizeof *yppm);
     uint8_t *used = calloc(nm, sizeof *used);
     uint32_t *log_pairs = calloc((size_t)nm * nm, sizeof *log_pairs);
-    if (!cand || !leads || !holds || !used || !log_pairs) {
+    if (!cand || !leads || !holds || !fast || !yppm || !used || !log_pairs) {
         free(cand);
         free(leads);
         free(holds);
+        free(fast);
+        free(yppm);
         free(used);
         free(log_pairs);
         return -1;
     }
     build_pair_matrices(sm, log_pairs, NULL);
-    uint32_t nc = 0;
+    uint32_t nc = 0, nfast = 0;
     for (uint32_t i = 0; i < nm; i++) {
         const struct meta_member *mb = &sm->members[i];
         if (!member_placeable(in, mb))
+            continue;
+        int is_fast = 1;
+        uint64_t ppm = 0;
+        if (!member_log_eval(in, mb, 0, &is_fast, &ppm, NULL))
             continue;
         for (uint32_t v = 0; v < sm->nvolumes; v++) {
             const struct meta_volume *mv = &sm->volumes[v];
@@ -317,20 +670,30 @@ int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes)
                     leads[nc] += (k == 0);
                 }
         }
+        fast[nc] = (uint8_t)(is_fast != 0);
+        yppm[nc] = ppm;
+        nfast += fast[nc];
         cand[nc++] = i;
     }
     int rc = -1;
     if (nc < n)
         goto done;
+    /* E50: with log_on_hdd, HDD-only servers are used only when fewer than n fast servers qualify. */
+    int fast_only = (in->mutant != PLACE_MUT_LOG_HDD && nfast >= n);
     int racks = (in->mutant != PLACE_MUT_RACK_IGNORED);
-    for (uint32_t i = 0; i < nc && racks; i++)
+    for (uint32_t i = 0; i < nc && racks; i++) {
+        if (fast_only && !fast[i])
+            continue;
         if (!sm->members[cand[i]].rack[0])
             racks = 0;
+    }
     int32_t picked_mi[META_REPLICAS_MAX];
     for (uint32_t k = 0; k < n; k++) {
         int best = -1;
         uint32_t best_rack = UINT32_MAX, best_pairs = UINT32_MAX;
         for (uint32_t i = 0; i < nc; i++) {
+            if (fast_only && !fast[i])
+                continue;
             if (in->mutant == PLACE_MUT_TWO_PER_SERVER && k > 0) {
                 /* Planted mutant: intentionally pick an already-used server if one exists. */
                 if (!used[i])
@@ -351,6 +714,8 @@ int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes)
             int better = 0;
             if (best < 0) {
                 better = 1;
+            } else if (in->mutant != PLACE_MUT_LOG_HDD && fast[i] != fast[best]) {
+                better = fast[i] > fast[best];
             } else if (rack_used != best_rack) {
                 better = rack_used < best_rack;
             } else if (k == 0) {
@@ -358,11 +723,15 @@ int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes)
                     better = leads[i] < leads[best];
                 else if (holds[i] != holds[best])
                     better = holds[i] < holds[best];
+                else if (yppm[i] != yppm[best])
+                    better = yppm[i] < yppm[best];
                 else
                     better = mb->id < sm->members[cand[best]].id;
             } else {
                 if (holds[i] != holds[best])
                     better = holds[i] < holds[best];
+                else if (yppm[i] != yppm[best])
+                    better = yppm[i] < yppm[best];
                 else if (pairs != best_pairs)
                     better = pairs < best_pairs;
                 else
@@ -386,60 +755,29 @@ done:
     free(cand);
     free(leads);
     free(holds);
+    free(fast);
+    free(yppm);
     free(used);
     return rc;
 }
 
-int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint32_t *qualify)
+static int stripe_pick_greedy(const struct place_in *in, const uint32_t *cand, const uint32_t *holds,
+                              const uint64_t *cppm, const uint8_t *ccls, uint32_t nc, uint8_t filter_cls, int racks,
+                              const uint32_t *stripe_pairs, uint32_t ns, uint32_t *out_stripe, uint32_t *max_rack_out)
 {
-    if (qualify)
-        *qualify = 0;
-    if (!in || !in->sm || !stripe || ns == 0 || ns > META_STRIPE_MAX)
-        return -1;
     const struct meta_state *sm = in->sm;
     uint32_t nm = sm->nmembers;
-    if (nm == 0)
+    uint8_t *used = calloc(nc, sizeof *used);
+    if (!used)
         return -1;
-    uint32_t *cand = calloc(nm, sizeof *cand);
-    uint32_t *holds = calloc(nm, sizeof *holds);
-    uint8_t *used = calloc(nm, sizeof *used);
-    uint32_t *stripe_pairs = calloc((size_t)nm * nm, sizeof *stripe_pairs);
-    if (!cand || !holds || !used || !stripe_pairs) {
-        free(cand);
-        free(holds);
-        free(used);
-        free(stripe_pairs);
-        return -1;
-    }
-    build_pair_matrices(sm, NULL, stripe_pairs);
-    uint32_t nc = 0;
-    for (uint32_t i = 0; i < nm; i++) {
-        const struct meta_member *mb = &sm->members[i];
-        if (!member_placeable(in, mb))
-            continue;
-        if (member_chunk_stores(in, mb->id) == 0)
-            continue;
-        for (uint32_t v = 0; v < sm->nvolumes; v++) {
-            const struct meta_volume *mv = &sm->volumes[v];
-            for (uint32_t k = 0; k < mv->nstripe && k < META_STRIPE_MAX; k++)
-                holds[nc] += (mv->stripe[k] == mb->id);
-        }
-        cand[nc++] = i;
-    }
-    if (qualify)
-        *qualify = nc;
-    int rc = -1;
-    if (nc < ns)
-        goto done;
-    int racks = (in->mutant != PLACE_MUT_RACK_IGNORED);
-    for (uint32_t i = 0; i < nc && racks; i++)
-        if (!sm->members[cand[i]].rack[0])
-            racks = 0;
     int32_t picked_mi[META_STRIPE_MAX];
+    int rc = -1;
     for (uint32_t k = 0; k < ns; k++) {
         int best = -1;
         uint32_t best_rack = UINT32_MAX, best_pairs = UINT32_MAX;
         for (uint32_t i = 0; i < nc; i++) {
+            if (filter_cls && ccls[i] != filter_cls)
+                continue;
             if (in->mutant == PLACE_MUT_TWO_PER_SERVER && k > 0) {
                 if (!used[i])
                     continue;
@@ -463,6 +801,8 @@ int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint3
                 better = rack_cnt < best_rack;
             } else if (holds[i] != holds[best]) {
                 better = holds[i] < holds[best];
+            } else if (cppm[i] != cppm[best]) {
+                better = cppm[i] < cppm[best];
             } else if (pairs != best_pairs) {
                 better = pairs < best_pairs;
             } else {
@@ -478,14 +818,127 @@ int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint3
             goto done;
         used[best] = 1;
         picked_mi[k] = (int32_t)cand[best];
-        stripe[k] = sm->members[cand[best]].id;
+        out_stripe[k] = sm->members[cand[best]].id;
     }
+    if (max_rack_out) {
+        uint32_t mx = 0;
+        if (racks) {
+            for (uint32_t a = 0; a < ns; a++) {
+                uint32_t cnt = 0;
+                for (uint32_t b = 0; b < ns; b++)
+                    if (!strcmp(sm->members[picked_mi[a]].rack, sm->members[picked_mi[b]].rack))
+                        cnt++;
+                if (cnt > mx)
+                    mx = cnt;
+            }
+        }
+        *max_rack_out = mx;
+    }
+    rc = 0;
+done:
+    free(used);
+    return rc;
+}
+
+int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint32_t *qualify)
+{
+    if (qualify)
+        *qualify = 0;
+    if (!in || !in->sm || !stripe || ns == 0 || ns > META_STRIPE_MAX)
+        return -1;
+    const struct meta_state *sm = in->sm;
+    uint32_t nm = sm->nmembers;
+    if (nm == 0)
+        return -1;
+    uint32_t *cand = calloc(nm, sizeof *cand);
+    uint32_t *holds = calloc(nm, sizeof *holds);
+    uint64_t *cppm = calloc(nm, sizeof *cppm);
+    uint8_t *ccls = calloc(nm, sizeof *ccls);
+    uint32_t *stripe_pairs = calloc((size_t)nm * nm, sizeof *stripe_pairs);
+    if (!cand || !holds || !cppm || !ccls || !stripe_pairs) {
+        free(cand);
+        free(holds);
+        free(cppm);
+        free(ccls);
+        free(stripe_pairs);
+        return -1;
+    }
+    build_pair_matrices(sm, NULL, stripe_pairs);
+    uint64_t mark_ppm = chunk_fill_mark_ppm(in);
+    uint32_t nc = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        const struct meta_member *mb = &sm->members[i];
+        if (!member_placeable(in, mb))
+            continue;
+        uint64_t ppm = 0;
+        if (!member_stripe_eval(in, mb, 0, mark_ppm, &ppm, NULL))
+            continue;
+        for (uint32_t v = 0; v < sm->nvolumes; v++) {
+            const struct meta_volume *mv = &sm->volumes[v];
+            for (uint32_t k = 0; k < mv->nstripe && k < META_STRIPE_MAX; k++)
+                holds[nc] += (mv->stripe[k] == mb->id);
+        }
+        cppm[nc] = ppm;
+        ccls[nc] = place_member_chunk_class(mb);
+        cand[nc++] = i;
+    }
+    if (qualify)
+        *qualify = nc;
+    int rc = -1;
+    if (nc < ns)
+        goto done;
+    int racks = (in->mutant != PLACE_MUT_RACK_IGNORED);
+    for (uint32_t i = 0; i < nc && racks; i++)
+        if (!sm->members[cand[i]].rack[0])
+            racks = 0;
+
+    uint32_t all_stripe[META_STRIPE_MAX];
+    uint32_t all_max_rack = 0;
+    if (stripe_pick_greedy(in, cand, holds, cppm, ccls, nc, 0, racks, stripe_pairs, ns, all_stripe, &all_max_rack) != 0)
+        goto done;
+
+    /* E50 / E51 / §15.3: prefer a single-class stripe group (by chunk-use disks) when k + m members of one class
+     * pass E9's rules (distinct servers and same rack spread); capacity class (HDD) before SSD before NVMe. */
+    if (in->mutant != PLACE_MUT_MIX_STRIPE) {
+        static const uint8_t cls_order[3] = {META_DISK_HDD, META_DISK_SSD, META_DISK_NVME};
+        int have_single = 0;
+        uint32_t best_cls_rack = UINT32_MAX;
+        uint32_t best_cls_stripe[META_STRIPE_MAX];
+        for (size_t ci = 0; ci < 3; ci++) {
+            uint8_t cls = cls_order[ci];
+            uint32_t cnt = 0;
+            for (uint32_t i = 0; i < nc; i++)
+                cnt += (ccls[i] == cls);
+            if (cnt < ns)
+                continue;
+            uint32_t cur_stripe[META_STRIPE_MAX];
+            uint32_t cur_rack = 0;
+            if (stripe_pick_greedy(in, cand, holds, cppm, ccls, nc, cls, racks, stripe_pairs, ns, cur_stripe,
+                                   &cur_rack) != 0)
+                continue;
+            if (racks && cur_rack > all_max_rack)
+                continue; /* single class would sacrifice E9 rack spread: allow mixed fallback */
+            if (!have_single || cur_rack < best_cls_rack) {
+                have_single = 1;
+                best_cls_rack = cur_rack;
+                memcpy(best_cls_stripe, cur_stripe, ns * sizeof(uint32_t));
+            }
+        }
+        if (have_single) {
+            memcpy(stripe, best_cls_stripe, ns * sizeof(uint32_t));
+            rc = 0;
+            goto done;
+        }
+    }
+
+    memcpy(stripe, all_stripe, ns * sizeof(uint32_t));
     rc = 0;
 done:
     free(stripe_pairs);
     free(cand);
     free(holds);
-    free(used);
+    free(cppm);
+    free(ccls);
     return rc;
 }
 
@@ -628,9 +1081,9 @@ static int job_cmp(const void *va, const void *vb)
 
 /* Pick a log-replica target for volume `v`, replacing `v->rep[rep_idx]` (node A). Returns target node id or 0. */
 static uint32_t pick_log_target(const struct place_in *in, const struct meta_volume *v, uint32_t rep_idx,
-                                const uint8_t *pend_gone, const uint32_t *log_holds, const uint32_t *log_recv,
-                                const uint32_t *log_recv_urgent, const uint32_t *log_pairs, uint32_t rebuild_max,
-                                int urgent)
+                                uint64_t vbytes, const uint8_t *pend_gone, const uint32_t *log_holds,
+                                const uint32_t *log_recv, const uint32_t *log_recv_urgent, const uint32_t *log_pairs,
+                                uint32_t rebuild_max, int urgent)
 {
     const struct meta_state *sm = in->sm;
     uint32_t nm = sm->nmembers;
@@ -653,7 +1106,7 @@ static uint32_t pick_log_target(const struct place_in *in, const struct meta_vol
     }
     for (uint32_t i = 0; i < nm && racks; i++) {
         const struct meta_member *mb = &sm->members[i];
-        if (pend_gone[i] || !member_placeable(in, mb))
+        if (pend_gone[i] || !member_placeable(in, mb) || !member_log_eval(in, mb, vbytes, NULL, NULL, NULL))
             continue;
         if (!vol_has_rep(v, mb->id) && !mb->rack[0])
             racks = 0;
@@ -661,13 +1114,18 @@ static uint32_t pick_log_target(const struct place_in *in, const struct meta_vol
 
     int32_t best_mi = -1;
     uint32_t best_rack = UINT32_MAX, best_holds = UINT32_MAX, best_pairs = UINT32_MAX;
-    int best_dup = 0;
+    uint64_t best_yppm = UINT64_MAX;
+    int best_dup = 0, best_fast = -1;
     for (uint32_t i = 0; i < nm; i++) {
         uint32_t used_recv = urgent ? log_recv_urgent[i] : log_recv[i];
         if (used_recv >= rebuild_max || pend_gone[i])
             continue;
         const struct meta_member *mb = &sm->members[i];
         if (!member_placeable(in, mb) || mb->id == old_node)
+            continue;
+        int is_fast = 1;
+        uint64_t yppm = 0;
+        if (!member_log_eval(in, mb, vbytes, &is_fast, &yppm, NULL))
             continue;
         int dup = vol_has_rep(v, mb->id);
         if (dup && in->mutant != PLACE_MUT_TWO_PER_SERVER)
@@ -686,10 +1144,14 @@ static uint32_t pick_log_target(const struct place_in *in, const struct meta_vol
             better = 1;
         } else if (in->mutant == PLACE_MUT_TWO_PER_SERVER && dup != best_dup) {
             better = dup > best_dup; /* planted mutant: actively pick an existing holder of v */
+        } else if (in->mutant != PLACE_MUT_LOG_HDD && is_fast != best_fast) {
+            better = is_fast > best_fast;
         } else if (rack_used != best_rack) {
             better = rack_used < best_rack;
         } else if (log_holds[i] != best_holds) {
             better = log_holds[i] < best_holds;
+        } else if (yppm != best_yppm) {
+            better = yppm < best_yppm;
         } else if (pairs != best_pairs) {
             better = pairs < best_pairs;
         } else {
@@ -699,18 +1161,20 @@ static uint32_t pick_log_target(const struct place_in *in, const struct meta_vol
             best_mi = (int32_t)i;
             best_rack = rack_used;
             best_holds = log_holds[i];
+            best_yppm = yppm;
             best_pairs = pairs;
             best_dup = dup;
+            best_fast = is_fast;
         }
     }
     return best_mi >= 0 ? sm->members[best_mi].id : 0;
 }
 
 /* Pick a stripe-position target for EC volume `v`, replacing `v->stripe[pos]`. Returns target node id or 0. */
-static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_volume *v, uint32_t pos,
-                                   const uint8_t *pend_gone, const uint32_t *stripe_holds, const uint32_t *stripe_recv,
-                                   const uint32_t *stripe_recv_urgent, const uint32_t *stripe_pairs,
-                                   uint32_t stripe_cap, int urgent)
+static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_volume *v, uint32_t pos, int is_rebuild,
+                                   uint64_t mark_ppm, const uint8_t *pend_gone, const uint32_t *stripe_holds,
+                                   const uint32_t *stripe_recv, const uint32_t *stripe_recv_urgent,
+                                   const uint32_t *stripe_pairs, uint32_t stripe_cap, int urgent)
 {
     const struct meta_state *sm = in->sm;
     uint32_t nm = sm->nmembers;
@@ -718,6 +1182,8 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
     int32_t rem_mi[META_STRIPE_MAX];
     uint32_t nrem = 0;
     int racks = (in->mutant != PLACE_MUT_RACK_IGNORED);
+    uint8_t want_cls = META_DISK_NONE;
+    int cls_mixed = 0;
     for (uint32_t j = 0; j < v->nstripe && j < META_STRIPE_MAX; j++) {
         if (j == pos)
             continue;
@@ -726,13 +1192,23 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
             rem_mi[nrem++] = ji;
             if (!sm->members[ji].rack[0])
                 racks = 0;
+            uint8_t rc = place_member_chunk_class(&sm->members[ji]);
+            if (rc != META_DISK_NONE) {
+                if (want_cls == META_DISK_NONE)
+                    want_cls = rc;
+                else if (want_cls != rc)
+                    cls_mixed = 1;
+            }
         } else {
             racks = 0;
         }
     }
+    if (cls_mixed || in->mutant == PLACE_MUT_MIX_STRIPE)
+        want_cls = META_DISK_NONE;
     for (uint32_t i = 0; i < nm && racks; i++) {
         const struct meta_member *mb = &sm->members[i];
-        if (pend_gone[i] || !member_placeable(in, mb) || member_chunk_stores(in, mb->id) == 0)
+        if (pend_gone[i] || !member_placeable(in, mb) ||
+            !member_stripe_eval(in, mb, is_rebuild, mark_ppm, NULL, NULL))
             continue;
         if (!vol_has_stripe(v, mb->id) && !mb->rack[0])
             racks = 0;
@@ -740,7 +1216,8 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
 
     int32_t best_mi = -1;
     uint32_t best_rack = UINT32_MAX, best_holds = UINT32_MAX, best_pairs = UINT32_MAX;
-    int best_dup = 0;
+    uint64_t best_cppm = UINT64_MAX;
+    int best_dup = 0, best_cls_match = 0;
     for (uint32_t i = 0; i < nm; i++) {
         uint32_t used_recv = urgent ? stripe_recv_urgent[i] : stripe_recv[i];
         if (used_recv >= stripe_cap || pend_gone[i])
@@ -748,7 +1225,8 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
         const struct meta_member *mb = &sm->members[i];
         if (!member_placeable(in, mb) || mb->id == old_node)
             continue;
-        if (member_chunk_stores(in, mb->id) == 0)
+        uint64_t cppm = 0;
+        if (!member_stripe_eval(in, mb, is_rebuild, mark_ppm, &cppm, NULL))
             continue;
         int dup = vol_has_stripe(v, mb->id);
         if (dup && in->mutant != PLACE_MUT_TWO_PER_SERVER)
@@ -759,6 +1237,7 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
                 if (!strcmp(mb->rack, sm->members[rem_mi[j]].rack))
                     rack_cnt++;
         }
+        int cls_match = (want_cls != META_DISK_NONE && place_member_chunk_class(mb) == want_cls) ? 1 : 0;
         uint32_t pairs = 0;
         for (uint32_t j = 0; j < nrem; j++)
             pairs += stripe_pairs[(size_t)i * nm + (size_t)rem_mi[j]];
@@ -769,8 +1248,12 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
             better = dup > best_dup;
         } else if (rack_cnt != best_rack) {
             better = rack_cnt < best_rack;
+        } else if (want_cls != META_DISK_NONE && cls_match != best_cls_match) {
+            better = cls_match > best_cls_match;
         } else if (stripe_holds[i] != best_holds) {
             better = stripe_holds[i] < best_holds;
+        } else if (cppm != best_cppm) {
+            better = cppm < best_cppm;
         } else if (pairs != best_pairs) {
             better = pairs < best_pairs;
         } else {
@@ -779,7 +1262,9 @@ static uint32_t pick_stripe_target(const struct place_in *in, const struct meta_
         if (better) {
             best_mi = (int32_t)i;
             best_rack = rack_cnt;
+            best_cls_match = cls_match;
             best_holds = stripe_holds[i];
+            best_cppm = cppm;
             best_pairs = pairs;
             best_dup = dup;
         }
@@ -1115,6 +1600,7 @@ void place_plan(const struct place_in *in, struct place_out *out)
     uint32_t stripe_cap = in->set.rebuild_concurrency
                               ? in->set.rebuild_concurrency
                               : (sm->set.rebuild_concurrency ? sm->set.rebuild_concurrency : 4);
+    uint64_t mark_ppm = chunk_fill_mark_ppm(in);
 
     /* 7. Emit proposals respecting concurrency limits (margin <= 0 preempts higher-margin jobs). */
     for (uint32_t ji = 0; ji < njobs; ji++) {
@@ -1138,14 +1624,15 @@ void place_plan(const struct place_in *in, struct place_out *out)
             if (j->forced_target) {
                 int32_t ti = member_idx(sm, j->forced_target);
                 if (ti >= 0 && !pend_gone[ti] && member_placeable(in, &sm->members[ti]) &&
+                    member_log_eval(in, &sm->members[ti], j->bytes, NULL, NULL, NULL) &&
                     !vol_has_rep(v, j->forced_target)) {
                     uint32_t used_recv = urgent ? log_recv_urg[ti] : log_recv[ti];
                     if (used_recv < rebuild_max)
                         target = j->forced_target;
                 }
             } else {
-                target = pick_log_target(in, v, j->pos, pend_gone, log_holds, log_recv, log_recv_urg, log_pairs,
-                                         rebuild_max, urgent);
+                target = pick_log_target(in, v, j->pos, j->bytes, pend_gone, log_holds, log_recv, log_recv_urg,
+                                         log_pairs, rebuild_max, urgent);
             }
             if (!target)
                 continue;
@@ -1199,17 +1686,19 @@ void place_plan(const struct place_in *in, struct place_out *out)
             if (vol_stripe_moved[j->vol_idx])
                 continue;
             uint32_t target = 0;
+            int is_rebuild = !j->is_drain;
             if (j->forced_target) {
                 int32_t ti = member_idx(sm, j->forced_target);
                 if (ti >= 0 && !pend_gone[ti] && member_placeable(in, &sm->members[ti]) &&
-                    member_chunk_stores(in, j->forced_target) > 0 && !vol_has_stripe(v, j->forced_target)) {
+                    member_stripe_eval(in, &sm->members[ti], is_rebuild, mark_ppm, NULL, NULL) &&
+                    !vol_has_stripe(v, j->forced_target)) {
                     uint32_t used_recv = urgent ? stripe_recv_urg[ti] : stripe_recv[ti];
                     if (used_recv < stripe_cap)
                         target = j->forced_target;
                 }
             } else {
-                target = pick_stripe_target(in, v, j->pos, pend_gone, stripe_holds, stripe_recv, stripe_recv_urg,
-                                            stripe_pairs, stripe_cap, urgent);
+                target = pick_stripe_target(in, v, j->pos, is_rebuild, mark_ppm, pend_gone, stripe_holds, stripe_recv,
+                                            stripe_recv_urg, stripe_pairs, stripe_cap, urgent);
             }
             if (!target)
                 continue;

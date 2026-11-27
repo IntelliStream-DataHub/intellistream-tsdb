@@ -48,14 +48,17 @@ struct disks_cfg {
     int allow_shared_device; /* --allow-shared-device */
 };
 
-/* Decoded HBS_DISKS payload stored in heard->ext (read by cluster.c's propose_disks). */
+/* Decoded HBS_DISKS payload stored in heard->ext (read by cluster.c's propose_disks and build_place_members). */
 struct hbs_disk_row {
     uint8_t store_id[16];
     uint8_t disk_class; /* enum meta_disk_class */
     uint8_t uses;       /* enum meta_disk_uses bitmask */
     uint8_t state;      /* enum meta_store_state */
+    uint8_t have_usage; /* 1 when young_bytes/chunk_bytes are reported (r13-fill or test knob) */
     uint64_t size_bytes;
     uint64_t sync_us;
+    uint64_t young_bytes; /* bytes in young-tier uses on this disk (valid when have_usage != 0) */
+    uint64_t chunk_bytes; /* bytes in chunk use on this disk (valid when have_usage != 0) */
 };
 
 struct hbs_disks {

@@ -2712,6 +2712,29 @@ int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node)
     return TSDB_ROLE_NONE;
 }
 
+int cluster_copy_stripe_mixed(const struct cluster_copy *c, const struct cluster_copy_vol *v)
+{
+    if (!c || !v || v->redundancy != META_RED_EC)
+        return 0;
+    uint32_t active = (uint32_t)v->ec_k + v->ec_m;
+    if (active > v->nstripe)
+        active = v->nstripe;
+    if (active > META_STRIPE_MAX)
+        active = META_STRIPE_MAX;
+    uint8_t first = META_DISK_NONE;
+    for (uint32_t p = 0; p < active; p++) {
+        const struct cluster_copy_member *mb = cluster_copy_member(c, v->stripe[p]);
+        uint8_t cls = mb ? place_disks_chunk_class(mb->disks, mb->ndisks) : META_DISK_NONE;
+        if (cls == META_DISK_NONE)
+            continue;
+        if (first == META_DISK_NONE)
+            first = cls;
+        else if (cls != first)
+            return 1;
+    }
+    return 0;
+}
+
 int cluster_copy_vol_owner(const struct cluster_copy *c, uint32_t vol, uint32_t *node, uint64_t *epoch, char *addr,
                            size_t cap)
 {
@@ -5155,10 +5178,13 @@ static int text_ok_cl(const char *s)
 }
 
 /* Build a place_member (and optional place_fill) snapshot of the Raft leader's heartbeat view, shared by
- * cl_place_volume, cl_place_stripe, and place_duty so all three see identical member liveness and store counts. */
+ * cl_place_volume, cl_place_stripe, and place_duty so all three see identical member liveness, disk usage and store
+ * counts. Per-member disk usage rows are packed in the same allocation after pm[0..nm) so free(pm) releases all. */
 static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, struct place_fill **pf_out,
                                                 uint32_t *nf_out)
 {
+    _Static_assert(_Alignof(struct place_member) >= _Alignof(struct place_disk_usage),
+                   "place_disk_usage alignment after place_member array");
     uint32_t nm = C.sm.nmembers;
     *nm_out = nm;
     if (pf_out)
@@ -5176,9 +5202,20 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
                 oom();
         }
     }
-    struct place_member *pm = nm ? calloc(nm, sizeof *pm) : NULL;
+    uint32_t total_disks = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        struct heard *h = heard_get(C.sm.members[i].id);
+        const struct hbs_disks *hd = h ? creport_heard_get(&h->ext, HBS_DISKS) : NULL;
+        if (hd && hd->ndisks > 0)
+            total_disks += hd->ndisks <= META_DISKS_MAX ? hd->ndisks : META_DISKS_MAX;
+    }
+    size_t pm_bytes = (size_t)nm * sizeof(struct place_member);
+    size_t du_bytes = (size_t)total_disks * sizeof(struct place_disk_usage);
+    struct place_member *pm = nm ? calloc(1, pm_bytes + du_bytes) : NULL;
     if (nm && !pm)
         oom();
+    struct place_disk_usage *du_pool = total_disks ? (struct place_disk_usage *)((uint8_t *)pm + pm_bytes) : NULL;
+    uint32_t du_off = 0;
     for (uint32_t i = 0; i < nm; i++) {
         uint32_t id = C.sm.members[i].id;
         struct heard *h = heard_get(id);
@@ -5199,6 +5236,26 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
             pm[i].fill_pct = h->fill_pct;
             if (id != C.id)
                 pm[i].chunk_stores = h->have_stores ? h->chunk_stores : 0;
+            const struct hbs_disks *hd = creport_heard_get(&h->ext, HBS_DISKS);
+            if (hd && hd->ndisks > 0 && du_pool) {
+                uint32_t nd = hd->ndisks <= META_DISKS_MAX ? hd->ndisks : META_DISKS_MAX;
+                if (du_off + nd <= total_disks) {
+                    struct place_disk_usage *dst = &du_pool[du_off];
+                    for (uint32_t d = 0; d < nd; d++) {
+                        memcpy(dst[d].store_id, hd->disks[d].store_id, 16);
+                        dst[d].disk_class = hd->disks[d].disk_class;
+                        dst[d].uses = hd->disks[d].uses;
+                        dst[d].state = hd->disks[d].state;
+                        dst[d].have_usage = hd->disks[d].have_usage;
+                        dst[d].size_bytes = hd->disks[d].size_bytes;
+                        dst[d].young_bytes = hd->disks[d].young_bytes;
+                        dst[d].chunk_bytes = hd->disks[d].chunk_bytes;
+                    }
+                    pm[i].disks = dst;
+                    pm[i].ndisks = nd;
+                    du_off += nd;
+                }
+            }
             if (pf_out) {
                 for (uint32_t j = 0; j < h->nvols && pm[i].nfaults < PLACE_FAULTS_MAX; j++) {
                     if (h->vols[j].v.health == CL_HEALTH_LOCAL_FAULT && h->vols[j].fault_ns) {
@@ -5248,7 +5305,7 @@ static struct place_replace *build_place_replaces(uint32_t *nr_out)
     return pr;
 }
 
-/* Initial log-replica placement for VOLUME_ADD: delegates to pure server/place.c (r9-plan). */
+/* Initial log-replica placement for VOLUME_ADD: delegates to pure server/place.c (r9-plan, r13-place). */
 static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
 {
     uint32_t nm = 0, nr = 0;
@@ -5265,13 +5322,15 @@ static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
         .nreplaces = nr,
     };
     place_settings_default(&in.set);
+    in.set.young_move_pct = C.sm.set.young_move_pct;
+    in.set.young_high_pct = C.sm.set.young_high_pct;
     int rc = place_volume(&in, n, nodes);
     free(pr);
     free(pm);
     return rc;
 }
 
-/* Initial EC stripe-group placement for VOLUME_ADD_EC: delegates to pure server/place.c (r9-plan, E9, D20). */
+/* Initial EC stripe-group placement for VOLUME_ADD_EC: delegates to pure server/place.c (r9-plan, r13-place, E9, D20). */
 static int cl_place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *qualify)
 {
     uint32_t nm = 0, nr = 0;
@@ -5288,6 +5347,8 @@ static int cl_place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t
         .nreplaces = nr,
     };
     place_settings_default(&in.set);
+    in.set.young_move_pct = C.sm.set.young_move_pct;
+    in.set.young_high_pct = C.sm.set.young_high_pct;
     int rc = place_stripe(&in, ns, stripe, qualify);
     free(pr);
     free(pm);
@@ -5369,6 +5430,20 @@ static void admin_volume_add(struct conn *c, uint32_t reqid, struct rd *r, int e
         a.ec_k = ek;
         a.ec_m = em;
         a.nstripe = (uint32_t)ek + em;
+        uint8_t first_cls = META_DISK_NONE;
+        int mixed = 0;
+        for (uint32_t i = 0; i < a.nstripe; i++) {
+            uint8_t cls = place_member_chunk_class(meta_member(&C.sm, a.stripe[i]));
+            if (cls == META_DISK_NONE)
+                continue;
+            if (first_cls == META_DISK_NONE)
+                first_cls = cls;
+            else if (cls != first_cls)
+                mixed = 1;
+        }
+        if (mixed)
+            say("volume add %s: warning: ec=%u+%u stripe group spans mixed disk classes (fewer than %u same-class "
+                "storage members qualified)", a.name, ek, em, ek + em);
     }
     a.n = n;
     a.kind = META_VOL_REPLICATED;
@@ -8618,6 +8693,7 @@ static void place_duty(uint64_t now)
     in.set.out_guard_pct = C.sm.set.out_guard_pct;
     in.set.out_guard_hold_s = C.sm.set.out_guard_hold_s;
     in.set.repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
+    in.set.young_move_pct = C.sm.set.young_move_pct;
     in.set.young_high_pct = C.sm.set.young_high_pct;
     in.set.balance_mb_s = C.sm.set.balance_mb_s;
     in.set.rebuild_concurrency = C.sm.set.rebuild_concurrency;
@@ -9522,6 +9598,42 @@ uint32_t cl_member_chunk_stores(uint32_t id)
         return atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
     struct heard *h = heard_get(id);
     return h && h->have_stores ? h->chunk_stores : 0;
+}
+
+static int cl_member_place_ok(uint32_t node, uint64_t now, int is_stripe, const char **why_out)
+{
+    const struct meta_member *mb = meta_member(&C.sm, node);
+    if (!mb) {
+        if (why_out)
+            *why_out = "unknown member";
+        return 0;
+    }
+    uint32_t nm = 0;
+    struct place_member *pm = build_place_members(now, &nm, NULL, NULL);
+    struct place_in in = {
+        .sm = &C.sm,
+        .members = pm,
+        .nmembers = nm,
+        .mono_ms = now / MS,
+        .self_id = C.id,
+        .mutant = place_mutant_env(),
+    };
+    place_settings_default(&in.set);
+    in.set.young_move_pct = C.sm.set.young_move_pct;
+    in.set.young_high_pct = C.sm.set.young_high_pct;
+    int ok = is_stripe ? place_member_stripe_ok(&in, mb, 0, why_out) : place_member_log_ok(&in, mb, 0, why_out);
+    free(pm);
+    return ok;
+}
+
+int cl_member_log_ok(uint32_t node, uint64_t now, const char **why_out)
+{
+    return cl_member_place_ok(node, now, 0, why_out);
+}
+
+int cl_member_stripe_ok(uint32_t node, uint64_t now, const char **why_out)
+{
+    return cl_member_place_ok(node, now, 1, why_out);
 }
 
 int cl_heard_live_objs(uint32_t node, uint32_t volume, struct cluster_live_objs_report *out)

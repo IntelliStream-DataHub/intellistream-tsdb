@@ -365,11 +365,14 @@ static const char *mv_propose_add(const struct meta_volume *v, uint32_t from, ui
         return cmove_err_already_proposed;
     }
     const struct meta_member *mb = meta_member(cl_meta(), to);
+    const char *log_why = NULL;
     const char *no = in                                         ? "a move of the volume is running"
                      : !meta_replica(v, from)                   ? "the old node is not a member of the volume"
                      : meta_replica(v, to)                      ? "the new node is a member already"
                      : !mb || !(mb->flags & META_MF_VOLUMES_OK) ? "the new node may not hold volumes"
                      : !member_up(to, now)                      ? "the new node is not up"
+                     : !cl_member_log_ok(to, now, &log_why)
+                           ? (log_why ? log_why : "the new node is not eligible for log replicas")
                      : v->nrep >= META_REPLICAS_MAX             ? "the volume has as many replicas as it may"
                      : g_nmv == sizeof g_mv / sizeof g_mv[0]    ? "too many moves under way"
                                                                 : NULL;

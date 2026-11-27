@@ -744,6 +744,212 @@ static void test_sender_reachability(void)
     meta_free(&sm);
 }
 
+/* 9. R13 (r13-place; E49, E50, E51, E53, §15.3, §15.5): placement by capability, role, disk class and fill marks.
+ * Catches planted mutants: loghdd, mixstripe, placefull. */
+static struct meta_disk mk_disk(uint8_t tag, uint8_t cls, uint8_t uses, uint64_t size_bytes)
+{
+    struct meta_disk d = {0};
+    d.store_id[0] = 0xd0;
+    d.store_id[1] = tag;
+    d.store_id[15] = (uint8_t)(tag ^ 0x5a);
+    d.disk_class = cls;
+    d.uses = uses;
+    d.state = META_STORE_UP;
+    d.size_bytes = size_bytes;
+    d.sync_us = cls == META_DISK_HDD ? 5000 : 100;
+    return d;
+}
+
+static void add_disk(struct meta_state *sm, uint32_t node, const struct meta_disk *d)
+{
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_store_add(&e, node, d);
+    int res[2] = {0};
+    int rc = apply_entry(sm, &e, res, 2);
+    CHECK(rc == META_OK && res[0] == META_OK, "store_add node %u: rc %d res %d", node, rc, res[0]);
+}
+
+static void set_role(struct meta_state *sm, uint32_t node, uint8_t role)
+{
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_member_role(&e, node, role);
+    int res[2] = {0};
+    int rc = apply_entry(sm, &e, res, 2);
+    CHECK(rc == META_OK && res[0] == META_OK, "member_role node %u -> %u: rc %d res %d", node, role, rc, res[0]);
+}
+
+static void test_r13_capability_class_and_fill(void)
+{
+    /* (a) 5 nodes: nodes 1,2 HDD-only + role=storage; nodes 3,4,5 NVMe(LOG)+HDD(CHUNK).
+     *     replicas=3 MUST land only on {3,4,5} (catches loghdd). */
+    struct meta_state sm;
+    struct place_member pm[6];
+    init_cluster_state(&sm, 5, NULL, pm, 1);
+
+    uint64_t sz = 1000ull * 1024 * 1024 * 1024; /* 1000 GiB */
+    struct meta_disk h1 = mk_disk(1, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk h2 = mk_disk(2, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk n3 = mk_disk(3, META_DISK_NVME, META_DISK_USE_LOG, sz);
+    struct meta_disk h3 = mk_disk(13, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk n4 = mk_disk(4, META_DISK_NVME, META_DISK_USE_LOG, sz);
+    struct meta_disk h4 = mk_disk(14, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk n5 = mk_disk(5, META_DISK_NVME, META_DISK_USE_LOG, sz);
+    struct meta_disk h5 = mk_disk(15, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    add_disk(&sm, 1, &h1);
+    add_disk(&sm, 2, &h2);
+    set_role(&sm, 1, META_ROLE_STORAGE);
+    set_role(&sm, 2, META_ROLE_STORAGE);
+    add_disk(&sm, 3, &n3);
+    add_disk(&sm, 3, &h3);
+    add_disk(&sm, 4, &n4);
+    add_disk(&sm, 4, &h4);
+    add_disk(&sm, 5, &n5);
+    add_disk(&sm, 5, &h5);
+
+    struct place_in in = make_in(&sm, pm, 5);
+    uint32_t reps[3] = {0};
+    CHECK(place_volume(&in, 3, reps) == 0, "place_volume(3) on 3 compute + 2 storage failed");
+    for (int i = 0; i < 3; i++)
+        CHECK(reps[i] >= 3 && reps[i] <= 5, "log replica landed on storage-only node %u (want 3..5)", reps[i]);
+
+    /* (b) Young use tie-breaking & young_move_pct (80%) avoidance (catches placefull). */
+    struct place_disk_usage du3[2] = {
+        {.disk_class = META_DISK_NVME, .uses = META_DISK_USE_LOG, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .young_bytes = sz * 85 / 100}, /* 85% >= 80%: full! */
+        {.disk_class = META_DISK_HDD, .uses = META_DISK_USE_CHUNK, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .chunk_bytes = sz * 10 / 100},
+    };
+    memcpy(du3[0].store_id, n3.store_id, 16);
+    memcpy(du3[1].store_id, h3.store_id, 16);
+    struct place_disk_usage du4[2] = {
+        {.disk_class = META_DISK_NVME, .uses = META_DISK_USE_LOG, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .young_bytes = sz * 50 / 100}, /* 50% < 80% */
+        {.disk_class = META_DISK_HDD, .uses = META_DISK_USE_CHUNK, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .chunk_bytes = sz * 10 / 100},
+    };
+    memcpy(du4[0].store_id, n4.store_id, 16);
+    memcpy(du4[1].store_id, h4.store_id, 16);
+    struct place_disk_usage du5[2] = {
+        {.disk_class = META_DISK_NVME, .uses = META_DISK_USE_LOG, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .young_bytes = sz * 20 / 100}, /* 20% < 80% (lowest!) */
+        {.disk_class = META_DISK_HDD, .uses = META_DISK_USE_CHUNK, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .chunk_bytes = sz * 10 / 100},
+    };
+    memcpy(du5[0].store_id, n5.store_id, 16);
+    memcpy(du5[1].store_id, h5.store_id, 16);
+    pm[2].disks = du3;
+    pm[2].ndisks = 2;
+    pm[3].disks = du4;
+    pm[3].ndisks = 2;
+    pm[4].disks = du5;
+    pm[4].ndisks = 2;
+
+    /* With node 3 at 85% >= 80%, replicas=3 cannot fit (only nodes 4 and 5 eligible), replicas=2 picks {5, 4} (lowest young use first!). */
+    CHECK(place_volume(&in, 3, reps) == -1, "place_volume(3) must fail when 1 of 3 compute nodes is at 85%% >= 80%%");
+    uint32_t reps2[2] = {0};
+    CHECK(place_volume(&in, 2, reps2) == 0, "place_volume(2) must succeed on nodes 4 and 5");
+    CHECK(reps2[0] == 5 && reps2[1] == 4,
+          "place_volume(2) must avoid 85%% node 3 and prefer lower young-use node 5 before 4 (got %u,%u)", reps2[0],
+          reps2[1]);
+
+    /* Adding a second NVMe below 80% on node 3 makes node 3 eligible again (not ALL fast disks >= 80%). */
+    struct meta_disk n3b = mk_disk(33, META_DISK_NVME, META_DISK_USE_LOG, sz);
+    add_disk(&sm, 3, &n3b);
+    struct place_disk_usage du3_two[3] = {du3[0], du3[1],
+        {.disk_class = META_DISK_NVME, .uses = META_DISK_USE_LOG, .state = META_STORE_UP, .have_usage = 1,
+         .size_bytes = sz, .young_bytes = sz * 15 / 100}};
+    memcpy(du3_two[2].store_id, n3b.store_id, 16);
+    pm[2].disks = du3_two;
+    pm[2].ndisks = 3;
+    CHECK(place_volume(&in, 3, reps) == 0, "node 3 with a second NVMe at 15%% must be eligible again");
+
+    /* (c) log_on_hdd = 1: fast nodes still preferred when enough exist; HDD-only used only as fallback. */
+    struct meta_settings st = sm.set;
+    st.log_on_hdd = 1;
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_settings(&e, &st);
+    int res[2] = {0};
+    CHECK(apply_entry(&sm, &e, res, 2) == META_OK && res[0] == META_OK, "enable log_on_hdd");
+    set_role(&sm, 1, META_ROLE_BOTH); /* node 1 HDD-only now has META_CAP_COMPUTE via log_on_hdd */
+    /* Even with node 1 having lower id and 0 holds, place_volume(3) MUST still pick fast nodes {3,4,5}. */
+    CHECK(place_volume(&in, 3, reps) == 0, "place_volume(3) with log_on_hdd=1 failed");
+    for (int i = 0; i < 3; i++)
+        CHECK(reps[i] >= 3 && reps[i] <= 5, "log_on_hdd=1 picked HDD node %u while 3 fast nodes exist", reps[i]);
+    /* Requesting 4 replicas exceeds the 3 fast nodes -> falls back to include node 1 (not storage-only node 2). */
+    uint32_t reps4[4] = {0};
+    CHECK(place_volume(&in, 4, reps4) == 0, "place_volume(4) with log_on_hdd=1 fallback failed");
+    int saw1 = 0, saw2 = 0;
+    for (int i = 0; i < 4; i++) {
+        saw1 += (reps4[i] == 1);
+        saw2 += (reps4[i] == 2);
+    }
+    CHECK(saw1 == 1 && saw2 == 0, "log_on_hdd=1 fallback: want node 1 (role=both) and not node 2 (role=storage)");
+    meta_free(&sm);
+
+    /* (d) Stripe class preference (catches mixstripe), mixed-class fallback + helper, and chunk fill mark (catches placefull). */
+    init_cluster_state(&sm, 5, NULL, pm, 1);
+    struct meta_disk hd1 = mk_disk(21, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk hd2 = mk_disk(22, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk hd3 = mk_disk(23, META_DISK_HDD, META_DISK_USE_CHUNK, sz);
+    struct meta_disk nv4 = mk_disk(24, META_DISK_NVME, META_DISK_USE_ALL, sz);
+    struct meta_disk nv5 = mk_disk(25, META_DISK_NVME, META_DISK_USE_ALL, sz);
+    add_disk(&sm, 1, &hd1);
+    add_disk(&sm, 2, &hd2);
+    add_disk(&sm, 3, &hd3);
+    add_disk(&sm, 4, &nv4);
+    add_disk(&sm, 5, &nv5);
+    /* Give nodes 1,2,3 (HDD) 1 existing stripe hold each so NVMe nodes 4,5 have FEWER holds (0 < 1). */
+    uint32_t init_rep[2] = {4, 5};
+    uint32_t init_str[3] = {1, 2, 3};
+    add_vol(&sm, 1, "ec_hdd1", init_rep, 2, 2, 1, init_str);
+    CHECK(place_stripe_mixed_class(&sm, meta_volume(&sm, 1)) == 0, "single-class HDD stripe must report mixed=0");
+
+    in = make_in(&sm, pm, 5);
+    uint32_t str3[3] = {0}, qual = 0;
+    CHECK(place_stripe(&in, 3, str3, &qual) == 0 && qual == 5, "place_stripe(3) failed (qual %u)", qual);
+    for (int i = 0; i < 3; i++)
+        CHECK(place_member_chunk_class(meta_member(&sm, str3[i])) == META_DISK_HDD,
+              "place_stripe(3) mixed classes (picked node %u class %s) despite 3 HDD members", str3[i],
+              meta_disk_class_name(place_member_chunk_class(meta_member(&sm, str3[i]))));
+
+    /* Asking for 4 stripe positions (3+1): neither HDD (3) nor NVMe (2) has 4 -> mixed fallback allowed, flagged mixed=1. */
+    uint32_t str4[4] = {0};
+    CHECK(place_stripe(&in, 4, str4, &qual) == 0, "place_stripe(4) mixed fallback failed");
+    add_vol(&sm, 2, "ec_mixed", init_rep, 2, 3, 1, str4);
+    CHECK(place_stripe_mixed_class(&sm, meta_volume(&sm, 2)) == 1, "mixed HDD+NVMe stripe must report mixed=1");
+
+    /* Chunk store fill mark (§5.6): 5 equal storage nodes -> mark = 95% * (4/5) = 76%.
+     * Filling node 1's HDD to 75% (< 76%) keeps it eligible; 77% (>= 76%) excludes it! */
+    struct place_disk_usage ch1 = {.disk_class = META_DISK_HDD, .uses = META_DISK_USE_CHUNK, .state = META_STORE_UP,
+                                   .have_usage = 1, .size_bytes = sz, .chunk_bytes = sz * 75 / 100};
+    memcpy(ch1.store_id, hd1.store_id, 16);
+    pm[0].disks = &ch1;
+    pm[0].ndisks = 1;
+    uint32_t str5[5] = {0};
+    CHECK(place_stripe(&in, 5, str5, &qual) == 0 && qual == 5,
+          "place_stripe(5) must accept node 1 at 75%% < 76%% mark (qual=%u)", qual);
+    ch1.chunk_bytes = sz * 77 / 100;
+    CHECK(place_stripe(&in, 5, str5, &qual) == -1 && qual == 4,
+          "place_stripe(5) must reject full chunk node 1 at 77%% >= 76%% mark (qual=%u, want 4)", qual);
+    CHECK(place_stripe(&in, 4, str4, &qual) == 0, "place_stripe(4) must succeed on remaining 4 nodes");
+    for (int i = 0; i < 4; i++)
+        CHECK(str4[i] != 1, "place_stripe(4) placed on full chunk node 1");
+
+    /* Shared disk (LOG|CHUNK) young mark uses (size - chunk_bytes): node 4 has 50% chunks + 42% young -> 42/50 = 84% >= 80%! */
+    struct place_disk_usage sh4 = {.disk_class = META_DISK_NVME, .uses = META_DISK_USE_ALL, .state = META_STORE_UP,
+                                   .have_usage = 1, .size_bytes = sz, .young_bytes = sz * 42 / 100,
+                                   .chunk_bytes = sz * 50 / 100};
+    memcpy(sh4.store_id, nv4.store_id, 16);
+    pm[3].disks = &sh4;
+    pm[3].ndisks = 1;
+    CHECK(place_member_log_ok(&in, meta_member(&sm, 4), 0, NULL) == 0,
+          "shared disk with 50%% chunks and 42%% young (84%% of non-chunk room >= 80%%) must be rejected for log");
+    meta_free(&sm);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--mutant") == 0) {
@@ -770,6 +976,7 @@ int main(int argc, char **argv)
     test_stripe_whole_barrier();
     test_drain_caps_fault_replace();
     test_sender_reachability();
+    test_r13_capability_class_and_fill();
 
     if (fails) {
         fprintf(stderr, "test_place: %d checks failed\n", fails);

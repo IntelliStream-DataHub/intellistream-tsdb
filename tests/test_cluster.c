@@ -40,6 +40,7 @@
 #include "harness.h"
 #include "meta.h"
 #include "peerlink.h"
+#include "place.h"
 #include "plrdma.h"
 #include "rdma_dev.h"
 #include "raft/raft.h"
@@ -30635,6 +30636,391 @@ static void scen_scrubrepair(void)
 #endif
 }
 
+/* R13 (r13-place; E9, E49, E50, E51, E53, §15.3, §15.5): placement by capability, role, disk class and fill marks.
+ *   1. 5 nodes: nodes 0,1 HDD-only + `--role storage`; nodes 2,3,4 NVMe + HDD.
+ *   2. `replicas=3` volumes land only on {2,3,4} (catches `loghdd`); R4 `volume move --log` to node 0 refused.
+ *   3. `ec=2+1` stripe groups land on HDD stores (single-class, not mixed).
+ *   4. Node 2's NVMe filled to 85% (> young_move_pct 80%) via TSDB_DISK_USAGE_FILE: new `replicas=2` and `ec=2+1`
+ *      volumes avoid node 2, `replicas=3` fails CLUSTER_ERR_FEW, and `volume move --log` onto node 2 is refused
+ *      (catches `placefull`).
+ *   5. Add node 5 (NVMe-only, 0 stripe holds while HDD nodes 0..4 each hold >= 1): `ec=2+1` still picks 3 HDD nodes
+ *      (same-class; catches `mixstripe`); `ec=4+2` (needs 6) falls back to mixed-class and is listed in health and
+ *      STATUS (`tsdb cluster status` CLI and client `TSDB_OP_STATUS`).
+ *   6. Filling node 5's chunk store past the fill mark makes a new `ec=4+2` fail CLUSTER_ERR_FEW. */
+static void write_usage_file(const char *path, const char *body)
+{
+    char tmp[PATH_MAX + 32];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        die("placeclass: fopen %s: %s", tmp, strerror(errno));
+    if (fputs(body, f) < 0 || fflush(f) != 0 || fclose(f) != 0)
+        die("placeclass: write %s: %s", tmp, strerror(errno));
+    if (rename(tmp, path) != 0)
+        die("placeclass: rename %s -> %s: %s", tmp, path, strerror(errno));
+}
+
+static void await_disk_section(int leader, uint32_t node_id, const char *needle, int want_present, int timeout_ms,
+                               const char *what)
+{
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < (uint64_t)timeout_ms; usleep(100000)) {
+        struct view vw;
+        view(leader, &vw);
+        int ok = 0;
+        for (uint32_t i = 0; i < vw.st.nheard; i++) {
+            if (vw.st.heard[i].id == node_id) {
+                int has = vw.st.heard[i].sections && strstr(vw.st.heard[i].sections, needle) != NULL;
+                if (has == (want_present != 0)) {
+                    ok = 1;
+                    break;
+                }
+            }
+        }
+        view_free(&vw);
+        if (ok)
+            return;
+    }
+    die("placeclass: timed out waiting for %s on node %" PRIu32, what, node_id);
+}
+
+static void run_cli_status(int server_idx, char *out, size_t cap)
+{
+    const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+    char addr[64];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pports[server_idx]);
+    int pfd[2];
+    if (pipe(pfd) != 0)
+        die("placeclass: pipe: %s", strerror(errno));
+    pid_t pid = fork();
+    if (pid < 0)
+        die("placeclass: fork: %s", strerror(errno));
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
+        close(pfd[1]);
+        execl(cli, "tsdb", "cluster", "status", addr, "--secret-file", secret_path, (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t off = 0;
+    while (off + 1 < cap) {
+        ssize_t n = read(pfd[0], out + off, cap - 1 - off);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        off += (size_t)n;
+    }
+    out[off] = '\0';
+    close(pfd[0]);
+    int wst = 0;
+    while (waitpid(pid, &wst, 0) < 0 && errno == EINTR)
+        ;
+    if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+        die("placeclass: tsdb cluster status exited 0x%x:\n%s", wst, out);
+}
+
+static void scen_placeclass(void)
+{
+    scenario("placeclass");
+    epoll_after_two = 1; /* keep io_uring memlock low across 6 servers */
+
+    char d0h[PATH_MAX], d1h[PATH_MAX], d2n[PATH_MAX], d2h[PATH_MAX], d3n[PATH_MAX], d3h[PATH_MAX];
+    char d4n[PATH_MAX], d4h[PATH_MAX], d5n[PATH_MAX];
+    snprintf(d0h, sizeof d0h, "%s/p0_hdd", base);
+    snprintf(d1h, sizeof d1h, "%s/p1_hdd", base);
+    snprintf(d2n, sizeof d2n, "%s/p2_nvme", base);
+    snprintf(d2h, sizeof d2h, "%s/p2_hdd", base);
+    snprintf(d3n, sizeof d3n, "%s/p3_nvme", base);
+    snprintf(d3h, sizeof d3h, "%s/p3_hdd", base);
+    snprintf(d4n, sizeof d4n, "%s/p4_nvme", base);
+    snprintf(d4h, sizeof d4h, "%s/p4_hdd", base);
+    snprintf(d5n, sizeof d5n, "%s/p5_nvme", base);
+
+    disk_make(d0h, "hdd");
+    disk_make(d1h, "hdd");
+    disk_make(d2n, "nvme");
+    disk_make(d2h, "hdd");
+    disk_make(d3n, "nvme");
+    disk_make(d3h, "hdd");
+    disk_make(d4n, "nvme");
+    disk_make(d4h, "hdd");
+    disk_make(d5n, "nvme");
+
+    char u2[PATH_MAX], u3[PATH_MAX], u4[PATH_MAX], u5[PATH_MAX];
+    snprintf(u2, sizeof u2, "%s/usage2", base);
+    snprintf(u3, sizeof u3, "%s/usage3", base);
+    snprintf(u4, sizeof u4, "%s/usage4", base);
+    snprintf(u5, sizeof u5, "%s/usage5", base);
+
+    char xa[6][PATH_MAX * 2 + 128];
+    char pe[6][PATH_MAX + 64];
+    snprintf(xa[0], sizeof xa[0], "--disk %s:hdd --role storage", d0h);
+    snprintf(xa[1], sizeof xa[1], "--disk %s:hdd --role storage", d1h);
+    snprintf(xa[2], sizeof xa[2], "--disk %s:nvme --disk %s:hdd", d2n, d2h);
+    snprintf(xa[3], sizeof xa[3], "--disk %s:nvme --disk %s:hdd", d3n, d3h);
+    snprintf(xa[4], sizeof xa[4], "--disk %s:nvme --disk %s:hdd", d4n, d4h);
+    snprintf(xa[5], sizeof xa[5], "--disk %s:nvme", d5n);
+    snprintf(pe[2], sizeof pe[2], "TSDB_DISK_USAGE_FILE=%s", u2);
+    snprintf(pe[3], sizeof pe[3], "TSDB_DISK_USAGE_FILE=%s", u3);
+    snprintf(pe[4], sizeof pe[4], "TSDB_DISK_USAGE_FILE=%s", u4);
+    snprintf(pe[5], sizeof pe[5], "TSDB_DISK_USAGE_FILE=%s", u5);
+
+    for (int i = 0; i < 5; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        xargs[i] = xa[i];
+        if (i >= 2)
+            penv[i] = pe[i];
+    }
+    int first5[5] = {0, 1, 2, 3, 4};
+    start_many(first5, 5);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "placeclass: five voters");
+
+    struct disks_want w0 = {ids[0], 1, META_ROLE_STORAGE, META_CAP_STORAGE};
+    struct disks_want w1 = {ids[1], 1, META_ROLE_STORAGE, META_CAP_STORAGE};
+    struct disks_want w2 = {ids[2], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w3 = {ids[3], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w4 = {ids[4], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "placeclass: node 0 storage hdd");
+    await_view(0, p_member_disks, &w1, "placeclass: node 1 storage hdd");
+    await_view(0, p_member_disks, &w2, "placeclass: node 2 nvme+hdd");
+    await_view(0, p_member_disks, &w3, "placeclass: node 3 nvme+hdd");
+    await_view(0, p_member_disks, &w4, "placeclass: node 4 nvme+hdd");
+
+    /* 1. replicas=3 volumes MUST land only on compute-capable nodes {2,3,4} (catches loghdd). */
+    uint32_t vrep1 = 0, vrep2 = 0;
+    int rc = vol_add(0, "pc_rep1", 3, &vrep1);
+    if (rc != 0)
+        die("placeclass: vol_add pc_rep1: %s", cluster_strerror(rc));
+    rc = vol_add(0, "pc_rep2", 3, &vrep2);
+    if (rc != 0)
+        die("placeclass: vol_add pc_rep2: %s", cluster_strerror(rc));
+
+    struct view vw;
+    view(0, &vw);
+    for (int vi = 0; vi < 2; vi++) {
+        uint32_t vn = vi == 0 ? vrep1 : vrep2;
+        const struct meta_volume *mv = meta_volume(&vw.m, vn);
+        if (!mv || mv->nrep != 3)
+            die("placeclass: missing rep volume %" PRIu32, vn);
+        for (uint32_t k = 0; k < mv->nrep; k++) {
+            uint32_t nd = mv->rep[k].node;
+            if (nd == ids[0] || nd == ids[1])
+                die("placeclass: replicas=3 vol %" PRIu32 " placed log replica on storage-only node %" PRIu32, vn, nd);
+            if (nd != ids[2] && nd != ids[3] && nd != ids[4])
+                die("placeclass: replicas=3 vol %" PRIu32 " unexpected node %" PRIu32, vn, nd);
+        }
+    }
+    view_free(&vw);
+    await_isr(0, "pc_rep1", 3, 20000, "placeclass: pc_rep1 ISR=3");
+
+    /* R4 `volume move --log` to storage-only node 0 must be refused. */
+    {
+        uint8_t body[16], *reply = NULL;
+        size_t rl = 0, bl = cluster_volume_move_encode(vrep1, ids[2], ids[0], CLUSTER_MOVE_LOG, body);
+        int mrc = admin(0, CLUSTER_OP_VOLUME_MOVE, body, bl, 1, &reply, &rl);
+        char why[256];
+        snprintf(why, sizeof why, "%.*s", (int)(rl < 240 ? rl : 240), reply ? (const char *)reply : "");
+        free(reply);
+        if (mrc == 0)
+            die("placeclass: volume move --log to storage-only node 0 unexpectedly succeeded (%s)", why);
+    }
+    printf("  replicas=3 volumes placed only on nvme+hdd nodes {2,3,4}; move to storage-only refused\n");
+
+    /* 2. ec=2+1 volumes: log group on {2,3,4}, stripe group of 3 on HDD stores (single-class). */
+    uint32_t vec[3] = {0};
+    const char *ec_names[3] = {"pc_ec1", "pc_ec2", "pc_ec3"};
+    for (int k = 0; k < 3; k++) {
+        char msg[256] = "";
+        int erc = -1;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(150000)) {
+            erc = vol_add_ec(0, ec_names[k], 0, 2, 1, &vec[k], msg, sizeof msg);
+            if (erc != CLUSTER_ERR_FEW)
+                break;
+        }
+        if (erc != 0)
+            die("placeclass: vol_add_ec %s failed: %s (%s)", ec_names[k], cluster_strerror(erc), msg);
+    }
+    view(0, &vw);
+    int hdd_holds[5] = {0};
+    for (int k = 0; k < 3; k++) {
+        const struct meta_volume *mv = meta_volume(&vw.m, vec[k]);
+        if (!mv || mv->nrep != 2 || mv->nstripe != 3)
+            die("placeclass: invalid ec volume %s", ec_names[k]);
+        for (uint32_t r = 0; r < mv->nrep; r++)
+            if (mv->rep[r].node == ids[0] || mv->rep[r].node == ids[1])
+                die("placeclass: %s placed log replica on storage-only node %" PRIu32, ec_names[k], mv->rep[r].node);
+        for (uint32_t p = 0; p < mv->nstripe; p++) {
+            const struct meta_member *mb = meta_member(&vw.m, mv->stripe[p]);
+            if (place_member_chunk_class(mb) != META_DISK_HDD)
+                die("placeclass: %s stripe pos %" PRIu32 " node %" PRIu32 " is not HDD", ec_names[k], p, mv->stripe[p]);
+            for (int si = 0; si < 5; si++)
+                if (mv->stripe[p] == ids[si])
+                    hdd_holds[si]++;
+        }
+        if (place_stripe_mixed_class(&vw.m, mv) != 0)
+            die("placeclass: %s unexpectedly reported mixed_class=1", ec_names[k]);
+    }
+    view_free(&vw);
+    for (int si = 0; si < 5; si++)
+        if (hdd_holds[si] == 0)
+            die("placeclass: HDD node %d received 0 stripe positions across 3 ec=2+1 volumes", si);
+    printf("  3 ec=2+1 volumes placed on hdd stores (single-class, spread across all 5 hdd nodes)\n");
+
+    /* 3. Fill node 2's NVMe past 80% (85%) via reported-bytes knob: new volumes MUST avoid it (catches placefull). */
+    write_usage_file(u2, "nvme 85 0\nhdd 0 10\n");
+    write_usage_file(u3, "nvme 15 0\nhdd 0 10\n");
+    write_usage_file(u4, "nvme 15 0\nhdd 0 10\n");
+    await_disk_section(0, ids[2], "young_bytes=", 1, 10000, "node 2 disk usage");
+    await_disk_section(0, ids[3], "young_bytes=", 1, 10000, "node 3 disk usage");
+    await_disk_section(0, ids[4], "young_bytes=", 1, 10000, "node 4 disk usage");
+
+    /* With node 2 >= 80%, replicas=3 has only 2 eligible compute nodes -> must fail CLUSTER_ERR_FEW. */
+    uint32_t vno3 = 0;
+    rc = vol_add(0, "pc_no3", 3, &vno3);
+    if (rc != CLUSTER_ERR_FEW)
+        die("placeclass: replicas=3 with node 2 nvme at 85%% returned %s (want CLUSTER_ERR_FEW)", cluster_strerror(rc));
+
+    /* New replicas=2 and ec=2+1 volumes MUST avoid node 2 and land on {3, 4}. */
+    uint32_t vav_rep = 0, vav_ec = 0;
+    rc = vol_add(0, "pc_avoid_rep", 2, &vav_rep);
+    if (rc != 0)
+        die("placeclass: vol_add pc_avoid_rep: %s", cluster_strerror(rc));
+    char ecmsg[256] = "";
+    rc = vol_add_ec(0, "pc_avoid_ec", 0, 2, 1, &vav_ec, ecmsg, sizeof ecmsg);
+    if (rc != 0)
+        die("placeclass: vol_add_ec pc_avoid_ec: %s (%s)", cluster_strerror(rc), ecmsg);
+    view(0, &vw);
+    for (int vi = 0; vi < 2; vi++) {
+        uint32_t vn = vi == 0 ? vav_rep : vav_ec;
+        const struct meta_volume *mv = meta_volume(&vw.m, vn);
+        if (!mv || mv->nrep != 2)
+            die("placeclass: missing avoid volume %" PRIu32, vn);
+        for (uint32_t k = 0; k < mv->nrep; k++)
+            if (mv->rep[k].node != ids[3] && mv->rep[k].node != ids[4])
+                die("placeclass: vol %" PRIu32 " did not avoid 85%%-full node 2 (picked node %" PRIu32 ")", vn,
+                    mv->rep[k].node);
+    }
+    view_free(&vw);
+
+    /* R4 `volume move --log` onto 85%-full node 2 must also be refused. */
+    {
+        uint8_t body[16], *reply = NULL;
+        size_t rl = 0, bl = cluster_volume_move_encode(vav_rep, ids[3], ids[2], CLUSTER_MOVE_LOG, body);
+        int mrc = admin(0, CLUSTER_OP_VOLUME_MOVE, body, bl, 1, &reply, &rl);
+        char why[256];
+        snprintf(why, sizeof why, "%.*s", (int)(rl < 240 ? rl : 240), reply ? (const char *)reply : "");
+        free(reply);
+        if (mrc == 0 || !strstr(why, "young_move_pct"))
+            die("placeclass: volume move --log to 85%%-full node 2 not refused with young_move_pct (rc=%d, %s)", mrc,
+                why);
+    }
+    printf("  node 2 nvme at 85%% avoided by replicas=2, ec=2+1, replicas=3 (FEW) and R4 move\n");
+
+    /* Clear node 2's fill override and wait until leader sees usage cleared before continuing. */
+    unlink(u2);
+    await_disk_section(0, ids[2], "young_bytes=", 0, 10000, "node 2 usage cleared");
+
+    /* 4. Add node 5 (nvme-only, 0 stripe holds while HDD nodes 0..4 each hold >= 1):
+     *    - ec=2+1 MUST stay single-class HDD (never pick node 5 -> catches mixstripe!).
+     *    - ec=4+2 (needs 6) MUST mix classes and appear in health and STATUS. */
+    no_auto_disk[5] = 1;
+    omit_dir[5] = 1;
+    xargs[5] = xa[5];
+    penv[5] = pe[5];
+    start(5);
+    node_add(0, 5);
+    struct disks_want w5 = {ids[5], 1, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w5, "placeclass: node 5 nvme-only registered");
+    /* Wait for node 5's chunk store to come up and a heartbeat carrying it to reach the Raft leader (no fixed sleep). */
+    await_log(5, "chunk server up as node", 10000, "placeclass: node 5 chunk server started");
+    write_usage_file(u5, "nvme 10 10\n");
+    await_disk_section(0, ids[5], "chunk_bytes=", 1, 10000, "node 5 heartbeat after chunk server start");
+
+    uint32_t vsame = 0;
+    rc = vol_add_ec(0, "pc_samecls", 0, 2, 1, &vsame, ecmsg, sizeof ecmsg);
+    if (rc != 0)
+        die("placeclass: vol_add_ec pc_samecls: %s (%s)", cluster_strerror(rc), ecmsg);
+    view(0, &vw);
+    const struct meta_volume *mvs = meta_volume(&vw.m, vsame);
+    if (!mvs || mvs->nstripe != 3)
+        die("placeclass: missing pc_samecls");
+    for (uint32_t p = 0; p < mvs->nstripe; p++) {
+        if (mvs->stripe[p] == ids[5] || place_member_chunk_class(meta_member(&vw.m, mvs->stripe[p])) != META_DISK_HDD)
+            die("placeclass: ec=2+1 pc_samecls mixed in nvme-only node %" PRIu32 " despite 5 hdd nodes", mvs->stripe[p]);
+    }
+    if (place_stripe_mixed_class(&vw.m, mvs) != 0)
+        die("placeclass: pc_samecls reported mixed_class=1");
+    view_free(&vw);
+    printf("  ec=2+1 with 5 hdd (holds>=1) + 1 nvme-only (holds=0) stayed single-class hdd\n");
+
+    uint32_t vmix = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(150000)) {
+        rc = vol_add_ec(0, "pc_mixed", 0, 4, 2, &vmix, ecmsg, sizeof ecmsg);
+        if (rc != CLUSTER_ERR_FEW)
+            break;
+    }
+    if (rc != 0)
+        die("placeclass: vol_add_ec pc_mixed (4+2) failed: %s (%s)", cluster_strerror(rc), ecmsg);
+    await_isr(0, "pc_mixed", 3, 20000, "placeclass: pc_mixed ISR=3");
+
+    view(0, &vw);
+    const struct meta_volume *mvm = meta_volume(&vw.m, vmix);
+    if (!mvm || mvm->nstripe != 6 || place_stripe_mixed_class(&vw.m, mvm) != 1)
+        die("placeclass: ec=4+2 pc_mixed not detected as mixed-class (nstripe=%u)", mvm ? mvm->nstripe : 0);
+    int mix_leader = server_of(mvm->leader);
+    view_free(&vw);
+
+    /* Verify mixed-class warning in `tsdb cluster status` CLI output. */
+    char cli_out[65536];
+    run_cli_status(0, cli_out, sizeof cli_out);
+    char want_cli[160], bad_cli[160];
+    snprintf(want_cli, sizeof want_cli, "health warn=mixed_stripe_class volume=%" PRIu32 " name=pc_mixed", vmix);
+    snprintf(bad_cli, sizeof bad_cli, "health warn=mixed_stripe_class volume=%" PRIu32 " name=pc_samecls", vsame);
+    if (!strstr(cli_out, "mixed_class 1") || !strstr(cli_out, want_cli))
+        die("placeclass: `tsdb cluster status` missing mixed-class warning (%s):\n%s", want_cli, cli_out);
+    if (strstr(cli_out, bad_cli))
+        die("placeclass: `tsdb cluster status` falsely warned mixed-class for pc_samecls");
+
+    /* Verify mixed-class warning in client protocol TSDB_OP_STATUS on the volume leader. */
+    tsdbc *c = client(mix_leader);
+    char *stxt = NULL;
+    if (tsdbc_status(c, &stxt) != 0 || !stxt)
+        die("placeclass: tsdbc_status on leader %d failed", mix_leader);
+    char want_st1[96], want_st2[128], bad_st[96];
+    snprintf(want_st1, sizeof want_st1, "vol.%" PRIu32 ".mixed_class=1\n", vmix);
+    snprintf(want_st2, sizeof want_st2, "health.mixed_class.vol.%" PRIu32 "=pc_mixed\n", vmix);
+    snprintf(bad_st, sizeof bad_st, "vol.%" PRIu32 ".mixed_class=1\n", vsame);
+    if (!strstr(stxt, want_st1) || !strstr(stxt, want_st2))
+        die("placeclass: TSDB_OP_STATUS missing mixed_class lines (%s / %s):\n%s", want_st1, want_st2, stxt);
+    if (strstr(stxt, bad_st))
+        die("placeclass: TSDB_OP_STATUS falsely reported mixed_class for pc_samecls");
+    free(stxt);
+    tsdbc_close(c);
+    printf("  ec=4+2 mixed-class fallback listed in cluster status and TSDB_OP_STATUS\n");
+
+    /* 5. Chunk store past fill mark: node 5 chunk fill 92% -> ec=4+2 (needs 6) refused with CLUSTER_ERR_FEW. */
+    unlink(u5);
+    await_disk_section(0, ids[5], "chunk_bytes=", 0, 10000, "node 5 usage cleared before full check");
+    write_usage_file(u5, "nvme 10 92\n");
+    await_disk_section(0, ids[5], "chunk_bytes=", 1, 10000, "node 5 chunk usage at 92%");
+    uint32_t vcf = 0;
+    rc = vol_add_ec(0, "pc_chunkfull", 0, 4, 2, &vcf, ecmsg, sizeof ecmsg);
+    if (rc != CLUSTER_ERR_FEW)
+        die("placeclass: ec=4+2 with node 5 chunk store at 92%% returned %s (want CLUSTER_ERR_FEW)",
+            cluster_strerror(rc));
+    printf("  chunk store past fill mark rejected for new stripe placement\n");
+
+    epoll_after_two = 0;
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -30693,7 +31079,7 @@ int main(int argc, char **argv)
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
-               {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}};
+               {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

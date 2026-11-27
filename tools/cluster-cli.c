@@ -447,10 +447,14 @@ static void print_status(const struct cluster_status *st)
             for (uint32_t k = 0; k < v->nstripe && k < META_STRIPE_MAX; k++)
                 printf("%s%" PRIu32, k ? "," : " ", v->stripe[k]);
             printf(" stripe_version %" PRIu64 " gc_suspended %u", v->stripe_version, v->gc_suspended);
+            if (place_stripe_mixed_class(&m, v))
+                printf(" mixed_class 1");
         } else {
             printf(" redundancy replicas=%" PRIu32, v->nrep);
         }
         printf(" rack loss survivable: %s\n", place_rack_survivable(&m, v) ? "yes" : "no");
+        if (v->redundancy == META_RED_EC && place_stripe_mixed_class(&m, v))
+            printf("health warn=mixed_stripe_class volume=%" PRIu32 " name=%s\n", v->number, v->name);
         for (uint32_t k = 0; k < v->nrep; k++) {
             printf("replica volume %" PRIu32 " node %" PRIu32 " rid %016" PRIx64 " open_gen %" PRIu64, v->number,
                    v->rep[k].node, v->rep[k].rid, v->rep[k].open_gen);

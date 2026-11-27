@@ -45,6 +45,10 @@ uint64_t cl_wall_ms(void);
 int cl_pend_member(uint32_t id);
 /* number of chunk stores currently UP on member `id` as last reported in HBS_STORES (0 if none/unknown) */
 uint32_t cl_member_chunk_stores(uint32_t id);
+/* R13 (r13-place; E49, E50, E51, E53): 1 if `node` passes log-replica / stripe-position capability, role and disk fill
+ * rules under the current heartbeat view, else 0 with optional reason in *why_out. */
+int cl_member_log_ok(uint32_t node, uint64_t now, const char **why_out);
+int cl_member_stripe_ok(uint32_t node, uint64_t now, const char **why_out);
 /* R10 (D26, D28): last HBS_LIVE_OBJS report heard from `node` for `volume` (1 if found and copied to *out, else 0) */
 int cl_heard_live_objs(uint32_t node, uint32_t volume, struct cluster_live_objs_report *out);
 /* the answer to an admin op (conn and reqid as the op's entry point got them) */

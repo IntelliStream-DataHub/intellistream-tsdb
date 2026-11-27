@@ -25,9 +25,11 @@
 #include "../src/compat.h"
 #include "../src/internal.h"
 
-#define HBS_DISKS_VER   1u
-#define HBS_DISKS_HDR   8u
-#define HBS_DISKS_ENTRY 36u
+#define HBS_DISKS_VER      2u
+#define HBS_DISKS_VER_V1   1u
+#define HBS_DISKS_HDR      8u
+#define HBS_DISKS_ENTRY_V1 36u
+#define HBS_DISKS_ENTRY    52u
 
 struct known_disk {
     uint8_t store_id[16];
@@ -489,6 +491,60 @@ int disks_parse_role(const char *arg, uint8_t *role_out)
 
 /* ---------------------------------------------------------------- HBS_DISKS heartbeat section & metrics */
 
+#ifdef TSDB_TEST_HOOKS
+/* Test knob (TSDB_DISK_USAGE_FILE=<path>): override reported young_bytes/chunk_bytes per disk in HBS_DISKS.
+ * Each line is either:
+ *   <target> <young_pct> <chunk_pct>
+ * or:
+ *   <target> bytes <young_bytes> <chunk_bytes>
+ * where <target> is "nvme", "ssd", "hdd", "all", or a 32-char hex store_id. */
+static void apply_disk_usage_file(struct hbs_disk_row *rows, uint32_t nrows)
+{
+    const char *path = getenv("TSDB_DISK_USAGE_FILE");
+    if (!path || !*path || nrows == 0)
+        return;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char target[64], mode[32];
+        unsigned long long a = 0, b = 0;
+        int by_bytes = 0;
+        if (sscanf(line, "%63s %31s %llu %llu", target, mode, &a, &b) == 4 && strcmp(mode, "bytes") == 0) {
+            by_bytes = 1;
+        } else if (sscanf(line, "%63s %llu %llu", target, &a, &b) == 3) {
+            by_bytes = 0;
+        } else {
+            continue;
+        }
+        uint8_t sid[16];
+        int is_sid = (parse_hex16(target, sid) == 0);
+        int cls = strcmp(target, "all") == 0 ? -1 : disk_class_parse(target);
+        if (!is_sid && cls == DISK_CLASS_NONE)
+            continue;
+        for (uint32_t i = 0; i < nrows; i++) {
+            struct hbs_disk_row *r = &rows[i];
+            int match = is_sid ? (memcmp(r->store_id, sid, 16) == 0)
+                               : (cls == -1 || (int)r->disk_class == cls);
+            if (!match)
+                continue;
+            r->have_usage = 1;
+            if (by_bytes) {
+                r->young_bytes = (uint64_t)a;
+                r->chunk_bytes = (uint64_t)b;
+            } else {
+                uint64_t yp = a > 100 ? 100 : (uint64_t)a;
+                uint64_t cp = b > 100 ? 100 : (uint64_t)b;
+                r->young_bytes = (uint64_t)(((__uint128_t)r->size_bytes * yp) / 100u);
+                r->chunk_bytes = (uint64_t)(((__uint128_t)r->size_bytes * cp) / 100u);
+            }
+        }
+    }
+    fclose(f);
+}
+#endif
+
 static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
 {
     if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
@@ -509,6 +565,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         if (d->present && !d->meta.bound)
             continue;
         struct hbs_disk_row *r = &rows[nrows++];
+        memset(r, 0, sizeof *r);
         memcpy(r->store_id, d->meta.store_id, 16);
         r->disk_class = (uint8_t)d->effective_class;
         r->uses = d->uses ? d->uses : META_DISK_USE_LOG;
@@ -522,6 +579,9 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         return 0;
     if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && mismatches == 0)
         return 0;
+#ifdef TSDB_TEST_HOOKS
+    apply_disk_usage_file(rows, nrows);
+#endif
     size_t need = HBS_DISKS_HDR + (size_t)nrows * HBS_DISKS_ENTRY;
     if (need > cap)
         return -1;
@@ -536,9 +596,11 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         e[16] = rows[i].disk_class;
         e[17] = rows[i].uses;
         e[18] = rows[i].state;
-        e[19] = 0;
+        e[19] = rows[i].have_usage ? 1u : 0u;
         put_le64(e + 20, rows[i].size_bytes);
         put_le64(e + 28, rows[i].sync_us);
+        put_le64(e + 36, rows[i].young_bytes);
+        put_le64(e + 44, rows[i].chunk_bytes);
     }
     return (ssize_t)need;
 }
@@ -548,14 +610,16 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     (void)member_id;
     if (!data || !out_val || len < HBS_DISKS_HDR)
         return -1;
-    if (data[0] != HBS_DISKS_VER)
+    uint8_t ver = data[0];
+    if (ver != HBS_DISKS_VER && ver != HBS_DISKS_VER_V1)
         return -1;
+    size_t esz = ver == HBS_DISKS_VER ? HBS_DISKS_ENTRY : HBS_DISKS_ENTRY_V1;
     uint8_t role = data[1];
     uint8_t flags = data[2];
     uint32_t n = data[3];
     if (role > META_ROLE_LAST || (flags & ~1u) || n > DISKS_MAX)
         return -1;
-    if (len != HBS_DISKS_HDR + (size_t)n * HBS_DISKS_ENTRY)
+    if (len != HBS_DISKS_HDR + (size_t)n * esz)
         return -1;
     struct hbs_disks *v = calloc(1, sizeof *v + (size_t)n * sizeof v->disks[0]);
     if (!v)
@@ -565,7 +629,7 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     v->class_mismatches = get_le32(data + 4);
     v->ndisks = n;
     for (uint32_t i = 0; i < n; i++) {
-        const uint8_t *e = data + HBS_DISKS_HDR + (size_t)i * HBS_DISKS_ENTRY;
+        const uint8_t *e = data + HBS_DISKS_HDR + (size_t)i * esz;
         struct hbs_disk_row *r = &v->disks[i];
         memcpy(r->store_id, e, 16);
         int nz = 0;
@@ -574,13 +638,30 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
         r->disk_class = e[16];
         r->uses = e[17];
         r->state = e[18];
-        if (!nz || e[19] != 0 || r->disk_class < META_DISK_NVME || r->disk_class > META_DISK_CLASS_LAST ||
+        if (!nz || r->disk_class < META_DISK_NVME || r->disk_class > META_DISK_CLASS_LAST ||
             r->uses == 0 || (r->uses & ~META_DISK_USE_ALL) || r->state > META_STORE_STATE_LAST) {
             free(v);
             return -1;
         }
+        if (ver == HBS_DISKS_VER_V1) {
+            if (e[19] != 0) {
+                free(v);
+                return -1;
+            }
+            r->have_usage = 0;
+        } else {
+            if (e[19] > 1u) {
+                free(v);
+                return -1;
+            }
+            r->have_usage = e[19];
+        }
         r->size_bytes = get_le64(e + 20);
         r->sync_us = get_le64(e + 28);
+        if (ver == HBS_DISKS_VER) {
+            r->young_bytes = get_le64(e + 36);
+            r->chunk_bytes = get_le64(e + 44);
+        }
         if (r->size_bytes == 0) {
             free(v);
             return -1;
@@ -613,7 +694,15 @@ static size_t disks_sec_format(uint32_t member_id, const void *val, char *buf, s
         const struct hbs_disk_row *r = &v->disks[i];
         char hex[33];
         chunk_oid_hex(r->store_id, hex);
-        int n = snprintf(buf + off, cap - off,
+        int n;
+        if (r->have_usage)
+            n = snprintf(buf + off, cap - off,
+                         "disk node=%" PRIu32 " id=%s class=%s uses=%s state=%s size=%" PRIu64 " sync_us=%" PRIu64
+                         " young_bytes=%" PRIu64 " chunk_bytes=%" PRIu64 "\n",
+                         member_id, hex, meta_disk_class_name(r->disk_class), uses_str(r->uses),
+                         meta_store_state_name(r->state), r->size_bytes, r->sync_us, r->young_bytes, r->chunk_bytes);
+        else
+            n = snprintf(buf + off, cap - off,
                          "disk node=%" PRIu32 " id=%s class=%s uses=%s state=%s size=%" PRIu64 " sync_us=%" PRIu64 "\n",
                          member_id, hex, meta_disk_class_name(r->disk_class), uses_str(r->uses),
                          meta_store_state_name(r->state), r->size_bytes, r->sync_us);

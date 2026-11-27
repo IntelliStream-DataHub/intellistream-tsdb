@@ -446,8 +446,10 @@ void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, si
         reply(conn, reqid, META_ERR_STATE, "volume move --pos: target node %" PRIu32 " is being replaced", to);
         return;
     }
-    if (cl_member_chunk_stores(to) == 0) {
-        reply(conn, reqid, META_ERR_INVALID, "volume move --pos: target node %" PRIu32 " has no chunk stores up", to);
+    const char *stripe_why = NULL;
+    if (!cl_member_stripe_ok(to, now, &stripe_why)) {
+        reply(conn, reqid, META_ERR_INVALID, "volume move --pos: target node %" PRIu32 ": %s", to,
+              stripe_why ? stripe_why : "not eligible for stripe positions");
         return;
     }
     for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {

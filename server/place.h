@@ -41,6 +41,18 @@ struct place_vol_fault {
     uint64_t fault_s; /* continuous seconds reporting CL_HEALTH_LOCAL_FAULT */
 };
 
+/* Per-disk usage report carried from HBS_DISKS into the pure planner (R13 r13-place; E50, E51, E53). */
+struct place_disk_usage {
+    uint8_t store_id[16];
+    uint8_t disk_class; /* enum meta_disk_class */
+    uint8_t uses;       /* enum meta_disk_uses bitmask */
+    uint8_t state;      /* enum meta_store_state */
+    uint8_t have_usage; /* 1 when young_bytes/chunk_bytes are reported (r13-fill or test knob) */
+    uint64_t size_bytes;
+    uint64_t young_bytes;
+    uint64_t chunk_bytes;
+};
+
 /* Per-member liveness and heartbeat report as the Raft leader sees it. */
 struct place_member {
     uint32_t id;
@@ -53,6 +65,8 @@ struct place_member {
     uint64_t store_ids[PLACE_STORES_MAX]; /* store identities for return-vs-lost check (D13, D15) */
     uint32_t nfaults;
     struct place_vol_fault faults[PLACE_FAULTS_MAX];
+    uint32_t ndisks;
+    const struct place_disk_usage *disks; /* optional HBS_DISKS per-disk usage snapshot (NULL/0: unreported) */
 };
 
 /* Per-position fill report received via HBS_FILL (D10, D11). */
@@ -74,6 +88,7 @@ struct place_settings {
     uint32_t out_guard_pct;       /* 25 */
     uint32_t out_guard_hold_s;    /* 7200 */
     uint32_t repl_retain_down_gb; /* 64 */
+    uint32_t young_move_pct;      /* 80 (R13 E51/E53: fast disk no-new-placement mark) */
     uint32_t young_high_pct;      /* 90 */
     uint32_t balance_mb_s;        /* 0 (= rebuild_mb_s) */
     uint32_t rebuild_concurrency; /* 4 */
@@ -96,6 +111,9 @@ enum place_mutant {
     PLACE_MUT_OPENING_UNBOUNDED = 10,
     PLACE_MUT_FAILSTOP_SLOW = 11,
     PLACE_MUT_BALANCE_UNBOUNDED = 12,
+    PLACE_MUT_LOG_HDD = 13,     /* R13 r13-place: ignore compute capability/role for log placement */
+    PLACE_MUT_MIX_STRIPE = 14,  /* R13 r13-place: ignore disk class for stripe placement */
+    PLACE_MUT_PLACE_FULL = 15,  /* R13 r13-place: ignore young_move_pct (80%) and chunk fill mark */
 };
 
 /* Active `node replace OLD NEW` intent (r9-ops records; place_plan sends each of OLD's positions to NEW). */
@@ -196,6 +214,22 @@ int place_stripe(const struct place_in *in, uint32_t ns, uint32_t *stripe, uint3
 
 /* Returns 1 if losing any single rack leaves volume `v` survivable in both log and EC tiers (E9, D20), else 0. */
 int place_rack_survivable(const struct meta_state *sm, const struct meta_volume *v);
+
+/* R13 (r13-place; E49, E50, E51, §15.3, §15.5): class & fill eligibility helpers (pure). */
+/* Effective chunk disk class over `disks[0..ndisks)` (enum meta_disk_class; META_DISK_NONE when unregistered/unknown;
+ * slowest class wins if multiple UP chunk-use classes exist: HDD > SSD > NVME). */
+uint8_t place_disks_chunk_class(const struct meta_disk *disks, uint32_t ndisks);
+uint8_t place_member_chunk_class(const struct meta_member *mb);
+/* Returns 1 if EC volume `v`'s active stripe group spans more than one disk class (E51, §15.3), else 0. */
+int place_stripe_mixed_class(const struct meta_state *sm, const struct meta_volume *v);
+/* Returns 1 if member `mb` is eligible for a log replica (compute-capable role/disks and at least one eligible disk
+ * below young_move_pct with projected add_bytes), else 0 (optional reason in *why_out). */
+int place_member_log_ok(const struct place_in *in, const struct meta_member *mb, uint64_t add_bytes,
+                        const char **why_out);
+/* Returns 1 if member `mb` is eligible for an EC stripe position (storage-capable role/disks, chunk store up, and at
+ * least one chunk store below fill mark / rebuild full), else 0 (optional reason in *why_out). */
+int place_member_stripe_ok(const struct place_in *in, const struct meta_member *mb, int is_rebuild,
+                           const char **why_out);
 
 /* Parse a mutant name (NULL or "" -> PLACE_MUT_NONE; unknown -> -1). */
 int place_mutant_parse(const char *name);

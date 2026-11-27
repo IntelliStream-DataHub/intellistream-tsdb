@@ -422,6 +422,8 @@ const struct cluster_copy_vol *cluster_copy_vol_named(const struct cluster_copy 
 /* The role of member `node` in volume v as TOPOLOGY says it (TSDB_ROLE_*, D9: no new role before S3): the leader
  * OWNER, a replica in the ISR STANDBY, any other replica (a learner too) FOLLOWER, anyone else NONE. */
 int cluster_copy_role(const struct cluster_copy_vol *v, uint32_t node);
+/* R13 (r13-place; E51, §15.3): 1 if EC volume `v`'s active stripe group spans more than one chunk disk class. */
+int cluster_copy_stripe_mixed(const struct cluster_copy *c, const struct cluster_copy_vol *v);
 /* Where requests for volume `vol` go, from the current snapshot: 1 when it has a leader whose member is UP and is
  * another server, 2 when that leader is this server (the snapshot's self), with its id, the epoch and its client
  * address in addr, cap bytes; 0 when there is none (no copy, no such volume, no leader, or the leader is not UP).

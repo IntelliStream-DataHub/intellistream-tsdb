@@ -672,7 +672,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle r4stubs r9stubs o
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
-    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -687,7 +687,7 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	./$(B)/test_pace $(SCRATCH)
 	$(MUT) --name test_pace --list "pacefifo nohalve" -- ./$(B)/test_pace --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_place
-	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
 	./$(B)/test_sfill $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust wholeearly" -- ./$(B)/test_sfill --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_sreconcile $(SCRATCH)
@@ -1080,7 +1080,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants cvolfs-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants cvolfs-mutants placeclass-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1233,7 +1233,7 @@ reconcile-mutants: $(B)/test_sreconcile $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 $(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
 place-plan-mutants: $(B)/test_place
-	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier" -- ./$(B)/test_place --mutant @M@
+	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull" -- ./$(B)/test_place --mutant @M@
 # R9 operator ops mutants (server/cnode.c, track r9-ops): drainleaves must fail nodedrain, replaceclear must fail nodereplace
 ops-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 	$(MUT) --name ops-drain --list "drainleaves" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodedrain
@@ -1280,7 +1280,7 @@ META_SOAK_FIRST   ?= 1000
 # cvol_check.o opens a replica directory in-process (the engine's headers; test_cluster speaks the client's)
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h tests/rdma_dev.h server/cluster.h server/creport.h server/crashpt.h server/meta.h server/peerlink.h server/plrdma.h \
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h tests/rdma_dev.h server/cluster.h server/creport.h server/crashpt.h server/meta.h server/peerlink.h server/place.h server/plrdma.h \
     $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
@@ -1318,6 +1318,11 @@ cvolfs-mutants: $(B)/test_cvolfs $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHF
 	$(MUT) --name test_cvolfs_r13 --list "cvolfirstdisk cvoldupok" -- ./$(B)/test_cvolfs --mutant @M@ @D@
 	$(MUT) --name twodisks --uring --list "cvolfirstdisk cvoldupok" -- env TSDB_CVOL_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ twodisks
+# R13 (r13-place) placement by capability, class and disk fill marks planted bugs (server/place.c; TSDB_PLACE_MUTANT)
+placeclass-mutants: $(B)/test_place $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	$(MUT) --name test_place_r13 --list "loghdd mixstripe placefull" -- ./$(B)/test_place --mutant @M@
+	$(MUT) --name placeclass --uring --list "loghdd mixstripe placefull" -- env TSDB_PLACE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ placeclass
 
 # TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
