@@ -96,6 +96,7 @@ typedef struct tier {
     bool read_only;
     uint8_t db_id[16];
     tiers_view tview;
+    int tiers_to_be[TIERS_STORES_MAX]; /* TIERS store index -> backend slot index (-1 when REMOVED at open) */
     bool ov_grace;
     /* R15 (r15-salvage): cumulative salvage counters exposed on /metrics */
     atomic_uint_fast64_t salvaged_partitions;

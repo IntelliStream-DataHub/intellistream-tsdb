@@ -2277,26 +2277,33 @@ static int cmd_tier_set(const char *dir, int argc, char **argv)
     }
     if (rc == 0 && (s.set_mask & TSDB_TIER_SET_REDUNDANCY)) {
         bool all_sc = true;
+        size_t elig_stores = 0;
         size_t active_stores = 0;
         for (size_t i = 0; i < tv.nstores; i++) {
+            uint8_t st = tv.stores[i].state;
+            if (st == TIERS_STATE_REMOVED || st == TIERS_STATE_SHRINKING)
+                continue;
+            elig_stores++;
             if (!tv.stores[i].single_copy)
                 all_sc = false;
-            if (tv.stores[i].state != TIERS_STATE_LOST)
+            if (tiers_state_is_active(st))
                 active_stores++;
         }
+        if (elig_stores == 0)
+            all_sc = false;
         if (s.m == 0) {
             if (s.k != 1 || !all_sc) {
                 fprintf(stderr, "tsdb: tier set: %u+0 redundancy requires k = 1 and every store to be --single-copy\n",
                         (unsigned)s.k);
                 rc = TSDB_ERR_INVALID;
             }
-        } else if ((size_t)s.k + (size_t)s.m > tv.nstores) {
+        } else if ((size_t)s.k + (size_t)s.m > elig_stores) {
             fprintf(stderr, "tsdb: tier set: redundancy %u+%u requires %u stores, only %zu configured\n",
-                    (unsigned)s.k, (unsigned)s.m, (unsigned)(s.k + s.m), tv.nstores);
+                    (unsigned)s.k, (unsigned)s.m, (unsigned)(s.k + s.m), elig_stores);
             rc = TSDB_ERR_INVALID;
         } else if ((size_t)s.k + (size_t)s.m > active_stores) {
-            fprintf(stderr, "tsdb: tier set: warning: redundancy %u+%u needs %u stores, only %zu non-lost store(s) "
-                            "currently active; settles will wait until lost stores are replaced\n",
+            fprintf(stderr, "tsdb: tier set: warning: redundancy %u+%u needs %u stores, only %zu active store(s) "
+                            "currently available; settles will wait until lost stores are replaced\n",
                     (unsigned)s.k, (unsigned)s.m, (unsigned)(s.k + s.m), active_stores);
         }
     }
@@ -2366,20 +2373,29 @@ static int cmd_tier_lost(const char *dir, int argc, char **argv)
         fprintf(stderr, "tsdb: tier lost: specify STORE and exactly one of --replace PATH or --shrink\n");
         return tier_usage();
     }
-    if (shrink) {
-#ifndef TSDB_EC
-        fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
-#else
-        fprintf(stderr, "tsdb: tier lost: --shrink: not built\n");
-#endif
-        return 2;
+    if (shrink && (flags & TSDB_TIER_SINGLE_COPY)) {
+        fprintf(stderr, "tsdb: tier lost: --single-copy cannot be used with --shrink\n");
+        return tier_usage();
     }
 #ifndef TSDB_EC
     (void)dir;
     (void)flags;
+    (void)shrink;
     fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
     return 1;
 #else
+    if (shrink) {
+        int slot = -1;
+        int rc = tierctl_lost_dir(dir, store, NULL, NULL, flags, NULL, &slot);
+        if (rc != 0) {
+            fprintf(stderr, "tsdb: tier lost %s --shrink: %s\n", store, tsdb_strerror(rc));
+            return 1;
+        }
+        printf("tier store %d marked LOST and SHRINKING (re-encode onto remaining stores will run in the writer or "
+               "when the database is next opened)\n",
+               slot);
+        return 0;
+    }
     char pathbuf[PATH_MAX];
     const char *cls = NULL;
     uint8_t cls_val = TSDB_TIER_CLASS_UNKNOWN;
@@ -2554,14 +2570,26 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     for (size_t i = 0; i < nextra; i++)
         vol_paths[i + 1] = extra_vols[i];
 
-    bool all_sc = nstores > 0;
-    size_t n_up = 0, n_down = 0, n_lost = 0, n_replacing = 0;
-    int rb_store = -1;
-    uint64_t rb_bytes_done = 0, rb_bytes_est = 0;
+    bool all_sc = true;
+    size_t n_up = 0, n_down = 0, n_lost = 0, n_replacing = 0, n_shrinking = 0, n_removed = 0;
+    int rb_store = -1, shrink_store = -1;
+    uint64_t rb_bytes_done = 0, rb_bytes_est = 0, shrink_objects_left = 0;
     uint64_t total_tier_bytes = 0;
     bool any_store_partial = false;
     for (size_t i = 0; i < nstores; i++) {
         const tiers_store *st = &tv.stores[i];
+        if (st->state == TIERS_STATE_REMOVED) {
+            store_state[i] = "removed";
+            n_removed++;
+            continue;
+        }
+        if (st->state == TIERS_STATE_SHRINKING) {
+            store_state[i] = "shrinking";
+            n_shrinking++;
+            if (shrink_store < 0)
+                shrink_store = (int)i;
+            continue;
+        }
         if (!st->single_copy)
             all_sc = false;
         if (st->state == TIERS_STATE_LOST) {
@@ -2614,6 +2642,12 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             }
         }
     }
+    size_t n_live = nstores - n_removed;
+    size_t n_non_shrinking = n_live - n_shrinking;
+    if (n_non_shrinking == 0)
+        all_sc = false;
+    if (n_shrinking > 0)
+        (void)tierctl_count_shrink_objects(&tv, vol_paths, nvols, &shrink_objects_left);
 
     for (size_t v = 0; v < nvols; v++) {
         tier_scan_vol_ec(vol_paths[v], &vol_ec_parts[v], &vol_ec_bytes[v], &vol_partial[v]);
@@ -2629,12 +2663,12 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
 
     int gk = 0, gm = 0;
     bool active = false;
-    if (nstores > 0) {
+    if (n_live > 0) {
         if (tv.global.set_mask & TSDB_TIER_SET_REDUNDANCY) {
             gk = (int)tv.global.k;
             gm = (int)tv.global.m;
             active = true;
-        } else if (tier_default_geom((int)nstores, all_sc, &gk, &gm)) {
+        } else if (tier_default_geom((int)n_non_shrinking, all_sc, &gk, &gm)) {
             active = true;
         }
     }
@@ -2642,7 +2676,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     bool underneath = active && all_sc && gm == 0;
     int min_m = gm;
     bool have_ec_vol = active && !underneath;
-    if (nstores > 0) {
+    if (n_live > 0) {
         for (size_t v = 0; v < nvols; v++) {
             tiers_settings vs;
             tiers_view_settings_for(&tv, (uint32_t)v, &vs);
@@ -2659,7 +2693,8 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             }
         }
     }
-    int margin = have_ec_vol ? min_m - (int)(n_down + n_lost + n_replacing) : 0;
+    size_t n_unavail = n_down + n_lost + n_replacing + n_shrinking;
+    int margin = have_ec_vol ? min_m - (int)n_unavail : 0;
     uint64_t settles_waiting = 0;
     uint64_t damaged_cells = 0;
 
@@ -2691,6 +2726,8 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         printf("  \"stores_down\": %zu,\n", n_down);
         printf("  \"stores_lost\": %zu,\n", n_lost);
         printf("  \"stores_replacing\": %zu,\n", n_replacing);
+        printf("  \"stores_shrinking\": %zu,\n", n_shrinking);
+        printf("  \"stores_removed\": %zu,\n", n_removed);
         printf("  \"total_tier_bytes\": %" PRIu64 ",\n", total_tier_bytes);
         printf("  \"bytes_partial\": %s,\n", any_store_partial ? "true" : "false");
         printf("  \"settings\": {\"after_s\": %" PRIu64 ", \"high_pct\": %u, \"young_high_pct\": %u, "
@@ -2706,6 +2743,12 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
                    rb_store, rb_bytes_done, rb_bytes_est);
         else
             fputs("  \"rebuild\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
+        if (shrink_store >= 0)
+            printf("  \"shrink\": {\"active\": true, \"state\": \"shrinking\", \"store\": %d, "
+                   "\"objects_left\": %" PRIu64 "},\n",
+                   shrink_store, shrink_objects_left);
+        else
+            fputs("  \"shrink\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
         fputs("  \"scrub\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
         fputs("  \"stores\": [", stdout);
         for (size_t i = 0; i < nstores; i++) {
@@ -2713,8 +2756,11 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             const uint8_t *cur_id = st->state == TIERS_STATE_REPLACED_BY ? st->replaced_by : st->id;
             char shex[33];
             chunk_oid_hex(cur_id, shex);
-            const char *tstate = st->state == TIERS_STATE_LOST ? "lost"
-                               : st->state == TIERS_STATE_REPLACED_BY ? "replaced" : "active";
+            const char *tstate = st->state == TIERS_STATE_LOST        ? "lost"
+                               : st->state == TIERS_STATE_REPLACED_BY ? "replaced"
+                               : st->state == TIERS_STATE_SHRINKING   ? "shrinking"
+                               : st->state == TIERS_STATE_REMOVED     ? "removed"
+                                                                      : "active";
             printf("%s\n    {\"index\": %zu, \"id\": \"%s\", \"class\": \"%s\", \"single_copy\": %s, "
                    "\"tiers_state\": \"%s\", \"state\": \"%s\", \"bytes\": %" PRIu64 ", \"bytes_partial\": %s, "
                    "\"damaged_cells\": 0, \"fs_total_bytes\": ",
@@ -2758,7 +2804,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             if (v_under)
                 fputs(", \"margin\": \"underneath\"", stdout);
             else if (vactive)
-                printf(", \"margin\": %d", vm - (int)(n_down + n_lost + n_replacing));
+                printf(", \"margin\": %d", vm - (int)n_unavail);
             else
                 fputs(", \"margin\": null", stdout);
             printf(", \"after_s\": %" PRIu64 ", \"high_pct\": %u, \"bytes_by_store\": [", vs.tier_after_s,
@@ -2778,6 +2824,10 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
                nstores, nstores == 1 ? "" : "s", n_up, n_down, n_lost);
         if (n_replacing > 0)
             printf(", %zu replacing", n_replacing);
+        if (n_shrinking > 0)
+            printf(", %zu shrinking", n_shrinking);
+        if (n_removed > 0)
+            printf(", %zu removed", n_removed);
         puts(")");
         printf("db_id: %s\n", db_hex);
         if (active)
@@ -2785,10 +2835,10 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         else
             puts("redundancy: none (need at least 2 stores or --single-copy)");
         if (underneath) {
-            if (n_down + n_lost + n_replacing == 0)
+            if (n_unavail == 0)
                 puts("margin: underneath");
             else
-                printf("margin: underneath (%zu store(s) unavailable)\n", n_down + n_lost + n_replacing);
+                printf("margin: underneath (%zu store(s) unavailable)\n", n_unavail);
         } else if (have_ec_vol) {
             if (margin < 0)
                 printf("margin: %d store(s) (below redundancy, %d store(s) short)\n", margin, -margin);
@@ -2817,6 +2867,8 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         } else {
             puts("rebuild: idle");
         }
+        if (shrink_store >= 0)
+            printf("shrink: store %d shrinking (%" PRIu64 " object(s) left)\n", shrink_store, shrink_objects_left);
         puts("scrub: idle");
         puts("stores:");
         for (size_t i = 0; i < nstores; i++) {
@@ -2851,7 +2903,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             if (v_under)
                 fputs("\tmargin=underneath", stdout);
             else if (vactive)
-                printf("\tmargin=%d", vm - (int)(n_down + n_lost + n_replacing));
+                printf("\tmargin=%d", vm - (int)n_unavail);
             else
                 fputs("\tmargin=none", stdout);
             printf("\tafter=%" PRIu64 "s\thigh_pct=%u%%\n", vs.tier_after_s, vs.tier_high_pct);

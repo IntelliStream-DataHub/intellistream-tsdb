@@ -316,7 +316,7 @@ typedef struct tsdb_tier_store_info {
     uint8_t id[16];
     uint8_t cls;         /* TSDB_TIER_CLASS_* */
     uint8_t single_copy;
-    uint8_t state;       /* 0 active, 1 lost, 2 replaced */
+    uint8_t state;       /* 0 active, 1 lost, 2 replaced, 3 shrinking, 4 removed */
     char path[4096];
     uint64_t bytes;
     uint64_t damaged_cells;
@@ -331,8 +331,8 @@ typedef struct tsdb_tier_info {
     int64_t days_to_full; /* -1 if unknown */
 } tsdb_tier_info;
 
-/* Local tier control (R15): tsdb_tier_lost (--replace) and tsdb_tier_salvage are implemented;
- * tsdb_tier_set and tsdb_tier_status remain stubbed until their tracks land. */
+/* Local tier control (R15): tsdb_tier_lost (--replace when replace_path != NULL, --shrink when NULL) and
+ * tsdb_tier_salvage are implemented; tsdb_tier_set and tsdb_tier_status remain stubbed until their tracks land. */
 int tsdb_tier_set(tsdb *db, const tsdb_tier_settings *settings);
 int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32_t flags);
 int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force);

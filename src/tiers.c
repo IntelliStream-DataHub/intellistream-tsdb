@@ -302,7 +302,7 @@ int tiers_encode_state(uint64_t off, const uint8_t id[16], uint8_t state, uint8_
     if (!id || is_all_zero(id) || !out)
         return TSDB_ERR_INVALID;
     size_t np_len = 0;
-    if (state == TIERS_STATE_LOST) {
+    if (state == TIERS_STATE_LOST || state == TIERS_STATE_SHRINKING || state == TIERS_STATE_REMOVED) {
         if (new_cls != 0 || new_single_copy || (new_id && !is_all_zero(new_id)) || (new_path && *new_path))
             return TSDB_ERR_INVALID;
     } else if (state == TIERS_STATE_REPLACED_BY) {
@@ -452,7 +452,7 @@ static int apply_store(tiers_view *v, const uint8_t *pl, size_t plen)
     if (v->nstores >= TIERS_STORES_MAX || seen_id_has(v, id))
         return TSDB_ERR_CORRUPT;
     for (size_t i = 0; i < v->nstores; i++) {
-        if (strcmp(v->stores[i].path, path) == 0)
+        if (v->stores[i].state != TIERS_STATE_REMOVED && strcmp(v->stores[i].path, path) == 0)
             return TSDB_ERR_CORRUPT;
     }
     char *pcopy = strdup(path);
@@ -538,7 +538,7 @@ static int apply_state(tiers_view *v, const uint8_t *pl, size_t plen)
             return TSDB_ERR_CORRUPT;
         /* Replacement path may reuse the lost slot's own mount point, but not another live store's path. */
         for (size_t i = 0; i < v->nstores; i++) {
-            if (i != tidx && v->stores[i].state != TIERS_STATE_LOST && strcmp(v->stores[i].path, npath) == 0)
+            if (i != tidx && tiers_state_is_active(v->stores[i].state) && strcmp(v->stores[i].path, npath) == 0)
                 return TSDB_ERR_CORRUPT;
         }
         char *pcopy = strdup(npath);
@@ -558,6 +558,22 @@ static int apply_state(tiers_view *v, const uint8_t *pl, size_t plen)
         target->cls = new_cls;
         target->single_copy = (new_flags & TIERS_STORE_SINGLE_COPY) != 0;
         target->state = TIERS_STATE_REPLACED_BY;
+        return 0;
+    }
+    if (state == TIERS_STATE_SHRINKING || state == TIERS_STATE_REMOVED) {
+        if (new_cls != 0 || new_flags != 0 || !is_all_zero(new_id) || np_len != 0)
+            return TSDB_ERR_CORRUPT;
+        uint8_t want_prev = state == TIERS_STATE_SHRINKING ? TIERS_STATE_LOST : TIERS_STATE_SHRINKING;
+        tiers_store *target = NULL;
+        for (size_t i = 0; i < v->nstores; i++) {
+            if (v->stores[i].state == want_prev && memcmp(v->stores[i].id, id, 16) == 0) {
+                target = &v->stores[i];
+                break;
+            }
+        }
+        if (!target)
+            return TSDB_ERR_CORRUPT;
+        target->state = state;
         return 0;
     }
     return TSDB_ERR_CORRUPT;

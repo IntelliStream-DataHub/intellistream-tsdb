@@ -145,10 +145,15 @@ static bool d_all_up(void *ctx)
     chunk_backend *be = wbe(d);
     if (!be)
         return false;
-    for (int i = 0; i < chunk_be_nstores(be); i++)
+    int elig = 0;
+    for (int i = 0; i < chunk_be_nstores(be); i++) {
+        if (chunk_be_store_excluded(be, i))
+            continue;
+        elig++;
         if (chunk_be_store_state(be, i) != CHUNK_STORE_UP)
             return false;
-    return true;
+    }
+    return elig > 0;
 }
 
 static bool d_writable(void *ctx)
@@ -156,14 +161,18 @@ static bool d_writable(void *ctx)
     dirctx *d = ctx;
     if (!d->own)
         return tier_writable(d->t);
+    int elig = 0;
     for (int i = 0; i < chunk_be_nstores(d->own); i++) {
+        if (chunk_be_store_excluded(d->own, i))
+            continue;
+        elig++;
         chunk_store *st = chunk_be_store_ref(d->own, i);
         bool bad = chunk_be_store_state(d->own, i) != CHUNK_STORE_UP || !st || chunk_store_failed(st);
         chunk_store_unref(st);
         if (bad)
             return false;
     }
-    return true;
+    return elig > 0;
 }
 
 static uint64_t d_epoch(void *ctx)

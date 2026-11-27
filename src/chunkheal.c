@@ -178,7 +178,7 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
             /* m = 0 objects have only pos 0: if found on another store (ev), not mine; if scanned from tgt (tv), mine. */
             if (p == 0 && found_on[0] < 0)
                 mine[0] = any_mine = true;
-        } else if (found_on[p] < 0 && chunk_be_place_n(oid, p, place_n) == h->store) {
+        } else if (found_on[p] < 0 && chunk_be_place_for_obj(h->be, oid, p, place_n) == h->store) {
             mine[p] = any_mine = true;
         }
     }
@@ -267,7 +267,7 @@ static int heal_object(heal_ctx *h, const uint8_t vuuid[16], const uint8_t oid[1
         int st = chunk_obj_pos_status(ob, p);
         navail += st == CHUNK_ST_OK;
         ndown += st == CHUNK_ST_DOWN && (chunk_mutant == CHUNK_MUT_HEAL_COUNT_TARGET ||
-                                         store_gone(h->be, chunk_be_place_n(oid, p, place_n)));
+                                         store_gone(h->be, chunk_be_place_for_obj(h->be, oid, p, place_n)));
     }
     unsigned want = chunk_mutant == CHUNK_MUT_HEAL_KMINUS1 ? k - 1 : k;
     if (navail < want) {
@@ -589,7 +589,7 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
         return rc;
     int open_rc = chunk_obj_open(be, id->volume, id->vuuid, id->oid, NULL, NULL, &ob);
     if (store < 0)
-        store = (open_rc == 0 && ob) ? chunk_be_place_n(id->oid, id->pos, chunk_obj_place_n(ob))
+        store = (open_rc == 0 && ob) ? chunk_be_place_for_obj(be, id->oid, id->pos, chunk_obj_place_n(ob))
                                      : chunk_be_pos_store(be, id->oid, id->pos);
     int stt = chunk_be_store_state(be, store);
     if (stt != CHUNK_STORE_UP && stt != CHUNK_STORE_REPLACING) {

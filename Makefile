@@ -624,7 +624,7 @@ test-units-b6:
 	./$(B)/test_tier $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_tier --list "tierperengine tierunsure tierstrict tierfresh tierfence selfepoch dbidskip lostopen downnoread attachnoheal fullnoflag storeput96 followflock followdel" -- ./$(B)/test_tier --mutant @M@ @D@,$(MUT) --name test_tier --list "tiernoec" -- ./$(B)/test_tier --mutant @M@ @D@) # each planted bug must fail it (tiernoec in a NO_EC=1 build)
 	./$(B)/test_tierctl $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast" -- ./$(B)/test_tierctl --mutant @M@ @D@) # r15-lost planted bugs must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast shrinkearly" -- ./$(B)/test_tierctl --mutant @M@ @D@) # r15-lost + r15-shrink planted bugs must fail it
 	./$(B)/test_tiersalv $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_tiersalv --list "salvagedown salvagelatest" -- ./$(B)/test_tiersalv --quick --mutant @M@ @D@) # r15-salvage planted bugs must fail it
 	$(if $(filter x86_64,$(shell uname -m)),test "$$($(MAKE) -s --no-print-directory NO_EC=0 print-ec)" = ec && test "$$($(MAKE) -s --no-print-directory NO_EC=1 print-ec)" = noec) # only NO_EC=1 turns the codec off
@@ -1355,9 +1355,9 @@ diskfill-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)
 	$(if $(EC_OBJ),$(MUT) --name test_tiers --list "tiersnosync nodbid samedev" -- ./$(B)/test_tiers --mutant @M@ @D@)
 
-# Tier worker, TIERS re-read, paced rebuild and tier lost --replace mutants (src/tierctl.c, tests/test_tierctl.c)
+# Tier worker, TIERS re-read, paced rebuild, tier lost --replace and --shrink mutants (src/tierctl.c, tests/test_tierctl.c)
 tierctl-mutants: $(B)/test_tierctl $(B)/tsdb $(CRASHFS_SO)
-	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast" -- ./$(B)/test_tierctl --mutant @M@ @D@)
+	$(if $(EC_OBJ),$(MUT) --name test_tierctl --list "lostnoreplace rebuildfast shrinkearly" -- ./$(B)/test_tierctl --mutant @M@ @D@)
 
 # Tier salvage past m LOST stores mutants (src/tiersalv.c, src/ecswap.c, src/ltab.c, tests/test_tiersalv.c)
 tiersalv-mutants: $(B)/test_tiersalv $(CRASHFS_SO)

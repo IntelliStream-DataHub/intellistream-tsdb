@@ -528,45 +528,54 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool re
     int n = (int)t->tview.nstores;
     if (n <= 0 || n > TIERS_STORES_MAX)
         return TSDB_ERR_INVALID;
+    for (int i = 0; i < TIERS_STORES_MAX; i++)
+        t->tiers_to_be[i] = -1;
     const char *paths[TIERS_STORES_MAX];
     uint8_t ids[TIERS_STORES_MAX * 16];
+    int out_n = 0;
     int active = 0;
     for (int i = 0; i < n; i++) {
         const tiers_store *st = &t->tview.stores[i];
-        if (st->state == TIERS_STATE_LOST) {
-            if (tier_mut() == TIER_MUT_LOSTOPEN) {
+        if (st->state == TIERS_STATE_REMOVED)
+            continue; /* R15 r15-shrink: REMOVED stores are skipped at reopen (backend opens n - 1 stores) */
+        int be_i = out_n++;
+        t->tiers_to_be[i] = be_i;
+        if (st->state == TIERS_STATE_LOST || st->state == TIERS_STATE_SHRINKING) {
+            if (st->state == TIERS_STATE_LOST && tier_mut() == TIER_MUT_LOSTOPEN) {
                 /* Planted mutant: opens a LOST store as UP instead of passing NULL (DOWN_MISSING). */
-                paths[i] = st->path;
-                memcpy(ids + 16 * i, st->id, 16);
+                paths[be_i] = st->path;
+                memcpy(ids + 16 * be_i, st->id, 16);
                 active++;
             } else {
-                paths[i] = NULL;
-                memset(ids + 16 * i, 0, 16);
+                paths[be_i] = NULL;
+                memset(ids + 16 * be_i, 0, 16);
             }
         } else if (st->state == TIERS_STATE_REPLACED_BY) {
-            paths[i] = st->path;
-            memcpy(ids + 16 * i, st->replaced_by, 16);
+            paths[be_i] = st->path;
+            memcpy(ids + 16 * be_i, st->replaced_by, 16);
             active++;
         } else {
-            paths[i] = st->path;
-            memcpy(ids + 16 * i, st->id, 16);
+            paths[be_i] = st->path;
+            memcpy(ids + 16 * be_i, st->id, 16);
             active++;
         }
     }
+    if (out_n <= 0)
+        return TSDB_ERR_UNAVAILABLE;
     if (!salvage_mode && active < min_up) {
         fprintf(stderr, "tsdb: %s: %d of %d tier stores in %s are active, %d are needed: the open fails\n", dir,
-                active, n, TIERS_FILE, min_up);
+                active, out_n, TIERS_FILE, min_up);
         return TSDB_ERR_UNAVAILABLE;
     }
     int rc;
     if (salvage_mode) {
         chunk_be_opts bo = {.min_up = 0, .read_only = false, .strict = false};
-        rc = chunk_be_open2(&t->be, paths, n, ids, &bo);
+        rc = chunk_be_open2(&t->be, paths, out_n, ids, &bo);
     } else if (read_only) {
         chunk_be_opts bo = {.min_up = min_up, .read_only = true, .strict = true};
-        rc = chunk_be_open2(&t->be, paths, n, ids, &bo);
+        rc = chunk_be_open2(&t->be, paths, out_n, ids, &bo);
     } else {
-        rc = chunk_be_open(&t->be, paths, n, ids);
+        rc = chunk_be_open(&t->be, paths, out_n, ids);
     }
     if (rc) {
         t->be = NULL;
@@ -578,10 +587,10 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool re
         return mapped;
     }
     if (tier_mut() != TIER_MUT_DBIDSKIP) {
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < out_n; i++) {
             chunk_store *st = chunk_be_store(t->be, i);
             if (!st)
-                continue; /* LOST store (DOWN_MISSING) */
+                continue; /* LOST or SHRINKING store (DOWN_MISSING) */
             chunk_store_owner ow;
             chunk_store_get_owner(st, &ow);
             if (!ow.db_set) {
@@ -607,15 +616,21 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool re
     }
     if (!read_only)
         chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
-    /* R15 (r15-lost): mark LOST slots for E15 TSDB_ERR_IO, and open any unfinished replacement (REBUILDING
-     * marker still present) in CHUNK_STORE_REPLACING so it is never claimed UP early and tierctl resumes it. */
+    /* R15 (r15-lost, r15-shrink): mark LOST/SHRINKING slots for E15 TSDB_ERR_IO, exclude SHRINKING from new
+     * placements, and open any unfinished replacement (REBUILDING marker present) in CHUNK_STORE_REPLACING. */
     for (int i = 0; i < n; i++) {
         const tiers_store *st = &t->tview.stores[i];
+        int be_i = t->tiers_to_be[i];
+        if (be_i < 0)
+            continue;
         if (st->state == TIERS_STATE_LOST && tier_mut() != TIER_MUT_LOSTOPEN) {
-            chunk_be_set_lost(t->be, i, true);
+            chunk_be_set_lost(t->be, be_i, true);
+        } else if (st->state == TIERS_STATE_SHRINKING) {
+            chunk_be_set_lost(t->be, be_i, true);
+            chunk_be_set_excluded(t->be, be_i, true);
         } else if (!read_only && st->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(st->path)) {
-            (void)chunk_be_set_replacing(t->be, i);
-            tier_ensure_paused(t, i, "is rebuilding");
+            (void)chunk_be_set_replacing(t->be, be_i);
+            tier_ensure_paused(t, be_i, "is rebuilding");
         }
     }
     return 0;
@@ -838,13 +853,29 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
 #endif
         bool ro = opt && (opt->read_only || opt->follow);
         int n = (int)tv.nstores;
+        int n_open = 0, n_elig = 0;
         bool all_single_copy = true;
-        for (int i = 0; i < n; i++)
-            if (!tv.stores[i].single_copy)
-                all_single_copy = false;
-        int vrc = validate_tiers_redundancy(dir, &tv.global, n, all_single_copy);
+        for (int i = 0; i < n; i++) {
+            if (tv.stores[i].state == TIERS_STATE_REMOVED)
+                continue;
+            n_open++;
+            if (tv.stores[i].state != TIERS_STATE_SHRINKING) {
+                n_elig++;
+                if (!tv.stores[i].single_copy)
+                    all_single_copy = false;
+            }
+        }
+        if (n_elig == 0)
+            all_single_copy = false;
+        if (n_open == 0) {
+            fprintf(stderr, "tsdb: %s: %s has no non-removed stores (%d store(s) all REMOVED): the open fails\n", dir,
+                    TIERS_FILE, n);
+            tiers_view_free(&tv);
+            return TSDB_ERR_CORRUPT;
+        }
+        int vrc = validate_tiers_redundancy(dir, &tv.global, n_elig, all_single_copy);
         for (size_t i = 0; i < tv.nvols && vrc == 0; i++)
-            vrc = validate_tiers_redundancy(dir, &tv.vols[i].s, n, all_single_copy);
+            vrc = validate_tiers_redundancy(dir, &tv.vols[i].s, n_elig, all_single_copy);
         if (vrc) {
             tiers_view_free(&tv);
             return vrc;
@@ -853,12 +884,12 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
         if (tv.global.set_mask & TSDB_TIER_SET_REDUNDANCY) {
             k = (int)tv.global.k;
             m = (int)tv.global.m;
-        } else if (!tier_default_geom(n, all_single_copy, &k, &m)) {
+        } else if (!tier_default_geom(n_elig, all_single_copy, &k, &m)) {
             /* One non-single-copy store added so far: no active tier yet until a second store is added. */
 #ifdef TSDB_TEST_HOOKS
             if (ov.any && !ro)
                 fprintf(stderr, "tsdb: %s: %s has only %d non-single-copy store (tier not active yet); "
-                                "TSDB_TEST_TIER timing overrides ignored\n", dir, TIERS_FILE, n);
+                                "TSDB_TEST_TIER timing overrides ignored\n", dir, TIERS_FILE, n_elig);
 #endif
             tiers_view_free(&tv);
             return 0;
@@ -867,25 +898,30 @@ static int tier_open_impl(const char *dir, const tsdb_options *opt, bool salvage
         for (size_t i = 0; i < tv.nvols; i++)
             if ((tv.vols[i].s.set_mask & TSDB_TIER_SET_REDUNDANCY) && (int)tv.vols[i].s.m < min_m)
                 min_m = (int)tv.vols[i].s.m;
-        int min_up = n - min_m;
+        int min_up = n_elig - min_m;
+        if (min_up < 1)
+            min_up = 1;
 
         tier_cfg c = {0};
         c.set = true;
         c.k = k;
         c.m = m;
-        c.ndirs = n;
-        c.dirs = calloc((size_t)n, sizeof *c.dirs);
+        c.ndirs = n_open;
+        c.dirs = calloc((size_t)n_open, sizeof *c.dirs);
         if (!c.dirs) {
             tiers_view_free(&tv);
             return TSDB_ERR_NOMEM;
         }
-        for (int i = 0; i < n; i++) {
-            c.dirs[i] = strdup(tv.stores[i].path);
-            if (!c.dirs[i]) {
+        for (int i = 0, j = 0; i < n; i++) {
+            if (tv.stores[i].state == TIERS_STATE_REMOVED)
+                continue;
+            c.dirs[j] = strdup(tv.stores[i].path);
+            if (!c.dirs[j]) {
                 tier_cfg_free(&c);
                 tiers_view_free(&tv);
                 return TSDB_ERR_NOMEM;
             }
+            j++;
         }
         c.grace_s = (int64_t)tv.global.tier_after_s;
         c.keep_s = TIER_KEEP_S_DEFAULT;
@@ -1325,11 +1361,17 @@ static void tier_fill_vol_settings(tier *t, uint32_t vol, tier_settings *out)
         bool all_sc = false;
         pthread_mutex_lock(&t->cmu);
         tiers_view_settings_for(&t->tview, vol, &vs);
-        tv_nstores = t->tview.nstores;
-        all_sc = tv_nstores > 0;
-        for (size_t i = 0; i < tv_nstores; i++)
+        tv_nstores = 0;
+        all_sc = true;
+        for (size_t i = 0; i < t->tview.nstores; i++) {
+            if (t->tview.stores[i].state == TIERS_STATE_REMOVED || t->tview.stores[i].state == TIERS_STATE_SHRINKING)
+                continue;
+            tv_nstores++;
             if (!t->tview.stores[i].single_copy)
                 all_sc = false;
+        }
+        if (tv_nstores == 0)
+            all_sc = false;
         has_def = tier_default_geom((int)tv_nstores, all_sc, &def_k, &def_m);
         pthread_mutex_unlock(&t->cmu);
         tier_settings_from_cfg(&t->cfg, out);
@@ -1608,16 +1650,23 @@ int tier_engine_attach(eng *db)
         pthread_mutex_lock(&t->cmu);
         tiers_settings vs;
         tiers_view_settings_for(&t->tview, vol, &vs);
-        bool all_sc = t->tview.nstores > 0;
-        for (size_t i = 0; i < t->tview.nstores; i++)
+        size_t tv_elig = 0;
+        bool all_sc = true;
+        for (size_t i = 0; i < t->tview.nstores; i++) {
+            if (t->tview.stores[i].state == TIERS_STATE_REMOVED || t->tview.stores[i].state == TIERS_STATE_SHRINKING)
+                continue;
+            tv_elig++;
             if (!t->tview.stores[i].single_copy)
                 all_sc = false;
+        }
+        if (tv_elig == 0)
+            all_sc = false;
         int def_k = 0, def_m = 0;
-        bool has_def = tier_default_geom((int)t->tview.nstores, all_sc, &def_k, &def_m);
+        bool has_def = tier_default_geom((int)tv_elig, all_sc, &def_k, &def_m);
         if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
             bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
                                 : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
-                                   (int)vs.k + (int)vs.m <= (int)t->tview.nstores);
+                                   (int)vs.k + (int)vs.m <= (int)tv_elig);
             if (ok)
                 tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
         } else if (has_def) {
@@ -1674,6 +1723,7 @@ void tier_engine_unreg(eng *db)
         return;
     tierfill_eng_stop(db);
     tier *t = db->tier;
+    bool was_reg = false;
     pthread_mutex_lock(&t->cmu);
     if (db->ecstate->tier_opening) {
         db->ecstate->tier_opening = false;
@@ -1688,10 +1738,13 @@ void tier_engine_unreg(eng *db)
                 break;
             }
         db->ecstate->tier_registered = false;
+        was_reg = true;
         while (t->eng_active > 0)
             pthread_cond_wait(&t->eng_cv, &t->cmu);
     }
     pthread_mutex_unlock(&t->cmu);
+    if (was_reg)
+        tierctl_eng_stop(db);
 }
 
 struct chunk_backend *tier_backend(const tier *t) { return t ? t->be : NULL; }
@@ -1752,11 +1805,18 @@ void tier_resume_if_all_up(tier *t)
     if (!t || !t->be || atomic_load(&t->fence_halted))
         return;
     int n = chunk_be_nstores(t->be);
-    for (int i = 0; i < n; i++)
+    int elig = 0;
+    for (int i = 0; i < n; i++) {
+        if (chunk_be_store_excluded(t->be, i))
+            continue;
+        elig++;
         if (chunk_be_store_state(t->be, i) != CHUNK_STORE_UP)
             return;
+    }
+    if (elig == 0)
+        return;
     if (atomic_exchange(&t->halted, false))
-        fprintf(stderr, "tsdb: tier: all %d stores are UP: settles and chunk deletes resume\n", n);
+        fprintf(stderr, "tsdb: tier: all %d active stores are UP: settles and chunk deletes resume\n", elig);
     ecgc_kick_tier(t);
 #else
     (void)t;
@@ -1769,7 +1829,11 @@ bool tier_writable(tier *t)
         return false;
     if (atomic_load(&t->halted))
         return false;
+    int elig = 0;
     for (int i = 0; i < chunk_be_nstores(t->be); i++) {
+        if (chunk_be_store_excluded(t->be, i))
+            continue;
+        elig++;
         int st = chunk_be_store_state(t->be, i);
         if (st == CHUNK_STORE_UP)
             continue;
@@ -1778,7 +1842,7 @@ bool tier_writable(tier *t)
         tier_pause_store(t, i, why);
         return false;
     }
-    return true;
+    return elig > 0;
 }
 
 bool tier_gc_deletable(tier *t)
@@ -1787,15 +1851,15 @@ bool tier_gc_deletable(tier *t)
     if (!t || !t->be || t->read_only || atomic_load(&t->fence_halted))
         return false;
     /* Respect health attach/reopen/sweep windows and non-LOST halts: only bypass t->halted when at least one
-     * store is permanently LOST (which keeps t->halted set to pause settles) and every non-LOST store is UP. */
+     * store is permanently LOST/excluded (which keeps t->halted set to pause settles) and every other store is UP. */
     if (tier_health_busy(t))
         return false;
     int bn = chunk_be_nstores(t->be);
     bool any_lost = false;
     for (int i = 0; i < bn; i++) {
-        if (chunk_be_store_is_lost(t->be, i)) {
+        if (chunk_be_store_is_lost(t->be, i) || chunk_be_store_excluded(t->be, i)) {
             any_lost = true;
-            continue; /* permanently LOST: unreachable chunks are clean no-ops */
+            continue; /* permanently LOST/excluded: unreachable chunks are clean no-ops */
         }
         if (chunk_be_store_state(t->be, i) != CHUNK_STORE_UP)
             return false;

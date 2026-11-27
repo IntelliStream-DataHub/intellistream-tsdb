@@ -2032,6 +2032,8 @@ static int tier_add_impl(int rootfd, const char *root, bool sync, const char *pa
         }
     }
     for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
+        if (tv.stores[i].state == TIERS_STATE_REMOVED)
+            continue;
         if (path_within(canon, tv.stores[i].path) || path_within(tv.stores[i].path, canon) ||
             same_dir(canon, tv.stores[i].path) > 0) {
             fprintf(stderr, "tsdb: tier add %s: overlaps existing tier store %s: refused\n", canon, tv.stores[i].path);
@@ -2184,13 +2186,10 @@ int tsdb_tier_set(tsdb *db, const tsdb_tier_settings *settings)
 
 int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32_t flags)
 {
-    if (!replace_path) {
-        fprintf(stderr, "tsdb: tsdb_tier_lost: --shrink is not built\n");
-        return TSDB_ERR_INVALID;
-    }
 #ifndef TSDB_EC
     (void)db;
     (void)store;
+    (void)replace_path;
     (void)flags;
     fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
     return TSDB_ERR_INVALID;
@@ -2206,7 +2205,7 @@ int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32
     if (eng_check(db->vols[0]))
         return TSDB_ERR_IO;
     /* Do not hold db->create_lock across tierctl_lost_impl: TIERS is serialized by the VOLUMES OFD lock, and a dead
-     * store path must never block series creation. */
+     * store path must never block series creation. replace_path == NULL performs --shrink (R15 D9). */
     int rc = tierctl_lost_impl(db->dirfd, db->dir, db->opt.fsync, store, replace_path, NULL, flags, NULL, NULL);
     if (rc == 0 && db->tier)
         tierctl_wake(db->tier);

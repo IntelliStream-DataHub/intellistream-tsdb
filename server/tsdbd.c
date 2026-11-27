@@ -7378,7 +7378,7 @@ static int check_storage_tiers(const char *dir, const struct tier_cfg_entry *ent
         for (size_t j = 0; j < tv.nstores; j++) {
             if (strcmp(tv.stores[j].path, canons[i]) == 0) {
                 found = j;
-                if (tv.stores[j].state != TIERS_STATE_LOST)
+                if (tiers_state_is_active(tv.stores[j].state))
                     break;
             }
         }
@@ -7386,9 +7386,11 @@ static int check_storage_tiers(const char *dir, const struct tier_cfg_entry *ent
             fprintf(stderr, "tsdbd: %s: storage.tiers lists %s, which is not in %s (storage.tiers never adds stores)\n",
                     dir, entries[i].path, TIERS_FILE);
             err = -1;
-        } else if (tv.stores[found].state == TIERS_STATE_LOST) {
-            fprintf(stderr, "tsdbd: %s: storage.tiers lists %s, which is marked LOST in %s\n", dir, entries[i].path,
-                    TIERS_FILE);
+        } else if (!tiers_state_is_active(tv.stores[found].state)) {
+            const char *sname = tv.stores[found].state == TIERS_STATE_SHRINKING ? "SHRINKING"
+                              : tv.stores[found].state == TIERS_STATE_REMOVED ? "REMOVED" : "LOST";
+            fprintf(stderr, "tsdbd: %s: storage.tiers lists %s, which is marked %s in %s\n", dir, entries[i].path,
+                    sname, TIERS_FILE);
             err = -1;
         } else if (tv.stores[found].cls != entries[i].cls) {
             fprintf(stderr, "tsdbd: %s: storage.tiers mismatch for %s: %s records class %s, storage.tiers gives %s\n",
@@ -7400,7 +7402,7 @@ static int check_storage_tiers(const char *dir, const struct tier_cfg_entry *ent
         }
     }
     for (size_t j = 0; j < tv.nstores && !err; j++) {
-        if (tv.stores[j].state != TIERS_STATE_LOST && !matched[j]) {
+        if (tiers_state_is_active(tv.stores[j].state) && !matched[j]) {
             fprintf(stderr, "tsdbd: %s: storage.tiers is missing store %s (%s) recorded in %s\n", dir,
                     tv.stores[j].path, tiers_class_name(tv.stores[j].cls), TIERS_FILE);
             err = -1;

@@ -888,7 +888,7 @@ static void obj_ensure_pos(chunk_obj *o, unsigned pos)
                 obj_update_place_n(o);
             } else if (o->st[pos] == CHUNK_ST_ABSENT || o->st[pos] == CHUNK_ST_DOWN) {
                 int pn = atomic_load_explicit(&o->place_n, memory_order_acquire);
-                int sidx = chunk_be_place_n(o->oid, pos, pn);
+                int sidx = chunk_be_place_for_obj(o->be, o->oid, pos, pn);
                 if (chunk_be_store_is_lost(o->be, sidx))
                     o->st[pos] = CHUNK_ST_LOST;
                 else if (chunk_be_store_state(o->be, sidx) != CHUNK_STORE_UP)
@@ -1009,13 +1009,16 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
             int min_n = npos >= 2 ? (int)npos : 1;
             if (min_n > bn)
                 min_n = bn;
-            /* Check all valid store counts [min_n, bn] that place every position on a non-UP store (so an object
-             * written before a `tier add` still classifies LOST vs DOWN accurately even if no chunk opened). */
+            /* Check active-store placement (when any slot is excluded) plus all valid store counts [min_n, bn] that
+             * place every position on a non-UP store (so objects written before `tier add` or during `--shrink` still
+             * classify LOST vs DOWN accurately even if no chunk opened). */
             bool any_cand = false, all_cand_lost = true, any_cand_away = false;
-            for (int cand = bn; cand >= min_n; cand--) {
+            bool has_excl = chunk_be_active_count(be) < bn;
+            for (int cand = bn; cand >= (has_excl ? min_n - 1 : min_n); cand--) {
+                bool use_active = has_excl && cand == min_n - 1;
                 unsigned lost_pos = 0, down_pos = 0, up_pos = 0;
                 for (unsigned i = 0; i < npos; i++) {
-                    int sidx = chunk_be_place_n(oid, i, cand);
+                    int sidx = use_active ? chunk_be_place(be, oid, i) : chunk_be_place_n(oid, i, cand);
                     if (chunk_be_store_is_lost(be, sidx))
                         lost_pos++;
                     else if (chunk_be_store_state(be, sidx) != CHUNK_STORE_UP)
@@ -1091,7 +1094,7 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
     if (away || any_lost)
         for (unsigned i = 0; i < p; i++)
             if (!o->rd[i] && (o->st[i] == CHUNK_ST_ABSENT || o->st[i] == CHUNK_ST_DOWN)) {
-                int sidx = chunk_be_place_n(oid, i, pn);
+                int sidx = chunk_be_place_for_obj(be, oid, i, pn);
                 if (chunk_be_store_is_lost(be, sidx))
                     o->st[i] = CHUNK_ST_LOST;
                 else if (chunk_be_store_state(be, sidx) != CHUNK_STORE_UP)

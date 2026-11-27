@@ -54,7 +54,14 @@ enum {
     TIERS_STATE_ACTIVE = 0,
     TIERS_STATE_LOST = 1,
     TIERS_STATE_REPLACED_BY = 2,
+    TIERS_STATE_SHRINKING = 3,
+    TIERS_STATE_REMOVED = 4,
 };
+
+static inline bool tiers_state_is_active(uint8_t st)
+{
+    return st == TIERS_STATE_ACTIVE || st == TIERS_STATE_REPLACED_BY;
+}
 
 typedef struct tiers_store {
     uint8_t id[16];          /* store id at this placement slot (or lost id if REPLACED_BY) */

@@ -11,6 +11,7 @@
 #include "ecpart.h"
 #include "ecskip.h"
 #include "tier.h"
+#include "tierctl.h"
 #include "settle.h"
 
 #include <dirent.h>
@@ -1351,6 +1352,7 @@ void eng_halt(eng *db)
     db->nmergers = 0;
     if (settle_mutant != SETTLE_MUT_NOHALTSTOP)
         ecsettle_eng_stop(db); /* R7: no settle of this engine runs from here on (abandoned or waited for) */
+    tierctl_eng_stop(db);      /* R15: no shrink re-encode of this engine runs from here on */
     ecgc_eng_stop(db);         /* R8: no cluster GC round of this engine runs from here on */
     if (eckeep_mutant != ECKEEP_MUT_NOHALTSTOP)
         eckeep_eng_stop(db); /* R7: the digest thread holds part references and takes db->lock */

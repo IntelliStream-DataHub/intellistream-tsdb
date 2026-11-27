@@ -13,6 +13,7 @@
 #include "eccache.h"
 #include "ecgc.h"
 #include "internal.h"
+#include "settle.h"
 #include "tier.h"
 #include "tierctl.h"
 #include "tiers.h"
@@ -391,12 +392,12 @@ static void t_replace_4plus2(void)
     int orig_chunks = count_and_scrub_store_chunks(stores[2], &orig_bytes, false);
     CHECK(orig_chunks >= 4 && orig_bytes > 0);
 
-    /* Refusals: --shrink not built, unknown store, relative path, non-empty directory. */
+    /* Refusals: --shrink below 4+2, unknown store, relative path, non-empty directory. */
     char log[2048];
     cap_begin();
     CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == TSDB_ERR_INVALID);
     cap_end(log, sizeof log);
-    CHECK(strstr(log, "not built") != NULL);
+    CHECK(strstr(log, "fewer than") != NULL && strstr(log, "4+2") != NULL);
 
     CHECK(tsdb_tier_lost(db, "s99", "/tmp/x_unused", TSDB_TIER_ALLOW_SHARED_DEV) == TSDB_ERR_NOTFOUND);
     CHECK(tsdb_tier_lost(db, "s2", "rel/path", TSDB_TIER_ALLOW_SHARED_DEV) == TSDB_ERR_INVALID);
@@ -1280,6 +1281,624 @@ static void t_two_lost_replace_one(void)
            new_chunks);
 }
 
+/* ------------------------------------------------------------ 10. Shrink 7 -> 6 stores (4+2) + refusal + kill resume */
+
+static void setup_7store_db(const char *base, char dbdir[PATH_MAX], char stores[7][PATH_MAX], tsdb **out_db)
+{
+    int n = snprintf(dbdir, PATH_MAX, "%s/db", base);
+    CHECK(n > 0 && n < PATH_MAX);
+    CHECK(sh("mkdir -p '%s'", dbdir) == 0);
+    tsdb *db = NULL;
+    CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+    for (int i = 0; i < 7; i++) {
+        n = snprintf(stores[i], PATH_MAX, "%s/st%d", base, i);
+        CHECK(n > 0 && n < PATH_MAX);
+        CHECK(tsdb_tier_add(db, stores[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+    }
+    CHECK(tsdb_close(db) == 0);
+    CHECK(open_db(dbdir, out_db) == 0 && *out_db != NULL);
+}
+
+static int child_kill_shrink(const char *dbdir, const char *ready_file)
+{
+    kill_hook_ctx hctx = {.ready_file = ready_file, .wrote = false};
+    tierctl_set_rebuild_hook(kill_progress_hook, &hctx);
+    tsdb *db = NULL;
+    if (open_db(dbdir, &db) != 0 || !db)
+        return 2;
+    for (int i = 0; i < 200; i++) {
+        struct timespec nap = {0, 50 * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    tsdb_close(db);
+    return 1; /* should have been killed mid-shrink */
+}
+
+static void t_shrink_7to6(void)
+{
+    /* 10a. Refusal when remaining < k+m (6 stores at 4+2 -> 5 < 6), then succeeds once redundancy lowered to 4+1. */
+    {
+        char base[PATH_MAX], dbdir[PATH_MAX], stores[6][PATH_MAX], log[2048];
+        fresh_dir("shrinkrefuse", base, sizeof base);
+        tsdb *db = NULL;
+        setup_6store_db(base, dbdir, stores, &db);
+        tsdb_sid s0 = 0, s1 = 0;
+        populate_and_settle(db, 2, 10000, &s0, &s1);
+
+        cap_begin();
+        CHECK(tsdb_tier_lost(db, "s4", NULL, 0) == TSDB_ERR_INVALID);
+        cap_end(log, sizeof log);
+        CHECK(strstr(log, "fewer than") != NULL && strstr(log, "redundancy") != NULL);
+
+        /* Lower redundancy to 4+1 in TIERS SETTINGS, let tierctl apply it, then --shrink succeeds (5 >= 4+1). */
+        int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(dfd >= 0);
+        tiers_settings ts;
+        memset(&ts, 0, sizeof ts);
+        ts.set_mask = TSDB_TIER_SET_REDUNDANCY;
+        ts.k = 4;
+        ts.m = 1;
+        CHECK(tiers_append_settings(dfd, true, TIERS_VOL_ALL, &ts) == 0);
+        close(dfd);
+
+        tier *t = tier_find_by_dir(dbdir);
+        CHECK(t != NULL);
+        tierctl_wake(t);
+        CHECK(tierctl_wait_idle(t, 10000) == 0);
+
+        CHECK(sh("rm -rf '%s'", stores[4]) == 0);
+        CHECK(tsdb_tier_lost(db, "s4", NULL, 0) == 0);
+        CHECK(tierctl_wait_idle(t, 30000) == 0);
+        tier_put(t);
+        CHECK(tsdb_close(db) == 0);
+
+        /* Reopen opens 5 active stores cleanly and answers every row bit-exact. */
+        CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+        t = tier_find_by_dir(dbdir);
+        CHECK(t != NULL && tier_store_count(t) == 5);
+        verify_rows(db, s0, s1, 2, 10000);
+        tier_put(t);
+        CHECK(tsdb_close(db) == 0);
+    }
+
+    /* 10b. Main 7 -> 6 shrink at 4+2: answers bit-exact before/during/after, all live objects placed on the 6
+     * remaining stores, TIERS marks REMOVED, reopen opens 6 stores cleanly, reads survive 2 remaining stores DOWN. */
+    char base[PATH_MAX], dbdir[PATH_MAX], stores[7][PATH_MAX], log[2048];
+    fresh_dir("shrink7to6", base, sizeof base);
+    tsdb *db = NULL;
+    setup_7store_db(base, dbdir, stores, &db);
+
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 6, 20000, &s0, &s1);
+    verify_rows(db, s0, s1, 6, 20000);
+
+    int orig_s2_chunks = count_and_scrub_store_chunks(stores[2], NULL, false);
+    CHECK(orig_s2_chunks >= 1);
+
+    tier *t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL && tier_store_count(t) == 7);
+
+    /* Lose store 2 permanently and start --shrink. */
+    CHECK(sh("rm -rf '%s'", stores[2]) == 0);
+    CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == 0);
+
+    /* Reads must answer bit-exact during the shrink as well as after. */
+    verify_rows(db, s0, s1, 6, 20000);
+
+    CHECK(tierctl_wait_idle(t, 30000) == 0);
+    verify_rows(db, s0, s1, 6, 20000);
+
+    tierctl_progress prog;
+    CHECK(tierctl_get_progress(t, &prog));
+    CHECK(!prog.shrink_active && prog.shrink_objects_left == 0 && prog.shrinks_done >= 1);
+
+    /* TIERS must record store 2 as TIERS_STATE_REMOVED, and 0 objects left to shrink. */
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    tiers_view tv;
+    CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7);
+    CHECK(tv.stores[2].state == TIERS_STATE_REMOVED);
+    const char *vpaths[1] = {dbdir};
+    uint64_t left_on_disk = 999;
+    CHECK(tierctl_count_shrink_objects(&tv, vpaths, 1, &left_on_disk) == 0);
+    /* Every live .ec object must have all 6 positions on the 6 remaining stores (kills `shrinkearly`!). */
+    CHECK(left_on_disk == 0);
+    tiers_view_free(&tv);
+    close(dfd);
+
+    /* Calling --shrink again on an already-REMOVED store is refused. */
+    cap_begin();
+    CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == TSDB_ERR_INVALID);
+    cap_end(log, sizeof log);
+    CHECK(strstr(log, "REMOVED") != NULL);
+
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+
+    /* Reopen: backend opens only the 6 active stores (skipping REMOVED store 2). */
+    CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+    t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL);
+    CHECK(tier_store_count(t) == 6);
+    verify_rows(db, s0, s1, 6, 20000);
+
+    /* Drop granule cache and take 2 of the 6 remaining stores DOWN -> reads MUST succeed using the 4 surviving stores
+     * (double-kills `shrinkearly` and verifies post-reopen placement matches chunk_be_place!). */
+    (void)tsdb_test_ec_retries(db, true);
+    tier_store_set_down(t, 0, CHUNK_STORE_DOWN_STALLED);
+    tier_store_set_down(t, 1, CHUNK_STORE_DOWN_STALLED);
+    eccache_reopen_all(t);
+    verify_rows(db, s0, s1, 6, 20000);
+
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+
+    /* Scrub all 6 remaining stores offline. */
+    int total_remaining = 0;
+    for (int i = 0; i < 7; i++) {
+        if (i == 2)
+            continue;
+        int c = count_and_scrub_store_chunks(stores[i], NULL, true);
+        CHECK(c >= 6);
+        total_remaining += c;
+    }
+    CHECK(total_remaining >= 36);
+    printf("  shrink_7to6: ok (7->6 at 4+2, refusal below k+m verified, reopen=6 stores, 2-down read ok)\n");
+}
+
+static void t_kill_mid_shrink(void)
+{
+    char base[PATH_MAX], dbdir[PATH_MAX], stores[7][PATH_MAX], ready[PATH_MAX + 32];
+    fresh_dir("killshrink", base, sizeof base);
+    tsdb *db = NULL;
+    setup_7store_db(base, dbdir, stores, &db);
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 8, 20000, &s0, &s1);
+    CHECK(tsdb_close(db) == 0);
+
+    /* Lose store 2 offline and record STATE LOST + STATE SHRINKING in TIERS. */
+    CHECK(sh("rm -rf '%s'", stores[2]) == 0);
+    CHECK(tierctl_lost_dir(dbdir, "s2", NULL, NULL, 0, NULL, NULL) == 0);
+
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    tiers_view tv;
+    CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7);
+    CHECK(tv.stores[2].state == TIERS_STATE_SHRINKING);
+    const char *vpaths_pre[1] = {dbdir};
+    uint64_t left_pre = 0;
+    CHECK(tierctl_count_shrink_objects(&tv, vpaths_pre, 1, &left_pre) == 0 && left_pre > 0);
+    tiers_view_free(&tv);
+    close(dfd);
+
+    /* Fork child to open DB and begin shrink; kill -9 mid-shrink once hook signals first re-encoded object. */
+    snprintf(ready, sizeof ready, "%s/ready", base);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (mutant_name)
+            execl(SELF, "test_tierctl", "--mutant", mutant_name, "--child", "kill-shrink", dbdir, ready, (char *)NULL);
+        else
+            execl(SELF, "test_tierctl", "--child", "kill-shrink", dbdir, ready, (char *)NULL);
+        _exit(127);
+    }
+    bool got_ready = false;
+    int64_t dl = mono_ms() + 15000;
+    while (mono_ms() < dl) {
+        if (access(ready, F_OK) == 0) {
+            got_ready = true;
+            break;
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid)
+            break;
+        struct timespec nap = {0, 10 * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    if (got_ready) {
+        safe_kill(pid, SIGKILL);
+        int st = 0;
+        waitpid(pid, &st, 0);
+        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    } else {
+        int st = 0;
+        safe_kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+        CHECK(false);
+    }
+
+    /* After kill -9 mid-shrink, store 2 MUST still be SHRINKING in TIERS (never marked REMOVED early!). */
+    dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7);
+    CHECK(tv.stores[2].state == TIERS_STATE_SHRINKING);
+    tiers_view_free(&tv);
+    close(dfd);
+
+    /* Next open resumes from TIERS SHRINKING and finishes cleanly to REMOVED. */
+    CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+    tier *t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL);
+    CHECK(tierctl_wait_idle(t, 30000) == 0);
+
+    dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7);
+    CHECK(tv.stores[2].state == TIERS_STATE_REMOVED);
+    const char *vpaths[1] = {dbdir};
+    uint64_t left_on_disk = 999;
+    CHECK(tierctl_count_shrink_objects(&tv, vpaths, 1, &left_on_disk) == 0 && left_on_disk == 0);
+    tiers_view_free(&tv);
+    close(dfd);
+
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+
+    /* Final reopen opens 6 stores cleanly and passes 2-store-DOWN read check across all 8 parts. */
+    CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+    t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL && tier_store_count(t) == 6);
+    (void)tsdb_test_ec_retries(db, true);
+    tier_store_set_down(t, 2, CHUNK_STORE_DOWN_STALLED);
+    tier_store_set_down(t, 3, CHUNK_STORE_DOWN_STALLED);
+    eccache_reopen_all(t);
+    verify_rows(db, s0, s1, 8, 20000);
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+    printf("  kill_mid_shrink: ok (killed mid-shrink, resumed on reopen, finished to REMOVED, 6 stores ok)\n");
+}
+
+/* ------------------------------------------------------------ 11. Damaged .ec part during shrink (no spin, salvage hint) */
+
+static void t_shrink_damaged(void)
+{
+    char base[PATH_MAX], dbdir[PATH_MAX], stores[7][PATH_MAX], log[4096];
+    fresh_dir("shrinkdmg", base, sizeof base);
+    tsdb *db = NULL;
+    setup_7store_db(base, dbdir, stores, &db);
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 3, 10000, &s0, &s1);
+
+    /* Mark the first live .ec part as damaged in memory. */
+    eng *e0 = tsdb_test_engine(db, 0);
+    CHECK(e0 != NULL);
+    bool marked = false;
+    pthread_mutex_lock(&e0->lock);
+    for (size_t i = 0; i < e0->nparts; i++) {
+        part *p = e0->parts[i];
+        if (!p->dropped && atomic_load_explicit(&p->ec, memory_order_acquire) != NULL) {
+            atomic_store_explicit(&p->damaged, true, memory_order_release);
+            marked = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&e0->lock);
+    CHECK(marked);
+
+    CHECK(sh("rm -rf '%s'", stores[2]) == 0);
+    tier *t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL);
+
+    cap_begin();
+    CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == 0);
+    /* Wait for undamaged parts to re-encode and worker to back off on the damaged part (must NOT spin forever!). */
+    int64_t dl = mono_ms() + 10000;
+    bool saw_backed_off = false;
+    while (mono_ms() < dl) {
+        tierctl_progress prog;
+        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= 2 &&
+            prog.shrink_objects_left == 1) {
+            saw_backed_off = true;
+            break;
+        }
+        struct timespec nap = {0, 20 * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    cap_end(log, sizeof log);
+
+    CHECK(saw_backed_off);
+    CHECK(strstr(log, "tier salvage") != NULL);
+
+    /* TIERS MUST still say SHRINKING (never REMOVED while a damaged part still references the store!). */
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    tiers_view tv;
+    CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7);
+    CHECK(tv.stores[2].state == TIERS_STATE_SHRINKING);
+    tiers_view_free(&tv);
+    close(dfd);
+
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+    printf("  shrink_damaged: ok (undamaged parts re-encoded, damaged part backed off with salvage hint, no spin)\n");
+}
+
+/* ------------------------------------------------------------ 12. Power loss (crashfs on dbdir) during shrink */
+
+static int child_crashfs_shrink(const char *dbdir)
+{
+    tsdb *db = NULL;
+    int rc = open_db(dbdir, &db);
+    if (rc != 0 || !db)
+        return 2;
+    tier *t = tier_find_by_dir(dbdir);
+    if (!t) {
+        tsdb_close(db);
+        return 3;
+    }
+    rc = tierctl_wait_idle(t, 20000);
+    tier_put(t);
+    tsdb_close(db);
+    if (rc != 0)
+        return 4;
+    int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return 5;
+    tiers_view tv;
+    bool ok = tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7 && tv.stores[2].state == TIERS_STATE_REMOVED;
+    tiers_view_free(&tv);
+    close(dfd);
+    return ok ? 0 : 6;
+}
+
+static int run_crashfs_shrink(const char *dbdir, int warmup, int seed)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512], wbuf[16], sbuf[16];
+        const char *prev = getenv("ASAN_OPTIONS");
+        snprintf(asan, sizeof asan, "%s%sverify_asan_link_order=0:detect_leaks=0",
+                 prev && *prev ? prev : "", prev && *prev ? ":" : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        snprintf(wbuf, sizeof wbuf, "%d", warmup);
+        snprintf(sbuf, sizeof sbuf, "%d", seed);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", dbdir, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", wbuf, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sbuf, 1);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) {
+            dup2(null, 1);
+            dup2(null, 2);
+            close(null);
+        }
+        if (mutant_name)
+            execl(SELF, "test_tierctl", "--mutant", mutant_name, "--child", "crashfs-shrink", dbdir, (char *)NULL);
+        else
+            execl(SELF, "test_tierctl", "--child", "crashfs-shrink", dbdir, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+static void t_shrink_crashfs(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        if (getenv("TSDB_REQUIRE_CRASHFS")) {
+            fprintf(stderr, "test_tierctl: %s missing\n", SHIM);
+            CHECK(false);
+        } else {
+            printf("  shrink_crashfs: skipped (no libcrashfs.so)\n");
+        }
+        return;
+    }
+#if defined(__SANITIZE_THREAD__)
+    printf("  shrink_crashfs: skipped (TSan)\n");
+    return;
+#endif
+    char base[PATH_MAX], snap[PATH_MAX + 32], work[PATH_MAX + 32];
+    char dbdir[PATH_MAX], stores[7][PATH_MAX];
+    fresh_dir("shrinkcfs", base, sizeof base);
+    snprintf(snap, sizeof snap, "%s/snap", base);
+    snprintf(work, sizeof work, "%s/work", base);
+    CHECK(sh("mkdir -p '%s' '%s'", snap, work) == 0);
+
+    tsdb *db = NULL;
+    setup_7store_db(work, dbdir, stores, &db);
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 2, 10000, &s0, &s1);
+    CHECK(tsdb_close(db) == 0);
+    CHECK(sh("rm -rf '%s'", stores[2]) == 0);
+    CHECK(tierctl_lost_dir(dbdir, "s2", NULL, NULL, 0, NULL, NULL) == 0);
+    CHECK(sh("rm -rf '%s' && cp -a '%s' '%s'", snap, work, snap) == 0);
+
+    int cuts = 0, finished = 0;
+    for (int w = 0; w < 240; w += (w < 16 ? 1 : 6)) {
+        CHECK(sh("rm -rf '%s' && cp -a '%s' '%s'", work, snap, work) == 0);
+        int rc = run_crashfs_shrink(dbdir, w, 900 + w);
+        if (rc == 99) {
+            cuts++;
+            int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            CHECK(dfd >= 0);
+            tiers_view tv;
+            CHECK(tiers_load(dfd, true, true, &tv) == 0 && tv.nstores == 7);
+            bool already_removed = (tv.stores[2].state == TIERS_STATE_REMOVED);
+            if (already_removed) {
+                /* If STATE REMOVED was durable in TIERS before the cut, EVERY live .ec swap MUST already be durable! */
+                const char *vpaths[1] = {dbdir};
+                uint64_t left = 999;
+                CHECK(tierctl_count_shrink_objects(&tv, vpaths, 1, &left) == 0 && left == 0);
+            }
+            tiers_view_free(&tv);
+            close(dfd);
+
+            /* Reopen cleanly: must finish shrink (or already be REMOVED), then reopen with 6 stores & verify reads. */
+            CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+            tier *t = tier_find_by_dir(dbdir);
+            CHECK(t != NULL);
+            CHECK(tierctl_wait_idle(t, 20000) == 0);
+            tier_put(t);
+            CHECK(tsdb_close(db) == 0);
+
+            CHECK(open_db(dbdir, &db) == 0 && db != NULL);
+            t = tier_find_by_dir(dbdir);
+            CHECK(t != NULL && tier_store_count(t) == 6);
+            (void)tsdb_test_ec_retries(db, true);
+            tier_store_set_down(t, 0, CHUNK_STORE_DOWN_STALLED);
+            tier_store_set_down(t, 1, CHUNK_STORE_DOWN_STALLED);
+            eccache_reopen_all(t);
+            verify_rows(db, s0, s1, 2, 10000);
+            tier_put(t);
+            CHECK(tsdb_close(db) == 0);
+        } else if (rc == 0) {
+            finished = 1;
+            int dfd = open(dbdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            CHECK(dfd >= 0);
+            tiers_view tv;
+            CHECK(tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 7 &&
+                  tv.stores[2].state == TIERS_STATE_REMOVED);
+            const char *vpaths[1] = {dbdir};
+            uint64_t left = 999;
+            CHECK(tierctl_count_shrink_objects(&tv, vpaths, 1, &left) == 0 && left == 0);
+            tiers_view_free(&tv);
+            close(dfd);
+            break;
+        } else {
+            fprintf(stderr, "test_tierctl: crashfs-shrink warmup %d returned unexpected status %d\n", w, rc);
+            CHECK(false);
+            break;
+        }
+    }
+    CHECK(cuts >= 3 && finished == 1);
+    printf("  shrink_crashfs: ok (%d power-cut points across .ec swap & TIERS REMOVED, all recovered cleanly)\n", cuts);
+}
+
+/* ------------------------------------------------------------ 13. Salvage during shrink of s0 keeps healthy parts */
+
+static void t_shrink_salvage_s0(void)
+{
+    char base[PATH_MAX], dbdir[PATH_MAX], stores[7][PATH_MAX];
+    fresh_dir("shrinksalv", base, sizeof base);
+    tsdb *db = NULL;
+    setup_7store_db(base, dbdir, stores, &db);
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 4, 10000, &s0, &s1);
+
+    /* Mark partition 0's .ec part damaged so shrink re-encodes partitions 1..3 onto the 6 remaining stores
+     * while store 0 remains in TIERS_STATE_SHRINKING (LOST). */
+    eng *e0 = tsdb_test_engine(db, 0);
+    CHECK(e0 != NULL);
+    pthread_mutex_lock(&e0->lock);
+    for (size_t i = 0; i < e0->nparts; i++) {
+        part *p = e0->parts[i];
+        if (!p->dropped && p->partition == 0 && atomic_load_explicit(&p->ec, memory_order_acquire) != NULL) {
+            atomic_store_explicit(&p->damaged, true, memory_order_release);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&e0->lock);
+
+    CHECK(sh("rm -rf '%s'", stores[0]) == 0);
+    tier *t = tier_find_by_dir(dbdir);
+    CHECK(t != NULL);
+    CHECK(tsdb_tier_lost(db, "s0", NULL, 0) == 0);
+
+    int64_t dl = mono_ms() + 10000;
+    bool ready = false;
+    while (mono_ms() < dl) {
+        tierctl_progress prog;
+        if (tierctl_get_progress(t, &prog) && !prog.shrink_active && prog.shrink_objects_done >= 3 &&
+            prog.shrink_objects_left == 1) {
+            ready = true;
+            break;
+        }
+        struct timespec nap = {0, 20 * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    CHECK(ready);
+
+    /* Run tier salvage while s0 is SHRINKING (LOST) and parts 1..3 are on active-store placement (-1).
+     * Salvage MUST NOT retire healthy re-encoded parts 1..3! */
+    CHECK(tsdb_tier_salvage(db, 0, 1, 0) == 0);
+
+    const int64_t day_ms = 86400000LL;
+    int64_t *ts = malloc(10000 * sizeof *ts);
+    double *va = malloc(10000 * sizeof *va);
+    CHECK(ts && va);
+    for (int p = 1; p < 4; p++) {
+        size_t n = 0;
+        CHECK(query_f64(db, s0, (int64_t)p * day_ms, (int64_t)(p + 1) * day_ms, ts, va, 10000, &n) == 0);
+        CHECK(n == 10000);
+        for (int r = 0; r < 10000; r++) {
+            if (va[r] != det_val(p, r, 0)) {
+                CHECK(false);
+                break;
+            }
+        }
+    }
+    free(ts);
+    free(va);
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+    printf("  shrink_salvage_s0: ok (salvage during s0 shrink retired 0 healthy re-encoded parts)\n");
+}
+
+/* ------------------------------------------------------------ 14. eng_halt waits for in-flight shrink re-encode */
+
+static atomic_bool g_halt_entered;
+static atomic_bool g_halt_finished;
+static atomic_bool g_halt_was_shrink;
+static tier *g_halt_tier;
+
+static void shrink_halt_fill_hook(eng *db, const part *p, uint64_t bytes)
+{
+    (void)db, (void)p, (void)bytes;
+    if (!atomic_exchange(&g_halt_entered, true)) {
+        tierctl_progress prog;
+        if (g_halt_tier && tierctl_get_progress(g_halt_tier, &prog) && prog.shrink_active)
+            atomic_store(&g_halt_was_shrink, true);
+        struct timespec nap = {0, 200 * 1000000L}; /* 200 ms hold inside eng_reencode -> settle_one */
+        nanosleep(&nap, NULL);
+        atomic_store(&g_halt_finished, true);
+    }
+}
+
+static void t_shrink_eng_halt(void)
+{
+    char base[PATH_MAX], dbdir[PATH_MAX], stores[7][PATH_MAX];
+    fresh_dir("shrinkhalt", base, sizeof base);
+    tsdb *db = NULL;
+    setup_7store_db(base, dbdir, stores, &db);
+    tsdb_sid s0 = 0, s1 = 0;
+    populate_and_settle(db, 4, 10000, &s0, &s1);
+
+    eng *e0 = tsdb_test_engine(db, 0);
+    tier *t = tier_find_by_dir(dbdir);
+    CHECK(e0 != NULL && t != NULL);
+    g_halt_tier = t;
+    atomic_store(&g_halt_entered, false);
+    atomic_store(&g_halt_finished, false);
+    atomic_store(&g_halt_was_shrink, false);
+    atomic_store(&settle_fill_hook, shrink_halt_fill_hook);
+
+    CHECK(sh("rm -rf '%s'", stores[2]) == 0);
+    CHECK(tsdb_tier_lost(db, "s2", NULL, 0) == 0);
+
+    int64_t dl = mono_ms() + 10000;
+    while (mono_ms() < dl && !atomic_load(&g_halt_entered)) {
+        struct timespec nap = {0, 5 * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    CHECK(atomic_load(&g_halt_entered));
+
+    /* eng_halt(e0) MUST wait for the in-flight shrink eng_reencode to finish before returning! */
+    eng_halt(e0);
+    CHECK(atomic_load(&g_halt_was_shrink));
+    CHECK(atomic_load(&g_halt_finished));
+    atomic_store(&settle_fill_hook, NULL);
+    g_halt_tier = NULL;
+
+    tier_put(t);
+    CHECK(tsdb_close(db) == 0);
+    printf("  shrink_eng_halt: ok (eng_halt waited for in-flight shrink re-encode before returning)\n");
+}
+
 #endif /* TSDB_EC */
 
 int main(int argc, char **argv)
@@ -1297,6 +1916,8 @@ int main(int argc, char **argv)
                 tierctl_mutant = TIERCTL_MUT_LOSTNOREPLACE;
             else if (strcmp(mutant_name, "rebuildfast") == 0)
                 tierctl_mutant = TIERCTL_MUT_REBUILDFAST;
+            else if (strcmp(mutant_name, "shrinkearly") == 0)
+                tierctl_mutant = TIERCTL_MUT_SHRINKEARLY;
             else {
                 fprintf(stderr, "test_tierctl: unknown mutant '%s'\n", mutant_name);
                 return 2;
@@ -1332,6 +1953,10 @@ int main(int argc, char **argv)
     if (child_mode) {
         if (strcmp(child_mode, "kill-rebuild") == 0 && child_arg1 && child_arg2)
             return child_kill_rebuild(child_arg1, child_arg2);
+        if (strcmp(child_mode, "kill-shrink") == 0 && child_arg1 && child_arg2)
+            return child_kill_shrink(child_arg1, child_arg2);
+        if (strcmp(child_mode, "crashfs-shrink") == 0 && child_arg1)
+            return child_crashfs_shrink(child_arg1);
         if (strcmp(child_mode, "crashfs-rebuild") == 0 && child_arg1)
             return child_crashfs_rebuild(child_arg1);
         if (strcmp(child_mode, "crashfs-lost") == 0 && child_arg1 && child_arg2)
@@ -1356,6 +1981,12 @@ int main(int argc, char **argv)
     t_e15_lost_vs_down();
     t_add_then_lost();
     t_two_lost_replace_one();
+    t_shrink_7to6();
+    t_kill_mid_shrink();
+    t_shrink_damaged();
+    t_shrink_crashfs();
+    t_shrink_salvage_s0();
+    t_shrink_eng_halt();
 
     (void)sh("rm -rf '%s'", S);
     if (fails) {

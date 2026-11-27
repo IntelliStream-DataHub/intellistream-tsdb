@@ -50,6 +50,7 @@ if [ "$probe_rc" -ne 0 ] && grep -q "not built with the erasure codec" "$dir/pro
     for args in \
         "add $fs1/s0:hdd --allow-shared-device" \
         "set --after 7d" \
+        "lost s0 --shrink" \
         "salvage" \
         "status"
     do
@@ -59,13 +60,6 @@ if [ "$probe_rc" -ne 0 ] && grep -q "not built with the erasure codec" "$dir/pro
         [ "$rc" -ne 0 ] || fail "NO_EC: tier $args was accepted"
         cli_refusal_ok "$rc" "$dir/noec.err" "not built with the erasure codec" ||
             fail "NO_EC: tier $args: status $rc, stderr '$(head -c 200 "$dir/noec.err")'"
-    done
-    for args in "lost s0 --shrink"; do
-        # shellcheck disable=SC2086
-        t tier $args >/dev/null 2>"$dir/noec.err"
-        rc=$?
-        [ "$rc" -eq 2 ] || fail "NO_EC: tier $args exited $rc (expected 2)"
-        grep -q "not built" "$dir/noec.err" || fail "NO_EC: tier $args stderr missing 'not built': $(cat "$dir/noec.err")"
     done
     [ "$errors" = 0 ] && echo "test_cli_tier: skipped (NO_EC=1)"
     exit $((errors != 0))
@@ -249,16 +243,8 @@ assert d["volumes"][0]["margin"] == "underneath"
 assert d["stores"][0]["single_copy"] is True
 ' || fail "sc_db status --json fields mismatch: $sc_json"
 
-# 7. Unbuilt verbs (lost --shrink) exit 2 with "not built", and salvage/lost validate arguments.
-for args in \
-    "lost s0 --shrink"
-do
-    # shellcheck disable=SC2086
-    t tier $args >/dev/null 2>"$dir/err"
-    rc=$?
-    [ "$rc" -eq 2 ] || fail "tier $args exited $rc (expected 2)"
-    grep -q "not built" "$dir/err" || fail "tier $args stderr missing 'not built': $(cat "$dir/err")"
-done
+# 7. tier lost --shrink refuses when remaining stores < k+m (6 stores at 4+2 -> 5 < 6), and salvage/lost validate arguments.
+refuse_tier "tier lost --shrink below 4+2" "fewer than" lost s0 --shrink
 # tier salvage with all stores UP (no lost objects) succeeds as a clean no-op.
 out_salv=$(t tier salvage) || fail "tier salvage no-op failed"
 echo "$out_salv" | grep -q "retired 0 part(s)" || fail "tier salvage no-op output unexpected: $out_salv"
@@ -335,10 +321,7 @@ assert d["stores"][0]["path"].endswith("/s0_new")
 assert d["rebuild"]["active"] is False and d["rebuild"]["state"] == "idle"
 ' || fail "live lost status --json mismatch: $jrep"
 
-    # Unbuilt lost --shrink beside live tsdbd still exits 2 with "not built"; tier salvage refuses while locked.
-    t tier lost s0 --shrink >/dev/null 2>"$dir/err"
-    rc=$?
-    [ "$rc" -eq 2 ] && grep -q "not built" "$dir/err" || fail "live tier lost: rc=$rc err=$(cat "$dir/err")"
+    # tier salvage refuses while tsdbd holds locks.
     t tier salvage >/dev/null 2>"$dir/err"
     rc=$?
     [ "$rc" -ne 0 ] || fail "live tier salvage was accepted while tsdbd held locks"
@@ -406,6 +389,53 @@ echo "$out_sf" | grep -q "retired 0 part(s)" || fail "tier salvage --force outpu
 mv "$fs2/s6.gone" "$fs2/s6" || fail "restore s6"
 mv "$dir/s5.META.bak" "$fs2/s5/META" || fail "restore s5 META"
 mv "$dir/s4.META.bak" "$fs2/s4/META" || fail "restore s4 META"
+
+# 10. tier lost --shrink on 7 stores (4+2 -> 6 active stores): offline status shows shrinking, tier set refuses
+#     redundancy > 6 non-shrinking stores (must not brick next open!), and tsdbd completes to removed.
+rm -rf "$fs2/s6"
+out_sh=$(t tier lost s6 --shrink) || fail "offline tier lost s6 --shrink"
+echo "$out_sh" | grep -q "SHRINKING" || fail "tier lost --shrink output missing SHRINKING: $out_sh"
+refuse_tier "tier set redundancy > non-shrinking stores" "requires 7 stores" set --redundancy 5+2
+out_sh_st=$(t tier status) || fail "tier status while shrinking"
+echo "$out_sh_st" | grep -q "shrink: store 6 shrinking" || fail "tier status missing shrink line: $out_sh_st"
+jsh=$(t tier status --json) || fail "tier status --json while shrinking"
+echo "$jsh" | python3 -I -m json.tool >/dev/null || fail "shrinking status --json invalid JSON"
+echo "$jsh" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["stores_shrinking"] == 1 and d["stores_removed"] == 0
+assert d["stores"][6]["tiers_state"] == "shrinking" and d["stores"][6]["state"] == "shrinking"
+assert d["shrink"]["active"] is True and d["shrink"]["state"] == "shrinking" and d["shrink"]["store"] == 6
+assert d["shrink"]["objects_left"] == 0
+' || fail "shrinking status --json mismatch: $jsh"
+
+me=$BASHPID
+"$B/tsdbd" --dir "$db" --no-auth --port 0 --port-file "$dir/port3" --exit-with-parent=$me >"$dir/d3.log" 2>&1 &
+srv_pid=$!
+shrunk_ok=0
+for _ in $(seq 300); do
+    if [ -s "$dir/port3" ]; then
+        jdone=$(t tier status --json 2>/dev/null || true)
+        if echo "$jdone" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["stores_removed"]==1 and d["stores"][6]["state"]=="removed" else 1)' 2>/dev/null; then
+            shrunk_ok=1
+            break
+        fi
+    fi
+    kill -0 "$srv_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[ "$shrunk_ok" = 1 ] || fail "tsdbd did not finish shrink to REMOVED: $(tail -10 "$dir/d3.log")"
+jfin=$(t tier status --json) || fail "tier status --json after shrink"
+echo "$jfin" | python3 -I -m json.tool >/dev/null || fail "post-shrink status --json invalid JSON"
+echo "$jfin" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["stores_up"] == 6 and d["stores_shrinking"] == 0 and d["stores_removed"] == 1
+assert d["margin"] == 2
+assert d["stores"][6]["tiers_state"] == "removed" and d["stores"][6]["state"] == "removed"
+assert d["shrink"]["active"] is False and d["shrink"]["state"] == "idle"
+' || fail "post-shrink status --json mismatch: $jfin"
+stop_server
 
 [ "$errors" = 0 ] && echo "test_cli_tier: ok"
 exit $((errors != 0))

@@ -69,6 +69,7 @@ struct chunk_backend {
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */
     atomic_bool *st_failed;      /* mirrors chunk_store_failed(st[i]) for lock-free chunk_be_store_state() */
     atomic_bool *st_lost;        /* R15 E15: true iff slot i was declared permanently LOST in TIERS */
+    atomic_bool *st_excluded;    /* R15 r15-shrink: true while slot i is SHRINKING or REMOVED (excluded from placement) */
     atomic_bool *st_draining;    /* R13 r13-lmove: true while store i is draining (no new puts; reads/dels continue) */
     int *store_pref;             /* R13 r13-lmove: per-store dedupe preference rank (higher wins) */
     bool has_store_pref;         /* R13 r13-lmove: true when caller passed store_pref (enables open-time dedupe) */
@@ -99,9 +100,14 @@ struct chunk_backend {
     pthread_cond_t ioerr_cv;
     atomic_uint put_max_pct;     /* R15 D7: >0 caps regular puts at this fs % (single-server tiers: 95; 0: off) */
 };
-/* R15 (r15-lost): LOST marking, open-as-REPLACING, runtime store additions, and pre-initialized replacement rebuild. */
+/* R15 (r15-lost, r15-shrink): LOST/excluded marking, open-as-REPLACING, runtime store additions, and rebuild. */
 void chunk_be_set_lost(chunk_backend *be, int i, bool lost);
 bool chunk_be_store_is_lost(const chunk_backend *be, int i);
+void chunk_be_set_excluded(chunk_backend *be, int i, bool excluded);
+bool chunk_be_store_excluded(const chunk_backend *be, int i);
+int chunk_be_active_count(const chunk_backend *be);
+int chunk_be_store_has_chunk(chunk_backend *be, int store, uint32_t volume, const uint8_t oid[16], unsigned pos);
+int chunk_be_place_for_obj(const chunk_backend *be, const uint8_t oid[16], unsigned pos, int place_n);
 int chunk_be_mark_lost(chunk_backend *be, int i);
 int chunk_be_set_replacing(chunk_backend *be, int i);
 int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expect_id, const uint8_t *expect_db,
@@ -116,7 +122,10 @@ int chunk_be_promote_up_norebuild(chunk_backend *be, int index, const char *new_
 #endif
 int chunk_be_volumes_list(chunk_backend *be, uint32_t **out, size_t *nout);
 /* Placement for an explicit store count `n`, and inference of an object's original store count from observed
- * (store, pos) chunks so objects written before `tier add` still map missing positions to their true stores. */
+ * (store, pos) chunks so objects written before `tier add` still map missing positions to their true stores.
+ * chunk_be_infer_place_n returns either a positive store count `n` (map via chunk_be_place_n) or the sentinel -1
+ * when excluded (SHRINKING) stores exist and all observed chunks match active-store placement (chunk_be_place).
+ * Callers MUST map positions through chunk_be_place_for_obj(be, oid, pos, place_n), never raw chunk_be_place_n. */
 int chunk_be_place_n(const uint8_t oid[16], unsigned pos, int n);
 int chunk_be_infer_place_n(const chunk_backend *be, const uint8_t oid[16], unsigned np, const int *obs_store,
                            const unsigned *obs_pos, size_t nobs, int target_store);

@@ -264,8 +264,18 @@ static void test_records_roundtrip(void)
     /* Chained replacement on slot 1 */
     CHECK(tiers_append_state(dfd, true, id4, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
     CHECK(tiers_append_state(dfd, true, id4, TIERS_STATE_REPLACED_BY, TSDB_TIER_CLASS_SSD, true, id5, "/mnt/t1b") == 0);
-    /* id3 LOST and left lost */
+    /* id3 LOST -> SHRINKING -> REMOVED transitions (R15 r15-shrink), plus invalid transitions refused. */
     CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+    CHECK(tiers_append_state(dfd, true, id2, TIERS_STATE_SHRINKING, 0, false, NULL, NULL) == TSDB_ERR_INVALID);
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_REMOVED, 0, false, NULL, NULL) == TSDB_ERR_INVALID);
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_SHRINKING, 0, false, NULL, NULL) == 0);
+    /* Replacing a SHRINKING store is refused; transitioning SHRINKING -> REMOVED succeeds. */
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_REPLACED_BY, TSDB_TIER_CLASS_HDD, false, id4, "/mnt/t3new") ==
+          TSDB_ERR_INVALID);
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_REMOVED, 0, false, NULL, NULL) == 0);
+    /* Further transitions on a REMOVED store are refused. */
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_LOST, 0, false, NULL, NULL) == TSDB_ERR_INVALID);
+    CHECK(tiers_append_state(dfd, true, id3, TIERS_STATE_SHRINKING, 0, false, NULL, NULL) == TSDB_ERR_INVALID);
 
     /* Reload and verify every field */
     CHECK(tiers_load(dfd, false, true, &v) == 0);
@@ -278,7 +288,7 @@ static void test_records_roundtrip(void)
     CHECK(memcmp(v.stores[2].id, id2, 16) == 0 && v.stores[2].cls == TSDB_TIER_CLASS_SSD &&
           !v.stores[2].single_copy && v.stores[2].state == TIERS_STATE_ACTIVE && strcmp(v.stores[2].path, "/mnt/t2") == 0);
     CHECK(memcmp(v.stores[3].id, id3, 16) == 0 && v.stores[3].cls == TSDB_TIER_CLASS_HDD &&
-          v.stores[3].single_copy && v.stores[3].state == TIERS_STATE_LOST && strcmp(v.stores[3].path, "/mnt/t3") == 0);
+          v.stores[3].single_copy && v.stores[3].state == TIERS_STATE_REMOVED && strcmp(v.stores[3].path, "/mnt/t3") == 0);
 
     /* Effective settings for volume 0 (global) and volume 2 (overridden) */
     tiers_view_settings_for(&v, 0, &eff);
@@ -469,11 +479,11 @@ static void test_add_validation_and_binding(void)
     cap_begin();
     CHECK(tsdb_tier_lost(db1, "s0", NULL, 0) == TSDB_ERR_INVALID);
     cap_end(log, sizeof log);
-    CHECK(strstr(log, "not built") != NULL);
+    CHECK(strstr(log, "no tier stores") != NULL);
     cap_begin();
     CHECK(tsdb_tier_salvage(db1, 0, 1, 0) == TSDB_ERR_INVALID);
     cap_end(log, sizeof log);
-    CHECK(strstr(log, "not built") != NULL);
+    CHECK(strstr(log, "no local tier") != NULL);
     cap_begin();
     CHECK(tsdb_tier_status(db1, &st_info) == TSDB_ERR_INVALID);
     cap_end(log, sizeof log);

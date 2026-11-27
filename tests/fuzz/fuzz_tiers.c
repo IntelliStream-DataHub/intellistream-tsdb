@@ -71,7 +71,7 @@ static void verify_parsed(const uint8_t *p, size_t size)
     uint8_t tmp_ids[TIERS_STORES_MAX][16];
     for (size_t i = 0; i < v.nstores; i++) {
         const tiers_store *s = &v.stores[i];
-        if (tiers_path_valid(s->path) != 0 || s->cls > TSDB_TIER_CLASS_HDD || s->state > TIERS_STATE_REPLACED_BY)
+        if (tiers_path_valid(s->path) != 0 || s->cls > TSDB_TIER_CLASS_HDD || s->state > TIERS_STATE_REMOVED)
             abort();
         if (s->state == TIERS_STATE_ACTIVE) {
             int n = tiers_encode_store(off, s->id, s->cls, s->single_copy, s->path, buf + off, cap - off);
@@ -102,7 +102,7 @@ static void verify_parsed(const uint8_t *p, size_t size)
     }
     for (size_t i = 0; i < v.nstores; i++) {
         const tiers_store *s = &v.stores[i];
-        if (s->state == TIERS_STATE_LOST) {
+        if (s->state == TIERS_STATE_LOST || s->state == TIERS_STATE_SHRINKING || s->state == TIERS_STATE_REMOVED) {
             int n = tiers_encode_state(off, tmp_ids[i], TIERS_STATE_REPLACED_BY, s->cls, s->single_copy, s->id,
                                        s->path, buf + off, cap - off);
             if (n <= 0)
@@ -112,6 +112,18 @@ static void verify_parsed(const uint8_t *p, size_t size)
             if (n <= 0)
                 abort();
             off += (size_t)n;
+            if (s->state == TIERS_STATE_SHRINKING || s->state == TIERS_STATE_REMOVED) {
+                n = tiers_encode_state(off, s->id, TIERS_STATE_SHRINKING, 0, false, NULL, NULL, buf + off, cap - off);
+                if (n <= 0)
+                    abort();
+                off += (size_t)n;
+            }
+            if (s->state == TIERS_STATE_REMOVED) {
+                n = tiers_encode_state(off, s->id, TIERS_STATE_REMOVED, 0, false, NULL, NULL, buf + off, cap - off);
+                if (n <= 0)
+                    abort();
+                off += (size_t)n;
+            }
         } else if (s->state == TIERS_STATE_REPLACED_BY) {
             int n = tiers_encode_state(off, tmp_ids[i], TIERS_STATE_REPLACED_BY, s->cls, s->single_copy,
                                        s->replaced_by, s->path, buf + off, cap - off);
@@ -271,6 +283,18 @@ void fuzz_seeds(const char *dir)
 
     n = tiers_encode_state(off, id1, TIERS_STATE_REPLACED_BY, TSDB_TIER_CLASS_SSD, false, id3, "/mnt/ssd0/tier",
                            buf + off, sizeof buf - off);
+    if (n <= 0)
+        exit(1);
+    off += (size_t)n;
+    n = tiers_encode_state(off, id2, TIERS_STATE_LOST, 0, false, NULL, NULL, buf + off, sizeof buf - off);
+    if (n <= 0)
+        exit(1);
+    off += (size_t)n;
+    n = tiers_encode_state(off, id2, TIERS_STATE_SHRINKING, 0, false, NULL, NULL, buf + off, sizeof buf - off);
+    if (n <= 0)
+        exit(1);
+    off += (size_t)n;
+    n = tiers_encode_state(off, id2, TIERS_STATE_REMOVED, 0, false, NULL, NULL, buf + off, sizeof buf - off);
     if (n <= 0)
         exit(1);
     off += (size_t)n;

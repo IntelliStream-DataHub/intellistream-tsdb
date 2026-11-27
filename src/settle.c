@@ -420,19 +420,23 @@ static bool stores_ready_for_settle(const eng *db, int *up_out, int *total_out, 
         return true;
     const tier_settings *cfg = tier_eng_settings(db);
     int n = chunk_be_nstores(be);
-    int km = cfg ? cfg->k + cfg->m : n;
-    int need = n > km ? n : km;
-    int up = 0;
-    for (int i = 0; i < n; i++)
+    int elig = 0, up = 0;
+    for (int i = 0; i < n; i++) {
+        if (chunk_be_store_excluded(be, i))
+            continue;
+        elig++;
         if (chunk_be_store_state(be, i) == CHUNK_STORE_UP)
             up++;
+    }
+    int km = cfg ? cfg->k + cfg->m : elig;
+    int need = elig > km ? elig : km;
     if (up_out)
         *up_out = up;
     if (total_out)
-        *total_out = n;
+        *total_out = elig;
     if (need_out)
         *need_out = need;
-    return n > 0 && up >= need;
+    return elig > 0 && up >= need;
 }
 
 static bool eng_stopping(eng *db)

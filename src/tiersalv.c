@@ -120,9 +120,11 @@ static bool ec_part_is_lost(const eng *db, const chunk_backend *be, const part *
     int min_n = npos >= 2 ? (int)npos : 1;
     if (min_n > bn)
         min_n = bn;
+    int active_n = chunk_be_active_count(be);
+    bool has_excl = active_n < bn;
 
-    /* Fast path: only one possible store count for placement (e.g. 6 stores with 4+2 -> min_n == bn == 6). */
-    if (min_n == bn) {
+    /* Fast path: only one possible store count for placement (no excluded/SHRINKING stores and min_n == bn). */
+    if (!has_excl && min_n == bn) {
         unsigned lost_pos = 0;
         for (unsigned pos = 0; pos < npos; pos++) {
             int sidx = chunk_be_place_n(r->oid, pos, bn);
@@ -132,8 +134,8 @@ static bool ec_part_is_lost(const eng *db, const chunk_backend *be, const part *
         return lost_pos > (unsigned)r->m;
     }
 
-    /* Multiple candidate store counts (e.g. k' < k or stores added after settle): observe any surviving chunk on
-     * an open store to infer the exact store count `place_n` the object was placed with. */
+    /* Multiple candidate placements (k' < k, stores added after settle, or active-store placement during SHRINKING):
+     * observe any surviving chunk on an open store to infer the exact placement the object was written with. */
     int obs_store[CHUNK_POS_MAX];
     unsigned obs_pos[CHUNK_POS_MAX];
     size_t nobs = 0;
@@ -160,20 +162,24 @@ static bool ec_part_is_lost(const eng *db, const chunk_backend *be, const part *
         int pn = chunk_be_infer_place_n(be, r->oid, npos, obs_store, obs_pos, nobs, -1);
         unsigned lost_pos = 0;
         for (unsigned pos = 0; pos < npos; pos++) {
-            int sidx = chunk_be_place_n(r->oid, pos, pn);
+            int sidx = chunk_be_place_for_obj(be, r->oid, pos, pn);
             if (chunk_be_store_is_lost(be, sidx))
                 lost_pos++;
         }
         return lost_pos > (unsigned)r->m;
     }
 
-    /* No surviving chunks observed on any UP store: match chunkread.c's conservative multi-candidate rule so an
-     * object written before a `tier add` is declared lost iff every candidate with 0 UP positions has > m LOST. */
+    /* No surviving chunks observed on any UP store: match chunkread.c's conservative multi-candidate rule (including
+     * the active-store placement sentinel -1 when excluded/SHRINKING stores exist). */
     bool any_cand = false, all_cand_lost = true;
-    for (int cand = bn; cand >= min_n; cand--) {
+    int first_cand = (has_excl && active_n >= (int)npos) ? -1 : bn;
+    for (int step = 0;; step++) {
+        int cand = (first_cand == -1 && step == 0) ? -1 : bn - (first_cand == -1 ? step - 1 : step);
+        if (cand != -1 && cand < min_n)
+            break;
         unsigned lost_pos = 0, up_pos = 0;
         for (unsigned pos = 0; pos < npos; pos++) {
-            int sidx = chunk_be_place_n(r->oid, pos, cand);
+            int sidx = chunk_be_place_for_obj(be, r->oid, pos, cand);
             if (chunk_be_store_is_lost(be, sidx))
                 lost_pos++;
             else if (chunk_be_store_state(be, sidx) == CHUNK_STORE_UP)
@@ -189,8 +195,9 @@ static bool ec_part_is_lost(const eng *db, const chunk_backend *be, const part *
         return all_cand_lost;
 
     unsigned lost_pos = 0;
+    int fb_pn = (has_excl && active_n >= (int)npos) ? -1 : bn;
     for (unsigned pos = 0; pos < npos; pos++) {
-        int sidx = chunk_be_place_n(r->oid, pos, bn);
+        int sidx = chunk_be_place_for_obj(be, r->oid, pos, fb_pn);
         if (chunk_be_store_is_lost(be, sidx))
             lost_pos++;
     }

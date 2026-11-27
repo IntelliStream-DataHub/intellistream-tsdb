@@ -11,7 +11,9 @@
 #include "chunk_priv.h"
 #include "eccache.h"
 #include "ecgc.h"
+#include "ecpart.h"
 #include "internal.h"
+#include "settle.h"
 #include "tier.h"
 #include "tiers.h"
 
@@ -86,9 +88,13 @@ bool tierctl_store_rebuilding(const char *store_path)
 typedef struct ctl_slot {
     uint8_t id[16];     /* active id in backend (replacement id when REPLACED_BY, else original id) */
     uint8_t state;      /* last applied TIERS_STATE_* */
+    int be_idx;         /* slot index in t->be, or -1 if already REMOVED at open */
     char *path;
     bool needs_rebuild; /* true while REPLACED_BY has not yet finished rebuild (REBUILDING present) */
+    bool needs_shrink;  /* true while SHRINKING has not yet re-encoded all live objects and marked REMOVED */
     bool wait_other_up; /* parked waiting for another transiently DOWN (non-LOST) store to recover */
+    bool shrink_park_logged; /* logged once while shrink waits on another LOST/DOWN store */
+    bool shrink_err_logged;  /* logged once while shrink is blocked by damaged/unrecoverable object */
     uint64_t bytes_done_saved; /* accumulated bytes_done preserved across between-object yields */
     int64_t retry_after_ms;
     int fails;
@@ -99,6 +105,8 @@ struct tierctl {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t idle_cv;
+    pthread_cond_t shrink_cv;
+    eng *shrink_cur; /* single engine pinned during eng_reencode (unrelated volumes never wait) */
     bool closing;
     atomic_bool closing_atomic;
     bool quiesced;
@@ -465,12 +473,19 @@ static void apply_live_settings(struct tierctl *ctl, tiers_view *tv)
                           memory_order_relaxed);
     atomic_store_explicit(&ctl->scrub_days, tv->global.scrub_days, memory_order_relaxed);
 
-    bool all_sc = tv->nstores > 0;
-    for (size_t i = 0; i < tv->nstores; i++)
+    size_t n_elig = 0;
+    bool all_sc = true;
+    for (size_t i = 0; i < tv->nstores; i++) {
+        if (tv->stores[i].state == TIERS_STATE_REMOVED || tv->stores[i].state == TIERS_STATE_SHRINKING)
+            continue;
+        n_elig++;
         if (!tv->stores[i].single_copy)
             all_sc = false;
+    }
+    if (n_elig == 0)
+        all_sc = false;
     int def_k = 0, def_m = 0;
-    bool has_def = tier_default_geom((int)tv->nstores, all_sc, &def_k, &def_m);
+    bool has_def = tier_default_geom((int)n_elig, all_sc, &def_k, &def_m);
 
     tiers_view old_tv;
     pthread_mutex_lock(&t->cmu);
@@ -484,12 +499,12 @@ static void apply_live_settings(struct tierctl *ctl, tiers_view *tv)
         if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
             bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
                                 : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
-                                   (int)vs.k + (int)vs.m <= (int)t->tview.nstores);
+                                   (int)vs.k + (int)vs.m <= (int)n_elig);
             if (ok) {
                 tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
             } else {
                 fprintf(stderr, "tsdb: tier: ignoring invalid live redundancy %u+%u in %s for %zu store(s)\n",
-                        (unsigned)vs.k, (unsigned)vs.m, TIERS_FILE, t->tview.nstores);
+                        (unsigned)vs.k, (unsigned)vs.m, TIERS_FILE, n_elig);
             }
         } else if (has_def) {
             tier_settings_set_km(&cv->set, def_k, def_m);
@@ -558,20 +573,24 @@ static void apply_tiers_changes(struct tierctl *ctl)
 
         pthread_mutex_lock(&ctl->mu);
         uint8_t prev_state = ctl->slots[i].state;
+        int be_idx = ctl->slots[i].be_idx;
         bool id_changed = memcmp(ctl->slots[i].id, want_id, 16) != 0;
         pthread_mutex_unlock(&ctl->mu);
 
         if (ts->state == TIERS_STATE_LOST && prev_state != TIERS_STATE_LOST) {
-            tier_health_store_lost(t, i);
-            tier_ensure_paused(t, i, "is LOST");
-            (void)chunk_be_mark_lost(t->be, i);
-            need_reopen = true;
-            chunk_be_release_down(t->be, i);
+            if (be_idx >= 0) {
+                tier_health_store_lost(t, be_idx);
+                tier_ensure_paused(t, be_idx, "is LOST");
+                (void)chunk_be_mark_lost(t->be, be_idx);
+                need_reopen = true;
+                chunk_be_release_down(t->be, be_idx);
+            }
             char *pcopy = strdup(ts->path);
             pthread_mutex_lock(&ctl->mu);
             ctl->slots[i].state = TIERS_STATE_LOST;
             memcpy(ctl->slots[i].id, ts->id, 16);
             ctl->slots[i].needs_rebuild = false;
+            ctl->slots[i].needs_shrink = false;
             ctl->slots[i].wait_other_up = false;
             ctl->slots[i].bytes_done_saved = 0;
             ctl->slots[i].retry_after_ms = 0;
@@ -582,23 +601,26 @@ static void apply_tiers_changes(struct tierctl *ctl)
             }
             /* A store transitioning from transiently DOWN to permanently LOST unblocks parked rebuilds. */
             for (int j = 0; j < ctl->nslots; j++)
-                if (ctl->slots[j].needs_rebuild) {
+                if (ctl->slots[j].needs_rebuild || ctl->slots[j].needs_shrink) {
                     ctl->slots[j].wait_other_up = false;
                     ctl->slots[j].retry_after_ms = 0;
                 }
             pthread_mutex_unlock(&ctl->mu);
             fprintf(stderr, "tsdb: tier: store %d (%s) declared LOST in %s\n", i, ts->path, TIERS_FILE);
         } else if (ts->state == TIERS_STATE_REPLACED_BY && (prev_state != TIERS_STATE_REPLACED_BY || id_changed)) {
-            tier_health_store_lost(t, i);
-            tier_ensure_paused(t, i, "is being replaced");
-            (void)chunk_be_mark_lost(t->be, i);
-            need_reopen = true;
-            chunk_be_release_down(t->be, i);
+            if (be_idx >= 0) {
+                tier_health_store_lost(t, be_idx);
+                tier_ensure_paused(t, be_idx, "is being replaced");
+                (void)chunk_be_mark_lost(t->be, be_idx);
+                need_reopen = true;
+                chunk_be_release_down(t->be, be_idx);
+            }
             char *pcopy = strdup(ts->path);
             pthread_mutex_lock(&ctl->mu);
             ctl->slots[i].state = TIERS_STATE_REPLACED_BY;
             memcpy(ctl->slots[i].id, ts->replaced_by, 16);
-            ctl->slots[i].needs_rebuild = true;
+            ctl->slots[i].needs_rebuild = be_idx >= 0;
+            ctl->slots[i].needs_shrink = false;
             ctl->slots[i].wait_other_up = false;
             ctl->slots[i].bytes_done_saved = 0;
             ctl->slots[i].retry_after_ms = 0;
@@ -608,12 +630,60 @@ static void apply_tiers_changes(struct tierctl *ctl)
                 ctl->slots[i].path = pcopy;
             }
             for (int j = 0; j < ctl->nslots; j++)
-                if (j != i && ctl->slots[j].needs_rebuild) {
+                if (j != i && (ctl->slots[j].needs_rebuild || ctl->slots[j].needs_shrink)) {
                     ctl->slots[j].wait_other_up = false;
                     ctl->slots[j].retry_after_ms = 0;
                 }
             pthread_mutex_unlock(&ctl->mu);
             fprintf(stderr, "tsdb: tier: store %d replaced by %s in %s: queuing rebuild\n", i, ts->path, TIERS_FILE);
+        } else if (ts->state == TIERS_STATE_SHRINKING && prev_state != TIERS_STATE_SHRINKING) {
+            if (be_idx >= 0) {
+                tier_health_store_lost(t, be_idx);
+                (void)chunk_be_mark_lost(t->be, be_idx);
+                chunk_be_set_excluded(t->be, be_idx, true);
+                need_reopen = true;
+                chunk_be_release_down(t->be, be_idx);
+            }
+            char *pcopy = strdup(ts->path);
+            pthread_mutex_lock(&ctl->mu);
+            ctl->slots[i].state = TIERS_STATE_SHRINKING;
+            memcpy(ctl->slots[i].id, ts->id, 16);
+            ctl->slots[i].needs_rebuild = false;
+            ctl->slots[i].needs_shrink = true;
+            ctl->slots[i].wait_other_up = false;
+            ctl->slots[i].bytes_done_saved = 0;
+            ctl->slots[i].retry_after_ms = 0;
+            ctl->slots[i].fails = 0;
+            if (pcopy) {
+                free(ctl->slots[i].path);
+                ctl->slots[i].path = pcopy;
+            }
+            for (int j = 0; j < ctl->nslots; j++)
+                if (ctl->slots[j].needs_rebuild || ctl->slots[j].needs_shrink) {
+                    ctl->slots[j].wait_other_up = false;
+                    ctl->slots[j].retry_after_ms = 0;
+                }
+            pthread_mutex_unlock(&ctl->mu);
+            fprintf(stderr, "tsdb: tier: store %d (%s) is SHRINKING in %s: queuing re-encode onto remaining stores\n",
+                    i, ts->path, TIERS_FILE);
+        } else if (ts->state == TIERS_STATE_REMOVED && prev_state != TIERS_STATE_REMOVED) {
+            if (be_idx >= 0) {
+                tier_health_store_lost(t, be_idx);
+                (void)chunk_be_mark_lost(t->be, be_idx);
+                chunk_be_set_excluded(t->be, be_idx, true);
+                need_reopen = true;
+                chunk_be_release_down(t->be, be_idx);
+            }
+            pthread_mutex_lock(&ctl->mu);
+            ctl->slots[i].state = TIERS_STATE_REMOVED;
+            memcpy(ctl->slots[i].id, ts->id, 16);
+            ctl->slots[i].needs_rebuild = false;
+            ctl->slots[i].needs_shrink = false;
+            ctl->slots[i].wait_other_up = false;
+            ctl->slots[i].retry_after_ms = 0;
+            ctl->slots[i].fails = 0;
+            pthread_mutex_unlock(&ctl->mu);
+            fprintf(stderr, "tsdb: tier: store %d (%s) marked REMOVED in %s\n", i, ts->path, TIERS_FILE);
         }
     }
 
@@ -625,18 +695,30 @@ static void apply_tiers_changes(struct tierctl *ctl)
         const tiers_store *ts = &tv.stores[i];
         int add_rc = 0;
         bool is_rebuilding = false;
+        bool is_shrinking = false;
+        int new_be_idx = -1;
         const uint8_t *want_id = ts->state == TIERS_STATE_REPLACED_BY ? ts->replaced_by : ts->id;
-        if (ts->state == TIERS_STATE_LOST) {
+        if (ts->state == TIERS_STATE_REMOVED) {
+            new_be_idx = -1;
+        } else if (ts->state == TIERS_STATE_LOST || ts->state == TIERS_STATE_SHRINKING) {
             add_rc = chunk_be_add_lost(t->be, ts->path);
             if (add_rc == 0) {
-                (void)tier_health_store_added(t, i, ts->path, ts->id, false);
-                tier_ensure_paused(t, i, "is LOST");
+                new_be_idx = chunk_be_nstores(t->be) - 1;
+                (void)tier_health_store_added(t, new_be_idx, ts->path, ts->id, false);
+                if (ts->state == TIERS_STATE_SHRINKING) {
+                    chunk_be_set_excluded(t->be, new_be_idx, true);
+                    is_shrinking = true;
+                } else {
+                    tier_ensure_paused(t, new_be_idx, "is LOST");
+                }
             }
         } else {
             is_rebuilding = ts->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(ts->path);
             add_rc = chunk_be_add_store(t->be, ts->path, want_id, t->db_id, is_rebuilding);
-            if (add_rc == 0)
-                (void)tier_health_store_added(t, i, ts->path, want_id, !is_rebuilding);
+            if (add_rc == 0) {
+                new_be_idx = chunk_be_nstores(t->be) - 1;
+                (void)tier_health_store_added(t, new_be_idx, ts->path, want_id, !is_rebuilding);
+            }
         }
         if (add_rc != 0) {
             fprintf(stderr, "tsdb: tier: newly added store %d (%s) could not be opened (%d): will retry\n", i, ts->path,
@@ -647,9 +729,11 @@ static void apply_tiers_changes(struct tierctl *ctl)
         char *pcopy = strdup(ts->path);
         pthread_mutex_lock(&ctl->mu);
         ctl->slots[i].state = ts->state;
+        ctl->slots[i].be_idx = new_be_idx;
         memcpy(ctl->slots[i].id, want_id, 16);
         ctl->slots[i].path = pcopy;
         ctl->slots[i].needs_rebuild = is_rebuilding;
+        ctl->slots[i].needs_shrink = is_shrinking;
         ctl->slots[i].retry_after_ms = 0;
         ctl->slots[i].fails = 0;
         ctl->nslots = i + 1;
@@ -678,8 +762,23 @@ static void run_rebuild(struct tierctl *ctl, int idx)
     if (!t || !t->be)
         return;
 
+    char path[PATH_MAX];
+    uint8_t expect_id[16];
+    int be_idx = -1;
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->closing || !ctl->slots[idx].needs_rebuild || !ctl->slots[idx].path || ctl->slots[idx].be_idx < 0) {
+        if (ctl->slots[idx].be_idx < 0)
+            ctl->slots[idx].needs_rebuild = false;
+        pthread_mutex_unlock(&ctl->mu);
+        return;
+    }
+    be_idx = ctl->slots[idx].be_idx;
+    snprintf(path, sizeof path, "%s", ctl->slots[idx].path);
+    memcpy(expect_id, ctl->slots[idx].id, 16);
+    pthread_mutex_unlock(&ctl->mu);
+
     /* Pause settles/GC across the rebuild so live OIDs are stable and no new chunks are placed on a partial store. */
-    tier_ensure_paused(t, idx, "is rebuilding");
+    tier_ensure_paused(t, be_idx, "is rebuilding");
 
     /* Wait briefly if any settle/reencode is currently in flight. */
     if (tier_health_any_settling(t)) {
@@ -689,15 +788,11 @@ static void run_rebuild(struct tierctl *ctl, int idx)
         return;
     }
 
-    char path[PATH_MAX];
-    uint8_t expect_id[16];
     pthread_mutex_lock(&ctl->mu);
-    if (ctl->closing || !ctl->slots[idx].needs_rebuild || !ctl->slots[idx].path) {
+    if (ctl->closing || !ctl->slots[idx].needs_rebuild) {
         pthread_mutex_unlock(&ctl->mu);
         return;
     }
-    snprintf(path, sizeof path, "%s", ctl->slots[idx].path);
-    memcpy(expect_id, ctl->slots[idx].id, 16);
     uint32_t mb_s = atomic_load_explicit(&ctl->rebuild_mb_s, memory_order_relaxed);
     if (mb_s == 0)
         mb_s = TIERS_REBUILD_MB_S_DEFAULT;
@@ -709,7 +804,7 @@ static void run_rebuild(struct tierctl *ctl, int idx)
     ctl->prog.rate_mb_s = mb_s;
     pthread_mutex_unlock(&ctl->mu);
 
-    uint64_t est = estimate_store_bytes(t->be, idx);
+    uint64_t est = estimate_store_bytes(t->be, be_idx);
     pthread_mutex_lock(&ctl->mu);
     ctl->prog.bytes_est = est;
     pthread_mutex_unlock(&ctl->mu);
@@ -746,23 +841,23 @@ static void run_rebuild(struct tierctl *ctl, int idx)
     chunk_heal_report rep;
     memset(&rep, 0, sizeof rep);
 
-    int cur = chunk_be_store_state(t->be, idx);
+    int cur = chunk_be_store_state(t->be, be_idx);
     int rc = 0;
     if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire)) {
         rc = TSDB_ERR_STOPPED;
 #ifdef TSDB_TEST_HOOKS
     } else if (tierctl_mut() == TIERCTL_MUT_LOSTNOREPLACE) {
         /* Planted mutant `lostnoreplace`: promotes replacement store to UP without rebuilding any chunks. */
-        rc = chunk_be_promote_up_norebuild(t->be, idx, path, expect_id, t->db_id, &ho);
+        rc = chunk_be_promote_up_norebuild(t->be, be_idx, path, expect_id, t->db_id, &ho);
 #endif
     } else if (cur == CHUNK_STORE_REPLACING) {
         /* Resuming a rebuild after kill/power loss or transient unavailability: ensure every volume's fence is in ns. */
-        rc = chunk_be_fence_store(t->be, idx);
+        rc = chunk_be_fence_store(t->be, be_idx);
         if (rc == 0)
-            rc = chunk_be_settle(t->be, idx, &ho, &rep);
+            rc = chunk_be_settle(t->be, be_idx, &ho, &rep);
     } else {
-        /* Live replacement triggered from TIERS: install pre-initialized store at slot idx and rebuild. */
-        rc = chunk_be_replace_open(t->be, idx, path, expect_id, t->db_id, &ho, &rep);
+        /* Live replacement triggered from TIERS: install pre-initialized store at slot be_idx and rebuild. */
+        rc = chunk_be_replace_open(t->be, be_idx, path, expect_id, t->db_id, &ho, &rep);
     }
     free(live.v);
 
@@ -771,7 +866,7 @@ static void run_rebuild(struct tierctl *ctl, int idx)
     if (rc == TSDB_ERR_UNAVAILABLE) {
         int bn = chunk_be_nstores(t->be);
         for (int j = 0; j < bn; j++) {
-            if (j == idx || chunk_be_store_is_lost(t->be, j))
+            if (j == be_idx || chunk_be_store_is_lost(t->be, j) || chunk_be_store_excluded(t->be, j))
                 continue;
             int st = chunk_be_store_state(t->be, j);
             if (st != CHUNK_STORE_UP && st != CHUNK_STORE_REPLACING) {
@@ -816,18 +911,654 @@ static void run_rebuild(struct tierctl *ctl, int idx)
     pthread_mutex_unlock(&ctl->mu);
 
     if (rc == 0 && !atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire)) {
-        tier_health_store_replaced(t, idx, path, expect_id);
+        tier_health_store_replaced(t, be_idx, path, expect_id);
         eccache_reopen_all(t);
         tier_resume_if_all_up(t);
-        /* If another slot is still REPLACING waiting for this store to come UP, retry it immediately. */
+        /* If another slot is still REPLACING or SHRINKING waiting for this store to come UP, retry it immediately. */
         pthread_mutex_lock(&ctl->mu);
         for (int j = 0; j < ctl->nslots; j++)
-            if (j != idx && ctl->slots[j].needs_rebuild) {
+            if (j != idx && (ctl->slots[j].needs_rebuild || ctl->slots[j].needs_shrink)) {
                 ctl->slots[j].wait_other_up = false;
                 ctl->slots[j].retry_after_ms = 0;
             }
         pthread_mutex_unlock(&ctl->mu);
     }
+}
+
+/* ---------------------------------------------------------------- paced shrink re-encode (r15-shrink, D9) */
+
+static int ctl_read_volumes(int vfd, char ***paths_out, size_t *n_out);
+static void ctl_free_paths(char **paths, size_t n);
+
+static bool ctl_eng_closing(const eng *db)
+{
+    return atomic_load_explicit(&db->stop, memory_order_acquire) ||
+           atomic_load_explicit(&db->quiesced, memory_order_acquire);
+}
+
+/* Returns 1 if live .ec part `p` still needs re-encoding onto the remaining active stores (either its width exceeds
+ * the remaining active store count, or at least one position is absent from its post-shrink target store), 0 if every
+ * position already lives on its exact post-shrink active store, or -1 if an active store could not be checked. */
+static int part_needs_shrink(chunk_backend *be, uint32_t vol, const uint8_t oid[16], uint16_t k, uint16_t m)
+{
+    unsigned np = (unsigned)k + (unsigned)m;
+    if (np == 0 || np > CHUNK_POS_MAX)
+        return 1;
+    int ne = chunk_be_active_count(be);
+    if (ne < (int)np)
+        return 1;
+    for (unsigned pos = 0; pos < np; pos++) {
+        int target = chunk_be_place(be, oid, pos);
+        int has = chunk_be_store_has_chunk(be, target, vol, oid, pos);
+        if (has < 0)
+            return -1;
+        if (has == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Counts expected total volumes (root + VOLUMES lines) for root dir `dir`. Returns true on clean read. */
+static bool ctl_expected_vol_count(const char *dir, size_t *out)
+{
+    *out = 1;
+    if (!dir || !*dir)
+        return false;
+    int rootfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0)
+        return false;
+    int vfd = openat(rootfd, "VOLUMES", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    close(rootfd);
+    if (vfd < 0)
+        return errno == ENOENT;
+    if (ctl_ofd_lock(vfd, F_RDLCK) != 0) {
+        close(vfd);
+        return false;
+    }
+    char **paths = NULL;
+    size_t nv = 0;
+    int rc = ctl_read_volumes(vfd, &paths, &nv);
+    close(vfd);
+    ctl_free_paths(paths, nv);
+    if (rc != 0)
+        return false;
+    *out = 1 + nv;
+    return true;
+}
+
+typedef struct shrink_item {
+    uint32_t vol;
+    int64_t partition;
+    char name[96];
+    uint8_t oid[16];
+    uint16_t k, m;
+    uint64_t obj_len;
+    bool busy;
+    bool damaged;
+    bool need;
+} shrink_item;
+
+/* Appends TIERS_STATE_REMOVED for slot `slot_idx` under the VOLUMES OFD write lock. Always syncs TIERS (sync=true)
+ * deliberately so REMOVED is durable on disk independently of per-volume opt.fsync, matching tiers_append_state calls
+ * from CLI and tsdb_tier_lost. */
+static int finish_shrink_removed(struct tierctl *ctl, int slot_idx)
+{
+    tier *t = ctl->t;
+    if (!t || !t->dir)
+        return TSDB_ERR_INVALID;
+    int rootfd = open(t->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0)
+        return TSDB_ERR_IO;
+    int vfd = openat(rootfd, "VOLUMES", O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (vfd < 0) {
+        close(rootfd);
+        return TSDB_ERR_IO;
+    }
+    int rc = ctl_ofd_lock(vfd, F_WRLCK);
+    tiers_view tv;
+    tiers_view_init(&tv);
+    if (rc == 0)
+        rc = tiers_load(rootfd, true, true, &tv);
+    char spath[PATH_MAX] = "";
+    if (rc == 0) {
+        if ((size_t)slot_idx >= tv.nstores) {
+            rc = TSDB_ERR_INVALID;
+        } else if (tv.stores[slot_idx].state == TIERS_STATE_SHRINKING) {
+            snprintf(spath, sizeof spath, "%s", tv.stores[slot_idx].path);
+            rc = tiers_append_state(rootfd, true, tv.stores[slot_idx].id, TIERS_STATE_REMOVED, 0, false, NULL, NULL);
+        } else if (tv.stores[slot_idx].state == TIERS_STATE_REMOVED) {
+            snprintf(spath, sizeof spath, "%s", tv.stores[slot_idx].path);
+            rc = 0; /* already marked REMOVED */
+        } else {
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+    struct stat st;
+    bool have_st = rc == 0 && fstatat(rootfd, TIERS_FILE, &st, AT_SYMLINK_NOFOLLOW) == 0;
+    tiers_view_free(&tv);
+    close(vfd);
+    close(rootfd);
+
+    if (rc == 0) {
+        pthread_mutex_lock(&t->cmu);
+        if ((size_t)slot_idx < t->tview.nstores)
+            t->tview.stores[slot_idx].state = TIERS_STATE_REMOVED;
+        pthread_mutex_unlock(&t->cmu);
+
+        pthread_mutex_lock(&ctl->mu);
+        ctl->slots[slot_idx].state = TIERS_STATE_REMOVED;
+        ctl->slots[slot_idx].needs_shrink = false;
+        ctl->slots[slot_idx].wait_other_up = false;
+        ctl->slots[slot_idx].shrink_park_logged = false;
+        ctl->slots[slot_idx].shrink_err_logged = false;
+        ctl->slots[slot_idx].bytes_done_saved = 0;
+        ctl->slots[slot_idx].fails = 0;
+        ctl->slots[slot_idx].retry_after_ms = 0;
+        ctl->prog.shrink_active = false;
+        ctl->prog.shrink_store = -1;
+        ctl->prog.shrink_objects_left = 0;
+        ctl->prog.shrinks_done++;
+        if (have_st) {
+            ctl->tiers_st = st;
+            ctl->have_tiers_st = true;
+        }
+        pthread_cond_broadcast(&ctl->idle_cv);
+        pthread_mutex_unlock(&ctl->mu);
+        fprintf(stderr, "tsdb: tier: store %d (%s) shrink complete: marked REMOVED in %s\n", slot_idx,
+                spath[0] ? spath : "-", TIERS_FILE);
+    }
+    return rc;
+}
+
+/* Pins ONLY the single engine matching `vol` into ctl->shrink_cur (strict lock order: t->cmu -> ctl->mu).
+ * Returns the pinned engine (caller MUST call ctl_shrink_unpin_eng), or NULL if absent/closing. */
+static eng *ctl_shrink_pin_eng(struct tierctl *ctl, uint32_t vol)
+{
+    tier *t = ctl->t;
+    eng *found = NULL;
+    pthread_mutex_lock(&t->cmu);
+    for (size_t i = 0; i < t->nengs; i++) {
+        eng *db = t->engs[i];
+        if (db->tier_vol == vol && !ctl_eng_closing(db)) {
+            found = db;
+            break;
+        }
+    }
+    if (found) {
+        pthread_mutex_lock(&ctl->mu);
+        ctl->shrink_cur = found;
+        /* Dekker re-check under ctl->mu against eng_halt() setting db->stop before calling tierctl_eng_stop(db). */
+        if (ctl_eng_closing(found)) {
+            ctl->shrink_cur = NULL;
+            pthread_cond_broadcast(&ctl->shrink_cv);
+            found = NULL;
+        }
+        pthread_mutex_unlock(&ctl->mu);
+    }
+    pthread_mutex_unlock(&t->cmu);
+    return found;
+}
+
+static void ctl_shrink_unpin_eng(struct tierctl *ctl)
+{
+    pthread_mutex_lock(&ctl->mu);
+    ctl->shrink_cur = NULL;
+    pthread_cond_broadcast(&ctl->shrink_cv);
+    pthread_mutex_unlock(&ctl->mu);
+}
+
+static void run_shrink(struct tierctl *ctl, int slot_idx)
+{
+    tier *t = ctl->t;
+    if (!t || !t->be)
+        return;
+
+    /* Ensure all non-excluded stores are UP; park if another store is transiently DOWN, REPLACING, or LOST. */
+    int bn = chunk_be_nstores(t->be);
+    int elig = 0;
+    bool other_down = false, other_lost = false;
+    int first_lost = -1, first_down = -1;
+    for (int j = 0; j < bn; j++) {
+        if (chunk_be_store_excluded(t->be, j))
+            continue;
+        elig++;
+        int st = chunk_be_store_state(t->be, j);
+        if (st != CHUNK_STORE_UP) {
+            if (chunk_be_store_is_lost(t->be, j)) {
+                other_lost = true;
+                if (first_lost < 0)
+                    first_lost = j;
+            } else {
+                other_down = true;
+                if (first_down < 0)
+                    first_down = j;
+            }
+        }
+    }
+    if (elig == 0 || other_down || other_lost) {
+        bool do_log = false;
+        pthread_mutex_lock(&ctl->mu);
+        if (!ctl->slots[slot_idx].shrink_park_logged) {
+            ctl->slots[slot_idx].shrink_park_logged = true;
+            do_log = true;
+        }
+        if (other_down && !other_lost)
+            ctl->slots[slot_idx].wait_other_up = true;
+        else
+            ctl->slots[slot_idx].retry_after_ms = ctl_mono_ms() + 1000;
+        pthread_cond_broadcast(&ctl->idle_cv);
+        pthread_mutex_unlock(&ctl->mu);
+        if (do_log) {
+            if (other_lost)
+                fprintf(stderr, "tsdb: tier: shrink of store %d waiting: another store (slot %d) is LOST; "
+                                "replace or shrink it so remaining stores are UP\n",
+                        slot_idx, first_lost);
+            else if (other_down)
+                fprintf(stderr, "tsdb: tier: shrink of store %d waiting: another store (slot %d) is not UP\n",
+                        slot_idx, first_down);
+        }
+        return;
+    }
+
+    tier_resume_if_all_up(t);
+    if (!tier_writable(t)) {
+        bool do_log = false;
+        pthread_mutex_lock(&ctl->mu);
+        if (!ctl->slots[slot_idx].shrink_park_logged) {
+            ctl->slots[slot_idx].shrink_park_logged = true;
+            do_log = true;
+        }
+        ctl->slots[slot_idx].retry_after_ms = ctl_mono_ms() + 500;
+        pthread_cond_broadcast(&ctl->idle_cv);
+        pthread_mutex_unlock(&ctl->mu);
+        if (do_log)
+            fprintf(stderr, "tsdb: tier: shrink of store %d waiting: tier is not writable (halted or fenced)\n",
+                    slot_idx);
+        return;
+    }
+
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->closing || !ctl->slots[slot_idx].needs_shrink) {
+        pthread_mutex_unlock(&ctl->mu);
+        return;
+    }
+    ctl->slots[slot_idx].shrink_park_logged = false;
+    uint32_t mb_s = atomic_load_explicit(&ctl->rebuild_mb_s, memory_order_relaxed);
+    if (mb_s == 0)
+        mb_s = TIERS_REBUILD_MB_S_DEFAULT;
+    uint64_t saved_done = ctl->slots[slot_idx].bytes_done_saved;
+    ctl->prog.shrink_active = true;
+    ctl->prog.shrink_store = slot_idx;
+    ctl->prog.rate_mb_s = mb_s;
+    pthread_mutex_unlock(&ctl->mu);
+
+    ctl_pacer pacer = {
+        .ctl = ctl,
+        .store = slot_idx,
+        .next_tiers_check_ms = ctl_mono_ms() + ctl_poll_ms(),
+        .total_bytes = saved_done,
+    };
+
+    int rc = 0;
+    bool retry_soon = false;
+    bool park_down = false;
+
+    for (;;) {
+        if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire) || ctl_yield_cb(ctl)) {
+            rc = TSDB_ERR_STOPPED;
+            break;
+        }
+
+        size_t expect_vols = 1;
+        if (!ctl_expected_vol_count(t->dir, &expect_vols)) {
+            retry_soon = true;
+            break;
+        }
+        uint32_t *bvols = NULL;
+        size_t nbvols = 0;
+        if (chunk_be_volumes_list(t->be, &bvols, &nbvols) != 0) {
+            retry_soon = true;
+            break;
+        }
+
+        /* Step 1 (memory-only): snapshot live .ec part metadata under t->eng_active, then release t->eng_active
+         * BEFORE any store fstatat or re-encode I/O (tier_health.c locking rule: eng_active is never held across I/O). */
+        shrink_item *items = NULL;
+        size_t nitems = 0, capitems = 0;
+        bool ready = false, incomplete = false, oom = false, any_settling = false;
+
+        pthread_mutex_lock(&t->cmu);
+        ready = t->eng_opening == 0 && t->nengs > 0 && t->nengs >= t->ncvs && t->nengs >= expect_vols;
+        size_t nengs = ready ? t->nengs : 0;
+        eng **engs = (ready && nengs) ? malloc(nengs * sizeof *engs) : NULL;
+        if (ready && engs) {
+            memcpy(engs, t->engs, nengs * sizeof *engs);
+            t->eng_active++;
+        }
+        pthread_mutex_unlock(&t->cmu);
+
+        if (!ready || !engs) {
+            free(bvols);
+            free(engs);
+            if (!ready) {
+                bool do_log = false;
+                pthread_mutex_lock(&ctl->mu);
+                if (!ctl->slots[slot_idx].shrink_park_logged) {
+                    ctl->slots[slot_idx].shrink_park_logged = true;
+                    do_log = true;
+                }
+                pthread_mutex_unlock(&ctl->mu);
+                if (do_log)
+                    fprintf(stderr, "tsdb: tier: shrink of store %d waiting: not all %zu volume(s) are open/ready\n",
+                            slot_idx, expect_vols);
+            }
+            retry_soon = true;
+            break;
+        }
+
+        for (size_t i = 0; i < nengs && !incomplete; i++)
+            if (ctl_eng_closing(engs[i]))
+                incomplete = true;
+        for (size_t vi = 0; vi < nbvols && !incomplete; vi++) {
+            bool found = false;
+            for (size_t ei = 0; ei < nengs; ei++)
+                if (engs[ei]->tier_vol == bvols[vi]) {
+                    found = true;
+                    break;
+                }
+            if (!found)
+                incomplete = true;
+        }
+        free(bvols);
+
+        for (size_t ei = 0; ei < nengs && !incomplete && !oom; ei++) {
+            eng *db = engs[ei];
+            pthread_mutex_lock(&db->lock);
+            for (size_t pi = 0; pi < db->nparts; pi++) {
+                part *p = db->parts[pi];
+                if (p->settling)
+                    any_settling = true;
+                if (p->dropped)
+                    continue;
+                struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+                if (!ep || ep->test_mark)
+                    continue;
+                if (nitems == capitems) {
+                    size_t ncap = capitems ? capitems * 2 : 64;
+                    shrink_item *ni = realloc(items, ncap * sizeof *ni);
+                    if (!ni) {
+                        oom = true;
+                        break;
+                    }
+                    items = ni;
+                    capitems = ncap;
+                }
+                shrink_item *it = &items[nitems++];
+                memset(it, 0, sizeof *it);
+                it->vol = db->tier_vol;
+                it->partition = p->partition;
+                snprintf(it->name, sizeof it->name, "%s", p->name);
+                memcpy(it->oid, ep->rec.oid, 16);
+                it->k = ep->rec.k;
+                it->m = ep->rec.m;
+                it->obj_len = ep->rec.object_len;
+                it->busy = p->settling || p->merging || p->pending != NULL;
+                it->damaged = atomic_load_explicit(&p->damaged, memory_order_acquire);
+            }
+            pthread_mutex_unlock(&db->lock);
+        }
+
+        free(engs);
+        pthread_mutex_lock(&t->cmu);
+        if (--t->eng_active == 0)
+            pthread_cond_broadcast(&t->eng_cv);
+        pthread_mutex_unlock(&t->cmu);
+
+        if (incomplete || oom) {
+            free(items);
+            if (incomplete) {
+                bool do_log = false;
+                pthread_mutex_lock(&ctl->mu);
+                if (!ctl->slots[slot_idx].shrink_park_logged) {
+                    ctl->slots[slot_idx].shrink_park_logged = true;
+                    do_log = true;
+                }
+                pthread_mutex_unlock(&ctl->mu);
+                if (do_log)
+                    fprintf(stderr, "tsdb: tier: shrink of store %d waiting: a volume engine is opening, closing, "
+                                    "or quiesced\n",
+                            slot_idx);
+            }
+            retry_soon = true;
+            break;
+        }
+
+        /* Step 2 (outside t->eng_active): check chunk placement once per pass across all snapshotted objects. */
+        uint64_t left = 0;
+        bool scan_err = false, any_damaged = false;
+        uint32_t dmg_vol = 0;
+        int64_t dmg_part = 0;
+        size_t ncand = 0;
+        for (size_t i = 0; i < nitems; i++) {
+            if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire) || ctl_yield_cb(ctl)) {
+                rc = TSDB_ERR_STOPPED;
+                break;
+            }
+            int need = part_needs_shrink(t->be, items[i].vol, items[i].oid, items[i].k, items[i].m);
+            if (need < 0) {
+                scan_err = true;
+                break;
+            }
+            if (need > 0) {
+                left++;
+                if (items[i].damaged) {
+                    if (!any_damaged) {
+                        dmg_vol = items[i].vol;
+                        dmg_part = items[i].partition;
+                    }
+                    any_damaged = true;
+                } else if (!items[i].busy) {
+                    items[i].need = true;
+                    ncand++;
+                }
+            }
+        }
+        if (rc == TSDB_ERR_STOPPED) {
+            free(items);
+            break;
+        }
+        if (scan_err) {
+            free(items);
+            for (int j = 0; j < bn; j++)
+                if (!chunk_be_store_excluded(t->be, j) && !chunk_be_store_is_lost(t->be, j) &&
+                    chunk_be_store_state(t->be, j) != CHUNK_STORE_UP)
+                    park_down = true;
+            if (!park_down) {
+                bool do_log = false;
+                pthread_mutex_lock(&ctl->mu);
+                if (!ctl->slots[slot_idx].shrink_park_logged) {
+                    ctl->slots[slot_idx].shrink_park_logged = true;
+                    do_log = true;
+                }
+                pthread_mutex_unlock(&ctl->mu);
+                if (do_log)
+                    fprintf(stderr, "tsdb: tier: shrink of store %d waiting: chunk store stat check failed; retrying\n",
+                            slot_idx);
+            }
+            retry_soon = !park_down;
+            break;
+        }
+
+        pthread_mutex_lock(&ctl->mu);
+        ctl->prog.shrink_objects_left = left;
+        pthread_mutex_unlock(&ctl->mu);
+
+#ifdef TSDB_TEST_HOOKS
+        if (tierctl_mut() == TIERCTL_MUT_SHRINKEARLY && left > 0) {
+            /* Planted mutant `shrinkearly`: marks STATE REMOVED while live objects still reference the store. */
+            free(items);
+            rc = finish_shrink_removed(ctl, slot_idx);
+            break;
+        }
+#endif
+
+        if (left == 0) {
+            free(items);
+            if (any_settling || tier_health_any_settling(t)) {
+                retry_soon = true;
+                break;
+            }
+            /* Re-verify all non-excluded stores are still UP before appending STATE REMOVED. */
+            bool all_up = true;
+            for (int j = 0; j < chunk_be_nstores(t->be); j++)
+                if (!chunk_be_store_excluded(t->be, j) && chunk_be_store_state(t->be, j) != CHUNK_STORE_UP)
+                    all_up = false;
+            if (!all_up) {
+                park_down = true;
+                break;
+            }
+            ecgc_kick_tier(t);
+            rc = finish_shrink_removed(ctl, slot_idx);
+            break;
+        }
+
+        if (ncand == 0) {
+            free(items);
+            if (any_damaged) {
+                bool do_log = false;
+                pthread_mutex_lock(&ctl->mu);
+                if (!ctl->slots[slot_idx].shrink_err_logged) {
+                    ctl->slots[slot_idx].shrink_err_logged = true;
+                    do_log = true;
+                }
+                pthread_mutex_unlock(&ctl->mu);
+                if (do_log)
+                    fprintf(stderr, "tsdb: tier: shrink of store %d blocked by damaged .ec part in volume %u "
+                                    "partition %" PRId64 "; run `tsdb %s tier salvage` to retire unreadable parts\n",
+                            slot_idx, dmg_vol, dmg_part, t->dir ? t->dir : "DIR");
+                rc = TSDB_ERR_CORRUPT;
+            } else {
+                retry_soon = true;
+            }
+            break;
+        }
+
+        /* Step 3 (O(N) worklist): re-encode every candidate collected in this pass, pinning only its single engine
+         * through ctl->shrink_cur so unrelated volumes never wait and t->eng_active stays 0. */
+        bool made_progress = false;
+        for (size_t i = 0; i < nitems; i++) {
+            if (!items[i].need)
+                continue;
+            if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire) || ctl_yield_cb(ctl)) {
+                rc = TSDB_ERR_STOPPED;
+                break;
+            }
+
+            eng *db = ctl_shrink_pin_eng(ctl, items[i].vol);
+            if (!db) {
+                retry_soon = true;
+                break;
+            }
+
+            part *cand_p = NULL;
+            pthread_mutex_lock(&db->lock);
+            for (size_t pi = 0; pi < db->nparts; pi++) {
+                part *p = db->parts[pi];
+                if (p->dropped || p->partition != items[i].partition || strcmp(p->name, items[i].name) != 0)
+                    continue;
+                struct ecpart *ep = atomic_load_explicit(&p->ec, memory_order_acquire);
+                if (!ep || ep->test_mark || memcmp(ep->rec.oid, items[i].oid, 16) != 0)
+                    continue;
+                if (p->settling || p->merging || p->pending || atomic_load_explicit(&p->damaged, memory_order_acquire))
+                    break;
+                part_ref(p);
+                cand_p = p;
+                break;
+            }
+            pthread_mutex_unlock(&db->lock);
+
+            int rrc = TSDB_ERR_NOTFOUND;
+            if (cand_p) {
+                size_t got = 0;
+                rrc = eng_reencode(db, items[i].partition, &cand_p, 1, &got);
+                part_unref(cand_p);
+            }
+            ctl_shrink_unpin_eng(ctl);
+
+            if (rrc == 0) {
+                made_progress = true;
+                pthread_mutex_lock(&ctl->mu);
+                ctl->prog.shrink_objects_done++;
+                if (ctl->prog.shrink_objects_left > 0)
+                    ctl->prog.shrink_objects_left--;
+                pthread_mutex_unlock(&ctl->mu);
+                ctl_pace_cb(&pacer, items[i].obj_len ? items[i].obj_len : 1);
+                continue;
+            }
+            if (rrc == TSDB_ERR_NOTFOUND)
+                continue; /* part dropped, busy, or damaged concurrently; avoid tight spin */
+            if (rrc == TSDB_ERR_STOPPED) {
+                rc = TSDB_ERR_STOPPED;
+                break;
+            }
+            if (rrc == TSDB_ERR_IO || rrc == TSDB_ERR_CORRUPT) {
+                bool do_log = false;
+                pthread_mutex_lock(&ctl->mu);
+                if (!ctl->slots[slot_idx].shrink_err_logged) {
+                    ctl->slots[slot_idx].shrink_err_logged = true;
+                    do_log = true;
+                }
+                pthread_mutex_unlock(&ctl->mu);
+                if (do_log)
+                    fprintf(stderr, "tsdb: tier: shrink of store %d failed re-encoding %s (volume %u partition "
+                                    "%" PRId64 "): %s; if unrecoverable, run `tsdb %s tier salvage`\n",
+                            slot_idx, items[i].name, items[i].vol, items[i].partition, tsdb_strerror(rrc),
+                            t->dir ? t->dir : "DIR");
+            }
+            rc = rrc;
+            if (rrc == TSDB_ERR_UNAVAILABLE) {
+                for (int j = 0; j < chunk_be_nstores(t->be); j++)
+                    if (!chunk_be_store_excluded(t->be, j) && !chunk_be_store_is_lost(t->be, j) &&
+                        chunk_be_store_state(t->be, j) != CHUNK_STORE_UP)
+                        park_down = true;
+            }
+            break;
+        }
+        free(items);
+
+        if (rc != 0 || park_down || retry_soon)
+            break;
+        if (!made_progress) {
+            /* Every candidate returned NOTFOUND transiently: back off briefly instead of spinning at 100% CPU. */
+            retry_soon = true;
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->slots[slot_idx].needs_shrink) {
+        ctl->prog.shrink_active = false;
+        ctl->prog.shrink_store = -1;
+        ctl->slots[slot_idx].bytes_done_saved = pacer.total_bytes;
+        if (rc == TSDB_ERR_STOPPED) {
+            ctl->slots[slot_idx].retry_after_ms = 0;
+        } else if (park_down) {
+            ctl->slots[slot_idx].wait_other_up = true;
+            ctl->slots[slot_idx].fails = 0;
+            ctl->slots[slot_idx].retry_after_ms = 0;
+        } else if (retry_soon) {
+            ctl->slots[slot_idx].retry_after_ms = ctl_mono_ms() + 200;
+        } else if (rc != 0) {
+            if (ctl->slots[slot_idx].fails < 6)
+                ctl->slots[slot_idx].fails++;
+            int64_t backoff = (int64_t)500 << (ctl->slots[slot_idx].fails - 1);
+            if (backoff > 15000)
+                backoff = 15000;
+            ctl->slots[slot_idx].retry_after_ms = ctl_mono_ms() + backoff;
+        }
+    }
+    pthread_cond_broadcast(&ctl->idle_cv);
+    pthread_mutex_unlock(&ctl->mu);
 }
 
 /* ---------------------------------------------------------------- single tier worker thread */
@@ -906,10 +1637,10 @@ static void *worker_main(void *arg)
             .pace_ctx = &hpacer,
         };
         if (tier_health_run_one(t, &htpl, &h_wait)) {
-            /* A store may have just come UP: unpark any rebuild that was waiting on another transiently DOWN store. */
+            /* A store may have just come UP: unpark any rebuild/shrink waiting on another transiently DOWN store. */
             pthread_mutex_lock(&ctl->mu);
             for (int i = 0; i < ctl->nslots; i++)
-                if (ctl->slots[i].needs_rebuild && ctl->slots[i].wait_other_up) {
+                if ((ctl->slots[i].needs_rebuild || ctl->slots[i].needs_shrink) && ctl->slots[i].wait_other_up) {
                     ctl->slots[i].wait_other_up = false;
                     ctl->slots[i].retry_after_ms = 0;
                 }
@@ -917,8 +1648,8 @@ static void *worker_main(void *arg)
             continue;
         }
 
-        /* 4. Pending replacement rebuilds (yields cleanly between objects for TIERS changes and health attaches). */
-        int pick_rb = -1;
+        /* 4. Pending replacement rebuilds and shrinks (yield cleanly between objects for TIERS & health attaches). */
+        int pick_rb = -1, pick_sh = -1;
         int64_t wait_ms = t->from_tiers ? ctl_poll_ms() : 500;
         if (h_wait < wait_ms)
             wait_ms = h_wait;
@@ -940,10 +1671,27 @@ static void *worker_main(void *arg)
             if (rem < wait_ms)
                 wait_ms = rem;
         }
+        if (pick_rb < 0) {
+            for (int i = 0; i < ctl->nslots; i++) {
+                if (!ctl->slots[i].needs_shrink || ctl->slots[i].wait_other_up)
+                    continue;
+                if (now >= ctl->slots[i].retry_after_ms) {
+                    pick_sh = i;
+                    break;
+                }
+                int64_t rem = ctl->slots[i].retry_after_ms - now;
+                if (rem < wait_ms)
+                    wait_ms = rem;
+            }
+        }
         pthread_mutex_unlock(&ctl->mu);
 
         if (pick_rb >= 0) {
             run_rebuild(ctl, pick_rb);
+            continue;
+        }
+        if (pick_sh >= 0) {
+            run_shrink(ctl, pick_sh);
             continue;
         }
 
@@ -976,9 +1724,11 @@ int tierctl_open(tier *t)
         return TSDB_ERR_NOMEM;
     ctl->t = t;
     ctl->prog.store = -1;
+    ctl->prog.shrink_store = -1;
     pthread_mutex_init(&ctl->mu, NULL);
     tsdb_cond_init_mono(&ctl->cv);
     tsdb_cond_init_mono(&ctl->idle_cv);
+    pthread_cond_init(&ctl->shrink_cv, NULL);
     atomic_init(&ctl->closing_atomic, false);
 
     uint32_t rb_mb = TIERS_REBUILD_MB_S_DEFAULT;
@@ -1000,14 +1750,17 @@ int tierctl_open(tier *t)
             const uint8_t *cur_id = ts->state == TIERS_STATE_REPLACED_BY ? ts->replaced_by : ts->id;
             memcpy(ctl->slots[i].id, cur_id, 16);
             ctl->slots[i].state = ts->state;
+            ctl->slots[i].be_idx = t->tiers_to_be[i];
             ctl->slots[i].path = ts->path ? strdup(ts->path) : NULL;
             if (ts->path && !ctl->slots[i].path) {
                 atomic_store_explicit(&t->ctl, ctl, memory_order_release);
                 tierctl_close(t);
                 return TSDB_ERR_NOMEM;
             }
-            if (chunk_be_store_state(t->be, i) == CHUNK_STORE_REPLACING)
+            if (ctl->slots[i].be_idx >= 0 && chunk_be_store_state(t->be, ctl->slots[i].be_idx) == CHUNK_STORE_REPLACING)
                 ctl->slots[i].needs_rebuild = true;
+            if (ts->state == TIERS_STATE_SHRINKING)
+                ctl->slots[i].needs_shrink = true;
         }
         ctl->tiers_file_end = t->tview.file_end;
         if (t->dir) {
@@ -1031,6 +1784,19 @@ int tierctl_open(tier *t)
     }
     ctl->worker_started = true;
     return 0;
+}
+
+void tierctl_eng_stop(eng *db)
+{
+    if (!db || !db->tier)
+        return;
+    struct tierctl *ctl = atomic_load_explicit(&db->tier->ctl, memory_order_acquire);
+    if (!ctl)
+        return;
+    pthread_mutex_lock(&ctl->mu);
+    while (ctl->shrink_cur == db)
+        pthread_cond_wait(&ctl->shrink_cv, &ctl->mu);
+    pthread_mutex_unlock(&ctl->mu);
 }
 
 void tierctl_quiesce(tier *t)
@@ -1093,6 +1859,7 @@ bool tierctl_close(tier *t)
     atomic_store_explicit(&t->ctl, NULL, memory_order_release);
     for (int i = 0; i < ctl->nslots; i++)
         free(ctl->slots[i].path);
+    pthread_cond_destroy(&ctl->shrink_cv);
     pthread_cond_destroy(&ctl->idle_cv);
     pthread_cond_destroy(&ctl->cv);
     pthread_mutex_destroy(&ctl->mu);
@@ -1121,6 +1888,7 @@ bool tierctl_get_progress(const tier *t, tierctl_progress *out)
         return false;
     memset(out, 0, sizeof *out);
     out->store = -1;
+    out->shrink_store = -1;
     struct tierctl *ctl = atomic_load_explicit(&((tier *)t)->ctl, memory_order_acquire);
     if (!ctl)
         return false;
@@ -1143,9 +1911,9 @@ int tierctl_wait_idle(tier *t, int timeout_ms)
     tsdb_cond_deadline_ms(&dl, timeout_ms > 0 ? (uint64_t)timeout_ms : 10000);
     pthread_mutex_lock(&ctl->mu);
     for (;;) {
-        bool busy = ctl->check_tiers_now || ctl->checking_tiers || ctl->prog.active;
+        bool busy = ctl->check_tiers_now || ctl->checking_tiers || ctl->prog.active || ctl->prog.shrink_active;
         for (int i = 0; !busy && i < ctl->nslots; i++)
-            if (ctl->slots[i].needs_rebuild && !ctl->slots[i].wait_other_up)
+            if ((ctl->slots[i].needs_rebuild || ctl->slots[i].needs_shrink) && !ctl->slots[i].wait_other_up)
                 busy = true;
         if (!busy || ctl->closing) {
             pthread_mutex_unlock(&ctl->mu);
@@ -1506,10 +2274,156 @@ static int resolve_store(const tiers_view *tv, const char *spec, size_t *idx_out
     return 0;
 }
 
+static int tierctl_shrink_impl(int rootfd, const char *root, bool sync, const char *store, uint32_t flags, int *slot_out)
+{
+    if (flags & ~TSDB_TIER_ALLOW_SHARED_DEV)
+        return TSDB_ERR_INVALID;
+    int rc = ctl_check_root_meta(rootfd, root);
+    if (rc != 0)
+        return rc;
+
+    bool vol_existed = faccessat(rootfd, "VOLUMES", F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+    int vfd = openat(rootfd, "VOLUMES", O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (vfd < 0)
+        return TSDB_ERR_IO;
+    tiers_view tv;
+    tiers_view_init(&tv);
+
+    rc = ctl_ofd_lock(vfd, F_WRLCK);
+    if (rc == 0)
+        rc = tiers_load(rootfd, true, sync, &tv);
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    memset(db_id, 0, sizeof db_id);
+    if (rc == 0) {
+        if (tv.nstores == 0) {
+            fprintf(stderr, "tsdb: tier lost --shrink: %s has no tier stores\n", root);
+            rc = TSDB_ERR_INVALID;
+        } else {
+            rc = tiers_db_id_read(rootfd, &has_db_id, db_id);
+            if (rc == 0 && !has_db_id) {
+                fprintf(stderr, "tsdb: tier lost --shrink: %s/%s lists %zu store(s) but root META has no db_id=: "
+                                "refused\n", root, TIERS_FILE, tv.nstores);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+
+    size_t tidx = 0;
+    if (rc == 0) {
+        rc = resolve_store(&tv, store, &tidx);
+        if (rc != 0)
+            fprintf(stderr, "tsdb: tier lost --shrink: store '%s' not found in %s (%zu store(s))\n", store, TIERS_FILE,
+                    tv.nstores);
+    }
+
+    bool already_shrinking = false;
+    if (rc == 0) {
+        const tiers_store *target = &tv.stores[tidx];
+        if (target->state == TIERS_STATE_REMOVED) {
+            fprintf(stderr, "tsdb: tier lost %s --shrink: store %zu is already REMOVED: refused\n", store, tidx);
+            rc = TSDB_ERR_INVALID;
+        } else if (target->state == TIERS_STATE_SHRINKING) {
+            already_shrinking = true;
+        }
+    }
+
+    bool other_lost = false;
+    if (rc == 0 && !already_shrinking) {
+        size_t remaining = 0, n_elig_cur = 0;
+        bool all_sc_cur = true, all_sc_rem = true;
+        for (size_t i = 0; i < tv.nstores; i++) {
+            uint8_t st = tv.stores[i].state;
+            if (st != TIERS_STATE_REMOVED && st != TIERS_STATE_SHRINKING) {
+                n_elig_cur++;
+                if (!tv.stores[i].single_copy)
+                    all_sc_cur = false;
+            }
+            if (i != tidx && st == TIERS_STATE_LOST)
+                other_lost = true;
+            if (i != tidx && tiers_state_is_active(st)) {
+                remaining++;
+                if (!tv.stores[i].single_copy)
+                    all_sc_rem = false;
+            }
+        }
+        if (n_elig_cur == 0)
+            all_sc_cur = false;
+        if (remaining == 0)
+            all_sc_rem = false;
+
+        int gk = 0, gm = 0;
+        bool have_geom = false;
+        if (tv.global.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            gk = (int)tv.global.k;
+            gm = (int)tv.global.m;
+            have_geom = true;
+        } else {
+            have_geom = tier_default_geom((int)n_elig_cur, all_sc_cur, &gk, &gm);
+        }
+        if (remaining == 0 || (!all_sc_rem && remaining < 2)) {
+            fprintf(stderr, "tsdb: tier lost %s --shrink: %zu active store(s) would remain, too few for a tier; "
+                            "use --replace instead: refused\n", store, remaining);
+            rc = TSDB_ERR_INVALID;
+        } else if (have_geom && remaining < (size_t)(gk + gm)) {
+            fprintf(stderr, "tsdb: tier lost %s --shrink: %zu active store(s) would remain, fewer than k + m = %d "
+                            "(%d+%d); set a smaller redundancy with `tier set --redundancy` first: refused\n",
+                    store, remaining, gk + gm, gk, gm);
+            rc = TSDB_ERR_INVALID;
+        }
+        for (size_t v = 0; rc == 0 && v < tv.nvols; v++) {
+            const tiers_settings *vs = &tv.vols[v].s;
+            if (!(vs->set_mask & TSDB_TIER_SET_REDUNDANCY))
+                continue;
+            if (remaining < (size_t)vs->k + (size_t)vs->m) {
+                fprintf(stderr, "tsdb: tier lost %s --shrink: volume %u redundancy %u+%u needs %u store(s), only %zu "
+                                "active store(s) would remain; set a smaller redundancy with `tier set --volume %u "
+                                "--redundancy` first: refused\n",
+                        store, tv.vols[v].volume, (unsigned)vs->k, (unsigned)vs->m, (unsigned)(vs->k + vs->m),
+                        remaining, tv.vols[v].volume);
+                rc = TSDB_ERR_INVALID;
+            }
+        }
+    }
+
+    if (rc == 0 && !already_shrinking) {
+        const tiers_store *target = &tv.stores[tidx];
+        uint8_t lost_id[16];
+        if (target->state == TIERS_STATE_REPLACED_BY)
+            memcpy(lost_id, target->replaced_by, 16);
+        else
+            memcpy(lost_id, target->id, 16);
+        if (target->state != TIERS_STATE_LOST)
+            rc = tiers_append_state(rootfd, sync, lost_id, TIERS_STATE_LOST, 0, false, NULL, NULL);
+        if (rc == 0)
+            rc = tiers_append_state(rootfd, sync, lost_id, TIERS_STATE_SHRINKING, 0, false, NULL, NULL);
+        if (rc == 0 && !vol_existed && sync && tsdb_fsync(rootfd) != 0)
+            rc = TSDB_ERR_IO;
+        if (rc == 0 && other_lost)
+            fprintf(stderr, "tsdb: tier lost %s --shrink: warning: another store is LOST; shrink will wait until "
+                            "that store is replaced or shrunk too\n",
+                    store);
+    }
+
+    if (rc == 0 && slot_out)
+        *slot_out = (int)tidx;
+
+    tiers_view_free(&tv);
+    close(vfd);
+    return rc;
+}
+
 int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store, const char *replace_path,
                       const char *opt_class, uint32_t flags, uint8_t new_id_out[16], int *slot_out)
 {
-    if (!root || !store || !*store || !replace_path || !*replace_path)
+    if (!root || !store || !*store)
+        return TSDB_ERR_INVALID;
+    if (!replace_path) {
+        if (opt_class)
+            return TSDB_ERR_INVALID;
+        return tierctl_shrink_impl(rootfd, root, sync, store, flags, slot_out);
+    }
+    if (!*replace_path)
         return TSDB_ERR_INVALID;
     if (flags & ~(TSDB_TIER_SINGLE_COPY | TSDB_TIER_ALLOW_SHARED_DEV))
         return TSDB_ERR_INVALID;
@@ -1594,6 +2508,11 @@ int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store
         if (rc != 0)
             fprintf(stderr, "tsdb: tier lost: store '%s' not found in %s (%zu store(s))\n", store, TIERS_FILE,
                     tv.nstores);
+        else if (tv.stores[tidx].state == TIERS_STATE_SHRINKING || tv.stores[tidx].state == TIERS_STATE_REMOVED) {
+            fprintf(stderr, "tsdb: tier lost --replace: store %zu is %s and cannot be replaced: refused\n", tidx,
+                    tv.stores[tidx].state == TIERS_STATE_REMOVED ? "REMOVED" : "SHRINKING");
+            rc = TSDB_ERR_INVALID;
+        }
     }
 
     /* Path nesting / overlap checks against root, volumes, and every OTHER non-lost store. */
@@ -1609,7 +2528,7 @@ int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store
         }
     }
     for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
-        if (i == tidx || tv.stores[i].state == TIERS_STATE_LOST)
+        if (i == tidx || !tiers_state_is_active(tv.stores[i].state))
             continue;
         if (ctl_path_within(canon, tv.stores[i].path) || ctl_path_within(tv.stores[i].path, canon) ||
             ctl_same_dir(canon, tv.stores[i].path) > 0) {
@@ -1640,7 +2559,7 @@ int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store
             }
         }
         for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
-            if (i == tidx || tv.stores[i].state == TIERS_STATE_LOST)
+            if (i == tidx || !tiers_state_is_active(tv.stores[i].state))
                 continue;
             if (stat(tv.stores[i].path, &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
                 fprintf(stderr, "tsdb: tier lost --replace %s: is on the same device as tier store %s: refused (pass "
@@ -1708,6 +2627,102 @@ fail_mkdir:
     return rc;
 }
 
+int tierctl_count_shrink_objects(const struct tiers_view *tv, const char *const *vol_paths, size_t nvols,
+                                 uint64_t *objects_out)
+{
+    if (!objects_out)
+        return TSDB_ERR_INVALID;
+    *objects_out = 0;
+    if (!tv || !vol_paths || nvols == 0)
+        return 0;
+
+    const char *elig_paths[TIERS_STORES_MAX];
+    size_t n_elig = 0;
+    for (size_t i = 0; i < tv->nstores && n_elig < TIERS_STORES_MAX; i++)
+        if (tv->stores[i].state != TIERS_STATE_SHRINKING && tv->stores[i].state != TIERS_STATE_REMOVED)
+            elig_paths[n_elig++] = tv->stores[i].path;
+
+    uint64_t count = 0;
+    for (size_t v = 0; v < nvols; v++) {
+        if (!vol_paths[v])
+            continue;
+        int vfd = open(vol_paths[v], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (vfd < 0)
+            continue;
+        DIR *d = fdopendir(vfd);
+        if (!d) {
+            close(vfd);
+            continue;
+        }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            const char *nm = e->d_name;
+            size_t nl = strlen(nm);
+            if (nl <= 3 || strcmp(nm + nl - 3, ".ec") != 0)
+                continue;
+            if (strncmp(nm, "retired_", 8) == 0 || strncmp(nm, "tmp_", 4) == 0)
+                continue;
+            int fd = openat(dirfd(d), nm, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0)
+                continue;
+            struct stat st;
+            if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < (off_t)(EC_TRAILER_BYTES + EC_REC_FIXED)) {
+                close(fd);
+                continue;
+            }
+            uint8_t tr[EC_TRAILER_BYTES];
+            if (pread(fd, tr, sizeof tr, st.st_size - (off_t)EC_TRAILER_BYTES) != (ssize_t)sizeof tr ||
+                memcmp(tr + EC_TR_MAGIC, EC_TRAILER_MAGIC, 8) != 0) {
+                close(fd);
+                continue;
+            }
+            uint64_t rec_off = 0, rec_len = 0;
+            memcpy(&rec_off, tr + EC_TR_REC_OFF, 8);
+            memcpy(&rec_len, tr + EC_TR_REC_LEN, 8);
+            if (rec_len < EC_REC_FIXED || rec_off > (uint64_t)st.st_size - EC_TRAILER_BYTES ||
+                rec_len > (uint64_t)st.st_size - EC_TRAILER_BYTES - rec_off) {
+                close(fd);
+                continue;
+            }
+            uint8_t rec[EC_REC_FIXED];
+            if (pread(fd, rec, sizeof rec, (off_t)rec_off) != (ssize_t)sizeof rec) {
+                close(fd);
+                continue;
+            }
+            close(fd);
+
+            uint8_t oid[16];
+            uint16_t k = 0, m = 0;
+            memcpy(oid, rec + EC_REC_OID, 16);
+            memcpy(&k, rec + EC_REC_K, 2);
+            memcpy(&m, rec + EC_REC_M, 2);
+            unsigned np = (unsigned)k + (unsigned)m;
+            if (np == 0 || np > CHUNK_POS_MAX || n_elig < (size_t)np) {
+                count++;
+                continue;
+            }
+            char ohex[33];
+            chunk_oid_hex(oid, ohex);
+            uint64_t h = xxh64(oid, 16, 0);
+            bool need = false;
+            for (unsigned pos = 0; pos < np; pos++) {
+                size_t si = (size_t)((h + (uint64_t)pos) % (uint64_t)n_elig);
+                char cpath[PATH_MAX + 128];
+                int n = snprintf(cpath, sizeof cpath, "%s/s%zu/o%s.%u.chunk", elig_paths[si], v, ohex, pos);
+                if (n <= 0 || (size_t)n >= sizeof cpath || access(cpath, F_OK) != 0) {
+                    need = true;
+                    break;
+                }
+            }
+            if (need)
+                count++;
+        }
+        closedir(d);
+    }
+    *objects_out = count;
+    return 0;
+}
+
 int tierctl_lost_dir(const char *dir, const char *store, const char *replace_path, const char *opt_class,
                      uint32_t flags, uint8_t new_id_out[16], int *slot_out)
 {
@@ -1731,6 +2746,7 @@ int tierctl_open(struct tier *t)
     (void)t;
     return 0;
 }
+void tierctl_eng_stop(struct eng *db) { (void)db; }
 void tierctl_quiesce(struct tier *t) { (void)t; }
 bool tierctl_close(struct tier *t)
 {
@@ -1744,6 +2760,7 @@ bool tierctl_get_progress(const struct tier *t, tierctl_progress *out)
     if (out) {
         memset(out, 0, sizeof *out);
         out->store = -1;
+        out->shrink_store = -1;
     }
     return false;
 }
@@ -1760,6 +2777,14 @@ int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store
     (void)new_id_out, (void)slot_out;
     fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
     return TSDB_ERR_INVALID;
+}
+int tierctl_count_shrink_objects(const struct tiers_view *tv, const char *const *vol_paths, size_t nvols,
+                                 uint64_t *objects_out)
+{
+    (void)tv, (void)vol_paths, (void)nvols;
+    if (objects_out)
+        *objects_out = 0;
+    return 0;
 }
 int tierctl_lost_dir(const char *dir, const char *store, const char *replace_path, const char *opt_class,
                      uint32_t flags, uint8_t new_id_out[16], int *slot_out)
