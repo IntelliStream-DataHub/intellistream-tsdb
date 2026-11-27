@@ -123,7 +123,8 @@ static bool meta_has(const char *dir, const char *what)
     return r;
 }
 
-/* Parts of both directories by the version their header says (offset 8): how many are of format 8 and of 9. */
+/* Parts of both directories by the version their header says (offset 8): how many are of format 8 and of the current
+ * one (FORMAT_VERSION: an upgrade from 8 goes straight to it). */
 static void part_versions(const char *top, int *v8, int *v9)
 {
     *v8 = *v9 = 0;
@@ -141,7 +142,7 @@ static void part_versions(const char *top, int *v8, int *v9)
             int fd = open(f, O_RDONLY);
             uint32_t ver = 0;
             if (fd >= 0 && pread(fd, &ver, 4, 8) == 4)
-                *(ver == 8 ? v8 : v9) += ver == 8 || ver == 9;
+                *(ver == 8 ? v8 : v9) += ver == 8 || ver == FORMAT_VERSION;
             if (fd >= 0)
                 close(fd);
         }
@@ -280,8 +281,8 @@ static void test_refusals(void)
            "writes nothing\n");
 }
 
-/* A damaged META with very many `version=` lines (each grows by a byte when it is rewritten) must not overflow the
- * buffer that rewrites it: the upgrade finishes and the META says 9. Before the fix the output was sized
+/* A damaged META with very many `version=` lines (each grows by two bytes when it is rewritten) must not overflow the
+ * buffer that rewrites it: the upgrade finishes and the META says FORMAT_VERSION. Before the fix the output was sized
  * strlen + 64 and this wrote tens of kilobytes past it (a crash here, a heap-buffer-overflow under ASan). */
 static void test_meta_many_version_lines(void)
 {
@@ -302,7 +303,7 @@ static void test_meta_many_version_lines(void)
             memcpy(big + k, "version=\n", 9);
         spit(mp, big, k);
         CHECK(tsdb_upgrade(db) == 2);
-        CHECK(meta_version(db) == 9);
+        CHECK(meta_version(db) == FORMAT_VERSION);
         CHECK(tsdb_upgrade(db) == 0);
     }
     free(big);
@@ -322,15 +323,16 @@ static void test_upgrade_and_merge(bool mutant)
     part_versions(top, &v8, &v9);
     CHECK(v8 > 5 && v9 == 0);
     CHECK(tsdb_upgrade(db) == 2); /* the volume and the root */
-    CHECK(meta_version(db) == 9 && meta_version(vol) == 9 && meta_has(db, "parts_v8=1") && meta_has(vol, "parts_v8=1"));
+    CHECK(meta_version(db) == FORMAT_VERSION && meta_version(vol) == FORMAT_VERSION && meta_has(db, "parts_v8=1") &&
+          meta_has(vol, "parts_v8=1"));
     char f[PATH_MAX + 16];
     snprintf(f, sizeof f, "%s/FNO", db);
     struct stat st;
     CHECK(stat(f, &st) == 0 && st.st_size == 8192);
     snprintf(f, sizeof f, "%s/FNO", vol);
     CHECK(stat(f, &st) == 0 && st.st_size == 8192);
-    CHECK(sh("head -1 '%s/MANIFEST' | grep -q '^tsdb-manifest 9$' && grep -q '^fno_next 1$' '%s/MANIFEST'", db, db) ==
-          0);
+    CHECK(sh("head -1 '%s/MANIFEST' | grep -q '^tsdb-manifest %d$' && grep -q '^fno_next 1$' '%s/MANIFEST'", db,
+             FORMAT_VERSION, db) == 0);
     part_versions(top, &v8, &v9);
     CHECK(v8 > 5 && v9 == 0); /* the parts are as they were */
     CHECK(tsdb_upgrade(db) == 0); /* nothing left to do */
@@ -356,8 +358,8 @@ static void test_upgrade_and_merge(bool mutant)
     CHECK(tsdb_open(db, &o, &t) == 0 && tsdb_close(t) == 0);
     check_equal_to_reference(top, "reopened");
     sh("rm -rf '%s'", top);
-    printf("  the fixture of 0.9.0 is upgraded, read as it is, merged into format 9 and reopened: every series "
-           "answers as its export says\n");
+    printf("  the fixture of 0.9.0 is upgraded, read as it is, merged into format %d and reopened: every series "
+           "answers as its export says\n", FORMAT_VERSION);
     (void)mutant;
 }
 
@@ -434,22 +436,22 @@ static void test_power_loss(void)
             break;
         crashes += code == 99;
         finished = code == 0;
-        /* the root is written last: if it says 9, the volume says 9 */
+        /* the root is written last: if it says the new format, the volume does */
         int rv = meta_version(db), vv = meta_version(vol);
-        CHECK(rv == 8 || rv == 9);
-        CHECK(rv != 9 || vv == 9);
-        half += rv == 8 && vv == 9;
+        CHECK(rv == 8 || rv == FORMAT_VERSION);
+        CHECK(rv != FORMAT_VERSION || vv == FORMAT_VERSION);
+        half += rv == 8 && vv == FORMAT_VERSION;
         tsdb *t;
         tsdb_options o = opts();
         fprintf(stderr, "  (a refusal may be logged next: step %d)\n", k);
         int rc = tsdb_open(db, &o, &t);
-        CHECK(rc == (rv == 9 ? 0 : TSDB_ERR_CORRUPT)); /* upgraded, or refused: never half open */
+        CHECK(rc == (rv == FORMAT_VERSION ? 0 : TSDB_ERR_CORRUPT)); /* upgraded, or refused: never half open */
         if (rc == 0)
             CHECK(tsdb_close(t) == 0);
         /* run again: whatever the crash left, the second run finishes it */
         int n = tsdb_upgrade(db);
         CHECK(n >= 0 && n <= 2);
-        CHECK(meta_version(db) == 9 && meta_version(vol) == 9);
+        CHECK(meta_version(db) == FORMAT_VERSION && meta_version(vol) == FORMAT_VERSION);
         CHECK(tsdb_open(db, &o, &t) == 0 && tsdb_close(t) == 0);
         if (k % 8 == 0 || finished)
             check_equal_to_reference(top, "after power loss and a second run");
@@ -483,13 +485,145 @@ static void test_old_binary(void)
     snprintf(db, sizeof db, "%s/db", top);
     snprintf(vol, sizeof vol, "%s/vol1", top);
     unpack(top);
-    /* a half-way upgrade: the volume at 9, the root at 8: the old binary opens the root and refuses the volume */
+    /* both directories carried over to the current format: the old binary refuses each, naming the version */
     CHECK(tsdb_upgrade(db) == 2);
     CHECK(sh("'%s' '%s' stats >/dev/null 2>&1", old, db) != 0);
-    CHECK(sh("'%s' '%s' stats 2>&1 | grep -q 'disk format version 9'", old, db) == 0);
-    CHECK(sh("'%s' '%s' stats 2>&1 | grep -q 'disk format version 9'", old, vol) == 0);
+    CHECK(sh("'%s' '%s' stats 2>&1 | grep -q 'disk format version %d'", old, db, FORMAT_VERSION) == 0);
+    CHECK(sh("'%s' '%s' stats 2>&1 | grep -q 'disk format version %d'", old, vol, FORMAT_VERSION) == 0);
     sh("rm -rf '%s'", top);
     printf("  the 0.9.0 binary refuses an upgraded database, naming the versions\n");
+}
+
+/* The digest of every regular file of dir by name and bytes (order-free), but LOCK. */
+static uint64_t files_digest(const char *dir)
+{
+    DIR *d = opendir(dir);
+    uint64_t sum = 0;
+    for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
+        char p[PATH_MAX + 300];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        size_t n;
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode) || strcmp(e->d_name, "LOCK") == 0)
+            continue;
+        char *b = slurp(p, &n);
+        sum += xxh64(e->d_name, strlen(e->d_name), 0) * 31 + (b ? xxh64(b, n, n) : 1);
+        free(b);
+    }
+    if (d)
+        closedir(d);
+    return sum;
+}
+
+/* Whether a WAL segment of dir holds a columnar record (WAL_KIND_COL), read the way test_fno reads them. */
+static bool wal_has_col(const char *dir)
+{
+    DIR *d = opendir(dir);
+    bool col = false;
+    for (struct dirent *e; d && !col && (e = readdir(d)) != NULL;) {
+        if (strncmp(e->d_name, "wal_", 4) != 0)
+            continue;
+        char p[PATH_MAX + 300];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        size_t n;
+        uint8_t *b = (uint8_t *)slurp(p, &n);
+        for (size_t pos = 0; b && pos + WAL_HDR <= n && !col;) {
+            uint32_t w;
+            memcpy(&w, b + pos, 4);
+            uint32_t kind = w >> 28, len = w & 0x0fffffffu;
+            col = kind == WAL_KIND_COL;
+            if (kind > WAL_KIND_COL || len == 0)
+                break;
+            pos += WAL_HDR + (size_t)len * (kind == WAL_KIND_ROWS ? WAL_ROW : 1);
+        }
+        free(b);
+    }
+    if (d)
+        closedir(d);
+    return col;
+}
+
+/* An optional check with the CLI of 0.10.1 (TSDB_V010_CLI, format 9; TSDB_REQUIRE_V010_CLI=1 makes a missing one a
+ * failure): a format-10 database whose WAL ends in a columnar record (WAL_KIND_COL, which 0.10.x reads as a torn tail
+ * and would cut, losing acknowledged rows) is refused at open, naming version 10, by a writer's open (`optimize`,
+ * which would replay the WAL and cut its tail) and by a reader's, and nothing in it changes; this release then reads
+ * every row of the record. */
+static void test_v010_binary(void)
+{
+    const char *old = getenv("TSDB_V010_CLI");
+    if (!old) {
+        const char *req = getenv("TSDB_REQUIRE_V010_CLI"); /* the weekly job (ci.yml, upgrade-v010) sets it */
+        if (req && *req && strcmp(req, "0") != 0) {
+            fprintf(stderr, "test_upgrade: FAIL: the 0.10.1 binary is required (TSDB_REQUIRE_V010_CLI) and "
+                            "TSDB_V010_CLI is not set\n");
+            exit(1);
+        }
+        tr_skip("the 0.10.1 binary on a format-10 database with a columnar WAL record",
+                "set TSDB_V010_CLI; counted by the weekly job");
+        return;
+    }
+    if (access(old, X_OK) != 0) {
+        fprintf(stderr, "test_upgrade: FAIL: TSDB_V010_CLI=%s is not an executable file\n", old);
+        exit(1);
+    }
+    char db[PATH_MAX + 16];
+    snprintf(db, sizeof db, "%s/col", S);
+    sh("rm -rf '%s'", db);
+    enum { N = 1000 }; /* at least WAL_COL_MIN_ROWS, well below a large insert: one columnar WAL record */
+    pid_t pid = fork();
+    if (pid == 0) { /* writes and ends without a close: the record stays in the WAL, unflushed */
+        tsdb_options o = opts();
+        tsdb *t;
+        tsdb_sid id;
+        static int64_t ts[N];
+        static float v[N];
+        for (int i = 0; i < N; i++)
+            ts[i] = 1700000000000LL + i * 1000LL, v[i] = (float)i;
+        if (tsdb_open(db, &o, &t) != 0 || tsdb_series(t, "s", &id) != 0 || tsdb_insert_series(t, id, ts, v, N) != 0)
+            _exit(1);
+        _exit(0);
+    }
+    int st = 0;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(wal_has_col(db));
+    uint64_t before = files_digest(db);
+    char log[PATH_MAX + 32];
+    snprintf(log, sizeof log, "%s/col.err", S);
+    for (int w = 0; w < 2; w++) { /* a writer's open first: the one that would cut */
+        CHECK(sh("'%s' '%s' %s >/dev/null 2>'%s'", old, db, w == 0 ? "optimize" : "stats", log) != 0);
+        CHECK(sh("grep -q 'disk format version %d' '%s'", FORMAT_VERSION, log) == 0);
+        CHECK(files_digest(db) == before && wal_has_col(db)); /* nothing cut, nothing written */
+    }
+    /* The control, which gives "nothing cut" its teeth: a copy whose META says 9, as 0.10.x expects, loses the record
+       to the same writer's open of 0.10.1 (cut as a torn tail: no columnar record left, and no part holds its rows).
+       That loss is what version 10 is there to refuse. */
+    char db9[PATH_MAX + 16];
+    snprintf(db9, sizeof db9, "%s/col9", S);
+    sh("rm -rf '%s'", db9);
+    CHECK(sh("cp -a '%s' '%s' && sed 's/^version=%d$/version=%d/' '%s/META' >'%s/META.new'", db, db9,
+             FORMAT_VERSION, EXPORT_ONLY_FORMAT_VERSION, db9, db9) == 0);
+    CHECK(sh("mv '%s/META.new' '%s/META'", db9, db9) == 0);
+    CHECK(sh("grep -qx 'version=%d' '%s/META'", EXPORT_ONLY_FORMAT_VERSION, db9) == 0);
+    sh("'%s' '%s' optimize >/dev/null 2>&1", old, db9);
+    CHECK(!wal_has_col(db9));
+    CHECK(sh("ls '%s' | grep -q '^p.*[.]part$'", db9) != 0);
+    sh("rm -rf '%s'", db9);
+    tsdb_options o = opts();
+    tsdb *t;
+    tsdb_sid id;
+    tsdb_points pt = {0};
+    CHECK(tsdb_open(db, &o, &t) == 0);
+    CHECK(tsdb_series(t, "s", &id) == 0 && tsdb_query_points(t, id, 0, INT64_MAX, &pt) == 0 && pt.n == N);
+    for (size_t i = 0; i < pt.n && i < N; i++)
+        if (pt.values[i] != (float)i || pt.ts[i] != 1700000000000LL + (int64_t)i * 1000LL) {
+            CHECK(!"a row of the columnar record differs");
+            break;
+        }
+    tsdb_points_free(&pt);
+    CHECK(tsdb_close(t) == 0);
+    sh("rm -rf '%s'", db);
+    printf("  the 0.10.1 binary refuses a format-10 database with a columnar WAL record and cuts nothing "
+           "(and cuts the record when META says %d)\n", EXPORT_ONLY_FORMAT_VERSION);
 }
 
 int main(int argc, char **argv)
@@ -541,6 +675,7 @@ int main(int argc, char **argv)
         test_v8_part_not_allowed();
         test_power_loss();
         test_old_binary();
+        test_v010_binary();
     }
     sh("rm -rf '%s'", S);
     if (failures)

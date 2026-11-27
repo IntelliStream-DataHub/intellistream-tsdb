@@ -263,8 +263,9 @@ static bool source_name(const char *name, char out[96])
 int ec_index_write(eng *db, const part *src, const ec_record *r, char tmp[96])
 {
     tmp[0] = '\0';
-    /* a .part of format 9 with granules (v8 parts and parts without granules are never settled: src/merge.c), and a
-     * record of exactly this part: a settle's mix-up must not become a file that names another */
+    /* a .part of the current format (FORMAT_VERSION) with granules (v8 parts and parts without granules are never
+     * settled: src/merge.c), and a record of exactly this part: a settle's mix-up must not become a file that names
+     * another */
     if (atomic_load(&((part *)src)->ec) || src->hdr_len != sizeof(part_header) || src->ng == 0 || !record_valid(r, db->ec_cluster) ||
         (r->nsums && !r->sums) || r->key != src->partition || r->min_block != src->min_block ||
         r->max_block != src->max_block || r->level != src->level || r->object_len != src->map_len)

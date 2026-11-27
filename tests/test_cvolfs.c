@@ -118,7 +118,8 @@ static void fresh(const char *name, char *dir, size_t cap)
     FILE *f = fopen(meta, "w");
     CHECK(f != NULL);
     if (f) {
-        fputs("version=9\npartition_ms=86400000\ngranule_rows=8192\npartition_classes=1\nsomething=else\n", f);
+        fprintf(f, "version=%d\npartition_ms=86400000\ngranule_rows=8192\npartition_classes=1\nsomething=else\n",
+                FORMAT_VERSION);
         fclose(f);
     }
 }
@@ -208,7 +209,9 @@ static void test_basic(void)
     meta[n] = 0;
     if (f)
         fclose(f);
-    CHECK(strstr(meta, "version=9\n") && strstr(meta, "partition_ms=86400000\n") && strstr(meta, "\nvolume=1\n") &&
+    char vline[32];
+    snprintf(vline, sizeof vline, "version=%d\n", FORMAT_VERSION);
+    CHECK(strstr(meta, vline) && strstr(meta, "partition_ms=86400000\n") && strstr(meta, "\nvolume=1\n") &&
           strstr(meta, "volume_uuid=101112131415161718191a1b1c1d1e1f\n") && strstr(meta, "requires=cluster,replica\n") &&
           !strstr(meta, "something=else"));
     struct replfile_state st;
@@ -558,7 +561,9 @@ static void check_after(const char *dir, const char *ackfile, int k)
         if (mf)
             fclose(mf);
         mb[mn] = 0;
-        if (!strstr(mb, "version=9\n") || !strstr(mb, "\nvolume=1\n") || !strstr(mb, "\nvolume_uuid=") ||
+        char vline[32];
+        snprintf(vline, sizeof vline, "version=%d\n", FORMAT_VERSION);
+        if (!strstr(mb, vline) || !strstr(mb, "\nvolume=1\n") || !strstr(mb, "\nvolume_uuid=") ||
             !strstr(mb, "\ncluster=") || !strstr(mb, "\nrequires=cluster,replica\n")) {
             snprintf(m, sizeof m, "step %d: v1/META is empty or torn (%zu bytes)", k, mn);
             fail_at(__FILE__, __LINE__, m);

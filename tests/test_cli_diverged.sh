@@ -20,7 +20,9 @@ out=$("$B/tsdb" "$dir/db" volume diverged) || fail "volume diverged: exit $?"
 "$B/tsdb" "$dir/db" volume diverged --bogus >/dev/null 2>&1 && fail "an unknown option was taken"
 
 mkdir "$dir/cv"
-printf 'version=9\nrequires=cluster,replica\n' >"$dir/cv/META"
+fmt=$(sed -n 's/^#define FORMAT_VERSION \([0-9]*\).*/\1/p' src/internal.h) # the current disk format
+[[ $fmt =~ ^[0-9]+$ ]] || fail "no FORMAT_VERSION in src/internal.h"
+printf 'version=%s\nrequires=cluster,replica\n' "$fmt" >"$dir/cv/META"
 err=$("$B/tsdb" "$dir/cv" volume diverged --clear 2>&1 >/dev/null) && fail "--clear on a cluster volume"
 [[ $err == *R4* && $err == *refused* ]] || fail "the refusal does not name R4: $err"
 

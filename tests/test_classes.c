@@ -823,10 +823,10 @@ static void test_format(void)
     char buf[512] = {0};
     int fd = open(path, O_RDWR);
     ssize_t n = read(fd, buf, sizeof buf - 1);
-    char *v = strstr(buf, "version=9");
+    char *v = strstr(buf, "version=10\n"); /* the current format */
     CK(n > 0 && v, "META: %s", buf);
     if (v) {
-        v[8] = '7'; /* version=9 -> version=7 */
+        v[8] = '0', v[9] = '7'; /* version=10 -> version=07, read as 7 */
         CK(pwrite(fd, buf, (size_t)n, 0) == n, "pwrite");
     }
     close(fd);

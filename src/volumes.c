@@ -4578,11 +4578,13 @@ const char *tsdb_volume_path(tsdb *t, uint32_t index)
  * the writers' locks (LOCK of every directory) and the OFD lock of VOLUMES until it is done. Followers on other
  * hosts cannot be seen: they must be stopped first (docs/compatibility.md).
  *
- * Per volume: FNO is made and synced (with its directory), MANIFEST is rewritten as version 9 (tmp, fsync, rename,
- * directory fsync), and META is written last (same way) with version=9: META is what says which format the files
- * have. Volumes first, the root last, so that a crash anywhere leaves a root that still says 8: the new binary
- * refuses it and names this command, the old binary opens it and refuses the volumes already at 9. Every step is
- * safe to repeat, so a run that died is simply run again; a volume at 9 is skipped.
+ * Per volume: FNO is made and synced (with its directory), MANIFEST is rewritten as version 10 (FORMAT_VERSION; tmp,
+ * fsync, rename, directory fsync), and META is written last (same way) with version=10: META is what says which
+ * format the files have. Volumes first, the root last, so that a crash anywhere leaves a root that still says 8: the
+ * new binary refuses it and names this command, the old binary opens it and refuses the volumes already at 10. Every
+ * step is safe to repeat, so a run that died is simply run again; a volume at 10 is skipped. Format 9 (0.10.x) is
+ * not carried over in place (refused, naming export and import): its WAL is gone after a clean close as well, but 8
+ * is the one format this code knows how to turn into the current one, and 9 differs from 10 only in what 10 adds.
  */
 typedef struct up_dir {
     char *path;
@@ -4611,9 +4613,10 @@ static int up_put(int dirfd, const char *tmp, const char *final, const char *dat
     return 0;
 }
 
-/* MANIFEST as format 9: the first line says 9 and an `fno_next` line (information for followers only, 1: no
- * number was ever given) goes before `parts`; the checksum is made again. A missing MANIFEST stays missing (the
- * open writes it); one that is damaged or of another format is refused. A MANIFEST already at 9 is kept. */
+/* MANIFEST as the current format (FORMAT_VERSION): the first line says it and an `fno_next` line (information for
+ * followers only, 1: no number was ever given) goes before `parts`; the checksum is made again. A missing MANIFEST
+ * stays missing (the open writes it); one that is damaged or of another format is refused. A MANIFEST already current
+ * is kept. */
 static int up_manifest(const up_dir *d, bool write)
 {
     char *txt;
@@ -4684,9 +4687,9 @@ static int up_manifest(const up_dir *d, bool write)
 
 static int up_meta(const up_dir *d, const char *txt)
 {
-    /* The META is read from a file anyone can damage, and every line is copied or replaced. A line grows by at
-     * most one byte (`version=` and its newline become `version=9` and a newline; a last line without a newline
-     * gets one), so twice the input and room for the added line bound the output. */
+    /* The META is read from a file anyone can damage, and every line is copied or replaced. No line more than
+     * doubles (a `version=` line, nine bytes at least with its newline, becomes `version=10` and a newline, eleven;
+     * a last line without a newline gets one), so twice the input and room for the added line bound the output. */
     size_t cap = 2 * strlen(txt) + 64, n = 0;
     char *out = malloc(cap);
     if (!out)
@@ -4775,6 +4778,16 @@ static int up_open(up_dir *d, const char *path, uint32_t index)
     }
     d->version = meta_version_of(txt);
     free(txt);
+    if (d->version == EXPORT_ONLY_FORMAT_VERSION) {
+        fprintf(stderr, "tsdb: upgrade: %s has disk format version %d, which is not upgradable in place to %d (this "
+                "tsdb carries version %d over only). Export the data with the release that wrote it (0.10.x: `tsdb "
+                "DIR export`) and import it here (`tsdb DIR import`; docs/compatibility.md)%s\n", path, d->version,
+                FORMAT_VERSION, PREV_FORMAT_VERSION,
+                index ? ". A volume at 9 beside a database directory at 8 is a 0.10.x upgrade that did not finish: "
+                        "finish it with 0.10.x's `tsdb DIR upgrade` first, which 0.10.x's export needs"
+                      : "");
+        return TSDB_ERR_INVALID;
+    }
     if (d->version != PREV_FORMAT_VERSION && d->version != FORMAT_VERSION) {
         fprintf(stderr, "tsdb: upgrade: %s has disk format version %d; this tsdb carries version %d over to %d. "
                 "Export the data with the release that wrote it and import it here (docs/compatibility.md)\n", path,
@@ -5190,7 +5203,7 @@ int tsdb_cvol_promote(tsdb *t, uint32_t number, uint64_t epoch_pos)
 }
 
 /* The FNO of a cluster volume's new directory (tsdbd's manager makes it whole in a tmp directory before the rename,
- * server/cvol.c): META then says format 9, and a format-9 volume without FNO is damage at open. */
+ * server/cvol.c): META then says the current format, and a volume of it without FNO is damage at open. */
 int tsdb_cvol_fno_create(const char *dir)
 {
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);

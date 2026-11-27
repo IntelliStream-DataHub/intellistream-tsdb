@@ -478,6 +478,45 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # 0.10.1 (format 9) must refuse a format-10 database whose WAL ends in a columnar record, by a writer's open that
+  # would otherwise cut that record as a torn tail, and leave every byte; and, as the control, cut it when META says 9.
+  # Weekly, as upgrade-v090; a missing binary is a failure there (TSDB_REQUIRE_V010_CLI).
+  upgrade-v010:
+    name: 0.10.1 refuses a format-10 database
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Build the 0.10.1 CLI from its tag
+        run: |
+          set -o pipefail
+          mkdir "$RUNNER_TEMP/tsdb-v010"
+          git archive v0.10.1 | tar -x -C "$RUNNER_TEMP/tsdb-v010"
+          make -C "$RUNNER_TEMP/tsdb-v010" -j"$(nproc)" build/tsdb
+          "$RUNNER_TEMP/tsdb-v010/build/tsdb" --version | grep -q 'tsdb 0.10.1'
+      - name: test_upgrade with it
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          make -j"$(nproc)" build/test_upgrade build/tsdb build/libcrashfs.so
+          TSDB_V010_CLI="$RUNNER_TEMP/tsdb-v010/build/tsdb" TSDB_REQUIRE_V010_CLI=1 \
+              build/test_upgrade "$RUNNER_TEMP" 2>&1 | tee ci-logs/test-upgrade-v010.log
+          grep -q 'the 0.10.1 binary refuses a format-10 database' ci-logs/test-upgrade-v010.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-upgrade-v010
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   # ------------------------------------------------------------------------------------------------------ jepsen
   jepsen:
     name: jepsen fault injection (${{ matrix.name }})

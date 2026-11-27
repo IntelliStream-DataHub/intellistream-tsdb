@@ -42,10 +42,15 @@ typedef struct eng eng;
  * has a 32-byte header with fno and commit_ms, and markers (docs/design-cdc.md 2.1), the part header 48 bytes (the
  * position range fno_lo/fno_hi and written_ms), each volume an FNO file (the durable bound of the numbers, fno.c),
  * META may say requires= and parts_v8=1 (a database `tsdb DIR upgrade` carried over from 8: its parts keep their
- * 24-byte headers until merges rewrite them). Databases of older versions are refused (upgrade, or export and
- * import). */
-#define FORMAT_VERSION 9
-#define PREV_FORMAT_VERSION 8
+ * 24-byte headers until merges rewrite them); 10: columnar WAL records (WAL_KIND_COL) and the F64_FOR flag in
+ * BLK_F64_DECIMAL blocks (a 0.10.x binary cut the first as a torn tail: the number makes it refuse the database
+ * instead). The files are otherwise those of 9; a part written by this release says 10 in its header and footer,
+ * and a format-10 database never holds a part that says 9 (format 9 is refused, upgrade comes from 8 only).
+ * Databases of older versions are refused: 8 is carried over by `tsdb DIR upgrade` (its parts keep their v8
+ * headers, parts_v8=1), 9 (0.10.x) and older by export with the release that wrote them and import here. */
+#define FORMAT_VERSION 10
+#define PREV_FORMAT_VERSION 8      /* the one format `tsdb DIR upgrade` carries over in place */
+#define EXPORT_ONLY_FORMAT_VERSION 9 /* 0.10.x's: refused at open and by upgrade, named in the message (export) */
 #define PART_HDR_V8 24 /* the header of a part written at format 8 */
 /* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
  * catches the bug; nothing in the library or the server ever sets it. */
@@ -1569,7 +1574,7 @@ extern void (*eng_test_drop_hook)(struct eng *db, int at); /* test hook: a leade
                                                             * its marker and the retire */
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n, int type);
-/* WAL records, version 2 (format 9, docs/design-cdc.md 2.1):
+/* WAL records, version 2 (format 9; kind 2 from format 10, docs/design-cdc.md 2.1):
  *   [u32 len | kind << 28][u32 header check][u64 hash][u64 fno][i64 commit_ms][payload]
  * kind 0, rows: len = rows (below 2^28), payload rows of 20 bytes (u32 series, i64 ts, u64 slot); takes len numbers.
  * kind 1, marker: len = payload bytes (a multiple of 4, at least 8), payload u16 type, u16 flags, u32 span, then the

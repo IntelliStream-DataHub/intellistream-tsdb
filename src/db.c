@@ -596,6 +596,12 @@ static int meta_load_or_create(eng *db, bool read_only)
                         "cleanly with the release that wrote it and run `tsdb DIR upgrade` here, or export the data "
                         "with that release and import it here (docs/compatibility.md)\n",
                         version, TSDB_VERSION, FORMAT_VERSION);
+            else if (version == EXPORT_ONLY_FORMAT_VERSION)
+                fprintf(stderr,
+                        "tsdb: the database has disk format version %d; tsdb %s reads version %d only, and %d is not "
+                        "carried over in place. Export the data with the release that wrote it (0.10.x: `tsdb DIR "
+                        "export`) and import it here (`tsdb DIR import`; docs/compatibility.md)\n",
+                        version, TSDB_VERSION, FORMAT_VERSION, version);
             else
                 fprintf(stderr,
                         "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the "

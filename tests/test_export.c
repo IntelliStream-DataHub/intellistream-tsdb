@@ -2011,16 +2011,22 @@ static void test_old_format(void)
     snprintf(meta, sizeof meta, "%s/META", dir);
     size_t n;
     char *buf = slurp(meta, &n);
-    char *v = buf ? strstr(buf, "version=9") : NULL;
-    CHECK(v != NULL);
-    if (!v) {
+    char *v = buf ? strstr(buf, "version=") : NULL; /* the current format, whatever its number */
+    int cur = v ? atoi(v + 8) : 0;
+    CHECK(v != NULL && cur > 7 && cur < 100);
+    if (!v || cur <= 7 || cur >= 100) {
         free(buf);
         return;
     }
-    v[8] = '7';
+    if (cur >= 10)
+        v[8] = '0', v[9] = '7'; /* version=07: the same length, read as 7 */
+    else
+        v[8] = '7';
     spit(meta, buf, n);
     free(buf);
-    const char *want[] = {"disk format version 7", "reads version 9 only", "Export the data"};
+    char reads[64];
+    snprintf(reads, sizeof reads, "reads version %d only", cur);
+    const char *want[] = {"disk format version 7", reads, "Export the data"};
     CHECK(RUN(NULL, NULL, dir, "stats") == 1);
     for (int i = 0; i < 3; i++)
         CHECK(err_has(want[i]));

@@ -1794,9 +1794,9 @@ int main(int argc, char **argv)
         if (rc < 0)
             die(dir, rc);
         if (rc == 0)
-            printf("%s: nothing to upgrade (already disk format 9)\n", dir);
+            printf("%s: nothing to upgrade (already disk format 10)\n", dir);
         else
-            printf("%s: %d director%s carried over to disk format 9; parts keep their old headers until merges "
+            printf("%s: %d director%s carried over to disk format 10; parts keep their old headers until merges "
                    "rewrite them\n", dir, rc, rc == 1 ? "y" : "ies");
         return 0;
     }

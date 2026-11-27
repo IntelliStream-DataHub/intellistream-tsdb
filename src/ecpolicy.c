@@ -333,8 +333,9 @@ static bool part_is_real_ec(const part *p)
     return ep != NULL && !ep->test_mark;
 }
 
-/* Whether p may participate in a re-encode window: not busy/damaged/pending/test_mark, and if a .part, format 9 (v8
- * parts are rewritten alone first). Unlike settleable(), tombstone-only and empty .part files (ng == 0) are combinable. */
+/* Whether p may participate in a re-encode window: not busy/damaged/pending/test_mark, and if a .part, the current
+ * format (v8 parts are rewritten alone first). Unlike settleable(), tombstone-only and empty .part files (ng == 0) are
+ * combinable. */
 static bool reencodeable(const part *p)
 {
     struct ecpart *ep = atomic_load_explicit(&((part *)p)->ec, memory_order_acquire);

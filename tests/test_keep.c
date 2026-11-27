@@ -524,7 +524,7 @@ static void clear_checks(h *x, const settled *s)
         fclose(g);
     snprintf(dst, sizeof dst, "%s/META", cdir);
     g = fopen(dst, "w");
-    CHECK(g && fputs("version=9\nrequires=cluster,replica\n", g) >= 0);
+    CHECK(g && fprintf(g, "version=%d\nrequires=cluster,replica\n", FORMAT_VERSION) > 0);
     if (g)
         fclose(g);
     cap_begin();

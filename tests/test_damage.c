@@ -22,6 +22,7 @@
 #include "watchdog.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <ftw.h>
 #include <pthread.h>
@@ -2094,8 +2095,46 @@ static int entries(const char *dir)
     return n;
 }
 
-/* A database of another disk format (7: series ids from a CATALOG, no volume numbers in META) is refused at open,
- * by writers and readers, with a message that names both versions, and nothing in it is touched. */
+/* Runs fn(dir) with stderr captured into got. */
+static int with_stderr(const char *dir, int (*fn)(const char *, void *), void *arg, char *got, size_t cap)
+{
+    char log[700];
+    snprintf(log, sizeof log, "%s.stderr", dir);
+    fflush(stderr);
+    int saved = dup(2), lfd = open(log, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    dup2(lfd, 2);
+    int rc = fn(dir, arg);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    ssize_t n = pread(lfd, got, cap - 1, 0);
+    got[n > 0 ? n : 0] = '\0';
+    close(lfd);
+    unlink(log);
+    return rc;
+}
+
+static int open_ro_or_rw(const char *dir, void *arg)
+{
+    tsdb_options *o = arg;
+    tsdb *db = NULL;
+    int rc = tsdb_open(dir, o, &db);
+    if (db)
+        tsdb_close(db);
+    return rc;
+}
+
+static int upgrade_fn(const char *dir, void *arg)
+{
+    (void)arg;
+    return tsdb_upgrade(dir);
+}
+
+/* A database of another disk format is refused at open, by writers and readers, with a message that names both
+ * versions, and nothing in it is touched: 7 (series ids from a CATALOG, no volume numbers in META) and 9 (0.10.x's,
+ * which reads a columnar WAL record of 10 as a torn tail: both sides must refuse rather than read the other's files)
+ * only export and import, 8 names `tsdb DIR upgrade`. `tsdb DIR upgrade` refuses 7 and 9 the same way (9 is not
+ * carried over in place). */
 static void test_format_version_of(const char *scratch, int old)
 {
     char dir[600];
@@ -2110,53 +2149,223 @@ static void test_format_version_of(const char *scratch, int old)
     OK(tsdb_close(db));
     char meta[512], text[512];
     off_t len = file_size(dir, "META");
-    CHECK(len > 0 && len < (off_t)sizeof meta);
+    CHECK(len > 0 && len < (off_t)sizeof meta - 8);
     file_pread(dir, "META", 0, meta, (size_t)len);
     meta[len] = '\0';
     char *v = strstr(meta, "version=");
-    CHECK(v && atoi(v + 8) == FORMAT_VERSION && FORMAT_VERSION == 9);
+    CHECK(v && atoi(v + 8) == FORMAT_VERSION);
     if (!v)
         return;
-    v[8] = (char)('0' + old);
-    file_pwrite(dir, "META", 0, meta, (size_t)len);
-    int before = entries(dir);
-    for (int ro = 0; ro < 2; ro++) {
-        char log[700];
-        snprintf(log, sizeof log, "%s.stderr", dir);
-        fflush(stderr);
-        int saved = dup(2), lfd = open(log, O_RDWR | O_CREAT | O_TRUNC, 0644);
-        dup2(lfd, 2);
-        o.read_only = ro;
-        db = NULL;
-        int rc = tsdb_open(dir, &o, &db);
-        fflush(stderr);
-        dup2(saved, 2);
-        close(saved);
-        char got[1024] = "";
-        ssize_t n = pread(lfd, got, sizeof got - 1, 0);
-        got[n > 0 ? n : 0] = '\0';
-        close(lfd);
-        unlink(log);
-        RC(rc, TSDB_ERR_CORRUPT);
-        if (db)
-            tsdb_close(db);
-        char want[64];
-        snprintf(want, sizeof want, "disk format version %d;", old);
-        CHECK(strstr(got, want) && strstr(got, "reads version 9 only"));
-        /* the previous format has a way over, named in the message; older ones only export and import */
-        CHECK((old == 8) == (strstr(got, "tsdb DIR upgrade") != NULL));
+    /* the META as the other release wrote it: its version line only differs */
+    char *eol = strchr(v, '\n');
+    CHECK(eol != NULL);
+    if (!eol)
+        return;
+    char rest[512];
+    snprintf(rest, sizeof rest, "%s", eol);
+    snprintf(v, sizeof meta - (size_t)(v - meta), "version=%d%s", old, rest);
+    len = (off_t)strlen(meta);
+    {
+        char path[700];
+        snprintf(path, sizeof path, "%s/META", dir);
+        FILE *f = fopen(path, "w");
+        CHECK(f && fwrite(meta, 1, (size_t)len, f) == (size_t)len && fclose(f) == 0);
     }
-    CHECK(entries(dir) == before);
+    int before = entries(dir);
+    uint64_t digest = dir_digest(dir);
+    char want[64], reads[64];
+    snprintf(want, sizeof want, "disk format version %d;", old);
+    snprintf(reads, sizeof reads, "reads version %d only", FORMAT_VERSION);
+    for (int ro = 0; ro < 2; ro++) {
+        char got[1024] = "";
+        o.read_only = ro;
+        int rc = with_stderr(dir, open_ro_or_rw, &o, got, sizeof got);
+        RC(rc, TSDB_ERR_CORRUPT);
+        CHECK(strstr(got, want) && strstr(got, reads));
+        /* the previous format has a way over, named in the message; older ones only export and import */
+        CHECK((old == PREV_FORMAT_VERSION) == (strstr(got, "tsdb DIR upgrade") != NULL));
+        if (old == EXPORT_ONLY_FORMAT_VERSION)
+            CHECK(strstr(got, "0.10.x") && strstr(got, "tsdb DIR export") && strstr(got, "tsdb DIR import") &&
+                  strstr(got, "not carried over in place"));
+    }
+    if (old != PREV_FORMAT_VERSION) {
+        char got[1024] = "";
+        int rc = with_stderr(dir, upgrade_fn, NULL, got, sizeof got);
+        RC(rc, TSDB_ERR_INVALID);
+        snprintf(want, sizeof want, "disk format version %d", old);
+        CHECK(strstr(got, want) && strstr(got, "import it here"));
+        if (old == EXPORT_ONLY_FORMAT_VERSION)
+            CHECK(strstr(got, "not upgradable in place") && strstr(got, "0.10.x"));
+    }
+    CHECK(entries(dir) == before && dir_digest(dir) == digest); /* the names and every byte (dir_digest, above) */
     file_pread(dir, "META", 0, text, (size_t)len);
     CHECK(memcmp(text, meta, (size_t)len) == 0 && file_size(dir, "META") == len);
     rm_rf(dir);
-    printf("  a format-%d database is refused at open, naming both versions, untouched\n", old);
+    printf("  a format-%d database is refused at open%s, naming both versions, untouched\n", old,
+           old != PREV_FORMAT_VERSION ? " and by upgrade" : "");
+}
+
+/* Sets the version a part says in its header and footer and seals its hash again over the new bytes (chained as
+ * part_hash in src/part.c does), so the version alone can make an open refuse it. */
+static void part_set_version(const char *dir, const char *name, uint32_t version)
+{
+    off_t size = file_size(dir, name);
+    CHECK(size >= (off_t)(sizeof(part_header) + sizeof(part_footer)));
+    if (size < (off_t)(sizeof(part_header) + sizeof(part_footer)))
+        return;
+    uint8_t *b = malloc((size_t)size);
+    file_pread(dir, name, 0, b, (size_t)size);
+    part_header h;
+    part_footer f;
+    memcpy(&h, b, sizeof h);
+    memcpy(&f, b + size - sizeof f, sizeof f);
+    h.version = f.version = version;
+    size_t ilen = f.index_len, tlen = (size_t)size - sizeof f - f.index_off - ilen;
+    uint64_t x = xxh64(&h, sizeof h, 0);
+    x = xxh64(b + f.index_off, ilen, x);
+    if (tlen)
+        x = xxh64(b + f.index_off + ilen, tlen, x);
+    f.index_hash = xxh64(&f, offsetof(part_footer, index_hash), x);
+    memcpy(b, &h, sizeof h);
+    memcpy(b + size - sizeof f, &f, sizeof f);
+    file_pwrite(dir, name, 0, b, (size_t)size);
+    free(b);
+}
+
+/* Sets the format MANIFEST names on its first line and writes its checksum line again over the new text. */
+static void manifest_set_version(const char *dir, int version)
+{
+    off_t size = file_size(dir, "MANIFEST");
+    CHECK(size > 0 && size < 65536);
+    if (size <= 0 || size >= 65536)
+        return;
+    char *t = malloc((size_t)size + 1), *out = malloc((size_t)size + 64);
+    file_pread(dir, "MANIFEST", 0, t, (size_t)size);
+    t[size] = '\0';
+    char *body = strchr(t, '\n'), *ck = strstr(t, "\nchecksum ");
+    CHECK(strncmp(t, "tsdb-manifest ", 14) == 0 && body && ck && ck >= body);
+    if (body && ck && ck >= body) {
+        int n = snprintf(out, (size_t)size + 64, "tsdb-manifest %d%.*s\n", version, (int)(ck - body), body);
+        n += snprintf(out + n, (size_t)size + 64 - (size_t)n, "checksum %016" PRIx64 "\n", xxh64(out, (size_t)n, 0));
+        char p[1024];
+        path(p, sizeof p, dir, "MANIFEST");
+        FILE *f = fopen(p, "w");
+        CHECK(f && fwrite(out, 1, (size_t)n, f) == (size_t)n && fclose(f) == 0);
+    }
+    free(t);
+    free(out);
+}
+
+/* The rows of series "s" a follower opened on dir sees; SIZE_MAX when it cannot open or query. */
+static size_t follower_rows(const char *dir)
+{
+    tsdb_options o = opts();
+    o.read_only = 1;
+    tsdb *db;
+    tsdb_sid id;
+    tsdb_points pt = {0};
+    size_t n = SIZE_MAX;
+    if (tsdb_open(dir, &o, &db) != 0)
+        return n;
+    if (tsdb_series_lookup(db, "s", &id) == 0 && tsdb_query_points(db, id, 0, INT64_MAX, &pt) == 0)
+        n = pt.n;
+    tsdb_points_free(&pt);
+    tsdb_close(db);
+    return n;
+}
+
+/* A format-10 database never holds a part or a MANIFEST that says 9 (0.10.x refuses the database, the upgrade starts
+ * from 8 only): a part that says so fails the open, sealed hash and all, and so does a follower's open on a MANIFEST
+ * that says so. Each is checked against the same file sealed again with the current version, which reads. */
+static void test_format_inner(const char *scratch)
+{
+    char dir[600], part[256];
+    snprintf(dir, sizeof dir, "%s/damage-format-inner", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "s", &id));
+    for (int i = 0; i < 100; i++)
+        OK(tsdb_append(db, id, 1000 + i, (float)i));
+    OK(tsdb_close(db)); /* flushes: one part, listed in MANIFEST */
+    CHECK(find_file(dir, "p", ".part", part, sizeof part));
+    CHECK(follower_rows(dir) == 100);
+    manifest_set_version(dir, EXPORT_ONLY_FORMAT_VERSION);
+    CHECK(follower_rows(dir) == SIZE_MAX); /* its open waits out its patience (2 s), then fails */
+    manifest_set_version(dir, FORMAT_VERSION);
+    CHECK(follower_rows(dir) == 100);
+    part_set_version(dir, part, EXPORT_ONLY_FORMAT_VERSION);
+    fprintf(stderr, "  (a broken part is logged next)\n");
+    int rc = tsdb_open(dir, &o, &db);
+    RC(rc, TSDB_ERR_CORRUPT);
+    if (rc == 0)
+        tsdb_close(db);
+    part_set_version(dir, part, FORMAT_VERSION);
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_close(db));
+    rm_rf(dir);
+    printf("  a part or a MANIFEST that says format %d is refused in a format-%d database\n",
+           EXPORT_ONLY_FORMAT_VERSION, FORMAT_VERSION);
+}
+
+/* Rewrites the version= line of dir's META, the rest as it was. */
+static void meta_set_version(const char *dir, int version)
+{
+    char meta[1024], out[1100];
+    off_t len = file_size(dir, "META");
+    CHECK(len > 0 && len < (off_t)sizeof meta);
+    if (len <= 0 || len >= (off_t)sizeof meta)
+        return;
+    file_pread(dir, "META", 0, meta, (size_t)len);
+    meta[len] = '\0';
+    char *v = strstr(meta, "version="), *eol = v ? strchr(v, '\n') : NULL;
+    CHECK(v && eol && (v == meta || v[-1] == '\n'));
+    if (!v || !eol)
+        return;
+    int n = snprintf(out, sizeof out, "%.*sversion=%d%s", (int)(v - meta), meta, version, eol);
+    char p[1024];
+    path(p, sizeof p, dir, "META");
+    FILE *f = fopen(p, "w");
+    CHECK(f && fwrite(out, 1, (size_t)n, f) == (size_t)n && fclose(f) == 0);
+}
+
+/* A 0.10.x upgrade from 8 that did not finish (a volume at 9, the database directory still at 8): 0.10.x's export
+ * refuses that database, so the refusal of the volume says to finish the upgrade with 0.10.x first. */
+static void test_format_half_upgrade(const char *scratch)
+{
+    char dir[600], vol[600];
+    snprintf(dir, sizeof dir, "%s/damage-format-half", scratch);
+    snprintf(vol, sizeof vol, "%s/damage-format-half-vol", scratch);
+    rm_rf(dir);
+    rm_rf(vol);
+    tsdb_options o = opts();
+    tsdb *db;
+    uint32_t index;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_volume_add(db, vol, &index));
+    OK(tsdb_close(db));
+    meta_set_version(dir, PREV_FORMAT_VERSION);
+    meta_set_version(vol, EXPORT_ONLY_FORMAT_VERSION);
+    uint64_t digest = dir_digest(vol);
+    char got[1024] = "";
+    RC(with_stderr(dir, upgrade_fn, NULL, got, sizeof got), TSDB_ERR_INVALID);
+    CHECK(strstr(got, "not upgradable in place") && strstr(got, "did not finish") &&
+          strstr(got, "0.10.x's `tsdb DIR upgrade` first"));
+    CHECK(dir_digest(vol) == digest);
+    rm_rf(dir);
+    rm_rf(vol);
+    printf("  a volume at 9 beside a root at 8 (a 0.10.x upgrade left half done) is refused, naming 0.10.x's upgrade\n");
 }
 
 static void test_format_version(const char *scratch)
 {
     test_format_version_of(scratch, 7);
-    test_format_version_of(scratch, 8);
+    test_format_version_of(scratch, PREV_FORMAT_VERSION);
+    test_format_version_of(scratch, EXPORT_ONLY_FORMAT_VERSION);
+    test_format_inner(scratch);
+    test_format_half_upgrade(scratch);
 }
 
 /* ---------------------------------------------------- second review (REVIEW2) */
