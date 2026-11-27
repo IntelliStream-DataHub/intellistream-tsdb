@@ -455,6 +455,8 @@ int cluster_self_full(void);
 void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills);
 /* R10 (D26, D28): HBS_LIVE_OBJS entries published by volume leaders for the heartbeat path. Any thread. */
 void cluster_set_live_objs(const struct cluster_live_objs_report *live, uint32_t nlive);
+/* R9 (r9-whole): register a callback for place_duty to kick volume EC GC on PLACE_PROP_GC_RELEASE. */
+void cluster_set_gc_kick(void (*fn)(uint32_t volume));
 /* R9 (D5): before tsdbd exits 1 on fail-stop, ask the cluster thread to send one last heartbeat with failstop=1 to the
  * Raft leader it knows and wait at most timeout_ms (capped at 100 ms). Safe no-op when the cluster thread is not
  * running. */

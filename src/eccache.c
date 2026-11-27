@@ -697,8 +697,10 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, 
     int rc = TSDB_ERR_UNAVAILABLE;
     coldvol *cv = tier_cold_get(c->t, e->volume);
     if (cv) {
-        rc = cv->ops->obj_open_pos ? cv->ops->obj_open_pos(cv->ctx, r->oid, &gm, nw->sums, r->positions, &nw->o)
-                                   : cv->ops->obj_open(cv->ctx, r->oid, &gm, nw->sums, &nw->o);
+        rc = cv->ops->obj_open_ver
+                 ? cv->ops->obj_open_ver(cv->ctx, r->oid, &gm, nw->sums, r->positions, r->stripe_version, &nw->o)
+                 : cv->ops->obj_open_pos ? cv->ops->obj_open_pos(cv->ctx, r->oid, &gm, nw->sums, r->positions, &nw->o)
+                                         : cv->ops->obj_open(cv->ctx, r->oid, &gm, nw->sums, &nw->o);
         nw->ops = cv->ops;
         tier_cold_put(cv);
     }
@@ -1705,6 +1707,34 @@ void eccache_reopen_all(struct tier *t)
     }
     memset(c->pfs, 0, sizeof c->pfs);
     memset(c->pf_bad, 0, sizeof c->pf_bad);
+    if (c->obj_waiters)
+        pthread_cond_broadcast(&c->obj_cv);
+    pthread_mutex_unlock(&c->obj_mu);
+    co_close_list(c, ov);
+}
+
+void eccache_reopen_vol(struct tier *t, uint32_t volume)
+{
+    struct eccache_tier *c = t ? t->cache : NULL;
+    if (!c || eccache_mutant == ECC_MUT_FORGETNOOP)
+        return;
+    co *ov = NULL;
+    pthread_mutex_lock(&c->obj_mu);
+    for (size_t i = 0; i < c->ohn; i++) {
+        co *o = c->oh[i];
+        while (o) {
+            co *nx = o->hnext;
+            if (o->volume == volume) {
+                pf_reset_locked(c, o->oid);
+                co_remove(c, o);
+                if (o->pins == 0) {
+                    o->hnext = ov;
+                    ov = o;
+                }
+            }
+            o = nx;
+        }
+    }
     if (c->obj_waiters)
         pthread_cond_broadcast(&c->obj_cv);
     pthread_mutex_unlock(&c->obj_mu);

@@ -19,6 +19,7 @@
 #include "../src/compat.h"
 #include "../src/cvol.h"
 #include "../src/eccache.h"
+#include "../src/eccold.h"
 #include "../src/ecgc.h"
 #include "../src/ecgcmk.h"
 #include "../src/ecpart.h"
@@ -27,6 +28,7 @@
 #include "../src/tier.h"
 #include "chunksrv.h"
 #include "cluster.h"
+#include "crashpt.h"
 #include "creport.h"
 #include "cvol.h"
 #include "margins.h"
@@ -63,7 +65,7 @@ static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool
                           const uint8_t cursor_oid[16], uint32_t max_entries, size_t max_bytes,
                           uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
                           bool *more_out);
-static void cp_reopen_srv(void *arg, uint32_t volume, const uint8_t oid[16]);
+static void cp_reopen_srv(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16]);
 static int cp_gcpending_srv(void *arg, uint32_t volume, uint8_t (**oids_out)[16], uint32_t *n_out,
                             bool *truncated_out);
 static void cp_reconcile_srv(void *arg, uint32_t volume, uint32_t pos, uint64_t stripe_version);
@@ -74,6 +76,19 @@ static void cp_reconcile_srv(void *arg, uint32_t volume, uint32_t pos, uint64_t 
 static int cp_damaged_srv(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16], uint16_t pos,
                           uint64_t bad_cells);
 static void cp_read_pace(void *arg, uint32_t volume, size_t bytes);
+static void cp_release_gc_crash(void) { crash_point(CP_RELEASE_GC); }
+static void cp_gc_kick(uint32_t volume)
+{
+    tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+    if (!db)
+        return;
+    eng *e = tsdb_cvol_ref(db, volume);
+    if (e) {
+        if (e->tier)
+            ecgc_kick_tier(e->tier);
+        tsdb_cvol_unref(&e);
+    }
+}
 
 /* Per-volume counter of CHUNK_DAMAGED reports received while leading (R12, r12-chunk). */
 static pthread_mutex_t cp_dmg_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -297,10 +312,38 @@ static int view(void *arg, uint32_t volume, struct chunkpeer_view *v)
         v->nstripe = cv->nstripe;
         v->gc_suspended = cv->gc_suspended;
         memcpy(v->stripe, cv->stripe, cv->nstripe * sizeof *cv->stripe);
+        for (uint32_t i = 0; i < cv->nstripe; i++) {
+            v->stripe_filling[i] = cv->stripe_pos[i].state == META_STRIPE_FILLING ? 1 : 0;
+            uint32_t prev = cv->stripe_pos[i].prev;
+            v->stripe_prev[i] = prev;
+            v->stripe_set_ver[i] = cv->stripe_pos[i].set_ver;
+            if (prev != 0) {
+                const struct cluster_copy_member *pm = cluster_copy_member(c, prev);
+                v->stripe_prev_up[i] = (pm && (pm->state == META_UP || pm->state == META_DRAINING)) ? 1 : 0;
+            }
+        }
         rc = 0;
     }
     cluster_copy_put(c);
     return rc;
+}
+
+static int cp_node_state(void *arg, uint32_t node)
+{
+    (void)arg;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return CP_NODE_DOWN;
+    int st = CP_NODE_DOWN;
+    if (cluster_copy_caught_up_at(c)) {
+        const struct cluster_copy_member *mb = cluster_copy_member(c, node);
+        if (!mb || mb->state == META_DESTROYED)
+            st = CP_NODE_DESTROYED;
+        else if (mb->state == META_UP || mb->state == META_DRAINING)
+            st = CP_NODE_UP;
+    }
+    cluster_copy_put(c);
+    return st;
 }
 
 /* tier_cluster_fn: what an ec volume attaches with */
@@ -330,6 +373,8 @@ static int attach(void *arg, uint32_t volume, tier_attach *a, tier_settings *s)
     return 0;
 }
 
+static int cp_rel_guard(void *arg, uint32_t volume, unsigned pos, uint64_t stripe_ver);
+
 static void *src_main(void *arg)
 {
     (void)arg;
@@ -344,6 +389,7 @@ static void *src_main(void *arg)
             chunksrv_set_reconcile(cs, cp_reconcile_srv, NULL);
             chunksrv_set_damaged(cs, cp_damaged_srv, NULL);
             chunksrv_set_read_pacer(cs, cp_read_pace, NULL);
+            chunksrv_set_rel_guard(cs, cp_rel_guard, NULL);
             fprintf(stderr, "tsdbd: chunk peer: the epoch source is set\n");
             pthread_mutex_lock(&src_mu);
             while (!atomic_load(&src_stop))
@@ -383,9 +429,13 @@ int chunkpeer_cluster_start(const char *stage_dir)
         fprintf(stderr, "tsdbd: chunkpeer MUTANT %s (tests only)\n", mu);
     }
 #endif
+    ecgc_env_init();
+    atomic_store_explicit(&ecgcmk_release_crash_hook, cp_release_gc_crash, memory_order_release);
+    cluster_set_gc_kick(cp_gc_kick);
     G.net = (struct chunkpeer_net){.call = net_call, .put = net_put, .arg = &G};
     G.view = view;
     G.view_arg = &G;
+    G.node_state = cp_node_state;
     G.note_missing = sreconcile_note_missing;
     snprintf(G.stage_dir, sizeof G.stage_dir, "%s", stage_dir);
     tier_set_cluster(attach, &G, g_ec_cfg.cache_bytes >> 20);
@@ -400,6 +450,8 @@ int chunkpeer_cluster_start(const char *stage_dir)
 void chunkpeer_cluster_stop(void)
 {
     creport_metric_collector_del("tsdb_chunk_scrub_reports_received_total");
+    cluster_set_gc_kick(NULL);
+    atomic_store_explicit(&ecgcmk_release_crash_hook, NULL, memory_order_release);
     if (!atomic_exchange(&src_started, false))
         return;
     pthread_mutex_lock(&src_mu);
@@ -483,17 +535,21 @@ static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool
     if (!db)
         return TSDB_ERR_UNAVAILABLE;
 
-    /* Serve OBJLIST only from the volume's lease-holding leader (cvol_led && cluster_lease_valid): a non-leader
-     * replica's engine apply can lag committed MK_COLD markers, so serving an incomplete list from a lagging replica
-     * could cause the filler to report whole with objects missing. (Note: any in-flight settle at version < V is
-     * fenced by the r9-whole settle barrier in the parallel track.) */
+    /* Serve OBJLIST only from the volume's lease-holding leader (cvol_led && cluster_lease_valid) whose copy has
+     * already adopted >= max_version (D10 barrier) and has no in-flight settle at stripe_version < max_version.
+     * Repeat the leader + lease + version check after db_snapshot so a deposition racing with db_snapshot can never
+     * serve an incomplete list. */
     if (!cvol_led(volume) || !cluster_lease_valid())
         return TSDB_ERR_UNAVAILABLE;
     const struct cluster_copy *c = cluster_copy_get();
     if (!c)
         return TSDB_ERR_UNAVAILABLE;
     const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
-    bool allowed = cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self;
+    uint64_t snap_epoch = 0;
+    bool allowed = cv && cv->redundancy == META_RED_EC && c->self != 0 && cv->leader == c->self &&
+                   (max_version == 0 || cv->stripe_version >= max_version);
+    if (allowed)
+        snap_epoch = cv->epoch;
     cluster_copy_put(c);
     if (!allowed)
         return TSDB_ERR_UNAVAILABLE;
@@ -501,6 +557,11 @@ static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool
     eng *e = tsdb_cvol_ref(db, volume);
     if (!e)
         return TSDB_ERR_UNAVAILABLE;
+    uint64_t active_sv = eccold_active_sv(e);
+    if (active_sv != 0 && (max_version == 0 || active_sv < max_version)) {
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_UNAVAILABLE;
+    }
     const uint8_t *vu = tier_vuuid(e);
     if (!vu) {
         tsdb_cvol_unref(&e);
@@ -513,6 +574,26 @@ static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool
     if (!ps) {
         tsdb_cvol_unref(&e);
         return TSDB_ERR_NOMEM;
+    }
+
+    /* Post-snapshot leader, lease, epoch, and active-settle re-verification (r9-fill Round-3 follow-up + D10). */
+    bool still_ok = cvol_led(volume) && cluster_lease_valid();
+    if (still_ok) {
+        uint64_t post_sv = eccold_active_sv(e);
+        if (post_sv != 0 && (max_version == 0 || post_sv < max_version))
+            still_ok = false;
+    }
+    if (still_ok) {
+        const struct cluster_copy *c2 = cluster_copy_get();
+        const struct cluster_copy_vol *cv2 = c2 ? cluster_copy_vol(c2, volume) : NULL;
+        still_ok = cv2 && cv2->redundancy == META_RED_EC && c2->self != 0 && cv2->leader == c2->self &&
+                   cv2->epoch == snap_epoch && (max_version == 0 || cv2->stripe_version >= max_version);
+        cluster_copy_put(c2);
+    }
+    if (!still_ok) {
+        db_release(ps, np);
+        tsdb_cvol_unref(&e);
+        return TSDB_ERR_UNAVAILABLE;
     }
 
     /* Bounded top-K selection (keep at most max_entries + 1 smallest unique oids above cursor) so each page
@@ -615,9 +696,60 @@ static int cp_objlist_srv(void *arg, uint32_t volume, uint64_t max_version, bool
     return 0;
 }
 
-static void cp_reopen_srv(void *arg, uint32_t volume, const uint8_t oid[16])
+/* R9 (D12, r9-whole): server-side guard for CS_OP_DEL_REL. Refuses release deletes if this node's metadata copy
+ * is not caught up, lags behind `stripe_ver`, or shows this node holding/filling `pos` or `pos` moved past `stripe_ver`. */
+static int cp_rel_guard(void *arg, uint32_t volume, unsigned pos, uint64_t stripe_ver)
 {
     (void)arg;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (!c)
+        return TSDB_ERR_UNAVAILABLE;
+    int rc = 0;
+    if (!cluster_copy_caught_up_at(c)) {
+        rc = TSDB_ERR_UNAVAILABLE;
+    } else {
+        const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+        if (!cv || cv->redundancy != META_RED_EC || pos >= cv->nstripe) {
+            rc = TSDB_ERR_UNAVAILABLE;
+        } else if (cv->stripe_version < stripe_ver) {
+            rc = TSDB_ERR_UNAVAILABLE;
+        } else {
+            uint64_t sver = cv->stripe_pos[pos].set_ver ? cv->stripe_pos[pos].set_ver : cv->stripe_version;
+            if (sver < stripe_ver) {
+                rc = TSDB_ERR_UNAVAILABLE;
+            } else if (cv->stripe[pos] == c->self || cv->stripe_pos[pos].state == META_STRIPE_FILLING) {
+                rc = TSDB_ERR_LOCKED;
+            } else {
+                for (uint32_t p = 0; p < cv->nstripe && p < META_STRIPE_MAX; p++) {
+                    if (cv->stripe_pos[p].state == META_STRIPE_FILLING && cv->stripe_pos[p].prev == c->self) {
+                        rc = TSDB_ERR_LOCKED;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    cluster_copy_put(c);
+    return rc;
+}
+
+static void cp_reopen_srv(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16])
+{
+    (void)arg;
+    const struct cluster_copy *c = cluster_copy_get();
+    if (c) {
+        const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
+        if (cv && cv->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < cv->nstripe && p < META_STRIPE_MAX; p++) {
+                if (cv->stripe[p] == peer && cv->stripe_pos[p].state == META_STRIPE_FILLING) {
+                    uint64_t sver = cv->stripe_pos[p].set_ver ? cv->stripe_pos[p].set_ver : cv->stripe_version;
+                    if (sver > 0)
+                        chunkpeer_note_filled(peer, volume, p, sver, oid);
+                }
+            }
+        }
+        cluster_copy_put(c);
+    }
     tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
     if (!db)
         return;
@@ -1263,6 +1395,63 @@ struct sf_key {
     uint32_t pos;
 };
 
+#ifdef TSDB_TEST_HOOKS
+struct nomark_del_ctx {
+    uint32_t vol;
+    unsigned pos;
+    uint8_t (*oids)[16];
+    size_t n, cap;
+};
+
+static int nomark_list_cb(void *arg, const chunk_listed *c)
+{
+    struct nomark_del_ctx *ctx = arg;
+    if (c->pos != ctx->pos)
+        return 0;
+    if (ctx->n == ctx->cap) {
+        size_t nc = ctx->cap ? ctx->cap * 2 : 32;
+        uint8_t (*nv)[16] = realloc(ctx->oids, nc * 16);
+        if (!nv)
+            return TSDB_ERR_NOMEM;
+        ctx->oids = nv;
+        ctx->cap = nc;
+    }
+    memcpy(ctx->oids[ctx->n++], c->oid, 16);
+    return 0;
+}
+
+/* Planted bug releasenomark: deletes local chunks of (vol, pos) directly on the list change without MK_GC_RELEASE. */
+static void nomark_delete_local_pos(uint32_t vol, unsigned pos, uint64_t epoch)
+{
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    chunk_backend *be = chunksrv_backend(cs);
+    if (be) {
+        struct nomark_del_ctx d = {.vol = vol, .pos = pos};
+        if (chunk_be_list_names(be, vol, nomark_list_cb, &d) == 0) {
+            uint64_t ep = epoch ? epoch : 1;
+            uint64_t cur = chunk_be_epoch(be, vol);
+            if (cur > ep)
+                ep = cur;
+            for (size_t i = 0; i < d.n; i++) {
+                chunk_ident id = {.volume = vol, .pos = (uint16_t)pos};
+                memcpy(id.oid, d.oids[i], 16);
+                (void)chunk_be_del(be, &id, ep);
+            }
+        }
+        free(d.oids);
+    }
+    chunksrv_cluster_release();
+}
+#endif
+
+struct sf_vol_state {
+    uint32_t vol;
+    uint64_t stripe_version;
+    uint32_t filling_mask;
+};
+
 static void *sf_watch_main(void *arg)
 {
     (void)arg;
@@ -1275,6 +1464,19 @@ static void *sf_watch_main(void *arg)
     uint32_t nactive = 0, cap_active = 0;
     struct sf_key *next_active = NULL;
     uint32_t cap_next = 0;
+    struct sf_vol_state *vstates = NULL;
+    uint32_t nvstates = 0, cap_vstates = 0;
+    uint32_t *kick_vols = NULL;
+    uint32_t cap_kick = 0;
+    uint32_t *reopen_vols = NULL;
+    uint32_t cap_reopen = 0;
+#ifdef TSDB_TEST_HOOKS
+    struct {
+        uint32_t vol, pos;
+        uint64_t epoch;
+    } *nomark_del = NULL;
+    uint32_t cap_nomark = 0;
+#endif
 
     for (;;) {
         pthread_mutex_lock(&SF.mu);
@@ -1292,6 +1494,11 @@ static void *sf_watch_main(void *arg)
             if (c) {
                 uint32_t nnext = 0;
                 int cur_self_state = -1;
+                uint32_t nkick = 0;
+                uint32_t nreopen = 0;
+#ifdef TSDB_TEST_HOOKS
+                uint32_t nnomark = 0;
+#endif
                 if (c->self != 0) {
                     const struct cluster_copy_member *sm = cluster_copy_member(c, c->self);
                     if (sm)
@@ -1300,8 +1507,42 @@ static void *sf_watch_main(void *arg)
                         const struct cluster_copy_vol *v = &c->volumes[vi];
                         if (v->redundancy != META_RED_EC || v->nstripe == 0)
                             continue;
+                        if (v->leader == c->self) {
+                            if (nkick == cap_kick) {
+                                uint32_t nc = cap_kick ? cap_kick * 2 : 64;
+                                uint32_t *nv = realloc(kick_vols, (size_t)nc * sizeof *nv);
+                                if (nv) {
+                                    kick_vols = nv;
+                                    cap_kick = nc;
+                                }
+                            }
+                            if (nkick < cap_kick)
+                                kick_vols[nkick++] = v->number;
+                        }
+                        uint32_t fmask = 0;
                         int margin = vol_settled_margin(c, v);
                         for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                            if (v->stripe_pos[p].state == META_STRIPE_FILLING && p < 32)
+                                fmask |= 1u << p;
+#ifdef TSDB_TEST_HOOKS
+                            if (ecgc_mutant == GC_MUT_RELEASE_NOMARK && v->stripe[p] != c->self &&
+                                v->stripe_pos[p].prev == c->self) {
+                                if (nnomark == cap_nomark) {
+                                    uint32_t nc = cap_nomark ? cap_nomark * 2 : 32;
+                                    void *nv = realloc(nomark_del, (size_t)nc * sizeof *nomark_del);
+                                    if (nv) {
+                                        nomark_del = nv;
+                                        cap_nomark = nc;
+                                    }
+                                }
+                                if (nnomark < cap_nomark) {
+                                    nomark_del[nnomark].vol = v->number;
+                                    nomark_del[nnomark].pos = p;
+                                    nomark_del[nnomark].epoch = v->epoch;
+                                    nnomark++;
+                                }
+                            }
+#endif
                             if (v->stripe[p] == c->self && v->stripe_pos[p].state == META_STRIPE_FILLING) {
                                 struct sfill_job_cfg cfg = {
                                     .volume = v->number,
@@ -1323,14 +1564,82 @@ static void *sf_watch_main(void *arg)
                                     cap_next = ncap;
                                 }
                                 sreconcile_stop_pos(SF.rec, v->number, p);
+                                /* Drain any in-flight CS_OP_DEL_REL on (vol, pos) before starting fill so
+                                 * local_chunk_intact cannot race a guard-approved delete (r9-whole R2). */
+                                struct chunksrv *cs = chunksrv_cluster_hold();
+                                if (cs) {
+                                    chunksrv_rel_barrier(cs, v->number, p);
+                                    chunksrv_cluster_release();
+                                }
                                 if (sfill_start(SF.sf, &cfg) == 0)
                                     next_active[nnext++] = (struct sf_key){.vol = v->number, .pos = p};
                             }
+                        }
+                        /* Detect stripe_version or fill-state transitions (e.g. STRIPE_WHOLE / STRIPE_SET) so cached
+                         * open objects reopen against the new stripe map and stale filled-object entries are purged. */
+                        int vsi = -1;
+                        for (uint32_t j = 0; j < nvstates; j++)
+                            if (vstates[j].vol == v->number) {
+                                vsi = (int)j;
+                                break;
+                            }
+                        bool changed = false;
+                        if (vsi < 0) {
+                            if (nvstates == cap_vstates) {
+                                uint32_t nc = cap_vstates ? cap_vstates * 2 : 32;
+                                struct sf_vol_state *nv = realloc(vstates, (size_t)nc * sizeof *nv);
+                                if (nv) {
+                                    vstates = nv;
+                                    cap_vstates = nc;
+                                }
+                            }
+                            if (nvstates < cap_vstates)
+                                vstates[nvstates++] = (struct sf_vol_state){
+                                    .vol = v->number,
+                                    .stripe_version = v->stripe_version,
+                                    .filling_mask = fmask,
+                                };
+                        } else if (vstates[vsi].stripe_version != v->stripe_version ||
+                                   vstates[vsi].filling_mask != fmask) {
+                            vstates[vsi].stripe_version = v->stripe_version;
+                            vstates[vsi].filling_mask = fmask;
+                            changed = true;
+                        }
+                        if (changed) {
+                            if (nreopen == cap_reopen) {
+                                uint32_t nc = cap_reopen ? cap_reopen * 2 : 32;
+                                uint32_t *nv = realloc(reopen_vols, (size_t)nc * sizeof *nv);
+                                if (nv) {
+                                    reopen_vols = nv;
+                                    cap_reopen = nc;
+                                }
+                            }
+                            if (nreopen < cap_reopen)
+                                reopen_vols[nreopen++] = v->number;
                         }
                     }
                 }
                 uint32_t self_now = c->self;
                 cluster_copy_put(c);
+
+                tsdb *db = atomic_load_explicit(&G_db, memory_order_acquire);
+                for (uint32_t i = 0; i < nreopen; i++) {
+                    chunkpeer_filled_clear_vol(reopen_vols[i]);
+                    if (db) {
+                        eng *e = tsdb_cvol_ref(db, reopen_vols[i]);
+                        if (e) {
+                            if (e->tier)
+                                eccache_reopen_vol(e->tier, reopen_vols[i]);
+                            tsdb_cvol_unref(&e);
+                        }
+                    }
+                }
+                for (uint32_t i = 0; i < nkick; i++)
+                    cp_gc_kick(kick_vols[i]);
+#ifdef TSDB_TEST_HOOKS
+                for (uint32_t i = 0; i < nnomark; i++)
+                    nomark_delete_local_pos(nomark_del[i].vol, nomark_del[i].pos, nomark_del[i].epoch);
+#endif
 
                 /* Stop any previously active job no longer FILLING on this node. */
                 for (uint32_t i = 0; i < nactive; i++) {
@@ -1390,6 +1699,12 @@ static void *sf_watch_main(void *arg)
     }
     free(active);
     free(next_active);
+    free(vstates);
+    free(kick_vols);
+    free(reopen_vols);
+#ifdef TSDB_TEST_HOOKS
+    free(nomark_del);
+#endif
     return NULL;
 }
 

@@ -44,9 +44,14 @@
 _Atomic int sfill_mutant = SFILL_MUT_NONE;
 
 #ifdef TSDB_TEST_HOOKS
+#include <unistd.h>
 _Atomic int sfill_test_readback_flip = 0;
 uint32_t sfill_test_objlist_page = 0;
 int sfill_test_retry_ms = 0;
+static _Atomic int sfill_test_obj_delay_ms = 0;
+static _Atomic int sfill_test_pause_after = -1;
+static _Atomic int sfill_test_pause_seen = 0;
+static char sfill_test_pause_path[512];
 #endif
 
 int sfill_mutant_parse(const char *name)
@@ -59,6 +64,8 @@ int sfill_mutant_parse(const char *name)
         return SFILL_MUT_FEWERK;
     if (strcmp(name, "fillsurvivortrust") == 0)
         return SFILL_MUT_SURVIVOR_TRUST;
+    if (strcmp(name, "wholeearly") == 0)
+        return SFILL_MUT_WHOLE_EARLY;
     return -1;
 }
 
@@ -616,6 +623,30 @@ static int run_object_task(struct sfill *sf, struct sfill_task *t)
     if (task_cancelled(sf, t))
         return SFILL_OBJ_CANCELLED;
 
+#ifdef TSDB_TEST_HOOKS
+    {
+        int pa = atomic_load_explicit(&sfill_test_pause_after, memory_order_relaxed);
+        if (pa >= 0 && sfill_test_pause_path[0]) {
+            int idx = atomic_fetch_add_explicit(&sfill_test_pause_seen, 1, memory_order_relaxed);
+            if (idx >= pa) {
+                while (access(sfill_test_pause_path, F_OK) == 0 && !job_cancelled(sf, t->job, t->gen)) {
+                    struct timespec ts = {0, 50 * 1000000L};
+                    nanosleep(&ts, NULL);
+                }
+                if (job_cancelled(sf, t->job, t->gen))
+                    return SFILL_OBJ_CANCELLED;
+            }
+        }
+        int dms = atomic_load_explicit(&sfill_test_obj_delay_ms, memory_order_relaxed);
+        if (dms > 0) {
+            struct timespec ts = {dms / 1000, (long)(dms % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+            if (job_cancelled(sf, t->job, t->gen))
+                return SFILL_OBJ_CANCELLED;
+        }
+    }
+#endif
+
     const struct sfill_obj *obj = &t->obj;
     unsigned npos = chunk_npos(&obj->g);
     if (t->pos >= npos) {
@@ -867,6 +898,8 @@ static void *worker_main(void *arg)
                 j->done++;
                 j->bytes_done += t->obj_bytes;
                 j->progress_ms = mono_ms();
+                if (atomic_load_explicit(&sfill_mutant, memory_order_relaxed) == SFILL_MUT_WHOLE_EARLY)
+                    j->whole = 1;
                 should_publish = true;
             } else if (rc != SFILL_OBJ_CANCELLED) {
                 j->round_errors++;
@@ -1062,6 +1095,8 @@ static void *coord_main(void *arg)
                     (void)finish_pass_locked(sf, pick);
             }
             if (pick->round_pending > 0) {
+                if (atomic_load_explicit(&sfill_mutant, memory_order_relaxed) == SFILL_MUT_WHOLE_EARLY)
+                    pick->whole = 1;
                 should_publish = true;
                 pthread_cond_broadcast(&sf->work_cv);
             }
@@ -1089,6 +1124,23 @@ static void load_env_mutant_once(void)
         if (m > 0) {
             atomic_store_explicit(&sfill_mutant, m, memory_order_relaxed);
             fprintf(stderr, "tsdbd: sfill MUTANT %s (tests only)\n", mu);
+        }
+    }
+    const char *th = getenv("TSDB_SFILL_TEST");
+    if (th && *th) {
+        char buf[1024];
+        snprintf(buf, sizeof buf, "%s", th);
+        char *sp = NULL;
+        for (char *tok = strtok_r(buf, ",", &sp); tok; tok = strtok_r(NULL, ",", &sp)) {
+            if (strncmp(tok, "obj_delay_ms=", 13) == 0) {
+                atomic_store_explicit(&sfill_test_obj_delay_ms, atoi(tok + 13), memory_order_relaxed);
+            } else if (strncmp(tok, "pause_after=", 12) == 0) {
+                const char *col = strchr(tok + 12, ':');
+                if (col && col[1]) {
+                    atomic_store_explicit(&sfill_test_pause_after, atoi(tok + 12), memory_order_relaxed);
+                    snprintf(sfill_test_pause_path, sizeof sfill_test_pause_path, "%s", col + 1);
+                }
+            }
         }
     }
 #endif

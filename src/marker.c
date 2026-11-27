@@ -18,7 +18,8 @@
  *           objects: nobjs x (oid[16], u32 rec_len, u32 0, record, zeros to 4 bytes),
  *           files: nfiles x (as COMMIT's, with the kind in the byte after name_len: u16 name_len, u8 kind, u8 0, ...),
  *           retired: nretired x oid[16] (R10's; this build refuses nretired != 0)
- *   GC      u32 reason, u32 noids, noids x oid[16]
+ *   GC      u32 reason, u32 noids, noids x oid[16] (RETIRED/ORPHAN/DONE);
+ *           u32 reason, u32 0, u32 rel_vol, u32 rel_pos, u32 rel_node, u32 0, u64 rel_ver (RELEASE/RELEASE_DONE)
  *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, i64 now_ms, u32 noids, u32 0, noids x oid[16]; flags MKD_TOMBS
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
@@ -130,6 +131,7 @@ static bool name_ok(const char *s, size_t n)
 #define COLD_FIXED 48
 #define OBJ_FIXED 24 /* oid, u32 rec_len, u32 0 */
 #define GC_FIXED 8
+#define GC_RELEASE_LEN 32 /* u32 reason, u32 0, u32 vol, u32 pos, u32 node, u32 0, u64 ver */
 #define DIGEST_FIXED 56
 
 size_t mk_file_size(const mk_file *f)
@@ -356,6 +358,18 @@ static int decode_gc(const uint8_t *b, size_t n, mk_gc *g)
         return TSDB_ERR_CORRUPT;
     memcpy(&g->reason, b, 4);
     memcpy(&g->noids, b + 4, 4);
+    if (g->reason == MK_GC_RELEASE || g->reason == MK_GC_RELEASE_DONE) {
+        if (g->noids != 0 || n != GC_RELEASE_LEN || !zeros(b, 20, 24))
+            return TSDB_ERR_CORRUPT;
+        memcpy(&g->rel_vol, b + 8, 4);
+        memcpy(&g->rel_pos, b + 12, 4);
+        memcpy(&g->rel_node, b + 16, 4);
+        g->rel_ver = get64(b + 24);
+        g->oids = NULL;
+        if (g->rel_pos >= MK_REL_POS_MAX || g->rel_node == 0 || g->rel_ver == 0)
+            return TSDB_ERR_CORRUPT;
+        return 0;
+    }
     g->oids = b + GC_FIXED;
     if (g->reason < MK_GC_RETIRED || g->reason > MK_GC_DONE || g->noids == 0 || !counts_ok(g->noids, 0, 0) ||
         n - GC_FIXED != (size_t)g->noids * MK_OID)
@@ -541,9 +555,16 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         break;
     }
     case MK_GC:
-        if (!counts_ok(m->u.gc.noids, 0, 0) || (m->u.gc.noids && !m->u.gc.oids))
-            return TSDB_ERR_INVALID;
-        bn = GC_FIXED + (size_t)m->u.gc.noids * MK_OID;
+        if (m->u.gc.reason == MK_GC_RELEASE || m->u.gc.reason == MK_GC_RELEASE_DONE) {
+            if (m->u.gc.noids != 0 || m->u.gc.rel_pos >= MK_REL_POS_MAX || m->u.gc.rel_node == 0 ||
+                m->u.gc.rel_ver == 0)
+                return TSDB_ERR_INVALID;
+            bn = GC_RELEASE_LEN;
+        } else {
+            if (!counts_ok(m->u.gc.noids, 0, 0) || (m->u.gc.noids && !m->u.gc.oids))
+                return TSDB_ERR_INVALID;
+            bn = GC_FIXED + (size_t)m->u.gc.noids * MK_OID;
+        }
         break;
     case MK_DIGEST:
         if (!counts_ok(m->u.digest.noids, 0, 0) || (m->u.digest.noids && !m->u.digest.oids))
@@ -650,8 +671,14 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
     case MK_GC:
         memcpy(b, &m->u.gc.reason, 4);
         memcpy(b + 4, &m->u.gc.noids, 4);
-        if (m->u.gc.noids)
+        if (m->u.gc.reason == MK_GC_RELEASE || m->u.gc.reason == MK_GC_RELEASE_DONE) {
+            memcpy(b + 8, &m->u.gc.rel_vol, 4);
+            memcpy(b + 12, &m->u.gc.rel_pos, 4);
+            memcpy(b + 16, &m->u.gc.rel_node, 4);
+            put64(b + 24, m->u.gc.rel_ver);
+        } else if (m->u.gc.noids) {
             memcpy(b + GC_FIXED, m->u.gc.oids, (size_t)m->u.gc.noids * MK_OID);
+        }
         break;
     case MK_DIGEST: {
         const mk_digest *d = &m->u.digest;

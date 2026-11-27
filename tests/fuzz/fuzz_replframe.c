@@ -245,7 +245,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (w == 0) {
             struct cs_req r;
             if (cs_req_decode(p, n, &r) == 0) {
-                if (r.op < CS_OP_READ || r.op > CS_OP_DAMAGED || r.op == CS_OP_PUT || r.pos >= CHUNK_POS_MAX)
+                if (r.op < CS_OP_READ || r.op > CS_OP_DEL_REL || r.op == CS_OP_PUT || r.pos >= CHUNK_POS_MAX)
                     abort();
                 uint32_t max = r.op == CS_OP_READ      ? CS_READ_MAX
                                : r.op == CS_OP_SUMS    ? CS_SUMS_MAX
@@ -261,7 +261,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         } else if (w == 1) {
             struct cs_resp r;
             if (cs_resp_decode(p, n, &r) == 0) {
-                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_DAMAGED)
+                if (r.rc > 0 || r.op < CS_OP_READ || r.op > CS_OP_DEL_REL)
                     abort();
                 if (r.body_len && (r.body < p || r.body + r.body_len != p + n))
                     abort();

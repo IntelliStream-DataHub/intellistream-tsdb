@@ -111,6 +111,7 @@ static size_t req_body_len(uint8_t op)
     case CS_OP_SUMS: return ID_LEN + 12;
     case CS_OP_LIST: return 1 + 16 + 2 + 4;
     case CS_OP_DEL: return ID_LEN;
+    case CS_OP_DEL_REL: return ID_LEN + 8;
     case CS_OP_EPOCH: return 0;
     case CS_OP_OBJLIST: return 8 + 1 + 16 + 4;
     case CS_OP_REOPEN: return 16;
@@ -131,11 +132,13 @@ size_t cs_req_encode(const struct cs_req *r, uint8_t *out, size_t cap)
     put32(out + 9, r->volume);
     put64(out + 13, r->epoch);
     uint8_t *b = out + REQ_HDR;
-    if (r->op == CS_OP_READ || r->op == CS_OP_SUMS || r->op == CS_OP_DEL) {
+    if (r->op == CS_OP_READ || r->op == CS_OP_SUMS || r->op == CS_OP_DEL || r->op == CS_OP_DEL_REL) {
         memcpy(b, r->vuuid, 16);
         memcpy(b + 16, r->oid, 16);
         put16(b + 32, r->pos);
-        if (r->op != CS_OP_DEL) {
+        if (r->op == CS_OP_DEL_REL) {
+            put64(b + 34, r->off);
+        } else if (r->op != CS_OP_DEL) {
             put64(b + 34, r->off);
             put32(b + 42, r->len);
         }
@@ -178,13 +181,17 @@ int cs_req_decode(const uint8_t *p, size_t n, struct cs_req *r)
     if (get64(p + REQ_HDR + bl) != xh(p, REQ_HDR + bl) && chunksrv_mutant != CS_MUT_NOREQCHECK)
         return -1;
     const uint8_t *b = p + REQ_HDR;
-    if (r->op == CS_OP_READ || r->op == CS_OP_SUMS || r->op == CS_OP_DEL) {
+    if (r->op == CS_OP_READ || r->op == CS_OP_SUMS || r->op == CS_OP_DEL || r->op == CS_OP_DEL_REL) {
         memcpy(r->vuuid, b, 16);
         memcpy(r->oid, b + 16, 16);
         r->pos = get16(b + 32);
         if (r->pos >= CHUNK_POS_MAX)
             return -1;
-        if (r->op != CS_OP_DEL) {
+        if (r->op == CS_OP_DEL_REL) {
+            r->off = get64(b + 34);
+            if (r->off == 0)
+                return -1;
+        } else if (r->op != CS_OP_DEL) {
             r->off = get64(b + 34);
             r->len = get32(b + 42);
             uint32_t max = r->op == CS_OP_READ ? CS_READ_MAX : CS_SUMS_MAX;
@@ -316,7 +323,7 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
     r->body_len = n - RESP_HDR;
     if (get64(p + 13) != resp_check(p, n) && chunksrv_mutant != CS_MUT_NORESPCHECK)
         return -1;
-    if (r->op < CS_OP_READ || r->op > CS_OP_DAMAGED || r->rc > 0)
+    if (r->op < CS_OP_READ || r->op > CS_OP_DEL_REL || r->rc > 0)
         return -1;
     if (r->rc != 0)
         return r->body_len == 0 ? 0 : -1;
@@ -328,7 +335,8 @@ int cs_resp_decode(const uint8_t *p, size_t n, struct cs_resp *r)
         return bl >= 36 && get32(b + 32) <= CS_SUMS_MAX && bl == 36 + 8 * (size_t)get32(b + 32) ? 0 : -1;
     case CS_OP_LIST:
         return bl >= 5 && b[4] <= 1 && get32(b) <= CS_LIST_MAX && bl == 5 + CS_LIST_ENTRY * (size_t)get32(b) ? 0 : -1;
-    case CS_OP_DEL: return bl == 0 ? 0 : -1;
+    case CS_OP_DEL:
+    case CS_OP_DEL_REL: return bl == 0 ? 0 : -1;
     case CS_OP_EPOCH: return bl == 9 && b[8] <= 1 ? 0 : -1;
     case CS_OP_PUT: return bl == 8 ? 0 : -1;
     case CS_OP_OBJLIST: return objlist_body_valid(b, bl);
@@ -533,6 +541,10 @@ struct chunksrv {
     _Atomic(void *) read_pace_arg;
     _Atomic(chunksrv_damaged_fn) damaged;
     _Atomic(void *) damaged_arg;
+    _Atomic(chunksrv_rel_guard_fn) rel_guard;
+    _Atomic(void *) rel_guard_arg;
+    /* Striped per-(volume, pos) leaf mutex serializing CS_OP_DEL_REL (guard + delete) with sfill start barrier. */
+    pthread_mutex_t rel_mu[64];
     struct chunksrv_stats st;
 
     /* per-store background chunk scrubbers and activity pause tracking (R12, r12-chunk) */
@@ -611,6 +623,8 @@ struct chunksrv *chunksrv_open(const char *const *paths, int n, char *err, size_
     pthread_mutex_init(&cs->smu, NULL);
     cs->scrub_put_burst_conc = 2;
     cs->scrub_put_burst_bps = 16ull << 20;
+    for (size_t i = 0; i < 64; i++)
+        pthread_mutex_init(&cs->rel_mu[i], NULL);
     uint64_t r;
     if (chunk_random(&r, sizeof r) != 0) { /* a restarted client's ids never meet a late answer to its previous life */
         snprintf(err, errlen, "cannot read random bytes");
@@ -655,6 +669,8 @@ void chunksrv_close(struct chunksrv *cs)
     pthread_cond_destroy(&cs->rqcv);
     pthread_mutex_destroy(&cs->cmu);
     pthread_mutex_destroy(&cs->smu);
+    for (size_t i = 0; i < 64; i++)
+        pthread_mutex_destroy(&cs->rel_mu[i]);
     free(cs);
 }
 
@@ -957,6 +973,23 @@ void chunksrv_scrub_pause_all(struct chunksrv *cs, int delta)
     if (!cs || delta == 0)
         return;
     atomic_fetch_add_explicit(&cs->scrub_pause_ext, delta, memory_order_relaxed);
+}
+
+void chunksrv_set_rel_guard(struct chunksrv *cs, chunksrv_rel_guard_fn fn, void *arg)
+{
+    atomic_store(&cs->rel_guard_arg, arg);
+    atomic_store(&cs->rel_guard, fn);
+}
+
+static inline size_t rel_stripe(uint32_t volume, unsigned pos) { return (size_t)((volume * 31u + pos) & 63u); }
+
+void chunksrv_rel_barrier(struct chunksrv *cs, uint32_t volume, unsigned pos)
+{
+    if (!cs)
+        return;
+    pthread_mutex_t *mu = &cs->rel_mu[rel_stripe(volume, pos)];
+    pthread_mutex_lock(mu);
+    pthread_mutex_unlock(mu);
 }
 
 /* Each counter is read on its own (relaxed, as STAT writes them): a plain struct copy races the workers. */
@@ -1306,11 +1339,11 @@ static void do_objlist(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn 
     free(b);
 }
 
-static void do_reopen(struct chunksrv *cs, const struct cs_req *r, cs_reply_fn reply, void *arg)
+static void do_reopen(struct chunksrv *cs, uint32_t peer, const struct cs_req *r, cs_reply_fn reply, void *arg)
 {
     chunksrv_reopen_fn fn = atomic_load(&cs->reopen);
     if (fn)
-        fn(atomic_load(&cs->reopen_arg), r->volume, r->oid);
+        fn(atomic_load(&cs->reopen_arg), peer, r->volume, r->oid);
     reply_rc(reply, arg, r->rid, CS_OP_REOPEN, 0, NULL, 0);
 }
 
@@ -1380,7 +1413,7 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
         return 0;
     }
     if (r->op == CS_OP_REOPEN) {
-        do_reopen(cs, r, reply, arg);
+        do_reopen(cs, peer, r, reply, arg);
         return 0;
     }
     if (r->op == CS_OP_GCPENDING) {
@@ -1397,6 +1430,32 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
     }
     if (!cs->be) {
         reply_rc(reply, arg, r->rid, r->op, TSDB_ERR_UNAVAILABLE, NULL, 0);
+        return 0;
+    }
+    if (r->op == CS_OP_DEL_REL) {
+        /* Fail closed until rel_guard is installed (startup window before src_main registers cp_rel_guard).
+         * Hold the per-(volume, pos) rel_mu across guard + cs_see + chunk_be_del so a concurrent sfill start
+         * (which crosses chunksrv_rel_barrier after observing stripe[pos] == self) never races an in-flight delete. */
+        chunksrv_rel_guard_fn guard = atomic_load_explicit(&cs->rel_guard, memory_order_acquire);
+        if (!guard) {
+            reply_rc(reply, arg, r->rid, CS_OP_DEL_REL, TSDB_ERR_UNAVAILABLE, NULL, 0);
+            return 0;
+        }
+        pthread_mutex_t *rmu = &cs->rel_mu[rel_stripe(r->volume, r->pos)];
+        pthread_mutex_lock(rmu);
+        void *garg = atomic_load_explicit(&cs->rel_guard_arg, memory_order_relaxed);
+        int rc = guard(garg, r->volume, r->pos, r->off);
+        if (rc == 0)
+            rc = cs_see(cs, r->volume, r->epoch, true);
+        if (rc == 0) {
+            chunk_ident id;
+            ident_of(r, &id);
+            rc = chunk_be_del(cs->be, &id, act_epoch(cs, r->volume, r->epoch));
+            if (rc == CHUNK_ERR_FENCED)
+                STAT(cs, fenced);
+        }
+        pthread_mutex_unlock(rmu);
+        reply_rc(reply, arg, r->rid, CS_OP_DEL_REL, rc, NULL, 0);
         return 0;
     }
     bool mutating = r->op == CS_OP_DEL;

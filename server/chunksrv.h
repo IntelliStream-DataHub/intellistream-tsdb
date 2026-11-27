@@ -63,6 +63,7 @@ enum {
     CS_OP_GCPENDING = 9,  /* R9 (D15): list oids on leader's committed MK_GC pending-delete list (and kick GC) */
     CS_OP_RECONCILE = 10, /* R9 (D15): nudge a stripe holder to run reconcile for (volume, pos, stripe_version) */
     CS_OP_DAMAGED = 11,   /* R12 (E25, D5): storage server reports a damaged chunk to the volume's leader */
+    CS_OP_DEL_REL = 12,   /* R9 (D12): release delete carrying stripe_ver (off); refused if receiver holds/fills pos */
 };
 
 #define CS_READ_MAX (4u << 20)        /* bytes of one CS_OP_READ */
@@ -182,8 +183,8 @@ typedef int (*chunksrv_objlist_fn)(void *arg, uint32_t volume, uint64_t max_vers
                                    uint8_t vuuid_out[16], struct cs_objlist_item **items_out, uint32_t *n_out,
                                    bool *more_out);
 void chunksrv_set_objlist(struct chunksrv *cs, chunksrv_objlist_fn fn, void *arg);
-/* R9 (D11): server-side handler for CS_OP_REOPEN (calls eccache_reopen(tier, volume, oid) on log replicas). */
-typedef void (*chunksrv_reopen_fn)(void *arg, uint32_t volume, const uint8_t oid[16]);
+/* R9 (D11, r9-whole): server-side handler for CS_OP_REOPEN (notes filled on `peer` and calls eccache_reopen). */
+typedef void (*chunksrv_reopen_fn)(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16]);
 void chunksrv_set_reopen(struct chunksrv *cs, chunksrv_reopen_fn fn, void *arg);
 /* R9 (D15): server-side handler for CS_OP_GCPENDING (returns leader's committed MK_GC pending oids and kicks GC). */
 typedef int (*chunksrv_gcpending_fn)(void *arg, uint32_t volume, uint8_t (**oids_out)[16], uint32_t *n_out,
@@ -200,6 +201,14 @@ void chunksrv_set_read_pacer(struct chunksrv *cs, chunksrv_read_pace_fn fn, void
 typedef int (*chunksrv_damaged_fn)(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16], uint16_t pos,
                                    uint64_t bad_cells);
 void chunksrv_set_damaged(struct chunksrv *cs, chunksrv_damaged_fn fn, void *arg);
+
+/* R9 (D12, r9-whole): server-side guard for CS_OP_DEL_REL (fails closed with TSDB_ERR_UNAVAILABLE when unset);
+ * returns 0 to allow delete, or a negative TSDB_ERR_* (TSDB_ERR_UNAVAILABLE if copy lags, TSDB_ERR_LOCKED if
+ * receiver holds/fills pos or is prev of a filling pos). chunksrv_rel_barrier serializes sfill start against
+ * in-flight CS_OP_DEL_REL on the same (volume, pos) so a concurrent fill cannot race a guard-approved delete. */
+typedef int (*chunksrv_rel_guard_fn)(void *arg, uint32_t volume, unsigned pos, uint64_t stripe_ver);
+void chunksrv_set_rel_guard(struct chunksrv *cs, chunksrv_rel_guard_fn fn, void *arg);
+void chunksrv_rel_barrier(struct chunksrv *cs, uint32_t volume, unsigned pos);
 
 /* Per-store chunk scrub lifecycle on a chunksrv instance (R12, r12-chunk). */
 struct chunksrv_scrub_cfg {

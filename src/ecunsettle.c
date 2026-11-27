@@ -264,9 +264,11 @@ static int decode_ec_source(eng *db, const part *ec, const char *fin_name, bool 
         } else {
             rc = chunk_geom_make(&g, r->k, r->m, r->cell_bytes, r->object_len);
             if (rc == 0)
-                rc = cv->ops->obj_open_pos
-                         ? cv->ops->obj_open_pos(cv->ctx, r->oid, &g, r->sums, r->positions, &o)
-                         : cv->ops->obj_open(cv->ctx, r->oid, &g, r->sums, &o);
+                rc = cv->ops->obj_open_ver
+                         ? cv->ops->obj_open_ver(cv->ctx, r->oid, &g, r->sums, r->positions, r->stripe_version, &o)
+                         : cv->ops->obj_open_pos
+                               ? cv->ops->obj_open_pos(cv->ctx, r->oid, &g, r->sums, r->positions, &o)
+                               : cv->ops->obj_open(cv->ctx, r->oid, &g, r->sums, &o);
             if (rc != 0)
                 rc = map_cold_rc(rc);
         }

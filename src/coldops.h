@@ -38,6 +38,21 @@ enum {
     COLD_DEL_MKGC = 3,  /* a committed MK_GC marker (R8 cluster volume, r8k-gc) */
 };
 
+/* Candidate former stripe holder eligible for MK_GC_RELEASE (R9 D12). */
+typedef struct cold_release {
+    uint32_t pos;
+    uint32_t node;
+    uint64_t version;
+} cold_release;
+
+/* Live object descriptor passed by ecgcmk_work to release_verify (R9 D12). */
+typedef struct cold_live_obj {
+    uint8_t oid[16];
+    unsigned npos;
+    uint32_t positions;
+    uint64_t stripe_version;
+} cold_live_obj;
+
 typedef struct cold_ops {
     const char *name; /* "dir", "peer": for messages */
     /* Encodes the object from src in one pass and puts every position (E26): per-cell sums into sums_out
@@ -102,6 +117,22 @@ typedef struct cold_ops {
                           unsigned *npos_out);
     /* R9 (r9-degsettle, E10): notify the server's reconcile queue of a degraded settle's unwritten position. */
     void (*note_missing)(void *ctx, const uint8_t oid[16], unsigned pos);
+    /* R9 (r9-whole, D10): obj_open with written-positions bitmap and the object's stripe_version (0: unknown/old).
+     * While a position is FILLING at version V, reads of objects with stripe_version < V read from `prev` (A) while
+     * A is UP and listed as prev, else treat pos as an erasure unless B reported the object filled. NULL: fall back. */
+    int (*obj_open_ver)(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                        uint32_t positions, uint64_t stripe_version, cold_obj **out);
+    /* R9 (r9-whole, D12): discover up to `cap` former holders of WHOLE positions that are UP and may still hold
+     * stale chunks of `(volume, pos)` since `version`. NULL: no position releases (single-server tiers). */
+    unsigned (*release_candidates)(void *ctx, cold_release *out, unsigned cap);
+    /* R9 (r9-whole, D12): verify that the current holder of `pos` is WHOLE (>= `ver`, != `node`), holds every live
+     * object in `objs[0..nobjs)` (checked via CHUNK_LIST), and that `node` holds >= 1 chunk of `(volume, pos)`.
+     * Returns 1 if ready to append MK_GC_RELEASE, 0 if `node` already holds 0 chunks of `(volume, pos)`, -1 to wait. */
+    int (*release_verify)(void *ctx, unsigned pos, uint32_t node, uint64_t ver, const cold_live_obj *objs,
+                          size_t nobjs);
+    /* R9 (r9-whole, D12): delete all chunks of `(volume, pos)` on `node` under committed MK_GC_RELEASE at `mk_pos`.
+     * Returns 0 when all chunks of `(volume, pos)` on `node` are gone, CHUNK_ERR_FENCED if fenced, or retryable err. */
+    int (*release_pos)(void *ctx, unsigned pos, uint32_t node, uint64_t ver, uint64_t epoch, uint64_t mk_pos);
 } cold_ops;
 
 /* ------------------------------------------------------------ the directory ops (src/coldops_dir.c) */

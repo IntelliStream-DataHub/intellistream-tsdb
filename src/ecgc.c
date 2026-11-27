@@ -65,6 +65,7 @@ int ecgc_mutant_parse(const char *name)
         {"gcsuspendignored", GC_MUT_SUSPENDIGNORED},
         {"holdatretire", GC_MUT_HOLDATRET},
         {"gcreplicanoop", GC_MUT_REPLICANOOP},
+        {"releasenomark", GC_MUT_RELEASE_NOMARK},
     };
     if (!name)
         return -1;

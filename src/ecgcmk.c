@@ -3,12 +3,22 @@
  * Cluster EC garbage collection via committed MK_GC (src/ecgcmk.h; design-cluster-data.md E14, §5.7, D13).
  *
  * GCMK on-disk format: append-only file of 48-byte offset-bound checksummed records (like PPOS/CLASSES):
- *   [0..8)   u64 pos      log position of the MK_GC marker (> 0)
- *   [8..12)  u32 op       GCMK_OP_ADD (1) or GCMK_OP_DONE (2)
- *   [12..16) u32 0        reserved
- *   [16..32) u8  oid[16]  object id
- *   [32..40) u64 0        reserved
- *   [40..48) u64 check    xxh64(rec[0..40), off ^ 0x47434d4bULL)
+ *   OID record (GCMK_OP_ADD=1, GCMK_OP_DONE=2):
+ *     [0..8)   u64 pos      log position of the MK_GC marker (> 0)
+ *     [8..12)  u32 op       GCMK_OP_ADD (1) or GCMK_OP_DONE (2)
+ *     [12..16) u32 0        reserved
+ *     [16..32) u8  oid[16]  object id
+ *     [32..40) u64 0        reserved
+ *     [40..48) u64 check    xxh64(rec[0..40), off ^ 0x47434d4bULL)
+ *   Release record (GCMK_OP_REL_ADD=3, GCMK_OP_REL_DONE=4; R9 D12):
+ *     [0..8)   u64 pos      log position of the MK_GC marker (> 0)
+ *     [8..12)  u32 op       GCMK_OP_REL_ADD (3) or GCMK_OP_REL_DONE (4)
+ *     [12..16) u32 rel_pos  stripe position (< MK_REL_POS_MAX)
+ *     [16..20) u32 rel_vol  volume number
+ *     [20..24) u32 rel_node released member id (> 0)
+ *     [24..32) u64 rel_ver  stripe_version (> 0)
+ *     [32..40) u64 0        reserved
+ *     [40..48) u64 check    xxh64(rec[0..40), off ^ 0x47434d4bULL)
  * A torn tail at EOF is truncated on open; a bad record before a valid one fails the open (TSDB_ERR_CORRUPT).
  * Compacts atomically via GCMK.tmp + fdatasync + rename + directory fsync when empty or past 64 KiB.
  *
@@ -45,7 +55,9 @@
 #define GCMK_COMPACT_BYTES (64u << 10)
 #define GCMK_ORPHAN_GRACE_DEFAULT_MS 60000LL
 
-enum { GCMK_OP_ADD = 1, GCMK_OP_DONE = 2 };
+enum { GCMK_OP_ADD = 1, GCMK_OP_DONE = 2, GCMK_OP_REL_ADD = 3, GCMK_OP_REL_DONE = 4 };
+
+void (*_Atomic ecgcmk_release_crash_hook)(void);
 
 #ifdef TSDB_TEST_HOOKS
 /* Test hooks configured by TSDB_ECGC_TEST (parsed via ecgc_env_init). */
@@ -79,6 +91,21 @@ typedef struct gcmk_ent {
     uint64_t pos; /* MK_GC marker log position */
 } gcmk_ent;
 
+typedef struct gcmk_rel {
+    uint32_t vol;
+    uint32_t pos;  /* stripe position */
+    uint32_t node; /* released member id */
+    uint64_t ver;  /* stripe_version */
+    uint64_t mk_pos;
+} gcmk_rel;
+
+#define GCMK_CLEAN_RELS_MAX 256u
+typedef struct gcmk_rel_clean {
+    uint32_t pos;
+    uint32_t node;
+    uint64_t ver;
+} gcmk_rel_clean;
+
 typedef struct gcmk_cand {
     uint8_t oid[16];
     int64_t first_seen_ms;
@@ -87,17 +114,21 @@ typedef struct gcmk_cand {
 struct ecgcmk {
     pthread_mutex_t wmu; /* outermost: serializes ecgcmk_work on this engine */
     pthread_mutex_t fmu; /* serializes GCMK file appends and compaction */
-    pthread_mutex_t mu;  /* leaf: protects ents and qorph */
+    pthread_mutex_t mu;  /* leaf: protects ents, rels and qorph */
     int fd;              /* -1 until first write or open */
     uint64_t off;        /* valid byte length of GCMK */
     bool broken;
     gcmk_ent *ents;
     size_t nents, capents;
+    gcmk_rel *rels;
+    size_t nrels, caprels;
     uint8_t (*qorph)[16]; /* explicitly aborted-settle oids (never directly deleted) */
     size_t nqorph, capqorph;
     /* Owned solely by ecgcmk_work (one GC worker runs on db at a time): */
     gcmk_cand *cands;
     size_t ncands, capcands;
+    gcmk_rel_clean clean_rels[GCMK_CLEAN_RELS_MAX];
+    size_t nclean_rels, clean_next;
     int64_t last_sweep_ms;
     atomic_bool fenced; /* a CHUNK_DEL returned CHUNK_ERR_FENCED (or INDETERMINATE): stop GC */
     atomic_bool stop;
@@ -144,18 +175,49 @@ static void rec_encode(uint8_t rec[GCMK_REC], uint64_t pos, uint32_t op, const u
     put64(rec + 40, rec_check(rec, off));
 }
 
-static bool rec_decode(const uint8_t rec[GCMK_REC], uint64_t off, uint64_t *pos, uint32_t *op, uint8_t oid[16])
+static void rec_encode_rel(uint8_t rec[GCMK_REC], uint64_t pos, uint32_t op, uint32_t rel_vol, uint32_t rel_pos,
+                           uint32_t rel_node, uint64_t rel_ver, uint64_t off)
+{
+    memset(rec, 0, GCMK_REC);
+    put64(rec + 0, pos);
+    put32(rec + 8, op);
+    put32(rec + 12, rel_pos);
+    put32(rec + 16, rel_vol);
+    put32(rec + 20, rel_node);
+    put64(rec + 24, rel_ver);
+    put64(rec + 40, rec_check(rec, off));
+}
+
+static bool rec_decode(const uint8_t rec[GCMK_REC], uint64_t off, uint64_t *pos, uint32_t *op, uint8_t oid[16],
+                       gcmk_rel *rel)
 {
     if (get64(rec + 40) != rec_check(rec, off))
         return false;
     uint64_t p = get64(rec + 0);
     uint32_t o = get32(rec + 8);
-    if (p == 0 || (o != GCMK_OP_ADD && o != GCMK_OP_DONE) || get32(rec + 12) != 0 || get64(rec + 32) != 0)
+    if (p == 0 || get64(rec + 32) != 0)
         return false;
-    *pos = p;
-    *op = o;
-    memcpy(oid, rec + 16, 16);
-    return true;
+    if (o == GCMK_OP_ADD || o == GCMK_OP_DONE) {
+        if (get32(rec + 12) != 0)
+            return false;
+        *pos = p;
+        *op = o;
+        memcpy(oid, rec + 16, 16);
+        return true;
+    }
+    if (o == GCMK_OP_REL_ADD || o == GCMK_OP_REL_DONE) {
+        uint32_t rpos = get32(rec + 12);
+        uint32_t rvol = get32(rec + 16);
+        uint32_t rnode = get32(rec + 20);
+        uint64_t rver = get64(rec + 24);
+        if (rpos >= MK_REL_POS_MAX || rnode == 0 || rver == 0)
+            return false;
+        *pos = p;
+        *op = o;
+        *rel = (gcmk_rel){.vol = rvol, .pos = rpos, .node = rnode, .ver = rver, .mk_pos = p};
+        return true;
+    }
+    return false;
 }
 
 static int pwrite_all(int fd, const uint8_t *buf, size_t len, uint64_t off)
@@ -213,6 +275,42 @@ static bool ent_del_locked(struct ecgcmk *g, const uint8_t oid[16])
     return true;
 }
 
+static ssize_t rel_find_locked(const struct ecgcmk *g, uint32_t vol, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    for (size_t i = 0; i < g->nrels; i++) {
+        const gcmk_rel *r = &g->rels[i];
+        if (r->vol == vol && r->pos == pos && r->node == node && r->ver == ver)
+            return (ssize_t)i;
+    }
+    return -1;
+}
+
+static int rel_add_locked(struct ecgcmk *g, const gcmk_rel *r)
+{
+    ssize_t idx = rel_find_locked(g, r->vol, r->pos, r->node, r->ver);
+    if (idx >= 0)
+        return 0; /* keep original on-disk mk_pos so in-memory and GCMK state stay identical */
+    if (g->nrels == g->caprels) {
+        size_t cap = g->caprels ? g->caprels * 2 : 8;
+        gcmk_rel *nr = realloc(g->rels, cap * sizeof *nr);
+        if (!nr)
+            return TSDB_ERR_NOMEM;
+        g->rels = nr;
+        g->caprels = cap;
+    }
+    g->rels[g->nrels++] = *r;
+    return 0;
+}
+
+static bool rel_del_locked(struct ecgcmk *g, uint32_t vol, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    ssize_t idx = rel_find_locked(g, vol, pos, node, ver);
+    if (idx < 0)
+        return false;
+    g->rels[idx] = g->rels[--g->nrels];
+    return true;
+}
+
 /* ------------------------------------------------------------ durable file ops (under g->fmu) */
 
 static int gcmk_compact_locked(eng *db, struct ecgcmk *g)
@@ -220,32 +318,43 @@ static int gcmk_compact_locked(eng *db, struct ecgcmk *g)
     if (g->broken || eng_check(db))
         return TSDB_ERR_IO;
     pthread_mutex_lock(&g->mu);
-    size_t n = g->nents;
-    gcmk_ent *snap = n ? malloc(n * sizeof *snap) : NULL;
-    if (n && !snap) {
+    size_t ne = g->nents, nr = g->nrels;
+    gcmk_ent *snap = ne ? malloc(ne * sizeof *snap) : NULL;
+    gcmk_rel *rsnap = nr ? malloc(nr * sizeof *rsnap) : NULL;
+    if ((ne && !snap) || (nr && !rsnap)) {
         pthread_mutex_unlock(&g->mu);
+        free(snap);
+        free(rsnap);
         return TSDB_ERR_NOMEM;
     }
-    if (n)
-        memcpy(snap, g->ents, n * sizeof *snap);
+    if (ne)
+        memcpy(snap, g->ents, ne * sizeof *snap);
+    if (nr)
+        memcpy(rsnap, g->rels, nr * sizeof *rsnap);
     pthread_mutex_unlock(&g->mu);
 
-    uint8_t *buf = n ? malloc(n * GCMK_REC) : NULL;
-    if (n && !buf) {
+    size_t total = ne + nr;
+    uint8_t *buf = total ? malloc(total * GCMK_REC) : NULL;
+    if (total && !buf) {
         free(snap);
+        free(rsnap);
         return TSDB_ERR_NOMEM;
     }
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < ne; i++)
         rec_encode(buf + i * GCMK_REC, snap[i].pos, GCMK_OP_ADD, snap[i].oid, (uint64_t)i * GCMK_REC);
+    for (size_t i = 0; i < nr; i++)
+        rec_encode_rel(buf + (ne + i) * GCMK_REC, rsnap[i].mk_pos, GCMK_OP_REL_ADD, rsnap[i].vol, rsnap[i].pos,
+                       rsnap[i].node, rsnap[i].ver, (uint64_t)(ne + i) * GCMK_REC);
     free(snap);
+    free(rsnap);
 
     int fd = openat(db->dirfd, GCMK_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int err = 0;
     if (fd < 0) {
         err = errno;
     } else {
-        if (n)
-            err = pwrite_all(fd, buf, n * GCMK_REC, 0);
+        if (total)
+            err = pwrite_all(fd, buf, total * GCMK_REC, 0);
         if (err == 0 && db->opt.fsync && tsdb_fdatasync(fd) != 0)
             err = errno;
         if (close(fd) != 0 && err == 0)
@@ -271,7 +380,29 @@ static int gcmk_compact_locked(eng *db, struct ecgcmk *g)
         close(g->fd);
         g->fd = -1;
     }
-    g->off = (uint64_t)n * GCMK_REC;
+    g->off = (uint64_t)total * GCMK_REC;
+    return 0;
+}
+
+static int gcmk_ensure_fd_locked(eng *db, struct ecgcmk *g)
+{
+    if (g->fd >= 0)
+        return 0;
+    bool existed = faccessat(db->dirfd, GCMK_FILE, F_OK, 0) == 0;
+    g->fd = openat(db->dirfd, GCMK_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (g->fd < 0) {
+        int err = errno;
+        g->broken = true;
+        eng_fail(db, "open of GCMK", err);
+        return TSDB_ERR_IO;
+    }
+    if (!existed && db->opt.fsync) {
+        int rc = eng_sync_dir(db, "fsync of the directory after creating GCMK");
+        if (rc) {
+            g->broken = true;
+            return rc;
+        }
+    }
     return 0;
 }
 
@@ -282,23 +413,9 @@ static int gcmk_append_locked(eng *db, struct ecgcmk *g, uint64_t pos, uint32_t 
         return 0;
     if (g->broken || eng_check(db))
         return TSDB_ERR_IO;
-    if (g->fd < 0) {
-        bool existed = faccessat(db->dirfd, GCMK_FILE, F_OK, 0) == 0;
-        g->fd = openat(db->dirfd, GCMK_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-        if (g->fd < 0) {
-            int err = errno;
-            g->broken = true;
-            eng_fail(db, "open of GCMK", err);
-            return TSDB_ERR_IO;
-        }
-        if (!existed && db->opt.fsync) {
-            int rc = eng_sync_dir(db, "fsync of the directory after creating GCMK");
-            if (rc) {
-                g->broken = true;
-                return rc;
-            }
-        }
-    }
+    int rc = gcmk_ensure_fd_locked(db, g);
+    if (rc)
+        return rc;
     uint8_t *buf = malloc(noids * GCMK_REC);
     if (!buf)
         return TSDB_ERR_NOMEM;
@@ -314,6 +431,27 @@ static int gcmk_append_locked(eng *db, struct ecgcmk *g, uint64_t pos, uint32_t 
         return TSDB_ERR_IO;
     }
     g->off += (uint64_t)noids * GCMK_REC;
+    return 0;
+}
+
+static int gcmk_append_rel_locked(eng *db, struct ecgcmk *g, uint64_t pos, uint32_t op, const gcmk_rel *r)
+{
+    if (g->broken || eng_check(db))
+        return TSDB_ERR_IO;
+    int rc = gcmk_ensure_fd_locked(db, g);
+    if (rc)
+        return rc;
+    uint8_t rec[GCMK_REC];
+    rec_encode_rel(rec, pos, op, r->vol, r->pos, r->node, r->ver, g->off);
+    int err = pwrite_all(g->fd, rec, GCMK_REC, g->off);
+    if (err == 0 && db->opt.fsync && tsdb_fdatasync(g->fd) != 0)
+        err = errno;
+    if (err != 0) {
+        g->broken = true;
+        eng_fail(db, "write of GCMK", err);
+        return TSDB_ERR_IO;
+    }
+    g->off += GCMK_REC;
     return 0;
 }
 
@@ -376,7 +514,8 @@ int ecgcmk_open(eng *db)
         uint64_t pos = 0;
         uint32_t op = 0;
         uint8_t oid[16];
-        if (!rec_decode(buf + off, off, &pos, &op, oid)) {
+        gcmk_rel rel = {0};
+        if (!rec_decode(buf + off, off, &pos, &op, oid, &rel)) {
             saw_bad = true;
             continue;
         }
@@ -388,8 +527,12 @@ int ecgcmk_open(eng *db)
         }
         if (op == GCMK_OP_ADD)
             rc = ent_add_locked(g, oid, pos);
-        else
+        else if (op == GCMK_OP_DONE)
             (void)ent_del_locked(g, oid);
+        else if (op == GCMK_OP_REL_ADD)
+            rc = rel_add_locked(g, &rel);
+        else
+            (void)rel_del_locked(g, rel.vol, rel.pos, rel.node, rel.ver);
         if (rc)
             break;
         good_end = (size_t)(off + GCMK_REC);
@@ -407,7 +550,7 @@ int ecgcmk_open(eng *db)
     }
     g->fd = fd;
     g->off = (uint64_t)good_end;
-    if (g->nents == 0 && g->off > 0)
+    if (g->nents == 0 && g->nrels == 0 && g->off > 0)
         rc = gcmk_compact_locked(db, g);
     return rc;
 }
@@ -426,6 +569,7 @@ void ecgcmk_close(eng *db)
     if (g->fd >= 0)
         close(g->fd);
     free(g->ents);
+    free(g->rels);
     free(g->qorph);
     free(g->cands);
     pthread_mutex_destroy(&g->mu);
@@ -479,6 +623,28 @@ int ecgcmk_pending_list(const eng *db, uint8_t (**oids_out)[16], size_t *n_out)
     return 0;
 }
 
+size_t ecgcmk_pending_releases(const eng *db)
+{
+    struct ecgcmk *g = db ? db->gcmk : NULL;
+    if (!g)
+        return 0;
+    pthread_mutex_lock(&g->mu);
+    size_t n = g->nrels;
+    pthread_mutex_unlock(&g->mu);
+    return n;
+}
+
+bool ecgcmk_pending_release_has(const eng *db, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    struct ecgcmk *g = db ? db->gcmk : NULL;
+    if (!g)
+        return false;
+    pthread_mutex_lock(&g->mu);
+    bool has = rel_find_locked(g, db->tier_vol, pos, node, ver) >= 0;
+    pthread_mutex_unlock(&g->mu);
+    return has;
+}
+
 bool ecgcmk_is_fenced(const eng *db) { return db && db->gcmk && atomic_load(&db->gcmk->fenced); }
 
 int ecgcmk_queue_orphan(eng *db, const uint8_t oid[16])
@@ -521,6 +687,59 @@ int ecgcmk_apply(eng *db, uint64_t pos, const mk *m)
     if (!g)
         return 0;
     const mk_gc *gc = &m->u.gc;
+
+    /* R9 (D12): position release markers carry {rel_vol, rel_pos, rel_node, rel_ver} with noids == 0. */
+    if (gc->reason == MK_GC_RELEASE || gc->reason == MK_GC_RELEASE_DONE) {
+        if (gc->rel_pos >= MK_REL_POS_MAX || gc->rel_node == 0 || gc->rel_ver == 0 || gc->rel_vol != db->tier_vol)
+            return TSDB_ERR_INVALID;
+        gcmk_rel r = {
+            .vol = gc->rel_vol,
+            .pos = gc->rel_pos,
+            .node = gc->rel_node,
+            .ver = gc->rel_ver,
+            .mk_pos = pos,
+        };
+        pthread_mutex_lock(&g->fmu);
+        int rc = 0;
+        if (gc->reason == MK_GC_RELEASE) {
+            pthread_mutex_lock(&g->mu);
+            bool have = rel_find_locked(g, r.vol, r.pos, r.node, r.ver) >= 0;
+            pthread_mutex_unlock(&g->mu);
+            if (!have)
+                rc = gcmk_append_rel_locked(db, g, pos, GCMK_OP_REL_ADD, &r);
+            if (rc == 0) {
+                pthread_mutex_lock(&g->mu);
+                rc = rel_add_locked(g, &r);
+                pthread_mutex_unlock(&g->mu);
+            }
+        } else {
+            pthread_mutex_lock(&g->mu);
+            bool have = rel_find_locked(g, r.vol, r.pos, r.node, r.ver) >= 0;
+            pthread_mutex_unlock(&g->mu);
+            if (have) {
+                rc = gcmk_append_rel_locked(db, g, pos, GCMK_OP_REL_DONE, &r);
+                if (rc == 0) {
+                    pthread_mutex_lock(&g->mu);
+                    (void)rel_del_locked(g, r.vol, r.pos, r.node, r.ver);
+                    size_t left = g->nents + g->nrels;
+                    pthread_mutex_unlock(&g->mu);
+                    if (g->off > 0 && (left == 0 || g->off >= GCMK_COMPACT_BYTES))
+                        rc = gcmk_compact_locked(db, g);
+                }
+            }
+        }
+        pthread_mutex_unlock(&g->fmu);
+        if (rc == 0 && gc->reason == MK_GC_RELEASE) {
+            /* Lock order: g->fmu is released above; eccache_reopen_vol acquires only the leaf obj_mu. */
+            if (db->tier)
+                eccache_reopen_vol(db->tier, db->tier_vol);
+            void (*hook)(void) = atomic_load_explicit(&ecgcmk_release_crash_hook, memory_order_acquire);
+            if (hook)
+                hook();
+        }
+        return rc;
+    }
+
     if (gc->noids == 0)
         return 0;
 
@@ -549,7 +768,7 @@ int ecgcmk_apply(eng *db, uint64_t pos, const mk *m)
             pthread_mutex_lock(&g->mu);
             for (size_t i = 0; i < nd; i++)
                 (void)ent_del_locked(g, del[i]);
-            size_t left = g->nents;
+            size_t left = g->nents + g->nrels;
             pthread_mutex_unlock(&g->mu);
             if (g->off > 0 && (left == 0 || g->off >= GCMK_COMPACT_BYTES))
                 rc = gcmk_compact_locked(db, g);
@@ -1236,6 +1455,196 @@ static void collect_orphans(eng *db, coldvol *cv)
     free(due.v);
 }
 
+static int append_and_apply_mkgc_release(eng *db, uint32_t reason, uint32_t vol, uint32_t pos, uint32_t node,
+                                         uint64_t ver)
+{
+    mk m;
+    memset(&m, 0, sizeof m);
+    m.type = MK_GC;
+    m.span = 1;
+    m.u.gc.reason = reason;
+    m.u.gc.rel_vol = vol;
+    m.u.gc.rel_pos = pos;
+    m.u.gc.rel_node = node;
+    m.u.gc.rel_ver = ver;
+    const char *what = reason == MK_GC_RELEASE_DONE
+                           ? "an MK_GC{release_done} marker was appended but its commit point did not come"
+                           : "an MK_GC{release} marker was appended but its commit point did not come";
+    uint64_t mk_pos = 0;
+    int rc = jr_markers_append(db, &m, 1, what, &mk_pos);
+    if (rc != 0)
+        return rc;
+    if (mk_pos == 0)
+        return TSDB_ERR_UNAVAILABLE;
+    if (reason == MK_GC_RELEASE_DONE || ecgc_mutant != GC_MUT_UNCOMMITTED) {
+        rc = jr_markers_wait(db, mk_pos, what);
+        if (rc != 0) {
+            if (rc == TSDB_ERR_INDETERMINATE && db->gcmk)
+                atomic_store(&db->gcmk->fenced, true);
+            return rc;
+        }
+    }
+    return ecgcmk_apply(db, mk_pos, &m);
+}
+
+static bool rel_is_clean(const struct ecgcmk *g, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    for (size_t i = 0; i < g->nclean_rels; i++)
+        if (g->clean_rels[i].pos == pos && g->clean_rels[i].node == node && g->clean_rels[i].ver == ver)
+            return true;
+    return false;
+}
+
+static void rel_mark_clean(struct ecgcmk *g, uint32_t pos, uint32_t node, uint64_t ver)
+{
+    pthread_mutex_lock(&g->mu);
+    if (!rel_is_clean(g, pos, node, ver)) {
+        size_t slot = g->nclean_rels < GCMK_CLEAN_RELS_MAX ? g->nclean_rels++ : (g->clean_next++ % GCMK_CLEAN_RELS_MAX);
+        g->clean_rels[slot] = (gcmk_rel_clean){.pos = pos, .node = node, .ver = ver};
+    }
+    pthread_mutex_unlock(&g->mu);
+}
+
+static int live_obj_oid_cmp(const void *a, const void *b)
+{
+    const cold_live_obj *x = a, *y = b;
+    return memcmp(x->oid, y->oid, 16);
+}
+
+static void process_pending_releases(eng *db, coldvol *cv)
+{
+    if (!cv->ops->release_pos)
+        return;
+    struct ecgcmk *g = db->gcmk;
+    pthread_mutex_lock(&g->mu);
+    size_t nr = g->nrels;
+    gcmk_rel *snap = nr ? malloc(nr * sizeof *snap) : NULL;
+    if (nr && snap)
+        memcpy(snap, g->rels, nr * sizeof *snap);
+    pthread_mutex_unlock(&g->mu);
+    if (!nr || !snap) {
+        free(snap);
+        return;
+    }
+
+    for (size_t i = 0; i < nr; i++) {
+        if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+            break;
+        uint64_t epoch = coldvol_epoch(cv);
+        if (epoch == 0)
+            break;
+        int rc = cv->ops->release_pos(cv->ctx, snap[i].pos, snap[i].node, snap[i].ver, epoch, snap[i].mk_pos);
+        if (rc == 0) {
+            if (append_and_apply_mkgc_release(db, MK_GC_RELEASE_DONE, snap[i].vol, snap[i].pos, snap[i].node,
+                                              snap[i].ver) == 0)
+                rel_mark_clean(g, snap[i].pos, snap[i].node, snap[i].ver);
+        } else if (rc == CHUNK_ERR_FENCED) {
+            fprintf(stderr,
+                    "tsdb: %s: release delete of pos %" PRIu32 " on node %" PRIu32 " at epoch %" PRIu64
+                    " was fenced: stopping GC on this deposed leader\n",
+                    db->dir, snap[i].pos, snap[i].node, epoch);
+            atomic_store(&g->fenced, true);
+            break;
+        }
+    }
+    free(snap);
+}
+
+static void collect_releases(eng *db, coldvol *cv)
+{
+    if (!cv->ops->release_candidates || !cv->ops->release_verify || !cv->ops->release_pos)
+        return;
+    struct ecgcmk *g = db->gcmk;
+    bool suspended = cv->ops->gc_suspended ? cv->ops->gc_suspended(cv->ctx) : false;
+    if (suspended && ecgc_mutant != GC_MUT_SUSPENDIGNORED)
+        return;
+    uint64_t epoch = coldvol_epoch(cv);
+    if (epoch == 0)
+        return;
+
+    cold_release cands[32];
+    unsigned nc = cv->ops->release_candidates(cv->ctx, cands, 32);
+    if (nc == 0)
+        return;
+
+    /* Filter candidates already pending in GCMK or already verified empty. */
+    cold_release todo[32];
+    unsigned ntodo = 0;
+    pthread_mutex_lock(&g->mu);
+    for (unsigned i = 0; i < nc && ntodo < 32; i++) {
+        if (cands[i].pos >= MK_REL_POS_MAX || cands[i].node == 0 || cands[i].version == 0)
+            continue;
+        if (rel_find_locked(g, db->tier_vol, cands[i].pos, cands[i].node, cands[i].version) >= 0)
+            continue;
+        if (rel_is_clean(g, cands[i].pos, cands[i].node, cands[i].version))
+            continue;
+        todo[ntodo++] = cands[i];
+    }
+    pthread_mutex_unlock(&g->mu);
+    if (ntodo == 0)
+        return;
+
+    if (ecgc_mutant == GC_MUT_RELEASE_NOMARK) {
+        /* Planted bug releasenomark: deletes chunks on the former holder without checking CHUNK_LIST or committing MK_GC. */
+        for (unsigned i = 0; i < ntodo; i++) {
+            if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+                break;
+            int rc = cv->ops->release_pos(cv->ctx, todo[i].pos, todo[i].node, todo[i].version, epoch, 1);
+            if (rc == 0)
+                rel_mark_clean(g, todo[i].pos, todo[i].node, todo[i].version);
+        }
+        return;
+    }
+
+    /* Snapshot live .ec objects (OBJLIST on this leader) to verify the current whole holder's CHUNK_LIST. */
+    size_t np = 0;
+    part **ps = db_snapshot(db, INT64_MIN, INT64_MAX, &np);
+    if (!ps)
+        return;
+    cold_live_obj *objs = np ? malloc(np * sizeof *objs) : NULL;
+    size_t nobjs = 0;
+    if (np && !objs) {
+        db_release(ps, np);
+        return;
+    }
+    for (size_t i = 0; i < np; i++) {
+        struct ecpart *ep = atomic_load_explicit(&ps[i]->ec, memory_order_acquire);
+        if (!ep || ep->test_mark)
+            continue;
+        memcpy(objs[nobjs].oid, ep->rec.oid, 16);
+        objs[nobjs].npos = (unsigned)ep->rec.k + (unsigned)ep->rec.m;
+        objs[nobjs].positions = ep->rec.positions;
+        objs[nobjs].stripe_version = ep->rec.stripe_version;
+        nobjs++;
+    }
+    db_release(ps, np);
+    if (nobjs > 1) {
+        qsort(objs, nobjs, sizeof *objs, live_obj_oid_cmp);
+        size_t u = 1;
+        for (size_t i = 1; i < nobjs; i++)
+            if (memcmp(objs[i].oid, objs[u - 1].oid, 16) != 0)
+                objs[u++] = objs[i];
+        nobjs = u;
+    }
+
+    bool added = false;
+    for (unsigned i = 0; i < ntodo; i++) {
+        if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+            break;
+        int vrc = cv->ops->release_verify(cv->ctx, todo[i].pos, todo[i].node, todo[i].version, objs, nobjs);
+        if (vrc == 0) {
+            rel_mark_clean(g, todo[i].pos, todo[i].node, todo[i].version);
+        } else if (vrc > 0) {
+            if (append_and_apply_mkgc_release(db, MK_GC_RELEASE, db->tier_vol, todo[i].pos, todo[i].node,
+                                              todo[i].version) == 0)
+                added = true;
+        }
+    }
+    free(objs);
+    if (added && eccold_leader(db) && !atomic_load(&g->fenced) && !atomic_load(&g->stop) && !eng_check(db))
+        process_pending_releases(db, cv);
+}
+
 void ecgcmk_work(eng *db)
 {
     if (!db || !db->ec_cluster || !db->gcmk || !db->tier || eng_check(db) || atomic_load(&db->stop))
@@ -1249,8 +1658,11 @@ void ecgcmk_work(eng *db)
     if (!cv)
         goto out;
 
-    /* 1. Finish any already-committed MK_GC deletes (including those inherited across failover). */
+    /* 1. Finish any already-committed MK_GC deletes and position releases (including those inherited across failover). */
     process_pending(db, cv);
+    if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+        goto out;
+    process_pending_releases(db, cv);
     if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
         goto out;
 
@@ -1274,6 +1686,11 @@ void ecgcmk_work(eng *db)
 
     /* 3. Orphan collection by E14's four conditions (stopped while gc_suspended). */
     collect_orphans(db, cv);
+    if (!eccold_leader(db) || atomic_load(&g->fenced) || atomic_load(&g->stop) || eng_check(db))
+        goto out;
+
+    /* 4. Position releases for former holders once the current holder is whole (D12; stopped while gc_suspended). */
+    collect_releases(db, cv);
 out:
     pthread_mutex_unlock(&g->wmu);
 }

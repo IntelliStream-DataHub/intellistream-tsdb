@@ -4665,6 +4665,8 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
 
 static _Atomic(cluster_drv_counts_fn) g_drv_counts;
 void cluster_set_drv_counts(cluster_drv_counts_fn fn) { atomic_store_explicit(&g_drv_counts, fn, memory_order_release); }
+static _Atomic(void (*)(uint32_t)) g_gc_kick;
+void cluster_set_gc_kick(void (*fn)(uint32_t volume)) { atomic_store_explicit(&g_gc_kick, fn, memory_order_release); }
 
 static void put_status(struct buf *b)
 {
@@ -8388,11 +8390,20 @@ static void place_duty(uint64_t now)
             struct meta_entry e;
             meta_entry_init(&e);
             meta_op_stripe_whole(&e, p->volume, p->pos, p->version);
-            (void)propose(&e, 0, 0, 0);
+            if (propose(&e, 0, 0, 0) == ISO_OK) {
+                say("proposes STRIPE_WHOLE vol %" PRIu32 " pos %" PRIu32 " ver %" PRIu64, p->volume, p->pos, p->version);
+                crash_point(CP_WHOLE_PROPOSED);
+            }
+        } else if (p->kind == PLACE_PROP_GC_RELEASE) {
+            /* Kicks GC directly when the Raft leader also leads `p->volume`; remote volume leaders are kicked
+             * by chunkpeer_cluster's sf_watch_main when their cluster_copy updates. */
+            void (*kick)(uint32_t) = atomic_load_explicit(&g_gc_kick, memory_order_acquire);
+            if (kick)
+                kick(p->volume);
         } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
             (void)ctr_move_start(p->volume, p->node, now);
         }
-        /* TODO(r9-whole, r9-return): wire PLACE_PROP_GC_RELEASE and PLACE_PROP_MOVE_CANCEL once handlers land. */
+        /* TODO(r9-return): wire PLACE_PROP_MOVE_CANCEL once handler lands. */
     }
     memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
     ndefer_last = ndefer_next;

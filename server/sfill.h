@@ -154,12 +154,13 @@ uint32_t sfill_get_progress(struct sfill *sf, struct sfill_progress *out, uint32
 
 void sfill_get_stats(struct sfill *sf, struct sfill_stats *out);
 
-/* Planted bugs (TSDB_SFILL_MUTANT env var or sfill_set_mutant; tests/test_sfill.c, make sfill-mutants). */
+/* Planted bugs (TSDB_SFILL_MUTANT env var or sfill_set_mutant; tests/test_sfill.c, make sfill-mutants, whole-mutants). */
 enum sfill_mutant {
     SFILL_MUT_NONE = 0,
     SFILL_MUT_NOCHECK = 1,       /* fillnocheck: skips verifying rebuilt cells against encode-time sums */
     SFILL_MUT_FEWERK = 2,        /* fillfewerk: attempts decode with fewer than k good survivors */
     SFILL_MUT_SURVIVOR_TRUST = 3, /* fillsurvivortrust: skips verifying survivor cells against encode-time sums */
+    SFILL_MUT_WHOLE_EARLY = 4,   /* wholeearly: reports whole=1 on the first report before all objects finish */
 };
 extern _Atomic int sfill_mutant;
 int sfill_mutant_parse(const char *name);

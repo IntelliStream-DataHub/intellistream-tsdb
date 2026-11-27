@@ -2178,6 +2178,7 @@ struct eng {
     int8_t meta_tier_cache; /* load_parts batch cache for meta_says_tier(): 0=off, 1=active/unread, 2=no, 3=yes */
     struct ppos *ppos;
     struct eccold *cold;
+    atomic_uint_fast64_t cold_active_sv; /* R9 (r9-whole, D10): stripe_version of an eccold_settle in commit phase */
     struct ecdiverge *diverge;
     struct ecgcmk *gcmk;
     pthread_mutex_t feed_lock;

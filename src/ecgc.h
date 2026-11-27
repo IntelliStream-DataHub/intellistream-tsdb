@@ -115,6 +115,8 @@ enum {
     GC_MUT_SUSPENDIGNORED, /* gcsuspendignored: cluster orphan sweep ignores gc_suspended */
     GC_MUT_HOLDATRET,      /* holdatretire: holds taken at ecgc_retire_locked instead of part_open_ec */
     GC_MUT_REPLICANOOP,    /* gcreplicanoop: ecgcmk_apply on a replica is a no-op */
+    /* R9 (r9-whole) planted bug: */
+    GC_MUT_RELEASE_NOMARK, /* releasenomark: deletes released holder's chunks without waiting for committed MK_GC */
 };
 extern int ecgc_mutant;
 int ecgc_mutant_parse(const char *name); /* GC_MUT_* or -1 */

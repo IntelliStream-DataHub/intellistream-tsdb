@@ -62,15 +62,25 @@ struct chunkpeer_view {
     unsigned k, m, nstripe;
     uint8_t gc_suspended; /* R8 (E14): orphan collection suspended until GC_RESUME */
     uint32_t stripe[CHUNK_POS_MAX]; /* position -> member */
+    /* R9 (r9-whole, D10, D12): per-position fill state and previous holder for filling reads and MK_GC releases. */
+    uint8_t stripe_filling[CHUNK_POS_MAX];  /* 1 while position is META_STRIPE_FILLING, else 0 */
+    uint32_t stripe_prev[CHUNK_POS_MAX];    /* previous holder A (0: none) */
+    uint8_t stripe_prev_up[CHUNK_POS_MAX];  /* 1 when prev is UP/DRAINING in the copy */
+    uint64_t stripe_set_ver[CHUNK_POS_MAX]; /* stripe_version V at which pos was set (barrier) */
 };
 /* 0 with *v, TSDB_ERR_NOTFOUND when there is no copy or it does not hold `volume` as an ec volume. Any thread. */
 typedef int (*chunkpeer_view_fn)(void *arg, uint32_t volume, struct chunkpeer_view *v);
+
+/* Member state reported by chunkpeer.node_state for release GC (D12). */
+enum { CP_NODE_DOWN = 0, CP_NODE_UP = 1, CP_NODE_DESTROYED = 2 };
 
 /* One per process (tsdbd's, or a test's): the attach's make_arg and epoch_arg. Outlives every tier using it. */
 struct chunkpeer {
     struct chunkpeer_net net;
     chunkpeer_view_fn view;
     void *view_arg;
+    /* Optional member state query (CP_NODE_UP / CP_NODE_DOWN / CP_NODE_DESTROYED); NULL assumes UP. */
+    int (*node_state)(void *arg, uint32_t node);
     struct chunksrv *local; /* this member's chunk server (the ownepoch mutant reads its stores' own fence) */
     char stage_dir[PATH_MAX]; /* where puts are staged (unlinked temporaries) */
     int timeout_ms;           /* per request or put; 0: 30,000 */
@@ -146,18 +156,27 @@ struct chunkpeer_peer_stats {
 size_t chunkpeer_peer_stats_get(struct chunkpeer_peer_stats *out, size_t cap);
 void chunkpeer_hedge_reset(void); /* clears per-peer latency/bucket/avoid state (tests) */
 
-/* Planted bugs (tests/test_chunkpeer.c and test_cluster ecbasic/ecslow --mutant; TSDB_CHUNKPEER_MUTANT in tsdbd). */
+/* R9 (r9-whole, D10): track objects reported filled by a filling holder (CS_OP_REOPEN from peer B) keyed by
+ * (node, volume, pos, set_ver, oid) so reads of objects < V may read from B only once B reported the object filled
+ * for that exact fill version, and stale entries are purged when the stripe version or fill state changes. */
+void chunkpeer_note_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16]);
+bool chunkpeer_is_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16]);
+void chunkpeer_filled_clear_vol(uint32_t volume);
+void chunkpeer_filled_reset(void);
+
+/* Planted bugs (tests/test_chunkpeer.c and test_cluster ecbasic/ecslow/ecwhole --mutant; TSDB_CHUNKPEER_MUTANT in tsdbd). */
 enum {
     CP_MUT_NONE = 0,
-    CP_MUT_OWNEPOCH = 1,     /* ownepoch: the epoch provider and source answer the stores' own fence (the writer's) */
-    CP_MUT_NOSUMCMP = 2,     /* nosumcmp: a PUT_OK's sum is not compared with the table sent */
-    CP_MUT_STALERAISE = 3,   /* staleraise: the source answers from a copy that is not caught up */
-    CP_MUT_DELBEFOREGC = 4,  /* delbeforegc: deletes go through on a cluster volume before MK_GC exists */
-    CP_MUT_STICKY = 5,       /* sticky: a context unfenced at attach stays so for its life (never asked again) */
-    CP_MUT_UNSUREDOWN = 6,   /* unsuredown: all_up counts a member whose store is unsure as down */
-    CP_MUT_HEDGEALL = 7,     /* hedgeall: no 5% token bucket (every hedge timer expiry launches a hedge) */
-    CP_MUT_NOAVOID = 8,      /* noavoid: never enter read-avoid after 8 timeouts in 10 s */
-    CP_MUT_HEDGECORRUPT = 9, /* hedgecorrupt: report a hedge timeout as CORRUPT instead of UNAVAILABLE (breaks E15) */
+    CP_MUT_OWNEPOCH = 1,          /* ownepoch: the epoch provider and source answer the stores' own fence (the writer's) */
+    CP_MUT_NOSUMCMP = 2,          /* nosumcmp: a PUT_OK's sum is not compared with the table sent */
+    CP_MUT_STALERAISE = 3,        /* staleraise: the source answers from a copy that is not caught up */
+    CP_MUT_DELBEFOREGC = 4,       /* delbeforegc: deletes go through on a cluster volume before MK_GC exists */
+    CP_MUT_STICKY = 5,            /* sticky: a context unfenced at attach stays so for its life (never asked again) */
+    CP_MUT_UNSUREDOWN = 6,        /* unsuredown: all_up counts a member whose store is unsure as down */
+    CP_MUT_HEDGEALL = 7,          /* hedgeall: no 5% token bucket (every hedge timer expiry launches a hedge) */
+    CP_MUT_NOAVOID = 8,           /* noavoid: never enter read-avoid after 8 timeouts in 10 s */
+    CP_MUT_HEDGECORRUPT = 9,      /* hedgecorrupt: report a hedge timeout as CORRUPT instead of UNAVAILABLE (breaks E15) */
+    CP_MUT_READ_FROM_FILLING = 10,/* readfromfilling: reads a filling holder B for an unfilled object < V */
 };
 extern int chunkpeer_mutant;
 extern uint32_t chunkpeer_test_list_max; /* entries per page of list_names (test_chunkpeer: pagination) */

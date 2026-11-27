@@ -250,7 +250,7 @@ static struct chunksrv *open1(const char *path)
 static void test_wire(void)
 {
     uint8_t buf[128];
-    for (uint8_t op = CS_OP_READ; op <= CS_OP_DAMAGED; op++) {
+    for (uint8_t op = CS_OP_READ; op <= CS_OP_DEL_REL; op++) {
         if (op == CS_OP_PUT)
             continue;
         struct cs_req r = {.rid = 77, .op = op, .volume = 3, .epoch = 9, .pos = 4, .off = 100, .len = 10,
@@ -1455,8 +1455,9 @@ static int mock_objlist_fn(void *arg, uint32_t volume, uint64_t max_version, boo
     return 0;
 }
 
-static void mock_reopen_fn(void *arg, uint32_t volume, const uint8_t oid[16])
+static void mock_reopen_fn(void *arg, uint32_t peer, uint32_t volume, const uint8_t oid[16])
 {
+    (void)peer;
     struct mock_objlist_ctx *ctx = arg;
     pthread_mutex_lock(&ctx->mu);
     ctx->reopen_calls++;

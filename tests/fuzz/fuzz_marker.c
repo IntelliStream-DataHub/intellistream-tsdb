@@ -57,8 +57,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 c->retired + (size_t)c->nretired * MK_OID != p + size)
                 abort();
         }
-        if ((m.type == MK_GC && (m.u.gc.noids == 0 || m.u.gc.noids > MK_FILES_MAX)) ||
-            (m.type == MK_DIGEST && m.u.digest.noids > MK_FILES_MAX))
+        if (m.type == MK_GC) {
+            if (m.u.gc.reason == MK_GC_RELEASE || m.u.gc.reason == MK_GC_RELEASE_DONE) {
+                if (m.u.gc.noids != 0 || m.u.gc.rel_pos >= MK_REL_POS_MAX || m.u.gc.rel_node == 0 ||
+                    m.u.gc.rel_ver == 0)
+                    abort();
+            } else if (m.u.gc.noids == 0 || m.u.gc.noids > MK_FILES_MAX) {
+                abort();
+            }
+        }
+        if (m.type == MK_DIGEST && m.u.digest.noids > MK_FILES_MAX)
             abort();
         uint8_t *q;
         size_t qn;
@@ -185,6 +193,12 @@ void fuzz_seeds(const char *dir)
     seed(dir, "seed-gc-orphan", &m);
     m.u.gc.reason = MK_GC_DONE, m.u.gc.noids = 2;
     seed(dir, "seed-gc-done", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_GC;
+    m.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .noids = 0, .rel_vol = 2, .rel_pos = 1, .rel_node = 5, .rel_ver = 3};
+    seed(dir, "seed-gc-release", &m);
+    m.u.gc.reason = MK_GC_RELEASE_DONE;
+    seed(dir, "seed-gc-release-done", &m);
     memset(&m, 0, sizeof m);
     m.type = MK_DIGEST;
     m.u.digest = (mk_digest){.key = 4 * 19700 + 1, .z = 5000, .rows = 86400, .series = 3, .xxh64 = 0x1234567890abcdefull,

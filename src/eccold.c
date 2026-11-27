@@ -199,6 +199,11 @@ bool eccold_swap_cur(struct eng *db, uint64_t *pos, int64_t *key, uint64_t *z)
     return true;
 }
 
+uint64_t eccold_active_sv(const struct eng *db)
+{
+    return db ? atomic_load_explicit(&db->cold_active_sv, memory_order_seq_cst) : 0;
+}
+
 static int64_t mono_ms(void)
 {
     struct timespec ts;
@@ -735,6 +740,10 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
     cut.nobjs = np;
     step(db, ECCOLD_STEP_PRE_MARKER);
     pause_pre_marker_hook();
+    /* R9 (D10): advertise this settle's stripe_version with seq_cst BEFORE the final stripe_version check so
+     * cp_objlist_srv(max_version = V) either sees active_sv < V (and retries) or this check sees stripe_of >= V
+     * (and aborts); no object of version < V can slip past OBJLIST into ec_swap_commit unseen. */
+    atomic_store_explicit(&db->cold_active_sv, sv, memory_order_seq_cst);
     /* E10: just before MK_COLD, verify every written position is still UP in the current epoch. */
     if (eccold_mutant != ECCOLD_MUT_DEGNOUPCHECK && !stripe_written_ok(cv, epoch, sv, check_mask)) {
         fprintf(stderr, "tsdb: %s: settle: a written stripe position dropped before MK_COLD: aborting\n", db->dir);
@@ -767,6 +776,7 @@ int eccold_settle(eng *db, int64_t key, part **pin, size_t np, part **ec)
         dw->last_seen_ms = mono_ms();
     }
 out:
+    atomic_store_explicit(&db->cold_active_sv, 0, memory_order_release);
     if (gated) {
         lw_leave(db, &f);
         cut.hold_us = mono_us() - t_gate;

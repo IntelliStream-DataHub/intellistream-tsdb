@@ -68,6 +68,7 @@ struct fake {
     atomic_int read_fail_stripe[NM + 1]; /* >=0: fail CS_OP_READ on this stripe index (cell_off / fail_cell) */
     atomic_int read_delay_stripe[NM + 1]; /* >=0: apply read_delay_ms only on this stripe index; <0: all stripes */
     atomic_uint fail_cell;               /* cell size used with read_fail_stripe / read_delay_stripe */
+    void (*after_del_rel)(uint32_t node, const struct cs_req *r);
     pthread_cond_t hcv;
     struct chunkpeer_view view;
     pthread_mutex_t mu;
@@ -123,6 +124,8 @@ static int f_call(void *arg, uint32_t node, const struct cs_req *r, int tmo, int
         return 0;
     }
     int trc = chunkpeer_local_call(F.cs[node], 99, r, rc, body, n);
+    if (trc == 0 && r->op == CS_OP_DEL_REL && F.after_del_rel)
+        F.after_del_rel(node, r);
     if (trc == 0 && *rc == 0 && r->op == CS_OP_READ && *n > 0 && (atomic_load(&F.flip_byte) >> node & 1))
         (*body)[0] ^= 0xff;
     if (trc == 0 && *rc == 0 && r->op == CS_OP_READ && *n > 0 && (atomic_load(&F.shortread) >> node & 1))
@@ -1348,6 +1351,264 @@ static void test_degraded_put_read(void)
     cluster_down();
 }
 
+static atomic_int g_del_rel_calls;
+static atomic_int g_rel_guard_rc;
+static atomic_int g_mock_node_state;
+
+static int mock_node_state(void *arg, uint32_t node)
+{
+    (void)arg, (void)node;
+    return atomic_load(&g_mock_node_state);
+}
+
+static void move_back_after_first_del(uint32_t node, const struct cs_req *r)
+{
+    (void)node, (void)r;
+    if (atomic_fetch_add(&g_del_rel_calls, 1) == 0) {
+        pthread_mutex_lock(&F.mu);
+        F.view.stripe[0] = 1;
+        F.view.stripe_version = 3;
+        F.view.stripe_set_ver[0] = 3;
+        F.view.stripe_filling[0] = 1;
+        F.view.stripe_prev[0] = 6;
+        F.view.stripe_prev_up[0] = 1;
+        pthread_mutex_unlock(&F.mu);
+    }
+}
+
+static int mock_rel_guard(void *arg, uint32_t volume, unsigned pos, uint64_t stripe_ver)
+{
+    (void)arg, (void)volume, (void)pos, (void)stripe_ver;
+    return atomic_load(&g_rel_guard_rc);
+}
+
+/* R9 (r9-whole, D10, D12): reads while filling (prev UP -> A, prev DOWN -> erasure unless B reported filled,
+ * post-barrier >= V -> B; kills readfromfilling) and release_candidates / release_verify / release_pos,
+ * including mid-release move-back to A and server-side CS_OP_DEL_REL guard. */
+static void test_filling_reads_and_release(void)
+{
+    char dir[PATH_MAX];
+    cluster_up("fillread", dir, sizeof dir);
+    chunkpeer_filled_reset();
+    void *ctx = NULL;
+    CHECK(chunkpeer_make(&CP, NULL, VOL, VUUID, &ctx) == 0);
+    CHECK(coldops_peer.see_epoch(ctx, 5) == 0);
+
+    /* Use k=3, m=2 (5 positions on nodes 1..5, with node 6 as spare B) so pos 0 can transition from node 1 (A)
+     * to node 6 (B) within the 6-node test cluster. */
+    pthread_mutex_lock(&F.mu);
+    F.view.k = 3;
+    F.view.m = 2;
+    F.view.nstripe = 5;
+    F.view.stripe_version = 1;
+    for (unsigned i = 0; i < 5; i++)
+        F.view.stripe[i] = i + 1;
+    pthread_mutex_unlock(&F.mu);
+
+    obj old_o, old_o2;
+    obj_make(&old_o, 256u << 10, 71);
+    CHECK(chunk_geom_derive(&old_o.g, 3, 2, old_o.g.len) == 0);
+    free(old_o.sums);
+    old_o.sums = calloc(chunk_sums_total(&old_o.g), sizeof *old_o.sums);
+    chunk_put_src psrc = {.ctx = old_o.bytes, .fill = fill};
+    CHECK(coldops_peer.put_stream(ctx, old_o.oid, &old_o.g, 5, &psrc, old_o.sums) == 0);
+
+    obj_make(&old_o2, 256u << 10, 73);
+    CHECK(chunk_geom_derive(&old_o2.g, 3, 2, old_o2.g.len) == 0);
+    free(old_o2.sums);
+    old_o2.sums = calloc(chunk_sums_total(&old_o2.g), sizeof *old_o2.sums);
+    chunk_put_src psrc_o2 = {.ctx = old_o2.bytes, .fill = fill};
+    CHECK(coldops_peer.put_stream(ctx, old_o2.oid, &old_o2.g, 5, &psrc_o2, old_o2.sums) == 0);
+
+    /* Move pos 0 from node 1 (A) to node 6 (B) in state FILLING at stripe_version = 2 (barrier V = 2).
+     * Node 6 does NOT hold old_o or old_o2's pos-0 chunks yet! */
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe[0] = 6;
+    F.view.stripe_version = 2;
+    F.view.stripe_filling[0] = 1;
+    F.view.stripe_prev[0] = 1;
+    F.view.stripe_prev_up[0] = 1;
+    F.view.stripe_set_ver[0] = 2;
+    pthread_mutex_unlock(&F.mu);
+
+    /* Put new_o at stripe_version = 2 while pos 0 is FILLING: new_o goes directly to node 6 (B)! */
+    obj new_o;
+    obj_make(&new_o, 256u << 10, 72);
+    CHECK(chunk_geom_derive(&new_o.g, 3, 2, new_o.g.len) == 0);
+    free(new_o.sums);
+    new_o.sums = calloc(chunk_sums_total(&new_o.g), sizeof *new_o.sums);
+    chunk_put_src psrc2 = {.ctx = new_o.bytes, .fill = fill};
+    CHECK(coldops_peer.put_stream(ctx, new_o.oid, &new_o.g, 5, &psrc2, new_o.sums) == 0);
+
+    uint8_t *got = malloc(old_o.g.len);
+    chunk_report rep;
+
+    /* 0. Filled-object tracking keyed by (node, volume, pos, set_ver, oid) and cleared per volume. */
+    chunkpeer_note_filled(6, VOL, 0, 2, old_o.oid);
+    CHECK(chunkpeer_is_filled(6, VOL, 0, 2, old_o.oid));
+    CHECK(!chunkpeer_is_filled(6, VOL, 1, 2, old_o.oid));
+    CHECK(!chunkpeer_is_filled(6, VOL, 0, 3, old_o.oid));
+    chunkpeer_filled_clear_vol(VOL);
+    CHECK(!chunkpeer_is_filled(6, VOL, 0, 2, old_o.oid));
+
+    /* 1. Post-barrier object (stripe_version == 2 >= V): MUST read pos 0 directly from node 6 (B). */
+    atomic_store(&F.read_calls[6], 0);
+    cold_obj *h = NULL;
+    CHECK(coldops_peer.obj_open_ver(ctx, new_o.oid, &new_o.g, new_o.sums, 0, 2, &h) == 0 && h);
+    CHECK(coldops_peer.obj_read(h, 0, new_o.g.len, got, 0, &rep) == 0 && memcmp(got, new_o.bytes, new_o.g.len) == 0);
+    CHECK(atomic_load(&F.read_calls[6]) > 0);
+    coldops_peer.obj_close(h);
+
+    /* 2. Pre-barrier object (stripe_version == 1 < V) with prev A (node 1) UP:
+     *    rot 2 other positions (nodes 4 and 5) so reading pos 0 from A is REQUIRED (3 healthy = {1,2,3} == k=3).
+     *    Honest reads from A (OK, 0 reads to B); readfromfilling asks B (ABSENT) -> CORRUPT! */
+    atomic_store(&F.flip_byte, (1u << 4) | (1u << 5));
+    atomic_store(&F.read_calls[6], 0);
+    atomic_store(&F.read_calls[1], 0);
+    h = NULL;
+    CHECK(coldops_peer.obj_open_ver(ctx, old_o.oid, &old_o.g, old_o.sums, 0, 1, &h) == 0 && h);
+    memset(got, 0, old_o.g.len);
+    CHECK(coldops_peer.obj_read(h, 0, old_o.g.len, got, 0, &rep) == 0 && memcmp(got, old_o.bytes, old_o.g.len) == 0);
+    CHECK(atomic_load(&F.read_calls[1]) > 0 && atomic_load(&F.read_calls[6]) == 0);
+    coldops_peer.obj_close(h);
+
+    /* 3. Pre-barrier object with prev A DOWN and B NOT reported filled:
+     *    with nodes 4 and 5 rotted, only 2 healthy (nodes 2,3) + pos 0 erasure (DOWN) = 3 >= k=3 -> UNAVAILABLE!
+     *    readfromfilling asks B (ABSENT) -> 2 good + 0 down < k=3 -> TSDB_ERR_CORRUPT! */
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe_prev_up[0] = 0;
+    pthread_mutex_unlock(&F.mu);
+    atomic_store(&F.read_calls[6], 0);
+    h = NULL;
+    CHECK(coldops_peer.obj_open_ver(ctx, old_o.oid, &old_o.g, old_o.sums, 0, 1, &h) == 0 && h);
+    CHECK(coldops_peer.obj_read(h, 0, old_o.g.len, got, 0, &rep) == TSDB_ERR_UNAVAILABLE);
+    CHECK(atomic_load(&F.read_calls[6]) == 0);
+    coldops_peer.obj_close(h);
+    atomic_store(&F.flip_byte, 0);
+
+    /* 4. With prev A DOWN and healthy survivors, decode around unfilled pos 0 without ever asking B. */
+    atomic_store(&F.read_calls[6], 0);
+    h = NULL;
+    CHECK(coldops_peer.obj_open_ver(ctx, old_o.oid, &old_o.g, old_o.sums, 0, 1, &h) == 0 && h);
+    memset(got, 0, old_o.g.len);
+    CHECK(coldops_peer.obj_read(h, 0, old_o.g.len, got, 0, &rep) == 0 && memcmp(got, old_o.bytes, old_o.g.len) == 0);
+    CHECK(atomic_load(&F.read_calls[6]) == 0);
+    coldops_peer.obj_close(h);
+
+    /* 5. release_candidates / release_verify / release_pos (D12):
+     *    While FILLING: release_candidates returns 0 and release_verify refuses (-1). */
+    cold_release cands[8];
+    CHECK(coldops_peer.release_candidates(ctx, cands, 8) == 0);
+    cold_live_obj live[3];
+    memcpy(live[0].oid, old_o.oid, 16);
+    live[0].npos = 5;
+    live[0].positions = 0;
+    live[0].stripe_version = 1;
+    memcpy(live[1].oid, old_o2.oid, 16);
+    live[1].npos = 5;
+    live[1].positions = 0;
+    live[1].stripe_version = 1;
+    memcpy(live[2].oid, new_o.oid, 16);
+    live[2].npos = 5;
+    live[2].positions = 0;
+    live[2].stripe_version = 2;
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) < 0);
+
+    /* Mark WHOLE while B (node 6) STILL lacks old_o & old_o2 -> release_verify MUST refuse (-1) via CHUNK_LIST! */
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe_filling[0] = 0;
+    F.view.stripe_prev_up[0] = 1;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_candidates(ctx, cands, 8) == 1 && cands[0].pos == 0 && cands[0].node == 1 &&
+          cands[0].version == 2);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) < 0);
+
+    /* Put both old_o and old_o2 onto B (node 6) at stripe={6,2,3,4,5}. */
+    chunk_put_src psrc3 = {.ctx = old_o.bytes, .fill = fill};
+    CHECK(coldops_peer.put_stream(ctx, old_o.oid, &old_o.g, 5, &psrc3, NULL) == 0);
+    chunk_put_src psrc4 = {.ctx = old_o2.bytes, .fill = fill};
+    CHECK(coldops_peer.put_stream(ctx, old_o2.oid, &old_o2.g, 5, &psrc4, NULL) == 0);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 1);
+
+    /* 5a. Lagging copy (caught_up == 0) must refuse release_candidates, release_verify, and release_pos. */
+    pthread_mutex_lock(&F.mu);
+    F.view.caught_up = 0;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_candidates(ctx, cands, 8) == 0);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) < 0);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == TSDB_ERR_UNAVAILABLE);
+    pthread_mutex_lock(&F.mu);
+    F.view.caught_up = 1;
+    pthread_mutex_unlock(&F.mu);
+
+    /* 5a2. Fail-closed CS_OP_DEL_REL when server has no rel_guard registered yet (startup window):
+     *      must return TSDB_ERR_UNAVAILABLE and leave node 1's chunks untouched! */
+    chunksrv_set_rel_guard(F.cs[1], NULL, NULL);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == TSDB_ERR_UNAVAILABLE);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 1);
+
+    /* 5b. Mid-release move-back to A (node 1): install permissive rel_guard; after the 1st CS_OP_DEL_REL,
+     *     STRIPE_SET moves pos 0 back to node 1 at stripe_version=3 (FILLING). release_pos MUST stop
+     *     immediately after 1 delete and leave chunk 2 intact! */
+    atomic_store(&g_rel_guard_rc, 0);
+    chunksrv_set_rel_guard(F.cs[1], mock_rel_guard, NULL);
+    atomic_store(&g_del_rel_calls, 0);
+    F.after_del_rel = move_back_after_first_del;
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == 0);
+    F.after_del_rel = NULL;
+    CHECK(atomic_load(&g_del_rel_calls) == 1);
+
+    /* Restore version 2 (node 6 whole): node 1 MUST still hold its 2nd chunk (release_verify returns 1). */
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe[0] = 6;
+    F.view.stripe_version = 2;
+    F.view.stripe_set_ver[0] = 2;
+    F.view.stripe_filling[0] = 0;
+    F.view.stripe_prev[0] = 1;
+    F.view.stripe_prev_up[0] = 1;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 1);
+
+    /* 5c. Server-side CS_OP_DEL_REL guard: node 1's own rel_guard refuses with TSDB_ERR_LOCKED (node 1 sees it now
+     *     holds pos 0) -> release_pos refuses without deleting node 1's remaining chunk! */
+    atomic_store(&g_rel_guard_rc, TSDB_ERR_LOCKED);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == TSDB_ERR_UNAVAILABLE);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 1);
+
+    /* 5d. Former holder DOWN skips without network call; DESTROYED retires with 0 without network call. */
+    atomic_store(&g_rel_guard_rc, 0);
+    CP.node_state = mock_node_state;
+    atomic_store(&g_mock_node_state, CP_NODE_DOWN);
+    atomic_store(&g_del_rel_calls, 0);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == TSDB_ERR_UNAVAILABLE);
+    CHECK(atomic_load(&g_del_rel_calls) == 0);
+    atomic_store(&g_mock_node_state, CP_NODE_DESTROYED);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == 0);
+    CHECK(atomic_load(&g_del_rel_calls) == 0);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 1); /* chunk still on disk */
+    CP.node_state = NULL;
+
+    /* 5e. Chain move A(1)->B(6) at V=2, then B(6)->C(6, whole) at V=3 (set_ver > ver, stripe[0] != 1):
+     *     pending release for A at V=2 MUST STILL delete A's remaining chunk instead of leaking it! */
+    pthread_mutex_lock(&F.mu);
+    F.view.stripe_version = 3;
+    F.view.stripe_set_ver[0] = 3;
+    F.view.stripe_filling[0] = 0;
+    F.view.stripe_prev[0] = 6;
+    pthread_mutex_unlock(&F.mu);
+    CHECK(coldops_peer.release_pos(ctx, 0, 1, 2, 5, 42) == 0);
+    chunksrv_set_rel_guard(F.cs[1], NULL, NULL);
+    CHECK(coldops_peer.release_verify(ctx, 0, 1, 2, live, 3) == 0);
+
+    free(got);
+    obj_free(&old_o);
+    obj_free(&old_o2);
+    obj_free(&new_o);
+    chunkpeer_filled_reset();
+    coldops_peer.ctx_free(ctx);
+    cluster_down();
+}
+
 int main(int argc, char **argv)
 {
     const char *base = "/tmp";
@@ -1371,6 +1632,7 @@ int main(int argc, char **argv)
     test_put_read();
     test_parallel_put();
     test_degraded_put_read();
+    test_filling_reads_and_release();
     test_sum();
     test_fence_del();
     test_unsure();

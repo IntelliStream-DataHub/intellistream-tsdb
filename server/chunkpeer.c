@@ -46,8 +46,9 @@ static int pool_submit(cp_job *j);
 
 int chunkpeer_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"none",        "ownepoch",   "nosumcmp",   "staleraise",  "delbeforegc",
-                                        "sticky",      "unsuredown", "hedgeall",   "noavoid",     "hedgecorrupt"};
+    static const char *const names[] = {"none",        "ownepoch",   "nosumcmp",   "staleraise",     "delbeforegc",
+                                        "sticky",      "unsuredown", "hedgeall",   "noavoid",        "hedgecorrupt",
+                                        "readfromfilling"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++)
         if (!strcmp(name, names[i]))
             return (int)i;
@@ -683,6 +684,191 @@ void chunkpeer_hedge_reset(void)
     cp_npeers = 0;
     memset(cp_peers, 0, sizeof cp_peers);
     pthread_mutex_unlock(&cp_mu);
+}
+
+/* ---------------------------------------------------------------- R9 filled-object tracking (D10) */
+#define CP_FILLED_INIT_CAP 1024u
+#define CP_FILLED_MAX_CAP (1u << 20) /* up to ~786k concurrent filled entries before per-volume eviction */
+enum { CP_FS_EMPTY = 0, CP_FS_USED = 1, CP_FS_TOMB = 2 };
+typedef struct cp_filled_ent {
+    uint64_t set_ver;
+    uint32_t node;
+    uint32_t volume;
+    uint16_t pos;
+    uint8_t state;
+    uint8_t oid[16];
+} cp_filled_ent;
+
+static pthread_mutex_t cp_filled_mu = PTHREAD_MUTEX_INITIALIZER;
+static cp_filled_ent *cp_filled;
+static size_t cp_filled_cap, cp_filled_used, cp_filled_tomb;
+
+static size_t cp_filled_hash(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16],
+                             size_t mask)
+{
+    uint64_t a = 0, b = 0;
+    memcpy(&a, oid, 8);
+    memcpy(&b, oid + 8, 8);
+    uint64_t h = a ^ (b * 0x9e3779b97f4a7c15ull) ^ ((uint64_t)node << 32 | volume) ^
+                 ((uint64_t)pos * 0xbf58476d1ce4e5b9ull) ^ (set_ver * 0x94d049bb133111ebull);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return (size_t)(h & mask);
+}
+
+static bool cp_filled_eq(const cp_filled_ent *e, uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver,
+                         const uint8_t oid[16])
+{
+    return e->node == node && e->volume == volume && e->pos == pos && e->set_ver == set_ver &&
+           memcmp(e->oid, oid, 16) == 0;
+}
+
+static bool cp_filled_rehash_locked(size_t new_cap)
+{
+    cp_filled_ent *tmp = calloc(new_cap, sizeof *tmp);
+    if (!tmp)
+        return false;
+    size_t mask = new_cap - 1u, n = 0;
+    for (size_t i = 0; i < cp_filled_cap; i++) {
+        if (cp_filled[i].state != CP_FS_USED)
+            continue;
+        size_t idx = cp_filled_hash(cp_filled[i].node, cp_filled[i].volume, cp_filled[i].pos, cp_filled[i].set_ver,
+                                    cp_filled[i].oid, mask);
+        while (tmp[idx].state == CP_FS_USED)
+            idx = (idx + 1u) & mask;
+        tmp[idx] = cp_filled[i];
+        n++;
+    }
+    free(cp_filled);
+    cp_filled = tmp;
+    cp_filled_cap = new_cap;
+    cp_filled_used = n;
+    cp_filled_tomb = 0;
+    return true;
+}
+
+static void cp_filled_evict_vol_locked(uint32_t volume)
+{
+    for (size_t i = 0; i < cp_filled_cap; i++) {
+        if (cp_filled[i].state == CP_FS_USED && cp_filled[i].volume == volume) {
+            cp_filled[i].state = CP_FS_TOMB;
+            cp_filled_used--;
+            cp_filled_tomb++;
+        }
+    }
+    if (cp_filled_used == 0) {
+        free(cp_filled);
+        cp_filled = NULL;
+        cp_filled_cap = 0;
+        cp_filled_tomb = 0;
+    }
+}
+
+void chunkpeer_note_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16])
+{
+    if (node == 0 || !oid || pos >= CHUNK_POS_MAX || set_ver == 0)
+        return;
+    pthread_mutex_lock(&cp_filled_mu);
+    if (cp_filled_cap == 0) {
+        if (!cp_filled_rehash_locked(CP_FILLED_INIT_CAP)) {
+            pthread_mutex_unlock(&cp_filled_mu);
+            return;
+        }
+    } else if ((cp_filled_used + cp_filled_tomb + 1u) * 4u >= cp_filled_cap * 3u) {
+        size_t target = cp_filled_cap;
+        if ((cp_filled_used + 1u) * 4u >= cp_filled_cap * 3u) {
+            if (cp_filled_cap < CP_FILLED_MAX_CAP)
+                target = cp_filled_cap * 2u;
+            else
+                cp_filled_evict_vol_locked(volume); /* evict only this volume; never disturb other volumes */
+        }
+        if (cp_filled_cap == 0) {
+            if (!cp_filled_rehash_locked(CP_FILLED_INIT_CAP)) {
+                pthread_mutex_unlock(&cp_filled_mu);
+                return;
+            }
+        } else if (!cp_filled_rehash_locked(target)) {
+            /* OOM fallback: evict only this volume so other volumes keep their filled entries. */
+            cp_filled_evict_vol_locked(volume);
+            if (cp_filled_cap == 0 || (cp_filled_used + cp_filled_tomb + 1u) >= cp_filled_cap) {
+                pthread_mutex_unlock(&cp_filled_mu);
+                return;
+            }
+        }
+    }
+    size_t mask = cp_filled_cap - 1u;
+    size_t idx = cp_filled_hash(node, volume, pos, set_ver, oid, mask);
+    size_t first_tomb = cp_filled_cap;
+    for (size_t step = 0; step < cp_filled_cap; step++) {
+        cp_filled_ent *e = &cp_filled[idx];
+        if (e->state == CP_FS_EMPTY) {
+            size_t dst = first_tomb < cp_filled_cap ? first_tomb : idx;
+            if (dst == first_tomb)
+                cp_filled_tomb--;
+            cp_filled[dst] = (cp_filled_ent){
+                .set_ver = set_ver,
+                .node = node,
+                .volume = volume,
+                .pos = (uint16_t)pos,
+                .state = CP_FS_USED,
+            };
+            memcpy(cp_filled[dst].oid, oid, 16);
+            cp_filled_used++;
+            break;
+        }
+        if (e->state == CP_FS_TOMB) {
+            if (first_tomb == cp_filled_cap)
+                first_tomb = idx;
+        } else if (cp_filled_eq(e, node, volume, pos, set_ver, oid)) {
+            break;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    pthread_mutex_unlock(&cp_filled_mu);
+}
+
+bool chunkpeer_is_filled(uint32_t node, uint32_t volume, unsigned pos, uint64_t set_ver, const uint8_t oid[16])
+{
+    if (node == 0 || !oid || pos >= CHUNK_POS_MAX || set_ver == 0)
+        return false;
+    bool found = false;
+    pthread_mutex_lock(&cp_filled_mu);
+    if (cp_filled_used > 0 && cp_filled_cap > 0) {
+        size_t mask = cp_filled_cap - 1u;
+        size_t idx = cp_filled_hash(node, volume, pos, set_ver, oid, mask);
+        for (size_t step = 0; step < cp_filled_cap; step++) {
+            const cp_filled_ent *e = &cp_filled[idx];
+            if (e->state == CP_FS_EMPTY)
+                break;
+            if (e->state == CP_FS_USED && cp_filled_eq(e, node, volume, pos, set_ver, oid)) {
+                found = true;
+                break;
+            }
+            idx = (idx + 1u) & mask;
+        }
+    }
+    pthread_mutex_unlock(&cp_filled_mu);
+    return found;
+}
+
+void chunkpeer_filled_clear_vol(uint32_t volume)
+{
+    pthread_mutex_lock(&cp_filled_mu);
+    if (cp_filled_used > 0 && cp_filled_cap > 0)
+        cp_filled_evict_vol_locked(volume);
+    pthread_mutex_unlock(&cp_filled_mu);
+}
+
+void chunkpeer_filled_reset(void)
+{
+    pthread_mutex_lock(&cp_filled_mu);
+    free(cp_filled);
+    cp_filled = NULL;
+    cp_filled_cap = 0;
+    cp_filled_used = 0;
+    cp_filled_tomb = 0;
+    pthread_mutex_unlock(&cp_filled_mu);
 }
 
 /* ---------------------------------------------------------------- read */
@@ -1540,8 +1726,8 @@ static int none_ok(const int *st, unsigned n)
     return away ? TSDB_ERR_UNAVAILABLE : damaged ? TSDB_ERR_CORRUPT : TSDB_ERR_NOTFOUND;
 }
 
-static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
-                          uint32_t positions, cold_obj **out)
+static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                          uint32_t positions, uint64_t stripe_version, cold_obj **out)
 {
     pctx *p = ctx;
     *out = NULL;
@@ -1559,8 +1745,28 @@ static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     o->positions = positions;
     memcpy(o->vuuid, p->vuuid, 16);
     memcpy(o->oid, oid, 16);
-    for (unsigned i = 0; i < v.nstripe; i++)
+
+    /* R9 (r9-whole, D10): for each FILLING position at barrier V and an object with stripe_version < V,
+     * read from prev (A) while A is UP and listed as prev; else treat pos as an erasure (CHUNK_ST_DOWN) unless
+     * the filling holder B has reported this object filled. Never ask B for an unfilled object. */
+    bool skip_filling[CHUNK_POS_MAX];
+    memset(skip_filling, 0, sizeof skip_filling);
+    bool any_filling_skip = false;
+    for (unsigned i = 0; i < v.nstripe; i++) {
         o->node[i] = v.stripe[i];
+        if (positions != 0 && !(positions & (1u << i)))
+            continue;
+        uint64_t barrier = v.stripe_set_ver[i] ? v.stripe_set_ver[i] : v.stripe_version;
+        bool pre_barrier = v.stripe_filling[i] && (barrier == 0 || stripe_version < barrier);
+        if (pre_barrier && chunkpeer_mutant != CP_MUT_READ_FROM_FILLING) {
+            if (v.stripe_prev[i] != 0 && v.stripe_prev_up[i]) {
+                o->node[i] = v.stripe_prev[i];
+            } else if (!chunkpeer_is_filled(o->node[i], p->volume, i, barrier, oid)) {
+                skip_filling[i] = true;
+                any_filling_skip = true;
+            }
+        }
+    }
     if (expect) {
         o->g = *expect;
     } else { /* the geometry from the first header found (positions are placed whatever k' is: E9) */
@@ -1569,13 +1775,15 @@ static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         for (unsigned i = 0; i < v.nstripe; i++) {
             if (positions != 0 && !(positions & (1u << i)))
                 continue;
+            if (skip_filling[i])
+                continue;
             probe_nodes[nprobe] = o->node[i];
             probe_pos[nprobe] = i;
             nprobe++;
         }
         if (nprobe == 0) {
             p_obj_close(o);
-            return TSDB_ERR_CORRUPT;
+            return any_filling_skip ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
         }
         fan *f = fan_new(p->cp, o->volume, o->epoch, probe_nodes, nprobe);
         if (!f) {
@@ -1589,17 +1797,20 @@ static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         ask a[CHUNK_POS_MAX];
         fan_run(f, 1, 0, false, a, CHUNK_ST_DOWN);
         int st[CHUNK_POS_MAX];
+        unsigned nst = 0;
         bool found = false;
         for (unsigned j = 0; j < nprobe; j++) {
-            st[j] = a[j].st;
+            st[nst++] = a[j].st;
             if (a[j].st == CHUNK_ST_OK && !found) {
                 o->g = a[j].g;
                 found = true;
             }
         }
         if (!found) {
+            if (any_filling_skip && nst < CHUNK_POS_MAX)
+                st[nst++] = CHUNK_ST_DOWN;
             p_obj_close(o);
-            return none_ok(st, nprobe);
+            return none_ok(st, nst);
         }
     }
     o->npos = chunk_npos(&o->g);
@@ -1613,6 +1824,10 @@ static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     for (unsigned i = 0; i < o->npos; i++) {
         if (positions != 0 && !(positions & (1u << i))) {
             o->st[i] = CHUNK_ST_UNWRITTEN; /* E10: known erasure, never asked */
+            continue;
+        }
+        if (skip_filling[i]) {
+            o->st[i] = CHUNK_ST_DOWN; /* R9 (D10): unfilled on B with prev unavailable: erasure, never ask B */
             continue;
         }
         if (cp_peer_is_avoid(o->node[i], false)) {
@@ -1673,10 +1888,16 @@ static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *ex
     return 0;
 }
 
+static int p_obj_open_pos(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
+                          uint32_t positions, cold_obj **out)
+{
+    return p_obj_open_ver(ctx, oid, expect, rec_sums, positions, 0, out);
+}
+
 static int p_obj_open(void *ctx, const uint8_t oid[16], const chunk_geom *expect, const uint64_t *rec_sums,
                       cold_obj **out)
 {
-    return p_obj_open_pos(ctx, oid, expect, rec_sums, 0, out);
+    return p_obj_open_ver(ctx, oid, expect, rec_sums, 0, 0, out);
 }
 
 static int p_obj_read(cold_obj *o, uint64_t off, uint64_t len, void *buf, unsigned flags, chunk_report *rep)
@@ -2094,6 +2315,263 @@ static void p_note_missing(void *ctx, const uint8_t oid[16], unsigned pos)
         p->cp->note_missing(p->volume, oid, pos);
 }
 
+/* ---------------------------------------------------------------- R9 MK_GC position release (D12) */
+static int cp_oid_cmp(const void *a, const void *b) { return memcmp(a, b, 16); }
+
+static bool cp_vuuid_zero(const uint8_t u[16])
+{
+    for (int i = 0; i < 16; i++)
+        if (u[i])
+            return false;
+    return true;
+}
+
+/* Paginates CS_OP_LIST on `node` and collects sorted, deduplicated oids held at `(p->volume, pos)`. */
+static int list_node_pos_oids(pctx *p, uint32_t node, unsigned pos, bool ok_only, uint8_t (**oids_out)[16],
+                              size_t *n_out)
+{
+    *oids_out = NULL;
+    *n_out = 0;
+    uint8_t (*v)[16] = NULL;
+    size_t nv = 0, cap = 0;
+    bool has = false, more = true;
+    uint8_t coid[16] = {0};
+    unsigned cpos = 0;
+    int rc = 0;
+    while (more && rc == 0) {
+        uint8_t *b = NULL;
+        size_t bn = 0;
+        uint32_t n = 0;
+        rc = list_page(p, node, has, coid, cpos, chunkpeer_test_list_max, &b, &bn, &n, &more);
+        if (rc != 0)
+            break;
+        for (uint32_t j = 0; j < n && rc == 0; j++) {
+            chunk_listed c;
+            list_entry(b + 5 + (size_t)j * CS_LIST_ENTRY, &c, NULL);
+            memcpy(coid, c.oid, 16);
+            cpos = c.pos;
+            has = true;
+            if (c.pos != pos)
+                continue;
+            bool match = ok_only ? (c.status == CHUNK_ST_OK && memcmp(c.vuuid, p->vuuid, 16) == 0)
+                                 : (memcmp(c.vuuid, p->vuuid, 16) == 0 ||
+                                    (c.status != CHUNK_ST_OK && cp_vuuid_zero(c.vuuid)));
+            if (!match)
+                continue;
+            if (nv == cap) {
+                size_t ncap = cap ? cap * 2 : 32;
+                uint8_t (*nvp)[16] = realloc(v, ncap * 16);
+                if (!nvp) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                v = nvp;
+                cap = ncap;
+            }
+            memcpy(v[nv++], c.oid, 16);
+        }
+        free(b);
+        if (n == 0)
+            break;
+    }
+    if (rc != 0) {
+        free(v);
+        return rc;
+    }
+    if (nv > 1) {
+        qsort(v, nv, 16, cp_oid_cmp);
+        size_t u = 1;
+        for (size_t i = 1; i < nv; i++)
+            if (memcmp(v[i], v[u - 1], 16) != 0)
+                memcpy(v[u++], v[i], 16);
+        nv = u;
+    }
+    *oids_out = v;
+    *n_out = nv;
+    return 0;
+}
+
+enum { REL_VIEW_RETRY = -1, REL_VIEW_SUPERSEDED = 0, REL_VIEW_OK = 1 };
+
+/* Checks whether `v` authorizes deleting former holder `node`'s chunks of `pos` from release version `ver`.
+ * Requires a caught-up copy, `pos` whole at `set_ver >= ver`, `node` not holding `pos`, and `node` not
+ * listed as `prev` of any filling position. Only `stripe[pos] == node` supersedes the release (so a later
+ * move B->C at V2 > V still lets A's pending release at V clean A's stale chunks once C is whole). */
+static int release_view_status(const struct chunkpeer_view *v, unsigned pos, uint32_t node, uint64_t ver)
+{
+    if (!v->caught_up || pos >= v->nstripe || v->stripe_version < ver)
+        return REL_VIEW_RETRY;
+    if (v->stripe[pos] == node)
+        return REL_VIEW_SUPERSEDED;
+    uint64_t sver = v->stripe_set_ver[pos] ? v->stripe_set_ver[pos] : v->stripe_version;
+    if (sver < ver || v->stripe_filling[pos])
+        return REL_VIEW_RETRY;
+    for (unsigned p = 0; p < v->nstripe; p++)
+        if (v->stripe_filling[p] && v->stripe_prev[p] == node)
+            return REL_VIEW_RETRY;
+    return REL_VIEW_OK;
+}
+
+static unsigned p_release_candidates(void *ctx, cold_release *out, unsigned cap)
+{
+    pctx *p = ctx;
+    struct chunkpeer_view v;
+    if (!out || cap == 0 || view_of(p, &v) != 0 || !v.caught_up)
+        return 0;
+    unsigned n = 0;
+    for (unsigned i = 0; i < v.nstripe && n < cap; i++) {
+        if (v.stripe_filling[i])
+            continue;
+        uint32_t prev = v.stripe_prev[i];
+        if (prev == 0 || prev == v.stripe[i] || !v.stripe_prev_up[i])
+            continue;
+        uint64_t ver = v.stripe_set_ver[i] ? v.stripe_set_ver[i] : v.stripe_version;
+        if (ver == 0)
+            continue;
+        if (release_view_status(&v, i, prev, ver) != REL_VIEW_OK)
+            continue;
+        out[n++] = (cold_release){.pos = i, .node = prev, .version = ver};
+    }
+    return n;
+}
+
+static int p_release_verify(void *ctx, unsigned pos, uint32_t node, uint64_t ver, const cold_live_obj *objs,
+                            size_t nobjs)
+{
+    pctx *p = ctx;
+    struct chunkpeer_view v;
+    if (view_of(p, &v) != 0)
+        return -1;
+    if (release_view_status(&v, pos, node, ver) != REL_VIEW_OK)
+        return -1;
+    uint32_t cur_holder = v.stripe[pos];
+
+    /* 1. Check whether `node` actually holds any chunk of `(volume, pos)` to release. */
+    uint8_t (*old_oids)[16] = NULL;
+    size_t nold = 0;
+    if (list_node_pos_oids(p, node, pos, false, &old_oids, &nold) != 0)
+        return -1;
+    free(old_oids);
+    if (nold == 0)
+        return 0; /* already clean */
+
+    /* 2. Check the current whole holder's CHUNK_LIST against OBJLIST (D12 / §5.4). */
+    uint8_t (*cur_oids)[16] = NULL;
+    size_t ncur = 0;
+    if (list_node_pos_oids(p, cur_holder, pos, true, &cur_oids, &ncur) != 0)
+        return -1;
+    bool all_ok = true;
+    for (size_t i = 0; i < nobjs; i++) {
+        if (pos >= objs[i].npos)
+            continue; /* E7: small object has no chunk at pos */
+        if (objs[i].stripe_version >= ver && objs[i].positions != 0 && !(objs[i].positions & (1u << pos)))
+            continue; /* E10: degraded settle after ver never wrote pos */
+        if (!cur_oids || !bsearch(objs[i].oid, cur_oids, ncur, 16, cp_oid_cmp)) {
+            char hex[33];
+            chunk_oid_hex(objs[i].oid, hex);
+            fprintf(stderr,
+                    "tsdbd: volume %" PRIu32 " pos %u: refusing release of node %" PRIu32
+                    ": current holder %" PRIu32 " CHUNK_LIST missing live object %s\n",
+                    p->volume, pos, node, cur_holder, hex);
+            all_ok = false;
+            break;
+        }
+    }
+    free(cur_oids);
+    /* Re-verify the stripe view has not changed during the two LIST RPCs. */
+    if (!all_ok || view_of(p, &v) != 0 || release_view_status(&v, pos, node, ver) != REL_VIEW_OK ||
+        v.stripe[pos] != cur_holder)
+        return -1;
+    return 1;
+}
+
+static int p_release_pos(void *ctx, unsigned pos, uint32_t node, uint64_t ver, uint64_t epoch, uint64_t mk_pos)
+{
+    pctx *p = ctx;
+    if (mk_pos == 0 || epoch == 0 || node == 0 || ver == 0)
+        return TSDB_ERR_INVALID;
+    if (!p_writable(p))
+        return TSDB_ERR_UNAVAILABLE;
+    struct chunkpeer_view v;
+    int rc = view_of(p, &v);
+    if (rc)
+        return rc;
+    if (pos >= v.nstripe)
+        return TSDB_ERR_INVALID;
+    int vst = release_view_status(&v, pos, node, ver);
+    if (vst == REL_VIEW_SUPERSEDED)
+        return 0; /* node holds pos again: retire stale release without deleting */
+    if (vst != REL_VIEW_OK)
+        return TSDB_ERR_UNAVAILABLE;
+    if (p->cp->node_state) {
+        int nst = p->cp->node_state(p->cp->view_arg, node);
+        if (nst == CP_NODE_DESTROYED)
+            return 0; /* destroyed former holder will never return: retire pending release with RELEASE_DONE */
+        if (nst == CP_NODE_DOWN)
+            return TSDB_ERR_UNAVAILABLE; /* skip without network timeout while former holder is away */
+    }
+
+    uint8_t (*oids)[16] = NULL;
+    size_t noids = 0;
+    rc = list_node_pos_oids(p, node, pos, false, &oids, &noids);
+    if (rc != 0)
+        return rc;
+
+    size_t deleted = 0;
+    for (size_t i = 0; i < noids; i++) {
+        /* Re-check the metadata copy before every delete so a concurrent STRIPE_SET(pos -> node) stops the loop. */
+        if (view_of(p, &v) != 0) {
+            free(oids);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+        vst = release_view_status(&v, pos, node, ver);
+        if (vst == REL_VIEW_SUPERSEDED) {
+            free(oids);
+            return 0;
+        }
+        if (vst != REL_VIEW_OK) {
+            free(oids);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+
+        struct cs_req r;
+        req_init(&r, CS_OP_DEL_REL, p->volume, epoch, p->vuuid, oids[i], pos);
+        r.off = ver;
+        int32_t arc = 0;
+        uint8_t *b = NULL;
+        size_t bn = 0;
+        int call_rc = p->cp->net.call(p->cp->net.arg, node, &r, timeout_of(p->cp), &arc, &b, &bn);
+        free(b);
+        int res = call_rc ? call_rc : arc;
+        if (res == CHUNK_ERR_FENCED) {
+            free(oids);
+            return CHUNK_ERR_FENCED;
+        }
+        if (res == TSDB_ERR_LOCKED) {
+            /* Target's own rel_guard refused because it holds/fills pos or stripe version moved past ver. */
+            free(oids);
+            if (view_of(p, &v) == 0 && release_view_status(&v, pos, node, ver) == REL_VIEW_SUPERSEDED)
+                return 0;
+            return TSDB_ERR_UNAVAILABLE;
+        }
+        if (res != 0 && res != TSDB_ERR_NOTFOUND) {
+            free(oids);
+            return res;
+        }
+        if (res == 0) {
+            see_fence(p, epoch);
+            deleted++;
+        }
+    }
+    free(oids);
+    if (deleted > 0)
+        fprintf(stderr,
+                "tsdbd: volume %" PRIu32 " pos %u: released %zu chunk(s) on node %" PRIu32 " (version %" PRIu64
+                ", mk_pos %" PRIu64 ")\n",
+                p->volume, pos, deleted, node, ver, mk_pos);
+    return 0;
+}
+
 static void p_free(void *ctx) { free(ctx); }
 
 const cold_ops coldops_peer = {
@@ -2119,6 +2597,10 @@ const cold_ops coldops_peer = {
     .obj_open_pos = p_obj_open_pos,
     .stripe_up_mask = p_stripe_up_mask,
     .note_missing = p_note_missing,
+    .obj_open_ver = p_obj_open_ver,
+    .release_candidates = p_release_candidates,
+    .release_verify = p_release_verify,
+    .release_pos = p_release_pos,
 };
 
 /* ---------------------------------------------------------------- in-process delivery */

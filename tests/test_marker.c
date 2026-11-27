@@ -244,10 +244,35 @@ static void test_gc_digest(void)
     }
     m.u.gc.reason = 0;
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
-    m.u.gc.reason = MK_GC_DONE + 1;
+    m.u.gc.reason = MK_GC_RELEASE_DONE + 1;
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
     m.u.gc.reason = MK_GC_ORPHAN, m.u.gc.noids = 0;
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* a GC names something */
+
+    /* R9 (D12): MK_GC_RELEASE and MK_GC_RELEASE_DONE round-trip, truncations, reserved word, invalid fields */
+    for (uint32_t reason = MK_GC_RELEASE; reason <= MK_GC_RELEASE_DONE; reason++) {
+        memset(&m, 0, sizeof m);
+        m.type = MK_GC;
+        m.u.gc = (mk_gc){.reason = reason, .noids = 0, .rel_vol = 7, .rel_pos = 3, .rel_node = 4, .rel_ver = 19};
+        CHECK(mk_encode(&m, &p, &n) == 0 && n == MK_HDR + 32);
+        CHECK(mk_decode(p, n, &d) == 0 && d.type == MK_GC && d.span == 1 && d.u.gc.reason == reason &&
+              d.u.gc.noids == 0 && d.u.gc.rel_vol == 7 && d.u.gc.rel_pos == 3 && d.u.gc.rel_node == 4 &&
+              d.u.gc.rel_ver == 19);
+        truncations(p, n, "GC_RELEASE");
+        p[MK_HDR + 20] = 1; /* reserved word */
+        CHECK(mk_decode(p, n, &d) == TSDB_ERR_CORRUPT);
+        free(p);
+    }
+    memset(&m, 0, sizeof m);
+    m.type = MK_GC;
+    m.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .noids = 1, .oids = oids, .rel_vol = 1, .rel_pos = 0, .rel_node = 2, .rel_ver = 2};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* RELEASE forbids oids */
+    m.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .noids = 0, .rel_vol = 1, .rel_pos = MK_REL_POS_MAX, .rel_node = 2, .rel_ver = 2};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* pos out of range */
+    m.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .noids = 0, .rel_vol = 1, .rel_pos = 0, .rel_node = 0, .rel_ver = 2};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* node == 0 */
+    m.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .noids = 0, .rel_vol = 1, .rel_pos = 0, .rel_node = 2, .rel_ver = 0};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* ver == 0 */
 
     memset(&m, 0, sizeof m);
     m.type = MK_DIGEST;

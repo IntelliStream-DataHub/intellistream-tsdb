@@ -77,6 +77,7 @@ static const struct {
     {"gcsuspendignored", GC_MUT_SUSPENDIGNORED},
     {"holdatretire", GC_MUT_HOLDATRET},
     {"gcreplicanoop", GC_MUT_REPLICANOOP},
+    {"releasenomark", GC_MUT_RELEASE_NOMARK},
 };
 
 static const char *mutant_name(int m)
@@ -979,17 +980,41 @@ static int child_gcmk(const char *dir)
         h_close(&x);
         return 5;
     }
-    mk d1 = {.type = MK_GC, .span = 1};
-    d1.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 2, .oids = (const uint8_t *)oids};
-    if (ecgcmk_apply(x.db, 11, &d1) != 0) {
+    mk r1 = {.type = MK_GC, .span = 1};
+    r1.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3};
+    if (ecgcmk_apply(x.db, 11, &r1) != 0) {
         h_close(&x);
         return 6;
     }
-    mk d2 = {.type = MK_GC, .span = 1};
-    d2.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 1, .oids = (const uint8_t *)&oids[2]};
-    if (ecgcmk_apply(x.db, 12, &d2) != 0) {
+    mk r2 = {.type = MK_GC, .span = 1};
+    r2.u.gc = (mk_gc){.reason = MK_GC_RELEASE, .rel_vol = 0, .rel_pos = 3, .rel_node = 8, .rel_ver = 4};
+    if (ecgcmk_apply(x.db, 12, &r2) != 0) {
         h_close(&x);
         return 7;
+    }
+    mk d1 = {.type = MK_GC, .span = 1};
+    d1.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 2, .oids = (const uint8_t *)oids};
+    if (ecgcmk_apply(x.db, 13, &d1) != 0) {
+        h_close(&x);
+        return 8;
+    }
+    mk d2 = {.type = MK_GC, .span = 1};
+    d2.u.gc = (mk_gc){.reason = MK_GC_DONE, .noids = 1, .oids = (const uint8_t *)&oids[2]};
+    if (ecgcmk_apply(x.db, 14, &d2) != 0) {
+        h_close(&x);
+        return 9;
+    }
+    mk rd1 = {.type = MK_GC, .span = 1};
+    rd1.u.gc = (mk_gc){.reason = MK_GC_RELEASE_DONE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3};
+    if (ecgcmk_apply(x.db, 15, &rd1) != 0) {
+        h_close(&x);
+        return 10;
+    }
+    mk rd2 = {.type = MK_GC, .span = 1};
+    rd2.u.gc = (mk_gc){.reason = MK_GC_RELEASE_DONE, .rel_vol = 0, .rel_pos = 3, .rel_node = 8, .rel_ver = 4};
+    if (ecgcmk_apply(x.db, 16, &rd2) != 0) {
+        h_close(&x);
+        return 11;
     }
     h_close(&x);
     return 0;
@@ -1024,6 +1049,46 @@ static void gcmk_power_case(void)
                 close(fd);
             }
             CHECK(h_open(&x, dir, 3600) == TSDB_ERR_CORRUPT);
+        }
+    }
+    /* Compaction carrying pending GCMK release records across reopen + wrong-volume rejection. */
+    {
+        char dir[PATH_MAX];
+        fresh("gpcomp", dir, sizeof dir);
+        h x;
+        CHECK(h_open(&x, dir, 3600) == 0);
+        if (x.db) {
+            mk badv = {.type = MK_GC, .span = 1,
+                       .u.gc = {.reason = MK_GC_RELEASE, .rel_vol = 99, .rel_pos = 1, .rel_node = 5, .rel_ver = 2}};
+            CHECK(ecgcmk_apply(x.db, 1, &badv) == TSDB_ERR_INVALID);
+            mk rel = {.type = MK_GC, .span = 1,
+                      .u.gc = {.reason = MK_GC_RELEASE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3}};
+            CHECK(ecgcmk_apply(x.db, 2, &rel) == 0);
+            /* Append > 64 KiB (GCMK_COMPACT_BYTES) of OID add/done pairs so compaction fires while `rel` is pending. */
+            uint8_t o[16];
+            for (uint64_t i = 0; i < 700; i++) {
+                memset(o, 0, sizeof o);
+                memcpy(o, &i, sizeof i);
+                mk a = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_ORPHAN, .noids = 1, .oids = o}};
+                mk d = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_DONE, .noids = 1, .oids = o}};
+                CHECK(ecgcmk_apply(x.db, 10 + i * 2, &a) == 0);
+                CHECK(ecgcmk_apply(x.db, 11 + i * 2, &d) == 0);
+            }
+            CHECK(ecgcmk_pending_count(x.db) == 0 && ecgcmk_pending_releases(x.db) == 1);
+            h_close(&x);
+            char gp[PATH_MAX + 32];
+            snprintf(gp, sizeof gp, "%s/db/GCMK", dir);
+            struct stat st;
+            CHECK(stat(gp, &st) == 0 && st.st_size < 16384); /* compacted well below 64 KiB */
+            CHECK(h_open(&x, dir, 3600) == 0);
+            if (x.db) {
+                CHECK(ecgcmk_pending_releases(x.db) == 1 && ecgcmk_pending_release_has(x.db, 2, 7, 3));
+                mk rd = {.type = MK_GC, .span = 1,
+                         .u.gc = {.reason = MK_GC_RELEASE_DONE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3}};
+                CHECK(ecgcmk_apply(x.db, 2000, &rd) == 0);
+                CHECK(ecgcmk_pending_releases(x.db) == 0);
+                h_close(&x);
+            }
         }
     }
     if (access(SHIM, R_OK) != 0) {
@@ -1065,10 +1130,23 @@ static void gcmk_power_case(void)
             }
             mk m = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_RETIRED, .noids = 3, .oids = (const uint8_t *)GP_OIDS}};
             CHECK(ecgcmk_apply(x.db, 10, &m) == 0);
-            CHECK(ecgcmk_pending_count(x.db) == 3);
+            mk r1 = {.type = MK_GC, .span = 1,
+                     .u.gc = {.reason = MK_GC_RELEASE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3}};
+            mk r2 = {.type = MK_GC, .span = 1,
+                     .u.gc = {.reason = MK_GC_RELEASE, .rel_vol = 0, .rel_pos = 3, .rel_node = 8, .rel_ver = 4}};
+            CHECK(ecgcmk_apply(x.db, 11, &r1) == 0);
+            CHECK(ecgcmk_apply(x.db, 12, &r2) == 0);
+            CHECK(ecgcmk_pending_count(x.db) == 3 && ecgcmk_pending_releases(x.db) == 2);
+            CHECK(ecgcmk_pending_release_has(x.db, 2, 7, 3) && ecgcmk_pending_release_has(x.db, 3, 8, 4));
             mk d = {.type = MK_GC, .span = 1, .u.gc = {.reason = MK_GC_DONE, .noids = 3, .oids = (const uint8_t *)GP_OIDS}};
-            CHECK(ecgcmk_apply(x.db, 12, &d) == 0);
-            CHECK(ecgcmk_pending_count(x.db) == 0);
+            CHECK(ecgcmk_apply(x.db, 14, &d) == 0);
+            mk rd1 = {.type = MK_GC, .span = 1,
+                      .u.gc = {.reason = MK_GC_RELEASE_DONE, .rel_vol = 0, .rel_pos = 2, .rel_node = 7, .rel_ver = 3}};
+            mk rd2 = {.type = MK_GC, .span = 1,
+                      .u.gc = {.reason = MK_GC_RELEASE_DONE, .rel_vol = 0, .rel_pos = 3, .rel_node = 8, .rel_ver = 4}};
+            CHECK(ecgcmk_apply(x.db, 15, &rd1) == 0);
+            CHECK(ecgcmk_apply(x.db, 16, &rd2) == 0);
+            CHECK(ecgcmk_pending_count(x.db) == 0 && ecgcmk_pending_releases(x.db) == 0);
             h_close(&x);
         }
     }
@@ -1128,6 +1206,15 @@ static int mj_ship(void *ctx, eng *db, const char *s, const char *n, uint64_t sz
 typedef struct mock_cops_state {
     atomic_bool suspended;
     _Atomic uint64_t copy_epoch;
+    bool rel_enable;
+    cold_release rel_cand;
+    int rel_verify_rc;
+    int rel_pos_rc;
+    atomic_int rel_pos_calls;
+    atomic_uint rel_last_pos;
+    atomic_uint rel_last_node;
+    _Atomic uint64_t rel_last_ver;
+    _Atomic uint64_t rel_last_mk_pos;
 } mock_cops_state;
 
 static mock_cops_state MC;
@@ -1147,6 +1234,32 @@ static int mc_del_gc(void *ctx, const uint8_t oid[16], unsigned pos, uint64_t ep
     if (mk_pos == 0 || epoch == 0)
         return TSDB_ERR_INVALID;
     return coldops_dir.del(ctx, oid, pos, epoch, COLD_DEL_MKGC);
+}
+static unsigned mc_release_candidates(void *ctx, cold_release *out, unsigned cap)
+{
+    (void)ctx;
+    if (!MC.rel_enable || cap == 0)
+        return 0;
+    out[0] = MC.rel_cand;
+    return 1;
+}
+static int mc_release_verify(void *ctx, uint32_t pos, uint32_t node, uint64_t ver, const cold_live_obj *objs,
+                             size_t nobjs)
+{
+    (void)ctx, (void)pos, (void)node, (void)ver, (void)objs, (void)nobjs;
+    return MC.rel_verify_rc;
+}
+static int mc_release_pos(void *ctx, uint32_t pos, uint32_t node, uint64_t ver, uint64_t epoch, uint64_t mk_pos)
+{
+    (void)ctx;
+    if (mk_pos == 0 || epoch == 0)
+        return TSDB_ERR_INVALID;
+    atomic_fetch_add(&MC.rel_pos_calls, 1);
+    atomic_store(&MC.rel_last_pos, pos);
+    atomic_store(&MC.rel_last_node, node);
+    atomic_store(&MC.rel_last_ver, ver);
+    atomic_store(&MC.rel_last_mk_pos, mk_pos);
+    return MC.rel_pos_rc;
 }
 static cold_ops MC_OPS;
 
@@ -1183,6 +1296,9 @@ static int open_cluster_leader(h *x, const char *dir, uint64_t lead_epoch, mock_
     MC_OPS = coldops_dir;
     MC_OPS.del_gc = mc_del_gc;
     MC_OPS.gc_suspended = mc_suspended;
+    MC_OPS.release_candidates = mc_release_candidates;
+    MC_OPS.release_verify = mc_release_verify;
+    MC_OPS.release_pos = mc_release_pos;
     atomic_store(&MC.copy_epoch, lead_epoch);
     char dbp[PATH_MAX + 8], spec[8192];
     snprintf(dbp, sizeof dbp, "%s/db", dir);
@@ -1456,9 +1572,78 @@ static void cluster_gc_case(void)
             h_close(&x);
         }
     }
+
+    /* 6. MK_GC_RELEASE: verify-before-release, commit gate, durable GCMK persistence across reopen/failover
+     * (kills releasenomark). */
+    {
+        char dir[PATH_MAX], name[96];
+        uint8_t oid[16];
+        fresh("cg_rel", dir, sizeof dir);
+        make_cluster_dir(dir);
+        mock_jr mj = {0};
+        struct jr_ops jops = {0};
+        h x = {0};
+        atomic_store(&MC.suspended, false);
+        MC.rel_enable = true;
+        MC.rel_cand = (cold_release){.pos = 2, .node = 7, .version = 3};
+        MC.rel_verify_rc = -1; /* holder NOT whole / missing objects */
+        MC.rel_pos_rc = 0;
+        atomic_store(&MC.rel_pos_calls, 0);
+        CHECK(open_cluster_leader(&x, dir, 2, &mj, &jops) == 0);
+        if (x.db) {
+            write_day(x.db, 0);
+            settle_day(&x, 0, oid, name);
+            /* 6a: release_verify fails -> must NOT emit MK_GC_RELEASE and must NOT call release_pos. */
+            ecgc_tier_work(x.t);
+            CHECK(atomic_load(&MC.rel_pos_calls) == 0); /* fails with releasenomark! */
+            CHECK(ecgcmk_pending_releases(x.db) == 0);
+            /* 6b: release_verify succeeds, but commit is withheld -> must NOT call release_pos. */
+            MC.rel_verify_rc = 1;
+            atomic_store(&mj.withhold_commit, true);
+            ecgc_tier_work(x.t);
+            CHECK(atomic_load(&MC.rel_pos_calls) == 0); /* fails with releasenomark / gcuncommitted! */
+            CHECK(ecgcmk_pending_releases(x.db) == 0);
+            h_close(&x);
+        }
+        /* 6c: commit succeeds, release_pos fails transiently -> persists in GCMK across reopen, then finishes. */
+        memset(&mj, 0, sizeof mj);
+        MC.rel_verify_rc = 1;
+        MC.rel_pos_rc = TSDB_ERR_UNAVAILABLE;
+        atomic_store(&MC.rel_pos_calls, 0);
+        CHECK(open_cluster_leader(&x, dir, 3, &mj, &jops) == 0);
+        if (x.db) {
+            ecgc_tier_work(x.t);
+            CHECK(atomic_load(&MC.rel_pos_calls) == 1);
+            CHECK(ecgcmk_pending_releases(x.db) == 1);
+            CHECK(ecgcmk_pending_release_has(x.db, 2, 7, 3));
+            h_close(&x);
+        }
+        memset(&mj, 0, sizeof mj);
+        MC.rel_enable = false; /* must resume strictly from durable GCMK */
+        MC.rel_pos_rc = 0;
+        atomic_store(&MC.rel_pos_calls, 0);
+        atomic_store(&MC.rel_last_pos, 0);
+        atomic_store(&MC.rel_last_node, 0);
+        atomic_store(&MC.rel_last_ver, 0);
+        atomic_store(&MC.rel_last_mk_pos, 0);
+        CHECK(open_cluster_leader(&x, dir, 4, &mj, &jops) == 0);
+        if (x.db) {
+            CHECK(ecgcmk_pending_releases(x.db) == 1);
+            CHECK(ecgcmk_pending_release_has(x.db, 2, 7, 3));
+            ecgc_tier_work(x.t);
+            CHECK(atomic_load(&MC.rel_pos_calls) == 1);
+            CHECK(atomic_load(&MC.rel_last_pos) == 2);
+            CHECK(atomic_load(&MC.rel_last_node) == 7);
+            CHECK(atomic_load(&MC.rel_last_ver) == 3);
+            CHECK(atomic_load(&MC.rel_last_mk_pos) > 0);
+            CHECK(ecgcmk_pending_releases(x.db) == 0);
+            h_close(&x);
+        }
+    }
+    MC.rel_enable = false;
     atomic_store(&ecgc_test_orphan_grace_ms, -1);
     meta_cluster_open_allow(false);
-    printf("  cluster_gc: uncommitted gate, WAL log scan, gc_suspended, replica apply, FENCED + r8f F4 OK\n");
+    printf("  cluster_gc: uncommitted gate, WAL log scan, gc_suspended, replica apply, FENCED + r8f F4, MK_GC_RELEASE OK\n");
 }
 
 static void run(void)

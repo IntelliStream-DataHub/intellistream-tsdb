@@ -886,6 +886,14 @@ static void test_version_change_mid_object(void)
           "verchg: live sfill_get_progress mismatch (n=%u done=%" PRIu64 " total=%" PRIu64 " want=%" PRIu64 ")", npr,
           pr.bytes_done, pr.bytes_total, fs.objs[0].pos_len[2]);
 
+    /* While blocked mid-fill (0 of 2 objects finished), whole MUST remain 0 (catches wholeearly). */
+    struct sfill_report mid_rep[4];
+    uint32_t mid_n = sfill_report(sf, mid_rep, 4);
+    CHECK(mid_n == 1 && mid_rep[0].whole == 0,
+          "verchg: reported whole=%u before all objects finished (done=%" PRIu64 "/%" PRIu64 ")",
+          mid_n ? mid_rep[0].whole : 99u, (uint64_t)(mid_n ? mid_rep[0].done : 0),
+          (uint64_t)(mid_n ? mid_rep[0].total : 0));
+
     /* Bump stripe_version to 3 while worker is in-flight on V=2, then unblock the read! */
     cfg.stripe_version = 3;
     CHECK(sfill_start(sf, &cfg) == 0, "verchg: sfill_start V=3");

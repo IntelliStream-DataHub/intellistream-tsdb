@@ -170,13 +170,25 @@ typedef struct mk_cold_obj {
     uint32_t rec_len; /* 1 .. MK_REC_MAX */
 } mk_cold_obj;
 
-/* GC (R8, E14, D13): chunks of these objects go (retired objects, orphans), or their deletion is done everywhere and
- * the pending-delete list forgets them */
-enum mk_gc_reason { MK_GC_RETIRED = 1, MK_GC_ORPHAN = 2, MK_GC_DONE = 3 };
+/* GC (R8, E14, D13; R9 D12): chunks of these objects go (retired objects, orphans), their deletion is done everywhere
+ * and the pending-delete list forgets them, or a released stripe position on a former holder goes (MK_GC_RELEASE /
+ * MK_GC_RELEASE_DONE: {rel_vol, rel_pos, rel_node, rel_ver}). */
+#define MK_REL_POS_MAX 32u /* matches CHUNK_POS_MAX / META_STRIPE_MAX */
+enum mk_gc_reason {
+    MK_GC_RETIRED = 1,
+    MK_GC_ORPHAN = 2,
+    MK_GC_DONE = 3,
+    MK_GC_RELEASE = 4,
+    MK_GC_RELEASE_DONE = 5,
+};
 typedef struct mk_gc {
-    uint32_t reason; /* enum mk_gc_reason */
-    uint32_t noids;  /* at most MK_FILES_MAX */
+    uint32_t reason;     /* enum mk_gc_reason */
+    uint32_t noids;      /* RETIRED/ORPHAN/DONE: 1..MK_FILES_MAX; RELEASE/RELEASE_DONE: 0 */
     const uint8_t *oids; /* noids x MK_OID bytes */
+    uint32_t rel_vol;    /* MK_GC_RELEASE / MK_GC_RELEASE_DONE: volume number */
+    uint32_t rel_pos;    /* MK_GC_RELEASE / MK_GC_RELEASE_DONE: stripe position (< MK_REL_POS_MAX) */
+    uint32_t rel_node;   /* MK_GC_RELEASE / MK_GC_RELEASE_DONE: released member id (> 0) */
+    uint64_t rel_ver;    /* MK_GC_RELEASE / MK_GC_RELEASE_DONE: stripe_version since which node left pos (> 0) */
 } mk_gc;
 
 /* DIGEST (R8, E26, D7): the leader's logical digest of key `key` as of Z, over the objects named: the visible rows

@@ -422,9 +422,15 @@ cgroup, so `nice` does not keep your work out of its way.
   records pending oids in the durable checksummed `GCMK` file (48-byte offset-bound xxh64 records, torn tail cut,
   compacted via `GCMK.tmp` + `tsdb_fdatasync` + `rename` + dir fsync), unlinks `retired_` names with directory fsync,
   and clears `GCMK` + lingering `retired_` entries on `MK_GC_DONE`; a promoted leader drains pending oids from `GCMK`.
+  R9 (r9-whole, D12) adds `MK_GC` reasons `MK_GC_RELEASE` (4) and `MK_GC_RELEASE_DONE` (5) carrying a 32-byte release
+  body `{volume, pos, node, version}` with `noids == 0` and corresponding `GCMK` ops `GCMK_OP_REL_ADD` (3) /
+  `GCMK_OP_REL_DONE` (4): once a replacement holder is whole (its `CHUNK_LIST` verified against `OBJLIST` on a caught-up
+  copy), the leader commits `MK_GC_RELEASE` (`CP_RELEASE_GC`), issues guarded `CS_OP_DEL_REL` (verifying `caught_up`,
+  whole state, exact `set_ver`, and server-side `rel_guard` before every delete), and commits `MK_GC_RELEASE_DONE`.
   `tests/test_ecgc.c` (mutants `gcunlinkfirst gcunrefleak gcnohold sweeplive sweepinflight sweepforeign unlistednoop
-  noretrytimer gcuncommitted gcnamedorphan gcsuspendignored holdatretire gcreplicanoop`), `test_cluster ecgc`, and
-  `make ecgc-mutants` (`gcsuspendignored gcreplicanoop`).
+  noretrytimer gcuncommitted gcnamedorphan gcsuspendignored holdatretire gcreplicanoop releasenomark`), `test_cluster ecgc`,
+  `test_cluster ecwhole`, `make ecgc-mutants` (`gcsuspendignored gcreplicanoop`), and `make whole-mutants`
+  (`wholeearly releasenomark readfromfilling`).
 - `src/snapshot.[ch]` (R4 D3, D4; design-cluster.md 5.2-5.3, 8.1): the make side of a leader's snapshot. `snap_make`
   takes the cut P (the commit point) under `flush_lock` then `publish_lock` with no I/O (the part list, the memtables'
   segments and S, RSTATE, the COMMIT markers' files), releases both, hard links every part before it reads any (by its
@@ -595,9 +601,14 @@ cgroup, so `nice` does not keep your work out of its way.
   `MK_GC` position (`mk_pos > 0`); `see_epoch` / `writable` re-check unfenced or unsure members at most once a second.
   Epoch provider: `coldvol.lead_epoch` when leading (set at attach and `wal_open`, so a deposed leader with a current
   copy still puts/deletes at its own epoch and is fenced), else `chunkpeer_epoch` (copy's epoch); `chunkpeer_epoch_source`
-  answers only while `cluster_copy_caught_up_at()`. `chunksrv_cluster_hold`/`release` guard shutdown. `tests/test_chunkpeer.c`
-  (mutants `ownepoch nosumcmp staleraise delbeforegc sticky unsuredown`), `test_cluster ecbasic|ec16`,
-  `make chunkpeer-mutants` (`ownepoch staleraise`).
+  answers only while `cluster_copy_caught_up_at()`. `chunksrv_cluster_hold`/`release` guard shutdown. R9 (r9-whole, D10)
+  adds `obj_open_ver` (reads pre-barrier `< V` objects at a `FILLING` position from UP `prev` A, else treats as
+  `CHUNK_ST_DOWN` erasure unless B reported the object filled for `(pos, set_ver)`; `eccache_reopen_vol` and filled-table
+  purge run on stripe transitions), `CS_OP_DEL_REL` with server-side `cp_rel_guard`, and `CP_WHOLE_PROPOSED` /
+  `CP_RELEASE_GC`. `tests/test_chunkpeer.c`
+  (mutants `ownepoch nosumcmp staleraise delbeforegc sticky unsuredown hedgeall noavoid hedgecorrupt readfromfilling`),
+  `tests/test_sfill.c` (mutants `fillnocheck fillfewerk fillsurvivortrust wholeearly`), `test_cluster ecbasic|ec16|ecwhole`,
+  `make chunkpeer-mutants` (`ownepoch staleraise`), and `make whole-mutants` (`wholeearly releasenomark readfromfilling`).
 - `src/ecdiverge.[ch]` (R8 r8i; D8, D23, E26): durable `DIVERGED` file in the volume directory (48-byte offset-bound
   xxh64 records, torn tail cut after `tail_confirm`, damage fails open, `fdatasync` + `eng_sync_dir` on first record
   before `db->diverged` is visible, fail-stop on write/sync error), read by `ecdiverge_open` before any engine thread

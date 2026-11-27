@@ -43,6 +43,10 @@ int eccold_settle(struct eng *db, int64_t key, struct part **pin, size_t np, str
 /* The COLD being carried out by ec_swap_commit on this engine, for r8h's swap hooks (the same thread): its marker
  * position, key and cut. false when no settle of this engine is between its marker and the end of its swap. */
 bool eccold_swap_cur(struct eng *db, uint64_t *pos, int64_t *key, uint64_t *z);
+/* R9 (r9-whole, D10): stripe_version of an in-flight settle between its pre-MK_COLD stripe check and the end of
+ * ec_swap_commit (0 when none). Paired with cp_objlist_srv's stripe_version >= max_version check via seq_cst so no
+ * settle at version < V can commit unseen by OBJLIST(max_version = V). */
+uint64_t eccold_active_sv(const struct eng *db);
 
 #define ECCOLD_FORCE_S_DEFAULT 3600   /* tier_settings.force_s 0 */
 #define ECCOLD_WAIT_MAX_S_DEFAULT 600 /* tier_settings.wait_max_s 0 */
