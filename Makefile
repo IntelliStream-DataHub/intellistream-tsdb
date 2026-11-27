@@ -798,9 +798,12 @@ fuzz-replay-asan: $(FUZZ_V4_CHECK:%=$(FUZZ_B)/fuzz-%)
 	for h in $(FUZZ_V4_CHECK); do FUZZ_TMP=$(SCRATCH) ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0 \
 	    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(FUZZ_B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 
-# writes each harness's generated seeds into tests/fuzz/corpus/<harness>/ (after a format change)
+# writes each harness's generated seeds into tests/fuzz/corpus/<harness>/ (after a format change); a harness without
+# seeds (exit 2, "no seeds": diverge) is passed over. Inputs that hold a time (WAL records, users, export streams)
+# come out different on every run: keep only what the change made different.
 fuzz-seeds: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
-	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(SCRATCH) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h || exit 1; done
+	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(SCRATCH) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h; \
+	    rc=$$?; [ $$rc = 0 ] || [ $$rc = 2 ] || exit 1; done
 
 endif
 fuzz-v4-check:
