@@ -70,7 +70,8 @@ typedef struct tier {
     struct eccache_tier *cache;   /* r7-seam: the granule cache and the open objects (src/eccache.c) */
     struct ecgc_tier *gc;         /* r7-gc: the delete queue the settle thread works (src/ecgc.c) */
     struct ecsettle_tier *settle; /* r7-settle: the settle thread (src/settle.c) */
-    _Atomic(struct tier_health *) health; /* r15-health: probes & attach worker (freed only in tier_put) */
+    _Atomic(struct tier_health *) health; /* r15-health: probes & domain hooks (freed only in tier_put) */
+    _Atomic(struct tierctl *) ctl;        /* r15-lost: single tier worker, TIERS re-read, paced rebuild */
     /* r7-tier: the backend over cfg.dirs, opened once by tier_open (chunk_be_open2, min_up = stores - m) and closed by
      * the last tier_put: a store flocks its directory, so one backend per engine would make the second volume BUSY.
      * halted: settles and chunk deletes are paused while any store is not UP (cleared when all stores return to UP,
@@ -156,13 +157,25 @@ void tier_resume_if_all_up(tier *t);
 void tier_health_domain_state(tier *t, int store, bool down);
 void tier_health_test_opts(int stall_ms, int every_ms, int ok_need, int fast_ms);
 extern atomic_uint_fast64_t tier_health_attach_attempts;
+/* R15 (r15-lost): tier_health <-> tierctl single-worker coordination */
+struct chunk_heal_opts;
+void tier_health_set_wake(tier *t, void (*fn)(void *), void *ctx);
+bool tier_health_take_reopen(tier *t);
+bool tier_health_has_pending(tier *t);
+bool tier_health_run_one(tier *t, const struct chunk_heal_opts *ho_tpl, int64_t *wait_ms_out);
+bool tier_health_any_settling(tier *t);
+int tier_health_live_oids(tier *t, uint8_t (**oids_out)[16], size_t *n_out, bool *complete_out);
+void tier_health_store_lost(tier *t, int store);
+void tier_health_store_replaced(tier *t, int store, const char *new_path, const uint8_t new_id[16]);
+int tier_health_store_added(tier *t, int store, const char *path, const uint8_t id[16], bool active);
 
 /* r8b-coldops (E22). A volume's settings: the tier's configuration on a single server (tier_settings_from_cfg); r8f
  * gives a cluster volume its own from tsdbd's keys (D22). cache_mb is the tier's (one cache per handle), read only by
- * tier_open. */
+ * tier_open. Live-updatable TIERS fields are atomic so tierctl's TIERS re-read never races with settle/ecpolicy. */
 typedef struct tier_settings {
-    int k, m;
-    int64_t grace_s, keep_s, coarse_s;
+    _Atomic int k, m;
+    _Atomic uint32_t km_packed; /* (k << 16) | m: single atomic word for tear-free live redundancy updates */
+    _Atomic int64_t grace_s, keep_s, coarse_s;
     uint64_t cache_mb;
     bool eager;
     /* r8g-cut, a cluster leader's settle (src/eccold.c; ec.settle_force_s, ec.settle_wait_max_s): how long past
@@ -172,13 +185,31 @@ typedef struct tier_settings {
     int64_t force_s, wait_max_s;
     /* R15 (r15-open, D6, D7, D12, D16, D20): settings from TIERS (from_tiers false when not opened from TIERS). */
     bool from_tiers;
-    uint64_t tier_after_s;
-    uint32_t tier_high_pct;
-    uint32_t young_high_pct;
-    uint32_t rebuild_mb_s;
-    uint32_t scrub_mb_s;
-    uint32_t scrub_days;
+    _Atomic uint64_t tier_after_s;
+    _Atomic uint32_t tier_high_pct;
+    _Atomic uint32_t young_high_pct;
+    _Atomic uint32_t rebuild_mb_s;
+    _Atomic uint32_t scrub_mb_s;
+    _Atomic uint32_t scrub_days;
 } tier_settings;
+static inline void tier_settings_set_km(tier_settings *s, int k, int m)
+{
+    uint32_t packed = ((uint32_t)(uint16_t)k << 16) | (uint32_t)(uint16_t)m;
+    atomic_store_explicit(&s->km_packed, packed, memory_order_release);
+    atomic_store_explicit(&s->k, k, memory_order_relaxed);
+    atomic_store_explicit(&s->m, m, memory_order_relaxed);
+}
+static inline void tier_settings_get_km(const tier_settings *s, int *k_out, int *m_out)
+{
+    uint32_t packed = atomic_load_explicit(&((tier_settings *)s)->km_packed, memory_order_acquire);
+    if (packed != 0) {
+        *k_out = (int)(packed >> 16);
+        *m_out = (int)(packed & 0xffffu);
+    } else {
+        *k_out = atomic_load_explicit(&((tier_settings *)s)->k, memory_order_relaxed);
+        *m_out = atomic_load_explicit(&((tier_settings *)s)->m, memory_order_relaxed);
+    }
+}
 void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s);
 
 /* The epoch provider of an attached volume: the epoch every put and delete of the volume carries and the one an unsure

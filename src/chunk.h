@@ -60,7 +60,8 @@
 /* What a chunk (or a cell of one) is, as a reader found it. */
 enum { CHUNK_ST_OK = 0, CHUNK_ST_ABSENT, CHUNK_ST_DAMAGED, CHUNK_ST_IOERR, CHUNK_ST_VIRTUAL /* zero padding */,
        CHUNK_ST_DOWN /* the chunk's store is not UP: it may well be there, and it comes back with the store (E15) */,
-       CHUNK_ST_UNWRITTEN /* E10: known erasure from a degraded settle: never requested, never CORRUPT */ };
+       CHUNK_ST_UNWRITTEN /* E10: known erasure from a degraded settle: never requested, never CORRUPT */,
+       CHUNK_ST_LOST /* E15: the chunk's store was declared permanently LOST (never coming back) */ };
 
 /* ---------------------------------------------------------------- geometry */
 typedef struct chunk_geom {
@@ -311,6 +312,17 @@ typedef struct chunk_heal_opts {
     /* Optional: non-zero aborts a multi-object heal/settle promptly (returns TSDB_ERR_STOPPED), e.g., on shutdown. */
     int (*cancel)(void *ctx);
     void *cancel_ctx;
+    /* Optional (R15 D20): checked between objects/volumes only (never mid-object) to yield for higher-priority work
+     * such as TIERS re-reads or health attaches without discarding an in-progress chunk; returns TSDB_ERR_STOPPED. */
+    int (*yield)(void *ctx);
+    void *yield_ctx;
+    /* Optional (R15 D20): rate-limiting and progress hook called with chunk bytes just processed. */
+    void (*pace)(void *ctx, uint64_t bytes_done);
+    void *pace_ctx;
+    /* Optional (R15 D9): invoked right before chunk_be_settle promotes a REPLACING store to UP (e.g., to remove its
+     * durable REBUILDING marker and fsync). Non-zero leaves the store REPLACING and is returned. */
+    int (*before_up)(void *ctx, int store);
+    void *before_up_ctx;
 } chunk_heal_opts;
 
 typedef struct chunk_heal_report {

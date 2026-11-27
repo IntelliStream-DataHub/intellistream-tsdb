@@ -725,7 +725,9 @@ static int settle_put_as(eng *db, part *p, ec_record *r, uint64_t *epoch_out, ui
     if (!cv)
         return TSDB_ERR_UNAVAILABLE;
     chunk_geom g;
-    int rc = chunk_geom_derive(&g, (unsigned)cv->set.k, (unsigned)cv->set.m, p->map_len);
+    int sk = 0, sm = 0;
+    tier_settings_get_km(&cv->set, &sk, &sm);
+    int rc = chunk_geom_derive(&g, (unsigned)sk, (unsigned)sm, p->map_len);
     if (rc)
         return rc;
     uint64_t epoch = coldvol_epoch(cv); /* the volume's provider (D4: 1 on a single server) */

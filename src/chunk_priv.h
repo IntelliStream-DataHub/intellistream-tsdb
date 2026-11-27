@@ -49,10 +49,12 @@ void chunk_rpool_destroy(chunk_rpool *p);
 
 /* A backend's stores (chunkstore.c) as the heal code (chunkheal.c) needs them. */
 struct chunk_backend {
-    int n;
+    atomic_int n;
+    int cap;                     /* allocated slots (>= n; fixed across runtime store additions for lock-free reads) */
     _Atomic(chunk_store *) *st;  /* NULL while DOWN; guarded by st_mu for swaps and ref acquisition */
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */
     atomic_bool *st_failed;      /* mirrors chunk_store_failed(st[i]) for lock-free chunk_be_store_state() */
+    atomic_bool *st_lost;        /* R15 E15: true iff slot i was declared permanently LOST in TIERS */
     chunk_store **pending_close; /* stores detached by chunk_be_set_down: unreffed on attach worker or close, never on
                                   * health/monitor/reader threads where close() on a hung NFS mount could block */
     char **path;                 /* what each index was opened or attached at (for messages; guarded by st_mu) */
@@ -74,6 +76,27 @@ struct chunk_backend {
     pthread_cond_t ioerr_cv;
     atomic_uint put_max_pct;     /* R15 D7: >0 caps regular puts at this fs % (single-server tiers: 95; 0: off) */
 };
+/* R15 (r15-lost): LOST marking, open-as-REPLACING, runtime store additions, and pre-initialized replacement rebuild. */
+void chunk_be_set_lost(chunk_backend *be, int i, bool lost);
+bool chunk_be_store_is_lost(const chunk_backend *be, int i);
+int chunk_be_mark_lost(chunk_backend *be, int i);
+int chunk_be_set_replacing(chunk_backend *be, int i);
+int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expect_id, const uint8_t *expect_db,
+                       bool replacing);
+int chunk_be_add_lost(chunk_backend *be, const char *path);
+int chunk_be_fence_store(chunk_backend *be, int index);
+int chunk_be_replace_open(chunk_backend *be, int index, const char *new_path, const uint8_t expect_id[16],
+                          const uint8_t *expect_db, const chunk_heal_opts *o, chunk_heal_report *rep);
+#ifdef TSDB_TEST_HOOKS
+int chunk_be_promote_up_norebuild(chunk_backend *be, int index, const char *new_path, const uint8_t expect_id[16],
+                                  const uint8_t *expect_db, const chunk_heal_opts *o);
+#endif
+int chunk_be_volumes_list(chunk_backend *be, uint32_t **out, size_t *nout);
+/* Placement for an explicit store count `n`, and inference of an object's original store count from observed
+ * (store, pos) chunks so objects written before `tier add` still map missing positions to their true stores. */
+int chunk_be_place_n(const uint8_t oid[16], unsigned pos, int n);
+int chunk_be_infer_place_n(const chunk_backend *be, const uint8_t oid[16], unsigned np, const int *obs_store,
+                           const unsigned *obs_pos, size_t nobs, int target_store);
 /* Reference counting on chunk_store: chunk_store_open returns 1 ref; chunk_store_close is chunk_store_unref. */
 chunk_store *chunk_store_ref(chunk_store *st);
 void chunk_store_unref(chunk_store *st);
@@ -130,5 +153,6 @@ int chunk_encode_stripe(const chunk_geom *g, uint64_t s, const uint8_t *stripe, 
 const uint64_t *chunk_obj_pos_sums(const chunk_obj *o, unsigned pos);
 int chunk_obj_pos_status(const chunk_obj *o, unsigned pos);
 uint64_t chunk_obj_epoch(const chunk_obj *o);
+int chunk_obj_place_n(const chunk_obj *o);
 
 #endif

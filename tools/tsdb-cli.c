@@ -12,6 +12,7 @@
 #include "../src/disk.h"
 #include "../src/ecdiverge.h"
 #include "../src/ecunsettle.h"
+#include "../src/tierctl.h"
 #include "../src/tiers.h"
 #include "tsdb_calendar.h"
 
@@ -2402,34 +2403,70 @@ static int cmd_tier_set(const char *dir, int argc, char **argv)
 
 static int cmd_tier_lost(const char *dir, int argc, char **argv)
 {
-    (void)dir;
-    const char *store = NULL, *replace_path = NULL;
+    const char *store = NULL, *replace_arg = NULL;
     bool shrink = false;
+    uint32_t flags = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
-            if (replace_path)
+            if (replace_arg)
                 return tier_usage();
-            replace_path = argv[++i];
-            if (!*replace_path)
+            replace_arg = argv[++i];
+            if (!*replace_arg)
                 return tier_usage();
         } else if (strcmp(argv[i], "--shrink") == 0) {
             shrink = true;
+        } else if (strcmp(argv[i], "--allow-shared-device") == 0) {
+            flags |= TSDB_TIER_ALLOW_SHARED_DEV;
+        } else if (strcmp(argv[i], "--single-copy") == 0) {
+            flags |= TSDB_TIER_SINGLE_COPY;
         } else if (!store && argv[i][0] != '-') {
             store = argv[i];
         } else {
             return tier_usage();
         }
     }
-    if (!store || !*store || (replace_path != NULL) == shrink) {
+    if (!store || !*store || (replace_arg != NULL) == shrink) {
         fprintf(stderr, "tsdb: tier lost: specify STORE and exactly one of --replace PATH or --shrink\n");
         return tier_usage();
     }
+    if (shrink) {
 #ifndef TSDB_EC
-    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
+        fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
 #else
-    fprintf(stderr, "tsdb: tier lost: not built\n");
+        fprintf(stderr, "tsdb: tier lost: --shrink: not built\n");
 #endif
-    return 2;
+        return 2;
+    }
+#ifndef TSDB_EC
+    (void)dir;
+    (void)flags;
+    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
+    return 1;
+#else
+    char pathbuf[PATH_MAX];
+    const char *cls = NULL;
+    uint8_t cls_val = TSDB_TIER_CLASS_UNKNOWN;
+    int prc = tier_parse_path_class(replace_arg, pathbuf, sizeof pathbuf, &cls, &cls_val);
+    if (prc != 0)
+        return prc;
+    if (pathbuf[0] != '/') {
+        fprintf(stderr, "tsdb: tier lost: %s: store path must be absolute\n", pathbuf);
+        return 1;
+    }
+    uint8_t new_id[16];
+    int slot = -1;
+    int rc = tierctl_lost_dir(dir, store, pathbuf, cls, flags, new_id, &slot);
+    if (rc != 0) {
+        fprintf(stderr, "tsdb: tier lost %s: %s\n", store, tsdb_strerror(rc));
+        return 1;
+    }
+    char hex[33], canon[PATH_MAX];
+    chunk_oid_hex(new_id, hex);
+    const char *shown = realpath(pathbuf, canon) ? canon : pathbuf;
+    printf("tier store %d replaced by %s: id %s (rebuild will run in the writer or when the database is next opened)\n",
+           slot, shown, hex);
+    return 0;
+#endif
 }
 
 static int cmd_tier_salvage(const char *dir, int argc, char **argv)
@@ -2567,7 +2604,9 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         vol_paths[i + 1] = extra_vols[i];
 
     bool all_sc = nstores > 0;
-    size_t n_up = 0, n_down = 0, n_lost = 0;
+    size_t n_up = 0, n_down = 0, n_lost = 0, n_replacing = 0;
+    int rb_store = -1;
+    uint64_t rb_bytes_done = 0, rb_bytes_est = 0;
     uint64_t total_tier_bytes = 0;
     bool any_store_partial = false;
     for (size_t i = 0; i < nstores; i++) {
@@ -2596,13 +2635,25 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             store_state[i] = "down_other_id";
             n_down++;
         } else {
-            store_state[i] = "up";
-            n_up++;
+            bool is_rb = st->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(st->path);
+            if (is_rb) {
+                store_state[i] = "replacing";
+                n_replacing++;
+            } else {
+                store_state[i] = "up";
+                n_up++;
+            }
             tier_scan_store_bytes(st->path, nvols, &store_bytes[i], vol_tier_bytes, vol_store_bytes, i, nstores,
                                   &store_partial[i]);
             if (store_partial[i])
                 any_store_partial = true;
             total_tier_bytes += store_bytes[i];
+            if (is_rb && rb_store < 0) {
+                rb_store = (int)i;
+                rb_bytes_done = store_bytes[i];
+            } else if (!is_rb && rb_bytes_est == 0 && store_bytes[i] > 0) {
+                rb_bytes_est = store_bytes[i];
+            }
             struct statvfs sv;
             if (statvfs(st->path, &sv) == 0 && sv.f_blocks > 0) {
                 uint64_t fr = sv.f_frsize ? (uint64_t)sv.f_frsize : (uint64_t)sv.f_bsize;
@@ -2657,7 +2708,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             }
         }
     }
-    int margin = have_ec_vol ? min_m - (int)(n_down + n_lost) : 0;
+    int margin = have_ec_vol ? min_m - (int)(n_down + n_lost + n_replacing) : 0;
     uint64_t settles_waiting = 0;
     uint64_t damaged_cells = 0;
 
@@ -2688,6 +2739,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         printf("  \"stores_up\": %zu,\n", n_up);
         printf("  \"stores_down\": %zu,\n", n_down);
         printf("  \"stores_lost\": %zu,\n", n_lost);
+        printf("  \"stores_replacing\": %zu,\n", n_replacing);
         printf("  \"total_tier_bytes\": %" PRIu64 ",\n", total_tier_bytes);
         printf("  \"bytes_partial\": %s,\n", any_store_partial ? "true" : "false");
         printf("  \"settings\": {\"after_s\": %" PRIu64 ", \"high_pct\": %u, \"young_high_pct\": %u, "
@@ -2697,7 +2749,12 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         printf("  \"settles_waiting\": %" PRIu64 ",\n", settles_waiting);
         fputs("  \"days_to_full\": null,\n", stdout);
         printf("  \"damaged_cells\": %" PRIu64 ",\n", damaged_cells);
-        fputs("  \"rebuild\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
+        if (rb_store >= 0)
+            printf("  \"rebuild\": {\"active\": true, \"state\": \"rebuilding\", \"store\": %d, "
+                   "\"bytes_done\": %" PRIu64 ", \"bytes_est\": %" PRIu64 "},\n",
+                   rb_store, rb_bytes_done, rb_bytes_est);
+        else
+            fputs("  \"rebuild\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
         fputs("  \"scrub\": {\"active\": false, \"state\": \"idle\"},\n", stdout);
         fputs("  \"stores\": [", stdout);
         for (size_t i = 0; i < nstores; i++) {
@@ -2750,7 +2807,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             if (v_under)
                 fputs(", \"margin\": \"underneath\"", stdout);
             else if (vactive)
-                printf(", \"margin\": %d", vm - (int)(n_down + n_lost));
+                printf(", \"margin\": %d", vm - (int)(n_down + n_lost + n_replacing));
             else
                 fputs(", \"margin\": null", stdout);
             printf(", \"after_s\": %" PRIu64 ", \"high_pct\": %u, \"bytes_by_store\": [", vs.tier_after_s,
@@ -2766,18 +2823,21 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
     } else {
         char tot_h[32];
         human((double)total_tier_bytes, tot_h, sizeof tot_h);
-        printf("tier: configured (%s, %zu store%s: %zu up, %zu down, %zu lost)\n", active ? "active" : "inactive",
+        printf("tier: configured (%s, %zu store%s: %zu up, %zu down, %zu lost", active ? "active" : "inactive",
                nstores, nstores == 1 ? "" : "s", n_up, n_down, n_lost);
+        if (n_replacing > 0)
+            printf(", %zu replacing", n_replacing);
+        puts(")");
         printf("db_id: %s\n", db_hex);
         if (active)
             printf("redundancy: %d+%d\n", gk, gm);
         else
             puts("redundancy: none (need at least 2 stores or --single-copy)");
         if (underneath) {
-            if (n_down + n_lost == 0)
+            if (n_down + n_lost + n_replacing == 0)
                 puts("margin: underneath");
             else
-                printf("margin: underneath (%zu store(s) unavailable)\n", n_down + n_lost);
+                printf("margin: underneath (%zu store(s) unavailable)\n", n_down + n_lost + n_replacing);
         } else if (have_ec_vol) {
             if (margin < 0)
                 printf("margin: %d store(s) (below redundancy, %d store(s) short)\n", margin, -margin);
@@ -2794,7 +2854,18 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
         printf("settles_waiting: %" PRIu64 "\n", settles_waiting);
         puts("days_to_full: unknown");
         printf("damage: %" PRIu64 " cell(s)\n", damaged_cells);
-        puts("rebuild: idle");
+        if (rb_store >= 0) {
+            char dh[32], eh[32];
+            human((double)rb_bytes_done, dh, sizeof dh);
+            if (rb_bytes_est > 0) {
+                human((double)rb_bytes_est, eh, sizeof eh);
+                printf("rebuild: store %d replacing (%s / %s)\n", rb_store, dh, eh);
+            } else {
+                printf("rebuild: store %d replacing (%s)\n", rb_store, dh);
+            }
+        } else {
+            puts("rebuild: idle");
+        }
         puts("scrub: idle");
         puts("stores:");
         for (size_t i = 0; i < nstores; i++) {
@@ -2829,7 +2900,7 @@ static int cmd_tier_status(const char *dir, int argc, char **argv)
             if (v_under)
                 fputs("\tmargin=underneath", stdout);
             else if (vactive)
-                printf("\tmargin=%d", vm - (int)(n_down + n_lost));
+                printf("\tmargin=%d", vm - (int)(n_down + n_lost + n_replacing));
             else
                 fputs("\tmargin=none", stdout);
             printf("\tafter=%" PRIu64 "s\thigh_pct=%u%%\n", vs.tier_after_s, vs.tier_high_pct);

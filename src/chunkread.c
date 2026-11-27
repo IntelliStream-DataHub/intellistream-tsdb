@@ -345,14 +345,15 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
         }
 #endif
         int st = r->rep->st[0];
+        bool is_lost = st == CHUNK_ST_LOST;
         bool away = st == CHUNK_ST_DOWN;
         if (!chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: stripe %llu single-copy chunk is unusable (%s): %s\n", r->src->name,
                     (unsigned long long)s,
                     st == CHUNK_ST_ABSENT ? "absent" : st == CHUNK_ST_DAMAGED ? "damaged"
-                    : st == CHUNK_ST_DOWN ? "store down" : "unreadable",
-                    away ? "unavailable while it is" : "not readable");
-        return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+                    : st == CHUNK_ST_LOST ? "store lost" : st == CHUNK_ST_DOWN ? "store down" : "unreadable",
+                    is_lost ? "data lost" : away ? "unavailable while it is" : "not readable");
+        return is_lost ? TSDB_ERR_IO : away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
 #ifndef TSDB_EC
     (void)off, (void)bad, (void)have, (void)xs, (void)ys, (void)buf;
@@ -429,7 +430,7 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
     }
     if (ngood < k) {
         unsigned absent = 0, damaged = 0, io = 0, unwritten = 0;
-        unsigned nbad = 0, down = 0;
+        unsigned nbad = 0, down = 0, lost = 0;
         for (unsigned p = 0; p < k + m; p++) {
             int pst = sts[p] ? sts[p] : (isbad[p] ? r->rep->st[p] : 0);
             if (pst)
@@ -440,14 +441,19 @@ static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool 
             unwritten += pst == CHUNK_ST_UNWRITTEN;
             /* a position whose store is merely away: the cell may be fine (E15: unavailable, never lost) */
             down += pst == CHUNK_ST_DOWN;
+            /* a position whose store was declared permanently LOST (E15: > m lost -> TSDB_ERR_IO) */
+            lost += pst == CHUNK_ST_LOST;
         }
-        bool away = ngood + down >= k;
+        bool is_lost = lost > m;
+        bool away = !is_lost && (ngood + down >= k);
         if (!chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: stripe %llu has %u good chunks of the %u it needs (%u of %u positions "
-                        "unusable: %u absent, %u damaged, %u unreadable, %u on stores that are down, %u unwritten): %s\n",
-                    r->src->name, (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io, down, unwritten,
-                    away ? "unavailable while they are" : "not readable");
-        return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+                        "unusable: %u absent, %u damaged, %u unreadable, %u on stores that are down, %u on lost "
+                        "stores, %u unwritten): %s\n",
+                    r->src->name, (unsigned long long)s, ngood, k, nbad, k + m, absent, damaged, io, down, lost,
+                    unwritten,
+                    is_lost ? "data lost" : away ? "unavailable while they are" : "not readable");
+        return is_lost ? TSDB_ERR_IO : away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
     }
     /* the buffers the decode fills: every absent data position gets one of its own (data_only=true never writes parity) */
     for (unsigned p = 0; p < k; p++)
@@ -781,6 +787,7 @@ struct chunk_obj {
     chunk_rd *rd[CHUNK_POS_MAX];
     int rd_store[CHUNK_POS_MAX];      /* store index rd[p] was opened from (-1 if none) */
     int st[CHUNK_POS_MAX];
+    atomic_int place_n;               /* inferred store count that placed this object (handles tier add) */
     const uint64_t *rec;
     char name[40];
 };
@@ -806,7 +813,8 @@ static bool obj_store_down(const chunk_backend *be, int st_idx)
 static bool obj_healthy_pos_ready(const chunk_obj *o, unsigned pos)
 {
     return pos < CHUNK_POS_MAX && atomic_load_explicit(&((chunk_obj *)o)->tried[pos], memory_order_acquire) &&
-           o->rd[pos] != NULL && !obj_store_down(o->be, o->rd_store[pos]);
+           o->rd[pos] != NULL && !chunk_be_store_is_lost(o->be, o->rd_store[pos]) &&
+           !obj_store_down(o->be, o->rd_store[pos]);
 }
 
 static chunk_backend *obj_backend(const chunk_obj *o)
@@ -845,6 +853,25 @@ static int obj_open_pos(chunk_obj *o, unsigned p, bool *have, int *worst)
     return rc;
 }
 
+static void obj_update_place_n(chunk_obj *o)
+{
+    int obs_st[CHUNK_POS_MAX];
+    unsigned obs_pos[CHUNK_POS_MAX];
+    size_t nobs = 0;
+    unsigned np = chunk_npos(&o->g);
+    for (unsigned i = 0; i < np && i < CHUNK_POS_MAX; i++) {
+        if (o->rd[i] && o->rd_store[i] >= 0) {
+            obs_st[nobs] = o->rd_store[i];
+            obs_pos[nobs] = i;
+            nobs++;
+        }
+    }
+    if (nobs > 0) {
+        int pn = chunk_be_infer_place_n(o->be, o->oid, np, obs_st, obs_pos, nobs, -1);
+        atomic_store_explicit(&o->place_n, pn, memory_order_release);
+    }
+}
+
 /* Lazily opens a deferred parity position (k .. k+m-1) on first use (degrade() or heal); lock-free once tried. */
 static void obj_ensure_pos(chunk_obj *o, unsigned pos)
 {
@@ -857,9 +884,18 @@ static void obj_ensure_pos(chunk_obj *o, unsigned pos)
         } else if (pos < chunk_npos(&o->g)) {
             bool have = true;
             (void)obj_open_pos(o, pos, &have, NULL);
-            if (!o->rd[pos] && o->st[pos] == CHUNK_ST_ABSENT &&
-                chunk_be_store_state(o->be, chunk_be_pos_store(o->be, o->oid, pos)) != CHUNK_STORE_UP)
-                o->st[pos] = CHUNK_ST_DOWN;
+            if (o->rd[pos]) {
+                obj_update_place_n(o);
+            } else if (o->st[pos] == CHUNK_ST_ABSENT || o->st[pos] == CHUNK_ST_DOWN) {
+                int pn = atomic_load_explicit(&o->place_n, memory_order_acquire);
+                int sidx = chunk_be_place_n(o->oid, pos, pn);
+                if (chunk_be_store_is_lost(o->be, sidx))
+                    o->st[pos] = CHUNK_ST_LOST;
+                else if (chunk_be_store_state(o->be, sidx) != CHUNK_STORE_UP)
+                    o->st[pos] = CHUNK_ST_DOWN;
+                else
+                    o->st[pos] = CHUNK_ST_ABSENT;
+            }
         } else {
             o->st[pos] = CHUNK_ST_ABSENT;
         }
@@ -877,6 +913,8 @@ static int obj_read(void *ctx, unsigned pos, uint64_t off, void *buf, size_t len
     if (!o->rd[pos])
         return o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
     int st_idx = o->rd_store[pos];
+    if (chunk_be_store_is_lost(o->be, st_idx))
+        return CHUNK_ST_LOST;
     if (obj_store_down(o->be, st_idx))
         return CHUNK_ST_DOWN;
     bool real_io = false;
@@ -901,6 +939,10 @@ static const uint64_t *obj_sums(void *ctx, unsigned pos, int *status)
         *status = o->st[pos] ? o->st[pos] : CHUNK_ST_ABSENT;
         return NULL;
     }
+    if (chunk_be_store_is_lost(o->be, o->rd_store[pos])) {
+        *status = CHUNK_ST_LOST;
+        return NULL;
+    }
     if (obj_store_down(o->be, o->rd_store[pos])) {
         *status = CHUNK_ST_DOWN;
         return NULL;
@@ -917,6 +959,7 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
     for (unsigned i = 0; i < CHUNK_POS_MAX; i++)
         o->rd_store[i] = -1;
     o->be = be;
+    atomic_init(&o->place_n, chunk_be_nstores(be));
     o->volume = volume;
     memcpy(o->vuuid, vuuid, 16);
     memcpy(o->oid, oid, 16);
@@ -950,34 +993,112 @@ int chunk_obj_open_pos(chunk_backend *be, uint32_t volume, const uint8_t vuuid[1
             alive = true;
     }
     bool away = false; /* a store that is not UP: what it holds may be what this object lacks */
-    for (int i = 0; i < chunk_be_nstores(be); i++)
-        away |= chunk_be_store_state(be, i) != CHUNK_STORE_UP;
+    bool any_lost = false;
+    for (int i = 0; i < chunk_be_nstores(be); i++) {
+        if (chunk_be_store_is_lost(be, i))
+            any_lost = true;
+        else if (chunk_be_store_state(be, i) != CHUNK_STORE_UP)
+            away = true;
+    }
     if (!alive || !have) {
+        bool obj_lost = false;
         bool obj_away = away;
-        if (have && o->g.m == 0) {
-            /* single-copy (D5): only pos 0 exists; if it was found damaged on an UP store it is CORRUPT, and it is
-             * unavailable only when its own store is not UP */
-            if (o->st[0] == CHUNK_ST_DAMAGED)
-                obj_away = false;
-            else
-                obj_away = chunk_be_store_state(be, chunk_be_pos_store(be, oid, 0)) != CHUNK_STORE_UP;
+        if (have) {
+            unsigned npos = chunk_npos(&o->g);
+            int bn = chunk_be_nstores(be);
+            int min_n = npos >= 2 ? (int)npos : 1;
+            if (min_n > bn)
+                min_n = bn;
+            /* Check all valid store counts [min_n, bn] that place every position on a non-UP store (so an object
+             * written before a `tier add` still classifies LOST vs DOWN accurately even if no chunk opened). */
+            bool any_cand = false, all_cand_lost = true, any_cand_away = false;
+            for (int cand = bn; cand >= min_n; cand--) {
+                unsigned lost_pos = 0, down_pos = 0, up_pos = 0;
+                for (unsigned i = 0; i < npos; i++) {
+                    int sidx = chunk_be_place_n(oid, i, cand);
+                    if (chunk_be_store_is_lost(be, sidx))
+                        lost_pos++;
+                    else if (chunk_be_store_state(be, sidx) != CHUNK_STORE_UP)
+                        down_pos++;
+                    else
+                        up_pos++;
+                }
+                if (up_pos > 0)
+                    continue;
+                any_cand = true;
+                bool clost = false, caway = false;
+                if (o->g.m == 0) {
+                    if (o->st[0] != CHUNK_ST_DAMAGED) {
+                        clost = lost_pos > 0;
+                        caway = !clost && down_pos > 0;
+                    }
+                } else if (lost_pos > o->g.m) {
+                    clost = true;
+                } else {
+                    caway = down_pos > 0;
+                }
+                if (!clost)
+                    all_cand_lost = false;
+                if (caway)
+                    any_cand_away = true;
+            }
+            if (any_cand) {
+                obj_lost = all_cand_lost;
+                obj_away = !obj_lost && any_cand_away;
+            } else {
+                unsigned lost_pos = 0, down_pos = 0;
+                for (unsigned i = 0; i < npos; i++) {
+                    int sidx = chunk_be_place_n(oid, i, bn);
+                    if (chunk_be_store_is_lost(be, sidx))
+                        lost_pos++;
+                    else if (chunk_be_store_state(be, sidx) != CHUNK_STORE_UP)
+                        down_pos++;
+                }
+                if (o->g.m == 0) {
+                    if (o->st[0] == CHUNK_ST_DAMAGED) {
+                        obj_away = false;
+                    } else if (lost_pos > 0) {
+                        obj_lost = true;
+                        obj_away = false;
+                    } else {
+                        obj_away = down_pos > 0;
+                    }
+                } else if (lost_pos > o->g.m) {
+                    obj_lost = true;
+                    obj_away = false;
+                } else {
+                    obj_away = down_pos > 0;
+                }
+            }
         }
-        if (obj_away && !chunk_log_quiet && worst != TSDB_ERR_NOTFOUND)
+        if (obj_lost && !chunk_log_quiet)
+            fprintf(stderr, "tsdb: object %s: more than m positions are on lost stores: data lost\n", o->name);
+        else if (obj_away && !chunk_log_quiet && worst != TSDB_ERR_NOTFOUND)
             fprintf(stderr, "tsdb: object %s: no chunk of it can be read while a store is down: unavailable\n", o->name);
         else if (worst != TSDB_ERR_NOTFOUND && !chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: no chunk of it can be read: not readable\n", o->name);
         chunk_obj_close(o);
+        if (obj_lost)
+            return TSDB_ERR_IO;
         if (obj_away)
             return TSDB_ERR_UNAVAILABLE;
         if (worst == TSDB_ERR_NOMEM)
             return TSDB_ERR_NOMEM;
         return worst == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_CORRUPT;
     }
-    if (away)
+    obj_update_place_n(o);
+    int pn = atomic_load_explicit(&o->place_n, memory_order_acquire);
+    if (away || any_lost)
         for (unsigned i = 0; i < p; i++)
-            if (!o->rd[i] && o->st[i] == CHUNK_ST_ABSENT &&
-                chunk_be_store_state(be, chunk_be_pos_store(be, oid, i)) != CHUNK_STORE_UP)
-                o->st[i] = CHUNK_ST_DOWN; /* it may be there: it comes back with its store (or its heal) */
+            if (!o->rd[i] && (o->st[i] == CHUNK_ST_ABSENT || o->st[i] == CHUNK_ST_DOWN)) {
+                int sidx = chunk_be_place_n(oid, i, pn);
+                if (chunk_be_store_is_lost(be, sidx))
+                    o->st[i] = CHUNK_ST_LOST;
+                else if (chunk_be_store_state(be, sidx) != CHUNK_STORE_UP)
+                    o->st[i] = CHUNK_ST_DOWN; /* it may be there: it comes back with its store (or its heal) */
+                else
+                    o->st[i] = CHUNK_ST_ABSENT;
+            }
     if (chunk_mutant == CHUNK_MUT_SETTINGS) { /* planted: the layout taken from today's settings, not from the object */
         chunk_geom t;
         if (chunk_geom_derive(&t, chunk_settings_k, chunk_settings_m, o->g.len) == 0)
@@ -1031,6 +1152,11 @@ uint64_t chunk_obj_epoch(const chunk_obj *o)
             e = chunk_rd_hdr(o->rd[p])->epoch;
     }
     return e;
+}
+
+int chunk_obj_place_n(const chunk_obj *o)
+{
+    return o ? atomic_load_explicit(&((chunk_obj *)o)->place_n, memory_order_acquire) : 0;
 }
 
 int chunk_obj_source(chunk_obj *o, chunk_source *src)

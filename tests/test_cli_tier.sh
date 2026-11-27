@@ -248,9 +248,8 @@ assert d["volumes"][0]["margin"] == "underneath"
 assert d["stores"][0]["single_copy"] is True
 ' || fail "sc_db status --json fields mismatch: $sc_json"
 
-# 7. Unbuilt verbs (lost, salvage) exit 2 with "not built", and validate arguments.
+# 7. Unbuilt verbs (lost --shrink, salvage) exit 2 with "not built", and validate arguments.
 for args in \
-    "lost s0 --replace $fs2/repl" \
     "lost s0 --shrink" \
     "salvage" \
     "salvage --partition 100 --force"
@@ -272,6 +271,11 @@ do
     rc=$?
     [ "$rc" -eq 2 ] || fail "invalid tier $args exited $rc (expected 2)"
 done
+
+# 7b. Refusals for tier lost --replace (relative path, unknown store, same device without flag).
+refuse_tier "tier lost relative path" "absolute" lost s0 --replace rel/store --allow-shared-device
+refuse_tier "tier lost unknown store" "not found" lost s99 --replace "$fs2/repl_unk" --allow-shared-device
+refuse_tier "tier lost same device without flag" "same device" lost s0 --replace "$fs2/repl_nodev"
 
 # 8. Running beside a live tsdbd (D10: appends to TIERS under VOLUMES OFD lock).
 me=$BASHPID
@@ -302,6 +306,31 @@ assert d["settings"]["after_s"] == 3 * 86400
 assert d["settings"]["high_pct"] == 85
 ' || fail "live tier status --json did not reflect live add+set: $jlive"
 
+    # Live tier lost --replace beside running tsdbd: tsdbd's tier worker picks up TIERS, rebuilds, and marks UP.
+    rm -rf "$fs1/s0"
+    out_lost=$(t tier lost s0 --replace "$fs1/s0_new:hdd" --allow-shared-device) || fail "live tier lost --replace"
+    echo "$out_lost" | grep -q "replaced by" || fail "live tier lost output missing 'replaced by': $out_lost"
+    rebuilt_ok=0
+    for _ in $(seq 300); do
+        if [ ! -e "$fs1/s0_new/REBUILDING" ]; then
+            rebuilt_ok=1
+            break
+        fi
+        kill -0 "$srv_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    [ "$rebuilt_ok" = 1 ] || fail "live tsdbd did not finish rebuilding s0_new"
+    jrep=$(t tier status --json) || fail "tier status --json after live lost --replace"
+    echo "$jrep" | python3 -I -m json.tool >/dev/null || fail "live lost status --json invalid JSON"
+    echo "$jrep" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert len(d["stores"]) == 7 and d["stores_up"] == 7 and d["stores_lost"] == 0
+assert d["stores"][0]["tiers_state"] == "replaced" and d["stores"][0]["state"] == "up"
+assert d["stores"][0]["path"].endswith("/s0_new")
+assert d["rebuild"]["active"] is False and d["rebuild"]["state"] == "idle"
+' || fail "live lost status --json mismatch: $jrep"
+
     # Unbuilt verbs beside live tsdbd still exit 2 with "not built".
     t tier lost s0 --shrink >/dev/null 2>"$dir/err"
     rc=$?
@@ -316,11 +345,37 @@ else
 fi
 stop_server
 
+# 8b. Offline tier lost --replace reports replacing state and rebuild progress in tier status until next open.
+rm -rf "$fs1/s1"
+t tier lost s1 --replace "$fs1/s1_new:hdd" --allow-shared-device >/dev/null || fail "offline tier lost --replace"
+[ -f "$fs1/s1_new/REBUILDING" ] || fail "offline tier lost --replace did not create REBUILDING marker"
+out_rb=$(t tier status) || fail "tier status while offline replacing"
+echo "$out_rb" | grep -q "rebuild: store 1 replacing" || fail "expected replacing rebuild line: $out_rb"
+jrb=$(t tier status --json) || fail "tier status --json while offline replacing"
+echo "$jrb" | python3 -I -m json.tool >/dev/null || fail "offline replacing status --json invalid JSON"
+echo "$jrb" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["stores"][1]["state"] == "replacing" and d["stores_replacing"] == 1
+assert d["rebuild"]["active"] is True and d["rebuild"]["store"] == 1
+' || fail "offline replacing status --json mismatch: $jrb"
+# Clear REBUILDING by briefly running tsdbd so step 9 sees 7 up stores.
+me=$BASHPID
+"$B/tsdbd" --dir "$db" --no-auth --port 0 --port-file "$dir/port2" --exit-with-parent=$me >"$dir/d2.log" 2>&1 &
+srv_pid=$!
+for _ in $(seq 300); do
+    [ ! -e "$fs1/s1_new/REBUILDING" ] && [ -s "$dir/port2" ] && break
+    kill -0 "$srv_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[ ! -e "$fs1/s1_new/REBUILDING" ] || fail "tsdbd reopen did not finish offline rebuild of s1_new"
+stop_server
+
 # 9. Missing, wrong-id, damaged stores, and negative margin in tier status.
 cp "$fs2/s5/META" "$dir/s5.META.bak" || fail "backup s5 META"
 cp "$fs2/s4/META" "$dir/s4.META.bak" || fail "backup s4 META"
 mv "$fs2/s6" "$fs2/s6.gone" || fail "move s6 aside"
-cp "$fs1/s0/META" "$fs2/s5/META" || fail "overwrite s5 META with s0 META"
+cp "$fs1/s0_new/META" "$fs2/s5/META" || fail "overwrite s5 META with s0_new META"
 printf 'corrupt\n' >"$fs2/s4/META" || fail "corrupt s4 META"
 
 out_neg=$(t tier status) || fail "tier status with 3 unavailable stores"

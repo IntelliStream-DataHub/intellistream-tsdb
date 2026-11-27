@@ -634,9 +634,12 @@ static int map_rc(int rc)
     return rc <= -100 ? TSDB_ERR_IO : rc;
 }
 
-/* Gives the reader the object of e, open and pinned (obj_put lets go of it). */
-static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, co **out)
+/* Gives the reader the object of e, open and pinned (obj_put lets go of it). When `lost_out` is non-NULL, sets it to
+ * true only when obj_open itself reported TSDB_ERR_IO (E15: > m positions on LOST stores), not a mapped CHUNK_ERR_*. */
+static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, co **out, bool *lost_out)
 {
+    if (lost_out)
+        *lost_out = false;
     const ec_record *r = &e->rec;
     chunk_geom gm;
     if (chunk_geom_make(&gm, r->k, r->m, r->cell_bytes, r->object_len) != 0 || r->nsums != chunk_sums_total(&gm))
@@ -717,6 +720,8 @@ static int obj_get(struct eccache_tier *c, const struct ecpart *e, const ce *x, 
         pthread_mutex_unlock(&c->obj_mu);
         free(nw->sums);
         free(nw);
+        if (lost_out && rc == TSDB_ERR_IO)
+            *lost_out = true;
         return map_rc(rc);
     }
     nw->state = CO_OPEN;
@@ -786,6 +791,16 @@ static void corrupt_line(const part *p, const struct ecpart *e, const granule *g
     chunk_oid_hex(e->rec.oid, hex);
     fprintf(stderr, "tsdb: volume %" PRIu32 ", partition %" PRId64 ", part %s, granule %ld (offset %" PRIu64
                     ", %" PRIu64 " bytes): %s (object %s): TSDB_ERR_CORRUPT\n",
+            e->volume, p->partition, p->name, resolve_gran_index(p, g, gi), g->off, (uint64_t)g->ts_len + g->val_len,
+            why, hex);
+}
+
+static void lost_line(const part *p, const struct ecpart *e, const granule *g, size_t gi, const char *why)
+{
+    char hex[33];
+    chunk_oid_hex(e->rec.oid, hex);
+    fprintf(stderr, "tsdb: volume %" PRIu32 ", partition %" PRId64 ", part %s, granule %ld (offset %" PRIu64
+                    ", %" PRIu64 " bytes): %s (object %s): TSDB_ERR_IO\n",
             e->volume, p->partition, p->name, resolve_gran_index(p, g, gi), g->off, (uint64_t)g->ts_len + g->val_len,
             why, hex);
 }
@@ -864,10 +879,13 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
         memset(x->data + x->len, 0, BLK_SLACK);
     }
     co *o = NULL;
-    int rc = obj_get(c, e, x, &o);
+    bool open_lost = false;
+    int rc = obj_get(c, e, x, &o, &open_lost);
     if (rc) {
         if (rc == TSDB_ERR_CORRUPT)
             corrupt_line(p, e, g, gi, "the object cannot be opened");
+        else if (rc == TSDB_ERR_IO)
+            lost_line(p, e, g, gi, open_lost ? "more than m positions are on lost stores" : "chunk I/O error");
         return rc;
     }
     chunk_report rep;
@@ -919,6 +937,14 @@ static int fill_inner(struct eccache_tier *c, const part *p, const struct ecpart
     if (rc == TSDB_ERR_CORRUPT)
         corrupt_line(p, e, g, gi, mismatch ? "its bytes fail its checksum after a decode of whole cells"
                                            : "its object lost more chunks of a stripe than it has parity");
+    else if (rc == TSDB_ERR_IO) {
+        unsigned lost_cnt = 0;
+        unsigned npos = (unsigned)e->rec.k + (unsigned)e->rec.m;
+        for (unsigned pi = 0; pi < npos && pi < CHUNK_POS_MAX; pi++)
+            if (rep.st[pi] == CHUNK_ST_LOST)
+                lost_cnt++;
+        lost_line(p, e, g, gi, lost_cnt > e->rec.m ? "more than m positions are on lost stores" : "chunk I/O error");
+    }
     return map_rc(rc);
 }
 
@@ -1166,7 +1192,7 @@ static int fill_ahead(struct eccache_tier *c, const part *p, const struct ecpart
         slab_unref(sl);
         return TSDB_ERR_UNAVAILABLE;
     }
-    int rc = sl ? obj_get(c, e, x, &o) : TSDB_ERR_NOMEM;
+    int rc = sl ? obj_get(c, e, x, &o, NULL) : TSDB_ERR_NOMEM;
     bool demand = false, pf_injected = false, abandoned = false;
     if (rc == 0) {
         chunk_report rep;
@@ -2012,7 +2038,9 @@ int ec_test_attach_from(eng *db, part *p, const uint8_t *src, ec_record *rec_out
     ec_record r;
     memset(&r, 0, sizeof r);
     chunk_geom g;
-    if ((rc = chunk_geom_derive(&g, (unsigned)cv->set.k, (unsigned)cv->set.m, p->map_len)) != 0)
+    int sk = 0, sm = 0;
+    tier_settings_get_km(&cv->set, &sk, &sm);
+    if ((rc = chunk_geom_derive(&g, (unsigned)sk, (unsigned)sm, p->map_len)) != 0)
         return rc;
     uint64_t epoch = coldvol_epoch(cv);
     if (epoch == 0)

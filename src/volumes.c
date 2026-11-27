@@ -52,6 +52,7 @@
 #include "stats_priv.h"
 #include "tier.h"
 #include "tierfill.h"
+#include "tierctl.h"
 #include "tiers.h"
 #include "chunk.h"
 #include "settle.h"
@@ -2182,12 +2183,34 @@ int tsdb_tier_set(tsdb *db, const tsdb_tier_settings *settings)
 
 int tsdb_tier_lost(tsdb *db, const char *store, const char *replace_path, uint32_t flags)
 {
+    if (!replace_path) {
+        fprintf(stderr, "tsdb: tsdb_tier_lost: --shrink is not built\n");
+        return TSDB_ERR_INVALID;
+    }
+#ifndef TSDB_EC
     (void)db;
     (void)store;
-    (void)replace_path;
     (void)flags;
-    fprintf(stderr, "tsdb: tsdb_tier_lost: not built\n");
+    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
     return TSDB_ERR_INVALID;
+#else
+    if (!db || !store || !*store)
+        return TSDB_ERR_INVALID;
+    if (db->opt.read_only)
+        return TSDB_ERR_READONLY;
+    if (db->cluster) {
+        fprintf(stderr, "tsdb: tier lost: cluster handles do not use local tiers: refused\n");
+        return TSDB_ERR_INVALID;
+    }
+    if (eng_check(db->vols[0]))
+        return TSDB_ERR_IO;
+    /* Do not hold db->create_lock across tierctl_lost_impl: TIERS is serialized by the VOLUMES OFD lock, and a dead
+     * store path must never block series creation. */
+    int rc = tierctl_lost_impl(db->dirfd, db->dir, db->opt.fsync, store, replace_path, NULL, flags, NULL, NULL);
+    if (rc == 0 && db->tier)
+        tierctl_wake(db->tier);
+    return rc;
+#endif
 }
 
 int tsdb_tier_salvage(tsdb *db, int64_t partition, int all_partitions, int force)

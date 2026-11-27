@@ -18,6 +18,7 @@
 #include "ecpart.h"
 #include "ecswap.h"
 #include "settle.h"
+#include "tierctl.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -592,6 +593,17 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
         }
     }
     chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
+    /* R15 (r15-lost): mark LOST slots for E15 TSDB_ERR_IO, and open any unfinished replacement (REBUILDING
+     * marker still present) in CHUNK_STORE_REPLACING so it is never claimed UP early and tierctl resumes it. */
+    for (int i = 0; i < n; i++) {
+        const tiers_store *st = &t->tview.stores[i];
+        if (st->state == TIERS_STATE_LOST && tier_mut() != TIER_MUT_LOSTOPEN) {
+            chunk_be_set_lost(t->be, i, true);
+        } else if (st->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(st->path)) {
+            (void)chunk_be_set_replacing(t->be, i);
+            tier_ensure_paused(t, i, "is rebuilding");
+        }
+    }
     return 0;
 }
 
@@ -916,11 +928,11 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
             return open_rc;
         }
         eccache_set_backend(t, t->be);
-        if ((open_rc = tier_health_open(t)) != 0) {
+        tier_reg_add(t, dir);
+        if ((open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
             tier_put(t);
             return open_rc;
         }
-        tier_reg_add(t, dir);
         *out = t;
         return 0;
 #endif
@@ -995,11 +1007,11 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
     /* the cache reads through this backend, never one of its own (its stores' flocks would make that one BUSY) */
     eccache_set_backend(t, t->be);
     if (t->be) {
-        if ((open_rc = tier_health_open(t)) != 0) {
+        tier_reg_add(t, dir);
+        if ((open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
             tier_put(t);
             return open_rc;
         }
-        tier_reg_add(t, dir);
     }
     *out = t;
     return 0;
@@ -1018,8 +1030,10 @@ void tier_put(tier *t)
     if (!t || atomic_fetch_sub_explicit(&t->refs, 1, memory_order_acq_rel) != 1)
         return;
     tier_reg_remove(t);
+    if (tierctl_close(t))
+        return; /* a detached tier worker is still stuck in the kernel using t/be/cache: leave allocated */
     if (tier_health_close(t))
-        return; /* a detached attach worker is still stuck in the kernel using t/be/cache: leave allocated */
+        return; /* a detached health worker is still stuck in the kernel using t/be/cache: leave allocated */
     ecsettle_tier_close(t);
     ecgc_tier_close(t);
     eccache_tier_close(t);
@@ -1043,6 +1057,7 @@ void tier_quiesce(tier *t)
 {
     if (t) {
         tier_health_quiesce(t);
+        tierctl_quiesce(t);
         ecsettle_tier_quiesce(t);
         ecgc_tier_quiesce(t);
     }
@@ -1172,8 +1187,7 @@ static int tier_meta_write(eng *db, const char *txt, uint8_t u[16])
 void tier_settings_from_cfg(const tier_cfg *c, tier_settings *s)
 {
     memset(s, 0, sizeof *s);
-    s->k = c->k;
-    s->m = c->m;
+    tier_settings_set_km(s, c->k, c->m);
     s->grace_s = c->grace_s;
     s->keep_s = c->keep_s;
     s->coarse_s = c->coarse_s;
@@ -1370,12 +1384,31 @@ int tier_engine_attach(eng *db)
         cv->set = *at.settings;
     } else if (t->from_tiers) {
         tiers_settings vs;
+        int def_k = 0, def_m = 0;
+        bool has_def = false;
+        size_t tv_nstores = 0;
+        bool all_sc = false;
+        pthread_mutex_lock(&t->cmu);
         tiers_view_settings_for(&t->tview, vol, &vs);
+        tv_nstores = t->tview.nstores;
+        all_sc = tv_nstores > 0;
+        for (size_t i = 0; i < tv_nstores; i++)
+            if (!t->tview.stores[i].single_copy)
+                all_sc = false;
+        has_def = tier_default_geom((int)tv_nstores, all_sc, &def_k, &def_m);
+        pthread_mutex_unlock(&t->cmu);
         tier_settings_from_cfg(&t->cfg, &cv->set);
         cv->set.from_tiers = true;
         if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
-            cv->set.k = (int)vs.k;
-            cv->set.m = (int)vs.m;
+            bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
+                                : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
+                                   (int)vs.k + (int)vs.m <= (int)tv_nstores);
+            if (ok)
+                tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
+            else if (has_def)
+                tier_settings_set_km(&cv->set, def_k, def_m);
+        } else if (has_def) {
+            tier_settings_set_km(&cv->set, def_k, def_m);
         }
         cv->set.tier_after_s = t->ov_grace ? (uint64_t)t->cfg.grace_s : vs.tier_after_s;
         cv->set.grace_s = t->ov_grace ? t->cfg.grace_s : (int64_t)vs.tier_after_s;
@@ -1453,6 +1486,37 @@ int tier_engine_attach(eng *db)
      * that failed above leaves the volume's previous entry in place (none of those lookups runs before the open
      * returns but the gc worker, which keeps an item it cannot delete yet). */
     rc = cold_register(t, cv);
+    if (rc == 0 && !at.settings && t->from_tiers) {
+        /* Refresh live TIERS settings under t->cmu after cold_register so any update applied while attach ran is seen. */
+        pthread_mutex_lock(&t->cmu);
+        tiers_settings vs;
+        tiers_view_settings_for(&t->tview, vol, &vs);
+        bool all_sc = t->tview.nstores > 0;
+        for (size_t i = 0; i < t->tview.nstores; i++)
+            if (!t->tview.stores[i].single_copy)
+                all_sc = false;
+        int def_k = 0, def_m = 0;
+        bool has_def = tier_default_geom((int)t->tview.nstores, all_sc, &def_k, &def_m);
+        if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
+                                : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
+                                   (int)vs.k + (int)vs.m <= (int)t->tview.nstores);
+            if (ok)
+                tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
+        } else if (has_def) {
+            tier_settings_set_km(&cv->set, def_k, def_m);
+        }
+        if (!t->ov_grace) {
+            atomic_store_explicit(&cv->set.tier_after_s, vs.tier_after_s, memory_order_relaxed);
+            atomic_store_explicit(&cv->set.grace_s, (int64_t)vs.tier_after_s, memory_order_relaxed);
+        }
+        atomic_store_explicit(&cv->set.tier_high_pct, vs.tier_high_pct, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.young_high_pct, vs.young_high_pct, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.rebuild_mb_s, vs.rebuild_mb_s, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.scrub_mb_s, vs.scrub_mb_s, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.scrub_days, vs.scrub_days, memory_order_relaxed);
+        pthread_mutex_unlock(&t->cmu);
+    }
     if (rc == 0 && !db->ec_cluster) {
         pthread_mutex_lock(&t->cmu);
         t->eng_opening++;
@@ -1517,10 +1581,12 @@ const uint8_t *tier_vuuid(const eng *db) { return db->ecstate ? db->ecstate->vuu
 
 static void tier_pause_store(tier *t, int i, const char *why)
 {
-    if (!atomic_exchange(&t->halted, true))
+    if (!atomic_exchange(&t->halted, true)) {
+        char pbuf[PATH_MAX];
+        const char *p = tier_store_path(t, i, pbuf, sizeof pbuf) ? pbuf : "-";
         fprintf(stderr, "tsdb: tier store %d (%s) %s: settles and chunk deletes stop for this tier until stores "
-                        "recover; reads go on\n", i,
-                (i >= 0 && i < t->cfg.ndirs && t->cfg.dirs[i]) ? t->cfg.dirs[i] : "-", why);
+                        "recover; reads go on\n", i, p, why);
+    }
 }
 
 void tier_halt_store(tier *t, int i, const char *why)

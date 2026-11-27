@@ -1,0 +1,1772 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/*
+ * Local tier controller: one tier worker thread per handle (nice 19, zero engine locks across chunk I/O),
+ * periodic TIERS stat/re-read, paced replacement rebuilds (chunk_be_replace_open / chunk_be_settle),
+ * crash/power-loss resume via durable REBUILDING marker, and execution of r15-health's queued attaches
+ * (docs/design-cluster-data.md §15.7, E15, E55; R15 D9, D10, D20).
+ */
+#define _GNU_SOURCE
+#include "tierctl.h"
+#include "chunk.h"
+#include "chunk_priv.h"
+#include "eccache.h"
+#include "ecgc.h"
+#include "internal.h"
+#include "tier.h"
+#include "tiers.h"
+
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
+
+#ifdef TSDB_TEST_HOOKS
+int tierctl_mutant;
+static atomic_int g_poll_ms = 1000;
+static pthread_mutex_t g_hook_mu = PTHREAD_MUTEX_INITIALIZER;
+static void (*g_rebuild_hook)(void *ctx, int store, uint64_t bytes_done);
+static void *g_rebuild_hook_ctx;
+
+static inline int tierctl_mut(void) { return tierctl_mutant; }
+#else
+static inline int tierctl_mut(void) { return 0; }
+#endif
+
+void tierctl_set_poll_ms(int ms)
+{
+#ifdef TSDB_TEST_HOOKS
+    atomic_store_explicit(&g_poll_ms, ms > 0 ? ms : 1000, memory_order_relaxed);
+#else
+    (void)ms;
+#endif
+}
+
+void tierctl_set_rebuild_hook(void (*fn)(void *ctx, int store, uint64_t bytes_done), void *ctx)
+{
+#ifdef TSDB_TEST_HOOKS
+    pthread_mutex_lock(&g_hook_mu);
+    g_rebuild_hook = fn;
+    g_rebuild_hook_ctx = ctx;
+    pthread_mutex_unlock(&g_hook_mu);
+#else
+    (void)fn;
+    (void)ctx;
+#endif
+}
+
+bool tierctl_store_rebuilding(const char *store_path)
+{
+    if (!store_path || !*store_path)
+        return false;
+    char p[PATH_MAX + 32];
+    int n = snprintf(p, sizeof p, "%s/%s", store_path, TIERCTL_REBUILDING_FILE);
+    if (n <= 0 || (size_t)n >= sizeof p)
+        return false;
+    return access(p, F_OK) == 0;
+}
+
+#ifdef TSDB_EC
+
+#define TIERCTL_POLL_MS_DEFAULT 1000
+
+typedef struct ctl_slot {
+    uint8_t id[16];     /* active id in backend (replacement id when REPLACED_BY, else original id) */
+    uint8_t state;      /* last applied TIERS_STATE_* */
+    char *path;
+    bool needs_rebuild; /* true while REPLACED_BY has not yet finished rebuild (REBUILDING present) */
+    bool wait_other_up; /* parked waiting for another transiently DOWN (non-LOST) store to recover */
+    uint64_t bytes_done_saved; /* accumulated bytes_done preserved across between-object yields */
+    int64_t retry_after_ms;
+    int fails;
+} ctl_slot;
+
+struct tierctl {
+    tier *t;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_cond_t idle_cv;
+    bool closing;
+    atomic_bool closing_atomic;
+    bool quiesced;
+    bool worker_started;
+    bool worker_done;
+    bool worker_owns_ref;
+    bool worker_stuck;
+    pthread_t worker_th;
+
+    /* TIERS stat/re-read tracking */
+    bool check_tiers_now;
+    bool checking_tiers;
+    bool have_tiers_st;
+    struct stat tiers_st;
+    uint64_t tiers_file_end;
+    int64_t next_stat_ms;
+    int nslots;
+    ctl_slot slots[TIERS_STORES_MAX];
+
+    /* Live rate settings from TIERS SETTINGS (defaults from tiers.h) */
+    atomic_uint rebuild_mb_s;
+    atomic_uint scrub_mb_s;
+    atomic_uint scrub_days;
+
+    /* Live rebuild progress (guarded by mu) */
+    tierctl_progress prog;
+};
+
+static int64_t ctl_mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t ctl_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+static int ctl_poll_ms(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    int v = atomic_load_explicit(&g_poll_ms, memory_order_relaxed);
+    return v > 0 ? v : TIERCTL_POLL_MS_DEFAULT;
+#else
+    return TIERCTL_POLL_MS_DEFAULT;
+#endif
+}
+
+static int ctl_ofd_lock(int fd, short type)
+{
+    struct flock fl = {.l_type = type, .l_whence = SEEK_SET};
+    int r;
+    while ((r = fcntl(fd, F_OFD_SETLKW, &fl)) != 0 && errno == EINTR)
+        ;
+    return r == 0 ? 0 : TSDB_ERR_IO;
+}
+
+/* ---------------------------------------------------------------- durable REBUILDING marker */
+
+static int write_rebuilding_marker(const char *store_path, bool sync)
+{
+    int dfd = open(store_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return TSDB_ERR_IO;
+    char tmp[64];
+    snprintf(tmp, sizeof tmp, "%s.tmp", TIERCTL_REBUILDING_FILE);
+    (void)unlinkat(dfd, tmp, 0);
+    int fd = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        close(dfd);
+        return TSDB_ERR_IO;
+    }
+    static const char msg[] = "rebuilding\n";
+    int rc = 0;
+    ssize_t w = write(fd, msg, sizeof msg - 1);
+    if (w != (ssize_t)(sizeof msg - 1))
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && sync && tsdb_fsync(fd) != 0)
+        rc = TSDB_ERR_IO;
+    if (close(fd) != 0 && rc == 0)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && renameat(dfd, tmp, dfd, TIERCTL_REBUILDING_FILE) != 0)
+        rc = TSDB_ERR_IO;
+    if (rc != 0)
+        (void)unlinkat(dfd, tmp, 0);
+    if (rc == 0 && sync && tsdb_fsync(dfd) != 0)
+        rc = TSDB_ERR_IO;
+    close(dfd);
+    return rc;
+}
+
+static int clear_rebuilding_marker(const char *store_path)
+{
+    int dfd = open(store_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return TSDB_ERR_IO;
+    int rc = 0;
+    if (unlinkat(dfd, TIERCTL_REBUILDING_FILE, 0) != 0 && errno != ENOENT)
+        rc = TSDB_ERR_IO;
+    if (rc == 0 && tsdb_fsync(dfd) != 0)
+        rc = TSDB_ERR_IO;
+    close(dfd);
+    return rc;
+}
+
+/* ---------------------------------------------------------------- pacer & progress callbacks */
+
+typedef struct ctl_pacer {
+    struct tierctl *ctl;
+    int store;
+    uint32_t rate_mb_s;
+    int64_t start_ns;
+    int64_t next_tiers_check_ms;
+    uint64_t bytes_since;
+    uint64_t total_bytes;
+} ctl_pacer;
+
+static bool tiers_file_changed_stat(struct tierctl *ctl)
+{
+    tier *t = ctl->t;
+    if (!t || !t->from_tiers || !t->dir)
+        return false;
+    char tp[PATH_MAX + 16];
+    snprintf(tp, sizeof tp, "%s/%s", t->dir, TIERS_FILE);
+    struct stat st;
+    if (stat(tp, &st) != 0)
+        return false;
+    bool changed = false;
+    pthread_mutex_lock(&ctl->mu);
+    if (!ctl->have_tiers_st || st.st_size != ctl->tiers_st.st_size || st.st_ino != ctl->tiers_st.st_ino ||
+        st.st_mtime != ctl->tiers_st.st_mtime
+#ifdef __linux__
+        || st.st_mtim.tv_nsec != ctl->tiers_st.st_mtim.tv_nsec
+#endif
+    )
+        changed = true;
+    pthread_mutex_unlock(&ctl->mu);
+    return changed;
+}
+
+/* Lightweight mid-object refresh of rebuild_mb_s only (no backend mutations), so a live `tier set --rebuild-mb-s`
+ * takes effect within 1 s even during a multi-gigabyte single object rebuild. */
+static void ctl_refresh_rebuild_rate(struct tierctl *ctl)
+{
+    tier *t = ctl->t;
+    if (!t || !t->from_tiers || !t->dir)
+        return;
+    int rootfd = open(t->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0)
+        return;
+    tiers_view tv;
+    tiers_view_init(&tv);
+    if (tiers_load(rootfd, false, false, &tv) == 0 && tv.exists) {
+        uint32_t rb = tv.global.rebuild_mb_s ? tv.global.rebuild_mb_s : TIERS_REBUILD_MB_S_DEFAULT;
+        atomic_store_explicit(&ctl->rebuild_mb_s, rb, memory_order_relaxed);
+    }
+    tiers_view_free(&tv);
+    close(rootfd);
+}
+
+static int ctl_cancel_cb(void *ctx)
+{
+    const struct tierctl *ctl = ctx;
+    return atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire) ? 1 : 0;
+}
+
+/* Checked only between objects/volumes so a long rebuild yields promptly for TIERS changes and health attaches
+ * without discarding an in-progress chunk. */
+static int ctl_yield_cb(void *ctx)
+{
+    struct tierctl *ctl = ctx;
+    if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire))
+        return 1;
+    if (tier_health_has_pending(ctl->t))
+        return 1;
+    pthread_mutex_lock(&ctl->mu);
+    bool want_tiers = ctl->check_tiers_now;
+    int64_t due = ctl->next_stat_ms;
+    pthread_mutex_unlock(&ctl->mu);
+    if (want_tiers)
+        return 1;
+    if (ctl->t && ctl->t->from_tiers && ctl_mono_ms() >= due) {
+        if (tiers_file_changed_stat(ctl)) {
+            pthread_mutex_lock(&ctl->mu);
+            ctl->check_tiers_now = true;
+            pthread_mutex_unlock(&ctl->mu);
+            return 1;
+        }
+        pthread_mutex_lock(&ctl->mu);
+        ctl->next_stat_ms = ctl_mono_ms() + ctl_poll_ms();
+        pthread_mutex_unlock(&ctl->mu);
+    }
+    return 0;
+}
+
+static void ctl_pace_cb(void *ctx, uint64_t bytes_done)
+{
+    ctl_pacer *p = ctx;
+    if (!p || bytes_done == 0)
+        return;
+    struct tierctl *ctl = p->ctl;
+    p->total_bytes += bytes_done;
+
+    /* At most once per poll interval, check whether TIERS changed so rebuild_mb_s updates live even mid-object. */
+    int64_t now_ms = ctl_mono_ms();
+    if (ctl->t && ctl->t->from_tiers && now_ms >= p->next_tiers_check_ms) {
+        p->next_tiers_check_ms = now_ms + ctl_poll_ms();
+        if (tiers_file_changed_stat(ctl)) {
+            ctl_refresh_rebuild_rate(ctl);
+            pthread_mutex_lock(&ctl->mu);
+            ctl->check_tiers_now = true;
+            pthread_mutex_unlock(&ctl->mu);
+        }
+    }
+
+    uint32_t mb_s = atomic_load_explicit(&ctl->rebuild_mb_s, memory_order_relaxed);
+    if (mb_s == 0)
+        mb_s = TIERS_REBUILD_MB_S_DEFAULT;
+
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->prog.active && ctl->prog.store == p->store) {
+        ctl->prog.bytes_done = p->total_bytes;
+        ctl->prog.rate_mb_s = mb_s;
+    }
+    pthread_mutex_unlock(&ctl->mu);
+
+#ifdef TSDB_TEST_HOOKS
+    {
+        void (*hook)(void *, int, uint64_t);
+        void *hctx;
+        pthread_mutex_lock(&g_hook_mu);
+        hook = g_rebuild_hook;
+        hctx = g_rebuild_hook_ctx;
+        pthread_mutex_unlock(&g_hook_mu);
+        if (hook)
+            hook(hctx, p->store, p->total_bytes);
+    }
+#endif
+
+    if (tierctl_mut() == TIERCTL_MUT_REBUILDFAST)
+        return; /* planted mutant: ignores rebuild_mb_s pacing */
+
+    if (p->start_ns == 0 || p->rate_mb_s != mb_s) {
+        p->start_ns = ctl_mono_ns();
+        p->bytes_since = 0;
+        p->rate_mb_s = mb_s;
+    }
+    p->bytes_since += bytes_done;
+
+    uint64_t rate_bps = (uint64_t)mb_s * (1024ull * 1024ull);
+    uint64_t target_ns = (uint64_t)(((__uint128_t)p->bytes_since * 1000000000ull) / rate_bps);
+    int64_t want_ns = p->start_ns + (int64_t)target_ns;
+
+    int64_t now = ctl_mono_ns();
+    if (now >= want_ns)
+        return;
+
+    pthread_mutex_lock(&ctl->mu);
+    while (!ctl->closing) {
+        int64_t cur_ns = ctl_mono_ns();
+        if (cur_ns >= want_ns)
+            break;
+        uint64_t rem_ms = (uint64_t)((want_ns - cur_ns + 999999LL) / 1000000LL);
+        if (rem_ms == 0)
+            rem_ms = 1;
+        int r = tsdb_cond_timedwait_ms(&ctl->cv, &ctl->mu, rem_ms);
+        if (r == ETIMEDOUT)
+            break;
+    }
+    pthread_mutex_unlock(&ctl->mu);
+}
+
+typedef struct ctl_before_up_ctx {
+    const char *path;
+} ctl_before_up_ctx;
+
+static int ctl_before_up_cb(void *ctx, int store)
+{
+    (void)store;
+    const ctl_before_up_ctx *b = ctx;
+    if (!b || !b->path)
+        return 0;
+    return clear_rebuilding_marker(b->path);
+}
+
+/* Estimate total chunk bytes to rebuild for slot `store` by scanning one UP peer store's chunk files. */
+static uint64_t estimate_store_bytes(chunk_backend *be, int skip_store)
+{
+    int n = chunk_be_nstores(be);
+    for (int i = 0; i < n; i++) {
+        if (i == skip_store)
+            continue;
+        if (chunk_be_store_state(be, i) != CHUNK_STORE_UP)
+            continue;
+        char pbuf[PATH_MAX];
+        if (!chunk_be_store_path_copy(be, i, pbuf, sizeof pbuf))
+            continue;
+        int sfd = open(pbuf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sfd < 0)
+            continue;
+        DIR *sd = fdopendir(sfd);
+        if (!sd) {
+            close(sfd);
+            continue;
+        }
+        uint64_t tot = 0;
+        struct dirent *de;
+        while ((de = readdir(sd)) != NULL) {
+            if (de->d_name[0] != 's' || !isdigit((unsigned char)de->d_name[1]))
+                continue;
+            int vfd = openat(dirfd(sd), de->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (vfd < 0)
+                continue;
+            DIR *vd = fdopendir(vfd);
+            if (!vd) {
+                close(vfd);
+                continue;
+            }
+            struct dirent *fe;
+            while ((fe = readdir(vd)) != NULL) {
+                size_t fl = strlen(fe->d_name);
+                if (fl <= 6 || strcmp(fe->d_name + fl - 6, ".chunk") != 0)
+                    continue;
+                struct stat st;
+                if (fstatat(dirfd(vd), fe->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+                    st.st_size > 0)
+                    tot += (uint64_t)st.st_size;
+            }
+            closedir(vd);
+        }
+        closedir(sd);
+        return tot;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------- live OID callback */
+
+typedef struct ctl_oid_set {
+    uint8_t (*v)[16];
+    size_t n;
+} ctl_oid_set;
+
+static int ctl_oid_cmp16(const void *a, const void *b) { return memcmp(a, b, 16); }
+
+static int ctl_live_cb(void *ctx, const uint8_t oid[16])
+{
+    const ctl_oid_set *s = ctx;
+    return s->n > 0 && bsearch(oid, s->v, s->n, 16, ctl_oid_cmp16) != NULL ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------- apply TIERS changes */
+
+static void apply_live_settings(struct tierctl *ctl, tiers_view *tv)
+{
+    tier *t = ctl->t;
+    atomic_store_explicit(&ctl->rebuild_mb_s, tv->global.rebuild_mb_s ? tv->global.rebuild_mb_s : TIERS_REBUILD_MB_S_DEFAULT,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctl->scrub_mb_s, tv->global.scrub_mb_s ? tv->global.scrub_mb_s : TIERS_SCRUB_MB_S_DEFAULT,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctl->scrub_days, tv->global.scrub_days, memory_order_relaxed);
+
+    bool all_sc = tv->nstores > 0;
+    for (size_t i = 0; i < tv->nstores; i++)
+        if (!tv->stores[i].single_copy)
+            all_sc = false;
+    int def_k = 0, def_m = 0;
+    bool has_def = tier_default_geom((int)tv->nstores, all_sc, &def_k, &def_m);
+
+    tiers_view old_tv;
+    pthread_mutex_lock(&t->cmu);
+    old_tv = t->tview;
+    t->tview = *tv; /* transfer ownership */
+    memset(tv, 0, sizeof *tv);
+    for (size_t i = 0; i < t->ncvs; i++) {
+        coldvol *cv = t->cvs[i];
+        tiers_settings vs;
+        tiers_view_settings_for(&t->tview, cv->volume, &vs);
+        if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
+                                : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
+                                   (int)vs.k + (int)vs.m <= (int)t->tview.nstores);
+            if (ok) {
+                tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
+            } else {
+                fprintf(stderr, "tsdb: tier: ignoring invalid live redundancy %u+%u in %s for %zu store(s)\n",
+                        (unsigned)vs.k, (unsigned)vs.m, TIERS_FILE, t->tview.nstores);
+            }
+        } else if (has_def) {
+            tier_settings_set_km(&cv->set, def_k, def_m);
+        }
+        if (!t->ov_grace) {
+            atomic_store_explicit(&cv->set.tier_after_s, vs.tier_after_s, memory_order_relaxed);
+            atomic_store_explicit(&cv->set.grace_s, (int64_t)vs.tier_after_s, memory_order_relaxed);
+        }
+        atomic_store_explicit(&cv->set.tier_high_pct, vs.tier_high_pct, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.young_high_pct, vs.young_high_pct, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.rebuild_mb_s, vs.rebuild_mb_s, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.scrub_mb_s, vs.scrub_mb_s, memory_order_relaxed);
+        atomic_store_explicit(&cv->set.scrub_days, vs.scrub_days, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&t->cmu);
+    tiers_view_free(&old_tv);
+}
+
+static void apply_tiers_changes(struct tierctl *ctl)
+{
+    tier *t = ctl->t;
+    if (!t || !t->from_tiers || !t->dir || !t->be)
+        return;
+
+    int rootfd = open(t->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0)
+        return;
+
+    /* Brief shared OFD lock on VOLUMES (if present) so we never observe a half-appended TIERS record. */
+    int vfd = openat(rootfd, "VOLUMES", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (vfd >= 0 && ctl_ofd_lock(vfd, F_RDLCK) != 0) {
+        close(vfd);
+        vfd = -1;
+    }
+
+    struct stat st;
+    int sr = fstatat(rootfd, TIERS_FILE, &st, AT_SYMLINK_NOFOLLOW);
+    tiers_view tv;
+    tiers_view_init(&tv);
+    int rc = sr == 0 ? tiers_load(rootfd, false, false, &tv) : TSDB_ERR_IO;
+
+    if (vfd >= 0)
+        close(vfd);
+    close(rootfd);
+
+    if (rc != 0 || !tv.exists) {
+        tiers_view_free(&tv);
+        return;
+    }
+
+    pthread_mutex_lock(&ctl->mu);
+    ctl->tiers_st = st;
+    ctl->have_tiers_st = true;
+    ctl->tiers_file_end = tv.file_end;
+    int cur_n = ctl->nslots;
+    pthread_mutex_unlock(&ctl->mu);
+
+    bool need_reopen = false;
+    bool all_ok = true;
+
+    /* 1. Act on STATE changes for existing slots (0 .. cur_n - 1). */
+    int common = (int)tv.nstores < cur_n ? (int)tv.nstores : cur_n;
+    for (int i = 0; i < common; i++) {
+        const tiers_store *ts = &tv.stores[i];
+        const uint8_t *want_id = ts->state == TIERS_STATE_REPLACED_BY ? ts->replaced_by : ts->id;
+
+        pthread_mutex_lock(&ctl->mu);
+        uint8_t prev_state = ctl->slots[i].state;
+        bool id_changed = memcmp(ctl->slots[i].id, want_id, 16) != 0;
+        pthread_mutex_unlock(&ctl->mu);
+
+        if (ts->state == TIERS_STATE_LOST && prev_state != TIERS_STATE_LOST) {
+            tier_health_store_lost(t, i);
+            tier_ensure_paused(t, i, "is LOST");
+            (void)chunk_be_mark_lost(t->be, i);
+            need_reopen = true;
+            chunk_be_release_down(t->be, i);
+            char *pcopy = strdup(ts->path);
+            pthread_mutex_lock(&ctl->mu);
+            ctl->slots[i].state = TIERS_STATE_LOST;
+            memcpy(ctl->slots[i].id, ts->id, 16);
+            ctl->slots[i].needs_rebuild = false;
+            ctl->slots[i].wait_other_up = false;
+            ctl->slots[i].bytes_done_saved = 0;
+            ctl->slots[i].retry_after_ms = 0;
+            ctl->slots[i].fails = 0;
+            if (pcopy) {
+                free(ctl->slots[i].path);
+                ctl->slots[i].path = pcopy;
+            }
+            /* A store transitioning from transiently DOWN to permanently LOST unblocks parked rebuilds. */
+            for (int j = 0; j < ctl->nslots; j++)
+                if (ctl->slots[j].needs_rebuild) {
+                    ctl->slots[j].wait_other_up = false;
+                    ctl->slots[j].retry_after_ms = 0;
+                }
+            pthread_mutex_unlock(&ctl->mu);
+            fprintf(stderr, "tsdb: tier: store %d (%s) declared LOST in %s\n", i, ts->path, TIERS_FILE);
+        } else if (ts->state == TIERS_STATE_REPLACED_BY && (prev_state != TIERS_STATE_REPLACED_BY || id_changed)) {
+            tier_health_store_lost(t, i);
+            tier_ensure_paused(t, i, "is being replaced");
+            (void)chunk_be_mark_lost(t->be, i);
+            need_reopen = true;
+            chunk_be_release_down(t->be, i);
+            char *pcopy = strdup(ts->path);
+            pthread_mutex_lock(&ctl->mu);
+            ctl->slots[i].state = TIERS_STATE_REPLACED_BY;
+            memcpy(ctl->slots[i].id, ts->replaced_by, 16);
+            ctl->slots[i].needs_rebuild = true;
+            ctl->slots[i].wait_other_up = false;
+            ctl->slots[i].bytes_done_saved = 0;
+            ctl->slots[i].retry_after_ms = 0;
+            ctl->slots[i].fails = 0;
+            if (pcopy) {
+                free(ctl->slots[i].path);
+                ctl->slots[i].path = pcopy;
+            }
+            for (int j = 0; j < ctl->nslots; j++)
+                if (j != i && ctl->slots[j].needs_rebuild) {
+                    ctl->slots[j].wait_other_up = false;
+                    ctl->slots[j].retry_after_ms = 0;
+                }
+            pthread_mutex_unlock(&ctl->mu);
+            fprintf(stderr, "tsdb: tier: store %d replaced by %s in %s: queuing rebuild\n", i, ts->path, TIERS_FILE);
+        }
+    }
+
+    if (need_reopen)
+        eccache_reopen_all(t);
+
+    /* 2. Open newly added stores (cur_n .. tv.nstores - 1). */
+    for (int i = cur_n; i < (int)tv.nstores && i < TIERS_STORES_MAX; i++) {
+        const tiers_store *ts = &tv.stores[i];
+        int add_rc = 0;
+        bool is_rebuilding = false;
+        const uint8_t *want_id = ts->state == TIERS_STATE_REPLACED_BY ? ts->replaced_by : ts->id;
+        if (ts->state == TIERS_STATE_LOST) {
+            add_rc = chunk_be_add_lost(t->be, ts->path);
+            if (add_rc == 0) {
+                (void)tier_health_store_added(t, i, ts->path, ts->id, false);
+                tier_ensure_paused(t, i, "is LOST");
+            }
+        } else {
+            is_rebuilding = ts->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(ts->path);
+            add_rc = chunk_be_add_store(t->be, ts->path, want_id, t->db_id, is_rebuilding);
+            if (add_rc == 0)
+                (void)tier_health_store_added(t, i, ts->path, want_id, !is_rebuilding);
+        }
+        if (add_rc != 0) {
+            fprintf(stderr, "tsdb: tier: newly added store %d (%s) could not be opened (%d): will retry\n", i, ts->path,
+                    add_rc);
+            all_ok = false;
+            break; /* keep slot indices strictly in order */
+        }
+        char *pcopy = strdup(ts->path);
+        pthread_mutex_lock(&ctl->mu);
+        ctl->slots[i].state = ts->state;
+        memcpy(ctl->slots[i].id, want_id, 16);
+        ctl->slots[i].path = pcopy;
+        ctl->slots[i].needs_rebuild = is_rebuilding;
+        ctl->slots[i].retry_after_ms = 0;
+        ctl->slots[i].fails = 0;
+        ctl->nslots = i + 1;
+        pthread_mutex_unlock(&ctl->mu);
+        fprintf(stderr, "tsdb: tier: opened newly added store %d (%s)\n", i, ts->path);
+    }
+
+    /* 3. Apply live SETTINGS (updates rebuild_mb_s, scrub_mb_s, scrub_days, and every volume's coldvol->set). */
+    apply_live_settings(ctl, &tv);
+
+    if (all_ok)
+        tier_resume_if_all_up(t);
+    else {
+        /* Retry opening any store that failed on the next poll tick. */
+        pthread_mutex_lock(&ctl->mu);
+        ctl->have_tiers_st = false;
+        pthread_mutex_unlock(&ctl->mu);
+    }
+}
+
+/* ---------------------------------------------------------------- paced replacement rebuild */
+
+static void run_rebuild(struct tierctl *ctl, int idx)
+{
+    tier *t = ctl->t;
+    if (!t || !t->be)
+        return;
+
+    /* Pause settles/GC across the rebuild so live OIDs are stable and no new chunks are placed on a partial store. */
+    tier_ensure_paused(t, idx, "is rebuilding");
+
+    /* Wait briefly if any settle/reencode is currently in flight. */
+    if (tier_health_any_settling(t)) {
+        pthread_mutex_lock(&ctl->mu);
+        ctl->slots[idx].retry_after_ms = ctl_mono_ms() + 200;
+        pthread_mutex_unlock(&ctl->mu);
+        return;
+    }
+
+    char path[PATH_MAX];
+    uint8_t expect_id[16];
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->closing || !ctl->slots[idx].needs_rebuild || !ctl->slots[idx].path) {
+        pthread_mutex_unlock(&ctl->mu);
+        return;
+    }
+    snprintf(path, sizeof path, "%s", ctl->slots[idx].path);
+    memcpy(expect_id, ctl->slots[idx].id, 16);
+    uint32_t mb_s = atomic_load_explicit(&ctl->rebuild_mb_s, memory_order_relaxed);
+    if (mb_s == 0)
+        mb_s = TIERS_REBUILD_MB_S_DEFAULT;
+    ctl->prog.active = true;
+    ctl->prog.store = idx;
+    uint64_t saved_done = ctl->slots[idx].bytes_done_saved;
+    ctl->prog.bytes_done = saved_done;
+    ctl->prog.bytes_est = 0;
+    ctl->prog.rate_mb_s = mb_s;
+    pthread_mutex_unlock(&ctl->mu);
+
+    uint64_t est = estimate_store_bytes(t->be, idx);
+    pthread_mutex_lock(&ctl->mu);
+    ctl->prog.bytes_est = est;
+    pthread_mutex_unlock(&ctl->mu);
+
+    ctl_pacer pacer = {
+        .ctl = ctl,
+        .store = idx,
+        .next_tiers_check_ms = ctl_mono_ms() + ctl_poll_ms(),
+        .total_bytes = saved_done,
+    };
+    ctl_before_up_ctx bctx = {.path = path};
+
+    ctl_oid_set live = {0};
+    bool complete = false;
+    bool use_live = !atomic_load(&ecgc_test_nosweep);
+    if (use_live && (tier_health_live_oids(t, &live.v, &live.n, &complete) != 0 || !complete))
+        use_live = false;
+
+    chunk_heal_opts ho = {
+        .epoch = 0,
+        .scrub = false,
+        .live = use_live ? ctl_live_cb : NULL,
+        .live_ctx = use_live ? &live : NULL,
+        .cancel = ctl_cancel_cb,
+        .cancel_ctx = ctl,
+        .yield = ctl_yield_cb,
+        .yield_ctx = ctl,
+        .pace = ctl_pace_cb,
+        .pace_ctx = &pacer,
+        .before_up = ctl_before_up_cb,
+        .before_up_ctx = &bctx,
+    };
+
+    chunk_heal_report rep;
+    memset(&rep, 0, sizeof rep);
+
+    int cur = chunk_be_store_state(t->be, idx);
+    int rc = 0;
+    if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire)) {
+        rc = TSDB_ERR_STOPPED;
+#ifdef TSDB_TEST_HOOKS
+    } else if (tierctl_mut() == TIERCTL_MUT_LOSTNOREPLACE) {
+        /* Planted mutant `lostnoreplace`: promotes replacement store to UP without rebuilding any chunks. */
+        rc = chunk_be_promote_up_norebuild(t->be, idx, path, expect_id, t->db_id, &ho);
+#endif
+    } else if (cur == CHUNK_STORE_REPLACING) {
+        /* Resuming a rebuild after kill/power loss or transient unavailability: ensure every volume's fence is in ns. */
+        rc = chunk_be_fence_store(t->be, idx);
+        if (rc == 0)
+            rc = chunk_be_settle(t->be, idx, &ho, &rep);
+    } else {
+        /* Live replacement triggered from TIERS: install pre-initialized store at slot idx and rebuild. */
+        rc = chunk_be_replace_open(t->be, idx, path, expect_id, t->db_id, &ho, &rep);
+    }
+    free(live.v);
+
+    /* Check whether another non-LOST store is currently transiently DOWN (if so, park instead of timer-spinning). */
+    bool other_down = false;
+    if (rc == TSDB_ERR_UNAVAILABLE) {
+        int bn = chunk_be_nstores(t->be);
+        for (int j = 0; j < bn; j++) {
+            if (j == idx || chunk_be_store_is_lost(t->be, j))
+                continue;
+            int st = chunk_be_store_state(t->be, j);
+            if (st != CHUNK_STORE_UP && st != CHUNK_STORE_REPLACING) {
+                other_down = true;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_lock(&ctl->mu);
+    ctl->prog.active = false;
+    ctl->prog.store = -1;
+    ctl->prog.objects_done = rep.objects;
+    ctl->prog.rebuilt_chunks = rep.rebuilt_missing + rep.rebuilt_damaged;
+    if (rc == 0) {
+        ctl->prog.rebuilds_done++;
+        ctl->slots[idx].needs_rebuild = false;
+        ctl->slots[idx].wait_other_up = false;
+        ctl->slots[idx].bytes_done_saved = 0;
+        ctl->slots[idx].fails = 0;
+        ctl->slots[idx].retry_after_ms = 0;
+    } else if (rc == TSDB_ERR_STOPPED) {
+        /* Clean yield between objects (or closing): preserve progress and resume right after pending work runs. */
+        ctl->slots[idx].bytes_done_saved = pacer.total_bytes;
+        ctl->slots[idx].retry_after_ms = 0;
+    } else if (rc == TSDB_ERR_UNAVAILABLE && other_down) {
+        /* Parked until the other transiently DOWN store recovers via health attach or is declared LOST in TIERS. */
+        ctl->slots[idx].wait_other_up = true;
+        ctl->slots[idx].bytes_done_saved = pacer.total_bytes;
+        ctl->slots[idx].fails = 0;
+        ctl->slots[idx].retry_after_ms = 0;
+    } else {
+        ctl->slots[idx].bytes_done_saved = pacer.total_bytes;
+        if (ctl->slots[idx].fails < 6)
+            ctl->slots[idx].fails++;
+        int64_t backoff = (int64_t)500 << (ctl->slots[idx].fails - 1);
+        if (backoff > 15000)
+            backoff = 15000;
+        ctl->slots[idx].retry_after_ms = ctl_mono_ms() + backoff;
+    }
+    pthread_cond_broadcast(&ctl->idle_cv);
+    pthread_mutex_unlock(&ctl->mu);
+
+    if (rc == 0 && !atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire)) {
+        tier_health_store_replaced(t, idx, path, expect_id);
+        eccache_reopen_all(t);
+        tier_resume_if_all_up(t);
+        /* If another slot is still REPLACING waiting for this store to come UP, retry it immediately. */
+        pthread_mutex_lock(&ctl->mu);
+        for (int j = 0; j < ctl->nslots; j++)
+            if (j != idx && ctl->slots[j].needs_rebuild) {
+                ctl->slots[j].wait_other_up = false;
+                ctl->slots[j].retry_after_ms = 0;
+            }
+        pthread_mutex_unlock(&ctl->mu);
+    }
+}
+
+/* ---------------------------------------------------------------- single tier worker thread */
+
+static void ctl_wake_from_health(void *ctx)
+{
+    struct tierctl *ctl = ctx;
+    if (!ctl)
+        return;
+    pthread_mutex_lock(&ctl->mu);
+    if (!ctl->closing)
+        pthread_cond_signal(&ctl->cv);
+    pthread_mutex_unlock(&ctl->mu);
+}
+
+static void *worker_main(void *arg)
+{
+    struct tierctl *ctl = arg;
+    tier *t = ctl->t;
+#ifdef __linux__
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19); /* this thread only (D20) */
+#endif
+    int64_t next_stat_ms = ctl_mono_ms();
+    pthread_mutex_lock(&ctl->mu);
+    ctl->next_stat_ms = next_stat_ms;
+    pthread_mutex_unlock(&ctl->mu);
+
+    for (;;) {
+        if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire))
+            break;
+
+        /* 1. Off-thread eccache reopen requests from tier_store_set_down. */
+        if (tier_health_take_reopen(t)) {
+            eccache_reopen_all(t);
+            continue;
+        }
+
+        /* 2. Periodic TIERS stat/re-read (every 1 s, or immediately when woken by in-process API). */
+        int64_t now = ctl_mono_ms();
+        bool do_stat = false, forced = false;
+        if (t->from_tiers && t->dir) {
+            pthread_mutex_lock(&ctl->mu);
+            forced = ctl->check_tiers_now;
+            if (forced || now >= next_stat_ms) {
+                ctl->check_tiers_now = false;
+                ctl->checking_tiers = true;
+                do_stat = true;
+            }
+            pthread_mutex_unlock(&ctl->mu);
+        }
+        if (do_stat) {
+            int pms = ctl_poll_ms();
+            next_stat_ms = now + pms;
+            pthread_mutex_lock(&ctl->mu);
+            ctl->next_stat_ms = next_stat_ms;
+            pthread_mutex_unlock(&ctl->mu);
+            if (forced || tiers_file_changed_stat(ctl))
+                apply_tiers_changes(ctl);
+            pthread_mutex_lock(&ctl->mu);
+            ctl->checking_tiers = false;
+            pthread_cond_broadcast(&ctl->idle_cv);
+            pthread_mutex_unlock(&ctl->mu);
+        }
+
+        if (atomic_load_explicit(&ctl->closing_atomic, memory_order_acquire))
+            break;
+
+        /* 3. Queued r15-health attaches (run ahead of / between rebuild objects so a transiently stalled store
+         * recovers promptly and unblocks any parked rebuild). */
+        int64_t h_wait = 500;
+        ctl_pacer hpacer = {.ctl = ctl, .store = -1, .next_tiers_check_ms = ctl_mono_ms() + ctl_poll_ms()};
+        chunk_heal_opts htpl = {
+            .cancel = ctl_cancel_cb,
+            .cancel_ctx = ctl,
+            .pace = ctl_pace_cb,
+            .pace_ctx = &hpacer,
+        };
+        if (tier_health_run_one(t, &htpl, &h_wait)) {
+            /* A store may have just come UP: unpark any rebuild that was waiting on another transiently DOWN store. */
+            pthread_mutex_lock(&ctl->mu);
+            for (int i = 0; i < ctl->nslots; i++)
+                if (ctl->slots[i].needs_rebuild && ctl->slots[i].wait_other_up) {
+                    ctl->slots[i].wait_other_up = false;
+                    ctl->slots[i].retry_after_ms = 0;
+                }
+            pthread_mutex_unlock(&ctl->mu);
+            continue;
+        }
+
+        /* 4. Pending replacement rebuilds (yields cleanly between objects for TIERS changes and health attaches). */
+        int pick_rb = -1;
+        int64_t wait_ms = t->from_tiers ? ctl_poll_ms() : 500;
+        if (h_wait < wait_ms)
+            wait_ms = h_wait;
+        now = ctl_mono_ms();
+        if (t->from_tiers && next_stat_ms > now && next_stat_ms - now < wait_ms)
+            wait_ms = next_stat_ms - now;
+        else if (t->from_tiers && next_stat_ms <= now)
+            wait_ms = 0;
+
+        pthread_mutex_lock(&ctl->mu);
+        for (int i = 0; i < ctl->nslots; i++) {
+            if (!ctl->slots[i].needs_rebuild || ctl->slots[i].wait_other_up)
+                continue;
+            if (now >= ctl->slots[i].retry_after_ms) {
+                pick_rb = i;
+                break;
+            }
+            int64_t rem = ctl->slots[i].retry_after_ms - now;
+            if (rem < wait_ms)
+                wait_ms = rem;
+        }
+        pthread_mutex_unlock(&ctl->mu);
+
+        if (pick_rb >= 0) {
+            run_rebuild(ctl, pick_rb);
+            continue;
+        }
+
+        /* 5. Sleep until next poll, retry, or wakeup. */
+        pthread_mutex_lock(&ctl->mu);
+        if (!ctl->closing && !ctl->check_tiers_now && wait_ms > 0)
+            tsdb_cond_timedwait_ms(&ctl->cv, &ctl->mu, (uint64_t)wait_ms);
+        pthread_mutex_unlock(&ctl->mu);
+    }
+
+    pthread_mutex_lock(&ctl->mu);
+    bool drop_ref = ctl->worker_owns_ref;
+    ctl->worker_done = true;
+    pthread_cond_broadcast(&ctl->cv);
+    pthread_cond_broadcast(&ctl->idle_cv);
+    pthread_mutex_unlock(&ctl->mu);
+    if (drop_ref)
+        tier_put(t);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- lifecycle & status API */
+
+int tierctl_open(tier *t)
+{
+    if (!t || !t->be)
+        return 0;
+    struct tierctl *ctl = calloc(1, sizeof *ctl);
+    if (!ctl)
+        return TSDB_ERR_NOMEM;
+    ctl->t = t;
+    ctl->prog.store = -1;
+    pthread_mutex_init(&ctl->mu, NULL);
+    tsdb_cond_init_mono(&ctl->cv);
+    tsdb_cond_init_mono(&ctl->idle_cv);
+    atomic_init(&ctl->closing_atomic, false);
+
+    uint32_t rb_mb = TIERS_REBUILD_MB_S_DEFAULT;
+    uint32_t sc_mb = TIERS_SCRUB_MB_S_DEFAULT;
+    uint32_t sc_days = TIERS_SCRUB_DAYS_DEFAULT;
+    if (t->from_tiers) {
+        if (t->tview.global.rebuild_mb_s)
+            rb_mb = t->tview.global.rebuild_mb_s;
+        if (t->tview.global.scrub_mb_s)
+            sc_mb = t->tview.global.scrub_mb_s;
+        sc_days = t->tview.global.scrub_days;
+
+        int n = (int)t->tview.nstores;
+        if (n > TIERS_STORES_MAX)
+            n = TIERS_STORES_MAX;
+        ctl->nslots = n;
+        for (int i = 0; i < n; i++) {
+            const tiers_store *ts = &t->tview.stores[i];
+            const uint8_t *cur_id = ts->state == TIERS_STATE_REPLACED_BY ? ts->replaced_by : ts->id;
+            memcpy(ctl->slots[i].id, cur_id, 16);
+            ctl->slots[i].state = ts->state;
+            ctl->slots[i].path = ts->path ? strdup(ts->path) : NULL;
+            if (ts->path && !ctl->slots[i].path) {
+                atomic_store_explicit(&t->ctl, ctl, memory_order_release);
+                tierctl_close(t);
+                return TSDB_ERR_NOMEM;
+            }
+            if (chunk_be_store_state(t->be, i) == CHUNK_STORE_REPLACING)
+                ctl->slots[i].needs_rebuild = true;
+        }
+        ctl->tiers_file_end = t->tview.file_end;
+        if (t->dir) {
+            char tp[PATH_MAX + 16];
+            snprintf(tp, sizeof tp, "%s/%s", t->dir, TIERS_FILE);
+            if (stat(tp, &ctl->tiers_st) == 0)
+                ctl->have_tiers_st = true;
+        }
+    }
+    atomic_init(&ctl->rebuild_mb_s, rb_mb);
+    atomic_init(&ctl->scrub_mb_s, sc_mb);
+    atomic_init(&ctl->scrub_days, sc_days);
+
+    atomic_store_explicit(&t->ctl, ctl, memory_order_release);
+    tier_health_set_wake(t, ctl_wake_from_health, ctl);
+
+    if (tsdb_thread_create(&ctl->worker_th, worker_main, ctl) != 0) {
+        tier_health_set_wake(t, NULL, NULL);
+        tierctl_close(t);
+        return TSDB_ERR_NOMEM;
+    }
+    ctl->worker_started = true;
+    return 0;
+}
+
+void tierctl_quiesce(tier *t)
+{
+    if (!t)
+        return;
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl)
+        return;
+    tier_health_set_wake(t, NULL, NULL);
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->quiesced) {
+        pthread_mutex_unlock(&ctl->mu);
+        return;
+    }
+    ctl->closing = true;
+    atomic_store_explicit(&ctl->closing_atomic, true, memory_order_release);
+    ctl->quiesced = true;
+    pthread_cond_broadcast(&ctl->cv);
+    pthread_cond_broadcast(&ctl->idle_cv);
+    pthread_mutex_unlock(&ctl->mu);
+
+    struct timespec dl;
+    tsdb_cond_deadline_ms(&dl, 2000);
+    bool do_join = false, do_detach = false;
+    pthread_mutex_lock(&ctl->mu);
+    if (ctl->worker_started) {
+        while (!ctl->worker_done) {
+            if (pthread_cond_timedwait(&ctl->cv, &ctl->mu, &dl) != 0)
+                break;
+        }
+        if (ctl->worker_done) {
+            do_join = true;
+        } else {
+            do_detach = true;
+            if (tier_try_get(t) != NULL)
+                ctl->worker_owns_ref = true;
+            else
+                ctl->worker_stuck = true;
+        }
+        ctl->worker_started = false;
+    }
+    pthread_mutex_unlock(&ctl->mu);
+    if (do_join)
+        pthread_join(ctl->worker_th, NULL);
+    else if (do_detach)
+        pthread_detach(ctl->worker_th);
+}
+
+bool tierctl_close(tier *t)
+{
+    if (!t)
+        return false;
+    tierctl_quiesce(t);
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl)
+        return false;
+    if (ctl->worker_stuck)
+        return true;
+    atomic_store_explicit(&t->ctl, NULL, memory_order_release);
+    for (int i = 0; i < ctl->nslots; i++)
+        free(ctl->slots[i].path);
+    pthread_cond_destroy(&ctl->idle_cv);
+    pthread_cond_destroy(&ctl->cv);
+    pthread_mutex_destroy(&ctl->mu);
+    free(ctl);
+    return false;
+}
+
+void tierctl_wake(tier *t)
+{
+    if (!t)
+        return;
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl)
+        return;
+    pthread_mutex_lock(&ctl->mu);
+    if (!ctl->closing) {
+        ctl->check_tiers_now = true;
+        pthread_cond_signal(&ctl->cv);
+    }
+    pthread_mutex_unlock(&ctl->mu);
+}
+
+bool tierctl_get_progress(const tier *t, tierctl_progress *out)
+{
+    if (!t || !out)
+        return false;
+    memset(out, 0, sizeof *out);
+    out->store = -1;
+    struct tierctl *ctl = atomic_load_explicit(&((tier *)t)->ctl, memory_order_acquire);
+    if (!ctl)
+        return false;
+    pthread_mutex_lock(&ctl->mu);
+    *out = ctl->prog;
+    if (out->rate_mb_s == 0)
+        out->rate_mb_s = atomic_load_explicit(&ctl->rebuild_mb_s, memory_order_relaxed);
+    pthread_mutex_unlock(&ctl->mu);
+    return true;
+}
+
+int tierctl_wait_idle(tier *t, int timeout_ms)
+{
+    if (!t)
+        return 0;
+    struct tierctl *ctl = atomic_load_explicit(&t->ctl, memory_order_acquire);
+    if (!ctl)
+        return 0;
+    struct timespec dl;
+    tsdb_cond_deadline_ms(&dl, timeout_ms > 0 ? (uint64_t)timeout_ms : 10000);
+    pthread_mutex_lock(&ctl->mu);
+    for (;;) {
+        bool busy = ctl->check_tiers_now || ctl->checking_tiers || ctl->prog.active;
+        for (int i = 0; !busy && i < ctl->nslots; i++)
+            if (ctl->slots[i].needs_rebuild && !ctl->slots[i].wait_other_up)
+                busy = true;
+        if (!busy || ctl->closing) {
+            pthread_mutex_unlock(&ctl->mu);
+            return 0;
+        }
+        if (pthread_cond_timedwait(&ctl->idle_cv, &ctl->mu, &dl) == ETIMEDOUT) {
+            pthread_mutex_unlock(&ctl->mu);
+            return TSDB_ERR_UNAVAILABLE;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- tsdb_tier_lost / tierctl_lost_impl */
+
+static int read_fd_all(int fd, size_t max_bytes, char **out, size_t *len_out)
+{
+    *out = NULL;
+    *len_out = 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > max_bytes)
+        return TSDB_ERR_IO;
+    size_t sz = (size_t)st.st_size;
+    char *buf = malloc(sz + 1);
+    if (!buf)
+        return TSDB_ERR_NOMEM;
+    size_t got = 0;
+    while (got < sz) {
+        ssize_t r = pread(fd, buf + got, sz - got, (off_t)got);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            free(buf);
+            return TSDB_ERR_IO;
+        }
+        got += (size_t)r;
+    }
+    buf[sz] = '\0';
+    *out = buf;
+    *len_out = sz;
+    return 0;
+}
+
+static bool ctl_path_within(const char *a, const char *b)
+{
+    size_t bl = strlen(b);
+    if (bl == 1 && b[0] == '/')
+        return a[0] == '/';
+    return strncmp(a, b, bl) == 0 && (a[bl] == '\0' || a[bl] == '/');
+}
+
+static void ctl_path_norm(const char *p, char out[PATH_MAX])
+{
+    size_t n = strlen(p);
+    if (n >= PATH_MAX)
+        n = PATH_MAX - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    while (n > 1 && out[n - 1] == '/')
+        out[--n] = '\0';
+}
+
+static int ctl_same_dir(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0)
+        return 0;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino ? 1 : 0;
+}
+
+static int ctl_sync_parent(const char *path)
+{
+    char par[PATH_MAX];
+    snprintf(par, sizeof par, "%s", path);
+    char *sl = strrchr(par, '/');
+    if (!sl)
+        return 0;
+    if (sl == par)
+        par[1] = '\0';
+    else
+        *sl = '\0';
+    int fd = open(par, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    int rc = tsdb_fsync(fd) == 0 ? 0 : TSDB_ERR_IO;
+    close(fd);
+    return rc;
+}
+
+static int ctl_sync_adopted(const char *canon)
+{
+    int dfd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return TSDB_ERR_IO;
+    int mfd = openat(dfd, "META", O_RDONLY | O_CLOEXEC);
+    int rc = 0;
+    if (mfd < 0 || tsdb_fsync(mfd) != 0)
+        rc = TSDB_ERR_IO;
+    if (mfd >= 0)
+        close(mfd);
+    if (rc == 0 && tsdb_fsync(dfd) != 0)
+        rc = TSDB_ERR_IO;
+    close(dfd);
+    return rc;
+}
+
+static long ctl_meta_volume(const char *txt)
+{
+    for (const char *l = txt; *l;) {
+        if (strncmp(l, "volume=", 7) == 0)
+            return strtol(l + 7, NULL, 10);
+        const char *nl = strchr(l, '\n');
+        l = nl ? nl + 1 : l + strlen(l);
+    }
+    return 0;
+}
+
+static int ctl_check_root_meta(int rootfd, const char *root)
+{
+    int fd = openat(rootfd, "META", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    char *mtxt = NULL;
+    size_t mlen = 0;
+    int rc = read_fd_all(fd, 1u << 20, &mtxt, &mlen);
+    close(fd);
+    if (rc != 0)
+        return rc;
+    char *vl = strstr(mtxt, "version="), unknown[96];
+    unsigned feats = 0;
+    meta_requires_parse(mtxt, &feats, unknown, sizeof unknown);
+    long vnum = ctl_meta_volume(mtxt);
+    bool has_v8 = false;
+    for (const char *l = mtxt; *l && !has_v8;) {
+        if (strncmp(l, "parts_v8=", 9) == 0)
+            has_v8 = true;
+        const char *nl = strchr(l, '\n');
+        l = nl ? nl + 1 : l + strlen(l);
+    }
+    if ((vl ? atoi(vl + 8) : 0) != FORMAT_VERSION || unknown[0] ||
+        (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || vnum != 0) {
+        fprintf(stderr, "tsdb: tier lost: %s/META is not a local format %d database root: refused\n", root,
+                FORMAT_VERSION);
+        free(mtxt);
+        return TSDB_ERR_INVALID;
+    }
+    if (has_v8) {
+        fprintf(stderr, "tsdb: tier lost: %s/META still records format-8 parts (parts_v8=); run `tsdb %s optimize` "
+                        "first: refused\n", root, root);
+        free(mtxt);
+        return TSDB_ERR_INVALID;
+    }
+    free(mtxt);
+    return 0;
+}
+
+static void ctl_free_paths(char **paths, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        free(paths[i]);
+    free(paths);
+}
+
+static int ctl_read_volumes(int vfd, char ***paths_out, size_t *n_out)
+{
+    *paths_out = NULL;
+    *n_out = 0;
+    char *txt = NULL;
+    size_t len = 0;
+    int rc = read_fd_all(vfd, 16u << 20, &txt, &len);
+    if (rc != 0)
+        return rc;
+    char **paths = NULL;
+    size_t n = 0, cap = 0;
+    for (char *line = txt; line < txt + len;) {
+        char *nl = memchr(line, '\n', len - (size_t)(line - txt));
+        if (!nl)
+            break;
+        *nl = '\0';
+        size_t ll = (size_t)(nl - line);
+        if (ll < 10 || line[8] != ' ' || line[9] != '/') {
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            char **np = realloc(paths, cap * sizeof *np);
+            if (!np) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            paths = np;
+        }
+        paths[n] = strdup(line + 9);
+        if (!paths[n]) {
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        n++;
+        line = nl + 1;
+    }
+    free(txt);
+    if (rc != 0) {
+        ctl_free_paths(paths, n);
+        return rc;
+    }
+    *paths_out = paths;
+    *n_out = n;
+    return 0;
+}
+
+/* Directory check for replacement store (matching r15-tiers' tier_dir_check, plus allowing REBUILDING on adopt). */
+static int ctl_dir_check(const char *canon, const uint8_t db_id[16], const tiers_view *tv, bool *adopt_out,
+                         uint8_t sid_out[16])
+{
+    *adopt_out = false;
+    int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    DIR *d = fdopendir(fd);
+    if (!d) {
+        close(fd);
+        return TSDB_ERR_IO;
+    }
+    bool has_meta = false;
+    char other[256] = "";
+    struct dirent *e;
+    errno = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (strcmp(e->d_name, "META") == 0) {
+            has_meta = true;
+        } else if (strcmp(e->d_name, "META.tmp") == 0 || strcmp(e->d_name, TIERCTL_REBUILDING_FILE) == 0 ||
+                   strcmp(e->d_name, TIERCTL_REBUILDING_FILE ".tmp") == 0) {
+            /* crashed init/rebuilding temporary; cleaned or adopted below */
+        } else if (!other[0]) {
+            snprintf(other, sizeof other, "%s", e->d_name);
+        }
+    }
+    int rerr = errno;
+    closedir(d);
+    if (rerr)
+        return TSDB_ERR_IO;
+
+    if (has_meta) {
+        uint8_t exist_sid[16];
+        chunk_store_owner ow = {0};
+        int mrc = chunk_store_meta_read(canon, exist_sid, &ow);
+        if (mrc == 0 && ow.db_set) {
+            char have_hex[33];
+            chunk_oid_hex(ow.db_id, have_hex);
+            if (memcmp(ow.db_id, db_id, 16) != 0) {
+                char want_hex[33];
+                chunk_oid_hex(db_id, want_hex);
+                fprintf(stderr, "tsdb: tier lost --replace %s: store META belongs to database %s, not %s: refused\n",
+                        canon, have_hex, want_hex);
+                return TSDB_ERR_INVALID;
+            }
+            bool known = false;
+            for (size_t i = 0; i < tv->nseen_ids; i++)
+                if (memcmp(tv->seen_ids[i], exist_sid, 16) == 0)
+                    known = true;
+            if (known) {
+                fprintf(stderr, "tsdb: tier lost --replace %s: store is already recorded in TIERS: refused\n", canon);
+                return TSDB_ERR_INVALID;
+            }
+            if (other[0]) {
+                fprintf(stderr, "tsdb: tier lost --replace %s: directory is not empty (found %s): refused\n", canon,
+                        other);
+                return TSDB_ERR_INVALID;
+            }
+            memcpy(sid_out, exist_sid, 16);
+            *adopt_out = true;
+            return 0;
+        }
+        if (mrc == 0) {
+            fprintf(stderr, "tsdb: tier lost --replace %s: directory already holds an unbound/cluster store META: "
+                            "refused\n", canon);
+            return TSDB_ERR_INVALID;
+        }
+        fprintf(stderr, "tsdb: tier lost --replace %s: directory is not empty (found META): refused\n", canon);
+        return TSDB_ERR_INVALID;
+    }
+    if (other[0]) {
+        fprintf(stderr, "tsdb: tier lost --replace %s: directory is not empty (found %s): refused\n", canon, other);
+        return TSDB_ERR_INVALID;
+    }
+    return 0;
+}
+
+static bool parse_hex16(const char *s, uint8_t out[16])
+{
+    if (!s || strlen(s) != 32)
+        return false;
+    for (int i = 0; i < 16; i++) {
+        int a = s[2 * i] >= '0' && s[2 * i] <= '9'       ? s[2 * i] - '0'
+              : s[2 * i] >= 'a' && s[2 * i] <= 'f'       ? s[2 * i] - 'a' + 10
+              : s[2 * i] >= 'A' && s[2 * i] <= 'F'       ? s[2 * i] - 'A' + 10
+                                                         : -1;
+        int b = s[2 * i + 1] >= '0' && s[2 * i + 1] <= '9' ? s[2 * i + 1] - '0'
+              : s[2 * i + 1] >= 'a' && s[2 * i + 1] <= 'f' ? s[2 * i + 1] - 'a' + 10
+              : s[2 * i + 1] >= 'A' && s[2 * i + 1] <= 'F' ? s[2 * i + 1] - 'A' + 10
+                                                           : -1;
+        if (a < 0 || b < 0)
+            return false;
+        out[i] = (uint8_t)((a << 4) | b);
+    }
+    return true;
+}
+
+/* Resolves STORE specification (32-hex id, index "N" or "sN", or store path) into a slot index in tv. */
+static int resolve_store(const tiers_view *tv, const char *spec, size_t *idx_out)
+{
+    if (!spec || !*spec)
+        return TSDB_ERR_INVALID;
+    uint8_t hid[16];
+    if (parse_hex16(spec, hid)) {
+        for (size_t i = 0; i < tv->nstores; i++) {
+            const tiers_store *st = &tv->stores[i];
+            const uint8_t *cur = st->state == TIERS_STATE_REPLACED_BY ? st->replaced_by : st->id;
+            if (memcmp(cur, hid, 16) == 0 || (st->state == TIERS_STATE_LOST && memcmp(st->id, hid, 16) == 0)) {
+                *idx_out = i;
+                return 0;
+            }
+        }
+        return TSDB_ERR_NOTFOUND;
+    }
+    if (spec[0] == '/') {
+        char norm[PATH_MAX], canon[PATH_MAX];
+        ctl_path_norm(spec, norm);
+        /* Match recorded paths directly before calling realpath(): a lost NFS mount can hang in realpath(). */
+        for (size_t i = 0; i < tv->nstores; i++) {
+            if (strcmp(tv->stores[i].path, spec) == 0 || strcmp(tv->stores[i].path, norm) == 0) {
+                *idx_out = i;
+                return 0;
+            }
+        }
+        const char *rp = realpath(spec, canon);
+        if (rp) {
+            for (size_t i = 0; i < tv->nstores; i++) {
+                if (strcmp(tv->stores[i].path, rp) == 0) {
+                    *idx_out = i;
+                    return 0;
+                }
+            }
+        }
+        return TSDB_ERR_NOTFOUND;
+    }
+    const char *num = (spec[0] == 's' || spec[0] == 'S') ? spec + 1 : spec;
+    if (!isdigit((unsigned char)num[0]))
+        return TSDB_ERR_INVALID;
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(num, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || v >= tv->nstores)
+        return TSDB_ERR_NOTFOUND;
+    *idx_out = (size_t)v;
+    return 0;
+}
+
+int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store, const char *replace_path,
+                      const char *opt_class, uint32_t flags, uint8_t new_id_out[16], int *slot_out)
+{
+    if (!root || !store || !*store || !replace_path || !*replace_path)
+        return TSDB_ERR_INVALID;
+    if (flags & ~(TSDB_TIER_SINGLE_COPY | TSDB_TIER_ALLOW_SHARED_DEV))
+        return TSDB_ERR_INVALID;
+    uint8_t opt_cls = TSDB_TIER_CLASS_UNKNOWN;
+    if (opt_class && tiers_class_parse(opt_class, &opt_cls) != 0) {
+        fprintf(stderr, "tsdb: tier lost: unknown class '%s' (expected nvme, ssd, hdd or unknown)\n", opt_class);
+        return TSDB_ERR_INVALID;
+    }
+    if (tiers_path_valid(replace_path) != 0) {
+        fprintf(stderr, "tsdb: tier lost --replace %s: store path must be absolute without '.' or '..'\n", replace_path);
+        return TSDB_ERR_INVALID;
+    }
+    int rc = ctl_check_root_meta(rootfd, root);
+    if (rc != 0)
+        return rc;
+
+    char norm[PATH_MAX];
+    ctl_path_norm(replace_path, norm);
+    if (ctl_path_within(norm, root) || ctl_path_within(root, norm)) {
+        fprintf(stderr, "tsdb: tier lost --replace %s: overlaps database root %s: refused\n", norm, root);
+        return TSDB_ERR_INVALID;
+    }
+
+    char canon[PATH_MAX];
+    bool made = mkdir(replace_path, 0755) == 0;
+    if (!made && errno != EEXIST)
+        return TSDB_ERR_IO;
+    if (!realpath(replace_path, canon)) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    if (tiers_path_valid(canon) != 0) {
+        rc = TSDB_ERR_INVALID;
+        goto fail_mkdir;
+    }
+    struct stat st_new;
+    if (stat(canon, &st_new) != 0) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    if (!S_ISDIR(st_new.st_mode)) {
+        fprintf(stderr, "tsdb: tier lost --replace %s: not a directory: refused\n", canon);
+        rc = TSDB_ERR_INVALID;
+        goto fail_mkdir;
+    }
+
+    int vfd = openat(rootfd, "VOLUMES", O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (vfd < 0) {
+        rc = TSDB_ERR_IO;
+        goto fail_mkdir;
+    }
+    char **vpaths = NULL;
+    size_t nv = 0;
+    tiers_view tv;
+    tiers_view_init(&tv);
+
+    rc = ctl_ofd_lock(vfd, F_WRLCK);
+    if (rc == 0)
+        rc = ctl_read_volumes(vfd, &vpaths, &nv);
+    if (rc == 0)
+        rc = tiers_load(rootfd, true, sync, &tv);
+    bool has_db_id = false;
+    uint8_t db_id[16];
+    memset(db_id, 0, sizeof db_id);
+    if (rc == 0) {
+        if (tv.nstores == 0) {
+            fprintf(stderr, "tsdb: tier lost: %s has no tier stores\n", root);
+            rc = TSDB_ERR_INVALID;
+        } else {
+            rc = tiers_db_id_read(rootfd, &has_db_id, db_id);
+            if (rc == 0 && !has_db_id) {
+                fprintf(stderr, "tsdb: tier lost: %s/%s lists %zu store(s) but root META has no db_id=: refused\n",
+                        root, TIERS_FILE, tv.nstores);
+                rc = TSDB_ERR_CORRUPT;
+            }
+        }
+    }
+
+    size_t tidx = 0;
+    if (rc == 0) {
+        rc = resolve_store(&tv, store, &tidx);
+        if (rc != 0)
+            fprintf(stderr, "tsdb: tier lost: store '%s' not found in %s (%zu store(s))\n", store, TIERS_FILE,
+                    tv.nstores);
+    }
+
+    /* Path nesting / overlap checks against root, volumes, and every OTHER non-lost store. */
+    if (rc == 0 && (ctl_path_within(canon, root) || ctl_path_within(root, canon) || ctl_same_dir(canon, root) > 0)) {
+        fprintf(stderr, "tsdb: tier lost --replace %s: overlaps database root %s: refused\n", canon, root);
+        rc = TSDB_ERR_INVALID;
+    }
+    for (size_t i = 0; rc == 0 && i < nv; i++) {
+        if (ctl_path_within(canon, vpaths[i]) || ctl_path_within(vpaths[i], canon) ||
+            ctl_same_dir(canon, vpaths[i]) > 0) {
+            fprintf(stderr, "tsdb: tier lost --replace %s: overlaps volume %s: refused\n", canon, vpaths[i]);
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+    for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
+        if (i == tidx || tv.stores[i].state == TIERS_STATE_LOST)
+            continue;
+        if (ctl_path_within(canon, tv.stores[i].path) || ctl_path_within(tv.stores[i].path, canon) ||
+            ctl_same_dir(canon, tv.stores[i].path) > 0) {
+            fprintf(stderr, "tsdb: tier lost --replace %s: overlaps existing tier store %s: refused\n", canon,
+                    tv.stores[i].path);
+            rc = TSDB_ERR_INVALID;
+        }
+    }
+
+    /* Device (st_dev) isolation check (E58, D18) unless TSDB_TIER_ALLOW_SHARED_DEV is set. */
+    if (rc == 0 && !(flags & TSDB_TIER_ALLOW_SHARED_DEV)) {
+        struct stat st_cmp;
+        if (stat("/", &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+            fprintf(stderr, "tsdb: tier lost --replace %s: is on the same device as /: refused (pass "
+                            "--allow-shared-device for tests)\n", canon);
+            rc = TSDB_ERR_INVALID;
+        }
+        if (rc == 0 && fstat(rootfd, &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+            fprintf(stderr, "tsdb: tier lost --replace %s: is on the same device as database root %s: refused (pass "
+                            "--allow-shared-device for tests)\n", canon, root);
+            rc = TSDB_ERR_INVALID;
+        }
+        for (size_t i = 0; rc == 0 && i < nv; i++) {
+            if (stat(vpaths[i], &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+                fprintf(stderr, "tsdb: tier lost --replace %s: is on the same device as volume %s: refused (pass "
+                                "--allow-shared-device for tests)\n", canon, vpaths[i]);
+                rc = TSDB_ERR_INVALID;
+            }
+        }
+        for (size_t i = 0; rc == 0 && i < tv.nstores; i++) {
+            if (i == tidx || tv.stores[i].state == TIERS_STATE_LOST)
+                continue;
+            if (stat(tv.stores[i].path, &st_cmp) == 0 && st_new.st_dev == st_cmp.st_dev) {
+                fprintf(stderr, "tsdb: tier lost --replace %s: is on the same device as tier store %s: refused (pass "
+                                "--allow-shared-device for tests)\n", canon, tv.stores[i].path);
+                rc = TSDB_ERR_INVALID;
+            }
+        }
+    }
+
+    /* Check replacement directory is empty (or crashed init of this db), never non-empty or foreign db. */
+    bool adopt = false;
+    uint8_t new_sid[16];
+    memset(new_sid, 0, sizeof new_sid);
+    if (rc == 0)
+        rc = ctl_dir_check(canon, db_id, &tv, &adopt, new_sid);
+
+    /* Step 1: initialize replacement store META (bound to db_id) + durable REBUILDING marker BEFORE TIERS update. */
+    if (rc == 0 && made && sync)
+        rc = ctl_sync_parent(canon);
+    if (rc == 0) {
+        if (adopt) {
+            if (sync)
+                rc = ctl_sync_adopted(canon);
+        } else {
+            chunk_store_owner ow = {.db_set = true};
+            memcpy(ow.db_id, db_id, 16);
+            rc = chunk_store_init2(canon, NULL, &ow, new_sid);
+        }
+    }
+    if (rc == 0)
+        rc = write_rebuilding_marker(canon, sync);
+
+    /* Step 2: append STATE LOST (if store is not already LOST) and STATE REPLACED_BY to TIERS under VOLUMES lock. */
+    if (rc == 0) {
+        const tiers_store *target = &tv.stores[tidx];
+        uint8_t lost_id[16];
+        if (target->state == TIERS_STATE_REPLACED_BY)
+            memcpy(lost_id, target->replaced_by, 16);
+        else
+            memcpy(lost_id, target->id, 16);
+
+        uint8_t new_cls = opt_class ? opt_cls : target->cls;
+        bool new_sc = (flags & TSDB_TIER_SINGLE_COPY) ? true : target->single_copy;
+
+        if (target->state != TIERS_STATE_LOST)
+            rc = tiers_append_state(rootfd, sync, lost_id, TIERS_STATE_LOST, 0, false, NULL, NULL);
+        if (rc == 0)
+            rc = tiers_append_state(rootfd, sync, lost_id, TIERS_STATE_REPLACED_BY, new_cls, new_sc, new_sid, canon);
+    }
+
+    if (rc == 0) {
+        if (new_id_out)
+            memcpy(new_id_out, new_sid, 16);
+        if (slot_out)
+            *slot_out = (int)tidx;
+    }
+
+    tiers_view_free(&tv);
+    ctl_free_paths(vpaths, nv);
+    close(vfd);
+
+fail_mkdir:
+    if (rc != 0 && made)
+        (void)rmdir(replace_path);
+    return rc;
+}
+
+int tierctl_lost_dir(const char *dir, const char *store, const char *replace_path, const char *opt_class,
+                     uint32_t flags, uint8_t new_id_out[16], int *slot_out)
+{
+    if (!dir || !*dir)
+        return TSDB_ERR_INVALID;
+    char root[PATH_MAX];
+    if (!realpath(dir, root))
+        return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+    int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0)
+        return TSDB_ERR_IO;
+    int rc = tierctl_lost_impl(rootfd, root, true, store, replace_path, opt_class, flags, new_id_out, slot_out);
+    close(rootfd);
+    return rc;
+}
+
+#else /* !TSDB_EC */
+
+int tierctl_open(struct tier *t)
+{
+    (void)t;
+    return 0;
+}
+void tierctl_quiesce(struct tier *t) { (void)t; }
+bool tierctl_close(struct tier *t)
+{
+    (void)t;
+    return false;
+}
+void tierctl_wake(struct tier *t) { (void)t; }
+bool tierctl_get_progress(const struct tier *t, tierctl_progress *out)
+{
+    (void)t;
+    if (out) {
+        memset(out, 0, sizeof *out);
+        out->store = -1;
+    }
+    return false;
+}
+int tierctl_wait_idle(struct tier *t, int timeout_ms)
+{
+    (void)t;
+    (void)timeout_ms;
+    return 0;
+}
+int tierctl_lost_impl(int rootfd, const char *root, bool sync, const char *store, const char *replace_path,
+                      const char *opt_class, uint32_t flags, uint8_t new_id_out[16], int *slot_out)
+{
+    (void)rootfd, (void)root, (void)sync, (void)store, (void)replace_path, (void)opt_class, (void)flags;
+    (void)new_id_out, (void)slot_out;
+    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
+    return TSDB_ERR_INVALID;
+}
+int tierctl_lost_dir(const char *dir, const char *store, const char *replace_path, const char *opt_class,
+                     uint32_t flags, uint8_t new_id_out[16], int *slot_out)
+{
+    (void)dir, (void)store, (void)replace_path, (void)opt_class, (void)flags, (void)new_id_out, (void)slot_out;
+    fprintf(stderr, "tsdb: tier lost: not built with the erasure codec (TSDB_EC)\n");
+    return TSDB_ERR_INVALID;
+}
+
+#endif

@@ -1009,8 +1009,9 @@ void chunk_be_set_put_cap(chunk_backend *be, unsigned max_pct)
     if (!be)
         return;
     atomic_store_explicit(&be->put_max_pct, max_pct, memory_order_release);
-    for (int i = 0; i < be->n; i++) {
-        chunk_store *st = chunk_be_store_ref(be, i);
+    int n = atomic_load_explicit(&be->n, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        chunk_store *st = chunk_be_raw_store_ref(be, i);
         if (st) {
             atomic_store_explicit(&st->put_max_pct, max_pct, memory_order_release);
             chunk_store_unref(st);
@@ -1036,7 +1037,8 @@ bool chunk_be_any_store_full(chunk_backend *be)
     /* Read-only cached fill % (zero syscalls): the detached per-store probe threads (tier_health.c) and real puts
      * (wr_open) refresh fill_pct. Calling fstatvfs() here from the shared settle thread would hang eng_close/tsdb_close
      * whenever a tier store on NFS stalls. */
-    for (int i = 0; i < be->n; i++) {
+    int n = atomic_load_explicit(&be->n, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
         chunk_store *st = chunk_be_store_ref(be, i);
         bool full = st && store_cached_fill_pct(st) > cap;
         chunk_store_unref(st);
@@ -1660,12 +1662,14 @@ static struct fence *fence_find(chunk_backend *be, uint32_t vol, bool add)
 
 chunk_store *chunk_be_raw_store(const chunk_backend *be, int i)
 {
-    return be && i >= 0 && i < be->n ? atomic_load_explicit(&be->st[i], memory_order_acquire) : NULL;
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    return be && i >= 0 && i < n ? atomic_load_explicit(&be->st[i], memory_order_acquire) : NULL;
 }
 
 chunk_store *chunk_be_store_ref(const chunk_backend *be, int i)
 {
-    if (!be || i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return NULL;
     chunk_backend *mbe = (chunk_backend *)be;
     pthread_mutex_lock(&mbe->st_mu);
@@ -1681,7 +1685,8 @@ chunk_store *chunk_be_store_ref(const chunk_backend *be, int i)
 
 chunk_store *chunk_be_raw_store_ref(const chunk_backend *be, int i)
 {
-    if (!be || i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return NULL;
     chunk_backend *mbe = (chunk_backend *)be;
     pthread_mutex_lock(&mbe->st_mu);
@@ -1694,7 +1699,8 @@ chunk_store *chunk_be_raw_store_ref(const chunk_backend *be, int i)
 
 chunk_store *chunk_be_open_store(const chunk_backend *be, int i)
 {
-    if (i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return NULL;
     int s = atomic_load_explicit(&be->state[i], memory_order_acquire);
     if (s != CHUNK_STORE_UP && s != CHUNK_STORE_REPLACING)
@@ -1706,7 +1712,8 @@ chunk_store *chunk_be_store(chunk_backend *be, int i) { return chunk_be_open_sto
 
 int chunk_be_store_state(const chunk_backend *be, int i)
 {
-    if (!be || i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return -1;
     int s = atomic_load_explicit(&be->state[i], memory_order_acquire);
     if ((s == CHUNK_STORE_UP || s == CHUNK_STORE_REPLACING) &&
@@ -1717,7 +1724,8 @@ int chunk_be_store_state(const chunk_backend *be, int i)
 
 int chunk_be_mark_down(chunk_backend *be, int i, const chunk_store *expected, int state)
 {
-    if (!be || i < 0 || i >= be->n ||
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n ||
         (state != CHUNK_STORE_DOWN_DAMAGED && state != CHUNK_STORE_DOWN_IOERR))
         return 0;
     pthread_mutex_lock(&be->st_mu);
@@ -1732,9 +1740,62 @@ int chunk_be_mark_down(chunk_backend *be, int i, const chunk_store *expected, in
     return changed;
 }
 
+void chunk_be_set_lost(chunk_backend *be, int i, bool lost)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
+        return;
+    atomic_store_explicit(&be->st_lost[i], lost, memory_order_release);
+}
+
+bool chunk_be_store_is_lost(const chunk_backend *be, int i)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
+        return false;
+    return atomic_load_explicit(&be->st_lost[i], memory_order_acquire);
+}
+
+int chunk_be_mark_lost(chunk_backend *be, int i)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&be->st_mu);
+    atomic_store_explicit(&be->st_lost[i], true, memory_order_release);
+    atomic_store_explicit(&be->state[i], CHUNK_STORE_DOWN_MISSING, memory_order_release);
+    atomic_store_explicit(&be->st_failed[i], false, memory_order_release);
+    chunk_store *old = atomic_load_explicit(&be->st[i], memory_order_relaxed);
+    atomic_store_explicit(&be->st[i], NULL, memory_order_release);
+    if (old) {
+        old->next_pending = be->pending_close[i];
+        be->pending_close[i] = old;
+    }
+    pthread_mutex_unlock(&be->st_mu);
+    return 0;
+}
+
+int chunk_be_set_replacing(chunk_backend *be, int i)
+{
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
+        return TSDB_ERR_INVALID;
+    pthread_mutex_lock(&be->st_mu);
+    chunk_store *st = atomic_load_explicit(&be->st[i], memory_order_relaxed);
+    if (!st) {
+        pthread_mutex_unlock(&be->st_mu);
+        return TSDB_ERR_UNAVAILABLE;
+    }
+    atomic_store_explicit(&be->st_lost[i], false, memory_order_release);
+    atomic_store_explicit(&be->state[i], CHUNK_STORE_REPLACING, memory_order_release);
+    pthread_mutex_unlock(&be->st_mu);
+    return 0;
+}
+
 bool chunk_be_store_path_copy(const chunk_backend *be, int i, char *buf, size_t cap)
 {
-    if (!be || i < 0 || i >= be->n || !buf || cap == 0)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n || !buf || cap == 0)
         return false;
     chunk_backend *mbe = (chunk_backend *)be;
     bool ok = false;
@@ -1751,7 +1812,8 @@ bool chunk_be_store_path_copy(const chunk_backend *be, int i, char *buf, size_t 
 
 void chunk_be_release_down(chunk_backend *be, int i)
 {
-    if (!be || i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return;
     pthread_mutex_lock(&be->st_mu);
     chunk_store *list = be->pending_close ? be->pending_close[i] : NULL;
@@ -1768,7 +1830,8 @@ void chunk_be_release_down(chunk_backend *be, int i)
 
 int chunk_be_set_down(chunk_backend *be, int i, int reason)
 {
-    if (!be || i < 0 || i >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || i < 0 || i >= n)
         return TSDB_ERR_INVALID;
     if (reason != CHUNK_STORE_DOWN_IOERR && reason != CHUNK_STORE_DOWN_STALLED)
         return TSDB_ERR_INVALID;
@@ -1816,7 +1879,8 @@ void chunk_be_set_ioerr_cb(chunk_backend *be, void (*fn)(void *ctx, int store), 
 
 void chunk_be_note_ioerr(chunk_backend *be, int store)
 {
-    if (!be || store < 0 || store >= be->n)
+    int n = be ? atomic_load_explicit(&be->n, memory_order_acquire) : 0;
+    if (!be || store < 0 || store >= n)
         return;
     pthread_mutex_lock(&be->st_mu);
     void (*fn)(void *, int) = be->on_ioerr;
@@ -1863,16 +1927,19 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
     chunk_backend *be = calloc(1, sizeof *be);
     if (!be)
         return TSDB_ERR_NOMEM;
-    be->st = calloc((size_t)n, sizeof *be->st);
-    be->state = calloc((size_t)n, sizeof *be->state);
-    be->st_failed = calloc((size_t)n, sizeof *be->st_failed);
-    be->pending_close = calloc((size_t)n, sizeof *be->pending_close);
-    be->path = calloc((size_t)n, sizeof *be->path);
+    int cap = n > 64 ? n : 64;
+    be->cap = cap;
+    be->st = calloc((size_t)cap, sizeof *be->st);
+    be->state = calloc((size_t)cap, sizeof *be->state);
+    be->st_failed = calloc((size_t)cap, sizeof *be->st_failed);
+    be->st_lost = calloc((size_t)cap, sizeof *be->st_lost);
+    be->pending_close = calloc((size_t)cap, sizeof *be->pending_close);
+    be->path = calloc((size_t)cap, sizeof *be->path);
     pthread_mutex_init(&be->mu, NULL);
     pthread_mutex_init(&be->st_mu, NULL);
     pthread_cond_init(&be->ioerr_cv, NULL);
-    int rc = be->st && be->state && be->st_failed && be->pending_close && be->path ? 0 : TSDB_ERR_NOMEM;
-    be->n = rc == 0 ? n : 0; /* chunk_be_close closes what is open (NULL for the stores not opened) */
+    int rc = be->st && be->state && be->st_failed && be->st_lost && be->pending_close && be->path ? 0 : TSDB_ERR_NOMEM;
+    atomic_init(&be->n, rc == 0 ? n : 0); /* chunk_be_close closes what is open (NULL for the stores not opened) */
     int rcs[64]; /* why a store is down, for the message when too few are up */
     int up = 0;
     for (int i = 0; i < n && rc == 0; i++) {
@@ -1944,7 +2011,8 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
         fprintf(stderr, "tsdb: chunk backend: %d of %d stores are up, %d are needed: down: %s\n", up, n, need, names);
         rc = TSDB_ERR_UNAVAILABLE;
     }
-    for (int i = 0; i < be->n && rc == 0; i++) { /* the fence: the maximum over the stores present */
+    int bn = atomic_load_explicit(&be->n, memory_order_relaxed);
+    for (int i = 0; i < bn && rc == 0; i++) { /* the fence: the maximum over the stores present */
         chunk_store *st = atomic_load(&be->st[i]);
         if (!st)
             continue;
@@ -1983,7 +2051,8 @@ void chunk_be_close(chunk_backend *be)
     chunk_rpool *rp = atomic_load_explicit(&be->rpool, memory_order_acquire);
     if (rp)
         chunk_rpool_destroy(rp);
-    for (int i = 0; i < be->n; i++) {
+    int bn = atomic_load_explicit(&be->n, memory_order_relaxed);
+    for (int i = 0; i < bn; i++) {
         chunk_store_unref(atomic_load(&be->st[i])); /* NULL for a store opened or set as down */
         chunk_be_release_down(be, i);
         free(be->path[i]);
@@ -1996,6 +2065,7 @@ void chunk_be_close(chunk_backend *be)
     free(be->st);
     free(be->state);
     free(be->st_failed);
+    free(be->st_lost);
     free(be->pending_close);
     free(be->path);
     free(be->retired);
@@ -2003,7 +2073,94 @@ void chunk_be_close(chunk_backend *be)
     free(be);
 }
 
-int chunk_be_nstores(const chunk_backend *be) { return be->n; }
+int chunk_be_nstores(const chunk_backend *be) { return atomic_load_explicit(&be->n, memory_order_acquire); }
+
+int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expect_id, const uint8_t *expect_db,
+                       bool replacing)
+{
+    if (!be || !path)
+        return TSDB_ERR_INVALID;
+    int idx = atomic_load_explicit(&be->n, memory_order_acquire);
+    if (idx >= be->cap)
+        return TSDB_ERR_INVALID;
+    chunk_store *ns = NULL;
+    int rc = chunk_store_open_db_quiet(path, expect_id, expect_db, &ns);
+    if (rc != 0)
+        return rc;
+    for (int j = 0; j < idx; j++) {
+        chunk_store *sj = chunk_be_store_ref(be, j);
+        bool dup = sj && memcmp(chunk_store_id(sj), chunk_store_id(ns), 16) == 0;
+        chunk_store_unref(sj);
+        if (dup) {
+            chunk_store_close(ns);
+            return TSDB_ERR_INVALID;
+        }
+    }
+    /* Raise every known volume's fence in the newly opened store before publishing it. */
+    uint32_t *vols = NULL;
+    size_t nv = 0;
+    rc = chunk_be_volumes_list(be, &vols, &nv);
+    for (size_t j = 0; rc == 0 && j < nv; j++) {
+        uint64_t ep = chunk_be_epoch(be, vols[j]);
+        if (ep > 0)
+            rc = chunk_store_raise(ns, vols[j], ep);
+    }
+    free(vols);
+    if (rc != 0) {
+        chunk_store_close(ns);
+        return rc;
+    }
+    char *pcopy = strdup(path);
+    if (!pcopy) {
+        chunk_store_close(ns);
+        return TSDB_ERR_NOMEM;
+    }
+    pthread_mutex_lock(&be->mu);
+    int cur_n = atomic_load_explicit(&be->n, memory_order_relaxed);
+    if (cur_n >= be->cap) {
+        pthread_mutex_unlock(&be->mu);
+        free(pcopy);
+        chunk_store_close(ns);
+        return TSDB_ERR_INVALID;
+    }
+    pthread_mutex_lock(&be->st_mu);
+    be->path[cur_n] = pcopy;
+    chunk_store_bind_be(ns, be, cur_n);
+    atomic_store_explicit(&be->st_failed[cur_n], chunk_store_failed(ns), memory_order_release);
+    atomic_store_explicit(&be->st_lost[cur_n], false, memory_order_release);
+    atomic_store_explicit(&be->state[cur_n], replacing ? CHUNK_STORE_REPLACING : CHUNK_STORE_UP, memory_order_release);
+    atomic_store_explicit(&be->st[cur_n], ns, memory_order_release);
+    atomic_store_explicit(&be->n, cur_n + 1, memory_order_release);
+    pthread_mutex_unlock(&be->st_mu);
+    pthread_mutex_unlock(&be->mu);
+    return 0;
+}
+
+int chunk_be_add_lost(chunk_backend *be, const char *path)
+{
+    if (!be)
+        return TSDB_ERR_INVALID;
+    char *pcopy = path ? strdup(path) : NULL;
+    if (path && !pcopy)
+        return TSDB_ERR_NOMEM;
+    pthread_mutex_lock(&be->mu);
+    int cur_n = atomic_load_explicit(&be->n, memory_order_relaxed);
+    if (cur_n >= be->cap) {
+        pthread_mutex_unlock(&be->mu);
+        free(pcopy);
+        return TSDB_ERR_INVALID;
+    }
+    pthread_mutex_lock(&be->st_mu);
+    be->path[cur_n] = pcopy;
+    atomic_store_explicit(&be->st_failed[cur_n], false, memory_order_release);
+    atomic_store_explicit(&be->st_lost[cur_n], true, memory_order_release);
+    atomic_store_explicit(&be->state[cur_n], CHUNK_STORE_DOWN_MISSING, memory_order_release);
+    atomic_store_explicit(&be->st[cur_n], NULL, memory_order_release);
+    atomic_store_explicit(&be->n, cur_n + 1, memory_order_release);
+    pthread_mutex_unlock(&be->st_mu);
+    pthread_mutex_unlock(&be->mu);
+    return 0;
+}
 
 uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume)
 {
@@ -2019,8 +2176,9 @@ int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
     pthread_mutex_lock(&be->mu);
     struct fence *f = fence_find(be, volume, true);
     int rc = f ? 0 : TSDB_ERR_NOMEM;
+    int bn = atomic_load_explicit(&be->n, memory_order_acquire);
     bool unsure = false; /* a store whose EPOCH lost a slot needs this call even at the epoch it already holds */
-    for (int i = 0; f && i < be->n; i++) {
+    for (int i = 0; f && i < bn; i++) {
         chunk_store *st = chunk_be_store_ref(be, i);
         unsure |= st && chunk_store_epoch_unsure(st, volume);
         chunk_store_unref(st);
@@ -2029,7 +2187,7 @@ int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
         if (e > f->epoch)
             f->epoch = e; /* in memory first: a store that fails to sync it still does not act below it */
         int ok = 0;
-        for (int i = 0; i < be->n; i++) {
+        for (int i = 0; i < bn; i++) {
             chunk_store *st = chunk_be_store_ref(be, i);
             if (!st || chunk_store_failed(st)) {
                 chunk_store_unref(st);
@@ -2057,7 +2215,8 @@ int chunk_be_prepare(chunk_backend *be, uint32_t volume, uint64_t e)
     uint64_t cur = chunk_be_epoch(be, volume);
     if (e < cur && chunk_mutant != CHUNK_MUT_NOFENCE)
         return CHUNK_ERR_FENCED;
-    for (int i = 0; i < be->n; i++) {
+    int bn = chunk_be_nstores(be);
+    for (int i = 0; i < bn; i++) {
         chunk_store *st = chunk_be_store_ref(be, i);
         bool u = st && chunk_store_epoch_unsure(st, volume);
         chunk_store_unref(st);
@@ -2072,7 +2231,7 @@ static chunk_store *be_target_ref(chunk_backend *be, int store, const chunk_iden
     if (store < 0)
         store = chunk_be_place(be, id->oid, id->pos);
     *err = 0;
-    if (store >= be->n) {
+    if (store >= chunk_be_nstores(be)) {
         *err = TSDB_ERR_INVALID;
         return NULL;
     }
@@ -2082,9 +2241,60 @@ static chunk_store *be_target_ref(chunk_backend *be, int store, const chunk_iden
     return st;
 }
 
+int chunk_be_place_n(const uint8_t oid[16], unsigned pos, int n)
+{
+    if (n <= 0)
+        return 0;
+    return (int)((xxh64(oid, 16, 0) + pos) % (uint64_t)n);
+}
+
+int chunk_be_infer_place_n(const chunk_backend *be, const uint8_t oid[16], unsigned np, const int *obs_store,
+                           const unsigned *obs_pos, size_t nobs, int target_store)
+{
+    int bn = chunk_be_nstores(be);
+    if (bn <= 0 || nobs == 0 || !obs_store || !obs_pos)
+        return bn;
+    int min_n = np >= 2 ? (int)np : 1;
+    if (min_n > bn)
+        min_n = bn;
+    uint64_t h = xxh64(oid, 16, 0);
+    bool seen_pos[CHUNK_POS_MAX] = {false};
+    for (size_t q = 0; q < nobs; q++)
+        if (obs_pos[q] < CHUNK_POS_MAX)
+            seen_pos[obs_pos[q]] = true;
+
+    int best_n = -1;
+    unsigned best_up_miss = UINT_MAX;
+    for (int cand = bn; cand >= min_n; cand--) {
+        bool ok = true;
+        for (size_t q = 0; q < nobs; q++) {
+            if ((int)((h + obs_pos[q]) % (uint64_t)cand) != obs_store[q]) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        unsigned up_miss = 0;
+        for (unsigned p = 0; p < np && p < CHUNK_POS_MAX; p++) {
+            if (seen_pos[p])
+                continue;
+            int s = (int)((h + p) % (uint64_t)cand);
+            if (s != target_store && !chunk_be_store_is_lost(be, s) &&
+                chunk_be_store_state(be, s) == CHUNK_STORE_UP)
+                up_miss++;
+        }
+        if (best_n < 0 || up_miss < best_up_miss) {
+            best_n = cand;
+            best_up_miss = up_miss;
+        }
+    }
+    return best_n > 0 ? best_n : bn;
+}
+
 int chunk_be_place(const chunk_backend *be, const uint8_t oid[16], unsigned pos)
 {
-    return (int)((xxh64(oid, 16, 0) + pos) % (uint64_t)be->n);
+    return chunk_be_place_n(oid, pos, chunk_be_nstores(be));
 }
 
 int chunk_be_pos_store(const chunk_backend *be, const uint8_t oid[16], unsigned pos) { return chunk_be_place(be, oid, pos); }
@@ -2124,8 +2334,9 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
     int worst = TSDB_ERR_NOTFOUND;
     bool saw_down = false;
     bool saw_nomem = false;
-    int primary = be->n > 0 ? chunk_be_place(be, id->oid, id->pos) : -1;
-    if (primary >= 0 && primary < be->n) {
+    int bn = chunk_be_nstores(be);
+    int primary = bn > 0 ? (int)((xxh64(id->oid, 16, 0) + id->pos) % (uint64_t)bn) : -1;
+    if (primary >= 0 && primary < bn) {
         chunk_store *st = chunk_be_store_ref(be, primary);
         if (!st) {
             saw_down = true;
@@ -2146,7 +2357,7 @@ int chunk_be_rd_open_at(chunk_backend *be, const chunk_ident *id, chunk_rd **out
                 worst = rc;
         }
     }
-    for (int i = 0; i < be->n; i++) {
+    for (int i = 0; i < bn; i++) {
         if (i == primary)
             continue;
         chunk_store *st = chunk_be_store_ref(be, i);
@@ -2189,7 +2400,8 @@ int chunk_be_del(chunk_backend *be, const chunk_ident *id, uint64_t epoch)
     if (rc)
         return rc;
     bool found = false;
-    for (int i = 0; i < be->n; i++) {
+    int bn = chunk_be_nstores(be);
+    for (int i = 0; i < bn; i++) {
         chunk_store *st = chunk_be_store_ref(be, i);
         if (!st)
             continue;
@@ -2219,7 +2431,8 @@ static int list_one(void *ctx, const chunk_listed *c)
 
 static int be_list(chunk_backend *be, uint32_t volume, bool verify, bool names_only, chunk_list_fn fn, void *ctx)
 {
-    for (int i = 0; i < be->n; i++) {
+    int bn = chunk_be_nstores(be);
+    for (int i = 0; i < bn; i++) {
         chunk_store *st = chunk_be_store_ref(be, i);
         if (!st)
             continue;
@@ -2269,14 +2482,17 @@ int chunk_be_put_stream(chunk_backend *be, uint32_t volume, const uint8_t vuuid[
     put_ctx pc;
     memset(&pc, 0, sizeof pc);
     unsigned np = chunk_npos(g);
-    int base = chunk_be_place(be, oid, 0), rc = 0;
+    int bn = chunk_be_nstores(be);
+    if (bn <= 0)
+        return TSDB_ERR_INVALID;
+    int base = (int)(xxh64(oid, 16, 0) % (uint64_t)bn), rc = 0;
     for (unsigned p = 0; p < np && rc == 0; p++) {
         if (!(posmask >> p & 1))
             continue;
         chunk_ident id = {.volume = volume, .pos = (uint16_t)p};
         memcpy(id.vuuid, vuuid, 16);
         memcpy(id.oid, oid, 16);
-        rc = chunk_be_wr_open(be, (base + (int)p) % be->n, &id, g, epoch, &pc.w[p]);
+        rc = chunk_be_wr_open(be, (base + (int)p) % bn, &id, g, epoch, &pc.w[p]);
     }
     if (rc == 0)
         rc = chunk_encode_stream(g, src, put_cell, &pc, sums_out);
