@@ -112,6 +112,11 @@ cfg badb.properties 'storage.verify.checksums = maybe'
 refused "bad boolean" 'badb.properties:1: .*storage.verify.checksums' "$B/tsdbd" --config "$dir/badb.properties" --check-config
 cfg agemax.properties 'storage.dir = /x' 'cluster.fwd.max.age = 3000'
 refused "fwd max age past the clients' 3 s floor" 'agemax.properties:2.*from 1 to 2000' "$B/tsdbd" --config "$dir/agemax.properties" --check-config
+cfg brmax.properties 'storage.dir = /x' 'flush.buffer.rows = 16777217'
+refused "buffer rows above the cap (file)" 'brmax.properties:2.*from 1 to 16777216' "$B/tsdbd" --config "$dir/brmax.properties" --check-config
+refused "buffer rows above the cap (flag)" 'buffer-rows 16777217: expected a whole number from 1 to 16777216' "$B/tsdbd" --no-config --dir /x --buffer-rows 16777217 --check-config
+cfg brok.properties 'storage.dir = /x' 'flush.buffer.rows = 16777216'
+"$B/tsdbd" --config "$dir/brok.properties" --check-config > /dev/null || fail "buffer rows at the cap was refused"
 cfg bade.properties 'server.io = kqueue'
 refused "bad enum" 'bade.properties:1: .*server.io' "$B/tsdbd" --config "$dir/bade.properties" --check-config
 cfg badd.properties 'server.send.timeout = 5 parsecs'

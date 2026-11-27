@@ -101,6 +101,11 @@ enum {
  * CHIMP force one XOR codec for every granule. All are lossless. */
 enum { TSDB_VALUES_AUTO = 0, TSDB_VALUES_GORILLA = 1, TSDB_VALUES_CHIMP = 2 };
 
+/* The most memtable rows of one volume before a flush (tsdb_options.buffer_rows): writes are held back at twice
+ * that, which must stay well below one series' row cap (2^31 - 1) and bound the copy a growing series makes
+ * under the volume's buffer lock */
+#define TSDB_BUFFER_ROWS_MAX ((size_t)1 << 24)
+
 typedef struct tsdb_options {
     int64_t partition_ms;    /* the base partition, fixed at creation; default 1 day. With partition_classes,
                               * a series slower than about one row per 1.3 s (at the defaults: under 8
@@ -116,7 +121,8 @@ typedef struct tsdb_options {
     int query_threads;       /* threads of the database's query scheduler, the calling threads included (it
                               * starts query_threads - 1 helpers, shared by every volume); default: every
                               * logical CPU, capped at 256 */
-    size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M */
+    size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M, at most
+                              * TSDB_BUFFER_ROWS_MAX (an open with more is TSDB_ERR_INVALID) */
     int flush_interval_ms;   /* memtable age before it is flushed into parts; default 5000 */
     int wal_sync_ms;         /* 0: every small write waits for fsync (group commit, default);
                               * N > 0: the WAL is fsync'd every N ms in the background;

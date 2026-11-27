@@ -1063,6 +1063,12 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         db->opt.max_part_bytes = 4ull << 30;
     if (db->opt.buffer_rows == 0)
         db->opt.buffer_rows = 1u << 20;
+    if (db->opt.buffer_rows > TSDB_BUFFER_ROWS_MAX) {
+        fprintf(stderr, "tsdb: buffer_rows %zu is above the most a volume takes (%zu)\n", db->opt.buffer_rows,
+                (size_t)TSDB_BUFFER_ROWS_MAX);
+        free(db);
+        return TSDB_ERR_INVALID;
+    }
     if (db->opt.wal_max_batch_rows == 0)
         db->opt.wal_max_batch_rows = 65536;
     if (db->opt.retention_merge_s == 0)

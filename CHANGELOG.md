@@ -18,6 +18,11 @@ disk format and the wire protocol.
   `opening_hold_s`, `failstop_out_s`, `out_guard_pct`, `out_guard_hold_s`, `repl_retain_down_gb`, `young_high_pct`,
   `balance_mb_s`, `rebuild_concurrency`).
 
+- **`tsdbd --buffer-rows` (`flush.buffer.rows`), at most 16M rows.** The memtable rows of one volume before it is
+  flushed (default 1048576). tsdbd refuses a value above 16777216 (`TSDB_BUFFER_ROWS_MAX` in `tsdb.h`), and so does
+  an open with `tsdb_options.buffer_rows` above it (`TSDB_ERR_INVALID`): writes are held back at twice the value,
+  and at the 2^30 the option first took one series reached its row cap first, so writes failed with NOMEM instead
+  of waiting for the flush.
 - **Disk format 10 (changed; breaking).** 0.11.0 writes format 10: columnar WAL records (`WAL_KIND_COL`, kind 2: a
   write of 256 rows or more as zstd-compressed columns) and the `F64_FOR` flag (0x40) in float64 fixed-point blocks,
   besides the new block kinds and scales below. A 0.10.x binary would have cut a columnar record as a torn WAL tail

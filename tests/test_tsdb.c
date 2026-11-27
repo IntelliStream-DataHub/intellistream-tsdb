@@ -743,6 +743,26 @@ static tsdb_options test_opts(int merge_threads)
     return o;
 }
 
+/* buffer_rows is capped at TSDB_BUFFER_ROWS_MAX: writes are held back at twice it, which must stay below one
+ * series' row cap; an open with more is refused before it touches the directory, the cap itself opens */
+static void test_buffer_rows_cap(const char *dir)
+{
+    rm_rf(dir);
+    tsdb_options o = test_opts(0);
+    tsdb *db = NULL;
+    o.buffer_rows = TSDB_BUFFER_ROWS_MAX + 1;
+    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID && db == NULL);
+    o.buffer_rows = (size_t)1 << 30; /* what --buffer-rows took before the cap */
+    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID && db == NULL);
+    struct stat st;
+    CHECK(stat(dir, &st) != 0 && errno == ENOENT); /* refused before anything was made */
+    o.buffer_rows = TSDB_BUFFER_ROWS_MAX;
+    CHECK(tsdb_open(dir, &o, &db) == 0 && db != NULL);
+    if (db)
+        CHECK(tsdb_close(db) == 0);
+    rm_rf(dir);
+}
+
 static void test_db(const char *dir)
 {
     rm_rf(dir);
@@ -3888,6 +3908,7 @@ int main(int argc, char **argv)
     desc_window_rows = 37; /* descending queries cross many windows */
     snprintf(dir, sizeof dir, "%s/tsdb-test-%d", base, (int)getpid());
     test_db(dir);
+    test_buffer_rows_cap(dir);
     printf("replace semantics\n");
     test_replace(dir);
     printf("write-ahead log\n");

@@ -134,7 +134,7 @@ number to switch something off (`merge.idle = -1`) the file takes it too.
 | `wal.max.batch.rows` | `--wal-max-batch-rows` | integer | 65536 | Most rows of one insert that go through the WAL. |
 | `merge.idle` | `--merge-idle-s` | duration (plain: s) | 300s | Merge a partition completely once it has had no new rows for this long; -1 never. |
 | `flush.interval` | `--flush-interval-ms` | duration (plain: ms) | 5s | How long rows stay in memory before they are flushed to a part. |
-| `flush.buffer.rows` | `--buffer-rows` | integer | 1048576 | Memtable rows per volume before it is flushed to a part. |
+| `flush.buffer.rows` | `--buffer-rows` | integer | 1048576 | Memtable rows per volume before it is flushed to a part; at most 16777216. |
 | `insert.zstd.level` | `--insert-zstd-level` | integer | 0 | The zstd level of parts that inserts and flushes write; 0 none, -1 the level merges use. |
 | `query.threads` | `--query-threads` | integer | unset | Threads one tsdbd uses for queries. Default: the number of CPUs. |
 | `query.request.threads` | `--request-threads` | integer | unset | Most threads one request may use. Default: all of them. |

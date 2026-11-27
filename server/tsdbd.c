@@ -6791,7 +6791,7 @@ int main(int argc, char **argv)
         case 'G': o.merge_idle_s = (int)num_arg("merge-idle-s", optarg, -1, 86400 * 365); break;
         case 'Z': o.insert_zstd_level = (int)num_arg("insert-zstd-level", optarg, -1, 22); break;
         case 'H': o.flush_interval_ms = (int)num_arg("flush-interval-ms", optarg, 1, 86400000); break;
-        case 0x126: o.buffer_rows = (size_t)num_arg("buffer-rows", optarg, 1, 1LL << 30); break;
+        case 0x126: o.buffer_rows = (size_t)num_arg("buffer-rows", optarg, 1, (long long)TSDB_BUFFER_ROWS_MAX); break;
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
