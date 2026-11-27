@@ -2402,7 +2402,7 @@ $(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calenda
 all: $(B)/embedded-example $(B)/client-example
 
 # Runs the README's quick start, word for word, in a scratch directory.
-test: test-quickstart test-seeds-selftest test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial
+test: test-quickstart test-seeds-selftest test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-cli test-cluster-tutorial
 # The random-heavy tests under a seed that is not their constant (tests/seed.h): `make test-seeds` picks one and prints it,
 # `make test-seeds TSDB_TEST_SEED=N` repeats a run. A failure is rerun with the same N on the one test.
 SEED_TESTS = test_users test_latest test_buckets test_delete test_limits
@@ -2420,6 +2420,8 @@ test-cli-stats-net: $(B)/tsdb $(B)/tsdbd
 	B=$(B) tests/test_cli_stats_net.sh $(TMPDIR)
 test-cli-cluster: $(B)/tsdb
 	B=$(B) tests/test_cli_cluster.sh $(TMPDIR)
+test-cluster-cli: $(B)/tsdb $(B)/tsdbd
+	B=$(B) tests/test_cluster_cli.sh $(TMPDIR)
 # The cluster tutorial's command block, word for word (docs/cluster-preview.md), on ports the kernel picks.
 test-cluster-tutorial: $(B)/tsdb $(B)/tsdbd $(B)/client-example
 	B=$(B) tests/test_cluster_tutorial.sh
@@ -2503,4 +2505,4 @@ test: check-ci-groups
 check-ci-groups:
 	tests/check_ci_groups.sh
 
-.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par
+.PHONY: test-quickstart check-site test-release test-spdx check-ci-groups test-mutants-helper test-release-hooks tsan-par test-cluster-cli
