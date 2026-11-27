@@ -665,6 +665,22 @@ cgroup, so `nice` does not keep your work out of its way.
   state and `tsdb_disk_state{store,class}` is exported via `creport`.
   Tests: `test_chunksrv` (`test_spool_fallback`), `test_cluster diskstall diskeio`, `make diskfault-mutants`
   (`TSDB_DISKS_MUTANT`: `stallexit stallnoresign storeeioexit`).
+  R13 `r13-fill` (E30, E50, E53, `docs/design-cluster-data.md` §15.4, `PLAN.md` D17): `disk_usage_*` runs one
+  refcounted, detachable 256 KiB worker per present UP disk (skipping non-UP/stalled disks, bounded 500 ms stop)
+  sampling bytes by use (`young`, `retained`, `retired`, `local`, `index`, `chunks`; O(1) `statvfs` for chunks on
+  dedicated disks) every 10 s (`TSDB_DISK_USAGE_MS` / `TSDB_DISK_USAGE_FILE` supporting `<pct> <pct>`, `bytes`,
+  `phantom`, `size` under `TSDB_TEST_HOOKS`), reporting `HBS_DISKS` v3 with 7-day young peak and fill flags
+  (`75%` `warn=filling`, `80%` `warn=move_needed` + placement exclusion, `90%` `warn=full` with hysteresis `< high - 2`
+  scoped ONLY to volumes on the full disk via `disks_vol_full` / `RW_ACK_FULL` -> `TSDB_WHY_FULL`, while volumes on
+  other disks of the same server write on). At `>= 90%`, `eng_set_disk_full` releases matched retired settle copies
+  immediately (`src/eckeep.c`), holds non-shrinking merges while allowing TTL rewrites and tombstone merges
+  (`src/merge.c`) and lets `src/ecpolicy.c` settle unmerged/level-0 keys out of FULL; chunk stores past the cluster
+  fill mark / shared young reserve soft-refuse regular puts with `CHUNK_ERR_FULL` (store stays `UP`) while local
+  rebuilds (`server/sfill.c`) and remote repairs (`CS_PUT_F_REPLACE`) stay allowed up to 95%. Exports
+  `tsdb_disk_bytes{store,class,use}`, `tsdb_disk_size_bytes{store,class}`, `tsdb_volume_full{volume}`, local
+  `disk.<id>.*` / `vol.<N>.early_releases` / `vol.<N>.merges_held` and Raft leader `cluster.disks.<class>.*` in STATUS.
+  Tests: `test_chunksrv` (`test_fill_mark`), `test_cluster diskfill`, `make diskfill-mutants`
+  (`TSDB_DISKS_MUTANT`: `fullall fullmergeon fullnorelease`).
 - `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
   cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
   position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally

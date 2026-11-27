@@ -72,4 +72,13 @@ void eng_set_wal_sync_observer(void (*fn)(int64_t ns));
  * thread in src/settle.c; never takes db->lock or t->lock, safe on the cluster heartbeat and metrics threads). */
 void ecpolicy_cluster_backlog_get(uint32_t vol, uint32_t *keys_waiting, uint64_t *oldest_wait_s);
 
+/* R13 (r13-fill, E53): per-volume disk-full backpressure state on an engine. Setting `full=true` immediately purges
+ * matched retired settle parts (eckeep.c) and holds background merges that would not shrink the disk (merge.c);
+ * clearing `full=false` wakes merge threads. Uses eng_* naming so libtsdb.so keeps them internal. */
+void eng_set_disk_full(struct eng *db, bool full);
+bool eng_disk_full(const struct eng *db);
+uint64_t eng_early_releases(const struct eng *db);
+uint64_t eng_merges_held(const struct eng *db);
+void eng_set_disk_fill_mutants(int no_release, int merge_on);
+
 #endif

@@ -32,6 +32,7 @@
 #include "crashpt.h"
 #include "creport.h"
 #include "cvol.h"
+#include "disks.h"
 #include "margins.h"
 #include "meta.h"
 #include "pace.h"
@@ -1943,6 +1944,7 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
     if (SF.started)
         return 0;
     atomic_store_explicit(&G_db, db, memory_order_release);
+    sfill_set_store_allow(disks_chunk_store_can_put);
     struct sfill_ops ops = {
         .objlist = sf_op_objlist,
         .read_cell = sf_op_read_cell,

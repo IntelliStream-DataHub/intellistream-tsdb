@@ -32537,9 +32537,9 @@ static void scen_placeclass(void)
     write_usage_file(u2, "nvme 85 0\nhdd 0 10\n");
     write_usage_file(u3, "nvme 15 0\nhdd 0 10\n");
     write_usage_file(u4, "nvme 15 0\nhdd 0 10\n");
-    await_disk_section(0, ids[2], "young_bytes=", 1, 10000, "node 2 disk usage");
-    await_disk_section(0, ids[3], "young_bytes=", 1, 10000, "node 3 disk usage");
-    await_disk_section(0, ids[4], "young_bytes=", 1, 10000, "node 4 disk usage");
+    await_disk_section(0, ids[2], "young_pct=85", 1, 10000, "node 2 disk usage");
+    await_disk_section(0, ids[3], "young_pct=15", 1, 10000, "node 3 disk usage");
+    await_disk_section(0, ids[4], "young_pct=15", 1, 10000, "node 4 disk usage");
 
     /* With node 2 >= 80%, replicas=3 has only 2 eligible compute nodes -> must fail CLUSTER_ERR_FEW. */
     uint32_t vno3 = 0;
@@ -32585,7 +32585,7 @@ static void scen_placeclass(void)
 
     /* Clear node 2's fill override and wait until leader sees usage cleared before continuing. */
     unlink(u2);
-    await_disk_section(0, ids[2], "young_bytes=", 0, 10000, "node 2 usage cleared");
+    await_disk_section(0, ids[2], "young_pct=85", 0, 10000, "node 2 usage cleared");
 
     /* 4. Add node 5 (nvme-only, 0 stripe holds while HDD nodes 0..4 each hold >= 1):
      *    - ec=2+1 MUST stay single-class HDD (never pick node 5 -> catches mixstripe!).
@@ -32601,7 +32601,7 @@ static void scen_placeclass(void)
     /* Wait for node 5's chunk store to come up and a heartbeat carrying it to reach the Raft leader (no fixed sleep). */
     await_log(5, "chunk server up as node", 10000, "placeclass: node 5 chunk server started");
     write_usage_file(u5, "nvme 10 10\n");
-    await_disk_section(0, ids[5], "chunk_bytes=", 1, 10000, "node 5 heartbeat after chunk server start");
+    await_disk_section(0, ids[5], "chunk_pct=10", 1, 10000, "node 5 heartbeat after chunk server start");
 
     uint32_t vsame = 0;
     rc = vol_add_ec(0, "pc_samecls", 0, 2, 1, &vsame, ecmsg, sizeof ecmsg);
@@ -32666,10 +32666,8 @@ static void scen_placeclass(void)
     printf("  ec=4+2 mixed-class fallback listed in cluster status and TSDB_OP_STATUS\n");
 
     /* 5. Chunk store past fill mark: node 5 chunk fill 92% -> ec=4+2 (needs 6) refused with CLUSTER_ERR_FEW. */
-    unlink(u5);
-    await_disk_section(0, ids[5], "chunk_bytes=", 0, 10000, "node 5 usage cleared before full check");
     write_usage_file(u5, "nvme 10 92\n");
-    await_disk_section(0, ids[5], "chunk_bytes=", 1, 10000, "node 5 chunk usage at 92%");
+    await_disk_section(0, ids[5], "chunk_pct=92", 1, 10000, "node 5 chunk usage at 92%");
     uint32_t vcf = 0;
     rc = vol_add_ec(0, "pc_chunkfull", 0, 4, 2, &vcf, ecmsg, sizeof ecmsg);
     if (rc != CLUSTER_ERR_FEW)
@@ -33872,6 +33870,656 @@ static void scen_settings(void)
         unlink(ctl);
 }
 
+static int df_count_settled_parts(const char *vol_dir)
+{
+    DIR *d = opendir(vol_dir);
+    if (!d)
+        return 0;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(d)) != NULL;) {
+        size_t l = strlen(e->d_name);
+        if (strncmp(e->d_name, "settled_", 8) == 0 && l > 13 && strcmp(e->d_name + l - 5, ".part") == 0)
+            n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static int df_status_i64(int srv, const char *key_eq, int64_t *out)
+{
+    tsdbc *c = client(srv);
+    char *st = NULL;
+    int rc = tsdbc_status(c, &st);
+    tsdbc_close(c);
+    if (rc != 0 || !st) {
+        free(st);
+        return 0;
+    }
+    const char *p = strstr(st, key_eq);
+    int ok = 0;
+    if (p) {
+        p += strlen(key_eq);
+        char *end = NULL;
+        long long v = strtoll(p, &end, 10);
+        if (end != p) {
+            *out = (int64_t)v;
+            ok = 1;
+        }
+    }
+    free(st);
+    return ok;
+}
+
+static int df_metrics_vol_u64(const char *mbuf, const char *family_prefix, uint32_t vol, int64_t *out)
+{
+    char needle[128];
+    snprintf(needle, sizeof needle, "\n%s{volume=\"%" PRIu32 "\"", family_prefix, vol);
+    const char *p = strstr(mbuf, needle);
+    if (!p)
+        return 0;
+    const char *rb = strchr(p + 1, '}');
+    if (!rb || rb[1] != ' ')
+        return 0;
+    char *end = NULL;
+    long long v = strtoll(rb + 2, &end, 10);
+    if (end == rb + 2)
+        return 0;
+    *out = (int64_t)v;
+    return 1;
+}
+
+/* diskfill (R13, r13-fill; E30, E50, E53, §15.4):
+ *   3-node cluster where node 0 has two NVMe fast disks (d0a, d0b) and one HDD chunk disk (d0h), and nodes 1 & 2 each
+ *   have one NVMe + one HDD. Verifies:
+ *   1. Real per-disk bytes-by-use accounting in HBS_DISKS, STATUS (local + Raft leader cluster.disks.<class>.*), CLI
+ *      `tsdb cluster status disks` / `--json`, and Prometheus metrics tsdb_disk_bytes{store,class,use} /
+ *      tsdb_disk_size_bytes{store,class} / tsdb_volume_full{volume}.
+ *   2. Phantom bytes on ONE fast disk (full_dir) of node 0:
+ *      - >= 75% (young_warn_pct): health warning (`warn=filling`, `health.disk_filling`).
+ *      - >= 80% (young_move_pct): `warn=move_needed`, new volume avoids full_dir and lands on free_dir; when BOTH
+ *        fast disks on node 0 are >= 80%, replicas=3 fails CLUSTER_ERR_FEW.
+ *      - >= 90% (young_high_pct): ONLY volume V1 (on full_dir) becomes FULL (leader refuses writes with definite
+ *        UNAVAILABLE TSDB_WHY_FULL, tsdb_volume_full=1), while volume V2 (on free_dir of the SAME node 0!) keeps
+ *        accepting writes cleanly with tsdb_volume_full=0 (catches `fullall`!).
+ *      - Early release (under TSDB_EC): matched retired `settled_*.part` on full_dir is released immediately despite
+ *        `ec_settle_keep_s=3600` and counted in `vol.<V1>.early_releases >= 1` (catches `fullnorelease`!).
+ *      - Merge hold: background merges on full_dir wait while >= 90% (`tsdb_merges_total` unchanged,
+ *        `vol.<V1>.merges_held >= 1`; catches `fullmergeon`!).
+ *      - Hysteresis at 88% (stays FULL); cleared below 88% -> writes resume AND held merge finishes.
+ *   3. Chunk store fill mark (under TSDB_EC): d0h past cluster fill mark refuses regular settle puts (settle waits
+ *      without marking d0h DOWN) and resumes cleanly when cleared.
+ *   4. Real fill run (no phantom bytes, small virtual cap on full_dir): real WAL + parts drive full_dir past 90% and
+ *      trigger TSDB_WHY_FULL before hitting cap/ENOSPC; zero fail-stop; every acknowledged row reads back intact. */
+static void scen_diskfill(void)
+{
+    scenario("diskfill");
+    epoll_after_two = 1;
+
+    char d0a[PATH_MAX], d0b[PATH_MAX], d0h[PATH_MAX];
+    char d1a[PATH_MAX], d1h[PATH_MAX], d2a[PATH_MAX], d2h[PATH_MAX];
+    snprintf(d0a, sizeof d0a, "%s/df_n0_a", base);
+    snprintf(d0b, sizeof d0b, "%s/df_n0_b", base);
+    snprintf(d0h, sizeof d0h, "%s/df_n0_h", base);
+    snprintf(d1a, sizeof d1a, "%s/df_n1_a", base);
+    snprintf(d1h, sizeof d1h, "%s/df_n1_h", base);
+    snprintf(d2a, sizeof d2a, "%s/df_n2_a", base);
+    snprintf(d2h, sizeof d2h, "%s/df_n2_h", base);
+    disk_make(d0a, "nvme");
+    disk_make(d0b, "nvme");
+    disk_make(d0h, "hdd");
+    disk_make(d1a, "nvme");
+    disk_make(d1h, "hdd");
+    disk_make(d2a, "nvme");
+    disk_make(d2h, "hdd");
+
+    disk_meta dm0a, dm0b, dm0h;
+    if (disk_load(d0a, &dm0a) != 0 || disk_load(d0b, &dm0b) != 0 || disk_load(d0h, &dm0h) != 0)
+        die("diskfill: disk_load failed");
+    char hex_a[33], hex_b[33], hex_h[33];
+    chunk_oid_hex(dm0a.store_id, hex_a);
+    chunk_oid_hex(dm0b.store_id, hex_b);
+    chunk_oid_hex(dm0h.store_id, hex_h);
+
+    char u0[PATH_MAX];
+    snprintf(u0, sizeof u0, "%s/df_usage0", base);
+
+    static char xa[3][PATH_MAX * 3 + 256];
+    static char pe0[PATH_MAX + 64];
+    const char *ec_flags =
+#ifdef TSDB_EC
+        " --ec-settle-keep-s 3600 --ec-settle-grace-s 0 --ec-settle-force-s 1";
+#else
+        "";
+#endif
+    snprintf(xa[0], sizeof xa[0],
+             "--disk %s:nvme --disk %s:nvme --disk %s:hdd --metrics-port auto --merge-idle-s 3 --flush-interval-ms 150%s",
+             d0a, d0b, d0h, ec_flags);
+    snprintf(xa[1], sizeof xa[1],
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto --merge-idle-s 3 --flush-interval-ms 150%s",
+             d1a, d1h, ec_flags);
+    snprintf(xa[2], sizeof xa[2],
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto --merge-idle-s 3 --flush-interval-ms 150%s",
+             d2a, d2h, ec_flags);
+    snprintf(pe0, sizeof pe0, "TSDB_DISK_USAGE_FILE=%s", u0);
+
+    for (int i = 0; i < 3; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+        xargs[i] = xa[i];
+    }
+    penv[0] = pe0;
+
+    start(0);
+    int mport0 = th_mport;
+    start(1);
+    start(2);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "diskfill: three voters");
+
+    struct disks_want w0 = {ids[0], 3, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w1 = {ids[1], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w2 = {ids[2], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "diskfill: node 0 disks");
+    await_view(0, p_member_disks, &w1, "diskfill: node 1 disks");
+    await_view(0, p_member_disks, &w2, "diskfill: node 2 disks");
+
+    /* Create V1 (EC 2+1 under TSDB_EC, else replicas=3) ensuring node 0 holds a replica of V1, then V2 (replicas=3)
+     * so node 0 holds V1 on one NVMe disk (full_dir) and V2 on its second NVMe disk (free_dir). */
+    uint32_t v1 = 0, v2 = 0;
+    const char *v1_name = "df_v1";
+    int rc;
+#ifdef TSDB_EC
+    char ecmsg[256] = "";
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const char *nm = attempt == 0 ? "df_v1" : "df_v1b";
+        uint32_t vn = 0;
+        for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, nm, 0, 2, 1, &vn, ecmsg, sizeof ecmsg)) != 0; usleep(100000))
+            if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+                die("diskfill: vol_add_ec %s: %s (%s)", nm, cluster_strerror(rc), ecmsg);
+        struct meta_volume tmpv = {0};
+        if (!vol_rec(0, nm, &tmpv))
+            die("diskfill: missing record for %s", nm);
+        int on0 = 0;
+        for (uint32_t r = 0; r < tmpv.nrep; r++)
+            if (tmpv.rep[r].node == ids[0])
+                on0 = 1;
+        if (on0) {
+            v1 = vn;
+            v1_name = nm;
+            break;
+        }
+    }
+    if (!v1)
+        die("diskfill: neither ec=2+1 volume placed a replica on node 0");
+    {
+        struct meta_volume tmpv = {0};
+        if (!vol_rec(0, v1_name, &tmpv))
+            die("diskfill: missing record for %s", v1_name);
+        for (uint32_t r = 0; r < tmpv.nrep; r++)
+            await_open_gen(0, v1_name, server_of(tmpv.rep[r].node), 1, 0);
+        await_isr(0, v1_name, (int)tmpv.nrep, 20000, "diskfill: df_v1 ISR full");
+    }
+#else
+    if ((rc = vol_add(0, "df_v1", 3, &v1)) != 0)
+        die("diskfill: vol_add df_v1: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "df_v1", i, 1, 0);
+    await_isr(0, "df_v1", 3, 20000, "diskfill: df_v1 ISR=3");
+#endif
+
+    if ((rc = vol_add(0, "df_v2", 3, &v2)) != 0)
+        die("diskfill: vol_add df_v2: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "df_v2", i, 1, 0);
+    await_isr(0, "df_v2", 3, 20000, "diskfill: df_v2 ISR=3");
+
+    /* Identify which fast disk on node 0 holds v1 (full_dir) vs v2 (free_dir). */
+    char v1_on_a[PATH_MAX + 32], v1_on_b[PATH_MAX + 32], v2_on_a[PATH_MAX + 32], v2_on_b[PATH_MAX + 32];
+    snprintf(v1_on_a, sizeof v1_on_a, "%s/v%" PRIu32, d0a, v1);
+    snprintf(v1_on_b, sizeof v1_on_b, "%s/v%" PRIu32, d0b, v1);
+    snprintf(v2_on_a, sizeof v2_on_a, "%s/v%" PRIu32, d0a, v2);
+    snprintf(v2_on_b, sizeof v2_on_b, "%s/v%" PRIu32, d0b, v2);
+    struct stat st;
+    int v1_in_a = (stat(v1_on_a, &st) == 0 && S_ISDIR(st.st_mode));
+    int v1_in_b = (stat(v1_on_b, &st) == 0 && S_ISDIR(st.st_mode));
+    int v2_in_a = (stat(v2_on_a, &st) == 0 && S_ISDIR(st.st_mode));
+    int v2_in_b = (stat(v2_on_b, &st) == 0 && S_ISDIR(st.st_mode));
+    if ((v1_in_a == v1_in_b) || (v2_in_a == v2_in_b) || (v1_in_a == v2_in_a))
+        die("diskfill: expected v1 and v2 on distinct fast disks of node 0 (v1 a=%d b=%d, v2 a=%d b=%d)",
+            v1_in_a, v1_in_b, v2_in_a, v2_in_b);
+    const char *full_dir = v1_in_a ? d0a : d0b;
+    const char *free_dir = v1_in_a ? d0b : d0a;
+    const char *full_hex = v1_in_a ? hex_a : hex_b;
+    const char *free_hex = v1_in_a ? hex_b : hex_a;
+    char v1_dir[PATH_MAX + 32];
+    snprintf(v1_dir, sizeof v1_dir, "%s/v%" PRIu32, full_dir, v1);
+
+    struct meta_volume mv1 = {0}, mv2 = {0};
+    if (!vol_rec(0, v1_name, &mv1) || !mv1.leader || !vol_rec(0, "df_v2", &mv2) || !mv2.leader)
+        die("diskfill: missing volume leaders");
+    int L1 = server_of(mv1.leader);
+    int L2 = server_of(mv2.leader);
+    tsdbc *c1 = client(L1);
+    tsdbc *c2 = client(L2);
+    tsdbc_set_retry(c1, 0);
+    tsdbc_set_retry(c2, 0);
+    tsdb_sid s1 = rep_series(c1, "df.s1", v1_name, 30000);
+    tsdb_sid s2 = rep_series(c2, "df.s2", "df_v2", 30000);
+
+    /* Query node 0's reported disk size for full_hex and hex_h from /metrics (also verifies tsdb_disk_size_bytes). */
+    char mbuf[131072];
+    char key_sz_full[160], key_sz_hdd[160], key_by_young[160], key_by_ret[160], key_by_idx[160], key_by_chk[160];
+    snprintf(key_sz_full, sizeof key_sz_full, "\ntsdb_disk_size_bytes{store=\"%s\",class=\"nvme\"} ", full_hex);
+    snprintf(key_sz_hdd, sizeof key_sz_hdd, "\ntsdb_disk_size_bytes{store=\"%s\",class=\"hdd\"} ", hex_h);
+    snprintf(key_by_young, sizeof key_by_young, "\ntsdb_disk_bytes{store=\"%s\",class=\"nvme\",use=\"young\"} ", full_hex);
+    snprintf(key_by_ret, sizeof key_by_ret, "\ntsdb_disk_bytes{store=\"%s\",class=\"nvme\",use=\"retired\"} ", full_hex);
+    snprintf(key_by_idx, sizeof key_by_idx, "\ntsdb_disk_bytes{store=\"%s\",class=\"nvme\",use=\"index\"} ", full_hex);
+    snprintf(key_by_chk, sizeof key_by_chk, "\ntsdb_disk_bytes{store=\"%s\",class=\"hdd\",use=\"chunks\"} ", hex_h);
+    int64_t disk_size = 0, hdd_size = 0, by_young = -1, by_ret = -1, by_idx = -1, by_chk = -1;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(100000)) {
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        if (metrics_find_i64(mbuf, key_sz_full, &disk_size) && disk_size > 0 &&
+            metrics_find_i64(mbuf, key_sz_hdd, &hdd_size) && hdd_size > 0 &&
+            metrics_find_i64(mbuf, key_by_young, &by_young) &&
+            metrics_find_i64(mbuf, key_by_ret, &by_ret) &&
+            metrics_find_i64(mbuf, key_by_idx, &by_idx) &&
+            metrics_find_i64(mbuf, key_by_chk, &by_chk))
+            break;
+    }
+    if (disk_size <= 0 || hdd_size <= 0 || by_young < 0 || by_ret < 0 || by_idx < 0 || by_chk < 0)
+        die("diskfill: missing tsdb_disk_bytes / tsdb_disk_size_bytes metrics on node 0");
+
+    /* Baseline writes to V1 and V2 (plus settle an old partition on V1 under TSDB_EC so retired settled_*.part
+     * sits on full_dir/v<v1> held by --ec-settle-keep-s 3600). */
+    const int64_t day0 = 1704067200000LL;
+    const int64_t part_step = 30LL * 86400000LL;
+    {
+        int64_t ts[128];
+        float fv[128];
+        for (int k = 0; k < 128; k++) {
+            ts[k] = day0 + k * 1000LL;
+            fv[k] = 1.0f + (float)k;
+        }
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 128)) != 0)
+            die("diskfill: baseline write V1 day0: %s", ers(rc));
+        for (int k = 0; k < 128; k++)
+            ts[k] = day0 + part_step + k * 1000LL;
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 128)) != 0)
+            die("diskfill: baseline write V1 day1: %s", ers(rc));
+        if ((rc = tsdbc_insert_series(c2, s2, ts, fv, 128)) != 0)
+            die("diskfill: baseline write V2: %s", ers(rc));
+    }
+#ifdef TSDB_EC
+    /* Wait for day0 on V1 to settle and leave a retired settled_*.part held by keep_s=3600 on node 0's full_dir. */
+    for (uint64_t t0 = now_ms(); df_count_settled_parts(v1_dir) < 1; usleep(100000))
+        if (now_ms() - t0 > 30000)
+            die("diskfill: df_v1 did not produce a retired settled_*.part in %s within 30 s", v1_dir);
+    /* Wait briefly to confirm keep_s=3600 holds the retired file while the disk is below 90%. */
+    usleep(800000);
+    if (df_count_settled_parts(v1_dir) < 1)
+        die("diskfill: retired settled_*.part vanished before 90%% despite keep_s=3600");
+#endif
+
+    /* 1. 75% (young_warn_pct): add 76% phantom bytes to full_hex -> health warning + STATUS + CLI + metrics. */
+    char ubuf[512];
+    uint64_t ph76 = ((uint64_t)disk_size / 100u) * 76u + ((uint64_t)disk_size % 100u);
+    snprintf(ubuf, sizeof ubuf, "%s phantom %" PRIu64 " 0\n", full_hex, ph76);
+    write_usage_file(u0, ubuf);
+    await_disk_section(0, ids[0], "warn=filling", 1, 10000, "diskfill 75% warn=filling");
+    {
+        tsdbc *cs0 = client(0);
+        char *stxt = NULL;
+        if (tsdbc_status(cs0, &stxt) != 0 || !stxt)
+            die("diskfill: tsdbc_status on node 0 failed");
+        if (!strstr(stxt, "health.disk_filling.") || !strstr(stxt, "cluster.disks.nvme.size_bytes=") ||
+            !strstr(stxt, "cluster.disks.nvme.young_bytes="))
+            die("diskfill: STATUS missing health.disk_filling or cluster.disks.nvme.* at 76%%:\n%s", stxt);
+        free(stxt);
+        tsdbc_close(cs0);
+
+        /* Verify `tsdb cluster status disks` CLI reports the disk table cleanly. */
+        char cli_out[32768];
+        const char *cli = getenv("TSDB_CLI") ? getenv("TSDB_CLI") : "./build/tsdb";
+        char addr[64];
+        snprintf(addr, sizeof addr, "127.0.0.1:%d", pports[0]);
+        int pfd[2];
+        if (pipe(pfd) != 0)
+            die("diskfill: pipe");
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(pfd[0]);
+            dup2(pfd[1], 1);
+            dup2(pfd[1], 2);
+            close(pfd[1]);
+            execl(cli, "tsdb", "cluster", "status", "disks", "--json", addr, "--secret-file", secret_path, (char *)NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        size_t off = 0;
+        while (off + 1 < sizeof cli_out) {
+            ssize_t nr = read(pfd[0], cli_out + off, sizeof cli_out - 1 - off);
+            if (nr < 0 && errno == EINTR)
+                continue;
+            if (nr <= 0)
+                break;
+            off += (size_t)nr;
+        }
+        cli_out[off] = '\0';
+        close(pfd[0]);
+        int wst = 0;
+        while (waitpid(pid, &wst, 0) < 0 && errno == EINTR)
+            ;
+        if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0 || !strstr(cli_out, "\"young_bytes\"") ||
+            !strstr(cli_out, "\"retired_bytes\"") || !strstr(cli_out, "\"index_bytes\""))
+            die("diskfill: `tsdb cluster status disks --json` failed or missing fields:\n%s", cli_out);
+    }
+    printf("  75%% (young_warn_pct): warn=filling in HBS_DISKS, STATUS, CLI JSON, and Prometheus metrics\n");
+
+    /* 2. 80% (young_move_pct): raise full_hex to 82% -> move_needed warning; new volume V3 avoids full_dir and lands
+     *    on free_dir; raising BOTH fast disks on node 0 to 82% refuses replicas=3 with CLUSTER_ERR_FEW. */
+    uint64_t ph82 = ((uint64_t)disk_size / 100u) * 82u + ((uint64_t)disk_size % 100u);
+    snprintf(ubuf, sizeof ubuf, "%s phantom %" PRIu64 " 0\n", full_hex, ph82);
+    write_usage_file(u0, ubuf);
+    await_disk_section(0, ids[0], "warn=move_needed", 1, 10000, "diskfill 80% warn=move_needed");
+
+    uint32_t v3 = 0;
+    if ((rc = vol_add(0, "df_v3", 3, &v3)) != 0)
+        die("diskfill: vol_add df_v3 with one disk at 82%% failed: %s", cluster_strerror(rc));
+    await_open_gen(0, "df_v3", 0, 1, 0);
+    {
+        char v3_full[PATH_MAX + 32], v3_free[PATH_MAX + 32];
+        snprintf(v3_full, sizeof v3_full, "%s/v%" PRIu32, full_dir, v3);
+        snprintf(v3_free, sizeof v3_free, "%s/v%" PRIu32, free_dir, v3);
+        if (stat(v3_full, &st) == 0 || stat(v3_free, &st) != 0)
+            die("diskfill: df_v3 landed on 82%%-full disk instead of free_dir");
+    }
+    snprintf(ubuf, sizeof ubuf, "%s phantom %" PRIu64 " 0\n%s phantom %" PRIu64 " 0\n", full_hex, ph82, free_hex, ph82);
+    write_usage_file(u0, ubuf);
+    {
+        char want_b[64];
+        snprintf(want_b, sizeof want_b, "disk=%s warn=move_needed", free_hex);
+        await_disk_section(0, ids[0], want_b, 1, 10000, "diskfill both fast disks at 82%");
+        uint32_t vno = 0;
+        rc = vol_add(0, "df_noplace", 3, &vno);
+        if (rc != CLUSTER_ERR_FEW)
+            die("diskfill: vol_add replicas=3 with both fast disks of node 0 at 82%% returned %s, want FEW",
+                cluster_strerror(rc));
+    }
+    /* Clear free_hex back to 0 phantom before 90% checks. */
+    unlink(u0);
+    await_disk_section(0, ids[0], "warn=move_needed", 0, 10000, "diskfill usage cleared before 90%");
+    printf("  80%% (young_move_pct): warn=move_needed, V3 avoided 82%% disk, both >=80%% refused replicas=3\n");
+
+    /* 3. 90% (young_high_pct) on ONLY full_hex (free_hex stays low!):
+     *    - Flush 2 small level-0 batches into a CURRENT-window partition (day_m, so EC settle will not touch it,
+     *      and 2 < merge_min_parts so non-idle merge will never run before --merge-idle-s 3).
+     *    - Under TSDB_EC, also flush 2 small level-0 batches into an AGED partition (day_drain) right before 92%
+     *      to verify that held merges never block settling finished keys out of FULL! */
+    const int64_t day_m = (int64_t)time(NULL) * 1000LL;
+#ifdef TSDB_EC
+    int ch_pre90 = count_chunk_files_in(d0h, v1);
+    const int64_t day_drain = day0 + 2 * part_step;
+    for (int b = 0; b < 2; b++) {
+        int64_t ts[16];
+        float fv[16];
+        for (int k = 0; k < 16; k++) {
+            ts[k] = day_drain + (int64_t)b * 60000LL + k * 1000LL;
+            fv[k] = 4.0f + (float)b;
+        }
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 16)) != 0)
+            die("diskfill: pre-90%% drain batch %d on V1: %s", b, ers(rc));
+        usleep(220000);
+    }
+#endif
+    for (int b = 0; b < 2; b++) {
+        int64_t ts[16];
+        float fv[16];
+        for (int k = 0; k < 16; k++) {
+            ts[k] = day_m + (int64_t)b * 60000LL + k * 1000LL;
+            fv[k] = 5.0f + (float)b;
+        }
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 16)) != 0)
+            die("diskfill: pre-90%% merge batch %d on V1: %s", b, ers(rc));
+        usleep(220000); /* > flush-interval-ms 150 so each batch flushes a separate level-0 part */
+    }
+
+    uint64_t ph92 = ((uint64_t)disk_size / 100u) * 92u + ((uint64_t)disk_size % 100u);
+    snprintf(ubuf, sizeof ubuf, "%s phantom %" PRIu64 " 0\n", full_hex, ph92);
+    write_usage_file(u0, ubuf);
+    await_disk_section(0, ids[0], "warn=full", 1, 10000, "diskfill 90% warn=full");
+
+    /* V1 MUST refuse writes with definite UNAVAILABLE TSDB_WHY_FULL. */
+    int saw_v1_full = 0;
+    for (int k = 0; k < 40; k++) {
+        int64_t ts = day_m + 500000LL + k * 1000LL;
+        float fv = 9.0f;
+        rc = tsdbc_insert_series(c1, s1, &ts, &fv, 1);
+        if (rc == TSDB_ERR_UNAVAILABLE) {
+            full_check_unavail(c1, "diskfill V1 at 92%");
+            saw_v1_full = 1;
+            break;
+        }
+        if (rc != 0)
+            die("diskfill: unexpected error on V1 waiting for FULL: %s", ers(rc));
+        usleep(100000);
+    }
+    if (!saw_v1_full)
+        die("diskfill: V1 did not return UNAVAILABLE TSDB_WHY_FULL at 92%% on %s", full_hex);
+
+    /* Snapshot merges_before once FULL is confirmed active on node 0 (well before --merge-idle-s 3 elapses). */
+    int64_t merges_before = 0;
+    {
+        int64_t vf1 = -1, vf2 = -1;
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        if (!df_metrics_vol_u64(mbuf, "tsdb_merges_total", v1, &merges_before))
+            die("diskfill: missing tsdb_merges_total for V1 on node 0");
+        if (!df_metrics_vol_u64(mbuf, "tsdb_volume_full", v1, &vf1) || vf1 != 1)
+            die("diskfill: node 0 tsdb_volume_full{volume=\"%" PRIu32 "\"} = %" PRId64 ", want 1", v1, vf1);
+        if (!df_metrics_vol_u64(mbuf, "tsdb_volume_full", v2, &vf2) || vf2 != 0)
+            die("diskfill: node 0 tsdb_volume_full{volume=\"%" PRIu32 "\"} = %" PRId64 ", want 0 (fullall bug?)", v2, vf2);
+        char sf1[48], sf2[48];
+        snprintf(sf1, sizeof sf1, "vol.%" PRIu32 ".full=", v1);
+        snprintf(sf2, sizeof sf2, "vol.%" PRIu32 ".full=", v2);
+        int64_t sv1 = -1, sv2 = -1;
+        if (!df_status_i64(0, sf1, &sv1) || sv1 != 1 || !df_status_i64(0, sf2, &sv2) || sv2 != 0)
+            die("diskfill: STATUS vol.full mismatch with metrics on node 0 (v1=%" PRId64 " v2=%" PRId64 ")", sv1, sv2);
+    }
+
+    /* V2 (on free_dir of the SAME node 0!) MUST keep accepting writes cleanly (catches `fullall`!). */
+    for (int k = 0; k < 6; k++) {
+        int64_t ts = day_m + 600000LL + k * 1000LL;
+        float fv = 12.0f + (float)k;
+        rc = tsdbc_insert_series(c2, s2, &ts, &fv, 1);
+        if (rc != 0)
+            die("diskfill: V2 on healthy second disk of node 0 failed while first disk was 92%% FULL: %s "
+                "(fullall bug?)",
+                ers(rc));
+        usleep(120000);
+    }
+
+#ifdef TSDB_EC
+    /* Unmerged level-0 aged key (day_drain) MUST still settle into the chunk tier while at 92% FULL (never
+     * deadlocked behind held merges), AND all matched retired copies MUST be released early despite keep_s=3600! */
+    for (uint64_t t0 = now_ms(); count_chunk_files_in(d0h, v1) <= ch_pre90; usleep(100000))
+        if (now_ms() - t0 > 15000)
+            die("diskfill: aged key with unmerged level-0 parts failed to settle while at 92%% FULL (chunks=%d)",
+                ch_pre90);
+    for (uint64_t t0 = now_ms(); df_count_settled_parts(v1_dir) > 0; usleep(100000))
+        if (now_ms() - t0 > 15000)
+            die("diskfill: retired settled_*.part in %s not released early at 92%% FULL (fullnorelease bug?)", v1_dir);
+    char er_key[64];
+    snprintf(er_key, sizeof er_key, "vol.%" PRIu32 ".early_releases=", v1);
+    int64_t er_cnt = 0;
+    if (!df_status_i64(0, er_key, &er_cnt) || er_cnt < 1)
+        die("diskfill: expected %s>=1 on node 0, got %" PRId64 " (fullnorelease bug?)", er_key, er_cnt);
+#endif
+
+    /* Merge hold: wait past --merge-idle-s 3 while full_hex stays at 92%; non-shrinking merges on day_m MUST be held
+     * (catches `fullmergeon`!). */
+    char mh_key[64];
+    snprintf(mh_key, sizeof mh_key, "vol.%" PRIu32 ".merges_held=", v1);
+    int64_t mh_cnt = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 6000; usleep(200000)) {
+        if (df_status_i64(0, mh_key, &mh_cnt) && mh_cnt >= 1)
+            break;
+    }
+    int64_t merges_while_full = 0;
+    metrics_get(mport0, mbuf, sizeof mbuf);
+    (void)df_metrics_vol_u64(mbuf, "tsdb_merges_total", v1, &merges_while_full);
+    if (mh_cnt < 1 || merges_while_full != merges_before)
+        die("diskfill: merges on full disk were not held at 92%% (merges_held=%" PRId64 ", merges %" PRId64 "->%" PRId64
+            "; fullmergeon bug?)",
+            mh_cnt, merges_before, merges_while_full);
+    printf("  90%% (young_high_pct): V1 FULL, V2 on second disk wrote on, aged key settled, retired released early, "
+           "merges held\n");
+
+    /* Hysteresis: drop to 88% (not < 90 - 2) -> V1 MUST stay FULL. */
+    uint64_t ph88 = ((uint64_t)disk_size / 100u) * 88u + ((uint64_t)disk_size % 100u);
+    snprintf(ubuf, sizeof ubuf, "%s phantom %" PRIu64 " 0\n", full_hex, ph88);
+    write_usage_file(u0, ubuf);
+    await_disk_section(0, ids[0], "young_pct=88", 1, 10000, "diskfill hysteresis 88%");
+    {
+        int64_t ts = day_m + 800000LL;
+        float fv = 8.8f;
+        rc = tsdbc_insert_series(c1, s1, &ts, &fv, 1);
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("diskfill: hysteresis at 88%% did not keep V1 FULL (rc=%s)", ers(rc));
+        full_check_unavail(c1, "diskfill V1 hysteresis 88%");
+    }
+
+    /* Lift: clear phantom bytes -> V1 writes resume, tsdb_volume_full=0, AND held merge completes! */
+    unlink(u0);
+    await_disk_section(0, ids[0], "warn=full", 0, 10000, "diskfill FULL cleared");
+    int resumed = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(100000)) {
+        int64_t ts = day_m + 900000LL;
+        float fv = 10.0f;
+        rc = tsdbc_insert_series(c1, s1, &ts, &fv, 1);
+        if (rc == 0) {
+            resumed = 1;
+            break;
+        }
+        if (rc != TSDB_ERR_UNAVAILABLE)
+            die("diskfill: unexpected error resuming V1 writes: %s", ers(rc));
+    }
+    if (!resumed)
+        die("diskfill: V1 writes did not resume after clearing FULL");
+    int64_t merges_after = merges_before;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(150000)) {
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        if (df_metrics_vol_u64(mbuf, "tsdb_merges_total", v1, &merges_after) && merges_after > merges_before)
+            break;
+    }
+    if (merges_after <= merges_before)
+        die("diskfill: held merge on V1 did not finish after FULL cleared (%" PRId64 " -> %" PRId64 ")", merges_before,
+            merges_after);
+    printf("  hysteresis held at 88%%; below mark: V1 writes resumed and held merge completed (%" PRId64 "->%" PRId64 ")\n",
+           merges_before, merges_after);
+
+#ifdef TSDB_EC
+    /* 4. Chunk-store fill mark: push node 0's HDD chunk store past 3-node fill mark (~63.3%) to 80% -> regular settle
+     *    waits cleanly without marking d0h DOWN; clearing resumes settle and lands chunks on d0h! */
+    int ch_before = count_chunk_files_in(d0h, v1);
+    uint64_t ph_ch80 = ((uint64_t)hdd_size / 100u) * 80u + ((uint64_t)hdd_size % 100u);
+    snprintf(ubuf, sizeof ubuf, "%s phantom 0 %" PRIu64 "\n", hex_h, ph_ch80);
+    write_usage_file(u0, ubuf);
+    await_disk_section(0, ids[0], "warn=chunk_full", 1, 10000, "diskfill d0h warn=chunk_full");
+
+    const int64_t day_cf = day0 + 5 * part_step;
+    {
+        int64_t ts[64];
+        float fv[64];
+        for (int k = 0; k < 64; k++) {
+            ts[k] = day_cf + k * 1000LL;
+            fv[k] = 3.0f + (float)k;
+        }
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 64)) != 0)
+            die("diskfill: insert day_cf: %s", ers(rc));
+        for (int k = 0; k < 64; k++)
+            ts[k] = day_cf + part_step + k * 1000LL;
+        if ((rc = tsdbc_insert_series(c1, s1, ts, fv, 64)) != 0)
+            die("diskfill: insert day_cf+1: %s", ers(rc));
+    }
+    usleep(2500000);
+    if (count_chunk_files_in(d0h, v1) != ch_before)
+        die("diskfill: regular settle put landed on d0h past chunk fill mark (%d -> %d)", ch_before,
+            count_chunk_files_in(d0h, v1));
+    /* Confirm d0h stayed UP (soft CHUNK_ERR_FULL refusal never marks the store DOWN). */
+    char want_hdd_up[128];
+    snprintf(want_hdd_up, sizeof want_hdd_up, "id=%s class=hdd uses=chunk state=up", hex_h);
+    await_disk_section(0, ids[0], want_hdd_up, 1, 5000, "diskfill d0h stayed UP on soft fill refusal");
+
+    unlink(u0);
+    await_disk_section(0, ids[0], "warn=chunk_full", 0, 10000, "diskfill d0h chunk_full cleared");
+    for (uint64_t t0 = now_ms(); count_chunk_files_in(d0h, v1) <= ch_before; usleep(150000))
+        if (now_ms() - t0 > 30000)
+            die("diskfill: waiting settle did not complete after d0h chunk_full cleared (chunks=%d)", ch_before);
+    printf("  chunk store past fill mark refused regular settle (store stayed UP) and resumed when cleared\n");
+#endif
+
+    /* 5. Real fill run (NO phantom bytes): set a tight virtual capacity cap on full_dir only, write real batches to V1
+     *    until real WAL + part bytes cross 90% and trigger TSDB_WHY_FULL BEFORE reaching the cap (zero ENOSPC). */
+    int64_t cur_young = 0, cur_ret = 0, cur_idx = 0;
+    metrics_get(mport0, mbuf, sizeof mbuf);
+    (void)metrics_find_i64(mbuf, key_by_young, &cur_young);
+    (void)metrics_find_i64(mbuf, key_by_ret, &cur_ret);
+    (void)metrics_find_i64(mbuf, key_by_idx, &cur_idx);
+    uint64_t cur_tot = (uint64_t)(cur_young > 0 ? cur_young : 0) + (uint64_t)(cur_ret > 0 ? cur_ret : 0) +
+                       (uint64_t)(cur_idx > 0 ? cur_idx : 0);
+    uint64_t cap_bytes = cur_tot + 512u * 1024u; /* ~512 KiB of real headroom before cap */
+    snprintf(ubuf, sizeof ubuf, "%s size %" PRIu64 "\n", full_hex, cap_bytes);
+    write_usage_file(u0, ubuf);
+
+    int real_full = 0;
+    uint64_t real_acked = 0;
+    const int64_t day_rf = day0 + 8 * part_step;
+    int64_t *rts = malloc(2048 * sizeof *rts);
+    float *rfv = malloc(2048 * sizeof *rfv);
+    if (!rts || !rfv)
+        die("diskfill: malloc real fill");
+    for (int b = 0; b < 300 && !real_full; b++) {
+        for (int k = 0; k < 2048; k++) {
+            rts[k] = day_rf + (int64_t)b * 2048000LL + (int64_t)k * 1000LL;
+            rfv[k] = (float)((b * 2048 + k) % 997) + 0.25f;
+        }
+        rc = tsdbc_insert_series(c1, s1, rts, rfv, 2048);
+        if (rc == TSDB_ERR_UNAVAILABLE) {
+            full_check_unavail(c1, "diskfill real fill 90%");
+            real_full = 1;
+            break;
+        }
+        if (rc != 0)
+            die("diskfill: real fill batch %d failed unexpectedly: %s", b, ers(rc));
+        real_acked += 2048;
+        usleep(50000);
+    }
+    free(rts);
+    free(rfv);
+    if (!real_full)
+        die("diskfill: real fill never hit TSDB_WHY_FULL within 300 batches (cap=%" PRIu64 ")", cap_bytes);
+
+    /* Clear cap and verify all real-fill acknowledged rows read back intact and server 0 never failed-stop. */
+    unlink(u0);
+    await_disk_section(0, ids[0], "warn=full", 0, 10000, "diskfill real fill cap cleared");
+    {
+        nrows = 0;
+        if ((rc = tsdbc_query_raw(c1, s1, day_rf, day_rf + 300LL * 2048000LL, count_rows, NULL)) != 0)
+            die("diskfill: query after real fill failed: %s", ers(rc));
+        if ((uint64_t)nrows != real_acked)
+            die("diskfill: post-real-fill row count %" PRIu64 " != acked %" PRIu64, (uint64_t)nrows, real_acked);
+    }
+    printf("  real fill: %" PRIu64 " real rows hit TSDB_WHY_FULL before %" PRIu64 " B cap (0 ENOSPC), all read back\n",
+           real_acked, cap_bytes);
+
+    tsdbc_close(c1);
+    tsdbc_close(c2);
+    epoll_after_two = 0;
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -33933,7 +34581,7 @@ int main(int argc, char **argv)
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
-               {"hddadd", scen_hddadd}, {"settings", scen_settings}};
+               {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

@@ -111,6 +111,7 @@
 #include <unistd.h>
 
 #include "repld.h"
+#include "disks.h"
 #include "tsdb_protocol.h"
 #include "crashpt.h"
 #include "peerlink.h"
@@ -264,9 +265,26 @@ static int isr_full_locked(const struct rvol *rv)
     return 0;
 }
 
+static int vol_local_full(uint32_t v)
+{
+    if (cluster_fill_override_active())
+        return cluster_self_full();
+    if (disks_usage_active())
+        return disks_vol_full(v);
+    return cluster_self_full();
+}
+
+static uint8_t vol_local_fill_pct(uint32_t v)
+{
+    if (cluster_fill_override_active() || !disks_usage_active())
+        return cluster_get_fill_pct();
+    uint8_t pct = disks_vol_fill_pct(v);
+    return pct != 0xff ? pct : cluster_get_fill_pct();
+}
+
 static int vol_full_locked(const struct rvol *rv)
 {
-    return cluster_self_full() || isr_full_locked(rv);
+    return vol_local_full(rv->number) || isr_full_locked(rv);
 }
 
 /* R12 (D7): checks whether this damaged follower should ask to leave the ISR via RW_ACK_DAMAGED.
@@ -366,7 +384,7 @@ static void full_sync_locked(struct rvol *rv)
         __atomic_add_fetch(&G.nfull_isr, f ? 1 : -1, __ATOMIC_RELEASE);
     }
     if (rv->mode == M_WRITER && !rv->failed) {
-        int vf = cluster_self_full() || f;
+        int vf = vol_local_full(rv->number) || f;
         if (vf && !rv->full_said) {
             say("volume %" PRIu32 ": FULL (backpressure active; refusing writes with UNAVAILABLE FULL)", rv->number);
             rv->full_said = 1;
@@ -1475,9 +1493,9 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
         free(r);
         return -1;
     }
-    /* E30 (D17): refuse incoming bulk part files for a non-ISR replica while this server is FULL so large writes on
-     * the healthy ISR never fill a FULL disk via staging/spilling; the replica FETCHes them once FULL clears. */
-    if (cluster_self_full()) {
+    /* E30 (D17) / E53: refuse incoming bulk part files for a non-ISR replica while its disk (or server) is FULL so
+     * large writes on the healthy ISR never fill a FULL disk via staging/spilling; the replica FETCHes once FULL clears. */
+    if (vol_local_full(r->volume)) {
         struct rvol *rv = vol_find(r->volume);
         int reject_full = 0;
         if (rv) {
@@ -1486,7 +1504,7 @@ static int bin_open(void *arg, struct plink *l, uint64_t file, const void *meta,
                 reject_full = 1;
                 if (!rv->full_pause_said) {
                     say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
-                        "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+                        "%%): pausing catch-up", rv->number, vol_local_fill_pct(rv->number), rv->rec.young_high_pct);
                     rv->full_pause_said = 1;
                 }
             }
@@ -2411,7 +2429,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
             if (a->msg.type == REPL_M_ACK) {
                 if (G.slow_ack && rv->mode == M_REPLICA)
                     slow_ack(rv, &a->msg);
-                a->msg.full = cluster_self_full();
+                a->msg.full = vol_local_full(rv->number);
                 a->msg.damaged = damaged_want_leave_locked(rv);
             }
             send_msg(rv, &a->msg);
@@ -2483,10 +2501,10 @@ static void exec(struct rvol *rv, struct repl_action *a)
         vol_fail(rv, a->reason ? a->reason : "the core failed");
         break;
     case REPL_A_SNAPSHOT: /* the core repeats the notice until the replica catches up */
-        if (rv->mode == M_REPLICA && !self_in_isr_locked(rv) && cluster_self_full()) {
+        if (rv->mode == M_REPLICA && !self_in_isr_locked(rv) && vol_local_full(rv->number)) {
             if (!rv->full_pause_said) {
                 say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
-                    "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+                    "%%): pausing catch-up", rv->number, vol_local_fill_pct(rv->number), rv->rec.young_high_pct);
                 rv->full_pause_said = 1;
             }
             break;
@@ -2850,11 +2868,12 @@ static void handle(struct rvol *rv, struct item *it)
         ahead_mark(p, now_ms());
         full_sync_locked(rv);
         damaged_leader_sync_locked(rv);
-    } else if (rv->mode == M_REPLICA && rv->cur.m.type == REPL_M_APPEND && rv->cur.m.nrec > 0 &&
-               !self_in_isr_locked(rv) && cluster_self_full()) {
+    } else if (rv->mode == M_REPLICA && rv->cur.m.type == REPL_M_APPEND &&
+               (rv->cur.m.nrec > 0 || (rv->core && rv->cur.m.commit > repl_written(rv->core))) &&
+               !self_in_isr_locked(rv) && vol_local_full(rv->number)) {
         if (!rv->full_pause_said) {
             say("volume %" PRIu32 ": non-ISR replica is FULL (fill %" PRIu8 "%% >= %" PRIu32
-                "%%): pausing catch-up", rv->number, cluster_get_fill_pct(), rv->rec.young_high_pct);
+                "%%): pausing catch-up", rv->number, vol_local_fill_pct(rv->number), rv->rec.young_high_pct);
             rv->full_pause_said = 1;
         }
         /* Strip data records so nothing is appended to the WAL while FULL; the empty APPEND still triggers epoch
@@ -3315,7 +3334,7 @@ static void *vol_main(void *arg)
             } else if (rv->mode == M_REPLICA) {
                 (void)damaged_want_leave_locked(rv);
             }
-            if (rv->full_pause_said && (rv->mode != M_REPLICA || self_in_isr_locked(rv) || !cluster_self_full())) {
+            if (rv->full_pause_said && (rv->mode != M_REPLICA || self_in_isr_locked(rv) || !vol_local_full(rv->number))) {
                 say("volume %" PRIu32 ": FULL cleared; resuming catch-up", rv->number);
                 rv->full_pause_said = 0;
             }
@@ -4020,8 +4039,8 @@ int repld_isr_short(uint32_t v)
 
 int repld_full(uint32_t v)
 {
-    if (!cluster_self_full() && !__atomic_load_n(&G.nfull_isr, __ATOMIC_ACQUIRE))
-        return 0; /* neither this server nor any ISR peer is FULL: zero-lock fast path */
+    if (!disks_any_full() && !cluster_self_full() && !__atomic_load_n(&G.nfull_isr, __ATOMIC_ACQUIRE))
+        return 0; /* neither any local disk, this server, nor any ISR peer is FULL: zero-lock fast path */
     struct rvol *rv = vol_find(v);
     if (!rv)
         return 0;
@@ -4030,6 +4049,13 @@ int repld_full(uint32_t v)
     pthread_mutex_unlock(&rv->mu);
     vol_put(rv);
     return f;
+}
+
+int repld_vol_full(uint32_t v)
+{
+    if (repld_full(v))
+        return 1;
+    return vol_local_full(v);
 }
 
 void repld_note_full_refusal(uint32_t v)

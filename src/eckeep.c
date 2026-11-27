@@ -634,6 +634,13 @@ static void run_job(eng *db, struct eckeep_eng *k, kjob *jp)
             k->lost += bad;
         mark_job_locked(k, jp, st, deadline);
         done_jobs(db, k);
+        if (st == ECKEEP_MATCHED && atomic_load_explicit(&db->disk_full, memory_order_acquire) &&
+            eckeep_mutant != ECKEEP_MUT_FULLNORELEASE && !eng_disk_fill_no_release()) {
+            /* E53: disk is >= young_high_pct; release newly matched retired copies immediately (db->lock > k->mu). */
+            pthread_mutex_unlock(&k->mu);
+            graveyard_purge(db, false);
+            pthread_mutex_lock(&k->mu);
+        }
     }
     pthread_cond_broadcast(&k->cv);
 }
@@ -712,6 +719,13 @@ static void *keep_main(void *arg)
         case R_MATCH:
             e->status = ECKEEP_MATCHED;
             e->deadline = deadline;
+            if (atomic_load_explicit(&db->disk_full, memory_order_acquire) &&
+                eckeep_mutant != ECKEEP_MUT_FULLNORELEASE && !eng_disk_fill_no_release()) {
+                /* E53: disk is >= young_high_pct; release newly matched retired source immediately (db->lock > k->mu). */
+                pthread_mutex_unlock(&k->mu);
+                graveyard_purge(db, false);
+                pthread_mutex_lock(&k->mu);
+            }
             break;
         case R_ORPHAN:
             e->status = ECKEEP_ORPHAN;
@@ -813,10 +827,14 @@ bool eckeep_purge_entry(eng *db, const graveyard_entry *e, bool all, int64_t now
     pthread_mutex_lock(&k->mu);
     kick(db, k);
     kent *x = find(k, e->name);
-    if (x && !x->busy && wall >= x->deadline &&
+    bool early = x && x->status == ECKEEP_MATCHED && atomic_load_explicit(&db->disk_full, memory_order_acquire) &&
+                 eckeep_mutant != ECKEEP_MUT_FULLNORELEASE && !eng_disk_fill_no_release();
+    if (x && !x->busy && (wall >= x->deadline || early) &&
         (x->status == ECKEEP_MATCHED || x->status == ECKEEP_ORPHAN || x->status == ECKEEP_ROT ||
          (x->status == ECKEEP_DIVERGED && eckeep_mutant == ECKEEP_MUT_DIGESTNOHOLD)) &&
         !ec_part_settling_locked(db, e->name)) {
+        if (early && wall < x->deadline)
+            atomic_fetch_add_explicit(&db->st_early_releases, 1, memory_order_relaxed);
         drop_entry(k, x);
         release = true;
     }

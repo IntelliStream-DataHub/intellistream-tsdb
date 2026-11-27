@@ -228,6 +228,12 @@ void chunksrv_rel_barrier(struct chunksrv *cs, uint32_t volume, unsigned pos);
 typedef void (*chunksrv_store_fault_fn)(void *arg, int store_idx, int err_code);
 void chunksrv_set_store_fault(struct chunksrv *cs, chunksrv_store_fault_fn fn, void *arg);
 
+/* R13 (r13-fill, E53, §15.4): optional per-store put admission hook. Returns 1 if store_idx may accept this put
+ * (is_rebuild=0: below cluster fill mark and shared-disk young reserve; is_rebuild=1: below 95%), else 0 (soft
+ * refusal with CHUNK_ERR_FULL without marking the store DOWN). */
+typedef int (*chunksrv_put_allow_fn)(void *arg, int store_idx, int is_rebuild);
+void chunksrv_set_put_allow(struct chunksrv *cs, chunksrv_put_allow_fn fn, void *arg);
+
 /* Per-store chunk scrub lifecycle on a chunksrv instance (R12, r12-chunk). */
 struct chunksrv_scrub_cfg {
     uint32_t scrub_days;

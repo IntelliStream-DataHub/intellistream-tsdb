@@ -2394,6 +2394,9 @@ struct eng {
     atomic_bool diverged;  /* R7 (src/eckeep.c, D5): a settle's digest did not match: refused like quiesced, also after
                             * a restart (the DIVERGED file, src/ecdiverge.h) until `volume diverged --clear`
                             * (tsdb_volume_resume does not clear it) */
+    atomic_bool disk_full; /* R13 r13-fill (E53): volume's disk is >= young_high_pct (early retired release + merge hold) */
+    atomic_uint_fast64_t st_early_releases; /* R13 r13-fill: matched retired settle parts released early while disk_full */
+    atomic_uint_fast64_t st_merges_held;    /* R13 r13-fill: background merge cycles held while disk_full */
     int bg_error;
     /* statistics (stats.c): `stats` exists once the sweeper has started and is freed by eng_close; `stats_on` is
      * set (under db->lock, after `stats` is complete) while list changes push events into its ring */
@@ -3057,5 +3060,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
 /* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
  * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
 size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, char drop_intent[64]);
+/* R13 r13-fill: test mutant getters (always false when TSDB_TEST_HOOKS is off). */
+bool eng_disk_fill_no_release(void);
+bool eng_disk_fill_merge_on(void);
 
 #endif

@@ -109,8 +109,9 @@ enum {
     ECKEEP_MUT_NOOBJCMP,     /* noobjcmp: the object's xxh64 is not compared with the record's (only the file's is) */
     ECKEEP_MUT_OPENWAIT,     /* openwait: an object that cannot be opened with every store UP waits, never DIVERGED */
     ECKEEP_MUT_NOLENCHECK,   /* nolencheck: a settled_ file of another length is not refused (its first bytes hashed) */
-    ECKEEP_MUT_ORPHANNOW,    /* orphannow: an orphan is released at once, not keep_s after it was found */
-    ECKEEP_MUT_NOHALTSTOP,   /* nohaltstop: eng_halt leaves the digest thread running (src/db.c) */
+    ECKEEP_MUT_ORPHANNOW,     /* orphannow: an orphan is released at once, not keep_s after it was found */
+    ECKEEP_MUT_NOHALTSTOP,    /* nohaltstop: eng_halt leaves the digest thread running (src/db.c) */
+    ECKEEP_MUT_FULLNORELEASE, /* fullnorelease: matched retired parts are not released early while disk_full (R13) */
 };
 extern int eckeep_mutant;
 #endif

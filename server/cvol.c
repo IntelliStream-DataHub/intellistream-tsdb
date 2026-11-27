@@ -265,6 +265,16 @@ static int build_cvolfs_disks(struct cvolfs_disk *out, int cap, uint32_t exclude
             out[i].state = di[i].state;
             out[i].present = di[i].present;
             out[i].recovering = di[i].recovering;
+            if (di[i].have_usage) {
+                out[i].have_usage = 1;
+                if (di[i].young_room_bytes > 0) {
+                    out[i].size_bytes = di[i].young_room_bytes;
+                    out[i].used_bytes = di[i].young_used_bytes;
+                } else {
+                    out[i].size_bytes = 1;
+                    out[i].used_bytes = 1;
+                }
+            }
         }
     }
     free(di);
@@ -413,11 +423,12 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
         m->fault_reason = rc == TSDB_ERR_CORRUPT ? CL_FAULT_CORRUPT_OPEN : CL_FAULT_REFUSED;
     }
     pthread_mutex_unlock(&M.mu);
-    if (rc == 0)
+    if (rc == 0) {
+        disk_usage_kick();
         say("volume %" PRIu32 " (%s): open as the %s, generation %" PRIu64, r->number, r->name,
             writer ? "writer" : r->leader == M.self ? "leader (writes off until replication: a replica)" : "replica",
             m->gen);
-    else
+    } else
         say("volume %" PRIu32 " (%s): the open of %s failed: %s", r->number, r->name, vdir, tsdb_strerror(rc));
 }
 

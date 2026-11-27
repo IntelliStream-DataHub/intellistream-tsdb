@@ -772,6 +772,10 @@ struct cl_disk_item {
     uint64_t sync_us;
     uint64_t young_bytes;
     uint64_t chunk_bytes;
+    uint64_t retained_bytes;
+    uint64_t retired_bytes;
+    uint64_t local_bytes;
+    uint64_t index_bytes;
 };
 
 struct cl_disk_class_agg {
@@ -783,6 +787,10 @@ struct cl_disk_class_agg {
     int has_log_use;
     int has_chunk_use;
     uint64_t young_bytes;
+    uint64_t retained_bytes;
+    uint64_t retired_bytes;
+    uint64_t local_bytes;
+    uint64_t index_bytes;
     uint64_t chunk_bytes;
     uint64_t free_bytes;
 };
@@ -896,6 +904,7 @@ static void parse_disk_sections(struct cl_disk_summary *ds, const char *sections
 
         if (strncmp(line, "disks node=", 11) == 0) {
             uint32_t nid = 0, cnt = 0;
+            char dhex[40] = "", wkind[32] = "";
             if (sscanf(line, "disks node=%" SCNu32 " warn=allow_shared_device", &nid) == 1) {
                 char w[128];
                 snprintf(w, sizeof w, "node %" PRIu32 ": allow_shared_device", nid);
@@ -904,15 +913,26 @@ static void parse_disk_sections(struct cl_disk_summary *ds, const char *sections
                 char w[128];
                 snprintf(w, sizeof w, "node %" PRIu32 ": class_mismatch (%" PRIu32 ")", nid, cnt);
                 disk_summary_add_warn(ds, w);
+            } else if (sscanf(line, "disks node=%" SCNu32 " warn=drain_no_space", &nid) == 1) {
+                char w[128];
+                snprintf(w, sizeof w, "node %" PRIu32 ": drain_no_space", nid);
+                disk_summary_add_warn(ds, w);
+            } else if (sscanf(line, "disks node=%" SCNu32 " disk=%39s warn=%31s pct=%" SCNu32, &nid, dhex, wkind,
+                              &cnt) == 4) {
+                char w[160];
+                snprintf(w, sizeof w, "node %" PRIu32 " disk %s: %s (%" PRIu32 "%%)", nid, dhex, wkind, cnt);
+                disk_summary_add_warn(ds, w);
             }
         } else if (strncmp(line, "disk node=", 10) == 0) {
             uint32_t nid = 0;
             char hex[40] = "", cls[16] = "", uses[24] = "", state[24] = "";
-            uint64_t sz = 0, sus = 0, yb = 0, cb = 0;
+            uint64_t sz = 0, sus = 0, yb = 0, cb = 0, retb = 0, rtdb = 0, locb = 0, ixb = 0;
             int n = sscanf(line,
                            "disk node=%" SCNu32 " id=%39s class=%15s uses=%23s state=%23s size=%" SCNu64
-                           " sync_us=%" SCNu64 " young_bytes=%" SCNu64 " chunk_bytes=%" SCNu64,
-                           &nid, hex, cls, uses, state, &sz, &sus, &yb, &cb);
+                           " sync_us=%" SCNu64 " young_bytes=%" SCNu64 " chunk_bytes=%" SCNu64
+                           " retained_bytes=%" SCNu64 " retired_bytes=%" SCNu64 " local_bytes=%" SCNu64
+                           " index_bytes=%" SCNu64,
+                           &nid, hex, cls, uses, state, &sz, &sus, &yb, &cb, &retb, &rtdb, &locb, &ixb);
             if (n < 7)
                 continue;
             uint8_t sid[16];
@@ -948,10 +968,16 @@ static void parse_disk_sections(struct cl_disk_summary *ds, const char *sections
                 if (it->sync_us == 0)
                     it->sync_us = sus;
             }
-            if (n == 9) {
+            if (n >= 9) {
                 it->have_usage = 1;
                 it->young_bytes = yb;
                 it->chunk_bytes = cb;
+                if (n >= 13) {
+                    it->retained_bytes = retb;
+                    it->retired_bytes = rtdb;
+                    it->local_bytes = locb;
+                    it->index_bytes = ixb;
+                }
             }
         }
     }
@@ -1081,6 +1107,10 @@ static void collect_disks(const struct cluster_status *st, const struct meta_sta
         if (it->have_usage) {
             a->have_usage = 1;
             a->young_bytes = status_add_sat(a->young_bytes, it->young_bytes);
+            a->retained_bytes = status_add_sat(a->retained_bytes, it->retained_bytes);
+            a->retired_bytes = status_add_sat(a->retired_bytes, it->retired_bytes);
+            a->local_bytes = status_add_sat(a->local_bytes, it->local_bytes);
+            a->index_bytes = status_add_sat(a->index_bytes, it->index_bytes);
             a->chunk_bytes = status_add_sat(a->chunk_bytes, it->chunk_bytes);
         }
     }
@@ -2030,11 +2060,24 @@ static int print_status_disks(const struct cluster_status *st, int json)
                    ", \"size_bytes\": %" PRIu64 ", \"young_bytes\": ",
                    nc++ ? "," : "", meta_disk_class_name(c), a->disks, a->disks_up, a->disks_down, a->disks_out,
                    a->disks_destroyed, a->size_bytes);
+            if (a->have_usage && (fast || a->has_log_use)) {
+                uint64_t sub = status_add_sat(status_add_sat(a->retained_bytes, a->retired_bytes),
+                                              status_add_sat(a->local_bytes, a->index_bytes));
+                uint64_t yd = a->young_bytes > sub ? a->young_bytes - sub : 0;
+                printf("%" PRIu64, yd);
+            } else
+                fputs("null", stdout);
+            fputs(", \"retired_bytes\": ", stdout);
             if (a->have_usage && (fast || a->has_log_use))
-                printf("%" PRIu64, a->young_bytes);
+                printf("%" PRIu64, a->retired_bytes);
             else
                 fputs("null", stdout);
-            fputs(", \"retired_bytes\": null, \"index_bytes\": null, \"chunk_bytes\": ", stdout);
+            fputs(", \"index_bytes\": ", stdout);
+            if (a->have_usage && (fast || a->has_log_use))
+                printf("%" PRIu64, a->index_bytes);
+            else
+                fputs("null", stdout);
+            fputs(", \"chunk_bytes\": ", stdout);
             if (a->have_usage)
                 printf("%" PRIu64, a->chunk_bytes);
             else
@@ -2106,12 +2149,20 @@ static int print_status_disks(const struct cluster_status *st, int json)
         if (a->disks == 0)
             continue;
         int fast = meta_disk_class_fast(c);
-        char s_sz[20], s_y[20], s_c[20], s_f[20], marks[24];
+        char s_sz[20], s_y[20], s_ret[20], s_ix[20], s_c[20], s_f[20], marks[24];
         fmt_bytes(a->size_bytes, s_sz, sizeof s_sz);
-        if (a->have_usage && (fast || a->has_log_use))
-            fmt_bytes(a->young_bytes, s_y, sizeof s_y);
-        else
+        if (a->have_usage && (fast || a->has_log_use)) {
+            uint64_t sub = status_add_sat(status_add_sat(a->retained_bytes, a->retired_bytes),
+                                          status_add_sat(a->local_bytes, a->index_bytes));
+            uint64_t yd = a->young_bytes > sub ? a->young_bytes - sub : 0;
+            fmt_bytes(yd, s_y, sizeof s_y);
+            fmt_bytes(a->retired_bytes, s_ret, sizeof s_ret);
+            fmt_bytes(a->index_bytes, s_ix, sizeof s_ix);
+        } else {
             snprintf(s_y, sizeof s_y, "-");
+            snprintf(s_ret, sizeof s_ret, "-");
+            snprintf(s_ix, sizeof s_ix, "-");
+        }
         if (a->have_usage) {
             fmt_bytes(a->chunk_bytes, s_c, sizeof s_c);
             fmt_bytes(a->free_bytes, s_f, sizeof s_f);
@@ -2124,7 +2175,7 @@ static int print_status_disks(const struct cluster_status *st, int json)
         else
             snprintf(marks, sizeof marks, "%" PRIu32 "%%", ds.chunk_fill_mark_pct);
         printf("%-6s %-6" PRIu32 " %-8s %-7s %-8s %-7s %-8s %-8s %-11s %s\n", meta_disk_class_name(c), a->disks, s_sz,
-               s_y, "-", "-", s_c, s_f, marks, "-");
+               s_y, s_ret, s_ix, s_c, s_f, marks, "-");
     }
     for (size_t i = 0; i < ds.nwarnings; i++)
         printf("warn %s\n", ds.warnings[i]);

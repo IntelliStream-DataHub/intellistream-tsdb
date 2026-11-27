@@ -594,6 +594,8 @@ struct chunksrv {
     _Atomic(void *) rel_guard_arg;
     _Atomic(chunksrv_store_fault_fn) store_fault;
     _Atomic(void *) store_fault_arg;
+    _Atomic(chunksrv_put_allow_fn) put_allow;
+    _Atomic(void *) put_allow_arg;
     /* Striped per-(volume, pos) leaf mutex serializing CS_OP_DEL_REL (guard + delete) with sfill start barrier. */
     pthread_mutex_t rel_mu[64];
     struct chunksrv_stats st;
@@ -1085,6 +1087,14 @@ void chunksrv_set_store_fault(struct chunksrv *cs, chunksrv_store_fault_fn fn, v
         return;
     atomic_store_explicit(&cs->store_fault_arg, arg, memory_order_relaxed);
     atomic_store_explicit(&cs->store_fault, fn, memory_order_release);
+}
+
+void chunksrv_set_put_allow(struct chunksrv *cs, chunksrv_put_allow_fn fn, void *arg)
+{
+    if (!cs)
+        return;
+    atomic_store_explicit(&cs->put_allow_arg, arg, memory_order_relaxed);
+    atomic_store_explicit(&cs->put_allow, fn, memory_order_release);
 }
 
 static void cs_store_fault(struct chunksrv *cs, int store_idx, int rc)
@@ -1746,30 +1756,53 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
         memcpy(id.vuuid, p->m.vuuid, 16);
         memcpy(id.oid, p->m.oid, 16);
         uint64_t fence = act_epoch(cs, p->m.volume, p->m.epoch);
+        chunksrv_put_allow_fn allow_fn = atomic_load_explicit(&cs->put_allow, memory_order_acquire);
+        void *allow_arg = atomic_load_explicit(&cs->put_allow_arg, memory_order_relaxed);
         if (p->m.flags & CS_PUT_F_REPLACE) {
-            bool was_up[CHUNKSRV_DIRS_MAX] = {0};
-            for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
-                was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
-            rc = chunk_be_wr_open_replace(cs->be, &id, &p->m.g, p->m.hdr_epoch, fence, &p->w, &p->st);
-            if (rc == 0 && p->st) {
-                for (int i = 0; i < cs->n; i++) {
-                    if (chunk_be_raw_store(cs->be, i) == p->st) {
-                        p->store_idx = i;
-                        break;
-                    }
+            int rb_ok = 0;
+            for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++) {
+                if (chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP && (!allow_fn || allow_fn(allow_arg, i, 1))) {
+                    rb_ok = 1;
+                    break;
                 }
-            } else if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL) {
+            }
+            if (allow_fn && !rb_ok) {
+                rc = CHUNK_ERR_FULL;
+            } else {
+                bool was_up[CHUNKSRV_DIRS_MAX] = {0};
                 for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
-                    if (was_up[i] && chunk_be_store_state(cs->be, i) == CHUNK_STORE_DOWN_IOERR)
-                        cs_store_fault(cs, i, rc);
-            } else if (rc == TSDB_ERR_NOTFOUND) {
-                char hex[33];
-                chunk_oid_hex(p->m.oid, hex);
-                fprintf(stderr, "tsdbd: chunk replace refused: volume %" PRIu32 " oid=%s pos=%u not found (deleted)\n",
-                        p->m.volume, hex, (unsigned)p->m.pos);
+                    was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
+                rc = chunk_be_wr_open_replace(cs->be, &id, &p->m.g, p->m.hdr_epoch, fence, &p->w, &p->st);
+                if (rc == 0 && p->st) {
+                    for (int i = 0; i < cs->n; i++) {
+                        if (chunk_be_raw_store(cs->be, i) == p->st) {
+                            p->store_idx = i;
+                            break;
+                        }
+                    }
+                    if (allow_fn && p->store_idx >= 0 && !allow_fn(allow_arg, p->store_idx, 1)) {
+                        chunk_wr_abort(p->w);
+                        p->w = NULL;
+                        chunk_store_unref(p->st);
+                        p->st = NULL;
+                        p->store_idx = -1;
+                        rc = CHUNK_ERR_FULL;
+                    }
+                } else if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL) {
+                    for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                        if (was_up[i] && chunk_be_store_state(cs->be, i) == CHUNK_STORE_DOWN_IOERR)
+                            cs_store_fault(cs, i, rc);
+                } else if (rc == TSDB_ERR_NOTFOUND) {
+                    char hex[33];
+                    chunk_oid_hex(p->m.oid, hex);
+                    fprintf(stderr,
+                            "tsdbd: chunk replace refused: volume %" PRIu32 " oid=%s pos=%u not found (deleted)\n",
+                            p->m.volume, hex, (unsigned)p->m.pos);
+                }
             }
         } else {
             int primary = cs->n > 0 ? chunk_be_place(cs->be, id.oid, id.pos) : 0;
+            int saw_full = 0;
             rc = TSDB_ERR_UNAVAILABLE;
             for (int off = 0; off < cs->n; off++) {
                 int cand = (primary + off) % cs->n;
@@ -1778,6 +1811,11 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
                 int st_state = chunk_be_store_state(cs->be, cand);
                 if (st_state != CHUNK_STORE_UP && st_state != CHUNK_STORE_REPLACING)
                     continue;
+                if (allow_fn && !allow_fn(allow_arg, cand, 0)) {
+                    /* R13 r13-fill (E53): soft refusal past fill mark without marking store DOWN. */
+                    saw_full = 1;
+                    continue;
+                }
                 int wrc =
 #ifdef TSDB_TEST_HOOKS
                     atomic_load_explicit(&chunksrv_test_eio_store, memory_order_relaxed) == cand
@@ -1798,6 +1836,8 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
                 rc = wrc;
                 break;
             }
+            if (rc == TSDB_ERR_UNAVAILABLE && saw_full)
+                rc = CHUNK_ERR_FULL;
         }
     }
     if (rc != 0) {

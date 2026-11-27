@@ -2172,3 +2172,69 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
     db_release(ps, n);
     return 0;
 }
+
+static atomic_int g_disk_fill_no_release;
+static atomic_int g_disk_fill_merge_on;
+
+void eng_set_disk_fill_mutants(int no_release, int merge_on)
+{
+#ifdef TSDB_TEST_HOOKS
+    atomic_store_explicit(&g_disk_fill_no_release, no_release ? 1 : 0, memory_order_release);
+    atomic_store_explicit(&g_disk_fill_merge_on, merge_on ? 1 : 0, memory_order_release);
+#else
+    (void)no_release;
+    (void)merge_on;
+#endif
+}
+
+bool eng_disk_fill_no_release(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return atomic_load_explicit(&g_disk_fill_no_release, memory_order_acquire) != 0;
+#else
+    return false;
+#endif
+}
+
+bool eng_disk_fill_merge_on(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    return atomic_load_explicit(&g_disk_fill_merge_on, memory_order_acquire) != 0;
+#else
+    return false;
+#endif
+}
+
+void eng_set_disk_full(eng *db, bool full)
+{
+    if (!db)
+        return;
+    bool prev = atomic_exchange_explicit(&db->disk_full, full, memory_order_acq_rel);
+    if (full && !prev) {
+        /* E53: wake the flush thread so already-matched retired settle parts are purged immediately
+         * on the engine's own joined thread (never doing blocking unlink/fsync I/O on the detachable sampler). */
+        pthread_mutex_lock(&db->buf_lock);
+        pthread_cond_signal(&db->flush_cv);
+        pthread_mutex_unlock(&db->buf_lock);
+    } else if (!full && prev) {
+        /* Lift merge hold promptly when disk drops below the hysteresis clear mark. */
+        pthread_mutex_lock(&db->lock);
+        pthread_cond_broadcast(&db->merge_cv);
+        pthread_mutex_unlock(&db->lock);
+    }
+}
+
+bool eng_disk_full(const eng *db)
+{
+    return db && atomic_load_explicit(&db->disk_full, memory_order_acquire);
+}
+
+uint64_t eng_early_releases(const eng *db)
+{
+    return db ? atomic_load_explicit(&db->st_early_releases, memory_order_relaxed) : 0;
+}
+
+uint64_t eng_merges_held(const eng *db)
+{
+    return db ? atomic_load_explicit(&db->st_merges_held, memory_order_relaxed) : 0;
+}

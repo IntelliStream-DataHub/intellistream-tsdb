@@ -51,6 +51,7 @@ struct place_disk_usage {
     uint64_t size_bytes;
     uint64_t young_bytes;
     uint64_t chunk_bytes;
+    uint64_t young_peak_7d; /* 7-day peak of young-tier bytes (0: fall back to young_bytes; §15.4) */
 };
 
 /* Per-member liveness and heartbeat report as the Raft leader sees it. */

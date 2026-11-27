@@ -36,6 +36,13 @@
 #define HBS_DISKS 12
 #define DISKS_MAX META_DISKS_MAX
 
+/* Per-disk fill/mark flags carried in HBS_DISKS v3 (R13 r13-fill; E30, E50, E53, §15.4). */
+#define HBS_DISK_F_USAGE      1u  /* usage byte counters are valid */
+#define HBS_DISK_F_WARN       2u  /* young_fill_pct >= young_warn_pct (75% default) */
+#define HBS_DISK_F_MOVE       4u  /* young_fill_pct >= young_move_pct (80%: no new placement + move needed) */
+#define HBS_DISK_F_FULL       8u  /* young_fill_pct >= young_high_pct (90% with 2-point hysteresis) */
+#define HBS_DISK_F_CHUNK_FULL 16u /* chunk store past fill mark (settles wait; rebuilds allowed up to 95%) */
+
 struct disk_spec {
     char path[PATH_MAX];
     int stated_class; /* DISK_CLASS_NONE (0) when omitted, else DISK_CLASS_NVME/SSD/HDD */
@@ -56,11 +63,19 @@ struct hbs_disk_row {
     uint8_t disk_class; /* enum meta_disk_class */
     uint8_t uses;       /* enum meta_disk_uses bitmask */
     uint8_t state;      /* enum meta_store_state */
-    uint8_t have_usage; /* 1 when young_bytes/chunk_bytes are reported (r13-fill or test knob) */
+    uint8_t have_usage; /* 1 when usage bytes are reported (r13-fill or test knob) */
+    uint8_t fill_flags; /* HBS_DISK_F_* bitmask */
+    uint8_t young_fill_pct;
+    uint8_t chunk_fill_pct;
     uint64_t size_bytes;
     uint64_t sync_us;
-    uint64_t young_bytes; /* bytes in young-tier uses on this disk (valid when have_usage != 0) */
-    uint64_t chunk_bytes; /* bytes in chunk use on this disk (valid when have_usage != 0) */
+    uint64_t young_bytes;    /* total young-tier bytes on this disk (young_data+retained+retired+local+index) */
+    uint64_t chunk_bytes;    /* bytes in chunk use on this disk */
+    uint64_t retained_bytes; /* retained WAL segments (E29) */
+    uint64_t retired_bytes;  /* retired settle parts kept settle_keep_s (E26) */
+    uint64_t local_bytes;    /* local copies (ec_keep_local_h) */
+    uint64_t index_bytes;    /* .ec index files */
+    uint64_t young_peak_7d;  /* 7-day peak of young-tier bytes (shared disk young reserve, §15.4) */
 };
 
 struct hbs_disks {
@@ -102,7 +117,7 @@ int disks_mark_draining(const uint8_t store_id[16], int draining);
 int disks_drain_start(void);
 void disks_drain_stop(void);
 
-/* Read-only snapshot of one configured disk (for multi-disk cvolfs/scrubd; R13 r13-cvolfs). */
+/* Read-only snapshot of one configured disk (for multi-disk cvolfs/scrubd; R13 r13-cvolfs/r13-fill). */
 struct disk_info {
     char path[PATH_MAX];
     uint8_t store_id[16];
@@ -111,10 +126,51 @@ struct disk_info {
     uint8_t state;  /* enum meta_store_state */
     int present;    /* 1 if DISK loaded and present on this start */
     int recovering; /* 1 while disk health domain is RECOVERING (existing v<N> reopen allowed) */
+    int have_usage; /* 1 when young_room_bytes/young_used_bytes are populated by disk_usage_* */
     uint64_t size_bytes;
+    uint64_t young_room_bytes; /* size_bytes (or size_bytes - chunk_bytes on shared disks) */
+    uint64_t young_used_bytes; /* effective young-tier bytes counted against young_room_bytes */
+    uint8_t young_fill_pct;
+    uint8_t chunk_fill_pct;
+    uint8_t fill_flags; /* HBS_DISK_F_* */
 };
 /* Copy up to `cap` local disk entries into `out`. Returns count copied (0 before disks_prepare). Thread-safe. */
 int disks_list(struct disk_info *out, int cap);
+
+/* Per-disk bytes-by-use accounting, 75/80/90% fill marks, per-volume FULL, and chunk-store fill mark (R13 r13-fill;
+ * E30, E50, E53, §15.4). Samples every 10 s (or faster under test) off any engine lock.
+ * Callbacks decouple disks.o (also linked into tsdb CLI) from cvol.o / repld.o. */
+struct disk_usage_hooks {
+    int (*vol_disk)(uint32_t vol, char *root_out, size_t cap, uint8_t store_id_out[16]);
+    uint32_t (*vols_on_disk)(const uint8_t store_id[16], uint32_t *vols_out, uint32_t cap);
+    void (*wake_vol)(uint32_t vol);
+};
+int disk_usage_start(tsdb *db, const struct disk_usage_hooks *hooks);
+void disk_usage_stop(void);
+void disk_usage_kick(void);
+int disks_usage_active(void);
+int disks_any_full(void);
+int disks_vol_full(uint32_t vol);
+uint8_t disks_vol_fill_pct(uint32_t vol);
+int disks_chunk_store_can_put(int chunk_slot, int is_rebuild);
+
+struct disk_fill_snap {
+    uint8_t store_id[16];
+    int disk_class;
+    uint8_t uses;
+    uint8_t fill_flags;
+    uint8_t young_fill_pct;
+    uint8_t chunk_fill_pct;
+    uint64_t size_bytes;
+    uint64_t young_data_bytes; /* pure young data: active WAL + young parts + metadata */
+    uint64_t retained_bytes;
+    uint64_t retired_bytes;
+    uint64_t local_bytes;
+    uint64_t index_bytes;
+    uint64_t chunk_bytes;
+    uint64_t young_peak_7d;
+};
+int disks_usage_snapshot(struct disk_fill_snap *out, int cap);
 
 /* Per-disk O_DIRECT health probes & fault isolation (R13, r13-fault; E57, §15.6, PLAN.md D16).
  * Callback runs off g_mu and off health->mu; must not block. `old_state` / `new_state` are TSDB_DOM_*. */
@@ -143,6 +199,9 @@ enum {
     DISKS_MUT_STALLEXIT = 4,     /* stallexit: exit(1) when a fast disk probe goes DOWN */
     DISKS_MUT_STALLNORESIGN = 5, /* stallnoresign: keep leaders on a DOWN fast disk instead of deposing */
     DISKS_MUT_STOREEIOEXIT = 6,  /* storeeioexit: exit(1) when a chunk store fails EIO/ENOSPC or goes DOWN */
+    DISKS_MUT_FULLALL = 7,       /* fullall: mark EVERY volume on the node FULL when any disk is FULL */
+    DISKS_MUT_FULLNORELEASE = 8, /* fullnorelease: do not early-release matched retired parts at 90% */
+    DISKS_MUT_FULLMERGEON = 9,   /* fullmergeon: do not hold non-shrinking merges at 90% */
 };
 int disks_mutant_parse(const char *name);
 int disks_mutant(void);

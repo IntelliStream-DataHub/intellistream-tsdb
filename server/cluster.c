@@ -2678,6 +2678,7 @@ static void copy_publish(void)
         mem[i].capability = m->capability;
         snprintf(mem[i].addr, sizeof mem[i].addr, "%s", m->addr);
         snprintf(mem[i].peer, sizeof mem[i].peer, "%s", m->peer);
+        snprintf(mem[i].rack, sizeof mem[i].rack, "%s", m->rack);
         mem[i].ndisks = m->ndisks < META_DISKS_MAX ? m->ndisks : META_DISKS_MAX;
         if (mem[i].ndisks)
             memcpy(mem[i].disks, m->disks, mem[i].ndisks * sizeof mem[i].disks[0]);
@@ -3079,6 +3080,10 @@ static _Atomic int g_hb_failstop;
 static _Atomic uint8_t g_hb_fill_pct = 0xff; /* 0xff: unknown until r9-hb reports statvfs fill % */
 /* R9 (E30, D17): per-server FULL hysteresis state (g_young_high_pct declared above copy_publish). */
 static _Atomic int g_self_full;
+static _Atomic int g_fill_override_active;
+static pthread_mutex_t g_disk_tot_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_disk_tot_valid;
+static struct cluster_disk_class_totals g_disk_tot[META_DISK_CLASS_LAST + 1];
 
 static void refresh_self_full(void)
 {
@@ -3125,6 +3130,70 @@ void cluster_set_fill_pct(uint8_t pct)
 uint8_t cluster_get_fill_pct(void) { return atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed); }
 uint32_t cluster_young_high_pct(void) { return atomic_load_explicit(&g_young_high_pct, memory_order_acquire); }
 int cluster_self_full(void) { return atomic_load_explicit(&g_self_full, memory_order_acquire); }
+int cluster_fill_override_active(void) { return atomic_load_explicit(&g_fill_override_active, memory_order_acquire); }
+
+int cluster_disk_usage_totals(struct cluster_disk_class_totals out[META_DISK_CLASS_LAST + 1])
+{
+    if (!out)
+        return 0;
+    pthread_mutex_lock(&g_disk_tot_mu);
+    int ok = g_disk_tot_valid;
+    if (ok)
+        memcpy(out, g_disk_tot, sizeof g_disk_tot);
+    pthread_mutex_unlock(&g_disk_tot_mu);
+    return ok;
+}
+
+static uint64_t cl_add_sat(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+static void refresh_disk_usage_totals(void)
+{
+    int is_lead = (C.r && raft_get_role(C.r) == RAFT_LEADER);
+    struct cluster_disk_class_totals tot[META_DISK_CLASS_LAST + 1];
+    memset(tot, 0, sizeof tot);
+    if (is_lead) {
+        for (size_t i = 0; i < C.nheard; i++) {
+            const struct meta_member *mb = meta_member(&C.sm, C.heard[i].id);
+            if (!mb || mb->state >= META_OUT)
+                continue;
+            const struct hbs_disks *hd = creport_heard_get(&C.heard[i].ext, HBS_DISKS);
+            if (!hd)
+                continue;
+            for (uint32_t k = 0; k < hd->ndisks && k < DISKS_MAX; k++) {
+                const struct hbs_disk_row *r = &hd->disks[k];
+                if (r->state == META_STORE_DESTROYED)
+                    continue;
+                if (r->disk_class < META_DISK_NVME || r->disk_class > META_DISK_CLASS_LAST)
+                    continue;
+                struct cluster_disk_class_totals *a = &tot[r->disk_class];
+                a->disks++;
+                a->size_bytes = cl_add_sat(a->size_bytes, r->size_bytes);
+                if (r->have_usage) {
+                    uint64_t other = cl_add_sat(cl_add_sat(r->retained_bytes, r->retired_bytes),
+                                                cl_add_sat(r->local_bytes, r->index_bytes));
+                    uint64_t yd = r->young_bytes > other ? r->young_bytes - other : 0;
+                    a->young_data_bytes = cl_add_sat(a->young_data_bytes, yd);
+                    a->retained_bytes = cl_add_sat(a->retained_bytes, r->retained_bytes);
+                    a->retired_bytes = cl_add_sat(a->retired_bytes, r->retired_bytes);
+                    a->local_bytes = cl_add_sat(a->local_bytes, r->local_bytes);
+                    a->index_bytes = cl_add_sat(a->index_bytes, r->index_bytes);
+                    a->chunk_bytes = cl_add_sat(a->chunk_bytes, r->chunk_bytes);
+                }
+                if (r->fill_flags & HBS_DISK_F_FULL)
+                    a->full_disks++;
+                else if (r->fill_flags & HBS_DISK_F_MOVE)
+                    a->move_disks++;
+                else if (r->fill_flags & HBS_DISK_F_WARN)
+                    a->warn_disks++;
+            }
+        }
+    }
+    pthread_mutex_lock(&g_disk_tot_mu);
+    g_disk_tot_valid = is_lead;
+    if (is_lead)
+        memcpy(g_disk_tot, tot, sizeof g_disk_tot);
+    pthread_mutex_unlock(&g_disk_tot_mu);
+}
 
 /* R9 (D10, D11; filled by r9-fill): HBS_FILL entries published by sfill for the heartbeat path */
 static pthread_mutex_t g_hb_fills_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -5189,7 +5258,7 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
         left = until > m ? (int64_t)((until - m) / MS) : -(int64_t)((m - until) / MS) - 1;
     }
     put64(b, (uint64_t)left);
-    char secbuf[4096];
+    char secbuf[12288];
     secbuf[0] = '\0';
     if (h)
         creport_heard_format(&h->ext, h->id, secbuf, sizeof secbuf);
@@ -5623,6 +5692,7 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
                         dst[d].size_bytes = hd->disks[d].size_bytes;
                         dst[d].young_bytes = hd->disks[d].young_bytes;
                         dst[d].chunk_bytes = hd->disks[d].chunk_bytes;
+                        dst[d].young_peak_7d = hd->disks[d].young_peak_7d;
                     }
                     pm[i].disks = dst;
                     pm[i].ndisks = nd;
@@ -9301,8 +9371,10 @@ static void place_duty(uint64_t now)
 
 static void leader_duties(uint64_t now)
 {
-    if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER) {
+        refresh_disk_usage_totals();
         return;
+    }
     if (C.init_pending && !C.sm.initialised) {
         struct meta_member first = {.id = C.id, .state = META_UP, .incarnation = C.incarnation, .flags = my_flags()};
         snprintf(first.addr, sizeof first.addr, "%s", C.adv);
@@ -9323,6 +9395,7 @@ static void leader_duties(uint64_t now)
     member_states(now);
     propose_opens(now);
     propose_disks(now);
+    refresh_disk_usage_totals();
     propose_isr(now);
     promote_duty(now);
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
@@ -9659,6 +9732,11 @@ int cluster_start(const struct cluster_cfg *cfg)
     for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++)
         g_sw[i].seen_ver = 0;
     pthread_mutex_unlock(&g_sw_mu);
+    atomic_store_explicit(&g_fill_override_active, 0, memory_order_relaxed);
+    pthread_mutex_lock(&g_disk_tot_mu);
+    g_disk_tot_valid = 0;
+    memset(g_disk_tot, 0, sizeof g_disk_tot);
+    pthread_mutex_unlock(&g_disk_tot_mu);
     if (cfg->witness)
         atomic_store_explicit(&g_hb_opening, 0, memory_order_relaxed);
     if (cfg->secret_len < CLUSTER_SECRET_MIN || cfg->secret_len > CLUSTER_SECRET_MAX) {
@@ -9718,6 +9796,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     snprintf(C.fillpctfile, sizeof C.fillpctfile, "%s/fillpct", C.metadir);
     test_knobs();
+    atomic_store_explicit(&g_fill_override_active, (C.fill_pct_override >= 0 || C.fill_pct_file) ? 1 : 0,
+                          memory_order_release);
     if (C.fill_pct_override >= 0)
         cluster_set_fill_pct((uint8_t)C.fill_pct_override);
     if (C.users_probe)
@@ -9957,6 +10037,11 @@ void cluster_stop(void)
     for (int i = 0; i < CLUSTER_SETTINGS_WATCH_MAX; i++)
         g_sw[i].seen_ver = 0;
     pthread_mutex_unlock(&g_sw_mu);
+    atomic_store_explicit(&g_fill_override_active, 0, memory_order_relaxed);
+    pthread_mutex_lock(&g_disk_tot_mu);
+    g_disk_tot_valid = 0;
+    memset(g_disk_tot, 0, sizeof g_disk_tot);
+    pthread_mutex_unlock(&g_disk_tot_mu);
     if (C.copy_hold)
         pthread_join(C.copy_hold_th, NULL);
     if (C.copy_probe)

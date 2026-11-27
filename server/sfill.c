@@ -315,6 +315,13 @@ static bool verify_written_chunk(chunk_store *st, const chunk_ident *id, const s
     return ok;
 }
 
+static _Atomic(sfill_store_allow_fn) g_sfill_store_allow;
+
+void sfill_set_store_allow(sfill_store_allow_fn fn)
+{
+    atomic_store_explicit(&g_sfill_store_allow, fn, memory_order_release);
+}
+
 /* Open a local chunk writer for `(id, obj)` at `obj->writer_epoch`, fenced at `fence_epoch`. */
 static int open_local_writer(chunk_backend *be, const chunk_ident *id, const struct sfill_obj *obj,
                              uint64_t fence_epoch, chunk_store **st_out, chunk_wr **w_out)
@@ -331,13 +338,25 @@ static int open_local_writer(chunk_backend *be, const chunk_ident *id, const str
         return rc;
     int n = chunk_be_nstores(be);
     int base = chunk_be_place(be, id->oid, id->pos);
-    int idx = base;
+    int idx = -1;
+    int saw_full = 0;
+    sfill_store_allow_fn allow = atomic_load_explicit(&g_sfill_store_allow, memory_order_acquire);
     for (int k = 0; k < n; k++) {
         int cand = (base + k) % n;
-        if (chunk_be_store_state(be, cand) == CHUNK_STORE_UP && !chunk_be_store_draining(be, cand)) {
+        int st_state = chunk_be_store_state(be, cand);
+        if ((st_state == CHUNK_STORE_UP || st_state == CHUNK_STORE_REPLACING) && !chunk_be_store_draining(be, cand)) {
+            if (allow && !allow(cand, 1)) {
+                saw_full = 1;
+                continue;
+            }
             idx = cand;
             break;
         }
+    }
+    if (idx < 0) {
+        if (saw_full || (allow && !allow(base, 1)))
+            return CHUNK_ERR_FULL;
+        idx = base; /* preserve original fallback to base store when no non-draining UP/REPLACING store exists */
     }
     chunk_store *st = chunk_be_open_store(be, idx);
     if (!st)

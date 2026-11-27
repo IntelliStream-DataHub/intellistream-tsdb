@@ -533,12 +533,12 @@ static int member_stripe_eval(const struct place_in *in, const struct meta_membe
         if (cppm > 1000000ull)
             cppm = 1000000ull;
         int full = (cppm >= eff_mark);
-        /* Shared disk (LOG|CHUNK) young reserve (E50, §15.4): keep >= max(10% of size, 2 * young_bytes;
-         * uses current young_bytes until r13-fill reports the 7-day peak). A member remains eligible while
-         * at least one UP chunk store is below the mark (r13-fill / chunksrv steers puts away from full stores). */
+        /* Shared disk (LOG|CHUNK) young reserve (E50, §15.4): keep >= max(10% of size, 2 * 7-day peak of young-tier
+         * bytes). A member remains eligible while at least one UP chunk store is below the mark. */
         if (!full && !is_rebuild && (d->uses & META_DISK_USE_LOG)) {
             uint64_t reserve = du->size_bytes / 10u;
-            uint64_t y2 = du->young_bytes > (UINT64_MAX / 2u) ? UINT64_MAX : du->young_bytes * 2u;
+            uint64_t peak = du->young_peak_7d > du->young_bytes ? du->young_peak_7d : du->young_bytes;
+            uint64_t y2 = peak > (UINT64_MAX / 2u) ? UINT64_MAX : peak * 2u;
             if (y2 > reserve)
                 reserve = y2;
             if (du->size_bytes <= du->chunk_bytes || (du->size_bytes - du->chunk_bytes) < reserve)

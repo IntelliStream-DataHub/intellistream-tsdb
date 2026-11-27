@@ -3414,7 +3414,8 @@ static void handle_status(req *r)
     ST_PUT("node.id=%u\nnode.role=%s\nprotocol=%d\nvolumes=%u\n", cp ? (unsigned)cp->self : cvol_active() ? 0u : 1u,
            g_reader_only ? "follower" : "owner", TSDB_PROTOCOL_VERSION, (unsigned)nv);
     if (cp) {
-        ST_PUT("cluster.applied=%llu\nnode.full=%d\n", (unsigned long long)cp->applied, cluster_self_full());
+        int node_full = cluster_fill_override_active() ? cluster_self_full() : (cluster_self_full() || disks_any_full());
+        ST_PUT("cluster.applied=%llu\nnode.full=%d\n", (unsigned long long)cp->applied, node_full);
         for (uint32_t i = 0; i < cp->nmembers; i++) {
             const struct cluster_copy_member *m = &cp->members[i];
             if (m->id != cp->self)
@@ -3438,10 +3439,56 @@ static void handle_status(req *r)
             if (v->redundancy == META_RED_EC && cluster_copy_stripe_mixed(cp, v))
                 ST_PUT("vol.%u.mixed_class=1\nhealth.mixed_class.vol.%u=%s\n", (unsigned)v->number,
                        (unsigned)v->number, v->name);
-            ST_PUT("vol.%u.full=%d\nvol.%u.full_refusals=%llu\n", (unsigned)v->number, repld_full(v->number),
+            ST_PUT("vol.%u.full=%d\nvol.%u.full_refusals=%llu\n", (unsigned)v->number, repld_vol_full(v->number),
                    (unsigned)v->number, (unsigned long long)repld_full_refusals(v->number));
+            struct eng *vdb = tsdb_cvol_ref(db, v->number);
+            if (vdb) {
+                ST_PUT("vol.%u.early_releases=%llu\nvol.%u.merges_held=%llu\n", (unsigned)v->number,
+                       (unsigned long long)eng_early_releases(vdb), (unsigned)v->number,
+                       (unsigned long long)eng_merges_held(vdb));
+                tsdb_cvol_unref(&vdb);
+            }
         }
         cluster_copy_put(cp);
+        /* R13 r13-fill: local per-disk fill status & health warnings, plus Raft leader per-class usage sums. */
+        struct disk_fill_snap dsnap[DISKS_MAX];
+        int nds = disks_usage_snapshot(dsnap, DISKS_MAX);
+        for (int i = 0; i < nds; i++) {
+            char shex[33];
+            chunk_oid_hex(dsnap[i].store_id, shex);
+            ST_PUT("disk.%s.class=%s\ndisk.%s.size_bytes=%llu\ndisk.%s.young_pct=%u\ndisk.%s.chunk_pct=%u\n"
+                   "disk.%s.young_bytes=%llu\ndisk.%s.retained_bytes=%llu\ndisk.%s.retired_bytes=%llu\n"
+                   "disk.%s.local_bytes=%llu\ndisk.%s.index_bytes=%llu\ndisk.%s.chunk_bytes=%llu\n",
+                   shex, meta_disk_class_name(dsnap[i].disk_class), shex, (unsigned long long)dsnap[i].size_bytes,
+                   shex, (unsigned)dsnap[i].young_fill_pct, shex, (unsigned)dsnap[i].chunk_fill_pct, shex,
+                   (unsigned long long)dsnap[i].young_data_bytes, shex, (unsigned long long)dsnap[i].retained_bytes,
+                   shex, (unsigned long long)dsnap[i].retired_bytes, shex, (unsigned long long)dsnap[i].local_bytes,
+                   shex, (unsigned long long)dsnap[i].index_bytes, shex, (unsigned long long)dsnap[i].chunk_bytes);
+            if (dsnap[i].fill_flags & HBS_DISK_F_FULL)
+                ST_PUT("health.disk_full.%s=%u\n", shex, (unsigned)dsnap[i].young_fill_pct);
+            else if (dsnap[i].fill_flags & HBS_DISK_F_MOVE)
+                ST_PUT("health.disk_move_needed.%s=%u\n", shex, (unsigned)dsnap[i].young_fill_pct);
+            else if (dsnap[i].fill_flags & HBS_DISK_F_WARN)
+                ST_PUT("health.disk_filling.%s=%u\n", shex, (unsigned)dsnap[i].young_fill_pct);
+            if (dsnap[i].fill_flags & HBS_DISK_F_CHUNK_FULL)
+                ST_PUT("health.disk_chunk_full.%s=%u\n", shex, (unsigned)dsnap[i].chunk_fill_pct);
+        }
+        struct cluster_disk_class_totals dtot[META_DISK_CLASS_LAST + 1];
+        if (cluster_disk_usage_totals(dtot)) {
+            for (int c = META_DISK_NVME; c <= META_DISK_CLASS_LAST; c++) {
+                if (dtot[c].disks == 0)
+                    continue;
+                const char *cn = meta_disk_class_name(c);
+                ST_PUT("cluster.disks.%s.count=%u\ncluster.disks.%s.size_bytes=%llu\n"
+                       "cluster.disks.%s.young_bytes=%llu\ncluster.disks.%s.retained_bytes=%llu\n"
+                       "cluster.disks.%s.retired_bytes=%llu\ncluster.disks.%s.local_bytes=%llu\n"
+                       "cluster.disks.%s.index_bytes=%llu\ncluster.disks.%s.chunk_bytes=%llu\n",
+                       cn, (unsigned)dtot[c].disks, cn, (unsigned long long)dtot[c].size_bytes, cn,
+                       (unsigned long long)dtot[c].young_data_bytes, cn, (unsigned long long)dtot[c].retained_bytes,
+                       cn, (unsigned long long)dtot[c].retired_bytes, cn, (unsigned long long)dtot[c].local_bytes,
+                       cn, (unsigned long long)dtot[c].index_bytes, cn, (unsigned long long)dtot[c].chunk_bytes);
+            }
+        }
         struct fwd_peer_row fr[64]; /* forwarding one hop (ha.md 15.4 STATUS): per peer forwarded to */
         size_t nf = fwd_peer_rows(fr, sizeof fr / sizeof fr[0]);
         for (size_t i = 0; i < nf; i++)
@@ -4953,7 +5000,28 @@ static void crep_progress_metric(void *ctx, struct creport_sink *sink)
 static void crep_node_full(void *ctx, struct creport_sink *sink)
 {
     (void)ctx;
-    creport_sink_put_u64(sink, NULL, 0, cluster_self_full() ? 1u : 0u);
+    int nf = cluster_fill_override_active() ? cluster_self_full() : (cluster_self_full() || disks_any_full());
+    creport_sink_put_u64(sink, NULL, 0, nf ? 1u : 0u);
+}
+
+static void crep_vol_full(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cp->self) {
+        cluster_copy_put(cp);
+        return;
+    }
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (!crep_vol_held(v, cp->self))
+            continue;
+        char vbuf[16];
+        snprintf(vbuf, sizeof vbuf, "%u", (unsigned)v->number);
+        struct creport_label vlbl = {"volume", vbuf};
+        creport_sink_put_u64(sink, &vlbl, 1, repld_vol_full(v->number) ? 1u : 0u);
+    }
+    cluster_copy_put(cp);
 }
 
 static void crep_full_refusals(void *ctx, struct creport_sink *sink)
@@ -5057,6 +5125,9 @@ static void register_cluster_metrics(void)
     creport_metric_collector("tsdb_cluster_node_full", CREPORT_GAUGE,
                              "1 while this server is in FULL backpressure state (fill_pct >= young_high_pct), else 0.",
                              crep_node_full, NULL);
+    creport_metric_collector("tsdb_volume_full", CREPORT_GAUGE,
+                             "1 while this held volume is FULL (>= young_high_pct, refusing inserts with WHY_FULL), else 0.",
+                             crep_vol_full, NULL);
     creport_metric_collector("tsdb_cluster_full_refusals_total", CREPORT_COUNTER,
                              "Write requests refused with UNAVAILABLE FULL for a volume this server holds since process start.",
                              crep_full_refusals, NULL);
@@ -8505,8 +8576,25 @@ int main(int argc, char **argv)
             cvol_stop();
             return 1;
         }
+        struct disk_usage_hooks du_hooks = {
+            .vol_disk = cvol_vol_disk,
+            .vols_on_disk = cvol_vols_on_disk,
+            .wake_vol = repld_wake_vol,
+        };
+        if (disk_usage_start(db, &du_hooks) != 0) {
+            fprintf(stderr, "tsdbd: cannot start per-disk usage accounting\n");
+            disks_drain_stop();
+            chunksrv_cluster_stop();
+            disks_stop();
+            scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
+            return 1;
+        }
         if (dom_disk_init(cerr, sizeof cerr) != 0) {
             fprintf(stderr, "tsdbd: %s\n", cerr);
+            disk_usage_stop();
             disks_drain_stop();
             chunksrv_cluster_stop();
             disks_stop();
@@ -8519,6 +8607,7 @@ int main(int argc, char **argv)
         if (!witness && sfill_cluster_start(db, state_dir) != 0) {
             fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
             dom_disk_shutdown();
+            disk_usage_stop();
             disks_drain_stop();
             chunksrv_cluster_stop();
             disks_stop();
@@ -8566,6 +8655,7 @@ int main(int argc, char **argv)
         cluster_stop();
         sfill_cluster_stop(); /* stops fill workers while chunk server & db are still open */
         disks_drain_stop();   /* stops local chunk drain driver while chunk server is still open */
+        disk_usage_stop();    /* stops per-disk usage sampler while db & cvol are still open */
         creport_reset();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */

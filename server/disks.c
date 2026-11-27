@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include "disks.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -26,13 +27,17 @@
 #include "../src/chunk_priv.h"
 #include "../src/chunkmove.h"
 #include "../src/compat.h"
+#include "../src/cvol.h"
 #include "../src/internal.h"
 
-#define HBS_DISKS_VER      2u
+#define HBS_DISKS_VER      3u
+#define HBS_DISKS_VER_V2   2u
 #define HBS_DISKS_VER_V1   1u
 #define HBS_DISKS_HDR      8u
 #define HBS_DISKS_ENTRY_V1 36u
-#define HBS_DISKS_ENTRY    52u
+#define HBS_DISKS_ENTRY_V2 52u
+#define HBS_DISKS_ENTRY    96u
+#define DISK_PEAK_HOURS    168u /* 7 days of hourly young-tier peaks (§15.4) */
 
 struct known_disk {
     uint8_t store_id[16];
@@ -75,11 +80,37 @@ struct disk_entry {
     uint64_t drain_chunks_moved; /* chunks moved off this store since start */
     uint64_t drain_bytes_moved;  /* bytes moved off this store since start */
     uint64_t drain_done_logged;  /* drain_chunks_moved value when completion was last logged */
+    /* R13 r13-fill: per-disk bytes-by-use accounting, 7-day peak, and 75/80/90% fill hysteresis (E30, E50, E53). */
+    int usage_have;
+    uint64_t usage_raw_size;     /* raw statvfs total bytes */
+    uint64_t usage_fs_used;      /* raw statvfs (f_blocks - f_bavail) * unit */
+    uint64_t usage_raw_young;    /* raw pure young data: active WAL, young parts, metadata */
+    uint64_t usage_raw_retained; /* raw retained WAL segments (E29) */
+    uint64_t usage_raw_retired;  /* raw retired settle parts (settle_keep_s, E26) */
+    uint64_t usage_raw_local;    /* raw local copies (ec_keep_local_h) */
+    uint64_t usage_raw_index;    /* raw .ec index files */
+    uint64_t usage_raw_chunks;   /* raw chunk store bytes */
+    uint64_t usage_size;         /* effective size (statvfs or virtual size override) */
+    uint64_t usage_young_data;   /* effective pure young data (incl. any phantom/override delta) */
+    uint64_t usage_eff_young;    /* effective total young-tier bytes (for marks & HBS_DISKS young_bytes) */
+    uint64_t usage_eff_chunks;   /* effective chunk bytes (for marks & HBS_DISKS chunk_bytes) */
+    uint64_t usage_young_room;   /* room available to young tier (size or size - eff_chunks on shared disks) */
+    uint64_t usage_peak_7d;      /* 7-day peak of young-tier bytes (shared disk young reserve) */
+    uint64_t peak_hour_val[DISK_PEAK_HOURS];
+    uint64_t peak_hour_stamp[DISK_PEAK_HOURS];
+    uint8_t usage_young_pct;
+    uint8_t usage_chunk_pct;
+    uint8_t usage_fill_flags; /* HBS_DISK_F_* */
+    int usage_full;           /* 1 while in FULL hysteresis state (>= young_high_pct until < young_high_pct - 2) */
+    int usage_chunk_full;     /* 1 while past cluster chunk fill mark or shared young reserve */
+    int usage_chunk_rb_full;  /* 1 while chunk store >= 95% (rebuild hard cap) */
 };
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_probe_cv = PTHREAD_COND_INITIALIZER; /* waited on by disk_probe_stop until probe_users == 0 */
 static atomic_int g_disks_started; /* fast-path guard so heartbeat/metrics never block on disks_start() I/O */
+static atomic_int g_disks_usage_active;
+static atomic_int g_disks_any_full;
 
 static struct {
     int prepared;
@@ -111,6 +142,12 @@ static struct {
     int drain_no_space_any;
     pthread_t drain_thr;
     pthread_cond_t drain_cv;
+    /* R13 r13-fill: per-disk refcounted detachable usage sampler workers (10 s default, fast under test). */
+    tsdb *usage_db;
+    struct disk_usage_hooks usage_hooks;
+    int usage_started;
+    struct disk_usage_worker *usage_workers[DISKS_MAX];
+    int nusage_workers;
 #ifdef TSDB_TEST_HOOKS
     int mutant;
 #endif
@@ -466,6 +503,12 @@ int disks_mutant_parse(const char *name)
         return DISKS_MUT_STALLNORESIGN;
     if (strcmp(name, "storeeioexit") == 0)
         return DISKS_MUT_STOREEIOEXIT;
+    if (strcmp(name, "fullall") == 0)
+        return DISKS_MUT_FULLALL;
+    if (strcmp(name, "fullnorelease") == 0)
+        return DISKS_MUT_FULLNORELEASE;
+    if (strcmp(name, "fullmergeon") == 0)
+        return DISKS_MUT_FULLMERGEON;
     return -1;
 }
 
@@ -539,57 +582,160 @@ int disks_parse_role(const char *arg, uint8_t *role_out)
 
 /* ---------------------------------------------------------------- HBS_DISKS heartbeat section & metrics */
 
-#ifdef TSDB_TEST_HOOKS
-/* Test knob (TSDB_DISK_USAGE_FILE=<path>): override reported young_bytes/chunk_bytes per disk in HBS_DISKS.
- * Each line is either:
- *   <target> <young_pct> <chunk_pct>
- * or:
- *   <target> bytes <young_bytes> <chunk_bytes>
- * where <target> is "nvme", "ssd", "hdd", "all", or a 32-char hex store_id. */
-static void apply_disk_usage_file(struct hbs_disk_row *rows, uint32_t nrows)
+static uint64_t sat_add64(uint64_t a, uint64_t b)
 {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+#ifdef TSDB_TEST_HOOKS
+/* Per-disk usage override parsed from TSDB_DISK_USAGE_FILE=<path>.
+ * Supported line formats (<target> is "nvme", "ssd", "hdd", "all", or 32-char hex store_id):
+ *   <target> <young_pct> <chunk_pct>             (r13-place: override young/chunk bytes to % of size)
+ *   <target> bytes <young_bytes> <chunk_bytes>   (r13-place: override young/chunk bytes directly)
+ *   <target> phantom <add_young> <add_chunks>    (r13-fill: add phantom bytes on top of sampled bytes)
+ *   <target> size <virtual_size_bytes>           (r13-fill: virtual disk capacity cap for real-fill tests) */
+struct disk_usage_ov {
+    int have_pct;
+    int have_bytes;
+    int have_phantom;
+    int have_size;
+    uint64_t young_pct;
+    uint64_t chunk_pct;
+    uint64_t young_bytes;
+    uint64_t chunk_bytes;
+    uint64_t phantom_young;
+    uint64_t phantom_chunks;
+    uint64_t virt_size;
+};
+
+static int load_disk_usage_file(const uint8_t (*sids)[16], const int *classes, uint32_t n, struct disk_usage_ov *ovs)
+{
+    memset(ovs, 0, (size_t)n * sizeof *ovs);
     const char *path = getenv("TSDB_DISK_USAGE_FILE");
-    if (!path || !*path || nrows == 0)
-        return;
+    if (!path || !*path || n == 0)
+        return 0;
     FILE *f = fopen(path, "r");
     if (!f)
-        return;
+        return 0;
+    int matched_any = 0;
     char line[256];
     while (fgets(line, sizeof line, f)) {
         char target[64], mode[32];
         unsigned long long a = 0, b = 0;
-        int by_bytes = 0;
-        if (sscanf(line, "%63s %31s %llu %llu", target, mode, &a, &b) == 4 && strcmp(mode, "bytes") == 0) {
-            by_bytes = 1;
+        int kind = 0; /* 1=pct, 2=bytes, 3=phantom, 4=size */
+        if (sscanf(line, "%63s %31s %llu %llu", target, mode, &a, &b) == 4) {
+            if (strcmp(mode, "bytes") == 0)
+                kind = 2;
+            else if (strcmp(mode, "phantom") == 0)
+                kind = 3;
+        } else if (sscanf(line, "%63s %31s %llu", target, mode, &a) == 3 && strcmp(mode, "size") == 0) {
+            kind = 4;
         } else if (sscanf(line, "%63s %llu %llu", target, &a, &b) == 3) {
-            by_bytes = 0;
-        } else {
-            continue;
+            kind = 1;
         }
+        if (kind == 0)
+            continue;
         uint8_t sid[16];
         int is_sid = (parse_hex16(target, sid) == 0);
         int cls = strcmp(target, "all") == 0 ? -1 : disk_class_parse(target);
         if (!is_sid && cls == DISK_CLASS_NONE)
             continue;
-        for (uint32_t i = 0; i < nrows; i++) {
-            struct hbs_disk_row *r = &rows[i];
-            int match = is_sid ? (memcmp(r->store_id, sid, 16) == 0)
-                               : (cls == -1 || (int)r->disk_class == cls);
+        for (uint32_t i = 0; i < n; i++) {
+            int match = is_sid ? (memcmp(sids[i], sid, 16) == 0) : (cls == -1 || classes[i] == cls);
             if (!match)
                 continue;
-            r->have_usage = 1;
-            if (by_bytes) {
-                r->young_bytes = (uint64_t)a;
-                r->chunk_bytes = (uint64_t)b;
-            } else {
-                uint64_t yp = a > 100 ? 100 : (uint64_t)a;
-                uint64_t cp = b > 100 ? 100 : (uint64_t)b;
-                r->young_bytes = (uint64_t)(((__uint128_t)r->size_bytes * yp) / 100u);
-                r->chunk_bytes = (uint64_t)(((__uint128_t)r->size_bytes * cp) / 100u);
+            matched_any = 1;
+            if (kind == 1) {
+                ovs[i].have_pct = 1;
+                ovs[i].have_bytes = 0;
+                ovs[i].young_pct = a > 100 ? 100 : (uint64_t)a;
+                ovs[i].chunk_pct = b > 100 ? 100 : (uint64_t)b;
+            } else if (kind == 2) {
+                ovs[i].have_bytes = 1;
+                ovs[i].have_pct = 0;
+                ovs[i].young_bytes = (uint64_t)a;
+                ovs[i].chunk_bytes = (uint64_t)b;
+            } else if (kind == 3) {
+                ovs[i].have_phantom = 1;
+                ovs[i].phantom_young = sat_add64(ovs[i].phantom_young, (uint64_t)a);
+                ovs[i].phantom_chunks = sat_add64(ovs[i].phantom_chunks, (uint64_t)b);
+            } else if (kind == 4 && a > 0) {
+                ovs[i].have_size = 1;
+                ovs[i].virt_size = (uint64_t)a;
             }
         }
     }
     fclose(f);
+    return matched_any;
+}
+
+static void apply_disk_usage_file(struct hbs_disk_row *rows, uint32_t nrows, const uint64_t *raw_size,
+                                  const uint64_t *raw_young, const uint64_t *raw_chunks)
+{
+    if (nrows == 0)
+        return;
+    uint8_t sids[DISKS_MAX][16];
+    int classes[DISKS_MAX];
+    struct disk_usage_ov ovs[DISKS_MAX];
+    for (uint32_t i = 0; i < nrows; i++) {
+        memcpy(sids[i], rows[i].store_id, 16);
+        classes[i] = (int)rows[i].disk_class;
+    }
+    if (!load_disk_usage_file((const uint8_t (*)[16])sids, classes, nrows, ovs))
+        return;
+    for (uint32_t i = 0; i < nrows; i++) {
+        const struct disk_usage_ov *o = &ovs[i];
+        if (!o->have_pct && !o->have_bytes && !o->have_phantom && !o->have_size)
+            continue;
+        struct hbs_disk_row *r = &rows[i];
+        if (o->have_size && o->virt_size > 0)
+            r->size_bytes = o->virt_size;
+        else if (raw_size[i] > 0)
+            r->size_bytes = raw_size[i];
+        r->have_usage = 1;
+        r->fill_flags |= HBS_DISK_F_USAGE;
+        if (o->have_bytes) {
+            r->young_bytes = o->young_bytes;
+            r->chunk_bytes = o->chunk_bytes;
+        } else if (o->have_pct) {
+            r->young_bytes = o->young_pct == 0
+                                 ? 0
+                                 : (uint64_t)(((__uint128_t)r->size_bytes * o->young_pct + 99u) / 100u);
+            if (r->young_bytes > r->size_bytes)
+                r->young_bytes = r->size_bytes;
+            r->chunk_bytes = o->chunk_pct == 0
+                                 ? 0
+                                 : (uint64_t)(((__uint128_t)r->size_bytes * o->chunk_pct + 99u) / 100u);
+            if (r->chunk_bytes > r->size_bytes)
+                r->chunk_bytes = r->size_bytes;
+        } else if (o->have_phantom) {
+            r->young_bytes = sat_add64(raw_young[i], o->phantom_young);
+            r->chunk_bytes = sat_add64(raw_chunks[i], o->phantom_chunks);
+        }
+        uint64_t room = ((r->uses & META_DISK_USE_LOG) && (r->uses & META_DISK_USE_CHUNK))
+                            ? (r->size_bytes > r->chunk_bytes ? r->size_bytes - r->chunk_bytes : 0)
+                            : r->size_bytes;
+        uint64_t yp = (r->uses & META_DISK_USE_LOG)
+                          ? (room > 0 ? (uint64_t)(((__uint128_t)r->young_bytes * 100u) / room) : 100u)
+                          : 0u;
+        uint64_t cp = r->size_bytes > 0 ? (uint64_t)(((__uint128_t)r->chunk_bytes * 100u) / r->size_bytes) : 100u;
+        r->young_fill_pct = (uint8_t)(yp > 100u ? 100u : yp);
+        r->chunk_fill_pct = (uint8_t)(cp > 100u ? 100u : cp);
+        uint32_t wp = 75u, mp = 80u;
+        const struct cluster_copy *cpv = cluster_copy_get();
+        if (cpv) {
+            if (cpv->young_warn_pct >= 1 && cpv->young_warn_pct <= 99)
+                wp = cpv->young_warn_pct;
+            if (cpv->young_move_pct >= 1 && cpv->young_move_pct <= 99)
+                mp = cpv->young_move_pct;
+            cluster_copy_put(cpv);
+        }
+        r->fill_flags &= (uint8_t)~(HBS_DISK_F_WARN | HBS_DISK_F_MOVE);
+        if ((r->uses & META_DISK_USE_LOG) && r->young_fill_pct >= wp)
+            r->fill_flags |= HBS_DISK_F_WARN;
+        if ((r->uses & META_DISK_USE_LOG) && r->young_fill_pct >= mp)
+            r->fill_flags |= HBS_DISK_F_MOVE;
+    }
 }
 #endif
 
@@ -598,6 +744,9 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
     if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
         return 0;
     struct hbs_disk_row rows[DISKS_MAX];
+#ifdef TSDB_TEST_HOOKS
+    uint64_t raw_size[DISKS_MAX] = {0}, raw_young[DISKS_MAX] = {0}, raw_chunks[DISKS_MAX] = {0};
+#endif
     uint32_t nrows = 0, mismatches = 0;
     uint8_t role = META_ROLE_BOTH;
     int allow_shared = 0, drain_no_space = 0, started = 0;
@@ -613,14 +762,35 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         /* Never emit unbound disks: disk_bind must succeed before STORE_ADD can be proposed (§15.1). */
         if (d->present && !d->meta.bound)
             continue;
-        struct hbs_disk_row *r = &rows[nrows++];
+        uint32_t idx = nrows++;
+        struct hbs_disk_row *r = &rows[idx];
         memset(r, 0, sizeof *r);
         memcpy(r->store_id, d->meta.store_id, 16);
         r->disk_class = (uint8_t)d->effective_class;
         r->uses = d->uses ? d->uses : META_DISK_USE_LOG;
         r->state = d->state;
-        r->size_bytes = d->size_bytes > 0 ? d->size_bytes : 1;
+        r->size_bytes = d->usage_have && d->usage_size > 0 ? d->usage_size : (d->size_bytes > 0 ? d->size_bytes : 1);
         r->sync_us = d->sync_us;
+        if (d->usage_have) {
+            r->have_usage = 1;
+            r->fill_flags = d->usage_fill_flags | HBS_DISK_F_USAGE;
+            r->young_fill_pct = d->usage_young_pct;
+            r->chunk_fill_pct = d->usage_chunk_pct;
+            r->young_bytes = d->usage_eff_young;
+            r->chunk_bytes = d->usage_eff_chunks;
+            r->retained_bytes = d->usage_raw_retained;
+            r->retired_bytes = d->usage_raw_retired;
+            r->local_bytes = d->usage_raw_local;
+            r->index_bytes = d->usage_raw_index;
+            r->young_peak_7d = d->usage_peak_7d;
+        }
+#ifdef TSDB_TEST_HOOKS
+        raw_size[idx] = d->usage_raw_size > 0 ? d->usage_raw_size : (d->size_bytes > 0 ? d->size_bytes : 1);
+        raw_young[idx] = sat_add64(
+            sat_add64(d->usage_raw_young, d->usage_raw_retained),
+            sat_add64(sat_add64(d->usage_raw_retired, d->usage_raw_local), d->usage_raw_index));
+        raw_chunks[idx] = d->usage_raw_chunks;
+#endif
     }
     pthread_mutex_unlock(&g_mu);
 
@@ -629,7 +799,7 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
     if (nrows == 0 && role == META_ROLE_BOTH && !allow_shared && !drain_no_space && mismatches == 0)
         return 0;
 #ifdef TSDB_TEST_HOOKS
-    apply_disk_usage_file(rows, nrows);
+    apply_disk_usage_file(rows, nrows, raw_size, raw_young, raw_chunks);
 #endif
     size_t need = HBS_DISKS_HDR + (size_t)nrows * HBS_DISKS_ENTRY;
     if (need > cap)
@@ -645,11 +815,20 @@ static ssize_t disks_sec_encode(uint8_t *buf, size_t cap)
         e[16] = rows[i].disk_class;
         e[17] = rows[i].uses;
         e[18] = rows[i].state;
-        e[19] = rows[i].have_usage ? 1u : 0u;
+        e[19] = rows[i].have_usage ? (uint8_t)(rows[i].fill_flags | HBS_DISK_F_USAGE) : 0u;
         put_le64(e + 20, rows[i].size_bytes);
         put_le64(e + 28, rows[i].sync_us);
         put_le64(e + 36, rows[i].young_bytes);
         put_le64(e + 44, rows[i].chunk_bytes);
+        put_le64(e + 52, rows[i].retained_bytes);
+        put_le64(e + 60, rows[i].retired_bytes);
+        put_le64(e + 68, rows[i].local_bytes);
+        put_le64(e + 76, rows[i].index_bytes);
+        put_le64(e + 84, rows[i].young_peak_7d);
+        e[92] = rows[i].young_fill_pct;
+        e[93] = rows[i].chunk_fill_pct;
+        e[94] = 0;
+        e[95] = 0;
     }
     return (ssize_t)need;
 }
@@ -660,9 +839,15 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
     if (!data || !out_val || len < HBS_DISKS_HDR)
         return -1;
     uint8_t ver = data[0];
-    if (ver != HBS_DISKS_VER && ver != HBS_DISKS_VER_V1)
+    size_t esz;
+    if (ver == HBS_DISKS_VER)
+        esz = HBS_DISKS_ENTRY;
+    else if (ver == HBS_DISKS_VER_V2)
+        esz = HBS_DISKS_ENTRY_V2;
+    else if (ver == HBS_DISKS_VER_V1)
+        esz = HBS_DISKS_ENTRY_V1;
+    else
         return -1;
-    size_t esz = ver == HBS_DISKS_VER ? HBS_DISKS_ENTRY : HBS_DISKS_ENTRY_V1;
     uint8_t role = data[1];
     uint8_t flags = data[2];
     uint32_t n = data[3];
@@ -699,18 +884,36 @@ static int disks_sec_decode(uint32_t member_id, const uint8_t *data, size_t len,
                 return -1;
             }
             r->have_usage = 0;
-        } else {
+        } else if (ver == HBS_DISKS_VER_V2) {
             if (e[19] > 1u) {
                 free(v);
                 return -1;
             }
             r->have_usage = e[19];
+            r->fill_flags = e[19] ? HBS_DISK_F_USAGE : 0u;
+        } else {
+            if (e[19] & ~(HBS_DISK_F_USAGE | HBS_DISK_F_WARN | HBS_DISK_F_MOVE | HBS_DISK_F_FULL |
+                          HBS_DISK_F_CHUNK_FULL)) {
+                free(v);
+                return -1;
+            }
+            r->fill_flags = e[19];
+            r->have_usage = (e[19] & HBS_DISK_F_USAGE) != 0;
         }
         r->size_bytes = get_le64(e + 20);
         r->sync_us = get_le64(e + 28);
-        if (ver == HBS_DISKS_VER) {
+        if (ver >= HBS_DISKS_VER_V2) {
             r->young_bytes = get_le64(e + 36);
             r->chunk_bytes = get_le64(e + 44);
+        }
+        if (ver == HBS_DISKS_VER) {
+            r->retained_bytes = get_le64(e + 52);
+            r->retired_bytes = get_le64(e + 60);
+            r->local_bytes = get_le64(e + 68);
+            r->index_bytes = get_le64(e + 76);
+            r->young_peak_7d = get_le64(e + 84);
+            r->young_fill_pct = e[92] > 100u ? 100u : e[92];
+            r->chunk_fill_pct = e[93] > 100u ? 100u : e[93];
         }
         if (r->size_bytes == 0) {
             free(v);
@@ -749,13 +952,41 @@ static size_t disks_sec_format(uint32_t member_id, const void *val, char *buf, s
         const struct hbs_disk_row *r = &v->disks[i];
         char hex[33];
         chunk_oid_hex(r->store_id, hex);
+        if ((r->fill_flags & HBS_DISK_F_FULL) && off + 1 < cap) {
+            int wn = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " disk=%s warn=full pct=%u\n", member_id, hex,
+                              (unsigned)r->young_fill_pct);
+            if (wn > 0)
+                off += (size_t)wn < cap - off ? (size_t)wn : cap - off - 1;
+        } else if ((r->fill_flags & HBS_DISK_F_MOVE) && off + 1 < cap) {
+            int wn = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " disk=%s warn=move_needed pct=%u\n",
+                              member_id, hex, (unsigned)r->young_fill_pct);
+            if (wn > 0)
+                off += (size_t)wn < cap - off ? (size_t)wn : cap - off - 1;
+        } else if ((r->fill_flags & HBS_DISK_F_WARN) && off + 1 < cap) {
+            int wn = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " disk=%s warn=filling pct=%u\n", member_id,
+                              hex, (unsigned)r->young_fill_pct);
+            if (wn > 0)
+                off += (size_t)wn < cap - off ? (size_t)wn : cap - off - 1;
+        }
+        if ((r->fill_flags & HBS_DISK_F_CHUNK_FULL) && off + 1 < cap) {
+            int wn = snprintf(buf + off, cap - off, "disks node=%" PRIu32 " disk=%s warn=chunk_full pct=%u\n",
+                              member_id, hex, (unsigned)r->chunk_fill_pct);
+            if (wn > 0)
+                off += (size_t)wn < cap - off ? (size_t)wn : cap - off - 1;
+        }
+        if (off + 1 >= cap)
+            break;
         int n;
         if (r->have_usage)
             n = snprintf(buf + off, cap - off,
                          "disk node=%" PRIu32 " id=%s class=%s uses=%s state=%s size=%" PRIu64 " sync_us=%" PRIu64
-                         " young_bytes=%" PRIu64 " chunk_bytes=%" PRIu64 "\n",
+                         " young_bytes=%" PRIu64 " chunk_bytes=%" PRIu64 " retained_bytes=%" PRIu64
+                         " retired_bytes=%" PRIu64 " local_bytes=%" PRIu64 " index_bytes=%" PRIu64
+                         " young_pct=%u chunk_pct=%u\n",
                          member_id, hex, meta_disk_class_name(r->disk_class), uses_str(r->uses),
-                         meta_store_state_name(r->state), r->size_bytes, r->sync_us, r->young_bytes, r->chunk_bytes);
+                         meta_store_state_name(r->state), r->size_bytes, r->sync_us, r->young_bytes, r->chunk_bytes,
+                         r->retained_bytes, r->retired_bytes, r->local_bytes, r->index_bytes,
+                         (unsigned)r->young_fill_pct, (unsigned)r->chunk_fill_pct);
         else
             n = snprintf(buf + off, cap - off,
                          "disk node=%" PRIu32 " id=%s class=%s uses=%s state=%s size=%" PRIu64 " sync_us=%" PRIu64 "\n",
@@ -832,6 +1063,71 @@ static void disks_collect_state(void *ctx, struct creport_sink *sink)
     }
 }
 
+static void disks_collect_bytes(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct disk_fill_snap snap[DISKS_MAX];
+    int n = disks_usage_snapshot(snap, DISKS_MAX);
+    static const char *const use_names[6] = {"young", "retained", "retired", "local", "index", "chunks"};
+    for (int i = 0; i < n; i++) {
+        char hex[33];
+        chunk_oid_hex(snap[i].store_id, hex);
+        const char *cls = meta_disk_class_name(snap[i].disk_class);
+        uint64_t vals[6] = {
+            snap[i].young_data_bytes, snap[i].retained_bytes, snap[i].retired_bytes,
+            snap[i].local_bytes,      snap[i].index_bytes,    snap[i].chunk_bytes,
+        };
+        for (int u = 0; u < 6; u++) {
+            struct creport_label lbl[3] = {
+                {"store", hex},
+                {"class", cls},
+                {"use", use_names[u]},
+            };
+            creport_sink_put_u64(sink, lbl, 3, vals[u]);
+        }
+    }
+}
+
+static void disks_collect_size(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct {
+        uint8_t store_id[16];
+        int disk_class;
+        uint64_t size_bytes;
+    } snap[DISKS_MAX];
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks && n < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            int nz = 0;
+            for (int b = 0; b < 16; b++)
+                nz |= d->meta.store_id[b];
+            if (!nz)
+                continue;
+            memcpy(snap[n].store_id, d->meta.store_id, 16);
+            snap[n].disk_class = d->effective_class;
+            snap[n].size_bytes = d->usage_have && d->usage_size > 0 ? d->usage_size : d->size_bytes;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < n; i++) {
+        char hex[33];
+        chunk_oid_hex(snap[i].store_id, hex);
+        struct creport_label lbl[2] = {
+            {"store", hex},
+            {"class", meta_disk_class_name(snap[i].disk_class)},
+        };
+        creport_sink_put_u64(sink, lbl, 2, snap[i].size_bytes);
+    }
+}
+
 /* ---------------------------------------------------------------- detection helper */
 
 static void run_detect_check(struct disk_entry *d)
@@ -899,7 +1195,10 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
             return -1;
         }
         G.mutant = m;
+        eng_set_disk_fill_mutants(m == DISKS_MUT_FULLNORELEASE, m == DISKS_MUT_FULLMERGEON);
         fprintf(stderr, "tsdbd: disks: MUTANT %s (tests only)\n", mu);
+    } else {
+        eng_set_disk_fill_mutants(0, 0);
     }
 #endif
 
@@ -1499,6 +1798,12 @@ int disks_start(char *err, size_t errlen)
     (void)creport_metric_collector("tsdb_disk_state", CREPORT_GAUGE,
                                    "Local disk state per store: 0 up, 1 down, 2 out, 3 destroyed.",
                                    disks_collect_state, NULL);
+    (void)creport_metric_collector("tsdb_disk_bytes", CREPORT_GAUGE,
+                                   "Local disk bytes by use (young, retained, retired, local, index, chunks).",
+                                   disks_collect_bytes, NULL);
+    (void)creport_metric_collector("tsdb_disk_size_bytes", CREPORT_GAUGE,
+                                   "Total capacity in bytes of each local cluster disk.",
+                                   disks_collect_size, NULL);
     if (have_self)
         cluster_beat_soon();
     return 0;
@@ -1687,7 +1992,13 @@ int disks_list(struct disk_info *out, int cap)
             di->state = d->state;
             di->present = d->present;
             di->recovering = d->probe_recovering;
-            di->size_bytes = d->size_bytes;
+            di->have_usage = d->usage_have;
+            di->size_bytes = d->usage_have && d->usage_size > 0 ? d->usage_size : d->size_bytes;
+            di->young_room_bytes = d->usage_young_room;
+            di->young_used_bytes = d->usage_eff_young;
+            di->young_fill_pct = d->usage_young_pct;
+            di->chunk_fill_pct = d->usage_chunk_pct;
+            di->fill_flags = d->usage_fill_flags;
         }
     }
     pthread_mutex_unlock(&g_mu);
@@ -2885,11 +3196,894 @@ void disks_drain_stop(void)
     creport_metric_collector_del("tsdb_disk_drain_no_space");
 }
 
+/* ---------------------------------------------------------------- per-disk usage & fill marks (R13, r13-fill; E30, E50, E53, §15.4) */
+
+struct raw_disk_uses {
+    uint64_t size_bytes;
+    uint64_t fs_used;
+    uint64_t young;
+    uint64_t retained;
+    uint64_t retired;
+    uint64_t local;
+    uint64_t index;
+    uint64_t chunks;
+};
+
+static int has_suffix(const char *s, const char *suf)
+{
+    size_t sl = strlen(s), fl = strlen(suf);
+    return sl >= fl && strcmp(s + sl - fl, suf) == 0;
+}
+
+static int parse_wal_seq(const char *name, uint64_t *seq_out)
+{
+    if (strncmp(name, "wal_", 4) != 0 || !has_suffix(name, ".log"))
+        return 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(name + 4, &end, 10);
+    if (errno != 0 || !end || strcmp(end, ".log") != 0)
+        return 0;
+    *seq_out = (uint64_t)v;
+    return 1;
+}
+
+/* Walk a single v<N> (or sibling) directory off any engine lock and classify bytes by use. */
+static void walk_vol_dir(int parent_fd, const char *dname, struct raw_disk_uses *u)
+{
+    int dfd = openat(parent_fd, dname, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dfd < 0)
+        return;
+    DIR *dir = fdopendir(dfd);
+    if (!dir) {
+        close(dfd);
+        return;
+    }
+    struct wal_item {
+        uint64_t seq;
+        uint64_t bytes;
+    } stack_wals[32];
+    struct wal_item *wals = stack_wals;
+    size_t nwals = 0, wal_cap = 32;
+    uint64_t max_wal_seq = 0;
+
+    for (struct dirent *e; (e = readdir(dir)) != NULL;) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+            continue;
+        struct stat st;
+        if (fstatat(dfd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        /* Skip keep_ hard links of listed parts so the same inode is not counted twice. */
+        if (strncmp(nm, "keep_", 5) == 0 && st.st_nlink > 1)
+            continue;
+        uint64_t sz = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+        if (strncmp(nm, "settled_", 8) == 0 || strncmp(nm, "retired_", 8) == 0 || strncmp(nm, "digest_", 7) == 0) {
+            u->retired = sat_add64(u->retired, sz);
+        } else if (strncmp(nm, "local_", 6) == 0) {
+            u->local = sat_add64(u->local, sz);
+        } else if (nm[0] == 'p' && (has_suffix(nm, ".ec") || has_suffix(nm, ".ec.tmp"))) {
+            u->index = sat_add64(u->index, sz);
+        } else if (strncmp(nm, "fwal_", 5) == 0 && has_suffix(nm, ".log")) {
+            u->retained = sat_add64(u->retained, sz);
+        } else {
+            uint64_t wseq = 0;
+            if (parse_wal_seq(nm, &wseq)) {
+                if (wseq > max_wal_seq)
+                    max_wal_seq = wseq;
+                if (nwals == wal_cap) {
+                    size_t ncap = wal_cap * 2;
+                    struct wal_item *nw = (wals == stack_wals) ? malloc(ncap * sizeof *nw) : realloc(wals, ncap * sizeof *nw);
+                    if (nw) {
+                        if (wals == stack_wals)
+                            memcpy(nw, stack_wals, nwals * sizeof *nw);
+                        wals = nw;
+                        wal_cap = ncap;
+                    } else {
+                        u->young = sat_add64(u->young, sz);
+                        continue;
+                    }
+                }
+                wals[nwals].seq = wseq;
+                wals[nwals].bytes = sz;
+                nwals++;
+            } else {
+                u->young = sat_add64(u->young, sz);
+            }
+        }
+    }
+    closedir(dir);
+
+    for (size_t i = 0; i < nwals; i++) {
+        if (wals[i].seq < max_wal_seq)
+            u->retained = sat_add64(u->retained, wals[i].bytes);
+        else
+            u->young = sat_add64(u->young, wals[i].bytes);
+    }
+    if (wals != stack_wals)
+        free(wals);
+}
+
+static uint64_t walk_dir_bytes(const char *path, int depth)
+{
+    if (!path || !*path || depth > 3)
+        return 0;
+    int dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return 0;
+    DIR *dir = fdopendir(dfd);
+    if (!dir) {
+        close(dfd);
+        return 0;
+    }
+    uint64_t sum = 0;
+    for (struct dirent *e; (e = readdir(dir)) != NULL;) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+            continue;
+        struct stat st;
+        if (fstatat(dfd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            continue;
+        if (S_ISREG(st.st_mode)) {
+            if (st.st_size > 0)
+                sum = sat_add64(sum, (uint64_t)st.st_size);
+        } else if (S_ISDIR(st.st_mode) && depth < 3) {
+            char sub[PATH_MAX];
+            if (snprintf(sub, sizeof sub, "%s/%s", path, nm) < (int)sizeof sub)
+                sum = sat_add64(sum, walk_dir_bytes(sub, depth + 1));
+        }
+    }
+    closedir(dir);
+    return sum;
+}
+
+static void walk_disk_raw(const char *path, uint8_t uses, int has_chunks, const char *chunks_path, int allow_shared,
+                          struct raw_disk_uses *u)
+{
+    memset(u, 0, sizeof *u);
+    struct statvfs sv;
+    if (statvfs(path, &sv) == 0 && sv.f_blocks > 0) {
+        uint64_t unit = sv.f_frsize ? (uint64_t)sv.f_frsize : (uint64_t)sv.f_bsize;
+        uint64_t total = (uint64_t)sv.f_blocks * unit;
+        uint64_t avail = (uint64_t)sv.f_bavail * unit;
+        u->size_bytes = total > 0 ? total : 1;
+        u->fs_used = total > avail ? total - avail : 0;
+    } else {
+        u->size_bytes = 1;
+    }
+    if (uses & META_DISK_USE_LOG) {
+        int dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+            DIR *dir = fdopendir(dfd);
+            if (dir) {
+                for (struct dirent *e; (e = readdir(dir)) != NULL;) {
+                    const char *nm = e->d_name;
+                    if (nm[0] != 'v' || nm[1] < '0' || nm[1] > '9')
+                        continue;
+                    /* Skip background-deleting .removed-* siblings so already-removed replicas never inflate fill. */
+                    if (strstr(nm, ".removed-") != NULL)
+                        continue;
+                    struct stat st;
+                    if (fstatat(dfd, nm, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode))
+                        walk_vol_dir(dfd, nm, u);
+                }
+                closedir(dir);
+            } else {
+                close(dfd);
+            }
+        }
+    }
+    if (has_chunks && chunks_path && chunks_path[0]) {
+        if (!allow_shared) {
+            /* Dedicated disk (production): derive chunk bytes in O(1) from statvfs fs_used minus walked young-tier
+             * bytes instead of walking potentially millions of chunk files every 10 s. */
+            uint64_t non_chunk = sat_add64(sat_add64(u->young, u->retained),
+                                           sat_add64(sat_add64(u->retired, u->local), u->index));
+            u->chunks = u->fs_used > non_chunk ? u->fs_used - non_chunk : 0;
+        } else {
+            u->chunks = walk_dir_bytes(chunks_path, 0);
+        }
+    }
+}
+
+/* Cluster-wide chunk fill mark in ppm per §5.6 / E53 (matching server/place.c:chunk_fill_mark_ppm). */
+static uint64_t compute_cluster_chunk_mark_ppm(const struct cluster_copy *cp)
+{
+    if (!cp || cp->nmembers == 0)
+        return 900000ull;
+    int all_racked = 1;
+    uint64_t total_cap = 0;
+    uint32_t nstorage = 0;
+    for (uint32_t i = 0; i < cp->nmembers; i++) {
+        const struct cluster_copy_member *mb = &cp->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        uint64_t mcap = 0;
+        for (uint32_t d = 0; d < mb->ndisks && d < META_DISKS_MAX; d++) {
+            const struct meta_disk *dk = &mb->disks[d];
+            if (dk->state == META_STORE_UP && (dk->uses & META_DISK_USE_CHUNK))
+                mcap = sat_add64(mcap, dk->size_bytes);
+        }
+        if (mcap == 0)
+            continue;
+        nstorage++;
+        total_cap = sat_add64(total_cap, mcap);
+        if (!mb->rack[0])
+            all_racked = 0;
+    }
+    if (total_cap == 0 || nstorage <= 1)
+        return 900000ull;
+    uint64_t max_dom = 0;
+    for (uint32_t i = 0; i < cp->nmembers; i++) {
+        const struct cluster_copy_member *mb = &cp->members[i];
+        if (mb->state >= META_OUT || mb->role == META_ROLE_COMPUTE || mb->ndisks == 0)
+            continue;
+        uint64_t dcap = 0;
+        if (all_racked) {
+            int seen = 0;
+            for (uint32_t j = 0; j < i; j++) {
+                if (cp->members[j].state < META_OUT && cp->members[j].role != META_ROLE_COMPUTE &&
+                    cp->members[j].ndisks > 0 && strcmp(cp->members[j].rack, mb->rack) == 0) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (seen)
+                continue;
+            for (uint32_t j = i; j < cp->nmembers; j++) {
+                const struct cluster_copy_member *mj = &cp->members[j];
+                if (mj->state >= META_OUT || mj->role == META_ROLE_COMPUTE || mj->ndisks == 0 ||
+                    strcmp(mj->rack, mb->rack) != 0)
+                    continue;
+                for (uint32_t d = 0; d < mj->ndisks && d < META_DISKS_MAX; d++) {
+                    const struct meta_disk *dk = &mj->disks[d];
+                    if (dk->state == META_STORE_UP && (dk->uses & META_DISK_USE_CHUNK))
+                        dcap = sat_add64(dcap, dk->size_bytes);
+                }
+            }
+        } else {
+            for (uint32_t d = 0; d < mb->ndisks && d < META_DISKS_MAX; d++) {
+                const struct meta_disk *dk = &mb->disks[d];
+                if (dk->state == META_STORE_UP && (dk->uses & META_DISK_USE_CHUNK))
+                    dcap = sat_add64(dcap, dk->size_bytes);
+            }
+        }
+        if (dcap > max_dom)
+            max_dom = dcap;
+    }
+    if (max_dom >= total_cap)
+        return 900000ull;
+    uint64_t ppm = (uint64_t)(((__uint128_t)950000ull * (total_cap - max_dom)) / total_cap);
+    return ppm > 950000ull ? 950000ull : ppm;
+}
+
+static uint64_t usage_now_hour(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec / 3600ull) + 1ull; /* >= 1 so 0 means empty slot */
+}
+
+static uint64_t update_peak_7d_locked(struct disk_entry *d, uint64_t cur_young, uint64_t now_hr)
+{
+    uint32_t slot = (uint32_t)(now_hr % DISK_PEAK_HOURS);
+    if (d->peak_hour_stamp[slot] != now_hr) {
+        d->peak_hour_stamp[slot] = now_hr;
+        d->peak_hour_val[slot] = cur_young;
+    } else if (cur_young > d->peak_hour_val[slot]) {
+        d->peak_hour_val[slot] = cur_young;
+    }
+    uint64_t peak = cur_young;
+    for (uint32_t k = 0; k < DISK_PEAK_HOURS; k++) {
+        if (d->peak_hour_stamp[k] != 0 && now_hr >= d->peak_hour_stamp[k] &&
+            now_hr - d->peak_hour_stamp[k] < DISK_PEAK_HOURS && d->peak_hour_val[k] > peak)
+            peak = d->peak_hour_val[k];
+    }
+    d->usage_peak_7d = peak;
+    return peak;
+}
+
+/* Per-disk detachable usage sampler worker (R13 r13-fill; modeled on src/tierfill.c).
+ * Each present disk runs on its own 256 KiB worker thread so a stalled/hung disk can NEVER stall fill accounting,
+ * FULL transitions, or shutdown for any other disk. Non-UP / probe-down / io-down disks are skipped before touching
+ * the filesystem; disk_usage_stop() waits up to 500 ms and detaches any kernel-stuck worker cleanly. */
+struct disk_usage_worker {
+    atomic_int refs;
+    pthread_mutex_t mu; /* pure leaf mutex: NEVER held across statvfs, directory walk, g_mu, or engine calls */
+    pthread_cond_t cv;
+    pthread_t th;
+    int disk_idx;
+    uint8_t store_id[16];
+    char path[PATH_MAX];
+    char chunks_path[PATH_MAX];
+    tsdb *db; /* cleared to NULL under mu by disk_usage_stop() before db can be closed */
+    struct disk_usage_hooks hooks;
+    bool stop;
+    bool kick;
+    bool done;
+};
+
+static void usage_worker_unref(struct disk_usage_worker *w)
+{
+    if (!w || atomic_fetch_sub_explicit(&w->refs, 1, memory_order_acq_rel) != 1)
+        return;
+    pthread_cond_destroy(&w->cv);
+    pthread_mutex_destroy(&w->mu);
+    free(w);
+}
+
+static void disk_usage_sample_one(struct disk_usage_worker *w)
+{
+    int allow_shared = 0, has_chunks = 0;
+#ifdef TSDB_TEST_HOOKS
+    int eff_class = 0;
+#endif
+    uint8_t uses = 0;
+    uint8_t store_id[16];
+    int eligible = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (G.started && w->disk_idx >= 0 && w->disk_idx < G.ndisks) {
+        const struct disk_entry *d = &G.disks[w->disk_idx];
+        /* E57 / r13-fault: NEVER touch a missing, DOWN, probe-down, or io-down disk. */
+        if (d->present && d->path[0] && d->state == META_STORE_UP && !d->io_down && !d->probe_down &&
+            memcmp(d->meta.store_id, w->store_id, 16) == 0) {
+            allow_shared = G.allow_shared;
+            has_chunks = d->has_chunks;
+#ifdef TSDB_TEST_HOOKS
+            eff_class = d->effective_class;
+#endif
+            uses = d->uses ? d->uses : META_DISK_USE_LOG;
+            memcpy(store_id, d->meta.store_id, 16);
+            eligible = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!eligible)
+        return;
+
+    /* Walk this single disk off g_mu and off any engine lock. */
+    struct raw_disk_uses ru;
+    walk_disk_raw(w->path, uses, has_chunks, w->chunks_path, allow_shared, &ru);
+
+#ifdef TSDB_TEST_HOOKS
+    uint8_t sids1[1][16];
+    int cls1[1] = {eff_class};
+    struct disk_usage_ov ov1[1];
+    memcpy(sids1[0], store_id, 16);
+    (void)load_disk_usage_file((const uint8_t (*)[16])sids1, cls1, 1, ov1);
+#endif
+
+    uint32_t warn_pct = 75u, move_pct = 80u, high_pct = 90u;
+    uint64_t chunk_mark_ppm = 900000ull;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (cp) {
+        if (cp->young_warn_pct >= 1 && cp->young_warn_pct <= 99)
+            warn_pct = cp->young_warn_pct;
+        if (cp->young_move_pct >= 1 && cp->young_move_pct <= 99)
+            move_pct = cp->young_move_pct;
+        if (cp->young_high_pct >= 10 && cp->young_high_pct <= 99)
+            high_pct = cp->young_high_pct;
+        chunk_mark_ppm = compute_cluster_chunk_mark_ppm(cp);
+        cluster_copy_put(cp);
+    }
+    uint32_t clear_pct = high_pct >= 3u ? high_pct - 2u : high_pct;
+    uint64_t now_hr = usage_now_hour();
+
+    int full = 0, full_changed = 0, any_flag_changed = 0, need_beat = 0;
+    uint8_t out_ypct = 0, out_flags = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || w->disk_idx < 0 || w->disk_idx >= G.ndisks) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    struct disk_entry *d = &G.disks[w->disk_idx];
+    if (!d->present || memcmp(d->meta.store_id, store_id, 16) != 0) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+
+    uint64_t raw_young_total =
+        sat_add64(sat_add64(ru.young, ru.retained), sat_add64(sat_add64(ru.retired, ru.local), ru.index));
+    uint64_t eff_size = ru.size_bytes > 0 ? ru.size_bytes : (d->size_bytes > 0 ? d->size_bytes : 1);
+    uint64_t eff_young = raw_young_total;
+    uint64_t eff_chunks = ru.chunks;
+    uint64_t young_data = ru.young;
+    int has_ov = 0;
+
+#ifdef TSDB_TEST_HOOKS
+    const struct disk_usage_ov *ov = &ov1[0];
+    if (ov->have_size && ov->virt_size > 0) {
+        eff_size = ov->virt_size;
+        has_ov = 1;
+    }
+    if (ov->have_bytes) {
+        eff_young = ov->young_bytes;
+        eff_chunks = ov->chunk_bytes;
+        uint64_t other = sat_add64(sat_add64(ru.retained, ru.retired), sat_add64(ru.local, ru.index));
+        young_data = eff_young > other ? eff_young - other : 0;
+        has_ov = 1;
+    } else if (ov->have_pct) {
+        eff_young = ov->young_pct == 0 ? 0 : (uint64_t)(((__uint128_t)eff_size * ov->young_pct + 99u) / 100u);
+        if (eff_young > eff_size)
+            eff_young = eff_size;
+        eff_chunks = ov->chunk_pct == 0 ? 0 : (uint64_t)(((__uint128_t)eff_size * ov->chunk_pct + 99u) / 100u);
+        if (eff_chunks > eff_size)
+            eff_chunks = eff_size;
+        uint64_t other = sat_add64(sat_add64(ru.retained, ru.retired), sat_add64(ru.local, ru.index));
+        young_data = eff_young > other ? eff_young - other : 0;
+        has_ov = 1;
+    } else if (ov->have_phantom) {
+        eff_young = sat_add64(raw_young_total, ov->phantom_young);
+        eff_chunks = sat_add64(ru.chunks, ov->phantom_chunks);
+        young_data = sat_add64(ru.young, ov->phantom_young);
+        has_ov = 1;
+    }
+#endif
+    /* On a dedicated real disk (not --allow-shared-device and no test override), include real filesystem overhead
+     * (statvfs fs_used) so ENOSPC can never arrive before young_high_pct. */
+    if (!allow_shared && !has_ov) {
+        if ((d->uses & META_DISK_USE_LOG) && !(d->uses & META_DISK_USE_CHUNK)) {
+            if (ru.fs_used > eff_young)
+                eff_young = ru.fs_used;
+        } else if ((d->uses & META_DISK_USE_LOG) && (d->uses & META_DISK_USE_CHUNK)) {
+            uint64_t non_chunk = ru.fs_used > eff_chunks ? ru.fs_used - eff_chunks : 0;
+            if (non_chunk > eff_young)
+                eff_young = non_chunk;
+        } else if (d->uses & META_DISK_USE_CHUNK) {
+            if (ru.fs_used > eff_chunks)
+                eff_chunks = ru.fs_used;
+        }
+    }
+
+    uint64_t peak_7d = update_peak_7d_locked(d, eff_young, now_hr);
+    int shared = (d->uses & META_DISK_USE_LOG) && (d->uses & META_DISK_USE_CHUNK);
+    uint64_t young_room = shared ? (eff_size > eff_chunks ? eff_size - eff_chunks : 0) : eff_size;
+    uint64_t ypct = (d->uses & META_DISK_USE_LOG)
+                        ? (young_room > 0 ? (uint64_t)(((__uint128_t)eff_young * 100u) / young_room) : 100u)
+                        : 0u;
+    if (ypct > 100u)
+        ypct = 100u;
+    uint64_t cppm = eff_size > 0 ? (uint64_t)(((__uint128_t)eff_chunks * 1000000ull) / eff_size) : 1000000ull;
+    if (cppm > 1000000ull)
+        cppm = 1000000ull;
+    uint64_t cpct = cppm / 10000ull;
+    if (cpct > 100u)
+        cpct = 100u;
+
+    int prev_full = d->usage_full;
+    uint8_t prev_flags = d->usage_fill_flags;
+    int next_full = prev_full;
+    if (!(d->uses & META_DISK_USE_LOG)) {
+        next_full = 0;
+    } else if (!prev_full && ypct >= high_pct) {
+        next_full = 1;
+    } else if (prev_full && ypct < clear_pct) {
+        next_full = 0;
+    }
+
+    int chunk_full = 0;
+    int chunk_rb_full = 0;
+    if (d->uses & META_DISK_USE_CHUNK) {
+        if (cppm >= chunk_mark_ppm)
+            chunk_full = 1;
+        if (!chunk_full && shared) {
+            /* E50 / §15.4: young reserve on a shared disk = max(10% of size, 2 * 7-day peak). */
+            uint64_t reserve = eff_size / 10u;
+            uint64_t p2 = peak_7d > (UINT64_MAX / 2u) ? UINT64_MAX : peak_7d * 2u;
+            if (p2 > reserve)
+                reserve = p2;
+            if (eff_size <= eff_chunks || (eff_size - eff_chunks) < reserve)
+                chunk_full = 1;
+        }
+        if (cppm >= 950000ull)
+            chunk_rb_full = 1;
+    }
+
+    uint8_t flags = HBS_DISK_F_USAGE;
+    if ((d->uses & META_DISK_USE_LOG) && ypct >= warn_pct)
+        flags |= HBS_DISK_F_WARN;
+    if ((d->uses & META_DISK_USE_LOG) && ypct >= move_pct)
+        flags |= HBS_DISK_F_MOVE;
+    if (next_full)
+        flags |= HBS_DISK_F_FULL;
+    if (chunk_full)
+        flags |= HBS_DISK_F_CHUNK_FULL;
+
+    d->usage_have = 1;
+    d->usage_raw_size = ru.size_bytes > 0 ? ru.size_bytes : 1;
+    d->usage_fs_used = ru.fs_used;
+    d->usage_raw_young = ru.young;
+    d->usage_raw_retained = ru.retained;
+    d->usage_raw_retired = ru.retired;
+    d->usage_raw_local = ru.local;
+    d->usage_raw_index = ru.index;
+    d->usage_raw_chunks = ru.chunks;
+    d->usage_size = eff_size;
+    d->usage_young_data = young_data;
+    d->usage_eff_young = eff_young;
+    d->usage_eff_chunks = eff_chunks;
+    d->usage_young_room = young_room;
+    d->usage_young_pct = (uint8_t)ypct;
+    d->usage_chunk_pct = (uint8_t)cpct;
+    d->usage_fill_flags = flags;
+    d->usage_full = next_full;
+    d->usage_chunk_full = chunk_full;
+    d->usage_chunk_rb_full = chunk_rb_full;
+
+    int any_full = 0;
+    for (int i = 0; i < G.ndisks; i++)
+        if (G.disks[i].present && G.disks[i].usage_full)
+            any_full = 1;
+    atomic_store_explicit(&g_disks_any_full, any_full, memory_order_release);
+
+    full = next_full;
+    full_changed = (next_full != prev_full);
+    any_flag_changed = (flags != prev_flags);
+    out_ypct = (uint8_t)ypct;
+    out_flags = flags;
+    need_beat = any_flag_changed;
+    pthread_mutex_unlock(&g_mu);
+
+    /* Log transitions and propagate per-volume disk_full state to open engines off g_mu. */
+    if (full_changed) {
+        if (full)
+            fprintf(stderr,
+                    "tsdbd: disks: disk %s young fill %u%% >= young_high_pct %" PRIu32
+                    "%%: disk FULL (volumes on this disk refusing inserts with WHY_FULL)\n",
+                    w->path, (unsigned)out_ypct, high_pct);
+        else
+            fprintf(stderr,
+                    "tsdbd: disks: disk %s young fill %u%% < %" PRIu32
+                    "%%: disk FULL cleared (resuming writes and merges)\n",
+                    w->path, (unsigned)out_ypct, clear_pct);
+    } else if (any_flag_changed) {
+        if (out_flags & HBS_DISK_F_MOVE)
+            fprintf(stderr,
+                    "tsdbd: disks: disk %s young fill %u%% >= young_move_pct %" PRIu32
+                    "%%: move needed (no new replicas placed here)\n",
+                    w->path, (unsigned)out_ypct, move_pct);
+        else if (out_flags & HBS_DISK_F_WARN)
+            fprintf(stderr,
+                    "tsdbd: disks: disk %s young fill %u%% >= young_warn_pct %" PRIu32 "%%: filling warning\n",
+                    w->path, (unsigned)out_ypct, warn_pct);
+    }
+
+    pthread_mutex_lock(&w->mu);
+    tsdb *db = w->stop ? NULL : w->db;
+    struct disk_usage_hooks hooks = w->hooks;
+    pthread_mutex_unlock(&w->mu);
+
+    if (db && hooks.vols_on_disk) {
+        uint32_t *vols = malloc(CLUSTER_REPORT_VOLS * sizeof *vols);
+        if (vols) {
+            uint32_t nv = hooks.vols_on_disk(store_id, vols, CLUSTER_REPORT_VOLS);
+            for (uint32_t k = 0; k < nv; k++) {
+                pthread_mutex_lock(&w->mu);
+                int stopping = w->stop || !w->db;
+                pthread_mutex_unlock(&w->mu);
+                if (stopping)
+                    break;
+                struct eng *eng = tsdb_cvol_ref(db, vols[k]);
+                if (eng) {
+                    eng_set_disk_full(eng, full != 0);
+                    tsdb_cvol_unref(&eng);
+                }
+                if (full_changed && hooks.wake_vol)
+                    hooks.wake_vol(vols[k]);
+            }
+            free(vols);
+        }
+    }
+    if (need_beat)
+        cluster_beat_soon();
+}
+
+static int64_t disk_usage_interval_ms(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    const char *ms = getenv("TSDB_DISK_USAGE_MS");
+    if (ms && *ms) {
+        int v = atoi(ms);
+        if (v >= 50 && v <= 10000)
+            return v;
+    }
+    const char *uf = getenv("TSDB_DISK_USAGE_FILE");
+    if (uf && *uf)
+        return 100;
+#endif
+    return 10000; /* §15.4 / TASK-r13-fill: sample every 10 s off any engine lock */
+}
+
+static void *disk_usage_worker_main(void *arg)
+{
+    struct disk_usage_worker *w = arg;
+    tsdb_thread_name("tsdb-diskuse");
+    for (;;) {
+        pthread_mutex_lock(&w->mu);
+        bool stop = w->stop || !w->db;
+        w->kick = false;
+        pthread_mutex_unlock(&w->mu);
+        if (stop)
+            break;
+
+        disk_usage_sample_one(w);
+
+        int64_t wait_ms = disk_usage_interval_ms();
+        pthread_mutex_lock(&w->mu);
+        if (!w->stop && !w->kick) {
+            struct timespec dl;
+            tsdb_cond_deadline_ns(&dl, wait_ms * 1000000LL);
+            pthread_cond_timedwait(&w->cv, &w->mu, &dl);
+        }
+        stop = w->stop || !w->db;
+        pthread_mutex_unlock(&w->mu);
+        if (stop)
+            break;
+    }
+    pthread_mutex_lock(&w->mu);
+    w->done = true;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+    usage_worker_unref(w);
+    return NULL;
+}
+
+int disk_usage_start(tsdb *db, const struct disk_usage_hooks *hooks)
+{
+    pthread_mutex_lock(&g_mu);
+    if (!G.started || G.usage_started) {
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
+    G.usage_db = db;
+    if (hooks)
+        G.usage_hooks = *hooks;
+    else
+        memset(&G.usage_hooks, 0, sizeof G.usage_hooks);
+    G.nusage_workers = 0;
+
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 256 * 1024);
+
+    for (int i = 0; i < G.ndisks && G.nusage_workers < DISKS_MAX; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (!d->present || !d->path[0])
+            continue;
+        struct disk_usage_worker *w = calloc(1, sizeof *w);
+        if (!w)
+            continue;
+        atomic_init(&w->refs, 2); /* owner + worker thread */
+        pthread_mutex_init(&w->mu, NULL);
+        tsdb_cond_init_mono(&w->cv);
+        w->disk_idx = i;
+        memcpy(w->store_id, d->meta.store_id, 16);
+        snprintf(w->path, sizeof w->path, "%s", d->path);
+        snprintf(w->chunks_path, sizeof w->chunks_path, "%s", d->chunks_path);
+        w->db = db;
+        w->hooks = G.usage_hooks;
+        if (pthread_create(&w->th, &at, disk_usage_worker_main, w) != 0) {
+            atomic_store(&w->refs, 1);
+            usage_worker_unref(w);
+            continue;
+        }
+        G.usage_workers[G.nusage_workers++] = w;
+    }
+    pthread_attr_destroy(&at);
+
+    G.usage_started = 1;
+    atomic_store_explicit(&g_disks_usage_active, 1, memory_order_release);
+    pthread_mutex_unlock(&g_mu);
+    return 0;
+}
+
+void disk_usage_stop(void)
+{
+    struct disk_usage_worker *workers[DISKS_MAX];
+    int nw = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (!G.usage_started) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    nw = G.nusage_workers;
+    for (int i = 0; i < nw; i++) {
+        workers[i] = G.usage_workers[i];
+        G.usage_workers[i] = NULL;
+    }
+    G.nusage_workers = 0;
+    G.usage_started = 0;
+    G.usage_db = NULL;
+    memset(&G.usage_hooks, 0, sizeof G.usage_hooks);
+    atomic_store_explicit(&g_disks_usage_active, 0, memory_order_release);
+    atomic_store_explicit(&g_disks_any_full, 0, memory_order_release);
+    pthread_mutex_unlock(&g_mu);
+
+    /* Signal every per-disk worker first so all healthy workers exit in parallel. */
+    for (int i = 0; i < nw; i++) {
+        struct disk_usage_worker *w = workers[i];
+        pthread_mutex_lock(&w->mu);
+        w->stop = true;
+        w->db = NULL;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
+
+    /* Bounded join: wait up to 500 ms per worker; detach any worker hung inside kernel I/O on a stalled disk. */
+    struct timespec dl;
+    tsdb_cond_deadline_ns(&dl, 500 * 1000000LL);
+    for (int i = 0; i < nw; i++) {
+        struct disk_usage_worker *w = workers[i];
+        pthread_mutex_lock(&w->mu);
+        while (!w->done) {
+            if (pthread_cond_timedwait(&w->cv, &w->mu, &dl) != 0)
+                break;
+        }
+        bool join = w->done;
+        if (!join)
+            pthread_detach(w->th); /* worker cannot exit until it takes w->mu; safe while !w->done */
+        pthread_mutex_unlock(&w->mu);
+        if (join)
+            pthread_join(w->th, NULL);
+        usage_worker_unref(w);
+    }
+}
+
+void disk_usage_kick(void)
+{
+    if (!atomic_load_explicit(&g_disks_usage_active, memory_order_acquire))
+        return;
+    struct disk_usage_worker *workers[DISKS_MAX];
+    int nw = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.usage_started) {
+        nw = G.nusage_workers;
+        for (int i = 0; i < nw; i++) {
+            workers[i] = G.usage_workers[i];
+            atomic_fetch_add_explicit(&workers[i]->refs, 1, memory_order_relaxed);
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < nw; i++) {
+        pthread_mutex_lock(&workers[i]->mu);
+        workers[i]->kick = true;
+        pthread_cond_broadcast(&workers[i]->cv);
+        pthread_mutex_unlock(&workers[i]->mu);
+        usage_worker_unref(workers[i]);
+    }
+}
+
+int disks_usage_active(void) { return atomic_load_explicit(&g_disks_usage_active, memory_order_acquire) != 0; }
+int disks_any_full(void) { return atomic_load_explicit(&g_disks_any_full, memory_order_acquire) != 0; }
+
+int disks_vol_full(uint32_t vol)
+{
+    if (!atomic_load_explicit(&g_disks_any_full, memory_order_acquire))
+        return 0;
+#ifdef TSDB_TEST_HOOKS
+    if (disks_mutant() == DISKS_MUT_FULLALL)
+        return 1; /* planted: mark every volume on the node FULL whenever any disk is FULL */
+#endif
+    int (*vol_disk_fn)(uint32_t, char *, size_t, uint8_t[16]) = NULL;
+    pthread_mutex_lock(&g_mu);
+    vol_disk_fn = G.usage_hooks.vol_disk;
+    pthread_mutex_unlock(&g_mu);
+    if (!vol_disk_fn)
+        return 0;
+    uint8_t sid[16] = {0};
+    char root[PATH_MAX] = "";
+    if (vol_disk_fn(vol, root, sizeof root, sid) != 0)
+        return 0;
+    int nz = 0;
+    for (int b = 0; b < 16; b++)
+        nz |= sid[b];
+    int full = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        int match = nz ? (memcmp(d->meta.store_id, sid, 16) == 0) : (root[0] && same_path(d->path, root));
+        if (match) {
+            full = d->usage_full != 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return full;
+}
+
+uint8_t disks_vol_fill_pct(uint32_t vol)
+{
+    int (*vol_disk_fn)(uint32_t, char *, size_t, uint8_t[16]) = NULL;
+    pthread_mutex_lock(&g_mu);
+    vol_disk_fn = G.usage_hooks.vol_disk;
+    pthread_mutex_unlock(&g_mu);
+    if (!vol_disk_fn)
+        return 0xff;
+    uint8_t sid[16] = {0};
+    char root[PATH_MAX] = "";
+    if (vol_disk_fn(vol, root, sizeof root, sid) != 0)
+        return 0xff;
+    int nz = 0;
+    for (int b = 0; b < 16; b++)
+        nz |= sid[b];
+    uint8_t pct = 0xff;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        int match = nz ? (memcmp(d->meta.store_id, sid, 16) == 0) : (root[0] && same_path(d->path, root));
+        if (match && d->usage_have) {
+            pct = d->usage_young_pct;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return pct;
+}
+
+int disks_chunk_store_can_put(int chunk_slot, int is_rebuild)
+{
+    if (chunk_slot < 0 || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return 1;
+    int allow = 1;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        const struct disk_entry *d = &G.disks[i];
+        if (d->chunk_slot != chunk_slot)
+            continue;
+        if (d->usage_have)
+            allow = is_rebuild ? !d->usage_chunk_rb_full : !d->usage_chunk_full;
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    return allow;
+}
+
+int disks_usage_snapshot(struct disk_fill_snap *out, int cap)
+{
+    if (!out || cap <= 0 || !atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return 0;
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks && n < cap; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            int nz = 0;
+            for (int b = 0; b < 16; b++)
+                nz |= d->meta.store_id[b];
+            if (!nz || !d->usage_have)
+                continue;
+            struct disk_fill_snap *s = &out[n++];
+            memset(s, 0, sizeof *s);
+            memcpy(s->store_id, d->meta.store_id, 16);
+            s->disk_class = d->effective_class;
+            s->uses = d->uses ? d->uses : META_DISK_USE_LOG;
+            s->fill_flags = d->usage_fill_flags;
+            s->young_fill_pct = d->usage_young_pct;
+            s->chunk_fill_pct = d->usage_chunk_pct;
+            s->size_bytes = d->usage_size > 0 ? d->usage_size : d->size_bytes;
+            s->young_data_bytes = d->usage_young_data;
+            s->retained_bytes = d->usage_raw_retained;
+            s->retired_bytes = d->usage_raw_retired;
+            s->local_bytes = d->usage_raw_local;
+            s->index_bytes = d->usage_raw_index;
+            s->chunk_bytes = d->usage_eff_chunks;
+            s->young_peak_7d = d->usage_peak_7d;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
 void disks_stop(void)
 {
+    disk_usage_stop();
     disks_drain_stop();
     disk_probe_stop();
     atomic_store_explicit(&g_disks_started, 0, memory_order_release);
+    eng_set_disk_fill_mutants(0, 0);
     pthread_mutex_lock(&g_mu);
     int was_started = G.started;
     G.started = 0;
@@ -2902,5 +4096,7 @@ void disks_stop(void)
         creport_metric_collector_del("tsdb_disk_class_mismatch");
         creport_metric_collector_del("tsdb_disk_shared_device");
         creport_metric_collector_del("tsdb_disk_state");
+        creport_metric_collector_del("tsdb_disk_bytes");
+        creport_metric_collector_del("tsdb_disk_size_bytes");
     }
 }

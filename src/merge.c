@@ -80,7 +80,7 @@ static bool rewrite_alone(const part *p) { return insert_written(p) || p->hdr_le
  * Solo rewrites come last (merge_thread_main): after real merges and after the retention work, so that an
  * expired partition is dropped rather than rewritten and the WAL's removal is made durable without waiting
  * for every part of a bulk load. Caller holds db->lock. The chosen parts are marked merging and referenced. */
-static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
+static size_t select_merge_locked(eng *db, part **sel, bool solo_ok, bool shrink_only)
 {
     time_t now = time(NULL);
     double best = INFINITY;
@@ -102,13 +102,14 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
             continue;
         }
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
-        for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
+        for (size_t i = a; i < b && solo_ok && !shrink_only && idle && solo == SIZE_MAX; i++)
             if (rewrite_alone(db->parts[i]) && !db->parts[i]->merging && !atomic_load(&db->parts[i]->damaged) &&
                 !part_no_rewrite(db->parts[i])) /* R7: an .ec part is at rest already, a settling one is taken */
                 solo = i;
         if (nparts >= 2) {
             for (size_t i = a; i < b; i++) {
                 double sum = 0, max_size = 0, min_age = INFINITY;
+                bool has_tombs = false;
                 for (size_t j = i; j < b && j - i < MAX_MERGE_PARTS; j++) {
                     part *p = db->parts[j];
                     /* a damaged part is a barrier (merge_parts would fail on it again, part_checked): the ranges
@@ -117,6 +118,8 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
                      * beside an output that holds the same rows): src/ecskip.h */
                     if (p->merging || atomic_load(&p->damaged) || part_merge_barrier(p))
                         break;
+                    if (p->nt > 0)
+                        has_tombs = true;
                     double size = (double)p->map_len;
                     if (sum + size > (double)db->opt.max_part_bytes && j > i)
                         break;
@@ -126,6 +129,8 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
                     double count = (double)(j - i + 1);
                     if (count < 2)
                         continue;
+                    if (shrink_only && !has_tombs)
+                        continue; /* E53: at >= young_high_pct, hold merges whose output would not shrink the disk */
                     if (!idle && !merge_allowed(sum, max_size, min_age, (double)nparts, count))
                         continue;
                     double s = merge_score(count, sum);
@@ -850,7 +855,8 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal, cha
         for (size_t i = a; ret && i < b && !k; i++) {
             part *p = db->parts[i];
             /* R7: an .ec or settling part is never rewritten for its expired rows: queries clamp to the cutoff,
-             * and the partition goes whole once all of it has expired (above) */
+             * and the partition goes whole once all of it has expired (above). E53: TTL rewrites shrink the disk,
+             * so they still run while disk_full is set. */
             if (p->merging || atomic_load(&p->damaged) || part_no_rewrite(p) || (!p->ng && !p->nt) ||
                 now <= p->ttl_any || db->opt.retention_merge_s < 0 || wall - p->created < db->opt.retention_merge_s)
                 continue;
@@ -891,13 +897,37 @@ void *merge_thread_main(void *arg)
     tsdb_thread_name("tsdb-merge");
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
-        size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel, false); /* a failed engine writes nothing more */
+        bool full_hold = atomic_load_explicit(&db->disk_full, memory_order_acquire) && !eng_disk_fill_merge_on();
+        size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel, false, full_hold); /* a failed engine writes nothing more; E53 holds non-shrinking merges at >= young_high_pct */
         bool dropped = false, sync_wal = false;
         char drop_intent[64] = "";
         if (!k && !eng_check(db))
             k = ttl_select_locked(db, sel, &dropped, &sync_wal, drop_intent);
         if (!k && !dropped && !sync_wal && !eng_check(db))
-            k = select_merge_locked(db, sel, true);
+            k = select_merge_locked(db, sel, true, full_hold);
+        if (full_hold && !k && !dropped && !sync_wal && !eng_check(db)) {
+            /* Count when merge work is actually waiting behind disk_full (E53). */
+            bool has_work = false;
+            for (size_t a = 0; a < db->nparts && !has_work;) {
+                size_t b = a + 1;
+                while (b < db->nparts && db->parts[b]->partition == db->parts[a]->partition)
+                    b++;
+                size_t nyoung = 0;
+                for (size_t i = a; i < b; i++) {
+                    part *p = db->parts[i];
+                    if (p->merging || atomic_load(&p->damaged) || part_merge_barrier(p))
+                        continue;
+                    nyoung++;
+                    if (rewrite_alone(p))
+                        has_work = true;
+                }
+                if (nyoung >= 2)
+                    has_work = true;
+                a = b;
+            }
+            if (has_work)
+                atomic_fetch_add_explicit(&db->st_merges_held, 1, memory_order_relaxed);
+        }
         if (dropped || sync_wal) {
             pthread_mutex_unlock(&db->lock);
             if (drop_test_mutant == DROP_MUT_TTL_UNLINK_FIRST && dropped)

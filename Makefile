@@ -677,7 +677,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio \
-    ecbackduring ecbackafterwhole logbackduring hddadd settings
+    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1085,7 +1085,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants lmove-mutants tiers-mutants tierctl-mutants tiersalv-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1157,7 +1157,7 @@ $(B)/chunkpeer.o: server/chunkpeer.c server/chunkpeer.h server/chunksrv.h src/co
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/chunksrv_cluster.o: server/chunksrv_cluster.c server/chunksrv.h server/creport.h server/disks.h server/peerlink.h server/cluster.h server/meta.h src/chunk.h src/chunkscrub.h src/chunkmove.h client/tsdb_crypto.h src/chunk_priv.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
-$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/chunk_priv.h src/chunkmove.h src/compat.h src/internal.h | $(B)
+$(B)/disks.o: server/disks.c server/disks.h server/chunksrv.h server/cluster.h server/creport.h server/meta.h client/tsdb_crypto.h src/disk.h src/chunk.h src/chunk_priv.h src/chunkmove.h src/compat.h src/cvol.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # meta.c's promotion is src/repl.c's repl_meta_promote (one function for the state machine and the simulator)
 $(B)/repl.o: src/repl.c src/repl.h | $(B)
@@ -1346,6 +1346,10 @@ settings-mutants: $(B)/test_meta_mut $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(if
 	$(MUT) --name test_meta_settings --list "settingsany settingsnocas" -- ./$(B)/test_meta_mut @D@ --mutant @M@ --seeds 4 --seconds 6
 	$(MUT) --name settings --uring --list "settingsany settingsnocas" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb $(if $(filter Darwin,$(UNAME_S)),,OUTAGEFS_LIB=$(B)/liboutagefs.so )./$(B)/test_cluster @D@ settings
+# R13 (r13-fill) per-disk fill marks, per-volume FULL scope, early retired release and merge hold mutants (TSDB_DISKS_MUTANT)
+diskfill-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	$(MUT) --name diskfill --uring --list "fullall fullmergeon$(if $(EC_OBJ), fullnorelease)" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ diskfill
 
 # TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)

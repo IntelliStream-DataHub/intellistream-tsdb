@@ -2229,6 +2229,73 @@ static void test_spool_fallback(void)
     pthread_mutex_destroy(&fctx.mu);
 }
 
+static int g_allow_regular = 1;
+static int g_allow_rebuild = 1;
+static int test_put_allow_cb(void *arg, int store_slot, int is_rebuild)
+{
+    (void)arg;
+    (void)store_slot;
+    return is_rebuild ? g_allow_rebuild : g_allow_regular;
+}
+
+static void test_fill_mark(void)
+{
+    char dir[PATH_MAX], st[PATH_MAX + 16];
+    fresh("fillmark", dir, sizeof dir);
+    mkstore(dir, 0, 7, true, st, sizeof st);
+    struct chunksrv *cs = open1(st);
+    if (!cs)
+        return;
+    chunksrv_set_put_allow(cs, test_put_allow_cb, NULL);
+
+    /* Seed one chunk while below fill mark so CS_PUT_F_REPLACE can target it later. */
+    g_allow_regular = 1;
+    g_allow_rebuild = 1;
+    cdata c0, c1;
+    cdata_make(&c0, 3, 0, 4096, 3 * 4096 * 2 + 123, 100);
+    bool ok = false;
+    int up = 0;
+    CHECK(fake_put(cs, &c0, 1, &ok, NULL) == 0 && ok);
+
+    /* Past cluster fill mark, below 95%: regular put refused with CHUNK_ERR_FULL, store stays UP, repair replace succeeds. */
+    g_allow_regular = 0;
+    g_allow_rebuild = 1;
+    cdata_make(&c1, 3, 1, 4096, 3 * 4096 * 2 + 123, 101);
+    ok = false;
+    int prc = fake_put(cs, &c1, 2, &ok, NULL);
+    CHECK(prc == CHUNK_ERR_FULL && !ok);
+    CHECK(chunksrv_stores(cs, &up, false) == 1 && up == 1);
+
+    cdata rep = c0;
+    rep.m.flags = CS_PUT_F_REPLACE;
+    rep.m.hdr_epoch = c0.m.epoch;
+    rep.m.epoch = c0.m.epoch + 1;
+    ok = false;
+    prc = fake_put(cs, &rep, 3, &ok, NULL);
+    CHECK(prc == 0 && ok);
+    CHECK(chunksrv_stores(cs, &up, false) == 1 && up == 1);
+
+    /* Past 95%: replace put is also refused with CHUNK_ERR_FULL, store STILL stays UP. */
+    g_allow_rebuild = 0;
+    rep.m.epoch = c0.m.epoch + 2;
+    ok = false;
+    prc = fake_put(cs, &rep, 4, &ok, NULL);
+    CHECK(prc == CHUNK_ERR_FULL && !ok);
+    CHECK(chunksrv_stores(cs, &up, false) == 1 && up == 1);
+
+    /* Below fill mark again: regular put at current epoch succeeds. */
+    g_allow_regular = 1;
+    g_allow_rebuild = 1;
+    c1.m.epoch = rep.m.epoch;
+    ok = false;
+    prc = fake_put(cs, &c1, 5, &ok, NULL);
+    CHECK(prc == 0 && ok);
+
+    cdata_free(&c0);
+    cdata_free(&c1);
+    chunksrv_close(cs);
+}
+
 int main(int argc, char **argv)
 {
     const char *mutant = NULL, *base = "/tmp";
@@ -2304,6 +2371,7 @@ int main(int argc, char **argv)
     test_scrub_pause();
     test_spool_fallback();
     test_slow_disk();
+    test_fill_mark();
 out:
     if (fails == 0) {
         char cmd[PATH_MAX + 16];

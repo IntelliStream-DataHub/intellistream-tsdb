@@ -365,6 +365,7 @@ struct cluster_copy_member {
     uint8_t capability;       /* enum meta_cap bitmask (R13, E49) */
     char addr[META_ADDR_MAX]; /* the client address, host:port */
     char peer[META_ADDR_MAX]; /* the peer address */
+    char rack[META_RACK_MAX]; /* failure domain / rack ("" if none) */
     uint32_t ndisks;
     struct meta_disk disks[META_DISKS_MAX]; /* committed disks (R13, E52) */
 };
@@ -490,6 +491,25 @@ void cluster_set_fill_pct(uint8_t pct);
 uint8_t cluster_get_fill_pct(void);
 uint32_t cluster_young_high_pct(void);
 int cluster_self_full(void);
+/* 1 when TSDB_CLUSTER_TEST fill_pct=N or fill_pct_file=1 override is active (preserves r9-full single-dir tests). */
+int cluster_fill_override_active(void);
+
+/* R13 (r13-fill, E53, §15.4): Raft-leader aggregated disk usage totals per class across all heard members. */
+struct cluster_disk_class_totals {
+    uint32_t disks;
+    uint32_t warn_disks;
+    uint32_t move_disks;
+    uint32_t full_disks;
+    uint64_t size_bytes;
+    uint64_t young_data_bytes;
+    uint64_t retained_bytes;
+    uint64_t retired_bytes;
+    uint64_t local_bytes;
+    uint64_t index_bytes;
+    uint64_t chunk_bytes;
+};
+/* Returns 1 if this server is the Raft leader and filled `out[0..META_DISK_CLASS_LAST]`, else 0. Thread-safe. */
+int cluster_disk_usage_totals(struct cluster_disk_class_totals out[META_DISK_CLASS_LAST + 1]);
 /* R9 (D10, D11; filled by r9-fill): HBS_FILL entries published by sfill for the heartbeat path. Any thread. */
 void cluster_set_fills(const struct cluster_fill_report *fills, uint32_t nfills);
 /* R10 (D26, D28): HBS_LIVE_OBJS entries published by volume leaders for the heartbeat path. Any thread. */

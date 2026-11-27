@@ -126,6 +126,12 @@ static void cc_on_store_fault(void *ctx, int store_idx, int err_code)
     disk_probe_chunk_failed(store_idx, err_code);
 }
 
+static int cc_put_allow(void *ctx, int store_idx, int is_rebuild)
+{
+    (void)ctx;
+    return disks_chunk_store_can_put(store_idx, is_rebuild);
+}
+
 static void cc_on_ioerr(void *ctx, int store_idx)
 {
     (void)ctx;
@@ -684,6 +690,7 @@ int chunksrv_cluster_start_ex(const char *const *paths, const int *prefs, const 
     if (!G.cs)
         return -1;
     chunksrv_set_store_fault(G.cs, cc_on_store_fault, NULL);
+    chunksrv_set_put_allow(G.cs, cc_put_allow, NULL);
     if (chunksrv_backend(G.cs))
         chunk_be_set_ioerr_cb(chunksrv_backend(G.cs), cc_on_ioerr, NULL);
     chunksrv_stores(G.cs, NULL, n > 0);

@@ -42,9 +42,11 @@ int repld_engine_failed(uint32_t v, const char *msg);
 int repld_disk_down(uint32_t v, const char *why);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
-/* 1 while volume v is led here and this server or any current ISR member is FULL (R9 E30, D17): writes are refused
- * at admission with UNAVAILABLE TSDB_WHY_FULL (retry_after 1000 ms). */
+/* 1 while volume v is led here and this server or any current ISR member is FULL (R9 E30, D17; R13 E53 per-disk):
+ * writes are refused at admission with UNAVAILABLE TSDB_WHY_FULL (retry_after 1000 ms). */
 int repld_full(uint32_t v);
+/* 1 while volume v is FULL either as a leader refusing inserts or locally on a full disk (for tsdb_volume_full). */
+int repld_vol_full(uint32_t v);
 /* Records a FULL refusal for volume v (per-volume and process-total atomic counters, for STATUS and metrics). */
 void repld_note_full_refusal(uint32_t v);
 /* Refusal count for volume v (UINT32_MAX or TSDB_VOL_ANY: process-wide sum across volumes). Exported for STATUS

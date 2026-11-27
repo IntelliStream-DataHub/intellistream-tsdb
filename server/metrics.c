@@ -554,6 +554,29 @@ static void family(sb *b, const char *name, const char *type, const char *help)
 static metrics_cfg cfg;
 static time_t start_time;
 
+static void render_creport_samples(sb *b, const struct creport_snap_family *f)
+{
+    for (size_t j = 0; j < f->nsamples; j++) {
+        const struct creport_snap_sample *s = &f->samples[j];
+        sb_add(b, "%s", f->name);
+        if (s->nlabels > 0) {
+            sb_add(b, "{");
+            for (uint8_t k = 0; k < s->nlabels; k++) {
+                sb_add(b, "%s%s=\"", k ? "," : "", s->labels[k].key);
+                sb_label(b, s->labels[k].val);
+                sb_add(b, "\"");
+            }
+            sb_add(b, "}");
+        }
+        if (s->val_kind == CREPORT_VAL_I64)
+            sb_add(b, " %lld\n", (long long)s->ival);
+        else if (s->val_kind == CREPORT_VAL_U64)
+            sb_add(b, " %llu\n", (unsigned long long)s->uval);
+        else
+            sb_add(b, " %.9g\n", s->dval);
+    }
+}
+
 static void render(sb *b)
 {
     uint32_t nv = tsdb_volume_count(cfg.db);
@@ -565,6 +588,7 @@ static void render(sb *b)
     for (uint32_t i = 0; i < nv; i++)
         if (tsdb_get_volume_stats(cfg.db, i, &vs[i]) != 0)
             memset(&vs[i], 0, sizeof vs[i]);
+    struct creport_snap *cs = (cfg.cluster_snap && cfg.cluster_snap_free) ? cfg.cluster_snap() : NULL;
 
     /* "avx2, codecs x86-64-v3" -> simd avx2, codecs x86-64-v3 */
     char simd[64], codecs[64] = "native";
@@ -602,7 +626,13 @@ static void render(sb *b)
     } while (0)
 
     VOL_FAMILY("tsdb_rows", "gauge", "Rows in parts on disk, before merges drop overwritten ones.", rows);
-    VOL_FAMILY("tsdb_disk_bytes", "gauge", "Bytes of the part files.", bytes);
+    VOL_FAMILY("tsdb_disk_bytes", "gauge", "Bytes of the part files (and per local cluster disk by use).", bytes);
+    if (cs) {
+        for (size_t i = 0; i < cs->nfamilies; i++) {
+            if (strcmp(cs->families[i].name, "tsdb_disk_bytes") == 0)
+                render_creport_samples(b, &cs->families[i]);
+        }
+    }
     VOL_FAMILY("tsdb_parts", "gauge", "Part files.", parts);
     VOL_FAMILY("tsdb_partitions", "gauge", "Time partitions that have parts.", partitions);
     VOL_FAMILY("tsdb_granules", "gauge", "Granules in all parts.", granules);
@@ -937,34 +967,15 @@ static void render(sb *b)
                        (unsigned long long)pc.bytes[d][c]);
     }
 
-    if (cfg.cluster_snap && cfg.cluster_snap_free) { /* R14 cluster metrics registry (server/creport.h; lock-free render) */
-        struct creport_snap *cs = cfg.cluster_snap();
-        if (cs) {
-            for (size_t i = 0; i < cs->nfamilies; i++) {
-                const struct creport_snap_family *f = &cs->families[i];
-                family(b, f->name, f->type == CREPORT_COUNTER ? "counter" : "gauge", f->help);
-                for (size_t j = 0; j < f->nsamples; j++) {
-                    const struct creport_snap_sample *s = &f->samples[j];
-                    sb_add(b, "%s", f->name);
-                    if (s->nlabels > 0) {
-                        sb_add(b, "{");
-                        for (uint8_t k = 0; k < s->nlabels; k++) {
-                            sb_add(b, "%s%s=\"", k ? "," : "", s->labels[k].key);
-                            sb_label(b, s->labels[k].val);
-                            sb_add(b, "\"");
-                        }
-                        sb_add(b, "}");
-                    }
-                    if (s->val_kind == CREPORT_VAL_I64)
-                        sb_add(b, " %lld\n", (long long)s->ival);
-                    else if (s->val_kind == CREPORT_VAL_U64)
-                        sb_add(b, " %llu\n", (unsigned long long)s->uval);
-                    else
-                        sb_add(b, " %.9g\n", s->dval);
-                }
-            }
-            cfg.cluster_snap_free(cs);
+    if (cs) { /* R14 cluster metrics registry (server/creport.h; lock-free render) */
+        for (size_t i = 0; i < cs->nfamilies; i++) {
+            const struct creport_snap_family *f = &cs->families[i];
+            if (strcmp(f->name, "tsdb_disk_bytes") == 0)
+                continue; /* emitted contiguously under the single tsdb_disk_bytes family above */
+            family(b, f->name, f->type == CREPORT_COUNTER ? "counter" : "gauge", f->help);
+            render_creport_samples(b, f);
         }
+        cfg.cluster_snap_free(cs);
     }
 
     if (cfg.tier) { /* single-server tier metrics (R15 r15-full, E53, §15.7); omitted when no tier is configured */

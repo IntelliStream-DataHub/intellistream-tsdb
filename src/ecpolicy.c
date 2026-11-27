@@ -363,7 +363,10 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
         if (cluster) { /* D21: whole keys of any class, no per-part, coarse or eager settle */
             if (phi == INT64_MAX || !age_reached(phi, now, grace))
                 continue;
-            if (merge_selectable(db, lo_i, hi_i) && settle_mut() != SETTLE_MUT_BUSY)
+            /* E53: when disk_full holds non-shrinking merges, ignore held merges and allow settling level-0 parts
+             * so finished keys can drain into the chunk tier and free the full disk out of FULL. */
+            bool merges_held = atomic_load_explicit(&db->disk_full, memory_order_acquire) && !eng_disk_fill_merge_on();
+            if (!merges_held && merge_selectable(db, lo_i, hi_i) && settle_mut() != SETTLE_MUT_BUSY)
                 continue;
             if (expires_within(db, lo_i, hi_i, now, margin))
                 continue;
@@ -376,7 +379,7 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
             for (size_t i = lo_i; i < hi_i; i++) {
                 const part *p = db->parts[i];
                 nall += !part_is_ec(p);
-                ni += settleable(db->parts[i]) && p->level > 0; /* D18: never an insert-written part */
+                ni += settleable(db->parts[i]) && (p->level > 0 || merges_held); /* D18: level-0 only when merges held */
             }
             if (ni > cap || nall > MK_FILES_MAX || ecpolicy_test_cap_hit) {
                 if (ni) {
@@ -388,7 +391,7 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
                 continue;
             }
             for (size_t i = lo_i; i < hi_i; i++)
-                if (settleable(db->parts[i]) && db->parts[i]->level > 0)
+                if (settleable(db->parts[i]) && (db->parts[i]->level > 0 || merges_held))
                     sel[n++] = db->parts[i];
         } else if (cfg->eager) {
             for (size_t i = lo_i; i < hi_i && n < cap; i++) {
@@ -476,11 +479,12 @@ void ecpolicy_backlog(eng *db, uint32_t *keys_waiting, uint64_t *oldest_wait_s)
                 continue;
             if (expires_within(db, lo_i, hi_i, now, margin))
                 continue;
+            bool merges_held = atomic_load_explicit(&db->disk_full, memory_order_acquire) && !eng_disk_fill_merge_on();
             bool any_young = false;
             for (size_t i = lo_i; i < hi_i; i++) {
                 const part *p = db->parts[i];
                 if (!p->dropped && !part_is_ec(p) && p->ng > 0 && p->hdr_len == sizeof(part_header) && !p->pending &&
-                    p->level > 0) {
+                    (p->level > 0 || merges_held)) {
                     any_young = true;
                     break;
                 }

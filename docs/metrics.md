@@ -156,6 +156,9 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_disk_class_mismatch` | gauge | number of local `--disk` entries whose runtime `/sys` block-device class detection disagreed with the authoritative class at start (R13) |
 | `tsdb_disk_shared_device` | gauge | 1 while this server is running with `--allow-shared-device` (`cluster.allow.shared.device`), else 0 (R13) |
 | `tsdb_disk_state{store,class}` | gauge | per local `--disk` (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`): live disk state: `0` up, `1` down (missing, probe stalled/errors, or chunk store EIO/ENOSPC), `2` out, `3` destroyed (R13) |
+| `tsdb_disk_bytes{store,class,use}` | gauge | per local `--disk` (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`, `use` is `young`, `retained`, `retired`, `local`, `index`, or `chunks`): sampled bytes on disk by use (sampled every 10 s off engine locks; emitted contiguously under the single `tsdb_disk_bytes` family alongside per-volume part-file sizes) (R13) |
+| `tsdb_disk_size_bytes{store,class}` | gauge | per local `--disk` (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`): total filesystem capacity in bytes (R13) |
+| `tsdb_volume_full{volume}` | gauge | per held cluster volume: `1` while the volume is FULL (`>= young_high_pct` on any ISR replica's disk or locally on a full disk, refusing inserts with `UNAVAILABLE` `TSDB_WHY_FULL`; clears below `young_high_pct - 2`), else `0` (R13) |
 | `tsdb_disk_drain_bytes_left{store,class}` | gauge | per draining local chunk store (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`): remaining chunk bytes to move locally onto another store of this server (0 once drain finishes) (R13) |
 | `tsdb_disk_drain_chunks_moved_total{store,class}` | counter | per draining local chunk store: total chunks moved locally off this store since process start (R13) |
 | `tsdb_disk_drain_no_space` | gauge | 1 while any draining local chunk store is stopped because no target chunk store on this server has room below its fill mark, else 0 (R13) |
@@ -174,7 +177,7 @@ read_bytes, fenced, unsure_refused, source_raises, answer_mismatch), kept-copy r
 `eckeep_copies_undigested` in `src/eckeep.h`), and EC GC counters (`ecgc_counters` in `src/ecgc.h`) are internal/test
 counters only and are **not** exported on the metrics port yet (R14).
 
-Useful expressions: `tsdb_logical_bytes / tsdb_disk_bytes` is the compression ratio;
+Useful expressions: `tsdb_logical_bytes / tsdb_disk_bytes{volume=~".+"}` is the compression ratio (note: in cluster mode `tsdb_disk_bytes` carries both per-volume `{volume,path}` and per-disk `{store,class,use}` series, so `sum(tsdb_disk_bytes)` without a label filter counts part bytes twice);
 `sum(rate(tsdb_query_rows_total{source="stats"}[5m])) / sum(rate(tsdb_query_rows_total[5m]))` is the share of rows answered without decoding; `rate(tsdb_inserted_rows_total[1m])` is the insert rate;
 `histogram_quantile(0.99, sum by (le, op) (rate(tsdb_query_duration_seconds_bucket[5m])))` the p99 query time;
 `tsdb_failed == 1` pages someone; `tsdb_follow_refresh_age_seconds > 5` means the follower has stopped refreshing (it does not detect a dead writer);

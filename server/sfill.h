@@ -154,6 +154,10 @@ uint32_t sfill_get_progress(struct sfill *sf, struct sfill_progress *out, uint32
 
 void sfill_get_stats(struct sfill *sf, struct sfill_stats *out);
 
+/* R13 r13-fill (E53, §15.4): optional local store put-admission hook for rebuild writes (up to 95%). */
+typedef int (*sfill_store_allow_fn)(int store_idx, int is_rebuild);
+void sfill_set_store_allow(sfill_store_allow_fn fn);
+
 /* Planted bugs (TSDB_SFILL_MUTANT env var or sfill_set_mutant; tests/test_sfill.c, make sfill-mutants, whole-mutants). */
 enum sfill_mutant {
     SFILL_MUT_NONE = 0,

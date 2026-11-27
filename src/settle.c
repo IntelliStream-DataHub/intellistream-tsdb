@@ -898,6 +898,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
         return TSDB_ERR_NOMEM;
     }
     size_t np = 0;
+    bool merges_held = atomic_load_explicit(&db->disk_full, memory_order_acquire) && !eng_disk_fill_merge_on();
     pthread_mutex_lock(&db->lock);
     if (!partition_dropping(db, partition))
         for (size_t i = 0; i < n; i++) {
@@ -908,7 +909,7 @@ int eng_settle(eng *db, int64_t partition, part **sel, size_t n, size_t *settled
             /* a v8 part (hdr_len) is rewritten alone first (src/merge.c rewrite_alone); ec_index_write refuses it */
             if (dup || p->partition != partition || p->merging || p->settling || p->dropped || part_is_ec(p) ||
                 atomic_load(&p->damaged) || p->ng == 0 || p->hdr_len != sizeof(part_header) || p->pending ||
-                (cold && p->level == 0) || !listed_locked(db, p)) /* D18: never an insert-written part in a cluster */
+                (cold && p->level == 0 && !merges_held) || !listed_locked(db, p)) /* D18: level-0 only when merges held */
                 continue;
             p->settling = true;
             part_ref(p);
