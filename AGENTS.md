@@ -494,9 +494,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - `server/repld_int.h` (r4-iface): the replication driver's structs (`rvol`, `rpeer`, `item`, `G`) and the few helpers
   that `repld.c` shares with `rsnap.c`, `rset.c` and `rtransfer.c` (the names it exports for them are `rd_*`, `#define`d
   back to the short ones in the header, so each source reads as before); the lock rules of `repld.c` hold in every file that includes it.
-  `server/cluster_int.h`: what `ctransfer.c`, `cmove.c` and `cset.c` (the Raft leader's side) need of `cluster.c` (`cl_*`:
-  the clock, this node, the leader's peer, a proposal and its reply, the duty hooks) and the entry points `cluster.c` calls;
-  all of it runs on the cluster thread only, nothing there takes a lock. R4's wire pieces: admin ops 10 to 12
+  `server/cluster_int.h`: what `ctransfer.c`, `cmove.c`, `cset.c`, `cnode.c` and `cheal.c` (the Raft leader's side) need of `cluster.c` (`cl_*`:
+  the clock, this node, the leader's peer, a proposal and its reply, the duty hooks, reported volume health) and the entry points `cluster.c` calls;
+  all of it runs on the cluster thread only (`cheal.c` uses a private leaf lock only to hand its blocked-volume snapshot to the metrics collector).
+  `server/cheal.c` (R12, r12-heal; PLAN.md D8): automatic healing of `CL_HEALTH_DAMAGED` replicas on the Raft leader (`cheal_duty`: planned transfer via `ctransfer.c` for a DAMAGED leader to a healthy non-DAMAGED ISR member, `REPLICA_RESET` for a DAMAGED non-leader non-ISR replica while healthy non-DAMAGED ISR `>= min_isr`, one rebuild at a time, 10 min per-volume cooldown with exponential failure/recurrence backoff up to 1 h, `tsdb_cluster_auto_resets_total{why}` and `tsdb_cluster_heal_blocked{volume,why}` via `creport.h`; `TSDB_CLUSTER_TEST` `heal_off=1`, `heal_cooldown_ms=N`; `TSDB_CLUSTER_MUTANT` `healleader`, `healbelowmin`, `healrepeat`; `test_cluster scrubheal`, `make heal-mutants`). R4's wire pieces: admin ops 10 to 12
   (`CLUSTER_OP_VOLUME_TRANSFER`, `_VOLUME_MOVE`, `_REPLICA_RESET` in `cluster.h`), the Raft leader's command to a volume's member
   (`F_VOLCMD`, `CL_VOLCMD_*`) and the member's READY, link kind 5, peer protocol 7 for these, 8 now.
 - `src/coldops.h`, `src/coldops_dir.c` (R8, E22): the cold ops of one volume (put, open/read, delete, list, owner,

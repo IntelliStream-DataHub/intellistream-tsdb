@@ -42,7 +42,7 @@ static int cset_mutant(const char *name)
 }
 
 /* a rid no member of v holds (nor 0) */
-static uint64_t fresh_rid(const struct meta_volume *v)
+uint64_t cset_fresh_rid(const struct meta_volume *v)
 {
     for (;;) {
         uint64_t rid = 0;
@@ -82,7 +82,7 @@ static int reset_propose(uint32_t number, uint32_t node, uint64_t *rid, char *t,
             return META_ERR_INVALID;
         }
     }
-    *rid = cset_mutant("resetsamerid") ? r->rid : fresh_rid(v);
+    *rid = cset_mutant("resetsamerid") ? r->rid : cset_fresh_rid(v);
     struct meta_entry e;
     meta_entry_init(&e);
     meta_op_replica_reset(&e, number, v->epoch, node, *rid);
@@ -189,7 +189,7 @@ void cset_setop_file(const char *path)
                 struct meta_entry e;
                 meta_entry_init(&e);
                 if (!strcmp(op, "add")) {
-                    rid = fresh_rid(v);
+                    rid = cset_fresh_rid(v);
                     meta_op_replica_add(&e, vol, v->epoch, node, rid, k >= 4 ? repl : 0);
                 } else {
                     meta_op_replica_remove(&e, vol, v->epoch, node);

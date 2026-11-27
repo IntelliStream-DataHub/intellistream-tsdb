@@ -120,6 +120,24 @@ void scrubd_set_min_isr_held(uint32_t vol, int held)
         atomic_store_explicit(&S.min_isr_held[vol], (uint8_t)(held ? 1 : 0), memory_order_relaxed);
 }
 
+void scrubd_vol_reset(uint32_t vol)
+{
+    dmg_set(vol, 0);
+    scrubd_set_min_isr_held(vol, 0);
+    pthread_mutex_lock(&S.mu);
+    for (uint32_t i = 0; i < S.nvols; i++) {
+        if (S.vols[i].number == vol) {
+            S.vols[i].loaded = false;
+            S.vols[i].damaged = false;
+            S.vols[i].damaged_part[0] = '\0';
+            S.vols[i].cur = (scrub_cursor){0};
+            S.vols[i].next_pass_ms = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&S.mu);
+}
+
 /* ---- advisory progress file v<N>/SCRUB (D4) ---- */
 
 static void scrub_file_save_at(int dirfd, const char *root_dir, const struct scrub_vol *sv)

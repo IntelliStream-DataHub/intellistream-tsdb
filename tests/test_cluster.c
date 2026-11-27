@@ -24747,10 +24747,11 @@ static void scen_youngscrub(void)
 {
     scenario("youngscrub");
 
-    /* ---- Part A: 3 replicas, min_isr = 2 ---- */
+    /* ---- Part A: 3 replicas, min_isr = 2 (disable r12-heal auto-reset to test r12-young detection in isolation) ---- */
     int mports[3] = {0};
     init_min_isr = 2;
     for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_off=1";
         penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
         xargs[i] = "--metrics-port auto";
         start(i);
@@ -24978,6 +24979,7 @@ static void scen_youngscrub(void)
     scenario("youngscrub-minisr3");
     init_min_isr = 3;
     for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_off=1";
         penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
         xargs[i] = "--metrics-port auto";
         start(i);
@@ -25056,6 +25058,7 @@ static void scen_youngscrub(void)
     scenario("youngscrub-two-damaged");
     init_min_isr = 1;
     for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_off=1";
         penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
         xargs[i] = "--metrics-port auto";
         start(i);
@@ -25139,11 +25142,665 @@ static void scen_youngscrub(void)
     tsdbc_close(c);
     stop_all();
     for (int i = 0; i < 3; i++) {
+        envs[i] = NULL;
         penv[i] = NULL;
         xargs[i] = NULL;
     }
     printf("  youngscrub: min_isr=2 damaged follower left ISR + restart re-scrubbed first + damaged leader kept leading; "
            "min_isr=3 stayed in ISR with metric & log; two damaged followers (min_isr=1) both left ISR stably\n");
+}
+
+/* Helpers for scen_scrubheal (R12, r12-heal; PLAN.md D8). */
+struct sh_digest {
+    uint64_t count;
+    uint64_t hash;
+};
+
+static int sh_digest_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    struct sh_digest *d = ctx;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t ut = (uint64_t)ts[i];
+        uint32_t uv = 0;
+        memcpy(&uv, &v[i], sizeof uv);
+        d->hash ^= ut + 0x9e3779b97f4a7c15ull;
+        d->hash *= 0xbf58476d1ce4e5b9ull;
+        d->hash ^= (uint64_t)uv + 0x94d049bb133111ebull;
+        d->hash *= 0x94d049bb133111ebull;
+        d->count++;
+    }
+    return 0;
+}
+
+static struct sh_digest sh_read_digest(int srv, tsdb_sid id)
+{
+    tsdbc *c = client(srv);
+    struct sh_digest d = {.count = 0, .hash = 14695981039346656037ull};
+    int rc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, sh_digest_cb, &d);
+    tsdbc_close(c);
+    if (rc != 0)
+        die("scrubheal: query on server %d failed: %s", srv, ers(rc));
+    return d;
+}
+
+static int sh_raft_leader(int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (stopped[i] || !pids[i])
+            continue;
+        struct view vw = {0};
+        view(i, &vw);
+        uint32_t lid = vw.st.leader;
+        view_free(&vw);
+        if (lid)
+            return server_of(lid);
+    }
+    return 0;
+}
+
+/* Transfer volume `vnum` (`vname`) to each of the 3 replicas in turn and verify every key/row matches `want`. */
+static void sh_verify_all_replicas_equal(int count, uint32_t vnum, const char *vname, tsdb_sid id,
+                                         struct sh_digest want)
+{
+    struct meta_volume v = {0};
+    for (int target = 0; target < count; target++) {
+        int rl = sh_raft_leader(count);
+        await_isr(rl, vname, (uint32_t)count, 15000, "full ISR before transfer");
+        if (!vol_rec(rl, vname, &v))
+            die("scrubheal: vol_rec(%s) before transfer to %d failed", vname, target);
+        if (v.leader != ids[target]) {
+            uint8_t body[8];
+            size_t bl = cluster_volume_force_encode(vnum, ids[target], body);
+            uint8_t *rep = NULL;
+            size_t rlen = 0;
+            int rc = admin(rl, CLUSTER_OP_VOLUME_TRANSFER, body, bl, 1, &rep, &rlen);
+            if (rc != 0)
+                die("scrubheal: transfer %s to server %d failed: %s (%.*s)", vname, target, cluster_strerror(rc),
+                    (int)rlen, rep ? (const char *)rep : "");
+            free(rep);
+            for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+                if (vol_rec(target, vname, &v) && v.leader == ids[target])
+                    break;
+            }
+            if (!vol_rec(target, vname, &v) || v.leader != ids[target])
+                die("scrubheal: server %d did not become leader of %s after transfer", target, vname);
+        }
+        /* Wait briefly until the new leader answers reads cleanly. */
+        struct sh_digest got = {0};
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(100000)) {
+            tsdbc *c = client(target);
+            got = (struct sh_digest){.count = 0, .hash = 14695981039346656037ull};
+            int qrc = tsdbc_query_raw(c, id, 0, INT64_MAX / 2, sh_digest_cb, &got);
+            tsdbc_close(c);
+            if (qrc == 0)
+                break;
+        }
+        if (got.count != want.count || got.hash != want.hash)
+            die("scrubheal: replica %d data mismatch on %s (count %" PRIu64 " vs %" PRIu64 ", hash %016" PRIx64
+                " vs %016" PRIx64 ")", target, vname, got.count, want.count, got.hash, want.hash);
+    }
+}
+
+/* Write a valid v<vol>/SCRUB naming `pname` as damaged so scrubd_preload_locked marks the replica DAMAGED on boot. */
+static void sh_write_damaged_scrub(int srv, uint32_t vol, const char *pname)
+{
+    char sdir[PATH_MAX + 80], spath[PATH_MAX + 160], body[512];
+    server_dir(srv, sdir, sizeof sdir);
+    snprintf(spath, sizeof spath, "%s/v%" PRIu32 "/SCRUB", sdir, vol);
+    int bl = snprintf(body, sizeof body,
+                      "tsdb-scrub 1\n"
+                      "pass_start_s 1000\n"
+                      "last_pass_s 1000\n"
+                      "first_pass_s 1000\n"
+                      "cursor 0 0 0 0 0 0\n"
+                      "damaged 1\n"
+                      "damaged_part %s\n",
+                      pname);
+    int fd = open(spath, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || write(fd, body, (size_t)bl) != bl)
+        die("scrubheal: write %s", spath);
+    uint64_t bsz = 0, bh = 0;
+    if (snap_xxh64_fd(fd, &bsz, &bh) != 0)
+        die("scrubheal: snap_xxh64_fd %s", spath);
+    char tail[64];
+    int tl = snprintf(tail, sizeof tail, "end %016" PRIx64 "\n", bh);
+    if (lseek(fd, 0, SEEK_END) < 0 || write(fd, tail, (size_t)tl) != tl)
+        die("scrubheal: write end %s", spath);
+    close(fd);
+}
+
+/* scrubheal (R12, r12-heal; PLAN.md D8):
+ *   Part 1 (3 replicas, min_isr=2, heal_cooldown_ms=500):
+ *     - Flip a granule on follower R1 -> DAMAGED -> leaves ISR -> auto-reset -> v1.lost-<oldrid> kept -> snapshot ->
+ *       R1 rejoins ISR; verify every key equal on all three via planned leader transfer to each in turn.
+ *     - Flip a granule on leader L -> planned transfer first (catches healleader!), then old leader leaves ISR,
+ *       auto-reset -> v1.lost-<oldrid> kept -> snapshot -> rejoins ISR; verify every key equal on all three.
+ *     - Stop R2, flip R1 (held in ISR at min_isr=2), flip leader L -> no non-DAMAGED ISR member exists -> transfer
+ *       withheld, logged, tsdb_cluster_auto_resets_total{why="no_candidate"} >= 1 & heal_blocked == 1.
+ *   Part 2 (3 replicas, min_isr=2, heal_cooldown_ms=500; catches healbelowmin!):
+ *     - Stop R1 (ISR={L,R2}), flip R2 (held in ISR), flip R1 + persist SCRUB, start R1 -> R1 is DAMAGED & non-ISR
+ *       while healthy non-DAMAGED ISR == 1 < min_isr == 2 -> MUST NOT reset R1 (heal_blocked{why="below_min_isr"}==1).
+ *   Part 3 (3 replicas, min_isr=1, heal_cooldown_ms=500):
+ *     - Flip BOTH followers R1 and R2 at once -> healed strictly ONE AT A TIME (never 2 learners simultaneously),
+ *       last good copy L never reset, both lost dirs kept, all 3 equal.
+ *   Part 4 (3 replicas, min_isr=2, heal_cooldown_ms=3600000; catches healrepeat!):
+ *     - Flip R1 -> heals once (auto_resets{why="damaged"} == 1) -> immediately flip R1 again within 1 h cooldown ->
+ *       no 2nd reset during cooldown window (counter stays <= 1). */
+static void scen_scrubheal(void)
+{
+    const size_t nbatch = 70000;
+    int64_t *ts = malloc(nbatch * sizeof *ts);
+    float *vals = malloc(nbatch * sizeof *vals);
+    if (!ts || !vals)
+        die("scrubheal: malloc");
+    for (size_t k = 0; k < nbatch; k++) {
+        ts[k] = 100000 + (int64_t)k * 10;
+        vals[k] = (float)((k * 7) % 1000) * 0.25f;
+    }
+
+    /* ---- Part 1: follower heal, leader transfer+heal (catches healleader), no-candidate withhold ---- */
+    scenario("scrubheal-p1");
+    int mports[3] = {0};
+    init_min_isr = 2;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_cooldown_ms=500";
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("scrubheal: server %d reported no metrics port", i);
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+
+    uint32_t vnum = 0;
+    int rc;
+    if ((rc = vol_add(0, "sh1", 3, &vnum)) != 0 || vnum != 1)
+        die("scrubheal: vol_add sh1: %s num=%" PRIu32, cluster_strerror(rc), vnum);
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "sh1", i, 1, 0);
+    struct meta_volume v = {0};
+    if (!vol_rec(0, "sh1", &v) || v.min_isr != 2)
+        die("scrubheal: bad record for sh1");
+    int L = server_of(v.leader);
+    int R1 = (L + 1) % 3;
+    int R2 = (L + 2) % 3;
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, "sh1.s0", "sh1", 30000);
+    await_isr(L, "sh1", 3, 15000, "sh1 3/3 ISR");
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("scrubheal: large insert sh1: %s", ers(rc));
+    tsdbc_close(c);
+
+    char sdir[PATH_MAX + 80], vdir[PATH_MAX + 128], pname[128] = "";
+    for (int i = 0; i < 3; i++) {
+        server_dir(i, sdir, sizeof sdir);
+        snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+        uint64_t t0 = now_ms();
+        while (!find_first_part(vdir, pname, sizeof pname)) {
+            if (now_ms() - t0 > 15000)
+                die("scrubheal: server %d never got a .part file", i);
+            usleep(50000);
+        }
+    }
+    struct sh_digest ref_dig = sh_read_digest(L, id);
+    if (ref_dig.count != nbatch)
+        die("scrubheal: expected %zu rows on leader, got %" PRIu64, nbatch, ref_dig.count);
+
+    /* 1a. Flip a granule byte on follower R1 -> auto-reset -> snapshot -> rejoins ISR -> all 3 equal. */
+    if (!vol_rec(0, "sh1", &v))
+        die("scrubheal: vol_rec sh1 before follower flip");
+    uint64_t r1_oldrid = rep_of(&v, R1)->rid;
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    if (!find_first_part(vdir, pname, sizeof pname))
+        die("scrubheal: R1 has no .part");
+    flip_part_payload_byte(vdir, pname);
+
+    uint64_t r1_newrid = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 45000; usleep(100000)) {
+        if (vol_rec(0, "sh1", &v) && rep_of(&v, R1) && rep_of(&v, R1)->rid != r1_oldrid) {
+            r1_newrid = rep_of(&v, R1)->rid;
+            break;
+        }
+    }
+    if (!r1_newrid)
+        die("scrubheal: follower R1 (%d) was not automatically reset within 45 s", R1);
+    await_isr(0, "sh1", 3, 60000, "sh1 follower R1 rebuilt and rejoined ISR");
+
+    /* Verify v1.lost-<oldrid> was set aside and kept, and R1 health is back to OK. */
+    char lost[64];
+    snprintf(lost, sizeof lost, "v1.lost-%016" PRIx64, r1_oldrid);
+    if (!dir_has(R1, lost))
+        die("scrubheal: follower R1 (%d) missing preserved directory %s", R1, lost);
+    int r1_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(sh_raft_leader(3), ids[R1], 1) == CL_HEALTH_OK) {
+            r1_ok = 1;
+            break;
+        }
+    }
+    if (!r1_ok)
+        die("scrubheal: rebuilt follower R1 (%d) did not return to CL_HEALTH_OK", R1);
+
+    char mbuf[65536];
+    int rl = sh_raft_leader(3);
+    metrics_get(mports[rl], mbuf, sizeof mbuf);
+    int64_t c_dmg = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"damaged\"} ", &c_dmg) || c_dmg < 1)
+        die("scrubheal: Raft leader %d missing tsdb_cluster_auto_resets_total{why=\"damaged\"} >= 1 (got %" PRId64 ")",
+            rl, c_dmg);
+
+    sh_verify_all_replicas_equal(3, vnum, "sh1", id, ref_dig);
+
+    /* 1b. Flip a granule byte on the current leader -> planned transfer first, then reset & rebuild. */
+    if (!vol_rec(0, "sh1", &v))
+        die("scrubheal: vol_rec sh1 before leader flip");
+    L = server_of(v.leader);
+    uint64_t l_oldrid = rep_of(&v, L)->rid;
+    rl = sh_raft_leader(3);
+    metrics_get(mports[rl], mbuf, sizeof mbuf);
+    int64_t dmg_before_lead = 0;
+    (void)metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"damaged\"} ", &dmg_before_lead);
+    server_dir(L, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    pname[0] = '\0';
+    if (!find_first_part(vdir, pname, sizeof pname))
+        die("scrubheal: leader L (%d) has no .part", L);
+    flip_part_payload_byte(vdir, pname);
+
+    int moved_off_l = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 25000; usleep(100000)) {
+        rl = sh_raft_leader(3);
+        if (vol_rec(rl, "sh1", &v) && v.leader && v.leader != ids[L]) {
+            moved_off_l = 1;
+            break;
+        }
+        metrics_get(mports[rl], mbuf, sizeof mbuf);
+        int64_t dmg_now = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"damaged\"} ", &dmg_now) &&
+            dmg_now > dmg_before_lead && vol_rec(rl, "sh1", &v) && v.leader == ids[L])
+            die("scrubheal: auto-reset proposed while damaged leader L (%d) still leads (healleader)", L);
+    }
+    if (!moved_off_l)
+        die("scrubheal: damaged leader L (%d) was not transferred to a healthy ISR member within 25 s", L);
+
+    uint64_t l_newrid = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 45000; usleep(100000)) {
+        rl = sh_raft_leader(3);
+        if (vol_rec(rl, "sh1", &v) && rep_of(&v, L) && rep_of(&v, L)->rid != l_oldrid) {
+            l_newrid = rep_of(&v, L)->rid;
+            break;
+        }
+    }
+    if (!l_newrid)
+        die("scrubheal: former leader L (%d) was not reset after planned transfer", L);
+    await_isr(0, "sh1", 3, 60000, "sh1 former leader L rebuilt and rejoined ISR");
+
+    snprintf(lost, sizeof lost, "v1.lost-%016" PRIx64, l_oldrid);
+    if (!dir_has(L, lost))
+        die("scrubheal: former leader L (%d) missing preserved directory %s", L, lost);
+
+    rl = sh_raft_leader(3);
+    metrics_get(mports[rl], mbuf, sizeof mbuf);
+    int64_t c_xfer = -1;
+    if (!metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"leader_transfer\"} ", &c_xfer) || c_xfer < 1)
+        die("scrubheal: Raft leader %d missing leader_transfer counter >= 1 (got %" PRId64 ")", rl, c_xfer);
+
+    sh_verify_all_replicas_equal(3, vnum, "sh1", id, ref_dig);
+
+    /* 1c. DAMAGED leader with NO non-DAMAGED ISR member: transfer withheld, logged, blocked metric exposed. */
+    if (!vol_rec(0, "sh1", &v))
+        die("scrubheal: vol_rec sh1 before no-candidate check");
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    R2 = (L + 2) % 3;
+    stop(R2, SIGTERM);
+    await_isr(L, "sh1", 2, 20000, "sh1 ISR shrinks to {L, R1}");
+    /* Flip R1 (held in ISR because min_isr == 2), wait for Raft leader to observe R1 DAMAGED. */
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    pname[0] = '\0';
+    if (!find_first_part(vdir, pname, sizeof pname))
+        die("scrubheal: R1 has no .part for no-candidate check");
+    flip_part_payload_byte(vdir, pname);
+    int r1_dmg = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(sh_raft_leader(3), ids[R1], 1) == CL_HEALTH_DAMAGED) {
+            r1_dmg = 1;
+            break;
+        }
+    }
+    if (!r1_dmg)
+        die("scrubheal: R1 did not report CL_HEALTH_DAMAGED in no-candidate check");
+    /* Now flip leader L too -> neither ISR member is non-DAMAGED. */
+    uint64_t l_rid_nc = rep_of(&v, L)->rid;
+    server_dir(L, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    pname[0] = '\0';
+    if (!find_first_part(vdir, pname, sizeof pname))
+        die("scrubheal: L has no .part for no-candidate check");
+    flip_part_payload_byte(vdir, pname);
+    rl = sh_raft_leader(3);
+    await_log(rl, "with no non-DAMAGED ISR member; transfer withheld", 15000,
+              "Raft leader logged withheld transfer (no non-DAMAGED ISR candidate)");
+    int saw_nc_metric = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(100000)) {
+        metrics_get(mports[rl], mbuf, sizeof mbuf);
+        int64_t nc = -1, blk = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"no_candidate\"} ", &nc) && nc >= 1 &&
+            metrics_find_i64(mbuf, "\ntsdb_cluster_heal_blocked{volume=\"1\",why=\"no_candidate\"} ", &blk) &&
+            blk == 1) {
+            saw_nc_metric = 1;
+            break;
+        }
+    }
+    if (!saw_nc_metric)
+        die("scrubheal: missing no_candidate counter/blocked gauge on Raft leader %d", rl);
+    usleep(1000000);
+    if (!vol_rec(rl, "sh1", &v) || v.leader != ids[L] || rep_of(&v, L)->rid != l_rid_nc)
+        die("scrubheal: damaged leader moved or reset despite no non-DAMAGED ISR candidate");
+    stop_all();
+
+    /* ---- Part 2: remaining non-DAMAGED ISR < min_isr -> MUST NOT reset (catches healbelowmin!) ---- */
+    scenario("scrubheal-belowmin");
+    init_min_isr = 2;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_cooldown_ms=500";
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    want = 3;
+    await_view(0, p_voters, &want, "three voters (belowmin)");
+    vnum = 0;
+    if ((rc = vol_add(0, "shbm", 3, &vnum)) != 0 || vnum != 1)
+        die("scrubheal(belowmin): vol_add: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "shbm", i, 1, 0);
+    if (!vol_rec(0, "shbm", &v) || v.min_isr != 2)
+        die("scrubheal(belowmin): bad record");
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    R2 = (L + 2) % 3;
+    c = client(L);
+    id = rep_series(c, "shbm.s0", "shbm", 30000);
+    await_isr(L, "shbm", 3, 15000, "shbm 3/3 ISR");
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("scrubheal(belowmin): insert: %s", ers(rc));
+    tsdbc_close(c);
+
+    char p1[128] = "", p2[128] = "";
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    for (uint64_t t0 = now_ms(); !find_first_part(vdir, p1, sizeof p1); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(belowmin): R1 never got .part");
+    char r2sdir[PATH_MAX + 80], r2vdir[PATH_MAX + 128];
+    server_dir(R2, r2sdir, sizeof r2sdir);
+    snprintf(r2vdir, sizeof r2vdir, "%s/v1", r2sdir);
+    for (uint64_t t0 = now_ms(); !find_first_part(r2vdir, p2, sizeof p2); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(belowmin): R2 never got .part");
+
+    /* Stop R1 -> ISR = {L, R2}. Flip R2 -> R2 reports DAMAGED and stays in ISR (min_isr=2). */
+    stop(R1, SIGTERM);
+    await_isr(L, "shbm", 2, 20000, "shbm ISR shrinks to {L, R2}");
+    flip_part_payload_byte(r2vdir, p2);
+    int r2_dmg = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(sh_raft_leader(3), ids[R2], 1) == CL_HEALTH_DAMAGED) {
+            r2_dmg = 1;
+            break;
+        }
+    }
+    if (!r2_dmg)
+        die("scrubheal(belowmin): R2 did not report CL_HEALTH_DAMAGED");
+
+    /* Flip R1 while stopped and write v1/SCRUB so scrubd_preload marks R1 DAMAGED from boot before repld connects. */
+    if (!vol_rec(L, "shbm", &v))
+        die("scrubheal(belowmin): vol_rec before R1 start");
+    uint64_t bm_r1_rid = rep_of(&v, R1)->rid;
+    flip_part_payload_byte(vdir, p1);
+    sh_write_damaged_scrub(R1, 1, p1);
+    start(R1);
+    mports[R1] = th_mport;
+
+    /* Wait for Raft leader to observe R1 DAMAGED (out of ISR) while good_isr == 1 < min_isr == 2. */
+    int saw_r1_bm = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        rl = sh_raft_leader(3);
+        if (vol_rec(rl, "shbm", &v) && rep_of(&v, R1)->rid != bm_r1_rid)
+            die("scrubheal(belowmin): reset R1 while healthy non-DAMAGED ISR < min_isr (healbelowmin)");
+        if (vol_health_in_status(rl, ids[R1], 1) == CL_HEALTH_DAMAGED) {
+            saw_r1_bm = 1;
+            break;
+        }
+    }
+    if (!saw_r1_bm)
+        die("scrubheal(belowmin): R1 did not report CL_HEALTH_DAMAGED after restart");
+
+    /* Hold 2.5 s: R1 must NOT be reset, blocked gauge must be 1, auto_resets{why="damaged"} must remain 0. */
+    int saw_bm_metric = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 2500; usleep(100000)) {
+        rl = sh_raft_leader(3);
+        if (!vol_rec(rl, "shbm", &v) || rep_of(&v, R1)->rid != bm_r1_rid)
+            die("scrubheal(belowmin): reset R1 while healthy non-DAMAGED ISR < min_isr (healbelowmin)");
+        metrics_get(mports[rl], mbuf, sizeof mbuf);
+        int64_t dm = -1, bm = -1, blk = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"damaged\"} ", &dm) && dm != 0)
+            die("scrubheal(belowmin): auto_resets_total{why=\"damaged\"} = %" PRId64 " != 0 (healbelowmin)", dm);
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"below_min_isr\"} ", &bm) && bm >= 1 &&
+            metrics_find_i64(mbuf, "\ntsdb_cluster_heal_blocked{volume=\"1\",why=\"below_min_isr\"} ", &blk) &&
+            blk == 1)
+            saw_bm_metric = 1;
+    }
+    if (!saw_bm_metric)
+        die("scrubheal(belowmin): missing below_min_isr counter/blocked gauge");
+    stop_all();
+
+    /* ---- Part 3: two replicas DAMAGED at once (min_isr=1) -> healed one at a time, last good copy never reset ---- */
+    scenario("scrubheal-two");
+    init_min_isr = 1;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "heal_cooldown_ms=500";
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    want = 3;
+    await_view(0, p_voters, &want, "three voters (two-damaged)");
+    vnum = 0;
+    if ((rc = vol_add(0, "sh2", 3, &vnum)) != 0 || vnum != 1)
+        die("scrubheal(two): vol_add: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "sh2", i, 1, 0);
+    if (!vol_rec(0, "sh2", &v) || v.min_isr != 1)
+        die("scrubheal(two): bad record");
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    R2 = (L + 2) % 3;
+    c = client(L);
+    id = rep_series(c, "sh2.s0", "sh2", 30000);
+    await_isr(L, "sh2", 3, 15000, "sh2 3/3 ISR");
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("scrubheal(two): insert: %s", ers(rc));
+    tsdbc_close(c);
+    ref_dig = sh_read_digest(L, id);
+
+    p1[0] = p2[0] = '\0';
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    for (uint64_t t0 = now_ms(); !find_first_part(vdir, p1, sizeof p1); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(two): R1 never got .part");
+    server_dir(R2, r2sdir, sizeof r2sdir);
+    snprintf(r2vdir, sizeof r2vdir, "%s/v1", r2sdir);
+    for (uint64_t t0 = now_ms(); !find_first_part(r2vdir, p2, sizeof p2); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(two): R2 never got .part");
+
+    if (!vol_rec(0, "sh2", &v))
+        die("scrubheal(two): vol_rec before dual flip");
+    uint64_t l_rid0 = rep_of(&v, L)->rid;
+    uint64_t r1_rid0 = rep_of(&v, R1)->rid;
+    uint64_t r2_rid0 = rep_of(&v, R2)->rid;
+
+    flip_part_payload_byte(vdir, p1);
+    flip_part_payload_byte(r2vdir, p2);
+
+    int both_healed = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 90000; usleep(100000)) {
+        rl = sh_raft_leader(3);
+        if (!vol_rec(rl, "sh2", &v))
+            continue;
+        if (rep_of(&v, L)->rid != l_rid0)
+            die("scrubheal(two): last good copy L (%d) was reset!", L);
+        int nlearn = 0;
+        for (uint32_t k = 0; k < v.nrep; k++)
+            nlearn += v.rep[k].learner != 0;
+        if (nlearn > 1)
+            die("scrubheal(two): %d replicas rebuilding simultaneously (must heal one at a time)", nlearn);
+        if (rep_of(&v, R1)->rid != r1_rid0 && rep_of(&v, R2)->rid != r2_rid0 && v.nisr == 3) {
+            both_healed = 1;
+            break;
+        }
+    }
+    if (!both_healed)
+        die("scrubheal(two): both damaged followers did not heal and rejoin ISR within 90 s");
+    snprintf(lost, sizeof lost, "v1.lost-%016" PRIx64, r1_rid0);
+    if (!dir_has(R1, lost))
+        die("scrubheal(two): R1 missing %s", lost);
+    snprintf(lost, sizeof lost, "v1.lost-%016" PRIx64, r2_rid0);
+    if (!dir_has(R2, lost))
+        die("scrubheal(two): R2 missing %s", lost);
+    sh_verify_all_replicas_equal(3, vnum, "sh2", id, ref_dig);
+    stop_all();
+
+    /* ---- Part 4: per-volume cooldown window prevents repeat reset storm (catches healrepeat!) ---- */
+    scenario("scrubheal-cooldown");
+    init_min_isr = 2;
+    for (int i = 0; i < 3; i++) {
+        /* Large cooldown (1 h) so slow/TSan runs never outrun the window; healrepeat skips it and fires at once. */
+        envs[i] = "heal_cooldown_ms=3600000";
+        penv[i] = "TSDB_SCRUB_TEST=interval_ms=50";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+    }
+    init_cluster(0, 600);
+    init_min_isr = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    want = 3;
+    await_view(0, p_voters, &want, "three voters (cooldown)");
+    vnum = 0;
+    if ((rc = vol_add(0, "shcd", 3, &vnum)) != 0 || vnum != 1)
+        die("scrubheal(cooldown): vol_add: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "shcd", i, 1, 0);
+    if (!vol_rec(0, "shcd", &v) || v.min_isr != 2)
+        die("scrubheal(cooldown): bad record");
+    L = server_of(v.leader);
+    R1 = (L + 1) % 3;
+    c = client(L);
+    id = rep_series(c, "shcd.s0", "shcd", 30000);
+    await_isr(L, "shcd", 3, 15000, "shcd 3/3 ISR");
+    if ((rc = tsdbc_insert_series(c, id, ts, vals, nbatch)) != 0)
+        die("scrubheal(cooldown): insert: %s", ers(rc));
+    tsdbc_close(c);
+
+    server_dir(R1, sdir, sizeof sdir);
+    snprintf(vdir, sizeof vdir, "%s/v1", sdir);
+    pname[0] = '\0';
+    for (uint64_t t0 = now_ms(); !find_first_part(vdir, pname, sizeof pname); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(cooldown): R1 never got .part");
+
+    if (!vol_rec(0, "shcd", &v))
+        die("scrubheal(cooldown): vol_rec before flip 1");
+    uint64_t cd_rid0 = rep_of(&v, R1)->rid;
+    flip_part_payload_byte(vdir, pname);
+
+    /* Wait for first heal to complete. */
+    uint64_t cd_rid1 = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 45000; usleep(100000)) {
+        if (vol_rec(0, "shcd", &v) && rep_of(&v, R1)->rid != cd_rid0) {
+            cd_rid1 = rep_of(&v, R1)->rid;
+            break;
+        }
+    }
+    if (!cd_rid1)
+        die("scrubheal(cooldown): first auto-reset of R1 did not happen");
+    await_isr(0, "shcd", 3, 60000, "shcd R1 rebuilt after first flip");
+    int cd_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        if (vol_health_in_status(sh_raft_leader(3), ids[R1], 1) == CL_HEALTH_OK) {
+            cd_ok = 1;
+            break;
+        }
+    }
+    if (!cd_ok)
+        die("scrubheal(cooldown): rebuilt R1 did not return to CL_HEALTH_OK");
+
+    /* Immediately flip R1 a second time (well within the 1 h cooldown window). */
+    pname[0] = '\0';
+    for (uint64_t t0 = now_ms(); !find_first_part(vdir, pname, sizeof pname); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("scrubheal(cooldown): R1 has no .part after first rebuild");
+    flip_part_payload_byte(vdir, pname);
+
+    /* Wait for R1 to report DAMAGED and leave ISR again (catching an immediate repeat reset under healrepeat). */
+    int second_left = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(50000)) {
+        rl = sh_raft_leader(3);
+        if (vol_rec(rl, "shcd", &v) && rep_of(&v, R1)->rid != cd_rid1)
+            die("scrubheal(cooldown): R1 was reset again during cooldown window (healrepeat)");
+        uint32_t nisr = 0;
+        if (vol_health_in_status(rl, ids[R1], 1) == CL_HEALTH_DAMAGED && node_in_isr(L, "shcd", ids[R1], &nisr) == 0) {
+            second_left = 1;
+            break;
+        }
+    }
+    if (!second_left)
+        die("scrubheal(cooldown): R1 did not report DAMAGED and leave ISR on second flip");
+
+    /* Hold 2.5 s (still inside 1 h cooldown): NO second reset may fire; counter MUST stay <= 1! */
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 2500; usleep(100000)) {
+        rl = sh_raft_leader(3);
+        if (!vol_rec(rl, "shcd", &v) || rep_of(&v, R1)->rid != cd_rid1)
+            die("scrubheal(cooldown): R1 was reset again during cooldown window (healrepeat)");
+        metrics_get(mports[rl], mbuf, sizeof mbuf);
+        int64_t dm = -1;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_auto_resets_total{why=\"damaged\"} ", &dm) && dm > 1)
+            die("scrubheal(cooldown): reset storm counter %" PRId64 " > 1 within cooldown (healrepeat)", dm);
+    }
+
+    stop_all();
+    free(ts);
+    free(vals);
+    for (int i = 0; i < 3; i++) {
+        envs[i] = NULL;
+        penv[i] = NULL;
+        xargs[i] = NULL;
+    }
+    printf("  scrubheal: follower auto-reset+snapshot+equal; leader planned transfer+reset+equal; no-candidate withheld; "
+           "below-min_isr withheld; dual damage healed one-at-a-time keeping last good copy; cooldown rate-limit held\n");
 }
 
 
@@ -26622,7 +27279,7 @@ int main(int argc, char **argv)
                {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild},
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
-               {"youngscrub", scen_youngscrub}};
+               {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

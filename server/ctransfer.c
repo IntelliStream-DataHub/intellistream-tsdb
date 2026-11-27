@@ -496,8 +496,12 @@ static void balance(uint64_t now)
         if (b && now < b->until)
             continue;
         int busy = ctr_mutant() != CTM_NOBUSY && (busy_server(pref) || busy_server(v->leader));
-        const char *no = busy ? "a transfer of its server is under way"
-                         : tr_check(v, pref, now);
+        uint64_t pref_rid = 0;
+        int pref_dmg = cl_vol_health(pref, v->number, now, &pref_rid) == CL_HEALTH_DAMAGED &&
+                       (!pref_rid || !v->rep[0].rid || pref_rid == v->rep[0].rid);
+        const char *no = busy       ? "a transfer of its server is under way"
+                         : pref_dmg ? "the preferred leader is damaged"
+                                    : tr_check(v, pref, now);
         if (no) {
             if (no != c->why)
                 cl_say("leader balance: volume %" PRIu32 " stays on node %" PRIu32 " for now: %s", v->number,

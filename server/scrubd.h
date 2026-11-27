@@ -27,4 +27,8 @@ int scrubd_vol_damaged(uint32_t vol);
  * would drop below min_isr, 0 otherwise. Exported as tsdb_young_scrub_min_isr_held{volume}. */
 void scrubd_set_min_isr_held(uint32_t vol, int held);
 
+/* Clears in-memory damage and cached progress for `vol` when its directory is reset, removed, or replaced by a
+ * snapshot install, so the fresh replica never advertises stale CL_HEALTH_DAMAGED before scrubd notices the new inode. */
+void scrubd_vol_reset(uint32_t vol);
+
 #endif /* TSDBD_SCRUBD_H */

@@ -8430,6 +8430,7 @@ static void leader_duties(uint64_t now)
     promote_duty(now);
     ctr_duty(now); /* R4: transfers, moves (cluster_int.h; each checks cl_leading itself) */
     cmove_duty(now);
+    cheal_duty(now); /* R12 (D8): automatic transfer/reset for DAMAGED replicas */
     if (C.volcmd_file && cl_leading())
         volcmd_file_send();
     if (C.setop_file && cl_leading())
@@ -8977,7 +8978,9 @@ int cluster_start(const struct cluster_cfg *cfg)
     g_gasp_running = 1;
     pthread_mutex_unlock(&g_gasp_mu);
     (void)creport_progress_register();
+    cheal_start();
     if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
+        cheal_stop();
         pthread_mutex_lock(&g_gasp_mu);
         g_gasp_running = 0;
         pthread_mutex_unlock(&g_gasp_mu);
@@ -9006,6 +9009,8 @@ int cluster_start(const struct cluster_cfg *cfg)
     return 0;
 }
 
+static int g_vh_valid;
+
 void cluster_stop(void)
 {
     if (!C.running)
@@ -9018,6 +9023,8 @@ void cluster_stop(void)
     ssize_t w = write(C.stop_pipe[1], "x", 1);
     (void)w;
     pthread_join(C.th, NULL);
+    cheal_stop();
+    g_vh_valid = 0;
     if (C.fill_th_on) {
         pthread_mutex_lock(&g_fill_mu);
         g_fill_stop = 1;
@@ -9108,6 +9115,44 @@ int cl_lose_ready(void) { return C.lose_ready && access(C.losereadyfile, F_OK) =
 const char *cl_leader_peer(void) { return leader_peer(); }
 
 const struct meta_state *cl_meta(void) { return &C.sm; }
+
+int cl_leader_settled(uint64_t now) { return leader_settled(now); }
+
+int cl_vol_health(uint32_t node, uint32_t vol, uint64_t now, uint64_t *rid_out)
+{
+    static struct cluster_report own;
+    static uint64_t own_now;
+    if (rid_out)
+        *rid_out = 0;
+    if (node == C.id) {
+        if (!g_vh_valid || own_now != now) {
+            memset(&own, 0, sizeof own);
+            if (g_reporter)
+                g_reporter(g_reporter_arg, &own);
+            own_now = now;
+            g_vh_valid = 1;
+        }
+        for (uint32_t j = 0; j < own.nvols && j < CLUSTER_REPORT_VOLS; j++) {
+            if (own.vols[j].volume == vol) {
+                if (rid_out)
+                    *rid_out = own.vols[j].rid;
+                return (int)own.vols[j].health;
+            }
+        }
+        return -1;
+    }
+    if (!heard_fresh(node, now))
+        return -1;
+    const struct heard *h = heard_get(node);
+    for (uint32_t j = 0; h && j < h->nvols; j++) {
+        if (h->vols[j].v.volume == vol) {
+            if (rid_out)
+                *rid_out = h->vols[j].v.rid;
+            return (int)h->vols[j].v.health;
+        }
+    }
+    return -1;
+}
 
 int cl_heard_fresh(uint32_t id, uint64_t now) { return heard_fresh(id, now); }
 

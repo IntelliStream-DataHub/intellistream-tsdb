@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /*
- * What R4's files on the Raft leader's side (server/ctransfer.c, cmove.c, cset.c) need of cluster.c, and their entry
- * points, which cluster.c calls. Everything here runs on the cluster thread only (the admin ops, the duty round, the
- * frames), as cluster.c's own state is that thread's; nothing here takes a lock.
+ * What R4/R9/R12's files on the Raft leader's side (server/ctransfer.c, cmove.c, cset.c, cnode.c, cheal.c) need of
+ * cluster.c, and their entry points, which cluster.c calls. Everything here runs on the cluster thread only (the admin
+ * ops, the duty round, the frames), as cluster.c's own state is that thread's; only cheal.c takes a private leaf lock
+ * (g_blk_mu) to publish its blocked-volume snapshot to the metrics collector thread.
  */
 #ifndef TSDB_CLUSTER_INT_H
 #define TSDB_CLUSTER_INT_H
@@ -27,6 +28,11 @@ const char *cl_leader_peer(void);
 const struct meta_state *cl_meta(void);
 /* 1 if member `id` was heard within the node timeout (this server: always) */
 int cl_heard_fresh(uint32_t id, uint64_t now);
+/* 1 once this Raft leader has held leadership long enough to have heard all live members and outlast prior leases */
+int cl_leader_settled(uint64_t now);
+/* Reported health (enum cluster_vol_health) of `vol` on `node` from HBS_VOLUMES (or local reporter when node == self),
+ * or -1 if `node` is not heard fresh or does not report `vol`. If rid_out != NULL, stores the reported replica rid. */
+int cl_vol_health(uint32_t node, uint32_t vol, uint64_t now, uint64_t *rid_out);
 /* proposes `e` to the group (the leader only): 0 queued (applied later, through the watch), else CLUSTER_ERR_RETRY */
 int cl_propose(struct meta_entry *e);
 /* proposes `e` (and frees it) on behalf of an admin op: once applied, replies to (conn, reqid) with ok_text (if rc0 == 0)
@@ -95,8 +101,14 @@ void cmove_counts(unsigned long *started, unsigned long *done, unsigned long *ca
 void cmove_trace(const struct meta_state *sm, uint64_t index, const char *path);
 /* server/cset.c (r4-setchg): CLUSTER_OP_REPLICA_RESET */
 void cset_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+/* a fresh non-zero replica rid distinct from every current replica of `v` */
+uint64_t cset_fresh_rid(const struct meta_volume *v);
 /* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes the REPLICA_ADD/REMOVE/RESET lines of <state-dir>/setop */
 void cset_setop_file(const char *path);
+/* server/cheal.c (R12, r12-heal; PLAN.md D8): automatic REPLICA_RESET and planned leader transfer for DAMAGED replicas */
+void cheal_start(void);
+void cheal_stop(void);
+void cheal_duty(uint64_t now);
 /* server/cnode.c (R9, r9-ops): CLUSTER_OP_NODE_* and CLUSTER_OP_VOLUME_MOVE_POS on the Raft leader */
 void cnode_hold_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cnode_out_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);

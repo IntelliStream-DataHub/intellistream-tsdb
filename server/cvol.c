@@ -176,6 +176,8 @@ static void prepare(const struct cluster_vol_rec *r)
         memcpy(fr.cluster, r->cluster, 16);
         int prc = cvolfs_prepare(M.dir, &fr, &o);
         if (prc == 0) {
+            if (r->open_gen == 0)
+                scrubd_vol_reset(r->number); /* fresh/reset directory: clear any preloaded damage from set-aside dir */
             m.rid = o.rid;
             m.gen = o.gen;
             m.nonce = o.nonce;
@@ -285,6 +287,7 @@ static int forget(uint32_t number, int st)
 {
     if (st != MV_NONE && cvolset_close(number) != 0)
         return st;
+    scrubd_vol_reset(number);
     pthread_mutex_lock(&M.mu);
     struct mvol *m = mv_get(number);
     if (m)
@@ -629,6 +632,8 @@ int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, i
                                        * closed: no read of the old copy */
     pthread_mutex_unlock(&M.op);
     int rc = fn(ctx, &id, st == MV_OPEN, log_end); /* fn leaves nothing of the copy for after the hand-back below */
+    if (rc == 0)
+        scrubd_vol_reset(v);
     pthread_mutex_lock(&M.op);
     pthread_mutex_lock(&M.mu);
     if ((m = mv_get(v)) != NULL) {

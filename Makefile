@@ -666,7 +666,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild \
-    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1072,7 +1072,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1160,6 +1160,8 @@ $(B)/cmove.o: server/cmove.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/cset.o: server/cset.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+$(B)/cheal.o: server/cheal.c $(R4_CL_HDR) server/creport.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # R9's pure planners, fill/reconcile/pace workers, and operator admin handlers (r9-iface stubs until owning tracks land)
 R9_PLACE_HDR := server/place.h server/meta.h
 $(B)/place.o: server/place.c $(R9_PLACE_HDR) | $(B)
@@ -1177,7 +1179,7 @@ $(B)/pace.o: server/pace.c server/pace.h src/compat.h | $(B)
 $(B)/cnode.o: server/cnode.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 R9_OBJ := $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/sfill.o $(B)/sreconcile.o $(B)/pace.o $(B)/cnode.o
-CLUSTER_OBJ := $(B)/creport.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/creport.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(B)/cheal.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
 # R9 placement simulator (tests/sim_place.c, docs/design-cluster-data.md §10.2): stub main until r9-simplace fills it in
 $(B)/sim_place: tests/sim_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/sim_place.c $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
@@ -1306,6 +1308,10 @@ report-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 progress-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	$(MUT) --name progress --uring --list "progressfrozen progressnototal" -- env TSDB_PROGRESS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ progress
+# r12-heal: automatic damage-heal planted bugs in server/cheal.c (TSDB_CLUSTER_MUTANT), each must fail test_cluster scrubheal
+heal-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	$(MUT) --name heal --uring --list "healleader healbelowmin healrepeat" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ scrubheal
 # r8f + r8n: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail
 # test_cluster ecbasic or ecslow (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
