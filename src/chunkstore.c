@@ -1181,7 +1181,11 @@ static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, 
         chunk_store_unref(w->st);
         free(w->sums);
         free(w);
-        return e == ENOSPC ? CHUNK_ERR_FULL : TSDB_ERR_IO;
+        if (e == ENOSPC || e == EDQUOT)
+            return CHUNK_ERR_FULL;
+        if (e == EMFILE || e == ENFILE || e == ENOMEM)
+            return TSDB_ERR_NOMEM;
+        return TSDB_ERR_IO;
     }
     rc = wr_full(w->fd, w->hdr, CHUNK_HDR_BYTES);
     if (rc) {

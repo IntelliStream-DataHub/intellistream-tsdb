@@ -39,6 +39,7 @@
 #include "disks.h"
 #include "harness.h"
 #include "meta.h"
+#include "outagefs_ctl.h"
 #include "peerlink.h"
 #include "place.h"
 #include "plrdma.h"
@@ -627,7 +628,7 @@ static void stop_all(void)
 }
 
 static uint32_t init_rebuild_after_s, init_failstop_out_s, init_opening_hold_s, init_out_guard_pct,
-    init_out_guard_hold_s, init_voters; /* r9-out / r9-ops scenarios (0: default) */
+    init_out_guard_hold_s, init_voters, init_disk_stall_s; /* r9-out / r9-ops / r13-fault scenarios (0: default) */
 
 static void scenario(const char *name)
 {
@@ -648,6 +649,7 @@ static void scenario(const char *name)
     init_out_guard_pct = 0;
     init_out_guard_hold_s = 0;
     init_voters = 0;
+    init_disk_stall_s = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     memset(no_auto_disk, 0, sizeof no_auto_disk);
@@ -894,6 +896,8 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.out_guard_hold_s = init_out_guard_hold_s;
     if (init_voters)
         s.voters = init_voters;
+    if (init_disk_stall_s)
+        s.disk_stall_s = init_disk_stall_s;
     if (init_r4_set) {
         s.rebuild_mb_s = 300;
         s.rebuild_max = 3;
@@ -10404,6 +10408,39 @@ static const char *crashfs_skip(const char **so)
         die("no %s (make build/libcrashfs.so): the scenario cannot run, and must not pass as skipped", *so);
 #else
         return "no libcrashfs.so";
+#endif
+    }
+    return NULL;
+}
+
+static const char *outagefs_skip(const char **so)
+{
+    static char derived[PATH_MAX];
+    const char *env = getenv("OUTAGEFS_LIB");
+    if (env && *env) {
+        *so = env;
+    } else {
+        const char *bin = getenv("TSDBD");
+        const char *sl = bin ? strrchr(bin, '/') : NULL;
+        if (sl && (size_t)(sl - bin) + 20 < sizeof derived) {
+            snprintf(derived, sizeof derived, "%.*s/liboutagefs.so", (int)(sl - bin), bin);
+            *so = derived;
+        } else {
+            *so = "./build/liboutagefs.so";
+        }
+    }
+#if defined(__SANITIZE_ADDRESS__)
+    return "outagefs cannot be preloaded into an AddressSanitizer build";
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    return "outagefs cannot be preloaded into an AddressSanitizer build";
+#endif
+#endif
+    if (access(*so, F_OK) != 0) {
+#ifdef __linux__
+        die("no %s (make build/liboutagefs.so): the scenario cannot run, and must not pass as skipped", *so);
+#else
+        return "no liboutagefs.so";
 #endif
     }
     return NULL;
@@ -30656,6 +30693,631 @@ static void scen_twodisks(void)
     stop_all();
 }
 
+/* Helpers for r13-fault scenarios (diskstall, diskeio). */
+static int disk_status_has(int srv, uint32_t node_id, const uint8_t store_id[16], const char *want_state)
+{
+    struct view vw;
+    view(srv, &vw);
+    int L = leader_index(&vw);
+    if (L >= 0 && L != srv) {
+        view_free(&vw);
+        view(L, &vw);
+    }
+    char hex[33], want[160], st_needle[64];
+    chunk_oid_hex(store_id, hex);
+    snprintf(want, sizeof want, "disk node=%" PRIu32 " id=%s ", node_id, hex);
+    snprintf(st_needle, sizeof st_needle, " state=%s ", want_state);
+    int found = 0;
+    for (uint32_t i = 0; i < vw.st.nheard && !found; i++) {
+        if (vw.st.heard[i].id != node_id || !vw.st.heard[i].sections)
+            continue;
+        const char *p = strstr(vw.st.heard[i].sections, want);
+        if (!p)
+            continue;
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char line[512];
+        if (len >= sizeof line)
+            len = sizeof line - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        if (strstr(line, st_needle))
+            found = 1;
+    }
+    view_free(&vw);
+    return found;
+}
+
+static int disk_metric_state(int mport, const uint8_t store_id[16], const char *cls, int64_t *val_out)
+{
+    char mbuf[65536], hex[33], needle[160];
+    metrics_get(mport, mbuf, sizeof mbuf);
+    chunk_oid_hex(store_id, hex);
+    snprintf(needle, sizeof needle, "\ntsdb_disk_state{store=\"%s\",class=\"%s\"} ", hex, cls);
+    return metrics_find_i64(mbuf, needle, val_out);
+}
+
+static int count_chunk_files_in(const char *disk_path, uint32_t vol)
+{
+    char dir[PATH_MAX + 64];
+    snprintf(dir, sizeof dir, "%s/chunks/s%" PRIu32, disk_path, vol);
+    DIR *d = opendir(dir);
+    if (!d)
+        return 0;
+    int cnt = 0;
+    for (struct dirent *de; (de = readdir(d)) != NULL;) {
+        size_t l = strlen(de->d_name);
+        if (l > 6 && strcmp(de->d_name + l - 6, ".chunk") == 0)
+            cnt++;
+    }
+    closedir(d);
+    return cnt;
+}
+
+static void r13_transfer_leader(int admin_srv, uint32_t vnum, const char *vname, int target_srv)
+{
+    struct meta_volume mv;
+    if (vol_rec(admin_srv, vname, &mv) && mv.leader == ids[target_srv])
+        return;
+    uint8_t tbody[8], *treply = NULL;
+    size_t trlen = 0, tblen = cluster_volume_force_encode(vnum, ids[target_srv], tbody);
+    int rc;
+    for (uint64_t t0 = now_ms();
+         (rc = admin(admin_srv, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen)) != 0; usleep(150000)) {
+        if ((rc != CLUSTER_ERR_STATE && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("transfer %s to server %d: %s (%.*s)", vname, target_srv, cluster_strerror(rc), (int)trlen,
+                treply ? (const char *)treply : "");
+        free(treply);
+        treply = NULL;
+    }
+    free(treply);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(admin_srv, vname, &mv) && mv.leader == ids[target_srv])
+            break;
+        if (now_ms() - t0 > 30000)
+            die("transfer %s to server %d did not complete in 30 s", vname, target_srv);
+    }
+}
+
+/* R13 (r13-fault; E57, §15.6, PLAN.md D16): outagefs `hang` on one of node 0's two NVMe disks holding a leader ->
+ * leader resigns within disk_stall_s + failover (measured), writes proceed through the new leader, node 0 stays alive
+ * serving its other NVMe volume and healthy HDD store; `heal` -> disk returns UP, volumes reopen from disk (higher
+ * open_gen, never retried fsync) and rejoin ISR with all rows intact (mutants: stallexit, stallnoresign). */
+static void scen_diskstall(void)
+{
+    scenario("diskstall");
+    const char *so, *skip = outagefs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+
+    char d0a[PATH_MAX], d0b[PATH_MAX], h0[PATH_MAX], ctl[104];
+    snprintf(d0a, sizeof d0a, "%s/n0_nvme0", base);
+    snprintf(d0b, sizeof d0b, "%s/n0_nvme1", base);
+    snprintf(h0, sizeof h0, "%s/n0_hdd0", base);
+    disk_make(d0a, "nvme");
+    disk_make(d0b, "nvme");
+    disk_make(h0, "hdd");
+    disk_meta dm_a, dm_b, dm_h;
+    if (disk_load(d0a, &dm_a) != 0 || disk_load(d0b, &dm_b) != 0 || disk_load(h0, &dm_h) != 0)
+        die("diskstall: disk_load failed");
+
+    int unlink_ctl = 0;
+    if ((size_t)snprintf(ctl, sizeof ctl, "%s/ofs.ctl", base) >= sizeof ctl - 4) {
+        snprintf(ctl, sizeof ctl, "/tmp/tsdb-ds-%d.ctl", (int)getpid());
+        unlink_ctl = 1;
+    }
+    unlink(ctl);
+
+    static char xa0[PATH_MAX * 3 + 128];
+    static char pe0[PATH_MAX * 4 + 256];
+    no_auto_disk[0] = 1;
+    omit_dir[0] = 1;
+    snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:nvme --disk %s:hdd --metrics-port auto", d0a, d0b, h0);
+    /* Do NOT override down= in TSDBD_TEST_HEALTH so the cluster's real disk_stall_s=2 governs DOWN timing. */
+    snprintf(pe0, sizeof pe0,
+             "LD_PRELOAD=%s OUTAGEFS_ROOTS=%s:%s:%s OUTAGEFS_CTL=%s "
+             "TSDBD_TEST_HEALTH=read=200,write=300,recover=1000,fast=500",
+             so, d0a, d0b, h0, ctl);
+    xargs[0] = xa0;
+    penv[0] = pe0;
+    xargs[1] = "--metrics-port auto";
+    xargs[2] = "--metrics-port auto";
+
+    init_disk_stall_s = 2;
+    start(0);
+    int mport0 = th_mport;
+    pid_t pid0 = pids[0];
+    start(1);
+    start(2);
+    init_cluster(0, 600);
+    init_disk_stall_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "diskstall: three voters");
+
+    struct disks_want w0 = {ids[0], 3, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "diskstall: node 0 STORE_ADD (2 nvme + 1 hdd)");
+
+    /* Wait until outagefs control socket is ready. */
+    char cout[256];
+    for (uint64_t t0 = now_ms(); outagefs_cmd(ctl, "state", cout, sizeof cout) != 0; usleep(50000))
+        if (now_ms() - t0 > 10000)
+            die("diskstall: outagefs control socket %s not ready", ctl);
+
+    /* Create replicated volumes until node 0 has one on d0a (va) and one on d0b (vb). */
+    char va_name[32] = "", vb_name[32] = "";
+    uint32_t va_num = 0, vb_num = 0;
+    for (int k = 0; k < 4 && (!va_num || !vb_num); k++) {
+        char vn[32];
+        snprintf(vn, sizeof vn, "ds%d", k + 1);
+        uint32_t num = 0;
+        int rc = vol_add(0, vn, 3, &num);
+        if (rc != 0)
+            die("diskstall: vol_add %s: %s", vn, cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, vn, i, 1, 0);
+        await_isr(0, vn, 3, 30000, "diskstall: volume ISR=3");
+        char pa[PATH_MAX + 32], pb[PATH_MAX + 32];
+        snprintf(pa, sizeof pa, "%s/v%" PRIu32, d0a, num);
+        snprintf(pb, sizeof pb, "%s/v%" PRIu32, d0b, num);
+        if (!va_num && access(pa, F_OK) == 0) {
+            va_num = num;
+            snprintf(va_name, sizeof va_name, "%s", vn);
+        } else if (!vb_num && access(pb, F_OK) == 0) {
+            vb_num = num;
+            snprintf(vb_name, sizeof vb_name, "%s", vn);
+        }
+    }
+    if (!va_num || !vb_num)
+        die("diskstall: expected one volume on d0a and one on d0b (va=%" PRIu32 ", vb=%" PRIu32 ")", va_num, vb_num);
+
+    /* Ensure node 0 leads both va (on d0a) and vb (on d0b). */
+    r13_transfer_leader(0, va_num, va_name, 0);
+    r13_transfer_leader(0, vb_num, vb_name, 0);
+    await_isr(0, va_name, 3, 30000, "diskstall: va ISR=3 on node 0");
+    await_isr(0, vb_name, 3, 30000, "diskstall: vb ISR=3 on node 0");
+
+    /* Create series and write initial rows to both volumes on node 0. */
+    tsdbc *c0 = client(0);
+    uint64_t sid_a = rep_series(c0, "ds.a", va_name, 30000);
+    uint64_t sid_b = rep_series(c0, "ds.b", vb_name, 30000);
+    int64_t ts_init[3] = {1000, 2000, 3000};
+    float val_init[3] = {1.0f, 2.0f, 3.0f};
+    int rc;
+    if ((rc = tsdbc_insert_series(c0, sid_a, ts_init, val_init, 3)) != 0)
+        die("diskstall: initial insert va: %s", ers(rc));
+    if ((rc = tsdbc_insert_series(c0, sid_b, ts_init, val_init, 3)) != 0)
+        die("diskstall: initial insert vb: %s", ers(rc));
+    tsdbc_close(c0);
+
+    struct meta_volume mva0;
+    if (!vol_rec(1, va_name, &mva0))
+        die("diskstall: no record of %s", va_name);
+    uint64_t e0 = mva0.epoch;
+    uint64_t og0 = 0;
+    for (uint32_t k = 0; k < mva0.nrep; k++)
+        if (mva0.rep[k].node == ids[0])
+            og0 = mva0.rep[k].open_gen;
+    if (!og0)
+        die("diskstall: node 0 open_gen for %s is 0", va_name);
+
+    /* Baseline: all 3 disks UP in /metrics and HBS_DISKS STATUS. */
+    int64_t ms_a = -1, ms_b = -1, ms_h = -1;
+    if (!disk_metric_state(mport0, dm_a.store_id, "nvme", &ms_a) || ms_a != 0 ||
+        !disk_metric_state(mport0, dm_b.store_id, "nvme", &ms_b) || ms_b != 0 ||
+        !disk_metric_state(mport0, dm_h.store_id, "hdd", &ms_h) || ms_h != 0)
+        die("diskstall: baseline tsdb_disk_state expected 0/0/0, got %" PRId64 "/%" PRId64 "/%" PRId64, ms_a, ms_b,
+            ms_h);
+    if (!disk_status_has(1, ids[0], dm_a.store_id, "up") || !disk_status_has(1, ids[0], dm_b.store_id, "up") ||
+        !disk_status_has(1, ids[0], dm_h.store_id, "up"))
+        die("diskstall: baseline HBS_DISKS STATUS did not show all 3 disks up");
+
+    /* Hang d0a via outagefs: node 0's probe must mark d0a DOWN after disk_stall_s (2 s) and resign va's leader
+     * without exiting the process. */
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof cmd, "hang %s", d0a);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskstall: outagefs '%s' failed: %s", cmd, cout);
+    uint64_t t_hang = now_ms();
+
+    /* Wait for va leader to move off node 0 at epoch > e0 within disk_stall_s (2 s) + failover (strictly below the
+     * 10 s default so disk_stall_s propagation is proven; catches stallnoresign) while verifying node 0 stays alive
+     * (catches stallexit). */
+    int newL = -1;
+    uint64_t resign_ms = 0;
+    uint64_t limit_ms = 8000;
+    for (;;) {
+        int st = 0;
+        if (waitpid(pids[0], &st, WNOHANG) == pids[0]) {
+            pids[0] = 0;
+            die("diskstall: node 0 exited (status 0x%x) on fast-disk hang (stallexit!)", st);
+        }
+        struct meta_volume mva;
+        if (vol_rec(1, va_name, &mva) && mva.epoch > e0 && mva.leader && mva.leader != ids[0]) {
+            newL = server_of(mva.leader);
+            if (newL == 1 || newL == 2) {
+                resign_ms = now_ms() - t_hang;
+                break;
+            }
+        }
+        if (now_ms() - t_hang > limit_ms)
+            die("diskstall: leader of %s did not resign off node 0 within %" PRIu64 " ms after hang (stallnoresign!)",
+                va_name, limit_ms);
+        usleep(100000);
+    }
+
+    /* Check node 0 is STILL alive after failover. */
+    {
+        int st = 0;
+        if (waitpid(pids[0], &st, WNOHANG) == pids[0]) {
+            pids[0] = 0;
+            die("diskstall: node 0 exited after leader resignation (status 0x%x)", st);
+        }
+    }
+
+    /* Writes to va proceed through the new leader while d0a is hung. */
+    int64_t ts_mid[3] = {4000, 5000, 6000};
+    float val_mid[3] = {4.0f, 5.0f, 6.0f};
+    tsdbc *cn = client(newL);
+    for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(cn, sid_a, ts_mid, val_mid, 3)) != 0; usleep(100000))
+        if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 15000)
+            die("diskstall: write to %s on new leader %d failed: %s", va_name, newL, ers(rc));
+    tsdbc_close(cn);
+
+    /* Node 0 keeps serving vb (on healthy d0b) as leader while d0a is hung! */
+    struct meta_volume mvb;
+    if (!vol_rec(1, vb_name, &mvb) || mvb.leader != ids[0])
+        die("diskstall: healthy volume %s on d0b lost leader on node 0 (leader=%" PRIu32 ")", vb_name, mvb.leader);
+    c0 = client(0);
+    if ((rc = tsdbc_insert_series(c0, sid_b, ts_mid, val_mid, 3)) != 0)
+        die("diskstall: write to healthy volume %s on node 0 failed while d0a hung: %s", vb_name, ers(rc));
+    {
+        tsdb_points pts = {0};
+        if ((rc = tsdbc_query_points(c0, sid_b, 0, 10000, &pts)) != 0 || pts.n != 6)
+            die("diskstall: read of healthy volume %s on node 0 failed: rc=%d n=%zu", vb_name, rc, pts.n);
+        tsdb_points_free(&pts);
+    }
+    tsdbc_close(c0);
+
+    /* /metrics and HBS_DISKS STATUS report d0a DOWN (1 / state=down), d0b and h0 UP (0 / state=up). */
+    int metrics_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(100000)) {
+        if (disk_metric_state(mport0, dm_a.store_id, "nvme", &ms_a) && ms_a == 1 &&
+            disk_metric_state(mport0, dm_b.store_id, "nvme", &ms_b) && ms_b == 0 &&
+            disk_metric_state(mport0, dm_h.store_id, "hdd", &ms_h) && ms_h == 0 &&
+            disk_status_has(1, ids[0], dm_a.store_id, "down") && disk_status_has(1, ids[0], dm_b.store_id, "up") &&
+            disk_status_has(1, ids[0], dm_h.store_id, "up")) {
+            metrics_ok = 1;
+            break;
+        }
+    }
+    if (!metrics_ok)
+        die("diskstall: /metrics or HBS_DISKS did not report d0a=down and d0b/h0=up "
+            "(metrics %" PRId64 "/%" PRId64 "/%" PRId64 ")",
+            ms_a, ms_b, ms_h);
+    printf("  hang on d0a: leader of %s resigned to node %d in %" PRIu64 " ms; node 0 stayed alive serving %s on d0b; "
+           "metrics & HBS_DISKS reported d0a=down\n",
+           va_name, newL, resign_ms, vb_name);
+
+    /* Heal d0a: probe transitions DOWN -> RECOVERING -> UP, va reopens from disk (open_gen > og0, same pid) and
+     * rejoins va's ISR=3. */
+    snprintf(cmd, sizeof cmd, "heal %s", d0a);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskstall: outagefs '%s' failed: %s", cmd, cout);
+
+    await_open_gen(1, va_name, 0, og0 + 1, 0);
+    await_isr(1, va_name, 3, 30000, "diskstall: va rejoined ISR=3 after d0a heal");
+    if (pids[0] != pid0)
+        die("diskstall: node 0 pid changed across recovery");
+
+    int healed_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(100000)) {
+        if (disk_metric_state(mport0, dm_a.store_id, "nvme", &ms_a) && ms_a == 0 &&
+            disk_status_has(1, ids[0], dm_a.store_id, "up")) {
+            healed_ok = 1;
+            break;
+        }
+    }
+    if (!healed_ok)
+        die("diskstall: d0a did not return to UP in /metrics and HBS_DISKS after heal (metric=%" PRId64 ")", ms_a);
+
+    /* Read all rows of va on both the leader and node 0 (reopened replica) to verify full catch-up. */
+    {
+        tsdbc *cr = client(0);
+        tsdb_points pts = {0};
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            rc = tsdbc_query_points(cr, sid_a, 0, 10000, &pts);
+            if (rc == 0 && pts.n == 6)
+                break;
+            tsdb_points_free(&pts);
+            memset(&pts, 0, sizeof pts);
+            if (now_ms() - t0 > 15000)
+                die("diskstall: reopened replica on node 0 read %s rc=%d n=%zu (want 6)", va_name, rc, pts.n);
+        }
+        for (size_t i = 0; i < 6; i++)
+            if (pts.ts[i] != (int64_t)((i + 1) * 1000) || pts.values[i] != (float)(i + 1))
+                die("diskstall: %s row %zu mismatch (ts=%" PRId64 " val=%f)", va_name, i, pts.ts[i], pts.values[i]);
+        tsdb_points_free(&pts);
+        tsdbc_close(cr);
+    }
+    printf("  heal on d0a: d0a returned UP, %s reopened from disk (open_gen > %" PRIu64 ") and rejoined ISR=3 with all "
+           "6 rows intact\n",
+           va_name, og0);
+    stop_all();
+    if (unlink_ctl)
+        unlink(ctl);
+}
+
+/* R13 (r13-fault; E57, §15.6, PLAN.md D16): outagefs `eio` on one of node 0's two HDD chunk stores under puts and
+ * reads -> that store goes DOWN (tsdb_disk_state=1, tsdb_chunk_store_state=4, HBS_DISKS state=down), node 0 stays
+ * alive (catches mutant storeeioexit), degraded reads decode whole, and new settles put chunks onto node 0's other
+ * UP HDD store (h1). */
+static void scen_diskeio(void)
+{
+    scenario("diskeio");
+#ifndef TSDB_EC
+    printf("  skipped: no erasure codec in this build\n");
+    return;
+#else
+    const char *so, *skip = outagefs_skip(&so);
+    if (skip) {
+        printf("  skipped: %s\n", skip);
+        return;
+    }
+
+    char d0_nv[PATH_MAX], h0[PATH_MAX], h1[PATH_MAX], ctl[104];
+    char d1_nv[PATH_MAX], d1_hd[PATH_MAX], d2_nv[PATH_MAX], d2_hd[PATH_MAX];
+    snprintf(d0_nv, sizeof d0_nv, "%s/n0_nvme", base);
+    snprintf(h0, sizeof h0, "%s/n0_hdd0", base);
+    snprintf(h1, sizeof h1, "%s/n0_hdd1", base);
+    snprintf(d1_nv, sizeof d1_nv, "%s/n1_nvme", base);
+    snprintf(d1_hd, sizeof d1_hd, "%s/n1_hdd", base);
+    snprintf(d2_nv, sizeof d2_nv, "%s/n2_nvme", base);
+    snprintf(d2_hd, sizeof d2_hd, "%s/n2_hdd", base);
+    disk_make(d0_nv, "nvme");
+    disk_make(h0, "hdd");
+    disk_make(h1, "hdd");
+    disk_make(d1_nv, "nvme");
+    disk_make(d1_hd, "hdd");
+    disk_make(d2_nv, "nvme");
+    disk_make(d2_hd, "hdd");
+
+    disk_meta dm_nv, dm_h0, dm_h1;
+    if (disk_load(d0_nv, &dm_nv) != 0 || disk_load(h0, &dm_h0) != 0 || disk_load(h1, &dm_h1) != 0)
+        die("diskeio: disk_load failed");
+
+    int unlink_ctl = 0;
+    if ((size_t)snprintf(ctl, sizeof ctl, "%s/ofs.ctl", base) >= sizeof ctl - 4) {
+        snprintf(ctl, sizeof ctl, "/tmp/tsdb-de-%d.ctl", (int)getpid());
+        unlink_ctl = 1;
+    }
+    unlink(ctl);
+
+    static char xa0[PATH_MAX * 3 + 192], xa1[PATH_MAX * 2 + 192], xa2[PATH_MAX * 2 + 192];
+    static char pe0[PATH_MAX * 2 + 256];
+    for (int i = 0; i < 3; i++) {
+        no_auto_disk[i] = 1;
+        omit_dir[i] = 1;
+    }
+    snprintf(xa0, sizeof xa0,
+             "--disk %s:nvme --disk %s:hdd --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d0_nv, h0, h1);
+    snprintf(xa1, sizeof xa1,
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d1_nv, d1_hd);
+    snprintf(xa2, sizeof xa2,
+             "--disk %s:nvme --disk %s:hdd --metrics-port auto "
+             "--ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 --flush-interval-ms 200",
+             d2_nv, d2_hd);
+    snprintf(pe0, sizeof pe0,
+             "LD_PRELOAD=%s OUTAGEFS_ROOTS=%s OUTAGEFS_CTL=%s "
+             "TSDBD_TEST_HEALTH=read=300,write=400,recover=1000,fast=500",
+             so, h0, ctl);
+    xargs[0] = xa0;
+    xargs[1] = xa1;
+    xargs[2] = xa2;
+    penv[0] = pe0;
+
+    start(0);
+    int mport0 = th_mport;
+    start(1);
+    start(2);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "diskeio: three voters");
+
+    struct disks_want w0 = {ids[0], 3, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w1 = {ids[1], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    struct disks_want w2 = {ids[2], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "diskeio: node 0 disks");
+    await_view(0, p_member_disks, &w1, "diskeio: node 1 disks");
+    await_view(0, p_member_disks, &w2, "diskeio: node 2 disks");
+
+    char cout[256];
+    for (uint64_t t0 = now_ms(); outagefs_cmd(ctl, "state", cout, sizeof cout) != 0; usleep(50000))
+        if (now_ms() - t0 > 10000)
+            die("diskeio: outagefs control socket %s not ready", ctl);
+
+    /* Create an EC 2+1 volume (3 stripe members -> node 0 is guaranteed in the stripe) + replicated twin. */
+    uint32_t ec_num = 0, tw_num = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "de21", 0, 2, 1, &ec_num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("diskeio: vol_add_ec 2+1: %s (%s)", cluster_strerror(rc), text);
+    if ((rc = vol_add(0, "detwin", 3, &tw_num)) != 0)
+        die("diskeio: vol_add twin: %s", cluster_strerror(rc));
+
+    struct meta_volume mv, mt;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "de21", &mv) || !mv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("diskeio: no leader for de21");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "detwin", &mt) || !mt.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("diskeio: no leader for detwin");
+    int L = server_of(mv.leader);
+    int Lt = server_of(mt.leader);
+    await_isr(L, "de21", (int)mv.nrep, 30000, "diskeio: de21 ISR full");
+
+    /* Write and settle days until h0/chunks holds >= 1 settled chunk of de21. */
+    tsdbc *ce = client(L);
+    tsdbc *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "de.s%d", s);
+        ide[s] = ecb_series(ce, nm, "de21");
+        idt[s] = ecb_series(ct, nm, "detwin");
+    }
+    const int64_t day0 = 1704067200000LL;
+    const int64_t part_step = 30LL * 86400000LL; /* distinct partition per iteration */
+    int days_written = 0;
+    int h0_chunks_pre = 0;
+    for (int d = 0; d < 12; d++) {
+        int64_t day = day0 + (int64_t)d * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskeio: pre insert de21: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskeio: pre insert twin: %s", ers(rc));
+            }
+            usleep(400000);
+        }
+        days_written++;
+        /* Wait for this partition's chunk to appear on h0 or h1. */
+        int want_tot = days_written;
+        for (uint64_t t0 = now_ms(); count_chunk_files_in(h0, ec_num) + count_chunk_files_in(h1, ec_num) < want_tot;
+             usleep(200000))
+            if (now_ms() - t0 > 60000)
+                die("diskeio: day %d did not settle onto node 0 stores in 60 s (h0=%d h1=%d)", d,
+                    count_chunk_files_in(h0, ec_num), count_chunk_files_in(h1, ec_num));
+        h0_chunks_pre = count_chunk_files_in(h0, ec_num);
+        if (h0_chunks_pre >= 1 && days_written >= 2)
+            break;
+    }
+    if (h0_chunks_pre < 1)
+        die("diskeio: no settled chunk landed on h0 after %d partitions (h1=%d)", days_written,
+            count_chunk_files_in(h1, ec_num));
+    int h1_chunks_pre = count_chunk_files_in(h1, ec_num);
+    printf("  settled %d partition(s) pre-fault: node 0 h0=%d chunk(s), h1=%d chunk(s)\n", days_written, h0_chunks_pre,
+           h1_chunks_pre);
+
+    /* Inject EIO on h0 via outagefs. */
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof cmd, "eio %s", h0);
+    if (outagefs_cmd(ctl, cmd, cout, sizeof cout) != 0)
+        die("diskeio: outagefs '%s' failed: %s", cmd, cout);
+
+    /* 1. Write & settle 2 more distinct partitions so puts hit node 0 under EIO on h0 -> h0 goes DOWN, puts fall back
+     * to h1, and node 0 process MUST stay alive (catches storeeioexit). */
+    for (int extra = 0; extra < 2; extra++) {
+        int st = 0;
+        if (waitpid(pids[0], &st, WNOHANG) == pids[0]) {
+            pids[0] = 0;
+            die("diskeio: node 0 exited (status 0x%x) on HDD chunk store EIO (storeeioexit!)", st);
+        }
+        int64_t day = day0 + (int64_t)(days_written + extra) * part_step;
+        for (int b = 0; b < 2; b++) {
+            for (int s = 0; s < ECB_SERIES; s++) {
+                int64_t ts[ECB_ROWS];
+                float val[ECB_ROWS];
+                ecb_rows_of(s, b, day, ts, val);
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ce, ide[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskeio: post-EIO insert de21: %s", ers(rc));
+                for (uint64_t t0 = now_ms(); (rc = tsdbc_insert_series(ct, idt[s], ts, val, ECB_ROWS)) != 0;
+                     usleep(50000))
+                    if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                        die("diskeio: post-EIO insert twin: %s", ers(rc));
+            }
+            usleep(400000);
+        }
+    }
+    int want_h1 = h1_chunks_pre + 2;
+    for (uint64_t t0 = now_ms(); count_chunk_files_in(h1, ec_num) < want_h1; usleep(200000)) {
+        int st = 0;
+        if (waitpid(pids[0], &st, WNOHANG) == pids[0]) {
+            pids[0] = 0;
+            die("diskeio: node 0 exited (status 0x%x) while settling post-EIO (storeeioexit!)", st);
+        }
+        if (now_ms() - t0 > 90000)
+            die("diskeio: new settles did not land on surviving UP store h1 (have %d, want >= %d)",
+                count_chunk_files_in(h1, ec_num), want_h1);
+    }
+
+    /* 2. Verify node 0 is STILL alive, h0 is DOWN in /metrics, tsdb_chunk_store_state and HBS_DISKS STATUS,
+     * while h1 and nvme remain UP. */
+    {
+        int st = 0;
+        if (waitpid(pids[0], &st, WNOHANG) == pids[0]) {
+            pids[0] = 0;
+            die("diskeio: node 0 exited (status 0x%x) after EIO (storeeioexit!)", st);
+        }
+    }
+    int64_t ms_nv = -1, ms_h0 = -1, ms_h1 = -1, cst0 = -1, cst1 = -1;
+    int st_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(150000)) {
+        char mbuf[65536];
+        metrics_get(mport0, mbuf, sizeof mbuf);
+        int ok_m = disk_metric_state(mport0, dm_nv.store_id, "nvme", &ms_nv) && ms_nv == 0 &&
+                   disk_metric_state(mport0, dm_h0.store_id, "hdd", &ms_h0) && ms_h0 == 1 &&
+                   disk_metric_state(mport0, dm_h1.store_id, "hdd", &ms_h1) && ms_h1 == 0 &&
+                   metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"0\"} ", &cst0) && cst0 != 0 &&
+                   metrics_find_i64(mbuf, "\ntsdb_chunk_store_state{store=\"1\"} ", &cst1) && cst1 == 0;
+        if (ok_m && disk_status_has(1, ids[0], dm_h0.store_id, "down") &&
+            disk_status_has(1, ids[0], dm_h1.store_id, "up") && disk_status_has(1, ids[0], dm_nv.store_id, "up")) {
+            st_ok = 1;
+            break;
+        }
+    }
+    if (!st_ok)
+        die("diskeio: expected h0=DOWN and h1/nvme=UP in /metrics and HBS_DISKS "
+            "(disk_state nv=%" PRId64 " h0=%" PRId64 " h1=%" PRId64 ", chunk_state s0=%" PRId64 " s1=%" PRId64 ")",
+            ms_nv, ms_h0, ms_h1, cst0, cst1);
+
+    /* 3. Read EVERY settled series (both pre-EIO chunks on h0 -> decoded around h0, and post-EIO chunks on h1):
+     * must equal the replicated twin bit-for-bit! */
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(ct, idt[s], &b)) != 0)
+            die("diskeio: twin read series %d: %s", s, ers(rc));
+        if ((rc = ecb_read(ce, ide[s], &a)) != 0)
+            die("diskeio: de21 degraded read series %d under h0 EIO: %s", s, ers(rc));
+        if (a.n != b.n || a.h != b.h)
+            die("diskeio: series %d mismatch under h0 EIO: got %" PRIu64 " rows (0x%" PRIx64 "), twin %" PRIu64
+                " (0x%" PRIx64 ")",
+                s, a.n, a.h, b.n, b.h);
+    }
+    tsdbc_close(ce);
+    tsdbc_close(ct);
+    printf("  EIO on h0: h0 marked DOWN (chunk_state=%" PRId64 "), node 0 stayed alive, %d new chunks landed on h1, "
+           "all %d series decoded bit-exact against twin\n",
+           cst0, count_chunk_files_in(h1, ec_num) - h1_chunks_pre, ECB_SERIES);
+
+    snprintf(cmd, sizeof cmd, "heal %s", h0);
+    (void)outagefs_cmd(ctl, cmd, cout, sizeof cout);
+    stop_all();
+    if (unlink_ctl)
+        unlink(ctl);
+#endif
+}
+
 #ifdef TSDB_EC
 /* Helpers for scen_scrubrepair (R12, r12-repair; E11, E14, E25, E26, §5.9). */
 static void sr_flip_byte(const char *path, off_t off)
@@ -31653,7 +32315,8 @@ int main(int argc, char **argv)
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
-               {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass}};
+               {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
+               {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

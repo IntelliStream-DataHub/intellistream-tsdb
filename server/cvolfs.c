@@ -133,7 +133,7 @@ static void fill_state(struct replfile_state *st, const struct cvolfs_rec *r)
 
 int cvolfs_disk_scannable(const struct cvolfs_disk *d, int log_on_hdd)
 {
-    if (!d || !d->present || d->state != META_STORE_UP || !d->path[0])
+    if (!d || !d->present || (d->state != META_STORE_UP && !d->recovering) || !d->path[0])
         return 0;
     if (d->disk_class == DISK_CLASS_NVME || d->disk_class == DISK_CLASS_SSD)
         return 1;
@@ -416,15 +416,17 @@ int cvolfs_prepare_disks(const char *meta_root, const struct cvolfs_disk *disks,
     }
     if (nfound == 0 && nfound_down > 0) {
         const struct cvolfs_disk *dd = &disks[found_down[0]];
+        if (out)
+            memcpy(out->store_id, dd->store_id, 16);
         say("volume %" PRIu32 ": existing replica directory %s/v%" PRIu32
             " is on a non-UP or ineligible disk (state=%s, class=%s): refusing to open or make a copy elsewhere",
             r->number, dd->path, r->number, store_state_str(dd->state), disk_class_name(dd->disk_class));
-        return -1;
+        return TSDB_ERR_UNAVAILABLE;
     }
     if (nscan == 0) {
         say("volume %" PRIu32 ": no UP eligible disk available (log_on_hdd=%u): the volume is not opened", r->number,
             (unsigned)r->log_on_hdd);
-        return -1;
+        return TSDB_ERR_UNAVAILABLE;
     }
 
     /* Pass 3: reconcile existing v<N> (set aside stale/lost on the same disk) or pick a disk and make v<N>. */

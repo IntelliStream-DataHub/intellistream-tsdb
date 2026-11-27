@@ -25,6 +25,15 @@ int cvol_vol_disk(uint32_t v, char *root_out, size_t cap, uint8_t store_id_out[1
 /* Lists volume numbers currently held on the disk with `store_id` into `vols_out[0..cap)`. Returns count written.
  * Thread-safe (for r13-fill and r13-fault to map disk -> volumes). */
 uint32_t cvol_vols_on_disk(const uint8_t store_id[16], uint32_t *vols_out, uint32_t cap);
+/* R13 (r13-fault, E57, D16): close a stopped/failed replica on a RECOVERING fast disk (via tsdb_cvol_replace with
+ * retiring=true, skipping eng_flush / never retrying an old fsync) and hand it back to the manager to prepare and
+ * reopen from disk as a replica (MV_REPREP -> REPLICA_OPEN -> repld_open). Returns 0 on success or if volume is
+ * absent/already reopening, -1 if stopping or writes paused. */
+int cvol_disk_reopen(uint32_t v);
+/* Re-prepare any MV_REFUSED volumes on `store_id` (or unassigned when prepared while the disk was DOWN). */
+int cvol_disk_reopen_refused(const uint8_t store_id[16]);
+/* 1 while volume v is in MV_INSTALL, MV_REPREP or MV_WAIT (still reopening after cvol_disk_reopen), else 0. */
+int cvol_vol_reopening(uint32_t v);
 /* The reason (TSDB_WHY_*) a request for cluster volume `v` is refused, for UNAVAILABLE's body: FENCED on a replica
  * (and on a leader whose writes are not switched on), RECOVERING while the volume is not open yet, UNREACHABLE on the
  * leader while it holds no read lease (cluster_lease_valid: no Raft leader's answer extended it). -1: v is no

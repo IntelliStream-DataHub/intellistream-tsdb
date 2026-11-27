@@ -28,6 +28,8 @@
 #include "peerlink.h"
 
 int chunksrv_mutant;
+_Atomic int chunksrv_test_eio_store = -1;
+_Atomic int chunksrv_test_spool_hold_store = -1;
 
 int chunksrv_mutant_parse(const char *name)
 {
@@ -551,6 +553,25 @@ struct cs_lctx {
     struct cs_lctx *next;
 };
 
+/* Per-store worker pool (R13 r13-fault; E57, D16): two worker threads dedicated to one chunk store so a hung or slow
+ * disk never starves other stores or the peerlink event loop. Bounded without pausing the shared PL_KIND_CHUNK link:
+ * when a hung store's queue fills, excess requests for that store are answered UNAVAILABLE immediately on the link
+ * thread while healthy stores keep serving at full speed. */
+#define CS_STORE_WORKERS 2
+#define CS_SPOOL_QUEUE_MAX 256u
+#define CS_SPOOL_QUEUE_BYTES (2u * 1024u * 1024u)
+struct cs_spool {
+    struct chunksrv *cs;
+    int store_idx;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    struct cs_job *qh, *qt;
+    size_t qlen;
+    size_t qbytes;
+    pthread_t workers[CS_STORE_WORKERS];
+    int nworkers;
+};
+
 struct chunksrv {
     chunk_backend *be; /* NULL: no store on this member */
     int n;
@@ -571,6 +592,8 @@ struct chunksrv {
     _Atomic(void *) damaged_arg;
     _Atomic(chunksrv_rel_guard_fn) rel_guard;
     _Atomic(void *) rel_guard_arg;
+    _Atomic(chunksrv_store_fault_fn) store_fault;
+    _Atomic(void *) store_fault_arg;
     /* Striped per-(volume, pos) leaf mutex serializing CS_OP_DEL_REL (guard + delete) with sfill start barrier. */
     pthread_mutex_t rel_mu[64];
     struct chunksrv_stats st;
@@ -602,9 +625,12 @@ struct chunksrv {
     size_t qbytes;
     struct plink **paused;
     size_t npaused, cpaused;
-    bool closing;
+    atomic_bool closing;
+    bool leaked_stalled; /* true when a hung-disk worker was detached on unlisten: leave cs/be/pl until exit */
     pthread_t *workers;
     int nworkers;
+    struct cs_spool *spools; /* per-store worker pools (cs->nspools == cs->n while listening) */
+    int nspools;
     /* Dedicated worker pool for PL_KIND_CHUNKR (kind 8) rebuild reads so send-side pacing never stalls
      * foreground PL_KIND_CHUNK reads, sums, deletes, or put commits. */
     pthread_mutex_t rqmu;
@@ -686,6 +712,8 @@ void chunksrv_close(struct chunksrv *cs)
     chunksrv_scrub_stop(cs);
     if (cs->listening)
         chunksrv_unlisten(cs);
+    if (cs->leaked_stalled)
+        return; /* detached hung-disk workers still reference cs/be/pl until process exit */
     if (cs->be)
         chunk_be_close(cs->be);
     for (int i = 0; cs->paths && i < cs->n; i++)
@@ -1021,6 +1049,26 @@ void chunksrv_rel_barrier(struct chunksrv *cs, uint32_t volume, unsigned pos)
     pthread_mutex_unlock(mu);
 }
 
+void chunksrv_set_store_fault(struct chunksrv *cs, chunksrv_store_fault_fn fn, void *arg)
+{
+    if (!cs)
+        return;
+    atomic_store_explicit(&cs->store_fault_arg, arg, memory_order_relaxed);
+    atomic_store_explicit(&cs->store_fault, fn, memory_order_release);
+}
+
+static void cs_store_fault(struct chunksrv *cs, int store_idx, int rc)
+{
+    if (!cs || !cs->be || store_idx < 0 || store_idx >= cs->n)
+        return;
+    if (rc != TSDB_ERR_IO && rc != CHUNK_ERR_FULL)
+        return;
+    (void)chunk_be_set_down(cs->be, store_idx, CHUNK_STORE_DOWN_IOERR);
+    chunksrv_store_fault_fn fn = atomic_load_explicit(&cs->store_fault, memory_order_acquire);
+    if (fn)
+        fn(atomic_load_explicit(&cs->store_fault_arg, memory_order_relaxed), store_idx, rc);
+}
+
 /* Each counter is read on its own (relaxed, as STAT writes them): a plain struct copy races the workers. */
 void chunksrv_get_stats(struct chunksrv *cs, struct chunksrv_stats *st)
 {
@@ -1040,6 +1088,38 @@ static bool any_unsure(struct chunksrv *cs, uint32_t volume)
     return false;
 }
 
+/* Raises epoch across open stores; if a store fails with EIO/ENOSPC it is marked DOWN_IOERR and notified, and if at
+ * least one surviving UP store durably holds the fence >= e, returns 0 so puts/reads proceed on the healthy stores. */
+static int cs_see_raise(struct chunksrv *cs, uint32_t volume, uint64_t e)
+{
+    bool was_up[CHUNKSRV_DIRS_MAX] = {0};
+    for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+        was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
+    int rc = chunk_be_see_epoch(cs->be, volume, e);
+    if (rc != TSDB_ERR_IO && rc != CHUNK_ERR_FULL)
+        return rc;
+    int up_ok = 0;
+    for (int i = 0; i < cs->n; i++) {
+        int st_state = chunk_be_store_state(cs->be, i);
+        if (st_state == CHUNK_STORE_DOWN_IOERR) {
+            if (i < CHUNKSRV_DIRS_MAX && was_up[i])
+                cs_store_fault(cs, i, rc);
+            continue;
+        }
+        if (st_state != CHUNK_STORE_UP && st_state != CHUNK_STORE_REPLACING)
+            continue;
+        chunk_store *st = chunk_be_store_ref(cs->be, i);
+        bool bad = !st || chunk_store_failed(st) || chunk_store_epoch(st, volume) < e;
+        chunk_store_unref(st);
+        if (bad) {
+            cs_store_fault(cs, i, rc);
+            continue;
+        }
+        up_ok++;
+    }
+    return up_ok > 0 ? 0 : rc;
+}
+
 /* E14: a request raises the fence of its volume to its epoch first. An unsure store only from the authoritative source
  * (D9); the stores that are sure are raised all the same. 0, CHUNK_ERR_EPOCH_UNSURE (only for a put or a delete: a read
  * goes on), or the error of a store that could not store it. */
@@ -1054,16 +1134,17 @@ static int cs_see(struct chunksrv *cs, uint32_t volume, uint64_t e, bool mutatin
             uint64_t to = auth, be_e = chunk_be_epoch(cs->be, volume);
             to = be_e > to ? be_e : to;
             for (int i = 0; i < cs->n; i++) {
-                chunk_store *st = chunk_be_store(cs->be, i);
+                chunk_store *st = chunk_be_store_ref(cs->be, i);
                 uint64_t se = st && !chunk_store_epoch_unsure(st, volume) ? chunk_store_epoch(st, volume) : 0;
+                chunk_store_unref(st);
                 to = se > to ? se : to;
             }
-            int rc = chunk_be_see_epoch(cs->be, volume, to);
+            int rc = cs_see_raise(cs, volume, to);
             if (rc != 0)
                 return rc;
             STAT(cs, source_raises);
         } else if (chunksrv_mutant == CS_MUT_SELFRAISE) { /* planted: a request's epoch taken as authoritative */
-            int rc = chunk_be_see_epoch(cs->be, volume, e);
+            int rc = cs_see_raise(cs, volume, e);
             if (rc != 0)
                 return rc;
         }
@@ -1071,8 +1152,9 @@ static int cs_see(struct chunksrv *cs, uint32_t volume, uint64_t e, bool mutatin
     if (any_unsure(cs, volume)) {
         int rc = 0;
         for (int i = 0; i < cs->n && rc == 0; i++) {
-            chunk_store *st = chunk_be_store(cs->be, i);
+            chunk_store *st = chunk_be_store_ref(cs->be, i);
             int r = st ? chunk_store_see(st, volume, e) : 0;
+            chunk_store_unref(st);
             if (r != 0 && r != CHUNK_ERR_EPOCH_UNSURE)
                 rc = r;
         }
@@ -1082,7 +1164,7 @@ static int cs_see(struct chunksrv *cs, uint32_t volume, uint64_t e, bool mutatin
         }
         return rc;
     }
-    return e > chunk_be_epoch(cs->be, volume) ? chunk_be_see_epoch(cs->be, volume, e) : 0;
+    return e > chunk_be_epoch(cs->be, volume) ? cs_see_raise(cs, volume, e) : 0;
 }
 
 /* the epoch a put or a delete is made at */
@@ -1128,7 +1210,8 @@ static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_re
     chunk_ident id;
     ident_of(r, &id);
     chunk_rd *rd = NULL;
-    int rc = chunk_be_rd_open(cs->be, &id, &rd);
+    int store_idx = -1;
+    int rc = chunk_be_rd_open_at(cs->be, &id, &rd, &store_idx);
     if (rc == 0) {
         const chunk_hdr *h = chunk_rd_hdr(rd);
         if (r->off > h->chunk_len || r->len > h->chunk_len - r->off)
@@ -1137,8 +1220,11 @@ static void do_read(struct chunksrv *cs, int kind, const struct cs_req *r, cs_re
     uint8_t *b = rc == 0 ? malloc(RESP_HDR + r->len) : NULL;
     if (rc == 0 && !b)
         rc = TSDB_ERR_NOMEM;
-    if (rc == 0)
+    if (rc == 0) {
         rc = chunk_rd_read(rd, r->off, b + RESP_HDR, r->len);
+        if (rc == TSDB_ERR_IO && store_idx >= 0)
+            chunk_be_note_ioerr(cs->be, store_idx);
+    }
     if (rd)
         chunk_rd_close(rd);
     if (kind == PL_KIND_CHUNKR)
@@ -1477,11 +1563,19 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
         if (rc == 0)
             rc = cs_see(cs, r->volume, r->epoch, true);
         if (rc == 0) {
+            bool was_up[CHUNKSRV_DIRS_MAX] = {0};
+            for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
             chunk_ident id;
             ident_of(r, &id);
             rc = chunk_be_del(cs->be, &id, act_epoch(cs, r->volume, r->epoch));
             if (rc == CHUNK_ERR_FENCED)
                 STAT(cs, fenced);
+            else if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL) {
+                for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                    if (was_up[i] && chunk_be_store_state(cs->be, i) == CHUNK_STORE_DOWN_IOERR)
+                        cs_store_fault(cs, i, rc);
+            }
         }
         pthread_mutex_unlock(rmu);
         reply_rc(reply, arg, r->rid, CS_OP_DEL_REL, rc, NULL, 0);
@@ -1499,11 +1593,19 @@ static int chunksrv_handle_req(struct chunksrv *cs, int kind, uint32_t peer, con
     case CS_OP_SUMS: do_sums(cs, r, reply, arg); break;
     case CS_OP_LIST: do_list(cs, r, reply, arg); break;
     case CS_OP_DEL: {
+        bool was_up[CHUNKSRV_DIRS_MAX] = {0};
+        for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+            was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
         chunk_ident id;
         ident_of(r, &id);
         rc = chunk_be_del(cs->be, &id, act_epoch(cs, r->volume, r->epoch));
         if (rc == CHUNK_ERR_FENCED)
             STAT(cs, fenced);
+        else if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL) {
+            for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                if (was_up[i] && chunk_be_store_state(cs->be, i) == CHUNK_STORE_DOWN_IOERR)
+                    cs_store_fault(cs, i, rc);
+        }
         reply_rc(reply, arg, r->rid, CS_OP_DEL, rc, NULL, 0);
         break;
     }
@@ -1535,6 +1637,7 @@ struct cs_put {
     struct cs_put_meta m;
     chunk_wr *w;
     chunk_store *st; /* ref-counted store for CS_PUT_F_REPLACE read-back */
+    int store_idx;   /* local store index chosen for this put (-1 if unknown) */
     uint64_t total, got, ncells, cell_i;
     uint64_t *sums;
     uint8_t *cell;     /* the cell being assembled */
@@ -1584,7 +1687,7 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
     struct cs_put *p = calloc(1, sizeof *p);
     if (!p)
         return TSDB_ERR_NOMEM;
-    p->cs = cs, p->file = file, p->reply = reply, p->arg = arg;
+    p->cs = cs, p->file = file, p->reply = reply, p->arg = arg, p->store_idx = -1;
     uint8_t *flipped = flip_take(CS_FLIP_META, meta, meta_len);
     if (flipped)
         meta = flipped;
@@ -1614,15 +1717,55 @@ int chunksrv_put_begin(struct chunksrv *cs, uint32_t peer, uint64_t file, const 
         memcpy(id.oid, p->m.oid, 16);
         uint64_t fence = act_epoch(cs, p->m.volume, p->m.epoch);
         if (p->m.flags & CS_PUT_F_REPLACE) {
+            bool was_up[CHUNKSRV_DIRS_MAX] = {0};
+            for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                was_up[i] = chunk_be_store_state(cs->be, i) == CHUNK_STORE_UP;
             rc = chunk_be_wr_open_replace(cs->be, &id, &p->m.g, p->m.hdr_epoch, fence, &p->w, &p->st);
-            if (rc == TSDB_ERR_NOTFOUND) {
+            if (rc == 0 && p->st) {
+                for (int i = 0; i < cs->n; i++) {
+                    if (chunk_be_raw_store(cs->be, i) == p->st) {
+                        p->store_idx = i;
+                        break;
+                    }
+                }
+            } else if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL) {
+                for (int i = 0; i < cs->n && i < CHUNKSRV_DIRS_MAX; i++)
+                    if (was_up[i] && chunk_be_store_state(cs->be, i) == CHUNK_STORE_DOWN_IOERR)
+                        cs_store_fault(cs, i, rc);
+            } else if (rc == TSDB_ERR_NOTFOUND) {
                 char hex[33];
                 chunk_oid_hex(p->m.oid, hex);
                 fprintf(stderr, "tsdbd: chunk replace refused: volume %" PRIu32 " oid=%s pos=%u not found (deleted)\n",
                         p->m.volume, hex, (unsigned)p->m.pos);
             }
         } else {
-            rc = chunk_be_wr_open(cs->be, -1, &id, &p->m.g, fence, &p->w);
+            int primary = cs->n > 0 ? chunk_be_place(cs->be, id.oid, id.pos) : 0;
+            rc = TSDB_ERR_UNAVAILABLE;
+            for (int off = 0; off < cs->n; off++) {
+                int cand = (primary + off) % cs->n;
+                int st_state = chunk_be_store_state(cs->be, cand);
+                if (st_state != CHUNK_STORE_UP && st_state != CHUNK_STORE_REPLACING)
+                    continue;
+                int wrc =
+#ifdef TSDB_TEST_HOOKS
+                    atomic_load_explicit(&chunksrv_test_eio_store, memory_order_relaxed) == cand
+                        ? TSDB_ERR_IO
+                        :
+#endif
+                        chunk_be_wr_open(cs->be, cand, &id, &p->m.g, fence, &p->w);
+                if (wrc == 0) {
+                    p->store_idx = cand;
+                    rc = 0;
+                    break;
+                }
+                if (wrc == TSDB_ERR_IO || wrc == CHUNK_ERR_FULL) {
+                    cs_store_fault(cs, cand, wrc);
+                    rc = wrc;
+                    continue; /* E57 / D16: route puts to the server's other UP chunk stores */
+                }
+                rc = wrc;
+                break;
+            }
         }
     }
     if (rc != 0) {
@@ -1673,6 +1816,8 @@ int chunksrv_put_data(struct cs_put *p, uint64_t off, const void *d, size_t n)
                          ? chunk_wr_cell_trusted(p->w, p->cell, p->cell_len, p->sums[p->cell_i])
                          : chunk_wr_cell(p->w, p->cell, p->cell_len, true, p->sums[p->cell_i]);
             if (rc != 0) {
+                if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL)
+                    cs_store_fault(p->cs, p->store_idx, rc);
                 p->rc = rc;
                 put_answer(p, rc);
                 return rc;
@@ -1695,6 +1840,8 @@ void chunksrv_put_end(struct cs_put *p, int status)
                 put_answer(p, 0);
             rc = chunk_wr_commit(p->w);
             p->w = NULL; /* commit releases the writer, whatever it returns */
+            if (rc == TSDB_ERR_IO || rc == CHUNK_ERR_FULL)
+                cs_store_fault(p->cs, p->store_idx, rc);
             if (rc == TSDB_ERR_NOTFOUND && (p->m.flags & CS_PUT_F_REPLACE)) {
                 char hex[33];
                 chunk_oid_hex(p->m.oid, hex);
@@ -1774,6 +1921,12 @@ static void reply_link(void *arg, const uint8_t *p, size_t n)
     plink_send_gen(c->l, c->gen, CS_T_RESP, p, n, 1000); /* a lost answer is the requester's timeout */
 }
 
+static void reply_link_nowait(void *arg, const uint8_t *p, size_t n)
+{
+    struct rctx *c = arg;
+    plink_send_gen(c->l, c->gen, CS_T_RESP, p, n, 0); /* called from link thread: never block */
+}
+
 static void reply_put(void *arg, const uint8_t *p, size_t n)
 {
     struct cs_lctx *x = arg;
@@ -1787,9 +1940,9 @@ static void *worker_main(void *arg)
     struct chunksrv *cs = arg;
     pthread_mutex_lock(&cs->qmu);
     for (;;) {
-        while (!cs->qh && !cs->closing)
+        while (!cs->qh && !atomic_load_explicit(&cs->closing, memory_order_acquire))
             pthread_cond_wait(&cs->qcv, &cs->qmu);
-        if (cs->closing)
+        if (atomic_load_explicit(&cs->closing, memory_order_acquire))
             break;
         struct cs_job *j = cs->qh;
         cs->qh = j->next;
@@ -1813,6 +1966,82 @@ static void *worker_main(void *arg)
     }
     pthread_mutex_unlock(&cs->qmu);
     return NULL;
+}
+
+static int spool_push(struct cs_spool *sp, struct cs_job *j)
+{
+    pthread_mutex_lock(&sp->mu);
+    if (sp->qlen >= CS_SPOOL_QUEUE_MAX || sp->qbytes >= CS_SPOOL_QUEUE_BYTES) {
+        pthread_mutex_unlock(&sp->mu);
+        return -1;
+    }
+    j->next = NULL;
+    if (sp->qt)
+        sp->qt->next = j;
+    else
+        sp->qh = j;
+    sp->qt = j;
+    sp->qlen++;
+    sp->qbytes += j->n;
+    pthread_cond_signal(&sp->cv);
+    pthread_mutex_unlock(&sp->mu);
+    return 0;
+}
+
+static void *spool_worker_main(void *arg)
+{
+    struct cs_spool *sp = arg;
+    struct chunksrv *cs = sp->cs;
+    pthread_mutex_lock(&sp->mu);
+    for (;;) {
+        while (!sp->qh && !atomic_load_explicit(&cs->closing, memory_order_acquire))
+            pthread_cond_wait(&sp->cv, &sp->mu);
+        if (atomic_load_explicit(&cs->closing, memory_order_acquire))
+            break;
+        struct cs_job *j = sp->qh;
+        sp->qh = j->next;
+        if (!sp->qh)
+            sp->qt = NULL;
+        sp->qlen--;
+        sp->qbytes -= j->n;
+        pthread_mutex_unlock(&sp->mu);
+#ifdef TSDB_TEST_HOOKS
+        while (atomic_load_explicit(&chunksrv_test_spool_hold_store, memory_order_acquire) == sp->store_idx &&
+               !atomic_load_explicit(&cs->closing, memory_order_acquire))
+            nanosleep(&(struct timespec){0, 5 * 1000000L}, NULL);
+#endif
+        if (j->commit) {
+            chunksrv_put_end(j->put, 0);
+        } else {
+            struct rctx c = {.l = j->l, .gen = j->gen};
+            chunksrv_handle_req(cs, j->kind, j->peer, &j->req, reply_link, &c);
+        }
+        free(j);
+        pthread_mutex_lock(&sp->mu);
+    }
+    pthread_mutex_unlock(&sp->mu);
+    return NULL;
+}
+
+static int req_store_idx(struct chunksrv *cs, const struct cs_req *r)
+{
+    if (cs->nspools <= 0 || !cs->be)
+        return -1;
+    switch (r->op) {
+    case CS_OP_READ:
+    case CS_OP_SUMS:
+    case CS_OP_DEL:
+    case CS_OP_DEL_REL: {
+        int s = chunk_be_place_n(r->oid, r->pos, cs->nspools);
+        /* Only route to store s's dedicated pool while store s is UP: once DOWN (e.g. hung disk), route to the shared
+         * pool so fallback copies on other UP stores and DEL/DEL_REL never stall behind stuck workers. */
+        if (s >= 0 && s < cs->nspools && chunk_be_store_state(cs->be, s) == CHUNK_STORE_UP)
+            return s;
+        return -1;
+    }
+    default:
+        return -1;
+    }
 }
 
 static void rq_push(struct chunksrv *cs, struct cs_job *j, struct plink *pause_l)
@@ -1846,9 +2075,9 @@ static void *rworker_main(void *arg)
     struct chunksrv *cs = arg;
     pthread_mutex_lock(&cs->rqmu);
     for (;;) {
-        while (!cs->rqh && !cs->closing)
+        while (!cs->rqh && !atomic_load_explicit(&cs->closing, memory_order_acquire))
             pthread_cond_wait(&cs->rqcv, &cs->rqmu);
-        if (cs->closing)
+        if (atomic_load_explicit(&cs->closing, memory_order_acquire))
             break;
         struct cs_job *j = cs->rqh;
         cs->rqh = j->next;
@@ -1914,10 +2143,20 @@ static void on_frame_chunk(struct chunksrv *cs, struct plink *l, int kind, uint8
         if (!j)
             return; /* the requester times out */
         *j = (struct cs_job){.kind = kind, .l = l, .gen = plink_gen(l), .peer = plink_peer(l), .n = n, .req = r};
-        if (kind == PL_KIND_CHUNKR)
+        if (kind == PL_KIND_CHUNKR) {
             rq_push(cs, j, l);
-        else
-            q_push(cs, j, l);
+        } else {
+            int s = req_store_idx(cs, &r);
+            if (s >= 0 && s < cs->nspools) {
+                if (spool_push(&cs->spools[s], j) != 0) {
+                    struct rctx c = {.l = j->l, .gen = j->gen};
+                    reply_rc(reply_link_nowait, &c, j->req.rid, j->req.op, TSDB_ERR_UNAVAILABLE, NULL, 0);
+                    free(j);
+                }
+            } else {
+                q_push(cs, j, l);
+            }
+        }
         return;
     }
     if (is_rpc && type == CS_T_RESP) {
@@ -2098,25 +2337,45 @@ int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
 {
     if (cs->listening)
         return -1;
-    cs->closing = false;
-    cs->nworkers = cfg->workers > 0 ? cfg->workers : 4;
+    atomic_store_explicit(&cs->closing, false, memory_order_release);
+    cs->nspools = cs->n > 0 ? cs->n : 0;
+    cs->nworkers = cfg->workers > 0 ? cfg->workers : (cs->nspools > 0 ? 2 : 4);
     cs->nrworkers = 2;
     cs->workers = calloc((size_t)cs->nworkers, sizeof *cs->workers);
     cs->rworkers = calloc((size_t)cs->nrworkers, sizeof *cs->rworkers);
-    if (!cs->workers || !cs->rworkers) {
+    cs->spools = cs->nspools > 0 ? calloc((size_t)cs->nspools, sizeof *cs->spools) : NULL;
+    if (!cs->workers || !cs->rworkers || (cs->nspools > 0 && !cs->spools)) {
         free(cs->workers);
         free(cs->rworkers);
+        free(cs->spools);
         cs->workers = cs->rworkers = NULL;
-        cs->nworkers = cs->nrworkers = 0;
+        cs->spools = NULL;
+        cs->nworkers = cs->nrworkers = cs->nspools = 0;
         return -1;
     }
+    for (int s = 0; s < cs->nspools; s++) {
+        cs->spools[s].cs = cs;
+        cs->spools[s].store_idx = s;
+        pthread_mutex_init(&cs->spools[s].mu, NULL);
+        pthread_cond_init(&cs->spools[s].cv, NULL);
+    }
     int started = 0, rstarted = 0;
+    bool spools_ok = true;
     for (; started < cs->nworkers; started++)
         if (pthread_create(&cs->workers[started], NULL, worker_main, cs) != 0)
             break;
     for (; started == cs->nworkers && rstarted < cs->nrworkers; rstarted++)
         if (pthread_create(&cs->rworkers[rstarted], NULL, rworker_main, cs) != 0)
             break;
+    for (int s = 0; started == cs->nworkers && rstarted == cs->nrworkers && spools_ok && s < cs->nspools; s++) {
+        for (int w = 0; w < CS_STORE_WORKERS; w++) {
+            if (pthread_create(&cs->spools[s].workers[w], NULL, spool_worker_main, &cs->spools[s]) != 0) {
+                spools_ok = false;
+                break;
+            }
+            cs->spools[s].nworkers++;
+        }
+    }
     struct pl_cfg pc = {.secret = cfg->secret, .secret_len = cfg->secret_len, .arg = cs, .on_link = on_link_chunk,
                         .on_frame = on_frame, .bulk = {.open = b_open, .data = b_data, .end = b_end},
                         .bulk_rate = cfg->rate, .dead_ms = cfg->dead_ms, .ping_ms = cfg->ping_ms};
@@ -2124,7 +2383,7 @@ int chunksrv_listen(struct chunksrv *cs, const struct chunksrv_net_cfg *cfg)
     memcpy(pc.self.uuid, cfg->uuid, 16);
     memcpy(pc.self.ident, cfg->ident, 16);
     snprintf(pc.advertise, sizeof pc.advertise, "%s", cfg->advertise);
-    cs->pl = (started == cs->nworkers && rstarted == cs->nrworkers) ? peerlink_new(&pc) : NULL;
+    cs->pl = (started == cs->nworkers && rstarted == cs->nrworkers && spools_ok) ? peerlink_new(&pc) : NULL;
     if (!cs->pl) {
         cs->nworkers = started;
         cs->nrworkers = rstarted;
@@ -2148,13 +2407,18 @@ void chunksrv_unlisten(struct chunksrv *cs)
 {
     if (!cs->listening)
         return;
+    atomic_store_explicit(&cs->closing, true, memory_order_release);
     pthread_mutex_lock(&cs->qmu);
     pthread_mutex_lock(&cs->rqmu);
-    cs->closing = true;
     pthread_cond_broadcast(&cs->rqcv);
     pthread_mutex_unlock(&cs->rqmu);
     pthread_cond_broadcast(&cs->qcv);
     pthread_mutex_unlock(&cs->qmu);
+    for (int s = 0; s < cs->nspools; s++) {
+        pthread_mutex_lock(&cs->spools[s].mu);
+        pthread_cond_broadcast(&cs->spools[s].cv);
+        pthread_mutex_unlock(&cs->spools[s].mu);
+    }
     for (int i = 0; i < cs->nworkers; i++)
         pthread_join(cs->workers[i], NULL);
     free(cs->workers);
@@ -2165,6 +2429,26 @@ void chunksrv_unlisten(struct chunksrv *cs)
     free(cs->rworkers);
     cs->rworkers = NULL;
     cs->nrworkers = 0;
+    bool any_stalled_spool = false;
+    for (int s = 0; s < cs->nspools; s++) {
+        bool stalled = cs->be && chunk_be_store_state(cs->be, s) == CHUNK_STORE_DOWN_STALLED;
+        if (stalled) {
+            any_stalled_spool = true;
+            for (int w = 0; w < cs->spools[s].nworkers; w++)
+                pthread_detach(cs->spools[s].workers[w]);
+        } else {
+            for (int w = 0; w < cs->spools[s].nworkers; w++)
+                pthread_join(cs->spools[s].workers[w], NULL);
+        }
+        cs->spools[s].nworkers = 0;
+    }
+    if (any_stalled_spool) {
+        /* Detached workers stuck on a hung disk still hold pointers to cs, cs->be, cs->spools, and cs->pl: leave them
+         * alive for process exit so a disk returning mid-SIGTERM never triggers a use-after-free. */
+        cs->leaked_stalled = true;
+        cs->listening = false;
+        return;
+    }
     for (struct cs_lctx *x = cs->lctx; x; x = x->next) { /* their answers go out on the links: stopped first */
         pthread_mutex_lock(&x->mu);
         x->stop = true;
@@ -2177,6 +2461,19 @@ void chunksrv_unlisten(struct chunksrv *cs)
     if (cs->pl) /* the link threads end: nothing queues or calls back any more */
         peerlink_free(cs->pl);
     cs->pl = NULL;
+    for (int s = 0; s < cs->nspools; s++) {
+        for (struct cs_job *j = cs->spools[s].qh, *nx; j; j = nx) {
+            nx = j->next;
+            if (j->commit)
+                chunksrv_put_end(j->put, PL_E_CLOSED);
+            free(j);
+        }
+        pthread_mutex_destroy(&cs->spools[s].mu);
+        pthread_cond_destroy(&cs->spools[s].cv);
+    }
+    free(cs->spools);
+    cs->spools = NULL;
+    cs->nspools = 0;
     for (struct cs_job *j = cs->qh, *nx; j; j = nx) {
         nx = j->next;
         if (j->commit)

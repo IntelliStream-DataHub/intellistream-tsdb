@@ -1998,6 +1998,237 @@ static void test_scrub_pause(void)
     chunksrv_close(cs);
 }
 
+/* R13 (r13-fault): per-store 2-worker pools + put fallback to another UP store on EIO / DOWN. */
+struct mock_fault_ctx {
+    pthread_mutex_t mu;
+    int calls;
+    int last_store;
+    int last_err;
+};
+
+static void mock_store_fault(void *arg, int store, int err_code)
+{
+    struct mock_fault_ctx *fc = arg;
+    pthread_mutex_lock(&fc->mu);
+    fc->calls++;
+    fc->last_store = store;
+    fc->last_err = err_code;
+    pthread_mutex_unlock(&fc->mu);
+}
+
+struct spool_rd_arg {
+    struct chunksrv *a;
+    const cdata *c0;
+    const cdata *c1;
+    int tid;
+    int bad;
+};
+
+static void *spool_rd_main(void *arg)
+{
+    struct spool_rd_arg *r = arg;
+    for (int i = 0; i < 8; i++) {
+        const cdata *c = ((r->tid + i) & 1) ? r->c1 : r->c0;
+        struct cs_req req;
+        req_of(&req, CS_OP_READ, c, 4);
+        req.off = 0;
+        req.len = (uint32_t)c->len;
+        int32_t prc = -1;
+        uint8_t *body = NULL;
+        size_t bl = 0;
+        if (chunksrv_call(r->a, 2, &req, 10000, &prc, &body, &bl) != 0 || prc != 0 || bl != c->len ||
+            memcmp(body, c->cells, c->len) != 0)
+            r->bad++;
+        free(body);
+    }
+    return NULL;
+}
+
+static void *spool_hold_one(void *arg)
+{
+    struct spool_rd_arg *r = arg;
+    struct cs_req req;
+    req_of(&req, CS_OP_READ, r->c0, 4);
+    req.off = 0;
+    req.len = (uint32_t)r->c0->len;
+    int32_t prc = -1;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    int rc = chunksrv_call(r->a, 2, &req, 10000, &prc, &body, &bl);
+    if (rc != 0 || (prc != 0 && prc != TSDB_ERR_UNAVAILABLE))
+        r->bad++;
+    if (prc == 0 && (bl != r->c0->len || memcmp(body, r->c0->cells, r->c0->len) != 0))
+        r->bad++;
+    free(body);
+    return NULL;
+}
+
+static void cdata_for_store(cdata *c, uint64_t epoch, unsigned pos, const chunk_backend *be, int want_store,
+                            uint64_t seed0)
+{
+    for (uint64_t s = seed0;; s++) {
+        cdata_make(c, epoch, pos, 4096, 4096 * 3 * 2 + 13, s);
+        if (chunk_be_place(be, c->m.oid, c->m.pos) == want_store)
+            return;
+        cdata_free(c);
+    }
+}
+
+static void test_spool_fallback(void)
+{
+    char d[PATH_MAX], p0[PATH_MAX + 32], p1[PATH_MAX + 32], err[256];
+    fresh("spoolfb", d, sizeof d);
+    mkstore(d, 0, 2, true, p0, sizeof p0);
+    mkstore(d, 1, 2, true, p1, sizeof p1);
+
+    const char *paths[2] = {p0, p1};
+    struct chunksrv *b = chunksrv_open(paths, 2, err, sizeof err);
+    struct chunksrv *a = chunksrv_open(NULL, 0, err, sizeof err);
+    CHECK(a && b);
+    if (!a || !b)
+        return;
+
+    struct mock_fault_ctx fctx = {.mu = PTHREAD_MUTEX_INITIALIZER, .last_store = -1};
+    chunksrv_set_store_fault(b, mock_store_fault, &fctx);
+
+    static const uint8_t secret[32] = {9};
+    struct chunksrv_net_cfg ca = {.self_id = 1, .secret = secret, .secret_len = sizeof secret, .rate = 0};
+    memcpy(ca.uuid, CLUSTER, 16);
+    struct chunksrv_net_cfg cb = ca;
+    cb.self_id = 2;
+    ca.ident[0] = 1, cb.ident[0] = 2;
+    CHECK(chunksrv_listen(a, &ca) == 0 && chunksrv_listen(b, &cb) == 0);
+    int pa = peerlink_listen(chunksrv_peerlink(a), 0), pb = peerlink_listen(chunksrv_peerlink(b), 0);
+    CHECK(pa > 0 && pb > 0);
+    char addr[64];
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pb);
+    CHECK(chunksrv_set_peer(a, 2, addr) == 0);
+    snprintf(addr, sizeof addr, "127.0.0.1:%d", pa);
+    CHECK(chunksrv_set_peer(b, 1, addr) == 0);
+
+    cdata c0, c1, c0_fb, c0_down;
+    const chunk_backend *be = chunksrv_backend(b);
+    cdata_for_store(&c0, 4, 0, be, 0, 100);
+    cdata_for_store(&c1, 4, 1, be, 1, 200);
+    cdata_for_store(&c0_fb, 4, 0, be, 0, 300);
+    cdata_for_store(&c0_down, 4, 0, be, 0, 400);
+
+    /* Put c0 (store 0) and c1 (store 1) over real peerlink. */
+    int fd0 = chunksrv_stage(d, &c0.m.g, c0.m.pos, c0.cells, c0.sums);
+    int fd1 = chunksrv_stage(d, &c1.m.g, c1.m.pos, c1.cells, c1.sums);
+    CHECK(fd0 >= 0 && fd1 >= 0);
+    CHECK(chunksrv_put_remote(a, 2, &c0.m, fd0, 0, cs_sums_hash(c0.sums, c0.ncells), 10000) == 0);
+    CHECK(chunksrv_put_remote(a, 2, &c1.m, fd1, 0, cs_sums_hash(c1.sums, c1.ncells), 10000) == 0);
+    close(fd0);
+    close(fd1);
+
+    /* Concurrent reads across both per-store 2-worker pools over real peerlink. */
+    pthread_t th[4];
+    struct spool_rd_arg ra[4];
+    for (int i = 0; i < 4; i++) {
+        ra[i] = (struct spool_rd_arg){.a = a, .c0 = &c0, .c1 = &c1, .tid = i, .bad = 0};
+        CHECK(pthread_create(&th[i], NULL, spool_rd_main, &ra[i]) == 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(ra[i].bad == 0);
+    }
+
+    /* 1. Isolation under a hung store: hold store 0's 2 workers, park 2 requests on store 0, and verify reads on
+     * store 1 keep answering rapidly over the SAME PL_KIND_CHUNK link! */
+    atomic_store_explicit(&chunksrv_test_spool_hold_store, 0, memory_order_release);
+    struct spool_rd_arg hold_args[2];
+    pthread_t hold_th[2];
+    for (int i = 0; i < 2; i++) {
+        hold_args[i] = (struct spool_rd_arg){.a = a, .c0 = &c0, .c1 = &c0, .tid = i, .bad = 0};
+        CHECK(pthread_create(&hold_th[i], NULL, spool_hold_one, &hold_args[i]) == 0);
+    }
+    usleep(50000); /* let both store-0 spool workers enter the hold loop */
+    /* Store 1 reads over the SAME link must succeed promptly without waiting for store 0's held workers. */
+    for (int i = 0; i < 8; i++) {
+        struct cs_req r1;
+        req_of(&r1, CS_OP_READ, &c1, 4);
+        r1.off = 0;
+        r1.len = (uint32_t)c1.len;
+        int32_t prc1 = -1;
+        uint8_t *b1 = NULL;
+        size_t bl1 = 0;
+        CHECK(chunksrv_call(a, 2, &r1, 2000, &prc1, &b1, &bl1) == 0 && prc1 == 0 && bl1 == c1.len &&
+              memcmp(b1, c1.cells, c1.len) == 0);
+        free(b1);
+    }
+
+    /* 2. Inject EIO on store 0 during put_begin while store 0's workers are STILL held:
+     *    - chunksrv_put_begin hits TSDB_ERR_IO on store 0, marks store 0 DOWN_IOERR, fires store_fault callback,
+     *      and falls back to store 1 so the put SUCCEEDS.
+     *    - Because store 0 is now DOWN, reads of fallback chunk c0_fb (whose hash is store 0!) AND CS_OP_DEL route
+     *      to the shared pool instead of store 0's hung spool and succeed immediately! */
+    atomic_store_explicit(&chunksrv_test_eio_store, 0, memory_order_release);
+    int fd_fb = chunksrv_stage(d, &c0_fb.m.g, c0_fb.m.pos, c0_fb.cells, c0_fb.sums);
+    CHECK(fd_fb >= 0);
+    CHECK(chunksrv_put_remote(a, 2, &c0_fb.m, fd_fb, 0, cs_sums_hash(c0_fb.sums, c0_fb.ncells), 5000) == 0);
+    close(fd_fb);
+    atomic_store_explicit(&chunksrv_test_eio_store, -1, memory_order_release);
+
+    pthread_mutex_lock(&fctx.mu);
+    CHECK(fctx.calls >= 1 && fctx.last_store == 0 && fctx.last_err == TSDB_ERR_IO);
+    pthread_mutex_unlock(&fctx.mu);
+
+    /* Verify store 0 is now DOWN_IOERR while store 1 stays UP. */
+    int up = -1, st0 = -1, st1 = -1;
+    CHECK(chunksrv_stores(b, &up, false) == 2 && up == 1);
+    CHECK(chunksrv_store_info(b, 0, NULL, 0, &st0, NULL) == 0 && st0 == CHUNK_STORE_DOWN_IOERR);
+    CHECK(chunksrv_store_info(b, 1, NULL, 0, &st1, NULL) == 0 && st1 == CHUNK_STORE_UP);
+
+    /* Read c0_fb (hashes to store 0, stored on store 1) WHILE store 0's workers are STILL held -> must succeed! */
+    struct cs_req rd;
+    req_of(&rd, CS_OP_READ, &c0_fb, 4);
+    rd.off = 0;
+    rd.len = (uint32_t)c0_fb.len;
+    int32_t prc = -1;
+    uint8_t *body = NULL;
+    size_t bl = 0;
+    CHECK(chunksrv_call(a, 2, &rd, 2000, &prc, &body, &bl) == 0 && prc == 0 && bl == c0_fb.len &&
+          memcmp(body, c0_fb.cells, c0_fb.len) == 0);
+    free(body);
+    body = NULL;
+
+    /* Another put hashing to store 0 skips DOWN store 0 and lands on store 1 cleanly, reads back, and DEL succeeds
+     * even while store 0's spool workers are STILL held! */
+    int fd_dn = chunksrv_stage(d, &c0_down.m.g, c0_down.m.pos, c0_down.cells, c0_down.sums);
+    CHECK(fd_dn >= 0);
+    CHECK(chunksrv_put_remote(a, 2, &c0_down.m, fd_dn, 0, cs_sums_hash(c0_down.sums, c0_down.ncells), 5000) == 0);
+    close(fd_dn);
+    req_of(&rd, CS_OP_READ, &c0_down, 4);
+    rd.off = 0;
+    rd.len = (uint32_t)c0_down.len;
+    prc = -1;
+    CHECK(chunksrv_call(a, 2, &rd, 2000, &prc, &body, &bl) == 0 && prc == 0 && bl == c0_down.len &&
+          memcmp(body, c0_down.cells, c0_down.len) == 0);
+    free(body);
+    body = NULL;
+    struct cs_req dr;
+    req_of(&dr, CS_OP_DEL, &c0_down, 4);
+    prc = -1;
+    CHECK(chunksrv_call(a, 2, &dr, 2000, &prc, &body, &bl) == 0 && prc == 0);
+    free(body);
+
+    /* Release held store-0 workers and join the parked client threads cleanly. */
+    atomic_store_explicit(&chunksrv_test_spool_hold_store, -1, memory_order_release);
+    for (int i = 0; i < 2; i++) {
+        pthread_join(hold_th[i], NULL);
+        CHECK(hold_args[i].bad == 0);
+    }
+
+    cdata_free(&c0);
+    cdata_free(&c1);
+    cdata_free(&c0_fb);
+    cdata_free(&c0_down);
+    chunksrv_close(a);
+    chunksrv_close(b);
+    pthread_mutex_destroy(&fctx.mu);
+}
+
 int main(int argc, char **argv)
 {
     const char *mutant = NULL, *base = "/tmp";
@@ -2071,6 +2302,7 @@ int main(int argc, char **argv)
     test_net();
     test_objlist_reopen_chunkr();
     test_scrub_pause();
+    test_spool_fallback();
     test_slow_disk();
 out:
     if (fails == 0) {

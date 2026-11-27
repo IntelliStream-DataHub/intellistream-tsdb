@@ -18,6 +18,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#include "chunksrv.h"
 #include "cluster.h"
 #include "creport.h"
 #include "../client/tsdb_crypto.h"
@@ -57,10 +58,16 @@ struct disk_entry {
     int has_chunks;
     int class_mismatch;
     int detected_class;
-    int lock_fd; /* exclusive flock on bound disk directory, -1 when not held */
+    int lock_fd;          /* exclusive flock on bound disk directory, -1 when not held */
+    int dom_idx;          /* tsdb_health domain index, -1 when not probed */
+    int chunk_slot;       /* 0-based index in chunksrv's chunk_backend, -1 if none */
+    int probe_down;       /* 1 while health domain is DOWN or RECOVERING */
+    int probe_recovering; /* 1 while health domain is RECOVERING */
+    int io_down;          /* 1 after chunk store EIO/ENOSPC or probe DOWN (sticky until restart/replace) */
 };
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_probe_cv = PTHREAD_COND_INITIALIZER; /* waited on by disk_probe_stop until probe_users == 0 */
 static atomic_int g_disks_started; /* fast-path guard so heartbeat/metrics never block on disks_start() I/O */
 
 static struct {
@@ -77,6 +84,14 @@ static struct {
     struct known_disk known[DISKS_MAX];
     int have_primary_id;
     uint8_t primary_id[16];
+    /* R13 (r13-fault): per-disk health probe monitor (src/health.c). */
+    tsdb_health *probe_h;
+    int probe_users;    /* threads currently inside a tsdb_health_* call on probe_h */
+    int probe_stopping; /* 1 once disk_probe_stop begins draining probe_users */
+    disk_probe_cb probe_cb;
+    void *probe_ctx;
+    int probe_down_override; /* 1 if TSDBD_TEST_HEALTH explicitly set down= */
+    int probe_down_ms;       /* current down_ms configured on probe_h */
 #ifdef TSDB_TEST_HOOKS
     int mutant;
 #endif
@@ -426,7 +441,21 @@ int disks_mutant_parse(const char *name)
         return DISKS_MUT_CLASSSILENT;
     if (strcmp(name, "missingasnew") == 0)
         return DISKS_MUT_MISSINGASNEW;
+    if (strcmp(name, "stallexit") == 0)
+        return DISKS_MUT_STALLEXIT;
+    if (strcmp(name, "stallnoresign") == 0)
+        return DISKS_MUT_STALLNORESIGN;
+    if (strcmp(name, "storeeioexit") == 0)
+        return DISKS_MUT_STOREEIOEXIT;
     return -1;
+}
+
+int disks_mutant(void)
+{
+    pthread_mutex_lock(&g_mu);
+    int m = G.mutant;
+    pthread_mutex_unlock(&g_mu);
+    return m;
 }
 #endif
 
@@ -739,6 +768,44 @@ static void disks_collect_shared(void *ctx, struct creport_sink *sink)
         creport_sink_put_u64(sink, NULL, 0, sh ? 1u : 0u);
 }
 
+static void disks_collect_state(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    if (!atomic_load_explicit(&g_disks_started, memory_order_acquire))
+        return;
+    struct {
+        uint8_t store_id[16];
+        int disk_class;
+        uint8_t state;
+    } snap[DISKS_MAX];
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.started) {
+        for (int i = 0; i < G.ndisks && n < DISKS_MAX; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            int nz = 0;
+            for (int b = 0; b < 16; b++)
+                nz |= d->meta.store_id[b];
+            if (!nz)
+                continue;
+            memcpy(snap[n].store_id, d->meta.store_id, 16);
+            snap[n].disk_class = d->effective_class;
+            snap[n].state = d->state;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < n; i++) {
+        char hex[33];
+        chunk_oid_hex(snap[i].store_id, hex);
+        struct creport_label lbl[2] = {
+            {"store", hex},
+            {"class", meta_disk_class_name(snap[i].disk_class)},
+        };
+        creport_sink_put_u64(sink, lbl, 2, snap[i].state);
+    }
+}
+
 /* ---------------------------------------------------------------- detection helper */
 
 static void run_detect_check(struct disk_entry *d)
@@ -787,8 +854,11 @@ int disks_prepare(const struct disks_cfg *cfg, char *err, size_t errlen)
     atomic_store_explicit(&g_disks_started, 0, memory_order_release);
     close_all_locks_locked();
     memset(&G, 0, sizeof G);
-    for (int i = 0; i < DISKS_MAX; i++)
+    for (int i = 0; i < DISKS_MAX; i++) {
         G.disks[i].lock_fd = -1;
+        G.disks[i].dom_idx = -1;
+        G.disks[i].chunk_slot = -1;
+    }
     snprintf(G.state_dir, sizeof G.state_dir, "%s", cfg->state_dir);
     G.role = cfg->role;
     G.allow_shared = cfg->allow_shared_device ? 1 : 0;
@@ -1338,6 +1408,8 @@ int disks_start(char *err, size_t errlen)
                 struct disk_entry *d = &G.disks[G.ndisks++];
                 memset(d, 0, sizeof *d);
                 d->lock_fd = -1;
+                d->dom_idx = -1;
+                d->chunk_slot = -1;
                 d->present = 0;
                 d->state = META_STORE_DOWN;
                 memcpy(d->meta.store_id, md->store_id, 16);
@@ -1382,6 +1454,9 @@ int disks_start(char *err, size_t errlen)
     (void)creport_metric_collector("tsdb_disk_shared_device", CREPORT_GAUGE,
                                    "1 while --allow-shared-device is active on this server (health warning), else 0.",
                                    disks_collect_shared, NULL);
+    (void)creport_metric_collector("tsdb_disk_state", CREPORT_GAUGE,
+                                   "Local disk state per store: 0 up, 1 down, 2 out, 3 destroyed.",
+                                   disks_collect_state, NULL);
     if (have_self)
         cluster_beat_soon();
     return 0;
@@ -1495,6 +1570,8 @@ void disks_chunk_paths(const char **paths, int cap, int *n_out)
     int rank[DISKS_MAX];
     int n = 0;
     pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++)
+        G.disks[i].chunk_slot = -1;
     /* Order chunk slots by their persisted position in <state-dir>/DISKS (by path) so argv reordering does not
      * shift hash%n store placement, with newly added disks appended in argv order. */
     for (int i = 0; i < G.ndisks && n < DISKS_MAX; i++) {
@@ -1523,7 +1600,8 @@ void disks_chunk_paths(const char **paths, int cap, int *n_out)
     }
     int out = 0;
     for (int a = 0; a < n && out < cap; a++) {
-        const struct disk_entry *d = &G.disks[idx[a]];
+        struct disk_entry *d = &G.disks[idx[a]];
+        d->chunk_slot = out;
         /* Known-missing configured chunk disk keeps a NULL DOWN_MISSING slot so hash%n placement stays stable and
          * reads answer UNAVAILABLE instead of NOTFOUND. */
         if (d->present && d->chunks_path[0])
@@ -1553,6 +1631,7 @@ int disks_list(struct disk_info *out, int cap)
             di->uses = d->uses;
             di->state = d->state;
             di->present = d->present;
+            di->recovering = d->probe_recovering;
             di->size_bytes = d->size_bytes;
         }
     }
@@ -1560,8 +1639,466 @@ int disks_list(struct disk_info *out, int cap)
     return n;
 }
 
+/* ---------------------------------------------------------------- per-disk health probes (R13, r13-fault; E57, D16) */
+
+static void disk_probe_test_options(tsdb_health_options *o, int *down_override)
+{
+    *down_override = 0;
+#ifdef TSDB_TEST_HOOKS
+    const char *s = getenv("TSDBD_TEST_HEALTH");
+    if (!s || !*s)
+        return;
+    char *copy = strdup(s);
+    if (!copy)
+        return;
+    char *save = NULL;
+    for (char *kv = strtok_r(copy, ",", &save); kv; kv = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(kv, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        int val = atoi(eq + 1);
+        if (val <= 0)
+            continue;
+        if (strcmp(kv, "down") == 0) {
+            o->down_ms = val;
+            *down_override = 1;
+        } else if (strcmp(kv, "read") == 0) {
+            o->read_every_ms = val;
+        } else if (strcmp(kv, "write") == 0) {
+            o->write_every_ms = val;
+        } else if (strcmp(kv, "recover") == 0) {
+            o->recover_ms = val;
+        } else if (strcmp(kv, "flap") == 0) {
+            o->flap_recover_ms = val;
+        } else if (strcmp(kv, "fast") == 0) {
+            o->fast_ms = val;
+        } else if (strcmp(kv, "spawn") == 0) {
+            o->spawn_ms = val;
+        }
+    }
+    free(copy);
+#else
+    (void)o;
+#endif
+}
+
+/* Acquire a non-recursive-safe reference to G.probe_h (under g_mu); returns NULL once stopping. */
+static tsdb_health *probe_hold_locked(void)
+{
+    if (!G.probe_h || G.probe_stopping)
+        return NULL;
+    G.probe_users++;
+    return G.probe_h;
+}
+
+static void probe_release(void)
+{
+    pthread_mutex_lock(&g_mu);
+    if (--G.probe_users == 0 && G.probe_stopping)
+        pthread_cond_broadcast(&g_probe_cv);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void disk_on_health_change(void *ctx, int dom_idx, int old_state, int new_state)
+{
+    (void)ctx;
+    int disk_idx = -1;
+    uint8_t store_id[16] = {0};
+    char path[PATH_MAX] = "";
+    int disk_class = DISK_CLASS_NONE;
+    uint8_t uses = 0;
+    int chunk_slot = -1;
+    uint8_t new_store_state = META_STORE_UP;
+    int state_changed = 0;
+    int down_ms = 10000;
+    int chunk_reason = CHUNK_STORE_DOWN_IOERR;
+    disk_probe_cb cb = NULL;
+    void *cb_ctx = NULL;
+#ifdef TSDB_TEST_HOOKS
+    int mut = DISKS_MUT_NONE;
+#endif
+
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    if (!h) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    cb = G.probe_cb;
+    cb_ctx = G.probe_ctx;
+    down_ms = G.probe_down_ms > 0 ? G.probe_down_ms : 10000;
+#ifdef TSDB_TEST_HOOKS
+    mut = G.mutant;
+#endif
+    pthread_mutex_unlock(&g_mu);
+
+    /* Guard against a late UP callback from tsdb_health_set_up racing a newer DOWN from the monitor thread. */
+    if (new_state == TSDB_DOM_UP && tsdb_health_state(h, dom_idx) != TSDB_DOM_UP) {
+        probe_release();
+        return;
+    }
+    if (new_state == TSDB_DOM_DOWN) {
+        tsdb_domain_info di;
+        if (tsdb_health_info(h, dom_idx, &di) == 0 && (di.stuck_ms >= down_ms || di.probes_err == 0))
+            chunk_reason = CHUNK_STORE_DOWN_STALLED;
+    }
+    probe_release();
+
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].dom_idx != dom_idx)
+            continue;
+        struct disk_entry *d = &G.disks[i];
+        disk_idx = i;
+        memcpy(store_id, d->meta.store_id, 16);
+        snprintf(path, sizeof path, "%s", d->path);
+        disk_class = d->effective_class;
+        uses = d->uses;
+        chunk_slot = d->chunk_slot;
+        uint8_t prev = d->state;
+        if (new_state == TSDB_DOM_DOWN) {
+            d->probe_down = 1;
+            d->probe_recovering = 0;
+            if (d->state == META_STORE_UP)
+                d->state = META_STORE_DOWN;
+            /* A chunk-only disk that went DOWN missed writes/deletes and stays DOWN until replace/restart; a fast
+             * log+chunk disk recovers its log state on UP while its chunk backend slot stays DOWN_STALLED. */
+            if (d->chunk_slot >= 0 && !(d->uses & META_DISK_USE_LOG))
+                d->io_down = 1;
+        } else if (new_state == TSDB_DOM_RECOVERING) {
+            d->probe_down = 1;
+            d->probe_recovering = 1;
+        } else if (new_state == TSDB_DOM_UP) {
+            d->probe_down = 0;
+            d->probe_recovering = 0;
+            if (d->present && !d->io_down && d->state == META_STORE_DOWN)
+                d->state = META_STORE_UP;
+        }
+        new_store_state = d->state;
+        state_changed = (d->state != prev);
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    if (disk_idx < 0)
+        return;
+
+    static const char *const hnames[4] = {"up", "degraded", "down", "recovering"};
+    fprintf(stderr, "tsdbd: disks: disk %s (%s): probe %s -> %s (store state=%s)\n", path,
+            meta_disk_class_name(disk_class),
+            old_state >= 0 && old_state <= 3 ? hnames[old_state] : "?",
+            new_state >= 0 && new_state <= 3 ? hnames[new_state] : "?",
+            meta_store_state_name(new_store_state));
+
+    if (new_state == TSDB_DOM_DOWN) {
+#ifdef TSDB_TEST_HOOKS
+        if (mut == DISKS_MUT_STALLEXIT && (uses & META_DISK_USE_LOG)) {
+            fprintf(stderr, "tsdbd: disks: MUTANT stallexit: exiting 1 on DOWN fast disk %s\n", path);
+            fflush(stderr);
+            _exit(1);
+        }
+        if (mut == DISKS_MUT_STOREEIOEXIT && (uses & META_DISK_USE_CHUNK)) {
+            fprintf(stderr, "tsdbd: disks: MUTANT storeeioexit: exiting 1 on DOWN chunk disk %s\n", path);
+            fflush(stderr);
+            _exit(1);
+        }
+#endif
+        if (chunk_slot >= 0) {
+            struct chunksrv *cs = chunksrv_cluster_hold();
+            if (cs) {
+                chunk_backend *be = chunksrv_backend(cs);
+                if (be)
+                    (void)chunk_be_set_down(be, chunk_slot, chunk_reason);
+                chunksrv_cluster_release();
+            }
+        }
+    }
+
+    if (state_changed)
+        cluster_beat_soon();
+
+    if (cb)
+        cb(cb_ctx, disk_idx, store_id, path, disk_class, uses, old_state, new_state);
+}
+
+int disk_probe_start(disk_probe_cb cb, void *ctx, char *err, size_t errlen)
+{
+    uint32_t stall_s = 10;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (cp) {
+        if (cp->disk_stall_s > 0)
+            stall_s = cp->disk_stall_s;
+        cluster_copy_put(cp);
+    }
+
+    char node_lbl[64];
+    struct cluster_self me;
+    if (cluster_self(&me) == 0 && me.have_node)
+        snprintf(node_lbl, sizeof node_lbl, "n%" PRIu32, me.id);
+    else
+        snprintf(node_lbl, sizeof node_lbl, "local");
+    tsdb_wipe(&me, sizeof me);
+
+    tsdb_health_options o;
+    memset(&o, 0, sizeof o);
+    o.down_ms = (int)(stall_s * 1000u);
+    o.on_change = disk_on_health_change;
+    o.node = node_lbl;
+    int down_ov = 0;
+    disk_probe_test_options(&o, &down_ov);
+
+    tsdb_health *h = tsdb_health_open(&o);
+    if (!h) {
+        if (err && errlen)
+            snprintf(err, errlen, "cannot start per-disk health probe monitor");
+        return -1;
+    }
+
+    struct {
+        int disk_idx;
+        int dom_idx;
+        char path[PATH_MAX];
+    } todo[DISKS_MAX];
+    int ntodo = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (G.probe_h) {
+        pthread_mutex_unlock(&g_mu);
+        tsdb_health_close(h);
+        return 0;
+    }
+    G.probe_h = h;
+    G.probe_users = 0;
+    G.probe_stopping = 0;
+    G.probe_cb = cb;
+    G.probe_ctx = ctx;
+    G.probe_down_override = down_ov;
+    G.probe_down_ms = o.down_ms > 0 ? o.down_ms : 10000;
+    for (int i = 0; i < G.ndisks && ntodo < DISKS_MAX; i++) {
+        struct disk_entry *d = &G.disks[i];
+        d->dom_idx = -1;
+        if (!d->present || d->state == META_STORE_DESTROYED || !d->path[0])
+            continue;
+        d->dom_idx = ntodo;
+        todo[ntodo].disk_idx = i;
+        todo[ntodo].dom_idx = ntodo;
+        snprintf(todo[ntodo].path, sizeof todo[ntodo].path, "%s", d->path);
+        ntodo++;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    for (int k = 0; k < ntodo; k++) {
+        int idx = tsdb_health_add_domain(h, todo[k].path, todo[k].path);
+        if (idx != todo[k].dom_idx) {
+            if (err && errlen)
+                snprintf(err, errlen, "disk %s: cannot start health probe", todo[k].path);
+            disk_probe_stop();
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void disk_probe_set_stall_s(uint32_t disk_stall_s)
+{
+    uint32_t s = disk_stall_s > 0 ? disk_stall_s : 10u;
+    int ms = s > 3600u ? 3600000 : (int)(s * 1000u);
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    int ov = G.probe_down_override;
+    if (h && !ov)
+        G.probe_down_ms = ms;
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return;
+    if (!ov)
+        tsdb_health_set_down_ms(h, ms);
+    probe_release();
+}
+
+void disk_probe_now_store(const uint8_t store_id[16])
+{
+    if (!store_id)
+        return;
+    int dom_idx = -1;
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    for (int i = 0; h && i < G.ndisks; i++) {
+        if (memcmp(G.disks[i].meta.store_id, store_id, 16) == 0) {
+            dom_idx = G.disks[i].dom_idx;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return;
+    if (dom_idx >= 0)
+        tsdb_health_probe_now(h, dom_idx);
+    probe_release();
+}
+
+void disk_probe_now_chunk(int chunk_slot)
+{
+    if (chunk_slot < 0)
+        return;
+    int dom_idx = -1;
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    for (int i = 0; h && i < G.ndisks; i++) {
+        if (G.disks[i].chunk_slot == chunk_slot) {
+            dom_idx = G.disks[i].dom_idx;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return;
+    if (dom_idx >= 0)
+        tsdb_health_probe_now(h, dom_idx);
+    probe_release();
+}
+
+void disk_probe_set_up(int disk_idx)
+{
+    int dom_idx = -1;
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    if (h && disk_idx >= 0 && disk_idx < G.ndisks)
+        dom_idx = G.disks[disk_idx].dom_idx;
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return;
+    if (dom_idx >= 0)
+        tsdb_health_set_up(h, dom_idx);
+    probe_release();
+}
+
+int disk_probe_state(int disk_idx)
+{
+    int dom_idx = -1;
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    if (h && disk_idx >= 0 && disk_idx < G.ndisks)
+        dom_idx = G.disks[disk_idx].dom_idx;
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return -1;
+    int st = dom_idx >= 0 ? tsdb_health_state(h, dom_idx) : -1;
+    probe_release();
+    return st;
+}
+
+int disk_probe_info_by_store(const uint8_t store_id[16], tsdb_domain_info *out)
+{
+    if (!store_id || !out)
+        return TSDB_ERR_NOTFOUND;
+    int dom_idx = -1;
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+    for (int i = 0; h && i < G.ndisks; i++) {
+        if (memcmp(G.disks[i].meta.store_id, store_id, 16) == 0) {
+            dom_idx = G.disks[i].dom_idx;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!h)
+        return TSDB_ERR_NOTFOUND;
+    int rc = dom_idx >= 0 ? tsdb_health_info(h, dom_idx, out) : TSDB_ERR_NOTFOUND;
+    probe_release();
+    return rc;
+}
+
+void disk_probe_chunk_failed(int chunk_slot, int err_code)
+{
+    if (chunk_slot < 0)
+        return;
+    int dom_idx = -1;
+    int changed = 0;
+    int is_log = 0;
+    char path[PATH_MAX] = "";
+#ifdef TSDB_TEST_HOOKS
+    int mut = DISKS_MUT_NONE;
+#endif
+    pthread_mutex_lock(&g_mu);
+    tsdb_health *h = probe_hold_locked();
+#ifdef TSDB_TEST_HOOKS
+    mut = G.mutant;
+#endif
+    for (int i = 0; i < G.ndisks; i++) {
+        if (G.disks[i].chunk_slot != chunk_slot)
+            continue;
+        struct disk_entry *d = &G.disks[i];
+        is_log = (d->uses & META_DISK_USE_LOG) != 0;
+        /* Only take the whole disk DOWN in HBS_DISKS/cvolfs when it is a chunk-only disk: on a fast log+chunk disk
+         * (no capacity disks), keep d->state governed by the disk's health probe so ENOSPC or a chunks/-only error
+         * never leaves healthy log volumes unscannable while chunksrv already marks the chunk slot DOWN_IOERR. */
+        if (!is_log) {
+            d->io_down = 1;
+            if (d->state == META_STORE_UP) {
+                d->state = META_STORE_DOWN;
+                changed = 1;
+            }
+        }
+        dom_idx = d->dom_idx;
+        snprintf(path, sizeof path, "%s", d->path);
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (h) {
+        if (dom_idx >= 0)
+            tsdb_health_probe_now(h, dom_idx);
+        probe_release();
+    }
+
+    if (changed || is_log) {
+        fprintf(stderr, "tsdbd: disks: chunk store %d (%s) failed (%s): %s\n", chunk_slot, path[0] ? path : "-",
+                err_code == CHUNK_ERR_FULL ? "ENOSPC" : tsdb_strerror(err_code),
+                is_log ? "chunk store marked DOWN_IOERR (log disk remains governed by probe)" : "marking disk DOWN");
+    }
+#ifdef TSDB_TEST_HOOKS
+    if (mut == DISKS_MUT_STOREEIOEXIT) {
+        fprintf(stderr, "tsdbd: disks: MUTANT storeeioexit: exiting 1 on chunk store %d (%s) failure\n", chunk_slot,
+                path[0] ? path : "-");
+        fflush(stderr);
+        _exit(1);
+    }
+#endif
+    if (changed)
+        cluster_beat_soon();
+}
+
+void disk_probe_stop(void)
+{
+    pthread_mutex_lock(&g_mu);
+    if (!G.probe_h) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    G.probe_stopping = 1;
+    while (G.probe_users > 0)
+        pthread_cond_wait(&g_probe_cv, &g_mu);
+    tsdb_health *h = G.probe_h;
+    G.probe_h = NULL;
+    G.probe_stopping = 0;
+    G.probe_cb = NULL;
+    G.probe_ctx = NULL;
+    for (int i = 0; i < G.ndisks; i++)
+        G.disks[i].dom_idx = -1;
+    pthread_mutex_unlock(&g_mu);
+
+    int nd = tsdb_health_domains(h);
+    for (int d = 0; d < nd; d++) {
+        if (tsdb_health_state(h, d) != TSDB_DOM_UP)
+            return; /* a probe thread may be stuck inside a hung kernel call; process exits with it */
+    }
+    tsdb_health_close(h);
+}
+
 void disks_stop(void)
 {
+    disk_probe_stop();
     atomic_store_explicit(&g_disks_started, 0, memory_order_release);
     pthread_mutex_lock(&g_mu);
     int was_started = G.started;
@@ -1574,5 +2111,6 @@ void disks_stop(void)
         creport_section_unregister(HBS_DISKS);
         creport_metric_collector_del("tsdb_disk_class_mismatch");
         creport_metric_collector_del("tsdb_disk_shared_device");
+        creport_metric_collector_del("tsdb_disk_state");
     }
 }

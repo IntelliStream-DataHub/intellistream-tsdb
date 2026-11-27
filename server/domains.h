@@ -40,6 +40,13 @@ typedef struct dom_vol {
     atomic_int div_logged;   /* vol_diverged's log-once bits: 1 the engine's DIVERGED file, 2 the reopen's report */
 } dom_vol;
 
+typedef struct dom_disk_state {
+    uint8_t store_id[16];
+    uint32_t vols[CLUSTER_REPORT_VOLS];
+    uint32_t nvols;
+    atomic_bool recovering;
+} dom_disk_state;
+
 static struct {
     tsdb *db;
     tsdb_health *health;
@@ -55,7 +62,12 @@ static struct {
     atomic_int threads; /* recovery threads alive */
     atomic_bool stop;
     void (*waits)(int delta);
-} dom = {.mu = PTHREAD_MUTEX_INITIALIZER};
+    /* R13 (r13-fault): per-disk cluster fault-domain state & recovery threads. */
+    pthread_mutex_t disk_mu; /* pure leaf guarding disks[].store_id/vols/nvols */
+    dom_disk_state disks[DISKS_MAX];
+    atomic_int disk_threads;
+    atomic_bool disk_stop;
+} dom = {.mu = PTHREAD_MUTEX_INITIALIZER, .disk_mu = PTHREAD_MUTEX_INITIALIZER};
 
 /* Seconds on the monotonic clock: the lines of a storage event can be set beside the harness's own clock (jepsen's
  * outage trace) and the ones of another volume. */
@@ -595,8 +607,12 @@ static int dom_failwatch(char *msg, size_t msglen)
         char own[512]; /* this volume's own error: msg is the first failed volume's, which may be another one */
         if (tsdb_volume_failed(dom.db, (uint32_t)v, own, sizeof own) != TSDB_ERR_IO || !own[0])
             snprintf(own, sizeof own, "%s", msg);
-        if (v > 0 && repld_engine_failed((uint32_t)v, own))
+        if (v > 0 && repld_engine_failed((uint32_t)v, own)) {
+            uint8_t sid[16];
+            if (cvol_vol_disk((uint32_t)v, NULL, 0, sid) == 0)
+                disk_probe_now_store(sid);
             continue; /* a cluster volume: its driver quiesces it and reports it failed, the server goes on (D13) */
+        }
         if (dom_of(v) < 0)
             return 1;
         if (!atomic_load(&dom.vol[v].recovering) && !atomic_load(&dom.vol[v].diverged)) {
@@ -628,6 +644,247 @@ static void dom_shutdown(void)
     if (dom.health)
         tsdb_health_close(dom.health);
     tier_put(t);
+}
+
+/* ---- R13 (r13-fault; E57, §15.6, PLAN.md D16): per-disk cluster fault domains ---- */
+
+static int dom_disk_state_of_vol(uint32_t v, tsdb_domain_info *out)
+{
+    uint8_t sid[16];
+    if (!cvol_active() || cvol_vol_disk(v, NULL, 0, sid) != 0)
+        return -1;
+    tsdb_domain_info di;
+    if (disk_probe_info_by_store(sid, &di) != 0)
+        return -1;
+    if (out)
+        *out = di;
+    return di.state;
+}
+
+static void dom_disk_record_vols(int disk_idx, const uint8_t store_id[16], const uint32_t *vols, uint32_t nv)
+{
+    pthread_mutex_lock(&dom.disk_mu);
+    dom_disk_state *ds = &dom.disks[disk_idx];
+    memcpy(ds->store_id, store_id, 16);
+    for (uint32_t i = 0; i < nv && ds->nvols < CLUSTER_REPORT_VOLS; i++) {
+        int dup = 0;
+        for (uint32_t j = 0; j < ds->nvols; j++) {
+            if (ds->vols[j] == vols[i]) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup)
+            ds->vols[ds->nvols++] = vols[i];
+    }
+    pthread_mutex_unlock(&dom.disk_mu);
+}
+
+static void *dom_disk_recover_main(void *arg)
+{
+    int disk_idx = (int)(intptr_t)arg;
+    while (!atomic_load(&dom.disk_stop)) {
+        int st = disk_probe_state(disk_idx);
+        if (st < 0)
+            break;
+        if (st == TSDB_DOM_DOWN) {
+            dom_sleep_ms(50);
+            continue;
+        }
+        uint32_t vols[CLUSTER_REPORT_VOLS];
+        uint32_t nv = 0;
+        uint8_t sid[16];
+        pthread_mutex_lock(&dom.disk_mu);
+        memcpy(sid, dom.disks[disk_idx].store_id, 16);
+        nv = dom.disks[disk_idx].nvols;
+        if (nv > CLUSTER_REPORT_VOLS)
+            nv = CLUSTER_REPORT_VOLS;
+        if (nv > 0)
+            memcpy(vols, dom.disks[disk_idx].vols, nv * sizeof vols[0]);
+        pthread_mutex_unlock(&dom.disk_mu);
+
+        /* Also include any currently-failed volume on this disk that may have stopped while disk was DOWN. */
+        uint32_t cur[CLUSTER_REPORT_VOLS];
+        uint32_t ncur = cvol_vols_on_disk(sid, cur, CLUSTER_REPORT_VOLS);
+        for (uint32_t i = 0; i < ncur && nv < CLUSTER_REPORT_VOLS; i++) {
+            if (!repld_failed(cur[i]))
+                continue;
+            int dup = 0;
+            for (uint32_t j = 0; j < nv; j++) {
+                if (vols[j] == cur[i]) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup)
+                vols[nv++] = cur[i];
+        }
+
+        int relapsed = 0;
+        int retry = 0;
+        uint8_t done_v[CLUSTER_REPORT_VOLS] = {0};
+        for (uint32_t i = 0; i < nv; i++) {
+            if (atomic_load(&dom.disk_stop))
+                break;
+            if (disk_probe_state(disk_idx) == TSDB_DOM_DOWN) {
+                relapsed = 1;
+                break;
+            }
+            if (vol_diverged(vols[i], NULL)) {
+                done_v[i] = 1;
+                continue;
+            }
+            dom_log("reopening replica from disk after fast-disk outage", vols[i], NULL);
+            if (cvol_disk_reopen(vols[i]) == 0) {
+                done_v[i] = 1;
+            } else {
+                retry = 1;
+                break;
+            }
+        }
+        if (!relapsed && !retry && !atomic_load(&dom.disk_stop)) {
+            if (cvol_disk_reopen_refused(sid) < 0)
+                retry = 1;
+        }
+        if (relapsed)
+            continue;
+        /* Wait briefly for the manager to finish prepare + REPLICA_OPEN + repld_open before clearing RECOVERING. */
+        for (int wait_i = 0; wait_i < 600 && !atomic_load(&dom.disk_stop); wait_i++) {
+            if (disk_probe_state(disk_idx) == TSDB_DOM_DOWN) {
+                relapsed = 1;
+                break;
+            }
+            int still = 0;
+            for (uint32_t i = 0; i < nv; i++) {
+                if (done_v[i] && !vol_diverged(vols[i], NULL) && cvol_vol_reopening(vols[i])) {
+                    still = 1;
+                    break;
+                }
+            }
+            if (!still)
+                break;
+            dom_sleep_ms(50);
+        }
+        if (relapsed)
+            continue;
+
+        pthread_mutex_lock(&dom.disk_mu);
+        uint32_t keep = 0;
+        for (uint32_t j = 0; j < dom.disks[disk_idx].nvols; j++) {
+            int done = 0;
+            for (uint32_t i = 0; i < nv; i++) {
+                if (done_v[i] && dom.disks[disk_idx].vols[j] == vols[i]) {
+                    done = 1;
+                    break;
+                }
+            }
+            if (!done)
+                dom.disks[disk_idx].vols[keep++] = dom.disks[disk_idx].vols[j];
+        }
+        dom.disks[disk_idx].nvols = keep;
+        pthread_mutex_unlock(&dom.disk_mu);
+        if (retry && !atomic_load(&dom.disk_stop)) {
+            dom_sleep_ms(100);
+            continue;
+        }
+        break;
+    }
+    atomic_store(&dom.disks[disk_idx].recovering, false);
+    if (!atomic_load(&dom.disk_stop) && disk_probe_state(disk_idx) == TSDB_DOM_RECOVERING)
+        disk_probe_set_up(disk_idx);
+    atomic_fetch_sub(&dom.disk_threads, 1);
+    return NULL;
+}
+
+/* Per-disk health callback (runs on health.c monitor/probe thread, no locks held, must not block). */
+static void dom_on_disk_change(void *ctx, int disk_idx, const uint8_t store_id[16], const char *path, int disk_class,
+                               uint8_t uses, int old_state, int new_state)
+{
+    (void)ctx;
+    (void)path;
+    (void)disk_class;
+    (void)old_state;
+    if (atomic_load(&dom.disk_stop) || disk_idx < 0 || disk_idx >= DISKS_MAX)
+        return;
+
+    if (new_state == TSDB_DOM_DOWN) {
+        if (!(uses & META_DISK_USE_LOG))
+            return;
+        uint32_t vols[CLUSTER_REPORT_VOLS];
+        uint32_t nv = cvol_vols_on_disk(store_id, vols, CLUSTER_REPORT_VOLS);
+        dom_disk_record_vols(disk_idx, store_id, vols, nv);
+#ifdef TSDB_TEST_HOOKS
+        if (disks_mutant() == DISKS_MUT_STALLNORESIGN) {
+            fprintf(stderr, "tsdbd: disks: MUTANT stallnoresign: keeping leaders on DOWN fast disk %s\n", path);
+            return;
+        }
+#endif
+        for (uint32_t i = 0; i < nv; i++)
+            (void)repld_disk_down(vols[i], "fast disk probe DOWN");
+        return;
+    }
+
+    if (new_state == TSDB_DOM_RECOVERING) {
+        if (!(uses & META_DISK_USE_LOG)) {
+            disk_probe_set_up(disk_idx);
+            return;
+        }
+        uint32_t nv = 0;
+        pthread_mutex_lock(&dom.disk_mu);
+        nv = dom.disks[disk_idx].nvols;
+        pthread_mutex_unlock(&dom.disk_mu);
+        if (nv == 0) {
+            uint32_t cur[CLUSTER_REPORT_VOLS];
+            uint32_t ncur = cvol_vols_on_disk(store_id, cur, CLUSTER_REPORT_VOLS);
+            for (uint32_t i = 0; i < ncur; i++) {
+                if (repld_failed(cur[i])) {
+                    dom_disk_record_vols(disk_idx, store_id, &cur[i], 1);
+                    nv++;
+                }
+            }
+        }
+        if (nv == 0) {
+            disk_probe_set_up(disk_idx);
+            return;
+        }
+        bool no = false;
+        if (!atomic_compare_exchange_strong(&dom.disks[disk_idx].recovering, &no, true))
+            return;
+        atomic_fetch_add(&dom.disk_threads, 1);
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &at, dom_disk_recover_main, (void *)(intptr_t)disk_idx) != 0) {
+            atomic_fetch_sub(&dom.disk_threads, 1);
+            atomic_store(&dom.disks[disk_idx].recovering, false);
+            fprintf(stderr, "tsdbd: disks: cannot start recovery thread for disk %d: %s\n", disk_idx, strerror(errno));
+            disk_probe_set_up(disk_idx);
+        }
+        pthread_attr_destroy(&at);
+    }
+}
+
+static int dom_disk_init(char *err, size_t errlen)
+{
+    atomic_store(&dom.disk_stop, false);
+    atomic_store(&dom.disk_threads, 0);
+    pthread_mutex_lock(&dom.disk_mu);
+    for (int i = 0; i < DISKS_MAX; i++) {
+        memset(dom.disks[i].store_id, 0, 16);
+        dom.disks[i].nvols = 0;
+        atomic_store(&dom.disks[i].recovering, false);
+    }
+    pthread_mutex_unlock(&dom.disk_mu);
+    return disk_probe_start(dom_on_disk_change, NULL, err, errlen);
+}
+
+static void dom_disk_shutdown(void)
+{
+    atomic_store(&dom.disk_stop, true);
+    disk_probe_stop();
+    for (int i = 0; i < 100 && atomic_load(&dom.disk_threads) > 0; i++)
+        dom_sleep_ms(50);
 }
 
 #endif

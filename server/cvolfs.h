@@ -18,6 +18,7 @@ struct cvolfs_disk {
     int disk_class;      /* DISK_CLASS_NVME(1), DISK_CLASS_SSD(2), DISK_CLASS_HDD(3) */
     uint8_t state;       /* enum meta_store_state (META_STORE_UP = 0) */
     int present;         /* 1 if mounted/present on this start */
+    int recovering;      /* 1 while disk health domain is RECOVERING (existing v<N> reopen allowed, no new placement) */
     int have_usage;      /* 1: use size_bytes/used_bytes directly (tests); 0: statvfs(path) */
     uint64_t size_bytes; /* total filesystem bytes (when have_usage != 0) */
     uint64_t used_bytes; /* used filesystem bytes (when have_usage != 0) */

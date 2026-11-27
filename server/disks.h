@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "meta.h"
+#include "../include/tsdb.h"
 #include "../src/disk.h"
 
 /* Heartbeat section ID registered via creport_section() (1..9 built-in, 10 HBS_PROGRESS, 11 CREPORT_SEC_CHUNKSCRUB). */
@@ -98,10 +99,26 @@ struct disk_info {
     uint8_t uses;   /* enum meta_disk_uses bitmask */
     uint8_t state;  /* enum meta_store_state */
     int present;    /* 1 if DISK loaded and present on this start */
+    int recovering; /* 1 while disk health domain is RECOVERING (existing v<N> reopen allowed) */
     uint64_t size_bytes;
 };
 /* Copy up to `cap` local disk entries into `out`. Returns count copied (0 before disks_prepare). Thread-safe. */
 int disks_list(struct disk_info *out, int cap);
+
+/* Per-disk O_DIRECT health probes & fault isolation (R13, r13-fault; E57, §15.6, PLAN.md D16).
+ * Callback runs off g_mu and off health->mu; must not block. `old_state` / `new_state` are TSDB_DOM_*. */
+typedef void (*disk_probe_cb)(void *ctx, int disk_idx, const uint8_t store_id[16], const char *path, int disk_class,
+                              uint8_t uses, int old_state, int new_state);
+
+int disk_probe_start(disk_probe_cb cb, void *ctx, char *err, size_t errlen);
+void disk_probe_set_stall_s(uint32_t disk_stall_s);
+void disk_probe_now_store(const uint8_t store_id[16]);
+void disk_probe_now_chunk(int chunk_slot);
+void disk_probe_set_up(int disk_idx);
+int disk_probe_state(int disk_idx);
+int disk_probe_info_by_store(const uint8_t store_id[16], tsdb_domain_info *out);
+void disk_probe_chunk_failed(int chunk_slot, int err_code);
+void disk_probe_stop(void);
 
 /* Unregister HBS_DISKS / metrics and release disk locks. */
 void disks_stop(void);
@@ -109,11 +126,15 @@ void disks_stop(void);
 #ifdef TSDB_TEST_HOOKS
 enum {
     DISKS_MUT_NONE = 0,
-    DISKS_MUT_NODEVCHECK = 1,   /* nodevcheck: st_dev not compared */
-    DISKS_MUT_CLASSSILENT = 2,  /* classsilent: stated class mismatch accepted silently */
-    DISKS_MUT_MISSINGASNEW = 3, /* missingasnew: a known store missing its DISK is initialised as new */
+    DISKS_MUT_NODEVCHECK = 1,    /* nodevcheck: st_dev not compared */
+    DISKS_MUT_CLASSSILENT = 2,   /* classsilent: stated class mismatch accepted silently */
+    DISKS_MUT_MISSINGASNEW = 3,  /* missingasnew: a known store missing its DISK is initialised as new */
+    DISKS_MUT_STALLEXIT = 4,     /* stallexit: exit(1) when a fast disk probe goes DOWN */
+    DISKS_MUT_STALLNORESIGN = 5, /* stallnoresign: keep leaders on a DOWN fast disk instead of deposing */
+    DISKS_MUT_STOREEIOEXIT = 6,  /* storeeioexit: exit(1) when a chunk store fails EIO/ENOSPC or goes DOWN */
 };
 int disks_mutant_parse(const char *name);
+int disks_mutant(void);
 #endif
 
 #endif /* TSDBD_DISKS_H */

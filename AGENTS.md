@@ -634,6 +634,17 @@ cgroup, so `nice` does not keep your work out of its way.
   registers `HBS_DISKS` (`creport` section 12) in `cluster_start()` for all members including witnesses. The Raft leader
   proposes `STORE_ADD` for unknown `UP` store ids and `MEMBER_ROLE` on role change.
   `test_cluster disks`, `make disks-mutants` (`TSDB_DISKS_MUTANT`: `nodevcheck classsilent missingasnew`).
+  R13 `r13-fault` (E57, `docs/design-cluster-data.md` §15.6, `PLAN.md` D16): `disk_probe_*` runs one `health.c`
+  `O_DIRECT` probe domain per present `--disk` (`down_ms` tracks `disk_stall_s` via `tsdb_health_set_down_ms`,
+  `probe_hold_locked`/`probe_users` drain active probe callers before `disk_probe_stop` closes `probe_h`); a `DOWN`
+  fast disk deposes/quiesces only the volumes on that disk (`repld_disk_down`) without exiting the process, and
+  `DOWN -> RECOVERING` reopens them from disk (`cvol_disk_reopen`, `cvol_disk_reopen_refused` for disk-down refusals
+  only) to rejoin ISR; chunk stores mark `DOWN_IOERR`/`DOWN_STALLED` on EIO/ENOSPC or probe `DOWN`, route new puts to
+  surviving UP stores, and serve `PL_KIND_CHUNK` through bounded per-store 2-worker pools (routing non-UP stores to the
+  shared pool so hung disks never starve other stores or pause the shared link); `HBS_DISKS` carries live per-store
+  state and `tsdb_disk_state{store,class}` is exported via `creport`.
+  Tests: `test_chunksrv` (`test_spool_fallback`), `test_cluster diskstall diskeio`, `make diskfault-mutants`
+  (`TSDB_DISKS_MUTANT`: `stallexit stallnoresign storeeioexit`).
 - `server/chunkpeer.[ch]`, `server/chunkpeer_cluster.c` (R8 r8f/r8k): `coldops_peer`, the `cold_ops` implementation for
   cluster EC volumes (`requires=tier,ec` set by `chunkpeer_cluster_prepare` before `cvol` open). `put_stream` stages each
   position as an unlinked temporary (`mkstemp` + `unlink`, sums then cells), writes the leader's own position locally

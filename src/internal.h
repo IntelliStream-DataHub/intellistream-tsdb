@@ -3030,6 +3030,9 @@ int tsdb_test_reencode(struct tsdb *t, bool suffix_only, size_t *reencoded);
 /* test hook (tests/test_settle_oracle.c): the tier cache's granules read again as whole cells; drop empties it first */
 uint64_t tsdb_test_ec_retries(struct tsdb *t, bool drop);
 
+/* R13 (r13-fault): live update of a health monitor's probe stall threshold (down_ms) under leaf h->mu. */
+void tsdb_health_set_down_ms(tsdb_health *h, int down_ms);
+
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);
 int ret_cut_tail(eng *db); /* a writer's open, once its checks passed: cuts the torn tail ret_open found */

@@ -4571,7 +4571,8 @@ static void crep_held_vol(void *ctx, struct creport_sink *sink)
             } else {
                 int d = dom_of(v->number);
                 tsdb_domain_info di;
-                if (d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0 && di.state == TSDB_DOM_DOWN)
+                if ((d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0 && di.state == TSDB_DOM_DOWN) ||
+                    dom_disk_state_of_vol(v->number, NULL) == TSDB_DOM_DOWN)
                     h = CL_HEALTH_DOMAIN_FAULT;
                 else if (scrubd_vol_damaged(v->number))
                     h = CL_HEALTH_DAMAGED;
@@ -8486,8 +8487,19 @@ int main(int argc, char **argv)
             cvol_stop();
             return 1;
         }
+        if (dom_disk_init(cerr, sizeof cerr) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", cerr);
+            chunksrv_cluster_stop();
+            disks_stop();
+            scrubd_stop();
+            cluster_stop();
+            fwd_cluster_stop();
+            cvol_stop();
+            return 1;
+        }
         if (!witness && sfill_cluster_start(db, state_dir) != 0) {
             fprintf(stderr, "tsdbd: cannot start the stripe fill worker\n");
+            dom_disk_shutdown();
             chunksrv_cluster_stop();
             disks_stop();
             scrubd_stop();
@@ -8530,6 +8542,7 @@ int main(int argc, char **argv)
     eng_set_wal_sync_observer(NULL);
     if (cluster_on) {
         scrubd_stop();
+        dom_disk_shutdown(); /* stop per-disk probes & recovery threads before cluster/cvol/chunksrv close */
         cluster_stop();
         sfill_cluster_stop(); /* stops fill workers while chunk server & db are still open */
         creport_reset();

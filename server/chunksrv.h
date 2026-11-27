@@ -219,6 +219,11 @@ typedef int (*chunksrv_rel_guard_fn)(void *arg, uint32_t volume, unsigned pos, u
 void chunksrv_set_rel_guard(struct chunksrv *cs, chunksrv_rel_guard_fn fn, void *arg);
 void chunksrv_rel_barrier(struct chunksrv *cs, uint32_t volume, unsigned pos);
 
+/* R13 (r13-fault, E57, D16): callback invoked when a local chunk store hits EIO or ENOSPC on a write/sync/delete
+ * and is marked DOWN_IOERR (off chunksrv locks). */
+typedef void (*chunksrv_store_fault_fn)(void *arg, int store_idx, int err_code);
+void chunksrv_set_store_fault(struct chunksrv *cs, chunksrv_store_fault_fn fn, void *arg);
+
 /* Per-store chunk scrub lifecycle on a chunksrv instance (R12, r12-chunk). */
 struct chunksrv_scrub_cfg {
     uint32_t scrub_days;
@@ -344,6 +349,8 @@ enum {
 };
 extern int chunksrv_mutant;
 extern int chunksrv_test_put_delay_ms; /* tests: the first cell of every put waits this long (a slow disk) */
+extern _Atomic int chunksrv_test_eio_store; /* tests: >=0 injects TSDB_ERR_IO on put_begin for that store (-1: off) */
+extern _Atomic int chunksrv_test_spool_hold_store; /* tests: >=0 holds that store's spool workers (-1: off) */
 int chunksrv_mutant_parse(const char *name); /* CS_MUT_* or -1 */
 /* tests: XOR `mask` into byte `off` of the next frame received of kind `where` (CS_FLIP_*), on the receive side, before
  * it is decoded; with `rehash` its check is computed again over the changed bytes (a flip the check would miss) */

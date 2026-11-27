@@ -31,6 +31,7 @@
         tsdb_ec_select;
         tsdb_ec_strlcpy;
         tsdb_ec_xmalloc;
+        tsdb_health_set_down_ms;
         tsdb_test_before_parts;
         tsdb_test_class_switch;
         tsdb_test_deferred_retires;

@@ -113,6 +113,7 @@ struct mvol {
     int installed;    /* prepared again after an installed snapshot (TSDB_REPLD_MUTANT=snapservebeforeopen opens it at once) */
     char disk_root[PATH_MAX]; /* R13 (D14): disk root directory holding v<N> */
     uint8_t store_id[16];     /* R13 (D14): disk store_id holding v<N> (reported in HBS_VOLUMES) */
+    int refused_disk_down;    /* R13 (r13-fault): 1 when MV_REFUSED solely because its disk was non-UP */
     /* E51: 1-hour sliding window of WAL bytes written by this replica. */
     uint64_t wal_last_bytes;
     uint64_t wal_first_s;
@@ -263,6 +264,7 @@ static int build_cvolfs_disks(struct cvolfs_disk *out, int cap, uint32_t exclude
             out[i].disk_class = di[i].disk_class;
             out[i].state = di[i].state;
             out[i].present = di[i].present;
+            out[i].recovering = di[i].recovering;
         }
     }
     free(di);
@@ -337,6 +339,9 @@ static void prepare(const struct cluster_vol_rec *r)
                 r->number, r->name, m.gen);
         } else if (prc == TSDB_ERR_CORRUPT) {
             m.fault_reason = CL_FAULT_CORRUPT_OPEN;
+        } else if (prc == TSDB_ERR_UNAVAILABLE) {
+            m.refused_disk_down = 1;
+            memcpy(m.store_id, o.store_id, 16);
         }
     }
     int stored = 0;
@@ -892,6 +897,90 @@ int cvol_install(uint32_t v, int (*fn)(void *ctx, const struct snap_ident *id, i
     pthread_mutex_unlock(&M.mu);
     pthread_mutex_unlock(&M.op);
     return rc;
+}
+
+int cvol_disk_reopen(uint32_t v)
+{
+    pthread_mutex_lock(&M.op);
+    pthread_mutex_lock(&M.mu);
+    if (M.inst_closed || M.stop || M.writes) {
+        pthread_mutex_unlock(&M.mu);
+        pthread_mutex_unlock(&M.op);
+        return -1;
+    }
+    struct mvol *m = mv_get(v);
+    int st = m ? m->state : MV_NONE;
+    if (!m || (st != MV_OPEN && st != MV_REFUSED)) {
+        pthread_mutex_unlock(&M.mu);
+        pthread_mutex_unlock(&M.op);
+        return 0;
+    }
+    m->state = MV_INSTALL; /* requests get UNAVAILABLE RECOVERING; mgr_main skips until hand-back */
+    pthread_mutex_unlock(&M.mu);
+    if (st == MV_OPEN)
+        repld_close(v); /* stops & joins driver, waits for refs, closes engine retiring=true (no retried fsync) */
+    pthread_mutex_lock(&M.mu);
+    if ((m = mv_get(v)) != NULL) {
+        m->state = MV_REPREP; /* prepare + REPLICA_OPEN + repld_open replay from disk as a replica */
+        m->fault_reason = CL_FAULT_NONE;
+    }
+    M.dirty = 1;
+    pthread_cond_signal(&M.cv);
+    pthread_mutex_unlock(&M.mu);
+    pthread_mutex_unlock(&M.op);
+    cluster_beat_soon();
+    return 0;
+}
+
+int cvol_disk_reopen_refused(const uint8_t store_id[16])
+{
+    if (!store_id)
+        return 0;
+    pthread_mutex_lock(&M.op);
+    pthread_mutex_lock(&M.mu);
+    if (M.inst_closed || M.stop || M.writes) {
+        pthread_mutex_unlock(&M.mu);
+        pthread_mutex_unlock(&M.op);
+        return -1;
+    }
+    int n = 0;
+    for (uint32_t i = 0; i < M.nvols; i++) {
+        struct mvol *m = &M.vols[i];
+        if (m->state != MV_REFUSED || !m->refused_disk_down)
+            continue;
+        int zero = 1;
+        for (int b = 0; b < 16; b++)
+            if (m->store_id[b] != 0) {
+                zero = 0;
+                break;
+            }
+        if (zero || memcmp(m->store_id, store_id, 16) == 0) {
+            m->state = MV_REPREP;
+            m->fault_reason = CL_FAULT_NONE;
+            m->refused_disk_down = 0;
+            n++;
+        }
+    }
+    if (n > 0) {
+        M.dirty = 1;
+        pthread_cond_signal(&M.cv);
+    }
+    pthread_mutex_unlock(&M.mu);
+    pthread_mutex_unlock(&M.op);
+    if (n > 0)
+        cluster_beat_soon();
+    return n;
+}
+
+int cvol_vol_reopening(uint32_t v)
+{
+    int r = 0;
+    pthread_mutex_lock(&M.mu);
+    const struct mvol *m = mv_get(v);
+    if (m && (m->state == MV_INSTALL || m->state == MV_REPREP || m->state == MV_WAIT))
+        r = 1;
+    pthread_mutex_unlock(&M.mu);
+    return r;
 }
 
 void cvol_stop(void)

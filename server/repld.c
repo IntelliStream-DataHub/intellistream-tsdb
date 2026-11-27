@@ -4196,6 +4196,24 @@ int repld_engine_failed(uint32_t v, const char *msg)
     return 1;
 }
 
+int repld_disk_down(uint32_t v, const char *why)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return 0;
+    pthread_mutex_lock(&rv->mu);
+    int first = !rv->failed;
+    vol_fail(rv, why && why[0] ? why : "disk probe DOWN"); /* deposes any writer without blocking on stuck I/O */
+    pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
+    if (first) {
+        if (G.mutant != RM_NOQUIESCE)
+            tsdb_volume_quiesce(G.t, v); /* new requests get UNAVAILABLE / MOVED immediately */
+        cluster_beat_soon(); /* report CL_HEALTH_LOCAL_FAULT and CL_ROLE_NONE at once for failover */
+    }
+    return 1;
+}
+
 static int close_fn(void *ctx, struct eng **old, struct eng **neu)
 {
     (void)ctx;

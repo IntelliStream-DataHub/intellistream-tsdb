@@ -666,6 +666,15 @@ void tsdb_health_set_up(tsdb_health *h, int dom)
         fire(h, dom, old, TSDB_DOM_UP);
 }
 
+void tsdb_health_set_down_ms(tsdb_health *h, int down_ms)
+{
+    if (!h || down_ms <= 0)
+        return;
+    pthread_mutex_lock(&h->mu);
+    h->o.down_ms = down_ms;
+    pthread_mutex_unlock(&h->mu);
+}
+
 void tsdb_health_close(tsdb_health *h)
 {
     if (!h)

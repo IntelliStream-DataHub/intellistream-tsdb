@@ -113,6 +113,18 @@ static void cc_on_out(void *ctx, int store_idx, uint64_t day_damaged)
     cluster_beat_soon();
 }
 
+static void cc_on_store_fault(void *ctx, int store_idx, int err_code)
+{
+    (void)ctx;
+    disk_probe_chunk_failed(store_idx, err_code);
+}
+
+static void cc_on_ioerr(void *ctx, int store_idx)
+{
+    (void)ctx;
+    disk_probe_now_chunk(store_idx);
+}
+
 static void cscrub_put32(uint8_t *p, uint32_t v)
 {
     for (int i = 0; i < 4; i++)
@@ -557,6 +569,7 @@ static void *cc_main(void *arg)
                 const struct cluster_copy *c = cluster_copy_get();
                 if (c) {
                     set_peers(cs, c, self);
+                    disk_probe_set_stall_s(c->disk_stall_s);
                     cluster_copy_put(c);
                     seen = b;
                     have = 1;
@@ -585,6 +598,9 @@ int chunksrv_cluster_start(const char *const *paths, int n, uint64_t rate, char 
     G.cs = chunksrv_open(paths, n, err, errlen);
     if (!G.cs)
         return -1;
+    chunksrv_set_store_fault(G.cs, cc_on_store_fault, NULL);
+    if (chunksrv_backend(G.cs))
+        chunk_be_set_ioerr_cb(chunksrv_backend(G.cs), cc_on_ioerr, NULL);
     chunksrv_stores(G.cs, NULL, n > 0);
     struct cluster_self me;
     if (cluster_self(&me) == 0 && me.have_node) {
@@ -709,6 +725,11 @@ void chunksrv_cluster_free(void)
         nanosleep(&ts, NULL);
     }
     atomic_fetch_add(&closes, 1); /* before the close: a holder that sees no change still has a live instance */
+    if (G.cs) {
+        chunksrv_set_store_fault(G.cs, NULL, NULL);
+        if (chunksrv_backend(G.cs))
+            chunk_be_set_ioerr_cb(chunksrv_backend(G.cs), NULL, NULL);
+    }
     chunksrv_close(G.cs); /* tsdbd's workers are joined, and no holder is left; unlistens first */
     G.cs = NULL;
     G.checked = 0;

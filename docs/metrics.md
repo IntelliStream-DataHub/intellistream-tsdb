@@ -153,6 +153,7 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_chunk_repair_queue_depth` | gauge | number of damaged chunks currently queued or actively being repaired on this volume leader (R12) |
 | `tsdb_disk_class_mismatch` | gauge | number of local `--disk` entries whose runtime `/sys` block-device class detection disagreed with the authoritative class at start (R13) |
 | `tsdb_disk_shared_device` | gauge | 1 while this server is running with `--allow-shared-device` (`cluster.allow.shared.device`), else 0 (R13) |
+| `tsdb_disk_state{store,class}` | gauge | per local `--disk` (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`): live disk state: `0` up, `1` down (missing, probe stalled/errors, or chunk store EIO/ENOSPC), `2` out, `3` destroyed (R13) |
 
 Note on overlapping families: `tsdb_volume_{young_margin,settled_margin,settled_state}` report every volume in this server's metadata copy (including volumes held elsewhere), and `tsdb_volume_diverged{volume,path}` covers local engine volumes (standalone and cluster); the `tsdb_cluster_volume_*`, `tsdb_cluster_rebuild_*`, `tsdb_settle_backlog_*`, and `tsdb_cluster_full_refusals_total` families above report only cluster volumes **held** by this server (plus active stripe fills on storage servers) and carry the fixed names used by P4's cluster alerts. Messages a replica dropped for another set version remain a rate-limited log line only (not a counter).
 

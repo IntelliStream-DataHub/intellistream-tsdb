@@ -34,6 +34,10 @@ int repld_leading(uint32_t v, uint64_t *epoch);
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);
+/* R13 (r13-fault, E57, D16): volume v's fast disk went DOWN (probe stall or errors): stop the driver, depose any
+ * leader immediately without waiting for stuck calls, quiesce the engine, and schedule a heartbeat (LOCAL_FAULT).
+ * Returns 1 when a driver held v, 0 otherwise. */
+int repld_disk_down(uint32_t v, const char *why);
 /* 1 while volume v is led here with fewer in-sync replicas than its min_isr: writes are refused (REPL_E_ISR). */
 int repld_isr_short(uint32_t v);
 /* 1 while volume v is led here and this server or any current ISR member is FULL (R9 E30, D17): writes are refused
