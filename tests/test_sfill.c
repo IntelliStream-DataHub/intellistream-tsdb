@@ -492,6 +492,8 @@ static void test_copy_from_prev(void)
     for (unsigned p = 0; p < 6; p++)
         CHECK(fs.read_calls_node[10 + p] == 0, "copy: non-prev node %u was read during 1x copy", 10 + p);
     CHECK(fs.nreopened == 1 && memcmp(fs.reopened[0], fs.objs[0].oid, 16) == 0, "copy: notify_reopen missing");
+    struct sfill_progress pr = {0};
+    CHECK(sfill_get_progress(sf, &pr, 1) == 0, "copy: completed (whole) job must be omitted from sfill_get_progress");
     verify_chunk_matches_orig(be, 1, 2, &fs.objs[0], "copy");
 
     sfill_free(sf);
@@ -767,9 +769,11 @@ static void test_pagination_filter_and_empty(void)
     pace_stats(&ps);
     CHECK(ps.taken_bytes[PACE_RECV] > 0, "page: pace PACE_RECV taken_bytes should be > 0");
 
-    /* sfill_stop removes the job from reports immediately. */
+    /* sfill_stop removes the job from reports and progress immediately. */
+    struct sfill_progress pr = {0};
     sfill_stop(sf, 6, 4);
     CHECK(sfill_report(sf, &rep, 1) == 0, "page: sfill_stop did not remove report");
+    CHECK(sfill_get_progress(sf, &pr, 1) == 0, "page: sfill_stop did not remove progress");
 
     sfill_free(sf);
     fake_src_free(&fs);
@@ -873,6 +877,14 @@ static void test_version_change_mid_object(void)
     }
     CHECK(fs.read_entered, "verchg: worker did not enter read_cell");
     pthread_mutex_unlock(&fs.mu);
+
+    /* While obj 0 is actively in flight (V=2), sfill_get_progress must report bytes_total == pos_len[2]. */
+    struct sfill_progress pr = {0};
+    uint32_t npr = sfill_get_progress(sf, &pr, 1);
+    CHECK(npr == 1 && pr.volume == 9 && pr.pos == 2 && pr.bytes_done == 0 && pr.bytes_total == fs.objs[0].pos_len[2] &&
+              pr.started_ms > 0 && pr.last_progress_ms >= pr.started_ms,
+          "verchg: live sfill_get_progress mismatch (n=%u done=%" PRIu64 " total=%" PRIu64 " want=%" PRIu64 ")", npr,
+          pr.bytes_done, pr.bytes_total, fs.objs[0].pos_len[2]);
 
     /* Bump stripe_version to 3 while worker is in-flight on V=2, then unblock the read! */
     cfg.stripe_version = 3;

@@ -527,6 +527,8 @@ void cluster_status_free(struct cluster_status *st)
         free(st->heard[i].doms);
         free(st->heard[i].sections);
         free(st->heard[i].fills);
+        free(st->heard[i].progress_vols);
+        free(st->heard[i].progress_stores);
     }
     free(st->heard);
     st->heard = NULL;
@@ -667,12 +669,102 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         getstr(&r, st->links, sizeof st->links);
     st->wall_ms = r.bad ? 0 : get64(&r);
     uint32_t il = r.bad ? 0 : get32(&r);
-    if (r.bad || r.len - r.off != il) {
+    if (r.bad || !need(&r, il)) {
         cluster_status_free(st);
         return -1;
     }
     st->image = body + r.off;
     st->image_len = il;
+    r.off += il;
+    /* Optional appended progress block (R14, r14-progress; D23): strict bounds & exact-length check. */
+    if (r.off < r.len) {
+        uint32_t pmagic = get32(&r);
+        uint8_t pver = get8(&r);
+        uint32_t pn = get32(&r);
+        if (r.bad || pmagic != 0x50524f47u || pver != 1u || pn > st->nheard) {
+            cluster_status_free(st);
+            return -1;
+        }
+        uint8_t *seen = st->nheard ? calloc(st->nheard, 1) : NULL;
+        if (st->nheard && !seen) {
+            cluster_status_free(st);
+            return -1;
+        }
+        for (uint32_t i = 0; i < pn && !r.bad; i++) {
+            uint32_t mid = get32(&r);
+            uint32_t nv = get32(&r);
+            if (r.bad || nv > CREPORT_PROGRESS_VOLS_MAX || (size_t)nv * 58u > r.len - r.off) {
+                r.bad = 1;
+                break;
+            }
+            struct creport_vol_progress *vols = nv ? calloc(nv, sizeof *vols) : NULL;
+            if (nv && !vols) {
+                r.bad = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < nv && !r.bad; j++) {
+                vols[j].volume = get32(&r);
+                vols[j].role = get8(&r);
+                vols[j].stalled = get8(&r);
+                vols[j].bytes_done = get64(&r);
+                vols[j].bytes_total = get64(&r);
+                vols[j].started_ms = get64(&r);
+                vols[j].last_progress_ms = get64(&r);
+                vols[j].settle_keys_waiting = get32(&r);
+                vols[j].settle_oldest_wait_s = get64(&r);
+                vols[j].young_scrub_age_s = get64(&r);
+                if (vols[j].role > CREPORT_REBUILD_FILL || vols[j].stalled > 1)
+                    r.bad = 1;
+            }
+            uint32_t ns = r.bad ? 0 : get32(&r);
+            if (r.bad || ns > CREPORT_PROGRESS_STORES_MAX || (size_t)ns * 20u > r.len - r.off) {
+                free(vols);
+                r.bad = 1;
+                break;
+            }
+            struct creport_store_progress *stores = ns ? calloc(ns, sizeof *stores) : NULL;
+            if (ns && !stores) {
+                free(vols);
+                r.bad = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < ns && !r.bad; j++) {
+                stores[j].store = get32(&r);
+                stores[j].scrub_age_s = get64(&r);
+                stores[j].drain_bytes_left = get64(&r);
+            }
+            if (r.bad) {
+                free(vols);
+                free(stores);
+                break;
+            }
+            struct cluster_heard *dst = NULL;
+            uint32_t dst_idx = 0;
+            for (uint32_t k = 0; k < st->nheard; k++) {
+                if (st->heard[k].id == mid) {
+                    dst = &st->heard[k];
+                    dst_idx = k;
+                    break;
+                }
+            }
+            if (!dst || seen[dst_idx]) {
+                free(vols);
+                free(stores);
+                r.bad = 1;
+                break;
+            }
+            seen[dst_idx] = 1;
+            dst->nprogress_vols = nv;
+            dst->progress_vols = vols;
+            dst->nprogress_stores = ns;
+            dst->progress_stores = stores;
+        }
+        free(seen);
+        if (r.bad || r.off != r.len) {
+            cluster_status_free(st);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -4520,6 +4612,59 @@ static void put_status(struct buf *b)
         free(img);
     } else {
         put32(b, 0);
+    }
+    /* Appended progress block (R14, r14-progress; D23): per-member latest HBS_PROGRESS with leader-computed stalled. */
+    uint32_t pn = 0;
+    const struct heard *self_h = C.have_node ? heard_get(C.id) : NULL;
+    if (self_h && creport_heard_get(&self_h->ext, HBS_PROGRESS))
+        pn++;
+    for (size_t i = 0; i < C.nheard; i++) {
+        if (C.heard[i].id == C.id)
+            continue;
+        if (creport_heard_get(&C.heard[i].ext, HBS_PROGRESS))
+            pn++;
+    }
+    if (pn > 0) {
+        uint64_t now_mono = creport_mono_ns();
+        put32(b, 0x50524f47u); /* "PROG" */
+        put8(b, 1u);
+        put32(b, pn);
+        for (int pass = 0; pass < 2; pass++) {
+            size_t count = pass == 0 ? (self_h ? 1 : 0) : C.nheard;
+            for (size_t i = 0; i < count; i++) {
+                const struct heard *h = pass == 0 ? self_h : &C.heard[i];
+                if (pass == 1 && h->id == C.id)
+                    continue;
+                const struct creport_progress *pr = creport_heard_get(&h->ext, HBS_PROGRESS);
+                if (!pr)
+                    continue;
+                uint32_t nv = pr->nvols <= CREPORT_PROGRESS_VOLS_MAX ? pr->nvols : CREPORT_PROGRESS_VOLS_MAX;
+                uint32_t ns = pr->nstores <= CREPORT_PROGRESS_STORES_MAX ? pr->nstores : CREPORT_PROGRESS_STORES_MAX;
+                put32(b, h->id);
+                put32(b, nv);
+                for (uint32_t j = 0; j < nv; j++) {
+                    const struct creport_vol_progress *v = &pr->vols[j];
+                    uint8_t stalled = creport_progress_is_stalled(v->role, pr->sent_wall_ms, v->last_progress_ms,
+                                                                  pr->recv_mono_ns, now_mono);
+                    put32(b, v->volume);
+                    put8(b, v->role);
+                    put8(b, stalled);
+                    put64(b, v->bytes_done);
+                    put64(b, v->bytes_total);
+                    put64(b, v->started_ms);
+                    put64(b, v->last_progress_ms);
+                    put32(b, v->settle_keys_waiting);
+                    put64(b, v->settle_oldest_wait_s);
+                    put64(b, v->young_scrub_age_s);
+                }
+                put32(b, ns);
+                for (uint32_t j = 0; j < ns; j++) {
+                    put32(b, pr->stores[j].store);
+                    put64(b, pr->stores[j].scrub_age_s);
+                    put64(b, pr->stores[j].drain_bytes_left);
+                }
+            }
+        }
     }
 }
 
@@ -8649,6 +8794,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     C.gasp_done = 0;
     g_gasp_running = 1;
     pthread_mutex_unlock(&g_gasp_mu);
+    (void)creport_progress_register();
     if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
         pthread_mutex_lock(&g_gasp_mu);
         g_gasp_running = 0;

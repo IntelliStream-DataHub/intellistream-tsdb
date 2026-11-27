@@ -108,7 +108,8 @@ struct rjob {
     int have_man;
     uint8_t *fdone;          /* receiver: per file of SNAPMAN, 1 once it is in whole (a file begun again is not counted) */
     size_t fnext, nleft;      /* source: the next file to send; receiver: the files still to come */
-    uint64_t total, moved;   /* the bytes of the files (SNAPMAN's left out), and those moved so far */
+    uint64_t total, moved;    /* the bytes of the files (SNAPMAN's left out), and those moved so far */
+    uint64_t data_moved;      /* data file bytes moved so far (excluding SNAPMAN), for HBS_PROGRESS */
     /* receiver: the file being written */
     int fd;
     int cur_redo; /* the file is in already: begun again because its DONE was lost; fd is a read of it for the hash */
@@ -116,7 +117,7 @@ struct rjob {
     uint64_t cur_file, cur_total, got;
     struct pl_xxh h;
     struct plink *cur_l;
-    uint64_t start_ms, last_ms, down_ms;
+    uint64_t start_ms, last_ms, progress_ms, down_ms;
 };
 
 /* the fd of a file queued on a link: the link's until `done` */
@@ -132,11 +133,18 @@ struct wtask {
     struct rjob *j;
 };
 
-/* per volume: the next request no sooner than this; lines said once */
+/* per volume: the next request no sooner than this; lines said once; persistent receiver rebuild episode state */
 struct rvs {
     uint32_t vol;
     uint64_t retry_at, tick_ms;
     int said_space, said_wait, said_stale;
+    /* Persistent receiver rebuild progress across RS_STALL_MS (30 s) abandon/retry loops (R14, §14.4 15-min stall):
+     * stays active from first rsnap_need() until install succeeds, volume joins ISR / leaves M_REPLICA, or closes. */
+    int dst_active;
+    uint64_t dst_start_ms;
+    uint64_t dst_progress_ms;
+    uint64_t dst_bytes_done;
+    uint64_t dst_bytes_total;
 };
 
 static struct {
@@ -204,6 +212,19 @@ static uint64_t ms_now(void)
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+static uint64_t wall_ms_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static uint64_t mono_to_wall_ms(uint64_t mono_ts, uint64_t mono_now, uint64_t wall_now)
+{
+    uint64_t age = mono_now >= mono_ts ? mono_now - mono_ts : 0;
+    return wall_now > age ? wall_now - age : 0;
+}
+
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static void put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 static uint32_t get32(const void *p)
@@ -238,6 +259,91 @@ void rsnap_get_stats(struct rsnap_stats *out)
     out->last_ms = STATGET(last_ms);
     out->kind5_bytes = peerlink_kind_bytes(PL_KIND_SNAP);
     out->kind2_bytes = peerlink_kind_bytes(PL_KIND_BULK);
+}
+
+uint32_t rsnap_get_progress(struct rsnap_progress *out, uint32_t cap)
+{
+    if (!out || cap == 0)
+        return 0;
+    uint64_t mono_now = ms_now(), wall_now = wall_ms_now();
+    uint32_t n = 0;
+    pthread_mutex_lock(&S.mu);
+    for (struct rjob *j = S.jobs; j; j = j->next) {
+        if (j->dead)
+            continue;
+        uint8_t role = j->role == R_SRC ? 1 : 2;
+        uint64_t done = j->data_moved;
+        uint64_t total = j->total;
+        uint64_t start_m = j->start_ms;
+        uint64_t prog_m = j->progress_ms;
+        if (j->role == R_DST) {
+            /* Preserve persistent episode start/progress timestamps across abandon/retry loops. */
+            for (uint32_t vi = 0; vi < S.nvs; vi++) {
+                if (S.vs[vi].vol == j->vol && S.vs[vi].dst_active) {
+                    start_m = S.vs[vi].dst_start_ms;
+                    prog_m = S.vs[vi].dst_progress_ms;
+                    if (total == 0 && S.vs[vi].dst_bytes_total > 0) {
+                        done = S.vs[vi].dst_bytes_done;
+                        total = S.vs[vi].dst_bytes_total;
+                    }
+                    break;
+                }
+            }
+        }
+        if (total > 0 && done > total)
+            done = total;
+        uint64_t started = mono_to_wall_ms(start_m, mono_now, wall_now);
+        uint64_t last_prog = mono_to_wall_ms(prog_m, mono_now, wall_now);
+        /* Combine multiple concurrent sends of the same volume into one per-volume entry. */
+        uint32_t k = 0;
+        for (; k < n; k++) {
+            if (out[k].volume == j->vol)
+                break;
+        }
+        if (k < n) {
+            out[k].bytes_done += done;
+            out[k].bytes_total += total;
+            if (started < out[k].started_ms)
+                out[k].started_ms = started;
+            if (last_prog < out[k].last_progress_ms)
+                out[k].last_progress_ms = last_prog;
+        } else if (n < cap) {
+            out[n++] = (struct rsnap_progress){
+                .volume = j->vol,
+                .role = role,
+                .bytes_done = done,
+                .bytes_total = total,
+                .started_ms = started,
+                .last_progress_ms = last_prog,
+            };
+        }
+    }
+    /* Emit persistent receiver rebuild episodes currently between abandon/BUSY/space-refusal and next retry. */
+    for (uint32_t vi = 0; vi < S.nvs && n < cap; vi++) {
+        const struct rvs *v = &S.vs[vi];
+        if (!v->dst_active)
+            continue;
+        uint32_t k = 0;
+        for (; k < n; k++) {
+            if (out[k].volume == v->vol)
+                break;
+        }
+        if (k < n)
+            continue;
+        uint64_t done = v->dst_bytes_done;
+        if (v->dst_bytes_total > 0 && done > v->dst_bytes_total)
+            done = v->dst_bytes_total;
+        out[n++] = (struct rsnap_progress){
+            .volume = v->vol,
+            .role = 2,
+            .bytes_done = done,
+            .bytes_total = v->dst_bytes_total,
+            .started_ms = mono_to_wall_ms(v->dst_start_ms, mono_now, wall_now),
+            .last_progress_ms = mono_to_wall_ms(v->dst_progress_ms, mono_now, wall_now),
+        };
+    }
+    pthread_mutex_unlock(&S.mu);
+    return n;
 }
 
 /* ---- links */
@@ -471,6 +577,15 @@ void rsnap_need(struct rvol *rv, int src)
         pthread_mutex_unlock(&S.mu);
         return;
     }
+    /* Start the persistent rebuild episode only once a transfer job actually starts (not while queued behind
+     * rebuild_max or initial retry_at backoff); once started, dst_active survives dst_abandon retries until install
+     * succeeds or the volume leaves M_REPLICA / joins ISR. */
+    if (!v->dst_active) {
+        v->dst_active = 1;
+        v->dst_start_ms = v->dst_progress_ms = now;
+        v->dst_bytes_done = 0;
+        v->dst_bytes_total = 0;
+    }
     j->role = R_DST, j->state = S_PREP, j->vol = rv->number, j->peer = node, j->fd = -1;
     /* random: a source may still serve the request of this member's previous run, whose counter started where ours did */
     j->req = rnd ^ ++S.seq;
@@ -479,7 +594,7 @@ void rsnap_need(struct rvol *rv, int src)
     j->set_version = rv->rec.set_version, j->epoch = rv->epoch;
     j->margin = snap_pace_margin(&rv->rec);
     j->pace_id = pace_job_begin_ex(PACE_RECV, j->margin, 0);
-    j->start_ms = j->last_ms = now;
+    j->start_ms = j->last_ms = j->progress_ms = now;
     snprintf(j->dir, sizeof j->dir, "%s/v%" PRIu32 ".snap", G.dir, rv->number);
     j->next = S.jobs;
     S.jobs = j;
@@ -547,8 +662,11 @@ static void dst_man(struct rjob *j)
     } else {
         j->man = m, j->have_man = 1, j->fdone = fdone;
         j->total = total, j->nleft = nfiles, j->state = S_FILES;
-        j->last_ms = ms_now();
-        vs_get(j->vol)->said_space = 0;
+        j->last_ms = j->progress_ms = ms_now();
+        struct rvs *vs = vs_get(j->vol);
+        vs->said_space = 0;
+        if (vs->dst_active)
+            vs->dst_bytes_total = total;
         if (!nfiles) {
             j->state = S_COMPLETE;
             task_add(W_FINISH, j);
@@ -667,7 +785,18 @@ int rsnap_bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, cons
     pthread_cond_broadcast(&S.cv);
     if (!bad) {
         j->got += n, j->moved += n;
-        j->last_ms = ms_now();
+        uint64_t now = ms_now();
+        j->last_ms = now;
+        if (idx != RS_MAN) {
+            j->data_moved += n;
+            j->progress_ms = now;
+            struct rvs *vs = vs_get(j->vol);
+            if (vs->dst_active) {
+                vs->dst_bytes_done = j->data_moved;
+                vs->dst_bytes_total = j->total;
+                vs->dst_progress_ms = now;
+            }
+        }
         STAT(bytes_received, n);
     } else
         dst_abandon(j, "writing a file failed", 1);
@@ -798,7 +927,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
     j->role = R_SRC, j->state = S_MAKING, j->vol = vol, j->peer = from, j->req = req, j->epoch = epoch, j->fd = -1;
     j->set_version = setv, j->rate = rate, j->margin = margin, j->hist = hist, j->nhist = nhist;
     j->pace_id = pace_job_begin_ex(PACE_SEND, margin, 0);
-    j->start_ms = j->last_ms = ms_now();
+    j->start_ms = j->last_ms = j->progress_ms = ms_now();
     j->next = S.jobs;
     S.jobs = j;
     task_add(W_MAKE, j);
@@ -818,8 +947,13 @@ static void src_done(void *arg, uint64_t file, int status, uint64_t sent)
             src_abort(j, status == PL_E_REFUSED ? "the receiver refused a file" : "a file could not be sent");
         else {
             STAT(bytes_sent, sent);
-            j->moved += t->idx == RS_MAN ? 0 : t->size;
-            j->last_ms = ms_now();
+            uint64_t now = ms_now();
+            j->last_ms = now;
+            if (t->idx != RS_MAN) {
+                j->moved += t->size;
+                j->data_moved += t->size;
+                j->progress_ms = now;
+            }
             if (t->idx == RS_MAN) {
                 if (j->state == S_MAN)
                     j->state = S_WAITGO;
@@ -937,7 +1071,7 @@ void rsnap_frame(struct plink *l, uint8_t type, const uint8_t *p, size_t n)
         }
         if (j->state == S_WAITGO || j->state == S_MAN) {
             j->state = S_SENDING;
-            j->last_ms = ms_now();
+            j->last_ms = j->progress_ms = ms_now();
             task_add(W_NEXT, j);
         }
         break;
@@ -960,8 +1094,18 @@ void rsnap_in(struct rvol *rv, uint32_t node, const uint8_t *p, size_t n) { (voi
 void rsnap_tick(struct rvol *rv)
 {
     uint64_t now = ms_now();
+    int in_isr = 0;
+    for (uint32_t k = 0; k < rv->rec.nisr; k++)
+        if (rv->rec.isr[k] == G.self)
+            in_isr = 1;
     pthread_mutex_lock(&S.mu);
     struct rvs *v = vs_get(rv->number);
+    if (v->dst_active &&
+        (rv->mode != M_REPLICA || (in_isr && !rv->div_rebuild && !job_find(R_DST, rv->number, 0)))) {
+        v->dst_active = 0;
+        v->dst_bytes_done = 0;
+        v->dst_bytes_total = 0;
+    }
     if (now - v->tick_ms < RS_TICK_EVERY_MS || !S.jobs) {
         pthread_mutex_unlock(&S.mu);
         return;
@@ -1024,6 +1168,13 @@ void rsnap_closed(uint32_t vol)
             dst_abandon(j, "the replica is closed here", 1);
         else
             src_abort(j, "the volume is closed here");
+    }
+    for (uint32_t vi = 0; vi < S.nvs; vi++) {
+        if (S.vs[vi].vol == vol) {
+            S.vs[vi].dst_active = 0;
+            S.vs[vi].dst_bytes_done = 0;
+            S.vs[vi].dst_bytes_total = 0;
+        }
     }
     pthread_mutex_unlock(&S.mu);
 }
@@ -1137,6 +1288,7 @@ static void w_make(struct rjob *j)
     say("volume %" PRIu32 ": snapshot made for node %" PRIu32 ": P %" PRIu64 ", %zu files, %" PRIu64 " bytes; sent"
         " at %" PRIu64 " MB/s", j->vol, j->peer, info.p, info.nfiles, j->total, j->rate >> 20);
     j->state = S_MAN;
+    j->progress_ms = ms_now();
     j->busy++;
     pthread_mutex_unlock(&S.mu);
     const char *why = src_queue(j, RS_MAN);
@@ -1242,8 +1394,11 @@ static void install(struct rjob *j)
         return;
     }
     crash_point(CP_SNAP_RECEIVED);
+    uint64_t inst_start_wall = mono_to_wall_ms(j->start_ms, ms_now(), wall_ms_now());
+    snapinst_progress_begin(j->vol, j->total, inst_start_wall);
     struct snapinst_result res;
     int rc = snapinst_install(G.dir, j->vol, j->dir, m->p, m->p_epoch, &res);
+    snapinst_progress_end(j->vol);
     /* rv's reference keeps it (unlisted by the install's repld_close_end, or not) from being freed and its address
      * reused by the next open's driver until this compare is done */
     struct rvol *cur = drv ? vol_find(j->vol) : NULL;
@@ -1275,7 +1430,13 @@ static void install(struct rjob *j)
         STAT(failed, 1);
     }
     pthread_mutex_lock(&S.mu);
-    vs_get(j->vol)->retry_at = 0; /* the volume's next open asks again if it still needs one */
+    struct rvs *vs = vs_get(j->vol);
+    vs->retry_at = 0; /* the volume's next open asks again if it still needs one */
+    if (rc == 0) {
+        vs->dst_active = 0;
+        vs->dst_bytes_done = 0;
+        vs->dst_bytes_total = 0;
+    }
     pthread_mutex_unlock(&S.mu);
 }
 
@@ -1422,6 +1583,13 @@ void rsnap_stop(struct rvol *rv)
             job_free(j);
         } else
             pp = &j->next;
+    }
+    for (uint32_t vi = 0; vi < S.nvs; vi++) {
+        if (S.vs[vi].vol == rv->number) {
+            S.vs[vi].dst_active = 0;
+            S.vs[vi].dst_bytes_done = 0;
+            S.vs[vi].dst_bytes_total = 0;
+        }
     }
     pthread_mutex_unlock(&S.mu);
 }

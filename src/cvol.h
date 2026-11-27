@@ -68,4 +68,8 @@ int tsdb_volume_diverged(tsdb *t, size_t vol);
  * Uses eng_* naming so libtsdb.so does not export it as public API (tools/libtsdb.map). */
 void eng_set_wal_sync_observer(void (*fn)(int64_t ns));
 
+/* R14 (r14-progress, D23): leaf-locked cached settle backlog getter for cluster EC volumes (updated on the settle
+ * thread in src/settle.c; never takes db->lock or t->lock, safe on the cluster heartbeat and metrics threads). */
+void ecpolicy_cluster_backlog_get(uint32_t vol, uint32_t *keys_waiting, uint64_t *oldest_wait_s);
+
 #endif

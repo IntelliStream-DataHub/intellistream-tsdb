@@ -665,7 +665,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics full fullnonisr ecrebuild \
+    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
@@ -1072,7 +1072,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1209,9 +1209,9 @@ ops-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 	$(MUT) --name ops-drain --list "drainleaves" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodedrain
 	$(MUT) --name ops-replace --list "replaceclear" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodereplace
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
-$(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h server/place.h $(RAFT_HDR) | $(B)
+$(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/creport.h server/meta.h server/place.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
-$(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
+$(B)/cluster-user-cli.o: tools/cluster-user-cli.c server/cluster.h server/creport.h server/meta.h server/users.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<
 # the data links (server/peerlink.c): two endpoints in one process; includes src/internal.h for xxh64 (in the library)
 $(B)/test_plrdma: tests/test_plrdma.c tests/plr_fake.h tests/pl_fake.h server/plrdma.h server/pltransport.h server/peerlink.h $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/peerlink.o $(B)/tsdb_crypto.o $(B)/rdma.flags $(LIB)
@@ -1250,7 +1250,7 @@ META_SOAK_FIRST   ?= 1000
 # cvol_check.o opens a replica directory in-process (the engine's headers; test_cluster speaks the client's)
 $(B)/cvol_check.o: tests/cvol_check.c tests/cvol_check.h src/internal.h src/feed.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -Itests -c -o $@ $<
-$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h tests/rdma_dev.h server/cluster.h server/crashpt.h server/meta.h server/peerlink.h server/plrdma.h \
+$(B)/test_cluster: tests/test_cluster.c tests/harness.h tests/cvol_check.h tests/rdma_dev.h server/cluster.h server/creport.h server/crashpt.h server/meta.h server/peerlink.h server/plrdma.h \
     $(CLUSTER_OBJ) $(B)/cvol_check.o $(B)/users.o $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB) \
     $(if $(filter Darwin,$(UNAME_S)),,$(B)/libcrashfs.so)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -Itests -Iclient -o $@ $< $(CLUSTER_OBJ) $(B)/cvol_check.o \
@@ -1302,6 +1302,10 @@ hb-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
 report-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	$(MUT) --name report --uring --list "metricstale sectionsdrop" -- env TSDB_REPORT_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ metrics
+# r14-progress: HBS_PROGRESS & STATUS progress mutants (progressfrozen, progressnototal) must fail test_cluster progress
+progress-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	$(MUT) --name progress --uring --list "progressfrozen progressnototal" -- env TSDB_PROGRESS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ progress
 # r8f + r8n: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail
 # test_cluster ecbasic or ecslow (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb

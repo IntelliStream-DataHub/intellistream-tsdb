@@ -113,8 +113,10 @@ void chunkpeer_cluster_stop(void); /* the epoch source's installer, if it still 
 struct chunkpeer *chunkpeer_cluster(void);
 /* R9 (r9-fill): tsdbd's checked stripe fill worker and OBJLIST/REOPEN server handlers (chunkpeer_cluster.c). */
 struct tsdb;
+struct sfill_progress;
 int sfill_cluster_start(struct tsdb *db);
 void sfill_cluster_stop(void);
+uint32_t sfill_cluster_progress(struct sfill_progress *out, uint32_t cap);
 /* cvol.c, before a cluster volume's engine opens (writer or replica): an ec volume in the copy gets requires=tier,ec in
  * its META (synced), so that it attaches the peer cold ops; 0 for any other volume, else the line and an error. */
 int chunkpeer_cluster_prepare(uint32_t volume, const char *vdir);

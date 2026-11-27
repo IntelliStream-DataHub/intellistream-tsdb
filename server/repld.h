@@ -96,4 +96,16 @@ struct rsnap_stats {
 };
 void rsnap_get_stats(struct rsnap_stats *out);
 
+/* Active snapshot transfer progress per volume (server/rsnap.c; HBS_PROGRESS, R14). */
+struct rsnap_progress {
+    uint32_t volume;
+    uint8_t role; /* 1 = source (sending), 2 = receiver (receiving) */
+    uint64_t bytes_done;
+    uint64_t bytes_total;
+    uint64_t started_ms;       /* Unix epoch ms */
+    uint64_t last_progress_ms; /* Unix epoch ms */
+};
+/* Lock-safe getter (takes S.mu briefly, no I/O). Returns entries written (<= cap). */
+uint32_t rsnap_get_progress(struct rsnap_progress *out, uint32_t cap);
+
 #endif

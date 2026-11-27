@@ -19,8 +19,12 @@
 /* ---- 1. Heartbeat section registry ---- */
 
 #define CREPORT_SEC_BUILTIN_MAX 8 /* HBS_NODE(1) .. HBS_FILL(8) stay inline in cluster.c */
+#define HBS_PROGRESS 9            /* R14 (r14-progress, D23): rebuild/snapshot, settle backlog, scrub & drain progress */
 #define CREPORT_SEC_MAX 32
 #define CREPORT_SEC_PAYLOAD_MAX 65536
+#define CREPORT_PROGRESS_VOLS_MAX 256   /* matches CLUSTER_REPORT_VOLS */
+#define CREPORT_PROGRESS_STORES_MAX 64
+#define CREPORT_REBUILD_STALL_MS (15ull * 60ull * 1000ull) /* 15 min without progress (design-cluster-data.md §14.4) */
 
 /* Encode this server's section payload into buf[0..cap):
  * return bytes written (> 0 to emit), 0 to omit this beat, or < 0 on error (omitted). */
@@ -145,6 +149,72 @@ size_t creport_dump_registry(char *buf, size_t cap);
 
 /* Replication lag of held volume `vol` from server/repld.c (implemented in creport_drv.o for tsdbd). */
 void creport_repld_lag(uint32_t vol, uint64_t *lag_positions, uint64_t *lag_ms);
+
+/* ---- 3. Progress heartbeat section (HBS_PROGRESS; R14, r14-progress, D23) ---- */
+
+enum creport_rebuild_role {
+    CREPORT_REBUILD_NONE = 0,
+    CREPORT_REBUILD_SNAP_SRC = 1, /* sending a snapshot */
+    CREPORT_REBUILD_SNAP_DST = 2, /* receiving or installing a snapshot */
+    CREPORT_REBUILD_FILL = 3,     /* stripe position fill (sfill) */
+};
+
+struct creport_vol_progress {
+    uint32_t volume;
+    uint8_t role;              /* enum creport_rebuild_role */
+    uint8_t stalled;           /* 1 if active rebuild made no progress for >= stall threshold */
+    uint64_t bytes_done;
+    uint64_t bytes_total;
+    uint64_t started_ms;       /* Unix epoch ms when rebuild/snapshot started (0 if none) */
+    uint64_t last_progress_ms; /* Unix epoch ms when rebuild/snapshot last advanced (0 if none) */
+    uint32_t settle_keys_waiting;
+    uint64_t settle_oldest_wait_s;
+    uint64_t young_scrub_age_s; /* 0/unknown until r12-young registers its getter */
+};
+
+struct creport_store_progress {
+    uint32_t store;            /* 0-based local chunk store index */
+    uint64_t scrub_age_s;      /* 0/unknown until r12-chunk registers its getter */
+    uint64_t drain_bytes_left; /* 0 until r13-lmove registers its getter */
+};
+
+struct creport_progress {
+    uint64_t sent_wall_ms; /* sender's CLOCK_REALTIME ms at encode time (clock-skew-free stall age) */
+    uint64_t recv_mono_ns; /* receiver's CLOCK_MONOTONIC ns when decoded (0 on sender) */
+    uint32_t nvols;
+    uint32_t nstores;
+    struct creport_vol_progress *vols;     /* nvols <= CREPORT_PROGRESS_VOLS_MAX */
+    struct creport_store_progress *stores; /* nstores <= CREPORT_PROGRESS_STORES_MAX */
+};
+
+void creport_progress_free(struct creport_progress *p);
+const char *creport_rebuild_role_name(uint8_t role);
+
+/* Local providers & scrub/drain hook points (lock-safe; called from heartbeat encoder and metrics collectors). */
+typedef uint32_t (*creport_progress_vols_fn)(void *arg, struct creport_vol_progress *out, uint32_t cap);
+typedef uint32_t (*creport_progress_stores_fn)(void *arg, struct creport_store_progress *out, uint32_t cap);
+typedef uint64_t (*creport_young_scrub_age_fn)(void *arg, uint32_t volume);
+typedef void (*creport_store_extra_fn)(void *arg, uint32_t store, uint64_t *scrub_age_s, uint64_t *drain_bytes_left);
+
+/* Registers HBS_PROGRESS with creport_section() (idempotent; called from cluster_start()). */
+int creport_progress_register(void);
+void creport_progress_set_providers(creport_progress_vols_fn vols_fn, void *vols_arg,
+                                    creport_progress_stores_fn stores_fn, void *stores_arg);
+/* Hook points for r12-young, r12-chunk, and r13-lmove (return 0 until registered). */
+void creport_progress_set_young_scrub(creport_young_scrub_age_fn fn, void *arg);
+void creport_progress_set_store_extra(creport_store_extra_fn fn, void *arg);
+uint64_t creport_progress_query_young_scrub(uint32_t volume);
+void creport_progress_query_store_extra(uint32_t store, uint64_t *scrub_age_s, uint64_t *drain_bytes_left);
+
+/* Stall threshold in ms (CREPORT_REBUILD_STALL_MS, or test knob under TSDB_TEST_HOOKS). */
+uint64_t creport_progress_stall_ms(void);
+/* Monotonic nanoseconds in the same clock domain as struct creport_progress.recv_mono_ns. */
+uint64_t creport_mono_ns(void);
+/* Computes whether an active rebuild entry is stalled at receiver monotonic time now_mono_ns (0 if evaluated locally). */
+uint8_t creport_progress_is_stalled(uint8_t role, uint64_t sent_wall_ms, uint64_t last_progress_ms,
+                                    uint64_t recv_mono_ns, uint64_t now_mono_ns);
+/* 1 only when TSDB_TEST_HOOKS and mutant progressnototal is active; always 0 in production builds. */
+int creport_progress_zero_total(void);
 
 #ifdef TSDB_TEST_HOOKS
 #define CREPORT_SEC_TEST 250

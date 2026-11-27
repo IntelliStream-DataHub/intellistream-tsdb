@@ -161,5 +161,7 @@ int snap_leftovers(const char *root, uint32_t number);
  * renames when there was an old v<N> */
 enum { SNAP_INST_VERIFIED = 1, SNAP_INST_DONE = 2, SNAP_INST_SWAPPED = 3, SNAP_INST_HALF = 4 };
 extern void (*snap_inst_hook)(int at);
+/* Optional progress callback fired during snap_install file verification (R14: keeps last_progress_ms fresh). */
+extern void (*snap_inst_progress_hook)(uint32_t volume, uint64_t bytes_done);
 
 #endif

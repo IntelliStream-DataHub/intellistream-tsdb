@@ -88,6 +88,19 @@ static uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+static uint64_t wall_ms_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static uint64_t mono_to_wall_ms(uint64_t mono_ts, uint64_t mono_now, uint64_t wall_now)
+{
+    uint64_t age = mono_now >= mono_ts ? mono_now - mono_ts : 0;
+    return wall_now > age ? wall_now - age : 0;
+}
+
 /* ------------------------------------------------------------------ internal state */
 
 enum sfill_obj_rc {
@@ -106,6 +119,10 @@ struct sfill_job {
     uint64_t gen;          /* bumped on stripe_version change or removal */
     uint64_t done;         /* verified objects in current pass */
     uint64_t total;        /* objects discovered so far in current pass */
+    uint64_t bytes_done;   /* chunk bytes verified in current pass (HBS_PROGRESS) */
+    uint64_t bytes_total;  /* chunk bytes discovered so far in current pass (HBS_PROGRESS) */
+    uint64_t start_ms;     /* monotonic ms when job started */
+    uint64_t progress_ms;  /* monotonic ms when job last advanced */
     uint64_t failures;     /* failed passes or object attempts */
     uint8_t whole;         /* 1 once every object < stripe_version is durably held and verified */
     bool removed;          /* sfill_stop() called: hidden from reports and freed when inflight == 0 */
@@ -135,6 +152,7 @@ struct sfill_task {
     int margin;
     bool first_pass;
     uint8_t vuuid[16];
+    uint64_t obj_bytes;
     struct sfill_obj obj; /* owns obj.sums */
 };
 
@@ -819,6 +837,8 @@ static void *worker_main(void *arg)
         if (!j->removed && j->pass_active && j->pass_gen == t->gen && j->gen == t->gen) {
             if (rc == SFILL_OBJ_OK) {
                 j->done++;
+                j->bytes_done += t->obj_bytes;
+                j->progress_ms = mono_ms();
                 should_publish = true;
             } else if (rc != SFILL_OBJ_CANCELLED) {
                 j->round_errors++;
@@ -921,6 +941,8 @@ static void *coord_main(void *arg)
             pick->has_vuuid = false;
             pick->done = 0;
             pick->total = 0;
+            pick->bytes_done = 0;
+            pick->bytes_total = 0;
             pick->round_errors = 0;
             if (pick->pace_id)
                 pace_job_end_ex(PACE_RECV, pick->pace_id);
@@ -997,6 +1019,8 @@ static void *coord_main(void *arg)
                 t->margin = margin;
                 t->first_pass = first_pass;
                 memcpy(t->vuuid, pick->vuuid, 16);
+                t->obj_bytes = chunk_geom_valid(&items[i].g) ? chunk_pos_len(&items[i].g, pos) : 0;
+                pick->bytes_total += t->obj_bytes;
                 t->obj = items[i];
                 items[i].sums = NULL; /* transferred ownership */
                 push_task_locked(sf, t);
@@ -1140,6 +1164,9 @@ int sfill_start(struct sfill *sf, const struct sfill_job_cfg *cfg)
             found->gen++;
             found->done = 0;
             found->total = 0;
+            found->bytes_done = 0;
+            found->bytes_total = 0;
+            found->start_ms = found->progress_ms = mono_ms();
             found->whole = 0;
             found->pass_active = false;
             found->pass_num = 0;
@@ -1173,6 +1200,7 @@ int sfill_start(struct sfill *sf, const struct sfill_job_cfg *cfg)
         }
         j->cfg = *cfg;
         j->gen = 1;
+        j->start_ms = j->progress_ms = mono_ms();
         j->next = sf->jobs;
         sf->jobs = j;
         changed = true;
@@ -1233,6 +1261,32 @@ uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap)
             .total = j->total,
             .whole = j->whole,
             .failures = j->failures,
+        };
+    }
+    pthread_mutex_unlock(&sf->mu);
+    return n;
+}
+
+uint32_t sfill_get_progress(struct sfill *sf, struct sfill_progress *out, uint32_t cap)
+{
+    if (!sf || !out || cap == 0)
+        return 0;
+    uint64_t mono_now = mono_ms(), wall_now = wall_ms_now();
+    uint32_t n = 0;
+    pthread_mutex_lock(&sf->mu);
+    for (struct sfill_job *j = sf->jobs; j && n < cap; j = j->next) {
+        if (j->removed || j->whole)
+            continue;
+        uint64_t done = j->bytes_done;
+        if (j->bytes_total > 0 && done > j->bytes_total)
+            done = j->bytes_total;
+        out[n++] = (struct sfill_progress){
+            .volume = j->cfg.volume,
+            .pos = j->cfg.pos,
+            .bytes_done = done,
+            .bytes_total = j->bytes_total,
+            .started_ms = mono_to_wall_ms(j->start_ms, mono_now, wall_now),
+            .last_progress_ms = mono_to_wall_ms(j->progress_ms, mono_now, wall_now),
         };
     }
     pthread_mutex_unlock(&sf->mu);

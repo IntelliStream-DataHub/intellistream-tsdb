@@ -94,6 +94,9 @@ uint64_t ecsettle_tier_waiting(const struct tier *t);
 /* True while db's most recent settle round on a single-server tier found a due settle blocked by store availability
  * or a halted/unwritable tier. */
 bool eng_tier_settle_is_waiting(const eng *db);
+/* R14 (r14-progress, D23): lock-safe settle backlog getter for one engine (non-blocking, takes db->lock briefly).
+ * Sets *keys_waiting to partition keys due to settle and *oldest_wait_s to seconds past settle eligibility. */
+void ecpolicy_backlog(eng *db, uint32_t *keys_waiting, uint64_t *oldest_wait_s);
 /* R10 (E6): picks a contiguous range of parts of one key to re-encode (caller holds no engine lock): > ec_objects_max
  * combinable .ec objects, or tombstones in newer combinable parts covering > 10% of .ec rows (evaluated outside
  * db->lock); bounded by max_part_bytes and MAX_MERGE_PARTS; skips keys with a pending eckeep digest or recent

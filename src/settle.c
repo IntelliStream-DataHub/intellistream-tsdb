@@ -1135,12 +1135,108 @@ int eng_reencode(eng *db, int64_t partition, part **sel, size_t n, size_t *reenc
 
 /* ------------------------------------------------------------ the thread */
 
+/* R14 (r14-progress, D23): leaf-locked per-volume settle backlog cache for cluster EC volumes, updated on the
+ * settle thread so the cluster heartbeat thread and metrics thread never take db->lock or t->lock. */
+static pthread_mutex_t cbl_mu = PTHREAD_MUTEX_INITIALIZER;
+struct cbl_ent {
+    uint32_t vol;
+    uint32_t keys;
+    uint64_t oldest_s;
+};
+static struct cbl_ent *cbl_tab;
+static size_t cbl_n, cbl_cap;
+
+static void cluster_backlog_set(uint32_t vol, uint32_t keys, uint64_t oldest_s)
+{
+    if (!vol)
+        return;
+    pthread_mutex_lock(&cbl_mu);
+    for (size_t i = 0; i < cbl_n; i++) {
+        if (cbl_tab[i].vol == vol) {
+            if (keys == 0 && oldest_s == 0) {
+                cbl_tab[i] = cbl_tab[--cbl_n];
+            } else {
+                cbl_tab[i].keys = keys;
+                cbl_tab[i].oldest_s = oldest_s;
+            }
+            pthread_mutex_unlock(&cbl_mu);
+            return;
+        }
+    }
+    if (keys == 0 && oldest_s == 0) {
+        pthread_mutex_unlock(&cbl_mu);
+        return;
+    }
+    if (cbl_n == cbl_cap) {
+        size_t nc = cbl_cap ? cbl_cap * 2 : 16;
+        struct cbl_ent *nt = realloc(cbl_tab, nc * sizeof *nt);
+        if (!nt) {
+            pthread_mutex_unlock(&cbl_mu);
+            return;
+        }
+        cbl_tab = nt;
+        cbl_cap = nc;
+    }
+    cbl_tab[cbl_n++] = (struct cbl_ent){.vol = vol, .keys = keys, .oldest_s = oldest_s};
+    pthread_mutex_unlock(&cbl_mu);
+}
+
+void ecpolicy_cluster_backlog_get(uint32_t vol, uint32_t *keys_waiting, uint64_t *oldest_wait_s)
+{
+    if (keys_waiting)
+        *keys_waiting = 0;
+    if (oldest_wait_s)
+        *oldest_wait_s = 0;
+    if (!vol)
+        return;
+    pthread_mutex_lock(&cbl_mu);
+    for (size_t i = 0; i < cbl_n; i++) {
+        if (cbl_tab[i].vol == vol) {
+            if (keys_waiting)
+                *keys_waiting = cbl_tab[i].keys;
+            if (oldest_wait_s)
+                *oldest_wait_s = cbl_tab[i].oldest_s;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&cbl_mu);
+}
+
+/* Test knob (TSDB_TEST_HOOKS only): hold automatic settles while TSDB_SETTLE_HOLD is "1" or names an existing file. */
+static bool settle_test_held(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    const char *h = getenv("TSDB_SETTLE_HOLD");
+    if (!h || !*h)
+        return false;
+    if (strcmp(h, "1") == 0)
+        return true;
+    return access(h, F_OK) == 0;
+#else
+    return false;
+#endif
+}
+
 /* one settle or re-encode of db, if the policy has one due: whether it completed one */
 static bool settle_engine(eng *db)
 {
-    if (eng_check(db) || eng_stopping(db))
+    if (eng_check(db) || eng_stopping(db)) {
+        if (db->ec_cluster)
+            cluster_backlog_set(db->tier_vol, 0, 0);
         return false;
-    if (db->cluster_req && !eccold_leader(db)) /* a cluster volume settles only while this member leads it (D21) */
+    }
+    if (db->cluster_req && !eccold_leader(db)) { /* a cluster volume settles only while this member leads it (D21) */
+        if (db->ec_cluster)
+            cluster_backlog_set(db->tier_vol, 0, 0);
+        return false;
+    }
+    if (db->ec_cluster) {
+        uint32_t bk = 0;
+        uint64_t bo = 0;
+        ecpolicy_backlog(db, &bk, &bo);
+        cluster_backlog_set(db->tier_vol, bk, bo);
+    }
+    if (settle_test_held())
         return false;
     int64_t now = eng_now_ms(db), key = 0;
     bool stores_ready = true;
@@ -1249,6 +1345,12 @@ static bool settle_engine(eng *db)
     else if (rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_NOTFOUND) {
         if (!dw || !dw->waiting)
             ecpolicy_failed(db, key, now);
+    }
+    if (db->ec_cluster) {
+        uint32_t bk = 0;
+        uint64_t bo = 0;
+        ecpolicy_backlog(db, &bk, &bo);
+        cluster_backlog_set(db->tier_vol, bk, bo);
     }
     return rc == 0;
 }
@@ -1369,6 +1471,8 @@ void ecsettle_eng_ready(eng *db)
 
 void ecsettle_eng_stop(eng *db)
 {
+    if (db->ec_cluster)
+        cluster_backlog_set(db->tier_vol, 0, 0);
     if (!db->ecstate || !db->ecstate->settle)
         return;
     atomic_store(&db->ecstate->settle->stopping, true);

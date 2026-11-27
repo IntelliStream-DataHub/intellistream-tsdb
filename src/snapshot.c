@@ -113,6 +113,7 @@
 void (*snap_test_hook)(struct eng *db, int at, const char *arg);
 void (*snap_test_cut)(struct eng *db, uint64_t p, const char (*parts)[96], size_t nparts);
 void (*snap_inst_hook)(int at);
+void (*snap_inst_progress_hook)(uint32_t volume, uint64_t bytes_done);
 int snap_mutant;
 
 static void hook(eng *db, int at, const char *arg)
@@ -1252,14 +1253,22 @@ static int fsync_at(int dfd)
     return tsdb_fsync(dfd) == 0 ? 0 : TSDB_ERR_IO;
 }
 
+static void inst_progress(uint32_t volume, uint64_t bytes_done)
+{
+    void (*h)(uint32_t, uint64_t) = __atomic_load_n(&snap_inst_progress_hook, __ATOMIC_ACQUIRE);
+    if (h)
+        h(volume, bytes_done);
+}
+
 /* every file of the manifest is there with its size and xxh64 (a link entry may be missing: it is made here from the
  * entry it names, the receiver got the file once), nothing else is, every file is synced */
-static int inst_verify_files(int sdfd, const struct snap_man *m, const char *staged)
+static int inst_verify_files(int sdfd, uint32_t number, const struct snap_man *m, const char *staged)
 {
     struct stat *sts = calloc(m->nfiles ? m->nfiles : 1, sizeof *sts);
     if (!sts)
         return TSDB_ERR_NOMEM;
     int rc = 0;
+    uint64_t verified_bytes = 0;
     for (size_t i = 0; i < m->nfiles && rc == 0; i++) {
         const struct snap_file *f = &m->files[i];
         if (f->link && fstatat(sdfd, f->name, &sts[i], AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT &&
@@ -1292,6 +1301,10 @@ static int inst_verify_files(int sdfd, const struct snap_man *m, const char *sta
         if (rc == 0 && tsdb_fdatasync(fd) != 0)
             rc = TSDB_ERR_IO;
         close(fd);
+        if (rc == 0 && !f->link) {
+            verified_bytes += size;
+            inst_progress(number, verified_bytes);
+        }
     }
     free(sts);
     /* nothing else: a file the manifest does not name would be taken for the volume's own by the open */
@@ -1672,7 +1685,7 @@ int snap_install(const char *root, uint32_t number, const char *staged, const st
     if (rc == 0 && m.p >= FNO_BOUND_MAX)
         rc = TSDB_ERR_CORRUPT;
     if (rc == 0)
-        rc = inst_verify_files(sdfd, &m, staged);
+        rc = inst_verify_files(sdfd, number, &m, staged);
     bool ec = false;
     if (rc == 0) {
         uint8_t *b = NULL;

@@ -164,7 +164,10 @@ static int inst_body(struct inst *in, const struct snap_ident *id, int had_engin
         div = file_read(divp, &divn);
 #endif
     __atomic_store_n(&snap_inst_hook, inst_hook, __ATOMIC_RELEASE);
+    __atomic_store_n(&snap_inst_progress_hook, snapinst_progress_update, __ATOMIC_RELEASE);
+    snapinst_progress_touch(in->number);
     int rc = snap_install(in->root, in->number, in->staged, id, have ? &keep : NULL);
+    snapinst_progress_touch(in->number);
     replfile_state_free(&keep);
     if (rc != 0) {
         say("volume %" PRIu32 ": the install of %s failed: %s (%s)", in->number, in->staged, tsdb_strerror(rc),

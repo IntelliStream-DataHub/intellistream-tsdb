@@ -29,4 +29,19 @@ struct snapinst_result {
 int snapinst_install(const char *root, uint32_t number, const char *staged, uint64_t p, uint64_t p_epoch,
                      struct snapinst_result *out);
 
+/* Active snapshot install progress (server/snapinst.c; HBS_PROGRESS, R14). */
+struct snapinst_progress {
+    uint32_t volume;
+    uint64_t bytes_done;
+    uint64_t bytes_total;
+    uint64_t started_ms;       /* Unix epoch ms */
+    uint64_t last_progress_ms; /* Unix epoch ms */
+};
+/* Lock-safe getter (leaf mutex, no I/O). Returns entries written (<= cap). */
+uint32_t snapinst_get_progress(struct snapinst_progress *out, uint32_t cap);
+void snapinst_progress_begin(uint32_t volume, uint64_t bytes_total, uint64_t started_ms);
+void snapinst_progress_update(uint32_t volume, uint64_t bytes_done);
+void snapinst_progress_touch(uint32_t volume);
+void snapinst_progress_end(uint32_t volume);
+
 #endif

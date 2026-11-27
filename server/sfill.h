@@ -52,6 +52,16 @@ struct sfill_report {
     uint64_t failures;
 };
 
+/* Active stripe fill byte progress per (volume, pos) for HBS_PROGRESS (R14). */
+struct sfill_progress {
+    uint32_t volume;
+    uint32_t pos;
+    uint64_t bytes_done;
+    uint64_t bytes_total;
+    uint64_t started_ms;       /* Unix epoch ms */
+    uint64_t last_progress_ms; /* Unix epoch ms */
+};
+
 /* One committed .ec object returned by OBJLIST. */
 struct sfill_obj {
     uint8_t oid[16];
@@ -128,6 +138,8 @@ void sfill_stop(struct sfill *sf, uint32_t volume, uint32_t pos);
 /* Collect up to `cap` current fill reports into `out` (non-blocking, called on the cluster heartbeat path).
  * Returns the number of entries written. */
 uint32_t sfill_report(struct sfill *sf, struct sfill_report *out, uint32_t cap);
+/* Collect up to `cap` active (non-whole) fill byte-progress entries (non-blocking, under sf->mu). */
+uint32_t sfill_get_progress(struct sfill *sf, struct sfill_progress *out, uint32_t cap);
 
 void sfill_get_stats(struct sfill *sf, struct sfill_stats *out);
 

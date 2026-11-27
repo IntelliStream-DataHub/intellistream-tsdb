@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "creport.h"
 #include "meta.h"
 
 #define CLUSTER_SECRET_MIN 16
@@ -501,6 +502,11 @@ struct cluster_heard {
     char *sections;        /* formatted registered heartbeat sections (creport.h); NULL when none */
     uint32_t nfills;
     struct cluster_fill_report *fills;
+    /* R14 (r14-progress, D23): latest HBS_PROGRESS per member from STATUS appended block (stalled computed on leader). */
+    uint32_t nprogress_vols;
+    struct creport_vol_progress *progress_vols;
+    uint32_t nprogress_stores;
+    struct creport_store_progress *progress_stores;
 };
 struct cluster_status {
     uint32_t self;

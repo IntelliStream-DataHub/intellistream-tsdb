@@ -884,15 +884,20 @@ int sfill_cluster_start(struct tsdb *db)
         .on_report = sf_op_on_report,
         .arg = NULL,
     };
-    SF.sf = sfill_new_with_ops(&ops);
-    if (!SF.sf)
+    struct sfill *sf = sfill_new_with_ops(&ops);
+    if (!sf)
         return -1;
+    pthread_mutex_lock(&SF.mu);
+    SF.sf = sf;
     tsdb_cond_init_mono(&SF.cv);
     SF.stop = false;
+    pthread_mutex_unlock(&SF.mu);
     if (pthread_create(&SF.thr, NULL, sf_watch_main, NULL) != 0) {
-        pthread_cond_destroy(&SF.cv);
-        sfill_free(SF.sf);
+        pthread_mutex_lock(&SF.mu);
         SF.sf = NULL;
+        pthread_mutex_unlock(&SF.mu);
+        pthread_cond_destroy(&SF.cv);
+        sfill_free(sf);
         return -1;
     }
     SF.started = true;
@@ -908,11 +913,25 @@ void sfill_cluster_stop(void)
     pthread_cond_signal(&SF.cv);
     pthread_mutex_unlock(&SF.mu);
     pthread_join(SF.thr, NULL);
-    pthread_cond_destroy(&SF.cv);
-    sfill_free(SF.sf);
+    pthread_mutex_lock(&SF.mu);
+    struct sfill *sf = SF.sf;
     SF.sf = NULL;
+    pthread_mutex_unlock(&SF.mu);
+    pthread_cond_destroy(&SF.cv);
+    sfill_free(sf);
     SF.started = false;
     cluster_set_fills(NULL, 0);
+}
+
+uint32_t sfill_cluster_progress(struct sfill_progress *out, uint32_t cap)
+{
+    if (!out || cap == 0)
+        return 0;
+    pthread_mutex_lock(&SF.mu);
+    struct sfill *sf = SF.sf;
+    uint32_t n = sf ? sfill_get_progress(sf, out, cap) : 0;
+    pthread_mutex_unlock(&SF.mu);
+    return n;
 }
 
 #else /* a build without the erasure codec: no cluster tier; an ec volume's open is refused by its META */
@@ -936,5 +955,11 @@ int sfill_cluster_start(struct tsdb *db)
     return 0;
 }
 void sfill_cluster_stop(void) {}
+uint32_t sfill_cluster_progress(struct sfill_progress *out, uint32_t cap)
+{
+    (void)out;
+    (void)cap;
+    return 0;
+}
 
 #endif

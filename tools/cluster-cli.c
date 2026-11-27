@@ -379,6 +379,25 @@ static void print_status(const struct cluster_status *st)
         for (uint32_t j = 0; h && j < h->ndoms; j++)
             printf("domain-report node %" PRIu32 " %s %s\n", mb->id, h->doms[j].name,
                    h->doms[j].state == CL_DOM_OK ? "ok" : h->doms[j].state == CL_DOM_SLOW ? "slow" : "fault");
+        for (uint32_t j = 0; h && j < h->nprogress_vols; j++) {
+            const struct creport_vol_progress *vp = &h->progress_vols[j];
+            if (vp->role == CREPORT_REBUILD_NONE && vp->settle_keys_waiting == 0 && vp->young_scrub_age_s == 0)
+                continue;
+            printf("progress node %" PRIu32 " volume %" PRIu32 " role %s done %" PRIu64 "/%" PRIu64
+                   " started_ms %" PRIu64 " last_progress_ms %" PRIu64 " stalled %u settle_keys %" PRIu32
+                   " settle_oldest_s %" PRIu64 " young_scrub_age_s %" PRIu64 "\n",
+                   mb->id, vp->volume, creport_rebuild_role_name(vp->role), vp->bytes_done, vp->bytes_total,
+                   vp->started_ms, vp->last_progress_ms, (unsigned)vp->stalled, vp->settle_keys_waiting,
+                   vp->settle_oldest_wait_s, vp->young_scrub_age_s);
+        }
+        for (uint32_t j = 0; h && j < h->nprogress_stores; j++) {
+            const struct creport_store_progress *sp = &h->progress_stores[j];
+            if (sp->scrub_age_s == 0 && sp->drain_bytes_left == 0)
+                continue;
+            printf("store-progress node %" PRIu32 " store %" PRIu32 " scrub_age_s %" PRIu64
+                   " drain_bytes_left %" PRIu64 "\n",
+                   mb->id, sp->store, sp->scrub_age_s, sp->drain_bytes_left);
+        }
     }
     for (uint32_t i = 0; i < m.nvolumes; i++) {
         const struct meta_volume *v = &m.volumes[i];

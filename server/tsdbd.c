@@ -135,6 +135,8 @@ _Static_assert(METRICS_RDMA_FB_MAX == PL_RDMA_FB_MAX, "metrics RDMA fallback tab
 #include "cvol.h"
 #include "repld.h"
 #include "scrubd.h"
+#include "snapinst.h"
+#include "sfill.h"
 #include "../src/cvol.h"
 #include "crashpt.h"
 #include "margins.h"
@@ -4621,8 +4623,276 @@ static void crep_settles(void *ctx, struct creport_sink *sink)
     creport_sink_put_u64(sink, &l2, 1, atomic_load_explicit(&settle_abandoned, memory_order_relaxed));
 }
 
+/* R14 (r14-progress, D23): lock-safe local progress collection for HBS_PROGRESS and progress Prometheus metrics.
+ * Never takes db->lock or t->lock: reads only lock-free cluster_copy_get() and leaf-locked caches/getters
+ * (snapinst, rsnap, sfill, settle backlog cache, scrub hooks), so it is safe on the cluster heartbeat thread. */
+static uint64_t crep_wall_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void crep_fill_vol_progress(uint32_t vol, const struct snapinst_progress *sp, uint32_t nsp,
+                                   const struct rsnap_progress *rp, uint32_t nrp, const struct sfill_progress *fp,
+                                   uint32_t nfp, uint64_t now_wall, int zero_tot, struct creport_vol_progress *out)
+{
+    struct creport_vol_progress ent = {.volume = vol};
+    int found_reb = 0;
+    /* Check snapinst BEFORE rsnap so an active install's live verification progress overrides rsnap's episode state,
+     * while preserving the transfer episode's started_ms when rsnap is still tracking it. */
+    for (uint32_t k = 0; k < nsp; k++) {
+        if (sp[k].volume == vol) {
+            ent.role = CREPORT_REBUILD_SNAP_DST;
+            ent.bytes_done = sp[k].bytes_done;
+            ent.bytes_total = zero_tot ? 0 : sp[k].bytes_total;
+            ent.started_ms = sp[k].started_ms;
+            for (uint32_t j = 0; j < nrp; j++) {
+                if (rp[j].volume == vol && rp[j].started_ms > 0) {
+                    ent.started_ms = rp[j].started_ms;
+                    break;
+                }
+            }
+            ent.last_progress_ms = sp[k].last_progress_ms;
+            found_reb = 1;
+            break;
+        }
+    }
+    if (!found_reb) {
+        for (uint32_t k = 0; k < nrp; k++) {
+            if (rp[k].volume == vol) {
+                ent.role = rp[k].role == 1 ? CREPORT_REBUILD_SNAP_SRC : CREPORT_REBUILD_SNAP_DST;
+                ent.bytes_done = rp[k].bytes_done;
+                ent.bytes_total = zero_tot ? 0 : rp[k].bytes_total;
+                ent.started_ms = rp[k].started_ms;
+                ent.last_progress_ms = rp[k].last_progress_ms;
+                found_reb = 1;
+                break;
+            }
+        }
+    }
+    if (!found_reb) {
+        for (uint32_t k = 0; k < nfp; k++) {
+            if (fp[k].volume != vol)
+                continue;
+            if (!found_reb) {
+                ent.role = CREPORT_REBUILD_FILL;
+                ent.started_ms = fp[k].started_ms;
+                ent.last_progress_ms = fp[k].last_progress_ms;
+                found_reb = 1;
+            } else {
+                if (fp[k].started_ms < ent.started_ms)
+                    ent.started_ms = fp[k].started_ms;
+                if (fp[k].last_progress_ms < ent.last_progress_ms)
+                    ent.last_progress_ms = fp[k].last_progress_ms;
+            }
+            ent.bytes_done += fp[k].bytes_done;
+            if (!zero_tot)
+                ent.bytes_total += fp[k].bytes_total;
+        }
+    }
+    ecpolicy_cluster_backlog_get(vol, &ent.settle_keys_waiting, &ent.settle_oldest_wait_s);
+    ent.young_scrub_age_s = creport_progress_query_young_scrub(vol);
+    ent.stalled = creport_progress_is_stalled(ent.role, now_wall, ent.last_progress_ms, 0, 0);
+    *out = ent;
+}
+
+static uint32_t crep_progress_vols(void *arg, struct creport_vol_progress *out, uint32_t cap)
+{
+    (void)arg;
+    if (!out || cap == 0)
+        return 0;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cp->self) {
+        cluster_copy_put(cp);
+        return 0;
+    }
+
+    struct snapinst_progress sp[32];
+    struct rsnap_progress *rp = calloc(CLUSTER_REPORT_VOLS, sizeof *rp);
+    struct sfill_progress *fp = calloc(CLUSTER_REPORT_VOLS, sizeof *fp);
+    uint32_t nsp = snapinst_get_progress(sp, 32);
+    uint32_t nrp = rp ? rsnap_get_progress(rp, CLUSTER_REPORT_VOLS) : 0;
+    uint32_t nfp = fp ? sfill_cluster_progress(fp, CLUSTER_REPORT_VOLS) : 0;
+    uint64_t now_wall = crep_wall_ms();
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < cp->nvolumes && n < cap; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (!crep_vol_held(v, cp->self))
+            continue;
+        struct creport_vol_progress ent;
+        crep_fill_vol_progress(v->number, sp, nsp, rp, nrp, fp, nfp, now_wall, 0, &ent);
+        /* Omit idle held volumes from HBS_PROGRESS heartbeats. */
+        if (ent.role == CREPORT_REBUILD_NONE && ent.settle_keys_waiting == 0 && ent.young_scrub_age_s == 0)
+            continue;
+        out[n++] = ent;
+    }
+
+    /* Also include active stripe-fill jobs for volumes whose log this server does not hold. */
+    for (uint32_t k = 0; k < nfp && n < cap; k++) {
+        uint32_t vol = fp[k].volume;
+        int seen = 0;
+        for (uint32_t idx = 0; idx < n; idx++) {
+            if (out[idx].volume == vol) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen)
+            continue;
+        struct creport_vol_progress ent;
+        crep_fill_vol_progress(vol, sp, nsp, rp, nrp, fp, nfp, now_wall, 0, &ent);
+        out[n++] = ent;
+    }
+
+    free(rp);
+    free(fp);
+    cluster_copy_put(cp);
+    return n;
+}
+
+static uint32_t crep_progress_stores(void *arg, struct creport_store_progress *out, uint32_t cap)
+{
+    (void)arg;
+    if (!out || cap == 0)
+        return 0;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return 0;
+    uint32_t n = 0;
+    chunk_backend *be = chunksrv_backend(cs);
+    if (be) {
+        int ns = chunk_be_nstores(be);
+        for (int i = 0; i < ns && n < cap; i++) {
+            uint64_t scrub_age = 0, drain_left = 0;
+            creport_progress_query_store_extra((uint32_t)i, &scrub_age, &drain_left);
+            if (scrub_age == 0 && drain_left == 0)
+                continue;
+            out[n++] = (struct creport_store_progress){
+                .store = (uint32_t)i,
+                .scrub_age_s = scrub_age,
+                .drain_bytes_left = drain_left,
+            };
+        }
+    }
+    chunksrv_cluster_release();
+    return n;
+}
+
+enum {
+    CREP_P_BYTES_DONE = 0,
+    CREP_P_BYTES_TOTAL,
+    CREP_P_STALLED,
+    CREP_P_SETTLE_KEYS,
+    CREP_P_SETTLE_OLDEST,
+};
+
+static void crep_emit_progress_sample(int kind, const struct creport_vol_progress *vp, struct creport_sink *sink)
+{
+    char vbuf[16];
+    snprintf(vbuf, sizeof vbuf, "%u", (unsigned)vp->volume);
+    struct creport_label vlbl = {"volume", vbuf};
+    switch (kind) {
+    case CREP_P_BYTES_DONE:
+        creport_sink_put_u64(sink, &vlbl, 1, vp->bytes_done);
+        break;
+    case CREP_P_BYTES_TOTAL:
+        creport_sink_put_u64(sink, &vlbl, 1, vp->bytes_total);
+        break;
+    case CREP_P_STALLED:
+        creport_sink_put_u64(sink, &vlbl, 1, vp->stalled);
+        break;
+    case CREP_P_SETTLE_KEYS:
+        creport_sink_put_u64(sink, &vlbl, 1, vp->settle_keys_waiting);
+        break;
+    case CREP_P_SETTLE_OLDEST:
+        creport_sink_put_u64(sink, &vlbl, 1, vp->settle_oldest_wait_s);
+        break;
+    default: break;
+    }
+}
+
+static void crep_progress_metric(void *ctx, struct creport_sink *sink)
+{
+    int kind = (int)(intptr_t)ctx;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cp->self) {
+        cluster_copy_put(cp);
+        return;
+    }
+    struct snapinst_progress sp[32];
+    struct rsnap_progress *rp = calloc(CLUSTER_REPORT_VOLS, sizeof *rp);
+    struct sfill_progress *fp = calloc(CLUSTER_REPORT_VOLS, sizeof *fp);
+    uint32_t nsp = snapinst_get_progress(sp, 32);
+    uint32_t nrp = rp ? rsnap_get_progress(rp, CLUSTER_REPORT_VOLS) : 0;
+    uint32_t nfp = fp ? sfill_cluster_progress(fp, CLUSTER_REPORT_VOLS) : 0;
+    uint64_t now_wall = crep_wall_ms();
+    int zero_tot = creport_progress_zero_total();
+
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (!crep_vol_held(v, cp->self))
+            continue;
+        struct creport_vol_progress ent;
+        crep_fill_vol_progress(v->number, sp, nsp, rp, nrp, fp, nfp, now_wall, zero_tot, &ent);
+        crep_emit_progress_sample(kind, &ent, sink);
+    }
+
+    /* Emit active stripe-fill volumes not held in the log replica set (deduplicated per volume). */
+    for (uint32_t k = 0; k < nfp; k++) {
+        uint32_t vol = fp[k].volume;
+        int dup = 0;
+        for (uint32_t p = 0; p < k; p++) {
+            if (fp[p].volume == vol) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        const struct cluster_copy_vol *cv = cluster_copy_vol(cp, vol);
+        if (cv && crep_vol_held(cv, cp->self))
+            continue;
+        struct creport_vol_progress ent;
+        crep_fill_vol_progress(vol, sp, nsp, rp, nrp, fp, nfp, now_wall, zero_tot, &ent);
+        crep_emit_progress_sample(kind, &ent, sink);
+    }
+
+    free(rp);
+    free(fp);
+    cluster_copy_put(cp);
+}
+
+static void crep_node_full(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    creport_sink_put_u64(sink, NULL, 0, cluster_self_full() ? 1u : 0u);
+}
+
+static void crep_full_refusals(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cp->self) {
+        cluster_copy_put(cp);
+        return;
+    }
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (!crep_vol_held(v, cp->self))
+            continue;
+        char vbuf[16];
+        snprintf(vbuf, sizeof vbuf, "%u", (unsigned)v->number);
+        struct creport_label vlbl = {"volume", vbuf};
+        creport_sink_put_u64(sink, &vlbl, 1, repld_full_refusals(v->number));
+    }
+    cluster_copy_put(cp);
+}
+
 static void register_cluster_metrics(void)
 {
+    creport_progress_set_providers(crep_progress_vols, NULL, crep_progress_stores, NULL);
     creport_metric_collector("tsdb_cluster_raft_term", CREPORT_GAUGE, "Current metadata Raft term known to this server.",
                              crep_raft_term, NULL);
     creport_metric_collector("tsdb_cluster_raft_leader", CREPORT_GAUGE,
@@ -4683,6 +4953,27 @@ static void register_cluster_metrics(void)
     creport_metric_collector("tsdb_cluster_settles_total", CREPORT_COUNTER,
                              "EC part settle outcomes since process start (done, failed, abandoned).", crep_settles,
                              NULL);
+    creport_metric_collector("tsdb_cluster_rebuild_bytes_done", CREPORT_GAUGE,
+                             "Bytes completed so far by an active snapshot or stripe rebuild for a volume this server holds.",
+                             crep_progress_metric, (void *)(intptr_t)CREP_P_BYTES_DONE);
+    creport_metric_collector("tsdb_cluster_rebuild_bytes_total", CREPORT_GAUGE,
+                             "Total bytes expected by an active snapshot or stripe rebuild for a volume this server holds.",
+                             crep_progress_metric, (void *)(intptr_t)CREP_P_BYTES_TOTAL);
+    creport_metric_collector("tsdb_cluster_rebuild_stalled", CREPORT_GAUGE,
+                             "1 while an active snapshot or stripe rebuild for a held volume has made no progress for 15 minutes, else 0.",
+                             crep_progress_metric, (void *)(intptr_t)CREP_P_STALLED);
+    creport_metric_collector("tsdb_settle_backlog_keys", CREPORT_GAUGE,
+                             "Partition keys currently due to settle and waiting on this server for a held volume.",
+                             crep_progress_metric, (void *)(intptr_t)CREP_P_SETTLE_KEYS);
+    creport_metric_collector("tsdb_settle_backlog_oldest_seconds", CREPORT_GAUGE,
+                             "Seconds the oldest waiting partition key has waited past settle eligibility on this server.",
+                             crep_progress_metric, (void *)(intptr_t)CREP_P_SETTLE_OLDEST);
+    creport_metric_collector("tsdb_cluster_node_full", CREPORT_GAUGE,
+                             "1 while this server is in FULL backpressure state (fill_pct >= young_high_pct), else 0.",
+                             crep_node_full, NULL);
+    creport_metric_collector("tsdb_cluster_full_refusals_total", CREPORT_COUNTER,
+                             "Write requests refused with UNAVAILABLE FULL for a volume this server holds since process start.",
+                             crep_full_refusals, NULL);
 }
 
 static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */

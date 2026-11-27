@@ -424,6 +424,118 @@ size_t ecpolicy_pick_locked(eng *db, int64_t now, int64_t *key, part **sel, size
     return 0;
 }
 
+void ecpolicy_backlog(eng *db, uint32_t *keys_waiting, uint64_t *oldest_wait_s)
+{
+    if (keys_waiting)
+        *keys_waiting = 0;
+    if (oldest_wait_s)
+        *oldest_wait_s = 0;
+    if (!db || !db->tier || !ecpolicy_of(db))
+        return;
+    if (db->cluster_req && !eccold_leader(db))
+        return;
+    bool cluster = db->ec_cluster;
+    if (cluster && atomic_load(&db->diverged))
+        return;
+    const tier_settings *cfg = tier_eng_settings(db);
+    if (!cfg)
+        return;
+    int64_t now = eng_now_ms(db);
+    int64_t grace = (!cluster && cfg->from_tiers) ? sec_to_ms_sat(cfg->tier_after_s) : cfg->grace_s * 1000;
+    uint64_t cap_ms = atomic_load(&db->lead_cap_ms);
+    int64_t retain = cap_ms ? (int64_t)cap_ms : ECCOLD_RETAIN_S_DEFAULT * 1000LL;
+    int64_t margin = cfg->keep_s * 1000 + retain + 3600 * 1000LL;
+
+    uint32_t keys = 0;
+    uint64_t oldest_s = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t a = 0; a < db->nparts;) {
+        size_t b = a + 1;
+        int64_t k = db->parts[a]->partition;
+        while (b < db->nparts && db->parts[b]->partition == k)
+            b++;
+        size_t lo_i = a, hi_i = b;
+        a = b;
+        if (partition_dropping(db, k))
+            continue;
+        bool damaged = false;
+        for (size_t i = lo_i; i < hi_i; i++) {
+            if (atomic_load(&db->parts[i]->damaged)) {
+                damaged = true;
+                break;
+            }
+        }
+        if (damaged)
+            continue;
+        int64_t plo, phi;
+        partition_range(db, k, &plo, &phi);
+        bool waiting = false;
+        uint64_t wait_ms = 0;
+        if (cluster) {
+            if (phi == INT64_MAX || !age_reached(phi, now, grace))
+                continue;
+            if (expires_within(db, lo_i, hi_i, now, margin))
+                continue;
+            bool any_young = false;
+            for (size_t i = lo_i; i < hi_i; i++) {
+                const part *p = db->parts[i];
+                if (!p->dropped && !part_is_ec(p) && p->ng > 0 && p->hdr_len == sizeof(part_header) && !p->pending &&
+                    p->level > 0) {
+                    any_young = true;
+                    break;
+                }
+            }
+            if (any_young) {
+                waiting = true;
+                uint64_t elapsed = now > phi ? (uint64_t)now - (uint64_t)phi : 0;
+                uint64_t g = grace > 0 ? (uint64_t)grace : 0;
+                wait_ms = elapsed > g ? elapsed - g : 0;
+            }
+        } else if (cfg->eager || partition_class(db, k) != 0) {
+            for (size_t i = lo_i; i < hi_i; i++) {
+                const part *p = db->parts[i];
+                if (!p->dropped && !part_is_ec(p) && p->ng > 0 && p->hdr_len == sizeof(part_header) && !p->pending &&
+                    age_reached(p->max_ts, now, grace)) {
+                    waiting = true;
+                    uint64_t elapsed = now > p->max_ts ? (uint64_t)now - (uint64_t)p->max_ts : 0;
+                    uint64_t g = grace > 0 ? (uint64_t)grace : 0;
+                    uint64_t w = elapsed > g ? elapsed - g : 0;
+                    if (w > wait_ms)
+                        wait_ms = w;
+                }
+            }
+        } else {
+            if (phi == INT64_MAX || !age_reached(phi, now, grace))
+                continue;
+            bool any_young = false;
+            for (size_t i = lo_i; i < hi_i; i++) {
+                const part *p = db->parts[i];
+                if (!p->dropped && !part_is_ec(p) && p->ng > 0 && p->hdr_len == sizeof(part_header) && !p->pending) {
+                    any_young = true;
+                    break;
+                }
+            }
+            if (any_young) {
+                waiting = true;
+                uint64_t elapsed = now > phi ? (uint64_t)now - (uint64_t)phi : 0;
+                uint64_t g = grace > 0 ? (uint64_t)grace : 0;
+                wait_ms = elapsed > g ? elapsed - g : 0;
+            }
+        }
+        if (waiting) {
+            keys++;
+            uint64_t ws = wait_ms / 1000ull;
+            if (ws > oldest_s)
+                oldest_s = ws;
+        }
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (keys_waiting)
+        *keys_waiting = keys;
+    if (oldest_wait_s)
+        *oldest_wait_s = oldest_s;
+}
+
 /* ------------------------------------------------------------ R10 re-encode policy (E6) */
 
 /* A part's full data bytes: an .ec part's map holds only its index, so its object_len bounds max_part_bytes. */

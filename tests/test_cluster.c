@@ -23479,6 +23479,673 @@ static void scen_metrics(void)
            nonholder, drop_ms, L, R2);
 }
 
+/* Unit checks for HBS_PROGRESS encode/decode/bounds, scrub hook points, stall computation, and STATUS progress block. */
+static struct creport_vol_progress pu_vol;
+static struct creport_store_progress pu_store;
+static uint32_t pu_vols_cb(void *arg, struct creport_vol_progress *out, uint32_t cap)
+{
+    (void)arg;
+    if (cap == 0)
+        return 0;
+    out[0] = pu_vol;
+    out[0].young_scrub_age_s = creport_progress_query_young_scrub(out[0].volume);
+    return 1;
+}
+static uint32_t pu_stores_cb(void *arg, struct creport_store_progress *out, uint32_t cap)
+{
+    (void)arg;
+    if (cap == 0)
+        return 0;
+    out[0] = pu_store;
+    creport_progress_query_store_extra(out[0].store, &out[0].scrub_age_s, &out[0].drain_bytes_left);
+    return 1;
+}
+static uint64_t pu_young_scrub_cb(void *arg, uint32_t volume)
+{
+    (void)arg;
+    return volume == 7 ? 321u : 0u;
+}
+static void pu_store_extra_cb(void *arg, uint32_t store, uint64_t *scrub_age_s, uint64_t *drain_bytes_left)
+{
+    (void)arg;
+    if (store == 2) {
+        if (scrub_age_s)
+            *scrub_age_s = 654u;
+        if (drain_bytes_left)
+            *drain_bytes_left = 987654u;
+    }
+}
+struct pu_emit_ctx {
+    uint16_t type;
+    uint8_t buf[2048];
+    size_t len;
+    int seen;
+};
+static void pu_emit_cb(void *ctx, uint16_t type, const uint8_t *data, size_t len)
+{
+    struct pu_emit_ctx *e = ctx;
+    if (type == HBS_PROGRESS && len <= sizeof e->buf) {
+        e->type = type;
+        memcpy(e->buf, data, len);
+        e->len = len;
+        e->seen = 1;
+    }
+}
+
+static void progress_unit_checks(void)
+{
+    creport_reset();
+
+    /* 1. Unknown section skipped cleanly when HBS_PROGRESS is not registered (older peer simulation). */
+    struct creport_heard_secs hs;
+    creport_heard_init(&hs);
+    uint64_t err0 = creport_sec_decode_errors();
+    uint8_t dummy[17] = {1};
+    if (creport_sec_decode_into(&hs, HBS_PROGRESS, 1, dummy, sizeof dummy) != 1 ||
+        creport_sec_decode_errors() != err0)
+        die("progress unit: unregistered HBS_PROGRESS was not skipped cleanly");
+
+    /* 2. Register HBS_PROGRESS (idempotent) + encode/decode round-trip + scrub/drain hooks. */
+    if (creport_progress_register() != 0 || creport_progress_register() != 0)
+        die("progress unit: creport_progress_register failed");
+    pu_vol = (struct creport_vol_progress){
+        .volume = 7,
+        .role = CREPORT_REBUILD_SNAP_DST,
+        .bytes_done = 4096,
+        .bytes_total = 16384,
+        .started_ms = 100000,
+        .last_progress_ms = 100500,
+        .settle_keys_waiting = 3,
+        .settle_oldest_wait_s = 45,
+    };
+    pu_store = (struct creport_store_progress){.store = 2};
+    creport_progress_set_providers(pu_vols_cb, NULL, pu_stores_cb, NULL);
+
+    /* Unregistered scrub/drain hooks return 0. */
+    if (creport_progress_query_young_scrub(7) != 0)
+        die("progress unit: unregistered young scrub hook returned non-zero");
+    uint64_t sa = 1, dl = 1;
+    creport_progress_query_store_extra(2, &sa, &dl);
+    if (sa != 0 || dl != 0)
+        die("progress unit: unregistered store extra hook returned non-zero");
+
+    /* Register hooks and verify values flow through encode -> decode. */
+    creport_progress_set_young_scrub(pu_young_scrub_cb, NULL);
+    creport_progress_set_store_extra(pu_store_extra_cb, NULL);
+    struct pu_emit_ctx em = {0};
+    creport_sec_encode_all(pu_emit_cb, &em);
+    if (!em.seen || em.len != 17 + 57 + 20)
+        die("progress unit: unexpected HBS_PROGRESS encoded length %zu (seen=%d)", em.len, em.seen);
+    if (creport_sec_decode_into(&hs, HBS_PROGRESS, 2, em.buf, em.len) != 0)
+        die("progress unit: HBS_PROGRESS decode failed");
+    const struct creport_progress *pr = creport_heard_get(&hs, HBS_PROGRESS);
+    if (!pr || pr->nvols != 1 || pr->nstores != 1 || pr->vols[0].volume != 7 ||
+        pr->vols[0].role != CREPORT_REBUILD_SNAP_DST || pr->vols[0].bytes_done != 4096 ||
+        pr->vols[0].settle_keys_waiting != 3 || pr->vols[0].settle_oldest_wait_s != 45 ||
+        pr->vols[0].young_scrub_age_s != 321 || pr->stores[0].store != 2 || pr->stores[0].scrub_age_s != 654 ||
+        pr->stores[0].drain_bytes_left != 987654)
+        die("progress unit: decoded HBS_PROGRESS mismatch");
+
+    /* 3. Malformed HBS_PROGRESS payloads rejected & counted. */
+    uint64_t e1 = creport_sec_decode_errors();
+    uint8_t bad_ver[17] = {2};
+    uint8_t bad_cnt[17] = {1};
+    bad_cnt[9] = 1; /* nvols=1 but 0 vol bytes */
+    uint8_t bad_role[17 + 57 + 20];
+    memcpy(bad_role, em.buf, em.len);
+    bad_role[17 + 4] = 99; /* invalid role */
+    if (creport_sec_decode_into(&hs, HBS_PROGRESS, 2, em.buf, 16) != -1 ||
+        creport_sec_decode_into(&hs, HBS_PROGRESS, 2, bad_ver, sizeof bad_ver) != -1 ||
+        creport_sec_decode_into(&hs, HBS_PROGRESS, 2, bad_cnt, sizeof bad_cnt) != -1 ||
+        creport_sec_decode_into(&hs, HBS_PROGRESS, 2, bad_role, em.len) != -1 ||
+        creport_sec_decode_errors() != e1 + 4)
+        die("progress unit: malformed HBS_PROGRESS not rejected/counted");
+
+    /* 4. Stall boundary checks. */
+    uint64_t thresh = creport_progress_stall_ms();
+    if (creport_progress_is_stalled(CREPORT_REBUILD_NONE, thresh + 1000, 1, 0, 0) != 0)
+        die("progress unit: idle role reported stalled");
+    if (creport_progress_is_stalled(CREPORT_REBUILD_SNAP_DST, 1000 + thresh - 1, 1000, 0, 0) != 0)
+        die("progress unit: below stall threshold reported stalled");
+    if (creport_progress_is_stalled(CREPORT_REBUILD_SNAP_DST, 1000 + thresh, 1000, 0, 0) != 1)
+        die("progress unit: at stall threshold did not report stalled");
+    if (creport_progress_is_stalled(CREPORT_REBUILD_SNAP_DST, 1000, 1000, 1000000ull,
+                                    1000000ull + thresh * 1000000ull) != 1)
+        die("progress unit: beat_age at stall threshold did not report stalled");
+
+    /* 5. cluster_status_parse appended progress block strict bounds checks. */
+    uint8_t base_st[256];
+    size_t boff = 0;
+    memset(base_st, 0, sizeof base_st);
+    /* Minimal valid STATUS body with nheard=1 (id=1), 0 vols/doms/unreach/sections/fills, 0 tr, empty moves/links, 0 image. */
+    base_st[0] = 1; /* self=1 */
+    boff = 4 + 1 + 1 + 1 + 8 + 4 + 8 + 8; /* header before nheard: 35 bytes */
+    base_st[boff] = 1; /* nheard=1 */
+    boff += 4;
+    base_st[boff] = 1; /* heard[0].id=1 */
+    boff += 4 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8; /* 34 bytes */
+    boff += 4; /* nvols=0 */
+    boff += 4; /* ndoms=0 */
+    boff += 4; /* nunreach=0 */
+    boff += 8 + 8; /* answered_ms, lease_left_ms */
+    boff += 2; /* slen=0 */
+    boff += 4; /* nfills=0 */
+    boff += 1; /* users_caught_up=0 */
+    boff += 4; /* ntr=0 */
+    boff += 2; /* moves="" */
+    boff += 2; /* links="" */
+    boff += 8; /* wall_ms=0 */
+    boff += 4; /* image_len=0 */
+    struct cluster_status pst;
+    if (cluster_status_parse(base_st, boff, &pst) != 0 || pst.nheard != 1)
+        die("progress unit: minimal base STATUS without progress block failed to parse");
+    cluster_status_free(&pst);
+
+    /* Truncated magic, bad magic, pn > nheard, unknown mid, trailing garbage must all fail cleanly. */
+    uint8_t bad_st[320];
+    memcpy(bad_st, base_st, boff);
+    bad_st[boff] = 0x47;
+    if (cluster_status_parse(bad_st, boff + 1, &pst) == 0)
+        die("progress unit: truncated progress magic accepted");
+    bad_st[boff] = 0x47, bad_st[boff + 1] = 0x4f, bad_st[boff + 2] = 0x52, bad_st[boff + 3] = 0x50; /* "PROG" */
+    bad_st[boff + 4] = 1; /* version=1 */
+    bad_st[boff + 5] = 2, bad_st[boff + 6] = 0, bad_st[boff + 7] = 0, bad_st[boff + 8] = 0; /* pn=2 > nheard=1 */
+    if (cluster_status_parse(bad_st, boff + 9, &pst) == 0)
+        die("progress unit: pn > nheard accepted");
+    bad_st[boff + 5] = 1; /* pn=1 */
+    /* member_id=99 (not in heard), nvols=0, nstores=0 */
+    memset(bad_st + boff + 9, 0, 12);
+    bad_st[boff + 9] = 99;
+    if (cluster_status_parse(bad_st, boff + 21, &pst) == 0)
+        die("progress unit: unknown member_id in progress block accepted");
+    /* Valid member_id=1, nvols=0, nstores=0 -> must succeed, then +1 trailing byte must fail. */
+    bad_st[boff + 9] = 1;
+    if (cluster_status_parse(bad_st, boff + 21, &pst) != 0)
+        die("progress unit: valid empty progress block rejected");
+    cluster_status_free(&pst);
+    bad_st[boff + 21] = 0;
+    if (cluster_status_parse(bad_st, boff + 22, &pst) == 0)
+        die("progress unit: trailing garbage after progress block accepted");
+
+    /* Verify idle entries are omitted from HBS_PROGRESS (zero bytes on idle heartbeats). */
+    pu_vol = (struct creport_vol_progress){.volume = 7, .role = CREPORT_REBUILD_NONE};
+    pu_store = (struct creport_store_progress){.store = 2};
+    creport_progress_set_young_scrub(NULL, NULL);
+    creport_progress_set_store_extra(NULL, NULL);
+    struct pu_emit_ctx em_idle = {0};
+    creport_sec_encode_all(pu_emit_cb, &em_idle);
+    if (em_idle.seen)
+        die("progress unit: idle HBS_PROGRESS was not omitted");
+
+    creport_heard_clear(&hs);
+    creport_reset();
+}
+
+static const struct creport_vol_progress *view_find_progress(const struct view *v, uint32_t node_id, uint32_t vol)
+{
+    for (uint32_t i = 0; i < v->st.nheard; i++) {
+        if (v->st.heard[i].id != node_id)
+            continue;
+        for (uint32_t j = 0; j < v->st.heard[i].nprogress_vols; j++) {
+            if (v->st.heard[i].progress_vols[j].volume == vol)
+                return &v->st.heard[i].progress_vols[j];
+        }
+    }
+    return NULL;
+}
+
+/* R14 (r14-progress, E43, D23): rebuild/snapshot & settle backlog progress in HBS_PROGRESS, STATUS, and /metrics.
+ *   1. Unit checks for HBS_PROGRESS wire bounds, scrub hooks, stall math, and STATUS appended progress block.
+ *   2. 3-node cluster with low rebuild_mb_s=1 and progress_stall_ms=1500:
+ *      - Node 0 stays Raft leader; volume leader L != 0; replica R killed & falls past repl_retain_s.
+ *      - Restart R: bytes_done rises in Raft leader STATUS and R's /metrics; bytes_total matches snapshot size;
+ *        stalled=0 (catches progressfrozen and progressnototal).
+ *      - SIGSTOP source L past progress_stall_ms: stalled=1 in STATUS and R's /metrics.
+ *      - SIGCONT source L: transfer finishes, stalled returns to 0 and role returns to none.
+ *   3. (TSDB_EC builds) Hold settles via TSDB_SETTLE_HOLD=<file>: create ec=2+1 volume, write 2 past-day partitions,
+ *      verify settle_keys_waiting >= 2 and settle_oldest_wait_s > 0 in STATUS and leader /metrics; release hold and
+ *      verify backlog drains to 0. */
+static void scen_progress(void)
+{
+    scenario("progress");
+    progress_unit_checks();
+
+    int mports[4] = {0};
+    init_retain_s = 2;
+    init_rebuild_mb_s = 1;
+    init_node_timeout_ms = 15000;
+    init_isr_lag_ms = 500;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "progress_stall_ms=2500";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("progress: server %d reported no metrics port", i);
+    }
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    init_rebuild_mb_s = 0;
+    init_node_timeout_ms = 0;
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+
+    uint32_t vnum = 0;
+    int rc = vol_add(0, "pvol", 3, &vnum);
+    if (rc != 0)
+        die("progress: vol_add pvol: %s", cluster_strerror(rc));
+    for (int i = 0; i < 3; i++)
+        await_open_gen(0, "pvol", i, 1, 0);
+    await_isr(0, "pvol", 3, 20000, "pvol 3/3 ISR");
+
+    /* Ensure volume leader L is NOT node 0 (the Raft leader), so SIGSTOPping L leaves Raft leader 0 answering STATUS. */
+    struct meta_volume mv;
+    if (!vol_rec(0, "pvol", &mv))
+        die("progress: missing pvol record");
+    int L = server_of(mv.leader);
+    if (L == 0) {
+        uint8_t tbody[8], *treply = NULL;
+        size_t tblen = cluster_volume_force_encode(vnum, ids[1], tbody), trlen = 0;
+        rc = -1;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(150000)) {
+            rc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen);
+            free(treply);
+            treply = NULL;
+            if (rc == 0)
+                break;
+        }
+        if (rc != 0)
+            die("progress: transfer pvol to node %" PRIu32 ": %s", ids[1], cluster_strerror(rc));
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(100000)) {
+            if (vol_rec(1, "pvol", &mv) && server_of(mv.leader) == 1) {
+                struct view v;
+                view(1, &v);
+                int is_owner = 0;
+                for (uint32_t h = 0; h < v.st.nheard; h++)
+                    if (v.st.heard[h].id == ids[1])
+                        for (uint32_t j = 0; j < v.st.heard[h].nvols; j++)
+                            if (v.st.heard[h].vols[j].v.volume == vnum && v.st.heard[h].vols[j].v.role == CL_ROLE_OWNER)
+                                is_owner = 1;
+                view_free(&v);
+                if (is_owner)
+                    break;
+            }
+        }
+        L = server_of(mv.leader);
+    }
+    if (L != 1 && L != 2)
+        die("progress: expected pvol leader on server 1 or 2, got %d", L);
+    int R = (L == 1) ? 2 : 1;
+
+    /* Write ~3M random rows (~10-12 MB compressed -> ~10-12 s transfer at 1 MB/s). */
+    tsdbc *c = client(L);
+    tsdb_sid sid = rep_series(c, "prog.s0", "pvol", 30000);
+    int64_t t = 1000;
+    snap_rows(c, sid, &t, 3000000);
+    await_isr(0, "pvol", 3, 20000, "pvol synced before kill R");
+
+    stop(R, SIGKILL);
+    await_isr(0, "pvol", 2, 15000, "pvol ISR shrunk after kill R");
+    struct timespec s1 = {1, 0};
+    for (int r = 0; r < 7; r++) {
+        snap_rows(c, sid, &t, 100);
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("progress: flush: %s", ers(rc));
+        nanosleep(&s1, NULL);
+    }
+    snap_rows(c, sid, &t, 1);
+    tsdbc_close(c);
+
+    /* Restart R with snapstallms=1000 (< progress_stall_ms=2500) to prove stall persists across abandon/retry loops. */
+    penv[R] = "TSDB_REPLD_TEST=snapstallms=1000";
+    start(R);
+    mports[R] = th_mport;
+    if (mports[R] <= 0)
+        die("progress: restarted server %d reported no metrics port", R);
+
+    char needle[128], line[4096];
+    snprintf(needle, sizeof needle, "snapshot made for node %" PRIu32 ":", ids[R]);
+    await_log(L, needle, 30000, "leader never made snapshot for R");
+    log_line(L, needle, line, sizeof line);
+    uint64_t snap_bytes = 0;
+    const char *fp = strstr(line, " files, ");
+    if (fp)
+        snap_bytes = strtoull(fp + 8, NULL, 10);
+    if (snap_bytes < (1u << 20))
+        die("progress: parsed unexpected snapshot size %" PRIu64 " from log line: %s", snap_bytes, line);
+
+    /* Verify bytes_done > 0 and bytes_total == snap_bytes and stalled == 0 in STATUS and R's /metrics, then rises. */
+    static char mbuf[1 << 20];
+    uint64_t st_b1 = 0, st_b2 = 0, mt_b1 = 0, mt_b2 = 0;
+    int got_first = 0, got_rise = 0;
+    char k_done[96], k_tot[96], k_stall[96];
+    snprintf(k_done, sizeof k_done, "\ntsdb_cluster_rebuild_bytes_done{volume=\"%" PRIu32 "\"} ", vnum);
+    snprintf(k_tot, sizeof k_tot, "\ntsdb_cluster_rebuild_bytes_total{volume=\"%" PRIu32 "\"} ", vnum);
+    snprintf(k_stall, sizeof k_stall, "\ntsdb_cluster_rebuild_stalled{volume=\"%" PRIu32 "\"} ", vnum);
+
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 20000 && !got_rise; usleep(150000)) {
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        if (vp && vp->role == CREPORT_REBUILD_SNAP_DST && vp->bytes_done > 0) {
+            if (vp->bytes_total != snap_bytes) {
+                uint64_t got_t = vp->bytes_total;
+                view_free(&v);
+                die("progress: STATUS bytes_total=%" PRIu64 " != snapshot size %" PRIu64, got_t, snap_bytes);
+            }
+            if (vp->started_ms == 0 || vp->last_progress_ms < vp->started_ms) {
+                uint64_t sm = vp->started_ms, lm = vp->last_progress_ms;
+                view_free(&v);
+                die("progress: STATUS bad timestamps started=%" PRIu64 " last=%" PRIu64, sm, lm);
+            }
+            if (vp->stalled != 0) {
+                view_free(&v);
+                die("progress: STATUS reported stalled=1 while snapshot was actively transferring");
+            }
+            metrics_get(mports[R], mbuf, sizeof mbuf);
+            int64_t md = -1, mt = -1, ms = -1;
+            if (metrics_find_i64(mbuf, k_done, &md) && metrics_find_i64(mbuf, k_tot, &mt) &&
+                metrics_find_i64(mbuf, k_stall, &ms) && md > 0) {
+                if ((uint64_t)mt != snap_bytes) {
+                    view_free(&v);
+                    die("progress: /metrics bytes_total=%" PRId64 " != snapshot size %" PRIu64, mt, snap_bytes);
+                }
+                if (ms != 0) {
+                    view_free(&v);
+                    die("progress: /metrics reported stalled=%" PRId64 " while transferring", ms);
+                }
+                if (!got_first) {
+                    st_b1 = vp->bytes_done;
+                    mt_b1 = (uint64_t)md;
+                    got_first = 1;
+                } else if (vp->bytes_done > st_b1 && (uint64_t)md > mt_b1) {
+                    st_b2 = vp->bytes_done;
+                    mt_b2 = (uint64_t)md;
+                    got_rise = 1;
+                }
+            }
+        }
+        view_free(&v);
+    }
+    if (!got_first)
+        die("progress: never saw active snapshot bytes_done > 0 in STATUS and /metrics");
+    if (!got_rise)
+        die("progress: bytes_done did not rise in STATUS (st_b1=%" PRIu64 ") and /metrics (mt_b1=%" PRIu64 ")", st_b1,
+            mt_b1);
+
+    /* SIGSTOP source L past BOTH snapstallms (1000 ms) AND progress_stall_ms (2500 ms): verify R abandons on the
+     * stall timer yet stalled still becomes 1 in STATUS and R's /metrics across the retry loop. */
+    pause_server(L, 1);
+    await_log(R, "the stall timer", 6000, "R never hit snapstallms=1000 while source was SIGSTOPped");
+    int got_stalled = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 10000 && !got_stalled; usleep(150000)) {
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        int st_ok = vp && vp->role == CREPORT_REBUILD_SNAP_DST && vp->stalled == 1;
+        view_free(&v);
+        if (!st_ok)
+            continue;
+        metrics_get(mports[R], mbuf, sizeof mbuf);
+        int64_t ms = -1;
+        if (metrics_find_i64(mbuf, k_stall, &ms) && ms == 1)
+            got_stalled = 1;
+    }
+    pause_server(L, 0);
+    if (!got_stalled)
+        die("progress: stalled did not become 1 in STATUS and /metrics after SIGSTOPping source %d past snapstallms", L);
+
+    /* Wait for snapshot to finish and R to rejoin ISR, then verify stalled=0 and idle (omitted or role=none). */
+    await_isr(0, "pvol", 3, 60000, "pvol 3/3 ISR after snapshot resume");
+    int cleared = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 8000 && !cleared; usleep(150000)) {
+        struct view v;
+        view(0, &v);
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[R], vnum);
+        int st_ok = !vp || (vp->role == CREPORT_REBUILD_NONE && vp->stalled == 0);
+        view_free(&v);
+        if (!st_ok)
+            continue;
+        metrics_get(mports[R], mbuf, sizeof mbuf);
+        int64_t ms = -1, nf = -1, fr = -1;
+        char k_fr[96];
+        snprintf(k_fr, sizeof k_fr, "\ntsdb_cluster_full_refusals_total{volume=\"%" PRIu32 "\"} ", vnum);
+        if (metrics_find_i64(mbuf, k_stall, &ms) && ms == 0 &&
+            metrics_find_i64(mbuf, "\ntsdb_cluster_node_full ", &nf) && nf == 0 &&
+            metrics_find_i64(mbuf, k_fr, &fr) && fr == 0)
+            cleared = 1;
+    }
+    if (!cleared)
+        die("progress: rebuild state did not clear to idle / stalled=0 after snapshot completed");
+
+    /* Part 2 (EC builds): hold settles via TSDB_SETTLE_HOLD file -> verify settle backlog counts rise & drain. */
+    uint32_t saw_keys = 0;
+    uint64_t saw_oldest = 0;
+#ifdef TSDB_EC
+    struct view uv;
+    view(0, &uv);
+    uint8_t cuuid[16];
+    memcpy(cuuid, uv.m.uuid, 16);
+    view_free(&uv);
+
+    char holdpath[sizeof base + 32], holdenv[sizeof base + 64];
+    snprintf(holdpath, sizeof holdpath, "%s/settlehold", base);
+    snprintf(holdenv, sizeof holdenv, "TSDB_SETTLE_HOLD=%s", holdpath);
+    FILE *hf = fopen(holdpath, "wb");
+    if (!hf)
+        die("progress: create %s: %s", holdpath, strerror(errno));
+    fclose(hf);
+
+    static char pxa[3][sizeof base + 256];
+    for (int i = 0; i < 3; i++) {
+        char sd[sizeof base + 32];
+        snprintf(sd, sizeof sd, "%s/ps%d", base, i);
+        chunk_store_make(sd, cuuid, ids[i]);
+        penv[i] = holdenv;
+        snprintf(pxa[i], sizeof pxa[i],
+                 "--metrics-port auto --chunk-dir %s --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                 "--merge-idle-s 1 --flush-interval-ms 200",
+                 sd);
+        restart_xargs(i, pxa[i]);
+        mports[i] = th_mport;
+    }
+
+    uint32_t ecnum = 0;
+    char etxt[256];
+    for (uint64_t w0 = now_ms(); (rc = vol_add_ec(0, "pec", 0, 2, 1, &ecnum, etxt, sizeof etxt)) != 0; usleep(150000)) {
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - w0 > 30000)
+            die("progress: vol_add_ec pec (2+1): %s (%s)", cluster_strerror(rc), etxt);
+    }
+    struct meta_volume ecv;
+    for (uint64_t w0 = now_ms(); !vol_rec(0, "pec", &ecv) || !ecv.leader; usleep(100000))
+        if (now_ms() - w0 > 20000)
+            die("progress: no pec record with leader");
+    int EL = server_of(ecv.leader);
+    if (EL < 0)
+        die("progress: bad pec leader %u", ecv.leader);
+    for (uint32_t k = 0; k < ecv.nrep; k++) {
+        int s = server_of(ecv.rep[k].node);
+        if (s >= 0)
+            await_open_gen(0, "pec", s, 1, 0);
+    }
+    await_isr(EL, "pec", 2, 20000, "pec 2/2 ISR");
+
+    tsdbc *ec = client(EL);
+    tsdb_sid esid = rep_series(ec, "pec.s0", "pec", 30000);
+    const int64_t day0 = 1704067200000LL; /* 2024-01-01 */
+    for (int d = 0; d < 8; d++) {
+        int64_t dt = day0 + (int64_t)d * 86400000LL;
+        for (int b = 0; b < 2; b++) {
+            snap_rows(ec, esid, &dt, 300000);
+            if ((rc = tsdbc_flush(ec)) != 0)
+                die("progress: flush pec: %s", ers(rc));
+        }
+    }
+    tsdbc_close(ec);
+
+    /* Wait for idle merge -> >= 2 keys eligible & held by TSDB_SETTLE_HOLD -> backlog >= 2 in STATUS and /metrics. */
+    char k_skeys[96], k_sold[96];
+    snprintf(k_skeys, sizeof k_skeys, "\ntsdb_settle_backlog_keys{volume=\"%" PRIu32 "\"} ", ecnum);
+    snprintf(k_sold, sizeof k_sold, "\ntsdb_settle_backlog_oldest_seconds{volume=\"%" PRIu32 "\"} ", ecnum);
+    int got_backlog = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 30000 && !got_backlog; usleep(200000)) {
+        struct view v;
+        view(0, &v);
+        int rl = server_of(v.st.leader);
+        if (rl >= 0 && rl != 0) {
+            view_free(&v);
+            view(rl, &v);
+        }
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[EL], ecnum);
+        uint32_t sk = vp ? vp->settle_keys_waiting : 0;
+        uint64_t so = vp ? vp->settle_oldest_wait_s : 0;
+        view_free(&v);
+        if (sk < 2 || so == 0)
+            continue;
+        metrics_get(mports[EL], mbuf, sizeof mbuf);
+        int64_t mk = -1, mo = -1;
+        if (metrics_find_i64(mbuf, k_skeys, &mk) && metrics_find_i64(mbuf, k_sold, &mo) && mk >= 2 && mo > 0) {
+            saw_keys = sk;
+            saw_oldest = so;
+            got_backlog = 1;
+        }
+    }
+    if (!got_backlog)
+        die("progress: settle backlog did not reach >= 2 keys (oldest > 0) in STATUS and /metrics while held");
+
+    /* Release settle hold and verify backlog drains back to 0. */
+    unlink(holdpath);
+    int drained = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 60000 && !drained; usleep(250000)) {
+        struct view v;
+        view(0, &v);
+        int rl = server_of(v.st.leader);
+        if (rl >= 0 && rl != 0) {
+            view_free(&v);
+            view(rl, &v);
+        }
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[EL], ecnum);
+        int st_zero = !vp || (vp->settle_keys_waiting == 0 && vp->settle_oldest_wait_s == 0);
+        view_free(&v);
+        if (!st_zero)
+            continue;
+        metrics_get(mports[EL], mbuf, sizeof mbuf);
+        int64_t mk = -1, mo = -1;
+        if (metrics_find_i64(mbuf, k_skeys, &mk) && metrics_find_i64(mbuf, k_sold, &mo) && mk == 0 && mo == 0)
+            drained = 1;
+    }
+    if (!drained)
+        die("progress: settle backlog did not drain to 0 after releasing settle hold");
+
+    /* End-to-end stripe-fill progress on a storage-only node (server 3 does not hold a log replica of pec). */
+    epoll_after_two = 1;
+    envs[3] = "progress_stall_ms=2500";
+    xargs[3] = "--metrics-port auto";
+    start(3);
+    mports[3] = th_mport;
+    if (mports[3] <= 0)
+        die("progress: server 3 reported no metrics port");
+    node_add(0, 3);
+    unsigned four = 4;
+    await_view(0, p_n_placeable, &four, "4 members UP before stripe-fill progress");
+    char sd3[sizeof base + 32];
+    static char pxa3[sizeof base + 256];
+    snprintf(sd3, sizeof sd3, "%s/ps3", base);
+    chunk_store_make(sd3, cuuid, ids[3]);
+    snprintf(pxa3, sizeof pxa3, "--metrics-port auto --chunk-dir %s", sd3);
+    restart_xargs(3, pxa3);
+    mports[3] = th_mport;
+    await_view(0, p_n_placeable, &four, "server 3 UP with chunk store");
+
+    char p0addr[META_ADDR_MAX], mvargs[PATH_MAX * 2 + 256], mvout[4096];
+    peer_of(0, p0addr, sizeof p0addr);
+    snprintf(mvargs, sizeof mvargs, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s",
+             p0addr, ecnum, ids[3], secret_path);
+    if (cli_run(mvargs, NULL, mvout, sizeof mvout) != 0)
+        die("progress: volume move --pos 0 --to %" PRIu32 " failed: %s", ids[3], mvout);
+
+    char k_fdone[96], k_ftot[96];
+    snprintf(k_fdone, sizeof k_fdone, "\ntsdb_cluster_rebuild_bytes_done{volume=\"%" PRIu32 "\"} ", ecnum);
+    snprintf(k_ftot, sizeof k_ftot, "\ntsdb_cluster_rebuild_bytes_total{volume=\"%" PRIu32 "\"} ", ecnum);
+    uint64_t fill_st_done = 0, fill_st_tot = 0, fill_mt_done = 0, fill_mt_tot = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 30000; usleep(50000)) {
+        struct view v;
+        view(0, &v);
+        int rl = server_of(v.st.leader);
+        if (rl >= 0 && rl != 0) {
+            view_free(&v);
+            view(rl, &v);
+        }
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[3], ecnum);
+        if (vp && vp->role == CREPORT_REBUILD_FILL && vp->bytes_total > 0) {
+            if (vp->bytes_total > fill_st_tot)
+                fill_st_tot = vp->bytes_total;
+            if (vp->bytes_done > fill_st_done)
+                fill_st_done = vp->bytes_done;
+        }
+        view_free(&v);
+
+        metrics_get(mports[3], mbuf, sizeof mbuf);
+        int64_t md = -1, mt = -1;
+        if (metrics_find_i64(mbuf, k_fdone, &md) && metrics_find_i64(mbuf, k_ftot, &mt) && mt > 0) {
+            if ((uint64_t)mt > fill_mt_tot)
+                fill_mt_tot = (uint64_t)mt;
+            if (md > 0 && (uint64_t)md > fill_mt_done)
+                fill_mt_done = (uint64_t)md;
+        }
+        if (fill_st_done > 0 && fill_st_tot > 0 && fill_mt_done > 0 && fill_mt_tot > 0)
+            break;
+        struct meta_volume cur = {0};
+        if (vol_rec(0, "pec", &cur) && cur.stripe[0] == ids[3] && cur.stripe_pos[0].state == META_STRIPE_WHOLE)
+            break;
+    }
+    if (fill_st_done == 0 || fill_st_tot == 0 || fill_mt_done == 0 || fill_mt_tot == 0)
+        die("progress: stripe fill on storage-only node 3 not observed with bytes_done/total > 0 "
+            "(STATUS %" PRIu64 "/%" PRIu64 ", metrics %" PRIu64 "/%" PRIu64 ")",
+            fill_st_done, fill_st_tot, fill_mt_done, fill_mt_tot);
+
+    /* Wait for pos 0 to reach STRIPE_WHOLE and verify fill progress clears in STATUS and /metrics. */
+    for (uint64_t w0 = now_ms();; usleep(100000)) {
+        struct meta_volume cur = {0};
+        if (vol_rec(0, "pec", &cur) && cur.stripe[0] == ids[3] && cur.stripe_pos[0].state == META_STRIPE_WHOLE)
+            break;
+        if (now_ms() - w0 > 45000)
+            die("progress: pec pos 0 on node %" PRIu32 " did not reach STRIPE_WHOLE", ids[3]);
+    }
+    int fill_cleared = 0;
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 15000 && !fill_cleared; usleep(150000)) {
+        struct view v;
+        view(0, &v);
+        int rl = server_of(v.st.leader);
+        if (rl >= 0 && rl != 0) {
+            view_free(&v);
+            view(rl, &v);
+        }
+        const struct creport_vol_progress *vp = view_find_progress(&v, ids[3], ecnum);
+        int st_ok = !vp || vp->role == CREPORT_REBUILD_NONE;
+        view_free(&v);
+        if (!st_ok)
+            continue;
+        metrics_get(mports[3], mbuf, sizeof mbuf);
+        int64_t md = -1;
+        if (!metrics_find_i64(mbuf, k_fdone, &md))
+            fill_cleared = 1;
+    }
+    if (!fill_cleared)
+        die("progress: stripe fill progress did not clear on storage-only node 3 after STRIPE_WHOLE");
+    epoll_after_two = 0;
+#endif
+
+    stop_all();
+    printf("  progress: snapshot bytes_done rose %" PRIu64 "->%" PRIu64 " / %" PRIu64
+           " (metrics %" PRIu64 "->%" PRIu64 "), SIGSTOP stalled=1->0, settle backlog %" PRIu32
+           " keys (oldest %" PRIu64 "s) -> 0\n",
+           st_b1, st_b2, snap_bytes, mt_b1, mt_b2, saw_keys, saw_oldest);
+}
+
 /* Atomically writes <state-dir>/fillpct for server i (used with TSDB_CLUSTER_TEST fill_pct_file=1). */
 static void fillpct_set(int i, int pct)
 {
@@ -25899,7 +26566,7 @@ int main(int argc, char **argv)
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
                {"replfault", scen_replfault}, {"pace", scen_pace},
                {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
-               {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics},
+               {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics}, {"progress", scen_progress},
                {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild},
                {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
