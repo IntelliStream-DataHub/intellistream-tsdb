@@ -203,8 +203,8 @@ have to be unpacked are unpacked in parallel.
 More detail: [docs/design.md](docs/design.md).
 
 **Version 0.11.0** ([CHANGELOG.md](CHANGELOG.md)) speaks wire protocol 15 (floor 12, talking to 0.9.x–0.11.x clients and
-servers) and keeps disk format 9 (0.10.x databases open as they are; a 0.9.x database carries over with
-`tsdb DIR upgrade` or export and import). Building on 0.10.x's latest-value cache, statistics and metadata group,
+servers) and writes disk format 10 (a 0.10.x database carries over by export with 0.10.x and import with 0.11.0; a
+0.9.x database with `tsdb DIR upgrade` or export and import). Building on 0.10.x's latest-value cache, statistics and metadata group,
 0.11.0 adds replicated and erasure-coded cluster volumes with failover, leadership transfers, copy moves and snapshot
 rebuilds ([docs/cluster-preview.md](docs/cluster-preview.md), [docs/design-cluster-data.md](docs/design-cluster-data.md)),
 RDMA peer links ([docs/design-rdma.md](docs/design-rdma.md)), and per-series and per-tenant statistics over the wire

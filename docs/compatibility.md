@@ -7,7 +7,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | | where | now |
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.11.0 |
-| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 9 (0.10.0; 0.9.0 and 0.9.1 wrote 8) |
+| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 10 (0.11.0; 0.10.x wrote 9, 0.9.0 and 0.9.1 wrote 8) |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 15 |
 | oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
 | embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 7 |
@@ -25,11 +25,12 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 0.10.0 changed the disk format (8 to 9), the wire protocol (12 to 14: 13 adds the HA reply bodies of docs/ha.md section
 15.4, 14 adds `QUERY_LATEST`) and the C ABI (3 to 7: the statistics, the latest table and the tenants added fields to
 `tsdb_options` and `tsdb_volume_stats`, and the functions and structs of the change feed, the statistics and the latest
-table). 0.11.0 raises the wire protocol to 15 (`STATS_SERIES` and `STATS_TENANTS`, `docs/design-stats.md` 5.1) while
-keeping disk format 9 and C ABI 7. Its floor stays 12: a client or server of 0.9.x speaks to it, with these limits. A client of 12 gets the bare
+table). 0.11.0 raises the wire protocol to 15 (`STATS_SERIES` and `STATS_TENANTS`, `docs/design-stats.md` 5.1) and the
+disk format to 10 (export with 0.10.x, import with 0.11.0), keeping C ABI 7. Its floor stays 12: a client or server of 0.9.x speaks to it, with these limits. A client of 12 gets the bare
 status codes it knew (the HA bodies only go to a client whose HELLO said 13), and a call that needs a newer server than
 the one connected (`latest` needs 14, `series_stats`/`tenant_stats` need 15) fails with `TSDB_ERR_INVALID` without sending. A database of 0.9.x is refused by
-0.10.0 and 0.11.0 until it is upgraded, and a format-9 database is refused by 0.9.x. A binary built for ABI 3 (an embedded
+0.10.0 and 0.11.0 until it is upgraded, a format-9 database is refused by 0.9.x and by 0.11.0 (export and import), and
+a format-10 database by 0.10.x and 0.9.x. A binary built for ABI 3 (an embedded
 program) must be rebuilt: the Rust and Java bindings check `tsdb_abi_version()` against the one they were written for and refuse a mismatch
 (Python goes through the Rust crate). Use the same release on the server and its clients all the same.
 
@@ -48,18 +49,30 @@ on, `META` says `requires=feed` and a binary without the feed refuses the direct
 
 | version | what changed |
 |---|---|
+| 10 | columnar WAL records (kind 2, `WAL_KIND_COL`: a batch of 256 rows or more as column streams, zstd-compressed; `docs/design-cdc.md` 2.1) and the `F64_FOR` flag (0x40) in the scale byte of float64 fixed-point blocks (`BLK_F64_DECIMAL`, `docs/design.md`); nothing else: the other files are those of 9. The number went up so that 0.10.x refuses the database at open (a 0.10.x binary read a columnar record as a torn WAL tail and would have cut acknowledged rows without a word) |
 | 9 | the WAL record has a 32-byte header with a log number (`fno`) and the group commit's time, and can be a marker (`docs/design-cdc.md` 2.1); the part header is 48 bytes (the range of log numbers its rows had, and the time they were written); each volume has an `FNO` file, the durable bound of the log numbers; `META` may say `requires=` (a feature this binary does not know is refused, and named) and, in an upgraded database, `parts_v8=1`; `MANIFEST` has an `fno_next` line (for followers) |
 | 8 | `CATALOG` is gone: a series id is `(volume + 1) << 32 \| local`, so it names its volume, and each volume's `META` holds its number (`volume=N`, checked at open) |
 | 7 | part keys `4 x first base partition + class` and the `CLASSES` file (partition classes); zstd frames without magic number and content size; the granule index bit-packed per part (about 32 bytes an entry instead of 160) behind a 64-byte footer that gives the index's length (`index_len`) |
 | 6 | block headers name their codec in 7 bits; the dictionary codec |
 | 5 | the spread in every granule entry (160 bytes) |
 
-Each version is refused by every release that reads another one; carry data over with export and import. The one
-exception is the step from 8 to 9, which `tsdb <dir> upgrade` does in place:
+Each version is refused by every release that reads another one; carry data over with export and import. **A
+format-9 database (0.10.x) is refused by 0.11.0 and is not carried over in place**: export it with 0.10.x (`tsdb <dir>
+export -o FILE`) and import it with 0.11.0 (`tsdb <newdir> import FILE`); `tsdb <dir> upgrade` refuses it and says so.
+The stream holds series, their types, retention and rows: what it does not carry is set up again. Logins: copy `USERS`
+from the old directory into the new one before tsdbd starts there (its format did not change; tsdbd refuses to start
+without a superuser), or make one with `tsdb <newdir> user add NAME --superuser --password-file F`. Volumes: a series
+goes back to a volume of the same path, which `import --create-volumes` adds (or `tsdb <newdir> volume add` before the
+import; `--volume-root OLD=NEW` moves them). A change feed starts again with `tsdb <newdir> feed enable`. Two corners:
+a 0.10.x upgrade from 8 that did not finish (the root still at 8) is finished with 0.10.x's `tsdb <dir> upgrade` first,
+since 0.10.x exports only a database that is all 9; and a database written by a development build of 0.11.0 from before
+the number went up says 9 but may hold columnar WAL records and `F64_FOR` blocks: export it with that build, never with
+0.10.x, which would cut those records as a torn tail and call those blocks damage.
+The one exception is format 8 (0.9.0 and 0.9.1), which `tsdb <dir> upgrade` carries over in place, straight to 10:
 
 - Close the database cleanly with 0.9.0 or 0.9.1 (stop tsdbd; no `wal_*` segment may be left, nor an intent or a `tmp_*`
   part; the upgrade refuses and says which), **stop every follower on other hosts** (they cannot be seen from here, and
-  a 0.9.x follower that reads a MANIFEST of version 9 reports damage), then run `tsdb <dir> upgrade` with the new
+  a 0.9.x follower that reads a MANIFEST of version 10 reports damage), then run `tsdb <dir> upgrade` with the new
   release. It takes the locks of every volume, writes `FNO`, MANIFEST and `META` of each volume and of the root
   last, and can simply be run again if it died. Keep the export of the old release until the new one has run for a
   while: 0.9.0 and 0.9.1 refuse the upgraded database (they name the version), and a way back is the export. **Do not run
@@ -67,7 +80,9 @@ exception is the step from 8 to 9, which `tsdb <dir> upgrade` does in place:
   (This release makes the file at the volume's first open when the volume never held a record, and its own `volume add`
   refuses a root of another format or with an unknown `requires=`.)
 - The parts are not rewritten: they keep their 24-byte headers, `META` says `parts_v8=1`, and the open reads such a
-  part (only where `META` says so, never in a database created at 9). Merges of idle partitions, and `tsdb <dir>
+  part (only where `META` says so, never in a database created at 9 or 10). A part written by 0.11.0 says 10 in its
+  header and footer; a format-10 database never holds a part that says 9 (format 9 is refused, the upgrade comes from 8
+  only). Merges of idle partitions, and `tsdb <dir>
   optimize` at once, rewrite them one by one; the open logs how many are left, and the line leaves `META` when none is.
 - **Before 1.0 that allowance is removed** (`docs/tasks/pre-1.0-v8-parts.md`): run 0.9.x until the count is zero
   (or `optimize`), or export and import. A 1.0 that finds a format-8 part refuses it and says so.
@@ -88,12 +103,13 @@ volume path, for example, changes both). So:
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:
 
   ```
-  tsdb: the database has disk format version 7; tsdb 0.11.0 reads version 9 only. Export the data with the
+  tsdb: the database has disk format version 7; tsdb 0.11.0 reads version 10 only. Export the data with the
   release that wrote it and import it here (docs/compatibility.md)
   ```
 
   (For a format-8 database the line says to close it cleanly with the release that wrote it and run `tsdb DIR upgrade`,
-  or to export and import.)
+  or to export and import; for a format-9 one that 9 is not carried over in place, and to export with 0.10.x and
+  import here.)
 
   `tsdbd` and `tsdb` then exit with an error and have touched nothing. A downgrade is refused the same
   way: a newer release's database is not read by an older release.

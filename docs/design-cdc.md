@@ -299,7 +299,7 @@ and the source's `reassert` option are gone.
 
 ## 2. Engine changes
 
-### 2.1 WAL record, version 2 (format 9, built in S0)
+### 2.1 WAL record, version 2 (format 9, built in S0; kind 2 from format 10)
 
 ```
 [u32 len | kind << 28][u32 header check][u64 hash][u64 fno][i64 commit_ms][payload]
@@ -316,6 +316,12 @@ the record to its segment and offset.
   and continues the numbering; `requires=` in META (§5) keeps a binary from opening a volume with markers it would
   have to apply and does not know. Built in S0: `src/marker.h` and `src/marker.c` (one encoder and decoder, fuzzed by
   `fuzz_marker`), `wal_marker` (the engine's append; nothing but tests calls it before the backends exist).
+- **kind 2, columnar rows** (disk format 10, `WAL_KIND_COL`): `len` = payload bytes; the same rows as kind 0, as
+  columns: `u32 nrows, u8 flags, u8 pad, u16 0, u32 cs, u32 uncomp_len`, then the body (series id deltas unless
+  `SINGLE`, the first timestamp and 32- or 64-bit deltas (`TS32`), the values at 4 or 8 bytes (`VAL4`)), zstd-compressed
+  when `ZSTD` is set, padded with zeros to 4 bytes. Takes `nrows` numbers. A write of 256 rows or more is encoded so
+  outside `buf_lock` (`wal_col_encode`, `src/memtable.c`); replay, followers and replicas decode it to rows. A 0.10.x
+  binary read kind 2 as a torn tail and would cut it, hence format 10, which 0.10.x refuses at open.
 
 Marker types (S0 defines the payloads once, design-ha-modes.md §2.1, M15):
 

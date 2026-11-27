@@ -766,7 +766,7 @@ cgroup, so `nice` does not keep your work out of its way.
   at least the segment's end (`fno_require`), and a clean close stores the exact next number. At open `fno_next` =
   max(the slot with the higher generation, the end of the valid records of every segment, 1 + the largest part
   `fno_hi`); one bad slot is a torn store or damage to the newest slot (they look alike), so the other is used and the
-  numbers skip ahead by `FNO_BELT` (2^40: a gap, never a repeat); both bad or no file in a format-9 volume is
+  numbers skip ahead by `FNO_BELT` (2^40: a gap, never a repeat); both bad or no file in a format-9 or 10 volume is
   `TSDB_ERR_CORRUPT` (a volume that never held a record, 0.9.0's add leaves one, gets its `FNO` at the first open).
   Bounds at or above `FNO_BOUND_MAX` (2^62 minus two belts) fail the open, and the writer fails the engine rather than
   number past it. **MANIFEST
@@ -1199,10 +1199,15 @@ cgroup, so `nice` does not keep your work out of its way.
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
-- The on-disk format is version 9 (`FORMAT_VERSION`; 9: the WAL record has a 32-byte header with `fno` and
-  `commit_ms` and may be a marker, the part header is 48 bytes with `fno_lo`, `fno_hi` and `written_ms`, every volume
-  has an `FNO` file, META may say `requires=` (an open refuses a feature it does not know, naming it) and
-  `parts_v8=1`; a format-8 database is carried over by `tsdb DIR upgrade`, below; 6: a 7-bit codec kind in block headers; 7: partition keys with
+- The on-disk format is version 10 (`FORMAT_VERSION`; 10: columnar WAL records (`WAL_KIND_COL` = 2, a write of 256
+  rows or more as zstd-compressed columns, `src/memtable.c` `wal_col_*`) and the `F64_FOR` flag (0x40) in
+  `BLK_F64_DECIMAL`'s scale byte (an `int_for` integer stream), nothing else; a format-9 database (0.10.x) is refused at
+  open and by `tsdb DIR upgrade` with a line naming 9, 10, export with 0.10.x and import here
+  (`EXPORT_ONLY_FORMAT_VERSION`; `test_damage` `test_format_version`): there is no 9 -> 10 path in place; parts this
+  release writes say 10 and a format-10 database never holds a part that says 9; 9: the WAL record has a 32-byte
+  header with `fno` and `commit_ms` and may be a marker, the part header is 48 bytes with `fno_lo`, `fno_hi` and
+  `written_ms`, every volume has an `FNO` file, META may say `requires=` (an open refuses a feature it does not know,
+  naming it) and `parts_v8=1`; a format-8 database is carried over by `tsdb DIR upgrade`, below; 6: a 7-bit codec kind in block headers; 7: partition keys with
   a class, CLASSES, zstd frames without magic and content size, the packed granule index and a 64-byte footer
   with `index_len`; 8: no CATALOG, the volume number in each volume's META, 64-bit series ids): granule entries
   with typed, time-weighted and spread statistics, bit-packed per part (about 32 bytes each), a checksum over each
@@ -1210,12 +1215,15 @@ cgroup, so `nice` does not keep your work out of its way.
   1.0 (the format freezes there; decided on 2026-10-25) older formats need not stay readable: a
   layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database
   of another version is refused at open with a message that names both versions. Value blocks name their codec, so new
-  codecs need no version bump.
-- **`tsdb DIR upgrade`** (`tsdb_upgrade`, `up_*` at the end of `src/volumes.c`) carries a format-8 database over in place.
+  codecs need no version bump; a new flag or variant inside an existing block kind, or a new WAL record kind, does (an
+  older binary must refuse the database at open, not call the block damage or cut the record as a torn tail: format 10).
+  Tests use `FORMAT_VERSION` rather than a literal where C allows it, so a bump touches few of them.
+- **`tsdb DIR upgrade`** (`tsdb_upgrade`, `up_*` at the end of `src/volumes.c`) carries a format-8 database over in place,
+  straight to the current format (10; `PREV_FORMAT_VERSION` stays 8, and a format-9 database is refused: export, import).
   It refuses, before writing anything, on a `wal_*` segment, an intent, a `tmp_*` part, a held writer lock or a
   damaged MANIFEST (not on `retired_*`: those are normal after a clean close); holds every directory's `LOCK` and the
-  VOLUMES OFD lock for the whole run; per volume makes `FNO` (synced with its directory), rewrites MANIFEST as 9 (tmp,
-  fsync, rename) and writes META (version 9, `parts_v8=1`) last; volumes first, the root last; safe to run again.
+  VOLUMES OFD lock for the whole run; per volume makes `FNO` (synced with its directory), rewrites MANIFEST as 10 (tmp,
+  fsync, rename) and writes META (version 10, `parts_v8=1`) last; volumes first, the root last; safe to run again.
   Parts keep their 24-byte headers: `part_open_as` reads one only where META says `parts_v8=1` and only when header and
   footer both say 8 (a v8 part anywhere else is damage), `rewrite_alone` (`src/merge.c`) lets an idle partition's merge
   or `tsdb_optimize` rewrite one alone, the open logs how many are left, and `v8_parts_account` (`src/db.c`) takes the

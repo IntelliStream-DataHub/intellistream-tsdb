@@ -18,8 +18,19 @@ disk format and the wire protocol.
   `opening_hold_s`, `failstop_out_s`, `out_guard_pct`, `out_guard_hold_s`, `repl_retain_down_gb`, `young_high_pct`,
   `balance_mb_s`, `rebuild_concurrency`).
 
+- **Disk format 10 (changed; breaking).** 0.11.0 writes format 10: columnar WAL records (`WAL_KIND_COL`, kind 2: a
+  write of 256 rows or more as zstd-compressed columns) and the `F64_FOR` flag (0x40) in float64 fixed-point blocks,
+  besides the new block kinds and scales below. A 0.10.x binary would have cut a columnar record as a torn WAL tail
+  (acknowledged rows lost without a word) and called the new blocks damage; with the number raised it refuses the
+  database at open, naming both versions. 0.11.0 refuses a format-9 database (0.10.x) the same way, and `tsdb DIR
+  upgrade` does not carry 9 over in place. **Carry a 0.10.x database over by export and import**: with 0.10.x,
+  `tsdb DIR export -o FILE` (stop tsdbd first); with 0.11.0, `tsdb NEWDIR import FILE`. A format-8 database (0.9.0,
+  0.9.1) is still carried over in place by `tsdb DIR upgrade`, now straight to 10 (docs/compatibility.md).
+  The stream does not carry logins (copy `USERS`, whose format did not change), the volumes (`import
+  --create-volumes`) or a change feed (`feed enable` again). A database written by a development build of 0.11.0
+  before this change says 9 but may hold columnar records: export it with that build, never with 0.10.x.
 - **Codec format improvements (`BLK_INT_FOR`, `BLK_BOOL_PACK`, `BLK_TS_FOR_BP`, dividing decimal/binary scales).**
-  No format bump (format 9 is unreleased; all existing block kinds `0..17` and scale indices decode bit-for-bit identically):
+  Part of disk format 10 (above; all existing block kinds `0..17` and scale indices decode bit-for-bit identically):
   - `BLK_INT_FOR` (kind 18) adds per-vector delta/direct frame-of-reference, 33–63-bit `pack64`, and PFOR outlier
     patching (up to `nv/32` low/high exceptions) for `TSDB_INT64`, shrinking steady counters (-20% to -42%), counters
     with resets/spikes/nulls (-35%, 9.7x faster decode), stationary rates (-6%, 1.7x faster decode), and 40-bit deltas

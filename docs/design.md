@@ -1522,8 +1522,14 @@ int64 codec below, zigzag deltas packed per vector of 1024 (raw 64-bit zigzags
 for a vector with a delta wider than 32 bits):
 
 ```
-u8 scale|flag | u32 nexc | nexc x (u32 pos, u64 bits) | int64 block
+u8 scale|flags | u32 nexc | nexc x (u32 pos, u64 bits) | int64 block
 ```
+
+The scale byte holds the scale in its low 6 bits (`F64_EXP_MASK`), `F64_MUL` (0x80: rebuild as `k * 10^-e`, else
+`k / 10^e`) and, from disk format 10, `F64_FOR` (0x40): the integers are an `int_for` stream (per-vector delta-FOR or
+direct-FOR with outlier patching, as `BLK_INT_FOR`) instead of `int_bp`. Without zstd the encoder takes `int_for`
+whenever it is smaller raw; with zstd it compares both after compression and keeps `int_for` on a tie (it decodes
+faster). A 0.10.x binary (format 9) refuses such a block as damage, which is one reason the format number went up.
 
 AUTO keeps fixed point outright at 16 bits a value or less (merges try the
 dictionary of its integers too). Otherwise inserts (`CODEC_FAST`) encode wider
