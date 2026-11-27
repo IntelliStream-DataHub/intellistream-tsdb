@@ -247,7 +247,7 @@ static void usage(void)
             "  volume diverged [PATH] [--clear]   the DIVERGED records of volume PATH (default: DIR), whose\n"
             "                                     settled data did not match; --clear (with the writer stopped)\n"
             "                                     removes them so it is served again; refused on a cluster volume\n"
-            "  upgrade                            carry a database closed cleanly by the previous release\n"
+            "  upgrade                            carry a database closed cleanly by 0.9.x\n"
             "                                     (disk format 8) over to this one, in place; stop followers first\n"
             "  latest NAME... [--with-nulls] [--end TIME]\n"
             "                                     the newest value of each series, one line each: name, time,\n"

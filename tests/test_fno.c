@@ -1171,7 +1171,8 @@ static void check_series_bits(eng *db, uint32_t sid, size_t w, const int64_t *ex
 /* Runs f(arg) with stderr going to a file and gives back what it printed (the caller frees it). */
 static char *stderr_of(int (*f)(void *), void *arg, int *rc)
 {
-    char path[] = "/var/tmp/test_fno_stderr_XXXXXX";
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s/stderr_XXXXXX", S); /* the scratch directory, as every file of this test */
     int fd = mkstemp(path);
     if (fd < 0) {
         *rc = f(arg);
@@ -1497,13 +1498,19 @@ static void test_wal_col(void)
         CHECK(write(wfd, wrec, WAL_HDR + plen) == (ssize_t)(WAL_HDR + plen));
         close(wfd);
         if (mode == 0) {
-            /* a read-only open skips wal_check_segment, so the replay itself must say why it refuses */
+            /* a read-only open skips wal_check_segment, so the replay itself must say why it refuses. Without
+             * MANIFEST a reader replays the directory (wal_open); with it, it follows (tail_segment_fd, below) */
+            char mpath[PATH_MAX + 48];
+            snprintf(mpath, sizeof mpath, "%s/MANIFEST", cdir);
+            CHECK(unlink(mpath) == 0);
             struct ro_open_arg oa = {cdir, false, NULL};
             int orc = 0;
             char *msg = stderr_of(ro_open_call, &oa, &orc);
+            const char *want_ro = "tsdb: WAL segment wal_0000000000000001.log: the columnar record at offset 0 does "
+                                  "not decode";
             CHECK(orc == TSDB_ERR_CORRUPT && oa.db == NULL);
-            CHECK(msg && strstr(msg, "columnar record at offset 0 does not decode"));
-            if (!(msg && strstr(msg, "columnar record at offset 0 does not decode")))
+            CHECK(msg && strstr(msg, want_ro));
+            if (!(msg && strstr(msg, want_ro)))
                 fprintf(stderr, "  read-only open printed: %s\n", msg ? msg : "(nothing)");
             free(msg);
         }
@@ -1522,8 +1529,10 @@ static void test_wal_col(void)
         CHECK(w && eng_series(w, "s0", TSDB_FLOAT32, &sid0) == 0);
         /* the writer stays open: its active segment (the one MANIFEST names) is where the follower tails */
         uint64_t aseq = w ? w->wal_seq : 0;
-        struct ro_open_arg oa = {fdir, true, NULL};
-        CHECK(open_eng(fdir, true, true, &oa.db) == 0);
+        /* follow=false: no follower thread whose own poll could print the line (once) before stderr_of looks; a
+         * reader with MANIFEST still tails (src/db.c), and eng_refresh polls it here */
+        struct ro_open_arg oa = {fdir, false, NULL};
+        CHECK(open_eng(fdir, true, false, &oa.db) == 0);
         char seg[PATH_MAX + 128], segname[64];
         snprintf(segname, sizeof segname, "wal_%016" PRIx64 ".log", aseq);
         snprintf(seg, sizeof seg, "%s/%s", fdir, segname);
@@ -1549,6 +1558,7 @@ static void test_wal_col(void)
         snprintf(want, sizeof want, "follower: WAL segment %s: the columnar record at offset 0", segname);
         CHECK(m1 && strstr(m1, want));
         CHECK(m2 && !strstr(m2, "columnar record")); /* once */
+        CHECK(r1 == TSDB_ERR_CORRUPT && r2 == TSDB_ERR_CORRUPT);
         if (!(m1 && strstr(m1, "columnar record")))
             fprintf(stderr, "  follower refresh printed: %s (rc %d)\n", m1 ? m1 : "(nothing)", r1);
         free(m1);
