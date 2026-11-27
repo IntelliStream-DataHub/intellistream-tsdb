@@ -457,7 +457,7 @@ static void test_requires(void)
     snprintf(vol, sizeof vol, "%s/requires-vol2", S);
     CHECK(tsdb_volume_add_dir(dir, vol, &idx) == TSDB_ERR_INVALID);
     CHECK(sh("test ! -e '%s/META'", vol) == 0);
-    CHECK(sh("cp '%s.saved' '%s' && sed -i 's/^version=.*/version=10/' '%s'", meta, meta, meta) == 0);
+    CHECK(sh("sed 's/^version=.*/version=%d/' '%s.saved' > '%s'", FORMAT_VERSION + 1, meta, meta) == 0);
     CHECK(tsdb_volume_add_dir(dir, vol, &idx) == TSDB_ERR_INVALID);
     CHECK(sh("test ! -e '%s/META'", vol) == 0);
     /* a volume that requires something: the open of the database refuses */
