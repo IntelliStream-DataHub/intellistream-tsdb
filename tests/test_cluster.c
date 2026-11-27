@@ -34520,6 +34520,645 @@ static void scen_diskfill(void)
     stop_all();
 }
 
+/* Count live replicated log moves in flight (nrep > replicas or any learner/replaces entry). */
+static int posbal_count_log_inflight(const struct meta_state *sm)
+{
+    int inflight = 0;
+    for (uint32_t vi = 0; vi < sm->nvolumes; vi++) {
+        const struct meta_volume *v = &sm->volumes[vi];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        int moving = 0;
+        for (uint32_t k = 0; !moving && k < v->nrep; k++)
+            if (v->rep[k].learner || v->rep[k].replaces)
+                moving = 1;
+        if (moving)
+            inflight++;
+    }
+    return inflight;
+}
+
+/* Insert one point into volume `vname` / series `sid`, following leader changes across MOVED / UNAVAILABLE. */
+static void posbal_write_one(const char *vname, tsdb_sid sid, int64_t ts, float val)
+{
+    for (uint64_t w0 = now_ms();; usleep(50000)) {
+        struct meta_volume mv;
+        int ml = leader_of(0);
+        if (vol_rec(ml, vname, &mv) && mv.leader) {
+            int vl = server_of(mv.leader);
+            if (vl >= 0) {
+                tsdbc *c = client(vl);
+                int rc = tsdbc_insert_series(c, sid, &ts, &val, 1);
+                tsdbc_close(c);
+                if (rc == 0)
+                    return;
+                if (rc != TSDB_ERR_MOVED && rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_IO)
+                    die("posbalance: write %s ts=%" PRId64 " failed: %s", vname, ts, ers(rc));
+            }
+        }
+        if (now_ms() - w0 > 30000)
+            die("posbalance: write %s ts=%" PRId64 " timed out after 30 s", vname, ts);
+    }
+}
+
+/* R9 balancer end-to-end (track r9-balance; docs/design-cluster-data.md §6.2-6.3, D18-D20):
+ *  (a) replicas=3 with 24 volumes on 5 nodes, add 6th node -> spread within 1 of mean, <= 5% (3) in flight, 0 lost
+ *      writes during live rebalancing, leaders balanced within 1 of mean.
+ *  (b) ec=4+2 on 6 storage nodes, add 7th storage node -> new node gets positions by COPY (0 decodes; kills
+ *      `balancedecode`), paced under class="balance", reads bit-exact against twin.
+ *  (c) 25% automatic cap stops rebalance when adding 2 nodes to 3-node 8-volume cluster (9/24 = 37.5% > 25%; kills
+ *      `balanceunbounded`), dry-run reports over cap, `tsdb cluster balance --apply` runs it at <= 5% concurrency. */
+static void scen_posbalance(void)
+{
+    /* ---- (a) replicas=3, 24 volumes on 5 nodes, add 6th node ---- */
+    scenario("posbalance-log");
+    epoll_after_two = 1;
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "5 voters for posbalance-log");
+
+    enum { NVOL = 24, NWATCH = 4, INIT_ROWS = 20, LIVE_ROWS = 30 };
+    char vnames[NVOL][16];
+    for (int i = 0; i < NVOL; i++) {
+        uint32_t vn = 0;
+        snprintf(vnames[i], sizeof vnames[i], "pb%d", i);
+        int rc;
+        for (uint64_t t0 = now_ms(); (rc = vol_add(0, vnames[i], 3, &vn)) != 0; usleep(100000))
+            if ((rc != CLUSTER_ERR_NOTLEADER && rc != CLUSTER_ERR_FEW) || now_ms() - t0 > 30000)
+                die("posbalance-log: vol_add %s: %s", vnames[i], cluster_strerror(rc));
+    }
+    for (int i = 0; i < NVOL; i++) {
+        struct meta_volume mv;
+        for (uint64_t t0 = now_ms(); !vol_rec(0, vnames[i], &mv) || !mv.leader; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-log: %s has no leader", vnames[i]);
+        await_isr(0, vnames[i], 3, 30000, "posbalance-log full ISR before scale-out");
+    }
+
+    const int64_t base_ts = 1704067200000LL;
+    tsdb_sid wsids[NWATCH];
+    int written[NWATCH] = {0};
+    for (int w = 0; w < NWATCH; w++) {
+        struct meta_volume mv;
+        if (!vol_rec(leader_of(0), vnames[w], &mv) || !mv.leader)
+            die("posbalance-log: lost vol_rec for %s", vnames[w]);
+        int vl = server_of(mv.leader);
+        tsdbc *c = client(vl);
+        char sname[32];
+        snprintf(sname, sizeof sname, "pblog.s%d", w);
+        wsids[w] = ecb_series(c, sname, vnames[w]);
+        int rc;
+        for (int k = 0; k < INIT_ROWS; k++) {
+            int64_t t = base_ts + (int64_t)k * 1000LL;
+            float val = (float)(w * 1000 + k) * 0.5f;
+            if ((rc = tsdbc_insert_series(c, wsids[w], &t, &val, 1)) != 0)
+                die("posbalance-log: init insert %s/%d: %s", vnames[w], k, ers(rc));
+            written[w]++;
+        }
+        tsdbc_close(c);
+    }
+
+    /* Add 6th server -> 72 replicas across 6 nodes (mean 12, 5% concurrent bound = 3, 12 moves = 16.7% <= 25%). */
+    start(5);
+    node_add(0, 5);
+    unsigned six = 6;
+    await_view(0, p_n_placeable, &six, "6 placeable members for posbalance-log");
+
+    int max_inflight = 0, converged = 0;
+    int rcnt[6] = {0}, lcnt[6] = {0};
+    int live_sent = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 120000; usleep(150000)) {
+        struct view vw;
+        view(leader_of(0), &vw);
+        int infl = posbal_count_log_inflight(&vw.m);
+        if (infl > 3)
+            die("posbalance-log: %d log moves in flight exceeds 5%% concurrent cap of 3 (72 positions)", infl);
+        if (infl > max_inflight)
+            max_inflight = infl;
+        memset(rcnt, 0, sizeof rcnt);
+        memset(lcnt, 0, sizeof lcnt);
+        for (uint32_t vi = 0; vi < vw.m.nvolumes; vi++) {
+            const struct meta_volume *v = &vw.m.volumes[vi];
+            if (v->kind != META_VOL_REPLICATED)
+                continue;
+            for (uint32_t k = 0; k < v->nrep; k++) {
+                int s = server_of(v->rep[k].node);
+                if (s >= 0 && s < 6)
+                    rcnt[s]++;
+            }
+            if (v->leader) {
+                int ls = server_of(v->leader);
+                if (ls >= 0 && ls < 6)
+                    lcnt[ls]++;
+            }
+        }
+        view_free(&vw);
+
+        if (live_sent < LIVE_ROWS) {
+            int w = live_sent % NWATCH;
+            int idx = written[w];
+            posbal_write_one(vnames[w], wsids[w], base_ts + (int64_t)idx * 1000LL, (float)(w * 1000 + idx) * 0.5f);
+            written[w]++;
+            live_sent++;
+        }
+
+        if (infl == 0 && live_sent >= LIVE_ROWS) {
+            int rmin = rcnt[0], rmax = rcnt[0], lmin = lcnt[0], lmax = lcnt[0];
+            for (int s = 1; s < 6; s++) {
+                if (rcnt[s] < rmin) rmin = rcnt[s];
+                if (rcnt[s] > rmax) rmax = rcnt[s];
+                if (lcnt[s] < lmin) lmin = lcnt[s];
+                if (lcnt[s] > lmax) lmax = lcnt[s];
+            }
+            if (rmax - rmin <= 1 && lmax - lmin <= 1 && rmin >= 11 && rmax <= 13 && lmin >= 3 && lmax <= 5) {
+                converged = 1;
+                break;
+            }
+        }
+    }
+    if (!converged)
+        die("posbalance-log: did not converge within 120 s (replicas=[%d,%d,%d,%d,%d,%d] leaders=[%d,%d,%d,%d,%d,%d])",
+            rcnt[0], rcnt[1], rcnt[2], rcnt[3], rcnt[4], rcnt[5], lcnt[0], lcnt[1], lcnt[2], lcnt[3], lcnt[4],
+            lcnt[5]);
+    if (max_inflight < 1)
+        die("posbalance-log: never observed any move in flight");
+
+    /* Verify every pre- and mid-balance write is intact (0 lost writes). */
+    for (int w = 0; w < NWATCH; w++) {
+        struct meta_volume mv;
+        if (!vol_rec(leader_of(0), vnames[w], &mv) || !mv.leader)
+            die("posbalance-log: lost vol_rec for %s after balance", vnames[w]);
+        tsdbc *c = client(server_of(mv.leader));
+        tsdb_points pts = {0};
+        int rc = tsdbc_query_points(c, wsids[w], base_ts, base_ts + (int64_t)written[w] * 1000LL, &pts);
+        tsdbc_close(c);
+        if (rc != 0)
+            die("posbalance-log: read %s failed: %s", vnames[w], ers(rc));
+        if ((int)pts.n != written[w])
+            die("posbalance-log: %s lost rows (got %zu, expected %d)", vnames[w], pts.n, written[w]);
+        for (int k = 0; k < written[w]; k++) {
+            int64_t exp_t = base_ts + (int64_t)k * 1000LL;
+            float exp_v = (float)(w * 1000 + k) * 0.5f;
+            if (pts.ts[k] != exp_t || pts.values[k] != exp_v)
+                die("posbalance-log: %s row %d mismatch (got %" PRId64 "/%g, want %" PRId64 "/%g)", vnames[w], k,
+                    pts.ts[k], pts.values[k], exp_t, exp_v);
+        }
+        tsdb_points_free(&pts);
+    }
+
+    char p1[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[16384];
+    peer_of(1, p1, sizeof p1);
+    snprintf(args, sizeof args, "cluster balance %s --secret-file %s", p1, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "cluster is balanced"))
+        die("posbalance-log: dry-run after convergence unexpected:\n%s", out);
+    printf("  posbalance-log: 24 vols 5->6 nodes converged replicas=[%d,%d,%d,%d,%d,%d] leaders=[%d,%d,%d,%d,%d,%d] "
+           "(max_inflight=%d <= 3, 0 lost writes)\n",
+           rcnt[0], rcnt[1], rcnt[2], rcnt[3], rcnt[4], rcnt[5], lcnt[0], lcnt[1], lcnt[2], lcnt[3], lcnt[4], lcnt[5],
+           max_inflight);
+
+    /* ---- (b) ec=4+2 on 6 storage nodes, add 7th storage node -> copy (0 decodes), bit-exact reads ---- */
+#ifdef TSDB_EC
+    {
+        scenario("posbalance-ec");
+        epoll_after_two = 1;
+        enum { EC_DAYS = 4 };
+        static char exa[7][PATH_MAX + 256];
+        static char esdirs[7][PATH_MAX + 96];
+        int emports[7] = {0};
+
+        for (int i = 0; i < 6; i++)
+            start(i);
+        init_cluster(0, 600);
+        for (int i = 1; i < 6; i++)
+            node_add(0, i);
+        await_view(0, p_voters, &five, "5 voters of 6 for posbalance-ec");
+
+        for (int i = 0; i < 6; i++) {
+            char ddir[PATH_MAX + 80];
+            snprintf(ddir, sizeof ddir, "%s/pbec%d", base, i);
+            disk_make(ddir, "hdd");
+            snprintf(esdirs[i], sizeof esdirs[i], "%s/chunks", ddir);
+            snprintf(exa[i], sizeof exa[i],
+                     "--disk %s:hdd --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                     "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16",
+                     ddir);
+            restart_xargs(i, exa[i]);
+            emports[i] = th_mport;
+        }
+        await_view(5, p_n_placeable, &six, "6 storage members UP for posbalance-ec");
+
+        uint32_t e0num = 0, e1num = 0, tnum = 0;
+        char txt[256];
+        int rc;
+        for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "pbe0", 0, 4, 2, &e0num, txt, sizeof txt)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+                die("posbalance-ec: vol_add_ec pbe0: %s (%s)", cluster_strerror(rc), txt);
+        for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "pbe1", 0, 4, 2, &e1num, txt, sizeof txt)) != 0;
+             usleep(100000))
+            if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+                die("posbalance-ec: vol_add_ec pbe1: %s (%s)", cluster_strerror(rc), txt);
+        for (uint64_t t0 = now_ms(); (rc = vol_add(0, "pbt0", 3, &tnum)) != 0; usleep(100000))
+            if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+                die("posbalance-ec: twin pbt0: %s", cluster_strerror(rc));
+
+        struct meta_volume ev0, ev1, tv0;
+        for (uint64_t t0 = now_ms(); !vol_rec(0, "pbe0", &ev0) || !ev0.leader; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: pbe0 has no leader");
+        for (uint64_t t0 = now_ms(); !vol_rec(0, "pbe1", &ev1) || !ev1.leader; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: pbe1 has no leader");
+        for (uint64_t t0 = now_ms(); !vol_rec(0, "pbt0", &tv0) || !tv0.leader; usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: pbt0 has no leader");
+        int L0 = server_of(ev0.leader), L1 = server_of(ev1.leader), Lt = server_of(tv0.leader);
+        for (uint64_t t0 = now_ms(); !vol_rec(L0, "pbe0", &ev0); usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: L0 did not see pbe0");
+        for (uint64_t t0 = now_ms(); !vol_rec(L1, "pbe1", &ev1); usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: L1 did not see pbe1");
+        for (uint64_t t0 = now_ms(); !vol_rec(Lt, "pbt0", &tv0); usleep(50000))
+            if (now_ms() - t0 > 30000)
+                die("posbalance-ec: Lt did not see pbt0");
+        await_isr(L0, "pbe0", 3, 30000, "pbe0 full ISR");
+        await_isr(L1, "pbe1", 3, 30000, "pbe1 full ISR");
+        await_isr(Lt, "pbt0", 3, 30000, "pbt0 full ISR");
+
+        const int64_t day0 = 1704067200000LL;
+        tsdbc *c0 = client(L0), *c1 = client(L1), *ct = client(Lt);
+        tsdb_sid id0[ECW_SERIES], id1[ECW_SERIES], idt[ECW_SERIES];
+        for (int s = 0; s < ECW_SERIES; s++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "pbec.s%d", s);
+            id0[s] = ecb_series(c0, nm, "pbe0");
+            id1[s] = ecb_series(c1, nm, "pbe1");
+            idt[s] = ecb_series(ct, nm, "pbt0");
+        }
+        ecw_write_days(c0, id0, day0, 0, EC_DAYS);
+        ecw_write_days(c1, id1, day0, 0, EC_DAYS);
+        ecw_write_days(ct, idt, day0, 0, EC_DAYS);
+        tsdbc_close(c0);
+        tsdbc_close(c1);
+        tsdbc_close(ct);
+
+        int nec0 = 0, nec1 = 0;
+        for (uint64_t t0 = now_ms(); (nec0 = ecb_ec_parts(L0, e0num)) < EC_DAYS ||
+                                     (nec1 = ecb_ec_parts(L1, e1num)) < EC_DAYS;
+             usleep(200000))
+            if (now_ms() - t0 > 120000)
+                die("posbalance-ec: only %d/%d and %d/%d .ec parts settled", nec0, EC_DAYS, nec1, EC_DAYS);
+        char live[1024];
+        for (uint64_t t0 = now_ms();
+             ecb_live_parts(L0, e0num, live, sizeof live) != 0 || ecb_live_parts(L1, e1num, live, sizeof live) != 0;
+             usleep(200000))
+            if (now_ms() - t0 > 90000)
+                die("posbalance-ec: live .part files remain: %s", live);
+
+        /* Add 7th storage node (server 6): balancer must move >= 1 stripe position onto it by COPY (0 decodes). */
+        char ddir6[PATH_MAX + 80];
+        snprintf(ddir6, sizeof ddir6, "%s/pbec6", base);
+        disk_make(ddir6, "hdd");
+        snprintf(esdirs[6], sizeof esdirs[6], "%s/chunks", ddir6);
+        snprintf(exa[6], sizeof exa[6],
+                 "--disk %s:hdd --metrics-port auto --ec-settle-grace-s 0 --ec-settle-force-s 1 "
+                 "--merge-idle-s 1 --flush-interval-ms 200 --ec-cache-mb 16",
+                 ddir6);
+        xargs[6] = exa[6];
+        start(6);
+        emports[6] = th_mport;
+        node_add(0, 6);
+        unsigned seven = 7;
+        await_view(6, p_n_placeable, &seven, "7 storage members UP for posbalance-ec");
+
+        /* Wait until node 6 holds >= 1 WHOLE stripe position across pbe0/pbe1 and no stripe fills remain. */
+        int n6_whole = 0;
+        for (uint64_t t0 = now_ms();; usleep(150000)) {
+            int got = 0, filling = 0;
+            const char *ecnames[2] = {"pbe0", "pbe1"};
+            for (int v = 0; v < 2; v++) {
+                struct meta_volume mv;
+                if (!vol_rec(leader_of(0), ecnames[v], &mv))
+                    continue;
+                for (uint32_t p = 0; p < mv.nstripe; p++) {
+                    if (mv.stripe_pos[p].state == META_STRIPE_FILLING)
+                        filling++;
+                    if (mv.stripe[p] == ids[6] && mv.stripe_pos[p].state == META_STRIPE_WHOLE)
+                        got++;
+                }
+            }
+            if (got >= 1 && filling == 0) {
+                n6_whole = got;
+                break;
+            }
+            if (now_ms() - t0 > 90000)
+                die("posbalance-ec: new storage node 6 did not gain a WHOLE stripe position within 90 s "
+                    "(got=%d filling=%d)",
+                    got, filling);
+        }
+
+        /* Verify 1x copy from old holder and 0 decodes on node 6 (kills `balancedecode`!). */
+        char mbuf[65536];
+        metrics_get(emports[6], mbuf, sizeof mbuf);
+        int64_t copied = -1, decoded = -1, pbal_in = -1;
+        if (!metrics_find_i64(mbuf, "\ntsdb_sfill_objects_total{method=\"copied\"} ", &copied) ||
+            !metrics_find_i64(mbuf, "\ntsdb_sfill_objects_total{method=\"decoded\"} ", &decoded))
+            die("posbalance-ec: node 6 metrics missing tsdb_sfill_objects_total:\n%s", mbuf);
+        if (copied < EC_DAYS)
+            die("posbalance-ec: node 6 copied %" PRId64 " objects (expected >= %d; balancedecode?)", copied, EC_DAYS);
+        if (decoded != 0)
+            die("posbalance-ec: node 6 decoded %" PRId64 " objects during balancer fill (expected 0; balancedecode!)",
+                decoded);
+        if (!metrics_find_i64(mbuf, "\ntsdb_pace_bytes_total{dir=\"recv\",class=\"balance\"} ", &pbal_in) ||
+            pbal_in <= 0)
+            die("posbalance-ec: node 6 balance pace bytes = %" PRId64 " (expected > 0)", pbal_in);
+
+        /* Verify bit-exact reads on both EC volumes against twin pbt0. */
+        if (!vol_rec(leader_of(0), "pbe0", &ev0) || !vol_rec(leader_of(0), "pbe1", &ev1) ||
+            !vol_rec(leader_of(0), "pbt0", &tv0))
+            die("posbalance-ec: lost vol_rec after balance");
+        c0 = client(server_of(ev0.leader));
+        c1 = client(server_of(ev1.leader));
+        ct = client(server_of(tv0.leader));
+        uint64_t expect_rows = (uint64_t)EC_DAYS * 2u * ECW_ROWS;
+        for (int s = 0; s < ECW_SERIES; s++) {
+            struct ecb_sum a0, a1, bt;
+            if ((rc = ecb_read(c0, id0[s], &a0)) != 0 || (rc = ecb_read(c1, id1[s], &a1)) != 0 ||
+                (rc = ecb_read(ct, idt[s], &bt)) != 0)
+                die("posbalance-ec: final read series %d failed: %s", s, ers(rc));
+            if (a0.n != expect_rows || a0.n != bt.n || a0.h != bt.h || a1.n != expect_rows || a1.n != bt.n ||
+                a1.h != bt.h)
+                die("posbalance-ec: bit-exact mismatch series %d (pbe0=%" PRIu64 "/%" PRIx64 " pbe1=%" PRIu64
+                    "/%" PRIx64 " twin=%" PRIu64 "/%" PRIx64 ")",
+                    s, a0.n, a0.h, a1.n, a1.h, bt.n, bt.h);
+        }
+        tsdbc_close(c0);
+        tsdbc_close(c1);
+        tsdbc_close(ct);
+        printf("  posbalance-ec: 7th storage node gained %d WHOLE stripe pos by copy (copied=%" PRId64
+               ", decoded=%" PRId64 ", pace_balance_in=%" PRId64 " B), reads bit-exact\n",
+               n6_whole, copied, decoded, pbal_in);
+    }
+#else
+    printf("  posbalance-ec: skipped (NO_EC=1 build)\n");
+#endif
+
+    /* ---- (c) 25% automatic cap stops automatic plan (kills `balanceunbounded`), `--apply` runs it ---- */
+    scenario("posbalance-cap");
+    epoll_after_two = 1;
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters for posbalance-cap");
+
+    /* Pause automatic balancer while adding both new nodes so 3->5 scale-out is evaluated as one 9/24 = 37.5% jump. */
+    char p0[META_ADDR_MAX];
+    peer_of(0, p0, sizeof p0);
+    snprintf(args, sizeof args, "cluster settings set %s balance=off --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+        die("posbalance-cap: settings set balance=off failed:\n%s", out);
+
+    enum { CAP_VOLS = 8 };
+    char cvnames[CAP_VOLS][16];
+    for (int i = 0; i < CAP_VOLS; i++) {
+        uint32_t vn = 0;
+        snprintf(cvnames[i], sizeof cvnames[i], "pbc%d", i);
+        int rc;
+        for (uint64_t t0 = now_ms(); (rc = vol_add(0, cvnames[i], 3, &vn)) != 0; usleep(100000))
+            if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+                die("posbalance-cap: vol_add %s: %s", cvnames[i], cluster_strerror(rc));
+        await_isr(0, cvnames[i], 3, 30000, "posbalance-cap full ISR");
+    }
+
+    start(3);
+    start(4);
+    node_add(0, 3);
+    node_add(0, 4);
+    await_view(0, p_n_placeable, &five, "5 placeable members for posbalance-cap");
+
+    /* Re-enable automatic balancer: 9/24 = 37.5% > 25% cap (6), so automatic balancer MUST stop and log, 0 moves! */
+    snprintf(args, sizeof args, "cluster settings set %s balance=on --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+        die("posbalance-cap: settings set balance=on failed:\n%s", out);
+
+    int ml = leader_of(0);
+    await_log(ml, "25% automatic cap", 15000,
+              "posbalance-cap: Raft leader did not log 25% automatic cap stop (balanceunbounded?)");
+    for (int k = 0; k < 15; k++) {
+        usleep(200000);
+        struct view vw;
+        view(leader_of(0), &vw);
+        int infl = posbal_count_log_inflight(&vw.m);
+        int new_holds = 0;
+        for (uint32_t vi = 0; vi < vw.m.nvolumes; vi++) {
+            const struct meta_volume *v = &vw.m.volumes[vi];
+            for (uint32_t r = 0; r < v->nrep; r++)
+                if (v->rep[r].node == ids[3] || v->rep[r].node == ids[4])
+                    new_holds++;
+        }
+        view_free(&vw);
+        if (infl != 0 || new_holds != 0)
+            die("posbalance-cap: automatic balancer moved replicas past 25%% cap (infl=%d new_holds=%d; "
+                "balanceunbounded!)",
+                infl, new_holds);
+    }
+
+    /* Dry-run via follower reports over 25% cap and makes no changes. */
+    peer_of(1, p1, sizeof p1);
+    snprintf(args, sizeof args, "cluster balance %s --secret-file %s", p1, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "> 25% automatic cap") || !strstr(out, "--apply"))
+        die("posbalance-cap: dry-run did not report > 25%% cap:\n%s", out);
+
+    /* Operator override: `tsdb cluster balance --apply` runs the plan at <= 5% (1) concurrent moves. */
+    snprintf(args, sizeof args, "cluster balance %s --apply --secret-file %s", p1, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "balance applied:"))
+        die("posbalance-cap: balance --apply failed:\n%s", out);
+
+    int cap_converged = 0;
+    int crcnt[5] = {0};
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 90000; usleep(150000)) {
+        struct view vw;
+        view(leader_of(0), &vw);
+        int infl = posbal_count_log_inflight(&vw.m);
+        if (infl > 1)
+            die("posbalance-cap: %d moves in flight exceeds 5%% cap of 1 (24 positions)", infl);
+        memset(crcnt, 0, sizeof crcnt);
+        for (uint32_t vi = 0; vi < vw.m.nvolumes; vi++) {
+            const struct meta_volume *v = &vw.m.volumes[vi];
+            if (v->kind != META_VOL_REPLICATED)
+                continue;
+            for (uint32_t r = 0; r < v->nrep; r++) {
+                int s = server_of(v->rep[r].node);
+                if (s >= 0 && s < 5)
+                    crcnt[s]++;
+            }
+        }
+        view_free(&vw);
+        if (infl == 0) {
+            int ok = 1;
+            for (int s = 0; s < 5; s++)
+                if (crcnt[s] < 4 || crcnt[s] > 5)
+                    ok = 0;
+            if (ok) {
+                cap_converged = 1;
+                break;
+            }
+        }
+    }
+    if (!cap_converged)
+        die("posbalance-cap: --apply did not converge within 90 s (replicas=[%d,%d,%d,%d,%d])", crcnt[0], crcnt[1],
+            crcnt[2], crcnt[3], crcnt[4]);
+
+    snprintf(args, sizeof args, "cluster balance %s --secret-file %s", p1, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "cluster is balanced"))
+        die("posbalance-cap: dry-run after --apply convergence unexpected:\n%s", out);
+    printf("  posbalance-cap: 37.5%% automatic plan stopped at 25%% cap, --apply converged replicas=[%d,%d,%d,%d,%d]\n",
+           crcnt[0], crcnt[1], crcnt[2], crcnt[3], crcnt[4]);
+
+    /* ---- (d) EC over-cap --apply persists across STRIPE_WHOLE until all stripe moves finish ---- */
+#ifdef TSDB_EC
+    {
+        scenario("posbalance-cap-ec");
+        epoll_after_two = 1;
+        static char cxa[5][PATH_MAX + 256];
+        for (int i = 0; i < 3; i++) {
+            char ddir[PATH_MAX + 80];
+            snprintf(ddir, sizeof ddir, "%s/pbce%d", base, i);
+            disk_make(ddir, "hdd");
+            snprintf(cxa[i], sizeof cxa[i],
+                     "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                     "--flush-interval-ms 200 --ec-cache-mb 16",
+                     ddir);
+            xargs[i] = cxa[i];
+            start(i);
+        }
+        init_cluster(0, 600);
+        node_add(0, 1);
+        node_add(0, 2);
+        await_view(0, p_voters, &three, "3 voters for posbalance-cap-ec");
+        await_view(0, p_n_placeable, &three, "3 storage members UP for posbalance-cap-ec");
+
+        peer_of(0, p0, sizeof p0);
+        snprintf(args, sizeof args, "cluster settings set %s balance=off --secret-file %s", p0, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+            die("posbalance-cap-ec: settings set balance=off failed:\n%s", out);
+
+        enum { EC_CAP_VOLS = 3 };
+        const char *ecvnames[EC_CAP_VOLS] = {"pbce0", "pbce1", "pbce2"};
+        uint32_t ecvnums[EC_CAP_VOLS] = {0};
+        const int64_t day0 = 1704067200000LL;
+        for (int v = 0; v < EC_CAP_VOLS; v++) {
+            char txt[256];
+            int rc;
+            for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, ecvnames[v], 0, 2, 1, &ecvnums[v], txt, sizeof txt)) != 0;
+                 usleep(100000))
+                if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+                    die("posbalance-cap-ec: vol_add_ec %s: %s (%s)", ecvnames[v], cluster_strerror(rc), txt);
+            struct meta_volume ev;
+            for (uint64_t t0 = now_ms(); !vol_rec(0, ecvnames[v], &ev) || !ev.leader; usleep(50000))
+                if (now_ms() - t0 > 30000)
+                    die("posbalance-cap-ec: %s has no leader", ecvnames[v]);
+            int Lv = server_of(ev.leader);
+            for (uint64_t t0 = now_ms(); !vol_rec(Lv, ecvnames[v], &ev); usleep(50000))
+                if (now_ms() - t0 > 30000)
+                    die("posbalance-cap-ec: leader did not see %s", ecvnames[v]);
+            await_isr(Lv, ecvnames[v], ev.nrep, 30000, "posbalance-cap-ec full ISR");
+            tsdbc *cv = client(Lv);
+            tsdb_sid idv[ECW_SERIES];
+            for (int s = 0; s < ECW_SERIES; s++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "pbce%d.s%d", v, s);
+                idv[s] = ecb_series(cv, nm, ecvnames[v]);
+            }
+            ecw_write_days(cv, idv, day0, 0, 1);
+            tsdbc_close(cv);
+            for (uint64_t t0 = now_ms(); ecb_ec_parts(Lv, ecvnums[v]) < 1; usleep(150000))
+                if (now_ms() - t0 > 60000)
+                    die("posbalance-cap-ec: %s did not settle 1 .ec part", ecvnames[v]);
+        }
+
+        /* Add 2 storage nodes (3 & 4): 3 ec=2+1 vols = 18 pos (9 log + 9 stripe); needs 6 moves = 33.3% > 25% cap. */
+        for (int i = 3; i < 5; i++) {
+            char ddir[PATH_MAX + 80];
+            snprintf(ddir, sizeof ddir, "%s/pbce%d", base, i);
+            disk_make(ddir, "hdd");
+            snprintf(cxa[i], sizeof cxa[i],
+                     "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                     "--flush-interval-ms 200 --ec-cache-mb 16",
+                     ddir);
+            xargs[i] = cxa[i];
+            start(i);
+            node_add(0, i);
+        }
+        await_view(4, p_n_placeable, &five, "5 storage members UP for posbalance-cap-ec");
+
+        snprintf(args, sizeof args, "cluster settings set %s balance=on --secret-file %s", p0, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "settings updated"))
+            die("posbalance-cap-ec: settings set balance=on failed:\n%s", out);
+        await_log(leader_of(0), "25% automatic cap", 15000,
+                  "posbalance-cap-ec: Raft leader did not log 25% automatic cap stop");
+
+        /* Run `balance --apply` ONCE: must keep running across STRIPE_WHOLE until all 3 stripe moves finish. */
+        peer_of(1, p1, sizeof p1);
+        snprintf(args, sizeof args, "cluster balance %s --apply --secret-file %s", p1, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "balance applied:"))
+            die("posbalance-cap-ec: balance --apply failed:\n%s", out);
+
+        int ec_cap_ok = 0;
+        int scnt[5] = {0};
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 120000; usleep(150000)) {
+            struct view vw;
+            view(leader_of(0), &vw);
+            int infl = posbal_count_log_inflight(&vw.m);
+            int sfill_n = 0;
+            memset(scnt, 0, sizeof scnt);
+            for (uint32_t vi = 0; vi < vw.m.nvolumes; vi++) {
+                const struct meta_volume *v = &vw.m.volumes[vi];
+                if (v->redundancy != META_RED_EC)
+                    continue;
+                for (uint32_t p = 0; p < v->nstripe; p++) {
+                    if (v->stripe_pos[p].state == META_STRIPE_FILLING)
+                        sfill_n++;
+                    int s = server_of(v->stripe[p]);
+                    if (s >= 0 && s < 5)
+                        scnt[s]++;
+                }
+            }
+            view_free(&vw);
+            if (infl == 0 && sfill_n == 0) {
+                int smin = scnt[0], smax = scnt[0];
+                for (int s = 1; s < 5; s++) {
+                    if (scnt[s] < smin) smin = scnt[s];
+                    if (scnt[s] > smax) smax = scnt[s];
+                }
+                if (smax - smin <= 1 && scnt[3] >= 1 && scnt[4] >= 1) {
+                    ec_cap_ok = 1;
+                    break;
+                }
+            }
+        }
+        if (!ec_cap_ok)
+            die("posbalance-cap-ec: single --apply did not finish all EC stripe moves across STRIPE_WHOLE "
+                "(stripes=[%d,%d,%d,%d,%d])",
+                scnt[0], scnt[1], scnt[2], scnt[3], scnt[4]);
+        snprintf(args, sizeof args, "cluster balance %s --secret-file %s", p1, secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "cluster is balanced"))
+            die("posbalance-cap-ec: dry-run after --apply convergence unexpected:\n%s", out);
+        printf("  posbalance-cap-ec: single --apply persisted across STRIPE_WHOLE, stripes=[%d,%d,%d,%d,%d]\n",
+               scnt[0], scnt[1], scnt[2], scnt[3], scnt[4]);
+    }
+#endif
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -34581,7 +35220,7 @@ int main(int argc, char **argv)
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
                {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
                {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring},
-               {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}};
+               {"hddadd", scen_hddadd}, {"settings", scen_settings}, {"diskfill", scen_diskfill}, {"posbalance", scen_posbalance}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

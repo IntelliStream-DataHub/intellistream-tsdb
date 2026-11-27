@@ -909,6 +909,35 @@ static int vol_settled_margin(const struct cluster_copy *c, const struct cluster
     return settled < 0 ? 0 : settled;
 }
 
+/* Returns true if volume `v`'s FILLING stripe position(s) are live balance/operator moves (every active stripe
+ * holder and every FILLING prev holder is UP — full margin, no outage/drain/replace rebuild). */
+static bool vol_is_balance_fill(const struct cluster_copy *c, const struct cluster_copy_vol *v, int only_pos)
+{
+    if (!c || !v || v->redundancy != META_RED_EC || v->nstripe == 0)
+        return false;
+    bool any_filling = false;
+    for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+        const struct cluster_copy_member *hm = cluster_copy_member(c, v->stripe[p]);
+        if (!hm || hm->state != META_UP)
+            return false;
+        if (v->stripe_pos[p].state == META_STRIPE_FILLING) {
+            if (only_pos >= 0 && (uint32_t)only_pos != p) {
+                const struct cluster_copy_member *pm =
+                    v->stripe_pos[p].prev ? cluster_copy_member(c, v->stripe_pos[p].prev) : NULL;
+                if (!pm || pm->state != META_UP)
+                    return false;
+                continue;
+            }
+            const struct cluster_copy_member *pm =
+                v->stripe_pos[p].prev ? cluster_copy_member(c, v->stripe_pos[p].prev) : NULL;
+            if (!pm || pm->state != META_UP)
+                return false;
+            any_filling = true;
+        }
+    }
+    return any_filling;
+}
+
 static void cp_read_pace(void *arg, uint32_t volume, size_t bytes)
 {
     (void)arg;
@@ -917,10 +946,13 @@ static void cp_read_pace(void *arg, uint32_t volume, size_t bytes)
     if (c) {
         const struct cluster_copy_vol *cv = cluster_copy_vol(c, volume);
         if (cv && cv->redundancy == META_RED_EC && cv->nstripe > 0)
-            margin = vol_settled_margin(c, cv);
+            margin = vol_is_balance_fill(c, cv, -1) ? PACE_MARGIN_BALANCE : vol_settled_margin(c, cv);
         cluster_copy_put(c);
     }
-    (void)pace_take_capped(PACE_SEND, bytes, margin, 1000000000ull);
+    if (pace_take_capped(PACE_SEND, bytes, margin, 1000000000ull) == PACE_REFUSED) {
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
 }
 
 /* ---- sfill_ops for cluster tsdbd */
@@ -1775,6 +1807,7 @@ static void *sf_watch_main(void *arg)
                             }
 #endif
                             if (v->stripe[p] == c->self && v->stripe_pos[p].state == META_STRIPE_FILLING) {
+                                int fill_margin = vol_is_balance_fill(c, v, (int)p) ? PACE_MARGIN_BALANCE : margin;
                                 struct sfill_job_cfg cfg = {
                                     .volume = v->number,
                                     .pos = p,
@@ -1783,7 +1816,7 @@ static void *sf_watch_main(void *arg)
                                     .leader = v->leader,
                                     .ec_k = v->ec_k,
                                     .ec_m = v->ec_m,
-                                    .margin = margin,
+                                    .margin = fill_margin,
                                     .concurrency = c->rebuild_concurrency,
                                 };
                                 if (nnext == cap_next) {
@@ -1939,6 +1972,26 @@ static void *sf_watch_main(void *arg)
     return NULL;
 }
 
+static void sf_collect_objects(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct sfill_stats st;
+    memset(&st, 0, sizeof st);
+    bool have = false;
+    pthread_mutex_lock(&SF.rec_mu);
+    if (SF.sf) {
+        sfill_get_stats(SF.sf, &st);
+        have = true;
+    }
+    pthread_mutex_unlock(&SF.rec_mu);
+    if (!have)
+        return;
+    struct creport_label lc = {"method", "copied"};
+    creport_sink_put_u64(sink, &lc, 1, st.copied);
+    struct creport_label ld = {"method", "decoded"};
+    creport_sink_put_u64(sink, &ld, 1, st.decoded);
+}
+
 int sfill_cluster_start(struct tsdb *db, const char *state_dir)
 {
     if (SF.started)
@@ -2012,6 +2065,9 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
     (void)creport_metric_collector("tsdb_chunk_repair_queue_depth", CREPORT_GAUGE,
                                    "Damaged chunks currently queued or actively being repaired on this leader.",
                                    cp_repair_collect_qdepth, NULL);
+    (void)creport_metric_collector("tsdb_sfill_objects_total", CREPORT_COUNTER,
+                                   "EC stripe fill objects completed on this storage node by method (copied vs decoded).",
+                                   sf_collect_objects, NULL);
 
     pthread_mutex_lock(&SF.mu);
     tsdb_cond_init_mono(&SF.cv);
@@ -2019,6 +2075,7 @@ int sfill_cluster_start(struct tsdb *db, const char *state_dir)
     pthread_mutex_unlock(&SF.mu);
     if (pthread_create(&SF.thr, NULL, sf_watch_main, NULL) != 0) {
         pthread_cond_destroy(&SF.cv);
+        creport_metric_collector_del("tsdb_sfill_objects_total");
         creport_metric_collector_del("tsdb_chunk_repairs_total");
         creport_metric_collector_del("tsdb_chunk_repair_bytes_total");
         creport_metric_collector_del("tsdb_chunk_repair_queue_depth");
@@ -2048,6 +2105,7 @@ void sfill_cluster_stop(void)
     pthread_join(SF.thr, NULL);
     pthread_cond_destroy(&SF.cv);
 
+    creport_metric_collector_del("tsdb_sfill_objects_total");
     creport_metric_collector_del("tsdb_chunk_repairs_total");
     creport_metric_collector_del("tsdb_chunk_repair_bytes_total");
     creport_metric_collector_del("tsdb_chunk_repair_queue_depth");

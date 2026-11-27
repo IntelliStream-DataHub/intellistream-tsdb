@@ -89,10 +89,13 @@ enum cluster_admin_op {
     CLUSTER_OP_VOLUME_MOVE_POS = 20,
     /* R14 (D25): body u64 expected_version + META_SETTINGS_WORDS u32 (cluster_settings_set_encode); on Raft leader. */
     CLUSTER_OP_SETTINGS = 21,
+    /* R9 (D19, r9-balance): body u32 flags (0 = dry-run plan summary, CLUSTER_BALANCE_APPLY = override 25% cap). */
+    CLUSTER_OP_BALANCE = 22,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
 enum { CLUSTER_DRAIN_CANCEL = 1 };                      /* CLUSTER_OP_NODE_DRAIN's flags */
+enum { CLUSTER_BALANCE_APPLY = 1 };                     /* CLUSTER_OP_BALANCE's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -692,6 +695,9 @@ size_t cluster_node_replace_cancel_encode(uint32_t old_node, uint8_t *out);
 int cluster_node_replace_decode_ex(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node, uint32_t *flags);
 size_t cluster_volume_move_pos_encode(uint32_t volume, uint32_t pos, uint32_t to, uint8_t *out);
 int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *pos, uint32_t *to);
+/* R9 (D19): CLUSTER_OP_BALANCE body (4 bytes: u32 flags). */
+size_t cluster_balance_encode(uint32_t flags, uint8_t *out);
+int cluster_balance_decode(const uint8_t *p, size_t n, uint32_t *flags);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

@@ -506,7 +506,7 @@ size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t 
         s->rebuild_max,       s->transfer_wait_ms,    s->leader_balance_s,   s->opening_hold_s,     s->failstop_out_s,
         s->out_guard_pct,     s->out_guard_hold_s,    s->repl_retain_down_gb, s->young_high_pct,    s->balance_mb_s,
         s->rebuild_concurrency, s->scrub_days,        s->scrub_mb_s,         s->scrub_out_count,    s->log_on_hdd,
-        s->young_warn_pct,    s->young_move_pct,      s->disk_stall_s,       (uint32_t)mode};
+        s->young_warn_pct,    s->young_move_pct,      s->disk_stall_s,       s->balance,            (uint32_t)mode};
     for (int i = 0; i <= META_SETTINGS_WORDS; i++)
         for (int j = 0; j < 4; j++)
             out[i * 4 + j] = (uint8_t)(v[i] >> (8 * j));
@@ -530,9 +530,9 @@ static int settings_decode(struct rd *r, struct meta_settings *s, int *mode)
                                 .young_high_pct = v[28], .balance_mb_s = v[29], .rebuild_concurrency = v[30],
                                 .scrub_days = v[31], .scrub_mb_s = v[32], .scrub_out_count = v[33],
                                 .log_on_hdd = (uint8_t)v[34], .young_warn_pct = v[35], .young_move_pct = v[36],
-                                .disk_stall_s = v[37]};
+                                .disk_stall_s = v[37], .balance = (uint8_t)v[38]};
     *mode = (int)v[META_SETTINGS_WORDS];
-    return r->bad || v[9] > 255 || v[10] > 255 || v[34] > 255 ? -1 : 0;
+    return r->bad || v[9] > 255 || v[10] > 255 || v[34] > 255 || v[38] > 255 ? -1 : 0;
 }
 
 size_t cluster_settings_set_encode(uint64_t expected_version, const struct meta_settings *s, uint8_t *out)
@@ -1347,6 +1347,8 @@ static struct {
     int uw_said;
 
     uint64_t next_hb, next_manage, next_duty, watch_conn, watch_next_try;
+    int balance_armed, balance_override, balance_was_rebuilding, balance_cap_logged;
+    uint64_t balance_sig, balance_override_term;
     unsigned watch_rot;
     uint32_t hint_leader;
     uint64_t hint_term, hint_commit;
@@ -5607,6 +5609,21 @@ int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume,
     return 0;
 }
 
+size_t cluster_balance_encode(uint32_t flags, uint8_t *out)
+{
+    for (int j = 0; j < 4; j++)
+        out[j] = (uint8_t)(flags >> (8 * j));
+    return 4;
+}
+
+int cluster_balance_decode(const uint8_t *p, size_t n, uint32_t *flags)
+{
+    if (!p || n != 4)
+        return -1;
+    *flags = le32(p);
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -6845,6 +6862,8 @@ static void admin_settings_set(struct conn *c, uint32_t reqid, struct rd *r)
     }
 }
 
+static void admin_balance(struct conn *c, uint32_t reqid, struct rd *r);
+
 /* R4's admin ops (cluster_int.h): only the Raft leader hands them on; a follower answers NOTLEADER with the leader's
  * peer address, as every op that proposes does (the CLI follows none of them) */
 static void r4_admin(struct conn *c, uint32_t reqid, struct rd *r,
@@ -6888,6 +6907,7 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_NODE_DESTROYED: r4_admin(c, reqid, r, cnode_destroyed_admin); break;
     case CLUSTER_OP_VOLUME_MOVE_POS: r4_admin(c, reqid, r, cnode_move_pos_admin); break;
     case CLUSTER_OP_SETTINGS: admin_settings_set(c, reqid, r); break;
+    case CLUSTER_OP_BALANCE: admin_balance(c, reqid, r); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -9203,13 +9223,199 @@ static void stripe_whole_file_propose(void)
 }
 #endif
 
-/* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
- * (re-placement / whole / return), balance_plan — and propose their output (one proposal per member/position at a
- * time). Waits until the Raft leader is settled (same wait as member_states) before proposing OUT or moves. */
-static void place_duty(uint64_t now)
+/* Signature of balancer-relevant topology/setting state on the Raft leader: changes on node add, drain, OUT,
+ * UP-after-OUT, storage bring-up (chunk_stores / ndisks), balance setting toggle, or Raft term change. */
+static uint64_t balance_trigger_sig(uint64_t now)
 {
-    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised || !leader_settled(now))
+    uint64_t h = 14695981039346656037ull;
+    uint64_t term = cl_term();
+    uint64_t vals[3] = {term, (uint64_t)C.sm.set.balance, (uint64_t)C.sm.nmembers};
+    for (int i = 0; i < 3; i++) {
+        h ^= vals[i];
+        h *= 1099511628211ull;
+    }
+    for (uint32_t i = 0; i < C.sm.nmembers; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        uint8_t st = mb->state == META_DOWN ? META_UP : mb->state;
+        uint32_t cs = cl_member_chunk_stores(mb->id);
+        uint8_t ever_heard = (mb->id == C.id || heard_ns(mb->id, now) != 0) ? 1u : 0u;
+        uint64_t mv = ((uint64_t)mb->id << 32) | ((uint64_t)st << 24) | ((uint64_t)(cs > 0 ? 1u : 0u) << 17) |
+                      ((uint64_t)ever_heard << 16) | (uint64_t)(mb->ndisks & 0xffffu);
+        h ^= mv;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void fill_place_settings(struct place_settings *ps)
+{
+    place_settings_default(ps);
+    ps->rebuild_after_s = C.sm.set.rebuild_after_s;
+    ps->opening_hold_s = C.sm.set.opening_hold_s;
+    ps->failstop_out_s = C.sm.set.failstop_out_s;
+    ps->out_guard_pct = C.sm.set.out_guard_pct;
+    ps->out_guard_hold_s = C.sm.set.out_guard_hold_s;
+    ps->repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
+    ps->young_move_pct = C.sm.set.young_move_pct;
+    ps->young_high_pct = C.sm.set.young_high_pct;
+    ps->balance_mb_s = C.sm.set.balance_mb_s;
+    ps->rebuild_concurrency = C.sm.set.rebuild_concurrency;
+    ps->balance = C.sm.set.balance;
+}
+
+static uint32_t apply_place_props(const struct place_out *out, uint64_t now, uint64_t wall_ms, int mutant)
+{
+    /* Deduplicate repeated deferral log lines per volume (pruned each tick so resolved deferrals don't linger). */
+    struct defer_entry {
+        uint32_t vol;
+        const char *why;
+    };
+    static struct defer_entry defer_last[64];
+    static uint32_t ndefer_last;
+    struct defer_entry defer_next[64];
+    uint32_t ndefer_next = 0;
+    uint32_t started = 0;
+
+    for (uint32_t i = 0; i < out->nprops && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
+        const struct place_prop *p = &out->props[i];
+        if (p->kind == PLACE_PROP_MEMBER_STATE) {
+            if (pend_member(p->node))
+                continue;
+            const struct meta_member *mb = meta_member(&C.sm, p->node);
+            if (!mb)
+                continue;
+            if (p->state == META_DOWN) {
+                /* Lease safety: never mark an UP/DRAINING member DOWN before promote_safe_ns (same rule as member_states). */
+                if ((mb->state == META_UP || mb->state == META_DRAINING) && cl_mutant() != CLM_NOPROMOTEWAIT &&
+                    now < promote_safe_ns(p->node))
+                    continue;
+                struct heard *hm = heard_get(p->node);
+                if (hm && hm->inc != mb->incarnation)
+                    continue;
+            }
+            struct meta_entry e;
+            meta_entry_init(&e);
+            uint64_t since_ms =
+                p->state == META_DOWN ? (mb->state == META_DOWN && mb->down_since_ms ? mb->down_since_ms : wall_ms) : 0;
+            uint64_t op_clk = wall_ms >= since_ms ? wall_ms : since_ms;
+            meta_op_member_state(&e, p->node, p->state, p->version, p->reason, since_ms, op_clk);
+            if (propose_ex(&e, 0, 0, p->node, p->state == META_OUT) == ISO_OK) {
+                say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", p->node,
+                    meta_member_state_name(p->state), p->version);
+                started++;
+            }
+        } else if (p->kind == PLACE_PROP_REPLICA_ADD) {
+            const char *why = cmove_start_auto(p->volume, p->other_node, p->node, now);
+            if (!why) {
+                started++;
+            } else if (why != cmove_err_already_proposed) {
+                int same = 0;
+                for (uint32_t di = 0; di < ndefer_last; di++)
+                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
+                        same = 1;
+                if (!same)
+                    say("place: move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32 " deferred: %s",
+                        p->volume, p->other_node, p->node, why);
+                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
+                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
+            }
+        } else if (p->kind == PLACE_PROP_REPLICA_REMOVE) {
+#ifdef TSDB_TEST_HOOKS
+            if (mutant == PLACE_MUT_MOVE_SHRINKS) {
+                struct meta_entry e;
+                meta_entry_init(&e);
+                meta_op_replica_remove(&e, p->volume, p->epoch, p->node);
+                (void)propose(&e, 0, 0, 0);
+            }
+#else
+            (void)mutant;
+#endif
+        } else if (p->kind == PLACE_PROP_STRIPE_SET) {
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->reason, p->other_node, p->version);
+            if (propose(&e, 0, 0, 0) == ISO_OK) {
+                started++;
+                if (p->is_return) {
+                    say("proposes return STRIPE_SET vol %" PRIu32 " pos %" PRIu32 " node %" PRIu32 " (prev %" PRIu32
+                        ") ver %" PRIu64,
+                        p->volume, p->pos, p->node, p->other_node, p->version);
+                    crash_point(CP_RETURN_SET);
+                }
+            }
+        } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
+#ifdef TSDB_TEST_HOOKS
+            if (C.stripe_whole_file)
+                continue; /* test drives STRIPE_WHOLE explicitly via <state-dir>/stripewhole */
+#endif
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_stripe_whole(&e, p->volume, p->pos, p->version);
+            if (propose(&e, 0, 0, 0) == ISO_OK) {
+                say("proposes STRIPE_WHOLE vol %" PRIu32 " pos %" PRIu32 " ver %" PRIu64, p->volume, p->pos, p->version);
+                crash_point(CP_WHOLE_PROPOSED);
+                started++;
+            }
+        } else if (p->kind == PLACE_PROP_GC_RELEASE) {
+            /* Kicks GC directly when the Raft leader also leads `p->volume`; remote volume leaders are kicked
+             * by chunkpeer_cluster's sf_watch_main when their cluster_copy updates. */
+            void (*kick)(uint32_t) = atomic_load_explicit(&g_gc_kick, memory_order_acquire);
+            if (kick)
+                kick(p->volume);
+        } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
+            if (ctr_move_start(p->volume, p->node, now) == NULL)
+                started++;
+        } else if (p->kind == PLACE_PROP_MOVE_CANCEL) {
+            const char *why = cmove_cancel_auto(p->volume, p->other_node, p->node, now);
+            if (!why) {
+                started++;
+            } else if (why != cmove_err_already_proposed) {
+                int same = 0;
+                for (uint32_t di = 0; di < ndefer_last; di++)
+                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
+                        same = 1;
+                if (!same)
+                    say("place: cancel move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32
+                        " deferred: %s",
+                        p->volume, p->other_node, p->node, why);
+                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
+                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
+            }
+        }
+    }
+    memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
+    ndefer_last = ndefer_next;
+    return started;
+}
+
+/* R9 (D19): CLUSTER_OP_BALANCE on the Raft leader. Body: u32 flags (0 = dry-run summary, CLUSTER_BALANCE_APPLY =
+ * override 25% automatic cap and run the plan at 5% concurrency). */
+static void admin_balance(struct conn *c, uint32_t reqid, struct rd *r)
+{
+    uint32_t flags = 0;
+    if (cluster_balance_decode(r->p + r->off, r->len - r->off, &flags) != 0) {
+        static const char msg[] = "balance: a body of 4 bytes is expected";
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, sizeof msg - 1);
         return;
+    }
+    if (flags & ~CLUSTER_BALANCE_APPLY) {
+        char msg[64];
+        int n = snprintf(msg, sizeof msg, "balance: unknown flags 0x%" PRIx32, flags);
+        admin_reply(c->serial, reqid, META_ERR_INVALID, msg, n > 0 ? (size_t)n : 0);
+        return;
+    }
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised) {
+        const char *lp = leader_peer();
+        admin_reply(c->serial, reqid, C.sm.initialised || C.have_node ? CLUSTER_ERR_NOTLEADER : CLUSTER_ERR_STATE,
+                    lp, strlen(lp));
+        return;
+    }
+    uint64_t now = cl_now_ns();
+    if (!leader_settled(now)) {
+        static const char msg[] = "balance: leader is still settling after election; retry shortly\n";
+        admin_reply(c->serial, reqid, CLUSTER_ERR_STATE, msg, sizeof msg - 1);
+        return;
+    }
     struct timespec ts;
     uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
                            ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
@@ -9236,131 +9442,182 @@ static void place_duty(uint64_t now)
         .return_cands = g_ret_cands,
         .nreturn_cands = (uint32_t)g_nret_cands,
     };
-    place_settings_default(&in.set);
-    in.set.rebuild_after_s = C.sm.set.rebuild_after_s;
-    in.set.opening_hold_s = C.sm.set.opening_hold_s;
-    in.set.failstop_out_s = C.sm.set.failstop_out_s;
-    in.set.out_guard_pct = C.sm.set.out_guard_pct;
-    in.set.out_guard_hold_s = C.sm.set.out_guard_hold_s;
-    in.set.repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
-    in.set.young_move_pct = C.sm.set.young_move_pct;
-    in.set.young_high_pct = C.sm.set.young_high_pct;
-    in.set.balance_mb_s = C.sm.set.balance_mb_s;
-    in.set.rebuild_concurrency = C.sm.set.rebuild_concurrency;
+    fill_place_settings(&in.set);
+
+    struct balance_summary sum;
+    struct place_out out;
+    place_out_init(&out);
+    if (flags & CLUSTER_BALANCE_APPLY) {
+        in.balance_apply = 1;
+        balance_plan_ex(&in, &out, &sum);
+    } else {
+        balance_plan_summary(&in, &sum);
+    }
+    char msg[384];
+    int rc = META_OK;
+    uint32_t data_moves = sum.log_moves + sum.stripe_moves;
+    double pct = sum.total_pos ? (100.0 * (double)(data_moves + sum.inflight_bal) / (double)sum.total_pos) : 0.0;
+
+    if (flags & CLUSTER_BALANCE_APPLY) {
+        if (sum.rebuild_busy) {
+            rc = META_ERR_STATE;
+            snprintf(msg, sizeof msg, "balance --apply: cannot start while a rebuild is queued or active\n");
+        } else if (data_moves == 0 && sum.leader_moves == 0 && sum.inflight_bal == 0) {
+            snprintf(msg, sizeof msg, "cluster is already balanced (0 moves needed across %" PRIu32 " positions)\n",
+                     sum.total_pos);
+        } else {
+            C.balance_override = 1;
+            C.balance_override_term = cl_term();
+            C.balance_armed = 1;
+            C.balance_cap_logged = 0;
+            uint32_t started = apply_place_props(&out, now, wall_ms, in.mutant);
+            snprintf(msg, sizeof msg,
+                     "balance applied: %" PRIu32 " moves planned (%" PRIu32 " log, %" PRIu32 " stripe, %" PRIu32
+                     " leader; %" PRIu32 " started now, capped at 5%% concurrent; %.1f%% of %" PRIu32 " positions)\n",
+                     data_moves + sum.inflight_bal, sum.log_moves, sum.stripe_moves, sum.leader_moves, started, pct,
+                     sum.total_pos);
+            say("operator balance --apply: %" PRIu32 " moves planned (%.1f%% of %" PRIu32 " positions, %" PRIu32
+                " started)",
+                data_moves + sum.inflight_bal, pct, sum.total_pos, started);
+        }
+    } else {
+        if (sum.rebuild_busy) {
+            snprintf(msg, sizeof msg, "balance paused: a rebuild is queued or active (%" PRIu32 " positions)\n",
+                     sum.total_pos);
+        } else if (data_moves == 0 && sum.leader_moves == 0 && sum.inflight_bal == 0) {
+            snprintf(msg, sizeof msg, "cluster is balanced (0 moves planned across %" PRIu32 " positions; auto=%s)\n",
+                     sum.total_pos, C.sm.set.balance ? "on" : "off");
+        } else if (sum.over_cap) {
+            snprintf(msg, sizeof msg,
+                     "balance plan: %" PRIu32 " moves (%" PRIu32 " log, %" PRIu32 " stripe, %" PRIu32
+                     " leader, %" PRIu32 " in flight) across %" PRIu32
+                     " positions (%.1f%% > 25%% automatic cap; auto=%s); run 'tsdb cluster balance --apply' to proceed\n",
+                     data_moves + sum.inflight_bal, sum.log_moves, sum.stripe_moves, sum.leader_moves,
+                     sum.inflight_bal, sum.total_pos, pct, C.sm.set.balance ? "on" : "off");
+        } else {
+            snprintf(msg, sizeof msg,
+                     "balance plan: %" PRIu32 " moves (%" PRIu32 " log, %" PRIu32 " stripe, %" PRIu32
+                     " leader, %" PRIu32 " in flight) across %" PRIu32 " positions (%.1f%% <= 25%% automatic cap; auto=%s)\n",
+                     data_moves + sum.inflight_bal, sum.log_moves, sum.stripe_moves, sum.leader_moves,
+                     sum.inflight_bal, sum.total_pos, pct, C.sm.set.balance ? "on" : "off");
+        }
+    }
+    place_out_free(&out);
+    admin_reply(c->serial, reqid, rc, msg, strlen(msg));
+    free(vl);
+    free(pr);
+    free(pf);
+    free(pm);
+}
+
+/* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
+ * (re-placement / whole / return), balance_plan — and propose their output (one proposal per member/position at a
+ * time). Waits until the Raft leader is settled (same wait as member_states) before proposing OUT or moves. */
+static void place_duty(uint64_t now)
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised || !leader_settled(now))
+        return;
+    struct timespec ts;
+    uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
+                           ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
+                           : now / MS;
+    if (C.balance_override && cl_term() != C.balance_override_term) {
+        C.balance_override = 0;
+        C.balance_override_term = 0;
+    }
+    uint64_t bsig = balance_trigger_sig(now);
+    if (bsig != C.balance_sig) {
+        C.balance_sig = bsig;
+        C.balance_armed = 1;
+        C.balance_cap_logged = 0;
+    }
+    uint32_t nm = 0, nf = 0, nr = 0, nvl = 0;
+    struct place_fill *pf = NULL;
+    struct place_member *pm = build_place_members(now, &nm, &pf, &nf);
+    struct place_replace *pr = build_place_replaces(&nr);
+    struct place_vol_log *vl = build_place_vol_logs(now, &nvl);
+    struct place_in in = {
+        .sm = &C.sm,
+        .members = pm,
+        .nmembers = nm,
+        .fills = pf,
+        .nfills = nf,
+        .now_ms = wall_ms,
+        .mono_ms = now / MS,
+        .self_id = C.id,
+        .mutant = place_mutant_env(),
+        .replaces = pr,
+        .nreplaces = nr,
+        .vol_logs = vl,
+        .nvol_logs = nvl,
+        .return_cands = g_ret_cands,
+        .nreturn_cands = (uint32_t)g_nret_cands,
+        .balance_apply = (uint8_t)(C.balance_override != 0),
+        .balance_gate = (uint8_t)(!C.balance_armed && !C.balance_override),
+    };
+    fill_place_settings(&in.set);
     struct place_out out;
     place_out_init(&out);
     pout_plan(&in, &out);
     place_plan(&in, &out);
-    balance_plan(&in, &out);
+    uint32_t place_props_end = out.nprops;
+    uint32_t place_logs_end = out.nlogs;
+
+    /* Detect real rebuild triggers (drain / OUT / DOWN / replace / place_plan REPLICA_ADD or STRIPE_SET) so we arm
+     * balance once they finish and clear any stale operator --apply override if a new rebuild starts. Do NOT count
+     * STRIPE_WHOLE or GC_RELEASE here: those also complete balancer-originated stripe moves. */
+    int has_rebuild = 0;
+    for (uint32_t i = 0; i < place_props_end; i++) {
+        enum place_prop_kind k = out.props[i].kind;
+        if (k == PLACE_PROP_REPLICA_ADD || k == PLACE_PROP_STRIPE_SET ||
+            (k == PLACE_PROP_MEMBER_STATE && out.props[i].state >= META_DOWN))
+            has_rebuild = 1;
+    }
+    for (uint32_t i = 0; !has_rebuild && i < C.sm.nmembers; i++) {
+        const struct meta_member *mb = &C.sm.members[i];
+        if (mb->state == META_DRAINING || mb->replaced_by != 0)
+            has_rebuild = 1;
+    }
+    if (has_rebuild) {
+        C.balance_was_rebuilding = 1;
+        C.balance_override = 0;
+        C.balance_override_term = 0;
+    } else if (C.balance_was_rebuilding) {
+        C.balance_was_rebuilding = 0;
+        C.balance_armed = 1;
+        C.balance_cap_logged = 0;
+        in.balance_gate = 0;
+    }
+
+    struct balance_summary bsum;
+    balance_plan_ex(&in, &out, &bsum);
     for (uint32_t i = 0; i < out.nlogs; i++) {
         if (strstr(out.logs[i].msg, "guard bound passed"))
             atomic_fetch_add_explicit(&g_out_guard_passed, 1, memory_order_relaxed);
+        if (i >= place_logs_end && strstr(out.logs[i].msg, "25% automatic cap")) {
+            if (C.balance_cap_logged)
+                continue;
+            C.balance_cap_logged = 1;
+        }
         say("%s", out.logs[i].msg);
     }
-    /* Deduplicate repeated deferral log lines per volume (pruned each tick so resolved deferrals don't linger). */
-    struct defer_entry {
-        uint32_t vol;
-        const char *why;
-    };
-    static struct defer_entry defer_last[64];
-    static uint32_t ndefer_last;
-    struct defer_entry defer_next[64];
-    uint32_t ndefer_next = 0;
-    for (uint32_t i = 0; i < out.nprops && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
-        const struct place_prop *p = &out.props[i];
-        if (p->kind == PLACE_PROP_MEMBER_STATE) {
-            if (pend_member(p->node))
-                continue;
-            const struct meta_member *mb = meta_member(&C.sm, p->node);
-            if (!mb)
-                continue;
-            if (p->state == META_DOWN) {
-                /* Lease safety: never mark an UP/DRAINING member DOWN before promote_safe_ns (same rule as member_states). */
-                if ((mb->state == META_UP || mb->state == META_DRAINING) && cl_mutant() != CLM_NOPROMOTEWAIT &&
-                    now < promote_safe_ns(p->node))
-                    continue;
-                struct heard *hm = heard_get(p->node);
-                if (hm && hm->inc != mb->incarnation)
-                    continue;
-            }
-            struct meta_entry e;
-            meta_entry_init(&e);
-            uint64_t since_ms = p->state == META_DOWN ? (mb->state == META_DOWN && mb->down_since_ms ? mb->down_since_ms : wall_ms) : 0;
-            uint64_t op_clk = wall_ms >= since_ms ? wall_ms : since_ms;
-            meta_op_member_state(&e, p->node, p->state, p->version, p->reason, since_ms, op_clk);
-            if (propose_ex(&e, 0, 0, p->node, p->state == META_OUT) == ISO_OK)
-                say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", p->node,
-                    meta_member_state_name(p->state), p->version);
-        } else if (p->kind == PLACE_PROP_REPLICA_ADD) {
-            const char *why = cmove_start_auto(p->volume, p->other_node, p->node, now);
-            if (why && why != cmove_err_already_proposed) {
-                int same = 0;
-                for (uint32_t di = 0; di < ndefer_last; di++)
-                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
-                        same = 1;
-                if (!same)
-                    say("place: move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32 " deferred: %s",
-                        p->volume, p->other_node, p->node, why);
-                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
-                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
-            }
-        } else if (p->kind == PLACE_PROP_REPLICA_REMOVE) {
-#ifdef TSDB_TEST_HOOKS
-            if (in.mutant == PLACE_MUT_MOVE_SHRINKS) {
-                struct meta_entry e;
-                meta_entry_init(&e);
-                meta_op_replica_remove(&e, p->volume, p->epoch, p->node);
-                (void)propose(&e, 0, 0, 0);
-            }
-#endif
-        } else if (p->kind == PLACE_PROP_STRIPE_SET) {
-            struct meta_entry e;
-            meta_entry_init(&e);
-            meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->reason, p->other_node, p->version);
-            if (propose(&e, 0, 0, 0) == ISO_OK && p->is_return) {
-                say("proposes return STRIPE_SET vol %" PRIu32 " pos %" PRIu32 " node %" PRIu32 " (prev %" PRIu32
-                    ") ver %" PRIu64,
-                    p->volume, p->pos, p->node, p->other_node, p->version);
-                crash_point(CP_RETURN_SET);
-            }
-        } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
-#ifdef TSDB_TEST_HOOKS
-            if (C.stripe_whole_file)
-                continue; /* test drives STRIPE_WHOLE explicitly via <state-dir>/stripewhole */
-#endif
-            struct meta_entry e;
-            meta_entry_init(&e);
-            meta_op_stripe_whole(&e, p->volume, p->pos, p->version);
-            if (propose(&e, 0, 0, 0) == ISO_OK) {
-                say("proposes STRIPE_WHOLE vol %" PRIu32 " pos %" PRIu32 " ver %" PRIu64, p->volume, p->pos, p->version);
-                crash_point(CP_WHOLE_PROPOSED);
-            }
-        } else if (p->kind == PLACE_PROP_GC_RELEASE) {
-            /* Kicks GC directly when the Raft leader also leads `p->volume`; remote volume leaders are kicked
-             * by chunkpeer_cluster's sf_watch_main when their cluster_copy updates. */
-            void (*kick)(uint32_t) = atomic_load_explicit(&g_gc_kick, memory_order_acquire);
-            if (kick)
-                kick(p->volume);
-        } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
-            (void)ctr_move_start(p->volume, p->node, now);
-        } else if (p->kind == PLACE_PROP_MOVE_CANCEL) {
-            const char *why = cmove_cancel_auto(p->volume, p->other_node, p->node, now);
-            if (why && why != cmove_err_already_proposed) {
-                int same = 0;
-                for (uint32_t di = 0; di < ndefer_last; di++)
-                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
-                        same = 1;
-                if (!same)
-                    say("place: cancel move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32
-                        " deferred: %s",
-                        p->volume, p->other_node, p->node, why);
-                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
-                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
-            }
+
+    /* Disarm trigger / clear override once the balancer sees a clean, balanced cluster (0 moves and 0 in flight). */
+    if ((C.balance_armed || C.balance_override) && (C.sm.set.balance || C.balance_override) &&
+        out.nprops == place_props_end && !has_rebuild) {
+        if (!bsum.rebuild_busy && bsum.log_moves == 0 && bsum.stripe_moves == 0 && bsum.leader_moves == 0 &&
+            bsum.inflight_bal == 0) {
+            C.balance_armed = 0;
+            C.balance_override = 0;
+            C.balance_override_term = 0;
+            C.balance_cap_logged = 0;
+        } else if (!bsum.rebuild_busy && bsum.over_cap && !C.balance_override &&
+                   in.mutant != PLACE_MUT_BALANCE_UNBOUNDED) {
+            C.balance_armed = 0;
         }
     }
-    memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
-    ndefer_last = ndefer_next;
+
+    (void)apply_place_props(&out, now, wall_ms, in.mutant);
     place_out_free(&out);
     free(vl);
     free(pr);

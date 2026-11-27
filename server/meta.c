@@ -35,8 +35,8 @@
  * record (`conv`, `conv_cancel_gen`), `retired_ver` on `stripe_pos`, and leader live-object counts per `stripe_version`
  * (E2, §6.4, D26, D28); 10: R13 member disks, declared role, computed capability, store ops, and R12/R13 scrub/disk
  * settings (E20, E25, E49, E52, E53, E57); 11: R14 live settings version (settings_version CAS and D25 whitelist on
- * META_OP_SETTINGS). A preview cluster is initialised again, not upgraded (the plan's D9): an
- * image of another version is refused, and its reader names both (meta_snapshot_version). */
+ * META_OP_SETTINGS); 12: R9 balancer enable setting (`balance`, D19). A preview cluster is initialised again, not
+ * upgraded (the plan's D9): an image of another version is refused, and its reader names both (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
@@ -65,7 +65,7 @@ static int meta_settings_env_mutant(int n)
 #endif
 }
 
-#define ENTRY_MAGIC 0x38454d54u    /* "TME8": entries of snapshot version 11 (R14 settings_version CAS) */
+#define ENTRY_MAGIC 0x39454d54u    /* "TME9": entries of snapshot version 12 (R9 balance setting) */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define ENTRY_MAGIC_V3 0x33454d54u /* "TME3": entries of the builds of version 6, refused by name */
@@ -73,6 +73,7 @@ static int meta_settings_env_mutant(int n)
 #define ENTRY_MAGIC_V5 0x35454d54u /* "TME5": entries of the builds of version 8, refused by name */
 #define ENTRY_MAGIC_V6 0x36454d54u /* "TME6": entries of the builds of version 9, refused by name */
 #define ENTRY_MAGIC_V7 0x37454d54u /* "TME7": entries of the builds of version 10, refused by name */
+#define ENTRY_MAGIC_V8 0x38454d54u /* "TME8": entries of the builds of version 11, refused by name */
 #define SNAP_MAGIC 0x31534d54u     /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -182,6 +183,7 @@ void meta_settings_default(struct meta_settings *s)
     s->young_warn_pct = 75;
     s->young_move_pct = 80;
     s->disk_stall_s = 10;
+    s->balance = 1;
 }
 
 uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers)
@@ -915,6 +917,7 @@ static void put_settings(struct wr *w, const struct meta_settings *s)
     put32(w, s->young_warn_pct);
     put32(w, s->young_move_pct);
     put32(w, s->disk_stall_s);
+    put8(w, s->balance);
 }
 
 static void get_settings(struct rd *r, struct meta_settings *s)
@@ -963,6 +966,7 @@ static void get_settings(struct rd *r, struct meta_settings *s)
     s->young_warn_pct = get32(r);
     s->young_move_pct = get32(r);
     s->disk_stall_s = get32(r);
+    s->balance = get8(r);
 }
 
 struct meta_setting_slot {
@@ -1019,6 +1023,7 @@ static const struct meta_setting_slot set_table[] = {
     SET_U32(young_move_pct,      1, 1, 98,                NULL),
     SET_U32(young_high_pct,      1, 10, 99,               NULL),
     SET_U32(disk_stall_s,        1, 1, 3600,              NULL),
+    SET_BOOL(balance,            1,                       NULL),
 };
 #undef SET_U32
 #undef SET_BOOL
@@ -3567,7 +3572,7 @@ int meta_entry_older(const void *data, size_t len)
     uint32_t magic = get32(&r);
     return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3 ||
             magic == ENTRY_MAGIC_V4 || magic == ENTRY_MAGIC_V5 || magic == ENTRY_MAGIC_V6 ||
-            magic == ENTRY_MAGIC_V7) &&
+            magic == ENTRY_MAGIC_V7 || magic == ENTRY_MAGIC_V8) &&
            !r.bad;
 }
 

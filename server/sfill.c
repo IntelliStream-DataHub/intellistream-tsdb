@@ -67,6 +67,8 @@ int sfill_mutant_parse(const char *name)
         return SFILL_MUT_SURVIVOR_TRUST;
     if (strcmp(name, "wholeearly") == 0)
         return SFILL_MUT_WHOLE_EARLY;
+    if (strcmp(name, "balancedecode") == 0)
+        return SFILL_MUT_BALANCE_DECODE;
     return -1;
 }
 
@@ -117,6 +119,7 @@ enum sfill_obj_rc {
     SFILL_OBJ_CORRUPT = 2,
     SFILL_OBJ_FAILED = 3,
     SFILL_OBJ_CANCELLED = 4,
+    SFILL_OBJ_YIELD = 5,
 };
 
 #define SFILL_BUCKETS 4u
@@ -403,7 +406,10 @@ static int try_copy_from_prev(struct sfill *sf, struct sfill_task *t, chunk_back
         }
         uint64_t clen = chunk_pos_cell_len(g, t->pos, c);
         uint64_t coff = c * (uint64_t)g->cell;
-        (void)pace_take_capped(PACE_RECV, clen, t->margin, SFILL_PACE_CAP_NS);
+        if (pace_take_capped(PACE_RECV, clen, t->margin, SFILL_PACE_CAP_NS) == PACE_REFUSED) {
+            res = SFILL_OBJ_YIELD;
+            break;
+        }
         int stc = sf->ops.read_cell(sf->ops.arg, t->prev_node, t->volume, vol_epoch, t->vuuid, obj->oid, t->pos,
                                     coff, buf, (size_t)clen);
         if (stc != CHUNK_ST_OK) {
@@ -533,7 +539,10 @@ static int decode_from_survivors(struct sfill *sf, struct sfill_task *t, chunk_b
             }
             uint64_t clen = chunk_pos_cell_len(g, p, s);
             uint64_t coff = s * (uint64_t)g->cell;
-            (void)pace_take_capped(PACE_RECV, clen, t->margin, SFILL_PACE_CAP_NS);
+            if (pace_take_capped(PACE_RECV, clen, t->margin, SFILL_PACE_CAP_NS) == PACE_REFUSED) {
+                res = SFILL_OBJ_YIELD;
+                break;
+            }
             int r = sf->ops.read_cell(sf->ops.arg, stripe[p], t->volume, vol_epoch, t->vuuid, obj->oid, p,
                                       coff, shards[p], (size_t)clen);
             if (r != CHUNK_ST_OK) {
@@ -560,6 +569,8 @@ static int decode_from_survivors(struct sfill *sf, struct sfill_task *t, chunk_b
             ngood++;
         }
 
+        if (res == SFILL_OBJ_CANCELLED || res == SFILL_OBJ_YIELD)
+            break;
         if (ngood < k) {
             if (mut == SFILL_MUT_FEWERK && ngood > 0) {
                 /* Planted mutant `fillfewerk`: fabricate zeros for missing survivors to reach k and decode anyway. */
@@ -712,12 +723,15 @@ static int run_object_task(struct sfill *sf, struct sfill_task *t)
     }
 
     int res = SFILL_OBJ_FAILED;
-    /* E13: copy from prev (A) at 1x bandwidth when A is UP and held this position (passing all encode-time sums). */
-    if (t->prev_node != 0 && prev_up && pos_written(obj->positions, t->pos))
+    /* E13: copy from prev (A) at 1x bandwidth when A is UP and held this position (passing all encode-time sums).
+     * Planted mutant `balancedecode` skips the 1x copy on balancer stripe fills and forces RS decode instead. */
+    int mut = atomic_load_explicit(&sfill_mutant, memory_order_relaxed);
+    bool skip_copy = (mut == SFILL_MUT_BALANCE_DECODE && t->margin == PACE_MARGIN_BALANCE);
+    if (!skip_copy && t->prev_node != 0 && prev_up && pos_written(obj->positions, t->pos))
         res = try_copy_from_prev(sf, t, be, &id, vol_epoch);
 
     /* Otherwise decode whole cells from k other written positions over PL_KIND_CHUNKR. */
-    if (res != SFILL_OBJ_OK && res != SFILL_OBJ_CANCELLED)
+    if (res != SFILL_OBJ_OK && res != SFILL_OBJ_CANCELLED && res != SFILL_OBJ_YIELD)
         res = decode_from_survivors(sf, t, be, &id, vol_epoch, stripe, nstripe);
 
     sf->ops.local_be_release(sf->ops.arg, be);
@@ -909,6 +923,35 @@ static void *worker_main(void *arg)
 
         int rc = run_object_task(sf, t);
 
+        if (rc == SFILL_OBJ_YIELD) {
+            /* Balance task yielded to an active rebuild: release the worker, refresh its margin from the job in
+             * case the job itself was promoted to a rebuild, re-queue without counting a failure, and wait briefly
+             * only if no higher-priority non-balance task is ready to run. */
+            pthread_mutex_lock(&sf->mu);
+            bool requeue = false;
+            if (t->job) {
+                struct sfill_job *j = t->job;
+                if (!sf->stopping && !j->removed && j->pass_active && j->pass_gen == t->gen && j->gen == t->gen) {
+                    t->margin = j->cfg.margin;
+                    push_task_locked(sf, t);
+                    requeue = true;
+                }
+            } else if (!sf->stopping && (!t->cancel_cb || !t->cancel_cb(t->done_arg))) {
+                push_task_locked(sf, t);
+                requeue = true;
+            }
+            if (requeue) {
+                if (!sf->q_head[0] && !sf->q_head[1] && !sf->q_head[2] && !sf->stopping) {
+                    struct timespec ts;
+                    tsdb_cond_deadline_ns(&ts, 25LL * 1000000LL);
+                    pthread_cond_timedwait(&sf->work_cv, &sf->mu, &ts);
+                }
+                continue;
+            }
+            pthread_mutex_unlock(&sf->mu);
+            rc = SFILL_OBJ_CANCELLED;
+        }
+
         if (!t->job) {
             if (t->done_cb)
                 t->done_cb(t->done_arg, rc == SFILL_OBJ_OK ? 0 : -1);
@@ -1036,7 +1079,7 @@ static void *coord_main(void *arg)
             pick->round_errors = 0;
             if (pick->pace_id)
                 pace_job_end_ex(PACE_RECV, pick->pace_id);
-            pick->pace_id = pace_job_begin_ex(PACE_RECV, pick->cfg.margin, 0);
+            pick->pace_id = pace_job_begin_ex(PACE_RECV, pick->cfg.margin, pick->cfg.margin == PACE_MARGIN_BALANCE);
         }
 
         pick->listing = true;
@@ -1305,8 +1348,15 @@ int sfill_start(struct sfill *sf, const struct sfill_job_cfg *cfg)
                 int old_m = found->cfg.margin;
                 found->cfg.margin = cfg->margin;
                 rebucket_job_tasks_locked(sf, found, old_m, cfg->margin);
-                if (found->pace_id)
-                    pace_job_update_ex(PACE_RECV, found->pace_id, cfg->margin);
+                if (found->pace_id) {
+                    if ((old_m == PACE_MARGIN_BALANCE) != (cfg->margin == PACE_MARGIN_BALANCE)) {
+                        pace_job_end_ex(PACE_RECV, found->pace_id);
+                        found->pace_id =
+                            pace_job_begin_ex(PACE_RECV, cfg->margin, cfg->margin == PACE_MARGIN_BALANCE);
+                    } else {
+                        pace_job_update_ex(PACE_RECV, found->pace_id, cfg->margin);
+                    }
+                }
             }
         }
     } else {

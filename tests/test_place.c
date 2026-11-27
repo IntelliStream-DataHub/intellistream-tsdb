@@ -1163,6 +1163,358 @@ static void test_r9_return(void)
     meta_free(&sm);
 }
 
+/* 11. Pure greedy balancer (r9-balance; D19, §3.2, §6.2, E9, E51):
+ *   (a) 5-node cluster with 18 replicas=3 volumes gains 6th node -> moves bounded by 5% concurrent,
+ *       add-before-drop only (never REPLICA_REMOVE), converges to exact 9 per node & balanced leaders;
+ *   (b) 25% automatic cap stops and logs (catches mutant `balanceunbounded`), `balance_apply = 1` overrides;
+ *       `balance = 0` disables automatic moves while `balance_apply = 1` still runs;
+ *   (c) E9 rack survivability never broken when adding a new server to an existing rack;
+ *   (d) EC stripe balance: same-class preservation (E51), chunk-bytes-per-capacity balancing, fill-mark avoidance;
+ *   (e) Never runs while any rebuild / drain / OUT / DOWN / fault / place_plan proposal is active. */
+static void test_balance(void)
+{
+    struct meta_state sm;
+    struct place_member pm[10];
+
+    /* (a) 5 nodes -> add 6th node with 18 replicas=3 volumes (54 positions: 5% = 2 concurrent, 25% = 13 cap). */
+    init_cluster_state(&sm, 5, NULL, pm, 1);
+    for (uint32_t v = 1; v <= 18; v++) {
+        struct place_in pin = make_in(&sm, pm, 5);
+        uint32_t reps[3] = {0};
+        CHECK(place_volume(&pin, 3, reps) == 0, "bal(a): place_volume %u", v);
+        char vname[32];
+        snprintf(vname, sizeof vname, "bv%u", v);
+        add_vol(&sm, v, vname, reps, 3, 0, 0, NULL);
+    }
+    /* Add 6th UP node. */
+    struct meta_entry e;
+    meta_entry_init(&e);
+    struct meta_member m6 = {.id = 6, .state = META_UP, .incarnation = 1, .flags = META_MF_ALL};
+    snprintf(m6.addr, sizeof m6.addr, "198.51.100.6:9000");
+    snprintf(m6.peer, sizeof m6.peer, "198.51.100.6:9001");
+    meta_op_member_add(&e, &m6);
+    int res[4] = {0};
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(a): add node 6");
+    memset(&pm[5], 0, sizeof pm[5]);
+    pm[5].id = 6;
+    pm[5].heard_age_ms = 50;
+    pm[5].fill_pct = 20;
+    pm[5].chunk_stores = 1;
+
+    struct place_in in = make_in(&sm, pm, 6);
+    struct balance_summary sum;
+    balance_plan_summary(&in, &sum);
+    CHECK(sum.total_pos == 54 && sum.max_plan == 13 && sum.max_conc == 2 && sum.log_moves == 9 && !sum.over_cap &&
+              !sum.rebuild_busy,
+          "bal(a): summary mismatch (tot=%u maxp=%u maxc=%u log=%u over=%u busy=%u)", sum.total_pos, sum.max_plan,
+          sum.max_conc, sum.log_moves, sum.over_cap, sum.rebuild_busy);
+
+    /* Drive balance_plan rounds to convergence, checking 5% concurrent cap and add-before-drop on every step. */
+    uint32_t total_log_emitted = 0;
+    for (int step = 0; step < 30; step++) {
+        struct place_out out;
+        place_out_init(&out);
+        balance_plan(&in, &out);
+        if (out.nprops == 0) {
+            place_out_free(&out);
+            break;
+        }
+        uint32_t step_data = 0;
+        for (uint32_t i = 0; i < out.nprops; i++) {
+            const struct place_prop *p = &out.props[i];
+            CHECK(p->kind != PLACE_PROP_REPLICA_REMOVE, "bal(a): must never emit REPLICA_REMOVE");
+            CHECK(p->is_balance == 1, "bal(a): prop must set is_balance=1");
+            if (p->kind == PLACE_PROP_REPLICA_ADD) {
+                step_data++;
+                total_log_emitted++;
+                const struct meta_volume *v = meta_volume(&sm, p->volume);
+                CHECK(v != NULL && p->other_node != 0 && meta_replica(v, p->other_node) != NULL &&
+                          meta_replica(v, p->node) == NULL,
+                      "bal(a): invalid REPLICA_ADD vol=%u %u->%u", p->volume, p->other_node, p->node);
+                /* Simulate completed add-before-drop move: add learner -> join ISR -> transfer if leader -> remove old. */
+                meta_entry_init(&e);
+                meta_op_replica_add(&e, v->number, v->epoch, p->node, 9000ull + (uint64_t)step * 10 + i, p->other_node);
+                CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(a): apply REPLICA_ADD");
+                v = meta_volume(&sm, p->volume);
+                uint32_t new_isr[META_REPLICAS_MAX], ni = 0;
+                for (uint32_t k = 0; k < v->nrep; k++)
+                    if (v->rep[k].node != p->other_node)
+                        new_isr[ni++] = v->rep[k].node;
+                if (v->leader == p->other_node) {
+                    /* Transfer leader to target before shrinking old out of ISR. */
+                    uint32_t all_isr[META_REPLICAS_MAX], na = 0;
+                    for (uint32_t k = 0; k < v->nrep; k++)
+                        all_isr[na++] = v->rep[k].node;
+                    set_isr(&sm, v->number, all_isr, na);
+                    v = meta_volume(&sm, p->volume);
+                    struct meta_grant gr = {.number = v->number, .epoch = v->epoch, .new_epoch = v->epoch + 1,
+                                            .isr_version = v->isr_version, .reason = META_GR_PLANNED, .leader = p->node,
+                                            .start = v->epoch + 1, .target = p->node, .min_end = 10,
+                                            .nfenced = v->nisr, .nreplies = v->nisr};
+                    for (uint32_t k = 0; k < v->nisr; k++) {
+                        gr.fenced[k] = v->isr[k];
+                        gr.reply[k] = (struct meta_fence_reply){.node = v->isr[k],
+                                                                .rid = meta_replica(v, v->isr[k])->rid,
+                                                                .durable = 10, .last_epoch = v->epoch};
+                    }
+                    meta_entry_init(&e);
+                    meta_op_volume_leader(&e, &gr);
+                    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(a): transfer leader");
+                }
+                set_isr(&sm, p->volume, new_isr, ni);
+                v = meta_volume(&sm, p->volume);
+                meta_entry_init(&e);
+                meta_op_replica_remove(&e, v->number, v->epoch, p->other_node);
+                CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(a): apply REPLICA_REMOVE");
+            } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
+                const struct meta_volume *v = meta_volume(&sm, p->volume);
+                CHECK(v != NULL && meta_volume_in_isr(v, p->node) && v->leader != p->node,
+                      "bal(a): invalid VOLUME_TRANSFER vol=%u -> %u", p->volume, p->node);
+                struct meta_grant gr = {.number = v->number, .epoch = v->epoch, .new_epoch = v->epoch + 1,
+                                        .isr_version = v->isr_version, .reason = META_GR_PLANNED, .leader = p->node,
+                                        .start = v->epoch + 1, .target = p->node, .min_end = 10,
+                                        .nfenced = v->nisr, .nreplies = v->nisr};
+                for (uint32_t k = 0; k < v->nisr; k++) {
+                    gr.fenced[k] = v->isr[k];
+                    gr.reply[k] = (struct meta_fence_reply){.node = v->isr[k],
+                                                            .rid = meta_replica(v, v->isr[k])->rid,
+                                                            .durable = 10, .last_epoch = v->epoch};
+                }
+                meta_entry_init(&e);
+                meta_op_volume_leader(&e, &gr);
+                CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(a): apply leader transfer");
+            }
+        }
+        CHECK(step_data <= sum.max_conc, "bal(a): step emitted %u moves > 5%% cap %u", step_data, sum.max_conc);
+        place_out_free(&out);
+    }
+    CHECK(total_log_emitted == 9, "bal(a): expected 9 log moves to balance 5->6 (got %u)", total_log_emitted);
+    uint32_t hcnt[7] = {0}, lcnt[7] = {0};
+    for (uint32_t vi = 0; vi < sm.nvolumes; vi++) {
+        const struct meta_volume *v = &sm.volumes[vi];
+        lcnt[v->leader]++;
+        for (uint32_t k = 0; k < v->nrep; k++)
+            hcnt[v->rep[k].node]++;
+    }
+    for (uint32_t id = 1; id <= 6; id++) {
+        CHECK(hcnt[id] == 9, "bal(a): node %u holds %u replicas (want 9)", id, hcnt[id]);
+        CHECK(lcnt[id] >= 2 && lcnt[id] <= 4, "bal(a): node %u leads %u volumes (want 2..4)", id, lcnt[id]);
+    }
+    meta_free(&sm);
+
+    /* (b) 25% automatic cap stops and logs (catches `balanceunbounded`), `--apply` overrides, `balance=off` stops auto. */
+    init_cluster_state(&sm, 3, NULL, pm, 1);
+    for (uint32_t v = 1; v <= 12; v++) {
+        uint32_t reps[3] = {1, 2, 3};
+        char vname[32];
+        snprintf(vname, sizeof vname, "capv%u", v);
+        add_vol(&sm, v, vname, reps, 3, 0, 0, NULL);
+    }
+    for (uint32_t nid = 4; nid <= 5; nid++) {
+        meta_entry_init(&e);
+        struct meta_member mn = {.id = nid, .state = META_UP, .incarnation = 1, .flags = META_MF_ALL};
+        snprintf(mn.addr, sizeof mn.addr, "10.0.0.%u:9000", nid);
+        snprintf(mn.peer, sizeof mn.peer, "10.0.0.%u:9001", nid);
+        meta_op_member_add(&e, &mn);
+        CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(b): add node %u", nid);
+        memset(&pm[nid - 1], 0, sizeof pm[nid - 1]);
+        pm[nid - 1].id = nid;
+        pm[nid - 1].heard_age_ms = 50;
+        pm[nid - 1].fill_pct = 20;
+        pm[nid - 1].chunk_stores = 1;
+    }
+    in = make_in(&sm, pm, 5);
+    balance_plan_summary(&in, &sum);
+    CHECK(sum.total_pos == 36 && sum.max_plan == 9 && sum.log_moves == 14 && sum.over_cap == 1,
+          "bal(b): expected 14/36 over 25%% cap (got %u/%u cap=%u over=%u)", sum.log_moves, sum.total_pos, sum.max_plan,
+          sum.over_cap);
+
+    struct place_out out;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 0, "bal(b): automatic plan >25%% MUST emit 0 props (got %u, mutant=%d)", out.nprops, g_mut);
+    CHECK(out.nlogs >= 1 && strstr(out.logs[0].msg, "25% automatic cap") != NULL,
+          "bal(b): automatic plan >25%% must log 25%% cap message");
+    place_out_free(&out);
+
+    /* Operator --apply overrides 25% cap while still respecting 5% concurrent bound (36/20 = 1). */
+    in.balance_apply = 1;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    uint32_t apply_data = 0;
+    for (uint32_t i = 0; i < out.nprops; i++)
+        if (out.props[i].kind == PLACE_PROP_REPLICA_ADD || out.props[i].kind == PLACE_PROP_STRIPE_SET)
+            apply_data++;
+    CHECK(apply_data == 1 && out.props[0].kind == PLACE_PROP_REPLICA_ADD && out.props[0].node >= 4,
+          "bal(b): balance_apply=1 must emit 1 data move (5%% cap) onto node 4/5 (got %u data / %u total)",
+          apply_data, out.nprops);
+    place_out_free(&out);
+    in.balance_apply = 0;
+
+    /* balance=off disables automatic moves even when <= 25%, while balance_apply=1 still works. */
+    struct meta_settings bs = sm.set;
+    bs.balance = 0;
+    meta_entry_init(&e);
+    meta_op_settings(&e, &bs, sm.settings_version);
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "bal(b): set balance=off");
+    in.balance_apply = 0;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 0 && out.nlogs == 0, "bal(b): balance=off must emit 0 props and 0 logs");
+    place_out_free(&out);
+    in.balance_apply = 1;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    apply_data = 0;
+    for (uint32_t i = 0; i < out.nprops; i++)
+        if (out.props[i].kind == PLACE_PROP_REPLICA_ADD || out.props[i].kind == PLACE_PROP_STRIPE_SET)
+            apply_data++;
+    CHECK(apply_data == 1, "bal(b): balance_apply=1 must run even when balance=off (got %u data)", apply_data);
+    place_out_free(&out);
+    meta_free(&sm);
+
+    /* (c) E9 rack survivability preserved: adding node 7 in rack r1 only replaces r1 replicas (never r2 or r3). */
+    static const char *const bracks[7] = {"r1", "r2", "r3", "r1", "r2", "r3", "r1"};
+    init_cluster_state(&sm, 7, bracks, pm, 1);
+    /* Place 9 volumes across nodes 1..6 (3 per rack: {1,2,3} and {4,5,6}), node 7 in r1 has 0 replicas. */
+    for (uint32_t v = 1; v <= 9; v++) {
+        uint32_t reps[3] = {(v % 2) ? 1u : 4u, (v % 2) ? 2u : 5u, (v % 2) ? 3u : 6u};
+        char vname[32];
+        snprintf(vname, sizeof vname, "rkv%u", v);
+        add_vol(&sm, v, vname, reps, 3, 0, 0, NULL);
+    }
+    in = make_in(&sm, pm, 7);
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    if (g_mut != PLACE_MUT_RACK_IGNORED) {
+        CHECK(out.nprops >= 1, "bal(c): expected balance move onto node 7 (r1)");
+        for (uint32_t i = 0; i < out.nprops; i++) {
+            if (out.props[i].kind != PLACE_PROP_REPLICA_ADD)
+                continue;
+            const struct meta_member *src = meta_member(&sm, out.props[i].other_node);
+            const struct meta_member *dst = meta_member(&sm, out.props[i].node);
+            CHECK(src && dst && strcmp(src->rack, dst->rack) == 0,
+                  "bal(c): replacing %s with %s would break E9 rack survivability", src ? src->rack : "?",
+                  dst ? dst->rack : "?");
+        }
+    }
+    place_out_free(&out);
+    meta_free(&sm);
+
+    /* (d) EC stripe balance: same-class preservation (E51), byte-utilization balancing, and fill-mark avoidance. */
+    init_cluster_state(&sm, 8, NULL, pm, 1);
+    uint64_t sz = 1000ull << 30;
+    struct meta_disk dks[8];
+    struct place_disk_usage du[8];
+    for (uint32_t i = 0; i < 8; i++) {
+        /* Nodes 1..6 and 8 are HDD; node 7 is NVMe (different class!). */
+        uint8_t cls = (i == 6) ? META_DISK_NVME : META_DISK_HDD;
+        uint8_t uses = (i == 6) ? META_DISK_USE_ALL : META_DISK_USE_CHUNK;
+        dks[i] = mk_disk((uint8_t)(60 + i), cls, uses, sz);
+        add_disk(&sm, i + 1, &dks[i]);
+        if (i != 6) {
+            struct meta_disk nv = mk_disk((uint8_t)(80 + i), META_DISK_NVME, META_DISK_USE_LOG, sz);
+            add_disk(&sm, i + 1, &nv);
+        }
+        du[i] = (struct place_disk_usage){.disk_class = cls, .uses = uses, .state = META_STORE_UP, .have_usage = 1,
+                                          .size_bytes = sz, .chunk_bytes = 0};
+        memcpy(du[i].store_id, dks[i].store_id, 16);
+        pm[i].disks = &du[i];
+        pm[i].ndisks = 1;
+    }
+    /* Create 4 EC 4+2 volumes across HDD nodes 1..6 (balanced logs: 2 per node 1..6; each HDD holds 4 stripe pos). */
+    for (uint32_t v = 1; v <= 4; v++) {
+        uint32_t lrep[3] = {(v % 2) ? 1u : 4u, (v % 2) ? 2u : 5u, (v % 2) ? 3u : 6u};
+        uint32_t stp[6] = {1, 2, 3, 4, 5, 6};
+        char vname[32];
+        snprintf(vname, sizeof vname, "ecb%u", v);
+        add_vol(&sm, v, vname, lrep, 3, 4, 2, stp);
+    }
+    in = make_in(&sm, pm, 8);
+    in.balance_apply = 1;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    if (g_mut != PLACE_MUT_MIX_STRIPE) {
+        int saw_stripe_to_8 = 0;
+        for (uint32_t i = 0; i < out.nprops; i++) {
+            if (out.props[i].kind == PLACE_PROP_STRIPE_SET) {
+                CHECK(out.props[i].node == 8, "bal(d): HDD stripe must move to HDD node 8, not NVMe node %u",
+                      out.props[i].node);
+                saw_stripe_to_8 = 1;
+            }
+        }
+        /* Logs on nodes 1..6 are balanced (2 each); only nodes 7/8 have 0 log replicas so a log move may take the
+         * single 5% slot first. Verify stripe-only behavior directly below once nodes 7/8 are storage-only. */
+        (void)saw_stripe_to_8;
+    }
+    place_out_free(&out);
+
+    /* Pure byte-utilization imbalance on balanced counts: node 1 at 70% chunks, node 8 at 5% chunks (and fill mark). */
+    du[0].chunk_bytes = sz * 70 / 100;
+    for (uint32_t i = 1; i < 6; i++)
+        du[i].chunk_bytes = sz * 30 / 100;
+    du[7].chunk_bytes = sz * 5 / 100;
+    /* Make node 8 storage-only so no log move competes for the 5% slot. */
+    set_role(&sm, 8, META_ROLE_STORAGE);
+    set_role(&sm, 7, META_ROLE_STORAGE);
+    in = make_in(&sm, pm, 8);
+    in.balance_apply = 1;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    if (g_mut != PLACE_MUT_MIX_STRIPE) {
+        CHECK(out.nprops >= 1 && out.props[0].kind == PLACE_PROP_STRIPE_SET && out.props[0].other_node == 1 &&
+                  out.props[0].node == 8,
+              "bal(d): expected byte-driven STRIPE_SET from 70%% node 1 to 5%% HDD node 8 (got %u props, kind=%d %u->%u)",
+              out.nprops, out.nprops ? (int)out.props[0].kind : -1, out.nprops ? out.props[0].other_node : 0,
+              out.nprops ? out.props[0].node : 0);
+    }
+    place_out_free(&out);
+
+    /* Fill mark check: pushing node 8 to 90% (> fill mark) must exclude it from stripe moves. */
+    du[7].chunk_bytes = sz * 90 / 100;
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    if (g_mut != PLACE_MUT_PLACE_FULL && g_mut != PLACE_MUT_MIX_STRIPE) {
+        for (uint32_t i = 0; i < out.nprops; i++)
+            CHECK(!(out.props[i].kind == PLACE_PROP_STRIPE_SET && out.props[i].node == 8),
+                  "bal(d): must not move stripe position onto 90%% full node 8");
+    }
+    place_out_free(&out);
+    du[7].chunk_bytes = sz * 5 / 100;
+
+    /* (e) Never runs while any rebuild / drain / OUT / DOWN / fault / place_plan proposal is active. */
+    set_member_state(&sm, 2, META_DRAINING);
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 0, "bal(e): must emit 0 props while a member is DRAINING");
+    place_out_free(&out);
+    set_member_state(&sm, 2, META_UP);
+
+    set_member_state(&sm, 2, META_DOWN);
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 0, "bal(e): must emit 0 props while a member holding data is DOWN");
+    place_out_free(&out);
+    set_member_state(&sm, 2, META_UP);
+
+    pm[0].nfaults = 1;
+    pm[0].faults[0] = (struct place_vol_fault){.volume = 1, .fault_s = 1};
+    place_out_init(&out);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 0, "bal(e): must emit 0 props while a member reports a replica fault");
+    place_out_free(&out);
+    pm[0].nfaults = 0;
+
+    place_out_init(&out);
+    struct place_prop prev_p = {.kind = PLACE_PROP_STRIPE_WHOLE, .volume = 1, .pos = 0, .node = 1, .version = 1};
+    place_out_push(&out, &prev_p);
+    balance_plan(&in, &out);
+    CHECK(out.nprops == 1, "bal(e): must emit 0 new props when place_plan emitted proposals this tick");
+    place_out_free(&out);
+
+    meta_free(&sm);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--mutant") == 0) {
@@ -1191,6 +1543,7 @@ int main(int argc, char **argv)
     test_sender_reachability();
     test_r13_capability_class_and_fill();
     test_r9_return();
+    test_balance();
 
     if (fails) {
         fprintf(stderr, "test_place: %d checks failed\n", fails);

@@ -165,6 +165,7 @@ enum sfill_mutant {
     SFILL_MUT_FEWERK = 2,        /* fillfewerk: attempts decode with fewer than k good survivors */
     SFILL_MUT_SURVIVOR_TRUST = 3, /* fillsurvivortrust: skips verifying survivor cells against encode-time sums */
     SFILL_MUT_WHOLE_EARLY = 4,   /* wholeearly: reports whole=1 on the first report before all objects finish */
+    SFILL_MUT_BALANCE_DECODE = 5, /* balancedecode: skips 1x copy on balancer fill and decodes instead */
 };
 extern _Atomic int sfill_mutant;
 int sfill_mutant_parse(const char *name);

@@ -72,7 +72,7 @@ for hargs in "" "help" "help status" "help status volumes" "help status volume" 
              "help init" "help node" "help node add" "help node hold" "help node out" "help node drain" \
              "help node replace" "help node destroyed" "help volume" "help volume add" "help volume move" \
              "help volume transfer" "help volume force-leader" "help volume gc resume" "help replica reset" \
-             "help settings" "help settings show" "help settings set" \
+             "help settings" "help settings show" "help settings set" "help balance" \
              "help secret" "help user"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $hargs 2>"$scratch/err"); rc=$?
@@ -95,7 +95,7 @@ done
 # Wrong verb / missing args must exit 2 with empty stdout.
 for bad in "bogus" "help bogus" "help status volumes extra" "status" "status --json" "status volumes" \
            "status volume" "status volume 1" "status disks" "node nope" "volume nope" "replica nope" \
-           "settings" "settings nope" "settings show" "settings set" "settings set 127.0.0.1:1"; do
+           "settings" "settings nope" "settings show" "settings set" "settings set 127.0.0.1:1" "balance"; do
     # shellcheck disable=SC2086
     out=$("$T" cluster $bad 2>"$scratch/err"); rc=$?
     [ "$rc" -eq 2 ] || fail "tsdb cluster $bad: exit $rc, want 2"
@@ -563,5 +563,18 @@ case $out in *'"settings_version": 2'*'"rebuild_mb_s": 80'*) ;; *) fail "refused
 
 "$T" cluster settings set "$p1" unknown_setting=1 --secret-file "$sec" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 2 ] || fail "settings set unknown_setting: exit $rc, want 2"
+
+# ---- 7. R9 balancer CLI (`balance [--apply]` via follower, `balance=off/on` live setting) ----
+
+out=$("$T" cluster balance "$p2" --secret-file "$sec") || fail "balance dry-run via follower failed"
+case $out in *"cluster is balanced"*) ;; *) fail "unexpected balance dry-run output: $out" ;; esac
+
+out=$("$T" cluster balance "$p2" --apply --secret-file "$sec") || fail "balance --apply via follower failed"
+case $out in *"already balanced"*) ;; *) fail "unexpected balance --apply output: $out" ;; esac
+
+out=$("$T" cluster settings set "$p2" balance=off --secret-file "$sec") || fail "settings set balance=off failed"
+case $out in *"balance on->off"*) ;; *) fail "unexpected balance=off output: $out" ;; esac
+out=$("$T" cluster settings set "$p2" balance=on --secret-file "$sec") || fail "settings set balance=on failed"
+case $out in *"balance off->on"*) ;; *) fail "unexpected balance=on output: $out" ;; esac
 
 echo "test_cluster_cli: ok"

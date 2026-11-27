@@ -452,9 +452,19 @@ static void task_add(int what, struct rjob *j)
 static int snap_pace_margin(const struct cluster_vol_rec *rec)
 {
     uint32_t full = 0;
-    for (uint32_t k = 0; k < rec->nrep; k++)
+    uint32_t replaces = 0;
+    for (uint32_t k = 0; k < rec->nrep; k++) {
         if (!rec->rep[k].learner)
             full++;
+        if (rec->rep[k].learner && rec->rep[k].replaces)
+            replaces = rec->rep[k].replaces;
+    }
+    if (replaces && rec->nisr >= full) {
+        for (uint32_t k = 0; k < rec->nrep; k++) {
+            if (rec->rep[k].node == replaces && rec->rep[k].state == META_UP)
+                return PACE_MARGIN_BALANCE;
+        }
+    }
     if (rec->nisr <= 1)
         return 0;
     int m = (int)rec->nisr - 1;
@@ -594,7 +604,7 @@ void rsnap_need(struct rvol *rv, int src)
         j->req = 1;
     j->set_version = rv->rec.set_version, j->epoch = rv->epoch;
     j->margin = snap_pace_margin(&rv->rec);
-    j->pace_id = pace_job_begin_ex(PACE_RECV, j->margin, 0);
+    j->pace_id = pace_job_begin_ex(PACE_RECV, j->margin, j->margin == PACE_MARGIN_BALANCE);
     j->start_ms = j->last_ms = j->progress_ms = now;
     snprintf(j->root, sizeof j->root, "%s", rv->disk_root[0] ? rv->disk_root : G.dir);
     snprintf(j->dir, sizeof j->dir, "%s/v%" PRIu32 ".snap", j->root, rv->number);
@@ -765,10 +775,14 @@ int rsnap_bin_data(void *arg, struct plink *l, uint64_t file, uint64_t off, cons
     uint32_t idx = j->cur_idx;
     j->busy++;
     pthread_mutex_unlock(&S.mu);
-    if (idx != RS_MAN) /* R9 D18: receive-side pacing before writing/acknowledging the next snapshot window;
-                        * capped at 500 ms per chunk (a 1 MiB read pass holds <= 4 chunks -> <= 2 s, well below
-                        * peerlink dead_ms = 5 s) so the link never times out under low halved rates. */
-        pace_take_capped(PACE_RECV, (uint64_t)n, margin, 500ull * 1000000ull);
+    if (idx != RS_MAN) { /* R9 D18: receive-side pacing before writing/acknowledging the next snapshot window;
+                          * capped at 500 ms per chunk (a 1 MiB read pass holds <= 4 chunks -> <= 2 s, well below
+                          * peerlink dead_ms = 5 s) so the link never times out under low halved rates. */
+        if (pace_take_capped(PACE_RECV, (uint64_t)n, margin, 500ull * 1000000ull) == PACE_REFUSED) {
+            struct timespec ts = {0, 50 * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
     int bad = 0;
     for (size_t done = 0; done < n;) {
         ssize_t w = pwrite(fd, (const uint8_t *)p + done, n - done, (off_t)(off + done));
@@ -928,7 +942,7 @@ static void src_req(struct plink *l, const uint8_t *p, size_t n)
     }
     j->role = R_SRC, j->state = S_MAKING, j->vol = vol, j->peer = from, j->req = req, j->epoch = epoch, j->fd = -1;
     j->set_version = setv, j->rate = rate, j->margin = margin, j->hist = hist, j->nhist = nhist;
-    j->pace_id = pace_job_begin_ex(PACE_SEND, margin, 0);
+    j->pace_id = pace_job_begin_ex(PACE_SEND, margin, margin == PACE_MARGIN_BALANCE);
     j->start_ms = j->last_ms = j->progress_ms = ms_now();
     j->next = S.jobs;
     S.jobs = j;
@@ -1125,9 +1139,17 @@ void rsnap_tick(struct rvol *rv)
                 samelink_rate_changed = 1;
         }
         if (j->margin != cur_margin) {
+            int old_m = j->margin;
             j->margin = cur_margin;
-            if (j->pace_id)
-                pace_job_update_ex(j->role == R_SRC ? PACE_SEND : PACE_RECV, j->pace_id, cur_margin);
+            if (j->pace_id) {
+                enum pace_dir dir = j->role == R_SRC ? PACE_SEND : PACE_RECV;
+                if ((old_m == PACE_MARGIN_BALANCE) != (cur_margin == PACE_MARGIN_BALANCE)) {
+                    pace_job_end_ex(dir, j->pace_id);
+                    j->pace_id = pace_job_begin_ex(dir, cur_margin, cur_margin == PACE_MARGIN_BALANCE);
+                } else {
+                    pace_job_update_ex(dir, j->pace_id, cur_margin);
+                }
+            }
         }
         if (j->role == R_DST) {
             if (rv->mode != M_REPLICA)

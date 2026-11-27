@@ -52,6 +52,7 @@ void place_settings_default(struct place_settings *s)
         .young_high_pct = 90,
         .balance_mb_s = 0,
         .rebuild_concurrency = 4,
+        .balance = 1,
     };
 }
 

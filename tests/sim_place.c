@@ -194,6 +194,7 @@ struct sim_cov {
     uint64_t op_destroyed;
     uint64_t op_move_pos;
     uint64_t op_node_add;
+    uint64_t bal_moves;
     uint64_t m_faults;
     uint64_t mplus1_faults;
     uint64_t props_lost;
@@ -1489,17 +1490,53 @@ static void check_balance_output(struct sim *s, const struct place_in *in, const
         return;
 
     const struct meta_state *sm = in->sm;
-    /* Total positions across all volumes (for 25% plan cap). */
-    uint32_t total_pos = 0;
+    /* Balance must never run if pout_plan / place_plan emitted any state-drop or rebuild proposal this tick. */
+    for (uint32_t i = 0; i < place_end_idx; i++) {
+        enum place_prop_kind k = out->props[i].kind;
+        if ((k == PLACE_PROP_MEMBER_STATE && out->props[i].state >= META_DOWN) || k == PLACE_PROP_REPLICA_ADD ||
+            k == PLACE_PROP_REPLICA_REMOVE || k == PLACE_PROP_STRIPE_SET || k == PLACE_PROP_STRIPE_WHOLE ||
+            k == PLACE_PROP_MOVE_CANCEL || k == PLACE_PROP_GC_RELEASE) {
+            sim_fail(s, "balance_plan emitted moves while rebuild/state proposal kind=%d was active", (int)k);
+            return;
+        }
+    }
+
+    /* Total positions across all volumes (for 25% plan cap and 5% cluster-wide concurrent cap) and in-flight moves. */
+    uint32_t total_pos = 0, inflight_bal = 0;
+    uint32_t vol_moving[SIM_MAX_VOLS] = {0};
+    uint32_t vol_bal_emitted[SIM_MAX_VOLS] = {0};
     for (uint32_t vi = 0; vi < sm->nvolumes; vi++) {
         const struct meta_volume *v = &sm->volumes[vi];
-        total_pos += v->nrep + (v->redundancy == META_RED_EC ? v->nstripe : 0);
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        uint32_t mv_node = 0, base_nrep = 0;
+        for (uint32_t k = 0; k < v->nrep; k++) {
+            if (v->rep[k].replaces)
+                mv_node = v->rep[k].node;
+            else
+                base_nrep++;
+        }
+        total_pos += base_nrep + (v->redundancy == META_RED_EC ? v->nstripe : 0);
+        if (mv_node) {
+            inflight_bal++;
+            if (v->number >= 1 && v->number <= SIM_MAX_VOLS)
+                vol_moving[v->number - 1]++;
+        }
+        if (v->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                if (v->stripe_pos[p].state == META_STRIPE_FILLING) {
+                    inflight_bal++;
+                    if (v->number >= 1 && v->number <= SIM_MAX_VOLS)
+                        vol_moving[v->number - 1]++;
+                }
+            }
+        }
     }
     uint32_t max_plan = total_pos / 4;
-    if (max_plan < 1)
-        max_plan = 1;
+    uint32_t max_conc = total_pos / 20;
+    if (max_conc < 1)
+        max_conc = 1;
 
-    uint32_t vol_moving[SIM_MAX_VOLS] = {0};
     uint32_t bal_moves = 0;
     for (uint32_t i = place_end_idx; i < out->nprops; i++) {
         const struct place_prop *p = &out->props[i];
@@ -1537,18 +1574,52 @@ static void check_balance_output(struct sim *s, const struct place_in *in, const
                     }
                 }
             }
+            /* E9 rack survivability must never be broken by a balancer move. */
+            if (place_rack_survivable(sm, v)) {
+                struct meta_volume va = *v;
+                if (p->kind == PLACE_PROP_REPLICA_ADD) {
+                    for (uint32_t k = 0; k < va.nrep; k++)
+                        if (va.rep[k].node == p->other_node)
+                            va.rep[k].node = p->node;
+                } else if (p->pos < va.nstripe) {
+                    va.stripe[p->pos] = p->node;
+                }
+                if (!place_rack_survivable(sm, &va)) {
+                    sim_fail(s, "balance_plan broke E9 rack survivability on vol %" PRIu32, p->volume);
+                    return;
+                }
+            }
             bal_moves++;
-            if (p->volume >= 1 && p->volume <= SIM_MAX_VOLS)
+            s->cov.bal_moves++;
+            if (p->volume >= 1 && p->volume <= SIM_MAX_VOLS) {
                 vol_moving[p->volume - 1]++;
+                vol_bal_emitted[p->volume - 1]++;
+            }
         }
     }
-    if (bal_moves > max_plan) {
-        sim_fail(s, "balance_plan exceeded 25%% plan cap: %" PRIu32 " moves > cap %" PRIu32, bal_moves, max_plan);
+    if (bal_moves > 0 && !in->balance_apply) {
+        /* Compute the clean (non-mutant) rack/class/fill-aware balance plan size (catches balanceunbounded). */
+        struct place_in clean_in = *in;
+        clean_in.mutant = PLACE_MUT_NONE;
+        clean_in.balance_apply = 0;
+        struct balance_summary sum;
+        balance_plan_summary(&clean_in, &sum);
+        uint32_t plan_total = sum.log_moves + sum.stripe_moves;
+        if (bal_moves > max_plan || sum.over_cap || (plan_total + inflight_bal) > max_plan) {
+            sim_fail(s, "balance_plan exceeded 25%% plan cap: emitted %" PRIu32 " moves (plan=%" PRIu32
+                        " inflight=%" PRIu32 " > cap %" PRIu32 ")",
+                     bal_moves, plan_total, inflight_bal, max_plan);
+            return;
+        }
+    }
+    if (bal_moves > 0 && (bal_moves + inflight_bal) > max_conc) {
+        sim_fail(s, "balance_plan exceeded 5%% cluster concurrent cap: %" PRIu32 " + %" PRIu32 " > %" PRIu32,
+                 bal_moves, inflight_bal, max_conc);
         return;
     }
     for (uint32_t vi = 0; vi < sm->nvolumes; vi++) {
         const struct meta_volume *v = &sm->volumes[vi];
-        if (v->number < 1 || v->number > SIM_MAX_VOLS)
+        if (v->number < 1 || v->number > SIM_MAX_VOLS || vol_bal_emitted[v->number - 1] == 0)
             continue;
         uint32_t grp = v->redundancy == META_RED_EC ? v->nstripe : v->nrep;
         uint32_t cap5 = grp / 20;
@@ -3492,6 +3563,7 @@ static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutan
         total_cov->op_destroyed += s->cov.op_destroyed;
         total_cov->op_move_pos += s->cov.op_move_pos;
         total_cov->op_node_add += s->cov.op_node_add;
+        total_cov->bal_moves += s->cov.bal_moves;
         total_cov->m_faults += s->cov.m_faults;
         total_cov->mplus1_faults += s->cov.mplus1_faults;
         total_cov->props_lost += s->cov.props_lost;

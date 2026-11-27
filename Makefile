@@ -677,7 +677,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle reencode r4stubs 
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
     nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub scrubrepair ecback ecbackempty ecbackgc disks twodisks placeclass diskstall diskeio \
-    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill
+    ecbackduring ecbackafterwhole logbackduring hddadd settings diskfill posbalance
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO) $(if $(filter Darwin,$(UNAME_S)),,$(B)/liboutagefs.so)
 	CRASHFS_SO=$(B)/libcrashfs.so OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -692,7 +692,7 @@ test-links: $(B)/test_peerlink $(B)/test_replwire $(B)/test_fwd $(B)/test_margin
 	./$(B)/test_pace $(SCRATCH)
 	$(MUT) --name test_pace --list "pacefifo nohalve" -- ./$(B)/test_pace --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_place
-	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull takebackwhole" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
+	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull takebackwhole balanceunbounded" -- ./$(B)/test_place --mutant @M@ # each planted bug must fail it
 	./$(B)/test_sfill $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_sfill --list "fillnocheck fillfewerk fillsurvivortrust wholeearly" -- ./$(B)/test_sfill --mutant @M@ @D@) # each planted bug must fail it
 	./$(B)/test_sreconcile $(SCRATCH)
@@ -1085,7 +1085,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants diskfault-mutants cvolfs-mutants placeclass-mutants diskfill-mutants lmove-mutants settings-mutants tiers-mutants tierctl-mutants tiersalv-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants reencode-mutants sfill-mutants whole-mutants reconcile-mutants return-mutants balance-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1183,7 +1183,7 @@ $(B)/place.o: server/place.c $(R9_PLACE_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/pout.o: server/pout.c $(R9_PLACE_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
-$(B)/balance.o: server/balance.c $(R9_PLACE_HDR) | $(B)
+$(B)/balance.o: server/balance.c $(R9_PLACE_HDR) server/pace.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 $(B)/sfill.o: server/sfill.c server/sfill.h server/pace.h server/crashpt.h src/chunk.h src/chunk_priv.h src/compat.h src/internal.h $(EC_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/ec/compat -c -o $@ $<
@@ -1234,11 +1234,11 @@ reconcile-mutants: $(B)/test_sreconcile $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	$(MUT) --name test_sreconcile --list "backfullcopy backskipmissing" -- ./$(B)/test_sreconcile --mutant @M@ @D@
 	$(MUT) --name ecback --list "backfullcopy backskipmissing" -- env TSDB_SRECONCILE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecback
-# R9 placement unit tests (server/place.c, track r9-plan)
-$(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
-	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
+# R9 placement and balancer unit tests (server/place.c, server/balance.c; tracks r9-plan, r9-balance)
+$(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
+	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
 place-plan-mutants: $(B)/test_place
-	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull takebackwhole" -- ./$(B)/test_place --mutant @M@
+	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier loghdd mixstripe placefull takebackwhole balanceunbounded" -- ./$(B)/test_place --mutant @M@
 # R9 returning-server mutants (track r9-return; E28, §5.4): takebackwhole must fail ecbackafterwhole, partialdelnow must fail ecbackduring
 return-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "return-mutants: this build has no erasure codec (NO_EC=1): ecbackduring/ecbackafterwhole skip, nothing to plant"; false)
@@ -1250,6 +1250,10 @@ return-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 ops-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 	$(MUT) --name ops-drain --list "drainleaves" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodedrain
 	$(MUT) --name ops-replace --list "replaceclear" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodereplace
+# R9 balancer mutants (server/balance.c, server/sfill.c, track r9-balance): balanceunbounded and balancedecode must fail posbalance
+balance-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	$(MUT) --name balance-cap --list "balanceunbounded" -- env TSDB_PLACE_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ posbalance
+	$(if $(EC_OBJ),$(MUT) --name balance-copy --list "balancedecode" -- env TSDB_SFILL_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ posbalance)
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/creport.h server/meta.h server/place.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<

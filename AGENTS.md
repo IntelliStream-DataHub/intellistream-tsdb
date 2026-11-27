@@ -275,12 +275,12 @@ cgroup, so `nice` does not keep your work out of its way.
   copynofloor` in `make copy-mutants`); R13 (`r13-meta`): per-member registered disks (`META_DISKS_MAX = 64`:
   `store_id`, `nvme`/`ssd`/`hdd`, `log`/`chunk`, size, sync_us, `UP`/`DOWN`/`OUT`/`DESTROYED`), declared `role`
   (`both`/`compute`/`storage`) and computed `capability`, ops `STORE_ADD`/`STORE_CLASS`/`STORE_STATE`/`MEMBER_ROLE`,
-  R12/R13 settings (`META_SETTINGS_WORDS = 38`: `scrub_days`, `scrub_mb_s`, `scrub_out_count`, `log_on_hdd`,
-  `young_warn_pct`, `young_move_pct`, `disk_stall_s`), `cluster_member_disks()`; R14 (`r14-settings`, D25):
+  R12/R13/R9 settings (`META_SETTINGS_WORDS = 39`: `scrub_days`, `scrub_mb_s`, `scrub_out_count`, `log_on_hdd`,
+  `young_warn_pct`, `young_move_pct`, `disk_stall_s`, `balance`), `cluster_member_disks()`; R14 (`r14-settings`, D25):
   `settings_version` in `meta_state` (1 at INIT, +1 per `META_OP_SETTINGS`), CAS + D25 init-only whitelist and range
   validation at both proposer (`CLUSTER_OP_SETTINGS` = 21) and `meta_apply`, live settings watch on consumers,
   `tsdb cluster settings show|set`, `test_cluster settings`, `make settings-mutants` (`settingsany`, `settingsnocas`);
-  snapshot version 11 and entry magic "TME8": a state directory or log of another version is refused naming both, never upgraded);
+  snapshot version 12 and entry magic "TME9": a state directory or log of another version is refused naming both, never upgraded);
   R9 operator ops (`server/cnode.c`: Raft leader handlers for `node hold|out|drain|replace|destroyed` and
   `volume move --pos`, answered after commit, plus `cnode_duty` DRAINING->OUT, replace completion/abandon, and live
   OUT leader handoff; `test_cluster nodehold nodeout nodedrain nodereplace nodedestroyed posmove`; `make ops-mutants`
@@ -1048,6 +1048,25 @@ cgroup, so `nice` does not keep your work out of its way.
     `tests/test_place.c` (`--mutant takebackwhole`), `tests/sim_place.c` / `tests/sim_place.sh` (`takebackwhole
     partialdelnow`), `test_cluster ecbackduring ecbackafterwhole logbackduring`, and `make return-mutants`
     (`takebackwhole partialdelnow`).
+  - **Cluster balancer** (R9, r9-balance; `server/balance.c`, `server/place.[ch]`, `server/cluster.[ch]`,
+    `server/meta.[ch]`, `server/sfill.[ch]`, `server/rsnap.c`, `server/chunkpeer_cluster.c`, `tools/cluster-cli.c`;
+    design-cluster.md §3.2, design-cluster-data.md §6.2–6.3, E9, E51, D18–D20):
+    `balance_plan()` / `balance_plan_ex()` / `balance_plan_summary()` are pure greedy planners (no I/O, no clock,
+    no locks) over log replica lists (even replicas across compute-capable UP members, preferred-leader `rep[0]`
+    preference, pair spread, E9 rack survivability never broken, R13 fast-log/role/fill respected), EC stripe
+    positions (chunk byte utilization per capacity when >=5% imbalanced and capacity-weighted position counts within
+    the same storage disk class, never exceeding the fill mark), and leaders via R4 planned transfers (when
+    `leader_balance_s == 0`, leaving R4's `ctransfer.c` untouched when `> 0`). Bounds: <=5% of positions moving at
+    once (min 1, per group and cluster-wide), automatic plans moving >25% of cluster positions stop and log
+    (override via `CLUSTER_OP_BALANCE = 22` / `tsdb cluster balance [--apply]`, cleared on term change or new
+    rebuild), never runs while any rebuild/drain/OUT/DOWN/fault/conversion is active, and never lowers any margin
+    (add-before-drop for log moves, `FILLING -> WHOLE` + 1x copy from UP `prev` before `MK_GC` release for stripe
+    moves). Controlled by live-changeable `balance` setting (`on|off`, default `on`, `META_SNAP_VERSION = 12` /
+    `"TME9"`); balancer transfers pace under `PACE_MARGIN_BALANCE` (`balance_mb_s`, yielding whenever any rebuild is
+    active). `tests/test_place.c` (`--mutant balanceunbounded`), `tests/sim_place.c` / `tests/sim_place.sh`
+    (`balanceunbounded`), `tests/test_sfill.c` (balance yields to rebuild without worker-pool deadlock),
+    `test_cluster posbalance`, and `make balance-mutants` (`TSDB_PLACE_MUTANT=balanceunbounded`,
+    `TSDB_SFILL_MUTANT=balancedecode`).
   - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
     marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
     check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's

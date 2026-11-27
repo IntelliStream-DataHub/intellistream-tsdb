@@ -61,6 +61,7 @@ static const char cl_help[] =
     "       tsdb cluster status disks [--json] PEER --secret-file F\n"
     "       tsdb cluster settings show [--json] PEER --secret-file F\n"
     "       tsdb cluster settings set PEER [--version N] KEY=VALUE... --secret-file F\n"
+    "       tsdb cluster balance PEER [--apply] --secret-file F\n"
     "       tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
     "       tsdb cluster help [VERB]\n"
     "\n"
@@ -117,6 +118,9 @@ static const char cl_help[] =
     "  settings show PEER  show current cluster settings and settings_version (marks live vs init-only; `--json`).\n"
     "  settings set PEER KEY=VALUE...  change one or more live cluster settings in one atomic CAS proposal (init-only\n"
     "                      keys such as lease_ms and replication are refused per D25; `help settings`).\n"
+    "  balance PEER [--apply]  show the cluster balancer's planned moves across log replicas, EC stripe positions,\n"
+    "                      and leaders (dry-run by default). With `--apply`, override the 25% automatic plan cap and\n"
+    "                      run the plan at 5% concurrent bounds.\n"
     "\n"
     "  user ...            users and grants of the whole cluster, kept by the group (`tsdb cluster user` says how).\n"
     "                      init --superuser NAME --password-file F makes the first superuser.\n"
@@ -163,6 +167,7 @@ static const char cl_help[] =
     "    --young-warn-pct N      fast disk fill % warning alert [75] (1 to 98, <= move < high)\n"
     "    --young-move-pct N      fast disk fill % move-off mark [80] (1 to 98, >= warn, < high)\n"
     "    --disk-stall-s S        disk probe stall before DOWN, s [10] (1 to 3600)\n"
+    "    --balance on|off        automatic balancer after node add, drain, and rebuilds [on]\n"
     "  Live operational settings can be changed on a running cluster with `tsdb cluster settings set` (`help settings`);\n"
     "  init-only settings (replication, min_isr, voters, lease/fence/heartbeat/commit timing, failover, read_barrier)\n"
     "  stay fixed for the life of the cluster.\n";
@@ -346,8 +351,8 @@ static const char help_settings_set[] =
     "  Use --version N to assert an exact expected settings_version (default: current version read before proposing).\n"
     "  Live-changeable keys (D25): rebuild_mb_s, rebuild_max, transfer_wait_ms, leader_balance_s, repl_retain_mb,\n"
     "    repl_retain_s, repl_retain_down_gb, rebuild_after_s, opening_hold_s, failstop_out_s, out_guard_pct,\n"
-    "    out_guard_hold_s, balance_mb_s, rebuild_concurrency, scrub_days, scrub_mb_s, scrub_out_count, log_on_hdd,\n"
-    "    young_warn_pct, young_move_pct, young_high_pct, disk_stall_s.\n"
+    "    out_guard_hold_s, balance, balance_mb_s, rebuild_concurrency, scrub_days, scrub_mb_s, scrub_out_count,\n"
+    "    log_on_hdd, young_warn_pct, young_move_pct, young_high_pct, disk_stall_s.\n"
     "  Init-only keys (refused with D25 reason): replication, min_isr, voters, heartbeat_ms, node_timeout_ms,\n"
     "    isr_lag_ms, voter_replace_s, volumes_per_server, failover, read_barrier, lease_s, lease_ms, drift_ppm,\n"
     "    unanswered_ms, commit_interval_ms, idle_seal_ms.\n"
@@ -1647,7 +1652,7 @@ static void print_status_summary_json(const struct cluster_status *st)
                ",\n"
                "    \"rebuild_concurrency\": %" PRIu32 ", \"scrub_days\": %" PRIu32 ", \"scrub_mb_s\": %" PRIu32 ",\n"
                "    \"scrub_out_count\": %" PRIu32 ", \"log_on_hdd\": %s, \"young_warn_pct\": %" PRIu32 ",\n"
-               "    \"young_move_pct\": %" PRIu32 ", \"disk_stall_s\": %" PRIu32 "\n"
+               "    \"young_move_pct\": %" PRIu32 ", \"disk_stall_s\": %" PRIu32 ", \"balance\": %s\n"
                "  },\n",
                m.set.replication, m.set.min_isr, m.set.node_timeout_ms, m.set.heartbeat_ms, m.set.isr_lag_ms,
                m.set.rebuild_after_s, m.set.voter_replace_s, m.set.voters, m.set.volumes_per_server, fo,
@@ -1657,7 +1662,8 @@ static void print_status_summary_json(const struct cluster_status *st)
                m.set.leader_balance_s, m.set.opening_hold_s, m.set.failstop_out_s, m.set.out_guard_pct,
                m.set.out_guard_hold_s, m.set.repl_retain_down_gb, m.set.young_high_pct, m.set.balance_mb_s,
                m.set.rebuild_concurrency, m.set.scrub_days, m.set.scrub_mb_s, m.set.scrub_out_count,
-               m.set.log_on_hdd ? "true" : "false", m.set.young_warn_pct, m.set.young_move_pct, m.set.disk_stall_s);
+               m.set.log_on_hdd ? "true" : "false", m.set.young_warn_pct, m.set.young_move_pct, m.set.disk_stall_s,
+               m.set.balance ? "true" : "false");
     } else {
         fputs("  \"settings\": null,\n", stdout);
     }
@@ -2236,12 +2242,13 @@ struct cl_ctx {
     uint32_t hold_for_s, hold_flags, drain_flags, repl_flags;
     int have_hold_for;
 
-    /* status / settings */
+    /* status / settings / balance */
     int status_view;
     int json;
     const char *vol_arg;
     uint64_t set_ver;
     int have_set_ver;
+    uint32_t bal_flags;
 };
 
 typedef int (*cl_parse_flag_fn)(struct cl_ctx *ctx, int argc, char **argv, int *idx);
@@ -2314,6 +2321,16 @@ static int parse_flag_init(struct cl_ctx *ctx, int argc, char **argv, int *idx)
             s->log_on_hdd = 1;
         else if (!strcmp(v, "off") || !strcmp(v, "0"))
             s->log_on_hdd = 0;
+        else
+            return cl_usage(), -1;
+        *idx = i + 1;
+        return 1;
+    }
+    if (!strcmp(a, "--balance")) {
+        if (!strcmp(v, "on") || !strcmp(v, "1"))
+            s->balance = 1;
+        else if (!strcmp(v, "off") || !strcmp(v, "0"))
+            s->balance = 0;
         else
             return cl_usage(), -1;
         *idx = i + 1;
@@ -2533,6 +2550,16 @@ static int parse_flag_settings_set(struct cl_ctx *ctx, int argc, char **argv, in
         ctx->set_ver = (uint64_t)v;
         ctx->have_set_ver = 1;
         *idx = i + 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_flag_balance(struct cl_ctx *ctx, int argc, char **argv, int *idx)
+{
+    (void)argc;
+    if (!strcmp(argv[*idx], "--apply")) {
+        ctx->bal_flags |= CLUSTER_BALANCE_APPLY;
         return 1;
     }
     return 0;
@@ -3131,6 +3158,23 @@ static int prt_settings_show(struct cl_ctx *ctx, const uint8_t *reply, size_t le
     return 0;
 }
 
+static const char help_balance[] =
+    "usage: tsdb cluster balance PEER [--apply] --secret-file F\n"
+    "\n"
+    "  Inspect or apply the cluster balancer plan across log replicas, EC stripe positions, and leaders.\n"
+    "  Without --apply, prints the dry-run plan size and whether it exceeds the 25% automatic cap.\n"
+    "  With --apply, overrides the 25% automatic cap (and balance=off) and runs the plan at 5% concurrent bounds.\n"
+    "  Refused while any rebuild is queued or active. Follows once to the Raft leader if PEER is a follower.\n";
+
+static int enc_balance(struct cl_ctx *ctx, uint8_t *req, size_t cap, size_t *req_len)
+{
+    if (cap < 4)
+        return 1;
+    ctx->peer = ctx->pos[0];
+    *req_len = cluster_balance_encode(ctx->bal_flags, req);
+    return 0;
+}
+
 /* ---- the verb table: longest word prefixes first (or matched by best nwords) ---- */
 
 static const struct cl_verb cl_verbs[] = {
@@ -3174,6 +3218,8 @@ static const struct cl_verb cl_verbs[] = {
      prt_settings_show, help_settings_show},
     {{"settings", "set", NULL}, 2, 2, 48, CL_VF_PRINT_ERR_BODY | CL_VF_SECRET_IN_ENCODE, CLUSTER_OP_SETTINGS, 30000,
      parse_flag_settings_set, enc_settings_set, prt_text_reply, help_settings_set},
+    {{"balance", NULL, NULL}, 1, 1, 1, CL_VF_PRINT_ERR_BODY, CLUSTER_OP_BALANCE, 30000, parse_flag_balance,
+     enc_balance, prt_text_reply, help_balance},
 };
 
 static const size_t cl_nverbs = sizeof cl_verbs / sizeof cl_verbs[0];

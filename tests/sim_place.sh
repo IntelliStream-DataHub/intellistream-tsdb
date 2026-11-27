@@ -10,14 +10,12 @@ set -u
 B=${B:-build}
 mode=${1:-quick}
 
-# Active planted mutants present in server/place.c, server/pout.c, and tests/sim_place.c:
-#   place.c (r9-plan):     orderfifo rackignored twoperserver moveshrinks wholenobarrier
-#   pout.c  (r9-out):      noguard guardunbounded holdignored openingunbounded failstopslow
-#   sim_place.c (r9-sim):  deleteunmarked belowk
-# Hook points ready to append once their owning tracks land:
-#   r9-whole:    releasenomark
-#   r9-balance:  balanceunbounded
-mutants_active="orderfifo rackignored twoperserver moveshrinks wholenobarrier noguard guardunbounded holdignored openingunbounded failstopslow deleteunmarked belowk takebackwhole partialdelnow"
+# Active planted mutants present in server/place.c, server/pout.c, server/balance.c, and tests/sim_place.c:
+#   place.c   (r9-plan, r9-return): orderfifo rackignored twoperserver moveshrinks wholenobarrier takebackwhole partialdelnow
+#   pout.c    (r9-out):             noguard guardunbounded holdignored openingunbounded failstopslow
+#   balance.c (r9-balance):         balanceunbounded
+#   sim_place (r9-sim):             deleteunmarked belowk
+mutants_active="orderfifo rackignored twoperserver moveshrinks wholenobarrier noguard guardunbounded holdignored openingunbounded failstopslow deleteunmarked belowk takebackwhole partialdelnow balanceunbounded"
 
 PLACE_MUTANT_SEEDS=${PLACE_MUTANT_SEEDS:-2000}
 
@@ -46,6 +44,7 @@ case $mode in
     belowk)           pat='below k=[0-9]+ readable positions' ;;
     takebackwhole)    pat='STRIPE_SET took back WHOLE UP position' ;;
     partialdelnow)    pat='chunk deleted (without committed MK_GC|before current holder reported whole)' ;;
+    balanceunbounded) pat='exceeded 25% plan cap' ;;
     *)                pat='.' ;;
     esac
     grep -m1 -F "KILLED $2 " "$4" | grep -E "$pat"

@@ -153,6 +153,7 @@ Gauges for volumes this server does **not** hold (not listed in the volume's rep
 | `tsdb_chunk_repairs_total{result}` | counter | cluster EC volume leader chunk repair outcomes since process start (`repaired`, `unrecoverable`, `unavailable`, `not_live`, `fenced`, `failed`, `dropped`) (R12) |
 | `tsdb_chunk_repair_bytes_total` | counter | total chunk bytes written by volume leader chunk repairs since process start (R12) |
 | `tsdb_chunk_repair_queue_depth` | gauge | number of damaged chunks currently queued or actively being repaired on this volume leader (R12) |
+| `tsdb_sfill_objects_total{method}` | counter | cluster EC builds only: settled objects written by the stripe fill worker on this storage server since process start, by fill method (`copied`: 1x copy from the previous UP holder; `decoded`: RS-decoded from k surviving holders) (R9) |
 | `tsdb_disk_class_mismatch` | gauge | number of local `--disk` entries whose runtime `/sys` block-device class detection disagreed with the authoritative class at start (R13) |
 | `tsdb_disk_shared_device` | gauge | 1 while this server is running with `--allow-shared-device` (`cluster.allow.shared.device`), else 0 (R13) |
 | `tsdb_disk_state{store,class}` | gauge | per local `--disk` (`store` is the 32-hex store id, `class` is `nvme`, `ssd`, or `hdd`): live disk state: `0` up, `1` down (missing, probe stalled/errors, or chunk store EIO/ENOSPC), `2` out, `3` destroyed (R13) |

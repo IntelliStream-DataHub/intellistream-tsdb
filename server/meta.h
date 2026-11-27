@@ -247,8 +247,9 @@ struct meta_settings {
     uint32_t young_warn_pct;      /* fast disk fill % warning alert (75, 1..98, <= young_move_pct) */
     uint32_t young_move_pct;      /* fast disk fill % move-off / no-new-placement mark (80, 1..98, < young_high_pct) */
     uint32_t disk_stall_s;        /* disk probe stall before DOWN, s (10, 1..3600) */
+    uint8_t balance;              /* R9 D19: 1 = automatic balancer on (default), 0 = off */
 };
-#define META_SETTINGS_WORDS 38 /* the words of the INIT body before the mode (cluster_settings_encode) */
+#define META_SETTINGS_WORDS 39 /* the words of the INIT body before the mode (cluster_settings_encode) */
 void meta_settings_default(struct meta_settings *s);
 
 /* Metadata descriptor and validation helpers for cluster settings (R14, D25). */
@@ -788,8 +789,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 11
-/* 1 when the entry is one of a build of metadata snapshot version 10 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 12
+/* 1 when the entry is one of a build of metadata snapshot version 11 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,

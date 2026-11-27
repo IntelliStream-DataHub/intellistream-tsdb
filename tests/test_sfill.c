@@ -916,6 +916,111 @@ static void test_version_change_mid_object(void)
     chunk_be_close(be);
 }
 
+/* 10. Balance fill must yield worker threads on PACE_REFUSED without deadlocking a rebuild on the same pool,
+ *     and must refresh its task margin if the job itself is promoted from balance to rebuild mid-object. */
+static void test_balance_yields_to_rebuild(void)
+{
+    char dir[PATH_MAX];
+    chunk_backend *be = make_local_be("balyield", dir, sizeof dir);
+    struct fake_src fs;
+    fake_src_init(&fs, 10, 4, 6, /*prev=*/42, /*prev_up=*/true, be);
+    /* 3 cells per position (cell=4096, k=4 -> 4096 * 10 = 40960 B -> 3 stripes) so cell 0 blocks while cell 1
+     * hits PACE_REFUSED after the rebuild job registers with pace. */
+    fake_obj_build(&fs.objs[0], 40, 4, 2, 4096, 4096 * 10 + 77, 2, 1, 0, 1201);
+    fs.nobjs = 1;
+    fs.read_block = true;
+
+    struct sfill_ops ops = make_ops(&fs);
+    struct sfill *sf = sfill_new_with_ops(&ops);
+
+    /* (a) Pool saturation deadlock regression: 1 shared worker runs a balance job; a rebuild job arrives while
+     * the worker is mid-object -> balance yields, rebuild finishes first, then balance resumes and finishes. */
+    struct sfill_job_cfg bal_cfg = {.volume = 10, .pos = 2, .stripe_version = 2, .prev_node = 42, .leader = 10,
+                                    .ec_k = 4, .ec_m = 2, .margin = PACE_MARGIN_BALANCE, .concurrency = 1};
+    CHECK(sfill_start(sf, &bal_cfg) == 0, "balyield: start balance job");
+
+    pthread_mutex_lock(&fs.mu);
+    uint64_t t0 = now_ms();
+    while (!fs.read_entered && now_ms() - t0 < 3000) {
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 20 * 1000000L;
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec++;
+            dl.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&fs.read_cv, &fs.mu, &dl);
+    }
+    CHECK(fs.read_entered, "balyield: worker did not enter balance read_cell");
+    pthread_mutex_unlock(&fs.mu);
+
+    /* Start a margin-0 rebuild job on the same 1-worker pool: coord_main registers non-balance pace_job_begin_ex. */
+    struct sfill_job_cfg reb_cfg = {.volume = 10, .pos = 3, .stripe_version = 2, .prev_node = 0, .leader = 10,
+                                    .ec_k = 4, .ec_m = 2, .margin = 0, .concurrency = 1};
+    CHECK(sfill_start(sf, &reb_cfg) == 0, "balyield: start rebuild job");
+    /* Wait until rebuild job is registered (report shows total==1 or active) before unblocking balance cell 0. */
+    for (uint64_t w0 = now_ms(); now_ms() - w0 < 1000; ) {
+        struct sfill_report reps[4];
+        uint32_t nr = sfill_report(sf, reps, 4);
+        bool seen = false;
+        for (uint32_t i = 0; i < nr; i++)
+            if (reps[i].volume == 10 && reps[i].pos == 3 && reps[i].total >= 1)
+                seen = true;
+        if (seen)
+            break;
+        struct timespec ts = {0, 10 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+
+    pthread_mutex_lock(&fs.mu);
+    fs.read_block = false;
+    pthread_cond_broadcast(&fs.read_cv);
+    pthread_mutex_unlock(&fs.mu);
+
+    CHECK(wait_whole(sf, 10, 3, 5000, NULL), "balyield: rebuild job deadlocked behind balance worker");
+    CHECK(wait_whole(sf, 10, 2, 5000, NULL), "balyield: balance job did not resume after rebuild finished");
+    verify_chunk_matches_orig(be, 10, 3, &fs.objs[0], "balyield-reb");
+    verify_chunk_matches_orig(be, 10, 2, &fs.objs[0], "balyield-bal");
+
+    /* (b) Promotion livelock regression: balance job on pos 1 promoted in-place to rebuild (margin=1) mid-object. */
+    pthread_mutex_lock(&fs.mu);
+    fs.read_entered = false;
+    fs.read_block = true;
+    pthread_mutex_unlock(&fs.mu);
+
+    struct sfill_job_cfg promo_cfg = {.volume = 10, .pos = 1, .stripe_version = 2, .prev_node = 42, .leader = 10,
+                                      .ec_k = 4, .ec_m = 2, .margin = PACE_MARGIN_BALANCE, .concurrency = 1};
+    CHECK(sfill_start(sf, &promo_cfg) == 0, "balpromo: start balance job");
+    pthread_mutex_lock(&fs.mu);
+    t0 = now_ms();
+    while (!fs.read_entered && now_ms() - t0 < 3000) {
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 20 * 1000000L;
+        if (dl.tv_nsec >= 1000000000L) {
+            dl.tv_sec++;
+            dl.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&fs.read_cv, &fs.mu, &dl);
+    }
+    CHECK(fs.read_entered, "balpromo: worker did not enter balance read_cell");
+    pthread_mutex_unlock(&fs.mu);
+
+    promo_cfg.margin = 1;
+    CHECK(sfill_start(sf, &promo_cfg) == 0, "balpromo: promote balance job to rebuild margin=1");
+    pthread_mutex_lock(&fs.mu);
+    fs.read_block = false;
+    pthread_cond_broadcast(&fs.read_cv);
+    pthread_mutex_unlock(&fs.mu);
+
+    CHECK(wait_whole(sf, 10, 1, 5000, NULL), "balpromo: promoted balance job livelocked on stale task margin");
+    verify_chunk_matches_orig(be, 10, 1, &fs.objs[0], "balpromo");
+
+    sfill_free(sf);
+    fake_src_free(&fs);
+    chunk_be_close(be);
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = NULL;
@@ -956,6 +1061,7 @@ int main(int argc, char **argv)
     test_pagination_filter_and_empty();
     test_readback_verify_and_resume();
     test_version_change_mid_object();
+    test_balance_yields_to_rebuild();
 
     rm_tree(root_dir);
     if (fails > 0) {

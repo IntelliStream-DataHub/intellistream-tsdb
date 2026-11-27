@@ -95,6 +95,7 @@ struct place_settings {
     uint32_t young_high_pct;      /* 90 */
     uint32_t balance_mb_s;        /* 0 (= rebuild_mb_s) */
     uint32_t rebuild_concurrency; /* 4 */
+    uint8_t balance;              /* 1: automatic balancer enabled (D19); 0: off */
 };
 
 void place_settings_default(struct place_settings *s);
@@ -174,6 +175,8 @@ struct place_in {
     uint32_t nvol_logs;
     const struct place_return_cand *return_cands; /* optional OUT-eviction return candidates (NULL/0: none) */
     uint32_t nreturn_cands;
+    uint8_t balance_apply; /* 1: operator `cluster balance --apply` overrides 25% cap & balance=off (D19) */
+    uint8_t balance_gate;  /* 1: caller gates automatic balance_plan when no trigger is armed (0: evaluate) */
 };
 
 /* Kinds of proposals a planner may emit. */
@@ -199,6 +202,7 @@ struct place_prop {
     uint8_t state;           /* MEMBER_STATE: enum meta_member_state */
     uint8_t reason;          /* MEMBER_STATE down reason (timeout/failstop/fault) or filling flag */
     uint8_t is_return;       /* 1 if emitted by place_return (STRIPE_SET take-back or MOVE_CANCEL; CP_RETURN_SET) */
+    uint8_t is_balance;      /* 1 if emitted by balance_plan (D19) */
     int margin;              /* priority margin for ordering/pacing (lower = more endangered) */
 };
 
@@ -223,6 +227,21 @@ int place_out_log(struct place_out *out, const char *fmt, ...) __attribute__((fo
 void pout_plan(const struct place_in *in, struct place_out *out);
 void place_plan(const struct place_in *in, struct place_out *out);
 void balance_plan(const struct place_in *in, struct place_out *out);
+
+/* Read-only summary of the balancer's full plan (used by `tsdb cluster balance` and trigger tracking; pure). */
+struct balance_summary {
+    uint32_t total_pos;    /* total non-learner log + EC stripe positions across replicated volumes */
+    uint32_t max_plan;     /* 25% automatic plan cap (total_pos / 4) */
+    uint32_t max_conc;     /* 5% cluster-wide concurrent cap (max(1, total_pos / 20)) */
+    uint32_t inflight_bal; /* currently in-flight balancer moves (log + stripe) */
+    uint32_t log_moves;    /* planned log replica moves */
+    uint32_t stripe_moves; /* planned EC stripe position moves */
+    uint32_t leader_moves; /* planned leader transfers */
+    uint8_t rebuild_busy;  /* 1 if any rebuild, drain, OUT, fault, or conversion is queued or active */
+    uint8_t over_cap;      /* 1 if (log_moves + stripe_moves + inflight_bal) > max_plan */
+};
+void balance_plan_ex(const struct place_in *in, struct place_out *out, struct balance_summary *sum);
+void balance_plan_summary(const struct place_in *in, struct balance_summary *sum);
 
 /* Computed mass-OUT guard summary (D4): shared by pout_plan and `tsdb cluster status` so they never drift. */
 struct pout_guard {
