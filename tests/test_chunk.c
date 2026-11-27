@@ -26,8 +26,8 @@
  *
  *   test_chunk [DIR]                  DIR is the scratch directory of the other tests
  *   test_chunk --quick                coarser power-loss sweeps (the mutant runs use it)
- *   test_chunk --mutant NAME          plants nosums | nofence | eof | settings | nosync | epochnosync | streamreread:
- *                                     must fail
+ *   test_chunk --mutant NAME          plants nosums | nofence | eof | settings | nosync | epochnosync | streamreread |
+ *                                     m0parity: must fail
  */
 #include "internal.h"
 #include "chunk.h"
@@ -132,6 +132,22 @@ static void test_geometry(void)
     CHECK(chunk_geom_derive(&g, 4, 2, 1) == 0 && g.k == 1 && chunk_pos_len(&g, 1) == 1);
     CHECK(chunk_geom_derive(&g, 0, 2, 100) == TSDB_ERR_INVALID && chunk_geom_derive(&g, 17, 2, 100) == TSDB_ERR_INVALID);
     CHECK(chunk_geom_derive(&g, 4, 0, 100) == TSDB_ERR_INVALID && chunk_geom_derive(&g, 4, 5, 100) == TSDB_ERR_INVALID);
+    /* m = 0 (single-copy, D5): accepted ONLY with k = 1; every other k refused even when len fits in 1 cell */
+    CHECK(chunk_geom_derive(&g, 1, 0, 1) == 0 && g.k == 1 && g.m == 0 && chunk_npos(&g) == 1 && chunk_pos_len(&g, 0) == 1);
+    CHECK(chunk_geom_derive(&g, 1, 0, 10000) == 0 && g.k == 1 && g.m == 0 && g.cell == CHUNK_CELL_MIN &&
+          chunk_pos_len(&g, 0) == 10000 && chunk_sums_total(&g) == 1);
+    CHECK(chunk_geom_derive(&g, 1, 0, 10u << 20) == 0 && g.k == 1 && g.m == 0 && g.cell == CHUNK_CELL_MAX &&
+          chunk_pos_len(&g, 0) == (10u << 20) && chunk_sums_total(&g) == 10 && chunk_npos(&g) == 1);
+    for (unsigned badk = 0; badk <= CHUNK_K_MAX; badk++) {
+        if (badk == 1)
+            continue;
+        CHECK(chunk_geom_derive(&g, badk, 0, 100) == TSDB_ERR_INVALID);
+        CHECK(chunk_geom_derive(&g, badk, 0, 1u << 20) == TSDB_ERR_INVALID);
+        CHECK(chunk_geom_make(&g, badk, 0, 64, 2000) == TSDB_ERR_INVALID);
+    }
+    CHECK(chunk_geom_make(&g, 1, 0, 64, 200) == 0 && g.k == 1 && g.m == 0 && chunk_npos(&g) == 1 &&
+          chunk_pos_cells(&g, 0) == 4 && chunk_pos_len(&g, 0) == 200 && chunk_sums_total(&g) == 4 &&
+          chunk_pos_cells(&g, 1) == 0 && chunk_pos_len(&g, 1) == 0);
     CHECK(chunk_geom_derive(&g, 4, 2, 0) == TSDB_ERR_INVALID);
     CHECK(chunk_geom_make(&g, 4, 2, 64, 100) == TSDB_ERR_INVALID); /* 2 cells cannot feed 4 data chunks */
     CHECK(chunk_geom_make(&g, 2, 2, 64, 100) == 0 && chunk_geom_make(&g, 2, 2, 0, 100) == TSDB_ERR_INVALID);
@@ -245,7 +261,7 @@ static void check_layout(const msrc *m, const uint8_t *obj)
     }
     /* with k' = 1 every parity chunk is as long as the data chunk (m + 1 copies by construction; the first parity row of
        the generator is all ones, so that one is byte for byte the data) */
-    if (g->k == 1) {
+    if (g->k == 1 && g->m > 0) {
         for (unsigned j = 0; j < g->m; j++)
             CHECK(m->clen[1 + j] == m->clen[0]);
         CHECK(memcmp(m->cells[1], m->cells[0], m->clen[0]) == 0);
@@ -2337,6 +2353,368 @@ static void test_stream_put(void)
            shapes, aborts);
 }
 
+/* Single-copy (m = 0, k' = 1, D5): encode, image, range reads, every damage kind, DOWN store, heal/repair/replace. */
+static int m0_count_dir_chunks(const char *store_path, uint32_t vol)
+{
+    char d[PATH_MAX + 64];
+    snprintf(d, sizeof d, "%s/s%u", store_path, vol);
+    DIR *dir = opendir(d);
+    if (!dir)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (l >= 7 && strcmp(e->d_name + l - 6, ".chunk") == 0)
+            n++;
+    }
+    closedir(dir);
+    return n;
+}
+
+static int m0_stream_fill(void *ctx, uint64_t s, uint64_t off, uint8_t *buf, size_t len)
+{
+    (void)s;
+    memcpy(buf, (const uint8_t *)ctx + off, len);
+    return 0;
+}
+
+static void test_single_copy(void)
+{
+    /* 1. Encode (memory + stream + stripe) and chunk image round trip across shapes */
+    static const struct {
+        uint32_t cell;
+        uint64_t len;
+    } shapes[] = {{64, 1}, {64, 37}, {64, 64}, {48, 48 * 4 + 19}, {CHUNK_CELL_MIN, CHUNK_CELL_MIN * 3 + 777}};
+    for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++) {
+        chunk_geom g;
+        CHECK(chunk_geom_make(&g, 1, 0, shapes[si].cell, shapes[si].len) == 0);
+        uint8_t *obj = malloc((size_t)g.len);
+        fill(obj, (size_t)g.len);
+        msrc ms;
+        ms_build(&ms, &g, obj);
+        check_layout(&ms, obj);
+        CHECK(chunk_npos(&g) == 1 && ms.clen[0] == g.len && memcmp(ms.cells[0], obj, (size_t)g.len) == 0);
+        for (uint64_t c = 0; c < chunk_ncells(&g); c++) {
+            uint64_t cl = chunk_cell_len(&g, c);
+            uint64_t want = xxh64(obj + c * g.cell, (size_t)cl, 0);
+            CHECK(ms.sums[0][c] == want && ms.rec[c] == want);
+        }
+        /* chunk_encode_stream matches chunk_encode byte for byte and sum for sum */
+        uint64_t *ssums = calloc(chunk_sums_total(&g) + 1, 8);
+        chunk_put_src psrc = {obj, m0_stream_fill};
+        CHECK(chunk_encode_stream(&g, &psrc, NULL, NULL, ssums) == 0);
+        CHECK(memcmp(ssums, ms.rec, (size_t)chunk_sums_total(&g) * 8) == 0);
+        free(ssums);
+
+        /* chunk image round trip + header checks for m = 0 */
+        chunk_hdr h;
+        memset(&h, 0, sizeof h);
+        memset(h.vuuid, 0x33, 16);
+        memset(h.oid, 0x44, 16);
+        h.epoch = 9;
+        h.g = g;
+        h.pos = 0;
+        h.chunk_len = g.len;
+        size_t in = 0;
+        uint8_t *img = chunk_image_build(&h, ms.cells[0], ms.sums[0], &in);
+        CHECK(img && in == chunk_file_size(&g, 0));
+        chunk_hdr back;
+        const uint8_t *cells, *sums;
+        CHECK(chunk_image_parse(img, in, true, &back, &cells, &sums) == 0);
+        CHECK(back.g.k == 1 && back.g.m == 0 && back.pos == 0 && back.chunk_len == g.len);
+        if (si == 3) {
+            /* crafted m = 0 headers with k = 2 (matching k = 2 chunk_len so ONLY the m = 0 geometry rule rejects it)
+             * or pos = 1 must be rejected by chunk_hdr_decode */
+            uint8_t badhdr[CHUNK_HDR_BYTES];
+            memcpy(badhdr, img, CHUNK_HDR_BYTES);
+            badhdr[64] = 2; /* k = 2 with m = 0 */
+            chunk_put_le64(badhdr + 88, 2 * g.cell + (g.len - 4 * g.cell)); /* pos 0 cells 0, 2, 4 for k = 2 */
+            CHECK(chunk_hdr_decode(badhdr, &back) == TSDB_ERR_CORRUPT);
+            memcpy(badhdr, img, CHUNK_HDR_BYTES);
+            badhdr[68] = 1; /* pos = 1 with m = 0 */
+            CHECK(chunk_hdr_decode(badhdr, &back) == TSDB_ERR_CORRUPT);
+        }
+        free(img);
+
+        /* 2. In-memory range reads: healthy, cell corruption, absent/ioerr/trunc, DOWN */
+        chunk_source src = ms_source(&ms);
+        range rg[64];
+        size_t nr = make_ranges(&g, rg, 64);
+        uint8_t *buf = malloc((size_t)g.len + 1);
+        for (size_t ri = 0; ri < nr; ri++) {
+            for (int use_rec = 0; use_rec < 2; use_rec++) {
+                chunk_report rep;
+                memset(buf, 0xA5, (size_t)rg[ri].len);
+                CHECK(chunk_read_range(&src, &g, use_rec ? ms.rec : NULL, rg[ri].off, rg[ri].len, buf, 0, &rep) == 0);
+                CHECK(memcmp(buf, obj + rg[ri].off, (size_t)rg[ri].len) == 0);
+                CHECK(rep.decoded_cells == 0 && rep.bad_cells == 0);
+            }
+            chunk_report rep;
+            memset(buf, 0xA5, (size_t)rg[ri].len);
+            CHECK(chunk_read_range(&src, &g, NULL, rg[ri].off, rg[ri].len, buf, CHUNK_RR_RAW, &rep) == 0);
+            CHECK(memcmp(buf, obj + rg[ri].off, (size_t)rg[ri].len) == 0 && rep.decoded_cells == 0);
+        }
+        if (si == 3) {
+            /* flip byte in cell 1 (offset 48 + 7): reads touching cell 1 -> CORRUPT, never fabricated (kills m0parity) */
+            ms.cells[0][g.cell + 7] ^= 0x55;
+            for (int use_rec = 0; use_rec < 2; use_rec++) {
+                chunk_report rep;
+                memset(buf, 0xA5, (size_t)g.len);
+                int rc = chunk_read_range(&src, &g, use_rec ? ms.rec : NULL, g.cell, g.cell, buf, 0, &rep);
+                CHECK(rc == TSDB_ERR_CORRUPT);
+                CHECK(rep.st[0] == CHUNK_ST_DAMAGED && rep.bad_cells == 1 && rep.decoded_cells == 0);
+                for (uint32_t j = 0; j < g.cell; j++)
+                    CHECK(buf[j] == 0xA5); /* never fabricated */
+            }
+            /* undamaged cell 0 and cells 2..4 still read cleanly */
+            CHECK(chunk_read_range(&src, &g, ms.rec, 0, g.cell, buf, 0, NULL) == 0 &&
+                  memcmp(buf, obj, g.cell) == 0);
+            CHECK(chunk_read_range(&src, &g, ms.rec, 2 * g.cell, g.len - 2 * g.cell, buf, 0, NULL) == 0 &&
+                  memcmp(buf, obj + 2 * g.cell, (size_t)(g.len - 2 * g.cell)) == 0);
+            ms.cells[0][g.cell + 7] ^= 0x55;
+
+            /* absent / ioerr / damaged -> CORRUPT; DOWN -> UNAVAILABLE (checked and RAW) */
+            int errs[3] = {CHUNK_ST_ABSENT, CHUNK_ST_IOERR, CHUNK_ST_DAMAGED};
+            for (int ei = 0; ei < 3; ei++) {
+                ms.fail[0] = errs[ei];
+                chunk_report rep;
+                memset(buf, 0xA5, (size_t)g.len);
+                CHECK(chunk_read_range(&src, &g, ms.rec, 0, g.len, buf, 0, &rep) == TSDB_ERR_CORRUPT);
+                CHECK(rep.decoded_cells == 0 && buf[0] == 0xA5);
+            }
+            ms.fail[0] = CHUNK_ST_DOWN;
+            for (int raw = 0; raw < 2; raw++) {
+                chunk_report rep;
+                memset(buf, 0xA5, (size_t)g.len);
+                int rc = chunk_read_range(&src, &g, raw ? NULL : ms.rec, 0, g.len, buf, raw ? CHUNK_RR_RAW : 0, &rep);
+                CHECK(rc == TSDB_ERR_UNAVAILABLE && rep.st[0] == CHUNK_ST_DOWN && rep.decoded_cells == 0);
+                CHECK(buf[0] == 0xA5);
+            }
+            ms.fail[0] = 0;
+        }
+        free(buf);
+        ms_free(&ms);
+        free(obj);
+    }
+
+    /* 3. Files on a 3-store backend: placement at chunk_be_place(oid, 0), every damage kind, DOWN store, heal/repair/replace */
+    char dir[PATH_MAX + 32], stp[3][PATH_MAX + 64];
+    const char *pp[3];
+    uint8_t ids[3 * 16];
+    fresh("m0-be", dir, sizeof dir);
+    for (int i = 0; i < 3; i++) {
+        snprintf(stp[i], sizeof stp[i], "%s/st%d", dir, i);
+        pp[i] = stp[i];
+        CHECK(chunk_store_init(stp[i], NULL, ids + 16 * i) == 0);
+    }
+    chunk_backend *be = NULL;
+    chunk_be_opts opt_all = {.min_up = 3};
+    CHECK(chunk_be_open2(&be, pp, 3, ids, &opt_all) == 0);
+    uint8_t vuuid[16];
+    chunk_random(vuuid, 16);
+    const uint32_t vol = 5;
+
+    /* Put 12 m = 0 objects (guaranteeing objects land across all 3 stores) */
+    uint8_t oids[12][16];
+    uint8_t *objs[12];
+    uint64_t *recs[12];
+    chunk_geom gs[12];
+    int placed[12];
+    int per_store[3] = {0, 0, 0};
+    for (int i = 0; i < 12; i++) {
+        CHECK(chunk_geom_make(&gs[i], 1, 0, 64, 64 * 4 + 13 + (uint64_t)i * 7) == 0);
+        objs[i] = malloc((size_t)gs[i].len);
+        fill(objs[i], (size_t)gs[i].len);
+        recs[i] = calloc(chunk_sums_total(&gs[i]) + 1, 8);
+        /* Pick oid so first 3 objects cover stores 0, 1, 2 deterministically */
+        do {
+            chunk_random(oids[i], 16);
+            placed[i] = chunk_be_place(be, oids[i], 0);
+        } while (i < 3 && placed[i] != i);
+        per_store[placed[i]]++;
+        if (i & 1) {
+            chunk_put_src psrc = {objs[i], m0_stream_fill};
+            CHECK(chunk_be_put_stream(be, vol, vuuid, oids[i], &gs[i], 2, &psrc, ~0u, recs[i]) == 0);
+        } else {
+            CHECK(chunk_be_put_object(be, vol, vuuid, oids[i], &gs[i], 2, objs[i], ~0u, recs[i]) == 0);
+        }
+        /* Chunk must exist ONLY on chunk_be_place(be, oid, 0) */
+        char hex[33], p[sizeof stp[0] + 64];
+        chunk_oid_hex(oids[i], hex);
+        for (int s = 0; s < 3; s++) {
+            snprintf(p, sizeof p, "%s/s%u/o%s.0.chunk", pp[s], vol, hex);
+            CHECK((access(p, F_OK) == 0) == (s == placed[i]));
+        }
+    }
+    for (int s = 0; s < 3; s++)
+        CHECK(m0_count_dir_chunks(stp[s], vol) == per_store[s]);
+
+    /* Read all 12 objects (full + ranges, checked + RAW, with + without expect/rec_sums) */
+    for (int i = 0; i < 12; i++) {
+        chunk_obj *o = NULL;
+        CHECK(chunk_obj_open(be, vol, vuuid, oids[i], (i & 1) ? &gs[i] : NULL, (i & 1) ? recs[i] : NULL, &o) == 0);
+        CHECK(chunk_obj_geom(o)->k == 1 && chunk_obj_geom(o)->m == 0 && chunk_obj_geom(o)->len == gs[i].len);
+        uint8_t *buf = malloc((size_t)gs[i].len);
+        CHECK(chunk_obj_read(o, 0, gs[i].len, buf, 0, NULL) == 0 && memcmp(buf, objs[i], (size_t)gs[i].len) == 0);
+        CHECK(chunk_obj_read(o, 50, 100, buf, 0, NULL) == 0 && memcmp(buf, objs[i] + 50, 100) == 0);
+        CHECK(chunk_obj_read(o, 50, 100, buf, CHUNK_RR_RAW, NULL) == 0 && memcmp(buf, objs[i] + 50, 100) == 0);
+        chunk_obj_close(o);
+        free(buf);
+    }
+
+    /* Every damage kind on disk for object 0 (on store 0): read error + repair reports damage and changes nothing */
+    char hex0[33], f0[sizeof stp[0] + 64];
+    chunk_oid_hex(oids[0], hex0);
+    snprintf(f0, sizeof f0, "%s/s%u/o%s.0.chunk", stp[0], vol, hex0);
+    size_t orig0_n = 0;
+    uint8_t *orig0 = slurp(f0, &orig0_n);
+    CHECK(orig0 && orig0_n == chunk_file_size(&gs[0], 0));
+    chunk_ident id0 = {.volume = vol, .pos = 0};
+    memcpy(id0.vuuid, vuuid, 16);
+    memcpy(id0.oid, oids[0], 16);
+    chunk_heal_opts ho = {.epoch = 2, .scrub = true};
+    chunk_heal_report hrep;
+    /* Whole object: repair reports chunks_ok == 1 */
+    CHECK(chunk_be_repair(be, &id0, &ho, &hrep) == 0 && hrep.objects == 1 && hrep.chunks_ok == 1 &&
+          hrep.unrecoverable == 0);
+
+    enum { M0D_HDR, M0D_SUMS, M0D_FTR, M0D_CELL, M0D_TRUNC, M0D_EMPTY, M0D_DEL, M0D_KINDS };
+    for (int dk = 0; dk < M0D_KINDS; dk++) {
+        uint8_t *dmg = malloc(orig0_n + 1);
+        memcpy(dmg, orig0, orig0_n);
+        size_t dn = orig0_n;
+        switch (dk) {
+        case M0D_HDR: dmg[20] ^= 0x40; spit(f0, dmg, dn); break;
+        case M0D_SUMS: dmg[CHUNK_HDR_BYTES + gs[0].len + 2] ^= 0x40; spit(f0, dmg, dn); break;
+        case M0D_FTR: dmg[dn - 4] ^= 0x40; spit(f0, dmg, dn); break;
+        case M0D_CELL: dmg[CHUNK_HDR_BYTES + 10] ^= 0x40; spit(f0, dmg, dn); break;
+        case M0D_TRUNC: dn -= 9; spit(f0, dmg, dn); break;
+        case M0D_EMPTY: dn = 0; spit(f0, dmg, dn); break;
+        case M0D_DEL: unlink(f0); break;
+        }
+        chunk_obj *o = NULL;
+        int orc = chunk_obj_open(be, vol, vuuid, oids[0], &gs[0], recs[0], &o);
+        if (dk == M0D_CELL) {
+            CHECK(orc == 0 && o != NULL);
+            uint8_t *buf = malloc((size_t)gs[0].len);
+            memset(buf, 0xA5, (size_t)gs[0].len);
+            chunk_report rrep;
+            CHECK(chunk_obj_read(o, 0, gs[0].len, buf, 0, &rrep) == TSDB_ERR_CORRUPT);
+            CHECK(rrep.decoded_cells == 0 && rrep.st[0] == CHUNK_ST_DAMAGED && buf[0] == 0xA5);
+            chunk_obj_close(o);
+            free(buf);
+        } else if (dk == M0D_DEL) {
+            CHECK(orc == TSDB_ERR_NOTFOUND);
+        } else {
+            CHECK(orc == TSDB_ERR_CORRUPT);
+        }
+        /* repair reports damage as unrecoverable and changes nothing on disk (objects == 1 when header identifies m=0) */
+        CHECK(chunk_be_repair(be, &id0, &ho, &hrep) == 0);
+        uint64_t want_obj = (dk == M0D_SUMS || dk == M0D_FTR || dk == M0D_CELL) ? 1 : 0;
+        CHECK(hrep.objects == want_obj && hrep.unrecoverable == 1 && hrep.chunks_ok == 0 && hrep.rebuilt_missing == 0 &&
+              hrep.rebuilt_damaged == 0 && hrep.bytes == 0);
+        if (dk == M0D_DEL) {
+            CHECK(access(f0, F_OK) != 0); /* never writes an empty chunk */
+        } else {
+            size_t after_n = 0;
+            uint8_t *after = slurp(f0, &after_n);
+            CHECK(after_n == dn && (dn == 0 || (after && memcmp(after, dmg, dn) == 0)));
+            free(after);
+        }
+        /* heal on store 0 also reports the damaged m = 0 object as unrecoverable (for on-disk files) */
+        if (dk != M0D_DEL) {
+            CHECK(chunk_be_heal(be, vol, 0, &ho, &hrep) == 0);
+            CHECK(hrep.objects == (uint64_t)per_store[0] && hrep.chunks_ok == (uint64_t)per_store[0] - 1 &&
+                  hrep.unrecoverable == 1 && hrep.rebuilt_missing == 0 && hrep.rebuilt_damaged == 0 && hrep.bytes == 0);
+        }
+        spit(f0, orig0, orig0_n); /* restore */
+        free(dmg);
+    }
+    free(orig0);
+
+    /* Store DOWN: min_up = 3 refuses; min_up = 2 makes store 0's m = 0 objects UNAVAILABLE while stores 1-2 read exact */
+    chunk_be_close(be);
+    be = NULL;
+    const char *pp_down0[3] = {NULL, stp[1], stp[2]};
+    CHECK(chunk_be_open2(&be, pp_down0, 3, ids, &opt_all) == TSDB_ERR_UNAVAILABLE);
+    chunk_be_opts opt_two = {.min_up = 2};
+    CHECK(chunk_be_open2(&be, pp_down0, 3, ids, &opt_two) == 0);
+    for (int i = 0; i < 12; i++) {
+        chunk_obj *o = NULL;
+        int orc = chunk_obj_open(be, vol, vuuid, oids[i], &gs[i], recs[i], &o);
+        if (placed[i] == 0) {
+            CHECK(orc == TSDB_ERR_UNAVAILABLE);
+            CHECK(chunk_obj_open(be, vol, vuuid, oids[i], NULL, NULL, &o) == TSDB_ERR_UNAVAILABLE);
+        } else {
+            CHECK(orc == 0 && o != NULL);
+            uint8_t *buf = malloc((size_t)gs[i].len);
+            CHECK(chunk_obj_read(o, 0, gs[i].len, buf, 0, NULL) == 0 && memcmp(buf, objs[i], (size_t)gs[i].len) == 0);
+            chunk_obj_close(o);
+            free(buf);
+        }
+    }
+    /* Put targeting DOWN store 0 is refused with UNAVAILABLE */
+    CHECK(chunk_be_put_object(be, vol, vuuid, oids[0], &gs[0], 3, objs[0], ~0u, NULL) == TSDB_ERR_UNAVAILABLE);
+    /* Damaged m = 0 object on UP store 1 with expect returns CORRUPT even while store 0 is DOWN */
+    char hex1[33], f1[sizeof stp[1] + 64];
+    chunk_oid_hex(oids[1], hex1);
+    snprintf(f1, sizeof f1, "%s/s%u/o%s.0.chunk", stp[1], vol, hex1);
+    size_t orig1_n = 0;
+    uint8_t *orig1 = slurp(f1, &orig1_n);
+    uint8_t *bad1 = malloc(orig1_n);
+    memcpy(bad1, orig1, orig1_n);
+    bad1[20] ^= 0x80;
+    spit(f1, bad1, orig1_n);
+    chunk_obj *o1 = NULL;
+    CHECK(chunk_obj_open(be, vol, vuuid, oids[1], &gs[1], recs[1], &o1) == TSDB_ERR_CORRUPT);
+    spit(f1, orig1, orig1_n);
+    free(bad1);
+    free(orig1);
+
+    /* Attach store 0 back (the put above raised the volume fence to 3): its m = 0 objects are checked and intact */
+    ho.epoch = 3;
+    CHECK(chunk_be_attach(be, 0, stp[0], ids, &ho, &hrep) == 0);
+    CHECK(chunk_be_store_state(be, 0) == CHUNK_STORE_UP && hrep.chunks_ok == (uint64_t)per_store[0] &&
+          hrep.unrecoverable == 0 && hrep.rebuilt_missing == 0);
+
+    /* Replace a failed-in-service store holding m = 0 objects: counts them unrecoverable, never writes an empty chunk */
+    chunk_store *st0 = chunk_be_store(be, 0);
+    CHECK(st0 != NULL);
+    if (st0)
+        chunk_store_test_fail(st0);
+    CHECK(chunk_be_store_state(be, 0) == CHUNK_STORE_DOWN_IOERR);
+    char np0[sizeof dir + 32];
+    snprintf(np0, sizeof np0, "%s/st0-new", dir);
+    uint8_t newid[16];
+    CHECK(chunk_be_replace(be, 0, np0, newid, &ho, &hrep) == 0);
+    CHECK(chunk_be_store_state(be, 0) == CHUNK_STORE_UP);
+    CHECK(hrep.unrecoverable == (uint64_t)per_store[0] && hrep.rebuilt_missing == 0 && hrep.rebuilt_damaged == 0 &&
+          hrep.bytes == 0);
+    CHECK(m0_count_dir_chunks(np0, vol) == 0); /* never an empty chunk */
+    /* Objects on stores 1 and 2 remain intact and readable */
+    for (int i = 0; i < 12; i++) {
+        chunk_obj *o = NULL;
+        int orc = chunk_obj_open(be, vol, vuuid, oids[i], &gs[i], recs[i], &o);
+        if (placed[i] == 0) {
+            CHECK(orc == TSDB_ERR_NOTFOUND);
+        } else {
+            CHECK(orc == 0 && o != NULL);
+            uint8_t *buf = malloc((size_t)gs[i].len);
+            CHECK(chunk_obj_read(o, 0, gs[i].len, buf, 0, NULL) == 0 && memcmp(buf, objs[i], (size_t)gs[i].len) == 0);
+            chunk_obj_close(o);
+            free(buf);
+        }
+    }
+
+    chunk_be_close(be);
+    for (int i = 0; i < 12; i++) {
+        free(objs[i]);
+        free(recs[i]);
+    }
+    printf("  single-copy (m = 0, k' = 1): encode, image, range reads, all damage kinds, DOWN store, heal/repair/attach/replace\n");
+}
+
 /* ---------------------------------------------------------------- main */
 static void set_mutant(const char *m)
 {
@@ -2354,6 +2732,8 @@ static void set_mutant(const char *m)
         chunk_mutant = CHUNK_MUT_EPOCH_NOSYNC;
     else if (!strcmp(m, "streamreread"))
         chunk_mutant = CHUNK_MUT_STREAM_REREAD;
+    else if (!strcmp(m, "m0parity"))
+        chunk_mutant = CHUNK_MUT_M0_PARITY;
     else {
         fprintf(stderr, "test_chunk: no mutant %s\n", m);
         exit(2);
@@ -2716,6 +3096,7 @@ int main(int argc, char **argv)
     test_other_encoding();
     test_geometry_from_object();
     test_short_read();
+    test_single_copy();
     quiet(false);
     test_args_and_writer();
     test_stores();

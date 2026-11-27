@@ -62,14 +62,16 @@ enum { CHUNK_ST_OK = 0, CHUNK_ST_ABSENT, CHUNK_ST_DAMAGED, CHUNK_ST_IOERR, CHUNK
 
 /* ---------------------------------------------------------------- geometry */
 typedef struct chunk_geom {
-    uint16_t k;    /* data chunks (k'), 1 .. CHUNK_K_MAX, at most the number of cells */
-    uint16_t m;    /* parity chunks, 1 .. CHUNK_M_MAX */
+    uint16_t k;    /* data chunks (k'), 1 .. CHUNK_K_MAX, at most the number of cells (with m = 0: always 1) */
+    uint16_t m;    /* parity chunks, 0 .. CHUNK_M_MAX (m = 0 only with k = 1: single copy, D5) */
     uint32_t cell; /* cell bytes */
     uint64_t len;  /* object bytes, at least 1 */
 } chunk_geom;
 
 /* E7: the cell size of an object of `len` bytes on a volume of k data chunks: clamp(len / (8k), 64 KiB, 1 MiB),
- * rounded up to 4 KiB (before the clamp); k' = min(k, cells). TSDB_ERR_INVALID for k or m out of range or len 0. */
+ * rounded up to 4 KiB (before the clamp); k' = min(k, cells). m = 0 is accepted only with k = 1 (single copy, D5: one
+ * chunk holding the whole object, cells and encode-time sums as today, no RS codec call). TSDB_ERR_INVALID for k or m
+ * out of range (including m = 0 with k != 1) or len 0. */
 int chunk_geom_derive(chunk_geom *g, unsigned k, unsigned m, uint64_t len);
 /* The geometry an object record or a header names (k' already derived), checked: 0 or TSDB_ERR_INVALID. */
 int chunk_geom_make(chunk_geom *g, unsigned k, unsigned m, uint32_t cell, uint64_t len);
@@ -217,11 +219,14 @@ enum {
 const char *chunk_store_state_name(int state);
 
 /* How a backend opens. min_up is the number of stores that must be UP: the caller derives it from its geometry, at
- * least k' of every object it holds (so each stays readable; with m = 0 every store), and for a cluster or a tier
- * that is the stores minus m, not less. A store that cannot be used becomes DOWN with its reason (one line on stderr
- * naming the index, the path and the reason); fewer than min_up UP is TSDB_ERR_UNAVAILABLE naming the down ones.
- * Never DOWN, always a failed open: CHUNK_ERR_BUSY (another owner: two owners would write the fence back lower),
- * and the same directory or store id twice (TSDB_ERR_INVALID). min_up 0: any number of stores, even none, may be up. */
+ * least k' of every object it holds (so each stays readable), and for a cluster or a tier that is the stores minus m,
+ * not less. For a backend holding m = 0 (single-copy) objects, callers should normally set min_up to every store (n):
+ * losing any store makes the single-copy objects placed on it unavailable (a lower min_up is allowed only when the
+ * caller explicitly wants surviving stores to remain readable). A store that cannot be used becomes DOWN with its
+ * reason (one line on stderr naming the index, the path and the reason); fewer than min_up UP is TSDB_ERR_UNAVAILABLE
+ * naming the down ones. Never DOWN, always a failed open: CHUNK_ERR_BUSY (another owner: two owners would write the
+ * fence back lower), and the same directory or store id twice (TSDB_ERR_INVALID). min_up 0: any number of stores, even
+ * none, may be up. */
 typedef struct chunk_be_opts {
     int min_up;
 } chunk_be_opts;
@@ -289,7 +294,9 @@ typedef struct chunk_heal_report {
     uint64_t rebuilt_damaged;  /* chunks replaced that did not parse, or (scrub) had a cell failing its sum */
     uint64_t unrecoverable;    /* objects that need a rebuild and have fewer than k' good positions even counting the
                                 * positions on DOWN stores: nothing is written for them, what is there is kept. This also
-                                * counts the remains of a deleted object (E14's orphans: never rebuilt) */
+                                * counts the remains of a deleted object (E14's orphans: never rebuilt), damaged or
+                                * lost m = 0 (single-copy) objects, and conservatively any damaged-header pos-0 chunk
+                                * present only on the target store (indistinguishable from a damaged m = 0 object) */
     uint64_t unavailable;      /* objects that need a rebuild and could have it once a DOWN store (one other than the
                                 * target, and not a REPLACING one: what those lack is what heals make) is back: E15's
                                 * unavailable, not lost */
@@ -300,20 +307,25 @@ typedef struct chunk_heal_report {
 } chunk_heal_report;
 
 /* Heals one volume of the store at index `store` (UP or REPLACING). The objects are those that the listings of the OTHER
- * stores name (a chunk found only here is an orphan: never a reason to rebuild), geometry and epoch from their
- * headers. 0 when it ran through, whatever the report says; a negative code when it could not start (the store is
- * DOWN or failed, the epoch is fenced or unsure) or a listing failed. Meant for a quiet volume: a put in flight may be
- * counted unrecoverable or rebuilt twice with the same bytes. A deletion in flight must be the caller's to order
- * (`live`). Never fabricated, never resurrected: an object with fewer than k' good positions is not rebuilt (the remains
- * of an object deleted while a store was away are orphans, E14's), but for k' = 1 a single copy decodes, so the layer
- * cannot tell an orphan from a survivor: a caller that deletes objects passes `live`.
+ * stores name (an m > 0 chunk whose header parses and is found only here is an orphan: never a reason to rebuild), plus
+ * single-copy (m = 0) chunks on `store` itself (which have no other position to rebuild from: whole ones count as
+ * chunks_ok, damaged ones are reported as unrecoverable and left untouched; a damaged-header pos-0 chunk present only on
+ * `store` cannot be distinguished from a damaged m = 0 object and is conservatively counted as unavailable while another
+ * store is DOWN, or unrecoverable when all other stores are open). Geometry and epoch come from the headers. 0 when it
+ * ran through, whatever the report says; a negative code when it could not start (the store is DOWN or failed, the
+ * epoch is fenced or unsure) or a listing failed. Meant for a quiet volume: a put in flight may be counted
+ * unrecoverable or rebuilt twice with the same bytes. A deletion in flight must be the caller's to order (`live`).
+ * Never fabricated, never resurrected: an object with fewer than k' good positions is not rebuilt (the remains of an
+ * object deleted while a store was away are orphans, E14's), but for k' = 1 with m > 0 a single copy decodes, so the
+ * layer cannot tell an orphan from a survivor: a caller that deletes objects passes `live`.
  * The listing is taken once, from the stores that are open: an object that only a DOWN store lists is not seen (it is
  * neither unavailable nor unrecoverable here; chunk_be_settle therefore does not promote while another store is DOWN),
  * and a degraded put (a posmask that skipped this store) that lands after the listing is not seen either: whoever
  * puts degraded heals the store again after it is UP. */
 int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_heal_opts *o, chunk_heal_report *rep);
 /* The chunk `id` (volume, vuuid, oid, pos) in the store its position is placed on, which a read or a scrub found
- * damaged: always checks its cells. 0 with rep->chunks_ok = 1 if it is whole, else as heal. */
+ * damaged: always checks its cells. 0 with rep->chunks_ok = 1 if it is whole, else as heal. For an m = 0 (single-copy)
+ * object there is nothing to rebuild from: damage is reported in rep->unrecoverable and nothing on disk is changed. */
 int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_opts *o, chunk_heal_report *rep);
 /* Heals every volume the backend knows on the store; a REPLACING store becomes UP only if nothing was unavailable
  * or failed and no other store is DOWN (objects that only that store lists were never seen; a REPLACING one does not
@@ -335,9 +347,15 @@ int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_
  * (the TIERS file, later the metadata group); the index is unchanged, so the new store takes exactly the old one's
  * positions. Refused (TSDB_ERR_INVALID) for a store that is UP. 0 when it is UP at the end; TSDB_ERR_UNAVAILABLE when
  * it was filled as far as the other stores allow and stays REPLACING (call chunk_be_settle again later); the id is
- * given in both cases. The new store holds every fence in its chunk writes from the first byte; its EPOCH file may be
- * one fence behind for the moment between the raise and the install (a chunk_be_see_epoch in between reaches the open
- * stores only), which nothing relies on: wr_open raises it before a chunk is written. A replace that died halfway leaves new_path behind: replace again at another path. */
+ * given in both cases. Single-copy (m = 0) objects on a retiring store that failed in service (still open for reads)
+ * are enumerated via its open dirfd and counted in rep->unrecoverable (any listing/read failure on it is reported in
+ * rep->failed on this chunk_be_replace call; a later chunk_be_settle does not re-enumerate the retired store), never
+ * written as empty chunks; when the retiring store is DOWN_MISSING, DOWN_OTHER_ID or DOWN_DAMAGED (cannot be opened),
+ * chunk_be_replace cannot enumerate lost m = 0 objects (only the caller's catalog knows which were placed on that
+ * index) and logs a note to stderr. The new store holds every fence in its chunk writes from the first byte; its
+ * EPOCH file may be one fence behind for the moment between the raise and the install (a chunk_be_see_epoch in between
+ * reaches the open stores only), which nothing relies on: wr_open raises it before a chunk is written. A replace that
+ * died halfway leaves new_path behind: replace again at another path. */
 int chunk_be_replace(chunk_backend *be, int index, const char *new_path, uint8_t new_id_out[16], const chunk_heal_opts *o,
                      chunk_heal_report *rep);
 
@@ -349,9 +367,10 @@ typedef int (*chunk_cell_fn)(void *ctx, unsigned pos, uint64_t idx, const uint8_
  * entries, or NULL) gets the object record's sums. TSDB_ERR_INVALID without an erasure codec in this build. */
 int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void *ctx, uint64_t *sums_out);
 /* Encodes and puts every position whose bit is set in posmask (all: ~0u) through the backend, position p in store
- * (chunk_be_place + p) mod n (with fewer stores than k' + m positions share a store, and losing it loses more than m
- * of them: only tests do that; R7 passes at least k' + m). Each chunk is durable when this returns 0, and a failure
- * aborts the unfinished ones (those already committed stay: chunks are immutable and an orphan is E14's business). */
+ * (chunk_be_place + p) mod n (with m = 0, k' = 1: the single chunk, position 0, goes to chunk_be_place(be, oid, 0) with
+ * no RS codec call; with fewer stores than k' + m positions share a store, and losing it loses more than m of them:
+ * only tests do that; R7 passes at least k' + m). Each chunk is durable when this returns 0, and a failure aborts the
+ * unfinished ones (those already committed stay: chunks are immutable and an orphan is E14's business). */
 int chunk_be_put_object(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], const uint8_t oid[16],
                         const chunk_geom *g, uint64_t epoch, const uint8_t *obj, unsigned posmask, uint64_t *sums_out);
 /* The object's bytes for a one-pass put (E26). fill() writes bytes [off, off + len) of the object, which are stripe s
@@ -440,7 +459,8 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_HEAL_COUNT_TARGET, /* the target's own absent positions count as a store that is away */
        CHUNK_MUT_SETTLE_UP_ALWAYS, /* a REPLACING store goes UP whatever the heal said */
        /* tests/test_chunk.c again */
-       CHUNK_MUT_STREAM_REREAD     /* a stream put reads the source a second time for the parity */ };
+       CHUNK_MUT_STREAM_REREAD,    /* a stream put reads the source a second time for the parity */
+       CHUNK_MUT_M0_PARITY         /* a reader calls chunk_rs_get for m = 0 (fails NOMEM instead of CORRUPT/UNAVAILABLE) */ };
 extern int chunk_mutant;
 /* Non-zero: chunk_read_range and chunk_obj_open do not log (a fuzz harness provokes the refusal by the million). */
 extern int chunk_log_quiet;

@@ -1576,6 +1576,304 @@ static void test_threads_replace(void)
            s.nextra);
 }
 
+/* Single-copy (m = 0, k' = 1, D5): heal, repair, attach, replace, settle on m = 0 objects (mixed with 4+2 and solo). */
+static void test_single_copy_heal(void)
+{
+    world w;
+    world_build(&w, "m0heal");
+    int t = 2;
+    /* Add two m = 0 objects placed on store t, and one placed on another store (t + 1) % NST */
+    obj m0[3];
+    for (int i = 0; i < 3; i++) {
+        int want_store = i < 2 ? t : (t + 1) % NST;
+        obj_make(&m0[i], 1, 0, 64, 64 * 3 + 11 + (uint64_t)i * 5);
+        while (place(m0[i].oid, 0) != want_store)
+            chunk_random(m0[i].oid, 16);
+        CHECK(put_obj(w.be, &m0[i], 5, ~0u) == 0);
+    }
+    int ec_on_t = count_chunks(w.path[t]) - 2;
+    CHECK(ec_on_t >= 3);
+
+    /* 1. Every damage kind on m0[0] on store t: repair reports unrecoverable and leaves disk unchanged; heal reports it too */
+    char p0[3 * PATH_MAX];
+    chunk_file(&w, &m0[0], t, p0, sizeof p0);
+    size_t orig_n = 0;
+    uint8_t *orig = slurp(p0, &orig_n);
+    CHECK(orig && orig_n == chunk_file_size(&m0[0].g, 0));
+    chunk_ident id0 = {.volume = VOL, .pos = 0};
+    memcpy(id0.vuuid, VU, 16);
+    memcpy(id0.oid, m0[0].oid, 16);
+    chunk_heal_opts ho = {.epoch = 5, .scrub = true};
+    chunk_heal_report rep;
+
+    /* Whole: repair -> chunks_ok == 1 */
+    CHECK(chunk_be_repair(w.be, &id0, &ho, &rep) == 0 && rep.objects == 1 && rep.chunks_ok == 1 &&
+          rep.unrecoverable == 0);
+    for (int kind = 0; kind < D_KINDS; kind++) {
+        damage(p0, kind);
+        size_t pre_n = 0;
+        uint8_t *pre = kind == D_DELETE ? NULL : slurp(p0, &pre_n);
+        CHECK(chunk_be_repair(w.be, &id0, &ho, &rep) == 0);
+        uint64_t want_obj = (kind == D_CELL || kind == D_SUMS || kind == D_FOOTER) ? 1 : 0;
+        CHECK(rep.objects == want_obj && rep.unrecoverable == 1 && rep.unavailable == 0 && rep.chunks_ok == 0 &&
+              rep.rebuilt_missing == 0 && rep.rebuilt_damaged == 0 && rep.bytes == 0);
+        if (kind == D_DELETE) {
+            CHECK(access(p0, F_OK) != 0); /* never an empty chunk */
+        } else {
+            size_t post_n = 0;
+            uint8_t *post = slurp(p0, &post_n);
+            CHECK(post_n == pre_n && (pre_n == 0 || (post && memcmp(post, pre, pre_n) == 0)));
+            free(post);
+        }
+        if (kind != D_DELETE) {
+            chunk_heal_opts hns = {.epoch = 5, .scrub = false};
+            CHECK(chunk_be_heal(w.be, VOL, t, &hns, &rep) == 0);
+            if (kind == D_CELL)
+                CHECK(rep.unrecoverable == 0 && rep.chunks_ok == (uint64_t)(ec_on_t + 2));
+            else
+                CHECK(rep.unrecoverable == 1 && rep.chunks_ok == (uint64_t)(ec_on_t + 1) &&
+                      rep.rebuilt_damaged == 0 && rep.bytes == 0);
+            CHECK(chunk_be_heal(w.be, VOL, t, &ho, &rep) == 0);
+            CHECK(rep.unrecoverable == 1 && rep.chunks_ok == (uint64_t)(ec_on_t + 1) && rep.rebuilt_damaged == 0 &&
+                  rep.rebuilt_missing == 0 && rep.bytes == 0);
+            /* non-live m = 0 object is skipped (not counted unrecoverable) */
+            chunk_heal_opts hnl = {.epoch = 5, .scrub = true, .live = never_live};
+            CHECK(chunk_be_heal(w.be, VOL, t, &hnl, &rep) == 0);
+            CHECK(rep.not_live == (uint64_t)(ec_on_t + 2) && rep.unrecoverable == 0);
+        }
+        free(pre);
+        spit(p0, orig, orig_n);
+    }
+
+    /* 2. Attach store t returning with one damaged (D_FOOTER) and one healthy m = 0 chunk */
+    world_close(&w);
+    damage(p0, D_FOOTER);
+    size_t dmg_n = 0;
+    uint8_t *dmg = slurp(p0, &dmg_n);
+    CHECK(world_open(&w, 1u << t, NST - 2, NULL) == 0);
+    /* Store t is DOWN: its m = 0 objects are UNAVAILABLE; m0[2] on store (t+1) is still readable */
+    CHECK(read_is(w.be, &m0[0], TSDB_ERR_UNAVAILABLE));
+    CHECK(read_is(w.be, &m0[1], TSDB_ERR_UNAVAILABLE));
+    CHECK(read_is(w.be, &m0[2], 0));
+    /* Even with store t DOWN, repair of a footer-damaged m0[2] on UP store (t+1) reports unrecoverable, not unavailable */
+    char p2[3 * PATH_MAX];
+    chunk_file(&w, &m0[2], (t + 1) % NST, p2, sizeof p2);
+    size_t orig2_n = 0;
+    uint8_t *orig2 = slurp(p2, &orig2_n);
+    damage(p2, D_FOOTER);
+    chunk_ident id2 = {.volume = VOL, .pos = 0};
+    memcpy(id2.vuuid, VU, 16);
+    memcpy(id2.oid, m0[2].oid, 16);
+    CHECK(chunk_be_repair(w.be, &id2, &ho, &rep) == 0 && rep.objects == 1 && rep.unrecoverable == 1 &&
+          rep.unavailable == 0);
+    spit(p2, orig2, orig2_n);
+    free(orig2);
+
+    CHECK(chunk_be_attach(w.be, t, w.path[t], w.ids + 16 * t, &ho, &rep) == 0);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(rep.unrecoverable == 1 && rep.chunks_ok == (uint64_t)(ec_on_t + 1) && rep.rebuilt_damaged == 0 &&
+          rep.rebuilt_missing == 0 && rep.bytes == 0);
+    size_t after_n = 0;
+    uint8_t *after = slurp(p0, &after_n);
+    CHECK(after && after_n == dmg_n && memcmp(after, dmg, dmg_n) == 0); /* untouched */
+    free(after);
+    free(dmg);
+    spit(p0, orig, orig_n);
+    free(orig);
+
+    /* 3. Replace store t after failing in service: 4+2 rebuilt, 2 m = 0 objects counted unrecoverable, 0 m = 0 chunks written */
+    chunk_store_test_fail(chunk_be_store(w.be, t));
+    char np[PATH_MAX + 64];
+    snprintf(np, sizeof np, "%s/new_m0_t", w.dir);
+    uint8_t newid[16];
+    CHECK(chunk_be_replace(w.be, t, np, newid, &ho, &rep) == 0);
+    CHECK(chunk_be_store_state(w.be, t) == CHUNK_STORE_UP);
+    CHECK(rep.rebuilt_missing == (uint64_t)ec_on_t && rep.unrecoverable == 2 && rep.failed == 0);
+    CHECK(count_chunks(np) == ec_on_t); /* only the 4+2 chunks; never an empty chunk for m = 0 */
+    CHECK(reads_exact(w.be, &w));       /* all 4+2 objects intact */
+    CHECK(read_is(w.be, &m0[2], 0));    /* m = 0 on other store still intact */
+    CHECK(read_is(w.be, &m0[0], TSDB_ERR_NOTFOUND));
+    CHECK(read_is(w.be, &m0[1], TSDB_ERR_NOTFOUND));
+
+    for (int i = 0; i < 3; i++)
+        free(m0[i].data);
+    world_free(&w);
+
+    /* 4. Single-store (1-store --single-copy) backend: a DOWN_MISSING store has no on-disk listing so replace cannot
+     * enumerate lost m = 0 objects (only the caller's catalog knows them); it logs a clear note and writes 0 chunks. */
+    char sdir[PATH_MAX + 32], s0[PATH_MAX + 64], s0new[PATH_MAX + 64];
+    fresh("m0solo", sdir, sizeof sdir);
+    snprintf(s0, sizeof s0, "%s/st0", sdir);
+    snprintf(s0new, sizeof s0new, "%s/st0new", sdir);
+    uint8_t sid[16], sid2[16];
+    CHECK(chunk_store_init(s0, NULL, sid) == 0);
+    const char *one[1] = {s0};
+    chunk_backend *sbe = NULL;
+    chunk_be_opts o1 = {.min_up = 1};
+    CHECK(chunk_be_open2(&sbe, one, 1, sid, &o1) == 0);
+    obj solo;
+    obj_make(&solo, 1, 0, 64, 64 * 2 + 9);
+    CHECK(put_obj(sbe, &solo, 4, ~0u) == 0);
+    CHECK(read_is(sbe, &solo, 0));
+    chunk_be_close(sbe);
+    sh("rm -rf '%s'", s0);
+    CHECK(chunk_be_open2(&sbe, one, 1, sid, &o1) == TSDB_ERR_UNAVAILABLE);
+    chunk_be_opts o0 = {.min_up = 0};
+    CHECK(chunk_be_open2(&sbe, one, 1, sid, &o0) == 0);
+    CHECK(read_is(sbe, &solo, TSDB_ERR_UNAVAILABLE));
+    char rlog[PATH_MAX + 64];
+    snprintf(rlog, sizeof rlog, "%s/m0-replace.log", S);
+    cap_start(rlog);
+    CHECK(chunk_be_replace(sbe, 0, s0new, sid2, NULL, &rep) == 0);
+    cap_end();
+    CHECK(cap_count(rlog, "single-copy (m=0)") == 1 && cap_count(rlog, "cannot be enumerated") == 1);
+    CHECK(chunk_be_store_state(sbe, 0) == CHUNK_STORE_UP && count_chunks(s0new) == 0 && rep.rebuilt_missing == 0 &&
+          rep.unrecoverable == 0);
+    CHECK(read_is(sbe, &solo, TSDB_ERR_NOTFOUND));
+    chunk_be_close(sbe);
+    free(solo.data);
+
+    /* 5. Regression: (a) retiring store's volume dir renamed away after open still enumerates lost m = 0 objects via
+     * its open dirfd; (b) sweeping chunk_fault_readdir across replace proves no readdir fault ever silently succeeds
+     * with unrecoverable == 0 && failed == 0, and hits the count_lost_m0 listing-fault path deterministically;
+     * (c) header-read EIO on retiring store surfaces unrecoverable >= 1 && failed >= 1; (d) damaged-header pos-0 chunk
+     * found only on target counts unavailable when another store is DOWN (E15). */
+    {
+        /* (a) dirfd enumeration survives volume directory rename */
+        char rdir[PATH_MAX + 32], rs0[PATH_MAX + 64], rs0new[PATH_MAX + 64];
+        char vsrc[PATH_MAX + 96], vdst[PATH_MAX + 96];
+        fresh("m0dirfd", rdir, sizeof rdir);
+        snprintf(rs0, sizeof rs0, "%s/st0", rdir);
+        snprintf(rs0new, sizeof rs0new, "%s/st0new", rdir);
+        snprintf(vsrc, sizeof vsrc, "%s/s%u", rs0, VOL);
+        snprintf(vdst, sizeof vdst, "%s/s%u_renamed", rs0, VOL);
+        uint8_t rid[16], rid2[16];
+        CHECK(chunk_store_init(rs0, NULL, rid) == 0);
+        const char *rone[1] = {rs0};
+        chunk_backend *rbe = NULL;
+        CHECK(chunk_be_open2(&rbe, rone, 1, rid, &o1) == 0);
+        obj robj;
+        obj_make(&robj, 1, 0, 64, 64 * 2 + 7);
+        CHECK(put_obj(rbe, &robj, 4, ~0u) == 0);
+        chunk_store_test_fail(chunk_be_store(rbe, 0));
+        CHECK(rename(vsrc, vdst) == 0); /* path-based opendir("<st0>/s1") would now get ENOENT */
+        chunk_heal_report rrep;
+        CHECK(chunk_be_replace(rbe, 0, rs0new, rid2, NULL, &rrep) == 0);
+        CHECK(chunk_be_store_state(rbe, 0) == CHUNK_STORE_UP);
+        CHECK(rrep.objects == 1 && rrep.unrecoverable == 1 && rrep.failed == 0 && count_chunks(rs0new) == 0);
+        chunk_be_close(rbe);
+        free(robj.data);
+    }
+
+    {
+        /* (b) deterministic readdir-fault sweep across chunk_be_replace: never silently hides m = 0 loss */
+        bool hit_list_fault = false;
+        for (int n = 1; n <= 32; n++) {
+            char fdir[PATH_MAX + 32], fs0[PATH_MAX + 64], fs0new[PATH_MAX + 64];
+            fresh("m0faultdir", fdir, sizeof fdir);
+            snprintf(fs0, sizeof fs0, "%s/st0", fdir);
+            snprintf(fs0new, sizeof fs0new, "%s/st0new", fdir);
+            uint8_t fid[16], fid2[16];
+            CHECK(chunk_store_init(fs0, NULL, fid) == 0);
+            const char *fone[1] = {fs0};
+            chunk_backend *fbe = NULL;
+            CHECK(chunk_be_open2(&fbe, fone, 1, fid, &o1) == 0);
+            obj fobj;
+            obj_make(&fobj, 1, 0, 64, 64 * 2 + 5);
+            CHECK(put_obj(fbe, &fobj, 4, ~0u) == 0);
+            chunk_store_test_fail(chunk_be_store(fbe, 0));
+            chunk_fault_readdir = n;
+            chunk_heal_report frep;
+            int frc = chunk_be_replace(fbe, 0, fs0new, fid2, NULL, &frep);
+            int fired = chunk_fault_readdir == 0;
+            chunk_fault_readdir = 0;
+            if (frc == TSDB_ERR_UNAVAILABLE) {
+                CHECK(chunk_be_store_state(fbe, 0) == CHUNK_STORE_REPLACING && frep.failed >= 1 &&
+                      count_chunks(fs0new) == 0);
+                CHECK(chunk_be_settle(fbe, 0, NULL, &frep) == 0 && chunk_be_store_state(fbe, 0) == CHUNK_STORE_UP);
+                hit_list_fault = true;
+            } else if (frc == 0) {
+                /* fault did not hit count_lost_m0: must have counted the lost m = 0 object */
+                CHECK(frep.unrecoverable == 1 && count_chunks(fs0new) == 0);
+            } else {
+                /* earlier open/fence fault (DOWN_IOERR) or post-install heal listing fault (REPLACING) */
+                int st = chunk_be_store_state(fbe, 0);
+                CHECK(frc == TSDB_ERR_IO && (st == CHUNK_STORE_DOWN_IOERR || st == CHUNK_STORE_REPLACING));
+            }
+            chunk_be_close(fbe);
+            free(fobj.data);
+            if (!fired)
+                break;
+        }
+        CHECK(hit_list_fault);
+    }
+
+    {
+        /* (c) header-read EIO on retiring store surfaces unrecoverable >= 1 && failed >= 1 */
+        char fdir[PATH_MAX + 32], fs0[PATH_MAX + 64], fs0new[PATH_MAX + 64];
+        fresh("m0faulthdr", fdir, sizeof fdir);
+        snprintf(fs0, sizeof fs0, "%s/st0", fdir);
+        snprintf(fs0new, sizeof fs0new, "%s/st0new", fdir);
+        uint8_t fid[16], fid2[16];
+        CHECK(chunk_store_init(fs0, NULL, fid) == 0);
+        const char *fone[1] = {fs0};
+        chunk_backend *fbe = NULL;
+        CHECK(chunk_be_open2(&fbe, fone, 1, fid, &o1) == 0);
+        obj fobj;
+        obj_make(&fobj, 1, 0, 64, 64 * 2 + 5);
+        CHECK(put_obj(fbe, &fobj, 4, ~0u) == 0);
+        chunk_store_test_fail(chunk_be_store(fbe, 0));
+        chunk_fault_read = 1;
+        chunk_heal_report frep;
+        int frc = chunk_be_replace(fbe, 0, fs0new, fid2, NULL, &frep);
+        chunk_fault_read = 0;
+        CHECK(frc == TSDB_ERR_UNAVAILABLE && chunk_be_store_state(fbe, 0) == CHUNK_STORE_REPLACING);
+        CHECK(frep.failed >= 1 && frep.unrecoverable >= 1 && count_chunks(fs0new) == 0);
+        CHECK(chunk_be_settle(fbe, 0, NULL, &frep) == 0 && chunk_be_store_state(fbe, 0) == CHUNK_STORE_UP);
+        chunk_be_close(fbe);
+        free(fobj.data);
+    }
+
+    {
+        /* (d) damaged-header pos-0 chunk found only on target counts unavailable when another store is DOWN (E15) */
+        char ddir[PATH_MAX + 32], ds0[PATH_MAX + 64], ds1[PATH_MAX + 64], df[PATH_MAX + 128];
+        fresh("m0dmgdown", ddir, sizeof ddir);
+        snprintf(ds0, sizeof ds0, "%s/st0", ddir);
+        snprintf(ds1, sizeof ds1, "%s/st1", ddir);
+        uint8_t dids[32];
+        CHECK(chunk_store_init(ds0, NULL, dids) == 0 && chunk_store_init(ds1, NULL, dids + 16) == 0);
+        const char *both[2] = {ds0, ds1};
+        chunk_backend *dbe = NULL;
+        chunk_be_opts o2 = {.min_up = 2};
+        CHECK(chunk_be_open2(&dbe, both, 2, dids, &o2) == 0);
+        obj dobj;
+        obj_make(&dobj, 1, 0, 64, 64 * 2 + 3);
+        while (chunk_be_place(dbe, dobj.oid, 0) != 0)
+            chunk_random(dobj.oid, 16);
+        CHECK(put_obj(dbe, &dobj, 4, ~0u) == 0);
+        char dhex[33];
+        chunk_oid_hex(dobj.oid, dhex);
+        snprintf(df, sizeof df, "%s/s%u/o%s.0.chunk", ds0, VOL, dhex);
+        /* corrupt magic byte 0 so chunk_hdr_decode fails and m cannot be determined from the header */
+        size_t dn = 0;
+        uint8_t *db = slurp(df, &dn);
+        CHECK(db && dn > 0);
+        db[0] ^= 0xff;
+        spit(df, db, dn);
+        free(db);
+        chunk_be_close(dbe);
+        const char *down1[2] = {ds0, NULL};
+        CHECK(chunk_be_open2(&dbe, down1, 2, dids, &o1) == 0);
+        chunk_heal_opts dho = {.epoch = 4};
+        chunk_heal_report drep;
+        CHECK(chunk_be_heal(dbe, VOL, 0, &dho, &drep) == 0);
+        CHECK(drep.objects == 1 && drep.unavailable == 1 && drep.unrecoverable == 0);
+        chunk_be_close(dbe);
+        free(dobj.data);
+    }
+    printf("  single-copy (m = 0): heal, repair, attach and replace report unrecoverable, use dirfd, surface retiring-store I/O faults, never touch damaged files or write empty chunks\n");
+}
+
 /* ---------------------------------------------------------------- main */
 static void set_mutant(const char *m)
 {
@@ -1668,6 +1966,7 @@ int main(int argc, char **argv)
     test_replace();
     test_attach();
     test_review();
+    test_single_copy_heal();
     test_threads();
     test_threads_replace();
     test_crashfs();

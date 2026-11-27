@@ -480,7 +480,7 @@ test-units-b: $(TEST_B_BINS_1) $(TEST_B_BINS_2)
 	./$(B)/test_rs $(SCRATCH)
 	$(if $(EC_OBJ),$(MUT) --name test_rs --list "coef kernel guard" -- ./$(B)/test_rs --quick --mutant @M@) # each planted bug must fail it (--quick: seconds, not 20 s a run)
 	./$(B)/test_chunk $(SCRATCH)
-	$(if $(EC_OBJ),$(MUT) --name test_chunk --list "nosums nofence eof settings nosync epochnosync" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # each planted bug must fail it
+	$(if $(EC_OBJ),$(MUT) --name test_chunk --list "nosums nofence eof settings nosync epochnosync m0parity" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # each planted bug must fail it
 	$(if $(EC_OBJ),$(MUT) --name test_chunk --fail --grep 'stream put .* differ from chunk_encode' --list "streamreread" -- ./$(B)/test_chunk --quick --mutant @M@ @D@) # pinned to its oracle's line
 	./$(B)/test_chunksrv $(SCRATCH)
 	$(if $(EC_OBJ),for c in header full; do ./$(B)/test_chunksrv $(SCRATCH) --net --check $$c || exit 1; done) # its peer links at the other check levels

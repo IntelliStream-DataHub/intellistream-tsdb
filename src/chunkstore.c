@@ -1183,6 +1183,11 @@ int chunk_store_list(chunk_store *st, uint32_t volume, bool verify, chunk_list_f
     return store_list(st, volume, verify, false, fn, ctx);
 }
 
+int chunk_store_list_names(chunk_store *st, uint32_t volume, chunk_list_fn fn, void *ctx)
+{
+    return store_list(st, volume, false, true, fn, ctx);
+}
+
 int chunk_store_list_one(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, bool verify,
                          chunk_listed *out)
 {

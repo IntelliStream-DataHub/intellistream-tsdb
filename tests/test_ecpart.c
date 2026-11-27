@@ -1285,6 +1285,104 @@ static void test_many_and_refusals(void)
     printf("  many_and_refusals: 64 .ec parts hit meta_tier_cache==3 and reset to 0; missing/untiered META refused\n");
 }
 
+/* Single-copy (m = 0, k = 1) .ec record and settled part readback through chunk_obj_read. */
+static void test_single_copy_ecpart(void)
+{
+    char dir[PATH_MAX], stp[PATH_MAX + 32];
+    fresh("m0copy1", dir, sizeof dir);
+    eng *db = NULL;
+    CHECK(open_eng(dir, &db) == 0);
+    uint32_t sid = 0;
+    CHECK(eng_series(db, "m0s", TSDB_FLOAT32, &sid) == 0);
+    rows(db, sid, T0, 200, 10.0f);
+    CHECK(eng_flush(db) == 0);
+    part *src = NULL;
+    pthread_mutex_lock(&db->lock);
+    if (db->nparts > 0) {
+        src = db->parts[0];
+        part_ref(src);
+    }
+    pthread_mutex_unlock(&db->lock);
+    CHECK(src != NULL);
+    if (!src) {
+        eng_close(db);
+        return;
+    }
+
+    /* 1. ec_record with m = 0, k = 1 round-trips; m = 0, k = 2 is refused */
+    chunk_geom g;
+    CHECK(chunk_geom_derive(&g, 1, 0, src->map_len) == 0 && g.k == 1 && g.m == 0);
+    ec_record r, dec;
+    memset(&r, 0, sizeof r);
+    r.version = EC_RECORD_VERSION;
+    r.class_check = EC_CLS_PASSED;
+    CHECK(chunk_random(r.oid, 16) == 0);
+    r.key = src->partition;
+    r.min_block = src->min_block;
+    r.max_block = src->max_block;
+    r.level = src->level;
+    r.k = g.k;
+    r.m = g.m;
+    r.cell_bytes = g.cell;
+    r.object_len = src->map_len;
+    r.object_xxh64 = xxh64(src->map, src->map_len, 0);
+    r.writer_epoch = 1;
+    r.settle_ms = 1234567;
+    snprintf(r.source, sizeof r.source, "%s", src->name);
+    r.nsums = chunk_sums_total(&g);
+    r.sums = calloc(r.nsums, 8);
+
+    /* Put the source .part bytes into a 1-store chunk backend as an m = 0, k = 1 object */
+    snprintf(stp, sizeof stp, "%s/tier0", dir);
+    CHECK(chunk_store_init(stp, NULL, NULL) == 0);
+    const char *pp[1] = {stp};
+    chunk_backend *be = NULL;
+    chunk_be_opts o1 = {.min_up = 1};
+    CHECK(chunk_be_open2(&be, pp, 1, NULL, &o1) == 0);
+    uint8_t vuuid[16];
+    CHECK(chunk_random(vuuid, 16) == 0);
+    CHECK(chunk_be_put_object(be, 1, vuuid, r.oid, &g, 1, src->map, ~0u, r.sums) == 0);
+
+    size_t rlen = ec_record_size(&r);
+    uint8_t *rbuf = malloc(rlen);
+    CHECK(ec_record_encode(&r, rbuf, rlen) == 0);
+    CHECK(ec_record_decode(rbuf, rlen, &dec) == 0 && records_equal(&r, &dec));
+    ec_record_free(&dec);
+    /* k = 2, m = 0 must be refused */
+    ec_record bad = r;
+    bad.k = 2;
+    CHECK(ec_record_encode(&bad, rbuf, rlen) == TSDB_ERR_INVALID);
+    free(rbuf);
+
+    /* 2. Write a real .ec file with m = 0, k = 1, open via part_open_ec, and read the object back bit-exact */
+    char ecname[96], tmp[96];
+    snprintf(ecname, sizeof ecname, "%.*s.ec", (int)(strlen(src->name) - 5), src->name);
+    CHECK(ec_index_write(db, src, &r, tmp) == 0);
+    part *ep = NULL;
+    CHECK(part_open_ec(db, tmp, ecname, &ep) == 0 && ep != NULL);
+    if (ep) {
+        CHECK(ep->ec && ep->ec->rec.k == 1 && ep->ec->rec.m == 0 && ep->ec->rec.nsums == chunk_sums_total(&g));
+        chunk_geom eg;
+        CHECK(chunk_geom_make(&eg, ep->ec->rec.k, ep->ec->rec.m, ep->ec->rec.cell_bytes, ep->ec->rec.object_len) == 0);
+        chunk_obj *co = NULL;
+        CHECK(chunk_obj_open(be, 1, vuuid, ep->ec->rec.oid, &eg, ep->ec->rec.sums, &co) == 0 && co != NULL);
+        if (co) {
+            uint8_t *got = malloc(src->map_len);
+            CHECK(chunk_obj_read(co, 0, src->map_len, got, 0, NULL) == 0);
+            CHECK(memcmp(got, src->map, src->map_len) == 0);
+            free(got);
+            chunk_obj_close(co);
+        }
+        part_unref(ep);
+    }
+
+    chunk_be_close(be);
+    ec_record_free(&r);
+    part_unref(src);
+    CHECK(eng_close(db) == 0);
+    printf("  single-copy (m = 0, k = 1): .ec record round-trip, part_open_ec, and chunk_obj_read bit-exact\n");
+}
+
 int main(int argc, char **argv)
 {
     int ai = 1;
@@ -1327,6 +1425,7 @@ int main(int argc, char **argv)
     test_many_and_refusals();
     test_replay();
     test_fno();
+    test_single_copy_ecpart();
     if (failures) {
         fprintf(stderr, "test_ecpart: %d failures\n", failures);
         return 1;

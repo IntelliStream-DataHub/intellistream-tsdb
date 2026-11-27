@@ -328,11 +328,31 @@ static void copy_out(const uint8_t *cell_bytes, uint64_t x, uint64_t y, uint8_t 
 static int degrade(rr *r, uint64_t s, uint64_t off, const bool *bad, const bool *have, const uint64_t *xs,
                    const uint64_t *ys, uint8_t *buf)
 {
+    const chunk_geom *g = r->g;
+    if (g->m == 0) { /* single-copy (D5, k' = 1): no parity to decode from, never fabricate */
+#ifdef TSDB_EC
+        if (chunk_mutant == CHUNK_MUT_M0_PARITY) { /* planted: reader tries parity decode for m = 0 */
+            if (!r->rs) {
+                r->rs = chunk_rs_get(g->k, g->m);
+                if (!r->rs)
+                    return TSDB_ERR_NOMEM;
+            }
+        }
+#endif
+        int st = r->rep->st[0];
+        bool away = st == CHUNK_ST_DOWN;
+        if (!chunk_log_quiet)
+            fprintf(stderr, "tsdb: object %s: stripe %llu single-copy chunk is unusable (%s): %s\n", r->src->name,
+                    (unsigned long long)s,
+                    st == CHUNK_ST_ABSENT ? "absent" : st == CHUNK_ST_DAMAGED ? "damaged"
+                    : st == CHUNK_ST_DOWN ? "store down" : "unreadable",
+                    away ? "unavailable while it is" : "not readable");
+        return away ? TSDB_ERR_UNAVAILABLE : TSDB_ERR_CORRUPT;
+    }
 #ifndef TSDB_EC
-    (void)r, (void)s, (void)off, (void)bad, (void)have, (void)xs, (void)ys, (void)buf;
+    (void)off, (void)bad, (void)have, (void)xs, (void)ys, (void)buf;
     return TSDB_ERR_INVALID;
 #else
-    const chunk_geom *g = r->g;
     unsigned k = g->k, m = g->m;
     uint64_t ncells = chunk_ncells(g), Ls = chunk_stripe_len(g, s);
     uint64_t x0 = Ls, y0 = 0;
@@ -850,12 +870,21 @@ int chunk_obj_open(chunk_backend *be, uint32_t volume, const uint8_t vuuid[16], 
     for (int i = 0; i < chunk_be_nstores(be); i++)
         away |= chunk_be_store_state(be, i) != CHUNK_STORE_UP;
     if (!alive || !have) {
-        if (away && !chunk_log_quiet && worst != TSDB_ERR_NOTFOUND)
+        bool obj_away = away;
+        if (have && o->g.m == 0) {
+            /* single-copy (D5): only pos 0 exists; if it was found damaged on an UP store it is CORRUPT, and it is
+             * unavailable only when its own store is not UP */
+            if (o->st[0] == CHUNK_ST_DAMAGED)
+                obj_away = false;
+            else
+                obj_away = chunk_be_store_state(be, chunk_be_pos_store(be, oid, 0)) != CHUNK_STORE_UP;
+        }
+        if (obj_away && !chunk_log_quiet && worst != TSDB_ERR_NOTFOUND)
             fprintf(stderr, "tsdb: object %s: no chunk of it can be read while a store is down: unavailable\n", o->name);
         else if (worst != TSDB_ERR_NOTFOUND && !chunk_log_quiet)
             fprintf(stderr, "tsdb: object %s: no chunk of it can be read: not readable\n", o->name);
         chunk_obj_close(o);
-        if (away)
+        if (obj_away)
             return TSDB_ERR_UNAVAILABLE;
         return worst == TSDB_ERR_NOTFOUND ? TSDB_ERR_NOTFOUND : TSDB_ERR_CORRUPT;
     }

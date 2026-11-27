@@ -86,7 +86,7 @@ static unsigned take(rd *r) { return r->at < r->n ? r->p[r->at++] : 0; }
 
 static void mode_object(rd *r)
 {
-    unsigned m = 1 + take(r) % 4, k = 1 + take(r) % 16, cell = 1 + take(r) % 40;
+    unsigned m = take(r) % 5, k = m == 0 ? 1 : 1 + take(r) % 16, cell = 1 + take(r) % 40;
     uint64_t cells = 1 + take(r) % 40, len = (cells - 1) * cell + 1 + take(r) % cell;
     chunk_geom g;
     if (chunk_geom_make(&g, k, m, cell, len) != 0) /* more data chunks than cells: the derived k' (E7) */
@@ -152,6 +152,8 @@ static void mode_object(rd *r)
                     abort(); /* wrong bytes: the one thing it must never give */
             } else if (nbad <= m) {
                 abort(); /* up to m unusable chunks is always readable */
+            } else if (m == 0 && rc != TSDB_ERR_CORRUPT) {
+                abort(); /* m = 0 has no parity to decode from: never NOMEM or another error */
             }
             if (nflip == 0 && nbad <= m && use_rec == 0) { /* raw reads: the chunks are absent or cut, never rotten */
                 memset(buf, 0xA5, g.len + 8);
@@ -254,10 +256,21 @@ void fuzz_seeds(const char *dir)
         for (int i = 0; i < 256; i++)
             b[i] = (uint8_t)(i * (3 + s) + s * 17 + (i >> 3));
         b[0] = 0; /* object mode */
-        b[1] = (uint8_t)(s % 4);     /* m - 1 */
+        b[1] = (uint8_t)(s % 4 + 1); /* m in 1..4 */
         b[2] = (uint8_t)(s * 2 + 1); /* k - 1 */
         char nm[40];
         snprintf(nm, sizeof nm, "seed-object-%d", s);
+        fuzz_put(dir, nm, b, sizeof b);
+    }
+    for (int s = 0; s < 2; s++) { /* m = 0 (single-copy, k' = 1): undamaged and damaged */
+        for (int i = 0; i < 256; i++)
+            b[i] = (uint8_t)(i * (7 + s) + 19 + s * 31);
+        b[0] = 0;                      /* object mode */
+        b[1] = 0;                      /* m = 0 (k is fixed to 1 without consuming a byte) */
+        b[2] = (uint8_t)(16 + s * 11); /* cell - 1 */
+        b[3] = (uint8_t)(4 + s * 3);   /* cells - 1 */
+        char nm[40];
+        snprintf(nm, sizeof nm, "seed-object-m0-%d", s);
         fuzz_put(dir, nm, b, sizeof b);
     }
     for (int s = 0; s < 4; s++) {

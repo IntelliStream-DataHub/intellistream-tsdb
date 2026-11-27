@@ -231,6 +231,8 @@ void fuzz_seeds(const char *dir)
     seed_for(dir, "seed-4+2-parity", 4, 2, 48, 48 * 9 + 5, 5);
     seed_for(dir, "seed-8+2-last", 8, 2, 40, 40 * 19 + 7, 2);
     seed_for(dir, "seed-copy-1+2", 1, 2, 64, 64 * 3 + 3, 2);
+    seed_for(dir, "seed-copy1-1+0", 1, 0, 64, 64 * 3 + 5, 0);
+    seed_for(dir, "seed-copy1-one-cell", 1, 0, 100, 37, 0);
     seed_for(dir, "seed-one-cell", 1, 1, 100, 37, 0);
     seed_for(dir, "seed-16+4", 16, 4, 16, 16 * 33 + 1, 18);
     fuzz_put(dir, "seed-empty", "", 0);

@@ -40,8 +40,8 @@ unsigned chunk_settings_k, chunk_settings_m;
 /* ---------------------------------------------------------------- geometry */
 bool chunk_geom_valid(const chunk_geom *g)
 {
-    if (g->k < 1 || g->k > CHUNK_K_MAX || g->m < 1 || g->m > CHUNK_M_MAX || g->cell < 1 || g->cell > CHUNK_CELL_LIMIT ||
-        g->len < 1 || g->len > CHUNK_OBJ_MAX)
+    if (g->k < 1 || g->k > CHUNK_K_MAX || g->m > CHUNK_M_MAX || (g->m == 0 && g->k != 1) || g->cell < 1 ||
+        g->cell > CHUNK_CELL_LIMIT || g->len < 1 || g->len > CHUNK_OBJ_MAX)
         return false;
     uint64_t cells = (g->len + g->cell - 1) / g->cell;
     return g->k <= cells && cells <= CHUNK_NCELLS_MAX;
@@ -60,7 +60,7 @@ int chunk_geom_make(chunk_geom *g, unsigned k, unsigned m, uint32_t cell, uint64
 
 int chunk_geom_derive(chunk_geom *g, unsigned k, unsigned m, uint64_t len)
 {
-    if (k < 1 || k > CHUNK_K_MAX || m < 1 || m > CHUNK_M_MAX || len < 1 || len > CHUNK_OBJ_MAX)
+    if (k < 1 || k > CHUNK_K_MAX || m > CHUNK_M_MAX || (m == 0 && k != 1) || len < 1 || len > CHUNK_OBJ_MAX)
         return TSDB_ERR_INVALID;
     uint64_t c = (len / (8ull * k) + 4095) & ~4095ull;
     if (c < CHUNK_CELL_MIN)
@@ -399,13 +399,21 @@ static void data_shards(const chunk_geom *g, uint64_t s, const uint8_t *cells, u
     }
 }
 
-/* Stripe s: `cells` points at the bytes of its first data cell (cell s * k); mem is (k + m) * cap bytes of scratch.
- * The parity is computed from `pcells`: `cells`, except in CHUNK_MUT_STREAM_REREAD (a second read of the source). */
+/* Stripe s: `cells` points at the bytes of its first data cell (cell s * k); mem is (k + m) * cap bytes of scratch
+ * (unused when m = 0). The parity is computed from `pcells`: `cells`, except in CHUNK_MUT_STREAM_REREAD (a second read
+ * of the source). */
 static int encode_stripe(const chunk_geom *g, iso_rs *rs, uint64_t s, const uint8_t *cells, const uint8_t *pcells,
                          uint8_t *mem, size_t cap, chunk_cell_fn fn, void *ctx, uint64_t *sums_out,
                          const uint64_t *bases)
 {
     unsigned k = g->k, m = g->m;
+    if (m == 0) { /* single-copy (D5, k' = 1): one cell, encode-time sum, no RS codec call */
+        size_t len = (size_t)chunk_cell_len(g, s);
+        uint64_t sum = xxh64(cells, len, 0);
+        if (sums_out)
+            sums_out[s] = sum;
+        return fn ? fn(ctx, 0, s, cells, len, sum) : 0;
+    }
     size_t ls = (size_t)chunk_stripe_len(g, s);
     uint8_t *shards[CHUNK_POS_MAX];
     data_shards(g, s, pcells, mem, cap, shards);
@@ -438,15 +446,15 @@ int chunk_encode(const chunk_geom *g, const uint8_t *obj, chunk_cell_fn fn, void
     if (!chunk_geom_valid(g))
         return TSDB_ERR_INVALID;
     unsigned k = g->k, m = g->m;
-    iso_rs *rs = chunk_rs_get(k, m);
-    if (!rs)
+    iso_rs *rs = m ? chunk_rs_get(k, m) : NULL;
+    if (m && !rs)
         return TSDB_ERR_NOMEM;
     uint64_t ns = chunk_nstripes(g), bases[CHUNK_POS_MAX];
     for (unsigned p = 0; p < k + m; p++)
         bases[p] = chunk_sums_base(g, p);
     size_t cap = g->cell > g->len ? (size_t)g->len : g->cell; /* the longest cell */
-    uint8_t *mem = malloc((size_t)(k + m) * cap);
-    if (!mem)
+    uint8_t *mem = m ? malloc((size_t)(k + m) * cap) : NULL;
+    if (m && !mem)
         return TSDB_ERR_NOMEM;
     int rc = 0;
     for (uint64_t s = 0; s < ns && rc == 0; s++)
@@ -464,12 +472,12 @@ int chunk_encode_stripe(const chunk_geom *g, uint64_t s, const uint8_t *stripe, 
 #else
     if (!chunk_geom_valid(g) || s >= chunk_nstripes(g))
         return TSDB_ERR_INVALID;
-    iso_rs *rs = chunk_rs_get(g->k, g->m);
-    if (!rs)
+    iso_rs *rs = g->m ? chunk_rs_get(g->k, g->m) : NULL;
+    if (g->m && !rs)
         return TSDB_ERR_NOMEM;
     size_t cap = g->cell > g->len ? (size_t)g->len : g->cell;
-    uint8_t *mem = malloc((size_t)(g->k + g->m) * cap);
-    if (!mem)
+    uint8_t *mem = g->m ? malloc((size_t)(g->k + g->m) * cap) : NULL;
+    if (g->m && !mem)
         return TSDB_ERR_NOMEM;
     int rc = encode_stripe(g, rs, s, stripe, stripe, mem, cap, fn, ctx, NULL, NULL);
     free(mem);
@@ -486,8 +494,8 @@ int chunk_encode_stream(const chunk_geom *g, const chunk_put_src *src, chunk_cel
     if (!chunk_geom_valid(g) || !src || !src->fill)
         return TSDB_ERR_INVALID;
     unsigned k = g->k, m = g->m;
-    iso_rs *rs = chunk_rs_get(k, m);
-    if (!rs)
+    iso_rs *rs = m ? chunk_rs_get(k, m) : NULL;
+    if (m && !rs)
         return TSDB_ERR_NOMEM;
     uint64_t ns = chunk_nstripes(g), bases[CHUNK_POS_MAX], sbytes = (uint64_t)k * g->cell;
     for (unsigned p = 0; p < k + m; p++)
@@ -496,9 +504,9 @@ int chunk_encode_stream(const chunk_geom *g, const chunk_put_src *src, chunk_cel
         sbytes = g->len; /* the most bytes one stripe holds */
     size_t cap = g->cell > g->len ? (size_t)g->len : g->cell;
     bool reread = chunk_mutant == CHUNK_MUT_STREAM_REREAD;
-    uint8_t *mem = malloc((size_t)(k + m) * cap), *buf = malloc((size_t)sbytes);
+    uint8_t *mem = m ? malloc((size_t)(k + m) * cap) : NULL, *buf = malloc((size_t)sbytes);
     uint8_t *buf2 = reread ? malloc((size_t)sbytes) : NULL;
-    int rc = mem && buf && (!reread || buf2) ? 0 : TSDB_ERR_NOMEM;
+    int rc = (!m || mem) && buf && (!reread || buf2) ? 0 : TSDB_ERR_NOMEM;
     for (uint64_t s = 0; s < ns && rc == 0; s++) {
         /* Everything below reads `buf` only: the source is asked for each byte once, so what fill() checked in it is
          * exactly what is hashed and encoded (E26: two reads of a mapping can see two different pages). */

@@ -62,6 +62,8 @@ chunk_store *chunk_be_open_store(const chunk_backend *be, int i);
 int chunk_store_open_quiet(const char *path, const uint8_t *expect_id, chunk_store **out);
 /* A chunk's header without opening the whole chunk: any volume uuid (the caller learns it). */
 int chunk_store_peek(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, chunk_hdr *h);
+/* Names-only listing of one open store's volume directory via its open dirfd (no chunk files opened or read). */
+int chunk_store_list_names(chunk_store *st, uint32_t volume, chunk_list_fn fn, void *ctx);
 /* chunk_wr_open for a rebuilt chunk: the header carries hdr_epoch (the epoch the object's chunks were written at, which
  * may be below the volume's), the fence is checked and raised at fence_epoch (the healer's). */
 int chunk_wr_open_heal(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t hdr_epoch,
