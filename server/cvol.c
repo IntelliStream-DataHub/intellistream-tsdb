@@ -81,16 +81,21 @@
 
 #include "cvol.h"
 #include "cvolfs.h"
+#include "disks.h"
 #include "repld.h"
 #include "scrubd.h"
 #include "chunkpeer.h"
 #include "cvolset.h"
 #include "../client/tsdb_crypto.h"
+#include "../src/compat.h"
 #include "../src/cvol.h"
+#include "../src/internal.h"
 #include "../src/snapshot.h"
 #include "tsdb_protocol.h"
 
 enum { MV_NONE = 0, MV_WAIT, MV_OPEN, MV_REFUSED, MV_INSTALL /* cvol_install holds it */, MV_REPREP /* prepare again */ };
+
+#define WAL_RATE_BUCKETS 60 /* 60 x 1 min = 1 hour sliding window (E51) */
 
 struct mvol {
     uint32_t number;
@@ -106,6 +111,14 @@ struct mvol {
     int unnamed; /* the latest push does not name this server for it (cvolset_record CVS_UNNAMED said once) */
     uint64_t rec_rid; /* the rid the record gave this server when prepare ran (refused or not): CVS_RESET compares it */
     int installed;    /* prepared again after an installed snapshot (TSDB_REPLD_MUTANT=snapservebeforeopen opens it at once) */
+    char disk_root[PATH_MAX]; /* R13 (D14): disk root directory holding v<N> */
+    uint8_t store_id[16];     /* R13 (D14): disk store_id holding v<N> (reported in HBS_VOLUMES) */
+    /* E51: 1-hour sliding window of WAL bytes written by this replica. */
+    uint64_t wal_last_bytes;
+    uint64_t wal_first_s;
+    uint64_t wal_last_min;
+    uint64_t wal_buckets[WAL_RATE_BUCKETS];
+    double wal_bps;
 };
 
 static struct {
@@ -115,7 +128,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_t th;
-    int started, stop, dirty, active;
+    int started, stop, dirty, active, disks_ready;
     int synced; /* the manager has gone through the volume records of a metadata copy once (every one declared) */
     uint32_t init_vols[CLUSTER_REPORT_VOLS]; /* R9 (D5): volumes held at startup (first push) */
     uint32_t ninit;
@@ -148,11 +161,136 @@ static struct mvol *mv_get(uint32_t number)
     return NULL;
 }
 
-/* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare); the new state under mu */
+static uint64_t mono_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+static int store_id_nonzero(const uint8_t id[16])
+{
+    uint8_t acc = 0;
+    for (int i = 0; i < 16; i++)
+        acc |= id[i];
+    return acc != 0;
+}
+
+/* Refreshes each open volume's 1-hour WAL ingest rate (bytes/s) off M.mu (mgr_main thread only). */
+static void sample_wal_rates(void)
+{
+    uint32_t nums[CLUSTER_REPORT_VOLS];
+    uint32_t n = 0;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nvols && n < CLUSTER_REPORT_VOLS; i++)
+        if (M.vols[i].state == MV_OPEN)
+            nums[n++] = M.vols[i].number;
+    pthread_mutex_unlock(&M.mu);
+    if (n == 0 || !M.t)
+        return;
+    uint64_t cur_bytes[CLUSTER_REPORT_VOLS];
+    uint8_t have[CLUSTER_REPORT_VOLS];
+    for (uint32_t i = 0; i < n; i++) {
+        struct eng *db = tsdb_cvol_ref(M.t, nums[i]);
+        if (db) {
+            cur_bytes[i] = atomic_load_explicit(&db->st_wal_bytes, memory_order_relaxed);
+            have[i] = 1;
+            tsdb_cvol_unref(&db);
+        } else {
+            cur_bytes[i] = 0;
+            have[i] = 0;
+        }
+    }
+    uint64_t now_s = mono_sec();
+    uint64_t now_min = now_s / 60;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < n; i++) {
+        if (!have[i])
+            continue;
+        struct mvol *m = mv_get(nums[i]);
+        if (!m)
+            continue;
+        if (m->wal_first_s == 0) {
+            /* Engine opened before first sample without timestamp: baseline at cur_bytes so we never spike on 1 s. */
+            m->wal_first_s = now_s ? now_s : 1;
+            m->wal_last_min = now_min;
+            m->wal_last_bytes = cur_bytes[i];
+        } else {
+            uint64_t delta = cur_bytes[i] >= m->wal_last_bytes ? cur_bytes[i] - m->wal_last_bytes : cur_bytes[i];
+            m->wal_last_bytes = cur_bytes[i];
+            if (now_min > m->wal_last_min) {
+                uint64_t adv = now_min - m->wal_last_min;
+                if (adv >= WAL_RATE_BUCKETS) {
+                    memset(m->wal_buckets, 0, sizeof m->wal_buckets);
+                } else {
+                    for (uint64_t k = 1; k <= adv; k++)
+                        m->wal_buckets[(m->wal_last_min + k) % WAL_RATE_BUCKETS] = 0;
+                }
+                m->wal_last_min = now_min;
+            }
+            m->wal_buckets[now_min % WAL_RATE_BUCKETS] += delta;
+        }
+        uint64_t sum = 0;
+        for (int b = 0; b < WAL_RATE_BUCKETS; b++)
+            sum += m->wal_buckets[b];
+        uint64_t elapsed = now_s > m->wal_first_s ? now_s - m->wal_first_s : 1;
+        if (elapsed > 3600)
+            elapsed = 3600;
+        m->wal_bps = (double)sum / (double)elapsed;
+    }
+    pthread_mutex_unlock(&M.mu);
+}
+
+/* Builds the cvolfs_disk table from disks_list() (falling back to M.dir) with per-disk replica counts and 1h WAL bps. */
+static int build_cvolfs_disks(struct cvolfs_disk *out, int cap, uint32_t exclude_vol)
+{
+    int lim = cap < DISKS_MAX ? cap : DISKS_MAX;
+    struct disk_info *di = calloc((size_t)lim, sizeof *di);
+    int nd = di ? disks_list(di, lim) : 0;
+    if (nd == 0) {
+        memset(&out[0], 0, sizeof out[0]);
+        snprintf(out[0].path, sizeof out[0].path, "%s", M.dir);
+        out[0].disk_class = DISK_CLASS_SSD;
+        out[0].state = META_STORE_UP;
+        out[0].present = 1;
+        nd = 1;
+    } else {
+        for (int i = 0; i < nd; i++) {
+            memset(&out[i], 0, sizeof out[i]);
+            memcpy(out[i].path, di[i].path, sizeof out[i].path);
+            out[i].path[sizeof out[i].path - 1] = '\0';
+            memcpy(out[i].store_id, di[i].store_id, 16);
+            out[i].disk_class = di[i].disk_class;
+            out[i].state = di[i].state;
+            out[i].present = di[i].present;
+        }
+    }
+    free(di);
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nvols; i++) {
+        const struct mvol *m = &M.vols[i];
+        if (m->number == exclude_vol || m->state == MV_NONE || !m->disk_root[0])
+            continue;
+        int nz = store_id_nonzero(m->store_id);
+        for (int d = 0; d < nd; d++) {
+            if ((nz && memcmp(out[d].store_id, m->store_id, 16) == 0) ||
+                (!nz && strcmp(out[d].path, m->disk_root) == 0)) {
+                out[d].nreplicas++;
+                out[d].wal_bps += m->wal_bps;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&M.mu);
+    return nd;
+}
+
+/* step 1 and 2 for a record not seen yet (the disk side is cvolfs_prepare_disks); the new state under mu */
 static void prepare(const struct cluster_vol_rec *r)
 {
     struct mvol m = {.number = r->number, .state = MV_REFUSED, .fault_reason = CL_FAULT_REFUSED,
                      .epoch = r->epoch, .rec_rid = r->rid};
+    sample_wal_rates();
     pthread_mutex_lock(&M.mu);
     uint32_t self = M.self;
     int stale_first = M.stale_first;
@@ -169,12 +307,21 @@ static void prepare(const struct cluster_vol_rec *r)
                                 .rid = r->rid,
                                 .open_gen = r->open_gen,
                                 .open_nonce = r->open_nonce,
-                                .stale_first = stale_first};
+                                .stale_first = stale_first,
+                                .young_move_pct = r->young_move_pct,
+                                .log_on_hdd = r->log_on_hdd};
         struct cvolfs_open o;
+        memset(&o, 0, sizeof o);
         snprintf(fr.name, sizeof fr.name, "%s", r->name);
         memcpy(fr.uuid, r->uuid, 16);
         memcpy(fr.cluster, r->cluster, 16);
-        int prc = cvolfs_prepare(M.dir, &fr, &o);
+        struct cvolfs_disk *disks = calloc(DISKS_MAX, sizeof *disks);
+        int prc = -1;
+        if (disks) {
+            int nd = build_cvolfs_disks(disks, DISKS_MAX, r->number);
+            prc = cvolfs_prepare_disks(M.dir, disks, nd, &fr, &o);
+            free(disks);
+        }
         if (prc == 0) {
             if (r->open_gen == 0)
                 scrubd_vol_reset(r->number); /* fresh/reset directory: clear any preloaded damage from set-aside dir */
@@ -182,6 +329,8 @@ static void prepare(const struct cluster_vol_rec *r)
             m.gen = o.gen;
             m.nonce = o.nonce;
             m.unsure = o.unsure;
+            snprintf(m.disk_root, sizeof m.disk_root, "%s", o.disk_root[0] ? o.disk_root : M.dir);
+            memcpy(m.store_id, o.store_id, 16);
             m.state = MV_WAIT;
             m.fault_reason = CL_FAULT_NONE;
             say("volume %" PRIu32 " (%s): open generation %" PRIu64 ", waiting for the metadata group to record it",
@@ -195,6 +344,11 @@ static void prepare(const struct cluster_vol_rec *r)
     struct mvol *old = mv_get(r->number); /* MV_REPREP: prepared again after an install */
     if (old) {
         m.installed = old->installed;
+        m.wal_last_bytes = old->wal_last_bytes;
+        m.wal_first_s = old->wal_first_s;
+        m.wal_last_min = old->wal_last_min;
+        memcpy(m.wal_buckets, old->wal_buckets, sizeof m.wal_buckets);
+        m.wal_bps = old->wal_bps;
         *old = m;
         stored = 1;
     } else if (M.nvols < CLUSTER_REPORT_VOLS) {
@@ -209,12 +363,13 @@ static void prepare(const struct cluster_vol_rec *r)
 /* step 3 once the generation is recorded */
 static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
 {
-    char vdir[4200];
-    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, M.dir, r->number);
+    char root[PATH_MAX], vdir[4200];
     pthread_mutex_lock(&M.mu);
+    snprintf(root, sizeof root, "%s", m->disk_root[0] ? m->disk_root : M.dir);
     int do_slow = M.slow_open_ms > 0 && !m->opened_once;
     unsigned slow_ms = M.slow_open_ms;
     pthread_mutex_unlock(&M.mu);
+    snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number);
     if (do_slow) {
         say("volume %" PRIu32 " (%s): delaying first open by %u ms (TSDB_CLUSTER_TEST slow_open_ms)", r->number,
             r->name, slow_ms);
@@ -235,13 +390,19 @@ static void open_engine(const struct cluster_vol_rec *r, struct mvol *m)
     /* replication (server/repld.c) opens it as a replica with REPL's floor; the record's leader promotes itself */
     int rc = chunkpeer_cluster_prepare(r->number, vdir); /* r8f: an ec volume's META asks for the peer cold ops */
     if (rc == 0)
-        rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r);
+        rc = M.writes ? tsdb_cvol_open(M.t, r->number, vdir, !writer, 0) : repld_open(r, root);
     pthread_mutex_lock(&M.mu);
     m->opened_once = 1;
     if (rc == 0) {
         m->state = MV_OPEN;
         m->fault_reason = CL_FAULT_NONE;
         m->writer = writer;
+        if (m->wal_first_s == 0) {
+            uint64_t now_s = mono_sec();
+            m->wal_first_s = now_s ? now_s : 1;
+            m->wal_last_min = m->wal_first_s / 60;
+        }
+        m->wal_last_bytes = 0; /* newly opened engine starts with st_wal_bytes == 0 */
     } else {
         m->state = MV_REFUSED;
         m->fault_reason = rc == TSDB_ERR_CORRUPT ? CL_FAULT_CORRUPT_OPEN : CL_FAULT_REFUSED;
@@ -296,14 +457,51 @@ static int forget(uint32_t number, int st)
     return MV_NONE;
 }
 
+static void sweep_all_disks(void)
+{
+    int log_on_hdd = 0;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (cp) {
+        log_on_hdd = cp->log_on_hdd != 0;
+        cluster_copy_put(cp);
+    }
+    struct disk_info *di = calloc(DISKS_MAX, sizeof *di);
+    int nd = di ? disks_list(di, DISKS_MAX) : 0;
+    const char *roots[DISKS_MAX];
+    int nroots = 0;
+    for (int i = 0; i < nd && nroots < DISKS_MAX; i++) {
+        struct cvolfs_disk cd = {.disk_class = di[i].disk_class, .state = di[i].state, .present = di[i].present};
+        memcpy(cd.path, di[i].path, sizeof cd.path);
+        cd.path[sizeof cd.path - 1] = '\0';
+        if (cvolfs_disk_scannable(&cd, log_on_hdd))
+            roots[nroots++] = di[i].path;
+    }
+    if (nroots == 0) {
+        roots[0] = M.dir;
+        nroots = 1;
+    }
+    cvolset_sweep_disks(roots, nroots);
+    free(di);
+}
+
 static void *mgr_main(void *arg)
 {
     (void)arg;
     static struct cluster_vol_rec recs[CLUSTER_REPORT_VOLS];
     pthread_mutex_lock(&M.mu);
     for (;;) {
-        while (!M.dirty && !M.stop)
-            pthread_cond_wait(&M.cv, &M.mu);
+        while ((!M.dirty || !M.disks_ready) && !M.stop) {
+            if (M.disks_ready && M.synced) {
+                tsdb_cond_timedwait_ms(&M.cv, &M.mu, 10000);
+                if (!M.dirty && !M.stop) {
+                    pthread_mutex_unlock(&M.mu);
+                    sample_wal_rates();
+                    pthread_mutex_lock(&M.mu);
+                }
+            } else {
+                pthread_cond_wait(&M.cv, &M.mu);
+            }
+        }
         if (M.stop)
             break;
         M.dirty = 0;
@@ -317,7 +515,7 @@ static void *mgr_main(void *arg)
         }
         pthread_mutex_unlock(&M.mu);
         if (first && !M.writes)
-            cvolset_sweep(M.dir); /* D12: a v<N> of a removal committed while this server was down is set aside */
+            sweep_all_disks(); /* D12/D14: v<N> of a removal committed while down is set aside per disk */
         for (uint32_t i = 0; i < n && !M.stop; i++) {
             const struct cluster_vol_rec *r = &recs[i];
             pthread_mutex_lock(&M.op);
@@ -436,6 +634,7 @@ static void on_report(void *arg, struct cluster_report *out)
         v->rid = m->rid;
         v->open_gen = m->gen;
         v->open_nonce = m->nonce;
+        memcpy(v->store_id, m->store_id, 16);
     }
     pthread_mutex_unlock(&M.mu);
     for (uint32_t i = 0; i < out->nvols; i++) { /* after M.mu: the driver's locks are never taken under it */
@@ -530,10 +729,56 @@ int cvol_synced(void)
     return s;
 }
 
+int cvol_vol_disk(uint32_t v, char *root_out, size_t cap, uint8_t store_id_out[16])
+{
+    int rc = -1;
+    pthread_mutex_lock(&M.mu);
+    const struct mvol *m = mv_get(v);
+    if (m && m->disk_root[0]) {
+        if (root_out && cap > 0)
+            snprintf(root_out, cap, "%s", m->disk_root);
+        if (store_id_out)
+            memcpy(store_id_out, m->store_id, 16);
+        rc = 0;
+    }
+    pthread_mutex_unlock(&M.mu);
+    return rc;
+}
+
+uint32_t cvol_vols_on_disk(const uint8_t store_id[16], uint32_t *vols_out, uint32_t cap)
+{
+    if (!store_id || !store_id_nonzero(store_id))
+        return 0;
+    uint32_t n = 0;
+    pthread_mutex_lock(&M.mu);
+    for (uint32_t i = 0; i < M.nvols && n < cap; i++) {
+        const struct mvol *m = &M.vols[i];
+        if (m->state == MV_NONE)
+            continue;
+        if (memcmp(m->store_id, store_id, 16) == 0) {
+            if (vols_out)
+                vols_out[n] = m->number;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&M.mu);
+    return n;
+}
+
+void cvol_disks_ready(void)
+{
+    pthread_mutex_lock(&M.mu);
+    M.disks_ready = 1;
+    pthread_cond_signal(&M.cv);
+    pthread_mutex_unlock(&M.mu);
+}
+
 int cvol_start(tsdb *t, const char *dir)
 {
     M.t = t;
     snprintf(M.dir, sizeof M.dir, "%s", dir);
+    tsdb_cond_init_mono(&M.cv);
+    M.disks_ready = 0;
     repld_init(t, dir);
     while (M.incarnation == 0 && tsdb_random(&M.incarnation, sizeof M.incarnation) == 0)
         ;
@@ -567,6 +812,8 @@ int cvol_start(tsdb *t, const char *dir)
                          : !strcmp(mu, "removedopen") ? CVOLFS_MUT_REMOVEDOPEN
                          : !strcmp(mu, "makemissing") ? CVOLFS_MUT_MAKEMISSING
                          : !strcmp(mu, "lostasstale") ? CVOLFS_MUT_LOSTASSTALE
+                         : !strcmp(mu, "cvolfirstdisk") ? CVOLFS_MUT_FIRSTDISK
+                         : !strcmp(mu, "cvoldupok")   ? CVOLFS_MUT_DUPOK
                                                       : CVOLFS_MUT_NONE;
     const char *ct = getenv("TSDB_CLUSTER_TEST");
     M.stale_first = ct && strstr(ct, "stale_first_watch=1");

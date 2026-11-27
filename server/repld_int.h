@@ -84,6 +84,7 @@ struct rpeer {
 
 struct rvol {
     uint32_t number;
+    char disk_root[PATH_MAX]; /* R13 (D14): parent disk directory holding v<N> and its R4 siblings */
     char dir[4200];
     pthread_mutex_t mu; /* the core, the index, the cursors, the inbox; below buf_lock (jr_ops.admit takes it) */
     pthread_cond_t cv;

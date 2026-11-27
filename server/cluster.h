@@ -142,6 +142,7 @@ struct cluster_vol_report { /* a volume this server owns */
     uint64_t rid, open_gen;            /* replicated: the directory's replica instance and the generation its last
                                         * open saved (§8.5); the leader proposes REPLICA_OPEN for a higher one */
     uint64_t open_nonce;               /* that open's random draw, recorded with the generation */
+    uint8_t store_id[16];              /* R13 (D14): disk store_id holding v<N> (all zeros when unknown) */
 };
 struct cluster_dom_report {
     char name[META_DOMAIN_MAX];

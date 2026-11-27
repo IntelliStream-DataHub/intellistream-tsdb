@@ -289,6 +289,16 @@ static int need(struct rd *r, size_t n)
 
 static uint8_t get8(struct rd *r) { return need(r, 1) ? r->p[r->off++] : 0; }
 
+static void getbytes(struct rd *r, void *dst, size_t n)
+{
+    if (!need(r, n)) {
+        memset(dst, 0, n);
+        return;
+    }
+    memcpy(dst, r->p + r->off, n);
+    r->off += n;
+}
+
 static uint32_t get32(struct rd *r)
 {
     if (!need(r, 4))
@@ -603,6 +613,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             v->rid = get64(&r);
             v->open_gen = get64(&r);
             v->open_nonce = get64(&r);
+            getbytes(&r, v->store_id, 16);
             h->vols[j].local_fault_s = get64(&r);
         }
         h->ndoms = get32(&r);
@@ -3333,6 +3344,11 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 for (uint32_t i = 0; i < n; i++)
                     nv[i].v.fault_reason = get8(&s);
             }
+            /* R13 (D14): optional trailing array of n 16-byte disk store_ids (backward-compatible with older senders). */
+            if (!s.bad && s.off < s.len) {
+                for (uint32_t i = 0; i < n; i++)
+                    getbytes(&s, nv[i].v.store_id, 16);
+            }
             if (s.bad) {
                 free(nv);
                 r->bad = 1;
@@ -4757,6 +4773,7 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
         put64(b, v->rid);
         put64(b, v->open_gen);
         put64(b, v->open_nonce);
+        put(b, v->store_id, 16);
         put64(b, h->vols[i].fault_ns ? since(now, h->vols[i].fault_ns) / (1000 * MS) : 0);
     }
     put32(b, h ? h->ndoms : 0);
@@ -6775,6 +6792,9 @@ static void put_sections(struct buf *b, uint64_t now)
     /* R9 (D6): trailing per-volume fault_reason byte (ignored by older parsers, read by new ones). */
     for (uint32_t i = 0; i < rep.nvols; i++)
         put8(b, rep.vols[i].fault_reason);
+    /* R13 (D14): trailing per-volume 16-byte disk store_id (ignored by older parsers, read by new ones). */
+    for (uint32_t i = 0; i < rep.nvols; i++)
+        put(b, rep.vols[i].store_id, 16);
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
     put32(b, rep.ndoms);

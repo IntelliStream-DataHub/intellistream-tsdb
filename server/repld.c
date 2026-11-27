@@ -3860,7 +3860,7 @@ static int core_build(struct rvol *rv, bool unsure, uint64_t *log_end_out, struc
     return 0;
 }
 
-int repld_open(const struct cluster_vol_rec *r)
+int repld_open(const struct cluster_vol_rec *r, const char *disk_root)
 {
     if (r->nrep == 0 || r->nrep > REPL_MAX_NODES || links_up(r) != 0)
         return TSDB_ERR_INVALID;
@@ -3869,7 +3869,9 @@ int repld_open(const struct cluster_vol_rec *r)
         return TSDB_ERR_NOMEM;
     rv->number = r->number;
     rec_set(rv, r);
-    snprintf(rv->dir, sizeof rv->dir, "%s/v%" PRIu32, G.dir, r->number);
+    const char *root = (disk_root && *disk_root) ? disk_root : G.dir;
+    snprintf(rv->disk_root, sizeof rv->disk_root, "%s", root);
+    snprintf(rv->dir, sizeof rv->dir, "%s/v%" PRIu32, rv->disk_root, r->number);
     rv->self = node_index(rv, G.self);
     rv->nnodes = (int)r->nrep;
     pthread_mutex_init(&rv->mu, NULL);

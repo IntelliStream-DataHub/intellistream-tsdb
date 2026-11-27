@@ -15,7 +15,16 @@
  * hooks it into the cluster thread (cluster_set_volume_watch, cluster_set_reporter): call before cluster_start.
  * 0, or -1 with a line on stderr. */
 int cvol_start(tsdb *t, const char *dir);
+/* Signal that disks_start() has finished (authoritative disk classes, states and store_ids are ready); the volume
+ * manager waits for this before scanning or opening any volume. */
+void cvol_disks_ready(void);
 void cvol_stop(void);
+/* Copies the disk root path (parent of v<N>) and/or 16-byte disk store_id of held volume `v`. Returns 0 if known,
+ * -1 otherwise. Thread-safe. */
+int cvol_vol_disk(uint32_t v, char *root_out, size_t cap, uint8_t store_id_out[16]);
+/* Lists volume numbers currently held on the disk with `store_id` into `vols_out[0..cap)`. Returns count written.
+ * Thread-safe (for r13-fill and r13-fault to map disk -> volumes). */
+uint32_t cvol_vols_on_disk(const uint8_t store_id[16], uint32_t *vols_out, uint32_t cap);
 /* The reason (TSDB_WHY_*) a request for cluster volume `v` is refused, for UNAVAILABLE's body: FENCED on a replica
  * (and on a leader whose writes are not switched on), RECOVERING while the volume is not open yet, UNREACHABLE on the
  * leader while it holds no read lease (cluster_lease_valid: no Raft leader's answer extended it). -1: v is no

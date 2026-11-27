@@ -58,5 +58,9 @@ void cvolset_sweep(const char *root);
 /* R9 (D6): log one clear line naming a v<N>.fault-<rid> evidence directory at most once per process (called from both
  * cvolset_sweep and cvolset_prepare so a directory is never logged twice). */
 void cvolset_log_fault_once(uint32_t number, const char *path);
+/* Scan `root` for v<N>.fault-* directories and log each once. */
+void cvolset_log_fault_dir(const char *root, uint32_t number);
+/* Multi-disk sweep (R13, r13-cvolfs): sweeps every eligible disk root for removed v<N>, .removed-* and .fault-*. */
+void cvolset_sweep_disks(const char *const *roots, int nroots);
 
 #endif

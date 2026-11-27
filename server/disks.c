@@ -1447,6 +1447,30 @@ void disks_chunk_paths(const char **paths, int cap, int *n_out)
         *n_out = out;
 }
 
+int disks_list(struct disk_info *out, int cap)
+{
+    if (!out || cap <= 0)
+        return 0;
+    int n = 0;
+    pthread_mutex_lock(&g_mu);
+    if (G.prepared || G.started) {
+        for (int i = 0; i < G.ndisks && n < cap; i++) {
+            const struct disk_entry *d = &G.disks[i];
+            struct disk_info *di = &out[n++];
+            memset(di, 0, sizeof *di);
+            snprintf(di->path, sizeof di->path, "%s", d->path);
+            memcpy(di->store_id, d->meta.store_id, 16);
+            di->disk_class = d->effective_class;
+            di->uses = d->uses;
+            di->state = d->state;
+            di->present = d->present;
+            di->size_bytes = d->size_bytes;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
 void disks_stop(void)
 {
     atomic_store_explicit(&g_disks_started, 0, memory_order_release);

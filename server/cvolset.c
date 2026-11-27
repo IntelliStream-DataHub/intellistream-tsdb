@@ -190,27 +190,30 @@ int cvolset_rid_of(const char *vdir, uint64_t *rid)
     return 0;
 }
 
+void cvolset_log_fault_dir(const char *root, uint32_t number)
+{
+    char pref[32];
+    int plen = snprintf(pref, sizeof pref, "v%" PRIu32 ".fault-", number);
+    DIR *d = opendir(root);
+    if (!d)
+        return;
+    for (struct dirent *e; (e = readdir(d)) != NULL;) {
+        if (plen > 0 && strncmp(e->d_name, pref, (size_t)plen) == 0) {
+            char fp[4400];
+            snprintf(fp, sizeof fp, "%s/%s", root, e->d_name);
+            cvolset_log_fault_once(number, fp);
+        }
+    }
+    closedir(d);
+}
+
 int cvolset_prepare(const char *root, uint32_t number, const struct cvolfs_rec *r)
 {
     char vdir[4200], to[4300];
     snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, number);
     /* R9 (D6): recognize v<N>.fault-<rid> set aside for a faulted replica: never opened, never deleted automatically,
      * one clear log line naming the path. */
-    {
-        char pref[32];
-        int plen = snprintf(pref, sizeof pref, "v%" PRIu32 ".fault-", number);
-        DIR *d = opendir(root);
-        if (d) {
-            for (struct dirent *e; (e = readdir(d)) != NULL;) {
-                if (plen > 0 && strncmp(e->d_name, pref, (size_t)plen) == 0) {
-                    char fp[4400];
-                    snprintf(fp, sizeof fp, "%s/%s", root, e->d_name);
-                    cvolset_log_fault_once(number, fp);
-                }
-            }
-            closedir(d);
-        }
-    }
+    cvolset_log_fault_dir(root, number);
     uint64_t want = 0;
     int reset = cvolset_noted(number, CVS_RESET, &want, 0) && want == r->rid;
     struct stat sb;

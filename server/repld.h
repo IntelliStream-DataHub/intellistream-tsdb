@@ -15,10 +15,11 @@
 
 /* The driver for the handle `t` whose root is `dir` (cluster mode). Call once, before the first repld_open. */
 void repld_init(tsdb *t, const char *dir);
-/* Opens the volume of record `r` from its directory (<dir>/v<N>, made and its generation recorded by server/cvol.c) as a
- * replica with the REPL file's commit floor, and starts its driver; the record's leader then leads it (an EPOCH marker,
- * the commit point past it, the promotion to the writer). 0, or a TSDB_ERR_* (nothing started). */
-int repld_open(const struct cluster_vol_rec *r);
+/* Opens the volume of record `r` from its directory (<disk_root>/v<N>, or <dir>/v<N> when disk_root is NULL/empty;
+ * made and its generation recorded by server/cvol.c) as a replica with the REPL file's commit floor, and starts its
+ * driver; the record's leader then leads it (an EPOCH marker, the commit point past it, the promotion to the writer).
+ * 0, or a TSDB_ERR_* (nothing started). */
+int repld_open(const struct cluster_vol_rec *r, const char *disk_root);
 /* A newer metadata record of a volume repld_open started (the ISR, the epoch, the members' addresses). */
 void repld_update(const struct cluster_vol_rec *r);
 /* 1 while volume v is held here and failed (FAIL, a failed save, the engine's fail-stop): it is quiesced and reported

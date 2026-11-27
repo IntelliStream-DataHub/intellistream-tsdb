@@ -386,7 +386,7 @@ $(B)/test_tiers: tests/test_tiers.c src/tiers.h src/chunk.h src/internal.h $(LIB
 
 # the disk side of tsdbd's volume manager (server/cvolfs.c): make v<N>, REPL's open generation and nonce; power loss
 # at every step (crashfs); the mutant runs plant the bugs it guards against and must fail
-$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/cluster.h server/snapinst.c server/snapinst.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
+$(B)/test_cvolfs: tests/test_cvolfs.c server/cvolfs.c server/cvolfs.h server/cvolset.c server/cvolset.h server/cluster.h server/meta.h server/snapinst.c server/snapinst.h src/disk.h src/replfile.h src/cvol.h src/internal.h $(B)/tsdb_crypto.o $(LIB) $(CRASHFS_SO)
 	$(CC) $(CFLAGS) -Isrc -Iserver -Iclient -o $@ tests/test_cvolfs.c server/cvolfs.c server/cvolset.c server/snapinst.c $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # the change feed's disk side (design-cdc.md step F1): FEED, requires=feed, retained segments, the cleaner
@@ -537,7 +537,7 @@ test-units-g:
 	$(if $(findstring -fsanitize=thread,$(CFLAGS)),TEST_REPLICA_CUT_PUBLISH_ONLY=1 $(MUT) --name test_replica --rc 66 --grep manifest_publish --grep replica_cut --list "cutwalsequnlocked" -- ./$(B)/test_replica --mutant @M@ @D@) # and a cut's
 	./$(B)/test_cvol $(SCRATCH)
 	./$(B)/test_cvolfs $(SCRATCH)
-	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
+	$(MUT) --name test_cvolfs --list "nosync nodirsync nononce trustunsure tornstale samerid removenodirsync cvolfirstdisk cvoldupok" -- ./$(B)/test_cvolfs --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_disks $(SCRATCH)
 	$(MUT) --name test_disks --list "rotationalflip bindtwice disknosync" -- ./$(B)/test_disks --mutant @M@ @D@ # each planted bug must fail it
 	./$(B)/test_tiers $(SCRATCH)
@@ -670,7 +670,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle r4stubs r9stubs o
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
     outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics progress full fullnonisr ecrebuild ecwhole \
-    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub ecback ecbackempty ecbackgc disks
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove youngscrub scrubheal scrub ecback ecbackempty ecbackgc disks twodisks
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1078,7 +1078,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants disks-mutants cvolfs-mutants tiers-mutants tierctl-mutants settle-policy-mutants margin-mutants lease-mutants hb-mutants report-mutants progress-mutants heal-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants sfill-mutants whole-mutants reconcile-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1116,7 +1116,7 @@ $(B)/creport.o: server/creport.c server/creport.h | $(B)
 $(B)/creport_drv.o: server/creport.c server/creport.h server/repld_int.h server/replwire.h server/cluster.h server/meta.h src/repl.h src/replfile.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -DCREPORT_DRV_ONLY -Isrc -c -o $@ $<
 # R12 (r12-young): per-node background scrub of cluster replicas' young .part and .ec files
-$(B)/scrubd.o: server/scrubd.c server/scrubd.h server/cluster.h server/creport.h server/repld.h src/cvol.h src/scrub.h src/internal.h | $(B)
+$(B)/scrubd.o: server/scrubd.c server/scrubd.h server/cluster.h server/creport.h server/cvol.h server/disks.h server/repld.h src/cvol.h src/scrub.h src/internal.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
 # frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
@@ -1309,6 +1309,11 @@ disk-mutants: $(B)/test_disks $(CRASHFS_SO) $(B)/tsdb
 disks-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
 	$(MUT) --name disks --list "nodevcheck classsilent missingasnew" -- env TSDB_DISKS_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ disks
+# R13 (r13-cvolfs) multi-disk log replica placement and duplicate-copy planted bugs, each must fail test_cvolfs and test_cluster twodisks
+cvolfs-mutants: $(B)/test_cvolfs $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(CRASHFS_SO)
+	$(MUT) --name test_cvolfs_r13 --list "cvolfirstdisk cvoldupok" -- ./$(B)/test_cvolfs --mutant @M@ @D@
+	$(MUT) --name twodisks --uring --list "cvolfirstdisk cvoldupok" -- env TSDB_CVOL_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ twodisks
 
 # TIERS catalog, db_id binding, device isolation and crashfs mutants (src/tiers.c, src/volumes.c, tests/test_tiers.c)
 tiers-mutants: $(B)/test_tiers $(CRASHFS_SO)

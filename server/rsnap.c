@@ -102,7 +102,8 @@ struct rjob {
     uint64_t pace_id;        /* active job id registered with server/pace.c (0: none) */
     struct snap_epoch *hist; /* source: the leader's epoch history for the make */
     size_t nhist;
-    char dir[PATH_MAX + 32]; /* source: the snapshot (once made); receiver: v<N>.snap */
+    char root[PATH_MAX];     /* receiver: disk root of v<N> (parent of v<N>.snap; R13 D14) */
+    char dir[PATH_MAX + 32]; /* source: the snapshot (once made); receiver: <root>/v<N>.snap */
     int made;                /* the directory exists and is this job's to remove */
     struct snap_man man;
     int have_man;
@@ -595,7 +596,8 @@ void rsnap_need(struct rvol *rv, int src)
     j->margin = snap_pace_margin(&rv->rec);
     j->pace_id = pace_job_begin_ex(PACE_RECV, j->margin, 0);
     j->start_ms = j->last_ms = j->progress_ms = now;
-    snprintf(j->dir, sizeof j->dir, "%s/v%" PRIu32 ".snap", G.dir, rv->number);
+    snprintf(j->root, sizeof j->root, "%s", rv->disk_root[0] ? rv->disk_root : G.dir);
+    snprintf(j->dir, sizeof j->dir, "%s/v%" PRIu32 ".snap", j->root, rv->number);
     j->next = S.jobs;
     S.jobs = j;
     task_add(W_PREP, j);
@@ -606,15 +608,15 @@ void rsnap_need(struct rvol *rv, int src)
     rv->snap_said = 1;
 }
 
-/* the space a snapshot of `total` bytes needs free beside the live volumes (D5) */
-static int space_ok(uint64_t total, uint64_t *avail)
+/* the space a snapshot of `total` bytes needs free beside the live volumes (D5, on the disk of v<N>: R13 D14) */
+static int space_ok(const char *root, uint64_t total, uint64_t *avail)
 {
     uint64_t need = total + (total / 10 > RS_SPACE_MIN ? total / 10 : RS_SPACE_MIN);
     if (S.free_hook) {
         *avail = S.free_hook;
     } else {
         struct statvfs sv;
-        if (statvfs(G.dir, &sv) != 0)
+        if (statvfs(root, &sv) != 0)
             return 0;
         *avail = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
     }
@@ -636,7 +638,7 @@ static void dst_man(struct rjob *j)
     uint8_t *fdone = rc == 0 ? calloc(m.nfiles ? m.nfiles : 1, 1) : NULL;
     if (rc == 0 && !fdone)
         rc = TSDB_ERR_NOMEM;
-    int space = rc == 0 && (G.mutant == RM_SNAPNOSPACECHECK || space_ok(total, &avail));
+    int space = rc == 0 && (G.mutant == RM_SNAPNOSPACECHECK || space_ok(j->root, total, &avail));
     pthread_mutex_lock(&S.mu);
     j->busy--;
     pthread_cond_broadcast(&S.cv);
@@ -652,7 +654,7 @@ static void dst_man(struct rjob *j)
         if (!v->said_space)
             say("volume %" PRIu32 ": a snapshot of %" PRIu64 " bytes is refused: the file system of %s has %" PRIu64
                 " bytes free and needs the snapshot plus 10%% (at least 1 GiB), so the live volumes never run out;"
-                " asked again at the next notice (said once)", j->vol, total, G.dir, avail);
+                " asked again at the next notice (said once)", j->vol, total, j->root, avail);
         v->said_space = 1;
         STAT(refused_space, 1);
         snap_man_free(&m);
@@ -1196,7 +1198,7 @@ static void w_prep(struct rjob *j)
     struct stat st;
     int ok = !(lstat(j->dir, &st) == 0 && snap_release(j->dir) != 0);
     int err = ok ? 0 : EIO;
-    if (ok && (mkdir(j->dir, 0755) != 0 || dir_sync(G.dir) != 0))
+    if (ok && (mkdir(j->dir, 0755) != 0 || dir_sync(j->root) != 0))
         ok = 0, err = errno;
     pthread_mutex_lock(&S.mu);
     j->made = ok;
@@ -1397,7 +1399,7 @@ static void install(struct rjob *j)
     uint64_t inst_start_wall = mono_to_wall_ms(j->start_ms, ms_now(), wall_ms_now());
     snapinst_progress_begin(j->vol, j->total, inst_start_wall);
     struct snapinst_result res;
-    int rc = snapinst_install(G.dir, j->vol, j->dir, m->p, m->p_epoch, &res);
+    int rc = snapinst_install(j->root, j->vol, j->dir, m->p, m->p_epoch, &res);
     snapinst_progress_end(j->vol);
     /* rv's reference keeps it (unlisted by the install's repld_close_end, or not) from being freed and its address
      * reused by the next open's driver until this compare is done */
@@ -1495,12 +1497,12 @@ static void w_finish(struct rjob *j)
         " MB/s)", j->vol, j->peer, j->man.nfiles, j->total, (double)took / 1000,
         took ? (double)j->total / (1 << 20) / ((double)took / 1000) : 0.0);
     if (S.hold) { /* TSDB_REPLD_TEST=snaphold: kept as v<N>.snapheld for the test to compare with SNAPMAN */
-        char held[sizeof G.dir + 32];
-        snprintf(held, sizeof held, "%s/v%" PRIu32 ".snapheld", G.dir, j->vol);
+        char held[sizeof j->root + 32];
+        snprintf(held, sizeof held, "%s/v%" PRIu32 ".snapheld", j->root, j->vol);
         struct stat st;
         if (lstat(held, &st) == 0)
             snap_release(held);
-        if (rename(j->dir, held) == 0 && dir_sync(G.dir) == 0) {
+        if (rename(j->dir, held) == 0 && dir_sync(j->root) == 0) {
             say("TEST: volume %" PRIu32 ": the snapshot is kept in %s (snaphold)", j->vol, held);
             j->made = 0;
         }

@@ -8470,6 +8470,7 @@ int main(int argc, char **argv)
             cvol_stop();
             return 1;
         }
+        cvol_disks_ready();
         const char *chunk_paths[CHUNKSRV_DIRS_MAX];
         int nchunk = 0;
         disks_chunk_paths(chunk_paths, CHUNKSRV_DIRS_MAX, &nchunk);

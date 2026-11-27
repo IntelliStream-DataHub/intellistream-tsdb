@@ -29807,6 +29807,280 @@ static void scen_disks(void)
     printf("  witness Raft leader decoded HBS_DISKS and committed STORE_ADD + MEMBER_ROLE\n");
 }
 
+/* R13 (r13-cvolfs; E48, E51, D14): a node with two fast disks spreads new log replicas across both, reports each
+ * volume's disk store_id in HBS_VOLUMES/STATUS, keeps the same placement across SIGKILL+restart, installs R4 snapshots
+ * onto the disk of its v<N> (second disk), and refuses a volume with duplicate v<N> across both disks naming both
+ * paths (mutants: cvolfirstdisk, cvoldupok). */
+static void scen_twodisks(void)
+{
+    scenario("twodisks");
+    char d0a[PATH_MAX], d0b[PATH_MAX];
+    snprintf(d0a, sizeof d0a, "%s/n0_nvme0", base);
+    snprintf(d0b, sizeof d0b, "%s/n0_nvme1", base);
+    disk_make(d0a, "nvme");
+    disk_make(d0b, "nvme");
+
+    disk_meta dm0a, dm0b;
+    if (disk_load(d0a, &dm0a) != 0 || disk_load(d0b, &dm0b) != 0)
+        die("twodisks: disk_load failed");
+
+    char xa0[PATH_MAX * 2 + 64];
+    no_auto_disk[0] = 1;
+    omit_dir[0] = 1;
+    snprintf(xa0, sizeof xa0, "--disk %s:nvme --disk %s:nvme", d0a, d0b);
+    xargs[0] = xa0;
+    envs[0] = "setop_file=1";
+    envs[1] = "setop_file=1";
+    envs[2] = "setop_file=1";
+
+    init_retain_s = 2;
+    start(0);
+    start(1);
+    start(2);
+    init_cluster(0, 600);
+    init_retain_s = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "twodisks: three voters");
+
+    struct disks_want w0 = {ids[0], 2, META_ROLE_BOTH, META_CAP_BOTH};
+    await_view(0, p_member_disks, &w0, "twodisks: node 0 STORE_ADD (2 nvme disks)");
+
+    /* 1. Create 4 replicated volumes (replicas=3) so node 0 holds all 4; E51 must spread across BOTH fast disks. */
+    static const char *const vnames[4] = {"tw1", "tw2", "tw3", "tw4"};
+    uint32_t vnums[4] = {0};
+    int on_disk[4] = {-1, -1, -1, -1}; /* 0 = d0a, 1 = d0b */
+    int cnt_a = 0, cnt_b = 0;
+    for (int k = 0; k < 4; k++) {
+        int rc = vol_add(0, vnames[k], 3, &vnums[k]);
+        if (rc != 0)
+            die("twodisks: vol_add %s: %s", vnames[k], cluster_strerror(rc));
+        for (int i = 0; i < 3; i++)
+            await_open_gen(0, vnames[k], i, 1, 0);
+        await_isr(0, vnames[k], 3, 30000, "twodisks: volume ISR=3");
+        char pa[PATH_MAX + 32], pb[PATH_MAX + 32];
+        snprintf(pa, sizeof pa, "%s/v%" PRIu32, d0a, vnums[k]);
+        snprintf(pb, sizeof pb, "%s/v%" PRIu32, d0b, vnums[k]);
+        int ha = access(pa, F_OK) == 0, hb = access(pb, F_OK) == 0;
+        if (ha == hb)
+            die("twodisks: v%" PRIu32 " present on d0a=%d d0b=%d (want exactly one)", vnums[k], ha, hb);
+        on_disk[k] = ha ? 0 : 1;
+        cnt_a += ha;
+        cnt_b += hb;
+    }
+    if (cnt_a == 0 || cnt_b == 0)
+        die("twodisks: volumes were not spread across both fast disks (d0a=%d, d0b=%d)", cnt_a, cnt_b);
+
+    /* Verify HBS_VOLUMES / STATUS reports the exact store_id for each volume on node 0. */
+    {
+        int matched = 0;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000 && matched < 4; usleep(100000)) {
+            matched = 0;
+            struct view vw;
+            view(1, &vw);
+            for (uint32_t i = 0; i < vw.st.nheard; i++) {
+                if (vw.st.heard[i].id != ids[0])
+                    continue;
+                for (uint32_t j = 0; j < vw.st.heard[i].nvols; j++) {
+                    const struct cluster_vol_report *vr = &vw.st.heard[i].vols[j].v;
+                    for (int k = 0; k < 4; k++) {
+                        if (vr->volume == vnums[k]) {
+                            const uint8_t *want = on_disk[k] == 0 ? dm0a.store_id : dm0b.store_id;
+                            if (memcmp(vr->store_id, want, 16) == 0)
+                                matched++;
+                        }
+                    }
+                }
+            }
+            view_free(&vw);
+        }
+        if (matched < 4)
+            die("twodisks: HBS_VOLUMES/STATUS did not report matching disk store_id for all 4 volumes (%d/4)", matched);
+    }
+    printf("  4 volumes placed across both fast disks (d0a=%d, d0b=%d), HBS_VOLUMES store_id verified\n", cnt_a, cnt_b);
+
+    /* Pick one volume on d0a (ka) and one volume on d0b (kb) for restart, snapshot install, and duplicate checks. */
+    int ka = -1, kb = -1;
+    for (int k = 0; k < 4; k++) {
+        if (on_disk[k] == 0 && ka < 0)
+            ka = k;
+        if (on_disk[k] == 1 && kb < 0)
+            kb = k;
+    }
+
+    /* 2. Kill (SIGKILL) and restart node 0: all 4 volumes must keep the exact same disk placement. */
+    {
+        struct view vw;
+        view(1, &vw);
+        const struct meta_member *m0 = meta_member(&vw.m, ids[0]);
+        struct state_want up0 = {ids[0], META_UP, m0 ? m0->incarnation + 1 : 1};
+        view_free(&vw);
+        stop(0, SIGKILL);
+        start(0);
+        await_view(1, p_member_state, &up0, "twodisks: node 0 restarted after SIGKILL");
+        for (int k = 0; k < 4; k++) {
+            await_isr(1, vnames[k], 3, 30000, "twodisks: ISR=3 after SIGKILL restart");
+            char pa[PATH_MAX + 32], pb[PATH_MAX + 32];
+            snprintf(pa, sizeof pa, "%s/v%" PRIu32, d0a, vnums[k]);
+            snprintf(pb, sizeof pb, "%s/v%" PRIu32, d0b, vnums[k]);
+            int ha = access(pa, F_OK) == 0, hb = access(pb, F_OK) == 0;
+            if ((on_disk[k] == 0 && (!ha || hb)) || (on_disk[k] == 1 && (ha || !hb)))
+                die("twodisks: v%" PRIu32 " moved across restart (want disk %d, got d0a=%d d0b=%d)", vnums[k],
+                    on_disk[k], ha, hb);
+        }
+    }
+    printf("  SIGKILL + restart preserved exact disk placement for all 4 volumes\n");
+
+    /* 3. R4 snapshot install on kb (living on second disk d0b) lands on d0b with a new inode, never d0a. */
+    {
+        char vbp[PATH_MAX + 32], vap[PATH_MAX + 32], snap_a[PATH_MAX + 48], snap_b[PATH_MAX + 48];
+        snprintf(vbp, sizeof vbp, "%s/v%" PRIu32, d0b, vnums[kb]);
+        snprintf(vap, sizeof vap, "%s/v%" PRIu32, d0a, vnums[kb]);
+        snprintf(snap_a, sizeof snap_a, "%s/v%" PRIu32 ".snap", d0a, vnums[kb]);
+        snprintf(snap_b, sizeof snap_b, "%s/v%" PRIu32 ".snap", d0b, vnums[kb]);
+        struct stat st_before;
+        if (stat(vbp, &st_before) != 0)
+            die("twodisks: stat %s before snapshot: %s", vbp, strerror(errno));
+
+        /* Write an initial row on kb's leader so the series exists across all 3 replicas. */
+        struct meta_volume mv;
+        if (!vol_rec(1, vnames[kb], &mv))
+            die("twodisks: no record of %s", vnames[kb]);
+        int L = server_of(mv.leader);
+        tsdbc *c = client(L);
+        uint64_t sid = rep_series(c, rep_names[0], vnames[kb], 30000);
+        int64_t t = 1000;
+        snap_rows(c, sid, &t, 10);
+        tsdbc_close(c);
+        await_isr(1, vnames[kb], 3, 15000, "twodisks: kb initial write in ISR=3");
+
+        /* Kill node 0, wait for kb ISR=2 and a live leader != 0, then advance past repl_retain_s=2 s. */
+        stop(0, SIGKILL);
+        await_isr(1, vnames[kb], 2, 15000, "twodisks: kb ISR=2 while node 0 down");
+        int newL = -1;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000; usleep(100000)) {
+            if (vol_rec(1, vnames[kb], &mv) && mv.leader != ids[0]) {
+                int s = server_of(mv.leader);
+                if (s == 1 || s == 2) {
+                    newL = s;
+                    break;
+                }
+            }
+        }
+        if (newL < 0)
+            die("twodisks: kb did not elect a leader among nodes 1/2 while node 0 was down");
+        c = client(newL);
+        struct timespec s1 = {1, 0};
+        for (int r = 0; r < 6; r++) {
+            snap_rows(c, sid, &t, 100);
+            int rc = tsdbc_flush(c);
+            if (rc != 0)
+                die("twodisks: flush on %s: %s", vnames[kb], ers(rc));
+            nanosleep(&s1, NULL);
+        }
+        snap_rows(c, sid, &t, 5);
+        tsdbc_close(c);
+
+        /* Restart node 0: it must receive and install the snapshot onto d0b/v<kb>. */
+        start(0);
+        char want_inst[96];
+        snprintf(want_inst, sizeof want_inst, "volume %" PRIu32 ": snapshot installed: P", vnums[kb]);
+        await_log(0, want_inst, 60000, "twodisks: snapshot installed on second disk d0b");
+        await_isr(1, vnames[kb], 3, 60000, "twodisks: kb rejoined ISR after snapshot install");
+
+        struct stat st_after;
+        if (stat(vbp, &st_after) != 0)
+            die("twodisks: %s missing after snapshot install", vbp);
+        if (st_after.st_ino == st_before.st_ino)
+            die("twodisks: %s inode unchanged after snapshot install (expected swap on d0b)", vbp);
+        if (access(vap, F_OK) == 0)
+            die("twodisks: %s unexpectedly appeared on d0a after snapshot install", vap);
+        if (access(snap_a, F_OK) == 0 || access(snap_b, F_OK) == 0)
+            die("twodisks: leftover v%" PRIu32 ".snap on d0a or d0b after install", vnums[kb]);
+    }
+    printf("  R4 snapshot install of v%" PRIu32 " landed atomically on second disk d0b (new inode, no leftovers)\n",
+           vnums[kb]);
+
+    /* 4. Duplicate v<kb> copied onto d0a while node 0 is down -> node 0 refuses ONLY v<kb> naming both paths
+     * (catches cvoldupok), while v<ka> continues to open and serve cleanly. */
+    {
+        struct view vw;
+        view(1, &vw);
+        const struct meta_member *m0 = meta_member(&vw.m, ids[0]);
+        struct state_want up0 = {ids[0], META_UP, m0 ? m0->incarnation + 1 : 1};
+        view_free(&vw);
+        stop(0, SIGTERM);
+
+        char cmd[PATH_MAX * 2 + 64], dup_a[PATH_MAX + 32], dup_b[PATH_MAX + 32];
+        snprintf(dup_a, sizeof dup_a, "%s/v%" PRIu32, d0a, vnums[kb]);
+        snprintf(dup_b, sizeof dup_b, "%s/v%" PRIu32, d0b, vnums[kb]);
+        snprintf(cmd, sizeof cmd, "cp -a '%s' '%s'", dup_b, dup_a);
+        if (system(cmd) != 0)
+            die("twodisks: failed to plant duplicate %s", dup_a);
+
+        start(0);
+        await_view(1, p_member_state, &up0, "twodisks: node 0 restarted with duplicate v<kb>");
+        await_isr(1, vnames[ka], 3, 30000, "twodisks: non-duplicate volume ka still joins ISR");
+
+        int saw_fault = 0;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000 && !saw_fault; usleep(150000)) {
+            view(1, &vw);
+            for (uint32_t i = 0; i < vw.st.nheard; i++) {
+                if (vw.st.heard[i].id != ids[0])
+                    continue;
+                for (uint32_t j = 0; j < vw.st.heard[i].nvols; j++) {
+                    const struct cluster_vol_report *vr = &vw.st.heard[i].vols[j].v;
+                    if (vr->volume == vnums[kb] && vr->health == CL_HEALTH_LOCAL_FAULT)
+                        saw_fault = 1;
+                }
+            }
+            view_free(&vw);
+        }
+        if (!saw_fault)
+            die("twodisks: duplicate v%" PRIu32 " across both disks was not refused (expected CL_HEALTH_LOCAL_FAULT)",
+                vnums[kb]);
+        if (!log_has(0, "duplicate replica directories found at") || !log_has(0, dup_a) || !log_has(0, dup_b))
+            die("twodisks: refusal log did not name both duplicate paths %s and %s", dup_a, dup_b);
+
+        /* Removing the duplicate restores v<kb> cleanly on restart. */
+        stop(0, SIGTERM);
+        if (nftw(dup_a, rm_one, 16, FTW_DEPTH | FTW_PHYS) != 0)
+            die("twodisks: remove duplicate %s: %s", dup_a, strerror(errno));
+        start(0);
+        await_isr(1, vnames[kb], 3, 30000, "twodisks: v<kb> recovered after removing duplicate");
+    }
+    printf("  duplicate v%" PRIu32 " on both disks refused naming both paths; other volumes unaffected; recovered after removal\n",
+           vnums[kb]);
+
+    /* 5. Live REPLICA_REMOVE of v<kb> (on second disk d0b): cvolset_close routes via cvol_vol_disk(), renaming
+     * d0b/v<kb> -> d0b/v<kb>.removed-<rid> on d0b (never crossing filesystems) and deleting it in background. */
+    {
+        pause_server(0, 1);
+        await_isr(1, vnames[kb], 2, 20000, "twodisks: node 0 paused for replica remove on d0b");
+        char res[512], op[64];
+        snprintf(op, sizeof op, "remove %" PRIu32 " %" PRIu32, vnums[kb], ids[0]);
+        set_op(3, op, res, sizeof res);
+        if (!strstr(res, "proposed"))
+            die("twodisks: remove v%" PRIu32 " from node 0: %s", vnums[kb], res);
+        struct meta_volume mv;
+        await_member(1, vnames[kb], 0, 0, 2, 15000, &mv);
+        pause_server(0, 0);
+        char want_rem[PATH_MAX + 64];
+        snprintf(want_rem, sizeof want_rem, "renamed %s/v%" PRIu32 ".removed-", d0b, vnums[kb]);
+        await_log(0, want_rem, 20000, "twodisks: cvolset_close renamed v<kb> to .removed- on second disk d0b");
+        char vbp[PATH_MAX + 32];
+        snprintf(vbp, sizeof vbp, "%s/v%" PRIu32, d0b, vnums[kb]);
+        for (uint64_t t0 = now_ms(); access(vbp, F_OK) == 0; usleep(50000)) {
+            if (now_ms() - t0 > 15000)
+                die("twodisks: %s still present 15 s after replica remove", vbp);
+        }
+    }
+    printf("  live REPLICA_REMOVE of v%" PRIu32 " renamed to .removed-<rid> on second disk d0b and cleaned up\n",
+           vnums[kb]);
+    stop_all();
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -29865,7 +30139,7 @@ int main(int argc, char **argv)
                {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove},
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
-               {"disks", scen_disks}};
+               {"disks", scen_disks}, {"twodisks", scen_twodisks}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

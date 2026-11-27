@@ -194,9 +194,16 @@ cgroup, so `nice` does not keep your work out of its way.
   surviving slot (the `unsure` flag is stored by the next save and cleared only by one with `led` = `fence`: a restart does not make the older
   slot's values trusted); `tests/test_replfile.c`, `fuzz_repl`). tsdbd's volume manager keeps its replicas' open generation and
   nonce in it: `server/cvolfs.c` (make `v<N>`: META, REPL, FNO in `v<N>.tmp`, renamed; load, check and raise REPL at every
-  open; a missing, unreadable or CORRUPT REPL, another identity and a failed save refuse the volume with a line naming the
-  path; `tests/test_cvolfs.c`: power loss at every step under crashfs, mutants `nosync nodirsync nononce trustunsure tornstale samerid`,
-  also settable as `TSDB_CVOL_MUTANT` in tsdbd for `test_cluster volumes`), `server/cvol.c` the manager thread above it.
+  open; R13 `r13-cvolfs` E48/E51/D14: `cvolfs_prepare_disks`/`cvolfs_pick_disk` place a new `v<N>` on the UP fast disk
+  with fewest replicas weighted by 1h WAL bytes/s below `young_move_pct` (`nvme` before `ssd`; `log_on_hdd` allows `hdd`
+  only when no fast disk is UP), scan every UP fast disk (and `hdd` with `log_on_hdd`) plus probe non-UP disks so a copy
+  on a DOWN disk is never duplicated, refuse duplicate `v<N>` across two disks naming both paths, keep R4 siblings and
+  snapshot staging/space checks on `v<N>`'s disk, and report each volume's disk `store_id` in `HBS_VOLUMES`/`STATUS`
+  alongside local `cvol_vol_disk`/`cvol_vols_on_disk`; a missing, unreadable or CORRUPT REPL, another identity and a failed
+  save refuse the volume with a line naming the path; `tests/test_cvolfs.c`: power loss at every step under crashfs on
+  primary and second disk, mutants `nosync nodirsync nononce trustunsure tornstale samerid removenodirsync cvolfirstdisk
+  cvoldupok`, also settable as `TSDB_CVOL_MUTANT` in tsdbd for `test_cluster volumes` and `test_cluster twodisks`;
+  `make cvolfs-mutants`), `server/cvol.c` the manager thread above it.
   Replica set changes (R4, r4-setchg; design-cluster.md 8.3): `server/rset.c` applies a new `set_version` in the driver
   on the volume thread (`rset_change` keeps a newer record, `rset_apply` drains the core, `repl_reconfig` with `old_of`
   by node AND rid, so a reset member is new; the driver's cursors move with their members; a newer record that came

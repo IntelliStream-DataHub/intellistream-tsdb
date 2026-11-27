@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 #include "cvolfs.h"
 #include "cvolset.h"
+#include "meta.h"
 #include "snapinst.h"
 
 #include <dirent.h>
@@ -25,12 +26,15 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "../client/tsdb_crypto.h"
 #include "../src/cvol.h"
+#include "../src/disk.h"
 #include "../src/replfile.h"
 #include "tsdb.h"
 
@@ -125,19 +129,167 @@ static void fill_state(struct replfile_state *st, const struct cvolfs_rec *r)
     st->rid = r->rid;
 }
 
-/* makes <root>/v<N> whole (the header); 0 or -1 with a line said */
-static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vdir)
+#define CVOLFS_BASE_BPS 65536.0 /* 64 KiB/s per replica so idle volumes spread evenly across disks (E51) */
+
+int cvolfs_disk_scannable(const struct cvolfs_disk *d, int log_on_hdd)
 {
-    char tmp[4300], meta[4096], u[33], c[33];
-    snprintf(tmp, sizeof tmp, "%s.tmp", vdir);
+    if (!d || !d->present || d->state != META_STORE_UP || !d->path[0])
+        return 0;
+    if (d->disk_class == DISK_CLASS_NVME || d->disk_class == DISK_CLASS_SSD)
+        return 1;
+    if (log_on_hdd && d->disk_class == DISK_CLASS_HDD)
+        return 1;
+    return 0;
+}
+
+static const char *store_state_str(uint8_t st)
+{
+    switch (st) {
+    case META_STORE_UP: return "up";
+    case META_STORE_DOWN: return "down";
+    case META_STORE_OUT: return "out";
+    case META_STORE_DESTROYED: return "destroyed";
+    default: return "unknown";
+    }
+}
+
+static int class_rank(int cls)
+{
+    if (cls == DISK_CLASS_NVME)
+        return 0;
+    if (cls == DISK_CLASS_SSD)
+        return 1;
+    return 2;
+}
+
+static double disk_fill_pct(const struct cvolfs_disk *d, int *known)
+{
+    uint64_t sz = 0, used = 0;
+    if (d->have_usage && d->size_bytes > 0) {
+        sz = d->size_bytes;
+        used = d->used_bytes;
+    } else {
+        struct statvfs sv;
+        if (statvfs(d->path, &sv) == 0 && sv.f_blocks > 0) {
+            uint64_t unit = sv.f_frsize ? (uint64_t)sv.f_frsize : (uint64_t)sv.f_bsize;
+            sz = (uint64_t)sv.f_blocks * unit;
+            uint64_t avail = (uint64_t)sv.f_bavail * unit;
+            used = sz > avail ? sz - avail : 0;
+        }
+    }
+    if (sz == 0) {
+        *known = 0;
+        return 0.0;
+    }
+    *known = 1;
+    return ((double)used * 100.0) / (double)sz;
+}
+
+int cvolfs_pick_disk(const struct cvolfs_disk *disks, int ndisks, uint32_t young_move_pct, int log_on_hdd)
+{
+    if (!disks || ndisks <= 0)
+        return -1;
+    int has_fast_up = 0;
+    for (int i = 0; i < ndisks; i++) {
+        const struct cvolfs_disk *d = &disks[i];
+        if (d->present && d->state == META_STORE_UP && d->path[0] &&
+            (d->disk_class == DISK_CLASS_NVME || d->disk_class == DISK_CLASS_SSD)) {
+            has_fast_up = 1;
+            break;
+        }
+    }
+    if (!has_fast_up && !log_on_hdd)
+        return -1;
+
+    uint32_t mark = young_move_pct ? young_move_pct : 80u;
+    int elig[META_DISKS_MAX];
+    int below[META_DISKS_MAX];
+    double fill[META_DISKS_MAX];
+    double score[META_DISKS_MAX];
+    int nelig = 0, nbelow = 0;
+
+    for (int i = 0; i < ndisks && nelig < META_DISKS_MAX; i++) {
+        const struct cvolfs_disk *d = &disks[i];
+        if (!d->present || d->state != META_STORE_UP || !d->path[0])
+            continue;
+        if (has_fast_up) {
+            if (d->disk_class != DISK_CLASS_NVME && d->disk_class != DISK_CLASS_SSD)
+                continue;
+        } else {
+            if (d->disk_class != DISK_CLASS_HDD)
+                continue;
+        }
+        int known = 0;
+        double pct = disk_fill_pct(d, &known);
+        int ok = !known || pct < (double)mark;
+        elig[nelig] = i;
+        below[nelig] = ok;
+        fill[nelig] = pct;
+        score[nelig] = (double)d->nreplicas * CVOLFS_BASE_BPS + (d->wal_bps > 0.0 ? d->wal_bps : 0.0);
+        if (ok)
+            nbelow++;
+        nelig++;
+    }
+    if (nelig == 0)
+        return -1;
+    if (cvolfs_test_mutant == CVOLFS_MUT_FIRSTDISK)
+        return elig[0]; /* planted: ignore E51 balance/fill/class rules and always choose disk 0 */
+
+    /* E51 / §15.3: never place a new log replica on a disk whose projected use is at or above young_move_pct
+     * (a brand-new empty v<N> adds 0 initial bytes; callers with a non-zero estimate fold it into used_bytes). */
+    if (nbelow == 0) {
+        say("all %d eligible disk(s) are at or above young_move_pct (%" PRIu32 "%%): refusing new replica placement",
+            nelig, mark);
+        return -1;
+    }
+
+    int best_k = -1;
+    for (int k = 0; k < nelig; k++) {
+        if (!below[k])
+            continue;
+        if (best_k < 0) {
+            best_k = k;
+            continue;
+        }
+        int idx = elig[k], bidx = elig[best_k];
+        /* Primary E51 criterion: fewest replicas weighted by 1-hour WAL bytes/s. */
+        if (score[k] + 1e-6 < score[best_k]) {
+            best_k = k;
+            continue;
+        }
+        if (score[best_k] + 1e-6 < score[k])
+            continue;
+        /* Tie-break 1 (E51): nvme before ssd. */
+        int cr = class_rank(disks[idx].disk_class), bcr = class_rank(disks[bidx].disk_class);
+        if (cr != bcr) {
+            if (cr < bcr)
+                best_k = k;
+            continue;
+        }
+        /* Tie-break 2: lower fill %. */
+        if (fill[k] + 1e-6 < fill[best_k])
+            best_k = k;
+    }
+    return best_k >= 0 ? elig[best_k] : -1;
+}
+
+int cvolfs_clean_tmp(const char *root, uint32_t number)
+{
+    char tmp[4300];
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s/v%" PRIu32 ".tmp", root, number) >= sizeof tmp) {
+        say("volume %" PRIu32 ": the path of %s is too long", number, root);
+        return -1;
+    }
     /* a crash may have left a tmp directory: every file in it (META, REPL, FNO and their tmps, whatever step the
      * crash came at), then itself; nothing in it was ever relied on */
     DIR *d = opendir(tmp);
-    if (!d && errno != ENOENT) {
-        say("volume %" PRIu32 ": cannot read the leftover %s: %s", r->number, tmp, strerror(errno));
+    if (!d) {
+        if (errno == ENOENT)
+            return 0;
+        say("volume %" PRIu32 ": cannot read the leftover %s: %s", number, tmp, strerror(errno));
         return -1;
     }
-    for (struct dirent *e; d && (errno = 0, e = readdir(d));) {
+    for (struct dirent *e; (errno = 0, e = readdir(d));) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
             continue;
         char f[4600];
@@ -146,19 +298,31 @@ static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vd
             break; /* rmdir names it below */
         errno = 0;
     }
-    if (d && errno) { /* a readdir error is an error, never the end of the directory */
-        say("volume %" PRIu32 ": cannot read the leftover %s: %s", r->number, tmp, strerror(errno));
+    if (errno) { /* a readdir error is an error, never the end of the directory */
+        say("volume %" PRIu32 ": cannot read the leftover %s: %s", number, tmp, strerror(errno));
         closedir(d);
         return -1;
     }
-    if (d)
-        closedir(d);
+    closedir(d);
     if (rmdir(tmp) != 0 && errno != ENOENT) {
-        say("volume %" PRIu32 ": cannot remove the leftover %s: %s", r->number, tmp, strerror(errno));
+        say("volume %" PRIu32 ": cannot remove the leftover %s: %s", number, tmp, strerror(errno));
         return -1;
     }
-    if (root_format(root, meta, sizeof meta - 256) != 0) {
-        say("volume %" PRIu32 ": cannot read the format lines of %s/META", r->number, root);
+    return 0;
+}
+
+/* makes <disk_root>/v<N> whole (reading root format lines from <meta_root>/META); 0 or -1 with a line said */
+static int make_dir(const char *meta_root, const char *disk_root, const struct cvolfs_rec *r, const char *vdir)
+{
+    char tmp[4300], meta[4096], u[33], c[33];
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", vdir) >= sizeof tmp) {
+        say("volume %" PRIu32 ": the path of %s is too long", r->number, vdir);
+        return -1;
+    }
+    if (cvolfs_clean_tmp(disk_root, r->number) != 0)
+        return -1;
+    if (root_format(meta_root, meta, sizeof meta - 256) != 0) {
+        say("volume %" PRIu32 ": cannot read the format lines of %s/META", r->number, meta_root);
         return -1;
     }
     if (r->rid == 0) {
@@ -185,7 +349,7 @@ static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vd
             close(dfd);
     }
     if (!ok || tsdb_cvol_fno_create(tmp) != 0 || sync_dir(tmp) != 0 || rename(tmp, vdir) != 0 ||
-        (cvolfs_test_mutant != CVOLFS_MUT_NODIRSYNC && sync_dir(root) != 0)) {
+        (cvolfs_test_mutant != CVOLFS_MUT_NODIRSYNC && sync_dir(disk_root) != 0)) {
         say("volume %" PRIu32 ": cannot make %s: %s", r->number, vdir, strerror(errno));
         return -1;
     }
@@ -193,24 +357,127 @@ static int make_dir(const char *root, const struct cvolfs_rec *r, const char *vd
     return 0;
 }
 
-int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_open *out)
+int cvolfs_prepare_disks(const char *meta_root, const struct cvolfs_disk *disks, int ndisks,
+                         const struct cvolfs_rec *r, struct cvolfs_open *out)
 {
-    char vdir[4200];
-    if (snapinst_leftovers(root, r->number) != 0 || cvolset_prepare(root, r->number, r) != 0)
-        return -1; /* R4: an install a crash interrupted, a directory the record no longer describes (lines said) */
-    if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number) >= sizeof vdir) {
-        say("volume %" PRIu32 ": the path of %s is too long", r->number, root);
+    if (!meta_root || !disks || ndisks <= 0 || !r || !out)
         return -1;
+    int scan[META_DISKS_MAX], found[META_DISKS_MAX], found_down[META_DISKS_MAX];
+    int nscan = 0, nfound = 0, nfound_down = 0;
+    int is_scan[META_DISKS_MAX];
+    int nlim = ndisks < META_DISKS_MAX ? ndisks : META_DISKS_MAX;
+    for (int i = 0; i < nlim; i++) {
+        is_scan[i] = cvolfs_disk_scannable(&disks[i], r->log_on_hdd);
+        if (is_scan[i])
+            scan[nscan++] = i;
     }
-    struct stat sb;
-    if (stat(vdir, &sb) != 0) {
-        if (errno != ENOENT) {
+
+    char vdir[4200];
+    /* Pass 1a: finish/undo snapshot install leftovers, log any fault evidence dirs, and locate v<N> on UP scannable disks. */
+    for (int s = 0; s < nscan; s++) {
+        int idx = scan[s];
+        const char *root = disks[idx].path;
+        if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, root, r->number) >= sizeof vdir) {
+            say("volume %" PRIu32 ": the path of %s is too long", r->number, root);
+            return -1;
+        }
+        if (snapinst_leftovers(root, r->number) != 0)
+            return -1;
+        cvolset_log_fault_dir(root, r->number);
+        struct stat sb;
+        if (lstat(vdir, &sb) == 0) {
+            found[nfound++] = idx;
+        } else if (errno != ENOENT) {
             say("volume %" PRIu32 ": cannot look at %s: %s", r->number, vdir, strerror(errno));
             return -1;
         }
-        if (make_dir(root, r, vdir) != 0)
+    }
+
+    /* Pass 1b: also probe non-UP / non-scannable configured disks with a path so a v<N> sitting on a DOWN disk is
+     * never invisible (would otherwise trigger a misleading missing-disk refusal on another disk or create a duplicate
+     * on open_gen == 0 / pending reset). */
+    for (int i = 0; i < nlim; i++) {
+        if (is_scan[i] || !disks[i].path[0])
+            continue;
+        if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, disks[i].path, r->number) >= sizeof vdir)
+            continue;
+        struct stat sb;
+        if (lstat(vdir, &sb) == 0)
+            found_down[nfound_down++] = i;
+    }
+
+    /* Pass 2: duplicate v<N> across two disks refuses the volume naming both paths (D14). */
+    if (nfound + nfound_down >= 2 && cvolfs_test_mutant != CVOLFS_MUT_DUPOK) {
+        int a = nfound > 0 ? found[0] : found_down[0];
+        int b = nfound >= 2 ? found[1] : nfound == 1 ? found_down[0] : found_down[1];
+        say("volume %" PRIu32 ": duplicate replica directories found at %s/v%" PRIu32 " and %s/v%" PRIu32
+            ": the volume is not opened", r->number, disks[a].path, r->number, disks[b].path, r->number);
+        return -1;
+    }
+    if (nfound == 0 && nfound_down > 0) {
+        const struct cvolfs_disk *dd = &disks[found_down[0]];
+        say("volume %" PRIu32 ": existing replica directory %s/v%" PRIu32
+            " is on a non-UP or ineligible disk (state=%s, class=%s): refusing to open or make a copy elsewhere",
+            r->number, dd->path, r->number, store_state_str(dd->state), disk_class_name(dd->disk_class));
+        return -1;
+    }
+    if (nscan == 0) {
+        say("volume %" PRIu32 ": no UP eligible disk available (log_on_hdd=%u): the volume is not opened", r->number,
+            (unsigned)r->log_on_hdd);
+        return -1;
+    }
+
+    /* Pass 3: reconcile existing v<N> (set aside stale/lost on the same disk) or pick a disk and make v<N>. */
+    int target = -1;
+    if (nfound >= 1) {
+        target = found[0];
+        if (cvolset_prepare(disks[target].path, r->number, r) != 0)
+            return -1;
+        snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, disks[target].path, r->number);
+        for (int s = 0; s < nscan; s++) {
+            if (cvolfs_clean_tmp(disks[scan[s]].path, r->number) != 0)
+                return -1;
+        }
+        struct stat sb;
+        if (stat(vdir, &sb) != 0) {
+            if (errno != ENOENT) {
+                say("volume %" PRIu32 ": cannot look at %s: %s", r->number, vdir, strerror(errno));
+                return -1;
+            }
+            /* cvolset_prepare set aside the old replica (stale/lost): pick the best disk via E51 for the fresh one.
+             * Callers exclude r->number from disks[].nreplicas, so pass disks directly without decrementing. */
+            int picked = cvolfs_pick_disk(disks, ndisks, r->young_move_pct, r->log_on_hdd);
+            if (picked < 0) {
+                say("volume %" PRIu32 ": no eligible disk to make fresh v%" PRIu32 ": the volume is not opened",
+                    r->number, r->number);
+                return -1;
+            }
+            target = picked;
+            snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, disks[target].path, r->number);
+            if (make_dir(meta_root, disks[target].path, r, vdir) != 0)
+                return -1;
+        }
+    } else {
+        if (cvolset_prepare(disks[scan[0]].path, r->number, r) != 0)
+            return -1; /* open_gen > 0 refusal (naming tsdb cluster replica reset) or CVS_RESET consumption */
+        for (int s = 0; s < nscan; s++) {
+            if (cvolfs_clean_tmp(disks[scan[s]].path, r->number) != 0)
+                return -1;
+        }
+        target = cvolfs_pick_disk(disks, ndisks, r->young_move_pct, r->log_on_hdd);
+        if (target < 0) {
+            say("volume %" PRIu32 ": no eligible disk to make v%" PRIu32 ": the volume is not opened", r->number,
+                r->number);
+            return -1;
+        }
+        if ((size_t)snprintf(vdir, sizeof vdir, "%s/v%" PRIu32, disks[target].path, r->number) >= sizeof vdir) {
+            say("volume %" PRIu32 ": the path of %s is too long", r->number, disks[target].path);
+            return -1;
+        }
+        if (make_dir(meta_root, disks[target].path, r, vdir) != 0)
             return -1;
     }
+
     int dfd = open(vdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) {
         say("volume %" PRIu32 ": cannot open %s: %s: the volume is not opened", r->number, vdir, strerror(errno));
@@ -294,9 +561,24 @@ int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_o
     out->gen = gen + 1;
     out->nonce = draw;
     out->unsure = st.unsure;
+    snprintf(out->disk_root, sizeof out->disk_root, "%s", disks[target].path);
+    memcpy(out->store_id, disks[target].store_id, 16);
     rc = 0;
 out:
     replfile_close(rf);
     replfile_state_free(&st);
     return rc;
+}
+
+int cvolfs_prepare(const char *root, const struct cvolfs_rec *r, struct cvolfs_open *out)
+{
+    if (!root || !r || !out)
+        return -1;
+    struct cvolfs_disk d;
+    memset(&d, 0, sizeof d);
+    snprintf(d.path, sizeof d.path, "%s", root);
+    d.disk_class = DISK_CLASS_SSD;
+    d.state = META_STORE_UP;
+    d.present = 1;
+    return cvolfs_prepare_disks(root, &d, 1, r, out);
 }

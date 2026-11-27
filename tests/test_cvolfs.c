@@ -27,7 +27,9 @@
 #include "cluster.h"
 #include "cvolfs.h"
 #include "cvolset.h"
+#include "disk.h"
 #include "internal.h"
+#include "meta.h"
 #include "replfile.h"
 
 #include <fcntl.h>
@@ -808,11 +810,313 @@ static void set_mutant(const char *m)
         cvolfs_test_mutant = CVOLFS_MUT_SAMERID;
     else if (!strcmp(m, "removenodirsync"))
         cvolfs_test_mutant = CVOLFS_MUT_REMOVENODIRSYNC;
+    else if (!strcmp(m, "cvolfirstdisk"))
+        cvolfs_test_mutant = CVOLFS_MUT_FIRSTDISK;
+    else if (!strcmp(m, "cvoldupok"))
+        cvolfs_test_mutant = CVOLFS_MUT_DUPOK;
     else {
         fprintf(stderr, "unknown mutant %s\n", m);
         exit(2);
     }
     setenv("TSDB_CVOLFS_MUTANT", m, 1); /* the processes the shim kills run the same bug */
+}
+
+/* ------------------------------------------------------------ multi-disk (R13 E48, E51, D14) */
+
+static void fresh_empty(const char *name, char *dir, size_t cap)
+{
+    snprintf(dir, cap, "%s/%s", S, name);
+    sh("rm -rf '%s'; mkdir -p '%s'", dir, dir);
+}
+
+static struct cvolfs_disk mk_disk(const char *path, int cls, uint8_t tag)
+{
+    struct cvolfs_disk d;
+    memset(&d, 0, sizeof d);
+    snprintf(d.path, sizeof d.path, "%s", path);
+    for (int i = 0; i < 16; i++)
+        d.store_id[i] = (uint8_t)(tag + i);
+    d.disk_class = cls;
+    d.state = META_STORE_UP;
+    d.present = 1;
+    return d;
+}
+
+static void test_two_disks(void)
+{
+    char d0[PATH_MAX + 32], d1[PATH_MAX + 32], dh[PATH_MAX + 32], log[8192];
+    fresh("two-d0", d0, sizeof d0);
+    fresh_empty("two-d1", d1, sizeof d1); /* second disk has NO root META: reads format lines from d0/META */
+    fresh_empty("two-dh", dh, sizeof dh);
+
+    struct cvolfs_disk disks[2];
+    disks[0] = mk_disk(d0, DISK_CLASS_NVME, 0x10);
+    disks[1] = mk_disk(d1, DISK_CLASS_NVME, 0x20);
+    disks[0].have_usage = disks[1].have_usage = 1;
+    disks[0].size_bytes = disks[1].size_bytes = 1000000;
+    disks[0].used_bytes = disks[1].used_bytes = 100000; /* 10% */
+
+    /* 1. Make v1 -> d0, then with d0 holding 1 replica, make v2 -> MUST land on d1 (catches cvolfirstdisk). */
+    struct cvolfs_rec r1 = rec(1, 0, 0), r2 = rec(2, 0, 0);
+    struct cvolfs_open o1, o2;
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, disks, 2, &r1, &o1) == 0);
+    cap_end(log, sizeof log);
+    CHECK(strcmp(o1.disk_root, d0) == 0 && memcmp(o1.store_id, disks[0].store_id, 16) == 0);
+    CHECK(exists(d0, "v1/REPL") && !exists(d1, "v1"));
+
+    disks[0].nreplicas = 1;
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, disks, 2, &r2, &o2) == 0);
+    cap_end(log, sizeof log);
+    CHECK(strcmp(o2.disk_root, d1) == 0 && memcmp(o2.store_id, disks[1].store_id, 16) == 0);
+    CHECK(exists(d1, "v2/META") && exists(d1, "v2/REPL") && exists(d1, "v2/FNO") && !exists(d0, "v2"));
+
+    /* 2. Restart (zero in-memory counts): v2 is found on d1, generation raised there; leftover v2.tmp on d0 cleaned. */
+    disks[0].nreplicas = disks[1].nreplicas = 0;
+    char tmp0[PATH_MAX + 64];
+    snprintf(tmp0, sizeof tmp0, "%s/v2.tmp", d0);
+    CHECK(mkdir(tmp0, 0755) == 0);
+    r2 = rec(2, o2.gen, o2.nonce);
+    struct cvolfs_open o2b;
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, disks, 2, &r2, &o2b) == 0);
+    cap_end(log, sizeof log);
+    CHECK(o2b.gen == 2 && strcmp(o2b.disk_root, d1) == 0 && memcmp(o2b.store_id, disks[1].store_id, 16) == 0);
+    CHECK(!exists(d0, "v2") && !exists(d0, "v2.tmp"));
+
+    /* 3. Duplicate v2 on BOTH d0 and d1 -> MUST refuse naming both paths (catches cvoldupok). */
+    CHECK(sh("cp -a '%s/v2' '%s/v2'", d1, d0) == 0);
+    r2 = rec(2, o2b.gen, o2b.nonce);
+    struct cvolfs_open o2c;
+    cap_begin();
+    int dup_rc = cvolfs_prepare_disks(d0, disks, 2, &r2, &o2c);
+    cap_end(log, sizeof log);
+    CHECK(dup_rc != 0);
+    CHECK(strstr(log, "duplicate") != NULL && strstr(log, d0) != NULL && strstr(log, d1) != NULL);
+    /* Remove the duplicate on d0 -> v2 opens cleanly on d1 again. */
+    CHECK(sh("rm -rf '%s/v2'", d0) == 0);
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, disks, 2, &r2, &o2c) == 0 && o2c.gen == 3 && strcmp(o2c.disk_root, d1) == 0);
+    cap_end(NULL, 0);
+
+    /* 3b. Existing v2 on a DOWN disk is NOT invisible: refuse naming d1/v2 and never create a duplicate on d0. */
+    disks[1].state = META_STORE_DOWN;
+    r2 = rec(2, 0, 0);
+    cap_begin();
+    int down_rc0 = cvolfs_prepare_disks(d0, disks, 2, &r2, &o2c);
+    cap_end(log, sizeof log);
+    CHECK(down_rc0 != 0 && strstr(log, d1) != NULL && !exists(d0, "v2"));
+    r2 = rec(2, o2c.gen, o2c.nonce);
+    cap_begin();
+    int down_rc1 = cvolfs_prepare_disks(d0, disks, 2, &r2, &o2c);
+    cap_end(log, sizeof log);
+    CHECK(down_rc1 != 0 && strstr(log, d1) != NULL && !exists(d0, "v2"));
+    disks[1].state = META_STORE_UP;
+
+    /* 4. E51 placement rules: WAL bytes/s weighting, young_move_pct, nvme before ssd, log_on_hdd. */
+    /* 4a. WAL bytes/s weighting: 1 hot replica (10 MB/s) on d0 vs 2 idle replicas on d1 -> picks d1. */
+    disks[0].nreplicas = 1, disks[0].wal_bps = 10.0 * 1024 * 1024;
+    disks[1].nreplicas = 2, disks[1].wal_bps = 0.0;
+    CHECK(cvolfs_pick_disk(disks, 2, 80, 0) == 1);
+
+    /* 4b. Projected use >= young_move_pct (85% >= 80%): skipped even with 0 replicas in favor of d1 at 20%. */
+    disks[0].nreplicas = 0, disks[0].wal_bps = 0.0, disks[0].used_bytes = 850000;
+    disks[1].nreplicas = 3, disks[1].wal_bps = 5.0 * 1024 * 1024, disks[1].used_bytes = 200000;
+    CHECK(cvolfs_pick_disk(disks, 2, 80, 0) == 1);
+    /* When ALL eligible disks are at or above young_move_pct, placement MUST refuse (-1) and create no v<N>. */
+    disks[1].used_bytes = 820000; /* 82% >= 80% */
+    if (cvolfs_test_mutant != CVOLFS_MUT_FIRSTDISK) {
+        cap_begin();
+        CHECK(cvolfs_pick_disk(disks, 2, 80, 0) == -1);
+        cap_end(log, sizeof log);
+        CHECK(strstr(log, "young_move_pct") != NULL);
+        struct cvolfs_rec r4 = rec(4, 0, 0);
+        r4.young_move_pct = 80;
+        struct cvolfs_open o4;
+        cap_begin();
+        CHECK(cvolfs_prepare_disks(d0, disks, 2, &r4, &o4) != 0);
+        cap_end(NULL, 0);
+        CHECK(!exists(d0, "v4") && !exists(d1, "v4"));
+    }
+
+    /* 4c. nvme before ssd on tie: d0 is ssd (0 replicas), d1 is nvme (0 replicas) -> picks d1. */
+    disks[0] = mk_disk(d0, DISK_CLASS_SSD, 0x10);
+    disks[1] = mk_disk(d1, DISK_CLASS_NVME, 0x20);
+    disks[0].have_usage = disks[1].have_usage = 1;
+    disks[0].size_bytes = disks[1].size_bytes = 1000000;
+    disks[0].used_bytes = disks[1].used_bytes = 100000;
+    CHECK(cvolfs_pick_disk(disks, 2, 80, 0) == 1);
+
+    /* 4d. log_on_hdd: HDD only allowed when NO fast disk is UP. */
+    struct cvolfs_disk hdd_only[1] = {mk_disk(dh, DISK_CLASS_HDD, 0x30)};
+    hdd_only[0].have_usage = 1, hdd_only[0].size_bytes = 1000000, hdd_only[0].used_bytes = 100000;
+    CHECK(cvolfs_pick_disk(hdd_only, 1, 80, 0) == -1);
+    CHECK(cvolfs_pick_disk(hdd_only, 1, 80, 1) == 0);
+    /* Make v3 on HDD when log_on_hdd=1 and no fast disk is UP; refused when log_on_hdd=0. */
+    struct cvolfs_rec r3 = rec(3, 0, 0);
+    struct cvolfs_open o3;
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, hdd_only, 1, &r3, &o3) != 0);
+    cap_end(NULL, 0);
+    r3.log_on_hdd = 1;
+    cap_begin();
+    CHECK(cvolfs_prepare_disks(d0, hdd_only, 1, &r3, &o3) == 0 && strcmp(o3.disk_root, dh) == 0);
+    cap_end(NULL, 0);
+    /* With an UP fast disk beside an HDD (even with log_on_hdd=1 and 5 replicas on fast disk), HDD is never picked. */
+    struct cvolfs_disk mix[2] = {hdd_only[0], mk_disk(d1, DISK_CLASS_SSD, 0x20)};
+    mix[1].have_usage = 1, mix[1].size_bytes = 1000000, mix[1].used_bytes = 100000, mix[1].nreplicas = 5;
+    CHECK(cvolfs_pick_disk(mix, 2, 80, 1) == 1);
+    /* If that fast disk is DOWN and log_on_hdd=1, HDD IS picked; if log_on_hdd=0, refused. */
+    mix[1].state = META_STORE_DOWN;
+    CHECK(cvolfs_pick_disk(mix, 2, 80, 0) == -1);
+    CHECK(cvolfs_pick_disk(mix, 2, 80, 1) == 0);
+    printf("  two disks: E51 placement (replicas, WAL bps, young_move_pct, nvme>ssd, log_on_hdd), restart/find, "
+           "tmp cleanup, duplicate refused naming both paths\n");
+}
+
+static void child2_run(const char *d0, const char *d1, const char *ackfile)
+{
+    uint64_t gen, nonce;
+    last_ack(ackfile, &gen, &nonce);
+    struct cvolfs_disk disks[2] = {mk_disk(d0, DISK_CLASS_NVME, 0x10), mk_disk(d1, DISK_CLASS_NVME, 0x20)};
+    disks[0].have_usage = disks[1].have_usage = 1;
+    disks[0].size_bytes = disks[1].size_bytes = 1000000;
+    disks[0].used_bytes = disks[1].used_bytes = 100000;
+    disks[0].nreplicas = 1; /* force E51 to place new v1 on second disk d1 */
+    for (int k = 0; k < NOPENS; k++) {
+        struct cvolfs_rec r = rec(1, gen, nonce);
+        struct cvolfs_open o;
+        if (cvolfs_prepare_disks(d0, disks, 2, &r, &o) != 0)
+            _exit(4);
+        ack(ackfile, o.gen, o.nonce);
+        gen = o.gen, nonce = o.nonce;
+    }
+    exit(0);
+}
+
+static void set_child2(const char *d1, const char *ackfile)
+{
+    char to[PATH_MAX + 64];
+    if (exists(d1, "v1") && cvolset_setaside(d1, 1, "removed", RID_A, to, sizeof to) != 0)
+        _exit(4);
+    ack(ackfile, 1, 0);
+    exit(0);
+}
+
+static int run_child2(const char *d0, const char *d1, const char *ackfile, int warmup, int seed, int is_remove)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        char asan[512];
+        snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+        setenv("ASAN_OPTIONS", asan, 1);
+        char w[16], sd[16];
+        snprintf(w, sizeof w, "%d", warmup);
+        snprintf(sd, sizeof sd, "%d", seed);
+        setenv("LD_PRELOAD", SHIM, 1);
+        setenv("CRASHFS_ROOT", d1, 1);
+        setenv("CRASHFS_PROB", "1", 1);
+        setenv("CRASHFS_WARMUP", w, 1);
+        setenv("CRASHFS_AT_EXIT", "1", 1);
+        setenv("CRASHFS_TEAR", "1", 1);
+        setenv("CRASHFS_SEED", sd, 1);
+        int null = open(getenv("TSDB_CVOLFS_CHILDLOG") ? getenv("TSDB_CVOLFS_CHILDLOG") : "/dev/null",
+                        O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (null >= 0) {
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        if (is_remove)
+            execl(SELF, "test_cvolfs", "--setchild2", d1, ackfile, (char *)NULL);
+        else
+            execl(SELF, "test_cvolfs", "--child2", d0, d1, ackfile, (char *)NULL);
+        _exit(127);
+    }
+    int st = -1;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* crashfs power loss at every step of make and remove on a second disk (d1, no META of its own). */
+static void test_second_disk_power(void)
+{
+    if (access(SHIM, R_OK) != 0) {
+        printf("  second-disk power loss: skipped (no %s)\n", SHIM);
+        return;
+    }
+    char d0[PATH_MAX + 32], d1[PATH_MAX + 32], ackf[PATH_MAX + 32];
+    snprintf(ackf, sizeof ackf, "%s/pl2.ack", S);
+    int crashes = 0, whole = 0;
+    bool finished = false;
+    for (int k = 0; k < 600 && whole < 8; k++) {
+        int warm = finished ? 1000000 : k;
+        fresh("pl2-d0", d0, sizeof d0);
+        fresh_empty("pl2-d1", d1, sizeof d1);
+        unlink(ackf);
+        int code = run_child2(d0, d1, ackf, warm, k + 1, 0);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        if (code == 0)
+            finished = true, whole++;
+        CHECK(!exists(d0, "v1"));
+        /* Verify d1/v1 state and recover via multi-disk cvolfs_prepare_disks. */
+        uint64_t agen, anonce;
+        int acks = last_ack(ackf, &agen, &anonce);
+        if (exists(d1, "v1")) {
+            CHECK(exists(d1, "v1/META") && exists(d1, "v1/REPL") && exists(d1, "v1/FNO"));
+        } else {
+            CHECK(!acks);
+        }
+        struct cvolfs_disk disks[2] = {mk_disk(d0, DISK_CLASS_NVME, 0x10), mk_disk(d1, DISK_CLASS_NVME, 0x20)};
+        disks[0].have_usage = disks[1].have_usage = 1;
+        disks[0].size_bytes = disks[1].size_bytes = 1000000;
+        disks[0].used_bytes = disks[1].used_bytes = 100000;
+        disks[0].nreplicas = 1;
+        struct cvolfs_rec r = rec(1, agen, anonce);
+        struct cvolfs_open o;
+        cap_begin();
+        int rc = cvolfs_prepare_disks(d0, disks, 2, &r, &o);
+        cap_end(NULL, 0);
+        CHECK(rc == 0 && strcmp(o.disk_root, d1) == 0 && o.gen > agen && !exists(d1, "v1.tmp") && !exists(d0, "v1"));
+    }
+    CHECK(finished && crashes > 20 && whole == 8);
+    printf("  second-disk power loss (make): lost at %d steps + %d exit runs: d1/v1 absent or whole, next prepare on d1\n",
+           crashes, whole);
+
+    /* Remove on second disk under crashfs at every step + 16 whole runs with exit power loss. */
+    crashes = 0, whole = 0, finished = false;
+    for (int k = 0; k < 300 && whole < 16; k++) {
+        int warm = finished ? 1000000 : k;
+        fresh("sp2-d0", d0, sizeof d0);
+        fresh_empty("sp2-d1", d1, sizeof d1);
+        unlink(ackf);
+        struct cvolfs_disk disks[2] = {mk_disk(d0, DISK_CLASS_NVME, 0x10), mk_disk(d1, DISK_CLASS_NVME, 0x20)};
+        disks[0].have_usage = disks[1].have_usage = 1;
+        disks[0].size_bytes = disks[1].size_bytes = 1000000;
+        disks[0].used_bytes = disks[1].used_bytes = 100000;
+        disks[0].nreplicas = 1;
+        struct cvolfs_rec ra = rec(1, 0, 0);
+        ra.rid = RID_A;
+        struct cvolfs_open o;
+        cap_begin();
+        CHECK(cvolfs_prepare_disks(d0, disks, 2, &ra, &o) == 0 && strcmp(o.disk_root, d1) == 0);
+        cap_end(NULL, 0);
+        int code = run_child2(d0, d1, ackf, warm, k + 1, 1);
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        if (code == 0)
+            finished = true, whole++;
+        check_set_after(d1, ackf, "removed", k);
+    }
+    CHECK(finished && whole == 16 && crashes >= 2);
+    printf("  second-disk power loss (remove): lost at %d steps + %d exit runs: d1/v1 or d1/v1.removed-<rid>, never neither\n",
+           crashes, whole);
 }
 
 /* unnamed (review r4-iface F2): the volume manager reports a volume as no longer named (CVS_UNNAMED, behind which
@@ -879,6 +1183,18 @@ int main(int argc, char **argv)
         set_child(argv[2], argv[3], argv[4]);
         return 0;
     }
+    if (argc >= 5 && strcmp(argv[1], "--child2") == 0) {
+        if (getenv("TSDB_CVOLFS_MUTANT"))
+            set_mutant(getenv("TSDB_CVOLFS_MUTANT"));
+        child2_run(argv[2], argv[3], argv[4]);
+        return 0;
+    }
+    if (argc >= 4 && strcmp(argv[1], "--setchild2") == 0) {
+        if (getenv("TSDB_CVOLFS_MUTANT"))
+            set_mutant(getenv("TSDB_CVOLFS_MUTANT"));
+        set_child2(argv[2], argv[3]);
+        return 0;
+    }
     const char *scratch = "/tmp", *mutant = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mutant") == 0 && i + 1 < argc)
@@ -905,6 +1221,7 @@ int main(int argc, char **argv)
         test_unsure();
         test_unnamed();
         test_fault_aside();
+        test_two_disks();
     } else if (cvolfs_test_mutant == CVOLFS_MUT_SAMERID) {
         test_basic();
         test_refusals();
@@ -912,12 +1229,16 @@ int main(int argc, char **argv)
                cvolfs_test_mutant == CVOLFS_MUT_TORNSTALE) {
         test_basic();
         test_unsure();
+    } else if (cvolfs_test_mutant == CVOLFS_MUT_FIRSTDISK || cvolfs_test_mutant == CVOLFS_MUT_DUPOK) {
+        test_two_disks();
     }
     if (!mutant || replfile_test_mutant == REPLFILE_MUT_NOSYNC || cvolfs_test_mutant == CVOLFS_MUT_NODIRSYNC ||
         cvolfs_test_mutant == CVOLFS_MUT_NONONCE)
         test_power_loss();
     if (!mutant || cvolfs_test_mutant == CVOLFS_MUT_REMOVENODIRSYNC)
         test_set_power();
+    if (!mutant || cvolfs_test_mutant == CVOLFS_MUT_NODIRSYNC || cvolfs_test_mutant == CVOLFS_MUT_REMOVENODIRSYNC)
+        test_second_disk_power();
     sh("rm -rf '%s'", S);
     if (failures)
         fprintf(stderr, "%d cvolfs checks FAILED\n", failures);

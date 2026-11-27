@@ -24,11 +24,14 @@
 #include "cvolset.h"
 #include "cluster.h"
 #include "crashpt.h"
+#include "cvol.h"
+#include "meta.h"
 #include "repld.h"
 
 #define say cvolfs_say
 
-static char g_root[4096];
+static char g_roots[META_DISKS_MAX][PATH_MAX];
+static int g_nroots;
 
 /* 1 if the metadata copy holds volume `number` and does not name `self` among its replicas */
 static int removed_here(uint32_t number)
@@ -98,26 +101,33 @@ int cvolset_close(uint32_t number)
     }
     if (removed) {
         cvolset_noted(number, CVS_UNNAMED, NULL, 1);
-        if (g_root[0]) /* cvolset_sweep ran at the first push: it always does before any removal */
-            remove_dir(g_root, number);
+        char vroot[PATH_MAX];
+        if (cvol_vol_disk(number, vroot, sizeof vroot, NULL) == 0 && vroot[0]) {
+            remove_dir(vroot, number);
+        } else {
+            for (int i = 0; i < g_nroots; i++)
+                remove_dir(g_roots[i], number);
+        }
     }
     return 0;
 }
 
-void cvolset_sweep(const char *root)
+static void sweep_one(const char *root)
 {
-    snprintf(g_root, sizeof g_root, "%s", root);
     DIR *d = opendir(root);
     if (!d)
         return;
     uint32_t nums[256], nn = 0;
-    for (struct dirent *e; (errno = 0, e = readdir(d)) && nn < 256;) {
+    uint32_t tmps[256], nt = 0;
+    for (struct dirent *e; (errno = 0, e = readdir(d));) {
         char *end;
         if (e->d_name[0] != 'v' || e->d_name[1] < '0' || e->d_name[1] > '9')
             continue;
         unsigned long v = strtoul(e->d_name + 1, &end, 10);
-        if (*end == 0 && v <= UINT32_MAX)
+        if (*end == 0 && v <= UINT32_MAX && nn < 256)
             nums[nn++] = (uint32_t)v;
+        else if (!strcmp(end, ".tmp") && v <= UINT32_MAX && nt < 256)
+            tmps[nt++] = (uint32_t)v;
         else if (!strncmp(end, ".removed-", 9)) { /* a removal's background delete a stop cut short */
             char p[4400];
             snprintf(p, sizeof p, "%s/%s", root, e->d_name);
@@ -132,4 +142,27 @@ void cvolset_sweep(const char *root)
     for (uint32_t i = 0; i < nn; i++)
         if (removed_here(nums[i]) && cvolfs_test_mutant != CVOLFS_MUT_STALEOPEN)
             remove_dir(root, nums[i]);
+    for (uint32_t i = 0; i < nt; i++)
+        if (removed_here(tmps[i]))
+            (void)cvolfs_clean_tmp(root, tmps[i]);
+}
+
+void cvolset_sweep_disks(const char *const *roots, int nroots)
+{
+    g_nroots = 0;
+    for (int i = 0; i < nroots && g_nroots < META_DISKS_MAX; i++) {
+        if (!roots[i] || !roots[i][0])
+            continue;
+        snprintf(g_roots[g_nroots], sizeof g_roots[g_nroots], "%s", roots[i]);
+        g_nroots++;
+    }
+    for (int i = 0; i < g_nroots; i++)
+        sweep_one(g_roots[i]);
+}
+
+void cvolset_sweep(const char *root)
+{
+    if (!root || !root[0])
+        return;
+    cvolset_sweep_disks(&root, 1);
 }

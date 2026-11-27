@@ -17,6 +17,8 @@
 
 #include "cluster.h"
 #include "creport.h"
+#include "cvol.h"
+#include "disks.h"
 #include "repld.h"
 #include "../src/compat.h"
 #include "../src/cvol.h"
@@ -181,7 +183,7 @@ static void scrub_file_save_at(int dirfd, const char *root_dir, const struct scr
     }
 }
 
-static void scrub_file_load(const char *root_dir, struct scrub_vol *sv)
+static void scrub_file_load_fd(int dirfd, const char *root_dir, struct scrub_vol *sv)
 {
     char path[4240];
     snprintf(path, sizeof path, "%s/v%" PRIu32 "/SCRUB", root_dir, sv->number);
@@ -194,7 +196,7 @@ static void scrub_file_load(const char *root_dir, struct scrub_vol *sv)
     sv->damaged = false;
     sv->damaged_part[0] = '\0';
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = dirfd >= 0 ? openat(dirfd, "SCRUB", O_RDONLY | O_CLOEXEC) : open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return; /* missing or unreadable: advisory, start fresh */
 
@@ -472,8 +474,11 @@ static void *scrubd_main(void *arg)
             local = *sv;
             pthread_mutex_unlock(&S.mu);
 
+            char vroot[PATH_MAX];
+            if (cvol_vol_disk(vol, vroot, sizeof vroot, NULL) != 0 || !vroot[0])
+                snprintf(vroot, sizeof vroot, "%s", S.dir);
             if (need_load) {
-                scrub_file_load(S.dir, &local);
+                scrub_file_load_fd(db->dirfd, vroot, &local);
                 pthread_mutex_lock(&S.mu);
                 sv = vol_get_or_add_locked(vol);
                 if (sv && sv->dir_dev == local.dir_dev && sv->dir_ino == local.dir_ino)
@@ -562,7 +567,7 @@ static void *scrubd_main(void *arg)
                 local.last_save_s = now_s;
                 /* Save through db->dirfd while holding the engine ref so a concurrent snapshot install / replica reset
                  * can never receive a stale SCRUB file written into its new directory. */
-                scrub_file_save_at(db->dirfd, S.dir, &local);
+                scrub_file_save_at(db->dirfd, vroot, &local);
             }
             tsdb_cvol_unref(&db);
 
@@ -594,9 +599,9 @@ static void *scrubd_main(void *arg)
 /* Preloads existing v<N>/SCRUB files before repld/cvol start so a previously DAMAGED replica never briefly reports
  * healthy or rejoins the ISR on restart before its priority re-scrub finishes. Any volume directory this node no
  * longer holds is pruned once the first applied metadata copy arrives. */
-static void scrubd_preload_locked(void)
+static void scrubd_preload_dir_locked(const char *root)
 {
-    DIR *d = opendir(S.dir);
+    DIR *d = opendir(root);
     if (!d)
         return;
     struct dirent *e;
@@ -608,7 +613,7 @@ static void scrubd_preload_locked(void)
         if (!end || *end != '\0' || v == 0 || v >= SCRUBD_VOL_MAP_MAX)
             continue;
         char vdir[4224];
-        int n = snprintf(vdir, sizeof vdir, "%s/%s", S.dir, e->d_name);
+        int n = snprintf(vdir, sizeof vdir, "%s/%s", root, e->d_name);
         if (n <= 0 || (size_t)n >= sizeof vdir)
             continue;
         struct stat vst;
@@ -621,11 +626,27 @@ static void scrubd_preload_locked(void)
         sv->dir_ino = vst.st_ino;
         sv->loaded = true;
         sv->next_pass_ms = 0;
-        scrub_file_load(S.dir, sv);
+        scrub_file_load_fd(-1, root, sv);
         if (sv->cur.priority[0] != '\0')
             dmg_set((uint32_t)v, 1);
     }
     closedir(d);
+}
+
+static void scrubd_preload_locked(void)
+{
+    struct disk_info *di = calloc(DISKS_MAX, sizeof *di);
+    int nd = di ? disks_list(di, DISKS_MAX) : 0;
+    int scanned = 0;
+    for (int i = 0; i < nd; i++) {
+        if (di[i].present && di[i].path[0]) {
+            scrubd_preload_dir_locked(di[i].path);
+            scanned++;
+        }
+    }
+    free(di);
+    if (!scanned)
+        scrubd_preload_dir_locked(S.dir);
 }
 
 int scrubd_start(tsdb *t, const char *dir)

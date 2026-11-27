@@ -86,6 +86,20 @@ int disks_start(char *err, size_t errlen);
 int disks_bind_late(const uint8_t cluster_uuid[16], uint32_t node_id, char *err, size_t errlen);
 /* Fill `paths[0..cap)` with the `<disk>/chunks` directories this server serves and store count in `*n_out`. */
 void disks_chunk_paths(const char **paths, int cap, int *n_out);
+
+/* Read-only snapshot of one configured disk (for multi-disk cvolfs/scrubd; R13 r13-cvolfs). */
+struct disk_info {
+    char path[PATH_MAX];
+    uint8_t store_id[16];
+    int disk_class; /* DISK_CLASS_NVME / DISK_CLASS_SSD / DISK_CLASS_HDD */
+    uint8_t uses;   /* enum meta_disk_uses bitmask */
+    uint8_t state;  /* enum meta_store_state */
+    int present;    /* 1 if DISK loaded and present on this start */
+    uint64_t size_bytes;
+};
+/* Copy up to `cap` local disk entries into `out`. Returns count copied (0 before disks_prepare). Thread-safe. */
+int disks_list(struct disk_info *out, int cap);
+
 /* Unregister HBS_DISKS / metrics and release disk locks. */
 void disks_stop(void);
 
