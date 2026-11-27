@@ -1755,7 +1755,9 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
      * read from prev (A) while A is UP and listed as prev; else treat pos as an erasure (CHUNK_ST_DOWN) unless
      * the filling holder B has reported this object filled. Never ask B for an unfilled object. */
     bool skip_filling[CHUNK_POS_MAX];
+    bool from_prev[CHUNK_POS_MAX];
     memset(skip_filling, 0, sizeof skip_filling);
+    memset(from_prev, 0, sizeof from_prev);
     bool any_filling_skip = false;
     for (unsigned i = 0; i < v.nstripe; i++) {
         o->node[i] = v.stripe[i];
@@ -1766,6 +1768,7 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         if (pre_barrier && chunkpeer_mutant != CP_MUT_READ_FROM_FILLING) {
             if (v.stripe_prev[i] != 0 && v.stripe_prev_up[i]) {
                 o->node[i] = v.stripe_prev[i];
+                from_prev[i] = true;
             } else if (!chunkpeer_is_filled(o->node[i], p->volume, i, barrier, oid)) {
                 skip_filling[i] = true;
                 any_filling_skip = true;
@@ -1860,13 +1863,51 @@ static int p_obj_open_ver(void *ctx, const uint8_t oid[16], const chunk_geom *ex
         ask a[CHUNK_POS_MAX];
         /* k' positions are enough to read every byte: one that does not answer by then is DOWN for this handle */
         fan_run(f, o->g.k, FAN_GRACE_MS, false, a, CHUNK_ST_DOWN);
+        uint32_t fb_nodes[CHUNK_POS_MAX];
+        unsigned fb_pos[CHUNK_POS_MAX];
+        unsigned nfb = 0;
         for (unsigned j = 0; j < nactive; j++) {
             unsigned i = active_pos[j];
             o->st[i] = a[j].st;
             o->sums[i] = a[j].sums;
+            if (from_prev[i] && o->st[i] == CHUNK_ST_ABSENT && v.stripe[i] != 0 && v.stripe[i] != o->node[i]) {
+                /* R9 (r9-return, E28): while returning holder A is FILLING with prev=B (a partial fill), B may lack an
+                 * old pre-outage object that A already holds. Probe the active holder before declaring ABSENT so
+                 * return reads hit A directly while genuine missing chunks on normal drains still report ABSENT (E15). */
+                fb_nodes[nfb] = v.stripe[i];
+                fb_pos[nfb] = i;
+                nfb++;
+                continue;
+            }
             ok += o->st[i] == CHUNK_ST_OK;
             if (o->st[i] == CHUNK_ST_DAMAGED && o->on_damaged)
                 o->on_damaged(o->on_damaged_arg, o->volume, o->oid, i, o->node[i]);
+        }
+        if (nfb > 0) {
+            fan *ff = fan_new(p->cp, o->volume, o->epoch, fb_nodes, nfb);
+            if (!ff) {
+                p_obj_close(o);
+                return TSDB_ERR_NOMEM;
+            }
+            for (unsigned j = 0; j < nfb; j++)
+                ff->pos[j] = fb_pos[j];
+            memcpy(ff->vuuid, o->vuuid, 16);
+            memcpy(ff->oid, oid, 16);
+            ff->has_expect = true;
+            ff->expect = o->g;
+            ask afb[CHUNK_POS_MAX];
+            fan_run(ff, nfb, FAN_GRACE_MS, false, afb, CHUNK_ST_DOWN);
+            for (unsigned j = 0; j < nfb; j++) {
+                unsigned i = fb_pos[j];
+                o->st[i] = afb[j].st;
+                if (afb[j].st == CHUNK_ST_OK) {
+                    o->node[i] = fb_nodes[j];
+                    o->sums[i] = afb[j].sums;
+                    ok++;
+                } else if (afb[j].st == CHUNK_ST_DAMAGED && o->on_damaged) {
+                    o->on_damaged(o->on_damaged_arg, o->volume, o->oid, i, fb_nodes[j]);
+                }
+            }
         }
     }
     if (ok == 0) {

@@ -143,6 +143,7 @@ struct cluster_vol_report { /* a volume this server owns */
                                         * open saved (§8.5); the leader proposes REPLICA_OPEN for a higher one */
     uint64_t open_nonce;               /* that open's random draw, recorded with the generation */
     uint8_t store_id[16];              /* R13 (D14): disk store_id holding v<N> (all zeros when unknown) */
+    uint64_t log_start, log_end;       /* R9 (r9-return, D13): retained WAL log_start (>= 1) and durable log_end */
 };
 struct cluster_dom_report {
     char name[META_DOMAIN_MAX];

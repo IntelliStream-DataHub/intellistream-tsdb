@@ -486,6 +486,39 @@ const char *cmove_start_auto(uint32_t vol, uint32_t from, uint32_t to, uint64_t 
     return NULL;
 }
 
+const char *cmove_cancel_auto(uint32_t vol, uint32_t from, uint32_t to, uint64_t now)
+{
+    if (!cl_leading())
+        return "not the Raft leader";
+    if (cl_term() != g_term) {
+        g_nmv = 0;
+        g_term = cl_term();
+    }
+    const struct meta_volume *v = meta_volume(cl_meta(), vol);
+    if (!v || v->kind != META_VOL_REPLICATED || !v->nhist)
+        return "no such replicated volume";
+    const struct meta_replica *in = moving_in(v);
+    if (!in || in->node != to || in->replaces != from)
+        return "no such move is running";
+    if (!in->learner || meta_volume_in_isr(v, to))
+        return "too late: the learner has already joined the ISR";
+    struct mv *m = mv_find(vol);
+    if (!m && !(m = mv_new(vol, from, to, in->rid, now)))
+        return "too many moves under way";
+    if (m->cancel && m->a == from && m->b == to && m->rid == in->rid)
+        return NULL; /* already cancelling */
+    m->a = from;
+    m->b = to;
+    m->rid = in->rid;
+    m->cancel = 1;
+    m->sent_ns = 0;
+    m->said_shrunk = 0;
+    m->seen = 1;
+    cl_say("volume %" PRIu32 ": move from node %" PRIu32 " to node %" PRIu32
+           " cancelled automatically (returned replica can catch up)", vol, from, to);
+    return NULL;
+}
+
 size_t cmove_status(char *out, size_t n, uint64_t now)
 {
     size_t o = 0;

@@ -63,6 +63,8 @@ struct place_member {
     uint32_t chunk_stores; /* HBS_STORES: number of chunk stores currently UP */
     uint32_t nstore_ids;
     uint64_t store_ids[PLACE_STORES_MAX]; /* store identities for return-vs-lost check (D13, D15) */
+    uint32_t expected_nstore_ids;
+    uint64_t expected_store_ids[PLACE_STORES_MAX]; /* prior store_ids when ndisks == 0 (0: unchecked) */
     uint32_t nfaults;
     struct place_vol_fault faults[PLACE_FAULTS_MAX];
     uint32_t ndisks;
@@ -111,9 +113,11 @@ enum place_mutant {
     PLACE_MUT_OPENING_UNBOUNDED = 10,
     PLACE_MUT_FAILSTOP_SLOW = 11,
     PLACE_MUT_BALANCE_UNBOUNDED = 12,
-    PLACE_MUT_LOG_HDD = 13,     /* R13 r13-place: ignore compute capability/role for log placement */
-    PLACE_MUT_MIX_STRIPE = 14,  /* R13 r13-place: ignore disk class for stripe placement */
-    PLACE_MUT_PLACE_FULL = 15,  /* R13 r13-place: ignore young_move_pct (80%) and chunk fill mark */
+    PLACE_MUT_LOG_HDD = 13,        /* R13 r13-place: ignore compute capability/role for log placement */
+    PLACE_MUT_MIX_STRIPE = 14,     /* R13 r13-place: ignore disk class for stripe placement */
+    PLACE_MUT_PLACE_FULL = 15,     /* R13 r13-place: ignore young_move_pct (80%) and chunk fill mark */
+    PLACE_MUT_TAKEBACK_WHOLE = 16, /* R9 r9-return: take a stripe position back from a WHOLE holder */
+    PLACE_MUT_PARTIAL_DEL_NOW = 17,/* R9 r9-return: delete B's partial chunks at STRIPE_SET, not by MK_GC release */
 };
 
 /* Active `node replace OLD NEW` intent (r9-ops records; place_plan sends each of OLD's positions to NEW). */
@@ -126,6 +130,27 @@ struct place_replace {
 struct place_vol_size {
     uint32_t volume;
     uint64_t bytes;
+};
+
+/* Per-member volume WAL log bounds for E28/D13 log move cancellation on return. */
+struct place_vol_log {
+    uint32_t node;
+    uint32_t volume;
+    uint64_t rid;       /* replica instance id (0: unknown/leader) */
+    uint64_t epoch;     /* volume epoch observed by this member */
+    uint64_t log_start; /* first retained WAL log position (1: all retained; 0: unreported) */
+    uint64_t log_end;   /* durable WAL log end on this member */
+    uint8_t is_leader;  /* 1 if this member currently leads the volume */
+    uint8_t healthy;    /* 1 if volume health == CL_HEALTH_OK */
+};
+
+/* Active EC stripe fill or log move started while `prev_node` was OUT/DOWN (R9 r9-return, E28, D13). */
+struct place_return_cand {
+    uint32_t volume;
+    uint32_t pos;       /* stripe position (is_log == 0) */
+    uint32_t prev_node; /* original holder evicted while OUT/DOWN */
+    uint64_t version;   /* stripe_pos[pos].set_ver (is_log == 0) or learner rid (is_log == 1) */
+    uint8_t is_log;     /* 0: EC stripe position, 1: log replica move */
 };
 
 /* Complete read-only input to pout_plan / place_plan / balance_plan (D7). */
@@ -144,6 +169,10 @@ struct place_in {
     uint32_t nreplaces;
     const struct place_vol_size *vol_sizes; /* optional per-volume bytes (NULL/0: none) */
     uint32_t nvol_sizes;
+    const struct place_vol_log *vol_logs; /* optional per-member volume log_start/log_end (NULL/0: none) */
+    uint32_t nvol_logs;
+    const struct place_return_cand *return_cands; /* optional OUT-eviction return candidates (NULL/0: none) */
+    uint32_t nreturn_cands;
 };
 
 /* Kinds of proposals a planner may emit. */
@@ -168,6 +197,7 @@ struct place_prop {
     uint64_t version;        /* expected stripe_version (STRIPE_SET, STRIPE_WHOLE, GC_RELEASE) or incarnation */
     uint8_t state;           /* MEMBER_STATE: enum meta_member_state */
     uint8_t reason;          /* MEMBER_STATE down reason (timeout/failstop/fault) or filling flag */
+    uint8_t is_return;       /* 1 if emitted by place_return (STRIPE_SET take-back or MOVE_CANCEL; CP_RETURN_SET) */
     int margin;              /* priority margin for ordering/pacing (lower = more endangered) */
 };
 

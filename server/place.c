@@ -32,6 +32,7 @@
 #include "place.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,18 +141,24 @@ int place_mutant_parse(const char *name)
         return PLACE_MUT_MIX_STRIPE;
     if (!strcmp(name, "placefull"))
         return PLACE_MUT_PLACE_FULL;
+    if (!strcmp(name, "takebackwhole"))
+        return PLACE_MUT_TAKEBACK_WHOLE;
+    if (!strcmp(name, "partialdelnow"))
+        return PLACE_MUT_PARTIAL_DEL_NOW;
     return -1;
 }
 
 int place_mutant_env(void)
 {
 #ifdef TSDB_TEST_HOOKS
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
         int m = place_mutant_parse(getenv("TSDB_PLACE_MUTANT"));
-        cached = m > 0 ? m : PLACE_MUT_NONE;
+        v = m > 0 ? m : PLACE_MUT_NONE;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
     }
-    return cached;
+    return v;
 #else
     return PLACE_MUT_NONE;
 #endif
@@ -1003,11 +1010,219 @@ int place_rack_survivable(const struct meta_state *sm, const struct meta_volume 
 
 /* ------------------------------------------------------------------ place_plan */
 
-/* Empty hook owned by r9-return (D13, E28): called after STRIPE_WHOLE and before new re-placements. */
-static void place_return(const struct place_in *in, struct place_out *out)
+/* Returns 1 if member `mb`'s heartbeat confirms all of its prior chunk store ids are UP and intact (E28, D13). */
+static int member_stores_intact(const struct place_in *in, const struct meta_member *mb)
 {
-    (void)in;
-    (void)out;
+    if (!in || !mb)
+        return 0;
+    const struct place_member *pm = find_pm(in, mb->id);
+    if ((in->members || in->nmembers) && !pm)
+        return 0;
+    if (pm && pm->chunk_stores == 0)
+        return 0;
+    if (mb->ndisks > 0) {
+        if (!pm || !pm->disks || pm->ndisks == 0)
+            return 0;
+        uint32_t expected_chunk = 0, up_chunk = 0;
+        for (uint32_t i = 0; i < mb->ndisks && i < META_DISKS_MAX; i++) {
+            const struct meta_disk *d = &mb->disks[i];
+            if (!(d->uses & META_DISK_USE_CHUNK) || d->state == META_STORE_OUT || d->state == META_STORE_DESTROYED)
+                continue;
+            expected_chunk++;
+            const struct place_disk_usage *du = find_disk_usage(pm, d->store_id);
+            if (!du || du->state != META_STORE_UP)
+                return 0;
+            if (du->uses & META_DISK_USE_CHUNK)
+                up_chunk++;
+        }
+        return expected_chunk > 0 && up_chunk > 0;
+    }
+    if (pm && pm->expected_nstore_ids > 0) {
+        for (uint32_t i = 0; i < pm->expected_nstore_ids && i < PLACE_STORES_MAX; i++) {
+            uint64_t want = pm->expected_store_ids[i];
+            int found = 0;
+            for (uint32_t j = 0; j < pm->nstore_ids && j < PLACE_STORES_MAX; j++) {
+                if (pm->store_ids[j] == want) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                return 0;
+        }
+    }
+    return !pm || pm->chunk_stores > 0;
+}
+
+static int return_cand_has(const struct place_in *in, uint32_t vol, uint32_t pos, uint32_t prev_node, uint64_t version,
+                           uint8_t is_log)
+{
+    if (!in || !in->return_cands || in->nreturn_cands == 0)
+        return 0;
+    for (uint32_t i = 0; i < in->nreturn_cands; i++) {
+        const struct place_return_cand *c = &in->return_cands[i];
+        if (c->is_log == is_log && c->volume == vol && c->prev_node == prev_node && c->version == version &&
+            (is_log || c->pos == pos))
+            return 1;
+    }
+    return 0;
+}
+
+static int member_has_vol_fault(const struct place_in *in, uint32_t node, uint32_t vol)
+{
+    const struct place_member *pm = find_pm(in, node);
+    if (!pm)
+        return 0;
+    for (uint32_t i = 0; i < pm->nfaults && i < PLACE_FAULTS_MAX; i++)
+        if (pm->faults[i].volume == vol)
+            return 1;
+    return 0;
+}
+
+static const struct place_vol_log *find_vol_log(const struct place_in *in, uint32_t node, uint32_t vol)
+{
+    if (!in || !in->vol_logs || in->nvol_logs == 0)
+        return NULL;
+    for (uint32_t i = 0; i < in->nvol_logs; i++)
+        if (in->vol_logs[i].node == node && in->vol_logs[i].volume == vol)
+            return &in->vol_logs[i];
+    return NULL;
+}
+
+/* R9 (r9-return; E28, §5.4, D12, D13, D16):
+ *   1. For a member UP again whose heartbeat shows its old store ids intact, take back each EC stripe position it
+ *      previously held (recorded in return_cands) while the replacement is still FILLING (state FILLING until
+ *      reconcile reports whole; B's partial fill is released by MK_GC once A is whole). Positions already WHOLE stay
+ *      with B (mutant `takebackwhole` violates this).
+ *   2. For a log move (recorded in return_cands) whose learner B has not joined the ISR, cancel the move when the
+ *      returned replica A is UP, healthy, and can catch up from retained segments (already in ISR, or A's log_end >=
+ *      leader's log_start / leader log_start <= 1). */
+static int place_return(const struct place_in *in, struct place_out *out, const uint8_t *pend_gone,
+                        const uint32_t *whole_mask, const int *vol_ym, const int *vol_sm, uint8_t *vol_stripe_moved)
+{
+    const struct meta_state *sm = in->sm;
+    uint32_t nv = sm->nvolumes;
+    if (!in->return_cands || in->nreturn_cands == 0)
+        return 0;
+
+    /* 1. EC stripe position take-backs. */
+    for (uint32_t vi = 0; vi < nv; vi++) {
+        const struct meta_volume *v = &sm->volumes[vi];
+        if (v->kind != META_VOL_REPLICATED || v->redundancy != META_RED_EC || vol_stripe_moved[vi])
+            continue;
+        for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+            if (v->stripe_pos[p].retired_ver != 0)
+                continue;
+            uint32_t prev = v->stripe_pos[p].prev;
+            uint32_t cur = v->stripe[p];
+            if (prev == 0 || prev == cur)
+                continue;
+            if (!return_cand_has(in, v->number, p, prev, v->stripe_pos[p].set_ver, 0))
+                continue;
+            int reported_whole = (whole_mask[vi] & (1u << p)) != 0;
+            for (uint32_t fi = 0; !reported_whole && in->fills && fi < in->nfills; fi++) {
+                const struct place_fill *f = &in->fills[fi];
+                if (f->volume == v->number && f->pos == p && f->node == cur && f->whole == 1)
+                    reported_whole = 1;
+            }
+            int is_filling = (v->stripe_pos[p].state == META_STRIPE_FILLING) && !reported_whole;
+            if (!is_filling) {
+                if (in->mutant != PLACE_MUT_TAKEBACK_WHOLE)
+                    continue;
+                /* Planted mutant `takebackwhole`: also takes back a position that is already WHOLE on cur. */
+                if (v->stripe_pos[p].state != META_STRIPE_WHOLE)
+                    continue;
+            }
+            int32_t ai = member_idx(sm, prev);
+            if (ai < 0 || pend_gone[ai])
+                continue;
+            const struct meta_member *mb_a = &sm->members[ai];
+            if (!member_placeable(in, mb_a) || vol_has_stripe(v, prev))
+                continue;
+            if (mb_a->role == META_ROLE_COMPUTE)
+                continue;
+            if (mb_a->ndisks > 0 && !(meta_member_effective_cap(mb_a) & META_CAP_STORAGE))
+                continue;
+            if (!member_stores_intact(in, mb_a))
+                continue;
+            /* Never worsen rack survivability (e.g. if another position moved into A's rack while A was away; E9). */
+            if (in->mutant != PLACE_MUT_RACK_IGNORED && place_rack_survivable(sm, v)) {
+                struct meta_volume v_after = *v;
+                v_after.stripe[p] = prev;
+                if (!place_rack_survivable(sm, &v_after))
+                    continue;
+            }
+            struct place_prop prop = {
+                .kind = PLACE_PROP_STRIPE_SET,
+                .volume = v->number,
+                .node = prev,
+                .other_node = cur,
+                .pos = p,
+                .version = v->stripe_version,
+                .reason = META_STRIPE_FILLING,
+                .is_return = 1,
+                .margin = vol_sm[vi],
+            };
+            if (place_out_push(out, &prop) != 0)
+                return -1;
+            vol_stripe_moved[vi] = 1;
+            break; /* one STRIPE_SET per volume per tick (stripe_version advances by 1) */
+        }
+    }
+
+    /* 2. Log replica move cancellation before learner joins the ISR. */
+    for (uint32_t vi = 0; vi < nv; vi++) {
+        const struct meta_volume *v = &sm->volumes[vi];
+        if (v->kind != META_VOL_REPLICATED || !v->nhist)
+            continue;
+        for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++) {
+            const struct meta_replica *rb = &v->rep[k];
+            if (!rb->replaces || !rb->learner)
+                continue;
+            uint32_t a = rb->replaces;
+            uint32_t b = rb->node;
+            if (meta_volume_in_isr(v, b))
+                continue;
+            if (!return_cand_has(in, v->number, 0, a, rb->rid, 1))
+                continue;
+            const struct meta_replica *ra = meta_replica(v, a);
+            if (!ra)
+                continue;
+            int32_t ai = member_idx(sm, a);
+            if (ai < 0 || pend_gone[ai])
+                continue;
+            const struct meta_member *mb_a = &sm->members[ai];
+            if (!member_placeable(in, mb_a) || member_has_vol_fault(in, a, v->number))
+                continue;
+            int can_catch_up = 0;
+            if (meta_volume_in_isr(v, a)) {
+                can_catch_up = 1;
+            } else if (v->leader) {
+                const struct place_vol_log *ll = find_vol_log(in, v->leader, v->number);
+                const struct place_vol_log *la = find_vol_log(in, a, v->number);
+                if (ll && la && ll->is_leader && ll->healthy && la->healthy && ll->epoch == v->epoch &&
+                    ll->log_start > 0 && (la->rid == 0 || ra->rid == 0 || la->rid == ra->rid) &&
+                    (ll->log_start <= 1 || la->log_end >= ll->log_start))
+                    can_catch_up = 1;
+            }
+            if (!can_catch_up)
+                continue;
+            struct place_prop prop = {
+                .kind = PLACE_PROP_MOVE_CANCEL,
+                .volume = v->number,
+                .node = b,
+                .other_node = a,
+                .epoch = v->epoch,
+                .version = rb->rid,
+                .is_return = 1,
+                .margin = vol_ym[vi],
+            };
+            if (place_out_push(out, &prop) != 0)
+                return -1;
+            break; /* at most one move per volume */
+        }
+    }
+    return 0;
 }
 
 struct plan_live_ctx {
@@ -1440,8 +1655,9 @@ void place_plan(const struct place_in *in, struct place_out *out)
         }
     }
 
-    /* 3. Return-during-rebuild hook (owned by r9-return, D13). */
-    place_return(in, out);
+    /* 3. Return-during-rebuild (r9-return; E28, §5.4, D13). */
+    if (place_return(in, out, pend_gone, whole_mask, vol_ym, vol_sm, vol_stripe_moved) != 0)
+        goto cleanup;
 
     /* 4. Count current replica/stripe holdings and in-flight rebuilds per server. */
     for (uint32_t vi = 0; vi < nv; vi++) {

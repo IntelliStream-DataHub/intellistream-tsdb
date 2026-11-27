@@ -4181,6 +4181,25 @@ int repld_leading(uint32_t v, uint64_t *epoch)
     return l;
 }
 
+int repld_log_bounds(uint32_t v, uint64_t *log_start, uint64_t *log_end)
+{
+    struct rvol *rv = vol_find(v);
+    if (!rv)
+        return -1;
+    pthread_mutex_lock(&rv->mu);
+    int rc = -1;
+    if (!rv->failed && rv->core) {
+        if (log_start)
+            *log_start = rv->log_start ? rv->log_start : 1;
+        if (log_end)
+            *log_end = repl_durable_end(rv->core);
+        rc = 0;
+    }
+    pthread_mutex_unlock(&rv->mu);
+    vol_put(rv);
+    return rc;
+}
+
 int repld_engine_failed(uint32_t v, const char *msg)
 {
     struct rvol *rv = vol_find(v);

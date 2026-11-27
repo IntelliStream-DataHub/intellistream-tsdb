@@ -3374,6 +3374,24 @@ int meta_entry_older(const void *data, size_t len)
            !r.bad;
 }
 
+int meta_entry_has_op_mask(const void *data, size_t len, uint64_t op_mask)
+{
+    uint32_t nops;
+    if (!op_mask || !entry_valid(data, len, &nops))
+        return 0;
+    struct rd r = {data, len, 8, 0};
+    for (uint32_t i = 0; i < nops; i++) {
+        uint8_t kind = get8(&r);
+        uint32_t n = get32(&r);
+        if (r.bad || n > r.len - r.off)
+            return 0;
+        if (kind < 64 && (op_mask & (1ull << kind)))
+            return 1;
+        r.off += n;
+    }
+    return 0;
+}
+
 int meta_apply(struct meta_state *m, uint64_t index, uint64_t term, const void *data, size_t len, int *res,
                uint32_t nres)
 {

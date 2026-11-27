@@ -139,6 +139,7 @@ struct sim_node {
     int ndisks;
     uint8_t disk_ok[SIM_MAX_DISKS];
     uint64_t disk_store_id[SIM_MAX_DISKS];
+    uint64_t expected_store_id[SIM_MAX_DISKS];
     int alive;
     int destroyed;
     uint64_t incarnation;
@@ -155,7 +156,9 @@ struct sim_vol {
     uint32_t number;
     uint8_t redundancy, ec_k, ec_m;
     uint64_t bytes_mb;
+    uint64_t log_start;
     uint64_t log_end;
+    uint64_t rep_log_end[SIM_MAX_NODES];
     uint32_t log_move_rem_mb;
     uint32_t deg_wait_ticks;
     uint32_t fill_rem_mb[META_STRIPE_MAX];
@@ -184,6 +187,8 @@ struct sim_cov {
     uint64_t guards_passed;
     uint64_t holds_applied;
     uint64_t returns_after_out;
+    uint64_t stripe_returns;
+    uint64_t log_cancels;
     uint64_t op_replace;
     uint64_t op_drain;
     uint64_t op_destroyed;
@@ -217,6 +222,8 @@ struct sim {
     int use_racks;
     uint32_t ninflight;
     struct sim_inflight inflight[SIM_MAX_INFLIGHT];
+    uint32_t nret_cands;
+    struct place_return_cand ret_cands[SIM_MAX_VOLS * (META_STRIPE_MAX + 2)];
     int mutant;
     const char *mutant_name;
     int trace;
@@ -327,6 +334,81 @@ static uint32_t pace_rate_for_margin(const struct sim *s, int margin)
     return base;
 }
 
+static void sim_ret_cands_add(struct sim *s, uint32_t vol, uint32_t pos, uint32_t prev_node, uint64_t version,
+                              uint8_t is_log)
+{
+    for (uint32_t i = 0; i < s->nret_cands; i++) {
+        const struct place_return_cand *c = &s->ret_cands[i];
+        if (c->is_log == is_log && c->volume == vol && c->prev_node == prev_node && c->version == version &&
+            (is_log || c->pos == pos))
+            return;
+    }
+    if (s->nret_cands < sizeof s->ret_cands / sizeof s->ret_cands[0]) {
+        s->ret_cands[s->nret_cands++] = (struct place_return_cand){
+            .volume = vol,
+            .pos = pos,
+            .prev_node = prev_node,
+            .version = version,
+            .is_log = is_log,
+        };
+    }
+}
+
+static void sim_ret_cands_update(struct sim *s, const struct meta_state *prev)
+{
+    if (!prev->initialised || !s->sm.initialised)
+        return;
+    for (uint32_t vi = 0; vi < s->sm.nvolumes; vi++) {
+        const struct meta_volume *v = &s->sm.volumes[vi];
+        const struct meta_volume *pv = meta_volume(prev, v->number);
+        if (v->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                if (v->stripe_pos[p].retired_ver != 0 || v->stripe_pos[p].state != META_STRIPE_FILLING)
+                    continue;
+                uint32_t pr = v->stripe_pos[p].prev;
+                if (!pr || pr == v->stripe[p])
+                    continue;
+                if (pv && p < pv->nstripe && pv->stripe_pos[p].set_ver == v->stripe_pos[p].set_ver)
+                    continue;
+                const struct meta_member *pmb = meta_member(prev, pr);
+                if (pmb && (pmb->state == META_OUT || pmb->state == META_DOWN) && pmb->replaced_by == 0)
+                    sim_ret_cands_add(s, v->number, p, pr, v->stripe_pos[p].set_ver, 0);
+            }
+        }
+        for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++) {
+            if (!v->rep[k].learner || !v->rep[k].replaces)
+                continue;
+            int existed = 0;
+            for (uint32_t j = 0; pv && j < pv->nrep; j++)
+                if (pv->rep[j].rid == v->rep[k].rid)
+                    existed = 1;
+            if (!existed) {
+                const struct meta_member *pmb = meta_member(prev, v->rep[k].replaces);
+                if (pmb && (pmb->state == META_OUT || pmb->state == META_DOWN) && pmb->replaced_by == 0)
+                    sim_ret_cands_add(s, v->number, 0, v->rep[k].replaces, v->rep[k].rid, 1);
+            }
+        }
+    }
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < s->nret_cands; i++) {
+        struct place_return_cand c = s->ret_cands[i];
+        const struct meta_volume *v = meta_volume(&s->sm, c.volume);
+        int keep = 0;
+        if (v && c.is_log) {
+            for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++)
+                if (v->rep[k].learner && v->rep[k].replaces == c.prev_node && v->rep[k].rid == c.version)
+                    keep = 1;
+        } else if (v && v->redundancy == META_RED_EC && c.pos < v->nstripe && c.pos < META_STRIPE_MAX) {
+            if (v->stripe_pos[c.pos].retired_ver == 0 && v->stripe_pos[c.pos].prev == c.prev_node &&
+                v->stripe[c.pos] != c.prev_node && v->stripe_pos[c.pos].set_ver == c.version)
+                keep = 1;
+        }
+        if (keep)
+            s->ret_cands[w++] = c;
+    }
+    s->nret_cands = w;
+}
+
 static int sim_apply_entry(struct sim *s, struct meta_entry *e, int *res, uint32_t nres)
 {
     struct meta_state prev;
@@ -344,6 +426,7 @@ static int sim_apply_entry(struct sim *s, struct meta_entry *e, int *res, uint32
     char why[256];
     if (prev.initialised && meta_check_step(&prev, &s->sm, why, sizeof why) != 0)
         sim_fail(s, "meta_check_step failed: %s", why);
+    sim_ret_cands_update(s, &prev);
     meta_free(&prev);
     return rc;
 }
@@ -359,6 +442,8 @@ struct plan_snap {
     uint32_t nreplaces;
     struct place_vol_size vsizes[SIM_MAX_VOLS];
     uint32_t nvsizes;
+    struct place_vol_log vlogs[SIM_MAX_VOLS * META_REPLICAS_MAX];
+    uint32_t nvlogs;
 };
 
 static void build_place_in(const struct sim *s, struct plan_snap *snap, struct place_in *in)
@@ -379,6 +464,8 @@ static void build_place_in(const struct sim *s, struct plan_snap *snap, struct p
         pm->fill_pct = 25;
         uint32_t stores = 0;
         for (int d = 0; d < n->ndisks; d++) {
+            if (n->expected_store_id[d] && pm->expected_nstore_ids < PLACE_STORES_MAX)
+                pm->expected_store_ids[pm->expected_nstore_ids++] = n->expected_store_id[d];
             if (n->disk_ok[d] && !n->destroyed) {
                 if (pm->nstore_ids < PLACE_STORES_MAX)
                     pm->store_ids[pm->nstore_ids++] = n->disk_store_id[d];
@@ -412,6 +499,22 @@ static void build_place_in(const struct sim *s, struct plan_snap *snap, struct p
             snap->vsizes[snap->nvsizes++] = (struct place_vol_size){
                 .volume = v->number,
                 .bytes = sv->bytes_mb << 20,
+            };
+        }
+        for (uint32_t k = 0; k < v->nrep && snap->nvlogs < SIM_MAX_VOLS * META_REPLICAS_MAX; k++) {
+            uint32_t u = v->rep[k].node;
+            const struct sim_node *un = sim_node_by_id_c(s, u);
+            if (!un || !un->alive || un->destroyed || !node_is_heard_fresh(s, un))
+                continue;
+            snap->vlogs[snap->nvlogs++] = (struct place_vol_log){
+                .node = u,
+                .volume = v->number,
+                .rid = v->rep[k].rid,
+                .epoch = v->epoch,
+                .log_start = sv->log_start ? sv->log_start : 1,
+                .log_end = u >= 1 && u <= SIM_MAX_NODES ? sv->rep_log_end[u - 1] : 0,
+                .is_leader = (uint8_t)(u == v->leader),
+                .healthy = (uint8_t)(un->fault_vol != v->number),
             };
         }
         if (v->redundancy != META_RED_EC)
@@ -458,11 +561,15 @@ static void build_place_in(const struct sim *s, struct plan_snap *snap, struct p
     in->mono_ms = s->now_ms;
     in->self_id = s->self_id;
     in->set = s->pset;
-    in->mutant = (s->mutant >= 0 && s->mutant <= PLACE_MUT_BALANCE_UNBOUNDED) ? s->mutant : PLACE_MUT_NONE;
+    in->mutant = (s->mutant >= 0 && s->mutant < SIM_MUT_RELEASE_NOMARK) ? s->mutant : PLACE_MUT_NONE;
     in->replaces = snap->nreplaces ? snap->replaces : NULL;
     in->nreplaces = snap->nreplaces;
     in->vol_sizes = snap->nvsizes ? snap->vsizes : NULL;
     in->nvol_sizes = snap->nvsizes;
+    in->vol_logs = snap->nvlogs ? snap->vlogs : NULL;
+    in->nvol_logs = snap->nvlogs;
+    in->return_cands = s->nret_cands ? s->ret_cands : NULL;
+    in->nreturn_cands = s->nret_cands;
 }
 
 /* ------------------------------------------------------------------ chunk deletion & GC checker (Rule 6) */
@@ -1129,8 +1236,23 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             continue;
         }
 
+        /* Rule 2b (r9-return): MOVE_CANCEL only for an unjoined learner when returning replica is UP & can catch up. */
+        if (p->kind == PLACE_PROP_MOVE_CANCEL) {
+            const struct meta_replica *rb = meta_replica(v, p->node);
+            const struct meta_member *ma = meta_member(sm, p->other_node);
+            if (!rb || !rb->learner || rb->replaces != p->other_node || meta_volume_in_isr(v, p->node)) {
+                sim_fail(s, "MOVE_CANCEL invalid learner %" PRIu32 " on vol %" PRIu32, p->node, p->volume);
+                return;
+            }
+            if (!ma || ma->state != META_UP) {
+                sim_fail(s, "MOVE_CANCEL non-UP returning node %" PRIu32 " on vol %" PRIu32, p->other_node, p->volume);
+                return;
+            }
+            continue;
+        }
+
         /* Rule 3: E13 rebuild order by margin (independent margin check + non-decreasing margin + no starvation). */
-        if (p->kind == PLACE_PROP_REPLICA_ADD || p->kind == PLACE_PROP_STRIPE_SET) {
+        if ((p->kind == PLACE_PROP_REPLICA_ADD || p->kind == PLACE_PROP_STRIPE_SET) && !p->is_return) {
             if (v->number >= 1 && v->number <= SIM_MAX_VOLS) {
                 int exp_m = (p->kind == PLACE_PROP_REPLICA_ADD) ? vol_ym[v->number - 1] : vol_sm[v->number - 1];
                 if (p->margin != exp_m) {
@@ -1283,7 +1405,7 @@ static void check_place_output(struct sim *s, const struct place_in *in, const s
             int urgent = p->margin <= 0;
             uint32_t old_holder = v->stripe[p->pos];
             uint32_t forced = chk_forced_target(in, old_holder);
-            if (!forced) {
+            if (!forced && !p->is_return) {
                 int racks_ok = 1;
                 const char *rem_racks[META_STRIPE_MAX];
                 uint32_t nrem = 0;
@@ -1600,6 +1722,7 @@ static void sim_add_member_meta(struct sim *s, uint32_t id, const char *rack)
     for (int d = 0; d < n->ndisks; d++) {
         n->disk_ok[d] = 1;
         n->disk_store_id[d] = ++s->next_store_id;
+        n->expected_store_id[d] = n->disk_store_id[d];
     }
     n->alive = 1;
     n->incarnation = 1;
@@ -1776,7 +1899,11 @@ static void sim_init_cluster(struct sim *s, uint64_t seed, int mutant, const cha
         sv->ec_k = va.ec_k;
         sv->ec_m = va.ec_m;
         sv->bytes_mb = 500 + rng_u32(&s->r, 4500); /* 500..5000 MB */
+        sv->log_start = 1;
         sv->log_end = 10;
+        for (uint32_t k = 0; k < va.n; k++)
+            if (va.nodes[k] >= 1 && va.nodes[k] <= SIM_MAX_NODES)
+                sv->rep_log_end[va.nodes[k] - 1] = sv->log_end;
 
         /* Verify place_rack_survivable matches rack configuration when racks are configured and nracks >= m+1. */
         if (s->use_racks && s->mutant == PLACE_MUT_NONE) {
@@ -1866,8 +1993,28 @@ static void sim_step_volumes_isr(struct sim *s)
         ln = sim_node_by_id_c(s, v->leader);
         if (!ln || !ln->alive || ln->destroyed || !node_is_heard_fresh(s, ln))
             continue;
-        if (v->nisr >= v->min_isr)
+        if (v->nisr >= v->min_isr) {
             sv->log_end++;
+            for (uint32_t j = 0; j < v->nisr; j++) {
+                uint32_t u = v->isr[j];
+                const struct sim_node *un = sim_node_by_id_c(s, u);
+                if (un && un->alive && !un->destroyed && node_is_heard_fresh(s, un) && un->fault_vol != v->number &&
+                    u >= 1 && u <= SIM_MAX_NODES)
+                    sv->rep_log_end[u - 1] = sv->log_end;
+            }
+        }
+        /* Occasionally trim old WAL segments past an OUT replica (models repl_retain_down_gb cap being reached on a
+         * subset of moves so sim_place exercises both retained-segment cancel and trimmed-segment non-cancel). */
+        if (sv->log_end > sv->log_start + 5) {
+            int has_out_rep = 0;
+            for (uint32_t k = 0; k < v->nrep; k++) {
+                const struct meta_member *rmb = meta_member(&s->sm, v->rep[k].node);
+                if (!v->rep[k].learner && rmb && rmb->state == META_OUT)
+                    has_out_rep = 1;
+            }
+            if (has_out_rep && rng_pct(&s->r, 4))
+                sv->log_start = sv->log_end;
+        }
 
         /* 2. Shrink ISR for down/OUT/faulted non-leader ISR members. */
         uint32_t new_isr[META_REPLICAS_MAX], nnew = 0;
@@ -1907,6 +2054,8 @@ static void sim_step_volumes_isr(struct sim *s)
                 new_isr[nnew] = u;
                 new_rids[nnew] = v->rep[k].rid;
                 nnew++;
+                if (u >= 1 && u <= SIM_MAX_NODES)
+                    sv->rep_log_end[u - 1] = sv->log_end;
                 changed = 1;
             }
         }
@@ -2448,6 +2597,13 @@ static void deliver_inflight(struct sim *s)
                 (void)sim_promote_volume(s, v, p->node, META_GR_PLANNED);
             meta_entry_free(&e);
             continue;
+        } else if (p->kind == PLACE_PROP_MOVE_CANCEL) {
+            const struct meta_volume *v = meta_volume(&s->sm, p->volume);
+            const struct meta_replica *rb = v ? meta_replica(v, p->node) : NULL;
+            if (v && rb && rb->learner && rb->replaces == p->other_node && !meta_volume_in_isr(v, p->node)) {
+                meta_op_replica_remove(&e, p->volume, v->epoch, p->node);
+                emit = 1;
+            }
         }
 
         if (!emit) {
@@ -2476,13 +2632,29 @@ static void deliver_inflight(struct sim *s)
                 const struct meta_volume *v = meta_volume(&s->sm, p->volume);
                 if (sv && v) {
                     sv->fill_rem_mb[p->pos] = 0;
+                    if (p->is_return) {
+                        s->cov.stripe_returns++;
+                        if (s->mutant == PLACE_MUT_PARTIAL_DEL_NOW && prev_holder_before &&
+                            prev_holder_before != p->node) {
+                            /* Planted mutant `partialdelnow`: deletes B's partial fill chunks immediately at return
+                             * STRIPE_SET instead of waiting for A's WHOLE + committed MK_GC release. */
+                            for (uint32_t oi = 0; oi < sv->nobjs; oi++) {
+                                if (sv->objs[oi].state == OBJ_LIVE && sv->objs[oi].stripe_version < v->stripe_version)
+                                    sim_delete_chunk(s, sv, oi, p->pos, prev_holder_before);
+                            }
+                        }
+                    }
                     record_release_obligation(s, sv, p->pos, p->other_node, v->stripe_version);
                     if (prev_holder_before && prev_holder_before != p->other_node && prev_holder_before != p->node)
                         record_release_obligation(s, sv, p->pos, prev_holder_before, v->stripe_version);
                 }
-                sim_trace(s, "applied STRIPE_SET vol=%" PRIu32 " pos=%" PRIu32 " node=%" PRIu32 " prev=%" PRIu32
+                sim_trace(s, "applied %sSTRIPE_SET vol=%" PRIu32 " pos=%" PRIu32 " node=%" PRIu32 " prev=%" PRIu32
                              " margin=%d",
-                          p->volume, p->pos, p->node, p->other_node, p->margin);
+                          p->is_return ? "return " : "", p->volume, p->pos, p->node, p->other_node, p->margin);
+            } else if (p->kind == PLACE_PROP_MOVE_CANCEL) {
+                s->cov.log_cancels++;
+                sim_trace(s, "applied MOVE_CANCEL vol=%" PRIu32 " from=%" PRIu32 " cancel_learner=%" PRIu32, p->volume,
+                          p->other_node, p->node);
             } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
                 s->cov.fills_done++;
                 sim_trace(s, "applied STRIPE_WHOLE vol=%" PRIu32 " pos=%" PRIu32 " ver=%" PRIu64, p->volume, p->pos,
@@ -2745,6 +2917,14 @@ static void wipe_node_all_disks(struct sim *s, struct sim_node *n)
         wipe_node_disk(s, n, d);
 }
 
+static void snapshot_node_stores(struct sim_node *n)
+{
+    if (!n)
+        return;
+    for (int d = 0; d < n->ndisks; d++)
+        n->expected_store_id[d] = n->disk_store_id[d];
+}
+
 static void sim_step_events(struct sim *s, uint32_t total_ticks)
 {
     /* 1. Scheduled auto-recoveries of transient faults. */
@@ -2832,10 +3012,12 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
         uint32_t id = 1 + rng_u32(&s->r, s->nnodes);
         struct sim_node *n = sim_node_by_id(s, id);
         if (n && n->alive && !n->destroyed && count_alive_nodes(s) > 3 && !taking_down_exceeds(s, id, 0)) {
+            snapshot_node_stores(n);
             n->alive = 0;
             n->failstop_beat = 0;
-            uint32_t dur = rng_pct(&s->r, 45) ? (10 + rng_u32(&s->r, s->pset.rebuild_after_s))
-                                              : (s->pset.rebuild_after_s + 20 + rng_u32(&s->r, 80));
+            uint32_t dur = rng_pct(&s->r, 40)
+                               ? (10 + rng_u32(&s->r, s->pset.rebuild_after_s))
+                               : (s->pset.rebuild_after_s + 4 + rng_u32(&s->r, 50));
             n->recover_tick = s->tick + dur;
             sim_trace(s, "FAULT server down id=%" PRIu32 " dur=%" PRIu32 "s", id, dur);
         }
@@ -2846,10 +3028,11 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
         const struct meta_member *mb = meta_member(&s->sm, id);
         if (n && n->alive && !n->destroyed && mb && mb->state == META_UP && count_alive_nodes(s) > 3 &&
             !taking_down_exceeds(s, id, 0)) {
+            snapshot_node_stores(n);
             n->alive = 0;
             n->failstop_beat = 1;
             n->last_heard_ms = s->now_ms; /* last-gasp beat arrives fresh! */
-            n->recover_tick = s->tick + s->pset.rebuild_after_s + 30;
+            n->recover_tick = s->tick + s->pset.failstop_out_s + 4 + rng_u32(&s->r, 45);
             s->cov.failstops++;
             sim_trace(s, "FAULT fail-stop id=%" PRIu32, id);
         }
@@ -2910,6 +3093,7 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                 for (uint32_t t = 0; t < nt; t++) {
                     struct sim_node *n = sim_node_by_id(s, targets[t]);
                     if (n && n->alive && !n->destroyed) {
+                        snapshot_node_stores(n);
                         n->alive = 0;
                         n->recover_tick = s->tick + dur;
                     }
@@ -2938,6 +3122,7 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                 struct sim_node *n = &s->nodes[i];
                 if (n->id != s->self_id && n->alive && !n->destroyed && count_alive_nodes(s) > 3 &&
                     !taking_down_exceeds(s, n->id, 0)) {
+                    snapshot_node_stores(n);
                     n->alive = 0;
                     n->recover_tick = s->tick + dur;
                     downed++;
@@ -2967,6 +3152,7 @@ static void sim_step_events(struct sim *s, uint32_t total_ticks)
                 struct sim_node *n = sim_node_by_id(s, id);
                 if (n && n->alive && !n->destroyed && id != s->self_id && count_alive_nodes(s) > 3 &&
                     !taking_down_exceeds(s, id, do_mplus1)) {
+                    snapshot_node_stores(n);
                     n->alive = 0;
                     n->recover_tick = s->tick + dur;
                     added++;
@@ -3299,6 +3485,8 @@ static int run_seed(uint64_t seed, uint32_t ticks, int mutant, const char *mutan
         total_cov->guards_passed += s->cov.guards_passed;
         total_cov->holds_applied += s->cov.holds_applied;
         total_cov->returns_after_out += s->cov.returns_after_out;
+        total_cov->stripe_returns += s->cov.stripe_returns;
+        total_cov->log_cancels += s->cov.log_cancels;
         total_cov->op_replace += s->cov.op_replace;
         total_cov->op_drain += s->cov.op_drain;
         total_cov->op_destroyed += s->cov.op_destroyed;
@@ -4039,27 +4227,29 @@ int main(int argc, char **argv)
     if (seeds >= 50 && ticks >= 400) {
         if (!cov.objs_settled || !cov.deg_settled || !cov.fills_done || !cov.gc_releases || !cov.log_moves ||
             !cov.guards_active || !cov.guards_passed || !cov.holds_applied || !cov.returns_after_out ||
-            !cov.m_faults || !cov.op_destroyed || !cov.props_lost || !cov.props_delayed) {
+            !cov.stripe_returns || !cov.log_cancels || !cov.m_faults || !cov.op_destroyed || !cov.props_lost ||
+            !cov.props_delayed) {
             fprintf(stderr,
                     "sim_place: coverage floor failed over %" PRIu64 " seeds (settled=%" PRIu64 " deg=%" PRIu64
                     " fills=%" PRIu64 " gc=%" PRIu64 " logmoves=%" PRIu64 " guards=%" PRIu64 "/%" PRIu64
-                    " holds=%" PRIu64 " returns=%" PRIu64 " m=%" PRIu64 " dst=%" PRIu64 " lost=%" PRIu64
-                    " dly=%" PRIu64 ")\n",
+                    " holds=%" PRIu64 " returns=%" PRIu64 " sret=%" PRIu64 " lcan=%" PRIu64 " m=%" PRIu64
+                    " dst=%" PRIu64 " lost=%" PRIu64 " dly=%" PRIu64 ")\n",
                     seeds, cov.objs_settled, cov.deg_settled, cov.fills_done, cov.gc_releases, cov.log_moves,
-                    cov.guards_active, cov.guards_passed, cov.holds_applied, cov.returns_after_out, cov.m_faults,
-                    cov.op_destroyed, cov.props_lost, cov.props_delayed);
+                    cov.guards_active, cov.guards_passed, cov.holds_applied, cov.returns_after_out, cov.stripe_returns,
+                    cov.log_cancels, cov.m_faults, cov.op_destroyed, cov.props_lost, cov.props_delayed);
             return 1;
         }
     }
     printf("sim_place: %" PRIu64 " seeds ok (first=%" PRIu64 " ticks=%" PRIu32
            " settled=%" PRIu64 " deg=%" PRIu64 " fills=%" PRIu64 " gc=%" PRIu64 " logmoves=%" PRIu64
-           " guards=%" PRIu64 "/%" PRIu64 " holds=%" PRIu64 " returns=%" PRIu64
+           " guards=%" PRIu64 "/%" PRIu64 " holds=%" PRIu64 " returns=%" PRIu64 " sret=%" PRIu64 " lcan=%" PRIu64
            " ops[rep=%" PRIu64 " drn=%" PRIu64 " dst=%" PRIu64 " mov=%" PRIu64 " add=%" PRIu64 "]"
            " faults[m=%" PRIu64 " m1=%" PRIu64 " fs=%" PRIu64 " rf=%" PRIu64 " dk=%" PRIu64 " op=%" PRIu64 "]"
            " net[lost=%" PRIu64 " dly=%" PRIu64 "])\n",
            seeds, first, ticks, cov.objs_settled, cov.deg_settled, cov.fills_done, cov.gc_releases, cov.log_moves,
-           cov.guards_active, cov.guards_passed, cov.holds_applied, cov.returns_after_out, cov.op_replace,
-           cov.op_drain, cov.op_destroyed, cov.op_move_pos, cov.op_node_add, cov.m_faults, cov.mplus1_faults,
-           cov.failstops, cov.repl_faults, cov.disk_losses, cov.slow_opens, cov.props_lost, cov.props_delayed);
+           cov.guards_active, cov.guards_passed, cov.holds_applied, cov.returns_after_out, cov.stripe_returns,
+           cov.log_cancels, cov.op_replace, cov.op_drain, cov.op_destroyed, cov.op_move_pos, cov.op_node_add,
+           cov.m_faults, cov.mplus1_faults, cov.failstops, cov.repl_faults, cov.disk_losses, cov.slow_opens,
+           cov.props_lost, cov.props_delayed);
     return 0;
 }

@@ -16,9 +16,8 @@ mode=${1:-quick}
 #   sim_place.c (r9-sim):  deleteunmarked belowk
 # Hook points ready to append once their owning tracks land:
 #   r9-whole:    releasenomark
-#   r9-return:   takebackwhole
 #   r9-balance:  balanceunbounded
-mutants_active="orderfifo rackignored twoperserver moveshrinks wholenobarrier noguard guardunbounded holdignored openingunbounded failstopslow deleteunmarked belowk"
+mutants_active="orderfifo rackignored twoperserver moveshrinks wholenobarrier noguard guardunbounded holdignored openingunbounded failstopslow deleteunmarked belowk takebackwhole partialdelnow"
 
 PLACE_MUTANT_SEEDS=${PLACE_MUTANT_SEEDS:-2000}
 
@@ -45,6 +44,8 @@ case $mode in
     failstopslow)     pat='(not marked OUT|not escalated) at failstop_out_s' ;;
     deleteunmarked)   pat='chunk deleted (without committed MK_GC|while pending MK_COLD names it)' ;;
     belowk)           pat='below k=[0-9]+ readable positions' ;;
+    takebackwhole)    pat='STRIPE_SET took back WHOLE UP position' ;;
+    partialdelnow)    pat='chunk deleted (without committed MK_GC|before current holder reported whole)' ;;
     *)                pat='.' ;;
     esac
     grep -m1 -F "KILLED $2 " "$4" | grep -E "$pat"

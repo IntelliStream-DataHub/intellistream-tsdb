@@ -32257,6 +32257,708 @@ static void scen_placeclass(void)
     stop_all();
 }
 
+/* ecbackduring (r9-return; E28, §5.4, D12, D13): 4+2 on 7 nodes. Settle 10 days, stop victim V past rebuild_after_s,
+ * pause spare S mid-fill (3 chunks) while settling 2 new days onto S. Arm CP_RETURN_SET on voters and pause V's fill.
+ * Bring V back UP -> Raft leader proposes return STRIPE_SET and hits CP_RETURN_SET -> restart voter -> return STRIPE_SET
+ * commits (V FILLING, prev=S). Verify S's partial fill chunks stay intact while V is FILLING (kills partialdelnow!),
+ * old pre-outage days remain readable while V is FILLING with partial prev=S, unpause V -> V reaches WHOLE with all 10
+ * pre-existing chunk inodes untouched and ONLY the 2 new days copied, MK_GC_RELEASE cleans S to 0 chunks, and all 12
+ * days match twin oracle t42. */
+static void scen_ecbackduring(void)
+{
+    scenario("ecbackduring");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    enum { INIT_DAYS = 10, NEW_DAYS = 2 };
+    epoll_after_two = 1;
+    init_rebuild_after_s = 6;
+    for (int i = 0; i < 7; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16", ddir);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecbackduring: vol_add_ec e42: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("ecbackduring: twin t42: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: e42 has no leader");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: t42 has no leader");
+    int L = server_of(e.leader), Lt = server_of(tv.leader);
+    if (L < 0 || Lt < 0)
+        die("ecbackduring: bad leaders L=%d Lt=%d", L, Lt);
+    for (uint64_t t0 = now_ms(); !vol_rec(L, "e42", &e); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: L did not see e42");
+    for (uint64_t t0 = now_ms(); !vol_rec(Lt, "t42", &tv); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: Lt did not see t42");
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before writes");
+    await_isr(Lt, "t42", 3, 30000, "t42 full ISR before writes");
+
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECW_SERIES], idt[ECW_SERIES];
+    for (int s = 0; s < ECW_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "retd.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    ecw_write_days(c, ide, day0, 0, INIT_DAYS);
+    ecw_write_days(ct, idt, day0, 0, INIT_DAYS);
+
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) < INIT_DAYS; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecbackduring: only %d/%d .ec parts settled within 120 s", nec, INIT_DAYS);
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecbackduring: live .part files still remain: %s", live);
+    nec = ecb_ec_parts(L, num);
+
+    /* Pick spare 7th server S and victim V (in e42 stripe, != L, != ml, != S). */
+    if (!vol_rec(L, "e42", &e))
+        die("ecbackduring: lost vol_rec for e42");
+    int S = -1;
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < e.nstripe; p++)
+            in_s |= (e.stripe[p] == ids[i]);
+        if (!in_s) {
+            S = i;
+            break;
+        }
+    }
+    if (S < 0)
+        die("ecbackduring: no spare 7th server");
+    int ml = leader_of(L);
+    int V = -1;
+    uint32_t vpos = UINT32_MAX;
+    for (int pass = 0; pass < 4 && V < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && V < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml || s == S)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (match) {
+                V = s;
+                vpos = p;
+            }
+        }
+    }
+    if (V < 0)
+        die("ecbackduring: could not pick victim holder");
+
+    struct rec_chunk_ino before[32];
+    int nbef = rec_scan_chunks(sdirs[V], num, before, 32, false);
+    if (nbef != nec)
+        die("ecbackduring: victim srv %d holds %d chunks before stop, want %d", V, nbef, nec);
+
+    char pause_s[PATH_MAX + 96], pause_v[PATH_MAX + 96], ret_arm[PATH_MAX + 96];
+    snprintf(pause_s, sizeof pause_s, "%s/ecbackduring.pause_s", base);
+    snprintf(pause_v, sizeof pause_v, "%s/ecbackduring.pause_v", base);
+    snprintf(ret_arm, sizeof ret_arm, "%s/ecbackduring.ret_arm", base);
+    int fd = open(pause_s, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        die("ecbackduring: create %s: %s", pause_s, strerror(errno));
+    close(fd);
+    fd = open(pause_v, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        die("ecbackduring: create %s: %s", pause_v, strerror(errno));
+    close(fd);
+    unlink(ret_arm);
+
+    static char pbuf[7][PATH_MAX * 2 + 256];
+    for (int i = 0; i < 7; i++) {
+        pbuf[i][0] = 0;
+        if (i == S && voter_srv[i])
+            snprintf(pbuf[i], sizeof pbuf[i],
+                     "TSDB_SFILL_TEST=obj_delay_ms=25,pause_after=3:%s TSDB_CRASH_AT=return-set:1@%s",
+                     pause_s, ret_arm);
+        else if (i == S)
+            snprintf(pbuf[i], sizeof pbuf[i], "TSDB_SFILL_TEST=obj_delay_ms=25,pause_after=3:%s", pause_s);
+        else if (voter_srv[i] && i != V)
+            snprintf(pbuf[i], sizeof pbuf[i], "TSDB_CRASH_AT=return-set:1@%s", ret_arm);
+        if (pbuf[i][0]) {
+            penv[i] = pbuf[i];
+            restart_xargs(i, xa[i]);
+            await_view(i, p_n_placeable, &seven, "restarted member back UP");
+        }
+    }
+    tsdbc_close(c);
+    tsdbc_close(ct);
+    for (uint64_t t0 = now_ms(); !vol_rec(S, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: e42 has no leader after arm");
+    for (uint64_t t0 = now_ms(); !vol_rec(S, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: t42 has no leader after arm");
+    L = server_of(e.leader);
+    Lt = server_of(tv.leader);
+    await_isr(L, "e42", 3, 30000, "e42 ISR after arm");
+    await_isr(Lt, "t42", 3, 30000, "t42 ISR after arm");
+    c = client(L);
+    ct = client(Lt);
+
+    /* Kill V -> V goes META_OUT -> S starts filling vpos and pauses at 3 chunks. */
+    stop(V, SIGKILL);
+    struct state_want out_w = {ids[V], META_OUT, 1};
+    await_view(L, p_member_state, &out_w, "victim V marked META_OUT");
+
+    struct meta_volume e2 = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(L, "e42", &e2) && e2.stripe[vpos] == ids[S] && e2.stripe_pos[vpos].state == META_STRIPE_FILLING)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: STRIPE_SET did not assign pos %" PRIu32 " to S within 30 s", vpos);
+    }
+    for (uint64_t t0 = now_ms(); ecw_count_vol_chunks(sdirs[S], num) < 3; usleep(100000))
+        if (now_ms() - t0 > 45000)
+            die("ecbackduring: spare S filled only %d chunks (expected >= 3)", ecw_count_vol_chunks(sdirs[S], num));
+
+    /* Settle 2 NEW days while V is away -> land on S while S is still FILLING. */
+    ecw_write_days(c, ide, day0, INIT_DAYS, NEW_DAYS);
+    ecw_write_days(ct, idt, day0, INIT_DAYS, NEW_DAYS);
+    for (uint64_t t0 = now_ms(); ecb_ec_parts(L, num) < nec + NEW_DAYS; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecbackduring: new days while V away did not settle (%d/%d)", ecb_ec_parts(L, num), nec + NEW_DAYS);
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 60000)
+            die("ecbackduring: live .part files remain after new days: %s", live);
+    int n_s_partial = ecw_count_vol_chunks(sdirs[S], num);
+    if (n_s_partial < 3 + NEW_DAYS || !vol_rec(L, "e42", &e2) || e2.stripe_pos[vpos].state != META_STRIPE_FILLING)
+        die("ecbackduring: expected S FILLING with >= %d chunks (got %d, state %u)", 3 + NEW_DAYS, n_s_partial,
+            e2.stripe_pos[vpos].state);
+
+    /* Arm CP_RETURN_SET and restart V (with V's own fill paused at 0 so V stays FILLING while we check S). */
+    fd = open(ret_arm, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        die("ecbackduring: create %s: %s", ret_arm, strerror(errno));
+    close(fd);
+    snprintf(pbuf[V], sizeof pbuf[V], "TSDB_SFILL_TEST=obj_delay_ms=25,pause_after=0:%s", pause_v);
+    penv[V] = pbuf[V];
+    xargs[V] = xa[V];
+    start(V);
+
+    /* Wait for Raft leader to hit CP_RETURN_SET after proposing return STRIPE_SET. */
+    int v_hit = -1, cst = 0;
+    for (uint64_t t0 = now_ms(); v_hit < 0;) {
+        for (int i = 0; i < 7; i++) {
+            if (!voter_srv[i] || i == V || pids[i] <= 0)
+                continue;
+            pid_t w = waitpid(pids[i], &cst, WNOHANG);
+            if (w == pids[i]) {
+                pids[i] = 0;
+                v_hit = i;
+                break;
+            }
+        }
+        if (v_hit >= 0)
+            break;
+        if (now_ms() - t0 > 45000)
+            die("ecbackduring: no voter hit CP_RETURN_SET within 45 s");
+        usleep(50000);
+    }
+    if (!WIFEXITED(cst) || WEXITSTATUS(cst) != CRASH_EXIT_STATUS)
+        die("ecbackduring: voter %d exited with 0x%x (expected %d from CP_RETURN_SET)", v_hit, cst, CRASH_EXIT_STATUS);
+    if (!log_has(v_hit, "crash point return-set"))
+        die("ecbackduring: voter %d log missing 'crash point return-set'", v_hit);
+    unlink(ret_arm);
+    penv[v_hit] = NULL;
+    xargs[v_hit] = xa[v_hit];
+    start(v_hit);
+
+    /* Wait for return STRIPE_SET to commit: V holds vpos in FILLING state with prev = S. */
+    struct meta_volume e3 = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(S, "e42", &e3) && e3.stripe[vpos] == ids[V])
+            break;
+        if (now_ms() - t0 > 45000)
+            die("ecbackduring: return STRIPE_SET did not commit back to V within 45 s (cur=%" PRIu32 ")",
+                e3.stripe[vpos]);
+    }
+    /* Wait 1.5 s while V is paused in FILLING -> S's partial fill chunks MUST remain intact (kills partialdelnow!). */
+    usleep(1500000);
+    if (!vol_rec(S, "e42", &e3) || e3.stripe[vpos] != ids[V] || e3.stripe_pos[vpos].state != META_STRIPE_FILLING ||
+        e3.stripe_pos[vpos].prev != ids[S])
+        die("ecbackduring: expected V FILLING with prev=S (holder=%" PRIu32 " state=%u prev=%" PRIu32 ")",
+            e3.stripe[vpos], e3.stripe_pos[vpos].state, e3.stripe_pos[vpos].prev);
+    int n_s_during = ecw_count_vol_chunks(sdirs[S], num);
+    if (n_s_during != n_s_partial)
+        die("ecbackduring: spare S partial chunks changed while V FILLING (%d != %d; partialdelnow!)",
+            n_s_during, n_s_partial);
+
+    /* Mid-return read check: old pre-outage days AND new days read cleanly while V is FILLING with partial prev=S. */
+    tsdbc_close(c);
+    tsdbc_close(ct);
+    for (uint64_t t0 = now_ms(); !vol_rec(S, "e42", &e3) || !e3.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: e42 has no leader mid-return");
+    for (uint64_t t0 = now_ms(); !vol_rec(S, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackduring: t42 has no leader mid-return");
+    L = server_of(e3.leader);
+    Lt = server_of(tv.leader);
+    c = client(L);
+    ct = client(Lt);
+    for (int d = 0; d < INIT_DAYS + NEW_DAYS; d++) {
+        int64_t d0 = day0 + (int64_t)d * ECW_STEP_MS, d1 = d0 + 86400000LL;
+        struct ecb_sum a, b;
+        if ((rc = ecw_read_range(c, ide[0], d0, d1, &a)) != 0 ||
+            (rc = ecw_read_range(ct, idt[0], d0, d1, &b)) != 0 || a.n != b.n || a.h != b.h)
+            die("ecbackduring: mid-return read day %d mismatch (rc=%s, %" PRIu64 "/%" PRIu64 ")", d, ers(rc), a.n, b.n);
+    }
+
+    /* Unpause V (and S) -> V copies ONLY the 2 new days from S, reaches WHOLE, and MK_GC_RELEASE cleans S to 0! */
+    unlink(pause_v);
+    unlink(pause_s);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(S, "e42", &e3) && e3.stripe[vpos] == ids[V] && e3.stripe_pos[vpos].state == META_STRIPE_WHOLE)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("ecbackduring: returning V did not reach META_STRIPE_WHOLE within 60 s (state=%u, chunks=%d/%d)",
+                e3.stripe_pos[vpos].state, ecw_count_vol_chunks(sdirs[V], num), nec + NEW_DAYS);
+    }
+
+    /* Verify every pre-existing chunk on V kept its exact original inode (only the 2 new days were written). */
+    struct rec_chunk_ino after[32];
+    int naft = rec_scan_chunks(sdirs[V], num, after, 32, true);
+    if (naft != nbef + NEW_DAYS)
+        die("ecbackduring: V holds %d chunks after WHOLE, expected %d", naft, nbef + NEW_DAYS);
+    int new_found = 0;
+    for (int i = 0; i < naft; i++) {
+        int old_idx = -1;
+        for (int j = 0; j < nbef; j++)
+            if (strcmp(after[i].name, before[j].name) == 0) {
+                old_idx = j;
+                break;
+            }
+        if (old_idx >= 0) {
+            if (after[i].ino != before[old_idx].ino)
+                die("ecbackduring: pre-existing chunk %s on V was rewritten (inode %" PRIu64 " -> %" PRIu64 ")",
+                    after[i].name, (uint64_t)before[old_idx].ino, (uint64_t)after[i].ino);
+        } else {
+            new_found++;
+        }
+    }
+    if (new_found != NEW_DAYS)
+        die("ecbackduring: found %d new chunks on V, expected %d", new_found, NEW_DAYS);
+
+    /* Wait for committed MK_GC_RELEASE to clean S's partial fill chunks to 0. */
+    for (uint64_t t0 = now_ms(); ecw_count_vol_chunks(sdirs[S], num) != 0; usleep(100000))
+        if (now_ms() - t0 > 45000)
+            die("ecbackduring: spare S still holds %d partial chunks after MK_GC release (expected 0)",
+                ecw_count_vol_chunks(sdirs[S], num));
+
+    /* Final oracle verification across all 12 days and all series. */
+    uint64_t expect_rows = (uint64_t)(INIT_DAYS + NEW_DAYS) * 2u * ECW_ROWS;
+    for (int s = 0; s < ECW_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || (rc = ecb_read(ct, idt[s], &b)) != 0)
+            die("ecbackduring: final read series %d failed: %s", s, ers(rc));
+        if (a.n != expect_rows || a.n != b.n || a.h != b.h)
+            die("ecbackduring: final series %d mismatch: %" PRIu64 " (%" PRIx64 "), twin %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, b.n, b.h);
+    }
+    tsdbc_close(c);
+    tsdbc_close(ct);
+    for (int i = 0; i < 7; i++)
+        penv[i] = NULL;
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecbackduring: 4+2 on 7 -> V (srv %d, pos %" PRIu32 ") returned during S (srv %d) fill; hit CP_RETURN_SET, "
+           "S kept %d partial chunks while V FILLING, V kept all %d original chunk inodes + copied ONLY %d new days, "
+           "MK_GC cleaned S to 0, all %d days matched oracle\n",
+           V, vpos, S, n_s_partial, nbef, NEW_DAYS, INIT_DAYS + NEW_DAYS);
+#endif
+}
+
+/* ecbackafterwhole (r9-return; E28, §5.4, D12, D13): 4+2 on 7 nodes. Victim V goes OUT, spare S finishes filling to
+ * META_STRIPE_WHOLE, then V returns UP. Position MUST stay with S (stripe_version unchanged; kills takebackwhole!),
+ * V's old chunks are released to 0 by committed MK_GC_RELEASE, and reads match twin oracle t42. */
+static void scen_ecbackafterwhole(void)
+{
+    scenario("ecbackafterwhole");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    enum { INIT_DAYS = 6 };
+    epoll_after_two = 1;
+    init_rebuild_after_s = 6;
+    for (int i = 0; i < 7; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned want_v = 5;
+    await_view(0, p_voters, &want_v, "five voters of seven members");
+    struct view v;
+    view(0, &v);
+    int voter_srv[7] = {0};
+    for (int i = 0; i < 7; i++)
+        voter_srv[i] = is_voter(&v, ids[i]) != 0;
+    view_free(&v);
+
+    static char xa[7][PATH_MAX + 256];
+    static char sdirs[7][PATH_MAX + 96];
+    for (int i = 0; i < 7; i++) {
+        char ddir[PATH_MAX + 80];
+        snprintf(ddir, sizeof ddir, "%s/ecs%d", base, i);
+        disk_make(ddir, "hdd");
+        snprintf(sdirs[i], sizeof sdirs[i], "%s/chunks", ddir);
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200 --ec-cache-mb 16", ddir);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(6, p_n_placeable, &seven, "seven members UP with chunk stores");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("ecbackafterwhole: vol_add_ec e42: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("ecbackafterwhole: twin t42: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "e42", &e) || !e.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackafterwhole: e42 has no leader");
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackafterwhole: t42 has no leader");
+    int L = server_of(e.leader), Lt = server_of(tv.leader);
+    if (L < 0 || Lt < 0)
+        die("ecbackafterwhole: bad leaders L=%d Lt=%d", L, Lt);
+    for (uint64_t t0 = now_ms(); !vol_rec(L, "e42", &e); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackafterwhole: L did not see e42");
+    for (uint64_t t0 = now_ms(); !vol_rec(Lt, "t42", &tv); usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("ecbackafterwhole: Lt did not see t42");
+    await_isr(L, "e42", 3, 30000, "e42 full ISR before writes");
+    await_isr(Lt, "t42", 3, 30000, "t42 full ISR before writes");
+
+    const int64_t day0 = 1704067200000LL;
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECW_SERIES], idt[ECW_SERIES];
+    for (int s = 0; s < ECW_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "retw.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    ecw_write_days(c, ide, day0, 0, INIT_DAYS);
+    ecw_write_days(ct, idt, day0, 0, INIT_DAYS);
+
+    int nec = 0;
+    for (uint64_t t0 = now_ms(); (nec = ecb_ec_parts(L, num)) < INIT_DAYS; usleep(200000))
+        if (now_ms() - t0 > 120000)
+            die("ecbackafterwhole: only %d/%d .ec parts settled within 120 s", nec, INIT_DAYS);
+    char live[1024];
+    for (uint64_t t0 = now_ms(); ecb_live_parts(L, num, live, sizeof live) != 0; usleep(200000))
+        if (now_ms() - t0 > 90000)
+            die("ecbackafterwhole: live .part files remain: %s", live);
+    nec = ecb_ec_parts(L, num);
+
+    if (!vol_rec(L, "e42", &e))
+        die("ecbackafterwhole: lost vol_rec for e42");
+    int S = -1;
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < e.nstripe; p++)
+            in_s |= (e.stripe[p] == ids[i]);
+        if (!in_s) {
+            S = i;
+            break;
+        }
+    }
+    if (S < 0)
+        die("ecbackafterwhole: no spare 7th server");
+    int ml = leader_of(L);
+    int V = -1;
+    uint32_t vpos = UINT32_MAX;
+    for (int pass = 0; pass < 4 && V < 0; pass++) {
+        for (uint32_t p = 0; p < e.nstripe && V < 0; p++) {
+            int s = server_of(e.stripe[p]);
+            if (s < 0 || s == L || s == ml || s == S)
+                continue;
+            bool rep = ecb_is_rep(&e, s);
+            bool vot = voter_srv[s] != 0;
+            bool match = (pass == 0 && !rep && !vot) || (pass == 1 && !rep && vot) ||
+                         (pass == 2 && rep && !vot) || (pass == 3 && rep && vot);
+            if (match) {
+                V = s;
+                vpos = p;
+            }
+        }
+    }
+    if (V < 0)
+        die("ecbackafterwhole: could not pick victim holder");
+
+    /* Kill V -> V goes META_OUT -> wait for S to take vpos AND reach META_STRIPE_WHOLE. */
+    stop(V, SIGKILL);
+    struct state_want out_w = {ids[V], META_OUT, 1};
+    await_view(L, p_member_state, &out_w, "victim V marked META_OUT");
+
+    struct meta_volume e2 = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(L, "e42", &e2) && e2.stripe[vpos] == ids[S] && e2.stripe_pos[vpos].state == META_STRIPE_WHOLE)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("ecbackafterwhole: S did not reach META_STRIPE_WHOLE within 90 s (holder=%" PRIu32 " state=%u)",
+                e2.stripe[vpos], e2.stripe_pos[vpos].state);
+    }
+    uint64_t whole_ver = e2.stripe_version;
+    if (ecw_count_vol_chunks(sdirs[S], num) != nec)
+        die("ecbackafterwhole: S holds %d chunks at WHOLE (expected %d)", ecw_count_vol_chunks(sdirs[S], num), nec);
+
+    /* Bring V back UP -> pos MUST stay on S (WHOLE, stripe_version unchanged -> kills takebackwhole!), and V's old
+     * chunks MUST be released to 0 by committed MK_GC_RELEASE. */
+    xargs[V] = xa[V];
+    start(V);
+    struct state_want up_w = {ids[V], META_UP, 1};
+    await_view(S, p_member_state, &up_w, "victim V returned META_UP after WHOLE");
+
+    /* Wait 3 s across several place_duty ticks, checking every 200 ms that S never loses vpos. */
+    for (int k = 0; k < 15; k++) {
+        usleep(200000);
+        if (!vol_rec(S, "e42", &e2))
+            die("ecbackafterwhole: lost vol_rec after V returned");
+        if (e2.stripe[vpos] != ids[S] || e2.stripe_pos[vpos].state != META_STRIPE_WHOLE ||
+            e2.stripe_version != whole_ver)
+            die("ecbackafterwhole: pos %" PRIu32 " left WHOLE holder S (holder=%" PRIu32 " state=%u ver=%" PRIu64
+                " != %" PRIu64 "; takebackwhole!)",
+                vpos, e2.stripe[vpos], e2.stripe_pos[vpos].state, e2.stripe_version, whole_ver);
+    }
+    for (uint64_t t0 = now_ms(); ecw_count_pos_chunks(sdirs[V], num, vpos) != 0; usleep(100000))
+        if (now_ms() - t0 > 45000)
+            die("ecbackafterwhole: V still holds %d old chunks after MK_GC release (expected 0)",
+                ecw_count_pos_chunks(sdirs[V], num, vpos));
+    if (!vol_rec(S, "e42", &e2) || e2.stripe[vpos] != ids[S] || e2.stripe_pos[vpos].state != META_STRIPE_WHOLE ||
+        e2.stripe_version != whole_ver)
+        die("ecbackafterwhole: pos %" PRIu32 " moved after release (holder=%" PRIu32 " state=%u ver=%" PRIu64 ")",
+            vpos, e2.stripe[vpos], e2.stripe_pos[vpos].state, e2.stripe_version);
+    if (ecw_count_vol_chunks(sdirs[S], num) != nec)
+        die("ecbackafterwhole: S lost chunks (%d != %d)", ecw_count_vol_chunks(sdirs[S], num), nec);
+
+    uint64_t expect_rows = (uint64_t)INIT_DAYS * 2u * ECW_ROWS;
+    for (int s = 0; s < ECW_SERIES; s++) {
+        struct ecb_sum a, b;
+        if ((rc = ecb_read(c, ide[s], &a)) != 0 || (rc = ecb_read(ct, idt[s], &b)) != 0)
+            die("ecbackafterwhole: final read series %d failed: %s", s, ers(rc));
+        if (a.n != expect_rows || a.n != b.n || a.h != b.h)
+            die("ecbackafterwhole: final series %d mismatch: %" PRIu64 " (%" PRIx64 "), twin %" PRIu64 " (%" PRIx64 ")",
+                s, a.n, a.h, b.n, b.h);
+    }
+    tsdbc_close(c);
+    tsdbc_close(ct);
+    epoll_after_two = 0;
+    stop_all();
+    printf("  ecbackafterwhole: 4+2 on 7 -> V (srv %d, pos %" PRIu32 ") returned after S (srv %d) reached WHOLE; "
+           "pos stayed on S at stripe_version %" PRIu64 ", V's %d old chunks released to 0 via MK_GC, oracle matched\n",
+           V, vpos, S, whole_ver, nec);
+#endif
+}
+
+/* logbackduring (r9-return; E28, §5.4, D13): replicas=3 on 4 nodes. Replica A is killed past rebuild_after_s=6 while
+ * leader retains segments (repl_retain_s=20, repl_retain_down_gb=64). Spare B is held from joining ISR via synchold +
+ * snapslowmake. Once place_plan starts moving A -> learner B, restart A -> place_return cancels the unjoined log move
+ * automatically, removes learner B, and A catches up from retained WAL segments with 0 snapshots and rejoins the ISR. */
+static void scen_logbackduring(void)
+{
+    scenario("logbackduring");
+    init_rebuild_after_s = 6;
+    init_retain_s = 20;
+    init_retain_down_set = 1;
+    init_retain_down_gb = 64;
+    for (int i = 0; i < 4; i++) {
+        penv[i] = "TSDB_REPLD_TEST=synchold,snapslowmake=20000";
+        start(i);
+    }
+    init_cluster(0, 600);
+    init_rebuild_after_s = 0;
+    init_retain_s = 0;
+    init_retain_down_set = 0;
+    init_retain_down_gb = 0;
+    for (int i = 1; i < 4; i++)
+        node_add(0, i);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters of four members");
+    unsigned four = 4;
+    await_view(0, p_n_placeable, &four, "four placeable members");
+
+    uint32_t num = 0;
+    int rc;
+    if ((rc = vol_add(0, "plant", 3, &num)) != 0 || num != 1)
+        die("logbackduring: vol_add plant: %s (num=%" PRIu32 ")", cluster_strerror(rc), num);
+    struct meta_volume v;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "plant", &v) || !v.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("logbackduring: plant has no leader");
+    for (uint32_t k = 0; k < v.nrep; k++)
+        await_open_gen(0, "plant", server_of(v.rep[k].node), 1, 0);
+    await_isr(0, "plant", 3, 15000, "plant 3/3 ISR before stop");
+
+    int L = server_of(v.leader);
+    int ml = leader_of(L);
+    int B = -1, A = -1;
+    for (int i = 0; i < 4; i++)
+        if (rep_index(&v, i) < 0)
+            B = i;
+    for (int pass = 0; pass < 2 && A < 0; pass++) {
+        for (uint32_t k = 0; k < v.nrep && A < 0; k++) {
+            int s = server_of(v.rep[k].node);
+            if (s < 0 || s == L)
+                continue;
+            if (pass == 0 && s == ml)
+                continue;
+            A = s;
+        }
+    }
+    if (L < 0 || A < 0 || B < 0)
+        die("logbackduring: bad server roles L=%d A=%d B=%d", L, A, B);
+
+    /* Hold learner B's WAL syncs so B cannot finish joining ISR before A returns. */
+    char hold_b[PATH_MAX + 64];
+    server_dir(B, hold_b, sizeof hold_b);
+    snprintf(hold_b + strlen(hold_b), sizeof hold_b - strlen(hold_b), "/synchold");
+    int hfd = open(hold_b, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (hfd < 0)
+        die("logbackduring: create %s: %s", hold_b, strerror(errno));
+    close(hfd);
+
+    tsdbc *c = client(L);
+    tsdb_sid id = rep_series(c, rep_names[0], "plant", 30000);
+    int64_t t = 1000;
+    float fv = 1.0f;
+    uint64_t rows = 0;
+    if ((rc = tsdbc_insert_series(c, id, &t, &fv, 1)) != 0)
+        die("logbackduring: initial write: %s", ers(rc));
+    rows++;
+    if ((rc = tsdbc_flush(c)) != 0)
+        die("logbackduring: initial flush: %s", ers(rc));
+    await_isr(L, "plant", 3, 10000, "plant 3/3 ISR after initial write");
+
+    /* Kill A and write flushed segments while A is down until A goes META_OUT and learner B is added. */
+    stop(A, SIGKILL);
+    await_isr(L, "plant", 2, 15000, "plant ISR shrinks to 2 after A killed");
+
+    t = 10000;
+    for (int k = 0; k < 4; k++) {
+        int64_t tv[50];
+        float vv[50];
+        for (int j = 0; j < 50; j++)
+            tv[j] = t++, vv[j] = (float)(k * 50 + j);
+        if ((rc = tsdbc_insert_series(c, id, tv, vv, 50)) != 0)
+            die("logbackduring: write %d while A down: %s", k, ers(rc));
+        rows += 50;
+        if ((rc = tsdbc_flush(c)) != 0)
+            die("logbackduring: flush %d: %s", k, ers(rc));
+        usleep(400000);
+    }
+
+    struct state_want out_w = {ids[A], META_OUT, 1};
+    await_view(L, p_member_state, &out_w, "replica A marked META_OUT");
+
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(L, "plant", &v)) {
+            int bi = rep_index(&v, B);
+            if (bi >= 0 && v.rep[bi].learner && v.rep[bi].replaces == ids[A])
+                break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("logbackduring: place_plan did not add learner B replacing A within 30 s (nrep=%u)", v.nrep);
+    }
+    if (meta_volume_in_isr(&v, ids[B]))
+        die("logbackduring: learner B already in ISR despite synchold/snapslowmake");
+
+    /* Restart A -> A comes back META_UP with retained segments -> place_return cancels move & removes learner B! */
+    start(A);
+    struct state_want up_w = {ids[A], META_UP, 1};
+    await_view(L, p_member_state, &up_w, "replica A back META_UP");
+
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(L, "plant", &v) && v.nrep == 3 && rep_index(&v, B) < 0 && rep_index(&v, A) >= 0 &&
+            meta_volume_in_isr(&v, ids[A]) && v.nisr == 3)
+            break;
+        if (now_ms() - t0 > 45000)
+            die("logbackduring: move was not cancelled / A did not rejoin ISR within 45 s "
+                "(nrep=%u nisr=%u hasA=%d hasB=%d inA=%d inB=%d)",
+                v.nrep, v.nisr, rep_index(&v, A) >= 0, rep_index(&v, B) >= 0,
+                meta_volume_in_isr(&v, ids[A]), meta_volume_in_isr(&v, ids[B]));
+    }
+    unlink(hold_b);
+    if (log_has(A, "it needs a snapshot") || log_has(A, "snapshot installed"))
+        die("logbackduring: returning replica A installed a snapshot instead of catching up from retained WAL segments");
+
+    /* Write one more batch after cancel and verify all 3 replicas agree. */
+    int64_t tlast = t + 100;
+    if ((rc = tsdbc_insert_series(c, id, &tlast, &fv, 1)) != 0)
+        die("logbackduring: post-cancel write: %s", ers(rc));
+    rows++;
+    tsdbc *ca = client(A);
+    int got_a = -1;
+    for (uint64_t t0 = now_ms(); (got_a = rows_of(ca, id)) != (int)rows && now_ms() - t0 < 15000;)
+        usleep(50000);
+    if (got_a != (int)rows)
+        die("logbackduring: replica A has %d rows after cancel, want %" PRIu64, got_a, rows);
+    tsdbc_close(ca);
+    tsdbc_close(c);
+    for (int i = 0; i < 4; i++)
+        penv[i] = NULL;
+    stop_all();
+    printf("  logbackduring: replicas=3 on 4 -> A (srv %d) returned while learner B (srv %d) unjoined; "
+           "move cancelled automatically, B removed, A rejoined ISR with 0 snapshots and %" PRIu64 " rows\n",
+           A, B, rows);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -32316,7 +33018,8 @@ int main(int argc, char **argv)
                {"youngscrub", scen_youngscrub}, {"scrubheal", scen_scrubheal},
                {"ecback", scen_ecback}, {"ecbackempty", scen_ecbackempty}, {"ecbackgc", scen_ecbackgc}, {"scrub", scen_scrub},
                {"scrubrepair", scen_scrubrepair}, {"disks", scen_disks}, {"twodisks", scen_twodisks}, {"placeclass", scen_placeclass},
-               {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio}};
+               {"diskstall", scen_diskstall}, {"diskeio", scen_diskeio},
+               {"ecbackduring", scen_ecbackduring}, {"ecbackafterwhole", scen_ecbackafterwhole}, {"logbackduring", scen_logbackduring}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

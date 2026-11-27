@@ -31,6 +31,8 @@ int repld_failed(uint32_t v);
  * is reopened as a replica (design-cluster.md 6.3, 7.1). */
 int repld_leading(uint32_t v, uint64_t *epoch);
 /* (repld_leading: 1 the writer, 2 promoting to *epoch, 0 neither, -1 no such volume) */
+/* R9 (r9-return, D13/D16): this replica/leader's retained log_start (>= 1) and durable log_end for volume v. 0 or -1. */
+int repld_log_bounds(uint32_t v, uint64_t *log_start, uint64_t *log_end);
 /* Volume v's engine failed (eng_fail): 1 when the driver holds v (it stops and quiesces it, the process goes on, D13),
  * 0 when v is no volume of the driver (tsdbd's own rules apply). */
 int repld_engine_failed(uint32_t v, const char *msg);

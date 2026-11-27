@@ -131,8 +131,10 @@ static void set_member_state(struct meta_state *sm, uint32_t id, int state)
     meta_entry_init(&e);
     if (state == META_DOWN)
         meta_op_member_state(&e, id, state, mb->incarnation, META_DOWN_TIMEOUT, 1000, 1000);
-    else
-        meta_op_member_state(&e, id, state, mb->incarnation, META_DOWN_NONE, 0, 0);
+    else {
+        uint64_t inc = (mb->state == META_OUT && state == META_UP) ? mb->incarnation + 1 : mb->incarnation;
+        meta_op_member_state(&e, id, state, inc, META_DOWN_NONE, 0, 0);
+    }
     int res[4] = {0};
     int rc = apply_entry(sm, &e, res, 4);
     CHECK(rc == META_OK && res[0] == META_OK, "member %" PRIu32 " -> state %d: rc %d res %d", id, state, rc, res[0]);
@@ -950,6 +952,217 @@ static void test_r13_capability_class_and_fill(void)
     meta_free(&sm);
 }
 
+/* 10. Returning server (r9-return; E28, §5.4, D13): take back FILLING stripe positions with intact stores, leave WHOLE
+ * positions alone (mutant `takebackwhole`), cancel unjoined log moves when returning replica can catch up from retained
+ * segments, ignore operator moves / already-joined learners / changed store ids. */
+static void test_r9_return(void)
+{
+    struct meta_state sm;
+    struct place_member pm[8];
+    init_cluster_state(&sm, 7, NULL, pm, 2);
+    uint64_t sz = 1000ull << 30;
+    struct meta_disk dks[7];
+    struct place_disk_usage du[7];
+    for (uint32_t i = 0; i < 7; i++) {
+        dks[i] = mk_disk((uint8_t)(40 + i), META_DISK_NVME, META_DISK_USE_ALL, sz);
+        add_disk(&sm, i + 1, &dks[i]);
+        du[i] = (struct place_disk_usage){.disk_class = META_DISK_NVME, .uses = META_DISK_USE_ALL,
+                                          .state = META_STORE_UP, .have_usage = 1, .size_bytes = sz};
+        memcpy(du[i].store_id, dks[i].store_id, 16);
+        pm[i].disks = &du[i];
+        pm[i].ndisks = 1;
+    }
+
+    uint32_t reps[3] = {1, 2, 3};
+    uint32_t stripe[6] = {1, 2, 3, 4, 5, 6};
+    add_vol(&sm, 1, "ec_ret", reps, 3, 4, 2, stripe);
+
+    /* (a) Node 6 goes OUT and is replaced at pos 5 by spare node 7 (FILLING). */
+    set_member_state(&sm, 6, META_DOWN);
+    set_member_state(&sm, 6, META_OUT);
+    const struct meta_volume *v = meta_volume(&sm, 1);
+    struct meta_entry e;
+    meta_entry_init(&e);
+    meta_op_stripe_set(&e, 1, 5, 7, META_STRIPE_FILLING, 6, v->stripe_version);
+    int res[4] = {0};
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "replace node 6 with 7");
+    v = meta_volume(&sm, 1);
+    uint64_t set_ver = v->stripe_pos[5].set_ver;
+
+    /* Node 6 returns UP with its store_id intact -> place_return emits STRIPE_SET(pos=5, node=6, prev=7, is_return=1). */
+    set_member_state(&sm, 6, META_UP);
+    struct place_return_cand cand_ec = {.volume = 1, .pos = 5, .prev_node = 6, .version = set_ver, .is_log = 0};
+    struct place_in in = make_in(&sm, pm, 7);
+    in.return_cands = &cand_ec;
+    in.nreturn_cands = 1;
+    struct place_out out;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 1 && out.props[0].kind == PLACE_PROP_STRIPE_SET && out.props[0].node == 6 &&
+              out.props[0].other_node == 7 && out.props[0].pos == 5 && out.props[0].reason == META_STRIPE_FILLING &&
+              out.props[0].is_return == 1,
+          "return during fill: expected 1 return STRIPE_SET to node 6 (got %u props)", out.nprops);
+    place_out_free(&out);
+
+    /* (b) Changed store_id on node 6 -> NOT intact -> must NOT take back! */
+    du[5].store_id[0] ^= 0xff;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "return with changed store_id must emit 0 props (got %u)", out.nprops);
+    place_out_free(&out);
+    du[5].store_id[0] ^= 0xff;
+
+    /* (c) Operator posmove (not in return_cands) -> must NOT take back (also prevents ping-pong). */
+    in.return_cands = NULL;
+    in.nreturn_cands = 0;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "non-OUT move (empty return_cands) must emit 0 props (got %u)", out.nprops);
+    place_out_free(&out);
+
+    /* (c2) Uncommitted STRIPE_WHOLE window: if B already reported whole == 1 in fills (even at an older version),
+     *      place_return MUST NOT propose a take-back. */
+    v = meta_volume(&sm, 1);
+    in.return_cands = &cand_ec;
+    in.nreturn_cands = 1;
+    struct place_fill wf = {.node = 7, .volume = 1, .pos = 5, .stripe_version = v->stripe_version - 1, .whole = 1};
+    in.fills = &wf;
+    in.nfills = 1;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "return while B already reported whole must emit 0 props (got %u)", out.nprops);
+    place_out_free(&out);
+    in.fills = NULL;
+    in.nfills = 0;
+
+    /* (d) Node 7 finishes filling -> STRIPE_WHOLE commits. Returning node 6 must NOT take back a WHOLE position!
+     *     (Kills mutant `takebackwhole`.) */
+    v = meta_volume(&sm, 1);
+    meta_entry_init(&e);
+    meta_op_stripe_whole(&e, 1, 5, v->stripe_version);
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "commit STRIPE_WHOLE on node 7");
+    in.return_cands = &cand_ec;
+    in.nreturn_cands = 1;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "return after WHOLE must emit 0 props (got %u, mutant=%d)", out.nprops, g_mut);
+    place_out_free(&out);
+
+    /* (e) Log replica move cancellation: node 3 went OUT, learner 4 replaces 3, node 3 returns UP before 4 joins ISR. */
+    set_member_state(&sm, 3, META_DOWN);
+    set_member_state(&sm, 3, META_OUT);
+    uint32_t isr12[2] = {1, 2};
+    set_isr(&sm, 1, isr12, 2);
+    v = meta_volume(&sm, 1);
+    meta_entry_init(&e);
+    meta_op_replica_add(&e, 1, v->epoch, 4, 7777, 3);
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "add learner 4 replacing 3");
+    set_member_state(&sm, 3, META_UP);
+
+    v = meta_volume(&sm, 1);
+    struct place_return_cand cand_log = {.volume = 1, .pos = 0, .prev_node = 3, .version = 7777, .is_log = 1};
+    struct place_vol_log vlogs[2] = {
+        {.node = v->leader, .volume = 1, .epoch = v->epoch, .log_start = 100, .log_end = 500, .is_leader = 1, .healthy = 1},
+        {.node = 3, .volume = 1, .rid = meta_replica(v, 3)->rid, .epoch = v->epoch, .log_start = 1, .log_end = 250, .is_leader = 0, .healthy = 1},
+    };
+    in = make_in(&sm, pm, 7);
+    in.return_cands = &cand_log;
+    in.nreturn_cands = 1;
+    in.vol_logs = vlogs;
+    in.nvol_logs = 2;
+
+    /* Retained segments cover node 3 (250 >= 100) -> cancel move! */
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 1 && out.props[0].kind == PLACE_PROP_MOVE_CANCEL && out.props[0].volume == 1 &&
+              out.props[0].node == 4 && out.props[0].other_node == 3 && out.props[0].is_return == 1,
+          "log return with retained segments: expected MOVE_CANCEL of learner 4 (got %u props)", out.nprops);
+    place_out_free(&out);
+
+    /* Trimmed segments (node 3 log_end=50 < leader log_start=100) -> cannot catch up -> do NOT cancel! */
+    vlogs[1].log_end = 50;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with trimmed segments must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+
+    /* Additional log-cancel safety guards: volume fault on A, leader epoch mismatch, unhealthy leader/A, rid mismatch. */
+    vlogs[1].log_end = 250;
+    pm[2].nfaults = 1;
+    pm[2].faults[0] = (struct place_vol_fault){.volume = 1, .fault_s = 1};
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with volume fault on A must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+    pm[2].nfaults = 0;
+
+    vlogs[0].epoch = v->epoch + 1;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with leader epoch mismatch must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+    vlogs[0].epoch = v->epoch;
+
+    vlogs[0].healthy = 0;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with unhealthy leader must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+    vlogs[0].healthy = 1;
+
+    vlogs[1].healthy = 0;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with unhealthy A must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+    vlogs[1].healthy = 1;
+
+    vlogs[1].rid = meta_replica(v, 3)->rid + 1;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return with rid mismatch must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+    vlogs[1].rid = meta_replica(v, 3)->rid;
+
+    /* Learner 4 already joined ISR -> do NOT cancel even if node 3 has log_end >= log_start! */
+    uint32_t isr124[3] = {1, 2, 4};
+    set_isr(&sm, 1, isr124, 3);
+    place_out_init(&out);
+    place_plan(&in, &out);
+    CHECK(out.nprops == 0, "log return after learner joined ISR must NOT cancel (got %u props)", out.nprops);
+    place_out_free(&out);
+
+    meta_free(&sm);
+
+    /* (f) Rack survivability guard: taking A back must NOT turn a rack-survivable stripe into non-rack-survivable. */
+    static const char *const racks7[7] = {"r1", "r1", "r2", "r2", "r3", "r1", "r3"};
+    init_cluster_state(&sm, 7, racks7, pm, 2);
+    /* 4+2 on 3 racks (r1, r2, r3): current stripe {1(r1), 2(r1), 3(r2), 4(r2), 5(r3), 7(r3)} has 2 per rack (<= m=2 ->
+     * rack-survivable). Node 6 is in r1: replacing 7(r3) with 6(r1) would put 3 positions in r1 (> m=2 -> NOT rack-survivable!). */
+    uint32_t reps_r[3] = {1, 3, 5};
+    uint32_t str_r[6] = {1, 2, 3, 4, 5, 6};
+    add_vol(&sm, 1, "ec_rackret", reps_r, 3, 4, 2, str_r);
+    set_member_state(&sm, 6, META_DOWN);
+    set_member_state(&sm, 6, META_OUT);
+    v = meta_volume(&sm, 1);
+    meta_entry_init(&e);
+    meta_op_stripe_set(&e, 1, 5, 7, META_STRIPE_FILLING, 6, v->stripe_version);
+    CHECK(apply_entry(&sm, &e, res, 4) == META_OK && res[0] == META_OK, "replace rack node 6 with 7");
+    set_member_state(&sm, 6, META_UP);
+    v = meta_volume(&sm, 1);
+    struct place_return_cand cand_rk = {
+        .volume = 1, .pos = 5, .prev_node = 6, .version = v->stripe_pos[5].set_ver, .is_log = 0};
+    in = make_in(&sm, pm, 7);
+    in.return_cands = &cand_rk;
+    in.nreturn_cands = 1;
+    place_out_init(&out);
+    place_plan(&in, &out);
+    if (g_mut != PLACE_MUT_RACK_IGNORED)
+        CHECK(out.nprops == 0, "take-back breaking rack survivability must emit 0 props (got %u)", out.nprops);
+    place_out_free(&out);
+    meta_free(&sm);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--mutant") == 0) {
@@ -977,6 +1190,7 @@ int main(int argc, char **argv)
     test_drain_caps_fault_replace();
     test_sender_reachability();
     test_r13_capability_class_and_fill();
+    test_r9_return();
 
     if (fails) {
         fprintf(stderr, "test_place: %d checks failed\n", fails);

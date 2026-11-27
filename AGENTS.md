@@ -997,6 +997,21 @@ cgroup, so `nice` does not keep your work out of its way.
     and drains `sreconcile_note_missing` off the watch thread via `CS_OP_RECONCILE`. Like r9-fill's `OBJLIST`/`REOPEN`,
     chunk ops 9 and 10 are added without a `PL_CL_VERSION` bump. `tests/test_sreconcile.c`,
     `test_cluster ecback ecbackempty ecbackgc`, `make reconcile-mutants` (`backfullcopy backskipmissing`).
+  - **Returning server during rebuild** (R9, r9-return; `server/place.[ch]` `place_return`, `server/cluster.c`,
+    `server/cmove.c` `cmove_cancel_auto`, `server/repld.[ch]` `repld_log_bounds`, `server/cvol.c`,
+    `server/chunkpeer.c`, `server/chunkpeer_cluster.c`; design-cluster-data.md E28, §5.4; D12, D13, D16):
+    `HBS_VOLUMES` carries trailing per-volume `(log_start, log_end)` (backward-compatible). The cluster thread tracks
+    OUT/DOWN evictions across all voters (`apply_entry` fast-pathed via `meta_entry_has_op_mask` for `STRIPE_SET` /
+    `REPLICA_ADD`). When an evicted member returns UP with intact chunk store ids, `place_return` proposes
+    `STRIPE_SET` back to it (firing `CP_RETURN_SET`, `"return-set"`) for any position whose replacement is still
+    `META_STRIPE_FILLING` (never after `WHOLE` or a `whole == 1` fill report, and never breaking E9 rack survivability);
+    reads during return fall back from partial `prev` to the active holder before reporting `CHUNK_ST_ABSENT`, and
+    partial fills on the displaced replacement are released only via committed `MK_GC_RELEASE` once the returned holder
+    reaches `WHOLE`. For an unjoined log move whose returning replica is UP, healthy, and covered by retained segments
+    (`log_start <= 1 || log_end >= log_start`), `place_return` emits `PLACE_PROP_MOVE_CANCEL` (`cmove_cancel_auto`).
+    `tests/test_place.c` (`--mutant takebackwhole`), `tests/sim_place.c` / `tests/sim_place.sh` (`takebackwhole
+    partialdelnow`), `test_cluster ecbackduring ecbackafterwhole logbackduring`, and `make return-mutants`
+    (`takebackwhole partialdelnow`).
   - **A replica applies a committed MK_COLD** (R8, r8h; `src/ecapply.c`, design-cluster-data.md 2.3 step 6): it checks the
     marker (every object record names its oid, the key and the marker's Z; one `.ec` file per object; each Y's header
     check), stages the files, numbers the `.ec` parts in the leader's block order with Y above them (never the marker's

@@ -97,6 +97,8 @@ void cmove_duty(uint64_t now);
 /* R9 (r9-plan): start an automatic log replica move tracked by cmove (NULL when proposed, else reason not started). */
 extern const char cmove_err_already_proposed[];
 const char *cmove_start_auto(uint32_t vol, uint32_t from, uint32_t to, uint64_t now);
+/* R9 (r9-return, D13): cancel an in-flight automatic log move before learner `to` joins the ISR. */
+const char *cmove_cancel_auto(uint32_t vol, uint32_t from, uint32_t to, uint64_t now);
 /* STATUS: a line per move this Raft leader drives ("move volume V node A -> node B: STEP, AGE s"); counters */
 size_t cmove_status(char *out, size_t n, uint64_t now);
 void cmove_counts(unsigned long *started, unsigned long *done, unsigned long *cancelled);

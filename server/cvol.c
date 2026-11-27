@@ -663,6 +663,11 @@ static void on_report(void *arg, struct cluster_report *out)
             out->vols[i].role = l == 1 ? CL_ROLE_OWNER : l == 2 ? CL_ROLE_PROMOTING : CL_ROLE_NONE;
         if (l == 2)
             out->vols[i].epoch = pe; /* the epoch it promotes to (leader_deposed in cluster.c) */
+        uint64_t ls = 0, le = 0;
+        if (out->vols[i].health == CL_HEALTH_OK && repld_log_bounds(out->vols[i].volume, &ls, &le) == 0) {
+            out->vols[i].log_start = ls;
+            out->vols[i].log_end = le;
+        }
     }
     out->nunreach = repld_unreachable(out->unreach, CLUSTER_REPORT_UNREACH, M.unreach_ms);
     out->nisr = repld_isr_requests(out->isr, CLUSTER_REPORT_ISR);

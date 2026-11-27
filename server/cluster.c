@@ -3372,6 +3372,13 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
                 for (uint32_t i = 0; i < n; i++)
                     getbytes(&s, nv[i].v.store_id, 16);
             }
+            /* R9 (D13): optional trailing array of n (log_start, log_end) pairs (backward-compatible). */
+            if (!s.bad && s.off < s.len) {
+                for (uint32_t i = 0; i < n; i++) {
+                    nv[i].v.log_start = get64(&s);
+                    nv[i].v.log_end = get64(&s);
+                }
+            }
             if (s.bad) {
                 free(nv);
                 r->bad = 1;
@@ -3595,9 +3602,174 @@ static void serve_watch(struct conn *c, uint64_t from)
     send_snap(c);
 }
 
+/* R9 (r9-return; E28, D13): tracks active EC stripe fills and log moves created while the previous holder was
+ * META_OUT/META_DOWN (with replaced_by == 0), so place_return takes back only OUT/DOWN evictions and never undoes
+ * intentional drains, replaces, UP operator moves, or its own take-backs. Maintained across all voters via apply_entry
+ * (fast-pathed to STRIPE_SET / REPLICA_ADD entries) so leader failover preserves candidates; snapshot rebuilds seed
+ * candidates whose previous holder is still META_OUT/META_DOWN. */
+static struct place_return_cand *g_ret_cands;
+static size_t g_nret_cands, g_cap_ret_cands;
+
+static void ret_cands_clear(void)
+{
+    free(g_ret_cands);
+    g_ret_cands = NULL;
+    g_nret_cands = g_cap_ret_cands = 0;
+}
+
+static void ret_cands_add(uint32_t volume, uint32_t pos, uint32_t prev_node, uint64_t version, uint8_t is_log)
+{
+    for (size_t i = 0; i < g_nret_cands; i++) {
+        const struct place_return_cand *c = &g_ret_cands[i];
+        if (c->is_log == is_log && c->volume == volume && c->prev_node == prev_node && c->version == version &&
+            (is_log || c->pos == pos))
+            return;
+    }
+    if (g_nret_cands == g_cap_ret_cands) {
+        size_t ncap = g_cap_ret_cands ? g_cap_ret_cands * 2 : 16;
+        struct place_return_cand *nc = realloc(g_ret_cands, ncap * sizeof *nc);
+        if (!nc)
+            oom();
+        g_ret_cands = nc;
+        g_cap_ret_cands = ncap;
+    }
+    g_ret_cands[g_nret_cands++] = (struct place_return_cand){
+        .volume = volume,
+        .pos = pos,
+        .prev_node = prev_node,
+        .version = version,
+        .is_log = is_log,
+    };
+}
+
+static void ret_cands_prune(const struct meta_state *sm)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < g_nret_cands; i++) {
+        struct place_return_cand c = g_ret_cands[i];
+        const struct meta_volume *v = meta_volume(sm, c.volume);
+        if (!v)
+            continue;
+        int keep = 0;
+        if (c.is_log) {
+            for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++) {
+                if (v->rep[k].learner && v->rep[k].replaces == c.prev_node && v->rep[k].rid == c.version) {
+                    keep = 1;
+                    break;
+                }
+            }
+        } else if (v->redundancy == META_RED_EC && c.pos < v->nstripe && c.pos < META_STRIPE_MAX) {
+            if (v->stripe_pos[c.pos].retired_ver == 0 && v->stripe_pos[c.pos].prev == c.prev_node &&
+                v->stripe[c.pos] != c.prev_node && v->stripe_pos[c.pos].set_ver == c.version)
+                keep = 1;
+        }
+        if (keep)
+            g_ret_cands[w++] = c;
+    }
+    g_nret_cands = w;
+}
+
+static void ret_cands_rebuild(const struct meta_state *sm)
+{
+    g_nret_cands = 0;
+    if (!sm || !sm->initialised)
+        return;
+    for (uint32_t vi = 0; vi < sm->nvolumes; vi++) {
+        const struct meta_volume *v = &sm->volumes[vi];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        if (v->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                if (v->stripe_pos[p].retired_ver != 0)
+                    continue;
+                uint32_t prev = v->stripe_pos[p].prev;
+                if (!prev || prev == v->stripe[p])
+                    continue;
+                const struct meta_member *mb = meta_member(sm, prev);
+                if (mb && (mb->state == META_OUT || mb->state == META_DOWN) && mb->replaced_by == 0)
+                    ret_cands_add(v->number, p, prev, v->stripe_pos[p].set_ver, 0);
+            }
+        }
+        for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++) {
+            if (!v->rep[k].learner || !v->rep[k].replaces)
+                continue;
+            const struct meta_member *mb = meta_member(sm, v->rep[k].replaces);
+            if (mb && (mb->state == META_OUT || mb->state == META_DOWN) && mb->replaced_by == 0)
+                ret_cands_add(v->number, 0, v->rep[k].replaces, v->rep[k].rid, 1);
+        }
+    }
+}
+
+struct ret_pre_mem {
+    uint32_t id;
+    uint8_t state;
+    uint32_t replaced_by;
+};
+
+struct ret_pre_vol {
+    uint32_t number;
+    uint32_t nstripe;
+    uint64_t set_ver[META_STRIPE_MAX];
+    uint32_t nrep;
+    uint64_t rids[META_REPLICAS_MAX];
+};
+
+static int ret_pre_was_out_or_down(const struct ret_pre_mem *pm, uint32_t nm, uint32_t id)
+{
+    for (uint32_t i = 0; i < nm; i++)
+        if (pm[i].id == id)
+            return (pm[i].state == META_OUT || pm[i].state == META_DOWN) && pm[i].replaced_by == 0;
+    return 0;
+}
+
+static void ret_cands_after_apply(const struct meta_state *sm, const struct ret_pre_mem *pm, uint32_t nm,
+                                  const struct ret_pre_vol *pv, uint32_t nv)
+{
+    for (uint32_t vi = 0; vi < sm->nvolumes; vi++) {
+        const struct meta_volume *v = &sm->volumes[vi];
+        if (v->kind != META_VOL_REPLICATED)
+            continue;
+        const struct ret_pre_vol *oldv = NULL;
+        for (uint32_t j = 0; j < nv; j++) {
+            if (pv[j].number == v->number) {
+                oldv = &pv[j];
+                break;
+            }
+        }
+        if (v->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                if (v->stripe_pos[p].retired_ver != 0 || v->stripe_pos[p].state != META_STRIPE_FILLING)
+                    continue;
+                uint32_t prev = v->stripe_pos[p].prev;
+                if (!prev || prev == v->stripe[p])
+                    continue;
+                if (oldv && p < oldv->nstripe && oldv->set_ver[p] == v->stripe_pos[p].set_ver)
+                    continue;
+                if (ret_pre_was_out_or_down(pm, nm, prev))
+                    ret_cands_add(v->number, p, prev, v->stripe_pos[p].set_ver, 0);
+            }
+        }
+        for (uint32_t k = 0; k < v->nrep && k < META_REPLICAS_MAX; k++) {
+            if (!v->rep[k].learner || !v->rep[k].replaces)
+                continue;
+            int existed = 0;
+            for (uint32_t j = 0; oldv && j < oldv->nrep; j++) {
+                if (oldv->rids[j] == v->rep[k].rid) {
+                    existed = 1;
+                    break;
+                }
+            }
+            if (!existed && ret_pre_was_out_or_down(pm, nm, v->rep[k].replaces))
+                ret_cands_add(v->number, 0, v->rep[k].replaces, v->rep[k].rid, 1);
+        }
+    }
+    ret_cands_prune(sm);
+}
+
 /* the state was replaced (a RESTORE, a snapshot from the watch stream): everyone watching starts from it */
 static void state_replaced(void)
 {
+    ret_cands_rebuild(&C.sm);
     ring_reset();
     for (size_t i = 0; i < C.nconns; i++)
         if (C.conns[i]->watch_served && !C.conns[i]->dead)
@@ -3612,8 +3784,46 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
     for (size_t i = 0; i < sizeof rcs / sizeof rcs[0]; i++)
         rcs[i] = META_OK;
     int rc0 = CLUSTER_ERR_RETRY;
+    struct ret_pre_mem *pre_m = NULL;
+    struct ret_pre_vol *pre_v = NULL;
+    uint32_t pre_nm = 0, pre_nv = 0;
+    const uint64_t ret_op_mask = (1ull << META_OP_STRIPE_SET) | (1ull << META_OP_REPLICA_ADD);
+    int may_add_ret = own && type == RAFT_ENTRY_NORMAL && m->initialised &&
+                      meta_entry_has_op_mask(data, len, ret_op_mask);
+    if (may_add_ret) {
+        pre_nm = m->nmembers;
+        pre_nv = m->nvolumes;
+        if (pre_nm) {
+            pre_m = malloc((size_t)pre_nm * sizeof *pre_m);
+            if (!pre_m)
+                oom();
+            for (uint32_t i = 0; i < pre_nm; i++)
+                pre_m[i] = (struct ret_pre_mem){
+                    .id = m->members[i].id,
+                    .state = m->members[i].state,
+                    .replaced_by = m->members[i].replaced_by,
+                };
+        }
+        if (pre_nv) {
+            pre_v = calloc(pre_nv, sizeof *pre_v);
+            if (!pre_v)
+                oom();
+            for (uint32_t i = 0; i < pre_nv; i++) {
+                const struct meta_volume *v = &m->volumes[i];
+                pre_v[i].number = v->number;
+                pre_v[i].nstripe = v->nstripe <= META_STRIPE_MAX ? v->nstripe : META_STRIPE_MAX;
+                for (uint32_t p = 0; p < pre_v[i].nstripe; p++)
+                    pre_v[i].set_ver[p] = v->stripe_pos[p].set_ver;
+                pre_v[i].nrep = v->nrep <= META_REPLICAS_MAX ? v->nrep : META_REPLICAS_MAX;
+                for (uint32_t k = 0; k < pre_v[i].nrep; k++)
+                    pre_v[i].rids[k] = v->rep[k].rid;
+            }
+        }
+    }
     if (type == RAFT_ENTRY_NORMAL) {
         if (meta_apply(m, index, term, data, len, rcs, sizeof rcs / sizeof rcs[0]) != META_OK) {
+            free(pre_m);
+            free(pre_v);
             if (meta_entry_older(data, len)) /* a preview cluster is initialised again, never upgraded */
                 fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 9 "
                           "or older and this build reads version %d: the cluster was made by another build; "
@@ -3622,6 +3832,10 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
                       term);
         }
         rc0 = rcs[0];
+        if (may_add_ret && m->initialised)
+            ret_cands_after_apply(m, pre_m, pre_nm, pre_v, pre_nv);
+        else if (own && g_nret_cands > 0 && m->initialised)
+            ret_cands_prune(m);
         if (own && rc0 == META_OK && C.r && raft_get_role(C.r) == RAFT_LEADER)
             for (size_t i = 1; i < sizeof rcs / sizeof rcs[0]; i++)
                 if (rcs[i] != META_OK)
@@ -3630,6 +3844,8 @@ static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t 
         meta_apply_other(m, index, term, type == RAFT_ENTRY_CONFIG ? data : NULL,
                          type == RAFT_ENTRY_CONFIG ? len : 0);
     }
+    free(pre_m);
+    free(pre_v);
     if (!own)
         return;
     if (C.vol_trace && type == RAFT_ENTRY_NORMAL)
@@ -4282,6 +4498,7 @@ static int core_boot(char *err, size_t errn)
     int adopted = adopt_install(err, errn);
     if (adopted < 0)
         return -1;
+    ret_cands_rebuild(&C.sm);
     raft_log_opts lo = {.segment_bytes = C.seg_bytes};
     if (raft_log_open(C.logdir, &lo, C.sm.applied, C.sm.applied_term, &C.log, err, errn) != ISO_OK)
         return -1;
@@ -5303,6 +5520,52 @@ static struct place_replace *build_place_replaces(uint32_t *nr_out)
             pr[k++] = (struct place_replace){.old_node = C.sm.members[i].id, .new_node = C.sm.members[i].replaced_by};
     *nr_out = k;
     return pr;
+}
+
+static int heard_fresh(uint32_t id, uint64_t now);
+
+/* Collect per-member volume WAL log bounds from fresh heartbeats for place_return log-move cancel (E28, D13). */
+static struct place_vol_log *build_place_vol_logs(uint64_t now, uint32_t *nvl_out)
+{
+    *nvl_out = 0;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < C.sm.nmembers; i++) {
+        uint32_t id = C.sm.members[i].id;
+        if (id != C.id && !heard_fresh(id, now))
+            continue;
+        struct heard *h = heard_get(id);
+        if (h)
+            total += h->nvols;
+    }
+    if (!total)
+        return NULL;
+    struct place_vol_log *vl = calloc(total, sizeof *vl);
+    if (!vl)
+        oom();
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < C.sm.nmembers; i++) {
+        uint32_t id = C.sm.members[i].id;
+        if (id != C.id && !heard_fresh(id, now))
+            continue;
+        struct heard *h = heard_get(id);
+        if (!h)
+            continue;
+        for (uint32_t j = 0; j < h->nvols && k < total; j++) {
+            const struct cluster_vol_report *rv = &h->vols[j].v;
+            vl[k++] = (struct place_vol_log){
+                .node = id,
+                .volume = rv->volume,
+                .rid = rv->rid,
+                .epoch = rv->epoch,
+                .log_start = rv->log_start,
+                .log_end = rv->log_end,
+                .is_leader = (uint8_t)(rv->role == CL_ROLE_OWNER),
+                .healthy = (uint8_t)(rv->health == CL_HEALTH_OK),
+            };
+        }
+    }
+    *nvl_out = k;
+    return vl;
 }
 
 /* Initial log-replica placement for VOLUME_ADD: delegates to pure server/place.c (r9-plan, r13-place). */
@@ -6870,6 +7133,11 @@ static void put_sections(struct buf *b, uint64_t now)
     /* R13 (D14): trailing per-volume 16-byte disk store_id (ignored by older parsers, read by new ones). */
     for (uint32_t i = 0; i < rep.nvols; i++)
         put(b, rep.vols[i].store_id, 16);
+    /* R9 (D13): trailing per-volume (log_start, log_end) for return-during-log-move cancel. */
+    for (uint32_t i = 0; i < rep.nvols; i++) {
+        put64(b, rep.vols[i].log_start);
+        put64(b, rep.vols[i].log_end);
+    }
     sec_end(b, at);
     at = sec_begin(b, HBS_DOMAINS);
     put32(b, rep.ndoms);
@@ -8669,10 +8937,11 @@ static void place_duty(uint64_t now)
     uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
                            ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
                            : now / MS;
-    uint32_t nm = 0, nf = 0, nr = 0;
+    uint32_t nm = 0, nf = 0, nr = 0, nvl = 0;
     struct place_fill *pf = NULL;
     struct place_member *pm = build_place_members(now, &nm, &pf, &nf);
     struct place_replace *pr = build_place_replaces(&nr);
+    struct place_vol_log *vl = build_place_vol_logs(now, &nvl);
     struct place_in in = {
         .sm = &C.sm,
         .members = pm,
@@ -8685,6 +8954,10 @@ static void place_duty(uint64_t now)
         .mutant = place_mutant_env(),
         .replaces = pr,
         .nreplaces = nr,
+        .vol_logs = vl,
+        .nvol_logs = nvl,
+        .return_cands = g_ret_cands,
+        .nreturn_cands = (uint32_t)g_nret_cands,
     };
     place_settings_default(&in.set);
     in.set.rebuild_after_s = C.sm.set.rebuild_after_s;
@@ -8767,7 +9040,12 @@ static void place_duty(uint64_t now)
             struct meta_entry e;
             meta_entry_init(&e);
             meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->reason, p->other_node, p->version);
-            (void)propose(&e, 0, 0, 0);
+            if (propose(&e, 0, 0, 0) == ISO_OK && p->is_return) {
+                say("proposes return STRIPE_SET vol %" PRIu32 " pos %" PRIu32 " node %" PRIu32 " (prev %" PRIu32
+                    ") ver %" PRIu64,
+                    p->volume, p->pos, p->node, p->other_node, p->version);
+                crash_point(CP_RETURN_SET);
+            }
         } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
 #ifdef TSDB_TEST_HOOKS
             if (C.stripe_whole_file)
@@ -8788,12 +9066,26 @@ static void place_duty(uint64_t now)
                 kick(p->volume);
         } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
             (void)ctr_move_start(p->volume, p->node, now);
+        } else if (p->kind == PLACE_PROP_MOVE_CANCEL) {
+            const char *why = cmove_cancel_auto(p->volume, p->other_node, p->node, now);
+            if (why && why != cmove_err_already_proposed) {
+                int same = 0;
+                for (uint32_t di = 0; di < ndefer_last; di++)
+                    if (defer_last[di].vol == p->volume && defer_last[di].why == why)
+                        same = 1;
+                if (!same)
+                    say("place: cancel move of volume %" PRIu32 " from node %" PRIu32 " to node %" PRIu32
+                        " deferred: %s",
+                        p->volume, p->other_node, p->node, why);
+                if (ndefer_next < sizeof defer_next / sizeof defer_next[0])
+                    defer_next[ndefer_next++] = (struct defer_entry){.vol = p->volume, .why = why};
+            }
         }
-        /* TODO(r9-return): wire PLACE_PROP_MOVE_CANCEL once handler lands. */
     }
     memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
     ndefer_last = ndefer_next;
     place_out_free(&out);
+    free(vl);
     free(pr);
     free(pf);
     free(pm);
@@ -9489,6 +9781,7 @@ void cluster_stop(void)
     close(C.stop_pipe[0]);
     close(C.stop_pipe[1]);
     cluster_set_fills(NULL, 0);
+    ret_cands_clear();
 }
 
 /* ------------------------------------------------------------------ cluster_int.h (R4's files) */

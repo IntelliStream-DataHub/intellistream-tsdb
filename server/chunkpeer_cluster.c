@@ -35,6 +35,7 @@
 #include "margins.h"
 #include "meta.h"
 #include "pace.h"
+#include "place.h"
 #include "repld.h"
 #include "sfill.h"
 #include "sreconcile.h"
@@ -1615,10 +1616,15 @@ struct sf_key {
 };
 
 #ifdef TSDB_TEST_HOOKS
+struct nomark_del_item {
+    uint8_t oid[16];
+    uint8_t vuuid[16];
+};
+
 struct nomark_del_ctx {
     uint32_t vol;
     unsigned pos;
-    uint8_t (*oids)[16];
+    struct nomark_del_item *items;
     size_t n, cap;
 };
 
@@ -1629,17 +1635,19 @@ static int nomark_list_cb(void *arg, const chunk_listed *c)
         return 0;
     if (ctx->n == ctx->cap) {
         size_t nc = ctx->cap ? ctx->cap * 2 : 32;
-        uint8_t (*nv)[16] = realloc(ctx->oids, nc * 16);
+        struct nomark_del_item *nv = realloc(ctx->items, nc * sizeof *nv);
         if (!nv)
             return TSDB_ERR_NOMEM;
-        ctx->oids = nv;
+        ctx->items = nv;
         ctx->cap = nc;
     }
-    memcpy(ctx->oids[ctx->n++], c->oid, 16);
+    memcpy(ctx->items[ctx->n].oid, c->oid, 16);
+    memcpy(ctx->items[ctx->n].vuuid, c->vuuid, 16);
+    ctx->n++;
     return 0;
 }
 
-/* Planted bug releasenomark: deletes local chunks of (vol, pos) directly on the list change without MK_GC_RELEASE. */
+/* Planted bugs releasenomark / partialdelnow: deletes local chunks of (vol, pos) directly without MK_GC_RELEASE. */
 static void nomark_delete_local_pos(uint32_t vol, unsigned pos, uint64_t epoch)
 {
     struct chunksrv *cs = chunksrv_cluster_hold();
@@ -1648,18 +1656,19 @@ static void nomark_delete_local_pos(uint32_t vol, unsigned pos, uint64_t epoch)
     chunk_backend *be = chunksrv_backend(cs);
     if (be) {
         struct nomark_del_ctx d = {.vol = vol, .pos = pos};
-        if (chunk_be_list_names(be, vol, nomark_list_cb, &d) == 0) {
+        if (chunk_be_list(be, vol, false, nomark_list_cb, &d) == 0) {
             uint64_t ep = epoch ? epoch : 1;
             uint64_t cur = chunk_be_epoch(be, vol);
             if (cur > ep)
                 ep = cur;
             for (size_t i = 0; i < d.n; i++) {
                 chunk_ident id = {.volume = vol, .pos = (uint16_t)pos};
-                memcpy(id.oid, d.oids[i], 16);
+                memcpy(id.oid, d.items[i].oid, 16);
+                memcpy(id.vuuid, d.items[i].vuuid, 16);
                 (void)chunk_be_del(be, &id, ep);
             }
         }
-        free(d.oids);
+        free(d.items);
     }
     chunksrv_cluster_release();
 }
@@ -1744,8 +1753,10 @@ static void *sf_watch_main(void *arg)
                             if (v->stripe_pos[p].state == META_STRIPE_FILLING && p < 32)
                                 fmask |= 1u << p;
 #ifdef TSDB_TEST_HOOKS
-                            if (ecgc_mutant == GC_MUT_RELEASE_NOMARK && v->stripe[p] != c->self &&
-                                v->stripe_pos[p].prev == c->self) {
+                            if ((ecgc_mutant == GC_MUT_RELEASE_NOMARK ||
+                                 (place_mutant_env() == PLACE_MUT_PARTIAL_DEL_NOW &&
+                                  v->stripe_pos[p].state == META_STRIPE_FILLING)) &&
+                                v->stripe[p] != c->self && v->stripe_pos[p].prev == c->self) {
                                 if (nnomark == cap_nomark) {
                                     uint32_t nc = cap_nomark ? cap_nomark * 2 : 32;
                                     void *nv = realloc(nomark_del, (size_t)nc * sizeof *nomark_del);

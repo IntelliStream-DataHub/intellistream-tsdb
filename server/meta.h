@@ -748,6 +748,8 @@ void meta_op_volume_force(struct meta_entry *e, const struct meta_volume *v, uin
  * the caller stops (see the head comment). */
 int meta_apply(struct meta_state *m, uint64_t index, uint64_t term, const void *data, size_t len, int *res,
                uint32_t nres);
+/* Returns 1 if the encoded entry contains any operation whose kind bit (1ull << kind) is set in `op_mask`, else 0. */
+int meta_entry_has_op_mask(const void *data, size_t len, uint64_t op_mask);
 /* A Raft entry that is not a command (the no-op, a configuration: `config` in raft_config's wire form) still moves
  * the applied index; a configuration is kept for snapshots. */
 void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const void *config, size_t config_len);
