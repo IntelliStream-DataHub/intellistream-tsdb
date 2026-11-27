@@ -101,6 +101,7 @@
 #include "cluster_int.h"
 
 #include "crashpt.h"
+#include "creport.h"
 #include "meta.h"
 #include "pace.h"
 #include "peerlink.h"
@@ -524,6 +525,7 @@ void cluster_status_free(struct cluster_status *st)
     for (uint32_t i = 0; st->heard && i < st->nheard; i++) {
         free(st->heard[i].vols);
         free(st->heard[i].doms);
+        free(st->heard[i].sections);
     }
     free(st->heard);
     st->heard = NULL;
@@ -615,6 +617,22 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         }
         h->answered_ms = get64(&r);
         h->lease_left_ms = (int64_t)get64(&r);
+        uint32_t slen = get8(&r);
+        slen |= (uint32_t)get8(&r) << 8;
+        if (r.bad || !need(&r, slen)) {
+            r.bad = 1;
+            break;
+        }
+        if (slen > 0) {
+            h->sections = malloc((size_t)slen + 1);
+            if (!h->sections) {
+                r.bad = 1;
+                break;
+            }
+            memcpy(h->sections, r.p + r.off, slen);
+            h->sections[slen] = '\0';
+            r.off += slen;
+        }
     }
     st->users_caught_up = r.bad ? 0 : get8(&r);
     st->ntr = r.bad ? 0 : get32(&r);
@@ -994,6 +1012,8 @@ struct heard {
     uint8_t fill_pct; /* 0..100 data-dir fill percentage (0xff: unknown) */
     uint32_t nfills;
     struct cluster_fill_report *fills;
+    /* R14: custom registered heartbeat sections decoded via server/creport.h */
+    struct creport_heard_secs ext;
 };
 
 struct addr_e {
@@ -2250,6 +2270,8 @@ static void cc_clear(void)
         sched_yield();
 }
 
+static void cluster_metrics_publish(uint64_t now);
+
 /* After whatever moved the copy (an applied batch, an installed snapshot, a swap to the state file's copy, a
  * restore): a new snapshot of C.sm. The cluster thread only. */
 static void copy_publish(void)
@@ -2284,6 +2306,7 @@ static void copy_publish(void)
             o->rep[k] = (struct cluster_copy_rep){v->rep[k].node, v->rep[k].learner};
         o->nisr = v->nisr < META_REPLICAS_MAX ? v->nisr : META_REPLICAS_MAX;
         memcpy(o->isr, v->isr, o->nisr * sizeof o->isr[0]);
+        o->min_isr = v->min_isr;
         o->redundancy = v->redundancy;
         o->ec_k = v->ec_k;
         o->ec_m = v->ec_m;
@@ -2310,6 +2333,7 @@ static void copy_publish(void)
     cc_swap(s);
     atomic_fetch_add_explicit(&cc_builds, 1, memory_order_release);
     pace_configure(&(struct pace_cfg){(uint64_t)C.sm.set.rebuild_mb_s << 20, (uint64_t)C.sm.set.balance_mb_s << 20});
+    cluster_metrics_publish(iso_now_ns());
 }
 
 const struct cluster_copy_member *cluster_copy_member(const struct cluster_copy *c, uint32_t id)
@@ -2569,6 +2593,79 @@ void cluster_set_fill_pct(uint8_t pct) { atomic_store_explicit(&g_hb_fill_pct, p
 static _Atomic uint64_t g_out_guard_passed;
 uint64_t cluster_out_guard_passed(void) { return atomic_load_explicit(&g_out_guard_passed, memory_order_relaxed); }
 
+/* R14 (D22): short-lock metrics snapshot published by the cluster thread for server/metrics.c (no cluster locks held
+ * across rendering). */
+static pthread_mutex_t g_cm_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct cluster_metrics_snap g_cm_snap;
+static uint64_t g_cm_lease_until; /* leader's core_lease_until(now) at publish time (0: not leading / no lease) */
+static int g_cm_valid;
+
+static const struct meta_state *view_state(void);
+
+static void cluster_metrics_publish(uint64_t now)
+{
+    struct cluster_metrics_snap s;
+    memset(&s, 0, sizeof s);
+    uint64_t commit = C.r ? (uint64_t)raft_get_commit(C.r) : C.hint_commit;
+    uint64_t applied = view_state()->applied;
+    uint64_t lease_until = 0;
+    s.raft_term = C.r ? (uint64_t)raft_get_term(C.r) : C.hint_term;
+    s.raft_leader = (C.r && raft_get_role(C.r) == RAFT_LEADER) ? 1 : 0;
+    if (s.raft_leader) {
+        lease_until = core_lease_until(now);
+        s.raft_quorum = lease_until != 0 ? 1 : 0;
+    } else {
+        s.raft_quorum = (C.have_node && cluster_lease_valid()) ? 1 : 0;
+    }
+    s.raft_commit = commit;
+    s.raft_applied = applied;
+    s.raft_commit_lag = commit > applied ? commit - applied : 0;
+    struct ctr_counts cc;
+    ctr_counts(&cc);
+    s.tr[CL_TR_STARTED] = cc.started;
+    s.tr[CL_TR_DONE] = cc.done;
+    s.tr[CL_TR_TIMEDOUT] = cc.timedout;
+    s.tr[CL_TR_CANCELLED] = cc.cancelled;
+    s.tr[CL_TR_FALLBACK] = cc.fallback;
+    s.tr[CL_TR_BALANCE] = cc.balance;
+    unsigned long ms = 0, md = 0, mc = 0;
+    cmove_counts(&ms, &md, &mc);
+    s.tr[CL_TR_MV_STARTED] = ms;
+    s.tr[CL_TR_MV_DONE] = md;
+    s.tr[CL_TR_MV_CANCELLED] = mc;
+    s.out_guard_passed = cluster_out_guard_passed();
+
+    pthread_mutex_lock(&g_cm_mu);
+    g_cm_snap = s;
+    g_cm_lease_until = lease_until;
+    g_cm_valid = 1;
+    pthread_mutex_unlock(&g_cm_mu);
+}
+
+void cluster_metrics_get(struct cluster_metrics_snap *out)
+{
+    if (!out)
+        return;
+    uint64_t lease_until = 0;
+    int valid = 0;
+    pthread_mutex_lock(&g_cm_mu);
+    if (g_cm_valid) {
+        *out = g_cm_snap;
+        lease_until = g_cm_lease_until;
+        valid = 1;
+    } else {
+        memset(out, 0, sizeof *out);
+    }
+    pthread_mutex_unlock(&g_cm_mu);
+    out->out_guard_passed = cluster_out_guard_passed();
+    if (valid) {
+        if (out->raft_leader)
+            out->raft_quorum = (lease_until == UINT64_MAX || mono_ns() < lease_until) ? 1 : 0;
+        else
+            out->raft_quorum = cluster_lease_valid() ? 1 : 0;
+    }
+}
+
 /* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
  * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
  * its arrival), at most 2 s. The cluster thread raises it; any thread reads it lock-free (single-writer seqlock with
@@ -2638,6 +2735,7 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
     free(h->fills);     /* a beat without HBS_FILL reports no active fills (never retain stale entries) */
     h->fills = NULL;
     h->nfills = 0;
+    creport_heard_clear(&h->ext); /* replace & free prior registered custom sections on each beat */
     while (!r->bad && r->off < r->len) {
         uint32_t type = get8(r);
         type |= (uint32_t)get8(r) << 8;
@@ -2820,6 +2918,11 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
             free(h->doms);
             h->doms = nd;
             h->ndoms = n;
+        } else {
+            /* Custom registered heartbeat sections (server/creport.h): unknown types (1) and malformed custom
+             * payloads (-1, counted in creport_sec_decode_errors) are skipped so one module's decoder bug or
+             * version skew never drops the rest of the heartbeat (lease, ISR, volumes). */
+            (void)creport_sec_decode_into(&h->ext, (uint16_t)type, h->id, s.p, s.len);
         }
     }
 }
@@ -4214,6 +4317,11 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
         left = until > m ? (int64_t)((until - m) / MS) : -(int64_t)((m - until) / MS) - 1;
     }
     put64(b, (uint64_t)left);
+    char secbuf[4096];
+    secbuf[0] = '\0';
+    if (h)
+        creport_heard_format(&h->ext, h->id, secbuf, sizeof secbuf);
+    putstr(b, secbuf);
 }
 
 static _Atomic(cluster_drv_counts_fn) g_drv_counts;
@@ -5963,6 +6071,14 @@ static uint8_t my_flags_at(uint64_t free_bytes)
 
 static uint8_t my_flags(void) { return my_flags_at(state_free_bytes()); }
 
+static void emit_reg_section(void *ctx, uint16_t type, const uint8_t *data, size_t len)
+{
+    struct buf *b = ctx;
+    size_t at = sec_begin(b, type);
+    put(b, data, len);
+    sec_end(b, at);
+}
+
 static void put_sections(struct buf *b, uint64_t now)
 {
     uint64_t free_bytes = state_free_bytes();
@@ -6069,6 +6185,7 @@ static void put_sections(struct buf *b, uint64_t now)
         put8(b, f->whole);
     }
     sec_end(b, at);
+    creport_sec_encode_all(emit_reg_section, b);
 }
 
 static void heartbeat(uint64_t now)
@@ -7908,6 +8025,7 @@ static void *cluster_main(void *arg)
                     (c->join && since(now, c->opened_ns) > JOIN_NS))
                     c->dead = 1;
             }
+            cluster_metrics_publish(now);
         }
         if (!C.copy_lag_ns || since(mono_ns(), C.pushed_ns) >= C.copy_lag_ns)
             copy_publish(); /* whatever moved the copy since the last round: an apply, an install, the watch stream */
@@ -8243,6 +8361,9 @@ int cluster_start(const struct cluster_cfg *cfg)
         return -1;
     }
     C.running = 1;
+#ifdef TSDB_TEST_HOOKS
+    creport_test_init(C.metadir);
+#endif
     if (C.dir[0] && C.fill_pct_override < 0) {
         pthread_once(&g_fill_once, fill_cv_init);
         pthread_mutex_lock(&g_fill_mu);
@@ -8308,8 +8429,14 @@ void cluster_stop(void)
         free(C.heard[i].vols);
         free(C.heard[i].doms);
         free(C.heard[i].fills);
+        creport_heard_clear(&C.heard[i].ext);
     }
     free(C.heard);
+    pthread_mutex_lock(&g_cm_mu);
+    memset(&g_cm_snap, 0, sizeof g_cm_snap);
+    g_cm_lease_until = 0;
+    g_cm_valid = 0;
+    pthread_mutex_unlock(&g_cm_mu);
     free(C.addrs);
     free(C.pend);
     buf_free(&C.fb);

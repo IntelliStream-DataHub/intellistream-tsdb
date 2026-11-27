@@ -32,6 +32,7 @@
 #define _GNU_SOURCE
 #include "cluster.h"
 #include "crashpt.h"
+#include "creport.h"
 #include "cvol_check.h"
 #include "harness.h"
 #include "meta.h"
@@ -23041,6 +23042,439 @@ static void scen_ecout(void)
            ids[H], hpos, ids[S], e2.stripe_pos[hpos].prev, e2.stripe_version);
 }
 
+/* Helper for scen_metrics: parse an integer metric value from a scraped /metrics buffer. Returns 1 if found. */
+static int metrics_find_i64(const char *buf, const char *key, int64_t *out)
+{
+    const char *p = strstr(buf, key);
+    if (!p)
+        return 0;
+    p += strlen(key);
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (end == p)
+        return 0;
+    *out = (int64_t)v;
+    return 1;
+}
+
+/* Unit checks for server/creport.[ch] failure & edge paths (run inside scen_metrics). */
+static ssize_t cr_u_enc(uint8_t *buf, size_t cap)
+{
+    if (cap < 4)
+        return -1;
+    memcpy(buf, "OKAY", 4);
+    return 4;
+}
+static int cr_u_dec(uint32_t member_id, const uint8_t *data, size_t len, void **out)
+{
+    (void)member_id;
+    if (len != 4 || memcmp(data, "OKAY", 4) != 0)
+        return -1;
+    char *s = malloc(8);
+    if (!s)
+        return -1;
+    memcpy(s, "ok_val", 7);
+    *out = s;
+    return 0;
+}
+static void cr_u_free(void *v) { free(v); }
+static size_t cr_u_fmt(uint32_t member_id, const void *v, char *buf, size_t cap)
+{
+    int n = snprintf(buf, cap, "u%" PRIu32 "=%s\n", member_id, (const char *)v);
+    return n > 0 ? (size_t)n : 0;
+}
+
+static void creport_unit_checks(void)
+{
+    creport_reset();
+    /* Built-in types (<= 8) and missing callbacks must be rejected. */
+    if (creport_section(0, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) == 0 ||
+        creport_section(CREPORT_SEC_BUILTIN_MAX, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) == 0 ||
+        creport_section(100, NULL, cr_u_dec, cr_u_free, cr_u_fmt) == 0)
+        die("creport unit: invalid section registration succeeded");
+    /* Duplicate type rejected; valid type decodes, replaces without leaking, skips unknown and malformed. */
+    if (creport_section(100, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) != 0 ||
+        creport_section(100, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) == 0)
+        die("creport unit: section register/dup check failed");
+    struct creport_heard_secs hs;
+    creport_heard_init(&hs);
+    if (creport_sec_decode_into(&hs, 101, 1, (const uint8_t *)"xx", 2) != 1)
+        die("creport unit: unknown section did not return 1");
+    uint64_t err0 = creport_sec_decode_errors();
+    if (creport_sec_decode_into(&hs, 100, 1, (const uint8_t *)"BAD!", 4) != -1 ||
+        creport_sec_decode_errors() != err0 + 1)
+        die("creport unit: malformed section did not fail and increment error count");
+    if (creport_sec_decode_into(&hs, 100, 1, (const uint8_t *)"OKAY", 4) != 0 ||
+        creport_sec_decode_into(&hs, 100, 1, (const uint8_t *)"OKAY", 4) != 0)
+        die("creport unit: valid decode/replace failed");
+    /* Format truncation check (tiny cap must NUL-terminate without overflow). */
+    char small[5];
+    size_t fn = creport_heard_format(&hs, 1, small, sizeof small);
+    if (fn != 4 || small[4] != '\0')
+        die("creport unit: format truncation bad (fn=%zu)", fn);
+    creport_heard_clear(&hs);
+    /* Full section table check. */
+    for (int t = 101; t < 100 + CREPORT_SEC_MAX; t++)
+        if (creport_section((uint8_t)t, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) != 0)
+            die("creport unit: filling section table failed at %d", t);
+    if (creport_section(200, cr_u_enc, cr_u_dec, cr_u_free, cr_u_fmt) == 0)
+        die("creport unit: overflowed section table");
+    /* Direct gauge/counter metrics + snapshot + cleanup. */
+    struct creport_label lbl = {"node", "1"};
+    struct creport_metric *g = creport_metric_gauge("test_u_g", "help", &lbl, 1);
+    struct creport_metric *c = creport_metric_counter("test_u_c", "help", NULL, 0);
+    if (!g || !c)
+        die("creport unit: metric alloc failed");
+    creport_metric_set(g, 42.5);
+    creport_metric_add(c, 7);
+    creport_metric_inc(c);
+    struct creport_snap *sn = creport_snap_take();
+    if (!sn || sn->nfamilies != 2 || sn->families[0].samples[0].dval != 42.5 || sn->families[1].samples[0].uval != 8)
+        die("creport unit: direct metric snapshot mismatch");
+    creport_snap_free(sn);
+    creport_metric_del(g);
+    creport_metric_del(c);
+    creport_reset();
+}
+
+/* R14 (r14-report, D22/D23): cluster metrics & heartbeat-section registries end-to-end.
+ * 3 nodes with --metrics-port auto and report_test=1:
+ *   1. Registry dump test hook (<state-dir>/creport.dump) lists CREPORT_SEC_TEST (250) and cluster collectors.
+ *   2. Registered creport_section (type 250) arrives in CLUSTER_OP_STATUS for every member (catches sectionsdrop).
+ *   3. Every required P4 cluster metric family is present on every node; a 2-replica volume is absent (never 0) on
+ *      the non-holding 3rd node.
+ *   4. Killing a replica drops tsdb_cluster_volume_isr_size and tsdb_cluster_volume_young_margin on the leader's
+ *      /metrics within 2 s (catches metricstale); restarting recovers them.
+ *   5. Leadership transfer moves tsdb_cluster_volume_role to the new leader and bumps tsdb_cluster_transfers_total. */
+static void scen_metrics(void)
+{
+    scenario("metrics");
+    creport_unit_checks();
+    int mports[3] = {0};
+    init_isr_lag_ms = 500;
+    for (int i = 0; i < 3; i++) {
+        envs[i] = "report_test=1";
+        xargs[i] = "--metrics-port auto";
+        start(i);
+        mports[i] = th_mport;
+        if (mports[i] <= 0)
+            die("metrics: server %d reported no metrics port", i);
+    }
+    init_cluster(0, 600);
+    init_isr_lag_ms = 0;
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned want = 3;
+    await_view(0, p_voters, &want, "three voters");
+
+    /* Create vol3 (replicas=3: held by all 3 nodes) and vol2 (replicas=2: held by 2, absent on 3rd). */
+    uint32_t v3 = 0, v2 = 0;
+    int rc = vol_add(0, "mvol3", 3, &v3);
+    if (rc != 0)
+        die("metrics: vol_add mvol3: %s", cluster_strerror(rc));
+    rc = vol_add(0, "mvol2", 2, &v2);
+    if (rc != 0)
+        die("metrics: vol_add mvol2: %s", cluster_strerror(rc));
+
+    struct meta_volume mv3, mv2;
+    if (!vol_rec(0, "mvol3", &mv3) || !vol_rec(0, "mvol2", &mv2))
+        die("metrics: missing volume record");
+    int L = server_of(mv3.leader), R1 = -1, R2 = -1;
+    for (uint32_t k = 0; k < mv3.nrep; k++) {
+        int s = server_of(mv3.rep[k].node);
+        await_open_gen(0, "mvol3", s, 1, 0);
+        if (s != L) {
+            if (R1 < 0)
+                R1 = s;
+            else
+                R2 = s;
+        }
+    }
+    int nonholder = -1;
+    for (int i = 0; i < 3; i++) {
+        int holds = 0;
+        for (uint32_t k = 0; k < mv2.nrep; k++)
+            if (mv2.rep[k].node == ids[i])
+                holds = 1;
+        if (holds)
+            await_open_gen(0, "mvol2", i, 1, 0);
+        else
+            nonholder = i;
+    }
+    if (L < 0 || R1 < 0 || R2 < 0 || nonholder < 0)
+        die("metrics: unexpected topology L=%d R1=%d R2=%d nonholder=%d", L, R1, R2, nonholder);
+
+    await_isr(L, "mvol3", 3, 20000, "mvol3 3/3 ISR");
+    await_isr(0, "mvol2", 2, 20000, "mvol2 2/2 ISR");
+
+    /* Write a small batch so replication state is exercised. */
+    tsdbc *c = client(L);
+    tsdb_sid sid = rep_series(c, "metrics.s1", "mvol3", 30000);
+    int64_t ts[16];
+    float vals[16];
+    for (int k = 0; k < 16; k++)
+        ts[k] = 10000 + k * 100, vals[k] = (float)(k + 1);
+    if ((rc = tsdbc_insert_series(c, sid, ts, vals, 16)) != 0)
+        die("metrics: insert mvol3: %s", ers(rc));
+    tsdbc_close(c);
+
+    /* 1. Verify registry dump test hook file on node 0. */
+    {
+        char dpath[PATH_MAX + 128];
+        snprintf(dpath, sizeof dpath, "%s/n0/state/creport.dump", base);
+        FILE *f = fopen(dpath, "rb");
+        if (!f)
+            die("metrics: missing registry dump file %s", dpath);
+        char dbuf[16384];
+        size_t dn = fread(dbuf, 1, sizeof dbuf - 1, f);
+        fclose(f);
+        dbuf[dn] = '\0';
+        if (!strstr(dbuf, "section type=250\n") || !strstr(dbuf, "collector tsdb_cluster_raft_term type=gauge\n"))
+            die("metrics: registry dump %s missing expected entries:\n%s", dpath, dbuf);
+    }
+
+    /* 2. Verify registered creport_section (type 250) arrives in CLUSTER_OP_STATUS on the Raft leader. */
+    int sec_ok = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 8000 && !sec_ok; usleep(150000)) {
+        struct view v;
+        view(0, &v);
+        int found = 0;
+        for (int i = 0; i < 3; i++) {
+            char needle[64];
+            snprintf(needle, sizeof needle, "r14test node=%" PRIu32 " seq=", ids[i]);
+            for (uint32_t k = 0; k < v.st.nheard; k++) {
+                if (v.st.heard[k].id == ids[i] && v.st.heard[k].sections &&
+                    strstr(v.st.heard[k].sections, needle)) {
+                    found++;
+                    break;
+                }
+            }
+        }
+        view_free(&v);
+        if (found == 3)
+            sec_ok = 1;
+    }
+    if (!sec_ok)
+        die("metrics: registered creport_section (type 250) did not arrive in STATUS for all 3 members");
+
+    /* 3. Verify every required metric family is present on every node, and non-held vol2 is absent on nonholder. */
+    static const char *const required_families[] = {
+        "\n# TYPE tsdb_cluster_raft_term gauge\n",
+        "\n# TYPE tsdb_cluster_raft_leader gauge\n",
+        "\n# TYPE tsdb_cluster_raft_commit_lag gauge\n",
+        "\n# TYPE tsdb_cluster_raft_quorum gauge\n",
+        "\n# TYPE tsdb_cluster_member_state gauge\n",
+        "\n# TYPE tsdb_cluster_volume_role gauge\n",
+        "\n# TYPE tsdb_cluster_volume_epoch gauge\n",
+        "\n# TYPE tsdb_cluster_volume_isr_size gauge\n",
+        "\n# TYPE tsdb_cluster_volume_min_isr gauge\n",
+        "\n# TYPE tsdb_cluster_volume_young_margin gauge\n",
+        "\n# TYPE tsdb_cluster_volume_settled_margin gauge\n",
+        "\n# TYPE tsdb_cluster_volume_health gauge\n",
+        "\n# TYPE tsdb_cluster_volume_diverged gauge\n",
+        "\n# TYPE tsdb_cluster_volume_lag_positions gauge\n",
+        "\n# TYPE tsdb_cluster_volume_lag_ms gauge\n",
+        "\n# TYPE tsdb_cluster_volume_unavailable gauge\n",
+        "\n# TYPE tsdb_chunk_store_state gauge\n",
+        "\n# TYPE tsdb_cluster_out_guard_passed_total counter\n",
+        "\n# TYPE tsdb_cluster_transfers_total counter\n",
+        "\n# TYPE tsdb_cluster_moves_total counter\n",
+        "\n# TYPE tsdb_cluster_settles_total counter\n",
+    };
+    static const char *const held_prefixes[] = {
+        "\ntsdb_cluster_volume_role{volume=\"",
+        "\ntsdb_cluster_volume_epoch{volume=\"",
+        "\ntsdb_cluster_volume_isr_size{volume=\"",
+        "\ntsdb_cluster_volume_min_isr{volume=\"",
+        "\ntsdb_cluster_volume_young_margin{volume=\"",
+        "\ntsdb_cluster_volume_settled_margin{volume=\"",
+        "\ntsdb_cluster_volume_health{volume=\"",
+        "\ntsdb_cluster_volume_diverged{volume=\"",
+        "\ntsdb_cluster_volume_lag_positions{volume=\"",
+        "\ntsdb_cluster_volume_lag_ms{volume=\"",
+        "\ntsdb_cluster_volume_unavailable{volume=\"",
+    };
+
+    static char mbuf[1 << 20];
+    int raft_leaders = 0;
+    int64_t initial_epoch = 0;
+    for (int i = 0; i < 3; i++) {
+        /* Wait briefly until node i's /metrics has caught up to vol3 and quorum. */
+        int ready = 0;
+        for (uint64_t t0 = now_ms(); now_ms() - t0 < 5000 && !ready; usleep(100000)) {
+            metrics_get(mports[i], mbuf, sizeof mbuf);
+            int64_t q = 0, isr = 0;
+            char k_isr[96];
+            snprintf(k_isr, sizeof k_isr, "\ntsdb_cluster_volume_isr_size{volume=\"%" PRIu32 "\"} ", v3);
+            if (metrics_find_i64(mbuf, "\ntsdb_cluster_raft_quorum ", &q) && q == 1 &&
+                metrics_find_i64(mbuf, k_isr, &isr) && isr == 3)
+                ready = 1;
+        }
+        if (!ready)
+            die("metrics: server %d never reported raft_quorum=1 and mvol3 isr_size=3", i);
+
+        for (size_t f = 0; f < sizeof required_families / sizeof required_families[0]; f++) {
+            if (!strstr(mbuf, required_families[f]))
+                die("metrics: server %d missing family:%s", i, required_families[f]);
+        }
+        int64_t term = 0, rlead = 0, clag = -1, quorum = 0;
+        if (!metrics_find_i64(mbuf, "\ntsdb_cluster_raft_term ", &term) || term < 1 ||
+            !metrics_find_i64(mbuf, "\ntsdb_cluster_raft_leader ", &rlead) || (rlead != 0 && rlead != 1) ||
+            !metrics_find_i64(mbuf, "\ntsdb_cluster_raft_commit_lag ", &clag) || clag < 0 ||
+            !metrics_find_i64(mbuf, "\ntsdb_cluster_raft_quorum ", &quorum) || quorum != 1)
+            die("metrics: server %d bad raft gauges (term=%" PRId64 " leader=%" PRId64 " lag=%" PRId64 " quorum=%" PRId64 ")",
+                i, term, rlead, clag, quorum);
+        raft_leaders += (int)rlead;
+
+        for (int j = 0; j < 3; j++) {
+            char km[96];
+            int64_t mst = -1;
+            snprintf(km, sizeof km, "\ntsdb_cluster_member_state{node=\"%" PRIu32 "\"} ", ids[j]);
+            if (!metrics_find_i64(mbuf, km, &mst) || mst != META_UP)
+                die("metrics: server %d member %" PRIu32 " state=%" PRId64 " (want %d)", i, ids[j], mst, META_UP);
+        }
+
+        char k[128];
+        int64_t role = -1, ep = 0, isr = -1, misr = -1, ym = -99, hlth = -1, div = -1, lpos = -1, lms = -1;
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_role{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &role) || role != (i == L ? TSDB_ROLE_OWNER : TSDB_ROLE_STANDBY))
+            die("metrics: server %d mvol3 role=%" PRId64 " (want %d)", i, role,
+                i == L ? TSDB_ROLE_OWNER : TSDB_ROLE_STANDBY);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_epoch{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &ep) || ep < 1)
+            die("metrics: server %d mvol3 epoch=%" PRId64, i, ep);
+        if (i == L)
+            initial_epoch = ep;
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_isr_size{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &isr) || isr != 3)
+            die("metrics: server %d mvol3 isr_size=%" PRId64 " (want 3)", i, isr);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_min_isr{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &misr) || misr < 1)
+            die("metrics: server %d mvol3 min_isr=%" PRId64, i, misr);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_young_margin{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &ym) || ym != 2)
+            die("metrics: server %d mvol3 young_margin=%" PRId64 " (want 2)", i, ym);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_health{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &hlth) || hlth != CL_HEALTH_OK)
+            die("metrics: server %d mvol3 health=%" PRId64 " (want 0)", i, hlth);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_diverged{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &div) || div != 0)
+            die("metrics: server %d mvol3 diverged=%" PRId64 " (want 0)", i, div);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_lag_positions{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &lpos) || lpos < 0)
+            die("metrics: server %d missing mvol3 lag_positions", i);
+        snprintf(k, sizeof k, "\ntsdb_cluster_volume_lag_ms{volume=\"%" PRIu32 "\"} ", v3);
+        if (!metrics_find_i64(mbuf, k, &lms) || lms < 0)
+            die("metrics: server %d missing mvol3 lag_ms", i);
+
+        /* Non-held volume absence check: vol2 MUST be absent on nonholder, present on holders. */
+        if (i == nonholder) {
+            for (size_t p = 0; p < sizeof held_prefixes / sizeof held_prefixes[0]; p++) {
+                snprintf(k, sizeof k, "%s%" PRIu32 "\"", held_prefixes[p], v2);
+                if (strstr(mbuf, k))
+                    die("metrics: non-holding server %d emitted non-held volume %" PRIu32 " (%s)", i, v2, k + 1);
+            }
+        } else {
+            int64_t isr2 = -1;
+            snprintf(k, sizeof k, "\ntsdb_cluster_volume_isr_size{volume=\"%" PRIu32 "\"} ", v2);
+            if (!metrics_find_i64(mbuf, k, &isr2) || isr2 != 2)
+                die("metrics: holding server %d missing mvol2 isr_size=2 (got %" PRId64 ")", i, isr2);
+        }
+    }
+    if (raft_leaders != 1)
+        die("metrics: expected exactly 1 Raft leader across 3 nodes, got %d", raft_leaders);
+
+    /* 4. Kill replica R1: isr_size drops to 2 and young_margin drops to 1 on leader L's /metrics within 2 s of
+     *    ISR shrink (catches metricstale). Then restart R1 and verify both recover to 3 and 2. */
+    stop(R1, SIGKILL);
+    await_isr(L, "mvol3", 2, 15000, "mvol3 ISR shrink after kill R1");
+    int dropped = 0;
+    uint64_t drop_ms = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 <= 2000; usleep(50000)) {
+        metrics_get(mports[L], mbuf, sizeof mbuf);
+        char ki[96], ky[96];
+        int64_t isr = -1, ym = -99;
+        snprintf(ki, sizeof ki, "\ntsdb_cluster_volume_isr_size{volume=\"%" PRIu32 "\"} ", v3);
+        snprintf(ky, sizeof ky, "\ntsdb_cluster_volume_young_margin{volume=\"%" PRIu32 "\"} ", v3);
+        if (metrics_find_i64(mbuf, ki, &isr) && isr == 2 && metrics_find_i64(mbuf, ky, &ym) && ym == 1) {
+            drop_ms = now_ms() - t0;
+            dropped = 1;
+            break;
+        }
+    }
+    if (!dropped)
+        die("metrics: leader %d /metrics did not drop mvol3 isr_size->2 and young_margin->1 within 2 s", L);
+
+    start(R1);
+    mports[R1] = th_mport;
+    await_isr(L, "mvol3", 3, 20000, "mvol3 ISR recovery after restart R1");
+    int recovered = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 <= 2000; usleep(50000)) {
+        metrics_get(mports[L], mbuf, sizeof mbuf);
+        char ki[96], ky[96];
+        int64_t isr = -1, ym = -99;
+        snprintf(ki, sizeof ki, "\ntsdb_cluster_volume_isr_size{volume=\"%" PRIu32 "\"} ", v3);
+        snprintf(ky, sizeof ky, "\ntsdb_cluster_volume_young_margin{volume=\"%" PRIu32 "\"} ", v3);
+        if (metrics_find_i64(mbuf, ki, &isr) && isr == 3 && metrics_find_i64(mbuf, ky, &ym) && ym == 2) {
+            recovered = 1;
+            break;
+        }
+    }
+    if (!recovered)
+        die("metrics: leader %d /metrics did not recover mvol3 isr_size->3 and young_margin->2 within 2 s", L);
+
+    /* 5. Transfer leadership of vol3 from L to R2: verify role gauge moves to R2 and epoch advances. */
+    uint8_t tbody[8], *treply = NULL;
+    size_t tblen = cluster_volume_force_encode(v3, ids[R2], tbody), trlen = 0;
+    rc = -1;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 10000; usleep(150000)) {
+        rc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen);
+        free(treply);
+        treply = NULL;
+        if (rc == 0)
+            break;
+    }
+    if (rc != 0)
+        die("metrics: volume transfer mvol3 -> node %" PRIu32 ": %s", ids[R2], cluster_strerror(rc));
+    int moved = 0;
+    for (uint64_t t0 = now_ms(); now_ms() - t0 < 15000 && !moved; usleep(100000)) {
+        char kr[96], ke[96];
+        int64_t role_old = -1, role_new = -1, ep_new = 0;
+        snprintf(kr, sizeof kr, "\ntsdb_cluster_volume_role{volume=\"%" PRIu32 "\"} ", v3);
+        snprintf(ke, sizeof ke, "\ntsdb_cluster_volume_epoch{volume=\"%" PRIu32 "\"} ", v3);
+        metrics_get(mports[L], mbuf, sizeof mbuf);
+        int ok1 = metrics_find_i64(mbuf, kr, &role_old);
+        metrics_get(mports[R2], mbuf, sizeof mbuf);
+        int ok2 = metrics_find_i64(mbuf, kr, &role_new) && metrics_find_i64(mbuf, ke, &ep_new);
+        if (ok1 && ok2 && role_old == TSDB_ROLE_STANDBY && role_new == TSDB_ROLE_OWNER && ep_new > initial_epoch)
+            moved = 1;
+    }
+    if (!moved)
+        die("metrics: tsdb_cluster_volume_role did not move from server %d to server %d after transfer", L, R2);
+
+    /* Verify transfer counter bumped on the Raft leader. */
+    int raft_l = -1;
+    for (int i = 0; i < 3; i++) {
+        metrics_get(mports[i], mbuf, sizeof mbuf);
+        int64_t rl = 0;
+        if (metrics_find_i64(mbuf, "\ntsdb_cluster_raft_leader ", &rl) && rl == 1) {
+            raft_l = i;
+            int64_t td = 0;
+            if (!metrics_find_i64(mbuf, "\ntsdb_cluster_transfers_total{event=\"done\"} ", &td) || td < 1)
+                die("metrics: Raft leader %d tsdb_cluster_transfers_total{event=\"done\"}=%" PRId64 " (want >= 1)", i,
+                    td);
+            break;
+        }
+    }
+    if (raft_l < 0)
+        die("metrics: could not find Raft leader for transfer counter check");
+
+    stop_all();
+    printf("  metrics: 3 nodes, all 21 families verified, non-held volume absent on server %d, "
+           "creport_section 250 in STATUS, kill/restart drop in %" PRIu64 " ms, role moved %d->%d\n",
+           nonholder, drop_ms, L, R2);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -23092,7 +23526,7 @@ int main(int argc, char **argv)
                {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
                {"replfault", scen_replfault}, {"pace", scen_pace},
                {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
-               {"outmove", scen_outmove}, {"ecout", scen_ecout}};
+               {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

@@ -87,12 +87,37 @@ directory) and `path`.
 | `tsdb_chunk_reads_total{peer}`, `tsdb_chunk_read_hedges_total{peer}`, `tsdb_chunk_read_avoids_total{peer}`, `tsdb_chunk_decoded_cells_total{peer}`, `tsdb_chunk_read_avoid{peer}` | counter, counter, counter, counter, gauge | cluster only, per storage peer (design-cluster-data.md E31): chunk cell read requests sent, hedged reads launched when a peer exceeded its hedge timer (`2 * p99` clamped to `[20, 500]` ms, capped at 5% of reads per peer), cell reads decoded around a peer while it was in `read-avoid` (8 timeouts in 10 s -> 30 s avoid), cells decoded from other stripe positions in place of that peer, and 1 while that peer is in `read-avoid` |
 | `tsdb_pace_rate_bytes_per_second{dir}`, `tsdb_pace_halved`, `tsdb_pace_bytes_total{dir,class}` | gauge, gauge, counter | cluster only (design-cluster-data.md E13, design-cluster.md §8.4): current effective rebuild/balance pace rate in bytes/s by direction (`send`, `recv`; 0 when unlimited at margin 0), 1 while non-emergency pacing is halved because 1-minute query p99 or WAL sync p99 exceeds twice its 1-hour median, and total bytes paced by direction and margin class (`margin0`, `margin1`, `margin2plus`, `balance`) |
 
-R4's other cluster counters are **not** on the metrics port, only in `tsdb cluster status` (the `transfers started ...` and
-`moves started ...` lines, `CL_TR_*` in `server/cluster.h`, counted from the start of the server you ask): leadership
-transfers started, done, timed out, cancelled, fallen back to a failover, started by the leader balance, drains that gave
-up, records admitted blind after a READY's hard cap, READYs sent and replica log cuts; replica moves started, done and
-cancelled; and the messages a replica dropped for another set version (a log line, once in 5 s). Per-volume rebuild
-progress is not counted at all (R14). The snapshot rows above are what the metrics port has of R4.
+### Cluster metrics (R14, P4 alerts)
+
+In cluster mode (`tsdbd --cluster`), `server/creport.[ch]` exposes cluster health, Raft, member, per-held-volume, and chunk-store metrics from immutable snapshots taken without holding cluster locks across rendering. Standalone servers (`!cluster_on`) omit all of these families.
+
+Gauges for volumes this server does **not** hold (not listed in the volume's replica set) are **absent**, never emitted as 0.
+
+| metric | type | meaning |
+|---|---|---|
+| `tsdb_cluster_raft_term` | gauge | current metadata Raft term known to this server |
+| `tsdb_cluster_raft_leader` | gauge | 1 while this server is the metadata Raft leader, else 0 |
+| `tsdb_cluster_raft_commit_lag` | gauge | metadata Raft entries committed ahead of this server's applied index |
+| `tsdb_cluster_raft_quorum` | gauge | 1 while metadata Raft quorum holds from this server's view (leader holds check-quorum lease, or non-leader holds a valid read lease), else 0; alert on 0 |
+| `tsdb_cluster_member_state{node}` | gauge | cluster member state in the metadata copy: `0` up, `1` down, `2` draining, `3` out, `4` destroyed |
+| `tsdb_cluster_volume_role{volume}` | gauge | per held volume: this server's role: `1` owner (leader), `2` standby (in ISR), `3` follower (out of ISR or learner) |
+| `tsdb_cluster_volume_epoch{volume}` | gauge | per held volume: current leadership epoch |
+| `tsdb_cluster_volume_isr_size{volume}` | gauge | per held volume: current in-sync replica count |
+| `tsdb_cluster_volume_min_isr{volume}` | gauge | per held volume: configured `min_isr` |
+| `tsdb_cluster_volume_young_margin{volume}` | gauge | per held volume: young-tier fault-tolerance margin (`isr_size - 1`; omitted for shared volumes); page on `<= 0` |
+| `tsdb_cluster_volume_settled_margin{volume}` | gauge | per held EC volume: settled-tier fault-tolerance margin (`present stripe positions - k`; omitted for non-EC volumes); page on `<= 0` |
+| `tsdb_cluster_volume_health{volume}` | gauge | per held volume: local health: `0` ok, `1` local_fault (fail-stopped or diverged), `2` domain_fault |
+| `tsdb_cluster_volume_diverged{volume}` | gauge | per held volume: 1 while the volume is DIVERGED, else 0; page on 1 |
+| `tsdb_cluster_volume_lag_positions{volume}` | gauge | per held volume: replication lag in log positions (leader: written minus commit; replica: max(commit, written) minus applied) |
+| `tsdb_cluster_volume_lag_ms{volume}` | gauge | per held volume: replication lag duration in milliseconds (leader: commit stall or unacked peer age while `lag_positions > 0`; replica: active missing-file fetch wait while `lag_positions > 0`; 0 when caught up) |
+| `tsdb_cluster_volume_unavailable{volume,why}` | gauge | per held volume: 1 while unavailable, labelled by reason (`no_owner`, `diverged`, `recovering`, `unreachable`, `lost`, `stuck`, `nfs_down`, ...); absent while available; page on 1 |
+| `tsdb_chunk_store_state{store}` | gauge | per local chunk store (0-based index): `0` up, `1` missing, `2` other_id, `3` damaged, `4` ioerr, `5` replacing |
+| `tsdb_cluster_out_guard_passed_total` | counter | times automatic member OUT proceeded past the mass-OUT guard bound (R9 D4) |
+| `tsdb_cluster_transfers_total{event}` | counter | planned leadership transfer events since process start (`started`, `done`, `timed_out`, `cancelled`, `fallback`, `balance`, `drain_timed_out`, `blind`, `ready`, `cuts`) |
+| `tsdb_cluster_moves_total{event}` | counter | replica move lifecycle events since process start on the Raft leader (`started`, `done`, `cancelled`) |
+| `tsdb_cluster_settles_total{result}` | counter | EC part settle outcomes since process start (`done`, `failed`, `abandoned`) |
+
+Note on overlapping families: `tsdb_volume_{young_margin,settled_margin,settled_state}` report every volume in this server's metadata copy (including volumes held elsewhere), and `tsdb_volume_diverged{volume,path}` covers local engine volumes (standalone and cluster); the `tsdb_cluster_volume_*` families above report only cluster volumes **held** by this server and carry the fixed names used by P4's cluster alerts. Per-volume rebuild progress metrics are added by R14's progress track (`r14-progress`); messages a replica dropped for another set version remain a rate-limited log line only (not a counter).
 
 Not exported, although docs/design-latest.md 6.5 names them: the engine keeps no counters for why a lookup searched
 (`tsdb_latest_search_total{why}`), for the time lookups waited for a write section (`wait_seconds_total`) or for the

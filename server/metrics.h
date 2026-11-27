@@ -83,6 +83,8 @@ typedef struct metrics_p99_win {
     int halved;
 } metrics_p99_win;
 
+struct creport_snap;
+
 typedef struct metrics_cfg {
     tsdb *db;
     int listen_fd;           /* bound and listening; metrics_start takes it over */
@@ -108,6 +110,9 @@ typedef struct metrics_cfg {
     void (*pace)(metrics_pace *out);
     /* foreground p99 halving callback (§8.4), invoked once per second on the metrics thread; NULL: disabled */
     void (*on_p99_halved)(int halved);
+    /* cluster metrics registry snapshot (R14, server/creport.h); NULL: standalone (output unchanged) */
+    struct creport_snap *(*cluster_snap)(void);
+    void (*cluster_snap_free)(struct creport_snap *snap);
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

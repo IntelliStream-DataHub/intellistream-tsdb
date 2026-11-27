@@ -118,6 +118,7 @@
 #include "../client/tsdb_pack.h"
 #include "../client/tsdb_crypto.h"
 #include "metrics.h"
+#include "creport.h"
 #include "auth.h"
 #include "tenants.h"
 #include "cluster.h"
@@ -4267,6 +4268,330 @@ static void pace_metrics(metrics_pace *out)
     }
 }
 
+/* R14 (r14-report, D22): cluster metric collectors registered into server/creport.h.
+ * Every collector reads only lock-free or short-lock snapshots (cluster_metrics_get, cluster_copy_get,
+ * chunksrv_cluster_hold, creport_repld_lag) and emits into the snapshot sink before metrics.c renders. */
+extern atomic_uint_fast64_t settle_done, settle_failed, settle_abandoned; /* src/settle.c */
+
+static bool crep_vol_held(const struct cluster_copy_vol *v, uint32_t self)
+{
+    if (!self)
+        return false;
+    for (uint32_t k = 0; k < v->nrep; k++)
+        if (v->rep[k].node == self)
+            return true;
+    return false;
+}
+
+static void crep_raft_term(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    creport_sink_put_u64(sink, NULL, 0, cm.raft_term);
+}
+
+static void crep_raft_leader(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    creport_sink_put_u64(sink, NULL, 0, cm.raft_leader);
+}
+
+static void crep_raft_commit_lag(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    creport_sink_put_u64(sink, NULL, 0, cm.raft_commit_lag);
+}
+
+static void crep_raft_quorum(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    creport_sink_put_u64(sink, NULL, 0, cm.raft_quorum);
+}
+
+static void crep_member_state(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp)
+        return;
+    for (uint32_t i = 0; i < cp->nmembers; i++) {
+        char idbuf[16];
+        snprintf(idbuf, sizeof idbuf, "%u", (unsigned)cp->members[i].id);
+        struct creport_label lbl = {"node", idbuf};
+        creport_sink_put_u64(sink, &lbl, 1, cp->members[i].state);
+    }
+    cluster_copy_put(cp);
+}
+
+enum {
+    CREP_V_ROLE = 0,
+    CREP_V_EPOCH,
+    CREP_V_ISR_SIZE,
+    CREP_V_MIN_ISR,
+    CREP_V_YOUNG_MARGIN,
+    CREP_V_SETTLED_MARGIN,
+    CREP_V_HEALTH,
+    CREP_V_DIVERGED,
+    CREP_V_LAG_POS,
+    CREP_V_LAG_MS,
+    CREP_V_UNAVAIL,
+};
+
+static void crep_held_vol(void *ctx, struct creport_sink *sink)
+{
+    int kind = (int)(intptr_t)ctx;
+    const struct cluster_copy *cp = cluster_copy_get();
+    if (!cp || !cp->self) {
+        cluster_copy_put(cp);
+        return;
+    }
+    struct cold_hook ch = {0};
+    if (kind == CREP_V_YOUNG_MARGIN || kind == CREP_V_SETTLED_MARGIN || kind == CREP_V_UNAVAIL)
+        cold_hook_read(&ch);
+    for (uint32_t i = 0; i < cp->nvolumes; i++) {
+        const struct cluster_copy_vol *v = &cp->volumes[i];
+        if (!crep_vol_held(v, cp->self))
+            continue; /* volumes this server does not hold MUST be absent, never 0 */
+        char vbuf[16];
+        snprintf(vbuf, sizeof vbuf, "%u", (unsigned)v->number);
+        struct creport_label vlbl = {"volume", vbuf};
+        switch (kind) {
+        case CREP_V_ROLE:
+            creport_sink_put_i64(sink, &vlbl, 1, cluster_copy_role(v, cp->self));
+            break;
+        case CREP_V_EPOCH:
+            creport_sink_put_u64(sink, &vlbl, 1, v->epoch);
+            break;
+        case CREP_V_ISR_SIZE:
+            creport_sink_put_u64(sink, &vlbl, 1, v->nisr);
+            break;
+        case CREP_V_MIN_ISR:
+            creport_sink_put_u64(sink, &vlbl, 1, v->min_isr);
+            break;
+        case CREP_V_YOUNG_MARGIN: {
+            struct margins m;
+            margins_of(cp, v, ch.destroyed, ch.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
+                       margin_mutant, &m);
+            if (!m.young_na)
+                creport_sink_put_i64(sink, &vlbl, 1, m.young);
+            break;
+        }
+        case CREP_V_SETTLED_MARGIN: {
+            struct margins m;
+            margins_of(cp, v, ch.destroyed, ch.nd, v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]),
+                       margin_mutant, &m);
+            if (m.tier != MARGIN_TIER_NONE)
+                creport_sink_put_i64(sink, &vlbl, 1, m.settled);
+            break;
+        }
+        case CREP_V_HEALTH: {
+            uint8_t h = CL_HEALTH_OK;
+            if (repld_failed(v->number) || vol_diverged(v->number, NULL)) {
+                h = CL_HEALTH_LOCAL_FAULT;
+            } else {
+                int d = dom_of(v->number);
+                tsdb_domain_info di;
+                if (d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0 && di.state == TSDB_DOM_DOWN)
+                    h = CL_HEALTH_DOMAIN_FAULT;
+            }
+            creport_sink_put_u64(sink, &vlbl, 1, h);
+            break;
+        }
+        case CREP_V_DIVERGED:
+            creport_sink_put_u64(sink, &vlbl, 1, vol_diverged(v->number, NULL) ? 1 : 0);
+            break;
+        case CREP_V_LAG_POS: {
+            uint64_t pos = 0, ms = 0;
+            creport_repld_lag(v->number, &pos, &ms);
+            creport_sink_put_u64(sink, &vlbl, 1, pos);
+            break;
+        }
+        case CREP_V_LAG_MS: {
+            uint64_t pos = 0, ms = 0;
+            creport_repld_lag(v->number, &pos, &ms);
+            creport_sink_put_u64(sink, &vlbl, 1, ms);
+            break;
+        }
+        case CREP_V_UNAVAIL: {
+            const char *why = NULL;
+            if (vol_diverged(v->number, NULL)) {
+                why = why_name(TSDB_WHY_DIVERGED);
+            } else if (cvol_no_owner(v->number)) {
+                why = why_name(TSDB_WHY_NO_OWNER);
+            } else {
+                struct margins m;
+                margins_of(cp, v, ch.destroyed, ch.nd,
+                           v->number < TSDB_VOL_ANY && atomic_load(&vol_corrupt[v->number]), margin_mutant, &m);
+                if (m.tier == MARGIN_TIER_LOST)
+                    why = why_name(TSDB_WHY_LOST);
+                else if (m.tier == MARGIN_TIER_UNAVAILABLE)
+                    why = why_name(TSDB_WHY_UNREACHABLE);
+                else if (repld_failed(v->number))
+                    why = why_name(TSDB_WHY_STUCK);
+                else {
+                    int cw = cvol_why(v->number);
+                    if (cw >= 0 && cw != TSDB_WHY_FENCED)
+                        why = why_name((unsigned)cw);
+                    else if (repld_leading(v->number, NULL) == 1 && repld_isr_short(v->number))
+                        why = why_name(TSDB_WHY_UNREACHABLE);
+                    else {
+                        int d = dom_of(v->number);
+                        tsdb_domain_info di;
+                        if (d >= 0 && dom.health && tsdb_health_info(dom.health, d, &di) == 0 &&
+                            di.state == TSDB_DOM_DOWN)
+                            why = why_name(TSDB_WHY_NFS_DOWN);
+                    }
+                }
+            }
+            if (why) {
+                struct creport_label lbl[2] = {{"volume", vbuf}, {"why", why}};
+                creport_sink_put_u64(sink, lbl, 2, 1);
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+    cluster_copy_put(cp);
+}
+
+static void crep_chunk_store_state(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct chunksrv *cs = chunksrv_cluster_hold();
+    if (!cs)
+        return;
+    chunk_backend *be = chunksrv_backend(cs);
+    if (be) {
+        int ns = chunk_be_nstores(be);
+        for (int i = 0; i < ns; i++) {
+            int st = chunk_be_store_state(be, i);
+            if (st < 0)
+                continue;
+            char sbuf[16];
+            snprintf(sbuf, sizeof sbuf, "%d", i);
+            struct creport_label lbl = {"store", sbuf};
+            creport_sink_put_i64(sink, &lbl, 1, st);
+        }
+    }
+    chunksrv_cluster_release();
+}
+
+static void crep_out_guard_passed(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    creport_sink_put_u64(sink, NULL, 0, cluster_out_guard_passed());
+}
+
+static void crep_transfers(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    static const char *const ev[10] = {"started", "done",          "timed_out", "cancelled", "fallback",
+                                       "balance", "drain_timed_out", "blind",   "ready",     "cuts"};
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    repld_transfer_counts(cm.tr);
+    for (int i = 0; i < 10; i++) {
+        struct creport_label lbl = {"event", ev[i]};
+        creport_sink_put_u64(sink, &lbl, 1, cm.tr[i]);
+    }
+}
+
+static void crep_moves(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct cluster_metrics_snap cm;
+    cluster_metrics_get(&cm);
+    struct creport_label l0 = {"event", "started"};
+    struct creport_label l1 = {"event", "done"};
+    struct creport_label l2 = {"event", "cancelled"};
+    creport_sink_put_u64(sink, &l0, 1, cm.tr[CL_TR_MV_STARTED]);
+    creport_sink_put_u64(sink, &l1, 1, cm.tr[CL_TR_MV_DONE]);
+    creport_sink_put_u64(sink, &l2, 1, cm.tr[CL_TR_MV_CANCELLED]);
+}
+
+static void crep_settles(void *ctx, struct creport_sink *sink)
+{
+    (void)ctx;
+    struct creport_label l0 = {"result", "done"};
+    struct creport_label l1 = {"result", "failed"};
+    struct creport_label l2 = {"result", "abandoned"};
+    creport_sink_put_u64(sink, &l0, 1, atomic_load_explicit(&settle_done, memory_order_relaxed));
+    creport_sink_put_u64(sink, &l1, 1, atomic_load_explicit(&settle_failed, memory_order_relaxed));
+    creport_sink_put_u64(sink, &l2, 1, atomic_load_explicit(&settle_abandoned, memory_order_relaxed));
+}
+
+static void register_cluster_metrics(void)
+{
+    creport_metric_collector("tsdb_cluster_raft_term", CREPORT_GAUGE, "Current metadata Raft term known to this server.",
+                             crep_raft_term, NULL);
+    creport_metric_collector("tsdb_cluster_raft_leader", CREPORT_GAUGE,
+                             "1 while this server is the metadata Raft leader, else 0.", crep_raft_leader, NULL);
+    creport_metric_collector("tsdb_cluster_raft_commit_lag", CREPORT_GAUGE,
+                             "Metadata Raft entries committed ahead of this server's applied index.",
+                             crep_raft_commit_lag, NULL);
+    creport_metric_collector("tsdb_cluster_raft_quorum", CREPORT_GAUGE,
+                             "1 while metadata Raft quorum holds from this server's view, else 0.", crep_raft_quorum,
+                             NULL);
+    creport_metric_collector("tsdb_cluster_member_state", CREPORT_GAUGE,
+                             "Cluster member state in the metadata copy: 0 up, 1 down, 2 draining, 3 out, 4 destroyed.",
+                             crep_member_state, NULL);
+    creport_metric_collector("tsdb_cluster_volume_role", CREPORT_GAUGE,
+                             "Role of this server for a volume it holds: 1 owner (leader), 2 standby (in ISR), 3 follower.",
+                             crep_held_vol, (void *)(intptr_t)CREP_V_ROLE);
+    creport_metric_collector("tsdb_cluster_volume_epoch", CREPORT_GAUGE,
+                             "Current leadership epoch of a volume this server holds.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_EPOCH);
+    creport_metric_collector("tsdb_cluster_volume_isr_size", CREPORT_GAUGE,
+                             "Current in-sync replica count of a volume this server holds.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_ISR_SIZE);
+    creport_metric_collector("tsdb_cluster_volume_min_isr", CREPORT_GAUGE,
+                             "Configured min_isr of a volume this server holds.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_MIN_ISR);
+    creport_metric_collector("tsdb_cluster_volume_young_margin", CREPORT_GAUGE,
+                             "Young-tier fault-tolerance margin (ISR size minus 1) of a volume this server holds.",
+                             crep_held_vol, (void *)(intptr_t)CREP_V_YOUNG_MARGIN);
+    creport_metric_collector("tsdb_cluster_volume_settled_margin", CREPORT_GAUGE,
+                             "Settled-tier fault-tolerance margin (present stripe positions minus k) of an EC volume this server holds.",
+                             crep_held_vol, (void *)(intptr_t)CREP_V_SETTLED_MARGIN);
+    creport_metric_collector("tsdb_cluster_volume_health", CREPORT_GAUGE,
+                             "Local health of a volume this server holds: 0 ok, 1 local_fault, 2 domain_fault.",
+                             crep_held_vol, (void *)(intptr_t)CREP_V_HEALTH);
+    creport_metric_collector("tsdb_cluster_volume_diverged", CREPORT_GAUGE,
+                             "1 while a volume this server holds is DIVERGED, else 0.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_DIVERGED);
+    creport_metric_collector("tsdb_cluster_volume_lag_positions", CREPORT_GAUGE,
+                             "Replication lag in log positions of a volume this server holds.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_LAG_POS);
+    creport_metric_collector("tsdb_cluster_volume_lag_ms", CREPORT_GAUGE,
+                             "Replication lag in milliseconds of a volume this server holds.", crep_held_vol,
+                             (void *)(intptr_t)CREP_V_LAG_MS);
+    creport_metric_collector("tsdb_cluster_volume_unavailable", CREPORT_GAUGE,
+                             "1 while a volume this server holds is unavailable, labelled by reason (why).",
+                             crep_held_vol, (void *)(intptr_t)CREP_V_UNAVAIL);
+    creport_metric_collector("tsdb_chunk_store_state", CREPORT_GAUGE,
+                             "Local chunk store state: 0 up, 1 missing, 2 other_id, 3 damaged, 4 ioerr, 5 replacing.",
+                             crep_chunk_store_state, NULL);
+    creport_metric_collector("tsdb_cluster_out_guard_passed_total", CREPORT_COUNTER,
+                             "Times automatic member OUT proceeded past the mass-OUT guard bound.",
+                             crep_out_guard_passed, NULL);
+    creport_metric_collector("tsdb_cluster_transfers_total", CREPORT_COUNTER,
+                             "Planned leadership transfer events since process start.", crep_transfers, NULL);
+    creport_metric_collector("tsdb_cluster_moves_total", CREPORT_COUNTER,
+                             "Replica move lifecycle events since process start (on the Raft leader).", crep_moves,
+                             NULL);
+    creport_metric_collector("tsdb_cluster_settles_total", CREPORT_COUNTER,
+                             "EC part settle outcomes since process start (done, failed, abandoned).", crep_settles,
+                             NULL);
+}
+
 static void fwd_close_client(conn *c) /* an outcome nobody knows (D12): the client learns it from the closed connection */
 {
     atomic_store(&c->closing, true);
@@ -7399,6 +7724,8 @@ int main(int argc, char **argv)
             pack_keep.arr = dyn;
     }
     if (mfd >= 0 || cluster_on) {
+        if (cluster_on)
+            register_cluster_metrics();
         metrics_cfg mc = {.db = db,
                           .listen_fd = mfd,
                           .io = io == IO_URING ? "io_uring" : "epoll",
@@ -7414,7 +7741,9 @@ int main(int argc, char **argv)
                           .peer_rdma = cluster_on ? tsdbd_peer_rdma_metrics : NULL,
                           .chunk_peers = cluster_on ? chunk_peer_metrics_rows : NULL,
                           .pace = cluster_on ? pace_metrics : NULL,
-                          .on_p99_halved = cluster_on ? pace_set_p99_halved : NULL};
+                          .on_p99_halved = cluster_on ? pace_set_p99_halved : NULL,
+                          .cluster_snap = cluster_on ? creport_snap_take : NULL,
+                          .cluster_snap_free = cluster_on ? creport_snap_free : NULL};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
@@ -7609,6 +7938,7 @@ int main(int argc, char **argv)
     eng_set_wal_sync_observer(NULL);
     if (cluster_on) {
         cluster_stop();
+        creport_reset();
         fwd_cluster_stop(); /* after the cluster thread: it hands the forwarding links no socket any more; freed below */
         chunksrv_cluster_stop(); /* likewise for the chunk links; freed below */
         chunkpeer_cluster_stop(); /* its installer thread names the chunk server: before that is freed */

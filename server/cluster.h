@@ -342,6 +342,7 @@ struct cluster_copy_vol {
     } rep[META_REPLICAS_MAX]; /* in record order */
     uint32_t nisr;
     uint32_t isr[META_REPLICAS_MAX]; /* node ids, ascending */
+    uint32_t min_isr;
     /* R8: an erasure-coded volume's (redundancy META_RED_EC) k + m, its stripe group (position -> node) and version,
      * and whether its orphan collection is suspended (E14); a replicas volume has 0 in all of them */
     uint8_t redundancy, ec_k, ec_m, gc_suspended;
@@ -481,6 +482,7 @@ struct cluster_heard {
     struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
     uint64_t answered_ms; /* on the Raft leader: since its last lease-granting HB_ACK to it (UINT64_MAX: none) */
     int64_t lease_left_ms; /* the server's own entry: how long its lease still runs (< 0: expired) */
+    char *sections;        /* formatted registered heartbeat sections (creport.h); NULL when none */
 };
 struct cluster_status {
     uint32_t self;
@@ -520,6 +522,20 @@ enum cluster_tr_count {
 /* The volume leaders' counters (CL_TR_DRAIN_TIMEDOUT and on) come from tsdbd's driver; without one they read 0. */
 typedef void (*cluster_drv_counts_fn)(uint64_t out[CL_TR_N]);
 void cluster_set_drv_counts(cluster_drv_counts_fn fn);
+/* R9 (D4, r9-out): count of times automatic OUT proceeded past the mass-OUT guard bound. Any thread. */
+uint64_t cluster_out_guard_passed(void);
+/* Lock-free/short-lock cluster metrics snapshot published by the cluster thread for server/metrics.c (R14 D22). */
+struct cluster_metrics_snap {
+    uint64_t raft_term;
+    uint8_t raft_leader;       /* 1 if this server is currently the Raft leader, else 0 */
+    uint8_t raft_quorum;       /* 1 if metadata quorum holds from this server's view, else 0 */
+    uint64_t raft_commit;
+    uint64_t raft_applied;
+    uint64_t raft_commit_lag;  /* commit > applied ? commit - applied : 0 */
+    uint64_t tr[CL_TR_N];      /* transfer and move counters (Raft leader's side) */
+    uint64_t out_guard_passed; /* cluster_out_guard_passed() */
+};
+void cluster_metrics_get(struct cluster_metrics_snap *out);
 /* Parses a STATUS body; `image` points into it, `heard` is allocated (cluster_status_free). 0 or -1. */
 int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status *st);
 void cluster_status_free(struct cluster_status *st);

@@ -26,6 +26,7 @@
  */
 #define _GNU_SOURCE
 #include "metrics.h"
+#include "creport.h" /* struct creport_snap layout only: no direct call, so binaries without creport.o still link */
 #include "margins.h" /* enum margin_tier only: no call, so every binary with metrics.c links without margins.c */
 #include "tsdb_protocol.h"
 
@@ -934,6 +935,36 @@ static void render(sb *b)
             for (int c = 0; c < METRICS_PACE_CLASSES; c++)
                 sb_add(b, "tsdb_pace_bytes_total{dir=\"%s\",class=\"%s\"} %llu\n", pdir[d], pcls[c],
                        (unsigned long long)pc.bytes[d][c]);
+    }
+
+    if (cfg.cluster_snap && cfg.cluster_snap_free) { /* R14 cluster metrics registry (server/creport.h; lock-free render) */
+        struct creport_snap *cs = cfg.cluster_snap();
+        if (cs) {
+            for (size_t i = 0; i < cs->nfamilies; i++) {
+                const struct creport_snap_family *f = &cs->families[i];
+                family(b, f->name, f->type == CREPORT_COUNTER ? "counter" : "gauge", f->help);
+                for (size_t j = 0; j < f->nsamples; j++) {
+                    const struct creport_snap_sample *s = &f->samples[j];
+                    sb_add(b, "%s", f->name);
+                    if (s->nlabels > 0) {
+                        sb_add(b, "{");
+                        for (uint8_t k = 0; k < s->nlabels; k++) {
+                            sb_add(b, "%s%s=\"", k ? "," : "", s->labels[k].key);
+                            sb_label(b, s->labels[k].val);
+                            sb_add(b, "\"");
+                        }
+                        sb_add(b, "}");
+                    }
+                    if (s->val_kind == CREPORT_VAL_I64)
+                        sb_add(b, " %lld\n", (long long)s->ival);
+                    else if (s->val_kind == CREPORT_VAL_U64)
+                        sb_add(b, " %llu\n", (unsigned long long)s->uval);
+                    else
+                        sb_add(b, " %.9g\n", s->dval);
+                }
+            }
+            cfg.cluster_snap_free(cs);
+        }
     }
 
     family(b, "tsdb_query_duration_seconds", "histogram",

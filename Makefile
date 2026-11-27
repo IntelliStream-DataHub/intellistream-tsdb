@@ -659,7 +659,7 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout
+    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1063,7 +1063,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants hb-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
+.PHONY: test-rdma check-rdma-syms disk-mutants tiers-mutants margin-mutants lease-mutants hb-mutants report-mutants chunkpeer-mutants ecgc-mutants degsettle-mutants transfer-mutants move-mutants rset-mutants fwd-mutants copy-mutants auth-mutants check-default-goal test-cli-stats test-cli-stats-net test-cli-cluster test-cluster-tutorial sim-repl-soak sim-repl-mutants place-soak place-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest cluster-mutants rewind-mutants test-clients-epoll test-pulsar integration-mutants
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -1093,8 +1093,13 @@ $(B)/meta.o: server/meta.c server/meta.h src/repl.h | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 # tsdbd's cluster thread (and the CLI's side of the admin ops); CLUSTER_OBJ goes into tsdbd, every binary that
 # includes tsdbd.c, and the CLI
-$(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/crashpt.h server/place.h server/pace.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
+$(B)/cluster.o: server/cluster.c server/cluster.h server/cluster_int.h server/creport.h server/crashpt.h server/place.h server/pace.h server/peerlink.h server/meta.h client/tsdb_crypto.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -Isrc/raft/compat -Iclient -c -o $@ $<
+# R14 (r14-report): cluster heartbeat-section and metrics registries (creport.o: no engine/repld deps; creport_drv.o: repld lag bridge)
+$(B)/creport.o: server/creport.c server/creport.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(B)/creport_drv.o: server/creport.c server/creport.h server/repld_int.h server/replwire.h server/cluster.h server/meta.h src/repl.h src/replfile.h src/internal.h | $(B)
+	$(CC) $(CFLAGS) -DCREPORT_DRV_ONLY -Isrc -c -o $@ $<
 # the data links (peerlink.h): in every binary that has the cluster thread, whose acceptor hands sockets to it; the
 # frames' check (plcheck.h, PLCHECK_HDR above) is xxHash's XXH3 inline (server/xxhash, unchanged, UPSTREAM)
 $(B)/peerlink.o: server/peerlink.c server/peerlink.h server/pltransport.h server/plrdma.h $(PLCHECK_HDR) client/tsdb_crypto.h src/compat.h $(B)/rdma.flags | $(B)
@@ -1160,7 +1165,7 @@ $(B)/pace.o: server/pace.c server/pace.h src/compat.h | $(B)
 $(B)/cnode.o: server/cnode.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 R9_OBJ := $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/sfill.o $(B)/sreconcile.o $(B)/pace.o $(B)/cnode.o
-CLUSTER_OBJ := $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
+CLUSTER_OBJ := $(B)/creport.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
 # R9 placement simulator (tests/sim_place.c, docs/design-cluster-data.md §10.2): stub main until r9-simplace fills it in
 $(B)/sim_place: tests/sim_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/sim_place.c $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
@@ -1199,7 +1204,7 @@ $(B)/test_replwire: tests/test_replwire.c $(B)/replwire.o server/replwire.h src/
 $(B)/test_margins: tests/test_margins.c server/margins.c server/margins.h server/cluster.h server/meta.h tests/jepsen/outage_judge.h include/tsdb_protocol.h | $(B)
 	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< server/margins.c
 # R9 rebuild and balancer traffic pacer (server/pace.[ch], server/metrics.[ch] p99 window; track r9-pace)
-$(B)/test_pace: tests/test_pace.c server/pace.h server/metrics.h server/metrics.c $(B)/pace.o $(LIB) | $(B)
+$(B)/test_pace: tests/test_pace.c server/pace.h server/metrics.h server/metrics.c server/creport.h $(B)/pace.o $(LIB) | $(B)
 	$(CC) $(CFLAGS) -Iinclude -Iserver -o $@ $< server/metrics.c $(B)/pace.o $(LIB) $(LDLIBS)
 pace-mutants: $(B)/test_pace
 	$(MUT) --name test_pace --list "pacefifo nohalve" -- ./$(B)/test_pace --mutant @M@ @D@
@@ -1267,6 +1272,10 @@ lease-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 hb-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(CRASHFS_SO)
 	$(MUT) --name hb --list "nogasp failstoppromo" -- env CRASHFS_SO=$(B)/libcrashfs.so TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ failgasp
+# r14-report: cluster metrics and heartbeat-section registry mutants (metricstale, sectionsdrop) must fail test_cluster metrics
+report-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
+	$(MUT) --name report --uring --list "metricstale sectionsdrop" -- env TSDB_REPORT_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ metrics
 # r8f + r8n: the chunk peer's planted bugs in tsdbd (server/chunkpeer.c TSDB_CHUNKPEER_MUTANT), each must fail
 # test_cluster ecbasic or ecslow (nosumcmp and delbeforegc in test_chunkpeer: MK_GC now handles cluster deletes)
 chunkpeer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
@@ -1315,11 +1324,11 @@ R4_HDR := server/repld_int.h server/rsnap.h server/rset.h server/rtransfer.h ser
           server/margins.h server/pace.h
 # r8f: the peer cold ops and their cluster instance (server/chunkpeer.h), compiled with tsdbd (g_ec_cfg is tsdbd.c's)
 CP_SRC := server/chunkpeer.c server/chunkpeer_cluster.c
-TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/stbuf.h server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
+TSDBD_SRC := $(CP_SRC) server/chunkpeer.h $(R4_SRC) $(R4_HDR) server/creport.h server/fwd.h server/fwdreq.h server/plrdma.h server/tsdbd_keys.h tools/cfg.h server/tsdbd.c server/stbuf.h server/metrics.c server/metrics.h server/auth.c server/auth.h server/tenants.c server/tenants.h server/users.h \
              server/cluster.h server/cvol.h server/cvol.c server/cvolfs.h server/cvolfs.c server/repld.h server/repld.c server/replwire.h src/cvol.h src/replica.h src/repl.h src/replfile.h src/tiers.h server/meta.h server/domains.h server/epoll_compat.h include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
-$(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
+$(B)/tsdbd: server/tsdbd.c $(TSDBD_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
-	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
+	    $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # A server with a bug planted in the Raft log (the copy in src/raft is upstream's and stays unedited, so the mutant is
 # made here, from it, by sed): C2, the hard state (term and vote) saved without its fdatasync. test_cluster's powervote
@@ -1331,10 +1340,10 @@ $(B)/raft_log_c2.c: src/raft/raft_log.c | $(B)
 	! cmp -s $< $@
 $(B)/raft_log_c2.o: $(B)/raft_log_c2.c $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Wno-stringop-overflow -Isrc -Isrc/raft -Isrc/raft/compat -c -o $@ $<
-$(B)/tsdbd-mut-c2: server/tsdbd.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) \
+$(B)/tsdbd-mut-c2: server/tsdbd.c $(TSDBD_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) \
                    $(B)/raft_log_c2.o $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ server/tsdbd.c server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) \
-	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) $(CFG_OBJ) \
+	    $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(filter-out $(B)/raft_raft_log.o,$(CLUSTER_OBJ)) $(CFG_OBJ) \
 	    $(B)/raft_log_c2.o $(LIB) $(LDLIBS) $(URING_LIBS)
 # Under AddressSanitizer crashfs cannot be preloaded (test_cluster's powervote prints "skipped" and passes, so the planted
 # bug would not fail anything): the target says so and does not run, instead of reporting a mutant that nothing caught.
@@ -1350,9 +1359,9 @@ endif
 # -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and
 # the checks, is compiled with it too); empty in `make test` (FUZZ_COV is the on-disk harnesses' coverage flag and
 # is always set).
-$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
+$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                   $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/tsdb_pack.o \
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o \
 	    $(B)/users.o $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS) $(PLAT_FUZZ_LDFLAGS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
@@ -1457,15 +1466,15 @@ $(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
-$(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
+$(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o \
                     $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/tsdb_pack.o $(B)/users.o \
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c server/tenants.c server/cvol.c server/cvolfs.c server/repld.c $(CP_SRC) $(R4_SRC) $(B)/creport_drv.o $(B)/tsdb_pack.o $(B)/users.o \
 	    $(B)/tsdb_crypto.o $(CLUSTER_OBJ) $(CFG_OBJ) $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)
 
-$(B)/test_server: tests/test_server.c tests/harness.h tests/samekeys.h tests/lttb_ref.h server/metrics.c server/metrics.h server/stbuf.h $(CLIB) $(LIB)
+$(B)/test_server: tests/test_server.c tests/harness.h tests/samekeys.h tests/lttb_ref.h server/metrics.c server/metrics.h server/creport.h server/stbuf.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/metrics.c $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_follow: tests/test_follow.c $(LIB)
