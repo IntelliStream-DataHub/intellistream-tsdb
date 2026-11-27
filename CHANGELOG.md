@@ -29,6 +29,8 @@ disk format and the wire protocol.
   The stream does not carry logins (copy `USERS`, whose format did not change), the volumes (`import
   --create-volumes`) or a change feed (`feed enable` again). A database written by a development build of 0.11.0
   before this change says 9 but may hold columnar records: export it with that build, never with 0.10.x.
+  The cluster peer protocol (`PL_CL_VERSION`) is 11 for the same reason: replication carries columnar records, and
+  a 0.10.x peer (10) is now refused at HELLO, naming both versions, instead of stalling on the first such record.
 - **Codec format improvements (`BLK_INT_FOR`, `BLK_BOOL_PACK`, `BLK_TS_FOR_BP`, dividing decimal/binary scales).**
   Part of disk format 10 (above; all existing block kinds `0..17` and scale indices decode bit-for-bit identically):
   - `BLK_INT_FOR` (kind 18) adds per-vector delta/direct frame-of-reference, 33–63-bit `pack64`, and PFOR outlier

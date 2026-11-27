@@ -276,7 +276,8 @@ cgroup, so `nice` does not keep your work out of its way.
   carries the set version (`repl_set_version`, others dropped and counted) and the ACK the replay start
   (`repl_replay_start`, D17); `repl_leave` and `repl_meta_promote_to` for moves (design-cluster.md 8.3, R4);
   `tests/test_repl.c`, `tests/sim_repl.c` (`make sim-repl-mutants`, `make sim-repl-soak`); replwire `RW_VERSION` 3, cluster
-  version (`PL_CL_VERSION`) 10: every driver message (replication messages, FETCH, a bulk file's meta) ends its
+  version (`PL_CL_VERSION`) 11 (11: columnar WAL records in APPEND; 10 brought this): every driver message
+  (replication messages, FETCH, a bulk file's meta) ends its
   fields with the driver check, an XXH3-64 that the decoder verifies before any field is read out (`RW_E_CHECK`:
   dropped and counted, the resend repairs it), at every check level, `none` included, never over record bytes
   (rd-drvcheck, review F3: a flipped ACK `durable` inside [durable, written]; `tests/test_replwire.c`, `test_cluster

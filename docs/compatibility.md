@@ -37,7 +37,7 @@ program) must be rebuilt: the Rust and Java bindings check `tsdb_abi_version()` 
 Cluster and off by default: the cluster (`tsdbd --cluster`, `tsdb cluster ...`) runs replicated (`--replicas`) and
 erasure-coded (`--redundancy ec=K+M`) cluster volumes with failover, leadership transfers, copy moves and snapshot
 rebuilds ([cluster-preview.md](cluster-preview.md), [design-cluster-data.md](design-cluster-data.md)); its metadata
-snapshot (version 6) and peer protocol (`PL_CL_VERSION`, version 10) may still change before 1.0, and builds that
+snapshot (version 6) and peer protocol (`PL_CL_VERSION`, version 11) may still change before 1.0, and builds that
 differ there refuse each other naming both versions. The change feed is off until `tsdb <dir> feed enable`; with it
 on, `META` says `requires=feed` and a binary without the feed refuses the directory.
 

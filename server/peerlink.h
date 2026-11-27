@@ -55,7 +55,7 @@
 #include <stdint.h>
 
 #define PL_CL_MAGIC 0x43445354u /* "TSDC": the cluster HELLO's magic (cluster.c) */
-#define PL_CL_VERSION 10        /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
+#define PL_CL_VERSION 11        /* the cluster protocol version; 4 adds the link kind to HELLO, 5 the lease in
                                  * HB and HB_ACK (r3e-leases), 6 the replication messages' set version and replay
                                  * start (replwire RW_VERSION 2, r4-core): a peer of 5 would drop every frame unheard;
                                  * 7 R4's F_VOLCMD and VOLMSG READY (r4-iface): a peer of 6 drops the connection that
@@ -64,7 +64,9 @@
                                  * capability byte after it in both (rd-seam); 9 the check an option of three levels
                                  * (none by default: no check bytes; rd-nocheck): an 8 peer is refused naming both;
                                  * 10 the replication driver's own check on every driver message, whatever the level
-                                 * (replwire RW_VERSION 3, rd-drvcheck): a 9 peer is refused naming both */
+                                 * (replwire RW_VERSION 3, rd-drvcheck): a 9 peer is refused naming both; 11 columnar WAL
+                                 * records (WAL_KIND_COL, disk format 10) in APPEND: a 10 peer would pass HELLO and
+                                 * then refuse every such record as unlike its descriptor, stalling the volume */
 /* The capability bits of a data link's HELLO and HELLO_ACK (one byte after the check types; bits a build does not know
  * are ignored, so a later build of the same cluster version adds one without a version bump). PL_CAP_RDMA: this build
  * decodes RDMA_OFFER (docs/design-rdma.md §5.1 step 1); rd-upgrade sets it, a build before it sends 0 and is never
