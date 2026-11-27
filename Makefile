@@ -1187,21 +1187,20 @@ $(B)/cnode.o: server/cnode.c $(R4_CL_HDR) | $(B)
 	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
 R9_OBJ := $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/sfill.o $(B)/sreconcile.o $(B)/pace.o $(B)/cnode.o
 CLUSTER_OBJ := $(B)/creport.o $(B)/plrdma.o $(B)/plrdma_dl.o $(B)/ctransfer.o $(B)/cmove.o $(B)/cset.o $(B)/cheal.o $(R9_OBJ) $(B)/cluster.o $(B)/meta.o $(B)/repl.o $(B)/crashpt.o $(B)/peerlink.o $(B)/replwire.o $(B)/fwd.o $(B)/fwd_cluster.o $(B)/fwdreq.o $(B)/chunksrv.o $(B)/chunksrv_cluster.o $(RAFT_OBJ)
-# R9 placement simulator (tests/sim_place.c, docs/design-cluster-data.md §10.2): stub main until r9-simplace fills it in
+# R9 placement simulator (tests/sim_place.c, tests/sim_place.sh, docs/design-cluster-data.md §10.2; track r9-simplace)
 $(B)/sim_place: tests/sim_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
-	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/sim_place.c $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
+	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/sim_place.c $(B)/place.o $(B)/pout.o $(B)/balance.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o -lm
 # R9 DOWN/OUT timer planner unit tests and planted mutants (server/pout.c, tests/test_pout.c)
 $(B)/test_pout: tests/test_pout.c $(R9_PLACE_HDR) $(B)/pout.o $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_pout.c $(B)/pout.o $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
 pout-mutants: $(B)/test_pout
 	$(MUT) --name test_pout --list "noguard guardunbounded holdignored openingunbounded failstopslow" -- ./$(B)/test_pout --mutant @M@
 PLACE_SEEDS ?= 10000
+PLACE_JOBS  ?= $(shell nproc 2>/dev/null || echo 4)
 place-soak: $(B)/sim_place
-	@echo "place-soak: not built yet (see r9-simplace)" >&2
-	@exit 1
+	B=$(B) tests/sim_place.sh soak $(PLACE_SEEDS) $(PLACE_JOBS)
 place-mutants: $(B)/sim_place
-	@echo "place-mutants: not built yet (see r9-simplace)" >&2
-	@exit 1
+	B=$(B) tests/sim_place.sh mutants
 # R9 checked stripe fill worker unit tests and planted mutants (server/sfill.c, tests/test_sfill.c; track r9-fill)
 $(B)/test_sfill: tests/test_sfill.c server/sfill.h server/pace.h src/chunk.h src/chunk_priv.h $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) | $(B)
 	$(CC) $(CFLAGS) -Iinclude -Iserver -Isrc -o $@ tests/test_sfill.c $(B)/sfill.o $(B)/pace.o $(B)/crashpt.o $(LIB) $(LDLIBS)
