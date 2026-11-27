@@ -38,6 +38,8 @@ void margins_of(const struct cluster_copy *cp, const struct cluster_copy_vol *v,
         for (size_t i = 0; i < nd && !gone; i++)
             gone = destroyed[i] == v->stripe[p];
         int st = member_state(cp, v->stripe[p]);
+        if (st == META_DESTROYED)
+            gone = true;
         if (gone && mutant != MARGIN_MUT_LOSTASDOWN)
             out->destroyed++;
         else if (!gone && (st == META_UP || st == META_DRAINING))

@@ -660,7 +660,8 @@ CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening fa
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
     moveleader moverep0 moveraft movekill movecancel moveold ackdurable writerfail writerfailq diverged \
     writerdepose lease hungloop leasedown leasequorum hardslot repcheck rdma openfast \
-    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics full fullnonisr ecrebuild
+    outtimer outback outguard outhold outopening outfailstop replfault pace downkeep downbudget holdkeep outmove ecout metrics full fullnonisr ecrebuild \
+    nodehold nodeout nodedrain nodereplace nodedestroyed posmove
 test-cluster-1 test-cluster-2 test-cluster-3: test-cluster-%: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb $(B)/tsdbc-bench $(CRASHFS_SO)
 	CRASHFS_SO=$(B)/libcrashfs.so TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb TSDBC_BENCH=$(B)/tsdbc-bench ./$(B)/test_cluster $(SCRATCH) $(CLUSTER_SCEN_$*)
 
@@ -1195,6 +1196,10 @@ $(B)/test_place: tests/test_place.c $(R9_PLACE_HDR) $(B)/place.o $(B)/meta.o $(B
 	$(CC) $(CFLAGS) -Iserver -Isrc -o $@ tests/test_place.c $(B)/place.o $(B)/meta.o $(B)/repl.o $(B)/raft_compat.o
 place-plan-mutants: $(B)/test_place
 	$(MUT) --name test_place --list "orderfifo rackignored twoperserver moveshrinks wholenobarrier" -- ./$(B)/test_place --mutant @M@
+# R9 operator ops mutants (server/cnode.c, track r9-ops): drainleaves must fail nodedrain, replaceclear must fail nodereplace
+ops-mutants: $(B)/test_cluster $(B)/tsdbd $(B)/tsdb
+	$(MUT) --name ops-drain --list "drainleaves" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodedrain
+	$(MUT) --name ops-replace --list "replaceclear" -- env TSDB_CLUSTER_MUTANT=@M@ TSDBD=$(TSDBD) TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ nodereplace
 $(B)/tsdb: $(B)/cluster-cli.o $(B)/cluster-user-cli.o $(CLUSTER_OBJ)
 $(B)/cluster-cli.o: tools/cluster-cli.c server/cluster.h server/meta.h server/place.h $(RAFT_HDR) | $(B)
 	$(CC) $(CFLAGS) -Iserver -Isrc -Isrc/raft/compat -c -o $@ $<

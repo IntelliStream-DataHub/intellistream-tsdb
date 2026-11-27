@@ -556,7 +556,7 @@ static void stop_all(void)
 }
 
 static uint32_t init_rebuild_after_s, init_failstop_out_s, init_opening_hold_s, init_out_guard_pct,
-    init_out_guard_hold_s; /* r9-out scenarios (0: default) */
+    init_out_guard_hold_s, init_voters; /* r9-out / r9-ops scenarios (0: default) */
 
 static void scenario(const char *name)
 {
@@ -576,6 +576,7 @@ static void scenario(const char *name)
     init_opening_hold_s = 0;
     init_out_guard_pct = 0;
     init_out_guard_hold_s = 0;
+    init_voters = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
@@ -817,6 +818,8 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.out_guard_pct = init_out_guard_pct;
     if (init_out_guard_hold_s)
         s.out_guard_hold_s = init_out_guard_hold_s;
+    if (init_voters)
+        s.voters = init_voters;
     if (init_r4_set) {
         s.rebuild_mb_s = 300;
         s.rebuild_max = 3;
@@ -14784,7 +14787,7 @@ static int no_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
 static void scen_margins(void)
 {
     scenario("margins");
-    static char cold[PATH_MAX], pe[PATH_MAX + 32];
+    static char cold[PATH_MAX + 96], pe[PATH_MAX + 128];
     snprintf(cold, sizeof cold, "%s/cold-hook", base);
     snprintf(pe, sizeof pe, "TSDBD_TEST_COLD=%s", cold);
     for (int i = 0; i < 6; i++) {
@@ -18559,31 +18562,36 @@ static void scen_r9stubs(void)
     unsigned three = 3;
     await_view(0, p_voters, &three, "3 voters up before r9stubs");
     await_view(1, p_names_leader, &ids[0], "follower 1 knows leader before r9stubs");
+    uint32_t vnum = 0;
+    int rc = vol_add(0, "r9health", 3, &vnum);
+    if (rc != 0 || vnum != 1)
+        die("volume add r9health before r9stubs: %s", cluster_strerror(rc));
     char p0[META_ADDR_MAX], p1[META_ADDR_MAX], args[PATH_MAX * 2 + 512], out[8192];
     peer_of(0, p0, sizeof p0);
     peer_of(1, p1, sizeof p1);
-    /* Each new R9 CLI verb hits the Raft leader (half via follower p1 to verify NOTLEADER redirect) and returns
-     * "not built" with exit 1. */
+    /* Each R9 CLI verb hits the Raft leader (half via follower p1 to verify NOTLEADER redirect) and returns a clear
+     * refusal reason on invalid targets/preconditions without disturbing cluster state. */
     static const struct {
         const char *fmt;
         int via_follower;
         const char *expect;
     } verbs[] = {
-        {"node hold %s 2 --for 600s", 0, "node hold of node 2 for 600 s: not built"},
-        {"node hold %s 2 --release", 1, "node hold release of node 2: not built"},
-        {"node out %s 2", 0, "node out of node 2: not built"},
-        {"node drain %s 2", 1, "node drain of node 2: not built"},
-        {"node replace %s 2 3", 0, "node replace of node 2 with node 3: not built"},
-        {"node destroyed %s 2", 1, "node destroyed of node 2: not built"},
-        {"volume move %s 1 --pos 0 --to 2", 1, "volume 1 move pos 0 to node 2: not built"},
+        {"node hold %s 99 --for 600s", 0, "unknown node 99"},
+        {"node hold %s 99 --release", 1, "unknown node 99"},
+        {"node out %s 99", 0, "unknown node 99"},
+        {"node drain %s 99", 1, "unknown node 99"},
+        {"node drain %s 2 --cancel", 1, "not draining"},
+        {"node replace %s 2 3", 0, "already holds"},
+        {"node destroyed %s 2", 1, "not out"},
+        {"volume move %s 1 --pos 0 --to 2", 1, "not erasure-coded"},
     };
     for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
         char v[256];
         snprintf(v, sizeof v, verbs[k].fmt, verbs[k].via_follower ? p1 : p0);
         snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
-        int rc = cli_run(args, NULL, out, sizeof out);
-        if (rc != 1 || !strstr(out, verbs[k].expect))
-            die("tsdb cluster %s: exit %d, wanted \"%s\": %s", v, rc, verbs[k].expect, out);
+        int crc = cli_run(args, NULL, out, sizeof out);
+        if (crc != 1 || !strstr(out, verbs[k].expect))
+            die("tsdb cluster %s: exit %d, wanted \"%s\": %s", v, crc, verbs[k].expect, out);
         printf("  %s: %s", v, out);
     }
     /* Malformed bodies sent directly to the leader are refused by each decoder with META_ERR_INVALID. */
@@ -18622,21 +18630,17 @@ static void scen_r9stubs(void)
         char v[256];
         snprintf(v, sizeof v, badcli[k], p0);
         snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
-        int rc = cli_run(args, NULL, out, sizeof out);
-        if (rc != 2)
-            die("tsdb cluster %s: exit %d, wanted 2: %s", v, rc, out);
+        int crc = cli_run(args, NULL, out, sizeof out);
+        if (crc != 2)
+            die("tsdb cluster %s: exit %d, wanted 2: %s", v, crc, out);
     }
-    /* Verify the 3-node cluster remains completely healthy after all stub calls. */
-    uint32_t vnum = 0;
-    int rc = vol_add(0, "r9health", 3, &vnum);
-    if (rc != 0 || vnum == 0)
-        die("cluster health check volume add failed after r9stubs: %s", cluster_strerror(rc));
+    /* Verify the 3-node cluster remains completely healthy after all checks. */
     await_view(0, p_voters, &three, "3 voters still up after r9stubs");
     for (int i = 0; i < 3; i++) {
         struct state_want w = {ids[i], META_UP, 1};
         await_view(0, p_member_state, &w, "member still UP after r9stubs");
     }
-    printf("  cluster healthy after r9stubs: 3 nodes up, created volume r9health (#%" PRIu32 ")\n", vnum);
+    printf("  cluster healthy after r9stubs: 3 nodes up, volume r9health (#%" PRIu32 ")\n", vnum);
 }
 
 /* opening (r9-hb; D5, D17): HBS_NODE reports opening=1 from cluster thread start until every startup volume finishes
@@ -24309,6 +24313,1055 @@ static void scen_ecrebuild(void)
 #endif
 }
 
+/* ---- r9-ops: operator CLI verbs (node hold/out/drain/replace/destroyed, volume move --pos) and STATUS details */
+
+/* nodehold (r9-ops): `tsdb cluster node hold` keeps a DOWN node from going OUT past rebuild_after_s=4, STATUS prints
+ * down_reason/down_age/out_in/hold_left (and guard when active), `--release` lets it go OUT, and a 2-day hold is
+ * refused both by the CLI and on the wire. */
+static void scen_nodehold(void)
+{
+    scenario("nodehold");
+    init_rebuild_after_s = 4;
+    init_out_guard_pct = 25;
+    pout_boot5();
+
+    char p0[META_ADDR_MAX], p1[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[16384];
+    peer_of(0, p0, sizeof p0);
+    peer_of(1, p1, sizeof p1);
+
+    /* 2-day hold refused by CLI (exit 2) and on the wire (META_ERR_INVALID). */
+    snprintf(args, sizeof args, "cluster node hold %s %" PRIu32 " --for 2d --secret-file %s", p0, ids[4], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 2)
+        die("nodehold: 2d CLI hold was not refused with exit 2: %s", out);
+    uint8_t hreq[12], *hrep = NULL;
+    size_t hlen = 0, hrl = cluster_node_hold_encode(ids[4], 172800, 0, hreq);
+    int hrc = admin(0, CLUSTER_OP_NODE_HOLD, hreq, hrl, 0, &hrep, &hlen);
+    if (hrc != META_ERR_INVALID || !bytes_has(hrep, hlen, "exceeds 1 day"))
+        die("nodehold: 2-day wire hold rc=%d (%.*s)", hrc, (int)hlen, hrep ? (const char *)hrep : "");
+    free(hrep);
+
+    /* Hold node 5 for 60 s via follower p1 (tests NOTLEADER redirect + commit wait). */
+    snprintf(args, sizeof args, "cluster node hold %s %" PRIu32 " --for 60s --secret-file %s", p1, ids[4], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "held against automatic OUT"))
+        die("nodehold: node hold 60s failed: %s", out);
+    uint64_t hold = 0;
+    (void)member_state_of(leader_of(0), ids[4], NULL, &hold);
+    if (hold == 0)
+        die("nodehold: hold_until_ms still 0 after CLI returned success");
+
+    /* Kill node 5; wait until DOWN, then past rebuild_after_s=4 (6.5 s): must stay DOWN. */
+    stop(4, SIGKILL);
+    struct state_want down_w = {ids[4], META_DOWN, 0};
+    await_view(0, p_member_state, &down_w, "held node 5 marked DOWN");
+    uint64_t t_down = now_ms();
+
+    /* STATUS prints down_reason, down_age, out_in, hold_left. */
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", p0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "down_reason timeout") ||
+        !strstr(out, "down_age ") || !strstr(out, "out_in ") || !strstr(out, "hold_left "))
+        die("nodehold: cluster status missing DOWN/hold fields:\n%s", out);
+
+    /* Kill a second member (node 4) briefly so 2/5 = 40% > 25% triggers the mass-OUT guard; check STATUS guard line. */
+    stop(3, SIGKILL);
+    struct state_want down3 = {ids[3], META_DOWN, 0};
+    await_view(0, p_member_state, &down3, "node 4 DOWN for guard status check");
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "guard active yes reason pct down 2/5"))
+        die("nodehold: cluster status missing active guard line:\n%s", out);
+    start(3);
+    struct state_want up3 = {ids[3], META_UP, 0};
+    await_view(0, p_member_state, &up3, "node 4 back UP after guard check");
+
+    while (now_ms() - t_down < 6500)
+        usleep(100000);
+    if (member_state_of(0, ids[4], NULL, NULL) != META_DOWN)
+        die("nodehold: held node 5 left DOWN while hold was active");
+
+    /* Release the hold: node 5 is already past rebuild_after_s=4, so pout_plan transitions it to OUT. */
+    snprintf(args, sizeof args, "cluster node hold %s %" PRIu32 " --release --secret-file %s", p1, ids[4], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "hold released"))
+        die("nodehold: --release failed: %s", out);
+    struct state_want out_w = {ids[4], META_OUT, 0};
+    await_view(0, p_member_state, &out_w, "node 5 OUT after --release");
+    printf("  nodehold: 2-day hold refused, 60 s hold kept node %" PRIu32 " DOWN past rebuild_after_s=4, STATUS showed "
+           "down/hold/guard lines, OUT after --release\n", ids[4]);
+}
+
+/* nodeout (r9-ops): `tsdb cluster node out` on a LIVE volume leader marks it OUT immediately (after commit), hands
+ * off leadership promptly so writes continue without waiting in NO_OWNER, and evacuates the volume to 3 ISR. */
+static void scen_nodeout(void)
+{
+    scenario("nodeout");
+    move_env(0);
+    struct meta_volume v;
+    int L = set_setup(5, &v, 0);
+    set_cenv = NULL;
+    await_isr(0, "plant", 3, 15000, "plant ISR of 3 before nodeout");
+
+    int R = leader_of(0);
+    char pF[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[8192];
+    /* If plant's volume leader happens to be the Raft leader, transfer plant to another ISR replica so we can mark
+     * the live volume leader OUT without stepping down the Raft leader. */
+    if (L == R) {
+        int dst = -1;
+        for (uint32_t k = 0; k < v.nrep; k++) {
+            int s = server_of(v.rep[k].node);
+            if (s >= 0 && s != R) {
+                dst = s;
+                break;
+            }
+        }
+        if (dst < 0)
+            die("nodeout: no non-Raft-leader replica to transfer plant to");
+        peer_of(R, pF, sizeof pF);
+        snprintf(args, sizeof args, "cluster volume transfer %s %" PRIu32 " %" PRIu32 " --secret-file %s", pF, v.number,
+                 ids[dst], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("nodeout: pre-transfer failed: %s", out);
+        L = dst;
+    }
+    int A = L, F = -1;
+    for (int i = 0; i < 5 && F < 0; i++)
+        if (i != R && i != A)
+            F = i;
+    if (F < 0)
+        die("nodeout: could not pick follower F");
+
+    tsdbc *wc = client(L);
+    tsdbc_set_retry(wc, 30000);
+    tsdb_sid sid = rep_series(wc, "nodeout.s0", "plant", 30000);
+    int64_t ts0 = 1000;
+    float val0 = 1.0f;
+    if (tsdbc_insert_series(wc, sid, &ts0, &val0, 1) != 0)
+        die("nodeout: pre-out write failed");
+
+    peer_of(F, pF, sizeof pF);
+    snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", pF, ids[A], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "marked out"))
+        die("nodeout: CLI node out failed: %s", out);
+    if (member_state_of(R, ids[A], NULL, NULL) != META_OUT)
+        die("nodeout: node %" PRIu32 " not META_OUT immediately after commit", ids[A]);
+
+    /* Second node out is refused as already out. */
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "already out"))
+        die("nodeout: second node out was not refused: %s", out);
+
+    /* Wait for leadership to transfer off OUT leader A, then verify a write succeeds on the new leader. */
+    struct meta_volume fv = {0};
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(R, "plant", &fv) && fv.leader && fv.leader != ids[A])
+            break;
+        if (now_ms() - t0 > 30000)
+            die("nodeout: leadership did not transfer off OUT live leader %" PRIu32 " in 30 s", ids[A]);
+    }
+    tsdbc_close(wc);
+    wc = client(server_of(fv.leader));
+    tsdbc_set_retry(wc, 30000);
+    int64_t ts1 = 2000;
+    float val1 = 2.0f;
+    if (tsdbc_insert_series(wc, sid, &ts1, &val1, 1) != 0)
+        die("nodeout: post-out write on new leader failed");
+
+    /* Wait for place_plan + cmove to move plant off A back to 3 ISR. */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        if (vol_rec(R, "plant", &fv) && fv.nrep == 3 && fv.nisr == 3 && rep_index(&fv, A) < 0 &&
+            !fv.rep[0].learner && !fv.rep[1].learner && !fv.rep[2].learner)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("nodeout: plant did not evacuate OUT node %" PRIu32 " in 60 s", ids[A]);
+    }
+    if (rows_of(wc, sid) != 2)
+        die("nodeout: expected 2 rows on plant after evacuation, got %d", rows_of(wc, sid));
+    tsdbc_close(wc);
+    move_dir_gone(A);
+    printf("  nodeout: `node out %" PRIu32 "` on live leader marked OUT via follower, transferred leadership, "
+           "preserved writes, evacuated to 3 ISR\n", ids[A]);
+}
+
+/* nodedrain (r9-ops):
+ *   Part A: on 3 nodes (no 4th spare), `node drain` holds DRAINING while the member still holds a replica (catches
+ *           mutant `drainleaves` deterministically!), and `node drain --cancel` returns it to UP.
+ *   Part B: with a 4th node added under live writers, `node drain` moves every log replica off with zero lost writes,
+ *           never transitioning to OUT while holding any replica, then automatically transitions DRAINING -> OUT.
+ *   Part C: ec=4+2 on 7 nodes under writes -> `node drain` moves both log replica and stripe position off (stripe
+ *           position FILLING with prev = drained node, shown in STATUS), then automatically transitions to OUT. */
+static void scen_nodedrain(void)
+{
+    scenario("nodedrain");
+    /* Part A: 3-node cluster with replicas=3 (no spare -> stays DRAINING -> catches `drainleaves`, then --cancel). */
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters up before nodedrain part A");
+    uint32_t vnum = 0;
+    if (vol_add(0, "d3", 3, &vnum) != 0 || vnum != 1)
+        die("nodedrain: volume add d3 failed");
+    struct meta_volume dv;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "d3", &dv); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("nodedrain: no record of d3");
+    for (uint32_t k = 0; k < dv.nrep; k++)
+        await_open_gen(0, "d3", server_of(dv.rep[k].node), 1, 0);
+    await_isr(0, "d3", 3, 15000, "d3 ISR of 3");
+
+    char p0[META_ADDR_MAX], p1[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[16384];
+    peer_of(0, p0, sizeof p0);
+    peer_of(1, p1, sizeof p1);
+
+    /* Drain node 3 (holds a replica of d3, no 4th server to move it to): must stay DRAINING across >= 2 duty ticks. */
+    snprintf(args, sizeof args, "cluster node drain %s %" PRIu32 " --secret-file %s", p1, ids[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "draining"))
+        die("nodedrain: node drain part A failed: %s", out);
+    uint64_t inc_before = 0;
+    {
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m2 = meta_member(&vw.m, ids[2]);
+        inc_before = m2 ? m2->incarnation : 0;
+        view_free(&vw);
+    }
+    uint64_t t_hold = now_ms();
+    while (now_ms() - t_hold < 2500) {
+        int st = member_state_of(0, ids[2], NULL, NULL);
+        if (st != META_DRAINING)
+            die("nodedrain: node %" PRIu32 " left DRAINING (state %s) while still holding d3 (drainleaves!)", ids[2],
+                meta_member_state_name(st));
+        usleep(100000);
+    }
+
+    /* Restart draining node 3 cleanly: new incarnation must be recorded while staying DRAINING, and d3 must reopen. */
+    stop(2, SIGTERM);
+    start(2);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m2 = meta_member(&vw.m, ids[2]);
+        int ok = m2 && m2->state == META_DRAINING && m2->incarnation > inc_before;
+        view_free(&vw);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("nodedrain: restarted draining node %" PRIu32 " did not bump incarnation while staying DRAINING",
+                ids[2]);
+    }
+    await_open_gen(0, "d3", 2, 2, 0);
+    await_isr(0, "d3", 3, 15000, "d3 ISR of 3 after draining node restart");
+
+    /* Kill draining node 3: must transition DRAINING -> DOWN(drain), then on restart return to DRAINING (not UP!). */
+    uint64_t inc_kill = 0;
+    {
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m2 = meta_member(&vw.m, ids[2]);
+        inc_kill = m2 ? m2->incarnation : 0;
+        view_free(&vw);
+    }
+    stop(2, SIGKILL);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        uint8_t dr = 0;
+        int st = member_state_of(0, ids[2], &dr, NULL);
+        if (st == META_DOWN && dr == META_DOWN_DRAIN)
+            break;
+        if (st == META_DOWN && dr != META_DOWN_DRAIN)
+            die("nodedrain: killed draining node %" PRIu32 " went DOWN with reason %s, not drain", ids[2],
+                meta_down_reason_name(dr));
+        if (now_ms() - t0 > 20000)
+            die("nodedrain: killed draining node %" PRIu32 " was never marked DOWN(drain) (st=%d)", ids[2], st);
+    }
+    start(2);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *m2 = meta_member(&vw.m, ids[2]);
+        int st = m2 ? (int)m2->state : -1;
+        uint64_t inc = m2 ? m2->incarnation : 0;
+        view_free(&vw);
+        if (st == META_UP)
+            die("nodedrain: draining node %" PRIu32 " returned UP instead of DRAINING after crash+restart", ids[2]);
+        if (st == META_DRAINING && inc > inc_kill)
+            break;
+        if (now_ms() - t0 > 20000)
+            die("nodedrain: node %" PRIu32 " did not return to DRAINING after crash+restart (st=%d)", ids[2], st);
+    }
+    await_open_gen(0, "d3", 2, 3, 0);
+    await_isr(0, "d3", 3, 15000, "d3 ISR of 3 after draining node crash+restart");
+
+    /* Cancel the drain: returns DRAINING -> UP. */
+    snprintf(args, sizeof args, "cluster node drain %s %" PRIu32 " --cancel --secret-file %s", p0, ids[2], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "drain cancelled"))
+        die("nodedrain: --cancel failed: %s", out);
+    if (member_state_of(leader_of(0), ids[2], NULL, NULL) != META_UP)
+        die("nodedrain: node %" PRIu32 " did not return to UP after --cancel", ids[2]);
+
+    /* Part B: add 4th server, run live writes on d3, drain node 3 (or d3's leader!), verify 0 lost writes and OUT. */
+    start(3);
+    node_add(0, 3);
+    unsigned four = 4;
+    await_view(0, p_n_placeable, &four, "4 placeable members for nodedrain part B");
+
+    int dL = server_of(dv.leader);
+    int D = dL; /* drain the volume's leader itself to exercise live serving + planned transfer during DRAINING! */
+    if (D == leader_of(0)) {
+        for (uint32_t k = 0; k < dv.nrep; k++) {
+            int s = server_of(dv.rep[k].node);
+            if (s >= 0 && s != leader_of(0)) {
+                D = s;
+                break;
+            }
+        }
+    }
+    tsdbc *wc = client(dL);
+    tsdbc_set_retry(wc, 30000);
+    tsdb_sid sid = rep_series(wc, "drain.s0", "d3", 30000);
+    int64_t acked = 0;
+    for (int b = 0; b < 5; b++) {
+        int64_t ts = 10000 + b * 10;
+        float val = (float)b;
+        if (tsdbc_insert_series(wc, sid, &ts, &val, 1) != 0)
+            die("nodedrain: pre-drain write failed");
+        acked++;
+    }
+
+    snprintf(args, sizeof args, "cluster node drain %s %" PRIu32 " --secret-file %s", p0, ids[D], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "draining"))
+        die("nodedrain: part B node drain failed: %s", out);
+
+    int b_idx = 5;
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        /* Write a row periodically while draining (following MOVED if leadership transferred off D). */
+        if (b_idx < 25) {
+            struct meta_volume cur;
+            if (vol_rec(0, "d3", &cur) && cur.leader) {
+                int cl = server_of(cur.leader);
+                if (cl >= 0 && cl != dL) {
+                    tsdbc_close(wc);
+                    dL = cl;
+                    wc = client(dL);
+                    tsdbc_set_retry(wc, 30000);
+                }
+            }
+            int64_t ts = 10000 + b_idx * 10;
+            float val = (float)b_idx;
+            if (tsdbc_insert_series(wc, sid, &ts, &val, 1) == 0) {
+                acked++;
+                b_idx++;
+            }
+        }
+        struct view vw;
+        view(0, &vw);
+        const struct meta_member *dm = meta_member(&vw.m, ids[D]);
+        const struct meta_volume *v1 = meta_volume(&vw.m, 1);
+        int still_holds = v1 && meta_replica(v1, ids[D]) != NULL;
+        int st = dm ? (int)dm->state : -1;
+        int done = !still_holds && v1 && v1->nrep == 3 && v1->nisr == 3 && st == META_OUT;
+        view_free(&vw);
+        if (still_holds && st == META_OUT)
+            die("nodedrain: node %" PRIu32 " marked OUT while still holding d3 (drainleaves!)", ids[D]);
+        if (done)
+            break;
+        if (now_ms() - t0 > 60000)
+            die("nodedrain: part B did not finish draining node %" PRIu32 " in 60 s (st=%d holds=%d)", ids[D], st,
+                still_holds);
+    }
+    /* Verify every acknowledged write reads back with zero loss. */
+    struct meta_volume fv;
+    if (!vol_rec(0, "d3", &fv) || !fv.leader)
+        die("nodedrain: d3 has no leader after drain");
+    tsdbc_close(wc);
+    wc = client(server_of(fv.leader));
+    tsdbc_set_retry(wc, 30000);
+    if ((int64_t)rows_of(wc, sid) != acked)
+        die("nodedrain: lost writes on d3: got %d, acked %" PRId64, rows_of(wc, sid), acked);
+    tsdbc_close(wc);
+    printf("  nodedrain part A+B: replicas=3 --cancel ok, drained node %" PRIu32 " -> OUT with %" PRId64 " rows intact\n",
+           ids[D], acked);
+
+    /* Part C: ec=4+2 on 7 nodes under writes -> drain moves log replica & marks stripe pos FILLING(prev=H);
+     * H MUST stay DRAINING while it is still the FILLING copy source (`prev == H`), then transitions to OUT once
+     * STRIPE_WHOLE commits (driven via stripe_whole_file=1 test hook until r9-fill/r9-whole land). */
+    stop_all();
+    snprintf(base, sizeof base, "%s/nodedrain-ec", root);
+    if (mkdir(base, 0755) != 0)
+        die("mkdir %s: %s", base, strerror(errno));
+    memset(ids, 0, sizeof ids);
+    memset(pports, 0, sizeof pports);
+    memset(stopped, 0, sizeof stopped);
+    memset(xargs, 0, sizeof xargs);
+    epoll_after_two = 1;
+    for (int i = 0; i < 7; i++) {
+        envs[i] = "stripe_whole_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 7; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "5 voters of 7 for nodedrain part C");
+    struct view v0;
+    view(0, &v0);
+    uint8_t uuid[16];
+    memcpy(uuid, v0.m.uuid, 16);
+    view_free(&v0);
+    static char xa[7][PATH_MAX + 128];
+    for (int i = 0; i < 7; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ds%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned seven = 7;
+    await_view(0, p_n_placeable, &seven, "7 placeable EC members for nodedrain part C");
+    uint32_t ecnum = 0;
+    char etxt[256];
+    int erc;
+    for (uint64_t t0 = now_ms(); (erc = vol_add_ec(0, "d42", 0, 4, 2, &ecnum, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((erc != CLUSTER_ERR_FEW && erc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("nodedrain: ec=4+2 add: %s (%s)", cluster_strerror(erc), etxt);
+    struct meta_volume e42;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "d42", &e42); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("nodedrain: no record of d42");
+    for (uint32_t k = 0; k < e42.nrep; k++)
+        await_open_gen(0, "d42", server_of(e42.rep[k].node), 1, 0);
+    await_isr(0, "d42", 3, 15000, "d42 ISR of 3");
+
+    /* Pick H holding BOTH a log replica and a stripe position of d42 (not Raft leader), and find spare S. */
+    int R = leader_of(0), H = -1, S = -1;
+    uint32_t hpos = UINT32_MAX;
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < e42.nstripe; p++)
+            in_s |= (e42.stripe[p] == ids[i]);
+        if (!in_s)
+            S = i;
+    }
+    for (uint32_t p = 0; p < e42.nstripe; p++) {
+        int s = server_of(e42.stripe[p]);
+        if (s >= 0 && s != R && rep_index(&e42, s) >= 0) {
+            H = s;
+            hpos = p;
+            break;
+        }
+    }
+    if (H < 0) {
+        for (uint32_t p = 0; p < e42.nstripe; p++) {
+            int s = server_of(e42.stripe[p]);
+            if (s >= 0 && s != R) {
+                H = s;
+                hpos = p;
+                break;
+            }
+        }
+    }
+    if (H < 0 || S < 0)
+        die("nodedrain part C: could not pick H and spare S");
+
+    int eL = server_of(e42.leader);
+    tsdbc *ec = client(eL);
+    tsdbc_set_retry(ec, 30000);
+    tsdb_sid esid = rep_series(ec, "drain.ec0", "d42", 30000);
+    int64_t eacked = 0;
+    for (int b = 0; b < 5; b++) {
+        int64_t ts = 20000 + b * 10;
+        float val = (float)b;
+        if (tsdbc_insert_series(ec, esid, &ts, &val, 1) != 0)
+            die("nodedrain part C: pre-drain write failed");
+        eacked++;
+    }
+
+    peer_of(R, p0, sizeof p0);
+    snprintf(args, sizeof args, "cluster node drain %s %" PRIu32 " --secret-file %s", p0, ids[H], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "draining"))
+        die("nodedrain part C: node drain failed: %s", out);
+
+    /* Wait until log replica moved off H and pos hpos is FILLING on S with prev = H. */
+    uint64_t fill_ver = 0;
+    for (uint64_t t0 = now_ms();; usleep(50000)) {
+        struct view vw;
+        view(R, &vw);
+        const struct meta_member *hm = meta_member(&vw.m, ids[H]);
+        const struct meta_volume *ev = meta_volume(&vw.m, ecnum);
+        int holds_log = ev && meta_replica(ev, ids[H]) != NULL;
+        int pos_filling = ev && ev->stripe[hpos] == ids[S] && ev->stripe_pos[hpos].state == META_STRIPE_FILLING &&
+                          ev->stripe_pos[hpos].prev == ids[H];
+        int st = hm ? (int)hm->state : -1;
+        uint64_t sv = ev ? ev->stripe_version : 0;
+        int done = !holds_log && pos_filling && ev && ev->nrep == 3 && ev->nisr == 3;
+        view_free(&vw);
+        if (st == META_OUT)
+            die("nodedrain part C: node %" PRIu32 " marked OUT while still holding/serving FILLING pos (drainleaves!)",
+                ids[H]);
+        if (done) {
+            fill_ver = sv;
+            break;
+        }
+        if (now_ms() - t0 > 60000)
+            die("nodedrain part C: log/stripe did not move off node %" PRIu32 " (st=%d log=%d fill=%d)", ids[H], st,
+                holds_log, pos_filling);
+    }
+    /* H MUST remain DRAINING across >= 2 duty ticks while hpos is FILLING with prev == H! */
+    for (uint64_t t_wait = now_ms(); now_ms() - t_wait < 2500; usleep(100000)) {
+        int st = member_state_of(R, ids[H], NULL, NULL);
+        if (st != META_DRAINING)
+            die("nodedrain part C: node %" PRIu32 " left DRAINING (state %s) while still FILLING prev source!",
+                ids[H], meta_member_state_name(st));
+    }
+
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", p0, secret_path);
+    char want_fill[128];
+    snprintf(want_fill, sizeof want_fill, "fill volume %" PRIu32 " pos %" PRIu32 " node %" PRIu32 " prev %" PRIu32,
+             ecnum, hpos, ids[S], ids[H]);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, want_fill))
+        die("nodedrain part C: STATUS missing '%s':\n%s", want_fill, out);
+
+    /* Commit STRIPE_WHOLE via test hook -> now H has zero positions and zero FILLING prev refs, so it goes OUT! */
+    {
+        char swline[64];
+        snprintf(swline, sizeof swline, "%" PRIu32 " %" PRIu32 " %" PRIu64 "\n", ecnum, hpos, fill_ver);
+        pout_touch(R, "stripewhole", swline);
+    }
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view vw;
+        view(R, &vw);
+        const struct meta_member *hm = meta_member(&vw.m, ids[H]);
+        const struct meta_volume *ev = meta_volume(&vw.m, ecnum);
+        int ok = hm && hm->state == META_OUT && ev && ev->stripe[hpos] == ids[S] &&
+                 ev->stripe_pos[hpos].state == META_STRIPE_WHOLE;
+        view_free(&vw);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 20000)
+            die("nodedrain part C: node %" PRIu32 " did not transition DRAINING -> OUT after STRIPE_WHOLE", ids[H]);
+    }
+    struct meta_volume e42f;
+    if (!vol_rec(R, "d42", &e42f) || !e42f.leader)
+        die("nodedrain part C: d42 missing after drain");
+    tsdbc_close(ec);
+    ec = client(server_of(e42f.leader));
+    tsdbc_set_retry(ec, 30000);
+    if ((int64_t)rows_of(ec, esid) != eacked)
+        die("nodedrain part C: lost writes on d42");
+    tsdbc_close(ec);
+    epoll_after_two = 0;
+    printf("  nodedrain part C: ec=4+2 held DRAINING while pos %" PRIu32 " FILLING(prev=%" PRIu32 "), then OUT after "
+           "STRIPE_WHOLE (STATUS showed fill line)\n", hpos, ids[H]);
+}
+
+/* nodereplace (r9-ops): 8-node cluster (6 initial nodes holding ec=4+2 + replicas=3, plus 2 spares S1 < NEW).
+ * Kill OLD (holding both log replicas and an EC stripe pos), run `tsdb cluster node replace OLD NEW`, verify
+ * replaced_by + hold in metadata and STATUS, restart the Raft leader mid-replace so the new leader resumes from
+ * metadata (with rebuild_max=1 so the second volume's move starts AFTER Raft failover!), verify ALL of OLD's log and
+ * stripe positions land specifically on NEW (never S1), zero unrelated positions move, and OLD ends OUT with
+ * replaced_by cleared. */
+static void scen_nodereplace(void)
+{
+    scenario("nodereplace");
+    init_rebuild_after_s = 60;
+    init_rebuild_max = 1;
+    epoll_after_two = 1;
+    for (int i = 0; i < 6; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "5 voters of 6 before nodereplace");
+    struct view v0;
+    view(0, &v0);
+    uint8_t uuid[16];
+    memcpy(uuid, v0.m.uuid, 16);
+    view_free(&v0);
+    static char xa[8][PATH_MAX + 128];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/rs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned six = 6;
+    await_view(0, p_n_placeable, &six, "6 initial EC servers UP");
+
+    uint32_t ecnum = 0, repnum = 0;
+    char etxt[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "nr42", 0, 4, 2, &ecnum, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("nodereplace: ec=4+2 add: %s (%s)", cluster_strerror(rc), etxt);
+    if (vol_add(0, "nrrep", 3, &repnum) != 0)
+        die("nodereplace: replicas=3 add failed");
+
+    struct meta_volume e0, r0;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "nr42", &e0) || !vol_rec(0, "nrrep", &r0); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("nodereplace: volumes not in view");
+    for (uint32_t k = 0; k < e0.nrep; k++)
+        await_open_gen(0, "nr42", server_of(e0.rep[k].node), 1, 0);
+    for (uint32_t k = 0; k < r0.nrep; k++)
+        await_open_gen(0, "nrrep", server_of(r0.rep[k].node), 1, 0);
+    await_isr(0, "nr42", 3, 15000, "nr42 ISR 3");
+    await_isr(0, "nrrep", 3, 15000, "nrrep ISR 3");
+
+    /* Add 2 spare storage servers: S1 (index 6, id 7) and NEW (index 7, id 8). */
+    for (int i = 6; i < 8; i++) {
+        start(i);
+        node_add(0, i);
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/rs%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned eight = 8;
+    await_view(0, p_n_placeable, &eight, "8 servers UP with stores");
+
+    /* Wait for a non-leader voter F to know the Raft leader R, and pick OLD != R && OLD != F. */
+    int R = leader_of(0), S1 = 6, NEW = 7, OLD = -1, F = -1;
+    for (uint32_t k = 0; k < e0.nrep; k++) {
+        int s = server_of(e0.rep[k].node);
+        if (s >= 0 && s != R) {
+            OLD = s;
+            break;
+        }
+    }
+    for (int i = 0; i < 5 && F < 0; i++)
+        if (i != R && i != OLD)
+            F = i;
+    if (OLD < 0 || F < 0)
+        die("nodereplace: could not pick OLD and follower F");
+    await_view(F, p_names_leader, &ids[R], "follower F knows leader before nodereplace");
+    uint32_t old_pos = UINT32_MAX;
+    for (uint32_t p = 0; p < e0.nstripe; p++)
+        if (e0.stripe[p] == ids[OLD])
+            old_pos = p;
+    if (old_pos == UINT32_MAX)
+        die("nodereplace: OLD not in nr42 stripe");
+    int old_in_rep = rep_index(&r0, OLD) >= 0;
+
+    char pF[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[16384];
+    peer_of(F, pF, sizeof pF);
+
+    /* Refusals: NEW already holds a position of OLD's volume; unknown node. */
+    uint32_t peer_in_e0 = e0.stripe[(old_pos + 1) % e0.nstripe];
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pF, ids[OLD],
+             peer_in_e0, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "already holds"))
+        die("nodereplace: replace onto existing volume holder not refused: %s", out);
+    snprintf(args, sizeof args, "cluster node replace %s 99 %" PRIu32 " --secret-file %s", pF, ids[NEW], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "unknown old node"))
+        die("nodereplace: unknown old node not refused: %s", out);
+
+    /* Kill OLD and wait for DOWN (stays DOWN because rebuild_after_s=60). */
+    stop(OLD, SIGKILL);
+    struct state_want down_w = {ids[OLD], META_DOWN, 0};
+    await_view(F, p_member_state, &down_w, "OLD marked DOWN");
+
+    /* Run `tsdb cluster node replace OLD NEW` (retry briefly if NEW's chunk-store HB has not landed yet). */
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pF, ids[OLD],
+             ids[NEW], secret_path);
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        int crc = cli_run(args, NULL, out, sizeof out);
+        if (crc == 0 && strstr(out, "replacing with node"))
+            break;
+        if (!strstr(out, "no chunk stores") || now_ms() - t0 > 10000)
+            die("nodereplace: CLI node replace failed (rc=%d): %s", crc, out);
+    }
+
+    /* Verify replaced_by == NEW and hold_until_ms != 0 in metadata and STATUS. */
+    {
+        struct view vw;
+        view(R, &vw);
+        const struct meta_member *om = meta_member(&vw.m, ids[OLD]);
+        if (!om || om->replaced_by != ids[NEW] || om->hold_until_ms == 0)
+            die("nodereplace: OLD missing replaced_by=%" PRIu32 " or hold (got repl=%u hold=%" PRIu64 ")", ids[NEW],
+                om ? om->replaced_by : 0, om ? om->hold_until_ms : 0);
+        view_free(&vw);
+    }
+    char want_rb[64];
+    snprintf(want_rb, sizeof want_rb, "replaced_by %" PRIu32, ids[NEW]);
+    char pR[META_ADDR_MAX];
+    peer_of(R, pR, sizeof pR);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", pR, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, want_rb))
+        die("nodereplace: STATUS missing '%s':\n%s", want_rb, out);
+
+    /* Restart the Raft leader mid-replace so a new Raft leader must resume from persisted replaced_by! */
+    stop(R, SIGTERM);
+    start(R);
+
+    /* Wait for replace to complete: OLD holds nothing, replaced_by cleared, OLD becomes META_OUT. */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view vw;
+        view(F, &vw);
+        const struct meta_member *om = meta_member(&vw.m, ids[OLD]);
+        const struct meta_volume *ev = meta_volume(&vw.m, ecnum);
+        const struct meta_volume *rv = meta_volume(&vw.m, repnum);
+        int still_holds = (ev && (meta_replica(ev, ids[OLD]) != NULL || ev->stripe[old_pos] == ids[OLD])) ||
+                          (old_in_rep && rv && meta_replica(rv, ids[OLD]) != NULL);
+        int early_clear = still_holds && om && (om->replaced_by == 0 || om->state == META_OUT);
+        int ok_e = ev && ev->nrep == 3 && ev->nisr >= ev->min_isr && meta_replica(ev, ids[OLD]) == NULL &&
+                   meta_replica(ev, ids[NEW]) != NULL && meta_volume_in_isr(ev, ids[NEW]) &&
+                   ev->stripe[old_pos] == ids[NEW] && ev->stripe_pos[old_pos].state == META_STRIPE_FILLING &&
+                   ev->stripe_pos[old_pos].prev == ids[OLD];
+        int ok_r = !old_in_rep || (rv && rv->nrep == 3 && rv->nisr >= rv->min_isr &&
+                                   meta_replica(rv, ids[OLD]) == NULL && meta_replica(rv, ids[NEW]) != NULL &&
+                                   meta_volume_in_isr(rv, ids[NEW]));
+        int ok_m = om && om->state == META_OUT && om->replaced_by == 0;
+        view_free(&vw);
+        if (early_clear)
+            die("nodereplace: OLD cleared replaced_by / marked OUT while still holding positions (replaceclear!)");
+        if (ok_e && ok_r && ok_m)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("nodereplace: replace did not complete in 90 s (ok_e=%d ok_r=%d ok_m=%d)", ok_e, ok_r, ok_m);
+    }
+
+    /* Verify zero unrelated positions were touched and S1 received nothing. */
+    struct meta_volume ef, rf;
+    if (!vol_rec(F, "nr42", &ef) || !vol_rec(F, "nrrep", &rf))
+        die("nodereplace: volumes missing after replace");
+    for (uint32_t p = 0; p < ef.nstripe; p++) {
+        if (p == old_pos) {
+            if (ef.stripe[p] != ids[NEW])
+                die("nodereplace: pos %u went to %u, not NEW %u", p, ef.stripe[p], ids[NEW]);
+        } else if (ef.stripe[p] != e0.stripe[p]) {
+            die("nodereplace: unrelated stripe pos %u moved (%u -> %u)", p, e0.stripe[p], ef.stripe[p]);
+        }
+    }
+    if (rep_index(&ef, S1) >= 0 || rep_index(&rf, S1) >= 0)
+        die("nodereplace: spare S1 received a replica instead of NEW");
+
+    /* Also verify `node replace --cancel` and auto-abandon when replace target goes OUT (releasing OLD's hold). */
+    int X = -1;
+    for (uint32_t p = 0; p < ef.nstripe; p++) {
+        int s = server_of(ef.stripe[p]);
+        if (s >= 0 && s != OLD && s != S1 && s != NEW) {
+            X = s;
+            break;
+        }
+    }
+    if (X < 0)
+        die("nodereplace: could not pick surviving node X for cancel/abandon check");
+    int curR = leader_of(F);
+    peer_of(curR, pR, sizeof pR);
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pR, ids[X], ids[S1],
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("nodereplace: second replace for --cancel failed: %s", out);
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " --cancel --secret-file %s", pR, ids[X],
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "cancelled"))
+        die("nodereplace: --cancel failed: %s", out);
+    {
+        struct view vw;
+        view(curR, &vw);
+        const struct meta_member *xm = meta_member(&vw.m, ids[X]);
+        if (!xm || xm->replaced_by != 0 || xm->hold_until_ms != 0)
+            die("nodereplace: --cancel left replaced_by=%u hold=%" PRIu64, xm ? xm->replaced_by : 0,
+                xm ? xm->hold_until_ms : 0);
+        view_free(&vw);
+    }
+    /* Start replace onto S1 again, then mark S1 OUT -> cnode_duty must clear replaced_by and release hold on X. */
+    snprintf(args, sizeof args, "cluster node replace %s %" PRIu32 " %" PRIu32 " --secret-file %s", pR, ids[X], ids[S1],
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("nodereplace: replace onto S1 for target-OUT abandon check failed: %s", out);
+    snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", pR, ids[S1], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("nodereplace: node out S1 failed: %s", out);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct view vw;
+        view(curR, &vw);
+        const struct meta_member *xm = meta_member(&vw.m, ids[X]);
+        int ok = xm && xm->replaced_by == 0 && xm->hold_until_ms == 0;
+        view_free(&vw);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("nodereplace: cnode_duty did not abandon replace & release hold after target S1 went OUT");
+    }
+    epoll_after_two = 0;
+    printf("  nodereplace: dead node %" PRIu32 " replaced directly onto node %" PRIu32
+           " across Raft leader restart (0 unrelated positions moved, OLD now OUT, --cancel & target-OUT abandon ok)\n",
+           ids[OLD], ids[NEW]);
+}
+
+/* nodedestroyed (r9-ops): `tsdb cluster node destroyed` is refused on UP and DOWN members, succeeds on OUT (final:
+ * restarted server cannot return UP), and destroying m+1=3 stripe holders of ec=4+2 marks the volume LOST in OP_STATUS
+ * and makes settled reads fail immediately with TSDB_ERR_UNAVAILABLE / TSDB_WHY_LOST (no retry). */
+static void scen_nodedestroyed(void)
+{
+    scenario("nodedestroyed");
+    init_voters = 3; /* nodes 0..2 are the 3 voters; watchers 3..5 can all be destroyed while Raft keeps quorum */
+    epoll_after_two = 1;
+    static char cold[PATH_MAX + 96], pe[PATH_MAX + 128];
+    snprintf(cold, sizeof cold, "%s/cold-hook", base);
+    snprintf(pe, sizeof pe, "TSDBD_TEST_COLD=%s", cold);
+    /* Only "reads" in cold-hook (NO "destroyed ..." line!): LOST must come purely from real META_DESTROYED! */
+    cold_file(cold, "reads\n");
+    for (int i = 0; i < 6; i++) {
+        penv[i] = pe;
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters of 6 before nodedestroyed");
+    struct view v0;
+    view(0, &v0);
+    uint8_t uuid[16];
+    memcpy(uuid, v0.m.uuid, 16);
+    view_free(&v0);
+    static char xa[6][PATH_MAX + 128];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/nd%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned six = 6;
+    await_view(0, p_n_placeable, &six, "6 members UP for nodedestroyed");
+
+    uint32_t num = 0;
+    char etxt[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "nd42", 0, 4, 2, &num, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("nodedestroyed: ec=4+2 add: %s (%s)", cluster_strerror(rc), etxt);
+    struct meta_volume ev;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "nd42", &ev); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("nodedestroyed: no record of nd42");
+    for (uint32_t k = 0; k < ev.nrep; k++)
+        await_open_gen(0, "nd42", server_of(ev.rep[k].node), 1, 0);
+    await_isr(0, "nd42", 3, 15000, "nd42 ISR 3");
+
+    /* Ensure the volume leader is one of the surviving voters 0..2 (transfer if it landed on 3..5). */
+    int L = server_of(ev.leader);
+    if (L >= 3) {
+        int dst = -1;
+        for (uint32_t k = 0; k < ev.nrep; k++) {
+            int s = server_of(ev.rep[k].node);
+            if (s >= 0 && s < 3) {
+                dst = s;
+                break;
+            }
+        }
+        if (dst >= 0) {
+            char p0[META_ADDR_MAX], args[PATH_MAX * 2 + 128], out[4096];
+            peer_of(0, p0, sizeof p0);
+            snprintf(args, sizeof args, "cluster volume transfer %s %" PRIu32 " %" PRIu32 " --secret-file %s", p0, num,
+                     ids[dst], secret_path);
+            if (cli_run(args, NULL, out, sizeof out) != 0)
+                die("nodedestroyed: transfer off watcher failed: %s", out);
+            L = dst;
+        }
+    }
+    tsdbc *c = client(L);
+    tsdbc_set_retry(c, 30000);
+    tsdb_sid sid = rep_series(c, "nd.s0", "nd42", 30000);
+
+    char p0[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[8192];
+    peer_of(0, p0, sizeof p0);
+
+    /* Refused on UP member 3. */
+    snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "not out"))
+        die("nodedestroyed: UP node not refused: %s", out);
+
+    /* Kill member 3 -> DOWN -> still refused on DOWN. */
+    stop(3, SIGKILL);
+    struct state_want d3 = {ids[3], META_DOWN, 0};
+    await_view(0, p_member_state, &d3, "node 4 DOWN");
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "not out"))
+        die("nodedestroyed: DOWN node not refused: %s", out);
+
+    /* Mark member 3 OUT, then DESTROYED -> succeeds; restarting member 3 cannot bring it back UP. */
+    snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0)
+        die("nodedestroyed: node out 4 failed: %s", out);
+    snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[3], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "declared destroyed"))
+        die("nodedestroyed: node destroyed 4 failed: %s", out);
+    if (member_state_of(leader_of(0), ids[3], NULL, NULL) != META_DESTROYED)
+        die("nodedestroyed: node 4 not META_DESTROYED");
+
+    start(3);
+    usleep(2500000);
+    if (member_state_of(leader_of(0), ids[3], NULL, NULL) != META_DESTROYED)
+        die("nodedestroyed: restarted destroyed node 4 left META_DESTROYED!");
+    stop(3, SIGKILL);
+
+    /* Destroy 2 more stripe holders (watchers 4 and 5) -> m+1 = 3 holders DESTROYED! */
+    for (int s = 4; s <= 5; s++) {
+        stop(s, SIGKILL);
+        snprintf(args, sizeof args, "cluster node out %s %" PRIu32 " --secret-file %s", p0, ids[s], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("nodedestroyed: node out %d failed: %s", s, out);
+        snprintf(args, sizeof args, "cluster node destroyed %s %" PRIu32 " --secret-file %s", p0, ids[s], secret_path);
+        if (cli_run(args, NULL, out, sizeof out) != 0)
+            die("nodedestroyed: node destroyed %d failed: %s", s, out);
+    }
+
+    /* Wait for L's metadata copy to show vol.1.tier=lost in OP_STATUS. */
+    char want_tier[64];
+    snprintf(want_tier, sizeof want_tier, "vol.%" PRIu32 ".tier=lost", num);
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        char *stxt = NULL;
+        int src = tsdbc_status(c, &stxt);
+        int ok = src == 0 && stxt && strstr(stxt, want_tier) != NULL;
+        free(stxt);
+        if (ok)
+            break;
+        if (now_ms() - t0 > 15000)
+            die("nodedestroyed: OP_STATUS never showed '%s'", want_tier);
+    }
+
+    /* Settled read fails immediately with TSDB_ERR_UNAVAILABLE / TSDB_WHY_LOST (not retried). */
+    tsdbc_set_retry(c, 30000);
+    uint64_t t0 = now_ms();
+    rc = tsdbc_query_raw(c, sid, 0, INT64_MAX, no_rows, NULL);
+    uint64_t took = now_ms() - t0;
+    tsdb_unavail u[4];
+    unsigned nu = 0;
+    if (rc != TSDB_ERR_UNAVAILABLE || tsdbc_unavailable(c, u, 4, &nu) != 0 || nu != 1 || u[0].reason != TSDB_WHY_LOST ||
+        u[0].vol != num || u[0].retry_after_ms != TSDB_RETRY_MAX_MS)
+        die("nodedestroyed: read of lost volume: %s nu=%u reason=%u vol=%u retry=%u", ers(rc), nu,
+            nu ? u[0].reason : 0, nu ? u[0].vol : 0, nu ? u[0].retry_after_ms : 0);
+    if (took > 1500)
+        die("nodedestroyed: read of lost volume retried (took %" PRIu64 " ms)", took);
+    tsdbc_close(c);
+    epoll_after_two = 0;
+    printf("  nodedestroyed: UP/DOWN refused, OUT -> DESTROYED final, 3 destroyed holders -> tier=lost and read "
+           "TSDB_WHY_LOST in %" PRIu64 " ms\n", took);
+}
+
+/* posmove (r9-ops): `tsdb cluster volume move PEER V --pos P --to N` moves stripe position P of an EC volume onto
+ * target N (FILLING, prev = old_holder, stripe_version + 1, shown in STATUS), and refuses non-EC volumes, invalid
+ * positions, targets already in the stripe, targets with no chunk stores, and positions already FILLING. */
+static void scen_posmove(void)
+{
+    scenario("posmove");
+    epoll_after_two = 1;
+    for (int i = 0; i < 8; i++) {
+        envs[i] = "stripe_whole_file=1";
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 8; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "5 voters of 8 before posmove");
+    struct view v0;
+    view(0, &v0);
+    uint8_t uuid[16];
+    memcpy(uuid, v0.m.uuid, 16);
+    view_free(&v0);
+    /* Give nodes 0..6 chunk stores; leave node 7 without a chunk store to test the no-chunk-stores refusal! */
+    static char xa[7][PATH_MAX + 128];
+    for (int i = 0; i < 7; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ps%d", base, i);
+        chunk_store_make(sd, uuid, ids[i]);
+        snprintf(xa[i], sizeof xa[i], "--chunk-dir %s", sd);
+        restart_xargs(i, xa[i]);
+    }
+    unsigned eight = 8;
+    await_view(0, p_n_placeable, &eight, "8 members UP for posmove");
+
+    uint32_t ecnum = 0, repnum = 0;
+    char etxt[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "pm42", 0, 4, 2, &ecnum, etxt, sizeof etxt)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("posmove: ec=4+2 add: %s (%s)", cluster_strerror(rc), etxt);
+    if (vol_add(0, "pmrep", 3, &repnum) != 0)
+        die("posmove: replicas=3 add failed");
+
+    struct meta_volume ev;
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "pm42", &ev); usleep(50000))
+        if (now_ms() - t0 > 15000)
+            die("posmove: no record of pm42");
+
+    int S = -1; /* the 7th storage server (0..6) not in pm42's stripe */
+    for (int i = 0; i < 7; i++) {
+        int in_s = 0;
+        for (uint32_t p = 0; p < ev.nstripe; p++)
+            in_s |= (ev.stripe[p] == ids[i]);
+        if (!in_s) {
+            S = i;
+            break;
+        }
+    }
+    if (S < 0)
+        die("posmove: could not find 7th storage server");
+    uint32_t old_holder = ev.stripe[0];
+    int NS = 7; /* node without a chunk store */
+
+    char p0[META_ADDR_MAX], p1[META_ADDR_MAX], args[PATH_MAX * 2 + 256], out[16384];
+    peer_of(0, p0, sizeof p0);
+    peer_of(1, p1, sizeof p1);
+
+    /* Refusals: non-EC volume, pos out of range, target already in stripe, target with no stores, unknown vol/node. */
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p1,
+             repnum, ids[S], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "not erasure-coded"))
+        die("posmove: non-EC not refused: %s", out);
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 6 --to %" PRIu32 " --secret-file %s", p0,
+             ecnum, ids[S], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "out of range"))
+        die("posmove: pos 6 not refused: %s", out);
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p0,
+             ecnum, ev.stripe[1], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "already holds"))
+        die("posmove: target already in stripe not refused: %s", out);
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p0,
+             ecnum, ids[NS], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "no chunk stores"))
+        die("posmove: target with no chunk stores not refused: %s", out);
+    snprintf(args, sizeof args, "cluster volume move %s 99 --pos 0 --to %" PRIu32 " --secret-file %s", p0, ids[S],
+             secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "does not exist"))
+        die("posmove: unknown volume not refused: %s", out);
+
+    /* Valid move via follower p1: pos 0 -> S (FILLING, prev = old_holder, stripe_version = 2). */
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p1,
+             ecnum, ids[S], secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, "moving from node") || !strstr(out, "filling"))
+        die("posmove: valid move failed: %s", out);
+
+    struct meta_volume ev2 = {0};
+    if (!vol_rec(leader_of(0), "pm42", &ev2) || ev2.stripe[0] != ids[S] ||
+        ev2.stripe_pos[0].state != META_STRIPE_FILLING || ev2.stripe_pos[0].prev != old_holder ||
+        ev2.stripe_version != 2)
+        die("posmove: unexpected record after move (holder=%u state=%u prev=%u ver=%" PRIu64 ")", ev2.stripe[0],
+            ev2.stripe_pos[0].state, ev2.stripe_pos[0].prev, ev2.stripe_version);
+
+    /* STATUS on the Raft leader prints the fill line immediately after commit. */
+    char pL[META_ADDR_MAX], want_fill[128];
+    peer_of(leader_of(0), pL, sizeof pL);
+    snprintf(want_fill, sizeof want_fill, "fill volume %" PRIu32 " pos 0 node %" PRIu32 " prev %" PRIu32 " version 2",
+             ecnum, ids[S], old_holder);
+    snprintf(args, sizeof args, "cluster status %s --secret-file %s", pL, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 0 || !strstr(out, want_fill))
+        die("posmove: STATUS missing '%s':\n%s", want_fill, out);
+
+    /* Moving pos 0 again while already FILLING is refused. */
+    snprintf(args, sizeof args, "cluster volume move %s %" PRIu32 " --pos 0 --to %" PRIu32 " --secret-file %s", p0,
+             ecnum, old_holder, secret_path);
+    if (cli_run(args, NULL, out, sizeof out) != 1 || !strstr(out, "already filling"))
+        die("posmove: move of already-FILLING pos not refused: %s", out);
+
+    epoll_after_two = 0;
+    printf("  posmove: vol %" PRIu32 " pos 0 moved %" PRIu32 " -> %" PRIu32 " (FILLING, ver 2); refusals and STATUS ok\n",
+           ecnum, old_holder, ids[S]);
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -24361,7 +25414,9 @@ int main(int argc, char **argv)
                {"replfault", scen_replfault}, {"pace", scen_pace},
                {"downkeep", scen_downkeep}, {"downbudget", scen_downbudget}, {"holdkeep", scen_holdkeep},
                {"outmove", scen_outmove}, {"ecout", scen_ecout}, {"metrics", scen_metrics},
-               {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild}};
+               {"full", scen_full}, {"fullnonisr", scen_fullnonisr}, {"ecrebuild", scen_ecrebuild},
+               {"nodehold", scen_nodehold}, {"nodeout", scen_nodeout}, {"nodedrain", scen_nodedrain},
+               {"nodereplace", scen_nodereplace}, {"nodedestroyed", scen_nodedestroyed}, {"posmove", scen_posmove}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

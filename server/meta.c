@@ -31,8 +31,9 @@
  * (R4: set_version, a replica's `replaces`, the last grant's target and end, rebuild_mb_s, rebuild_max,
  * transfer_wait_ms, leader_balance_s); 6: erasure-coded volumes (R8: redundancy, k, m, the stripe group and its version,
  * gc_suspended, gc_gen); 7: failure handling, holds, DESTROYED, stripe fill states and R9 settings (D2-D4, D9-D10,
- * D23). A preview cluster is initialised again, not upgraded (the plan's D9): an image of another version is refused,
- * and its reader names both (meta_snapshot_version). */
+ * D23); 8: member `replaced_by` for `node replace OLD NEW` failover resume (r9-ops, D22). A preview cluster is
+ * initialised again, not upgraded (the plan's D9): an image of another version is refused, and its reader names both
+ * (meta_snapshot_version). */
 #define SNAP_VERSION META_SNAP_VERSION
 
 /* tests/test_meta.c --mutant N plants bug N (MUT(n)) in a build with -DMETA_MUTANTS; the simulator and the unit tests
@@ -44,10 +45,11 @@ uint64_t meta_mutants;
 #define MUT(n) 0
 #endif
 
-#define ENTRY_MAGIC 0x34454d54u    /* "TME4": entries of snapshot version 7 (R9 grew INIT, MEMBER_STATE, STRIPE_SET) */
+#define ENTRY_MAGIC 0x35454d54u    /* "TME5": entries of snapshot version 8 (r9-ops grew INIT/MEMBER_ADD with replaced_by) */
 #define ENTRY_MAGIC_V1 0x31454d54u /* "TME1": entries of the builds of versions 1-4, refused by name */
 #define ENTRY_MAGIC_V2 0x32454d54u /* "TME2": entries of the builds of version 5, refused by name */
 #define ENTRY_MAGIC_V3 0x33454d54u /* "TME3": entries of the builds of version 6, refused by name */
+#define ENTRY_MAGIC_V4 0x34454d54u /* "TME4": entries of the builds of version 7, refused by name */
 #define SNAP_MAGIC 0x31534d54u     /* "TMS1" */
 
 uint32_t iso_crc32c(uint32_t crc, const void *buf, size_t len); /* src/raft/compat.c */
@@ -757,6 +759,7 @@ static void put_member(struct wr *w, const struct meta_member *mb)
     put64(w, mb->down_clock_ms);
     put64(w, mb->hold_until_ms);
     put64(w, mb->hold_clock_ms);
+    put32(w, MUT(60) ? 0u : mb->replaced_by); /* replacenosnap */
 }
 
 static void get_member(struct rd *r, struct meta_member *mb)
@@ -777,6 +780,7 @@ static void get_member(struct rd *r, struct meta_member *mb)
     mb->down_clock_ms = get64(r);
     mb->hold_until_ms = get64(r);
     mb->hold_clock_ms = get64(r);
+    mb->replaced_by = get32(r);
     if (mb->state > META_DESTROYED || (mb->flags & ~META_MF_ALL) || mb->down_reason > META_DOWN_LAST)
         r->bad = 1;
 }
@@ -897,6 +901,15 @@ void meta_op_node_hold(struct meta_entry *e, uint32_t id, uint64_t until_ms, uin
     put32(&w, id);
     put64(&w, until_ms);
     put64(&w, op_clock_ms);
+    op_end(e, st);
+}
+
+void meta_op_node_replace(struct meta_entry *e, uint32_t old_node, uint32_t new_node)
+{
+    struct wr w;
+    size_t st = op_begin(e, &w, META_OP_NODE_REPLACE);
+    put32(&w, old_node);
+    put32(&w, new_node);
     op_end(e, st);
 }
 
@@ -1346,6 +1359,7 @@ static int insert_member(struct meta_state *m, const struct meta_member *mb)
     m->members[pos].down_clock_ms = 0;
     m->members[pos].hold_until_ms = 0;
     m->members[pos].hold_clock_ms = 0;
+    m->members[pos].replaced_by = 0;
     m->nmembers++;
     m->next_member = mb->id + 1;
     return META_OK;
@@ -1640,6 +1654,8 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
                 mb->hold_until_ms = 0;
                 mb->hold_clock_ms = 0;
             }
+            if (st == META_DESTROYED && !MUT(61)) /* destroyedkeepreplace */
+                mb->replaced_by = 0;
         }
         return META_OK;
     }
@@ -1664,6 +1680,50 @@ static int apply_op(struct meta_state *m, uint8_t kind, struct rd *r, uint32_t *
             return META_ERR_INVALID; /* holdunbounded: skips the 24 h bound (D3, E12) */
         mb->hold_until_ms = until_ms;
         mb->hold_clock_ms = op_clock_ms;
+        return META_OK;
+    }
+    case META_OP_NODE_REPLACE: {
+        uint32_t id = get32(r);
+        uint32_t target = get32(r);
+        if (r->bad)
+            return META_ERR_FORMAT;
+        int32_t at = member_at(m, id);
+        if (at < 0)
+            return META_ERR_NOTFOUND;
+        struct meta_member *mb = &m->members[at];
+        if (mb->state == META_DESTROYED)
+            return META_ERR_STATE;
+        if (target == 0) {
+            mb->replaced_by = 0;
+            return META_OK;
+        }
+        if (target == id)
+            return META_ERR_INVALID;
+        const struct meta_member *nt = meta_member(m, target);
+        if (!nt)
+            return META_ERR_NOTFOUND;
+        if (nt->state >= META_OUT)
+            return META_ERR_STATE;
+        /* Re-check at apply time so a concurrent volume placement cannot stall the forced replace target. */
+        for (uint32_t i = 0; i < m->nvolumes; i++) {
+            const struct meta_volume *v = &m->volumes[i];
+            int old_holds = meta_replica(v, id) != NULL;
+            if (!old_holds && v->redundancy == META_RED_EC) {
+                for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++)
+                    if (v->stripe[p] == id)
+                        old_holds = 1;
+            }
+            if (!old_holds)
+                continue;
+            if (meta_replica(v, target) != NULL)
+                return META_ERR_INVALID;
+            if (v->redundancy == META_RED_EC) {
+                for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++)
+                    if (v->stripe[p] == target)
+                        return META_ERR_INVALID;
+            }
+        }
+        mb->replaced_by = target;
         return META_OK;
     }
     case META_OP_MEMBER_FLAGS: {
@@ -2470,7 +2530,9 @@ int meta_entry_older(const void *data, size_t len)
 {
     struct rd r = {data, len, 0, 0};
     uint32_t magic = get32(&r);
-    return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3) && !r.bad;
+    return (magic == ENTRY_MAGIC_V1 || magic == ENTRY_MAGIC_V2 || magic == ENTRY_MAGIC_V3 ||
+            magic == ENTRY_MAGIC_V4) &&
+           !r.bad;
 }
 
 int meta_apply(struct meta_state *m, uint64_t index, uint64_t term, const void *data, size_t len, int *res,
@@ -2780,6 +2842,12 @@ static int decode_body(struct rd *r, struct meta_state *m)
                               : (mb->hold_clock_ms != 0))
             r->bad = 1;
         m->nmembers = i + 1;
+    }
+    for (uint32_t i = 0; i < m->nmembers && !r->bad; i++) {
+        const struct meta_member *mb = &m->members[i];
+        if (mb->replaced_by &&
+            (mb->replaced_by == mb->id || mb->state == META_DESTROYED || !meta_member(m, mb->replaced_by)))
+            r->bad = 1;
     }
     m->next_volume = get32(r);
     n = get32(r);
@@ -3308,6 +3376,14 @@ int meta_check_step(const struct meta_state *prev, const struct meta_state *next
                      (unsigned long long)b->hold_until_ms, (unsigned long long)b->hold_clock_ms);
         } else if (b->hold_clock_ms) {
             FAIL("member %u: hold_clock set without hold_until", b->id);
+        }
+        if (b->replaced_by) {
+            if (b->replaced_by == b->id)
+                FAIL("member %u: replaced_by names itself", b->id);
+            if (b->state == META_DESTROYED)
+                FAIL("member %u: DESTROYED with replaced_by %u", b->id, b->replaced_by);
+            if (!meta_member(next, b->replaced_by))
+                FAIL("member %u: replaced_by unknown member %u", b->id, b->replaced_by);
         }
     }
     if (next->next_member < prev->next_member || next->next_volume < prev->next_volume)

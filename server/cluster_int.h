@@ -29,6 +29,16 @@ const struct meta_state *cl_meta(void);
 int cl_heard_fresh(uint32_t id, uint64_t now);
 /* proposes `e` to the group (the leader only): 0 queued (applied later, through the watch), else CLUSTER_ERR_RETRY */
 int cl_propose(struct meta_entry *e);
+/* proposes `e` (and frees it) on behalf of an admin op: once applied, replies to (conn, reqid) with ok_text (if rc0 == 0)
+ * or rc0/CLUSTER_ERR_RETRY; `member` (0: none) registers with pend_member. 0 if queued (caller does not reply), else
+ * CLUSTER_ERR_RETRY (already replied). */
+int cl_propose_reply(struct meta_entry *e, uint64_t conn, uint32_t reqid, uint32_t member, const char *ok_text);
+/* proposer's wall-clock time in ms (CLOCK_REALTIME, >= 1) */
+uint64_t cl_wall_ms(void);
+/* 1 if a proposal for member `id` is already in flight on this Raft leader */
+int cl_pend_member(uint32_t id);
+/* number of chunk stores currently UP on member `id` as last reported in HBS_STORES (0 if none/unknown) */
+uint32_t cl_member_chunk_stores(uint32_t id);
 /* the answer to an admin op (conn and reqid as the op's entry point got them) */
 void cl_admin_reply(uint64_t conn, uint32_t reqid, int32_t rc, const void *body, size_t len);
 /* sends a VOLCMD to member `node` (to this server's own handler when it is this server): 0, or -1 with no connection
@@ -92,5 +102,7 @@ void cnode_drain_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_
 void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cnode_destroyed_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+/* once-per-second Raft leader duty: DRAINING -> OUT when empty, and node replace completion (r9-ops) */
+void cnode_duty(uint64_t now);
 
 #endif

@@ -526,6 +526,7 @@ void cluster_status_free(struct cluster_status *st)
         free(st->heard[i].vols);
         free(st->heard[i].doms);
         free(st->heard[i].sections);
+        free(st->heard[i].fills);
     }
     free(st->heard);
     st->heard = NULL;
@@ -633,6 +634,26 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
             h->sections[slen] = '\0';
             r.off += slen;
         }
+        h->nfills = get32(&r);
+        if (r.bad || h->nfills > CLUSTER_REPORT_FILLS) {
+            r.bad = 1;
+            break;
+        }
+        if (h->nfills) {
+            h->fills = calloc(h->nfills, sizeof *h->fills);
+            if (!h->fills) {
+                r.bad = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < h->nfills; j++) {
+                h->fills[j].volume = get32(&r);
+                h->fills[j].pos = get32(&r);
+                h->fills[j].version = get64(&r);
+                h->fills[j].done = get64(&r);
+                h->fills[j].total = get64(&r);
+                h->fills[j].whole = get8(&r);
+            }
+        }
     }
     st->users_caught_up = r.bad ? 0 : get8(&r);
     st->ntr = r.bad ? 0 : get32(&r);
@@ -644,6 +665,7 @@ int cluster_status_parse(const uint8_t *body, size_t len, struct cluster_status 
         getstr(&r, st->moves, sizeof st->moves);
     if (!r.bad)
         getstr(&r, st->links, sizeof st->links);
+    st->wall_ms = r.bad ? 0 : get64(&r);
     uint32_t il = r.bad ? 0 : get32(&r);
     if (r.bad || r.len - r.off != il) {
         cluster_status_free(st);
@@ -1031,6 +1053,7 @@ struct pend {
     uint32_t volume; /* a VOLUME_ADD: its number + 1, the reply's body once committed (0: none) */
     struct upend *user; /* a USER_PUT or USER_DEL (malloc'ed; NULL: none) */
     int is_out;      /* 1 for an automatic MEMBER_STATE OUT proposal (fires CP_OUT_PROPOSED on commit) */
+    char *text;      /* optional reply text sent on rc == 0 (malloc'ed; NULL: empty body; r9-ops) */
 };
 
 /* A user op's pending reply (S2-1): once applied it waits in C.uwait until every member reported an applied index at
@@ -1144,6 +1167,7 @@ static struct {
     uint64_t pend_join; /* set around propose() by a NODE_ADD: the new server's link (struct pend) */
     uint32_t pend_volume; /* set around propose() by a VOLUME_ADD: its number + 1 (struct pend) */
     struct upend *pend_user; /* set around propose() by a USER_PUT or USER_DEL (struct pend owns it after) */
+    char *pend_text;         /* set around propose() by cl_propose_reply (struct pend owns it after) */
     struct uwait *uwait;     /* applied user ops waiting for the members (users_duty) */
     size_t nuwait, capuwait;
     uint64_t users_floor;    /* a Raft leader's commit index heard in this run (cluster_users_caught_up); 0: none */
@@ -1224,8 +1248,10 @@ static struct {
     char hbopeningfile[1100];
     int hb_failstop_file; /* TSDB_CLUSTER_TEST hb_failstop_file=1: HBS_NODE.failstop=1 while <state-dir>/hbfailstop exists */
     char hbfailstopfile[1100];
-    int node_hold_file;   /* TSDB_CLUSTER_TEST node_hold_file=1: leader proposes NODE_HOLD lines in <state-dir>/nodehold */
+    int node_hold_file;    /* TSDB_CLUSTER_TEST node_hold_file=1: leader proposes NODE_HOLD lines in <state-dir>/nodehold */
     char nodeholdfile[1100];
+    int stripe_whole_file; /* TSDB_CLUSTER_TEST stripe_whole_file=1: leader proposes STRIPE_WHOLE lines in <state-dir>/stripewhole */
+    char stripewholefile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1601,6 +1627,8 @@ static void test_knobs(void)
             C.hb_failstop_file = v != 0;
         else if (sscanf(p, "node_hold_file=%llu", &v) == 1)
             C.node_hold_file = v != 0;
+        else if (sscanf(p, "stripe_whole_file=%llu", &v) == 1)
+            C.stripe_whole_file = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -2401,7 +2429,9 @@ int cluster_copy_vol_owner(const struct cluster_copy *c, uint32_t vol, uint32_t 
 {
     const struct cluster_copy_vol *v = cluster_copy_vol(c, vol);
     const struct cluster_copy_member *m = v && v->leader ? cluster_copy_member(c, v->leader) : NULL;
-    int ok = m && m->state == META_UP ? (c->self && m->id == c->self && cl_mutant() != CLM_OWNERSELF ? 2 : 1) : 0;
+    int ok = m && (m->state == META_UP || m->state == META_DRAINING)
+                 ? (c->self && m->id == c->self && cl_mutant() != CLM_OWNERSELF ? 2 : 1)
+                 : 0;
     if (ok) {
         if (node)
             *node = m->id;
@@ -3020,8 +3050,10 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume, C.pend_user, is_out};
+    C.pend[C.npend++] =
+        (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume, C.pend_user, is_out, C.pend_text};
     C.pend_user = NULL;
+    C.pend_text = NULL;
 }
 
 static void send_join(struct conn *d, uint32_t id);
@@ -3066,8 +3098,12 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
                 uint8_t nb[4] = {(uint8_t)(p->volume - 1), (uint8_t)((p->volume - 1) >> 8),
                                  (uint8_t)((p->volume - 1) >> 16), (uint8_t)((p->volume - 1) >> 24)};
                 admin_reply(p->conn, p->reqid, 0, nb, 4);
-            } else if (p->conn)
-                admin_reply(p->conn, p->reqid, p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc, NULL, 0);
+            } else if (p->conn) {
+                int rcode = p->join && rc == 0 ? CLUSTER_ERR_UNREACHABLE : rc;
+                const char *txt = rcode == 0 ? p->text : NULL;
+                admin_reply(p->conn, p->reqid, rcode, txt, txt ? strlen(txt) : 0);
+            }
+            free(p->text);
             if (d && rc != 0)
                 d->dead = 1;
             C.pend[i] = C.pend[--C.npend];
@@ -3195,16 +3231,24 @@ static void state_replaced(void)
 static void apply_entry(struct meta_state *m, int own, uint64_t index, uint64_t term, uint8_t type, const void *data,
                         uint32_t len)
 {
+    int rcs[8];
+    for (size_t i = 0; i < sizeof rcs / sizeof rcs[0]; i++)
+        rcs[i] = META_OK;
     int rc0 = CLUSTER_ERR_RETRY;
     if (type == RAFT_ENTRY_NORMAL) {
-        if (meta_apply(m, index, term, data, len, &rc0, 1) != META_OK) {
+        if (meta_apply(m, index, term, data, len, rcs, sizeof rcs / sizeof rcs[0]) != META_OK) {
             if (meta_entry_older(data, len)) /* a preview cluster is initialised again, never upgraded */
-                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 5 "
+                fail_stop("entry %" PRIu64 " (term %" PRIu64 ") was written by a build of metadata snapshot version 7 "
                           "or older and this build reads version %d: the cluster was made by another build; "
                           "initialise it again (docs/cluster-preview.md)", index, term, META_SNAP_VERSION);
             fail_stop("entry %" PRIu64 " (term %" PRIu64 ") does not decode: this build cannot apply it", index,
                       term);
         }
+        rc0 = rcs[0];
+        if (own && rc0 == META_OK && C.r && raft_get_role(C.r) == RAFT_LEADER)
+            for (size_t i = 1; i < sizeof rcs / sizeof rcs[0]; i++)
+                if (rcs[i] != META_OK)
+                    say("entry %" PRIu64 " secondary op %zu refused: %s", index, i, meta_strerror(rcs[i]));
     } else {
         meta_apply_other(m, index, term, type == RAFT_ENTRY_CONFIG ? data : NULL,
                          type == RAFT_ENTRY_CONFIG ? len : 0);
@@ -3995,6 +4039,7 @@ static void core_stop(struct meta_state *next)
         if (C.pend[i].conn)
             admin_reply(C.pend[i].conn, C.pend[i].reqid, CLUSTER_ERR_RETRY, NULL, 0);
         free(C.pend[i].user);
+        free(C.pend[i].text);
     }
     C.npend = 0;
     close_watches();
@@ -4398,6 +4443,16 @@ static void put_heard_extra(struct buf *b, const struct heard *h, uint64_t now, 
     if (h)
         creport_heard_format(&h->ext, h->id, secbuf, sizeof secbuf);
     putstr(b, secbuf);
+    put32(b, h ? h->nfills : 0);
+    for (uint32_t i = 0; h && i < h->nfills; i++) {
+        const struct cluster_fill_report *f = &h->fills[i];
+        put32(b, f->volume);
+        put32(b, f->pos);
+        put64(b, f->version);
+        put64(b, f->done);
+        put64(b, f->total);
+        put8(b, f->whole);
+    }
 }
 
 static _Atomic(cluster_drv_counts_fn) g_drv_counts;
@@ -4454,6 +4509,7 @@ static void put_status(struct buf *b)
     char lk[sizeof ((struct cluster_status *)0)->links];
     peerlink_links_status(lk, sizeof lk); /* 8 lines of at most ~70 bytes: never cut */
     putstr(b, lk);
+    put64(b, cl_wall_ms());
     if (S->applied || S->config_len) {
         uint8_t *img;
         size_t len;
@@ -4562,6 +4618,32 @@ int cluster_node_op_decode(const uint8_t *p, size_t n, uint32_t *node)
     return 0;
 }
 
+size_t cluster_node_drain_encode(uint32_t node, uint32_t flags, uint8_t *out)
+{
+    for (int j = 0; j < 4; j++)
+        out[j] = (uint8_t)(node >> (8 * j));
+    if (!flags)
+        return 4;
+    for (int j = 0; j < 4; j++)
+        out[4 + j] = (uint8_t)(flags >> (8 * j));
+    return 8;
+}
+
+int cluster_node_drain_decode(const uint8_t *p, size_t n, uint32_t *node, uint32_t *flags)
+{
+    if (n == 4) {
+        *node = le32(p);
+        *flags = 0;
+        return 0;
+    }
+    if (n == 8) {
+        *node = le32(p);
+        *flags = le32(p + 4);
+        return 0;
+    }
+    return -1;
+}
+
 size_t cluster_node_hold_encode(uint32_t node, uint32_t for_s, uint32_t flags, uint8_t *out)
 {
     uint32_t v[3] = {node, for_s, flags};
@@ -4589,6 +4671,32 @@ size_t cluster_node_replace_encode(uint32_t old_node, uint32_t new_node, uint8_t
 int cluster_node_replace_decode(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node)
 {
     return cluster_volume_force_decode(p, n, old_node, new_node);
+}
+
+size_t cluster_node_replace_cancel_encode(uint32_t old_node, uint8_t *out)
+{
+    uint32_t v[3] = {old_node, 0, CLUSTER_REPLACE_CANCEL};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = (uint8_t)(v[i] >> (8 * j));
+    return 12;
+}
+
+int cluster_node_replace_decode_ex(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node, uint32_t *flags)
+{
+    if (n == 8) {
+        *old_node = le32(p);
+        *new_node = le32(p + 4);
+        *flags = 0;
+        return 0;
+    }
+    if (n == 12) {
+        *old_node = le32(p);
+        *new_node = le32(p + 4);
+        *flags = le32(p + 8);
+        return 0;
+    }
+    return -1;
 }
 
 size_t cluster_volume_move_pos_encode(uint32_t volume, uint32_t pos, uint32_t to, uint8_t *out)
@@ -4695,11 +4803,33 @@ static struct place_member *build_place_members(uint64_t now, uint32_t *nm_out, 
     return pm;
 }
 
+/* Collect active `node replace OLD NEW` intents from metadata (member.replaced_by != 0) for place_in.replaces[]. */
+static struct place_replace *build_place_replaces(uint32_t *nr_out)
+{
+    *nr_out = 0;
+    uint32_t nr = 0;
+    for (uint32_t i = 0; i < C.sm.nmembers; i++)
+        if (C.sm.members[i].replaced_by)
+            nr++;
+    if (!nr)
+        return NULL;
+    struct place_replace *pr = calloc(nr, sizeof *pr);
+    if (!pr)
+        oom();
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < C.sm.nmembers; i++)
+        if (C.sm.members[i].replaced_by)
+            pr[k++] = (struct place_replace){.old_node = C.sm.members[i].id, .new_node = C.sm.members[i].replaced_by};
+    *nr_out = k;
+    return pr;
+}
+
 /* Initial log-replica placement for VOLUME_ADD: delegates to pure server/place.c (r9-plan). */
 static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
 {
-    uint32_t nm = 0;
+    uint32_t nm = 0, nr = 0;
     struct place_member *pm = build_place_members(now, &nm, NULL, NULL);
+    struct place_replace *pr = build_place_replaces(&nr);
     struct place_in in = {
         .sm = &C.sm,
         .members = pm,
@@ -4707,9 +4837,12 @@ static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
         .mono_ms = now / MS,
         .self_id = C.id,
         .mutant = place_mutant_env(),
+        .replaces = pr,
+        .nreplaces = nr,
     };
     place_settings_default(&in.set);
     int rc = place_volume(&in, n, nodes);
+    free(pr);
     free(pm);
     return rc;
 }
@@ -4717,8 +4850,9 @@ static int cl_place_volume(uint32_t n, uint64_t now, uint32_t *nodes)
 /* Initial EC stripe-group placement for VOLUME_ADD_EC: delegates to pure server/place.c (r9-plan, E9, D20). */
 static int cl_place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t *qualify)
 {
-    uint32_t nm = 0;
+    uint32_t nm = 0, nr = 0;
     struct place_member *pm = build_place_members(now, &nm, NULL, NULL);
+    struct place_replace *pr = build_place_replaces(&nr);
     struct place_in in = {
         .sm = &C.sm,
         .members = pm,
@@ -4726,9 +4860,12 @@ static int cl_place_stripe(uint32_t ns, uint64_t now, uint32_t *stripe, uint32_t
         .mono_ms = now / MS,
         .self_id = C.id,
         .mutant = place_mutant_env(),
+        .replaces = pr,
+        .nreplaces = nr,
     };
     place_settings_default(&in.set);
     int rc = place_stripe(&in, ns, stripe, qualify);
+    free(pr);
     free(pm);
     return rc;
 }
@@ -6591,7 +6728,7 @@ static void member_states(uint64_t now)
         return;
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct meta_member *m = &C.sm.members[i];
-        if (m->state == META_DESTROYED || m->state == META_DRAINING || pend_member(m->id))
+        if (m->state == META_DESTROYED || pend_member(m->id))
             continue;
         uint64_t last = heard_ns(m->id, now);
         struct heard *h = heard_get(m->id);
@@ -6622,24 +6759,33 @@ static void member_states(uint64_t now)
             continue;
         }
         /* A DOWN member that restarted while still opening gets its new incarnation recorded immediately (still
-         * META_DOWN, preserving down_since_ms) so vol_watch_duty unblocks volume opens while opening_hold_s stays
-         * bounded; once opening clears it becomes META_UP. */
+         * META_DOWN, preserving down_since_ms and down_reason including META_DOWN_DRAIN) so vol_watch_duty unblocks
+         * volume opens while opening_hold_s stays bounded; once opening clears it returns UP (or DRAINING if down for
+         * drain). A DRAINING member that restarts gets its new incarnation recorded while staying DRAINING. */
         int down_opening_inc = st == META_DOWN && alive && is_opening && inc > minc;
         int comes_back = alive && inc >= minc &&
-                         ((st == META_DOWN && !is_opening) || (st == META_UP && inc > minc));
+                         ((st == META_DOWN && !is_opening) ||
+                          ((st == META_UP || st == META_DRAINING) && inc > minc));
+        int back_st = (st == META_DRAINING || (st == META_DOWN && m->down_reason == META_DOWN_DRAIN))
+                          ? META_DRAINING
+                          : META_UP;
         if (!settled && !comes_back && !down_opening_inc && !fs)
             continue;
         if (down_opening_inc)
             propose_member_r(id, META_DOWN, inc, keep_reason, keep_since, moved, now);
-        else if (fs && (st == META_UP || (st == META_DOWN && (m->down_reason != META_DOWN_FAILSTOP || inc > minc))))
+        else if (fs && (st == META_UP || st == META_DRAINING ||
+                        (st == META_DOWN && (m->down_reason != META_DOWN_FAILSTOP || inc > minc))))
             /* R9 (D5): a fresh failstop=1 last-gasp beat marks the member DOWN/failstop immediately; promo_step
              * continues to hold volume promotions until promote_safe_ns(id) expires. */
             propose_member_r(id, META_DOWN, inc, META_DOWN_FAILSTOP, st == META_DOWN && inc == minc ? keep_since : 0,
                              NULL, now);
-        else if (st == META_UP && !fresh && lease_safe)
-            propose_member_r(id, META_DOWN, minc, is_failstop ? META_DOWN_FAILSTOP : META_DOWN_TIMEOUT, 0, NULL, now);
+        else if ((st == META_UP || st == META_DRAINING) && !fresh && lease_safe)
+            propose_member_r(id, META_DOWN, minc,
+                             is_failstop ? META_DOWN_FAILSTOP
+                                         : (st == META_DRAINING ? META_DOWN_DRAIN : META_DOWN_TIMEOUT),
+                             0, NULL, now);
         else if (comes_back)
-            propose_member_r(id, META_UP, inc, META_DOWN_NONE, 0, moved, now);
+            propose_member_r(id, back_st, inc, META_DOWN_NONE, 0, moved, now);
         else if (moved)
             propose_member_r(id, -1, inc, META_DOWN_NONE, 0, moved, now);
         else if (fresh && !fs && h && h->have_flags && inc >= minc && h->flags != m->flags &&
@@ -6841,7 +6987,7 @@ static void vol_watch_duty(void)
             r->no_owner = 1;
             for (uint32_t j = 0; j < v->nisr; j++) {
                 const struct meta_member *im = meta_member(&C.sm, v->isr[j]);
-                if (im && im->state == META_UP)
+                if (im && (im->state == META_UP || im->state == META_DRAINING))
                     r->no_owner = 0;
             }
             r->min_isr = v->min_isr;
@@ -7714,7 +7860,8 @@ static void promote_duty(uint64_t now)
             uint8_t reason = 0;
             if (m && m->state == META_DOWN)
                 reason = META_GR_UNHEARD;
-            else if (m && m->state >= META_OUT && psettled && !heard_fresh(v->leader, now) &&
+            else if (m && (m->state == META_DRAINING || m->state >= META_OUT) && psettled &&
+                     !heard_fresh(v->leader, now) &&
                      (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(v->leader)))
                 reason = META_GR_UNHEARD;
             else if (vol_reports_fault(v->leader, v))
@@ -7772,6 +7919,29 @@ static void node_hold_file_propose(void)
     fclose(f);
     unlink(C.nodeholdfile);
 }
+
+/* TSDB_CLUSTER_TEST stripe_whole_file=1: the Raft leader proposes STRIPE_WHOLE lines ("VOL POS VER") from
+ * <state-dir>/stripewhole and removes the file (test_cluster nodedrain until r9-fill/r9-whole auto-commit). */
+static void stripe_whole_file_propose(void)
+{
+    FILE *f = fopen(C.stripewholefile, "r");
+    if (!f)
+        return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long vol = 0, pos = 0;
+        unsigned long long ver = 0;
+        if (sscanf(line, "%lu %lu %llu", &vol, &pos, &ver) != 3)
+            continue;
+        struct meta_entry e;
+        meta_entry_init(&e);
+        meta_op_stripe_whole(&e, (uint32_t)vol, (uint32_t)pos, (uint64_t)ver);
+        (void)propose(&e, 0, 0, 0);
+        say("stripewhole vol %lu pos %lu ver %llu: proposed", vol, pos, ver);
+    }
+    fclose(f);
+    unlink(C.stripewholefile);
+}
 #endif
 
 /* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
@@ -7785,9 +7955,10 @@ static void place_duty(uint64_t now)
     uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
                            ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
                            : now / MS;
-    uint32_t nm = 0, nf = 0;
+    uint32_t nm = 0, nf = 0, nr = 0;
     struct place_fill *pf = NULL;
     struct place_member *pm = build_place_members(now, &nm, &pf, &nf);
+    struct place_replace *pr = build_place_replaces(&nr);
     struct place_in in = {
         .sm = &C.sm,
         .members = pm,
@@ -7798,6 +7969,8 @@ static void place_duty(uint64_t now)
         .mono_ms = now / MS,
         .self_id = C.id,
         .mutant = place_mutant_env(),
+        .replaces = pr,
+        .nreplaces = nr,
     };
     place_settings_default(&in.set);
     in.set.rebuild_after_s = C.sm.set.rebuild_after_s;
@@ -7837,8 +8010,9 @@ static void place_duty(uint64_t now)
             if (!mb)
                 continue;
             if (p->state == META_DOWN) {
-                /* Lease safety: never mark an UP member DOWN before promote_safe_ns (same rule as member_states). */
-                if (mb->state == META_UP && cl_mutant() != CLM_NOPROMOTEWAIT && now < promote_safe_ns(p->node))
+                /* Lease safety: never mark an UP/DRAINING member DOWN before promote_safe_ns (same rule as member_states). */
+                if ((mb->state == META_UP || mb->state == META_DRAINING) && cl_mutant() != CLM_NOPROMOTEWAIT &&
+                    now < promote_safe_ns(p->node))
                     continue;
                 struct heard *hm = heard_get(p->node);
                 if (hm && hm->inc != mb->incarnation)
@@ -7880,6 +8054,10 @@ static void place_duty(uint64_t now)
             meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->reason, p->other_node, p->version);
             (void)propose(&e, 0, 0, 0);
         } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
+#ifdef TSDB_TEST_HOOKS
+            if (C.stripe_whole_file)
+                continue; /* test drives STRIPE_WHOLE explicitly via <state-dir>/stripewhole */
+#endif
             struct meta_entry e;
             meta_entry_init(&e);
             meta_op_stripe_whole(&e, p->volume, p->pos, p->version);
@@ -7892,8 +8070,10 @@ static void place_duty(uint64_t now)
     memcpy(defer_last, defer_next, ndefer_next * sizeof defer_last[0]);
     ndefer_last = ndefer_next;
     place_out_free(&out);
+    free(pr);
     free(pf);
     free(pm);
+    cnode_duty(now);
 }
 
 static void leader_duties(uint64_t now)
@@ -7930,6 +8110,8 @@ static void leader_duties(uint64_t now)
 #ifdef TSDB_TEST_HOOKS
     if (C.node_hold_file && cl_leading())
         node_hold_file_propose();
+    if (C.stripe_whole_file && cl_leading())
+        stripe_whole_file_propose();
 #endif
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
@@ -8296,6 +8478,7 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.hbopeningfile, sizeof C.hbopeningfile, "%s/hbopening", C.metadir);
     snprintf(C.hbfailstopfile, sizeof C.hbfailstopfile, "%s/hbfailstop", C.metadir);
     snprintf(C.nodeholdfile, sizeof C.nodeholdfile, "%s/nodehold", C.metadir);
+    snprintf(C.stripewholefile, sizeof C.stripewholefile, "%s/stripewhole", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     snprintf(C.fillpctfile, sizeof C.fillpctfile, "%s/fillpct", C.metadir);
     test_knobs();
@@ -8553,7 +8736,12 @@ void cluster_stop(void)
     g_cm_valid = 0;
     pthread_mutex_unlock(&g_cm_mu);
     free(C.addrs);
+    for (size_t i = 0; i < C.npend; i++) {
+        free(C.pend[i].user);
+        free(C.pend[i].text);
+    }
     free(C.pend);
+    free(C.pend_text);
     buf_free(&C.fb);
     close(C.lfd);
     close(C.stop_pipe[0]);
@@ -8595,6 +8783,42 @@ const struct meta_state *cl_meta(void) { return &C.sm; }
 int cl_heard_fresh(uint32_t id, uint64_t now) { return heard_fresh(id, now); }
 
 int cl_propose(struct meta_entry *e) { return propose(e, 0, 0, 0) == ISO_OK ? 0 : CLUSTER_ERR_RETRY; }
+
+int cl_propose_reply(struct meta_entry *e, uint64_t conn, uint32_t reqid, uint32_t member, const char *ok_text)
+{
+    free(C.pend_text);
+    C.pend_text = NULL;
+    if (ok_text && *ok_text) {
+        C.pend_text = strdup(ok_text);
+        if (!C.pend_text)
+            oom();
+    }
+    iso_err rc = propose(e, conn, reqid, member);
+    if (C.pend_text) {
+        free(C.pend_text);
+        C.pend_text = NULL;
+    }
+    return rc == ISO_OK ? 0 : CLUSTER_ERR_RETRY;
+}
+
+uint64_t cl_wall_ms(void)
+{
+    struct timespec ts;
+    uint64_t ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
+                      ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
+                      : 1;
+    return ms ? ms : 1;
+}
+
+int cl_pend_member(uint32_t id) { return pend_member(id); }
+
+uint32_t cl_member_chunk_stores(uint32_t id)
+{
+    if (id == C.id)
+        return atomic_load_explicit(&g_chunk_stores, memory_order_relaxed);
+    struct heard *h = heard_get(id);
+    return h && h->have_stores ? h->chunk_stores : 0;
+}
 
 void cl_admin_reply(uint64_t conn, uint32_t reqid, int32_t rc, const void *body, size_t len)
 {

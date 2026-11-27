@@ -8,6 +8,15 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+- **Cluster metadata snapshot version 8 and R9 operator CLI verbs (`r9-ops`).** Bumps `META_SNAP_VERSION` from 7 to 8
+  (and entry magic from `"TME4"` to `"TME5"`; snapshot version 7 and `"TME4"` entries are refused by name — pre-1.0
+  preview clusters are re-initialised, not upgraded). Persists `replaced_by` on `meta_member` (`META_OP_NODE_REPLACE`)
+  so `node replace` survives Raft leader failover, implements Raft leader handlers and CLI verbs for
+  `tsdb cluster node hold (--for DUR | --release)`, `node out`, `node drain [--cancel]`, `node replace (NEW | --cancel)`,
+  `node destroyed`, and `volume move --pos P --to NODE`, adds `DRAINING` crash/restart/intent tracking and `prev`-source
+  protection during stripe fills, and extends `tsdb cluster status` with D23 failure settings, active mass-OUT guard,
+  per-member down/hold/OUT-deadline/replace fields, and active stripe fills.
+
 - **Cluster metadata snapshot version 7 (`r9-meta`).** Bumps `META_SNAP_VERSION` from 6 to 7 (and entry magic to
   `"TME4"`; snapshot version 6 and `"TME3"` entries are refused by name — pre-1.0 preview clusters are re-initialised,
   not upgraded). Adds member down timers and reasons (`down_since_ms`, `down_reason`), bounded operator holds

@@ -855,7 +855,7 @@ static void test_replica_set(void)
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 7);
+        CHECK(meta_snapshot_version(img, len) == META_SNAP_VERSION && META_SNAP_VERSION == 8);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -881,7 +881,7 @@ static void test_replica_set(void)
     {
         meta_op_replica_reset(&e, 2, 3, 3, 7200);
         meta_entry_finish(&e);
-        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME4", 4) == 0);
+        CHECK(e.len >= 8 && !meta_entry_older(e.buf, e.len) && memcmp(e.buf, "TME5", 4) == 0);
         uint64_t h = meta_hash(&m);
         memcpy(e.buf, "TME1", 4);
         CHECK(meta_entry_older(e.buf, e.len) && !meta_entry_older(e.buf, 3));
@@ -1176,6 +1176,9 @@ static void test_ec(void)
         memcpy(e.buf, "TME3", 4);
         CHECK(meta_entry_older(e.buf, e.len));
         CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
+        memcpy(e.buf, "TME4", 4);
+        CHECK(meta_entry_older(e.buf, e.len));
+        CHECK(meta_apply(&m, m.applied + 1, 1, e.buf, e.len, res, 8) == META_ERR_FORMAT && meta_hash(&m) == h);
         meta_entry_free(&e);
         meta_entry_init(&e);
     }
@@ -1466,13 +1469,14 @@ static void test_r9_meta(void)
         meta_op_settings(&e, &st);
         meta_op_member_state(&e, 2, META_DOWN, 2, META_DOWN_FAILSTOP, 9000, 9100);
         meta_op_node_hold(&e, 2, clk + 3600000, clk);
+        meta_op_node_replace(&e, 2, 10);
         meta_op_stripe_set(&e, 0, 4, 8, META_STRIPE_FILLING, 5, 2);
         CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK &&
-              res[3] == META_OK);
+              res[3] == META_OK && res[4] == META_OK);
         uint8_t *img;
         size_t len;
         meta_snapshot_encode(&m, &img, &len);
-        CHECK(meta_snapshot_version(img, len) == 7);
+        CHECK(meta_snapshot_version(img, len) == 8);
         struct meta_state back;
         meta_init(&back);
         CHECK(meta_snapshot_decode(&back, img, len) == META_OK && meta_hash(&back) == meta_hash(&m));
@@ -1481,18 +1485,55 @@ static void test_r9_meta(void)
               back.set.young_high_pct == 85 && back.set.balance_mb_s == 100 && back.set.rebuild_concurrency == 8);
         CHECK(meta_member(&back, 2)->down_since_ms == 9000 && meta_member(&back, 2)->down_reason == META_DOWN_FAILSTOP &&
               meta_member(&back, 2)->down_clock_ms == 9100 && meta_member(&back, 2)->hold_until_ms == clk + 3600000 &&
-              meta_member(&back, 2)->hold_clock_ms == clk && meta_member(&back, 9)->state == META_DESTROYED);
+              meta_member(&back, 2)->hold_clock_ms == clk && meta_member(&back, 2)->replaced_by == 10 &&
+              meta_member(&back, 9)->state == META_DESTROYED);
         const struct meta_volume *bv = meta_volume(&back, 0);
         CHECK(bv->stripe[4] == 8 && bv->stripe_pos[4].state == META_STRIPE_FILLING && bv->stripe_pos[4].prev == 5 &&
               bv->stripe_pos[4].set_ver == 3 && bv->stripe_whole_gen == 1 && bv->stripe_whole_ver == 2);
-        /* snapshot version 6 refused and named */
-        uint32_t six = 6, crc;
+        /* snapshot version 7 and 6 refused and named */
+        uint32_t seven = 7, six = 6, crc;
+        memcpy(img + 4, &seven, 4);
+        crc = iso_crc32c(0, img, len - 4);
+        memcpy(img + len - 4, &crc, 4);
+        CHECK(meta_snapshot_version(img, len) == 7 && meta_snapshot_decode(&back, img, len) == META_ERR_FORMAT);
         memcpy(img + 4, &six, 4);
         crc = iso_crc32c(0, img, len - 4);
         memcpy(img + len - 4, &crc, 4);
         CHECK(meta_snapshot_version(img, len) == 6 && meta_snapshot_decode(&back, img, len) == META_ERR_FORMAT);
         meta_free(&back);
         free(img);
+    }
+
+    /* 5b. NODE_REPLACE: refusals, volume overlap, clearing, OUT + replace, DESTROYED clears replaced_by */
+    {
+        meta_op_node_replace(&e, 99, 10);  /* unknown old */
+        meta_op_node_replace(&e, 2, 99);   /* unknown new */
+        meta_op_node_replace(&e, 2, 2);    /* self */
+        meta_op_node_replace(&e, 9, 10);   /* old is DESTROYED */
+        meta_op_node_replace(&e, 2, 6);    /* new is OUT */
+        meta_op_node_replace(&e, 2, 9);    /* new is DESTROYED */
+        meta_op_node_replace(&e, 2, 1);    /* new holds volume 0 alongside old (overlap) */
+        meta_op_node_replace(&e, 6, 10);   /* old is OUT, new is UP: allowed */
+        meta_op_node_replace(&e, 2, 0);    /* clear replaced_by on member 2 */
+        CHECK(apply1(&m, &e, res, 16) == META_OK && res[0] == META_ERR_NOTFOUND && res[1] == META_ERR_NOTFOUND &&
+              res[2] == META_ERR_INVALID && res[3] == META_ERR_STATE && res[4] == META_ERR_STATE &&
+              res[5] == META_ERR_STATE && res[6] == META_ERR_INVALID && res[7] == META_OK && res[8] == META_OK);
+        CHECK(meta_member(&m, 6)->replaced_by == 10 && meta_member(&m, 2)->replaced_by == 0);
+        /* clear replaced_by on OUT member 6; test DESTROYED clearing replaced_by on fresh member 11 */
+        meta_op_node_replace(&e, 6, 0);
+        struct meta_member mb11;
+        member(&mb11, 11);
+        meta_op_member_add(&e, &mb11);
+        meta_op_member_state(&e, 11, META_OUT, 1, META_DOWN_NONE, 0, 0);
+        meta_op_node_replace(&e, 11, 10);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && res[1] == META_OK && res[2] == META_OK &&
+              res[3] == META_OK && meta_member(&m, 6)->replaced_by == 0 && meta_member(&m, 11)->replaced_by == 10);
+        meta_copy(&prev, &m);
+        meta_op_member_state(&e, 11, META_DESTROYED, 1, META_DOWN_NONE, 0, 0);
+        CHECK(apply1(&m, &e, res, 8) == META_OK && res[0] == META_OK && meta_member(&m, 11)->state == META_DESTROYED &&
+              meta_member(&m, 11)->replaced_by == 0);
+        CHECK(meta_check_step(&prev, &m, why, sizeof why) == 0);
+        meta_free(&prev);
     }
 
     /* 6. meta_check_step catches every new invariant violation directly */
@@ -1530,6 +1571,16 @@ static void test_r9_meta(void)
         /* stripe pos goes whole at wrong version */
         ((struct meta_volume *)meta_volume(&bad, 0))->stripe_whole_gen++;
         ((struct meta_volume *)meta_volume(&bad, 0))->stripe_whole_ver = 1;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        meta_free(&bad);
+        /* replaced_by invariants: self, unknown, or on DESTROYED */
+        meta_copy(&bad, &m);
+        ((struct meta_member *)meta_member(&bad, 1))->replaced_by = 1;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        ((struct meta_member *)meta_member(&bad, 1))->replaced_by = 999;
+        CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
+        ((struct meta_member *)meta_member(&bad, 1))->replaced_by = 0;
+        ((struct meta_member *)meta_member(&bad, 9))->replaced_by = 1;
         CHECK(meta_check_step(&m, &bad, why, sizeof why) != 0);
         meta_free(&bad);
     }
@@ -2894,7 +2945,7 @@ static void check_one_op(struct msim *s, struct snode *nd, uint64_t index, uint3
     if ((setop || kind == META_OP_VOLUME_LEADER || kind == META_OP_ISR_CHANGE || kind == META_OP_VOLUME_ADD ||
          kind == META_OP_STRIPE_SET || kind == META_OP_STRIPE_WHOLE || kind == META_OP_GC_SUSPEND ||
          kind == META_OP_GC_RESUME || kind == META_OP_RESTORE || kind == META_OP_MEMBER_STATE ||
-         kind == META_OP_NODE_HOLD) &&
+         kind == META_OP_NODE_HOLD || kind == META_OP_NODE_REPLACE) &&
         meta_check_step(pre, at, why, sizeof why))
         sim_fail(s, "node %u, index %" PRIu64 ", op %u (kind %u) on its own: %s", nd->id, index, k, kind, why);
 }
@@ -2989,6 +3040,26 @@ static void check_named(struct msim *s, struct snode *nd, const struct meta_stat
                 (until_ms && (!clk || until_ms < clk || until_ms - clk > META_HOLD_MAX_MS)))
                 sim_fail(s, "node %u, index %" PRIu64 ": NODE_HOLD of member %u (until %" PRIu64 ", clock %" PRIu64
                          ", state %d) was applied", nd->id, e->index, rd32(b), until_ms, clk, mb ? mb->state : -1);
+        }
+        if (kind == META_OP_NODE_REPLACE && n >= 8 && ok) {
+            uint32_t old_id = rd32(b), new_id = rd32(b + 4);
+            const struct meta_member *mb = meta_member(&at, old_id);
+            const struct meta_member *nt = new_id ? meta_member(&at, new_id) : NULL;
+            int overlap = 0;
+            for (uint32_t vi = 0; new_id && vi < at.nvolumes && !overlap; vi++) {
+                const struct meta_volume *vv = &at.volumes[vi];
+                int oh = meta_replica(vv, old_id) != NULL, nh = meta_replica(vv, new_id) != NULL;
+                if (vv->redundancy == META_RED_EC)
+                    for (uint32_t p = 0; p < vv->nstripe && p < META_STRIPE_MAX; p++) {
+                        oh |= vv->stripe[p] == old_id;
+                        nh |= vv->stripe[p] == new_id;
+                    }
+                overlap = oh && nh;
+            }
+            if (!mb || mb->state == META_DESTROYED ||
+                (new_id && (new_id == old_id || !nt || nt->state >= META_OUT || overlap)))
+                sim_fail(s, "node %u, index %" PRIu64 ": NODE_REPLACE of %u -> %u (state %d, overlap %d) was applied",
+                         nd->id, e->index, old_id, new_id, mb ? mb->state : -1, overlap);
         }
         if (ok) { /* the state the next op meets */
             uint8_t one[8 + 5 + 4096];
@@ -3508,6 +3579,9 @@ static void propose(struct msim *s, struct snode *nd)
                 /* DOWN with random reason; occasionally a future since_ms (must be refused) */
                 uint64_t since_ms = rnd(s, 0, 9) ? clk - rnd(s, 0, 5000) : clk + 1000;
                 meta_op_member_state(&e, id, META_DOWN, inc, (uint8_t)rnd(s, 1, META_DOWN_LAST), since_ms, clk);
+            } else if (act == 5 && m->nmembers >= 2) {
+                uint32_t target = rnd(s, 0, 2) == 0 ? 0 : m->members[rnd(s, 0, m->nmembers - 1)].id;
+                meta_op_node_replace(&e, id, target);
             } else {
                 int st = rnd(s, 0, 1) ? META_UP : META_DRAINING;
                 meta_op_member_state(&e, id, st, inc, META_DOWN_NONE, 0, 0);

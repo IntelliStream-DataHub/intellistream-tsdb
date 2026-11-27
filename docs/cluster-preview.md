@@ -25,17 +25,16 @@ leader; copies can be moved to other servers and the leader handed over (step 10
 
 What the preview does **not** do yet. Please do not skip this list:
 
-- **It does not decide by itself where volumes live.** A server that dies is replaced by another copy of each volume
-  it led (step 7), but nothing makes a new copy elsewhere: you move a copy, hand over a leader or rebuild a copy
-  yourself (step 10). There is no `node drain` and no automatic rebuild of a lost server's volumes yet; a server is
-  never marked `out`.
+- **Automatic failure handling and operator verbs (R9) are in progress.** `node hold`, `node out`, `node drain`,
+  `node replace`, `node destroyed`, and `volume move --pos` are built alongside automatic DOWN-to-OUT timers and
+  re-placement; stripe fill execution and balancer tracks are landing next.
 - **Clients name the volume.** The client port and the protocol are as without `--cluster`, but a series is made in
   a cluster volume, named like any volume (`tsdbc_series_at` with the volume's name). A request may go to any
   server ([Writes through any server](#writes-through-any-server)). Logins use the cluster's users, the same on
   every server ([Logins](#logins)).
 - **It is not for production.** The format of the metadata and the peer protocol may change in a later 0.x
   release. A build of the preview does not talk to a build from before such a change: you start the cluster again
-  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 7 and its peer protocol version 11;
+  with `tsdb cluster init`, you do not upgrade it. This build's metadata is version 8 and its peer protocol version 11;
   a server that finds a state directory or a peer of another version stops, or refuses the peer, with a line naming both
   versions. The changes of replica sets, moves and rebuilds (R4) are in those versions, so a cluster made before them
   must be made again.
@@ -612,8 +611,7 @@ stored, and `--mode shared` and `--failover` (the shared side of the cluster) ar
 | `--transfer-wait-ms MS` | 2000 | How long a leader drains for a transfer (100 to 60000): the time writes wait, at most, before it goes on as leader. |
 | `--leader-balance-s S` | 0 | 0: off. Otherwise a volume whose first copy (`preferred`) is not its leader is handed back to that copy, by a transfer, once the copy has been in the in-sync set for this long (at most 86400). One transfer at a time on a server and one a second in the cluster; after a failed one the copy is left alone for `S`, doubling up to 10 minutes. Off by default until the pause of a transfer on a busy volume has been measured on real servers (the test-machine figures are in design-cluster.md 3.2). |
 
-The design lists more commands (`node drain` and `out`, `restore`, `adopt` and
-others). They are not built: `tsdb cluster` prints what exists.
+The design lists more commands (`restore`, `adopt` and others) that are not built yet; `tsdb cluster` prints what exists.
 
 ## What's next
 

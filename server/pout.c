@@ -159,40 +159,13 @@ static uint64_t kth_down_since(const struct meta_state *sm, uint32_t k_1based)
     return 0;
 }
 
-void pout_plan(const struct place_in *in, struct place_out *out)
+void pout_guard_eval(const struct meta_state *sm, uint32_t out_guard_pct, uint32_t out_guard_hold_s, uint64_t now_ms,
+                     struct pout_guard *out)
 {
-    if (!in || !in->sm || !out || !in->sm->initialised)
+    memset(out, 0, sizeof *out);
+    if (!sm || !sm->initialised)
         return;
 
-    const struct meta_state *sm = in->sm;
-    int mut = pout_mutant(in);
-    uint64_t node_to_ms = sm->set.node_timeout_ms;
-
-    /* 1. Fail-stop fast path (D5): an UP member reporting a fresh failstop beat goes DOWN with reason failstop.
-     *    In tsdbd, cluster.c's member_states + place_duty still gate any UP -> DOWN transition on promote_safe_ns so
-     *    a volume leader's read lease runs out before promotion. */
-    for (uint32_t i = 0; i < sm->nmembers; i++) {
-        const struct meta_member *m = &sm->members[i];
-        if (m->id == in->self_id || m->state != META_UP)
-            continue;
-        const struct place_member *pm = find_pm(in, m->id);
-        if (!pm || !pm->failstop || !pm_heard_fresh(pm, node_to_ms))
-            continue;
-        struct place_prop p = {
-            .kind = PLACE_PROP_MEMBER_STATE,
-            .node = m->id,
-            .version = m->incarnation,
-            .state = META_DOWN,
-            .reason = META_DOWN_FAILSTOP,
-        };
-        (void)place_out_push(out, &p);
-    }
-
-    /* 2. Mass-OUT guard (D4): computed solely from the metadata record so every Raft leader agrees.
-     *    Active while > out_guard_pct % of non-OUT/non-DESTROYED members are DOWN, OR every non-OUT/non-DESTROYED
-     *    member of one multi-server rack (>= 2 members in the rack, every non-OUT/non-DESTROYED member has a rack,
-     *    and at least two distinct racks exist) is DOWN. Its start is the down_since_ms of the member that crossed
-     *    the line. */
     uint32_t non_out = 0, ndown = 0;
     uint64_t downs_stack[128];
     const uint32_t downs_cap = (uint32_t)(sizeof downs_stack / sizeof downs_stack[0]);
@@ -220,9 +193,9 @@ void pout_plan(const struct place_in *in, struct place_out *out)
 
     int pct_guarded = 0;
     uint64_t pct_guard_start_ms = 0;
-    if (non_out > 0 && (uint64_t)ndown * 100ull > (uint64_t)non_out * (uint64_t)in->set.out_guard_pct) {
+    if (non_out > 0 && (uint64_t)ndown * 100ull > (uint64_t)non_out * (uint64_t)out_guard_pct) {
         pct_guarded = 1;
-        uint32_t k_cross = (uint32_t)(((uint64_t)non_out * (uint64_t)in->set.out_guard_pct) / 100ull + 1ull);
+        uint32_t k_cross = (uint32_t)(((uint64_t)non_out * (uint64_t)out_guard_pct) / 100ull + 1ull);
         if (k_cross == 0)
             k_cross = 1;
         if (k_cross > ndown)
@@ -276,22 +249,58 @@ void pout_plan(const struct place_in *in, struct place_out *out)
         }
     }
 
-    int guarded = pct_guarded || rack_guarded;
-    if (mut == PLACE_MUT_NO_GUARD)
-        guarded = 0;
+    out->non_out = non_out;
+    out->ndown = ndown;
+    out->pct_triggered = pct_guarded;
+    out->rack_triggered = rack_guarded;
+    out->active = pct_guarded || rack_guarded;
+    if (out->active) {
+        uint64_t start_ms = pct_guarded && rack_guarded
+                                ? (pct_guard_start_ms < rack_guard_start_ms ? pct_guard_start_ms : rack_guard_start_ms)
+                                : pct_guarded ? pct_guard_start_ms : rack_guard_start_ms;
+        out->start_ms = start_ms;
+        out->due_ms = add_sat_u64(start_ms, (uint64_t)out_guard_hold_s * 1000ull);
+        out->holding = now_ms < out->due_ms;
+    }
+}
 
-    uint64_t guard_start_ms = 0;
-    if (pct_guarded && rack_guarded)
-        guard_start_ms = pct_guard_start_ms < rack_guard_start_ms ? pct_guard_start_ms : rack_guard_start_ms;
-    else if (pct_guarded)
-        guard_start_ms = pct_guard_start_ms;
-    else if (rack_guarded)
-        guard_start_ms = rack_guard_start_ms;
+void pout_plan(const struct place_in *in, struct place_out *out)
+{
+    if (!in || !in->sm || !out || !in->sm->initialised)
+        return;
 
-    uint64_t guard_due_ms = add_sat_u64(guard_start_ms, (uint64_t)in->set.out_guard_hold_s * 1000ull);
+    const struct meta_state *sm = in->sm;
+    int mut = pout_mutant(in);
+    uint64_t node_to_ms = sm->set.node_timeout_ms;
+
+    /* 1. Fail-stop fast path (D5): an UP or DRAINING member reporting a fresh failstop beat goes DOWN with reason
+     *    failstop. In tsdbd, cluster.c's member_states + place_duty still gate any UP/DRAINING -> DOWN transition on
+     *    promote_safe_ns so a volume leader's read lease runs out before promotion. */
+    for (uint32_t i = 0; i < sm->nmembers; i++) {
+        const struct meta_member *m = &sm->members[i];
+        if (m->id == in->self_id || (m->state != META_UP && m->state != META_DRAINING))
+            continue;
+        const struct place_member *pm = find_pm(in, m->id);
+        if (!pm || !pm->failstop || !pm_heard_fresh(pm, node_to_ms))
+            continue;
+        struct place_prop p = {
+            .kind = PLACE_PROP_MEMBER_STATE,
+            .node = m->id,
+            .version = m->incarnation,
+            .state = META_DOWN,
+            .reason = META_DOWN_FAILSTOP,
+        };
+        (void)place_out_push(out, &p);
+    }
+
+    /* 2. Mass-OUT guard (D4): computed solely from the metadata record so every Raft leader agrees. */
+    struct pout_guard g;
+    pout_guard_eval(sm, in->set.out_guard_pct, in->set.out_guard_hold_s, in->now_ms, &g);
+    uint32_t non_out = g.non_out, ndown = g.ndown;
+    int guarded = mut == PLACE_MUT_NO_GUARD ? 0 : g.active;
     int guard_holding = 0, guard_passed = 0;
     if (guarded) {
-        if (mut == PLACE_MUT_GUARD_UNBOUNDED || in->now_ms < guard_due_ms)
+        if (mut == PLACE_MUT_GUARD_UNBOUNDED || g.holding)
             guard_holding = 1;
         else
             guard_passed = 1;

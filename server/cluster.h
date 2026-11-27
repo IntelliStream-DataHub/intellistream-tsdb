@@ -89,6 +89,7 @@ enum cluster_admin_op {
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
 enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
+enum { CLUSTER_DRAIN_CANCEL = 1 };                      /* CLUSTER_OP_NODE_DRAIN's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -493,6 +494,8 @@ struct cluster_heard {
     uint64_t answered_ms; /* on the Raft leader: since its last lease-granting HB_ACK to it (UINT64_MAX: none) */
     int64_t lease_left_ms; /* the server's own entry: how long its lease still runs (< 0: expired) */
     char *sections;        /* formatted registered heartbeat sections (creport.h); NULL when none */
+    uint32_t nfills;
+    struct cluster_fill_report *fills;
 };
 struct cluster_status {
     uint32_t self;
@@ -510,6 +513,7 @@ struct cluster_status {
     uint64_t tr[16];
     char moves[8192]; /* the Raft leader's moves running, a line each with its step and age (cmove_status) */
     char links[1024]; /* the answering server's peer data links up, per kind and frame check (peerlink_links_status) */
+    uint64_t wall_ms; /* server wall clock (ms) when STATUS was built (for down age, hold left, OUT deadline, guard) */
     const uint8_t *image;
     size_t image_len;
 };
@@ -585,10 +589,17 @@ int cluster_volume_force_decode(const uint8_t *p, size_t n, uint32_t *volume, ui
  * VOLUME_MOVE_POS (12 bytes); decoders accept exact lengths only (0, else -1). */
 size_t cluster_node_op_encode(uint32_t node, uint8_t *out);
 int cluster_node_op_decode(const uint8_t *p, size_t n, uint32_t *node);
+/* NODE_DRAIN: 4 bytes (flags=0) or 8 bytes (node, flags); backward-safe decoder accepts both. */
+size_t cluster_node_drain_encode(uint32_t node, uint32_t flags, uint8_t *out);
+int cluster_node_drain_decode(const uint8_t *p, size_t n, uint32_t *node, uint32_t *flags);
 size_t cluster_node_hold_encode(uint32_t node, uint32_t for_s, uint32_t flags, uint8_t *out);
 int cluster_node_hold_decode(const uint8_t *p, size_t n, uint32_t *node, uint32_t *for_s, uint32_t *flags);
 size_t cluster_node_replace_encode(uint32_t old_node, uint32_t new_node, uint8_t *out);
 int cluster_node_replace_decode(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node);
+/* NODE_REPLACE --cancel: 12-byte body (old_node, 0, CLUSTER_REPLACE_CANCEL); decoder accepts 8 bytes (start) or 12 bytes. */
+enum { CLUSTER_REPLACE_CANCEL = 1 };
+size_t cluster_node_replace_cancel_encode(uint32_t old_node, uint8_t *out);
+int cluster_node_replace_decode_ex(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node, uint32_t *flags);
 size_t cluster_volume_move_pos_encode(uint32_t volume, uint32_t pos, uint32_t to, uint8_t *out);
 int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *pos, uint32_t *to);
 

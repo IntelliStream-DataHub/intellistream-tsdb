@@ -175,6 +175,20 @@ void pout_plan(const struct place_in *in, struct place_out *out);
 void place_plan(const struct place_in *in, struct place_out *out);
 void balance_plan(const struct place_in *in, struct place_out *out);
 
+/* Computed mass-OUT guard summary (D4): shared by pout_plan and `tsdb cluster status` so they never drift. */
+struct pout_guard {
+    int active;        /* 1 if pct or rack guard threshold is currently crossed */
+    int pct_triggered; /* 1 if > out_guard_pct % of non-OUT/non-DESTROYED members are DOWN */
+    int rack_triggered;/* 1 if every non-OUT/non-DESTROYED member of a multi-server rack is DOWN */
+    uint32_t ndown;    /* DOWN members with down_since_ms > 0 */
+    uint32_t non_out;  /* non-OUT/non-DESTROYED members */
+    uint64_t start_ms; /* down_since_ms of the member that crossed the guard */
+    uint64_t due_ms;   /* start_ms + out_guard_hold_s * 1000 (saturated) */
+    int holding;       /* 1 if active && now_ms < due_ms */
+};
+void pout_guard_eval(const struct meta_state *sm, uint32_t out_guard_pct, uint32_t out_guard_hold_s, uint64_t now_ms,
+                     struct pout_guard *out);
+
 /* Initial placement for VOLUME_ADD / VOLUME_ADD_EC (pure; moved from cluster.c by r9-plan; §3.2 rules 1-4, E9, D20).
  * Returns 0 on success, -1 if fewer than n (or ns) eligible members qualify. */
 int place_volume(const struct place_in *in, uint32_t n, uint32_t *nodes);

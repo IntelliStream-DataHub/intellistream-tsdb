@@ -204,6 +204,7 @@ struct meta_member {
     uint64_t down_clock_ms; /* op_clock_ms of the MEMBER_STATE down (checker witness); 0 unless state == META_DOWN */
     uint64_t hold_until_ms; /* proposer's wall clock (ms) until which automatic OUT is held; 0: no hold */
     uint64_t hold_clock_ms; /* op_clock_ms of the NODE_HOLD (checker witness); 0 when hold_until_ms == 0 */
+    uint32_t replaced_by;   /* R9 (snapshot version 8; D22): node replace OLD NEW target (0: none) */
 };
 
 struct meta_replica {
@@ -416,10 +417,11 @@ enum meta_op_kind {
     META_OP_GC_SUSPEND,       /* orphan collection off (force-leader proposes it before its ISR_CHANGE); idempotent,
                                * and not counted by the one-touch-per-entry rule (it only ever sets a flag) */
     META_OP_GC_RESUME,        /* orphan collection on again (`tsdb cluster volume gc resume`), gc_gen + 1 */
-    /* R9 (snapshot version 7): member holds and stripe fill whole barrier */
+    /* R9 (snapshot version 7-8): member holds, stripe fill whole barrier, and node replace intent */
     META_OP_NODE_HOLD,        /* hold member id against automatic OUT until until_ms (0: release), bounded by op_clock_ms */
     META_OP_STRIPE_WHOLE,     /* EC: if stripe_version == v and pos is filling: mark pos whole (D10) */
-    META_OP_LAST = META_OP_STRIPE_WHOLE,
+    META_OP_NODE_REPLACE,     /* set/clear member replaced_by (new_node; 0 clears), persisted for Raft failover (D22) */
+    META_OP_LAST = META_OP_NODE_REPLACE,
 };
 
 /* Why a volume got a new leader (grant reasons of §5.5, in its order; 7 is the replicated mode's RESIGN). */
@@ -520,6 +522,9 @@ void meta_op_member_state(struct meta_entry *e, uint32_t id, int state, uint64_t
 /* Hold member `id` against automatic OUT until `until_ms` (0: release); refused if until_ms - op_clock_ms exceeds
  * META_HOLD_MAX_MS, until_ms < op_clock_ms, op_clock_ms == 0 (for until_ms > 0), or the member is OUT or DESTROYED. */
 void meta_op_node_hold(struct meta_entry *e, uint32_t id, uint64_t until_ms, uint64_t op_clock_ms);
+/* Record or clear `node replace OLD NEW` intent (new_node == 0 clears). Refused if old_node is unknown or DESTROYED,
+ * or (when new_node != 0) new_node == old_node, unknown, or OUT/DESTROYED. */
+void meta_op_node_replace(struct meta_entry *e, uint32_t old_node, uint32_t new_node);
 /* Refused as STALE for an incarnation below the member's, EXISTS for a peer address another live member has. */
 void meta_op_member_addr(struct meta_entry *e, uint32_t id, uint64_t incarnation, const char *addr,
                          const char *peer);
@@ -597,8 +602,8 @@ void meta_apply_other(struct meta_state *m, uint64_t index, uint64_t term, const
 int meta_snapshot_encode(const struct meta_state *m, uint8_t **out, size_t *len);
 /* The snapshot format (meta.c has its history). Until 1.0 a change of the state's layout bumps it, and an image of
  * another version is refused (a preview cluster is initialised again, never upgraded). */
-#define META_SNAP_VERSION 7
-/* 1 when the entry is one of a build of metadata snapshot version 6 or older (its magic): meta_apply says
+#define META_SNAP_VERSION 8
+/* 1 when the entry is one of a build of metadata snapshot version 7 or older (its magic): meta_apply says
  * META_ERR_FORMAT for it, and the caller names both versions (the cluster is initialised again, never upgraded). */
 int meta_entry_older(const void *data, size_t len);
 /* Replaces `m` with the image; META_ERR_FORMAT (and `m` unchanged) when it does not verify, is not META_SNAP_VERSION,

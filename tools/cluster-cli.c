@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int cluster_cli(int argc, char **argv); /* tools/tsdb-cli.c */
 int cluster_user_cli(int argc, char **argv); /* tools/cluster-user-cli.c */
@@ -37,8 +38,9 @@ static const char cl_help[] =
     "       tsdb cluster init PEER --secret-file F [options]\n"
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
     "       tsdb cluster node hold PEER NODE (--for DUR | --release) --secret-file F\n"
-    "       tsdb cluster node out|drain|destroyed PEER NODE --secret-file F\n"
-    "       tsdb cluster node replace PEER OLD NEW --secret-file F\n"
+    "       tsdb cluster node out|destroyed PEER NODE --secret-file F\n"
+    "       tsdb cluster node drain PEER NODE [--cancel] --secret-file F\n"
+    "       tsdb cluster node replace PEER OLD (NEW | --cancel) --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M|replicas=N] --secret-file F\n"
     "       tsdb cluster volume gc resume PEER VOLUME --secret-file F\n"
     "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
@@ -62,6 +64,17 @@ static const char cl_help[] =
     "                      cluster that PEER belongs to; PEER may be any member. The members vote\n"
     "                      in groups of 1, 3 or 5 (at most --voters); the rest watch and take a voter's place when\n"
     "                      one is lost. A witness (tsdbd --witness) is added the same way.\n"
+    "  node hold PEER NODE (--for DUR | --release)  hold NODE against automatic OUT for DUR (e.g. 30m, 2h; at most\n"
+    "                      1 day), or release an active hold.\n"
+    "  node out PEER NODE  mark NODE out immediately so its log replicas and stripe positions rebuild elsewhere.\n"
+    "  node drain PEER NODE [--cancel]  mark NODE draining to move every log replica and stripe position off it\n"
+    "                      before marking it out automatically (--cancel returns a live draining node to up).\n"
+    "  node replace PEER OLD (NEW | --cancel)  move every log replica and stripe position of OLD directly onto NEW\n"
+    "                      (which must be up, accept volumes, have chunk stores if OLD holds stripe positions, and\n"
+    "                      hold none of OLD's volumes); OLD is held while the replace runs and marked out once empty.\n"
+    "                      --cancel clears an active replace and releases OLD's hold.\n"
+    "  node destroyed PEER NODE  declare an OUT node permanently destroyed (final; frees its peer address and\n"
+    "                      identity; more than M destroyed stripe holders mark an EC volume LOST).\n"
     "  volume add PEER NAME  a replicated volume called NAME on N servers (the cluster's --replication by default).\n"
     "                      The leader of the group picks its number and its servers; each of them makes the\n"
     "                      volume's directory (v<number> in its --dir) and opens it. Clients create and find\n"
@@ -82,6 +95,8 @@ static const char cl_help[] =
     "  volume move PEER VOLUME --log --from A --to B  moves the copy on node A to node B: B is added and filled,\n"
     "                      then A is removed (--log: B catches up from the log and a snapshot; --cancel stops a\n"
     "                      move that has not removed A yet).\n"
+    "  volume move PEER VOLUME --pos P --to B  moves stripe position P of erasure-coded volume VOLUME to node B\n"
+    "                      (B is marked filling with the previous holder kept until whole).\n"
     "  replica reset PEER VOLUME NODE  gives the copy on NODE (neither the leader nor in sync) a new identity: its\n"
     "                      directory is set aside as v<N>.lost-<rid> and it is rebuilt from a snapshot.\n"
     "  status PEER         what that server knows: its role, the leader, the settings, every member (up or down,\n"
@@ -116,6 +131,14 @@ static const char cl_help[] =
     "    --transfer-wait-ms MS   a leader transfer's drain, at most [2000] (100 to 60000)\n"
     "    --leader-balance-s S    leadership goes back to a volume's first server once it has been in sync this\n"
     "                            long [0: off] (at most 86400)\n"
+    "    --opening-hold-s S      extra hold from OUT while a server reports opening [3600] (0 to 86400)\n"
+    "    --failstop-out-s S      fast path to OUT after a fail-stop beat or replica fault [60]\n"
+    "    --out-guard-pct N       mass-OUT guard threshold, % of non-OUT members down [25] (1 to 100)\n"
+    "    --out-guard-hold-s S    upper bound of the mass-OUT guard before OUT proceeds [7200] (1 to 86400)\n"
+    "    --repl-retain-down-gb GB  per-server WAL retention budget for down or held members [64]\n"
+    "    --young-high-pct N      data dir fill % at which a member reports FULL [90] (10 to 99)\n"
+    "    --balance-mb-s MB       balancer move rate, MB/s [0: = rebuild-mb-s]\n"
+    "    --rebuild-concurrency N EC objects filled in flight per server [4] (1 to 64)\n"
     "  The settings are fixed here and shown by status; they cannot be changed on a running cluster.\n"
     "  A setting marked (stored, not acted on yet) is kept and shown, and nothing uses it.\n";
 
@@ -218,6 +241,25 @@ static const char *role_name(int r)
     return r >= 0 && r < 4 ? n[r] : "?";
 }
 
+static uint64_t status_add_sat(uint64_t a, uint64_t b)
+{
+    return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+}
+
+static void status_print_guard(const struct meta_state *m, uint64_t now_ms)
+{
+    struct pout_guard g;
+    pout_guard_eval(m, m->set.out_guard_pct, m->set.out_guard_hold_s, now_ms, &g);
+    if (!g.active)
+        return;
+    uint64_t since_s = now_ms > g.start_ms ? (now_ms - g.start_ms) / UINT64_C(1000) : 0;
+    uint64_t left_s = g.due_ms > now_ms ? (g.due_ms - now_ms + UINT64_C(999)) / UINT64_C(1000) : 0;
+    const char *why = g.pct_triggered && g.rack_triggered ? "pct+rack" : g.pct_triggered ? "pct" : "rack";
+    printf("guard active yes reason %s down %" PRIu32 "/%" PRIu32 " since %" PRIu64 "s bound %" PRIu32 "s left %" PRIu64
+           "s\n",
+           why, g.ndown, g.non_out, since_s, m->set.out_guard_hold_s, left_s);
+}
+
 static void print_status(const struct cluster_status *st)
 {
     static const char *mode[] = {"none", "core", "watch"};
@@ -234,6 +276,12 @@ static void print_status(const struct cluster_status *st)
         meta_free(&m);
         return;
     }
+    uint64_t now_ms = st->wall_ms;
+    if (!now_ms) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+            now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    }
     char u[33];
     for (int i = 0; i < 16; i++)
         sprintf(u + 2 * i, "%02x", m.uuid[i]);
@@ -246,7 +294,7 @@ static void print_status(const struct cluster_status *st)
                m.set.failover == META_FAILOVER_BMC ? "bmc" : m.set.failover == META_FAILOVER_ATTESTED ? "attested"
                                                                                                      : "lease",
                m.set.read_barrier ? "on" : "off", m.set.lease_s, m.restore_gen);
-    if (m.initialised)
+    if (m.initialised) {
         printf("replicated lease_ms %" PRIu32 " drift_ppm %" PRIu32 " unanswered_ms %" PRIu32
                " commit_interval_ms %" PRIu32 " repl_retain_mb %" PRIu32 " repl_retain_s %" PRIu32
                " idle_seal_ms %" PRIu32 " rebuild_mb_s %" PRIu32 " rebuild_max %" PRIu32 " transfer_wait_ms %" PRIu32
@@ -254,8 +302,15 @@ static void print_status(const struct cluster_status *st)
                m.set.lease_ms, m.set.drift_ppm, m.set.unanswered_ms, m.set.commit_interval_ms,
                m.set.repl_retain_mb, m.set.repl_retain_s, m.set.idle_seal_ms, m.set.rebuild_mb_s, m.set.rebuild_max,
                m.set.transfer_wait_ms, m.set.leader_balance_s);
-    else
+        printf("failure rebuild_after_s %" PRIu32 " opening_hold_s %" PRIu32 " failstop_out_s %" PRIu32
+               " out_guard_pct %" PRIu32 " out_guard_hold_s %" PRIu32 " repl_retain_down_gb %" PRIu32
+               " young_high_pct %" PRIu32 " balance_mb_s %" PRIu32 " rebuild_concurrency %" PRIu32 "\n",
+               m.set.rebuild_after_s, m.set.opening_hold_s, m.set.failstop_out_s, m.set.out_guard_pct,
+               m.set.out_guard_hold_s, m.set.repl_retain_down_gb, m.set.young_high_pct, m.set.balance_mb_s,
+               m.set.rebuild_concurrency);
+    } else {
         printf("cluster %s (not initialised)\n", u);
+    }
     raft_config cfg = {0};
     if (m.config_len)
         raft_config_decode(m.config, m.config_len, &cfg);
@@ -273,6 +328,8 @@ static void print_status(const struct cluster_status *st)
             }
     }
     printf("%s\n", any ? "" : " -");
+    if (m.initialised)
+        status_print_guard(&m, now_ms);
     for (uint32_t i = 0; i < m.nmembers; i++) {
         const struct meta_member *mb = &m.members[i];
         char heard[48] = "never";
@@ -284,11 +341,29 @@ static void print_status(const struct cluster_status *st)
             if (st->heard[j].id == mb->id)
                 h = &st->heard[j];
         printf("member %" PRIu32 " %s incarnation %" PRIu64 " addr %s peer %s rack %s heard %s feed %s voter_ok %d"
-               " volumes_ok %d core_dropped %d read_barrier %s\n",
+               " volumes_ok %d core_dropped %d read_barrier %s",
                mb->id, meta_member_state_name(mb->state), mb->incarnation, mb->addr, mb->peer,
                mb->rack[0] ? mb->rack : "-", heard, mb->power_feed[0] ? mb->power_feed : "-",
                !!(mb->flags & META_MF_VOTER_OK), !!(mb->flags & META_MF_VOLUMES_OK), h ? h->core_dropped : 0,
                !h || (!h->flags && !h->state_free) ? "?" : h->read_barrier ? "on" : "off");
+        if (mb->state == META_DOWN && mb->down_since_ms) {
+            uint64_t age_s = now_ms > mb->down_since_ms ? (now_ms - mb->down_since_ms) / 1000ull : 0;
+            uint32_t base_s = mb->down_reason == META_DOWN_FAILSTOP ? m.set.failstop_out_s : m.set.rebuild_after_s;
+            uint64_t due_ms = status_add_sat(mb->down_since_ms, (uint64_t)base_s * 1000ull);
+            if (h && h->opening && h->ago_ms != UINT64_MAX &&
+                (m.set.node_timeout_ms == 0 || h->ago_ms < m.set.node_timeout_ms))
+                due_ms = status_add_sat(due_ms, (uint64_t)m.set.opening_hold_s * 1000ull);
+            if (mb->hold_until_ms > due_ms)
+                due_ms = mb->hold_until_ms;
+            uint64_t out_in_s = due_ms > now_ms ? (due_ms - now_ms + 999ull) / 1000ull : 0;
+            printf(" down_reason %s down_age %" PRIu64 "s out_in %" PRIu64 "s",
+                   meta_down_reason_name(mb->down_reason), age_s, out_in_s);
+        }
+        if (mb->hold_until_ms > now_ms)
+            printf(" hold_left %" PRIu64 "s", (mb->hold_until_ms - now_ms + UINT64_C(999)) / UINT64_C(1000));
+        if (mb->replaced_by)
+            printf(" replaced_by %" PRIu32, mb->replaced_by);
+        printf("\n");
         for (uint32_t j = 0; h && j < h->nvols; j++) {
             const struct cluster_vol_status *v = &h->vols[j];
             printf("volume-report node %" PRIu32 " volume %" PRIu32 " role %s health %s epoch %" PRIu64
@@ -332,6 +407,28 @@ static void print_status(const struct cluster_status *st)
             if (v->rep[k].replaces) /* a move in progress: this learner takes that member's slot (D10) */
                 printf(" replaces %" PRIu32, v->rep[k].replaces);
             printf("\n");
+        }
+        if (v->redundancy == META_RED_EC) {
+            for (uint32_t p = 0; p < v->nstripe && p < META_STRIPE_MAX; p++) {
+                if (v->stripe_pos[p].state != META_STRIPE_FILLING)
+                    continue;
+                const struct cluster_fill_report *fr = NULL;
+                for (uint32_t j = 0; j < st->nheard && !fr; j++) {
+                    if (st->heard[j].id != v->stripe[p])
+                        continue;
+                    for (uint32_t fi = 0; fi < st->heard[j].nfills; fi++) {
+                        const struct cluster_fill_report *c = &st->heard[j].fills[fi];
+                        if (c->volume == v->number && c->pos == p && c->version == v->stripe_version) {
+                            fr = c;
+                            break;
+                        }
+                    }
+                }
+                printf("fill volume %" PRIu32 " pos %" PRIu32 " node %" PRIu32 " prev %" PRIu32 " version %" PRIu64
+                       " done %" PRIu64 "/%" PRIu64 " whole %u\n",
+                       v->number, p, v->stripe[p], v->stripe_pos[p].prev, v->stripe_version, fr ? fr->done : 0,
+                       fr ? fr->total : 0, fr ? fr->whole : 0u);
+            }
         }
     }
     printf("volumes %" PRIu32 " users %" PRIu32 "\n", m.nvolumes, m.nusers);
@@ -377,7 +474,7 @@ int cluster_cli(int argc, char **argv)
     int r4op = 0, r9op = 0;                               /* R4 and R9 operator ops */
     const char *gc_vol = NULL;                            /* volume gc resume: a number or a name */
     uint32_t r4_vol = 0, r4_node = 0, mv_from = 0, mv_to = 0, mv_flags = 0;
-    uint32_t r9_node = 0, r9_node2 = 0, hold_for_s = 0, hold_flags = 0, mv_pos = 0;
+    uint32_t r9_node = 0, r9_node2 = 0, hold_for_s = 0, hold_flags = 0, drain_flags = 0, repl_flags = 0, mv_pos = 0;
     int have_pos = 0, have_hold_for = 0;
     int i = 2;
     if (!strcmp(verb, "user"))
@@ -399,11 +496,18 @@ int cluster_cli(int argc, char **argv)
             i = 5;
         } else if (argc >= 6 && !strcmp(argv[2], "replace")) {
             addr = argv[3];
-            if (num("OLD", argv[4], &r9_node) != 0 || num("NEW", argv[5], &r9_node2) != 0)
+            if (num("OLD", argv[4], &r9_node) != 0)
                 return 2;
-            if (r9_node == r9_node2) {
-                fprintf(stderr, "tsdb cluster node replace: OLD and NEW must be different nodes\n");
-                return 2;
+            if (!strcmp(argv[5], "--cancel")) {
+                repl_flags |= CLUSTER_REPLACE_CANCEL;
+                r9_node2 = 0;
+            } else {
+                if (num("NEW", argv[5], &r9_node2) != 0)
+                    return 2;
+                if (r9_node == r9_node2) {
+                    fprintf(stderr, "tsdb cluster node replace: OLD and NEW must be different nodes\n");
+                    return 2;
+                }
             }
             r9op = CLUSTER_OP_NODE_REPLACE;
             i = 6;
@@ -515,6 +619,10 @@ int cluster_cli(int argc, char **argv)
         }
         if (r9op == CLUSTER_OP_NODE_HOLD && !strcmp(argv[i], "--release")) {
             hold_flags |= CLUSTER_HOLD_RELEASE;
+            continue;
+        }
+        if (r9op == CLUSTER_OP_NODE_DRAIN && !strcmp(argv[i], "--cancel")) {
+            drain_flags |= CLUSTER_DRAIN_CANCEL;
             continue;
         }
         if (r9op == CLUSTER_OP_NODE_HOLD && i + 1 < argc && !strcmp(argv[i], "--for")) {
@@ -683,8 +791,11 @@ int cluster_cli(int argc, char **argv)
         op = r9op;
         if (op == CLUSTER_OP_NODE_HOLD)
             rl = cluster_node_hold_encode(r9_node, hold_for_s, hold_flags, req);
+        else if (op == CLUSTER_OP_NODE_DRAIN)
+            rl = cluster_node_drain_encode(r9_node, drain_flags, req);
         else if (op == CLUSTER_OP_NODE_REPLACE)
-            rl = cluster_node_replace_encode(r9_node, r9_node2, req);
+            rl = (repl_flags & CLUSTER_REPLACE_CANCEL) ? cluster_node_replace_cancel_encode(r9_node, req)
+                                                       : cluster_node_replace_encode(r9_node, r9_node2, req);
         else if (op == CLUSTER_OP_VOLUME_MOVE_POS)
             rl = cluster_volume_move_pos_encode(r4_vol, mv_pos, mv_to, req);
         else
