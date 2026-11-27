@@ -785,18 +785,18 @@ static void t_refuse(void)
     cap_begin();
     int rro = open_db(dir, &db, 1);
     const char *err = cap_end();
-    CHECK(rro == TSDB_ERR_INVALID); /* read-only: refused for that reason, not for the missing tier */
-    CHECK(count(err, "a follower or a read-only open does not read erasure-coded parts") == 1);
+    CHECK(rro == TSDB_ERR_INVALID); /* read-only without TIERS: refused naming requires=tier and no tier */
+    CHECK(count(err, "no tier is configured") == 1);
     tsdb_options o;
     tsdb_options_init(&o);
     o.read_only = 1;
     o.follow = 1;
-    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID); /* a follower (D7) */
+    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID); /* follower without TIERS */
     tier_env(stores, 3, 2, 1);
     unsetenv("TSDB_TEST_TIER_I_KNOW");
     CHECK(open_db(dir, &db, 0) == TSDB_ERR_INVALID);
     tier_env(stores, 3, 2, 1);
-    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID); /* a tier on a follower */
+    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID); /* TSDB_TEST_TIER without TIERS on a follower */
     CHECK(open_db(dir, &db, 0) == 0);
     tsdb_close(db);
 
@@ -2567,15 +2567,573 @@ static void t_tiers_settings(void)
     }
     no_tier_env();
 
-    /* Read-only / follower open on a tiered DB (root META has requires=tier) is refused. */
+    /* Read-only / follower open on a TIERS DB (root META has requires=tier) succeeds (R15 D13, r15-follow). */
     tsdb *db = NULL;
-    CHECK(open_db(dbdir, &db, 1) == TSDB_ERR_INVALID && !db);
+    CHECK(open_db(dbdir, &db, 1) == 0 && db != NULL);
+    if (db)
+        tsdb_close(db);
+    db = NULL;
     tsdb_options fo;
     tsdb_options_init(&fo);
     fo.follow = 1;
-    CHECK(tsdb_open(dbdir, &fo, &db) == TSDB_ERR_INVALID && !db);
+    CHECK(tsdb_open(dbdir, &fo, &db) == 0 && db != NULL);
+    if (db)
+        tsdb_close(db);
 
-    printf("  tiers_settings: per-volume SETTINGS, cache_bytes, TSDB_TEST_TIER rules, ro/follow refusal\n");
+    printf("  tiers_settings: per-volume SETTINGS, cache_bytes, TSDB_TEST_TIER rules, ro/follow open\n");
+}
+
+/* ---------------------------------------------------------------------------------------------- R15: follower */
+
+static int tf_sum_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    return rh_sum_cb(ctx, ts, v, n);
+}
+
+static int tf_query_sum(tsdb *db, tsdb_sid sid, int64_t t0, int64_t t1, rh_sum *out)
+{
+    *out = (rh_sum){0, 0};
+    return tsdb_query_raw(db, sid, t0, t1, tf_sum_cb, out);
+}
+
+static int tf_count_ec_files(const char *dir)
+{
+    DIR *dd = opendir(dir);
+    if (!dd)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dd)) != NULL)
+        if (ec_file_name(e->d_name))
+            n++;
+    closedir(dd);
+    return n;
+}
+
+static int tf_count_retired_ec(const char *dir)
+{
+    DIR *dd = opendir(dir);
+    if (!dd)
+        return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dd)) != NULL)
+        if (ec_retired_name(e->d_name))
+            n++;
+    closedir(dd);
+    return n;
+}
+
+static void init_db_part_ms(const char *dir, int64_t part_ms)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.partition_ms = part_ms;
+    o.partition_classes = 0;
+    o.create_volumes = 0;
+    tsdb *db = NULL;
+    CHECK(tsdb_open(dir, &o, &db) == 0 && db != NULL);
+    if (db)
+        tsdb_close(db);
+}
+
+/* R15 r15-follow (D13): read-only chunk store open (no flock, no EPOCH write, no tmp cleanup, no delete, store_id &
+ * db_id verified), ecpart_follower_open through the follower's own eccache, snapshot survival across settle and drop
+ * within obsolete_part_lifetime_s, and follower startup refusals for missing/wrong-id/foreign-db stores.
+ * Kills planted mutants `followflock` and `followdel`. */
+static void t_follower(void)
+{
+    char base[PATH_MAX + 32];
+    snprintf(base, sizeof base, "%s/r15follow", S);
+    fresh(base);
+    no_tier_env();
+    tier_health_test_opts(0, -1, 0, 0);
+
+    /* (1) Low-level read-only store & backend contract. */
+    {
+        char db1[PATH_MAX + 48], st[3][PATH_MAX + 64], tmpf[PATH_MAX + 96], epf[PATH_MAX + 96];
+        snprintf(db1, sizeof db1, "%s/ro_db", base);
+        for (int i = 0; i < 3; i++)
+            snprintf(st[i], sizeof st[i], "%s/ro_st%d", base, i);
+        init_empty_db(db1);
+        for (int i = 0; i < 3; i++)
+            CHECK(tsdb_tier_add_dir(db1, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+        int dfd = open(db1, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        tiers_view tv;
+        uint8_t db1_id[16], wrong_id[16];
+        bool has_db = false;
+        CHECK(dfd >= 0 && tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 3);
+        CHECK(tiers_db_id_read(dfd, &has_db, db1_id) == 0 && has_db);
+        close(dfd);
+        memcpy(wrong_id, db1_id, 16);
+        wrong_id[0] ^= 0xff;
+
+        /* Open writer (holds exclusive flock on all 3 stores) and write an object. */
+        direct w;
+        CHECK(direct_open(db1, 0, &w) == 0 && w.t && w.db);
+        if (w.t && w.db) {
+            CHECK(put_obj_km(&w, OID, 2, 1) == 0);
+            /* Create a stray tmp_* file in s0/ and snapshot EPOCH bytes before read-only open. */
+            snprintf(tmpf, sizeof tmpf, "%s/s0/tmp_keep_me", st[0]);
+            int tfd = open(tmpf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            CHECK(tfd >= 0);
+            if (tfd >= 0) {
+                CHECK(write(tfd, "keep", 4) == 4);
+                close(tfd);
+            }
+            snprintf(epf, sizeof epf, "%s/s0/EPOCH", st[0]);
+            uint8_t ep_before[8192];
+            int efd = open(epf, O_RDONLY);
+            CHECK(efd >= 0 && pread(efd, ep_before, sizeof ep_before, 0) == (ssize_t)sizeof ep_before);
+            if (efd >= 0)
+                close(efd);
+
+            /* Read-only open succeeds while writer holds flock (kills followflock). */
+            chunk_store *rost = NULL;
+            CHECK(chunk_store_open_flags(st[0], tv.stores[0].id, db1_id, 0x2u, &rost) == TSDB_ERR_INVALID && !rost);
+            CHECK(chunk_store_open_flags(st[0], tv.stores[0].id, db1_id, CHUNK_OPEN_RDONLY, &rost) == 0 && rost);
+            if (rost) {
+                /* Find which position of OID is placed on store 0 and read it. */
+                unsigned p0 = 0;
+                for (unsigned p = 0; p < 3; p++)
+                    if (chunk_be_place(tier_backend(w.t), OID, p) == 0)
+                        p0 = p;
+                chunk_ident cid = {.volume = 0, .pos = (uint16_t)p0};
+                memcpy(cid.vuuid, tier_vuuid(w.db), 16);
+                memcpy(cid.oid, OID, 16);
+                chunk_rd *rd = NULL;
+                CHECK(chunk_rd_open(rost, &cid, &rd) == 0 && rd != NULL);
+                if (rd)
+                    chunk_rd_close(rd);
+                /* No tmp_* cleanup, no EPOCH write, all mutating calls refused with TSDB_ERR_READONLY. */
+                CHECK(access(tmpf, F_OK) == 0);
+                CHECK(chunk_store_raise(rost, 0, 99) == TSDB_ERR_READONLY);
+                CHECK(chunk_store_del(rost, &cid, 1) == TSDB_ERR_READONLY);
+                chunk_geom g;
+                CHECK(chunk_geom_make(&g, 2, 1, 512, sizeof OBJ) == 0);
+                chunk_wr *wr = NULL;
+                CHECK(chunk_wr_open(rost, &cid, &g, 1, &wr) == TSDB_ERR_READONLY && !wr);
+                uint8_t ep_after[8192];
+                efd = open(epf, O_RDONLY);
+                CHECK(efd >= 0 && pread(efd, ep_after, sizeof ep_after, 0) == (ssize_t)sizeof ep_after);
+                if (efd >= 0)
+                    close(efd);
+                CHECK(memcmp(ep_before, ep_after, sizeof ep_before) == 0);
+                chunk_store_close(rost);
+            }
+            /* Wrong store_id and wrong db_id are refused on read-only open. */
+            CHECK(chunk_store_open_flags(st[0], wrong_id, db1_id, CHUNK_OPEN_RDONLY, &rost) == CHUNK_ERR_STORE_ID &&
+                  !rost);
+            CHECK(chunk_store_open_flags(st[0], tv.stores[0].id, wrong_id, CHUNK_OPEN_RDONLY, &rost) ==
+                      CHUNK_ERR_STORE_ID &&
+                  !rost);
+
+            /* Read-only backend works while writer holds flock and refuses all writes/deletes/epoch raises. */
+            const char *paths[3] = {st[0], st[1], st[2]};
+            uint8_t ids[48];
+            for (int i = 0; i < 3; i++)
+                memcpy(ids + 16 * i, tv.stores[i].id, 16);
+            chunk_backend *robe = NULL;
+            chunk_be_opts bo = {.min_up = 2, .read_only = true, .strict = true};
+            CHECK(chunk_be_open2(&robe, paths, 3, ids, &bo) == 0 && robe != NULL);
+            if (robe) {
+                chunk_obj *ob = NULL;
+                CHECK(chunk_obj_open(robe, 0, tier_vuuid(w.db), OID, NULL, NULL, &ob) == 0 && ob != NULL);
+                if (ob) {
+                    uint8_t back[sizeof OBJ];
+                    CHECK(chunk_obj_read(ob, 0, sizeof back, back, 0, NULL) == 0 &&
+                          memcmp(back, OBJ, sizeof OBJ) == 0);
+                    chunk_obj_close(ob);
+                }
+                chunk_ident cid = {.volume = 0, .pos = 0};
+                memcpy(cid.vuuid, tier_vuuid(w.db), 16);
+                memcpy(cid.oid, OID, 16);
+                chunk_geom g;
+                CHECK(chunk_geom_make(&g, 2, 1, 512, sizeof OBJ) == 0);
+                CHECK(chunk_be_see_epoch(robe, 0, 5) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_del(robe, &cid, 1) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_put_object(robe, 0, tier_vuuid(w.db), OID, &g, 1, OBJ, ~0u, NULL) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_heal(robe, 0, 0, NULL, NULL) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_repair(robe, &cid, NULL, NULL) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_settle(robe, 0, NULL, NULL) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_attach(robe, 0, paths[0], NULL, NULL, NULL) == TSDB_ERR_READONLY);
+                CHECK(chunk_be_replace(robe, 0, paths[0], NULL, NULL, NULL) == TSDB_ERR_READONLY);
+                chunk_be_close(robe);
+            }
+            direct_close(&w);
+
+            /* Even on read-only directory/file permissions (simulating ro NFS export), read-only open reads cleanly. */
+            if (geteuid() != 0) {
+                char s0d[PATH_MAX + 80];
+                snprintf(s0d, sizeof s0d, "%s/s0", st[0]);
+                int c1 = chmod(epf, 0444);
+                int c2 = chmod(s0d, 0555);
+                int c3 = chmod(st[0], 0555);
+                chunk_backend *robe2 = NULL;
+                int ro_rc = (c1 == 0 && c2 == 0 && c3 == 0) ? chunk_be_open2(&robe2, paths, 3, ids, &bo) : -1;
+                if (robe2)
+                    chunk_be_close(robe2);
+                int r1 = chmod(st[0], 0755);
+                int r2 = chmod(s0d, 0755);
+                int r3 = chmod(epf, 0644);
+                CHECK(c1 == 0 && c2 == 0 && c3 == 0);
+                CHECK(ro_rc == 0 && robe2 != NULL);
+                CHECK(r1 == 0 && r2 == 0 && r3 == 0);
+            }
+            unlink(tmpf);
+        }
+        tiers_view_free(&tv);
+    }
+
+    /* (2) Follower opens BEFORE writer starts (kills followflock in follower-first order, tests lazy vuuid pickup),
+     *     then writer inserts, settles across root + volume 1, and follower + plain read-only open match writer. */
+    {
+        char db2[PATH_MAX + 48], vol1[PATH_MAX + 48], st[3][PATH_MAX + 64];
+        snprintf(db2, sizeof db2, "%s/e2e_db", base);
+        snprintf(vol1, sizeof vol1, "%s/e2e_v1", base);
+        for (int i = 0; i < 3; i++)
+            snprintf(st[i], sizeof st[i], "%s/e2e_st%d", base, i);
+        init_db_part_ms(db2, 1000);
+        for (int i = 0; i < 3; i++)
+            CHECK(tsdb_tier_add_dir(db2, st[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+        /* Open follower FIRST (before writer has written vuuid= or requires=tier to META). */
+        tsdb_options fo;
+        tsdb_options_init(&fo);
+        fo.follow = 1;
+        fo.refresh_ms = 50;
+        tsdb *f = NULL;
+        CHECK(tsdb_open(db2, &fo, &f) == 0 && f != NULL);
+
+        /* Now open writer while follower is open (kills followflock!). */
+        setenv("TSDB_TEST_TIER", "grace_s=0,keep_s=3600", 1);
+        setenv("TSDB_TEST_TIER_I_KNOW", "1", 1);
+        int prev_poll = atomic_exchange(&settle_poll_ms, 50);
+        tsdb_options wo;
+        tsdb_options_init(&wo);
+        wo.merge_threads = 0;
+        wo.partition_ms = 1000;
+        wo.partition_classes = 0;
+        wo.obsolete_part_lifetime_s = 60;
+        wo.flush_interval_ms = 50;
+        tsdb *w = NULL;
+        CHECK(tsdb_open(db2, &wo, &w) == 0 && w != NULL);
+        if (w && f) {
+            uint32_t vidx = 0;
+            CHECK(tsdb_volume_add(w, vol1, &vidx) == 0 && vidx == 1);
+            tsdb_sid s0 = 0, s1 = 0;
+            CHECK(tsdb_series_create(w, "tf.s0", TSDB_FLOAT32, NULL, &s0) == 0);
+            CHECK(tsdb_series_create(w, "tf.s1", TSDB_FLOAT32, vol1, &s1) == 0);
+            int64_t ts[200];
+            float vals[200];
+            for (int p = 0; p < 3; p++) {
+                for (int i = 0; i < 200; i++)
+                    ts[i] = (int64_t)p * 1000 + i * 4, vals[i] = (float)(p * 1000 + i);
+                CHECK(tsdb_insert_series(w, s0, ts, vals, 200) == 0);
+            }
+            for (int i = 0; i < 200; i++)
+                ts[i] = i * 4, vals[i] = (float)(5000 + i);
+            CHECK(tsdb_insert_series(w, s1, ts, vals, 200) == 0);
+            CHECK(tsdb_flush(w) == 0);
+
+            /* Wait for eager settle thread to produce .ec parts in both root and volume 1. */
+            int64_t dl = rh_now_ms() + 10000;
+            while ((tf_count_ec_files(db2) < 3 || tf_count_ec_files(vol1) < 1) && rh_now_ms() < dl)
+                rh_sleep_ms(30);
+            CHECK(tf_count_ec_files(db2) >= 3 && tf_count_ec_files(vol1) >= 1);
+
+            /* Wait for follower to refresh and see both series and all settled rows. */
+            tsdb_sid fs0 = 0, fs1 = 0;
+            dl = rh_now_ms() + 10000;
+            while (rh_now_ms() < dl) {
+                (void)tsdb_refresh(f);
+                if (tsdb_series_lookup(f, "tf.s0", &fs0) == 0 && tsdb_series_lookup(f, "tf.s1", &fs1) == 0) {
+                    rh_sum cs0 = {0, 0}, cs1 = {0, 0};
+                    if (tf_query_sum(f, fs0, 0, 3000, &cs0) == 0 && cs0.n == 600 &&
+                        tf_query_sum(f, fs1, 0, 1000, &cs1) == 0 && cs1.n == 200)
+                        break;
+                }
+                rh_sleep_ms(30);
+            }
+            rh_sum ws0, ws1, fs0_res, fs1_res;
+            CHECK(tf_query_sum(w, s0, 0, 3000, &ws0) == 0 && ws0.n == 600);
+            CHECK(tf_query_sum(w, s1, 0, 1000, &ws1) == 0 && ws1.n == 200);
+            CHECK(tsdb_series_lookup(f, "tf.s0", &fs0) == 0 && tsdb_series_lookup(f, "tf.s1", &fs1) == 0);
+            CHECK(tf_query_sum(f, fs0, 0, 3000, &fs0_res) == 0 && fs0_res.n == ws0.n && fs0_res.sum == ws0.sum);
+            CHECK(tf_query_sum(f, fs1, 0, 1000, &fs1_res) == 0 && fs1_res.n == ws1.n && fs1_res.sum == ws1.sum);
+
+            /* Plain read-only open (follow = 0) also reads settled .ec parts cleanly while writer is open. */
+            no_tier_env();
+            tsdb *ro = NULL;
+            CHECK(open_db(db2, &ro, 1) == 0 && ro != NULL);
+            if (ro) {
+                tsdb_sid rs0 = 0, rs1 = 0;
+                rh_sum r0 = {0, 0}, r1 = {0, 0};
+                CHECK(tsdb_series_lookup(ro, "tf.s0", &rs0) == 0 && tsdb_series_lookup(ro, "tf.s1", &rs1) == 0);
+                CHECK(tf_query_sum(ro, rs0, 0, 3000, &r0) == 0 && r0.n == ws0.n && r0.sum == ws0.sum);
+                CHECK(tf_query_sum(ro, rs1, 0, 1000, &r1) == 0 && r1.n == ws1.n && r1.sum == ws1.sum);
+                tsdb_close(ro);
+            }
+        }
+        if (f)
+            tsdb_close(f);
+        if (w)
+            tsdb_close(w);
+        no_tier_env();
+        atomic_store(&settle_poll_ms, prev_poll);
+    }
+
+    /* (3) Snapshot survival across settle + drop within obsolete_part_lifetime_s (kills followdel),
+     *     follower's own eccache, retired_ fallback in ecpart_follower_open, and cleanup after lifetime. */
+    char db3[PATH_MAX + 48], st3[3][PATH_MAX + 64];
+    snprintf(db3, sizeof db3, "%s/snap_db", base);
+    for (int i = 0; i < 3; i++)
+        snprintf(st3[i], sizeof st3[i], "%s/snap_st%d", base, i);
+    init_db_part_ms(db3, 1000);
+    for (int i = 0; i < 3; i++)
+        CHECK(tsdb_tier_add_dir(db3, st3[i], "hdd", TSDB_TIER_ALLOW_SHARED_DEV) == 0);
+
+    {
+        tsdb_options wo, fo;
+        tsdb_options_init(&wo);
+        wo.merge_threads = 0;
+        wo.partition_ms = 1000;
+        wo.partition_classes = 0;
+        wo.obsolete_part_lifetime_s = 60;
+        wo.flush_interval_ms = 50;
+        wo.create_volumes = 0;
+
+        direct wd = {0}, fd = {0};
+        CHECK(tier_open(db3, &wo, &wd.t) == 0 && wd.t != NULL);
+        if (wd.t) {
+            tier_want(wd.t, 0);
+            CHECK(eng_open(db3, &wo, &wd.db) == 0 && wd.db != NULL);
+            tier_want(NULL, 0);
+        }
+        uint32_t sid = 0;
+        if (wd.db) {
+            CHECK(eng_series(wd.db, "snap.s", TSDB_FLOAT32, &sid) == 0);
+            int64_t ts[200];
+            float vals[200];
+            for (int p = 0; p < 3; p++) {
+                for (int i = 0; i < 200; i++)
+                    ts[i] = (int64_t)p * 1000 + i * 4, vals[i] = (float)(p * 1000 + i);
+                CHECK(eng_insert_series(wd.db, TSDB_FLOAT32, sid, ts, vals, 200) == 0);
+            }
+            CHECK(eng_flush(wd.db) == 0);
+            /* Settle partition 0 only; partitions 1 and 2 remain .part files for now. */
+            CHECK(rh_settle_part(wd.db, 0) == 0);
+            CHECK(tf_count_ec_files(db3) == 1);
+
+            /* Open follower with manual refresh (refresh_ms huge). */
+            tsdb_options_init(&fo);
+            fo.read_only = 1;
+            fo.follow = 1;
+            fo.refresh_ms = 1000000;
+            fo.create_volumes = 0;
+            CHECK(tier_open(db3, &fo, &fd.t) == 0 && fd.t != NULL);
+            if (fd.t) {
+                CHECK(fd.t->read_only && !tier_writable(fd.t) && fd.t->gc == NULL && fd.t->settle == NULL);
+                tier_want(fd.t, 0);
+                CHECK(eng_open(db3, &fo, &fd.db) == 0 && fd.db != NULL);
+                tier_want(NULL, 0);
+            }
+        }
+        if (wd.db && fd.db) {
+            /* Follower reads partition 0 (.ec) through its OWN eccache. */
+            eccache_test_drop(fd.t);
+            eccache_counters cc0, cc1;
+            eccache_get_counters(fd.t, &cc0);
+            rh_sum got0 = {0, 0};
+            CHECK(eng_query_raw_ex(fd.db, sid, 0, 1000, false, 0, rh_sum_cb, &got0) == 0 && got0.n == 200 &&
+                  (int64_t)(got0.sum + 0.5) == 19900);
+            eccache_get_counters(fd.t, &cc1);
+            CHECK(cc1.obj_opens > cc0.obj_opens && cc1.misses > cc0.misses);
+
+            /* Hold a snapshot on the follower while writer settles partition 1 AND drops partition 0! */
+            size_t nsnap = 0;
+            part **snap = db_snapshot(fd.db, INT64_MIN, INT64_MAX, &nsnap);
+            CHECK(snap != NULL && nsnap == 3);
+            int64_t pk1 = wd.db->cls_kmul;
+            CHECK(rh_settle_part(wd.db, pk1) == 0);
+            CHECK(eng_drop_before(wd.db, 1000) == 0);
+            CHECK(tf_count_retired_ec(db3) == 1);
+
+            /* Drive writer's graveyard purge + synchronous GC worker: within obsolete_part_lifetime_s (60 s), chunks
+             * MUST stay! (Planted mutant `followdel` ignores ge->deadline and deletes p0's chunks right here.) */
+            graveyard_purge(wd.db, false);
+            ecgc_tier_work(wd.t);
+            graveyard_purge(wd.db, false);
+            ecgc_tier_work(wd.t);
+
+            /* Drop follower's eccache so it MUST fetch p0's chunks from disk (not from cache). */
+            eccache_test_drop(fd.t);
+            rh_sum sp0 = {0, 0}, sp1 = {0, 0};
+            CHECK(eng_query_raw_ex(fd.db, sid, 0, 1000, false, 0, rh_sum_cb, &sp0) == 0 && sp0.n == 200 &&
+                  (int64_t)(sp0.sum + 0.5) == 19900);
+            CHECK(eng_query_raw_ex(fd.db, sid, 1000, 2000, false, 0, rh_sum_cb, &sp1) == 0 && sp1.n == 200 &&
+                  (int64_t)(sp1.sum + 0.5) == 219900);
+
+            /* Also verify ecpart_follower_open falls back to retired_<name>.ec if writer just retired it. */
+            char ret_ec[128] = "";
+            DIR *dd = opendir(db3);
+            if (dd) {
+                struct dirent *de;
+                while ((de = readdir(dd)) != NULL)
+                    if (ec_retired_name(de->d_name)) {
+                        snprintf(ret_ec, sizeof ret_ec, "%s", de->d_name + 8);
+                        break;
+                    }
+                closedir(dd);
+            }
+            CHECK(ret_ec[0] != '\0');
+            if (ret_ec[0]) {
+                part *rp = NULL;
+                CHECK(ecpart_follower_open(fd.db, ret_ec, &rp) == 0 && rp != NULL);
+                if (rp)
+                    part_unref(rp);
+            }
+
+            db_release(snap, nsnap);
+
+            /* Follower refreshes: p0 is gone, p1 is now .ec and reads cleanly via follower's eccache. */
+            CHECK(eng_refresh(fd.db) == 0);
+            eccache_test_drop(fd.t);
+            rh_sum af0 = {0, 0}, af1 = {0, 0};
+            CHECK(eng_query_raw_ex(fd.db, sid, 0, 1000, false, 0, rh_sum_cb, &af0) == 0 && af0.n == 0);
+            CHECK(eng_query_raw_ex(fd.db, sid, 1000, 2000, false, 0, rh_sum_cb, &af1) == 0 && af1.n == 200 &&
+                  (int64_t)(af1.sum + 0.5) == 219900);
+        }
+        direct_close(&fd);
+        if (wd.t)
+            tier_quiesce(wd.t);
+        direct_close(&wd);
+
+        /* Reopen writer with 1 s lifetime: verify retired_p0.ec is cleaned up once the lifetime expires.
+         * ("Still kept before deadline" was already asserted above under the 60 s lifetime, immune to load stalls.) */
+        if (ecgc_mutant != GC_MUT_FOLLOWDEL && chunk_mutant != CHUNK_MUT_FOLLOW_FLOCK) {
+            wo.obsolete_part_lifetime_s = 1;
+            CHECK(tier_open(db3, &wo, &wd.t) == 0 && wd.t != NULL);
+            if (wd.t) {
+                tier_want(wd.t, 0);
+                CHECK(eng_open(db3, &wo, &wd.db) == 0 && wd.db != NULL);
+                tier_want(NULL, 0);
+            }
+            if (wd.db) {
+                int64_t dl = rh_now_ms() + 10000;
+                while (tf_count_retired_ec(db3) > 0 && rh_now_ms() < dl) {
+                    graveyard_purge(wd.db, false);
+                    ecgc_tier_work(wd.t);
+                    rh_sleep_ms(50);
+                }
+                CHECK(tf_count_retired_ec(db3) == 0); /* cleaned up once lifetime expired */
+            }
+            if (wd.t)
+                tier_quiesce(wd.t);
+            direct_close(&wd);
+        }
+    }
+
+    /* (4) Follower store refusals: missing non-LOST store, wrong store_id, foreign db_id, unbound store,
+     *     LOST store decode-around, and too many LOST stores. */
+    {
+        char st1_bak[PATH_MAX + 80];
+        snprintf(st1_bak, sizeof st1_bak, "%s/snap_st1.bak", base);
+        int dfd = open(db3, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        tiers_view tv;
+        uint8_t db3_id[16], other_db_id[16], s1_id[16], s2_id[16];
+        bool has3 = false;
+        CHECK(dfd >= 0 && tiers_load(dfd, false, false, &tv) == 0 && tv.nstores == 3);
+        CHECK(tiers_db_id_read(dfd, &has3, db3_id) == 0 && has3);
+        memcpy(s1_id, tv.stores[1].id, 16);
+        memcpy(s2_id, tv.stores[2].id, 16);
+        memcpy(other_db_id, db3_id, 16);
+        other_db_id[0] ^= 0x55;
+        tiers_view_free(&tv);
+
+        tsdb_options fo;
+        tsdb_options_init(&fo);
+        fo.follow = 1;
+        tsdb *f = NULL;
+
+        /* 4a. Missing non-LOST store -> refused naming the store. */
+        CHECK(rename(st3[1], st1_bak) == 0);
+        cap_begin();
+        int rc = tsdb_open(db3, &fo, &f);
+        const char *err = cap_end();
+        CHECK(rc == TSDB_ERR_NOTFOUND && !f && strstr(err, st3[1]) != NULL);
+        if (f) {
+            tsdb_close(f);
+            f = NULL;
+        }
+
+        /* 4b. Wrong store_id (same db_id) -> refused naming the store. */
+        chunk_store_owner ow_same = {.db_set = true};
+        memcpy(ow_same.db_id, db3_id, 16);
+        CHECK(chunk_store_init2(st3[1], NULL, &ow_same, NULL) == 0);
+        cap_begin();
+        rc = tsdb_open(db3, &fo, &f);
+        err = cap_end();
+        CHECK(rc == TSDB_ERR_INVALID && !f && strstr(err, st3[1]) != NULL);
+        if (f) {
+            tsdb_close(f);
+            f = NULL;
+        }
+        sh("rm -rf '%s'", st3[1]);
+
+        /* 4c. Foreign db_id (matching store_id) -> refused naming store and BOTH db_ids. */
+        chunk_store_owner ow_other = {.db_set = true};
+        memcpy(ow_other.db_id, other_db_id, 16);
+        CHECK(chunk_store_init2(st3[1], s1_id, &ow_other, NULL) == 0);
+        char hex_want[33], hex_have[33];
+        chunk_oid_hex(db3_id, hex_want);
+        chunk_oid_hex(other_db_id, hex_have);
+        cap_begin();
+        rc = tsdb_open(db3, &fo, &f);
+        err = cap_end();
+        CHECK(rc == TSDB_ERR_INVALID && !f && strstr(err, st3[1]) != NULL && strstr(err, hex_want) != NULL &&
+              strstr(err, hex_have) != NULL);
+        if (f) {
+            tsdb_close(f);
+            f = NULL;
+        }
+        sh("rm -rf '%s'", st3[1]);
+
+        /* 4d. Unbound store (no db= line, matching store_id) -> refused naming store and expected db_id. */
+        CHECK(chunk_store_init(st3[1], s1_id, NULL) == 0);
+        cap_begin();
+        rc = tsdb_open(db3, &fo, &f);
+        err = cap_end();
+        CHECK(rc == TSDB_ERR_INVALID && !f && strstr(err, st3[1]) != NULL && strstr(err, hex_want) != NULL);
+        if (f) {
+            tsdb_close(f);
+            f = NULL;
+        }
+        sh("rm -rf '%s'", st3[1]);
+
+        /* 4e. LOST store (missing from disk, marked LOST in TIERS): follower opens and decodes around it. */
+        CHECK(tiers_append_state(dfd, true, s1_id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+        CHECK(tsdb_open(db3, &fo, &f) == 0 && f != NULL);
+        if (f) {
+            tsdb_sid fs = 0;
+            rh_sum got = {0, 0};
+            CHECK(tsdb_series_lookup(f, "snap.s", &fs) == 0);
+            CHECK(tf_query_sum(f, fs, 1000, 2000, &got) == 0 && got.n == 200 && (int64_t)(got.sum + 0.5) == 219900);
+            tsdb_close(f);
+            f = NULL;
+        }
+
+        /* 4f. Too many LOST stores (< min_up): follower refuses with TSDB_ERR_UNAVAILABLE. */
+        CHECK(tiers_append_state(dfd, true, s2_id, TIERS_STATE_LOST, 0, false, NULL, NULL) == 0);
+        CHECK(tsdb_open(db3, &fo, &f) == TSDB_ERR_UNAVAILABLE && !f);
+        close(dfd);
+    }
+
+    tier_health_test_opts(0, 0, 0, 0);
+    printf("  follower: ro stores (no flock/EPOCH/tmp/del), follower eccache reads, snapshot across settle+drop, "
+           "missing/wrong-id/foreign-db refusals, LOST decode\n");
 }
 
 /* ---------------------------------------------------------------------------------------------------------- r15-full */
@@ -3261,6 +3819,12 @@ int main(int argc, char **argv)
             tierfill_mutant = TIERFILL_MUT_FULLNOFLAG;
         } else if (strcmp(mutant, "storeput96") == 0) {
             chunk_mutant = CHUNK_MUT_STOREPUT96;
+        } else if (strcmp(mutant, "followflock") == 0) {
+            tier_mutant = TIER_MUT_FOLLOWFLOCK;
+            chunk_mutant = CHUNK_MUT_FOLLOW_FLOCK;
+        } else if (strcmp(mutant, "followdel") == 0) {
+            tier_mutant = TIER_MUT_FOLLOWDEL;
+            ecgc_mutant = GC_MUT_FOLLOWDEL;
         } else {
             fprintf(stderr, "unknown mutant %s\n", mutant);
             return 2;
@@ -3292,11 +3856,12 @@ int main(int argc, char **argv)
     t_tiers_open();
     t_tiers_defaults();
     t_tiers_settings();
+    t_follower();
     t_runtime_health();
     t_full();
 #else
     printf("  volumes, down, lost, fence, unsure, ops, refuse, reval, power, eio, tiers_open, tiers_defaults, "
-           "tiers_settings, runtime_health, full: skipped (no TSDB_EC in this build)\n");
+           "tiers_settings, follower, runtime_health, full: skipped (no TSDB_EC in this build)\n");
 #endif
     t_follow();
     if (!fails)

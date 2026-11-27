@@ -62,6 +62,7 @@ typedef struct vol_state {
 
 struct chunk_store {
     atomic_uint refs; /* 1 from store_open; chunk_store_ref/unref; last unref closes fds and frees */
+    bool read_only;   /* R15 D13: opened with CHUNK_OPEN_RDONLY (no flock, no EPOCH, no tmp cleanup, no write/del) */
     char *path;
     int dirfd;
     uint8_t id[16];
@@ -481,6 +482,29 @@ static int vol_get(chunk_store *st, uint32_t vol, bool create, vol_state **out)
             *out = &st->v[i];
             return 0;
         }
+    if (st->read_only) {
+        if (create)
+            return TSDB_ERR_READONLY;
+        char name[32];
+        snprintf(name, sizeof name, "s%u", vol);
+        int vfd = openat(st->dirfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (vfd < 0)
+            return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
+        if (st->nv == st->capv) {
+            size_t nc = st->capv ? 2 * st->capv : 4;
+            vol_state *nv = realloc(st->v, nc * sizeof *nv);
+            if (!nv) {
+                close(vfd);
+                return TSDB_ERR_NOMEM;
+            }
+            st->v = nv;
+            st->capv = nc;
+        }
+        vol_state *v = &st->v[st->nv++];
+        *v = (vol_state){.vol = vol, .dirfd = vfd, .efd = -1, .epoch = 0, .gen = 0, .slot = 0, .unsure = false};
+        *out = v;
+        return 0;
+    }
     char name[32];
     snprintf(name, sizeof name, "s%u", vol);
     bool made = false;
@@ -649,18 +673,21 @@ static int scan_volumes(chunk_store *st)
     return rc;
 }
 
-static int store_open(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, bool quiet,
+static int store_open(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, bool read_only, bool quiet,
                       chunk_store **out)
 {
+    *out = NULL;
     int dirfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dirfd < 0)
         return errno == ENOENT ? TSDB_ERR_NOTFOUND : TSDB_ERR_IO;
-    if (flock(dirfd, LOCK_EX | LOCK_NB) != 0) { /* held by the open file description: a second open here conflicts too */
-        int busy = errno == EWOULDBLOCK;
-        if (busy && !quiet)
-            fprintf(stderr, "tsdb: chunk store %s is open elsewhere (two owners would let its EPOCH go back)\n", path);
-        close(dirfd);
-        return busy ? CHUNK_ERR_BUSY : TSDB_ERR_IO;
+    if (!read_only || chunk_mutant == CHUNK_MUT_FOLLOW_FLOCK) {
+        if (flock(dirfd, LOCK_EX | LOCK_NB) != 0) { /* held by the open file description: a second open here conflicts too */
+            int busy = errno == EWOULDBLOCK;
+            if (busy && !quiet)
+                fprintf(stderr, "tsdb: chunk store %s is open elsewhere (two owners would let its EPOCH go back)\n", path);
+            close(dirfd);
+            return busy ? CHUNK_ERR_BUSY : TSDB_ERR_IO;
+        }
     }
     uint8_t id[16];
     chunk_store_owner ow;
@@ -704,13 +731,14 @@ static int store_open(const char *path, const uint8_t *expect_id, const uint8_t 
         return TSDB_ERR_NOMEM;
     }
     atomic_init(&st->refs, 1);
+    st->read_only = read_only;
     st->path = strdup(path);
     st->dirfd = dirfd;
     memcpy(st->id, id, 16);
     st->owner = ow;
     pthread_mutex_init(&st->mu, NULL);
     pthread_mutex_lock(&st->mu);
-    rc = st->path ? scan_volumes(st) : TSDB_ERR_NOMEM;
+    rc = !st->path ? TSDB_ERR_NOMEM : read_only ? 0 : scan_volumes(st);
     pthread_mutex_unlock(&st->mu);
     if (rc) {
         chunk_store_close(st);
@@ -725,29 +753,44 @@ static int store_open(const char *path, const uint8_t *expect_id, const uint8_t 
 
 int chunk_store_open(const char *path, const uint8_t *expect_id, chunk_store **out)
 {
-    return store_open(path, expect_id, NULL, false, out);
+    return store_open(path, expect_id, NULL, false, false, out);
 }
 
 int chunk_store_open_quiet(const char *path, const uint8_t *expect_id, chunk_store **out)
 {
-    return store_open(path, expect_id, NULL, true, out);
+    return store_open(path, expect_id, NULL, false, true, out);
 }
 
 int chunk_store_open_db(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out)
 {
-    return store_open(path, expect_id, expect_db, false, out);
+    return store_open(path, expect_id, expect_db, false, false, out);
 }
 
 int chunk_store_open_db_quiet(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out)
 {
-    return store_open(path, expect_id, expect_db, true, out);
+    return store_open(path, expect_id, expect_db, false, true, out);
+}
+
+int chunk_store_open_flags(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, unsigned flags,
+                           chunk_store **out)
+{
+    *out = NULL;
+    if (flags & ~(unsigned)CHUNK_OPEN_RDONLY)
+        return TSDB_ERR_INVALID;
+    return store_open(path, expect_id, expect_db, (flags & CHUNK_OPEN_RDONLY) != 0, false, out);
+}
+
+int chunk_store_open_ro_quiet(const char *path, const uint8_t *expect_id, chunk_store **out)
+{
+    return store_open(path, expect_id, NULL, true, true, out);
 }
 
 static void store_destroy(chunk_store *st)
 {
     for (size_t i = 0; i < st->nv; i++) {
         close(st->v[i].dirfd);
-        close(st->v[i].efd);
+        if (st->v[i].efd >= 0)
+            close(st->v[i].efd);
     }
     free(st->v);
     if (st->dirfd >= 0)
@@ -814,6 +857,8 @@ uint64_t chunk_store_epoch(chunk_store *st, uint32_t volume)
 
 int chunk_store_raise(chunk_store *st, uint32_t volume, uint64_t e)
 {
+    if (st->read_only)
+        return TSDB_ERR_READONLY;
     pthread_mutex_lock(&st->mu);
     vol_state *v;
     int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, volume, true, &v);
@@ -828,6 +873,8 @@ int chunk_store_raise(chunk_store *st, uint32_t volume, uint64_t e)
 
 int chunk_store_see(chunk_store *st, uint32_t volume, uint64_t e)
 {
+    if (st->read_only)
+        return TSDB_ERR_READONLY;
     pthread_mutex_lock(&st->mu);
     vol_state *v;
     int rc = atomic_load(&st->failed) ? TSDB_ERR_IO : vol_get(st, volume, true, &v);
@@ -1067,6 +1114,8 @@ struct chunk_wr {
 static int wr_open(chunk_store *st, const chunk_ident *id, const chunk_geom *g, uint64_t epoch, uint64_t fence,
                    bool heal, chunk_wr **out)
 {
+    if (st->read_only)
+        return TSDB_ERR_READONLY;
     if (!chunk_geom_valid(g) || id->pos >= chunk_npos(g))
         return TSDB_ERR_INVALID;
     /* R15 D7 / §15.7: regular puts on single-server tiers (put_max_pct > 0) stop when integer filesystem fill %
@@ -1263,6 +1312,8 @@ int chunk_store_put(chunk_store *st, const chunk_ident *id, const chunk_geom *g,
 
 int chunk_store_del(chunk_store *st, const chunk_ident *id, uint64_t epoch)
 {
+    if (st->read_only)
+        return TSDB_ERR_READONLY;
     char name[80];
     chunk_name(name, sizeof name, id->oid, id->pos);
     pthread_mutex_lock(&st->mu);
@@ -1939,6 +1990,9 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
     pthread_mutex_init(&be->st_mu, NULL);
     pthread_cond_init(&be->ioerr_cv, NULL);
     int rc = be->st && be->state && be->st_failed && be->st_lost && be->pending_close && be->path ? 0 : TSDB_ERR_NOMEM;
+    bool ro = o && o->read_only;
+    bool strict = !o || o->strict;
+    be->read_only = ro;
     atomic_init(&be->n, rc == 0 ? n : 0); /* chunk_be_close closes what is open (NULL for the stores not opened) */
     int rcs[64]; /* why a store is down, for the message when too few are up */
     int up = 0;
@@ -1955,9 +2009,10 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
             continue; /* down: the index stays */
         }
         chunk_store *st = NULL;
-        int r = chunk_store_open_quiet(paths[i], ids ? ids + 16 * i : NULL, &st);
+        int r = ro ? chunk_store_open_ro_quiet(paths[i], ids ? ids + 16 * i : NULL, &st)
+                   : chunk_store_open_quiet(paths[i], ids ? ids + 16 * i : NULL, &st);
         if (r == CHUNK_ERR_STORE_ID && chunk_mutant == CHUNK_MUT_OPEN_ID_UP) /* planted: any disk will do */
-            r = chunk_store_open_quiet(paths[i], NULL, &st);
+            r = ro ? chunk_store_open_ro_quiet(paths[i], NULL, &st) : chunk_store_open_quiet(paths[i], NULL, &st);
         if (r == CHUNK_ERR_BUSY && chunk_mutant == CHUNK_MUT_OPEN_BUSY_DOWN) /* planted: another owner's store is down */
             r = TSDB_ERR_NOTFOUND;
         if (r == 0) {
@@ -1989,8 +2044,8 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
         fprintf(stderr, "tsdb: chunk backend: store %d (%s) is %s: %s\n", i, paths[i], chunk_store_state_name(ds),
                 down_reason(r));
     }
-    int need = o ? o->min_up : up; /* NULL: every store that was named must open (what chunk_be_open means) */
-    if (!o) {
+    int need = o ? o->min_up : up; /* NULL or strict: every store that was named must open (what chunk_be_open means) */
+    if (strict) {
         for (int i = 0; i < n && rc == 0; i++)
             if (paths[i] && atomic_load(&be->state[i]) != CHUNK_STORE_UP) {
                 rc = i < 64 ? rcs[i] : TSDB_ERR_IO; /* the code the store's own open gave, as before */
@@ -2012,7 +2067,7 @@ int chunk_be_open2(chunk_backend **out, const char *const *paths, int n, const u
         rc = TSDB_ERR_UNAVAILABLE;
     }
     int bn = atomic_load_explicit(&be->n, memory_order_relaxed);
-    for (int i = 0; i < bn && rc == 0; i++) { /* the fence: the maximum over the stores present */
+    for (int i = 0; !be->read_only && i < bn && rc == 0; i++) { /* the fence: the maximum over the stores present */
         chunk_store *st = atomic_load(&be->st[i]);
         if (!st)
             continue;
@@ -2080,6 +2135,8 @@ int chunk_be_add_store(chunk_backend *be, const char *path, const uint8_t *expec
 {
     if (!be || !path)
         return TSDB_ERR_INVALID;
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     int idx = atomic_load_explicit(&be->n, memory_order_acquire);
     if (idx >= be->cap)
         return TSDB_ERR_INVALID;
@@ -2140,6 +2197,8 @@ int chunk_be_add_lost(chunk_backend *be, const char *path)
 {
     if (!be)
         return TSDB_ERR_INVALID;
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     char *pcopy = path ? strdup(path) : NULL;
     if (path && !pcopy)
         return TSDB_ERR_NOMEM;
@@ -2173,6 +2232,8 @@ uint64_t chunk_be_epoch(chunk_backend *be, uint32_t volume)
 
 int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     pthread_mutex_lock(&be->mu);
     struct fence *f = fence_find(be, volume, true);
     int rc = f ? 0 : TSDB_ERR_NOMEM;
@@ -2212,6 +2273,8 @@ int chunk_be_see_epoch(chunk_backend *be, uint32_t volume, uint64_t e)
  * stand in for the fence that was lost. */
 int chunk_be_prepare(chunk_backend *be, uint32_t volume, uint64_t e)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     uint64_t cur = chunk_be_epoch(be, volume);
     if (e < cur && chunk_mutant != CHUNK_MUT_NOFENCE)
         return CHUNK_ERR_FENCED;
@@ -2396,6 +2459,8 @@ int chunk_be_rd_open(chunk_backend *be, const chunk_ident *id, chunk_rd **out)
 
 int chunk_be_del(chunk_backend *be, const chunk_ident *id, uint64_t epoch)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     int rc = chunk_be_prepare(be, id->volume, epoch);
     if (rc)
         return rc;
@@ -2477,6 +2542,8 @@ int chunk_be_put_stream(chunk_backend *be, uint32_t volume, const uint8_t vuuid[
     (void)be, (void)volume, (void)vuuid, (void)oid, (void)g, (void)epoch, (void)src, (void)posmask, (void)sums_out;
     return TSDB_ERR_INVALID; /* no erasure codec in this build: nothing is opened */
 #else
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     if (!chunk_geom_valid(g) || !src || !src->fill)
         return TSDB_ERR_INVALID;
     put_ctx pc;

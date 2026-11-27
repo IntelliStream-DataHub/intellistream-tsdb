@@ -117,6 +117,8 @@ enum {
     GC_MUT_REPLICANOOP,    /* gcreplicanoop: ecgcmk_apply on a replica is a no-op */
     /* R9 (r9-whole) planted bug: */
     GC_MUT_RELEASE_NOMARK, /* releasenomark: deletes released holder's chunks without waiting for committed MK_GC */
+    /* R15 (r15-follow) planted bug: */
+    GC_MUT_FOLLOWDEL,      /* followdel: writer deletes retired chunks immediately ignoring obsolete_part_lifetime_s */
 };
 extern int ecgc_mutant;
 int ecgc_mutant_parse(const char *name); /* GC_MUT_* or -1 */

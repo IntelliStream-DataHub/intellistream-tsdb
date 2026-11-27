@@ -452,6 +452,8 @@ int chunk_be_heal(chunk_backend *be, uint32_t volume, int store, const chunk_hea
     if (!rep)
         rep = &local;
     memset(rep, 0, sizeof *rep);
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     if (!o)
         o = &none;
     int bn = chunk_be_nstores(be);
@@ -562,6 +564,8 @@ int chunk_be_repair(chunk_backend *be, const chunk_ident *id, const chunk_heal_o
     if (!rep)
         rep = &local;
     memset(rep, 0, sizeof *rep);
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     if (!o)
         o = &none;
     int store = -1;
@@ -784,6 +788,8 @@ static int be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chu
 
 int chunk_be_settle(chunk_backend *be, int store, const chunk_heal_opts *o, chunk_heal_report *rep)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     return be_settle(be, store, o, rep, NULL);
 }
 
@@ -877,6 +883,8 @@ static bool id_taken(chunk_backend *be, int except, const uint8_t id[16])
 int chunk_be_attach(chunk_backend *be, int index, const char *path, const uint8_t *id, const chunk_heal_opts *o,
                     chunk_heal_report *rep)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     if (index < 0 || index >= chunk_be_nstores(be) || !path)
         return TSDB_ERR_INVALID;
     int stt = chunk_be_store_state(be, index);
@@ -1025,6 +1033,8 @@ static void count_lost_m0(chunk_backend *be, int index, chunk_store *old, const 
 int chunk_be_replace(chunk_backend *be, int index, const char *new_path, uint8_t new_id_out[16], const chunk_heal_opts *o,
                      chunk_heal_report *rep)
 {
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     if (index < 0 || index >= chunk_be_nstores(be) || !new_path)
         return TSDB_ERR_INVALID;
     int stt = chunk_be_store_state(be, index);
@@ -1073,6 +1083,8 @@ int chunk_be_replace_open(chunk_backend *be, int index, const char *new_path, co
 {
     if (!be || index < 0 || index >= chunk_be_nstores(be) || !new_path)
         return TSDB_ERR_INVALID;
+    if (be->read_only)
+        return TSDB_ERR_READONLY;
     int stt = chunk_be_store_state(be, index);
     if (stt == CHUNK_STORE_UP || stt == CHUNK_STORE_REPLACING)
         return TSDB_ERR_INVALID;

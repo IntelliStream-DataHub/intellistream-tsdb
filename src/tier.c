@@ -514,12 +514,16 @@ static int tier_be_open(tier *t, const char *dir)
 #endif
 
 #ifdef TSDB_EC
-/* Open the directory chunk backend strictly from TIERS (R15 r15-open, design-cluster-data.md §15.7, D3, D4, D9):
+/* Open the directory chunk backend strictly from TIERS (R15 r15-open, r15-follow, design-cluster-data.md §15.7, D3,
+ * D4, D9, D13):
  * - At open, every non-LOST store in TIERS must exist with its recorded store_id and db_id (strict chunk_be_open +
  *   owner db_id check; an unrecorded missing/down store fails open naming it until declared LOST).
+ * - With read_only (followers and read-only opens, D13): stores are opened with CHUNK_OPEN_RDONLY (no flock, no EPOCH
+ *   write, no tmp_* cleanup, no delete), still enforcing strict presence of every non-LOST store and verifying
+ *   store_id and db_id so a follower on shared storage refuses a missing or foreign-db store naming it.
  * - LOST stores are passed as NULL (CHUNK_STORE_DOWN_MISSING), REPLACED_BY stores by their replacement path & id.
  * - Fewer than min_up active stores fails the open (TSDB_ERR_UNAVAILABLE). */
-static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
+static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up, bool read_only)
 {
     int n = (int)t->tview.nstores;
     if (n <= 0 || n > TIERS_STORES_MAX)
@@ -554,7 +558,13 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
                 active, n, TIERS_FILE, min_up);
         return TSDB_ERR_UNAVAILABLE;
     }
-    int rc = chunk_be_open(&t->be, paths, n, ids);
+    int rc;
+    if (read_only) {
+        chunk_be_opts bo = {.min_up = min_up, .read_only = true, .strict = true};
+        rc = chunk_be_open2(&t->be, paths, n, ids, &bo);
+    } else {
+        rc = chunk_be_open(&t->be, paths, n, ids);
+    }
     if (rc) {
         t->be = NULL;
         int mapped = rc == CHUNK_ERR_BUSY ? TSDB_ERR_LOCKED : rc == CHUNK_ERR_STORE_ID ? TSDB_ERR_INVALID : rc;
@@ -592,14 +602,15 @@ static int tier_be_open_from_tiers(tier *t, const char *dir, int min_up)
             }
         }
     }
-    chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
+    if (!read_only)
+        chunk_be_set_put_cap(t->be, CHUNK_STORE_PUT_MAX_PCT);
     /* R15 (r15-lost): mark LOST slots for E15 TSDB_ERR_IO, and open any unfinished replacement (REBUILDING
      * marker still present) in CHUNK_STORE_REPLACING so it is never claimed UP early and tierctl resumes it. */
     for (int i = 0; i < n; i++) {
         const tiers_store *st = &t->tview.stores[i];
         if (st->state == TIERS_STATE_LOST && tier_mut() != TIER_MUT_LOSTOPEN) {
             chunk_be_set_lost(t->be, i, true);
-        } else if (st->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(st->path)) {
+        } else if (!read_only && st->state == TIERS_STATE_REPLACED_BY && tierctl_store_rebuilding(st->path)) {
             (void)chunk_be_set_replacing(t->be, i);
             tier_ensure_paused(t, i, "is rebuilding");
         }
@@ -822,20 +833,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
             return orc;
         }
 #endif
-        if (opt && (opt->read_only || opt->follow)) {
-#ifdef TSDB_TEST_HOOKS
-            if (ov.any) {
-                fprintf(stderr, "tsdb: %s: TSDB_TEST_TIER is set on a read-only open or a follower: only a writer "
-                                "opens a tier: the open fails\n", dir);
-                tiers_view_free(&tv);
-                return TSDB_ERR_INVALID;
-            }
-#endif
-            /* Read-only / follower opens do not acquire store flocks; if META already carries requires=tier,
-             * tier_engine_attach refuses the open with its requires=tier message (until r15-follow). */
-            tiers_view_free(&tv);
-            return 0;
-        }
+        bool ro = opt && (opt->read_only || opt->follow);
         int n = (int)tv.nstores;
         bool all_single_copy = true;
         for (int i = 0; i < n; i++)
@@ -855,7 +853,7 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         } else if (!tier_default_geom(n, all_single_copy, &k, &m)) {
             /* One non-single-copy store added so far: no active tier yet until a second store is added. */
 #ifdef TSDB_TEST_HOOKS
-            if (ov.any)
+            if (ov.any && !ro)
                 fprintf(stderr, "tsdb: %s: %s has only %d non-single-copy store (tier not active yet); "
                                 "TSDB_TEST_TIER timing overrides ignored\n", dir, TIERS_FILE, n);
 #endif
@@ -892,16 +890,18 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         c.cache_mb = atomic_load_explicit(&tier_cache_mb_opt, memory_order_relaxed);
         c.eager = false;
 #ifdef TSDB_TEST_HOOKS
-        if (ov.has_grace)
-            c.grace_s = ov.grace_s;
-        if (ov.has_keep)
-            c.keep_s = ov.keep_s;
-        if (ov.has_coarse)
-            c.coarse_s = ov.coarse_s;
+        if (!ro) {
+            if (ov.has_grace)
+                c.grace_s = ov.grace_s;
+            if (ov.has_keep)
+                c.keep_s = ov.keep_s;
+            if (ov.has_coarse)
+                c.coarse_s = ov.coarse_s;
+            if (ov.has_eager)
+                c.eager = ov.eager;
+        }
         if (ov.has_cache)
             c.cache_mb = ov.cache_mb;
-        if (ov.has_eager)
-            c.eager = ov.eager;
 #endif
         tier *t = calloc(1, sizeof *t);
         if (!t) {
@@ -916,22 +916,25 @@ int tier_open(const char *dir, const tsdb_options *opt, tier **out)
         pthread_cond_init(&t->eng_cv, NULL);
         t->cfg = c;
         t->from_tiers = true;
+        t->read_only = ro;
         memcpy(t->db_id, db_id, 16);
         t->tview = tv; /* ownership transferred; tier_put frees it */
 #ifdef TSDB_TEST_HOOKS
-        t->ov_grace = ov.has_grace;
+        t->ov_grace = !ro && ov.has_grace;
 #endif
-        int open_rc = tier_be_open_from_tiers(t, dir, min_up);
-        if (open_rc != 0 || (open_rc = eccache_tier_open(t)) != 0 || (open_rc = ecgc_tier_open(t)) != 0 ||
-            (open_rc = ecsettle_tier_open(t)) != 0) {
+        int open_rc = tier_be_open_from_tiers(t, dir, min_up, ro);
+        if (open_rc != 0 || (open_rc = eccache_tier_open(t)) != 0) {
             tier_put(t);
             return open_rc;
         }
         eccache_set_backend(t, t->be);
-        tier_reg_add(t, dir);
-        if ((open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
-            tier_put(t);
-            return open_rc;
+        if (!ro) {
+            if ((open_rc = ecgc_tier_open(t)) != 0 || (open_rc = ecsettle_tier_open(t)) != 0 ||
+                (open_rc = tier_health_open(t)) != 0 || (open_rc = tierctl_open(t)) != 0) {
+                tier_put(t);
+                return open_rc;
+            }
+            tier_reg_add(t, dir);
         }
         *out = t;
         return 0;
@@ -1291,6 +1294,101 @@ static bool tier_is_cluster_volume(eng *db)
     return (feats & (META_REQ_CLUSTER | META_REQ_REPLICA)) || db->replica_req;
 }
 
+static void tier_fill_vol_settings(tier *t, uint32_t vol, tier_settings *out)
+{
+    if (t->from_tiers) {
+        tiers_settings vs;
+        int def_k = 0, def_m = 0;
+        bool has_def = false;
+        size_t tv_nstores = 0;
+        bool all_sc = false;
+        pthread_mutex_lock(&t->cmu);
+        tiers_view_settings_for(&t->tview, vol, &vs);
+        tv_nstores = t->tview.nstores;
+        all_sc = tv_nstores > 0;
+        for (size_t i = 0; i < tv_nstores; i++)
+            if (!t->tview.stores[i].single_copy)
+                all_sc = false;
+        has_def = tier_default_geom((int)tv_nstores, all_sc, &def_k, &def_m);
+        pthread_mutex_unlock(&t->cmu);
+        tier_settings_from_cfg(&t->cfg, out);
+        out->from_tiers = true;
+        if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
+            bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
+                                : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
+                                   (int)vs.k + (int)vs.m <= (int)tv_nstores);
+            if (ok)
+                tier_settings_set_km(out, (int)vs.k, (int)vs.m);
+            else if (has_def)
+                tier_settings_set_km(out, def_k, def_m);
+        } else if (has_def) {
+            tier_settings_set_km(out, def_k, def_m);
+        }
+        out->tier_after_s = t->ov_grace ? (uint64_t)t->cfg.grace_s : vs.tier_after_s;
+        out->grace_s = t->ov_grace ? t->cfg.grace_s : (int64_t)vs.tier_after_s;
+        out->tier_high_pct = vs.tier_high_pct;
+        out->young_high_pct = vs.young_high_pct;
+        out->rebuild_mb_s = vs.rebuild_mb_s;
+        out->scrub_mb_s = vs.scrub_mb_s;
+        out->scrub_days = vs.scrub_days;
+    } else {
+        tier_settings_from_cfg(&t->cfg, out);
+    }
+}
+
+/* R15 D13 (r15-follow): attach a read-only coldvol for follower/read-only reads through the follower's eccache
+ * without writing META, touching EPOCH, or starting any writer/GC/settle state. */
+static int follower_attach_cold(eng *db, tier *t, uint32_t vol, const uint8_t vuuid[16])
+{
+    coldvol *cv = calloc(1, sizeof *cv);
+    if (!cv)
+        return TSDB_ERR_NOMEM;
+    atomic_init(&cv->refs, 1);
+    cv->volume = vol;
+    memcpy(cv->vuuid, vuuid, 16);
+    tier_fill_vol_settings(t, vol, &cv->set);
+    int rc = coldops_dir_make(NULL, t, vol, cv->vuuid, &cv->ctx);
+    if (rc != 0) {
+        free(cv);
+        return rc;
+    }
+    cv->ops = &coldops_dir;
+    rc = cold_register(t, cv);
+    if (rc != 0) {
+        tier_cold_put(cv);
+        return rc;
+    }
+    tier_cold_put(db->ecstate->cold);
+    db->ecstate->cold = cv;
+    return 0;
+}
+
+int tier_follower_ensure_vuuid(eng *db)
+{
+    if (!db || !db->tier || !db->tier->read_only || !db->ecstate || db->ecstate->has_vuuid)
+        return 0;
+    char txt[512];
+    int rc = tier_meta_read(db, txt, sizeof txt);
+    if (rc)
+        return rc;
+    unsigned feats = 0;
+    meta_requires_parse(txt, &feats, NULL, 0);
+    uint8_t u[16];
+    int vrc = meta_vuuid(txt, u);
+    if (vrc != 1 || !(feats & META_REQ_TIER)) {
+        fprintf(stderr, "tsdb: %s: erasure-coded part opened on a follower, but META lacks requires=tier or a valid "
+                        "vuuid=: the open fails\n", db->dir);
+        return TSDB_ERR_CORRUPT;
+    }
+    rc = follower_attach_cold(db, db->tier, db->tier_vol, u);
+    if (rc == 0) {
+        memcpy(db->ecstate->vuuid, u, 16);
+        db->ecstate->has_vuuid = true;
+        db->tier_req = true;
+    }
+    return rc;
+}
+
 int tier_engine_attach(eng *db)
 {
     tier *t = want_tier;
@@ -1313,18 +1411,20 @@ int tier_engine_attach(eng *db)
                         "build has no erasure codec (TSDB_EC): the open fails\n", db->dir);
         return TSDB_ERR_INVALID;
 #endif
-        if (ro) {
-            fprintf(stderr, "tsdb: %s: META says requires=tier: a follower or a read-only open does not read "
-                            "erasure-coded parts: the open fails\n", db->dir);
-            return TSDB_ERR_INVALID;
-        }
         if (!t) {
+            if (ro) {
+                fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured (a follower or a "
+                                "read-only open needs %s to read erasure-coded parts): the open fails\n",
+                        db->dir, TIERS_FILE);
+            } else {
 #ifdef TSDB_TEST_HOOKS
-            fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured (TSDB_TEST_TIER with "
-                            "TSDB_TEST_TIER_I_KNOW=1): the open fails\n", db->dir);
+                fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured (TSDB_TEST_TIER with "
+                                "TSDB_TEST_TIER_I_KNOW=1): the open fails\n", db->dir);
 #else
-            fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured: the open fails\n", db->dir);
+                fprintf(stderr, "tsdb: %s: META says requires=tier, but no tier is configured: the open fails\n",
+                        db->dir);
 #endif
+            }
             return TSDB_ERR_INVALID;
         }
     }
@@ -1360,9 +1460,40 @@ int tier_engine_attach(eng *db)
                         "fails\n", db->dir);
         return TSDB_ERR_INVALID;
     }
-    if (ro) { /* tier_open refuses these; an engine opened read-only under a writer's tier is the same mistake */
-        fprintf(stderr, "tsdb: %s: a read-only open under a tier: the open fails\n", db->dir);
+    if (ro && !t->read_only) { /* an engine opened read-only under a writer's tier is a mistake */
+        fprintf(stderr, "tsdb: %s: a read-only open under a writer's tier: the open fails\n", db->dir);
         return TSDB_ERR_INVALID;
+    }
+    if (!ro && t->read_only) { /* a writer engine cannot attach to a read-only tier */
+        fprintf(stderr, "tsdb: %s: a writer open under a read-only tier: the open fails\n", db->dir);
+        return TSDB_ERR_INVALID;
+    }
+    if (ro && t->read_only) {
+        /* R15 D13 (r15-follow): attach read-only without writing META, raising EPOCH, or starting GC/settle/keep. */
+        struct ecstate *es = calloc(1, sizeof *es);
+        if (!es)
+            return TSDB_ERR_NOMEM;
+        db->ecstate = es;
+        db->tier = tier_get(t);
+        db->tier_vol = vol;
+        db->tier_req = (feats & META_REQ_TIER) != 0;
+        int vrc = meta_vuuid(txt, es->vuuid);
+        if (vrc < 0) {
+            fprintf(stderr, "tsdb: %s: META's vuuid= line is damaged: the open fails\n", db->dir);
+            return vrc;
+        }
+        if (vrc == 0) {
+            if (feats & META_REQ_TIER) {
+                fprintf(stderr, "tsdb: %s: META says requires=tier but has no vuuid= line: the open fails\n", db->dir);
+                return TSDB_ERR_CORRUPT;
+            }
+            /* Writer has not yet attached a tier to this volume; vuuid= will be loaded lazily on first .ec part. */
+            return 0;
+        }
+        rc = follower_attach_cold(db, t, vol, es->vuuid);
+        if (rc == 0)
+            es->has_vuuid = true;
+        return rc;
     }
     struct ecstate *es = calloc(1, sizeof *es);
     coldvol *cv = calloc(1, sizeof *cv);
@@ -1380,48 +1511,13 @@ int tier_engine_attach(eng *db)
     cv->epoch_fn = at.epoch;
     cv->epoch_arg = at.epoch_arg;
     atomic_init(&cv->lead_epoch, (at.lead_epoch && db->leader_open) ? at.lead_epoch : 0);
-    if (at.settings) {
+    if (at.settings)
         cv->set = *at.settings;
-    } else if (t->from_tiers) {
-        tiers_settings vs;
-        int def_k = 0, def_m = 0;
-        bool has_def = false;
-        size_t tv_nstores = 0;
-        bool all_sc = false;
-        pthread_mutex_lock(&t->cmu);
-        tiers_view_settings_for(&t->tview, vol, &vs);
-        tv_nstores = t->tview.nstores;
-        all_sc = tv_nstores > 0;
-        for (size_t i = 0; i < tv_nstores; i++)
-            if (!t->tview.stores[i].single_copy)
-                all_sc = false;
-        has_def = tier_default_geom((int)tv_nstores, all_sc, &def_k, &def_m);
-        pthread_mutex_unlock(&t->cmu);
-        tier_settings_from_cfg(&t->cfg, &cv->set);
-        cv->set.from_tiers = true;
-        if (vs.set_mask & TSDB_TIER_SET_REDUNDANCY) {
-            bool ok = vs.m == 0 ? (vs.k == 1 && all_sc)
-                                : (vs.k >= 1 && vs.k <= CHUNK_K_MAX && vs.m <= CHUNK_M_MAX &&
-                                   (int)vs.k + (int)vs.m <= (int)tv_nstores);
-            if (ok)
-                tier_settings_set_km(&cv->set, (int)vs.k, (int)vs.m);
-            else if (has_def)
-                tier_settings_set_km(&cv->set, def_k, def_m);
-        } else if (has_def) {
-            tier_settings_set_km(&cv->set, def_k, def_m);
-        }
-        cv->set.tier_after_s = t->ov_grace ? (uint64_t)t->cfg.grace_s : vs.tier_after_s;
-        cv->set.grace_s = t->ov_grace ? t->cfg.grace_s : (int64_t)vs.tier_after_s;
-        cv->set.tier_high_pct = vs.tier_high_pct;
-        cv->set.young_high_pct = vs.young_high_pct;
-        cv->set.rebuild_mb_s = vs.rebuild_mb_s;
-        cv->set.scrub_mb_s = vs.scrub_mb_s;
-        cv->set.scrub_days = vs.scrub_days;
-    } else {
-        tier_settings_from_cfg(&t->cfg, &cv->set);
-    }
+    else
+        tier_fill_vol_settings(t, vol, &cv->set);
     if ((rc = tier_meta_write(db, txt, es->vuuid)) != 0)
         return rc; /* the open fails; its eng_close detaches */
+    es->has_vuuid = true;
     db->tier_req = true; /* the one place it is set: META says requires=tier now, also at the first attach (E55) */
     memcpy(cv->vuuid, es->vuuid, 16);
     void *make_arg = at.make_arg;
@@ -1532,8 +1628,10 @@ void tier_engine_ready(eng *db)
         return;
     /* Seed FULL state synchronously before eng_open returns so a volume opened/reopened at >= young_high_pct
      * refuses inserts immediately, then start the per-volume 1 s sampler thread (isolated per volume). */
-    tierfill_eng_seed(db);
-    (void)tierfill_eng_start(db);
+    if (!db->tier->read_only) {
+        tierfill_eng_seed(db);
+        (void)tierfill_eng_start(db);
+    }
     tier *t = db->tier;
     pthread_mutex_lock(&t->cmu);
     if (db->ecstate->tier_opening) {
@@ -1577,7 +1675,7 @@ void tier_engine_unreg(eng *db)
 
 struct chunk_backend *tier_backend(const tier *t) { return t ? t->be : NULL; }
 
-const uint8_t *tier_vuuid(const eng *db) { return db->ecstate ? db->ecstate->vuuid : NULL; }
+const uint8_t *tier_vuuid(const eng *db) { return (db->ecstate && db->ecstate->has_vuuid) ? db->ecstate->vuuid : NULL; }
 
 static void tier_pause_store(tier *t, int i, const char *why)
 {
@@ -1646,7 +1744,7 @@ void tier_resume_if_all_up(tier *t)
 
 bool tier_writable(tier *t)
 {
-    if (!t || !t->be)
+    if (!t || !t->be || t->read_only)
         return false;
     if (atomic_load(&t->halted))
         return false;

@@ -357,7 +357,7 @@ static int cmp_part_order(const void *x, const void *y)
 static int open_listed_part(eng *db, const char *name, part **out)
 {
     if (ec_file_name(name))
-        return ecpart_follower_open(db, name, out); /* R7: a follower does not read .ec parts (D7) */
+        return ecpart_follower_open(db, name, out); /* R15 D13: read-only tier reads via eccache; without a tier, stops (D7) */
     int rc = part_open_as(db->dirfd, name, name, db->opt.pin_index, db->parts_v8, out);
     if (rc == TSDB_ERR_NOTFOUND) {
         char retired[256];

@@ -90,8 +90,10 @@ typedef struct tier {
     size_t eng_opening; /* engines between tier_engine_attach and tier_engine_ready (parts not loaded yet) */
     unsigned eng_active;
     char *dir; /* database root path (canonical if available), for tier_find_by_dir */
-    /* R15 (r15-open): loaded TIERS view & db_id when opened from TIERS, plus TSDB_TEST_TIER grace override flag */
+    /* R15 (r15-open, r15-follow): loaded TIERS view & db_id when opened from TIERS, read-only follower flag, plus
+     * TSDB_TEST_TIER grace override flag */
     bool from_tiers;
+    bool read_only;
     uint8_t db_id[16];
     tiers_view tview;
     bool ov_grace;
@@ -120,13 +122,17 @@ struct chunk_backend *tier_backend(const tier *t);
 bool tier_writable(tier *t);
 /* The volume's uuid (META's vuuid=, made once by the first open with a tier), for chunk idents; NULL without a tier. */
 const uint8_t *tier_vuuid(const eng *db);
-/* A follower's MANIFEST names an .ec part (ecpart_follower_open): the follower stops (eng_fail, one line; the code is
- * TSDB_ERR_IO, which follow_refresh passes up without its "broken part, keeping the previous view" line): it cannot
- * read the part (D7). What "stops" means: tsdb_failed reports it, and every refresh that meets an .ec name fails, so the
- * view does not move past the last MANIFEST without one; tsdbd sees tsdb_failed and exits. An embedded follower's queries
- * still answer from that last view (no query path checks eng_fail), as a follower that lags would: rows the writer
- * has since settled are the same rows, and the parts it maps stay readable while they are retired. */
+/* A follower without a tier attached meets an .ec part in MANIFEST (ecpart_follower_open): the follower stops
+ * (eng_fail, one line; the code is TSDB_ERR_IO, which follow_refresh passes up without its "broken part, keeping the
+ * previous view" line). Followers of a TIERS database instead open a read-only tier (R15 D13: stores on shared
+ * storage, opened without flock/EPOCH writes/deletes, store ids and db_id checked; missing non-LOST store or wrong
+ * db_id refused at start) and read .ec parts through their own eccache. A read-only tier keeps the TIERS store set
+ * seen at open and does not run the health or attach worker: a store replaced/removed later or hitting runtime EIO
+ * stays DOWN until the follower reopens, while reads decode around it as long as k positions remain. */
 int tier_follower_ec(eng *db, const char *name);
+/* R15 D13 (r15-follow): ensures a read-only/follower engine that opened before the writer wrote vuuid= into META has
+ * loaded vuuid= and registered its read-only coldvol before opening an .ec part. No-op once loaded or on writers. */
+int tier_follower_ensure_vuuid(eng *db);
 /* Planted bugs (tests/test_tier.c --mutant NAME; the Makefile requires each to fail it): each engine opens its own
  * backend (the second volume is BUSY); no chunk_be_see_epoch at attach (an unsure EPOCH stays unsure); a build without
  * TSDB_EC opens a requires=tier volume; the strict chunk_be_open (a missing store fails the open); a tier is new when
@@ -139,7 +145,9 @@ enum { TIER_MUT_NONE = 0, TIER_MUT_PERENGINE, TIER_MUT_UNSURE, TIER_MUT_NOEC, TI
        TIER_MUT_DBIDSKIP,  /* dbidskip: skips db_id verification when opening stores from TIERS */
        TIER_MUT_LOSTOPEN,  /* lostopen: opens a LOST store as UP instead of passing NULL (DOWN_MISSING) */
        TIER_MUT_DOWNNOREAD,   /* downnoread: reads are still sent to a DOWN store */
-       TIER_MUT_ATTACHNOHEAL  /* attachnoheal: returning store marked UP without healing */ };
+       TIER_MUT_ATTACHNOHEAL, /* attachnoheal: returning store marked UP without healing */
+       TIER_MUT_FOLLOWFLOCK,  /* followflock: label for CHUNK_MUT_FOLLOW_FLOCK (follower takes exclusive store flock) */
+       TIER_MUT_FOLLOWDEL     /* followdel: label for GC_MUT_FOLLOWDEL (writer deletes retired chunks immediately) */ };
 extern int tier_mutant;
 
 /* R15 (r15-health): per-store probes, runtime store DOWN, queued attach/heal worker, and tsdbd --health-domain hooks. */
@@ -307,6 +315,7 @@ struct ecstate {
     struct ecswap_eng *swap;     /* r7-swap (src/ecswap.c) */
     tierfill_state fill;         /* r15-full: atomic FULL hysteresis flag & refusal count (src/tierfill.c) */
     uint8_t vuuid[16];           /* r7-tier: META's vuuid= (tier_vuuid) */
+    bool has_vuuid;              /* r15-follow: true once vuuid= has been read and coldvol registered */
     struct coldvol *cold;        /* r8b-coldops: the volume's ops, epoch provider and settings (a reference) */
     struct chunk_backend *mut_be; /* r7-tier: the backend of the tierperengine mutant only */
     bool tier_opening;           /* r15-health: counted in tier->eng_opening until tier_engine_ready */

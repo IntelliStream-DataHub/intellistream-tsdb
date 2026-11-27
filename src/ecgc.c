@@ -66,6 +66,7 @@ int ecgc_mutant_parse(const char *name)
         {"holdatretire", GC_MUT_HOLDATRET},
         {"gcreplicanoop", GC_MUT_REPLICANOOP},
         {"releasenomark", GC_MUT_RELEASE_NOMARK},
+        {"followdel", GC_MUT_FOLLOWDEL},
     };
     if (!name)
         return -1;
@@ -898,7 +899,7 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
         unlinkat(db->dirfd, ge->name, 0);
         return true;
     }
-    if (!all && !db->ec_cluster && ge->deadline > now)
+    if (!all && !db->ec_cluster && ge->deadline > now && ecgc_mutant != GC_MUT_FOLLOWDEL)
         return false;
     if (!r->object) { /* a test-marked part: a file and nothing else */
         if (!all && ge->deadline > now)

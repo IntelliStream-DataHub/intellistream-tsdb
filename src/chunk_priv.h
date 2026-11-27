@@ -51,6 +51,7 @@ void chunk_rpool_destroy(chunk_rpool *p);
 struct chunk_backend {
     atomic_int n;
     int cap;                     /* allocated slots (>= n; fixed across runtime store additions for lock-free reads) */
+    bool read_only;              /* R15 D13: opened read-only (no flock, no EPOCH write, no put/del) */
     _Atomic(chunk_store *) *st;  /* NULL while DOWN; guarded by st_mu for swaps and ref acquisition */
     atomic_int *state;           /* CHUNK_STORE_* (an open store that failed in service reads as DOWN_IOERR) */
     atomic_bool *st_failed;      /* mirrors chunk_store_failed(st[i]) for lock-free chunk_be_store_state() */
@@ -128,6 +129,7 @@ chunk_store *chunk_be_raw_store(const chunk_backend *be, int i);
 /* Opens a store as chunk_store_open does, without the log lines of its refusals (the backend logs one line). */
 int chunk_store_open_quiet(const char *path, const uint8_t *expect_id, chunk_store **out);
 int chunk_store_open_db_quiet(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out);
+int chunk_store_open_ro_quiet(const char *path, const uint8_t *expect_id, chunk_store **out);
 /* A chunk's header without opening the whole chunk: any volume uuid (the caller learns it). */
 int chunk_store_peek(chunk_store *st, uint32_t volume, const uint8_t oid[16], unsigned pos, chunk_hdr *h);
 /* Names-only listing of one open store's volume directory via its open dirfd (no chunk files opened or read). */

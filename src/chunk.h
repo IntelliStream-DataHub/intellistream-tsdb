@@ -158,6 +158,13 @@ int chunk_store_open(const char *path, const uint8_t *expect_id, chunk_store **o
 /* Opens a store and, when expect_db is non-NULL, requires META's db= line to match expect_db (D3); a store of another
  * database (or without db=) is refused with CHUNK_ERR_STORE_ID naming both ids. */
 int chunk_store_open_db(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, chunk_store **out);
+/* Read-only store open flags (R15 D13, r15-follow): CHUNK_OPEN_RDONLY skips flock, EPOCH open/write, and tmp_*
+ * cleanup, and refuses all puts, deletes and epoch raises (TSDB_ERR_READONLY). Store META (id and expect_db) is still
+ * checked identically so a follower on shared storage refuses a wrong or foreign-db store. Direct callers/tests use
+ * chunk_store_open_flags; chunk_be_open2 uses the internal quiet helper chunk_store_open_ro_quiet. */
+enum { CHUNK_OPEN_RDONLY = 1 };
+int chunk_store_open_flags(const char *path, const uint8_t *expect_id, const uint8_t *expect_db, unsigned flags,
+                           chunk_store **out);
 void chunk_store_close(chunk_store *st);
 const uint8_t *chunk_store_id(const chunk_store *st);
 bool chunk_store_failed(const chunk_store *st); /* a failed write or sync: it acknowledges nothing more (reads go on) */
@@ -243,6 +250,8 @@ const char *chunk_store_state_name(int state);
  * none, may be up. */
 typedef struct chunk_be_opts {
     int min_up;
+    bool read_only; /* R15 D13: open every store with CHUNK_OPEN_RDONLY (no flock, no EPOCH, no tmp cleanup, no write/del) */
+    bool strict;    /* require every named (non-NULL) store path to open UP, as chunk_be_open does */
 } chunk_be_opts;
 /* The stores at paths[0..n); ids (n x 16 bytes) or NULL as chunk_store_open's expect_id. The fence of a volume is the
  * maximum over the stores that are UP at open: a DOWN store may have seen a higher epoch, so the caller gives the
@@ -508,7 +517,9 @@ enum { CHUNK_MUT_NONE = 0, CHUNK_MUT_NOSUMS, CHUNK_MUT_NOFENCE, CHUNK_MUT_EOF, C
        CHUNK_MUT_DOWNNOREAD,       /* reads are still sent to a DOWN store instead of decoding around it */
        CHUNK_MUT_ATTACHNOHEAL,     /* chunk_be_attach marks store UP without healing missing/damaged chunks */
        /* R15 r15-full mutant (tests/test_tier.c) */
-       CHUNK_MUT_STOREPUT96        /* skips the 95% store fill cap on regular puts */ };
+       CHUNK_MUT_STOREPUT96,       /* skips the 95% store fill cap on regular puts */
+       /* R15 r15-follow mutant (tests/test_tier.c) */
+       CHUNK_MUT_FOLLOW_FLOCK      /* read-only store open takes exclusive flock (blocking writer open) */ };
 extern int chunk_mutant;
 /* R15 r15-full test hooks (active only under TSDB_TEST_HOOKS): override store fs fill % (0..100; < 0 restores real
  * fstatvfs), globally or for stores matching `path`. chunk_store_fill_samples counts real fstatvfs() calls. */

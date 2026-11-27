@@ -572,6 +572,11 @@ int ecpart_load(eng *db, const char *name, bool read_only, part **out)
     *out = NULL;
     if (ecpart_mutant == EC_MUT_SKIPNAME)
         return 0; /* planted: the file is left alone, and its rows vanish */
+    if (read_only) {
+        int vrc = tier_follower_ensure_vuuid(db);
+        if (vrc != 0)
+            return vrc;
+    }
     int tier = meta_says_tier(db);
     if (tier < 0)
         return tier;
@@ -606,7 +611,20 @@ int ecpart_follower_open(eng *db, const char *name, part **out)
 {
     EC_CALLED(EC_CALL_FOLLOWER_OPEN);
     *out = NULL;
-    return tier_follower_ec(db, name); /* r7-tier: the follower stops with one line (D7) */
+    if (!db->tier)
+        return tier_follower_ec(db, name); /* no tier attached: the follower stops with one line */
+    int rc = tier_follower_ensure_vuuid(db);
+    if (rc != 0)
+        return rc;
+    rc = part_open_ec(db, name, name, out);
+    if (rc == TSDB_ERR_NOTFOUND) {
+        char retired[256];
+        snprintf(retired, sizeof retired, "retired_%s", name);
+        rc = part_open_ec(db, retired, name, out);
+    }
+    if (rc == 0)
+        (*out)->verify = db->opt.verify_checksums; /* eccache always checks cell sums; mirror open_listed_part */
+    return rc;
 }
 
 bool ec_index_intact(const part *p)

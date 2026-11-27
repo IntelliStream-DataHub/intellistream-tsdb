@@ -150,7 +150,9 @@ extern atomic_bool ec_test_assume_tier;
  * before the first .ec name; an .ec name without it is damage), or both an .ec part and its source with no intent
  * naming them, fail the open with a line (TSDB_ERR_CORRUPT): load_parts never leaves a part out quietly. */
 int ecpart_load(eng *db, const char *name, bool read_only, part **out);
-/* A follower's MANIFEST names an .ec part: the follower stops with one line (tier_follower_ec, D7). */
+/* A follower's MANIFEST names an .ec part: when attached to a read-only tier (R15 D13), opens the .ec part (or its
+ * retired_ name if the writer just retired it) through the follower's own eccache; without a tier attached, stops
+ * with one line (tier_follower_ec). */
 int ecpart_follower_open(eng *db, const char *name, part **out);
 /* part_index_intact of an .ec part: its record's hash, and the source's header, index, tombstones and footer against
  * the hash the open checked (a test-marked part: part_map_intact, its map is a whole part). */
