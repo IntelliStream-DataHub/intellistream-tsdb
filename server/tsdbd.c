@@ -3328,7 +3328,8 @@ static void handle_status(req *r)
                (unsigned long long)ss.installed, (unsigned long long)ss.refused_stale, (double)ss.install_ms / 1000,
                (unsigned long long)ss.kind5_bytes, (unsigned long long)ss.kind2_bytes);
         /* the peer data links up, by kind, frame check (--peer-check) and transport (tcp vs rdma) */
-        static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        static const char *const lkind[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb",
+                                                     "chunkr"};
         uint64_t lup[PL_NKINDS][4], ltr[PL_NKINDS][2];
         peerlink_up_by_check(lup);
         peerlink_up_by_transport(ltr);
@@ -6142,9 +6143,12 @@ static void tsdbd_peer_rdma_metrics(metrics_peer_rdma *out)
     out->qp_errors = gs.qp_errors;
 }
 
+_Static_assert(METRICS_PL_NKINDS == PL_NKINDS, "metrics and peerlink kind counts must match");
+
 static int parse_rdma_kind_name(const char *s, size_t n)
 {
-    static const char *const names[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+    static const char *const names[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb",
+                                                 "chunkr"};
     for (int k = 1; k < PL_NKINDS; k++)
         if (strlen(names[k]) == n && memcmp(names[k], s, n) == 0)
             return k;
@@ -6707,7 +6711,7 @@ int main(int argc, char **argv)
             break;
         case 0x11f:
             if (parse_rdma_kinds(optarg, &rdma_kinds) != 0) {
-                fprintf(stderr, "tsdbd: --peer-rdma-kinds %s: expected data kinds (log,bulk,fwd,fwdq,snap,chunk,chunkb; "
+                fprintf(stderr, "tsdbd: --peer-rdma-kinds %s: expected data kinds (log,bulk,fwd,fwdq,snap,chunk,chunkb,chunkr; "
                                 "meta always stays TCP)\n", optarg);
                 return 2;
             }

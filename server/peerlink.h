@@ -80,12 +80,12 @@
  * peerlink_adopt), and the dialer redials with backoff. */
 /* CHUNK (requests to a member's chunk stores and their answers) and CHUNKB (chunk puts as bulk files, under a rate cap
  * of their own) are server/chunksrv.c's, on a peerlink of its own as well (design-cluster-data.md §5.7, R8 D10); 5 is
- * R4's snapshot transfer. */
+ * R4's snapshot transfer; 8 (CHUNKR) is R9's rebuild reads (D11, D18, D20), isolated from foreground CHUNK traffic. */
 /* SNAP carries snapshots only (R4 plan D7: a COMMIT's file never waits behind a snapshot's), on the replication
  * driver's peerlink (repld.c hands its frames and files to server/rsnap.c). */
 enum { PL_KIND_META = 0, PL_KIND_LOG = 1, PL_KIND_BULK = 2, PL_KIND_FWD = 3, PL_KIND_FWDQ = 4, PL_KIND_SNAP = 5,
-       PL_KIND_CHUNK = 6, PL_KIND_CHUNKB = 7 };
-#define PL_KIND_DATA_MAX PL_KIND_CHUNKB /* data kinds are 1 .. this */
+       PL_KIND_CHUNK = 6, PL_KIND_CHUNKB = 7, PL_KIND_CHUNKR = 8 };
+#define PL_KIND_DATA_MAX PL_KIND_CHUNKR /* data kinds are 1 .. this */
 
 enum {
     PL_OK = 0,
@@ -141,7 +141,7 @@ enum {
     PL_RDMA_ON = 2,   /* require RDMA on enabled kinds: end connection instead of falling back to TCP */
 };
 
-#define PL_NKINDS 8
+#define PL_NKINDS 9
 #define PL_RDMA_POOLS_MAX 8
 
 struct plr_pool;

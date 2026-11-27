@@ -45,7 +45,12 @@
     X(CP_SNAP_HALFSWAP, "snap-halfswap")               /* a replica's install: v<N> renamed to v<N>.old (placed) */ \
     X(CP_SET_REMOVED, "set-removed")                   /* a removed replica's v<N> renamed .removed-, root synced (R4) */ \
     X(CP_MOVE_ADDED, "move-added")                     /* the Raft leader saw a move's REPLICA_ADD applied (cmove.c) */ \
-    X(CP_MOVE_SHRUNK, "move-shrunk")                   /* it saw the moved-out member leave the ISR, no REMOVE yet */
+    X(CP_MOVE_SHRUNK, "move-shrunk")                   /* it saw the moved-out member leave the ISR, no REMOVE yet */ \
+    X(CP_OUT_PROPOSED, "out-proposed")                 /* Raft leader proposed MEMBER_STATE OUT (R9) */              \
+    X(CP_FILL_WRITTEN, "fill-written")                 /* stripe fill wrote rebuilt chunk before next step (R9) */   \
+    X(CP_WHOLE_PROPOSED, "whole-proposed")             /* Raft leader proposed STRIPE_WHOLE for a filled pos (R9) */ \
+    X(CP_RETURN_SET, "return-set")                     /* Raft leader proposed STRIPE_SET returning a pos (R9) */    \
+    X(CP_RELEASE_GC, "release-gc")                     /* MK_GC release committed/applied for partial fill (R9) */
 
 enum crash_point_id {
 #define X(id, name) id,

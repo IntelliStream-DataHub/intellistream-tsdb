@@ -35,11 +35,15 @@ static const char cl_help[] =
     "usage: tsdb cluster secret FILE\n"
     "       tsdb cluster init PEER --secret-file F [options]\n"
     "       tsdb cluster node add PEER NEW_PEER --secret-file F\n"
+    "       tsdb cluster node hold PEER NODE (--for DUR | --release) --secret-file F\n"
+    "       tsdb cluster node out|drain|destroyed PEER NODE --secret-file F\n"
+    "       tsdb cluster node replace PEER OLD NEW --secret-file F\n"
     "       tsdb cluster volume add PEER NAME [--replicas N | --redundancy ec=K+M|replicas=N] --secret-file F\n"
     "       tsdb cluster volume gc resume PEER VOLUME --secret-file F\n"
     "       tsdb cluster volume force-leader PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster volume transfer PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster volume move PEER VOLUME --log --from NODE --to NODE [--cancel] --secret-file F\n"
+    "       tsdb cluster volume move PEER VOLUME --pos P --to NODE --secret-file F\n"
     "       tsdb cluster replica reset PEER VOLUME NODE --secret-file F\n"
     "       tsdb cluster status PEER --secret-file F\n"
        "       tsdb cluster user add|passwd|drop|grant|revoke|list|import PEER ... --secret-file F\n"
@@ -129,6 +133,42 @@ static int num(const char *flag, const char *s, uint32_t *out)
         return -1;
     }
     *out = (uint32_t)v;
+    return 0;
+}
+
+/* Duration in seconds (plain integer, or suffix s/m/h/d), bounded to 1 .. max_s (D3, D22). */
+static int dur_s(const char *flag, const char *s, uint32_t max_s, uint32_t *out)
+{
+    char *end;
+    unsigned long v = strtoul(s, &end, 10);
+    unsigned long mult = 1;
+    if (!*s || end == s) {
+        fprintf(stderr, "tsdb cluster: %s %s: expected a duration (e.g. 600s, 10m, 1h)\n", flag, s);
+        return -1;
+    }
+    if (*end) {
+        if (end[1] != '\0') {
+            fprintf(stderr, "tsdb cluster: %s %s: unknown unit (use s, m, h or d)\n", flag, s);
+            return -1;
+        }
+        if (*end == 's')
+            mult = 1;
+        else if (*end == 'm')
+            mult = 60;
+        else if (*end == 'h')
+            mult = 3600;
+        else if (*end == 'd')
+            mult = 86400;
+        else {
+            fprintf(stderr, "tsdb cluster: %s %s: unknown unit (use s, m, h or d)\n", flag, s);
+            return -1;
+        }
+    }
+    if (v == 0 || v > (unsigned long)max_s / mult) {
+        fprintf(stderr, "tsdb cluster: %s %s: expected 1 s to %" PRIu32 " s\n", flag, s, max_s);
+        return -1;
+    }
+    *out = (uint32_t)(v * mult);
     return 0;
 }
 
@@ -333,18 +373,42 @@ int cluster_cli(int argc, char **argv)
     const char *verb = argv[1], *addr = NULL, *newpeer = NULL, *secret_file = NULL;
     const char *superuser = NULL, *pwfile = NULL;
     uint32_t force_vol = 0, force_node = 0; /* volume force-leader */
-    int r4op = 0;                                         /* volume transfer, volume move, replica reset */
+    int r4op = 0, r9op = 0;                               /* R4 and R9 operator ops */
     const char *gc_vol = NULL;                            /* volume gc resume: a number or a name */
     uint32_t r4_vol = 0, r4_node = 0, mv_from = 0, mv_to = 0, mv_flags = 0;
+    uint32_t r9_node = 0, r9_node2 = 0, hold_for_s = 0, hold_flags = 0, mv_pos = 0;
+    int have_pos = 0, have_hold_for = 0;
     int i = 2;
     if (!strcmp(verb, "user"))
         return cluster_user_cli(argc, argv);
     if (!strcmp(verb, "node")) {
-        if (argc < 5 || strcmp(argv[2], "add") != 0)
+        if (argc >= 5 && !strcmp(argv[2], "add")) {
+            addr = argv[3];
+            newpeer = argv[4];
+            i = 5;
+        } else if (argc >= 5 && (!strcmp(argv[2], "hold") || !strcmp(argv[2], "out") || !strcmp(argv[2], "drain") ||
+                                 !strcmp(argv[2], "destroyed"))) {
+            addr = argv[3];
+            if (num("NODE", argv[4], &r9_node) != 0)
+                return 2;
+            r9op = !strcmp(argv[2], "hold")    ? CLUSTER_OP_NODE_HOLD
+                   : !strcmp(argv[2], "out")   ? CLUSTER_OP_NODE_OUT
+                   : !strcmp(argv[2], "drain") ? CLUSTER_OP_NODE_DRAIN
+                                               : CLUSTER_OP_NODE_DESTROYED;
+            i = 5;
+        } else if (argc >= 6 && !strcmp(argv[2], "replace")) {
+            addr = argv[3];
+            if (num("OLD", argv[4], &r9_node) != 0 || num("NEW", argv[5], &r9_node2) != 0)
+                return 2;
+            if (r9_node == r9_node2) {
+                fprintf(stderr, "tsdb cluster node replace: OLD and NEW must be different nodes\n");
+                return 2;
+            }
+            r9op = CLUSTER_OP_NODE_REPLACE;
+            i = 6;
+        } else {
             return cl_usage();
-        addr = argv[3];
-        newpeer = argv[4];
-        i = 5;
+        }
     } else if ((!strcmp(verb, "volume") && argc >= 6 && !strcmp(argv[2], "transfer")) ||
                (!strcmp(verb, "replica") && argc >= 6 && !strcmp(argv[2], "reset"))) {
         addr = argv[3];
@@ -399,6 +463,11 @@ int cluster_cli(int argc, char **argv)
                 {"--heartbeat-ms", &s.heartbeat_ms},
                 {"--isr-lag-ms", &s.isr_lag_ms},
                 {"--rebuild-after-s", &s.rebuild_after_s},
+                {"--failstop-out-s", &s.failstop_out_s},
+                {"--out-guard-pct", &s.out_guard_pct},
+                {"--out-guard-hold-s", &s.out_guard_hold_s},
+                {"--young-high-pct", &s.young_high_pct},
+                {"--rebuild-concurrency", &s.rebuild_concurrency},
                 {"--voter-replace-s", &s.voter_replace_s},
                 {"--voters", &s.voters},
                 {"--volumes-per-server", &s.volumes_per_server},
@@ -443,13 +512,56 @@ int cluster_cli(int argc, char **argv)
             i++;
             continue;
         }
+        if (r9op == CLUSTER_OP_NODE_HOLD && !strcmp(argv[i], "--release")) {
+            hold_flags |= CLUSTER_HOLD_RELEASE;
+            continue;
+        }
+        if (r9op == CLUSTER_OP_NODE_HOLD && i + 1 < argc && !strcmp(argv[i], "--for")) {
+            if (dur_s("--for", argv[i + 1], 86400, &hold_for_s) != 0)
+                return 2;
+            have_hold_for = 1;
+            i++;
+            continue;
+        }
         if (r4op == CLUSTER_OP_VOLUME_MOVE && (!strcmp(argv[i], "--log") || !strcmp(argv[i], "--cancel"))) {
             mv_flags |= !strcmp(argv[i], "--log") ? CLUSTER_MOVE_LOG : CLUSTER_MOVE_CANCEL;
+            continue;
+        }
+        if (r4op == CLUSTER_OP_VOLUME_MOVE && i + 1 < argc && !strcmp(argv[i], "--pos")) {
+            char *end;
+            unsigned long p = strtoul(argv[i + 1], &end, 10);
+            if (!argv[i + 1][0] || *end || p >= META_STRIPE_MAX) {
+                fprintf(stderr, "tsdb cluster volume move: --pos %s: expected 0 to %d\n", argv[i + 1],
+                        META_STRIPE_MAX - 1);
+                return 2;
+            }
+            mv_pos = (uint32_t)p;
+            have_pos = 1;
+            i++;
             continue;
         }
         if (r4op == CLUSTER_OP_VOLUME_MOVE && i + 1 < argc && (!strcmp(argv[i], "--from") || !strcmp(argv[i], "--to"))) {
             if (num(argv[i], argv[i + 1], !strcmp(argv[i], "--from") ? &mv_from : &mv_to) != 0)
                 return 2;
+            i++;
+            continue;
+        }
+        if (!strcmp(verb, "init") && i + 1 < argc &&
+            (!strcmp(argv[i], "--opening-hold-s") || !strcmp(argv[i], "--repl-retain-down-gb") ||
+             !strcmp(argv[i], "--balance-mb-s"))) {
+            char *end;
+            unsigned long v = strtoul(argv[i + 1], &end, 10);
+            unsigned long maxv = !strcmp(argv[i], "--opening-hold-s") ? 86400ul : 0x7ffffffful;
+            if (!argv[i + 1][0] || *end || v > maxv) {
+                fprintf(stderr, "tsdb cluster: %s %s: expected 0 to %lu\n", argv[i], argv[i + 1], maxv);
+                return 2;
+            }
+            if (!strcmp(argv[i], "--opening-hold-s"))
+                s.opening_hold_s = (uint32_t)v;
+            else if (!strcmp(argv[i], "--repl-retain-down-gb"))
+                s.repl_retain_down_gb = (uint32_t)v;
+            else
+                s.balance_mb_s = (uint32_t)v;
             i++;
             continue;
         }
@@ -521,7 +633,22 @@ int cluster_cli(int argc, char **argv)
                         "--cluster-secret-file)\n");
         return 2;
     }
-    if (r4op == CLUSTER_OP_VOLUME_MOVE && (!(mv_flags & CLUSTER_MOVE_LOG) || !mv_from || !mv_to || mv_from == mv_to)) {
+    if (r9op == CLUSTER_OP_NODE_HOLD) {
+        int rel = (hold_flags & CLUSTER_HOLD_RELEASE) != 0;
+        if (rel == have_hold_for) {
+            fprintf(stderr, "tsdb cluster node hold: give exactly one of --for DUR or --release\n");
+            return 2;
+        }
+    }
+    if (r4op == CLUSTER_OP_VOLUME_MOVE && have_pos) {
+        if (mv_flags || mv_from || !mv_to) {
+            fprintf(stderr, "tsdb cluster volume move --pos: --pos P and --to NODE are required (no --log/--from)\n");
+            return 2;
+        }
+        r4op = 0;
+        r9op = CLUSTER_OP_VOLUME_MOVE_POS;
+    } else if (r4op == CLUSTER_OP_VOLUME_MOVE &&
+               (!(mv_flags & CLUSTER_MOVE_LOG) || !mv_from || !mv_to || mv_from == mv_to)) {
         fprintf(stderr, "tsdb cluster volume move: --log, --from NODE and --to NODE (another node) are required\n");
         return 2;
     }
@@ -551,6 +678,16 @@ int cluster_cli(int argc, char **argv)
     if (!strcmp(verb, "init")) {
         op = CLUSTER_OP_INIT;
         rl = cluster_settings_encode(&s, mode, req);
+    } else if (r9op) {
+        op = r9op;
+        if (op == CLUSTER_OP_NODE_HOLD)
+            rl = cluster_node_hold_encode(r9_node, hold_for_s, hold_flags, req);
+        else if (op == CLUSTER_OP_NODE_REPLACE)
+            rl = cluster_node_replace_encode(r9_node, r9_node2, req);
+        else if (op == CLUSTER_OP_VOLUME_MOVE_POS)
+            rl = cluster_volume_move_pos_encode(r4_vol, mv_pos, mv_to, req);
+        else
+            rl = cluster_node_op_encode(r9_node, req);
     } else if (!strcmp(verb, "node")) {
         op = CLUSTER_OP_NODE_ADD;
         size_t n = strlen(newpeer);
@@ -610,8 +747,8 @@ int cluster_cli(int argc, char **argv)
         }
         if (rc != 0) {
             if ((op == CLUSTER_OP_VOLUME_FORCE || op == CLUSTER_OP_VOLUME_ADD || op == CLUSTER_OP_VOLUME_ADD_EC ||
-                 op == CLUSTER_OP_VOLUME_GC_RESUME ||
-                 r4op) && len) /* the leader's reason, e.g. how many members qualify for a stripe group */
+                 op == CLUSTER_OP_VOLUME_GC_RESUME || r4op ||
+                 r9op) && len) /* the leader's reason, e.g. how many members qualify for a stripe group */
                 fprintf(stderr, "tsdb cluster %s %s: %.*s\n", verb, argv[2], (int)len, (const char *)reply);
             fprintf(stderr, "tsdb cluster %s: %s\n", verb, cluster_strerror(rc));
             free(reply);
@@ -631,7 +768,7 @@ int cluster_cli(int argc, char **argv)
             for (size_t k = 0; k < 4 && k < len; k++)
                 number |= (uint32_t)reply[k] << (8 * k);
             printf("added volume %s: number %" PRIu32 "\n", newpeer, number);
-        } else if (op == CLUSTER_OP_VOLUME_FORCE || r4op) {
+        } else if (op == CLUSTER_OP_VOLUME_FORCE || r4op || r9op) {
             printf("%.*s\n", (int)len, (const char *)reply);
         } else if (op == CLUSTER_OP_VOLUME_GC_RESUME) {
             printf("volume %s: orphan collection resumed\n", gc_vol);

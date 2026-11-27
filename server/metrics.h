@@ -47,9 +47,10 @@ typedef struct metrics_chunk_peer {
 } metrics_chunk_peer;
 
 /* peer link RDMA transport and fault counters (design-rdma.md §5.2; peerlink.h + plrdma.h) */
+#define METRICS_PL_NKINDS 9
 #define METRICS_RDMA_FB_MAX 11
 typedef struct metrics_peer_rdma {
-    uint64_t up[8][2];                    /* [kind][0=tcp, 1=rdma] */
+    uint64_t up[METRICS_PL_NKINDS][2];       /* [kind][0=tcp, 1=rdma] */
     uint64_t fallbacks[METRICS_RDMA_FB_MAX]; /* indexed by PL_RDMA_FB_* */
     uint64_t credit_stalls;
     uint64_t rnr_retries;
@@ -72,7 +73,7 @@ typedef struct metrics_cfg {
      * NULL: not a cluster server */
     size_t (*margins)(metrics_margin **out);
     /* the peer data links up by kind and frame check type (peerlink_up_by_check); NULL: not a cluster server */
-    void (*peer_links)(uint64_t out[8][4]);
+    void (*peer_links)(uint64_t out[METRICS_PL_NKINDS][4]);
     /* the peer data links by transport and RDMA counters; NULL: not a cluster server */
     void (*peer_rdma)(metrics_peer_rdma *out);
     /* chunk read hedging, read-avoid and decoded cell counters per storage peer (E31); NULL: not a cluster server */

@@ -76,8 +76,18 @@ enum cluster_admin_op {
     /* R8: VOLUME_ADD's body then u8 k, u8 m (cluster_volume_add_ec_encode): an erasure-coded volume. An op of its own,
      * so that a server that predates it refuses it (unknown op) instead of adding a replicas volume */
     CLUSTER_OP_VOLUME_ADD_EC = 14,
+    /* R9 (R9 plan D22; server/cnode.c): operator node and stripe-position ops on the Raft leader. Reply: text.
+     * NODE_HOLD: u32 node, u32 for_s, u32 flags (CLUSTER_HOLD_RELEASE). NODE_OUT/DRAIN/DESTROYED: u32 node.
+     * NODE_REPLACE: u32 old_node, u32 new_node. VOLUME_MOVE_POS: u32 volume, u32 pos, u32 to. */
+    CLUSTER_OP_NODE_HOLD = 15,
+    CLUSTER_OP_NODE_OUT = 16,
+    CLUSTER_OP_NODE_DRAIN = 17,
+    CLUSTER_OP_NODE_REPLACE = 18,
+    CLUSTER_OP_NODE_DESTROYED = 19,
+    CLUSTER_OP_VOLUME_MOVE_POS = 20,
 };
 enum { CLUSTER_MOVE_LOG = 1, CLUSTER_MOVE_CANCEL = 2 }; /* CLUSTER_OP_VOLUME_MOVE's flags */
+enum { CLUSTER_HOLD_RELEASE = 1 };                      /* CLUSTER_OP_NODE_HOLD's flags */
 
 /* Results beside meta.h's META_ERR_* (an op's own result travels as that) */
 enum cluster_err {
@@ -137,12 +147,23 @@ struct cluster_isr_req {
     uint32_t node[META_REPLICAS_MAX];
     uint64_t rid[META_REPLICAS_MAX];
 };
+#define CLUSTER_REPORT_FILLS 256
+/* R9 (D10, D11): per-position stripe fill progress reported in HBS_FILL (skippable heartbeat section). */
+struct cluster_fill_report {
+    uint32_t volume;
+    uint32_t pos;
+    uint64_t version; /* stripe_version this fill is for */
+    uint64_t done;    /* objects filled so far */
+    uint64_t total;   /* objects to fill */
+    uint8_t whole;    /* 1 once every object below version is held and verified */
+};
 struct cluster_report {
-    uint32_t nvols, ndoms, nunreach, nisr;
+    uint32_t nvols, ndoms, nunreach, nisr, nfills;
     struct cluster_vol_report vols[CLUSTER_REPORT_VOLS];
     struct cluster_dom_report doms[CLUSTER_REPORT_DOMS];
     struct cluster_unreach unreach[CLUSTER_REPORT_UNREACH];
     struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
+    struct cluster_fill_report fills[CLUSTER_REPORT_FILLS];
 };
 /* A volume led here has a new request for the metadata group (any thread, an atomic store): the cluster thread sends
  * its next heartbeat within a duty round (100 ms) instead of after heartbeat_ms, so an ISR change waits that long. */
@@ -190,7 +211,7 @@ void cluster_set_peerlink(struct peerlink *pl);
  * registered for k, and a kind without one (or at or above CLUSTER_PL_KINDS) is refused with a line.
  * cluster_set_peerlink(pl) is this for PL_KIND_LOG and PL_KIND_BULK. Any thread; each kind's pointer follows the
  * shutdown order above. -1 for PL_KIND_META (the cluster thread's own) or a kind out of range, else 0. */
-#define CLUSTER_PL_KINDS 8
+#define CLUSTER_PL_KINDS 9
 int cluster_set_peerlink_kind(int kind, struct peerlink *pl);
 
 /* Promotion (design-cluster.md 6.2, r3e-failover). The Raft leader sends FENCE(v, fence) to the reachable ISR members of
@@ -383,6 +404,10 @@ int cluster_copy_caught_up(void);
 /* the number of chunk stores UP on this server (chunksrv_cluster.c), sent in every heartbeat (HBS_STORES): the
  * proposer of an erasure-coded volume picks its stripe group among the members that report one or more */
 void cluster_set_chunk_stores(uint32_t n);
+/* R9 (D5, D17; filled by r9-hb): HBS_NODE fields sent in every heartbeat. Any thread. */
+void cluster_set_opening(int opening);
+void cluster_set_failstop(int failstop);
+void cluster_set_fill_pct(uint8_t pct);
 /* The applied index through which the users watch has every change of the group's users (the index of the copy when
  * the watch was last given, or found to have, its users): a forwarded request's owner refuses it with UNAVAILABLE while
  * this is below the index the entry node's users were at (fwdreq.h), so a user added a moment ago is retried, never
@@ -510,6 +535,16 @@ size_t cluster_volume_move_encode(uint32_t volume, uint32_t from, uint32_t to, u
 int cluster_volume_move_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *from, uint32_t *to,
                                uint32_t *flags);
 int cluster_volume_force_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *node);
+/* R9 admin op bodies (D22): NODE_OUT/DRAIN/DESTROYED (4 bytes), NODE_HOLD (12 bytes), NODE_REPLACE (8 bytes),
+ * VOLUME_MOVE_POS (12 bytes); decoders accept exact lengths only (0, else -1). */
+size_t cluster_node_op_encode(uint32_t node, uint8_t *out);
+int cluster_node_op_decode(const uint8_t *p, size_t n, uint32_t *node);
+size_t cluster_node_hold_encode(uint32_t node, uint32_t for_s, uint32_t flags, uint8_t *out);
+int cluster_node_hold_decode(const uint8_t *p, size_t n, uint32_t *node, uint32_t *for_s, uint32_t *flags);
+size_t cluster_node_replace_encode(uint32_t old_node, uint32_t new_node, uint8_t *out);
+int cluster_node_replace_decode(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node);
+size_t cluster_volume_move_pos_encode(uint32_t volume, uint32_t pos, uint32_t to, uint8_t *out);
+int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *pos, uint32_t *to);
 
 /* The INIT body for `s` and the deployment's mode, an enum meta_mode (4 * (META_SETTINGS_WORDS + 1) bytes). */
 size_t cluster_settings_encode(const struct meta_settings *s, int mode, uint8_t *out);

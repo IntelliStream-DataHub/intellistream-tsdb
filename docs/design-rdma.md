@@ -611,7 +611,7 @@ per link in step 2. New keys (tsdbd_keys.h rows, docs/config.md):
 |---|---|---|---|
 | `cluster.peer.rdma` | `--peer-rdma` | `auto` | `off`, `auto` (use where both ends can, else TCP), `on` (a data link that cannot upgrade ends; for tests and for operators who want to know) |
 | `cluster.peer.rdma.device` | `--peer-rdma-device` | the first active InfiniBand port | `mlx4_0:1`: device and port; a list for servers with more than one. Unset, only ports whose link layer is InfiniBand (`IBV_LINK_LAYER_INFINIBAND`) are taken: a RoCE or iWARP port (port 2 of the test servers' ConnectX-3 is 40GbE) is used only when named (D10) |
-| `cluster.peer.rdma.kinds` | `--peer-rdma-kinds` | `log,bulk,fwd,fwdq,snap,chunk,chunkb` | the kinds that upgrade |
+| `cluster.peer.rdma.kinds` | `--peer-rdma-kinds` | `log,bulk,fwd,fwdq,snap,chunk,chunkb,chunkr` | the kinds that upgrade |
 | `cluster.peer.rdma.pool_mb` | `--peer-rdma-pool-mb` | 64 | registered memory per tsdbd and device, shared by its three peerlinks (§4) |
 | `cluster.peer.rdma.sl` | `--peer-rdma-sl` | `0` | the InfiniBand service level of the QPs: one number, or `KIND=SL,...` (`log=1,bulk=2,snap=2`); effective only where the subnet manager maps SLs to VLs (§4 "Sharing the port", D13) |
 | `cluster.peer.rdma.retry_s` | `--peer-rdma-retry-s` | 600 | a link that settled on TCP after a failure (not a decline for `not_built`, `off` or `kind`) offers again after this long (§5.3) |

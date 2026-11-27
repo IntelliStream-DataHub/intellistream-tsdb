@@ -1520,7 +1520,8 @@ static _Atomic uint64_t g_up[PL_NKINDS][4];    /* the process's connections up b
 static _Atomic uint64_t g_up_tr[PL_NKINDS][2]; /* the process's connections up by kind and transport (0: tcp, 1: rdma) */
 static _Atomic uint64_t g_rdma_fb[PL_RDMA_FB_MAX];
 
-static const char *const kname_tab[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+static const char *const kname_tab[PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb",
+                                                 "chunkr"};
 
 static const char *const rdma_fb_names[PL_RDMA_FB_MAX] = {
     [PL_RDMA_FB_NOT_BUILT] = "not_built",
@@ -1556,7 +1557,7 @@ static void rdma_cfg_get(const struct peerlink *pl, struct pl_rdma_cfg *out)
         pthread_mutex_unlock(&g_rdma_mu);
     }
     if (!out->kinds)
-        out->kinds = ((1u << (PL_KIND_DATA_MAX + 1)) - 1u) & ~1u; /* all data kinds 1..7, never META (0) */
+        out->kinds = ((1u << (PL_KIND_DATA_MAX + 1)) - 1u) & ~1u; /* all data kinds 1..8, never META (0) */
 }
 
 static void up_count(int kind, int type, int d)

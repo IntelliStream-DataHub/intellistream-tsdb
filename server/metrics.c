@@ -685,20 +685,22 @@ static void render(sb *b)
     }
 
     if (cfg.peer_links) { /* the peer links' frame check (--peer-check; a link runs at the stronger end's level) */
-        static const char *const kname[8] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        static const char *const kname[METRICS_PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk",
+                                                             "chunkb", "chunkr"};
         static const char *const cname[4] = {"", "none", "header", "full"};
-        uint64_t up[8][4];
+        uint64_t up[METRICS_PL_NKINDS][4];
         cfg.peer_links(up);
         family(b, "tsdb_peer_links", "gauge",
                "Peer link connections up now, by link kind and the frame check they run (none, header or full).");
-        for (int k = 1; k < 8; k++) /* the metadata link (kind 0) keeps its HMAC whatever the level */
+        for (int k = 1; k < METRICS_PL_NKINDS; k++) /* the metadata link (kind 0) keeps its HMAC whatever the level */
             for (int c = 1; c < 4; c++)
                 sb_add(b, "tsdb_peer_links{kind=\"%s\",check=\"%s\"} %llu\n", kname[k], cname[c],
                        (unsigned long long)up[k][c]);
     }
 
     if (cfg.peer_rdma) { /* peer links by transport (tcp vs rdma) and RDMA fault counters (design-rdma.md §5.2) */
-        static const char *const kname[8] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk", "chunkb"};
+        static const char *const kname[METRICS_PL_NKINDS] = {"meta", "log", "bulk", "fwd", "fwdq", "snap", "chunk",
+                                                             "chunkb", "chunkr"};
         static const char *const fbname[METRICS_RDMA_FB_MAX] = {
             "not_built", "off", "kind", "subnet", "pool", "qp", "timeout", "auth", "qp_error", "backoff", "bad",
         };
@@ -707,7 +709,7 @@ static void render(sb *b)
         cfg.peer_rdma(&rd);
         family(b, "tsdb_peer_links_transport", "gauge",
                "Peer link connections up now, by link kind and transport (tcp or rdma).");
-        for (int k = 1; k < 8; k++) {
+        for (int k = 1; k < METRICS_PL_NKINDS; k++) {
             sb_add(b, "tsdb_peer_links_transport{kind=\"%s\",transport=\"tcp\"} %llu\n", kname[k],
                    (unsigned long long)rd.up[k][0]);
             sb_add(b, "tsdb_peer_links_transport{kind=\"%s\",transport=\"rdma\"} %llu\n", kname[k],

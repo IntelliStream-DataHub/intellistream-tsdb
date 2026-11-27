@@ -102,6 +102,7 @@
 
 #include "meta.h"
 #include "peerlink.h"
+#include "place.h"
 #include "raft/raft.h"
 #include "raft/raft_log.h"
 #include "raft/raft_wire.h"
@@ -128,6 +129,7 @@
 #include <sys/statfs.h>
 #endif
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FRAME_MAX (16u << 20)
@@ -182,7 +184,8 @@ enum {
 };
 
 /* the sections of a heartbeat (after its address fields) */
-enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6, HBS_STORES = 7 };
+enum { HBS_NODE = 1, HBS_VOLUMES = 2, HBS_DOMAINS = 3, HBS_LEASE = 4, HBS_UNREACH = 5, HBS_ISR = 6, HBS_STORES = 7,
+       HBS_FILL = 8 };
 #define FREE_MIN_DEFAULT (1ull << 30) /* a state directory below this is not voter_ok (M11) */
 
 /* ------------------------------------------------------------------ bytes */
@@ -968,6 +971,12 @@ struct heard {
     struct cluster_isr_req isr[CLUSTER_REPORT_ISR];
     int have_stores;       /* HBS_STORES in its last heartbeat (R8): */
     uint32_t chunk_stores; /* its chunk stores that are UP (an EC volume's stripe group is picked among those with 1+) */
+    /* R9: HBS_NODE extensions (D5, D17; filled by r9-hb) and HBS_FILL (D10, D11) */
+    uint8_t opening;  /* 1 while the member is still running its first volume opens */
+    uint8_t failstop; /* 1 sent once in a last-gasp beat before fail-stop exit */
+    uint8_t fill_pct; /* 0..100 data-dir fill percentage (0xff: unknown) */
+    uint32_t nfills;
+    struct cluster_fill_report *fills;
 };
 
 struct addr_e {
@@ -1734,7 +1743,7 @@ static void heard_set(uint32_t id, uint64_t now, uint64_t inc, uint64_t applied,
                 oom();
         }
         h = &C.heard[C.nheard++];
-        *h = (struct heard){.id = id};
+        *h = (struct heard){.id = id, .fill_pct = 0xff};
     }
     h->ns = now;
     h->inc = inc;
@@ -2449,6 +2458,15 @@ static _Atomic uint32_t g_chunk_stores;
 
 void cluster_set_chunk_stores(uint32_t n) { atomic_store_explicit(&g_chunk_stores, n, memory_order_relaxed); }
 
+/* R9 (D5, D17; filled by r9-hb): HBS_NODE extra fields */
+static _Atomic int g_hb_opening;
+static _Atomic int g_hb_failstop;
+static _Atomic uint8_t g_hb_fill_pct = 0xff; /* 0xff: unknown until r9-hb reports statvfs fill % */
+
+void cluster_set_opening(int opening) { atomic_store_explicit(&g_hb_opening, opening != 0, memory_order_relaxed); }
+void cluster_set_failstop(int failstop) { atomic_store_explicit(&g_hb_failstop, failstop != 0, memory_order_relaxed); }
+void cluster_set_fill_pct(uint8_t pct) { atomic_store_explicit(&g_hb_fill_pct, pct, memory_order_relaxed); }
+
 /* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
  * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
  * its arrival), at most 2 s. The cluster thread raises it; any thread reads it lock-free (single-writer seqlock with
@@ -2515,6 +2533,9 @@ int cluster_copy_caught_up(void)
 static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
 {
     h->have_stores = 0; /* a beat without the section (a build before R8) reports no stores */
+    free(h->fills);     /* a beat without HBS_FILL reports no active fills (never retain stale entries) */
+    h->fills = NULL;
+    h->nfills = 0;
     while (!r->bad && r->off < r->len) {
         uint32_t type = get8(r);
         type |= (uint32_t)get8(r) << 8;
@@ -2584,6 +2605,12 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
         } else if (type == HBS_NODE) {
             uint8_t flags = get8(&s), dropped = get8(&s), rb = get8(&s);
             uint64_t fr = get64(&s);
+            uint8_t opening = 0, failstop = 0, fill_pct = 0xff;
+            if (!s.bad && s.off < s.len) {
+                opening = get8(&s);
+                failstop = get8(&s);
+                fill_pct = get8(&s);
+            }
             if (s.bad) {
                 r->bad = 1;
                 return;
@@ -2592,9 +2619,37 @@ static void heard_sections(struct heard *h, struct rd *r, uint64_t now)
             h->core_dropped = dropped;
             h->read_barrier = rb;
             h->state_free = fr;
+            h->opening = opening;
+            h->failstop = failstop;
+            h->fill_pct = fill_pct;
             h->have_flags = 1;
             int bad = !(flags & META_MF_VOTER_OK) || dropped;
             h->bad_ns = !bad ? 0 : h->bad_ns ? h->bad_ns : now;
+        } else if (type == HBS_FILL) {
+            uint32_t n = get32(&s);
+            if (s.bad || n > CLUSTER_REPORT_FILLS || (size_t)n * 33 > len) {
+                r->bad = 1;
+                return;
+            }
+            struct cluster_fill_report *nf = n ? calloc(n, sizeof *nf) : NULL;
+            if (n && !nf)
+                oom();
+            for (uint32_t i = 0; i < n; i++) {
+                nf[i].volume = get32(&s);
+                nf[i].pos = get32(&s);
+                nf[i].version = get64(&s);
+                nf[i].done = get64(&s);
+                nf[i].total = get64(&s);
+                nf[i].whole = get8(&s);
+            }
+            if (s.bad) {
+                free(nf);
+                r->bad = 1;
+                return;
+            }
+            free(h->fills);
+            h->fills = nf;
+            h->nfills = n;
         } else if (type == HBS_VOLUMES) {
             uint32_t n = get32(&s);
             if (s.bad || n > CLUSTER_REPORT_VOLS || (size_t)n * 62 > len) {
@@ -4183,6 +4238,69 @@ int cluster_volume_move_decode(const uint8_t *p, size_t n, uint32_t *volume, uin
     return 0;
 }
 
+size_t cluster_node_op_encode(uint32_t node, uint8_t *out)
+{
+    for (int j = 0; j < 4; j++)
+        out[j] = (uint8_t)(node >> (8 * j));
+    return 4;
+}
+
+int cluster_node_op_decode(const uint8_t *p, size_t n, uint32_t *node)
+{
+    if (n != 4)
+        return -1;
+    *node = le32(p);
+    return 0;
+}
+
+size_t cluster_node_hold_encode(uint32_t node, uint32_t for_s, uint32_t flags, uint8_t *out)
+{
+    uint32_t v[3] = {node, for_s, flags};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = (uint8_t)(v[i] >> (8 * j));
+    return 12;
+}
+
+int cluster_node_hold_decode(const uint8_t *p, size_t n, uint32_t *node, uint32_t *for_s, uint32_t *flags)
+{
+    if (n != 12)
+        return -1;
+    *node = le32(p);
+    *for_s = le32(p + 4);
+    *flags = le32(p + 8);
+    return 0;
+}
+
+size_t cluster_node_replace_encode(uint32_t old_node, uint32_t new_node, uint8_t *out)
+{
+    return cluster_volume_force_encode(old_node, new_node, out);
+}
+
+int cluster_node_replace_decode(const uint8_t *p, size_t n, uint32_t *old_node, uint32_t *new_node)
+{
+    return cluster_volume_force_decode(p, n, old_node, new_node);
+}
+
+size_t cluster_volume_move_pos_encode(uint32_t volume, uint32_t pos, uint32_t to, uint8_t *out)
+{
+    uint32_t v[3] = {volume, pos, to};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = (uint8_t)(v[i] >> (8 * j));
+    return 12;
+}
+
+int cluster_volume_move_pos_decode(const uint8_t *p, size_t n, uint32_t *volume, uint32_t *pos, uint32_t *to)
+{
+    if (n != 12)
+        return -1;
+    *volume = le32(p);
+    *pos = le32(p + 4);
+    *to = le32(p + 8);
+    return 0;
+}
+
 /* A volume's name: what clients name it by (letters, digits, '_', '-', '.'; not "." or ".."). */
 static int text_ok_cl(const char *s)
 {
@@ -5286,6 +5404,12 @@ static void on_admin(struct conn *c, struct rd *r)
     case CLUSTER_OP_VOLUME_TRANSFER: r4_admin(c, reqid, r, ctr_admin); break;
     case CLUSTER_OP_VOLUME_MOVE: r4_admin(c, reqid, r, cmove_admin); break;
     case CLUSTER_OP_REPLICA_RESET: r4_admin(c, reqid, r, cset_admin); break;
+    case CLUSTER_OP_NODE_HOLD: r4_admin(c, reqid, r, cnode_hold_admin); break;
+    case CLUSTER_OP_NODE_OUT: r4_admin(c, reqid, r, cnode_out_admin); break;
+    case CLUSTER_OP_NODE_DRAIN: r4_admin(c, reqid, r, cnode_drain_admin); break;
+    case CLUSTER_OP_NODE_REPLACE: r4_admin(c, reqid, r, cnode_replace_admin); break;
+    case CLUSTER_OP_NODE_DESTROYED: r4_admin(c, reqid, r, cnode_destroyed_admin); break;
+    case CLUSTER_OP_VOLUME_MOVE_POS: r4_admin(c, reqid, r, cnode_move_pos_admin); break;
     case CLUSTER_OP_STATUS: {
         struct buf b = {0};
         put_status(&b);
@@ -5678,6 +5802,9 @@ static void put_sections(struct buf *b, uint64_t now)
     put8(b, (uint8_t)(C.core_dropped || C.retired));
     put8(b, (uint8_t)(!C.rb_off));
     put64(b, free_bytes);
+    put8(b, (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0));
+    put8(b, (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0));
+    put8(b, atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed));
     sec_end(b, at);
     static struct cluster_report rep;
     memset(&rep, 0, sizeof rep);
@@ -5747,6 +5874,20 @@ static void put_sections(struct buf *b, uint64_t now)
     sec_end(b, at);
     at = sec_begin(b, HBS_STORES);
     put32(b, atomic_load_explicit(&g_chunk_stores, memory_order_relaxed));
+    sec_end(b, at);
+    if (rep.nfills > CLUSTER_REPORT_FILLS)
+        rep.nfills = 0;
+    at = sec_begin(b, HBS_FILL);
+    put32(b, rep.nfills);
+    for (uint32_t i = 0; i < rep.nfills; i++) {
+        const struct cluster_fill_report *f = &rep.fills[i];
+        put32(b, f->volume);
+        put32(b, f->pos);
+        put64(b, f->version);
+        put64(b, f->done);
+        put64(b, f->total);
+        put8(b, f->whole);
+    }
     sec_end(b, at);
 }
 
@@ -6967,6 +7108,121 @@ static void promote_duty(uint64_t now)
     }
 }
 
+/* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
+ * (re-placement / whole / return), balance_plan — and propose their output (one proposal per member/position at a
+ * time). Until their owning tracks fill them in, all three return 0 proposals and 0 log lines. */
+static void place_duty(uint64_t now)
+{
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised)
+        return;
+    struct timespec ts;
+    uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
+                           ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
+                           : now / MS;
+    uint32_t nm = C.sm.nmembers;
+    struct place_member *pm = nm ? calloc(nm, sizeof *pm) : NULL;
+    if (nm && !pm)
+        oom();
+    uint32_t total_fills = 0;
+    for (size_t i = 0; i < C.nheard; i++)
+        total_fills += C.heard[i].nfills;
+    struct place_fill *pf = total_fills ? calloc(total_fills, sizeof *pf) : NULL;
+    if (total_fills && !pf)
+        oom();
+    uint32_t nf = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        uint32_t id = C.sm.members[i].id;
+        struct heard *h = heard_get(id);
+        pm[i].id = id;
+        pm[i].fill_pct = 0xff; /* unknown unless reported in HBS_NODE */
+        uint64_t last = heard_ns(id, now);
+        pm[i].heard_age_ms = last ? since(now, last) / MS : UINT64_MAX;
+        if (h) {
+            pm[i].opening = h->opening;
+            pm[i].failstop = h->failstop;
+            pm[i].fill_pct = h->fill_pct;
+            pm[i].chunk_stores = h->have_stores ? h->chunk_stores : 0;
+            for (uint32_t j = 0; j < h->nvols && pm[i].nfaults < PLACE_FAULTS_MAX; j++) {
+                if (h->vols[j].v.health == CL_HEALTH_LOCAL_FAULT && h->vols[j].fault_ns) {
+                    pm[i].faults[pm[i].nfaults].volume = h->vols[j].v.volume;
+                    pm[i].faults[pm[i].nfaults].fault_s = since(now, h->vols[j].fault_ns) / (1000 * MS);
+                    pm[i].nfaults++;
+                }
+            }
+            for (uint32_t j = 0; j < h->nfills && nf < total_fills; j++) {
+                pf[nf].node = id;
+                pf[nf].volume = h->fills[j].volume;
+                pf[nf].pos = h->fills[j].pos;
+                pf[nf].stripe_version = h->fills[j].version;
+                pf[nf].done = h->fills[j].done;
+                pf[nf].total = h->fills[j].total;
+                pf[nf].whole = h->fills[j].whole;
+                nf++;
+            }
+        }
+    }
+    struct place_in in = {
+        .sm = &C.sm,
+        .members = pm,
+        .nmembers = nm,
+        .fills = pf,
+        .nfills = nf,
+        .now_ms = wall_ms,
+        .mono_ms = now / MS,
+        .self_id = C.id,
+    };
+    place_settings_default(&in.set);
+    in.set.rebuild_after_s = C.sm.set.rebuild_after_s;
+    in.set.opening_hold_s = C.sm.set.opening_hold_s;
+    in.set.failstop_out_s = C.sm.set.failstop_out_s;
+    in.set.out_guard_pct = C.sm.set.out_guard_pct;
+    in.set.out_guard_hold_s = C.sm.set.out_guard_hold_s;
+    in.set.repl_retain_down_gb = C.sm.set.repl_retain_down_gb;
+    in.set.young_high_pct = C.sm.set.young_high_pct;
+    in.set.balance_mb_s = C.sm.set.balance_mb_s;
+    in.set.rebuild_concurrency = C.sm.set.rebuild_concurrency;
+    struct place_out out;
+    place_out_init(&out);
+    pout_plan(&in, &out);
+    place_plan(&in, &out);
+    balance_plan(&in, &out);
+    for (uint32_t i = 0; i < out.nlogs; i++)
+        say("%s", out.logs[i].msg);
+    for (uint32_t i = 0; i < out.nprops && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
+        const struct place_prop *p = &out.props[i];
+        if (p->kind == PLACE_PROP_MEMBER_STATE) {
+            if (pend_member(p->node))
+                continue;
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_member_state(&e, p->node, p->state, p->version, p->reason,
+                                 p->state == META_DOWN ? wall_ms : 0, wall_ms);
+            (void)propose(&e, 0, 0, p->node);
+        } else if (p->kind == PLACE_PROP_REPLICA_ADD) {
+            /* TODO(r9-plan): route automatic log moves through cmove so g_mv tracks the move (progress,
+             * min_isr, status, and cancel). Do not propose a bare REPLICA_ADD directly. */
+            say("place: REPLICA_ADD for vol %" PRIu32 " skipped (awaiting cmove wiring in r9-plan)", p->volume);
+            continue;
+        } else if (p->kind == PLACE_PROP_STRIPE_SET) {
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_stripe_set(&e, p->volume, p->pos, p->node, p->version, p->reason, p->other_node);
+            (void)propose(&e, 0, 0, 0);
+        } else if (p->kind == PLACE_PROP_STRIPE_WHOLE) {
+            struct meta_entry e;
+            meta_entry_init(&e);
+            meta_op_stripe_whole(&e, p->volume, p->pos, p->version);
+            (void)propose(&e, 0, 0, 0);
+        } else if (p->kind == PLACE_PROP_VOLUME_TRANSFER) {
+            (void)ctr_move_start(p->volume, p->node, now);
+        }
+        /* TODO(r9-whole, r9-return): wire PLACE_PROP_GC_RELEASE and PLACE_PROP_MOVE_CANCEL once handlers land. */
+    }
+    place_out_free(&out);
+    free(pf);
+    free(pm);
+}
+
 static void leader_duties(uint64_t now)
 {
     if (!C.r || raft_get_role(C.r) != RAFT_LEADER)
@@ -7001,6 +7257,7 @@ static void leader_duties(uint64_t now)
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
+        place_duty(now);
     }
 }
 
@@ -7539,6 +7796,7 @@ void cluster_stop(void)
     for (size_t i = 0; i < C.nheard; i++) {
         free(C.heard[i].vols);
         free(C.heard[i].doms);
+        free(C.heard[i].fills);
     }
     free(C.heard);
     free(C.addrs);

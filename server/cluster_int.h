@@ -82,5 +82,12 @@ void cmove_trace(const struct meta_state *sm, uint64_t index, const char *path);
 void cset_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 /* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes the REPLICA_ADD/REMOVE/RESET lines of <state-dir>/setop */
 void cset_setop_file(const char *path);
+/* server/cnode.c (R9, r9-ops): CLUSTER_OP_NODE_* and CLUSTER_OP_VOLUME_MOVE_POS on the Raft leader */
+void cnode_hold_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_out_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_drain_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_replace_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_destroyed_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
+void cnode_move_pos_admin(uint64_t conn, uint32_t reqid, const uint8_t *body, size_t n);
 
 #endif

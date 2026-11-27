@@ -18104,6 +18104,110 @@ static void scen_r4stubs(void)
     }
 }
 
+static int bytes_has(const uint8_t *buf, size_t len, const char *sub)
+{
+    size_t n = strlen(sub);
+    if (!buf || n > len)
+        return 0;
+    for (size_t i = 0; i + n <= len; i++)
+        if (memcmp(buf + i, sub, n) == 0)
+            return 1;
+    return 0;
+}
+
+/* r9stubs (r9-iface): R9's operator verbs reach their stubs on the Raft leader (including via a follower redirect)
+ * and answer "not built" against a 3-node cluster without disturbing cluster health. */
+static void scen_r9stubs(void)
+{
+    scenario("r9stubs");
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "3 voters up before r9stubs");
+    await_view(1, p_names_leader, &ids[0], "follower 1 knows leader before r9stubs");
+    char p0[META_ADDR_MAX], p1[META_ADDR_MAX], args[PATH_MAX * 2 + 512], out[8192];
+    peer_of(0, p0, sizeof p0);
+    peer_of(1, p1, sizeof p1);
+    /* Each new R9 CLI verb hits the Raft leader (half via follower p1 to verify NOTLEADER redirect) and returns
+     * "not built" with exit 1. */
+    static const struct {
+        const char *fmt;
+        int via_follower;
+        const char *expect;
+    } verbs[] = {
+        {"node hold %s 2 --for 600s", 0, "node hold of node 2 for 600 s: not built"},
+        {"node hold %s 2 --release", 1, "node hold release of node 2: not built"},
+        {"node out %s 2", 0, "node out of node 2: not built"},
+        {"node drain %s 2", 1, "node drain of node 2: not built"},
+        {"node replace %s 2 3", 0, "node replace of node 2 with node 3: not built"},
+        {"node destroyed %s 2", 1, "node destroyed of node 2: not built"},
+        {"volume move %s 1 --pos 0 --to 2", 1, "volume 1 move pos 0 to node 2: not built"},
+    };
+    for (size_t k = 0; k < sizeof verbs / sizeof verbs[0]; k++) {
+        char v[256];
+        snprintf(v, sizeof v, verbs[k].fmt, verbs[k].via_follower ? p1 : p0);
+        snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
+        int rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 1 || !strstr(out, verbs[k].expect))
+            die("tsdb cluster %s: exit %d, wanted \"%s\": %s", v, rc, verbs[k].expect, out);
+        printf("  %s: %s", v, out);
+    }
+    /* Malformed bodies sent directly to the leader are refused by each decoder with META_ERR_INVALID. */
+    uint8_t badbody[16] = {0};
+    static const uint8_t r9ops[6] = {CLUSTER_OP_NODE_HOLD,    CLUSTER_OP_NODE_OUT,       CLUSTER_OP_NODE_DRAIN,
+                                     CLUSTER_OP_NODE_REPLACE, CLUSTER_OP_NODE_DESTROYED, CLUSTER_OP_VOLUME_MOVE_POS};
+    for (int k = 0; k < 6; k++) {
+        uint8_t *reply = NULL;
+        size_t len = 0;
+        int arc = admin(0, r9ops[k], badbody, 5, 0, &reply, &len);
+        if (arc != META_ERR_INVALID || !bytes_has(reply, len, "got 5"))
+            die("op %u with 5-byte body: rc %d (%s)", r9ops[k], arc, cluster_strerror(arc));
+        free(reply);
+    }
+    /* D23 init flags are wired into meta_settings (r9-meta); sending init to an already-init cluster returns exit 1
+     * ("already") rather than exit 2 ("not built" / usage error). */
+    snprintf(args, sizeof args,
+             "cluster init %s --secret-file %s --opening-hold-s 600 --failstop-out-s 30 --out-guard-pct 20 "
+             "--out-guard-hold-s 3600 --repl-retain-down-gb 32 --young-high-pct 85 --balance-mb-s 100 "
+             "--rebuild-concurrency 2",
+             p0, secret_path);
+    int irc = cli_run(args, NULL, out, sizeof out);
+    if (irc != 1 || strstr(out, "not built"))
+        die("tsdb cluster init with D23 flags: exit %d, wanted 1 (already init): %s", irc, out);
+    /* CLI argument validation errors exit 2 before contacting the server. */
+    static const char *const badcli[] = {
+        "node hold %s 2",
+        "node hold %s 2 --for 60s --release",
+        "node hold %s 2 --for 86401s",
+        "node replace %s 2 2",
+        "volume move %s 1 --log --pos 0 --to 2",
+        "volume move %s 1 --pos 0",
+        "volume move %s 1 --pos 99 --to 2",
+    };
+    for (size_t k = 0; k < sizeof badcli / sizeof badcli[0]; k++) {
+        char v[256];
+        snprintf(v, sizeof v, badcli[k], p0);
+        snprintf(args, sizeof args, "cluster %s --secret-file %s", v, secret_path);
+        int rc = cli_run(args, NULL, out, sizeof out);
+        if (rc != 2)
+            die("tsdb cluster %s: exit %d, wanted 2: %s", v, rc, out);
+    }
+    /* Verify the 3-node cluster remains completely healthy after all stub calls. */
+    uint32_t vnum = 0;
+    int rc = vol_add(0, "r9health", 3, &vnum);
+    if (rc != 0 || vnum == 0)
+        die("cluster health check volume add failed after r9stubs: %s", cluster_strerror(rc));
+    await_view(0, p_voters, &three, "3 voters still up after r9stubs");
+    for (int i = 0; i < 3; i++) {
+        struct state_want w = {ids[i], META_UP, 1};
+        await_view(0, p_member_state, &w, "member still UP after r9stubs");
+    }
+    printf("  cluster healthy after r9stubs: 3 nodes up, created volume r9health (#%" PRIu32 ")\n", vnum);
+}
+
 /* volcmd (r4-iface): the plumbing R4's tracks build on, before any of them sends. The Raft leader (server 0, hook
  * TSDB_CLUSTER_TEST volcmd_file=1) sends each VOLCMD kind to server 1 (the F_VOLCMD frame) and to itself (the
  * self-delivery of cl_volcmd_send); each server's driver routes it (IN_CMD: TRANSFER and CANCEL to rtransfer.c,
@@ -20894,7 +20998,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast}};

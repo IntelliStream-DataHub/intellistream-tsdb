@@ -120,7 +120,7 @@ static const struct cfg_key tsdbd_keys[] = {
     CK_L("cluster.peer.rdma.device", "peer-rdma-device", "",
          "RDMA device and port (NAME[:PORT], comma-separated list for multiple fabrics). Default: the first active "
          "InfiniBand port (RoCE and iWARP ports are used only when named)."),
-    CK_L("cluster.peer.rdma.kinds", "peer-rdma-kinds", "log,bulk,fwd,fwdq,snap,chunk,chunkb",
+    CK_L("cluster.peer.rdma.kinds", "peer-rdma-kinds", "log,bulk,fwd,fwdq,snap,chunk,chunkb,chunkr",
          "Data link kinds that upgrade to RDMA (comma-separated; the metadata link always stays TCP)."),
     CK_Z("cluster.peer.rdma.pool_mb", "peer-rdma-pool-mb", "MB", "64",
          "Registered memory per tsdbd and RDMA device, shared by its peerlinks (default 64 MiB: 32 KiB slots, 1 MiB "
