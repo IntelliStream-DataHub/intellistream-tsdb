@@ -6,6 +6,7 @@
 #include "tsdb.h"
 #include "../client/tsdb_client.h"
 #include "../src/chunk.h"
+#include "../src/disk.h"
 #include "../src/ecdiverge.h"
 #include "tsdb_calendar.h"
 
@@ -87,12 +88,114 @@ static int chunk_store_cli(int argc, char **argv)
     return 0;
 }
 
+/* `tsdb disk init PATH[:CLASS] [--chunks]` and `tsdb disk show PATH` (docs/design-cluster-data.md §15.1, D11). */
+static int disk_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: tsdb disk init PATH[:CLASS] [--chunks]\n"
+                        "       tsdb disk show PATH\n");
+        return 2;
+    }
+    if (strcmp(argv[1], "init") == 0) {
+        const char *arg = NULL;
+        bool want_chunks = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--chunks") == 0) {
+                want_chunks = true;
+            } else if (!arg && argv[i][0] != '-') {
+                arg = argv[i];
+            } else {
+                arg = NULL;
+                break;
+            }
+        }
+        if (!arg || !*arg) {
+            fprintf(stderr, "usage: tsdb disk init PATH[:CLASS] [--chunks]\n");
+            return 2;
+        }
+        char pathbuf[PATH_MAX];
+        int cls = DISK_CLASS_NONE;
+        const char *slash = strrchr(arg, '/');
+        const char *colon = strrchr(slash ? slash + 1 : arg, ':');
+        if (colon) {
+            size_t plen = (size_t)(colon - arg);
+            if (plen == 0 || plen >= sizeof pathbuf) {
+                fprintf(stderr, "tsdb disk init: invalid path '%s'\n", arg);
+                return 2;
+            }
+            cls = disk_class_parse(colon + 1);
+            if (cls == DISK_CLASS_NONE) {
+                fprintf(stderr, "tsdb disk init: unknown class '%s' (expected nvme, ssd or hdd)\n", colon + 1);
+                return 2;
+            }
+            memcpy(pathbuf, arg, plen);
+            pathbuf[plen] = '\0';
+        } else {
+            if (strlen(arg) >= sizeof pathbuf) {
+                fprintf(stderr, "tsdb disk init: path too long\n");
+                return 2;
+            }
+            snprintf(pathbuf, sizeof pathbuf, "%s", arg);
+        }
+        drop_root(pathbuf);
+        disk_meta d;
+        char why[512];
+        int rc = disk_init2(pathbuf, cls, NULL, want_chunks, &d, why, sizeof why);
+        if (rc != 0) {
+            fprintf(stderr, "tsdb disk init: %s\n", why[0] ? why : tsdb_strerror(rc));
+            return 1;
+        }
+        char hex[33];
+        chunk_oid_hex(d.store_id, hex);
+        printf("disk %s: id %s, class %s, sync_p50 %" PRIu64 " us\n",
+               pathbuf, hex, disk_class_name(d.disk_class), d.sync_p50_us);
+        return 0;
+    }
+    if (strcmp(argv[1], "show") == 0) {
+        if (argc != 3 || !argv[2][0] || argv[2][0] == '-') {
+            fprintf(stderr, "usage: tsdb disk show PATH\n");
+            return 2;
+        }
+        const char *path = argv[2];
+        drop_root(path);
+        disk_meta d;
+        int rc = disk_load(path, &d);
+        if (rc != 0) {
+            if (rc == TSDB_ERR_NOTFOUND)
+                fprintf(stderr, "tsdb disk show: %s: no %s metadata file\n", path, DISK_META_FILE);
+            else if (rc != TSDB_ERR_CORRUPT) /* disk_load already logged the corrupt path */
+                fprintf(stderr, "tsdb disk show: %s: %s\n", path, tsdb_strerror(rc));
+            return 1;
+        }
+        char shex[33], chex[33];
+        chunk_oid_hex(d.store_id, shex);
+        printf("path: %s\n", path);
+        printf("version: %" PRIu32 "\n", d.version);
+        printf("store_id: %s\n", shex);
+        printf("class: %s\n", disk_class_name(d.disk_class));
+        printf("sync_p50_us: %" PRIu64 "\n", d.sync_p50_us);
+        if (d.bound) {
+            chunk_oid_hex(d.cluster_uuid, chex);
+            printf("cluster: %s\n", chex);
+            printf("node: %" PRIu32 "\n", d.node_id);
+        } else {
+            printf("cluster: (unbound)\n");
+            printf("node: (unbound)\n");
+        }
+        return 0;
+    }
+    fprintf(stderr, "usage: tsdb disk init PATH[:CLASS] [--chunks]\n"
+                    "       tsdb disk show PATH\n");
+    return 2;
+}
+
 static void usage(void) __attribute__((noreturn));
 static void usage(void)
 {
     fprintf(stderr,
             "usage: tsdb <dir> <command> [args]\n"
             "       tsdb cluster secret|init|node add|status ... (tsdb cluster for the details)\n"
+            "       tsdb disk init PATH[:CLASS] [--chunks] | show PATH   (initialise or inspect a disk)\n"
             "       tsdb chunk-store init PATH --cluster UUID --node ID   (a chunk store for tsdbd --chunk-dir)\n"
             "       tsdb --version\n"
             "\n"
@@ -1607,6 +1710,8 @@ int main(int argc, char **argv)
         printf("tsdb %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION);
         return 0;
     }
+    if (argc >= 2 && strcmp(argv[1], "disk") == 0)
+        return disk_cli(argc - 1, argv + 1);
     if (argc >= 2 && strcmp(argv[1], "chunk-store") == 0)
         return chunk_store_cli(argc - 1, argv + 1);
     /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory. Before the argument count check:
