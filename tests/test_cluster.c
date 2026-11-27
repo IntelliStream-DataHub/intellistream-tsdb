@@ -554,6 +554,9 @@ static void stop_all(void)
         }
 }
 
+static uint32_t init_rebuild_after_s, init_failstop_out_s, init_opening_hold_s, init_out_guard_pct,
+    init_out_guard_hold_s; /* r9-out scenarios (0: default) */
+
 static void scenario(const char *name)
 {
     stop_all();
@@ -567,6 +570,11 @@ static void scenario(const char *name)
     strict_reads = 0;
     fwd_on = 0;
     epoll_after_two = 0;
+    init_rebuild_after_s = 0;
+    init_failstop_out_s = 0;
+    init_opening_hold_s = 0;
+    init_out_guard_pct = 0;
+    init_out_guard_hold_s = 0;
     memset(is_witness, 0, sizeof is_witness);
     memset(auth_on, 0, sizeof auth_on);
     snprintf(base, sizeof base, "%s/%s", root, name);
@@ -790,6 +798,16 @@ static void init_mode(int i, uint32_t replace_s, int mode)
         s.transfer_wait_ms = init_transfer_wait_ms;
     if (init_leader_balance_s)
         s.leader_balance_s = init_leader_balance_s;
+    if (init_rebuild_after_s)
+        s.rebuild_after_s = init_rebuild_after_s;
+    if (init_failstop_out_s)
+        s.failstop_out_s = init_failstop_out_s;
+    if (init_opening_hold_s)
+        s.opening_hold_s = init_opening_hold_s;
+    if (init_out_guard_pct)
+        s.out_guard_pct = init_out_guard_pct;
+    if (init_out_guard_hold_s)
+        s.out_guard_hold_s = init_out_guard_hold_s;
     if (init_r4_set) {
         s.rebuild_mb_s = 300;
         s.rebuild_max = 3;
@@ -20955,6 +20973,382 @@ static void scen_openfast(void)
            dt1, dt2);
 }
 
+/* ---- r9-out: DOWN -> OUT timers, holds, opening hold, mass-OUT guard, failstop fast path, replica faults */
+
+static void pout_touch(int i, const char *name, const char *body)
+{
+    char dir[PATH_MAX + 80], p[PATH_MAX + 128];
+    server_dir(i, dir, sizeof dir);
+    snprintf(p, sizeof p, "%s/state/%s", dir, name);
+    FILE *f = fopen(p, "w");
+    if (!f)
+        die("fopen %s: %s", p, strerror(errno));
+    if (body)
+        fputs(body, f);
+    fclose(f);
+}
+
+static void pout_unlink(int i, const char *name)
+{
+    char dir[PATH_MAX + 80], p[PATH_MAX + 128];
+    server_dir(i, dir, sizeof dir);
+    snprintf(p, sizeof p, "%s/state/%s", dir, name);
+    (void)unlink(p);
+}
+
+static int member_state_of(int via, uint32_t id, uint8_t *reason, uint64_t *hold_until)
+{
+    struct view v;
+    view(via, &v);
+    const struct meta_member *m = meta_member(&v.m, id);
+    int st = m ? (int)m->state : -1;
+    if (reason)
+        *reason = m ? m->down_reason : 0;
+    if (hold_until)
+        *hold_until = m ? m->hold_until_ms : 0;
+    view_free(&v);
+    return st;
+}
+
+static void pout_boot5(void)
+{
+    for (int i = 0; i < 5; i++)
+        start(i);
+    init_cluster(0, 600);
+    for (int i = 1; i < 5; i++)
+        node_add(0, i);
+    unsigned five = 5;
+    await_view(0, p_voters, &five, "five voters up");
+}
+
+/* outtimer: 5 nodes, rebuild_after_s=6, guard 25%. Stopping 1 node marks it DOWN, keeps it DOWN before 6 s, and
+ * transitions it to OUT at ~6 s; also exercises crash point `out-proposed` on the Raft leader after OUT commits. */
+static void scen_outtimer(void)
+{
+    scenario("outtimer");
+    init_rebuild_after_s = 6;
+    init_out_guard_pct = 25;
+    init_out_guard_hold_s = 15;
+    penv[0] = "TSDB_CRASH_AT=out-proposed";
+    pout_boot5();
+
+    stop(4, SIGKILL);
+    struct state_want down = {ids[4], META_DOWN, 0};
+    await_view(1, p_member_state, &down, "node 5 marked DOWN");
+    uint64_t t_down = now_ms();
+
+    /* Stay DOWN well before 6 s (at ~4 s), and crash point must not have fired yet. */
+    while (now_ms() - t_down < 4000)
+        usleep(100000);
+    if (member_state_of(1, ids[4], NULL, NULL) != META_DOWN)
+        die("outtimer: node 5 left META_DOWN too early (at %" PRIu64 " ms)", now_ms() - t_down);
+    if (await_exit(0, 10) != -1)
+        die("outtimer: leader exited before rebuild_after_s");
+
+    /* At ~6 s OUT commits and fires CP_OUT_PROPOSED (status 99) on leader 0. */
+    int ex = await_exit(0, 12000);
+    uint64_t dt = now_ms() - t_down;
+    if (ex != CRASH_EXIT_STATUS || !log_has(0, "crash point out-proposed"))
+        die("outtimer: expected leader 0 to hit out-proposed (exit 99), got exit %d", ex);
+    if (dt < 5000)
+        die("outtimer: OUT committed too early (%" PRIu64 " ms < 5000 ms)", dt);
+
+    struct state_want out = {ids[4], META_OUT, 0};
+    await_view(1, p_member_state, &out, "node 5 recorded META_OUT on surviving quorum");
+
+    /* Restart leader 0 without the crash point and verify it recovers with node 5 still OUT. */
+    penv[0] = NULL;
+    start(0);
+    await_view(0, p_member_state, &out, "restarted server 0 sees node 5 META_OUT");
+    printf("  outtimer: node 5 OUT after %" PRIu64 " ms, leader hit out-proposed (exit 99) and recovered\n", dt);
+}
+
+/* outback: an OUT member that returns under a new incarnation transitions back to UP (D2). */
+static void scen_outback(void)
+{
+    scenario("outback");
+    init_rebuild_after_s = 4;
+    init_out_guard_pct = 25;
+    pout_boot5();
+
+    stop(4, SIGKILL);
+    struct state_want out = {ids[4], META_OUT, 0};
+    await_view(0, p_member_state, &out, "node 5 marked OUT");
+
+    start(4);
+    struct state_want back = {ids[4], META_UP, 2};
+    await_view(0, p_member_state, &back, "returning OUT node 5 back to UP with incarnation >= 2");
+    check_all_agree(0, 5);
+    printf("  outback: node 5 transitioned OUT -> UP on restart\n");
+}
+
+/* outguard: 2 of 5 DOWN (> 25% guard), rebuild_after_s=4, out_guard_hold_s=12. No OUT before 12 s; both OUT after
+ * with "guard bound passed" logged. */
+static void scen_outguard(void)
+{
+    scenario("outguard");
+    init_rebuild_after_s = 4;
+    init_out_guard_pct = 25;
+    init_out_guard_hold_s = 12;
+    pout_boot5();
+
+    stop(3, SIGKILL);
+    stop(4, SIGKILL);
+    struct state_want d3 = {ids[3], META_DOWN, 0}, d4 = {ids[4], META_DOWN, 0};
+    await_view(0, p_member_state, &d3, "node 4 marked DOWN");
+    await_view(0, p_member_state, &d4, "node 5 marked DOWN");
+    uint64_t t_down = now_ms();
+
+    /* Past rebuild_after_s (4 s), still well before out_guard_hold_s (12 s): neither may be OUT. */
+    while (now_ms() - t_down < 8000)
+        usleep(100000);
+    if (member_state_of(0, ids[3], NULL, NULL) != META_DOWN || member_state_of(0, ids[4], NULL, NULL) != META_DOWN)
+        die("outguard: node went OUT while mass-OUT guard should hold (at %" PRIu64 " ms)", now_ms() - t_down);
+
+    struct state_want o3 = {ids[3], META_OUT, 0}, o4 = {ids[4], META_OUT, 0};
+    await_view(0, p_member_state, &o3, "node 4 OUT after guard bound passed");
+    await_view(0, p_member_state, &o4, "node 5 OUT after guard bound passed");
+    uint64_t dt = now_ms() - t_down;
+    if (dt < 10500)
+        die("outguard: OUT happened too early (%" PRIu64 " ms < 10500 ms)", dt);
+    if (!log_has(0, "guard bound passed"))
+        die("outguard: leader log missing 'guard bound passed'");
+    printf("  outguard: held 2/5 DOWN past rebuild_after, OUT at %" PRIu64 " ms with guard bound passed\n", dt);
+}
+
+/* outhold: a 2-day hold is refused by meta apply (D3); a valid 14 s hold keeps a DOWN node from going OUT past
+ * rebuild_after_s=4 until the hold expires. */
+static void scen_outhold(void)
+{
+    scenario("outhold");
+    init_rebuild_after_s = 4;
+    init_out_guard_pct = 25;
+    envs[0] = "node_hold_file=1";
+    pout_boot5();
+
+    /* 2 days (172800 s > META_HOLD_MAX_MS 86400 s) must be refused, leaving hold_until_ms == 0. Wait until the
+     * Raft applied index actually advances past the proposal so we prove meta_apply ran and refused it. */
+    uint64_t applied0 = 0;
+    {
+        struct view v;
+        view(0, &v);
+        applied0 = v.m.applied;
+        view_free(&v);
+    }
+    pout_touch(0, "nodehold", "5 172800\n");
+    await_log(0, "nodehold node 5 for 172800 s: proposed", 5000, "2-day nodehold proposed");
+    uint64_t t_ref = now_ms();
+    for (;;) {
+        struct view v;
+        view(0, &v);
+        uint64_t ap = v.m.applied;
+        view_free(&v);
+        if (ap > applied0)
+            break;
+        if (now_ms() - t_ref > 5000)
+            die("outhold: 2-day NODE_HOLD entry never committed/applied");
+        usleep(50000);
+    }
+    uint64_t hold = 0;
+    (void)member_state_of(0, ids[4], NULL, &hold);
+    if (hold != 0)
+        die("outhold: 2-day hold was applied (hold_until_ms=%" PRIu64 ")", hold);
+
+    /* Apply a valid 14 s hold on node 5. */
+    pout_touch(0, "nodehold", "5 14\n");
+    uint64_t t_hold = now_ms();
+    for (;;) {
+        (void)member_state_of(0, ids[4], NULL, &hold);
+        if (hold != 0)
+            break;
+        if (now_ms() - t_hold > 5000)
+            die("outhold: 14 s hold never applied");
+        usleep(100000);
+    }
+
+    stop(4, SIGKILL);
+    struct state_want down = {ids[4], META_DOWN, 0};
+    await_view(0, p_member_state, &down, "held node 5 marked DOWN");
+
+    /* Well past rebuild_after_s (4 s), still well inside the 14 s hold: must remain META_DOWN. */
+    while (now_ms() - t_hold < 9500)
+        usleep(100000);
+    if (member_state_of(0, ids[4], NULL, NULL) != META_DOWN)
+        die("outhold: held node 5 went OUT early at %" PRIu64 " ms", now_ms() - t_hold);
+
+    /* After the 14 s hold expires, node 5 goes OUT. */
+    struct state_want out = {ids[4], META_OUT, 0};
+    await_view(0, p_member_state, &out, "node 5 OUT after hold expired");
+    uint64_t dt = now_ms() - t_hold;
+    if (dt < 12500)
+        die("outhold: node 5 went OUT before hold expired (%" PRIu64 " ms)", dt);
+    printf("  outhold: 2-day hold refused; 14 s hold kept node 5 DOWN until %" PRIu64 " ms\n", dt);
+}
+
+/* outopening: a DOWN server restarted while reporting opening=1 gets its new incarnation recorded immediately (so
+ * vol_watch_duty does not deadlock), stays META_DOWN held past rebuild_after_s=4 up to opening_hold_s=8 (~12 s total),
+ * goes OUT once the opening bound passes, and returns UP on a fresh restart once opening clears. */
+static void scen_outopening(void)
+{
+    scenario("outopening");
+    init_rebuild_after_s = 4;
+    init_opening_hold_s = 8;
+    init_out_guard_pct = 25;
+    envs[4] = "hb_opening_file=1";
+    pout_boot5();
+
+    stop(4, SIGKILL);
+    struct state_want down = {ids[4], META_DOWN, 0};
+    await_view(0, p_member_state, &down, "node 5 marked DOWN before opening restart");
+    uint64_t t_down = now_ms();
+
+    /* Restart server 4 stuck in opening=1: incarnation must advance to 2 immediately while state remains META_DOWN
+     * (proving vol_watch_duty is unblocked and opening does not deadlock volume opens). */
+    pout_touch(4, "hbopening", "1\n");
+    start(4);
+    struct state_want down2 = {ids[4], META_DOWN, 2};
+    await_view(0, p_member_state, &down2, "opening node 5 recorded incarnation 2 while staying META_DOWN");
+
+    /* Past rebuild_after_s (4 s), still inside 4 + 8 = 12 s: must stay META_DOWN (neither UP nor OUT). */
+    while (now_ms() - t_down < 8000)
+        usleep(100000);
+    int st = member_state_of(0, ids[4], NULL, NULL);
+    if (st != META_DOWN)
+        die("outopening: node 5 state %d (expected META_DOWN) at %" PRIu64 " ms while opening", st, now_ms() - t_down);
+
+    /* Past 4 + 8 = 12 s: opening hold bound expires and node 5 goes OUT despite opening=1. */
+    struct state_want out = {ids[4], META_OUT, 2};
+    await_view(0, p_member_state, &out, "node 5 OUT after opening_hold_s bound passed");
+    uint64_t dt = now_ms() - t_down;
+    if (dt < 10500)
+        die("outopening: node 5 went OUT too early (%" PRIu64 " ms < 10500 ms)", dt);
+
+    /* Clearing opening and restarting (incarnation 3) brings node 5 back to META_UP. */
+    pout_unlink(4, "hbopening");
+    stop(4, SIGTERM);
+    start(4);
+    struct state_want back = {ids[4], META_UP, 3};
+    await_view(0, p_member_state, &back, "node 5 UP on restart after opening cleared");
+    printf("  outopening: recorded inc 2 while DOWN+opening, held past 4 s, OUT at %" PRIu64 " ms, UP on restart\n", dt);
+}
+
+/* outfailstop: a fail-stop last-gasp heartbeat respects promote_safe_ns (no premature DOWN or volume promotion while
+ * the old leader's read lease is still valid), then marks the server DOWN(failstop) and transitions it to OUT in
+ * failstop_out_s=2 instead of rebuild_after_s=12. */
+static void scen_outfailstop(void)
+{
+    scenario("outfailstop");
+    init_rebuild_after_s = 12;
+    init_failstop_out_s = 2;
+    init_out_guard_pct = 25;
+    for (int i = 0; i < 5; i++)
+        envs[i] = "hb_failstop_file=1";
+    pout_boot5();
+
+    uint32_t vnum = 0;
+    int rc = vol_add(0, "fsvol", 3, &vnum);
+    if (rc != 0 || vnum != 1)
+        die("outfailstop: volume add fsvol failed: %s", cluster_strerror(rc));
+    await_isr(0, "fsvol", 3, 20000, "fsvol 3-replica ISR before failstop");
+
+    struct meta_volume v;
+    if (!vol_rec(0, "fsvol", &v))
+        die("outfailstop: missing fsvol record");
+    /* Ensure the fail-stopping volume leader is NOT the Raft leader (server 0) so Raft quorum stays smooth. */
+    int target = -1;
+    for (uint32_t k = 0; k < v.nrep; k++) {
+        int s = server_of(v.rep[k].node);
+        if (s > 0) {
+            target = s;
+            break;
+        }
+    }
+    if (target < 0)
+        die("outfailstop: no non-zero replica for fsvol");
+    if (v.leader != ids[target]) {
+        uint8_t tbody[8], *treply = NULL;
+        size_t trlen = 0, tblen = cluster_volume_force_encode(vnum, ids[target], tbody);
+        rc = admin(0, CLUSTER_OP_VOLUME_TRANSFER, tbody, tblen, 1, &treply, &trlen);
+        free(treply);
+        if (rc != 0)
+            die("outfailstop: transfer fsvol to server %d: %s", target, cluster_strerror(rc));
+        uint64_t tw = now_ms();
+        while (!vol_rec(0, "fsvol", &v) || v.leader != ids[target]) {
+            if (now_ms() - tw > 15000)
+                die("outfailstop: fsvol did not transfer to server %d", target);
+            usleep(50000);
+        }
+    }
+    uint64_t ep0 = v.epoch;
+    /* Let at least one heartbeat cycle grant target a fresh read lease (lease_ms = 2000). */
+    usleep(400000);
+
+    pout_touch(target, "hbfailstop", "1\n");
+    uint64_t t_fs = now_ms();
+    /* Lease safety: before lease_ms (~2000 ms) runs out, target must stay META_UP and fsvol must NOT promote. */
+    while (now_ms() - t_fs < 1200) {
+        if (member_state_of(0, ids[target], NULL, NULL) != META_UP)
+            die("outfailstop: node %" PRIu32 " marked DOWN before read lease expired (at %" PRIu64 " ms)", ids[target],
+                now_ms() - t_fs);
+        if (vol_rec(0, "fsvol", &v) && v.epoch != ep0)
+            die("outfailstop: fsvol promoted from epoch %" PRIu64 " to %" PRIu64 " before lease expired (at %" PRIu64
+                " ms)",
+                ep0, v.epoch, now_ms() - t_fs);
+        usleep(50000);
+    }
+
+    for (;;) {
+        uint8_t reason = 0;
+        if (member_state_of(0, ids[target], &reason, NULL) == META_DOWN && reason == META_DOWN_FAILSTOP)
+            break;
+        if (now_ms() - t_fs > 8000)
+            die("outfailstop: node %" PRIu32 " was not marked DOWN(failstop) within 8 s", ids[target]);
+        usleep(50000);
+    }
+    uint64_t t_down = now_ms();
+    /* Server exits after its last-gasp beat. */
+    stop(target, SIGKILL);
+
+    struct state_want out = {ids[target], META_OUT, 0};
+    await_view(0, p_member_state, &out, "fail-stopped node marked OUT");
+    uint64_t dt = now_ms() - t_down;
+    if (dt > 7000)
+        die("outfailstop: OUT took %" PRIu64 " ms (expected ~2 s, well below rebuild_after_s=12 s)", dt);
+    printf("  outfailstop: lease held >=1200 ms, DOWN(failstop) at %" PRIu64 " ms, OUT in %" PRIu64
+           " ms (rebuild_after_s=12 s)\n",
+           t_down - t_fs, dt);
+}
+
+/* replfault: an UP member reporting LOCAL_FAULT on volume 1 continuously for failstop_out_s=2 triggers a
+ * PLACE_PROP_REPLICA_ADD replace-replica request while keeping the server UP (D6). */
+static void scen_replfault(void)
+{
+    scenario("replfault");
+    init_rebuild_after_s = 60;
+    init_failstop_out_s = 2;
+    init_out_guard_pct = 25;
+    /* Server 2 (member id 3) reports CL_HEALTH_LOCAL_FAULT (1) on volume 1. */
+    envs[2] = "vol=1/2/1/1/fault";
+    for (int i = 0; i < 3; i++)
+        start(i);
+    init_cluster(0, 600);
+    node_add(0, 1);
+    node_add(0, 2);
+    unsigned three = 3;
+    await_view(0, p_voters, &three, "three voters up");
+
+    uint32_t vnum = 0;
+    int rc = vol_add(0, "rfault", 3, &vnum);
+    if (rc != 0 || vnum != 1)
+        die("replfault: volume add failed: %s (vnum=%" PRIu32 ")", cluster_strerror(rc), vnum);
+
+    await_log(0, "place: REPLICA_ADD for vol 1 replaces 3", 12000,
+              "replace-replica request for faulted replica on node 3");
+    if (member_state_of(0, ids[2], NULL, NULL) != META_UP)
+        die("replfault: server 2 should remain META_UP on a per-replica fault");
+    printf("  replfault: continuous LOCAL_FAULT on vol 1 node 3 emitted replace-replica request while server stayed UP\n");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -21001,7 +21395,10 @@ int main(int argc, char **argv)
                {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
-               {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast}};
+               {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},
+               {"outtimer", scen_outtimer}, {"outback", scen_outback}, {"outguard", scen_outguard},
+               {"outhold", scen_outhold}, {"outopening", scen_outopening}, {"outfailstop", scen_outfailstop},
+               {"replfault", scen_replfault}};
     int n = (int)(sizeof all / sizeof all[0]);
     for (int a = 2; a < argc; a++) { /* a name that matches nothing would run nothing and print OK */
         int known = 0;

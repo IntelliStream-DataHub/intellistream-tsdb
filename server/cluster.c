@@ -100,6 +100,7 @@
 #include "cluster.h"
 #include "cluster_int.h"
 
+#include "crashpt.h"
 #include "meta.h"
 #include "peerlink.h"
 #include "place.h"
@@ -993,6 +994,7 @@ struct pend {
     uint64_t join; /* a NODE_ADD's MEMBER_ADD: the link to the new server, which gets JOIN once it applied */
     uint32_t volume; /* a VOLUME_ADD: its number + 1, the reply's body once committed (0: none) */
     struct upend *user; /* a USER_PUT or USER_DEL (malloc'ed; NULL: none) */
+    int is_out;      /* 1 for an automatic MEMBER_STATE OUT proposal (fires CP_OUT_PROPOSED on commit) */
 };
 
 /* A user op's pending reply (S2-1): once applied it waits in C.uwait until every member reported an applied index at
@@ -1182,6 +1184,12 @@ static struct {
     char volcmdfile[1100];
     int setop_file;      /* TSDB_CLUSTER_TEST setop_file=1: the Raft leader proposes <state-dir>/setop (cset.c) */
     char setopfile[1100];
+    int hb_opening_file;  /* TSDB_CLUSTER_TEST hb_opening_file=1: HBS_NODE.opening=1 while <state-dir>/hbopening exists */
+    char hbopeningfile[1100];
+    int hb_failstop_file; /* TSDB_CLUSTER_TEST hb_failstop_file=1: HBS_NODE.failstop=1 while <state-dir>/hbfailstop exists */
+    char hbfailstopfile[1100];
+    int node_hold_file;   /* TSDB_CLUSTER_TEST node_hold_file=1: leader proposes NODE_HOLD lines in <state-dir>/nodehold */
+    char nodeholdfile[1100];
     int stall_file;      /* TSDB_CLUSTER_TEST sync_stall_file=1: the worker holds a sync while <state-dir>/stall exists */
     char stallfile[1100];
     char holdopensfile[1100];
@@ -1490,6 +1498,12 @@ static void test_knobs(void)
             C.volcmd_file = v != 0;
         else if (sscanf(p, "setop_file=%llu", &v) == 1)
             C.setop_file = v != 0;
+        else if (sscanf(p, "hb_opening_file=%llu", &v) == 1)
+            C.hb_opening_file = v != 0;
+        else if (sscanf(p, "hb_failstop_file=%llu", &v) == 1)
+            C.hb_failstop_file = v != 0;
+        else if (sscanf(p, "node_hold_file=%llu", &v) == 1)
+            C.node_hold_file = v != 0;
         else if (sscanf(p, "isr_replay=%llu", &v) == 1)
             C.isr_replay = v != 0;
         else if (sscanf(p, "sync_stall_file=%llu", &v) == 1)
@@ -2467,6 +2481,10 @@ void cluster_set_opening(int opening) { atomic_store_explicit(&g_hb_opening, ope
 void cluster_set_failstop(int failstop) { atomic_store_explicit(&g_hb_failstop, failstop != 0, memory_order_relaxed); }
 void cluster_set_fill_pct(uint8_t pct) { atomic_store_explicit(&g_hb_fill_pct, pct, memory_order_relaxed); }
 
+/* R9 (D4, r9-out): count of times automatic OUT proceeded past the mass-OUT guard bound (for metrics). */
+static _Atomic uint64_t g_out_guard_passed;
+uint64_t cluster_out_guard_passed(void) { return atomic_load_explicit(&g_out_guard_passed, memory_order_relaxed); }
+
 /* R8 (D9): the floor of cluster_copy_caught_up: the Raft leader's commit index heard last and the time (iso_now_ns)
  * until which no other leader can have committed past it: the lease that heartbeat gave (from its send time, never
  * its arrival), at most 2 s. The cluster thread raises it; any thread reads it lock-free (single-writer seqlock with
@@ -2726,7 +2744,7 @@ static uint64_t heard_ns(uint32_t id, uint64_t now)
     return h ? h->ns : 0;
 }
 
-static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t index, uint64_t term)
+static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t index, uint64_t term, int is_out)
 {
     if (C.npend == C.cappend) {
         C.cappend = C.cappend ? C.cappend * 2 : 16;
@@ -2734,7 +2752,7 @@ static void pend_add(uint64_t conn, uint32_t reqid, uint32_t member, uint64_t in
         if (!C.pend)
             oom();
     }
-    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume, C.pend_user};
+    C.pend[C.npend++] = (struct pend){conn, reqid, member, index, term, C.pend_join, C.pend_volume, C.pend_user, is_out};
     C.pend_user = NULL;
 }
 
@@ -2760,10 +2778,13 @@ static void uwait_add(const struct pend *p, uint64_t index)
 /* entry `index` (`term`) applied with the first operation's result rc0: answer whoever waited for it */
 static void pend_applied(uint64_t index, uint64_t term, int rc0)
 {
+    int fire_out_cp = 0;
     for (size_t i = 0; i < C.npend;) {
         struct pend *p = &C.pend[i];
         if (p->index <= index) {
             int rc = p->index == index && p->term == term ? rc0 : CLUSTER_ERR_RETRY;
+            if (p->is_out && rc == 0)
+                fire_out_cp = 1;
             struct conn *d = p->join ? conn_by_serial(p->join) : NULL;
             if (p->user) {
                 if (p->conn && rc == 0)
@@ -2786,6 +2807,8 @@ static void pend_applied(uint64_t index, uint64_t term, int rc0)
             i++;
         }
     }
+    if (fire_out_cp)
+        crash_point(CP_OUT_PROPOSED);
 }
 
 static int pend_member(uint32_t member)
@@ -3712,18 +3735,23 @@ static void core_stop(struct meta_state *next)
 
 /* Proposes `e` (and frees it); whoever waits for it (an admin reply on `conn`, a member's state) is registered
  * before the core runs: a single voter commits and applies inside the pump. */
-static iso_err propose(struct meta_entry *e, uint64_t conn, uint32_t reqid, uint32_t member)
+static iso_err propose_ex(struct meta_entry *e, uint64_t conn, uint32_t reqid, uint32_t member, int is_out)
 {
     meta_entry_finish(e);
     raft_index idx = 0;
     iso_err rc = raft_propose(C.r, e->buf, e->len, &idx);
     meta_entry_free(e);
     if (rc == ISO_OK)
-        pend_add(conn, reqid, member, idx, raft_get_term(C.r));
+        pend_add(conn, reqid, member, idx, raft_get_term(C.r), is_out);
     else if (conn)
         admin_reply(conn, reqid, CLUSTER_ERR_RETRY, NULL, 0);
     pump();
     return rc;
+}
+
+static iso_err propose(struct meta_entry *e, uint64_t conn, uint32_t reqid, uint32_t member)
+{
+    return propose_ex(e, conn, reqid, member, 0);
 }
 
 /* ------------------------------------------------------------------ frames from peers */
@@ -3816,7 +3844,7 @@ static void on_hb(struct conn *c, struct rd *r)
     /* the lease (§7.1): only the Raft leader grants, and only while its own lease from the core holds (check-quorum:
      * no other Raft leader can exist before it ends), so an answer is never given after a new Raft leader began its
      * wait of one lease */
-    uint64_t until = h->send_ns && !promo_holds_lease(node) ? core_lease_until(now) : 0;
+    uint64_t until = h->send_ns && !h->failstop && !promo_holds_lease(node) ? core_lease_until(now) : 0;
     int granted = until != 0;
     if (granted && until != UINT64_MAX && now >= until) /* only the mutants can: test_cluster lease looks for it */
         say("BUG: grants node %" PRIu32 " a lease %" PRIu64 " ms past the end of its own (term %" PRIu64 ")", node,
@@ -5802,8 +5830,16 @@ static void put_sections(struct buf *b, uint64_t now)
     put8(b, (uint8_t)(C.core_dropped || C.retired));
     put8(b, (uint8_t)(!C.rb_off));
     put64(b, free_bytes);
-    put8(b, (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0));
-    put8(b, (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0));
+    uint8_t hb_open = (uint8_t)(atomic_load_explicit(&g_hb_opening, memory_order_relaxed) != 0);
+    uint8_t hb_fs = (uint8_t)(atomic_load_explicit(&g_hb_failstop, memory_order_relaxed) != 0);
+#ifdef TSDB_TEST_HOOKS
+    if (C.hb_opening_file && exists(C.hbopeningfile))
+        hb_open = 1;
+    if (C.hb_failstop_file && exists(C.hbfailstopfile))
+        hb_fs = 1;
+#endif
+    put8(b, hb_open);
+    put8(b, hb_fs);
     put8(b, atomic_load_explicit(&g_hb_fill_pct, memory_order_relaxed));
     sec_end(b, at);
     static struct cluster_report rep;
@@ -5944,8 +5980,11 @@ static void heartbeat(uint64_t now)
         conn_send(c, 0);
 }
 
-/* MEMBER_ADDR when `h` names other addresses than the record (h NULL: none), then MEMBER_STATE when state >= 0 */
-static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h, uint64_t now)
+/* MEMBER_ADDR when `h` names other addresses than the record (h NULL: none), then MEMBER_STATE when state >= 0.
+ * When state == META_DOWN and keep_since_ms > 0 (recording a restarting opening member's new incarnation while
+ * keeping it DOWN), down_since_ms is preserved so opening_hold_s stays bounded from the original DOWN time. */
+static void propose_member_r(uint32_t id, int state, uint64_t inc, uint8_t down_reason, uint64_t keep_since_ms,
+                             struct heard *h, uint64_t now)
 {
     struct meta_entry e;
     meta_entry_init(&e);
@@ -5964,7 +6003,9 @@ static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h
             uint64_t wms = (uint64_t)wt.tv_sec * 1000ull + (uint64_t)wt.tv_nsec / 1000000ull;
             if (!wms)
                 wms = 1;
-            meta_op_member_state(&e, id, state, inc, META_DOWN_TIMEOUT, wms, wms);
+            uint64_t since_ms = keep_since_ms ? keep_since_ms : wms;
+            uint64_t op_clk = wms >= since_ms ? wms : since_ms;
+            meta_op_member_state(&e, id, state, inc, down_reason, since_ms, op_clk);
         } else {
             meta_op_member_state(&e, id, state, inc, META_DOWN_NONE, 0, 0);
         }
@@ -5975,6 +6016,11 @@ static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h
         if (state >= 0)
             say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", id, meta_member_state_name(state), inc);
     }
+}
+
+static void propose_member(uint32_t id, int state, uint64_t inc, struct heard *h, uint64_t now)
+{
+    propose_member_r(id, state, inc, META_DOWN_TIMEOUT, 0, h, now);
 }
 
 /* The earliest time (this server's clock) at which a promotion away from server `id` is safe: one lease with the drift
@@ -5990,18 +6036,27 @@ static uint64_t promote_safe_ns(uint32_t id)
     return cluster_lease_safe(a, s->lease_ms, s->drift_ppm);
 }
 
-static void member_states(uint64_t now)
+/* 1 once this Raft leader has held leadership long enough to have heard from all live members and outlast any earlier
+ * leader's leases (shared by member_states and place_duty; R9 D4/r9-out). */
+static int leader_settled(uint64_t now)
 {
     const struct meta_settings *s = settings();
     uint64_t to = (uint64_t)s->node_timeout_ms * MS;
     uint64_t wait = cluster_lease_safe(0, s->lease_ms, s->drift_ppm);
     if (cl_mutant() == CLM_NOPROMOTEWAIT)
         wait = 0;
+    return since(now, C.leader_since) >= (wait > to ? wait : to);
+}
+
+static void member_states(uint64_t now)
+{
+    const struct meta_settings *s = settings();
+    uint64_t to = (uint64_t)s->node_timeout_ms * MS;
     /* A new leader does not know when the others last heard from anyone, nor the leases given before: it proposes
      * nothing but a member it hears itself coming back (DOWN, or a new incarnation: a restart, whose volumes open
      * only once the group holds that incarnation) until the wait is over. A restarted volume leader resigns only
      * then, and its restart often is what made this server the Raft leader (test_cluster resign). */
-    int settled = since(now, C.leader_since) >= (wait > to ? wait : to);
+    int settled = leader_settled(now);
     if (!settled && cl_mutant() == CLM_UPWAITS)
         return;
     for (uint32_t i = 0; i < C.sm.nmembers && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
@@ -6012,9 +6067,15 @@ static void member_states(uint64_t now)
         struct heard *h = heard_get(m->id);
         uint64_t inc = m->id == C.id ? C.incarnation : h ? h->inc : 0;
         int fresh = last && since(now, last) < to;
+        int is_failstop = h && h->failstop && inc == m->incarnation;
+        int is_opening = h && h->opening;
+        int alive = fresh && !(h && h->failstop);
+        int lease_safe = cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(m->id);
         uint32_t id = m->id;
         uint64_t minc = m->incarnation;
         int st = m->state;
+        uint64_t keep_since = m->down_since_ms;
+        uint8_t keep_reason = m->down_reason ? m->down_reason : META_DOWN_TIMEOUT;
         /* a member that came back elsewhere (with --port 0, or on another host) is recorded there, or nobody
          * reaches it: only addresses its own heartbeat carried, of the run the record is about or a later one */
         struct heard *moved = fresh && h && inc >= minc && h->peer[0] && h->addr[0] &&
@@ -6023,16 +6084,29 @@ static void member_states(uint64_t now)
                                   ? h
                                   : NULL;
         if (st == META_OUT) {
-            /* OUT is reversible (D2): a returning server with a new incarnation comes back UP */
-            if (fresh && inc > minc)
+            /* OUT is reversible (D2): a returning server with a new incarnation comes back UP immediately so its
+             * vol_watch_duty sees the new incarnation and opens its volumes. */
+            if (alive && inc > minc)
                 propose_member(id, META_UP, inc, moved, now);
             continue;
         }
-        if (!settled && !(fresh && inc >= minc && (st == META_DOWN || inc > minc)))
+        /* A DOWN member that restarted while still opening gets its new incarnation recorded immediately (still
+         * META_DOWN, preserving down_since_ms) so vol_watch_duty unblocks volume opens while opening_hold_s stays
+         * bounded; once opening clears it becomes META_UP. */
+        int down_opening_inc = st == META_DOWN && alive && is_opening && inc > minc;
+        int comes_back = alive && inc >= minc &&
+                         ((st == META_DOWN && !is_opening) || (st == META_UP && inc > minc));
+        if (!settled && !comes_back && !down_opening_inc)
             continue;
-        if (st == META_UP && !fresh && (cl_mutant() == CLM_NOPROMOTEWAIT || now >= promote_safe_ns(id)))
-            propose_member(id, META_DOWN, minc, NULL, now);
-        else if (fresh && inc >= minc && (st == META_DOWN || inc > minc))
+        if (down_opening_inc)
+            propose_member_r(id, META_DOWN, inc, keep_reason, keep_since, moved, now);
+        else if (st == META_UP && is_failstop && fresh && lease_safe)
+            propose_member_r(id, META_DOWN, minc, META_DOWN_FAILSTOP, 0, NULL, now);
+        else if (st == META_DOWN && m->down_reason != META_DOWN_FAILSTOP && is_failstop)
+            propose_member_r(id, META_DOWN, minc, META_DOWN_FAILSTOP, keep_since, NULL, now);
+        else if (st == META_UP && !fresh && lease_safe)
+            propose_member_r(id, META_DOWN, minc, is_failstop ? META_DOWN_FAILSTOP : META_DOWN_TIMEOUT, 0, NULL, now);
+        else if (comes_back)
             propose_member(id, META_UP, inc, moved, now);
         else if (moved)
             propose_member(id, -1, inc, moved, now);
@@ -7108,12 +7182,43 @@ static void promote_duty(uint64_t now)
     }
 }
 
+#ifdef TSDB_TEST_HOOKS
+/* TSDB_CLUSTER_TEST node_hold_file=1: the Raft leader proposes NODE_HOLD lines ("NODE FOR_S", 0 releases) from
+ * <state-dir>/nodehold and removes the file (test_cluster outhold until r9-ops wires cnode_hold_admin). */
+static void node_hold_file_propose(void)
+{
+    FILE *f = fopen(C.nodeholdfile, "r");
+    if (!f)
+        return;
+    struct timespec ts;
+    uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
+                           ? (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull
+                           : 1;
+    if (!wall_ms)
+        wall_ms = 1;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long node = 0, for_s = 0;
+        if (sscanf(line, "%lu %lu", &node, &for_s) != 2 || !node)
+            continue;
+        uint64_t until_ms = for_s ? wall_ms + (uint64_t)for_s * 1000ull : 0;
+        struct meta_entry e;
+        meta_entry_init(&e);
+        meta_op_node_hold(&e, (uint32_t)node, until_ms, wall_ms);
+        (void)propose(&e, 0, 0, (uint32_t)node);
+        say("nodehold node %lu for %lu s: proposed", node, for_s);
+    }
+    fclose(f);
+    unlink(C.nodeholdfile);
+}
+#endif
+
 /* R9 (D7): once a second on the Raft leader, run the pure planners in order — pout_plan (timers), place_plan
  * (re-placement / whole / return), balance_plan — and propose their output (one proposal per member/position at a
- * time). Until their owning tracks fill them in, all three return 0 proposals and 0 log lines. */
+ * time). Waits until the Raft leader is settled (same wait as member_states) before proposing OUT or moves. */
 static void place_duty(uint64_t now)
 {
-    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised)
+    if (!C.r || raft_get_role(C.r) != RAFT_LEADER || !C.sm.initialised || !leader_settled(now))
         return;
     struct timespec ts;
     uint64_t wall_ms = clock_gettime(CLOCK_REALTIME, &ts) == 0
@@ -7186,22 +7291,41 @@ static void place_duty(uint64_t now)
     pout_plan(&in, &out);
     place_plan(&in, &out);
     balance_plan(&in, &out);
-    for (uint32_t i = 0; i < out.nlogs; i++)
+    for (uint32_t i = 0; i < out.nlogs; i++) {
+        if (strstr(out.logs[i].msg, "guard bound passed"))
+            atomic_fetch_add_explicit(&g_out_guard_passed, 1, memory_order_relaxed);
         say("%s", out.logs[i].msg);
+    }
     for (uint32_t i = 0; i < out.nprops && C.r && raft_get_role(C.r) == RAFT_LEADER; i++) {
         const struct place_prop *p = &out.props[i];
         if (p->kind == PLACE_PROP_MEMBER_STATE) {
             if (pend_member(p->node))
                 continue;
+            const struct meta_member *mb = meta_member(&C.sm, p->node);
+            if (!mb)
+                continue;
+            if (p->state == META_DOWN) {
+                /* Lease safety: never mark an UP member DOWN before promote_safe_ns (same rule as member_states). */
+                if (mb->state == META_UP && cl_mutant() != CLM_NOPROMOTEWAIT && now < promote_safe_ns(p->node))
+                    continue;
+                struct heard *hm = heard_get(p->node);
+                if (hm && hm->inc != mb->incarnation)
+                    continue;
+            }
             struct meta_entry e;
             meta_entry_init(&e);
-            meta_op_member_state(&e, p->node, p->state, p->version, p->reason,
-                                 p->state == META_DOWN ? wall_ms : 0, wall_ms);
-            (void)propose(&e, 0, 0, p->node);
+            uint64_t since_ms = p->state == META_DOWN ? (mb->state == META_DOWN && mb->down_since_ms ? mb->down_since_ms : wall_ms) : 0;
+            uint64_t op_clk = wall_ms >= since_ms ? wall_ms : since_ms;
+            meta_op_member_state(&e, p->node, p->state, p->version, p->reason, since_ms, op_clk);
+            if (propose_ex(&e, 0, 0, p->node, p->state == META_OUT) == ISO_OK)
+                say("proposes node %" PRIu32 " %s (incarnation %" PRIu64 ")", p->node,
+                    meta_member_state_name(p->state), p->version);
         } else if (p->kind == PLACE_PROP_REPLICA_ADD) {
             /* TODO(r9-plan): route automatic log moves through cmove so g_mv tracks the move (progress,
              * min_isr, status, and cancel). Do not propose a bare REPLICA_ADD directly. */
-            say("place: REPLICA_ADD for vol %" PRIu32 " skipped (awaiting cmove wiring in r9-plan)", p->volume);
+            say("place: REPLICA_ADD for vol %" PRIu32 " replaces %" PRIu32
+                " skipped (awaiting cmove wiring in r9-plan)",
+                p->volume, p->other_node);
             continue;
         } else if (p->kind == PLACE_PROP_STRIPE_SET) {
             struct meta_entry e;
@@ -7254,6 +7378,10 @@ static void leader_duties(uint64_t now)
         volcmd_file_send();
     if (C.setop_file && cl_leading())
         cset_setop_file(C.setopfile);
+#ifdef TSDB_TEST_HOOKS
+    if (C.node_hold_file && cl_leading())
+        node_hold_file_propose();
+#endif
     if (C.r && raft_get_role(C.r) == RAFT_LEADER && now >= C.next_manage) {
         C.next_manage = now + 1000 * MS;
         manage_voters(now);
@@ -7591,6 +7719,9 @@ int cluster_start(const struct cluster_cfg *cfg)
     snprintf(C.replayreplyfile, sizeof C.replayreplyfile, "%s/replayreply", C.metadir);
     snprintf(C.volcmdfile, sizeof C.volcmdfile, "%s/volcmd", C.metadir);
     snprintf(C.setopfile, sizeof C.setopfile, "%s/setop", C.metadir);
+    snprintf(C.hbopeningfile, sizeof C.hbopeningfile, "%s/hbopening", C.metadir);
+    snprintf(C.hbfailstopfile, sizeof C.hbfailstopfile, "%s/hbfailstop", C.metadir);
+    snprintf(C.nodeholdfile, sizeof C.nodeholdfile, "%s/nodehold", C.metadir);
     snprintf(C.failfile, sizeof C.failfile, "%s/failsync", C.metadir);
     test_knobs();
     if (C.users_probe)
