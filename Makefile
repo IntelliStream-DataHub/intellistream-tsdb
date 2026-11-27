@@ -143,8 +143,8 @@ endif
 # out gf256.c's constructor; src/cpu.c calls tsdb_ec_select() instead (AGENTS.md "CPU levels"). Compiled once, at the
 # baseline of $(ARCH): the AVX2, AVX-512 and GFNI kernels carry target attributes and run only where src/ec/compat.c's
 # iso_cpu_has() says so (tools/check-isa.sh checks that nothing else in them goes beyond x86-64-v2).
-# NO_EC=1 builds an x86-64 engine without it, as the embedded bindings and other machines do (after make clean, or with
-# its own B=): every R7 stub and test must build and pass both ways. Only NO_EC=1 turns it off (NO_EC=0 or empty: on).
+# NO_EC=1 builds an x86-64 engine without it, as other architectures do (after make clean, or with its own B=): every
+# R7 stub and test must build and pass both ways. Only NO_EC=1 turns it off (NO_EC=0 or empty: on).
 ifeq ($(shell uname -m)$(filter 1,$(NO_EC)),x86_64)
 EC_OBJ := $(B)/ec_gf256.o $(B)/ec_gf256_avx2.o $(B)/ec_gf256_avx512.o $(B)/ec_rs.o $(B)/ec_compat.o
 OBJ  += $(EC_OBJ)
@@ -975,7 +975,7 @@ test-java: $(B)/tsdbd $(B)/tsdb $(OUTAGE_SERVER)
 # The embedded Java binding (Java 22+, FFM) needs the TCP client's jar for the shared types. It is installed into a
 # local repository of this tree's build (read through to ~/.m2), never into the ~/.m2 that other trees share.
 JAVA_M2 := -Dmaven.repo.local=$(abspath $(B))/m2 -Dmaven.repo.local.tail=$(HOME)/.m2/repository
-test-java-embedded: $(B)/tsdbd $(B)/libtsdb.$(SOEXT)
+test-java-embedded: $(B)/tsdbd $(B)/tsdb $(B)/libtsdb.$(SOEXT)
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 

@@ -24,9 +24,13 @@ The default build is portable: the engine is compiled for the target's
 baseline, like `make PORTABLE=1`, and on x86-64 the codec files are compiled
 twice more for x86-64-v3 and v4 (as in `make dist`, see `src/levels.h`); the
 engine picks the copy the CPU supports at startup, and the aggregation
-kernels pick AVX-512, AVX2 or scalar code at runtime either way. The flags are
-the Makefile's: `-std=gnu11 -O3 -fno-math-errno -ffp-contract=off`, so parts
-written by a Rust program are byte for byte those `make` would write.
+kernels pick AVX-512, AVX2 or scalar code at runtime either way. On x86-64 the
+erasure codec (`src/ec`, `-DTSDB_EC -DISO_GF256_NO_BOOT`) is also compiled in
+so tiered databases open embedded; set `NO_EC=1` in the environment to build
+without it (other architectures build without it and refuse tiered databases
+with `requires=tier`). The flags are the Makefile's:
+`-std=gnu11 -O3 -fno-math-errno -ffp-contract=off`, so parts written by a Rust
+program are byte for byte those `make` would write.
 
 `TSDB_SRC_DIR` points the build at another checkout of the repository. Outside
 the repository (a package of this crate, such as the Python sdist) the build

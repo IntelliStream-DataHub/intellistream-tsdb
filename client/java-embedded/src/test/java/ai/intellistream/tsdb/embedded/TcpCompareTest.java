@@ -232,6 +232,183 @@ class TcpCompareTest {
         }
     }
 
+    /**
+     * A database tiered by the CLI ({@code tsdb DIR tier add}) and settled by tsdbd opens in {@link EmbeddedDb}
+     * without {@code TSDB_TEST_TIER} and answers settled keys identically to tsdbd (E55, D19).
+     */
+    @Test
+    void tieredDatabaseOpensEmbeddedAndMatchesTcp() throws Exception {
+        Path bin = Paths.get(System.getProperty("tsdbd", "../../build/tsdbd"));
+        Assumptions.assumeTrue(Files.isExecutable(bin), bin + " is missing: run make first");
+        Path cli = bin.resolveSibling("tsdb");
+        Assumptions.assumeTrue(Files.isExecutable(cli), cli + " is missing: run make first");
+
+        Path dir = tmp.resolve("tiered_db");
+        runCli(cli, dir, "create", "f32", "--type", "float32");
+        Process probe = new ProcessBuilder(cli.toString(), dir.toString(), "tier", "status")
+                .redirectErrorStream(true).start();
+        String probeOut = new String(probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int probeRc = probe.waitFor();
+        if (probeRc != 0 && probeOut.contains("not built with the erasure codec"))
+            Assumptions.abort("tsdb built without TSDB_EC");
+        assertEquals(0, probeRc, "tsdb tier status: " + probeOut);
+
+        for (int i = 0; i < 3; i++)
+            runCli(cli, dir, "tier", "add", tmp.resolve("st" + i) + ":hdd", "--allow-shared-device");
+
+        Path log = tmp.resolve("tsdbd-tier.log");
+        Path portFile = tmp.resolve("tsdbd-tier.port");
+        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
+                portFile.toString(), "--no-fsync", "--workers", "2", "--no-auth",
+                "--exit-with-parent=" + ProcessHandle.current().pid())
+                .redirectErrorStream(true)
+                .redirectOutput(log.toFile());
+        pb.environment().put("TSDB_TEST_TIER", "grace_s=0,keep_s=1,coarse_s=1,eager=1");
+        pb.environment().put("TSDB_TEST_TIER_I_KNOW", "1");
+        Process server = pb.start();
+
+        int n = 20_000;
+        long[] ts = new long[n];
+        float[] f = new float[n];
+        double[] d = new double[n];
+        long[] l = new long[n];
+        boolean[] b = new boolean[n];
+        BitSet nulls = new BitSet();
+        for (int i = 0; i < n; i++) {
+            ts[i] = T0 + i * 60_000L;
+            f[i] = (float) Math.sin(i / 100.0) * 50;
+            d[i] = Math.cos(i / 77.0) * 1e6;
+            l[i] = (long) i * i - 1_000_000_000L;
+            b[i] = i % 3 == 0;
+            if (i % 97 == 5)
+                nulls.set(i);
+        }
+        String[] names = {"f32", "f64", "i64", "bool", "state"};
+        long[] ids = new long[names.length];
+        long lo = T0 + 999 * 60_000L, hi = T0 + 15_000 * 60_000L;
+        long[] bounds = {T0 - 1, T0 + 1_000_000, T0 + 9_999_999};
+        Group oslo = Group.of(Unit.DAY).in("Europe/Oslo");
+
+        List<Object> tcpAnswers = new ArrayList<>();
+        try {
+            int port = -1;
+            for (int i = 0; i < 1500 && server.isAlive() && port < 0; i++) {
+                if (Files.exists(portFile)) {
+                    String[] pf = Files.readString(portFile, StandardCharsets.UTF_8).trim().split("\\s+");
+                    assertEquals(server.pid(), Long.parseLong(pf[1]), "the port file names another process");
+                    port = Integer.parseInt(pf[0]);
+                } else {
+                    Thread.sleep(20);
+                }
+            }
+            assertTrue(server.isAlive() && port > 0, () -> "tsdbd did not serve: " + read(log));
+
+            try (TsdbClient tcp = TsdbClient.connect("127.0.0.1", port)) {
+                ids[0] = tcp.series(names[0]);
+                tcp.insert(ids[0], ts, f);
+                ids[1] = tcp.seriesCreate(names[1], ValueType.FLOAT64);
+                tcp.insertSeriesValues(ids[1], ts, Column.ofDoubles(d).withNulls(nulls));
+                ids[2] = tcp.seriesCreate(names[2], ValueType.INT64);
+                tcp.insertSeriesValues(ids[2], ts, Column.ofLongs(l).withNulls(nulls));
+                ids[3] = tcp.seriesCreate(names[3], ValueType.BOOL);
+                tcp.insertSeriesValues(ids[3], ts, Column.ofBools(b).withNulls(nulls));
+                ids[4] = tcp.seriesCreate(names[4], ValueType.STATE);
+                int[] codes = {tcp.state(ids[4], "idle"), tcp.state(ids[4], "run"), tcp.state(ids[4], "stop")};
+                int[] st = new int[n];
+                for (int i = 0; i < n; i++)
+                    st[i] = codes[i % 3];
+                tcp.insertSeriesValues(ids[4], ts, Column.ofStates(st).withNulls(nulls));
+                tcp.flush();
+                tcp.optimize();
+
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+                boolean settled = false;
+                while (System.nanoTime() < deadline) {
+                    boolean hasEc = false, hasLivePart = false;
+                    try (var stream = Files.list(dir)) {
+                        for (Path p : stream.toList()) {
+                            String fn = p.getFileName().toString();
+                            if (fn.endsWith(".ec") && !fn.startsWith("tmp_") && !fn.startsWith("retired_"))
+                                hasEc = true;
+                            if (fn.endsWith(".part") && !fn.startsWith("tmp_") && !fn.startsWith("settled_")
+                                    && !fn.startsWith("retired_"))
+                                hasLivePart = true;
+                        }
+                    }
+                    if (hasEc && !hasLivePart) {
+                        settled = true;
+                        break;
+                    }
+                    Thread.sleep(100);
+                }
+                assertTrue(settled, () -> "partitions did not settle within 60 s: " + read(log));
+
+                tcpAnswers.add(answers(tcp.latest(ids, LatestOptions.defaults())));
+                tcpAnswers.add(answers(tcp.latest(ids, LatestOptions.defaults().withNulls(true))));
+                for (long id : ids) {
+                    tcpAnswers.add(points(tcp.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 0)));
+                    tcpAnswers.add(points(tcp.queryValues(id, lo, hi, Order.DESC, 500)));
+                    tcpAnswers.add(tcp.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, Order.ASC, 0));
+                    tcpAnswers.add(tcp.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, oslo, Order.ASC, 0));
+                    tcpAnswers.add(tcp.queryBounds(id, T0, hi, bounds, Order.ASC, 0));
+                    tcpAnswers.add(capture(() -> tcp.querySpread(id, lo, hi, 3_600_000L, Order.ASC, 0)));
+                    tcpAnswers.add(capture(() -> tcp.queryTwa(id, lo, hi, 3_600_000L, TwaOptions.linear())));
+                    tcpAnswers.add(capture(() -> points(tcp.queryLttb(id, Long.MIN_VALUE, Long.MAX_VALUE, 100,
+                            Order.ASC, 0))));
+                }
+            }
+        } finally {
+            server.destroy(); /* SIGTERM to this one process */
+            if (!server.waitFor(60, TimeUnit.SECONDS))
+                server.destroyForcibly().waitFor();
+        }
+        assertEquals(0, server.exitValue(), () -> "tsdbd exited with " + server.exitValue() + ": " + read(log));
+
+        try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().fsync(false))) {
+            List<PartInfo> parts = db.parts();
+            assertTrue(parts.stream().anyMatch(p -> p.name().endsWith(".ec")), "expected settled .ec parts: " + parts);
+
+            List<Object> embAnswers = new ArrayList<>();
+            embAnswers.add(answers(db.latest(ids, LatestOptions.defaults())));
+            embAnswers.add(answers(db.latest(ids, LatestOptions.defaults().withNulls(true))));
+            for (int k = 0; k < names.length; k++) {
+                long id = ids[k];
+                assertEquals(id, db.series(names[k], false));
+                embAnswers.add(points(db.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 0)));
+                embAnswers.add(points(db.queryValues(id, lo, hi, Order.DESC, 500)));
+                embAnswers.add(db.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, Order.ASC, 0));
+                embAnswers.add(db.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, oslo, Order.ASC, 0));
+                embAnswers.add(db.queryBounds(id, T0, hi, bounds, Order.ASC, 0));
+                embAnswers.add(capture(() -> db.querySpread(id, lo, hi, 3_600_000L, Order.ASC, 0)));
+                embAnswers.add(capture(() -> db.queryTwa(id, lo, hi, 3_600_000L, TwaOptions.linear())));
+                embAnswers.add(capture(() -> points(db.queryLttb(id, Long.MIN_VALUE, Long.MAX_VALUE, 100,
+                        Order.ASC, 0))));
+            }
+            assertEquals(tcpAnswers.size(), embAnswers.size());
+            for (int i = 0; i < tcpAnswers.size(); i++)
+                alike("tiered[" + i + "]", tcpAnswers.get(i), embAnswers.get(i));
+        }
+    }
+
+    private static void runCli(Path cli, Path dir, String... args) throws Exception {
+        List<String> cmd = new ArrayList<>();
+        cmd.add(cli.toString());
+        cmd.add(dir.toString());
+        for (String a : args)
+            cmd.add(a);
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, p.waitFor(), () -> "tsdb " + String.join(" ", args) + ": " + out);
+    }
+
+    private static <T> Object capture(Query<T> q) {
+        try {
+            return q.run();
+        } catch (TsdbException e) {
+            return "status " + e.status();
+        }
+    }
+
     interface Query<T> {
         T run() throws TsdbException;
     }

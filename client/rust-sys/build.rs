@@ -6,7 +6,10 @@
 //! same language and floating-point flags, because the bytes a codec writes must not depend on
 //! who compiled it. Portable by default; on x86-64 the files of `src/levels.h` are compiled for
 //! the baseline, x86-64-v3 and x86-64-v4 and `src/cpu.c` picks one set at startup, as in
-//! `make dist`. Feature `native` compiles everything with `-march=native` instead.
+//! `make dist`. On x86-64 (unless `NO_EC=1`) the erasure codec in `src/ec` is also compiled with
+//! `-DTSDB_EC` and `-DISO_GF256_NO_BOOT` so tiered databases open embedded; other architectures
+//! build without it and refuse a tiered database (`requires=tier`). Feature `native` compiles
+//! everything with `-march=native` instead.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -53,7 +56,23 @@ fn main() {
 
     let native = env::var_os("CARGO_FEATURE_NATIVE").is_some();
     let x86_64 = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "x86_64";
+    println!("cargo:rerun-if-env-changed=NO_EC");
+    let ec = x86_64 && env::var("NO_EC").as_deref() != Ok("1");
     let levels = x86_64 && !native;
+    let ec_dir = src.join("ec");
+    let ec_compat = ec_dir.join("compat");
+    if ec {
+        println!("cargo:rerun-if-changed={}", ec_dir.display());
+        for sub in ["", "compat/codec", "compat/common"] {
+            let d = if sub.is_empty() { ec_dir.clone() } else { ec_dir.join(sub) };
+            for e in std::fs::read_dir(&d).unwrap_or_else(|err| panic!("read {}: {err}", d.display())) {
+                let p = e.unwrap().path();
+                if p.extension().is_some_and(|x| x == "c" || x == "h") {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
+            }
+        }
+    }
     // zstd-sys (feature bundled-zstd) names its headers, ';'-separated; else the system's zstd.h
     let zstd_include: Vec<PathBuf> =
         env::var("DEP_ZSTD_INCLUDE").map(|s| s.split(';').map(PathBuf::from).collect()).unwrap_or_default();
@@ -71,6 +90,9 @@ fn main() {
         if levels {
             b.define("TSDB_LEVELS", None).define("TSDB_HAVE_v3", None).define("TSDB_HAVE_v4", None);
         }
+        if ec {
+            b.define("TSDB_EC", None).include(&ec_compat);
+        }
         b.includes(&zstd_include);
         for f in extra {
             b.flag(f);
@@ -81,6 +103,19 @@ fn main() {
 
     let mut objects =
         base("common", &[]).files(files.iter().filter(|p| !levels || !is_level(p))).compile_intermediates();
+    if ec {
+        let mut ec_files: Vec<PathBuf> = std::fs::read_dir(&ec_dir)
+            .expect("read src/ec/")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "c"))
+            .collect();
+        ec_files.sort();
+        // Mirrors Makefile EC_CFLAGS: -mssse3 for gf256.c's unattributed SSSE3 kernel, -fno-tree-vectorize so
+        // generic builds emit no SSSE3 outside it, and -DISO_GF256_NO_BOOT so src/cpu.c drives tsdb_ec_select().
+        let mut b = base("ec", &["-mssse3", "-fno-tree-vectorize"]);
+        b.define("ISO_GF256_NO_BOOT", None).files(&ec_files);
+        objects.extend(b.compile_intermediates());
+    }
     if levels {
         let lv: Vec<&PathBuf> = files.iter().filter(|p| is_level(p)).collect();
         for (name, flags) in [
@@ -126,7 +161,13 @@ fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
         let names: std::collections::BTreeSet<&str> = std::str::from_utf8(&nm.stdout)
             .expect("nm output")
             .lines()
-            .filter(|n| n.starts_with("_tsdb_") && !n.starts_with("_tsdb_test_"))
+            .filter(|n| {
+                n.starts_with("_tsdb_")
+                    && !n.starts_with("_tsdb_test_")
+                    && !n.starts_with("_tsdb_ec_")
+                    && !n.starts_with("_tsdb_cvol_")
+                    && *n != "_tsdb_volume_diverged"
+            })
             .collect();
         assert!(names.contains("_tsdb_open"), "nm listed no _tsdb_open: the exported symbols list would be empty");
         let text: String = names.iter().map(|n| format!("{n}\n")).collect();
@@ -142,10 +183,18 @@ fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
     println!("cargo:rerun-if-env-changed=OBJCOPY");
     let tools = env::var("OBJCOPY").map(|o| vec![o]).unwrap_or_else(|_| vec!["objcopy".into(), "llvm-objcopy".into()]);
     for tool in &tools {
-        // The test hooks match tsdb_* as well: they are localized by name (tools/libtsdb.map does the same for
-        // libtsdb.so), whatever the order in which the tool applies the two options.
+        // The test hooks and internal glue (tsdb_ec_*, tsdb_cvol_*, tsdb_volume_diverged) match tsdb_* as well: they
+        // are localized by name (keep in sync with tools/libtsdb.map for libtsdb.so), whatever the order in which the
+        // tool applies the options.
         let status = std::process::Command::new(tool)
-            .args(["--wildcard", "--keep-global-symbol=tsdb_*", "--localize-symbol=tsdb_test_*"])
+            .args([
+                "--wildcard",
+                "--keep-global-symbol=tsdb_*",
+                "--localize-symbol=tsdb_test_*",
+                "--localize-symbol=tsdb_ec_*",
+                "--localize-symbol=tsdb_cvol_*",
+                "--localize-symbol=tsdb_volume_diverged",
+            ])
             .arg(&merged)
             .status();
         match status {
@@ -160,7 +209,7 @@ fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
     panic!("no objcopy found (tried {tools:?}; set OBJCOPY) to localize the engine's internal symbols");
 }
 
-/// Fails the build when the merged object still exports a `tsdb_test_*` hook (they can corrupt a database).
+/// Fails the build when the merged object still exports a `tsdb_test_*` hook or internal EC/cluster glue symbol.
 /// ELF only (the Apple list excludes them by pattern); skipped with a warning when no `nm` is installed.
 fn assert_no_test_hooks(merged: &Path) {
     println!("cargo:rerun-if-env-changed=NM");
@@ -171,9 +220,19 @@ fn assert_no_test_hooks(merged: &Path) {
         };
         assert!(out.status.success(), "{tool} failed to list the symbols of the engine object");
         let text = String::from_utf8_lossy(&out.stdout);
-        let hooks: Vec<&str> =
-            text.lines().filter_map(|l| l.split_whitespace().last()).filter(|n| n.starts_with("tsdb_test_")).collect();
-        assert!(hooks.is_empty(), "the engine object still exports test hooks: {hooks:?}");
+        let leaked: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_whitespace().last())
+            .filter(|n| {
+                n.starts_with("tsdb_test_")
+                    || n.starts_with("tsdb_ec_")
+                    || n.starts_with("tsdb_cvol_")
+                    || *n == "tsdb_volume_diverged"
+                    || n.starts_with("iso_gf256_")
+                    || n.starts_with("iso_rs_")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "the engine object still exports internal/test/ec symbols: {leaked:?}");
         assert!(text.contains(" tsdb_open"), "the engine object exports no tsdb_open: the symbol check read nothing");
         return;
     }

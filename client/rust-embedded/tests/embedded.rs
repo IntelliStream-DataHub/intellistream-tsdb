@@ -747,8 +747,139 @@ fn tsdbd_answers_what_the_embedded_engine_answered() {
     let mut c = srv.client();
     let tcp: Vec<String> = names.iter().flat_map(|name| answers(&mut c, name, range.clone(), &groups)).collect();
     assert_eq!(embedded.len(), tcp.len());
-    for (e, t) in embedded.iter().zip(&tcp) {
-        assert_eq!(e, t);
+    for (i, (e, t)) in embedded.iter().zip(&tcp).enumerate() {
+        assert_eq!(e, t, "answer {i}");
+    }
+}
+
+/// A database tiered by the CLI (`tsdb DIR tier add`) and settled by tsdbd opens in `Db` without
+/// `TSDB_TEST_TIER` and answers settled keys identically to tsdbd (E55, D19).
+#[test]
+fn tiered_database_opens_embedded_and_matches_tsdbd() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let root = test_dir("tsdb-embedded-tier");
+    std::fs::create_dir_all(&root).unwrap();
+    struct RmDir(std::path::PathBuf);
+    impl Drop for RmDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RmDir(root.clone());
+
+    let dir = root.join("db");
+    let cli = common::tsdbd().with_file_name("tsdb");
+    assert!(cli.exists(), "{} is missing: run make in the repository root", cli.display());
+
+    let run_cli = |args: &[&str]| {
+        Command::new(&cli)
+            .arg(&dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .env_remove("LD_PRELOAD")
+            .output()
+            .unwrap_or_else(|e| panic!("{}: {e}", cli.display()))
+    };
+
+    let out = run_cli(&["create", "cmp.float32", "--type", "float32"]);
+    assert!(out.status.success(), "tsdb create: {}", String::from_utf8_lossy(&out.stderr));
+
+    let probe = run_cli(&["tier", "status"]);
+    if !probe.status.success() && String::from_utf8_lossy(&probe.stderr).contains("not built with the erasure codec") {
+        eprintln!("tiered_database_opens_embedded_and_matches_tsdbd: skipped (no TSDB_EC)");
+        return;
+    }
+    assert!(probe.status.success(), "tsdb tier status: {}", String::from_utf8_lossy(&probe.stderr));
+
+    for i in 0..3 {
+        let store = format!("{}:hdd", root.join(format!("st{i}")).display());
+        let out = run_cli(&["tier", "add", &store, "--allow-shared-device"]);
+        assert!(out.status.success(), "tsdb tier add st{i}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let mut srv = Server::spawn_args_env(
+        dir.clone(),
+        false,
+        &[],
+        &[("TSDB_TEST_TIER", "grace_s=0,keep_s=1,coarse_s=1,eager=1"), ("TSDB_TEST_TIER_I_KNOW", "1")],
+    );
+
+    let n = 40_000i64;
+    let ts: Vec<i64> = (0..n).map(|i| T0 + i * 7_000).collect();
+    let make = |ty, r: std::ops::Range<i64>, shift: i64, codes: [u32; 2]| match ty {
+        ValueType::Float32 => Column::new(r.map(|i| ((i + shift) as f32).sin() * 100.0).collect::<Vec<f32>>()),
+        ValueType::Float64 => Column::new(r.map(|i| ((i + shift) as f64).sqrt()).collect::<Vec<f64>>()),
+        ValueType::Int64 => Column::new(r.map(|i| (i + shift) * i - 5000).collect::<Vec<i64>>()),
+        ValueType::Bool => Column::new(r.map(|i| (i + shift) % 3 == 0).collect::<Vec<bool>>()),
+        _ => Column::new(r.map(|i| codes[((i + shift) % 2) as usize]).collect::<Vec<u32>>()),
+    };
+    let groups = [
+        Group::new(Unit::Hour),
+        Group::new(Unit::Minute).count(15),
+        Group::new(Unit::Day).timezone("Europe/Oslo"),
+        Group::new(Unit::Week).timezone("America/New_York"),
+        Group::new(Unit::Month).timezone("+05:30"),
+    ];
+    let range = T0 + 1000..T0 + 200_000_000;
+
+    let mut names = Vec::new();
+    let tcp: Vec<String> = {
+        let mut c = srv.client();
+        for ty in ValueType::ALL {
+            let name = format!("cmp.{ty}");
+            let id = c.series_create(&name, ty, None).unwrap();
+            let codes =
+                if ty == ValueType::State { [c.state(id, "a").unwrap(), c.state(id, "b").unwrap()] } else { [0; 2] };
+            let valid: Bitmap = (0..n).map(|i| i % 97 != 3).collect();
+            let col = make(ty, 0..n, 0, codes);
+            c.insert_series_values(id, &ts, ColumnRef::from(&col).with_validity(&valid)).unwrap();
+            c.flush().unwrap();
+            c.insert_series_values(id, &ts[100..110], &make(ty, 100..110, 1, codes)).unwrap();
+            names.push(name);
+        }
+        c.flush().unwrap();
+        c.optimize().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut settled = false;
+        while Instant::now() < deadline {
+            let entries: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().and_then(|d| d.file_name().into_string().ok()))
+                .collect();
+            let has_ec =
+                entries.iter().any(|f| f.ends_with(".ec") && !f.starts_with("tmp_") && !f.starts_with("retired_"));
+            let has_live_part = entries.iter().any(|f| {
+                f.ends_with(".part")
+                    && !f.starts_with("tmp_")
+                    && !f.starts_with("settled_")
+                    && !f.starts_with("retired_")
+            });
+            if has_ec && !has_live_part {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(settled, "partitions did not settle within 60 s:\n{}", srv.log());
+        names.iter().flat_map(|name| answers(&mut c, name, range.clone(), &groups)).collect()
+    };
+
+    // Stop tsdbd cleanly (keeping `srv` alive until after `Db` closes so Drop does not delete `dir` early).
+    let st = srv.stop();
+    assert!(st.success(), "tsdbd exited with {st}");
+
+    let mut db = Db::open(&dir, &opts()).expect("open tiered db embedded");
+    let parts = db.parts().unwrap();
+    assert!(parts.iter().any(|p| p.name.ends_with(".ec")), "expected settled .ec parts in {parts:?}");
+    let embedded: Vec<String> = names.iter().flat_map(|name| answers(&mut db, name, range.clone(), &groups)).collect();
+    db.close().unwrap();
+
+    assert_eq!(embedded.len(), tcp.len());
+    for (i, (e, t)) in embedded.iter().zip(&tcp).enumerate() {
+        assert_eq!(e, t, "answer {i}");
     }
 }
 

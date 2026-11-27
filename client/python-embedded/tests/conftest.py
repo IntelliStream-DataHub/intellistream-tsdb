@@ -51,7 +51,7 @@ def plain(x):
 
 
 class Server:
-    def __init__(self, base, dir=None, root_password=None, root="root", extra_args=()):
+    def __init__(self, base, dir=None, root_password=None, root="root", extra_args=(), extra_env=None):
         """Serves dir (an existing database: test_embedded), or a new directory under base. With root_password the
         server requires a login, and USERS holds the superuser root (a name) with that password (made by the CLI);
         without, it runs with --no-auth."""
@@ -60,6 +60,9 @@ class Server:
         pf = own / "port"
         if root_password is not None:
             user_cli(self.dir, root_password, "add", root, "--superuser")
+        env = None
+        if extra_env:
+            env = {**os.environ, **extra_env}
         self.proc = subprocess.Popen(
             # --exit-with-parent: a test run killed by a timeout leaves no server behind
             [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4",
@@ -70,8 +73,10 @@ class Server:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         log = []
+        self.log = log
 
         def collect():
             for line in self.proc.stderr:

@@ -7,7 +7,9 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$here/../..
 rm -rf "$here/csrc"
-mkdir -p "$here/csrc/include" "$here/csrc/src" "$here/csrc/client"
+mkdir -p "$here/csrc/include" "$here/csrc/src/ec" "$here/csrc/client"
 cp "$root"/include/*.h "$here/csrc/include/"
 cp "$root"/src/*.c "$root"/src/*.h "$root"/src/*.inc "$here/csrc/src/"
+cp "$root"/src/ec/*.c "$root"/src/ec/*.h "$here/csrc/src/ec/"
+cp -R "$root/src/ec/compat" "$here/csrc/src/ec/"
 cp "$root/client/tsdb_calendar.c" "$here/csrc/client/"

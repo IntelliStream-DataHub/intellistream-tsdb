@@ -257,7 +257,7 @@ def test_engine_calls_release_the_gil(tmp_path):
     vals = array.array("d", range(n))
 
     def loaded(name):
-        db = Db(tmp_path / name, fsync=False, merge_threads=1, wal_max_batch_rows=n + 1, buffer_rows=8 * n,
+        db = Db(tmp_path / name, fsync=False, merge_threads=1, wal_max_batch_rows=n + 1, buffer_rows=16_000_000,
                 flush_interval_ms=3_600_000)
         for i in range(4):
             db.insert_series_values(db.series_create(f"s{i}", "float64"), ts, vals)
@@ -374,6 +374,82 @@ def test_tsdbd_answers_what_the_embedded_engine_answered(tmp_path):
         assert srv.stop() == 0
     with Db(path, read_only=True) as db:  # and what tsdbd left is still the same
         assert plain(answers(db, ids)) == plain(embedded)
+
+
+def test_tiered_database_opens_embedded_and_matches_tsdbd(tmp_path):
+    """A database tiered by the CLI (`tsdb DIR tier add`) and settled by tsdbd opens in tsdb_embedded.Db
+    without TSDB_TEST_TIER and answers settled keys identically to tsdbd (E55, D19)."""
+    from conftest import TSDBD, Server, plain
+
+    import os
+    import pathlib
+    import subprocess
+
+    if not os.access(TSDBD, os.X_OK):
+        pytest.fail(f"{TSDBD} is missing: run make in the repository root")
+    cli = str(pathlib.Path(TSDBD).with_name("tsdb"))
+    if not os.access(cli, os.X_OK):
+        pytest.fail(f"{cli} is missing: run make in the repository root")
+
+    path = tmp_path / "tiered_db"
+    env_cli = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+    r = subprocess.run([cli, str(path), "create", "f32"], capture_output=True, text=True, env=env_cli)
+    assert r.returncode == 0, f"tsdb create: {r.stderr}"
+
+    probe = subprocess.run([cli, str(path), "tier", "status"], capture_output=True, text=True, env=env_cli)
+    if probe.returncode != 0 and "not built with the erasure codec" in probe.stderr:
+        pytest.skip("tsdb built without TSDB_EC")
+    assert probe.returncode == 0, f"tsdb tier status: {probe.stderr}"
+
+    for i in range(3):
+        store = tmp_path / f"st{i}"
+        r = subprocess.run(
+            [cli, str(path), "tier", "add", f"{store}:hdd", "--allow-shared-device"],
+            capture_output=True,
+            text=True,
+            env=env_cli,
+        )
+        assert r.returncode == 0, f"tsdb tier add st{i}: {r.stderr}"
+
+    srv = Server(
+        tmp_path,
+        dir=path,
+        extra_env={
+            "TSDB_TEST_TIER": "grace_s=0,keep_s=1,coarse_s=1,eager=1",
+            "TSDB_TEST_TIER_I_KNOW": "1",
+        },
+    )
+    try:
+        with tsdb_client.Client(port=srv.port) as c:
+            ids = fill(c)
+            c.flush()
+            c.optimize()
+            deadline = time.time() + 60
+            settled = False
+            while time.time() < deadline:
+                names = [p.name for p in path.iterdir()]
+                has_ec = any(n.endswith(".ec") and not n.startswith(("tmp_", "retired_")) for n in names)
+                has_live_part = any(
+                    n.endswith(".part") and not n.startswith(("tmp_", "settled_", "retired_")) for n in names
+                )
+                if has_ec and not has_live_part:
+                    settled = True
+                    break
+                time.sleep(0.1)
+            assert settled, (
+                f"partitions did not settle within 60 s: {[p.name for p in path.iterdir()]}\n"
+                + "".join(srv.log)
+            )
+            tcp = answers(c, ids)
+    finally:
+        assert srv.stop() == 0
+
+    ec_files = [p.name for p in path.iterdir() if p.name.endswith(".ec") and not p.name.startswith(("tmp_", "retired_"))]
+    assert ec_files, "expected settled .ec parts on disk"
+
+    with Db(path, fsync=False) as db:
+        assert [db.series(n, create=False) for n in ("f32", "f64", "i64", "bool", "state")] == ids
+        assert plain(answers(db, ids)) == plain(tcp)
 
 
 def test_errors_are_the_exceptions_of_tsdb_client(tmp_path):

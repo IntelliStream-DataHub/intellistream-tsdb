@@ -60,6 +60,7 @@ pub struct Server {
     child: Option<Child>,
     pub port: u16,
     pub dir: PathBuf,
+    log: Arc<Mutex<String>>,
 }
 
 impl Server {
@@ -87,14 +88,19 @@ impl Server {
 
     /// [`spawn`](Server::spawn) with more tsdbd arguments (`--tenants FILE`).
     pub fn spawn_args(dir: PathBuf, auth: bool, extra: &[&str]) -> Server {
+        Server::spawn_args_env(dir, auth, extra, &[])
+    }
+
+    /// [`spawn_args`](Server::spawn_args) with extra environment variables for tsdbd.
+    pub fn spawn_args_env(dir: PathBuf, auth: bool, extra: &[&str], env: &[(&str, &str)]) -> Server {
         let bin = tsdbd();
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
         // tsdbd picks its port (--port 0) and writes "PORT PID" to this file once it serves: no port is
         // computed here, and the pid in the file must be the child started here.
         let pf = dir.with_extension("port");
         let _ = std::fs::remove_file(&pf);
-        let mut child = Command::new(&bin)
-            .arg("--dir")
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--dir")
             .arg(&dir)
             .args(["--port", "0", "--port-file"])
             .arg(&pf)
@@ -113,9 +119,11 @@ impl Server {
             // call that its io_uring_enter never makes, so the server would never stop.
             .env_remove("LD_PRELOAD")
             .env_remove("TSAN_OPTIONS")
-            .env_remove("ASAN_OPTIONS")
-            .spawn()
-            .expect("spawn tsdbd");
+            .env_remove("ASAN_OPTIONS");
+        for &(k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn tsdbd");
         let log = Arc::new(Mutex::new(String::new()));
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let sink = Arc::clone(&log);
@@ -141,7 +149,7 @@ impl Server {
                         let _ = child.wait();
                         panic!("{} names pid {pid}, but the server started here is pid {}", pf.display(), child.id());
                     }
-                    return Server { child: Some(child), port: port as u16, dir };
+                    return Server { child: Some(child), port: port as u16, dir, log };
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -149,6 +157,10 @@ impl Server {
         let _ = child.kill();
         let _ = child.wait();
         panic!("tsdbd did not write {} in 30 s:\n{}", pf.display(), log.lock().unwrap());
+    }
+
+    pub fn log(&self) -> String {
+        self.log.lock().unwrap().clone()
     }
 
     /// Adds volume `path` to the running server's database, as an operator does: `tsdb <dir> volume add`

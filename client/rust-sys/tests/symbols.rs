@@ -14,8 +14,21 @@ macro_rules! clash {
         }
     )*};
 }
-// one name from each of: the thread pool, codecs, WAL, parts, memtable, SIMD dispatch, hashing
-clash!(pool_new, codec_new, wal_open, part_open, mt_new, simd_init, xxh64, insert_rows, series_open);
+// one name from each of: the thread pool, codecs, WAL, parts, memtable, SIMD dispatch, hashing, erasure codec
+clash!(
+    pool_new,
+    codec_new,
+    wal_open,
+    part_open,
+    mt_new,
+    simd_init,
+    xxh64,
+    insert_rows,
+    series_open,
+    iso_gf256_init,
+    iso_rs_new,
+    tsdb_ec_select
+);
 
 #[test]
 fn engine_keeps_its_internal_names_to_itself() {

@@ -138,8 +138,9 @@ Apache-2.0 is taken under MIT. It is generated from `client/python/Cargo.lock` a
 directories, so `cargo package --list` shows them; the AGPL crates also hold `LICENSES/Apache-2.0.txt`; the sdists
 carry their crates as path dependencies and so those copies.
 `client/rust-sys` vendors the engine's own C sources (`vendor.sh`, `csrc/`), among them the Apache-2.0 files of the
-table above (which is why it carries the Apache text): nothing in them comes from another
-project (see "Copied code" above), so the licence files are all they need. The crates do not pack their
+table above (which is why it carries the Apache text) and `src/ec/` (the AGPL-3.0-only erasure codec copied from
+intellistream-objects, same owner): nothing in them comes from a third party (see "Copied code" above), so the licence
+files are all they need. The crates do not pack their
 dependencies (cargo fetches them), so a program that links them carries its dependencies' notices itself.
 `tools/check-package-licenses.sh` is the check (see below).
 
