@@ -119,6 +119,7 @@
 #include "../src/eccold.h"
 #include "../src/ecapply.h"
 #include "../src/ecdiverge.h"
+#include "../src/ecunsettle.h"
 #include "../src/marker.h"
 #include "../src/repl.h"
 #include "../src/replfile.h"
@@ -2272,19 +2273,34 @@ static void exec(struct rvol *rv, struct repl_action *a)
         idx_cut(rv, a->pos);
         hist_cut(rv, a->pos);
         break;
-    case REPL_A_SAVE:
+    case REPL_A_SAVE: {
+        db = tsdb_cvol_ref(G.t, rv->number);
+        uint64_t save_floor = a->floor;
+        if (db && ecunsettle_mut() != ECUNSETTLE_MUT_NOFLOORCLAMP) {
+            uint64_t uhold = eng_unsettle_hold_pos(db);
+            if (uhold > 0 && save_floor >= uhold) {
+                /* R10 (r10-unsettle): clamp REPL.floor below an in-flight or INDETERMINATE leader MK_UNSETTLE until
+                 * its local swap is durable on disk (or the engine closes/reopens on depose), regardless of rv->mode,
+                 * so a crash, eng_fail or depose always replays MK_UNSETTLE on reopen. */
+                save_floor = uhold - 1;
+                if (save_floor < rv->st.floor)
+                    save_floor = rv->st.floor;
+                rv->floor_clamped = 1;
+            } else {
+                rv->floor_clamped = 0;
+            }
+        }
         rc = G.mutant == RM_FLOORNOTSAVED || (G.mutant == RM_FENCENOSYNC && a->fence > rv->st.fence)
                  ? 0
-                 : save_repl(rv, a->fence, a->led, a->floor);
+                 : save_repl(rv, a->fence, a->led, save_floor);
         if (rc != 0) {
             vol_fail(rv, "the REPL file could not be saved");
             break;
         }
-        db = tsdb_cvol_ref(G.t, rv->number);
         if (!db)
             break;
         if (rv->mode == M_WRITER) {
-            uint64_t keep = a->floor;
+            uint64_t keep = save_floor;
             for (int i = 0; i < (int)rv->rec.nrep; i++)
                 if (i != rv->self && rv->peer[i].acked < keep && G.mutant != RM_KEEPIGNORESPEERS)
                     keep = rv->peer[i].acked; /* a peer never heard from holds everything */
@@ -2297,20 +2313,20 @@ static void exec(struct rvol *rv, struct repl_action *a)
             rv->ret_last_capb = capb;
             rv->ret_last_capms = capms;
             rv->ret_caps_set = 1;
-            uint64_t floor = a->floor;
+            uint64_t floor = save_floor;
             uint64_t idle_seal = G.mutant == RM_NOSEAL || G.no_clock ? 0 : rv->rec.idle_seal_ms;
             pthread_mutex_unlock(&rv->mu);
             eng_leader_keep_cap(db, capb, capms);
             eng_leader_clock(db, G.no_clock ? 0 : NOW_EVERY_MS, idle_seal);
             eng_leader_keep_floor(db, keep, floor);
             pthread_mutex_lock(&rv->mu);
-        } else if (a->floor) {
+        } else if (save_floor) {
             uint64_t capb = 0, capms = 0;
             compute_retain_caps(rv, db, &capb, &capms);
             rv->ret_last_capb = capb;
             rv->ret_last_capms = capms;
             rv->ret_caps_set = 1;
-            uint64_t floor = a->floor;
+            uint64_t floor = save_floor;
             pthread_mutex_unlock(&rv->mu);
             replica_keep_cap(db, capb, capms); /* the settings may have changed since the open */
             rc = G.mutant == RM_FLOORNOTTOLD ? 0 : replica_floor_saved(db, floor);
@@ -2327,6 +2343,7 @@ static void exec(struct rvol *rv, struct repl_action *a)
                 repl_replay_start(rv->core, rs);
         }
         break;
+    }
     case REPL_A_SEND:
         if (a->msg.type == REPL_M_APPEND && a->msg.to >= 0 && a->msg.to < (int)rv->rec.nrep) {
             struct rpeer *p = &rv->peer[a->msg.to];
@@ -2412,6 +2429,13 @@ static void exec(struct rvol *rv, struct repl_action *a)
             }
             crash_point(CP_ACKED_BEFORE_OK); /* the replicas acknowledged; no client has its answer yet */
             eng_leader_commit(db, a->pos);
+            {
+                uint64_t af = repl_applied_floor(rv->core);
+                uint64_t uhold = eng_unsettle_hold_pos(db);
+                if (uhold > 0 && af >= uhold)
+                    af = uhold - 1;
+                eng_leader_applied_floor(db, af);
+            }
             break;
         }
         pthread_mutex_unlock(&rv->mu);
@@ -2854,9 +2878,15 @@ static void handle(struct rvol *rv, struct item *it)
         rv->ck_drops++; /* too late: the core has it */
     if (rv->mode == M_WRITER && rv->cur.m.type == REPL_M_ACK) {
         uint64_t f = repl_replay_floor(rv->core);
+        uint64_t af = repl_applied_floor(rv->core);
         struct eng *db = tsdb_cvol_ref(G.t, rv->number);
-        if (db)
+        if (db) {
+            uint64_t uhold = eng_unsettle_hold_pos(db);
+            if (uhold > 0 && af >= uhold)
+                af = uhold - 1;
             eng_leader_replay_floor(db, f);
+            eng_leader_applied_floor(db, af);
+        }
         tsdb_cvol_unref(&db);
     }
 }
@@ -3024,6 +3054,7 @@ static void demote(struct rvol *rv)
     tsdb_cvol_unref(&db);
     rv->core = NULL;
     rv->mode = M_REPLICA;
+    rv->floor_clamped = 0;
     rv->fetch_wait_until = 0;
     rv->isr_want = 0;
     rv->synced_rep = rv->held_commit = rv->epoch_pos = 0;
@@ -3129,6 +3160,11 @@ static uint32_t vol_idle_deadline(struct rvol *rv, uint64_t now, uint64_t next_t
     *wait_until_out = wait_until;
     return dt;
 }
+
+#ifdef TSDB_TEST_HOOKS
+static char utrig_path[512];
+static void utrig_poll_leader(uint32_t vol);
+#endif
 
 static void *vol_main(void *arg)
 {
@@ -3254,6 +3290,28 @@ static void *vol_main(void *arg)
             if (rv->mode == M_WRITER) {
                 full_sync_locked(rv);
                 damaged_leader_sync_locked(rv);
+                if (rv->floor_clamped) {
+                    struct eng *udb = tsdb_cvol_ref(G.t, rv->number);
+                    if (udb && eng_unsettle_hold_pos(udb) == 0) {
+                        uint64_t app = repl_applied(rv->core);
+                        if (app > rv->st.floor) {
+                            if (save_repl(rv, rv->st.fence, rv->st.led, app) == 0)
+                                rv->floor_clamped = 0;
+                        } else {
+                            rv->floor_clamped = 0;
+                        }
+                        eng_leader_applied_floor(udb, repl_applied_floor(rv->core));
+                    }
+                    tsdb_cvol_unref(&udb);
+                }
+#ifdef TSDB_TEST_HOOKS
+                if (utrig_path[0]) {
+                    uint32_t vno = rv->number;
+                    pthread_mutex_unlock(&rv->mu);
+                    utrig_poll_leader(vno);
+                    pthread_mutex_lock(&rv->mu);
+                }
+#endif
             } else if (rv->mode == M_REPLICA) {
                 (void)damaged_want_leave_locked(rv);
             }
@@ -3397,6 +3455,122 @@ static void cold_apply_crash(struct eng *db, int which)
     (void)db;
     crash_point(which == ECAPPLY_CRASH_BEFORE_APPLY ? CP_COLD_BEFORE_APPLY : CP_COLD_MID_INTENT);
 }
+
+/* a replica's apply of MK_UNSETTLE (src/ecunsettle.c) */
+static void unsettle_apply_crash(struct eng *db)
+{
+    (void)db;
+    crash_point(CP_UNSETTLE_MID_APPLY);
+}
+
+/* a leader's MK_UNSETTLE committed, before its own swap (src/ecunsettle.c) */
+static int utrig_after_marker_ms;
+static void unsettle_leader_crash(struct eng *db)
+{
+    (void)db;
+    if (utrig_after_marker_ms > 0) {
+        struct timespec ts = {utrig_after_marker_ms / 1000, (long)(utrig_after_marker_ms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    crash_point(CP_UNSETTLE_AFTER_MARKER);
+}
+
+/* Test hook (TSDB_ECUNSETTLE_TEST=trigger=<path>): when <path> exists containing "<vol>", spawns a worker thread
+ * on the leader of volume <vol> to unsettle all listed .ec keys via eng_ec_keys + eng_unsettle_key, writes the
+ * outcome to <path>.out, and removes <path>. Runs off the volume thread so jr_markers_wait never deadlocks repld. */
+static pthread_mutex_t utrig_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t utrig_th;
+static int utrig_active, utrig_joinable;
+static uint32_t utrig_vol;
+
+static void *utrig_main(void *arg)
+{
+    (void)arg;
+    uint32_t v = utrig_vol;
+    struct eng *db = tsdb_cvol_ref(G.t, v);
+    int rc = db ? 0 : TSDB_ERR_NOTFOUND;
+    int64_t *keys = NULL;
+    size_t nkeys = 0, done = 0;
+    uint64_t tot_objs = 0, tot_bytes = 0;
+    if (rc == 0)
+        rc = eng_ec_keys(db, &keys, &nkeys);
+    for (size_t i = 0; rc == 0 && i < nkeys; i++) {
+        uint64_t objs = 0, bytes = 0;
+        rc = eng_unsettle_key(db, keys[i], &objs, &bytes);
+        if (rc == 0) {
+            done++;
+            tot_objs += objs;
+            tot_bytes += bytes;
+        }
+    }
+    free(keys);
+    tsdb_cvol_unref(&db);
+    char out[544], tmp[560];
+    snprintf(out, sizeof out, "%s.out", utrig_path);
+    snprintf(tmp, sizeof tmp, "%s.out.tmp", utrig_path);
+    FILE *o = fopen(tmp, "w");
+    if (o) {
+        if (rc == 0)
+            fprintf(o, "ok %zu %" PRIu64 " %" PRIu64 "\n", done, tot_objs, tot_bytes);
+        else
+            fprintf(o, "err %d %s\n", rc, tsdb_strerror(rc));
+        fflush(o);
+        fsync(fileno(o));
+        fclose(o);
+        (void)rename(tmp, out);
+    }
+    unlink(utrig_path);
+    say("volume %" PRIu32 ": unsettle trigger done (rc=%d keys=%zu objs=%" PRIu64 " bytes=%" PRIu64 ")", v, rc, done,
+        tot_objs, tot_bytes);
+    pthread_mutex_lock(&utrig_mu);
+    utrig_active = 0;
+    pthread_mutex_unlock(&utrig_mu);
+    return NULL;
+}
+
+static void utrig_poll_leader(uint32_t vol)
+{
+    if (!utrig_path[0] || access(utrig_path, F_OK) != 0)
+        return;
+    FILE *f = fopen(utrig_path, "r");
+    if (!f)
+        return;
+    unsigned want = 0;
+    int got = fscanf(f, "%u", &want);
+    fclose(f);
+    if (got != 1 || want != vol)
+        return;
+    pthread_mutex_lock(&utrig_mu);
+    if (!utrig_active) {
+        if (utrig_joinable) {
+            pthread_t old = utrig_th;
+            utrig_joinable = 0;
+            pthread_mutex_unlock(&utrig_mu);
+            pthread_join(old, NULL);
+            pthread_mutex_lock(&utrig_mu);
+        }
+        if (!utrig_active) {
+            utrig_vol = vol;
+            utrig_active = 1;
+            if (pthread_create(&utrig_th, NULL, utrig_main, NULL) == 0)
+                utrig_joinable = 1;
+            else
+                utrig_active = 0;
+        }
+    }
+    pthread_mutex_unlock(&utrig_mu);
+}
+
+static void utrig_join(void)
+{
+    pthread_mutex_lock(&utrig_mu);
+    int j = utrig_joinable;
+    pthread_t th = utrig_th;
+    utrig_joinable = 0;
+    pthread_mutex_unlock(&utrig_mu);
+    if (j)
+        pthread_join(th, NULL);
+}
 #endif
 
 void repld_init(tsdb *t, const char *dir)
@@ -3539,6 +3713,25 @@ void repld_init(tsdb *t, const char *dir)
     G.bulk_frame = te && strstr(te, "bulkframe");
     atomic_store(&eccold_marker_hook, cold_marker_crash); /* r8l's midcommit: cold-after-marker */
     atomic_store(&ecapply_crash_hook, cold_apply_crash);  /* cold-before-apply, cold-mid-intent */
+    atomic_store(&ecunsettle_crash_hook, unsettle_apply_crash); /* r10-unsettle: unsettle-mid-apply */
+    atomic_store(&ecunsettle_leader_crash_hook, unsettle_leader_crash); /* r10-unsettle: unsettle-after-marker */
+    ecunsettle_env_init();
+    const char *ut = getenv("TSDB_ECUNSETTLE_TEST");
+    if (ut) {
+        const char *tp = strstr(ut, "trigger=");
+        if (tp) {
+            tp += 8;
+            const char *comma = strchr(tp, ',');
+            size_t len = comma ? (size_t)(comma - tp) : strlen(tp);
+            if (len >= sizeof utrig_path)
+                len = sizeof utrig_path - 1;
+            memcpy(utrig_path, tp, len);
+            utrig_path[len] = '\0';
+        }
+        const char *am = strstr(ut, "after_marker_ms=");
+        if (am)
+            utrig_after_marker_ms = atoi(am + 16);
+    }
     if (!leader_test_marker_hook) /* jr_cold's hook right after the append: eccold_after_append passes the COLD on */
         leader_test_marker_hook = eccold_after_append;
     if (te && strstr(te, "smallinbox"))
@@ -4043,6 +4236,10 @@ int repld_close_end(uint32_t v, uint64_t *log_end)
         pthread_cond_signal(&rv->cv);
         pthread_cond_broadcast(&rv->in_space);
         pthread_mutex_unlock(&rv->mu);
+        struct eng *sdb = tsdb_cvol_ref(G.t, v);
+        if (sdb)
+            eng_replica_stop(sdb);
+        tsdb_cvol_unref(&sdb);
         if (rv->started)
             pthread_join(rv->th, NULL);
         rv->started = 0;
@@ -4113,6 +4310,10 @@ void repld_stop(void)
         pthread_cond_signal(&rv->cv);
         pthread_cond_broadcast(&rv->in_space);
         pthread_mutex_unlock(&rv->mu);
+        struct eng *sdb = tsdb_cvol_ref(G.t, rv->number);
+        if (sdb)
+            eng_replica_stop(sdb);
+        tsdb_cvol_unref(&sdb);
         if (rv->started)
             pthread_join(rv->th, NULL);
         rv->started = 0;
@@ -4121,6 +4322,9 @@ void repld_stop(void)
             eng_leader_depose(db); /* nothing waits for a commit point that no longer moves */
         tsdb_cvol_unref(&db);
     }
+#ifdef TSDB_TEST_HOOKS
+    utrig_join();
+#endif
     rsnap_quiesce(); /* the snapshot worker sends on the links: stopped before they go */
     retain_reset();
     /* Wait for any unlocked plink_send/plink_sendv (e.g. op_bytes on a writer thread) before freeing the links. */

@@ -36,6 +36,7 @@
 #include "eccold.h"
 #include "ecdigest.h"
 #include "ecgcmk.h"
+#include "ecunsettle.h"
 #include "ppos.h"
 
 #include <dirent.h>
@@ -2126,6 +2127,8 @@ static int apply_marker(eng *db, struct replica *rp, uint64_t seq, const wal_rec
         return ecdigest_apply(db, wr->fno + wr->span - 1, &m);
     case MK_GC:
         return ecgcmk_apply(db, wr->fno + wr->span - 1, &m);
+    case MK_UNSETTLE:
+        return ec_unsettle_apply(db, wr->fno + wr->span - 1, &m);
     case MK_EPOCH:
         /* The marker sits in the segment its epoch names, (e << 40) (6.2 step 3): segments only go up, so epochs do too,
          * and a record of a lower epoch's leader cannot pass as the new one's. */

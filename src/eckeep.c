@@ -867,6 +867,22 @@ void eckeep_unsettle_locked(eng *db, const char *settled_name)
     pthread_mutex_unlock(&k->mu);
 }
 
+void eckeep_unsettle_cleanup_jobs(eng *db)
+{
+    struct eckeep_eng *k = keep_of(db);
+    if (!k)
+        return;
+    char done[16][64];
+    size_t ndone;
+    do {
+        pthread_mutex_lock(&k->mu);
+        ndone = jobs_done_locked(k, done, 16);
+        pthread_mutex_unlock(&k->mu);
+        for (size_t i = 0; i < ndone; i++)
+            ecdigest_job_remove(db, done[i]);
+    } while (ndone == 16);
+}
+
 void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z) { held(db, own, n, true, key, z); }
 
 bool eckeep_active(eng *db) { return keep_of(db) != NULL; }

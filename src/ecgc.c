@@ -21,6 +21,7 @@
 #include "eccache.h"
 #include "ecgcmk.h"
 #include "ecpart.h"
+#include "ecunsettle.h"
 #include "tier.h"
 
 #include <errno.h>
@@ -200,7 +201,11 @@ typedef struct gc_rec {
     uint8_t oid[16];
     uint16_t npos;
     bool object;
-    int64_t deadline; /* monotonic ms: when cluster MK_GC may collect this retired object */
+    bool loaded_from_disk; /* loaded by ecgc_load_retired at open (checked in ecgc_eng_ready for unsettle gating) */
+    int64_t partition;
+    uint64_t min_block, max_block;
+    uint64_t need_applied; /* >0: cluster MK_GC waits until db->lead_applied_floor >= need_applied (R10 unsettle) */
+    int64_t deadline;      /* monotonic ms: when cluster MK_GC may collect this retired object */
     gc_ticket *tk;
 } gc_rec;
 
@@ -681,6 +686,34 @@ void ecgc_eng_ready(eng *db)
 {
     if (!db || !db->ec_cluster || !db->tier || !db->tier->gc)
         return;
+    /* R10 (r10-unsettle): on a newly opened/promoted cluster EC leader, any retired_<P>.ec loaded from disk whose
+     * object is not referenced by a currently listed .ec part may have come from an unsettle (including a key that was
+     * subsequently dropped or TTL-retired before failover, where a lagging replica still needs the chunks to replay
+     * MK_UNSETTLE before MK_DROP). Gate its MK_GC on all log replicas reaching this open's log end (fno_next - 1). */
+    struct ecgc_eng *ee = db->ecstate ? db->ecstate->gc : NULL;
+    if (ee && !db->rp) {
+        pthread_mutex_lock(&db->lock);
+        uint64_t gate = db->fno_next > 1 ? db->fno_next - 1 : 0;
+        for (size_t i = 0; i < ee->n; i++) {
+            gc_rec *r = &ee->r[i];
+            if (!r->loaded_from_disk || !r->object || r->need_applied > 0)
+                continue;
+            bool live_ec = false;
+            for (size_t j = 0; j < db->nparts; j++) {
+                part *p = db->parts[j];
+                if (p->dropped)
+                    continue;
+                struct ecpart *ec = atomic_load(&p->ec);
+                if (ec && memcmp(ec->rec.oid, r->oid, 16) == 0) {
+                    live_ec = true;
+                    break;
+                }
+            }
+            if (!live_ec)
+                r->need_applied = gate;
+        }
+        pthread_mutex_unlock(&db->lock);
+    }
     struct ecgc_tier *g = db->tier->gc;
     pthread_mutex_lock(&g->mu);
     for (size_t i = 0; i < g->neng; i++)
@@ -849,14 +882,21 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only)
     uint8_t oid[16];
     memcpy(oid, ep->rec.oid, 16);
     unsigned npos = (unsigned)ep->rec.k + ep->rec.m;
+    int64_t part_key = p->partition;
+    uint64_t min_blk = p->min_block, max_blk = p->max_block;
     part_unref(p); /* drops the temporary hold taken by part_open_ec */
     int64_t deadline = eng_mono_ms() + gc_life_ms(db);
-    if (!rec_add(e, name, oid, npos, true, deadline) || graveyard_add(db, name, GY_EC, deadline) != 0)
+    gc_rec *r = rec_add(e, name, oid, npos, true, deadline);
+    if (!r || graveyard_add(db, name, GY_EC, deadline) != 0)
         return TSDB_ERR_NOMEM;
+    r->loaded_from_disk = true;
+    r->partition = part_key;
+    r->min_block = min_blk;
+    r->max_block = max_blk;
     return 0;
 }
 
-void ecgc_retire_locked(eng *db, part *p)
+void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied)
 {
     EC_CALLED(EC_CALL_GC_RETIRE);
     struct ecgc_eng *e = eng_gc(db);
@@ -873,6 +913,7 @@ void ecgc_retire_locked(eng *db, part *p)
     /* out of memory: no record, and a GY_EC entry without one is kept (its name stays for the next open) */
     if (!r)
         return;
+    r->need_applied = need_applied;
     /* Holds are taken in part_open_ec; holdatretire plants the old r7-gc F5 bug of taking them only here. */
     if (object && ecgc_mutant == GC_MUT_HOLDATRET && ecgc_hold(db->tier, p, db->tier_vol, ep->rec.oid) != 0) {
         rec_remove(e, r);
@@ -882,8 +923,15 @@ void ecgc_retire_locked(eng *db, part *p)
      * (ecgc_owns_name). Unrecorded (out of memory): the next open. */
     if (object && db->opt.obsolete_part_lifetime_s <= 0)
         (void)graveyard_add(db, retired, GY_EC, now);
-    if (object && db->ec_cluster && deadline <= now)
+    if (object && db->ec_cluster && deadline <= now &&
+        (need_applied == 0 || ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE ||
+         atomic_load(&db->lead_applied_floor) >= need_applied))
         ecgc_kick_tier(db->tier);
+}
+
+void ecgc_retire_locked(eng *db, part *p)
+{
+    ecgc_retire_locked_at(db, p, 0);
 }
 
 bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
@@ -910,7 +958,10 @@ bool ecgc_purge_entry(eng *db, const graveyard_entry *ge, bool all, int64_t now)
     }
     /* Cluster EC volume (E14, D13): never directly delete chunks; retired objects go only via committed MK_GC. */
     if (db->ec_cluster) {
-        if (!db->rp && r->deadline <= now && (ecgc_mutant == GC_MUT_NOHOLD || !ecgc_held(db->tier, db->tier_vol, r->oid)))
+        if (!db->rp && r->deadline <= now &&
+            (r->need_applied == 0 || ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE ||
+             atomic_load(&db->lead_applied_floor) >= r->need_applied) &&
+            (ecgc_mutant == GC_MUT_NOHOLD || !ecgc_held(db->tier, db->tier_vol, r->oid)))
             ecgc_kick_tier(db->tier);
         return false;
     }
@@ -997,8 +1048,12 @@ int ecgc_take_due_retired(eng *db, int64_t now, uint8_t (**oids_out)[16], size_t
         return TSDB_ERR_NOMEM;
     }
     size_t n = 0;
+    uint64_t app_floor = atomic_load(&db->lead_applied_floor);
+    bool nogcgate = ecunsettle_mut() == ECUNSETTLE_MUT_NOGCGATE;
     for (size_t i = 0; i < e->n && n < MK_FILES_MAX; i++) {
         if (!e->r[i].object || e->r[i].deadline > now)
+            continue;
+        if (!nogcgate && e->r[i].need_applied > 0 && app_floor < e->r[i].need_applied)
             continue;
         if (ecgc_mutant != GC_MUT_NOHOLD && ecgc_held(db->tier, db->tier_vol, e->r[i].oid))
             continue;

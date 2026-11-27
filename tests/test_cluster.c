@@ -16658,6 +16658,454 @@ static void scen_ecgc(void)
            ecb_chunks(num));
 }
 
+/* unsettle (R10 r10-unsettle, §6.4, D14, D27): 4+2 cluster EC volume with settled keys converted back to plain .part
+ * files across all 3 log replicas via MK_UNSETTLE:
+ *   1. Write 2 days to e42 (ec=4+2) and twin oracle t42 (replicas=3); wait until settled across all 3 log replicas.
+ *   2. Hold background settles (TSDB_SETTLE_HOLD), arm unsettle-mid-apply crash on replica R2 only, and trigger leader
+ *      unsettle (eng_ec_keys + eng_unsettle_key).
+ *   3. Verify R2 hits unsettle-mid-apply (exits 99 before acknowledging), R1 swaps to plain .part files, and while R2
+ *      is dead the stripe chunks stay alive (MK_GC waits until every log replica has applied MK_UNSETTLE).
+ *   4. Restart R2 -> R2 recovers cleanly, decodes from the still-alive chunks, swaps to plain .part files, rejoins ISR,
+ *      and MK_GC retires all stripe chunks (0 chunks on all 6 stores, 0 .ec and 0 retired_ on all 3 log replicas).
+ *   5. Transfer leadership across all 3 log replicas and verify every series equals oracle t42 on every replica.
+ * Planted bug: TSDB_ECUNSETTLE_MUTANT=unsettleleaderonly (replicas skip applying MK_UNSETTLE) must fail this scenario. */
+static void scen_unsettle(void)
+{
+    scenario("unsettle");
+#ifndef TSDB_EC
+    printf("  skipped: this build has no erasure codec (x86-64 only)\n");
+    return;
+#else
+    static char hold_path[PATH_MAX + 64], trig_path[PATH_MAX + 64], trig_out[PATH_MAX + 80];
+    static char crash_path[6][PATH_MAX + 64];
+    static char penv_buf[6][4 * PATH_MAX + 512];
+    snprintf(hold_path, sizeof hold_path, "%s/unsettle_hold", base);
+    snprintf(trig_path, sizeof trig_path, "%s/unsettle_trig", base);
+    snprintf(trig_out, sizeof trig_out, "%s.out", trig_path);
+    unlink(hold_path);
+    unlink(trig_path);
+    unlink(trig_out);
+
+    for (int i = 0; i < 6; i++) {
+        snprintf(crash_path[i], sizeof crash_path[i], "%s/crash_unsettle_%d", base, i);
+        unlink(crash_path[i]);
+        snprintf(penv_buf[i], sizeof penv_buf[i],
+                 "TSDB_SETTLE_HOLD=%s TSDB_ECUNSETTLE_TEST=trigger=%s "
+                 "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0 TSDB_CRASH_AT=unsettle-mid-apply:1@%s",
+                 hold_path, trig_path, crash_path[i]);
+        penv[i] = penv_buf[i];
+        start(i);
+    }
+    init_cluster(0, 600);
+    for (int i = 1; i < 6; i++)
+        node_add(0, i);
+    unsigned want = 5;
+    await_view(0, p_voters, &want, "five voters of six members");
+
+    static char xa[6][PATH_MAX + 256];
+    for (int i = 0; i < 6; i++) {
+        char sd[PATH_MAX + 96];
+        snprintf(sd, sizeof sd, "%s/ecs%d", base, i);
+        disk_make(sd, "hdd");
+        snprintf(xa[i], sizeof xa[i],
+                 "--disk %s:hdd --ec-settle-grace-s 0 --ec-settle-force-s 1 --merge-idle-s 1 "
+                 "--flush-interval-ms 200",
+                 sd);
+        restart_xargs(i, xa[i]);
+    }
+    await_view(5, p_six_placeable, NULL, "six members UP with their volumes open");
+
+    uint32_t num = 0, tnum = 0;
+    char text[256];
+    int rc;
+    for (uint64_t t0 = now_ms(); (rc = vol_add_ec(0, "e42", 0, 4, 2, &num, text, sizeof text)) != 0; usleep(100000))
+        if ((rc != CLUSTER_ERR_FEW && rc != CLUSTER_ERR_NOTLEADER) || now_ms() - t0 > 30000)
+            die("unsettle: ec=4+2 add: %s (%s)", cluster_strerror(rc), text);
+    for (uint64_t t0 = now_ms(); (rc = vol_add(0, "t42", 3, &tnum)) != 0; usleep(100000))
+        if (rc != CLUSTER_ERR_NOTLEADER || now_ms() - t0 > 30000)
+            die("unsettle: twin t42 add: %s", cluster_strerror(rc));
+
+    struct meta_volume e, tv;
+    int L = ecgc_leader_of(num, 0, &e);
+    for (uint64_t t0 = now_ms(); !vol_rec(0, "t42", &tv) || !tv.leader; usleep(50000))
+        if (now_ms() - t0 > 30000)
+            die("unsettle: no leader for twin t42 in 30 s");
+    int Lt = server_of(tv.leader);
+    int reps[3], nreps = 0;
+    for (uint32_t k = 0; k < e.nrep && nreps < 3; k++)
+        reps[nreps++] = server_of(e.rep[k].node);
+    if (nreps != 3 || Lt < 0)
+        die("unsettle: bad layout (nreps=%d Lt=%d)", nreps, Lt);
+    int R1 = -1, R2 = -1;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L)
+            *(R1 < 0 ? &R1 : &R2) = reps[k];
+    printf("  e42 (vol %" PRIu32 ") led by %d, replicas %d,%d,%d (mid-apply crash target %d)\n", num, L, reps[0],
+           reps[1], reps[2], R2);
+
+    /* 1. Write 2 days to both e42 and oracle t42 and wait until all 3 log replicas hold settled .ec parts. */
+    tsdbc *c = client(L), *ct = client(Lt);
+    tsdb_sid ide[ECB_SERIES], idt[ECB_SERIES];
+    const int64_t day0 = 1704067200000LL;
+    for (int s = 0; s < ECB_SERIES; s++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "un.s%d", s);
+        ide[s] = ecb_series(c, nm, "e42");
+        idt[s] = ecb_series(ct, nm, "t42");
+    }
+    for (int d = 0; d < 2; d++) {
+        int64_t dm = day0 + (int64_t)d * 30 * 86400000LL; /* 30 days apart -> 2 distinct partition keys */
+        ecb_write_day(c, ide, dm);
+        ecb_write_day(ct, idt, dm);
+    }
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int ok = 1;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) < 2 || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                ok = 0;
+        }
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        if (ok && nch == nec * 6)
+            break;
+        if (now_ms() - t0 > 120000)
+            die("unsettle: 2 days did not settle on all 3 replicas in 120 s (ec %d/%d/%d, chunks %d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch);
+    }
+    struct ecb_sum oracle[ECB_SERIES];
+    for (int s = 0; s < ECB_SERIES; s++) {
+        struct ecb_sum got;
+        if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n != 4 * ECB_ROWS)
+            die("unsettle: oracle read s=%d: %s (n=%" PRIu64 ")", s, ers(rc), oracle[s].n);
+        if ((rc = ecb_read(c, ide[s], &got)) != 0 || got.n != oracle[s].n || got.h != oracle[s].h)
+            die("unsettle: settled read s=%d mismatch: %s (n=%" PRIu64 " want %" PRIu64 ")", s, ers(rc), got.n,
+                oracle[s].n);
+    }
+    tsdbc_close(ct);
+    tsdbc_close(c);
+    c = ct = NULL;
+    int ch_settled = ecb_chunks(num);
+    printf("  settled: %d .ec parts/replica, %d chunks on 6 stores, oracle verified\n", ecb_ec_parts(L, num),
+           ch_settled);
+
+    /* 2. Hold further settles and arm mid-apply crash on replica R2 ONLY. */
+    touch_file(hold_path);
+    touch_file(crash_path[R2]);
+
+    /* 3. Trigger leader unsettle of all settled keys via TSDB_ECUNSETTLE_TEST. */
+    {
+        char tmp[PATH_MAX + 80];
+        snprintf(tmp, sizeof tmp, "%s.tmp", trig_path);
+        FILE *f = fopen(tmp, "w");
+        if (!f)
+            die("open %s: %s", tmp, strerror(errno));
+        fprintf(f, "%" PRIu32 "\n", num);
+        fclose(f);
+        if (rename(tmp, trig_path) != 0)
+            die("rename %s -> %s: %s", tmp, trig_path, strerror(errno));
+    }
+
+    /* Wait for leader trigger to complete and R2 to hit unsettle-mid-apply (exiting 99 before acknowledging). */
+    for (uint64_t t0 = now_ms(); access(trig_out, F_OK) != 0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("unsettle: leader %d did not complete unsettle trigger in 90 s", L);
+    {
+        char line[256] = "";
+        FILE *f = fopen(trig_out, "r");
+        if (!f || !fgets(line, sizeof line, f))
+            die("unsettle: cannot read %s", trig_out);
+        fclose(f);
+        if (strncmp(line, "ok ", 3) != 0)
+            die("unsettle: leader trigger failed: %s", line);
+        printf("  leader unsettle: %s", line);
+    }
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[R2], &st, WNOHANG) == pids[R2]) {
+            pids[R2] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("unsettle: replica %d did not hit unsettle-mid-apply in 30 s (unsettleleaderonly?)", R2);
+    }
+    if (!log_has(R2, "unsettle-mid-apply"))
+        die("unsettle: replica %d exited without hitting unsettle-mid-apply", R2);
+    unlink(crash_path[R2]);
+
+    /* R1 must already have plain .part files and 0 .ec parts. */
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        char live[512];
+        if (ecb_ec_parts(R1, num) == 0 && ecb_live_parts(R1, num, live, sizeof live) >= 2)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("unsettle: replica %d still has %d .ec parts (unsettleleaderonly?)", R1, ecb_ec_parts(R1, num));
+    }
+
+    /* Wait until ISR shrinks to 2 (so leader L has definitely processed heartbeats without R2) + several GC polls:
+     * while R2 is dead (having not applied MK_UNSETTLE yet), MK_GC MUST NOT delete the stripe chunks! */
+    await_isr(L, "e42", 2, 30000, "R2 dropped from ISR while dead mid-apply");
+    usleep(1200000); /* 6x poll_ms (200 ms) after ISR shrink */
+    int ch_while_down = ecb_chunks(num);
+    if (ch_while_down != ch_settled)
+        die("unsettle: chunks deleted while killed replica %d had not applied MK_UNSETTLE (got %d, want %d; "
+            "unsettlenogcgate?)",
+            R2, ch_while_down, ch_settled);
+    printf("  mid-apply crash on replica %d: chunks held (%d == %d) across ISR shrink until recovery\n", R2,
+           ch_while_down, ch_settled);
+
+    /* 4. Restart R2 -> R2 decodes from still-alive chunks, swaps .ec -> .part, rejoins ISR -> MK_GC empties stores! */
+    start(R2);
+    await_isr(L, "e42", 3, 60000, "all 3 replicas back in ISR after R2 mid-apply recovery");
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int ok = ecb_chunks(num) == 0;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) != 0 || ecb_retired_ec(reps[k], num) != 0 ||
+                ecb_live_parts(reps[k], num, live, sizeof live) < 2)
+                ok = 0;
+        }
+        if (ok)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("unsettle: post-recovery cleanup incomplete after 90 s (chunks=%d; ec=%d/%d/%d; ret=%d/%d/%d)",
+                ecb_chunks(num), ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num), ecb_retired_ec(reps[2], num));
+    }
+    printf("  phase 1: all 3 replicas hold plain .part files (0 .ec, 0 retired_), 0 chunks left on all 6 stores\n");
+
+    /* 5. Phase 2 (MUST-FIX #1 + ecgc_eng_ready failover gate): settle a 3rd day, transfer leadership to R1 armed with
+     * unsettle-after-marker (leader commits MK_UNSETTLE and exits 99 BEFORE its own swap!). Failover promotes another
+     * replica; chunks MUST stay alive while crashed ex-leader R1 is down (ecgc_eng_ready gates retired_.ec on all
+     * replicas reaching fno_next - 1). Restart R1 -> R1 opens with clamped REPL.floor < pos, replays MK_UNSETTLE,
+     * swaps .ec -> .part, rejoins ISR -> ONLY THEN promoted leader's MK_GC empties the stores! */
+    unlink(hold_path);
+    c = client(L);
+    ct = client(Lt);
+    ecb_write_day(c, ide, day0 + 60 * 86400000LL);
+    ecb_write_day(ct, idt, day0 + 60 * 86400000LL);
+    int ec_p2 = 0, ch_p2 = 0;
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int nec = ecb_ec_parts(L, num);
+        int nch = ecb_chunks(num);
+        int ok = nec >= 3 && nch == nec * 6;
+        for (int k = 0; k < 3; k++)
+            if (ecb_ec_parts(reps[k], num) != nec || ecb_live_parts(reps[k], num, live, sizeof live) != 0)
+                ok = 0;
+        if (ok) {
+            ec_p2 = nec;
+            ch_p2 = nch;
+            break;
+        }
+        if (now_ms() - t0 > 120000)
+            die("unsettle phase 2: 3 days did not settle on all 3 replicas in 120 s (ec=%d/%d/%d chunks=%d)",
+                ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num), nch);
+    }
+    for (int s = 0; s < ECB_SERIES; s++) {
+        if ((rc = ecb_read(ct, idt[s], &oracle[s])) != 0 || oracle[s].n != 6 * ECB_ROWS)
+            die("unsettle phase 2: oracle read s=%d: %s (n=%" PRIu64 ")", s, ers(rc), oracle[s].n);
+    }
+    tsdbc_close(ct);
+    tsdbc_close(c);
+    c = ct = NULL;
+    touch_file(hold_path);
+
+    /* Arm R1 with unsettle-after-marker, restart R1, wait for ISR=3, transfer leadership of e42 to R1. */
+    static char lcrash_path[PATH_MAX + 64], lpenv[4 * PATH_MAX + 512];
+    snprintf(lcrash_path, sizeof lcrash_path, "%s/crash_unsettle_leader", base);
+    unlink(lcrash_path);
+    snprintf(lpenv, sizeof lpenv,
+             "TSDB_SETTLE_HOLD=%s TSDB_ECUNSETTLE_TEST=trigger=%s,after_marker_ms=2500 "
+             "TSDB_ECGC_TEST=poll_ms=200,lifetime_s=0 TSDB_CRASH_AT=unsettle-after-marker:1@%s",
+             hold_path, trig_path, lcrash_path);
+    penv[R1] = lpenv;
+    restart_xargs(R1, xa[R1]);
+    await_isr(L, "e42", 3, 60000, "ISR=3 after restarting R1 with unsettle-after-marker");
+    {
+        char why[256];
+        for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[R1], why, sizeof why)) != 0; usleep(200000))
+            if (now_ms() - t0 > 30000)
+                die("unsettle phase 2: transfer e42 to R1 (%d): %s (%s)", R1, cluster_strerror(rc), why);
+        for (uint64_t t0 = now_ms();; usleep(100000)) {
+            struct meta_volume mv;
+            if (vol_rec(R1, "e42", &mv) && mv.leader == ids[R1])
+                break;
+            if (now_ms() - t0 > 30000)
+                die("unsettle phase 2: R1 (%d) did not become leader in 30 s", R1);
+        }
+    }
+    unlink(trig_out);
+    touch_file(lcrash_path);
+    {
+        char tmp[PATH_MAX + 80];
+        snprintf(tmp, sizeof tmp, "%s.tmp", trig_path);
+        FILE *f = fopen(tmp, "w");
+        if (!f)
+            die("open %s: %s", tmp, strerror(errno));
+        fprintf(f, "%" PRIu32 "\n", num);
+        fclose(f);
+        if (rename(tmp, trig_path) != 0)
+            die("rename %s -> %s: %s", tmp, trig_path, strerror(errno));
+    }
+    /* Write 1 small row on R1 while R1 is in its after_marker_ms window (after MK_UNSETTLE committed, before swap):
+     * small writes do not wait on jr_serial, so this row lands in the same WAL segment and lets flusher_main advance
+     * RSTATE.kept past MK_UNSETTLE while REPL_A_SAVE fires. Without the REPL.floor clamp (unsettlenofloorclamp), R1
+     * reopens skipping the segment and never replays MK_UNSETTLE! */
+    usleep(300000);
+    {
+        tsdbc *cw = client(R1), *cwt = client(Lt);
+        int64_t ts1 = day0 + 90 * 86400000LL;
+        float val1 = 42.25f;
+        if ((rc = tsdbc_insert_series(cw, ide[0], &ts1, &val1, 1)) != 0)
+            die("unsettle phase 2: concurrent small write on R1: %s", ers(rc));
+        if ((rc = tsdbc_insert_series(cwt, idt[0], &ts1, &val1, 1)) != 0)
+            die("unsettle phase 2: oracle small write: %s", ers(rc));
+        if ((rc = ecb_read(cwt, idt[0], &oracle[0])) != 0)
+            die("unsettle phase 2: oracle re-read s=0: %s", ers(rc));
+        tsdbc_close(cwt);
+        tsdbc_close(cw);
+    }
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        int st = 0;
+        if (waitpid(pids[R1], &st, WNOHANG) == pids[R1]) {
+            pids[R1] = 0;
+            break;
+        }
+        if (now_ms() - t0 > 60000)
+            die("unsettle phase 2: leader R1 (%d) did not hit unsettle-after-marker in 60 s", R1);
+    }
+    if (!log_has(R1, "unsettle-after-marker"))
+        die("unsettle phase 2: leader R1 (%d) exited without hitting unsettle-after-marker", R1);
+    unlink(lcrash_path);
+    unlink(trig_path);
+
+    /* Wait for failover onto L2 (L or R2) and verify R1 still holds its .ec on disk while chunks stay alive! */
+    int L2 = -1;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        struct meta_volume mv;
+        if (vol_rec(L, "e42", &mv) && mv.leader && mv.leader != ids[R1]) {
+            L2 = server_of(mv.leader);
+            break;
+        }
+        if (now_ms() - t0 > 30000)
+            die("unsettle phase 2: failover off crashed leader R1 (%d) did not finish in 30 s", R1);
+    }
+    await_isr(L2, "e42", 2, 30000, "ISR=2 on promoted leader L2 while crashed leader R1 is down");
+    if (ecb_ec_parts(R1, num) != ec_p2)
+        die("unsettle phase 2: expected crashed leader R1 (%d) to still list %d .ec before restart, got %d", R1,
+            ec_p2, ecb_ec_parts(R1, num));
+    int ec_after = ec_p2;
+    for (uint64_t t0 = now_ms();; usleep(100000)) {
+        ec_after = ecb_ec_parts(L2, num);
+        if (ec_after < ec_p2)
+            break;
+        if (now_ms() - t0 > 30000)
+            die("unsettle phase 2: promoted leader L2 (%d) did not apply MK_UNSETTLE in 30 s (ec=%d, was %d)", L2,
+                ec_after, ec_p2);
+    }
+    usleep(1200000); /* 6x poll_ms (200 ms) on promoted leader L2 */
+    if (ecb_chunks(num) != ch_p2)
+        die("unsettle phase 2: promoted leader %d deleted chunks before crashed leader R1 (%d) recovered (chunks=%d, "
+            "want %d)",
+            L2, R1, ecb_chunks(num), ch_p2);
+    printf("  phase 2: leader %d crashed after MK_UNSETTLE commit (before swap); promoted leader %d held %d chunks\n",
+           R1, L2, ch_p2);
+
+    /* Restart R1 -> replays MK_UNSETTLE from WAL (clamped REPL.floor < pos), swaps 1st key .ec -> .part, unblocks MK_GC! */
+    start(R1);
+    await_isr(L2, "e42", 3, 60000, "ISR=3 after crashed leader R1 restarted and replayed MK_UNSETTLE");
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int ok = ecb_chunks(num) == ec_after * 6;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) != ec_after || ecb_retired_ec(reps[k], num) != 0 ||
+                ecb_live_parts(reps[k], num, live, sizeof live) < 1)
+                ok = 0;
+        }
+        if (ok)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("unsettle phase 2: post-recovery replay/GC incomplete after 90 s (chunks=%d want %d; ec=%d/%d/%d want "
+                "%d; ret=%d/%d/%d)",
+                ecb_chunks(num), ec_after * 6, ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num),
+                ecb_ec_parts(reps[2], num), ec_after, ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num),
+                ecb_retired_ec(reps[2], num));
+    }
+    /* Finish unsettling the remaining 2 settled keys on promoted leader L2 so all 3 replicas end with 0 .ec, 0 chunks. */
+    unlink(trig_out);
+    {
+        char tmp[PATH_MAX + 80];
+        snprintf(tmp, sizeof tmp, "%s.tmp", trig_path);
+        FILE *f = fopen(tmp, "w");
+        if (!f)
+            die("open %s: %s", tmp, strerror(errno));
+        fprintf(f, "%" PRIu32 "\n", num);
+        fclose(f);
+        if (rename(tmp, trig_path) != 0)
+            die("rename %s -> %s: %s", tmp, trig_path, strerror(errno));
+    }
+    for (uint64_t t0 = now_ms(); access(trig_out, F_OK) != 0; usleep(100000))
+        if (now_ms() - t0 > 90000)
+            die("unsettle phase 2: promoted leader %d did not complete final unsettle trigger in 90 s", L2);
+    for (uint64_t t0 = now_ms();; usleep(200000)) {
+        char live[512];
+        int ok = ecb_chunks(num) == 0;
+        for (int k = 0; k < 3; k++) {
+            if (ecb_ec_parts(reps[k], num) != 0 || ecb_retired_ec(reps[k], num) != 0 ||
+                ecb_live_parts(reps[k], num, live, sizeof live) < 3)
+                ok = 0;
+        }
+        if (ok)
+            break;
+        if (now_ms() - t0 > 90000)
+            die("unsettle phase 2: final cleanup incomplete after 90 s (chunks=%d; ec=%d/%d/%d; ret=%d/%d/%d)",
+                ecb_chunks(num), ecb_ec_parts(reps[0], num), ecb_ec_parts(reps[1], num), ecb_ec_parts(reps[2], num),
+                ecb_retired_ec(reps[0], num), ecb_retired_ec(reps[1], num), ecb_retired_ec(reps[2], num));
+    }
+    printf("  phase 2: crashed leader %d replayed MK_UNSETTLE cleanly; 0 .ec, 0 retired_, 0 chunks on all 6 stores\n",
+           R1);
+
+    /* 6. Verify row-for-row equality against oracle on EVERY log replica (L2, then transfer to the other two). */
+    int check_order[3], nc = 0;
+    check_order[nc++] = L2;
+    for (int k = 0; k < 3; k++)
+        if (reps[k] != L2)
+            check_order[nc++] = reps[k];
+    for (int step = 0; step < 3; step++) {
+        int tgt = check_order[step];
+        if (step > 0) {
+            char why[256];
+            for (uint64_t t0 = now_ms(); (rc = tr_transfer(num, ids[tgt], why, sizeof why)) != 0; usleep(200000))
+                if (now_ms() - t0 > 30000)
+                    die("unsettle: transfer e42 to replica %d failed: %s (%s)", tgt, cluster_strerror(rc), why);
+            for (uint64_t t0 = now_ms();; usleep(100000)) {
+                struct meta_volume mv;
+                if (vol_rec(tgt, "e42", &mv) && mv.leader == ids[tgt])
+                    break;
+                if (now_ms() - t0 > 30000)
+                    die("unsettle: replica %d did not become leader of e42 in 30 s", tgt);
+            }
+        }
+        c = client(tgt);
+        for (int s = 0; s < ECB_SERIES; s++) {
+            struct ecb_sum got;
+            for (uint64_t t0 = now_ms(); (rc = ecb_read(c, ide[s], &got)) != 0; usleep(100000))
+                if ((rc != TSDB_ERR_UNAVAILABLE && rc != TSDB_ERR_MOVED) || now_ms() - t0 > 30000)
+                    die("unsettle: read on replica %d s=%d: %s", tgt, s, ers(rc));
+            if (got.n != oracle[s].n || got.h != oracle[s].h)
+                die("unsettle: replica %d s=%d mismatch (n=%" PRIu64 " want %" PRIu64 ", h=%016" PRIx64
+                    " want %016" PRIx64 ")",
+                    tgt, s, got.n, oracle[s].n, got.h, oracle[s].h);
+        }
+        tsdbc_close(c);
+        c = NULL;
+    }
+    printf("  oracle equality verified across all 3 log replicas (%d, %d, %d) with empty chunk stores\n", check_order[0],
+           check_order[1], check_order[2]);
+#endif
+}
+
 #ifdef TSDB_EC
 static int ecd_chunks_of(int srv, uint32_t num)
 {
@@ -29402,7 +29850,7 @@ int main(int argc, char **argv)
                {"retired", scen_retired},   {"feed", scen_feed}, {"syncrace", scen_syncrace}, {"power", scen_power}, {"powersnap", scen_powersnap},   {"life", scen_life},
                {"copyback", scen_copyback}, {"voterstale", scen_voterstale}, {"snapmove", scen_snapmove}, {"dirsyncshared", scen_dirsync_shared},
                {"installshared", scen_install_shared}, {"powervote", scen_powervote}, {"pendshared", scen_pend_shared}, {"copyfault", scen_copyfault},
-               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
+               {"volumes", scen_volumes}, {"volrefuse", scen_volrefuse}, {"snapversion", scen_snapversion}, {"links", scen_links}, {"fwdlinks", scen_fwdlinks}, {"replicate", scen_replicate}, {"replindet", scen_replindet}, {"replfail", scen_replfail}, {"failover", scen_failover}, {"failoverkeep", scen_failoverkeep}, {"fencecrash", scen_fencecrash}, {"promotecrash", scen_promotecrash}, {"deposecrash", scen_deposecrash}, {"pause", scen_pause}, {"promoteslow", scen_promoteslow}, {"openread", scen_openread}, {"openreadlead", scen_openreadlead}, {"jointpause", scen_jointpause}, {"leasestale", scen_leasestale}, {"resign", scen_resign}, {"refused", scen_refused}, {"cut", scen_cut}, {"cuthold", scen_cuthold}, {"deposetail", scen_deposetail}, {"replflip", scen_replflip}, {"replmeta", scen_replmeta}, {"replepoch", scen_replepoch}, {"repldesc", scen_repldesc}, {"drvcheck", scen_drvcheck}, {"replbulk", scen_replbulk}, {"readdepose", scen_readdepose}, {"oneway", scen_oneway}, {"oneway2", scen_oneway2}, {"cutstuck", scen_cutstuck}, {"manystuck", scen_manystuck}, {"noowner", scen_noowner}, {"isr", scen_isr}, {"topology", scen_topology}, {"copyhold", scen_copyhold}, {"movedself", scen_movedself}, {"route", scen_route}, {"forward", scen_forward}, {"fwdseries", scen_fwdseries}, {"fwdseriesstrict", scen_fwdseries_strict}, {"fwdlease", scen_fwdlease}, {"fwddepose", scen_fwddepose}, {"fwdload", scen_fwdload}, {"viabench", scen_viabench}, {"ccstress", scen_ccstress}, {"minisr", scen_minisr}, {"closegone", scen_closegone}, {"writersync", scen_writersync}, {"shipstall", scen_shipstall}, {"keepcap", scen_keepcap}, {"snapxfer", scen_snapxfer}, {"snaplarge", scen_snaplarge}, {"snapnospace", scen_snapnospace}, {"snapbusy", scen_snapbusy}, {"snapsrckill", scen_snapsrckill}, {"snaplost", scen_snaplost}, {"snapstall", scen_snapstall}, {"rejoin", scen_rejoin}, {"rejoinsteady", scen_rejoinsteady}, {"rejoinslow", scen_rejoinslow}, {"tickwall", scen_tickwall}, {"rejoinlate", scen_rejoinlate}, {"keepfloor", scen_keepfloor}, {"reopenhold", scen_reopenhold}, {"backpressure", scen_backpressure}, {"stallstop", scen_stallstop}, {"inboxshared", scen_inboxshared}, {"idleseal", scen_idleseal}, {"chunksrv", scen_chunksrv}, {"ecadd", scen_ecadd}, {"margins", scen_margins}, {"ecbasic", scen_ecbasic}, {"ecslow", scen_ecslow}, {"ec16", scen_ec16}, {"ecgc", scen_ecgc}, {"ecdegraded", scen_ecdegraded}, {"unsettle", scen_unsettle}, {"copycaught", scen_copycaught}, {"r4stubs", scen_r4stubs}, {"r9stubs", scen_r9stubs}, {"opening", scen_opening}, {"failgasp", scen_failgasp}, {"faultreason", scen_faultreason}, {"addreplica", scen_addreplica}, {"setnext", scen_setnext}, {"addswitch", scen_addswitch}, {"removereplica", scen_removereplica}, {"removeindex", scen_removeindex}, {"removedown", scen_removedown}, {"setstale", scen_setstale}, {"setchurn", scen_setchurn}, {"resetlost", scen_resetlost}, {"volcmd", scen_volcmd}, {"transfer", scen_transfer}, {"transferslow", scen_transferslow}, {"transferlag", scen_transferlag}, {"transferhold", scen_transferhold}, {"transfergrant", scen_transfergrant}, {"transferadmin", scen_transferadmin}, {"transferstale", scen_transferstale}, {"transfermarkers", scen_transfermarkers}, {"transferkill", scen_transferkill}, {"transferraftkill", scen_transferraftkill}, {"transferraftdrain", scen_transferraftdrain}, {"balance", scen_balance}, {"balancetwo", scen_balancetwo}, {"balancecut", scen_balancecut}, {"balancehb", scen_balancehb}, {"snapcatch", scen_snapcatch}, {"snapkill", scen_snapkill}, {"snappower", scen_snappower}, {"snapfence", scen_snapfence}, {"snapdiverged", scen_snapdiverged}, {"addsnap", scen_addsnap}, {"classfailover", scen_classfailover}, {"removesnap", scen_removesnap}, {"move", scen_move}, {"movelag", scen_movelag}, {"moveleader", scen_moveleader}, {"moverep0", scen_moverep0}, {"moveraft", scen_moveraft}, {"movekill", scen_movekill}, {"movecancel", scen_movecancel}, {"moveold", scen_moveold},
                {"ackdurable", scen_ackdurable}, {"writerfail", scen_writerfail}, {"writerfailq", scen_writerfailq}, {"diverged", scen_diverged}, {"writerdepose", scen_writerdepose}, {"lease", scen_lease}, {"hungloop", scen_hungloop},
                {"leasedown", scen_leasedown}, {"leasequorum", scen_leasequorum}, {"hardslot", scen_hardslot},
                {"repcheck", scen_repcheck}, {"rdma", scen_rdma}, {"openfast", scen_openfast},

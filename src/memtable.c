@@ -1672,6 +1672,16 @@ int eng_leader_attach(eng *db, const struct jr_ops *ops)
 }
 
 void eng_leader_replay_floor(eng *db, uint64_t floor) { atomic_store(&db->lead_floor, floor); }
+void eng_leader_applied_floor(eng *db, uint64_t floor) { atomic_store(&db->lead_applied_floor, floor); }
+uint64_t eng_unsettle_hold_pos(const eng *db)
+{
+    return db ? atomic_load_explicit(&db->unsettle_hold_pos, memory_order_acquire) : 0;
+}
+void eng_replica_stop(eng *db)
+{
+    if (db)
+        atomic_store_explicit(&db->replica_stop, true, memory_order_release);
+}
 
 void eng_leader_commit(eng *db, uint64_t pos)
 {
@@ -2254,7 +2264,7 @@ static int lk_push(eng *db, uint64_t seq, uint64_t fno_end)
 static void leader_flushed(eng *db, uint64_t seq, uint64_t fno_end)
 {
     /* RSTATE names it as holding nothing outside the parts before it can outlive a drop of its rows: a writer's open
-     * neither replays nor removes it (fails the engine on error) */
+     * neither replays nor removes it (fails the engine on error). */
     leader_rs_kept(db, seq, fno_end);
     if (lk_push(db, seq, fno_end) != 0) {
         db->lk_stuck = true; /* the segment stays; a later one must not go before it */

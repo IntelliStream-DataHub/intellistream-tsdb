@@ -1790,6 +1790,18 @@ void eng_leader_depose(struct eng *db);
  * switch on a leader takes its T past every row at or above it, and waits (eng_class_switch: TSDB_ERR_UNAVAILABLE; the
  * automatic switches ask again later) while it is below the first position this run tracks (classes.c). */
 void eng_leader_replay_floor(struct eng *db, uint64_t floor);
+/* R10 (r10-unsettle): lowest applied log position across all log replicas (repl_applied_floor; 0: unknown).
+ * Cluster MK_GC holds back unsettled objects until lead_applied_floor >= MK_UNSETTLE's log position so every log
+ * replica has durably swapped .ec -> .part before chunks are deleted. */
+void eng_leader_applied_floor(struct eng *db, uint64_t floor);
+/* R10 (r10-unsettle): non-zero while a cluster EC leader is between appending MK_UNSETTLE and completing its own
+ * durable ec_swap_unsettle_at (holds the first possible position of MK_UNSETTLE). Clamps leader REPL.floor, keep
+ * floor, RSTATE.kept and applied_floor below it and makes snap_make return SNAP_RETRY so neither a leader crash nor
+ * a concurrent snapshot can leave a member with P.ec listed at applied >= MK_UNSETTLE pos. */
+uint64_t eng_unsettle_hold_pos(const struct eng *db);
+/* Signals an in-flight replica apply retry loop (e.g. ec_unsettle_apply waiting out a transient chunk-store outage)
+ * to abort promptly during driver shutdown before repld_stop joins the volume thread. */
+void eng_replica_stop(struct eng *db);
 /* test hook (tests/test_replica.c): called by a switch right after it released flush_lock */
 extern void (*cls_test_after_switch)(struct eng *db);
 int cls_test_apply(struct eng *db, uint32_t s, int64_t from, int c);
@@ -2146,6 +2158,9 @@ struct eng {
      * while the floor is below it (db->lock). */
     uint64_t wtail_from;
     _Atomic uint64_t lead_floor;
+    _Atomic uint64_t lead_applied_floor; /* lowest applied position across all log replicas (0: unknown; R10 unsettle) */
+    _Atomic uint64_t unsettle_hold_pos;  /* >0: leader MK_UNSETTLE in append..swap window (clamps floor & snap_make) */
+    _Atomic bool replica_stop;           /* driver stopping: wakes replica apply retry loops before join */
     _Atomic uint64_t lead_replay; /* a leader's replay start: the end of the `kept` RSTATE holds durably (0: none) */
     /* The ends of the kept segments (RSTATE holds them durably) whose last position is still above the commit floor
      * the driver saved (lead_saved): the same directory reopened as a replica at that floor replays them

@@ -18,6 +18,10 @@ int ecgc_load_retired(eng *db, const char *name, bool read_only);
  * GC, and with obsolete_part_lifetime_s <= 0 adds its graveyard entry (due now). The hold itself is taken in
  * part_open_ec (ecgc_hold) so a reopen's old engine reading p keeps its object alive. */
 void ecgc_retire_locked(eng *db, part *p);
+/* R10 (r10-unsettle): ecgc_retire_locked with a required leader applied floor (`need_applied`, the MK_UNSETTLE log
+ * position on a cluster EC leader; 0 for TTL/DROP retirement). Cluster MK_GC holds the retired object until
+ * db->lead_applied_floor >= need_applied so every log replica has durably swapped .ec -> .part before chunks go. */
+void ecgc_retire_locked_at(eng *db, part *p, uint64_t need_applied);
 /* graveyard_purge, for a GY_EC entry (db->lock held): true when the entry is done and leaves the list. On a single
  * server: once due and no part of the object is referenced (in any engine of the tier) the object goes to the tier's
  * delete queue; once the queue has deleted every chunk, the name is unlinked and only then does the entry leave. On a

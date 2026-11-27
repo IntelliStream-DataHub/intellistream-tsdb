@@ -663,7 +663,7 @@ CLUSTER_SCEN_2 := jointpause leasestale resign refused cut cuthold deposetail re
     fwdload viabench ccstress minisr closegone writersync shipstall keepcap snapxfer snaplarge snapnospace \
     snapbusy snapsrckill snaplost snapstall rejoin rejoinsteady rejoinslow tickwall rejoinlate keepfloor \
     reopenhold backpressure stallstop inboxshared idleseal chunksrv ecadd margins copycaught
-CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
+CLUSTER_SCEN_3 := ecbasic ecslow ec16 ecgc ecdegraded unsettle r4stubs r9stubs opening failgasp faultreason addreplica setnext addswitch removereplica removeindex removedown setstale setchurn resetlost \
     volcmd transfer transferslow transferlag transferhold transfergrant transferadmin transferstale \
     transfermarkers transferkill transferraftkill transferraftdrain balance balancetwo balancecut balancehb \
     snapcatch snapkill snappower snapfence snapdiverged addsnap classfailover removesnap move movelag \
@@ -1362,6 +1362,13 @@ degsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	@$(if $(EC_OBJ),true,echo "degsettle-mutants: this build has no erasure codec (NO_EC=1): ecdegraded skips, nothing to plant"; false)
 	$(MUT) --name ecdegraded --list "degtwo degnoupcheck degnopositions" -- env TSDB_ECCOLD_MUTANT=@M@ TSDBD=$(B)/tsdbd \
 	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ ecdegraded
+# r10-unsettle: cluster MK_UNSETTLE planted bugs in tsdbd (TSDB_ECUNSETTLE_MUTANT), each must fail test_cluster unsettle
+.PHONY: unsettle-mutants
+unsettle-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb $(B)/test_ecapply
+	@$(if $(EC_OBJ),true,echo "unsettle-mutants: this build has no erasure codec (NO_EC=1): unsettle skips, nothing to plant"; false)
+	$(MUT) --name unsettle --list "unsettleleaderonly unsettlenogcgate unsettlenofloorclamp" -- env TSDB_ECUNSETTLE_MUTANT=@M@ TSDBD=$(B)/tsdbd \
+	    TSDB_CLI=$(B)/tsdb ./$(B)/test_cluster @D@ unsettle
+	$(MUT) --name unsettle-snap --list "unsettlesnapnohold" -- env TSDB_ECUNSETTLE_MUTANT=@M@ ./$(B)/test_ecapply @D@ --case unsettle
 # the planned leader transfer's mutants (server/rtransfer.c, server/ctransfer.c; tests/transfer_mutants.sh)
 transfer-mutants: $(B)/tsdbd $(B)/test_cluster $(B)/tsdb
 	TSDBD=$(B)/tsdbd TSDB_CLI=$(B)/tsdb tests/transfer_mutants.sh $(SCRATCH)

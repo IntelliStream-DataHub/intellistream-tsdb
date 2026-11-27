@@ -21,6 +21,7 @@
  *   GC      u32 reason, u32 noids, noids x oid[16] (RETIRED/ORPHAN/DONE);
  *           u32 reason, u32 0, u32 rel_vol, u32 rel_pos, u32 rel_node, u32 0, u64 rel_ver (RELEASE/RELEASE_DONE)
  *   DIGEST  i64 key, u64 z, u64 rows, u64 series, u64 xxh64, i64 now_ms, u32 noids, u32 0, noids x oid[16]; flags MKD_TOMBS
+ *   UNSETTLE i64 key, u32 noids, u32 0, noids x oid[16]
  *
  * The decoder refuses what the encoder never writes (a non-zero reserved field or padding, a span other than the
  * type's, trailing bytes), so a payload has exactly one encoding and the fuzz harness compares both directions.
@@ -33,7 +34,8 @@
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "marker payloads are little endian and written by memcpy");
 
 static const char *const type_names[] = {NULL,    "COMMIT", "DROP", "RETENTION", "EPOCH", "FEED_SLOT", "CLASS",
-                                         "SERIES", "STATE",  "SLOT", "NOW",       "COLD",  "GC",        "DIGEST"};
+                                         "SERIES", "STATE",  "SLOT", "NOW",       "COLD",  "GC",        "DIGEST",
+                                         "UNSETTLE"};
 _Static_assert(sizeof type_names / sizeof type_names[0] == MK_TYPE_LAST + 1, "a name per type");
 
 int mk_test_mutant;
@@ -56,14 +58,14 @@ bool mk_type_admitted(uint16_t type, bool ec, bool tier)
         return false;
     if (type == MK_COLD)
         return ec || tier;
-    return ec || (type != MK_GC && type != MK_DIGEST);
+    return ec || (type != MK_GC && type != MK_DIGEST && type != MK_UNSETTLE);
 }
 
 /* the types whose payload this file defines: their span is 1 (COMMIT: its events) */
 static bool defined(uint16_t t)
 {
     return (t >= MK_COMMIT && t <= MK_EPOCH) || t == MK_CLASS || t == MK_SERIES || t == MK_STATE || t == MK_NOW ||
-           t == MK_COLD || t == MK_GC || t == MK_DIGEST;
+           t == MK_COLD || t == MK_GC || t == MK_DIGEST || t == MK_UNSETTLE;
 }
 
 uint32_t mk_span(const mk *m)
@@ -133,6 +135,7 @@ static bool name_ok(const char *s, size_t n)
 #define GC_FIXED 8
 #define GC_RELEASE_LEN 32 /* u32 reason, u32 0, u32 vol, u32 pos, u32 node, u32 0, u64 ver */
 #define DIGEST_FIXED 56
+#define UNSETTLE_FIXED 16
 
 size_t mk_file_size(const mk_file *f)
 {
@@ -394,6 +397,18 @@ static int decode_digest(const uint8_t *b, size_t n, mk_digest *d)
     return 0;
 }
 
+static int decode_unsettle(const uint8_t *b, size_t n, mk_unsettle *u)
+{
+    if (n < UNSETTLE_FIXED || !zeros(b, 12, 16))
+        return TSDB_ERR_CORRUPT;
+    u->key = (int64_t)get64(b);
+    memcpy(&u->noids, b + 8, 4);
+    u->oids = b + UNSETTLE_FIXED;
+    if (u->noids == 0 || !counts_ok(u->noids, 0, 0) || n - UNSETTLE_FIXED != (size_t)u->noids * MK_OID)
+        return TSDB_ERR_CORRUPT;
+    return 0;
+}
+
 int mk_decode(const uint8_t *p, size_t n, mk *m)
 {
     memset(m, 0, sizeof *m);
@@ -491,6 +506,9 @@ int mk_decode(const uint8_t *p, size_t n, mk *m)
     case MK_DIGEST:
         rc = decode_digest(b, bn, &m->u.digest);
         break;
+    case MK_UNSETTLE:
+        rc = decode_unsettle(b, bn, &m->u.unsettle);
+        break;
     default:
         break; /* reserved and unknown types: the body is theirs */
     }
@@ -570,6 +588,11 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         if (!counts_ok(m->u.digest.noids, 0, 0) || (m->u.digest.noids && !m->u.digest.oids))
             return TSDB_ERR_INVALID;
         bn = DIGEST_FIXED + (size_t)m->u.digest.noids * MK_OID;
+        break;
+    case MK_UNSETTLE:
+        if (m->u.unsettle.noids == 0 || !counts_ok(m->u.unsettle.noids, 0, 0) || !m->u.unsettle.oids)
+            return TSDB_ERR_INVALID;
+        bn = UNSETTLE_FIXED + (size_t)m->u.unsettle.noids * MK_OID;
         break;
     default:
         bn = m->body_len;
@@ -691,6 +714,14 @@ int mk_encode(const mk *m, uint8_t **out, size_t *len)
         memcpy(b + 48, &d->noids, 4);
         if (d->noids)
             memcpy(b + DIGEST_FIXED, d->oids, (size_t)d->noids * MK_OID);
+        break;
+    }
+    case MK_UNSETTLE: {
+        const mk_unsettle *u = &m->u.unsettle;
+        put64(b, (uint64_t)u->key);
+        memcpy(b + 8, &u->noids, 4);
+        if (u->noids)
+            memcpy(b + UNSETTLE_FIXED, u->oids, (size_t)u->noids * MK_OID);
         break;
     }
     default:

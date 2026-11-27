@@ -66,7 +66,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 abort();
             }
         }
-        if (m.type == MK_DIGEST && m.u.digest.noids > MK_FILES_MAX)
+        if ((m.type == MK_DIGEST && m.u.digest.noids > MK_FILES_MAX) ||
+            (m.type == MK_UNSETTLE && (m.u.unsettle.noids == 0 || m.u.unsettle.noids > MK_FILES_MAX)))
             abort();
         uint8_t *q;
         size_t qn;
@@ -204,6 +205,10 @@ void fuzz_seeds(const char *dir)
     m.u.digest = (mk_digest){.key = 4 * 19700 + 1, .z = 5000, .rows = 86400, .series = 3, .xxh64 = 0x1234567890abcdefull,
                              .now_ms = 1700000000000, .noids = 2, .oids = oids};
     seed(dir, "seed-digest", &m);
+    memset(&m, 0, sizeof m);
+    m.type = MK_UNSETTLE;
+    m.u.unsettle = (mk_unsettle){.key = 4 * 19700 + 1, .noids = 2, .oids = oids};
+    seed(dir, "seed-unsettle", &m);
 
     memset(&m, 0, sizeof m); /* a reserved type and an unknown one: the body is theirs */
     m.type = MK_FEED_SLOT;

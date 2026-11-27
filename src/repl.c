@@ -47,6 +47,7 @@ struct peer {
     uint64_t lo;        /* the lowest position sent to it in this epoch (0: none): an empty log gets nothing below */
     uint64_t snap_lo;   /* told to install a snapshot (0: not): this leader's replay start at the first notice, which
                            the snapshot's segments start at or above; until an ACK shows a retained next position */
+    uint64_t applied;   /* the highest position this peer has durably applied (from ACK's commit field; R10 unsettle) */
     int heard;
 };
 
@@ -348,6 +349,9 @@ static void ack(struct repl *r, int resync)
     if (MUT(17) && m->durable && m->durable < r->verified)
         m->durable++;
     m->written = r->verified;
+    /* r->applied is raised when REPL_A_APPLY is queued; every caller invokes apply_follower() before ack(), and
+     * drivers execute queued actions in order (failing the volume on apply error before any subsequent SEND). */
+    m->commit = r->applied;
     m->rid = r->rid;
     m->start = MUT(38) ? r->durable + 1 : r->start;
     m->replay = r->written ? (r->replay > r->start ? r->replay : r->start) : 0;
@@ -873,6 +877,7 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
         p->rid = m->rid;
         if (!MUT(19))
             p->match = 0;
+        p->applied = 0;
     } else {
         /* Under one rid, durable never shrinks (a snapshot install always raises it to P > pre-install written end, and
          * crashes keep durable records). An ACK with a lower durable end was sent before a newer one already heard
@@ -882,6 +887,9 @@ static void on_ack(struct repl *r, const struct repl_msg *m)
     }
     if (m->durable > p->match)
         p->match = m->durable;
+    uint64_t app = min64(m->commit, m->durable);
+    if (app > p->applied)
+        p->applied = app;
     p->acked = m->written;
     p->last_ack = r->now;
     p->last_heard = r->now;
@@ -1308,6 +1316,22 @@ uint64_t repl_replay_floor(const struct repl *r)
         l = min64(l, c);
     }
     return l;
+}
+
+uint64_t repl_applied_floor(const struct repl *r)
+{
+    if (!r->leading || r->failed)
+        return 0;
+    uint64_t a = r->applied;
+    for (int i = 0; i < r->cfg.nnodes; i++) {
+        const struct peer *p = &r->peer[i];
+        if (i == r->cfg.self)
+            continue;
+        if (!p->heard)
+            return 0;
+        a = min64(a, p->applied);
+    }
+    return a;
 }
 
 void repl_replay_start(struct repl *r, uint64_t s)

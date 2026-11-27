@@ -1972,6 +1972,114 @@ static void idle_deadline(void)
     repl_free(rf);
 }
 
+/* R10 (r10-unsettle): ACK carries r->applied in commit, and repl_applied_floor tracks the minimum applied position
+ * across ALL log replicas (0 while any peer is unheard, resets on rid change or reconfig adding a peer). */
+static void applied_floor(void)
+{
+    static struct drv d;
+    memset(&d, 0, sizeof d);
+    d.start = 1;
+    struct repl_config c = config(0, &d);
+    c.min_isr = 2;
+    struct repl_durable dur = {.rid = 11, .log_start = 1};
+    struct repl *r = repl_open(&c, &dur);
+    CHECK(r != NULL, "applied_floor: open leader");
+    CHECK(repl_applied_floor(r) == 0, "applied_floor: not leading -> 0");
+
+    struct repl_msg m = meta_msg(0, 1, 0, 0x7, 0);
+    repl_recv(r, &m);
+    drain(r, &d, NULL);
+    repl_synced(r, repl_written(r)); /* EPOCH at pos 1 */
+    drain(r, &d, NULL);
+    uint64_t p2 = 0, p3 = 0;
+    CHECK(repl_write(r, 1, &p2) == REPL_OK && p2 == 2, "write pos 2");
+    drain(r, &d, NULL);
+    repl_synced(r, 2);
+    drain(r, &d, NULL);
+    CHECK(repl_write(r, 1, &p3) == REPL_OK && p3 == 3, "write pos 3");
+    drain(r, &d, NULL);
+    repl_synced(r, 3);
+    drain(r, &d, NULL);
+
+    /* Only peer 1 heard -> peer 2 unheard -> applied_floor must remain 0. */
+    struct repl_msg k1 = {.type = REPL_M_ACK, .from = 1, .to = 0, .epoch = 1, .leader = -1, .durable = 3,
+                          .written = 3, .commit = 3, .rid = 22, .resync = 1};
+    repl_recv(r, &k1);
+    drain(r, &d, NULL);
+    CHECK(repl_applied_floor(r) == 0, "applied_floor: peer 2 unheard -> 0, got %" PRIu64, repl_applied_floor(r));
+
+    /* Peer 2 durable to 3, but only applied to 1 -> applied_floor == 1. */
+    struct repl_msg k2 = {.type = REPL_M_ACK, .from = 2, .to = 0, .epoch = 1, .leader = -1, .durable = 3,
+                          .written = 3, .commit = 1, .rid = 33, .resync = 1};
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_applied_floor(r) == 1, "applied_floor: min(3,3,1)==1, got %" PRIu64, repl_applied_floor(r));
+
+    /* Peer 2 applies through 3 -> applied_floor == 3. */
+    k2.commit = 3;
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_applied_floor(r) == 3, "applied_floor: all applied 3, got %" PRIu64, repl_applied_floor(r));
+
+    /* Peer 2 resets with new rid 44 and commit 0 -> applied_floor drops to 0. */
+    k2.rid = 44;
+    k2.durable = 2;
+    k2.written = 2;
+    k2.commit = 0;
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_applied_floor(r) == 0, "applied_floor: new rid commit 0 -> 0, got %" PRIu64, repl_applied_floor(r));
+
+    /* Restore peer 2 to 2, then reconfig adding a 4th unheard peer -> drops to 0. */
+    k2.commit = 2;
+    repl_recv(r, &k2);
+    drain(r, &d, NULL);
+    CHECK(repl_applied_floor(r) == 2, "applied_floor: min(3,3,2)==2, got %" PRIu64, repl_applied_floor(r));
+    int old_of[4] = {0, 1, 2, -1};
+    CHECK(repl_reconfig(r, 4, 0, old_of) == REPL_OK, "reconfig add 4th peer");
+    CHECK(repl_applied_floor(r) == 0, "applied_floor: unheard 4th peer -> 0, got %" PRIu64, repl_applied_floor(r));
+    repl_free(r);
+
+    /* Follower side: ACK carries r->applied in commit, and REPL_A_APPLY precedes REPL_A_SEND(ACK). */
+    static struct drv df;
+    memset(&df, 0, sizeof df);
+    df.start = 1;
+    struct repl_config cf = c;
+    cf.self = 1;
+    cf.ctx = &df;
+    struct repl_durable durf = {.rid = 22, .log_start = 1};
+    struct repl *rf = repl_open(&cf, &durf);
+    CHECK(rf != NULL, "applied_floor: open follower");
+    struct repl_msg mf = meta_msg(1, 1, 0, 0x7, 0);
+    repl_recv(rf, &mf);
+    drain(rf, &df, NULL);
+    struct repl_msg ans = {.type = REPL_M_ANSWER, .from = 0, .to = 1, .epoch = 1, .leader = 0};
+    repl_recv(rf, &ans);
+    drain(rf, &df, NULL);
+    struct repl_rec rec = {.pos = 1, .epoch = 1, .n = 1};
+    struct repl_msg app = {.type = REPL_M_APPEND, .from = 0, .to = 1, .epoch = 1, .leader = 0, .commit = 1,
+                           .nrec = 1, .rec = &rec};
+    repl_recv(rf, &app);
+    drain(rf, &df, NULL);
+    df.nact = 0;
+    repl_synced(rf, 1);
+    drain(rf, &df, NULL);
+    int apply_idx = -1, ack_idx = -1;
+    uint64_t ack_commit = 0;
+    for (int i = 0; i < df.nact; i++) {
+        if (df.act[i].type == REPL_A_APPLY && apply_idx < 0)
+            apply_idx = i;
+        if (df.act[i].type == REPL_A_SEND && df.act[i].msg.type == REPL_M_ACK && ack_idx < 0) {
+            ack_idx = i;
+            ack_commit = df.act[i].msg.commit;
+        }
+    }
+    CHECK(apply_idx >= 0 && ack_idx > apply_idx && ack_commit == 1,
+          "follower ACK must follow APPLY with commit=1 (apply=%d ack=%d commit=%" PRIu64 ")",
+          apply_idx, ack_idx, ack_commit);
+    repl_free(rf);
+}
+
 int main(int argc, char **argv)
 {
     th_watchdog("test_repl", 1200);
@@ -2031,6 +2139,7 @@ int main(int argc, char **argv)
     stale_epoch();
     debug_trunc();
     idle_deadline();
+    applied_floor();
     if (failures) {
         fprintf(stderr, "test_repl: %d scenario(s) failed\n", failures);
         return 1;

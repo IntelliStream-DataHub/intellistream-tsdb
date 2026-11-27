@@ -210,8 +210,8 @@ cgroup, so `nice` does not keep your work out of its way.
   setchurn resetlost`, `test_cvolfs` setpower; `make rset-mutants` (tests/rset_mutants.sh). `TSDB_REPLD_TEST=keepall` keeps every
   leader segment, for the tests that fill a learner from the log (a fresh learner otherwise gets a snapshot, below).
   `src/marker.c`, `src/marker.h`: the marker payloads (one encoder and
-  decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13 = `MK_TYPE_LAST`, `MK_EC_LATER_LO..HI` = 14..15 reserved
-  for R10 and admitted nowhere; `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
+  decoder; `MK_COLD` = 11, `MK_GC` = 12, `MK_DIGEST` = 13, `MK_UNSETTLE` = 14 = `MK_TYPE_LAST`, `MK_EC_LATER_LO..HI` = 15..15 reserved
+  for R10 (`MK_DROP_OBJ`) and admitted nowhere; `mk_type_admitted` gates both writer and replay on `requires=ec|tier`; `test_marker`
   mutants `mkcoldbounds mkadmitall ecpposloose mkwriteany mkretired`; `jr_intent`/`jr_commit` and `jr_cold`/
   `jr_markers_append`/`jr_markers_wait` in `src/replica.c` carry them).
 - `src/stats_tenant.c`, `src/stats_hot.c` (`src/stats_priv.h`): statistics steps 3-4: the tenant list, map and
@@ -1044,9 +1044,26 @@ cgroup, so `nice` does not keep your work out of its way.
     `TSDB_EC` fails. The embedded bindings copy `src/*.c` and build without `TSDB_EC`: a volume whose META says
     `requires=tier` is then refused at open.
   - **Late rows** go to young parts above the object and settle again as further objects of the key (E6); on a single
-    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones);
-    cluster re-encode and redundancy conversion (`MK_UNSETTLE`, §6.4) stay with R10. Answers do not change
-    (`tests/test_settle_oracle.c`).
+    server `eng_reencode` / `ecpolicy_pick_reencode` (R10) combines them (`> ecpolicy_objects_max` or `> 10%` tombstones).
+    Cluster unsettle (`r10-unsettle`, `MK_UNSETTLE = 14`, §6.4, D14, D27) converts settled keys back to plain `.part`
+    files on all log replicas: `eng_ec_keys` lists settled keys, `eng_unsettle_key` prepares local `.part` files unlocked
+    (Source 1 `settled_` or Source 2 cluster chunk decode with sum/digest/granule checks), takes `jr_serial`, arms
+    `db->unsettle_hold_pos` before appending `MK_UNSETTLE{key, oids[]}`, waits for commit, and swaps via
+    `ec_swap_unsettle_at(..., pos)` (recording PPOS durably before intent v5, clearing `unsettle_hold_pos` under
+    `publish_lock` after post-rename dir fsync, and cleaning up stale `digest_<key>_<z>` jobs via
+    `eckeep_unsettle_cleanup_jobs`). While `unsettle_hold_pos > 0` (including after an `INDETERMINATE` depose when
+    `pos != 0`), `REPL_A_SAVE` clamps `REPL.floor` and `keep_floor` below it regardless of `rv->mode`, and `snap_make`
+    (loading `lead_commit` before checking the hold under `publish_lock`) returns `SNAP_RETRY`. Replicas apply
+    `MK_UNSETTLE` in `ec_unsettle_apply` (dropping `rp->mu` across decode with bounded transient-`UNAVAILABLE` retry,
+    swapping durably before acknowledging). Every peer's `REPL_M_ACK` reports `r->applied` in its `commit` field
+    (`repl_applied_floor` tracks the minimum across all log replicas, resetting on `rid` change or `repl_reconfig`),
+    and `ecgc` gates cluster `MK_GC` of unsettled objects (`need_applied`, plus `ecgc_eng_ready` failover gating for
+    `loaded_from_disk` retired `.ec` objects not referenced by a live `.ec`) until every log replica has applied
+    `MK_UNSETTLE`. Progress counters export via `ecunsettle_get_progress`. Crash points `unsettle-mid-apply` and
+    `unsettle-after-marker`; test hooks `TSDB_ECUNSETTLE_TEST=trigger=<path>[,after_marker_ms=<N>]` and
+    `TSDB_ECUNSETTLE_MUTANT`; tests `test_ecapply --case unsettle`, `test_repl` (`applied_floor`), `test_cluster unsettle`
+    (in `CLUSTER_SCEN_3`), and `make unsettle-mutants` (`unsettleleaderonly`, `unsettlenogcgate`, `unsettlenofloorclamp`,
+    `unsettlesnapnohold`). Answers do not change (`tests/test_settle_oracle.c`).
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
@@ -1217,7 +1234,10 @@ cgroup, so `nice` does not keep your work out of its way.
   R8 additions: a leader's settle (`src/eccold.c`, `src/settle.h`, `src/settle.c`) takes `jr_serial` (from `lw_enter`)
   > `flush_lock` > `cls_rw` (when rotating a memtable) > `lead_mu` (`eng_leader_wait`) > the WAL writer role and
   `buf_lock` (`jr_cold`) > `publish_lock` > `ppos_mu` / `latest_rw` > `db->lock` (the stripe check and bounded wait run
-  before `lw_enter`, never under the fence; no engine lock is held across chunk puts); `PPOS` (`src/ppos.h`) takes
+  before `lw_enter`, never under the fence; no engine lock is held across chunk puts); a leader's unsettle
+  (`src/ecunsettle.c` `eng_unsettle_key`) decodes unlocked and then takes `jr_serial` > `db->lock` > `buf_lock` (briefly
+  to arm `unsettle_hold_pos`), then `jr_markers_append`/`jr_markers_wait` and `ec_swap_unsettle_at` (`publish_lock` >
+  `ppos_mu` / `latest_rw` > `manifest_lock` > `db->lock`); `PPOS` (`src/ppos.h`) takes
   `publish_lock` > `ppos_mu` (its append, `fdatasync` and creation `eng_sync_dir`) > `ppos` map mutex (a leaf, never
   held across I/O; `ppos_of` takes only it), and `ppos_mu` is never taken under `db->lock`, `latest_rw` or `buf_lock`
   (records go out before those are taken); `DIVERGED` (`src/ecdiverge.h`) takes its mutex > `dir_sync_lock` > `fail_lock`

@@ -88,7 +88,7 @@ struct rvol {
     pthread_mutex_t mu; /* the core, the index, the cursors, the inbox; below buf_lock (jr_ops.admit takes it) */
     pthread_cond_t cv;
     pthread_t th;
-    int started, stop, mode, failed, set_changed;
+    int started, stop, mode, failed, set_changed, floor_clamped;
     int div_rebuild; /* failed as DIVERGED on a replica: rebuilt by a snapshot (rsnap_rebuild on the failed thread) */
     struct repl *core;
     struct replfile *rf;

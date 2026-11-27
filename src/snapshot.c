@@ -93,6 +93,7 @@
  * Not built: reuse of files the receiver holds (D4, R9).
  */
 #include "internal.h"
+#include "ecunsettle.h"
 #include "snapshot.h"
 #include "feed.h"
 #include "replfile.h"
@@ -769,7 +770,17 @@ int snap_make(eng *db, const char *name, struct snap_info *out)
     uint64_t p, done, mem_seq = UINT64_MAX;
     pthread_mutex_lock(&db->flush_lock);
     pthread_mutex_lock(&db->publish_lock);
-    p = atomic_load(&db->lead_commit);
+    p = atomic_load_explicit(&db->lead_commit, memory_order_acquire);
+    if (ecunsettle_mut() != ECUNSETTLE_MUT_SNAPNOHOLD && eng_unsettle_hold_pos(db) != 0) {
+        /* R10 (r10-unsettle): load lead_commit FIRST, then check unsettle_hold_pos while holding publish_lock.
+         * Leader sets unsettle_hold_pos (release) BEFORE appending MK_UNSETTLE and clears it ONLY under publish_lock
+         * after P.part is listed and P.ec is retired, so checking after loading p closes any TOCTOU window where a
+         * snapshot could cut P >= pos with P.ec still listed. */
+        pthread_mutex_unlock(&db->publish_lock);
+        pthread_mutex_unlock(&db->flush_lock);
+        rc = SNAP_RETRY;
+        goto out;
+    }
     if (snap_mutant == SNAP_MUT_DICTSHORT) /* planted: the lengths read with no barrier, so a writer whose marker P */
         dict_lengths_now(db, &dl);         /* passes and whose record is not written yet is left out */
     if (snap_mutant != SNAP_MUT_AFTERP)

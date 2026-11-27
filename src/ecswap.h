@@ -44,6 +44,10 @@ int ec_swap_reencode(eng *db, part **in, size_t nin, part *out);
  * writing the intent (caller may retry via decode), TSDB_ERR_LOCKED if retired_<P>.ec is still awaiting GC,
  * TSDB_ERR_STOPPED if an input was dropped/merged/unlisted. Lock order: publish_lock > latest_rw > db->lock. */
 int ec_swap_unsettle(eng *db, part **in, part **out, size_t n);
+/* R10 (r10-unsettle): ec_swap_unsettle for a cluster EC volume, recording PPOS for each restored .part before writing
+ * intent v5 and tagging each retired .ec part with `unsettle_pos` (the MK_UNSETTLE log position on a leader; 0 on a
+ * replica or single-server volume) so MK_GC waits until every log replica has applied MK_UNSETTLE. */
+int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unsettle_pos);
 
 /* The open's recovery of the v4 intent `name` (its whole text in buf[0 .. len), which may be changed). 0: done, and
  * intents_recover unlinks the intent (and syncs the directory); else the open fails with it. */

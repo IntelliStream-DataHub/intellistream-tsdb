@@ -18,14 +18,15 @@
  *   CLASS, SERIES, STATE, NOW        payloads defined below (the replica engine applies them, src/replica.c)
  *   FEED_SLOT                        number reserved for the change feed (its payload comes with the feed)
  *   SLOT                             number reserved for the cluster (design-cluster.md 4.1; its payload comes with it)
- *   COLD, GC, DIGEST                 payloads defined below (R8, docs/design-cluster-data.md 2.3, E14, E26): a settle's
- *                                    cut, a chunk deletion, a settle's logical digest. GC and DIGEST (12, 13) belong to a
- *                                    volume whose META says requires=ec, COLD to one with ec or tier (E17 and its
- *                                    amendment for E55): an open of any other refuses them, and so does the writer
- *                                    (mk_type_admitted), where every older binary refuses the word itself
- *   14, 15                           MK_DROP_OBJ and MK_UNSETTLE of the design (docs/design-cluster-data.md, the
- *                                    format table; R10 gives them bodies), behind the same word: this binary cannot
- *                                    apply them, so a volume that holds one is refused, never replayed past them
+ *   COLD, GC, DIGEST, UNSETTLE       payloads defined below (R8/R10, docs/design-cluster-data.md 2.3, §6.4, E14, E26):
+ *                                    a settle's cut, a chunk deletion, a settle's logical digest, an unsettle back to
+ *                                    plain parts. GC, DIGEST and UNSETTLE (12, 13, 14) belong to a volume whose META
+ *                                    says requires=ec, COLD to one with ec or tier (E17 and its amendment for E55): an
+ *                                    open of any other refuses them, and so does the writer (mk_type_admitted), where
+ *                                    every older binary refuses the word itself
+ *   15                               MK_DROP_OBJ of the design (docs/design-cluster-data.md, the format table), behind
+ *                                    the same word: this binary cannot apply it, so a volume that holds one is refused,
+ *                                    never replayed past it
  * A type this binary does not know at all is MK_UNKNOWN: the record is intact and skipped.
  */
 #ifndef TSDB_MARKER_H
@@ -50,10 +51,11 @@ enum mk_type {
     MK_COLD = 11,
     MK_GC = 12,
     MK_DIGEST = 13,
-    MK_TYPE_LAST = MK_DIGEST /* the types above this one are unknown to this binary */
+    MK_UNSETTLE = 14,
+    MK_TYPE_LAST = MK_UNSETTLE /* the types above this one are unknown to this binary */
 };
-/* Numbers the design gives R10's ec markers (MK_DROP_OBJ, MK_UNSETTLE): unknown here, and admitted nowhere. */
-#define MK_EC_LATER_LO 14
+/* Number the design gives R10's remaining ec marker (MK_DROP_OBJ): unknown here, and admitted nowhere. */
+#define MK_EC_LATER_LO 15
 #define MK_EC_LATER_HI 15
 
 #define MK_HDR 8 /* type, flags, span: the start of every marker payload (WAL_MARKER_HDR) */
@@ -204,6 +206,16 @@ typedef struct mk_digest {
 /* mk.flags of a MK_DIGEST: the leader hashed its set's tombstone term (a listed part of the key lay below the set) */
 #define MKD_TOMBS 1u
 
+/* UNSETTLE (R10, design-cluster-data.md §6.4, D14, D27): converts settled .ec parts of partition key `key`
+ * (named by `oids[0..noids)`) back to plain local .part files on every log replica. Replicas decode each named
+ * object through the read path, verify sums/digest/part integrity, and swap .ec -> .part via intent v5 before
+ * acknowledging; chunks are retired only by committed MK_GC after every log replica has applied MK_UNSETTLE. */
+typedef struct mk_unsettle {
+    int64_t key;
+    uint32_t noids;      /* 1 .. MK_FILES_MAX */
+    const uint8_t *oids; /* noids x MK_OID bytes */
+} mk_unsettle;
+
 typedef struct mk {
     uint16_t type;  /* enum mk_type, or the raw number of an unknown one (then mk_type_name gives NULL) */
     uint16_t flags;
@@ -220,6 +232,7 @@ typedef struct mk {
         mk_cold cold;
         mk_gc gc;
         mk_digest digest;
+        mk_unsettle unsettle;
     } u;
     const uint8_t *body; /* every type: the raw body (an unknown or reserved type has nothing else) */
     size_t body_len;

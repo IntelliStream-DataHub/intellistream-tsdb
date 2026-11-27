@@ -110,7 +110,8 @@ struct repl_msg {
     uint64_t epoch;               /* the sender's epoch (the fence epoch for FENCE and FENCE_REPLY) */
     int leader;                   /* REFUSE: the leader of `epoch` if known, else -1 */
     /* APPEND */
-    uint64_t prev_pos, prev_epoch, commit;
+    uint64_t prev_pos, prev_epoch, commit; /* ACK: reuses `commit` wire slot for sender's applied position (older
+                                              binaries send 0, which safely holds unsettled-object GC until upgraded) */
     uint32_t nrec;
     const struct repl_rec *rec;   /* nrec descriptors, contiguous from prev_pos + 1 */
     /* ACK, FENCE_REPLY, QUERY, ANSWER */
@@ -247,6 +248,10 @@ void repl_replay_start(struct repl *r, uint64_t s);
  * ACKs show a retained next position. Rows at positions below it can never come back on any replica: a
  * partition-class switch takes its T past every row at or above it (classes.c). */
 uint64_t repl_replay_floor(const struct repl *r);
+/* Leader (R10 unsettle): lowest applied log position across all log replicas (including the leader itself), from
+ * each peer's ACK in this epoch; 0 while any peer has not acknowledged in this epoch or when not leading. Used to
+ * gate cluster MK_GC of unsettled objects until every log replica has durably applied MK_UNSETTLE. */
+uint64_t repl_applied_floor(const struct repl *r);
 
 /* Replica set changes (D8). The driver calls repl_reconfig when the metadata record's set version changes, then
  * repl_set_version, then hands over the record (META) in the new indexes. old_of[i] is the old index of new member i,

@@ -25,17 +25,20 @@
  */
 #include "internal.h"
 #include "ecunsettle.h"
+#include "ecapply.h"
 #include "ecdiverge.h"
 #include "eckeep.h"
 #include "ecpart.h"
 #include "ecswap.h"
 #include "coldops.h"
+#include "marker.h"
 #include "tier.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,14 +49,60 @@
 int ecunsettle_mutant;
 atomic_uint_fast64_t ecunsettle_from_settled;
 atomic_uint_fast64_t ecunsettle_from_decode;
+static atomic_uint_fast64_t ecunsettle_keys_done;
+static atomic_uint_fast64_t ecunsettle_objs_done;
+static atomic_uint_fast64_t ecunsettle_bytes_done;
+static atomic_uint_fast64_t ecunsettle_keys_failed;
+void (*_Atomic ecunsettle_crash_hook)(struct eng *db);
+void (*_Atomic ecunsettle_leader_crash_hook)(struct eng *db);
+_Atomic int64_t ecunsettle_test_retry_ms = -1;
 
 int ecunsettle_mutant_parse(const char *name)
 {
-    static const char *const names[] = {"none", "unsettlenodecodecheck", "unsettlerank"};
+    static const char *const names[] = {"none",
+                                        "unsettlenodecodecheck",
+                                        "unsettlerank",
+                                        "unsettleleaderonly",
+                                        "unsettlenogcgate",
+                                        "unsettlenofloorclamp",
+                                        "unsettlesnapnohold"};
     for (int i = 0; i < (int)(sizeof names / sizeof *names); i++)
         if (strcmp(name, names[i]) == 0)
             return i;
     return -1;
+}
+
+static pthread_once_t unsettle_env_once = PTHREAD_ONCE_INIT;
+
+static void unsettle_env_init_fn(void)
+{
+#ifdef TSDB_TEST_HOOKS
+    const char *m = getenv("TSDB_ECUNSETTLE_MUTANT");
+    if (m && *m) {
+        int v = ecunsettle_mutant_parse(m);
+        if (v < 0) {
+            fprintf(stderr, "tsdb: TSDB_ECUNSETTLE_MUTANT=%s names no mutant: exiting with status 2\n", m);
+            _exit(2);
+        }
+        if (ecunsettle_mutant == ECUNSETTLE_MUT_NONE)
+            ecunsettle_mutant = v;
+        fprintf(stderr, "tsdb: ecunsettle MUTANT %s (tests only)\n", m);
+    }
+#endif
+}
+
+void ecunsettle_env_init(void) { pthread_once(&unsettle_env_once, unsettle_env_init_fn); }
+
+void ecunsettle_get_progress(ecunsettle_progress *out)
+{
+    if (!out)
+        return;
+    out->keys_done = atomic_load_explicit(&ecunsettle_keys_done, memory_order_relaxed);
+    out->objs_done = atomic_load_explicit(&ecunsettle_objs_done, memory_order_relaxed);
+    out->bytes_done = atomic_load_explicit(&ecunsettle_bytes_done, memory_order_relaxed);
+    out->keys_failed = atomic_load_explicit(&ecunsettle_keys_failed, memory_order_relaxed);
+    out->from_settled = atomic_load_explicit(&ecunsettle_from_settled, memory_order_relaxed);
+    out->from_decode = atomic_load_explicit(&ecunsettle_from_decode, memory_order_relaxed);
 }
 
 #ifdef TSDB_EC
@@ -361,21 +410,142 @@ static void cleanup_prepared(eng *db, part **out, size_t n, bool unlink_tmps)
     }
 }
 
+static int cmp_i64(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static bool oid_in_list(const uint8_t oid[MK_OID], const uint8_t *oids, uint32_t noids)
+{
+    for (uint32_t i = 0; i < noids; i++)
+        if (memcmp(oid, oids + (size_t)i * MK_OID, MK_OID) == 0)
+            return true;
+    return false;
+}
+
+static int prepare_unsettle_parts(eng *db, part **in, size_t n, bool rank_mut, bool decode_only, part **out,
+                                  size_t *n_settled_out, size_t *n_decode_out)
+{
+    size_t n_settled = 0, n_decode = 0;
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        size_t elen = strlen(in[i]->name);
+        if (elen <= 3 || elen - 3 + 6 >= sizeof in[i]->name) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        char orig_part[128], fin_name[128], settled_name[160];
+        snprintf(orig_part, sizeof orig_part, "%.*s.part", (int)(elen - 3), in[i]->name);
+        snprintf(settled_name, sizeof settled_name, "settled_%s", orig_part);
+        if (rank_mut) {
+            uint64_t b = atomic_fetch_add(&db->next_block, 1);
+            snprintf(fin_name, sizeof fin_name, "p%" PRId64 "_%" PRIu64 "_%" PRIu64 "_%u.part", in[i]->partition, b, b,
+                     in[i]->level);
+        } else {
+            snprintf(fin_name, sizeof fin_name, "%s", orig_part);
+        }
+
+        if (!decode_only) {
+            int src_rc = try_settled_source(db, in[i], settled_name, fin_name, rank_mut, &out[i]);
+            if (src_rc == 0) {
+                n_settled++;
+                continue;
+            }
+            if (src_rc != TSDB_ERR_NOTFOUND && src_rc != TSDB_ERR_CORRUPT) {
+                rc = src_rc;
+                break;
+            }
+        }
+        rc = decode_ec_source(db, in[i], fin_name, rank_mut, &out[i]);
+        if (rc == 0)
+            n_decode++;
+    }
+    if (n_settled_out)
+        *n_settled_out = n_settled;
+    if (n_decode_out)
+        *n_decode_out = n_decode;
+    return rc;
+}
+
 #endif /* TSDB_EC */
 
-int eng_unsettle(eng *db, int64_t partition_key)
+int eng_ec_keys(eng *db, int64_t **keys_out, size_t *nkeys_out)
 {
+    if (!keys_out || !nkeys_out)
+        return TSDB_ERR_INVALID;
+    *keys_out = NULL;
+    *nkeys_out = 0;
+    if (!db)
+        return TSDB_ERR_INVALID;
+#ifndef TSDB_EC
+    return 0;
+#else
+    int64_t *keys = NULL;
+    size_t n = 0, cap = 0;
+    int rc = 0;
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        struct ecpart *ep = atomic_load(&p->ec);
+        if (p->dropped || !ep || ep->test_mark)
+            continue;
+        bool dup = false;
+        for (size_t j = 0; j < n && !dup; j++)
+            dup = keys[j] == p->partition;
+        if (dup)
+            continue;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            int64_t *x = realloc(keys, nc * sizeof *x);
+            if (!x) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            keys = x;
+            cap = nc;
+        }
+        keys[n++] = p->partition;
+    }
+    pthread_mutex_unlock(&db->lock);
+    if (rc != 0) {
+        free(keys);
+        return rc;
+    }
+    if (n > 1)
+        qsort(keys, n, sizeof *keys, cmp_i64);
+    *keys_out = keys;
+    *nkeys_out = n;
+    return 0;
+#endif
+}
+
+int eng_unsettle_key(eng *db, int64_t partition_key, uint64_t *objs_out, uint64_t *bytes_out)
+{
+    if (objs_out)
+        *objs_out = 0;
+    if (bytes_out)
+        *bytes_out = 0;
 #ifndef TSDB_EC
     (void)partition_key;
     fprintf(stderr, "tsdb: %s: eng_unsettle needs the erasure codec (TSDB_EC), which this build lacks\n",
             db ? db->dir : "(null)");
     return TSDB_ERR_INVALID;
 #else
+    ecunsettle_env_init();
     if (!db)
         return TSDB_ERR_INVALID;
-    if (db->opt.read_only || db->opt.follow)
+    if (db->opt.read_only || db->opt.follow || db->rp)
         return TSDB_ERR_READONLY;
-    if (db->ec_cluster || db->rp || eng_jr(db) || db->replica_req) {
+    bool is_cluster = db->ec_cluster;
+    if (is_cluster) {
+        if (!eng_jr(db)) {
+            fprintf(stderr, "tsdb: %s: eng_unsettle on a cluster ec volume requires an active leader\n", db->dir);
+            return TSDB_ERR_INVALID;
+        }
+        if (atomic_load(&db->lead_deposed))
+            return TSDB_ERR_INDETERMINATE;
+    } else if (eng_jr(db) || db->replica_req) {
         fprintf(stderr, "tsdb: %s: eng_unsettle is refused on cluster or replicated volumes\n", db->dir);
         return TSDB_ERR_INVALID;
     }
@@ -408,6 +578,275 @@ int eng_unsettle(eng *db, int64_t partition_key)
         }
         if (rc != 0)
             break;
+        if (is_cluster && n >= MK_FILES_MAX) {
+            fprintf(stderr,
+                    "tsdb: %s: unsettle of key %" PRId64 " refused: exceeds MK_FILES_MAX (%u) objects in one "
+                    "MK_UNSETTLE marker (re-encode/compact the partition first)\n",
+                    db->dir, partition_key, MK_FILES_MAX);
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            part **x = realloc(in, nc * sizeof *x);
+            if (!x) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            in = x;
+            cap = nc;
+        }
+        part_ref(p);
+        p->settling = true;
+        in[n++] = p;
+    }
+    if (rc != 0) {
+        for (size_t i = 0; i < n; i++)
+            in[i]->settling = false;
+    }
+    pthread_mutex_unlock(&db->lock);
+
+    if (rc != 0) {
+        for (size_t i = 0; i < n; i++)
+            part_unref(in[i]);
+        free(in);
+        atomic_fetch_add_explicit(&ecunsettle_keys_failed, 1, memory_order_relaxed);
+        return rc;
+    }
+    if (n == 0) {
+        free(in);
+        return 0;
+    }
+
+    /* Also check disk for any retired_<P>.ec (e.g. from an earlier unsettle still awaiting GC) before decoding. */
+    for (size_t i = 0; i < n; i++) {
+        char retired[sizeof in[i]->name + 16];
+        snprintf(retired, sizeof retired, "retired_%s", in[i]->name);
+        if (faccessat(db->dirfd, retired, F_OK, 0) == 0) {
+            fprintf(stderr, "tsdb: %s: unsettle of %s refused while %s is still awaiting GC\n", db->dir, in[i]->name,
+                    retired);
+            rc = TSDB_ERR_LOCKED;
+            goto unpin;
+        }
+        if (errno != ENOENT) {
+            rc = TSDB_ERR_IO;
+            goto unpin;
+        }
+    }
+
+    uint64_t total_bytes = 0;
+    uint8_t *oids = is_cluster ? malloc(n * MK_OID) : NULL;
+    if (is_cluster && !oids) {
+        rc = TSDB_ERR_NOMEM;
+        goto unpin;
+    }
+    for (size_t i = 0; i < n; i++) {
+        struct ecpart *ep = atomic_load(&in[i]->ec);
+        if (ep) {
+            total_bytes += ep->rec.object_len;
+            if (oids)
+                memcpy(oids + i * MK_OID, ep->rec.oid, MK_OID);
+        }
+    }
+
+    part **out = calloc(n, sizeof *out);
+    if (!out) {
+        free(oids);
+        rc = TSDB_ERR_NOMEM;
+        goto unpin;
+    }
+
+    bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
+    size_t n_settled = 0, n_decode = 0;
+
+    if (!is_cluster) {
+        bool decode_only = false;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            rc = prepare_unsettle_parts(db, in, n, rank_mut, decode_only, out, &n_settled, &n_decode);
+            if (rc != 0) {
+                cleanup_prepared(db, out, n, true);
+                break;
+            }
+            rc = ec_swap_unsettle_at(db, in, out, n, 0);
+            if (rc == TSDB_ERR_NOTFOUND && !decode_only) {
+                /* A settled_ source disappeared concurrently (e.g. eckeep purge) before db->lock: retry via decode. */
+                cleanup_prepared(db, out, n, true);
+                decode_only = true;
+                continue;
+            }
+            cleanup_prepared(db, out, n, rc != 0);
+            break;
+        }
+    } else {
+        /* Cluster EC leader path (R10 §6.4, D14, D27):
+         * 1. Decode/prepare local .part files unlocked (outside jr_serial and db->lock).
+         * 2. Under jr_serial: verify inputs still listed and not dropping, raise unsettle_hold_pos BEFORE append (so
+         *    REPL.floor, keep_floor, RSTATE.kept, applied_floor and snap_make cannot pass MK_UNSETTLE before the
+         *    leader's swap is durable), then append & commit MK_UNSETTLE{key, oids[]}.
+         * 3. Swap .ec -> .part via ec_swap_unsettle_at(..., pos), which clears unsettle_hold_pos under publish_lock
+         *    after the post-rename dir fsync and gates MK_GC until every log replica has applied MK_UNSETTLE. */
+        rc = prepare_unsettle_parts(db, in, n, rank_mut, false, out, &n_settled, &n_decode);
+        if (rc != 0) {
+            cleanup_prepared(db, out, n, true);
+        } else {
+            uint64_t pos = 0;
+            bool committed = false;
+            jr_serial_lock(db);
+            pthread_mutex_lock(&db->lock);
+            bool still_ok = eng_check(db) == 0 && !partition_dropping(db, partition_key);
+            for (size_t i = 0; i < n && still_ok; i++) {
+                size_t j = 0;
+                while (j < db->nparts && db->parts[j] != in[i])
+                    j++;
+                still_ok = j < db->nparts && !in[i]->dropped;
+            }
+            uint64_t hold_pos = 0;
+            if (still_ok) {
+                pthread_mutex_lock(&db->buf_lock);
+                hold_pos = db->fno_next ? db->fno_next : 1;
+                pthread_mutex_unlock(&db->buf_lock);
+                atomic_store_explicit(&db->unsettle_hold_pos, hold_pos, memory_order_release);
+            }
+            pthread_mutex_unlock(&db->lock);
+            if (!still_ok) {
+                rc = eng_check(db) ? TSDB_ERR_IO : TSDB_ERR_STOPPED;
+            } else {
+                mk m;
+                memset(&m, 0, sizeof m);
+                m.type = MK_UNSETTLE;
+                m.span = 1;
+                m.u.unsettle = (mk_unsettle){.key = partition_key, .noids = (uint32_t)n, .oids = oids};
+                rc = jr_markers_append(db, &m, 1, "an UNSETTLE marker was appended but its commit point did not come",
+                                       &pos);
+                if (rc == 0 && pos == 0)
+                    rc = TSDB_ERR_INVALID;
+                if (rc == 0)
+                    rc = jr_markers_wait(db, pos, "an UNSETTLE marker was appended but its commit point did not come");
+                if (rc == 0) {
+                    committed = true;
+                    void (*lch)(eng *) = atomic_load(&ecunsettle_leader_crash_hook);
+                    if (lch)
+                        lch(db);
+                    rc = ec_swap_unsettle_at(db, in, out, n, pos);
+                } else if (pos == 0) {
+                    /* Marker never entered the WAL: safe to release the hold. When pos != 0 (e.g. deposed /
+                     * TSDB_ERR_INDETERMINATE between append and commit), the marker is in the WAL and may still
+                     * commit under the next leader, so unsettle_hold_pos stays armed until this engine closes/reopens
+                     * (clamping REPL.floor and snap_make below pos). */
+                    atomic_store_explicit(&db->unsettle_hold_pos, 0, memory_order_release);
+                }
+            }
+            jr_serial_unlock(db);
+            if (committed && rc == TSDB_ERR_NOTFOUND) {
+                /* A settled_ source vanished: decode unlocked (slow I/O outside jr_serial while unsettle_hold_pos
+                 * stays armed), then re-take jr_serial to serialize the swap against concurrent tsdb_drop_before. */
+                cleanup_prepared(db, out, n, true);
+                rc = prepare_unsettle_parts(db, in, n, rank_mut, true, out, &n_settled, &n_decode);
+                if (rc == 0) {
+                    jr_serial_lock(db);
+                    pthread_mutex_lock(&db->lock);
+                    bool dropped_meanwhile = partition_dropping(db, partition_key);
+                    if (!dropped_meanwhile) {
+                        bool any_live = false;
+                        for (size_t i = 0; i < n && !any_live; i++) {
+                            if (in[i]->dropped)
+                                continue;
+                            for (size_t j = 0; j < db->nparts; j++)
+                                if (db->parts[j] == in[i]) {
+                                    any_live = true;
+                                    break;
+                                }
+                        }
+                        if (!any_live)
+                            dropped_meanwhile = true;
+                    }
+                    pthread_mutex_unlock(&db->lock);
+                    if (dropped_meanwhile) {
+                        /* A legitimate drop retired the key while we decoded unlocked: nothing left to swap. */
+                        pthread_mutex_lock(&db->publish_lock);
+                        atomic_store_explicit(&db->unsettle_hold_pos, 0, memory_order_release);
+                        pthread_mutex_unlock(&db->publish_lock);
+                        cleanup_prepared(db, out, n, true);
+                        rc = 0;
+                    } else {
+                        rc = ec_swap_unsettle_at(db, in, out, n, pos);
+                    }
+                    jr_serial_unlock(db);
+                }
+            }
+            if (committed && rc != 0 && eng_check(db) == 0)
+                eng_fail(db, "unsettle swap failed after MK_UNSETTLE committed", EIO);
+            /* On a failed swap after commit (or INDETERMINATE with pos != 0), leave unsettle_hold_pos non-zero so
+             * REPL.floor and snap_make never pass pos. */
+            cleanup_prepared(db, out, n, rc != 0);
+        }
+    }
+
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&ecunsettle_from_settled, n_settled, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ecunsettle_from_decode, n_decode, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ecunsettle_keys_done, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ecunsettle_objs_done, n, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ecunsettle_bytes_done, total_bytes, memory_order_relaxed);
+        if (objs_out)
+            *objs_out = n;
+        if (bytes_out)
+            *bytes_out = total_bytes;
+    } else {
+        atomic_fetch_add_explicit(&ecunsettle_keys_failed, 1, memory_order_relaxed);
+    }
+
+    free(oids);
+    free(out);
+unpin:
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < n; i++)
+        in[i]->settling = false;
+    pthread_mutex_unlock(&db->lock);
+    for (size_t i = 0; i < n; i++)
+        part_unref(in[i]);
+    free(in);
+    return rc;
+#endif
+}
+
+int eng_unsettle(eng *db, int64_t partition_key)
+{
+    return eng_unsettle_key(db, partition_key, NULL, NULL);
+}
+
+int ec_unsettle_apply(eng *db, uint64_t pos, const mk *m)
+{
+    if (!db || !m || m->type != MK_UNSETTLE)
+        return TSDB_ERR_INVALID;
+#ifndef TSDB_EC
+    (void)pos;
+    fprintf(stderr, "tsdb: %s: MK_UNSETTLE at pos %" PRIu64 " needs the erasure codec (TSDB_EC)\n", db->dir, pos);
+    return TSDB_ERR_INVALID;
+#else
+    ecunsettle_env_init();
+    if (ecunsettle_mut() == ECUNSETTLE_MUT_LEADERONLY && db->rp)
+        return 0; /* planted bug: replicas skip applying MK_UNSETTLE */
+    if (eng_check(db))
+        return TSDB_ERR_IO;
+
+    const mk_unsettle *u = &m->u.unsettle;
+    part **in = NULL;
+    size_t n = 0, cap = 0;
+    int rc = 0;
+
+    pthread_mutex_lock(&db->lock);
+    for (size_t i = 0; i < db->nparts; i++) {
+        part *p = db->parts[i];
+        struct ecpart *ep = atomic_load(&p->ec);
+        if (p->partition != u->key || p->dropped || !ep || ep->test_mark)
+            continue;
+        if (!oid_in_list(ep->rec.oid, u->oids, u->noids))
+            continue;
+        if (p->settling || p->reencoding || p->merging) {
+            rc = TSDB_ERR_LOCKED;
+            break;
+        }
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 8;
             part **x = realloc(in, nc * sizeof *x);
@@ -436,23 +875,7 @@ int eng_unsettle(eng *db, int64_t partition_key)
     }
     if (n == 0) {
         free(in);
-        return 0;
-    }
-
-    /* Also check disk for any retired_<P>.ec (e.g. from an earlier unsettle still awaiting GC) before decoding. */
-    for (size_t i = 0; i < n; i++) {
-        char retired[sizeof in[i]->name + 16];
-        snprintf(retired, sizeof retired, "retired_%s", in[i]->name);
-        if (faccessat(db->dirfd, retired, F_OK, 0) == 0) {
-            fprintf(stderr, "tsdb: %s: unsettle of %s refused while %s is still awaiting GC\n", db->dir, in[i]->name,
-                    retired);
-            rc = TSDB_ERR_LOCKED;
-            goto unpin;
-        }
-        if (errno != ENOENT) {
-            rc = TSDB_ERR_IO;
-            goto unpin;
-        }
+        return 0; /* idempotent replay: all named .ec parts already swapped or dropped */
     }
 
     part **out = calloc(n, sizeof *out);
@@ -463,48 +886,55 @@ int eng_unsettle(eng *db, int64_t partition_key)
 
     bool rank_mut = ecunsettle_mut() == ECUNSETTLE_MUT_RANK;
     bool decode_only = false;
+    /* Bounded retry on transient TSDB_ERR_UNAVAILABLE (chunk-store outage/restart): replica_apply runs synchronously on
+     * repld's volume thread inside REPL_A_APPLY, so retrying for up to retry_ms (default 30 s) rides out brief store
+     * restarts without failing the replica, while bounding the volume-thread stall so a prolonged outage cleanly drops
+     * the replica from ISR and fails it for later reopen/rebuild rather than acknowledging MK_UNSETTLE unswapped. */
+    int64_t retry_ms = atomic_load(&ecunsettle_test_retry_ms);
+    if (retry_ms < 0)
+        retry_ms = 30000;
+    int64_t t0 = eng_mono_ms();
+    bool logged_unavail = false;
     for (int attempt = 0; attempt < 2; attempt++) {
         size_t n_settled = 0, n_decode = 0;
-        rc = 0;
-        for (size_t i = 0; i < n && rc == 0; i++) {
-            size_t elen = strlen(in[i]->name);
-            if (elen <= 3 || elen - 3 + 6 >= sizeof in[i]->name) {
-                rc = TSDB_ERR_INVALID;
+        uint64_t gen = replica_mu_drop(db);
+        for (;;) {
+            rc = prepare_unsettle_parts(db, in, n, rank_mut, decode_only, out, &n_settled, &n_decode);
+            if (rc != TSDB_ERR_UNAVAILABLE || atomic_load_explicit(&db->stop, memory_order_acquire) ||
+                atomic_load_explicit(&db->replica_stop, memory_order_acquire) || eng_check(db) != 0 ||
+                eng_mono_ms() - t0 >= retry_ms)
                 break;
+            cleanup_prepared(db, out, n, true);
+            if (!logged_unavail) {
+                fprintf(stderr, "tsdb: %s: MK_UNSETTLE at pos %" PRIu64 " of key %" PRId64
+                                ": chunk stores unavailable; retrying before failing replica\n",
+                        db->dir, pos, u->key);
+                logged_unavail = true;
             }
-            char orig_part[128], fin_name[128], settled_name[160];
-            snprintf(orig_part, sizeof orig_part, "%.*s.part", (int)(elen - 3), in[i]->name);
-            snprintf(settled_name, sizeof settled_name, "settled_%s", orig_part);
-            if (rank_mut) {
-                uint64_t b = atomic_fetch_add(&db->next_block, 1);
-                snprintf(fin_name, sizeof fin_name, "p%" PRId64 "_%" PRIu64 "_%" PRIu64 "_%u.part", in[i]->partition, b,
-                         b, in[i]->level);
-            } else {
-                snprintf(fin_name, sizeof fin_name, "%s", orig_part);
+            struct timespec ts = {0, 200 * 1000000L};
+            nanosleep(&ts, NULL);
+            if (replica_mu_retake(db, gen)) {
+                rc = RP_AGAIN;
+                goto done_loop;
             }
-
-            if (!decode_only) {
-                int src_rc = try_settled_source(db, in[i], settled_name, fin_name, rank_mut, &out[i]);
-                if (src_rc == 0) {
-                    n_settled++;
-                    continue;
-                }
-                if (src_rc != TSDB_ERR_NOTFOUND && src_rc != TSDB_ERR_CORRUPT) {
-                    rc = src_rc;
-                    break;
-                }
-            }
-            rc = decode_ec_source(db, in[i], fin_name, rank_mut, &out[i]);
-            if (rc == 0)
-                n_decode++;
+            gen = replica_mu_drop(db);
+        }
+        if (rc == 0) {
+            void (*ch)(eng *) = atomic_load(&ecunsettle_crash_hook);
+            if (ch)
+                ch(db);
+        }
+        if (replica_mu_retake(db, gen)) {
+            cleanup_prepared(db, out, n, true);
+            rc = RP_AGAIN;
+            break;
         }
         if (rc != 0) {
             cleanup_prepared(db, out, n, true);
             break;
         }
-        rc = ec_swap_unsettle(db, in, out, n);
+        rc = ec_swap_unsettle_at(db, in, out, n, 0);
         if (rc == TSDB_ERR_NOTFOUND && !decode_only) {
-            /* A settled_ source disappeared concurrently (e.g. eckeep purge) before db->lock: retry via decode. */
             cleanup_prepared(db, out, n, true);
             decode_only = true;
             continue;
@@ -516,6 +946,7 @@ int eng_unsettle(eng *db, int64_t partition_key)
         cleanup_prepared(db, out, n, rc != 0);
         break;
     }
+done_loop:
 
     free(out);
 unpin:
@@ -526,6 +957,9 @@ unpin:
     for (size_t i = 0; i < n; i++)
         part_unref(in[i]);
     free(in);
+    if (rc != 0 && rc != RP_AGAIN)
+        fprintf(stderr, "tsdb: %s: MK_UNSETTLE at pos %" PRIu64 " of key %" PRId64 " failed: %s\n", db->dir, pos,
+                u->key, tsdb_strerror(rc));
     return rc;
 #endif
 }

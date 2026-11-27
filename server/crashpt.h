@@ -50,7 +50,9 @@
     X(CP_FILL_WRITTEN, "fill-written")                 /* stripe fill wrote rebuilt chunk before next step (R9) */   \
     X(CP_WHOLE_PROPOSED, "whole-proposed")             /* Raft leader proposed STRIPE_WHOLE for a filled pos (R9) */ \
     X(CP_RETURN_SET, "return-set")                     /* Raft leader proposed STRIPE_SET returning a pos (R9) */    \
-    X(CP_RELEASE_GC, "release-gc")                     /* MK_GC release committed/applied for partial fill (R9) */
+    X(CP_RELEASE_GC, "release-gc")                     /* MK_GC release committed/applied for partial fill (R9) */   \
+    X(CP_UNSETTLE_MID_APPLY, "unsettle-mid-apply")     /* replica decoded MK_UNSETTLE, before durable swap (R10) */  \
+    X(CP_UNSETTLE_AFTER_MARKER, "unsettle-after-marker") /* leader committed MK_UNSETTLE, before its own swap (R10) */
 
 enum crash_point_id {
 #define X(id, name) id,

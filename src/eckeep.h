@@ -44,6 +44,10 @@ void eckeep_swapped(eng *db, part *const *in, size_t n);
 /* ec_swap_unsettle, under db->lock: called on both fast and decode paths after P.ec is swapped back to P.part; drops
  * any GY_SETTLED graveyard entry and keep-thread entry for settled_<P.part> so a later re-settle of P starts fresh. */
 void eckeep_unsettle_locked(eng *db, const char *settled_name);
+/* ec_swap_unsettle, after releasing publish_lock, db->lock and latest_rw: removes any replica digest_<key>_<z> job
+ * files whose last settled_ copy was consumed or removed by the unsettle, preventing false ROT or early release on a
+ * future re-settle. */
+void eckeep_unsettle_cleanup_jobs(eng *db);
 /* A replica's cold apply (src/ecapply.c) after its renames: settled_<own[i]->name> held for the MK_DIGEST of (key, z),
  * never digested by bytes (no .ec of its name) and never released before that digest matched. */
 void eckeep_retired(eng *db, part *const *own, size_t n, int64_t key, uint64_t z);

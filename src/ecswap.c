@@ -83,6 +83,7 @@
 #include "ecgc.h"
 #include "ecpart.h"
 #include "ecunsettle.h"
+#include "ppos.h"
 #include "settle.h"
 
 #include <errno.h>
@@ -907,7 +908,7 @@ static void unsettle_discard(eng *db, const char *intent, part **out, size_t n)
     }
 }
 
-int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
+int ec_swap_unsettle_at(eng *db, part **in, part **out, size_t n, uint64_t unsettle_pos)
 {
     sm_init();
     if (n == 0)
@@ -1002,6 +1003,28 @@ int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
         }
     }
 
+    /* R10 (r10-unsettle; src/ppos.h): on a cluster EC volume (db->ppos != NULL), record PPOS for each restored .part
+     * durably BEFORE writing the unsettle intent so the next open never refuses a listed .part lacking a PPOS record. */
+    if (db->ppos) {
+        for (size_t i = 0; i < n && rc == 0; i++) {
+            uint64_t pp = 0;
+            if (ppos_of(db, in[i]->name, &pp) != 0 || pp == 0) {
+                struct ecpart *ep = atomic_load(&in[i]->ec);
+                pp = (ep && ep->rec.ppos) ? ep->rec.ppos : PPOS_UNKNOWN;
+            }
+            const char *nm = out[i]->name;
+            rc = ppos_record(db, &nm, 1, pp);
+        }
+        if (rc != 0) {
+            unsettle_discard(db, NULL, out, n);
+            db_pub_end(db);
+            pthread_mutex_unlock(&db->publish_lock);
+            free(at);
+            free(was_settled);
+            return rc;
+        }
+    }
+
     /* Write and sync the v5 intent OUTSIDE latest_rw and db->lock (matching ec_swap_commit's lock rules). */
     rc = intent_write_unsettle(db, intent, in, out, n);
     if (rc == 0 && eng_sync_dir(db, "fsync of the directory after writing an unsettle's intent") != 0)
@@ -1041,7 +1064,7 @@ int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
             settled_of_ec(in[i]->name, settled, sizeof settled);
             if (settled[0])
                 eckeep_unsettle_locked(db, settled);
-            ecgc_retire_locked(db, in[i]);
+            ecgc_retire_locked_at(db, in[i], unsettle_pos);
             if (db->opt.obsolete_part_lifetime_s <= 0) {
                 in[i]->retired = true;
                 atomic_store(&in[i]->obsolete, true);
@@ -1106,11 +1129,21 @@ int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
     }
     if (unlinked_settled)
         (void)eng_sync_dir(db, "fsync of the directory after removing a corrupt settled_ copy");
+    /* The swap is now durable on disk (while publish_lock is still held): release the leader unsettle hold so
+     * snap_make and REPL.floor can advance past MK_UNSETTLE knowing P.part is listed and P.ec is retired. */
+    if (unsettle_pos > 0)
+        atomic_store_explicit(&db->unsettle_hold_pos, 0, memory_order_release);
     free(was_settled);
     db_pub_end(db);
     pthread_mutex_unlock(&db->publish_lock);
+    eckeep_unsettle_cleanup_jobs(db);
     (void)ec_swap_publish(db);
     return 0;
+}
+
+int ec_swap_unsettle(eng *db, part **in, part **out, size_t n)
+{
+    return ec_swap_unsettle_at(db, in, out, n, 0);
 }
 
 /* ------------------------------------------------------------ recovery */

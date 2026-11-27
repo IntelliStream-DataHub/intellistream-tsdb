@@ -289,9 +289,24 @@ static void test_gc_digest(void)
     p[MK_HDR + 52] = 1; /* the reserved word */
     CHECK(mk_decode(p, n, &d) == TSDB_ERR_CORRUPT);
     free(p);
-    CHECK(MK_TYPE_LAST == 13 && strcmp(mk_type_name(MK_GC), "GC") == 0 &&
-          strcmp(mk_type_name(MK_DIGEST), "DIGEST") == 0 && mk_type_name(14) == NULL);
-    printf("  GC and DIGEST: round trips, reasons, truncation\n");
+
+    memset(&m, 0, sizeof m);
+    m.type = MK_UNSETTLE;
+    m.u.unsettle = (mk_unsettle){.key = -19700, .noids = 5, .oids = oids};
+    CHECK(mk_encode(&m, &p, &n) == 0 && n == MK_HDR + 16 + 5 * MK_OID);
+    CHECK(mk_decode(p, n, &d) == 0 && d.type == MK_UNSETTLE && d.span == 1 && d.u.unsettle.key == -19700 &&
+          d.u.unsettle.noids == 5 && memcmp(mk_oid_at(d.u.unsettle.oids, 4), oids + 4 * MK_OID, MK_OID) == 0);
+    truncations(p, n, "UNSETTLE");
+    p[MK_HDR + 12] = 1; /* the reserved word */
+    CHECK(mk_decode(p, n, &d) == TSDB_ERR_CORRUPT);
+    free(p);
+    m.u.unsettle.noids = 0;
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID); /* an UNSETTLE names at least one oid */
+
+    CHECK(MK_TYPE_LAST == 14 && strcmp(mk_type_name(MK_GC), "GC") == 0 &&
+          strcmp(mk_type_name(MK_DIGEST), "DIGEST") == 0 && strcmp(mk_type_name(MK_UNSETTLE), "UNSETTLE") == 0 &&
+          mk_type_name(15) == NULL);
+    printf("  GC, DIGEST and UNSETTLE: round trips, reasons, truncation\n");
 }
 
 /* ---------------------------------------------------------------- bounds */
@@ -340,12 +355,15 @@ static void test_bounds(void)
                 fprintf(stderr, "COLD list %d with %u entries: decode gives %d, not %d\n", list, cnt, rc, w);
             CHECK(rc == w);
         }
-        /* GC and DIGEST */
+        /* GC, DIGEST and UNSETTLE */
         uint32_t g[2] = {MK_GC_RETIRED, cnt};
         CHECK(decode_body(MK_GC, (const uint8_t *)g, 8, ids, (size_t)cnt * MK_OID) == want);
         memset(fixed, 0, sizeof fixed);
         memcpy(fixed + 48, &cnt, 4);
         CHECK(decode_body(MK_DIGEST, fixed, 56, ids, (size_t)cnt * MK_OID) == want);
+        memset(fixed, 0, sizeof fixed);
+        memcpy(fixed + 8, &cnt, 4);
+        CHECK(decode_body(MK_UNSETTLE, fixed, 16, ids, (size_t)cnt * MK_OID) == want);
     }
     /* the encoder refuses a count past the bound as well */
     mk m;
@@ -362,6 +380,10 @@ static void test_bounds(void)
     memset(&m, 0, sizeof m);
     m.type = MK_DIGEST;
     m.u.digest = (mk_digest){.noids = over, .oids = ids};
+    CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
+    memset(&m, 0, sizeof m);
+    m.type = MK_UNSETTLE;
+    m.u.unsettle = (mk_unsettle){.key = 1, .noids = over, .oids = ids};
     CHECK(mk_encode(&m, &p, &n) == TSDB_ERR_INVALID);
     /* a huge count with nothing behind it: refused without walking past the end */
     uint32_t huge = UINT32_MAX;
@@ -436,6 +458,8 @@ static void marker_of(mk *m, uint16_t type, uint8_t oid[MK_OID])
         m->u.gc = (mk_gc){.reason = MK_GC_RETIRED, .noids = 1, .oids = oid};
     else if (type == MK_DIGEST)
         m->u.digest = (mk_digest){.key = 1, .z = 1, .noids = 1, .oids = oid};
+    else if (type == MK_UNSETTLE)
+        m->u.unsettle = (mk_unsettle){.key = 1, .noids = 1, .oids = oid};
     else
         m->u.cold = (mk_cold){.z = 1, .key = 1}; /* COLD with empty lists */
 }
@@ -503,7 +527,7 @@ static void test_admitted(void)
     for (uint32_t t = 1; t <= 70000; t = t < 40 ? t + 1 : t * 2) {
         uint16_t ty = (uint16_t)t;
         bool later = ty >= MK_EC_LATER_LO && ty <= MK_EC_LATER_HI;
-        bool ec_only = ty == MK_GC || ty == MK_DIGEST;
+        bool ec_only = ty == MK_GC || ty == MK_DIGEST || ty == MK_UNSETTLE;
         for (int ec = 0; ec < 2; ec++)
             for (int tier = 0; tier < 2; tier++) {
                 bool want = later ? false : ty == MK_COLD ? (ec || tier) : ec_only ? ec : true;
@@ -512,13 +536,13 @@ static void test_admitted(void)
                 CHECK(mk_type_admitted(ty, ec, tier) == want);
             }
     }
-    printf("  admitted: GC, DIGEST with ec; COLD with ec or tier; 14-15 nowhere; the rest everywhere\n");
+    printf("  admitted: GC, DIGEST, UNSETTLE with ec; COLD with ec or tier; 15 nowhere; the rest everywhere\n");
 }
 
 static void test_open(const char *scratch)
 {
-    static const uint16_t types[3] = {MK_GC, MK_DIGEST, MK_COLD};
-    for (int t = 0; t < 3; t++) {
+    static const uint16_t types[4] = {MK_GC, MK_DIGEST, MK_UNSETTLE, MK_COLD};
+    for (int t = 0; t < 4; t++) {
         uint16_t type = types[t];
         char dir[PATH_MAX];
         fresh_dir(scratch, mk_type_name(type), dir, sizeof dir);

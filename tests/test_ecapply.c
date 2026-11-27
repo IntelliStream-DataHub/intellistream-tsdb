@@ -51,6 +51,8 @@
 #include "ppos.h"
 #include "ecdigest.h"
 #include "eckeep.h"
+#include "ecunsettle.h"
+#include "snapshot.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -137,6 +139,7 @@ static int w_make(void *arg, tier *t, uint32_t volume, const uint8_t vuuid[16], 
 
 typedef struct xport {
     _Atomic bool manual; /* only the test moves the commit point */
+    _Atomic bool depose_on_unsettle; /* depose leader when MK_UNSETTLE hits WAL without advancing commit */
     pthread_mutex_t mu;
     uint64_t adm_fno[1024];
     uint32_t adm_span[1024];
@@ -182,6 +185,10 @@ static void xp_bytes(void *ctx, eng *db, uint64_t seq, uint64_t off, const void 
             free(x->cold);
             x->cold = c, x->ncold = wr.n, x->cold_fno = wr.fno;
             pthread_mutex_unlock(&x->mu);
+        }
+        if (wr.kind == WAL_KIND_MARKER && wr.mtype == MK_UNSETTLE && atomic_load(&x->depose_on_unsettle)) {
+            eng_leader_depose(db);
+            return;
         }
         at += sz;
     }
@@ -2345,6 +2352,187 @@ static void test_degraded(void)
            "single-server partial bitmap\n", leader_pos);
 }
 
+/* ------------------------------------------------------------ unsettle: R10 MK_UNSETTLE leader + replica + GC gate */
+
+static void remove_settled_files(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    for (struct dirent *de; (de = readdir(d));) {
+        if (strncmp(de->d_name, "settled_", 8) == 0) {
+            char p[PATH_MAX + 256];
+            snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+            unlink(p);
+        }
+    }
+    closedir(d);
+}
+
+static int snap_mid_unsettle_rc;
+static uint64_t snap_mid_unsettle_hold;
+
+static void unsettle_snap_hook(struct eng *db)
+{
+    snap_mid_unsettle_hold = eng_unsettle_hold_pos(db);
+    struct snap_info si;
+    memset(&si, 0, sizeof si);
+    snap_mid_unsettle_rc = snap_make(db, "snap_mid_unsettle", &si);
+    if (snap_mid_unsettle_rc == 0)
+        snap_release(si.path);
+}
+
+static void test_unsettle(void)
+{
+    lt L;
+    rt R;
+    rec_reset();
+    if (!start("unsettle", &L))
+        return;
+    make_replica(&L, &R);
+    eccold_cut c;
+    workload(&L, &c, false);
+    uint64_t cold_pos = L.x.cold_fno;
+    CHECK(cold_pos > 0 && cold_pos == c.pos);
+
+    /* Remove settled_ on leader so eng_unsettle_key exercises the cluster decode path. */
+    remove_settled_files(L.dir);
+
+    int64_t *keys = NULL;
+    size_t nkeys = 0;
+    CHECK(eng_ec_keys(L.db, &keys, &nkeys) == 0 && nkeys == 1 && keys && keys[0] == KEY);
+    free(keys);
+
+    /* Verify snap_make returns SNAP_RETRY in the window between MK_UNSETTLE commit and leader swap (MUST-FIX #2). */
+    snap_mid_unsettle_rc = 0;
+    snap_mid_unsettle_hold = 0;
+    atomic_store(&ecunsettle_leader_crash_hook, unsettle_snap_hook);
+
+    ecunsettle_progress p0, p1;
+    ecunsettle_get_progress(&p0);
+    uint64_t objs = 0, bytes = 0;
+    CHECK(eng_unsettle_key(L.db, KEY, &objs, &bytes) == 0);
+    atomic_store(&ecunsettle_leader_crash_hook, NULL);
+    CHECK(snap_mid_unsettle_hold > 0 && snap_mid_unsettle_rc == SNAP_RETRY);
+    CHECK(eng_unsettle_hold_pos(L.db) == 0);
+    CHECK(objs >= 1 && bytes > 0);
+    ecunsettle_get_progress(&p1);
+    CHECK(p1.keys_done == p0.keys_done + 1 && p1.objs_done == p0.objs_done + objs &&
+          p1.bytes_done == p0.bytes_done + bytes && p1.from_decode >= p0.from_decode + objs);
+
+    /* After swap completes, snap_make succeeds cleanly with plain .part listed (no .ec). */
+    {
+        struct snap_info si;
+        memset(&si, 0, sizeof si);
+        CHECK(snap_make(L.db, "snap_post_unsettle", &si) == 0 && si.nparts >= objs);
+        snap_release(si.path);
+    }
+
+    /* Leader now holds plain .part files only for KEY, and all rows remain intact. */
+    part *ec[8], *plain[8];
+    size_t ne = parts_of(L.db, KEY, ec, 8, true);
+    size_t np = parts_of(L.db, KEY, plain, 8, false);
+    CHECK(ne == 0 && np >= objs);
+    unref_all(ec, ne);
+    unref_all(plain, np);
+    CHECK(p_holds(L.db) && d1_holds(L.db, false));
+
+    /* GC gating: while lead_applied_floor < MK_UNSETTLE pos, ecgc_take_due_retired MUST NOT release unsettled oids. */
+    uint64_t last = LAST;
+    eng_leader_applied_floor(L.db, cold_pos);
+    uint8_t (*due)[16] = NULL;
+    size_t ndue = 0;
+    CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == 0);
+    free(due);
+    /* Once all log replicas have applied past MK_UNSETTLE, ecgc_take_due_retired releases the unsettled oids. */
+    eng_leader_applied_floor(L.db, last);
+    due = NULL;
+    ndue = 0;
+    CHECK(ecgc_take_due_retired(L.db, INT64_MAX, &due, &ndue) == 0 && ndue == objs);
+    free(due);
+
+    lstop(&L);
+
+    /* Replica applies MK_COLD first (lists .ec parts), removes settled_ copies, then applies MK_UNSETTLE via decode. */
+    if (ropen(&L, &R, 0) != 0) {
+        CHECK(0);
+        lclose(&L);
+        return;
+    }
+    CHECK(feed(&R, cold_pos) == 0);
+    ne = parts_of(R.db, KEY, ec, 8, true);
+    CHECK(ne == objs);
+    unref_all(ec, ne);
+    remove_settled_files(R.dir);
+
+    /* Direct eng_unsettle_key on a replica must be refused with TSDB_ERR_READONLY. */
+    CHECK(eng_unsettle_key(R.db, KEY, NULL, NULL) == TSDB_ERR_READONLY);
+
+    CHECK(replica_apply(R.db, last) == 0);
+    ne = parts_of(R.db, KEY, ec, 8, true);
+    np = parts_of(R.db, KEY, plain, 8, false);
+    CHECK(ne == 0 && np >= objs);
+    unref_all(ec, ne);
+    unref_all(plain, np);
+    CHECK(p_holds(R.db) && d1_holds(R.db, false));
+    rstop(&R);
+
+    /* Reopen replica at cold_pos (idempotent replay of MK_UNSETTLE) and at last (PPOS validation on reopen). */
+    if (ropen(&L, &R, cold_pos) == 0) {
+        CHECK(replica_apply(R.db, last) == 0);
+        ne = parts_of(R.db, KEY, ec, 8, true);
+        np = parts_of(R.db, KEY, plain, 8, false);
+        CHECK(ne == 0 && np >= objs);
+        unref_all(ec, ne);
+        unref_all(plain, np);
+        CHECK(p_holds(R.db) && d1_holds(R.db, false));
+        rstop(&R);
+    } else {
+        CHECK(0);
+    }
+    if (ropen(&L, &R, last) == 0) {
+        ne = parts_of(R.db, KEY, ec, 8, true);
+        CHECK(ne == 0);
+        unref_all(ec, ne);
+        CHECK(p_holds(R.db) && d1_holds(R.db, false));
+        rstop(&R);
+    } else {
+        CHECK(0);
+    }
+    lclose(&L);
+
+    /* MUST-FIX #1 regression: depose leader between MK_UNSETTLE append and commit (TSDB_ERR_INDETERMINATE).
+     * Because the marker reached the WAL (pos != 0) and may still commit under the next leader, unsettle_hold_pos
+     * MUST stay armed (clamping REPL.floor and keeping snap_make at SNAP_RETRY) and the .ec part stays listed. */
+    {
+        lt L2;
+        if (start("unsettle-indet", &L2)) {
+            eccold_cut c2;
+            workload(&L2, &c2, false);
+            remove_settled_files(L2.dir);
+            atomic_store(&L2.x.depose_on_unsettle, true);
+            CHECK(eng_unsettle_key(L2.db, KEY, NULL, NULL) == TSDB_ERR_INDETERMINATE);
+            CHECK(eng_unsettle_hold_pos(L2.db) > 0);
+            struct snap_info si;
+            memset(&si, 0, sizeof si);
+            int src = snap_make(L2.db, "snap_indet_unsettle", &si);
+            if (src == 0)
+                snap_release(si.path);
+            CHECK(src == SNAP_RETRY);
+            part *ec2[8];
+            size_t ne2 = parts_of(L2.db, KEY, ec2, 8, true);
+            CHECK(ne2 >= 1);
+            unref_all(ec2, ne2);
+            lstop(&L2);
+            lclose(&L2);
+        } else {
+            CHECK(0);
+        }
+    }
+    printf("  unsettle: leader MK_UNSETTLE + GC applied-floor gate + INDETERMINATE hold + replica decode apply + "
+           "PPOS reopen + idempotent replay\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *only = NULL, *power_root = NULL, *lpower_root = NULL, *recover_root = NULL, *dpower_root = NULL;
@@ -2380,6 +2568,7 @@ int main(int argc, char **argv)
     }
     signal(SIGALRM, alarm_exit);
     alarm(240);
+    ecunsettle_env_init();
     meta_cluster_open_allow(true);
     WRAP = coldops_dir;
     WRAP.all_up = w_all_up;
@@ -2411,7 +2600,7 @@ int main(int argc, char **argv)
                  {"multi", test_multi}, {"twice", test_twice}, {"tamper", test_tamper}, {"leader", test_leader},
                  {"badft", test_badft}, {"leaderpower", test_leaderpower}, {"power", test_power},
                  {"recover", test_recover}, {"recpower", test_recpower}, {"digest", test_digest},
-                 {"digestpower", test_digestpower}, {"degraded", test_degraded}};
+                 {"digestpower", test_digestpower}, {"degraded", test_degraded}, {"unsettle", test_unsettle}};
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
         if (!only || !strcmp(only, cases[i].name))
             cases[i].fn();
